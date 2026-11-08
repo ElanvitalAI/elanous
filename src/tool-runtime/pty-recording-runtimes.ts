@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Phase C (Capture Fabric) — PTY recording LLM tools ──
 //
 // Companion to the existing `recording-runtimes.ts` (IUL Bundle 8T —
@@ -23,7 +24,7 @@ import {
   type RecordingEncoder,
   type RecordingStore,
 } from '../capture/recording-store.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { registerToolRuntime } from './registry.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 

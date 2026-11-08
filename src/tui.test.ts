@@ -1,7 +1,75 @@
 import { describe, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
-import { join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import ts from 'typescript';
 import { splitKeys, KeyStreamParser, sliceAnsiByColumns } from './tui.js';
+
+function runtimeImports(filePath: string): string[] {
+  const source = ts.createSourceFile(filePath, readFileSync(filePath, 'utf8'), ts.ScriptTarget.Latest, true);
+  const imports = source.statements.flatMap((statement) => {
+    if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
+      const clause = statement.importClause;
+      const runtimeBinding = !clause?.isTypeOnly && (clause === undefined || clause.name !== undefined
+        || (clause.namedBindings && (ts.isNamespaceImport(clause.namedBindings)
+          || clause.namedBindings.elements.some((element) => !element.isTypeOnly))));
+      return runtimeBinding ? [statement.moduleSpecifier.text] : [];
+    }
+    if (ts.isExportDeclaration(statement) && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) {
+      const runtimeBinding = !statement.isTypeOnly && (!statement.exportClause
+        || ts.isNamespaceExport(statement.exportClause)
+        || statement.exportClause.elements.some((element) => !element.isTypeOnly));
+      return runtimeBinding ? [statement.moduleSpecifier.text] : [];
+    }
+    return [];
+  });
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && node.arguments.length === 1 && ts.isStringLiteral(node.arguments[0]!)) {
+      const specifier = node.arguments[0]!.text;
+      if ((node.expression.kind === ts.SyntaxKind.ImportKeyword)
+        || (ts.isIdentifier(node.expression) && node.expression.text === 'require')) imports.push(specifier);
+    }
+    ts.forEachChild(node, visit);
+  };
+  for (const statement of source.statements) visit(statement);
+  return imports;
+}
+
+function resolveRuntimeImport(filePath: string, specifier: string): string | undefined {
+  if (!specifier.startsWith('.')) return undefined;
+  const target = resolve(dirname(filePath), specifier.replace(/\.(?:js|ts|tsx)$/, ''));
+  for (const candidate of [`${target}.ts`, `${target}.tsx`, `${target}.js`, join(target, 'index.ts')]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function runtimeImportPath(from: string, to: string, seen = new Set<string>()): string[] | undefined {
+  if (from === to) return [from];
+  if (seen.has(from)) return undefined;
+  seen.add(from);
+  for (const specifier of runtimeImports(from)) {
+    const next = resolveRuntimeImport(from, specifier);
+    if (!next) continue;
+    const path = runtimeImportPath(next, to, seen);
+    if (path) return [from, ...path];
+  }
+  return undefined;
+}
+
+test('TUI render cache imports terminal primitives from the neutral contract', () => {
+  const renderCache = join(import.meta.dir, 'tui-render-cache.ts');
+  const terminalContract = join(import.meta.dir, 'tui-terminal-contract.ts');
+  const tui = join(import.meta.dir, 'tui.ts');
+  const renderCacheImports = runtimeImports(renderCache);
+  const tuiImports = runtimeImports(tui);
+
+  expect(renderCacheImports).toContain('./tui-terminal-contract.js');
+  expect(renderCacheImports).not.toContain('./tui.js');
+  expect(tuiImports).toContain('./tui-terminal-contract.js');
+  expect(tuiImports).toContain('./tui-render-cache.js');
+  expect(runtimeImportPath(terminalContract, tui)).toBeUndefined();
+});
 
 describe('raw terminal control keys', () => {
   test('LF is Ctrl+J, not Enter', () => {

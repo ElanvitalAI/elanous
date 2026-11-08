@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -237,6 +238,74 @@ describe('gateLockfileHash — 후보가 실제로 실행한 lockfile 식별값'
       writeFileSync(join(root, 'bun.lock'), '# lock v2\n');
       expect(gateLockfileHash(root)).not.toBe(first);
       expect(gateLockfileHash(join(root, 'absent-dir'))).toBe('absent');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('bun.lock 지문은 dev/runtime 분류와 서식은 접고 요청·해결 package graph 변화는 감지한다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'gate-receipt-lock-semantic-'));
+    try {
+      type FixtureLock = { lockfileVersion: number; configVersion: number; workspaces: Record<string, {
+        name: string; dependencies: Record<string, string>; devDependencies: Record<string, string>;
+        optionalDependencies?: Record<string, string>; peerDependencies?: Record<string, string>; scripts: Record<string, string>;
+      }>; packages: Record<string, unknown[]> };
+      const integrity = `sha512-${'A'.repeat(86)}==`;
+      const runtime: FixtureLock = { lockfileVersion: 1, configVersion: 1, workspaces: {
+        '': { name: 'fixture', dependencies: { alpha: '1.0.0' }, devDependencies: { beta: '^2.0.0' }, scripts: { test: 'bun test' } },
+      }, packages: { 'alpha@1.0.0': ['alpha', '', {}, integrity], 'beta@2.1.0': ['beta', '', {}, integrity] } };
+      writeFileSync(join(root, 'bun.lock'), JSON.stringify(runtime));
+      const first = gateLockfileHash(root);
+      const moved = structuredClone(runtime);
+      delete moved.workspaces[''].dependencies.alpha;
+      moved.workspaces[''].devDependencies.alpha = '1.0.0';
+      moved.workspaces['']!.scripts = { test: 'bun test', lint: 'bun lint' };
+      writeFileSync(join(root, 'bun.lock'), `${JSON.stringify(moved, null, 2).replace(/\n}$/, ',\n}')}\n`);
+      expect(gateLockfileHash(root)).toBe(first);
+
+      moved.workspaces['']!.name = 'renamed-workspace';
+      writeFileSync(join(root, 'bun.lock'), JSON.stringify(moved));
+      expect(gateLockfileHash(root)).not.toBe(first);
+      moved.workspaces['']!.name = 'fixture';
+      moved.workspaces['']!.optionalDependencies = { optional: '^3.0.0' };
+      writeFileSync(join(root, 'bun.lock'), JSON.stringify(moved));
+      expect(gateLockfileHash(root)).not.toBe(first);
+      delete moved.workspaces['']!.optionalDependencies;
+      moved.workspaces['']!.peerDependencies = { peer: '^4.0.0' };
+      writeFileSync(join(root, 'bun.lock'), JSON.stringify(moved));
+      expect(gateLockfileHash(root)).not.toBe(first);
+      delete moved.workspaces['']!.peerDependencies;
+      moved.workspaces['']!.dependencies.beta = '^2.2.0';
+      writeFileSync(join(root, 'bun.lock'), JSON.stringify(moved));
+      expect(gateLockfileHash(root)).not.toBe(first);
+
+      moved.packages['alpha@1.0.0'] = ['alpha', '', { dependencies: { peer: 'changed' } }, 'sha512-AAAAAAAA=='];
+      writeFileSync(join(root, 'bun.lock'), JSON.stringify(moved));
+      expect(gateLockfileHash(root)).not.toBe(first);
+
+      moved.lockfileVersion = 2;
+      const unsupported = JSON.stringify(moved);
+      writeFileSync(join(root, 'bun.lock'), unsupported);
+      expect(gateLockfileHash(root)).toBe(createHash('sha256').update(unsupported).digest('hex'));
+      const malformed = '{"lockfileVersion":1,"workspaces":[]';
+      writeFileSync(join(root, 'bun.lock'), malformed);
+      expect(gateLockfileHash(root)).toBe(createHash('sha256').update(malformed).digest('hex'));
+      const malformedPackage = JSON.stringify({ lockfileVersion: 1, configVersion: 1, workspaces: {}, packages: { x: [] } });
+      writeFileSync(join(root, 'bun.lock'), malformedPackage);
+      expect(gateLockfileHash(root)).toBe(createHash('sha256').update(malformedPackage).digest('hex'));
+      const malformedPackageMetadata = JSON.stringify({ lockfileVersion: 1, configVersion: 1, workspaces: {},
+        packages: { x: ['x@1.0.0', '', { dependencies: 42 }, integrity] } });
+      writeFileSync(join(root, 'bun.lock'), malformedPackageMetadata);
+      expect(gateLockfileHash(root)).toBe(createHash('sha256').update(malformedPackageMetadata).digest('hex'));
+      const malformedBin = JSON.stringify({ lockfileVersion: 1, configVersion: 1, workspaces: {},
+        packages: { x: ['x@1.0.0', '', { bin: 42 }, integrity] } });
+      writeFileSync(join(root, 'bun.lock'), malformedBin);
+      expect(gateLockfileHash(root)).toBe(createHash('sha256').update(malformedBin).digest('hex'));
+      const malformedIntegrity = JSON.stringify({ lockfileVersion: 1, configVersion: 1, workspaces: {},
+        packages: { x: ['x@1.0.0', '', {}, 'sha512-A'] } });
+      writeFileSync(join(root, 'bun.lock'), malformedIntegrity);
+      expect(gateLockfileHash(root)).toBe(createHash('sha256').update(malformedIntegrity).digest('hex'));
+      const malformedScripts = JSON.stringify({ ...runtime, workspaces: { '': { ...runtime.workspaces['']!, scripts: [] } } });
+      writeFileSync(join(root, 'bun.lock'), malformedScripts);
+      expect(gateLockfileHash(root)).toBe(createHash('sha256').update(malformedScripts).digest('hex'));
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

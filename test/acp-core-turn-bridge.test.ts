@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // UI-Core arc Phase U3b Step 2 — ACP ↔ runCoreTurn bridge test.
 //
 // Locks the translation from AcpTurnContext into CoreTurnContext:
@@ -16,7 +17,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { LLMMessage, LLMToolSpec } from '../src/llm.js';
+import type { LLMMessage } from '../src/llm.js';
 import { createSession, loadSession } from '../src/session/index.js';
 import { writeOriginSessionMeta } from '../src/acp/origin-session-meta.js';
 import { persistCompletedTuiAcpTurn } from '../src/acp/server.js';

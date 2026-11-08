@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tool: SpawnCodingAgentHeadless — I2 (텔레그램 코딩 에이전트).
 //
 // Lands claude-code / codex in a bare PtyShell so a HEADLESS surface
@@ -18,7 +19,7 @@
 // no ACP). The macOS keychain-unlock wrap lets `claude` read its credentials.
 
 import { spawnSync } from 'node:child_process';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { getSessionCwd } from '../../session/working-dir.js';
 import { startPty, unregisterPty, type PtyHandle } from '../../pty-shell/registry.js';
 import { CodingAgentBinaryMissing } from '../../terminal/coding-agent.js';

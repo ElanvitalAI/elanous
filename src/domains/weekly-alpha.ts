@@ -1,3 +1,4 @@
+import { textOnly } from '../llm/stream-text.js';
 // ── R1 · 주간 알파 추천 리포트 (2026-07-06 · ROADMAP-organic-signal-engine) ──
 //
 // 대표 지시: "주당 한번씩 머니무브먼트·펀더멘털·수급 변화를 가지고 매매 추천".
@@ -17,7 +18,7 @@
 import { buildFinanceTools } from './finance-tools.js';
 import { openSignalsDb, periodStats, topSignals } from './breaking-signals.js';
 import { getUserConfig } from '../user-config.js';
-import { getProviderForConfig, anyProviderAvailable, textOnly, type LLMMessage } from '../llm.js';
+import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';

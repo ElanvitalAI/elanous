@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Tier flip — defer specialised tool schemas (Coding Pipeline P1 followup) ──
 //
 // The `nativeToolCatalog` ships three meta fields per entry:
@@ -27,7 +28,7 @@
 // by default, big-armada loaded on demand" philosophy from the P1
 // HANDOFF.
 
-import type { ContentBlock, LLMMessage, LLMToolSpec } from '../llm.js';
+import type { ContentBlock, LLMMessage } from '../llm.js';
 import {
   nativeToolCatalog,
   type NativeToolCatalogEntry,

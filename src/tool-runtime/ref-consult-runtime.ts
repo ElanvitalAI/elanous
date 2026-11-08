@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── RefConsult ToolRuntime (Coding Pipeline P5) ──
 //
 // Third step of the discovery cycle: FindRepo → SyncRepo →
@@ -21,7 +22,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 import { DEFAULT_REFERENCE_ROOTS, denyNonPublicReference } from '../agent/ref-grounding.js';   // ★ F3 — 로컬 canonical ref 루트
 import { debug } from '../debug/log.js';

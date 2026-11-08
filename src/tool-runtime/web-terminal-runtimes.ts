@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // WT-L-1 — LLM tools that work on the web-terminal kind.
 //
 // Three reads / writes that let an agent inspect + drive web terminals
@@ -38,7 +39,7 @@ import {
   lookupPreviewTerminal,
   listPreviewTerminals,
 } from '../web-terminal/preview-tap-registry.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { webTerminalScreenshotRuntime } from './web-terminal-screenshot.js';
 

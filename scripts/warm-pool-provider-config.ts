@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { userConfigPath } from '../src/user-config.js';
 import type { WarmWorkerCandidate } from '../src/task-orchestrator/surfaces/pod-warm-worker-provider.js';
+import type { RuntimeIdentityInput } from '../src/runtime-identity.js';
 import { machinePoolCapacity, parseMachinePoolDeclarations, readMachinePoolDeclarations, type MachinePoolDeclaration } from '../src/resource-ledger/machine-pool-inventory.js';
 
 const TOKEN = /^[a-f0-9]{64}$/;
@@ -22,6 +23,7 @@ export interface WarmPoolProviderConfig {
   poolTemplates: Array<{
     host: string;
     tier: 'lite' | 'standard';
+    kind: 'gate' | 'implementation';
     slotCount?: number;
     spec: {
       name: string;
@@ -34,13 +36,19 @@ export interface WarmPoolProviderConfig {
       nodeName: string;
       cutSha: string;
       key: { context: string; imageDigest: string; lockHash: string; architecture: string };
-      runtimeContract?: { bunVersion: string; os: 'linux'; architecture: string; requiredTools: string[] };
+      runtimeContract?: { baseImageDigest?: string; bunVersion: string; os: 'linux'; architecture: string; requiredTools: string[] };
       memoryLimit: '2Gi' | '16Gi';
       hostProbeUrl: string;
       prodProbeUrl: string;
     };
   }>;
   profileConfig: { pod: { warmPoolProfile: string } };
+  /** Cross-architecture reuse is opt-in; omission keeps exact architecture matching. */
+  allowedArchitectures?: Array<'amd64' | 'arm64'>;
+  runtimeIdentity?: RuntimeIdentityInput;
+  /** Canonical SI target identity, independent of any selected worker row. */
+  siSelection: { kind: 'implementation'; imageDigest: string;
+    runtimeContract: { baseImageDigest?: string; bunVersion: string; os: 'linux'; architecture: string; requiredTools: string[] } };
   controlUrl: string;
   memberToken: string;
   machineTokens: Record<string, string>;
@@ -152,8 +160,19 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
     || new Set(drainingHostsValue).size !== drainingHostsValue.length)
     throw new Error('pod.warmPool.drainingHosts must be a unique list of host names');
   const drainingHosts = drainingHostsValue as string[];
+  const allowedArchitecturesValue = pool.allowedArchitectures;
+  if (allowedArchitecturesValue !== undefined && (!Array.isArray(allowedArchitecturesValue)
+    || allowedArchitecturesValue.some(arch => arch !== 'amd64' && arch !== 'arm64')
+    || new Set(allowedArchitecturesValue).size !== allowedArchitecturesValue.length))
+    throw new Error('pod.warmPool.allowedArchitectures must be a unique list of amd64 and/or arm64');
+  const allowedArchitectures = allowedArchitecturesValue as Array<'amd64' | 'arm64'> | undefined;
   const lockHash = text(pool.lockHash, 'pod.warmPool.lockHash');
   if (!LOCK_HASH.test(lockHash)) throw new Error('pod.warmPool.lockHash must be a 64-character SHA-256');
+  const configuredBaseImageDigest = pool.baseImageDigest;
+  const baseImageDigest = typeof configuredBaseImageDigest === 'string' && DIGEST.test(configuredBaseImageDigest)
+    ? configuredBaseImageDigest : undefined;
+  if (configuredBaseImageDigest !== undefined && !baseImageDigest)
+    throw new Error('pod.warmPool.baseImageDigest must be a sha256 digest');
   const architecture = text(pool.architecture, 'pod.warmPool.architecture');
   const bunVersion = readFileSync(fileURLToPath(new URL('../.bun-version', import.meta.url)), 'utf8').trim();
   if (!/^\d+\.\d+\.\d+$/.test(bunVersion)) throw new Error('.bun-version must be a semantic version');
@@ -204,13 +223,14 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
     return {
       host,
       tier: tier as 'lite' | 'standard',
+      kind: profile === 'feature' ? 'implementation' as const : 'gate' as const,
       ...(slotCount !== undefined ? { slotCount } : {}),
       spec: {
         name: `warm-${host}-${tier}-template`, namespace, kubectlContext,
         workerId: `warm-${host}-${cutSha.slice(0, 12)}`, image: `${imageRepository}@${imageDigest}`,
         ...source, nodeName, cutSha,
         key: { context: kubectlContext, imageDigest, lockHash, architecture },
-        runtimeContract: { bunVersion, os: 'linux' as const, architecture, requiredTools: ['bun', 'git'] },
+        runtimeContract: { ...(baseImageDigest ? { baseImageDigest } : {}), bunVersion, os: 'linux' as const, architecture, requiredTools: ['bun', 'git'] },
         memoryLimit: tier === 'lite' ? '2Gi' as const : '16Gi' as const,
         hostProbeUrl, prodProbeUrl,
       },
@@ -218,6 +238,10 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
   });
   return { candidates: [], expandPoolTemplatesToQuota: expandPoolTemplatesToQuota === true, drainingHosts,
     poolTemplates, profileConfig: { pod: { warmPoolProfile: profile } },
+    ...(allowedArchitectures ? { allowedArchitectures } : {}),
+    ...(baseImageDigest ? { runtimeIdentity: { baseImageDigest, lockHash, os: 'linux', architecture, bunVersion } } : {}),
+    siSelection: { kind: 'implementation', imageDigest,
+      runtimeContract: { ...(baseImageDigest ? { baseImageDigest } : {}), bunVersion, os: 'linux', architecture, requiredTools: ['bun', 'git'] } },
     controlUrl: controlUrl(input.controlUrl), memberToken: token(input.memberToken, 'member token'), machineTokens, ...(input.machinePools ? { machinePools: input.machinePools } : {}) };
 }
 

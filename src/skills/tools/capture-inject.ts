@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // H6 P7 · InjectCaptureToContext LLM tool (Tier B).
 //
 // Atomic pipeline: P6 `registry.snapshot(sourceId)` → wrap per `as`
@@ -13,7 +14,7 @@
 // `isError` unset with `warnings: ['approver-denied' | 'approver-timeout']`
 // so the LLM can adapt (e.g. simplify the request and retry).
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   findLiveSessionById,
 } from '../../agent/spawn-embodied-agent-in-vw.js';

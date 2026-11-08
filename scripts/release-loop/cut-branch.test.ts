@@ -91,6 +91,51 @@ test('existing remote branch is refused without changing its tip and names --app
   expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/0.2.4').split('\t')[0]).toBe(existing.commit!);
 });
 
+test('--append dry-run suggests up to two main commits defining imports from its conflict hunk without moving the release tip', () => {
+  const f = fixture();
+  mkdirSync(join(f.repo, 'src/cli'), { recursive: true });
+  writeFileSync(join(f.repo, 'src/cli/helpers.ts'), "export * from './internal.js';\nexport { aliasTarget as dependencyAlias } from './internal.js';\nexport type * from './types.js';\nconst helperA = 1,\n  legacyHelper = () => {};\nlet optionalHelper;\nexport{ legacyHelper, optionalHelper };\ntype LocalType = { value: string };\nexport type { LocalType };\nimport { existingAlias as localAlias } from './internal.js';\nexport { localAlias as importedAlias };\nimport defaultHelper from './internal.js';\nexport { defaultHelper as defaultAlias };\n");
+  writeFileSync(join(f.repo, 'src/cli/internal.ts'), 'export function oldHelper() {}\nexport function existingAlias() {}\nexport default function defaultHelper() {}\n');
+  writeFileSync(join(f.repo, 'src/cli/types.ts'), 'export interface SharedType { value: string }\n');
+  writeFileSync(join(f.repo, 'src/cli/release-cli.ts'), "import {\n  oldHelper,\n} from './helpers.js';\n");
+  f.git(f.repo, 'add', 'src/cli/helpers.ts', 'src/cli/internal.ts', 'src/cli/types.ts', 'src/cli/release-cli.ts');
+  f.git(f.repo, 'commit', '-q', '-m', 'add release cli fixture');
+  const base = f.git(f.repo, 'rev-parse', 'HEAD');
+
+  f.git(f.repo, 'checkout', '-q', '-b', 'fixture-release');
+  writeFileSync(join(f.repo, 'package.json'), '{"version":"9.9.9"}\n');
+  writeFileSync(join(f.repo, 'src/cli/release-cli.ts'), "import {\n  releaseOnly,\n} from './helpers.js';\n");
+  f.git(f.repo, 'add', 'package.json', 'src/cli/release-cli.ts');
+  f.git(f.repo, 'commit', '-q', '-m', 'cut release fixture');
+  const releaseTip = f.git(f.repo, 'rev-parse', 'HEAD');
+  f.git(f.repo, 'push', '-q', 'origin', `${releaseTip}:refs/heads/release/9.9.9`);
+
+  f.git(f.repo, 'checkout', '-q', 'main');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  mkdirSync(join(f.repo, 'src/cli'), { recursive: true });
+  writeFileSync(join(f.repo, 'src/cli/other.ts'), 'export function unrelatedMissing() {}\nexport function depA() {}\n');
+  writeFileSync(join(f.repo, 'src/cli/release-cli.ts'), "import {\n  oldHelper,\n} from './helpers.js';\nimport { unrelatedMissing } from './other.js';\nimport { depA } from './other.js';\n");
+  f.git(f.repo, 'add', 'src/cli/other.ts', 'src/cli/release-cli.ts');
+  f.git(f.repo, 'commit', '-q', '-m', 'add unrelated import outside the future conflict hunk');
+  const depA = f.commit('src/cli/internal.ts', 'export function oldHelper() {}\nexport function existingAlias() {}\nexport default function defaultHelper() {}\nexport function aliasTarget() {}\nexport function depA() {}\n');
+  const depB = f.commit('src/cli/internal.ts', 'export function oldHelper() {}\nexport function existingAlias() {}\nexport default function defaultHelper() {}\nexport function aliasTarget() {}\nexport function depA() {}\nexport function depB() {}\n');
+  f.commit('src/cli/internal.ts', 'export function oldHelper() {}\nexport function existingAlias() {}\nexport default function defaultHelper() {}\nexport function aliasTarget() {}\nexport function depA() {}\nexport function depB() {}\nexport function depC() {}\n');
+  const picked = f.commit('src/cli/release-cli.ts', "import {\n  depA,\n  dependencyAlias,\n  importedAlias,\n  defaultAlias,\n  LocalType,\n  SharedType,\n  depB,\n  depC,\n  legacyHelper,\n} from './helpers.js';\nimport { unrelatedMissing } from './other.js';\nimport { depA } from './other.js';\n");
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+
+  const result = cutReleaseBranch({ version: '9.9.9', base, pick: [picked], append: true, dryRun: true, repoRoot: f.repo, log: () => {} });
+  expect(result).toMatchObject({ branch: 'release/9.9.9', commit: null, dryRun: true });
+  expect(result.dependencyPicks).toEqual([
+    { sha: depA, path: 'src/cli/helpers.ts', symbols: ['depA', 'dependencyAlias'] },
+    { sha: depB, path: 'src/cli/helpers.ts', symbols: ['depB'] },
+  ]);
+  expect(result.dependencyPicks).toHaveLength(2);
+  expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/9.9.9').split('\t')[0]).toBe(releaseTip);
+  expect(f.git(f.repo, 'worktree', 'list', '--porcelain')).not.toContain('release-cut-append-dry-run-');
+  expect(f.git(f.repo, 'show', `${depA}:src/cli/internal.ts`)).toContain('depA');
+  expect(result.dependencyPicks?.flatMap((pick) => pick.symbols)).not.toContain('unrelatedMissing');
+});
+
 test('--append fast-forwards a new main pick onto release/9.9.9 and refuses a moved tip without force-push', () => {
   const f = fixture();
   writeFileSync(join(f.repo, 'package.json'), '{"version":"9.9.9"}\n');

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── VW-term Bundle P7-E-α · ComparePanes LLM tool ──
 //
 // Produce a unified diff between two pane snapshots. LLM use cases:
@@ -13,7 +14,7 @@
 
 import { createTwoFilesPatch } from 'diff';
 import { stripAnsi } from '../tui.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { lookupPane, paneRefOf } from './sources/pane-source.js';
 import type { PaneFactory } from '../panes/factory.js';
 import type { PaneRef } from '../panes/types.js';

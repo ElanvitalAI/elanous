@@ -7,13 +7,15 @@ import {
   fetchDaemonModelTier,
   hydrateFromDaemon,
   pushMonthlyCapToDaemon,
+  pushLlmTierToDaemon,
+  pushPresetToDaemon,
+  pushTtsVoiceMappingToDaemon,
   pushSttTierToDaemon,
   type DaemonHttpConfig,
 } from './model-tier-sync';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../test-devices/fake-fetch';
 
 const CFG: DaemonHttpConfig = { baseUrl: 'http://localhost:31415', token: 'tk' };
-
-const originalFetch = globalThis.fetch;
 
 interface FetchCall {
   url: string;
@@ -23,26 +25,29 @@ interface FetchCall {
 }
 
 let calls: FetchCall[] = [];
+let fakeFetch: FakeFetchDevice | undefined;
 
 function installFetch(
   responder: (call: FetchCall) => { status?: number; body?: unknown } | Error,
 ): void {
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    const method = (init?.method ?? 'GET').toUpperCase();
-    const headers = (init?.headers ?? {}) as Record<string, string>;
+  fakeFetch?.restore();
+  const respond = (request: { url: string; method: string; headers: Readonly<Record<string, string>>; body: string | null }) => {
+    const url = request.url;
+    const method = request.method;
+    const headers = request.headers as Record<string, string>;
     let body: unknown;
-    try { body = init?.body ? JSON.parse(String(init.body)) : undefined; } catch { body = init?.body; }
+    try { body = request.body ? JSON.parse(request.body) : undefined; } catch { body = request.body; }
     const call = { url, method, headers, body };
     calls.push(call);
     const r = responder(call);
     if (r instanceof Error) throw r;
     const status = r.status ?? 200;
-    return new Response(JSON.stringify(r.body ?? {}), {
-      status,
-      headers: { 'content-type': 'application/json' },
-    });
-  }) as typeof globalThis.fetch;
+    return Response.json(r.body ?? {}, { status });
+  };
+  fakeFetch = createFakeFetchDevice([
+    { url: '/v1/config/model-tier', method: 'GET', response: respond },
+    { url: '/v1/config/model-tier', method: 'PUT', response: respond },
+  ]);
 }
 
 function installLocalStorage(): void {
@@ -65,7 +70,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  globalThis.fetch = originalFetch;
+  fakeFetch?.restore();
+  fakeFetch = undefined;
   delete (globalThis as unknown as { window?: object }).window;
   delete (globalThis as unknown as { localStorage?: Storage }).localStorage;
 });
@@ -145,13 +151,13 @@ describe('M1-2b · pushSttTierToDaemon', () => {
     installFetch(() => ({ body: { modelTier: { voice: { stt: 'best' } } } }));
     const status = await pushSttTierToDaemon(CFG, 'best');
     expect(status).toBe('synced');
-    expect(calls[0]?.method).toBe('PUT');
-    expect(calls[0]?.body).toEqual({ modelTier: { voice: { stt: 'best' } } });
+    expect(calls.map((call) => call.method)).toEqual(['GET', 'PUT']);
+    expect(calls[1]?.body).toEqual({ modelTier: { voice: { stt: 'best' } } });
     // localStorage written first (optimistic).
     expect(JSON.parse(localStorage.getItem('elanous.model-tier.prefs')!).stt).toBe('best');
   });
 
-  test('null tier clears modelTier · localStorage cleared too', async () => {
+  test('null tier clears only STT · localStorage cleared too', async () => {
     localStorage.setItem(
       'elanous.model-tier.prefs',
       JSON.stringify({ stt: 'best', audioMinPerDay: 0 }),
@@ -159,7 +165,8 @@ describe('M1-2b · pushSttTierToDaemon', () => {
     installFetch(() => ({ body: {} }));
     const status = await pushSttTierToDaemon(CFG, null);
     expect(status).toBe('synced');
-    expect(calls[0]?.body).toEqual({ modelTier: null });
+    expect(calls.map((call) => call.method)).toEqual(['GET', 'PUT']);
+    expect(calls[1]?.body).toEqual({ modelTier: { voice: {} } });
     // resetModelTierPrefs clears the localStorage entry entirely.
     expect(localStorage.getItem('elanous.model-tier.prefs')).toBeNull();
   });
@@ -181,6 +188,69 @@ describe('M1-2b · pushSttTierToDaemon', () => {
     installFetch(() => ({ body: {} }));
     expect(await pushSttTierToDaemon({ baseUrl: '' }, 'best')).toBe('offline');
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('M1-2b · preserve daemon-only model tiers', () => {
+  test('changing an owned tier preserves embedding/vision and other daemon-only fields', async () => {
+    installFetch((call) => call.method === 'GET'
+      ? { body: { modelTier: {
+        voice: { stt: 'balanced', ttsVoice: { chat: 'voice-1' } },
+        embedding: 'best', vision: 'loaded', profile: 'custom', preset: 'meeting',
+      } } }
+      : { body: {} });
+
+    expect(await pushLlmTierToDaemon(CFG, 'best')).toBe('synced');
+    expect(calls.map((call) => call.method)).toEqual(['GET', 'PUT']);
+    expect(calls[1]?.body).toEqual({ modelTier: {
+      voice: { stt: 'balanced', ttsVoice: { chat: 'voice-1' } },
+      llm: 'best', embedding: 'best', vision: 'loaded', profile: 'custom', preset: 'meeting',
+    } });
+  });
+
+  test('resetting an owned tier preserves daemon-only fields and other tiers', async () => {
+    installFetch((call) => call.method === 'GET'
+      ? { body: { modelTier: {
+        voice: { stt: 'best', tts: 'better', ttsVoice: { chat: 'voice-1' } },
+        llm: 'balanced', embedding: 'best', vision: 'loaded', profile: 'custom', preset: 'meeting',
+      } } }
+      : { body: {} });
+
+    expect(await pushSttTierToDaemon(CFG, null)).toBe('synced');
+    expect(calls[1]?.body).toEqual({ modelTier: {
+      voice: { tts: 'better', ttsVoice: { chat: 'voice-1' } },
+      llm: 'balanced', embedding: 'best', vision: 'loaded', profile: 'custom', preset: 'meeting',
+    } });
+  });
+
+  test('clearing preset preserves daemon-only fields and removes only preset', async () => {
+    installFetch((call) => call.method === 'GET'
+      ? { body: { modelTier: {
+        voice: { stt: 'best', ttsVoice: { chat: 'voice-1' } },
+        llm: 'balanced', embedding: 'best', vision: 'loaded', profile: 'custom', preset: 'meeting',
+      } } }
+      : { body: {} });
+
+    expect(await pushPresetToDaemon(CFG, null)).toBe('synced');
+    expect(calls[1]?.body).toEqual({ modelTier: {
+      voice: { stt: 'best', ttsVoice: { chat: 'voice-1' } },
+      llm: 'balanced', embedding: 'best', vision: 'loaded', profile: 'custom',
+    } });
+  });
+
+  test('an empty local modelTier request never clears an existing daemon tree', async () => {
+    installFetch((call) => call.method === 'GET'
+      ? { body: { modelTier: {
+        voice: { stt: 'best', ttsVoice: { chat: 'voice-1' } },
+        llm: 'balanced', embedding: 'best', vision: 'loaded', profile: 'custom', preset: 'meeting',
+      } } }
+      : { body: {} });
+
+    expect(await pushTtsVoiceMappingToDaemon(CFG, {})).toBe('synced');
+    expect(calls[1]?.body).toEqual({ modelTier: {
+      voice: { stt: 'best', ttsVoice: { chat: 'voice-1' } },
+      llm: 'balanced', embedding: 'best', vision: 'loaded', profile: 'custom', preset: 'meeting',
+    } });
   });
 });
 

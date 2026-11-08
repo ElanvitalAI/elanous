@@ -11,7 +11,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 
 const work: WorkItem[] = [
   { kind: 'pr', ref: '#1', seat: 'TC', files: ['src/a.ts', 'release/next.md'], cells: ['W9'] },
-  { kind: 'goal', ref: 'ASK-X.txt', seat: 'MK', files: ['src/a.ts', 'release/next.md'], cells: ['ORCH2'] },
+  { kind: 'goal', ref: 'ASK-X.txt', seat: 'MK', files: ['release/next.md', 'src/a.ts'], cells: ['ORCH2'] },
   { kind: 'goal', ref: 'ASK-Y.txt', seat: 'UX', files: ['src/b.ts'], cells: ['ORCH2'] },
   { kind: 'goal', ref: 'ASK-Z.txt', seat: 'TC', files: [], cells: [], unreadable: true },
 ];
@@ -68,10 +68,53 @@ test('collectWork reads open PR title/body and running goal documents, keeping u
         files: [{ path: 'src/a.ts' }, { path: 'release/next.md' }] }]);
     },
     listProcesses: () => ({ status: 'ok', records, excludedCount: 0 }),
+    listTrackedPaths: () => ['src/a.ts', 'release/next.md', 'src/b.ts'],
   });
   expect(calls).toEqual([['pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,title,body,headRefName,files,isDraft,labels']]);
   expect(observed).toEqual({ work, excluded: { stalled: 0, superseded: 0, draft: 0 }, unreadableTrees: 0, unreadableGoals: 0 });
   expect(findOverlaps(observed.work)).toEqual(findOverlaps(work));
+});
+
+test('matching unresolved goal targets remain visible to overlap detection', () => {
+  const collected = collectWork({
+    runGh: () => '[]',
+    listProcesses: () => ({ status: 'ok', records: [
+      { pid: 21, ppid: 1, cpuPercent: 0, elapsedSeconds: 30, command: 'bun bin/elanous.mjs harness ask --file ASK-A.txt', cwd: '/repo', cwdStatus: 'observed' as const },
+      { pid: 22, ppid: 1, cpuPercent: 0, elapsedSeconds: 25, command: 'bun bin/elanous.mjs harness ask --file ASK-B.txt', cwd: '/repo', cwdStatus: 'observed' as const },
+    ], excludedCount: 0 }),
+    readGoal: (path) => path.endsWith('ASK-A.txt')
+      ? '대상 경로: src/present.ts · src/missing.ts'
+      : '대상 경로: src/missing.ts',
+    listTrackedPaths: () => ['src/present.ts'],
+    config: { seatTrees: { OP: [], MK: [], TC: [], UX: [] } },
+  });
+  expect(collected.work.map(({ files, unresolvedTargets }) => ({ files, unresolvedTargets }))).toEqual([
+    { files: ['src/missing.ts', 'src/present.ts'], unresolvedTargets: ['src/missing.ts'] },
+    { files: ['src/missing.ts'], unresolvedTargets: ['src/missing.ts'] },
+  ]);
+  expect(findOverlaps(collected.work)).toEqual([{ type: 'file', path: 'src/missing.ts', refs: [
+    { kind: 'goal', ref: 'ASK-A.txt', seat: null }, { kind: 'goal', ref: 'ASK-B.txt', seat: null },
+  ], crossSeat: false }]);
+});
+
+test('a target resolved in one goal and unresolved in another still overlaps', () => {
+  const collected = collectWork({
+    runGh: () => '[]',
+    listProcesses: () => ({ status: 'ok', records: [
+      { pid: 31, ppid: 1, cpuPercent: 0, elapsedSeconds: 30, command: 'bun bin/elanous.mjs harness ask --file ASK-RESOLVED.txt', cwd: '/repo-a', cwdStatus: 'observed' as const },
+      { pid: 32, ppid: 1, cpuPercent: 0, elapsedSeconds: 25, command: 'bun bin/elanous.mjs harness ask --file ASK-UNRESOLVED.txt', cwd: '/repo-b', cwdStatus: 'observed' as const },
+    ], excludedCount: 0 }),
+    readGoal: () => '대상 경로: src/shared.ts',
+    listTrackedPaths: (cwd) => cwd === '/repo-a' ? ['src/shared.ts'] : [],
+    config: { seatTrees: { OP: [], MK: [], TC: [], UX: [] } },
+  });
+  expect(collected.work.map(({ ref, files, unresolvedTargets }) => ({ ref, files, unresolvedTargets }))).toEqual([
+    { ref: 'ASK-RESOLVED.txt', files: ['src/shared.ts'], unresolvedTargets: undefined },
+    { ref: 'ASK-UNRESOLVED.txt', files: ['src/shared.ts'], unresolvedTargets: ['src/shared.ts'] },
+  ]);
+  expect(findOverlaps(collected.work)).toEqual([{ type: 'file', path: 'src/shared.ts', refs: [
+    { kind: 'goal', ref: 'ASK-RESOLVED.txt', seat: null }, { kind: 'goal', ref: 'ASK-UNRESOLVED.txt', seat: null },
+  ], crossSeat: false }]);
 });
 
 test('CLI --json keeps stdout parseable while retaining the summary on stderr; text mode ends in summary', () => {
@@ -148,6 +191,7 @@ test('relative goal paths require observed cwd even when another tree has a same
     listProcesses: () => ({ status: 'ok', records, excludedCount: 0 }),
     config: { seatTrees: {} },
     readGoal: path => { reads.push(path); return readFileSync(path, 'utf8'); },
+    listTrackedPaths: cwd => [cwd === observed ? 'src/b.ts' : 'src/a.ts'],
   });
   expect(reads).toEqual([join(observed, 'ASK-X.txt'), absolute]);
   expect(result).toEqual({ work: [

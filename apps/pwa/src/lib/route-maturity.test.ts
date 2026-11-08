@@ -24,7 +24,7 @@ function builtPages(directory: string): string[] {
 }
 
 // The public export omits private pages; this scoped PR also withdraws resources UI while retaining its route grade for the follow-up.
-const exportExcludedPages = ['/dashboard', '/pitch', '/ops/resources'].filter(page => !existsSync(join(app, page.slice(1), 'page.tsx')));
+const exportExcludedPages = ['/pitch', '/ops/resources'].filter(page => !existsSync(join(app, page.slice(1), 'page.tsx')));
 
 describe('PWA route maturity', () => {
   test('every graded App Router page is classified exactly once (including nested and dynamic pages)', () => {
@@ -45,8 +45,8 @@ describe('PWA route maturity', () => {
     expect(ROUTE_MATURITY['/ops/release']).toBe('ops');
     expect(ROUTE_MATURITY['/ops/seats']).toBe('ops');
     expect(ROUTE_MATURITY['/ops/checklist']).toBe('ops');
-    expect(ROUTE_MATURITY['/ceo']).toBe('ops');
-    expect(ROUTE_MATURITY['/settings']).toBe('beta');
+    expect(ROUTE_MATURITY['/ceo']).toBeUndefined();
+    expect(ROUTE_MATURITY["/settings"]).toBe("beta");
     expect(ROUTE_MATURITY['/approvals']).toBe('tool');
     expect(ROUTE_MATURITY['/chat']).toBe('stable');
     expect(ROUTE_MATURITY['/today']).toBe('stable');

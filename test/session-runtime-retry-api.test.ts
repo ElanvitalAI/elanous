@@ -9,13 +9,14 @@ import {
   ApiHttpError,
 } from '../src/session-runtime/retry-api.js';
 import { DoomLoopTracker } from '../src/session-runtime/retry-policy.js';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 type Canned =
   | { kind: 'response'; status: number; body: string; headers?: Record<string, string> }
   | { kind: 'error'; err: Error };
 
 let queue: Canned[] = [];
-let realFetch: typeof fetch;
+let device: FakeFetchDevice;
 let calls = 0;
 
 function makeResponse(c: Extract<Canned, { kind: 'response' }>): Response {
@@ -28,10 +29,9 @@ function makeResponse(c: Extract<Canned, { kind: 'response' }>): Response {
 }
 
 beforeEach(() => {
-  realFetch = globalThis.fetch;
   calls = 0;
   queue = [];
-  globalThis.fetch = (async (_url: any, _init?: any) => {
+  device = createFakeFetchDevice([{ url: 'https://x/', method: 'GET', response: () => {
     calls++;
     const next = queue.shift();
     if (!next) {
@@ -39,11 +39,11 @@ beforeEach(() => {
     }
     if (next.kind === 'error') throw next.err;
     return makeResponse(next);
-  }) as typeof fetch;
+  } }]);
 });
 
 afterEach(() => {
-  globalThis.fetch = realFetch;
+  device.restore();
 });
 
 describe('fetchApiWithRetry — happy path', () => {

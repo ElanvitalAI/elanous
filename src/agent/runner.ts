@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Agent runner ──
 //
 // Phase B3 — turns an AgentTask into a stream of AgentEvent frames.
@@ -12,14 +13,7 @@
 // Every early exit path (abort, throw, done) closes the queue so the
 // generator terminates instead of hanging.
 
-import {
-  inferProviderFromModel,
-  isModelCompatible,
-  resolveDefaultProvider,
-  streamLLMWithTools,
-  type LLMMessage,
-  type LLMToolSpec,
-} from '../llm.js';
+import { inferProviderFromModel, isModelCompatible, resolveDefaultProvider, streamLLMWithTools, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { buildUniversalPreamble } from '../prompt-library/universal-preamble.js';
 import { getModelFamily } from '../models/prompts.js';

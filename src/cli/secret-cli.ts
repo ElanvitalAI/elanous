@@ -23,6 +23,7 @@ import { registerCredCommands } from './cred-cli.js';
 import { appSecretId, appSecretIdForExistingApp } from '../nexus/config/secrets/app-secret-ledger.js';
 import type { SecretBackendId } from '../nexus/config/secrets/types.js';
 import { revokeAppSecretValues, setAppSecretValue, type AppSecretRevokeResult } from '../nexus/config/secrets/file-backend.js';
+import { deleteCredentialSlotAsync, listCredentialSlotsAsync, parseCredentialSlotId, setCredentialSlotAsync } from '../nexus/config/secrets/cred-slots.js';
 
 export interface SecretCliDeps {
   isInteractive?: () => boolean;
@@ -44,6 +45,9 @@ export interface SecretCliDeps {
   writeBundleFile?: (path: string, contents: string) => Promise<void>;
   syncBundle?: (host: string, contents: string) => Promise<void>;
   importSecrets?: (secrets: Readonly<Record<string, string>>, overwrite: boolean, expectedConflicts?: readonly string[]) => Promise<{ imported: boolean; conflicts: string[]; changedSinceConfirmation: boolean }>;
+  saveCredentialSlot?: (id: string, value: string) => Promise<void>;
+  removeCredentialSlot?: (id: string) => Promise<boolean>;
+  listCredentialSlots?: typeof listCredentialSlotsAsync;
 }
 
 const SECRET_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -116,6 +120,9 @@ function resolveDeps(deps: SecretCliDeps) {
     isInteractive: deps.isInteractive ?? (() => process.stdin.isTTY === true && process.stdout.isTTY === true),
     promptSecret: deps.promptSecret ?? createSecretPrompt(),
     saveSecret: deps.saveSecret ?? setSecretAsync,
+    saveCredentialSlot: deps.saveCredentialSlot ?? setCredentialSlotAsync,
+    removeCredentialSlot: deps.removeCredentialSlot ?? deleteCredentialSlotAsync,
+    listCredentialSlots: deps.listCredentialSlots ?? listCredentialSlotsAsync,
     saveAppSecret: deps.saveAppSecret ?? deps.saveSecret ?? setAppSecretValue,
     revokeAppSecrets: deps.revokeAppSecrets ?? revokeAppSecretValues,
     getSecret,
@@ -168,6 +175,23 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
   // Commander shares output configuration across parent/child commands. Override
   // error handling on this command tree instead so sibling commands keep theirs.
   redactParserErrors(secret);
+
+  const slots = secret.command('slot').description('Inspect shared credential slots without displaying their values.');
+  slots.command('list')
+    .description('List supported shared credential slots and whether each is present.')
+    .allowExcessArguments(false)
+    .action(async () => {
+      try {
+        cli.initializeBackend();
+        const inventory = await cli.listCredentialSlots();
+        cli.output.log('slot\tservice\tfield\tstatus');
+        for (const row of inventory) cli.output.log(`${row.id}\t${row.label}\t${row.field}\t${row.present ? 'present' : 'missing'}`);
+        cli.setExitCode(0);
+      } catch {
+        cli.output.error('credential slot list failed');
+        cli.setExitCode(1);
+      }
+    });
 
   const appSecret = secret.command('app').description('Manage app-scoped secrets; values remain in the secret backend.');
   appSecret.command('set <slug> <name>')
@@ -352,7 +376,12 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
           return;
         }
         cli.initializeBackend();
-        await cli.saveSecret(id, value);
+        if (id.startsWith('cred:')) {
+          if (!parseCredentialSlotId(id)) throw new Error('unsupported credential slot');
+          await cli.saveCredentialSlot(id, value);
+        } else {
+          await cli.saveSecret(id, value);
+        }
         cli.output.log(`saved ${id} · ${cli.storageBackend()}`);
         cli.setExitCode(0);
       } catch {
@@ -391,7 +420,9 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
       }
       try {
         cli.initializeBackend();
-        const removed = await cli.removeSecret(id);
+        const removed = id.startsWith('cred:')
+          ? parseCredentialSlotId(id) ? await cli.removeCredentialSlot(id) : false
+          : await cli.removeSecret(id);
         cli.output.log(removed ? `removed ${id}` : `not found ${id}`);
         cli.setExitCode(removed ? 0 : 1);
       } catch {

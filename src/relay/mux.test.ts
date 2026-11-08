@@ -63,6 +63,30 @@ describe('relay plaintext multiplexing', () => {
     expect(daemonDecoder.decode(encoded(phoneEncoder, open))).toEqual({ ok: true, value: open });
   });
 
+  test('allows full close after a directional end and permits the opposite endpoint to close a half-closed stream', () => {
+    const phoneStreams = new MuxStreamState();
+    const daemonStreams = new MuxStreamState();
+    const phoneEncoder = new MuxEncoder(phoneStreams);
+    const phoneDecoder = new MuxDecoder(phoneStreams);
+    const daemonEncoder = new MuxEncoder(daemonStreams);
+    const daemonDecoder = new MuxDecoder(daemonStreams);
+    const open: MuxFrame = { streamId: 41, kind: 'open', protocol: 'http', method: 'POST', path: '/', headers: {} };
+    const end: MuxFrame = { streamId: 41, kind: 'end' };
+    const close: MuxFrame = { streamId: 41, kind: 'close', reason: 'done' };
+    expect(daemonDecoder.decode(encoded(phoneEncoder, open))).toEqual({ ok: true, value: open });
+    expect(daemonDecoder.decode(encoded(phoneEncoder, end))).toEqual({ ok: true, value: end });
+    const phoneClose = encoded(phoneEncoder, close);
+    expect(daemonDecoder.decode(phoneClose)).toEqual({ ok: true, value: close });
+
+    const responseOpen = { ...open, streamId: 42 };
+    const responseEnd = { ...end, streamId: 42 };
+    const responseClose = { ...close, streamId: 42 };
+    expect(daemonDecoder.decode(encoded(phoneEncoder, responseOpen))).toEqual({ ok: true, value: responseOpen });
+    expect(daemonDecoder.decode(encoded(phoneEncoder, responseEnd))).toEqual({ ok: true, value: responseEnd });
+    const daemonResponseClose = encoded(daemonEncoder, responseClose);
+    expect(phoneDecoder.decode(daemonResponseClose)).toEqual({ ok: true, value: responseClose });
+  });
+
   test('rejects unknown kinds/protocols, truncation, trailing bytes, invalid UTF-8 and invalid input without throwing or consuming an ID', () => {
     const encoder = new MuxEncoder();
     const decoder = new MuxDecoder();

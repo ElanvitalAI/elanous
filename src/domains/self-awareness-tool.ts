@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Self-awareness 회상 도구 (P2 · 코어·도메인 무관 · 2026-07-08) ──────────
 //
 // elanous **코어** 기능 — finance/Conatus 도메인 팩과 독립(대표 지시: Conatus는 퍼스트
@@ -9,7 +10,7 @@
 // 문서 벡터(knowledge.db kind=docs domain=elanous — HANDOFF/REPORT/PLAN 의미검색·fail-soft).
 
 import { existsSync } from 'node:fs';
-import type { LLMToolSpec } from '../llm.js';
+
 import { surfaceEventsDbPath, openSurfaceEventsDb, recallEvents } from './surface-events.js';
 import { knowledgeDbPath, openKnowledgeDb, hybridQueryKnowledge, renderKnowledgeMatches } from './knowledge.js';
 import { SELF_DOMAIN } from './self-awareness.js';

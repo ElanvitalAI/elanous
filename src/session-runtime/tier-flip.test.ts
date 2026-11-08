@@ -1,7 +1,8 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { describe, expect, test } from 'bun:test';
 
 import { splitDeferredToolSpecs } from './tier-flip.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { isNativeToolModelExposed, nativeToolCatalog, type NativeToolCatalogEntry } from '../native-tool-catalog.js';
 
 function spec(name: string): LLMToolSpec {

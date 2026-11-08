@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,6 +8,9 @@ import { readFileDurations } from './shard-plan';
 import { createGateRunner, graphGateResult, judgeGate, readBaselineFileCache, readIsolatedRun, shardFailureIds } from './gate-node';
 import { formatGateTiming, gateTiming } from './gate-timing';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { podCommandImageFor } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
+import { prebuildGateImagePinAtCut } from './gate-image-pin.js';
+import { debug } from '../../src/debug/log.js';
 
 const scratch: string[] = [];
 afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -76,7 +79,7 @@ const BASE = 'b'.repeat(40);
 const FILE = 'src/x.test.ts';
 const summary = (rc: number, ran = true) => ({ rc, output: `3 pass\n0 fail\n${ran ? 'Ran 3 tests across 1 file.\n' : ''}` });
 
-function gateFixture(cutRc: number, baseRc: number, cutRan = true) {
+function gateFixture(cutRc: number, baseRc: number, cutRan = true, options: { podDigest?: string; podDigests?: Record<string, string>; cleanPod?: boolean; pool?: string } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'gate-method-verdict-'));
   scratch.push(root);
   const repo = join(root, 'repo');
@@ -90,16 +93,23 @@ function gateFixture(cutRc: number, baseRc: number, cutRan = true) {
     return { rc: 0, output: '' };
   };
   const podImageCommits: Array<string | null | undefined> = [];
-  const podCommand: Parameters<typeof createGateRunner>[3] = async (options) => {
-    podImageCommits.push(options.imageCommit);
+  const podCommand: Parameters<typeof createGateRunner>[3] = async (podOptions) => {
+    podImageCommits.push(podOptions.imageCommit);
     const dir = join(root, 'job');
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'shard.log'), `${FILE}:\n(fail) A [1.00ms]\n2 pass\n1 fail\nRan 3 tests across 1 file.\n`);
-    writeFileSync(join(dir, 'shard.rc'), '1\n');
+    writeFileSync(join(dir, 'shard.log'), options.cleanPod
+      ? `${FILE}:\n(pass) A [1.00ms]\n3 pass\n0 fail\nRan 3 tests across 1 file.\n`
+      : `${FILE}:\n(fail) A [1.00ms]\n2 pass\n1 fail\nRan 3 tests across 1 file.\n`);
+    writeFileSync(join(dir, 'shard.rc'), options.cleanPod ? '0\n' : '1\n');
     return { exitCode: 0, artifactsDir: dir, job: 'fake' };
   };
+  const pool = options.pool ?? 'pool-test:1';
+  const members = pool.split(',').map((spec) => spec.trim().split(/[@:#]/, 1)[0]!).filter(Boolean);
   const runner = createGateRunner(repo, undefined, command, podCommand,
-    new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+    new PodPoolScheduler(members.map((context) => ({ context, capacity: 1, k3dCluster: context })), {
+      status: () => ({ recommended: 1 } as never), occupancy: () => ({}), memberMemory: () => [],
+    }), undefined,
+    options.podDigest || options.podDigests ? { podImageDigest: ({ host }) => options.podDigests?.[host] ?? options.podDigest ?? null } : undefined);
   // These cases exercise the host's isolated-output and cache classification.
   // The fake Pod only supplies sweep artifacts, not final recheck artifacts.
   runner.recheckPod = undefined;
@@ -109,7 +119,7 @@ function gateFixture(cutRc: number, baseRc: number, cutRan = true) {
   runner.remove = async () => {};
   runner.removeSnapshot = async () => {};
   return { root, runner, podImageCommits, opts: { commit: CUT, version: '0.2.24', baselineVersion: '0.2.23', baselineCommit: BASE,
-    repo, instanceRoot: root, ledgerRoot: root, pod: { pool: 'pool-test', shards: 1 } } };
+    repo, instanceRoot: root, ledgerRoot: root, pod: { pool, shards: 1 } } };
 }
 
 test('cut and baseline rc 1 with zero failures are preexisting, not a gate error; cache retains the id', async () => {
@@ -132,6 +142,45 @@ test('cut-commit policy pins the gate Pod image to the checked-out cut SHA', asy
   const result = await judgeGate({ ...opts, imagePin: 'cut-commit' }, runner);
   expect(result.outcome).toBe('ok');
   expect(podImageCommits).toContain(CUT);
+});
+
+test('GATE-IMAGE-PREBUILD-AT-CUT sim: judgeGate consumes the cut pin without syncing images again', async () => {
+  const digest = `sha256:${'a'.repeat(64)}`;
+  const otherDigest = `sha256:${'b'.repeat(64)}`;
+  const members = [{ context: 'pool-a' }, { context: 'pool-b' }];
+  const { root, runner, opts } = gateFixture(0, 0, true, { pool: 'pool-a:1,pool-b:1', podDigests: { 'pool-b': digest, unobserved: digest }, cleanPod: true });
+  const graphRunId = 'gate-image-prebuilt-run';
+  const image = `${podCommandImageFor([], true).split(':')[0]}:${CUT.slice(0, 12)}`;
+  const built = new Map<string, string | null>();
+  await prebuildGateImagePinAtCut({ root, version: opts.version, runId: graphRunId, commit: CUT, image, members,
+    probe: (member) => built.get(member.context) ?? null,
+    sync: async () => { for (const member of members) built.set(member.context, digest);
+      return new Map(members.map((member) => [member.context, { ok: true }])); },
+  });
+  let syncCalls = 0;
+  const pinEvents: Array<Record<string, unknown>> = [];
+  let sweepPinDigest: string | undefined;
+  let sweepPool: string | undefined;
+  const originalSweep = runner.sweep.bind(runner);
+  runner.sweep = async (tree, logDir, pod, only, control) => {
+    sweepPinDigest = pod?.pinnedImageDigest;
+    sweepPool = pod?.pool;
+    return originalSweep(tree, logDir, pod, only, control);
+  };
+  const debugSpy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate' && event === 'image-pin') pinEvents.push(data as Record<string, unknown>);
+  });
+  try {
+    const result = await judgeGate({ ...opts, graphRunId }, runner, (spec) => spec.startsWith('pool-a') ? otherDigest : digest, () => ({
+      bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'test', baseImageDigest: digest, imageDigest: digest,
+    }), async () => { syncCalls++; return new Map(); });
+    expect(result.error).toBeUndefined();
+    expect(result.outcome).toBe('ok');
+  } finally { debugSpy.mockRestore(); }
+  expect(syncCalls).toBe(0);
+  expect(sweepPinDigest).toBe(digest);
+  expect(sweepPool).toBe('pool-b:1');
+  expect(pinEvents).toContainEqual(expect.objectContaining({ decision: 'resume-pinned', pinnedDigest: digest }));
 });
 
 test('baseline clean rc 0 leaves the cut rc-only failure introduced', async () => {

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from './llm/tool-spec.js';
 // OR-TOOLARGS-REPAIR (2026-10-10) — OpenRouter tool-call arguments that are not valid JSON
 // (truncated at the output limit, or malformed) must NOT run the tool with `{}`.
 //   · OpenRouter: broken args → tool_call carries `argsInvalid` → the tool loop does not dispatch,
@@ -8,10 +9,7 @@
 // Fake fetch via spyOn (never mock.module) · no network.
 import { expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
-import {
-  buildInvalidToolArgsMessage, getProviderForConfig, parseOpenAISSELines, streamLLMWithTools,
-  type LLMMessage, type LLMProvider, type LLMStreamEvent, type LLMToolSpec,
-} from './llm.js';
+import { buildInvalidToolArgsMessage, getProviderForConfig, parseOpenAISSELines, streamLLMWithTools, type LLMMessage, type LLMProvider, type LLMStreamEvent } from './llm.js';
 import type { UserConfig } from './user-config.js';
 
 const tools: LLMToolSpec[] = [{ name: 'Write', description: 'write', parameters: { type: 'object', properties: { file_path: { type: 'string' } } } }];

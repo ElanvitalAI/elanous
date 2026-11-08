@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.6 P1: RootCauseAnalyze (5-Why) LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   buildWhyChain,
   renderWhyChain,

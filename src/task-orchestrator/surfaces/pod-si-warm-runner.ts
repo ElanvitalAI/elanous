@@ -357,17 +357,26 @@ function maintenance(verb: string, raw: unknown): { status?: number | null; stdo
 if (import.meta.main) {
   const verb = process.argv[2];
   if (verb === '--probe') {
+    const requestedSourceSha = process.argv[3] ?? '';
+    const requestedLockHash = process.argv[4] ?? '';
     const head = git(['rev-parse', 'HEAD']);
     const status = git(['status', '--porcelain', '--untracked-files=no']);
+    const requestedCommit = SHA.test(requestedSourceSha)
+      ? git(['rev-parse', '--verify', '--end-of-options', `${requestedSourceSha}^{commit}`]) : { status: 1, stdout: '' };
+    const requestedLock = requestedCommit.status === 0
+      ? git(['show', `${requestedSourceSha}:bun.lock`]) : { status: 1, stdout: '' };
+    const requestedLockMatches = requestedLock.status === 0
+      && siWarmSha256(Buffer.from(requestedLock.stdout)) === requestedLockHash;
     const ready = process.platform === 'linux' && head.status === 0
       && head.stdout.trim() === process.env.WARM_CUT_SHA
       && existsSync(join(REPO, 'bun.lock'))
       && siWarmSha256(readFileSync(join(REPO, 'bun.lock'))) === process.env.WARM_LOCK_HASH
+      && requestedLockMatches
       && status.status === 0 && status.stdout.trim() === ''
       && !existsSync(join(CONTROL, 'si-active')) && !existsSync(join(CONTROL, 'quarantine'));
     process.stdout.write(JSON.stringify({ protocol: 'si-v1', runner: ready ? 'ready' : 'unavailable',
       workerId: process.env.WARM_WORKER_ID ?? null, podUid: process.env.WARM_POD_UID ?? null,
-      sourceSha: process.env.WARM_CUT_SHA ?? null }));
+      sourceSha: process.env.WARM_CUT_SHA ?? null, requestedSourceSha, requestedLockHash }));
     if (!ready) process.exitCode = 2;
   } else if (verb) {
     try { process.stdout.write(JSON.stringify(maintenance(verb, JSON.parse(await Bun.stdin.text())))); }

@@ -100,6 +100,8 @@ export interface ActionPickerViewOpts {
   framed?: boolean;
 }
 
+export type ActionPickerViewFactory = typeof createActionPickerView;
+
 /** Recipe spec as consumed by the normalize + view path: `placement`
  *  is only needed by the mount path (buildActionPicker), so it is
  *  optional here. This lets the view-only entry points
@@ -1027,7 +1029,7 @@ export function createDockMenuTreeRecipe(opts: DockMenuTreeRecipeOpts): ViewSurf
     onCancel: opts.onCancel,
     theme: parentTheme,
     shadow: opts.shadow,
-  });
+  }, createActionPickerView);
 
   const childView = (): View => {
     const metrics = childMetrics();
@@ -1051,7 +1053,7 @@ export function createDockMenuTreeRecipe(opts: DockMenuTreeRecipeOpts): ViewSurf
       onCancel: opts.onCancel,
       theme: childTheme,
       shadow: opts.shadow,
-    });
+    }, createActionPickerView);
   };
 
   return mountSubmenuPopupPairSurface({

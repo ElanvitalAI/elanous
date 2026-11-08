@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { CHAT_DEFAULTS } from '../src/user-config.js';
+import { CHAT_DEFAULTS } from '../src/user-config/chat.js';
 import { renderToolResultVariants } from '../src/chat/tool-render/index.js';
 import { resolveToolBlockLineBudget } from '../src/chat/tool-render/block.js';
 import type { ToolRenderName } from '../src/chat/tool-render/types.js';

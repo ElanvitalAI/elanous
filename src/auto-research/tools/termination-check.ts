@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S4 P4: TerminationCheck LLM tool ──
 //
 // Evaluates the termination DSL AST against the live goal state.
@@ -12,7 +13,7 @@
 // YAML for nested rule trees.
 
 import { existsSync, readFileSync } from 'node:fs';
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   discoverObsidianVault,
   parseFrontmatter,

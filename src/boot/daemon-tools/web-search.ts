@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // MVP M1.5 A.2 — WebSearch tool (daemon side).
 //
 // Thin adapter over the existing `src/web-search/searchWeb()`
@@ -8,7 +9,7 @@
 // shape so headless callers (PWA · iPhone Shortcut · Telegram ·
 // remote TUI) get a predictable contract.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { searchWeb, WebSearchUnavailableError } from '../../web-search/index.js';
 
 import { ToolSafetyError, type DaemonToolDispatchCtx } from './types.js';

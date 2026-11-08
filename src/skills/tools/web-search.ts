@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── web_search native tool ──
 //
 // Model-facing tool that routes through the provider registry in
@@ -6,7 +7,7 @@
 // no-opping — the model should surface that to the user rather than
 // hallucinate around it.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { searchWeb, WebSearchUnavailableError } from '../../web-search/index.js';
 
 export interface WebSearchArgs {

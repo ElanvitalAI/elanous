@@ -13,6 +13,14 @@ export {
   setSecretAsync,
   deleteSecretAsync,
   listSecretIdsAsync,
+  // Shared credential slots (typed writer and metadata-only inventory)
+  setCredentialSlotAsync,
+  setCredentialSlotBatchAsync,
+  deleteCredentialSlotAsync,
+  listCredentialSlotsAsync,
+  parseCredentialSlotId,
+  type CredentialSlotId,
+  type CredentialSlotStatus,
   // Sync (legacy / file backend only)
   getSecret,
   setSecret,

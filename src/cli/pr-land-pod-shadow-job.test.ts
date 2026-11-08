@@ -78,6 +78,7 @@ test('PRLAND-SHADOW-HOST-TIMEOUT: landing resumes after real runner deletes Job 
   const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool' };
   const pool = new PodPoolScheduler([member]);
   const commands: string[][] = [];
+  let jobLabels: Record<string, string> | undefined;
   const warnings: string[] = [];
   const local: LandingPodShadowVerdict = { measured: true, ok: true, rootPlan: { mode: 'full', roots: null, promoted: true, reason: 'promoted' } };
   const result = await runHeavyOnPodShadow({ enabled: true, pr: 77, head, local,
@@ -87,7 +88,14 @@ test('PRLAND-SHADOW-HOST-TIMEOUT: landing resumes after real runner deletes Job 
         expect(options.provenance).toMatchObject({ actorKind: 'loop', actor: 'pr-land-shadow',
           kind: 'land-shadow', run: head, phase: 'land-shadow', entrance: 'pr-land', commit: head });
         return runPodCommand({ ...options, name: 'shadow-integration', poolScheduler: pool,
-        kubectl: (args) => { commands.push([...args]); return { status: 0, stdout: '', stderr: '' }; },
+        kubectl: (args, input) => {
+          commands.push([...args]);
+          if (args.includes('apply') && input) {
+            const resource = JSON.parse(input) as { kind?: string; spec?: { template?: { metadata?: { labels?: Record<string, string> } } } };
+            if (resource.kind === 'Job') jobLabels = resource.spec?.template?.metadata?.labels;
+          }
+          return { status: 0, stdout: '', stderr: '' };
+        },
         syncImages: async () => new Map([[member.context, { ok: true, action: 'fresh' as const, detail: 'ready', ms: 1 }]]),
         sleep: async () => { fireTimeout!(); }, ghToken: () => 'test-token', imageCommit: null,
         env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-command-shadow-integration', log: () => {},
@@ -98,7 +106,14 @@ test('PRLAND-SHADOW-HOST-TIMEOUT: landing resumes after real runner deletes Job 
   });
   expect(result).toBe(local);
   expect(warnings).toEqual([`pod shadow: host timeout after ${LANDING_POD_SHADOW_HOST_TIMEOUT_MS}ms`]);
-  expect(commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('shadow-integration'))).toHaveLength(1);
+  const cleanup = commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('--wait=false'));
+  expect(cleanup).toHaveLength(1);
+  const job = jobLabels?.['elanous.job'];
+  const launch = jobLabels?.['elanous.launch'];
+  expect(job).toBe('shadow-integration');
+  expect(launch).toEqual(expect.any(String));
+  const selectorIndex = cleanup[0]!.indexOf('-l');
+  expect(cleanup[0]![selectorIndex + 1]).toBe(`elanous.job=${job},elanous.launch=${launch}`);
   expect(commands.some((args) => args.includes('delete') && args.includes('secret'))).toBe(true);
   expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
 });

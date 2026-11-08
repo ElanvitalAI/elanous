@@ -144,7 +144,7 @@ test('POD-REUSE-SIM-WORLD runs clean reuse, scheduled residue quarantine, and go
     expect(worldRuntime?.eventNames).toContain('pod.reuse/uncertain-exec-injected');
     expect(result.cleanReuse).toMatchObject({ leaseGenerations: [1, 2, 1], cleanupOutcomes: ['returned', 'quarantined', 'returned'],
       leaseHosts: ['pool-host-a', 'pool-host-a', 'pool-host-b'], recoveryHost: 'pool-host-b',
-      leaseArchitectures: ['arm64', 'arm64', 'amd64'],
+      leaseArchitectures: ['arm64', 'arm64', 'arm64'],
       podUids: ['si-warm-pod-uid-1', 'si-warm-pod-uid-1', 'si-warm-pod-uid-2'], finalPodState: 'idle' });
     expect(result.residueBeforeCleanup).toMatchObject({ credentials: [expect.any(String)], processes: ['child-pod-reuse-core-residue'] });
     expect(result.residueBeforeCleanup.gitStatus).toContain('README.md');

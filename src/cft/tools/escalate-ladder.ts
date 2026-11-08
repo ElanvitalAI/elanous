@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.10 P1: EscalateLadder LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   escalateLadder,
   renderEscalateLadder,

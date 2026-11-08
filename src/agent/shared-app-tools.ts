@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // 공통 앱 tool 단일 조립기 — turn 조립기 통일 Phase 0 (2026-07-22)
 //
 // 종전 3 조립기(telegram makeElanousAgentRunTurn · CLI buildCliAgentTools · daemon toolSurface)가
@@ -20,7 +21,7 @@ import type { SkillExecArgs } from '../tool-runtime/skill-exec-runtime.js';
 import { buildElanousSkillsListTool, dispatchElanousSkillsList } from '../tool-runtime/elanous-skills-list-runtime.js';
 import type { ElanousSkillsListArgs } from '../tool-runtime/elanous-skills-list-runtime.js';
 import type { UserConfig } from '../user-config.js';
-import type { LLMToolSpec } from '../llm.js';
+
 
 export interface SharedAppTools {
   specs: LLMToolSpec[];

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Command } from 'commander';
@@ -8,7 +9,10 @@ import { runSelfGateCli, selectGateTestFiles, type SelfGateCliOptions, type Self
 import { GATE_CALLER_TEST_LIMIT } from '../self-implement/gate-scope.js';
 import { GATE_REMOTE_DEFAULTS, type DispatchDeps, type DispatchOptions, type GateRemoteRunner } from '../self-implement/gate-remote.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
-import { judgeGate, type GateRunner } from '../../scripts/release-loop/gate-node.js';
+import { createGateRunner, judgeGate } from '../../scripts/release-loop/gate-node.js';
+import { PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
+import { gateBaselineReceipt, gateEnvFingerprint } from '../../scripts/release-loop/gate-baseline-receipt.js';
+import { gateShardLedgerPath, readGateShardLedger } from './gate-shard-ledger.js';
 import { LIGHT_RC_ALWAYS_FILE, LIGHT_RC_UNKNOWN_HOST, formatLightRc, parseAlwaysIncludeList, resolveMeasuredCommit, runLightRc, type LightRcDeps } from './light-rc.js';
 
 const REPO = resolve(import.meta.dir, '../..');
@@ -135,7 +139,8 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     const result = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', ledgerRoot: '/release-ledger', log: () => {} }, setup.deps);
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({ commit: MAIN_SHA, baselineCommit: MAIN_SHA, executor: 'host', remote: 'minim5', full: true,
-      repo: REPO, instanceRoot: expect.stringContaining('elanous-light-rc-host-gate-'), ledgerRoot: '/release-ledger' });
+      repo: REPO, instanceRoot: expect.stringContaining('elanous-light-rc-host-gate-'),
+      ledgerRoot: expect.stringContaining('elanous-light-rc-host-gate-'), scratchOnly: true });
     expect(setup.dispatched).toHaveLength(0);
     expect(result).toMatchObject({ version: '0.2.19', base: MAIN_SHA, measuredCommit: MAIN_SHA, introduced: 0,
       preexisting: 0, unclassified: 0, remote: 'minim5', gateExitCode: 0, ok: true, unmeasured: null });
@@ -153,37 +158,182 @@ describe('runLightRc (LIGHT-RC ⑶)', () => {
     const explicitLedger = tempRepo();
     const defaultLedger = tempRepo();
     const ids = ['boot', 'prompt', 'status-bar', 'help-opens', 'help-closes', 'no-error-text'];
-    const runner: GateRunner = {
-      command: async (cmd, args) => cmd === 'sh' ? { rc: 0, output: '/home/remote\n' }
-        : cmd === 'test' ? { rc: 0, output: '' }
-          : cmd === 'mktemp' ? { rc: 0, output: '/tmp/release-gate-proof\n' }
-            : cmd === 'git' && args[0] === 'ls-files' ? { rc: 0, output: 'src/a.test.ts\0' }
-              : cmd === 'git' && args.includes('rev-parse') ? { rc: 0, output: 'true\n' }
-                : cmd === 'git' && args.includes('show-ref') ? { rc: 1, output: '' } : { rc: 0, output: '' },
-      localCommand: async (_cmd, args) => args[0] === 'scripts/release-loop/tui-sim-node.ts'
-        ? { rc: 0, output: JSON.stringify({ commit: MAIN_SHA, verdict: 'pass', attempts: 1,
-          checks: ids.map((id) => ({ id, pass: true, detail: 'ok' })), regress: { unmeasured: 'fixture' } }) }
-        : { rc: 0, output: '' },
-      sweep: async () => ({ rc: 0, output: 'src/a.test.ts:\n(pass) sample [1.00ms]\n\n1 pass\n0 fail\nRan 1 tests across 1 files.\n' }),
-      add: async () => {}, remove: async () => {}, snapshot: async () => {}, removeSnapshot: async () => {},
-    };
+    const gateRepo = tempRepo();
+    mkdirSync(join(gateRepo, 'src'), { recursive: true });
+    mkdirSync(join(gateRepo, 'release'), { recursive: true });
+    mkdirSync(join(gateRepo, 'test'), { recursive: true });
+    mkdirSync(join(gateRepo, 'scripts'), { recursive: true });
+    writeFileSync(join(gateRepo, 'test/discovery.test.ts'), "test('fixture discovery', () => expect(true).toBe(true));\n");
+    writeFileSync(join(gateRepo, 'scripts/discovery.ts'), 'export {};\n');
+    writeFileSync(join(gateRepo, 'package.json'), '{"name":"light-rc-receipt-fixture","version":"0.2.18"}\n');
+    writeFileSync(join(gateRepo, 'src/a.test.ts'), "test('a', () => expect(true).toBe(true));\n");
+    writeFileSync(join(gateRepo, LIGHT_RC_ALWAYS_FILE), '');
+    const gateGit = (args: string[], cwd = gateRepo) => spawnSync('git', args, { cwd, encoding: 'utf8' });
+    gateGit(['init', '-q']); gateGit(['config', 'user.name', 'Census receipt test']); gateGit(['config', 'user.email', 'census@test']);
+    gateGit(['add', '.']); gateGit(['commit', '-qm', 'light rc receipt fixture']);
+    const gateCommitResult = gateGit(['rev-parse', 'HEAD']);
+    const gateCommit = gateCommitResult.stdout.trim();
+    const executionIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64',
+      envFingerprint: gateEnvFingerprint(process.env), baseImageDigest: `sha256:${'a'.repeat(64)}` };
+    let podRuns = 0;
+    const runner = createGateRunner(gateRepo, undefined, async (cmd, args, cwd) => {
+      if (args[0] === 'scripts/release-loop/tui-sim-node.ts') return { rc: 0, output: JSON.stringify({ commit: gateCommit,
+        verdict: 'pass', attempts: 1, checks: ids.map((id) => ({ id, pass: true, detail: 'ok' })), regress: { unmeasured: 'fixture' } }) };
+      if (cmd === 'bun' && args[0] === 'install') return { rc: 0, output: 'fixture dependencies already provisioned\n' };
+      const simulatedArgs = cmd === 'git' && args[0] === 'push' && args[1]?.startsWith('minim5:')
+        ? [args[0], `file://${args[1].slice('minim5:'.length)}`, ...args.slice(2)] : args;
+      const result = spawnSync(cmd, simulatedArgs, { cwd, encoding: 'utf8' });
+      return { rc: result.error ? 2 : result.status ?? 2, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+    }, async () => {
+      const artifactsDir = mkdtempSync(join(tmpdir(), 'light-rc-pod-proof-'));
+      dirs.push(artifactsDir);
+      const output = '1 pass\n0 fail\n0 errors\nRan 1 tests across 1 files.\n';
+      const junit = '<testsuites><testsuite file="src/a.test.ts" tests="1"><testcase name="passes" file="src/a.test.ts"/></testsuite></testsuites>';
+      writeFileSync(join(artifactsDir, 'shard.log'), output);
+      writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+      writeFileSync(join(artifactsDir, 'junit.xml'), junit);
+      writeFileSync(join(artifactsDir, 'part-0.junit.xml'), junit);
+      writeFileSync(join(artifactsDir, 'runtime-identity.json'), JSON.stringify(executionIdentity));
+      return { exitCode: 0, artifactsDir, job: `light-rc-pod-${++podRuns}`, context: 'receipt-test' };
+    }, new PodPoolScheduler([{ context: 'receipt-test', sshHost: 'sim-remote', capacity: 1, k3dCluster: 'receipt-test' }]), undefined,
+    { podImageDigest: () => executionIdentity.baseImageDigest,
+      remoteRun: (_host, script) => ({ status: 0, stdout: script === 'uname -s' ? 'Linux\n' : '', stderr: '' }),
+      kubectl: () => ({ status: 1, stdout: '', stderr: 'mock' }) });
+    runner.localCommand = runner.command;
     const actualJudgeGate = judgeGate;
-    const deps: LightRcDeps = { ...localDeps().deps, formalHostGateRunner: runner,
-      runFormalHostGate: (options, injectedRunner) => actualJudgeGate(options, injectedRunner) };
-    const result = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', rehearsalTui: true,
-      ledgerRoot: explicitLedger, log: () => {} }, deps);
+    const graphRunId = 'light-rc-receipt-inherit-sim';
+    let simulateCopyFailure = false;
+    let copyFailureRoot: string | undefined;
+    let simulateInvalidFailureRecord = false;
+    let scratchReceipt: Record<string, unknown> | undefined;
+    let scratchFailures: Record<string, unknown> | undefined;
+    const deps: LightRcDeps = { cwd: gateRepo, git: (args, cwd) => {
+      const result = gateGit(args, cwd);
+      return { rc: result.error ? null : result.status, stdout: result.stdout ?? '' };
+    }, previousVersion: () => '0.2.18', gatePodPool: 'receipt-test@sim-remote:1', formalHostGateRunner: runner,
+      runFormalHostGate: async (options, injectedRunner) => {
+        const gateResult = await actualJudgeGate(options, injectedRunner, () => executionIdentity.baseImageDigest);
+        const scratchVerdictPath = join(options.instanceRoot!, 'release', '0.2.19', 'gate-verdict.json');
+        if (!existsSync(scratchVerdictPath)) throw new Error(`judgeGate did not write verdict: ${gateResult.error ?? gateResult.outcome}`);
+        const storedVerdict = JSON.parse(readFileSync(scratchVerdictPath, 'utf8')) as Record<string, unknown>;
+        scratchReceipt = storedVerdict.baselineReceipt as Record<string, unknown>;
+        const failuresPath = join(options.instanceRoot!, 'release', '0.2.19', 'gate-failures.json');
+        if (!existsSync(failuresPath)) throw new Error(`gate failures missing; outcome=${gateResult.outcome}; error=${gateResult.error ?? 'none'}; verdict=${JSON.stringify(storedVerdict)}`);
+        scratchFailures = JSON.parse(readFileSync(failuresPath, 'utf8'));
+        if (simulateInvalidFailureRecord)
+          writeFileSync(join(options.instanceRoot!, 'release', '0.2.19', 'gate-failures.json'), JSON.stringify({
+            commit: gateCommit, failures: [], errors: null,
+          }));
+        if (simulateCopyFailure && copyFailureRoot) {
+          const receiptRoot = join(copyFailureRoot, 'release', '0.2.19');
+          mkdirSync(receiptRoot, { recursive: true });
+          writeFileSync(join(receiptRoot, 'light-rc-receipts'), 'blocks directory creation');
+        }
+        return gateResult;
+      } };
+    const graphRunDir = join(explicitLedger, 'graph-runs', 'release-loop');
+    mkdirSync(graphRunDir, { recursive: true });
+    writeFileSync(join(graphRunDir, `${graphRunId}.json`), JSON.stringify({
+      graphId: 'release-loop', runId: graphRunId,
+      graphSnapshot: { graphSha: 'b'.repeat(64), recipesSha: 'c'.repeat(64) },
+    }));
+    const legacyCut = join(explicitLedger, 'release', '0.2.19', 'gate-logs', 'cut');
+    mkdirSync(legacyCut, { recursive: true });
+    writeFileSync(join(legacyCut, 'preserve-me.txt'), 'old cut remains readable');
+    const result = await runLightRc('0.2.19', { base: gateCommit, head: gateCommit, remote: 'minim5', rehearsalTui: true,
+      ledgerRoot: explicitLedger, graphRunId, log: () => {} }, deps);
     expect(result).toMatchObject({ remote: 'minim5', gateExitCode: 0, ok: true, rehearsalTui: { outcome: 'ok' } });
+    expect(podRuns).toBeGreaterThan(0);
+    const hqShardLedger = readGateShardLedger(gateShardLedgerPath('0.2.19', explicitLedger));
+    expect(hqShardLedger?.trailingPartial).toBe(false);
+    expect(hqShardLedger?.rows.some((row) => row.batchId && row.state === 'done')).toBe(true);
+    expect(scratchReceipt).toMatchObject({ valid: true, executionIdentity });
+    expect(scratchFailures).toMatchObject({ commit: gateCommit, failures: [] });
     expect(JSON.parse(readFileSync(join(explicitLedger, 'release', '0.2.19', 'gate-verdict.json'), 'utf8')))
-      .toMatchObject({ commit: MAIN_SHA, outcome: 'ok', baselineReceipt: { valid: false, commit: MAIN_SHA,
-        reason: 'pinned graph or recipe SHA absent' } });
+      .toMatchObject({ commit: gateCommit, outcome: 'ok', baselineReceipt: { valid: true, commit: gateCommit,
+        executionIdentity } });
+    const persistedVerdict = JSON.parse(readFileSync(join(explicitLedger, 'release', '0.2.19', 'gate-verdict.json'), 'utf8')) as {
+      baselineReceipt: { artifactPath?: string };
+    };
+    expect(persistedVerdict.baselineReceipt.artifactPath).toMatch(/^release\/0\.2\.19\/light-rc-receipts\//);
+    const retainedPodLog = join(explicitLedger, persistedVerdict.baselineReceipt.artifactPath!, 'gate-logs', 'cut', 'pod-0.json');
+    expect(existsSync(retainedPodLog)).toBe(true);
+    expect(existsSync(join(explicitLedger, persistedVerdict.baselineReceipt.artifactPath!, 'gate-failures.json'))).toBe(true);
+    expect(readFileSync(join(legacyCut, 'preserve-me.txt'), 'utf8')).toBe('old cut remains readable');
+    expect(gateBaselineReceipt({ root: explicitLedger, version: '0.2.19', commit: gateCommit, fullSweep: true,
+      graphPins: { graphSha: 'b'.repeat(64), recipeSha: 'c'.repeat(64) }, envFingerprint: executionIdentity.envFingerprint,
+      artifactPath: persistedVerdict.baselineReceipt.artifactPath }))
+      .toMatchObject({ valid: true, executionIdentity });
+
+    const copyFailureLedger = tempRepo();
+    mkdirSync(join(copyFailureLedger, 'graph-runs', 'release-loop'), { recursive: true });
+    writeFileSync(join(copyFailureLedger, 'graph-runs', 'release-loop', `${graphRunId}.json`), JSON.stringify({
+      graphId: 'release-loop', runId: graphRunId,
+      graphSnapshot: { graphSha: 'b'.repeat(64), recipesSha: 'c'.repeat(64) },
+    }));
+    simulateCopyFailure = true;
+    copyFailureRoot = copyFailureLedger;
+    try {
+      const copyFailure = await runLightRc('0.2.19', { base: gateCommit, head: gateCommit, remote: 'minim5',
+        ledgerRoot: copyFailureLedger, graphRunId, log: () => {} }, deps);
+      expect(copyFailure.ok).toBe(true);
+      expect(existsSync(join(copyFailureLedger, 'release', '0.2.19', 'gate-verdict.json'))).toBe(false);
+    } finally { simulateCopyFailure = false; copyFailureRoot = undefined; }
+
+    const invalidFailureLedger = tempRepo();
+    mkdirSync(join(invalidFailureLedger, 'graph-runs', 'release-loop'), { recursive: true });
+    writeFileSync(join(invalidFailureLedger, 'graph-runs', 'release-loop', `${graphRunId}.json`), JSON.stringify({
+      graphId: 'release-loop', runId: graphRunId,
+      graphSnapshot: { graphSha: 'b'.repeat(64), recipesSha: 'c'.repeat(64) },
+    }));
+    simulateInvalidFailureRecord = true;
+    try {
+      const invalidFailure = await runLightRc('0.2.19', { base: gateCommit, head: gateCommit, remote: 'minim5',
+        ledgerRoot: invalidFailureLedger, graphRunId, log: () => {} }, deps);
+      expect(invalidFailure.ok).toBe(true);
+      expect(existsSync(join(invalidFailureLedger, 'release', '0.2.19', 'gate-verdict.json'))).toBe(false);
+    } finally { simulateInvalidFailureRecord = false; }
+
+    const concurrentLedger = tempRepo();
+    mkdirSync(join(concurrentLedger, 'graph-runs', 'release-loop'), { recursive: true });
+    writeFileSync(join(concurrentLedger, 'graph-runs', 'release-loop', `${graphRunId}.json`), JSON.stringify({
+      graphId: 'release-loop', runId: graphRunId,
+      graphSnapshot: { graphSha: 'b'.repeat(64), recipesSha: 'c'.repeat(64) },
+    }));
+    const incompleteReads: string[] = [];
+    const observe = setInterval(() => {
+      const verdictPath = join(concurrentLedger, 'release', '0.2.19', 'gate-verdict.json');
+      if (!existsSync(verdictPath)) return;
+      try {
+        const observed = JSON.parse(readFileSync(verdictPath, 'utf8')) as { baselineReceipt?: { valid?: boolean; artifactPath?: string } };
+        const artifact = observed.baselineReceipt?.artifactPath;
+        if (observed.baselineReceipt?.valid !== true || !artifact
+          || !existsSync(join(concurrentLedger, artifact, 'gate-logs', 'cut', 'pod-0.json'))
+          || !existsSync(join(concurrentLedger, artifact, 'gate-failures.json'))) incompleteReads.push('incomplete receipt view');
+      } catch { incompleteReads.push('unreadable verdict'); }
+    }, 0);
+    try {
+      await Promise.all([1, 2].map(() => runLightRc('0.2.19', { base: gateCommit, head: gateCommit, remote: 'minim5',
+        ledgerRoot: concurrentLedger, graphRunId, log: () => {} }, deps)));
+    } finally { clearInterval(observe); }
+    expect(incompleteReads).toEqual([]);
+    const concurrentVerdict = JSON.parse(readFileSync(join(concurrentLedger, 'release', '0.2.19', 'gate-verdict.json'), 'utf8')) as {
+      baselineReceipt: { valid: boolean; artifactPath?: string };
+    };
+    const publishedBundles = readdirSync(join(concurrentLedger, 'release', '0.2.19', 'light-rc-receipts'));
+    expect(publishedBundles).toHaveLength(2);
+    expect(publishedBundles.every((bundle) => existsSync(join(concurrentLedger, 'release', '0.2.19', 'light-rc-receipts', bundle,
+      'gate-logs', 'cut', 'pod-0.json')) && existsSync(join(concurrentLedger, 'release', '0.2.19', 'light-rc-receipts', bundle,
+      'gate-failures.json')))).toBe(true);
+    expect(concurrentVerdict.baselineReceipt.valid).toBe(true);
+    expect(existsSync(join(concurrentLedger, concurrentVerdict.baselineReceipt.artifactPath!, 'gate-logs', 'cut', 'pod-0.json'))).toBe(true);
 
     setElanousConfigDir(defaultLedger);
     try {
-      const defaultResult = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, remote: 'minim5', log: () => {} }, deps);
+      const defaultResult = await runLightRc('0.2.19', { base: gateCommit, head: gateCommit, remote: 'minim5', log: () => {} }, deps);
       expect(defaultResult).toMatchObject({ remote: 'minim5', gateExitCode: 0, ok: true });
-      expect(JSON.parse(readFileSync(join(defaultLedger, 'release', '0.2.19', 'gate-verdict.json'), 'utf8')))
-        .toMatchObject({ commit: MAIN_SHA, outcome: 'ok', baselineReceipt: { valid: false, commit: MAIN_SHA,
-          reason: 'pinned graph or recipe SHA absent' } });
+      expect(existsSync(join(defaultLedger, 'release', '0.2.19', 'gate-verdict.json'))).toBe(false);
+      expect(existsSync(join(defaultLedger, 'release', '0.2.19', 'light-rc-receipts'))).toBe(false);
     } finally { resetElanousConfigDir(); }
   });
 

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── IUL Bundle 8T — StartRecording / StopRecording LLM tools ──
 //
 // Wrap the Bundle 7T `widget-recorder` (src/capture/widget-recorder.ts)
@@ -30,7 +31,7 @@ import {
   type WidgetTimelineFrame,
 } from '../capture/widget-recorder.js';
 import type { WidgetStateChangeEvent } from '../widgets/host.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { registerToolRuntime } from './registry.js';
 import type { ToolRuntime } from './types.js';
 import {

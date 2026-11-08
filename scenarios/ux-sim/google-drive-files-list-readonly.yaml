@@ -1,0 +1,21 @@
+id: GOOGLE-DRIVE-LIST-READONLY
+scope: https://www.googleapis.com/auth/drive.metadata.readonly
+pageSize: 2
+files:
+  - id: file-a
+    name: notes.txt
+    mimeType: text/plain
+    modifiedTime: '2026-11-07T00:00:00.000Z'
+  - id: file-b
+    name: image.png
+    mimeType: image/png
+    modifiedTime: '2026-11-07T00:01:00.000Z'
+  - id: file-c
+    name: plan.pdf
+    mimeType: application/pdf
+    modifiedTime: '2026-11-07T00:02:00.000Z'
+expected:
+  firstPageCount: 2
+  secondPageCount: 1
+  writeStatus: 403
+  mutations: 0

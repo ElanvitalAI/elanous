@@ -240,7 +240,10 @@ describe('provisionDerivedUniverse — 모든 결과를 관측한다', () => {
   function captureObservation<T>(run: () => T): { result: T; calls: Observation[] } {
     const originalLog = debug.log;
     const calls: Observation[] = [];
-    debug.log = ((...args: unknown[]) => { calls.push(args as Observation); }) as typeof debug.log;
+    debug.log = ((...args: unknown[]) => {
+      // Git I/O telemetry is additive; keep the legacy observation contract scoped to its own events.
+      if (args[0] !== 'git-fs.io') calls.push(args as Observation);
+    }) as typeof debug.log;
     try {
       return { result: run(), calls };
     } finally {

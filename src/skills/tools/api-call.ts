@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tool: api_call
 //
 // Generic HTTP JSON tool. Purpose: let the LLM query external APIs
@@ -13,7 +14,7 @@
 //   display   — longer preview for dashboard.
 //   metadata  — status, bytes, durationMs, allow/rate diagnostics.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { debug } from '../../debug/log.js';
 import { consumeRateToken, isAllowed, listAllowed } from '../../tool-hints/api-allowlist.js';
 import { truncateOutput } from '../../output-truncation.js';

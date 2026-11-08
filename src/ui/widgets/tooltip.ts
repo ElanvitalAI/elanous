@@ -21,7 +21,7 @@ import {
 } from '../../theme/tokens.js';
 import { C } from '../../tui.js';
 import type { WidgetChromeSpec } from '../declarative/spec.js';
-import { resolveWidgetChromeBoxViewOptions } from '../declarative/index.js';
+import { resolveWidgetChromeBoxViewOptions } from '../declarative/presentation.js';
 import type { Printer } from '../printer.js';
 import { cellWidth } from '../printer.js';
 import { BoxView, Ignored, TextView, type EventResult, type FocusSource, type Size, type View } from '../view.js';

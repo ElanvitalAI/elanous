@@ -27,6 +27,7 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Option, type Command } from 'commander';
 import { debug } from '../debug/log.js';
+import { codeRevision } from '../version/code-revision.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
@@ -52,7 +53,7 @@ import type { PrereleaseKind } from '../../scripts/release-loop/release-version.
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 import { runReleaseIfReady } from './release-run-if-ready.js';
 import { ReleaseRunClaimConflict, findActiveReleaseRun, readActiveForceReleaseRun, isPidAlive, readReleaseRunLock, withDirectReleaseRunLock, withForceReleaseRunMarker } from './release-single-flight.js';
-import { formatCountdown, formatPreflight, releasePreflight, runReleaseCountdown } from '../../scripts/release-loop/preflight.js';
+import { assertReleaseCliFresh, formatCountdown, formatPreflight, releasePreflight, runReleaseCountdown } from '../../scripts/release-loop/preflight.js';
 import { defaultReleaseGraphRunsRoot, formatPublishProposal, measurePublishWindow, proposePublishAt, publishWindowWarning } from '../../scripts/release-loop/publish-window.js';
 import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-loop/auto-start.js';
 import { runRehearsalTick, type RehearsalDeps } from '../release-loop/rehearsal.js';
@@ -63,6 +64,16 @@ import { applyWatchList, formatGateHistory, gateHistory, ghMergedPrs } from '../
 import { registerRfcCommands } from './rfc-cli.js';
 import { checklistCodenames, checklistVersion, isReleaseVersion, readChecklistContext, registerChecklistReadCommands, type ChecklistEvidenceReader } from './release-checklist-read-cli.js';
 import { syncLinearProgress } from '../decisions/linear-progress-sync.js';
+import { registerReleaseRunStatusCommand } from './release-run-status-cli.js';
+
+/** Pin release-run freshness in tests so child CLIs do not observe a moving origin/main ref. */
+export function releaseCliFreshnessCutRevision(explicitCut: string | undefined, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const explicit = explicitCut?.trim();
+  if (explicit) return explicit;
+  if (env.NODE_ENV !== 'test') return undefined;
+  const testBase = env.ELANOUS_TEST_RELEASE_CLI_FRESHNESS_BASE?.trim();
+  return testBase || undefined;
+}
 
 export { isReleaseVersion } from './release-checklist-read-cli.js';
 
@@ -645,6 +656,7 @@ export function formatResumeGatePlan(mode: 'not-run' | 'partial' | 'full', reaso
 export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}, resumeDeps: RecoverReleaseDeps = {}, checklistEvidenceReader?: ChecklistEvidenceReader): void {
   registerRfcCommands(program);
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
+  registerReleaseRunStatusCommand(release);
   release.command('gate-shards').description('실행 중에도 읽는 게이트 조각 원장(시도·귀속·증거)')
     .requiredOption('--version <v>', '조회할 판').option('--all', '과거 전이와 재시도까지 조회').option('--json', '결과 JSON')
     .action((o: { version: string; all?: boolean; json?: boolean }) => {
@@ -1162,12 +1174,12 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       console.log(renderReleaseNotes(draftReleaseNotes(readLandedCommits(o.from, o.to), o.from, o.to)));
     });
   release.command('cut-branch')
-    .description('원래 컷에 main 의 수리 커밋만 얹은 release/<v> 가지를 만들고 push. --append 는 이미 있는 가지에 fast-forward 로만 더 얹는다')
+    .description('원래 컷에 main 의 수리 커밋만 얹은 release/<v> 가지를 만들고 push. --append --dry-run 은 충돌 import 정의 커밋을 의존 pick 으로 최대 2개 제안한다')
     .requiredOption('--version <v>', '릴리스 판(x.y.z)')
     .option('--base <sha>', '원래 컷 SHA(--append 에서 생략하면 런 원장 version-release 기록이나 release/<v> 끝의 첫 부모에서 스스로 찾는다)')
     .requiredOption('--pick <sha...>', '차례로 얹을 main 커밋 SHA')
     .option('--append', '이미 있는 release/<v> 를 출발점으로 fast-forward push(강제 push 없음)')
-    .option('--dry-run', '가지·worktree·push 없이 계획만 출력')
+    .option('--dry-run', 'push 없이 계획 출력; --append 는 임시 worktree 충돌과 의존 pick 후보도 확인')
     .option('--json', '결과 한 줄 JSON(stdout)')
     .action(async (o: { version: string; base?: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => cutReleaseBranch({ ...o, log }), () => true);
@@ -1188,6 +1200,23 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         else console.error(`⛔ ${publishAtInvalid}`);
         process.exitCode = 1;
         return false;
+      }
+      let branchCutBaseCommit: string | undefined;
+      if (!o.dryRun) {
+        const cliCommit = codeRevision();
+        const freshnessCut = releaseCliFreshnessCutRevision(o.cutCommit);
+        try {
+          const freshness = assertReleaseCliFresh(process.cwd(), cliCommit, freshnessCut);
+          if (o.cutCommit === undefined && !o.mainCut) branchCutBaseCommit = freshness.cutCommit;
+        }
+        catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          debug.log('release.run', 'stale-cli-refused', { version: o.version, cliCommit: cliCommit ?? null, cutCommit: freshnessCut ?? 'origin/main', reason: message });
+          if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, reason: 'stale-cli', error: message })}\n`);
+          else console.error(`⛔ ${message}`);
+          process.exitCode = 1;
+          return false;
+        }
       }
       const ledgerRoot = releaseRunDeps.ledgerRoot ?? releaseLedgerRoot();
       if (!o.dryRun && !o.forceNew) {
@@ -1234,7 +1263,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
             ledgerRoot: releaseRunDeps.ledgerRoot,
             forceNew: o.forceNew,
             readiness: (version, options) => releaseReadiness(version, { ledgerRoot: releaseRunDeps.ledgerRoot, checklist: releaseRunDeps.checklist, ...options }),
-            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps),
+            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps),
           });
           if (outcome.skipped) {
             if (outcome.reason === 'already-running') {
@@ -1271,7 +1300,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         }
       }
       await jsonAction(o.json, async (log) => {
-        const run = () => runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps);
+        const run = () => runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps);
         const forceRun = () => {
           const atStart = releaseReadiness(o.version, { ledgerRoot, checklist: releaseRunDeps.checklist, isPidAlive: () => false });
           if (!atStart.ready) throw new Error(`release run --force-new not ready after claim: ${atStart.reason}`);
@@ -1363,7 +1392,8 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--no-partial', 'GATE-REUSE-BY-DIFF 기본 부분 재검을 끄고 전체 게이트')
     .option('--waive <node>', '저장된 실패 노드 한 개를 면제(--from 은 그 노드 그대로)')
     .option('--owner-waive <node>', '소유자 직권으로 실패 gate를 통과하고 known issue로 기록')
-    .option('--reason <text>', '면제 사유 — 공개 알려진 문제에 들어갈 사용자 영향 설명')
+    .option('--reason <text>', '면제 또는 budget-exceeded 재개 사유')
+    .option('--resume-budget-exceeded', 'budget-exceeded 런을 --reason 사유와 함께 재개하고 실행 카운터를 재설정해 기록')
     .option('--approved-by <identity>', '게이트 면제 승인자 — 기본 ELANOUS_SEAT')
     .option('--accepted-regressions <json>', '알려진 문제 추가 입력 JSON 배열 [{"id":"…","note":"…"}]')
     .option('--gate-executor <pod|host>', '다시 도는 gate 의 실행기 전환(--from gate 이전만) — 런 입력에 기록 · 면제 아님')
@@ -1375,7 +1405,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--command-root <path>', '노드 명령을 실행할 컷 tip checkout(생략 시 현재 폴더)')
     .option('--dry-run', '재개 preflight만 수행하고 런·상태 원장·시도 횟수는 변경하지 않는다')
     .option('--json', '결과 한 줄 JSON(stdout)')
-    .action(async (o: { run: string; from?: string; partial?: boolean; waive?: string; ownerWaive?: string; reason?: string; approvedBy?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
+    .action(async (o: { run: string; from?: string; partial?: boolean; waive?: string; ownerWaive?: string; reason?: string; resumeBudgetExceeded?: boolean; approvedBy?: string; acceptedRegressions?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string; rerouteShard?: string; shardHost?: string; shardOs?: string; commandRoot?: string; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => {
         let acceptedRegressions: AcceptedRegression[] | undefined;
         if (o.acceptedRegressions !== undefined) {
@@ -1387,7 +1417,11 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           }
         }
         if (o.waive !== undefined && !o.waive.trim()) throw new Error('--waive must not be empty');
-        if (o.ownerWaive === undefined && (o.waive === undefined) !== (o.reason === undefined)) throw new Error('--waive <node> and --reason <text> must be supplied together');
+        if (o.resumeBudgetExceeded && (!o.reason?.trim() || o.waive !== undefined || o.ownerWaive !== undefined || o.acceptedRegressions !== undefined))
+          throw new Error('--resume-budget-exceeded requires --reason and cannot be combined with a waiver');
+        if (!o.resumeBudgetExceeded && o.reason !== undefined && o.waive === undefined && o.ownerWaive === undefined)
+          throw new Error('--reason requires --waive/--owner-waive or --resume-budget-exceeded');
+        if (!o.resumeBudgetExceeded && o.ownerWaive === undefined && (o.waive === undefined) !== (o.reason === undefined)) throw new Error('--waive <node> and --reason <text> must be supplied together');
         if (o.shardOs !== undefined && o.shardOs !== 'darwin' && o.shardOs !== 'linux') throw new Error('--shard-os must be darwin or linux');
         const shardOs = o.shardOs as 'darwin' | 'linux' | undefined;
         const from = o.from ?? (o.waive === 'gate' || o.ownerWaive === 'gate' ? 'gate' : undefined);
@@ -1397,6 +1431,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         if (o.ownerWaive !== undefined && !o.approvedBy?.trim()) throw new Error('--owner-waive requires --approved-by');
         if (o.ownerWaive !== undefined && o.waive !== undefined) throw new Error('--owner-waive and --waive are mutually exclusive');
         const resumeOptions = { runId: o.run, from, partial: o.partial, commandRoot: o.commandRoot,
+          ...(o.resumeBudgetExceeded ? { resumeBudgetExceeded: true } : {}),
           ...(o.waive === undefined ? {} : { waive: o.waive }),
           ...(o.ownerWaive === undefined ? {} : { ownerWaive: o.ownerWaive }),
           ...(o.reason === undefined ? {} : { reason: o.reason }),

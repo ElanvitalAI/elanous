@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { afterAll, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -33,19 +33,30 @@ const warmPoolAssemblerInput = (host = 'test-host') => {
 };
 
 const key = { context: 'pool-test-host', imageDigest: `sha256:${'b'.repeat(64)}`, lockHash: 'c'.repeat(64), architecture: 'amd64' };
+const baseImageDigest = `sha256:${'f'.repeat(64)}`;
 const spec: WarmPodSpec = { name: 'warm-test-1', namespace: 'elanous-test', kubectlContext: 'test-host',
   workerId: 'warm-test-1-uid', image: `registry.example/elanous@${key.imageDigest}`,
   sourceUrl: 'https://github.com/ElanvitalAI/elanous.git', cutSha: 'a'.repeat(40), key,
+  runtimeContract: { baseImageDigest, bunVersion: '1.4.2', os: 'linux', architecture: 'amd64', requiredTools: ['bun', 'git'] },
   memoryLimit: '16Gi', hostProbeUrl: 'http://host.orb.internal:10001/health',
   prodProbeUrl: 'http://core.elanous-prod:10002/' };
 const candidate = { host: 'test-host', tier: 'standard' as const, spec };
 const testHostQuota: typeof resolveWarmPoolQuota = (profile, host, tier) =>
   (host === 'test-host' || host === 'test-host-b') ? (tier === 'standard' ? 4 : 0)
     : resolveWarmPoolQuota(profile, host, tier);
+const providerStateRoot = mkdtempSync(join(tmpdir(), 'warm-provider-state-tests-'));
+let providerStateIndex = 0;
+afterAll(() => rmSync(providerStateRoot, { recursive: true, force: true }));
 const newTestWarmPodProvider = (options: ConstructorParameters<typeof WarmPodProvider>[0]) =>
-  new WarmPodProvider({ quotaResolverForTest: testHostQuota, ...options });
+  new WarmPodProvider({ quotaResolverForTest: testHostQuota, ...options,
+    rotationStatePath: options.rotationStatePath ?? join(providerStateRoot, `provider-${++providerStateIndex}.json`) });
 const input = () => ({ protocol: 1 as const, runId: 'run-1', attemptId: 'attempt-1', cutSha: spec.cutSha,
   deadlineAt: Date.now() + 60_000, files: ['src/example/worker.test.ts'], envProfile: 'gate-v1' });
+const gateSelection = (target = key) => ({ kind: 'gate' as const,
+  lockHash: target.lockHash, imageDigest: target.imageDigest,
+  runtimeContract: { baseImageDigest, bunVersion: '1.4.2', os: 'linux' as const,
+    architecture: target.architecture, requiredTools: [] as string[] },
+  runtimeIdentity: { baseImageDigest, lockHash: target.lockHash, os: 'linux', architecture: target.architecture, bunVersion: '1.4.2' } });
 const lease = () => ({ name: spec.workerId, attrs: { key, leaseId: 'lease-1', generation: 1,
   podUid: 'lease-pod-uid', state: 'leased' } });
 const leaseKubectl = (specs: WarmPodSpec[] = [spec]) => {
@@ -54,16 +65,27 @@ const leaseKubectl = (specs: WarmPodSpec[] = [spec]) => {
     uid: 'lease-pod-uid', resourceVersion: '1',
   } }]));
   return (args: readonly string[]) => {
+    if (args[4] === 'get' && args[5] === 'pods') {
+      const selectedName = args.find(arg => arg.startsWith('--field-selector=metadata.name='))?.split('=').at(-1);
+      const pod = selectedName ? pods.get(selectedName) : undefined;
+      const items = pod && pod.metadata.labels['elanous.ai/quarantined'] !== 'true' ? [pod] : [];
+      return { status: 0, stdout: JSON.stringify({ apiVersion: 'v1', kind: 'PodList', items }), stderr: '' };
+    }
     const name = args[6]!;
     const pod = pods.get(name);
     if (!pod) return { status: 1, stdout: '', stderr: 'pod missing' };
     if (args[4] === 'get') return { status: 0, stdout: JSON.stringify(pod), stderr: '' };
     if (args[4] === 'patch') {
-      const patch = JSON.parse(args[args.indexOf('-p') + 1]!) as Array<{ op: string; value: any }>;
+      const patch = JSON.parse(args[args.indexOf('-p') + 1]!) as Array<{ op: string; path?: string; value: any }>;
       if (patch[0]?.value !== pod.metadata.uid || patch[1]?.value !== pod.metadata.resourceVersion)
         return { status: 1, stdout: '', stderr: 'precondition failed' };
-      pod.metadata = { ...pod.metadata, labels: patch[2]!.value, annotations: patch[3]!.value,
-        resourceVersion: String(Number(pod.metadata.resourceVersion) + 1) };
+      if (patch[2]?.path === '/metadata/labels/elanous.ai~1quarantined') {
+        pod.metadata = { ...pod.metadata, labels: { ...pod.metadata.labels, 'elanous.ai/quarantined': patch[2].value },
+          resourceVersion: String(Number(pod.metadata.resourceVersion) + 1) };
+      } else {
+        pod.metadata = { ...pod.metadata, labels: patch[2]!.value, annotations: patch[3]!.value,
+          resourceVersion: String(Number(pod.metadata.resourceVersion) + 1) };
+      }
       return { status: 0, stdout: JSON.stringify(pod), stderr: '' };
     }
     return { status: 1, stdout: '', stderr: 'unexpected kubectl' };
@@ -140,6 +162,7 @@ test('named slots are independently reconciled and bounded by the measured host 
         return result(pod);
       }
       if (args[4] === 'wait') return result({});
+      if (args[4] === 'get' && args[5] === 'pod') return result(pods.get(args[6]!));
       if (args[4] === 'get') return result(pods.get(args[5]!.slice(4)));
       throw new Error(`unexpected ${args.join(' ')}`);
     },
@@ -241,7 +264,8 @@ test('pool occupancy is unmeasured when the lease row is absent or belongs to an
       kubectl: args => {
         if (args[4] === 'get' && args[5] === 'pods') return { status: 0,
           stdout: JSON.stringify({ kind: 'PodList', metadata: {}, items: [pod] }), stderr: '' };
-        if (args[4] === 'get' && args[5] === spec.name) return { status: 0, stdout: JSON.stringify(pod), stderr: '' };
+        if (args[4] === 'get' && args[5] === 'pod' && args[6] === spec.name)
+          return { status: 0, stdout: JSON.stringify(pod), stderr: '' };
         if (args[4] === 'wait') return { status: 0, stdout: '', stderr: '' };
         throw new Error(`unexpected ${args.join(' ')}`);
       },
@@ -514,6 +538,7 @@ test('a pool template defaults to one candidate unless quota expansion is opted 
   const prepare = spyOn(provider, 'ensureStandingWorker').mockImplementation(async row => {
     names.push(row.spec.name); ids.push(row.spec.workerId); return true;
   });
+  (provider as any).readClusterQuarantineState = () => 'available';
   try {
     expect(await provider.reconcilePool()).toMatchObject({ profile: 'gate', target: 1, ready: 1, failed: [] });
     expect(names).toEqual(['warm-test-host-standard-1']);
@@ -535,6 +560,7 @@ test('explicitly opting in expands a pool template to its measured quota', async
   const prepare = spyOn(provider, 'ensureStandingWorker').mockImplementation(async row => {
     names.push(row.spec.name); ids.push(row.spec.workerId); return true;
   });
+  (provider as any).readClusterQuarantineState = () => 'available';
   try {
     expect(await provider.reconcilePool()).toMatchObject({ profile: 'gate', target: 4, ready: 4, failed: [] });
     expect(names).toEqual(['warm-gate-host-a-standard-1', 'warm-gate-host-a-standard-2',
@@ -718,7 +744,7 @@ test('a busy or unavailable first host lets the request lease a matching worker 
       },
       transport: () => ({ request: async () => ({ status: 'observed' as const, reason: 'complete', reply: null }) }),
     });
-    const replay = await provider.request(input());
+    const replay = await provider.request(input(), gateSelection());
     expect(hosts).toEqual(['test-host', 'test-host-b']);
     expect(replay.command?.workerId).toBe('elangram-worker');
     expect(replay.command).toMatchObject({ podName: second.spec.name, podContext: second.spec.kubectlContext, image: second.spec.image,
@@ -1356,7 +1382,8 @@ test('standing producer refuses a replaced Pod without create/delete and registe
       },
     });
     expect(await repeated.prepareWorker(prepareSpec.workerId)).toBe(state !== 'quarantined');
-    expect(repeatCommands).toEqual(['get', 'get', 'wait', 'get']);
+    expect(repeatCommands).toEqual(state === 'quarantined'
+      ? ['get', 'get', 'wait', 'get', 'get', 'get'] : ['get', 'get', 'wait', 'get']);
     expect(controlCalls).toEqual(['GET /v1/resources']);
   }
 
@@ -1483,11 +1510,14 @@ test('provider retains the lease through gate comparison, then releases and mach
     },
     transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
   });
-  const result = await provider.request(input());
+  const result = await provider.request(input(), gateSelection());
   expect(result.command).toMatchObject({ workerId: spec.workerId, generation: 1, leaseId: 'lease-1', key });
   expect(result.transport.reason).toBe('complete');
+  const cleanupKey = JSON.stringify([spec.workerId, 'lease-1', 1, 'lease-pod-uid']);
+  expect((provider as any).cleanupVerifiedLeases.has(cleanupKey)).toBe(true);
   expect(calls.map(call => call.path)).toEqual(['/v1/leases/pod-worker']);
   await provider.finalize(result.command!);
+  expect((provider as any).cleanupVerifiedLeases.has(cleanupKey)).toBe(false);
   expect(calls.map(call => call.path)).toEqual([
     '/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/release`,
     `/v1/leases/pod-worker/${spec.workerId}/sanitize`,
@@ -1498,6 +1528,127 @@ test('provider retains the lease through gate comparison, then releases and mach
   expect(calls[1]!.token).toBe(`Bearer ${'1'.repeat(64)}`);
   expect(calls[2]!.token).toBe(`Bearer ${'2'.repeat(64)}`);
   expect(calls[1]!.body).toMatchObject({ leaseId: 'lease-1', generation: 1 });
+});
+
+test('a retryable finalize error retains cleanup proof until the exact lease can be returned', async () => {
+  const paths: string[] = [];
+  const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) }, kubectl: leaseKubectl(),
+    fetch: async url => {
+      const path = new URL(String(url)).pathname;
+      paths.push(path);
+      return Response.json(path === '/v1/leases/pod-worker' ? lease() : { attrs: { state: 'idle' } });
+    },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+  });
+  const result = await provider.request(input(), gateSelection());
+  const command = result.command!;
+  const cleanupKey = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
+  const candidates = (provider as any).candidates as WarmWorkerCandidate[];
+  candidates.splice(0, candidates.length);
+
+  await expect(provider.finalize(command)).rejects.toThrow('warm finalize candidate missing');
+  expect((provider as any).cleanupVerifiedLeases.has(cleanupKey)).toBe(true);
+  expect(paths).toEqual(['/v1/leases/pod-worker']);
+
+  candidates.push(candidate);
+  await provider.finalize(command);
+  expect((provider as any).cleanupVerifiedLeases.has(cleanupKey)).toBe(false);
+  expect(paths).toEqual(['/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/release`,
+    `/v1/leases/pod-worker/${spec.workerId}/sanitize`]);
+});
+
+test('a quarantine racing cleanup prevents a late complete receipt from reviving the lease', async () => {
+  const paths: string[] = [];
+  let markTransportStarted!: () => void;
+  let finishTransport!: () => void;
+  const transportStarted = new Promise<void>(resolve => { markTransportStarted = resolve; });
+  const transportPause = new Promise<void>(resolve => { finishTransport = resolve; });
+  const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) }, kubectl: leaseKubectl(),
+    fetch: async url => {
+      const path = new URL(String(url)).pathname;
+      paths.push(path);
+      return Response.json(path === '/v1/leases/pod-worker' ? lease() : { attrs: { state: 'quarantined' } });
+    },
+    transport: () => ({ request: async () => {
+      markTransportStarted();
+      await transportPause;
+      return { status: 'observed', reason: 'complete', reply: null };
+    } }),
+  });
+  const request = provider.request(input(), gateSelection());
+  await transportStarted;
+  const command = { ...input(), leaseId: 'lease-1', generation: 1, podUid: 'lease-pod-uid',
+    podName: spec.name, podContext: spec.kubectlContext, image: spec.image,
+    requestedAt: new Date().toISOString(), workerId: spec.workerId, key };
+  await provider.quarantine(command, 'concurrent-gate-fallback');
+  finishTransport();
+  const result = await request;
+  const cleanupKey = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
+
+  expect(result.transport.reason).toBe('complete');
+  expect((provider as any).cleanupVerifiedLeases.has(cleanupKey)).toBe(false);
+  await expect(provider.finalize(result.command!)).rejects.toThrow('warm lease already quarantined');
+  expect(paths).toEqual(['/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/quarantine`]);
+});
+test('provider quarantines a return without the runtime cleanup receipt', async () => {
+  const paths: string[] = [];
+  const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) }, kubectl: leaseKubectl(),
+    fetch: async url => {
+      const path = new URL(String(url)).pathname;
+      paths.push(path);
+      return Response.json(path === '/v1/leases/pod-worker' ? lease() : { attrs: { state: 'quarantined' } });
+    },
+  });
+  const command = { ...input(), leaseId: 'lease-1', generation: 1, podUid: 'lease-pod-uid',
+    podName: spec.name, podContext: spec.kubectlContext, image: spec.image,
+    requestedAt: new Date().toISOString(), workerId: spec.workerId, key };
+
+  await expect(provider.finalize(command)).rejects.toThrow('warm cleanup unverified');
+  expect(paths).toEqual([`/v1/leases/pod-worker/${spec.workerId}/quarantine`]);
+});
+
+test('provider quarantines incomplete runtime cleanup without releasing the lease', async () => {
+  const paths: string[] = [];
+  const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) }, kubectl: leaseKubectl(),
+    fetch: async url => {
+      const path = new URL(String(url)).pathname;
+      paths.push(path);
+      return Response.json(path === '/v1/leases/pod-worker' ? lease() : { attrs: { state: 'quarantined' } });
+    },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'worker-quarantined', reply: null }) }),
+  });
+  const result = await provider.request(input(), gateSelection());
+  expect(result.command).not.toBeNull();
+  expect(result.transport.reason).toBe('worker-quarantined');
+  await expect(provider.finalize(result.command!)).rejects.toThrow('warm lease already quarantined');
+  expect(paths).toEqual([`/v1/leases/pod-worker`, `/v1/leases/pod-worker/${spec.workerId}/quarantine`]);
+});
+
+test('cleanup proof is scoped to worker, lease, generation, and Pod UID', async () => {
+  for (const [field, value] of [
+    ['workerId', 'other-worker'], ['leaseId', 'other-lease'], ['generation', 2], ['podUid', 'other-pod-uid'],
+  ] as const) {
+    const paths: string[] = [];
+    const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+      memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) }, kubectl: leaseKubectl(),
+      fetch: async url => {
+        const path = new URL(String(url)).pathname;
+        paths.push(path);
+        return Response.json(path === '/v1/leases/pod-worker' ? lease() : { attrs: { state: 'quarantined' } });
+      },
+      transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+    });
+    const result = await provider.request(input(), gateSelection());
+    expect(result.command).not.toBeNull();
+    const mismatched = Object.assign({}, result.command, { [field]: value });
+    await expect(provider.finalize(mismatched)).rejects.toThrow('warm cleanup unverified');
+    expect(paths.some(path => path.endsWith('/release') || path.endsWith('/sanitize'))).toBe(false);
+    expect(paths.some(path => path.endsWith('/quarantine'))).toBe(true);
+  }
 });
 
 test('lease occupancy transitions carry stable run identity and measured acquisition wait', async () => {
@@ -1513,7 +1664,7 @@ test('lease occupancy transitions carry stable run identity and measured acquisi
       events.push({ event, data });
   }) as typeof debug.log);
   try {
-    const result = await provider.request(input());
+    const result = await provider.request(input(), gateSelection());
     expect(result.command).not.toBeNull();
     await provider.finalize(result.command!);
   } finally { log.mockRestore(); }
@@ -1533,7 +1684,7 @@ test('quarantine with unconfirmed Pod cleanup does not report measured lease rel
   let failQuarantinePatch = false;
   let failedPatchCalls = 0;
   const kubectl: NonNullable<WarmPodProviderOptions['kubectl']> = args => {
-    if (failQuarantinePatch && args.includes('patch')) {
+    if (failQuarantinePatch && args.includes('patch') && failedPatchCalls === 0) {
       failedPatchCalls += 1;
       return { status: 1, stdout: '', stderr: 'injected quarantine metadata patch failure' };
     }
@@ -1552,7 +1703,7 @@ test('quarantine with unconfirmed Pod cleanup does not report measured lease rel
   }) as typeof debug.log);
   let command: any;
   try {
-    const result = await provider.request(input());
+    const result = await provider.request(input(), gateSelection());
     expect(result.command).not.toBeNull();
     command = result.command;
     failQuarantinePatch = true;
@@ -1570,6 +1721,89 @@ test('quarantine with unconfirmed Pod cleanup does not report measured lease rel
   expect(events.at(-1)?.data).toMatchObject({ state: 'quarantined', leasedDelta: -1, measured: true });
 });
 
+test('Kubernetes quarantine fences sibling providers when both local state writes fail', async () => {
+  const baseKubectl = leaseKubectl();
+  const leaseCalls: string[] = [];
+  const sharedStatePath = join(providerStateRoot, `shared-failure-${++providerStateIndex}.json`);
+  const options: WarmPodProviderOptions = { candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) }, rotationStatePath: sharedStatePath,
+    kubectl: baseKubectl,
+    fetch: async url => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/v1/leases/pod-worker') { leaseCalls.push(path); return Response.json(lease()); }
+      return Response.json({ attrs: { state: 'quarantined' } });
+    },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+  };
+  const first = newTestWarmPodProvider(options);
+  const sibling = newTestWarmPodProvider(options);
+  (first as any).persistQuarantinedWorkerIds = () => { throw new Error('injected quarantine state write failure'); };
+  (first as any).persistWarmReuseDisabled = () => { throw new Error('injected disabled marker write failure'); };
+
+  const used = await first.request(input(), gateSelection());
+  expect(used.command).not.toBeNull();
+  await first.quarantine(used.command!, 'injected-local-state-write-failure');
+  const adoptedPod = JSON.parse(baseKubectl(['--context', spec.kubectlContext, '-n', spec.namespace,
+    'get', 'pod', spec.name, '-o', 'json']).stdout);
+  expect(adoptedPod.metadata.labels['elanous.ai/quarantined']).toBe('true');
+
+  const siblingReplay = await sibling.request(input(), gateSelection());
+  expect(siblingReplay.command).toBeNull();
+  expect(siblingReplay.transport.reason).toBe('no-candidate');
+  expect(leaseCalls).toHaveLength(1);
+});
+
+test('failed Kubernetes label quarantine falls back to shared durable block for sibling and restarted providers', async () => {
+  const baseKubectl = leaseKubectl();
+  const leaseCalls: string[] = [];
+  const order: string[] = [];
+  const events: Array<{ event: string; data: any }> = [];
+  const sharedStatePath = join(providerStateRoot, `shared-label-failure-${++providerStateIndex}.json`);
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm.provider' && event === 'cluster-quarantine-failed') events.push({ event, data });
+  }) as typeof debug.log);
+  const options: WarmPodProviderOptions = { candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) }, rotationStatePath: sharedStatePath,
+    kubectl: args => {
+      if (args[4] === 'patch') {
+        const body = JSON.parse(args[args.indexOf('-p') + 1]!);
+        if (body[2]?.path === '/metadata/labels/elanous.ai~1quarantined') {
+          order.push('pod-label');
+          return { status: 1, stdout: '', stderr: 'injected label patch failure' };
+        }
+      }
+      return baseKubectl(args);
+    },
+    fetch: async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/v1/leases/pod-worker') { leaseCalls.push(path); return Response.json(lease()); }
+      if (path.endsWith('/quarantine')) order.push('control-quarantine');
+      return Response.json({ attrs: { state: 'quarantined' } });
+    },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+  };
+  try {
+    const first = newTestWarmPodProvider(options);
+    const sibling = newTestWarmPodProvider(options);
+    const used = await first.request(input(), gateSelection());
+    expect(used.command).not.toBeNull();
+    await first.quarantine(used.command!, 'injected-kubernetes-label-failure');
+    expect(order.slice(0, 2)).toEqual(['pod-label', 'control-quarantine']);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.data).toMatchObject({ workerId: spec.workerId, reason: 'conditional-patch-failed' });
+
+    const siblingReplay = await sibling.request(input(), gateSelection());
+    expect(siblingReplay.command).toBeNull();
+    expect(siblingReplay.transport.reason).toBe('no-candidate');
+    const restarted = newTestWarmPodProvider(options);
+    const restartedReplay = await restarted.request(input(), gateSelection());
+    expect(restartedReplay.command).toBeNull();
+    expect(restartedReplay.transport.reason).toBe('no-candidate');
+    expect(await restarted.reconcilePool()).toMatchObject({ target: 1, ready: 0, failed: [spec.workerId] });
+    expect(leaseCalls).toHaveLength(1);
+  } finally { log.mockRestore(); }
+});
+
 test('lease acquisition timeout records a measured wait without inventing occupancy', async () => {
   const events: Array<{ event: string; data: any }> = [];
   const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
@@ -1580,7 +1814,7 @@ test('lease acquisition timeout records a measured wait without inventing occupa
     if (category === 'pod.warm' && event === 'lease-acquire-wait') events.push({ event, data });
   }) as typeof debug.log);
   try {
-    const replay = await provider.request({ ...input(), deadlineAt: Date.now() + 20 });
+    const replay = await provider.request({ ...input(), deadlineAt: Date.now() + 20 }, gateSelection());
     expect(replay.command).toBeNull();
     expect(replay.transport.reason).toBe('lease-unavailable');
   } finally { log.mockRestore(); }
@@ -1590,21 +1824,28 @@ test('lease acquisition timeout records a measured wait without inventing occupa
     measured: true, waitMs: expect.any(Number), observedAt: expect.any(String) });
 });
 
-test('a finalize without matching Pod lease metadata quarantines instead of sanitizing', async () => {
+test('a verified cleanup still cannot return a Pod whose lease metadata patch mismatches', async () => {
   const paths: string[] = [];
+  let patches = 0;
+  const baseKubectl = leaseKubectl();
   const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-    memberToken: '1'.repeat(64), machineTokens: { ['test-host']: '2'.repeat(64) }, kubectl: leaseKubectl(),
+    memberToken: '1'.repeat(64), machineTokens: { ['test-host']: '2'.repeat(64) },
+    kubectl: args => {
+      if (args[4] === 'patch' && ++patches === 2) return { status: 1, stdout: '', stderr: 'lease state changed' };
+      return baseKubectl(args);
+    },
     fetch: async url => {
       const path = new URL(String(url)).pathname;
       paths.push(path);
-      return Response.json({ attrs: { state: path.endsWith('/quarantine') ? 'quarantined' : 'sanitizing' } });
+      return Response.json(path === '/v1/leases/pod-worker' ? lease() : { attrs: { state: 'quarantined' } });
     },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
   });
-  const command = { ...input(), leaseId: 'lease-never-adopted', generation: 1, podUid: 'lease-pod-uid',
-    podName: spec.name, podContext: spec.kubectlContext, image: spec.image, requestedAt: new Date().toISOString(),
-    workerId: spec.workerId, key };
-  await expect(provider.finalize(command)).rejects.toThrow('warm sanitize unavailable');
+  const result = await provider.request(input(), gateSelection());
+  expect(result.command).not.toBeNull();
+  await expect(provider.finalize(result.command!)).rejects.toThrow('warm sanitize unavailable');
   expect(paths).toEqual([
+    `/v1/leases/pod-worker`,
     `/v1/leases/pod-worker/${spec.workerId}/release`,
     `/v1/leases/pod-worker/${spec.workerId}/quarantine`,
   ]);
@@ -1622,7 +1863,7 @@ test('a sanitize failure followed by the gate fallback quarantines one lease onl
     },
     transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
   });
-  const result = await provider.request(input());
+  const result = await provider.request(input(), gateSelection());
   expect(result.command).not.toBeNull();
   await expect(provider.finalize(result.command!)).rejects.toThrow('warm sanitize unavailable');
   await provider.quarantine(result.command!, 'gate-finalize-failed');
@@ -1649,11 +1890,11 @@ test('gate fallback quarantines a lease even when sanitize completes after the t
     },
     transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
   });
-  const result = await provider.request(input());
+  const result = await provider.request(input(), gateSelection());
   const finalizing = provider.finalize(result.command!);
   await enteredSanitize;
   const fallback = provider.quarantine(result.command!, 'adoption-fallback');
-  const next = await provider.request(input());
+  const next = await provider.request(input(), gateSelection());
   expect(next.command?.workerId).toBe(sibling.workerId);
   expect(paths.filter(path => path === '/v1/leases/pod-worker')).toHaveLength(2);
   releaseSanitize!();
@@ -1678,7 +1919,7 @@ test('concurrent quarantine callers share one fenced lease transition', async ()
     },
     transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
   });
-  const result = await provider.request(input());
+  const result = await provider.request(input(), gateSelection());
   const first = provider.quarantine(result.command!, 'first-failure');
   const second = provider.quarantine(result.command!, 'same-failure');
   releaseQuarantine!();
@@ -1698,10 +1939,93 @@ test('a failed quarantine transition can retry the same lease', async () => {
     },
     transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
   });
-  const result = await provider.request(input());
+  const result = await provider.request(input(), gateSelection());
   await expect(provider.quarantine(result.command!, 'first-failure')).rejects.toThrow('warm quarantine unavailable');
   await provider.quarantine(result.command!, 'retry');
   expect(quarantineCalls).toBe(2);
+});
+
+test('a failed quarantine blocks the worker for sibling and restarted provider requests', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'warm-quarantine-block-'));
+  try {
+    const statePath = join(root, 'rotations.json');
+    let quarantineCalls = 0;
+    let unexpectedControlCalls = 0;
+    const options: WarmPodProviderOptions = { candidates: [candidate], rotationStatePath: statePath,
+      controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+      machineTokens: { 'test-host': '2'.repeat(64) }, kubectl: leaseKubectl(),
+      fetch: async url => {
+        const path = new URL(String(url)).pathname;
+        if (path === '/v1/leases/pod-worker') return Response.json(lease());
+        if (path.endsWith('/quarantine')) return new Response('{}', { status: ++quarantineCalls === 1 ? 503 : 200 });
+        unexpectedControlCalls++;
+        return Response.json({ attrs: { state: 'idle' } });
+      },
+      transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+    };
+    const provider = newTestWarmPodProvider(options);
+    const alreadyRunningSibling = newTestWarmPodProvider(options);
+    const acquired = await provider.request(input(), gateSelection());
+    await expect(provider.quarantine(acquired.command!, 'failed-transition')).rejects.toThrow('warm quarantine unavailable');
+    expect(await provider.request({ ...input(), runId: 'sibling-run', attemptId: 'sibling-attempt' }, gateSelection()))
+      .toMatchObject({ command: null, transport: { status: 'fallback', reason: 'no-candidate' } });
+    expect(await alreadyRunningSibling.request({ ...input(), runId: 'other-provider-run', attemptId: 'other-provider-attempt' }, gateSelection()))
+      .toMatchObject({ command: null, transport: { status: 'fallback', reason: 'no-candidate' } });
+    expect(JSON.parse(readFileSync(`${statePath}.quarantined`, 'utf8'))).toEqual([spec.workerId]);
+
+    const restarted = newTestWarmPodProvider(options);
+    expect(await restarted.request({ ...input(), runId: 'later-run', attemptId: 'later-attempt' }, gateSelection()))
+      .toMatchObject({ command: null, transport: { status: 'fallback', reason: 'no-candidate' } });
+    expect(unexpectedControlCalls).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a quarantine state write failure disables warm reuse in the current and restarted provider', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'warm-quarantine-state-failure-'));
+  try {
+    const statePath = join(root, 'rotations.json');
+    let leaseCalls = 0;
+    const options: WarmPodProviderOptions = { candidates: [candidate], rotationStatePath: statePath,
+      controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+      machineTokens: { 'test-host': '2'.repeat(64) }, kubectl: leaseKubectl(),
+      fetch: async url => {
+        const path = new URL(String(url)).pathname;
+        if (path === '/v1/leases/pod-worker') { leaseCalls++; return Response.json(lease()); }
+        if (path.endsWith('/quarantine')) return new Response('{}', { status: 503 });
+        return Response.json({ attrs: { state: 'idle' } });
+      },
+      transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+    };
+    const provider = newTestWarmPodProvider(options);
+    const acquired = await provider.request(input(), gateSelection());
+    // A non-file at the state target deterministically injects the atomic rename failure.
+    mkdirSync(`${statePath}.quarantined`);
+    await expect(provider.quarantine(acquired.command!, 'failed-transition')).rejects.toThrow('warm quarantine unavailable');
+    await expect(provider.request({ ...input(), runId: 'disabled-run' }, gateSelection()))
+      .resolves.toMatchObject({ command: null, transport: { status: 'fallback', reason: 'no-candidate' } });
+    expect(JSON.parse(readFileSync(`${statePath}.disabled`, 'utf8'))).toEqual({ disabled: true });
+
+    const restarted = newTestWarmPodProvider(options);
+    await expect(restarted.request({ ...input(), runId: 'after-restart' }, gateSelection()))
+      .resolves.toMatchObject({ command: null, transport: { status: 'fallback', reason: 'no-candidate' } });
+    expect(leaseCalls).toBe(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a provider without durable quarantine state never selects a worker', async () => {
+  let leaseCalls = 0;
+  const options: WarmPodProviderOptions = { candidates: [candidate],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    fetch: async () => { leaseCalls++; return Response.json(lease()); },
+    transport: () => ({ request: async () => ({ status: 'observed', reason: 'complete', reply: null }) }),
+  };
+  for (const provider of [new WarmPodProvider({ ...options, quotaResolverForTest: testHostQuota }),
+    new WarmPodProvider({ ...options, quotaResolverForTest: testHostQuota })]) {
+    await expect(provider.request(input(), gateSelection()))
+      .resolves.toMatchObject({ command: null, transport: { status: 'fallback', reason: 'no-candidate' } });
+    expect(await provider.reconcilePool()).toMatchObject({ target: 1, ready: 0, failed: [spec.workerId] });
+  }
+  expect(leaseCalls).toBe(0);
 });
 
 test('WARM-POOL-CORE-FU1: 지연 응답→timeout→늦은 lease 응답과 finalize/quarantine 경합에서 종결을 한 번만 채택한다', async () => {
@@ -1742,32 +2066,31 @@ test('WARM-POOL-CORE-FU1: 지연 응답→timeout→늦은 lease 응답과 final
   try {
     // finalize 경합: 정상 finalize가 같은 키의 종결을 먼저 채택하면 늦은 lease 응답은 재채택되지 않는다.
     const finalizeRace = terminal();
-    const late = finalizeRace.provider.request(input());
+    const late = finalizeRace.provider.request(input(), gateSelection());
     await finalizeRace.started;
-    await expect(finalizeRace.provider.finalize(command())).rejects.toThrow('warm sanitize unavailable');
+    await expect(finalizeRace.provider.finalize(command())).rejects.toThrow('warm cleanup unverified');
     finalizeRace.release();
     const lateResult = await late;
     expect(lateResult.command).toBeNull();
     expect(lateResult.transport).toEqual({ status: 'fallback', reason: 'lease-unavailable', reply: null });
     expect(finalizeRace.terminalCalls).toEqual([
-      `/v1/leases/pod-worker/${spec.workerId}/release`,
       `/v1/leases/pod-worker/${spec.workerId}/quarantine`,
     ]);
     // terminal 요청 중복 0 — 격리된 종결을 finalize로 뒤집지 못한다.
     await expect(finalizeRace.provider.finalize(command())).rejects.toThrow('warm lease already quarantined');
-    expect(finalizeRace.terminalCalls).toHaveLength(2);
+    expect(finalizeRace.terminalCalls).toHaveLength(1);
     // lease-end 중복 0
     expect(events.filter(row => row.event === 'lease-end')).toHaveLength(1);
-    // 다음 warm 채택 차단 — 같은 workerId·leaseId·generation·Pod UID 재채택 거부.
-    const blocked = await finalizeRace.provider.request(input());
+    // 격리 terminal은 성공 여부와 관계없이 worker 전체를 막는다.
+    const blocked = await finalizeRace.provider.request(input(), gateSelection());
     expect(blocked.command).toBeNull();
-    expect(blocked.transport.reason).toBe('lease-unavailable');
-    expect(events.filter(row => row.event === 'lease-terminal-refused')).toHaveLength(2);
+    expect(blocked.transport.reason).toBe('no-candidate');
+    expect(events.filter(row => row.event === 'lease-terminal-refused')).toHaveLength(1);
 
     // quarantine 경합: 불확실한 종료(격리) 뒤 늦은 lease 응답도 재채택 없이 냉 Job 판정을 유지한다.
     events.length = 0;
     const quarantineRace = terminal();
-    const lateQuarantine = quarantineRace.provider.request(input());
+    const lateQuarantine = quarantineRace.provider.request(input(), gateSelection());
     await quarantineRace.started;
     await quarantineRace.provider.quarantine(command(), 'adoption-fallback');
     quarantineRace.release();
@@ -1778,9 +2101,9 @@ test('WARM-POOL-CORE-FU1: 지연 응답→timeout→늦은 lease 응답과 final
     await quarantineRace.provider.quarantine(command(), 'late-failure');
     expect(quarantineRace.terminalCalls).toHaveLength(1);
     expect(events.filter(row => row.event === 'lease-end')).toHaveLength(1);
-    const blockedQuarantine = await quarantineRace.provider.request(input());
+    const blockedQuarantine = await quarantineRace.provider.request(input(), gateSelection());
     expect(blockedQuarantine.command).toBeNull();
-    expect(blockedQuarantine.transport.reason).toBe('lease-unavailable');
+    expect(blockedQuarantine.transport.reason).toBe('no-candidate');
 
     // One adopted lease can enter finalize and caller-timeout quarantine concurrently; quarantine wins once sanitize settles.
     events.length = 0;
@@ -1822,15 +2145,15 @@ test('WARM-POOL-CORE-FU1: 지연 응답→timeout→늦은 lease 응답과 final
     };
     const adoptedRace = newTestWarmPodProvider(raceOptions);
     const contender = newTestWarmPodProvider(raceOptions);
-    const adopted = await adoptedRace.request(input());
+    const adopted = await adoptedRace.request(input(), gateSelection());
     expect(adopted.command).not.toBeNull();
     const finalizing = adoptedRace.finalize(adopted.command!);
     await sanitizeEntered;
     const quarantineAfterTimeout = adoptedRace.quarantine(adopted.command!, 'caller-timeout');
     await quarantineEntered;
-    const contenderAttempt = await contender.request(input());
+    const contenderAttempt = await contender.request(input(), gateSelection());
     expect(contenderAttempt.command).toBeNull();
-    expect(contenderAttempt.transport.reason).toBe('lease-unavailable');
+    expect(contenderAttempt.transport.reason).toBe('no-candidate');
     releaseSanitize();
     const [finalized, quarantined] = await Promise.allSettled([finalizing, quarantineAfterTimeout]);
     expect(finalized.status).toBe('rejected');
@@ -1841,9 +2164,9 @@ test('WARM-POOL-CORE-FU1: 지연 응답→timeout→늦은 lease 응답과 final
       `/v1/leases/pod-worker/${spec.workerId}/quarantine`,
     ]);
     expect(events.filter(row => row.event === 'lease-end')).toHaveLength(1);
-    const refusedAfterRace = await contender.request(input());
+    const refusedAfterRace = await contender.request(input(), gateSelection());
     expect(refusedAfterRace.command).toBeNull();
-    expect(refusedAfterRace.transport.reason).toBe('lease-unavailable');
+    expect(refusedAfterRace.transport.reason).toBe('no-candidate');
   } finally { log.mockRestore(); }
 });
 
@@ -1888,11 +2211,11 @@ test('a timed-out acquisition fences only its worker; its sibling remains reusab
     },
     transport: () => ({ request: async () => { transported++; return { status: 'observed', reason: 'complete', reply: null }; } }),
   });
-  const timedOut = provider.request({ ...input(), deadlineAt: Date.now() + 30 });
+  const timedOut = provider.request({ ...input(), deadlineAt: Date.now() + 30 }, gateSelection());
   await acquireEntered;
   const timeoutResult = await timedOut;
   expect(timeoutResult).toMatchObject({ command: null, transport: { status: 'fallback', reason: 'lease-unavailable' } });
-  const sibling = await provider.request({ ...input(), runId: 'sibling-run', attemptId: 'sibling-attempt' });
+  const sibling = await provider.request({ ...input(), runId: 'sibling-run', attemptId: 'sibling-attempt' }, gateSelection());
   expect(sibling.command).toMatchObject({ workerId: siblingSpec.workerId, leaseId: `lease-${siblingSpec.workerId}` });
   expect(transported).toBe(1);
   expect(states.get(spec.workerId)).toBe('leased');
@@ -1929,7 +2252,7 @@ test('a delayed sibling lease is fenced and quarantined by the worker ID actuall
       return Response.json({ attrs: { state: 'released' } });
     },
   });
-  const pending = provider.request({ ...input(), deadlineAt: Date.now() + 30 });
+  const pending = provider.request({ ...input(), deadlineAt: Date.now() + 30 }, gateSelection());
   await acquireEntered;
   const result = await pending;
   expect(result.command).toBeNull();
@@ -1958,7 +2281,7 @@ test('a timed-out fence request is bounded and the late lease is still quarantin
       return Response.json({ attrs: { state: 'released' } });
     },
   });
-  const pending = provider.request({ ...input(), deadlineAt: Date.now() + 30 });
+  const pending = provider.request({ ...input(), deadlineAt: Date.now() + 30 }, gateSelection());
   await acquireEntered;
   const result = await pending;
   expect(result.command).toBeNull();
@@ -1983,7 +2306,7 @@ test('a quarantined warm worker emits a slot-hold observation when acquisition i
         return Response.json({});
       },
     });
-    const result = await provider.request(input());
+    const result = await provider.request(input(), gateSelection());
     expect(result.transport).toMatchObject({ status: 'fallback', reason: 'lease-unavailable' });
     expect(observations).toHaveLength(1);
     expect(observations[0]).toMatchObject({ category: 'pod.warm', event: 'quarantine-holds-slot',
@@ -2003,7 +2326,7 @@ test('a stalled diagnostic ledger read after lease conflict stays within its bou
     },
   });
   const startedAt = Date.now();
-  const result = await provider.request(input());
+  const result = await provider.request(input(), gateSelection());
   expect(result).toMatchObject({ command: null,
     transport: { status: 'fallback', reason: 'lease-unavailable', reply: null } });
   expect(Date.now() - startedAt).toBeLessThan(3_000);
@@ -2016,7 +2339,7 @@ test('multiple lease conflicts respect the request deadline instead of accumulat
   let diagnostics = 0;
   const provider = newTestWarmPodProvider({ candidates: [candidate, second], controlUrl: 'http://127.0.0.1:31413/',
     memberToken: '1'.repeat(64), machineTokens: { ['test-host']: '2'.repeat(64), 'test-host-b': '3'.repeat(64) },
-    kubectl: args => ({ status: 0, stdout: args[2]!, stderr: '' }),
+    kubectl: leaseKubectl([spec, second.spec]),
     fetch: async url => {
       const parsed = new URL(String(url));
       if (parsed.pathname === '/v1/leases/pod-worker') return new Response('{}', { status: 409 });
@@ -2025,7 +2348,7 @@ test('multiple lease conflicts respect the request deadline instead of accumulat
     },
   });
   const startedAt = Date.now();
-  const result = await provider.request({ ...input(), deadlineAt: startedAt + 100 });
+  const result = await provider.request({ ...input(), deadlineAt: startedAt + 100 }, gateSelection());
   expect(result.transport.reason).toBe('lease-unavailable');
   expect(diagnostics).toBe(1);
   expect(Date.now() - startedAt).toBeLessThan(150);
@@ -2045,7 +2368,7 @@ test('a late lease returns cold fallback when its quarantine control response st
     },
   });
   const startedAt = Date.now();
-  const result = await provider.request({ ...input(), deadlineAt: 101 });
+  const result = await provider.request({ ...input(), deadlineAt: 101 }, gateSelection());
   expect(result).toMatchObject({ command: null,
     transport: { status: 'fallback', reason: 'lease-unavailable', reply: null } });
   expect(Date.now() - startedAt).toBeLessThan(3_000);
@@ -2066,9 +2389,9 @@ test('an uncertain quarantine refuses the same Pod before a second transport', a
     },
     transport: () => ({ request: async () => { transportRuns++; return { status: 'observed', reason: 'complete', reply: null }; } }),
   });
-  const first = await provider.request(input());
+  const first = await provider.request(input(), gateSelection());
   await expect(provider.quarantine(first.command!, 'first-failure')).rejects.toThrow('warm quarantine unavailable');
-  const second = await provider.request(input());
+  const second = await provider.request(input(), gateSelection());
   expect(second.command).toBeNull();
   expect(transportRuns).toBe(1);
 });
@@ -2080,8 +2403,8 @@ test('a replaced Pod refuses the acquired lease before transport and quarantines
   const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
     memberToken: '1'.repeat(64), kubectl: args => {
       expect(args[4]).toBe('get');
-      return { status: 0, stdout: JSON.stringify({ metadata: { ...(manifest.metadata as object),
-        name: spec.name, namespace: spec.namespace, uid: 'replacement-uid', resourceVersion: '1' } }), stderr: '' };
+      return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { ...(manifest.metadata as object),
+        name: spec.name, namespace: spec.namespace, uid: 'replacement-uid', resourceVersion: '1' } }] }), stderr: '' };
     },
     fetch: async url => {
       const path = new URL(String(url)).pathname;
@@ -2093,7 +2416,7 @@ test('a replaced Pod refuses the acquired lease before transport and quarantines
       return { status: 'observed', reason: 'complete', reply: null };
     } }),
   });
-  expect(await provider.request(input())).toMatchObject({ command: null,
+  expect(await provider.request(input(), gateSelection())).toMatchObject({ command: null,
     transport: { status: 'fallback', reason: 'lease-unavailable' } });
   expect(transported).toBe(0);
   expect(paths).toEqual(['/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/quarantine`]);
@@ -2107,11 +2430,11 @@ test('a lease refused before start logs lease-refused, never an unpaired lease-e
   try {
     const manifest = warmWorkerPodManifest(spec);
     const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
-      memberToken: '1'.repeat(64), kubectl: () => ({ status: 0, stdout: JSON.stringify({ metadata: {
+      memberToken: '1'.repeat(64), kubectl: () => ({ status: 0, stdout: JSON.stringify({ items: [{ metadata: {
         ...(manifest.metadata as object), name: spec.name, namespace: spec.namespace,
-        uid: 'replacement-uid', resourceVersion: '1' } }), stderr: '' }),
+        uid: 'replacement-uid', resourceVersion: '1' } }] }), stderr: '' }),
       fetch: async url => Response.json(new URL(String(url)).pathname === '/v1/leases/pod-worker' ? lease() : {}) });
-    await provider.request(input());
+    await provider.request(input(), gateSelection());
   } finally { log.mockRestore(); }
   const names = events.map(row => row.event);
   expect(names).not.toContain('lease-start');
@@ -2137,7 +2460,7 @@ test('a host/key lease executes the worker ID returned by the control plane', as
       return { status: 'observed', reason: 'complete', reply: null };
     } }),
   });
-  const result = await provider.request(input());
+  const result = await provider.request(input(), gateSelection());
   expect(result.command?.workerId).toBe(secondSpec.workerId);
   expect(transported).toBe(secondSpec.workerId);
   expect(paths).toEqual(['/v1/leases/pod-worker']);
@@ -2148,6 +2471,7 @@ test('an unrecognized leased worker is refused without transport or quarantine',
   let transported = 0;
   const provider = newTestWarmPodProvider({ candidates: [candidate],
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    kubectl: leaseKubectl(),
     fetch: async url => {
       const path = new URL(String(url)).pathname; paths.push(path);
       return Response.json({ ...lease(), name: 'unknown-worker' });
@@ -2157,7 +2481,7 @@ test('an unrecognized leased worker is refused without transport or quarantine',
       return { status: 'observed', reason: 'complete', reply: null };
     } }),
   });
-  expect(await provider.request(input())).toMatchObject({ command: null,
+  expect(await provider.request(input(), gateSelection())).toMatchObject({ command: null,
     transport: { status: 'fallback', reason: 'lease-unavailable' } });
   expect(transported).toBe(0);
   expect(paths).toEqual(['/v1/leases/pod-worker']);
@@ -2171,7 +2495,7 @@ test('transport mismatch quarantines the leased worker and never sanitizes it', 
       return Response.json(path === '/v1/leases/pod-worker' ? lease() : {});
     }, kubectl: leaseKubectl(),
     transport: () => ({ request: async () => ({ status: 'fallback', reason: 'invalid-result', reply: null }) }) });
-  const result = await provider.request(input());
+  const result = await provider.request(input(), gateSelection());
   expect(result.transport.reason).toBe('invalid-result');
   expect(paths).toEqual(['/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/quarantine`]);
 });
@@ -2190,7 +2514,7 @@ test('missing remote-internal context refuses before lease, Pod exec or quaranti
     fetch: async url => { paths.push(new URL(String(url)).pathname); return Response.json(lease()); },
     transport: () => ({ request: async () => { transportCalls++; return { status: 'fallback', reason: 'exec-failed', reply: null }; } }),
   });
-  expect(await provider.request(input())).toEqual({ command: null, transport: {
+  expect(await provider.request(input(), gateSelection())).toEqual({ command: null, transport: {
     status: 'fallback', reason: 'context-unavailable', reply: null, kubectlStderr: stderr,
   } });
   expect(paths).toEqual([]);
@@ -2204,7 +2528,7 @@ test('a zero shadow budget never starts kubectl and quarantines its acquired lea
       const path = new URL(String(url)).pathname; paths.push(path);
       return Response.json(path === '/v1/leases/pod-worker' ? lease() : {});
     } });
-  expect((await provider.request(input())).transport).toMatchObject({ status: 'fallback', reason: 'exec-failed' });
+  expect((await provider.request(input(), gateSelection())).transport).toMatchObject({ status: 'fallback', reason: 'exec-failed' });
   expect(paths).toEqual(['/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/quarantine`]);
 });
 
@@ -2231,7 +2555,7 @@ test('a timed-out kubectl child is stopped before the acquired lease is quaranti
         return Response.json(path === '/v1/leases/pod-worker' ? lease() : {});
       } });
     const started = Date.now();
-    const result = await provider.request(input());
+    const result = await provider.request(input(), gateSelection());
     expect(result.transport).toMatchObject({ status: 'fallback', reason: 'exec-failed' });
     expect(existsSync(marker)).toBe(true);
     expect(Date.now() - started).toBeLessThan(12_000);
@@ -2410,7 +2734,7 @@ test('WARM-REUSE-TIME-PAIRS: separate cold and warm provider processes pair into
   try {
     const { gateFile, prepareSpec, cold, warm } = pairingFixture();
     expect(await cold.prepareWorker(prepareSpec.workerId)).toBe(true);
-    expect((await warm.request({ ...input(), files: [gateFile] })).transport)
+    expect((await warm.request({ ...input(), files: [gateFile] }, gateSelection())).transport)
       .toMatchObject({ status: 'observed', reason: 'complete' });
     sink.flush();
     // Neither process holds the pair in memory; the read-only reader joins the shared rows.
@@ -2439,7 +2763,7 @@ test('WARM-REUSE-TIME-PAIRS: a multi-file gate never becomes a warm leg and logs
     if (category === 'pod.warm' && event.startsWith('warm-reuse-time-pair')) events.push({ event, data });
   }) as typeof debug.log);
   try {
-    const replay = await warm.request({ ...input(), files: [gateFile, 'src/example/other.test.ts'] });
+    const replay = await warm.request({ ...input(), files: [gateFile, 'src/example/other.test.ts'] }, gateSelection());
     expect(replay.transport).toMatchObject({ status: 'observed', reason: 'complete' });
     expect(warm.warmReuseTimeLegs()).toEqual([]);
     expect(events).toEqual([{ event: 'warm-reuse-time-pair-skipped',
@@ -2646,7 +2970,7 @@ test('WARM-POOL-PROVIDER-DEPLOY: production CLIs redact tokens, reconcile with f
     }
     expect(JSON.parse(reconciled.stdout.trim().split('\n')[0]!)).toMatchObject({ target: 16, ready: 16, failed: [] });
     const podReads = device.calls.filter(args => args[4] === 'get' && args[5] === 'pods');
-    expect(podReads).toHaveLength(32);
+    expect(podReads).toHaveLength(48);
     const rawPodQueries = rawPodRequests.map(path => new URLSearchParams(path.slice(path.indexOf('?') + 1)));
     expect(rawPodQueries).toHaveLength(32);
     expect(rawPodQueries.filter(query => query.get('fieldSelector')?.startsWith('metadata.name=warm-node-b-standard-'))).toHaveLength(16);
@@ -2709,4 +3033,150 @@ describe('parseWarmPodProviderArgs — CLI 인자 배선', () => {
     expect(() => parseWarmPodProviderArgs(['--nope'])).toThrow('usage:');
     expect(() => parseWarmPodProviderArgs(['--pairs', 'x'])).toThrow('usage:');
   });
+});
+
+test('request gates candidates on exact cut, lock hash, and image digest before lease attempts', async () => {
+  const implementation = { host: 'test-host', tier: 'standard' as const, kind: 'implementation' as const,
+    spec: { ...spec, name: 'warm-test-implementation', workerId: 'implementation-worker' } };
+  const wrongLockGate = { ...candidate, kind: 'gate' as const, spec: { ...spec,
+    workerId: 'gate-wrong-lock', key: { ...key, lockHash: 'd'.repeat(64) } } };
+  const gateSpec = { ...spec, name: 'warm-test-host-b', workerId: 'gate-worker', kubectlContext: 'test-host-b',
+    key: { ...key, lockHash: 'e'.repeat(64) } };
+  const gate = { host: 'test-host-b', tier: 'standard' as const, kind: 'gate' as const, spec: gateSpec };
+  const attemptedHosts: string[] = [];
+  const provider = newTestWarmPodProvider({ candidates: [implementation, wrongLockGate, gate],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    machineTokens: { 'test-host': '2'.repeat(64), 'test-host-b': '3'.repeat(64) },
+    kubectl: args => {
+      if (args[4] === 'get' && args[5] === 'pods' && args.includes(`--field-selector=metadata.name=${gateSpec.name}`))
+        return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: gateSpec.name,
+          namespace: gateSpec.namespace, uid: 'lease-pod-uid', labels: {}, resourceVersion: '1' } }] }), stderr: '' };
+      throw new Error('unexpected kubectl for a candidate rejected before cluster lookup');
+    },
+    fetch: async (url, init) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/v1/leases/pod-worker' && init?.method === 'POST') {
+        attemptedHosts.push(JSON.parse(String(init.body)).machine);
+        return new Response('{}', { status: 503 });
+      }
+      return Response.json({ resources: [] });
+    },
+  });
+  await provider.request(input(), { ...gateSelection(gateSpec.key) });
+  expect(attemptedHosts).toEqual(['test-host-b']);
+});
+
+test('provider generated with an old base-image digest never leases a warm Pod after the pin changes', async () => {
+  const oldImageDigest = `sha256:${'1'.repeat(64)}`;
+  const nextImageDigest = `sha256:${'2'.repeat(64)}`;
+  const oldBaseImageDigest = `sha256:${'3'.repeat(64)}`;
+  const nextBaseImageDigest = `sha256:${'4'.repeat(64)}`;
+  const staleProviderCandidate = { ...candidate, spec: { ...spec,
+    image: `registry.example/elanous@${oldImageDigest}`,
+    key: { ...key, imageDigest: oldImageDigest },
+    runtimeContract: { baseImageDigest: oldBaseImageDigest, bunVersion: '1.4.2', os: 'linux' as const,
+      architecture: key.architecture, requiredTools: ['bun', 'git'] },
+  } };
+  const attemptedHosts: string[] = [];
+  const provider = newTestWarmPodProvider({ candidates: [staleProviderCandidate],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) },
+    kubectl: () => { throw new Error('stale runtime identity must not reach a Pod'); },
+    fetch: async (url, init) => {
+      if (new URL(String(url)).pathname === '/v1/leases/pod-worker' && init?.method === 'POST')
+        attemptedHosts.push('attempted');
+      return Response.json({ resources: [] });
+    },
+  });
+  const reply = await provider.request(input(), { ...gateSelection({ ...key, imageDigest: nextImageDigest }),
+    imageDigest: nextImageDigest, runtimeIdentity: { baseImageDigest: nextBaseImageDigest, lockHash: key.lockHash,
+      os: 'linux', architecture: key.architecture, bunVersion: '1.4.2' } });
+  expect(reply).toEqual({ command: null, transport: { status: 'fallback', reason: 'lease-unavailable', reply: null } });
+  expect(attemptedHosts).toEqual([]);
+});
+
+test('gate request without an independent lock and image tuple cannot infer its target from candidates', async () => {
+  const calls: string[] = [];
+  const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) },
+    kubectl: () => { throw new Error('missing selection must fail before Pod access'); },
+    fetch: async url => { calls.push(String(url)); throw new Error('missing selection must fail before lease'); },
+  });
+  expect(await provider.request(input())).toEqual({ command: null,
+    transport: { status: 'fallback', reason: 'no-candidate', reply: null } });
+  expect(calls).toEqual([]);
+});
+
+test('gate request without an architecture-bearing runtime contract fails closed before Pod access', async () => {
+  const calls: string[] = [];
+  const provider = newTestWarmPodProvider({ candidates: [candidate], controlUrl: 'http://127.0.0.1:31413/',
+    memberToken: '1'.repeat(64), machineTokens: { 'test-host': '2'.repeat(64) },
+    kubectl: () => { calls.push('kubectl'); throw new Error('missing gate architecture must fail before Pod access'); },
+    fetch: async url => { calls.push(String(url)); throw new Error('missing gate architecture must fail before lease'); },
+  });
+  const selection = gateSelection();
+  expect(await provider.request(input(), { ...selection, runtimeContract: undefined })).toEqual({ command: null,
+    transport: { status: 'fallback', reason: 'no-candidate', reply: null } });
+  expect(await provider.request(input(), { ...selection,
+    runtimeContract: { ...selection.runtimeContract, architecture: '' } })).toEqual({ command: null,
+    transport: { status: 'fallback', reason: 'no-candidate', reply: null } });
+  expect(calls).toEqual([]);
+});
+
+test('provider reuses a cross-architecture candidate only when its private config allowlists both architectures', async () => {
+  const arm64Candidate: WarmWorkerCandidate = { host: 'test-host', tier: 'standard', kind: 'gate', spec: {
+    ...spec, name: 'warm-test-arm64', workerId: 'gate-arm64-worker',
+    key: { ...key, architecture: 'arm64' },
+    runtimeContract: { ...spec.runtimeContract!, architecture: 'arm64' },
+  } };
+  const scores: Array<{ accepted: boolean; reason: string }> = [];
+  const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+    if (category === 'pod.warm' && event === 'candidate-match-score') {
+      const rows = (data as { candidates: Array<{ accepted: boolean; reason: string }> }).candidates;
+      scores.push(rows[0]!);
+    }
+  }) as typeof debug.log);
+  try {
+    const makeProvider = (allowedArchitectures?: readonly ('amd64' | 'arm64')[]) => newTestWarmPodProvider({
+      candidates: [arm64Candidate], controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+      ...(allowedArchitectures ? { allowedArchitectures } : {}), kubectl: () => ({ status: 1, stdout: '', stderr: 'context unavailable' }),
+      fetch: async () => Response.json({ resources: [] }),
+    });
+    await makeProvider().request(input(), gateSelection());
+    await makeProvider(['amd64', 'arm64']).request(input(), gateSelection());
+  } finally { log.mockRestore(); }
+  expect(scores).toEqual([
+    expect.objectContaining({ accepted: false, reason: 'runtime-identity-mismatch' }),
+    expect.objectContaining({ accepted: true, reason: 'selected' }),
+  ]);
+});
+
+test('provider allocates an allowlisted arm64 worker for an amd64 gate runtime', async () => {
+  const arm64Key = { ...key, architecture: 'arm64' };
+  const arm64Spec: WarmPodSpec = { ...spec, name: 'warm-test-arm64', workerId: 'gate-arm64-worker',
+    key: arm64Key, runtimeContract: { ...spec.runtimeContract!, architecture: 'arm64' } };
+  const arm64Candidate: WarmWorkerCandidate = { host: 'test-host', tier: 'standard', kind: 'gate', spec: arm64Spec };
+  const leaseHosts: string[] = [];
+  const transported: string[] = [];
+  const provider = newTestWarmPodProvider({ candidates: [arm64Candidate], allowedArchitectures: ['amd64', 'arm64'],
+    controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64),
+    machineTokens: { 'test-host': '2'.repeat(64) }, kubectl: leaseKubectl([arm64Spec]),
+    fetch: async (url, init) => {
+      if (new URL(String(url)).pathname === '/v1/leases/pod-worker' && init?.method === 'POST') {
+        leaseHosts.push(JSON.parse(String(init.body)).machine);
+        return Response.json({ name: arm64Spec.workerId, attrs: { key: arm64Key, leaseId: 'lease-arm64',
+          generation: 1, podUid: 'lease-pod-uid', state: 'leased' } });
+      }
+      return Response.json({});
+    },
+    transport: () => ({ request: async command => {
+      transported.push(command.workerId);
+      return { status: 'observed', reason: 'complete', reply: null };
+    } }),
+  });
+
+  const result = await provider.request(input(), gateSelection());
+  expect(leaseHosts).toEqual(['test-host']);
+  expect(transported).toEqual([arm64Spec.workerId]);
+  expect(result.command).toMatchObject({ workerId: arm64Spec.workerId, key: arm64Key });
+  expect(result.transport).toMatchObject({ status: 'observed', reason: 'complete' });
 });

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.2 P2: EmitProcessHealth LLM tool ──
 //
 // Write-only feed for a named SPC series. Records the sample, reports
@@ -5,7 +6,7 @@
 // when the sample is a ≥2σ outlier. Use it to let the LLM surface
 // drift in latency, answer length, retries, etc. without polling.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   emitEscalation,
   type EmitOpts,

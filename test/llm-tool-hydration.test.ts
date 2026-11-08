@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // ── ⭐ 툴 루프 하이드레이션 흡수 (F2 gap④ · 2026-07-26) ──────────────────
 //
 // 소환로 3갭(#5460)을 고쳐 ToolSearch 가 스키마를 **돌려주게** 됐지만, 그것만으론
@@ -11,7 +12,7 @@
 
 import { afterEach, describe, expect, test } from 'bun:test';
 import { streamLLMWithTools } from '../src/llm';
-import type { LLMProvider, LLMStreamEvent, LLMToolSpec } from '../src/llm';
+import type { LLMProvider, LLMStreamEvent } from '../src/llm';
 import { HYDRATED_TOOLS_KEY } from '../src/skills/tools/tool-search-spec.js';
 import { routeToolSearch } from '../src/skills/tools/tool-search-route.js';
 import { __resetSnapshotStore, __resetTurnState } from '../src/undo-turn/index.js';

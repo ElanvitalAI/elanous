@@ -1,11 +1,12 @@
 import { readPresence, writePresence, type Presence } from './away/presence.js';
-import { releaseNowText, releaseWatchTick } from './away/release-watch.js';
-import { readReleaseRuns, type ReleaseRunView } from './nexus/api/ops-api.js';
+import { releaseWatchTick } from './away/release-watch.js';
+import { telegramNowSlash } from './context-bus/context-now-surfaces.js';
+import type { ContextNowDeps } from './context-bus/context-now.js';
 
-/** AWAY-MODE-1 ③ — 텔레그램 /release: PWA /ops/release 와 같은 원장을 읽어 지금 런·노드를 한 통으로. */
-export function telegramReleaseStatus(args: string[], runs: () => ReleaseRunView[] | 'unavailable' = () => readReleaseRuns(null, undefined, { facts: true }), now: () => number = Date.now): string {
+/** Telegram /release and /away read the same release-status fact as TUI and context_now. */
+export function telegramReleaseStatus(args: string[], deps?: ContextNowDeps): string {
   if (args.length) return '사용법: /release';
-  return releaseNowText(runs(), now());
+  return telegramNowSlash(['발행 상황'], deps);
 }
 
 export interface AwaySlashDeps {

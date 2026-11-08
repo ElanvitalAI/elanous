@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // MVP M1.5 A.2 — Read tool (daemon side).
 //
 // LLM-facing primitive that returns the contents of a single file.
@@ -22,7 +23,7 @@
 
 import { closeSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   createSeqTracker,
   makeEnvelope,

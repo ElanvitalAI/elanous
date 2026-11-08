@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { withFakeFetchDevice } from '../../ux-sim/fake-fetch.js';
 import { debug } from '../../debug/log.js';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -117,13 +118,16 @@ describe('POST /v1/pod/credential/github', () => {
   });
 
   test('GitHub listing requires exactly one repository, including the reported total count', async () => {
-    const original = globalThis.fetch;
-    try {
-      globalThis.fetch = (async () => Response.json({ total_count: 2, repositories: [{ full_name: 'owner/repo' }] })) as unknown as typeof fetch;
+    let responseIndex = 0;
+    await withFakeFetchDevice([{ url: 'https://api.github.com/installation/repositories?per_page=100', response: () => {
+      const total_count = responseIndex++ === 0 ? 2 : 1;
+      return Response.json({ total_count, repositories: [{ full_name: 'owner/repo' }] });
+    } }], async (device) => {
       expect(await installationRepositories('opaque-app-token')).toBeNull();
-      globalThis.fetch = (async () => Response.json({ total_count: 1, repositories: [{ full_name: 'owner/repo' }] })) as unknown as typeof fetch;
       expect(await installationRepositories('opaque-app-token')).toEqual(['owner/repo']);
-    } finally { globalThis.fetch = original; }
+      expect(device.calls()).toHaveLength(2);
+      expect(device.calls().every((call) => call.headers.authorization === 'Bearer opaque-app-token')).toBe(true);
+    });
   });
 
   test('multi-repository installation token is not handed to a run even when its repository is present', async () => {

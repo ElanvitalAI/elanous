@@ -1,4 +1,5 @@
-import type { LLMToolSpec } from '../../llm.js';
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
+
 import { openMsgStore, validateMessageEnvelope, type Message, type MsgStore } from '../../msg/msg-store.js';
 
 export interface MsgAskDeps {

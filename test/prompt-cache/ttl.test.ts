@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../src/llm/tool-spec.js';
 import { describe, expect, test } from 'bun:test';
 import {
   toAnthropicSystemBlocks,
@@ -6,7 +7,7 @@ import {
   EPHEMERAL_CACHE,
   EPHEMERAL_CACHE_1H,
 } from '../../src/prompt-cache/index.js';
-import type { LLMMessage, LLMToolSpec } from '../../src/llm.js';
+import type { LLMMessage } from '../../src/llm.js';
 
 describe('cacheControlFor', () => {
   test('default 5m returns EPHEMERAL_CACHE', () => {

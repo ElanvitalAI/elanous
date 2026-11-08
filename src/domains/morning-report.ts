@@ -11,7 +11,7 @@
 // 각 단계 fail-soft: S3/LLM 실패해도 결정론 에센셜은 나간다.
 
 import { collectMorningSources } from './morning-synthesis.js';
-import { assembleDetailMarkdown, uploadMorningReport, type UploadedReport } from './morning-detail.js';
+import { assembleDetailMarkdown, readLatestMorningRlaScorecard, uploadMorningReport, type UploadedReport } from './morning-detail.js';
 import { synthesizeEssentialBrief, buildEssentialMessage } from './morning-essential.js';
 import { dashboardHeatmap, dashboardSummary } from './dashboard-data.js';
 
@@ -29,7 +29,7 @@ export interface MorningReportOpts {
 /** 밤사이 소스를 종합한 아침 에센셜(텔레그램) 조립. 상세는 S3 링크로. */
 export async function composeMorningReport(now: Date = new Date(), opts: MorningReportOpts = {}): Promise<string> {
   const src = await collectMorningSources(now);
-  const md = assembleDetailMarkdown(src);
+  const md = assembleDetailMarkdown(src, readLatestMorningRlaScorecard());
 
   // KST 날짜 키(07:45 KST 는 UTC 전날 22:45 — UTC 날짜와 다름).
   const kstDate = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Seoul' });

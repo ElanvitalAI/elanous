@@ -1,7 +1,8 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 /**
  * TaskUpdate runtime — partial patch with status / priority / notes.
  */
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 import type { Task, TaskStatus, TaskPriority } from '../types.js';
 import { isTaskStatus } from '../types.js';

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // ── Tier flip · wire helpers · unit tests ──
 //
 // ROADMAP-agent-surface-deferred-tools-2026-05-13 Wave 2 W2.4/W2.5.
@@ -11,7 +12,7 @@ import {
   applyDeferredTools,
   injectDeferredAnnounce,
 } from '../src/session-runtime/tier-flip.ts';
-import type { LLMMessage, LLMToolSpec } from '../src/llm.ts';
+import type { LLMMessage } from '../src/llm.ts';
 import type { NativeToolCatalogEntry } from '../src/native-tool-catalog.ts';
 
 function spec(name: string): LLMToolSpec {

@@ -1010,6 +1010,10 @@ export interface HeadlessGoalLoopPtyOptions {
    *  ⚠️ **테스트 seam 겸용**(리뷰 must-fix — 이게 없으면 timeout fail-soft 경로를 45초 없이 검증할 수
    *  없다). 프로덕션은 기본값을 쓴다(호출부 미지정). */
   brainTimeoutMs?: number;
+  /** Test seam for the brain-decision timeout only; loop and wall-clock budgets stay real. */
+  brainTimeoutTimers?: { setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout };
+  /** Test clock for the brain timeout budget only; the loop's wall-clock guard remains real. */
+  brainTimeoutBudgetNowMs?: () => number;
   /** ★S4 P3 **관측 시계 seam**(테스트 전용·기본 `Date.now`).
    *
    *  stall 사다리는 15s·60s·**5min** 이라, 자동 종료 배선을 *런타임으로* 검증하려면 그만큼 실제로
@@ -1017,6 +1021,8 @@ export interface HeadlessGoalLoopPtyOptions {
    *  ⚠️ **타임아웃 축(soft/hard/grace)은 이 시계를 쓰지 않는다** — 가상 시간이 종료 판정을 흔들면
    *     테스트가 검증하려는 것과 다른 경로를 타게 된다. 프로덕션에선 둘 다 `Date.now` 로 동일하다. */
   nowMs?: () => number;
+  /** Wall-clock timeout clock seam; production uses `Date.now`. */
+  wallClockNowMs?: () => number;
   /** Parent mailbox observation dependencies, injectable only for lifecycle tests. */
   boundaryRequestsWatchOptions?: BoundaryRequestWatchOptions;
   /** Lifecycle scoreboard reader seam. Missing or throwing readers are recorded as an empty signal. */
@@ -1034,6 +1040,10 @@ export interface HeadlessGoalLoopPtyOptions {
   /** 테스트 seam. */
   spawn?: typeof startPty;
   ptyAvailable?: () => boolean;
+}
+
+export function calculateBrainTimeoutMs(configuredTimeoutMs: number, hardBudgetMs: number, elapsedMs: number): number {
+  return Math.min(configuredTimeoutMs, Math.max(1, hardBudgetMs - elapsedMs));
 }
 
 /**
@@ -1208,6 +1218,8 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
     ?? (() => { try { return resolveActiveProvider(getUserConfig()); } catch { return undefined; } })();
   if (implementRole) debug.log('self-implement.child-llm', 'implement-role', { provider: implementRole.provider, model: implementRole.model, tier: implementRole.tier ?? null, source: implementRole.source });
   const spawn = opts.spawn ?? startPty;
+  const setBrainTimeout = opts.brainTimeoutTimers?.setTimeout ?? setTimeout;
+  const clearBrainTimeout = opts.brainTimeoutTimers?.clearTimeout ?? clearTimeout;
   const available = opts.ptyAvailable ?? ptyAvailable;
   const nexusPwaResolver = opts.resolveNexusPwa ?? resolveNexusPwa;
   const grokFreshnessReader = opts.readGrokTokenFreshness ?? readGrokTokenFreshness;
@@ -1555,8 +1567,11 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
     //   ⇒ 기존 활동-grace 의미(i 기반)는 **그대로 두고** 절대 경과시간을 **추가 상한**으로만 얹는다.
     //   단조 안전: 더 **일찍** 멈출 뿐 늦게 멈추는 경우가 없다. brain 미주입이면 i≈초라 두 조건이 일치
     //   (무회귀). ROADMAP §2 P1(종료 지연)의 회계 구조를 재작성하지 않는 최소 개입이다.
-    const loopStartedMs = Date.now();
-    const elapsedSec = (): number => (Date.now() - loopStartedMs) / 1000;
+    const wallClockNowMs = opts.wallClockNowMs ?? Date.now;
+    const loopStartedMs = wallClockNowMs();
+    const brainTimeoutBudgetNowMs = opts.brainTimeoutBudgetNowMs ?? wallClockNowMs;
+    const brainTimeoutBudgetStartedMs = opts.brainTimeoutBudgetNowMs?.() ?? loopStartedMs;
+    const elapsedSec = (): number => (wallClockNowMs() - loopStartedMs) / 1000;
     pollLoop: for (let i = 0; i < hardI; i += 1) {
       if (opts.signal?.aborted) { timedOut = false; exitReason = 'abort'; break; } // /cancel → 조기 종료(PTY 이미 kill)
       if (elapsedSec() >= hardI) { // 절대 상한(상담 시간 포함) — i 회계가 늘어져도 여기서 끊긴다
@@ -1747,9 +1762,9 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                       //   검사하므로, deadline 직전에 시작된 상담이 그대로면 최대 brainTimeoutMs(기본 45초)만큼
                       //   hard deadline 을 **초과**한다. 상담 자체를 남은 예산 안으로 묶어 창을 닫는다.
                       //   최소 1ms(음수·0 이면 즉시 timeout → 다음 tick 상단 wall-clock 체크가 루프를 끊는다).
-                      const remainMs = Math.max(1, hardI * 1000 - (Date.now() - loopStartedMs));
-                      timer = setTimeout(() => { controller.abort(); reject(new Error('brain suggestion timeout')); },
-                        Math.min(opts.brainTimeoutMs ?? 45_000, remainMs));
+                      const timeoutMs = calculateBrainTimeoutMs(opts.brainTimeoutMs ?? 45_000, hardI * 1000,
+                        brainTimeoutBudgetNowMs() - brainTimeoutBudgetStartedMs);
+                      timer = setBrainTimeout(() => { controller.abort(); reject(new Error('brain suggestion timeout')); }, timeoutMs);
                     }),
                     ...(parentAbort ? [parentAbort] : []),
                   ]);
@@ -1925,7 +1940,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                     error: String(e instanceof Error ? e.message : e).slice(0, 120),
                   });
                 } finally {
-                  if (timer) clearTimeout(timer);
+                  if (timer) clearBrainTimeout(timer);
                   opts.signal?.removeEventListener('abort', onBrainAbort);
                 }
               }

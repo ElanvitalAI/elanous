@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Read tool (Claude Code-compatible file reader) ──
 //
 // Ports claude-code-fork/src/tools/FileReadTool with a scope trimmed
@@ -23,7 +24,7 @@
 
 import { statSync, openSync, readSync, closeSync, createReadStream, existsSync } from 'node:fs';
 import { isAbsolute, extname } from 'node:path';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { debug } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import {

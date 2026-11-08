@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { collectGraphEvents, formatApprovalMessage, notifyGraphEvents as notifyGraphEventsRaw, setGraphNotifyFlockForTest, type GraphNotifyOptions } from './graph-notify.js';
 import type { GraphRunState } from './runner.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
-import { simInProcessCli } from '../ux-sim/in-process-cli.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
 // Approval events now raise decision cards; the real ledger resolves versions from git (seconds per card), so tests pin it.
 function notifyGraphEvents(options: GraphNotifyOptions) {
@@ -58,7 +58,7 @@ test('collects opted-in node and pending approval from persisted runs without ch
 });
 
 async function runGraphNotifyCommand(root: string, dryRun = false) {
-  return simInProcessCli(['graph', 'notify', ...(dryRun ? ['--dry-run'] : []), '--graphs-dir', join(root, 'graphs')], {
+  return simCli(['graph', 'notify', ...(dryRun ? ['--dry-run'] : []), '--graphs-dir', join(root, 'graphs')], {
     allowPaths: [['graph', 'notify']], stateRoot: root,
   });
 }

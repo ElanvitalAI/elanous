@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // PLAN-ios-rich-dev-feedback-hydrate followup (2026-05-13) — Write tool
 // alongside Edit. Edit 는 *기존* 파일의 exact-substring 치환만 지원하므로
 // LLM 이 새 파일 생성 시 Bash 로 우회 → daemon Bash 는 envelope 미발화 →
@@ -16,7 +17,7 @@
 
 import { promises as fsp } from 'fs';
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { computePatch } from '../../code-edit/diff-compute.js';
 import type { StructuredPatchHunk } from '../../code-edit/types.js';
 import {

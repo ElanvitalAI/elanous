@@ -16,6 +16,7 @@ import { DEFAULT_THEME_TOKENS } from '../../theme/tokens.js';
 import { listThemes } from '../../themes/index.js';
 import type { QuestionChannel } from '../../hitl/question.js';
 import { displayedSlashCommandNames, SLASH_COMMANDS } from '../../chat/index.js';
+import { withFakeFetchDevice } from '../../ux-sim/fake-fetch.js';
 import {
   applyClarificationReply,
   parseGoalDocumentClarifications,
@@ -363,17 +364,20 @@ test('/loops uses the dashboardLoops API contract: category is mode, not owner; 
   const ctx = createContext(lines);
   ctx.error = (text) => `<red>${text}</red>`;
   ctx.sessionSlash = { remoteDaemon: () => ({ url: 'ws://127.0.0.1:3020/acp', token: 'secret' }) } as DashboardSlashContext['sessionSlash'];
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-    expect((init?.headers as Record<string, string>).authorization).toBe('Bearer secret');
-    if (String(url).endsWith('/v1/dashboard/loops')) return new Response(JSON.stringify({ ok: true, loops: apiLoops }), { status: 200 });
-    return new Response(JSON.stringify({ schedules: [
+  await withFakeFetchDevice([
+    { url: '/acp/v1/dashboard/loops', response: (request) => {
+      expect(request.headers.authorization).toBe('Bearer secret');
+      return Response.json({ ok: true, loops: apiLoops });
+    } },
+    { url: '/acp/v1/schedules', response: (request) => {
+      expect(request.headers.authorization).toBe('Bearer secret');
+      return Response.json({ schedules: [
       { name: 'heartbeat', domain: 'ops', runVia: 'crontab', source: 'crontab', registryEnabled: true, state: 'live',
         lastRun: { at: '2026-01-01T00:00:00Z', status: 'error', exit: 1 }, intervalMs: 60_000 },
       { name: 'markets', domain: 'finance', runVia: 'crontab', source: 'crontab', registryEnabled: true, state: 'live', lastRun: null },
-    ] }), { status: 200 });
-  }) as typeof fetch;
-  try {
+    ] });
+    } },
+  ], async (device) => {
     await registry.dispatch('loops', [], ctx);
     expect(lines.join('\n')).toContain('LAYER');
     expect(lines.join('\n')).toContain('OWNER');
@@ -393,7 +397,9 @@ test('/loops uses the dashboardLoops API contract: category is mode, not owner; 
     expect(lines.join('\n')).toContain('markets');
     expect(lines.join('\n')).not.toContain('Dig');
     expect(lines.join('\n')).not.toContain('heartbeat');
-  } finally { globalThis.fetch = previousFetch; }
+    expect(device.calls().length).toBeGreaterThan(0);
+    expect(device.calls().every(call => call.routeId !== null && call.status === 200)).toBe(true);
+  });
 });
 
 test('/loops daemon cron uses calendar due instants rather than future interval across a weekend', async () => {
@@ -401,24 +407,26 @@ test('/loops daemon cron uses calendar due instants rather than future interval 
   const ctx = createContext(lines);
   ctx.sessionSlash = { remoteDaemon: () => ({ url: 'ws://127.0.0.1:3020/acp', token: undefined }) } as DashboardSlashContext['sessionSlash'];
   ctx.loopsLocalRows = () => [];
-  const previousFetch = globalThis.fetch;
   const previousNow = Date.now;
   let currentTime = '2026-01-10T12:00:00Z';
-  Date.now = () => Date.parse(currentTime);
-  globalThis.fetch = (async (url: string | URL | Request) => new Response(JSON.stringify(
-    String(url).includes('/v1/schedules') ? { schedules: [{
+  await withFakeFetchDevice([
+      { url: '/acp/v1/schedules', response: Response.json({ schedules: [{
       name: 'weekday', domain: 'ops', runVia: 'crontab', source: 'crontab', cron: '0 9 * * 1-5', state: 'live',
       lastRun: { at: '2026-01-09T09:00:00Z', status: 'ok', exit: 0 }, intervalMs: 86_400_000,
-    }] } : { loops: { loops: [] } },
-  ), { status: 200 })) as typeof fetch;
-  try {
-    await buildDashboardSlashRegistry().dispatch('loops', ['ops'], ctx);
-    expect(lines.find(line => line.includes('weekday'))).toMatch(/daemon cron\s+weekday\s+ops\s+crontab\s+2026-01-09T09:00:00Z\s+alive/);
-    lines.length = 0;
-    currentTime = '2026-01-13T09:01:00Z';
-    await buildDashboardSlashRegistry().dispatch('loops', ['ops'], ctx);
-    expect(lines.find(line => line.includes('weekday'))).toContain('late');
-  } finally { globalThis.fetch = previousFetch; Date.now = previousNow; }
+      }] }) },
+      { url: '/acp/v1/dashboard/loops', response: Response.json({ loops: { loops: [] } }) },
+    ], async (device) => {
+      Date.now = () => Date.parse(currentTime);
+      try {
+        await buildDashboardSlashRegistry().dispatch('loops', ['ops'], ctx);
+        expect(lines.find(line => line.includes('weekday'))).toMatch(/daemon cron\s+weekday\s+ops\s+crontab\s+2026-01-09T09:00:00Z\s+alive/);
+        lines.length = 0;
+        currentTime = '2026-01-13T09:01:00Z';
+        await buildDashboardSlashRegistry().dispatch('loops', ['ops'], ctx);
+        expect(lines.find(line => line.includes('weekday'))).toContain('late');
+        expect(device.calls().every(call => call.routeId !== null)).toBe(true);
+      } finally { Date.now = previousNow; }
+    });
 });
 
 test('/loops displays local rows and the other daemon registry when schedules never respond, even if fetch ignores abort', async () => {
@@ -426,16 +434,16 @@ test('/loops displays local rows and the other daemon registry when schedules ne
   const ctx = createContext(lines);
   ctx.sessionSlash = { remoteDaemon: () => ({ url: 'ws://127.0.0.1:3020/acp', token: undefined }) } as DashboardSlashContext['sessionSlash'];
   ctx.loopsLocalRows = () => [{ layer: 'local loop', name: 'local-pulse', owner: 'ops', mode: 'event', lastRun: null, verdict: 'alive' }];
-  const previousFetch = globalThis.fetch;
   const requested: string[] = [];
-  globalThis.fetch = (async (url: string | URL | Request) => {
-    requested.push(String(url));
-    if (String(url).includes('/v1/schedules')) return new Promise<Response>(() => {});
-    return new Response(JSON.stringify({ loops: { loops: [
+  await withFakeFetchDevice([
+    { url: '/acp/v1/schedules', response: () => new Promise<Response>(() => {}) },
+    { url: '/acp/v1/dashboard/loops', response: (request) => {
+      requested.push(request.url);
+      return Response.json({ loops: { loops: [
       { name: 'dig', label: 'Remote dig', armed: true, category: 'exec', last: null },
-    ] } }), { status: 200 });
-  }) as typeof fetch;
-  try {
+      ] } });
+    } },
+  ], async (device) => {
     const completion = await Promise.race([
       buildDashboardSlashRegistry().dispatch('loops', [], ctx).then(() => 'completed'),
       Bun.sleep(3000).then(() => 'timed out'),
@@ -446,7 +454,9 @@ test('/loops displays local rows and the other daemon registry when schedules ne
     expect(lines.join('\n')).toContain('Remote dig');
     expect(lines.join('\n')).toContain('local-pulse');
     expect(lines.join('\n')).toContain('VERDICT');
-  } finally { globalThis.fetch = previousFetch; }
+    expect(device.calls().some(call => call.routeId === 'route-1' && call.status === null)).toBe(true);
+    expect(device.calls().some(call => call.routeId === 'route-2' && call.status === 200)).toBe(true);
+  });
 });
 
 test('/loops displays local rows when both daemon responses stall', async () => {
@@ -455,9 +465,10 @@ test('/loops displays local rows when both daemon responses stall', async () => 
   ctx.sessionSlash = { remoteDaemon: () => ({ url: 'ws://127.0.0.1:3020/acp', token: undefined }) } as DashboardSlashContext['sessionSlash'];
   ctx.loopsLocalRows = () => [{ layer: 'local cron', name: 'local-ops', owner: 'ops', mode: 'crontab', lastRun: null, verdict: 'late' }];
   ctx.error = text => `<red>${text}</red>`;
-  const previousFetch = globalThis.fetch;
-  globalThis.fetch = (async () => new Promise<Response>(() => {})) as unknown as typeof fetch;
-  try {
+  await withFakeFetchDevice([
+    { url: '/acp/v1/schedules', response: () => new Promise<Response>(() => {}) },
+    { url: '/acp/v1/dashboard/loops', response: () => new Promise<Response>(() => {}) },
+  ], async (device) => {
     const completion = await Promise.race([
       buildDashboardSlashRegistry().dispatch('loops', ['ops'], ctx).then(() => 'completed'),
       Bun.sleep(3000).then(() => 'timed out'),
@@ -467,7 +478,9 @@ test('/loops displays local rows when both daemon responses stall', async () => 
     expect(lines.join('\n')).toContain('daemon loops unavailable:');
     expect(lines.join('\n')).toContain('local-ops');
     expect(lines.join('\n')).toContain('<red>late</red>');
-  } finally { globalThis.fetch = previousFetch; }
+    expect(device.calls()).toHaveLength(2);
+    expect(device.calls().every(call => call.routeId !== null && call.status === null)).toBe(true);
+  });
 });
 
 test('/wish follows /now in the visible catalog and registers on the human dashboard', () => {

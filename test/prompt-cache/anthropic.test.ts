@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../src/llm/tool-spec.js';
 import { describe, expect, test } from 'bun:test';
 import {
   toAnthropicSystemBlocks,
@@ -6,7 +7,7 @@ import {
   formatUsageLine,
   EPHEMERAL_CACHE,
 } from '../../src/prompt-cache/index.js';
-import type { LLMMessage, LLMToolSpec } from '../../src/llm.js';
+import type { LLMMessage } from '../../src/llm.js';
 
 // ── toAnthropicSystemBlocks ────────────────────────────────────────
 

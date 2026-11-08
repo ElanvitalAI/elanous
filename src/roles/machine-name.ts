@@ -1,17 +1,12 @@
 import { hostname } from 'node:os';
-import { join } from 'node:path';
 import { assertJoinedMachineId, readMachineProfile, writeMachineProfile } from './machine-profile.js';
 import { readPrimaryJoin } from '../control-plane/primary.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-
-export const MACHINE_NAME = /^[a-z0-9][a-z0-9-]{0,31}$/;
+import { MACHINE_NAME } from './machine-profile-contract.js';
+export { MACHINE_NAME, machineConfigPath } from './machine-profile-contract.js';
 
 export type MachineNameSource = 'option' | 'config' | 'join' | 'hostname';
 export interface ResolvedMachineName { readonly machine: string; readonly source: MachineNameSource }
-
-export function machineConfigPath(root: string = effectiveInstanceRoot()): string {
-  return join(root, 'control', 'machine.json');
-}
 
 /** A missing or damaged file is not a name — fall through to the next source. */
 export function readConfiguredMachine(root: string = effectiveInstanceRoot()): string | undefined {

@@ -1,63 +1,287 @@
 #!/usr/bin/env bun
+import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
+import { evaluateWaiverEvent, readWaiverEvents, type WaiverEventDecision } from '../../src/release-loop/waiver-events.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
-import type { GateResult } from './gate-node.js';
+import type { GateResult } from './gate-types.js';
 import { emitNodeResult, readGraphContext, type GraphContext } from './node-verdict.js';
 import { planAdaptiveGateHeal } from './adaptive-gate-heal.js';
+import { macrophageEvidenceMatchesObservedGate, planMacrophageRepairLadder, type MacrophageRepairLadderDecision, type MacrophageRepairLadderInput } from '../../src/release-loop/macrophage-repair-ladder.js';
+import type { GateTriageClass, GateTriageEvidence, GateTriageShadow } from './gate-triage-types.js';
+import { parseRollingMainState, rollingMainReceiptIntact, type RollingMainReceipt } from './rolling-main-gate.js';
+export type { GateTriageClass, GateTriageEvidence, GateTriageShadow } from './gate-triage-types.js';
 
-/** A shadow recommendation. No value here is a release waiver or a graph edge. */
-export type GateTriageClass = 'unmeasured' | 'load' | 'env' | 'regression' | 'clean' | 'exhausted';
+const COMMIT_SHA = /^[0-9a-f]{40}$/i;
 
-export interface GateTriageEvidence {
-  /** Observed from the Pod/host during this gate; a timeout alone is not proof of load. */
-  highLoad?: boolean;
-  /** Count of the suspected failure IDs reproduced in an isolated run. */
-  isolatedReproductions?: number;
-  /** Exact introduced IDs that actually received an isolated recheck. */
-  isolatedCheckedFailureIds?: string[];
-  /** Timeout shard files that completed an isolated recheck. */
-  isolatedPassedFiles?: string[];
-  /** Exact test IDs independently attributed to the Pod environment. */
-  environmentFailureIds?: string[];
-  /** The last two actual decisions, including their measured identities. */
-  priorDecisions?: Array<{ classification: GateTriageClass; commit: string; failureIds: string[] }>;
+function supportsIntroducedMainFixedPick(version: string): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(version);
+  if (!match) return false;
+  const [, majorText, minorText, patchText, prerelease] = match;
+  const major = Number(majorText);
+  const minor = Number(minorText);
+  const patch = Number(patchText);
+  return major > 0 || minor > 3 || (minor === 3 && (patch > 7 || (patch === 7 && prerelease === undefined)));
 }
 
-export interface GateTriageShadow {
-  /** Exact gate execution this triage was computed from; absent only for legacy/direct offline inputs. */
-  gateExecutionId?: string;
-  classification: GateTriageClass;
-  reason: string;
-  commit: string;
-  introduced: string[];
-  stalledFiles: string[];
-  failureIds: string[];
-  evidence: {
-    highLoad: boolean | null;
-    isolatedReproductions: number | null;
-    isolatedCheckedFailureIds: string[] | null;
-    isolatedPassedFiles: string[] | null;
-    environmentFailureIds: string[] | null;
-    loadFlaky: string[] | null;
-    stalledEnv: Array<{ file: string; local: string }>;
+export interface IntroducedMainFixedPickInput {
+  readonly cutCommit: string;
+  readonly mainTip: string;
+  readonly firstParentBaseCommit: string;
+  /** Complete main first-parent sequence, inclusive of merge base and main tip. */
+  readonly firstParentCommits: readonly string[];
+  readonly introducedIds: readonly string[];
+  readonly cutResults: readonly { id: string; status: 'pass' | 'fail' | 'unmeasured' }[];
+  readonly mainMeasurement?: { commit: string; runId: string; receiptSha256: string; receiptBody: string };
+  readonly rollingRuns?: readonly { commit: string; status: 'green' | 'red' | 'unreusable'; introduced: readonly string[];
+    receipt?: RollingMainReceipt }[];
+}
+
+export interface IntroducedMainFixedPick {
+  readonly status: 'measured' | 'unmeasured';
+  readonly reason: string;
+  readonly candidates: readonly { failureId: string; commit: string; source: 'rolling-main-transition' | 'main-head-fallback' }[];
+  readonly unverifiedCandidates: readonly { failureId: string; commit: string; status: 'unverified'; reason: 'execution receipt absent' }[];
+  readonly firstParentCommits?: readonly string[];
+}
+
+type GateTriageShadowWithMainFixedPick = GateTriageShadow & { mainFixedPick?: IntroducedMainFixedPick };
+
+/** Suggest only the first measured first-parent point where a cut failure disappears. */
+export function assessIntroducedMainFixedPick(input: IntroducedMainFixedPickInput): IntroducedMainFixedPick {
+  const unmeasured = (reason: string, unverifiedCandidates: IntroducedMainFixedPick['unverifiedCandidates'] = [],
+    firstParentCommits?: readonly string[]): IntroducedMainFixedPick =>
+    ({ status: 'unmeasured', reason, candidates: [], unverifiedCandidates,
+      ...(firstParentCommits ? { firstParentCommits: [...firstParentCommits] } : {}) });
+  if (!COMMIT_SHA.test(input.cutCommit) || !COMMIT_SHA.test(input.mainTip)
+      || !COMMIT_SHA.test(input.firstParentBaseCommit)
+      || !Array.isArray(input.firstParentCommits) || !Array.isArray(input.introducedIds)
+      || !Array.isArray(input.cutResults)
+      || input.firstParentCommits.length < 2 || input.firstParentCommits[0] !== input.firstParentBaseCommit
+      || input.firstParentCommits.at(-1) !== input.mainTip
+      || input.firstParentCommits.some((commit) => !COMMIT_SHA.test(commit))
+      || new Set(input.firstParentCommits).size !== input.firstParentCommits.length)
+    return unmeasured('cut-to-main first-parent chain is incomplete or invalid');
+  const ids = [...new Set(input.introducedIds)];
+  if (!ids.length || ids.length !== input.introducedIds.length || ids.some((id) => typeof id !== 'string' || !id.trim()))
+    return unmeasured('cut introduced failure identities are empty, duplicated, or invalid');
+  const exactResults = (rows: readonly { id: string; status: string }[]) => rows.length === ids.length
+    && rows.every((row) => row && typeof row.id === 'string' && typeof row.status === 'string')
+    && new Set(rows.map((row) => row.id)).size === rows.length
+    && ids.every((id) => rows.some((row) => row.id === id));
+  if (!exactResults(input.cutResults) || input.cutResults.some((row) => row.status !== 'fail'))
+    return unmeasured('cut remeasurement does not prove every introduced identity failed');
+  let mainResults: readonly { id: string; status: 'pass' | 'fail' | 'unmeasured' }[] | undefined;
+  if (input.mainMeasurement) {
+    const measurement = input.mainMeasurement;
+    if (measurement.commit === input.mainTip && /^[\w.-]{1,120}$/.test(measurement.runId)
+        && /^[0-9a-f]{64}$/i.test(measurement.receiptSha256)
+        && createHash('sha256').update(measurement.receiptBody).digest('hex') === measurement.receiptSha256) {
+      try {
+        const receipt = JSON.parse(measurement.receiptBody) as {
+          schema?: unknown; complete?: unknown; runId?: unknown; commit?: unknown; results?: unknown;
+        };
+        if (receipt.schema === 'main-standalone-v1' && receipt.complete === true && receipt.runId === measurement.runId
+            && receipt.commit === input.mainTip && Array.isArray(receipt.results)
+            && exactResults(receipt.results) && receipt.results.every((row) => ['pass', 'fail', 'unmeasured'].includes(row.status))
+            && !receipt.results.some((row) => row.status === 'unmeasured'))
+          mainResults = receipt.results as readonly { id: string; status: 'pass' | 'fail' | 'unmeasured' }[];
+      } catch {
+        // Ignore unusable standalone evidence; an intact rolling receipt can still prove a transition.
+      }
+    }
+  }
+  const standaloneFallback = (reason: string): IntroducedMainFixedPick => {
+    if (!input.mainMeasurement || !mainResults) {
+      const claimedPasses = mainResults?.filter((row) => row.status === 'pass').map((row) => row.id) ?? ids;
+      return unmeasured(reason, claimedPasses.map((failureId) => ({ failureId, commit: input.mainTip,
+        status: 'unverified' as const, reason: 'execution receipt absent' as const })), input.firstParentCommits);
+    }
+    return { status: 'measured', reason, firstParentCommits: [...input.firstParentCommits],
+      candidates: ids.flatMap((failureId) => mainResults!.find((row) => row.id === failureId)?.status === 'pass'
+        ? [{ failureId, commit: input.mainTip, source: 'main-head-fallback' as const }] : []), unverifiedCandidates: [] };
   };
-  /** Classification succeeded; the release graph still routes to its failure exit. */
-  outcome: 'ok' | 'error';
+  if (input.rollingRuns === undefined) {
+    return standaloneFallback('rolling-main state absent; main-head standalone measurements and verified first-parent range used as fallback');
+  }
+  const expectedRunCommits = input.firstParentCommits.slice(1);
+  if (input.rollingRuns.length !== expectedRunCommits.length
+      || input.rollingRuns.some((run, index) => run.commit !== expectedRunCommits[index]))
+    return standaloneFallback('rolling-main range is incomplete; verified main-head standalone measurements used as fallback');
+  for (const run of input.rollingRuns) {
+    if (run.status === 'unreusable' || !Array.isArray(run.introduced)
+        || run.introduced.some((id: unknown) => typeof id !== 'string'))
+      return standaloneFallback(`rolling-main run ${run.commit} is unmeasured; standalone measurements used as fallback`);
+    if (run.status === 'green' && (!run.receipt || run.receipt.commit !== run.commit
+        || !rollingMainReceiptIntact(run.receipt) || run.introduced.length !== 0))
+      return standaloneFallback(`rolling-main green receipt ${run.commit} is absent, changed, or inconsistent; standalone measurements used as fallback`);
+    if (run.status === 'red' && run.receipt !== undefined)
+      return standaloneFallback(`rolling-main red run ${run.commit} unexpectedly carries a green receipt; standalone measurements used as fallback`);
+  }
+  const candidates: Array<{ failureId: string; commit: string; source: 'rolling-main-transition' | 'main-head-fallback' }> = [];
+  const unverifiedCandidates: IntroducedMainFixedPick['unverifiedCandidates'][number][] = [];
+  for (const id of ids) {
+    let observedMainFailure = false;
+    let transitionAmbiguous = false;
+    let currentRollingFailure = false;
+    let latestGreen: { failureId: string; commit: string; source: 'rolling-main-transition' } | undefined;
+    let latestUnverified: IntroducedMainFixedPick['unverifiedCandidates'][number] | undefined;
+    for (const run of input.rollingRuns) {
+      const stillIntroduced = run.introduced.includes(id);
+      if (stillIntroduced) {
+        observedMainFailure = true;
+        transitionAmbiguous = false;
+        if (run.commit === input.mainTip) currentRollingFailure = true;
+        latestGreen = undefined;
+        latestUnverified = { failureId: id, commit: run.commit, status: 'unverified', reason: 'execution receipt absent' };
+      } else if (observedMainFailure && run.status === 'green' && run.receipt && rollingMainReceiptIntact(run.receipt)) {
+        if (!transitionAmbiguous) {
+          latestGreen ??= { failureId: id, commit: run.commit, source: 'rolling-main-transition' };
+          latestUnverified = undefined;
+        }
+      } else if (observedMainFailure) {
+        transitionAmbiguous = true;
+        latestGreen = undefined;
+        latestUnverified = { failureId: id, commit: run.commit, status: 'unverified', reason: 'execution receipt absent' };
+      }
+    }
+    if (mainResults?.find((row) => row.id === id)?.status === 'fail') continue;
+    if (latestGreen) candidates.push(latestGreen);
+    else if (mainResults?.find((row) => row.id === id)?.status === 'pass' && !currentRollingFailure)
+      candidates.push({ failureId: id, commit: input.mainTip, source: 'main-head-fallback' });
+    else if (latestUnverified) unverifiedCandidates.push(latestUnverified);
+    else unverifiedCandidates.push({ failureId: id, commit: input.mainTip,
+      status: 'unverified', reason: 'execution receipt absent' });
+  }
+  return { status: candidates.length || mainResults ? 'measured' : 'unmeasured',
+    reason: candidates.some((candidate) => candidate.source === 'rolling-main-transition')
+      ? 'cut, main, first-parent sequence, and rolling-main receipt agree'
+      : candidates.length ? 'main standalone receipt verifies the current main-head candidate'
+      : mainResults ? 'main standalone receipt confirms no verified fix candidate at the current main tip'
+        : 'no per-test transition receipt; suggestions are unverified',
+    firstParentCommits: [...input.firstParentCommits], candidates,
+    unverifiedCandidates: unverifiedCandidates.filter((item) => !candidates.some((candidate) => candidate.failureId === item.failureId)) };
+}
+
+function verifiedFirstParentRange(cutCommit: string, mainTip: string, supplied: unknown):
+  { baseCommit: string; commits: string[] } | null {
+  if (!COMMIT_SHA.test(cutCommit) || !COMMIT_SHA.test(mainTip)
+      || (supplied !== undefined && (!Array.isArray(supplied) || !supplied.every((commit) => typeof commit === 'string')))) return null;
+  const tip = spawnSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8', timeout: 15_000 });
+  if (tip.status !== 0 || tip.stdout.trim() !== mainTip) return null;
+  const remoteTip = spawnSync('git', ['ls-remote', 'origin', 'refs/heads/main'], { encoding: 'utf8', timeout: 15_000 });
+  if (remoteTip.status !== 0 || remoteTip.stdout.trim().split(/\s+/)[0] !== mainTip) return null;
+  const mergeBase = spawnSync('git', ['merge-base', cutCommit, mainTip], { encoding: 'utf8', timeout: 15_000 });
+  const baseCommit = mergeBase.status === 0 ? mergeBase.stdout.trim() : '';
+  if (!COMMIT_SHA.test(baseCommit)) return null;
+  const history = spawnSync('git', ['rev-list', '--first-parent', '--reverse', `${baseCommit}..${mainTip}`],
+    { encoding: 'utf8', timeout: 15_000 });
+  if (history.status !== 0) return null;
+  const firstParentAncestors = spawnSync('git', ['rev-list', '--first-parent', mainTip],
+    { encoding: 'utf8', timeout: 15_000 });
+  if (firstParentAncestors.status !== 0 || !firstParentAncestors.stdout.split(/\r?\n/).includes(baseCommit)) return null;
+  const commits = [baseCommit, ...history.stdout.trim().split(/\r?\n/).filter(Boolean)];
+  return supplied === undefined || JSON.stringify(commits) === JSON.stringify(supplied) ? { baseCommit, commits } : null;
+}
+
+function introducedMainFixedPickFromContext(context: GraphContext, supplied: unknown,
+  introducedIds: readonly string[]): IntroducedMainFixedPick {
+  const unmeasured = (reason: string, mainTip = '', firstParentCommits?: readonly string[]): IntroducedMainFixedPick => ({
+    status: 'unmeasured', reason, candidates: [], unverifiedCandidates: mainTip
+      ? introducedIds.map((failureId) => ({ failureId, commit: mainTip, status: 'unverified', reason: 'execution receipt absent' })) : [],
+    ...(firstParentCommits ? { firstParentCommits: [...firstParentCommits] } : {}),
+  });
+  const value = supplied && typeof supplied === 'object' && !Array.isArray(supplied) ? supplied as Record<string, unknown> : {};
+  const cutCommit = typeof context.outputs.gate?.commit === 'string' ? context.outputs.gate.commit : '';
+  const currentMain = spawnSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8', timeout: 15_000 });
+  const mainTip = typeof value.mainTip === 'string' ? value.mainTip : currentMain.status === 0 ? currentMain.stdout.trim() : '';
+  const firstParentRange = verifiedFirstParentRange(cutCommit, mainTip, value.firstParentCommits);
+  if (!firstParentRange) return unmeasured('main tip or first-parent sequence does not match the local main history');
+  const statePath = join(effectiveInstanceRoot(), 'release', context.input.version, 'rolling-main-gate.json');
+  const measurementInfo = value.mainMeasurement && typeof value.mainMeasurement === 'object' && !Array.isArray(value.mainMeasurement)
+    ? value.mainMeasurement as Record<string, unknown> : {};
+  const runId = typeof measurementInfo.runId === 'string' ? measurementInfo.runId : '';
+  const receiptSha256 = typeof measurementInfo.receiptSha256 === 'string' ? measurementInfo.receiptSha256 : '';
+  let mainMeasurement: IntroducedMainFixedPickInput['mainMeasurement'];
+  if (runId && /^[\w.-]{1,120}$/.test(runId) && /^[0-9a-f]{64}$/i.test(receiptSha256)
+      && measurementInfo.commit === mainTip) {
+    const measurementPath = join(effectiveInstanceRoot(), 'release', context.input.version, 'main-standalone', `${runId}.json`);
+    try {
+      const body = readFileSync(measurementPath, 'utf8');
+      mainMeasurement = { commit: mainTip, runId, receiptSha256, receiptBody: body };
+    } catch {
+      // Missing or corrupt execution evidence yields only an explicitly unverified suggestion below.
+    }
+  }
+  const measurement = { cutCommit: cutCommit as string, mainTip, firstParentBaseCommit: firstParentRange.baseCommit,
+    firstParentCommits: firstParentRange.commits, introducedIds,
+    cutResults: introducedIds.map((id) => ({ id, status: 'fail' as const })),
+    ...(mainMeasurement ? { mainMeasurement } : {}) };
+  try {
+    const state = parseRollingMainState(readFileSync(statePath, 'utf8'), context.input.version);
+    return assessIntroducedMainFixedPick({ ...measurement, rollingRuns: state.runs });
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
+      return assessIntroducedMainFixedPick(measurement);
+    if (mainMeasurement) return assessIntroducedMainFixedPick(measurement);
+    return unmeasured(`rolling-main state or reusable receipt unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      mainTip, firstParentRange.commits);
+  }
+}
+
+/** Gate-triage reports eligible waiver events as evidence; it never consumes one. */
+export function gateWaiverEventObservations(events: ReturnType<typeof readWaiverEvents>, context: {
+  runId: string; head: string; now: number; measuredRegression: boolean; releaseEnded?: boolean;
+}): Array<{ eventId: string; kind: string; target: string; mode: string; decision: WaiverEventDecision }> {
+  return events.filter((event) => event.kind === 'gate').map((event) => ({
+    eventId: event.eventId, kind: event.kind, target: event.target, mode: event.mode,
+    decision: evaluateWaiverEvent(event, { target: `run:${context.runId}`, head: context.head, now: context.now,
+      measuredRegression: context.measuredRegression, releaseEnded: context.releaseEnded ?? false }),
+  }));
 }
 
 /** A prescription is selected from observed gate facts. Execution waits until the failed run is terminal. */
 export type GatePrescription =
-  | { action: 'rerun-pod'; reason: string; runId: string | null; commit: string }
-  | { action: 'repair-card'; reason: string; runId: string | null; commit: string; failureIds: string[] }
-  | { action: 'decision-card'; reason: string; runId: string | null; commit: string }
-  | { action: 'none'; reason: string; runId: string | null; commit: string };
+  | { action: 'rerun-pod'; reason: string; runId: string | null; commit: string; macrophageRepairLadder?: MacrophageRepairLadderDecision }
+  | { action: 'repair-card'; reason: string; runId: string | null; commit: string; failureIds: string[]; macrophageRepairLadder?: MacrophageRepairLadderDecision }
+  | { action: 'decision-card'; reason: string; runId: string | null; commit: string; macrophageRepairLadder?: MacrophageRepairLadderDecision }
+  | { action: 'none'; reason: string; runId: string | null; commit: string; macrophageRepairLadder?: MacrophageRepairLadderDecision };
 
 export function chooseGatePrescription(context: GraphContext, triage: GateTriageShadow): GatePrescription {
   const runId = context.runId ?? null;
   const common = { runId, commit: triage.commit };
+  const hasLadderInput = Object.prototype.hasOwnProperty.call(context.input, 'macrophageRepairLadder');
+  if (hasLadderInput) {
+    const raw = context.input.macrophageRepairLadder;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ...common, action: 'decision-card', reason: 'macrophage repair-ladder input is malformed' };
+    }
+    const ladderInput = raw as MacrophageRepairLadderInput;
+    if (typeof context.runId !== 'string' || ladderInput.runId !== context.runId) {
+      return { ...common, action: 'decision-card', reason: 'repair-ladder run id does not match the active release run' };
+    }
+    if (!Array.isArray(ladderInput.failureIds) || !ladderInput.failureIds.every((id) => typeof id === 'string')
+      || JSON.stringify([...ladderInput.failureIds].sort()) !== JSON.stringify([...triage.failureIds].sort())) {
+      return { ...common, action: 'decision-card', reason: 'repair-ladder failure IDs do not match the attributed gate failures' };
+    }
+    const gate = context.outputs.gate;
+    if (!gate || typeof gate.outcome !== 'string' || gate.commit !== triage.commit
+      || !macrophageEvidenceMatchesObservedGate(ladderInput.evidence, gate as never, triage)) {
+      return { ...common, action: 'decision-card', reason: 'repair-ladder evidence contradicts the observed gate or triage result' };
+    }
+    const macrophageRepairLadder = planMacrophageRepairLadder(ladderInput);
+    const ladderCommon = { ...common, macrophageRepairLadder };
+    if (macrophageRepairLadder.action === 'no-op')
+      return { ...ladderCommon, action: 'none', reason: macrophageRepairLadder.reason };
+    if (macrophageRepairLadder.step === 'R0-remeasure')
+      return { ...ladderCommon, action: 'decision-card', reason: 'same-slice isolated remeasurement executor is not connected' };
+    if (macrophageRepairLadder.step === 'R1-single-file' || macrophageRepairLadder.step === 'R2-split-files')
+      return { ...ladderCommon, action: 'decision-card', reason: `${macrophageRepairLadder.step} awaits a cut-append constrained executor` };
+    return { ...ladderCommon, action: 'decision-card', reason: macrophageRepairLadder.reason };
+  }
   const gate = context.outputs.gate;
   const unattributed = (Array.isArray(gate?.stalledShards)
     && gate.stalledShards.some((shard: unknown) => shard && typeof shard === 'object'
@@ -138,7 +362,7 @@ export function classifyGateShadow(gate: GateResult, evidence: GateTriageEvidenc
 
 /** Read only the completed gate output. The graph wiring is a separate change after M3. */
 export function gateTriageShadowFromContext(context: GraphContext, evidence?: GateTriageEvidence,
-  ledgerHistory: NonNullable<GateTriageEvidence['priorDecisions']> = []): GateTriageShadow {
+  ledgerHistory: NonNullable<GateTriageEvidence['priorDecisions']> = []): GateTriageShadowWithMainFixedPick {
   const value = context.outputs.gate;
   if (!value || typeof value.commit !== 'string' || !Array.isArray(value.introduced)
     || !value.introduced.every((item) => typeof item === 'string')
@@ -179,8 +403,13 @@ export function gateTriageShadowFromContext(context: GraphContext, evidence?: Ga
     typeof value.executionId !== 'string' || value.executionId !== expectedExecutionId)) {
     throw new Error('gate triage input does not match the latest gate execution id');
   }
-  return { ...classifyGateShadow(gate as unknown as GateResult, observed),
+  const shadow = { ...classifyGateShadow(gate as unknown as GateResult, observed),
     ...(typeof value.executionId === 'string' ? { gateExecutionId: value.executionId } : {}) };
+  if ((value.introduced as string[]).length > 0
+      && (supplied.introducedMainFixedPick !== undefined || supportsIntroducedMainFixedPick(context.input.version)))
+    return { ...shadow, mainFixedPick: introducedMainFixedPickFromContext(context, supplied.introducedMainFixedPick,
+      value.introduced as string[]) };
+  return shadow;
 }
 
 export function logGateTriageShadow(result: GateTriageShadow, version: string): void {
@@ -249,22 +478,33 @@ if (import.meta.main) {
       ? gateTriageShadowFromSavedVerdict(JSON.parse(readFileSync(savedPath, 'utf8')))
       : { version: context!.input.version, result: gateTriageShadowFromContext(context!, undefined, history) };
     logGateTriageShadow(result, version);
-    const prescription = context ? chooseGatePrescription(context, result) : undefined;
-    if (prescription) debug.log('release-loop.heal', 'prescribed-shadow', { version, ...prescription });
+    const waiverEvents = readWaiverEvents(join(effectiveInstanceRoot(), 'review-results', 'waiver-events.jsonl'));
+    const measuredRegression = Array.isArray(context?.outputs.gate?.introduced)
+      && (context.outputs.gate.introduced as unknown[]).length > 0;
+    const waiverEventObservations = context ? gateWaiverEventObservations(waiverEvents, { runId: context.runId ?? '',
+      head: typeof context.outputs.gate?.commit === 'string' ? context.outputs.gate.commit : 'unknown', now: Date.now(),
+      measuredRegression, releaseEnded: false }) : [];
     const gateOutput = context?.outputs.gate;
     const rawVisitState = context?.input.adaptiveHealVisitState;
     const visitState = rawVisitState && typeof rawVisitState === 'object' && !Array.isArray(rawVisitState)
       ? { gate: Number((rawVisitState as Record<string, unknown>).gate),
         gateTriage: Number((rawVisitState as Record<string, unknown>).gateTriage) } : undefined;
+    const macroInputPresent = context ? Object.prototype.hasOwnProperty.call(context.input, 'macrophageRepairLadder') : false;
     const adaptiveHeal = context && gateOutput ? planAdaptiveGateHeal({ version, runId: context.runId ?? 'unknown',
       gate: (gateOutput.outcome === 'fail' ? { ...gateOutput, outcome: 'regression' } : gateOutput) as unknown as GateResult,
       triage: result, sourceOutcome: gateOutput.outcome as GateResult['outcome'] | 'fail',
       ...(visitState ? { visitState } : {}),
+      ...(macroInputPresent
+        ? { macrophageRepairLadder: context.input.macrophageRepairLadder as MacrophageRepairLadderInput } : {}),
       gateExecutor: context.input.gateExecutor === 'host' ? 'host' : 'pod',
       ...(typeof context.input.gatePodPool === 'string' ? { gatePodPool: context.input.gatePodPool } : {}) }) : undefined;
+    if (adaptiveHeal) debug.log('release-loop.heal', 'prescription-issued', { version, runId: context?.runId ?? null,
+      disposition: adaptiveHeal.disposition });
     if (adaptiveHeal) for (const event of adaptiveHeal.events)
       debug.log('release-loop.heal', event.name, { version, runId: context?.runId ?? null, ...event.data });
-    emitNodeResult({ ...result, ...(prescription ? { prescription } : {}), ...(adaptiveHeal ? { adaptiveHeal } : {}), verdict: result.outcome === 'ok' ? 'pass' : 'fail',
+    const outcome = adaptiveHeal?.disposition.action === 'decision-required' ? 'fail' : result.outcome;
+    emitNodeResult<Record<string, unknown>>({ ...result, outcome, waiverEventObservations,
+      ...(adaptiveHeal ? { prescription: adaptiveHeal.disposition, adaptiveHeal } : {}), verdict: result.outcome === 'ok' ? 'pass' : 'fail',
       summary: adaptiveHeal ? `gate-triage live plan: ${adaptiveHeal.disposition.action}`
         : `gate-triage shadow: ${result.classification} — ${result.reason}` });
   } catch (error) {
@@ -279,7 +519,8 @@ if (import.meta.main) {
         knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 0, error: reason }, triage: result });
     for (const event of adaptiveHeal.events) debug.log('release-loop.heal', event.name, { version: errorVersion,
       runId: context?.runId ?? null, ...event.data });
-    emitNodeResult({ ...result, adaptiveHeal, verdict: 'fail', summary: `gate-triage failed closed: ${reason}` });
+    emitNodeResult({ ...result, outcome: 'fail', prescription: adaptiveHeal.disposition, adaptiveHeal,
+      verdict: 'fail', summary: `gate-triage failed closed: ${reason}` });
     process.exitCode = 1;
   }
 }

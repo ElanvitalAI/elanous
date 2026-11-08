@@ -108,7 +108,7 @@ function exportedIdentifiers(declaration: string): string[] {
   return names;
 }
 
-function exportedDeclarations(source: string): Map<string, string> {
+export function exportedDeclarations(source: string): Map<string, string> {
   const declarations = new Map<string, string>();
   const lines = source.split(/\r?\n/);
   for (let index = 0; index < lines.length; index++) {

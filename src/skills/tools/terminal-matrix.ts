@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native LLM tools for the Terminal Matrix.
 //
 // Exposes T1-T7 matrix APIs (list / move / broadcast / channel /
@@ -12,7 +13,7 @@
 // additive: matrix-flavoured tools cover everything session e added
 // *on top of* the session registry.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { getTerminalMatrix, getChannelBus } from '../../terminal-matrix/index.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import type {

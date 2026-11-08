@@ -107,6 +107,14 @@ test('same carry evidence closes the original only when title and owner also mat
   expect(listChecklist('0.2.7').items).toHaveLength(1);
 }));
 
+test('publish gate output preserves blocking yellows and postpub yellows for auto-approval', () => isolated(() => {
+  addItem('0.2.6', { id: 'BLOCKED', title: 'Blocked before publish' });
+  setItem('0.2.6', 'BLOCKED', { disposition: 'block' }, 'TC');
+  addItem('0.2.6', { id: 'LIFECYCLE', title: 'Post-publish proof', kind: 'postpub' });
+  const result = runChecklistGate(context('0.2.6'));
+  expect(result.publishBlockingYellow).toEqual(['BLOCKED', 'LIFECYCLE']);
+}));
+
 test('a real earlier move recorded in next-version history counts as the same carry', () => isolated(() => {
   addItem('0.2.6', { id: 'K13', title: 'Carry over', owner: 'TC' });
   setItem('0.2.6', 'K13', { disposition: 'move' }, 'TC');

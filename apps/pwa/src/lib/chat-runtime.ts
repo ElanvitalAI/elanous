@@ -537,7 +537,7 @@ const TUI_SLASH_NAMES = new Set([
   'local', 'll', 'session', 'sess', 'persona', 'fork', 'rewind',
   'resume-turn', 'context', 'ctx', 'paste', 'sync', 's', 'plugin',
   'plugins', 'widget', 'widgets', 'log', 'loops', 'board', 'memory', 'mem', 'export',
-  'delta', 'diffs', 'theme', 'debug', 'rebind', 'api-allow', 'api',
+  'delta', 'diffs', 'theme', 'debug', 'api-allow', 'api',
   'prompt', 'prompts', 'history', 'hist', 'inputs', 'research', 'rsh',
   'harness', 'plan', 'chat', 'dashboard', 'dash', 'telegram', 'tg',
   'tablet', 'surface', 'term', 'terminal', 'side', 'claude', 'codex', 'gemini',

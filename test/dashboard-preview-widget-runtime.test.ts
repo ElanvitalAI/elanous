@@ -20,23 +20,6 @@ describe('createDashboardPreviewWidgetRuntime', () => {
     expect(widget.character).toBe('Terminal · pid 1 · 80×24');
   });
 
-  test('projects vi preview widget state', () => {
-    const runtime = createDashboardPreviewWidgetRuntime();
-    const widget = { state: {} as Record<string, unknown>, character: '' };
-
-    runtime.projectVi(widget, {
-      text: 'vi rows',
-      focused: false,
-      title: 'vi NOR · note.txt',
-    });
-
-    expect(widget.state.text).toBe('vi rows');
-    expect(widget.state.scroll).toBe(0);
-    expect(widget.state.focused).toBe(false);
-    expect(widget.state.preformatted).toBe(true);
-    expect(widget.character).toBe('vi NOR · note.txt');
-  });
-
   test('projects plain preview widget state', () => {
     const runtime = createDashboardPreviewWidgetRuntime();
     const widget = { state: {} as Record<string, unknown>, character: '' };

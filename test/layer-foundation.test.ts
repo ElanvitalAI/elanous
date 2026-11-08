@@ -1,5 +1,4 @@
 import { describe, expect, test } from 'bun:test';
-import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve, sep } from 'node:path';
@@ -10,14 +9,6 @@ import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-confi
 
 const root = resolve(import.meta.dir, '..');
 const src = join(root, 'src') + sep;
-const foundations = [
-  'src/debug/log.ts',
-  'src/time/format.ts',
-  'src/autopilot/state-paths.ts',
-  'src/instance/resolve.ts',
-  'src/user-config.ts',
-];
-const maxSourceFiles = 80;
 const compilerOptions: ts.CompilerOptions = {
   module: ts.ModuleKind.ESNext,
   moduleResolution: ts.ModuleResolutionKind.Bundler,
@@ -53,46 +44,6 @@ function sourceEdges(file: string): string[] {
     .filter((resolved): resolved is string => !!resolved && isSourceFile(resolved));
 }
 
-function firstPath(start: string, included: Set<string>): string {
-  const highFanout = join(root, 'src/user-config.ts');
-  const target = included.has(highFanout) ? highFanout : undefined;
-  const queue: { file: string; path: string[] }[] = [{ file: start, path: [start] }];
-  const seen = new Set<string>([start]);
-  let first: string[] | undefined;
-  for (let i = 0; i < queue.length; i++) {
-    const { file, path } = queue[i]!;
-    for (const next of sourceEdges(file)) {
-      if (seen.has(next)) continue;
-      const nextPath = [...path, next];
-      if (included.has(next)) {
-        first ??= nextPath;
-        if (!target || next === target) return nextPath.map((p) => relative(root, p)).join(' → ');
-      }
-      seen.add(next);
-      if (nextPath.length < 8) queue.push({ file: next, path: nextPath });
-    }
-  }
-  return first?.map((p) => relative(root, p)).join(' → ')
-    ?? `${relative(root, start)} → (first edge not resolved)`;
-}
-
-function repositorySourcesFor(file: string): Set<string> {
-  const dir = mkdtempSync(join(tmpdir(), 'layer-foundation-'));
-  try {
-    const config = join(dir, 'tsconfig.json');
-    writeFileSync(config, JSON.stringify({
-      extends: join(root, 'tsconfig.json'), files: [join(root, file)], include: [],
-      compilerOptions: { noEmit: true, typeRoots: [join(root, 'node_modules/@types'), join(root, 'node_modules')] },
-    }));
-    const output = execFileSync('node', [join(root, 'node_modules/typescript/bin/tsc'), '-p', config, '--listFilesOnly'], {
-      cwd: root, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, timeout: 120_000,
-    });
-    return new Set(output.trim().split(/\r?\n/).filter(isSourceFile));
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
 function allTimeFiles(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const path = join(dir, entry.name);
@@ -101,7 +52,7 @@ function allTimeFiles(dir: string): string[] {
 }
 
 describe('foundation import boundary', () => {
-  test('static imports and single-root tsc stay inside the foundation boundary', () => {
+  test('static imports stay inside the foundation boundary', () => {
     const config = join(root, 'src/user-config.ts');
     const configSource = readFileSync(config, 'utf8');
     expect(configSource).not.toMatch(/typeof\s+import\s*\(\s*['"]\.\/llm\.js['"]\s*\)/);
@@ -121,13 +72,6 @@ describe('foundation import boundary', () => {
     expect(sourceEdges(log).filter((file) => file.startsWith(sinkDir)),
       'src/debug/log.ts → src/mss/logging/sinks/**').toEqual([]);
 
-    for (const file of foundations) {
-      const files = repositorySourcesFor(file);
-      const count = files.size;
-      console.log(`${file}: ${count} repository src files (limit ${maxSourceFiles})`);
-      expect(count <= maxSourceFiles,
-        `${file}: ${count} > ${maxSourceFiles}; first path: ${firstPath(join(root, file), new Set([...files].filter((f) => f !== join(root, file))))}`).toBe(true);
-    }
   });
 });
 

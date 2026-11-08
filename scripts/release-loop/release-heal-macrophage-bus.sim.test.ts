@@ -6,7 +6,7 @@ import { createGraphEventBus, type GraphEvent } from '../../src/graph-runner/gra
 import { createMacrophageRuntime } from '../../src/release-loop/macrophage-heal-node.js';
 import type { MacrophageScrap } from '../../src/release-loop/macrophage-heal.js';
 import { registerAdaptiveGateHealAdapter, RELEASE_GATE_FAILED_EVENT, type AdaptiveGateHealAppendNodeRequest } from './adaptive-gate-heal-adapter.js';
-import type { GateResult } from './gate-node.js';
+import type { GateResult } from './gate-types.js';
 import { classifyGateShadow } from './gate-triage-node.js';
 
 interface Scenario {

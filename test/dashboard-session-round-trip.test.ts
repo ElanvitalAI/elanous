@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // U3c Phase 4 — DashboardSession end-to-end round-trip test.
 //
 // Proves the full ACP-bridge fabric works when a real in-process
@@ -20,11 +21,7 @@
 
 import { describe, expect, test, mock, spyOn, beforeEach, afterEach } from 'bun:test';
 
-import type {
-  LLMMessage,
-  LLMToolSpec,
-  StreamWithToolsHandlers,
-} from '../src/llm.js';
+import type { LLMMessage, StreamWithToolsHandlers } from '../src/llm.js';
 import * as llmModule from '../src/llm.js';
 import { isTuiRouteLine } from '../src/core-turn/short-question.js';
 import { debug } from '../src/debug/log.js';

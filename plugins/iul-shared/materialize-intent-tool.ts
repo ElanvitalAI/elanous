@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../src/llm/tool-spec.js';
 // ── MaterializeFromIntent LLM tool (IUL Phase L · Bundle 4W) ──
 //
 // Expose the generic materialize() pipeline as an LLM tool. An LLM
@@ -14,7 +15,7 @@
 //   - `dryRun: true` returns the WidgetSpec without spawning — useful
 //     for preview UX or cost-free LLM evaluations.
 
-import type { LLMProvider, LLMToolSpec } from '../../src/llm.js';
+import type { LLMProvider } from '../../src/llm.js';
 import type { WidgetInstance, WidgetTypeInfo } from '../../src/widgets/types.js';
 import {
   buildGenericSystemPrompt,

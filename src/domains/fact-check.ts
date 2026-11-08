@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── fact_check — 팩트체크 캐스케이드 (커뮤니티 정성 감시 P0 · 2026-07-09) ──────
 //
 // PLAN-community-buzz-surveillance-2026-07-09 §5-①. 특정 사실/뉴스/이벤트가 실제로
@@ -12,7 +13,7 @@
 // READ-ONLY · fail-soft. bump=false — 팩트체크는 관찰이지 회상-사용이 아니라 미엘린 강화 안 함.
 
 import { existsSync } from 'node:fs';
-import type { LLMToolSpec } from '../llm.js';
+
 import { surfaceEventsDbPath, openSurfaceEventsDb, recallEvents, ftsQuery } from './surface-events.js';
 import { searchArchive } from './memory-archive.js';
 import { BUZZ_DB_PATH, openBuzzDb } from './community-buzz/store.js';

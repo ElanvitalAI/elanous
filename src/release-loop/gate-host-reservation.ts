@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { psProcessStartMs } from '../harness/harness-stop.js';
@@ -7,6 +8,7 @@ import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { psProcessStart, type HostLeaseRecord, type PendingJobIdentity } from '../pod-lease/host-lease.js';
 import { parsePodPool, podPoolHostLease, resolvePodPoolSpec, type PodPoolMember } from '../task-orchestrator/surfaces/pod-pool.js';
+import { admitGuardianHostLease, endGuardianHostLease, renewGuardianHostLease, requestGuardianHostLease, resourceLedgerPath } from '../resource-ledger/resource-ledger.js';
 
 interface GateHostClaim {
   token: string;
@@ -175,6 +177,36 @@ const claimsDir = (root: string) => join(root, 'release', 'gate-host-reservation
 /** The release graph's pinned child state and the self gate CLI's selected universe resolve through this same entry. */
 export function gateHostReservationRoot(): string { return effectiveInstanceRoot(); }
 
+/** Keep admitted leases alive for gates longer than the initial TTL; stop is idempotent. */
+export function startGuardianHostLeaseHeartbeat(leaseIds: readonly string[], root: string, options: {
+  intervalMs?: number; ttlMs?: number; now?: () => Date;
+  schedule?: (tick: () => void, intervalMs: number) => () => void;
+} = {}): () => void {
+  const intervalMs = options.intervalMs ?? 30 * 60 * 1000;
+  const ttlMs = options.ttlMs ?? 2 * 60 * 60 * 1000;
+  const now = options.now ?? (() => new Date());
+  if (intervalMs <= 0 || ttlMs <= intervalMs) throw new Error('invalid Guardian host lease heartbeat timing');
+  const tick = () => {
+    for (const leaseId of leaseIds) {
+      try {
+        const instant = now();
+        if (!renewGuardianHostLease(leaseId, new Date(instant.getTime() + ttlMs).toISOString(), instant, resourceLedgerPath(root)))
+          debug.log('release-loop.gate', 'guardian-lease-renewal-refused', { leaseId }, { level: 'error' });
+      } catch (error) {
+        debug.log('release-loop.gate', 'guardian-lease-renewal-failed', { leaseId, error: String(error) }, { level: 'error' });
+      }
+    }
+  };
+  if (options.schedule) return options.schedule(tick, intervalMs);
+  const worker = new Worker(new URL('../resource-ledger/guardian-host-lease-heartbeat-worker.ts', import.meta.url), {
+    workerData: { leaseIds: [...leaseIds], ledgerPath: resourceLedgerPath(root), intervalMs, ttlMs },
+  });
+  worker.on('message', (message: unknown) => debug.log('release-loop.gate', 'guardian-lease-heartbeat', { message }));
+  worker.on('error', error => debug.log('release-loop.gate', 'guardian-lease-heartbeat-worker-error', { error: String(error) }, { level: 'error' }));
+  worker.unref();
+  return () => { worker.postMessage('stop'); };
+}
+
 /** Fresh instances have no claims yet; initialize the ledger before a gate asks whether a host is reserved. */
 export function ensureGateHostReservationDirectory(root: string): void {
   mkdirSync(claimsDir(root), { recursive: true, mode: 0o700 });
@@ -192,10 +224,13 @@ function claimAlive(claim: GateHostClaim): 'alive' | 'dead' | 'unknown' {
 }
 
 /** A gate owns its host until its node exits. A crashed owner's claim is removed on the next read. */
-export function reserveReleaseGateHosts(root: string, runId: string, hosts: readonly string[]): () => void {
+export function reserveReleaseGateHosts(root: string, runId: string, hosts: readonly string[], options: {
+  purpose?: string; releaseVersion?: string; requestedBy?: string;
+} = {}): () => void {
   const unique = [...new Set(hosts)];
   if (!runId || unique.some(host => host !== '*' && !hostName.test(host))) throw new Error('invalid release gate reservation');
   if (!unique.length) return () => undefined;
+  if (unique.includes('*')) throw new Error('Guardian host lease cannot admit an unresolved wildcard host');
   const dir = claimsDir(root);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const token = randomUUID();
@@ -204,12 +239,33 @@ export function reserveReleaseGateHosts(root: string, runId: string, hosts: read
   const claim: GateHostClaim = { token, runId, hosts: unique, pid: process.pid, pidStartedAt, reservedAt: Date.now() };
   const path = join(dir, `${token}.json`);
   const temp = join(dir, `.${token}.tmp`);
+  const guardianLeases: string[] = [];
+  let stopHeartbeat: () => void = () => undefined;
   try {
+    for (const rawHost of unique) {
+      const host = rawHost.split('@').at(-1)!;
+      const requestId = `release-gate:${token}:${host}`;
+      const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+      const decision = requestGuardianHostLease({ requestId, runId, requestedBy: options.requestedBy ?? 'release-loop.gate',
+        consumer: 'release-gate', purpose: options.purpose ?? 'release-cut-gate', host, priority: 'P0: release gate host',
+        expiresAt, ...(options.releaseVersion ? { releaseVersion: options.releaseVersion } : {}) }, new Date(), resourceLedgerPath(root));
+      if (decision.state !== 'active')
+        throw new Error(`Guardian denied release gate host ${host}: ${decision.reason ?? decision.state}; alternatives=${(decision.alternatives ?? []).join(',')}`);
+      guardianLeases.push(decision.leaseId);
+      if (!admitGuardianHostLease({ leaseId: decision.leaseId, host, runId, consumer: 'release-gate' }, new Date(), resourceLedgerPath(root)))
+        throw new Error(`Guardian host lease admission failed for ${host}`);
+    }
+    stopHeartbeat = startGuardianHostLeaseHeartbeat(guardianLeases, root);
     writeFileSync(temp, JSON.stringify(claim) + '\n', { mode: 0o600, flag: 'wx' });
     renameSync(temp, path);
+  } catch (error) {
+    stopHeartbeat();
+    for (const leaseId of guardianLeases) endGuardianHostLease(leaseId, 'reservation-failed', new Date(), resourceLedgerPath(root));
+    throw error;
   } finally { if (existsSync(temp)) rmSync(temp); }
   debug.log('release-loop.gate', 'host-reserved', { runId, hosts: unique, pid: process.pid, path });
   return () => {
+    stopHeartbeat();
     try {
       const current = JSON.parse(readFileSync(path, 'utf8')) as Partial<GateHostClaim>;
       if (current.token === token) rmSync(path);
@@ -217,6 +273,10 @@ export function reserveReleaseGateHosts(root: string, runId: string, hosts: read
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
         debug.log('release-loop.gate', 'host-release-unmeasured', { runId, path, error: String(error) });
+    }
+    for (const leaseId of guardianLeases) {
+      try { endGuardianHostLease(leaseId, 'release-gate-finished', new Date(), resourceLedgerPath(root)); }
+      catch (error) { debug.log('release-loop.gate', 'guardian-lease-release-unmeasured', { runId, leaseId, error: String(error) }); }
     }
   };
 }

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tool: omni_search
 //
 // Skill-essence extraction of ~/.claude/skills/omni-crawl/. Different
@@ -12,7 +13,7 @@
 //   interleave  — round-robin pick across providers (default)
 //   by-engine   — group hits under per-provider headings
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { getAvailableResearchWebSearchProviders, getAvailableWebSearchProviders } from '../../web-search/index.js';
 import type { WebSearchHit } from '../../web-search/provider.js';
 

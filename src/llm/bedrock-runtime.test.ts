@@ -1,8 +1,9 @@
+import type { LLMToolSpec } from './tool-spec.js';
 // BEDROCK-RUNTIME-PATH — runtime 경로(InvokeModelWithResponseStream) ⊕ eventstream 디코더 ⊕ 경로 표.
 // ⛔ 실 AWS 호출 0 · 자격 값은 가짜다.
 import { describe, expect, test } from 'bun:test';
 import type { UserConfig } from '../user-config.js';
-import type { LLMStreamEvent, LLMToolSpec } from '../llm.js';
+import type { LLMStreamEvent } from '../llm.js';
 import { LLM_TIER_MAP_BY_PROVIDER } from '../model-tier/llm-tier-map.js';
 import {
   BEDROCK_MODELS,

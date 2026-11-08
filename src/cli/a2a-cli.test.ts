@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { Command } from 'commander';
 import { registerA2ACommands } from './a2a-cli.js';
-import { simInProcessCli } from '../ux-sim/in-process-cli.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
 function commands() {
   const program = new Command();
@@ -14,7 +14,7 @@ function commands() {
 describe('a2a CLI commands', () => {
   test('registered a2a card prints its public card; real entry rejects serve without --tool-cwd', async () => {
     const entry = new URL('../../bin/elanous.mjs', import.meta.url).pathname;
-    const card = await simInProcessCli(['a2a', 'card'], { allowPaths: [['a2a', 'card']] });
+    const card = await simCli(['a2a', 'card'], { allowPaths: [['a2a', 'card']] });
     expect(card.exitCode).toBe(0);
     expect(card.stdout).toContain('"url": "http://127.0.0.1:31490/a2a"');
     expect(card.stdout).toContain('"kind": "remote"');

@@ -1,5 +1,5 @@
 import type { ChecklistItem } from '../../release-loop/checklist.js';
-import type { OrchestratorSeat } from '../../user-config.js';
+import type { OrchestratorSeat } from '../../user-config/orchestrator.js';
 import { calculateSeatBaseShares as budgetSeatBaseShares } from '../budget.js';
 
 /** Existing orchestrator callers keep their signature; the resource loop owns the decision. */

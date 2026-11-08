@@ -349,7 +349,7 @@ describe('scripts/test-deterministic.ts preservation', () => {
     // ⛔ 이 칸이 지키는 «뜻»은 「사람이 준 argv 가 bun test 까지 그대로 간다」다.
     //   2026-09-24: CDP 레인 분리로 그 앞에 ...ignoreArgs 가 붙었다 — argv 통과는 그대로다.
     expect(source).toContain('let commands = planDeterministicTestCommands(argv, ignoredTestPatterns, mockFiles, allTestFiles, testCwd)');
-    expect(source).toContain('for (const cmd of commands)');
+    expect(source).toContain('for (const [commandIndex, cmd] of commands.entries())');
     expect(source).toContain("join(tempBase(), TEMP_ROOT_PREFIX)");
     expect(source).toContain("export const TEMP_ROOT_PREFIX = 'elanous-deterministic-test-';");
     expect(source).toContain('if (import.meta.main)');
@@ -1179,56 +1179,108 @@ describe('mock.module process isolation', () => {
     expect(invalid.status).not.toBe(0);
   });
 
-  test('keeps shared output options in one Bun child while preserving ordinary split options', async () => {
-    const mock = 'src/mock.test.ts';
-    const plain = 'src/plain.test.ts';
-    for (const option of [
-      ['--reporter-outfile', 'report.xml'], ['--reporter-outfile=report.xml'],
-      ['--coverage', '--coverage-reporter=lcov'], ['--coverage', '--coverage-reporter', 'lcov'],
-      ['--timings=timings.json', '--update-timings'],
-    ]) {
-      const messages: string[] = [];
-      const commands: string[][] = [];
-      const code = await runDeterministicTestsOriginal({
-        argv: [...option, plain, mock],
-        deriveMockModuleFiles: () => [mock],
-        deriveTestFiles: () => [mock, plain],
-        report: (message) => messages.push(message),
-        spawn: (opts) => {
-          commands.push(opts.cmd);
-          return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
-        },
-        waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
-      });
-      expect(code).toBe(0);
-      expect(commands).toEqual([['bun', 'test', ...option, plain, mock]]);
-      expect(messages.join('\n')).toContain('공유 파일 출력 옵션');
-      expect(messages.join('\n')).not.toContain('각자 단독 프로세스');
-    }
-    const splitCommands: string[][] = [];
-    expect(await runDeterministicTestsOriginal({
-      argv: ['--coverage', '--coverage-reporter=text', mock, plain],
-      deriveMockModuleFiles: () => [mock], deriveTestFiles: () => [mock, plain],
-      spawn: (opts) => {
-        splitCommands.push(opts.cmd);
-        return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
-      },
-      waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
-    })).toBe(0);
-    expect(splitCommands.length).toBe(2);
+  test('preserves mock.module isolation while merging per-child JUnit output', async () => {
+    const root = makeRoot();
+    expect(spawnSync('git', ['init', '-q'], { cwd: root }).status).toBe(0);
+    mkdirSync(join(root, 'src'));
+    const mockFile = 'src/mock.test.ts';
+    const plainFile = 'src/plain.test.ts';
+    writeFileSync(join(root, mockFile), "import { mock } from 'bun:test'; mock.module('virtual-test-module', () => ({}));\n");
+    writeFileSync(join(root, plainFile), 'export {};\n');
+    const reportFile = join(root, 'merged.xml');
     const commands: string[][] = [];
+    const messages: string[] = [];
     const code = await runDeterministicTestsOriginal({
-      argv: ['--reporter-outfile', 'report.xml', mock],
-      deriveMockModuleFiles: () => [mock],
-      deriveTestFiles: () => [mock],
+      argv: ['--reporter=junit', `--reporter-outfile=${reportFile}`, mockFile, plainFile],
+      cwd: root,
+      deriveMockModuleFiles: () => [mockFile],
+      deriveTestFiles: () => [mockFile, plainFile],
+      report: (message) => messages.push(message),
       spawn: (opts) => {
         commands.push(opts.cmd);
+        const outfile = opts.cmd.find((arg) => arg.startsWith('--reporter-outfile='))?.slice('--reporter-outfile='.length);
+        if (!outfile) throw new Error('child missing isolated JUnit outfile');
+        const name = opts.cmd.includes(mockFile) ? mockFile : plainFile;
+        writeFileSync(outfile, `<testsuites><testsuite name="${name}" tests="1" failures="0" errors="0" skipped="0" time="0.01" /></testsuites>`);
         return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
       },
       waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
     });
     expect(code).toBe(0);
-    expect(commands).toEqual([['bun', 'test', '--reporter-outfile', 'report.xml', mock]]);
+    expect(commands).toHaveLength(2);
+    const childReports = commands.map((command) => command.find((arg) => arg.startsWith('--reporter-outfile='))!.slice('--reporter-outfile='.length));
+    expect(new Set(childReports).size).toBe(2);
+    expect(childReports).not.toContain(reportFile);
+    expect(messages.join('\n')).toContain('JUnit outputs are split per child');
+    const merged = readFileSync(reportFile, 'utf8');
+    expect(merged).toContain(mockFile);
+    expect(merged).toContain(plainFile);
+    expect(merged).toContain('tests="2"');
+  });
+
+  test('merges JUnit XML emitted by real Bun children', () => {
+    const root = makeRoot();
+    expect(spawnSync('git', ['init', '-q'], { cwd: root }).status).toBe(0);
+    mkdirSync(join(root, 'src'));
+    const mockFile = 'src/mock.test.ts';
+    const plainFile = 'src/plain.test.ts';
+    writeFileSync(join(root, mockFile), "import { mock, test } from 'bun:test'; mock.module('virtual-test-module', () => ({})); test('mock child', () => {});\n");
+    writeFileSync(join(root, plainFile), "import { test } from 'bun:test'; test('plain child', () => {});\n");
+    const reportFile = join(root, 'merged.xml');
+    const result = spawnSync('bun', ['run', script, '--cwd', root, '--reporter=junit', `--reporter-outfile=${reportFile}`, mockFile, plainFile], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+    });
+    expect(result.status).toBe(0);
+    const merged = readFileSync(reportFile, 'utf8');
+    expect(merged).toContain('tests="2"');
+    expect(merged).toContain('mock child');
+    expect(merged).toContain('plain child');
+  });
+
+  test('refuses shared coverage and timing outputs when mock.module files need isolation', async () => {
+    const mockFile = 'src/mock.test.ts';
+    const plainFile = 'src/plain.test.ts';
+    for (const option of [
+      ['--coverage', '--coverage-reporter=lcov'],
+      ['--timings=timings.json', '--update-timings'],
+      ['--reporter=junit', '--reporter-outfile=report.xml', '--coverage', '--coverage-reporter=lcov'],
+    ]) {
+      const commands: string[][] = [];
+      const messages: string[] = [];
+      const code = await runDeterministicTestsOriginal({
+        argv: [...option, plainFile, mockFile],
+        deriveMockModuleFiles: () => [mockFile],
+        deriveTestFiles: () => [mockFile, plainFile],
+        report: (message) => messages.push(message),
+        spawn: (opts) => {
+          commands.push(opts.cmd);
+          return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+        },
+      });
+      expect(code).toBe(1);
+      expect(commands).toHaveLength(0);
+      expect(messages.join('\n')).toContain('Cannot preserve mock.module isolation');
+    }
+  });
+
+  test('keeps shared output options in one Bun child when no module mocks are selected', async () => {
+    for (const option of [
+      ['--reporter-outfile', 'report.xml'],
+      ['--coverage', '--coverage-reporter=lcov'],
+      ['--timings=timings.json', '--update-timings'],
+    ]) {
+      const commands: string[][] = [];
+      const code = await runDeterministicTests({
+        argv: [...option, 'src/plain.test.ts'],
+        deriveMockModuleFiles: () => [],
+        spawn: (opts) => {
+          commands.push(opts.cmd);
+          return { pid: process.pid, exited: Promise.resolve(0), kill: () => true };
+        },
+      });
+      expect(code).toBe(0);
+      expect(commands).toHaveLength(1);
+    }
   });
 
   test('rejects global shard and multi-failure bail across children; first-failure bail stops', async () => {
@@ -1248,15 +1300,28 @@ describe('mock.module process isolation', () => {
       expect(messages.join('\n')).toContain(option.startsWith('--shard') ? '--shard' : '--bail');
     }
     for (const bail of ['--bail', '--bail=1']) {
-      let spawned = 0;
+      const root = makeRoot();
+      expect(spawnSync('git', ['init', '-q'], { cwd: root }).status).toBe(0);
+      const reportFile = join(root, 'merged.xml');
+      const commands: string[][] = [];
       const code = await runDeterministicTestsOriginal({
-        argv: [bail, mock, plain],
+        argv: [bail, '--reporter=junit', `--reporter-outfile=${reportFile}`, mock, plain],
+        cwd: root,
         deriveMockModuleFiles: () => [mock], deriveTestFiles: () => [mock, plain],
-        spawn: () => { spawned++; return { pid: process.pid, exited: Promise.resolve(3), kill: () => true }; },
+        spawn: (opts) => {
+          commands.push(opts.cmd);
+          const childReport = opts.cmd.find((arg) => arg.startsWith('--reporter-outfile='))!.slice('--reporter-outfile='.length);
+          writeFileSync(childReport, '<testsuites><testsuite name="first-child" tests="1" failures="1" errors="0" skipped="0" time="0.01" /></testsuites>');
+          return { pid: process.pid, exited: Promise.resolve(3), kill: () => true };
+        },
         waitForSignal: () => new Promise<ShutdownSignal>(() => {}),
       });
       expect(code).toBe(3);
-      expect(spawned).toBe(1);
+      expect(commands).toHaveLength(1);
+      const merged = readFileSync(reportFile, 'utf8');
+      expect(merged).toContain('tests="1"');
+      expect(merged).toContain('failures="1"');
+      expect(merged).toContain('first-child');
     }
   });
 

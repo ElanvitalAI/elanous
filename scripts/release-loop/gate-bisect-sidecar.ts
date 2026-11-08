@@ -4,12 +4,15 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
-import { createGateRunner, GATE_ISOLATED_TIMEOUT_MS, readBaselineFileCache, saveBaselineFileCache, type GateOptions } from './gate-node.js';
+import { createGateRunner, GATE_ISOLATED_TIMEOUT_MS, readBaselineFileCache, saveBaselineFileCache } from './gate-api-leaf.js';
+import type { GateOptions } from './gate-types.js';
 import { parseFailures } from './gate-diff.js';
 import { advanceGateBisectMode, runGateBisect, runGateBisectLinear, type GateBisectMeasurement, type GateBisectPlan,
   type ShadowOperationalState } from './gate-bisect.js';
 import { testFileOfId } from './gate-partial.js';
 import { acquireLockAsync } from '../../src/storage/file-lock.js';
+import { createGateBisectOwnerMailDeps, deliverGateBisectOwnerMail, ownerSeatFromPullRequest,
+  uniqueAssociatedPullRequest, type GateBisectOwnerCandidate, type GateBisectOwnerMailDeps } from './gate-bisect-owner-mail.js';
 
 type SidecarInput = {
   plan: GateBisectPlan;
@@ -21,6 +24,37 @@ type SidecarInput = {
   alternatePool: string;
 };
 
+export interface GateBisectSidecarIntegrations {
+  readonly resolveOwner?: (finding: { file: string; firstFailingCommit: string }) => {
+    pullRequest: number | null; owner: string | null; ownerSeat: string | null;
+  };
+  readonly ownerMail?: GateBisectOwnerMailDeps;
+}
+
+function resolveOwner(finding: { file: string; firstFailingCommit: string }, repo: string): {
+  pullRequest: number | null; owner: string | null; ownerSeat: string | null;
+} {
+  // Resolve the commit-to-PR relationship from GitHub's association endpoint;
+  // commit subject issue/PR references are not proof of authorship.
+  const association = spawnSync('gh', ['api', `repos/{owner}/{repo}/commits/${finding.firstFailingCommit}/pulls`, '--jq', '[.[].number]'],
+    { cwd: repo, encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024 });
+  if (association.status !== 0) return { pullRequest: null, owner: null, ownerSeat: null };
+  let pr: number | null;
+  try { pr = uniqueAssociatedPullRequest(JSON.parse(association.stdout) as number[]); }
+  catch { return { pullRequest: null, owner: null, ownerSeat: null }; }
+  if (pr === null) return { pullRequest: null, owner: null, ownerSeat: null };
+  const lookup = spawnSync('gh', ['pr', 'view', String(pr), '--json', 'assignees,headRefName',
+    '--jq', '{assignees:[.assignees[].login],headRefName:.headRefName}'],
+  { cwd: repo, encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024 });
+  if (lookup.status !== 0) return { pullRequest: pr, owner: null, ownerSeat: null };
+  try {
+    const value = JSON.parse(lookup.stdout) as { assignees?: string[]; headRefName?: string };
+    const assignees = Array.isArray(value.assignees) ? value.assignees : [];
+    return { pullRequest: pr, owner: assignees.join(', ') || null,
+      ownerSeat: ownerSeatFromPullRequest({ headRefName: value.headRefName ?? '', assignees }) };
+  } catch { return { pullRequest: pr, owner: null, ownerSeat: null }; }
+}
+
 function atomicJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
   const temp = join(dirname(path), `.${process.pid}-${Date.now()}.tmp`);
@@ -31,18 +65,19 @@ function atomicJson(path: string, value: unknown): void {
 }
 
 function readMode(path: string): ShadowOperationalState {
-  if (!existsSync(path)) return { mode: 'shadow', agreements: 0 };
+  if (!existsSync(path)) return { mode: 'operational', agreements: 0 };
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as { schema?: unknown; state?: ShadowOperationalState };
     if (value.schema === 1 && value.state && (value.state.mode === 'shadow' || value.state.mode === 'operational')
         && Number.isSafeInteger(value.state.agreements) && value.state.agreements >= 0) return value.state;
-  } catch { /* Corrupt state fails closed to shadow. */ }
+  } catch { /* Corrupt state is observed below and defaults to operational. */ }
   debug.log('release-loop.gate', 'bisect-mode-unmeasured', { reason: 'mode-state-unreadable', path });
-  return { mode: 'shadow', agreements: 0 };
+  return { mode: 'operational', agreements: 0 };
 }
 
 export async function runGateBisectSidecar(input: SidecarInput,
-  measureOverride?: (file: string, commit: string, host: string) => Promise<GateBisectMeasurement>): Promise<void> {
+  measureOverride?: (file: string, commit: string, host: string) => Promise<GateBisectMeasurement>,
+  integrations: GateBisectSidecarIntegrations = {}): Promise<void> {
   const runner = createGateRunner(input.repo);
   if (!measureOverride && !runner.recheckPodBatch) throw new Error('gate Pod recheck runner unavailable');
   const cacheHost = `pod:${input.alternatePool}`;
@@ -75,21 +110,23 @@ export async function runGateBisectSidecar(input: SidecarInput,
   const operational = evaluation.state.mode === 'operational';
   const findings = evaluation.findings;
   const unmeasured = [...evaluation.shadow.unmeasured, ...evaluation.operational.unmeasured];
-  const cards = (operational && unmeasured.length === 0 ? findings : []).map((finding) => {
-    // git-spawn-allow: read-only commit subject maps a verified first-failure commit to its PR.
-    const subject = spawnSync('git', ['show', '-s', '--format=%s', finding.firstFailingCommit], { cwd: input.repo, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
-    const pr = subject.status === 0 ? subject.stdout.match(/#(\d{4,})\b/)?.[1] : undefined;
-    const lookup = pr ? spawnSync('gh', ['pr', 'view', pr, '--json', 'author,assignees', '--jq', '.assignees[0].login // .author.login'],
-      { cwd: input.repo, encoding: 'utf8', timeout: 10_000, maxBuffer: 16 * 1024 * 1024 }) : null;
-    const owner = lookup?.status === 0 ? lookup.stdout.trim() || null : null;
-    const card = { ...finding, pullRequest: pr ? Number(pr) : null, owner, ownerStatus: owner ? 'resolved' : 'unresolved', evidence: input.path };
+  const cards: GateBisectOwnerCandidate[] = (operational && unmeasured.length === 0 ? findings : []).map((finding) => {
+    const resolved = integrations.resolveOwner?.(finding) ?? resolveOwner(finding, input.repo);
+    const card = { ...finding, ...resolved, ownerStatus: resolved.ownerSeat ? 'resolved' as const : 'unresolved' as const, evidence: input.path };
     debug.log('release-loop.gate-autoheal', 'repair-card', { version: input.plan.version, runId: input.runId, ...card });
     debug.log('release-loop.gate', 'bisect-found', { version: input.plan.version, cutCommit: input.plan.cutCommit, ...card });
     return card;
   });
-  atomicJson(input.path, { ...input.plan, status: unmeasured.length ? 'partial' : operational ? 'complete' : evaluation.event === 'unmeasured' ? 'unmeasured' : 'shadow',
+  const resultRecord = { ...input.plan, status: unmeasured.length ? 'partial' : operational ? 'complete' : evaluation.event === 'unmeasured' ? 'unmeasured' : 'shadow',
     shadowFindings: evaluation.shadow.findings, operationalFindings: evaluation.operational.findings, findings: cards,
-    unmeasured, completedAt: new Date().toISOString() });
+    unmeasured, completedAt: new Date().toISOString() };
+  atomicJson(input.path, { ...resultRecord, ownerMailStatus: cards.length > 0 ? 'pending' : 'not-required' });
+  const ownerMail = await deliverGateBisectOwnerMail(cards, integrations.ownerMail ?? createGateBisectOwnerMailDeps(input.repo));
+  const findingsWithMail = cards.map((card, index) => ({ ...card, ownerMail: ownerMail[index] }));
+  for (const record of ownerMail) debug.log('release-loop.gate-autoheal', 'owner-mail', { version: input.plan.version, runId: input.runId, ...record });
+  const ownerMailStatus = ownerMail.length === 0 ? 'not-required'
+    : ownerMail.every((item) => item.status === 'delivered') ? 'delivered' : 'attention';
+  atomicJson(input.path, { ...resultRecord, findings: findingsWithMail, ownerMail, ownerMailStatus });
   } finally { modeLock.release(); }
 }
 

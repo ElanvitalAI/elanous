@@ -14,6 +14,7 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { listInstalledPlugins } from '../plugins/install/plugin-install.js';
 import { credentialStatus, pluginEnv } from '../plugins/install/plugin-credentials.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { spawnElanousSync } from '../instance/spawn-elanous.js';
 import { loadNodeCatalog } from '../self-implement/graph-catalog.js';
 import { recordFailureEvent } from '../self-implement/heal-intake.js';
 import { growthApprovalRef, proposeGrowth, type GraphGrowth, type GrowthProposer, type GrowthRecipeEffect, type GrowthDecisionDeps, type GrowthCommand } from './graph-grow.js';
@@ -35,7 +36,8 @@ import { requireInProcessHandler, type InProcessHandlerRegistry } from './in-pro
 import { interpolate } from '../workflow-runtime/variables.js';
 import type { BashNode, ClassifyNode, NodeExecContext, NodeOutput, WorkflowDeps } from '../workflow-runtime/types.js';
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression, type GateExecutorOverride, type GatePodPoolOverride, type GateShardRerouteOverride } from '../../scripts/release-loop/resume.js';
-import { registerAdaptiveGateHealAdapter, RELEASE_GATE_FAILED_EVENT, type AdaptiveGateHealAppendNodeRequest, type AdaptiveGateHealAppendNodeReceipt } from '../../scripts/release-loop/adaptive-gate-heal-adapter.js';
+import { registerAdaptiveGateHealAdapter, RELEASE_GATE_FAILED_EVENT, type AdaptiveGateHealAppendNodeRequest,
+  type AdaptiveGateHealAppendNodeReceipt, type AdaptiveGateHealRerunGateRequest } from '../../scripts/release-loop/adaptive-gate-heal-adapter.js';
 import { resolveChildAllowance } from './arg-allowance.js';
 import { emitReleaseStageTransition, postReleaseStageMail, type ReleaseStageState } from '../release-loop/stage-mail.js';
 import { openMsgStore } from '../msg/msg-store.js';
@@ -117,11 +119,16 @@ const RELEASE_NODE_COMMANDS: Readonly<Record<string, { recipe: string; command?:
   'traffic-cut-start': { recipe: 'cmd:traffic-cut-start', command: 'bun scripts/release-loop/traffic-node.ts traffic-cut-start' },
   cutoff: { recipe: 'cmd:cutoff', command: 'bun scripts/release-loop/node-verdict.ts cutoff' },
   'checklist-gate': { recipe: 'cmd:checklist-gate', command: 'bun scripts/release-loop/checklist-gate-node.ts' },
+  tsc: { recipe: 'cmd:tsc', command: 'bun run scripts/ci-typecheck-changed.ts' },
+  ratchet: { recipe: 'cmd:ratchet', command: 'bash scripts/ratchets/train-side-invariants.sh' },
   prefetch: { recipe: 'cmd:docs', command: 'bun scripts/release-loop/docs-node.ts --json' },
   'pre-gate-join': { recipe: 'none' },
   gate: { recipe: 'cmd:gate', command: 'bun scripts/release-loop/gate-node.ts --json' },
   'traffic-gate-passed': { recipe: 'cmd:traffic-gate-passed', command: 'bun scripts/release-loop/traffic-node.ts traffic-gate-passed' },
   'gate-triage': { recipe: 'cmd:gate-triage', command: 'bun scripts/release-loop/gate-triage-node.ts' },
+  'gate-repair-recovery': { recipe: 'approval:repair-recovery' },
+  'gate-heal-decision': { recipe: 'approval:gate-heal-decision' },
+  'gate-same-run-recheck': { recipe: 'cmd:gate-same-run-recheck', command: 'bun scripts/release-loop/gate-same-run-recheck-node.ts' },
   'mac-smoke': { recipe: 'cmd:mac-smoke', command: 'bun scripts/release-loop/mac-smoke-node.ts' },
   'export-check': { recipe: 'cmd:export-check', command: 'bun scripts/release-loop/export-check-node.ts' },
   pwa: { recipe: 'cmd:pwa', command: 'bun scripts/release-loop/node-verdict.ts pwa' },
@@ -136,6 +143,7 @@ const RELEASE_NODE_COMMANDS: Readonly<Record<string, { recipe: string; command?:
   'notes-recheck': { recipe: 'cmd:notes-check', command: 'bun scripts/announce-loop/check-node.ts --json' },
   'auto-approve': { recipe: 'cmd:auto-approve', command: 'bun scripts/release-loop/auto-approve-node.ts' },
   'approve-publish': { recipe: 'approval:publish' },
+  'approve-continue': { recipe: 'approval:continue-publish' },
   publish: { recipe: 'cmd:publish-command', command: 'bun scripts/release-loop/publish-node.ts' },
   'npm-publish': { recipe: 'cmd:npm-publish', command: 'bun scripts/release-loop/npm-publish-node.ts' },
   'traffic-npm-published': { recipe: 'cmd:traffic-npm-published', command: 'bun scripts/release-loop/traffic-node.ts traffic-npm-published' },
@@ -266,8 +274,8 @@ export interface GraphRunState {
     action: GraphSubscriptionDispatch['action']; outcome: 'queued' | 'handled' | 'rejected'; reason?: string; at: string }>;
   /** Durable undispatched actions and wake continuation, restored after interruption/resume. */
   pendingSubscriptionActions?: Array<{ subscriberId: string; nodeId: string; action: GraphSubscriptionDispatch['action']; event: GraphEvent;
-    returnTo?: string; failureTo?: string; appendNodeIds?: string[] }>;
-  wakeContinuation?: { nodeId: string; returnTo?: string; failureTo?: string; appendNodeIds?: string[] };
+    returnTo?: string; failureTo?: string; errorTo?: string; recoveryTo?: string; appendNodeIds?: string[] }>;
+  wakeContinuation?: { nodeId: string; returnTo?: string; failureTo?: string; errorTo?: string; recoveryTo?: string; appendNodeIds?: string[] };
   /** Validated append-only subgraphs installed by a subscriber and restored on resume. */
   subscriptionGraphAppends?: Array<{ proposal: GraphSubgraphAppendProposal; eventId: string; subscriberId: string }>;
   /** Subscriber-proposed event vocabulary and direct edges, durable across run resume. */
@@ -275,6 +283,8 @@ export interface GraphRunState {
   adaptiveGraphEdges?: Array<{ from: string; to: string; triggerEvent: string; rationale: string; eventId: string; subscriberId: string }>;
   /** Release ARG append receipts keyed by the originating bus event identity. */
   adaptiveGateNodeAppends?: Array<{ eventId: string; request: AdaptiveGateHealAppendNodeRequest; graphRevision: number }>;
+  /** Same-run host-to-Pod reruns are idempotent per gate failure event. */
+  adaptiveGateReruns?: Array<{ eventId: string; request: AdaptiveGateHealRerunGateRequest }>;
   /** Monotonic revision for run-local graph appends; starts at 1 for the loaded graph. */
   graphRevision?: number;
   /** Failed event envelopes remain byte-for-byte retryable so successful subscribers dedupe. */
@@ -296,7 +306,7 @@ export interface GraphRunState {
    * Legacy parked states without this field resume append-only, so their first recorded event may be applied/rejected. */
   growthEvents?: Array<{ phase: 'proposal' | 'parked' | 'applied' | 'rejected' | 'undo-available'; from: string; outcome: string; at: string; nodeId?: string; kind?: string; reason?: string; undo?: GraphGrowth['undo'] }>;
   growthPark?: { from: string; outcome: string; reason: string; decisionId: string; decisionRef: string; growth: GraphGrowth; command?: GrowthCommand; approval?: string };
-  resume?: { from: string; at: string; previousStatus: GraphRunState['status']; graph?: 'snapshot' | 'current' };
+  resume?: { from: string; at: string; previousStatus: GraphRunState['status']; graph?: 'snapshot' | 'current'; budgetReset?: { reason: string; at: string; priorExecuted: number; resumedPrefixExecuted: number; priorUnitCalls: number; resumedPrefixUnitCalls: number } };
   /** GATE-HOST-EXECUTOR — every explicit input change a resume made (what was set and what it replaced), oldest first. */
   inputOverrides?: Array<GateExecutorOverride | GatePodPoolOverride | GateShardRerouteOverride>;
   executed: number;
@@ -307,6 +317,86 @@ export interface GraphRunState {
 function failedCommandStderrTail(exitCode: number, stderr: string): string | undefined {
   if (exitCode === 0 || !stderr.trim()) return undefined;
   return stderr.replace(/(?:\r?\n)+$/, '').split(/\r?\n/).slice(-40).join('\n') || undefined;
+}
+
+export interface ReleaseNodeFailureDetail {
+  kind: 'export-detection' | 'tool-error' | 'timeout';
+  stderrTail?: string;
+  markers: string[];
+  locations: string[];
+}
+
+function scrubReleaseFailureText(text: string, rootDir: string, redact: (value: string) => string): string {
+  const root = resolve(rootDir).replaceAll('\\', '/').replace(/\/$/u, '');
+  const safe = (value: string) => {
+    const normalized = value.replaceAll('\\', '/');
+    if (normalized === root) return '<repo>';
+    if (normalized.startsWith(`${root}/`)) return `<repo>/${normalized.slice(root.length + 1)}`;
+    return `<absolute-path>/${normalized.split('/').at(-1) ?? 'path'}`;
+  };
+  return redact(text)
+    .replace(/\\\\[^\\\s]+(?:\\[^\\\s]+)+/gu, (path) => safe(path))
+    .replace(/\b[A-Za-z]:[\\/](?:[^\s:]+[\\/])*[^\s:]+/gu, (path) => safe(path))
+    .replace(/(?<=[=:])\/(?:[^/\s:]+\/)*[^/\s:]+/gu, (path) => safe(path))
+    .replace(/(?<![A-Za-z0-9])(?<!\.\/)(?<!\.\.)(?<!<repo>)(?<!<absolute-path>)\/(?:[^/\s:]+\/)*[^/\s:]+/gu, (path) => safe(path))
+    .replaceAll(root, '<repo>');
+}
+
+/** Scrub all strings before persisting an export-check payload, not just the compact summary. */
+function scrubReleaseNodeOutput(output: unknown, rootDir: string, redact: (value: string) => string): unknown {
+  if (typeof output === 'string') {
+    try { return JSON.stringify(scrubReleaseNodeOutput(JSON.parse(output) as unknown, rootDir, redact)); }
+    catch { return scrubReleaseFailureText(output, rootDir, redact); }
+  }
+  if (Array.isArray(output)) return output.map((value) => scrubReleaseNodeOutput(value, rootDir, redact));
+  if (output && typeof output === 'object') {
+    const usedKeys = new Set<string>();
+    const entries = Object.entries(output).map(([key, value]) => {
+      const base = scrubReleaseFailureText(key, rootDir, redact);
+      let safeKey = base;
+      let suffix = 1;
+      while (usedKeys.has(safeKey)) safeKey = `${base}#${suffix++}`;
+      usedKeys.add(safeKey);
+      return [safeKey, scrubReleaseNodeOutput(value, rootDir, redact)] as const;
+    });
+    return Object.fromEntries(entries);
+  }
+  return output;
+}
+
+/** Extract only bounded, path- and credential-scrubbed evidence from the export-check node's JSON result. */
+export function releaseNodeFailureDetail(output: unknown, rootDir: string, redact: (value: string) => string): ReleaseNodeFailureDetail | undefined {
+  const result = lastJsonObject(output);
+  if (!result || (result.outcome !== 'fail' && result.outcome !== 'error')) return undefined;
+  const diagnostics = Array.isArray(result.diagnostics) ? result.diagnostics.filter((value): value is string => typeof value === 'string') : [];
+  const rawLines = [result.summary, result.tail, ...diagnostics]
+    .filter((value): value is string => typeof value === 'string');
+  if (!rawLines.length) return undefined;
+  const lines = rawLines.map((value) => scrubReleaseFailureText(value, rootDir, redact).slice(-1_000));
+  const markers = [...new Set(lines.flatMap(line => [...line.matchAll(/\b(absolute-home-path|kr-mobile-phone|pilot-tree|handoff-doc-link|plan-doc-link|xcode-author-header|[a-z][a-z0-9-]*-error)\b/gu)].map(match => match[1]!)))].slice(0, 12);
+  const root = resolve(rootDir).replaceAll('\\', '/').replace(/\/$/u, '');
+  const locations = [...new Set(lines.flatMap((line) => [...line.matchAll(/(?:^|[\s(=:>])((?:<repo>\/|<absolute-path>\/|[A-Za-z]:[\\/]|\/)?[^\s():>]+\.(?:tsx?|jsx?|json|ya?ml)):(\d+)(?::\d+)?/gu)].map((match) => {
+    const rawPath = match[1]!.replaceAll('\\', '/');
+    const path = rawPath.startsWith(`${root}/`) ? `<repo>/${rawPath.slice(root.length + 1)}`
+      : rawPath.startsWith('/') || /^[A-Za-z]:\//u.test(rawPath) ? `<absolute-path>/${rawPath.split('/').at(-1)}` : rawPath;
+    return `${path}:${match[2]}`;
+  })))].slice(0, 12);
+  const text = lines.join('\n');
+  const kind: ReleaseNodeFailureDetail['kind'] = /(?:timed?\s*out|timeout|ETIMEDOUT|SIGTERM)/iu.test(text)
+    ? 'timeout' : markers.length ? 'export-detection' : 'tool-error';
+  const tail = typeof result.tail === 'string' && result.tail.trim() ? result.tail : diagnostics.join('\n');
+  return { kind, ...(tail.trim() ? { stderrTail: scrubReleaseFailureText(tail, rootDir, redact).slice(-1_000) } : {}), markers, locations };
+}
+
+function fanOutFailureDiagnostics(fanout: NonNullable<GraphRunState['fanOuts']>[string]) {
+  return Object.entries(fanout.branches).flatMap(([nodeId, branch]) => {
+    if (branch.status !== 'failed') return [];
+    const renderedOutput = typeof branch.output === 'string' ? branch.output
+      : branch.output === undefined ? '' : JSON.stringify(branch.output) ?? String(branch.output);
+    const outputFirstLine = renderedOutput.split(/\r?\n/, 1)[0];
+    return [{ nodeId, runId: branch.runId, ...(branch.error ? { error: branch.error } : {}),
+      outputFirstLine: outputFirstLine || null }];
+  });
 }
 
 export interface GraphClassifyInput {
@@ -375,6 +465,8 @@ export interface GraphRunOptions {
   releaseGatePodPool?: string;
   /** Release-only: remeasure a shard after the same-commit resume preflight. */
   releaseGateShardReroute?: { shard: string; host?: string; os?: 'darwin' | 'linux' };
+  /** Release-only: explicit, reasoned restart after the graph's execution budget stopped the run. */
+  releaseBudgetExceededResume?: { reason: string };
   useCurrentGraph?: boolean;
   /** Internal unit invocation context, propagated only by runGraph. */
   unitContext?: { parentRunId: string; ancestors: readonly string[]; remainingSteps: number; entryNodeId?: string };
@@ -410,6 +502,8 @@ export interface GraphRunOptions {
     /** Fault-injection hook for verifying lifecycle closure and persisted resume state. */
     beforePersist?: (state: GraphRunState) => void;
     beforeNode?: () => void;
+    /** Observe heal-loop terminal failures without making notification delivery affect the saved verdict. */
+    postOpAlert?: (body: string) => void;
     processStartMs?: (pid: number) => number | null;
     monotonicMs?: () => number;
     growthProposer?: GrowthProposer;
@@ -660,6 +754,26 @@ function recordReleaseRunFailure(state: GraphRunState, root: string, summary: st
   }
 }
 
+function alertHealLoopFailure(state: GraphRunState, summary: string, postOpAlert?: (body: string) => void): void {
+  const body = `heal-loop 실패 · ${state.runId} · ${state.path.at(-1) ?? 'unknown'} · ${summary} · ${state.statePath}`;
+  try {
+    if (postOpAlert) {
+      postOpAlert(body);
+      return;
+    }
+    if (process.env.NODE_ENV === 'test' || process.env.ELANOUS_TEST_HOME) return;
+    const result = spawnElanousSync(['msg', 'post', '--from', 'HARNESS', '--to', 'OP', '--kind', 'alert', '--body', body],
+      { executable: 'eln', encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+    if (result.error || result.status !== 0) {
+      const failureMessage = result.stderr || result.stdout || `eln exit ${result.status}`;
+      throw result.error ?? new Error(String(failureMessage));
+    }
+  } catch (error) {
+    debug.log('heal.intake', 'op-alert-failed', { graphId: state.graphId, runId: state.runId, statePath: state.statePath,
+      error: String(error) }, { level: 'error' });
+  }
+}
+
 /** A synchronous, per-ledger critical section shared by runner writes and stop/destroy. */
 function withRunWriteLock<T>(file: string, work: () => T): T {
   mkdirSync(dirname(file), { recursive: true });
@@ -814,9 +928,9 @@ function subscriptionAppendNodeOrder(proposal: GraphSubgraphAppendProposal): str
     outcomeEdges.length > 1 || (outcomeEdges.length === 0 && proposal.failureTo !== undefined) ||
     (outcomeEdges.length === 1 && (!proposal.failureTo || outcomeEdges[0]!.on !== 'outcome' ||
       !outcomeEdges[0]!.map || outcomeEdges[0]!.branches !== undefined || outcomeEdges[0]!.to !== undefined ||
-      Object.keys(outcomeEdges[0]!.map).sort().join(',') !== 'error,fail,ok' ||
+      !['error,fail,ok', 'error,fail,ok,recovery-required'].includes(Object.keys(outcomeEdges[0]!.map).sort().join(',')) ||
       outcomeEdges[0]!.map.ok !== proposal.returnTo || outcomeEdges[0]!.map.fail !== proposal.failureTo ||
-      outcomeEdges[0]!.map.error !== proposal.failureTo || !added.has(outcomeEdges[0]!.from)))) {
+      !outcomeEdges[0]!.map.fail || !added.has(outcomeEdges[0]!.from)))) {
     throw new Error('invalid saved subscriber graph append');
   }
   const outgoing = new Map<string, string>();
@@ -849,8 +963,17 @@ function withSubscriptionGraphAppends(graph: GraphTemplateSpec,
     const { proposal } = append;
     subscriptionAppendNodeOrder(proposal);
     const nodeIds = proposal.nodes.map((node) => node.nodeId);
+    const outcomeEdge = proposal.edges.find((edge) => edge.on === 'outcome');
+    const recoveryTarget = outcomeEdge?.map?.['recovery-required'] ?? outcomeEdge?.map?.error;
+    const recoveryHitl = recoveryTarget && recoveryTarget !== proposal.failureTo
+      ? current.nodes.find((node) => node.nodeId === recoveryTarget && node.kind === 'hitl' && node.recipe === 'approval:repair-recovery')
+      : undefined;
+    const failureHitl = proposal.failureTo ? current.nodes.find((node) => node.nodeId === proposal.failureTo && node.kind === 'hitl'
+      && (node.recipe === 'approval:repair-recovery' || node.recipe === 'approval:gate-heal-decision')) : undefined;
     if (!current.nodes.some((node) => node.nodeId === proposal.returnTo) ||
-      (proposal.failureTo !== undefined && !current.terminalNodes.includes(proposal.failureTo)) ||
+      (proposal.failureTo !== undefined && !current.terminalNodes.includes(proposal.failureTo)
+        && !failureHitl) ||
+      (recoveryTarget !== undefined && recoveryTarget !== proposal.failureTo && !recoveryHitl) ||
       nodeIds.some((nodeId) => !nodeId || current.nodes.some((node) => node.nodeId === nodeId)))
       throw new Error('invalid saved subscriber graph append');
     return { ...current, nodes: [...current.nodes, ...proposal.nodes], edges: [...current.edges, ...proposal.edges] };
@@ -990,7 +1113,14 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   }
   const snapshotDir = saved ? `${saved.statePath}.graph` : undefined;
   const graphMode: 'snapshot' | 'current' = snapshotDir && saved?.graphSnapshot && !options.useCurrentGraph ? 'snapshot' : 'current';
-  const source = graphMode === 'snapshot' ? readFileSync(join(snapshotDir!, 'graph.yaml'), 'utf8') : currentSource ?? options.graphSource ?? readFileSync(path, 'utf8');
+  let source = graphMode === 'snapshot' ? readFileSync(join(snapshotDir!, 'graph.yaml'), 'utf8') : currentSource ?? options.graphSource ?? readFileSync(path, 'utf8');
+  // Fan-out is an explicit release rehearsal input; ordinary runs retain the existing graph.
+  const releaseFanoutInput = options.input && typeof options.input === 'object' && !Array.isArray(options.input)
+    ? (options.input as Record<string, unknown>).releaseGateFanout === true : false;
+  if (releaseFanoutInput && graphMode === 'current' && !options.resumeRunId && !options.graphSource
+    && resolve(path).endsWith('/graphs/release/release-loop.yaml')) {
+    source = readFileSync(join(dirname(resolve(path)), 'release-loop-fanout.yaml'), 'utf8');
+  }
   // The shared YAML parser requires a recipe string. A command-less node in
   // this runner is represented internally as `none`, without changing that parser.
   const raw: unknown = parseYaml(source);
@@ -1314,9 +1444,14 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       state.subscriptionGraphAppends.push(record);
       graph = appendedGraph;
       registerGraphSubscriptionNodes(proposal.nodes);
+      const outcomeMap = proposal.edges.find((edge) => edge.on === 'outcome')?.map;
+      const errorTo = outcomeMap?.error;
+      const recoveryTo = outcomeMap?.['recovery-required'];
       const appendedAction = { subscriberId: `${dispatch.subscriberId}/append:${proposal.entryNodeId}`,
         nodeId: proposal.entryNodeId, action: 'wake' as const, event: dispatch.event, returnTo: proposal.returnTo,
         ...(proposal.failureTo === undefined ? {} : { failureTo: proposal.failureTo }),
+        ...(errorTo === undefined || errorTo === proposal.failureTo ? {} : { errorTo }),
+        ...(recoveryTo === undefined ? {} : { recoveryTo }),
         appendNodeIds: appendNodeOrder };
       pendingSubscriptionActions.push(appendedAction);
       state.pendingSubscriptionActions = [...pendingSubscriptionActions];
@@ -1411,10 +1546,18 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (state.adaptiveGraphEdges?.length) graph = withAdaptiveGraphEdges(graph, state.adaptiveGraphEdges, state.adaptiveGraphVocabulary ?? []);
   let waivedRecord: GraphRunState['nodes'][number] | undefined;
   if (options.fromNodeId) {
-    if (state.status !== 'failed' || state.pending || state.dryRun) throw new Error('--from requires a failed, non-dry run without pending approval');
+    const budgetResume = options.releaseBudgetExceededResume;
+    if (budgetResume && (graphId !== 'release-loop' || !budgetResume.reason.trim() || state.status !== 'budget-exceeded'))
+      throw new Error('--resume-budget-exceeded requires a budget-exceeded release-loop run and a reason');
+    if (state.status !== 'failed' && !(budgetResume && state.status === 'budget-exceeded')) {
+      if (state.status === 'budget-exceeded') throw new Error(`release run ${runId} is budget-exceeded — use --resume-budget-exceeded --reason <text>`);
+      throw new Error('--from requires a failed, non-dry run without pending approval');
+    }
+    if (state.pending || state.dryRun) throw new Error('--from requires a failed, non-dry run without pending approval');
     if (graphMode === 'current' && (!state.sourceHash || state.sourceHash !== approvalSourceHash)) throw new Error('graph or recipes changed since failed run');
-    const from = state.path.indexOf(options.fromNodeId);
-    if (from < 0 || state.path.lastIndexOf(options.fromNodeId) !== from || graph.terminalNodes.includes(options.fromNodeId)) throw new Error(`--from node is not unique on the saved executable path: ${options.fromNodeId}`);
+    // Repeated nodes restart at their latest visit, so an earlier approval remains in the preserved prefix.
+    const from = state.path.lastIndexOf(options.fromNodeId);
+    if (from < 0 || graph.terminalNodes.includes(options.fromNodeId)) throw new Error(`--from node is not on the saved executable path: ${options.fromNodeId}`);
     if (state.path.length !== state.nodes.length || state.nodes.some((record, i) => record.nodeId !== state.path[i]) ||
       state.executed !== state.nodes.filter((record) => record.executed).length) {
       throw new Error('saved run path and node records do not match');
@@ -1433,7 +1576,25 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           ? namedOutcome : priorEdge?.branches && Object.hasOwn(priorEdge.branches, exitOutcome) ? exitOutcome : undefined;
         const next = branchOutcome !== undefined && priorEdge?.join
           ? priorEdge.join : nextNode(graph.edges, prior.nodeId, exitOutcome, namedOutcome);
-        if (next !== recorded.nodeId) {
+        const adaptiveAppend = (state.adaptiveGateNodeAppends ?? []).find(({ eventId, request }) => {
+          const nodeId = request.node.nodeId;
+          const repairNode = (request.node.recipe === 'cmd:gate-repair' && /^gate-repair-[a-f0-9]{12}$/.test(nodeId)) ||
+            (request.node.recipe === 'cmd:gate-image-repair' && /^gate-image-repair-[a-f0-9]{12}$/.test(nodeId));
+          if (eventId !== request.eventId || request.graphId !== graphId || request.runId !== runId ||
+            request.afterNodeId !== 'gate-triage' || request.rerunGateAt !== 'gate' || !repairNode) return false;
+          const appended = (state.subscriptionGraphAppends ?? []).find((append) => append.eventId === eventId &&
+            append.subscriberId === 'arg-adaptive-gate-heal' &&
+            append.proposal.entryNodeId === nodeId && append.proposal.returnTo === request.rerunGateAt &&
+            append.proposal.nodes.some((node) => node.nodeId === nodeId &&
+              JSON.stringify(node) === JSON.stringify(request.node)) &&
+            append.proposal.edges.some((edge) => edge.from === nodeId && edge.on === 'outcome' &&
+              edge.map?.ok === request.rerunGateAt && edge.map?.fail === append.proposal.failureTo &&
+              edge.map?.error === append.proposal.failureTo));
+          if (!appended || request.resumeFrom !== nodeId) return false;
+          return (prior.nodeId === request.afterNodeId && recorded.nodeId === nodeId) ||
+            (prior.nodeId === nodeId && recorded.nodeId === request.rerunGateAt);
+        });
+        if (next !== recorded.nodeId && !adaptiveAppend) {
           throw new Error(`saved run path does not follow graph edges: ${prior.nodeId} -> ${recorded.nodeId}, expected ${next ?? '<terminal>'}`);
         }
       } else if (recorded.nodeId !== unitEntryNode) throw new Error('saved run path does not start at entry node');
@@ -1513,6 +1674,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       state.inputOverrides = [...(state.inputOverrides ?? []), override];
       debug.log('graph.runs', 'input-override', { graphId, runId, ...override });
     }
+    const priorUnitCalls = state.unitCalls?.length ?? 0;
     if (state.unitCalls) {
       const calls = state.unitCalls;
       state.unitCalls = calls.filter(call => {
@@ -1520,13 +1682,20 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         return calls.filter(item => item.node === call.node).indexOf(call) < keep;
       });
     }
+    const priorExecuted = state.executed;
     state.path = state.path.slice(0, from);
     state.nodes = state.nodes.slice(0, from);
     state.executed = state.nodes.filter((node) => node.executed).length;
     state.status = 'running';
     delete state.stoppedAt;
     Object.assign(state, runnerOwner);
-    state.resume = { from: options.fromNodeId, at: new Date().toISOString(), previousStatus: 'failed', graph: graphMode };
+    const resumedAt = new Date().toISOString();
+    state.resume = { from: options.fromNodeId, at: resumedAt, previousStatus: budgetResume ? 'budget-exceeded' : 'failed', graph: graphMode,
+      ...(budgetResume ? { budgetReset: { reason: budgetResume.reason.trim(), at: resumedAt, priorExecuted, resumedPrefixExecuted: state.executed,
+        priorUnitCalls, resumedPrefixUnitCalls: state.unitCalls?.length ?? 0 } } : {}) };
+    if (budgetResume) debug.log('graph.runs', 'budget-exceeded-resume', { graphId, runId, from: options.fromNodeId,
+      reason: budgetResume.reason.trim(), priorExecuted, resumedPrefixExecuted: state.executed, priorUnitCalls,
+      resumedPrefixUnitCalls: state.unitCalls?.length ?? 0 });
     // Persist the restart boundary before executing it, so previous outputs remain durable.
     persistOwnedRun(state, saved!, true);
   }
@@ -1692,7 +1861,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   // sequence is carried on the run state so a restart continues it.
   const unitVisits = new Map<string, number>(Object.entries(state.unitVisitSeq ?? {}));
   const monotonicMs = options.deps?.monotonicMs ?? (() => performance.now());
-  let wakeContinuation: { nodeId: string; returnTo?: string; failureTo?: string; appendNodeIds?: string[] } | undefined = state.wakeContinuation;
+  let wakeContinuation: { nodeId: string; returnTo?: string; failureTo?: string; errorTo?: string; recoveryTo?: string; appendNodeIds?: string[] } | undefined = state.wakeContinuation;
   let current: string | undefined = options.fromNodeId ?? state.pending?.nodeId ?? wakeContinuation?.nodeId ?? state.path.at(-1) ?? unitEntryNode;
   const storedGate = [...state.nodes].reverse().find((record) => record.nodeId === 'gate' && record.output !== undefined);
   const storedGateOutput = lastJsonObject(storedGate?.output);
@@ -1765,10 +1934,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       throw new Error(`adaptive gate repair node id already exists: ${request.node.nodeId}`);
     const proposal: GraphSubgraphAppendProposal = {
       nodes: [request.node],
-      edges: [{ from: request.node.nodeId, on: 'outcome', map: { ok: request.rerunGateAt, fail: 'failed', error: 'failed' } }],
+      edges: [{ from: request.node.nodeId, on: 'outcome', map: { ok: request.rerunGateAt,
+        fail: 'gate-heal-decision', error: 'gate-heal-decision', 'recovery-required': 'gate-repair-recovery' } }],
       entryNodeId: request.resumeFrom,
       returnTo: request.rerunGateAt,
-      failureTo: 'failed',
+      failureTo: 'gate-heal-decision',
       reason: `ARG repair for ${request.eventId}`,
     };
     const appendRecord = { proposal, eventId: request.eventId, subscriberId: 'arg-adaptive-gate-heal' };
@@ -1778,7 +1948,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     assertReleaseCommandBinding(request.node, resolved.command.command, false);
     const graphRevision = (state.graphRevision ?? 1) + 1;
     const action: QueuedSubscriptionAction = { subscriberId: appendRecord.subscriberId, nodeId: request.resumeFrom,
-      action: 'wake', event, returnTo: request.rerunGateAt, failureTo: 'failed', appendNodeIds: [request.node.nodeId] };
+      action: 'wake', event, returnTo: request.rerunGateAt, failureTo: 'gate-heal-decision', errorTo: 'gate-heal-decision', recoveryTo: 'gate-repair-recovery',
+      appendNodeIds: [request.node.nodeId] };
     state.adaptiveGateNodeAppends ??= [];
     const priorGate = [...state.nodes].reverse().find((record) => record.nodeId === 'gate' && record.output !== undefined);
     if (!priorGate) throw new Error('adaptive gate repair cannot invalidate a missing prior gate result');
@@ -1796,8 +1967,54 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     persistOwnedRun(state, eventRunOwner!);
     return { disposition: 'appended', graphRevision };
   };
+  const rerunAdaptiveGateOnPod = async (request: AdaptiveGateHealRerunGateRequest): Promise<{ disposition: 'queued' | 'already-queued' }> => {
+    if (!isReleaseLoop || state.dryRun || request.graphId !== graphId || request.runId !== runId || request.resumeFrom !== 'gate'
+      || request.visitLimits.gate !== 2 || request.visitLimits.gateTriage !== 2 || !request.gatePodPool.trim())
+      throw new Error('adaptive gate Pod rerun request is outside the release ARG contract');
+    const prior = state.adaptiveGateReruns?.find((rerun) => rerun.eventId === request.eventId);
+    if (prior) {
+      if (JSON.stringify(prior.request) !== JSON.stringify(request))
+        throw new Error(`adaptive gate rerun identity conflict: ${graphId}/${runId}/${request.eventId}`);
+      return { disposition: 'already-queued' };
+    }
+    const event = (state.pendingGraphEvents ?? []).find((pending) => pending.eventId === request.eventId);
+    const data = event?.data;
+    const gate = data?.gate;
+    const triage = data?.triage;
+    const releaseInput = state.input as Record<string, unknown>;
+    const actualVisits = { gate: visits.get('gate') ?? 0, gateTriage: visits.get('gate-triage') ?? 0 };
+    const rawGate = gate && typeof gate === 'object' ? gate as Record<string, unknown> : {};
+    const triageRecord = triage && typeof triage === 'object' ? triage as Record<string, unknown> : {};
+    const stalledUnattributed = Array.isArray(rawGate.stalledShards) && rawGate.stalledShards.some((shard) =>
+      !!shard && typeof shard === 'object' && (shard as { reason?: unknown }).reason === 'unattributed');
+    const attributionGap = typeof rawGate.error === 'string' && /failure attribution/.test(rawGate.error) || stalledUnattributed;
+    if (!event || event.graphId !== graphId || event.runId !== runId || event.type !== RELEASE_GATE_FAILED_EVENT ||
+      event.source.kind !== 'node' || event.source.nodeId !== 'gate-triage' || data?.dryRun === true || current !== 'gate-triage' ||
+      state.path.at(-1) !== 'gate-triage' || state.nodes.at(-1)?.nodeId !== 'gate-triage' || state.nodes.at(-1)?.executed !== true ||
+      data?.gateExecutor !== 'host' || releaseInput.gateExecutor !== 'host' || request.gatePodPool !== releaseInput.gatePodPool ||
+      data?.version !== releaseInput.version || !Array.isArray(triageRecord.introduced) || triageRecord.introduced.length !== 0 ||
+      rawGate.outcome !== 'error' || !attributionGap || request.visitState.gate !== actualVisits.gate ||
+      request.visitState.gateTriage !== actualVisits.gateTriage || actualVisits.gate < 1 || actualVisits.gate >= 2 ||
+      actualVisits.gateTriage < 1 || actualVisits.gateTriage >= 2) {
+      throw new Error('adaptive gate Pod rerun does not match the active host attribution failure or visit budget');
+    }
+    const priorGate = [...state.nodes].reverse().find((record) => record.nodeId === 'gate' && record.output !== undefined);
+    if (!priorGate) throw new Error('adaptive gate Pod rerun cannot invalidate a missing prior gate result');
+    priorGate.output = undefined;
+    priorGate.invalidatedByEvent = request.eventId;
+    state.input = { ...releaseInput, gateExecutor: 'pod', gatePodPool: request.gatePodPool };
+    const action: QueuedSubscriptionAction = { subscriberId: 'arg-adaptive-gate-heal', nodeId: 'gate', action: 'wake', event,
+      returnTo: 'gate-triage', failureTo: 'gate-triage', errorTo: 'gate-triage' };
+    state.adaptiveGateReruns ??= [];
+    state.adaptiveGateReruns.push({ eventId: request.eventId, request });
+    pendingSubscriptionActions.push(action);
+    state.pendingSubscriptionActions = [...pendingSubscriptionActions];
+    logSubscriptionAction('queued', { event, subscriberId: action.subscriberId, nodeId: action.nodeId, action: 'wake' });
+    persistOwnedRun(state, eventRunOwner!);
+    return { disposition: 'queued' };
+  };
   if (eventBus && isReleaseLoop) disposeAdaptiveGateHealAdapter = registerAdaptiveGateHealAdapter(eventBus,
-    { graphId, runId, dryRun: state.dryRun }, { appendNode: appendAdaptiveGateNode });
+    { graphId, runId, dryRun: state.dryRun }, { appendNode: appendAdaptiveGateNode, rerunGate: rerunAdaptiveGateOnPod });
   let growthScopeSkipLogged = false;
   let growthCapReachedLogged = state.growthRejections?.some((item) =>
     item.reason === 'growth proposal limit 8 reached' || item.reason === 'growth limit 3 reached') ?? false;
@@ -1931,6 +2148,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     persist();
     const joinedFanout = Object.values(state.fanOuts ?? {}).find((fanout) => fanout.join === current &&
       Object.values(fanout.branches).every((branch) => branch.status === 'done' || branch.status === 'failed'));
+    const branchDiagnostics = joinedFanout ? fanOutFailureDiagnostics(joinedFanout) : [];
     const warningBranches = joinedFanout
       ? graph.edges.find((edge) => edge.from === joinedFanout.from)?.warningBranches ?? [] : [];
     let ok = approval && !state.dryRun ? state.pending?.decision === 'approved' : joinedFanout
@@ -2059,7 +2277,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           readingProgress = false;
           await progressPump;
           code = result.exitCode;
-          const stderr = redactCredentials(result.stderr);
+          const scrubCommandDiagnostic = current === 'export-check'
+            ? (text: string) => scrubReleaseFailureText(text, options.deps?.root ?? process.cwd(), redactCredentials)
+            : redactCredentials;
+          const stderr = scrubCommandDiagnostic(result.stderr);
           commandFailureReason = failedCommandStderrTail(result.exitCode, stderr);
           return { ...result, stdout: redactCredentials(result.stdout), stderr };
         } finally {
@@ -2106,7 +2327,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       }
       ok = result.ok;
       exit = code;
-      error = result.error ? redactCredentials(result.error) : undefined;
+      error = result.error ? (current === 'export-check'
+        ? scrubReleaseFailureText(result.error, options.deps?.root ?? process.cwd(), redactCredentials)
+        : redactCredentials(result.error)) : undefined;
       state.executed++;
     }
     let unitExecuted = false;
@@ -2310,9 +2533,22 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', graphId, runId, nodeId: current,
           ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
       }
-      const failureMessage = !ok
-        ? redactCredentials(commandFailureReason ?? error ?? `Node ${current} failed without a diagnostic.`)
+      const joinFailureMessage = branchDiagnostics.length
+        ? `join failed: ${JSON.stringify({ failedBranches: branchDiagnostics })}` : undefined;
+      const releaseRoot = options.deps?.root ?? process.cwd();
+      const releaseDetail = !ok && current === 'export-check' ? releaseNodeFailureDetail(output, releaseRoot, redactCredentials) : undefined;
+      if (!ok && current === 'export-check') output = scrubReleaseNodeOutput(output, releaseRoot, redactCredentials);
+      if (releaseDetail) {
+        const structured = lastJsonObject(output);
+        if (structured) output = JSON.stringify({ ...structured, failureDetail: releaseDetail });
+        debug.log('release-loop.node', 'failed', { graphId, runId, nodeId: current, ...releaseDetail });
+      }
+      const rawFailureMessage = !ok
+        ? redactCredentials([commandFailureReason ?? error ?? joinFailureMessage ?? `Node ${current} failed without a diagnostic.`,
+          ...(releaseDetail ? [`${releaseDetail.kind}${releaseDetail.markers.length ? ` · ${releaseDetail.markers.join(', ')}` : ''}${releaseDetail.locations.length ? ` · ${releaseDetail.locations.join(', ')}` : ''}${releaseDetail.stderrTail ? ` · ${releaseDetail.stderrTail}` : ''}`] : [])].join(' · '))
         : undefined;
+      const failureMessage = rawFailureMessage === undefined ? undefined : releaseDetail
+        ? scrubReleaseFailureText(rawFailureMessage, releaseRoot, redactCredentials) : rawFailureMessage;
       const failure = failureMessage === undefined ? undefined : {
         errorCode: error?.startsWith('unit input missing:') ? 'GRAPH_UNIT_INPUT_MISSING' : 'GRAPH_NODE_FAILED',
         message: failureMessage,
@@ -2379,6 +2615,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       releaseGateFailedEvent = eventBus.prepare({ graphId, runId, type: RELEASE_GATE_FAILED_EVENT,
         source: { kind: 'node', nodeId: 'gate-triage' },
         data: { version: releaseInput.version, gate: normalizedGate, triage: triageOutput,
+          ...(Object.prototype.hasOwnProperty.call(releaseInput, 'macrophageRepairLadder')
+            ? { macrophageRepairLadder: releaseInput.macrophageRepairLadder } : {}),
           ...(sourceOutcome === 'ok' || sourceOutcome === 'regression' || sourceOutcome === 'error' || sourceOutcome === 'fail'
             ? { sourceOutcome } : {}),
           ...(releaseInput.gateExecutor === 'host' || releaseInput.gateExecutor === 'pod' ? { gateExecutor: releaseInput.gateExecutor } : {}),
@@ -2408,6 +2646,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       persist();
       if (state.status === 'failed' && !state.dryRun && graphId === 'release-loop') {
         recordReleaseRunFailure(state, root, `Graph ${graphId}/${runId} failed at ${current}`);
+      }
+      if (state.status === 'failed' && !state.dryRun && graphId === 'heal-loop') {
+        alertHealLoopFailure(state, `Graph ${graphId}/${runId} failed at ${current}`, options.deps?.postOpAlert);
       }
       break;
     }
@@ -2588,12 +2829,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (continuation && (continuation.nodeId === completedNodeId || continuation.appendNodeIds?.includes(completedNodeId))) {
       const isAppendedNode = continuation.appendNodeIds?.includes(completedNodeId) === true;
       const isLastAppendedNode = !isAppendedNode || continuation.appendNodeIds?.at(-1) === completedNodeId;
-      if (isLastAppendedNode && continuation.failureTo !== undefined && naturalNext === continuation.failureTo) {
-        // Preserve a fail-closed outcome edge instead of resuming its success continuation.
-        wakeContinuation = undefined;
-        delete state.wakeContinuation;
-      } else if (isLastAppendedNode) {
-        scheduledNext = continuation.returnTo;
+      if (isLastAppendedNode) {
+        const preservesFailureRoute = isAppendedNode &&
+          (naturalNext === continuation.failureTo || naturalNext === continuation.errorTo || naturalNext === continuation.recoveryTo);
+        if (!preservesFailureRoute) scheduledNext = continuation.returnTo;
+        // Appended graphs keep their declared failure/error targets; ordinary wake actions resume at returnTo.
         wakeContinuation = undefined;
         delete state.wakeContinuation;
       } else {
@@ -2619,6 +2859,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       } else if (scheduledNext !== action.nodeId || action.returnTo !== undefined) {
         wakeContinuation = { nodeId: action.nodeId, returnTo: action.returnTo ?? scheduledNext,
           ...(action.failureTo === undefined ? {} : { failureTo: action.failureTo }),
+          ...(action.errorTo === undefined ? {} : { errorTo: action.errorTo }),
+          ...(action.recoveryTo === undefined ? {} : { recoveryTo: action.recoveryTo }),
           ...(action.appendNodeIds === undefined ? {} : { appendNodeIds: [...action.appendNodeIds] }) };
         state.wakeContinuation = wakeContinuation;
         scheduledNext = action.nodeId;
@@ -2643,6 +2885,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       persist();
       if (!state.dryRun && graphId === 'release-loop') {
         recordReleaseRunFailure(state, root, `Graph ${graphId}/${runId} failed after ${fromNodeId} (no outgoing edge)`);
+      }
+      if (!state.dryRun && graphId === 'heal-loop') {
+        alertHealLoopFailure(state, `Graph ${graphId}/${runId} failed after ${fromNodeId} (no outgoing edge)`, options.deps?.postOpAlert);
       }
     }
   }

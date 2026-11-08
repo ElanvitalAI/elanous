@@ -1,5 +1,4 @@
-import { afterEach, expect, spyOn, test } from 'bun:test';
-import { createServer, type Server } from 'node:http';
+import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,15 +13,14 @@ import { podChildLlmArgs, podNamedChildProvider, podSelfImplementSpawn } from '.
 import { runResearchQuestionLadder } from './auto-research/research-turn.js';
 import { routeResearchOutput } from './research/output-router.js';
 import { getUserConfig } from './user-config.js';
+import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import { bootDashboardAcpSession } from './dashboard/acp-boot.js';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from './elanous-config-dir.js';
 
-const originalFetch = globalThis.fetch;
 const originalZaiKey = process.env.ZAI_API_KEY;
 
 afterEach(() => {
   setUserConfigOverlay(null);
-  globalThis.fetch = originalFetch;
   if (originalZaiKey === undefined) delete process.env.ZAI_API_KEY;
   else process.env.ZAI_API_KEY = originalZaiKey;
 });
@@ -51,36 +49,24 @@ async function withOpenAICompatibleServer(
 ): Promise<void> {
   const requests: CapturedRequest[] = [];
   const attempts: Array<{ host: string; model?: string }> = [];
-  const server: Server = createServer((req, res) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
-    req.on('end', () => {
-      try {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { model?: string; messages?: unknown };
-        requests.push({ path: req.url ?? '', ...(body.model ? { model: body.model } : {}) });
-        const content = respond(JSON.stringify(body.messages ?? []));
-        res.writeHead(200, { 'content-type': 'text/event-stream' });
-        res.end(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`);
-      } catch {
-        res.writeHead(400).end('{}');
-      }
+  function makeResponse(request: { url: string; body: string | null }): Response {
+    const originalUrl = new URL(request.url);
+    const body = JSON.parse(request.body ?? '{}') as { model?: string; messages?: unknown };
+    attempts.push({ host: originalUrl.hostname, ...(body.model ? { model: body.model } : {}) });
+    requests.push({ path: `${originalUrl.pathname}${originalUrl.search}`, ...(body.model ? { model: body.model } : {}) });
+    const content = respond(JSON.stringify(body.messages ?? []));
+    return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\n\ndata: [DONE]\n\n`, {
+      status: 200, headers: { 'content-type': 'text/event-stream' },
     });
-  });
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('fake server did not bind');
-  const realFetch = originalFetch;
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input, init) => {
-    const originalUrl = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
-    const body = typeof init?.body === 'string' ? JSON.parse(init.body) as { model?: string } : undefined;
-    attempts.push({ host: originalUrl.hostname, ...(body?.model ? { model: body.model } : {}) });
-    return realFetch(`http://127.0.0.1:${address.port}${originalUrl.pathname}${originalUrl.search}`, init);
-  }) as typeof fetch);
-  try { await run(requests, attempts); }
-  finally {
-    fetchSpy.mockRestore();
-    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
+  await withFakeFetchDevice([
+    { url: '/api/v1/chat/completions', method: 'POST', response: makeResponse },
+    { url: '/api/coding/paas/v4/chat/completions', method: 'POST', response: makeResponse },
+  ], async (device) => {
+    await run(requests, attempts);
+    expect(device.calls().length).toBe(requests.length);
+    expect(device.calls().every(call => call.routeId !== null && call.status === 200)).toBe(true);
+  });
 }
 
 async function sendConfiguredDashboardTurn(userText: string): Promise<string> {

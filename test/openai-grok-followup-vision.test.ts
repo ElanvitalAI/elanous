@@ -18,10 +18,7 @@
 // the strict text-only contract.
 
 import { describe, expect, test } from 'bun:test';
-import {
-  toOpenAIMessages,
-  type LLMMessage,
-} from '../src/llm.js';
+import { toOpenAIMessages, type LLMMessage } from '../src/llm.js';
 
 function imageBearingMessages(): LLMMessage[] {
   return [

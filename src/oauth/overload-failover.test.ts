@@ -23,6 +23,7 @@ import {
   applyLaunchOverloadFailover,
   setLaunchOverloadOutcomesForTesting,
 } from './overload-failover-launch.js';
+import { createFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 
 const dirs: string[] = [];
 
@@ -55,12 +56,11 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
   test('three real overload responses switch the next child to grok', async () => {
     const store = tempDb();
     armStore(store);
-    const original = globalThis.fetch;
     let fetches = 0;
-    globalThis.fetch = (async () => {
+    const fetchDevice = createFakeFetchDevice([{ url: 'https://example.test/v1/responses', method: 'POST', response: () => {
       fetches += 1;
       return overloadResponse(503);
-    }) as unknown as typeof fetch;
+    } }]);
     try {
       for (let i = 0; i < 3; i++) {
         await fetchApiWithRetry('https://example.test/v1/responses', { method: 'POST' }, {
@@ -68,7 +68,7 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
         }).catch(() => undefined);
       }
     } finally {
-      globalThis.fetch = original;
+      fetchDevice.restore();
     }
     expect(fetches).toBe(3);
     const outcomes = readLlmCallOutcomes({ dbPath: store.path, open: () => store });
@@ -92,8 +92,7 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
   test('a 400 from the same call path does not switch', async () => {
     const store = tempDb();
     armStore(store);
-    const original = globalThis.fetch;
-    globalThis.fetch = (async () => new Response('nope', { status: 400 })) as unknown as typeof fetch;
+    const fetchDevice = createFakeFetchDevice([{ url: 'https://example.test/v1/responses', method: 'POST', response: () => new Response('nope', { status: 400 }) }]);
     try {
       for (let i = 0; i < 3; i++) {
         await fetchApiWithRetry('https://example.test/v1/responses', { method: 'POST' }, {
@@ -101,7 +100,7 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
         }).catch(() => undefined);
       }
     } finally {
-      globalThis.fetch = original;
+      fetchDevice.restore();
     }
     const outcomes = readLlmCallOutcomes({ dbPath: store.path, open: () => store });
     store.close();
@@ -131,9 +130,8 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
   test('recovery of N ok responses keeps the next launch on codex', async () => {
     const store = tempDb();
     armStore(store);
-    const original = globalThis.fetch;
     let status = 503;
-    globalThis.fetch = (async () => new Response('ok', { status })) as unknown as typeof fetch;
+    const fetchDevice = createFakeFetchDevice([{ url: 'https://example.test/v1/responses', method: 'POST', response: () => new Response('ok', { status }) }]);
     try {
       for (let i = 0; i < 3; i++) {
         await fetchApiWithRetry('https://example.test/v1/responses', { method: 'POST' }, {
@@ -147,7 +145,7 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
         });
       }
     } finally {
-      globalThis.fetch = original;
+      fetchDevice.restore();
     }
     const outcomes = readLlmCallOutcomes({ dbPath: store.path, open: () => store });
     store.close();
@@ -164,8 +162,7 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
   test('applyLaunchOverloadFailover reads the real rows and moves only an unpinned child', async () => {
     const store = tempDb();
     armStore(store);
-    const original = globalThis.fetch;
-    globalThis.fetch = (async () => overloadResponse(503)) as unknown as typeof fetch;
+    const fetchDevice = createFakeFetchDevice([{ url: 'https://example.test/v1/responses', method: 'POST', response: () => overloadResponse(503) }]);
     try {
       for (let i = 0; i < 3; i++) {
         await fetchApiWithRetry('https://example.test/v1/responses', { method: 'POST' }, {
@@ -173,7 +170,7 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
         }).catch(() => undefined);
       }
     } finally {
-      globalThis.fetch = original;
+      fetchDevice.restore();
     }
     setLaunchOverloadOutcomesForTesting(() => readLlmCallOutcomes({ dbPath: store.path, open: () => store }));
     const moved = applyLaunchOverloadFailover(undefined, {});
@@ -192,12 +189,11 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
   });
 
   test('k overload responses with a remaining fallback throw before another retry', async () => {
-    const original = globalThis.fetch;
     let fetches = 0;
-    globalThis.fetch = (async () => {
+    const fetchDevice = createFakeFetchDevice([{ url: 'https://example.test/v1/responses', method: 'POST', response: () => {
       fetches += 1;
       return overloadResponse(503);
-    }) as unknown as typeof fetch;
+    } }]);
     setLlmCallOutcomeWriterForTesting(() => undefined);
     let thrown: unknown;
     try {
@@ -210,7 +206,7 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
     } catch (err) {
       thrown = err;
     } finally {
-      globalThis.fetch = original;
+      fetchDevice.restore();
     }
     expect(thrown).toBeInstanceOf(OverloadFailoverError);
     expect(fetches).toBe(OVERLOAD_FAILOVER_STREAK);
@@ -218,12 +214,11 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
   });
 
   test('a 400 with remaining fallbacks does not switch provider', async () => {
-    const original = globalThis.fetch;
     let fetches = 0;
-    globalThis.fetch = (async () => {
+    const fetchDevice = createFakeFetchDevice([{ url: 'https://example.test/v1/responses', method: 'POST', response: () => {
       fetches += 1;
       return new Response('bad', { status: 400 });
-    }) as unknown as typeof fetch;
+    } }]);
     setLlmCallOutcomeWriterForTesting(() => undefined);
     let thrown: unknown;
     try {
@@ -236,7 +231,7 @@ describe('overload failover — real llm.call outcomes (#24256 superseded)', () 
     } catch (err) {
       thrown = err;
     } finally {
-      globalThis.fetch = original;
+      fetchDevice.restore();
     }
     expect(thrown).not.toBeInstanceOf(OverloadFailoverError);
     expect(fetches).toBeGreaterThan(0);
@@ -284,12 +279,11 @@ test('one call writes exactly one llm.call/outcome row (the debug trace is not a
   armStore(store);
   const traced: string[] = [];
   const off = debug.registerSink({ name: 'outcome-dup-probe', emit: (record) => { if (record.category === 'llm.call') traced.push(record.event); } });
-  const original = globalThis.fetch;
-  globalThis.fetch = (async () => new Response('ok', { status: 200 })) as unknown as typeof fetch;
+  const fetchDevice = createFakeFetchDevice([{ url: 'https://example.test/v1/responses', method: 'POST', response: () => new Response('ok', { status: 200 }) }]);
   try {
     await fetchApiWithRetry('https://example.test/v1/responses', { method: 'POST' }, { provider: 'codex', errorPrefix: 'Codex API', maxAttempts: 1 });
   } finally {
-    globalThis.fetch = original;
+    fetchDevice.restore();
     off();
   }
   const outcomes = readLlmCallOutcomes({ dbPath: store.path, open: () => store });

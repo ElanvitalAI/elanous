@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { integrateTrain, planTrain, runTrain, tangledPairs, type TrainCandidate, type TrainGit, type TrainObservation } from './merge-train.js';
 import { enqueueL8ShadowQueue, runL8ShadowQueue, statusL8ShadowQueue } from './l8-merge-queue.js';
+import { createGraphEventBus } from '../graph-runner/graph-events.js';
+import { createMacrophageRuntime } from '../release-loop/macrophage-heal-node.js';
 
 const candidates = Array.from({ length: 8 }, (_, index): TrainCandidate => ({ number: index + 1, head: 'a'.repeat(40), files: [`${index}.ts`] }));
 const dirs: string[] = [];
@@ -102,6 +104,91 @@ test('omitted deferred remains unknown in the train-verdict log rather than repo
   });
   expect(observed).toEqual([{ batch: [1], deferred: null, gatesRun: 1,
     passed: [1], culprits: [], unmeasured: [], gatesPerLanding: 1 }]);
+});
+
+test('runTrain emits real batch and verdict progress into the macrophage simulation receipts', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'merge-train-macrophage-'));
+  dirs.push(root);
+  const runId = 'train-macrophage-run';
+  const graphId = 'train-macrophage-sim';
+  const bus = createGraphEventBus();
+  const macrophage = createMacrophageRuntime({ runId, graphId, root, eventBus: bus, mode: 'simulation' });
+  const emitted: string[] = [];
+  const largeBatch = Array.from({ length: 40 }, (_, index): TrainCandidate => ({
+    number: 100 + index, head: index.toString(16).padStart(40, '0'), files: [`${index}.ts`],
+  }));
+  try {
+    const result = await runTrain(largeBatch, {
+      progressId: 'batch-42',
+      emitProgress: async (event) => {
+        emitted.push(event.type);
+        await bus.publish({ eventId: event.eventId, graphId, runId, type: event.type,
+          source: { kind: 'node', nodeId: 'merge-train' },
+          data: event.type === 'merge-train.batch'
+            ? { batch: event.batch }
+            : { observation: event.observation, verdicts: event.verdicts } });
+      },
+      integrate: () => ({ commitSha: 'b'.repeat(40), conflicts: [] }),
+      gate: () => 'pass',
+      observe: () => {},
+    });
+    const failed = await runTrain([{ number: 900, head: 'c'.repeat(40), files: ['failed.ts'] }], {
+      progressId: 'batch-fail',
+      emitProgress: async (event) => {
+        emitted.push(event.type);
+        await bus.publish({ eventId: event.eventId, graphId, runId, type: event.type,
+          source: { kind: 'node', nodeId: 'merge-train' },
+          data: event.type === 'merge-train.batch'
+            ? { batch: event.batch }
+            : { observation: event.observation, verdicts: event.verdicts } });
+      },
+      integrate: () => ({ commitSha: 'd'.repeat(40), conflicts: [] }),
+      gate: () => 'fail',
+      observe: () => {},
+    });
+    const receiptPath = join(root, 'graph-runs', 'release-loop', `${runId}.json.contexts`, 'macrophage.jsonl');
+    const receipts = readFileSync(receiptPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as {
+      eventId: string; data: Record<string, unknown>;
+    });
+    expect(result.verdicts.every(({ verdict }) => verdict === 'pass')).toBe(true);
+    expect(failed.verdicts).toEqual([{ number: 900, verdict: 'fail' }]);
+    expect(emitted).toEqual(['merge-train.batch', 'merge-train.verdict', 'merge-train.batch', 'merge-train.verdict']);
+    expect(macrophage.decisions).toHaveLength(4);
+    expect(macrophage.decisions.map((event) => event.data?.sourceEventType)).toEqual(emitted);
+    expect(receipts).toHaveLength(4);
+    expect(receipts.map((receipt) => receipt.data.sourceEventId)).toEqual([
+      'batch-42:batch', 'batch-42:verdict', 'batch-fail:batch', 'batch-fail:verdict',
+    ]);
+    expect(receipts.every((receipt) => receipt.data.action === 'retain' && receipt.data.applied === false
+      && receipt.data.sourceEventType?.toString().startsWith('merge-train.'))).toBe(true);
+    expect((receipts[0]?.data.evidence as string).length).toBeGreaterThan(1200);
+    expect(receipts[0]?.data.evidence).toContain('"number":139');
+    expect(receipts[1]?.data.evidence).toContain('"passed":[100,101,102');
+    expect(receipts[3]?.data.evidence).toContain('"verdict":"fail"');
+  } finally { macrophage.dispose(); }
+});
+
+test('runTrain progress callback failures stop work or suppress a final verdict as documented', async () => {
+  const candidate = candidates[0]!;
+  let integrations = 0;
+  const firstEvents: string[] = [];
+  await expect(runTrain([candidate], {
+    progressId: 'sink-fails',
+    emitProgress: (event) => { firstEvents.push(event.type); throw new Error('batch sink failed'); },
+    integrate: () => { integrations++; return { commitSha: 'b'.repeat(40), conflicts: [] }; },
+    gate: () => 'pass', observe: () => {},
+  })).rejects.toThrow('batch sink failed');
+  expect(firstEvents).toEqual(['merge-train.batch']);
+  expect(integrations).toBe(0);
+
+  const observedEvents: string[] = [];
+  await expect(runTrain([candidate], {
+    progressId: 'observe-fails',
+    emitProgress: (event) => { observedEvents.push(event.type); },
+    integrate: () => ({ commitSha: 'b'.repeat(40), conflicts: [] }),
+    gate: () => 'pass', observe: () => { throw new Error('observation sink failed'); },
+  })).rejects.toThrow('observation sink failed');
+  expect(observedEvents).toEqual(['merge-train.batch']);
 });
 
 test('provided overlap deferrals survive in the train observation', async () => {

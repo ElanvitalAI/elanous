@@ -29,8 +29,10 @@ import {
 import { debug } from '../src/debug/log.js';
 import { currentEventLoopActivity } from '../src/debug/event-loop-watchdog.js';
 import type { DiscoverySource } from '../src/registry/discovery/types.js';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 let tmpHome: string;
+let fakeFetch: FakeFetchDevice | undefined;
 const KEYS = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GEMINI_API_KEY', 'XAI_API_KEY', 'FIRECRAWL_API_KEY'];
 
 beforeEach(() => {
@@ -45,6 +47,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  fakeFetch?.restore();
+  fakeFetch = undefined;
   rmSync(tmpHome, { recursive: true, force: true });
   delete process.env.ELANOUS_TEST_HOME;
   delete process.env.ELANOUS_S3_DISABLED;
@@ -247,10 +251,9 @@ describe('lmStudioSource (local-hosts)', () => {
     // local-hosts source delegates to `fetchAllHosts` which uses the
     // global fetch · override that for this test (the source doesn't
     // expose a fetchImpl seam to keep its signature minimal).
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = (async (url: unknown) => {
-      if (String(url) === 'http://lm.test:1234/v1/models') {
-        return new Response(
+    fakeFetch = createFakeFetchDevice([{
+      url: 'http://lm.test:1234/v1/models', method: 'GET', response: (request) => {
+        if (request.url === 'http://lm.test:1234/v1/models') return new Response(
           JSON.stringify({
             data: [
               { id: 'gemma-4-26b-a4b-it', object: 'model', owned_by: 'lmstudio-community' },
@@ -259,18 +262,15 @@ describe('lmStudioSource (local-hosts)', () => {
           }),
           { status: 200, headers: { 'content-type': 'application/json' } },
         );
-      }
-      return new Response('', { status: 404 });
-    }) as unknown as typeof fetch;
-    try {
-      const r = await lmStudioSource.run();
-      expect(r.ok).toBe(true);
-      expect(r.models.map((m) => m.id).sort()).toEqual(['gemma-4-26b-a4b-it', 'qwen3-72b-instruct']);
-      expect(r.models[0]?.provider).toBe('local');
-      expect(r.models[0]?.discoveryMeta.source).toBe('auto-local-host');
-    } finally {
-      globalThis.fetch = origFetch;
-    }
+        return new Response('', { status: 404 });
+      },
+    }]);
+    const r = await lmStudioSource.run();
+    expect(r.ok).toBe(true);
+    expect(r.models.map((m) => m.id).sort()).toEqual(['gemma-4-26b-a4b-it', 'qwen3-72b-instruct']);
+    expect(r.models[0]?.provider).toBe('local');
+    expect(r.models[0]?.discoveryMeta.source).toBe('auto-local-host');
+    expect(fakeFetch.calls().map(({ method, url }) => `${method} ${url}`)).toEqual(['GET http://lm.test:1234/v1/models']);
   });
 
   test('skips ollama hosts (filter mismatch)', async () => {
@@ -289,10 +289,9 @@ describe('ollamaSource (local-hosts)', () => {
     setHostsOverride([
       { name: 'workstation', kind: 'ollama', endpoint: 'http://ollama.test:11434' },
     ]);
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = (async (url: unknown) => {
-      if (String(url) === 'http://ollama.test:11434/api/tags') {
-        return new Response(
+    fakeFetch = createFakeFetchDevice([{
+      url: 'http://ollama.test:11434/api/tags', method: 'GET', response: (request) => {
+        if (request.url === 'http://ollama.test:11434/api/tags') return new Response(
           JSON.stringify({
             models: [
               { name: 'llama-3', model: 'llama-3' },
@@ -301,19 +300,16 @@ describe('ollamaSource (local-hosts)', () => {
           }),
           { status: 200, headers: { 'content-type': 'application/json' } },
         );
-      }
-      return new Response('', { status: 404 });
-    }) as unknown as typeof fetch;
-    try {
-      const r = await ollamaSource.run();
-      expect(r.ok).toBe(true);
-      expect(r.models.map((m) => m.id).sort()).toEqual(['llama-3', 'phi-4']);
-      expect(r.models[0]?.provider).toBe('local');
-      expect(r.models[0]?.discoveryMeta.confidence).toBe('medium');
-      expect(r.models[0]?.discoveryMeta.source).toBe('auto-local-host');
-    } finally {
-      globalThis.fetch = origFetch;
-    }
+        return new Response('', { status: 404 });
+      },
+    }]);
+    const r = await ollamaSource.run();
+    expect(r.ok).toBe(true);
+    expect(r.models.map((m) => m.id).sort()).toEqual(['llama-3', 'phi-4']);
+    expect(r.models[0]?.provider).toBe('local');
+    expect(r.models[0]?.discoveryMeta.confidence).toBe('medium');
+    expect(r.models[0]?.discoveryMeta.source).toBe('auto-local-host');
+    expect(fakeFetch.calls().map(({ method, url }) => `${method} ${url}`)).toEqual(['GET http://ollama.test:11434/api/tags']);
   });
 });
 

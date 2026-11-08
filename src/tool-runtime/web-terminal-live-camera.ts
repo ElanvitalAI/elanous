@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // WT-N-5 P2 — LiveCameraFrame LLM tool.
 //
 // Reads the most-recent frame the PWA streamed for the current
@@ -17,7 +18,7 @@
 // hallucinating a vision answer.
 
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { resolveAttachmentPath } from '../boot/attachment-store.js';
 import {

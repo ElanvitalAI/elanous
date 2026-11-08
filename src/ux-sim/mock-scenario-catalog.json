@@ -48,6 +48,54 @@
       {
         "path": "src/ux-sim/app-contract-secret-entropy.test.ts",
         "reason": "APP-CONTRACT-SECRET-ENTROPY: safe synthetic credential corpus measures the production parser false-positive rate."
+      },
+      {
+        "path": "src/ux-sim/readiness-countdown.ts",
+        "reason": "COORD-READINESS-COUNTDOWN simulator-first contract probe for RLA-LAUNCH-COUNTDOWN-PHASES."
+      },
+      {
+        "path": "src/ux-sim/readiness-countdown.test.ts",
+        "reason": "COORD-READINESS-COUNTDOWN deterministic late-readiness, hold, notification and reservation assertions."
+      },
+      {
+        "path": "src/ux-sim/fake-app-drive-world.ts",
+        "reason": "APP-WEB-DRIVE-TENANT: tenant-isolated read-only Drive fake world for the D5-preapproval contract."
+      },
+      {
+        "path": "src/ux-sim/fake-app-drive-world.test.ts",
+        "reason": "APP-WEB-DRIVE-TENANT: A/B isolation, scope, page-token, refresh, logout and revoke simulation coverage."
+      },
+      {
+        "path": "src/ux-sim/fake-app-source-concurrent-writer.ts",
+        "reason": "APP-SOURCE-SNAPSHOT preexisting source-inventory omission registered while advancing the simulator catalog version."
+      },
+      {
+        "path": "src/ux-sim/fake-app-source-world.ts",
+        "reason": "APP-SOURCE-SNAPSHOT preexisting source-inventory omission registered while advancing the simulator catalog version."
+      },
+      {
+        "path": "src/ux-sim/fake-app-source-world.test.ts",
+        "reason": "APP-SOURCE-SNAPSHOT preexisting source-inventory omission registered while advancing the simulator catalog version."
+      },
+      {
+        "path": "src/ux-sim/fake-google-drive-world.ts",
+        "reason": "APP-OAUTH-ONE: synthetic Google Drive files.list readonly fake world; no live OAuth or API call."
+      },
+      {
+        "path": "src/ux-sim/fake-google-drive-world.test.ts",
+        "reason": "APP-OAUTH-ONE: scenario exercises metadata-only pagination, scope rejection, and write refusal."
+      },
+      {
+        "path": "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+        "reason": "GIT-PUSH-FALSE-FAIL: simulates a transport timeout after a local remote accepts a branch ref so the production CLI can verify the partial outcome."
+      },
+      {
+        "path": "src/ux-sim/fake-temp-cleanup.ts",
+        "reason": "TMP-DIR-LEAK: suite-scoped fake temp filesystem verifies test-owned directory cleanup and preservation of unrelated roots."
+      },
+      {
+        "path": "src/ux-sim/fake-temp-cleanup.test.ts",
+        "reason": "TMP-DIR-LEAK: normal and exceptional suite teardown scenarios exercise the tracked temp-root cleanup helper."
       }
     ],
     "excludedPaths": 27,
@@ -61,7 +109,8 @@
       "requiredPaths": [
         "test/ux-sim/aimock-local.ts",
         "test/telegram-surface-hitl.test.ts",
-        "src/ux-sim/safe-public-copy-publish.ts"
+        "src/ux-sim/safe-public-copy-publish.ts",
+        "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts"
       ],
       "missingPaths": []
     },
@@ -475,10 +524,142 @@
         "scenarioIds": [
           "APP-CONTRACT-SECRET-ENTROPY"
         ]
+      },
+      {
+        "path": "src/ux-sim/readiness-countdown.ts",
+        "disposition": "device",
+        "entryCommand": "bun scripts/ux-sim.ts readiness-countdown",
+        "logsRecorded": "no",
+        "logsDetail": "Deterministic event replay; external boundaries are injected.",
+        "deviceId": "readiness-countdown",
+        "scenarioIds": [
+          "RLA-LAUNCH-COUNTDOWN-1107"
+        ]
+      },
+      {
+        "path": "src/ux-sim/readiness-countdown.test.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/readiness-countdown.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Asserts 11-07 fixed-time constraint, no-go/hold, ETA notification and host lease extension.",
+        "deviceId": "readiness-countdown",
+        "scenarioIds": [
+          "RLA-LAUNCH-COUNTDOWN-1107"
+        ]
+      },
+      {
+        "path": "src/ux-sim/fake-app-drive-world.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/fake-app-drive-world.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Synthetic tenant fixtures stay in memory; no external Google calls or credential persistence occur.",
+        "deviceId": "fake-app-drive-world",
+        "scenarioIds": [
+          "APP-WEB-DRIVE-TENANT"
+        ]
+      },
+      {
+        "path": "src/ux-sim/fake-app-drive-world.test.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/fake-app-drive-world.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Synthetic tenant fixtures stay in memory; no external Google calls or credential persistence occur.",
+        "deviceId": "fake-app-drive-world",
+        "scenarioIds": [
+          "APP-WEB-DRIVE-TENANT"
+        ]
+      },
+      {
+        "path": "src/ux-sim/fake-app-source-concurrent-writer.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/fake-app-source-world.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Local fake object store and concurrent workers expose only synthetic source snapshots and records.",
+        "deviceId": "fake-app-source-world",
+        "scenarioIds": [
+          "APP-SOURCE-SNAPSHOT"
+        ]
+      },
+      {
+        "path": "src/ux-sim/fake-app-source-world.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/fake-app-source-world.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Local fake object store and concurrent workers expose only synthetic source snapshots and records.",
+        "deviceId": "fake-app-source-world",
+        "scenarioIds": [
+          "APP-SOURCE-SNAPSHOT"
+        ]
+      },
+      {
+        "path": "src/ux-sim/fake-app-source-world.test.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/fake-app-source-world.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Local fake object store and concurrent workers expose only synthetic source snapshots and records.",
+        "deviceId": "fake-app-source-world",
+        "scenarioIds": [
+          "APP-SOURCE-SNAPSHOT"
+        ]
+      },
+      {
+        "path": "src/ux-sim/fake-google-drive-world.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/fake-google-drive-world.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Synthetic OAuth token is in memory only; requests record only whether authorization was present.",
+        "deviceId": "fake-google-drive-world",
+        "scenarioIds": [
+          "GOOGLE-DRIVE-LIST-READONLY"
+        ]
+      },
+      {
+        "path": "src/ux-sim/fake-google-drive-world.test.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/fake-google-drive-world.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Scenario assertions use synthetic file metadata and no live Google endpoint.",
+        "deviceId": "fake-google-drive-world",
+        "scenarioIds": [
+          "GOOGLE-DRIVE-LIST-READONLY"
+        ]
+      },
+      {
+        "path": "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/git-fs/git-cli.test.ts -t \"confirms a timed-out push\"",
+        "logsRecorded": "no",
+        "logsDetail": "The scenario asserts the CLI status receipt and local bare-remote ref; no production logs or network are written.",
+        "deviceId": "git-push-timeout-partial-outcome-remote-verify",
+        "scenarioIds": [
+          "GIT-PUSH-TIMEOUT-PARTIAL-OUTCOME-REMOTE-VERIFY"
+        ]
+      },
+      {
+        "path": "src/ux-sim/fake-temp-cleanup.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/fake-temp-cleanup.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Uses isolated OS temporary roots and verifies post-run filesystem state without writing production logs.",
+        "deviceId": "fake-temp-cleanup",
+        "scenarioIds": [
+          "TASK-TEMP-CLEANUP"
+        ]
+      },
+      {
+        "path": "src/ux-sim/fake-temp-cleanup.test.ts",
+        "disposition": "device",
+        "entryCommand": "bun test src/ux-sim/fake-temp-cleanup.test.ts",
+        "logsRecorded": "no",
+        "logsDetail": "Checks cleanup after successful and throwing suites while preserving an unrelated directory.",
+        "deviceId": "fake-temp-cleanup",
+        "scenarioIds": [
+          "TASK-TEMP-CLEANUP"
+        ]
       }
     ]
   },
-  "deviceCatalogVersion": 11,
+  "deviceCatalogVersion": 15,
   "devices": [
     {
       "id": "SIM-FAKE-PROVIDERS-AV",
@@ -567,11 +748,13 @@
       "name": "Fake app traffic caps and admin kill switch",
       "implementation": [
         "src/ux-sim/fake-app-traffic.ts",
-        "src/ux-sim/fake-clock.ts"
+        "src/ux-sim/fake-clock.ts",
+        "src/ux-sim/app-kill-switch-world.ts"
       ],
       "tests": [
         "src/ux-sim/fake-app-traffic.test.ts",
-        "src/ux-sim/fake-clock.test.ts"
+        "src/ux-sim/fake-clock.test.ts",
+        "src/ux-sim/app-kill-switch-world.test.ts"
       ],
       "target": "Per-app request and response byte accounting with warning, throttle, block, window reset, and immediate admin stream termination",
       "inputs": [
@@ -729,6 +912,8 @@
         "signal",
         "delay",
         "argv",
+        "argv response rules",
+        "allowlisted environment variable names",
         "caller PATH",
         "exact install prefix",
         "declared relative installation artifacts",
@@ -738,6 +923,8 @@
       ],
       "observations": [
         "spawn arguments",
+        "argv-selected stdout/stderr/exit responses",
+        "selected environment values (unset recorded as null)",
         "stdout/stderr when piped",
         "exit code or signal",
         "spawn error",
@@ -896,6 +1083,43 @@
       ],
       "entryCommands": [
         "bun test src/ux-sim/fault-nexus-stall.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "pod-reuse-match-by-kind-sim",
+      "name": "Kind-aware warm Pod candidate matching",
+      "implementation": [
+        "src/ux-sim/pod-reuse-match-by-kind-sim.ts",
+        "src/task-orchestrator/surfaces/pod-warm-provenance.ts",
+        "src/task-orchestrator/surfaces/pod-warm-worker-pod.ts",
+        "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts",
+        "src/task-orchestrator/surfaces/pod-si-warm-provider.ts",
+        "src/ux-sim/warm-si-reuse-sim.ts"
+      ],
+      "tests": [
+        "src/ux-sim/pod-reuse-match-by-kind-sim.test.ts"
+      ],
+      "target": "One production candidate scorer selects exact Pod kind; gate reuse requires exact cut SHA, lock hash, and image digest while runtime architecture is exact unless an explicit amd64/arm64 allowlist is configured",
+      "inputs": [
+        "exact cut SHA",
+        "lockfile hash",
+        "runtime contract and observed Bun/OS/architecture/tools",
+        "exact architecture by default and explicit amd64/arm64 allowlist",
+        "image digest drift",
+        "gate versus implementation candidate kind"
+      ],
+      "observations": [
+        "implementation and gate paths reject a candidate of the other kind",
+        "gate path rejects any cut SHA, lock hash, or image digest mismatch",
+        "cross-architecture candidates fail closed by default and match only when both architectures are allowlisted",
+        "implementation ALLOC-RETURN reaches two lease generations on the same cleaned Pod UID through the shared scorer",
+        "implementation digest drift is observed; gate mismatch reasons are explicit"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/pod-reuse-match-by-kind-sim.test.ts"
       ],
       "logsRecorded": "no",
       "eventNames": [],
@@ -1230,7 +1454,8 @@
         "scenarios/ux-sim/sim-hq-move.yaml",
         "src/ux-sim/fake-app-host.ts",
         "src/ux-sim/gate-roster-second-pool.ts",
-        "src/ux-sim/world-watch.ts"
+        "src/ux-sim/world-watch.ts",
+        "src/ux-sim/multi-tenant-relay-world.ts"
       ],
       "inputs": [
         "world YAML",
@@ -1268,7 +1493,8 @@
         "src/ux-sim/world-host-chaos.test.ts",
         "src/ux-sim/warm-si-reuse-sim.test.ts",
         "src/ux-sim/fake-app-host.test.ts",
-        "src/ux-sim/gate-roster-second-pool.test.ts"
+        "src/ux-sim/gate-roster-second-pool.test.ts",
+        "src/ux-sim/multi-tenant-relay-world.test.ts"
       ]
     },
     {
@@ -1494,7 +1720,9 @@
         "scenarios/ux-sim/rla-rehearsal-incident-sim-b.yaml",
         "scenarios/ux-sim/release-sim-rig.yaml",
         "src/ux-sim/release-event-trace.ts",
-        "src/ux-sim/release-publish-devices.ts"
+        "src/ux-sim/release-publish-devices.ts",
+        "src/ux-sim/gate-image-pin-handshake-sim.ts",
+        "src/ux-sim/gate-image-preflight-runtime-identity-sim.ts"
       ],
       "tests": [
         "src/ux-sim/release-sim-rig.test.ts",
@@ -1509,11 +1737,14 @@
         "scripts/release-loop/adaptive-gate-heal.sim.test.ts",
         "src/ux-sim/release-event-trace.test.ts",
         "src/ux-sim/release-incident-events.test.ts",
-        "scripts/release-loop/rla-rehearsal-incident-sim-b.test.ts"
+        "scripts/release-loop/rla-rehearsal-incident-sim-b.test.ts",
+        "src/ux-sim/gate-image-pin-handshake-sim.test.ts",
+        "src/ux-sim/gate-image-preflight-runtime-identity-sim.test.ts"
       ],
-      "target": "release graph routing, fan-out joins and resume failures; the live gate-triage node consumes attributed gate results and emits a bounded repair node, graph append and resume plan; SIM-B drives the real release.gate.failed adapter through durable append, interruption and resume; the cutoff notes-empty case runs the version-release, graph cutoff and cutoff CLIs against an isolated local Git world",
+      "target": "release graph routing, fan-out joins and resume failures; injected publish outcomes including unknown publication status pause at human approval before npm publish; the live gate-triage node consumes attributed gate results and emits a bounded repair node, graph append and resume plan; SIM-B drives the real release.gate.failed adapter through durable append, interruption and resume; the cutoff notes-empty case runs the version-release, graph cutoff and cutoff CLIs against an isolated local Git world",
       "inputs": [
         "node outcomes",
+        "unknown publish outcome with process exit 0",
         "branch overlap delays",
         "evidence",
         "resume state",
@@ -1527,6 +1758,7 @@
         "fan-out branch results",
         "start-time overlap",
         "unexpected edges",
+        "unknown publish HITL routing",
         "ledger events",
         "final graph state",
         "repair node plan",
@@ -1880,7 +2112,7 @@
         "src/ux-sim/classic-tui-seat-scenarios.test.ts",
         "src/ux-sim/next-tui-seat-scenarios.test.ts"
       ],
-      "target": "first-run, authoring, scripted TUI flows, persisted same-build seminar freeze state, and first-screen noise regression through a real isolated PTY",
+      "target": "first-run and authoring, scripted classic/next TUI flows, busy classic Escape abort with FIFO inputs, persisted same-build seminar freeze state, and first-screen noise regression through a real isolated PTY",
       "inputs": [
         "mock author response",
         "scenario steps",
@@ -1889,7 +2121,8 @@
         "three consecutive rehearsal verdicts",
         "owner approval receipt",
         "private simulation world",
-        "first-run Enter skip"
+        "first-run Enter skip",
+        "classic busy-turn Escape abort and two-input FIFO ordering"
       ],
       "observations": [
         "step result",
@@ -1902,7 +2135,8 @@
         "internal prompt-bank event absent from the screen",
         "daemon setup command absent from the screen",
         "human web setup guidance visible",
-        "Doctor start event absent after Enter skip"
+        "Doctor start event absent after Enter skip",
+        "classic PTY escape abort event and queued user-input order"
       ],
       "entryCommands": [
         "bun test src/ux-sim/mock-authoring-first-run.test.ts src/ux-sim/seminar-rehearsal.test.ts src/ux-sim/classic-tui-seat-scenarios.test.ts src/ux-sim/next-tui-seat-scenarios.test.ts"
@@ -1928,7 +2162,8 @@
         "src/publishing/markdown-renderer.ts",
         "src/publishing/artifact-store.ts",
         "src/debug/log.ts",
-        "src/ux-sim/fake-app-db-world.ts"
+        "src/ux-sim/fake-app-db-world.ts",
+        "src/ux-sim/fake-relay-world.ts"
       ],
       "tests": [
         "src/ux-sim/aimock-local.test.ts",
@@ -1940,7 +2175,8 @@
         "src/ux-sim/safe-public-copy-publish.test.ts",
         "src/ux-sim/install-consent-device.test.ts",
         "test/nexus/api/markdown-publish.test.ts",
-        "src/ux-sim/fake-app-db-world.test.ts"
+        "src/ux-sim/fake-app-db-world.test.ts",
+        "src/ux-sim/fake-relay-world.test.ts"
       ],
       "target": "local fake LLM server, browser/linear fakes, service-key setup, terminal slash device and test CLI instance; safe launch-copy redaction and real Markdown publish/serve handlers with isolated storage",
       "inputs": [
@@ -2582,6 +2818,230 @@
       "logsRecorded": "no",
       "eventNames": [],
       "recentUse": null
+    },
+    {
+      "id": "readiness-countdown",
+      "name": "Release readiness countdown simulation",
+      "implementation": [
+        "src/ux-sim/readiness-countdown.ts"
+      ],
+      "tests": [
+        "src/ux-sim/readiness-countdown.test.ts"
+      ],
+      "target": "Readiness gates, hold, ETA notices and host reservation extensions against a fixed-time constraint",
+      "inputs": [
+        "fake PR land events",
+        "gate duration",
+        "host readiness",
+        "manual hold",
+        "milestone completion"
+      ],
+      "observations": [
+        "GO/NO-GO at cutoff, gate, publish and announcement",
+        "ETA change notifications",
+        "T-minus host reservation expiry",
+        "11-07 06:00 constraint to 07:xx readiness replay"
+      ],
+      "entryCommands": [
+        "bun scripts/ux-sim.ts readiness-countdown",
+        "bun test src/ux-sim/readiness-countdown.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-app-drive-world",
+      "name": "Tenant-isolated fake Google Drive read world",
+      "checklistCells": [
+        "APP-WEB-DRIVE-TENANT"
+      ],
+      "implementation": [
+        "src/ux-sim/fake-app-drive-world.ts",
+        "src/nexus/apps/drive-contract.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-app-drive-world.test.ts"
+      ],
+      "target": "Read-only Google Drive files.list contract with per-identity tenant boundaries and no Google or credential-store dependency",
+      "inputs": [
+        "verified issuer and subject identities",
+        "synthetic file metadata and granted scopes",
+        "token expiry, refresh, logout and revoke events",
+        "page size and opaque continuation token"
+      ],
+      "observations": [
+        "tenant-separated file lists and page tokens",
+        "scope, expiry, refresh, logout and revoke outcomes",
+        "Google API adapter absent",
+        "credential persistence adapter absent"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-app-drive-world.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-app-source-world",
+      "name": "Fake app source snapshot and restore world",
+      "checklistCells": [
+        "APP-SOURCE-SNAPSHOT"
+      ],
+      "implementation": [
+        "src/ux-sim/fake-app-source-concurrent-writer.ts",
+        "src/ux-sim/fake-app-source-world.ts",
+        "src/nexus/apps/app-source-snapshot.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-app-source-world.test.ts"
+      ],
+      "target": "Production app source snapshot and restore logic backed by a private local object store, including concurrent-writer isolation.",
+      "inputs": [
+        "app slug, deployment ID and source tree",
+        "tampered, missing or mismatched snapshot state",
+        "concurrent writers"
+      ],
+      "observations": [
+        "source fingerprint and snapshot ledger records",
+        "restore refusal before target mutation",
+        "writer-specific object keys and results"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-app-source-world.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "fake-google-drive-world",
+      "name": "Fake Google Drive metadata-only files.list world",
+      "checklistCells": [
+        "APP-OAUTH-ONE"
+      ],
+      "implementation": [
+        "src/ux-sim/fake-google-drive-world.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-google-drive-world.test.ts"
+      ],
+      "target": "Drive files.list pagination and metadata scope against an in-memory, network-free read-only world",
+      "inputs": [
+        "synthetic file metadata",
+        "granted OAuth scopes",
+        "pageSize and opaque pageToken",
+        "Bearer token and HTTP method"
+      ],
+      "observations": [
+        "only id/name/mimeType/modifiedTime metadata is returned",
+        "readonly scope is required",
+        "write methods are rejected without mutation",
+        "unknown hosts and endpoints fail closed",
+        "captured requests never retain bearer values"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-google-drive-world.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "git-push-timeout-partial-outcome-remote-verify",
+      "name": "Git push timeout remote verification",
+      "implementation": [
+        "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+        "src/git-fs/git-cli.ts"
+      ],
+      "tests": [
+        "src/git-fs/git-cli.test.ts"
+      ],
+      "target": "Production git CLI push after a transport timeout, verified against one stable push URL, unchanged ordinary loose branch ref identity/content, and unchanged reflog.",
+      "inputs": [
+        "one explicit full branch refspec",
+        "remote accepts the ref update before the client reports timeout",
+        "ordinary source ref moves or moves away-and-back are refused",
+        "symbolic source refs and symbolic transitions during push are refused"
+      ],
+      "observations": [
+        "ls-remote target ref and pre-push commit",
+        "CLI status line and PARTIAL_OUTCOME receipt",
+        "source ref file identity/content and reflog remain stable"
+      ],
+      "entryCommands": [
+        "bun test src/git-fs/git-cli.test.ts -t \"confirms a timed-out push\""
+      ],
+      "logsRecorded": "no",
+      "eventNames": [
+        "git.cli/partial-outcome"
+      ],
+      "recentUse": null
+    },
+    {
+      "id": "fake-temp-cleanup",
+      "name": "Task-agent test temporary directory cleanup",
+      "checklistCells": [
+        "TMP-DIR-LEAK"
+      ],
+      "implementation": [
+        "src/ux-sim/fake-temp-cleanup.ts",
+        "src/test-utils/temp-dir-cleanup.ts",
+        "src/task-agent/task-hand.test.ts",
+        "src/task-agent/live-moves.test.ts",
+        "src/task-agent/card-evidence.test.ts",
+        "src/cli/tasks-cli.test.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-temp-cleanup.test.ts"
+      ],
+      "target": "Task-agent suites that create temporary roots, including failure teardown and preservation of unrelated host state.",
+      "inputs": [
+        "normal suite completion after creating task-hand, ta-live and task-card-evidence roots",
+        "suite failure after creating nested temporary artifacts",
+        "an unrelated untracked temporary root"
+      ],
+      "observations": [
+        "tracked temporary roots removed after teardown",
+        "unrelated temporary root remains untouched",
+        "cleanup failure is reported to the suite"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/fake-temp-cleanup.test.ts",
+        "bun test src/cli/tasks-cli.test.ts src/task-agent/task-hand.test.ts src/task-agent/live-moves.test.ts src/task-agent/card-evidence.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [],
+      "recentUse": null
+    },
+    {
+      "id": "rla-context-release-status-arrival-event",
+      "name": "Release context status from live graph node-arrival",
+      "implementation": [
+        "src/ux-sim/rla-context-release-status-arrival-event.ts",
+        "src/context-bus/context-now.ts"
+      ],
+      "tests": [
+        "src/ux-sim/rla-context-release-status-arrival-event.test.ts"
+      ],
+      "target": "Production release graph runner node-arrival delivery into release context status, CLI, TUI and Telegram surfaces",
+      "inputs": [
+        "Isolated one-node release graph",
+        "Real graph-runner node-arrival event and durable context event adapter"
+      ],
+      "observations": [
+        "Release currentNode and phase at node-arrival before node-start",
+        "CLI, TUI and Telegram release status from the same event-derived fact"
+      ],
+      "entryCommands": [
+        "bun test src/ux-sim/rla-context-release-status-arrival-event.test.ts"
+      ],
+      "logsRecorded": "no",
+      "eventNames": [
+        "release graph node-arrival"
+      ],
+      "recentUse": null
     }
   ],
   "discovery": {
@@ -2597,7 +3057,7 @@
       "src/playground-scenario/*.ts",
       "src/showroom/outbound/channels/stubs.ts"
     ],
-    "limits": "File-level sourceModules recursively covers src/ux-sim/**/*.ts except *.test.ts plus *.json fixtures; other extensions are outside this catalog contract."
+    "limits": "sourceModules is a curated runtime index; every src/ux-sim/**/*-world.ts simulation world must be registered, while other runtime modules may be indexed selectively."
   },
   "runEvidence": {
     "scope": "ScenarioV0 YAML runs only; catalog entries reference reusable devices/tests, and list/show/devices do not execute them",
@@ -3101,9 +3561,139 @@
         "gate hosts are excluded from the concurrent harness task pool"
       ],
       "expected": "both matching pools participate; one failed host is removed and the other completes the sweep; two failed hosts never produce a reduced-roster pass; image digest mismatch is refused"
+    },
+    {
+      "id": "RLA-LAUNCH-COUNTDOWN-1107",
+      "name": "Readiness countdown · 11-07 delayed release",
+      "kind": "launch-countdown",
+      "device": "readiness-countdown",
+      "implementation": [
+        "src/ux-sim/readiness-countdown.ts"
+      ],
+      "tests": [
+        "src/ux-sim/readiness-countdown.test.ts"
+      ],
+      "trigger": "Inject delayed prerequisite PR landing, gate duration, host readiness and hold events around the reported 06:00 fixed-time constraint.",
+      "observe": [
+        "cutoff/gate/publish/announcement GO or NO-GO",
+        "ETA change notice",
+        "T-minus host reservation expiry",
+        "explicit hold reason"
+      ],
+      "expected": "fixed clock does not trigger launch; readiness controls GO, ETA updates and reservation extension"
+    },
+    {
+      "id": "APP-WEB-DRIVE-TENANT",
+      "name": "Tenant-isolated Drive files.list read contract",
+      "kind": "tenant-drive-read-isolation",
+      "device": "fake-app-drive-world",
+      "implementation": [
+        "src/ux-sim/fake-app-drive-world.ts",
+        "src/nexus/apps/drive-contract.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-app-drive-world.test.ts"
+      ],
+      "trigger": "Create two verified issuer/subject accounts with same-name synthetic files; interleave listing, page-token reuse, expiry, refresh, logout, revoke and missing-scope requests.",
+      "observe": [
+        "each tenant receives only its own file IDs",
+        "continuation tokens cannot cross tenants",
+        "refresh and revocation affect only the selected tenant",
+        "Google API and credential persistence capabilities remain absent"
+      ],
+      "expected": "The read-only listFiles contract isolates both datasets and credentials by tenant, rejects cross-tenant context and page tokens, and performs no real Google call or credential persistence."
+    },
+    {
+      "id": "APP-SOURCE-SNAPSHOT",
+      "name": "App source snapshot restore integrity",
+      "kind": "source-snapshot-integrity",
+      "device": "fake-app-source-world",
+      "implementation": [
+        "src/ux-sim/fake-app-source-concurrent-writer.ts",
+        "src/ux-sim/fake-app-source-world.ts",
+        "src/nexus/apps/app-source-snapshot.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-app-source-world.test.ts"
+      ],
+      "trigger": "Snapshot a deployment source tree, restore a matching snapshot, then exercise mismatched, missing, corrupt and concurrent-writer cases.",
+      "observe": [
+        "restore matches the recorded source fingerprint",
+        "mismatch or corrupt state refuses before changing the target",
+        "concurrent writers retain isolated object keys and ledger results"
+      ],
+      "expected": "A deployment source can be restored only from the matching immutable snapshot; invalid or racing writes cannot silently replace another deployment revision."
+    },
+    {
+      "id": "GOOGLE-DRIVE-LIST-READONLY",
+      "name": "Google Drive files.list metadata-only scope and read-only boundary",
+      "kind": "oauth-readonly-simulation",
+      "device": "fake-google-drive-world",
+      "implementation": [
+        "src/ux-sim/fake-google-drive-world.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-google-drive-world.test.ts"
+      ],
+      "trigger": "Grant only the synthetic Drive metadata readonly scope, list three synthetic files in two pages, then attempt a write.",
+      "observe": [
+        "page token returns the remaining metadata",
+        "file content and unrequested fields are absent",
+        "write is rejected and world state remains unchanged",
+        "no external request or real credential is used"
+      ],
+      "expected": "Two pages expose only metadata under the readonly scope; write returns 403 with zero mutations."
+    },
+    {
+      "id": "GIT-PUSH-TIMEOUT-PARTIAL-OUTCOME-REMOTE-VERIFY",
+      "name": "Remote-applied push with client timeout",
+      "kind": "partial-outcome",
+      "device": "git-push-timeout-partial-outcome-remote-verify",
+      "implementation": [
+        "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+        "src/git-fs/git-cli.ts"
+      ],
+      "tests": [
+        "src/git-fs/git-cli.test.ts"
+      ],
+      "trigger": "The fake transport delegates push to a local bare remote, then exits with a timeout failure after the remote ref changed.",
+      "observe": [
+        "remote ref from ls-remote",
+        "production CLI return code and PARTIAL_OUTCOME status receipt"
+      ],
+      "expected": "When ls-remote on the single effective push URL matches the pre-push commit and the ordinary loose source ref identity, contents, and reflog remain unchanged, the CLI reports CONFIRMED_APPLIED with rc=0; source or symbolic movement, unmatched refs, and ambiguous shapes remain unconfirmed."
+    },
+    {
+      "id": "TASK-TEMP-CLEANUP",
+      "name": "Task-agent test temporary directory cleanup",
+      "kind": "suite-temp-root-cleanup",
+      "device": "fake-temp-cleanup",
+      "implementation": [
+        "src/ux-sim/fake-temp-cleanup.ts",
+        "src/test-utils/temp-dir-cleanup.ts"
+      ],
+      "tests": [
+        "src/ux-sim/fake-temp-cleanup.test.ts"
+      ],
+      "trigger": "Task-agent suites create their temporary roots, then complete normally or throw after writing nested artifacts.",
+      "observe": [
+        "all roots registered by the suite-scoped tracker are absent after cleanup",
+        "an unrelated temporary root remains present"
+      ],
+      "expected": "Suite teardown removes every directory it registered on both success and failure while preserving paths it did not create."
     }
   ],
   "sourceModules": [
+    {
+      "id": "MD-UX-SIM-APP-CONTRACT-SECRET-ENTROPY-TS",
+      "path": "src/ux-sim/app-contract-secret-entropy.ts",
+      "boundary": "Feeds synthetic credential candidates through the production app contract parser; records only case IDs and rates, never candidate values.",
+      "deviceIds": [
+        "app-contract-secret-entropy"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
     {
       "id": "MD-UX-SIM-ASIDE-FEEDBACK-LOOP-TS",
       "path": "src/ux-sim/aside-feedback-loop.ts",
@@ -3276,6 +3866,16 @@
       "integrityCertificatePath": null
     },
     {
+      "id": "MD-UX-SIM-FAKE-APP-DRIVE-WORLD-TS",
+      "path": "src/ux-sim/fake-app-drive-world.ts",
+      "boundary": "In-memory tenant-partitioned Google Drive files.list simulation; synthetic tokens, page-token binding, expiry and revocation are exercised without network or credential persistence.",
+      "deviceIds": [
+        "fake-app-drive-world"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
       "id": "MD-UX-SIM-FAKE-APP-HOST-TS",
       "path": "src/ux-sim/fake-app-host.ts",
       "boundary": "Serves declared in-memory app versions through the simulated app-host fetch boundary, including deploy, rollback, content type and content digest behavior.",
@@ -3292,6 +3892,26 @@
       "boundary": "App-slug-scoped row-change SSE contract matrix run on the real NexusEventBus reference port (createNexusEventBusAppRealtimePortFactory) and injected port factories (simulation boundary).",
       "deviceIds": [
         "fake-app-realtime"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-APP-SOURCE-CONCURRENT-WRITER-TS",
+      "path": "src/ux-sim/fake-app-source-concurrent-writer.ts",
+      "boundary": "APP-SOURCE-SNAPSHOT preexisting simulator module: fake-app-source-concurrent-writer.ts.",
+      "deviceIds": [
+        "fake-app-source-world"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-APP-SOURCE-WORLD-TS",
+      "path": "src/ux-sim/fake-app-source-world.ts",
+      "boundary": "APP-SOURCE-SNAPSHOT preexisting simulator module: fake-app-source-world.ts.",
+      "deviceIds": [
+        "fake-app-source-world"
       ],
       "integrityCertificatePresent": false,
       "integrityCertificatePath": null
@@ -3319,7 +3939,7 @@
     {
       "id": "MD-UX-SIM-FAKE-BIN-TS",
       "path": "src/ux-sim/fake-bin.ts",
-      "boundary": "Creates a temporary PATH shim for declared executables and records argv, output, exit status, signals and cleanup.",
+      "boundary": "Creates a temporary PATH shim for declared executables, selects scripted output and exit status by argv prefix, optionally records allowlisted environment values, and records calls, signals and cleanup.",
       "deviceIds": [
         "fake-executable"
       ],
@@ -3414,6 +4034,16 @@
       "boundary": "fake gh: GitHub data at the CLI boundary; sweep decisions remain in the production callers.",
       "deviceIds": [
         "fake-github"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-FAKE-GOOGLE-DRIVE-WORLD-TS",
+      "path": "src/ux-sim/fake-google-drive-world.ts",
+      "boundary": "Serves synthetic Drive files.list metadata only through an in-memory fake; enforces the metadata readonly scope and rejects writes without network or token persistence.",
+      "deviceIds": [
+        "fake-google-drive-world"
       ],
       "integrityCertificatePresent": false,
       "integrityCertificatePath": null
@@ -3964,11 +4594,62 @@
       "integrityCertificatePath": null
     },
     {
+      "id": "MD-UX-SIM-POD-REUSE-MATCH-BY-KIND-SIM-TS",
+      "path": "src/ux-sim/pod-reuse-match-by-kind-sim.ts",
+      "boundary": "Runs the production kind-aware Pod candidate scorer and runtime-contract predicate against deterministic fixtures without cluster or network access.",
+      "deviceIds": [
+        "pod-reuse-match-by-kind-sim"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-POD-REUSE-SHARED-FAKE-BOUNDARY-TS",
+      "path": "src/ux-sim/pod-reuse-shared-fake-boundary.ts",
+      "boundary": "Shares one isolated primary-control server and host-keyed fake Kubernetes stores across production SI warm leases; host-mirror adapter reads the production Job manifest readOnly flag, counts simulated mount reads, and rejects writes.",
+      "deviceIds": [
+        "warm-si-reuse-sim"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-POD-REUSE-WORLD-TS",
+      "path": "src/ux-sim/pod-reuse-world.ts",
+      "boundary": "Runs the integrated production Pod reuse scenario with real Job manifest and lease logic, isolated fake Kubernetes boundaries, production read-only hostPath checks, and source mount byte measurements compared with a non-hardlinked clone.",
+      "deviceIds": [
+        "warm-si-reuse-sim",
+        "pod-reuse-residue-fault"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-PR-LAND-DRIFT-GATE-DEVICE-TS",
+      "path": "src/ux-sim/pr-land-drift-gate-device.ts",
+      "boundary": "Calls the production pinned-main delta assessment and refusal classifier with synthetic remote output; no SSH is opened.",
+      "deviceIds": [
+        "pr-land-drift-gate"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
       "id": "MD-UX-SIM-PTY-KEY-MODIFIERS-DEVICE-TS",
       "path": "src/ux-sim/pty-key-modifiers-device.ts",
       "boundary": "Sends modifier-key sequences through a real PTY to the production TUI parser and records parsed key events and rendered output.",
       "deviceIds": [
         "tui-interaction"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-READINESS-COUNTDOWN-TS",
+      "path": "src/ux-sim/readiness-countdown.ts",
+      "boundary": "Replays readiness events, holds, ETA changes and T-minus host reservation from injected inputs without wall time or external I/O.",
+      "deviceIds": [
+        "readiness-countdown"
       ],
       "integrityCertificatePresent": false,
       "integrityCertificatePath": null
@@ -4352,42 +5033,51 @@
       "integrityCertificatePath": null
     },
     {
-      "id": "MD-UX-SIM-POD-REUSE-SHARED-FAKE-BOUNDARY-TS",
-      "path": "src/ux-sim/pod-reuse-shared-fake-boundary.ts",
-      "boundary": "Shares one isolated primary-control server and host-keyed fake Kubernetes stores across production SI warm leases; host-mirror adapter reads the production Job manifest readOnly flag, counts simulated mount reads, and rejects writes.",
+      "id": "MD-UX-SIM-GIT-PUSH-TIMEOUT-PARTIAL-OUTCOME-REMOTE-VERIFY-TS",
+      "path": "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+      "boundary": "Wraps the real git executable so push updates an isolated local remote, then returns a simulated transport timeout; source-ref move, move-away-and-back, and symbolic-transition injections verify conservative refusal. Confirmation requires an unchanged loose ref file identity/content and reflog plus a URL stable under rewriting.",
       "deviceIds": [
-        "warm-si-reuse-sim"
+        "git-push-timeout-partial-outcome-remote-verify"
       ],
       "integrityCertificatePresent": false,
       "integrityCertificatePath": null
     },
     {
-      "id": "MD-UX-SIM-POD-REUSE-WORLD-TS",
-      "path": "src/ux-sim/pod-reuse-world.ts",
-      "boundary": "Runs the integrated production Pod reuse scenario with real Job manifest and lease logic, isolated fake Kubernetes boundaries, production read-only hostPath checks, and source mount byte measurements compared with a non-hardlinked clone.",
+      "id": "MD-UX-SIM-FAKE-TEMP-CLEANUP-TS",
+      "path": "src/ux-sim/fake-temp-cleanup.ts",
+      "boundary": "Creates isolated task-agent temporary roots through the shared suite tracker, simulates successful or exceptional suite teardown, and verifies unrelated host paths remain untouched.",
       "deviceIds": [
-        "warm-si-reuse-sim",
-        "pod-reuse-residue-fault"
+        "fake-temp-cleanup"
       ],
       "integrityCertificatePresent": false,
       "integrityCertificatePath": null
     },
     {
-      "id": "MD-UX-SIM-PR-LAND-DRIFT-GATE-DEVICE-TS",
-      "path": "src/ux-sim/pr-land-drift-gate-device.ts",
-      "boundary": "Calls the production pinned-main delta assessment and refusal classifier with synthetic remote output; no SSH is opened.",
+      "id": "MD-UX-SIM-APP-KILL-SWITCH-WORLD-TS",
+      "path": "src/ux-sim/app-kill-switch-world.ts",
+      "boundary": "Exercises the production app kill-switch with local incident events and no live relay.",
       "deviceIds": [
-        "pr-land-drift-gate"
+        "fake-app-traffic"
       ],
       "integrityCertificatePresent": false,
       "integrityCertificatePath": null
     },
     {
-      "id": "MD-UX-SIM-APP-CONTRACT-SECRET-ENTROPY-TS",
-      "path": "src/ux-sim/app-contract-secret-entropy.ts",
-      "boundary": "Feeds synthetic credential candidates through the production app contract parser; records only case IDs and rates, never candidate values.",
+      "id": "MD-UX-SIM-FAKE-RELAY-WORLD-TS",
+      "path": "src/ux-sim/fake-relay-world.ts",
+      "boundary": "Provides deterministic fake relay hosts, OAuth state, and encrypted sessions for relay-boundary simulations; no public relay or provider is contacted.",
       "deviceIds": [
-        "app-contract-secret-entropy"
+        "support-fakes"
+      ],
+      "integrityCertificatePresent": false,
+      "integrityCertificatePath": null
+    },
+    {
+      "id": "MD-UX-SIM-MULTI-TENANT-RELAY-WORLD-TS",
+      "path": "src/ux-sim/multi-tenant-relay-world.ts",
+      "boundary": "Creates isolated fake OAuth users, Nexus relays, app data, storage, and injected incidents without any live Google calls.",
+      "deviceIds": [
+        "world-runtime"
       ],
       "integrityCertificatePresent": false,
       "integrityCertificatePath": null

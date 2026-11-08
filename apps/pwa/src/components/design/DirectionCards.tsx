@@ -124,7 +124,8 @@ function DirectionCard({
     <li
       data-direction={d.id}
       data-direction-id={d.id}
-      className={`flex flex-col gap-2 rounded-md border p-3 text-sm ${chosen ? 'border-primary ring-1 ring-primary' : ''}`}
+      data-state={chosen ? 'selected' : 'available'}
+      className={`flex flex-col gap-3 rounded-lg border bg-card p-4 text-sm transition-colors ${chosen ? 'border-primary bg-primary/5 ring-1 ring-primary' : 'hover:border-primary/50'}`}
     >
       <div className="flex items-center gap-1.5" aria-hidden>
         {[bg, fg, d.swatch.accent].map((colour, i) => (
@@ -155,7 +156,7 @@ function DirectionCard({
           </button>
         )}
         {chosen ? (
-          <span className="inline-flex items-center gap-1 text-xs text-primary">
+          <span role="status" className="inline-flex items-center gap-1 text-xs font-medium text-primary">
             <CheckCircle2 className="h-3.5 w-3.5" aria-hidden />
             Selected
           </span>
@@ -163,6 +164,7 @@ function DirectionCard({
           <button
             type="button"
             disabled={busy}
+            aria-pressed={false}
             onClick={() => onPick(d.id)}
             className="self-start rounded-md border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-50"
             aria-label={`Select ${d.label ?? d.id}`}

@@ -3,8 +3,9 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { inspectReleaseGateHost, readGateHostResourcesForHost, reserveReleaseGateHosts } from './gate-host-reservation.js';
+import { inspectReleaseGateHost, readGateHostResourcesForHost, reserveReleaseGateHosts, startGuardianHostLeaseHeartbeat } from './gate-host-reservation.js';
 import { podPoolHostLease, type PodPoolMember } from '../task-orchestrator/surfaces/pod-pool.js';
+import { admitGuardianHostLease, guardianHostLeaseRecords, readResourceLedger, requestGuardianHostLease, resourceLedgerPath } from '../resource-ledger/resource-ledger.js';
 
 const roots: string[] = [];
 const root = () => { const path = mkdtempSync(join(tmpdir(), 'gate-host-reserve-')); roots.push(path); return path; };
@@ -17,6 +18,73 @@ test('release gate publishes run and host, then releases exactly its own claim',
   expect(inspectReleaseGateHost(state, 'node-c')).toEqual({ status: 'free' });
   release();
   expect(inspectReleaseGateHost(state, 'node-b')).toEqual({ status: 'free' });
+});
+
+test('release gate admission uses the Nexus Guardian lease and records completion', () => {
+  const state = root();
+  const release = reserveReleaseGateHosts(state, 'guardian-cut-run', ['node-b'], { releaseVersion: '0.3.7' });
+  const ledgerPath = resourceLedgerPath(state);
+  expect(guardianHostLeaseRecords(readResourceLedger(ledgerPath))).toMatchObject([
+    { state: 'active', request: { host: 'node-b', runId: 'guardian-cut-run', purpose: 'release-cut-gate' } },
+  ]);
+  release();
+  expect(guardianHostLeaseRecords(readResourceLedger(ledgerPath))).toMatchObject([
+    { state: 'released', reason: 'release-gate-finished', request: { host: 'node-b' } },
+  ]);
+});
+
+test('release gate fails closed for dedicated non-gate hosts and non-cut work on node-b', () => {
+  const state = root();
+  expect(() => reserveReleaseGateHosts(state, 'wrong-purpose', ['node-b'], { purpose: 'rolling-main-gate' }))
+    .toThrow('Guardian denied release gate host node-b: host-purpose-restricted');
+  expect(() => reserveReleaseGateHosts(state, 'restricted-host', ['gcp1']))
+    .toThrow('Guardian denied release gate host gcp1: exclusive-lease-conflict');
+  expect(inspectReleaseGateHost(state, 'node-b')).toEqual({ status: 'free' });
+  expect(guardianHostLeaseRecords(readResourceLedger(resourceLedgerPath(state))))
+    .toMatchObject([{ state: 'denied', reason: 'host-purpose-restricted' }, { state: 'denied', reason: 'exclusive-lease-conflict' }]);
+});
+
+test('a long-running release gate renews its durable Guardian lease until release', () => {
+  const state = root();
+  const ledgerPath = resourceLedgerPath(state);
+  let now = new Date('2026-11-08T00:00:00.000Z');
+  const initialExpiry = new Date(now.getTime() + 2 * 60 * 60 * 1000).toISOString();
+  const lease = requestGuardianHostLease({ requestId: 'long-cut-gate', runId: 'long-run', requestedBy: 'release-loop.gate',
+    consumer: 'release-gate', purpose: 'release-cut-gate', host: 'node-b', priority: 'P0', expiresAt: initialExpiry }, now, ledgerPath);
+  expect(lease.state).toBe('active');
+  let tick: (() => void) | undefined;
+  let cancelled = false;
+  const stop = startGuardianHostLeaseHeartbeat([lease.leaseId], state, { intervalMs: 60 * 60 * 1000, ttlMs: 2 * 60 * 60 * 1000,
+    now: () => now, schedule: (callback) => { tick = callback; return () => { cancelled = true; }; } });
+
+  now = new Date(now.getTime() + 60 * 60 * 1000);
+  tick!();
+  now = new Date(now.getTime() + 60 * 60 * 1000);
+  tick!();
+  now = new Date(now.getTime() + 60 * 60 * 1000);
+  expect(admitGuardianHostLease({ leaseId: lease.leaseId, host: 'node-b', runId: 'long-run', consumer: 'release-gate' }, now, ledgerPath)).toBe(true);
+  expect(guardianHostLeaseRecords(readResourceLedger(ledgerPath)).find(row => row.leaseId === lease.leaseId)?.request.expiresAt)
+    .toBe(new Date(now.getTime() + 60 * 60 * 1000).toISOString());
+  stop();
+  expect(cancelled).toBe(true);
+});
+
+test('Guardian lease heartbeat continues while a synchronous gate blocks the main event loop', async () => {
+  const state = root();
+  const ledgerPath = resourceLedgerPath(state);
+  const startedAt = new Date();
+  const lease = requestGuardianHostLease({ requestId: 'sync-cut-gate', runId: 'sync-run', requestedBy: 'release-loop.gate',
+    consumer: 'release-gate', purpose: 'release-cut-gate', host: 'node-b', priority: 'P0',
+    expiresAt: new Date(startedAt.getTime() + 1_500).toISOString() }, startedAt, ledgerPath);
+  const stop = startGuardianHostLeaseHeartbeat([lease.leaseId], state, { intervalMs: 100, ttlMs: 1_500 });
+  try {
+    await new Promise(resolve => setTimeout(resolve, 250));
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2_200);
+    expect(Date.now() - startedAt.getTime()).toBeGreaterThan(1_500);
+    expect(admitGuardianHostLease({ leaseId: lease.leaseId, host: 'node-b', runId: 'sync-run', consumer: 'release-gate' }, new Date(), ledgerPath)).toBe(true);
+  } finally {
+    stop();
+  }
 });
 
 test('a dead owner is automatically released; corrupt evidence fails closed', () => {

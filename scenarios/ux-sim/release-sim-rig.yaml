@@ -88,8 +88,8 @@ cases:
       evidence: { publicArtifactLeak: true, classification: release-blocking }
     expect:
       status: failed
-      mustVisit: [export-check, traffic-failed-restore, failed]
-      mustNotVisit: [gate, publish]
+      mustVisit: [gate, export-check, traffic-failed-restore, failed]
+      mustNotVisit: [publish]
   - id: cut-tip-moved-after-resume
     mode: cut-tip-moved-after-resume
     expect:
@@ -132,18 +132,26 @@ cases:
       pwa: { outcome: ok, delayMs: 40 }
     expect:
       status: done
-      mustVisit: [mac-smoke, pwa, pre-prepare-join, prepare, publish, done]
+      mustVisit: [mac-smoke, pwa, pre-gate-join, prepare, publish, done]
       mustNotVisit: [failed]
       overlap: [mac-smoke, pwa]
-  - id: publish-command-fails
+  - id: publish-command-failure-pauses-for-approval
     fault:
       node: publish
       outcome: fail
       evidence: { published: false, restoreTraffic: true }
     expect:
-      status: failed
-      mustVisit: [publish, traffic-failed-restore, failed]
+      status: awaiting-approval
+      mustVisit: [publish, approve-continue]
       mustNotVisit: [npm-publish, docs-land]
+  - id: publish-status-unknown-pauses-for-approval
+    mode: baseline
+    nodeOutcomes:
+      publish: { outcome: unknown }
+    expect:
+      status: awaiting-approval
+      mustVisit: [publish, approve-continue]
+      mustNotVisit: [npm-publish, done]
   - id: pwa-node-times-out
     fault:
       node: pwa
@@ -151,7 +159,7 @@ cases:
       evidence: { timeoutSeconds: 900, restoreTraffic: true }
     expect:
       status: failed
-      mustVisit: [mac-smoke, pwa, pre-prepare-join, traffic-failed-restore, failed]
+      mustVisit: [mac-smoke, pwa, pre-gate-join, traffic-failed-restore, failed]
       mustNotVisit: [prepare, publish]
   - id: pwa-failure-preserves-mac-smoke-result
     mode: baseline
@@ -160,7 +168,7 @@ cases:
       pwa: { outcome: fail, delayMs: 40 }
     expect:
       status: failed
-      mustVisit: [mac-smoke, pwa, pre-prepare-join, traffic-failed-restore, failed]
+      mustVisit: [mac-smoke, pwa, pre-gate-join, traffic-failed-restore, failed]
       mustNotVisit: [prepare, publish]
       overlap: [mac-smoke, pwa]
       events:

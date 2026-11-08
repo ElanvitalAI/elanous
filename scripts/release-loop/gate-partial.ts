@@ -208,6 +208,69 @@ const INERT_MD = /\.md$/;
 const TEST_INPUT = /(?:^|\/)(?:test|tests|fixtures|__fixtures__|__snapshots__|__mocks__)\//;
 const isInert = (file: string) => INERT_MD.test(file) && !TEST_INPUT.test(file);
 
+export const DEFAULT_GATE_APPEND_PROMOTE_TO_FULL = [
+  'dep-layer', 'verdict-files', 'opaque-closure', 'cost-crossover',
+] as const;
+export type GateAppendPromotionCondition = typeof DEFAULT_GATE_APPEND_PROMOTE_TO_FULL[number];
+export type GateAppendReceiptCosts = { partialMs: number; fullMs: number; source: 'same-ledger-receipts' };
+
+const DEPENDENCY_LAYER_FILE = /(?:^|\/)(?:bun\.lock(?:b)?|package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|tsconfig(?:\.[^/]+)?\.json|Dockerfile)$/i;
+const VERDICT_AFFECTING_FILE = /^(?:scripts\/release-loop\/(?:gate-[^/]+\.ts|resume-release\.ts|node-verdict\.ts)|src\/release-loop\/gate-[^/]+\.ts|graphs\/release\/(?:recipes|release-policies)\.yaml)$/;
+
+export function selectGateAppendRecheckEdge(input: {
+  changedFiles: readonly string[];
+  radiusFiles: readonly string[];
+  closureOpaque?: boolean;
+  receiptCosts?: GateAppendReceiptCosts;
+  promoteToFull?: readonly string[];
+}): { edge: 'append-recheck' | 'full-recheck'; promoted: GateAppendPromotionCondition[]; reason: string } {
+  const allowed = new Set<string>(DEFAULT_GATE_APPEND_PROMOTE_TO_FULL);
+  const policy = input.promoteToFull ?? DEFAULT_GATE_APPEND_PROMOTE_TO_FULL;
+  if (!Array.isArray(policy) || new Set(policy).size !== policy.length || policy.some((item) => !allowed.has(item)))
+    return { edge: 'full-recheck', promoted: [], reason: 'invalid gate.plan.promoteToFull policy' };
+  const promoted = new Set<GateAppendPromotionCondition>();
+  if (policy.includes('dep-layer') && input.changedFiles.some((file) => DEPENDENCY_LAYER_FILE.test(file))) promoted.add('dep-layer');
+  if (policy.includes('verdict-files') && input.changedFiles.some((file) => VERDICT_AFFECTING_FILE.test(file))) promoted.add('verdict-files');
+  const docsOnly = input.changedFiles.length > 0 && input.changedFiles.every(isInert);
+  if (policy.includes('opaque-closure') && (input.closureOpaque || (!input.radiusFiles.length && !docsOnly))) promoted.add('opaque-closure');
+  if (input.receiptCosts) {
+    const { partialMs, fullMs, source } = input.receiptCosts;
+    if (source !== 'same-ledger-receipts' || !Number.isFinite(partialMs) || !Number.isFinite(fullMs) || partialMs < 0 || fullMs < 0)
+      return { edge: 'full-recheck', promoted: [], reason: 'append receipt costs require non-negative same-ledger measurements' };
+    if (policy.includes('cost-crossover') && input.radiusFiles.length > 0 && partialMs >= fullMs) promoted.add('cost-crossover');
+  }
+  const reasons = [...promoted];
+  return reasons.length
+    ? { edge: 'full-recheck', promoted: reasons, reason: 'structural promotion: ' + reasons.join(', ') }
+    : { edge: 'append-recheck', promoted: [], reason: 'radius is eligible for append recheck' };
+}
+
+/** Read actual full and partial shard durations from one release ledger and one measured commit. */
+export function gateAppendReceiptCostsFromLedger(root: string, version: string, commit: string): GateAppendReceiptCosts | undefined {
+  if (!RELEASE_VERSION.test(version) || !FULL_SHA.test(commit)) return undefined;
+  const measured = (phase: 'cut' | 'cut-partial'): number | undefined => {
+    const dir = join(root, 'release', version, 'gate-logs', phase);
+    if (!existsSync(dir)) return undefined;
+    let names: string[];
+    try { names = readdirSync(dir).filter((name) => /^pod-.+\.json$/.test(name)); }
+    catch { return undefined; }
+    if (!names.length) return undefined;
+    let total = 0;
+    for (const name of names) {
+      try {
+        const row = JSON.parse(readFileSync(join(dir, name), 'utf8')) as { commit?: unknown; durationMs?: unknown };
+        if (row.commit !== commit || typeof row.durationMs !== 'number' || !Number.isFinite(row.durationMs) || row.durationMs < 0)
+          return undefined;
+        total += row.durationMs;
+      } catch { return undefined; }
+    }
+    return Number.isFinite(total) ? total : undefined;
+  };
+  const fullMs = measured('cut');
+  const partialMs = measured('cut-partial');
+  return fullMs === undefined || partialMs === undefined ? undefined : { fullMs, partialMs, source: 'same-ledger-receipts' };
+}
+
 /** Recheck the immutable Git diff at the consumer; a mutable plan file alone cannot authorize a zero-file gate. */
 export function verifyDocsOnlyCarry(repo: string, priorCommit: string, forCommit: string): boolean {
   const files = changedFilesBetween(repo, priorCommit, forCommit);
@@ -238,7 +301,11 @@ export function planPartialRegate(input: { version: string; priorCommit: string;
   /** Directory of prior full-gate `pod-N.json` rows; collected when `priorShards` is omitted. */
   priorCutLogs?: string;
   /** Directory of current-sweep `pod-N.json` rows; collected when `currentShards` is omitted. */
-  currentCutLogs?: string }):
+  currentCutLogs?: string;
+  /** Graph policy contract: structural reasons that promote an append recheck to a full gate. */
+  promoteToFull?: readonly string[];
+  /** Measured partial/full receipt costs from the same ledger; no fixed threshold is used. */
+  receiptCosts?: GateAppendReceiptCosts }):
   { ok: true; plan: PartialPlan; closure?: { reached: number; opaque: number } } | { ok: false; reason: string } {
   if (!/^[0-9a-f]{40}$/i.test(input.priorCommit) || !/^[0-9a-f]{40}$/i.test(input.forCommit)) return { ok: false, reason: 'commit is not a full sha' };
   if (input.priorCommit === input.forCommit) return { ok: false, reason: 'no new commit since the prior gate' };
@@ -270,6 +337,10 @@ export function planPartialRegate(input: { version: string; priorCommit: string;
   const gone = failureFiles.filter((file) => !exists(file));
   if (gone.length) return { ok: false, reason: `prior failure file deleted at the tip → full gate: ${list(gone)}` };
   const files = [...new Set([...input.changedFiles.filter((file) => TEST_FILE.test(file) && exists(file)), ...failureFiles, ...reaching])].sort();
+  const appendEdge = selectGateAppendRecheckEdge({ changedFiles: input.changedFiles, radiusFiles: files,
+    closureOpaque: (closure?.opaque ?? 0) > 0, ...(input.receiptCosts ? { receiptCosts: input.receiptCosts } : {}),
+    ...(input.promoteToFull ? { promoteToFull: input.promoteToFull } : {}) });
+  if (appendEdge.edge === 'full-recheck') return { ok: false, reason: appendEdge.reason };
   // An empty selection is safe only for a genuinely docs-only diff. A deleted test also selects zero files,
   // but it changes the measured suite and must not masquerade as a carry.
   if (!files.length && (!input.changedFiles.length || input.changedFiles.some((file) => !isInert(file))))

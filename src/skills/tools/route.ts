@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // H6 P3 Bundle 1 · LLM tools: PolicyDecide · PolicyExplain.
 //
 // Both tools are pure reads (no side effects on the UsageStore /
@@ -20,7 +21,7 @@
 //   input  = { task? }           // omit = explain lastDecision
 //   output = { trace, narrative } // step-by-step reason chain
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import type {
   RouteCandidate,
   RouteDecision,

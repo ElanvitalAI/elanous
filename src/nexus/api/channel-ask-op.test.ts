@@ -1,5 +1,11 @@
 import { expect, test } from 'bun:test';
+import { Command } from 'commander';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { MsgStore } from '../../msg/msg-store.js';
+import { startMsgSseServer } from '../../msg/msg-sse-server.js';
+import { registerMsgCommands } from '../../cli/msg-cli.js';
 import type { TgIncoming } from '../../telegram.js';
 import { createAskOpDiscordIngress, createAskOpTelegramSlashCommand } from './channel-ask-op.js';
 import { createTelegramChannelOpReplyTransport, deliverChannelOpReply } from '../../session/channel-op-reply-route.js';
@@ -64,8 +70,20 @@ test('the same Telegram update is idempotent and preserves its first question', 
 });
 
 test('ten simulated Telegram questions complete received → forwarded → OP answer → Telegram send', async () => {
-  const store = new MsgStore(':memory:');
+  const dir = mkdtempSync(join(tmpdir(), 'telegram-ask-op-sim-'));
+  const ledgerPath = join(dir, 'messages.db');
+  const store = new MsgStore(ledgerPath);
   const sent: Array<{ chatId: number; body: string; options?: unknown }> = [];
+  const coordinatorReadStore = new MsgStore(ledgerPath, { readOnly: true });
+  const messageServer = startMsgSseServer({ store: coordinatorReadStore, token: 'fake-op-mailbox-token', port: 0, pollMs: 5 });
+  const opCli = new Command();
+  const opCliOut: string[] = [];
+  registerMsgCommands(opCli, {
+    openStore: () => new MsgStore(join(dir, 'messages.db')),
+    out: { log: (line) => opCliOut.push(line), error: (line) => { throw new Error(line); } },
+    registerLogSink: async () => undefined,
+    wake: async (address, msgId) => ({ wake: 'cron', source: 'loop-table', address, msgId, result: 'wake-deferred' }),
+  });
   try {
     const command = createAskOpTelegramSlashCommand({
       allowedUserIds: [42],
@@ -79,23 +97,98 @@ test('ten simulated Telegram questions complete received → forwarded → OP an
       } } as never,
     });
 
-    for (let index = 0; index < 10; index++) {
+    const scenarios = Array.from({ length: 10 }, (_, index) => ({
+      index,
+      chatId: -100123 - index,
+      threadId: 8 + index,
+      question: index === 1 || index === 7
+        ? `long fake question ${index}: ${'release readiness detail '.repeat(120).trimEnd()}`
+        : `short fake question ${index}?`,
+    }));
+    let opBusy = true;
+    expect(scenarios[1]!.question.length).toBeGreaterThan(2_000);
+    expect(scenarios[0]!.question.length).toBeLessThan(80);
+
+    // All ten Telegram updates arrive while the simulated OP worker is busy.
+    // Short and long questions queue while the OP worker is simulated as busy.
+    for (const scenario of scenarios) {
+      const { index, chatId, threadId, question: body } = scenario;
       const updateId = 700 + index;
-      const ctx = incoming({ updateId, text: `/askop fake question ${index}`, messageId: 80 + index });
+      const ctx = incoming({ updateId, chatId, threadId, text: `/askop ${body}`, messageId: 80 + index });
       const received = await command.handler([], ctx, { userConfig: {} as never, allCommands: [command] });
       expect(received).toContain('전달했습니다');
-      const question = store.listByRecipient('COORDINATOR').find((message) => message.body.includes(`updateId=${updateId}`));
-      expect(question).toBeDefined();
-      const answer = store.append({ from: 'OP', to: 'TELEGRAM', body: `fake answer ${index}`, replyTo: question!.id });
+      expect(opBusy).toBe(true);
+      // No answer can leave Telegram while the simulated OP is busy.
+      expect(opBusy).toBe(true);
+      expect(sent).toHaveLength(0);
+    }
+
+    // Read the actual coordinator mailbox SSE endpoint after the backlog forms;
+    // its replay output is the evidence that each question reached the recipient.
+    const response = await fetch(`http://127.0.0.1:${messageServer.port}/stream?to=COORDINATOR&since=0`, {
+      headers: { authorization: 'Bearer fake-op-mailbox-token' },
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let pending = '';
+    const opInbox: Array<{ id: number; body: string }> = [];
+    const deadline = Date.now() + 5_000;
+    try {
+      while (opInbox.length < 10 && Date.now() < deadline) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('coordinator SSE replay timed out before ten questions arrived')),
+            Math.max(1, deadline - Date.now()));
+        });
+        const { value, done } = await Promise.race([reader.read(), timeout]).finally(() => clearTimeout(timer));
+        if (done) break;
+        pending += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+        let boundary: number;
+        while ((boundary = pending.indexOf('\n\n')) >= 0) {
+          const event = pending.slice(0, boundary);
+          pending = pending.slice(boundary + 2);
+          const data = event.split('\n').find((line) => line.startsWith('data: '))?.slice(6);
+          if (data) opInbox.push(JSON.parse(data) as { id: number; body: string });
+        }
+      }
+    } finally { await reader.cancel().catch(() => undefined); }
+    expect(opInbox).toHaveLength(10);
+    const queued = scenarios.map(({ index, chatId, question }) => {
+      const envelope = opInbox.find((message) => message.body.includes(`updateId=${700 + index}`));
+      expect(envelope).toBeDefined();
+      expect(envelope!.body).toContain(question);
+      return { questionId: envelope!.id, index, chatId };
+    });
+
+    opBusy = false;
+    expect(opBusy).toBe(false);
+    // OP works through the backlog out of order; two replies are delayed to
+    // model long handling. Each answer must still route to its own question.
+    for (const { questionId, index, chatId } of [...queued].reverse()) {
+      if (index === 2 || index === 6) await new Promise((resolve) => setTimeout(resolve, 10));
+      // Simulate OP answering through the actual message CLI posting path.
+      await opCli.parseAsync(['msg', 'post', `fake answer ${index}`, '--from', 'OP', '--to', 'TELEGRAM', '--reply-to', String(questionId), '--json'], { from: 'user' });
+      const answer = JSON.parse(opCliOut.pop()!) as { id: number };
       expect(await deliverChannelOpReply(store, answer.id, transport, { instance: 'test-instance' }))
         .toMatchObject({ status: 'delivered' });
+      expect(store.getMessage(answer.id)).toMatchObject({ from: 'OP', to: 'TELEGRAM', replyTo: questionId });
+      expect(store.db.query('SELECT status FROM channel_op_reply_receipts WHERE question_id = ?').get(questionId))
+        .toEqual({ status: 'delivered' });
+      expect(chatId).toBe(-100123 - index);
     }
 
     expect(store.listByRecipient('COORDINATOR')).toHaveLength(10);
     expect(sent).toHaveLength(10);
-    expect(sent.map((entry) => entry.chatId)).toEqual(Array(10).fill(-100123));
-    expect(sent.map((entry) => entry.body)).toEqual(Array.from({ length: 10 }, (_, index) => `fake answer ${index}`));
-  } finally { store.close(); }
+    expect(sent.map(({ body, chatId }) => [body, chatId]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))))
+      .toEqual(scenarios.map(({ index, chatId }) => [`fake answer ${index}`, chatId])
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+  } finally {
+    messageServer.stop();
+    coordinatorReadStore.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a forwarding failure tells the Telegram user which stage failed', async () => {

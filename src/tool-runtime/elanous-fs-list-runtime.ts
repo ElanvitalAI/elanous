@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // PLAN-codex-app-server-hermes-parity §5 Phase H1·5d (2026-05-16) —
 // `elanous_fs_list` MCP tool. Mirrors the daemon-side ACP method
 // `elanous/fs/list` (src/acp/server.ts:1960). Session-agnostic so the
@@ -17,7 +18,7 @@ import {
   isHiddenForBrowser,
   type FsRootKind,
 } from '../acp/fs-roots.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime } from './types.js';
 
 export interface ElanousFsListArgs {

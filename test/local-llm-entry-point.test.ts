@@ -24,18 +24,30 @@ import { createSession, loadSession } from '../src/session/index.js';
 import { runTurn } from '../src/session/chat.js';
 import { getProviderForConfig, LocalProvider } from '../src/llm.js';
 import type { UserConfig } from '../src/user-config.js';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 // ── Fixtures ─────────────────────────────────────────────────
 
-const realFetch = globalThis.fetch;
 const savedEnv: Record<string, string | undefined> = {};
 let tmpRoot: string;
+let fakeFetch: FakeFetchDevice | undefined;
+let expectedFetchCalls: string[] | undefined;
 
-function installFetch(handler: (url: string, init?: RequestInit) => Response | Promise<Response>): void {
-  globalThis.fetch = (async (input: any, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.url;
-    return handler(url, init);
-  }) as typeof fetch;
+function installFetch(handler: (url: string, init?: RequestInit) => Response | Promise<Response>, callCount = 1): void {
+  fakeFetch?.restore();
+  const baseUrl = (process.env.LOCAL_LLM_URL ?? 'http://192.168.0.50:1234').replace(/\/+$/, '');
+  const url = `${baseUrl}/chat/completions`;
+  expectedFetchCalls = Array.from({ length: callCount }, () => `POST ${url}`);
+  fakeFetch = createFakeFetchDevice([{
+    url,
+    method: 'POST',
+    response: (request) => handler(request.url, {
+      method: request.method,
+      headers: { ...request.headers },
+      ...(request.body !== null ? { body: request.body } : {}),
+      signal: request.signal,
+    }),
+  }]);
 }
 
 function sseRes(events: unknown[]): Response {
@@ -102,11 +114,19 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  globalThis.fetch = realFetch;
-  rmSync(tmpRoot, { recursive: true, force: true });
-  for (const [k, v] of Object.entries(savedEnv)) {
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
+  try {
+    if (fakeFetch && expectedFetchCalls) {
+      expect(fakeFetch.calls().map(({ method, url }) => `${method} ${url}`).sort()).toEqual([...expectedFetchCalls].sort());
+    }
+  } finally {
+    fakeFetch?.restore();
+    fakeFetch = undefined;
+    expectedFetchCalls = undefined;
+    rmSync(tmpRoot, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
   }
 });
 
@@ -257,7 +277,7 @@ describe('runTurn — local provider end-to-end', () => {
   });
 
   it('a non-2xx response surfaces as an error through runTurn', async () => {
-    installFetch(() => jsonRes({ error: 'model not loaded' }, 503));
+    installFetch(() => jsonRes({ error: 'model not loaded' }, 503), 3);
     const cfg = baseConfig();
     const meta = createSession({
       source: 'cli', provider: 'local', model: cfg.llm.model!, title: 'err-test',

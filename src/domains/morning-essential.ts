@@ -1,3 +1,4 @@
+import { textOnly } from '../llm/stream-text.js';
 // ── 종합 아침 브리핑 · 에센셜(텔레그램) 조립 (2026-07-10) ─────────────────────
 //
 // 대표 지시: 텔레그램엔 "섹터별 간략 에센셜 + 커뮤니티 버즈 정리 + 반도체 밸류체인/미국장
@@ -6,7 +7,7 @@
 // LLM 실패 시 서사만 빠지고 결정론 섹션은 그대로(fail-soft).
 
 import { getUserConfig } from '../user-config.js';
-import { getProviderForConfig, anyProviderAvailable, textOnly, type LLMMessage } from '../llm.js';
+import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { marketClock } from './finance.js';
 import { renderSemisEssential } from './kg-semis.js';

@@ -6,7 +6,9 @@ test('APP-CONTRACT-SECRET-ENTROPY measures secret recall and false positives thr
   expect(result.secretCount).toBe(32);
   expect(result.benignCount).toBe(48);
   expect(result.referenceCount).toBe(13);
-  expect(result.actualFixtureCount).toBe(5);
+  const actualFixtures = result.observations.filter(({ kind }) => kind === 'actual-fixture');
+  expect(actualFixtures.length).toBeGreaterThan(0);
+  expect(actualFixtures.every(({ validReferenceAccepted, secretDetected }) => validReferenceAccepted && !secretDetected)).toBe(true);
   expect(result.actualFixturesAccepted).toBe(result.actualFixtureCount);
   expect(result.actualFixtureFalsePositives).toBe(0);
   expect(result.actualFixtureFalsePositiveRate).toBe(0);

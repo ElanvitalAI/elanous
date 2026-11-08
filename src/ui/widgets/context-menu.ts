@@ -15,7 +15,7 @@ import {
   type ThemeTokens,
 } from '../../theme/tokens.js';
 import type { WidgetChromeSpec } from '../declarative/spec.js';
-import { resolveWidgetChromeBoxViewOptions } from '../declarative/index.js';
+import { resolveWidgetChromeBoxViewOptions } from '../declarative/presentation.js';
 import { resolvePickerChromePresentation } from '../chrome/picker-chrome.js';
 import type { Printer } from '../printer.js';
 import { BoxView, type View, type EventResult, type FocusSource, type Size } from '../view.js';

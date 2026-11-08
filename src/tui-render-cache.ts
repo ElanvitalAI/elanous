@@ -1,4 +1,4 @@
-import { ansi, termSize } from './tui.js';
+import { ansi, termSize } from './tui-terminal-contract.js';
 import { perf } from './perf-counters.js';
 import { noteInputLagPaint } from './tui/input-lag-probe.js';
 import { sliceAnsiByColumns, visibleWidth } from './tui-string-width.js';

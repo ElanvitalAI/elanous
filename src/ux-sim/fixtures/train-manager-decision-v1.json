@@ -1,0 +1,38 @@
+{
+  "schema": "train-manager-decision-sim/v1",
+  "provenance": {
+    "source": "seat-state/OP/tools/train-manager.py",
+    "sha256": "1dee50e507466c53f2f00cdeda376d7a526e22346b386ba24f48057def5b9187",
+    "method": "One tick with fixed queue, slots, active PRs, gate outcomes, and refusal events; filesystem and park-command boundaries redirected to a temporary directory."
+  },
+  "input": {
+    "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "queue": [
+      { "pr": "10001", "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "state": "open", "gate": "passed", "expressRank": 0 },
+      { "pr": "10002", "head": "cccccccccccccccccccccccccccccccccccccccc", "state": "open", "gate": "passed" },
+      { "pr": "10003", "head": "dddddddddddddddddddddddddddddddddddddddd", "state": "open", "gate": "unmeasured" },
+      { "pr": "10004", "head": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "state": "open", "gate": "passed" },
+      { "pr": "10005", "head": "ffffffffffffffffffffffffffffffffffffffff", "state": "open", "gate": "conflict" }
+    ],
+    "activePrs": ["10004"],
+    "refusals": [
+      { "pr": "10003", "head": "dddddddddddddddddddddddddddddddddddddddd", "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "runId": "run-1", "at": "2026-11-03T10:00:00+09:00", "kind": "batch-refusal" },
+      { "pr": "10003", "head": "dddddddddddddddddddddddddddddddddddddddd", "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "runId": "run-2", "at": "2026-11-03T10:05:00+09:00", "kind": "batch-refusal" }
+    ],
+    "lastParks": [],
+    "slots": [
+      { "host": "aws1", "slot": 3, "expressOnly": true },
+      { "host": "gcp2", "slot": 1, "expressOnly": false }
+    ],
+    "groupLimit": 4
+  },
+  "expected": {
+    "parked": ["10003"],
+    "assignments": [
+      { "stage": "express", "host": "aws1", "slot": 3, "prs": ["10001"] },
+      { "stage": "group", "host": "gcp2", "slot": 1, "prs": ["10002"] }
+    ],
+    "waiting": [{ "pr": "10005", "reason": "main-merge-conflict" }],
+    "skipped": [{ "pr": "10004", "reason": "active" }]
+  }
+}

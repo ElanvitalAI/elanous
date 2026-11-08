@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Finance domain pack — first-class tools (A1, 2026-07-05) ────────
 //
 // Upgrades the Bash-ad-hoc queries the T1 agent ran (sqlite/scripts,
@@ -16,7 +17,7 @@ import { openBacktestDb, listExperiments, latestResult, BACKTEST_DB_PATH } from 
 import { dashboardLoops } from './dashboard-data.js';
 import { summarizePaper } from './backtest-paper.js';
 import { oosStats, gateConfidence } from './backtest-oos.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { computeDislocations, renderDislocationSection } from './dislocation.js';
 import { computeSectorFusion, renderSectorFusion } from './sector-fusion.js';
 import { evaluateOpportunities, renderOpportunities } from './finance-opportunity.js';

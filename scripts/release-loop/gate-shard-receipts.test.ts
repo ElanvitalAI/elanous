@@ -2,8 +2,9 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { carryGateShardResult, gateShardReceiptPath, inspectGateShardReceipts, markGateShardUnmeasured, readGateShardResult, saveGateShardResult } from './gate-shard-receipts.js';
+import { carryGateShardResult, gateShardReceiptPath, inspectGateShardReceipts, markGateShardUnmeasured, readGateShardResult, reusableGateShardFailures, saveGateShardResult, summarizeGateShardExecution } from './gate-shard-receipts.js';
 import { gateShardRuntimeIdentityKey, type GateShardReceipt } from './gate-shard-dispatch.js';
+import type { GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -39,6 +40,23 @@ test('receipt reads require the exact recorded baseline; moved heads need radius
   expect(readGateShardResult(root, expected)).toBeNull();
 });
 
+test('same-head failed shard requires the exact judged preexisting IDs for its own files', () => {
+  const prior = { ...receipt(), failureIds: ['src/a.test.ts > existing failure'] };
+  const root = mkdtempSync(join(tmpdir(), 'gate-receipt-failed-same-head-')); roots.push(root);
+  const saved = saveGateShardResult(root, { receipt: prior,
+    runs: [{ output: '0 pass\n1 fail\nRan 1 test across 1 file.\n', rc: 1, pass: 0, fail: 1, errors: 0,
+      ran: 1, files: 1, passedIds: [] }] });
+  expect(readGateShardResult(root, { shard: saved, head40: saved.head40, base40: saved.base40,
+    envKey: saved.envKey })?.receipt.failureIds).toEqual(prior.failureIds);
+  expect(reusableGateShardFailures(prior, prior.head40, prior.failureIds)).toBe(true);
+  expect(reusableGateShardFailures(prior, prior.head40, undefined)).toBe(false);
+  expect(reusableGateShardFailures(prior, prior.head40, 'invalid' as unknown as string[])).toBe(false);
+  expect(reusableGateShardFailures(prior, prior.head40, ['src/a.test.ts > other failure'])).toBe(false);
+  expect(reusableGateShardFailures(prior, 'c'.repeat(40), prior.failureIds)).toBe(false);
+  expect(reusableGateShardFailures(prior, prior.head40, [...prior.failureIds, 'src/b.test.ts > unrelated'])).toBe(true);
+  expect(reusableGateShardFailures({ ...prior, errorIds: ['src/a.test.ts > error'] }, prior.head40, prior.failureIds)).toBe(false);
+});
+
 test('a radius-proven unchanged shard is carried to the descendant head with its measured bytes intact', () => {
   const root = mkdtempSync(join(tmpdir(), 'gate-receipt-carry-')); roots.push(root);
   const original = receipt();
@@ -65,6 +83,31 @@ test('receipt payload rejects incomplete passed IDs and inconsistent execution c
   saveGateShardResult(root, { receipt: inconsistent,
     runs: [{ output: '1 pass\n0 fail\nRan 2 tests across 1 file.\n', rc: 0, pass: 1, fail: 0, errors: 0, ran: 2, files: 1, passedIds: ['src/b.test.ts > pass'] }] });
   expect(readGateShardResult(root, { shard: inconsistent, head40: inconsistent.head40, base40: inconsistent.base40, envKey: inconsistent.envKey })).toBeNull();
+});
+
+test('receipt execution summary matches the latest persisted reuse and rerun decisions', () => {
+  const invocationId = 'run-current';
+  const shards = Array.from({ length: 81 }, (_, index) => ({ shardId: `pod-${index}`, files: [`src/test-${index}.test.ts`] }));
+  const rows: Pick<GateShardLedgerRow, 'version' | 'phase' | 'commit' | 'invocationId' | 'shardId' | 'files' | 'state' | 'attribution' | 'reuseDecision'>[] = [
+    { version: '0.3.6', phase: 'cut', commit: 'a'.repeat(40), invocationId: 'run-prior', shardId: 'pod-0', files: shards[0]!.files,
+      state: 'done', attribution: 'complete', reuseDecision: 'reuse' },
+    ...shards.map(({ shardId, files }, index) => ({ version: '0.3.6', phase: 'cut' as const, commit: 'a'.repeat(40), invocationId,
+      shardId, files, state: 'done' as const, attribution: 'complete' as const,
+      reuseDecision: index < 12 ? 'reuse' as const : 'rerun' as const })),
+  ];
+  const expected = { version: '0.3.6', phase: 'cut' as const, commit: 'a'.repeat(40), invocationId, shards };
+  expect(summarizeGateShardExecution(rows, expected)).toEqual({
+    plannedShards: 81, reusedShards: 12, rerunShards: 69, unmeasuredShards: 0,
+    selectedFiles: 69, carriedFiles: 12, action: 'partial-sweep',
+  });
+  expect(summarizeGateShardExecution(rows.slice(0, -1), expected)).toMatchObject({
+    plannedShards: 81, reusedShards: 12, rerunShards: 68, unmeasuredShards: 1, action: 'unmeasured',
+  });
+  expect(summarizeGateShardExecution(rows, { ...expected, commit: 'b'.repeat(40) }).action).toBe('unmeasured');
+  expect(summarizeGateShardExecution(rows, { ...expected, shards: [{ ...shards[0]!, files: ['src/wrong.test.ts'] }, ...shards.slice(1)] }))
+    .toMatchObject({ reusedShards: 11, unmeasuredShards: 1, action: 'unmeasured' });
+  expect(summarizeGateShardExecution(rows, { ...expected, invocationId: 'run-next' }))
+    .toMatchObject({ reusedShards: 0, rerunShards: 0, unmeasuredShards: 81, action: 'unmeasured' });
 });
 
 test('GATE-SHARD-RECEIPT-PAYLOAD-CORRUPT: a replacement attempt gets a fresh payload path', () => {

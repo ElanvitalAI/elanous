@@ -15,7 +15,9 @@ import { setSchedule, type ReleaseSchedule } from './release-schedule.js';
 import { spawnHardRehearsalGate, planRehearsal as livePlanRehearsal, rehearsalLeakFailureDetail, runRehearsalLeakCheck, runRehearsalTick, sanitizeRehearsalLeakDetail, type HardGateResult, type RehearsalDeps, type StepId } from './rehearsal.js';
 import { planRehearsalShards, type RehearsalShardPlan } from './rehearsal-shard-plan.js';
 import { writeGateVerdictRecord } from '../../scripts/release-loop/gate-node.js';
-import { hardRehearsalGateVersion, planHardRehearsalRadius } from '../../scripts/release-loop/gate-radius-live.js';
+import { HARD_REHEARSAL_POD_SHARDS, hardRehearsalGateVersion, planHardRehearsalRadius } from '../../scripts/release-loop/gate-radius-live.js';
+import { appendGateShardLedger, appendGateShardLedgerBatch, gateShardLedgerPath, readGateShardLedger, type GateShardLedgerRow } from './gate-shard-ledger.js';
+import { gateShardsPath, writeGateShards } from './gate-shards.js';
 
 const cut = '2026-10-10T13:00:00Z';
 const schedule = { version: '0.2.23', cutAt: cut, publishAt: '2026-10-10T15:30:00Z' } as ReleaseSchedule;
@@ -50,7 +52,7 @@ function harness(now: Date, result: LightRcResult = rc(), dirty = false) {
     lightRc: async (version, checkout) => { expect(checkout).toBe('/fake/checkout'); calls.push(version); return result; },
     hardGate: async (version, checkout, sha) => {
       expect(checkout).toBe('/fake/checkout'); hardCalls.push(version);
-      return { outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0 };
+      return { outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0, receiptRecord: { available: true } };
     },
     notify: (text) => { notifications.push(text); },
   };
@@ -87,7 +89,7 @@ test('cut minus five hours launches one pinned full Pod gate with twelve shards 
     expect(claimed).toMatchObject({ outcome: 'running', hardGateRunId: runId,
       hardGateLog: join(root, 'release', schedule.version, 'rehearsal', `${runId}.log`) });
     seen.push({ version, sha, ledgerRoot, runId });
-    return { outcome: 'regression', commit: sha, executor: 'pod', introduced: ['test/new.test.ts > new case'], preexisting: 2 };
+    return { outcome: 'regression', commit: sha, executor: 'pod', introduced: ['test/new.test.ts > new case'], preexisting: 2, receiptRecord: { available: true } };
   };
   const opts = { ledgerRoot: root, checkout: '/fake/checkout', apply: true };
   await runRehearsalTick(opts, h.deps);
@@ -115,7 +117,7 @@ test('invalid pinned Pod result fails closed', async () => {
 test('an ok Pod verdict with introduced failures is recorded as an error', async () => {
   const root = newRoot(), h = harness(at(300)), sha = 'a'.repeat(40);
   h.deps.git = args => ({ rc: 0, stdout: args[0] === 'rev-parse' ? sha : '' });
-  h.deps.hardGate = async () => ({ outcome: 'ok', commit: sha, executor: 'pod', introduced: ['src/ui/screen.test.ts > fails'], preexisting: 0 });
+  h.deps.hardGate = async () => ({ outcome: 'ok', commit: sha, executor: 'pod', introduced: ['src/ui/screen.test.ts > fails'], preexisting: 0, receiptRecord: { available: true } });
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
   const result = stamp(root, 'hard-5h');
   expect(result.outcome).toBe('error');
@@ -161,6 +163,7 @@ async function runDefaultHardGateFixture(options: {
   identityUnavailable?: boolean;
   omitGateVerdict?: boolean;
   omitGraphSha?: boolean;
+  shardLedger?: 'complete' | 'remote-only' | 'interrupted' | 'partial' | 'partial-plan' | 'plan-underreports' | 'plan-id-mismatch';
 } = {}) {
   const root = newRoot(), checkout = join(root, 'checkout');
   const sha = 'a'.repeat(40), digest = `sha256:${'b'.repeat(64)}`;
@@ -195,6 +198,43 @@ async function runDefaultHardGateFixture(options: {
     receipt.version = gateVersion;
     if (options.omitGraphSha) delete (receipt as { graphSha?: string }).graphSha;
     if (!options.omitGateVerdict) writeGateVerdictRecord(join(root, 'release', gateVersion, 'gate-verdict.json'), gateVerdict);
+    const row = (shardId: string): GateShardLedgerRow => ({
+      v: 1, version: gateVersion, phase: 'cut', shardId, files: [`test/${shardId}.test.ts`], host: 'aws2', executor: 'pod',
+      imageDigest: digest, measuredImageDigest: digest, currentImageDigest: digest, commit: sha,
+      envFingerprint: runtimeIdentity.envFingerprint, startedAt: '2026-10-10T08:00:00.000Z', endedAt: '2026-10-10T08:00:01.000Z',
+      observedAt: '2026-10-10T08:00:02.000Z', state: 'done', rc: 0, pass: 1, fail: 0, errors: 0, ran: 1,
+      failureIds: [], errorIds: [], attribution: 'complete', logPath: null, junitPath: null, stopReason: null, attemptId: `attempt-${shardId}`,
+    });
+    const expectedShardIds = Array.from({ length: HARD_REHEARSAL_POD_SHARDS + 1 }, (_, index) => `pod-${index}`);
+    const plannedShardIds = options.shardLedger === 'partial-plan' ? expectedShardIds.slice(0, 2)
+      : options.shardLedger === 'plan-underreports' ? expectedShardIds.slice(0, HARD_REHEARSAL_POD_SHARDS) : expectedShardIds;
+    writeGateShards(gateShardsPath(gateVersion, root), {
+      v: 1, version: gateVersion, updatedAt: '2026-10-10T08:00:02.000Z',
+      shards: plannedShardIds.map(id => ({ id, state: 'done' as const, rc: 0, startedAt: '2026-10-10T08:00:00.000Z', endedAt: '2026-10-10T08:00:01.000Z' })),
+    });
+    const shardRoot = options.shardLedger === 'remote-only' ? mkdtempSync(join(tmpdir(), 'rehearsal-remote-only-ledger-')) : root;
+    if (shardRoot !== root) roots.push(shardRoot);
+    const shardPath = gateShardLedgerPath(gateVersion, shardRoot);
+    if (options.shardLedger === 'interrupted') {
+      const planned = row('pod-0');
+      appendGateShardLedger(shardPath, { ...planned, state: 'pending', host: null, startedAt: null, endedAt: null,
+        observedAt: '2026-10-10T08:00:00.000Z', rc: null, pass: null, fail: null, errors: null, ran: null,
+        failureIds: null, errorIds: null, attribution: 'unmeasured', imageDigest: null, measuredImageDigest: null, attemptId: 'attempt-pod-0' });
+      appendGateShardLedger(shardPath, { ...planned, state: 'running', host: 'aws2', startedAt: '2026-10-10T08:00:01.000Z',
+        endedAt: null, observedAt: '2026-10-10T08:00:01.000Z', rc: null, pass: null, fail: null, errors: null, ran: null,
+        failureIds: null, errorIds: null, attribution: 'unmeasured', attemptId: 'attempt-pod-0' });
+    } else {
+      const completedIds = options.shardLedger === 'partial' ? expectedShardIds.slice(0, -1)
+        : options.shardLedger === 'partial-plan' ? expectedShardIds.slice(0, 2)
+          : options.shardLedger === 'plan-underreports' ? expectedShardIds.slice(0, HARD_REHEARSAL_POD_SHARDS) : expectedShardIds;
+      appendGateShardLedgerBatch(shardPath, completedIds.map(row), true, '123e4567-e89b-12d3-a456-426614174000');
+    }
+    const runId = stamp(root, 'hard-5h').hardGateRunId;
+    const progressPath = join(root, 'release', schedule.version, 'rehearsal', `${runId}.gate-progress.jsonl`);
+    const actualPlanIds = options.shardLedger === 'plan-id-mismatch'
+      ? [...expectedShardIds.slice(0, -1), 'pod-extra'] : expectedShardIds;
+    writeFileSync(progressPath, `${actualPlanIds.map((shard, index) => JSON.stringify({ phase: 'shard-planning', shard,
+      shardIndex: index + 1, shardTotal: actualPlanIds.length })).join('\n')}\n${JSON.stringify({ phase: 'collection', state: 'complete', shardCount: actualPlanIds.length })}\n`);
     writeFileSync(gate.logPath, JSON.stringify({ outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0 }) + '\\n');
     return { outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0 };
   };
@@ -202,23 +242,42 @@ async function runDefaultHardGateFixture(options: {
   return { root, sha, digest, runtimeIdentity, receipt, gateVerdict, releaseVerdict, originalVerdict, state: stamp(root, 'hard-5h'), argv, identityPool };
 }
 
+test.each([
+  ['remote-only', 'HQ shard ledger has no completed batch'],
+  ['interrupted', 'HQ shard ledger has no completed batch'],
+  ['partial', 'HQ shard ledger batch is incomplete'],
+  ['partial-plan', 'HQ gate shard plan incomplete'],
+  ['plan-underreports', 'HQ gate shard plan incomplete'],
+  ['plan-id-mismatch', 'HQ gate shard plan incomplete'],
+] as const)('hard rehearsal rejects %s shard evidence even when the remote gate reports ok', async (shardLedger, reason) => {
+  const fixture = await runDefaultHardGateFixture({ shardLedger });
+  expect(fixture.state.outcome).toBe('unmeasured');
+  expect(fixture.state.hardGate).toMatchObject({ outcome: 'unmeasured', receiptRecord: { available: false, reason } });
+  expect(fixture.state.measurementGap.cause).toContain(reason);
+  if (shardLedger === 'interrupted') {
+    const gateVersion = hardRehearsalGateVersion(schedule.version, fixture.state.hardGateRunId!);
+    expect(readGateShardLedger(gateShardLedgerPath(gateVersion, fixture.root))?.rows.map(row => row.state)).toEqual(['pending', 'running']);
+  }
+});
+
 test('default hard gate subprocess preserves args, state environment, and verdict parsing', () => {
   const root = mkdtempSync(join(tmpdir(), 'rehearsal-spawn-gate-')); roots.push(root);
   const checkout = join(root, 'checkout'); mkdirSync(checkout);
-  const logPath = join(root, 'release', 'hard.log'), sha = 'a'.repeat(40);
-  const script = `console.log(JSON.stringify({outcome:'ok',commit:'${sha}',executor:'pod',introduced:[],preexisting:0,env:process.env.ELANOUS_STATE_DIR,argv:process.argv.slice(1)}))`;
+  const logPath = join(root, 'release', 'hard.log'), progressFile = join(root, 'release', 'progress.jsonl'), sha = 'a'.repeat(40);
+  const script = `console.log(JSON.stringify({outcome:'ok',commit:'${sha}',executor:'pod',introduced:[],preexisting:0,env:process.env.ELANOUS_STATE_DIR,progress:process.env.ELANOUS_GATE_PROGRESS_FILE,argv:process.argv.slice(1)}))`;
   const result = spawnHardRehearsalGate({ binary: process.execPath, args: ['-e', script, '--', 'gate-arg'], checkout,
-    ledgerRoot: root, logPath, timeoutMs: 10_000, sha });
+    ledgerRoot: root, logPath, progressFile, timeoutMs: 10_000, sha });
   expect(result).toMatchObject({ outcome: 'ok', commit: sha, executor: 'pod' });
   const log = readFileSync(logPath, 'utf8');
   expect(log).toContain(`"env":"${root}"`);
+  expect(log).toContain(`"progress":"${progressFile}"`);
   expect(log).toContain('gate-arg');
 });
 
 test('default hard rehearsal targets the requested Pod and writes a complete structured receipt', async () => {
   const fixture = await runDefaultHardGateFixture();
   const gateVersion = hardRehearsalGateVersion(schedule.version, fixture.state.hardGateRunId!);
-  expect(fixture.argv).toContain('scripts/release-loop/gate-node.ts');
+  expect(fixture.argv).toContain('scripts/release-loop/gate-node-cli.ts');
   expect(fixture.argv.slice(fixture.argv.indexOf('--pod-pool'), fixture.argv.indexOf('--pod-pool') + 2)).toEqual(['--pod-pool', 'pool-aws2@aws2:12']);
   expect(fixture.state).toMatchObject({ outcome: 'ok', selection: { shards: 12, remote: 'aws2' },
     hardGate: { receiptRecord: { available: true } } });
@@ -264,9 +323,9 @@ test('an unavailable injected aws1 Pod ends unmeasured without falling back or l
   expect(fixture.argv).toEqual([]);
 });
 
-test('hard rehearsal rejects a writer record whose selected-host architecture differs', async () => {
+test('hard rehearsal fails closed when the writer record selected-host architecture differs', async () => {
   const fixture = await runDefaultHardGateFixture({ receiptRuntime: { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'c'.repeat(64) } });
-  expect(fixture.state).toMatchObject({ outcome: 'ok', hardGate: { receiptRecord: { available: false, reason: 'receipt environment-architecture-mismatch' } } });
+  expect(fixture.state).toMatchObject({ outcome: 'unmeasured', hardGate: { outcome: 'unmeasured', receiptRecord: { available: false, reason: 'receipt environment-architecture-mismatch' } } });
   const gateVersion = hardRehearsalGateVersion(schedule.version, fixture.state.hardGateRunId!);
   expect(JSON.parse(readFileSync(join(fixture.root, 'release', gateVersion, 'gate-verdict.json'), 'utf8')))
     .toMatchObject({ baselineReceipt: { executionIdentity: { architecture: 'x64' } } });
@@ -274,8 +333,8 @@ test('hard rehearsal rejects a writer record whose selected-host architecture di
 
 test('hard rehearsal reports missing structured receipt fields instead of claiming reuse', async () => {
   const fixture = await runDefaultHardGateFixture({ omitGraphSha: true });
-  expect(fixture.state).toMatchObject({ outcome: 'ok', hardGate: { receiptRecord: { available: false } } });
-  expect(fixture.state.summary).toContain('영수증 재사용 불가: 기록 검증 실패: receipt graph/recipe source pins differ from recorded commit');
+  expect(fixture.state).toMatchObject({ outcome: 'unmeasured', hardGate: { outcome: 'unmeasured', receiptRecord: { available: false } } });
+  expect(fixture.state.summary).toContain('HQ 원장 영수증 실패: receipt graph/recipe source pins differ from recorded commit');
 });
 
 test('hard rehearsal preserves graph preflight and receipt-read failures together', async () => {
@@ -293,14 +352,14 @@ test('a hard rehearsal with no requested Pod member refuses before launching gat
   expect(fixture.argv).toEqual([]);
 });
 
-test('an unreadable source graph pin does not suppress the hard gate verdict', async () => {
+test('an unreadable source graph pin blocks a reusable hard gate verdict', async () => {
   const fixture = await runDefaultHardGateFixture({ graphProbeThrows: 'probe unavailable' });
-  expect(fixture.state).toMatchObject({ outcome: 'ok', hardGate: { outcome: 'ok', receiptRecord: { available: false } } });
-  expect(fixture.state.summary).toContain('영수증 재사용 불가: 기록 검증 실패: receipt source pins could not be read: probe unavailable');
-  expect(fixture.argv).toContain('scripts/release-loop/gate-node.ts');
+  expect(fixture.state).toMatchObject({ outcome: 'unmeasured', hardGate: { outcome: 'unmeasured', receiptRecord: { available: false } } });
+  expect(fixture.state.summary).toContain('HQ 원장 영수증 실패: receipt source pins could not be read: probe unavailable');
+  expect(fixture.argv).toContain('scripts/release-loop/gate-node-cli.ts');
 });
 
-test('a hard gate receipt identity mismatch is visible without changing the gate verdict', async () => {
+test('a hard gate receipt identity mismatch prevents a green rehearsal stamp', async () => {
   const root = newRoot(), h = harness(at(300));
   h.deps.hardGate = async (_version, _checkout, sha, _ledger, _runId, remote) => {
     expect(remote).toBe('aws2');
@@ -308,9 +367,9 @@ test('a hard gate receipt identity mismatch is visible without changing the gate
       receiptRecord: { available: false, reason: 'receipt writer record incomplete' } };
   };
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, remote: 'aws2' }, h.deps);
-  expect(stamp(root, 'hard-5h')).toMatchObject({ outcome: 'ok', selection: { remote: 'aws2' },
-    hardGate: { receiptRecord: { available: false } } });
-  expect(stamp(root, 'hard-5h').summary).toContain('영수증 재사용 불가: 기록 검증 실패: receipt writer record incomplete');
+  expect(stamp(root, 'hard-5h')).toMatchObject({ outcome: 'unmeasured', selection: { remote: 'aws2' },
+    hardGate: { outcome: 'unmeasured', receiptRecord: { available: false } } });
+  expect(stamp(root, 'hard-5h').summary).toContain('HQ 원장 영수증 실패: receipt writer record incomplete');
 });
 
 test('a gate launch with no JSON appends its cause to an already created empty evidence log', async () => {
@@ -436,7 +495,7 @@ test('hard rehearsal keeps a gate process error cause even when no verdict commi
 
 test('hard rehearsal records a cause and an actual evidence file when a verdict cannot be measured', async () => {
   const root = newRoot(), h = harness(at(300));
-  h.deps.hardGate = async (_version, _checkout, sha) => ({ outcome: 'regression', commit: sha, executor: 'pod', introduced: [], preexisting: 2 });
+  h.deps.hardGate = async (_version, _checkout, sha) => ({ outcome: 'regression', commit: sha, executor: 'pod', introduced: [], preexisting: 2, receiptRecord: { available: true } });
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
   const saved = stamp(root, 'hard-5h');
   expect(saved.outcome).toBe('unmeasured');

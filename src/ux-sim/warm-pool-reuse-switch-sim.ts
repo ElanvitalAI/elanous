@@ -12,10 +12,14 @@ import { createFakePrimaryControl } from './warm-pool-reuse-sim.js';
 const host = 'pool-host-a';
 const key = { context: 'pool-host-a-context', imageDigest: `sha256:${'d'.repeat(64)}`,
   lockHash: 'e'.repeat(64), architecture: 'amd64' };
+const runtimeContract = { baseImageDigest: `sha256:${'a'.repeat(64)}`, bunVersion: Bun.version,
+  os: 'linux' as const, architecture: 'amd64', requiredTools: ['bun', 'git'] };
+const runtimeIdentity = { baseImageDigest: runtimeContract.baseImageDigest, lockHash: key.lockHash,
+  os: 'linux' as const, architecture: 'amd64', bunVersion: Bun.version };
 const spec: WarmPodSpec = { name: 'warm-pool-host-a-standard-1', namespace: 'elanous-test',
   kubectlContext: key.context, workerId: 'warm-pool-host-a-standard-1-generation-1',
   image: `registry.example/elanous@${key.imageDigest}`,
-  sourceUrl: 'https://github.com/ElanvitalAI/elanous.git', cutSha: 'f'.repeat(40), key,
+  sourceUrl: 'https://github.com/ElanvitalAI/elanous.git', cutSha: 'f'.repeat(40), key, runtimeContract,
   memoryLimit: '16Gi', nodeName: 'pool-host-a-server-0',
   hostProbeUrl: 'http://host.orb.internal:10001/health', prodProbeUrl: 'http://core.elanous-prod:10002/' };
 
@@ -30,7 +34,8 @@ export async function runWarmPoolReuseSwitchSimulation(input: {
   const provider = new WarmPodProvider({ candidates: [candidate], controlUrl: primary.url,
     memberToken: primary.memberToken, machineTokens: { [host]: primary.machineTokens[host] },
     profileConfig: { pod: { warmPoolProfile: 'gate' } }, kubectl: kubernetes.kubectl,
-    fetch: primary.fetch, prepareLockDirectory, quotaResolverForTest: () => 1,
+    fetch: primary.fetch, prepareLockDirectory, rotationStatePath: join(prepareLockDirectory, 'rotations.json'),
+    quotaResolverForTest: () => 1,
     transport: () => ({ request: async (command) => {
       const now = Date.now();
       const files: WarmWorkerFileResult[] = command.files.map((file) => ({ file, rc: 0,
@@ -47,7 +52,8 @@ export async function runWarmPoolReuseSwitchSimulation(input: {
     if (reconciled.ready !== 1 || reconciled.failed.length) throw new Error('sim warm worker did not reconcile ready');
     const replay = await requestWarmPodReplay({ protocol: 1, runId: input.runId, attemptId: `${input.runId}-attempt`,
       cutSha: spec.cutSha, baselineSha: spec.cutSha, deadlineAt: Date.now() + 60_000,
-      files: ['src/ux-sim/warm-pool-reuse-switch-sim.test.ts'], envProfile: 'gate-v1' }, provider);
+      files: ['src/ux-sim/warm-pool-reuse-switch-sim.test.ts'], envProfile: 'gate-v1' }, provider,
+    { kind: 'gate', lockHash: key.lockHash, imageDigest: key.imageDigest, runtimeContract, runtimeIdentity });
     const command = replay.command;
     const reply = replay.transport.reply;
     if (!command || replay.transport.status !== 'observed' || replay.transport.reason !== 'complete' || !reply)

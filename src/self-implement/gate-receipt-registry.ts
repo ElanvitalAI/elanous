@@ -34,7 +34,7 @@ export interface GateReceiptIdentity {
   baseCommit: string;
   /** 검사를 실행한 Bun 식별값(bun --version) */
   bunVersion: string;
-  /** 검사가 설치·실행한 lockfile 의 SHA-256(bun.lock/bun.lockb 바이트) — 없으면 'absent' */
+  /** 설치 입력 지문(bun.lock 은 dependency graph 정규화, 그 외는 raw SHA-256) — 없으면 'absent' */
   lockfileHash: string;
   /** 정규화된 radius 파일 집합(병합 후보 기준 변경 파일 — 중복 제거·정렬) */
   radiusFiles: readonly string[];
@@ -170,11 +170,97 @@ export function gateEnvFingerprint(env: NodeJS.ProcessEnv): string {
   return createHash('sha256').update(canonical).digest('hex');
 }
 
-/** 후보 워크트리가 실제로 설치·실행한 lockfile 의 SHA-256. 둘 다 없으면 'absent'. */
+/** 후보 워크트리가 실제로 설치·실행할 Bun dependency graph 지문. 불투명 lockfile 은 raw SHA로 fail-closed. */
 export function gateLockfileHash(worktree: string): string {
   for (const name of ['bun.lock', 'bun.lockb']) {
     if (!existsSync(join(worktree, name))) continue;
-    return createHash('sha256').update(readFileSync(join(worktree, name))).digest('hex');
+    const bytes = readFileSync(join(worktree, name));
+    if (name === 'bun.lock') {
+      try {
+        const parsed: unknown = Bun.JSONC.parse(bytes.toString('utf8'));
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const lock = parsed as Record<string, unknown>;
+          const workspaces = lock.workspaces;
+          const packages = lock.packages;
+          if (workspaces && typeof workspaces === 'object' && !Array.isArray(workspaces)
+            && packages && typeof packages === 'object' && !Array.isArray(packages)) {
+            // Test installation depends on requested dependency versions and their resolved graph. The
+            // dependency section (dev vs runtime) is an install-mode label; both are installed for a gate.
+            // Keep all lock schema fields except scripts and merge runtime/dev requests, since both are installed.
+            // Optional and peer dependencies retain distinct categories because their install semantics differ.
+            if (lock.lockfileVersion !== 1 || lock.configVersion !== 1
+              || Object.keys(lock).some((key) => !['lockfileVersion', 'configVersion', 'workspaces', 'packages'].includes(key))) {
+              throw new Error('unsupported bun lock schema');
+            }
+            const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+            const isStringMap = (value: unknown): value is Record<string, string> => isRecord(value)
+              && Object.values(value).every((item) => typeof item === 'string');
+            const normalizedWorkspaces = Object.fromEntries(Object.entries(workspaces as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+              .map(([workspace, raw]) => {
+                if (!isRecord(raw) || Object.keys(raw).some((key) => !['name', 'dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies', 'scripts'].includes(key))) {
+                  throw new Error('invalid workspace lock entry');
+                }
+                const entry = raw as Record<string, unknown>;
+                if (entry.name !== undefined && typeof entry.name !== 'string') throw new Error('invalid workspace name');
+                if (entry.scripts !== undefined && !isStringMap(entry.scripts)) {
+                  throw new Error('invalid workspace scripts');
+                }
+                const copy = { ...entry };
+                delete copy.scripts;
+                const merged: Record<string, string> = {};
+                for (const field of ['dependencies', 'devDependencies']) {
+                  const values = entry[field];
+                  if (values === undefined) continue;
+                  if (!isStringMap(values)) throw new Error('invalid workspace dependencies');
+                  for (const [name, version] of Object.entries(values)) {
+                    if (merged[name] !== undefined && merged[name] !== version) {
+                      throw new Error('conflicting workspace dependency request');
+                    }
+                    merged[name] = version;
+                  }
+                }
+                copy.dependencies = Object.fromEntries(Object.entries(merged).sort(([a], [b]) => a.localeCompare(b)));
+                delete copy.devDependencies;
+                for (const field of ['optionalDependencies', 'peerDependencies']) {
+                  const values = entry[field];
+                  if (values === undefined) continue;
+                  if (!isStringMap(values)) throw new Error(`invalid workspace ${field}`);
+                }
+                return [workspace, copy];
+              }));
+            if (!Object.values(packages as Record<string, unknown>).every((pkg) => {
+              if (!Array.isArray(pkg) || pkg.length !== 4 || typeof pkg[0] !== 'string' || !pkg[0]
+                || typeof pkg[1] !== 'string' || !isRecord(pkg[2]) || typeof pkg[3] !== 'string'
+                || !/^sha512-[A-Za-z0-9+/]{86}==$/.test(pkg[3])) return false;
+              const metadata = pkg[2] as Record<string, unknown>;
+              if (Object.keys(metadata).some((key) => !['dependencies', 'optionalDependencies', 'peerDependencies', 'optionalPeers', 'bin', 'os', 'cpu'].includes(key))) return false;
+              for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+                const dependencies = metadata[field];
+                if (dependencies !== undefined && !isStringMap(dependencies)) return false;
+              }
+              if (metadata.optionalPeers !== undefined && (!Array.isArray(metadata.optionalPeers)
+                || !metadata.optionalPeers.every((peer) => typeof peer === 'string'))) return false;
+              if (metadata.bin !== undefined && !isStringMap(metadata.bin)) return false;
+              for (const field of ['os', 'cpu']) {
+                const value = metadata[field];
+                if (value !== undefined && typeof value !== 'string'
+                  && (!Array.isArray(value) || !value.every((item) => typeof item === 'string'))) return false;
+              }
+              return true;
+            })) throw new Error('invalid bun package graph');
+            const stable = (value: unknown): unknown => {
+              if (Array.isArray(value)) return value.map(stable);
+              if (!value || typeof value !== 'object') return value;
+              return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+                .map(([key, item]) => [key, stable(item)]));
+            };
+            const semantic = JSON.stringify(stable({ ...lock, workspaces: normalizedWorkspaces, packages }));
+            return createHash('sha256').update(semantic).digest('hex');
+          }
+        }
+      } catch { /* malformed or unsupported lockfiles remain fail-closed via their raw-byte fingerprint */ }
+    }
+    return createHash('sha256').update(bytes).digest('hex');
   }
   return 'absent';
 }

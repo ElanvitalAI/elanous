@@ -84,6 +84,20 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     why: 'one-use setup link is verified by the claim handler without an owner bearer',
   },
   {
+    method: 'POST',
+    match: 'exact',
+    path: '/v1/setup/credential-claim',
+    selfVerified: true,
+    why: 'slot-bound one-use link is claimed by its own token handler; generic setup bearers are rejected',
+  },
+  {
+    method: 'POST',
+    match: 'exact',
+    path: '/v1/setup/credential-register',
+    selfVerified: true,
+    why: 'short-lived single-use bearer is consumed by the slot-bound registration handler',
+  },
+  {
     method: 'GET',
     match: 'prefix',
     path: '/v1/setup/',
@@ -103,7 +117,7 @@ export function isPublicRoute(
 ): boolean {
   for (const route of PUBLIC_ROUTES) {
     if (route.method !== method) continue;
-    if (route.path.startsWith('/v1/setup/') && route.path !== '/v1/setup/claim' && !ctx.setupMode) continue;
+    if (route.path.startsWith('/v1/setup/') && route.path !== '/v1/setup/claim' && !route.selfVerified && !ctx.setupMode) continue;
     if (route.match === 'exact') {
       if (pathname === route.path) return true;
     } else if (pathname === route.path || pathname.startsWith(route.path)) {

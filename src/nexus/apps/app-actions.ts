@@ -1,26 +1,41 @@
 import { transcribeAudioFile } from '../api/audio-stt.js';
 import { SERVICE_KEY_CATALOG } from '../../setup/service-key-catalog.js';
+import { emitNexusFunnelEvent, type NexusFunnelRuntime } from './funnel-observe.js';
+import type { AppCredentialCapability } from './app-credential-capability.js';
+
+export type AppActionCredential = string | AppCredentialCapability;
+export interface AppActionResolvedCredentials {
+  readonly appSlug: string;
+  readonly keyId: AppActionCredential;
+  readonly secret: AppActionCredential;
+}
 
 export interface AppActionSecretBoundary {
   /** Resolves an app-declared credential reference. Implemented after APP-SECRET-SCOPE lands. */
-  resolve(input: { appSlug: string; reference: string }): Promise<string | undefined>;
+  resolve(input: { appSlug: string; reference: string }): Promise<AppActionCredential | undefined>;
 }
 export interface AppActionDeclaration {
-  readonly builtin: 'stt' | 'summarize' | 'tts';
+  readonly builtin: 'stt' | 'summarize' | 'tts' | 'generate';
   readonly uses: readonly string[];
+  readonly async?: boolean;
+  readonly spend?: string;
 }
 export interface AppActionDeps {
   readonly secrets: AppActionSecretBoundary;
+  readonly funnel?: NexusFunnelRuntime;
   readonly readAudioObject?: (input: { appSlug: string; reference: string }) => Promise<{ bytes: Uint8Array; mimeType: string; filename: string } | undefined>;
+  readonly readImageObject?: (input: { appSlug: string; reference: string }) => Promise<{ bytes: Uint8Array; mimeType: string } | undefined>;
+  readonly generate?: (input: { appSlug: string; actionName?: string; prompt: string; image: Uint8Array; mimeType: string; credentials: AppActionResolvedCredentials }) => Promise<{ jobId: string; eventsUrl: string }>;
   readonly transcribe?: (input: { audio: Buffer; apiKey: string; mimeType: string; filename: string; language?: string }) => Promise<{ text: string; language?: string; durationMs?: number }>;
   readonly summarize?: (input: { text: string; apiKey: string }) => Promise<string>;
   readonly synthesize?: (input: { text: string; voiceId: string; modelId: string; apiKey: string }) => Promise<{ audio: Uint8Array; mimeType: string }>;
 }
-export interface AppActionInput { readonly audio?: Uint8Array | string; readonly mimeType?: string; readonly filename?: string; readonly text?: string; readonly language?: string; readonly voiceId?: string; readonly modelId?: string }
-export type AppActionResult = { readonly text: string; readonly language?: string; readonly durationMs?: number } | { readonly audioBase64: string; readonly mimeType: string };
+export interface AppActionInput { readonly audio?: Uint8Array | string; readonly image?: string; readonly mimeType?: string; readonly filename?: string; readonly text?: string; readonly language?: string; readonly voiceId?: string; readonly modelId?: string; readonly confirmSpend?: boolean }
+export type AppActionResult = { readonly text: string; readonly language?: string; readonly durationMs?: number } | { readonly audioBase64: string; readonly mimeType: string } | { readonly jobId: string; readonly status: 'queued'; readonly eventsUrl: string };
 
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 const MAX_TEXT_CHARS = 100_000;
+const MAX_GENERATE_PROMPT_CHARS = 8_000;
 const MAX_TTS_TEXT_CHARS = 5_000;
 const MAX_TTS_AUDIO_BYTES = 10 * 1024 * 1024;
 const CREDENTIAL_REF = /^cred:[a-z0-9][a-z0-9-]*\.[a-zA-Z][a-zA-Z0-9_-]*$/;
@@ -103,21 +118,56 @@ async function defaultSynthesize(input: { text: string; voiceId: string; modelId
   return { audio, mimeType: mimeType?.startsWith('audio/') ? mimeType : 'audio/mpeg' };
 }
 
-/** Runs only manifest-declared STT, summarize, and TTS actions; credentials cross one boundary and never enter results. */
+/** Runs manifest-declared app actions; credentials cross one boundary and never enter results. */
 export function createAppActions(deps: AppActionDeps) {
+  function recordFirstSuccess(appSlug: string): void {
+    if (!deps.funnel?.recordFirstSuccess(appSlug)) return;
+    emitNexusFunnelEvent(deps.funnel, {
+      type: 'first-success', accountHash: deps.funnel.accountHash, appHash: deps.funnel.appHash(appSlug),
+    });
+  }
+
   return {
-    async run(input: { appSlug: string; declaration: AppActionDeclaration; payload: AppActionInput }): Promise<AppActionResult> {
+    async run(input: { appSlug: string; declaration: AppActionDeclaration; payload: AppActionInput; actionName?: string }): Promise<AppActionResult> {
       const { appSlug, declaration, payload } = input;
       if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(appSlug) || appSlug.includes('--')) throw new AppActionError('invalid-app');
-      const expectedCredential = declaration?.builtin === 'tts' ? 'cred:elevenlabs.api_key' : 'cred:openai.api_key';
-      const expectedService = expectedCredential.slice('cred:'.length).split('.', 1)[0]!;
-      if (!declaration || !['stt', 'summarize', 'tts'].includes(declaration.builtin)
-        || !Array.isArray(declaration.uses) || declaration.uses.length !== 1
-        || declaration.uses[0] !== expectedCredential || !CREDENTIAL_REF.test(declaration.uses[0]!)
-        || !APP_ATTACHABLE_SERVICE_IDS.has(CREDENTIAL_SERVICE_IDS[expectedService] ?? expectedService)) {
+      const expectedCredentials = declaration?.builtin === 'tts' ? ['cred:elevenlabs.api_key']
+        : declaration?.builtin === 'generate' ? ['cred:higgsfield.key_id', 'cred:higgsfield.secret']
+          : ['cred:openai.api_key'];
+      const declarationValid = !!declaration && ['stt', 'summarize', 'tts', 'generate'].includes(declaration.builtin)
+        && Array.isArray(declaration.uses) && declaration.uses.length === expectedCredentials.length
+        && declaration.uses.every((value, index) => {
+          const service = value.slice('cred:'.length).split('.', 1)[0]!;
+          return value === expectedCredentials[index] && CREDENTIAL_REF.test(value)
+            && APP_ATTACHABLE_SERVICE_IDS.has(CREDENTIAL_SERVICE_IDS[service] ?? service);
+        });
+      if (!declaration || !declarationValid || (declaration.builtin === 'generate' && (declaration.async !== true || declaration.spend !== 'owner-confirm'))) {
         throw new AppActionError('invalid-declaration');
       }
-      let apiKey: string | undefined;
+      if (declaration.builtin === 'generate') {
+        if (payload.confirmSpend !== true) throw new AppActionError('invalid-input');
+        if (typeof payload.text !== 'string' || !payload.text.trim() || payload.text.length > MAX_GENERATE_PROMPT_CHARS
+          || typeof payload.image !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$/.test(payload.image)
+          || payload.image.split('/').some(part => !part || part === '.' || part === '..')) throw new AppActionError('invalid-input');
+        const image = deps.readImageObject
+          ? await deps.readImageObject({ appSlug, reference: payload.image }).catch(() => undefined)
+          : undefined;
+        if (!image || !(image.bytes instanceof Uint8Array) || image.bytes.byteLength === 0
+          || image.bytes.byteLength > MAX_AUDIO_BYTES || !/^image\/(?:jpeg|png|webp)$/.test(image.mimeType)) throw new AppActionError('invalid-input');
+        const [keyId, secret] = await Promise.all(expectedCredentials.map(reference => deps.secrets.resolve({ appSlug, reference }).catch(() => undefined)));
+        const hasValue = (value: AppActionCredential | undefined): value is AppActionCredential => typeof value === 'string' ? !!value.trim() : !!value;
+        if (!hasValue(keyId) || !hasValue(secret)) throw new AppActionError('credential-unavailable');
+        try {
+          if (!deps.generate) throw new Error('generate action is unavailable');
+          const queued = await deps.generate({ appSlug, actionName: input.actionName, prompt: payload.text.trim(), image: image.bytes,
+          mimeType: image.mimeType, credentials: { appSlug, keyId, secret } });
+          return { jobId: queued.jobId, status: 'queued', eventsUrl: queued.eventsUrl };
+        } catch (error) {
+          if (error instanceof AppActionError) throw error;
+          throw new AppActionError('provider-failed');
+        }
+      }
+      let apiKey: AppActionCredential | undefined;
       try { apiKey = await deps.secrets.resolve({ appSlug, reference: declaration.uses[0]! }); }
       catch { throw new AppActionError('credential-unavailable'); }
       if (typeof apiKey !== 'string' || !apiKey.trim()) throw new AppActionError('credential-unavailable');
@@ -132,6 +182,7 @@ export function createAppActions(deps: AppActionDeps) {
           const result = await (deps.synthesize ?? defaultSynthesize)({ text: text.trim(), voiceId, modelId, apiKey });
           if (!(result.audio instanceof Uint8Array) || result.audio.byteLength === 0 || result.audio.byteLength > MAX_TTS_AUDIO_BYTES
             || typeof result.mimeType !== 'string' || !/^audio\/[a-z0-9.+-]+$/.test(result.mimeType)) throw new Error('invalid TTS result');
+          recordFirstSuccess(appSlug);
           return { audioBase64: Buffer.from(result.audio).toString('base64'), mimeType: result.mimeType };
         }
         if (declaration.builtin === 'stt') {
@@ -156,11 +207,13 @@ export function createAppActions(deps: AppActionDeps) {
             ...(typeof payload.language === 'string' && payload.language.trim() ? { language: payload.language.trim() } : {}),
           });
           if (typeof result.text !== 'string') throw new Error('invalid transcription result');
+          recordFirstSuccess(appSlug);
           return { text: result.text, ...(result.language ? { language: result.language } : {}), ...(result.durationMs !== undefined ? { durationMs: result.durationMs } : {}) };
         }
         if (typeof payload.text !== 'string' || !payload.text.trim() || payload.text.length > MAX_TEXT_CHARS) throw new AppActionError('invalid-input');
         const text = await (deps.summarize ?? defaultSummarize)({ text: payload.text, apiKey });
         if (typeof text !== 'string' || !text.trim()) throw new Error('invalid summary result');
+        recordFirstSuccess(appSlug);
         return { text: text.trim() };
       } catch (error) {
         if (error instanceof AppActionError) throw error;
@@ -174,7 +227,7 @@ export function createAppActions(deps: AppActionDeps) {
 export interface AppActionHttpRuntime {
   authorize(request: Request, appSlug: string): boolean | Promise<boolean>;
   getDeclaration(appSlug: string, actionName: string): AppActionDeclaration | undefined | Promise<AppActionDeclaration | undefined>;
-  run(input: { appSlug: string; declaration: AppActionDeclaration; payload: AppActionInput }): Promise<AppActionResult>;
+  run(input: { appSlug: string; declaration: AppActionDeclaration; payload: AppActionInput; actionName?: string }): Promise<AppActionResult>;
 }
 
 async function readBoundedAudioBody(request: Request): Promise<Uint8Array | undefined> {
@@ -225,8 +278,8 @@ export async function handleAppActionRequest(request: Request, runtime: AppActio
   }
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return Response.json({ error: 'invalid-input' }, { status: 400 });
   try {
-    const result = await runtime.run({ appSlug: appSlug!, declaration, payload: payload as AppActionInput });
-    return Response.json({ ok: true, ...result }, { status: 200 });
+    const result = await runtime.run({ appSlug: appSlug!, declaration, payload: payload as AppActionInput, actionName: actionName! });
+    return Response.json({ ok: true, ...result }, { status: 'jobId' in result ? 202 : 200 });
   } catch (error) {
     const code = error instanceof AppActionError ? error.code : 'provider-failed';
     const status = code === 'credential-unavailable' ? 503 : code === 'provider-failed' ? 502 : 400;

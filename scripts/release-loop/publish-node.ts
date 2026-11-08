@@ -163,16 +163,50 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
     try { published = run('bun', ['bin/elanous.mjs', 'release', 'publish', '--dir', out, '--notes-file', file, '--yes', '--json'], undefined, 1_800_000); }
     finally { landing.end(); }
     if (published.stderr) process.stderr.write(published.stderr);
+    // Keep the command's complete streams in the graph node receipt. The graph runner redacts credentials
+    // before persisting command output, while this structured copy lets a partial/failed publish be audited.
+    const processEvidence = { status: published.status, stdout: published.stdout, stderr: published.stderr };
     const result = lastResult(published);
-    if (published.status === 1) return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `release publish failed: ${result?.error ?? published.stderr.trim()}` };
-    if (published.status !== 0 || result?.ok !== true || result.published !== true || result.tag !== `v${version}`) throw new Error(`release publish incomplete or tag mismatch: ${result?.error ?? published.stderr.trim()}`);
+    const reportedAssets = result?.assets;
+    const assetsKnown = Array.isArray(reportedAssets);
+    const declaredAssets: unknown[] = assetsKnown ? reportedAssets : [];
+    const names = declaredAssets.filter((asset): asset is string => typeof asset === 'string').map((asset) => asset.split('/').at(-1)!);
+    const tag = typeof result?.tag === 'string' ? result.tag : undefined;
+    if (result?.published === true && tag !== undefined && tag !== `v${version}`)
+      throw new Error(`publish tag mismatch: expected v${version}, received ${tag}`);
+    if (result?.published === true && (published.status !== 0 || result.ok !== true || !assetsKnown)) {
+      const reason = !assetsKnown ? 'asset inventory was not reported' : result.error ?? (published.stderr.trim() || `exit=${String(published.status)}`);
+      return { outcome: 'partial' as const, verdict: 'fail' as const,
+        summary: `release v${tag ?? version} was published but could not be fully verified: ${reason}`,
+        ...(tag === undefined ? {} : { tag }),
+        partialPublish: { ...(tag === undefined ? {} : { tag }), published: true, pendingAssets: [], pendingAssetsKnown: false,
+          declaredAssets: names, assetsDeclaredKnown: assetsKnown, assetsVerified: false },
+        publishProcess: processEvidence };
+    }
+    if (result?.published !== true && result?.published !== false) {
+      const tag = `v${version}`;
+      return { outcome: 'unknown' as const, verdict: 'fail' as const,
+        summary: `release ${tag} publication status is unknown; verify npm, GitHub release, and tag before recovery`,
+        publicationVerification: { state: 'unknown', commands: [
+          `npm view elanous@${version} version`,
+          `gh release view ${tag} --repo ElanvitalAI/elanous`,
+          `git ls-remote --tags https://github.com/ElanvitalAI/elanous.git refs/tags/${tag}`,
+        ] },
+        partialPublish: { published: 'unknown', pendingAssets: [], pendingAssetsKnown: false, assetsVerified: false },
+        publishProcess: processEvidence };
+    }
+    if (published.status !== 0 && result?.published !== true) return { outcome: 'error' as const, verdict: 'fail' as const, summary: `release publish failed before publication: ${result?.error ?? (published.stderr.trim() || `exit=${String(published.status)}`)}`, publishProcess: processEvidence };
+    if (published.status !== 0 || result?.ok !== true || result.published !== true || result.tag !== `v${version}`) {
+      return { outcome: 'error' as const, verdict: 'fail' as const,
+        summary: `release publish incomplete or tag mismatch: ${result?.error ?? (published.stderr.trim() || `exit=${String(published.status)}`)}`,
+        publishProcess: processEvidence };
+    }
     // REL3 — «published» only once every asset downloads. 10-01: the run went on to verify before GitHub served the
     // assets (release created 13:16Z, assets 13:20Z, run ended 13:15Z) and verify failed on a missing installer.
     const repo = typeof result.publicRepo === 'string' ? result.publicRepo : '';
-    const names = Array.isArray(result.assets) ? (result.assets as unknown[]).filter((a): a is string => typeof a === 'string').map((a) => a.split('/').at(-1)!) : [];
     const pending = waitForAssets(run, repo, `v${version}`, names, context.input.assetWaitSeconds);
-    if (pending.length) return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `published v${version} but assets not downloadable yet: ${pending.join(', ')}`, tag: `v${version}` };
-    return { outcome: 'ok' as const, verdict: 'pass' as const, summary: `published v${version} · ${names.length} assets downloadable`, tag: `v${version}` };
+    if (pending.length) return { outcome: 'partial' as const, verdict: 'fail' as const, summary: `published v${version} but assets are still pending: ${pending.join(', ')}`, tag: `v${version}`, partialPublish: { tag: `v${version}`, published: true, pendingAssets: pending, pendingAssetsKnown: true, assetsVerified: false }, publishProcess: processEvidence };
+    return { outcome: 'ok' as const, verdict: 'pass' as const, summary: `published v${version} · ${names.length} assets downloadable`, tag: `v${version}`, publishProcess: processEvidence };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 

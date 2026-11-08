@@ -22,6 +22,7 @@ import {
   runLocalLLMCompat,
   renderCompatMatrix,
 } from '../src/local-llm-test.js';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 // ── fetch stub scaffolding ───────────────────────────────────
 // Scripts a sequence of fetch responses keyed by request URL so a
@@ -29,17 +30,37 @@ import {
 
 type StubHandler = (url: string, init?: RequestInit) => Response | Promise<Response>;
 
-const realFetch = globalThis.fetch;
+let fakeFetch: FakeFetchDevice | undefined;
+let expectedCalls: string[] = [];
 
-function installFetch(handler: StubHandler): void {
-  globalThis.fetch = (async (input: any, init?: RequestInit) => {
-    const url = typeof input === 'string' ? input : input.url;
-    return handler(url, init);
-  }) as typeof fetch;
+function installFetch(handler: StubHandler, chatCalls = 7, baseUrl = 'http://mock:1234'): void {
+  fakeFetch?.restore();
+  const respond = (request: { url: string; method: string; headers: Readonly<Record<string, string>>; body: string | null }) =>
+    handler(request.url, {
+      method: request.method,
+      headers: { ...request.headers },
+      ...(request.body !== null ? { body: request.body } : {}),
+    });
+  fakeFetch = createFakeFetchDevice([
+    { url: `${baseUrl}/v1/models`, method: 'GET', response: respond },
+    { url: `${baseUrl}/v1/chat/completions`, method: 'POST', response: respond },
+  ]);
+  expectedCalls = [
+    `GET ${baseUrl}/v1/models`,
+    ...Array.from({ length: chatCalls }, () => `POST ${baseUrl}/v1/chat/completions`),
+  ];
 }
 
 function restoreFetch(): void {
-  globalThis.fetch = realFetch;
+  try {
+    if (fakeFetch) {
+      expect(fakeFetch.calls().map(({ method, url }) => `${method} ${url}`).sort()).toEqual([...expectedCalls].sort());
+    }
+  } finally {
+    fakeFetch?.restore();
+    fakeFetch = undefined;
+    expectedCalls = [];
+  }
 }
 
 /** Assemble a JSON response. */
@@ -236,7 +257,7 @@ describe('runLocalLLMCompat — scripted responses', () => {
   });
 
   it('unreachable endpoint short-circuits to all-skips after models', async () => {
-    installFetch(() => { throw new Error('fetch failed'); });
+    installFetch(() => { throw new Error('fetch failed'); }, 0);
     const summary = await runLocalLLMCompat({ baseUrl: BASE, model: MODEL, timeoutMs: 5000 });
     expect(summary.results[0]!.id).toBe('models');
     expect(summary.results[0]!.status).toBe('fail');
@@ -300,7 +321,7 @@ describe('runLocalLLMCompat — scripted responses', () => {
         choices: [{ message: { content: 'OK' } }],
         usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
       });
-    });
+    }, 6);
     const summary = await runLocalLLMCompat({
       baseUrl: BASE, model: MODEL, timeoutMs: 5000,
       skip: { vision: true },
@@ -368,12 +389,11 @@ describe('runLocalLLMCompat — scripted responses', () => {
 
 describe('renderCompatMatrix', () => {
   it('prints pass/fail counts and lists every row', async () => {
-    const realF = globalThis.fetch;
-    globalThis.fetch = (async () => jsonRes({
+    installFetch(async () => jsonRes({
       choices: [{ message: { content: 'OK' } }],
       usage: { total_tokens: 5, prompt_tokens: 3, completion_tokens: 2 },
       data: [{ id: 'mlx-community/gemma-4-26b-a4b-it' }],
-    })) as typeof fetch;
+    }), 7, 'http://mock');
     try {
       const summary = await runLocalLLMCompat({
         baseUrl: 'http://mock',
@@ -388,7 +408,7 @@ describe('renderCompatMatrix', () => {
         expect(out).toContain(r.label);
       }
     } finally {
-      globalThis.fetch = realF;
+      restoreFetch();
     }
   });
 });

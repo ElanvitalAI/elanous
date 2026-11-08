@@ -238,7 +238,8 @@ const invoke = async (root: string, runId: string, window: '08' | '12' | '18', d
   let final;
   for (const node of stages) final = await runOrchestratorNode(node, { root, runId, window, now: new Date('2026-10-04T00:00:00Z'),
     print: () => {}, observe: (event, data) => logged.push({ event, reason: data.reason, ...(data.targetLoopId ? { targetLoopId: data.targetLoopId } : {}) }),
-    seatTurn: async () => ({ status: 'skipped-empty' }), launchProcesses: () => ({ status: 'ok', records: [] }), ...deps });
+    seatTurn: async () => ({ status: 'skipped-empty' }), launchProcesses: () => ({ status: 'ok', records: [] }),
+    simImpactAudit: () => [], ...deps });
   return final!;
 };
 

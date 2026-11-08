@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.1 P2: EscalateSignal LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   emitEscalation,
   type EmitOpts,

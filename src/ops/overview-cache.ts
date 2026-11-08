@@ -1,5 +1,5 @@
 import { debug } from '../debug/log.js';
-import { parentPort, Worker } from 'node:worker_threads';
+import { isMainThread, parentPort, workerData, Worker } from 'node:worker_threads';
 import { collectOverview, type CollectOptions } from './overview-collect.js';
 import { computeVerdict, unmeasured, okCell, type Cell, type GateReservation, type OverviewSnapshot, type PodMemberRow } from './overview.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
@@ -11,6 +11,7 @@ const POD_STALE_MS = 2 * POD_MS;
 /** Bounds for distinct (version, owner, since) keys: memo entries kept and collections in flight. */
 const MAX_MEMO = 32;
 const MAX_PENDING = 2;
+const OVERVIEW_WORKER_KIND = 'ops-overview-cache';
 
 type PodReading = { context: string; occupied: number | null; reason: string | null; observedAt: number; gate?: GateReservation };
 type OverviewData = OverviewSnapshot & ReturnType<typeof computeVerdict> & { cacheAgeMs: number; durationMs: number; sources: string[]; refreshFailed: string | null };
@@ -18,7 +19,7 @@ type WorkerMessage = ({ kind: 'pods' } | { kind: 'snapshot'; options: CollectOpt
 
 /** The kubectl-capable grid reader lives in a worker, never on the HTTP event loop. */
 const port = parentPort;
-if (port) {
+if (!isMainThread && port && workerData?.kind === OVERVIEW_WORKER_KIND) {
   port.on('message', async (message: WorkerMessage) => {
     try {
       // A worker does not share the main thread's module state: carry the daemon's universe in.
@@ -36,7 +37,7 @@ if (port) {
 
 function workerRead<T>(message: WorkerMessage, timeoutMs: number, field: 'rows' | 'snapshot'): Promise<T> {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(new URL('./overview-cache.ts', import.meta.url));
+    const worker = new Worker(new URL('./overview-cache.ts', import.meta.url), { workerData: { kind: OVERVIEW_WORKER_KIND } });
     let settled = false;
     const finish = (error?: Error, result?: T) => {
       if (settled) return;

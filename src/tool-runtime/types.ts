@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── ToolRuntime — the shared dispatch contract ──
 //
 // Phase S4 of the PTY promotion track (DESIGN-pty-llm-native-promotion.md
@@ -19,7 +20,7 @@
 // with identical skill/dashboard behavior can stay on the direct
 // map until there's an actual reason to change.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import type { FeedbackEnvelope } from '../feedback/envelope.js';
 
 import type { ToolHost } from '../tool-surface.js';

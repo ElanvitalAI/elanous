@@ -93,6 +93,24 @@ describe.serial('SIM-FAKE-DNS-CERT', () => {
     });
   });
 
+  it('uses an injected clock for certificate expiry and renewal', async () => {
+    let now = EPOCH;
+    const device = createFakeDnsCert({ now: () => now, certificateLifetimeMs: 100 });
+    const issued = await device.issueCertificate();
+    expect(issued).toMatchObject({ status: 'issued', certificate: { issuedAt: EPOCH, expiresAt: EPOCH + 100 } });
+    now = EPOCH + 100;
+    const renewed = await device.renewIfDue();
+    expect(renewed).toMatchObject({ status: 'issued', certificate: { issuedAt: EPOCH + 100, expiresAt: EPOCH + 200 } });
+  });
+
+  it('uses the simulation clock when the contract port wraps a device created beforehand', async () => {
+    const device = createFakeDnsCertContractPort().create();
+    const issued = await device.issueCertificate();
+    if (issued.status !== 'issued') throw new Error('initial certificate issuance unexpectedly failed');
+    const renewed = await device.renewIfDueAtForContract(issued.certificate.issuedAt + 61 * DAY);
+    expect(renewed).toBe('issued');
+  });
+
   it('keeps the latest concurrent issuance result when an older slow request completes last', async () => {
     await withSimClock(EPOCH, async (clock) => {
       const device = createFakeDnsCert({ txtPropagationDelayMs: 30 });
@@ -225,7 +243,7 @@ describe.serial('SIM-FAKE-DNS-CERT', () => {
     const actual = await runFakeDnsCertContractMatrix(createFakeDnsCertContractPort());
     expect(fakeDnsCertContractCases).toHaveLength(actual.length);
     expect(actual).toEqual(fakeDnsCertContractCases.map((row) => row.expected));
-  });
+  }, 30_000); // Release gate runs this full async matrix inside a multi-file shard.
 
   it('keeps reserved words out of the required matrix and runs them only through an injected policy', async () => {
     expect(fakeDnsCertContractCases.some((row) => row.name.includes('reserved app word'))).toBe(false);

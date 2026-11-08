@@ -1,8 +1,9 @@
+import type { LLMToolSpec } from './tool-spec.js';
 // BEDROCK-MODELS-ALL — 공급자 본체: mantle-openai 경로(비-Anthropic) ⊕ Anthropic·runtime 경로 보존.
 // ⛔ 실 AWS 호출 0 · 자격 값은 가짜다.
 import { describe, expect, test } from 'bun:test';
 import type { UserConfig } from '../user-config.js';
-import type { LLMStreamEvent, LLMToolSpec } from '../llm.js';
+import type { LLMStreamEvent } from '../llm.js';
 import { makeBedrockProvider } from './bedrock-provider.js';
 import { encodeEventStreamFrame } from './bedrock-eventstream.js';
 

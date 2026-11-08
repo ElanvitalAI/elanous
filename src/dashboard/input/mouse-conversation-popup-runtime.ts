@@ -1,5 +1,5 @@
 import type { ConversationPopupHost } from '../../conv-dash/popup-host.js';
-import type { DashboardMouseWiringDeps } from './mouse-wiring.js';
+import type { DashboardMouseWiringDeps } from './mouse-wiring-types.js';
 
 export interface MouseConversationPopupRuntimeDeps {
   conversationPopupHost: Pick<

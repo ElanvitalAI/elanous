@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.7 P2: RunDMAIC LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   DMAIC_PHASES,
   renderDmaicPhase,

@@ -5,7 +5,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { debug } from '../debug/log.js';
+import ts from 'typescript';
 
 // ⚠️ manifest/ipc DB 는 ELANOUS_STATE_DIR 스코프 — 실 데이터 오염 방지로 tmp 로 격리(import 前 설정).
 // 갈림 ①: 모듈 최상위 설정을 유지한다. elanousStateRoot() 는 호출 시점에 env 를 읽지만
@@ -23,6 +25,27 @@ const { resetPtyEventLogForTesting } = await import('./pty-event-log.js');
 const { getPtyControlTarget, registerPtyControlTarget, resetForTesting, setPtyAdapterForTesting, startPty } = await import('./registry.js');
 const { createTuiControlTarget, startTuiSelfReport } = await import('../capture/tui-self-report.js');
 const { setExternalTuiKeyRoute } = await import('../tui.js');
+
+test('registry rename edge is deferred so importing the IPC module does not form a startup cycle', () => {
+  const path = fileURLToPath(new URL('./pty-control-ipc.ts', import.meta.url));
+  const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
+  const registryEdges = source.statements.filter((statement) =>
+    (ts.isImportDeclaration(statement) || ts.isExportDeclaration(statement))
+      && statement.moduleSpecifier !== undefined && ts.isStringLiteral(statement.moduleSpecifier)
+      && statement.moduleSpecifier.text === './registry.js'
+      && (ts.isImportDeclaration(statement) ? !statement.importClause?.isTypeOnly : !statement.isTypeOnly));
+  const deferredImports: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const specifier = node.arguments[0];
+      if (specifier !== undefined && ts.isStringLiteral(specifier) && specifier.text === './registry.js') deferredImports.push(specifier.text);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  expect(registryEdges).toEqual([]);
+  expect(deferredImports).toContain('./registry.js');
+});
 const { stopPtyRecording } = await import('./pty-recording.js');
 const { readFileSync, writeFileSync } = await import('node:fs');
 const registryIds: string[] = [];

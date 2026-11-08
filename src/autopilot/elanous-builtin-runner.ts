@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // src/autopilot/elanous-builtin-runner.ts
 //
 // ROADMAP-elanous-builtin-autopilot-cascade §MB-3.
@@ -32,7 +33,7 @@ import {
   flattenLlmContent,
 } from '../acp/content-blocks.js';
 import { debug } from '../debug/log.js';
-import { streamLLM, type LLMMessage, type LLMToolSpec } from '../llm.js';
+import { streamLLM, type LLMMessage } from '../llm.js';
 import { getUserConfig } from '../user-config.js';
 import { resolveAutoRoute, lookupLlmTierSpec, logRouterDecision } from '../model-tier/index.js';
 import type { LlmRunner } from '../model-tier/preset-suggest-llm.js';

@@ -1,4 +1,5 @@
-import type { LLMToolSpec } from '../llm.js';
+import type { LLMToolSpec } from '../llm/tool-spec.js';
+
 import { createHash } from 'node:crypto';
 import { debug } from '../debug/log.js';
 import { stripScreenAnsi } from '../harness/harness-screen.js';

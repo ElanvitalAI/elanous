@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // qwen-pipeline-bench.ts · empirical comparison matrix.
 //
 // Models (5):
@@ -21,14 +22,9 @@
 // Pre-req: LM Studio with qwen3.6 + qwen3.5 loaded; ANTHROPIC_API_KEY +
 // XAI_API_KEY in env. Missing keys → that model is skipped (logged).
 
-import {
-  LocalProvider,
-  AnthropicProvider,
-  GrokProvider,
-  streamLLMWithTools,
-} from '../src/llm.js';
+import { LocalProvider, AnthropicProvider, GrokProvider, streamLLMWithTools } from '../src/llm.js';
 import { refreshInventory, _resetManagerForTesting } from '../src/llm/local-manager/manager.js';
-import type { LLMMessage, LLMStreamEvent, LLMProvider, LLMToolSpec } from '../src/llm.js';
+import type { LLMMessage, LLMStreamEvent, LLMProvider } from '../src/llm.js';
 
 process.env['LOCAL_LLM_URL'] = process.env['LOCAL_LLM_URL'] || 'http://localhost:1234/v1';
 

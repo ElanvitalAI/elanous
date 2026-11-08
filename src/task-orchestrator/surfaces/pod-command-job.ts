@@ -16,12 +16,13 @@ import { collectPodArtifacts } from './pod-artifact-return.js';
 import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.js';
 import { podBunCacheVolume } from './pod-bun-cache.js';
 import { POD_JOB_TTL_AFTER_FINISHED_SECONDS } from './pod-lease.js';
-import { podHostDirsCheckScript, podInstallSlotsVolume, prepareHostDirsOnce, type HostDirsPrepResult, podHostDirsScript } from './pod-install-slots.js';
+import { invalidateGateExternalVolumeSnapshotMemo, podHostDirsCheckScript, podInstallSlotsVolume, prepareGateExternalVolumeSnapshotsOnce, prepareHostDirsOnce, type HostDirsPrepResult, podHostDirsScript } from './pod-install-slots.js';
 import { type PodPoolMember, PodPoolScheduler, defaultRemoteRun, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, registryImageRef, type PoolKubectl } from './pod-pool.js';
 import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
 import { podProvenanceMetadata, type PodProvenance } from './pod-provenance.js';
 import { seedMirrorOnce, type MirrorSeedResult } from './pod-mirror-seed.js';
+import { GATE_VOLUME_REF_MOUNT_PATH, type GateExternalVolumeExpectations, type GateExternalVolumeKind, type GateExternalVolumeRef } from './pod-gate-volume-ref.js';
 import {
   POD_CHILD_REQUESTS,
   POD_JOB_DEADLINE_SECONDS,
@@ -42,6 +43,21 @@ export const POD_NETWORK_SKILLS = ['omni-crawl', 'omni-digest'] as const;
 export const POD_LITE_IMAGE = 'elanous-harness-lite:local';
 
 export const POD_LITE_MEMORY_LIMIT = '2Gi';
+
+export type GatePodExternalVolumeExpectations = GateExternalVolumeExpectations;
+
+/** Carries the applied Job identity through post-launch failures so gate ledgers can count and inspect the attempt. */
+export class PodCommandJobFailure extends Error {
+  constructor(message: string, readonly job: string, readonly artifactsDir: string, readonly context: string | null,
+    readonly launchState: 'preflight-failed' | 'apply-attempted' | 'applied', readonly externalVolumeSnapshotMs?: number) {
+    super(message);
+    this.name = 'PodCommandJobFailure';
+  }
+}
+
+export function podCommandJobFailureInfo(error: unknown): Pick<PodCommandJobFailure, 'job' | 'artifactsDir' | 'context' | 'launchState' | 'externalVolumeSnapshotMs'> | null {
+  return error instanceof PodCommandJobFailure ? error : null;
+}
 
 /** W5 (10-15 #27801): where a memory-backed TMPDIR is mounted for release gate shards — the overlayfs `/tmp` made SQLite
  *  tests take 0.4~5s per turn (once 124s). tmpfs pages count against the container memory limit, so the caller's cap
@@ -501,6 +517,9 @@ export interface PodCommandJobInput {
   clone?: boolean;
   hostMirror?: string;
   bunCache?: string;
+  /** Release-gate only: sealed host directories mounted read-only and verified before the command runs. */
+  externalVolumeRefs?: readonly GateExternalVolumeRef[];
+  externalVolumeExpectations?: GatePodExternalVolumeExpectations;
   /** GATE-INSTALL-CACHE — hostPath of the node-wide install tokens (release gate shards only · `pod-install-slots.ts`). */
   installSlots?: string;
   /** 컨테이너 메모리 한도(기본 16Gi) — 게이트가 파일 하나 격리 Job 에 올린다. */
@@ -514,8 +533,85 @@ export interface PodCommandJobInput {
   warmFiles?: readonly string[];
   deadlineSeconds: number;
   runId?: string;
+  /** Gate image-pin metadata overrides a baked image ENV; null deliberately clears stale identity and disables reuse. */
+  gateBaseImageDigest?: string | null;
   /** GATE-WARM-BOOT-NO-INIT fallback: the node-side hand-over did not run, so a root init container hands the hostPath dirs to uid 1000. */
   hostDirsInit?: boolean;
+}
+
+export type GatePodExternalVolumeKind = GateExternalVolumeKind;
+export type GatePodExternalVolumeRef = GateExternalVolumeRef;
+
+function gatePodExternalVolumeRefs(o: Pick<PodCommandJobInput, 'externalVolumeRefs' | 'externalVolumeExpectations' | 'provenanceGate' | 'clone' | 'source' | 'hostMirror' | 'bunCache'>): GatePodExternalVolumeRef[] {
+  const refs = [...(o.externalVolumeRefs ?? [])];
+  if (!refs.length) return refs;
+  if (!o.provenanceGate || o.clone !== true || o.source?.kind !== 'commit') {
+    throw new Error('external volume refs require a release gate commit Job');
+  }
+  const pin = o.externalVolumeExpectations;
+  if (!pin || !/^sha256:[0-9a-f]{64}$/.test(pin.imageDigest) || !/^[0-9a-f]{64}$/.test(pin.lockSha256)
+    || !/^[0-9a-f]{40}$/.test(pin.sourceCommit) || pin.sourceCommit !== o.source.sha) {
+    throw new Error('external volume refs require complete cut identity expectations');
+  }
+  const seen = new Set<string>();
+  for (const ref of refs) {
+    if (!ref || !['git-mirror', 'node_modules', 'bun-cache'].includes(ref.kind)) throw new Error('external volume ref kind is invalid');
+    if (seen.has(ref.kind)) throw new Error(`external volume ref kind is duplicated: ${ref.kind}`);
+    seen.add(ref.kind);
+    if (!isAbsolute(ref.hostPath) || resolve(ref.hostPath) !== ref.hostPath) throw new Error(`external volume ref path is not canonical: ${ref.kind}`);
+    if (!/^[0-9a-f]{64}$/.test(ref.contentSha256)) throw new Error(`external volume ref trusted content digest is invalid: ${ref.kind}`);
+    if (!/^[0-9a-f]{64}$/.test(ref.identitySha256)) throw new Error(`external volume ref trusted identity digest is invalid: ${ref.kind}`);
+  }
+  const gitMirror = refs.find((ref) => ref.kind === 'git-mirror');
+  if (gitMirror && o.hostMirror !== gitMirror.hostPath) throw new Error('external volume ref git-mirror must match the gate host mirror');
+  const bunCache = refs.find((ref) => ref.kind === 'bun-cache');
+  if (bunCache && !refs.some((ref) => ref.kind === 'node_modules')) throw new Error('external volume ref bun-cache requires node_modules ref');
+  if (bunCache && o.bunCache && o.bunCache !== bunCache.hostPath) throw new Error('external volume ref bun-cache conflicts with writable bun cache');
+  return refs;
+}
+
+export function gateExternalVolumeRefPreflightCommand(refs: readonly GatePodExternalVolumeRef[],
+  expectations: GatePodExternalVolumeExpectations | undefined): string {
+  const payload = Buffer.from(JSON.stringify({ refs, expectations: expectations ?? null }), 'utf8').toString('base64');
+  const script = [
+    `const input = JSON.parse(Buffer.from('${payload}', 'base64').toString('utf8'));`,
+    "const reject = (kind, reason) => { console.error(`ELANOUS_GATE_VOLUME_REF_REJECTED ${kind} ${reason}`); process.exit(5); };",
+    "let verifier; try { verifier = await import('./src/task-orchestrator/surfaces/pod-gate-volume-ref.ts'); } catch { for (const ref of input.refs) console.error(`ELANOUS_GATE_VOLUME_REF_REJECTED ${ref.kind} verifier-unavailable`); process.exit(5); }",
+    "const pin = input.expectations; if (!pin || !/^sha256:[0-9a-f]{64}$/.test(pin.imageDigest) || !/^[0-9a-f]{64}$/.test(pin.lockSha256) || !/^[0-9a-f]{40}$/.test(pin.sourceCommit)) for (const ref of input.refs) reject(ref.kind, 'cut-expectation-incomplete');",
+    "let sourceCommit; try { sourceCommit = Bun.spawnSync(['git', 'rev-parse', 'HEAD'], { stdout: 'pipe', stderr: 'ignore' }).stdout.toString().trim(); } catch { sourceCommit = ''; }",
+    "let lockSha256 = ''; try { const fs = await import('node:fs'); const crypto = await import('node:crypto'); const lockPath = fs.existsSync('bun.lock') ? 'bun.lock' : 'bun.lockb'; lockSha256 = crypto.createHash('sha256').update(fs.readFileSync(lockPath)).digest('hex'); } catch { lockSha256 = ''; }",
+    "if (sourceCommit !== pin.sourceCommit) for (const ref of input.refs) reject(ref.kind, 'cut-source-commit-mismatch');",
+    "if (!lockSha256 || lockSha256 !== pin.lockSha256) for (const ref of input.refs.filter((item) => item.kind !== 'git-mirror')) reject(ref.kind, 'cut-lock-hash-mismatch');",
+    "let runtimeIdentity; try { runtimeIdentity = verifier.currentGateVolumeRuntimeIdentity(pin.imageDigest); } catch (error) { for (const ref of input.refs.filter((item) => item.kind !== 'git-mirror')) reject(ref.kind, error?.message ?? 'runtime-identity-unmeasured'); }",
+    `const mountPath = ${JSON.stringify(GATE_VOLUME_REF_MOUNT_PATH)};`,
+    'for (const ref of input.refs) {',
+    '  const started = Date.now();',
+    "  const comparison = ref.kind === 'git-mirror' ? { kind: ref.kind, sourceCommit: pin.sourceCommit, contentSha256: ref.contentSha256, identitySha256: ref.identitySha256 } : { kind: ref.kind, runtimeIdentity, lockSha256: pin.lockSha256, contentSha256: ref.contentSha256, identitySha256: ref.identitySha256 };",
+    '  const result = verifier.verifyGateExternalVolumeRef(mountPath[ref.kind], comparison);',
+    "  if (!result.ok) reject(ref.kind, result.reason);",
+    "  console.log(`ELANOUS_GATE_VOLUME_REF_READY ${ref.kind} ${Date.now() - started}`);",
+    '}',
+  ].join('\n');
+  return gateVolumeRefPreflightShell(script);
+}
+
+/** Git mirror identity is checked before podSourceScript; a bad sealed mirror may never fall back to GitHub. */
+export function gateGitMirrorPreflightCommand(refs: readonly GatePodExternalVolumeRef[],
+  expectations: GatePodExternalVolumeExpectations | undefined, mountedPath: string = GATE_VOLUME_REF_MOUNT_PATH['git-mirror']): string {
+  const mirrors = refs.filter((ref) => ref.kind === 'git-mirror');
+  if (!mirrors.length) return '';
+  const payload = Buffer.from(JSON.stringify({ refs: mirrors, expectations: expectations ?? null }), 'utf8').toString('base64');
+  const mirrorMount = JSON.stringify(mountedPath);
+  const script = [
+    `const input = JSON.parse(Buffer.from('${payload}', 'base64').toString('utf8'));`,
+    "const reject = (reason) => { console.error(`ELANOUS_GATE_VOLUME_REF_REJECTED git-mirror ${reason}`); process.exit(5); };",
+    "const pin = input.expectations; if (!pin || !/^[0-9a-f]{40}$/.test(pin.sourceCommit) || !/^sha256:[0-9a-f]{64}$/.test(pin.imageDigest) || !/^[0-9a-f]{64}$/.test(pin.lockSha256)) reject('cut-expectation-incomplete');",
+    "const fs = await import('node:fs'); const started = Date.now();",
+    "const path = await import('node:path'); const crypto = await import('node:crypto'); const add = (h, v) => { const b = Buffer.isBuffer(v) ? v : Buffer.from(String(v)); const n = Buffer.alloc(8); n.writeBigUInt64BE(BigInt(b.length)); h.update(n); h.update(b); }; const hashFileInto = (h, full) => { const fd=fs.openSync(full,'r'); const buf=Buffer.allocUnsafe(1024*1024); try { let n; while ((n=fs.readSync(fd,buf,0,buf.length,null))>0) h.update(buf.subarray(0,n)); } finally { fs.closeSync(fd); } }; const treeHash = (root) => { const real = fs.realpathSync(root); const names = []; const walk = (dir) => { for (const name of fs.readdirSync(dir)) { const full = path.join(dir, name); if (full === path.join(real, '.elanous-volume-ref.json')) continue; const rel = path.relative(real, full).split(path.sep).join('/'); const st = fs.lstatSync(full); names.push(rel); if (st.isDirectory()) walk(full); } }; walk(real); names.sort((a,b) => Buffer.compare(Buffer.from(a), Buffer.from(b))); const h=crypto.createHash('sha256'); for (const rel of names) { const full=path.join(real,...rel.split('/')); const st=fs.lstatSync(full); add(h,rel); add(h,String(st.mode & 0o555)); if (st.isDirectory()) add(h,'directory'); else if (st.isFile()) { add(h,'file'); add(h,String(st.size)); hashFileInto(h,full); } else if (st.isSymbolicLink()) { const target=fs.readlinkSync(full); if (path.isAbsolute(target)) throw new Error('volume-symlink-escapes-root:'+rel); const resolved=fs.realpathSync(full); const relativeTarget=path.relative(real,resolved); if (relativeTarget==='..'||relativeTarget.startsWith('..'+path.sep)||path.isAbsolute(relativeTarget)) throw new Error('volume-symlink-escapes-root:'+rel); add(h,'symlink'); add(h,target); } else throw new Error('volume-special-file:'+rel); } return h.digest('hex'); };",
+    `for (const ref of input.refs) { try { const root = ${mirrorMount}; if (!fs.lstatSync(root).isDirectory()) reject('mount-not-directory'); if (fs.existsSync(root + '/objects/info/alternates')) reject('git-mirror-external-alternates-forbidden'); const markerPath = root + '/.elanous-volume-ref.json'; if (!fs.lstatSync(markerPath).isFile()) reject('identity-file-not-regular-file'); const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')); if (marker.schemaVersion !== 1 || marker.kind !== 'git-mirror' || marker.runtimeIdentity !== null || marker.lockSha256 !== null || marker.sourceCommit !== pin.sourceCommit || marker.contentSha256 !== ref.contentSha256) reject('identity-mismatch'); const canonical = { schemaVersion: marker.schemaVersion, kind: marker.kind, runtimeIdentity: marker.runtimeIdentity, lockSha256: marker.lockSha256, sourceCommit: marker.sourceCommit, contentSha256: marker.contentSha256 }; if (crypto.createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex') !== ref.identitySha256) reject('trusted-identity-hash-mismatch'); if (treeHash(root) !== ref.contentSha256) reject('trusted-content-hash-mismatch'); const check = Bun.spawnSync(['git', '-c', 'safe.directory=' + root, '--git-dir', root, 'cat-file', '-e', pin.sourceCommit + '^{commit}'], { stdout: 'ignore', stderr: 'ignore' }); if (check.exitCode !== 0) reject('source-commit-missing'); } catch (error) { reject(error?.message ?? 'identity-unreadable'); } }`,
+    "console.log(`ELANOUS_GATE_VOLUME_REF_READY git-mirror ${Date.now() - started}`);",
+  ].join('\n');
+  return gateVolumeRefPreflightShell(script);
 }
 
 function warmSourceName(name: string, launch: string): string {
@@ -524,6 +620,10 @@ function warmSourceName(name: string, launch: string): string {
 
 function bashSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function gateVolumeRefPreflightShell(script: string): string {
+  return `mkdir -p "$HOME/outbox"; { bun -e ${bashSingleQuote(script)} 2>&1 | tee -a "$HOME/outbox/external-volume-ref.log"; pipeline=(\${PIPESTATUS[@]}); rc=\${pipeline[0]}; log_rc=\${pipeline[1]}; [ "$log_rc" -eq 0 ] || exit 5; [ "$rc" -eq 0 ] || exit "$rc"; }`;
 }
 
 function assertGateProvenanceException(gate: boolean | undefined, provenance: Partial<PodProvenance> | undefined,
@@ -540,13 +640,16 @@ function assertGateProvenanceException(gate: boolean | undefined, provenance: Pa
 /** 명령 Job 매니페스트. `skills`·`llm` 을 안 주면 Secret 키를 하나도 참조하지 않는다. */
 export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unknown> {
   assertGateProvenanceException(o.provenanceGate, o.provenance, o.clone, o.source);
+  const externalVolumeRefs = gatePodExternalVolumeRefs(o);
+  const externalNonMirrorRefs = externalVolumeRefs.filter((ref) => ref.kind !== 'git-mirror');
+  const externalBunCache = externalVolumeRefs.find((ref) => ref.kind === 'bun-cache');
   const provenance = podProvenanceMetadata(o.provenance, o.provenanceGate);
   const skillNames = [...new Set(o.skills.map((s) => s.trim()).filter(Boolean))];
   for (const name of skillNames) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(name)) throw new Error(`pod command skill name rejected: ${name}`);
   }
   const grok = o.llm === 'grok';
-  const bunCache = o.bunCache ? podBunCacheVolume(o.bunCache) : undefined;
+  const bunCache = !externalBunCache && o.bunCache ? podBunCacheVolume(o.bunCache) : undefined;
   const installSlots = o.installSlots ? podInstallSlotsVolume(o.installSlots) : undefined;
   // hostPath directories the uid-1000 child writes. DirectoryOrCreate makes them root 0755, so runPodCommand hands them to
   // uid 1000 once per node (prepareHostDirsOnce); the child only reports a directory it still cannot write.
@@ -564,17 +667,27 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
   const script = [
     isolationGateLines(),
     'set -u',
+    ...(externalVolumeRefs.some((ref) => ref.kind === 'git-mirror') ? ['unset GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_OBJECT_DIRECTORY GIT_COMMON_DIR', 'export GIT_NO_LAZY_FETCH=1'] : []),
     ...credLines,
     'curl -s -m 3 -o /dev/null http://host.orb.internal:31415/health && { echo "[pod] ISOLATION FAIL"; exit 3; }',
     ...(o.clone
-      ? ['export GH_TOKEN="$(cat /creds/gh-token)" && gh auth setup-git', podSourceScript(o.source ?? { kind: 'default' }, o.repoUrl)]
+      ? [
+          ...(externalVolumeRefs.some((ref) => ref.kind === 'git-mirror') ? [gateGitMirrorPreflightCommand(externalVolumeRefs, o.externalVolumeExpectations)] : []),
+          'export GH_TOKEN="$(cat /creds/gh-token)" && gh auth setup-git',
+          podSourceScript(o.source ?? { kind: 'default' }, o.repoUrl, '/host-mirror', { requireMirror: externalVolumeRefs.some((ref) => ref.kind === 'git-mirror') }),
+        ]
       : ['mkdir -p ~/work && cd ~/work']),
+    ...(externalVolumeRefs.some((ref) => ref.kind === 'node_modules') ? ['export ELANOUS_GATE_EXTERNAL_NODE_MODULES=1'] : []),
     ...(o.warmFiles?.length ? [
       `if [ "$(git rev-parse HEAD)" != ${bashSingleQuote(o.source?.kind === 'commit' ? o.source.sha : '')} ]; then echo '[warm-source] commit mismatch'; exit 5; fi`,
       ...o.warmFiles.map((path, i) => `install -m 644 -D /warm-source/file-${i} ${bashSingleQuote(`./${path}`)} || exit 5\nprintf 'ELANOUS_WARM_SOURCE %s %s %s\\n' ${bashSingleQuote(path)} "$(sha256sum ${bashSingleQuote(`./${path}`)} | cut -d ' ' -f1)" "$(git rev-parse HEAD)"`),
     ] : []),
+    // Verify against the final checkout, after a warm producer has overlaid its commit-pinned files.
+    ...(externalNonMirrorRefs.length
+      ? [gateExternalVolumeRefPreflightCommand(externalNonMirrorRefs, o.externalVolumeExpectations)]
+      : []),
     ...(hostDirMounts.length ? [podHostDirsCheckScript(hostDirMounts)] : []),
-    ...(bunCache ? [bunCache.shellPrefix] : []),
+    ...(externalBunCache ? ['export BUN_INSTALL_CACHE_DIR=/bun-cache'] : bunCache ? [bunCache.shellPrefix] : []),
     `set -- ${quotedArgs}`,
     '"$@"',
     'rc=$?',
@@ -611,23 +724,33 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
             command: ['bash', '-c'], args: [script],
             env: [
               ...(o.runId ? [{ name: 'ELANOUS_RUN_ID', value: o.runId }] : []),
+              ...(o.gateBaseImageDigest !== undefined ? [{ name: 'ELANOUS_GATE_BASE_IMAGE_DIGEST', value: o.gateBaseImageDigest ?? '' }] : []),
               { name: 'ELANOUS_SUBSTRATE', value: 'pod' },
               { name: 'ELANOUS_POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
               ...(provenance?.env ?? []),
               ...(tmpfs ? [{ name: 'TMPDIR', value: POD_TMPFS_MOUNT_PATH }] : []),
             ],
-            ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs || o.warmFiles?.length ? { volumeMounts: [
+            ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs || o.warmFiles?.length || externalVolumeRefs.length ? { volumeMounts: [
               ...(o.warmFiles?.length ? [{ name: 'warm-source', mountPath: '/warm-source', readOnly: true }] : []),
               ...(secretKeys ? [{ name: 'creds', mountPath: '/creds', readOnly: true }] : []),
               ...(o.hostMirror ? [{ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true }] : []),
+              ...externalVolumeRefs.filter((ref) => ref.kind !== 'git-mirror').map((ref) => ({
+                name: `gate-${ref.kind.replaceAll('_', '-')}`,
+                mountPath: GATE_VOLUME_REF_MOUNT_PATH[ref.kind],
+                readOnly: true,
+              })),
               ...hostDirMounts,
               ...tmpfsMounts,
             ] } : {}),
           }],
-          ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs || o.warmFiles?.length ? { volumes: [
+          ...(secretKeys || o.hostMirror || hostDirMounts.length || tmpfs || o.warmFiles?.length || externalVolumeRefs.length ? { volumes: [
             ...(o.warmFiles?.length ? [{ name: 'warm-source', configMap: { name: warmSourceName(o.name, o.launch ?? 'source') } }] : []),
             ...(secretKeys ? [{ name: 'creds', secret: { secretName: `${o.name}-creds`, defaultMode: 0o400 } }] : []),
             ...(o.hostMirror ? [{ name: 'host-mirror', hostPath: { path: o.hostMirror, type: 'Directory' } }] : []),
+            ...externalVolumeRefs.filter((ref) => ref.kind !== 'git-mirror').map((ref) => ({
+              name: `gate-${ref.kind.replaceAll('_', '-')}`,
+              hostPath: { path: ref.hostPath, type: 'Directory' },
+            })),
             ...(bunCache ? [bunCache.volume] : []),
             ...(installSlots ? [installSlots.volume] : []),
             ...(tmpfs ? [{ name: 'tmp-mem', emptyDir: { medium: 'Memory', sizeLimit: tmpfs } }] : []),
@@ -685,6 +808,9 @@ export interface PodCommandResult {
   exitCode: number;
   artifactsDir: string;
   job: string;
+  /** Kubernetes context that received this Job; gate measurements attribute work to this node pool member. */
+  context?: string;
+  externalVolumeSnapshotMs?: number;
   /** 이 런이 실제로 쓴 이미지(레지스트리 판 태그 또는 로컬 이름). */
   image?: string;
   /** collectPodArtifacts 가 회수한 파일. 로그 조회 실패면 files=null · error=사유. runPodCommand 는 항상 채운다. */
@@ -704,6 +830,10 @@ export interface RunPodCommandOptions {
   clone?: boolean;
   hostMirror?: string;
   bunCache?: string;
+  /** Release-gate external volume references; never used by general command Jobs. */
+  externalVolumeRefs?: readonly GateExternalVolumeRef[];
+  /** Cut-bound identity expectations supplied by the release gate; marker contents alone are never trusted. */
+  externalVolumeExpectations?: GatePodExternalVolumeExpectations;
   /** GATE-INSTALL-CACHE — hostPath of the node-wide install tokens (absolute). */
   installSlots?: string;
   /** 컨테이너 메모리 한도(기본 16Gi · lite 면 2Gi). */
@@ -728,6 +858,8 @@ export interface RunPodCommandOptions {
   image?: string;
   repoUrl?: string;
   runId?: string;
+  /** Exact dependency-layer digest read from the pinned gate image label; null disables runtime-compatible reuse. */
+  gateBaseImageDigest?: string | null;
   name?: string;
   pollMs?: number;
   /**
@@ -751,6 +883,8 @@ export interface RunPodCommandOptions {
   mirrorSeedCwd?: string;
   /** GATE-WARM-BOOT-NO-INIT — hands the hostPath dirs to uid 1000 on the member's nodes (test seam · default {@link prepareHostDirsOnce}). */
   prepareHostDirs?: (o: { member: PodPoolMember; hostPaths: readonly string[] }) => Promise<HostDirsPrepResult | undefined>;
+  /** Creates a content-addressed, root-owned snapshot in each selected k3d node before attaching external refs. */
+  prepareExternalVolumeSnapshots?: typeof prepareGateExternalVolumeSnapshotsOnce;
   /** POD-CPU-REQUEST-RIGHTSIZE-2-FU — SSH 도달 시험(test seam · 기본 `ssh <host> true`; 주입된 kubectl 이면 기본 없음). */
   sshProbe?: (host: string) => { status: number | null; stdout: string; stderr: string };
   checkPool?: typeof checkPodPool;
@@ -871,19 +1005,48 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   // deleted the other's credentials. The name now has a random tail, and cleanup selects this launch's label.
   const launch = randomBytes(6).toString('hex');
   const name = options.name ?? podJobName(`cmd-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`);
+  const artifactRoot = options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`;
+  const artifactsDir = `${artifactRoot}/${name}`;
+  const externalPreflightFailure = (error: unknown): never => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (options.externalVolumeRefs?.length) throw new PodCommandJobFailure(message, name, artifactsDir, null, 'preflight-failed', 0);
+    throw error instanceof Error ? error : new Error(message);
+  };
   const own = `elanous.job=${name},elanous.launch=${launch}`;
   const env = options.env ?? process.env;
-  const hostMirror = (options.hostMirror ?? env.ELANOUS_POD_HOST_MIRROR
+  const externalVolumeRefs = [...(options.externalVolumeRefs ?? [])];
+  const externalGitMirror = externalVolumeRefs.find((ref) => ref.kind === 'git-mirror');
+  const configuredHostMirror = (options.hostMirror ?? env.ELANOUS_POD_HOST_MIRROR
     ?? (options.configHostMirror ?? (() => getUserConfig().pod?.hostMirror))())?.trim() || undefined;
-  if (hostMirror && !isAbsolute(hostMirror)) throw new Error('pod.hostMirror must be an absolute directory path');
-  const bunCache = options.bunCache?.trim() || undefined;
-  if (bunCache && !isAbsolute(bunCache)) throw new Error('pod.bunCache must be an absolute directory path');
+  let hostMirror = configuredHostMirror ?? externalGitMirror?.hostPath;
+  if (hostMirror && !isAbsolute(hostMirror)) externalPreflightFailure(new Error('pod.hostMirror must be an absolute directory path'));
+  if (externalGitMirror && hostMirror !== externalGitMirror.hostPath) externalPreflightFailure(new Error('external volume ref git-mirror must match the gate host mirror'));
+  const externalBunCache = externalVolumeRefs.find((ref) => ref.kind === 'bun-cache');
+  const configuredBunCache = options.bunCache?.trim() || undefined;
+  if (externalBunCache && configuredBunCache && configuredBunCache !== externalBunCache.hostPath) {
+    externalPreflightFailure(new Error('external volume ref bun-cache conflicts with writable bun cache'));
+  }
+  let validatedExternalVolumeRefs: GatePodExternalVolumeRef[];
+  try {
+    validatedExternalVolumeRefs = gatePodExternalVolumeRefs({ externalVolumeRefs,
+      externalVolumeExpectations: options.externalVolumeExpectations,
+      provenanceGate: options.provenanceGate, clone: options.clone, source: options.source, hostMirror, bunCache: configuredBunCache });
+  } catch (error) {
+    if (externalVolumeRefs.length) externalPreflightFailure(error);
+    throw error;
+  }
+  const bunCache = externalBunCache ? undefined : configuredBunCache;
+  if (bunCache && !isAbsolute(bunCache)) externalPreflightFailure(new Error('pod.bunCache must be an absolute directory path'));
   const installSlots = options.installSlots?.trim() || undefined;
-  if (installSlots && !isAbsolute(installSlots)) throw new Error('pod installSlots must be an absolute directory path');
+  if (installSlots && !isAbsolute(installSlots)) externalPreflightFailure(new Error('pod installSlots must be an absolute directory path'));
   // Fail before any Secret/Job is applied — a bad quantity must not reach the cluster.
-  if (options.cpu) resolvePodCpu(options.cpu);
+  if (options.cpu) {
+    try { resolvePodCpu(options.cpu); }
+    catch (error) { externalPreflightFailure(error); }
+  }
 
   let member: PodPoolMember | null = null;
+  let externalVolumeSnapshotMs: number | undefined;
   let pool = options.poolScheduler;
   if (!pool) {
     const spec = resolvePodPoolSpec(options.pool, env, () => options.kubectl ? undefined : getUserConfig().pod?.pool);
@@ -926,9 +1089,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const cleanupWarmSource = () => {
     if (options.warmProducer) kubectlRaw(['-n', namespace, 'delete', 'configmap', '-l', own, '--ignore-not-found']);
   };
-  const artifactRoot = options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`;
-  const artifactsDir = `${artifactRoot}/${name}`;
   let jobApplied = false;
+  let jobApplyAttempted = false;
   /** POD-CPU-REQUEST-RIGHTSIZE-2-FU — 측정값이 정한 요청량(yellow 면 undefined = 기본값 그대로). */
   let rightsizeCpu: PodCpu | undefined;
   try {
@@ -1013,13 +1175,36 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
         if (synced?.imageRef) member = { ...member, imageRef: synced.imageRef };
       }
     }
-    const imageRef = member?.imageRef;
+    let imageRef = member?.imageRef;
+    if (validatedExternalVolumeRefs.length) {
+      const digest = options.externalVolumeExpectations?.imageDigest;
+      if (!digest || !/^sha256:[0-9a-f]{64}$/u.test(digest)) throw new Error('pod command: external volume image digest is invalid');
+      if (!imageRef) throw new Error('pod command: external volume refs require an immutable registry image reference');
+      const imageName = imageRef.split('@')[0]!;
+      const slash = imageName.lastIndexOf('/');
+      const colon = imageName.lastIndexOf(':');
+      imageRef = `${colon > slash ? imageName.slice(0, colon) : imageName}@${digest}`;
+    }
     if (!imageRef) log('pod.command-job', 'image-fallback-local', { reason: !member ? 'no-pool-member' : !imageCommit ? 'image-commit-unavailable' : 'registry-tag-unavailable' });
+    if (validatedExternalVolumeRefs.length) {
+      if (!member) throw new Error('pod command: external volume refs require a selected gate pool member');
+      const prepareSnapshots = options.prepareExternalVolumeSnapshots ?? (options.kubectl ? undefined : prepareGateExternalVolumeSnapshotsOnce);
+      if (!prepareSnapshots) throw new Error('pod command: external volume snapshot preparation unavailable');
+      const snapshot = await awaitPodCommandAbort(prepareSnapshots({ member, refs: validatedExternalVolumeRefs }), options.signal);
+      if (!snapshot) throw new Error('pod command: external volume immutable snapshot unmeasured');
+      externalVolumeSnapshotMs = snapshot.ms;
+      if (snapshot.ok === false) throw new Error(`pod command: external volume immutable snapshot failed: ${snapshot.detail}`);
+      validatedExternalVolumeRefs = snapshot.refs;
+      const snapshotMirror = validatedExternalVolumeRefs.find((ref) => ref.kind === 'git-mirror');
+      if (snapshotMirror) hostMirror = snapshotMirror.hostPath;
+      log('pod.command-job', 'external-volume-snapshot', { host: member.sshHost ?? 'local', ok: true,
+        ms: snapshot.ms, refs: validatedExternalVolumeRefs.map(({ kind, identitySha256 }) => ({ kind, identitySha256 })) });
+    }
     // GATE-WARM-BOOT (10-15): a commit-pinned clone on a pool host — put that commit into the host's mirror first (once per
     // host·commit in this process), so the Pod's podSourceScript finds it (`cat-file -e`) instead of fetching from GitHub.
     // Best effort: a failed seed only logs; the Pod keeps the old path. Never with an injected kubectl (tests) unless seeded.
     const seedMirror = options.seedMirror ?? (options.kubectl ? undefined : seedMirrorOnce);
-    if (seedMirror && options.clone && options.source?.kind === 'commit' && hostMirror && member?.sshHost) {
+    if (!externalGitMirror && seedMirror && options.clone && options.source?.kind === 'commit' && hostMirror && member?.sshHost) {
       // Worst case added to a cold start: the push limit (GATE_MIRROR_SEED_LIMIT_MS), once per host·commit.
       const seed = await awaitPodCommandAbort(seedMirror({ host: member.sshHost, commit: options.source.sha, cwd: options.mirrorSeedCwd ?? process.cwd() })
         .catch((error: unknown) => ({ host: member!.sshHost!, ok: false, ms: 0, detail: String(error).slice(0, 300) })), options.signal);
@@ -1084,17 +1269,21 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       ...(imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(options.returnLogs ? { returnLogs: true } : {}), ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
       ...(options.source ? { source: options.source } : {}), ...(options.warmProducer ? { warmFiles: options.warmProducer.files } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(installSlots ? { installSlots } : {}), ...(memoryLimit ? { memoryLimit } : {}), ...(effectiveCpu ? { cpu: effectiveCpu } : {}), ...(options.tmpfsSizeLimit ? { tmpfsSizeLimit: options.tmpfsSizeLimit } : {}), deadlineSeconds,
+      ...(validatedExternalVolumeRefs.length ? { externalVolumeRefs: validatedExternalVolumeRefs } : {}),
+      ...(options.externalVolumeExpectations ? { externalVolumeExpectations: options.externalVolumeExpectations } : {}),
       ...(options.runId ? { runId: options.runId } : {}),
+      ...(options.gateBaseImageDigest !== undefined ? { gateBaseImageDigest: options.gateBaseImageDigest } : {}),
       ...(hostDirsInit ? { hostDirsInit: true } : {}),
     });
     kubectl(['-n', namespace, 'delete', 'job', '-l', own, '--ignore-not-found']);
     // A wall deadline can elapse inside the synchronous apply; cleanup by this launch's name then remains safe.
-    jobApplied = true;
+    jobApplyAttempted = true;
     const applied = kubectl(['apply', '-f', '-'], JSON.stringify(manifest));
     if (applied.status !== 0) {
       cleanupSecret();
       throw new Error(applied.stderr.trim() || 'pod command: Job 적용 실패');
     }
+    jobApplied = true;
     let state: 'complete' | 'failed' = 'failed';
     let unreadableSince: number | null = null;
     let markerRc: number | null = null;
@@ -1161,6 +1350,9 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     }
     const logsFailed = logsResult.status !== 0;
     const logs = logsFailed ? '' : splitPodResultMarker(logsResult.stdout, launch).logs;
+    if (member && validatedExternalVolumeRefs.length && logs.includes('ELANOUS_GATE_VOLUME_REF_REJECTED')) {
+      invalidateGateExternalVolumeSnapshotMemo({ member, refs: validatedExternalVolumeRefs });
+    }
     if (options.warmProducer) {
       if (logsFailed) throw new Error(`pod warm source: consumer logs unavailable: ${logsResult.stderr.trim() || logsResult.status}`);
       for (const path of options.warmProducer.files) {
@@ -1214,16 +1406,46 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       artifacts,
       ...(logsFailed ? { artifactError: `산출 회수 못 함: ${artifacts.error}` } : {}),
     });
-    return { exitCode, artifactsDir, job: name, image: imageRef ?? image, artifacts };
+    return { exitCode, artifactsDir, job: name, ...(context ? { context } : {}), image: imageRef ?? image, artifacts,
+      ...(externalVolumeSnapshotMs !== undefined ? { externalVolumeSnapshotMs } : {}) };
   } catch (err) {
-    if (jobApplied && options.signal) {
-      // Opt-in bounded callers remove their own failed/Pending Job, including status-unreadable exits.
+    const uncertainApply = jobApplyAttempted && !jobApplied;
+    const cleanupJob = uncertainApply || (jobApplied && options.signal !== undefined);
+    if (cleanupJob) {
+      // Preserve logs before removing this launch's Job; the caller can still collect
+      // volume readiness events from the artifact on apply uncertainty or cancellation.
+      try {
+        const pods = kubectlRaw(['-n', namespace, 'get', 'pods', '-l', own, '-o', 'json']);
+        const podNames: string[] = pods.status === 0 ? ((JSON.parse(pods.stdout) as { items?: Array<{ metadata?: { name?: string } }> }).items ?? [])
+          .map((pod) => pod.metadata?.name ?? '').filter((podName) => /^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$/.test(podName)) : [];
+        const recoveredLogs: string[] = [];
+        for (const podName of podNames) {
+          const recovered = kubectlRaw(['-n', namespace, 'logs', `pod/${podName}`, '--all-containers=true', '--prefix', '--tail=-1']);
+          if (recovered.status === 0 && recovered.stdout) recoveredLogs.push(recovered.stdout);
+        }
+        // If Pod listing is unavailable, retain the Kubernetes Job log fallback.
+        if (recoveredLogs.length === 0) {
+          const recovered = kubectlRaw(['-n', namespace, 'logs', `job/${name}`, '--all-containers=true', '--prefix', '--tail=-1']);
+          if (recovered.status === 0 && recovered.stdout) recoveredLogs.push(recovered.stdout);
+        }
+        if (recoveredLogs.length) {
+          mkdirSync(artifactsDir, { recursive: true });
+          writeFileSync(resolve(artifactsDir, 'child.log'), recoveredLogs.join('\n'));
+        }
+      } catch { /* log recovery is best effort; preserve the apply failure */ }
+    }
+    if (cleanupJob) {
+      // Remove only this launch's failed/Pending Job, including uncertain apply outcomes.
       // On an unreachable API this is best effort; the local lease is always released in finally.
-      try { kubectlRaw(['-n', namespace, 'delete', 'job', name, '--ignore-not-found', '--wait=false']); }
+      try { kubectlRaw(['-n', namespace, 'delete', 'job', '-l', own, '--ignore-not-found', '--wait=false']); }
       catch { /* preserve the cancellation reason */ }
     }
-    cleanupSecret();
-    cleanupWarmSource();
+    try { cleanupSecret(); } catch { /* preserve the launch or preflight failure */ }
+    try { cleanupWarmSource(); } catch { /* preserve the launch or preflight failure */ }
+    if (validatedExternalVolumeRefs.length) {
+      throw new PodCommandJobFailure(err instanceof Error ? err.message : String(err), name, artifactsDir, context || null,
+        jobApplied ? 'applied' : jobApplyAttempted ? 'apply-attempted' : 'preflight-failed', externalVolumeSnapshotMs);
+    }
     throw err;
   } finally {
     if (member && pool) pool.release(member);

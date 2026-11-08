@@ -1,9 +1,10 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S4 P5: ExitAutoMode LLM tool ──
 //
 // Symmetric counterpart to EnterAutoMode. Optionally writes an
 // executive summary via ResearchPlan before tearing down state.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   discoverObsidianVault,
   type ObsidianVault,

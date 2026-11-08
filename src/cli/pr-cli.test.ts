@@ -1,6 +1,71 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
-import { registerPrCommands } from './pr-cli.js';
+import { debug } from '../debug/log.js';
+import { authorizePrLandDirectMerge, registerPrCommands, runPrLand } from './pr-cli.js';
+
+test('PR-LAND-TRAIN-ONLY-GUARD: a seat direct merge is refused before any landing side effect', async () => {
+  const priorTrack = process.env.ELANOUS_TRACK;
+  const priorTrainRunner = process.env.ELANOUS_TRAIN_RUNNER;
+  const errors: string[] = [];
+  const calls: string[] = [];
+  try {
+    process.env.ELANOUS_TRACK = 'OPT';
+    delete process.env.ELANOUS_TRAIN_RUNNER;
+    const exit = await runPrLand({}, {
+      run: (command, args) => { calls.push(`${command} ${args.join(' ')}`); return { ok: true, out: '' }; },
+      currentBranch: () => 'main',
+      resolveBase: () => 'origin/main',
+      out: { log: () => {}, error: line => errors.push(line) },
+    });
+    expect(exit).toBe(1);
+    expect(errors).toContain('✗ train-only: OPT 호출자의 직접 병합은 OP 또는 열차 실행기만 허용됩니다. PR만 쌓으려면 --hold를 사용하십시오.');
+    expect(calls).toEqual([]);
+  } finally {
+    if (priorTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = priorTrack;
+    if (priorTrainRunner === undefined) delete process.env.ELANOUS_TRAIN_RUNNER; else process.env.ELANOUS_TRAIN_RUNNER = priorTrainRunner;
+  }
+});
+
+test('PR-LAND-TRAIN-ONLY-GUARD: hold is exempt and OP or train-runner bypasses the seat restriction', () => {
+  expect(authorizePrLandDirectMerge({ hold: true }, { ELANOUS_TRACK: 'OPT' })).toEqual({ allowed: true });
+  expect(authorizePrLandDirectMerge({}, { ELANOUS_TRACK: 'OP' })).toEqual({ allowed: true, auditActor: 'OP' });
+  expect(authorizePrLandDirectMerge({}, { ELANOUS_TRACK: 'OPT', ELANOUS_TRAIN_RUNNER: '1' }))
+    .toEqual({ allowed: true, auditActor: 'train-runner' });
+  expect(authorizePrLandDirectMerge({}, { ELANOUS_TRACK: 'OPT' })).toEqual({ allowed: false, seat: 'OPT' });
+  expect(authorizePrLandDirectMerge({}, {})).toEqual({ allowed: true });
+});
+
+test('PR-LAND-TRAIN-ONLY-GUARD: OP and train-runner production paths each emit one audit event', async () => {
+  const priorTrack = process.env.ELANOUS_TRACK;
+  const priorTrainRunner = process.env.ELANOUS_TRAIN_RUNNER;
+  const calls: unknown[][] = [];
+  const logged = spyOn(debug, 'log').mockImplementation((...args) => { calls.push(args); });
+  try {
+    for (const identity of [
+      { seat: 'OP', marker: undefined, actor: 'OP' },
+      { seat: 'OPT', marker: '1', actor: 'train-runner' },
+    ]) {
+      calls.length = 0;
+      process.env.ELANOUS_TRACK = identity.seat;
+      if (identity.marker === undefined) delete process.env.ELANOUS_TRAIN_RUNNER;
+      else process.env.ELANOUS_TRAIN_RUNNER = identity.marker;
+      const commands: string[] = [];
+      const code = await runPrLand({}, {
+        currentBranch: () => 'main', resolveBase: () => 'origin/main',
+        run: (command, args) => { commands.push(`${command} ${args.join(' ')}`); return { ok: true, out: '' }; },
+        out: { log: () => {}, error: () => {} },
+      });
+      expect(code).toBe(1); // Reaches the harmless same-branch stop after passing authorization.
+      expect(commands.some(command => command.startsWith('gh '))).toBe(false);
+      expect(calls.filter(([category, event]) => category === 'pr.land' && event === 'train-only-bypass'))
+        .toEqual([['pr.land', 'train-only-bypass', { actor: identity.actor, seat: identity.seat, pr: null, hold: false }]]);
+    }
+  } finally {
+    logged.mockRestore();
+    if (priorTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = priorTrack;
+    if (priorTrainRunner === undefined) delete process.env.ELANOUS_TRAIN_RUNNER; else process.env.ELANOUS_TRAIN_RUNNER = priorTrainRunner;
+  }
+});
 
 function fixture(body: string | null = 'Supersedes: #7') {
   const calls: string[][] = [];

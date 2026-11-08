@@ -1,7 +1,7 @@
 // Fake executables on PATH for tests whose code under test spawns an external CLI
 // (grok · magick · tesseract · …) that a gate Pod does not have.
 //
-// The industry-standard shape is a «PATH shim»: a tiny shell script with the real
+// The industry-standard shape is a «PATH shim»: a tiny executable with the real
 // name, placed first on PATH. This module only makes that shape shared, so tests
 // stop hand-writing `writeFileSync + chmodSync` (MOCK-REVIEW R6 · MOCK-DEVICES-2 ⓑ).
 //
@@ -10,11 +10,12 @@
 // to such calls. Code that passes its own `env` must receive `fakeBins.env` (or a
 // PATH built from `fakeBins.path()`).
 //
-// ⛔ This is not a simulator of the real tool: a spec fixes process responses and records argv.
-// The one opt-in package-install fixture mode writes only declared files under an exact canonical
-// prefix; it does not emulate package resolution, scripts, or network behavior.
+// ⛔ This is not a simulator of the real tool: a spec only selects declared stdout ·
+// stderr · exit code · lifetime by argv prefix and optionally records allowlisted
+// environment values. Behaviour of the real tool stays with
+// tests that run where the tool exists.
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
 
@@ -26,9 +27,13 @@ export interface FakeBinSpec {
   /** Stay alive this long before exiting — for long-running daemons a test kills, or a fractional
    *  per-call latency (e.g. 0.2) for a test that measures fan-out. */
   readonly sleepSeconds?: number;
+  /** Select a fixed response by argv prefix. The first matching response wins; unmatched calls use the top-level defaults. */
+  readonly responses?: readonly FakeBinResponse[];
+  /** Environment variable names to record beside each invocation (unset values are recorded as null). */
+  readonly recordEnv?: readonly string[];
   /**
    * Fake only the calls whose argv starts with these words (e.g. `['worktree', 'add']`);
-   * every other call `exec`s `otherwise` with the same argv. Needs `otherwise`.
+   * every other call runs `otherwise` with the same argv. Needs `otherwise`.
    */
   readonly whenArgsStartWith?: readonly string[];
   /** Absolute path of the real executable that serves the calls `whenArgsStartWith` does not match. */
@@ -46,23 +51,28 @@ export interface FakeBinSpec {
    * (`utilLinuxScript()`); incompatible with the output-faking fields below.
    */
   readonly pty?: boolean;
-  /**
-   * Simulate package-manager outputs under one exact, caller-selected install prefix.
-   * The fake refuses a different prefix and writes only the declared relative files.
-   */
+  /** Simulate package-manager output under one exact prefix using only declared files. */
   readonly installArtifacts?: {
     readonly prefixEnv: string;
     readonly prefix: string;
     readonly argv: readonly string[];
     readonly files: readonly { readonly path: string; readonly contents: string; readonly mode?: number }[];
-    /** Deterministic race injection: helper signals after pinning prefix directories and waits before writing. */
     readonly testBarrier?: true;
   };
+}
+
+export interface FakeBinResponse {
+  readonly argsStartWith: readonly string[];
+  readonly stdout?: string;
+  readonly stderr?: string;
+  /** Exit code (default 0). */
+  readonly exitCode?: number;
 }
 
 export interface FakeBinCall {
   readonly name: string;
   readonly argv: readonly string[];
+  readonly env?: Readonly<Record<string, string | null>>;
 }
 
 export interface FakeBins {
@@ -84,11 +94,23 @@ export interface FakeBins {
 const NAME = /^[A-Za-z0-9._+-]+$/;
 const KILL_SIGNALS: ReadonlySet<string> = new Set(['KILL', 'TERM', 'INT', 'HUP', 'ABRT', 'SEGV']);
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
+let utilLinuxScriptCache: string | null | undefined;
+
+function fakeShimRuntime(): string {
+  const perl = findExecutable('perl');
+  if (!perl) throw new Error('fake-bin: Perl is required for lossless argv, environment, output, and delegation semantics');
+  return perl;
 }
 
-let utilLinuxScriptCache: string | null | undefined;
+function findExecutable(name: string): string | null {
+  if (typeof Bun !== 'undefined' && typeof Bun.which === 'function') return Bun.which(name);
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    try { accessSync(candidate, constants.X_OK); return candidate; } catch { /* continue on PATH */ }
+  }
+  return null;
+}
 
 /**
  * Absolute path of the util-linux `script` on PATH, or `null` when this host has none
@@ -112,52 +134,49 @@ export function utilLinuxScript(): string | null {
 }
 
 function script(name: string, spec: FakeBinSpec, dataDir: string, logPath: string): string {
-  const lines = ['#!/bin/sh'];
-  // One record per call: name and each argv entry NUL-terminated (one printf), then an ASCII record
-  // separator \x1e (a second printf). `calls()` drops the unterminated tail, so a reader never sees half a record.
-  // The record is staged in its own file and appended by one `cat` (one write), so concurrent calls never interleave.
-  // The fake PATH may itself contain mktemp, cat, or rm. Use the shell's default utility path
-  // for recorder and payload reads so a fake of one of those names cannot recursively call itself.
-  lines.push(`rec=$(command -p mktemp ${shellQuote(join(dataDir, 'rec.XXXXXX'))})`);
-  lines.push(`{ printf '%s\\0' ${shellQuote(name)} "$@"; printf '\\036'; } > "$rec"; command -p cat "$rec" >> ${shellQuote(logPath)}; command -p rm -f "$rec"`);
-  if (spec.installArtifacts !== undefined) {
-      lines.push(`${shellQuote(process.execPath)} ${shellQuote(join(dataDir, 'install-artifacts.mjs'))} ${shellQuote(join(dataDir, `${name}.install-artifacts.json`))} "$@"`);
-      lines.push('installer_status=$?');
-      lines.push('[ "$installer_status" -eq 0 ] || exit "$installer_status"');
-  }
-  if (spec.pty === true) {
-    // Recorded already: exec the real util-linux script so the caller gets a genuine TTY.
-    lines.push(`exec ${shellQuote(utilLinuxScript()!)} "$@"`);
-    return `${lines.join('\n')}\n`;
-  }
-  if (spec.whenArgsStartWith !== undefined && spec.otherwise !== undefined) {
-    const words = spec.whenArgsStartWith;
-    const tests = [`[ "$#" -ge ${words.length} ]`, ...words.map((word, index) => `[ "$${index + 1}" = ${shellQuote(word)} ]`)];
-    lines.push(`if ${tests.join(' && ')}; then :; else exec ${shellQuote(spec.otherwise)} "$@"; fi`);
-  }
-  if (spec.stdout !== undefined) {
-    const file = join(dataDir, `${name}.stdout`);
-    writeFileSync(file, spec.stdout);
-    lines.push(`command -p cat ${shellQuote(file)}`);
-  }
-  if (spec.stderr !== undefined) {
-    const file = join(dataDir, `${name}.stderr`);
-    writeFileSync(file, spec.stderr);
-    lines.push(`command -p cat ${shellQuote(file)} >&2`);
-  }
-  const exitCode = spec.exitCode ?? 0;
-  if (spec.sleepSeconds !== undefined && spec.sleepSeconds > 0) {
-    // Whole seconds stay as they were; a fraction keeps millisecond precision (`sleep 0.2` — BSD · GNU · busybox).
-    const seconds = Number.isInteger(spec.sleepSeconds) ? spec.sleepSeconds : Math.ceil(spec.sleepSeconds * 1000) / 1000;
-    // exit 0: `exec` so killing the fake kills the sleep itself. Any other code needs the shell to
-    // outlive the sleep; a fake killed mid-sleep then leaves `sleep` until `sleepSeconds` ends.
-    // killSignal must outlive the sleep too, or `exec` would replace the shell before the kill line.
-    if (exitCode === 0 && spec.killSignal === undefined) lines.push(`exec sleep ${seconds}`);
-    else lines.push(`sleep ${seconds}`);
-  }
-  if (spec.killSignal !== undefined) lines.push(`kill -s ${spec.killSignal} $$`);
-  lines.push(`exit ${exitCode}`);
-  return `${lines.join('\n')}\n`;
+  const config = JSON.stringify({ name, spec, logPath, dataDir, ptyPath: spec.pty ? utilLinuxScript() : null, nodePath: process.execPath });
+  return `#!/usr/bin/env -S -u PERL5OPT ${fakeShimRuntime()}\n` + [
+    'use strict;',
+    'use JSON::PP qw(decode_json);',
+    'use Encode qw(decode FB_CROAK);',
+    'use Fcntl qw(O_WRONLY O_APPEND);',
+    'use IO::Handle;',
+    'my $config = decode_json(<<\'FAKE_BIN_CONFIG\');',
+    config,
+    'FAKE_BIN_CONFIG',
+    'my @argv = map { decode("UTF-8", $_, FB_CROAK) } @ARGV;',
+    'my %env = map { $_ => (exists $ENV{$_} ? decode("UTF-8", $ENV{$_}, FB_CROAK) : undef) } @{$config->{spec}{recordEnv} // []};',
+    'my %call = (name => $config->{name}, argv => \\@argv);',
+    '$call{env} = \\%env if keys %env;',
+    'my $record = JSON::PP->new->utf8->encode(\\%call) . "\\n";',
+    'sysopen(my $log, $config->{logPath}, O_WRONLY | O_APPEND) or die "fake-bin: open call log: $!\\n";',
+    'my $written = syswrite($log, $record);',
+    'close($log);',
+    'die "fake-bin: short append write\\n" unless defined($written) && $written == length($record);',
+    'my $matches = sub { my ($prefix) = @_; return 0 unless defined $prefix; for my $i (0 .. $#$prefix) { return 0 if !defined($argv[$i]) || $argv[$i] ne $prefix->[$i]; } return 1; };',
+    'my $delegate = sub { my ($path) = @_; exec { $path } $path, @argv; die "fake-bin: exec $path: $!\\n"; };',
+    'my $spec = $config->{spec};',
+    'if (my $install = $spec->{installArtifacts}) {',
+    '  exit(78) unless defined($ENV{$install->{prefixEnv}}) && $ENV{$install->{prefixEnv}} eq $install->{prefix};',
+    '  my $expected = $install->{argv}; exit(64) unless @$expected == @argv;',
+    '  for my $i (0 .. $#$expected) { exit(64) if $argv[$i] ne $expected->[$i]; }',
+    '  my $status = system { $config->{nodePath} } $config->{nodePath}, $config->{dataDir} . "/install-artifacts.mjs", $config->{dataDir} . "/" . $config->{name} . ".install-artifacts.json", @$expected;',
+    '  if ($status != 0) { exit($status == -1 ? 127 : ($status & 127 ? 128 + ($status & 127) : $status >> 8)); }',
+    '}',
+    '$delegate->($config->{ptyPath}) if $spec->{pty};',
+    'my $response;',
+    'if (ref($spec->{responses}) eq "ARRAY") { for my $candidate (@{$spec->{responses}}) { if ($matches->($candidate->{argsStartWith})) { $response = $candidate; last; } } }',
+    'if (ref($spec->{responses}) eq "ARRAY" && !$response && $spec->{otherwise}) { $delegate->($spec->{otherwise}); }',
+    'if (!defined($spec->{responses}) && $spec->{whenArgsStartWith} && $spec->{otherwise} && !$matches->($spec->{whenArgsStartWith})) { $delegate->($spec->{otherwise}); }',
+    'my $selected = $response // $spec;',
+    'binmode(STDOUT, ":encoding(UTF-8)"); binmode(STDERR, ":encoding(UTF-8)");',
+    'STDOUT->autoflush(1); STDERR->autoflush(1);',
+    'print STDOUT $selected->{stdout} if exists $selected->{stdout};',
+    'print STDERR $selected->{stderr} if exists $selected->{stderr};',
+    'select undef, undef, undef, $spec->{sleepSeconds} if defined($spec->{sleepSeconds}) && $spec->{sleepSeconds} > 0;',
+    'if ($spec->{killSignal}) { kill $spec->{killSignal}, $$; select undef, undef, undef, 1; }',
+    'exit($selected->{exitCode} // 0);',
+  ].join('\n') + '\n';
 }
 
 export function createFakeBins(specs: Readonly<Record<string, FakeBinSpec>>): FakeBins {
@@ -165,17 +184,34 @@ export function createFakeBins(specs: Readonly<Record<string, FakeBinSpec>>): Fa
     if (!NAME.test(name) || name === '.' || name === '..') throw new Error(`fake-bin: invalid executable name ${JSON.stringify(name)}`);
     const spec = specs[name]!;
     if (spec.killSignal !== undefined && !KILL_SIGNALS.has(spec.killSignal)) throw new Error(`fake-bin: ${name}: killSignal must be one of ${[...KILL_SIGNALS].join(', ')}`);
+    if (spec.recordEnv !== undefined) {
+      const seen = new Set<string>();
+      for (const key of spec.recordEnv) {
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`fake-bin: ${name}: invalid recordEnv variable name ${JSON.stringify(key)}`);
+        if (seen.has(key)) throw new Error(`fake-bin: ${name}: duplicate recordEnv variable ${JSON.stringify(key)}`);
+        seen.add(key);
+      }
+    }
+    if (spec.responses !== undefined) {
+      if (spec.responses.length === 0) throw new Error(`fake-bin: ${name}: responses needs at least one argv rule`);
+      if (spec.whenArgsStartWith !== undefined) throw new Error(`fake-bin: ${name}: responses and whenArgsStartWith cannot be combined`);
+      for (const response of spec.responses) {
+        if (response.argsStartWith.length === 0) throw new Error(`fake-bin: ${name}: response argsStartWith needs at least one word`);
+      }
+    }
     if (spec.whenArgsStartWith !== undefined) {
       if (spec.whenArgsStartWith.length === 0) throw new Error(`fake-bin: ${name}: whenArgsStartWith needs at least one word`);
       if (spec.otherwise === undefined) throw new Error(`fake-bin: ${name}: whenArgsStartWith needs otherwise (the real executable)`);
       if (!isAbsolute(spec.otherwise)) throw new Error(`fake-bin: ${name}: otherwise must be an absolute path, got ${JSON.stringify(spec.otherwise)}`);
-    } else if (spec.otherwise !== undefined) {
-      throw new Error(`fake-bin: ${name}: otherwise is only used with whenArgsStartWith`);
+    } else if (spec.otherwise !== undefined && spec.responses === undefined) {
+      throw new Error(`fake-bin: ${name}: otherwise needs whenArgsStartWith or responses`);
+    } else if (spec.otherwise !== undefined && !isAbsolute(spec.otherwise)) {
+      throw new Error(`fake-bin: ${name}: otherwise must be an absolute path, got ${JSON.stringify(spec.otherwise)}`);
     }
     if (spec.pty === true) {
       if (spec.stdout !== undefined || spec.stderr !== undefined || spec.exitCode !== undefined
         || spec.sleepSeconds !== undefined || spec.killSignal !== undefined
-        || spec.whenArgsStartWith !== undefined || spec.otherwise !== undefined || spec.installArtifacts !== undefined) {
+        || spec.whenArgsStartWith !== undefined || spec.otherwise !== undefined || spec.responses !== undefined || spec.installArtifacts !== undefined) {
         throw new Error(`fake-bin: ${name}: pty is a pass-through PTY allocator and takes no output/fake fields`);
       }
       if (utilLinuxScript() === null) throw new Error(`fake-bin: ${name}: pty needs the util-linux \`script\` on PATH (this host has none)`);
@@ -184,20 +220,14 @@ export function createFakeBins(specs: Readonly<Record<string, FakeBinSpec>>): Fa
       const { prefixEnv, prefix, argv, files } = spec.installArtifacts;
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(prefixEnv)) throw new Error(`fake-bin: ${name}: invalid install prefix environment name`);
       if (prefix.includes('\0')) throw new Error(`fake-bin: ${name}: install prefix must not contain NUL`);
-      if (!isAbsolute(prefix)) throw new Error(`fake-bin: ${name}: install prefix must be absolute`);
-      if (resolve(prefix) !== prefix) throw new Error(`fake-bin: ${name}: install prefix must be normalized`);
-      if (argv.length === 0 || argv.some((word) => typeof word !== 'string')) throw new Error(`fake-bin: ${name}: installArtifacts needs exact argv`);
-      if (files.length === 0) throw new Error(`fake-bin: ${name}: installArtifacts needs at least one file`);
+      if (!isAbsolute(prefix) || resolve(prefix) !== prefix) throw new Error(`fake-bin: ${name}: install prefix must be absolute and normalized`);
+      if (argv.length === 0 || files.length === 0) throw new Error(`fake-bin: ${name}: installArtifacts needs exact argv and at least one file`);
       const paths = new Set<string>();
       for (const artifact of files) {
-        if (artifact.path.includes('\0') || isAbsolute(artifact.path) || artifact.path.split(/[\\/]/).some((part) => part === '..' || part === '')) {
-          throw new Error(`fake-bin: ${name}: install artifact path must stay relative to its prefix`);
-        }
+        if (!artifact.path || artifact.path.includes('\0') || isAbsolute(artifact.path) || artifact.path.split(/[\\/]/).some((part) => part === '..' || part === '')) throw new Error(`fake-bin: ${name}: install artifact path must stay relative to its prefix`);
         if (paths.has(artifact.path)) throw new Error(`fake-bin: ${name}: duplicate install artifact path ${artifact.path}`);
         paths.add(artifact.path);
-        if (artifact.mode !== undefined && (!Number.isInteger(artifact.mode) || artifact.mode < 0 || artifact.mode > 0o777)) {
-          throw new Error(`fake-bin: ${name}: invalid install artifact mode`);
-        }
+        if (artifact.mode !== undefined && (!Number.isInteger(artifact.mode) || artifact.mode < 0 || artifact.mode > 0o777)) throw new Error(`fake-bin: ${name}: invalid install artifact mode`);
       }
     }
   }
@@ -208,15 +238,11 @@ export function createFakeBins(specs: Readonly<Record<string, FakeBinSpec>>): Fa
   try {
     mkdirSync(dir);
     mkdirSync(dataDir);
-    writeFileSync(logPath, '');
+    writeFileSync(logPath, '', { mode: 0o600 });
     const hasInstallArtifacts = Object.values(specs).some((spec) => spec.installArtifacts !== undefined);
-    if (hasInstallArtifacts) {
-      writeFileSync(join(dataDir, 'install-artifacts.mjs'), readFileSync(new URL('./fake-bin-install-helper.mjs', import.meta.url)));
-    }
+    if (hasInstallArtifacts) writeFileSync(join(dataDir, 'install-artifacts.mjs'), readFileSync(new URL('./fake-bin-install-helper.mjs', import.meta.url)));
     for (const [name, spec] of Object.entries(specs)) {
-      if (spec.installArtifacts !== undefined) {
-        writeFileSync(join(dataDir, `${name}.install-artifacts.json`), JSON.stringify({ ...spec.installArtifacts, exitCode: spec.exitCode ?? 0 }));
-      }
+      if (spec.installArtifacts !== undefined) writeFileSync(join(dataDir, `${name}.install-artifacts.json`), JSON.stringify({ ...spec.installArtifacts, exitCode: spec.exitCode ?? 0 }));
       const file = join(dir, name);
       writeFileSync(file, script(name, spec, dataDir, logPath));
       chmodSync(file, 0o755);
@@ -236,13 +262,11 @@ export function createFakeBins(specs: Readonly<Record<string, FakeBinSpec>>): Fa
     calls() {
       if (!existsSync(logPath)) return [];
       // The segment after the last separator is either empty or a record still being written — never count it.
-      return readFileSync(logPath, 'utf8')
-        .split('\x1e')
-        .slice(0, -1)
-        .map((record) => {
-          const [name = '', ...argv] = record.split('\0').slice(0, -1);
-          return { name, argv };
-        });
+      const contents = readFileSync(logPath, 'utf8');
+      const lines = contents.split('\n');
+      if (lines.at(-1) === '') lines.pop();
+      else lines.pop(); // An incomplete append is not a call record.
+      return lines.map((line) => JSON.parse(line) as FakeBinCall);
     },
     async waitForCalls(count, timeoutMs = 5_000) {
       const deadline = Date.now() + timeoutMs;

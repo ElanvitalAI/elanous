@@ -1,3 +1,4 @@
+import { textOnly } from '../llm/stream-text.js';
 // ── 회고 리포트 생성 (R1 · retro-report · 2026-07-08) ─────────────────────
 //
 // PeriodSummary(R0) → REFLECTION-<period>-<date>.md. 결정론 base(순수 렌더) +
@@ -6,7 +7,7 @@
 
 import type { PeriodSummary, RetroPeriod } from './retro-aggregate.js';
 import { getUserConfig } from '../user-config.js';
-import { getProviderForConfig, anyProviderAvailable, textOnly, type LLMMessage } from '../llm.js';
+import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 
 const PERIOD_KO: Record<RetroPeriod, string> = { weekly: '주간', monthly: '월간', quarterly: '분기', annual: '연간' };
 

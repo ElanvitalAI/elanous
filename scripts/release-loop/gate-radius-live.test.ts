@@ -1,14 +1,52 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { gateRepoDigestProbeRequest, hardRehearsalGateArgs, hardRehearsalGateVersion, parseGateRepoDigestResponse, partialGateImagesMatch, planHardRehearsalRadius } from './gate-radius-live';
+import { gateEnvFingerprint } from './gate-baseline-receipt.js';
+import { gateRepoDigestProbeRequest, hardRehearsalGateArgs, hardRehearsalGateVersion, mergeHardRehearsalRecheck,
+  parseGateRepoDigestResponse, partialGateImagesMatch, planHardRehearsalRadius, preflightGateBaseImageDigest, preflightGateExecutionIdentity } from './gate-radius-live';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test('pinned image label authorizes reuse only when the exact runtime probe agrees', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-layer-probe-'));
+  dirs.push(root);
+  const bin = join(root, 'bin');
+  mkdirSync(bin);
+  const imageDigest = `sha256:${'a'.repeat(64)}`;
+  const dependencyDigest = `sha256:${'b'.repeat(64)}`;
+  const commit = 'c'.repeat(40);
+  const originalPath = process.env.PATH;
+  const writeTool = (name: string, body: string) => {
+    const path = join(bin, name);
+    writeFileSync(path, `#!/bin/sh\n${body}\n`);
+    chmodSync(path, 0o755);
+  };
+  writeTool('curl', `printf 'Docker-Content-Digest: ${imageDigest}\r\n'`);
+  const fingerprint = gateEnvFingerprint(process.env);
+  writeTool('docker', `if [ "$1" = image ]; then printf '%s\n' '${dependencyDigest}'; exit 0; fi
+if [ "$1" = run ]; then printf '{"bunVersion":"1.4.2","platform":"linux","architecture":"arm64","envFingerprint":"${fingerprint}","baseImageDigest":"%s"}\n' "$(cat '${root}/runtime-digest')"; exit 0; fi
+exit 1`);
+  process.env.PATH = `${bin}:${originalPath ?? ''}`;
+  const pool = 'k3d-test:1#k3d-registry:5050';
+  try {
+    expect(preflightGateBaseImageDigest(pool, commit, imageDigest)).toBe(dependencyDigest);
+    writeFileSync(join(root, 'runtime-digest'), dependencyDigest);
+    expect(preflightGateExecutionIdentity(pool, process.env, commit, imageDigest)).toMatchObject({
+      imageDigest, baseImageDigest: dependencyDigest,
+    });
+    writeFileSync(join(root, 'runtime-digest'), `sha256:${'d'.repeat(64)}`);
+    expect(preflightGateExecutionIdentity(pool, process.env, commit, imageDigest)).toBeNull();
+    writeFileSync(join(root, 'runtime-digest'), dependencyDigest);
+    expect(preflightGateExecutionIdentity(pool, process.env, commit, `sha256:${'e'.repeat(64)}`)).toBeNull();
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
+  }
+});
 
 test('receipt inheritance world replays the exact-head, radius, fingerprint and cross-host decisions', () => {
   const world = parseYaml(readFileSync(join(import.meta.dir, '../../scenarios/ux-sim/release-receipt-inheritance.yaml'), 'utf8')) as {
@@ -79,7 +117,7 @@ test('remote gate image probe sends Accept to a registry and parses its RepoDige
   }
 });
 
-function fixture(options: { versionBump?: boolean } = {}) {
+function fixture(options: { versionBump?: boolean; immutableEvidence?: boolean } = {}) {
   const repo = mkdtempSync(join(tmpdir(), 'radius-live-repo-'));
   const root = mkdtempSync(join(tmpdir(), 'radius-live-ledger-'));
   dirs.push(repo, root);
@@ -111,22 +149,36 @@ function fixture(options: { versionBump?: boolean } = {}) {
   const executionIdentity = { imageDigest, ...runtimeIdentity };
   const stampDir = join(root, 'release', version, 'rehearsal');
   const gateDir = join(root, 'release', gateVersion);
+  const artifactPath = options.immutableEvidence ? join('release', gateVersion, 'light-rc-receipts', 'fixture-run') : undefined;
+  const artifactRoot = artifactPath ? join(root, artifactPath) : gateDir;
   mkdirSync(stampDir, { recursive: true }); mkdirSync(gateDir, { recursive: true });
   writeFileSync(join(stampDir, 'hard-5h.json'), JSON.stringify({ version, step: 'hard-5h', outcome: 'ok', sha: priorCommit,
     endedAt: '2026-10-20T10:00:00.000Z',
     hardGateRunId: runId, hardGate: { outcome: 'ok', commit: priorCommit, executor: 'pod', introduced: [] } }));
   writeFileSync(join(gateDir, 'gate-verdict.json'), JSON.stringify({ commit: priorCommit, outcome: 'ok',
-    baselineReceipt: { schema: 2, valid: true, reason: 'complete clean full sweep', version: gateVersion, commit: priorCommit,
-      ...pins, envFingerprint, imageDigest, executionIdentity: runtimeIdentity, files: 3, shards: 1 } }));
-  writeFileSync(join(gateDir, 'gate-failures.json'), JSON.stringify({ commit: priorCommit, failures: [], errors: [] }));
-  mkdirSync(join(gateDir, 'gate-logs', 'cut'), { recursive: true });
-  writeFileSync(join(gateDir, 'gate-logs', 'cut', 'pod-0.json'), JSON.stringify({
+    baselineReceipt: { schema: 2, valid: true, reason: 'complete clean full sweep', version: gateVersion, commit: priorCommit, head40: priorCommit,
+      ...pins, envFingerprint, imageDigest, executionIdentity: runtimeIdentity, files: 3,
+      fileInventory: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], shards: 1,
+      ...(artifactPath ? { artifactPath } : {}) } }));
+  mkdirSync(artifactRoot, { recursive: true });
+  writeFileSync(join(artifactRoot, 'gate-failures.json'), JSON.stringify({ commit: priorCommit, failures: [], errors: [] }));
+  mkdirSync(join(artifactRoot, 'gate-logs', 'cut'), { recursive: true });
+  writeFileSync(join(artifactRoot, 'gate-logs', 'cut', 'pod-0.json'), JSON.stringify({
     commit: priorCommit, files: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], imageDigest, runtimeIdentity,
     shardCount: 1, sweepId: 'sweep-one', attemptId: 'attempt-one',
   }));
   const input = { root, repo, version, forCommit, graphPins: pins, envFingerprint, imageDigest, executionIdentity };
-  return { input, stampDir, gateDir, gateVersion, priorCommit };
+  return { input, stampDir, gateDir, gateVersion, priorCommit, artifactPath };
 }
+
+test('hard rehearsal verifies immutable receipt-selected evidence and falls back when that evidence is missing', () => {
+  const { input, artifactPath } = fixture({ immutableEvidence: true });
+  expect(artifactPath).toBeDefined();
+  expect(planHardRehearsalRadius(input)).toMatchObject({ plan: { files: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'] },
+    reason: 'hard rehearsal receipt and import radius verified' });
+  rmSync(join(input.root, artifactPath!, 'gate-logs', 'cut', 'pod-0.json'));
+  expect(planHardRehearsalRadius(input)).toMatchObject({ plan: null, reason: expect.stringContaining('hard rehearsal Pod proof differs') });
+});
 
 test('hard rehearsal evidence uses a distinct rc path; its receipt selects only the changed import radius', () => {
   const { input, gateDir, gateVersion } = fixture();
@@ -135,6 +187,7 @@ test('hard rehearsal evidence uses a distinct rc path; its receipt selects only 
   expect(gateVersion).not.toBe(input.version);
   expect(hardRehearsalGateVersion(input.version, 'hard-12345678-1234-1234-1234-123456789abd')).not.toBe(gateVersion);
   const args = hardRehearsalGateArgs(input.version, 'hard-12345678-1234-1234-1234-123456789abc', input.forCommit, '1.0.0', 'node-b:1');
+  expect(args[0]).toBe('scripts/release-loop/gate-node-cli.ts');
   expect(args[args.indexOf('--version') + 1]).toBe(gateVersion);
   expect(args).toContain('--rehearsal-baseline');
   expect(planHardRehearsalRadius(input)).toMatchObject({ plan: { files: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], priorCommit: expect.any(String) },
@@ -300,5 +353,86 @@ test('GATE-RECEIPT-VALID-ON-REGRESSION: a completed rehearsal with a regression 
   const sameHead = planHardRehearsalRadius({ ...input, forCommit: priorCommit });
   expect(sameHead.plan).toMatchObject({ priorCommit, forCommit: priorCommit, files: ['src/b.test.ts'], priorFailures: [failedId] });
   expect(sameHead.plan?.kind).toBeUndefined();
-  expect(sameHead.reason).toContain('re-measure 1 failed file(s) only');
+  expect(sameHead.reason).toContain('re-measure 1 failed or errored file(s) only');
+});
+
+test('same-head rehearsal remeasures errored files while retaining the passed inventory', () => {
+  const { input, stampDir, gateDir, priorCommit } = fixture();
+  const five = JSON.parse(readFileSync(join(stampDir, 'hard-5h.json'), 'utf8'));
+  const errorId = 'src/b.test.ts > setup error';
+  writeFileSync(join(stampDir, 'hard-5h.json'), JSON.stringify({ ...five, outcome: 'regression',
+    hardGate: { ...five.hardGate, outcome: 'fail', introduced: [errorId] } }));
+  const verdict = JSON.parse(readFileSync(join(gateDir, 'gate-verdict.json'), 'utf8'));
+  writeFileSync(join(gateDir, 'gate-verdict.json'), JSON.stringify({ ...verdict, outcome: 'regression' }));
+  const failurePath = join(gateDir, 'gate-failures.json');
+  writeFileSync(failurePath, JSON.stringify({ commit: priorCommit, failures: [], errors: [errorId] }));
+  const sameHead = planHardRehearsalRadius({ ...input, forCommit: priorCommit });
+  expect(sameHead.plan).toMatchObject({ files: ['src/b.test.ts'], priorErrors: [errorId] });
+  writeFileSync(failurePath, JSON.stringify({ commit: priorCommit, failures: [], errors: ['src/unknown.test.ts > error'] }));
+  expect(planHardRehearsalRadius({ ...input, forCommit: priorCommit }).plan).toBeNull();
+});
+
+test('GATE-RECEIPT-CARRY-ANY-RUN: a same-identity focused pass joins the full rehearsal receipt; identity drift is rejected', () => {
+  const { input, gateDir, priorCommit } = fixture();
+  const verdictPath = join(gateDir, 'gate-verdict.json');
+  const verdict = JSON.parse(readFileSync(verdictPath, 'utf8')) as { baselineReceipt: import('./gate-baseline-receipt').GateBaselineReceipt };
+  const receipt = verdict.baselineReceipt;
+  const failed = ['src/b.test.ts > flaky case'];
+  const sameRun = {
+    runId: 'focused-12345678-1234-1234-1234-123456789abc', commit: priorCommit,
+    graphSha: input.graphPins!.graphSha, recipeSha: input.graphPins!.recipeSha,
+    envFingerprint: input.envFingerprint, imageDigest: input.imageDigest!, executionIdentity: input.executionIdentity!,
+    results: [{ file: 'src/b.test.ts', outcome: 'pass' as const }],
+  };
+  const merged = mergeHardRehearsalRecheck({ receipt, priorFailures: failed, priorErrors: [], recheck: sameRun });
+  expect(merged).toMatchObject({ accepted: true });
+  expect(merged.failures).toEqual([]);
+  expect(merged.receipt).toMatchObject({ valid: true, commit: priorCommit, imageDigest: input.imageDigest,
+    rechecks: [{ runId: sameRun.runId, commit: priorCommit, files: ['src/b.test.ts'] }] });
+  writeFileSync(join(gateDir, 'gate-failures.json'), JSON.stringify({ commit: priorCommit, failures: merged.failures, errors: merged.errors }));
+  writeFileSync(verdictPath, JSON.stringify({ commit: priorCommit, outcome: 'ok', baselineReceipt: merged.receipt }));
+  expect(planHardRehearsalRadius({ ...input, forCommit: priorCommit }).plan).toMatchObject({
+    kind: 'carry', priorCommit, forCommit: priorCommit, files: [],
+  });
+
+  for (const changed of [
+    { ...sameRun, imageDigest: `sha256:${'9'.repeat(64)}` },
+    { ...sameRun, envFingerprint: 'a'.repeat(64) },
+    { ...sameRun, commit: 'a'.repeat(40) },
+    { ...sameRun, graphSha: 'a'.repeat(64) },
+    { ...sameRun, recipeSha: 'a'.repeat(64) },
+    { ...sameRun, executionIdentity: { ...sameRun.executionIdentity, bunVersion: '1.4.3' } },
+    { ...sameRun, executionIdentity: { ...sameRun.executionIdentity, imageDigest: `sha256:${'9'.repeat(64)}` } },
+    { ...sameRun, executionIdentity: { ...sameRun.executionIdentity, envFingerprint: 'a'.repeat(64) } },
+    { ...sameRun, results: [{ file: 'src/a.test.ts', outcome: 'pass' as const }] },
+    { ...sameRun, results: [{ file: 'src/not-in-inventory.test.ts', outcome: 'pass' as const }] },
+    { ...sameRun, results: [{ file: 'src/b.test.ts', outcome: 'unmeasured' as const }] },
+  ]) {
+    expect(mergeHardRehearsalRecheck({ receipt, priorFailures: failed, priorErrors: [], recheck: changed }).accepted).toBe(false);
+  }
+  expect(mergeHardRehearsalRecheck({ receipt: { ...receipt, fileInventory: ['../outside.test.ts'] },
+    priorFailures: failed, priorErrors: [], recheck: sameRun }).accepted).toBe(false);
+  expect(mergeHardRehearsalRecheck({ receipt: { ...receipt, head40: '' },
+    priorFailures: failed, priorErrors: [], recheck: sameRun }).accepted).toBe(false);
+  expect(mergeHardRehearsalRecheck({ receipt: { ...receipt, executionIdentity: { ...receipt.executionIdentity!, envFingerprint: 'a'.repeat(64) } },
+    priorFailures: failed, priorErrors: [], recheck: sameRun }).accepted).toBe(false);
+  expect(mergeHardRehearsalRecheck({ receipt: { ...receipt,
+    executionIdentity: { ...receipt.executionIdentity!, imageDigest: `sha256:${'9'.repeat(64)}` } },
+  priorFailures: failed, priorErrors: [], recheck: sameRun }).accepted).toBe(false);
+  expect(mergeHardRehearsalRecheck({ receipt, priorFailures: failed, priorErrors: [],
+    recheck: { ...sameRun, results: null } as unknown as typeof sameRun }).accepted).toBe(false);
+  expect(mergeHardRehearsalRecheck({ receipt, priorFailures: failed, priorErrors: [],
+    recheck: { ...sameRun, executionIdentity: null } as unknown as typeof sameRun }).accepted).toBe(false);
+  const malformedFailures = [null] as unknown as string[];
+  expect(mergeHardRehearsalRecheck({ receipt, priorFailures: malformedFailures, priorErrors: [], recheck: sameRun })).toMatchObject({
+    accepted: false, failures: malformedFailures,
+  });
+});
+
+test('hard rehearsal CLI leaf preserves the gate CLI help and exits before a gate run', () => {
+  const cli = spawnSync('bun', [join(import.meta.dir, 'gate-node-cli.ts'), '--help'], {
+    cwd: join(import.meta.dir, '../..'), encoding: 'utf8',
+  });
+  expect(cli.status).toBe(0);
+  expect(cli.stdout).toContain('--commit');
 });

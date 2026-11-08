@@ -15,15 +15,42 @@ import {
   resolveRoleJudgeBackend,
   resolveRoleJudgeModel,
 } from '../src/nexus/api/role-judge.js';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 type FetchFn = typeof globalThis.fetch;
 
-const realFetch = globalThis.fetch;
+let fakeFetch: FakeFetchDevice | undefined;
+let expectedFetchCalls: string[] | undefined;
+
+function installFetch(stub: FetchFn, expectedCallCount = 1): void {
+  fakeFetch?.restore();
+  const url = 'http://localhost:1234/v1/chat/completions';
+  expectedFetchCalls = Array.from({ length: expectedCallCount }, () => `POST ${url}`);
+  fakeFetch = createFakeFetchDevice([{
+    url,
+    method: 'POST',
+    response: (request) => stub(request.url, {
+      method: request.method,
+      headers: { ...request.headers },
+      ...(request.body !== null ? { body: request.body } : {}),
+      signal: request.signal,
+    }),
+  }]);
+}
+
 afterEach(() => {
-  globalThis.fetch = realFetch;
-  delete process.env.ELANOUS_SHOWROOM_ROLE_JUDGE_BACKEND;
-  delete process.env.ELANOUS_SHOWROOM_ROLE_JUDGE_MODEL;
-  delete process.env.ELANOUS_SHOWROOM_ROLE_JUDGE_MODEL_FALLBACK;
+  try {
+    if (fakeFetch && expectedFetchCalls) {
+      expect(fakeFetch.calls().map(({ method, url }) => `${method} ${url}`).sort()).toEqual([...expectedFetchCalls].sort());
+    }
+  } finally {
+    fakeFetch?.restore();
+    fakeFetch = undefined;
+    expectedFetchCalls = undefined;
+    delete process.env.ELANOUS_SHOWROOM_ROLE_JUDGE_BACKEND;
+    delete process.env.ELANOUS_SHOWROOM_ROLE_JUDGE_MODEL;
+    delete process.env.ELANOUS_SHOWROOM_ROLE_JUDGE_MODEL_FALLBACK;
+  }
 });
 
 describe('prompt-template · buildJudgePromptMessages', () => {
@@ -82,7 +109,7 @@ describe('hybridClassify · keyword tier short-circuits', () => {
       calls += 1;
       return new Response();
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, 0);
     const result = await hybridClassify({
       userPrompt: '리뷰',
       keywordClassifier: () => 'review',
@@ -100,7 +127,7 @@ describe('hybridClassify · keyword tier short-circuits', () => {
       calls += 1;
       return new Response();
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, 0);
     const result = await hybridClassify({
       userPrompt: 'unknown',
       keywordClassifier: () => null,
@@ -119,7 +146,7 @@ describe('hybridClassify · keyword tier short-circuits', () => {
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       )) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub);
     const result = await hybridClassify({
       userPrompt: 'ambiguous prompt',
       keywordClassifier: () => null,
@@ -137,7 +164,7 @@ describe('hybridClassify · keyword tier short-circuits', () => {
         JSON.stringify({ choices: [{ message: { content: 'hmm not json' } }] }),
         { status: 200 },
       )) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub);
     const result = await hybridClassify({
       userPrompt: 'ambiguous',
       keywordClassifier: () => null,
@@ -154,7 +181,7 @@ describe('hybridClassify · keyword tier short-circuits', () => {
 describe('classifyWithLocalLlm · transport branches', () => {
   test('non-2xx → http reason', async () => {
     const stub = (async () => new Response('rate limited', { status: 429 })) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub);
     const r = await classifyWithLocalLlm('foo', { model: 'gemma' });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('http');
@@ -162,7 +189,7 @@ describe('classifyWithLocalLlm · transport branches', () => {
 
   test('thrown fetch → network reason', async () => {
     const stub = (async () => { throw new Error('econnrefused'); }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub);
     const r = await classifyWithLocalLlm('foo', { model: 'gemma' });
     expect(r.ok).toBe(false);
     if (!r.ok) {
@@ -171,21 +198,28 @@ describe('classifyWithLocalLlm · transport branches', () => {
     }
   });
 
-  test('AbortError → timeout reason', async () => {
-    const stub = ((_input: unknown, init?: RequestInit) => {
-      const sig = init?.signal;
-      return new Promise<Response>((_resolve, reject) => {
-        sig?.addEventListener('abort', () => {
-          const e = new Error('aborted');
-          e.name = 'AbortError';
-          reject(e);
-        });
-      });
-    }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+  test('AbortError → timeout reason when the request signal aborts', async () => {
+    let observedSignal: AbortSignal | null | undefined;
+    const stub = (async (_url: Parameters<FetchFn>[0], init?: Parameters<FetchFn>[1]) => new Promise<Response>((_resolve, reject) => {
+      observedSignal = init?.signal;
+      const abort = () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      };
+      if (!init?.signal) {
+        reject(new Error('request signal was not provided'));
+        return;
+      }
+      if (init.signal.aborted) abort();
+      else init.signal.addEventListener('abort', abort, { once: true });
+    })) as unknown as FetchFn;
+    installFetch(stub);
     const r = await classifyWithLocalLlm('foo', { model: 'gemma', timeoutMs: 10 });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('timeout');
+    expect(observedSignal).toBeInstanceOf(AbortSignal);
+    expect(observedSignal?.aborted).toBe(true);
   });
 });
 
@@ -270,7 +304,7 @@ describe('FU.5 (2026-05-09) — body backend / model override', () => {
         JSON.stringify({ choices: [{ message: { content: '{"role":"plan"}' } }] }),
         { status: 200 },
       )) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, 0);
     const res = await handleRoleJudge(
       new Request('http://x/v1/showroom/role-judge', {
         method: 'POST',
@@ -298,7 +332,7 @@ describe('FU.5 (2026-05-09) — body backend / model override', () => {
         { status: 200 },
       );
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub);
     const res = await handleRoleJudge(
       new Request('http://x/v1/showroom/role-judge', {
         method: 'POST',
@@ -345,7 +379,7 @@ describe('FU.1 (2026-05-09) — max_tokens + timeout reasoning-safe defaults', (
         { status: 200 },
       );
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub);
     await classifyWithLocalLlm('foo', { model: 'gemma' });
     const parsed = JSON.parse(capturedBody) as { max_tokens?: number };
     expect(parsed.max_tokens).toBe(1024);
@@ -361,7 +395,7 @@ describe('FU.1 (2026-05-09) — max_tokens + timeout reasoning-safe defaults', (
         { status: 200 },
       );
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub);
     await classifyWithLocalLlm('foo', { model: 'gemma' });
     const parsed = JSON.parse(capturedBody) as { max_tokens?: number };
     expect(parsed.max_tokens).toBe(512);
@@ -381,7 +415,7 @@ describe('FU.1 (2026-05-09) — max_tokens + timeout reasoning-safe defaults', (
         }),
         { status: 200 },
       )) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub);
     const r = await classifyWithLocalLlm('foo', { model: 'gemma' });
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.role).toBe('reflect');

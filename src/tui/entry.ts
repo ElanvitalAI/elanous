@@ -1,5 +1,4 @@
 import { initTui, closeTui, injectKey, readKey, type Key } from '../tui.js';
-import { appendMessage, createSession, getActiveSessionId, loadSession, resolveSessionId, setActiveSessionId, updateSessionMeta } from '../session/index.js';
 import { fitLogLine, isToolFoldToggleKey, logViewLines, safeLogText, safeStatusText, streamReplyLines, toggleVisibleToolFold, toolFoldBlockStarts, wheelScroll } from './chat/log-view.js';
 import { BackgroundJobStatus } from './chat/background-job-status.js';
 import { MOUSE_RESIDUE_WINDOW_MS, MouseResidueGuard, applyComposerKey, composerViewport, emptyComposer, wheelDirection } from './input/composer.js';
@@ -90,6 +89,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     throw new Error('elanous --tui next requires at least 20 columns and 6 rows');
   }
   const dashboardRuntime = await (await import('../tui-client/next-dashboard-runtime.js')).loadNextTuiDashboardRuntime();
+  const { appendMessage, createSession, getActiveSessionId, loadSession, resolveSessionId, setActiveSessionId, updateSessionMeta } = await import('../session/index.js');
   const simWorldId = process.env.ELANOUS_SIM_WORLD_ID?.trim();
   const simWorld = simWorldId ? (await import('../ux-sim/world.js')).loadWorld(simWorldId) : null;
   const simWorldWatch = simWorld ? await import('../ux-sim/world-watch.js') : null;
@@ -1165,7 +1165,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           }
           if (pendingRoute?.id === 'session.new') {
             // A turn still writes to the current session; switching under it would split the reply.
-            status = requestNewTuiSession({ busy: true, from: id }).status;
+            status = (await requestNewTuiSession({ busy: true, from: id })).status;
             render();
             continue;
           }
@@ -1227,7 +1227,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         const route = routeRegistry.resolveNextTuiRoute(submitted, routeRegistry.NEXT_TUI_INPUT_CONTEXT);
         if (route?.action === 'quit') break;
         if (route?.id === 'session.new') {
-          const next = requestNewTuiSession({ busy, from: id });
+          const next = await requestNewTuiSession({ busy, from: id });
           if (next.kind === 'started') {
             (loopCommand as NextLoopCommand | null)?.run('stop');
             const previous = id;

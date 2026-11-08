@@ -68,12 +68,19 @@ test('remote completed shard rows append together and fail closed on write failu
     observedAt: row.observedAt, shardIds: ['pod-0', 'pod-1'] })).toBe(true);
   expect(gateShardLedgerBatchComplete(read.rows, { batchId: 'a-previous-batch', version: row.version, commit: row.commit, phase: 'cut',
     observedAt: row.observedAt, shardIds: ['pod-0', 'pod-1'] })).toBe(false);
+  const recoverablePath = gateShardLedgerPath('0.2.40', join(root, 'recoverable'));
+  const recoverable = { ...row, attribution: 'unmeasured' as const, failureIds: null, errorIds: null,
+    unmeasuredFiles: ['src/a.test.ts'], retryGroupId: 'attempt-1' };
+  expect(appendGateShardLedgerBatch(recoverablePath, [recoverable, { ...row, shardId: 'pod-1', files: ['src/b.test.ts'] }], true)).toBeNull();
+  const unrecovered = readGateShardLedger(recoverablePath)!;
+  expect(gateShardLedgerBatchComplete(unrecovered.rows, { batchId: unrecovered.rows[0]!.batchId!, version: row.version, commit: row.commit,
+    phase: 'cut', observedAt: row.observedAt, shardIds: ['pod-0', 'pod-1'] })).toBe(false);
   expect(gateShardLedgerBatchComplete([...read.rows, { ...read.rows[0]!, version: '0.2.41', shardId: 'pod-extra',
     observedAt: '2026-10-27T00:02:02.000Z' }], { batchId: read.rows[0]!.batchId!, version: row.version, commit: row.commit, phase: 'cut',
     observedAt: row.observedAt, shardIds: ['pod-0', 'pod-1'] })).toBe(false);
   writeFileSync(path, `${JSON.stringify(read.rows[0])}\n`);
   const truncated = readGateShardLedger(path)!;
-  expect(truncated.incompleteBatches).toEqual([read.rows[0]!.batchId]);
+  expect(truncated.incompleteBatches).toEqual([read.rows[0]!.batchId!]);
   expect(gateShardLedgerBatchComplete(truncated.rows, { batchId: read.rows[0]!.batchId!, version: row.version, commit: row.commit, phase: 'cut',
     observedAt: row.observedAt, shardIds: ['pod-0', 'pod-1'] })).toBe(false);
   writeFileSync(path, JSON.stringify(read.rows[0]));
@@ -87,10 +94,10 @@ test('remote completed shard rows append together and fail closed on write failu
   writeFileSync(path, `${legacy.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
   const oldFormat = readGateShardLedger(path)!;
   expect(oldFormat.incompleteBatches).toEqual([]);
-  expect(oldFormat.sizeUnknownBatches).toEqual([read.rows[0]!.batchId]);
+  expect(oldFormat.sizeUnknownBatches).toEqual([read.rows[0]!.batchId!]);
   writeFileSync(path, `${JSON.stringify(legacy[0])}\n${JSON.stringify(read.rows[1])}\n`);
   const mixedFormat = readGateShardLedger(path)!;
-  expect(mixedFormat.incompleteBatches).toEqual([read.rows[0]!.batchId]);
+  expect(mixedFormat.incompleteBatches).toEqual([read.rows[0]!.batchId!]);
   expect(mixedFormat.sizeUnknownBatches).toEqual([]);
   expect(() => appendGateShardLedgerBatch(path, [row, { ...row, files: ['src/b.test.ts'] }], true)).toThrow('duplicate shard id');
   const blocked = join(root, 'occupied');

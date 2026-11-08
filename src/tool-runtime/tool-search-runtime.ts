@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── ToolSearch ToolRuntime (Coding Pipeline P1) ──
 //
 // Wraps dispatchToolSearch in the ToolRuntime shape so the dashboard
@@ -11,7 +12,7 @@ import {
   type ToolSearchArgs,
 } from '../skills/tools/tool-search.js';
 import { HYDRATED_TOOLS_KEY } from '../skills/tools/tool-search-spec.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 
 /** Extended result — keeps `matched` / `unknown` arrays on the record

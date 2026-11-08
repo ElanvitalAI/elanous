@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // TUI-AGENT-CAPS (core + wiring) — subagent ceiling helpers: turn clamp, one-level
 // nest strip, background fan-out ceiling + live count, and the ceiling's single
 // enforcement point inside the production `dispatchAgent` dispatch path
@@ -20,7 +21,7 @@ import {
 import { globalAgentRegistry } from '../../agent/registry.js';
 import { SessionCache } from '../../session/cache.js';
 import type { AgentDefinition } from '../../agent/types.js';
-import type { LLMMessage, LLMProvider, LLMStreamEvent, LLMToolSpec } from '../../llm.js';
+import type { LLMMessage, LLMProvider, LLMStreamEvent } from '../../llm.js';
 
 function fakeProvider(turns: LLMStreamEvent[][]): LLMProvider {
   let call = 0;

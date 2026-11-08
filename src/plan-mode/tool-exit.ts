@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ExitPlanMode tool — Phase WF4.
 //
 // Opens a 3-way modal with the drafted plan body + three actions:
@@ -9,13 +10,13 @@
 //               chat loop) knows how to act on.
 //   cancel    — keep plan mode active; nothing changes.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import type { DisplayCoordinator } from '../display/coordinator.js';
 import { approvalModalRouter } from '../approval-modal.js';
 import { createPlanExitModal, type PlanExitChoice } from './exit-modal.js';
 import { loadPlanArtifactFromPath } from './persistence.js';
 import { getPlanModeState, resetPlanModeState } from './session.js';
-import { setPolicy } from '../code-edit/index.js';
+import { setPolicy } from '../code-edit/safety.js';
 import { setPlanToolPlanModeGuard } from '../code-edit/plan-tool.js';
 
 export interface ExitPlanModeDeps {

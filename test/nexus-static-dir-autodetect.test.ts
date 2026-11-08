@@ -1,7 +1,7 @@
 // P.1 — PWA static export auto-detect.
 
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath, dirname } from 'node:path';
 
@@ -14,7 +14,7 @@ function mkRepoLike(): { argvBin: string; pwaOut: string; cleanup: () => void } 
   const argvBin = joinPath(binDir, 'index.ts');
   mkdirSync(binDir, { recursive: true });
   mkdirSync(pwaOut, { recursive: true });
-  return { argvBin, pwaOut, cleanup: () => rmSync(root, { recursive: true }) };
+  return { argvBin, pwaOut: realpathSync(pwaOut), cleanup: () => rmSync(root, { recursive: true }) };
 }
 
 describe('P.1 · resolvePwaStaticDir', () => {
@@ -35,7 +35,7 @@ describe('P.1 · resolvePwaStaticDir', () => {
         npmShare,                         // 존재
       ],
     });
-    expect(got).toBe(npmShare);
+    expect(got).toBe(realpathSync(npmShare));
     rmSync(root, { recursive: true });
   });
 

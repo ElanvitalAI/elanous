@@ -9,6 +9,7 @@
 //   classic-seat-boot      TUI-SESSION-BOOT — COORD_ID seat ⊕ seat-state dir ⊕ one unread mail → first-screen line ⊕ card-injected on the first turn
 //                          ⊕ TUI-SEAT-MEMORY-RECALL: a hand handoff (HANDOFF-now.md) → one `memory-recall` hit (source · chars ≤ cap)
 //   classic-typing-lag     TUI-TYPING-LAG-REST — keys typed right after Enter in a git repo cwd → echo complete ⊕ `tui.input-lag` turn-start/keystroke rows
+//   classic-priority-keys  TUI-SPECIAL-KEYS-OUT — a delayed live turn receives two FIFO inputs and Escape aborts it through the classic dashboard PTY
 //   classic-mcp-calltool   CLASSIC-IDLE-MCP-LAZY — cached tools leave the child absent at boot; first real TUI dispatch starts one
 //                          fake MCP child and completes one tools/call through the production proxy
 //   classic-paste          TUI-PASTE-ECHO — short bracketed paste shows as typed · 50-line paste shows one placeholder ·
@@ -38,7 +39,7 @@ import {
 import { pasteFoldToken } from '../chat/paste-fold.js';
 import { bracketedPaste, CLIP_TEXT, GOAL_CONTINUE_PLEDGE_REPLY, GOAL_INTERIM_NOT_DONE_REPLY, GOAL_INTERIM_TOOL_CALL, goalInterimScreenCounts, INTERNAL_TURN_USER_HEADER, clipboardShimPath, PASTE_LONG, PASTE_LONG_TOKEN, PASTE_SHORT, parseData, readLogs } from './next-tui-seat-scenarios.js';
 
-export const CLASSIC_TUI_SCENARIOS = ['classic-first-screen-noise', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop'] as const;
+export const CLASSIC_TUI_SCENARIOS = ['classic-first-screen-noise', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-priority-keys', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop'] as const;
 export type ClassicTuiScenario = (typeof CLASSIC_TUI_SCENARIOS)[number];
 
 export interface ClassicTuiScenarioSpec {
@@ -165,7 +166,7 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
     quitKeys: '/exit\r',
     exitTimeoutMs: 20_000,
   };
-  const logCategories = 'llm.router,mcp.client,self-health.autoheal,dashboard.seat-boot,tui.input-lag,tui.wakeup,tui.autoturn,tui.paste,tui.goal-continue,tui.proactive,tui.goal-interim,tui.autowake';
+  const logCategories = 'llm.router,mcp.client,self-health.autoheal,dashboard.seat-boot,tui.input-lag,tui.wakeup,tui.autoturn,tui.paste,tui.goal-continue,tui.proactive,tui.goal-interim,tui.autowake,esc.abort';
   const finish = (run: SeatPtySequenceEvidence, store: Record<string, unknown>, checks: (rows: Row[]) => Record<string, boolean>): ClassicTuiScenarioResult => {
     const logs = readLogs({ root, executable: spec.executable, entry: spec.entry }, logCategories);
     return { scenario: spec.scenario, universe: root, run, store, logs, checks: checks(rowsOf(logs)) };
@@ -668,6 +669,31 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
         exitedClean: run.exitCode === 0,
       };
     });
+  }
+
+  if (spec.scenario === 'classic-priority-keys') {
+    const capturePath = join(root, 'fake-llm-requests.jsonl');
+    env[TEST_FAKE_LLM_CAPTURE_ENV] = capturePath;
+    env[TEST_FAKE_LLM_SCRIPT_ENV] = 'stall:busy-key-turn';
+    const steps: SeatPtyStep[] = [
+      { label: 'first turn is streaming', text: 'busy-key-turn', until: (screen) => readCapturedRequests(capturePath).length >= 1 && screen.includes('busy-key-turn'), timeoutMs: 30_000 },
+      { label: 'first busy input queued', text: 'fifo-one', until: (screen) => screen.includes('fifo-one') },
+      { label: 'second busy input queued', text: 'fifo-two', until: (screen) => screen.includes('fifo-one') && screen.includes('fifo-two') },
+      {
+        label: 'escape aborts and FIFO inputs remain available', keys: '\u001b',
+        until: (screen) => screen.includes('✘ 중단됨') && screen.includes('fifo-one') && screen.includes('fifo-two'),
+        timeoutMs: 30_000,
+      },
+    ];
+    const run = await mockSeatPtySequence({ ...base, env, steps, quitKeys: '\u0011' });
+    const aborted = run.frames.find((frame) => frame.label === 'escape aborts and FIFO inputs remain available')?.screen ?? '';
+    return finish(run, { capturePath, aborted }, (rows) => ({
+      escapeAbortedBusyTurn: aborted.includes('✘ 중단됨'),
+      firstSubmittedInputReturnedToDraft: aborted.includes('❯ fifo-one'),
+      secondInputRemainsAfterFirstInFifo: /❯ fifo-one[\s\S]*\n\s*· fifo-two(?:\s|$)/.test(aborted),
+      onlyFakeProvider: onlyFake(rows),
+      exitedClean: run.exitCode === 0,
+    }));
   }
 
   // classic-typing-lag: cwd = a git repo with a few thousand tracked files so the turn-start git snapshot is real work.

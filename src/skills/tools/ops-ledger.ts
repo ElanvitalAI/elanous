@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Ops-ledger native tools — 우편(msg) · 판(release checklist) ──
 //
 // OP TUI turns previously drove `elanous msg list/post/ack` and
@@ -44,7 +45,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { canonicalSeatId, openMsgStore, validateMessageEnvelope, type Message, type MsgStore } from '../../msg/msg-store.js';
 import {
   addItem,

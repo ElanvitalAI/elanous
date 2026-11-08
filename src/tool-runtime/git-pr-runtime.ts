@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── OpenPullRequest ToolRuntime (Coding Pipeline P4) ──
 //
 // Thin wrapper around `gh pr create` that handles the awkward parts
@@ -24,7 +25,7 @@
 // surface as structured exceptions the LLM can interpret.
 
 import { spawnSync } from 'node:child_process';
-import type { LLMToolSpec } from '../llm.js';
+
 import { getSessionCwd } from '../session/working-dir.js';
 import { debug } from '../debug/log.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';

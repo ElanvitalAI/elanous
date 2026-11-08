@@ -4,6 +4,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
+import { listChecklist } from '../../src/release-loop/checklist.js';
 import { emitNodeResult, readGraphContext, type GraphContext } from './node-verdict.js';
 import { regressWarning, validatedTuiRegress } from './tui-node-checks.js';
 
@@ -22,6 +23,22 @@ export const BLOCKING_METRIC_NAMES = [
   'public leak and prepare completeness', 'docs notes page', 'installation files',
 ] as const;
 
+/** Reasons that make unattended approval unsafe; publish-node repeats this check before invoking the irreversible CLI. */
+export function publishApprovalHoldReasons(context: GraphContext): string[] {
+  const reasons: string[] = [];
+  if (context.input.trafficHold === true) reasons.push('traffic hold active');
+  if (context.input.opApprovalMarker === true || (typeof context.input.opApprovalMarker === 'string' && context.input.opApprovalMarker.trim())) {
+    reasons.push('OP approval marker present');
+  }
+  const checklist = [
+    ...(Array.isArray(context.input.publishBlockingYellow) ? context.input.publishBlockingYellow : []),
+    ...(Array.isArray(context.outputs['checklist-gate']?.publishBlockingYellow) ? context.outputs['checklist-gate']!.publishBlockingYellow as unknown[] : []),
+  ];
+  const ids = [...new Set(checklist.filter((id): id is string => typeof id === 'string' && id.trim().length > 0))];
+  if (ids.length) reasons.push(`yellow publish blockers: ${ids.join(', ')}`);
+  return reasons;
+}
+
 /** `ok` · `warn` (a failure) · `unmeasured` (error or no output) — the macOS smoke never blocks publishing. */
 function macSmokeLevel(node: Record<string, unknown> | undefined): 'ok' | 'warn' | 'unmeasured' {
   if (node?.outcome === 'ok') return 'ok';
@@ -29,7 +46,7 @@ function macSmokeLevel(node: Record<string, unknown> | undefined): 'ok' | 'warn'
   return 'unmeasured';
 }
 
-export function runAutoApprove(context: GraphContext = readGraphContext(), deps: { instanceRoot?: string; repo?: string; bunVersion?: string } = {}) {
+export function runAutoApprove(context: GraphContext = readGraphContext(), deps: { instanceRoot?: string; repo?: string; bunVersion?: string; checklistRoot?: string } = {}) {
   const { version } = context.input;
   const root = deps.instanceRoot ?? effectiveInstanceRoot();
   const repo = deps.repo ?? resolve(import.meta.dir, '../..');
@@ -56,6 +73,16 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
   const failedLabel = failedCheckIds === null ? 'unmeasured' : `${failedCheckIds.length} [${failedCheckIds.join(', ') || '-'}]`;
   const regressNeedsApproval = regressStatus.level !== 'ok';
   const macSmoke = context.outputs['mac-smoke'];
+  const checklist = listChecklist(version, deps.checklistRoot ?? root);
+  const publishBlockingYellow = [...new Set([
+    ...(Array.isArray(context.input.publishBlockingYellow)
+      ? context.input.publishBlockingYellow.filter((id): id is string => typeof id === 'string') : []),
+    ...(Array.isArray(context.outputs['checklist-gate']?.publishBlockingYellow)
+      ? context.outputs['checklist-gate']!.publishBlockingYellow as string[] : []),
+    ...checklist.items.filter((item) => item.kind === 'postpub' && item.status === 'yellow').map((item) => item.id),
+  ])];
+  context.outputs['checklist-gate'] = { ...context.outputs['checklist-gate'], publishBlockingYellow };
+  const holdReasons = publishApprovalHoldReasons(context);
   const metrics: ApprovalMetric[] = [
     { name: BLOCKING_METRIC_NAMES[0], value: JSON.stringify({ outcome: gate?.outcome ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null, ownerWaived: ownerWaivedGate }),
       verdict: !gate || gate.outcome === undefined ? 'unmeasured'
@@ -81,11 +108,12 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
     { name: 'mac-smoke', value: macSmokeLevel(macSmoke), reason: typeof macSmoke?.summary === 'string' ? macSmoke.summary : undefined, verdict: 'pass' },
   ];
   const outcome = metrics.filter((metric) => !WARNING_ONLY.has(metric.name)).every((metric) => metric.verdict === 'pass')
-    && !regressNeedsApproval ? 'ok' as const : 'fail' as const;
+    && !regressNeedsApproval && holdReasons.length === 0 ? 'ok' as const : 'fail' as const;
   const report = join(root, 'release', version, 'auto-approval.md');
   const lines = [`# v${version} auto-approval`, '', `Outcome: ${outcome}`, '', '| # | Metric | Value | Verdict |', '|---|---|---|---|',
     ...metrics.map((metric, i) => `| ${i + 1} | ${metric.name} | ${[metric.value, metric.reason].filter(Boolean).join(' — ').replaceAll('|', '\\|').replace(/[\r\n]/g, ' ')} | ${metric.verdict} |`),
     '', `TUI subcheck: ${regressStatus.level} · failed ${failedLabel} · ${regressNeedsApproval ? 'HITL 수용/정지 필요' : '자동 판정 가능'}`,
+    ...(holdReasons.length ? ['', `Publish approval required: ${holdReasons.join('; ')}`] : []),
     '', '## 되돌리는 법', `gh release edit v${version} --draft`, `git tag -d v${version} && git push origin :refs/tags/v${version}`, '해당 docs PR revert', ''];
   mkdirSync(dirname(report), { recursive: true });
   writeFileSync(report, lines.join('\n'));
@@ -93,7 +121,7 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
     fail: failedCheckIds?.length ?? null, failedCheckIds, approvalRequired: regressNeedsApproval };
   debug.log('release-loop.approve', 'auto-decision', { version, outcome, metrics, runId: context.runId ?? null, tuiSubcheck });
   return { outcome, verdict: outcome === 'ok' ? 'pass' as const : 'fail' as const,
-    summary: `auto approval ${outcome}: ${metrics.filter((metric) => !WARNING_ONLY.has(metric.name) && metric.verdict === 'pass').length}/8${regressNeedsApproval ? ` · tui-regress ${regressStatus.level} failed ${failedLabel} → HITL` : ''}`,
+    summary: `auto approval ${outcome}: ${metrics.filter((metric) => !WARNING_ONLY.has(metric.name) && metric.verdict === 'pass').length}/8${regressNeedsApproval ? ` · tui-regress ${regressStatus.level} failed ${failedLabel} → HITL` : ''}${holdReasons.length ? ` · ${holdReasons.join('; ')} → HITL` : ''}`,
     runId: context.runId ?? null, tuiSubcheck, ...(outcome === 'ok' ? { decidedBy: 'release-loop metrics' as const } : {}), metrics, report };
 }
 

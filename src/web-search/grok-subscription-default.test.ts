@@ -7,6 +7,7 @@ import { _resetKeyCacheForTests } from '../config.js';
 import { resolveGrokCredential } from '../grok/credential.js';
 import { grokAgentSearch } from '../grok/agent-search.js';
 import { setUserConfigOverlay } from '../user-config.js';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import { _resetWebSearchProvidersForTests, addWebSearchProvider, listWebSearchProviders, searchWeb } from './index.js';
 
 afterEach(() => {
@@ -103,18 +104,20 @@ describe('Grok subscription search default', () => {
     }));
     const previousApiKey = process.env.XAI_API_KEY;
     const previousKeepEnvKeys = process.env.ELANOUS_KEEP_ENV_KEYS;
-    const previousFetch = globalThis.fetch;
     process.env.XAI_API_KEY = 'api-key-test-value';
     process.env.ELANOUS_KEEP_ENV_KEYS = '1';
     _resetKeyCacheForTests();
     setUserConfigOverlay(c => ({ ...c, webSearch: {} }));
     const logSpy = spyOn(debug, 'log');
     let captured: { url: string; init?: RequestInit } | undefined;
-    globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
-      captured = { url: String(url), init };
-      return new Response(JSON.stringify({ output: [] }), { status: 200 });
-    }) as unknown as typeof fetch;
     try {
+      await withFakeFetchDevice([{
+        url: 'https://api.x.ai/v1/responses', method: 'POST',
+        response: (request) => {
+          captured = { url: request.url, init: { method: request.method, headers: request.headers, body: request.body } };
+          return Response.json({ output: [] });
+        },
+      }], async (device) => {
       const credentialEnv = { ...process.env, XAI_API_KEY: 'api-key-test-value' } as NodeJS.ProcessEnv;
       expect(resolveGrokCredential({ home, env: credentialEnv, model: 'grok-4.6' })?.kind).toBe('subscription');
       expect(resolveGrokCredential({ home, env: credentialEnv, model: 'grok-4.6', skipSubscription: true })?.kind).toBe('api_key');
@@ -125,9 +128,11 @@ describe('Grok subscription search default', () => {
       expect(logSpy).toHaveBeenCalledWith('grok.agent-search', 'credential-selected', { kind: 'api_key', source: 'XAI_API_KEY' });
       expect(JSON.stringify(logSpy.mock.calls)).not.toContain('api-key-test-value');
       expect(JSON.stringify(logSpy.mock.calls)).not.toContain('subscription-test-token');
+      expect(device.calls()).toMatchObject([{ method: 'POST', routeId: 'route-1', status: 200 }]);
+      expect(device.calls()[0]?.headers).toEqual({ authorization: 'Bearer api-key-test-value', 'content-type': 'application/json' });
+      });
     } finally {
       logSpy.mockRestore();
-      globalThis.fetch = previousFetch;
       if (previousApiKey === undefined) delete process.env.XAI_API_KEY;
       else process.env.XAI_API_KEY = previousApiKey;
       if (previousKeepEnvKeys === undefined) delete process.env.ELANOUS_KEEP_ENV_KEYS;

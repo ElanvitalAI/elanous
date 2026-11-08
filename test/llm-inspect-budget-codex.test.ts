@@ -6,12 +6,7 @@
 //       미아밍 → 기존 2/3(implementation/structural). goal-loop 전-family 개방과 정합.
 
 import { describe, it, expect } from 'bun:test';
-import {
-  getInspectBudgetThreshold,
-  INSPECT_BUDGET_CODEX,
-  INSPECT_BUDGET_DEFAULT,
-  INSPECT_BUDGET_STRUCTURAL_ANALYSIS,
-} from '../src/llm.js';
+import { getInspectBudgetThreshold, INSPECT_BUDGET_CODEX, INSPECT_BUDGET_DEFAULT, INSPECT_BUDGET_STRUCTURAL_ANALYSIS } from '../src/llm.js';
 import type { LLMMessage } from '../src/llm.js';
 
 const impl = (): LLMMessage[] => [{ role: 'user', content: '이 버그를 수정해줘' }];

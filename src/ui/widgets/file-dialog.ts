@@ -12,7 +12,7 @@
 import type { KeyEvent } from '../../plugins/core/types.js';
 import { C } from '../../tui.js';
 import type { WidgetChromeSpec } from '../declarative/spec.js';
-import { resolveWidgetChromeBoxViewOptions } from '../declarative/index.js';
+import { resolveWidgetChromeBoxViewOptions } from '../declarative/presentation.js';
 import {
   buildPickerFooterHint,
   resolvePickerChromePresentation,

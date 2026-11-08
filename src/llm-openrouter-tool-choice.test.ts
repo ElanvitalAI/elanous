@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from './llm/tool-spec.js';
 // OR-TOOLCHOICE-PASS (2026-10-10) — the OpenRouter request builder carries the caller's toolChoice
 // as `tool_choice` (via toChatToolChoice), and nothing else moves:
 //   · openrouter without toolChoice → body unchanged (no tool_choice key)
@@ -8,7 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from './debug/log.js';
-import { getProviderForConfig, openRouterToolChoice, toChatToolChoice, toResponsesToolChoice, type LLMToolSpec, type ToolChoice } from './llm.js';
+import { getProviderForConfig, openRouterToolChoice, toChatToolChoice, toResponsesToolChoice, type ToolChoice } from './llm.js';
 import { saveTokens } from './oauth/store.js';
 import type { UserConfig } from './user-config.js';
 

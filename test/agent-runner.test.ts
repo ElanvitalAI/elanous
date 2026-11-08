@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // ── Phase B: agent runner tests ──
 //
 // Covers runAgent + AgentRegistry end-to-end using a fake LLMProvider
@@ -20,9 +21,7 @@ import {
 import type {
   AgentDefinition, AgentEvent,
 } from '../src/agent/types';
-import type {
-  LLMProvider, LLMStreamEvent, LLMToolSpec,
-} from '../src/llm';
+import type { LLMProvider, LLMStreamEvent } from '../src/llm';
 
 // ── Test helpers ──
 

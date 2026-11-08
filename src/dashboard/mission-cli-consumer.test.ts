@@ -295,7 +295,7 @@ test('parent continues after sidetab starts; late completion arrives once as a j
     notify: () => {},
     openTurn: {
       startTurnIfIdle: input => { openedInputs.push(input); return { opened: true, turnId: 'reflection-1' }; },
-      getCwd: () => '/Users/user/elanous-hq/seats/OPC',
+      getCwd: () => '/Users/TESTONLY/elanous-hq/seats/OPC',
       isPending: taskId => queue.has(taskId),
       detectSeat: () => ({ seat: 'OPC', source: 'cwd' }),
     },

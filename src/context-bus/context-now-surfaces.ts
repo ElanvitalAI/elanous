@@ -1,4 +1,4 @@
-import { contextNow, type ContextFact, type ContextNowAnswer, type ContextNowDeps } from './context-now.js';
+import { contextNow, releaseFactSummary, type ContextFact, type ContextNowAnswer, type ContextNowDeps } from './context-now.js';
 import { filterPublicDemoContext } from './context-now-public.js';
 
 export type ContextNowAudience = 'operator' | 'user' | 'public-demo';
@@ -35,22 +35,27 @@ function factText(fact: ContextFact): string {
     case 'decision': return `${fact.id} ${fact.title} (${fact.status})`;
     case 'seat': return `${fact.seat} ${fact.id ?? ''} ${fact.title ?? ''} (${fact.status})`.trim();
     case 'run': return fact.unreadable ? `못 읽음 · ${fact.unreadable}` : `${fact.goal} · ${fact.phase} · ${fact.elapsed}`;
-    case 'release': return fact.unreadable ? `못 읽음 · ${fact.unreadable}` : `${fact.version} · ${fact.node} · ${fact.status}`;
+    case 'release': return releaseFactSummary(fact);
     case 'schedule-late': return fact.unreadable ? `못 읽음 · ${fact.unreadable}` : `${fact.count}개 · ${fact.names.join(', ') || '없음'}`;
   }
 }
 
 export function renderTelegramNow(input: ContextNowAnswer, audience: ContextNowAudience = 'operator'): string {
   const answer = forAudience(input, audience);
+  const allRelease = answer.facts.filter(f => f.kind === 'release');
+  const release = allRelease.slice(0, 3);
   const rows = [
+    ...(release.length ? [['발행 런', release] as const] : []),
     ['판', answer.facts.filter(f => f.kind === 'version')],
     ['칸', answer.facts.filter(f => f.kind === 'cell')],
     ['결정', answer.facts.filter(f => f.kind === 'decision')],
     ['자리', answer.facts.filter(f => f.kind === 'seat')],
   ] as const;
   const lines = rows.map(([label, facts]) => `${label}: ${facts.length ? facts.map(f => `${factText(f)} — ${f.source}`).join(' · ') : '없음'}`);
+  if (allRelease.length > release.length) lines[0] += ` · 생략 ${allRelease.length - release.length}개 (/release)`;
   lines.push(`최근: ${answer.events.length ? answer.events.map(e => `${e.summary} — ${e.source}`).join(' · ') : '없음'}${answer.guide.length ? ` · 안내 ${answer.guide.join(' · ')}` : ''}`);
-  return lines.map(line => line.replace(/\s+/g, ' ').trim()).join('\n');
+  const rendered = lines.map(line => line.replace(/\s+/g, ' ').trim()).join('\n');
+  return Array.from(rendered).slice(0, 3800).join('') + (Array.from(rendered).length > 3800 ? '\n… 생략 (/release 로 상세 조회)' : '');
 }
 
 /** Context-first opening for chat connectors: up to three operational rows (live runs, an unfinished
@@ -100,7 +105,7 @@ export function renderTuiNow(input: ContextNowAnswer, audience: ContextNowAudien
     ...answer.facts.slice().sort((a, b) => {
       const priority = (kind: ContextFact['kind']) => ({ run: 0, release: 1, 'schedule-late': 2 } as Partial<Record<ContextFact['kind'], number>>)[kind] ?? 3;
       return priority(a.kind) - priority(b.kind);
-    }).map(f => [factLabels[f.kind], shortText(factText(f)), shortSource(f.source)]),
+    }).map(f => [factLabels[f.kind], f.kind === 'release' ? factText(f) : shortText(factText(f)), shortSource(f.source)]),
     ...events.slice(0, 8).map(e => [eventLabels[e.kind] ?? '소식', shortText(e.summary), shortSource(e.source)]),
     ...answer.guide.map(guide => ['안내', guide, '']),
     ...(events.length > 8 ? [['안내', `… 사건 ${events.length - 8}개 더(/now <주제> 로 좁히기)`, '']] : []),

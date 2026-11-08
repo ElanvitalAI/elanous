@@ -1,10 +1,11 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Autopilot Mission Tool (AL3 · 2026-07-09) ─────────────────────────────
 //
 // 대표 지시: "tool 로 내용 조회가 가능해야." 오토파일럿 미션과 그 파생물(크론/
 // 태스크/자율행동)을 조회하는 L2 코어 도구. list(미션 목록+헬스 롤업)·
 // trace(미션 1건의 계보 트리+각 live 상태). schedule-manage-tool 패턴(전 표면 공용).
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { openAutopilotMissionsDb, listMissions, getMission, type MissionRow } from './mission-registry.js';
 import { traceAutopilotMission } from './mission-trace.js';

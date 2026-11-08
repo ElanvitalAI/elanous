@@ -7,7 +7,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSy
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { snapshotWorktreeRoot, sweepNewEmptyWorktreeRoots } from './helpers/worktree-root-leak.js';
-import { simInProcessCli } from '../src/ux-sim/in-process-cli.js';
+import { simCli } from '../src/ux-sim/in-process-cli.js';
 import { createTempGitRemote, type TempGitRemote } from '../src/ux-sim/temp-git-remote.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -20,7 +20,6 @@ let worktreeRootBefore: ReadonlySet<string> = new Set();
 beforeAll(() => { worktreeRootBefore = snapshotWorktreeRoot(); });
 afterAll(() => { sweepNewEmptyWorktreeRoots(worktreeRootBefore); });
 
-const CLI = resolve(import.meta.dir, '..', 'bin', 'elanous.mjs');
 const childRoot = mkdtempSync(join(tmpdir(), 'elanous-cli-dev-child-'));
 const childHome = join(childRoot, 'home');
 const childConfig = join(childRoot, 'config');
@@ -46,26 +45,44 @@ function assertNoProductionConfigMaterialization(output: string): void {
   expect(output).not.toContain('[test-isolation] 운영 config 물질화');
 }
 
-function run(args: string[]): { code: number; out: string } {
-  const r = spawnSync('bun', [CLI, `--test=${childState}`, ...args], { encoding: 'utf-8', env: childEnv({ NODE_ENV: 'test' }) });
-  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+async function run(args: string[]): Promise<{ code: number; out: string }> {
+  const r = await simCli(args, {
+    allowPaths: [[], ['dev'], ['drive'], ['self', 'implement'], ['agent-mission', 'mission']], stateRoot: childState,
+    configRoot: childConfig, env: childEnv({ NODE_ENV: 'test' }),
+  });
+  const out = `${r.stdout}${r.stderr}`;
   assertNoProductionConfigMaterialization(out);
-  return { code: r.status ?? 1, out };
+  return { code: r.exitCode, out };
+}
+
+async function runSpawn(args: string[]): Promise<{ code: number; out: string }> {
+  const r = await simCli(args, {
+    mode: 'spawn', allowPaths: [[], ['dev'], ['drive'], ['self', 'implement'], ['agent-mission', 'mission']], stateRoot: childState,
+    configRoot: childConfig, timeoutMs: 90_000, killSignal: 'SIGKILL',
+    env: childEnv({ NODE_ENV: 'test' }),
+  });
+  const out = `${r.stdout}${r.stderr}`;
+  assertNoProductionConfigMaterialization(out);
+  return { code: r.exitCode, out };
 }
 
 /** Parser/help assertions use the real registered Commander tree in-process. */
 async function runRegistered(args: string[]): Promise<{ code: number; out: string }> {
-  const result = await simInProcessCli(args, { allowPaths: [['dev'], ['drive']] });
+  const result = await simCli(args, { allowPaths: [['dev'], ['drive']] });
   const out = result.stdout + result.stderr;
   assertNoProductionConfigMaterialization(out);
   return { code: result.exitCode, out };
 }
 
-function runIsolatedCli(args: string[], cwd?: string): { code: number; out: string } {
-  const r = spawnSync('bun', [CLI, `--test=${childState}`, ...args], { cwd, encoding: 'utf-8', env: childEnv({ NODE_ENV: 'test' }) });
-  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+async function runIsolatedCli(args: string[], cwd?: string, mode: 'in-process' | 'spawn' = 'in-process'): Promise<{ code: number; out: string }> {
+  const r = await simCli(args, {
+    mode, allowPaths: [['dev'], ['drive'], ['harness', 'dogfood']], stateRoot: childState,
+    configRoot: childConfig, cwd, env: childEnv({ NODE_ENV: 'test' }),
+    ...(mode === 'spawn' ? { timeoutMs: 90_000, killSignal: 'SIGKILL' as const } : {}),
+  });
+  const out = `${r.stdout}${r.stderr}`;
   assertNoProductionConfigMaterialization(out);
-  return { code: r.status ?? 1, out };
+  return { code: r.exitCode, out };
 }
 
 function createGitFixture(behind: number | 'no-origin'): TempGitRemote & { invoked: string } {
@@ -80,28 +97,26 @@ function createGitFixture(behind: number | 'no-origin'): TempGitRemote & { invok
   }
 }
 
-function runDevFixture(cwd: string, runId: string, gitEnv: Omit<NodeJS.ProcessEnv, 'NODE_ENV'>): {
+async function runDevFixture(cwd: string, runId: string, gitEnv: Omit<NodeJS.ProcessEnv, 'NODE_ENV'>): Promise<{
   output: string;
   logs: Array<{ event: string; data: string }>;
-} {
+}> {
   const env = childEnv({ ...gitEnv, ELANOUS_RUN_ID: runId });
-  const result = spawnSync('bun', [CLI, `--test=${childState}`, 'dev', 'runtime git fixture', '--backend', 'codex', '--transport', 'acp'], {
-    // The real CLI/ACP subprocess needs a cold-start window on gate Pods.
-    // 15 s hit ETIMEDOUT in all three worktree cases on node-b (2026-10-15).
-    cwd, env, encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL',
+  const result = await simCli([`--test=${childState}`, 'dev', 'runtime git fixture', '--backend', 'codex', '--transport', 'acp'], {
+    mode: 'spawn', allowPaths: [['dev']], stateRoot: childState,
+    cwd, env, timeoutMs: 60_000, killSignal: 'SIGKILL',
   });
   // 프로세스 종료와 pipeline 진입을 별개로 확인한다. 관측 `plan` 이 없으면
   // 경고를 출력했어도 실행 경로에 닿지 못한 것이다.
-  if (result.error || result.signal) {
-    throw new Error(`dev spawn 실패: ${result.error?.message ?? result.signal}\nstdout: ${(result.stdout ?? '').slice(-4000)}\nstderr: ${(result.stderr ?? '').slice(-4000)}`);
+  if (result.signal) {
+    throw new Error(`dev spawn 실패: ${result.signal}\nstdout: ${result.stdout.slice(-4000)}\nstderr: ${result.stderr.slice(-4000)}`);
   }
-  const logResult = spawnSync('bun', [CLI, `--test=${childState}`, 'logs', '--exact-category', 'dev-pipeline', '--since', '10m', '--json', '--limit', '10'], {
-    cwd, env, encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL',
+  const logResult = await simCli([`--test=${childState}`, 'logs', '--exact-category', 'dev-pipeline', '--since', '10m', '--json', '--limit', '10'], {
+    allowPaths: [['logs']], stateRoot: childState, cwd, env,
   });
-  if (logResult.error) throw new Error(`logs spawn 실패: ${logResult.error.message}`);
   if (logResult.signal) throw new Error(`logs 가 시그널로 죽었다(관측을 못 읽었다): signal=${logResult.signal}`);
-  expect(result.status, `${result.stdout ?? ''}${result.stderr ?? ''}`).toBe(2);
-  expect(logResult.status, `${logResult.stdout ?? ''}${logResult.stderr ?? ''}`).toBe(0);
+  expect(result.exitCode, `${result.stdout}${result.stderr}`).toBe(2);
+  expect(logResult.exitCode, `${logResult.stdout}${logResult.stderr}`).toBe(0);
   const logs = logResult.stdout.trim().split('\n').filter(Boolean)
     .map((line) => JSON.parse(line) as { event: string; data: string })
     .filter((record) => {
@@ -163,53 +178,67 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     }
   });
 
-  it('dev --file derives traced paths through the repository reader, reports labels, preserves explicit context priority, and keeps text goals empty', () => {
+  const createGoalFile = (tracedPaths: string) => {
     const directory = mkdtempSync(join(tmpdir(), 'elanous-dev-traced-context-'));
     const goalPath = join(directory, 'goal.md');
-    const validGoal = (tracedPaths: string) => [
+    const contents = [
       '## PROBLEM\nproblem', '## WHAT TO BUILD\nbuild', '## RULES\nrules',
       '## ACCEPTANCE CRITERIA\ncriteria', '## REQUIRED EVIDENCE\n- [test] proof',
       `## TRACED PATHS\n${tracedPaths}`, '## SCOPE BOUNDARY\nboundary', '## 불변식\nkeep', '## 판정 신호\nsignal',
     ].join('\n\n');
+    writeFileSync(goalPath, contents);
+    return { directory, goalPath };
+  };
+
+  it('dev --file derives traced paths through the repository reader and reports missing labels', async () => {
+    const { directory, goalPath } = createGoalFile('- src/index.ts — goal evidence\n- missing.ts — nonfatal diagnostic');
     try {
-      writeFileSync(goalPath, validGoal('- src/index.ts — goal evidence\n- missing.ts — nonfatal diagnostic'));
-      const derived = runIsolatedCli(['dev', '--file', goalPath, '--backend', 'codex', '--transport', 'acp', '--allow-goal-lint-errors']);
-      expect(derived.code, derived.out).toBe(2);
-      expect(derived.out).toContain('acp 완료 · ok=false');
-      expect(derived.out).toContain('Reviewer context: 1 loaded, 1 not loaded.');
-      expect(derived.out).toContain('- src/index.ts');
-      expect(derived.out).toContain('- missing.ts: missing');
-
-      const explicit = runIsolatedCli(['dev', '--file', goalPath, '--backend', 'codex', '--transport', 'acp', '--context', 'src/self-dev/dev-cli.ts', '--allow-goal-lint-errors']);
-      expect(explicit.code, explicit.out).toBe(2);
-      expect(explicit.out).toContain('acp 완료 · ok=false');
-      expect(explicit.out).toContain('Reviewer context: 1 loaded, 0 not loaded.');
-      expect(explicit.out).toContain('- src/self-dev/dev-cli.ts');
-      expect(explicit.out).not.toContain('- src/index.ts');
-
-      const text = runIsolatedCli(['dev', 'text goal', '--backend', 'codex', '--transport', 'acp']);
-      expect(text.code, text.out).toBe(2);
-      expect(text.out).toContain('acp 완료 · ok=false');
-      expect(text.out).not.toContain('Reviewer context:');
+      const result = await runIsolatedCli(['dev', '--file', goalPath, '--backend', 'codex', '--transport', 'acp', '--allow-goal-lint-errors']);
+      expect(result.code, result.out).not.toBe(0);
+      expect(result.out).toContain('acp 완료 · ok=false');
+      expect(result.out).toContain('Reviewer context: 1 loaded, 1 not loaded.');
+      expect(result.out).toContain('- src/index.ts');
+      expect(result.out).toContain('- missing.ts: missing');
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 90_000);
+  });
 
-  it('bin 실물 argv는 혼합 reviewer context 옵션을 등록·drive 거부·저장소 경계 읽기 실패까지 전달한다', () => {
-    const help = runIsolatedCli(['dev', '--help-all']);
+  it('dev --file keeps explicit reviewer context ahead of traced paths', async () => {
+    const { directory, goalPath } = createGoalFile('- src/index.ts — goal evidence');
+    try {
+      const result = await runIsolatedCli(['dev', '--file', goalPath, '--backend', 'codex', '--transport', 'acp', '--context', 'src/self-dev/dev-cli.ts', '--allow-goal-lint-errors']);
+      expect(result.code, result.out).not.toBe(0);
+      expect(result.out).toContain('acp 완료 · ok=false');
+      expect(result.out).toContain('Reviewer context: 1 loaded, 0 not loaded.');
+      expect(result.out).toContain('- src/self-dev/dev-cli.ts');
+      expect(result.out).not.toContain('- src/index.ts');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('dev text goals keep reviewer context empty', async () => {
+    const result = await runIsolatedCli(['dev', 'text goal', '--backend', 'codex', '--transport', 'acp']);
+    expect(result.code, result.out).not.toBe(0);
+    expect(result.out).toContain('acp 완료 · ok=false');
+    expect(result.out).not.toContain('Reviewer context:');
+  });
+
+  it('bin 실물 argv는 혼합 reviewer context 옵션을 등록·drive 거부·저장소 경계 읽기 실패까지 전달한다', async () => {
+    const help = await runIsolatedCli(['dev', '--help-all'], undefined, 'spawn');
     expect(help.code).toBe(0);
     expect(help.out).toContain('--context');
     expect(help.out).toContain('--context-text');
 
     for (const option of [['--context', 'README.md'], ['--context-text', 'review premise']] as const) {
-      const drive = runIsolatedCli(['drive', 'exit 0', '--goal', 'finish', ...option]);
+      const drive = await runIsolatedCli(['drive', 'exit 0', '--goal', 'finish', ...option], undefined, 'spawn');
       expect(drive.code).not.toBe(0);
       expect(drive.out).toContain(`drive: 지원하지 않는 옵션: ${option[0]}`);
     }
 
     const missing = 'definitely-missing-review-context.md';
-    const context = runIsolatedCli(['dev', 'no child launch', '--context', missing, '--context-text=inline premise']);
+    const context = await runIsolatedCli(['dev', 'no child launch', '--context', missing, '--context-text=inline premise'], undefined, 'spawn');
     expect(context.code).not.toBe(0);
     expect(context.out).toContain(missing);
     expect(context.out).toMatch(/not found|없|missing/i);
@@ -219,11 +248,11 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     //   ⇒ 흔들린 것은 «판정»이 아니라 «창»이다. 검사문은 그대로 두고 창만 넓힌다.
   }, 30_000);
 
-  it('뒤처진 invoked worktree는 정확한 경고·dev-pipeline 관측을 남기고 pipeline 발사를 계속한다', () => {
+  it('뒤처진 invoked worktree는 정확한 경고·dev-pipeline 관측을 남기고 pipeline 발사를 계속한다', async () => {
     const fixture = createGitFixture(2);
     try {
       const runId = `behind-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      const result = runDevFixture(fixture.invoked, runId, fixture.gitEnv);
+      const result = await runDevFixture(fixture.invoked, runId, fixture.gitEnv);
       expect(result.output).toContain('origin/main보다 2개 커밋 뒤처져 있습니다');
       const behindEvents = result.logs.filter(({ event }) => event === 'worktree-behind-main');
       expect(behindEvents).toHaveLength(1);
@@ -234,10 +263,10 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     }
   }, 90_000);
 
-  it('origin/main과 동기화된 invoked worktree는 무경고로 pipeline 발사를 계속한다', () => {
+  it('origin/main과 동기화된 invoked worktree는 무경고로 pipeline 발사를 계속한다', async () => {
     const fixture = createGitFixture(0);
     try {
-      const result = runDevFixture(fixture.invoked, `current-${Date.now()}-${Math.random().toString(16).slice(2)}`, fixture.gitEnv);
+      const result = await runDevFixture(fixture.invoked, `current-${Date.now()}-${Math.random().toString(16).slice(2)}`, fixture.gitEnv);
       expect(result.output).not.toContain('작업 트리는 origin/main보다');
       expect(result.logs.some(({ event }) => event === 'worktree-behind-main')).toBe(false);
       expect(result.logs.some(({ event }) => event === 'plan')).toBe(true);
@@ -246,10 +275,10 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     }
   }, 90_000);
 
-  it('origin을 측정할 수 없는 invoked worktree는 무경고로 pipeline 발사를 계속한다', () => {
+  it('origin을 측정할 수 없는 invoked worktree는 무경고로 pipeline 발사를 계속한다', async () => {
     const fixture = createGitFixture('no-origin');
     try {
-      const result = runDevFixture(fixture.invoked, `unknown-${Date.now()}-${Math.random().toString(16).slice(2)}`, fixture.gitEnv);
+      const result = await runDevFixture(fixture.invoked, `unknown-${Date.now()}-${Math.random().toString(16).slice(2)}`, fixture.gitEnv);
       expect(result.output).not.toContain('작업 트리는 origin/main보다');
       expect(result.logs.some(({ event }) => event === 'worktree-behind-main')).toBe(false);
       expect(result.logs.some(({ event }) => event === 'plan')).toBe(true);
@@ -258,23 +287,53 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     }
   }, 90_000);
 
-  it('dev --json --worktree preserves created provenance when the real child initialization throws', () => {
+  it('drive --worktree propagates a real child failure and preserves worktree metadata', async () => {
+    const fixture = createGitFixture(0);
+    const runId = `drive-worktree-failure-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    let testFailed = true;
+    try {
+      const result = await simCli([`--test=${childState}`, 'drive', 'printf child-dispatch-failed >&2; exit 23', '--goal', 'observe the child failure', '--worktree'], {
+        mode: 'spawn', allowPaths: [['drive']], stateRoot: childState, configRoot: childConfig, cwd: fixture.invoked,
+        timeoutMs: 120_000, killSignal: 'SIGKILL',
+        env: childEnv({ ...fixture.gitEnv, ELANOUS_RUN_ID: runId, NODE_ENV: 'test' }),
+      });
+      assertNoProductionConfigMaterialization(`${result.stdout}${result.stderr}`);
+      expect(result.signal).toBeNull();
+      expect(result.exitCode, `${result.stdout}${result.stderr}`).toBe(23);
+      expect(`${result.stdout}${result.stderr}`).toMatch(/(?:^|\n)child-dispatch-failed(?:\r?\n|$)/);
+      const worktreePath = findHarnessWorktree(fixture.invoked, `dev/${runId}`).path;
+      expect(worktreePath).toBeDefined();
+      const reportedPath = `${result.stdout}${result.stderr}`.match(/^worktree\.path: (.+)$/m)?.[1];
+      expect(reportedPath).toBeDefined();
+      expect(fixture.git(reportedPath!, ['rev-parse', '--show-toplevel'])).toBe(worktreePath!);
+      expect(`${result.stdout}${result.stderr}`).toContain(`worktree.branch: dev/${runId}`);
+      expect(`${result.stdout}${result.stderr}`).toContain('worktree.command: drive');
+      expect(worktreePath!.startsWith(`${realpathSync(fixture.invoked)}/`)).toBe(false);
+      expect(fixture.git(worktreePath!, ['config', '--worktree', '--get', 'elanous.harness.command'])).toBe('drive');
+      expect(fixture.git(worktreePath!, ['config', '--worktree', '--get', 'elanous.harness.owner'])).toBe(`dev:${runId}`);
+      expect(fixture.git(worktreePath!, ['config', '--worktree', '--get', 'elanous.harness.createdAt'])).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      testFailed = false;
+    } finally {
+      cleanupHarnessWorktree(fixture.invoked, `dev/${runId}`, testFailed);
+      fixture.cleanup();
+    }
+  }, 120_000);
+
+  it('dev --json --worktree preserves created provenance when the real child initialization throws', async () => {
     const fixture = createGitFixture(0);
     const runId = `worktree-failure-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const invalidIsolationRoot = join(fixture.invoked, 'not-a-directory');
     writeFileSync(invalidIsolationRoot, 'blocks directory creation\n');
     let testFailed = true;
     try {
-      const result = spawnSync('bun', [CLI, `--test=${childState}`, 'dev', 'exercise child dispatch', '--elanous', '--hold', '--isolated-root', invalidIsolationRoot, '--worktree', '--json'], {
-        cwd: fixture.invoked,
-        encoding: 'utf8',
-        timeout: 15_000, killSignal: 'SIGKILL',
+      const result = await simCli([`--test=${childState}`, 'dev', 'exercise child dispatch', '--elanous', '--hold', '--isolated-root', invalidIsolationRoot, '--worktree', '--json'], {
+        mode: 'spawn', allowPaths: [['dev']], stateRoot: childState, configRoot: childConfig, cwd: fixture.invoked,
+        timeoutMs: 15_000, killSignal: 'SIGKILL',
         env: childEnv({ ...fixture.gitEnv, ELANOUS_RUN_ID: runId, NODE_ENV: 'test' }),
       });
-      expect(result.error).toBeUndefined();
-      assertNoProductionConfigMaterialization(`${result.stdout ?? ''}${result.stderr ?? ''}`);
+      assertNoProductionConfigMaterialization(`${result.stdout}${result.stderr}`);
       expect(result.signal).toBeNull();
-      expect(result.status, `${result.stdout ?? ''}${result.stderr ?? ''}`).toBe(1);
+      expect(result.exitCode, `${result.stdout}${result.stderr}`).toBe(1);
       const jsonStart = result.stdout.lastIndexOf('\n{');
       expect(jsonStart, result.stdout).toBeGreaterThanOrEqual(0);
       const output = JSON.parse(result.stdout.slice(jsonStart + 1)) as { error: string; autoWorktree: { environment: { branch: string }; worktree: { path: string; branch: string; owner: string; command: string; createdAt: string } } };
@@ -358,7 +417,7 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
     //   정리 helper 가 조회 실패를 「없었다」로 삼키면, «지워야 할 워크트리»를 조용히 놓치고도
     //   시험은 초록이다. 그 약화가 다시 들어오면 여기가 먼저 빨개진다.
 
-    it('git 저장소가 «아닌» 곳에서는 「없다」가 아니라 «던진다»', () => {
+    it('git 저장소가 «아닌» 곳에서는 「없다」가 아니라 «던진다»', async () => {
       const notARepo = mkdtempSync(join(tmpdir(), 'elanous-not-a-repo-'));
       try {
         // 본 시험이 통과 중(testAlreadyFailed=false)이면 정리 실패는 «보여야» 한다.
@@ -368,7 +427,7 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
       }
     });
 
-    it('본 시험이 «이미 실패 중»이면 정리 실패가 원래 진단을 덮지 않는다', () => {
+    it('본 시험이 «이미 실패 중»이면 정리 실패가 원래 진단을 덮지 않는다', async () => {
       const notARepo = mkdtempSync(join(tmpdir(), 'elanous-not-a-repo-'));
       try {
         expect(() => cleanupHarnessWorktree(notARepo, 'dev/never-created', true)).not.toThrow();
@@ -377,65 +436,22 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
       }
     });
 
-    it('진짜 저장소인데 그 브랜치 워크트리가 «없으면» 조용히 넘어간다', () => {
+    it('진짜 저장소인데 그 브랜치 워크트리가 «없으면» 조용히 넘어간다', async () => {
       expect(() => cleanupHarnessWorktree(process.cwd(), 'dev/definitely-not-a-branch-xyz', false)).not.toThrow();
     });
   });
 
-  it('drive --worktree runs a real failing child and preserves git worktree metadata', () => {
-    const fixture = createGitFixture(0);
-    const runId = `drive-worktree-failure-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    let testFailed = true;
-    try {
-      const result = spawnSync('bun', [CLI, `--test=${childState}`, 'drive', 'printf child-dispatch-failed >&2; exit 23', '--goal', 'observe the child failure', '--worktree'], {
-        cwd: fixture.invoked,
-        encoding: 'utf8',
-        // ⛔⭐ 이 창은 «고정 상수가 아니라 관측값»이다 — 실측 2026-08-20 (같은 코드, 같은 기계):
-        //     15,000ms → 15,220ms 에 SIGTERM   ⇒ 25,000 으로 넓힘
-        //     25,000ms → 25,353ms 에 SIGTERM   ⇒ ***넓힌 만큼 더 걸렸다***
-        //   🔑 그 지문은 「자식이 느리다」가 아니라 ***「저장소의 워크트리 수에 비례한다」***를 가리킨다
-        //     (그날 이 저장소의 워크트리가 275개였다 · git worktree 조작이 전수를 훑는다).
-        //   ⇒ 그러니 이 값을 다시 올리기 전에 «워크트리 수»를 먼저 재라 —
-        //     창을 올리는 것은 증상 완화이고, 수가 늘면 또 넘는다.
-        timeout: 60_000, killSignal: 'SIGKILL',
-        env: childEnv({ ...fixture.gitEnv, ELANOUS_RUN_ID: runId, NODE_ENV: 'test' }),
-      });
-      expect(result.error).toBeUndefined();
-      assertNoProductionConfigMaterialization(`${result.stdout ?? ''}${result.stderr ?? ''}`);
-      expect(result.signal).toBeNull();
-      expect(result.status, `${result.stdout ?? ''}${result.stderr ?? ''}`).toBe(23);
-      // PTY merges child stderr into the CLI stdout stream; require the actual output, not the echoed command.
-      expect(result.stdout).toMatch(/(?:^|\n)child-dispatch-failed(?:\r?\n|$)/);
-      const worktreePath = findHarnessWorktree(fixture.invoked, `dev/${runId}`).path;
-      expect(worktreePath).toBeDefined();
-      const reportedPath = result.stdout.match(/^worktree\.path: (.+)$/m)?.[1];
-      expect(reportedPath).toBeDefined();
-      expect(fixture.git(reportedPath!, ['rev-parse', '--show-toplevel'])).toBe(worktreePath!);
-      expect(result.stdout).toContain(`worktree.branch: dev/${runId}`);
-      expect(result.stdout).toContain(`worktree.command: drive`);
-      expect(worktreePath!.startsWith(`${realpathSync(fixture.invoked)}/`)).toBe(false);
-      expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.command'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toBe('drive');
-      expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.owner'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toBe(`dev:${runId}`);
-      expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.createdAt'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toMatch(/^\d{4}-\d{2}-\d{2}T/);
-      testFailed = false;
-    } finally {
-      // ⛔ 성공/실패 «어느 경로에서도» 판정자에게 다시 물어 지운다(리뷰 must-fix).
-      cleanupHarnessWorktree(fixture.invoked, `dev/${runId}`, testFailed);
-      fixture.cleanup();
-    }
-  }, 120_000);
-
-  it('dev와 self implement는 공식 --observe-only 창구를 Commander 도움말에 노출한다', () => {
-    const dev = run(['dev', '--help-all']);
-    const selfImplement = run(['self', 'implement', '--help']);
+  it('dev와 self implement는 공식 --observe-only 창구를 Commander 도움말에 노출한다', async () => {
+    const dev = await run(['dev', '--help-all']);
+    const selfImplement = await run(['self', 'implement', '--help']);
     expect(dev.code).toBe(0);
     expect(selfImplement.code).toBe(0);
     expect(dev.out).toContain('--observe-only');
     expect(selfImplement.out).toContain('--observe-only');
-  });
+  }, 210_000);
 
-  it('external backend + --branch 누락 → agent-mission 대응 명령을 안내하고 branch 부재를 거부한다', () => {
-    const r = run(['dev', '기능', '--backend', 'codex']);
+  it('external backend + --branch 누락 → agent-mission 대응 명령을 안내하고 branch 부재를 거부한다', async () => {
+    const r = await run(['dev', '기능', '--backend', 'codex']);
     expect(r.code).not.toBe(0);
     expect(r.out).toContain('elanous agent-mission mission --backend codex');
     expect(r.out).toMatch(/--branch.*(?:필수|필요|없)/);
@@ -459,31 +475,31 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
     expect(r.out.toLowerCase()).toContain('choices');
   });
 
-  it('shell target은 dev에서 기존 drive 옵션을 받고 shell-drive 경로의 무효 옵션을 거부한다', () => {
-    const r = run(['dev', 'printf done', '--goal', 'finish', '--max-steps', '2', '--poll-ms', '0', '--model', 'brain', '--cwd', '/work', '--isolated-root', '/iso']);
+  it('shell target은 dev에서 기존 drive 옵션을 받고 shell-drive 경로의 무효 옵션을 거부한다', async () => {
+    const r = await run(['dev', 'printf done', '--goal', 'finish', '--max-steps', '2', '--poll-ms', '0', '--model', 'brain', '--cwd', '/work', '--isolated-root', '/iso']);
     expect(r.code).not.toBe(0);
     expect(r.out).toContain('shell-drive');
     expect(r.out).toContain('isolatedRoot');
   });
 
-  it('drive는 dev의 Commander alias이고 command·goal 검증·shell-only 경계를 보존하며 top-level help에는 독립 항목으로 노출되지 않는다', () => {
-    const noCommand = run(['drive', '--goal', 'finish']);
+  it('drive는 dev의 Commander alias이고 command·goal 검증·shell-only 경계를 보존하며 top-level help에는 독립 항목으로 노출되지 않는다', async () => {
+    const noCommand = await run(['drive', '--goal', 'finish']);
     expect(noCommand.code).not.toBe(0);
     expect(noCommand.out).toContain('drive: command 필요');
-    const noGoal = run(['drive', 'printf done']);
+    const noGoal = await run(['drive', 'printf done']);
     expect(noGoal.code).not.toBe(0);
     expect(noGoal.out).toContain('drive: --goal 필요');
-    const elanous = run(['drive', 'printf done', '--goal', 'finish', '--elanous']);
+    const elanous = await run(['drive', 'printf done', '--goal', 'finish', '--elanous']);
     expect(elanous.code).not.toBe(0);
     expect(elanous.out).toContain('drive: 지원하지 않는 옵션: --elanous');
-    const help = run(['--help']);
+    const help = await run(['--help']);
     expect(help.code).toBe(0);
     expect(help.out).toMatch(/^  dev\b/m);
     expect(help.out).not.toMatch(/^  drive\b/m);
   }, 15_000);
 
-  it('옵션값 drive를 alias 호출로 오인하지 않는다', () => {
-    const r = run(['dev', '--elanous', '--goal', 'drive', '--max-steps', '0']);
+  it('옵션값 drive를 alias 호출로 오인하지 않는다', async () => {
+    const r = await run(['dev', '--elanous', '--goal', 'drive', '--max-steps', '0']);
     expect(r.out).not.toContain('drive:');
     expect(r.out).toContain('--max-steps 는 양의 정수여야');
   });
@@ -497,14 +513,14 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
   }, 15_000);
 
   // 실제 셸 제어 루프는 임시 cwd 에서만 구동한다. 자격증명 없이도 자식 종료 코드를 전파한다.
-  it('drive subprocess는 실제 shell child exit code를 그대로 전파한다', () => {
-    const r = run(['drive', 'exit 7', '--goal', 'finish', '--poll-ms', '0', '--cwd', childRoot]);
-    expect(r.code, r.out).toBe(7);
+  it('drive subprocess는 성공 자식의 exit 0 도 그대로 전파한다', async () => {
+    const r = await runSpawn(['drive', 'true', '--goal', 'finish', '--poll-ms', '0', '--cwd', childRoot]);
+    expect(r.code, r.out).toBe(0);
   }, 30_000);
 
-  it('drive subprocess는 성공 자식의 exit 0 도 그대로 전파한다', () => {
-    const r = run(['drive', 'true', '--goal', 'finish', '--poll-ms', '0', '--cwd', childRoot]);
-    expect(r.code).toBe(0);
+  it('drive subprocess는 실제 shell child exit code를 그대로 전파한다', async () => {
+    const r = await runSpawn(['drive', 'exit 7', '--goal', 'finish', '--poll-ms', '0', '--cwd', childRoot]);
+    expect(r.code, r.out).toBe(7);
   }, 30_000);
 
   it('drive 는 무인 완결을 끄는 --no-* 를 받지 않고 기존처럼 거부한다', async () => {
@@ -515,8 +531,8 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
     }
   }, 30_000);
 
-  it('U6 — --backend self --transport acp → 거부(self 는 transport-free·silent-ignore 금지)', () => {
-    const r = run(['dev', '기능', '--backend', 'self', '--transport', 'acp']);
+  it('U6 — --backend self --transport acp → 거부(self 는 transport-free·silent-ignore 금지)', async () => {
+    const r = await run(['dev', '기능', '--backend', 'self', '--transport', 'acp']);
     expect(r.code).not.toBe(0);
     expect(r.out).toContain('transport 는 external backend 전용');
   });
@@ -530,14 +546,14 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
 
 describe('U4b — agent-mission mission 이 runDevPipeline 로 재라우팅(검증계약 보존)', () => {
   // 재라우팅 후에도 기존 CLI 검증(branch 필수·bad backend fail-fast)이 실행 전에 보존됨(무회귀·실행 미유발).
-  it('--branch 누락 → 여전히 거부(commander requiredOption)', () => {
-    const r = run(['agent-mission', 'mission', 'x']);
+  it('--branch 누락 → 여전히 거부(commander requiredOption)', async () => {
+    const r = await run(['agent-mission', 'mission', 'x']);
     expect(r.code).not.toBe(0);
     expect(r.out).toContain('--branch');
   });
 
-  it('bad backend → resolveBackend 조기 거부(재라우팅 전)', () => {
-    const r = run(['agent-mission', 'mission', 'x', '--branch', 'b', '--backend', 'bogus']);
+  it('bad backend → resolveBackend 조기 거부(재라우팅 전)', async () => {
+    const r = await run(['agent-mission', 'mission', 'x', '--branch', 'b', '--backend', 'bogus']);
     expect(r.code).not.toBe(0);
     expect(r.out).toContain('알 수 없는 agent backend');
   });
@@ -558,23 +574,23 @@ describe('U4b — agent-mission mission 이 runDevPipeline 로 재라우팅(검�
 describe('elanous dev --file — 골 린트 여섯 축 preflight(subprocess)', () => {
   const LINT_ERROR_GOAL = '## ACCEPTANCE CRITERIA\nx\n\n## REQUIRED EVIDENCE\n- [t] tag\n';
 
-  function withGoal<T>(body: (goalPath: string) => T): T {
+  async function withGoal<T>(body: (goalPath: string) => Promise<T>): Promise<T> {
     const directory = mkdtempSync(join(tmpdir(), 'elanous-dev-lint-'));
     try {
       const goalPath = join(directory, 'lint-error-goal.txt');
       writeFileSync(goalPath, LINT_ERROR_GOAL);
-      return body(goalPath);
+      return await body(goalPath);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   }
 
-  it('lint ERROR 가 있는 골은 발사 전에 거부되고, 걸린 축과 우회 경로를 문면에 말한다', () => {
-    withGoal((goalPath) => {
+  it('lint ERROR 가 있는 골은 발사 전에 거부되고, 걸린 축과 우회 경로를 문면에 말한다', async () => {
+    await withGoal(async (goalPath) => {
       // ⚠️ 디폴트 backend(self)로 둔다 — **거부는 디스패치 전에** 나므로 자식이 뜨지 않는다.
       //   ⛔ 운반체로 `--transport acp` 를 얹지 않는다: 그 경로는 이 진입점에서 **완료하지 않고 멈추고**,
       //      멈춘 자식이 프로세스로 **누적**된다(2026-08-03 실측 — 좀비 11개를 손으로 걷었다).
-      const r = run(['dev', '--file', goalPath]);
+      const r = await run(['dev', '--file', goalPath]);
       // ⛔ 종료 코드만으로는 못 가른다 — 무엇이 걸렸는지 문면이 말해야 사람이 고칠 수 있다.
       expect(r.code).not.toBe(0);
       expect(r.out).toContain('ERROR [canonical-structure]');
@@ -584,8 +600,8 @@ describe('elanous dev --file — 골 린트 여섯 축 preflight(subprocess)', (
     });
   }, 120_000);
 
-  it('--help 는 명시 lint 우회 플래그를 정문에 노출한다', () => {
-    const r = run(['dev', '--help-all']);
+  it('--help 는 명시 lint 우회 플래그를 정문에 노출한다', async () => {
+    const r = await run(['dev', '--help-all']);
     expect(r.code).toBe(0);
     expect(r.out).toContain('--allow-goal-lint-errors');
   });
@@ -595,8 +611,8 @@ describe('은퇴 입구가 «사람 눈에» 닿는다 (subprocess · RFC-one-do
   // ⛔ 리뷰 #10572 must-fix: 「접두사를 만들 수 있다」만 무는 시험은 «배선 누락»을 못 잡는다.
   //   ⇒ 진짜 CLI 를 띄워 --help 를 읽는다. 2026-08-17 사고가 정확히 「선언은 있는데 표면이 조용」이었다.
 
-  it('elanous harness dogfood --help 가 은퇴 사실과 «갈 곳»을 둘 다 말한다', () => {
-    const help = runIsolatedCli(['harness', 'dogfood', '--help']);
+  it('elanous harness dogfood --help 가 은퇴 사실과 «갈 곳»을 둘 다 말한다', async () => {
+    const help = await runIsolatedCli(['harness', 'dogfood', '--help']);
     expect(help.code, help.out).toBe(0);
     expect(help.out).toContain('DEPRECATED');
     expect(help.out).toContain('cli-harness-dogfood');       // 어느 입구인지 «이름»으로
@@ -605,8 +621,8 @@ describe('은퇴 입구가 «사람 눈에» 닿는다 (subprocess · RFC-one-do
     expect(help.out).toContain('RunDevHarness로 HITL 유지');
   }, 60_000);
 
-  it('live 입구(elanous dev --help)에는 은퇴 표시가 «안 붙는다»', () => {
-    const help = runIsolatedCli(['dev', '--help']);
+  it('live 입구(elanous dev --help)에는 은퇴 표시가 «안 붙는다»', async () => {
+    const help = await runIsolatedCli(['dev', '--help']);
     expect(help.code, help.out).toBe(0);
     expect(help.out).not.toContain('DEPRECATED(cli-');
   }, 60_000);

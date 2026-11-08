@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── session_search 공유 도구 (2026-07-09) — 전 표면 상속 + CLI + 외부 조회 ──
 //
 // 대표 지시: elanous가 관리하는 **대화 세션**(TUI/CLI·텔레그램·PWA)을 **내용 기반으로
@@ -18,7 +19,7 @@
 import { rgFilesWithMatchesAsync } from '../tool-runtime/ripgrep-core.js';
 import { readdirSync } from 'node:fs';
 import { basename } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import { getRecentMessages, getMessagesAround, findRecentMatches } from '../session/recent-context.js';
 import { rankByTrigramFts } from '../session/search-index.js';
 import {

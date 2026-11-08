@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // H5 Phase 2 · LLM tools for TTY snapshot inspection.
 //
 // Three tools exposed:
@@ -10,7 +11,7 @@
 // that come with channel info (from an attached TransportObserver)
 // include those buffers in the returned metadata.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   defaultTtySnapshotStore,
   diffSnapshots,

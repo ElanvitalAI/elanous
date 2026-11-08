@@ -218,6 +218,8 @@ export interface ReviewerContextBudget {
 export interface ReviewInput {
   prDiff: string;
   phaseIntent: string;
+  /** Explicit PR scope boundary and evidence-closed findings, kept separate from intent and evidence provenance. */
+  reviewScopeContract?: string;
   acceptance?: string;
   workingMemory?: string;
   /** Separate human-provided review context; preserve caller order and do not append to phaseIntent. */
@@ -695,6 +697,7 @@ export function buildReviewPrompt(
     'You are a strict staff-engineer reviewing an ALREADY-OPENED pull request from an autonomous coding agent.',
     // ⚠️ 무표식 절단 금지(리뷰 must-fix) — 잘렸으면 **어느 절부터**인지 리뷰어가 알아야 한다.
     phaseIntentHeading, phaseIntent,
+    ...(input.reviewScopeContract ? ['## Review scope contract', input.reviewScopeContract] : []),
     '## Mock-first evidence policy (default; applies even without reviewer context)',
     'Unit mocks, simulation, and isolated test-universe evidence are valid when the test invokes the real changed production entrypoint/path and mocks only external boundaries such as cloud, network, LLM, clock, or CLI tools.',
     'Missing production/live proof by itself is not a MUST-FIX, including missing deployed-environment proof. Put a finding that requires only live proof in SHOULD-FIX as a -LIVE follow-up candidate; name the exact <cell>-LIVE when the cell id is present in context.',

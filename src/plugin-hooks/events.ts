@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── PX-3 P1: 5 turn-level hook event types ──
 //
 // Each hook event has a strict In / Out pair. Plugins register handlers
@@ -9,7 +10,7 @@
 // need today (Turn / Message / ToolCall / SubagentSpawn / StateRestore).
 // UserPromptSubmit / SessionEnd / etc. are deferred.
 
-import type { LLMMessage, LLMToolSpec } from '../llm.js';
+import type { LLMMessage } from '../llm.js';
 import type { AgentDefinition } from '../agent/types.js';
 
 export type HookEvent =

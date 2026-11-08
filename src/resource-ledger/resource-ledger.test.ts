@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'bun:test';
-import { activeResourceLeases, activeResourcePools, beginResourceLease, declareResourcePool, endResourceLease, heartbeatResourceLease, latestWarmPoolPodReceipts, readResourceLedger, recordWarmPoolPodReceipt,
+import { activeResourceLeases, activeResourcePools, admitGuardianHostLease, beginResourceLease, declareResourcePool, endGuardianHostLease, endResourceLease, guardianHostLeaseRecords, heartbeatResourceLease, latestWarmPoolPodReceipts, readResourceLedger, recordWarmPoolPodReceipt, requestGuardianHostLease,
   reconcileResourceLeases, reapResourceLeaseIfCurrent, resourceMatrix, reassignResourcePools, type ResourceLease, type ResourceMeasurement } from './resource-ledger.js';
 import { buildResourceLedgerSnapshot, collectResourceMeasurement, registerResourceLedgerCommands, type ResourceCommandRunner } from '../cli/resource-ledger-cli.js';
 import { Command } from 'commander';
@@ -12,6 +12,62 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 const lease = (overrides: Partial<ResourceLease> = {}): ResourceLease => ({ id: 'fp_run001', fp: 'fp_run001', host: 'node-b', lane: 'ta',
   resources: { cpu: 2, memoryBytes: 1024 }, mission: { cell: 'TA-1' }, ttlMs: 1000,
   heartbeatAt: '2026-11-01T00:00:00.000Z', startedAt: '2026-11-01T00:00:00.000Z', ...overrides });
+
+test('Guardian host leases persist policy, enforce admission, expire, and release in the Nexus ledger', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-host-lease-')); dirs.push(dir);
+  const path = join(dir, 'events.jsonl');
+  const now = new Date('2026-11-08T00:00:00.000Z');
+  const gcpLease = requestGuardianHostLease({ requestId: 'tsc-run-1', runId: 'run-1', requestedBy: 'guardian', consumer: 'TSC-DIET',
+    purpose: 'typecheck', host: 'gcp1', priority: 'P0', expiresAt: new Date(now.getTime() + 1_000).toISOString() }, now, path);
+  expect(gcpLease.state).toBe('active');
+  expect(admitGuardianHostLease({ leaseId: gcpLease.leaseId, host: 'gcp1', runId: 'run-1', consumer: 'TSC-DIET' }, now, path)).toBe(true);
+  expect(readResourceLedger(path).some(event => event.event === 'guardian-host-lease-admitted'
+    && event.leaseId === gcpLease.leaseId && event.host === 'gcp1' && event.runId === 'run-1')).toBe(true);
+  expect(() => admitGuardianHostLease({ leaseId: '', host: '', runId: '', consumer: '' }, now, path))
+    .toThrow('invalid Guardian host lease admission identity');
+  expect(guardianHostLeaseRecords(readResourceLedger(path)).find(row => row.leaseId === gcpLease.leaseId)?.state).toBe('active');
+  expect(requestGuardianHostLease({ requestId: 'other-run', runId: 'run-2', requestedBy: 'coordinator', consumer: 'remote-test',
+    purpose: 'test', host: 'gcp1', priority: 'P1', expiresAt: new Date(now.getTime() + 1_000).toISOString() }, now, path))
+    .toMatchObject({ state: 'denied', reason: 'exclusive-lease-conflict', alternatives: ['mshq', 'node-c', 'aws1', 'gcp2'] });
+  expect(guardianHostLeaseRecords(readResourceLedger(path)).some(row => row.request.requestId === 'other-run')).toBe(true);
+  const conflict = requestGuardianHostLease({ requestId: 'tsc-run-1', runId: 'run-spoof', requestedBy: 'guardian', consumer: 'TSC-DIET',
+    purpose: 'typecheck', host: 'gcp1', priority: 'P0', expiresAt: new Date(now.getTime() + 1_000).toISOString() }, now, path);
+  expect(conflict).toMatchObject({ state: 'denied', reason: 'request-id-conflict' });
+  expect(guardianHostLeaseRecords(readResourceLedger(path)).find(row => row.leaseId === gcpLease.leaseId)?.state).toBe('active');
+  expect(readResourceLedger(path).some(event => event.event === 'guardian-host-lease-conflict' && event.requestId === 'tsc-run-1')).toBe(true);
+  expect(admitGuardianHostLease({ leaseId: gcpLease.leaseId, host: 'aws1', runId: 'run-1', consumer: 'TSC-DIET' }, now, path)).toBe(false);
+  expect(guardianHostLeaseRecords(readResourceLedger(path)).find(row => row.request.requestId === 'tsc-run-1')?.state).toBe('active');
+  expect(readResourceLedger(path).filter(event => event.event === 'guardian-host-lease-admission-denied').at(-1))
+    .toMatchObject({ host: 'aws1', runId: 'run-1', consumer: 'TSC-DIET', reason: 'lease-owner-mismatch', alternatives: ['mshq', 'node-c', 'aws1', 'gcp2'] });
+  expect(admitGuardianHostLease({ leaseId: 'guardian:missing', host: 'gcp1', runId: 'missing-run', consumer: 'other' }, now, path)).toBe(false);
+  expect(readResourceLedger(path).filter(event => event.event === 'guardian-host-lease-admission-denied').at(-1))
+    .toMatchObject({ leaseId: 'guardian:missing', host: 'gcp1', runId: 'missing-run', consumer: 'other', reason: 'lease-not-found', alternatives: ['mshq', 'node-c', 'aws1', 'gcp2'] });
+
+  const next = new Date(now.getTime() + 2_000);
+  const afterExpiry = requestGuardianHostLease({ requestId: 'tsc-run-2', runId: 'run-3', requestedBy: 'guardian', consumer: 'TSC-DIET',
+    purpose: 'typecheck', host: 'gcp1', priority: 'P0', expiresAt: new Date(next.getTime() + 1_000).toISOString() }, next, path);
+  expect(afterExpiry.state).toBe('active');
+  expect(endGuardianHostLease(afterExpiry.leaseId, 'completed', next, path)).toBe(true);
+  expect(endGuardianHostLease(afterExpiry.leaseId, 'duplicate', next, path)).toBe(false);
+  expect(guardianHostLeaseRecords(readResourceLedger(path)).find(row => row.leaseId === afterExpiry.leaseId)?.state).toBe('released');
+});
+
+test('Guardian host leases reject unrelated work on the cut-only host and fail closed on expired admission', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'guardian-cut-host-lease-')); dirs.push(dir);
+  const path = join(dir, 'events.jsonl');
+  const now = new Date('2026-11-08T00:00:00.000Z');
+  const unrelated = requestGuardianHostLease({ requestId: 'test-1', runId: 'run-1', requestedBy: 'coordinator', consumer: 'remote-test',
+    purpose: 'test', host: 'node-b', priority: 'P1', expiresAt: new Date(now.getTime() + 1_000).toISOString() }, now, path);
+  expect(unrelated).toMatchObject({ state: 'denied', reason: 'host-purpose-restricted', alternatives: ['mshq', 'node-c', 'aws1', 'gcp2'] });
+  const cut = requestGuardianHostLease({ requestId: 'cut-1', runId: 'cut-run', requestedBy: 'release', consumer: 'release-gate',
+    purpose: 'release-cut-gate', releaseVersion: '0.3.7', host: 'node-b', priority: 'P0',
+    expiresAt: new Date(now.getTime() + 1_000).toISOString() }, now, path);
+  expect(cut.state).toBe('active');
+  expect(admitGuardianHostLease({ leaseId: cut.leaseId, host: 'node-b', runId: 'cut-run', consumer: 'release-gate' },
+    new Date(now.getTime() + 2_000), path)).toBe(false);
+  expect(guardianHostLeaseRecords(readResourceLedger(path)).find(row => row.leaseId === cut.leaseId))
+    .toMatchObject({ state: 'expired', reason: 'lease-expired' });
+});
 
 test('Nexus resource ledger records per-Pod digest, runtime, skill, last job, and cleanup receipt', () => {
   const dir = mkdtempSync(join(tmpdir(), 'resource-ledger-pod-receipt-')); dirs.push(dir);

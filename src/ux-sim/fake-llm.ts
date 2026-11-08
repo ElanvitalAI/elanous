@@ -123,12 +123,22 @@ function scriptedToolCall(messages: LLMMessage[]): LLMStreamEvent | null {
   return { type: 'tool_call', id: `call_fake_llm_tool_${++toolCallSeq}`, name: spec.name, args };
 }
 
-async function scriptedDelay(messages: LLMMessage[]): Promise<void> {
+async function scriptedDelay(messages: LLMMessage[], signal?: AbortSignal): Promise<boolean> {
   const ms = Number(process.env[TEST_FAKE_LLM_DELAY_MS_ENV] ?? 0);
-  if (!Number.isFinite(ms) || ms <= 0) return;
+  if (!Number.isFinite(ms) || ms <= 0) return !signal?.aborted;
   const when = process.env[TEST_FAKE_LLM_DELAY_WHEN_ENV];
-  if (when && !(lastHumanText(messages) ?? '').includes(when)) return;
-  await new Promise((resolve) => setTimeout(resolve, ms));
+  if (when && !(lastHumanText(messages) ?? '').includes(when)) return !signal?.aborted;
+  if (signal?.aborted) return false;
+  return await new Promise<boolean>((resolve) => {
+    const finish = (completed: boolean) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(completed);
+    };
+    const timer = setTimeout(() => finish(true), ms);
+    const onAbort = () => finish(false);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /** Shares the real LLMProvider contract; only the external model call is replaced. */
@@ -139,16 +149,18 @@ export const testFakeLlmProvider: LLMProvider = {
   async *chat(messages: LLMMessage[], _opts?: LLMOpts): AsyncGenerator<string, void, unknown> {
     captureRequest(messages);
     consumeScriptStep(messages);
-    await scriptedDelay(messages);
+    if (!await scriptedDelay(messages, _opts?.signal)) return;
     yield testFakeLlmResponse(messages);
   },
   async *streamChat(messages: LLMMessage[], _opts?: LLMOpts): AsyncGenerator<LLMStreamEvent, void, unknown> {
     captureRequest(messages);
     const step = consumeScriptStep(messages);
-    await scriptedDelay(messages);
+    if (!await scriptedDelay(messages, _opts?.signal)) return;
     if (step?.startsWith('stall:')) {
       yield { type: 'text', delta: step.slice('stall:'.length) };
-      await new Promise<void>(() => {});
+      const signal = _opts?.signal;
+      if (!signal) await new Promise<void>(() => {});
+      else if (!signal.aborted) await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
       return;
     }
     const call = scriptedToolCall(messages);

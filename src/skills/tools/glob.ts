@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Glob tool (Claude Code-compatible file-path discovery) ──
 //
 // Ports claude-code-fork/src/tools/GlobTool. The LLM calls this when
@@ -20,7 +21,7 @@ import { statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { getSessionCwd } from '../../session/working-dir.js';
 import { rgListFiles } from '../../tool-runtime/ripgrep-core.js';
-import type { LLMToolSpec } from '../../llm.js';
+
 
 const DEFAULT_HEAD_LIMIT = 200;
 const MAX_HEAD_LIMIT = 5_000;

@@ -3,10 +3,89 @@ import type { Kubectl } from './self-implement-pod.js';
 import { podProvenanceMetadata } from './pod-provenance.js';
 import type { WarmWorkerCommand } from './pod-warm-worker-protocol.js';
 import type { WarmPodSpec } from './pod-warm-worker-pod.js';
+import { runtimeIdentitiesMatch, type RuntimeIdentityInput } from '../../runtime-identity.js';
 
 const PREFIX = 'elanous.ai/';
 const STATIC = new Set(['pool', 'image-digest', 'launch-host']);
 const workKey = (key: string) => key.startsWith(PREFIX) && !STATIC.has(key.slice(PREFIX.length));
+
+export type WarmPodKind = 'gate' | 'implementation';
+export interface WarmPodMatchCandidate<T> {
+  candidate: T;
+  kind: WarmPodKind;
+  cutSha: string;
+  lockHash: string;
+  imageDigest: string;
+  /** Host-independent environment tuple; source SHA and the full image digest are separate provenance. */
+  runtimeIdentity: RuntimeIdentityInput | null;
+  /** Git ancestry distance is supplied by the caller; no network or checkout is done here. */
+  cutShaDistance: number;
+  /** A runtime contract mismatch is the only compatibility rejection. */
+  contractCompatible: boolean;
+}
+export interface WarmPodMatchScore<T> {
+  candidate: T;
+  kind: WarmPodKind;
+  accepted: boolean;
+  score: readonly number[] | null;
+  reason: 'kind-mismatch' | 'cut-sha-mismatch' | 'lock-hash-mismatch' | 'runtime-identity-mismatch'
+    | 'contract-mismatch' | 'selected' | 'lower-score';
+  cutShaDistance: number;
+  lockHashMatches: boolean;
+  imageDigestDrift: boolean;
+}
+
+/** Deterministic kind-specific ordering; it never changes or refreshes a Pod checkout. */
+export function scoreWarmPodCandidates<T>(input: {
+  kind: WarmPodKind;
+  cutSha: string;
+  lockHash: string;
+  imageDigest: string;
+  runtimeIdentity: RuntimeIdentityInput;
+  /** Cross-architecture reuse is denied unless both architectures appear here. */
+  allowedArchitectures?: readonly string[];
+  candidates: readonly WarmPodMatchCandidate<T>[];
+}): { selected: T | null; rows: WarmPodMatchScore<T>[] } {
+  const eligible = input.candidates.map(row => {
+    const lockHashMatches = row.lockHash === input.lockHash;
+    const cutShaMatches = row.cutSha === input.cutSha;
+    const runtimeMatches = row.runtimeIdentity !== null
+      && runtimeIdentitiesMatch(input.runtimeIdentity, row.runtimeIdentity, input.allowedArchitectures);
+    const mismatch: WarmPodMatchScore<T>['reason'] | null = !Number.isSafeInteger(row.cutShaDistance)
+      || row.cutShaDistance < 0 ? 'cut-sha-mismatch'
+      : row.kind !== input.kind ? 'kind-mismatch'
+      : input.kind === 'gate' && !cutShaMatches ? 'cut-sha-mismatch'
+      : !runtimeMatches
+        ? 'runtime-identity-mismatch'
+        : !lockHashMatches ? 'lock-hash-mismatch'
+          : !row.contractCompatible ? 'contract-mismatch' : null;
+    const distance = cutShaMatches ? 0 : row.cutShaDistance;
+    const score = mismatch ? null : input.kind === 'gate' ? [0] : [distance];
+    return { row, score, mismatch, lockHashMatches,
+      imageDigestDrift: row.imageDigest !== input.imageDigest };
+  });
+  eligible.sort((left, right) => {
+    if (left.score === null) return right.score === null ? 0 : 1;
+    if (right.score === null) return -1;
+    for (let index = 0; index < Math.max(left.score.length, right.score.length); index++) {
+      const delta = (left.score[index] ?? 0) - (right.score[index] ?? 0);
+      if (delta) return delta;
+    }
+    return 0;
+  });
+  const winner = eligible.find(entry => entry.score !== null);
+  const rows = eligible.map((entry): WarmPodMatchScore<T> => ({
+    candidate: entry.row.candidate,
+    kind: entry.row.kind,
+    accepted: entry.score !== null,
+    score: entry.score,
+    reason: entry.mismatch ?? (entry === winner ? 'selected' : 'lower-score'),
+    cutShaDistance: entry.row.cutSha === input.cutSha ? 0 : entry.row.cutShaDistance,
+    lockHashMatches: entry.lockHashMatches,
+    imageDigestDrift: entry.imageDigestDrift,
+  }));
+  return { selected: winner?.row.candidate ?? null, rows };
+}
 
 export function warmLeaseMetadata(command: WarmWorkerCommand) {
   return podProvenanceMetadata({ actorKind: 'loop', actor: 'release-gate', character: 'gate-warm-worker',

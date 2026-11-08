@@ -84,9 +84,10 @@ export const DEFAULT_FILE_CENSUS_CONCURRENCY = 16;
 const DIFF_CACHE_MAX = 2000;
 const DIFF_CACHE_MAX_BYTES = 64 * 1024 * 1024;
 const DIFF_CACHE_ENTRY_MAX_BYTES = 4 * 1024 * 1024;
-const PARALLEL_CALL_TIMEOUT_MS = 120_000;
-/** Whole pool ceiling, independent of the call count — a stuck pool fails (inventory unknown) instead of hanging the guard. */
-const PARALLEL_POOL_TIMEOUT_MS = 10 * 60 * 1000;
+/** Match the normal GH runner ceiling; the census subprocess does not pass through CmdRunner. */
+const PARALLEL_CALL_TIMEOUT_MS = 45_000;
+/** Keep a stalled inventory from making `pr land --hold` appear silent for minutes. */
+const PARALLEL_POOL_TIMEOUT_MS = 60_000;
 const PARALLEL_MAX_BUFFER = 256 * 1024 * 1024;
 
 /** `gh pr diff` patches keyed by PR number ⊕ head sha. A head sha fixes the diff, so a retry or a second guard
@@ -177,26 +178,47 @@ export function spawnParallelCommands(calls: readonly PrToolCall[], options: { c
   if (calls.length === 0) return [];
   const concurrency = Math.max(1, Math.floor(options.concurrency ?? DEFAULT_DIFF_CONCURRENCY));
   const timeoutMs = options.timeoutMs ?? PARALLEL_CALL_TIMEOUT_MS;
+  const poolTimeoutMs = options.poolTimeoutMs ?? PARALLEL_POOL_TIMEOUT_MS;
+  const startedAt = Date.now();
+  debug.log('pr.land', 'open-pr-census-pool-started', {
+    callCount: calls.length,
+    concurrency,
+    timeoutMs,
+    poolTimeoutMs,
+    operations: calls.slice(0, 8).map(({ command, args }) => `${command} ${args.slice(0, 2).join(' ')}`),
+  });
+  const finish = (results: PrToolCommandResult[], reason?: string): PrToolCommandResult[] => {
+    debug.log('pr.land', 'open-pr-census-pool-completed', {
+      elapsedMs: Date.now() - startedAt,
+      callCount: calls.length,
+      okCount: results.filter(result => result.ok).length,
+      failedCount: results.filter(result => !result.ok).length,
+      ...(reason ? { reason } : {}),
+    }, reason ? { level: 'warn' } : undefined);
+    return results;
+  };
   const failAll = (err: string) => calls.map(() => ({ ok: false, out: '', err }));
   try {
     const r = spawnSync(process.execPath, ['-e', PARALLEL_SCRIPT], {
       input: JSON.stringify({ calls: calls.map(call => ({ command: call.command, args: [...call.args], cwd: call.opts?.cwd })), concurrency, timeoutMs }),
-      encoding: 'utf-8', maxBuffer: PARALLEL_MAX_BUFFER, timeout: options.poolTimeoutMs ?? PARALLEL_POOL_TIMEOUT_MS, killSignal: 'SIGTERM',
+      encoding: 'utf-8', maxBuffer: PARALLEL_MAX_BUFFER, timeout: poolTimeoutMs, killSignal: 'SIGTERM',
       ...(options.env ? { env: options.env } : {}),
     });
-    if ((r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS') return failAll('parallel output exceeded 256MiB (ENOBUFS)');
-    if ((r.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT' || r.signal) return failAll(`parallel runner timed out or was killed (${r.signal ?? 'ETIMEDOUT'})`);
-    if (r.status !== 0) return failAll(`parallel runner rc=${r.status}: ${(r.stderr ?? '').trim().slice(0, 300)}`);
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS') return finish(failAll('parallel output exceeded 256MiB (ENOBUFS)'), 'output-limit');
+    if ((r.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT' || r.signal) return finish(failAll(`parallel runner timed out or was killed (${r.signal ?? 'ETIMEDOUT'})`), 'pool-timeout');
+    if (r.status !== 0) return finish(failAll(`parallel runner rc=${r.status}: ${(r.stderr ?? '').trim().slice(0, 300)}`), `runner-rc-${r.status}`);
     const parsed: unknown = JSON.parse(r.stdout ?? '');
-    if (!Array.isArray(parsed) || parsed.length !== calls.length) return failAll('parallel runner result shape mismatch');
-    return parsed.map(row => {
+    if (!Array.isArray(parsed) || parsed.length !== calls.length) return finish(failAll('parallel runner result shape mismatch'), 'result-shape');
+    const results = parsed.map(row => {
       const value = row as { ok?: unknown; out?: unknown; err?: unknown } | null;
       return value && typeof value.ok === 'boolean' && typeof value.out === 'string'
         ? { ok: value.ok, out: value.out, err: typeof value.err === 'string' ? value.err : '' }
         : { ok: false, out: '', err: 'parallel runner row missing' };
     });
+    const timedOut = results.some(result => /\btimed out after\b|\bETIMEDOUT\b/i.test(result.err ?? ''));
+    return finish(results, timedOut ? 'call-timeout' : results.some(result => !result.ok) ? 'call-failed' : undefined);
   } catch (error) {
-    return failAll(`parallel runner: ${error instanceof Error ? error.message : String(error)}`);
+    return finish(failAll(`parallel runner: ${error instanceof Error ? error.message : String(error)}`), 'runner-threw');
   }
 }
 

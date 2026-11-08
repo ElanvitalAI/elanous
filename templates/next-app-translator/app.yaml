@@ -44,6 +44,7 @@ actions:
   transcribe:
     builtin: stt
     input: { audio: object-ref }
+    output: { text: text }
     uses: [cred:openai.api_key]
   translate:
     builtin: translate
@@ -52,7 +53,8 @@ actions:
     uses: [cred:openai.api_key]
   readAloud:
     builtin: tts
-    input: { text: text }
+    input: { text: text, voiceId: text }
+    output: { audioBase64: text, mimeType: text }
     uses: [cred:elevenlabs.api_key]
     optional: true
 

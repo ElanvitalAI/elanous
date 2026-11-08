@@ -3,6 +3,9 @@ import { act, createElement } from 'react';
 import { parseHTML } from 'linkedom';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import type { DaemonClient } from '@/lib/daemon-client';
+import { NexusProvider } from '@/nexus/hooks/use-nexus-context';
+import type { NexusClient } from '@/nexus/client';
+import type { NexusEvent } from '@/nexus/types';
 import AppsPage from './page';
 
 const apps = [{
@@ -10,10 +13,24 @@ const apps = [{
   simulation: { status: 'passed' as const, receipt: 'receipt-1', href: '/apps/voice-notes/sim' },
   production: { status: 'not-created' as const },
 }];
+const twoApps = [apps[0], {
+  slug: 'calendar', name: '달력', description: '회의 일정을 관리합니다.',
+  simulation: { status: 'ready' as const, receipt: 'receipt-calendar' },
+  production: { status: 'not-created' as const },
+}];
 
 const originals = { window: globalThis.window, document: globalThis.document, HTMLElement: globalThis.HTMLElement, Node: globalThis.Node, Event: globalThis.Event, actEnvironment: (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT };
 let root: import('react-dom/client').Root;
 let host: HTMLElement;
+let subscribedTopics: string[] | undefined;
+let onNexusEvent: ((event: NexusEvent) => void) | undefined;
+const nexusClient = {
+  subscribeEvents: (opts: { topics?: string[]; onEvent: (event: NexusEvent) => void }) => {
+    subscribedTopics = opts.topics;
+    onNexusEvent = opts.onEvent;
+    return () => { onNexusEvent = undefined; subscribedTopics = undefined; };
+  },
+} as unknown as NexusClient;
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -25,6 +42,8 @@ beforeEach(async () => {
   const { window } = parseHTML('<!doctype html><html><body><div id="root"></div></body></html>');
   Object.assign(globalThis, { window, document: window.document, HTMLElement: window.HTMLElement, Node: window.Node, Event: window.Event });
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  subscribedTopics = undefined;
+  onNexusEvent = undefined;
   host = document.getElementById('root')!;
   const { createRoot } = await import('react-dom/client');
   root = createRoot(host);
@@ -39,7 +58,12 @@ afterEach(async () => {
 async function renderClient(fetchJson: (path: string, init?: RequestInit) => Promise<unknown>) {
   const client = { fetchJson } as unknown as DaemonClient;
   const context = { client, config: { baseUrl: '', token: '', provider: '' }, setConfig: () => {}, sessionId: '', setSessionId: () => {} };
-  await act(async () => { root.render(createElement(DaemonContext.Provider, { value: context }, createElement(AppsPage))); });
+  await act(async () => {
+    root.render(createElement(NexusProvider, {
+      client: nexusClient,
+      children: createElement(DaemonContext.Provider, { value: context }, createElement(AppsPage)),
+    }));
+  });
 }
 
 async function mount(fetchJson: (path: string, init?: RequestInit) => Promise<unknown>) {
@@ -47,7 +71,7 @@ async function mount(fetchJson: (path: string, init?: RequestInit) => Promise<un
 }
 
 async function submitCreateForm() {
-  await act(async () => { [...host.querySelectorAll('button')].find((button) => button.textContent === '새 앱')!.dispatchEvent(new window.Event('click', { bubbles: true })); });
+  await act(async () => { [...host.querySelectorAll('button')].find((button) => button.textContent === '새 앱 만들기')!.dispatchEvent(new window.Event('click', { bubbles: true })); });
   const form = host.querySelector('form')!;
   const [name, slug, description] = [...form.querySelectorAll('input, textarea')];
   for (const [field, value] of [[name, '음성 메모'], [slug, 'voice-notes'], [description, '회의 기록']] as const) {
@@ -61,6 +85,8 @@ async function submitCreateForm() {
 test('loads one app tile with separate simulation and production environments', async () => {
   const paths: string[] = [];
   await mount(async (path) => { paths.push(path); return { apps }; });
+  expect(host.textContent).toContain('앱 스튜디오');
+  expect([...host.querySelectorAll('a')].some((link) => link.getAttribute('href') === '/design-check')).toBe(true);
   expect(paths).toEqual(['/v1/apps']);
   expect(host.textContent).toContain('음성 메모');
   expect(host.textContent).toContain('시뮬레이션');
@@ -68,6 +94,46 @@ test('loads one app tile with separate simulation and production environments', 
   expect(host.textContent).toContain('receipt-1');
   expect(host.textContent).toContain('정식');
   expect(host.textContent).toContain('영수증 뒤 올리기');
+});
+
+test('opens the app-scoped live simulation view from a tile and returns to the list', async () => {
+  await mount(async () => ({ apps }));
+  const open = [...host.querySelectorAll('button')].find((button) => button.textContent === '시뮬레이션 보기')!;
+  await act(async () => { open.dispatchEvent(new window.Event('click', { bubbles: true })); });
+  expect(host.querySelector('[data-testid="app-sim-live-view"]')?.getAttribute('data-app-id')).toBe('voice-notes');
+  expect(host.textContent).toContain('음성 메모');
+  expect(host.textContent).toContain('receipt-1');
+  expect(host.textContent).toContain('마지막 시뮬레이션 · 통과');
+  expect(host.textContent).toContain('시뮬레이션 사건을 기다리고 있습니다.');
+  expect(host.querySelector('[data-receipt-id="receipt-1"] time')).toBeNull();
+  expect(subscribedTopics).toEqual(['app.sim.']);
+  expect(onNexusEvent).toBeTruthy();
+  await act(async () => { onNexusEvent?.({ kind: 'app.sim.step-completed', ts: 1, appId: 'voice-notes', data: { step: 'save', message: '저장 완료' } } as unknown as NexusEvent); });
+  expect(host.textContent).toContain('저장 완료');
+  await act(async () => { host.querySelector('button[aria-label="앱 목록으로"]')!.dispatchEvent(new window.Event('click', { bubbles: true })); });
+  expect(host.textContent).toContain('음성 메모');
+  expect(host.querySelector('[data-testid="app-sim-live-view"]')).toBeNull();
+});
+
+test('keeps live events scoped to the selected tile when multiple apps are listed', async () => {
+  await mount(async () => ({ apps: twoApps }));
+  const openButtons = [...host.querySelectorAll('button')].filter((button) => button.textContent === '시뮬레이션 보기');
+  await act(async () => { openButtons[1].dispatchEvent(new window.Event('click', { bubbles: true })); });
+  expect(host.querySelector('[data-testid="app-sim-live-view"]')?.getAttribute('data-app-id')).toBe('calendar');
+  await act(async () => { onNexusEvent?.({ kind: 'app.sim.step-completed', ts: 1, appId: 'voice-notes', data: { message: '다른 앱 이벤트' } } as unknown as NexusEvent); });
+  expect(host.textContent).not.toContain('다른 앱 이벤트');
+  await act(async () => { onNexusEvent?.({ kind: 'app.sim.step-completed', ts: 2, appId: 'calendar', data: { message: '달력 동기화' } } as unknown as NexusEvent); });
+  expect(host.textContent).toContain('달력 동기화');
+});
+
+test('closes the selected app view when the daemon client changes', async () => {
+  await mount(async () => ({ apps }));
+  const open = [...host.querySelectorAll('button')].find((button) => button.textContent === '시뮬레이션 보기')!;
+  await act(async () => { open.dispatchEvent(new window.Event('click', { bubbles: true })); });
+  expect(host.querySelector('[data-testid="app-sim-live-view"]')).toBeTruthy();
+  await renderClient(async () => ({ apps: [] }));
+  expect(host.querySelector('[data-testid="app-sim-live-view"]')).toBeNull();
+  expect(host.textContent).toContain('첫 앱을 시작해 보세요');
 });
 
 test('moving an app to trash calls the lifecycle endpoint and removes its tile', async () => {
@@ -80,22 +146,22 @@ test('moving an app to trash calls the lifecycle endpoint and removes its tile',
   await act(async () => { trash.dispatchEvent(new window.Event('click', { bubbles: true })); });
   expect(calls).toEqual([{ path: '/v1/apps', method: undefined }, { path: '/v1/apps/voice-notes', method: 'DELETE' }]);
   expect(host.textContent).not.toContain('음성 메모');
-  expect(host.textContent).toContain('아직 앱이 없습니다');
+  expect(host.textContent).toContain('첫 앱을 시작해 보세요');
 });
 
 test('shows a recoverable message when the app ledger cannot be read', async () => {
   await mount(async () => { throw new Error('offline'); });
   expect(host.textContent).toContain('앱 목록을 불러오지 못했습니다');
-  expect(host.textContent).not.toContain('아직 앱이 없습니다');
-  expect([...host.querySelectorAll('button')].find((button) => button.textContent === '새 앱')?.disabled).toBe(true);
+  expect(host.textContent).not.toContain('첫 앱을 시작해 보세요');
+  expect([...host.querySelectorAll('button')].find((button) => button.textContent === '새 앱 만들기')?.disabled).toBe(true);
 });
 
 test('does not offer creation until the in-flight list request has completed', async () => {
   let resolveList!: (value: { apps: typeof apps }) => void;
   await mount(() => new Promise((resolve) => { resolveList = resolve; }));
-  expect([...host.querySelectorAll('button')].find((button) => button.textContent === '새 앱')?.disabled).toBe(true);
+  expect([...host.querySelectorAll('button')].find((button) => button.textContent === '새 앱 만들기')?.disabled).toBe(true);
   await act(async () => { resolveList({ apps }); });
-  expect([...host.querySelectorAll('button')].find((button) => button.textContent === '새 앱')?.disabled).toBe(false);
+  expect([...host.querySelectorAll('button')].find((button) => button.textContent === '새 앱 만들기')?.disabled).toBe(false);
   expect(host.textContent).toContain('음성 메모');
 });
 
@@ -198,7 +264,7 @@ test('ignores a delayed create success from a replaced client', async () => {
   expect(calls).toEqual(['original POST', 'replacement GET']);
   await act(async () => { replacementList.resolve({ apps: [] }); });
   expect(host.textContent).not.toContain('/new-app');
-  expect(host.textContent).toContain('아직 앱이 없습니다');
+  expect(host.textContent).toContain('첫 앱을 시작해 보세요');
   expect(host.textContent).not.toContain('앱을 만들지 못했습니다');
 });
 
@@ -210,7 +276,7 @@ test('ignores a delayed list response from the replaced client', async () => {
   expect(host.textContent).toContain('새 서버 앱');
   await act(async () => { oldList.resolve({ apps: [] }); });
   expect(host.textContent).toContain('새 서버 앱');
-  expect(host.textContent).not.toContain('아직 앱이 없습니다');
+  expect(host.textContent).not.toContain('첫 앱을 시작해 보세요');
 });
 
 test('hides old tiles and blocks mutations while the replacement client loads', async () => {
@@ -220,9 +286,9 @@ test('hides old tiles and blocks mutations while the replacement client loads', 
   await renderClient(async () => freshList.promise);
   expect(host.textContent).not.toContain(oldApp.name);
   expect(host.textContent).toContain('앱을 불러오는 중');
-  expect([...host.querySelectorAll('button')].find((button) => button.textContent === '새 앱')?.disabled).toBe(true);
+  expect([...host.querySelectorAll('button')].find((button) => button.textContent === '새 앱 만들기')?.disabled).toBe(true);
   await act(async () => { freshList.resolve({ apps: [] }); });
-  expect(host.textContent).toContain('아직 앱이 없습니다');
+  expect(host.textContent).toContain('첫 앱을 시작해 보세요');
 });
 
 test('ignores a delayed create failure from a replaced client', async () => {

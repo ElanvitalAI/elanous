@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pageTargetIds, planTabReclaim } from './browser-act-tabs.js';
@@ -81,23 +82,18 @@ describe('opened-tab reclaim', () => {
     //    📏 실측 2026-08-28: 배선을 죽이는 되돌리기 셋이 소스 시험에선 «전부 0 fail» 이었다
     //       (그중 하나는 `tabsBefore` → `tabsBeforeUnused` 인데 부분문자열이라 통과했다).
     //    ⇒ 그래서 이 시험은 CDP HTTP 를 «대역»으로 세우고 실제로 돌린다.
-    const realFetch = globalThis.fetch;
-    const closed: string[] = [];
     let listCalls = 0;
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.includes('/json/list')) {
+    await withFakeFetchDevice([
+      { url: '/json/list', response: () => {
         listCalls += 1;
         // 첫 조회(클릭 «전») = 탭 하나 · 둘째(클릭 «뒤») = 클릭이 연 탭이 하나 더
         const body = listCalls === 1
           ? [{ id: 'kept', type: 'page' }]
           : [{ id: 'kept', type: 'page' }, { id: 'opened', type: 'page' }];
         return new Response(JSON.stringify(body), { status: 200 });
-      }
-      if (url.includes('/json/close/')) { closed.push(url.split('/json/close/')[1] ?? ''); return new Response('ok', { status: 200 }); }
-      return new Response('', { status: 404 });
-    }) as typeof fetch;
-    try {
+      } },
+      { url: '/json/close/opened', response: new Response('ok', { status: 200 }) },
+    ], async (device) => {
       const events: Array<Record<string, unknown>> = [];
       const result = await performBrowserAction(
         { url: 'https://example.test', target: 'a', armed: true },
@@ -110,23 +106,14 @@ describe('opened-tab reclaim', () => {
       );
       expect(result.ok).toBe(true);
       // ⛔ 클릭이 «연» 것만 닫는다 — 원래 있던 탭은 안 건드린다
-      expect(closed).toEqual(['opened']);
+      expect(device.calls().map((call) => new URL(call.url).pathname)).toEqual(['/json/list', '/json/list', '/json/close/opened']);
+      expect(device.calls().at(-1)?.status).toBe(200);
       expect(events[0]).toMatchObject({ tabsPlanned: 1, tabsReclaimed: 1 });
-    } finally {
-      globalThis.fetch = realFetch;
-    }
+    });
   });
 
   test('an unreadable tab list closes nothing and says so — it does not guess', async () => {
-    const realFetch = globalThis.fetch;
-    const closed: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.includes('/json/list')) return new Response('', { status: 500 });
-      if (url.includes('/json/close/')) { closed.push(url); return new Response('ok', { status: 200 }); }
-      return new Response('', { status: 404 });
-    }) as typeof fetch;
-    try {
+    await withFakeFetchDevice([{ url: '/json/list', response: new Response('', { status: 500 }) }], async (device) => {
       const events: Array<Record<string, unknown>> = [];
       await performBrowserAction(
         { url: 'https://example.test', target: 'a', armed: true },
@@ -137,12 +124,10 @@ describe('opened-tab reclaim', () => {
           observe: (_event, data) => events.push(data),
         },
       );
-      expect(closed).toEqual([]);
+      expect(device.calls().map((call) => new URL(call.url).pathname)).toEqual(['/json/list', '/json/list']);
       expect(events[0]).toMatchObject({ tabsPlanned: 0, tabsReclaimed: 0 });
       expect(String(events[0]?.tabsDetail)).toContain('판정 불가');
-    } finally {
-      globalThis.fetch = realFetch;
-    }
+    });
   });
 
   test('the observation separates "how many opened" from "how many closed"', () => {

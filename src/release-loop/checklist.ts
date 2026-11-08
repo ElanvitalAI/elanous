@@ -125,10 +125,15 @@ export function checklistDevVersion(version = devVersion()): string {
   return version.replace(/-dev\.\d+$/, '');
 }
 
+const MANUAL_CHECKLIST_SEATS = new Set(['MVP-D', 'MVP-*', 'NM-*', 'NT-*', 'GATE-G']);
+
 export function parseOwner(value: string): { seat: string; sub?: string } {
-  const match = /^([A-Z]{2,8})(?:\/([a-z][a-z0-9-]{0,31}))?$/.exec(value);
-  if (!match || match[0] !== value) throw new CliUserError(`잘못된 담당: ${value}`, 'TC 또는 TC/rel');
-  return match[2] ? { seat: match[1]!, sub: match[2] } : { seat: match[1]! };
+  const match = /^([A-Z]{2,8}(?:-(?:[A-Z0-9]{1,8}|\*))?)(?:\/([a-z][a-z0-9-]{0,31}))?$/.exec(value);
+  const seat = match?.[1];
+  const legacySeat = seat !== undefined && /^[A-Z]{2,8}(?:-[0-9]{1,8})?$/.test(seat);
+  if (!match || match[0] !== value || (!legacySeat && !MANUAL_CHECKLIST_SEATS.has(seat!)))
+    throw new CliUserError(`잘못된 담당: ${value}`, '자리 이름(예: TC-1, MVP-D, MVP-*, GATE-G) 또는 자리/하위자리(예: TC/rel)');
+  return match[2] ? { seat: seat!, sub: match[2] } : { seat: seat! };
 }
 
 export function ownerMatches(owner: string | undefined, filter: string): boolean {

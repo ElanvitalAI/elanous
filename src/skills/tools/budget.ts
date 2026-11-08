@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tools: BudgetStatus · BudgetHistory · BudgetForecast · BudgetSetLimit
 //
 // LLM-facing surface for the H6 P1 budget tracker. All four tools
@@ -12,7 +13,7 @@
 // carries machine-readable fields for downstream dashboards /
 // budget-aware policy routers.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import type {
   RateWindow,
   UsageProvider,

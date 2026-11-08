@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S4 P3: Budget LLM tool ──
 //
 // Wraps BudgetMeter for the 4 actions the research loop needs:
@@ -10,7 +11,7 @@
 // helper `loadGoalBudget` restores the spec persisted on init so the
 // tool does not need the spec as an input.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   discoverObsidianVault,
   type ObsidianVault,

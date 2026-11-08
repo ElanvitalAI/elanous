@@ -2,9 +2,9 @@ import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { dismissAuthRequired, onAuthRequired, reportAuthRequired, resetAuthRequiredForTests } from './auth-required';
 import { DaemonClient } from './daemon-client';
 import { createNexusClient, NexusApiError } from '../nexus/client';
+import { withFakeFetchDevice } from '../test-devices/fake-fetch';
 
 const originalWindow = globalThis.window;
-const originalFetch = globalThis.fetch;
 
 beforeEach(() => {
   resetAuthRequiredForTests();
@@ -12,7 +12,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  globalThis.fetch = originalFetch;
   resetAuthRequiredForTests();
   if (originalWindow === undefined) delete (globalThis as { window?: Window }).window;
   else globalThis.window = originalWindow;
@@ -60,26 +59,28 @@ test('dismissed notice is not replayed to new subscribers', () => {
 
 test('daemon fetchResponse signals on 401 and preserves its Response and fetchJson error', async () => {
   const client = new DaemonClient({ baseUrl: 'http://localhost:31415', token: '', provider: 'anthropic' });
-  globalThis.fetch = (async () => new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
-  const seen: { path: string }[] = [];
-  const off = onAuthRequired((detail) => seen.push(detail));
-  const response = await client.fetchResponse('/v1/health');
-  expect(response.status).toBe(401);
-  expect(await response.json()).toEqual({ error: 'unauthorized' });
-  await expect(client.fetchJson('/v1/health')).rejects.toThrow('unauthorized');
-  expect(seen).toEqual([{ path: '/v1/health' }]);
-  off();
+  await withFakeFetchDevice([{ url: '/v1/health', response: () => Response.json({ error: 'unauthorized' }, { status: 401 }) }], async () => {
+    const seen: { path: string }[] = [];
+    const off = onAuthRequired((detail) => seen.push(detail));
+    const response = await client.fetchResponse('/v1/health');
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: 'unauthorized' });
+    await expect(client.fetchJson('/v1/health')).rejects.toThrow('unauthorized');
+    expect(seen).toEqual([{ path: '/v1/health' }]);
+    off();
+  });
 });
 
 test('daemon streaming fallback signals on 401 without changing errors', async () => {
   const client = new DaemonClient({ baseUrl: 'http://localhost:31415', token: '', provider: 'anthropic' });
   expect('prompt' in client).toBe(false);
-  globalThis.fetch = (async () => new Response('unauthorized', { status: 401 })) as unknown as typeof fetch;
-  const seen: { path: string }[] = [];
-  const off = onAuthRequired((detail) => seen.push(detail));
-  await expect(client.promptStream({ userText: 'hello' })).rejects.toThrow('prompt/stream 401: unauthorized');
-  expect(seen).toEqual([{ path: '/v1/prompt/stream' }]);
-  off();
+  await withFakeFetchDevice([{ url: '/v1/prompt/stream', method: 'POST', response: () => new Response('unauthorized', { status: 401 }) }], async () => {
+    const seen: { path: string }[] = [];
+    const off = onAuthRequired((detail) => seen.push(detail));
+    await expect(client.promptStream({ userText: 'hello' })).rejects.toThrow('prompt/stream 401: unauthorized');
+    expect(seen).toEqual([{ path: '/v1/prompt/stream' }]);
+    off();
+  });
 });
 
 test('nexus request signals on 401 and keeps the NexusApiError shape', async () => {
@@ -104,8 +105,9 @@ test('non-401 error shapes stay unchanged and do not signal', async () => {
   const seen: { path: string }[] = [];
   const off = onAuthRequired((detail) => seen.push(detail));
   const daemon = new DaemonClient({ baseUrl: 'http://localhost:31415', token: '', provider: 'anthropic' });
-  globalThis.fetch = (async () => new Response('{"reason":"bad_input","error":"other"}', { status: 400, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
-  await expect(daemon.fetchJson('/v1/health')).rejects.toThrow('bad_input');
+  await withFakeFetchDevice([{ url: '/v1/health', response: () => Response.json({ reason: 'bad_input', error: 'other' }, { status: 400 }) }], async () => {
+    await expect(daemon.fetchJson('/v1/health')).rejects.toThrow('bad_input');
+  });
   const nexus = createNexusClient({ baseUrl: 'http://localhost:31415', timeoutMs: 0,
     fetchImpl: (async () => new Response('{"error":"missing"}', { status: 404 })) as unknown as typeof fetch });
   await expect(nexus.getHealth()).rejects.toMatchObject({ status: 404, path: '/v1/health', body: { error: 'missing' } });
@@ -117,8 +119,9 @@ test('non-401 responses keep their values and do not signal', async () => {
   const seen: { path: string }[] = [];
   const off = onAuthRequired((detail) => seen.push(detail));
   const daemon = new DaemonClient({ baseUrl: 'http://localhost:31415', token: '', provider: 'anthropic' });
-  globalThis.fetch = (async () => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
-  expect(await daemon.health()).toEqual({ ok: true });
+  await withFakeFetchDevice([{ url: '/v1/health', response: () => Response.json({ ok: true }) }], async () => {
+    expect(await daemon.health()).toEqual({ ok: true });
+  });
   const nexus = createNexusClient({ baseUrl: 'http://localhost:31415', timeoutMs: 0,
     fetchImpl: (async () => new Response('{"ok":true}', { status: 200 })) as unknown as typeof fetch });
   expect((await nexus.getHealth()).ok).toBe(true);

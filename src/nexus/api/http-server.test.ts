@@ -8,10 +8,11 @@ import {
   DEFAULT_NEXUS_HTTP_PORT,
   NEXUS_HTTP_PORT_RANGE,
   probeNexusHttpPort,
+  routeRequest,
   startNexusHttpServer,
 } from './http-server.js';
 import { NexusEventBus } from './event-bus.js';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
@@ -19,6 +20,12 @@ import type { ContextNowDeps } from '../../context-bus/context-now.js';
 import { checkBrand } from '../../../scripts/brand/check.js';
 import { resetUserConfig } from '../../user-config.js';
 import { useBackend } from '../config/secrets/index.js';
+import { createPublicKey } from 'node:crypto';
+import { loadOrCreateRelayHostIdentity } from '../../relay/host-connector.js';
+import { startRelayServer } from '../../relay/relay-server.js';
+import { loadNexusAppHost } from '../apps/app-host.js';
+import { createAppLifecycleEvent, projectAppLifecycleSnapshot } from '../apps/app-lifecycle-ledger.js';
+import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -67,6 +74,54 @@ test('channel-bot GET and authenticated POST reach HTTP handlers without leaking
     expect(await post.json()).toEqual({ ok: true, restartNeeded: true });
   } finally {
     server.stop();
+    resetUserConfig();
+    resetElanousConfigDir();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Nexus app-host connector serves a public Host request through the authenticated public relay', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'nexus-relay-boot-'));
+  setElanousConfigDir(dir);
+  useBackend('file');
+  resetUserConfig();
+  const identity = await loadOrCreateRelayHostIdentity();
+  const signingPublicKey = (createPublicKey(identity.hostSigningKey).export({ format: 'der', type: 'spki' }) as Buffer).subarray(-32).toString('base64url');
+  const relay = startRelayServer({ trustedHostKeys: new Map([[identity.serverId, signingPublicKey]]),
+    publicDomain: 'elanous.app', publicServerId: identity.serverId, publicUserId: 'owner' });
+  const appsDir = join(dir, 'apps');
+  const appOutput = join(appsDir, 'voice-note', 'out');
+  mkdirSync(appOutput, { recursive: true });
+  writeFileSync(join(appsDir, 'voice-note', 'app.yaml'), 'apiVersion: elanous.app/v0\nslug: voice-note\ntitle: Voice notes\nfrontend:\n  kind: static-export\n  out: out\n');
+  writeFileSync(join(appOutput, 'index.html'), '<main>actual Nexus app-host relay</main>');
+  const mounted = loadNexusAppHost(appsDir, undefined, {
+    dir: join(dir, 'app-auth'), databaseDirectory: join(dir, 'app-db'), key: 'nexus-app-host-relay-test-key-with-256-bits',
+  });
+  expect(mounted.issues).toEqual([]);
+  const invitation = mounted.appHost.issueInvitation('voice-note', 'test-owner');
+  const accepted = await mounted.appHost.handle(new Request(`http://nexus.invalid/__auth/accept?token=${encodeURIComponent(invitation.token)}`, {
+    headers: { host: 'voice-note.app.localhost' },
+  }));
+  if (!accepted?.headers.get('set-cookie')) throw new Error('test app-host did not issue its share-link cookie');
+  const appCookie = accepted.headers.get('set-cookie')!.split(';', 1)[0]!;
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ nexus: { relay: { enabled: true, url: `ws://127.0.0.1:${relay.port}/host` } } }));
+  const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(), appHost: mounted.appHost });
+  try {
+    for (let attempt = 0; attempt < 200 && !relay.stats(identity.serverId).host; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(relay.stats(identity.serverId).host).toBe(true);
+    let response: Response | undefined;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      response = await fetch(`http://127.0.0.1:${relay.port}/`, { headers: { host: 'voice-note--owner.elanous.app', cookie: appCookie } });
+      if (response.status !== 503) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(response?.status).toBe(200);
+    expect(await response!.text()).toContain('actual Nexus app-host relay');
+  } finally {
+    server.stop();
+    relay.stop();
     resetUserConfig();
     resetElanousConfigDir();
     rmSync(dir, { recursive: true, force: true });
@@ -742,4 +797,89 @@ test('GET /v1/drafts/metrics is bearer-gated and answers from the cached source 
     expect(write.status).toBe(405);
     expect(reads).toBe(1);
   } finally { server.stop(); }
+});
+
+test('GET /v1/apps returns the apps page contract using mounted manifests and address helpers', async () => {
+  const lifecycle = projectAppLifecycleSnapshot('voice-note', [createAppLifecycleEvent({ appId: 'voice-note', action: 'created', environment: 'simulation', actor: 'system' }, { id: () => 'created-1' })]);
+  const appHost = {
+    slugs: ['voice-note', 'a'.repeat(21)],
+    getManifest: (slug: string) => slug === 'voice-note'
+      ? { slug, title: 'Voice Note', description: 'Capture notes' }
+      : { slug, title: 'Long Name', description: '' },
+    handle: () => undefined,
+    issueInvitation: () => { throw new Error('unused'); },
+    close: () => undefined,
+  };
+  const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+    metaApi: { bearerToken: 'auth', noAuth: false },
+    appHost: appHost as never,
+    appLifecycleSnapshot: slug => slug === 'voice-note' ? lifecycle : null,
+    appPreviewUserSlug: '1234567890abcdef1234',
+  });
+  try {
+    const denied = await fetch(`${server.url}/v1/apps`, { headers: { 'sec-fetch-site': 'cross-site' } });
+    expect(denied.status).toBe(401);
+    const response = await fetch(`${server.url}/v1/apps`, { headers: { 'sec-fetch-site': 'cross-site', authorization: 'Bearer auth' } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ apps: [
+      {
+        slug: 'voice-note', name: 'Voice Note', description: 'Capture notes',
+        lifecycle,
+        simulation: { status: 'not-created', href: 'https://voice-note-sim--1234567890abcdef1234.elanous.app' },
+        production: { status: 'not-created', href: new URL(server.url).origin },
+      },
+      {
+        slug: 'a'.repeat(21), name: 'Long Name', description: '',
+        lifecycle: null,
+        simulation: { status: 'not-created' },
+        production: { status: 'not-created', href: new URL(server.url).origin },
+      },
+    ] });
+    const hosted = await routeRequest(
+      new Request('https://nexus.elanous.ai/v1/apps', { headers: { authorization: 'Bearer auth' } }),
+      { metaApi: { bearerToken: 'auth', noAuth: false }, appHost: appHost as never, appPreviewUserSlug: '1234567890abcdef1234' } as never,
+      {} as never, null, createDevProxyRuntimeRef(),
+    );
+    expect((await hosted!.json() as { apps: Array<{ production: { href: string } }> }).apps[0]?.production.href)
+      .toBe('https://console.elanous.ai');
+  } finally { server.stop(); }
+});
+
+test('GET /v1/apps still lists mounted apps when its preview identity is unavailable', async () => {
+  const appHost = {
+    slugs: ['voice-note'],
+    getManifest: () => ({ slug: 'voice-note', title: 'Voice Note', description: 'Capture notes' }),
+    handle: () => undefined,
+    issueInvitation: () => { throw new Error('unused'); },
+    close: () => undefined,
+  };
+  const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+    metaApi: { bearerToken: 'auth', noAuth: false },
+    appHost: appHost as never,
+  });
+  try {
+    const response = await fetch(`${server.url}/v1/apps`, { headers: { 'sec-fetch-site': 'cross-site', authorization: 'Bearer auth' } });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ apps: [{
+      slug: 'voice-note', name: 'Voice Note', description: 'Capture notes',
+      lifecycle: null,
+      simulation: { status: 'not-created' },
+      production: { status: 'not-created', href: new URL(server.url).origin },
+    }] });
+  } finally { server.stop(); }
+});
+
+test('GET /v1/apps fails closed when the durable lifecycle reader is unavailable', async () => {
+  const appHost = {
+    slugs: ['voice-note'], getManifest: () => ({ slug: 'voice-note', title: 'Voice Note', description: '' }),
+    handle: () => undefined, issueInvitation: () => { throw new Error('unused'); }, close: () => undefined,
+  };
+  const response = await routeRequest(
+    new Request('http://127.0.0.1/v1/apps', { headers: { authorization: 'Bearer auth' } }),
+    { ...serverFixture(), metaApi: { bearerToken: 'auth', noAuth: false }, appHost: appHost as never,
+      appLifecycleSnapshot: () => { throw new Error('corrupt ledger'); } } as never,
+    {} as never, null, createDevProxyRuntimeRef(),
+  );
+  expect(response?.status).toBe(503);
+  expect(await response?.json()).toEqual({ error: 'app-lifecycle-unavailable' });
 });

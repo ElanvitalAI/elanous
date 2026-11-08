@@ -29,6 +29,7 @@ import { createCodexAccessMirror } from '../../oauth/codex-access-mirror.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { controlInboxEnv } from '../../harness/control-inbox.js';
 import { finishPodFragment, writePodFragment } from '../../harness/self-send-target.js';
+import { POD_MEMORY_SAMPLE_INTERVAL_SECONDS, podMemorySamplerScript, podMemoryStageToolWrappersScript, summarizePodMemoryByStage, type PodMemoryStageName } from '../../harness/pod-memory-policy.js';
 import { mintRunId, normalizeRunId } from '../../harness/harness-space.js';
 import { TA_LAND_ENV } from '../../task-agent/task-hand.js';
 import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, runLedgerPath, type RunLedgerEntry } from '../../self-implement/run-ledger.js';
@@ -1370,6 +1371,9 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     //   pod.lifecycle stages 의 clone · mirror · run 을 채운다. 실패한 단계는 끝 표지가 없다(→ missing · 지어내지 않는다).
     //   clone 끝 = podSourceScript 전체가 끝난 뒤(갈래마다 마지막 줄이 `ELANOUS_POD_SOURCE` 또는 `cd repo` — 둘 다 소스 받기의 일부).
     podDeadlineWatchdogScript({ deadlineSeconds: o.deadlineSeconds, job: o.name, runId: o.runId, prNumber: o.boundPrNumber }),
+    `printf 'source\\n' > /tmp/si.stage`,
+    podMemoryStageToolWrappersScript(),
+    podMemorySamplerScript(),
     siTaskPodStageShell('clone', 'start'),
     podSourceScript(o.source ?? { kind: 'default' }, o.repoUrl, undefined, { stageMarkers: true }),
     siTaskPodStageShell('clone', 'end'),
@@ -1384,8 +1388,7 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     ...(goalPath ? [
       `mkdir -p -- "$(dirname -- ${goalPath})" && cp -- /creds/goal-doc ${goalPath} || exit 6`,
     ] : []),
-    // Only fixed command shapes leave the Pod; arbitrary argv (including shell -c text) is never emitted.
-    `(while :; do { mem=$(if [ -r /sys/fs/cgroup/memory.current ]; then cat /sys/fs/cgroup/memory.current; elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then cat /sys/fs/cgroup/memory/memory.usage_in_bytes; else printf -- -; fi); top=$(ps -eo rss=,comm=,args= --sort=-rss | head -5 | awk 'function encode(s) { gsub(/%/, "%25", s); gsub(/:/, "%3A", s); gsub(/ /, "%20", s); gsub(/\\t/, "%09", s); return s } { rss=$1; name=$2; sub(/^[[:space:]]*[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]*/, ""); n=split($0, a, /[[:space:]]+/); cmd="<redacted>"; if (name=="sleep" && a[2]=="30") cmd="sleep 30" (n>2 ? " <redacted>" : ""); else if (name=="bun") { cmd="bun <redacted>"; if (a[2]=="test") cmd="bun test <redacted>"; else if (a[2]=="run") cmd="bun run <redacted>"; else if ((a[2]=="x" || a[2]=="exec") && a[3]=="tsc") cmd="bun x tsc <redacted>" } else if (name=="tsc") cmd="tsc <redacted>"; else if (name=="elanous") { cmd="elanous <redacted>"; if (a[2]=="self") cmd="elanous self <redacted>"; else if (a[2]=="harness") cmd="elanous harness <redacted>" } else if (name=="node") cmd="node <redacted>"; if (name=="sleep" && cmd=="<redacted>") cmd="sleep <redacted>"; else if (cmd=="<redacted>" && name!="bash" && name!="sh") name="other"; printf " %s:%s:%s", rss, encode(name), encode(substr(cmd,1,120)) }'); printf "ELANOUS_MEM %s %s%s\\n" "$(date +%s)" "$mem" "$top"; } || true; sleep 15 || break; done) & mem_sampler_pid=$!`,
+    // Stage labels come from active command wrappers; the top-five process data stays redacted.
     ...(o.appCredential && !o.repairCommitOnly ? [podGithubWatchdogScript(o.githubStaleSeconds ?? POD_GH_STALE_SECONDS)] : []),
     // METER-POD-ROLLUP-GAP — 부분 롤업 표본기: 최종 줄까지 못 사는 Pod 도 N 분마다(기본 5 · ELANOUS_USAGE_PARTIAL_MINUTES) PARTIAL 줄을 하나씩 남긴다.
     `(usage_partial_seq=0; while :; do { usage_partial_seq=$((usage_partial_seq+1)); printf '%s\\n' "$usage_partial_seq" > ${POD_USAGE_PARTIAL_SEQ_FILE} 2>/dev/null || true; [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial --seq "$usage_partial_seq" || true; } || true; usage_partial_sleep=$(( \${ELANOUS_USAGE_PARTIAL_MINUTES:-5} * 60 )); sleep "$usage_partial_sleep" || break; done) & usage_partial_pid=$!`,
@@ -3596,6 +3599,12 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           if ((event === 'ledger-collected' || event === 'ledger-collect-already-complete') && data.runId === liveChildRunId) ledgerCollected = true;
         }, liveChildRunId);
         const samples = collection.status === 'unavailable' ? parseMemSamples(logs) : collection.samples;
+        debug.log('self-implement.pod', 'memory-stages', {
+          job: name,
+          sampleIntervalSeconds: POD_MEMORY_SAMPLE_INTERVAL_SECONDS,
+          peakKind: 'sampled-high-water-mark',
+          stages: summarizePodMemoryByStage(samples),
+        }, { compact: { maxDepth: 6 } });
         const oomKilled = state === 'failed' && containerReason === 'OOMKilled' && containerExitCode === 137;
         if (oomKilled) {
           // 자식 stdout 원문은 싣지 않는다 — 임의 출력에 든 비밀이 진단 경로로 새지 않도록 «모양»(줄·바이트)만 남긴다.
@@ -4404,26 +4413,33 @@ export function podAbortSignalReasonCode(signal: AbortSignal | undefined): 'not-
   return 'unspecified';
 }
 
-export function parseMemSamples(logs: string): Array<{ at: number; cgroupBytes: number | null; top: Array<{ rssKb: number; name: string; cmd?: string }> }> {
-  const samples: Array<{ at: number; cgroupBytes: number | null; top: Array<{ rssKb: number; name: string; cmd?: string }> }> = [];
+export function parseMemSamples(logs: string): Array<{ at: number; cgroupBytes: number | null; stage?: PodMemoryStageName; top: Array<{ rssKb: number; name: string; cmd?: string }> | null }> {
+  const samples: Array<{ at: number; cgroupBytes: number | null; stage?: PodMemoryStageName; top: Array<{ rssKb: number; name: string; cmd?: string }> | null }> = [];
   for (const line of logs.split('\n')) {
     const match = /^ELANOUS_MEM (\d+) (\d+|-)(?: (.*))?\r?$/.exec(line);
     if (!match) continue;
     const at = Number(match[1]);
     const cgroupBytes = match[2] === '-' ? null : Number(match[2]);
     if (!Number.isSafeInteger(at) || (cgroupBytes !== null && !Number.isSafeInteger(cgroupBytes))) continue;
-    const top: Array<{ rssKb: number; name: string; cmd?: string }> = [];
+    let top: Array<{ rssKb: number; name: string; cmd?: string }> | null = [];
     let valid = true;
-    for (const token of (match[3] ?? '').split(' ').filter(Boolean)) {
+    const payload = match[3] ?? '';
+    const stageMatch = /^stage=(source|install|implement|typecheck|test|build)(?: |$)/.exec(payload);
+    let processPayload = stageMatch ? payload.slice(stageMatch[0].length) : payload;
+    const rssUnavailable = /(?:^| )rss=unavailable(?: |$)/.test(processPayload);
+    processPayload = processPayload.replace(/(?:^| )rss=unavailable(?= |$)/, ' ').trim();
+    if (rssUnavailable && processPayload) valid = false;
+    if (rssUnavailable) top = null;
+    for (const token of processPayload.split(' ').filter(Boolean)) {
       const entry = /^(\d+):([^\s:]+)(?::([^\s:]+))?$/.exec(token);
-      if (!entry || !Number.isSafeInteger(Number(entry[1])) || top.length >= 5) { valid = false; break; }
+      if (!entry || !Number.isSafeInteger(Number(entry[1])) || top === null || top.length >= 5) { valid = false; break; }
       let name: string;
       let cmd: string | undefined;
       try { name = decodeURIComponent(entry[2]!); if (entry[3] !== undefined) cmd = decodeURIComponent(entry[3]); }
       catch { valid = false; break; }
       top.push({ rssKb: Number(entry[1]), name, ...(cmd !== undefined ? { cmd } : {}) });
     }
-    if (valid) samples.push({ at, cgroupBytes, top });
+    if (valid) samples.push({ at, cgroupBytes, ...(stageMatch ? { stage: stageMatch[1] as PodMemoryStageName } : {}), top });
   }
   return samples;
 }
@@ -4431,7 +4447,8 @@ export function parseMemSamples(logs: string): Array<{ at: number; cgroupBytes: 
 function formatLastMemSample(sample: ReturnType<typeof parseMemSamples>[number] | undefined): string {
   if (!sample) return '마지막 샘플: 샘플 없음';
   const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(2)}GiB`;
-  return `마지막 샘플: cgroup ${sample.cgroupBytes === null ? '-' : gib(sample.cgroupBytes)} · 상위 ${sample.top.length ? sample.top.map((p) => `${p.name} ${gib(p.rssKb * 1024)}`).join(' · ') : '없음'}`;
+  const top = sample.top === null ? 'RSS 미측정' : sample.top.length ? sample.top.map((p) => `${p.name} ${gib(p.rssKb * 1024)}`).join(' · ') : '없음';
+  return `마지막 샘플: cgroup ${sample.cgroupBytes === null ? '-' : gib(sample.cgroupBytes)} · 상위 ${top}`;
 }
 
 /** METER-POD-ROLLUP-GAP — 결손 칸의 종료 사유 토큰: 최종도 부분도 없는 사용량을 0 이 아니 «측정 불가» 로 남긴다. */

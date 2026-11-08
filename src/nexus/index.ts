@@ -33,6 +33,7 @@ import { nexusLockPath, nexusRuntimePath, nexusRootDir } from './paths.js';
 import { createPwaRegistration, type PwaRegistrationDeps } from './pwa-registration.js';
 import { resolveCurrentInstance } from '../instance/current.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { getOrCreateElanousId } from '../mss/identity-store.js';
 import { startPortLeaseHeartbeat } from '../control-plane/port-lease-heartbeat.js';
 import { PORT_BANDS } from '../control-plane/ports.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from './default-port.js';
@@ -118,9 +119,19 @@ import { discoverWorkflows as discoverWorkflowsForDaemon } from '../workflow-run
 import { buildDefaultWorkflowDeps as buildWorkflowDaemonDeps } from './api/workflows.js';
 import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } from './api/http-server.js';
 import { loadNexusAppHost } from './apps/app-host.js';
+import { createAppLifecycleEvent } from './apps/app-lifecycle-ledger.js';
+import { createAppLifecycleStore, type AppLifecycleStore } from './apps/app-db.js';
+import {
+  claimNexusFunnelFirstSuccess,
+  tryCreateNexusFunnelRuntime,
+  type NexusFunnelEventSink,
+  type NexusFunnelRuntime,
+} from './apps/funnel-observe.js';
 import { createAppActions, handleAppActionRequest, type AppActionDeclaration, type AppActionDeps } from './apps/app-actions.js';
 import { createAppStorage, type AppStorage } from './apps/app-storage.js';
 import { createAppStorageRoute } from './apps/app-storage-route.js';
+import { createAppJobLedger, createAppJobs, createAppJobsGenerateAction, handleAppJobRequest, type AppGenerationRuntime } from './apps/app-jobs.js';
+import { createHiggsfieldAppBackend, downloadHiggsfieldResult } from './apps/higgsfield-backend.js';
 import { resolveStorageConfig } from '../storage/object-store.js';
 import { checkAuth } from './api/meta-api.js';
 import { startControlServer } from '../control-plane/server.js';
@@ -674,6 +685,10 @@ export interface RunNexusOptions {
   startNexusHttpServerFn?: typeof startNexusHttpServer;
   /** Test-only fake app action providers and credentials; production never supplies this. */
   appActionDepsForTesting?: Omit<Partial<AppActionDeps>, 'secrets'>;
+  /** Test-only observer sink to assert events emitted by the production Nexus boot wiring. */
+  funnelObserverForTesting?: NexusFunnelEventSink;
+  /** Injected app generation queue/provider; tests use fake Higgsfield and production adapters are configured separately. */
+  appGenerationRuntime?: AppGenerationRuntime;
   registerMcpClientsFn?: typeof registerMcpClients;
   getMcpUserConfigForTesting?: typeof getUserConfig;
   reloadUserConfigForTesting?: typeof import('../user-config.js').reloadUserConfig;
@@ -1316,6 +1331,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   const skipHttp = opts.skipHttpServer ?? !!opts.detachForTesting;
   let httpServer: NexusHttpServer | undefined;
   let appStorageService: AppStorage | undefined;
+  let appLifecycleStore: AppLifecycleStore | undefined;
+  let appGenerationRuntime = opts.appGenerationRuntime;
+  let appFunnelRuntime: NexusFunnelRuntime | undefined;
   let appAuthSigningKey: string | undefined;
   let stopMemberHeartbeat: (() => void) | undefined;
   // ⛔ 관제부는 운영 넥서스와 «별도 프로세스»다(RFC 관제 평면 A2 · P0 골 경계) — 넥서스는 기본으로 띄우지 않는다.
@@ -2264,6 +2282,14 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     // `~/.elanous/nexus/apps/<slug>/{app.yaml,out/}`. Invalid apps stay
     // unmounted without preventing the owner's Nexus API from starting.
     let appHostLoad: ReturnType<typeof loadNexusAppHost>;
+    appFunnelRuntime = tryCreateNexusFunnelRuntime(
+      getOrCreateElanousId,
+      opts.funnelObserverForTesting,
+      appHash => claimNexusFunnelFirstSuccess(joinPath(nexusRootDir(), 'funnel-first-success'), appHash),
+    );
+    if (!appFunnelRuntime) {
+      debug.log('nexus.funnel', 'identity-unavailable', {}, { level: 'warn' });
+    }
     try {
       const keyId = 'nexus.app-auth-signing-key';
       let key = await getSecretAsync(keyId);
@@ -2273,7 +2299,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       }
       appAuthSigningKey = key;
       appHostLoad = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'), undefined, {
-        dir: joinPath(nexusRootDir(), 'app-session-tokens'), key,
+        dir: joinPath(nexusRootDir(), 'app-session-tokens'), key, funnel: appFunnelRuntime,
       });
     } catch (error) {
       debug.log('nexus.app-auth', 'signing-key-unavailable', { reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
@@ -2281,6 +2307,16 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       appHostLoad = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'));
     }
     const { appHost, issues: appHostIssues } = appHostLoad;
+    try {
+      appLifecycleStore = createAppLifecycleStore(joinPath(nexusRootDir(), 'app-lifecycle.sqlite'));
+      for (const slug of appHost.slugs) {
+        appLifecycleStore.ensureCreated(createAppLifecycleEvent({ appId: slug, action: 'created', environment: 'simulation', actor: 'system' }));
+      }
+    } catch (error) {
+      debug.log('nexus.app-lifecycle', 'store-unavailable', { reason: error instanceof Error ? error.message : 'unknown' }, { level: 'error' });
+      try { appLifecycleStore?.close(); } catch { /* best-effort */ }
+      appLifecycleStore = undefined;
+    }
     for (const issue of appHostIssues) {
       debug.log('nexus.app-host', 'app-mount-rejected', issue, { level: 'warn' });
     }
@@ -2295,11 +2331,38 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
           .update('elanous-nexus-app-storage-signed-url-v1').digest('base64url');
         appStorageService = createAppStorage(storageManifests, {
           config: resolveStorageConfig(getUserConfig() as Parameters<typeof resolveStorageConfig>[0]), signingKey,
+          funnel: appFunnelRuntime,
         });
       } catch (error) {
         debug.log('nexus.app-storage', 'storage-unavailable', {
           reason: error instanceof Error ? error.message : String(error),
           apps: storageManifests.map(manifest => manifest.slug),
+        }, { level: 'warn' });
+      }
+    }
+    if (!appGenerationRuntime && appStorageService) {
+      try {
+        const ledger = createAppJobLedger(joinPath(nexusRootDir(), 'app-generation-jobs.sqlite'));
+        const jobs = createAppJobs({
+          ledger,
+          saveResult: async ({ appSlug, jobId, url }) => {
+            const maxBytes = appStorageService?.maxUploadBytes(appSlug);
+            if (!maxBytes) return undefined;
+            const downloaded = await downloadHiggsfieldResult(url, maxBytes);
+            if (!downloaded) return undefined;
+            const extension = downloaded.contentType === 'video/mp4' ? 'mp4' : 'webm';
+            const key = `generated/${jobId}.${extension}`;
+            const stored = appStorageService?.upload({ appSlug, key, body: downloaded.bytes, contentType: downloaded.contentType, role: 'owner' });
+            return stored?.status === 201 ? { key: `apps/${appSlug}/${key}` } : undefined;
+          },
+        });
+        appGenerationRuntime = {
+          jobs, ledger,
+          backendForCredentials: credentials => createHiggsfieldAppBackend(credentials),
+        };
+      } catch (error) {
+        debug.log('nexus.app-generation', 'runtime-unavailable', {
+          reason: error instanceof Error ? error.message : String(error),
         }, { level: 'warn' });
       }
     }
@@ -3102,21 +3165,44 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
           filename: result.filename ?? 'download',
         };
       },
+      readImageObject: async ({ appSlug, reference }) => {
+        const result = appStorageService?.read({ appSlug, key: reference });
+        if (!result || result.status !== 200 || result.body === undefined) return undefined;
+        return { bytes: result.body, mimeType: result.contentType ?? 'application/octet-stream' };
+      },
       ...opts.appActionDepsForTesting,
+      funnel: appFunnelRuntime,
+      ...(appGenerationRuntime ? { generate: createAppJobsGenerateAction(appGenerationRuntime) } : {}),
       secrets: {
         async resolve({ appSlug, reference }) {
           try {
-            const credentialService = /^cred:([a-z0-9][a-z0-9-]*)\.[a-zA-Z][a-zA-Z0-9_-]*$/.exec(reference)?.[1];
+            const credentialMatch = /^cred:([a-z0-9][a-z0-9-]*)\.([a-zA-Z][a-zA-Z0-9_-]*)$/.exec(reference);
+            const credentialService = credentialMatch?.[1];
             const serviceId = credentialService === 'openai' ? 'openai-api' : credentialService;
             const service = serviceId ? SERVICE_KEY_CATALOG.find(item => item.id === serviceId && item.appAttachable === true) : undefined;
-            const name = service?.envNames[0];
+            const field = credentialMatch?.[2];
+            const storeId = service?.storeIds?.find(id => id.endsWith(`.${field}`));
+            const name = storeId
+              ? storeId.toUpperCase().replace(/[^A-Z0-9_]/g, '_')
+              : service?.envNames[0];
             if (!name) {
               debug.log('nexus.app-actions', 'credential-unavailable', {
                 appSlug, reference, reason: 'credential reference is not app-attachable',
               }, { level: 'warn' });
               return undefined;
             }
+            if (serviceId === 'higgsfield' && (field === 'key_id' || field === 'secret')) {
+              const resolution = await import('./apps/higgsfield-backend.js').then(({ resolveHiggsfieldAppCredentialForApp }) =>
+                resolveHiggsfieldAppCredentialForApp(appSlug, reference, async credentialField => {
+                  const credentialStoreId = service?.storeIds?.find(id => id.endsWith(`.${credentialField}`));
+                  if (!credentialStoreId) return undefined;
+                  const credentialName = credentialStoreId.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+                  return getSecretAsync(appSecretId(appSlug, credentialName));
+                }));
+              if (resolution.handled) return resolution.value;
+            }
             const value = await getSecretAsync(appSecretId(appSlug, name));
+            if (value?.trim()) return value;
             if (!value?.trim()) {
               debug.log('nexus.app-actions', 'credential-unavailable', {
                 appSlug, reference, reason: 'app-scoped credential is absent',
@@ -3141,9 +3227,13 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         const raw = (actions as Record<string, unknown>)[actionName];
         if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
         const value = raw as Record<string, unknown>;
-        if ((value.builtin !== 'stt' && value.builtin !== 'summarize' && value.builtin !== 'tts')
+        if ((value.builtin !== 'stt' && value.builtin !== 'summarize' && value.builtin !== 'tts' && value.builtin !== 'generate')
           || !Array.isArray(value.uses) || !value.uses.every(item => typeof item === 'string')) return undefined;
-        return { builtin: value.builtin, uses: value.uses as string[] };
+        return {
+          builtin: value.builtin, uses: value.uses as string[],
+          ...(typeof value.async === 'boolean' ? { async: value.async } : {}),
+          ...(typeof value.spend === 'string' ? { spend: value.spend } : {}),
+        };
       },
       run: input => appActionExecutor.run(input),
     });
@@ -3152,6 +3242,13 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       getManifest: appSlug => appHost.getManifest(appSlug),
       authorize: candidate => !!metaApiOpts && checkAuth(candidate, metaApiOpts),
     });
+    const appJobRoute = appGenerationRuntime
+      ? (request: Request) => handleAppJobRequest(request, {
+        jobs: appGenerationRuntime!.jobs,
+        ledger: appGenerationRuntime!.ledger,
+        authorize: candidate => !!metaApiOpts && checkAuth(candidate, metaApiOpts),
+      })
+      : undefined;
     const mcpUserConfig = (opts.getMcpUserConfigForTesting ?? getUserConfig)();
     const configuredWidgetServerId = mcpUserConfig.mcp?.widgetServerId;
     const knownMcpServerIds = new Set((mcpUserConfig.mcp?.servers ?? []).map((server) => server.id));
@@ -3206,7 +3303,12 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       ...(getMcpWidgetServerId ? { getMcpWidgetServerId } : {}),
       ...(pwaStaticDir ? { staticDir: pwaStaticDir } : {}),
       appHost,
-      appRoutes: [appActionRoute, appStorageRoute],
+      appLifecycleSnapshot: (slug: string) => {
+        if (!appLifecycleStore) throw new Error('app lifecycle store is unavailable');
+        return appLifecycleStore.snapshot(slug);
+      },
+      ...(appFunnelRuntime ? { appPreviewUserSlug: appFunnelRuntime.accountHash.slice(0, 20) } : {}),
+      appRoutes: [appActionRoute, appStorageRoute, ...(appJobRoute ? [appJobRoute] : [])],
       ...(runtimeIntentPrediction ? { intentPrediction: runtimeIntentPrediction } : {}),
       // next-fluent(태스크 완료 → 다음 액션 1-클릭 칩·2026-07-15) — mission-fabric-aware source +
       // 항상 켜진 라우트(기본 ON). personas 만 선택 사항이며, route 는 503(not-wired) 안 냄.
@@ -3679,6 +3781,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     }
     controlServer?.stop();
     httpServer?.stop();
+    try { appGenerationRuntime?.jobs.close(); } catch { /* best-effort shutdown */ }
+    try { appLifecycleStore?.close(); } catch { /* best-effort shutdown */ }
+    appLifecycleStore = undefined;
     if (appStorageService) {
       try { appStorageService.close(); } catch { /* best-effort shutdown */ }
       appStorageService = undefined;

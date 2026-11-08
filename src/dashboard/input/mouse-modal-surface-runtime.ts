@@ -1,7 +1,7 @@
 import { topModalSurface } from '../../display/modal-stack.js';
 import type { ModalSurface } from '../../display/modal-stack.js';
 import type { DisplayMouseEvent } from '../../display/types.js';
-import type { DashboardMouseWiringDeps } from './mouse-wiring.js';
+import type { DashboardMouseWiringDeps } from './mouse-wiring-types.js';
 
 export interface MouseModalSurfaceRuntimeDeps {
   getFocusStack: () => readonly string[];

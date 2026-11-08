@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Context pull tools — Phase C of PLAN-llm-active-context-and-control ──
 //
 // A family of read-only LLM tools that replace the dropped auto-inject
@@ -12,7 +13,7 @@
 //   • src/tool-runtime/context-runtime.ts — registry registration
 //   • 내부 문서 `PLAN-llm-active-context-and-control` §4 Phase C
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   getGlobalElementRegistry,
   getGlobalElementStateStore,

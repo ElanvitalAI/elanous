@@ -48,19 +48,21 @@ interface TtsVoiceMappingWire {
 
 interface ModelTierUserConfigWire {
   voice?: {
-    stt?: ModelTierWire;
-    tts?: ModelTierWire;
+    stt?: ModelTierWire | null;
+    tts?: ModelTierWire | null;
     /** M2-2b — per-context voice identity (raw voice ids today). */
     ttsVoice?: TtsVoiceMappingWire;
   };
-  llm?: ModelTierWire;
+  llm?: ModelTierWire | null;
+  // Daemon-owned tiers stay in the wire shape so unrelated PWA writes
+  // can preserve values configured by another client.
   embedding?: ModelTierWire;
   vision?: ModelTierWire;
   profile?: 'casual' | 'power' | 'custom';
   /** M2-3 — preset id ("meeting" · "medical_dictation" · ...). The
    *  preset's tier values get expanded into the sibling slots at
    *  apply time, but the id stays for the "Active preset" banner. */
-  preset?: string;
+  preset?: string | null;
 }
 
 /** Patch applied per-row in the Voice ID picker — `null` for a key
@@ -172,10 +174,41 @@ async function putModelTier(
 ): Promise<SyncStatus> {
   if (!cfg.baseUrl) return 'offline';
   try {
+    let payload = body;
+    if ('modelTier' in body) {
+      const currentRes = await fetch(buildUrl(cfg, '/v1/config/model-tier'), {
+        headers: buildHeaders(cfg),
+      });
+      if (!currentRes.ok) return 'error';
+      const current = (await currentRes.json() as ModelTierGetWire).modelTier ?? {};
+      // A null sub-tree means this caller has no PWA-owned tiers to
+      // resend. Preserve the daemon tree instead of turning an empty
+      // local cache into a destructive clear.
+      const requested = body.modelTier ?? {};
+      const merged: ModelTierUserConfigWire = { ...current };
+      for (const [key, value] of Object.entries(requested)) {
+        if (key === 'voice' && value && typeof value === 'object') {
+          const voice: NonNullable<ModelTierUserConfigWire['voice']> = { ...current.voice };
+          for (const [voiceKey, voiceValue] of Object.entries(value)) {
+            if (voiceValue === null) delete voice[voiceKey as keyof typeof voice];
+            else Object.assign(voice, { [voiceKey]: voiceValue });
+          }
+          merged.voice = voice;
+        } else if (value === null) {
+          delete merged[key as keyof ModelTierUserConfigWire];
+        } else {
+          Object.assign(merged, { [key]: value });
+        }
+      }
+      payload = {
+        ...body,
+        modelTier: merged,
+      };
+    }
     const res = await fetch(buildUrl(cfg, '/v1/config/model-tier'), {
       method: 'PUT',
       headers: buildHeaders(cfg),
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) return 'error';
     return 'synced';
@@ -201,14 +234,14 @@ export async function pushSttTierToDaemon(
     saveModelTierPrefs({ stt: tier });
   }
   const body: ModelTierPutWire = tier === null
-    ? { modelTier: null }
+    ? { modelTier: { voice: { stt: null } } }
     : { modelTier: { voice: { stt: tier } } };
   return putModelTier(cfg, body);
 }
 
 /** Compose a full modelTier sub-tree from current prefs so partial
  *  updates don't clobber sibling surfaces. The daemon endpoint merges
- *  sub-trees whole-cloth — to keep STT/TTS/LLM/embedding/vision
+ *  sub-trees whole-cloth — to keep STT/TTS/LLM
  *  independent the PWA has to re-send everything currently known on
  *  each PUT. */
 function composeModelTierBody(): NonNullable<ModelTierPutWire['modelTier']> | null {
@@ -219,8 +252,6 @@ function composeModelTierBody(): NonNullable<ModelTierPutWire['modelTier']> | nu
   if (local.tts) voice.tts = local.tts;
   if (Object.keys(voice).length > 0) body.voice = voice;
   if (local.llm) body.llm = local.llm;
-  if (local.embedding) body.embedding = local.embedding;
-  if (local.vision) body.vision = local.vision;
   return Object.keys(body).length === 0 ? null : body;
 }
 
@@ -235,7 +266,9 @@ export async function pushLlmTierToDaemon(
   } else {
     saveModelTierPrefs({ llm: tier });
   }
-  return putModelTier(cfg, { modelTier: composeModelTierBody() });
+  return putModelTier(cfg, {
+    modelTier: { ...composeModelTierBody(), ...(tier === null ? { llm: null } : {}) },
+  });
 }
 
 /** Push the user's chosen TTS tier (M2-2). null = reset to Smart
@@ -249,34 +282,9 @@ export async function pushTtsTierToDaemon(
   } else {
     saveModelTierPrefs({ tts: tier });
   }
-  return putModelTier(cfg, { modelTier: composeModelTierBody() });
-}
-
-/** Push the user's chosen embedding tier (M3-2). Same semantics as
- *  pushLlmTier — sparse sub-tree merge so siblings are preserved. */
-export async function pushEmbeddingTierToDaemon(
-  cfg: DaemonHttpConfig,
-  tier: ModelTier | null,
-): Promise<SyncStatus> {
-  if (tier === null) {
-    saveModelTierPrefs({ embedding: undefined as unknown as ModelTier });
-  } else {
-    saveModelTierPrefs({ embedding: tier });
-  }
-  return putModelTier(cfg, { modelTier: composeModelTierBody() });
-}
-
-/** Push the user's chosen vision tier (M3-2). */
-export async function pushVisionTierToDaemon(
-  cfg: DaemonHttpConfig,
-  tier: ModelTier | null,
-): Promise<SyncStatus> {
-  if (tier === null) {
-    saveModelTierPrefs({ vision: undefined as unknown as ModelTier });
-  } else {
-    saveModelTierPrefs({ vision: tier });
-  }
-  return putModelTier(cfg, { modelTier: composeModelTierBody() });
+  return putModelTier(cfg, {
+    modelTier: { ...composeModelTierBody(), ...(tier === null ? { voice: { tts: null } } : {}) },
+  });
 }
 
 /** Push a per-context TTS voice id patch (M2-2b). Reads the current
@@ -343,19 +351,14 @@ export async function pushPresetToDaemon(
   if (preset === null) {
     // Clear preset only · preserve other sub-trees.
     const local = loadModelTierPrefs();
-    const body: NonNullable<ModelTierPutWire['modelTier']> = {};
+    const body: NonNullable<ModelTierPutWire['modelTier']> = { preset: null };
     const voice: NonNullable<NonNullable<ModelTierPutWire['modelTier']>['voice']> = {};
     if (local.stt) voice.stt = local.stt;
     if (local.tts) voice.tts = local.tts;
     if (Object.keys(voice).length > 0) body.voice = voice;
     if (local.llm) body.llm = local.llm;
-    // Important: preset field cleared via undefined (the daemon
-    // validator drops absent keys). To force a clear we'd PUT
-    // modelTier:null but that wipes everything; preserving siblings
-    // means we just don't include preset here.
-    return putModelTier(cfg, {
-      modelTier: Object.keys(body).length === 0 ? null : body,
-    });
+    // Null explicitly removes just the preset key in putModelTier's merge.
+    return putModelTier(cfg, { modelTier: body });
   }
 
   // Apply: write tier slots from preset · also persist preset.id for

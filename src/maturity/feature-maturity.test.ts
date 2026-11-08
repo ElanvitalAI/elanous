@@ -23,7 +23,7 @@ function builtPages(directory: string): string[] {
 }
 
 // The export omits private dashboard; this scoped PR also withdraws the resources UI while retaining its route grade for the follow-up.
-const exportExcludedPages = ['/dashboard', '/ops/resources'].filter(page => !existsSync(join(app, page.slice(1), 'page.tsx')));
+const exportExcludedPages = ['/ops/resources'].filter(page => !existsSync(join(app, page.slice(1), 'page.tsx')));
 
 describe('feature maturity across surfaces', () => {
   test('each existing PWA page has exactly one PWA grade', () => {

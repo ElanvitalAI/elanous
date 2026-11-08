@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // LLM tool descriptors + dispatchers — Phase CE2.
 //
 // Three tools: Read, Edit, Write. Descriptors follow the spec of
@@ -11,7 +12,7 @@
 // field lets downstream UI (the diff renderer) pick up the structured
 // patch without re-parsing the text output.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { ReadFileStateStore } from './read-state.js';
 import { applyEdit, applyRead, applyWrite } from './apply.js';

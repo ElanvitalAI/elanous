@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Surface-Agnostic TOX × Agent registry bridge ──
 //
 // Phase 2 of RESEARCH-tox-surface-agnostic-boot-2026-05-13. Builds a
@@ -30,7 +31,7 @@ import { resolveAgentLayered } from './definition-registry.js';
 import { resolveAgent } from './loader.js';
 import { globalAgentRegistry } from './registry.js';
 import type { AgentRegistry } from './registry.js';
-import type { LLMProvider, LLMToolSpec } from '../llm.js';
+import type { LLMProvider } from '../llm.js';
 import type { SubagentCallable } from '../task-orchestrator/surfaces/subagent.js';
 
 export interface CreateSubagentCallableOpts {

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from './llm/tool-spec.js';
 // ── elanous ask — single-shot CLI prompt evaluator ─────────────────────────
 //
 // Headless entry that pipes a single user prompt through the same LLM
@@ -21,14 +22,7 @@
 // excluded — they would error without a live dashboard host anyway.
 
 import { requirePosixShell } from './platform/default-shell.js';
-import {
-  type LLMMessage,
-  type LLMProvider,
-  type LLMToolSpec,
-  getProviderForConfig,
-  resolveDefaultProvider,
-  streamLLMWithTools,
-} from './llm.js';
+import { type LLMMessage, type LLMProvider, getProviderForConfig, resolveDefaultProvider, streamLLMWithTools } from './llm.js';
 import { buildUniversalPreamble } from './prompt-library/universal-preamble.js';
 import { elanousSelfAccessPrompt } from './agent/self-ambient.js';
 import { getModelFamily } from './models/prompts.js';

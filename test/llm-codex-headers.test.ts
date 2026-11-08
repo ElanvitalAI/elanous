@@ -18,17 +18,18 @@ import {
   computePromptCacheKey,
 } from '../src/llm';
 import { debug } from '../src/debug/log';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 type Capture = { url: string; headers: Record<string, string>; body: any; wireJson: string };
 
-function installFetch(capture: Capture[]): typeof fetch {
-  const prior = globalThis.fetch;
-  const stub: any = async (url: string, init: any) => {
-    const hdrs = init?.headers as Record<string, string>;
-    const wireJson = String(init?.body ?? '');
-    let parsed: any = init?.body;
-    try { if (typeof init?.body === 'string') parsed = JSON.parse(init.body); } catch {}
-    capture.push({ url, headers: { ...hdrs }, body: parsed, wireJson });
+function installFetch(capture: Capture[]): FakeFetchDevice {
+  return createFakeFetchDevice([{
+    url: '/backend-api/codex/responses', method: 'POST', response: (request) => {
+    const hdrs = request.headers;
+    const wireJson = request.body ?? '';
+    let parsed: any = request.body;
+    try { if (typeof request.body === 'string') parsed = JSON.parse(request.body); } catch {}
+    capture.push({ url: request.url, headers: { ...hdrs }, body: parsed, wireJson });
     // Minimal SSE body with one text delta + [DONE] — enough to let
     // the generator finish without throwing.
     const sse = [
@@ -48,9 +49,7 @@ function installFetch(capture: Capture[]): typeof fetch {
       status: 200,
       headers: { 'content-type': 'text/event-stream' },
     });
-  };
-  globalThis.fetch = stub;
-  return prior;
+  } }]);
 }
 
 async function drain(gen: AsyncGenerator<unknown>): Promise<void> {
@@ -58,14 +57,14 @@ async function drain(gen: AsyncGenerator<unknown>): Promise<void> {
   for await (const _ of gen) { /* consume */ }
 }
 
-let prior: typeof fetch;
+let device: FakeFetchDevice;
 let calls: Capture[];
 beforeEach(() => {
   calls = [];
-  prior = installFetch(calls);
+  device = installFetch(calls);
 });
 afterEach(() => {
-  globalThis.fetch = prior;
+  device.restore();
 });
 
 describe('streamCodexResponsesEvents logging gate', () => {
@@ -160,7 +159,7 @@ describe('streamCodexResponsesEvents headers', () => {
       'bearer-token-abc',
       { model: 'gpt-5-codex', instructions: 'sys', input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] },
     ));
-    expect(calls[0]!.headers['OpenAI-Beta']).toBe('responses=experimental');
+    expect(calls[0]!.headers['openai-beta']).toBe('responses=experimental');
     expect(calls[0]!.headers['originator']).toBe('codex_cli_rs');
   });
 
@@ -170,7 +169,7 @@ describe('streamCodexResponsesEvents headers', () => {
       'bearer-token-xyz',
       { model: 'gpt-5-codex', instructions: 'sys', input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] },
     ));
-    expect(calls[0]!.headers['Authorization']).toBe('Bearer bearer-token-xyz');
+    expect(calls[0]!.headers['authorization']).toBe('Bearer bearer-token-xyz');
   });
 });
 

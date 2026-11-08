@@ -56,6 +56,7 @@ describe('document-guided installation', () => {
       const searchModule = new URL('../skills/tools/omni-search.ts', import.meta.url).pathname;
       const configModule = new URL('../registry/discovery/config.ts', import.meta.url).pathname;
       writeFileSync(preload, `import { mock } from 'bun:test';
+const { createFakeFetchDevice } = await import(${JSON.stringify(new URL('../ux-sim/fake-fetch.ts', import.meta.url).pathname)});
 const config = await import(${JSON.stringify(configModule)});
 mock.module(${JSON.stringify(configModule)}, () => ({ ...config, getFirecrawlConfig: () => ({ apiKey: 'test-only' }) }));
 const original = await import(${JSON.stringify(searchModule)});
@@ -63,10 +64,8 @@ mock.module(${JSON.stringify(searchModule)}, () => ({ ...original, dispatchOmniS
   if (query !== 'mlr install' || limit !== 5) throw new Error('wrong search invocation');
   return { output: ${JSON.stringify(RESULTS)}, metadata: { perEngine: {}, totalHits: 2, merge: 'interleave' } };
 } }));
-globalThis.fetch = async (input) => {
-  if (input !== 'https://api.firecrawl.dev/v2/scrape') throw new Error('unexpected fetch: ' + input);
-  return new Response(JSON.stringify({ success: true, data: { markdown: ${JSON.stringify(BODY)} } }), { status: 200 });
-};
+const device = createFakeFetchDevice([{ url: 'https://api.firecrawl.dev/v2/scrape', method: 'POST', response: Response.json({ success: true, data: { markdown: ${JSON.stringify(BODY)} } }) }]);
+process.once('exit', () => device.restore());
 `);
       const bin = new URL('../../bin/elanous.mjs', import.meta.url).pathname;
       const result = spawnSync(process.execPath, ['--preload', preload, bin, '--test', 'agent-mission', 'install-from-docs', 'mlr', '--smoke', 'mlr --version', '--dry-run', '--json'], { encoding: 'utf8', timeout: 30_000 });

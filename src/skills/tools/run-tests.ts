@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── run_tests — multi-filter test tool (OH8 follow-up · PR-1) ──
 //
 // 발단(INCIDENT-2026-07-24 타임존 트랙): `bun test <filter>` 는 **substring 필터**라
@@ -13,7 +14,7 @@
 // ⭐ 제1원칙(관측): dispatch 결과를 debug.log('run-tests.dispatch', ...) 로 남긴다.
 
 import { spawnSync } from 'node:child_process';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { parseTestOutput, type TestOutcome } from '../../agent-mission/parse.js';
 import { debug } from '../../debug/log.js';
 

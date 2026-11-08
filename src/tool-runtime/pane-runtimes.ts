@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── VW-term-infra Bundle B-1 · B1-1 — pane LLM tools (Phase 5 foundation) ──
 //
 // Two LLM-facing tools wrapping Bundle A's `PaneVisualStateStore` +
@@ -21,7 +22,7 @@
 //
 // PLAN: 내부 문서 `PLAN-vw-term-bundle-b1-symmetry-foundation` §2.1
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { describePaneWithState } from '../panes/describe-with-state.js';
 import type {
   PaneFocusPolicy,

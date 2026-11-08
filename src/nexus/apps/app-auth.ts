@@ -2,6 +2,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 import { resolve, join } from 'node:path';
 import { getElanousConfigDir } from '../../elanous-config-dir.js';
 import { issueTempToken, matchTempToken, revokeTempTokens, TEMP_TOKEN_MAX_TTL_MS } from '../../auth/temp-tokens.js';
+import { emitNexusFunnelEvent, type NexusFunnelRuntime } from './funnel-observe.js';
 
 const COOKIE_NAME = '__Host-app-session';
 const DEFAULT_INVITATION_TTL_MS = 15 * 60_000;
@@ -15,6 +16,7 @@ export interface AppAuthOptions {
   readonly now?: () => number;
   readonly invitationTtlMs?: number;
   readonly sessionTtlMs?: number;
+  readonly funnel?: NexusFunnelRuntime;
 }
 
 export interface IssueAppInvitationInput { readonly appSlug: string; readonly invitedBy: string; readonly ttlMs?: number; readonly role?: string }
@@ -134,6 +136,7 @@ export function createAppAuth(options: AppAuthOptions) {
     const role = input.role ?? 'owner';
     if (typeof role !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(role)) throw new Error('role must be a declared app role');
     const token = signedToken({ v: 1, purpose: 'invite', appSlug: input.appSlug, invitedBy: input.invitedBy, role, exp }, options.key);
+    if (options.funnel) emitNexusFunnelEvent(options.funnel, { type: 'invite-sent', accountHash: options.funnel.accountHash });
     return { token, expiresAt: new Date(exp).toISOString(), appSlug: input.appSlug, invitedBy: input.invitedBy, role };
   }
 

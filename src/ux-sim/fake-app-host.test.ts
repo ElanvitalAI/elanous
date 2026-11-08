@@ -36,6 +36,18 @@ test('SIM-APPHOST serves an explicitly deployed immutable version, rolls back by
     .toThrow('duplicate normalized app file path');
 });
 
+test('SIM-APPHOST publishes generated immutable artifacts and serves their captured files', () => {
+  const host = createFakeAppHost(apps);
+  host.deploy('demo', 'v1');
+  host.deployArtifact('demo', { id: 'v2-generated', files: { 'index.html': '<h1>generated</h1>', 'share/demo': '<article>note</article>' } });
+  expect(host.fetch('demo.app.sim.invalid', '/share/demo')).toMatchObject({ status: 200, body: '<article>note</article>' });
+  expect(host.fetch('demo.app.sim.invalid', '/index.html').headers['x-app-version']).toBe('v2-generated');
+  expect(() => host.deployArtifact('demo', { id: 'v2-generated', files: { 'index.html': 'mutated' } }))
+    .toThrow('app artifact version already exists or is invalid');
+  host.rollback('demo');
+  expect(host.fetch('demo.app.sim.invalid', '/index.html').headers['x-app-version']).toBe('v1');
+});
+
 test('SIM-APPHOST serves non-HTML assets with path-appropriate content types', () => {
   const host = createFakeAppHost([{ slug: 'assets', versions: [{ id: 'v1', files: {
     'app.js': 'console.log("ok")',

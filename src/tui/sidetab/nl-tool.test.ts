@@ -1,5 +1,6 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 import { describe, expect, test } from 'bun:test';
-import { streamLLMWithTools, type LLMProvider, type LLMToolSpec } from '../../llm.js';
+import { streamLLMWithTools, type LLMProvider } from '../../llm.js';
 import {
   answerNextSidetabCall, createNextSidetabHostHandler, registerNextSidetabReplTool,
   isNextSidetabCall, nextSidetabToolSpec, type NextSidetabCall,

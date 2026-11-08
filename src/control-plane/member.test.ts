@@ -9,6 +9,7 @@ import { setTestStateRoot } from '../nexus/paths.js';
 import { listHarnessParents, measureDiskIoPressure, measureHarnessParents, measureLoad, parseHarnessParentPs, readMemberToken, startMemberHeartbeat } from './member.js';
 import { resolvePrimary, writePrimaryJoin } from './primary.js';
 import { ResourceLedger } from './ledger.js';
+import { createFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -478,7 +479,7 @@ test('missing member token keeps Nexus registration off despite an HTTP listener
   setTestStateRoot(root);
   setElanousConfigDir(root);
   expect(readMemberToken(root)).toBeUndefined();
-  const fetchSpy = spyOn(globalThis, 'fetch');
+  const fetchDevice = createFakeFetchDevice([{ url: '/unreachable', response: Response.json({}) }]);
   const logSpy = spyOn(debug, 'log');
   let nexus: Awaited<ReturnType<typeof runNexus>>;
   try {
@@ -486,10 +487,10 @@ test('missing member token keeps Nexus registration off despite an HTTP listener
       skipRuntimeApi: true, registerDaemonTab: false, registerSettingsTab: false, mcpEnabled: false });
     expect(nexus?.httpServer?.port).toBeGreaterThan(0);
     await Bun.sleep(30);
-    expect(fetchSpy).toHaveBeenCalledTimes(0);
+    expect(fetchDevice.calls()).toHaveLength(0);
     expect(logSpy.mock.calls.filter(([category, event]) =>
       category === 'control.member' && event === 'start-skipped')).toHaveLength(1);
-  } finally { nexus?.release(); fetchSpy.mockRestore(); logSpy.mockRestore(); }
+  } finally { nexus?.release(); fetchDevice.restore(); logSpy.mockRestore(); }
 });
 
 test('Nexus registers to the joined Primary with its member credential', async () => {
@@ -502,12 +503,10 @@ test('Nexus registers to the joined Primary with its member credential', async (
   writeFileSync(join(root, 'control', 'tokens.json'), JSON.stringify({ member: 'a'.repeat(64) }));
   writePrimaryJoin({ url: 'https://primary.example:31413', tokens: { member: joined } }, root);
   const calls: Array<{ url: string; auth: string | null; body: any }> = [];
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(
-    async (input: URL | RequestInfo, init?: RequestInit) => {
-      calls.push({ url: String(input), auth: new Headers(init?.headers).get('authorization'), body: JSON.parse(String(init?.body)) });
+  const fetchDevice = createFakeFetchDevice([{ url: '/v1/resources/register', method: 'POST', response: request => {
+      calls.push({ url: request.url, auth: request.headers.authorization ?? null, body: JSON.parse(String(request.body)) });
       return Response.json({});
-    }, { preconnect: globalThis.fetch.preconnect },
-  ));
+  } }]);
   let nexus: Awaited<ReturnType<typeof runNexus>>;
   try {
     nexus = await runNexus({ detachForTesting: true, skipHttpServer: false, skipSupervisor: true,
@@ -518,7 +517,7 @@ test('Nexus registers to the joined Primary with its member credential', async (
     expect(calls[0]?.body.kind).toBe('machine');
     expect(calls[1]?.body).toMatchObject({ kind: 'instance', endpoint: nexus?.httpServer?.url });
     expect(readMemberToken(root)).toBe(joined);
-  } finally { nexus?.release(); fetchSpy.mockRestore(); }
+  } finally { nexus?.release(); fetchDevice.restore(); }
 });
 
 test('Nexus does not send a local member credential to a joined Primary without member scope', async () => {
@@ -529,14 +528,14 @@ test('Nexus does not send a local member credential to a joined Primary without 
   mkdirSync(join(root, 'control'));
   writeFileSync(join(root, 'control', 'tokens.json'), JSON.stringify({ member: 'a'.repeat(64) }));
   writePrimaryJoin({ url: 'https://primary.example:31413', tokens: { query: 'c'.repeat(64) } }, root);
-  const fetchSpy = spyOn(globalThis, 'fetch');
+  const fetchDevice = createFakeFetchDevice([{ url: '/unreachable', response: Response.json({}) }]);
   let nexus: Awaited<ReturnType<typeof runNexus>>;
   try {
     nexus = await runNexus({ detachForTesting: true, skipHttpServer: false, skipSupervisor: true,
       skipRuntimeApi: true, registerDaemonTab: false, registerSettingsTab: false, mcpEnabled: false });
     await Bun.sleep(30);
-    expect(fetchSpy).not.toHaveBeenCalled();
-  } finally { nexus?.release(); fetchSpy.mockRestore(); }
+    expect(fetchDevice.calls()).toHaveLength(0);
+  } finally { nexus?.release(); fetchDevice.restore(); }
 });
 
 test('Nexus registers after binding the actual port without waiting for an unresponsive coordinator, and stops on release', async () => {
@@ -550,12 +549,10 @@ test('Nexus registers after binding the actual port without waiting for an unres
   const calls: Array<{ path: string; body: any }> = [];
   let releaseFetch!: (value: Response) => void;
   const pending = new Promise<Response>(resolve => { releaseFetch = resolve; });
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(
-    async (input: URL | RequestInfo, init?: RequestInit) => {
-      calls.push({ path: new URL(String(input)).pathname, body: JSON.parse(String(init?.body)) });
+  const fetchDevice = createFakeFetchDevice([{ url: '/v1/resources/register', method: 'POST', response: request => {
+      calls.push({ path: new URL(request.url).pathname, body: JSON.parse(String(request.body)) });
       return pending;
-    }, { preconnect: globalThis.fetch.preconnect },
-  ));
+  } }]);
   let nexus: Awaited<ReturnType<typeof runNexus>>;
   try {
     nexus = await runNexus({ detachForTesting: true, skipHttpServer: false, skipSupervisor: true,
@@ -571,5 +568,5 @@ test('Nexus registers after binding the actual port without waiting for an unres
     const count = calls.length;
     await Bun.sleep(50);
     expect(calls).toHaveLength(count);
-  } finally { releaseFetch(Response.json({})); nexus?.release(); fetchSpy.mockRestore(); }
+  } finally { releaseFetch(Response.json({})); nexus?.release(); fetchDevice.restore(); }
 });

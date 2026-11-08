@@ -1,5 +1,5 @@
 import type { ShellHandle } from '../../shell-runner/types.js';
-import type { DashboardMouseWiringDeps } from './mouse-wiring.js';
+import type { DashboardMouseWiringDeps } from './mouse-wiring-types.js';
 
 interface ShellRegistryEntry {
   id: string;

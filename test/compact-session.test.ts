@@ -24,7 +24,7 @@ import {
 import { compactSessionHistory } from '../src/session/compact-session.js';
 import { resetAutoCompactStateForTest } from '../src/compact/auto-state.js';
 import type { CompactProvider } from '../src/compact/provider.js';
-import type { ChatAutoCompactConfig } from '../src/user-config.js';
+import type { ChatAutoCompactConfig } from '../src/user-config/chat.js';
 
 let root: string;
 

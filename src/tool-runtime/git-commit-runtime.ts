@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── GitCommit ToolRuntime (Coding Pipeline P4) ──
 //
 // Structured wrapper around `git add <specific files>` + `git commit
@@ -35,7 +36,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { basename } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import { getSessionCwd } from '../session/working-dir.js';
 import { harnessCommandWriteReject } from '../harness/harness-write-boundary.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';

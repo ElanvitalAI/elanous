@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── RunShell LLM tool ──
 //
 // Codex PTY port Phase X1 follow-up: surfaces `runShell` to LLMs as a
@@ -18,7 +19,7 @@
 // taxonomy (outcome) and audit key so the LLM can reference runs in
 // multi-turn follow-ups.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { harnessCommandWriteReject } from '../../harness/harness-write-boundary.js';
 import {
   runShell,

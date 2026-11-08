@@ -7,7 +7,7 @@ import { NEXT_MD_PATH, resolveNextMdConflict } from '../release-loop/next-md-mer
 import { defaultLlmResolve, mergeMainWithLlmResolve, type MergeGitSeam } from '../autopilot/build/llm-conflict-merge.js';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
 import { debug } from '../debug/log.js';
-import { integrateTrain, runTrain, type TrainCandidate, type TrainDeferred, type TrainGit, type TrainIntegration } from './merge-train.js';
+import { integrateTrain, runTrain, type TrainCandidate, type TrainDeferred, type TrainGit, type TrainIntegration, type TrainProgressEvent } from './merge-train.js';
 import { trainGateOnHost, type TrainGate } from './train-gate-remote.js';
 import type { GateRemoteRunner, GateRemoteSettings } from './gate-remote.js';
 import {
@@ -104,6 +104,8 @@ export type L8ShadowQueueDeps = L8MergeQueueDeps & {
   trainMaxBatch?: number;
   /** Reach observation seam (default: inspect each fetched PR worktree via buildTrainReachDecision). */
   trainReachInspect?: (candidate: TrainReachCandidate, baseSha: string) => TrainReachObservation;
+  /** Production shadow-train progress sink; defaults to the durable debug log. Tests may bridge it into the macrophage bus. */
+  emitTrainProgress?: (event: TrainProgressEvent) => void | Promise<void>;
 };
 
 function shadowCommand(execute: Command, bin: string, args: string[], cwd: string): string {
@@ -337,6 +339,11 @@ async function runShadowMergeTrain(
     gate,
     deferred: plan.deferred,
     observe: (data) => { debug.log('self-implement.merge-train', 'shadow-verdict', data); },
+    progressId: `shadow:${queueSig}`,
+    emitProgress: async (event) => {
+      debug.log('self-implement.merge-train', event.type, event);
+      await deps.emitTrainProgress?.(event);
+    },
   });
   const at = new Date().toISOString();
   const batchNumbers = trainBatch.map((item) => item.number);

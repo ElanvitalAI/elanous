@@ -1,10 +1,11 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── PX-4 P5: MissionStatus LLM tool ──
 //
 // Read-only observation into globalMissionRegistry. The parent LLM
 // uses this to check on autonomous mission progress without waiting
 // for the Turn hook banner.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { globalMissionRegistry, type MissionRegistry } from './registry.js';
 import type { MissionState, MissionDefinition } from './types.js';
 

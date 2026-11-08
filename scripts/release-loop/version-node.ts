@@ -9,12 +9,13 @@ import { effectiveInstanceRoot, prodInstanceRoot } from '../../src/instance/reso
 import { landingFreezeMessage, readLandingFreeze, type LandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { baseVersion, isReleaseVersion, isStableVersion, prereleaseKind } from './release-version.js';
 import { cutReleaseBranch } from './cut-branch.js';
+import { runCutGateImagePrebuild, type CutGateImagePrebuildOutcome } from './gate-image-pin.js';
 
 type Kind = 'release' | 'dev-bump';
 type Output = { outcome: 'ok' | 'error'; kind: Kind | null; version: string | null; commit: string | null; pr: number | null; files?: string[]; worktree?: string; error?: string;
   /** RELEASE-BRANCH: the release branch the cut lives on and the main commit it was cut from. */
   branch?: string; base?: string; existing?: boolean; skipped?: string;
-  artifactOwner?: { runId: string; attempt: number } };
+  artifactOwner?: { runId: string; attempt: number }; gateImagePrebuild?: CutGateImagePrebuildOutcome };
 
 export function nextDevVersion(version: string): string {
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(isReleaseVersion(version) ? baseVersion(version) : version);
@@ -151,6 +152,8 @@ export interface BranchCutDeps {
   forceFreeze?: boolean;
   /** Identity of the graph run cutting this branch. A direct legacy call may omit it. */
   runId?: string;
+  /** Exact origin/main commit checked before graph launch; prevents a later fetch from moving the cut. */
+  baseCommit?: string;
   /** Release run ledger universe; defaults to the active instance root. */
   root?: string;
 }
@@ -262,7 +265,23 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
     const current = versionAt(repo, tip);
     if (current !== version) throw new Error(`${branch} tip ${tip} package.json version ${current} is not ${version}`);
     // The branch must be a cut of this release line: its fork point on main still carries <base>-dev.N (or <v>).
-    const fork = git(repo, 'merge-base', 'origin/main', tip);
+    let fork: string;
+    if (deps.baseCommit) {
+      const cutRecord = git(repo, 'log', '-1', '--format=%H%x1f%B', '--grep=^Cut from main ', tip);
+      const [cutCommit, message] = cutRecord.split('\x1f', 2);
+      const recordedBase = /^Cut from main ([0-9a-f]{40})\./mu.exec(message ?? '')?.[1];
+      if (!cutCommit || !recordedBase) throw new Error(`${branch} has no verifiable original main cut SHA`);
+      const cutParent = git(repo, 'rev-parse', '--verify', `${cutCommit}^`);
+      if (cutParent !== recordedBase) throw new Error(`${branch} cut commit ${cutCommit} parent ${cutParent} does not match recorded main SHA ${recordedBase}`);
+      const includesRecordedCut = spawnSync('git', ['merge-base', '--is-ancestor', recordedBase, deps.baseCommit], {
+        cwd: repo, encoding: 'utf8', timeout: 10_000, maxBuffer: 1 << 20,
+      });
+      if (includesRecordedCut.error || includesRecordedCut.status !== 0)
+        throw new Error(`${branch} original cut ${recordedBase} is not an ancestor of the CLI-verified main commit ${deps.baseCommit}`);
+      // The checked original base defines this existing cut. Current origin/main may have advanced
+      // independently or may already contain the release branch; neither changes the cut identity.
+      fork = recordedBase;
+    } else fork = git(repo, 'merge-base', 'origin/main', tip);
     const forkVersion = versionAt(repo, fork);
     const stableLine = baseVersion(version);
     if (forkVersion !== version && !new RegExp(`^${stableLine.replaceAll('.', '\\.')}-dev\\.(0|[1-9][0-9]*)$`).test(forkVersion)) {
@@ -273,7 +292,7 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
     debug.log('release-loop.cut', 'chosen', { version, source: 'release-branch', commit: tip, branch, existing: true, artifactOwner });
     return { outcome: 'ok', kind: 'release', version, commit: tip, pr: null, branch, existing: true, ...(artifactOwner ? { artifactOwner } : {}) };
   }
-  const base = git(repo, 'rev-parse', 'origin/main');
+  const base = deps.baseCommit === undefined ? git(repo, 'rev-parse', 'origin/main') : git(repo, 'rev-parse', '--verify', `${deps.baseCommit}^{commit}`);
   const current = versionAt(repo, base);
   const stable = baseVersion(version);
   const devOfStable = new RegExp(`^${stable.replaceAll('.', '\\.')}-dev\\.(0|[1-9][0-9]*)$`);
@@ -312,8 +331,8 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
   }
 }
 
-function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false, branchCut = false, devTarget?: string, runId?: string): Output {
-  if (kind === 'release' && branchCut && cutCommit === undefined) return cutReleaseBranchForRun(repo, releaseVersion, { forceFreeze, runId });
+function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false, branchCut = false, devTarget?: string, runId?: string, branchCutBaseCommit?: string): Output {
+  if (kind === 'release' && branchCut && cutCommit === undefined) return cutReleaseBranchForRun(repo, releaseVersion, { forceFreeze, runId, ...(branchCutBaseCommit ? { baseCommit: branchCutBaseCommit } : {}) });
   if (kind === 'dev-bump' && prereleaseKind(releaseVersion) !== null) {
     // A prerelease (rehearsal) never moves main: the next stable release still owns this -dev line.
     debug.log('release-loop.version-dev-bump', 'skipped', { version: releaseVersion, reason: 'prerelease' });
@@ -468,14 +487,21 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
   }
 }
 
-export function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Output {
+export function main(args: string[] = process.argv.slice(2), repo = process.cwd(), deps: {
+  cutBranch?: typeof cutReleaseBranch;
+  prebuildGateImage?: typeof runCutGateImagePrebuild;
+} = {}): Output {
   let kind: Kind | null = null;
   let version: string | null = null;
   let cut: string | undefined;
   let cutCommit: string | undefined;
   let forceFreeze = false;
   let branchCut = false;
+  let branchCutBaseCommit: string | undefined;
   let runId: string | undefined;
+  let gatePodPool: string | undefined;
+  let gateExecutor: string | undefined;
+  let gateImagePin: string | undefined;
   try {
     if (args[0] !== 'release' && args[0] !== 'dev-bump' && args[0] !== 'cut-branch')
       throw new Error('usage: version-node.ts <release|dev-bump|cut-branch> [--version <v>] [--cut <sha>] [--cut-commit <sha>] [--pick <sha>] [--base <sha>] [--append] [--dry-run] --json');
@@ -499,14 +525,23 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
     if (process.env.ELANOUS_GRAPH_CONTEXT) {
       const location = process.env.ELANOUS_GRAPH_CONTEXT;
       const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as {
-        runId?: unknown; input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown };
+        runId?: unknown; input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown;
+          branchCutBaseCommit?: unknown; gatePodPool?: unknown; gateExecutor?: unknown; gateImagePin?: unknown };
         outputs?: Record<string, { outcome?: unknown; commit?: unknown; base?: unknown; branch?: unknown } | undefined> };
       if (context.runId !== undefined) {
         if (typeof context.runId !== 'string') throw new Error('runId must be a string');
         runId = context.runId;
       }
       if (!version && typeof context.input?.version === 'string') version = context.input.version;
+      if (typeof context.input?.gatePodPool === 'string') gatePodPool = context.input.gatePodPool;
+      if (typeof context.input?.gateExecutor === 'string') gateExecutor = context.input.gateExecutor;
+      if (typeof context.input?.gateImagePin === 'string') gateImagePin = context.input.gateImagePin;
       forceFreeze = context.input?.forceFreeze === true;
+      if (context.input?.branchCutBaseCommit !== undefined) {
+        if (typeof context.input.branchCutBaseCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(context.input.branchCutBaseCommit))
+          throw new Error('branchCutBaseCommit must be a full commit SHA');
+        branchCutBaseCommit = context.input.branchCutBaseCommit;
+      }
       const releasedBranch = context.outputs?.['version-release']?.branch;
       branchCut = context.input?.branchCut === true
         || (kind === 'dev-bump'
@@ -527,17 +562,29 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
     }
     if (!version) throw new Error('version required (--version or ELANOUS_GRAPH_CONTEXT.input.version)');
     nextDevVersion(version);
+    const prebuildGateImage = (commit: string | null): CutGateImagePrebuildOutcome | undefined => {
+      if (typeof commit !== 'string' || !commit || dryRun || gateExecutor !== 'pod' || gateImagePin !== 'cut-commit' || !gatePodPool || !runId) return undefined;
+      const result = (deps.prebuildGateImage ?? runCutGateImagePrebuild)({ root: effectiveInstanceRoot(), repo: resolve(repo), runId, version: version!, commit, pool: gatePodPool });
+      debug.log('release-loop.cut-image', 'prebuild', { runId, version, commit, outcome: result.outcome,
+        ...(result.outcome === 'failed' ? { reason: result.reason } : {}),
+        ...(result.outcome === 'built' || result.outcome === 'reused' ? { digest: result.digest, eligiblePools: result.eligiblePools } : {}) });
+      return result;
+    };
     if (args[0] === 'cut-branch') {
       if (cut !== undefined || cutCommit !== undefined) throw new Error('--cut/--cut-commit are not valid for cut-branch');
       if (!picks.length) throw new Error('at least one --pick commit is required');
-      const result = cutReleaseBranch({
+      const result = (deps.cutBranch ?? cutReleaseBranch)({
         version, pick: picks, ...(base !== undefined ? { base } : {}), append, dryRun,
         repoRoot: resolve(repo), ledger: () => versionRelease,
       });
-      return { outcome: 'ok', kind: 'release', version, commit: result.commit, pr: null, branch: result.branch, ...(dryRun ? { skipped: 'dry-run' } : {}) };
+      const gateImagePrebuild = prebuildGateImage(result.commit);
+      return { outcome: 'ok', kind: 'release', version, commit: result.commit, pr: null, branch: result.branch,
+        ...(gateImagePrebuild ? { gateImagePrebuild } : {}), ...(dryRun ? { skipped: 'dry-run' } : {}) };
     }
     if (kind === 'dev-bump' && cutCommit !== undefined) throw new Error('--cut-commit is only valid for release');
-    return landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze, branchCut, undefined, runId);
+    const output = landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze, branchCut, undefined, runId, branchCutBaseCommit);
+    const gateImagePrebuild = kind === 'release' && branchCut ? prebuildGateImage(output.commit) : undefined;
+    return gateImagePrebuild ? { ...output, gateImagePrebuild } : output;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const worktree = /\[worktree: ([^\]]+)\]$/.exec(message)?.[1];

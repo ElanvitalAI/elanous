@@ -1,3 +1,4 @@
+import { textOnly } from '../llm/stream-text.js';
 // ── US 머니무브 펄스 (2026-07-06 대표 지시) ─────────────────────────────
 //
 // "팔란티어가 6일째 오르고 있는데 … 미국장 머니무브·섹터 순환 체크가 원활하게
@@ -17,7 +18,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { getUserConfig } from '../user-config.js';
-import { getProviderForConfig, anyProviderAvailable, textOnly, type LLMMessage } from '../llm.js';
+import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 import { conatusPath } from './conatus-data-dir.js';
 
 export const US_PULSE_DB = conatusPath('us_pulse.db');

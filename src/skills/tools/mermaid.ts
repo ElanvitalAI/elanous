@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tool: mermaid_render
 //
 // Turn mermaid syntax into a terminal-displayable diagram. Wraps the
@@ -15,7 +16,7 @@
 // supports it, emit an inline-image escape sequence; else fall
 // through to ascii. No architectural change needed to light that up.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 export interface MermaidRenderArgs {
   source: string;

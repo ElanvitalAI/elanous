@@ -4,8 +4,10 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { MAX_FRAME_BYTES, serverIdFromPublicKey } from './channel.js';
-import { challengeMessage, loadTrustedHostKeys, startRelayServer } from './relay-server.js';
+import { acceptDaemonChannel, generateDaemonKeyPair, MAX_FRAME_BYTES, serverIdFromPublicKey } from './channel.js';
+import { MuxDecoder, MuxEncoder, MuxStreamState } from './mux.js';
+import { challengeMessage, loadTrustedHostKeys, parsePublicAppHost, startRelayServer } from './relay-server.js';
+import { validateRelayPublicOptions } from './relay-cli.js';
 
 type Relay = ReturnType<typeof startRelayServer>;
 type Message = string | Uint8Array;
@@ -77,6 +79,182 @@ afterEach(() => {
 });
 
 describe('Bun encrypted-frame relay', () => {
+  test('public app hosts follow the one-label elanous.app and D2 name contract', () => {
+    expect(parsePublicAppHost('notes--alice.elanous.app')).toEqual({ app: 'notes', user: 'alice' });
+    expect(parsePublicAppHost('voice-note--user-7.elanous.app:443')).toEqual({ app: 'voice-note', user: 'user-7' });
+    for (const invalid of [
+      'notes.alice.elanous.app', 'notes--al.elanous.app', '-notes--alice.elanous.app',
+      'notes--alice-.elanous.app', 'notes--alice--other.elanous.app', 'www--alice.elanous.app',
+      'note--s--alice.elanous.app', 'notes--ali--ce.elanous.app',
+      'notes-pr12--alice.elanous.app', 'notes--alice.other.test', 'notes--alice.elanous.app.evil.test',
+    ]) expect(parsePublicAppHost(invalid)).toBeUndefined();
+  });
+
+  test('relay CLI requires a complete public domain/server/user tuple', () => {
+    expect(() => validateRelayPublicOptions({ publicDomain: 'elanous.app', publicServerId: 'a'.repeat(64) }))
+      .toThrow('--public-domain, --public-server-id, and --public-user-id must be supplied together');
+    expect(() => validateRelayPublicOptions({ publicDomain: 'other.test', publicServerId: 'a'.repeat(64), publicUserId: 'alice' }))
+      .toThrow('public domain must be elanous.app');
+    expect(() => validateRelayPublicOptions({ publicDomain: 'elanous.app', publicServerId: 'a'.repeat(64), publicUserId: 'alice' })).not.toThrow();
+  });
+
+  test('public mode requires an explicit pinned host and keeps its listener behind the TLS edge', async () => {
+    const key = signing();
+    expect(() => startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]), publicDomain: 'elanous.app' }))
+      .toThrow('public relay requires a pinned publicServerId and valid publicUserId');
+    expect(() => startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]), publicDomain: 'elanous.app', publicServerId: key.id, publicUserId: 'ali--ce' }))
+      .toThrow('public relay requires a pinned publicServerId and valid publicUserId');
+    expect(() => startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]), publicDomain: 'elanous.app', publicServerId: key.id, publicUserId: 'alice', hostname: '0.0.0.0' })).toThrow('listener must stay loopback');
+    const relay = startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]), publicDomain: 'elanous.app', publicServerId: key.id, publicUserId: 'alice' });
+    servers.push(relay);
+    expect(relay.port).toBeGreaterThan(0);
+    const invalidHost = await fetch(`http://127.0.0.1:${relay.port}/`, { headers: { host: 'evil.example.test' } });
+    expect(invalidHost.status).toBe(404);
+    const validHostOffline = await fetch(`http://127.0.0.1:${relay.port}/`, { headers: { host: 'notes--alice.elanous.app' } });
+    expect(validHostOffline.status).toBe(503);
+  });
+
+  test('public mode binds app Host user labels to the configured Nexus identity', async () => {
+    const key = signing();
+    const server = startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]), publicDomain: 'elanous.app', publicServerId: key.id, publicUserId: 'alice' });
+    servers.push(server);
+    const wrongUser = await fetch(`http://127.0.0.1:${server.port}/hello`, { headers: { host: 'notes--bob.elanous.app' } });
+    expect(wrongUser.status).toBe(404);
+    const correctUserOffline = await fetch(`http://127.0.0.1:${server.port}/hello`, { headers: { host: 'notes--alice.elanous.app' } });
+    expect(correctUserOffline.status).toBe(503);
+  });
+
+  test('public mode forwards a valid invited-app host request through the authenticated host channel', async () => {
+    const signingKey = generateKeyPairSync('ed25519');
+    const signingPublicKey = signingKey.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
+    const daemonKeys = await generateDaemonKeyPair(new Uint8Array(32).fill(21));
+    const serverId = serverIdFromPublicKey(daemonKeys.publicKey);
+    const server = startRelayServer({ trustedHostKeys: new Map([[serverId, signingPublicKey]]), publicDomain: 'elanous.app', publicServerId: serverId, publicUserId: 'alice' });
+    servers.push(server);
+    const hostSocket = await connected(`ws://127.0.0.1:${server.port}/host?serverId=${serverId}`);
+    const challenge = JSON.parse(await next(hostSocket) as string) as { nonce: string };
+    hostSocket.send(JSON.stringify({ type: 'auth', publicKey: signingPublicKey,
+      signature: sign(null, challengeMessage(serverId, challenge.nonce), signingKey.privateKey).toString('base64url') }));
+    expect(JSON.parse(await next(hostSocket) as string)).toEqual({ type: 'authenticated', capabilities: ['public-http-v1'] });
+    hostSocket.send(JSON.stringify({ type: 'host-public-key', publicKey: Buffer.from(daemonKeys.publicKey).toString('base64url') }));
+    expect(JSON.parse(await next(hostSocket) as string)).toEqual({ type: 'host-public-key-accepted' });
+    const responsePromise = fetch(`http://127.0.0.1:${server.port}/hello`, {
+      headers: { host: 'notes--alice.elanous.app', origin: 'https://notes--alice.elanous.app:444',
+        connection: 'x-private-hop, keep-alive', 'x-private-hop': 'must-not-forward' },
+    });
+    const taggedPhoneKey = await next(hostSocket) as Uint8Array;
+    const clientId = new DataView(taggedPhoneKey.buffer, taggedPhoneKey.byteOffset, 4).getUint32(0, false);
+    const channel = await acceptDaemonChannel(daemonKeys, taggedPhoneKey.subarray(4));
+    if (!channel.ok) throw new Error(channel.reason);
+    const streams = new MuxStreamState();
+    const decoder = new MuxDecoder(streams);
+    const encoder = new MuxEncoder(streams);
+    const requestOpen = await next(hostSocket) as Uint8Array;
+    const opened = channel.value.open(requestOpen.subarray(4));
+    if (!opened.ok) throw new Error(opened.reason);
+    const openFrame = decoder.decode(opened.value);
+    if (!openFrame.ok || openFrame.value.kind !== 'open') throw new Error('expected public HTTP open frame');
+    expect(openFrame.value.path).toBe('/hello');
+    expect(openFrame.value.headers.host).toBe('notes.app.localhost');
+    expect(openFrame.value.headers.origin).toBe('https://notes--alice.elanous.app:444');
+    expect(openFrame.value.headers.connection).toBeUndefined();
+    expect(openFrame.value.headers['x-private-hop']).toBeUndefined();
+    const requestEnd = await next(hostSocket);
+    if (!(requestEnd instanceof Uint8Array)) throw new Error(`expected encrypted request end frame, received control: ${requestEnd}`);
+    const ended = channel.value.open(requestEnd.subarray(4));
+    if (!ended.ok) throw new Error(ended.reason);
+    expect(decoder.decode(ended.value)).toEqual({ ok: true, value: { streamId: 1, kind: 'end' } });
+
+    const envelope = new TextEncoder().encode(JSON.stringify({ status: 200, headers: {
+      'content-type': 'text/plain', 'x-nexus-app-origin': 'http://notes.app.localhost', 'x-nexus-app-host': 'notes.app.localhost',
+      'access-control-allow-origin': 'http://notes.app.localhost', 'location': 'http://notes.app.localhost/next?from=relay',
+      'content-location': ' //notes.app.localhost/assets/app.json?version=1',
+      connection: 'x-private-response', 'x-private-response': 'must-not-return',
+    }, body: Buffer.from('public host ok').toString('base64') }));
+    const responseData = encoder.encode({ streamId: 1, kind: 'data', data: envelope });
+    if (!responseData.ok) throw new Error(responseData.reason);
+    const encryptedData = channel.value.seal(responseData.value);
+    if (!encryptedData.ok) throw new Error(encryptedData.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedData.value));
+    const responseClose = encoder.encode({ streamId: 1, kind: 'close', reason: '' });
+    if (!responseClose.ok) throw new Error(responseClose.reason);
+    const encryptedClose = channel.value.seal(responseClose.value);
+    if (!encryptedClose.ok) throw new Error(encryptedClose.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedClose.value));
+
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('text/plain');
+    expect(response.headers.get('x-nexus-app-origin')).toBe('https://notes--alice.elanous.app');
+    expect(response.headers.get('x-nexus-app-host')).toBe('notes--alice.elanous.app');
+    expect(response.headers.get('access-control-allow-origin')).toBe('https://notes--alice.elanous.app');
+    expect(response.headers.get('location')).toBe('https://notes--alice.elanous.app/next?from=relay');
+    expect(response.headers.get('content-location')).toBe('https://notes--alice.elanous.app/assets/app.json?version=1');
+    expect(response.headers.get('x-private-response')).toBeNull();
+    expect(await response.text()).toBe('public host ok');
+    expect(JSON.parse(await next(hostSocket) as string)).toMatchObject({ type: 'client-disconnected', clientId });
+
+    const abortController = new AbortController();
+    const cancelled = fetch(`http://127.0.0.1:${server.port}/cancel`, {
+      headers: { host: 'notes--alice.elanous.app' }, signal: abortController.signal,
+    }).then(() => 'resolved', error => error);
+    const abortTaggedKey = await next(hostSocket) as Uint8Array;
+    const abortClientId = new DataView(abortTaggedKey.buffer, abortTaggedKey.byteOffset, 4).getUint32(0, false);
+    expect(await next(hostSocket)).toBeInstanceOf(Uint8Array);
+    expect(await next(hostSocket)).toBeInstanceOf(Uint8Array);
+    abortController.abort();
+    expect(await cancelled).toBeInstanceOf(Error);
+    expect(JSON.parse(await next(hostSocket) as string)).toMatchObject({ type: 'client-disconnected', clientId: abortClientId });
+  });
+
+  test('cancelled public request resolves its response and clears its slot and timeout', async () => {
+    const signingKey = generateKeyPairSync('ed25519');
+    const signingPublicKey = signingKey.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
+    const daemonKeys = await generateDaemonKeyPair(new Uint8Array(32).fill(22));
+    const serverId = serverIdFromPublicKey(daemonKeys.publicKey);
+    const server = startRelayServer({ trustedHostKeys: new Map([[serverId, signingPublicKey]]), publicDomain: 'elanous.app',
+      publicServerId: serverId, publicUserId: 'alice', publicRequestTimeoutMsForTesting: 2_000 });
+    servers.push(server);
+    const hostSocket = await connected(`ws://127.0.0.1:${server.port}/host?serverId=${serverId}`);
+    const challenge = JSON.parse(await next(hostSocket) as string) as { nonce: string };
+    hostSocket.send(JSON.stringify({ type: 'auth', publicKey: signingPublicKey,
+      signature: sign(null, challengeMessage(serverId, challenge.nonce), signingKey.privateKey).toString('base64url') }));
+    expect(JSON.parse(await next(hostSocket) as string)).toEqual({ type: 'authenticated', capabilities: ['public-http-v1'] });
+    hostSocket.send(JSON.stringify({ type: 'host-public-key', publicKey: Buffer.from(daemonKeys.publicKey).toString('base64url') }));
+    expect(JSON.parse(await next(hostSocket) as string)).toEqual({ type: 'host-public-key-accepted' });
+
+    const abort = new AbortController();
+    const cancelledFetch = server.server.fetch(new Request(`http://127.0.0.1:${server.port}/cancel`, {
+      headers: { host: 'notes--alice.elanous.app' }, signal: abort.signal,
+    }));
+    const taggedPhoneKey = await next(hostSocket);
+    expect(taggedPhoneKey).toBeInstanceOf(Uint8Array);
+    const clientId = new DataView((taggedPhoneKey as Uint8Array).buffer, (taggedPhoneKey as Uint8Array).byteOffset, 4).getUint32(0, false);
+    expect(await next(hostSocket)).toBeInstanceOf(Uint8Array);
+    expect(await next(hostSocket)).toBeInstanceOf(Uint8Array);
+    expect(server.stats(serverId)).toMatchObject({ publicRequests: 1, publicSlots: 1 });
+
+    abort.abort();
+    expect((await cancelledFetch).status).toBe(499);
+    expect(JSON.parse(await next(hostSocket) as string)).toMatchObject({ type: 'client-disconnected', clientId });
+    expect(server.stats(serverId)).toMatchObject({ publicRequests: 0, publicSlots: 0 });
+
+    await Bun.sleep(2_100);
+    const nextAbort = new AbortController();
+    const nextFetch = server.server.fetch(new Request(`http://127.0.0.1:${server.port}/after-cancel`, {
+      headers: { host: 'notes--alice.elanous.app' }, signal: nextAbort.signal,
+    }));
+    const nextTaggedPhoneKey = await next(hostSocket);
+    expect(nextTaggedPhoneKey).toBeInstanceOf(Uint8Array);
+    const nextClientId = new DataView((nextTaggedPhoneKey as Uint8Array).buffer, (nextTaggedPhoneKey as Uint8Array).byteOffset, 4).getUint32(0, false);
+    expect(nextClientId).not.toBe(clientId);
+    expect(await next(hostSocket)).toBeInstanceOf(Uint8Array);
+    expect(await next(hostSocket)).toBeInstanceOf(Uint8Array);
+    nextAbort.abort();
+    expect((await nextFetch).status).toBe(499);
+    expect(JSON.parse(await next(hostSocket) as string)).toMatchObject({ type: 'client-disconnected', clientId: nextClientId });
+    expect(server.stats(serverId)).toMatchObject({ publicRequests: 0, publicSlots: 0 });
+  });
   test('relay serve starts from CLI with operator-pinned keys and rejects unregistered IDs', async () => {
     const key = signing();
     const dir = mkdtempSync(join(tmpdir(), 'relay-cli-'));

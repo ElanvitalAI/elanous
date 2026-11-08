@@ -10,13 +10,15 @@ import { listGraphRuns, runGraph as runGraphCore, STOPPED_NODE_ERROR, type Graph
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { releaseResumeWaiver } from '../../scripts/release-loop/resume.js';
 import { runKnownIssues } from '../../scripts/release-loop/known-issues-node.js';
-import { createGateRunner, graphGateResult, judgeGate, type GateResult, type GateRunner } from '../../scripts/release-loop/gate-node.js';
+import { createGateRunner, graphGateResult, judgeGate } from '../../scripts/release-loop/gate-api-leaf.js';
+import type { GateResult, GateRunner } from '../../scripts/release-loop/gate-types.js';
 import { runNpmPublish } from '../../scripts/release-loop/npm-publish-node.js';
 import { runPublish } from '../../scripts/release-loop/publish-node.js';
 import { resumeReleaseRun } from '../../scripts/release-loop/resume-release.js';
 import { runAutoApprove } from '../../scripts/release-loop/auto-approve-node.js';
 import { runVerify } from '../../scripts/release-loop/verify-node.js';
-import { runNodeVerdict } from '../../scripts/release-loop/node-verdict.js';
+import { readGraphContext, runNodeVerdict } from '../../scripts/release-loop/node-verdict.js';
+import { runGateRepairNode } from '../../scripts/release-loop/gate-repair-node.js';
 import { resolveScenarioFilePath } from './scenario.js';
 
 /** The sim world executes the same live subscribers against its isolated state root. */
@@ -32,6 +34,451 @@ import { checkReleaseEventTrace, type ReleaseEventExpectation, type ReleaseEvent
 import { createReleasePublishDevices } from './release-publish-devices.js';
 import { PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
 import { createGraphEventBus, type GraphEvent, type GraphEventBus } from '../graph-runner/graph-events.js';
+import { planMacrophageIncident, recordMacrophageGraphRecovery, simulateMacrophageRecovery, type MacrophageIncidentSignal } from '../release-loop/macrophage-incident-recovery.js';
+import { classifyGateShadow } from '../../scripts/release-loop/gate-triage-node.js';
+import { attributeReleaseFailures, type ReleaseFailureAttribution } from '../release-loop/release-failure-attribution.js';
+import { planMacrophageRepairLadder, type MacrophageRepairLadderInput, type MacrophageRepairLadderDecision } from '../release-loop/macrophage-repair-ladder.js';
+
+export interface MacrophageRepairLadderFiveStepCapSim {
+  readonly injector: 'macrophage-repair-ladder-five-step-cap-sim';
+  readonly pass: boolean;
+  readonly decisions: readonly { readonly id: string; readonly expectedStep: string; readonly decision: MacrophageRepairLadderDecision; readonly pass: boolean }[];
+  readonly checks: Readonly<Record<string, boolean>>;
+  readonly inputMutationCount: number;
+}
+
+/** GREEN-V injection seam: run the production five-step decision policy without PR, graph, or file writes. */
+export function runMacrophageRepairLadderFiveStepCapSim(): MacrophageRepairLadderFiveStepCapSim {
+  const common: Omit<MacrophageRepairLadderInput, 'evidence' | 'failureIds'> = {
+    runId: 'sim-macrophage-repair-ladder', signature: 'simulated-release-gate-failure',
+    repairChildrenUsed: 0, elapsedMs: 0, minutesToCut: 180, estimatedStepMs: 5 * 60_000,
+  };
+  const cases: Array<{ id: string; input: MacrophageRepairLadderInput; expectedStep: string }> = [
+    { id: 'R0-same-slice-remeasure', expectedStep: 'R0-remeasure', input: { ...common, evidence: 'load-flaky', failureIds: ['test/a.test.ts > timeout'], r0Attempts: 0 } },
+    { id: 'R1-one-file-fixture', expectedStep: 'R1-single-file', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > stale expectation'],
+      sourceFiles: ['src/a.ts'], changeKind: 'expectation' } },
+    { id: 'R2-independent-file-split', expectedStep: 'R2-split-files', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > regression'],
+      sourceFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'], independentFiles: true } },
+    { id: 'R2-exact-four-child-cap', expectedStep: 'R2-split-files', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > regression'],
+      sourceFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts'], independentFiles: true } },
+    { id: 'R3-safe-revert-draft', expectedStep: 'R3-revert-proposal', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > regression'],
+      sourceFiles: ['src/a.ts'], previousStep: 'R1-single-file', previousStepOutcome: 'failed', causePr: 123,
+      causePrFailureIds: ['test/a.test.ts > regression'], attributionConfidence: 'high', revertSafe: true,
+      attemptedSteps: ['R1-single-file'], attemptedStepsRunId: common.runId, attemptedFiles: ['src/a.ts'] } },
+    { id: 'R4-human-decision', expectedStep: 'R4-hitl', input: { ...common, evidence: 'unmeasured', failureIds: ['unattributed gate failure'] } },
+    { id: 'four-children-exhausted', expectedStep: 'R4-hitl', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > regression'],
+      sourceFiles: ['src/a.ts'], changeKind: 'fixture', repairChildrenUsed: 4 } },
+    { id: 'R2-no-partial-over-cap', expectedStep: 'R4-hitl', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > regression'],
+      sourceFiles: ['src/a.ts', 'src/b.ts', 'src/c.ts'], independentFiles: true, repairChildrenUsed: 2 } },
+    { id: 'ninety-minute-cap', expectedStep: 'R4-hitl', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > regression'],
+      sourceFiles: ['src/a.ts'], changeKind: 'fixture', elapsedMs: 90 * 60_000 } },
+    { id: 'step-would-overrun-cap', expectedStep: 'R4-hitl', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > regression'],
+      sourceFiles: ['src/a.ts'], changeKind: 'fixture', elapsedMs: 85 * 60_000, estimatedStepMs: 6 * 60_000 } },
+    { id: 'cut-minus-thirty-restricts-to-R3-R4', expectedStep: 'R3-revert-proposal', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > regression'],
+      sourceFiles: ['src/a.ts'], previousStep: 'R2-split-files', previousStepOutcome: 'failed', causePr: 123,
+      causePrFailureIds: ['test/a.test.ts > regression'], attributionConfidence: 'high', revertSafe: true,
+      attemptedSteps: ['R2-split-files'], attemptedStepsRunId: common.runId, attemptedFiles: ['src/a.ts'], minutesToCut: 30 } },
+    { id: 'cut-minus-thirty-one-allows-R1', expectedStep: 'R1-single-file', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > stale expectation'],
+      sourceFiles: ['src/a.ts'], changeKind: 'expectation', minutesToCut: 31, estimatedStepMs: 30_000 } },
+    { id: 'projected-step-crosses-cutoff', expectedStep: 'R4-hitl', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > stale expectation'],
+      sourceFiles: ['src/a.ts'], changeKind: 'expectation', minutesToCut: 31, estimatedStepMs: 5 * 60_000 } },
+    { id: 'cut-minus-thirty-blocks-R0', expectedStep: 'R4-hitl', input: { ...common, evidence: 'load-flaky', failureIds: ['test/a.test.ts > timeout'], minutesToCut: 30 } },
+    { id: 'unknown-countdown-fails-closed', expectedStep: 'R4-hitl', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > regression'],
+      sourceFiles: ['src/a.ts'], changeKind: 'fixture', minutesToCut: null } },
+    { id: 'R3-proposal-used-once', expectedStep: 'R4-hitl', input: { ...common, evidence: 'introduced', failureIds: ['test/a.test.ts > regression'],
+      sourceFiles: ['src/a.ts'], previousStep: 'R2-split-files', previousStepOutcome: 'failed', causePr: 123,
+      causePrFailureIds: ['test/a.test.ts > regression'], attributionConfidence: 'high', revertSafe: true,
+      r3ProposalUsed: true, attemptedSteps: ['R2-split-files', 'R3-revert-proposal'], attemptedStepsRunId: common.runId,
+      attemptedFiles: ['src/a.ts'] } },
+  ];
+  let inputMutationCount = 0;
+  const decisions = cases.map(({ id, input, expectedStep }) => {
+    const before = structuredClone(input);
+    const result = planMacrophageRepairLadder(input);
+    const unchanged = JSON.stringify(input) === JSON.stringify(before);
+    if (!unchanged) inputMutationCount++;
+    return { id, expectedStep, decision: result, pass: result.step === expectedStep && unchanged };
+  });
+  const r1 = decisions.find(({ id }) => id === 'R1-one-file-fixture')!.decision;
+  const r2 = decisions.find(({ id }) => id === 'R2-independent-file-split')!.decision;
+  const r3 = decisions.find(({ id }) => id === 'R3-safe-revert-draft')!.decision;
+  const r4 = decisions.find(({ id }) => id === 'R4-human-decision')!.decision;
+  const checks = {
+    allFiveSteps: ['R0-remeasure', 'R1-single-file', 'R2-split-files', 'R3-revert-proposal', 'R4-hitl']
+      .every((step) => decisions.some(({ decision }) => decision.step === step)),
+    repairPlansTargetCutAppendOnly: [r1, r2].every((item) => item.repositoryWrite === 'cut-append-only'
+      && item.repairUnits.every((unit) => unit.writeTarget === 'cut-append')),
+    r2ParallelismBounded: r2.childrenPlanned === 3 && r2.maxParallelChildren === 2,
+    exactFourChildrenAllowed: decisions.find(({ id }) => id === 'R2-exact-four-child-cap')?.decision.childrenPlanned === 4,
+    r3IsDraftOnly: r3.revertDraft?.draftOnly === true && r3.action === 'propose-revert-draft',
+    r4ProducesDecisionCard: r4.action === 'raise-decision' && r4.decisionCard !== undefined,
+    childLimitAndNoPartialSplit: decisions.find(({ id }) => id === 'four-children-exhausted')?.decision.childrenPlanned === 0
+      && decisions.find(({ id }) => id === 'R2-no-partial-over-cap')?.decision.childrenPlanned === 0,
+    ninetyMinuteBudget: decisions.find(({ id }) => id === 'ninety-minute-cap')?.decision.step === 'R4-hitl'
+      && decisions.find(({ id }) => id === 'step-would-overrun-cap')?.decision.step === 'R4-hitl',
+    cutoffBoundary: decisions.find(({ id }) => id === 'cut-minus-thirty-restricts-to-R3-R4')?.decision.step === 'R3-revert-proposal'
+      && decisions.find(({ id }) => id === 'cut-minus-thirty-one-allows-R1')?.decision.step === 'R1-single-file'
+      && decisions.find(({ id }) => id === 'projected-step-crosses-cutoff')?.decision.step === 'R4-hitl'
+      && decisions.find(({ id }) => id === 'cut-minus-thirty-blocks-R0')?.decision.step === 'R4-hitl',
+    unknownCountdownFailsClosed: decisions.find(({ id }) => id === 'unknown-countdown-fails-closed')?.decision.step === 'R4-hitl',
+    r3ProposalOnePerRun: decisions.find(({ id }) => id === 'R3-proposal-used-once')?.decision.step === 'R4-hitl',
+  };
+  return { injector: 'macrophage-repair-ladder-five-step-cap-sim', pass: decisions.every((item) => item.pass)
+    && inputMutationCount === 0 && Object.values(checks).every(Boolean), decisions, checks, inputMutationCount };
+}
+
+export interface ReleaseMacrophageIncidentSimInput {
+  readonly runId: string;
+  readonly incidents: readonly MacrophageIncidentSignal[];
+  readonly repairLandedIds: readonly string[];
+  readonly hitlApprovedIds: readonly string[];
+  readonly version?: string;
+  readonly attributionContext?: { readonly repo: string; readonly previousTag: string; readonly cutCommit: string };
+  readonly graphDrivenIncidentIds?: readonly string[];
+}
+
+export interface ReleaseMacrophageIncidentSimCase {
+  readonly signal: MacrophageIncidentSignal;
+  readonly plan: ReturnType<typeof planMacrophageIncident>;
+  readonly resumed: boolean;
+  readonly receipt?: ReturnType<typeof simulateMacrophageRecovery>['receipt'];
+  readonly receiptJsonl: string;
+  readonly eventNames: readonly string[];
+  readonly pass: boolean;
+}
+
+const GRAPH_DRIVEN_MACROPHAGE_INCIDENT = 'c-three-file-regression';
+
+const RELEASE_SIM_RIG_WORKTREE_MARKER = '.elanous-release-sim-rig';
+
+/** Fake Git boundary used by the simulator's real PWA worktree creation and teardown path. */
+export function createReleaseSimRigFakeGitScript(): string {
+  return [
+    '#!/bin/sh',
+    'if [ "$1" = "worktree" ] && [ "$2" = "add" ]; then',
+    '  if ! mkdir "$4" 2>/dev/null; then echo "[release-sim-rig] refused existing worktree path: $4" >&2; printf "add-refused-existing\\n" >> "$ELANOUS_SIM_RIG_WORKTREE_LOG"; exit 1; fi',
+    '  if ! mkdir -p "$4/apps/pwa"; then echo "[release-sim-rig] failed to prepare new worktree path: $4" >&2; printf "add-prepare-failed\\n" >> "$ELANOUS_SIM_RIG_WORKTREE_LOG"; exit 1; fi',
+    `  if ! (set -C; printf 'release-sim-rig-worktree-v1\\n%s\\n' "$ELANOUS_SIM_RIG_RUN_ID" > "$4/${RELEASE_SIM_RIG_WORKTREE_MARKER}"); then echo "[release-sim-rig] could not create ownership marker: $4" >&2; printf "add-marker-create-failed\\n" >> "$ELANOUS_SIM_RIG_WORKTREE_LOG"; exit 1; fi`,
+    `  if printf 'release-sim-rig-worktree-v1\\n%s\\n' "$ELANOUS_SIM_RIG_RUN_ID" | cmp -s - "$4/${RELEASE_SIM_RIG_WORKTREE_MARKER}"; then if [ -n "$ELANOUS_SIM_RIG_MARKER_SNAPSHOT" ]; then cp "$4/${RELEASE_SIM_RIG_WORKTREE_MARKER}" "$ELANOUS_SIM_RIG_MARKER_SNAPSHOT" || exit 1; printf '%s\\n' "$4" > "$ELANOUS_SIM_RIG_WORKTREE_PATH_SNAPSHOT" || exit 1; fi; printf "add-marker-verified\\n" >> "$ELANOUS_SIM_RIG_WORKTREE_LOG"; else echo "[release-sim-rig] marker verification failed: $4" >&2; exit 1; fi`,
+    '  exit 0',
+    'fi',
+    'if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then',
+    `  marker="$4/${RELEASE_SIM_RIG_WORKTREE_MARKER}"`,
+    `  if [ ! -f "$marker" ] || ! printf 'release-sim-rig-worktree-v1\\n%s\\n' "$ELANOUS_SIM_RIG_RUN_ID" | cmp -s - "$marker"; then`,
+    '    if [ -f "$marker" ]; then echo "[release-sim-rig] preserved worktree owned by another simulation run: $4" >&2; printf "remove-preserved-other-run\\n" >> "$ELANOUS_SIM_RIG_WORKTREE_LOG"; else echo "[release-sim-rig] preserved unmarked worktree: $4" >&2; printf "remove-preserved-unmarked\\n" >> "$ELANOUS_SIM_RIG_WORKTREE_LOG"; fi',
+    '    exit 0',
+    '  fi',
+    '  quarantine="$4.release-sim-rig-teardown-$ELANOUS_SIM_RIG_RUN_ID-$$"',
+    '  if ! mkdir "$quarantine" 2>/dev/null; then echo "[release-sim-rig] could not reserve teardown path for: $4" >&2; exit 1; fi',
+    '  chmod 700 "$quarantine" || exit 1',
+    '  if ! mv "$4" "$quarantine/worktree"; then rmdir "$quarantine" 2>/dev/null; echo "[release-sim-rig] worktree changed before teardown: $4" >&2; exit 1; fi',
+    `  if [ -f "$quarantine/worktree/${RELEASE_SIM_RIG_WORKTREE_MARKER}" ] && printf 'release-sim-rig-worktree-v1\\n%s\\n' "$ELANOUS_SIM_RIG_RUN_ID" | cmp -s - "$quarantine/worktree/${RELEASE_SIM_RIG_WORKTREE_MARKER}"; then`,
+    '    rm -rf "$quarantine/worktree"',
+    '    if [ ! -e "$quarantine/worktree" ] && rmdir "$quarantine" 2>/dev/null && [ ! -e "$quarantine" ]; then printf "remove-marker-matched-path-absent\\n" >> "$ELANOUS_SIM_RIG_WORKTREE_LOG"; exit 0; fi',
+    '    echo "[release-sim-rig] verified worktree remains in teardown quarantine: $4" >&2; exit 1',
+    '  fi',
+    '  if [ ! -e "$4" ]; then mv "$quarantine/worktree" "$4"; rmdir "$quarantine" 2>/dev/null; fi',
+    '  echo "[release-sim-rig] preserved worktree after ownership changed: $4" >&2; printf "remove-preserved-changed-marker\\n" >> "$ELANOUS_SIM_RIG_WORKTREE_LOG"; exit 0',
+    'fi',
+    'echo "unexpected git boundary: $*" >&2',
+    'exit 97',
+    '',
+  ].join('\n');
+}
+
+/** Extends the existing release graph rig with fake incident/PR/owner boundaries and the production recovery decision core. */
+export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIncidentSimInput): Promise<{
+  readonly pass: boolean;
+  readonly runId: string;
+  readonly graphState: GraphRunState;
+  readonly graphDrivenIncidentId: string;
+  readonly graphRepairFailureIds: readonly string[];
+  readonly graphRepairInputFailureIds: readonly string[];
+  readonly graphRepairInputFiles: readonly string[];
+  readonly graphRepairAttributions: readonly ReleaseFailureAttribution[];
+  readonly graphRepairMeasured: boolean;
+  readonly graphRepairChecks: Readonly<Record<string, boolean | number>>;
+  readonly statePath: string;
+  readonly receiptPath: string;
+  readonly recoveryReceiptPath: string;
+  readonly cases: readonly ReleaseMacrophageIncidentSimCase[];
+  readonly eventTrace: readonly GraphEvent[];
+  readonly runtimeDecisions: readonly GraphEvent[];
+  readonly jsonl: string;
+}> {
+  const bus = createGraphEventBus();
+  const injectedType = 'release.macrophage.incident.injected';
+  const outputTypes = ['release.macrophage.detected', 'release.macrophage.attributed', 'release.macrophage.classified',
+    'release.macrophage.repair-pr-landed', 'release.macrophage.hitl-approved', 'release.macrophage.run-resumed',
+    'release.macrophage.receipt-written'];
+  bus.registerType(injectedType);
+  for (const type of outputTypes) bus.registerType(type);
+  const root = getTestStateRoot();
+  if (!root) throw new Error('release macrophage incident simulation requires --test isolated mode');
+  const eventTrace: GraphEvent[] = [];
+  bus.subscribe((event) => { eventTrace.push(event); });
+  const runtimeDecisions: GraphEvent[] = [];
+  const macrophageRuntime = createMacrophageRuntime({ root, runId: input.runId, eventBus: bus, mode: 'simulation',
+    inventory: (event) => event.source.nodeId === 'pre-gate-join' ? [{ id: 'simulated-stale-output', kind: 'stale-generated-artifact',
+      evidence: { sourceFingerprint: 'cut-current', generatedFingerprint: 'stale' } }] : [] });
+  bus.subscribe((event) => { if (event.type === 'release.macrophage.decision') runtimeDecisions.push(event); }, { type: 'release.macrophage.decision' });
+  const jsonlRows: string[] = [];
+  const cases: ReleaseMacrophageIncidentSimCase[] = [];
+  const repairLanded = new Set(input.repairLandedIds);
+  const hitlApproved = new Set(input.hitlApprovedIds);
+  const graphDrivenIncidentIds = new Set(input.graphDrivenIncidentIds ?? [GRAPH_DRIVEN_MACROPHAGE_INCIDENT]);
+  bus.subscribe(async (event) => {
+    if (event.type !== injectedType) return;
+    const signal = event.data?.signal as MacrophageIncidentSignal;
+    const plan = planMacrophageIncident(signal);
+    await bus.publish({ graphId: event.graphId, runId: event.runId, type: 'release.macrophage.detected', source: { kind: 'runner' }, data: { incidentId: signal.id } });
+    await bus.publish({ graphId: event.graphId, runId: event.runId, type: 'release.macrophage.attributed', source: { kind: 'runner' },
+      data: { incidentId: signal.id, sourceFiles: plan.files, causePr: plan.causePr ?? null, method: signal.evidence } });
+    await bus.publish({ graphId: event.graphId, runId: event.runId, type: 'release.macrophage.classified', source: { kind: 'runner' },
+      data: { incidentId: signal.id, label: plan.label, step: plan.step, reason: plan.reason } });
+    const graphDriven = graphDrivenIncidentIds.has(signal.id);
+    const recovery = graphDriven ? undefined : simulateMacrophageRecovery({ runId: event.runId, plan, changedShardId: `shard-${cases.length}`,
+      carriedShardIds: ['shard-0', 'shard-1', 'shard-2', 'shard-3'], repairLanded: repairLanded.has(signal.id),
+      hitlApproved: hitlApproved.has(signal.id) });
+    if (plan.label === 'fix' && repairLanded.has(signal.id) && !graphDriven) {
+      await bus.publish({ graphId: event.graphId, runId: event.runId, type: 'release.macrophage.repair-pr-landed', source: { kind: 'runner' },
+        data: { incidentId: signal.id, files: plan.files } });
+    }
+    if (plan.label === 'hitl' && hitlApproved.has(signal.id)) {
+      await bus.publish({ graphId: event.graphId, runId: event.runId, type: 'release.macrophage.hitl-approved', source: { kind: 'runner' }, data: { incidentId: signal.id } });
+    }
+    if (recovery?.resumed) {
+      await bus.publish({ graphId: event.graphId, runId: event.runId, type: 'release.macrophage.run-resumed', source: { kind: 'runner' },
+        data: { incidentId: signal.id, disposition: recovery.receipt.disposition, gateVisit: recovery.receipt.gateVisit } });
+      jsonlRows.push(recovery.jsonl);
+      await bus.publish({ graphId: event.graphId, runId: event.runId, type: 'release.macrophage.receipt-written', source: { kind: 'runner' },
+        data: { incidentId: signal.id, schema: recovery.receipt.schema, jsonl: recovery.jsonl } });
+    }
+    const expectedResume = plan.label === 'noise' || (plan.label === 'fix' && repairLanded.has(signal.id))
+      || (plan.label === 'hitl' && hitlApproved.has(signal.id));
+    cases.push({ signal, plan, resumed: recovery?.resumed ?? false, ...(recovery ? { receipt: recovery.receipt } : {}),
+      receiptJsonl: recovery?.jsonl ?? '', eventNames: [], pass: graphDriven ? false
+        : recovery!.resumed === expectedResume && (!recovery!.resumed || recovery!.receipt.runId === event.runId)
+          && (plan.label !== 'fix' || !recovery!.resumed || recovery!.receipt.gateVisit === 2) });
+  }, { type: injectedType });
+  const version = input.version ?? '0.3.6';
+  let incidentsInjected = false;
+  let gateVisits = 0;
+  let graphRepairInputFiles: string[] = [];
+  let graphRepairInputFailureIds: string[] = [];
+  let graphState: GraphRunState;
+  try { graphState = await runGraph(RELEASE_GRAPH, { runId: input.runId,
+    input: { version, previousVersion: '0.3.5' }, eventBus: bus, pinChildUniverse: true, quiet: true,
+    deps: { root, runBash: async (_command: string, options: { env?: NodeJS.ProcessEnv }) => {
+      const { nodeId } = parseContext(options.env ?? process.env);
+      if (!incidentsInjected && nodeId === 'gate') {
+        incidentsInjected = true;
+        for (const incident of input.incidents) {
+          await bus.publish({ graphId: 'release-loop', runId: input.runId, type: injectedType, source: { kind: 'runner' }, data: { signal: incident } });
+        }
+        await bus.flush({ graphId: 'release-loop', runId: input.runId });
+      }
+      if (nodeId === 'gate') {
+        gateVisits++;
+        const graphDriven = cases.filter(({ signal }) => graphDrivenIncidentIds.has(signal.id));
+        if (graphDriven.length === 0 || graphDriven.some((item) => item.plan.label !== 'fix'
+          || !repairLanded.has(item.signal.id) || (item.signal.id === GRAPH_DRIVEN_MACROPHAGE_INCIDENT
+            && (item.plan.step !== 'R2-split-files' || item.plan.files.length < 2)))) {
+          throw new Error('graph-driven incidents must resolve to landed repair plans');
+        }
+        const commit = 'a'.repeat(40);
+        const introduced = graphDriven.flatMap(({ signal, plan }) => signal.failureIds?.length
+          ? signal.failureIds : plan.files.map((file) => `${file}.test.ts > injected R2 regression in ${file}`));
+        const gate = gateVisits === 1
+          ? { outcome: 'fail', commit, introduced, preexisting: 0, fixed: null,
+            knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 }
+          : { outcome: 'ok', commit, introduced: [], preexisting: 0, fixed: null,
+            knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
+        return { exitCode: gateVisits === 1 ? 1 : 0, stdout: `${JSON.stringify(gate)}\n`,
+          stderr: gateVisits === 1 ? 'TypeScript TS2322: simulated gate regression' : '' };
+      }
+      if (nodeId === 'gate-triage') {
+        const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
+        if (!contextPath) throw new Error('gate-triage simulation requires its graph context');
+        const context = JSON.parse(readFileSync(contextPath, 'utf8')) as { input: Record<string, unknown>; outputs: { gate?: Record<string, unknown> } };
+        if (!context.outputs.gate) throw new Error('gate-triage simulation did not receive the current gate output');
+        const triage = classifyGateShadow(context.outputs.gate as never);
+        return { exitCode: 0, stdout: `${JSON.stringify({ ...triage,
+          gateExecutionId: context.input.adaptiveGateExecutionId })}\n`, stderr: '' };
+      }
+      if (/^gate-repair-[a-f0-9]{12}$/.test(nodeId)) {
+        const graphDriven = cases.filter(({ signal }) => graphDrivenIncidentIds.has(signal.id));
+        if (graphDriven.length === 0 || graphDriven.some(({ signal }) => !repairLanded.has(signal.id))) throw new Error('repair PR landing was not supplied to the graph-driven incident');
+        const graphContext = readGraphContext(options.env);
+        const failureIds = graphContext.nodeInput?.failureIds;
+        const expectedFailureIds = graphDriven.flatMap(({ signal, plan }) => signal.failureIds?.length
+          ? signal.failureIds : plan.files.map((file) => `${file}.test.ts > injected R2 regression in ${file}`));
+        if (!Array.isArray(failureIds) || expectedFailureIds.some((id) => !failureIds.includes(id))) {
+          throw new Error('adaptive repair input does not preserve the original gate failure IDs');
+        }
+        const attributions = input.attributionContext
+          ? attributeReleaseFailures({ ...input.attributionContext, failureIds: failureIds as string[] })
+          : graphDriven.flatMap(({ signal, plan }) => (signal.failureIds?.length ? signal.failureIds : plan.files.map((file) => `${file}.test.ts > injected R2 regression in ${file}`))
+            .map((failureId) => {
+              const testFile = failureId.split(' > ')[0] ?? '';
+              const inferredSource = testFile.endsWith('.test.ts') ? testFile.slice(0, -8) : testFile;
+              const sourceFiles = plan.files.includes(inferredSource) ? [inferredSource] : plan.files.length === 1 ? [...plan.files] : [];
+              return { failureId, testFile, sourceFiles,
+              causePrs: signal.causePr ? [signal.causePr] : [], confidence: 'high' as const, method: 'first-parent-source-overlap' as const,
+              evidence: [], unresolvedImports: [] };
+            }));
+        for (const item of graphDriven) {
+          const itemAttributions = attributions.filter((row) => item.signal.failureIds?.includes(row.failureId)
+            || (!item.signal.failureIds?.length && item.plan.files.some((file) => row.sourceFiles.includes(file))));
+          const attributedFiles = new Set(itemAttributions.flatMap((row) => row.sourceFiles));
+          if (itemAttributions.length === 0 || itemAttributions.some((row) => row.confidence === 'unmeasured')
+            || !item.plan.files.every((file) => attributedFiles.has(file))) {
+            throw new Error(`adaptive repair input could not attribute original failures for ${item.signal.id}`);
+          }
+        }
+        const attributedRepairFailureIds = [...new Set(attributions.flatMap((row) => row.sourceFiles
+          .map((file) => `${file} > ${row.failureId}`)))];
+        if (!attributedRepairFailureIds.length) throw new Error('production attribution produced no repairable source files');
+        const repairPrFiles = new Map<number, string>();
+        let nextRepairPr = 90000;
+        const repairContext = { ...graphContext, nodeInput: { ...graphContext.nodeInput, failureIds: attributedRepairFailureIds,
+          independenceEvidence: attributions.map(({ failureId, sourceFiles, unresolvedImports }) => ({ failureId, sourceFiles, unresolvedImports })) } };
+        graphRepairInputFailureIds = [...attributedRepairFailureIds];
+        const repairResult = await runGateRepairNode(repairContext, {
+          root, repo: input.attributionContext?.repo,
+          attributeFailures: () => attributions,
+          startRepairChild: async (featurePath) => {
+            const body = readFileSync(featurePath, 'utf8');
+            const file = /^Attributed source file: (.+)$/m.exec(body)?.[1];
+            if (!file) throw new Error('production repair feature omitted its attributed source file');
+            const prNumber = nextRepairPr++;
+            repairPrFiles.set(prNumber, file);
+            return { ok: true, prNumber, prUrl: `https://github.com/ElanvitalAI/elanous/pull/${prNumber}` };
+          },
+          inspectRepairPr: async (prNumber) => {
+            const file = repairPrFiles.get(prNumber);
+            if (!file) throw new Error(`unknown simulated repair PR ${prNumber}`);
+            return { isDraft: false, files: [file], headRefOid: createHash('sha1').update(file).digest('hex') };
+          },
+          waitForLanded: async (prNumber) => {
+            const file = repairPrFiles.get(prNumber);
+            if (!file) throw new Error(`unknown simulated landing PR ${prNumber}`);
+            return { schema: 1, prNumber, repairRunId: input.runId,
+              head: createHash('sha1').update(file).digest('hex'), mergeSha: 'f'.repeat(40), base: 'main', mergedAt: '2026-11-07T00:00:00.000Z' };
+          },
+          isAncestor: () => true,
+          refreshMainlineHead: () => 'f'.repeat(40),
+        });
+        if (repairResult.outcome !== 'ok') throw new Error(`production repair entrypoint did not land every attributed file: ${repairResult.summary}`);
+        graphRepairInputFiles = repairResult.repairs.map(({ file }) => file).sort();
+        for (const item of graphDriven) {
+          const itemAttributions = attributions.filter((row) => item.signal.failureIds?.includes(row.failureId)
+            || (!item.signal.failureIds?.length && item.plan.files.some((file) => row.sourceFiles.includes(file))));
+          await bus.publish({ graphId: 'release-loop', runId: input.runId, type: 'release.macrophage.repair-pr-landed', source: { kind: 'runner' },
+            data: { incidentId: item.signal.id, files: item.plan.files, failureIds,
+              attribution: itemAttributions, adaptiveRepairInputFiles: graphRepairInputFiles, nodeId } });
+        }
+        return { exitCode: 0, stdout: `${JSON.stringify(repairResult)}\n`, stderr: '' };
+      }
+      return resultForNode(nodeId, undefined, version);
+    } } });
+  } finally { macrophageRuntime.dispose(); }
+  if (graphState.runId !== input.runId) throw new Error(`incident simulation run ${input.runId} does not match graph run ${graphState.runId}`);
+  await bus.flush({ graphId: 'release-loop', runId: input.runId });
+  const statePath = graphState.statePath;
+  if (!statePath) throw new Error('release graph simulation did not persist a run state path');
+  const receiptPath = `${statePath}.contexts/macrophage.jsonl`;
+  const recoveryReceiptPath = `${statePath}.contexts/macrophage-recovery.jsonl`;
+  const graphLifecycleMeasured = graphState.status === 'done'
+    && graphState.path.filter((nodeId) => nodeId === 'gate').length === 2
+    && graphState.path.some((nodeId) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId));
+  const graphDriven = cases.filter(({ signal }) => graphDrivenIncidentIds.has(signal.id));
+  const graphRepairAppend = graphState.adaptiveGateNodeAppends?.find(({ request }) => request.rerunGateAt === 'gate'
+    && request.node.recipe === 'cmd:gate-repair');
+  const graphRepairFailureIds = graphRepairAppend?.request.node.recipe === 'cmd:gate-repair'
+    ? graphRepairAppend.request.node.input.failureIds : [];
+  const graphRepairAttributions = input.attributionContext && graphRepairFailureIds.length
+    ? attributeReleaseFailures({ ...input.attributionContext, failureIds: graphRepairFailureIds }) : [];
+  const graphDrivenRepairMeasured = graphLifecycleMeasured && graphDriven.length > 0
+    && graphDriven.every(({ plan }) => plan.files.every((file) => graphRepairInputFiles.includes(file)))
+    && graphDriven.every(({ signal, plan }) => plan.files.every((file) => graphRepairInputFailureIds.some((id) =>
+      signal.failureIds?.includes(id) || id.startsWith(`${file} > `))))
+    && (!input.attributionContext || graphDriven.every(({ signal, plan }) => {
+      const rows = graphRepairAttributions.filter((row) => signal.failureIds?.includes(row.failureId));
+      return rows.length > 0 && rows.every((row) => row.confidence !== 'unmeasured')
+        && plan.files.every((file) => rows.some((row) => row.sourceFiles.includes(file)));
+    }));
+  const graphRepairChecks = { lifecycle: graphLifecycleMeasured, graphDrivenCount: graphDriven.length,
+    inputFiles: graphDriven.every(({ plan }) => plan.files.every((file) => graphRepairInputFiles.includes(file))),
+    failureMapping: graphDriven.every(({ signal, plan }) => plan.files.every((file) => graphRepairInputFailureIds.some((id) =>
+      signal.failureIds?.includes(id) || id.startsWith(`${file} > `)))), attribution: !input.attributionContext || graphDriven.every(({ signal, plan }) => {
+      const rows = graphRepairAttributions.filter((row) => signal.failureIds?.includes(row.failureId));
+      return rows.length > 0 && rows.every((row) => row.confidence !== 'unmeasured')
+        && plan.files.every((file) => rows.some((row) => row.sourceFiles.includes(file)));
+    }) };
+  const graphDrivenRepairNodeId = graphRepairAppend?.request.node.nodeId;
+  if (graphDrivenRepairMeasured) {
+    for (const [index, item] of graphDriven.entries()) {
+      const itemFailureIds = item.signal.failureIds?.length ? item.signal.failureIds
+        : graphRepairInputFailureIds.filter((id) => item.plan.files.some((file) => id.startsWith(`${file} > `)));
+      const itemAttributions = input.attributionContext
+        ? graphRepairAttributions.filter((row) => itemFailureIds.includes(row.failureId))
+        : itemFailureIds.map((failureId) => ({ failureId, sourceFiles: item.plan.files, confidence: 'high' as const }));
+      const recovery = recordMacrophageGraphRecovery({ runId: input.runId, plan: item.plan,
+        repairLanded: repairLanded.has(item.signal.id), repairNodeId: graphDrivenRepairNodeId,
+        gateVisits: graphState.path.filter((nodeId) => nodeId === 'gate').length, failureIds: itemFailureIds,
+        attributedFailures: itemAttributions,
+        changedShardId: item.signal.id === 'd-receipt-reuse-zero-of-81' ? 'shard-d-receipt-reuse-zero-of-81' : `shard-${index}`,
+        carriedShardIds: ['shard-0', 'shard-1', 'shard-2', 'shard-3'] });
+      await bus.publish({ graphId: 'release-loop', runId: input.runId, type: 'release.macrophage.run-resumed', source: { kind: 'runner' },
+        data: { incidentId: item.signal.id, disposition: recovery.receipt.disposition,
+          gateVisit: graphState.path.filter((nodeId) => nodeId === 'gate').length } });
+      jsonlRows.push(recovery.jsonl);
+      await bus.publish({ graphId: 'release-loop', runId: input.runId, type: 'release.macrophage.receipt-written', source: { kind: 'runner' },
+        data: { incidentId: item.signal.id, schema: recovery.receipt.schema, jsonl: recovery.jsonl } });
+    }
+  }
+  await bus.flush({ graphId: 'release-loop', runId: input.runId });
+  mkdirSync(dirname(receiptPath), { recursive: true });
+  writeFileSync(recoveryReceiptPath, jsonlRows.join(''), { mode: 0o600 });
+  const runtimeApplied = runtimeDecisions.some((event) => event.data?.id === 'simulated-stale-output'
+    && event.data.action === 'regenerate' && event.data.applied === true);
+  const runtimeFailureDetected = runtimeDecisions.some((decision) => {
+    const sourceEventId = decision.data?.sourceEventId;
+    const sourceEvent = typeof sourceEventId === 'string' ? eventTrace.find((event) => event.eventId === sourceEventId) : undefined;
+    return decision.data?.sourceNodeId === 'gate' && decision.data.action === 'attempt-repair'
+      && decision.data.failureSignature === 'type-error' && decision.data.applied === false
+      && sourceEvent?.type === 'node-end' && sourceEvent.data?.ok === false
+      && sourceEvent.source.kind === 'node' && sourceEvent.source.nodeId === 'gate';
+  });
+  const finalized = cases.map((item) => {
+    if (graphDrivenIncidentIds.has(item.signal.id) && graphDrivenRepairMeasured) {
+      const receipt = JSON.parse(jsonlRows.find((line) => JSON.parse(line).incidentId === item.signal.id) ?? 'null') as NonNullable<typeof item.receipt>;
+      item = { ...item, resumed: true, receipt, receiptJsonl: `${JSON.stringify(receipt)}\n`, pass: true };
+    }
+    const eventNames = eventTrace.filter((row) => row.runId === input.runId && row.data?.incidentId === item.signal.id).map((row) => row.type);
+    const expectedPrefix = ['release.macrophage.incident.injected', 'release.macrophage.detected', 'release.macrophage.attributed',
+      'release.macrophage.classified'];
+    const expectedTail = item.resumed ? [
+      ...(item.plan.label === 'fix' ? ['release.macrophage.repair-pr-landed'] : []),
+      ...(item.plan.label === 'hitl' ? ['release.macrophage.hitl-approved'] : []),
+      'release.macrophage.run-resumed', 'release.macrophage.receipt-written',
+    ] : [];
+    const relevantNames = eventNames.filter((name) => name !== 'release.macrophage.incident.injected');
+    const completeTrace = expectedPrefix.slice(1).every((name, index) => relevantNames[index] === name)
+      && expectedTail.every((name, index) => relevantNames[index + 3] === name)
+      && relevantNames.length === 3 + expectedTail.length;
+    return { ...item, eventNames, pass: item.pass && completeTrace };
+  });
+  return { pass: runtimeApplied && runtimeFailureDetected && graphDrivenRepairMeasured && graphState.runId === input.runId
+      && finalized.length === input.incidents.length && finalized.every((item) => item.pass)
+      && jsonlRows.length === finalized.filter((item) => item.resumed).length
+      && readFileSync(recoveryReceiptPath, 'utf8') === jsonlRows.join(''),
+    runId: input.runId, graphState, graphDrivenIncidentId: [...graphDrivenIncidentIds][0] ?? GRAPH_DRIVEN_MACROPHAGE_INCIDENT,
+    graphRepairFailureIds, graphRepairInputFailureIds, graphRepairInputFiles, graphRepairAttributions, graphRepairMeasured: graphDrivenRepairMeasured,
+    graphRepairChecks,
+    statePath, receiptPath, recoveryReceiptPath, cases: finalized, eventTrace, runtimeDecisions, jsonl: jsonlRows.join('') };
+}
 
 const REPOSITORY_ROOT = join(import.meta.dir, '../..');
 const RELEASE_GRAPH = join(REPOSITORY_ROOT, 'graphs/release/release-loop.yaml');
@@ -67,8 +514,8 @@ export interface ReleaseSimRigCase {
   mode?: 'baseline' | 'cut-tip-moved-after-resume' | 'approval-graph-path-mismatch' | 'pwa-costly-opt-in-required' | 'cutoff-cli-notes-empty' | 'docs-node-cli-in-sim' | 'gate-waive-introduced-regression' | 'owner-waive-unmeasured-gate' | 'owner-waive-0246-fixture' | 'append-receipt-continuity' | 'macrophage-heal' | 'old-graph-measured-waiver' | 'appended-tip-regate-before-waiver';
   unmeasuredGateShape?: 'stopped' | 'sweep-incomplete' | 'killed';
   fault?: { node: string; outcome: 'fail' | 'error' | 'timeout'; evidence?: Record<string, unknown> };
-  nodeOutcomes?: Record<string, { outcome: 'ok' | 'fail' | 'error'; delayMs?: number }>;
-  expect: { status: 'done' | 'failed' | 'resume-refused'; mustVisit: string[]; mustNotVisit: string[]; overlap?: [string, string]; refusalIncludes?: string; events?: ReleaseEventExpectation[] };
+  nodeOutcomes?: Record<string, { outcome: 'ok' | 'fail' | 'error' | 'unknown'; delayMs?: number }>;
+  expect: { status: 'done' | 'failed' | 'resume-refused' | 'awaiting-approval'; mustVisit: string[]; mustNotVisit: string[]; overlap?: [string, string]; refusalIncludes?: string; events?: ReleaseEventExpectation[] };
 }
 
 export interface ReleaseSimGateReceiptStage {
@@ -153,7 +600,7 @@ async function runProductionMissingReceiptGate(root: string, tests: string[], ve
   writeFileSync(join(repo, 'apps/pwa/bun.lock'), 'lockfileVersion = 1\n');
   writeFileSync(join(repo, 'docker/harness/Dockerfile'), 'FROM ubuntu:24.04\n');
   writeFileSync(join(repo, 'graphs/release/release-loop.yaml'), "  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1 }\n");
-  writeFileSync(join(repo, 'graphs/release/recipes.yaml'), "gate:\n  command: 'bun scripts/release-loop/gate-node.ts --json'\n  timeout_ms: 14400000\n");
+  writeFileSync(join(repo, 'graphs/release/recipes.yaml'), "gate:\n  command: 'bun scripts/release-loop/gate-node-cli.ts --json'\n  timeout_ms: 14400000\n");
   for (const file of tests) {
     const path = join(repo, file);
     mkdirSync(dirname(path), { recursive: true });
@@ -304,7 +751,8 @@ async function runAppendReceiptCase(scenario: ReleaseSimRigScenario, item: Relea
   const formalReceiptDir = join(root, 'release', scenario.input.version, 'gate-logs', 'cut', 'receipts');
   mkdirSync(formalReceiptDir, { recursive: true });
   const formalReceiptInspection = inspectGateShardReceipts(formalReceiptDir, { version: scenario.input.version, commit: cut,
-    base40: SIM_BASE_COMMIT, envFingerprint: SIM_ENV_FINGERPRINT, graphPins: { graphSha: '0'.repeat(64), recipeSha: '1'.repeat(64) },
+    base40: SIM_BASE_COMMIT, envFingerprint: SIM_ENV_FINGERPRINT, runtimeIdentity: SIM_RUNTIME_IDENTITY, lockHash: SIM_LOCKFILE_HASH,
+    graphPins: { graphSha: '0'.repeat(64), recipeSha: '1'.repeat(64) },
     graphEntry: 'release-sim-gate', recipeCommand: 'simulated gate receipt', recipeTimeoutMs: 1000,
     shards: tests.map((file, index) => ({ id: `pod-${index}`, files: [file] })), tests });
   const formalGateRun = await runProductionMissingReceiptGate(root, tests, scenario.input.version, scenario.input.previousVersion);
@@ -390,7 +838,7 @@ export interface ReleaseSimRigScenario {
   kind: 'release-graph';
   id: string;
   isolation: 'test';
-  input: { version: string; previousVersion: string };
+  input: { version: string; previousVersion: string; releaseGateFanout?: boolean };
   cases: ReleaseSimRigCase[];
 }
 
@@ -491,8 +939,9 @@ function stringList(value: unknown, where: string): string[] {
   return value as string[];
 }
 
-function releaseGraphShape(): { nodeIds: Set<string>; edges: Map<string, Record<string, unknown>> } {
-  const parsed = parseGraphTemplateYaml(readFileSync(RELEASE_GRAPH, 'utf8'));
+function releaseGraphShape(fanout = false): { nodeIds: Set<string>; edges: Map<string, Record<string, unknown>> } {
+  const graphPath = fanout ? join(dirname(RELEASE_GRAPH), 'release-loop-fanout.yaml') : RELEASE_GRAPH;
+  const parsed = parseGraphTemplateYaml(readFileSync(graphPath, 'utf8'));
   if (!parsed.template || parsed.errors.length) throw new Error(`release graph is invalid: ${parsed.errors.map((issue) => issue.message).join('; ')}`);
   const nodeIds = new Set(parsed.template.nodes.map((node) => node.nodeId));
   const edges = new Map<string, Record<string, unknown>>();
@@ -516,14 +965,17 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
   }
   if (typeof root.id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(root.id)) throw new Error('scenario.id must be lowercase letters, digits, and hyphens');
   const input = record(root.input, 'scenario.input');
-  exactKeys(input, ['version', 'previousVersion'], 'scenario.input');
+  exactKeys(input, ['version', 'previousVersion', 'releaseGateFanout'], 'scenario.input');
+  if (input.releaseGateFanout !== undefined && typeof input.releaseGateFanout !== 'boolean') {
+    throw new Error('scenario.input.releaseGateFanout must be boolean');
+  }
   if (typeof input.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(input.version)
     || typeof input.previousVersion !== 'string' || !/^\d+\.\d+\.\d+$/.test(input.previousVersion)) {
     throw new Error('scenario.input requires release version and previousVersion');
   }
   const rawCases = root.cases;
   if (!Array.isArray(rawCases) || rawCases.length === 0 || rawCases.length > 32) throw new Error('scenario.cases must contain 1–32 cases');
-  const { nodeIds } = releaseGraphShape();
+  const { nodeIds } = releaseGraphShape(input.releaseGateFanout === true);
   const ids = new Set<string>();
   const cases = rawCases.map((raw, index): ReleaseSimRigCase => {
     const row = record(raw, `scenario.cases[${index}]`);
@@ -556,14 +1008,14 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
         if (!nodeIds.has(node)) throw new Error(`scenario.cases[${index}].nodeOutcomes names unknown release node ${node}`);
         const injection = record(value, `scenario.cases[${index}].nodeOutcomes.${node}`);
         exactKeys(injection, ['outcome', 'delayMs'], `scenario.cases[${index}].nodeOutcomes.${node}`);
-        if (injection.outcome !== 'ok' && injection.outcome !== 'fail' && injection.outcome !== 'error') throw new Error(`scenario.cases[${index}].nodeOutcomes.${node}.outcome is invalid`);
+        if (injection.outcome !== 'ok' && injection.outcome !== 'fail' && injection.outcome !== 'error' && injection.outcome !== 'unknown') throw new Error(`scenario.cases[${index}].nodeOutcomes.${node}.outcome is invalid`);
         if (injection.delayMs !== undefined && (!Number.isSafeInteger(injection.delayMs) || (injection.delayMs as number) < 0 || (injection.delayMs as number) > 60_000)) throw new Error(`scenario.cases[${index}].nodeOutcomes.${node}.delayMs must be 0–60000`);
         nodeOutcomes[node] = { outcome: injection.outcome, ...(injection.delayMs === undefined ? {} : { delayMs: injection.delayMs as number }) };
       }
     }
     const expected = record(row.expect, `scenario.cases[${index}].expect`);
     exactKeys(expected, ['status', 'mustVisit', 'mustNotVisit', 'overlap', 'refusalIncludes', 'events'], `scenario.cases[${index}].expect`);
-    if (expected.status !== 'done' && expected.status !== 'failed' && expected.status !== 'resume-refused') throw new Error(`scenario.cases[${index}].expect.status is invalid`);
+    if (expected.status !== 'done' && expected.status !== 'failed' && expected.status !== 'resume-refused' && expected.status !== 'awaiting-approval') throw new Error(`scenario.cases[${index}].expect.status is invalid`);
     const mustVisit = stringList(expected.mustVisit, `scenario.cases[${index}].expect.mustVisit`);
     const mustNotVisit = stringList(expected.mustNotVisit, `scenario.cases[${index}].expect.mustNotVisit`);
     const refusalIncludes = expected.refusalIncludes;
@@ -600,7 +1052,7 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
       expect: { status: expected.status, mustVisit, mustNotVisit, ...(overlap ? { overlap } : {}), ...(typeof refusalIncludes === 'string' ? { refusalIncludes } : {}), ...(events ? { events } : {}) } };
   });
   return { version: 1, kind: 'release-graph', id: root.id, isolation: 'test',
-    input: { version: input.version, previousVersion: input.previousVersion }, cases };
+    input: { version: input.version, previousVersion: input.previousVersion, ...(input.releaseGateFanout === true ? { releaseGateFanout: true } : {}) }, cases };
 }
 
 function parseContext(env: NodeJS.ProcessEnv): { nodeId: string; executionId: string } {
@@ -612,7 +1064,9 @@ function parseContext(env: NodeJS.ProcessEnv): { nodeId: string; executionId: st
   return { nodeId: context.nodeId, executionId: context.executionId };
 }
 
-function resultForNode(nodeId: string, fault: ReleaseSimRigCase['fault'], version: string): { exitCode: number; stdout: string; stderr: string; evidence: Record<string, unknown> } {
+type SimulatedNodeFault = NonNullable<ReleaseSimRigCase['fault']> | { node: string; outcome: 'unknown'; evidence?: Record<string, unknown> };
+
+function resultForNode(nodeId: string, fault: SimulatedNodeFault | undefined, version: string): { exitCode: number; stdout: string; stderr: string; evidence: Record<string, unknown> } {
   const triggeredFault = fault?.node === nodeId ? fault : undefined;
   const outcome = triggeredFault ? triggeredFault.outcome === 'timeout' ? 'error' : triggeredFault.outcome : 'ok';
   const evidence = triggeredFault?.evidence ?? {};
@@ -630,7 +1084,7 @@ function resultForNode(nodeId: string, fault: ReleaseSimRigCase['fault'], versio
   } : {};
   const payload = { outcome, verdict: outcome === 'ok' ? 'pass' : 'fail', summary: triggeredFault ? `simulated ${triggeredFault.outcome}` : `simulated ${nodeId} success`, ...commit, ...gateOutput,
     simulation: { injected: triggeredFault !== undefined, node: nodeId, evidence } };
-  return { exitCode: !triggeredFault ? 0 : triggeredFault.outcome === 'fail' ? 1 : triggeredFault.outcome === 'timeout' ? 124 : 2,
+  return { exitCode: !triggeredFault || triggeredFault.outcome === 'unknown' ? 0 : triggeredFault.outcome === 'fail' ? 1 : triggeredFault.outcome === 'timeout' ? 124 : 2,
     stdout: `${JSON.stringify(payload)}\n`, stderr: triggeredFault ? `SIMULATED_${triggeredFault.outcome.toUpperCase()}` : '', evidence };
 }
 
@@ -1224,7 +1678,8 @@ async function runAppendedTipReGateCase(scenario: ReleaseSimRigScenario, item: R
   const movedTipAttemptUnchanged = readFileSync(first.statePath, 'utf8') === stateBefore;
 
   phase = 'regate';
-  const regated = await resumeReleaseRun({ runId, from: 'export-check' }, deps);
+  // In the current graph the gate runs before export-check, so a gate failure cannot resume from export-check.
+  const regated = await resumeReleaseRun({ runId, from: 'gate' }, deps);
   const regatedState = readFileSync(first.statePath, 'utf8');
   const reGateTip = regated.tip;
   const regateFailed = regated.state.status === 'failed';
@@ -1267,7 +1722,8 @@ async function runAppendedTipReGateCase(scenario: ReleaseSimRigScenario, item: R
 }
 
 async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase, root: string,
-  edges: Map<string, Record<string, unknown>>, sharedUnmeasuredGateFixture: SharedUnmeasuredGateFixture): Promise<ReleaseSimRigCaseResult> {
+  edges: Map<string, Record<string, unknown>>, sharedUnmeasuredGateFixture: SharedUnmeasuredGateFixture,
+): Promise<ReleaseSimRigCaseResult> {
   if (item.mode === 'append-receipt-continuity') return runAppendReceiptCase(scenario, item, root);
   if (item.mode === 'old-graph-measured-waiver') return runOldGraphMeasuredWaiverCase(scenario, item, root, edges);
   if (item.mode === 'appended-tip-regate-before-waiver') return runAppendedTipReGateCase(scenario, item, root, edges);
@@ -1292,7 +1748,7 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
     const now = new Date('2026-11-06T00:00:00Z');
     const active = runMacrophageHeal({ phase: 'active', mode: 'simulation', now, consecutiveFailureLimit: 3, inventory });
     const simulation = runMacrophageHeal({ phase: 'idle', mode: 'simulation', now, consecutiveFailureLimit: 3, inventory });
-    const expectedApplied = ['draft-stale', 'worktree-orphan', 'pod-orphan', 'job-orphan', 'hold-expired', 'receipt-stale', 'land-row-merged'];
+    const expectedApplied = ['draft-stale', 'test-timeout', 'artifact-stale', 'worktree-orphan', 'pod-orphan', 'job-orphan', 'hold-expired', 'receipt-stale', 'land-row-merged'];
     const appliedIds = simulation.events.filter((event) => event.applied).map((event) => event.id);
     const runId = `release-sim-${scenario.id}-macrophage`;
     const liveRuntime = createMacrophageRuntime({ runId, inventory: () => inventory, now: () => now });
@@ -1518,12 +1974,14 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
       let nodeStdout = '';
       const fakeBin = join(root, `${runId}-fake-bin`);
       const fakeNexusServer = join(root, `${runId}-fake-nexus-server.cjs`);
+      const worktreeLifecycleLog = join(root, `${runId}-worktree-lifecycle.log`);
       mkdirSync(fakeBin, { recursive: true });
       writeFileSync(fakeNexusServer, "const http=require('node:http'); const server=http.createServer((req,res)=>{res.statusCode=200;res.end('simulated nexus');}); server.listen(0,'127.0.0.1',()=>console.log('nexus :'+server.address().port+' pid '+process.pid));\n");
+      writeFileSync(worktreeLifecycleLog, '');
       const fakeBun = join(fakeBin, 'bun');
       writeFileSync(fakeBun, '#!/bin/sh\nif [ "$1" = "-e" ]; then printf \'[{"id":"regular","costly":false},{"id":"C1","costly":true}]\\n\'; exit 0; fi\nif [ "$1" = "scripts/pwa-scenarios.ts" ]; then printf \'{"results":[{"id":"regular","pass":true}]}\\n\'; exit 0; fi\nif [ "$1" = "bin/elanous.mjs" ] && [ "$2" = "nexus" ] && [ "$3" = "build" ]; then exit 0; fi\nif [ "$1" = "bin/elanous.mjs" ] && [ "$2" = "--test" ] && [ "$3" = "nexus" ] && [ "$4" = "run" ]; then\n  if [ "$5" = "--stop" ]; then exit 0; fi\n  "$ELANOUS_SIM_NODE_EXECUTABLE" "$ELANOUS_SIM_NEXUS_SERVER" &\n  exit 0\nfi\necho "unexpected bun boundary: $*" >&2\nexit 97\n');
       const fakeGit = join(fakeBin, 'git');
-      writeFileSync(fakeGit, '#!/bin/sh\nif [ "$1" = "worktree" ] && [ "$2" = "add" ]; then mkdir -p "$4/apps/pwa"; exit 0; fi\nif [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then rm -rf "$4"; exit 0; fi\necho "unexpected git boundary: $*" >&2\nexit 97\n');
+      writeFileSync(fakeGit, createReleaseSimRigFakeGitScript());
       chmodSync(fakeBun, 0o755); chmodSync(fakeGit, 0o755);
       const trafficPath = join(root, `${runId}-traffic.json`);
       writeFileSync(trafficPath, `${JSON.stringify({ global: 'green', seats: { OP: {}, TC: {}, MK: {}, UX: {} } })}\n`);
@@ -1539,11 +1997,15 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
           if (!bunExecutable || !nodeExecutable) return { status: 97, stdout: '', stderr: 'bun/node executable unavailable for isolated PWA simulation' };
           const child = spawnSync(bunExecutable, args, { cwd: REPOSITORY_ROOT, encoding: 'utf8', timeout: 120_000,
             maxBuffer: 4 * 1024 * 1024, env: { ...process.env, ...options.env, PATH: [fakeBin, process.env.PATH ?? ''].join(delimiter),
-              ELANOUS_SIM_NODE_EXECUTABLE: nodeExecutable, ELANOUS_SIM_NEXUS_SERVER: fakeNexusServer } });
+              ELANOUS_SIM_NODE_EXECUTABLE: nodeExecutable, ELANOUS_SIM_NEXUS_SERVER: fakeNexusServer, ELANOUS_SIM_RIG_RUN_ID: runId,
+              ELANOUS_SIM_RIG_WORKTREE_LOG: worktreeLifecycleLog,
+              ELANOUS_SIM_RIG_MARKER_SNAPSHOT: join(root, `${runId}-worktree-marker.snapshot`),
+              ELANOUS_SIM_RIG_WORKTREE_PATH_SNAPSHOT: join(root, `${runId}-worktree-path.snapshot`) } });
           let externalResult: Record<string, unknown> | null = null;
           try { externalResult = JSON.parse((child.stdout ?? '').trim().split('\n').at(-1) ?? 'null') as Record<string, unknown> | null; } catch { /* Preserve child diagnostics below. */ }
           pwaNodeEvidence = { actualNode: 'runNodeVerdict(pwa)', actualCli: 'scripts/release-loop/pwa-scenarios-node.ts',
-            externalBoundary: [program, ...args], costlyRequested: args.includes('--with-costly'), externalResult, stderr: child.stderr ?? '' };
+            externalBoundary: [program, ...args], costlyRequested: args.includes('--with-costly'), externalResult, stderr: child.stderr ?? '',
+            worktreeLifecycle: readFileSync(worktreeLifecycleLog, 'utf8').trim().split('\n').filter(Boolean) };
           return { status: child.status, stdout: child.stdout ?? '', stderr: child.stderr ?? '' };
         });
         pwaNodeEvidence = { ...pwaNodeEvidence, exitCode, capturedOutput: nodeStdout };
@@ -1693,7 +2155,7 @@ export async function runReleaseSimRigScenario(source: string): Promise<ReleaseS
   const scenario = parseReleaseSimRigScenario(source);
   const root = getTestStateRoot();
   if (!root) throw new Error('release simulation rig requires --test isolated mode');
-  const { edges } = releaseGraphShape();
+  const { edges } = releaseGraphShape(scenario.input.releaseGateFanout === true);
   const cases = [];
   const sharedUnmeasuredGateFixture: SharedUnmeasuredGateFixture = {
     runId: `release-sim-${scenario.id}-unmeasured-gate-shared`, initialRuns: 0,

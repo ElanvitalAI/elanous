@@ -96,6 +96,19 @@ export function createSiWarmSourceShaResolver(options: {
 
 const resolveSiWarmSourceSha = createSiWarmSourceShaResolver();
 
+/** Resolve the lockfile from the pinned source tree, not from whichever warm Pod is first. */
+function resolveSiWarmLockHash(sourceSha: string, cwd: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('git', ['show', `${sourceSha}:bun.lock`], { cwd, encoding: 'buffer', maxBuffer: 4 * 1024 * 1024 },
+      (error, stdout) => {
+        if (error) { reject(error); return; }
+        const bytes = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+        if (bytes.length === 0) { reject(new Error('source lockfile is empty')); return; }
+        resolve(createHash('sha256').update(bytes).digest('hex'));
+      });
+  });
+}
+
 function chunks(kind: 'ledger' | 'artifact', id: string, bytes: Uint8Array): string[] {
   const encoded = gzipSync(bytes).toString('base64');
   const size = 8000;
@@ -253,10 +266,12 @@ export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOpt
     if (!siWarmEligible(input, options, config.llm.provider)) return { status: 'no-entry', reason: 'invalid-input' };
     const source = await resolveSiWarmSourceSha(input.base, process.cwd());
     const sourceSha = source.sha;
+    const lockHash = await resolveSiWarmLockHash(sourceSha, process.cwd());
     debug.log('pod.reuse', 'source-sha-resolved', { cache: source.cache, durationMs: source.durationMs });
     const runId = `run-${randomUUID()}`;
     const attemptId = `attempt-${randomUUID()}`;
-    const executionKey = siWarmExecutionKey(input, runId);
+    const pinnedInput = { ...input, base: sourceSha };
+    const executionKey = siWarmExecutionKey(pinnedInput, runId);
     const plannedAccount = options.accountBroker?.() ?? options.account ?? 'team';
     const rotation = options.rotationAccounts;
     if (options.accountBroker && (!rotation?.includes(plannedAccount)
@@ -284,10 +299,10 @@ export async function acquireSiWarmChild(input: ChildInput, options: PodSpawnOpt
       'gh-token': credentials.ghToken,
       ...siWarmFallbackFiles(config.llm.fallbackChain, grok, config.llm.provider) },
     ...(accounts ? { accounts } : {}) };
-    const payload = Buffer.from(JSON.stringify(siWarmPayload(input, options, runId)));
+    const payload = Buffer.from(JSON.stringify(siWarmPayload(pinnedInput, options, runId)));
     const credentialBundle = Buffer.from(JSON.stringify(bundle));
     const deadlineAt = Date.now() + deadlineMs;
-    prepared = { runId, attemptId, executionKey, sourceSha, deadlineAt,
+    prepared = { runId, attemptId, executionKey, sourceSha, lockHash, deadlineAt,
       payload, credentialBundle, adopt: adoptSiWarmBytes };
   } catch (error) {
     // Credential errors may contain private paths or tokens; log the class, not its raw text.

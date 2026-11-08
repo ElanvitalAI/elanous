@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── IUL Phase L (subset) — LLM UX awareness tools ──
 //
 // Reads the live SurfaceRegistry (production-wired by Bundle 3) to
@@ -27,14 +28,14 @@
 //   * SurfaceRegistry / ModalIdentityRegistry / pane-source are
 //     terminal-team owned, edited freely.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import {
   getSurfaceRegistry,
-  type SurfaceAddress,
   type SurfaceDescriptor,
   type SurfaceEvent,
   type SurfaceRegistry,
-} from './index.js';
+} from './registry.js';
+import type { SurfaceAddress } from './address.js';
 import { getModalIdentityRegistry, type ModalIdentityRegistry } from '../display/modal-identity.js';
 import { describePane } from '../capture/sources/pane-source.js';
 import type { PaneVisualStateStore } from '../panes/visual-state.js';

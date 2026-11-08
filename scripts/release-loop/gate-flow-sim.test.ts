@@ -293,6 +293,12 @@ edges:
       expect(shard).toMatchObject({ durationMs: POD_SECONDS * 1000, rc: 1, files: FILES, commit: CUT });
       expect(JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-verdict.json'), 'utf8')))
         .toMatchObject({ version: '1.0.1', commit: CUT, outcome: 'regression', introduced: [FAILURE], knownEnv: [] });
+      const ledgerPath = join(instanceRoot, 'release/1.0.1/gate-logs/shard-ledger.jsonl');
+      const ledgerRows = readFileSync(ledgerPath, 'utf8').trim().split('\n').map((row) => JSON.parse(row) as Record<string, unknown>);
+      const completedReceipt = [...ledgerRows].reverse().find((row) => row.state === 'done' && row.shardId === 'pod-0')!;
+      expect(completedReceipt).toMatchObject({ invocationId: expect.any(String), reuseDecision: 'rerun' });
+      const ledgerSummary = progressLogSpy.mock.calls.find(([category, event]) => category === 'release-loop.gate' && event === 'shard-ledger-summary');
+      expect(ledgerSummary?.[2]).toMatchObject({ invocationId: completedReceipt.invocationId, disposition: { reused: 0, rerun: 1, unmeasured: 0 } });
     });
   } finally {
     if (previousPath === undefined) delete process.env.PATH;

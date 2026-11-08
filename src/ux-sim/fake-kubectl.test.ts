@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { afterAll, expect, test } from 'bun:test';
 import { createFakeKubectl } from './fake-kubectl.js';
 import { PodPoolScheduler, measureMemberOccupancy, parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 import { WarmPodProvider } from '../task-orchestrator/surfaces/pod-warm-worker-provider.js';
@@ -13,11 +13,19 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const key = { context: 'pool-node-c', imageDigest: `sha256:${'b'.repeat(64)}`, lockHash: 'c'.repeat(64), architecture: 'amd64' };
+const baseImageDigest = `sha256:${'f'.repeat(64)}`;
+const workerBunVersion = '1.2.3';
+const warmProviderStateRoot = mkdtempSync(join(tmpdir(), 'fake-kubectl-warm-provider-state-'));
+let warmProviderStateIndex = 0;
+afterAll(() => rmSync(warmProviderStateRoot, { recursive: true, force: true }));
 const spec: WarmPodSpec = { name: 'warm-node-c', namespace: 'elanous-test', kubectlContext: 'node-c',
   workerId: 'worker-1', image: `registry.example/elanous@${key.imageDigest}`,
   sourceUrl: 'https://github.com/ElanvitalAI/elanous.git', cutSha: 'a'.repeat(40), key,
+  runtimeContract: { baseImageDigest, bunVersion: workerBunVersion, os: 'linux', architecture: 'amd64', requiredTools: ['bun', 'git'] },
   memoryLimit: '16Gi', nodeName: 'pool-node-c-server-0', hostProbeUrl: 'http://host.orb.internal:10001/health',
   prodProbeUrl: 'http://core.elanous-prod:10002/' };
+const siSpec: WarmPodSpec = { ...spec,
+  runtimeContract: { baseImageDigest, bunVersion: '1.2.3', os: 'linux', architecture: 'amd64', requiredTools: ['bun', 'git'] } };
 const member = parsePodPool('node-c:1')[0]!;
 test('MOCK-FAKE-KUBECTL: pod listing matches Kubernetes PodList metadata contract', () => {
   const device = createFakeKubectl({ context: 'fake', node: 'fake-node' });
@@ -49,11 +57,17 @@ function stage(jobForLease?: string) {
     ...(jobForLease ? { job: jobForLease } : {}) });
   let transports = 0;
   const provider = new WarmPodProvider({ candidates: [{ host: 'node-c', tier: 'standard', spec }],
+    runtimeIdentity: { baseImageDigest, lockHash: key.lockHash, os: 'linux', architecture: 'amd64', bunVersion: workerBunVersion },
     controlUrl: 'http://127.0.0.1:31413/', memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
+    rotationStatePath: join(warmProviderStateRoot, `stage-${++warmProviderStateIndex}.json`),
     kubectl: device.kubectl, fetch: device.fetchLease, transport: () => ({ request: async () => { transports++;
       return { status: 'observed', reason: 'complete', reply: null }; } }),
   });
-  return { device, provider, paths: device.leaseCalls, transports: () => transports };
+  const request = (input: ReturnType<typeof replay> = replay()) => provider.request(input,
+    { kind: 'gate', lockHash: key.lockHash, imageDigest: key.imageDigest,
+      runtimeContract: { baseImageDigest, bunVersion: workerBunVersion, os: 'linux',
+        architecture: key.architecture, requiredTools: [] } });
+  return { device, provider, request, paths: device.leaseCalls, transports: () => transports };
 }
 
 test('MOCK-FAKE-KUBECTL: tracks Job disappearance, Pod UID and fenced lease transitions', async () => {
@@ -78,16 +92,17 @@ test('MOCK-FAKE-KUBECTL: tracks Job disappearance, Pod UID and fenced lease tran
 
 test('MOCK-FAKE-KUBECTL: lost warm-lease reply reconciles without starting a duplicate Pod Job', async () => {
   const device = createFakeKubectl({ context: member.context, node: spec.nodeName! });
-  device.setWarmLease({ workerId: spec.workerId, podUid: 'uid-1', key });
+  device.setWarmLease({ workerId: siSpec.workerId, podUid: 'uid-1', key });
   device.loseNextLeaseResponse();
-  const provider = new SiWarmPodProvider({ candidates: [{ host: 'node-c', tier: 'standard', spec }],
+  const provider = new SiWarmPodProvider({ candidates: [{ host: 'node-c', tier: 'standard', kind: 'implementation', spec: siSpec }],
+    selection: { kind: 'implementation', imageDigest: key.imageDigest, runtimeContract: siSpec.runtimeContract! },
     controlUrl: 'http://control/', memberToken: '1'.repeat(64), machineTokens: { 'node-c': '2'.repeat(64) },
     kubectl: device.kubectl, fetch: device.fetchLease, siRunnerReady: () => true,
   });
   const spawn = await podSpawnWithSiWarm({ kubectl: device.kubectl, env: {}, siWarmLedger: () => {} },
     { ELANOUS_SI_WARM_REUSE: '1' }, {
       acquire: async _input => provider.acquire({ runId: 'run-lost-reply', attemptId: 'attempt-lost-reply',
-        executionKey: 'd'.repeat(64), sourceSha: spec.cutSha, deadlineAt: Date.now() + 60_000,
+        executionKey: 'd'.repeat(64), sourceSha: siSpec.cutSha, lockHash: key.lockHash, deadlineAt: Date.now() + 60_000,
         payload: new Uint8Array([1]), credentialBundle: new Uint8Array([2]), adopt: async () => {} }),
       postprocess: async (_input, result) => result,
     });
@@ -111,9 +126,9 @@ test('MOCK-FAKE-KUBECTL: delete accepts both Kubernetes job target forms and rej
 });
 
 test('MOCK-FAKE-KUBECTL: UID replacement fences warm lease before transport and quarantines once', async () => {
-  const { device, provider, paths, transports } = stage();
+  const { device, request, paths, transports } = stage();
   device.replacePodUid(spec.name, 'uid-2');
-  expect(await provider.request(replay())).toMatchObject({ command: null,
+  expect(await request()).toMatchObject({ command: null,
     transport: { status: 'fallback', reason: 'lease-unavailable' } });
   expect(transports()).toBe(0);
   expect(paths).toEqual(['/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/quarantine`]);
@@ -135,12 +150,12 @@ test('MOCK-FAKE-KUBECTL: real warm transport refuses an isolation-drifted Pod be
 });
 
 test('MOCK-FAKE-KUBECTL: vanished Job leaves its Pod occupied; reuse and isolation fail closed with zero duplicate launch', async () => {
-  const { device, provider, paths, transports } = stage('job-1');
+  const { device, provider, request, paths, transports } = stage('job-1');
   device.putPod({ metadata: { name: 'job-pod', namespace: 'elanous-test', labels: {
     'elanous.substrate': 'pod', 'elanous.job': 'job-1' } },
     spec: { nodeName: spec.nodeName, containers: [{ resources: { limits: { memory: '16Gi' } } }] },
     status: { phase: 'Running' } });
-  const granted = await provider.request(replay());
+  const granted = await request();
   expect(granted.command).not.toBeNull();
   const command = granted.command!;
   const launchedTransports = transports();
@@ -175,7 +190,7 @@ test('MOCK-FAKE-KUBECTL: vanished Job leaves its Pod occupied; reuse and isolati
   expect(returns).toBe(0);
   expect(quarantines).toBe(1);
   expect(device.warmLeaseState()).toBe('quarantined');
-  expect((await provider.request(replay())).command).toBeNull();
+  expect((await request()).command).toBeNull();
   expect(transports()).toBe(launchedTransports);
   expect(paths).toEqual(['/v1/leases/pod-worker', `/v1/leases/pod-worker/${spec.workerId}/release`,
     `/v1/leases/pod-worker/${spec.workerId}/quarantine`, '/v1/leases/pod-worker']);
@@ -184,8 +199,8 @@ test('MOCK-FAKE-KUBECTL: vanished Job leaves its Pod occupied; reuse and isolati
 });
 
 test('MOCK-FAKE-KUBECTL: provider double finalize releases and sanitizes the warm lease exactly once', async () => {
-  const { device, provider, paths, transports } = stage('job-1');
-  const granted = await provider.request(replay());
+  const { device, provider, request, paths, transports } = stage('job-1');
+  const granted = await request();
   expect(granted.command).not.toBeNull();
   expect(transports()).toBe(1);
   await provider.finalize(granted.command!);
@@ -195,13 +210,13 @@ test('MOCK-FAKE-KUBECTL: provider double finalize releases and sanitizes the war
     `/v1/leases/pod-worker/${spec.workerId}/sanitize`]);
   expect(device.warmLeaseState()).toBe('idle');
   device.removeJob('job-1');
-  expect((await provider.request(replay())).command).toBeNull();
+  expect((await request()).command).toBeNull();
   expect(transports()).toBe(1);
   expect(device.calls.filter(call => call.includes('create'))).toHaveLength(0);
 });
 
 test('MOCK-FAKE-KUBECTL: duplicate admission release does not launch twice or reuse a quarantined lease', async () => {
-  const { device, provider, paths, transports } = stage();
+  const { device, request, paths, transports } = stage();
   const scheduler = new PodPoolScheduler([member], { kubectl: device.kubectl, dns: () => 'ready' });
   const admission = await scheduler.acquireAdmission();
   admission.applied('job-1', member.context, 'elanous-test');
@@ -211,14 +226,14 @@ test('MOCK-FAKE-KUBECTL: duplicate admission release does not launch twice or re
   expect(scheduler.admissionSnapshot().queued).toBe(0);
   expect(device.warmLeaseState()).toBe('idle');
   device.replacePodUid(spec.name, 'uid-2');
-  const first = await provider.request(replay());
+  const first = await request();
   expect(first.command).toBeNull();
   expect(transports()).toBe(0);
   expect(paths.filter(path => path.endsWith('/quarantine'))).toHaveLength(1);
   expect(device.warmLeaseState()).toBe('quarantined');
-  expect((await provider.request(replay())).command).toBeNull();
+  expect((await request()).command).toBeNull();
   expect(transports()).toBe(0);
-  expect(paths.filter(path => path === '/v1/leases/pod-worker')).toHaveLength(2);
+  expect(paths.filter(path => path === '/v1/leases/pod-worker')).toHaveLength(1);
   expect(device.calls.filter(call => call.includes('create'))).toHaveLength(0);
 });
 

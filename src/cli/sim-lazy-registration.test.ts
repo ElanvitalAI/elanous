@@ -3,37 +3,37 @@ import { spawnSync } from 'node:child_process';
 import { delimiter, resolve, join } from 'node:path';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
-const entry = resolve(import.meta.dir, '../../bin/elanous.mjs');
 const index = new URL('../index.ts', import.meta.url).href;
+const entry = resolve(import.meta.dir, '../../bin/elanous.mjs');
 const cwd = resolve(import.meta.dir, '../..');
 const simCommandLine = (output: string) => output.split('\n').find((line) => /^  sim\s/.test(line));
 
-function run(args: string[], forbidSim = false) {
+function run(args: string[]) {
   const script = `Bun.plugin({name:'sim-lazy-guard',setup(build){build.onLoad({filter:/[\\\\/]src[\\\\/]cli[\\\\/]sim-cli\\.ts$/,},()=>{throw Error('SIM_LOADED_FOR_OTHER_COMMAND')})}});\n` +
+    `process.argv=['node','elanous',...${JSON.stringify(args)}];const {runCli}=await import(${JSON.stringify(index)});await runCli();`;
+  return spawnSync(process.execPath, ['-e', script], { cwd, encoding: 'utf8', timeout: 45_000 });
+}
+
+function runEntry(args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv; stateRoot?: string } = {}) {
+  return simCli(args, { mode: 'spawn', allowPaths: [[], ['sim'], ['help', 'sim']], timeoutMs: 45_000, ...options });
+}
+
+function runWithReleaseRigBlocked(args: string[]) {
+  const script = `Bun.plugin({name:'sim-rig-lazy-guard',setup(build){build.onLoad({filter:/[\\/]src[\\/]ux-sim[\\/]release-sim-rig\\.ts$/,},()=>{throw Error('SIM_RIG_LOADED_BEFORE_RUN')})}});\n` +
     `process.argv=['node',${JSON.stringify(entry)},...${JSON.stringify(args)}];const {runCli}=await import(${JSON.stringify(index)});await runCli();`;
-  return spawnSync(process.execPath, forbidSim ? ['-e', script] : [entry, ...args], {
-    cwd, encoding: 'utf8', timeout: 45_000,
-  });
+  return spawnSync(process.execPath, ['-e', script], { cwd, encoding: 'utf8', timeout: 45_000 });
 }
 
 describe('lazy sim command registration', () => {
-  test('selected sim and all root help modes retain the command', () => {
-    for (const args of [['sim', '--help'], ['help', 'sim'], ['--help'], ['--help-all'], ['--help', '-h'], ['-h', '--help']]) {
-      const result = run(args);
-      expect({ args, status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
-      expect(result.stdout).toContain('sim');
-      if (args[0]?.startsWith('-')) {
-        expect(simCommandLine(result.stdout)).toBeDefined();
-        expect(result.stdout.indexOf('  sim ')).toBeGreaterThan(result.stdout.indexOf('Commands:'));
-      }
-    }
-    const canonicalHelp = run(['--help']);
-    for (const flags of [['--help', '-h'], ['-h', '--help']]) {
-      expect(run(flags).stdout).toBe(canonicalHelp.stdout);
-    }
+  test('sim command is present on the real root help entrypoint', async () => {
+    const result = await runEntry(['--help']);
+    expect({ status: result.exitCode, stderr: result.stderr }).toMatchObject({ status: 0 });
+    expect(simCommandLine(result.stdout)).toBeDefined();
+    expect(result.stdout.indexOf('  sim ')).toBeGreaterThan(result.stdout.indexOf('Commands:'));
   }, 180_000);
-  test('root help succeeds from blank HOME and outside-Git cwd when rev-parse fails', () => {
+  test('root help succeeds from blank HOME and outside-Git cwd when rev-parse fails', async () => {
     const directory = mkdtempSync(resolve(tmpdir(), 'elanous-help-no-git-'));
     try {
       const stubBin = join(directory, 'bin');
@@ -57,10 +57,8 @@ describe('lazy sim command registration', () => {
       delete env.GIT_DIR;
       delete env.GIT_WORK_TREE;
       delete env.GIT_COMMON_DIR;
-      const result = spawnSync(process.execPath, [entry, '--help'], {
-        cwd: directory, env, encoding: 'utf8', timeout: 45_000,
-      });
-      expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+      const result = await runEntry(['--help'], { cwd: directory, env, stateRoot: join(directory, 'state') });
+      expect({ status: result.exitCode, stderr: result.stderr }).toMatchObject({ status: 0 });
       expect(result.stdout).toContain('sim');
       expect(existsSync(gitLog)).toBe(true);
       expect(readFileSync(gitLog, 'utf8')).toContain('rev-parse HEAD');
@@ -121,13 +119,23 @@ describe('lazy sim command registration', () => {
       rmSync(directory, { recursive: true, force: true });
     }
   }, 60_000);
+  test('sim help registers without loading the release simulation rig', () => {
+    const result = runWithReleaseRigBlocked(['sim', '--help']);
+    expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+    expect(result.stdout).toContain('run <scenario-file>');
+    expect(result.stderr).not.toContain('SIM_RIG_LOADED_BEFORE_RUN');
+    const releaseRig = resolve(cwd, 'scenarios/ux-sim/release-sim-rig.yaml');
+    const run = runWithReleaseRigBlocked(['--test', 'sim', 'run', releaseRig]);
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain('SIM_RIG_LOADED_BEFORE_RUN');
+  }, 60_000);
   test('selected help imports the registrar while unrelated help does not', () => {
     for (const args of [['sim', '--help'], ['help', 'sim'], ['--help'], ['--help-all']]) {
-      const selected = run(args, true);
+      const selected = run(args);
       expect(selected.status).not.toBe(0);
       expect(selected.stderr).toContain('SIM_LOADED_FOR_OTHER_COMMAND');
     }
-    const unrelated = run(['logs', '--help'], true);
+    const unrelated = run(['logs', '--help']);
     expect({ status: unrelated.status, stderr: unrelated.stderr }).toMatchObject({ status: 0 });
     expect(unrelated.stdout).toContain('logs');
     expect(unrelated.stderr).not.toContain('SIM_LOADED_FOR_OTHER_COMMAND');

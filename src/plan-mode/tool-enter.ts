@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // EnterPlanMode tool — Phase WF4.
 //
 // Flips Elanous into plan mode: save previous code-edit policy, init
@@ -5,8 +6,9 @@
 // any parameters — optional initialTitle just lets the artifact
 // frontmatter start with something more descriptive than "(untitled)".
 
-import type { LLMToolSpec } from '../llm.js';
-import { getPolicy, setPolicy, type ApprovalPolicy } from '../code-edit/index.js';
+
+import { getPolicy, setPolicy } from '../code-edit/safety.js';
+import type { ApprovalPolicy } from '../code-edit/types.js';
 import { setPlanToolPlanModeGuard } from '../code-edit/plan-tool.js';
 import { getPlanModeState, setPlanModeState, generatePlanSessionId } from './session.js';
 import { initPlanArtifact } from './persistence.js';

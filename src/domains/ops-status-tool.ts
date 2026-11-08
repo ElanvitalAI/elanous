@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── ops_status 코어 도구 (Ops Observability P2 · 2026-07-10) — 전 표면 상속 ──
 //
 // L2 코어 도구: elanous 가 "지금 무엇이 어떤 상태로 도나(미션·태스크·계약 루프·오케스트
@@ -7,7 +8,7 @@
 // 거버넌스: 순수 조회. 매매/발송 로직과 무관. fail-soft(집계 실패해도 error 필드로 응답).
 // 도메인 무관 코어(feedback_conatus_first_customer_not_core) — finance 팩 아님.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { opsSnapshot, opsHealth, opsTimeline, opsMissionDetail, type OpsScheduleSnapshot } from './ops-status.js';
 import type { OpsEntityType, OpsEventKind } from './ops-log.js';
 

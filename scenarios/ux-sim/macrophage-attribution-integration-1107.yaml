@@ -1,0 +1,86 @@
+version: 1
+kind: release-macrophage-attribution-integration
+id: macrophage-attribution-integration-1107
+runId: release-sim-macrophage-attribution-integration-1107
+previousReleaseTag: release/0.3.5
+incidents:
+  - id: a-export-check-failures
+    source: release-graph
+    signature: export-check missing graph context and PWA type failure
+    evidence: unmeasured
+    failureIds:
+      - tests/export-context.test.ts > reads the graph context
+      - tests/pwa-typecheck.test.ts > PWA output has valid types
+    expected: hitl
+  - id: b-shard-ledger-config
+    source: release-graph
+    signature: gate HQ shard ledger is not configured
+    evidence: unmeasured
+    failureIds: [tests/shard-ledger.test.ts > requires the HQ shard ledger]
+    expected: hitl
+  - id: c-three-file-regression
+    source: release-graph
+    signature: gate regression with independently attributed source files
+    evidence: introduced
+    failureIds:
+      - tests/gate-metadata.test.ts > introduced metadata regression
+      - tests/gate-pod-stall.test.ts > introduced Pod-stall regression
+    independentFiles: true
+    expected: fix
+    landed: true
+  - id: d-receipt-reuse-zero-of-81
+    source: release-graph
+    signature: d4df149e changed non-TypeScript inputs and invalidated the full 81-shard receipt radius
+    evidence: introduced
+    failureIds: [tests/receipt-radius.test.ts > receipt reuse was lost]
+    radiusReplay:
+      priorHead: 63ff4cc9ea8cf1c0c5ad451c8b35a34224a89507
+      cutHead: d4df149e3ae9e8862033ebbb1a1d52c0ff65ffd0
+      changedFiles:
+        - docs/TECH-harness-map-2026-10-06.md
+        - scenarios/ux-sim/rla-arg-adaptive-heal.yaml
+        - scripts/release-loop/gate-node.ts
+        - src/graph-runner/runner.ts
+      nonTypeScriptImpactReason: changed-non-ts-input
+      receiptRosterFixture: scenarios/ux-sim/fixtures/release-cut-0306-shards.json
+      shardCount: 81
+      testCount: 6611
+      receiptsReused: 0
+      radiusInvalidated: 81
+      productionReplayTest: scripts/release-loop/gate-cut-preflight-sim.test.ts
+    expected: fix
+    landed: true
+  - id: e-cli-image-scope-owner
+    source: release-graph
+    signature: stale CLI image pin run scope and branch owner evidence
+    evidence: unmeasured
+    failureIds: [tests/pod-image-preflight.test.ts > pinned image metadata is incomplete]
+    expected: hitl
+  - id: f-train-solo-starvation
+    source: train
+    signature: needs_solo ran before ready bundle
+    evidence: external
+    expected: noise
+  - id: g-worker-run-id-collision
+    source: train
+    signature: worker exited after run id prefix collision
+    evidence: unmeasured
+    expected: hitl
+  - id: h-main-tsc-rules-ratchet
+    source: train
+    signature: main typecheck and rules contract ratchet blocked train
+    evidence: introduced
+    failureIds: [tests/main-tsc.test.ts > changed main typecheck is rejected]
+    revertSafe: true
+    priorRepairStepsFailed: 1
+    expected: hitl
+  - id: i-review-cap-loop
+    source: host
+    signature: review cap exhausted and owner decision required
+    evidence: unmeasured
+    expected: hitl
+  - id: j-mbp-overload
+    source: host
+    signature: host saturation without a release loop resource signal
+    evidence: external
+    expected: noise

@@ -7,7 +7,7 @@
 import { debug } from '../../debug/log.js';
 import { compactSessionHistory } from '../../session/compact-session.js';
 import type { CompactProvider } from '../../compact/provider.js';
-import type { ChatAutoCompactConfig } from '../../user-config.js';
+import type { ChatAutoCompactConfig } from '../../user-config/chat.js';
 export { COMPACT_BUSY_STATUS, COMPACT_NO_SESSION_STATUS, isCompactCommand } from './compact-command.js';
 
 /** Test/embedding seams. Production passes none of these. */

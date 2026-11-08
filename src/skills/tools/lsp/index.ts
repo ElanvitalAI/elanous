@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../../llm/tool-spec.js';
 // ── Lsp tool barrel + dispatcher ──
 //
 // Phase L2 surface: five operations (hover, goToDefinition,
@@ -9,7 +10,7 @@
 import { fileURLToPath } from 'node:url';
 import { debug } from '../../../debug/log.js';
 import { getUserConfig } from '../../../user-config.js';
-import type { LLMToolSpec } from '../../../llm.js';
+
 import type { LLMToolDef } from '../../../plugins/core/types.js';
 import { getSessionCwd } from '../../../session/working-dir.js';
 import type {

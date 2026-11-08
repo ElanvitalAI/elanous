@@ -25,10 +25,6 @@ export interface ModelTierPrefs {
   llm?: ModelTier;
   /** TTS tier (M2-2 · Phase 2). Same sparse semantics. */
   tts?: ModelTier;
-  /** Embedding tier (M3-2 · Phase 3). RAG retrieval / similarity. */
-  embedding?: ModelTier;
-  /** Vision tier (M3-2 · Phase 3). OCR / image understanding. */
-  vision?: ModelTier;
   /** User's recent daily-average audio minutes — used to power the
    *  slider's live monthly-cost tooltip without re-fetching the cost
    *  tracker on every drag. Updated by the cost subscriber when the
@@ -61,8 +57,6 @@ export function loadModelTierPrefs(): ModelTierPrefs {
       stt: isModelTier(parsed.stt) ? parsed.stt : undefined,
       llm: isModelTier(parsed.llm) ? parsed.llm : undefined,
       tts: isModelTier(parsed.tts) ? parsed.tts : undefined,
-      embedding: isModelTier(parsed.embedding) ? parsed.embedding : undefined,
-      vision: isModelTier(parsed.vision) ? parsed.vision : undefined,
       audioMinPerDay: clampMinPerDay(parsed.audioMinPerDay),
     };
   } catch {
@@ -78,8 +72,6 @@ export function saveModelTierPrefs(patch: Partial<ModelTierPrefs>): ModelTierPre
     stt: patch.stt === undefined ? current.stt : (isModelTier(patch.stt) ? patch.stt : undefined),
     llm: patch.llm === undefined ? current.llm : (isModelTier(patch.llm) ? patch.llm : undefined),
     tts: patch.tts === undefined ? current.tts : (isModelTier(patch.tts) ? patch.tts : undefined),
-    embedding: patch.embedding === undefined ? current.embedding : (isModelTier(patch.embedding) ? patch.embedding : undefined),
-    vision: patch.vision === undefined ? current.vision : (isModelTier(patch.vision) ? patch.vision : undefined),
     audioMinPerDay: patch.audioMinPerDay === undefined
       ? current.audioMinPerDay
       : clampMinPerDay(patch.audioMinPerDay),
@@ -120,14 +112,4 @@ export function activeLlmTier(prefs: ModelTierPrefs): ModelTier {
 /** Active TTS tier (M2-2). */
 export function activeTtsTier(prefs: ModelTierPrefs): ModelTier {
   return prefs.tts ?? DEFAULT_MODEL_TIER;
-}
-
-/** Active embedding tier (M3-2). */
-export function activeEmbeddingTier(prefs: ModelTierPrefs): ModelTier {
-  return prefs.embedding ?? DEFAULT_MODEL_TIER;
-}
-
-/** Active vision tier (M3-2). */
-export function activeVisionTier(prefs: ModelTierPrefs): ModelTier {
-  return prefs.vision ?? DEFAULT_MODEL_TIER;
 }

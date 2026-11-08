@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S2: ClassifyGoal LLM tool ──
 //
 // Expose the Conductor's classify + dispatch pipeline to the LLM as a
@@ -12,7 +13,7 @@
 // responsibility once it commits to a session. ClassifyGoal is a
 // pure read-only query.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   dispatchGoalKind,
 } from '../dispatch.js';

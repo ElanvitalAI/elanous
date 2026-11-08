@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // Sticky-session REPL — multi-turn CLI conversation in one process.
 //
 // `elanous repl` keeps the boot cost (LLM SDK init, session load, debug
@@ -47,7 +48,7 @@ import { resolveModelContextWindow } from '../models/context-window.js';
 import { decideSigintAction } from './sigint.js';
 import { decideSessionStart, observeSessionStart } from '../session/session-start.js';
 import { buildReplayTurnsFromSession } from './replay.js';
-import type { LLMToolSpec, ContentBlock } from '../llm.js';
+import type { ContentBlock } from '../llm.js';
 import { inspectActiveProvider } from '../provider-summary.js';
 import { parse as parseYaml } from 'yaml';
 import type { PendingTaskNotification } from '../agent/task-notification.js';

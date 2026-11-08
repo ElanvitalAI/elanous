@@ -1180,7 +1180,7 @@ describe('gemini(agy) backend answers the folder-trust menu', () => {
 describe('claude backend answers the folder-trust menu (09-29 S6 실물 화면)', () => {
   const screen = (sel: 'no' | 'yes') => [
     'Accessing workspace:',
-    '/Users/user/.elanous/worktrees/demo-a2a1e533/retry-demo.worktrees/s6-retry-0929c',
+    '/Users/TESTONLY/.elanous/worktrees/demo-a2a1e533/retry-demo.worktrees/s6-retry-0929c',
     'Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open',
     "Claude Code'll be able to read, edit, and execute files here.",
     'Security guide',

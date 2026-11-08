@@ -10,26 +10,26 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { ControlSignalsApi, type EmitSignalPayload } from './control-signals-api';
 import { DaemonClient } from './daemon-client';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../test-devices/fake-fetch';
 
 interface FetchCall {
   url: string | URL;
   init?: RequestInit;
 }
 
-const realFetch = globalThis.fetch;
 let calls: FetchCall[] = [];
+let fakeFetch: FakeFetchDevice | undefined;
 
-function mockResponse(opts: { status: number; body: unknown }): typeof fetch {
-  return ((async (input: RequestInfo | URL, init?: RequestInit) => {
-    calls.push({ url: input as string | URL, init });
-    return {
-      ok: opts.status >= 200 && opts.status < 300,
-      status: opts.status,
-      headers: new Headers({ 'content-type': 'application/json' }),
-      json: async () => opts.body,
-      text: async () => JSON.stringify(opts.body),
-    } as unknown as Response;
-  }) as unknown) as typeof fetch;
+function mockResponse(opts: { status: number; body: unknown }, method = 'GET'): void {
+  fakeFetch?.restore();
+  fakeFetch = createFakeFetchDevice([{
+    url: '/v1/control-signals',
+    method,
+    response: (request) => {
+      calls.push({ url: request.url, init: { method: request.method, headers: request.headers, body: request.body ?? undefined } });
+      return Response.json(opts.body, { status: opts.status });
+    },
+  }]);
 }
 
 function makeClient(): DaemonClient {
@@ -41,11 +41,11 @@ function makeClient(): DaemonClient {
 }
 
 beforeEach(() => { calls = []; });
-afterEach(() => { globalThis.fetch = realFetch; });
+afterEach(() => { fakeFetch?.restore(); fakeFetch = undefined; });
 
 describe('ControlSignalsApi.list — GET /v1/control-signals', () => {
   it('hits the bare endpoint with no filters', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse({
       status: 200,
       body: { total: 0, latest: null, countsByKind: {}, items: [] },
     });
@@ -56,7 +56,7 @@ describe('ControlSignalsApi.list — GET /v1/control-signals', () => {
   });
 
   it('serializes filters into the query string', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse({
       status: 200,
       body: { total: 1, items: [] },
     });
@@ -77,7 +77,7 @@ describe('ControlSignalsApi.list — GET /v1/control-signals', () => {
   });
 
   it('drops empty-string filter values from the query string', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse({
       status: 200,
       body: { total: 0, items: [] },
     });
@@ -89,7 +89,7 @@ describe('ControlSignalsApi.list — GET /v1/control-signals', () => {
   });
 
   it('returns the parsed response body verbatim', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse({
       status: 200,
       body: {
         total: 3,
@@ -108,7 +108,7 @@ describe('ControlSignalsApi.list — GET /v1/control-signals', () => {
   });
 
   it('throws with the meta-api-runtime-not-wired hint on 503', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse({
       status: 503,
       body: { error: 'meta-api-runtime-not-wired' },
     });
@@ -119,7 +119,7 @@ describe('ControlSignalsApi.list — GET /v1/control-signals', () => {
 
 describe('ControlSignalsApi.emit — POST /v1/control-signals', () => {
   it('serializes the request body as JSON', async () => {
-    globalThis.fetch = mockResponse({ status: 201, body: { ok: true } });
+    mockResponse({ status: 201, body: { ok: true } }, 'POST');
     const api = new ControlSignalsApi(makeClient());
     const payload: EmitSignalPayload = {
       kind: 'turn-submit-begin',
@@ -134,10 +134,10 @@ describe('ControlSignalsApi.emit — POST /v1/control-signals', () => {
   });
 
   it('throws on 503 (NEXUS PR k 이전 상태)', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse({
       status: 503,
       body: { error: 'meta-api-runtime-not-wired' },
-    });
+    }, 'POST');
     const api = new ControlSignalsApi(makeClient());
     await expect(api.emit({ kind: 'noop', urgency: 'normal' })).rejects.toThrow(
       /meta-api-runtime-not-wired/,

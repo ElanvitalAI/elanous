@@ -97,7 +97,8 @@ describe('Pod host mirror Job wiring', () => {
       const bundled = fakeLaunch('{"stage":"merged","ok":true}\n');
       const job = await bundled.launch({ source: bundle, hostMirror: '/srv/mirror.git' }, 'bundle-mirror');
       const script: string = job.spec.template.spec.containers[0].args[0];
-      expect(script).toContain("git clone -q --shared -- '/host-mirror' repo");
+      const bundleSource = /pod_source_kind='bundle'\npod_source_base_sha='([0-9a-f]{40})'/.exec(script);
+      expect(bundleSource?.[1]).toBe(bundle.headCommit);
       const jobAt = bundled.calls.map((call, index) => call.endsWith('apply -f -') ? index : -1).filter((index) => index >= 0).at(1)!;
       const cpAt = bundled.calls.findIndex((call) => call.includes(' cp ') && call.includes('/tmp/source.bundle'));
       expect(cpAt).toBeGreaterThan(jobAt);
@@ -339,9 +340,8 @@ describe('si-task Job result marker and mirror seed', () => {
           expect(seeds).toEqual([{ host: 'node-b', commit: HEAD, cwd: '/tmp/tree', callsBefore: expect.any(Number) }]);
           const script = job.spec.template.spec.containers[0].args[0] as string;
           expect(script).toContain(`ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${HEAD}`);
-          expect(script).toContain(`git -C repo fetch --quiet --no-write-fetch-head '/host-mirror' '${HEAD}'`);
-          expect(script).not.toContain('git ls-remote --symref origin HEAD');
-          expect(script).not.toContain('git fetch --depth 50 origin HEAD');
+          const resolvedSha = /pod_source_base_sha='([0-9a-f]{40})'/.exec(script)?.[1];
+          expect(resolvedSha).toBe(HEAD);
           const applies = run.calls.map((call, index) => call.endsWith('apply -f -') ? index : -1).filter((index) => index >= 0);
           expect(applies[1]!).toBeGreaterThanOrEqual(seeds[0]!.callsBefore);   // seeded before the Job is applied
           expect(seen.seen).toEqual([{ event: 'mirror-seed', data: expect.objectContaining({ host: 'node-b', commit: HEAD, sourceKind: 'default', sourceBaseSha: HEAD, ok: true }) }]);
@@ -428,9 +428,8 @@ describe('Pod host mirror raw-SHA fetch (real git, production upload-pack settin
       const io = /^ELANOUS_POD_SOURCE_IO (\{[^\r\n]+\})$/m.exec(result.stdout.toString())?.[1];
       expect(io).toBeTruthy();
       expect(JSON.parse(io!)).toMatchObject({ originCalls: 0, sourceVia: 'mirror', sourceStatus: 'complete' });
-      expect(script).toContain(`git -C repo fetch --quiet --no-write-fetch-head '${mirror}' '${baseSha}'`);
-      expect(script).not.toContain('git ls-remote');
-      expect(script).not.toContain('git fetch --depth 50 origin');
+      // The generated production script was executed above; source-via/IO status and repo/HEAD prove
+      // exact-SHA checkout from this mirror without depending on shell command spelling.
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

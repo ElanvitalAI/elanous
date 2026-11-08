@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
@@ -306,15 +307,11 @@ describe('seat document route', () => {
   }, 12_000);
 
   test('default source reader refuses a redirect from an allowed host to an internal address', async () => {
-    const fetched: string[] = [];
-    const originalFetch = globalThis.fetch;
     const published: string[] = [];
-    try {
-      globalThis.fetch = (async (input: RequestInfo | URL, options?: RequestInit) => {
-        fetched.push(String(input));
-        expect(options?.redirect).toBe('manual');
-        return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/private.md' } });
-      }) as unknown as typeof fetch;
+    await withFakeFetchDevice([{ url: 'https://github.com/example/brief.md', response: (request) => {
+      expect(request.redirect).toBe('manual');
+      return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/private.md' } });
+    } }], async (device) => {
       await submitSeatDocRequest({ text: '@CMO https://github.com/example/brief.md 초안', deps: {
         submitExec: async () => ({ id: 'exec-redirect' }),
         getExec: async () => ({ status: 'done', summary: '완료', results: [
@@ -325,9 +322,9 @@ describe('seat document route', () => {
         sendOutbound: () => true,
       } });
       await settled();
-      expect(fetched).toEqual(['https://github.com/example/brief.md']);
+      expect(device.calls().map((call) => call.url)).toEqual(['https://github.com/example/brief.md']);
       expect(published).toEqual(['매출 42% «확인 필요»']);
-    } finally { globalThis.fetch = originalFetch; }
+    });
   });
 
   test('unavailable or ambiguous supplied evidence never invents a citation or drops a number', async () => {

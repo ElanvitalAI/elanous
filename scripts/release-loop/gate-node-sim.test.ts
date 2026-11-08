@@ -17,8 +17,9 @@ test('GATE-MOCK-EVENT-SCENARIOS: distinct injected evidence pins gate judgements
       if (scenario.expectedError) expect(judged.error).toBe(scenario.expectedError);
       if (scenario.planner === 'dispatch') {
         expect(judged.evidence.kind).toBe('dispatch');
-        if (judged.evidence.kind !== 'dispatch' || !scenario.expectedDispatchKinds) throw new Error(`${scenario.id} needs dispatch evidence`);
-        expect(judged.evidence.actions.map((item) => item.kind), scenario.id).toEqual(scenario.expectedDispatchKinds);
+        if (judged.evidence.kind !== 'dispatch') throw new Error(`${scenario.id} needs dispatch evidence`);
+        if (scenario.expectedDispatchKinds) expect(judged.evidence.actions.map((item) => item.kind), scenario.id).toEqual(scenario.expectedDispatchKinds);
+        if (scenario.expectedDispatchSummary) expect(judged.evidence.summary, scenario.id).toEqual(scenario.expectedDispatchSummary);
       }
       if (scenario.planner === 'partial') {
         expect(judged.evidence.kind).toBe('partial');
@@ -31,7 +32,7 @@ test('GATE-MOCK-EVENT-SCENARIOS: distinct injected evidence pins gate judgements
   console.log(['GATE-MOCK-EVENT-SCENARIOS', 'scenario | injected input | gate | decision', ...rows.map((row) =>
     `${row.scenario} | ${row.injectedInput} | ${row.outcome} | ${row.actual}`)].join('\n'));
 
-  expect(rows).toHaveLength(16);
+  expect(rows).toHaveLength(22);
 });
 
 test('GATE-MOCK-EVENT-SCENARIOS: injected HOLDs and malformed sweep summaries stay HOLD', async () => {

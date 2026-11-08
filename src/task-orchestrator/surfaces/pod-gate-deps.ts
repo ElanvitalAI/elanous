@@ -116,9 +116,11 @@ export function gateDepsInstallScript(o: { log: string; installSlots: number; de
     'irc=0; gate_deps_need=',
     `for t in ${GATE_DEPS_TREES.join(' ')}; do gate_deps_link "$t" >> ${log} 2>&1 || gate_deps_need="$gate_deps_need $t"; done`,
     'if [ -n "$gate_deps_need" ]; then',
+    '  if [ "${ELANOUS_GATE_EXTERNAL_NODE_MODULES:-0}" = 1 ]; then echo "ELANOUS_GATE_VOLUME_REF_REJECTED node_modules gate-deps-mismatch:$gate_deps_need"; irc=5; else',
     ...(o.installSlots > 0 ? [`  install_slot_acquire >> ${log} 2>&1`] : []),
     `  for t in $gate_deps_need; do (cd "$t" && bun install) >> ${log} 2>&1; irc=$?; [ "$irc" -eq 0 ] || break; done`,
     ...(o.installSlots > 0 ? ['  install_slot_release'] : []),
+    '  fi',
     'fi',
   ].join('\n');
 }

@@ -505,7 +505,6 @@ export const SLASH_COMMANDS: SlashCommand[] = ([
   { name: 'delta', aliases: ['diffs'], description: 'Source delta browser — open the latest turn-scoped file diff popup', subcommands: ['open', 'help'] },
   { name: 'theme', aliases: [], description: 'Theme controls — list / switch / use / reset / preview / export', subcommands: ['list', 'switch', 'use', 'reset', 'preview', 'export'] },
   { name: 'debug', aliases: [], description: 'Runtime tracer + surfaces — /debug on (mirror+file) · off · file (quiet trail) · diag (loud trail) · render on|off (렌더 무음, 레벨과 직교); surfaces: window / popup / workbench / promote', subcommands: ['on', 'off', 'file', 'diag', 'mirror', 'verbose', 'render', 'level', 'toggle', 'tail', 'clear', 'path', 'view', 'status', 'window', 'popup', 'workbench'] },
-  { name: 'rebind', aliases: [], description: 'Manage runtime input bindings — list / show / add / reset / export / import', subcommands: ['actions', 'reset', 'export', 'import', 'help'] },
   { name: 'api-allow', aliases: ['api'], description: 'api_call allowlist — add/remove/list hosts the model may call', subcommands: ['add', 'remove', 'list', 'clear'] },
   { name: 'prompt', aliases: ['prompts'], description: 'Prompt Bank — list / show / search / select / inject / explain / enable / disable / config', subcommands: ['list', 'show', 'search', 'select', 'inject', 'explain', 'enable', 'disable', 'config'] },
   { name: 'history', aliases: ['hist', 'inputs'], description: 'Input history — list / find / show / clear', subcommands: ['list', 'find', 'show', 'clear'] },

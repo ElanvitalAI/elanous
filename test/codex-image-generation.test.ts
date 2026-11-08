@@ -20,6 +20,7 @@ import {
   streamCodexResponsesEvents,
   type LLMStreamEvent,
 } from '../src/llm';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 describe('toCodexResponsesTools — server-tool opt-in', () => {
   test('returns undefined when neither tools nor serverTools are present', () => {
@@ -85,13 +86,13 @@ describe('toCodexResponsesTools — server-tool opt-in', () => {
 
 type Capture = { url: string; headers: Record<string, string>; body: any };
 
-function installFetch(capture: Capture[], sseBody: string): typeof fetch {
-  const prior = globalThis.fetch;
-  const stub: any = async (url: string, init: any) => {
-    const hdrs = init?.headers as Record<string, string>;
-    let parsed: any = init?.body;
-    try { if (typeof init?.body === 'string') parsed = JSON.parse(init.body); } catch {}
-    capture.push({ url, headers: { ...hdrs }, body: parsed });
+function installFetch(capture: Capture[], sseBody: string): FakeFetchDevice {
+  return createFakeFetchDevice([{
+    url: '/backend-api/codex/responses', method: 'POST', response: (request) => {
+    const hdrs = request.headers;
+    let parsed: any = request.body;
+    try { if (typeof request.body === 'string') parsed = JSON.parse(request.body); } catch {}
+    capture.push({ url: request.url, headers: { ...hdrs }, body: parsed });
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       start(controller) {
@@ -103,9 +104,7 @@ function installFetch(capture: Capture[], sseBody: string): typeof fetch {
       status: 200,
       headers: { 'content-type': 'text/event-stream' },
     });
-  };
-  globalThis.fetch = stub;
-  return prior;
+  } }]);
 }
 
 async function collect(gen: AsyncGenerator<LLMStreamEvent>): Promise<LLMStreamEvent[]> {
@@ -114,12 +113,12 @@ async function collect(gen: AsyncGenerator<LLMStreamEvent>): Promise<LLMStreamEv
   return out;
 }
 
-let prior: typeof fetch;
+let device: FakeFetchDevice;
 let calls: Capture[];
 
 describe('streamCodexResponsesEvents — image_generation_call output', () => {
   beforeEach(() => { calls = []; });
-  afterEach(() => { globalThis.fetch = prior; });
+  afterEach(() => { device.restore(); });
 
   test('yields image event with base64 result + mediaType image/png', async () => {
     const sse = [
@@ -128,7 +127,7 @@ describe('streamCodexResponsesEvents — image_generation_call output', () => {
       'data: [DONE]',
       '',
     ].join('\n');
-    prior = installFetch(calls, sse);
+    device = installFetch(calls, sse);
     const events = await collect(streamCodexResponsesEvents(
       'https://chatgpt.com/backend-api/codex/responses',
       'bearer',
@@ -156,7 +155,7 @@ describe('streamCodexResponsesEvents — image_generation_call output', () => {
       'data: [DONE]',
       '',
     ].join('\n');
-    prior = installFetch(calls, sse);
+    device = installFetch(calls, sse);
     const events = await collect(streamCodexResponsesEvents(
       'https://chatgpt.com/backend-api/codex/responses',
       'bearer',
@@ -174,7 +173,7 @@ describe('streamCodexResponsesEvents — image_generation_call output', () => {
       'data: [DONE]',
       '',
     ].join('\n');
-    prior = installFetch(calls, sse);
+    device = installFetch(calls, sse);
     const events = await collect(streamCodexResponsesEvents(
       'https://chatgpt.com/backend-api/codex/responses',
       'bearer',
@@ -194,7 +193,7 @@ describe('streamCodexResponsesEvents — image_generation_call output', () => {
       'data: [DONE]',
       '',
     ].join('\n');
-    prior = installFetch(calls, sse);
+    device = installFetch(calls, sse);
     const events = await collect(streamCodexResponsesEvents(
       'https://chatgpt.com/backend-api/codex/responses',
       'bearer',
@@ -212,7 +211,7 @@ describe('streamCodexResponsesEvents — image_generation_call output', () => {
       'data: [DONE]',
       '',
     ].join('\n');
-    prior = installFetch(calls, sse);
+    device = installFetch(calls, sse);
     const events = await collect(streamCodexResponsesEvents(
       'https://chatgpt.com/backend-api/codex/responses',
       'bearer',

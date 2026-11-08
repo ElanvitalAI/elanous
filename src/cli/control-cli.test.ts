@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DEFAULT_CONTROL_PORT, ensureControlTokens } from '../control-plane/server.js';
 import { issueMemberToken, machineForToken } from '../control-plane/member-tokens.js';
-import { simInProcessCli } from '../ux-sim/in-process-cli.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 import { withSimClock } from '../ux-sim/fake-clock.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -87,7 +87,7 @@ async function command(dir: string, ...args: string[]) {
   const previousHome = process.env.HOME;
   process.env.HOME = dir;
   try {
-    const result = await simInProcessCli(args, { stateRoot: dir, allowPaths: [path] });
+    const result = await simCli(args, { stateRoot: dir, allowPaths: [path] });
     return { code: result.exitCode, stdout: result.stdout, stderr: result.stderr };
   } finally {
     if (previousHome === undefined) delete process.env.HOME;

@@ -8,7 +8,7 @@ const declaration: MachinePoolDeclaration = { purpose: 'gate', fanoutGroupId: 'g
   fanoutGroup: { shard: { kind: 'gate', input: 'gate-shard', result: 'gate-result', fingerprint: 'runtime-env' } },
   fingerprint: { runtime: 'bun-test', environment: 'linux', skillPacks: [] }, cleanup: { procedure: 'clean-v1', verify: 'verify-v1' } };
 const config = { pod: { warmPoolProfile: 'gate', warmPool: { namespace: 'test', imageRepository: 'registry.example/elanous',
-  imageDigest: digest, lockHash: 'b'.repeat(64), architecture: 'amd64', hostProbeUrl: 'http://host.orb.internal:10001/health',
+  imageDigest: digest, baseImageDigest: 'sha256:' + 'f'.repeat(64), lockHash: 'b'.repeat(64), architecture: 'amd64', hostProbeUrl: 'http://host.orb.internal:10001/health',
   prodProbeUrl: 'http://core.elanous-prod:10002/', sourceUrl: 'https://github.com/ElanvitalAI/elanous.git',
   templates: [{ host: 'gcp1', tier: 'standard', nodeName: 'gcp1-node' }] } },
   harness: { imageCommit: 'c'.repeat(40), podPool: 'gcp1-context' } };
@@ -30,6 +30,21 @@ test('provider config rejects pool members without a matching host or immutable 
   expect(() => assembleWarmPoolProviderConfig({ config, controlUrl: 'https://control.example:8413',
     memberToken: 'd'.repeat(64), machineTokens: { gcp1: 'e'.repeat(64) },
     machinePools: [{ ...declaration, members: [{ ...declaration.members[0]!, role: 'assigner' }] }] })).toThrow('cannot execute');
+});
+
+test('provider config keeps architecture matching exact unless an explicit supported allowlist is set', () => {
+  const input = { config, controlUrl: 'https://control.example:8413', memberToken: 'd'.repeat(64),
+    machineTokens: { gcp1: 'e'.repeat(64) }, machinePools: [declaration] };
+  expect(assembleWarmPoolProviderConfig(input).allowedArchitectures).toBeUndefined();
+  const multiArch = { ...config, pod: { ...config.pod, warmPool: {
+    ...config.pod.warmPool, allowedArchitectures: ['amd64', 'arm64'],
+  } } };
+  expect(assembleWarmPoolProviderConfig({ ...input, config: multiArch }).allowedArchitectures).toEqual(['amd64', 'arm64']);
+  const invalid = { ...multiArch, pod: { ...multiArch.pod, warmPool: {
+    ...multiArch.pod.warmPool, allowedArchitectures: ['amd64', 'armv7'],
+  } } };
+  expect(() => assembleWarmPoolProviderConfig({ ...input, config: invalid }))
+    .toThrow('pod.warmPool.allowedArchitectures must be a unique list of amd64 and/or arm64');
 });
 
 

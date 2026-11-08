@@ -24,32 +24,12 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { listPwaInstances, type PwaInstanceListing } from './pwa-registry.js';
-import { probeTailscale, type TailscaleProbe } from '../nexus/onboarding/tailscale-probe.js';
+import { listPwaInstances } from './pwa-registry.js';
+import type { PwaShowOpts, PwaShowResult } from './pwa-show-contract.js';
+export type { PwaShowOpts, PwaShowResult } from './pwa-show-contract.js';
+import { probeTailscale } from '../nexus/onboarding/tailscale-probe.js';
 import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 import { debug } from '../debug/log.js';
-
-export interface PwaShowOpts {
-  /** Format. Default 'human'. */
-  format?: 'human' | 'json';
-  /** Override the cwd used for matching (tests). */
-  cwd?: string;
-  /** Test seam — read registry. */
-  listFn?: (opts: { prune?: boolean }) => PwaInstanceListing[];
-  /** Test seam — Tailscale probe (for tailnet URL host). */
-  probeFn?: () => Promise<TailscaleProbe>;
-  /** Output sink. */
-  out?: { log: (s: string) => void; error: (s: string) => void };
-}
-
-export interface PwaShowResult {
-  exitCode: number;
-  instance?: PwaInstanceListing;
-  urls?: {
-    loopback: string;
-    tailnet?: string;
-  };
-}
 
 export async function runPwaShow(opts: PwaShowOpts = {}): Promise<PwaShowResult> {
   const out = opts.out ?? console;

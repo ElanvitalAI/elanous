@@ -1,8 +1,9 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import { releaseLedgerRoot } from '../instance/resolve.js';
-import { contextNow, type ContextNowAnswer, type ContextFact } from '../context-bus/context-now.js';
+import { contextNow, releaseFactSummary, type ContextNowAnswer, type ContextFact } from '../context-bus/context-now.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import { debug } from '../debug/log.js';
 import { requestConfirmation, type ConfirmOpts, type ConfirmResult } from '../hitl/confirm.js';
@@ -20,7 +21,7 @@ export const RELEASE_STATUS_SPEC: LLMToolSpec = {
     + 'topic=features: 지정 판의 모든 피처·칸(끝난 칸 포함).\n'
     + 'topic=cell: id 칸 하나의 상태·근거와 살핀 판.\n'
     + 'topic=schedule: 발행 이후 판의 컷·착지·발행·동결 일정.\n'
-    + 'topic=ops: 도는 런·발행·늦은 스케줄·자리·열린 결정의 출처 있는 개관.\n'
+    + 'topic=ops: 도는 런·발행 국면·현재 노드·다음 행위·게이트 진행·회귀·영수증·면제·긴급 전환·예상 발행 시각·늦은 스케줄·자리·열린 결정의 출처 있는 개관. «발행 상황» 질문은 이 topic으로 공용 맥락 버스에서 답한다.\n'
     + 'topic 과 action 을 동시에 쓰면 오류를 돌려받는다 — 둘 중 하나만 보낸다. topic 은 읽을 대상, action 은 단독 조회의 짧은 요약.\n'
     + 'topic=features 에서는 owner·status 로 칸을 필터링할 수 있다.\n'
     + '발행·버전·피처·체크리스트·칸·컷·일정·운영 상태 질문은 Grep·ListDir·파일 검색보다 이 도구를 먼저 부른다 — 그 답은 파일이 아니라 원장에 있다.',
@@ -165,7 +166,7 @@ export function dispatchReleaseStatus(rawArgs: Record<string, unknown>, deps: Re
     const kinds: ContextFact['kind'][] = ['run', 'release', 'schedule-late', 'seat', 'decision'];
     const facts = answer.facts.filter(fact => kinds.includes(fact.kind));
     debug.log('release.tool', 'status', { action: 'status', topic, version: requested ?? null });
-    return { text: facts.length ? facts.map(fact => JSON.stringify(fact)).join('\n') : '운영 개관: 관측된 사실 없음', structured: { facts } };
+    return { text: facts.length ? facts.map(fact => fact.kind === 'release' ? releaseFactSummary(fact) : JSON.stringify(fact)).join('\n') : '운영 개관: 관측된 사실 없음', structured: { facts } };
   }
   const dev = checklistDevVersion(deps.devVersion?.() ?? devVersion());
   if (args.action !== undefined) {

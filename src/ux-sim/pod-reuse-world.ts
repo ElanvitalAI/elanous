@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,9 @@ import { runWarmPoolReuseSimulation } from './warm-pool-reuse-sim.js';
 import { createWorld, destroyWorld, runWarmPoolReuseWorldScenario } from './world.js';
 import { getTestStateRoot } from '../nexus/paths.js';
 import { createHostMirrorMountAdapter } from './pod-reuse-shared-fake-boundary.js';
+import { currentGateVolumeRuntimeIdentity, gateExternalVolumeContentSha256, gateExternalVolumeIdentitySha256,
+  GATE_VOLUME_REF_IDENTITY_FILE, sealGateExternalVolume, verifyGateExternalVolumeRef } from '../task-orchestrator/surfaces/pod-gate-volume-ref.js';
+import { podCommandJobManifest } from '../task-orchestrator/surfaces/pod-command-job.js';
 
 export interface PodSourceIoMeasurement {
   sourceBytes: number;
@@ -20,6 +23,17 @@ export interface PodSourceIoMeasurement {
   hostMirrorAdapter: { readOnly: boolean; bytesRead: number; bytesWritten: number; writeRejected: boolean };
   reference: { objectStoreBytes: number; sharedObjectAlternate: boolean; readBytes: number; setupMs: number; digest: string; via: string };
   copy: { objectStoreBytes: number; readBytes: number; setupMs: number; digest: string; via: string };
+  nodeModules: {
+    sourceBytes: number;
+    mountPath: string;
+    hostPath: string;
+    readOnly: boolean;
+    reference: { materializedBytes: number; readBytes: number; setupMs: number; verificationMs: number; digest: string; via: string };
+    copy: { materializedBytes: number; readBytes: number; setupMs: number; verificationMs: number; digest: string; via: string };
+    writeRejected: boolean;
+    bytesWritten: number;
+    writableControlWriteBytes: number;
+  };
 }
 
 export interface PodReuseWorldResult {
@@ -29,6 +43,33 @@ export interface PodReuseWorldResult {
   scenario: Awaited<ReturnType<typeof runWarmPoolReuseWorldScenario>>;
   admission: ReturnType<typeof recommendConcurrency>;
   job: Record<string, unknown>;
+}
+
+type NodeModulesJobSpec = { template: { spec: {
+  volumes?: Array<{ name: string; hostPath?: { path?: string; type?: string } }>;
+  containers: Array<{ volumeMounts?: Array<{ name: string; mountPath?: string; readOnly?: boolean }> }>;
+} } };
+
+function createNodeModulesMountAdapter(job: Record<string, unknown>, outputPath: string) {
+  const spec = job.spec as NodeModulesJobSpec | undefined;
+  const mount = spec?.template.spec.containers[0]?.volumeMounts?.find(({ name }) => name === 'gate-node-modules');
+  const volume = spec?.template.spec.volumes?.find(({ name }) => name === 'gate-node-modules');
+  if (!mount || mount.mountPath !== '/external/node_modules' || !volume?.hostPath?.path
+    || realpathSync(outputPath) !== realpathSync(volume.hostPath.path)) {
+    throw new Error('gate Job node_modules mount does not map to its simulated host path');
+  }
+  const readOnly = mount.readOnly === true;
+  let bytesWritten = 0;
+  return {
+    readOnly,
+    get bytesWritten() { return bytesWritten; },
+    read(path: string) { return readFileSync(join(outputPath, path)); },
+    write(path: string, bytes: Buffer) {
+      if (readOnly) throw new Error('node_modules mount is read-only');
+      writeFileSync(join(outputPath, path), bytes);
+      bytesWritten += bytes.byteLength;
+    },
+  };
 }
 
 function measureSourceIo(): PodSourceIoMeasurement {
@@ -103,6 +144,101 @@ function measureSourceIo(): PodSourceIoMeasurement {
     const copyObjectStoreBytes = sumGitObjectPayloadBytes(join(copyCwd, 'repo', '.git', 'objects'));
     const digest = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 
+    const nodeModulesRoot = join(root, 'node_modules-host');
+    const referenceJobRoot = join(root, 'node-modules-reference-job');
+    const referenceMountPath = join(referenceJobRoot, 'node_modules');
+    const copyJobRoot = join(root, 'node-modules-copy-job');
+    const copyMountPath = join(copyJobRoot, 'node_modules');
+    const writableControlPath = join(root, 'node-modules-writable-control');
+    mkdirSync(join(nodeModulesRoot, '@fixture', 'probe'), { recursive: true });
+    mkdirSync(referenceJobRoot);
+    mkdirSync(copyJobRoot);
+    mkdirSync(writableControlPath);
+    writeFileSync(join(nodeModulesRoot, '@fixture', 'probe', 'index.js'), Buffer.alloc(192 * 1024, 0x62));
+    writeFileSync(join(nodeModulesRoot, '@fixture', 'probe', 'package.json'), '{"name":"@fixture/probe","version":"1.0.0"}\n');
+    const materializedBytes = (path: string, dependencyRoot: string): number => {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink()) return 0;
+      if (stat.isDirectory()) return readdirSync(path, { withFileTypes: true }).reduce((sum, entry) => {
+        if (path === dependencyRoot && entry.name === GATE_VOLUME_REF_IDENTITY_FILE) return sum;
+        return sum + materializedBytes(join(path, entry.name), dependencyRoot);
+      }, 0);
+      return stat.isFile() ? stat.size : 0;
+    };
+    const nodeModulesSourceBytes = materializedBytes(nodeModulesRoot, nodeModulesRoot);
+    const imageDigest = `sha256:${'a'.repeat(64)}`;
+    const lockSha256 = createHash('sha256').update('pod-reuse-node-modules-lock-fixture').digest('hex');
+    const sourceCommit = 'b'.repeat(40);
+    const runtimeIdentity = currentGateVolumeRuntimeIdentity(imageDigest);
+    const identity = sealGateExternalVolume(nodeModulesRoot, {
+      kind: 'node_modules',
+      runtimeIdentity,
+      lockSha256,
+    });
+    const nodeModulesRef = { kind: 'node_modules' as const, hostPath: nodeModulesRoot,
+      contentSha256: identity.contentSha256!, identitySha256: gateExternalVolumeIdentitySha256(identity) };
+    const nodeModulesJob = podCommandJobManifest({
+      name: 'pod-reuse-node-modules-io', namespace: 'elanous-test', image: 'elanous-harness:sim',
+      repoUrl: 'https://github.com/ElanvitalAI/elanous.git', command: ['true'], skills: [], clone: true,
+      source: { kind: 'commit', sha: sourceCommit }, provenanceGate: true,
+      provenance: { kind: 'gate-shard', entrance: 'release-run' } as never,
+      externalVolumeRefs: [nodeModulesRef],
+      externalVolumeExpectations: { imageDigest, lockSha256, sourceCommit }, deadlineSeconds: 60,
+    });
+    const nodeSpec = nodeModulesJob.spec as NodeModulesJobSpec;
+    const nodeMount = nodeSpec.template.spec.containers[0]?.volumeMounts?.find(({ name }) => name === 'gate-node-modules');
+    const nodeVolume = nodeSpec.template.spec.volumes?.find(({ name }) => name === 'gate-node-modules');
+    if (!nodeMount || nodeMount.mountPath !== '/external/node_modules' || nodeMount.readOnly !== true
+      || nodeVolume?.hostPath?.path !== nodeModulesRoot || nodeVolume.hostPath.type !== 'Directory') {
+      throw new Error('production gate Job omitted the read-only node_modules host reference');
+    }
+    const referenceVerificationStart = performance.now();
+    const verified = verifyGateExternalVolumeRef(nodeModulesRoot, {
+      ...nodeModulesRef, runtimeIdentity, lockSha256,
+    });
+    if (!verified.ok) throw new Error(`production node_modules external ref did not verify: ${verified.reason}`);
+    const referenceVerificationMs = performance.now() - referenceVerificationStart;
+    const nodeModulesDigest = identity.contentSha256!;
+    const referenceSetupStart = performance.now();
+    symlinkSync(nodeModulesRoot, referenceMountPath, 'dir');
+    const nodeModulesReferenceMs = performance.now() - referenceSetupStart;
+    const referenceMaterializedBytes = materializedBytes(referenceJobRoot, referenceMountPath);
+    const referenceMount = createNodeModulesMountAdapter(nodeModulesJob, referenceMountPath);
+    const referenceReadBytes = referenceMount.read('@fixture/probe/index.js').byteLength;
+    let nodeModulesWriteRejected = false;
+    try {
+      referenceMount.write('.write-probe', Buffer.from('read-only probe'));
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('node_modules mount is read-only')) throw error;
+      nodeModulesWriteRejected = true;
+    }
+    if (gateExternalVolumeContentSha256(nodeModulesRoot) !== nodeModulesDigest)
+      throw new Error('node_modules read-only write attempt changed the external ref');
+    const copyNodeModulesStart = performance.now();
+    cpSync(nodeModulesRoot, copyMountPath, { recursive: true,
+      filter: source => source !== join(nodeModulesRoot, GATE_VOLUME_REF_IDENTITY_FILE) });
+    const nodeModulesCopyMs = performance.now() - copyNodeModulesStart;
+    const nodeModulesCopyBytes = materializedBytes(copyMountPath, copyMountPath);
+    const copyVerificationStart = performance.now();
+    const copiedNodeModulesDigest = gateExternalVolumeContentSha256(copyMountPath);
+    const copyVerificationMs = performance.now() - copyVerificationStart;
+    if (copiedNodeModulesDigest !== nodeModulesDigest) throw new Error('copied node_modules content digest differs from the external ref');
+    const copyReadBytes = readFileSync(join(copyMountPath, '@fixture/probe/index.js')).byteLength;
+    const writableControlJob = structuredClone(nodeModulesJob);
+    const writableControlSpec = writableControlJob.spec as NodeModulesJobSpec;
+    const writableControlMountSpec = writableControlSpec.template.spec.containers[0]?.volumeMounts
+      ?.find(({ name }) => name === 'gate-node-modules');
+    const writableControlVolume = writableControlSpec.template.spec.volumes?.find(({ name }) => name === 'gate-node-modules');
+    if (!writableControlMountSpec || !writableControlVolume?.hostPath) throw new Error('gate Job node_modules volume is missing');
+    writableControlMountSpec.readOnly = false;
+    writableControlVolume.hostPath.path = writableControlPath;
+    const writableControlMount = createNodeModulesMountAdapter(writableControlJob, writableControlPath);
+    const controlWriteProbe = Buffer.from('writable control');
+    writableControlMount.write('.write-probe', controlWriteProbe);
+    if (statSync(join(writableControlPath, '.write-probe')).size !== controlWriteProbe.byteLength
+      || writableControlMount.bytesWritten !== controlWriteProbe.byteLength)
+      throw new Error('writable node_modules control did not write the probe');
+
     return {
       sourceBytes,
       sourceManifestReadOnly: sourceMount.readOnly === true,
@@ -112,6 +248,21 @@ function measureSourceIo(): PodSourceIoMeasurement {
         bytesWritten: hostMirrorAdapter.bytesWritten, writeRejected: hostMirrorWriteRejected },
       reference: { objectStoreBytes: referenceObjectStoreBytes, sharedObjectAlternate, readBytes: referenceRead.byteLength, setupMs: referenceMs, digest: digest(referenceRead), via: 'production-pod-source-script/shared-mirror' },
       copy: { objectStoreBytes: copyObjectStoreBytes, readBytes: copiedRead.byteLength, setupMs: copyMs, digest: digest(copiedRead), via: 'git-clone-no-hardlinks' },
+      nodeModules: {
+        sourceBytes: nodeModulesSourceBytes,
+        mountPath: nodeMount.mountPath,
+        hostPath: nodeVolume.hostPath.path,
+        readOnly: referenceMount.readOnly,
+        reference: { materializedBytes: referenceMaterializedBytes, readBytes: referenceReadBytes,
+          setupMs: nodeModulesReferenceMs, verificationMs: referenceVerificationMs,
+          digest: verified.identity.contentSha256!, via: 'production-gate-job/node_modules-hostPath-simulated-link' },
+        copy: { materializedBytes: nodeModulesCopyBytes, readBytes: copyReadBytes, setupMs: nodeModulesCopyMs,
+          verificationMs: copyVerificationMs,
+          digest: copiedNodeModulesDigest, via: 'recursive-copy' },
+        writeRejected: nodeModulesWriteRejected,
+        bytesWritten: referenceMount.bytesWritten,
+        writableControlWriteBytes: writableControlMount.bytesWritten,
+      },
     };
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -11,7 +11,9 @@ export type MacrophageScrapKind =
   | 'orphan-job'
   | 'merged-land-queue-row'
   | 'expired-hold'
-  | 'stale-receipt';
+  | 'stale-receipt'
+  | 'release-node-failure'
+  | 'merge-train-observation';
 
 export type MacrophageAction =
   | 'attempt-repair'
@@ -45,6 +47,10 @@ export interface MacrophageEvidence {
   mergedMainline?: boolean;
   queueRow?: string;
   worktreePath?: string;
+  nodeId?: string;
+  failureSignature?: 'configuration-missing' | 'type-error' | 'ledger-unconfigured' | 'unknown';
+  failureDetail?: string;
+  trainEventType?: 'merge-train.batch' | 'merge-train.verdict' | 'merge-train.incident';
 }
 
 export interface MacrophageScrap {
@@ -61,6 +67,8 @@ export interface MacrophageEvent {
   result: string;
   action: MacrophageAction;
   applied: boolean;
+  sourceNodeId?: string;
+  failureSignature?: MacrophageEvidence['failureSignature'];
 }
 
 export interface MacrophageHealInput {
@@ -135,10 +143,23 @@ function decide(scrap: MacrophageScrap, input: MacrophageHealInput): { action: M
       return evidence.receiptStale === true && evidence.receiptVerified === true && terminalRun(evidence.ownerRunStatus)
         ? { action: 'archive-receipt', evidence: `stale and verified; owner run=${evidence.ownerRunStatus}` }
         : { action: 'retain', evidence: `stale=${evidence.receiptStale ?? 'unknown'}; verified=${evidence.receiptVerified ?? 'unknown'}; owner run=${evidence.ownerRunStatus ?? 'unknown'}` };
+    case 'release-node-failure': {
+      const detail = (evidence.failureDetail ?? 'diagnostic unavailable').slice(0, 400);
+      const signature = evidence.failureSignature ?? 'unknown';
+      const node = evidence.nodeId ?? 'unknown-node';
+      if (signature === 'type-error') return { action: 'attempt-repair', evidence: `failure signature=${signature}; node=${node}; detail=${detail}` };
+      if (signature === 'configuration-missing' || signature === 'ledger-unconfigured')
+        return { action: 'open-cell', evidence: `failure signature=${signature}; node=${node}; detail=${detail}` };
+      return { action: scrap.owner ? 'notify-owner' : 'retain', evidence: `failure signature=unknown; node=${node}; owner=${scrap.owner ?? 'unverified'}; detail=${detail}` };
+    }
+    case 'merge-train-observation':
+      return { action: 'retain', evidence: `observed ${evidence.trainEventType ?? 'unknown train event'}; no train repair policy is attached; payload=${evidence.detail ?? 'unavailable'}` };
   }
 }
 
-const mutatingActions = new Set<MacrophageAction>(['triage-draft', 'remove-resource', 'release-hold', 'archive-receipt', 'remove-queue-row']);
+const mutatingActions = new Set<MacrophageAction>([
+  'triage-draft', 'quarantine-test', 'regenerate', 'remove-resource', 'release-hold', 'archive-receipt', 'remove-queue-row',
+]);
 
 /** Emit one evidence-backed decision per scrap by default; only simulation applies changes to its in-memory world. */
 export function runMacrophageHeal(input: MacrophageHealInput): MacrophageHealResult {
@@ -159,7 +180,8 @@ export function runMacrophageHeal(input: MacrophageHealInput): MacrophageHealRes
     const result = mode === 'simulation'
       ? applied ? `simulated ${decision.action}` : `simulated recommendation ${decision.action}`
       : `planned ${decision.action}; no cleanup applied`;
-    return { id: scrap.id, kind: scrap.kind, evidence: decision.evidence, result, action: decision.action, applied };
+    return { id: scrap.id, kind: scrap.kind, evidence: decision.evidence, result, action: decision.action, applied,
+      ...(scrap.kind === 'release-node-failure' ? { sourceNodeId: scrap.evidence.nodeId, failureSignature: scrap.evidence.failureSignature ?? 'unknown' } : {}) };
   });
   const removed = new Set(events.filter((event) => event.applied).map((event) => event.id));
   return { status: mode === 'simulation' ? 'simulated' : 'planned', events,

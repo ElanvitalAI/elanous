@@ -9,11 +9,12 @@ import {
   handleAudioStt,
   resolveAudioSttProviderId,
 } from '../src/nexus/api/audio-stt.js';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
-type FetchFn = typeof globalThis.fetch;
-const realFetch = globalThis.fetch;
+let fetchDevice: FakeFetchDevice | undefined;
 afterEach(() => {
-  globalThis.fetch = realFetch;
+  fetchDevice?.restore();
+  fetchDevice = undefined;
   delete process.env.ELANOUS_AUDIO_STT_PROVIDER;
 });
 
@@ -136,12 +137,11 @@ describe('handleAudioStt · multipart validation', () => {
 
 describe('handleAudioStt · provider call (mocked fetch)', () => {
   test('happy path → 200 with text + language + duration', async () => {
-    const stub = (async () =>
+    fetchDevice = createFakeFetchDevice([{ url: '/v1/audio/transcriptions', method: 'POST', response: () =>
       new Response(
         JSON.stringify({ text: '안녕하세요', language: 'ko', duration: 1.5 }),
         { status: 200, headers: { 'content-type': 'application/json' } },
-      )) as unknown as FetchFn;
-    globalThis.fetch = stub;
+      ) }]);
     const { body, contentType } = multipartBody([{
       name: 'file',
       value: { bytes: new Uint8Array([1,2,3,4]), filename: 'sample.m4a', type: 'audio/m4a' },
@@ -163,12 +163,11 @@ describe('handleAudioStt · provider call (mocked fetch)', () => {
     expect(json.language).toBe('ko');
     expect(json.durationMs).toBe(1500);
     expect(json.providerId).toBe('openai-whisper');
+    expect(fetchDevice.calls()).toMatchObject([{ method: 'POST', status: 200, body: expect.stringContaining('form-data:') }]);
   });
 
   test('provider failure → 502 stt-failed', async () => {
-    const stub = (async () =>
-      new Response('rate limited', { status: 429 })) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    fetchDevice = createFakeFetchDevice([{ url: '/v1/audio/transcriptions', method: 'POST', response: () => new Response('rate limited', { status: 429 }) }]);
     const { body, contentType } = multipartBody([{
       name: 'file',
       value: { bytes: new Uint8Array([1,2,3,4]), filename: 'x.m4a', type: 'audio/m4a' },
@@ -188,9 +187,7 @@ describe('handleAudioStt · provider call (mocked fetch)', () => {
   });
 
   test('CORS allow-origin set on success response', async () => {
-    const stub = (async () =>
-      new Response(JSON.stringify({ text: 'hi', duration: 0.5 }), { status: 200 })) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    fetchDevice = createFakeFetchDevice([{ url: '/v1/audio/transcriptions', method: 'POST', response: () => new Response(JSON.stringify({ text: 'hi', duration: 0.5 }), { status: 200 }) }]);
     const { body, contentType } = multipartBody([{
       name: 'file',
       value: { bytes: new Uint8Array([1,2,3,4]), filename: 'x.wav', type: 'audio/wav' },

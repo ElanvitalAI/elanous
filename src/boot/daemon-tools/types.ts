@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // MVP M1.5 A.2 — daemon tool surface types.
 //
 // Common shapes for the read-only tool catalog the daemon exposes
@@ -5,7 +6,7 @@
 // surface is a small, security-reviewed subset — Read · Grep ·
 // WebSearch — gated behind `path-guard.ts` for fs access.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { FeedbackEnvelope } from '../../feedback/envelope.js';
 import type { IngestionEntry } from '../../agent-substrate/execution/ingestion-policy.js';
 import type { SurfaceKind } from '../../agent/surface-ux/types.js';

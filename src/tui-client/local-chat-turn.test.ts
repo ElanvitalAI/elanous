@@ -7,7 +7,7 @@ import { debug } from '../debug/log.js';
 import { BackgroundJobStatus } from '../tui/chat/background-job-status.js';
 import { appendMessage, createSession, loadSession, setActiveSessionId } from '../session/index.js';
 import { ptyAvailable, startPty } from '../pty-shell/registry.js';
-import { CHAT_DEFAULTS } from '../user-config.js';
+import { CHAT_DEFAULTS } from '../user-config/chat.js';
 import type { CompactProvider } from '../compact/provider.js';
 import { compactNextTuiSession, isCompactCommand, type NextTuiCompactOutcome } from '../tui/slash/compact.js';
 import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';

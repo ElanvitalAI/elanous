@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── RefsGC ToolRuntime (Coding Pipeline P5 hygiene · Trail H) ──
 //
 // `~/.cache/elanous-refs/<host>/<owner>/<repo>` is elanous's scratch area
@@ -29,7 +30,7 @@
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 
 const CACHE_ROOT_DEFAULT = join(homedir(), '.cache', 'elanous-refs');

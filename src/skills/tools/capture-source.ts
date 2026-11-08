@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // H6 P6 · LLM tools for capture source discovery + dispatch.
 //
 // Two tools on top of the `CaptureSourceRegistry`:
@@ -10,7 +11,7 @@
 // Both tools are T1 read-only (D7). Happy-path output contract matches
 // the rest of the H6 family: `{output, metadata, isError?}`.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { InputSourceRef } from '../../input/input-source-kind.js';
 import {
   defaultCaptureSourceRegistry,

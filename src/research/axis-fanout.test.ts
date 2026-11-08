@@ -370,24 +370,24 @@ describe('research axis fanout', () => {
       const { debug } = await import(${JSON.stringify(join(process.cwd(), 'src/debug/log.ts'))});
       const events = [];
       debug.log = (category, event, data) => events.push({ category, event, data });
-      globalThis.fetch = async input => {
-        if (!String(input).includes('html.duckduckgo.com/html/')) throw new Error('unexpected fetch provider');
-        return new Response('<div class="result"><a class="result__a" href="https://example.org/ddg">DDG fallback result</a><a class="result__snippet">public snippet</a></div>', { status: 200 });
-      };
+      const { withFakeFetchDevice } = await import(${JSON.stringify(join(process.cwd(), 'src/ux-sim/fake-fetch.ts'))});
       const { getAvailableResearchWebSearchProviders } = await import(${JSON.stringify(join(process.cwd(), 'src/web-search/index.ts'))});
       const providers = getAvailableResearchWebSearchProviders();
       if (providers.some(provider => ['exa', 'firecrawl'].includes(provider.id))) throw new Error('paid provider unexpectedly available');
       const { invokeResearchAxes } = await import(${JSON.stringify(join(process.cwd(), 'src/research-bridge/invoke.ts'))});
-      const result = await invokeResearchAxes([{ id: 'ddg-default', level: 1, prompt: 'Find a public source.', searchTerms: ['public research source'] }], {
-        fetchPage: async url => ({ url, output: 'fetched test page' }),
+      await withFakeFetchDevice([{ url: 'https://html.duckduckgo.com/html/', method: 'POST', response: () => new Response('<div class="result"><a class="result__a" href="https://example.org/ddg">DDG fallback result</a><a class="result__snippet">public snippet</a></div>', { status: 200 }) }], async device => {
+        const result = await invokeResearchAxes([{ id: 'ddg-default', level: 1, prompt: 'Find a public source.', searchTerms: ['public research source'] }], {
+          fetchPage: async url => ({ url, output: 'fetched test page' }),
+        });
+        const evidence = result.axes.flatMap(axis => axis.evidence);
+        console.log('AXIS_ENTRYPOINT_RESULT=' + JSON.stringify({
+          providerIds: providers.map(provider => provider.id),
+          sourceKinds: evidence.map(item => item.sourceKind),
+          fallbackLog: events.some(event => event.category === 'research.search' && event.event === 'provider-preflight' && event.data.keylessFallback === 'ddg-free'),
+          providerLog: events.some(event => event.category === 'research.search' && event.event === 'provider-complete' && event.data.provider === 'ddg-free'),
+          fetchCalls: device.calls(),
+        }));
       });
-      const evidence = result.axes.flatMap(axis => axis.evidence);
-      console.log('AXIS_ENTRYPOINT_RESULT=' + JSON.stringify({
-        providerIds: providers.map(provider => provider.id),
-        sourceKinds: evidence.map(item => item.sourceKind),
-        fallbackLog: events.some(event => event.category === 'research.search' && event.event === 'provider-preflight' && event.data.keylessFallback === 'ddg-free'),
-        providerLog: events.some(event => event.category === 'research.search' && event.event === 'provider-complete' && event.data.provider === 'ddg-free'),
-      }));
     `;
     try {
       const child = spawnSync('bun', ['-e', script], {
@@ -411,6 +411,7 @@ describe('research axis fanout', () => {
       expect(result.sourceKinds).toContain('web-search:ddg-free');
       expect(result.fallbackLog).toBe(true);
       expect(result.providerLog).toBe(true);
+      expect(result.fetchCalls).toMatchObject([{ url: 'https://html.duckduckgo.com/html/', method: 'POST', routeId: 'route-1', status: 200 }]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

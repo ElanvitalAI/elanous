@@ -18,9 +18,9 @@ rpc:
     params: { id: { type: text } }
     allow: [owner, viewer]
 actions:
-  transcribe: { builtin: stt, uses: [cred:openai.api_key] }
-  summarize: { builtin: summarize, uses: [cred:openai.api_key] }
-  readAloud: { builtin: tts, uses: [cred:elevenlabs.api_key] }
+  transcribe: { builtin: stt, input: { audio: object-ref }, output: { text: text }, uses: [cred:openai.api_key] }
+  summarize: { builtin: summarize, input: { text: text }, output: { text: text }, uses: [cred:openai.api_key] }
+  readAloud: { builtin: tts, input: { text: text, voiceId: text }, output: { audioBase64: text, mimeType: text }, uses: [cred:elevenlabs.api_key] }
   makeAd: { builtin: generate, async: true, spend: owner-confirm, uses: [cred:higgsfield.secret] }
 storage:
   prefix: apps/voice-note/
@@ -28,9 +28,13 @@ credentials:
   - cred:openai.api_key
 `;
 
+function replaceInOnce(source: string, from: string, to: string): string {
+  if (!source.includes(from)) throw new Error(`fixture fragment missing: ${from}`);
+  return source.replace(from, to);
+}
+
 function replaceOnce(from: string, to: string): string {
-  if (!validYaml.includes(from)) throw new Error(`fixture fragment missing: ${from}`);
-  return validYaml.replace(from, to);
+  return replaceInOnce(validYaml, from, to);
 }
 
 type ParseResult = ReturnType<typeof parseAppManifest>;
@@ -79,22 +83,61 @@ describe('NEXUS-APP-CONTRACT', () => {
 
   test('accepts translate as a builtin with text and source/target language declarations', () => {
     const source = replaceOnce(
-      '  summarize: { builtin: summarize, uses: [cred:openai.api_key] }',
-      '  translate: { builtin: translate, input: { text: text, sourceLanguage: text, targetLanguage: text }, uses: [cred:openai.api_key] }',
+      '  summarize: { builtin: summarize, input: { text: text }, output: { text: text }, uses: [cred:openai.api_key] }',
+      '  translate: { builtin: translate, input: { text: text, sourceLanguage: text, targetLanguage: text }, output: { text: text }, uses: [cred:openai.api_key] }',
     );
     const result = parseAppManifest(source);
     expect(result.ok).toBe(true);
     expect(errorsOf(result)).toEqual([]);
   });
 
-  test('parses the translator template action input/output declaration', () => {
-    const source = readFileSync('templates/next-app-translator/app.yaml', 'utf8');
-    const result = parseAppManifest(source);
-    expect(result.ok).toBe(true);
-    if (!result.ok) return;
-    const actions = result.manifest.actions as Record<string, { input?: unknown; output?: { text?: string } }>;
-    expect(actions.translate?.input).toEqual({ text: 'text', sourceLanguage: 'text', targetLanguage: 'text' });
-    expect(actions.translate?.output).toEqual({ text: 'text' });
+  test('rejects builtin input/output declarations that differ from the executable contracts', () => {
+    const translate = replaceOnce(
+      '  summarize: { builtin: summarize, input: { text: text }, output: { text: text }, uses: [cred:openai.api_key] }',
+      '  translate: { builtin: translate, input: { text: text, sourceLanguage: text, targetLanguage: text }, output: { text: text }, uses: [cred:openai.api_key] }',
+    );
+    const invalid = [
+      { source: replaceOnce('input: { audio: object-ref }', 'input: { audio: text }'), path: '/actions/@entry:0/input' },
+      { source: replaceOnce('input: { audio: object-ref }, output: { text: text }', 'output: { text: text }'), path: '/actions/@entry:0/input' },
+      { source: replaceOnce('output: { text: text }', 'output: { text: text, unexpected: text }'), path: '/actions/@entry:0/output' },
+      { source: replaceOnce('output: { text: text }', 'output: { transcript: text }'), path: '/actions/@entry:0/output' },
+      { source: replaceOnce('output: { audioBase64: text, mimeType: text }', 'output: { audioBase64: text }'), path: '/actions/@entry:2/output' },
+      { source: replaceOnce('  summarize: { builtin: summarize, input: { text: text }, output: { text: text }, uses: [cred:openai.api_key] }', '  summarize: { builtin: summarize, input: { text: object-ref }, output: { text: text }, uses: [cred:openai.api_key] }'), path: '/actions/@entry:1/input' },
+      { source: replaceInOnce(translate, 'sourceLanguage: text, targetLanguage: text', 'sourceLanguage: text'), path: '/actions/@entry:1/input' },
+      { source: replaceInOnce(translate,
+        'translate: { builtin: translate, input: { text: text, sourceLanguage: text, targetLanguage: text }, output: { text: text }, uses: [cred:openai.api_key] }',
+        'translate: { builtin: translate, input: { text: text, sourceLanguage: text, targetLanguage: text }, output: { text: object-ref }, uses: [cred:openai.api_key] }'), path: '/actions/@entry:1/output' },
+    ];
+    for (const { source, path } of invalid) {
+      expect(errorsOf(parseAppManifest(source)).some(issue => issue.path === path)).toBe(true);
+    }
+    expect(parseAppManifest(replaceOnce('input: { text: text, voiceId: text }', 'input: { text: text, voiceId: text, modelId: text }')).ok).toBe(true);
+  });
+
+  test('parses the voice-note and translator template action input/output declarations', () => {
+    const expectations: Record<string, Record<string, { input: Record<string, string>; output: Record<string, string> }>> = {
+      'templates/next-app-voice-note/app.yaml': {
+        transcribe: { input: { audio: 'object-ref' }, output: { text: 'text' } },
+        summarize: { input: { text: 'text' }, output: { text: 'text' } },
+        readAloud: { input: { text: 'text', voiceId: 'text' }, output: { audioBase64: 'text', mimeType: 'text' } },
+      },
+      'templates/next-app-translator/app.yaml': {
+        transcribe: { input: { audio: 'object-ref' }, output: { text: 'text' } },
+        translate: { input: { text: 'text', sourceLanguage: 'text', targetLanguage: 'text' }, output: { text: 'text' } },
+        readAloud: { input: { text: 'text', voiceId: 'text' }, output: { audioBase64: 'text', mimeType: 'text' } },
+      },
+    };
+    for (const [path, expectedActions] of Object.entries(expectations)) {
+      const result = parseAppManifest(readFileSync(path, 'utf8'));
+      expect(result.ok).toBe(true);
+      if (!result.ok) continue;
+      const actions = result.manifest.actions as Record<string, { input?: Record<string, string>; output?: Record<string, string> }>;
+      for (const [name, expected] of Object.entries(expectedActions)) {
+        expect(actions[name]).toBeDefined();
+        expect(actions[name]?.input).toEqual(expected.input);
+        expect(actions[name]?.output).toEqual(expected.output);
+      }
+    }
   });
 
   test('reports malformed YAML without echoing the source', () => {
@@ -211,8 +254,8 @@ describe('NEXUS-APP-CONTRACT', () => {
     expect(errorsOf(rpc).some(issue => issue.path === '/rpc/@entry:0/sql')).toBe(true);
 
     const numericActionKey = replaceOnce(
-      '  transcribe: { builtin: stt, uses: [cred:openai.api_key] }',
-      '  transcribe: { builtin: shell, uses: [cred:openai.api_key] }\n  "0": { builtin: stt }',
+      '  transcribe: { builtin: stt, input: { audio: object-ref }, output: { text: text }, uses: [cred:openai.api_key] }',
+      '  transcribe: { builtin: shell, input: { audio: object-ref }, output: { text: text }, uses: [cred:openai.api_key] }\n  "0": { builtin: stt }',
     );
     const action = parseAppManifest(numericActionKey);
     expect(errorsOf(action).some(issue => issue.path === '/actions/@entry:0/builtin')).toBe(true);

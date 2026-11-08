@@ -5,6 +5,14 @@ export interface FakeFetchRequest {
   readonly method: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly body: string | null;
+  /** Base64 of the exact multipart request bytes when body is FormData. */
+  readonly wireBodyBase64?: string;
+  readonly redirect?: RequestRedirect;
+}
+
+/** Live request context available to route handlers for cancellation-sensitive contracts. */
+export interface FakeFetchRouteRequest extends FakeFetchRequest {
+  readonly signal: AbortSignal | null;
 }
 
 export interface FakeFetchCall extends FakeFetchRequest {
@@ -17,7 +25,7 @@ export interface FakeFetchRoute {
   /** Match an absolute URL exactly or a URL pathname (for example `/v1/tasks`). */
   readonly url: string;
   readonly method?: string;
-  readonly response: Response | ((request: FakeFetchRequest) => Response | Promise<Response>);
+  readonly response: Response | ((request: FakeFetchRouteRequest) => Response | Promise<Response>);
 }
 
 export interface FakeFetchDevice {
@@ -80,6 +88,7 @@ async function requestBody(request: Request, input: RequestInfo | URL, init?: Re
 }
 
 let fakeFetchInstalled = false;
+let fakeFetchLeaseQueue: Promise<void> = Promise.resolve();
 
 /** Install an exact-route fetch stub that records every request and cannot fall through to the network. */
 export function createFakeFetchDevice(routes: readonly FakeFetchRoute[]): FakeFetchDevice {
@@ -100,9 +109,18 @@ export function createFakeFetchDevice(routes: readonly FakeFetchRoute[]): FakeFe
       method,
       headers: Object.fromEntries(headers.entries()),
       body: null,
+    ...((init?.redirect ?? (input instanceof Request ? input.redirect : undefined)) !== undefined
+      ? { redirect: init?.redirect ?? (input instanceof Request ? input.redirect : undefined) }
+      : {}),
     };
     observations.push({ ...request, routeId: null, status: null });
-    request = { ...request, body: await requestBody(requestObject, input, init) };
+    request = {
+      ...request,
+      body: await requestBody(requestObject, input, init),
+      ...(init?.body instanceof FormData
+        ? { wireBodyBase64: Buffer.from(await requestObject.clone().arrayBuffer()).toString('base64') }
+        : {}),
+    };
     observations[callIndex] = { ...observations[callIndex]!, ...request };
     const target = new URL(url, 'http://fake-fetch.local');
     const routeIndex = routes.findIndex((route) => {
@@ -118,7 +136,7 @@ export function createFakeFetchDevice(routes: readonly FakeFetchRoute[]): FakeFe
     observations[callIndex] = { ...observations[callIndex]!, routeId: `route-${routeIndex + 1}` };
     try {
       const response = typeof route.response === 'function'
-        ? await route.response(request)
+        ? await route.response({ ...request, signal: requestObject.signal })
         : route.response.clone();
       observations[callIndex] = { ...observations[callIndex]!, status: response.status };
       return response;
@@ -144,12 +162,37 @@ export function createFakeFetchDevice(routes: readonly FakeFetchRoute[]): FakeFe
   };
 }
 
+/** Acquire the process-wide fetch stub in FIFO order for tests that run concurrently. */
+export async function acquireFakeFetchDevice(routes: readonly FakeFetchRoute[]): Promise<FakeFetchDevice> {
+  const previous = fakeFetchLeaseQueue;
+  let releaseNext!: () => void;
+  fakeFetchLeaseQueue = new Promise<void>((resolve) => { releaseNext = resolve; });
+  await previous;
+  let device: FakeFetchDevice;
+  try {
+    device = createFakeFetchDevice(routes);
+  } catch (error) {
+    releaseNext();
+    throw error;
+  }
+  let restored = false;
+  return {
+    calls: device.calls,
+    restore() {
+      if (restored) return;
+      device.restore();
+      restored = true;
+      releaseNext();
+    },
+  };
+}
+
 /** Install route fixtures for a callback and restore the original global fetch on every exit path. */
 export async function withFakeFetchDevice<T>(
   routes: readonly FakeFetchRoute[],
   run: (device: FakeFetchDevice) => T | Promise<T>,
 ): Promise<T> {
-  const device = createFakeFetchDevice(routes);
+  const device = await acquireFakeFetchDevice(routes);
   try {
     return await run(device);
   } finally {

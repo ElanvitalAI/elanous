@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── AgentList LLM tool (PFC PX-1 Phase 6) ──
 //
 // Read-only introspection of the 4-layer agent-definition registry.
@@ -14,7 +15,7 @@
 // concerns orthogonal — useful when the LLM wants to reason about the
 // agent catalog before committing to a spawn.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { loadAgentsLayered } from './definition-registry.js';
 import type { LayeredLoadReport, LoadLayeredOptions } from './definition-registry.js';

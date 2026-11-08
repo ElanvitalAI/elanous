@@ -135,6 +135,8 @@ export interface GateShardDispatchInput {
   shardHost?: string;
   /** IDs known to pass on macOS, supplied by the caller's env-known policy. */
   macPassShardIds?: readonly string[];
+  /** Failures proven preexisting by the previous same-head verdict for this exact baseline. */
+  sameHeadPreexistingFailureIds?: readonly string[];
   /** Shards whose test/import radius intersects the diff from each receipt baseline. */
   invalidatedShardIds?: readonly string[];
   /** Proof from changed-file/import-closure analysis that these moved-baseline shards are untouched. */
@@ -207,6 +209,7 @@ export function eligibleGateShardReceipt(
   head40: string,
   base40: string,
   allowMovedHead = false,
+  allowSameHeadUnhashed = false,
 ): boolean {
   return receipt.status === 'complete' && /^\d+\.\d+\.\d+(?:-rc\.\d+)?$/.test(receipt.version)
       && typeof receipt.graphEntry === 'string' && receipt.graphEntry.trim().length > 0
@@ -223,7 +226,8 @@ export function eligibleGateShardReceipt(
       && receipt.envFingerprint === receipt.runtimeIdentity.envFingerprint
       && receipt.envKey === gateShardRuntimeIdentityKey(receipt.runtimeIdentity, receipt.lockfileHash)
       && typeof receipt.lockfileHash === 'string' && /^[a-f0-9]{64}$/i.test(receipt.lockfileHash)
-      && validTestedFileHashesForFiles(receipt.testedFileHashes, receipt.files)
+      && (validTestedFileHashesForFiles(receipt.testedFileHashes, receipt.files)
+        || (allowSameHeadUnhashed && receipt.head40 === head40 && receipt.testedFileHashes === undefined))
       && Array.isArray(receipt.executions) && receipt.executions.length > 0
       && receipt.executions.every((execution) => typeof execution.branch === 'string'
         && typeof execution.attemptId === 'string' && execution.attemptId.trim().length > 0
@@ -261,14 +265,17 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
       ? (prior.graphEntry !== input.graphEntry ? 'graph-entry-mismatch' : prior.recipeCommand !== input.recipeCommand ? 'recipe-command-mismatch'
         : prior.recipeTimeoutMs !== input.recipeTimeoutMs ? 'recipe-timeout-mismatch' : undefined)
       : prior ? 'shard-recipe-unmeasured' : undefined;
-    const receipt = [...input.receipts].reverse().find((r) => eligibleGateShardReceipt(r, shard, input.head40, input.base40, radiusUnchanged.has(shard.id))
-      && r.failureIds.length === 0 && r.errorIds.length === 0
+    const receipt = [...input.receipts].reverse().find((r) => eligibleGateShardReceipt(r, shard, input.head40, input.base40,
+      radiusUnchanged.has(shard.id), r.head40 === input.head40)
+      && receiptFailureSetMatchesBaseline(r, shard, input.head40, input.sameHeadPreexistingFailureIds)
       && currentLockfileValid && r.lockfileHash === input.lockfileHash
       && currentFileHashesValid && sameTestedFileHashes(r.testedFileHashes, currentFileHashes)
       && !!input.graphEntry && !!input.recipeCommand && Number.isSafeInteger(input.recipeTimeoutMs)
       && r.graphEntry === input.graphEntry && r.recipeCommand === input.recipeCommand && r.recipeTimeoutMs === input.recipeTimeoutMs
       && !!input.environmentIdentity?.imageDigest && /^sha256:[a-f0-9]{64}$/i.test(input.environmentIdentity.imageDigest)
       && envFields.every((field) => ({ ...r.runtimeIdentity })[field] === input.environmentIdentity![field]));
+    const failureBaselineMismatch = !!prior && [...prior.failureIds, ...prior.errorIds].length > 0
+      && !receiptFailureSetMatchesBaseline(prior, shard, input.head40, input.sameHeadPreexistingFailureIds);
     const invalidated = new Set(input.invalidatedShardIds ?? []).has(shard.id);
     const forced = input.rerouteShard === shard.id || invalidated;
     const auto = input.rerouteShard === 'auto' && (prior?.status === 'unmeasured'
@@ -281,7 +288,8 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
     const lockfileMismatch = input.lockfileHash !== undefined && prior?.lockfileHash !== input.lockfileHash;
     const rerunReason = invalidated ? 'radius-invalidated' : !currentLockfileValid ? 'runtime-lockfile-unmeasured'
       : !currentFileHashesValid ? 'tested-file-identity-unmeasured' : testedContentMismatch ? 'tested-file-content-mismatch'
-      : lockfileMismatch ? 'runtime-lockfile-mismatch' : (prior && prior.head40 !== input.head40 && !radiusUnchanged.has(shard.id)) ? 'radius-proof-missing' : environmentMismatch ? 'environment-' + environmentMismatch + '-mismatch'
+      : failureBaselineMismatch ? 'baseline-failure-identity-mismatch'
+        : lockfileMismatch ? 'runtime-lockfile-mismatch' : (prior && prior.head40 !== input.head40 && !radiusUnchanged.has(shard.id)) ? 'radius-proof-missing' : environmentMismatch ? 'environment-' + environmentMismatch + '-mismatch'
       : recipeMismatch ?? (forced ? 'reroute-requested' : receipt ? 'receipt-ineligible' : 'receipt-unavailable');
     let candidates = hosts.filter((host) => !shard.requiredOs || host.platform === shard.requiredOs);
     if (input.shardHost && (forced || auto)) candidates = candidates.filter((host) => host.id === input.shardHost);
@@ -291,6 +299,20 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
     const host = candidates[nextHost++ % candidates.length]!;
     return { shardId: shard.id, files: [...shard.files], kind: 'run', host: host.id, reason: rerunReason, ...(prior ? { replacing: prior } : {}) };
   });
+}
+
+function receiptFailureSetMatchesBaseline(receipt: GateShardReceipt, shard: GateShardIdentity, head40: string,
+  sameHeadPreexistingFailureIds: readonly string[] | undefined): boolean {
+  const receiptIds = [...new Set([...receipt.failureIds, ...receipt.errorIds])].sort();
+  if (!receiptIds.length) return true;
+  if (receipt.head40 !== head40 || !Array.isArray(sameHeadPreexistingFailureIds)
+    || !sameHeadPreexistingFailureIds.every((id) => typeof id === 'string')) return false;
+  const files = new Set(shard.files);
+  const baselineIds = [...new Set(sameHeadPreexistingFailureIds)].filter((id) => {
+    const separator = id.indexOf(' > ');
+    return separator > 0 && files.has(id.slice(0, separator));
+  }).sort();
+  return baselineIds.length > 0 && JSON.stringify(receiptIds) === JSON.stringify(baselineIds);
 }
 
 function sameTestedFileHashes(a: Readonly<Record<string, string>> | undefined, b: Readonly<Record<string, string>> | undefined): boolean {

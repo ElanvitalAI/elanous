@@ -2,8 +2,9 @@
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { gateTestBaseline } from '../lib/gate-test-env.js';
+import { cachedCutSnapshot } from './gate-cut-snapshot.js';
 
 const SHA256 = /^[0-9a-f]{64}$/i;
 const IMAGE_DIGEST = /^sha256:[0-9a-f]{64}$/i;
@@ -12,13 +13,19 @@ export const POD_SWEEP_INTEGRATION_ONLY: readonly string[] = ['scripts/install.t
 /** Reconstruct the producer's tracked test selection at its pinned commit. Missing Git evidence is not a smaller set. */
 export function gateAssignableTestsAtCommit(repo: string, commit: string): string[] | null {
   if (!/^[0-9a-f]{40}$/i.test(commit)) return null;
-  const tree = spawnSync('git', ['ls-tree', '-r', '--name-only', commit], { cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
-  const cdp = spawnSync('git', ['grep', '-l', '-e', 'requireCdpBase', '-e', '9333', commit, '--', 'test', 'scripts'],
-    { cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
-  if (tree.status !== 0 || tree.error || (cdp.status !== 0 && cdp.status !== 1) || cdp.error) return null;
-  const cdpFiles = new Set(cdp.stdout.split(/\r?\n/).filter(Boolean).map((line) => line.slice(commit.length + 1))
-    .filter((file) => file.endsWith('.test.ts')));
-  return tree.stdout.split(/\r?\n/).filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file)
+  const snapshot = cachedCutSnapshot(repo, commit);
+  if (!snapshot) {
+    const tree = spawnSync('git', ['ls-tree', '-r', '--name-only', commit], { cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+    const cdp = spawnSync('git', ['grep', '-l', '-e', 'requireCdpBase', '-e', '9333', commit, '--', 'test', 'scripts'], { cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+    if (tree.status !== 0 || tree.error || (cdp.status !== 0 && cdp.status !== 1) || cdp.error) return null;
+    const skipped = new Set(cdp.stdout.split(/\r?\n/).filter(Boolean).map((line) => line.slice(commit.length + 1)).filter((file) => file.endsWith('.test.ts')));
+    return tree.stdout.split(/\r?\n/).filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file)
+      && !skipped.has(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
+      && !file.split('/').some((part) => part.startsWith('.'))).sort();
+  }
+  const cdpFiles = new Set(snapshot.files.filter((file) => /^(?:test|scripts)\//.test(file) && file.endsWith('.test.ts')
+    && /requireCdpBase|9333/.test(snapshot.read(file) ?? '')));
+  return snapshot.files.filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file)
     && !cdpFiles.has(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
     && !file.split('/').some((part) => part.startsWith('.'))).sort();
 }
@@ -35,9 +42,26 @@ export interface GateBaselineReceipt {
   envFingerprint: string;
   imageDigest: string | null;
   executionIdentity: GatePodRuntimeIdentity | null;
+  /** Optional immutable ledger-relative evidence root (gate-logs/cut and gate-failures.json). */
+  artifactPath?: string;
   files: number;
+  /** Exact full-sweep file set; required before a focused recheck can alter failures. */
+  fileInventory?: string[];
   shards: number;
+  /** Same-identity focused runs that re-measured files from this preserved full-sweep receipt. */
+  rechecks?: GateBaselineRecheck[];
   attributionRecheck?: { summary: number; observed: number; identified: number; baselineResult: string; targetFiles: string[] };
+}
+
+export interface GateBaselineRecheck {
+  runId: string;
+  commit: string;
+  graphSha: string;
+  recipeSha: string;
+  envFingerprint: string;
+  imageDigest: string;
+  executionIdentity: GatePodRuntimeIdentity;
+  files: string[];
 }
 
 export interface GatePodRuntimeIdentity {
@@ -46,6 +70,8 @@ export interface GatePodRuntimeIdentity {
   architecture: string;
   envFingerprint: string;
   baseImageDigest?: string;
+  /** Optional on older/runtime-only evidence; when present it must match the receipt's top-level digest. */
+  imageDigest?: string;
 }
 
 const validRuntimeIdentity = (value: unknown): value is GatePodRuntimeIdentity => {
@@ -71,8 +97,10 @@ export function parseGatePodRuntimeIdentity(text: string): GatePodRuntimeIdentit
 /** A direct hard rehearsal has no graph run state. Pin the graph and recipe bytes at its Git SHA. */
 export function gateSourcePins(repo: string, commit: string): { graphSha: string; recipeSha: string } | null {
   if (!/^[0-9a-f]{40}$/i.test(commit)) return null;
+  const snapshot = cachedCutSnapshot(repo, commit);
   const read = (file: string): string | null => {
-    const result = spawnSync('git', ['show', `${commit}:${file}`], { cwd: repo, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    if (snapshot) return snapshot.read(file) ?? null;
+    const result = spawnSync('git', ['show', commit + ':' + file], { cwd: repo, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     return result.status === 0 && !result.error ? result.stdout : null;
   };
   const graph = read('graphs/release/release-loop.yaml');
@@ -86,8 +114,10 @@ export function gateSourcePins(repo: string, commit: string): { graphSha: string
 /** Per-shard reusable recipe surface: the gate node's graph entry and its concrete command, not whole-file hashes. */
 export function gateShardRecipeIdentityAtCommit(repo: string, commit: string): { graphEntry: string; recipeCommand: string; recipeTimeoutMs: number } | null {
   if (!/^[0-9a-f]{40}$/i.test(commit)) return null;
+  const snapshot = cachedCutSnapshot(repo, commit);
   const show = (file: string): string | null => {
-    const result = spawnSync('git', ['show', `${commit}:${file}`], { cwd: repo, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    if (snapshot) return snapshot.read(file) ?? null;
+    const result = spawnSync('git', ['show', commit + ':' + file], { cwd: repo, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     return result.status === 0 && !result.error ? result.stdout : null;
   };
   const graph = show('graphs/release/release-loop.yaml');
@@ -142,11 +172,13 @@ export function gateGraphPins(root: string, runId: string | undefined): { graphS
 
 export function gateBaselineReceipt(input: { root: string; version: string; commit: string; fullSweep: boolean;
   graphPins: { graphSha: string; recipeSha: string } | null; envFingerprint: string;
+  artifactPath?: string;
   attributionRecheck?: { summary: number; observed: number; identified: number; baselineResult: string; targetFiles: string[] } }): GateBaselineReceipt {
   const { root, version, commit, graphPins, envFingerprint } = input;
   const base = { schema: 2 as const, version, commit, head40: commit, graphSha: graphPins?.graphSha ?? null,
     recipeSha: graphPins?.recipeSha ?? null, envFingerprint, imageDigest: null as string | null,
-    executionIdentity: null as GatePodRuntimeIdentity | null, files: 0, shards: 0 };
+    executionIdentity: null as GatePodRuntimeIdentity | null,
+    ...(input.artifactPath ? { artifactPath: input.artifactPath } : {}), files: 0, shards: 0 };
   const invalid = (reason: string): GateBaselineReceipt => ({ ...base, valid: false, reason });
   if (input.attributionRecheck) {
     const evidence = input.attributionRecheck;
@@ -157,7 +189,12 @@ export function gateBaselineReceipt(input: { root: string; version: string; comm
   if (!graphPins) return invalid('pinned graph or recipe SHA absent');
   if (!SHA256.test(envFingerprint)) return invalid('gate environment fingerprint absent');
   try {
-    const dir = join(root, 'release', version, 'gate-logs', 'cut');
+    const artifactPath = input.artifactPath ?? join('release', version);
+    const artifactRoot = resolve(root, artifactPath);
+    const dir = join(artifactRoot, 'gate-logs', 'cut');
+    const escape = relative(resolve(root), artifactRoot);
+    if (isAbsolute(artifactPath) || escape === '..' || escape.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`))
+      return invalid('receipt artifact path escapes ledger root');
     if (!existsSync(dir)) return invalid('cut Pod logs absent');
     const names = readdirSync(dir).filter((name) => /^pod-\d+(?:-[\w-]+)?\.json$/.test(name));
     const roots = new Map<number, { files: string[]; shardCount: number; sweepId: string; attemptId: string; runtimeIdentity?: GatePodRuntimeIdentity }>();
@@ -226,6 +263,6 @@ export function gateBaselineReceipt(input: { root: string; version: string; comm
     if (images.size !== 1) return invalid('cut Pods used different image digests');
     if (identities.size !== 1) return invalid('cut Pods used different runtime identities');
     return { ...base, valid: true, reason: 'complete clean full sweep', imageDigest: [...images][0]!,
-      executionIdentity: identities.values().next().value!, files: files.length, shards: count };
+      executionIdentity: identities.values().next().value!, files: files.length, fileInventory: [...files].sort(), shards: count };
   } catch (error) { return invalid(`cut Pod evidence unreadable: ${String(error)}`); }
 }

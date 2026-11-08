@@ -78,7 +78,7 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
     expect(screen).toContain(finalReply);
   });
   test('scenario list is the CLI contract', () => {
-    expect([...CLASSIC_TUI_SCENARIOS]).toEqual(['classic-first-screen-noise', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop']);
+    expect([...CLASSIC_TUI_SCENARIOS]).toEqual(['classic-first-screen-noise', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-priority-keys', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop']);
   });
 
   test('classic-first-screen-noise: first-run internals stay out of the screen and Enter skips without Doctor', async () => {
@@ -123,6 +123,19 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
     });
     expect(typeof r.store.keyToPaintMaxMs).toBe('number');
   }, 150_000);
+
+  test('classic-priority-keys: real dashboard PTY restores the first queued input and retains the second in FIFO order', async () => {
+    const r = await run('classic-priority-keys');
+    expect(r.checks).toEqual({
+      escapeAbortedBusyTurn: true,
+      firstSubmittedInputReturnedToDraft: true,
+      secondInputRemainsAfterFirstInFifo: true,
+      onlyFakeProvider: true,
+      exitedClean: true,
+    });
+    expect(String(r.store.aborted)).toContain('fifo-one');
+    expect(String(r.store.aborted)).toContain('fifo-two');
+  }, 60_000);
 
   test('classic-mcp-calltool: deferred MCP child is absent at boot and the first TUI tool dispatch succeeds once', async () => {
     const r = await run('classic-mcp-calltool');

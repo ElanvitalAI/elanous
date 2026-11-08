@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // TUI-TOKEN-GUARD-WIRE — shared request-size guard (#32254 cap).
 //
 // The 400k-char cap used to be built only inside `session/chat.ts runTurn`.
@@ -23,7 +24,7 @@
 // the session-facing transcript across turns.
 
 import { createHash } from 'node:crypto';
-import type { LLMMessage, LLMOpts, LLMToolSpec } from '../llm.js';
+import type { LLMMessage, LLMOpts } from '../llm.js';
 import type { CompactProvider } from '../compact/provider.js';
 import { truncateProportional } from '../compact/truncate-proportional.js';
 import { appendArchiveEntry, archiveReferencePath, getDefaultArchiveDir, inspectArchive } from '../compact/archive.js';

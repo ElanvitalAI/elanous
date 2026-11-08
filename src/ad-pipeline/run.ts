@@ -24,6 +24,7 @@ import { createConcept, type ConceptGenerator, type ConceptResult } from './conc
 import { parseSkillOutput } from './skill-bridge.js';
 import { surveyMarket, type OmniCrawlSurveyCollector, type SurveyRequest, type SurveyResult } from './survey.js';
 import { assessProductionReadiness, type ProductionReadinessInput, type StepReadiness } from './production.js';
+import { PRODUCTION_STEPS, type ProductionStep } from './production-contract.js';
 import { runShootPlan, type ShootBackend, type ShootOutcome, type ShootRunOptions, type ShootRunResult } from './shoot-run.js';
 import { buildShootPlan, type DurationRule, type ReferenceDelivery } from './shoot-plan.js';
 import type { CommandRunner } from './higgsfield-backend.js';
@@ -249,12 +250,9 @@ export interface AdPipelineDeps {
   readonly mode?: AdMode;
 }
 
-/**
- * 접지 뒤에 오는 «제작» 단계들 — 지금은 전부 셸 절차이고 이 진입이 «부르지 않는다».
- * ⛔ 이름을 여기 두는 이유: 안 부르는 것을 «안 부른다고» 말할 수 있어야 하기 때문이다.
- */
-export const PRODUCTION_STEPS = ['ground', 'invariants', 'expand', 'cut', 'voiceover', 'soundtrack', 'render'] as const;
-export type ProductionStep = typeof PRODUCTION_STEPS[number];
+// Preserve the existing public exports while keeping their contract dependency acyclic.
+export { PRODUCTION_STEPS };
+export type { ProductionStep };
 
 /**
  * ⛔ `completed` 라는 값을 «두지 않는다`.

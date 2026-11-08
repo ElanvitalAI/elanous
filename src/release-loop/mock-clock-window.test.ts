@@ -31,7 +31,7 @@ function replay() {
     leakCheck: () => ({ status: 0 }),
     hardGate: async (_version, _checkout, sha, ledgerRoot, id) => {
       gateCalls.push({ id, sha, root: ledgerRoot });
-      return { outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0 };
+      return { outcome: 'ok', commit: sha, executor: 'pod', introduced: [], preexisting: 0, receiptRecord: { available: true } };
     },
     lightRc: async (version, _checkout, selection) => {
       rcCalls.push({ version, selection: { ...selection } });

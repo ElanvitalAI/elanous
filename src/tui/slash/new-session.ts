@@ -1,7 +1,6 @@
 // `/new` (`/clear` and `/session new` aliases) — leave the old session without quitting next TUI.
 // The old session is never deleted; only the active marker moves.
 import { debug } from '../../debug/log.js';
-import { createSession, setActiveSessionId } from '../../session/index.js';
 
 export const NEW_SESSION_BUSY_STATUS = '응답 중에는 /new 를 받지 않습니다 · 완료(또는 Esc 취소) 뒤 다시';
 
@@ -22,12 +21,13 @@ export type NewTuiSessionResult =
   | { readonly kind: 'started'; readonly id: string; readonly status: string }
   | { readonly kind: 'rejected'; readonly status: string };
 
-export function requestNewTuiSession(input: { readonly busy: boolean; readonly from: string | null }): NewTuiSessionResult {
+export async function requestNewTuiSession(input: { readonly busy: boolean; readonly from: string | null }): Promise<NewTuiSessionResult> {
   const { busy, from } = input;
   if (busy) {
     debug.log('tui.next', 'session-new-rejected', { from, reason: 'busy' });
     return { kind: 'rejected', status: NEW_SESSION_BUSY_STATUS };
   }
+  const { createSession, setActiveSessionId } = await import('../../session/index.js');
   const id = createSession({ source: 'tui' }).id;
   setActiveSessionId(id);
   debug.log('tui.next', 'session-new', { from, to: id });

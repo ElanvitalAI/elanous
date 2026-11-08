@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { isMainThread, parentPort, workerData, Worker } from 'node:worker_threads';
 import { queryRunningRuns, type QueriedRunningRunsResult } from '../self-implement/running-runs.js';
@@ -8,7 +8,11 @@ import { checkBrand } from '../../scripts/brand/check.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
 import { listChecklist, devVersion, type Checklist } from '../release-loop/checklist.js';
-import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
+import { readReleaseRuns, type ReleaseRunView } from '../nexus/api/ops-api.js';
+import { gateShardsPath, readGateShards, summarizeShards } from '../release-loop/gate-shards.js';
+import { getSchedule, listSchedules } from '../release-loop/release-schedule.js';
+import { readLandingFreeze } from '../release-loop/landing-freeze.js';
 import { setElanousConfigDir } from '../elanous-config-dir.js';
 import { seatDay, seatLedgerPath, type SeatEntry } from '../seat-loop/seat-loop.js';
 import { listCoordEvents, type CoordEvent } from './coord-events.js';
@@ -20,10 +24,54 @@ export type ContextFact =
   | { kind: 'decision'; id: string; title: string; status: string; dueAt: string | null; source: string }
   | { kind: 'seat'; seat: string; at: string; status: string; id: string | null; title: string | null; source: string }
   | { kind: 'run'; goal: string; phase: string; elapsed: string; source: string; unreadable?: string }
-  | { kind: 'release'; version: string; node: string; status: string; source: string; unreadable?: string }
+  | { kind: 'release'; version: string; node: string; status: string; source: string; unreadable?: string;
+      phase?: string; currentNode?: string | null; nextAction?: string;
+      gateProgress?: { completed: number; total: number; failed: number } | null;
+      regressions?: { introduced: number | null; preexisting: number | null } | null;
+      receiptStatus?: 'valid' | 'invalid' | 'absent' | 'unreadable'; waiverEvents?: string[];
+      emergencySwitch?: { state: 'on' | 'off' | 'unknown'; reason?: string };
+      landingFreeze?: { state: 'on' | 'off' | 'unknown'; reason?: string };
+      expectedPublishAt?: string | null; sourceRefs?: Array<{ signal: string; source: string }>;
+      ledgerErrors?: Array<{ signal: string; source: string; reason: string }> }
   | { kind: 'schedule-late'; count: number | null; names: string[]; source: string; unreadable?: string };
 export type ContextEvent = { at: string; kind: string; summary: string; source: string };
 export type ContextNowAnswer = { at: string; topic: string | null; facts: ContextFact[]; events: ContextEvent[]; guide: string[]; hiddenCount?: number };
+
+interface GateVerdictEvidence {
+  version: string; commit: string; outcome: 'ok' | 'regression' | 'error';
+  introduced: string[]; knownEnv: string[]; preexisting: string[]; loadFlaky: string[];
+  baselineReceipt: { schema: 2; valid: boolean; reason: string; version: string; commit: string; head40: string;
+    graphSha: string | null; recipeSha: string | null; envFingerprint: string; imageDigest: string | null;
+    executionIdentity: unknown; files: number; shards: number };
+}
+
+function isGateVerdictEvidence(value: unknown, version: string): value is GateVerdictEvidence {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const receipt = row.baselineReceipt;
+  if (row.version !== version || typeof row.commit !== 'string' || !/^[0-9a-f]{40}$/i.test(row.commit)
+    || !['ok', 'regression', 'error'].includes(String(row.outcome))
+    || !['introduced', 'knownEnv', 'preexisting', 'loadFlaky'].every(key => Array.isArray(row[key]) && (row[key] as unknown[]).every(item => typeof item === 'string'))
+    || !receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return false;
+  const r = receipt as Record<string, unknown>;
+  const hex = (item: unknown) => typeof item === 'string' && /^[0-9a-f]{64}$/i.test(item);
+  const digest = (item: unknown) => item === null || (typeof item === 'string' && /^sha256:[0-9a-f]{64}$/i.test(item));
+  const identity = r.executionIdentity;
+  const validIdentity = identity === null || (!!identity && typeof identity === 'object' && !Array.isArray(identity)
+    && typeof (identity as Record<string, unknown>).bunVersion === 'string'
+    && typeof (identity as Record<string, unknown>).platform === 'string'
+    && typeof (identity as Record<string, unknown>).architecture === 'string'
+    && hex((identity as Record<string, unknown>).envFingerprint)
+    && typeof (identity as Record<string, unknown>).baseImageDigest === 'string');
+  return r.schema === 2 && typeof r.valid === 'boolean' && typeof r.reason === 'string'
+    && r.version === version && r.commit === row.commit && r.head40 === row.commit
+    && (r.graphSha === null || hex(r.graphSha)) && (r.recipeSha === null || hex(r.recipeSha))
+    && hex(r.envFingerprint) && digest(r.imageDigest) && validIdentity
+    && Number.isSafeInteger(r.files) && Number.isSafeInteger(r.shards)
+    && (r.artifactPath === undefined || typeof r.artifactPath === 'string')
+    && (r.fileInventory === undefined || (Array.isArray(r.fileInventory) && r.fileInventory.every(item => typeof item === 'string')))
+    && (r.rechecks === undefined || Array.isArray(r.rechecks));
+}
 
 export interface ContextNowDeps {
   now?: () => Date;
@@ -69,6 +117,25 @@ const releaseSource = 'elanous://graph-runs/release-loop';
 const scheduleSource = 'elanous://schedules';
 const oneLine = (text: string) => redactSecretText(text.split(/\r?\n/, 1)[0] ?? '').slice(0, 120);
 
+/** One concise release-ledger answer shared by chat, TUI and tool callers. */
+export function releaseFactSummary(fact: Extract<ContextFact, { kind: 'release' }>): string {
+  if (fact.unreadable) return `발행 런 원장 못 읽음 · ${fact.unreadable}`;
+  const parts = [`${fact.version} · ${fact.node} · ${fact.status}`];
+  if (fact.phase) parts.push(`국면 ${fact.phase}`);
+  if (fact.currentNode) parts.push(`현재 ${fact.currentNode}`);
+  if (fact.nextAction) parts.push(`다음 ${fact.nextAction}`);
+  if (fact.gateProgress) parts.push(`게이트 ${fact.gateProgress.completed}/${fact.gateProgress.total} · 실패 ${fact.gateProgress.failed}`);
+  if (fact.regressions) parts.push(`회귀 도입 ${fact.regressions.introduced ?? '?'} · 기존 ${fact.regressions.preexisting ?? '?'}`);
+  if (fact.receiptStatus) parts.push(`영수증 ${fact.receiptStatus}`);
+  if (fact.waiverEvents) parts.push(`면제 ${fact.waiverEvents.length ? `${fact.waiverEvents.slice(0, 3).map(oneLine).join(', ')}${fact.waiverEvents.length > 3 ? ` · 생략 ${fact.waiverEvents.length - 3} (/release)` : ''}` : '없음'}`);
+  if (fact.emergencySwitch) parts.push(`긴급 전환 ${fact.emergencySwitch.state}${fact.emergencySwitch.reason ? ` · ${fact.emergencySwitch.reason}` : ''}`);
+  if (fact.landingFreeze) parts.push(`착지 동결 ${fact.landingFreeze.state}${fact.landingFreeze.reason ? ` · ${fact.landingFreeze.reason}` : ''}`);
+  if (fact.expectedPublishAt) parts.push(`예상 발행 ${fact.expectedPublishAt}`);
+  if (fact.sourceRefs?.length) parts.push(`근거 ${fact.sourceRefs.slice(0, 8).map(ref => `${ref.signal}=${ref.source}`).join(', ')}${fact.sourceRefs.length > 8 ? ` · 생략 ${fact.sourceRefs.length - 8} (/release)` : ''}`);
+  if (fact.ledgerErrors?.length) parts.push(`원장 오류 ${fact.ledgerErrors.slice(0, 3).map(error => `${error.signal} (${error.source}): ${error.reason}`).join(', ')}${fact.ledgerErrors.length > 3 ? ` · 생략 ${fact.ledgerErrors.length - 3} (/release)` : ''}`);
+  return Array.from(parts.join(' · ')).slice(0, 1500).join('');
+}
+
 // src/dashboard/slash-runtime/dashboard-handlers.ts:buildDashboardSlashRegistry /now calls contextNowInWorker;
 // contextNow → queryRunningRuns → queryFederatedUnfinishedRunLedgers → queryUnfinishedRunLedgers (persisted scan index).
 function runningRunFacts(now: Date, queryRuns: () => QueriedRunningRunsResult = () => queryRunningRuns({
@@ -103,33 +170,156 @@ function runningRunFacts(now: Date, queryRuns: () => QueriedRunningRunsResult = 
   return unreadable ? [...facts, { kind: 'run', goal: '', phase: '', elapsed: '', source: runSource, unreadable: '런 원장 또는 관측 대상 일부' }] : facts;
 }
 
-function latestReleaseRun(): Extract<ContextFact, { kind: 'release' }> | null {
-  const dir = join(effectiveInstanceRoot(), 'graph-runs', 'release-loop');
-  let filenames: string[];
-  try { filenames = readdirSync(dir).filter(name => /^[A-Za-z0-9-]+\.json$/.test(name)); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw error;
-  }
-  const runs = filenames.flatMap(filename => {
-    const path = join(dir, filename);
-    let run: { startedAt?: unknown; status?: unknown; input?: { version?: unknown }; path?: unknown; nodes?: unknown };
-    try {
-      if (!lstatSync(path).isFile()) return [];
-      run = JSON.parse(readFileSync(path, 'utf8'));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return [];
-      throw error;
+function releaseContextFacts(defaultVersion: string, events: readonly CoordEvent[] = []): Array<Extract<ContextFact, { kind: 'release' }>> {
+  const stateRoot = effectiveInstanceRoot();
+  const ledgerRoot = releaseLedgerRoot();
+  const runs = readReleaseRuns(null, join(stateRoot, 'graph-runs', 'release-loop'), { facts: true, ledgerRoot, now: Date.now() });
+  const runsByVersion = new Map<string, ReleaseRunView>();
+  let latestUnversionedRun: ReleaseRunView | undefined;
+  if (runs !== 'unavailable') {
+    for (const run of runs) {
+      if (run.version) {
+        if (!runsByVersion.has(run.version)) runsByVersion.set(run.version, run);
+      } else latestUnversionedRun ??= run;
     }
-    if (typeof run.startedAt !== 'string' || typeof run.status !== 'string' || !Array.isArray(run.path) || !Array.isArray(run.nodes)) return [];
-    const steps = run.path.filter((step): step is string => typeof step === 'string');
-    const nodes = run.nodes.filter((node): node is { nodeId: string } => !!node && typeof node.nodeId === 'string');
-    const version = typeof run.input?.version === 'string' && /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(run.input.version) ? run.input.version : '판 미기록';
-    const index = Math.min(steps.length, nodes.length + (run.status === 'running' || run.status === 'awaiting-approval' ? 1 : 0));
-    return [{ startedAt: run.startedAt, fact: { kind: 'release' as const, version, node: `${index}/${steps.length}${steps[index - 1] ? ` ${oneLine(steps[index - 1]!)}` : ''}`,
-      status: oneLine(run.status), source: `${releaseSource}/${encodeURIComponent(filename.slice(0, -5))}` } }];
+  }
+  const latestRun = runs === 'unavailable' ? undefined : runs[0];
+  const runReadError = runs === 'unavailable' ? '런 목록을 읽을 수 없음' : undefined;
+  const commonErrors: Array<{ signal: string; source: string; reason: string }> = runReadError
+    ? [{ signal: 'run', source: releaseSource, reason: runReadError }] : [];
+  const knownVersions = new Set<string>();
+  try {
+    for (const schedule of listSchedules(ledgerRoot)) knownVersions.add(schedule.version);
+  } catch (error) { commonErrors.push({ signal: 'schedule-index', source: scheduleSource, reason: unreadableReason(error) }); }
+  const releaseRoot = join(ledgerRoot, 'release');
+  try {
+    for (const entry of readdirSync(releaseRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta|dev)\.\d+)?$/.test(entry.name)) continue;
+      if (existsSync(join(releaseRoot, entry.name, 'gate-verdict.json')) || existsSync(gateShardsPath(entry.name, ledgerRoot))) knownVersions.add(entry.name);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') commonErrors.push({ signal: 'release-index', source: 'elanous://release', reason: unreadableReason(error) });
+  }
+  for (const runVersion of runsByVersion.keys()) knownVersions.add(runVersion);
+  if (latestUnversionedRun) knownVersions.add('판 미기록');
+  if (!knownVersions.size) knownVersions.add(latestRun?.version ?? defaultVersion);
+  const versions = [...knownVersions].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  return versions.flatMap(version => {
+    const run = runsByVersion.get(version) ?? (version === '판 미기록' ? latestUnversionedRun : undefined);
+    const fact = releaseContextFact(version, run, runReadError, commonErrors, events);
+    return fact ? [fact] : [];
   });
-  return runs.sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0]?.fact ?? null;
+}
+
+function releaseContextFact(version: string, run: ReleaseRunView | undefined,
+  runReadError: string | undefined, commonErrors: Array<{ signal: string; source: string; reason: string }>,
+  events: readonly CoordEvent[] = []): Extract<ContextFact, { kind: 'release' }> | null {
+  const stateRoot = effectiveInstanceRoot();
+  const ledgerRoot = releaseLedgerRoot();
+  const ledgerErrors: Array<{ signal: string; source: string; reason: string }> = [...commonErrors];
+  const runUnavailable = runReadError !== undefined;
+  const runSourceRef = run ? `${releaseSource}/${encodeURIComponent(run.runId)}` : releaseSource;
+  const sourceRefs: Array<{ signal: string; source: string }> = [{ signal: runUnavailable ? 'run-status' : 'run', source: runSourceRef }];
+  let raw: { input?: { publishAt?: unknown }; pending?: { nodeId?: unknown; message?: unknown };
+    nodes?: Array<{ nodeId?: unknown; waiver?: { reason?: unknown; approvedBy?: unknown; at?: unknown } }> } = {};
+  if (run) {
+    try { raw = JSON.parse(readFileSync(join(stateRoot, 'graph-runs', 'release-loop', `${run.runId}.json`), 'utf8')); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') ledgerErrors.push({ signal: 'run', source: runSourceRef, reason: unreadableReason(error) });
+    }
+  }
+  const current = run ? run.nodes.find(node => node.ok === null && node.startedAt && run.path.at(-1) === node.nodeId) : undefined;
+  const arrival = run?.status === 'running' && !current && run.path.length
+    ? [...events].reverse().find(event => event.refs.origin === 'release-graph' && event.kind === 'exit'
+      && event.summary === `release graph node-arrival · run=${run.runId} · node=${run.path.at(-1)}`)
+    : undefined;
+  const arrivalNode = arrival ? run?.path.at(-1) : undefined;
+  const phase = !run ? runUnavailable ? '관측 불가' : '미기동'
+    : run.status === 'awaiting-approval' ? '승인 대기' : current?.nodeId ?? arrivalNode ?? run.status;
+  const pending = typeof raw.pending?.message === 'string' ? oneLine(raw.pending.message) : undefined;
+  let nextAction = !run ? runUnavailable ? '런 원장 복구 후 재관측' : '런 관측 대기'
+    : run.status === 'awaiting-approval' ? `승인${pending ? ` 필요 · ${pending}` : ' 필요'}`
+      : run.status === 'failed' || run.status === 'budget-exceeded' ? '실패 원인 확인 후 재개 판단'
+      : run.status === 'done' ? '완료' : current ? `${current.nodeId} 완료 대기` : arrivalNode ? `${arrivalNode} 도착 · 시작 대기` : '다음 노드 관측 대기';
+  const nodeIndex = run ? Math.min(run.path.length, run.nodes.length + (run.status === 'running' || run.status === 'awaiting-approval' ? 1 : 0)) : 0;
+  const versioned = version !== '판 미기록';
+  const gatePath = gateShardsPath(version, ledgerRoot);
+  const gateShardsSource = `elanous://release/${encodeURIComponent(version)}/gate-shards`;
+  const gateVerdictSource = `elanous://release/${encodeURIComponent(version)}/gate-verdict`;
+  const scheduleFactSource = `elanous://release/${encodeURIComponent(version)}/schedule`;
+  let gateFile: ReturnType<typeof readGateShards> = null;
+  try {
+    if (!versioned) throw Object.assign(new Error('unversioned'), { code: 'ENOENT' });
+    readFileSync(gatePath, 'utf8');
+    gateFile = readGateShards(gatePath);
+    if (!gateFile) ledgerErrors.push({ signal: 'gate-shards', source: gateShardsSource, reason: '원장 형식 오류' });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') ledgerErrors.push({ signal: 'gate-shards', source: gateShardsSource, reason: unreadableReason(error) });
+  }
+  const gate = gateFile?.version === version ? summarizeShards(gateFile, Date.now()) : null;
+  const terminalShards = gateFile?.shards.filter(shard => ['done', 'failed', 'timeout'].includes(shard.state)).length ?? 0;
+  let regressions: Extract<ContextFact, { kind: 'release' }>['regressions'] = gate?.verdict
+    ? { introduced: gate.verdict.introduced, preexisting: gate.verdict.preexisting } : null;
+  let receiptStatus: Extract<ContextFact, { kind: 'release' }>['receiptStatus'] = 'absent';
+  let verdict: GateVerdictEvidence | null = null;
+  if (version !== '판 미기록') {
+    try {
+      const rawVerdict: unknown = JSON.parse(readFileSync(join(ledgerRoot, 'release', version, 'gate-verdict.json'), 'utf8'));
+      if (!isGateVerdictEvidence(rawVerdict, version)) throw new Error('원장 형식 오류');
+      const parsed = rawVerdict;
+      verdict = parsed;
+      if (!regressions && (Array.isArray(verdict.introduced) || typeof verdict.preexisting === 'number')) {
+        regressions = { introduced: Array.isArray(verdict.introduced) ? verdict.introduced.length : null,
+          preexisting: typeof verdict.preexisting === 'number' ? verdict.preexisting : null };
+      }
+      receiptStatus = verdict.baselineReceipt?.valid === true ? 'valid'
+        : verdict.baselineReceipt?.valid === false ? 'invalid' : 'absent';
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        receiptStatus = 'unreadable';
+        const formatError = error instanceof SyntaxError || (error instanceof Error && error.message === '원장 형식 오류');
+        ledgerErrors.push({ signal: 'gate-verdict', source: gateVerdictSource,
+          reason: formatError ? '원장 형식 오류' : unreadableReason(error) });
+      }
+    }
+  }
+  const waiverEvents = (raw.nodes ?? []).flatMap(node => node.waiver?.reason
+    ? [`${oneLine(String(node.nodeId ?? '노드'))}: ${oneLine(String(node.waiver.reason))}${node.waiver.approvedBy ? ` · 승인 ${oneLine(String(node.waiver.approvedBy))}` : ''}`]
+    : []);
+  let landingFreeze: Extract<ContextFact, { kind: 'release' }>['landingFreeze'];
+  try {
+    const freeze = readLandingFreeze(ledgerRoot);
+    landingFreeze = freeze ? { state: 'on', reason: oneLine(freeze.reason) } : { state: 'off' };
+  } catch (error) {
+    landingFreeze = { state: 'unknown' };
+    ledgerErrors.push({ signal: 'landing-freeze', source: 'elanous://landing-freeze', reason: unreadableReason(error) });
+  }
+  let schedule: ReturnType<typeof getSchedule> = null;
+  try { if (versioned) schedule = getSchedule(version, ledgerRoot); }
+  catch (error) { ledgerErrors.push({ signal: 'schedule', source: scheduleFactSource, reason: unreadableReason(error) }); }
+  if (!run && !runUnavailable) nextAction = schedule ? '예약 시각 대기' : landingFreeze?.state === 'on' ? '착지 동결 해제 대기' : '런 관측 대기';
+  const runPublishAt = typeof raw.input?.publishAt === 'string' && Number.isFinite(Date.parse(raw.input.publishAt))
+    ? new Date(raw.input.publishAt).toISOString() : null;
+  const expectedPublishAt = schedule?.publishAt ?? runPublishAt;
+  const progress = gateFile?.version === version ? { completed: terminalShards, total: gateFile.shards.length,
+    failed: gateFile.shards.filter(shard => shard.state === 'failed' || shard.state === 'timeout' || (shard.state === 'done' && shard.rc !== undefined && shard.rc !== 0)).length } : null;
+  if (ledgerErrors.some(error => error.signal === 'schedule-index')) sourceRefs.push({ signal: 'schedule-index', source: scheduleSource });
+  if (ledgerErrors.some(error => error.signal === 'release-index')) sourceRefs.push({ signal: 'release-index', source: 'elanous://release' });
+  if (progress) sourceRefs.push({ signal: 'gate-progress', source: gateShardsSource });
+  if (arrival) sourceRefs.push({ signal: 'node-arrival', source: arrival.refs.source ?? arrival.refs.url ?? runSourceRef });
+  if (regressions) sourceRefs.push({ signal: 'regressions', source: gate?.verdict ? gateShardsSource : gateVerdictSource });
+  sourceRefs.push({ signal: 'receipt-status', source: gateVerdictSource },
+    { signal: 'landing-freeze', source: 'elanous://landing-freeze' });
+  if (waiverEvents.length) sourceRefs.push({ signal: 'waivers', source: runSourceRef });
+  if (expectedPublishAt) sourceRefs.push({ signal: 'expected-publish-at', source: schedule?.publishAt ? scheduleFactSource : runSourceRef });
+  if (!run && !schedule && landingFreeze?.state !== 'on' && !gateFile && !regressions && receiptStatus === 'absent' && !ledgerErrors.length) return null;
+  const runNode = run ? `${nodeIndex}/${run.path.length}${run.path[nodeIndex - 1] ? ` ${oneLine(run.path[nodeIndex - 1]!)}` : ''}`
+    : runUnavailable ? '런 관측 불가' : '런 없음';
+  return { kind: 'release', version, node: runNode,
+    status: oneLine(run?.status ?? (runUnavailable ? 'unknown' : 'no-run')), source: runSourceRef, phase: oneLine(phase), currentNode: current?.nodeId ?? arrivalNode ?? null,
+    nextAction, gateProgress: progress, regressions, receiptStatus, waiverEvents,
+    // The dedicated RLA emergency-publish switch is not in the current ledger yet; do not infer it from landing-freeze.
+    emergencySwitch: { state: 'unknown' }, landingFreeze, expectedPublishAt, sourceRefs, ledgerErrors };
 }
 
 function lateScheduleFact(now: Date): Extract<ContextFact, { kind: 'schedule-late' }> {
@@ -170,19 +360,23 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
   const rawEvents = (deps.events ?? (since => listCoordEvents({ since })))(new Date(now.getTime() - 7 * 86_400_000).toISOString());
   const chronologicalEvents = rawEvents.slice().sort((a, b) => a.at.localeCompare(b.at));
   const matches = (text: string) => !topic || text.toLocaleLowerCase().includes(topic.toLocaleLowerCase());
+  const operationsTopic = topic?.toLocaleLowerCase() === 'ops';
+  const asksRelease = operationsTopic || Boolean(topic && /발행|출시|릴리스|release|게이트|gate/i.test(topic));
   const operational: ContextFact[] = [];
   if (options.audience !== 'public-demo') {
     try { operational.push(...(deps.runningRuns ?? (date => runningRunFacts(date, deps.queryRuns)))(now)); }
     catch (error) { operational.push({ kind: 'run', goal: '', phase: '', elapsed: '', source: runSource, unreadable: unreadableReason(error) }); }
     try {
-      const release = (deps.releaseRun ?? latestReleaseRun)();
-      if (release) operational.push(release);
+      if (deps.releaseRun) {
+        const release = deps.releaseRun();
+        if (release) operational.push(release);
+      } else operational.push(...releaseContextFacts(version, chronologicalEvents));
     } catch (error) { operational.push({ kind: 'release', version: '', node: '', status: '', source: releaseSource, unreadable: unreadableReason(error) }); }
     try { const schedules = (deps.lateSchedules ?? lateScheduleFact)(now); if (schedules) operational.push(schedules); }
     catch (error) { operational.push({ kind: 'schedule-late', count: null, names: [], source: scheduleSource, unreadable: unreadableReason(error) }); }
   }
-  const selectedOperational = operational.filter(f => !topic || ('unreadable' in f && !!f.unreadable) || (f.kind === 'run' && matches(`${f.goal} ${f.phase}`))
-    || (f.kind === 'release' && matches(`${f.version} ${f.node} ${f.status}`))
+  const selectedOperational = operational.filter(f => !topic || operationsTopic || ('unreadable' in f && !!f.unreadable) || (f.kind === 'run' && matches(`${f.goal} ${f.phase}`))
+    || (f.kind === 'release' && (asksRelease || matches(`${f.version} ${f.node} ${f.status}`)))
     || (f.kind === 'schedule-late' && matches(f.names.join(' '))));
   const selectedFacts = facts.filter(f => !topic || (f.kind === 'cell' && matches(`${f.id} ${f.title}`))
     || (f.kind === 'seat' && matches(`${f.id ?? ''} ${f.title ?? ''}`)));

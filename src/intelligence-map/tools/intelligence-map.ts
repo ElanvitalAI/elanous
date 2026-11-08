@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S5 P5: IntelligenceMap LLM tool ──
 //
 // Aggregates catalog + enabled models + system snapshot + cost
@@ -5,7 +6,7 @@
 // produces a compact text formatting for injection into the
 // auto-mode loop-prompt.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { discoverModels, enabledModels } from '../model-catalog.js';
 import {
   loadCostConfig,

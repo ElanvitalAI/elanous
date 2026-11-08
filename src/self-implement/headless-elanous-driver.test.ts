@@ -1043,20 +1043,18 @@ describe('headless goal-loop timeout caps', () => {
     const log = spyOn(debug, 'log').mockImplementation(((_category: string, event: string, data?: Record<string, unknown>) => {
       events.push({ event, data: data ?? {} });
     }) as never);
-    const originalNow = Date.now;
-    Date.now = () => 0;
     try {
       const defaultResult = await runHeadlessGoalLoopPty({
         binRoot: '/tmp/repo', cwd, featurePrompt: 'x', pollMs: 1, ptyAvailable: () => true,
-        spawn: onePollPty(), readParentPid: () => 4242,
+        spawn: onePollPty(), readParentPid: () => 4242, wallClockNowMs: () => 0,
       });
       const defaultHeartbeat = JSON.parse(readFileSync(heartbeatPath(stateDir), 'utf8'));
 
       let wallclockNowCalls = 0;
-      Date.now = () => wallclockNowCalls++ === 0 ? 0 : 6_900_000;
       const wallclockResult = await runHeadlessGoalLoopPty({
         binRoot: '/tmp/repo', cwd, featurePrompt: 'x', pollMs: 1, ptyAvailable: () => true,
         spawn: alivePty(), readParentPid: () => 4242,
+        wallClockNowMs: () => wallclockNowCalls++ === 0 ? 0 : 6_900_000,
       });
       const wallclockCap = events.find(({ event }) => event === 'headless.wallclock-cap')!;
 
@@ -1065,7 +1063,6 @@ describe('headless goal-loop timeout caps', () => {
       expect(wallclockResult).toEqual(expect.objectContaining({ exitReason: 'wallclock-cap' }));
       expect(wallclockCap.data).toEqual(expect.objectContaining({ elapsedSec: DEFAULT_MAX_HARD_WAIT_SEC, hardI: DEFAULT_MAX_HARD_WAIT_SEC }));
     } finally {
-      Date.now = originalNow;
       log.mockRestore();
     }
   });

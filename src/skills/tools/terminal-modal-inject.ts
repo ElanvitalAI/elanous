@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // terminal_modal_inject native tool.
 //
 // Mutating counterpart to the read-only observe/list tools. Writes
@@ -17,7 +18,7 @@
 //     surface.send_text throttle so the PTY line buffer isn't
 //     overflowed.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { TerminalSessionRegistry } from '../../terminal/session-registry.js';
 
 const CHUNK_BYTES = 256;

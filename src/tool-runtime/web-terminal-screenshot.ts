@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // WT-C-2 — web-terminal screenshot LLM tool.
 //
 // Renders the visible buffer of a PreviewTerminal (xterm-headless) to
@@ -22,7 +23,7 @@
 
 import type { ToolRuntime } from './types.js';
 import { lookupPreviewTerminal } from '../web-terminal/preview-tap-registry.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import type { WebTerminalDispatchOpts } from './web-terminal-runtimes.js';
 import {

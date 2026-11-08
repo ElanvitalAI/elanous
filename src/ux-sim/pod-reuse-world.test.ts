@@ -36,6 +36,26 @@ test('POD-REUSE-SIM-METHOD: lifecycle world shares SI lease state and measures w
     expect(result.sourceIo.reference.digest).toBe(result.sourceIo.copy.digest);
     expect(result.sourceIo.reference.setupMs).toBeGreaterThanOrEqual(0);
     expect(result.sourceIo.copy.setupMs).toBeGreaterThanOrEqual(0);
+    expect(result.sourceIo.nodeModules.mountPath).toBe('/external/node_modules');
+    expect(result.sourceIo.nodeModules.hostPath).toContain('/node_modules-host');
+    expect(result.sourceIo.nodeModules.readOnly).toBe(true);
+    expect(result.sourceIo.nodeModules.reference).toMatchObject({
+      via: 'production-gate-job/node_modules-hostPath-simulated-link', materializedBytes: 0,
+    });
+    expect(result.sourceIo.nodeModules.copy).toMatchObject({ via: 'recursive-copy' });
+    expect(result.sourceIo.nodeModules.sourceBytes).toBeGreaterThan(0);
+    expect(result.sourceIo.nodeModules.copy.materializedBytes).toBeGreaterThan(0);
+    expect(result.sourceIo.nodeModules.reference.materializedBytes).toBe(0);
+    expect(result.sourceIo.nodeModules.copy.materializedBytes).toBe(result.sourceIo.nodeModules.sourceBytes);
+    expect(result.sourceIo.nodeModules.reference.readBytes).toBe(result.sourceIo.nodeModules.copy.readBytes);
+    expect(result.sourceIo.nodeModules.reference.digest).toBe(result.sourceIo.nodeModules.copy.digest);
+    expect(result.sourceIo.nodeModules.reference.setupMs).toBeGreaterThanOrEqual(0);
+    expect(result.sourceIo.nodeModules.copy.setupMs).toBeGreaterThanOrEqual(0);
+    expect(result.sourceIo.nodeModules.reference.verificationMs).toBeGreaterThanOrEqual(0);
+    expect(result.sourceIo.nodeModules.copy.verificationMs).toBeGreaterThanOrEqual(0);
+    expect(result.sourceIo.nodeModules.writeRejected).toBe(true);
+    expect(result.sourceIo.nodeModules.bytesWritten).toBe(0);
+    expect(result.sourceIo.nodeModules.writableControlWriteBytes).toBeGreaterThan(0);
     expect(result.scenario.pass).toBe(true);
     expect(result.scenario.cleanReuse.leaseGenerations).toEqual([1, 2, 1]);
     expect(result.scenario.cleanReuse.podUids[0]).toBe(result.scenario.cleanReuse.podUids[1]);

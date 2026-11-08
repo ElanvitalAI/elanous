@@ -1,0 +1,23 @@
+version: 1
+kind: release-graph-events
+id: rla-sim-vocab-node-edge-1107
+isolation: test
+input:
+  version: 0.3.7
+  previousVersion: 0.3.6
+cases:
+  - id: stale-generated-artifact
+    eventType: release.incident.generated-artifact-stale
+    description: Generated release artifact is stale for the current source.
+    nodeId: gate-repair-a11ce0000001
+    rationale: Regenerate and verify the artifact before continuing the release graph.
+  - id: release-host-lost
+    eventType: release.incident.host-lost
+    description: One release host disappears during the cut run.
+    nodeId: gate-repair-a11ce0000002
+    rationale: Reassign the affected release work after detecting host loss.
+  - id: damaged-receipt-fragment
+    eventType: release.incident.receipt-fragment-damaged
+    description: A release receipt fragment fails integrity validation.
+    nodeId: gate-repair-a11ce0000003
+    rationale: Rebuild the damaged receipt fragment before resuming the graph.

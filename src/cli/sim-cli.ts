@@ -1,7 +1,6 @@
 import type { Command } from 'commander';
 import { readFileSync } from 'node:fs';
 import { getTestStateRoot } from '../nexus/paths.js';
-import { runReleaseSimRigIfFile } from '../ux-sim/release-sim-rig.js';
 import { runScenarioFile } from '../ux-sim/scenario.js';
 import { loadMockScenarioCatalog, renderMockScenarioDevices } from '../ux-sim/mock-scenario-catalog.js';
 import { createWorld, destroyWorldById, loadWorld, runWorldScenario } from '../ux-sim/world.js';
@@ -22,6 +21,8 @@ export function registerSimCommands(program: Command): void {
         // Enforce isolation before either runner inspects the supplied path. Otherwise
         // release-graph dispatch can leak a path-validation error outside test mode.
         if (!getTestStateRoot()) throw new Error('scenario runner requires --test isolated mode');
+        // The release graph rig is only needed when a scenario is run, not to register sim commands.
+        const { runReleaseSimRigIfFile } = await import('../ux-sim/release-sim-rig.js');
         const releaseResult = await runReleaseSimRigIfFile(scenarioFile);
         const result = releaseResult ?? await runScenarioFile(scenarioFile);
         console.log(JSON.stringify(result));

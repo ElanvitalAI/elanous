@@ -1,5 +1,5 @@
 import type { FoldMode } from '../../log-entry.js';
-import type { ChatRenderingToolDisplayMode } from '../../user-config.js';
+import type { ChatRenderingToolDisplayMode } from '../../user-config/chat.js';
 
 export type ToolRenderName =
   | 'Bash'

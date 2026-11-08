@@ -22,22 +22,41 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { readlinkSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { dirname, join, resolve } from 'node:path';
 
 import { LOG_LEVEL_ORDER, type LogLevel, type LogRecord } from './record.js';
 import type { LogSink } from './sink.js';
-import { setInstanceName, resolveInstanceName } from '../../instance-identity.js';
-import * as nestDepth from '../../agent/nest-depth.js';
 import { logDiagnostic } from './diagnostic-sink.js';
 import { DebugLogBatchQueue, defaultDebugBatchScheduler, type DebugBatchScheduler } from '../../debug/batch-queue.js';
-import { assertNotTestWritingOps } from '../../instance/test-write-guard.js';
+
+type InstanceIdentityApi = { setInstanceName(name: string | undefined): void; resolveInstanceName(): string };
+type TestWriteGuardApi = { assertNotTestWritingOps(path: string, operation: string): void };
+
+function statePathsApi(): { elanousStateRoot(): string } {
+  const modulePath: string = '../../autopilot/state-paths.js';
+  return require(modulePath) as { elanousStateRoot(): string };
+}
+
+function instanceIdentityApi(): InstanceIdentityApi {
+  const modulePath: string = '../../instance-identity.js';
+  return require(modulePath) as InstanceIdentityApi;
+}
+
+function testWriteGuardApi(): TestWriteGuardApi {
+  const modulePath: string = '../../instance/test-write-guard.js';
+  return require(modulePath) as TestWriteGuardApi;
+}
+
+function observeNestAtBoot(): void {
+  const modulePath: string = '../../agent/nest-depth.js';
+  (require(modulePath) as { observeNestAtBoot(): void }).observeNestAtBoot();
+}
 
 /** 스토어 경로 — `ELANOUS_STATE_DIR` 존중(격리 테스트/`nexus run --test` 의
  *  기존 knob 그대로), 기본 `~/.elanous/logs/logs.db`. lazy 함수 — env 를
  *  임포트 시점이 아니라 호출 시점에 읽는다(telegram-test 등이 부팅 전 세팅). */
 export function logsDbPath(): string {
-  return join(elanousStateRoot(), 'logs', 'logs.db');
+  return join(statePathsApi().elanousStateRoot(), 'logs', 'logs.db');
 }
 
 // ── 인스턴스 identity (LF7-a · 2026-07-13) ───────────────────────────
@@ -59,11 +78,11 @@ export function logsDbPath(): string {
 
 /** 데몬/러너 부팅 1회 — config 의 logs.instanceName 을 주입. 빈 문자열 무시. */
 export function setLogInstanceName(name: string | undefined): void {
-  setInstanceName(name);
+  instanceIdentityApi().setInstanceName(name);
 }
 
 export function resolveLogInstanceName(): string {
-  return resolveInstanceName();
+  return instanceIdentityApi().resolveInstanceName();
 }
 
 // ── severity — 명시 채널(opts.level) 이 유일 공급원 (OH10 PR-b2 · 2026-07-24) ──
@@ -236,7 +255,7 @@ export class LogStore {
       return;
     }
     // TEST-PROD-LEAK: a test process never opens the ops logs.db for write, preload or not.
-    assertNotTestWritingOps(path, 'open logs.db for write');
+    testWriteGuardApi().assertNotTestWritingOps(path, 'open logs.db for write');
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     const openedAt = Date.now();
     for (let attempt = 0; ; attempt++) {
@@ -1388,7 +1407,7 @@ export function registerLogStoreSink(
     ...(drainChunkSize !== undefined ? { drainChunkSize } : {}),
   });
   const off = registerSink(sink);
-  try { nestDepth.observeNestAtBoot(); } catch { /* fail-soft — 관측 실패가 싱크 등록을 막지 않는다. */ }
+  try { observeNestAtBoot(); } catch { /* fail-soft — 관측 실패가 싱크 등록을 막지 않는다. */ }
   const owner = opts.retentionOwner ?? surface === 'nexus';
   const runRetention = (): void => {
     try { runStampedRetention(store, retention, owner); }

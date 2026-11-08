@@ -1,5 +1,5 @@
 import type { RotationEntry } from '../../user-config.js';
-import type { DashboardMouseWiringDeps } from './mouse-wiring.js';
+import type { DashboardMouseWiringDeps } from './mouse-wiring-types.js';
 
 export interface MousePickerRuntimeDeps {
   getRotation: () => RotationEntry[];

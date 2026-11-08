@@ -1,4 +1,4 @@
-import { PRODUCTION_STEPS, type ProductionStep } from './run.js';
+import { PRODUCTION_STEPS, type ProductionStep } from './production-contract.js';
 
 export type StepReadiness =
   | { readonly step: ProductionStep; readonly status: 'wired'; readonly by: string }

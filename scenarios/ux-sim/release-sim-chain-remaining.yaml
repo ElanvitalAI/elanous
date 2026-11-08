@@ -1,0 +1,46 @@
+version: 1
+kind: release-graph
+id: release-sim-chain-remaining-1108
+isolation: test
+input:
+  version: '0.3.7'
+  previousVersion: '0.3.6'
+cases:
+  - id: export-check-failure-blocks-prepare-and-publish
+    fault:
+      node: export-check
+      outcome: fail
+      evidence: { publicArtifactLeak: true, classification: release-blocking }
+    expect:
+      status: failed
+      mustVisit: [export-check, gate, pre-prepare-join, traffic-failed-restore, failed]
+      mustNotVisit: [prepare, publish, npm-publish]
+  - id: incomplete-gate-shard-blocks-publish
+    fault:
+      node: gate
+      outcome: error
+      evidence:
+        realGateTriage: true
+        error: 'pod sweep incomplete: stalled shards 3'
+        summaryFailures: 1
+        identifiedOccurrences: 0
+        uniqueFailures: 1
+        baselineRecheck: true
+        stalledShards: [{ shard: 3, files: [src/example.test.ts], reason: no-output }]
+    expect:
+      status: failed
+      mustVisit: [gate, gate-triage, traffic-failed-restore, failed]
+      mustNotVisit: [publish, npm-publish]
+  - id: stopped-gate-waiver-resumes-existing-release-cli
+    mode: owner-waive-unmeasured-gate
+    unmeasuredGateShape: stopped
+    expect:
+      status: done
+      mustVisit: [gate, known-issues, publish, npm-publish, done]
+      mustNotVisit: [failed]
+  - id: publish-npm-verify-production-entrypoints-with-fake-boundaries
+    mode: owner-waive-0246-fixture
+    expect:
+      status: done
+      mustVisit: [gate, known-issues, publish, npm-publish, verify, done]
+      mustNotVisit: [failed]

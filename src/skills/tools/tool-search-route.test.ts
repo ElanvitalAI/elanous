@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── 소환기 라우팅 불변식 · 소비자 전수 가드 (elanous review #5460 should-fix) ──
 //
 // tier-flip 은 라우터 지원 여부와 **무관하게** ToolSearch 를 주입한다(그게 맞다 —
@@ -17,7 +18,7 @@ import { HYDRATED_TOOLS_KEY, takeHydratedTools } from './tool-search-spec.js';
 import { splitDeferredToolSpecs } from '../../session-runtime/tier-flip.js';
 import { buildAutonomousToolSpecs } from '../../agent/autonomous-tools.js';
 import { toolSurface } from '../../boot/daemon-tools/index.js';
-import type { LLMToolSpec } from '../../llm.js';
+
 
 const repoRoot = join(import.meta.dir, '..', '..', '..');
 const readSrc = (rel: string): string => readFileSync(join(repoRoot, rel), 'utf8');

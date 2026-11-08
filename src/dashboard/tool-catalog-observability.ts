@@ -1,4 +1,5 @@
-import type { LLMToolSpec } from '../llm.js';
+import type { LLMToolSpec } from '../llm/tool-spec.js';
+
 import { debug } from '../debug/log.js';
 import { buildSessionRuntimeToolSpecs } from '../session-runtime/index.js';
 

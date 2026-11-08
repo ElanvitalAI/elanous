@@ -18,6 +18,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { appendWaiverEvent, appendWaiverEvents, consumeWaiverEvent, evaluateWaiverEvent, expireWaiverEvent, issueOpWaiverEvent, issueReviewCapEvent, readWaiverEvents } from '../release-loop/waiver-events.js';
 import { tierModel } from '../llm/model-defaults.js';
 import { buildReviewObservation, reviewIntentFingerprint, safeLogText } from './review-observation.js';
 import { checkCitedReviewPathsAtHead, citedReviewPaths, reviewFindingKey } from './review-finding-key.js';
@@ -26,6 +27,7 @@ import { ZAI_OPENROUTER_FALLBACK_MODEL } from '../llm/zai-coding-plan.js';
 import { debug } from '../debug/log.js';
 import { ACP_BACKENDS, canonicalizeBackendId } from '../acp/backend-registry.js';
 import { buildManualReviewIntent, intentFromPr, prIntentSectionCoverage, reviewIntentTruncationFromPr, reviewIntentTruncationObservation } from './review-intent.js';
+import { buildReviewScopeContractContext } from '../cli/review-carry.js';
 import { NO_VERDICT_LINE_REASON, budgetReviewerContext, isNoneSentinelFinding, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
 import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js';
 import { getUserConfig, type LLMProviderName, type ReviewerMixSpec, type RoleLlmSpec, type SubscriptionReviewerSpec } from '../user-config.js';
@@ -184,6 +186,7 @@ interface SavedReviewEvidence {
   records: Array<{ head: string; reviewedAt: number; model?: string; capExempt?: boolean }>;
   loopRounds: Array<{ head: string; reviewedAt: number; state: 'clear' | 'stale-reopen' }>;
   fixedFindings: string[];
+  latestFixedFindings: string[];
   priorFindings: string[];
   unreadableFiles: string[];
 }
@@ -331,6 +334,7 @@ function selectSavedReviewForDelta(pr: string, selector?: string, root = effecti
 
 function reviewInputCharacterCount(input: ReviewInput): number {
   return input.prDiff.length + input.phaseIntent.length + (input.acceptance?.length ?? 0)
+    + (input.reviewScopeContract?.length ?? 0)
     + (input.evidenceNote?.length ?? 0)
     + (input.workingMemory?.length ?? 0)
     + (input.reviewerContext ?? []).reduce((sum, item) => sum + item.label.length + item.body.length, 0);
@@ -559,13 +563,14 @@ function savedReviewEvidence(
 ): SavedReviewEvidence {
   const dir = join(root, 'review-results');
   let names: string[];
-  try { names = readdirSync(dir); } catch { return { heads: [], records: [], loopRounds: [], fixedFindings: [], priorFindings: [], unreadableFiles: [] }; }
+  try { names = readdirSync(dir); } catch { return { heads: [], records: [], loopRounds: [], fixedFindings: [], latestFixedFindings: [], priorFindings: [], unreadableFiles: [] }; }
   const escapedPr = pr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const matchingPrInName = new RegExp(`(?:^|-)${escapedPr}(?:-|\\.json$)`, 'i');
   const records = new Map<string, { head: string; reviewedAt: number; model?: string; capExempt?: boolean }>();
   const loopRounds = new Map<string, { head: string; reviewedAt: number; state: 'clear' | 'stale-reopen' }>();
   const fixedFindings = new Map<string, string>();
   let latestFindings: { reviewedAt: number; findings: string[] } | undefined;
+  let latestFixed: { reviewedAt: number; findings: string[] } | undefined;
   const unreadableFiles: string[] = [];
   for (const name of names) {
     if (!name.toLowerCase().endsWith('.json')) continue;
@@ -598,6 +603,7 @@ function savedReviewEvidence(
         ? result.reviewedAt : statSync(recordPath).mtimeMs;
       const findings = savedFindingList(result.mustFix);
       if (!latestFindings || reviewedAt > latestFindings.reviewedAt) latestFindings = { reviewedAt, findings };
+      const fixedThisRound: string[] = [];
       const normalized = head.toLowerCase();
       const model = [result.model, result.respondedModel, result.requestedModel]
         .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
@@ -623,8 +629,10 @@ function savedReviewEvidence(
         const delta = entry as Record<string, unknown>;
         if (delta.status === 'fixed' && typeof delta.finding === 'string' && delta.finding.trim()) {
           fixedFindings.set(reviewFindingKey(delta.finding).key, delta.finding);
+          fixedThisRound.push(delta.finding);
         }
       }
+      if (!latestFixed || reviewedAt > latestFixed.reviewedAt) latestFixed = { reviewedAt, findings: [...new Set(fixedThisRound)] };
     } catch {
       // A filename can associate an unreadable record with this PR; fail closed at the cap.
       if (nameSuggestsPr) { unreadableFiles.push(name); onUnreadable?.(name); }
@@ -632,7 +640,8 @@ function savedReviewEvidence(
   }
   const saved = [...records.values()];
   return { heads: saved.filter((record) => !record.capExempt).map(({ head }) => head), records: saved, loopRounds: [...loopRounds.values()],
-    fixedFindings: [...fixedFindings.values()], priorFindings: latestFindings?.findings ?? [], unreadableFiles };
+    fixedFindings: [...fixedFindings.values()], latestFixedFindings: latestFixed?.findings ?? [],
+    priorFindings: latestFindings?.findings ?? [], unreadableFiles };
 }
 
 export function savedReviewHeads(pr: string, root = effectiveInstanceRoot()): string[] {
@@ -713,6 +722,35 @@ function opAllowsReviewOverCap(pr: string): boolean {
     return Array.isArray(allow) && allow.every((number) => Number.isSafeInteger(number) && number > 0)
       && allow.includes(Number(pr));
   } catch { return false; }
+}
+
+/** Persist the OP allowlist grant and spend its one review-cap use at the pinned PR head. */
+function recordReviewCapWaiverEvents(pr: string, head: string, reason: string, now: number, claimPath: string): Array<Record<string, unknown>> {
+  const target = `pr:${pr}`;
+  const evidence = [`traffic-allowlist:${pr}`, `review-cap-claim:${claimPath}`, `reason:${reason}`];
+  const path = join(effectiveInstanceRoot(), 'review-results', 'waiver-events.jsonl');
+  const observations: Array<Record<string, unknown>> = [];
+  const pendingEvents: Array<ReturnType<typeof issueOpWaiverEvent>> = [];
+  const events = readWaiverEvents(path);
+  for (const prior of events.filter((event) => (event.kind === 'op-waiver' || event.kind === 'review-cap')
+    && event.target === target && event.mode === 'operational' && !event.expiredBy)) {
+    const expiredBy = prior.head !== head.toLowerCase() ? 'head-changed' : now >= prior.expiresAt ? 'timeout' : undefined;
+    if (expiredBy) appendWaiverEvent(path, expireWaiverEvent(prior, expiredBy, now));
+  }
+  for (const kind of ['op-waiver', 'review-cap'] as const) {
+    const active = readWaiverEvents(path).find((event) => event.kind === kind && event.target === target
+      && event.head === head.toLowerCase() && event.mode === 'operational' && !event.expiredBy && event.expiresAt > now);
+    const input = { mode: 'operational' as const, target, head, evidence, actor: 'OP', issuedAt: now };
+    const event = active ?? (kind === 'op-waiver' ? issueOpWaiverEvent(input) : issueReviewCapEvent(input));
+    const context = { target, head, now };
+    const decision = evaluateWaiverEvent(event, context);
+    const consumed = consumeWaiverEvent(event, context);
+    observations.push({ eventId: event.eventId, kind: event.kind, target: event.target,
+      head: event.head, mode: event.mode, decision });
+    pendingEvents.push(...(active ? [consumed] : [event, consumed]));
+  }
+  appendWaiverEvents(path, pendingEvents);
+  return observations;
 }
 
 interface GhResult {
@@ -2551,6 +2589,17 @@ async function runSelfReviewCliCommandPinned(
       claimedCapPath = join(effectiveInstanceRoot(), 'review-results', authorization
         ? `cap-override-${pr}-head-${diffRead.headCommit.toLowerCase()}.json`
         : `cap-override-${pr}.json`);
+      let capWaiverObservations: Array<Record<string, unknown>>;
+      try { capWaiverObservations = recordReviewCapWaiverEvents(pr, diffRead.headCommit, reason, deps.now(), claimedCapPath); }
+      catch (error) {
+        releaseCapClaim();
+        const message = `PR ${pr}: 면제 사건 원장에 상한 허용을 기록하지 못했습니다 (${error instanceof Error ? error.message : String(error)}).`;
+        deps.error(message);
+        if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-ledger-write-failed', headCommit: diffRead.headCommit });
+        failed += 1;
+        continue;
+      }
+      deps.observeDoctorReview?.('waiver-event', { pr, head: diffRead.headCommit, observations: capWaiverObservations }, { level: 'info' });
       deps.observeDoctorReview?.('cap-override', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason }, { level: 'warn' });
     }
     if (mergeOnlyDeltaRange) {
@@ -2583,6 +2632,17 @@ async function runSelfReviewCliCommandPinned(
     }
     if (previousRoundCount >= 5 && authorization && !opts.reviewerMixCapClaimed) {
       claimedCapPath = join(effectiveInstanceRoot(), 'review-results', `cap-override-${pr}-head-${diffRead.headCommit.toLowerCase()}.json`);
+      let capWaiverObservations: Array<Record<string, unknown>>;
+      try { capWaiverObservations = recordReviewCapWaiverEvents(pr, diffRead.headCommit, authorization.reason, deps.now(), claimedCapPath); }
+      catch (error) {
+        releaseCapClaim();
+        const message = `PR ${pr}: 면제 사건 원장에 상한 허용을 기록하지 못했습니다 (${error instanceof Error ? error.message : String(error)}).`;
+        deps.error(message);
+        if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'cap-ledger-write-failed', headCommit: diffRead.headCommit });
+        failed += 1;
+        continue;
+      }
+      deps.observeDoctorReview?.('waiver-event', { pr, head: diffRead.headCommit, observations: capWaiverObservations }, { level: 'info' });
       deps.observeDoctorReview?.('cap-override', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason: authorization.reason }, { level: 'warn' });
     }
     const localHeadComparison = compareLocalHead(pr, { value: diffRead.headCommit, state: diffRead.headCommitState }, deps);
@@ -2607,8 +2667,7 @@ async function runSelfReviewCliCommandPinned(
     //    ⭐ 경고 여부 판정은 `localHeadWarningDetails` 한 곳에 있다(호출부에서 같은 함수를 두 번 부르지 않는다).
     const mismatchWarning = localHeadWarningDetails(localHeadComparison);
     const mergeState = readPrMergeState(pr, deps);
-    const view = deltaBase ? { status: 1, stdout: '', stderr: '' }
-      : deps.gh(['pr', 'view', pr, '--json', 'title,body'], 15_000);
+    const view = deps.gh(['pr', 'view', pr, '--json', 'title,body'], 15_000);
     let prView: { title?: string; body?: string } | undefined;
     if (view.status === 0) {
       try { prView = JSON.parse(view.stdout) as { title?: string; body?: string }; } catch { /* fallback below */ }
@@ -2633,6 +2692,9 @@ async function runSelfReviewCliCommandPinned(
     const contextWithPack = pack
       ? { ...baseReviewerContext, items: [...baseReviewerContext.items, { label: 'review context pack', body: pack.text }] }
       : baseReviewerContext;
+    const reviewScopeContract = buildReviewScopeContractContext({
+      prBody: body ?? '', previouslyFixedFindings: savedEvidence.latestFixedFindings,
+    });
     const reviewerContext = appendDecompositionContext(contextWithPack, decompositionContext);
     const reviewerContextStatus = renderReviewerContextStatus(reviewerContext, decompositionContext);
     let intent: string;
@@ -2839,6 +2901,7 @@ async function runSelfReviewCliCommandPinned(
     const reviewInput: ReviewInput = {
       prDiff: evidence.diff,
       phaseIntent: intent,
+      reviewScopeContract,
       evidenceNote: evidenceLine,
       ...(reviewerContext.items.length ? { reviewerContext: reviewerContext.items } : {}),
       referencedFilesAlreadyOpened: baseReviewerContext.items.filter((item) => item.label !== 'provided text' && !item.image).length,

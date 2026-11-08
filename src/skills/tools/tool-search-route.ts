@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── 소환기 라우팅 헬퍼 (F2 · RFC-observability-driven-tool-selection · 2026-07-26) ──
 //
 // tier-flip 이 무언가를 defer 하면 ToolSearch 를 active 에 **주입**한다. 그러면
@@ -16,7 +17,7 @@
 import { dispatchToolSearch } from './tool-search.js';
 import { TOOL_SEARCH_NAME } from './tool-search-spec.js';
 import { debug } from '../../debug/log.js';
-import type { LLMToolSpec } from '../../llm.js';
+
 
 export { TOOL_SEARCH_NAME };
 

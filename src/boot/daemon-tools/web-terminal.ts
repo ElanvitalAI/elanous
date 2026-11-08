@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Daemon-tool surface for web-terminal LLM tools.
 //
 // PWA-only `elanous serve` mode bypasses the dashboard's
@@ -16,7 +17,7 @@
 // or (b) snapshot grows a `format: 'png'` option (WT-C-2), both
 // surfaces inherit the change.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 import {
   buildWebTerminalListTool,

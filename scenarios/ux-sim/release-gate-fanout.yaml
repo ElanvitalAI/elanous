@@ -1,0 +1,48 @@
+version: 1
+kind: release-graph
+id: release-gate-fanout-sim
+isolation: test
+input:
+  version: 0.3.7
+  previousVersion: 0.3.6
+  releaseGateFanout: true
+cases:
+  - id: successful-gates-continue-through-publish
+    mode: baseline
+    nodeOutcomes:
+      export-check: { outcome: ok, delayMs: 25 }
+      pwa: { outcome: ok, delayMs: 20 }
+      tsc: { outcome: ok, delayMs: 15 }
+      ratchet: { outcome: ok, delayMs: 10 }
+      gate: { outcome: ok, delayMs: 5 }
+    expect:
+      status: done
+      mustVisit: [pre-gate-join, traffic-gate-passed, publish, npm-publish, traffic-npm-published, docs-land, version-dev-bump, release-post-publish-join, verify, done]
+      mustNotVisit: [traffic-failed-restore]
+  - id: traffic-record-failure-still-completes-post-publish-work
+    mode: baseline
+    nodeOutcomes:
+      export-check: { outcome: ok, delayMs: 25 }
+      pwa: { outcome: ok, delayMs: 20 }
+      tsc: { outcome: ok, delayMs: 15 }
+      ratchet: { outcome: ok, delayMs: 10 }
+      gate: { outcome: ok, delayMs: 5 }
+      traffic-npm-published: { outcome: fail, delayMs: 1 }
+    expect:
+      status: done
+      mustVisit: [pre-gate-join, publish, npm-publish, traffic-npm-published, docs-land, version-dev-bump, release-post-publish-join, verify, done]
+      mustNotVisit: [traffic-failed-restore]
+  - id: two-gates-fail-together
+    mode: baseline
+    nodeOutcomes:
+      export-check: { outcome: fail, delayMs: 60 }
+      pwa: { outcome: fail, delayMs: 40 }
+      tsc: { outcome: ok, delayMs: 30 }
+      ratchet: { outcome: ok, delayMs: 20 }
+      gate: { outcome: ok, delayMs: 10 }
+      mac-smoke: { outcome: ok, delayMs: 5 }
+    expect:
+      status: failed
+      mustVisit: [export-check, pwa, tsc, ratchet, gate, checklist-gate, prefetch, mac-smoke, pre-gate-join, traffic-failed-restore, failed]
+      mustNotVisit: [publish, npm-publish]
+      overlap: [export-check, pwa]

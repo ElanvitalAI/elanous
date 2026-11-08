@@ -1,8 +1,9 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 /**
  * TaskDecompose + TaskDecomposeApply runtimes — LLM-driven split +
  * user-approval apply.
  */
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 import type { TaskSurfaceKind } from '../types.js';
 import type {

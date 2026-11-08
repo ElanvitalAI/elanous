@@ -42,7 +42,7 @@ import {
   type SafetyDecision,
   type WriteRequest,
 } from './types.js';
-import { assertPlanGate } from '../plan-mode/index.js';
+import { assertPlanGate } from '../plan-mode/write-gate.js';
 
 /** Act on a SafetyDecision. Returns an EditError when the edit must
  *  NOT proceed (rejected by policy, rejected by user, or no approver

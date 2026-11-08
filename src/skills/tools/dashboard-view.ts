@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // HT1/HT2 — Native tools: DashboardViewSwitch + DashboardWidgetInvoke.
 //
 // Lets the LLM (in control / skill modes) flip dashboard
@@ -11,7 +12,7 @@
 // just change which view is active and deliver keystrokes that the
 // target widget's onKey already understands.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 export interface DashboardViewInfo {
   id: string;

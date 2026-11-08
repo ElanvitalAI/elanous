@@ -112,15 +112,13 @@ export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
   { href: '/workflows/chat-ui', category: 'workflow-subflow', reason: 'Workflows에서 여는 hosted chat 하위 흐름.' },
   { href: '/', category: 'root-welcome', reason: '첫 방문자를 위한 루트 welcome 화면.' },
   { href: '/404', category: 'error-page', reason: '오류 페이지.' },
-  { href: '/decisions', category: 'operator-direct-link', reason: '대표 결정 화면(OPS-BOARD #24604) — /ceo 「결정 대기 카드」에서 들어간다(메뉴엔 /ceo 만).' },
-  { href: '/ops/resources', category: 'operator-direct-link', reason: '수호자 자원 원장 화면(#34368) — /ceo 자원 카드에서 들어가는 읽기 전용 운영 화면.' },
+  { href: '/ops/resources', category: 'operator-direct-link', reason: '수호자 자원 원장 화면(#34368) — 메뉴 밖 직접 경로로 여는 읽기 전용 운영 화면.' },
   { href: '/consult', category: 'contact-form', reason: 'AX 도입 상담·과정 문의를 접수하는 입력 화면(CS1 · #22436).' },
   { href: '/morning', category: 'unwired-screen', reason: '부르는 백엔드가 아직 없는 미배선 화면.' },
   { href: '/inside', category: 'beta-direct-link', reason: '시연자가 주소로 여는 엘라누스 안쪽 장면 지도(메뉴에는 노출하지 않음).' },
   // 481c22af2 로 diagnostic-readonly 분류가 생겼다. `/design-check` 는 2026-09-28 탭 다이어트에서
   // 메뉴 «Design» 으로 올라갔다(카드·시안·내 시스템 — 디자인 시스템 공개 결정).
   // 메뉴 «운영» 칸은 NAV1(0.2.10)에서 연다 — 이번 판은 주소로 연다.
-  { href: '/botlab', category: 'diagnostic-readonly', reason: '봇 화면 «벽»을 한 자리에서 보는 읽기 진단 화면(#15390 · 봇 운영자용).' },
 ];
 
 export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
@@ -143,14 +141,12 @@ export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { group: 'files', href: '/field', label: '현장 올리기', hint: '현장 올리기 · 사진과 메모', icon: Inbox, kind: null },
   { group: 'files', href: '/market', label: '마켓', hint: '플러그인 찾아보기 · 상세 · 설치됨', icon: Store, kind: null },
   { group: 'settings', href: '/settings', label: '설정', hint: '환경 + provider + theme', icon: Settings, kind: 'settings' },
-  { group: 'ops', href: '/ceo', label: '대표 조망판', hint: '판 진행 · 루프 판정 · 결정 대기 · 오늘 병합', icon: LayoutGrid, kind: null },
   { group: 'ops', href: '/loops', label: '루프 현황', hint: '루프·크론 발화 상태 (읽기 전용 · beta)', icon: Activity, kind: null },
   // 같은 주소(/loops)의 «보기» — 주소 회계는 `sidebarRoutePath` 로 경로만 센다(LOOP-INTERACT D).
   { group: 'ops', href: '/loops?view=interact', label: '루프 상호작용', hint: '자리·루프·런 사이 실제 사건 지도 (?journey=<카드> 여정 · 실시간)', icon: Share2, kind: null },
   { group: 'ops', href: '/ops/release', label: '릴리스', hint: '판 진행 노드 줄 · 로그 꼬리', icon: GitBranch, kind: null },
   { group: 'ops', href: '/ops/checklist', label: '판별 피처', hint: '확인표 칸 목록 · 상태 · 담당 · 근거', icon: GitPullRequest, kind: null },
   { group: 'ops', href: '/ops/seats', label: '자리 현황', hint: '자리별 지금 일 · 착지 · 막힘 · 결정 대기(?capture=public 공개 시연)', icon: Users, kind: null },
-  { group: 'ops', href: '/bots', label: '봇', hint: '봇 신원 + 공통 명령 카탈로그 (읽기 전용)', icon: Bot, kind: null, visibility: 'hidden' },
   { group: 'ops', href: '/observatory', label: '관측', hint: 'subject 관측 (talk · screen · agent)', icon: Telescope, kind: null, visibility: 'hidden' },
   { group: 'ops', href: '/worktrees', label: '작업 트리', hint: '격리 작업 트리 목록·상태', icon: GitBranch, kind: null, visibility: 'hidden' },
   { group: 'ops', href: '/control', label: '제어', hint: '데몬 제어 패널', icon: Sliders, kind: 'control', visibility: 'hidden' },

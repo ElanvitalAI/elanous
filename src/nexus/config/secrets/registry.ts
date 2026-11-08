@@ -7,20 +7,28 @@
 
 import { assertSharedSecretId, type SecretBackend, type SecretBackendId } from './types.js';
 import { appSecretLockKeyForLegacyId, hasAppSecretEventForId, withAppSecretLock } from './app-secret-ledger.js';
-import { fileBackend } from './file-backend.js';
+import { fileBackend, hasCredentialRegistrationReceipt as hasFileCredentialRegistrationReceipt, writeCredentialSlotBatchRaw } from './file-backend.js';
 import { readUserConfig, readSwitchValue } from '../user-config.js';
+import { assertCredentialSlotId } from './cred-slot-schema.js';
 
 const backends = new Map<SecretBackendId, SecretBackend>();
 const guardedBackends = new Map<SecretBackendId, SecretBackend>();
 const guardedBackendObjects = new WeakSet<object>();
+const rawMutations = new WeakMap<object, { set: (id: string, value: string) => Promise<void>; delete: (id: string) => Promise<boolean> }>();
 
 function guardBackend(backend: SecretBackend): SecretBackend {
   if (guardedBackendObjects.has(backend)) return backend;
   const mutable = backend as SecretBackend;
   const set = backend.set.bind(backend);
   const remove = backend.delete.bind(backend);
-  mutable.set = (id, value) => { assertSharedSecretId(id); return set(id, value); };
+  rawMutations.set(backend, { set, delete: remove });
+  mutable.set = (id, value) => {
+    assertSharedSecretId(id);
+    if (id.startsWith('cred:')) throw new Error('ELANOUS_CREDENTIAL_SLOT_WRITER_REQUIRED');
+    return set(id, value);
+  };
   mutable.delete = async (id) => {
+    if (id.startsWith('cred:')) throw new Error('ELANOUS_CREDENTIAL_SLOT_WRITER_REQUIRED');
     if (!id.startsWith('app/')) return remove(id);
     const deleteLegacy = async (assertHeld: () => void): Promise<boolean> => {
       if (await hasAppSecretEventForId(id)) throw new Error('ELANOUS_APP_SECRET_LEDGER_REQUIRED');
@@ -35,6 +43,36 @@ function guardBackend(backend: SecretBackend): SecretBackend {
   };
   guardedBackendObjects.add(backend);
   return backend;
+}
+
+/** @internal Used by cred-slots after canonical slot validation. */
+export async function writeCredentialSlotValue(id: string, value: string): Promise<void> {
+  assertCredentialSlotId(id);
+  const backend = currentBackend();
+  const mutation = rawMutations.get(backend);
+  if (!mutation) throw new Error('ELANOUS_SECRET_BACKEND_UNAVAILABLE');
+  await mutation.set(id, value);
+}
+
+/** @internal Used by cred-slots after canonical slot validation. */
+export async function removeCredentialSlotValue(id: string): Promise<boolean> {
+  assertCredentialSlotId(id);
+  const backend = currentBackend();
+  const mutation = rawMutations.get(backend);
+  if (!mutation) throw new Error('ELANOUS_SECRET_BACKEND_UNAVAILABLE');
+  return mutation.delete(id);
+}
+
+/** @internal Atomic file-backed batch for a single logical credential registration. */
+export function writeCredentialSlotBatchValue(values: Readonly<Record<string, string>>, receipt?: { id: string; valueHash: string }): void {
+  if (currentBackendId() !== 'file') throw new Error('ELANOUS_CREDENTIAL_SLOT_BATCH_BACKEND_UNSUPPORTED');
+  for (const id of Object.keys(values)) assertCredentialSlotId(id);
+  writeCredentialSlotBatchRaw(values, receipt);
+}
+
+/** @internal Reads only the one-way receipt, never a credential value. */
+export function hasCredentialSlotWriteReceipt(id: string, valueHash: string): boolean {
+  return hasFileCredentialRegistrationReceipt(id, valueHash);
 }
 let currentId: SecretBackendId = 'file';
 

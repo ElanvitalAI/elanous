@@ -1,10 +1,11 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── 미션 결정 기록 도구 (L2 core · RFC-mission-decision-injection-2026-07-15) ──
 //
 // elanous 에이전트·외부 도구(Claude Code/Codex)가 미션에 대한 운영 결정(re-ground·defer·check-pass·
 // boundary…)을 프로그램적으로 기록. self_recall·logs_query 옆 L2 코어 도구. dispatch 는
 // recordMissionDecision(통합 창구·3박자) 재사용 — 워킹메모리+logs.db+기억(surface_events)+ops.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { TaskStore } from '../task-orchestrator/store.js';
 import { recordMissionDecision, type MissionDecisionKind } from './mission-decision.js';
 

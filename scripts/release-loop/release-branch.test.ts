@@ -244,7 +244,8 @@ test('RELEASE-BRANCH resume refuses a non-fast-forward tip, a run that is not fa
     write('failed', { version: '0.2.18-rc.0' }, undefined);
     expect(() => refreshReleaseBranchTip('r', { root, git, isAncestor: () => true })).toThrow('was not cut as release/0.2.18-rc.0');
     write('failed', { version: '0.2.18-rc.0', cutCommit: 'a'.repeat(40) }, 'release/0.2.18-rc.0');
-    expect(() => refreshReleaseBranchTip('r', { root, git, isAncestor: () => true })).toThrow('was not cut as');
+    expect(refreshReleaseBranchTip('r', { root, git, isAncestor: () => true })).toMatchObject({ version: '0.2.18-rc.0',
+      branch: 'cut-commit', from: 'a'.repeat(40), to: 'a'.repeat(40), changed: false });
     write('failed');
     expect(() => refreshReleaseBranchTip('r', { root, git, isAncestor: () => false })).toThrow('does not descend');
     const original = readFileSync(runFile, 'utf8');
@@ -259,6 +260,11 @@ test('RELEASE-BRANCH resume refuses a non-fast-forward tip, a run that is not fa
       graph: async (_path, options) => { graphs++; expect(options).toMatchObject({ resumeRunId: 'r', fromNodeId: 'gate', pinChildUniverse: true }); return { status: 'done', runId: 'r' } as never; } });
     expect(resumed.tip).toMatchObject({ changed: true, to: 'b'.repeat(40) });
     expect(graphs).toBe(1);
+    write('budget-exceeded');
+    await expect(resumeReleaseRun({ runId: 'r', from: 'gate' }, { root, git, isAncestor: () => true }))
+      .rejects.toThrow('use --resume-budget-exceeded --reason');
+    await expect(resumeReleaseRun({ runId: 'r', from: 'gate', resumeBudgetExceeded: true }, { root, git, isAncestor: () => true }))
+      .rejects.toThrow('--resume-budget-exceeded requires --reason');
     write('done');
     expect(() => refreshReleaseBranchTip('r', { root, git })).toThrow('only a failed run');
     expect(() => refreshReleaseBranchTip('../r', { root, git })).toThrow('invalid run id');
@@ -455,15 +461,15 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
       if (context.nodeId === failNode) return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}\n' };
       return { exitCode: 0, stderr: '', stdout: '{"outcome":"ok","verdict":"pass"}\n' };
     };
-    const resumeDeps = { root: state, ledgerRoot: state, repo: f.repo, runBash };
+    const resumeDeps = { root: state, ledgerRoot: state, repo: f.repo, runBash, macrophageInventory: () => [] };
     const { runGraph } = await import('../../src/graph-runner/runner.js');
     const first = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'),
       { input: { version: '0.2.18', previousVersion: '0.2.17', gatePodPool: 'pool', branchCut: true }, deps: { root: state, runBash } });
     expect(first.status).toBe('failed');
-    expect(first.path.slice(0, 6)).toEqual(['version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate']);
+    expect(first.path.slice(0, 6)).toEqual(['version-release', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'gate-triage']);
     const cut = git(f.origin, 'rev-parse', 'release/0.2.18');
-    expect(seen.map((item) => item.nodeId)).toEqual(['traffic-cut-start', 'cutoff', 'export-check', 'checklist-gate', 'prefetch', 'gate', 'gate-triage', 'traffic-failed-restore']);
-    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut, cut, cut, cut, cut]);
+    expect(seen.map((item) => item.nodeId)).toEqual(['traffic-cut-start', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'gate-triage', 'traffic-failed-restore']);
+    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut, cut, cut, cut]);
     const fix = f.land('fix.ts', 'export const fix = true;\n');
     const base = git(f.origin, 'rev-parse', `${cut}^`);
     cutReleaseBranch({ version: '0.2.18', base, pick: [fix], append: true, repoRoot: f.repo, log: () => {} });
@@ -474,14 +480,21 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     mkdirSync(join(commandRoot, 'node_modules'), { recursive: true });
     mkdirSync(join(commandRoot, 'apps', 'pwa', 'node_modules'), { recursive: true });
     failNode = 'export-check';
-    await expect(resumeReleaseRun({ runId: first.runId, from: 'gate', commandRoot }, resumeDeps))
-      .rejects.toThrow('resume at export-check or earlier');
+    await expect(resumeReleaseRun({ runId: first.runId, from: 'gate-triage', commandRoot }, resumeDeps))
+      .rejects.toThrow('resume at gate or earlier');
     seen.length = 0;
-    const exportRepair = await resumeReleaseRun({ runId: first.runId, from: 'export-check', commandRoot }, resumeDeps);
+    const gateRepair = await resumeReleaseRun({ runId: first.runId, from: 'gate', commandRoot }, resumeDeps);
+    expect(gateRepair.state.status).toBe('failed');
+    expect(seen[0]?.nodeId).toBe('gate');
+    expect(seen.findIndex((item) => item.nodeId === 'gate')).toBeLessThan(seen.findIndex((item) => item.nodeId === 'export-check'));
+    expect(seen.filter((item) => item.nodeId === 'gate')).toHaveLength(1);
+    expect(seen.filter((item) => item.nodeId === 'export-check')).toHaveLength(1);
+    seen.length = 0;
+    const exportRepair = await resumeReleaseRun({ runId: first.runId, from: 'traffic-gate-passed', commandRoot }, resumeDeps);
     expect(exportRepair.state.status).toBe('failed');
     expect(seen.filter((item) => item.nodeId === 'export-check')).toHaveLength(1);
     failNode = 'prepare';
-    const prepareRepair = await resumeReleaseRun({ runId: first.runId, from: 'export-check', commandRoot }, resumeDeps);
+    const prepareRepair = await resumeReleaseRun({ runId: first.runId, from: 'traffic-gate-passed', commandRoot }, resumeDeps);
     expect(prepareRepair.state.status).toBe('failed');
     expect(seen.filter((item) => item.nodeId === 'prepare')).toHaveLength(1);
     failNode = 'known-issues';

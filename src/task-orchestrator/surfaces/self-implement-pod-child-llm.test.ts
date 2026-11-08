@@ -40,7 +40,7 @@ describe('CHILD-LLM-PIN-POD — delegated Pod commands carry the child LLM', () 
 
   test('(d) legacy self implement args pass through once beside the deadline marker', () => {
     const script = scriptOf(['--open-pr', '--base', 'main', ...CHILD], {});
-    const legacyLine = lineOf(script, 'elanous self implement')!;
+    const legacyLine = lineOf(script, 'elanous self implement "$(cat /creds/feature)"')!;
     expect(legacyLine).toContain(`elanous self implement "$(cat /creds/feature)" --json '--open-pr' '--base' 'main' '--child-llm-provider' 'openrouter' '--child-llm-model' 'openrouter/openai/gpt-6-luna'`);
     expect(legacyLine.split('--child-llm-provider').length - 1).toBe(1);
     expect(script).toContain('/tmp/si.deadline-marker');

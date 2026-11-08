@@ -1,9 +1,11 @@
 import { Database } from 'bun:sqlite';
 import { mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { AppManifest } from './app-contract.js';
+import { projectAppLifecycleSnapshot, validateAppLifecycleEvent, type AppLifecycleEvent, type AppLifecycleSnapshot } from './app-lifecycle-ledger.js';
 import { appObjectKey } from '../../storage/object-store.js';
 import { getElanousConfigDir } from '../../elanous-config-dir.js';
+import { nexusRootDir } from '../paths.js';
 import { sqlNowIso } from '../../time/db-window.js';
 
 type Column = { type?: unknown; primary?: unknown; default?: unknown };
@@ -14,6 +16,125 @@ const LEGACY_CURRENT_TIMESTAMP = ['CURRENT', '_TIMESTAMP'].join('');
 export interface AppDatabase {
   rpc(slug: string, name: string, params: Readonly<Record<string, unknown>> | undefined, role: string): unknown[];
   close(): void;
+}
+
+export interface AppLifecycleStore {
+  appendEvent(event: AppLifecycleEvent): AppLifecycleSnapshot | null;
+  ensureCreated(event: AppLifecycleEvent): AppLifecycleSnapshot | null;
+  events(appId: string): AppLifecycleEvent[];
+  snapshot(appId: string): AppLifecycleSnapshot | null;
+  view(appId: string): { events: AppLifecycleEvent[]; snapshot: AppLifecycleSnapshot | null };
+  snapshots(): AppLifecycleSnapshot[];
+  close(): void;
+}
+
+interface AppLifecycleEventRow { event_id: string; app_id: string; sequence: number; event_json: string }
+interface AppLifecycleSnapshotRow { app_id: string; snapshot_json: string }
+
+/** Durable, append-only app lifecycle events and their tile projection. Each append updates both in one SQLite transaction. */
+export function createAppLifecycleStore(databasePath = join(nexusRootDir(), 'app-lifecycle.sqlite')): AppLifecycleStore {
+  if (!databasePath.trim()) throw new Error('app lifecycle ledger path is required');
+  mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
+  const db = new Database(databasePath);
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec(`CREATE TABLE IF NOT EXISTS app_lifecycle_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id TEXT NOT NULL UNIQUE,
+      app_id TEXT NOT NULL,
+      event_json TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS app_lifecycle_events_app_sequence ON app_lifecycle_events(app_id, sequence)');
+    db.exec(`CREATE TABLE IF NOT EXISTS app_lifecycle_snapshots (
+      app_id TEXT PRIMARY KEY,
+      snapshot_json TEXT NOT NULL
+    )`);
+  } catch (error) { db.close(); throw error; }
+  let closed = false;
+  const assertOpen = () => { if (closed) throw new Error('app lifecycle ledger is closed'); };
+  const readEvents = (appId: string): AppLifecycleEvent[] => {
+    const rows = db.query('SELECT event_id, app_id, sequence, event_json FROM app_lifecycle_events WHERE app_id = ? ORDER BY sequence')
+      .all(appId) as AppLifecycleEventRow[];
+    try {
+      return rows.map(row => {
+        const event = validateAppLifecycleEvent(JSON.parse(row.event_json));
+        if (event.id !== row.event_id || event.appId !== row.app_id) throw new Error('identity mismatch');
+        return event;
+      });
+    } catch { throw new Error('app lifecycle ledger is corrupt'); }
+  };
+  const readSnapshot = (appId: string): AppLifecycleSnapshot | null => {
+    const events = readEvents(appId);
+    const expected = projectAppLifecycleSnapshot(appId, events);
+    const row = db.query('SELECT app_id, snapshot_json FROM app_lifecycle_snapshots WHERE app_id = ?').get(appId) as AppLifecycleSnapshotRow | null;
+    if (!expected) {
+      if (row) throw new Error('app lifecycle ledger is corrupt');
+      return null;
+    }
+    if (!row) throw new Error('app lifecycle ledger is corrupt');
+    try {
+      const stored = JSON.parse(row.snapshot_json) as AppLifecycleSnapshot;
+      if (row.app_id !== appId || JSON.stringify(stored) !== JSON.stringify(expected)) throw new Error('projection mismatch');
+    } catch { throw new Error('app lifecycle ledger is corrupt'); }
+    return expected;
+  };
+  const insertEvent = (event: AppLifecycleEvent): AppLifecycleSnapshot | null => {
+    db.query('INSERT INTO app_lifecycle_events(event_id, app_id, event_json) VALUES (?, ?, ?)')
+      .run(event.id, event.appId, JSON.stringify(event));
+    const snapshot = projectAppLifecycleSnapshot(event.appId, readEvents(event.appId));
+    if (snapshot) db.query(`INSERT INTO app_lifecycle_snapshots(app_id, snapshot_json) VALUES (?, ?)
+      ON CONFLICT(app_id) DO UPDATE SET snapshot_json = excluded.snapshot_json`).run(event.appId, JSON.stringify(snapshot));
+    else db.query('DELETE FROM app_lifecycle_snapshots WHERE app_id = ?').run(event.appId);
+    return snapshot;
+  };
+  const readView = (appId: string) => ({ events: readEvents(appId), snapshot: readSnapshot(appId) });
+  const readViewTransaction = (appId: string) => {
+    db.exec('BEGIN');
+    try {
+      const view = readView(appId);
+      db.exec('COMMIT');
+      return view;
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  };
+  return {
+    appendEvent(input) {
+      assertOpen();
+      const event = validateAppLifecycleEvent(input);
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        readSnapshot(event.appId);
+        const snapshot = insertEvent(event);
+        db.exec('COMMIT');
+        return snapshot;
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    ensureCreated(input) {
+      assertOpen();
+      const event = validateAppLifecycleEvent(input);
+      if (event.action !== 'created' || event.outcome !== 'succeeded') throw new Error('app lifecycle seed must be a successful created event');
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const current = readView(event.appId);
+        if (current.events.some(item => item.action === 'created' && item.outcome === 'succeeded')) {
+          db.exec('COMMIT');
+          return current.snapshot;
+        }
+        const snapshot = insertEvent(event);
+        db.exec('COMMIT');
+        return snapshot;
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    events(appId) { assertOpen(); return readViewTransaction(appId).events; },
+    snapshot(appId) { assertOpen(); return readViewTransaction(appId).snapshot; },
+    view(appId) { assertOpen(); return readViewTransaction(appId); },
+    snapshots() {
+      assertOpen();
+      const rows = db.query('SELECT app_id FROM app_lifecycle_snapshots ORDER BY app_id').all() as Array<{ app_id: string }>;
+      return rows.map(row => readViewTransaction(row.app_id).snapshot).filter((snapshot): snapshot is AppLifecycleSnapshot => snapshot !== null);
+    },
+    close() { if (!closed) { closed = true; db.close(); } },
+  };
 }
 
 function identifier(value: string): string { return `"${value.replaceAll('"', '""')}"`; }

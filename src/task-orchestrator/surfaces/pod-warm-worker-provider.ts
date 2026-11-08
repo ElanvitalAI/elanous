@@ -11,7 +11,8 @@ import { getUserConfig } from '../../user-config.js';
 import { resolveWarmPoolProfile, resolveWarmPoolQuota, type WarmPoolProfile, type WarmPoolTier } from '../../self-implement/pod-warm-pool-profile.js';
 import { WarmPodTransport, probeWarmPodContext, probeWarmPodRuntimeContract, imageReferencesDifferOnlyByDigest, warmWorkerPodManifest, type WarmPodSpec, type WarmPodTransportResult } from './pod-warm-worker-pod.js';
 import type { WarmWorkerCommand } from './pod-warm-worker-protocol.js';
-import { patchWarmLeaseMetadata, warmLeaseMetadata } from './pod-warm-provenance.js';
+import { runtimeArchitecturesMatch, type RuntimeIdentityInput } from '../../runtime-identity.js';
+import { patchWarmLeaseMetadata, scoreWarmPodCandidates, warmLeaseMetadata, type WarmPodKind } from './pod-warm-provenance.js';
 import type { LogStore } from '../../mss/logging/log-store.js';
 
 // Cold source install on node-b exceeded five minutes; recheck the pinned Pod UID in bounded intervals.
@@ -21,6 +22,7 @@ const POD_READY_RETRY_DELAY_MS = 1_000;
 const WARM_CONTROL_REQUEST_TIMEOUT_MS = 2_000;
 const WARM_POD_LIST_PAGE_SIZE = 25;
 const WARM_POD_LIST_MAX_PAGES = 20;
+const WARM_QUARANTINED_LABEL = 'elanous.ai/quarantined';
 
 function throwIfPrepareAborted(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
@@ -46,7 +48,9 @@ function waitForPrepareRetry(signal?: AbortSignal): Promise<void> {
 
 export type WarmReplayInput = Omit<WarmWorkerCommand, 'leaseId' | 'generation' | 'workerId' | 'key'>;
 export interface WarmReplayResult { command: WarmWorkerCommand | null; transport: WarmPodTransportResult }
-export interface WarmWorkerCandidate { host: string; tier: WarmPoolTier; spec: WarmPodSpec; slotCount?: number }
+export interface WarmWorkerCandidate { host: string; tier: WarmPoolTier; spec: WarmPodSpec; slotCount?: number;
+  /** Worker purpose is part of admission identity; untagged legacy pool entries are gate workers. */
+  kind?: WarmPodKind }
 export interface WarmPodDeleteOptions {
   apiVersion: 'v1'; kind: 'DeleteOptions'; preconditions: { uid: string };
 }
@@ -66,6 +70,10 @@ export interface WarmPodProviderOptions {
   /** Only the trusted producer host has these credentials; consumers may omit them. */
   machineTokens?: Readonly<Record<string, string>>;
   profileConfig?: unknown;
+  /** Optional multi-arch image policy. Omitted means exact runtime architecture only. */
+  allowedArchitectures?: readonly ('amd64' | 'arm64')[];
+  /** Trusted target tuple; absent or malformed identity disables reuse. */
+  runtimeIdentity?: RuntimeIdentityInput;
   leaseTtlMs?: number;
   fetch?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
   transport?: (spec: WarmPodSpec) => Pick<WarmPodTransport, 'request'>;
@@ -283,8 +291,14 @@ export class WarmPodProvider {
   private readonly legs: WarmReuseTimeLegRow[] = [];
   /** One terminal transition per fenced lease, including concurrent callers. Failed transitions remain retryable. */
   private readonly terminalLeases = new Map<string, Promise<'sanitized' | 'quarantined'>>();
+  /** Exact leases whose runtime returned `complete` after whitelist cleanup and residue verification. */
+  private readonly cleanupVerifiedLeases = new Set<string>();
   /** A gate fallback supersedes an in-flight sanitize even if its control reply is late. */
   private readonly quarantineRequested = new Set<string>();
+  /** Worker IDs with a terminal quarantine request are never selected again by this provider. */
+  private readonly quarantineBlockedWorkerIds = new Set<string>();
+  /** A failed private-state write disables all warm selections until this provider is replaced. */
+  private warmReuseDisabled = false;
   private readonly terminalEndLogged = new Set<string>();
   /** Leases observed at the provider boundary; used only to report transition deltas. */
   private readonly observedOccupancyLeases = new Map<string, { candidate: WarmWorkerCandidate; runId: string | null }>();
@@ -297,11 +311,18 @@ export class WarmPodProvider {
   private readonly standingWorkers = new Map<string, Promise<boolean>>();
   /** This instance's prepare-lease flock binding; null means the platform cannot lock and every slot fails. */
   private readonly prepareFlock: WarmPrepareFlock | null;
+  /** Quarantine-state synchronization uses the real platform lock, independent of prepare test injection. */
+  private readonly quarantineStateFlock: WarmPrepareFlock | null;
   private readonly quotaResolver: typeof resolveWarmPoolQuota;
   constructor(private readonly options: WarmPodProviderOptions) {
     const url = new URL(options.controlUrl);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash
       || url.pathname !== '/' || !token(options.memberToken)) throw new Error('invalid warm control address');
+    if (options.allowedArchitectures !== undefined
+      && (!Array.isArray(options.allowedArchitectures)
+        || options.allowedArchitectures.some(arch => arch !== 'amd64' && arch !== 'arm64')
+        || new Set(options.allowedArchitectures).size !== options.allowedArchitectures.length))
+      throw new Error('invalid warm Pod allowed architectures');
     this.quotaResolver = options.quotaResolverForTest ?? resolveWarmPoolQuota;
     const profile = resolveWarmPoolProfile(options.profileConfig ?? getUserConfig());
     this.profile = profile;
@@ -327,7 +348,7 @@ export class WarmPodProvider {
     }
     const expanded = templateSlots.flatMap(({ candidate, slots }) => {
       return Array.from({ length: slots }, (_, index): WarmWorkerCandidate => ({
-        host: candidate.host, tier: candidate.tier,
+        host: candidate.host, tier: candidate.tier, ...(candidate.kind ? { kind: candidate.kind } : {}),
         spec: {
           ...candidate.spec,
           name: `warm-${candidate.host}-${candidate.tier}-${index + 1}`,
@@ -339,6 +360,9 @@ export class WarmPodProvider {
     this.candidates = [...options.candidates.map(row => ({ ...row, spec: { ...row.spec } })), ...expanded];
     if (options.rotationStatePath) {
       const rotations = this.readRotations(options.rotationStatePath);
+      this.warmReuseDisabled = this.readWarmReuseDisabled(options.rotationStatePath);
+      if (!this.warmReuseDisabled)
+        for (const id of this.readQuarantinedWorkerIds(options.rotationStatePath)) this.quarantineBlockedWorkerIds.add(id);
       for (const row of this.candidates) {
         const rotated = rotations[`${row.host}/${row.spec.name}`];
         if (rotated) row.spec = { ...row.spec, workerId: rotated };
@@ -368,6 +392,7 @@ export class WarmPodProvider {
     // An omitted option keeps the platform binding; an explicit false/null declares flock unsupported.
     this.prepareFlock = options.prepareFlock === undefined ? prepareFlock
       : options.prepareFlock === false ? null : options.prepareFlock;
+    this.quarantineStateFlock = prepareFlock;
   }
 
   private async control(path: string, credential: string, body?: Record<string, unknown>): Promise<{ status: number; value: any }> {
@@ -546,6 +571,153 @@ export class WarmPodProvider {
     return parsed as Record<string, string>;
   }
 
+  private readQuarantinedWorkerIds(rotationPath: string): string[] {
+    const path = `${rotationPath}.quarantined`;
+    if (!existsSync(path)) return [];
+    const info = lstatSync(path);
+    const uid = typeof process.getuid === 'function' ? process.getuid() : userInfo().uid;
+    if (!info.isFile() || info.isSymbolicLink() || info.uid !== uid || (info.mode & 0o077) !== 0)
+      throw new Error('unsafe warm quarantine state');
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    if (!Array.isArray(parsed) || parsed.some(id => !workerId(id)) || new Set(parsed).size !== parsed.length)
+      throw new Error('invalid warm quarantine state');
+    return parsed as string[];
+  }
+
+  private readWarmReuseDisabled(rotationPath: string): boolean {
+    const path = `${rotationPath}.disabled`;
+    if (!existsSync(path)) return false;
+    const info = lstatSync(path);
+    const uid = typeof process.getuid === 'function' ? process.getuid() : userInfo().uid;
+    if (!info.isFile() || info.isSymbolicLink() || info.uid !== uid || (info.mode & 0o077) !== 0)
+      throw new Error('unsafe warm provider disable state');
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || (parsed as { disabled?: unknown }).disabled !== true) throw new Error('invalid warm provider disable state');
+    return true;
+  }
+
+  private persistQuarantinedWorkerIds(): void {
+    const rotationPath = this.options.rotationStatePath;
+    if (!rotationPath) return;
+    const path = `${rotationPath}.quarantined`;
+    if (!this.quarantineStateFlock) throw new Error('warm quarantine state lock is unavailable');
+    const lockPath = `${rotationPath}.lock`;
+    const fd = openSync(lockPath, constants.O_CREAT | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0), 0o600);
+    try {
+      const info = lstatSync(lockPath);
+      const uid = typeof process.getuid === 'function' ? process.getuid() : userInfo().uid;
+      if (!info.isFile() || info.isSymbolicLink() || info.uid !== uid || (info.mode & 0o077) !== 0
+        || this.quarantineStateFlock(fd, LOCK_EX) !== 0) throw new Error('unsafe warm quarantine state lock');
+      for (const id of this.readQuarantinedWorkerIds(rotationPath)) this.quarantineBlockedWorkerIds.add(id);
+      const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+      writeFileSync(temporary, JSON.stringify([...this.quarantineBlockedWorkerIds].sort()), { mode: 0o600, flag: 'wx' });
+      const temporaryFd = openSync(temporary, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      try { fsyncSync(temporaryFd); } finally { closeSync(temporaryFd); }
+      try {
+        renameSync(temporary, path);
+        const directoryFd = openSync(dirname(path), constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
+        try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+      } catch (error) { rmSync(temporary, { force: true }); throw error; }
+    } finally {
+      this.quarantineStateFlock(fd, LOCK_UN);
+      closeSync(fd);
+    }
+  }
+
+  private persistWarmReuseDisabled(): void {
+    const rotationPath = this.options.rotationStatePath;
+    if (!rotationPath || !this.quarantineStateFlock) throw new Error('warm provider disable state is not writable');
+    const path = `${rotationPath}.disabled`;
+    const lockPath = `${rotationPath}.lock`;
+    const fd = openSync(lockPath, constants.O_CREAT | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0), 0o600);
+    try {
+      const info = lstatSync(lockPath);
+      const uid = typeof process.getuid === 'function' ? process.getuid() : userInfo().uid;
+      if (!info.isFile() || info.isSymbolicLink() || info.uid !== uid || (info.mode & 0o077) !== 0
+        || this.quarantineStateFlock(fd, LOCK_EX) !== 0) throw new Error('unsafe warm provider disable state lock');
+      const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+      writeFileSync(temporary, JSON.stringify({ disabled: true }), { mode: 0o600, flag: 'wx' });
+      const temporaryFd = openSync(temporary, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      try { fsyncSync(temporaryFd); } finally { closeSync(temporaryFd); }
+      try {
+        renameSync(temporary, path);
+        const directoryFd = openSync(dirname(path), constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
+        try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+      } catch (error) { rmSync(temporary, { force: true }); throw error; }
+    } finally {
+      this.quarantineStateFlock(fd, LOCK_UN);
+      closeSync(fd);
+    }
+  }
+
+  private refreshQuarantineState(): void {
+    if (this.warmReuseDisabled) return;
+    if (!this.options.rotationStatePath) {
+      this.warmReuseDisabled = true;
+      debug.log('pod.warm.provider', 'quarantine-state-read-failed', {
+        reason: 'warm quarantine state is not configured',
+      }, { level: 'warn' });
+      return;
+    }
+    let fd: number | undefined;
+    try {
+      if (!this.quarantineStateFlock) throw new Error('warm quarantine state lock is unavailable');
+      const lockPath = `${this.options.rotationStatePath}.lock`;
+      fd = openSync(lockPath, constants.O_CREAT | constants.O_RDWR | (constants.O_NOFOLLOW ?? 0), 0o600);
+      const info = lstatSync(lockPath);
+      const uid = typeof process.getuid === 'function' ? process.getuid() : userInfo().uid;
+      if (!info.isFile() || info.isSymbolicLink() || info.uid !== uid || (info.mode & 0o077) !== 0
+        || this.quarantineStateFlock(fd, LOCK_EX) !== 0) throw new Error('unsafe warm quarantine state lock');
+      const probe = `${this.options.rotationStatePath}.probe.${process.pid}.${randomUUID()}`;
+      const probeTemporary = `${probe}.tmp`;
+      try {
+        writeFileSync(probeTemporary, '{}', { mode: 0o600, flag: 'wx' });
+        renameSync(probeTemporary, probe);
+      } finally {
+        rmSync(probeTemporary, { force: true });
+        rmSync(probe, { force: true });
+      }
+      if (this.readWarmReuseDisabled(this.options.rotationStatePath)) {
+        this.warmReuseDisabled = true;
+        return;
+      }
+      for (const id of this.readQuarantinedWorkerIds(this.options.rotationStatePath)) this.quarantineBlockedWorkerIds.add(id);
+    } catch (error) {
+      this.warmReuseDisabled = true;
+      debug.log('pod.warm.provider', 'quarantine-state-read-failed', {
+        reason: error instanceof Error ? error.message : String(error),
+      }, { level: 'warn' });
+    } finally {
+      if (fd !== undefined) {
+        this.quarantineStateFlock?.(fd, LOCK_UN);
+        closeSync(fd);
+      }
+    }
+  }
+
+  private recordQuarantineBlock(workerId: string): void {
+    this.quarantineBlockedWorkerIds.add(workerId);
+    if (!this.options.rotationStatePath) {
+      debug.log('pod.warm.provider', 'quarantine-worker-block-unpersisted', {
+        workerId, reason: 'rotation-state-not-configured',
+      }, { level: 'warn' });
+      return;
+    }
+    try {
+      this.persistQuarantinedWorkerIds();
+    }
+    catch (error) {
+      this.warmReuseDisabled = true;
+      let markerError: unknown;
+      try { this.persistWarmReuseDisabled(); } catch (persistError) { markerError = persistError; }
+      debug.log('pod.warm.provider', 'quarantine-worker-block-persist-failed', {
+        workerId, reason: error instanceof Error ? error.message : String(error),
+        ...(markerError ? { disableMarkerError: markerError instanceof Error ? markerError.message : String(markerError) } : {}),
+      }, { level: 'warn' });
+    }
+  }
+
   private writeRotation(slot: string, id: string): void {
     const path = this.options.rotationStatePath;
     if (!path) throw new Error('warm rotation state is not configured');
@@ -619,6 +791,67 @@ export class WarmPodProvider {
       child?.kill('SIGTERM');
       if (exitPromise) await Promise.race([exitPromise, new Promise(resolve => setTimeout(resolve, 1_000))]);
     }
+  }
+
+  private kubectlForSpec(spec: WarmPodSpec, args: readonly string[]) {
+    const fullArgs = ['--context', spec.kubectlContext, '-n', spec.namespace, ...args];
+    try {
+      if (this.options.kubectl) return this.options.kubectl(fullArgs);
+      const env = { ...process.env };
+      for (const name of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) delete env[name];
+      const result = spawnSync('kubectl', fullArgs, { encoding: 'utf8', env, timeout: 15_000, maxBuffer: 2 * 1024 * 1024 });
+      return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', error: result.error };
+    } catch (error) {
+      return { status: 1, stdout: '', stderr: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /** Kubernetes is the shared quarantine authority; missing or uncertain Pods cannot be leased. */
+  private readClusterQuarantineState(candidate: WarmWorkerCandidate): 'available' | 'missing' | 'quarantined' | 'unavailable' {
+    const spec = this.runtimeSpec(candidate);
+    const observed = this.kubectlForSpec(spec, ['get', 'pods', '-l',
+      `elanous.kind=warm-worker,${WARM_QUARANTINED_LABEL}!=true`, `--field-selector=metadata.name=${spec.name}`,
+      '--limit=25', '-o', 'json']);
+    if (observed.status !== 0) {
+      return /notfound|not found|does not exist|pod missing/i.test(observed.stderr) ? 'missing' : 'unavailable';
+    }
+    try {
+      const listing = JSON.parse(observed.stdout);
+      if (!Array.isArray(listing?.items)) return 'unavailable';
+      const pod = listing.items.find((row: any) => row?.metadata?.name === spec.name);
+      if (!pod) return 'missing';
+      if (pod?.metadata?.name !== spec.name || pod?.metadata?.namespace !== spec.namespace
+        || typeof pod?.metadata?.uid !== 'string' || !pod.metadata.uid || pod.metadata.deletionTimestamp)
+        return 'unavailable';
+      return 'available';
+    } catch { return 'unavailable'; }
+  }
+
+  /** Mark the exact Pod incarnation in Kubernetes so every provider observes the same quarantine. */
+  private markClusterQuarantined(candidate: WarmWorkerCandidate, podUid: string): { ok: boolean; reason: string } {
+    const spec = this.runtimeSpec(candidate);
+    const observed = this.kubectlForSpec(spec, ['get', 'pod', spec.name, '-o', 'json']);
+    if (observed.status !== 0) return { ok: false, reason: 'pod-read-failed' };
+    let pod: any;
+    try { pod = JSON.parse(observed.stdout); } catch { return { ok: false, reason: 'pod-read-invalid' }; }
+    const metadata = pod?.metadata;
+    if (metadata?.name !== spec.name || metadata?.namespace !== spec.namespace || metadata?.uid !== podUid
+      || typeof metadata?.resourceVersion !== 'string' || !metadata.resourceVersion
+      || !metadata.labels || typeof metadata.labels !== 'object' || Array.isArray(metadata.labels))
+      return { ok: false, reason: 'pod-identity-drift' };
+    if (metadata.labels[WARM_QUARANTINED_LABEL] === 'true') return { ok: true, reason: 'already-quarantined' };
+    const patch = [
+      { op: 'test', path: '/metadata/uid', value: podUid },
+      { op: 'test', path: '/metadata/resourceVersion', value: metadata.resourceVersion },
+      { op: 'add', path: '/metadata/labels/elanous.ai~1quarantined', value: 'true' },
+    ];
+    const result = this.kubectlForSpec(spec, ['patch', 'pod', spec.name, '--type=json', '-p', JSON.stringify(patch), '-o', 'json']);
+    if (result.status !== 0) return { ok: false, reason: 'conditional-patch-failed' };
+    try {
+      const updated = JSON.parse(result.stdout);
+      return updated?.metadata?.uid === podUid && updated?.metadata?.labels?.[WARM_QUARANTINED_LABEL] === 'true'
+        ? { ok: true, reason: 'applied' } : { ok: false, reason: 'patch-result-mismatch' };
+    } catch { return { ok: false, reason: 'patch-result-invalid' }; }
   }
 
   private async expireIdleWorker(candidate: WarmWorkerCandidate): Promise<boolean> {
@@ -1313,11 +1546,19 @@ export class WarmPodProvider {
 
   /** One bounded reconciliation pass. Failed slots stay unavailable until a fresh worker ID is configured. */
   async reconcilePool(): Promise<WarmPoolReconcileResult> {
+    this.refreshQuarantineState();
     const failed: string[] = [];
     let ready = 0;
     const occupancyRows: { candidate: WarmWorkerCandidate; prepared: boolean; podUid: string | null }[] = [];
-    const available = this.candidates.filter(candidate => !this.options.drainingHosts?.includes(candidate.host));
-    for (const candidate of this.candidates.filter(row => this.options.drainingHosts?.includes(row.host))) {
+    const available = this.warmReuseDisabled ? [] : this.candidates.filter(candidate => !this.options.drainingHosts?.includes(candidate.host)
+      && !this.quarantineBlockedWorkerIds.has(candidate.spec.workerId));
+    for (const candidate of this.candidates.filter(row => this.options.drainingHosts?.includes(row.host)
+      || this.warmReuseDisabled || this.quarantineBlockedWorkerIds.has(row.spec.workerId))) {
+      if (this.warmReuseDisabled || this.quarantineBlockedWorkerIds.has(candidate.spec.workerId)) {
+        failed.push(candidate.spec.workerId);
+        occupancyRows.push({ candidate, prepared: false, podUid: this.observedPodUids.get(candidate.spec.workerId) ?? null });
+        continue;
+      }
       try { await this.retireDrainedWorker(candidate); }
       catch (error) {
         debug.log('pod.warm.provider', 'drain-retire-deferred', { host: candidate.host,
@@ -1327,6 +1568,11 @@ export class WarmPodProvider {
       occupancyRows.push({ candidate, prepared: false, podUid: this.observedPodUids.get(candidate.spec.workerId) ?? null });
     }
     for (const candidate of available) {
+      if (this.warmReuseDisabled) {
+        failed.push(candidate.spec.workerId);
+        occupancyRows.push({ candidate, prepared: false, podUid: this.observedPodUids.get(candidate.spec.workerId) ?? null });
+        continue;
+      }
       let prepared = false;
       let decision: WarmPoolFailureDecision | undefined;
       try { prepared = await this.ensureStandingWorker(candidate, value => { decision = value; }); }
@@ -1336,6 +1582,19 @@ export class WarmPodProvider {
           stderr: safeWarmPoolStderr(error instanceof Error ? error.message : String(error), [
             this.options.memberToken, ...Object.values(this.options.machineTokens ?? {}),
           ]) };
+      }
+      if (prepared) {
+        const clusterState = this.readClusterQuarantineState(candidate);
+        if (clusterState === 'quarantined' || clusterState === 'unavailable') {
+          prepared = false;
+          decision = { stage: 'prepare', reason: `cluster-quarantine-${clusterState}` };
+          if (clusterState === 'unavailable') {
+            this.warmReuseDisabled = true;
+            debug.log('pod.warm.provider', 'cluster-quarantine-state-unavailable', {
+              host: candidate.host, workerId: candidate.spec.workerId,
+            }, { level: 'warn' });
+          }
+        }
       }
       occupancyRows.push({ candidate, prepared, podUid: this.observedPodUids.get(candidate.spec.workerId) ?? null });
       if (prepared) ready++;
@@ -1355,34 +1614,103 @@ export class WarmPodProvider {
         host: candidate.host, tier: candidate.tier, workerId: candidate.spec.workerId,
         pod: candidate.spec.name, ready: prepared }, { level: prepared ? 'info' : 'warn' });
     }
-    const result = { profile: this.profile,
-      target: available.length, ready, failed };
+    const target = this.candidates.filter(candidate => !this.options.drainingHosts?.includes(candidate.host)).length;
+    const result = { profile: this.profile, target, ready, failed };
     debug.log('pod.warm', 'pool-reconcile', result, { level: failed.length ? 'warn' : 'info' });
     await this.logPoolOccupancy(occupancyRows);
     return result;
   }
 
   /** Acquire a matching idle worker before exec. Every uncertain result is fenced out of reuse. */
-  async request(input: WarmReplayInput): Promise<WarmReplayResult> {
+  async request(input: WarmReplayInput, selection?: { kind?: WarmPodKind; lockHash?: string; cutShaDistance?: number;
+    runtimeIdentity?: RuntimeIdentityInput;
+    runtimeContract?: NonNullable<WarmPodSpec['runtimeContract']>; imageDigest?: string }): Promise<WarmReplayResult> {
     const requestedAt = this.now();
     if (input.protocol !== 1 || input.envProfile !== 'gate-v1' || !Array.isArray(input.files)
       || !input.files.length || !Number.isFinite(input.deadlineAt) || input.deadlineAt <= this.now()) return fallback('no-candidate');
+    this.refreshQuarantineState();
+    if (this.warmReuseDisabled) return fallback('no-candidate');
     const matches = this.candidates.filter(row => row.spec.cutSha === input.cutSha
+      && !this.quarantineBlockedWorkerIds.has(row.spec.workerId)
       && !this.options.drainingHosts?.includes(row.host));
     if (!matches.length) return fallback('no-candidate');
     let lastFallback: WarmReplayResult = fallback('lease-unavailable');
     // The control plane chooses an idle worker within a host/key. Probe each distinct
     // host/key once so a busy first host cannot strand an idle second pool.
     const tried = new Set<string>();
-    for (const candidate of matches) {
+    // Cross-cut checkout refresh is owned by POD-PREP-IO-MIN. Live gate acquisition
+    // sees only exact-cut candidates; the scorer still rejects an injected cut mismatch.
+    const kind = selection?.kind ?? 'gate';
+    // Production gate requests must carry the cut's lock hash and pinned image digest.
+    // Inferring either from a candidate would let a stale first slot define its own target.
+    if (kind === 'gate' && (!selection?.lockHash || !selection.imageDigest))
+      return fallback('no-candidate');
+    // Gate reuse must also be bound to the architecture measured for this execution.
+    // The candidate cannot supply its own expected architecture.
+    if (kind === 'gate' && !selection?.runtimeContract?.architecture)
+      return fallback('no-candidate');
+    const targetRuntimeIdentity = selection?.runtimeIdentity ?? this.options.runtimeIdentity;
+    if (!targetRuntimeIdentity) return fallback('no-candidate');
+    const candidateKind = (candidate: WarmWorkerCandidate) => candidate.kind ?? 'gate';
+    const sameKind = matches.filter(row => candidateKind(row) === kind);
+    const targetLockHash = selection?.lockHash ?? sameKind[0]?.spec.key.lockHash ?? '';
+    const targetImageDigest = selection?.imageDigest ?? sameKind[0]?.spec.key.imageDigest ?? '';
+    const runtimeContractMatches = (candidate: WarmWorkerCandidate): boolean => {
+      const expected = selection?.runtimeContract;
+      const actual = candidate.spec.runtimeContract;
+      if (!expected) return kind !== 'gate';
+      if (kind === 'gate') return !!actual && !!expected.architecture
+        && runtimeArchitecturesMatch(expected.architecture, actual.architecture, this.options.allowedArchitectures);
+      return !!actual && actual.bunVersion === expected.bunVersion && actual.os === expected.os
+        && runtimeArchitecturesMatch(expected.architecture, actual.architecture, this.options.allowedArchitectures)
+        && expected.requiredTools.length === actual.requiredTools.length
+        && expected.requiredTools.every(tool => actual.requiredTools.includes(tool));
+    };
+    const scored = scoreWarmPodCandidates({ kind, cutSha: input.cutSha, lockHash: targetLockHash,
+      imageDigest: targetImageDigest, runtimeIdentity: targetRuntimeIdentity, allowedArchitectures: this.options.allowedArchitectures,
+      candidates: matches.map(candidate => ({ candidate,
+        kind: candidateKind(candidate), cutSha: candidate.spec.cutSha, lockHash: candidate.spec.key.lockHash,
+        imageDigest: this.runtimeSpec(candidate).key.imageDigest, cutShaDistance: selection?.cutShaDistance ?? 0,
+        runtimeIdentity: candidate.spec.runtimeContract ? { baseImageDigest: candidate.spec.runtimeContract.baseImageDigest ?? '',
+          lockHash: candidate.spec.key.lockHash, os: candidate.spec.runtimeContract.os,
+          architecture: candidate.spec.runtimeContract.architecture, bunVersion: candidate.spec.runtimeContract.bunVersion } : null,
+        contractCompatible: runtimeContractMatches(candidate) })) });
+    debug.log('pod.warm', 'candidate-match-score', { kind, runId: input.runId,
+      candidates: scored.rows.map(row => ({ workerId: row.candidate.spec.workerId, kind: row.kind,
+        accepted: row.accepted, score: row.score, cutShaDistance: row.cutShaDistance,
+        lockHashMatches: row.lockHashMatches, imageDigestDrift: row.imageDigestDrift, reason: row.reason })) });
+    const orderedMatches = scored.rows.filter(row => row.accepted).map(row => row.candidate);
+    for (const candidate of orderedMatches) {
     if (input.deadlineAt <= this.now()) return lastFallback;
     const { host } = candidate;
     const spec = this.runtimeSpec(candidate);
+    // A gate run is pinned to its full image digest. Runtime-compatible digest drift
+    // remains useful for implementation workers, but cannot silently replace the cut pin.
+    if (kind === 'gate' && spec.key.imageDigest !== targetImageDigest) {
+      lastFallback = fallback('lease-unavailable');
+      continue;
+    }
     const poolKey = `${host}/${spec.key.context}/${spec.key.imageDigest}/${spec.key.lockHash}/${spec.key.architecture}`;
     if (tried.has(poolKey)) continue;
     tried.add(poolKey);
     const contextFailure = probeWarmPodContext(spec.kubectlContext, this.options.kubectl);
-    if (contextFailure) { lastFallback = { command: null, transport: contextFailure }; continue; }
+    if (contextFailure) {
+      this.warmReuseDisabled = true;
+      debug.log('pod.warm.provider', 'cluster-quarantine-state-unavailable', {
+        host, workerId: candidate.spec.workerId, reason: 'context-probe-failed',
+      }, { level: 'warn' });
+      lastFallback = { command: null, transport: contextFailure };
+      continue;
+    }
+    const clusterState = this.readClusterQuarantineState(candidate);
+    if (clusterState !== 'available') {
+      lastFallback = fallback('no-candidate');
+      debug.log('pod.warm.provider', 'cluster-quarantine-selection-refused', {
+        host, workerId: candidate.spec.workerId, reason: clusterState,
+      }, { level: 'warn' });
+      if (clusterState === 'unavailable') this.warmReuseDisabled = true;
+      continue;
+    }
     let acquired: { status: number; value: any };
     // Lease selection is a consumer action. Keep its owner at member scope so
     // finalize can release it; the machine token owns registration and sanitize.
@@ -1571,6 +1899,20 @@ export class WarmPodProvider {
       await this.quarantine(command, transport.reason);
       return { command, transport };
     }
+    // The runtime reports complete only after reset/whitelist-clean/status verification.
+    // Bind that receipt to the exact fenced lease; finalize must not make an arbitrary
+    // or incomplete worker reusable merely because its caller asks to return it.
+    const cleanupKey = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
+    if (this.terminalLeases.has(cleanupKey) || this.quarantineRequested.has(cleanupKey)) {
+      // A fallback/quarantine may race the worker's final cleanup ACK. Its terminal
+      // decision wins: a late `complete` cannot resurrect a reusable lease receipt.
+      this.cleanupVerifiedLeases.delete(cleanupKey);
+      debug.log('pod.reuse', 'cleanup-proof-suppressed', { workerId: command.workerId,
+        leaseId: command.leaseId, generation: command.generation, podUid: command.podUid,
+        reason: 'lease-terminal-during-cleanup' }, { level: 'warn' });
+      return { command, transport };
+    }
+    this.cleanupVerifiedLeases.add(cleanupKey);
     // Keep the lease fenced until the gate has compared these bytes with its Job baseline.
     // A missing finalization leaves the worker leased and therefore unavailable.
     return { command, transport };
@@ -1598,11 +1940,18 @@ export class WarmPodProvider {
       if (outcome === 'quarantined') throw new Error('warm lease already quarantined');
       return;
     }
+    if (!this.cleanupVerifiedLeases.has(key)) {
+      debug.log('pod.reuse', 'return-blocked', { workerId: command.workerId, podUid: command.podUid,
+        leaseId: command.leaseId, generation: command.generation, reason: 'cleanup-unverified' }, { level: 'warn' });
+      await this.quarantine(command, 'cleanup-unverified');
+      throw new Error('warm cleanup unverified');
+    }
     const terminal = this.finalizeOnce(command);
     this.terminalLeases.set(key, terminal);
     let outcome: 'sanitized' | 'quarantined';
     try { outcome = await terminal; }
     catch (error) { if (this.terminalLeases.get(key) === terminal) this.terminalLeases.delete(key); throw error; }
+    this.cleanupVerifiedLeases.delete(key);
     if (outcome === 'quarantined' || this.quarantineRequested.has(key)) throw new Error('warm sanitize unavailable');
   }
 
@@ -1641,13 +1990,19 @@ export class WarmPodProvider {
   /** `leaseStarted=false` marks a refusal before `lease-start`, so start/end history stays paired. */
   async quarantine(command: WarmWorkerCommand, reason: string, leaseStarted = true): Promise<void> {
     const key = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
+    this.cleanupVerifiedLeases.delete(key);
+    // Fence same-process sibling requests immediately and make the shared block visible before the terminal call.
+    this.recordQuarantineBlock(command.workerId);
     const podKey = JSON.stringify([command.workerId, command.podUid]);
     this.quarantiningPods.add(podKey);
     const prior = this.terminalLeases.get(key);
     if (prior) {
       if (this.quarantineRequested.has(key)) {
         try { await prior; this.quarantiningPods.delete(podKey); }
-        catch (error) { if (this.terminalLeases.get(key) === prior) this.terminalLeases.delete(key); throw error; }
+        catch (error) {
+          if (this.terminalLeases.get(key) === prior) this.terminalLeases.delete(key);
+          throw error;
+        }
         return;
       }
       this.quarantineRequested.add(key);
@@ -1656,22 +2011,26 @@ export class WarmPodProvider {
       const terminal = this.quarantineOnce(command, reason, leaseStarted).then(() => 'quarantined' as const);
       this.terminalLeases.set(key, terminal);
       try { await terminal; this.quarantiningPods.delete(podKey); }
-      catch (error) { if (this.terminalLeases.get(key) === terminal) this.terminalLeases.delete(key); throw error; }
+      catch (error) {
+        if (this.terminalLeases.get(key) === terminal) this.terminalLeases.delete(key);
+        throw error;
+      }
       return;
     }
     this.quarantineRequested.add(key);
     const terminal = this.quarantineOnce(command, reason, leaseStarted).then(() => 'quarantined' as const);
     this.terminalLeases.set(key, terminal);
     try { await terminal; this.quarantiningPods.delete(podKey); }
-    catch (error) { if (this.terminalLeases.get(key) === terminal) this.terminalLeases.delete(key); throw error; }
+    catch (error) {
+      if (this.terminalLeases.get(key) === terminal) this.terminalLeases.delete(key);
+      throw error;
+    }
   }
 
   private async quarantineOnce(command: WarmWorkerCommand, reason: string, leaseStarted: boolean): Promise<void> {
-    if (!await this.transition(command, 'quarantine', this.options.memberToken, reason.slice(0, 120) || 'mismatch')) {
-      throw new Error('warm quarantine unavailable');
-    }
     const candidate = this.candidates.find(row => row.spec.workerId === command.workerId);
     let occupancyUnmeasuredReason: string | undefined;
+    let clusterResult: { ok: boolean; reason: string } = { ok: false, reason: 'candidate-unavailable' };
     if (candidate) {
       const cleared = patchWarmLeaseMetadata(this.runtimeSpec(candidate), command, 'quarantined', this.options.kubectl);
       if (!cleared.ok) {
@@ -1679,6 +2038,24 @@ export class WarmPodProvider {
         if (reason !== 'provenance-unavailable') debug.log('pod.provenance', 'lease-patch-refused', { pod: candidate.spec.name,
           podUid: command.podUid, leaseId: command.leaseId, reason: cleared.reason }, { level: 'warn' });
       }
+      clusterResult = typeof command.podUid === 'string' && command.podUid
+        ? this.markClusterQuarantined(candidate, command.podUid)
+        : { ok: false, reason: 'pod-uid-unavailable' };
+      if (!clusterResult.ok) {
+        occupancyUnmeasuredReason = 'cluster-quarantine-unconfirmed';
+        this.warmReuseDisabled = true;
+        debug.log('pod.warm.provider', 'cluster-quarantine-failed', {
+          host: candidate.host, workerId: command.workerId, podUid: command.podUid, reason: clusterResult.reason,
+        }, { level: 'warn' });
+      }
+    } else {
+      this.warmReuseDisabled = true;
+      debug.log('pod.warm.provider', 'cluster-quarantine-failed', {
+        workerId: command.workerId, podUid: command.podUid, reason: clusterResult.reason,
+      }, { level: 'warn' });
+    }
+    if (!await this.transition(command, 'quarantine', this.options.memberToken, reason.slice(0, 120) || 'mismatch')) {
+      throw new Error('warm quarantine unavailable');
     }
     const key = JSON.stringify([command.workerId, command.leaseId, command.generation, command.podUid]);
     const occupancyCandidate = this.candidates.find(row => row.spec.workerId === command.workerId);
@@ -1727,9 +2104,11 @@ function currentProvider(): WarmPodProvider | null {
   return configuredProvider;
 }
 export async function requestWarmPodReplay(input: WarmReplayInput,
-  providerOverrideForTest?: WarmPodProvider): Promise<WarmReplayResult> {
+  providerOverrideForTest?: WarmPodProvider,
+  selection?: { kind?: WarmPodKind; lockHash?: string; cutShaDistance?: number; runtimeIdentity?: RuntimeIdentityInput;
+    runtimeContract?: NonNullable<WarmPodSpec['runtimeContract']>; imageDigest?: string }): Promise<WarmReplayResult> {
   const provider = providerOverrideForTest ?? currentProvider();
-  const result = provider ? await provider.request(input) : fallback('no-candidate');
+  const result = provider ? await provider.request(input, selection) : fallback('no-candidate');
   debug.log('pod.warm', 'request-selection', { runId: input.runId, attemptId: input.attemptId,
     cutSha: input.cutSha, selected: result.command !== null,
     workerId: result.command?.workerId ?? null, status: result.transport.status,

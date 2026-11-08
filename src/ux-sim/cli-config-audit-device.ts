@@ -14,7 +14,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readConfigHistory, type ConfigChangeRow } from '../cli/config-audit.js';
-import { simInProcessCli } from './in-process-cli.js';
+import { simCli } from './in-process-cli.js';
 
 /** 장치가 실 CLI 에 넘긴 인자와 그 턴의 결과. */
 export interface ConfigAuditTurn {
@@ -79,7 +79,7 @@ export function createCliConfigAuditDevice(): CliConfigAuditDevice {
 
   const run = async (...args: string[]): Promise<ConfigAuditTurn> => {
     try {
-      const result = await simInProcessCli(args, { allowPaths: ALLOWED_PATHS, stateRoot });
+      const result = await simCli(args, { allowPaths: ALLOWED_PATHS, stateRoot });
       return { args, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
     } catch (err) {
       // 거부된 명령(허용 목록 밖·미등록 하위 명령)도 «한 턴» 이다 — 던지지 않고 실패 턴으로 돌려준다.

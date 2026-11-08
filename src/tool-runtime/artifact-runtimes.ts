@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── VW-term-infra Bundle B-2 · P6-1 + Bundle B-6 · P6-5 ──────────
 //
 // LLM-facing artifact tools:
@@ -12,7 +13,7 @@
 // `store.list()` · prevents directory traversal · listing cache is
 // the whitelist.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import {
   ARTIFACT_KINDS,
   type ArtifactKind,

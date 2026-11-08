@@ -13,7 +13,7 @@ const PLANTED = {
   mdns: 'user-mbp.local',
   lan: '192.168.0.57',
   localhostPort: 'localhost:31415',
-  home: '/Users/user',
+  home: '/Users/TESTONLY',
   email: 'someone@example.com',
   plainToken: 'plainDeviceTokenNoPrefix77', // only removable as a literal
   pageHost: 'node-c-host:4016',

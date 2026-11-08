@@ -46,7 +46,7 @@ export interface WarmPodSpec {
   cutSha: string;
   key: WarmWorkerKey;
   /** Runtime prerequisites independent of the image digest; source code is checked out separately. */
-  runtimeContract?: { bunVersion: string; os: 'linux'; architecture: string; requiredTools: readonly string[] };
+  runtimeContract?: { baseImageDigest?: string; bunVersion: string; os: 'linux'; architecture: string; requiredTools: readonly string[] };
   /** Resident worker tier. A lite Pod is capped at 2 GiB, including each request exec. */
   memoryLimit?: '2Gi' | '16Gi';
   /** Caller resolves the live host daemon endpoint; no guessed port. */

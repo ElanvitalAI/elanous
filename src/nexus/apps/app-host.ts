@@ -15,6 +15,7 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { parseAppManifest, type AppManifest } from './app-contract.js';
 import { createAppAuth, type AppAuthOptions, type IssuedAppInvitation } from './app-auth.js';
 import { createAppDatabase, type AppDatabase } from './app-db.js';
+import { emitNexusFunnelEvent, type NexusFunnelRuntime } from './funnel-observe.js';
 
 const APP_HOST_SUFFIX = '.app.localhost';
 const MIME_BY_EXT: Readonly<Record<string, string>> = {
@@ -41,7 +42,7 @@ export interface NexusAppHost {
   close(): void;
 }
 
-export type NexusAppHostAuthOptions = Pick<AppAuthOptions, 'dir' | 'key' | 'now' | 'invitationTtlMs' | 'sessionTtlMs'> & { readonly databaseDirectory?: string };
+export type NexusAppHostAuthOptions = Pick<AppAuthOptions, 'dir' | 'key' | 'now' | 'invitationTtlMs' | 'sessionTtlMs' | 'funnel'> & { readonly databaseDirectory?: string };
 
 interface MountedApp {
   readonly slug: string;
@@ -291,7 +292,12 @@ function normalizeRequestPath(pathname: string): string | undefined {
   return pieces.join('/') || 'index.html';
 }
 
-function createNexusAppHost(mounts: ReadonlyMap<string, MountedApp>, authBySlug: ReadonlyMap<string, ReturnType<typeof createAppAuth>>, appDb?: AppDatabase): NexusAppHost {
+function createNexusAppHost(
+  mounts: ReadonlyMap<string, MountedApp>,
+  authBySlug: ReadonlyMap<string, ReturnType<typeof createAppAuth>>,
+  appDb?: AppDatabase,
+  funnel?: NexusFunnelRuntime,
+): NexusAppHost {
   return {
     slugs: [...mounts.keys()],
     getManifest(appSlug) { return mounts.get(appSlug)?.manifest; },
@@ -386,7 +392,13 @@ function createNexusAppHost(mounts: ReadonlyMap<string, MountedApp>, authBySlug:
         'x-nexus-app-host': hostname,
         'x-nexus-app-origin': `http://${requestAuthority(req, hostname)}`,
       });
-      return new Response(req.method === 'HEAD' ? null : new Uint8Array(body), { status: 200, headers });
+      const response = new Response(req.method === 'HEAD' ? null : new Uint8Array(body), { status: 200, headers });
+      if (req.method === 'GET' && url.pathname === '/' && funnel) {
+        emitNexusFunnelEvent(funnel, {
+          type: 'app-open', accountHash: funnel.accountHash, appHash: funnel.appHash(slug),
+        });
+      }
+      return response;
     },
   };
 }
@@ -405,7 +417,7 @@ export function loadNexusAppHost(
   const mounts = new Map<string, MountedApp>();
   const authBySlug = new Map<string, ReturnType<typeof createAppAuth>>();
   const issues: NexusAppHostIssue[] = [];
-  if (!existsSync(appsDir)) return { appHost: createNexusAppHost(mounts, authBySlug), issues };
+  if (!existsSync(appsDir)) return { appHost: createNexusAppHost(mounts, authBySlug, undefined, authOptions?.funnel), issues };
 
   const appsRoot = realpathSync(appsDir);
   const rootIdentity = stableDirectory(appsRoot, appsRoot);
@@ -451,5 +463,5 @@ export function loadNexusAppHost(
       };
     }
   }
-  return { appHost: createNexusAppHost(mounts, authBySlug, appDb), issues };
+  return { appHost: createNexusAppHost(mounts, authBySlug, appDb, authOptions?.funnel), issues };
 }

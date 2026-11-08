@@ -308,6 +308,21 @@ test('PR-CENSUS-PARALLEL: real spawn pool keeps in-flight ≤ cap and actually o
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('PR-CENSUS-PARALLEL: debug log brackets the synchronous GH pool with its timeout bounds', () => {
+  const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+    events.push({ event, data: data as Record<string, unknown> });
+  });
+  try {
+    const results = spawnParallelCommands([{ command: 'sh', args: ['-c', 'printf ok'] }]);
+    expect(results).toEqual([{ ok: true, out: 'ok', err: '' }]);
+    expect(events.map(row => row.event)).toEqual(['open-pr-census-pool-started', 'open-pr-census-pool-completed']);
+    expect(events[0]!.data).toMatchObject({ callCount: 1, concurrency: 6, timeoutMs: 45_000, poolTimeoutMs: 60_000 });
+    expect(events[1]!.data).toMatchObject({ callCount: 1, okCount: 1, failedCount: 0 });
+    expect(typeof events[1]!.data.elapsedMs).toBe('number');
+  } finally { log.mockRestore(); }
+});
+
 test('PR-CENSUS-PARALLEL: parallel verdict equals the sequential verdict (prs · hunks · status), input order kept', () => {
   const rows = [...overlapping(8), pr(20, ['src/other.ts'])];
   const sequential = diffFixture(rows);
@@ -429,30 +444,44 @@ async function waitNoLive(dir: string, sleepArg: string): Promise<string[]> {
 
 test('PR-CENSUS-PARALLEL: per-call timeout kills the gh group → inventory unknown, no gh left', async () => {
   await withFakeBins({ gh: { sleepSeconds: 41.731, exitCode: 1 } }, async (fakeBins) => {
-    const started = Date.now();
-    const inventory = readOpenPrs(fixture(overlapping(4)).run, {
-      candidateFiles: ['src/shared.ts'], diffCache: new CensusDiffCache(),
-      runParallel: (calls, concurrency) => spawnParallelCommands(calls, { concurrency, env: fakeBins.env, timeoutMs: 800 }),
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      events.push({ event, data: data as Record<string, unknown> });
     });
-    expect(Date.now() - started).toBeLessThan(10_000);
-    expect(inventory).toEqual({ status: 'unknown', reason: 'PR #1: 수정 줄 조회 실패: timed out after 800ms' });
-    // A loaded host may kill a shim before it records its argv; the kill itself is what matters.
-    expect(fakeBins.calls().length).toBeGreaterThan(0);
-    expect(await waitNoLive(fakeBins.dir, '41.731')).toEqual([]);
+    try {
+      const started = Date.now();
+      const inventory = readOpenPrs(fixture(overlapping(4)).run, {
+        candidateFiles: ['src/shared.ts'], diffCache: new CensusDiffCache(),
+        runParallel: (calls, concurrency) => spawnParallelCommands(calls, { concurrency, env: fakeBins.env, timeoutMs: 800 }),
+      });
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(inventory).toEqual({ status: 'unknown', reason: 'PR #1: 수정 줄 조회 실패: timed out after 800ms' });
+      expect(events.find(row => row.event === 'open-pr-census-pool-completed')).toMatchObject({ data: { okCount: 0, failedCount: 4, reason: 'call-timeout' } });
+      // A loaded host may kill a shim before it records its argv; the kill itself is what matters.
+      expect(fakeBins.calls().length).toBeGreaterThan(0);
+      expect(await waitNoLive(fakeBins.dir, '41.731')).toEqual([]);
+    } finally { log.mockRestore(); }
   });
 }, 20_000);
 
 test('PR-CENSUS-PARALLEL: pool ceiling (SIGTERM to the pool) kills every in-flight gh → inventory unknown, no gh left', async () => {
   await withFakeBins({ gh: { sleepSeconds: 43.917, exitCode: 1 } }, async (fakeBins) => {
-    const started = Date.now();
-    const inventory = readOpenPrs(fixture(overlapping(3)).run, {
-      candidateFiles: ['src/shared.ts'], diffCache: new CensusDiffCache(),
-      runParallel: (calls, concurrency) => spawnParallelCommands(calls, { concurrency, env: fakeBins.env, timeoutMs: 60_000, poolTimeoutMs: 1_500 }),
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      events.push({ event, data: data as Record<string, unknown> });
     });
-    expect(Date.now() - started).toBeLessThan(10_000);
-    expect(inventory).toMatchObject({ status: 'unknown', reason: expect.stringContaining('parallel runner timed out or was killed') });
-    expect(fakeBins.calls().length).toBeGreaterThan(0);
-    expect(await waitNoLive(fakeBins.dir, '43.917')).toEqual([]);
+    try {
+      const started = Date.now();
+      const inventory = readOpenPrs(fixture(overlapping(3)).run, {
+        candidateFiles: ['src/shared.ts'], diffCache: new CensusDiffCache(),
+        runParallel: (calls, concurrency) => spawnParallelCommands(calls, { concurrency, env: fakeBins.env, timeoutMs: 60_000, poolTimeoutMs: 1_500 }),
+      });
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(inventory).toMatchObject({ status: 'unknown', reason: expect.stringContaining('parallel runner timed out or was killed') });
+      expect(events.find(row => row.event === 'open-pr-census-pool-completed')).toMatchObject({ data: { okCount: 0, failedCount: 3, reason: 'pool-timeout' } });
+      expect(fakeBins.calls().length).toBeGreaterThan(0);
+      expect(await waitNoLive(fakeBins.dir, '43.917')).toEqual([]);
+    } finally { log.mockRestore(); }
   });
 }, 20_000);
 

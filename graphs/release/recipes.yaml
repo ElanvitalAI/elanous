@@ -10,6 +10,12 @@ cutoff:
 checklist-gate:
   command: 'bun scripts/release-loop/checklist-gate-node.ts'
   timeout_ms: 600000
+tsc:
+  command: 'bun run scripts/ci-typecheck-changed.ts'
+  timeout_ms: 3600000
+ratchet:
+  command: 'bash scripts/ratchets/train-side-invariants.sh'
+  timeout_ms: 3600000
 gate:
   command: 'bun scripts/release-loop/gate-node.ts --json'
   # 4h — the Pod gate took 2h02m on 09-30 (G1f ②) and the 0.2.5 loop was cut at exactly 2h with no verdict; K9 (≤15 min) is the real fix.
@@ -58,9 +64,19 @@ auto-approve:
   timeout_ms: 600000
 publish:
   approval: 'v{{input.version}} 공개 발행 — 되돌릴 수 없다. 승인하시겠습니까?'
+continue-publish:
+  approval: 'publishProcess와 partialPublish 증거를 확인하세요. 공개 발행이 완료됐으면 publish를 다시 실행하지 말고 npm-publish 단계부터 같은 런을 이어가시겠습니까? 부분 발행이 확인되지 않으면 거부하세요.'
+repair-recovery:
+  approval: 'Gate repair PR 착지 조회·기록 복구가 소진됐습니다. gate-repair 출력에서 run ID·PR 번호·검증된 inspection head를 읽고 현재 PR 및 main 병합과 대조하세요. 확인되면 승인해 같은 런에서 gate를 재측정하고, 아니면 거부하세요.'
+gate-heal-decision:
+  approval: 'Gate 자동 수리 또는 재측정이 완료되지 않았습니다. 같은 런의 gate·triage·repair 기록과 실패 사유를 확인하세요. 한 번 더 gate를 실행해도 안전하고 방문 한도가 남았으면 승인하고, 아니면 거부해 이 런을 실패로 닫으세요.'
+gate-same-run-recheck:
+  command: 'bun scripts/release-loop/gate-same-run-recheck-node.ts'
+  timeout_ms: 600000
 publish-command:
   command: 'bun scripts/release-loop/publish-node.ts'
-  # The node may wait until input.publishAt; runPublish bounds the actual publication subprocess to 30 minutes.
+  # 30m scheduled wait + 30m publish subprocess + 30m bounded asset polling.
+  timeout_ms: 5400000
 npm-publish:
   command: 'bun scripts/release-loop/npm-publish-node.ts'
   # 40m default wait + two 5m commands + up to 83 bounded 15s registry inspections.
@@ -85,4 +101,34 @@ ops-upgrade:
   timeout_ms: 1200000
 version-dev-bump:
   command: 'bun scripts/release-loop/version-node.ts dev-bump --json'
+  timeout_ms: 1800000
+rla-release-autostart:
+  command: 'bun scripts/release-loop/hand-response-node.ts rla-release-autostart'
+  timeout_ms: 600000
+rla-train-worker-restart:
+  command: 'bun scripts/release-loop/hand-response-node.ts rla-train-worker-restart'
+  timeout_ms: 30000
+rla-release-recover:
+  command: 'bun scripts/release-loop/hand-response-node.ts rla-release-recover'
+  timeout_ms: 1800000
+rla-rehearsal-retry:
+  command: 'bun scripts/release-loop/hand-response-node.ts rla-rehearsal-retry'
+  timeout_ms: 1800000
+rla-cloud-join:
+  command: 'bun scripts/release-loop/hand-response-node.ts rla-cloud-join'
+  timeout_ms: 1800000
+rla-cloud-leave:
+  command: 'bun scripts/release-loop/hand-response-node.ts rla-cloud-leave'
+  timeout_ms: 1800000
+rla-focused-verify:
+  command: 'bun scripts/release-loop/hand-response-node.ts rla-focused-verify'
+  timeout_ms: 1800000
+rla-rail-now:
+  command: 'bun scripts/release-loop/hand-response-node.ts rla-rail-now'
+  timeout_ms: 1800000
+rla-nexus-restart:
+  command: 'bun scripts/release-loop/hand-response-node.ts rla-nexus-restart'
+  timeout_ms: 30000
+rla-nexus-build:
+  command: 'bun scripts/release-loop/hand-response-node.ts rla-nexus-build'
   timeout_ms: 1800000

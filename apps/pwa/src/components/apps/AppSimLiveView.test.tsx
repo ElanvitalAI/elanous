@@ -59,9 +59,9 @@ describe('AppSimLiveView', () => {
     let tree!: ReactTestRenderer;
     act(() => { tree = create(<AppSimLiveView appId="voice-notes" appName="음성 노트" client={client} receipts={[]} />); });
 
-    act(() => { onEvent?.({ kind: 'app.sim.step-completed', ts: 1, appId: 'another-app', data: { message: 'wrong app' } } as NexusEvent); });
+    act(() => { onEvent?.({ kind: 'app.sim.step-completed', ts: 1, appId: 'another-app', data: { message: 'wrong app' } } as unknown as NexusEvent); });
     expect(renderedText(tree)).not.toContain('wrong app');
-    act(() => { onEvent?.({ kind: 'app.sim.step-completed', ts: 2, appId: 'voice-notes', data: { message: '전사 완료' } } as NexusEvent); });
+    act(() => { onEvent?.({ kind: 'app.sim.step-completed', ts: 2, appId: 'voice-notes', data: { message: '전사 완료' } } as unknown as NexusEvent); });
     expect(renderedText(tree)).toContain('전사 완료');
     act(() => { tree.unmount(); });
     expect(unsubscribed).toBe(true);

@@ -1,17 +1,22 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
+import { gateExternalVolumeIdentitySha256, sealGateExternalVolume, verifyGateExternalVolumeRef } from './pod-gate-volume-ref.js';
+import { gateExternalVolumeSnapshotDirectoryCheckScript, gateExternalVolumeSnapshotInvalidateScript, gateExternalVolumeSnapshotNodeScript, invalidateGateExternalVolumeSnapshotMemo, prepareGateExternalVolumeSnapshotsOnce } from './pod-install-slots.js';
 import {
   commandJobSecret,
+  gateExternalVolumeRefPreflightCommand,
+  gateGitMirrorPreflightCommand,
   podCommandJobManifest,
   podCommandImageFor,
   podCommandScript,
   podCommandSecretKeys,
   podCommandTargetCommit,
+  podCommandJobFailureInfo,
   podCpuMillis,
   resolvePodCpu,
   podCpuQuantity,
@@ -46,12 +51,21 @@ const base = {
 
 const testProvenance = { actorKind: 'seat', actor: 'OPC', kind: 'command', run: 'test-run-12345678',
   phase: 'exec', requestedAt: '2026-10-20T09:00:00Z' };
+const gateProvenance = { ...testProvenance, actorKind: 'loop', actor: 'release-loop', kind: 'gate-shard',
+  character: 'gate-shard-runner', entrance: 'release-run', phase: 'release-gate', graphNode: 'gate',
+  commit: 'a'.repeat(40), version: '0.3.6', shard: '1-of-1', pool: 'test-pool' };
+const externalVolumeExpectations = { imageDigest: `sha256:${'b'.repeat(64)}`, lockSha256: 'c'.repeat(64), sourceCommit: 'a'.repeat(40) };
 // The required launch identity changes the baseline bytes; optional Job fields must still leave this baseline untouched.
-const PROVENANCE_MANIFEST_SHA256 = 'f91a618d2917695e06beb846ad7baf02c1cd68c39847a7fbef1f479d8add0e65';
+const PROVENANCE_MANIFEST_SHA256 = 'a2e365104c8dbd0014701a023fb97dc0fd63aa9bd2c249d2566f9918e7383d2f';
 const runPodCommand = (options: RunPodCommandOptions) => runPodCommandImpl({ provenance: testProvenance, ...options });
 
 function manifest(over: Partial<Parameters<typeof podCommandJobManifest>[0]> = {}) {
   return podCommandJobManifest({ ...base, skills: [], ...over });
+}
+
+function gateManifest(over: Partial<Parameters<typeof podCommandJobManifest>[0]> = {}) {
+  return manifest({ clone: true, source: { kind: 'commit', sha: 'a'.repeat(40) }, provenanceGate: true,
+    provenance: gateProvenance as never, externalVolumeExpectations, ...over });
 }
 
 describe('pod command job manifest', () => {
@@ -82,6 +96,420 @@ describe('pod command job manifest', () => {
     expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true });
     expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe(PROVENANCE_MANIFEST_SHA256);
     expect(JSON.stringify(manifest({ clone: true, hostMirror: undefined }))).toBe(JSON.stringify(original));
+  });
+
+  test('release gate external refs mount sealed directories read-only and replace the writable Bun cache mount', () => {
+    const job = gateManifest({
+      hostMirror: '/srv/git-mirror',
+      bunCache: '/srv/bun-cache',
+      externalVolumeRefs: [
+        { kind: 'git-mirror', hostPath: '/srv/git-mirror', contentSha256: 'd'.repeat(64), identitySha256: '1'.repeat(64) },
+        { kind: 'node_modules', hostPath: '/srv/node-modules', contentSha256: 'e'.repeat(64), identitySha256: '2'.repeat(64) },
+        { kind: 'bun-cache', hostPath: '/srv/bun-cache', contentSha256: 'f'.repeat(64), identitySha256: '3'.repeat(64) },
+      ],
+    });
+    const spec = (job.spec as { template: { spec: { volumes: unknown[]; containers: Array<{ volumeMounts: unknown[] }> } } }).template.spec;
+    expect(spec.volumes).toContainEqual({ name: 'host-mirror', hostPath: { path: '/srv/git-mirror', type: 'Directory' } });
+    expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true });
+    expect(spec.volumes).toContainEqual({ name: 'gate-node-modules', hostPath: { path: '/srv/node-modules', type: 'Directory' } });
+    expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'gate-node-modules', mountPath: '/external/node_modules', readOnly: true });
+    expect(spec.volumes).toContainEqual({ name: 'gate-bun-cache', hostPath: { path: '/srv/bun-cache', type: 'Directory' } });
+    expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'gate-bun-cache', mountPath: '/bun-cache', readOnly: true });
+    expect(spec.volumes).not.toContainEqual({ name: 'bun-cache', hostPath: { path: '/srv/bun-cache', type: 'DirectoryOrCreate' } });
+    expect(podCommandScript(job)).toContain('export BUN_INSTALL_CACHE_DIR=/bun-cache');
+    const script = podCommandScript(job);
+    expect(script).toContain('ELANOUS_GATE_VOLUME_REF_READY');
+    expect(script).toContain('ELANOUS_GATE_VOLUME_REF_REJECTED');
+    expect(script).toContain('/external/node_modules');
+    expect(script).toContain('export ELANOUS_GATE_EXTERNAL_NODE_MODULES=1');
+    expect(script.indexOf('pod-gate-volume-ref.ts')).toBeLessThan(script.indexOf('set --'));
+    expect(script.indexOf('ELANOUS_GATE_VOLUME_REF_READY git-mirror')).toBeLessThan(script.indexOf('ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL'));
+  });
+
+  test('external volume refs reject use outside gate jobs, non-canonical paths, duplicate kinds and mirror drift', () => {
+    const ref = { kind: 'node_modules' as const, hostPath: '/srv/node-modules', contentSha256: 'e'.repeat(64), identitySha256: '2'.repeat(64) };
+    expect(() => manifest({ externalVolumeRefs: [ref] })).toThrow('external volume refs require a release gate commit Job');
+    expect(() => gateManifest({ externalVolumeRefs: [{ ...ref, hostPath: 'relative/path' }] })).toThrow('external volume ref path is not canonical: node_modules');
+    expect(() => gateManifest({ externalVolumeRefs: [ref, ref] })).toThrow('external volume ref kind is duplicated: node_modules');
+    expect(() => gateManifest({ externalVolumeRefs: [ref], externalVolumeExpectations: undefined }))
+      .toThrow('external volume refs require complete cut identity expectations');
+    expect(() => gateManifest({ hostMirror: '/srv/other-mirror', externalVolumeRefs: [{ kind: 'git-mirror', hostPath: '/srv/git-mirror', contentSha256: 'd'.repeat(64), identitySha256: '1'.repeat(64) }] }))
+      .toThrow('external volume ref git-mirror must match the gate host mirror');
+    expect(() => gateManifest({ externalVolumeRefs: [{ kind: 'node_modules', hostPath: '/srv/node-modules', contentSha256: 'bad', identitySha256: '2'.repeat(64) }] }))
+      .toThrow('external volume ref trusted content digest is invalid: node_modules');
+  });
+
+  test('external preflight binds marker and live Git mirror tree to the cut-owned digest before source use', () => {
+    const refs = [{ kind: 'git-mirror' as const, hostPath: '/srv/git-mirror', contentSha256: 'd'.repeat(64), identitySha256: '1'.repeat(64) },
+      { kind: 'node_modules' as const, hostPath: '/srv/node-modules', contentSha256: 'e'.repeat(64), identitySha256: '2'.repeat(64) }];
+    const nodePreflight = gateExternalVolumeRefPreflightCommand([refs[1]!], externalVolumeExpectations);
+    const mirrorPreflight = gateGitMirrorPreflightCommand([refs[0]!], externalVolumeExpectations);
+    expect(nodePreflight).toContain('contentSha256: ref.contentSha256');
+    expect(nodePreflight).toContain('identitySha256: ref.identitySha256');
+    expect(mirrorPreflight).toContain('marker.contentSha256 !== ref.contentSha256');
+    expect(mirrorPreflight).toContain('ref.identitySha256');
+    expect(mirrorPreflight).toContain('treeHash(root) !== ref.contentSha256');
+    expect(mirrorPreflight).toContain('fs.readSync(fd,buf,0,buf.length,null)');
+    expect(mirrorPreflight).not.toContain('h.update(fs.readFileSync(full))');
+    expect(mirrorPreflight.indexOf('treeHash(root) !== ref.contentSha256')).toBeLessThan(mirrorPreflight.indexOf("'cat-file'"));
+    const job = gateManifest({ hostMirror: '/srv/git-mirror', externalVolumeRefs: refs, command: ['true'] });
+    const script = podCommandScript(job);
+    expect(script.indexOf('unset GIT_ALTERNATE_OBJECT_DIRECTORIES')).toBeLessThan(script.indexOf('ELANOUS_GATE_VOLUME_REF_REJECTED git-mirror'));
+    expect(script).toContain('export GIT_NO_LAZY_FETCH=1');
+    expect(script.indexOf('ELANOUS_GATE_VOLUME_REF_REJECTED git-mirror')).toBeLessThan(script.indexOf('git clone'));
+    const warmJob = gateManifest({ externalVolumeRefs: [refs[1]!], externalVolumeExpectations,
+      clone: true, source: { kind: 'commit', sha: externalVolumeExpectations.sourceCommit }, warmFiles: ['package.json', 'bun.lock'] });
+    const warmScript = podCommandScript(warmJob);
+    expect(warmScript.indexOf('install -m 644 -D /warm-source/file-0')).toBeLessThan(warmScript.indexOf('cut-lock-hash-mismatch'));
+  });
+
+  test('external volume source is snapshotted once per node generation into a root-owned immutable content path', async () => {
+    const refs = [{ kind: 'node_modules', hostPath: '/srv/node-modules', contentSha256: 'a'.repeat(64), identitySha256: 'b'.repeat(64) }];
+    const script = gateExternalVolumeSnapshotNodeScript('k3d-snapshot-test', refs);
+    expect(script).toContain('docker exec -i "$n" sh');
+    expect(script).toContain('cp -a \'/srv/node-modules\'/.');
+    expect(script).toContain('chown -R 0:0 "$tmp"; chmod -R a-w "$tmp"');
+    expect(script).toContain('mv -T "$tmp"');
+    expect(script).toContain('rm -rf "$tmp"; snapshot_valid');
+    expect(script).toContain('docker cp "$n:');
+    expect(script).toContain('snapshot-content-mismatch');
+    expect(script).toContain("base='/var/lib/elanous/gate-volume-snapshots'");
+    const calls: string[] = [];
+    const prepare = (await prepareGateExternalVolumeSnapshotsOnce({
+      member: { sshHost: 'snapshot-test-host', k3dCluster: 'k3d-snapshot-test' }, refs,
+      shell: async (_host, shellScript) => {
+        calls.push(shellScript);
+        return shellScript.includes('ELANOUS_GATE_VOLUME_SNAPSHOT') ? { rc: 0, output: '' } : { rc: 0, output: 'node-generation-1' };
+      },
+    }));
+    expect(prepare).toMatchObject({ ok: true, refs: [{ kind: 'node_modules',
+      hostPath: `/var/lib/elanous/gate-volume-snapshots/${refs[0]!.identitySha256}/node_modules/snapshot/tree` }] });
+    await prepareGateExternalVolumeSnapshotsOnce({
+      member: { sshHost: 'snapshot-test-host', k3dCluster: 'k3d-snapshot-test' }, refs,
+      shell: async (_host, shellScript) => { calls.push(shellScript); return shellScript.includes('ELANOUS_GATE_VOLUME_SNAPSHOT')
+        ? { rc: 0, output: '' } : { rc: 0, output: 'node-generation-1' }; },
+    });
+    expect(calls.filter((call) => !call.includes('ELANOUS_GATE_VOLUME_SNAPSHOT'))).toHaveLength(2);
+    expect(calls.filter((call) => call.includes('ELANOUS_GATE_VOLUME_SNAPSHOT'))).toHaveLength(1);
+    invalidateGateExternalVolumeSnapshotMemo({ member: { sshHost: 'snapshot-test-host', k3dCluster: 'k3d-snapshot-test' }, refs });
+    await prepareGateExternalVolumeSnapshotsOnce({
+      member: { sshHost: 'snapshot-test-host', k3dCluster: 'k3d-snapshot-test' }, refs,
+      shell: async (_host, shellScript) => { calls.push(shellScript); return shellScript.includes('ELANOUS_GATE_VOLUME_SNAPSHOT')
+        ? { rc: 0, output: '' } : { rc: 0, output: 'node-generation-1' }; },
+    });
+    expect(calls.filter((call) => call.includes('ELANOUS_GATE_VOLUME_SNAPSHOT'))).toHaveLength(2);
+  });
+
+  test('host source mutation after node snapshot cannot change the gate-visible tree', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'pod-gate-volume-snapshot-')));
+    const source = join(root, 'source');
+    const snapshotRoot = join(root, 'snapshots');
+    const fakeBin = join(root, 'bin');
+    mkdirSync(source); mkdirSync(fakeBin);
+    const docker = join(fakeBin, 'docker');
+    const stat = join(fakeBin, 'stat');
+    const find = join(fakeBin, 'find');
+    const mv = join(fakeBin, 'mv');
+    const chown = join(fakeBin, 'chown');
+    const chmod = join(fakeBin, 'chmod');
+    const sourceFile = join(source, 'package.json');
+    writeFileSync(sourceFile, '{"sealed":true}\n');
+    symlinkSync('package.json', join(source, 'package-link.json'));
+    writeFileSync(docker, '#!/bin/sh\nif [ "$1" = ps ]; then printf "node1 server\\n"; exit 0; fi\nif [ "$1" = exec ]; then shift; [ "$1" = -i ] && shift; shift; exec "$@"; fi\nif [ "$1" = cp ]; then src=${2#*:}; cp -a "$src" "$3"; exit $?; fi\nexit 2\n');
+    chmodSync(docker, 0o755);
+    writeFileSync(stat, '#!/bin/sh\nif [ "$1" = -c ] && [ "$2" = %a ] && [ "$POD_TEST_UNTRUSTED_PATH" = "$3" ]; then printf "777\\n"; else printf "0\\n"; fi\n'); chmodSync(stat, 0o755);
+    writeFileSync(find, '#!/bin/sh\n[ "$POD_TEST_UNTRUSTED_PATH" = "$1" ] && printf "%s\\n" "$1"\nexit 0\n'); chmodSync(find, 0o755);
+    writeFileSync(mv, "#!/bin/sh\n[ \"$1\" = -T ] || exit 2\nshift\npython3 -c 'import os,sys; os.rename(sys.argv[1],sys.argv[2])' \"$1\" \"$2\"\n"); chmodSync(mv, 0o755);
+    writeFileSync(chown, '#!/bin/sh\nexit 0\n'); chmodSync(chown, 0o755);
+    writeFileSync(chmod, '#!/bin/sh\nfor target do case "$POD_TEST_TEMP_ROOT/" in "$target/"*) exit 0;; esac; done\nexec /bin/chmod "$@"\n'); chmodSync(chmod, 0o755);
+    const runtimeIdentity = { imageDigest: `sha256:${'c'.repeat(64)}`, bunVersion: '1.4.2', os: 'linux' as const, arch: 'x64' as const };
+    const sealed = sealGateExternalVolume(source, { kind: 'node_modules', runtimeIdentity, lockSha256: 'd'.repeat(64) });
+    const ref = { kind: 'node_modules', hostPath: source, contentSha256: sealed.contentSha256!, identitySha256: gateExternalVolumeIdentitySha256(sealed) };
+    const script = gateExternalVolumeSnapshotNodeScript('k3d-snapshot-race', [ref], snapshotRoot)
+      .replace(`chown 0:0 "$base" "$base/${ref.identitySha256}" "$base/${ref.identitySha256}/${ref.kind}"; chmod 0755 "$base" "$base/${ref.identitySha256}" "$base/${ref.identitySha256}/${ref.kind}"`, '')
+      .replace('chown -R 0:0 "$tmp"; ', '');
+    expect(script).toContain('stat -c %u');
+    expect(script).toContain('find ');
+    expect(script).toContain('! -type l -perm /222');
+    expect(script).toContain('[ -L');
+    expect(script).toContain('snapshot_generation');
+    expect(script).toContain('existing_generation');
+    const run = () => spawnSync('bash', ['-c', script], { encoding: 'utf8', env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, POD_TEST_TEMP_ROOT: root } });
+    try {
+      writeFileSync(sourceFile, '{"changed-before-copy":true}\n');
+      const invalid = run();
+      expect(invalid.status).toBe(1);
+      expect(invalid.stderr).toContain('external-volume-snapshot-content-mismatch:node_modules');
+      expect(existsSync(join(snapshotRoot, ref.identitySha256, ref.kind, 'snapshot'))).toBe(false);
+      writeFileSync(sourceFile, '{"sealed":true}\n');
+      const first = run();
+      expect(first.status).toBe(0);
+      const snapshotFile = join(snapshotRoot, ref.identitySha256, ref.kind, 'snapshot', 'tree', 'package.json');
+      expect(readFileSync(snapshotFile, 'utf8')).toBe('{"sealed":true}\n');
+      expect(readFileSync(join(snapshotRoot, ref.identitySha256, ref.kind, 'snapshot', 'tree', 'package-link.json'), 'utf8')).toBe('{"sealed":true}\n');
+      expect(statSync(snapshotFile).mode & 0o222).toBe(0);
+      expect(verifyGateExternalVolumeRef(join(snapshotRoot, ref.identitySha256, ref.kind, 'snapshot', 'tree'), {
+        kind: 'node_modules', runtimeIdentity, lockSha256: 'd'.repeat(64), contentSha256: ref.contentSha256,
+        identitySha256: ref.identitySha256,
+      })).toMatchObject({ ok: true });
+      spawnSync('chmod', ['-R', 'u+w', join(snapshotRoot, ref.identitySha256, ref.kind)]);
+      rmSync(join(snapshotRoot, ref.identitySha256, ref.kind, 'snapshot'), { recursive: true, force: true });
+      symlinkSync(join(snapshotRoot, 'missing-target'), join(snapshotRoot, ref.identitySha256, ref.kind, 'snapshot'));
+      const danglingLinkRetry = run();
+      expect(danglingLinkRetry.status, danglingLinkRetry.stderr || danglingLinkRetry.stdout).toBe(0);
+      expect(readFileSync(snapshotFile, 'utf8')).toBe('{"sealed":true}\n');
+      writeFileSync(sourceFile, '{"host-race":true}\n');
+      const second = run();
+      expect(second.status).toBe(0);
+      expect(readFileSync(snapshotFile, 'utf8')).toBe('{"sealed":true}\n');
+      chmodSync(snapshotRoot, 0o777);
+      const untrustedParent = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: { ...process.env,
+        PATH: `${fakeBin}:${process.env.PATH}`, POD_TEST_TEMP_ROOT: root, POD_TEST_UNTRUSTED_PATH: snapshotRoot } });
+      expect(untrustedParent.status).toBe(1);
+      expect(untrustedParent.stderr).toContain('external-volume-snapshot-parent-untrusted:node_modules');
+      expect(statSync(snapshotRoot).mode & 0o777).toBe(0o777);
+      chmodSync(snapshotRoot, 0o755);
+      const unsafeLink = join(root, 'snapshot-root-link');
+      symlinkSync(root, unsafeLink);
+      const symlinkParentScript = gateExternalVolumeSnapshotNodeScript('k3d-snapshot-link-race', [ref], join(unsafeLink, 'snapshots'));
+      const symlinkParent = spawnSync('bash', ['-c', symlinkParentScript], { encoding: 'utf8', env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH}`, POD_TEST_TEMP_ROOT: root } });
+      expect(symlinkParent.status).toBe(1);
+      expect(symlinkParent.stderr).toContain('external-volume-snapshot-parent-untrusted:node_modules');
+    } finally { spawnSync('chmod', ['-R', 'u+w', root]); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('snapshot invalidation preserves a replacement generation that arrives after verification starts', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-volume-snapshot-generation-race-'));
+    const snapshot = join(root, 'snapshot');
+    const displaced = join(root, 'old-generation');
+    const expectedMarker = `${'a'.repeat(64)} ${'b'.repeat(64)}`;
+    mkdirSync(snapshot);
+    writeFileSync(join(snapshot, 'value'), 'old');
+    writeFileSync(join(snapshot, '.complete'), expectedMarker);
+    const snapshotStat = statSync(snapshot);
+    const oldGeneration = `${snapshotStat.dev}:${snapshotStat.ino}`;
+    if (!oldGeneration) throw new Error('could not measure old snapshot generation');
+    try {
+      renameSync(snapshot, displaced);
+      mkdirSync(snapshot);
+      writeFileSync(join(snapshot, 'value'), 'replacement');
+      writeFileSync(join(snapshot, '.complete'), expectedMarker);
+      const invalidation = spawnSync('sh', ['-c', gateExternalVolumeSnapshotInvalidateScript, 'sh', snapshot, oldGeneration, expectedMarker], { encoding: 'utf8' });
+      expect(invalidation.status).toBe(0);
+      expect(readFileSync(join(snapshot, 'value'), 'utf8')).toBe('replacement');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('snapshot parent validation rejects a real writable directory without changing its owner or mode', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'pod-volume-parent-mode-')));
+    const before = statSync(root);
+    chmodSync(root, 0o777);
+    try {
+      const check = `${gateExternalVolumeSnapshotDirectoryCheckScript}\nsecure_snapshot_dir "$1" || { echo "external-volume-snapshot-parent-untrusted:$1" >&2; exit 1; }`;
+      const result = spawnSync('bash', ['-c', check, 'bash', root], { encoding: 'utf8' });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(`external-volume-snapshot-parent-untrusted:${root}`);
+      const after = statSync(root);
+      expect(after.uid).toBe(before.uid);
+      expect(after.mode & 0o777).toBe(0o777);
+    } finally { chmodSync(root, 0o755); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('runPodCommand mounts only the node snapshot and returns its per-shard preparation time', async () => {
+    const applied: Array<Record<string, any>> = [];
+    const original = { kind: 'git-mirror' as const, hostPath: '/srv/git-mirror', contentSha256: 'a'.repeat(64), identitySha256: 'b'.repeat(64) };
+    const snapshotPath = `/var/lib/elanous/gate-volume-snapshots/${original.identitySha256}/git-mirror/snapshot/tree`;
+    let snapshotCalls = 0;
+    const result = await runPodCommand({
+      command: ['true'], pool: 'pool-node-b@node-b:1', checkPool: (members) => ({ ok: true, ready: [...members], dropped: [] }),
+      syncImages: async (members) => new Map([[members[0]!.context, { ok: true, action: 'fresh' as const, detail: '', ms: 0, imageRef: 'registry.test/harness:cut' }]]), imageCommit: 'a'.repeat(40), clone: true, source: { kind: 'commit', sha: 'a'.repeat(40) },
+      provenanceGate: true, provenance: { ...testProvenance, kind: 'gate-shard', entrance: process.env.ELANOUS_RELEASE_ENTRANCE?.trim() || 'release-run' },
+      hostMirror: original.hostPath, externalVolumeRefs: [original], externalVolumeExpectations,
+      ghToken: () => 'test-token', env: {}, configHostMirror: () => undefined,
+      prepareExternalVolumeSnapshots: async ({ refs }) => {
+        snapshotCalls++;
+        return { ok: true, ms: 17, refs: refs.map((ref) => ({ ...ref, hostPath: snapshotPath })) };
+      },
+      kubectl: (args, input) => {
+        if (input) applied.push(JSON.parse(input) as Record<string, any>);
+        if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+        return { status: 0, stdout: '0', stderr: '' };
+      }, name: 'volume-snapshot-integration', artifactsRoot: '/tmp/pod-volume-snapshot-integration',
+    });
+    const job = applied.find((body) => body.kind === 'Job')!;
+    const spec = job.spec.template.spec;
+    expect(spec.containers.find((container: any) => container.name === 'child').image).toBe(`registry.test/harness@${externalVolumeExpectations.imageDigest}`);
+    expect(snapshotCalls).toBe(1);
+    expect(result.context).toBe('pool-node-b');
+    expect(result.externalVolumeSnapshotMs).toBe(17);
+    expect(spec.volumes.find((volume: any) => volume.name === 'host-mirror').hostPath.path).toBe(snapshotPath);
+    expect(spec.containers[0].volumeMounts.find((mount: any) => mount.name === 'host-mirror')).toMatchObject({ mountPath: '/host-mirror', readOnly: true });
+    expect(podCommandScript(job)).toContain('ELANOUS_GATE_VOLUME_REF_READY git-mirror');
+  });
+
+  test('an apply response failure without a signal best-effort deletes the named Job', async () => {
+    const calls: string[][] = [];
+    const order: string[] = [];
+    const childLogA = Array.from({ length: 350 }, (_, index) => `ELANOUS_GATE_VOLUME_REF_READY git-mirror ${index}`).join('\n');
+    const childLogB = Array.from({ length: 25 }, (_, index) => `retry pod event ${index}`).join('\n');
+    const artifactsRoot = mkdtempSync(join(tmpdir(), 'pod-uncertain-apply-'));
+    let applyAttempted = false;
+    try {
+      await expect(runPodCommand({ command: ['true'], name: 'uncertain-apply', artifactsRoot,
+        env: {}, configHostMirror: () => undefined,
+        kubectl: (args) => {
+          calls.push([...args]);
+          if (args.includes('apply')) applyAttempted = true;
+          if (args.includes('logs')) order.push('logs');
+          const deleteIndex = args.indexOf('delete');
+          if (args[deleteIndex + 1] === 'job' && args.some((arg) => arg.startsWith('elanous.job=uncertain-apply,'))) order.push('delete-job');
+          if (args.includes('apply')) return { status: 1, stdout: '', stderr: 'connection lost after server-side create' };
+          if (args.includes('get') && args.includes('pods')) return { status: 0, stdout: JSON.stringify({ items: applyAttempted ? [
+            { metadata: { name: 'uncertain-pod-a' } }, { metadata: { name: 'uncertain-pod-b' } },
+          ] : [] }), stderr: '' };
+          if (args.includes('logs')) return { status: 0, stdout: args.includes('pod/uncertain-pod-a') ? childLogA : childLogB, stderr: '' };
+          return { status: 0, stdout: '', stderr: '' };
+        },
+      })).rejects.toThrow('connection lost after server-side create');
+      const cleanup = calls.find((args) => args.includes('delete') && args.includes('job') && args.some((arg) => arg.startsWith('elanous.job=uncertain-apply,')));
+      expect(order.lastIndexOf('delete-job')).toBeGreaterThan(order.indexOf('logs'));
+      expect(cleanup?.join(' ')).toMatch(/delete job -l elanous\.job=uncertain-apply,elanous\.launch=[0-9a-f]+ --ignore-not-found(?: --wait=false)?/);
+      expect(calls.find((args) => args.includes('logs'))).toContain('--tail=-1');
+      expect(readFileSync(join(artifactsRoot, 'uncertain-apply', 'child.log'), 'utf8')).toBe(`${childLogA}\n${childLogB}`);
+    } finally { rmSync(artifactsRoot, { recursive: true, force: true }); }
+  });
+
+  test('a post-apply signal failure preserves full logs before launch-scoped cleanup', async () => {
+    const calls: string[][] = [];
+    const order: string[] = [];
+    const controller = new AbortController();
+    const artifactsRoot = mkdtempSync(join(tmpdir(), 'pod-cancel-logs-'));
+    const childLog = Array.from({ length: 350 }, (_, index) => `event ${index}`).join('\n');
+    let jobApplySucceeded = false;
+    try {
+      await expect(runPodCommand({ command: ['true'], name: 'cancelled-job', artifactsRoot,
+        env: {}, configHostMirror: () => undefined, signal: controller.signal,
+        kubectl: (args, input) => {
+          calls.push([...args]);
+          if (args.includes('apply') && input) {
+            jobApplySucceeded = true;
+            return { status: 0, stdout: '', stderr: '' };
+          }
+          if (args.includes('get') && args.includes('pods')) return { status: 0, stdout: JSON.stringify({ items: jobApplySucceeded ? [
+            { metadata: { name: 'cancelled-pod-a' } }, { metadata: { name: 'cancelled-pod-b' } },
+          ] : [] }), stderr: '' };
+          if (jobApplySucceeded && args.includes('get')) {
+            controller.abort(new Error('post-apply cancelled'));
+            return { status: 0, stdout: '{}', stderr: '' };
+          }
+          if (args.includes('logs')) order.push('logs');
+          const deleteIndex = args.indexOf('delete');
+          if (args[deleteIndex + 1] === 'job' && args.some((arg) => arg.startsWith('elanous.job=cancelled-job,'))) order.push('delete-job');
+          return args.includes('logs') ? { status: 0, stdout: args.includes('pod/cancelled-pod-a') ? childLog : `retry ${childLog}`, stderr: '' } : { status: 0, stdout: '', stderr: '' };
+        },
+      })).rejects.toThrow('post-apply cancelled');
+      expect(order.lastIndexOf('delete-job')).toBeGreaterThan(order.indexOf('logs'));
+      expect(calls.find((args) => args.includes('logs'))).toContain('--tail=-1');
+      expect(readFileSync(join(artifactsRoot, 'cancelled-job', 'child.log'), 'utf8')).toBe(`${childLog}\nretry ${childLog}`);
+    } finally { rmSync(artifactsRoot, { recursive: true, force: true }); }
+  });
+
+  test('external snapshot preparation failure retains selected host and elapsed time before Job apply', async () => {
+    const original = { kind: 'git-mirror' as const, hostPath: '/srv/git-mirror', contentSha256: 'a'.repeat(64), identitySha256: 'b'.repeat(64) };
+    let info: ReturnType<typeof podCommandJobFailureInfo> = null;
+    let prepCalls = 0;
+    try {
+      await runPodCommand({
+        command: ['true'], pool: 'pool-node-b@node-b:1', checkPool: (members) => ({ ok: true, ready: [...members], dropped: [] }),
+        syncImages: async (members) => new Map([[members[0]!.context, { ok: true, action: 'fresh' as const, detail: '', ms: 0, imageRef: 'registry.test/harness:cut' }]]),
+        imageCommit: 'a'.repeat(40), clone: true, source: { kind: 'commit', sha: 'a'.repeat(40) },
+        provenanceGate: true, provenance: { ...testProvenance, kind: 'gate-shard', entrance: process.env.ELANOUS_RELEASE_ENTRANCE?.trim() || 'release-run' },
+        hostMirror: original.hostPath, externalVolumeRefs: [original], externalVolumeExpectations,
+        ghToken: () => 'test-token', env: {}, configHostMirror: () => undefined,
+        prepareExternalVolumeSnapshots: async () => { prepCalls++; return { ok: false, ms: 23, host: 'pool-node-b', detail: 'source-copy-mismatch' }; },
+        kubectl: () => { throw new Error('Job must not be applied after failed snapshot preparation'); },
+      });
+      throw new Error('expected external snapshot preparation to fail');
+    } catch (error) {
+      info = podCommandJobFailureInfo(error);
+    }
+    expect(prepCalls).toBe(1);
+    expect(info).toMatchObject({ context: 'pool-node-b', launchState: 'preflight-failed', externalVolumeSnapshotMs: 23 });
+  });
+
+  test('invalid external image pin keeps a named preflight attempt for the gate ledger', async () => {
+    const original = { kind: 'git-mirror' as const, hostPath: '/srv/git-mirror', contentSha256: 'a'.repeat(64), identitySha256: 'b'.repeat(64) };
+    let info: ReturnType<typeof podCommandJobFailureInfo> = null;
+    try {
+      await runPodCommand({ command: ['true'], clone: true, source: { kind: 'commit', sha: 'a'.repeat(40) },
+        provenanceGate: true, provenance: { ...testProvenance, kind: 'gate-shard', entrance: process.env.ELANOUS_RELEASE_ENTRANCE?.trim() || 'release-run' },
+        hostMirror: original.hostPath, externalVolumeRefs: [original],
+        externalVolumeExpectations: { ...externalVolumeExpectations, imageDigest: 'invalid' },
+        env: {}, configHostMirror: () => undefined, name: 'bad-volume-pin', artifactsRoot: '/tmp/pod-bad-volume-pin' });
+      throw new Error('expected invalid image pin to fail');
+    } catch (error) { info = podCommandJobFailureInfo(error); }
+    expect(info).toMatchObject({ job: 'bad-volume-pin', launchState: 'preflight-failed', context: null });
+  });
+
+  test('external mirror path conflict keeps a named preflight attempt for the gate ledger', async () => {
+    const ref = { kind: 'git-mirror' as const, hostPath: '/srv/git-mirror', contentSha256: 'a'.repeat(64), identitySha256: 'b'.repeat(64) };
+    let info: ReturnType<typeof podCommandJobFailureInfo> = null;
+    try {
+      await runPodCommand({ command: ['true'], hostMirror: '/srv/other-mirror', externalVolumeRefs: [ref],
+        env: {}, configHostMirror: () => undefined, name: 'mirror-path-conflict', artifactsRoot: '/tmp/pod-mirror-conflict' });
+      throw new Error('expected external mirror path conflict');
+    } catch (error) { info = podCommandJobFailureInfo(error); }
+    expect(info).toMatchObject({ job: 'mirror-path-conflict', launchState: 'preflight-failed', context: null });
+  });
+
+  test('relative Bun cache path with an external ref keeps a named preflight attempt', async () => {
+    const ref = { kind: 'git-mirror' as const, hostPath: '/srv/git-mirror', contentSha256: 'a'.repeat(64), identitySha256: 'b'.repeat(64) };
+    let info: ReturnType<typeof podCommandJobFailureInfo> = null;
+    try {
+      await runPodCommand({ command: ['true'], hostMirror: ref.hostPath, externalVolumeRefs: [ref], bunCache: 'relative-cache',
+        provenanceGate: true, provenance: { ...testProvenance, kind: 'gate-shard', entrance: process.env.ELANOUS_RELEASE_ENTRANCE?.trim() || 'release-run' },
+        clone: true, source: { kind: 'commit', sha: 'a'.repeat(40) }, externalVolumeExpectations,
+        env: {}, configHostMirror: () => undefined, name: 'relative-cache-preflight', artifactsRoot: '/tmp/pod-relative-cache' });
+      throw new Error('expected relative Bun cache path to fail');
+    } catch (error) { info = podCommandJobFailureInfo(error); }
+    expect(info).toMatchObject({ job: 'relative-cache-preflight', launchState: 'preflight-failed', context: null });
+  });
+
+  test('Git mirror Pod preflight accepts the sealed tree and rejects tree plus marker replacement', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-git-mirror-preflight-'));
+    const source = join(root, 'source');
+    const mirror = join(root, 'mirror.git');
+    mkdirSync(source);
+    const git = (args: string[]) => {
+      const result = spawnSync('git', args, { encoding: 'utf8' });
+      if (result.status !== 0) throw new Error(result.stderr || result.stdout);
+      return result.stdout.trim();
+    };
+    try {
+      git(['init', source]);
+      git(['-C', source, 'config', 'user.name', 'Mirror test']);
+      git(['-C', source, 'config', 'user.email', 'mirror-test@example.invalid']);
+      writeFileSync(join(source, 'source.txt'), 'pinned source');
+      git(['-C', source, 'add', 'source.txt']);
+      git(['-C', source, 'commit', '-m', 'source']);
+      const sourceCommit = git(['-C', source, 'rev-parse', 'HEAD']);
+      git(['clone', '--bare', source, mirror]);
+      const identity = sealGateExternalVolume(mirror, { kind: 'git-mirror', sourceCommit });
+      const ref = { kind: 'git-mirror' as const, hostPath: mirror, contentSha256: identity.contentSha256!,
+        identitySha256: gateExternalVolumeIdentitySha256(identity) };
+      const expectations = { imageDigest: externalVolumeExpectations.imageDigest, lockSha256: externalVolumeExpectations.lockSha256, sourceCommit };
+      const command = gateGitMirrorPreflightCommand([ref], expectations, mirror);
+      const valid = spawnSync('bash', ['-c', command], { cwd: process.cwd(), encoding: 'utf8' });
+      expect(valid.status).toBe(0);
+      writeFileSync(join(mirror, 'untracked-mirror-state'), 'contamination');
+      const contaminatedTree = spawnSync('bash', ['-c', command], { cwd: process.cwd(), encoding: 'utf8' });
+      expect(contaminatedTree.status).toBe(5);
+      expect(`${contaminatedTree.stdout}${contaminatedTree.stderr}`).toContain('trusted-content-hash-mismatch');
+      sealGateExternalVolume(mirror, { kind: 'git-mirror', sourceCommit });
+      const contaminated = spawnSync('bash', ['-c', command], { cwd: process.cwd(), encoding: 'utf8' });
+      expect(contaminated.status).toBe(5);
+      expect(`${contaminated.stdout}${contaminated.stderr}`).toContain('identity-mismatch');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test('opt-in Bun cache mounts writable DirectoryOrCreate without changing the omitted manifest or host mirror', () => {
@@ -654,10 +1082,12 @@ describe('runPodCommand', () => {
     await expect(a.done).rejects.toThrow(/Job 상태를 0초 동안 못 읽었다\(pool-node-c\)/);
     expect(bounded.n).toBe(0);
     expect(a.pool.snapshot()).toEqual({ 'pool-node-c': 0 });
-    expect(a.commands.some((args) => args.includes('delete') && args.includes('job') && args.includes('gate-lost-member'))).toBe(true);
+    expect(a.commands.some((args) => args.includes('delete') && args.includes('job') && args.includes('--wait=false') && args.includes('-l')
+      && args[args.indexOf('-l') + 1]?.startsWith('elanous.job=gate-lost-member,elanous.launch='))).toBe(true);
     const ordinary = run(0, { n: 0 });
     await expect(ordinary.done).rejects.toThrow(/Job 상태를 0초 동안 못 읽었다/);
-    expect(ordinary.commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('gate-lost-member'))).toHaveLength(0); // omitted signal keeps the prior cleanup policy
+    expect(ordinary.commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('--wait=false') && args.includes('-l')
+      && args[args.indexOf('-l') + 1]?.startsWith('elanous.job=gate-lost-member,elanous.launch='))).toHaveLength(0); // omitted signal keeps the prior cleanup policy
     const unbounded = { n: 0 };
     await expect(run(undefined, unbounded).done).rejects.toThrow('still polling');
     expect(unbounded.n).toBe(6);
@@ -682,7 +1112,8 @@ describe('runPodCommand', () => {
     });
     await expect(pending).rejects.toThrow('shadow deadline');
     expect(polls).toBe(1);
-    expect(commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('shadow-timeout-test'))).toHaveLength(1);
+    expect(commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('--wait=false') && args.includes('-l')
+      && args[args.indexOf('-l') + 1]?.startsWith('elanous.job=shadow-timeout-test,elanous.launch='))).toHaveLength(1);
     expect(commands.some((args) => args.includes('delete') && args.includes('secret'))).toBe(true);
     expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
   });
@@ -705,7 +1136,8 @@ describe('runPodCommand', () => {
       artifactsRoot: '/tmp/pod-command-shadow-wall-test', log: () => {},
     });
     await expect(pending).rejects.toThrow('pod shadow: host timeout');
-    expect(commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('shadow-wall-deadline'))).toHaveLength(1);
+    expect(commands.filter((args) => args.includes('delete') && args.includes('job') && args.includes('--wait=false') && args.includes('-l')
+      && args[args.indexOf('-l') + 1]?.startsWith('elanous.job=shadow-wall-deadline,elanous.launch='))).toHaveLength(1);
     expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
   });
 

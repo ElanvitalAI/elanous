@@ -14,6 +14,7 @@ import { resolveLaunchdEnvironment } from './install/launchd.js';
 import { resolveSystemdEnvironment } from './install/systemd.js';
 import { resolvePwaStaticDir } from './static-dir-resolve.js';
 import { SKILLS_STEP_COMMAND, unattendedSetupHint } from '../onboarding/entry-hints.js';
+import { CREDENTIAL_SLOT_DEFINITIONS, parseCredentialSlotId, type CredentialSlotId } from './config/secrets/cred-slots.js';
 
 export type SetupItemId = 'llm' | 'pwa-build' | 'channel-bot' | 'skill-dirs' | 'os-install';
 
@@ -29,6 +30,31 @@ export interface SetupCheckResult {
   required: SetupItem[];
   recommended: SetupItem[];
   ok: boolean;
+}
+
+export interface CredentialSetupOption {
+  id: CredentialSlotId;
+  service: string;
+  label: string;
+  field: string;
+  setupUrl: string;
+  registerable: boolean;
+}
+
+/** Safe metadata for the web credential surface; unsupported verifiers stay fail-closed. */
+export function credentialSetupOptions(): CredentialSetupOption[] {
+  return CREDENTIAL_SLOT_DEFINITIONS.flatMap((definition) => definition.fields.map((field) => {
+    const id = `cred:${definition.service}.${field}` as CredentialSlotId;
+    const parsed = parseCredentialSlotId(id);
+    return {
+      id,
+      service: definition.service,
+      label: definition.label,
+      field,
+      setupUrl: definition.setupUrl,
+      registerable: parsed !== undefined && (definition.service === 'openai' || definition.service === 'elevenlabs'),
+    };
+  }));
 }
 
 export type SetupBootMode = 'normal' | 'setup' | 'refuse';

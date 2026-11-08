@@ -1,6 +1,7 @@
 import { test, expect, spyOn } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { Command } from 'commander';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { resetUserConfig } from '../user-config.js';
 import { renderCardText } from '../decisions/decision-cards.js';
@@ -11,10 +12,10 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import type { HqDeps } from '../hq/hq.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { createPendingQuestion, writePendingQuestion } from '../ask-user-question/pending-questions.js';
 import { registerDecisionsCommands } from './decisions-cli.js';
 import { openMsgStore } from '../msg/msg-store.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
 const root = () => mkdtempSync(join(tmpdir(), 'decisions-cli-'));
 const emptyGitRepo = (path: string) => {
@@ -89,7 +90,7 @@ test('CLI records delegated decisions and the owner reads overnight seat report 
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 });
 
-test('CLI cross-check, shadow warning, strict config and alternative validation', () => {
+test('CLI cross-check, shadow warning, strict config and alternative validation', async () => {
   const stateDir = root();
   const lines: string[] = [];
   const errors: string[] = [];
@@ -125,9 +126,10 @@ test('CLI cross-check, shadow warning, strict config and alternative validation'
     expect(() => run(...flags, '--xcheck', 'TC:확인', '--no-xcheck', '생략')).toThrow('choose --xcheck or --no-xcheck');
     const multiple = JSON.parse(run(...flags, '--xcheck', 'TC:키 확인', '--xcheck', 'UX:문구 확인')!);
     expect(multiple.crossCheck.map((check: { seat: string }) => check.seat)).toEqual(['TC', 'UX']);
-    const strictChild = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', ...flags],
-      { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
-    expect(strictChild.status).toBe(1);
+    const strictChild = await simCli([`--test=${stateDir}`, 'decisions', ...flags], {
+      allowPaths: [['decisions']], cwd: join(import.meta.dir, '..', '..'),
+    });
+    expect(strictChild.exitCode).toBe(1);
     expect(strictChild.stderr).toContain('교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유');
     expect(() => run(...flags, '--alternative', 'z', '--xcheck', 'TC:확인')).toThrow('alternative option not found');
     expect(JSON.parse(run(...flags, '--no-xcheck', '근거 부족')!).crossCheckSkipped).toBe('근거 부족');
@@ -135,36 +137,36 @@ test('CLI cross-check, shadow warning, strict config and alternative validation'
   } finally { console.error = oldError; resetElanousConfigDir(); resetUserConfig(); rmSync(stateDir, { recursive: true, force: true }); }
 });
 
-test('actual CLI parses checked, explicitly skipped, absent and conflicting cross-check flags', () => {
+test('actual CLI parses checked, explicitly skipped, absent and conflicting cross-check flags', async () => {
   const stateDir = root();
-  const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'raise', '--agent', 'OP', ...judgmentArgs,
+  const run = (...args: string[]) => simCli([`--test=${stateDir}`, 'decisions', 'raise', '--agent', 'OP', ...judgmentArgs,
     '--title', 'Pitch', '--category', 'scope', '--s', 'Situation', '--c', 'Complication', '--option', 'a=Go:Proceed',
     '--option', 'b=Wait:Delay', '--recommend', 'a', '--why', 'Ready', '--json', ...args],
-  { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
+  { allowPaths: [['decisions']], cwd: join(import.meta.dir, '..', '..') });
   const warning = '교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유';
   try {
     writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ decisions: { requireCrossCheck: false } }));
-    const checked = run('--xcheck', 'TC:키 경로 영향 없음', '--alternative', 'b', '--dissent', 'UX: 화면 문구 미정');
-    expect(checked.status, checked.stderr).toBe(0);
+    const checked = await run('--xcheck', 'TC:키 경로 영향 없음', '--alternative', 'b', '--dissent', 'UX: 화면 문구 미정');
+    expect(checked.exitCode, checked.stderr).toBe(0);
     expect(JSON.parse(checked.stdout)).toMatchObject({ crossCheck: [{ seat: 'TC', note: '키 경로 영향 없음' }], alternative: 'b', dissent: 'UX: 화면 문구 미정' });
     expect(checked.stderr).not.toContain(warning);
-    const skipped = run('--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②');
-    expect(skipped.status, skipped.stderr).toBe(0);
+    const skipped = await run('--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②');
+    expect(skipped.exitCode, skipped.stderr).toBe(0);
     expect(JSON.parse(skipped.stdout).crossCheckSkipped).toBe('자리 루프 · 이웃 교환은 DEC-XCHECK ②');
     expect(skipped.stderr).not.toContain(warning);
-    const absent = run();
-    expect(absent.status, absent.stderr).toBe(0);
+    const absent = await run();
+    expect(absent.exitCode, absent.stderr).toBe(0);
     expect(JSON.parse(absent.stdout).crossCheckSkipped).toBe('missing');
     expect(absent.stderr.split('\n').filter(line => line === warning)).toHaveLength(1);
-    const conflicting = run('--xcheck', 'TC:확인', '--no-xcheck', '생략');
-    expect(conflicting.status).toBe(1);
+    const conflicting = await run('--xcheck', 'TC:확인', '--no-xcheck', '생략');
+    expect(conflicting.exitCode).toBe(1);
     expect(conflicting.stderr).toContain('choose --xcheck or --no-xcheck');
-    const withoutReason = run('--no-xcheck');
-    expect(withoutReason.status).toBe(1);
+    const withoutReason = await run('--no-xcheck');
+    expect(withoutReason.exitCode).toBe(1);
     expect(withoutReason.stderr).toContain("option '--no-xcheck <이유>' argument missing");
     writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ decisions: { requireCrossCheck: true } }));
-    const strict = run();
-    expect(strict.status).toBe(1);
+    const strict = await run();
+    expect(strict.exitCode).toBe(1);
     expect(strict.stderr).toContain(warning);
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 }, 180_000);
@@ -347,21 +349,22 @@ test('decisions CLI fences raise/decide at generation, permits observed override
     expect(errors.some(line => line.includes('hq override: decisions raise'))).toBe(true);
   } finally { process.exitCode = prior ?? 0; console.error = oldError; rmSync(stateDir, { recursive: true, force: true }); }
 });
-test('actual isolated decisions CLI writes despite a foreign lease without override', () => {
+test('actual isolated decisions CLI writes despite a foreign lease without override', async () => {
   const stateDir = root();
   const store = fileLeaseStore(join(stateDir, 'hq', 'lease.json'), () => 100);
-  const run = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', ...withJudgment(args)],
-    { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
+  const run = (...args: string[]) => simCli(['--test', stateDir, 'decisions', ...withJudgment(args)], {
+    allowPaths: [['decisions']], stateRoot: stateDir, cwd: join(import.meta.dir, '..', '..'),
+  });
   const raise = ['raise', '--agent', 'codex', '--title', 'Fence?', '--category', 'scope', '--s', 'S.', '--c', 'C.',
     '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
   try {
     expect(store.cas(null, serializeLease({ holder: 'other-host', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
-    const added = run(...raise);
-    expect(added.status, added.stderr).toBe(0);
+    const added = await run(...raise);
+    expect(added.exitCode, added.stderr).toBe(0);
     expect(added.stderr).not.toContain('hq override:');
     const entry = JSON.parse(added.stdout);
-    const decided = run('decide', entry.id, 'a', '--json');
-    expect(decided.status, decided.stderr).toBe(0);
+    const decided = await run('decide', entry.id, 'a', '--json');
+    expect(decided.exitCode, decided.stderr).toBe(0);
     expect(JSON.parse(decided.stdout).status).toBe('decided');
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 }, 180_000);
@@ -462,37 +465,38 @@ test('unknown actor is never silently attributed to elanous; historical options 
   } finally { if (oldAgent === undefined) delete process.env.AI_AGENT; else process.env.AI_AGENT = oldAgent; }
 });
 
-test('actual CLI child reads an item raised in an isolated state directory', () => {
+test('isolated CLI helper reads an item raised in an isolated state directory', async () => {
   const stateDir = root();
-  const raise = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'raise', '--agent', 'codex', '--title', 'CLI child decision', '--category', 'scope', '--s', 'Scope requested.', '--c', 'Choice required.', '--option', 'a=Accept:Expands scope', '--option', 'b=Decline:Keeps scope', '--skip-recommend', 'Needs investigation', '--pending-question', '근거: 요청 문서\n무엇이 바뀌나: 승인 시 범위 확장\n기본값 시 결과: 현재 범위 유지', '--resume-question', 'auq:q1:abcde', '--run', 'run-x', '--json'], {
-    cwd: process.cwd(), encoding: 'utf8', timeout: 240000,
+  const raise = await simCli(['--test', stateDir, 'decisions', 'raise', '--agent', 'codex', '--title', 'CLI child decision', '--category', 'scope', '--s', 'Scope requested.', '--c', 'Choice required.', '--option', 'a=Accept:Expands scope', '--option', 'b=Decline:Keeps scope', '--skip-recommend', 'Needs investigation', '--pending-question', '근거: 요청 문서\n무엇이 바뀌나: 승인 시 범위 확장\n기본값 시 결과: 현재 범위 유지', '--resume-question', 'auq:q1:abcde', '--run', 'run-x', '--json'], {
+    allowPaths: [['decisions']], stateRoot: stateDir,
   });
-  expect(raise.status, raise.stderr.slice(0, 500)).toBe(0);
+  expect(raise.exitCode, raise.stderr.slice(0, 500)).toBe(0);
   const id = JSON.parse(raise.stdout.trim()).id;
   writePendingQuestion(createPendingQuestion('auq:q1:abcde', { questions: [{ id: 'scope_choice', header: 'Scope', question: 'Choose.', options: [
     { label: 'Accept', description: 'Expand' }, { label: 'Decline', description: 'Keep' },
   ] }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
   expect(readFileSync(join(stateDir, 'decisions', 'decisions.jsonl'), 'utf8')).toContain(id);
-  const decided = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'decide', id, 'a', '--json'], {
-    cwd: process.cwd(), encoding: 'utf8', timeout: 240000,
+  const decided = await simCli(['--test', stateDir, 'decisions', 'decide', id, 'a', '--json'], {
+    allowPaths: [['decisions']], stateRoot: stateDir,
   });
-  expect(decided.status, decided.stderr.slice(0, 500)).toBe(0);
+  expect(decided.exitCode, decided.stderr.slice(0, 500)).toBe(0);
   expect(JSON.parse(readFileSync(join(stateDir, 'ask-user-question', 'answers', `${encodeURIComponent('auq:q1:abcde')}.json`), 'utf8'))).toEqual({
     id: 'auq:q1:abcde', result: { answers: { scope_choice: 'a) Accept' } },
   });
-  const result = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'list', '--status', 'all', '--json'], {
-    cwd: process.cwd(), encoding: 'utf8', timeout: 240000,
+  const result = await simCli(['--test', stateDir, 'decisions', 'list', '--status', 'all', '--json'], {
+    allowPaths: [['decisions']], stateRoot: stateDir,
   });
-  expect(result.status, result.stderr.slice(0, 500)).toBe(0);
+  expect(result.exitCode, result.stderr.slice(0, 500)).toBe(0);
   expect(JSON.parse(result.stdout.trim()).map((entry: { id: string }) => entry.id)).toContain(id);
   // 전달 실패(exit 3 · retry-answer 안내)·재전달 판정은 같은 등록 명령을 in-process 로 도는
   // «CLI reports durable decision with failed delivery…»·«CLI decide with no pending question…» 가 잠근다.
-  // 실 자식 프로세스는 «격리 상태 디렉터리를 진입점이 읽는가» 하나만 본다(TEST-AUDIT-1105 · 자식 6 → 3).
+  // 실제 진입점 spawn 검증은 아래의 대용량 stdout 계약 한 건에 둔다.
 }, 500000);
 
-test('actual CLI list JSON over a slow pipe matches redirected bytes beyond 64 KiB', () => {
+test('real CLI entrypoint preserves large JSON through a deliberately slow stdout consumer', async () => {
   const stateDir = root();
-  const file = join(stateDir, 'list.json');
+  const referenceFile = join(stateDir, 'list-reference.json');
+  const slowFile = join(stateDir, 'list-slow.json');
   const cwd = join(import.meta.dir, '..', '..');
   try {
     const ledger = new DecisionLedger({ stateDir, resolveVersion: () => ({ released: null, dev: null, codename: null }) });
@@ -501,18 +505,31 @@ test('actual CLI list JSON over a slow pipe matches redirected bytes beyond 64 K
         options: [{ key: 'a', label: 'Yes', consequence: 'Proceed' }, { key: 'b', label: 'No', consequence: 'Wait' }],
         recommendation: { skipped: true, reason: 'Needs review' }, raisedBy: { agent: 'codex' } });
     }
-    const redirected = spawnSync('sh', ['-c', 'bun bin/elanous.mjs --test="$1" decisions list --status all --json > "$2"', 'sh', stateDir, file],
-      { cwd, encoding: 'utf8', timeout: 120_000 });
-    expect(redirected.status, redirected.stderr).toBe(0);
-    const bytes = readFileSync(file);
+    const reference = await simCli(['--test', stateDir, 'decisions', 'list', '--status', 'all', '--json'], {
+      mode: 'spawn', allowPaths: [['decisions']], stateRoot: stateDir, cwd, timeoutMs: 120_000,
+      stdoutFile: referenceFile,
+    });
+    expect(reference.exitCode, reference.stderr).toBe(0);
+    const referenceBytes = readFileSync(referenceFile);
+    expect(JSON.parse(referenceBytes.toString('utf8'))).toHaveLength(24);
+
+    const slowFd = openSync(slowFile, 'w');
+    let output: Awaited<ReturnType<typeof simCli>>;
+    try {
+      output = await simCli(['--test', stateDir, 'decisions', 'list', '--status', 'all', '--json'], {
+        mode: 'spawn', allowPaths: [['decisions']], stateRoot: stateDir, cwd, timeoutMs: 120_000,
+        onStdout: (chunk) => {
+          writeSync(slowFd, chunk, undefined, 'utf8');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        },
+      });
+    } finally { closeSync(slowFd); }
+    expect(output.exitCode, output.stderr).toBe(0);
+    const bytes = readFileSync(slowFile);
     expect(bytes.byteLength).toBeGreaterThan(200_000);
-    const piped = spawnSync('sh', ['-c', 'bun bin/elanous.mjs --test="$1" decisions list --status all --json | (sleep 1; cat)', 'sh', stateDir],
-      { cwd, encoding: 'buffer', timeout: 120_000, maxBuffer: 2_000_000 });
-    expect(piped.status, piped.stderr.toString('utf8')).toBe(0);
-    expect(Buffer.byteLength(piped.stdout)).toBe(bytes.byteLength);
-    expect(piped.stdout.equals(bytes)).toBe(true);
-    console.info(`decisions list bytes: file=${bytes.byteLength} pipe=${piped.stdout.byteLength}`);
-    expect(JSON.parse(piped.stdout.toString('utf8'))).toHaveLength(24);
+    expect(bytes.equals(referenceBytes)).toBe(true);
+    console.info(`decisions list bytes: reference=${referenceBytes.byteLength} slow=${bytes.byteLength}`);
+    expect(JSON.parse(bytes.toString('utf8'))).toHaveLength(24);
   } finally { rmSync(stateDir, { recursive: true, force: true }); }
 }, 260_000);
 

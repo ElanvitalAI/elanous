@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { CHAT_DEFAULTS } from '../src/user-config.js';
+import { CHAT_DEFAULTS } from '../src/user-config/chat.js';
 import { FOLD_LIMITS } from '../src/log-entry.js';
 import {
   measureChatToolDisplay,

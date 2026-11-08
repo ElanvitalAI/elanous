@@ -218,7 +218,7 @@ export function makeBedrockProvider(cfg: UCLLMConfig, deps: BedrockProviderDeps 
       }
     },
     async *chat(messages, opts = {}) {
-      const { textOnly } = await import('../llm.js');
+      const { textOnly } = await import('./stream-text.js');
       yield* textOnly(this.streamChat!(messages, opts));
     },
   };

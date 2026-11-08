@@ -40,7 +40,29 @@ export function runtimeIdentityKey(input: RuntimeIdentityInput): string | null {
   return `runtime-v1:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 
-export function runtimeIdentitiesMatch(left: RuntimeIdentityInput, right: RuntimeIdentityInput): boolean {
-  const leftKey = runtimeIdentityKey(left);
-  return leftKey !== null && leftKey === runtimeIdentityKey(right);
+/** Architecture equality is the default; cross-architecture matching needs both sides allowlisted. */
+export function runtimeArchitecturesMatch(left: string, right: string,
+  allowedArchitectures: readonly string[] = []): boolean {
+  const normalizedLeft = typeof left === 'string' && matchesEntire(atom, left) ? left.toLowerCase() : null;
+  const normalizedRight = typeof right === 'string' && matchesEntire(atom, right) ? right.toLowerCase() : null;
+  if (!normalizedLeft || !normalizedRight) return false;
+  if (normalizedLeft === normalizedRight) return true;
+  // The only supported cross-architecture compatibility is the explicit amd64/arm64 pair.
+  // A caller-provided list must never make unrelated or unknown architectures compatible.
+  if (!((normalizedLeft === 'amd64' && normalizedRight === 'arm64')
+    || (normalizedLeft === 'arm64' && normalizedRight === 'amd64'))) return false;
+  const allowed = new Set(allowedArchitectures.filter(value => typeof value === 'string').map(value => value.toLowerCase()));
+  return allowed.has(normalizedLeft) && allowed.has(normalizedRight);
+}
+
+export function runtimeIdentitiesMatch(left: RuntimeIdentityInput, right: RuntimeIdentityInput,
+  allowedArchitectures: readonly string[] = []): boolean {
+  const a = createRuntimeIdentity(left);
+  const b = createRuntimeIdentity(right);
+  return !!a && !!b
+    && a.baseImageDigest === b.baseImageDigest
+    && a.lockHash === b.lockHash
+    && a.os === b.os
+    && runtimeArchitecturesMatch(a.architecture, b.architecture, allowedArchitectures)
+    && a.bunVersion === b.bunVersion;
 }

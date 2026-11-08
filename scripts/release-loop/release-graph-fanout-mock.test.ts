@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGraph } from '../../src/graph-runner/runner.js';
@@ -124,7 +124,9 @@ test('RELEASE-GRAPH-FANOUT event injection: release YAML joins docs-land and ver
         }
       } } });
     expect(first.status).toBe('failed');
-    expect(maxActiveBranches).toBe(2);
+    // These release branches both mutate the same checkout. Their shared main-write lock
+    // intentionally serializes them even though the graph permits two concurrent nodes.
+    expect(maxActiveBranches).toBe(1);
     const fanout = first.fanOuts?.['traffic-npm-published:ok'];
     expect(fanout).toBeDefined();
     const branchRunIds = new Set(Object.values(fanout!.branches).map((branch) => branch.runId));
@@ -156,8 +158,9 @@ test('RELEASE-GRAPH-FANOUT event injection: release YAML joins docs-land and ver
     const startedBranchRunIds = new Set(lifecycle
       .filter((event) => event.event === 'node-start' && branchRunIds.has(event.runId)).map((event) => event.runId));
     expect([...startedBranchRunIds].sort()).toEqual([...branchRunIds].sort());
-    expect(concurrencyMeasurement.concurrentNodes).toBe(2);
-    expect(concurrencyMeasurement.concurrentNodeIds).toEqual(['docs-land', 'version-dev-bump']);
+    expect(concurrencyMeasurement.concurrentNodes).toBe(1);
+    expect(concurrencyMeasurement.concurrentNodeIds).toHaveLength(1);
+    expect(['docs-land', 'version-dev-bump']).toContain(concurrencyMeasurement.concurrentNodeIds[0]);
     expect(fanout?.branches).toMatchObject({
       'docs-land': { status: 'failed', output: expect.any(String), artifactSha256: expect.any(String) },
       'version-dev-bump': { status: 'done', output: expect.any(String), artifactSha256: expect.any(String) },
@@ -183,3 +186,61 @@ test('RELEASE-GRAPH-FANOUT event injection: release YAML joins docs-land and ver
     rmSync(root, { recursive: true, force: true });
   }
 }, 15_000);
+
+test('RELEASE-GRAPH-FANOUT scheduler: max_parallel_nodes runs independent synthetic branches concurrently', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-graph-fanout-independent-'));
+  const graph = join(root, 'graph.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), [
+    'start:', '  command: fanout-start',
+    'left:', '  command: branch-left',
+    'right:', '  command: branch-right', '',
+  ].join('\n'));
+  writeFileSync(graph, `graph_id: release-fanout-independent-test
+version: 1
+max_parallel_nodes: 2
+entry_node: start
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: start, kind: agent, recipe: 'cmd:start', max_visits: 1 }
+  - { node_id: left, kind: agent, recipe: 'cmd:left', max_visits: 1 }
+  - { node_id: right, kind: agent, recipe: 'cmd:right', max_visits: 1 }
+  - { node_id: joined, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - from: start
+    on: outcome
+    branches: { ok: [left, right] }
+    join: joined
+  - { from: joined, on: outcome, map: { ok: done, fail: failed } }
+`);
+  let activeBranches = 0;
+  let maxActiveBranches = 0;
+  const started = new Set<string>();
+  let releaseBothStarted!: () => void;
+  const bothStarted = new Promise<void>((resolve) => { releaseBothStarted = resolve; });
+  try {
+    const result = await runGraph(graph, { deps: { root, runBash: async (command: string) => {
+      if (command === 'branch-left' || command === 'branch-right') {
+        started.add(command);
+        activeBranches++;
+        maxActiveBranches = Math.max(maxActiveBranches, activeBranches);
+        if (activeBranches === 2) releaseBothStarted();
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const overlapped = await Promise.race([
+          bothStarted.then(() => true),
+          new Promise<boolean>((resolve) => { timeout = setTimeout(() => resolve(false), 2_000); }),
+        ]);
+        if (timeout) clearTimeout(timeout);
+        activeBranches--;
+        if (!overlapped) throw new Error('independent fanout branches did not overlap within 2 seconds');
+      }
+      return { stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 };
+    } } });
+    expect(result.status).toBe('done');
+    expect(started).toEqual(new Set(['branch-left', 'branch-right']));
+    expect(maxActiveBranches).toBe(2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

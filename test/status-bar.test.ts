@@ -598,7 +598,7 @@ describe('tf-bg-ghost — 상태줄은 프레임 폭을 넘지 않는다', () =>
   });
   // 라이브 화면과 같은 꼴(긴 작업 트리 · 긴 controller · ctx · host · 🐚).
   const liveInput = (backgroundJobs?: { background: number }) => ({
-    swd: '/Users/user/elanous-hq/work/tf-bg-visibility',
+    swd: '/Users/TESTONLY/elanous-hq/work/tf-bg-visibility',
     providerInfo: providerInfo({ model: 'gpt-6-luna' }),
     controller: 'agent:claude-code_2-1-270_agent_extra_long_name',
     runningAgents: 2,

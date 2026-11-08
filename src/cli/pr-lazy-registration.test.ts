@@ -4,9 +4,9 @@ import { describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
 import { registerPrCommands } from './pr-cli.js';
 import { program } from '../index.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
 const cwd = resolve(import.meta.dir, '../..');
-const entry = resolve(cwd, 'bin/elanous.mjs');
 const index = resolve(cwd, 'src/index.ts');
 const guard = `Bun.plugin({ setup(b) { b.onLoad({ filter: new RegExp('cli' + String.fromCharCode(47) + 'pr-cli[.]ts$') }, () => { throw new Error('PR_REGISTRAR_LOADED'); }); } });`;
 
@@ -17,7 +17,7 @@ function direct(args: string[], method: 'parse' | 'parseAsync' = 'parseAsync', g
 }
 
 function installed(args: string[]) {
-  return spawnSync(process.execPath, [entry, ...args], { cwd, encoding: 'utf8', timeout: 45_000 });
+  return simCli(args, { mode: 'spawn', allowPaths: [[], ['pr']], cwd, timeoutMs: 45_000 });
 }
 
 describe('lazy PR command registration', () => {
@@ -75,9 +75,9 @@ describe('lazy PR command registration', () => {
     }
   }, 100_000);
 
-  test('installed and direct synchronous/asynchronous PR help remain equal', () => {
-    const baseline = installed(['pr', '--help']);
-    expect(baseline.status).toBe(0);
+  test('installed and direct synchronous/asynchronous PR help remain equal', async () => {
+    const baseline = await installed(['pr', '--help']);
+    expect(baseline.exitCode).toBe(0);
     for (const method of ['parse', 'parseAsync'] as const) {
       for (const args of [['pr', '--help'], ['help', 'pr'], ['--test', 'pr', '--help']]) {
         const actual = direct(args, method);
@@ -86,6 +86,6 @@ describe('lazy PR command registration', () => {
         expect(actual.stdout).toContain('land');
       }
     }
-    expect(installed(['help', 'pr']).stdout).toBe(baseline.stdout);
+    expect((await installed(['help', 'pr'])).stdout).toBe(baseline.stdout);
   }, 180_000);
 });

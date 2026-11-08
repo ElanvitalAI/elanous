@@ -1,7 +1,8 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 /**
  * TaskGet runtime — detailed single-task fetch.
  */
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 import type { Task } from '../types.js';
 import { getToxRuntimeDeps } from '../runtime-deps.js';

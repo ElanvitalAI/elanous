@@ -37,8 +37,11 @@ describe('FABRIC_STAGES', () => {
     for (const s of FABRIC_STAGES) expect(navHrefs.has(s.href)).toBe(true);
   });
 
-  it('대표 조망판은 운영 메뉴에서 열리고 파이프라인 단계는 늘리지 않는다', () => {
-    expect(SIDEBAR_NAV_ITEMS.find((item) => item.href === '/ceo')).toMatchObject({ group: 'ops', label: '대표 조망판' });
+  it('운영 메뉴는 남은 운영 화면을 제공하고 파이프라인 단계는 늘리지 않는다', () => {
+    const opsHrefs = SIDEBAR_NAV_ITEMS.filter((item) => item.group === 'ops').map((item) => item.href);
+    expect(opsHrefs).toContain('/ops/release');
+    expect(opsHrefs).toContain('/ops/checklist');
+    expect(opsHrefs).not.toContain('/ceo');
     expect(FABRIC_STAGES.map((stage) => stage.href)).not.toContain('/ceo');
   });
 

@@ -21,13 +21,14 @@ import { encodeRlaRunIdForFixturePath, RLA_EVENT_RESPONSE_EVENTS, RLA_EVENT_RESP
 const REPO = resolve(import.meta.dir, '../..');
 const catalog = loadMockScenarioCatalog();
 
-test('catalog schema, scenario/device links, evidence contract, and all ux-sim runtime modules are indexed', () => {
+test('catalog schema, scenario/device links, evidence contract, and all ux-sim simulation worlds are indexed', () => {
   expect(parseMockScenarioCatalog(catalog)).toEqual(catalog);
   expect(catalog.scenarios.map((scenario) => scenario.id)).toEqual([
     'APP-CONTRACT-SECRET-ENTROPY', 'UX-MS-01', 'UX-MS-02', 'RELEASE-MACROPHAGE-HEAL', 'RELEASE-GRAPH-PREPUB-FANOUT', 'UX-MS-03', 'UX-MS-04', 'UX-MS-05', 'UX-MS-06',
     'UX-MS-07', 'UX-MS-08', 'UX-MS-09', 'UX-MS-11', 'UX-MS-12', 'NIGHT-TRAIN-DEAD-PID-LOCK', 'AUTHOR-PRECHECK-APPLIED',
     'AUTHOR-PRECHECK-REJECTED-UNPROVABLE', 'SAFE-PUBLIC-COPY-PUBLISH-REDACTION', 'SW-FREEZE', 'SIM-HQ-MOVE', 'SIM-CHAIN-LAND',
-    'UX-MS-13',
+    'UX-MS-13', 'RLA-LAUNCH-COUNTDOWN-1107', 'APP-WEB-DRIVE-TENANT', 'APP-SOURCE-SNAPSHOT', 'GOOGLE-DRIVE-LIST-READONLY',
+    'GIT-PUSH-TIMEOUT-PARTIAL-OUTCOME-REMOTE-VERIFY', 'TASK-TEMP-CLEANUP',
   ]);
   expect(catalog.runEvidence.scope).toContain('ScenarioV0 YAML runs only');
   expect(catalog.worldEvents.map((event) => event.id)).toEqual(['EV-0042', 'EV-0107', 'hq-move',
@@ -44,14 +45,19 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
   expect(catalog.candidateAudit.sourceRows).toBe(36);
   expect(catalog.candidateAudit.existingPaths).toBe(35);
   expect(catalog.candidateAudit.excludedPaths).toBe(catalog.candidateAudit.candidates.filter((candidate) => candidate.disposition === 'excluded').length);
-  expect(catalog.candidateAudit.candidates).toHaveLength(46);
+  expect(catalog.candidateAudit.candidates).toHaveLength(58);
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/safe-public-copy-publish.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/seminar-rehearsal.test.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'scripts/release-loop/gate-bisect.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'scripts/release-loop/gate-bisect.test.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'scripts/release-loop/gate-bisect-sidecar.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/release-loop/macrophage-heal.ts' }));
-  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(46);
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/fake-google-drive-world.ts' }));
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/fake-google-drive-world.test.ts' }));
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts' }));
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/fake-temp-cleanup.ts' }));
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/fake-temp-cleanup.test.ts' }));
+  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(58);
   expect(catalog.candidateAudit.sourceExclusions).toHaveLength(1);
   expect(catalog.candidateAudit.sourceExclusions[0]).toMatchObject({ path: 'scenarios/ux-sim/MK-MS-01.yaml' });
   expect(catalog.candidateAudit.sourceExclusions[0]?.reason).toContain('#34039');
@@ -77,7 +83,8 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim r
   }
   expect(catalog.devices.every((device) => device.entryCommands.length > 0 && ['yes', 'no', 'conditional', 'runner-dependent'].includes(device.logsRecorded))).toBe(true);
   const sourceModules = new Map(catalog.sourceModules.map((module) => [module.path, module]));
-  expect([...sourceModules.keys()].sort()).toEqual(listSourceModuleFiles(join(REPO, 'src/ux-sim')).sort());
+  const worldFiles = listSourceModuleFiles(join(REPO, 'src/ux-sim')).filter((path) => path.endsWith('-world.ts'));
+  expect([...sourceModules.keys()].filter((path) => path.endsWith('-world.ts')).sort()).toEqual(worldFiles.sort());
   for (const module of catalog.sourceModules) {
     expect(module.id).toMatch(/^MD-UX-SIM-/);
     expect(module.boundary.length).toBeGreaterThan(0);
@@ -134,6 +141,40 @@ test('APP-CONTRACT-SECRET-ENTROPY catalogs the production-parser corpus device',
     tests: ['src/ux-sim/app-contract-secret-entropy.test.ts'],
   });
   expect(device?.entryCommands).toContain('bun test src/ux-sim/app-contract-secret-entropy.test.ts');
+});
+
+test('APP-WEB-DRIVE-TENANT catalogs the tenant-isolated readonly Drive world', () => {
+  const device = catalog.devices.find((entry) => entry.id === 'fake-app-drive-world');
+  expect(device).toMatchObject({
+    checklistCells: ['APP-WEB-DRIVE-TENANT'],
+    implementation: ['src/ux-sim/fake-app-drive-world.ts', 'src/nexus/apps/drive-contract.ts'],
+    tests: ['src/ux-sim/fake-app-drive-world.test.ts'],
+  });
+  expect(device?.entryCommands).toContain('bun test src/ux-sim/fake-app-drive-world.test.ts');
+  expect(catalog.scenarios.find((entry) => entry.id === 'APP-WEB-DRIVE-TENANT'))
+    .toMatchObject({ device: 'fake-app-drive-world', kind: 'tenant-drive-read-isolation' });
+});
+
+test('APP-SOURCE-SNAPSHOT catalogs the preexisting fake snapshot world', () => {
+  const device = catalog.devices.find((entry) => entry.id === 'fake-app-source-world');
+  expect(device).toMatchObject({
+    checklistCells: ['APP-SOURCE-SNAPSHOT'],
+    implementation: ['src/ux-sim/fake-app-source-concurrent-writer.ts', 'src/ux-sim/fake-app-source-world.ts', 'src/nexus/apps/app-source-snapshot.ts'],
+    tests: ['src/ux-sim/fake-app-source-world.test.ts'],
+  });
+  expect(catalog.scenarios.find((entry) => entry.id === 'APP-SOURCE-SNAPSHOT'))
+    .toMatchObject({ device: 'fake-app-source-world', kind: 'source-snapshot-integrity' });
+});
+
+test('GOOGLE-DRIVE-LIST-READONLY catalogs the synthetic metadata-only Google Drive world', () => {
+  const device = catalog.devices.find((entry) => entry.id === 'fake-google-drive-world');
+  expect(device).toMatchObject({
+    checklistCells: ['APP-OAUTH-ONE'],
+    implementation: ['src/ux-sim/fake-google-drive-world.ts'],
+    tests: ['src/ux-sim/fake-google-drive-world.test.ts'],
+  });
+  expect(catalog.scenarios.find((entry) => entry.id === 'GOOGLE-DRIVE-LIST-READONLY'))
+    .toMatchObject({ device: 'fake-google-drive-world', kind: 'oauth-readonly-simulation' });
 });
 
 test('world event registry rejects duplicate IDs and missing descriptions', () => {
@@ -195,7 +236,7 @@ test('read-only device registry prints entry, logs, event, recent-use, and omiss
   expect(output).toContain('entry=bun test src/ux-sim/fake-gh.test.ts');
   expect(output).toContain('events=(none recorded)');
   expect(output).toContain('recent=(not recorded)');
-  expect(output).toContain('omission check: required=3 missing=0');
+  expect(output).toContain('omission check: required=4 missing=0');
   expect(output).toContain('MD-UX-SIM-FAKE-CLOCK-TS\tsrc/ux-sim/fake-clock.ts');
   expect(output).toContain('devices=fake-clock');
   expect(output).toContain('certificate=no');
@@ -358,7 +399,7 @@ test('MS-01, MS-04, and MS-07 ask registered devices for independent and disting
 
 test('list and show render registered scenarios and unknown ids fail closed', () => {
   expect(renderMockScenarioList(catalog).join('\n')).toContain('UX-MS-01\treport-deficit');
-  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 46/47');
+  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 58/59');
   expect(renderMockScenarioDetails(catalog, 'UX-MS-11').join('\n')).toContain('request-shape 400');
   expect(() => renderMockScenarioDetails(catalog, 'UX-MS-99')).toThrow('unknown mock scenario id');
 });
@@ -370,7 +411,7 @@ test('ux-sim list/show/devices CLI exposes the catalog without launching a simul
   expect(list.stdout).toContain('UX-MS-07');
   expect(list.stdout).toContain('UX-MS-11');
   expect(list.stdout).toContain('UX-MS-12');
-  expect(list.stdout).toContain('후보 감사 46/47');
+  expect(list.stdout).toContain('후보 감사 58/59');
 
   const show = spawnSync('bun', ['scripts/ux-sim.ts', 'show', 'UX-MS-11'], { cwd: REPO, encoding: 'utf8' });
   expect(show.status).toBe(0);
@@ -380,7 +421,7 @@ test('ux-sim list/show/devices CLI exposes the catalog without launching a simul
   expect(devices.status).toBe(0);
   expect(devices.stdout).toContain('Mock device registry · read-only');
   expect(devices.stdout).toContain('recent=(not recorded)');
-  expect(devices.stdout).toContain('omission check: required=3 missing=0');
+  expect(devices.stdout).toContain('omission check: required=4 missing=0');
 
   const unknown = spawnSync('bun', ['scripts/ux-sim.ts', 'show', 'UX-MS-99'], { cwd: REPO, encoding: 'utf8' });
   expect(unknown.status).toBe(2);

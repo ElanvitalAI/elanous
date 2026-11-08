@@ -4,7 +4,8 @@ import { mkdtempSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { GateResult } from './gate-node.js';
+import type { GateResult } from './gate-types.js';
+import type { GateTriageClass } from './gate-triage-types.js';
 import { planAdaptiveGateHeal } from './adaptive-gate-heal.js';
 import { classifyGateShadow } from './gate-triage-node.js';
 
@@ -15,7 +16,7 @@ test('RLA-ARG-ADAPTIVE-HEAL sim: production decision core consumes injected gate
   const world = parseYaml(readFileSync(join(import.meta.dir, '../../scenarios/ux-sim/rla-arg-adaptive-heal.yaml'), 'utf8')) as {
     cases: Array<{ id: string; inject: { outcome: GateResult['outcome']; introduced?: string[]; executor?: 'host' | 'pod'; error?: string;
       gatePodPool?: string; stalledShards?: GateResult['stalledShards']; repeat?: number };
-      expect: { classification?: string; action: string; events: string[] } }>;
+      expect: { classification?: GateTriageClass; action: string; events: string[] } }>;
   };
   const base = (outcome: GateResult['outcome'], patch: Partial<GateResult> = {}): GateResult => ({ outcome, commit: 'a'.repeat(40),
     introduced: [], preexisting: 0, fixed: null, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1, ...patch });
@@ -45,7 +46,7 @@ test('RLA-ARG-ADAPTIVE-HEAL sim: production decision core consumes injected gate
     }
     if (plan.disposition.action === 'append-image-repair-and-resume') {
       expect(plan.disposition.repairNode.input).toEqual({ version: '0.3.6', runId: `sim-${scenario.id}`,
-        commit: triage.commit, pool: scenario.inject.gatePodPool,
+        commit: triage.commit, pool: scenario.inject.gatePodPool!,
         failureCode: scenario.inject.error?.includes('pod-gate-missing-run-scope')
           ? 'pod-gate-missing-run-scope' : 'pod-gate-missing-cut-image-pin' });
       expect(plan.disposition.repairNode.recipe).toBe('cmd:gate-image-repair');

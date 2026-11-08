@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, openSync, closeSync, writeSync, realpathSync, re
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { homedir, loadavg } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
 import {
@@ -34,10 +34,13 @@ import { runGitCommand } from '../git-fs/runner.js';
 import {
   defaultCensusParallelRunner,
   defaultCmdRunner,
+  DEFAULT_PR_GH_COMMAND_TIMEOUT_MS,
   makePrManager,
   resolveDeliverableBase,
+  sanitizeCredentialText,
   type CmdRunner,
   type PrManager,
+  type UpsertPrOutcome,
 } from '../autopilot/pr-manager.js';
 import { observePrLineage } from '../pr-tool/census.js';
 import {
@@ -64,6 +67,7 @@ import { registerPrLandOptions } from './pr-land-options.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import type { VerifyOverlapEvidenceInput } from './pr-land-overlap-evidence.js';
 import { classifyTypecheckDrift, executeDriftPlan, planDriftRepair, resolveDriftAutorepairMode, type DriftDeps } from './pr-land-drift-repair.js';
+import { runTypeDriftRadarAfterLanding } from './pr-land-drift-radar.js';
 import { loadGateReceipts } from '../self-implement/gate-receipt-registry.js';
 import { getUserConfig } from '../user-config.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
@@ -78,6 +82,7 @@ import type { LandingPodShadowInput, LandingPodShadowVerdict } from './pr-land-p
 import type { TaskCard } from '../task-agent/task-hand.js';
 import { INFLIGHT_REGISTRY_FILE, removeInflightForPr } from '../pr-tool/inflight-registry.js';
 import type { L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
+import { createMacrophageRuntime } from '../release-loop/macrophage-heal-node.js';
 import { censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, sharedCensusDiffCache, type Seat } from '../pr-tool/census.js';
 
 export { branchLineageSlug, findSiblingPrs };
@@ -110,6 +115,27 @@ export interface PrLandOpts {
   heavyRemote?: boolean;
   /** Opt-in comparison of the heavy remote verdict with a Pod Job; the remote verdict still decides landing. */
   heavyOnPodShadow?: boolean;
+}
+
+type PrLandDirectAuthorization =
+  | { allowed: true; auditActor?: 'OP' | 'train-runner' }
+  | { allowed: false; seat: string };
+
+/**
+ * Direct merge authority for `pr land`. `ELANOUS_TRAIN_RUNNER=1` is the one process marker
+ * trusted train runners must pass; `ELANOUS_TRACK` identifies a seat. Seats may still use
+ * `--hold` to create/update a PR without merging it. Calls without a seat identity retain the
+ * existing manual CLI path; this guard restricts identified seats.
+ */
+export function authorizePrLandDirectMerge(
+  opts: Pick<PrLandOpts, 'hold'>,
+  env: NodeJS.ProcessEnv = process.env,
+): PrLandDirectAuthorization {
+  if (opts.hold) return { allowed: true };
+  const seat = env.ELANOUS_TRACK?.trim();
+  if (seat === 'OP') return { allowed: true, auditActor: 'OP' };
+  if (env.ELANOUS_TRAIN_RUNNER?.trim() === '1') return { allowed: true, auditActor: 'train-runner' };
+  return seat ? { allowed: false, seat } : { allowed: true };
 }
 
 export interface PrGranularityOpts {
@@ -269,6 +295,8 @@ export interface PrLandDeps {
   setExitCode?: (code: number) => void;
   runTypecheckGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
   driftAutorepair?: { mode?: 'off' | 'shadow' | 'live'; deps?: DriftDeps; attemptsByHead?: number; attemptsByPr?: number; readAttempts?: (pr: number, head: string) => { byHead: number; byPr: number }; recordAttempt?: (pr: number, head: string) => void; launch?: (goal: string, boundaryFiles: readonly string[]) => void; escalate?: (mail: string) => void };
+  /** Post-landing export drift radar; test seam keeps remote checks and owner mail out of unit tests. */
+  driftRadar?: (input: { cwd: string; mergeCommit: string }) => { scanned: number; warned: number; skipped: number };
   runIsolationGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
   runMockModuleRestoreGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
   runModelHardcodeGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
@@ -1514,6 +1542,19 @@ function defaultDriftDeps(): DriftDeps {
 
 export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): Promise<number> {
   const out = deps.out ?? liveOut;
+  const directAuthorization = authorizePrLandDirectMerge(opts);
+  if (!directAuthorization.allowed) {
+    debug.log('pr.land', 'train-only-refused', { seat: directAuthorization.seat, pr: Number(opts.pr) || null, hold: false });
+    out.error(`✗ train-only: ${directAuthorization.seat} 호출자의 직접 병합은 OP 또는 열차 실행기만 허용됩니다. PR만 쌓으려면 --hold를 사용하십시오.`);
+    return 1;
+  }
+  if (directAuthorization.auditActor) {
+    // Durable single-line JSONL ledger entry for each OP/train exception to train-only landing.
+    debug.log('pr.land', 'train-only-bypass', {
+      actor: directAuthorization.auditActor, seat: process.env.ELANOUS_TRACK?.trim() || null,
+      pr: Number(opts.pr) || null, hold: false,
+    });
+  }
   const landStartedAt = Date.now();
   const stage = (name: string, startedAt: number, ok: boolean, extra: Record<string, unknown> = {}): void => {
     if (!opts.heavyRemote) return;
@@ -1615,7 +1656,26 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
 
   const cwd = opts.cwd ?? process.cwd();
-  const run = deps.run ?? defaultCmdRunner;
+  const commandRunner = deps.run ?? defaultCmdRunner;
+  const run: CmdRunner = (cmd, args, commandOptions) => {
+    if (cmd !== 'gh') return commandRunner(cmd, args, commandOptions);
+    const operation = args.slice(0, 2).join(' ') || 'gh';
+    const timeoutMs = commandOptions?.timeoutMs ?? DEFAULT_PR_GH_COMMAND_TIMEOUT_MS;
+    const startedAt = Date.now();
+    debug.log('pr.land', 'gh-command-started', { operation, timeoutMs, cwd: commandOptions?.cwd ?? cwd });
+    const result = commandRunner(cmd, args, deps.run ? commandOptions : { ...commandOptions, timeoutMs });
+    const detail = result.err ? sanitizeCredentialText(result.err).slice(-400) : '';
+    const timedOut = /\bETIMEDOUT\b|timed? out/i.test(detail);
+    debug.log('pr.land', timedOut ? 'gh-command-timed-out' : 'gh-command-completed', {
+      operation,
+      timeoutMs,
+      elapsedMs: Date.now() - startedAt,
+      ok: result.ok,
+      ...(typeof result.rc === 'number' ? { rc: result.rc } : {}),
+      ...(detail ? { error: detail } : {}),
+    }, timedOut ? { level: 'warn' } : undefined);
+    return result;
+  };
   const pinned = opts.pr !== undefined || opts.expectedHead !== undefined;
   if (opts.dryRun && opts.pr !== undefined && opts.expectedHead === undefined) {
     if (opts.overlapEvidence !== undefined || opts.hold) {
@@ -2495,25 +2555,43 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
 
   // A pinned, already-reviewed commit must not go through upsertPr (git add/commit/force-push/PR edit).
-  const upsert = pinned
-    ? existing.status === 'ok OUTPUT' && existing.url === pinnedUrl
-      ? { ok: true as const, url: pinnedUrl!, reused: true }
-      : { ok: false as const, reason: 'gh' as const, detail: 'pinned PR is not the branch open PR' }
-    : manager.upsertPr({
+  const upsertStartedAt = Date.now();
+  debug.log('pr.land', 'upsert.started', { branch, hold: opts.hold === true, pinned });
+  let upsert: UpsertPrOutcome;
+  try {
+    upsert = pinned
+      ? existing.status === 'ok OUTPUT' && existing.url === pinnedUrl
+        ? { ok: true as const, url: pinnedUrl!, reused: true }
+        : { ok: false as const, reason: 'gh' as const, detail: 'pinned PR is not the branch open PR' }
+      : manager.upsertPr({
+        branch,
+        worktreePath: cwd,
+        // 기존 PR 재사용이면 명시 --base 일 때만 넘긴다 — 추론한 base 는 PR 을 main 으로 재타기팅한다(#26150).
+        ...(opts.base?.trim() || !existing.url ? { base } : {}),
+        draft: hold,
+        title: title ?? `Land ${branch}`,
+        // ⛔⭐ 본문 기본값도 «내용이 있는» 쪽으로 — 종전 34자 플레이스홀더는 ***아무에게도 쓸모가 없었고***
+        //   그래서 두 세션이 이틀간 「본문 없는 PR」을 156건 냈다. `--commit-message` 가 있으면 그것을 싣는다.
+        //   ⚠️ 그래도 ***서사는 `--body`/`--body-file` 로 주는 것이 옳다*** — 이 기본값은 «바닥»이지 «목표»가 아니다.
+        body: body ?? (commitMessage?.trim()
+          ? `${commitMessage.trim()}\n\n---\n⚠️ 이 본문은 --commit-message 에서 자동 생성됐다. 서사는 --body-file 로 주는 것이 옳다.`
+          : 'Human-requested atomic PR landing.'),
+        commitMessage: commitMessage ?? `chore: land ${branch}`,
+        ...(excludingActiveRunFiles ? { excludePaths } : {}),
+      });
+  } catch (error) {
+    const detail = sanitizeCredentialText(error instanceof Error ? error.message : String(error)).slice(-400);
+    debug.log('pr.land', 'upsert.threw', { branch, hold: opts.hold === true, pinned,
+      elapsedMs: Date.now() - upsertStartedAt, error: detail }, { level: 'error' });
+    throw error;
+  }
+  debug.log('pr.land', 'upsert.completed', {
     branch,
-    worktreePath: cwd,
-    // 기존 PR 재사용이면 명시 --base 일 때만 넘긴다 — 추론한 base 는 PR 을 main 으로 재타기팅한다(#26150).
-    ...(opts.base?.trim() || !existing.url ? { base } : {}),
-    draft: hold,
-    title: title ?? `Land ${branch}`,
-    // ⛔⭐ 본문 기본값도 «내용이 있는» 쪽으로 — 종전 34자 플레이스홀더는 ***아무에게도 쓸모가 없었고***
-    //   그래서 두 세션이 이틀간 「본문 없는 PR」을 156건 냈다. `--commit-message` 가 있으면 그것을 싣는다.
-    //   ⚠️ 그래도 ***서사는 `--body`/`--body-file` 로 주는 것이 옳다*** — 이 기본값은 «바닥»이지 «목표»가 아니다.
-    body: body ?? (commitMessage?.trim()
-      ? `${commitMessage.trim()}\n\n---\n⚠️ 이 본문은 \`--commit-message\` 에서 자동 생성됐다. 서사는 \`--body-file\` 로 주는 것이 옳다.`
-      : 'Human-requested atomic PR landing.'),
-    commitMessage: commitMessage ?? `chore: land ${branch}`,
-    ...(excludingActiveRunFiles ? { excludePaths } : {}),
+    hold: opts.hold === true,
+    pinned,
+    ok: upsert.ok,
+    elapsedMs: Date.now() - upsertStartedAt,
+    ...(!upsert.ok ? { reason: upsert.reason } : {}),
   });
   if (!upsert.ok) {
     if (upsert.reason === 'noop' && excludingActiveRunFiles && !pinned) {
@@ -2837,6 +2915,22 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     out.log(`⚠ heavy-remote: final PR base 조회 불가 (${finalBaseRead.attempts}회) — 병합 결과를 실패 처리하지 않습니다.`);
   }
   out.log(`✓ merge: squash ${upsert.url} → ${landingBase}`);
+  if (landingBase === 'main') {
+    try {
+      const mergedPr = run('gh', ['pr', 'view', upsert.url, '--json', 'mergeCommit']);
+      const mergeCommit = mergedPr.ok
+        ? (JSON.parse(mergedPr.out) as { mergeCommit?: { oid?: unknown } }).mergeCommit?.oid
+        : undefined;
+      if (typeof mergeCommit === 'string' && /^[a-f0-9]{40}$/i.test(mergeCommit)) {
+        const radar = (deps.driftRadar ?? runTypeDriftRadarAfterLanding)({ cwd, mergeCommit });
+        debug.log('pr.land', 'drift-radar-complete', { pr: prNumber, mergeCommit, ...radar });
+      } else {
+        debug.log('pr.land', 'drift-radar-skipped', { pr: prNumber, reason: 'merge-commit-unavailable' });
+      }
+    } catch (error) {
+      try { debug.log('pr.land', 'drift-radar-skipped', { pr: prNumber, reason: String(error).slice(0, 160) }); } catch { /* radar never changes landing outcome */ }
+    }
+  }
   if (landingBase === '<base unavailable>') {
     out.log('⚠ local HEAD does not contain the landed result; the landed base is unavailable, so no branch command can be provided.');
   } else {
@@ -2914,7 +3008,21 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
   };
   queue.command('status').description('Show pending PRs and shadow verdicts').action(() => queueAction(async () => (await import('../self-implement/l8-merge-queue.js')).statusL8ShadowQueue(process.cwd(), queueDeps)));
   queue.command('enqueue <pr>').description('Pin a ready PR at the tail of the shadow queue').action(async (prNumber: string) => queueAction(async () => { const queueMod = await import('../self-implement/l8-merge-queue.js'); return queueMod.enqueueL8ShadowQueue(process.cwd(), queueMod.shadowPrNumber(prNumber), queueDeps); }));
-  queue.command('run').description('Evaluate the first PR without merging').requiredOption('--shadow', 'Only evaluate; never land').action(() => queueAction(async () => (await import('../self-implement/l8-merge-queue.js')).runL8ShadowQueue(process.cwd(), queueDeps)));
+  queue.command('run').description('Evaluate the first PR without merging').requiredOption('--shadow', 'Only evaluate; never land').action(() => queueAction(async () => {
+    const runId = `merge-train-${randomUUID()}`;
+    const macrophage = createMacrophageRuntime({ runId, mode: 'live' });
+    try {
+      return await (await import('../self-implement/l8-merge-queue.js')).runL8ShadowQueue(process.cwd(), {
+        ...queueDeps,
+        emitTrainProgress: async (event) => {
+          await queueDeps.emitTrainProgress?.(event);
+          await macrophage.eventBus.publish({ graphId: 'release-loop', runId, eventId: event.eventId,
+            type: event.type, source: { kind: 'runner', nodeId: 'pr-queue-run' },
+            data: event as unknown as Record<string, unknown> });
+        },
+      });
+    } finally { macrophage.dispose(); }
+  }));
 
   const land = pr.command('land');
   registerPrLandOptions(land);

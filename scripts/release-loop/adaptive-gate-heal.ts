@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import type { GateResult } from './gate-node.js';
-import type { GateTriageShadow } from './gate-triage-node.js';
+import type { GateResult } from './gate-types.js';
+import type { GateTriageShadow } from './gate-triage-types.js';
+import { macrophageEvidenceMatchesObservedGate, planMacrophageRepairLadder, type MacrophageRepairLadderDecision, type MacrophageRepairLadderInput } from '../../src/release-loop/macrophage-repair-ladder.js';
 
 export type AdaptiveHealEventName =
   | 'gate.result.received'
@@ -12,7 +13,8 @@ export type AdaptiveHealEventName =
   | 'heal.resume.decided'
   | 'heal.pod-retry.decided'
   | 'heal.hitl.decided'
-  | 'heal.noop.decided';
+  | 'heal.noop.decided'
+  | 'heal.macrophage-ladder.decided';
 
 export interface AdaptiveHealEvent {
   name: AdaptiveHealEventName;
@@ -29,6 +31,8 @@ export interface AdaptiveHealInput {
   gatePodPool?: string;
   /** Actual visits already consumed when this node executes; absence is unmeasured and fails closed. */
   visitState?: { gate: number; gateTriage: number };
+  /** Optional bounded repair-ladder facts supplied by the release-loop adapter. */
+  macrophageRepairLadder?: unknown;
 }
 
 export interface AdaptiveGateRepairNode {
@@ -51,7 +55,8 @@ export interface AdaptiveGateImageRepairNode {
 export type AdaptiveHealDisposition =
   | { action: 'append-repair-and-resume'; repairNode: AdaptiveGateRepairNode; resumeFrom: string; rerunGateAt: 'gate'; visitState: { gate: number; gateTriage: number }; visitLimits: { gate: 2; gateTriage: 2 }; maxRepairRetries: 1 }
   | { action: 'append-image-repair-and-resume'; repairNode: AdaptiveGateImageRepairNode; resumeFrom: string; rerunGateAt: 'gate'; visitState: { gate: number; gateTriage: number }; visitLimits: { gate: 2; gateTriage: 2 }; maxRepairRetries: 1 }
-  | { action: 'rerun-pod'; reason: string; resumeFrom: 'gate' }
+  | { action: 'rerun-pod'; reason: string; resumeFrom: 'gate'; gatePodPool: string;
+      visitState: { gate: number; gateTriage: number }; visitLimits: { gate: 2; gateTriage: 2 } }
   | { action: 'decision-required'; reason: string }
   | { action: 'no-op'; reason: string };
 
@@ -59,6 +64,7 @@ export interface AdaptiveGateHealPlan {
   attribution: { commit: string; failureIds: string[]; classification: GateTriageShadow['classification'] };
   disposition: AdaptiveHealDisposition;
   events: AdaptiveHealEvent[];
+  macrophageRepairLadder?: MacrophageRepairLadderDecision;
 }
 
 function repairNodeId(commit: string, failureIds: readonly string[]): string {
@@ -81,6 +87,7 @@ export function planAdaptiveGateHeal(input: AdaptiveHealInput): AdaptiveGateHeal
     { name: 'gate.failures.attributed', data: { commit: triage.commit, failureIds } },
     { name: 'heal.classified', data: { classification: triage.classification, reason: triage.reason } },
   ];
+  let macrophageRepairLadder: MacrophageRepairLadderDecision | undefined;
   const visitState = input.visitState;
   const visitLimits = { gate: 2 as const, gateTriage: 2 as const };
   if (!visitState || !Number.isSafeInteger(visitState.gate) || !Number.isSafeInteger(visitState.gateTriage)
@@ -88,7 +95,49 @@ export function planAdaptiveGateHeal(input: AdaptiveHealInput): AdaptiveGateHeal
     || visitState.gate >= visitLimits.gate || visitState.gateTriage >= visitLimits.gateTriage) {
     const disposition = { action: 'decision-required' as const, reason: 'adaptive repair retry budget is exhausted or visit state is invalid' };
     events.push({ name: 'heal.hitl.decided', data: disposition });
-    return { attribution, disposition, events };
+    return { attribution, disposition, events, ...(macrophageRepairLadder ? { macrophageRepairLadder } : {}) };
+  }
+  if (Object.prototype.hasOwnProperty.call(input, 'macrophageRepairLadder')) {
+    const rawLadder = input.macrophageRepairLadder as unknown;
+    if (!rawLadder || typeof rawLadder !== 'object' || Array.isArray(rawLadder)) {
+      const disposition = { action: 'decision-required' as const,
+        reason: 'repair-ladder input is malformed; operator decision required' };
+      events.push({ name: 'heal.hitl.decided', data: disposition });
+      return { attribution, disposition, events };
+    }
+    const ladderInput = rawLadder as MacrophageRepairLadderInput;
+    const ladderFailureIds = ladderInput.failureIds;
+    const sameFailures = typeof ladderInput === 'object' && !Array.isArray(ladderInput)
+      && ladderInput.runId === input.runId
+      && Array.isArray(ladderFailureIds) && ladderFailureIds.every((id) => typeof id === 'string')
+      && JSON.stringify([...ladderFailureIds].sort()) === JSON.stringify([...triage.failureIds].sort());
+    const evidenceMatches = sameFailures
+      && macrophageEvidenceMatchesObservedGate(ladderInput.evidence, input.gate, triage);
+    if (!evidenceMatches) {
+      const disposition = { action: 'decision-required' as const,
+        reason: 'repair-ladder evidence failed run, failure-ID, or observed-gate verification' };
+      events.push({ name: 'heal.hitl.decided', data: disposition });
+      return { attribution, disposition, events };
+    }
+    macrophageRepairLadder = planMacrophageRepairLadder(ladderInput);
+    events.push({ name: 'heal.macrophage-ladder.decided', data: { decision: macrophageRepairLadder } });
+    if (macrophageRepairLadder.step === 'R0-remeasure') {
+      const disposition = { action: 'decision-required' as const, reason: 'same-slice isolated remeasurement executor is not connected' };
+      events.push({ name: 'heal.hitl.decided', data: disposition });
+      return { attribution, disposition, events, macrophageRepairLadder };
+    }
+    if (macrophageRepairLadder.step === 'R1-single-file' || macrophageRepairLadder.step === 'R2-split-files') {
+      const disposition = { action: 'decision-required' as const,
+        reason: `${macrophageRepairLadder.step} needs a cut-append constrained repair executor before graph append` };
+      events.push({ name: 'heal.hitl.decided', data: disposition });
+      return { attribution, disposition, events, macrophageRepairLadder };
+    }
+    if (macrophageRepairLadder.step === 'R3-revert-proposal' || macrophageRepairLadder.step === 'R4-hitl'
+      || macrophageRepairLadder.step === 'none') {
+      const disposition = { action: 'decision-required' as const, reason: macrophageRepairLadder.reason };
+      events.push({ name: 'heal.hitl.decided', data: disposition });
+      return { attribution, disposition, events, macrophageRepairLadder };
+    }
   }
   const failureCode = input.gate.error?.includes('pod-gate-missing-cut-image-pin') ? 'pod-gate-missing-cut-image-pin'
     : input.gate.error?.includes('pod-gate-missing-run-scope') ? 'pod-gate-missing-run-scope' : undefined;
@@ -105,16 +154,17 @@ export function planAdaptiveGateHeal(input: AdaptiveHealInput): AdaptiveGateHeal
       { name: 'heal.graph-append.planned', data: { after: 'gate-triage', nodeId } },
       { name: 'heal.resume.decided', data: { from: nodeId, rerunGateAt: 'gate' } },
     );
-    return { attribution, disposition, events };
+    return { attribution, disposition, events, ...(macrophageRepairLadder ? { macrophageRepairLadder } : {}) };
   }
   const unattributedHostFailure = input.gateExecutor === 'host'
     && input.gate.outcome === 'error' && failureIds.length === 0
     && (input.gate.error?.includes('failure attribution') === true
       || input.gate.stalledShards?.some((shard) => shard.reason === 'unattributed') === true);
-  if (unattributedHostFailure) {
-    const disposition = { action: 'rerun-pod' as const, reason: 'host gate attribution incomplete', resumeFrom: 'gate' as const };
+  if (unattributedHostFailure && input.gatePodPool?.trim()) {
+    const disposition = { action: 'rerun-pod' as const, reason: 'host gate attribution incomplete', resumeFrom: 'gate' as const,
+      gatePodPool: input.gatePodPool, visitState, visitLimits };
     events.push({ name: 'heal.pod-retry.decided', data: disposition });
-    return { attribution, disposition, events };
+    return { attribution, disposition, events, ...(macrophageRepairLadder ? { macrophageRepairLadder } : {}) };
   }
   if (triage.classification === 'regression' && failureIds.length > 0) {
     const nodeId = repairNodeId(triage.commit, failureIds);
@@ -127,14 +177,14 @@ export function planAdaptiveGateHeal(input: AdaptiveHealInput): AdaptiveGateHeal
       { name: 'heal.graph-append.planned', data: { after: 'gate-triage', nodeId } },
       { name: 'heal.resume.decided', data: { from: nodeId, rerunGateAt: 'gate' } },
     );
-    return { attribution, disposition, events };
+    return { attribution, disposition, events, ...(macrophageRepairLadder ? { macrophageRepairLadder } : {}) };
   }
   if (triage.classification === 'clean') {
     const disposition = { action: 'no-op' as const, reason: triage.reason };
     events.push({ name: 'heal.noop.decided', data: disposition });
-    return { attribution, disposition, events };
+    return { attribution, disposition, events, ...(macrophageRepairLadder ? { macrophageRepairLadder } : {}) };
   }
   const disposition = { action: 'decision-required' as const, reason: `${triage.classification}: ${triage.reason}` };
   events.push({ name: 'heal.hitl.decided', data: disposition });
-  return { attribution, disposition, events };
+  return { attribution, disposition, events, ...(macrophageRepairLadder ? { macrophageRepairLadder } : {}) };
 }

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // RunDevHarness — 스테이지드 하니스(P→E→R→D) front door LLM 툴 (P2 · 2026-07-20)
 //
 // PLAN-dev-harness-front-door §3 P2. 텔레그램 등에서 objective 를 던지면 **플래너→실행기→리뷰기→
@@ -16,7 +17,7 @@
 import { createHash } from 'node:crypto';
 import { tierModel } from '../../llm/model-defaults.js';
 import type { DispatchTaskDeps } from '../../execution-loop/dispatch-task.js';
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { DaemonToolDispatchCtx } from '../../boot/daemon-tools/types.js';
 import type { SelfImplementSeams } from '../../self-implement/orchestrator.js';
 import type { DefaultSeamsOptions } from '../../self-implement/seams.js';

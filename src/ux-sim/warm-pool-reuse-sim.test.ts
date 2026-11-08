@@ -120,7 +120,8 @@ test('WARM-POOL-REUSE-SIM: production reconcile selects a gate worker; refusals 
         observed: 'sha256:439cda88a55018764f7a2a76e4462b1489ed8f96edbb7132580d2e1f92988181',
       } });
     expect(digestRepro.reconcile).toMatchObject({ target: 1, ready: 1, failed: [] });
-    expect(digestRepro.selection).toMatchObject({ selected: true, transport: 'observed', reason: 'complete' });
+    // Gate reuse is pinned to the requested image digest; drift is observed but never leased.
+    expect(digestRepro.selection).toMatchObject({ selected: false, transport: 'fallback', reason: 'lease-unavailable' });
     expect(digestRepro.deletedPodUid).toBeNull();
     expect(digestRepro.controlRequests.filter(row => row.path === '/v1/workers/pod')).toHaveLength(1);
     expect(digestRepro.controlRequests).not.toContainEqual(expect.objectContaining({ path: expect.stringMatching(/\/(retire|reap)$/) }));
@@ -135,7 +136,7 @@ test('WARM-POOL-REUSE-SIM: production reconcile selects a gate worker; refusals 
       } });
     expect(incompatible.reconcile).toMatchObject({ target: 1, ready: 1, failed: [] });
     expect(incompatible.deletedPodUid).toBe('preexisting-pod-uid');
-    expect(incompatible.selection).toMatchObject({ selected: true, transport: 'observed', reason: 'complete' });
+    expect(incompatible.selection).toMatchObject({ selected: false, transport: 'fallback', reason: 'lease-unavailable' });
     expect(incompatible.controlRequests).toContainEqual({
       path: '/v1/leases/pod-worker/warm-pool-host-a-standard-1-generation-1/retire', status: 200 });
     expect(incompatible.controlRequests).toContainEqual(expect.objectContaining({ path: expect.stringMatching(/\/reap$/), status: 200 }));
@@ -172,6 +173,23 @@ test('WARM-POOL-REUSE-SIM: production reconcile selects a gate worker; refusals 
   }
 });
 
+
+test('GATE-WARM-POOL-SHARDS-SIM: three sequential shards reuse one pinned Pod with one receipt per lease', async () => {
+  const runId = `run-gate-warm-shards-${randomUUID()}`;
+  const result = await runWarmPoolReuseSimulation({ runId, shardCount: 3 });
+  expect(result.reconcile).toMatchObject({ target: 1, ready: 1, failed: [] });
+  const selections = result.shardSelections;
+  if (!selections) throw new Error('sequential shard selections were not recorded');
+  expect(selections).toHaveLength(3);
+  expect(selections.every(row => row.transport === 'observed' && row.reason === 'complete' && row.released)).toBe(true);
+  expect(new Set(selections.map(row => row.workerId)).size).toBe(1);
+  expect(new Set(selections.map(row => row.podUid)).size).toBe(1);
+  expect(result.protocol.requests.map(row => row.attemptId)).toEqual([
+    `${runId}-gate-1`, `${runId}-gate-2`, `${runId}-gate-3`,
+  ]);
+  expect(result.controlRequests.filter(row => row.path.endsWith('/release'))).toHaveLength(3);
+  expect(result.controlRequests.filter(row => row.path.endsWith('/sanitize'))).toHaveLength(3);
+});
 
 test('WARM-POOL-REUSE-SIM: disappearing mesh member reclaims its lease and reassigns same digest', async () => {
   const result = await simulateWarmPoolMachineLossRecovery();
@@ -236,7 +254,8 @@ test('WARM-POOL-REUSE-SIM: assembled drain config retains another host through p
   const digest = `sha256:${'d'.repeat(64)}`;
   const assembled = assembleWarmPoolProviderConfig({
     config: { pod: { warmPoolProfile: 'gate', warmPool: { namespace: 'elanous-test',
-      imageRepository: 'registry.example/elanous', imageDigest: digest, lockHash: 'e'.repeat(64),
+      imageRepository: 'registry.example/elanous', imageDigest: digest,
+      baseImageDigest: `sha256:${'a'.repeat(64)}`, lockHash: 'e'.repeat(64),
       architecture: 'amd64', hostProbeUrl: 'http://host.orb.internal:10001/health',
       prodProbeUrl: 'http://core.elanous-prod:10002/', sourceUrl: 'https://github.com/ElanvitalAI/elanous.git',
       drainingHosts: ['pool-host-a'], templates: [

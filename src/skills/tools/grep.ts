@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Grep tool (Claude Code-compatible ripgrep wrapper) ──
 //
 // Ports claude-code-fork/src/tools/GrepTool. Shells out to the
@@ -32,7 +33,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { basename, isAbsolute, resolve } from 'node:path';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { getSessionCwd } from '../../session/working-dir.js';
 import { getUserConfig } from '../../user-config.js';
 import { debug } from '../../debug/log.js';

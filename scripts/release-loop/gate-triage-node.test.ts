@@ -1,12 +1,14 @@
 import { expect, test } from 'bun:test';
-import { chooseGatePrescription, classifyGateShadow, gateTriageShadowFromContext, gateTriageShadowFromSavedVerdict, logGateTriageShadow, priorGateDecisionsFromLedger } from './gate-triage-node';
-import type { GateResult } from './gate-node';
+import { createHash } from 'node:crypto';
+import { assessIntroducedMainFixedPick, chooseGatePrescription, classifyGateShadow, gateTriageShadowFromContext, gateTriageShadowFromSavedVerdict, logGateTriageShadow, priorGateDecisionsFromLedger } from './gate-triage-node';
+import type { GateResult } from './gate-types.js';
 import { debug } from '../../src/debug/log';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { parse as yaml } from 'yaml';
+import { resetEffectiveInstanceRoot } from '../../src/instance/resolve.js';
 
 function gate(patch: Partial<GateResult> = {}): GateResult {
   return { outcome: 'ok', commit: 'abcdef0', introduced: [], preexisting: 0, fixed: null,
@@ -63,6 +65,7 @@ test('graph context consumes gate output without changing it', () => {
   const output = gate({ outcome: 'regression', introduced: ['a'] });
   const context = { input: { version: '0.2.30', previousVersion: '0.2.29' }, outputs: { gate: output as unknown as Record<string, unknown> } };
   expect(gateTriageShadowFromContext(context).classification).toBe('regression');
+  expect(gateTriageShadowFromContext(context).mainFixedPick).toBeUndefined();
   const graphOutput = { ...output, outcome: 'fail', verdict: 'fail' };
   expect(gateTriageShadowFromContext({ ...context, outputs: { gate: graphOutput } })).toMatchObject({
     classification: 'regression', commit: output.commit, failureIds: ['a'],
@@ -103,7 +106,8 @@ test('shadow decision records a graph.ground event', () => {
 });
 
 test('standalone entrypoint succeeds with structured classification', () => {
-  const context = { runId: 'run-shadow', input: { version: '0.2.30', previousVersion: '0.2.29' },
+  const context = { runId: 'run-shadow', input: { version: '0.2.30', previousVersion: '0.2.29', gateExecutor: 'pod',
+    adaptiveHealVisitState: { gate: 1, gateTriage: 1 } },
     outputs: { gate: { ...gate({ outcome: 'regression', introduced: ['src/a.test.ts: fails'] }), outcome: 'fail' } } };
   const run = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
     cwd: process.cwd(), encoding: 'utf8', timeout: 20_000,
@@ -113,14 +117,15 @@ test('standalone entrypoint succeeds with structured classification', () => {
   const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as Record<string, unknown>;
   expect(result).toMatchObject({ outcome: 'ok', classification: 'regression',
     verdict: 'pass',
-    prescription: { action: 'repair-card', runId: 'run-shadow', failureIds: ['src/a.test.ts: fails'] } });
+    prescription: { action: 'append-repair-and-resume', visitState: { gate: 1, gateTriage: 1 },
+      repairNode: { input: { runId: 'run-shadow', failureIds: ['src/a.test.ts: fails'] } } } });
 });
 
 test('successful triage still follows the release failure restoration edge', () => {
   const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as {
     edges: Array<{ from: string; map: Record<string, string> }> };
   const triage = graph.edges.find(edge => edge.from === 'gate-triage');
-  expect(triage?.map).toEqual({ ok: 'traffic-failed-restore', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
+  expect(triage?.map).toEqual({ ok: 'traffic-failed-restore', fail: 'gate-heal-decision', error: 'gate-heal-decision' });
   expect(graph.edges.find(edge => edge.from === 'traffic-failed-restore')?.map)
     .toEqual({ ok: 'failed', fail: 'failed', error: 'failed' });
 });
@@ -154,6 +159,7 @@ test('0.2.40 failure evidence selects only the matching gate prescription', () =
   expect(savedReplay.result).toMatchObject({ classification: 'regression', commit: regression.commit, introduced: ids });
   const context = { runId: '0.2.40-shadow', input: { version: '0.2.40', previousVersion: '0.2.38', gateExecutor: 'pod' },
     outputs: { gate: regression as unknown as Record<string, unknown> } };
+  expect(gateTriageShadowFromContext(context).mainFixedPick).toBeUndefined();
   expect(chooseGatePrescription(context, gateTriageShadowFromContext(context))).toEqual({
     action: 'repair-card', reason: 'introduced gate regressions', runId: '0.2.40-shadow',
     commit: regression.commit, failureIds: ids,
@@ -198,6 +204,234 @@ test('actual saved release runs supply repeated symptom decisions to the live tr
   expect(chooseGatePrescription(context, triage).action).toBe('decision-card');
 });
 
+test('GATE-INTRODUCED-MAIN-FIXED-PICK sim: only a measured first-parent transition with an intact rolling receipt is suggested', () => {
+  const root = mkdtempSync(join(tmpdir(), 'introduced-main-fixed-pick-'));
+  const cut = 'd'.repeat(40);
+  const baseCommit = 'c'.repeat(40);
+  const mainFailure = 'e'.repeat(40);
+  const fix = 'b'.repeat(40);
+  const tip = 'a'.repeat(40);
+  const id = 'src/a.test.ts > introduced failure';
+  const receiptPath = join(root, 'rolling-main-receipt.json');
+  const receiptBody = JSON.stringify({ outcome: 'ok', commit: tip });
+  writeFileSync(receiptPath, receiptBody);
+  const receipt = { valid: true as const, commit: tip, receiptPath,
+    sha256: createHash('sha256').update(receiptBody).digest('hex') };
+  const makeMeasurement = (status: 'pass' | 'fail' | 'unmeasured', commit = tip) => {
+    const receiptBody = JSON.stringify({ schema: 'main-standalone-v1', complete: true,
+      runId: 'main-run-1', commit, results: [{ id, status }] });
+    return { commit, runId: 'main-run-1', receiptSha256: createHash('sha256').update(receiptBody).digest('hex'), receiptBody };
+  };
+  const base = {
+    cutCommit: cut,
+    mainTip: tip,
+    firstParentBaseCommit: baseCommit,
+    firstParentCommits: [baseCommit, mainFailure, fix, tip],
+    introducedIds: [id],
+    cutResults: [{ id, status: 'fail' as const }],
+    mainMeasurement: makeMeasurement('pass'),
+    rollingRuns: [
+      { commit: mainFailure, status: 'red' as const, introduced: [id] },
+      { commit: fix, status: 'red' as const, introduced: [] },
+      { commit: tip, status: 'green' as const, introduced: [], receipt },
+    ],
+  };
+  try {
+    expect(assessIntroducedMainFixedPick(base)).toMatchObject({
+      status: 'measured', candidates: [{ failureId: id, commit: tip, source: 'main-head-fallback' }], unverifiedCandidates: [],
+    });
+    const laterRed = { commit: tip, status: 'red' as const, introduced: [id] };
+    const fixReceiptBody = JSON.stringify({ outcome: 'ok', commit: fix });
+    const fixReceiptPath = join(root, 'rolling-main-fix-receipt.json');
+    writeFileSync(fixReceiptPath, fixReceiptBody);
+    expect(assessIntroducedMainFixedPick({ ...base, rollingRuns: [
+      base.rollingRuns[0]!,
+      { commit: fix, status: 'green' as const, introduced: [], receipt: { valid: true as const, commit: fix,
+        receiptPath: fixReceiptPath, sha256: createHash('sha256').update(fixReceiptBody).digest('hex') } },
+      { ...base.rollingRuns[2]!, receipt },
+    ] })).toMatchObject({ status: 'measured', candidates: [{ failureId: id, commit: fix, source: 'rolling-main-transition' }] });
+    const ambiguousRollingRuns = [base.rollingRuns[0]!, base.rollingRuns[1]!, base.rollingRuns[2]!];
+    expect(assessIntroducedMainFixedPick({ ...base, mainMeasurement: undefined, rollingRuns: ambiguousRollingRuns }))
+      .toMatchObject({ status: 'unmeasured', candidates: [], unverifiedCandidates: [{ failureId: id }] });
+    const exactRollingRuns = [base.rollingRuns[0]!,
+      { commit: fix, status: 'green' as const, introduced: [], receipt: { valid: true as const, commit: fix,
+        receiptPath: fixReceiptPath, sha256: createHash('sha256').update(fixReceiptBody).digest('hex') } },
+      { ...base.rollingRuns[2]!, receipt }];
+    expect(assessIntroducedMainFixedPick({ ...base,
+      mainMeasurement: { ...base.mainMeasurement, receiptSha256: '0'.repeat(64) }, rollingRuns: exactRollingRuns }))
+      .toMatchObject({ status: 'measured', candidates: [{ failureId: id, commit: fix, source: 'rolling-main-transition' }] });
+    expect(assessIntroducedMainFixedPick({ ...base, mainMeasurement: makeMeasurement('unmeasured'), rollingRuns: exactRollingRuns }))
+      .toMatchObject({ status: 'measured', candidates: [{ failureId: id, commit: fix, source: 'rolling-main-transition' }] });
+    expect(assessIntroducedMainFixedPick({ ...base, mainMeasurement: makeMeasurement('fail') }))
+      .toMatchObject({ status: 'measured', candidates: [], unverifiedCandidates: [] });
+    expect(assessIntroducedMainFixedPick({ ...base, rollingRuns: [
+      base.rollingRuns[0]!,
+      { commit: fix, status: 'green' as const, introduced: [], receipt: { valid: true as const, commit: fix,
+        receiptPath: fixReceiptPath, sha256: createHash('sha256').update(fixReceiptBody).digest('hex') } },
+      laterRed,
+    ] })).toMatchObject({ status: 'measured', candidates: [],
+      unverifiedCandidates: [{ failureId: id, commit: tip, status: 'unverified' }] });
+    expect(assessIntroducedMainFixedPick({ ...base, rollingRuns: [] })).toMatchObject({
+      status: 'measured', candidates: [{ failureId: id, commit: tip, source: 'main-head-fallback' }],
+    });
+    const { rollingRuns, mainMeasurement, ...withoutRollingReceipts } = base;
+    void rollingRuns;
+    void mainMeasurement;
+    expect(assessIntroducedMainFixedPick(withoutRollingReceipts)).toMatchObject({
+      status: 'unmeasured', firstParentCommits: [baseCommit, mainFailure, fix, tip], candidates: [],
+      unverifiedCandidates: [{ failureId: id, commit: tip, status: 'unverified', reason: 'execution receipt absent' }],
+    });
+    expect(assessIntroducedMainFixedPick({ ...base, rollingRuns: base.rollingRuns.map((run) => ({ ...run, introduced: [] })) }))
+      .toMatchObject({ status: 'measured', candidates: [{ failureId: id, commit: tip, source: 'main-head-fallback' }] });
+    expect(assessIntroducedMainFixedPick({ ...base, rollingRuns: base.rollingRuns.map((run) => ({
+      commit: run.commit, status: 'red' as const, introduced: [id],
+    })) })).toMatchObject({ status: 'measured', candidates: [],
+      unverifiedCandidates: [{ failureId: id, commit: tip, status: 'unverified' }] });
+    expect(assessIntroducedMainFixedPick({ ...base, rollingRuns: undefined, mainMeasurement: makeMeasurement('fail') }))
+      .toMatchObject({ status: 'measured', candidates: [] });
+    expect(assessIntroducedMainFixedPick({ ...base, mainMeasurement: makeMeasurement('pass', cut) }))
+      .toMatchObject({ status: 'unmeasured', candidates: [], unverifiedCandidates: [{ failureId: id, status: 'unverified' }] });
+    expect(assessIntroducedMainFixedPick({ ...base, mainMeasurement: makeMeasurement('unmeasured') }))
+      .toMatchObject({ status: 'unmeasured', candidates: [], unverifiedCandidates: [{ failureId: id, status: 'unverified' }] });
+    expect(assessIntroducedMainFixedPick({ ...base, mainMeasurement: { ...base.mainMeasurement, receiptSha256: '0'.repeat(64) } }))
+      .toMatchObject({ status: 'unmeasured', candidates: [], unverifiedCandidates: [{ failureId: id, status: 'unverified' }] });
+    expect(assessIntroducedMainFixedPick({ ...base, rollingRuns: [
+      base.rollingRuns[0]!,
+      { commit: fix, status: 'red' as const, introduced: [] },
+      { commit: tip, status: 'red' as const, introduced: [] },
+    ] })).toMatchObject({ status: 'measured', candidates: [{ failureId: id, commit: tip, source: 'main-head-fallback' }],
+      unverifiedCandidates: [] });
+    expect(assessIntroducedMainFixedPick({ ...base,
+      rollingRuns: [{ ...base.rollingRuns[0]! }, { ...base.rollingRuns[1]!, receipt: { ...receipt, sha256: '0'.repeat(64) } }],
+    })).toMatchObject({ status: 'measured', candidates: [{ failureId: id, commit: tip, source: 'main-head-fallback' }] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-INTRODUCED-MAIN-FIXED-PICK sim: missing rolling-main receipts fall back to main-head recheck plus first-parent range', () => {
+  const priorCwd = process.cwd();
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  const isolatedStateDir = mkdtempSync(join(tmpdir(), 'introduced-main-fixed-pick-state-'));
+  const repo = mkdtempSync(join(tmpdir(), 'introduced-main-fixed-pick-git-'));
+  process.env.ELANOUS_STATE_DIR = isolatedStateDir;
+  resetEffectiveInstanceRoot();
+  const git = (...args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+  git('init', '-q');
+  git('config', 'user.name', 'Gate fixed-pick simulation');
+  git('config', 'user.email', 'gate-fixed-pick@example.invalid');
+  writeFileSync(join(repo, 'fixture.txt'), 'base\n');
+  git('add', 'fixture.txt');
+  git('commit', '-qm', 'base');
+  git('commit', '--allow-empty', '-qm', 'cut');
+  const cutCommit = git('rev-parse', 'HEAD').stdout.trim();
+  git('commit', '--allow-empty', '-qm', 'main standalone result');
+  const mainTip = git('rev-parse', 'HEAD').stdout.trim();
+  const bare = mkdtempSync(join(tmpdir(), 'introduced-main-fixed-pick-origin-'));
+  spawnSync('git', ['init', '--bare', '-q', bare]);
+  git('remote', 'add', 'origin', bare);
+  git('push', '-q', 'origin', `HEAD:refs/heads/main`);
+  git('update-ref', 'refs/remotes/origin/main', mainTip);
+  const baseCommit = git('merge-base', cutCommit, mainTip).stdout.trim();
+  const commits = git('rev-list', '--first-parent', '--reverse', `${baseCommit}..${mainTip}`)
+    .stdout.trim().split(/\r?\n/).filter(Boolean);
+  const id = 'src/a.test.ts > introduced failure';
+  const measurementDir = join(isolatedStateDir, 'release', '0.3.7', 'main-standalone');
+  mkdirSync(measurementDir, { recursive: true });
+  const measurementBody = JSON.stringify({ schema: 'main-standalone-v1', complete: true,
+    runId: 'main-run-1', commit: mainTip, results: [{ id, status: 'pass' }] });
+  writeFileSync(join(measurementDir, 'main-run-1.json'), measurementBody);
+  const context = { input: { version: '0.3.7', previousVersion: '0.3.6', gateTriageEvidence: {
+    introducedMainFixedPick: { mainTip, firstParentCommits: [baseCommit, ...commits],
+      mainMeasurement: { commit: mainTip, runId: 'main-run-1', receiptSha256: createHash('sha256').update(measurementBody).digest('hex'),
+        receiptBody: measurementBody } },
+  } }, outputs: { gate: gate({ outcome: 'regression', commit: cutCommit, introduced: [id] }) as unknown as Record<string, unknown> } };
+  try {
+    process.chdir(repo);
+    expect(gateTriageShadowFromContext(context).mainFixedPick).toMatchObject({
+      status: 'measured', firstParentCommits: [baseCommit, ...commits],
+      candidates: [{ failureId: id, commit: mainTip, source: 'main-head-fallback' }], unverifiedCandidates: [],
+    });
+    git('update-ref', 'refs/remotes/origin/main', cutCommit);
+    expect(gateTriageShadowFromContext(context).mainFixedPick).toMatchObject({
+      status: 'unmeasured', candidates: [], unverifiedCandidates: [],
+    });
+  } finally {
+    process.chdir(priorCwd);
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+    resetEffectiveInstanceRoot();
+    rmSync(isolatedStateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
+  }
+});
+
+test('GATE-INTRODUCED-MAIN-FIXED-PICK sim: live gate triage emits an unmeasured observation when no standalone result producer supplied a receipt', () => {
+  const priorCwd = process.cwd();
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  const isolatedStateDir = mkdtempSync(join(tmpdir(), 'introduced-main-fixed-pick-live-state-'));
+  const repo = mkdtempSync(join(tmpdir(), 'introduced-main-fixed-pick-live-git-'));
+  process.env.ELANOUS_STATE_DIR = isolatedStateDir;
+  resetEffectiveInstanceRoot();
+  const git = (...args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+  git('init', '-q');
+  git('config', 'user.name', 'Gate fixed-pick live simulation');
+  git('config', 'user.email', 'gate-fixed-pick@example.invalid');
+  writeFileSync(join(repo, 'fixture.txt'), 'base\n');
+  git('add', 'fixture.txt');
+  git('commit', '-qm', 'base');
+  git('commit', '--allow-empty', '-qm', 'cut');
+  const cutCommit = git('rev-parse', 'HEAD').stdout.trim();
+  git('commit', '--allow-empty', '-qm', 'main tip');
+  const mainTip = git('rev-parse', 'HEAD').stdout.trim();
+  const bare = mkdtempSync(join(tmpdir(), 'introduced-main-fixed-pick-live-origin-'));
+  spawnSync('git', ['init', '--bare', '-q', bare]);
+  git('remote', 'add', 'origin', bare);
+  git('push', '-q', 'origin', 'HEAD:refs/heads/main');
+  git('update-ref', 'refs/remotes/origin/main', mainTip);
+  const baseCommit = git('merge-base', cutCommit, mainTip).stdout.trim();
+  const commits = git('rev-list', '--first-parent', '--reverse', `${baseCommit}..${mainTip}`)
+    .stdout.trim().split(/\r?\n/).filter(Boolean);
+  const id = 'src/a.test.ts > introduced failure';
+  const context = { input: { version: '0.3.7', previousVersion: '0.3.6' },
+    outputs: { gate: gate({ outcome: 'regression', commit: cutCommit, introduced: [id] }) as unknown as Record<string, unknown> } };
+  try {
+    process.chdir(repo);
+    expect(gateTriageShadowFromContext(context).mainFixedPick).toMatchObject({
+      status: 'unmeasured', candidates: [], firstParentCommits: [baseCommit, ...commits],
+      unverifiedCandidates: [{ failureId: id, commit: mainTip, status: 'unverified', reason: 'execution receipt absent' }],
+    });
+    const rollingPath = join(isolatedStateDir, 'release', '0.3.7', 'rolling-main-gate.json');
+    mkdirSync(dirname(rollingPath), { recursive: true });
+    writeFileSync(rollingPath, '{corrupt rolling receipt');
+    expect(gateTriageShadowFromContext(context).mainFixedPick).toMatchObject({
+      status: 'unmeasured', candidates: [], firstParentCommits: [baseCommit, ...commits],
+      unverifiedCandidates: [{ failureId: id, commit: mainTip, status: 'unverified', reason: 'execution receipt absent' }],
+    });
+    const measurementDir = join(isolatedStateDir, 'release', '0.3.7', 'main-standalone');
+    mkdirSync(measurementDir, { recursive: true });
+    const receiptBody = JSON.stringify({ schema: 'main-standalone-v1', complete: true,
+      runId: 'main-run-fallback', commit: mainTip, results: [{ id, status: 'pass' }] });
+    writeFileSync(join(measurementDir, 'main-run-fallback.json'), receiptBody);
+    const standaloneContext = { ...context, input: { ...context.input, gateTriageEvidence: {
+      introducedMainFixedPick: { mainTip, firstParentCommits: [baseCommit, ...commits], mainMeasurement: {
+        commit: mainTip, runId: 'main-run-fallback', receiptSha256: createHash('sha256').update(receiptBody).digest('hex'),
+      } },
+    } } };
+    expect(gateTriageShadowFromContext(standaloneContext).mainFixedPick).toMatchObject({
+      status: 'measured', firstParentCommits: [baseCommit, ...commits],
+      candidates: [{ failureId: id, commit: mainTip, source: 'main-head-fallback' }], unverifiedCandidates: [],
+    });
+  } finally {
+    process.chdir(priorCwd);
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = priorStateDir;
+    resetEffectiveInstanceRoot();
+    rmSync(isolatedStateDir, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
+  }
+});
+
 if (process.env.ELANOUS_GATE_VERDICT_0229) test('actual 0.2.29 saved verdict retains commit and failure IDs through CLI', () => {
   const file = process.env.ELANOUS_GATE_VERDICT_0229!;
   const saved = JSON.parse(readFileSync(file, 'utf8')) as { commit: string; introduced: string[] };
@@ -212,20 +446,41 @@ if (process.env.ELANOUS_GATE_VERDICT_0229) test('actual 0.2.29 saved verdict ret
   expect(result).toMatchObject({ classification: 'regression', outcome: 'ok', commit: saved.commit, introduced: [expectedId] });
 });
 
-test('malformed graph context exits with error outcome', () => {
+test('malformed graph context exits with a fail-closed HITL prescription', () => {
   const run = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
     cwd: process.cwd(), encoding: 'utf8', timeout: 20_000,
     env: { ...process.env, ELANOUS_GRAPH_CONTEXT: JSON.stringify({ outputs: {} }) },
   });
   expect(run.status).toBe(1);
-  expect(JSON.parse(run.stdout.trim().split('\n').at(-1)!)).toMatchObject({ outcome: 'error', verdict: 'fail' });
+  expect(JSON.parse(run.stdout.trim().split('\n').at(-1)!)).toMatchObject({
+    outcome: 'fail', verdict: 'fail', prescription: { action: 'decision-required' },
+  });
+});
+
+test('rejected macrophage repair-ladder input emits decision-required for the live graph', () => {
+  const failureId = 'src/a.test.ts > introduced regression';
+  for (const ladder of [null, { runId: 'another-run', failureIds: [failureId], evidence: 'introduced' }]) {
+    const run = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 20_000,
+      env: { ...process.env, ELANOUS_GRAPH_CONTEXT: JSON.stringify({ runId: 'active-run', input: {
+        version: '0.3.7', previousVersion: '0.3.6', adaptiveHealVisitState: { gate: 1, gateTriage: 1 },
+        macrophageRepairLadder: ladder,
+      }, outputs: { gate: gate({ outcome: 'regression', introduced: [failureId] }) } }) },
+    });
+    expect(run.status).toBe(0);
+    expect(JSON.parse(run.stdout.trim().split('\n').at(-1)!)).toMatchObject({
+      outcome: 'fail', prescription: { action: 'decision-required' },
+      adaptiveHeal: { disposition: { action: 'decision-required' },
+        events: expect.arrayContaining([expect.objectContaining({ name: 'heal.hitl.decided' })]) },
+    });
+  }
 });
 
 test('successful gate triage emits the graph success verdict', () => {
   const run = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
     cwd: process.cwd(), encoding: 'utf8', timeout: 20_000,
     env: { ...process.env, ELANOUS_GRAPH_CONTEXT: JSON.stringify({
-      input: { version: '0.2.40', previousVersion: '0.2.39' },
+      input: { version: '0.2.40', previousVersion: '0.2.39', adaptiveHealVisitState: { gate: 1, gateTriage: 1 } },
       outputs: { gate: gate() },
     }) },
   });

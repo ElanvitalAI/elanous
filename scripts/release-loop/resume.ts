@@ -59,7 +59,7 @@ export function releaseResumeAcceptedRegressions(state: GraphRunState, additions
   return combined;
 }
 
-const SWEEP_INCOMPLETE = /^(?:pod sweep incomplete|sweep incomplete|[\w-]+ shard incomplete|failure attribution incomplete)\b/;
+const SWEEP_INCOMPLETE = /^(?:pod sweep incomplete|sweep incomplete|[\w-]+ shard incomplete|failure[- ]attribution[- ]incomplete)\b/;
 
 /**
  * RELEASE-WAIVE-UNMEASURED — why the saved gate record at `index` carries no verdict, or undefined when it does (or may).

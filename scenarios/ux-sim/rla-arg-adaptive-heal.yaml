@@ -29,7 +29,7 @@ cases:
       action: append-image-repair-and-resume
       events: [gate.result.received, gate.failures.attributed, heal.classified, heal.image-repair-node.planned, heal.graph-append.planned, heal.resume.decided]
   - id: host-attribution-gap
-    inject: { outcome: error, executor: host, error: cut host sweep failure attribution incomplete }
+    inject: { outcome: error, executor: host, gatePodPool: pool-aws2@aws2:1, error: cut host sweep failure attribution incomplete }
     expect:
       action: rerun-pod
       events: [gate.result.received, gate.failures.attributed, heal.classified, heal.pod-retry.decided]

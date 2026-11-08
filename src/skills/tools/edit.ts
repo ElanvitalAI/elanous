@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Edit tool (Claude Code-compatible exact-string replace) ──
 //
 // Ports claude-code-fork/src/tools/FileEditTool. Core guarantee:
@@ -31,7 +32,7 @@
 
 import { statSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { getSessionBoundary, getSessionCwd, isWriteAllowedInBoundary } from '../../session/working-dir.js';
 import { harnessMainTreeReject } from '../../harness/harness-write-boundary.js';
 import { debug } from '../../debug/log.js';

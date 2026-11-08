@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tool: youtube_transcript — T3-A1.
 //
 // Extracts YouTube transcript via Supadata API (fast path, free,
@@ -23,7 +24,7 @@
 // Truncation: output respects max_bytes (default 64 KB) so long
 // podcasts don't blow the LLM context.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { truncateOutput } from '../../output-truncation.js';
 
 const VIDEO_ID_PATTERNS = [

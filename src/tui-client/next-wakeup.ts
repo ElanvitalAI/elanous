@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── next TUI 의 자기 예약 깨움 (TUI-NEXT-QUEUE-AND-WAKE · 0.2.36 · 2026-10-22) ──────────────────────
 //
 // 🚨 무엇을 푸는가: 클래식 대시보드엔 `ScheduleWakeup`(H5) ⊕ 내부 턴 문(H2)이 있는데 next TUI 엔 없었다 —
@@ -16,7 +17,7 @@
 //   힐링 = 문이 열리면 next 가 내부 턴 한 번 · 바쁘면 1분마다 미룸(상한 30분) · 끝내 못 열면 «⏰ 예약 깨움 놓침» 한 줄
 
 import { createInternalTurnGate, formatInternalTurnBanner, isInternalTurnEnabledByEnv, type InternalTurnGate, type InternalTurnRequest } from '../dashboard/input/internal-turn.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { LLMToolDef, PluginContext } from '../plugins/core/types.js';
 import {
   SCHEDULE_WAKEUP_TOOL_NAME,

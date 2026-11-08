@@ -137,6 +137,8 @@ export interface SecretsFile {
   version: typeof SECRETS_VERSION;
   /** id (e.g., 'tg_token') → secret value (plain text). */
   secrets: Record<string, string>;
+  /** One-way receipts for crash-safe credential registration commits. */
+  credentialRegistrationReceipts?: Record<string, string>;
 }
 
 export const SECRET_REF_PREFIX = 'ref:secret:';

@@ -15,9 +15,11 @@ import { LIGHT_RC_DEFAULT_SHARDS, LIGHT_RC_UNKNOWN_HOST, runLightRc, type LightR
 import { planRehearsalShards, type RehearsalShardPlan, type RehearsalShardPlanDeps } from './rehearsal-shard-plan.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
-import { hardRehearsalGateArgs, hardRehearsalGateVersion } from '../../scripts/release-loop/gate-radius-live.js';
+import { HARD_REHEARSAL_POD_SHARDS, hardRehearsalGateArgs, hardRehearsalGateVersion } from '../../scripts/release-loop/gate-radius-live.js';
 import { gateSourcePins } from '../../scripts/release-loop/gate-baseline-receipt.js';
 import { preflightGateExecutionIdentity, type GatePodExecutionIdentity } from '../../scripts/release-loop/gate-radius-live.js';
+import { gateShardLedgerBatchComplete, gateShardLedgerPath, readGateShardLedger } from './gate-shard-ledger.js';
+import { gateShardsPath, readGateShards } from './gate-shards.js';
 
 export type StepId = 'hard-mid' | 'rc-7h' | 'hard-5h' | 'rc-150m';
 export type RehearsalOutcome = 'ok' | 'regression' | 'unmeasured' | 'error' | 'no-checkout' | 'checkout-dirty' | 'superseded' | 'interrupted';
@@ -207,7 +209,7 @@ export function runRehearsalLeakCheck(checkout: string): { status: number | null
 
 /** Run the exact hard-gate subprocess with an isolated clock budget for timeout replay. */
 export function spawnHardRehearsalGate(opts: {
-  binary: string; args: string[]; checkout: string; ledgerRoot: string; logPath: string; timeoutMs: number; sha: string;
+  binary: string; args: string[]; checkout: string; ledgerRoot: string; logPath: string; progressFile?: string; timeoutMs: number; sha: string;
 }): HardGateResult {
   mkdirSync(dirname(opts.logPath), { recursive: true });
   const log = openSync(opts.logPath, 'wx', 0o600);
@@ -215,7 +217,8 @@ export function spawnHardRehearsalGate(opts: {
   try {
     run = spawnSync(opts.binary, opts.args, {
       cwd: opts.checkout, encoding: 'utf8', stdio: ['ignore', log, log], timeout: opts.timeoutMs,
-      env: { ...process.env, ELANOUS_STATE_DIR: opts.ledgerRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(opts.ledgerRoot) },
+      env: { ...process.env, ELANOUS_STATE_DIR: opts.ledgerRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(opts.ledgerRoot),
+        ...(opts.progressFile ? { ELANOUS_GATE_PROGRESS_FILE: opts.progressFile } : {}) },
     });
   } finally { closeSync(log); }
   return parseHardRehearsalGateResult(run, opts.logPath, opts.sha);
@@ -278,6 +281,51 @@ function hardGateReceiptRecordMismatch(input: {
   return null;
 }
 
+/** Reuse is allowed only when this release ledger has a complete cut batch for the exact rehearsal gate SHA. */
+function hardGateShardLedgerRecordMismatch(ledgerRoot: string, gateVersion: string, commit: string, progressFile: string): string | null {
+  let progress: Array<Record<string, unknown>>;
+  try {
+    progress = readFileSync(progressFile, 'utf8').split(/\r?\n/).filter(line => line.trim()).map(line => {
+      const row: unknown = JSON.parse(line);
+      if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error('invalid progress row');
+      return row as Record<string, unknown>;
+    });
+  } catch { return 'HQ gate completion evidence unavailable'; }
+  const initialPlan = progress.find(row => row.phase === 'shard-planning' && row.shardIndex === 1
+    && Number.isSafeInteger(row.shardTotal) && Number(row.shardTotal) >= HARD_REHEARSAL_POD_SHARDS);
+  const plannedShardCount = initialPlan?.shardTotal;
+  if (!Number.isSafeInteger(plannedShardCount)) return 'HQ gate completion shard plan unavailable';
+  const planRows = progress.filter(row => row.phase === 'shard-planning' && row.shardTotal === plannedShardCount
+    && Number.isSafeInteger(row.shardIndex) && Number(row.shardIndex) >= 1 && Number(row.shardIndex) <= Number(plannedShardCount)
+    && typeof row.shard === 'string' && row.shard.trim());
+  const shardByIndex = new Map(planRows.map(row => [Number(row.shardIndex), String(row.shard)]));
+  if (shardByIndex.size !== Number(plannedShardCount) || new Set(shardByIndex.values()).size !== shardByIndex.size
+    || Array.from({ length: Number(plannedShardCount) }, (_, index) => index + 1).some(index => !shardByIndex.has(index))) {
+    return 'HQ gate completion shard plan unavailable';
+  }
+  const expectedShardIds = Array.from({ length: Number(plannedShardCount) }, (_, index) => shardByIndex.get(index + 1)!);
+  const completion = [...progress].reverse().find(row => row.phase === 'collection' && row.state === 'complete');
+  const completedShardCount = completion?.shardCount;
+  if (!Number.isSafeInteger(completedShardCount) || completedShardCount !== plannedShardCount) return 'HQ gate completion shard plan unavailable';
+  const shardPlan = readGateShards(gateShardsPath(gateVersion, ledgerRoot));
+  const plannedShardIds = shardPlan?.shards.map(row => row.id) ?? [];
+  if (!shardPlan || expectedShardIds.some(id => !plannedShardIds.includes(id))
+    || new Set(shardPlan.shards.map(row => row.id)).size !== shardPlan.shards.length) return 'HQ gate shard plan incomplete';
+  const ledger = readGateShardLedger(gateShardLedgerPath(gateVersion, ledgerRoot));
+  if (!ledger) return 'HQ shard ledger has no completed batch';
+  if (ledger.trailingPartial || ledger.malformed) return 'HQ shard ledger is malformed or unterminated';
+  const matching = ledger.rows.filter(row => row.version === gateVersion && row.commit === commit && row.phase === 'cut');
+  const groups = new Map<string, typeof matching>();
+  for (const row of matching) if (row.batchId) groups.set(row.batchId, [...(groups.get(row.batchId) ?? []), row]);
+  if (!groups.size) return 'HQ shard ledger has no completed batch';
+  for (const [batchId, rows] of groups) {
+    const first = rows[0]!;
+    const shardIds = plannedShardIds;
+    if (gateShardLedgerBatchComplete(rows, { batchId, version: gateVersion, commit, phase: 'cut', observedAt: first.observedAt, shardIds })) return null;
+  }
+  return 'HQ shard ledger batch is incomplete';
+}
+
 function validateRehearsalPodPoolOverride(remote: string | undefined, podPool: string): void {
   if (remote !== 'aws1') throw new Error('hard rehearsal --pod-pool override is reserved for --remote aws1');
   const members = parsePodPool(podPool);
@@ -324,7 +372,8 @@ async function runHardGate(version: string, checkout: string, sha: string, ledge
   const gateVersion = hardRehearsalGateVersion(version, runId);
   const result = gateSpawn({
     binary: 'bun', args: hardRehearsalGateArgs(version, runId, sha, previous, pool),
-    checkout, ledgerRoot, logPath, timeoutMs: 4 * 60 * 60_000, sha,
+    checkout, ledgerRoot, logPath, progressFile: join(ledgerRoot, 'release', version, 'rehearsal', `${runId}.gate-progress.jsonl`),
+    timeoutMs: 4 * 60 * 60_000, sha,
   });
   let reason: string | undefined;
   try {
@@ -334,7 +383,8 @@ async function runHardGate(version: string, checkout: string, sha: string, ledge
     reason = [graphProbeError ? `receipt source pins could not be read: ${graphProbeError}` : undefined,
       identityProbeError ? `receipt identity preflight failed: ${identityProbeError}` : undefined,
       hardGateReceiptRecordMismatch({ version: gateVersion, head40: sha, gateCommit: verdict.commit,
-        receipt: verdict.baselineReceipt, graphPins, expectedIdentity }) ?? undefined].filter(Boolean).join(' · ') || undefined;
+        receipt: verdict.baselineReceipt, graphPins, expectedIdentity }) ?? undefined,
+      hardGateShardLedgerRecordMismatch(ledgerRoot, gateVersion, sha, join(ledgerRoot, 'release', version, 'rehearsal', `${runId}.gate-progress.jsonl`)) ?? undefined].filter(Boolean).join(' · ') || undefined;
   } catch (error) {
     reason = [graphProbeError ? `receipt source pins could not be read: ${graphProbeError}` : undefined,
       identityProbeError ? `receipt identity preflight failed: ${identityProbeError}` : undefined,
@@ -588,22 +638,26 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
               const hard = await (deps.hardGate ?? ((version, cwd, sha, ledger, id, host) =>
                 runHardGate(version, cwd, sha, ledger, id, host, deps.hardGateGraphPins, deps.hardGateIdentity, deps.hardGateSpawn, opts.podPool)))
                 (plan.version, checkout, stamp.sha, root, hardGateRunId, targetHost, opts.podPool);
-              stamp.hardGate = hard;
+              const gateReceiptFailure = hard.receiptRecord?.available === true ? undefined
+                : hard.receiptRecord?.reason?.trim() || 'HQ gate receipt unavailable';
+              const measuredHard = gateReceiptFailure && hard.outcome !== 'error'
+                ? { ...hard, outcome: 'unmeasured' as const, error: gateReceiptFailure }
+                : hard;
+              stamp.hardGate = measuredHard;
               if (!existsSync(hardGateLog)) writeFileSync(hardGateLog, `${JSON.stringify(hard)}\n`, { flag: 'wx', mode: 0o600 });
-              if (hard.outcome !== 'error' && (hard.commit !== stamp.sha || hard.executor !== 'pod' || !Array.isArray(hard.introduced)))
+              if (measuredHard.outcome !== 'error' && (measuredHard.commit !== stamp.sha || measuredHard.executor !== 'pod' || !Array.isArray(measuredHard.introduced)))
                 throw new Error('hard rehearsal result did not measure pinned SHA on a Pod');
-              if (hard.outcome === 'ok' && hard.introduced.length) throw new Error('hard rehearsal gate ok verdict contains introduced failures');
-              stamp.outcome = hard.outcome === 'regression' && hard.introduced.length === 0 ? 'unmeasured' : hard.outcome;
-              const cause = stamp.outcome === 'unmeasured' ? (hard.outcome === 'unmeasured'
-                ? hard.error?.trim() || 'hard rehearsal execution identity unavailable' : 'regression verdict has no introduced IDs')
-                : hard.outcome === 'error' ? hard.error?.trim() || 'gate returned error without a cause' : undefined;
+              if (measuredHard.outcome === 'ok' && measuredHard.introduced.length) throw new Error('hard rehearsal gate ok verdict contains introduced failures');
+              stamp.outcome = measuredHard.outcome === 'regression' && measuredHard.introduced.length === 0 ? 'unmeasured' : measuredHard.outcome;
+              const cause = stamp.outcome === 'unmeasured' ? (gateReceiptFailure ?? (measuredHard.outcome === 'unmeasured'
+                ? measuredHard.error?.trim() || 'hard rehearsal execution identity unavailable' : 'regression verdict has no introduced IDs'))
+                : measuredHard.outcome === 'error' ? measuredHard.error?.trim() || 'gate returned error without a cause' : undefined;
               if (cause) stamp.measurementGap = { cause, runId: hardGateRunId, evidence: hardGateLog };
               const introducedCount: number | null = stamp.outcome === 'unmeasured' || stamp.outcome === 'error' ? null : hard.introduced.length;
               const preexistingCount: number | null = introducedCount === null ? null : hard.preexisting;
               const totalFailures: number | null = introducedCount === null || preexistingCount === null ? null : introducedCount + preexistingCount;
-              const receiptStatus = hard.receiptRecord?.available === false
-                ? ` · 영수증 재사용 불가: 기록 검증 실패: ${hard.receiptRecord.reason ?? 'record incomplete'}` : '';
-              stamp.summary = oneLine(`hard gate ${hard.outcome} · introduced ${introducedCount ?? 'UNKNOWN'} · preexisting ${preexistingCount ?? 'UNKNOWN'} · total failures ${totalFailures ?? 'UNKNOWN'} · 원격 Pod ${targetHost} · 12 shards · runId ${hardGateRunId} · evidence ${hardGateLog}${cause ? ` · ${cause}` : ''}${receiptStatus}`);
+              const receiptStatus = gateReceiptFailure ? ` · HQ 원장 영수증 실패: ${gateReceiptFailure}` : '';
+              stamp.summary = oneLine(`hard gate ${measuredHard.outcome} · introduced ${introducedCount ?? 'UNKNOWN'} · preexisting ${preexistingCount ?? 'UNKNOWN'} · total failures ${totalFailures ?? 'UNKNOWN'} · 원격 Pod ${targetHost} · 12 shards · runId ${hardGateRunId} · evidence ${hardGateLog}${cause ? ` · ${cause}` : ''}${receiptStatus}`);
             } else {
             const shardPlan = opts.shards === undefined ? (deps.shardPlan ?? planRehearsalShards)(plan.version, root, checkout, { ...deps.shardPlanDeps, remoteGate: true }) : undefined;
             if (shardPlan) stamp.shardPlan = shardPlan;

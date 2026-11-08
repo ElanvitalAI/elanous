@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── ToolSearch spec (pure · zero-dependency) ──
 //
 // The ToolSearch **schema** is needed by two very different layers:
@@ -13,7 +14,7 @@
 // a pure literal — lives here and both layers import it. One source of
 // truth, no cycle.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 /** Default result cap — large enough for realistic "select:A,B,C" batch
  *  loading, small enough that a loose keyword search won't flood the

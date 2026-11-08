@@ -13,47 +13,16 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
 import { runGraph, type GraphRunState } from '../graph-runner/runner.js';
 import { FENCE_ROLES } from '../hq/hq.js';
-import { dueBefore, type CheckEntry } from './checker.js';
+import { dueBefore } from './schedule-due.js';
+import type { CheckEntry } from './checker-contract.js';
+import type { LoopEntry, LoopRoot, LoopRun, LoopStage } from './registry-contract.js';
+export type { LoopEntry, LoopRoot, LoopRun, LoopStage } from './registry-contract.js';
 import { readUnreadCount } from '../msg/msg-store.js';
 import { loopMessageRoute, SEAT_MESSAGE_ROUTES, type LoopReplyBody, type MessageWake } from './msg-address.js';
 import { resolveWake, type WakeDeps, type WakeResolution } from './msg-wake.js';
 
-export interface LoopRun {
-  at: string;
-  status: GraphRunState['status'];
-  path: string;
-  runId: string;
-  failedNodes: string[];
-  durationMs: number | null;
-}
-export type LoopRoot = '조율자' | '수호자';
-export type LoopStage = 'proposed' | 'shadow' | 'live' | 'retiring' | 'retired';
 const LOOP_STAGES: readonly LoopStage[] = ['proposed', 'shadow', 'live', 'retiring', 'retired'];
 
-export interface LoopEntry {
-  id: string;
-  parent?: string | null;
-  root?: LoopRoot | null;
-  purpose?: string | null;
-  stage?: LoopStage | null;
-  msgAddress?: string | null;
-  replyBody?: LoopReplyBody;
-  wake?: MessageWake;
-  /** Where `wake` came from — `unresolved` is «모름», not a measured absence. */
-  wakeSource?: WakeResolution['source'];
-  unreadCount?: number | null;
-  title: string;
-  description: string | null;
-  owner?: string | null;
-  ownerSource?: 'header' | 'config' | 'seat' | 'seat-arg' | 'default';
-  mode?: string | null;
-  file: string;
-  trigger: { cron: string | null; events: string[] };
-  jobs: Array<{ id: string; cron: string | null; enabled: boolean; entryScript?: boolean }>;
-  enabled: boolean;
-  lastRun: LoopRun | null;
-  nextRun: string | null;
-}
 export interface LoopRegistryOptions {
   root?: string;
   stateRoot?: string;

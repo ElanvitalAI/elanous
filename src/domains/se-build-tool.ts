@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── se_build tool — SE 격리 빌드 관측(대표 2026-07-13·PLAN B2) ────────────────
 //
 // elanous 자신(과 외부 CLI)이 "지금 SE 격리 빌드 뭐 도나 · 그 빌드 안에서 뭘 하나"를 인지하는
@@ -8,7 +9,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { runGitCommand } from '../git-fs/runner.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import {
   openSeBuildsDb, listBuilds, getBuild, buildLogPath, markBuildStatus, type SeBuildRecord,
 } from '../autopilot/se-build-registry.js';

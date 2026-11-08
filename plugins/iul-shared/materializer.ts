@@ -1,3 +1,4 @@
+import { textOnly } from '../../src/llm/stream-text.js';
 // ── IUL-shared materializer pipeline ──────────────────────────
 //
 // Generic materialize() pipeline that consumes prebuilt (systemPrompt,
@@ -11,7 +12,7 @@
 // spec shape stays consistent across the whole IUL surface.
 
 import type { LLMMessage, LLMProvider } from '../../src/llm.js';
-import { textOnly } from '../../src/llm.js';
+
 import type { CatalogEntry } from './prompt.js';
 import type { WidgetSpec } from './types.js';
 

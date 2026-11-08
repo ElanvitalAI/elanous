@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { GATE_DEPS_TREES, gateDepsInstallScript, parseGateDeps, projectDepsManifest, stageGateDeps } from './pod-gate-deps.js';
-import { gateShardShell } from '../../../scripts/release-loop/gate-node.js';
+import { gateShardShell } from '../../../scripts/release-loop/gate-shard-shell.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -56,13 +56,14 @@ function bakeThroughDockerfileBoundary(f: ReturnType<typeof fixture>) {
   return staged;
 }
 
-function runInstall(f: ReturnType<typeof fixture>, installSlots = 0) {
+function runInstall(f: ReturnType<typeof fixture>, installSlots = 0, externalVolumeRef = false) {
   const slots = installSlots > 0 ? [
     `install_slot_acquire() { echo acquire >> '${f.root}/slots'; echo "[gate] install-slot 0 waited 0s"; }`,
     `install_slot_release() { echo release >> '${f.root}/slots'; }`,
   ] : [];
   const script = [...slots, gateDepsInstallScript({ log: `'${f.root}/install.log'`, installSlots, depsDir: f.deps }), 'echo "irc=$irc"'].join('\n');
-  const run = spawnSync('bash', ['-c', script], { cwd: f.repo, encoding: 'utf8', timeout: 20_000, env: { PATH: `${f.bin}:/usr/bin:/bin`, HOME: f.root } });
+  const run = spawnSync('bash', ['-c', script], { cwd: f.repo, encoding: 'utf8', timeout: 20_000,
+    env: { PATH: `${f.bin}:/usr/bin:/bin`, HOME: f.root, ...(externalVolumeRef ? { ELANOUS_GATE_EXTERNAL_NODE_MODULES: '1' } : {}) } });
   const read = (name: string) => existsSync(join(f.root, name)) ? readFileSync(join(f.root, name), 'utf8') : '';
   return { status: run.status, stdout: run.stdout, stderr: run.stderr, log: read('install.log'), installs: read('installs').trim().split('\n').filter(Boolean), slots: read('slots').trim().split('\n').filter(Boolean) };
 }
@@ -113,6 +114,17 @@ test('a different lockfile, an old image (nothing baked), or an existing node_mo
   expect(parseGateDeps(o.log)).toEqual({ '.': 'miss:no baked deps', 'apps/pwa': 'miss:no baked deps' });
   expect(o.installs).toEqual([old.repo, join(old.repo, 'apps/pwa')].map((p) => resolve(p)));
   expect(o.slots).toEqual(['acquire', 'release']);
+});
+
+test('a mismatched external node_modules ref fails closed without install or writable cache fallback', () => {
+  const f = fixture();
+  bake(f);
+  writeFileSync(join(f.repo, 'apps/pwa/bun.lock'), '{ "lockfileVersion": 1, "pwa": "changed" }\n');
+  const r = runInstall(f, 4, true);
+  expect(r.stdout).toContain('ELANOUS_GATE_VOLUME_REF_REJECTED node_modules gate-deps-mismatch: apps/pwa');
+  expect(r.stdout).toContain('irc=5');
+  expect(r.installs).toEqual([]);
+  expect(r.slots).toEqual([]);
 });
 
 test('a failed install stops at that tree and reports its exit (the shard runs no tests)', () => {

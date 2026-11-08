@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from '
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { buildNexusWsBridgeAuth, daemonThinStage1, DAEMON_THIN_STAY_ALLOWLIST, runNexus, type DaemonThinStayAllowlistClass } from './index.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
@@ -17,8 +18,11 @@ import { createFakeStt } from '../ux-sim/fake-stt.js';
 import { fakeElevenLabsAudioBytes, startFakeElevenLabs } from '../ux-sim/fake-elevenlabs.js';
 import { appSecretId } from './config/secrets/app-secret-ledger.js';
 import { deleteAppSecretValue, fileBackend, setAppSecretValue } from './config/secrets/file-backend.js';
+import { setCredentialSlotAsync } from './config/secrets/cred-slots.js';
 import type { StartOpts } from '../pty-shell/registry.js';
 import { setTestStateRoot } from './paths.js';
+import { __resetIdentityForTests, __setIdentityFileForTests } from '../mss/identity-store.js';
+import type { NexusFunnelEvent } from './apps/funnel-observe.js';
 import type { PwaShareDeps, PwaShareResult } from '../cli/pwa-share.js';
 import type { ShareMountResult } from '../cli/share-auto-mount.js';
 
@@ -183,10 +187,10 @@ describe('Nexus startup bearer token', () => {
   test('live Nexus dispatches manifest STT through the app route registry and closed secret boundary', async () => {
     const appDir = join(isolated, 'nexus', 'apps', 'voice-note');
     mkdirSync(join(appDir, 'out'), { recursive: true });
-    writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0\nslug: voice-note\ntitle: Voice notes\nfrontend:\n  kind: static-export\n  out: out\nroles:\n  owner: {}\nactions:\n  transcribe:\n    builtin: stt\n    uses: [cred:openai.api_key]\nstorage:\n  prefix: apps/voice-note/\n  quotaBytes: 1024\n  upload:\n    allow: [owner]\n    types: [audio/wav]\n    maxBytes: 512\n`);
+    writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0\nslug: voice-note\ntitle: Voice notes\nfrontend:\n  kind: static-export\n  out: out\nroles:\n  owner: {}\nactions:\n  transcribe:\n    builtin: stt\n    input: { audio: object-ref }\n    output: { text: text }\n    uses: [cred:openai.api_key]\n  makeAd:\n    builtin: generate\n    async: true\n    spend: owner-confirm\n    uses: [cred:higgsfield.key_id, cred:higgsfield.secret]\nstorage:\n  prefix: apps/voice-note/\n  quotaBytes: 1024\n  upload:\n    allow: [owner]\n    types: [audio/wav, image/png, video/mp4]\n    maxBytes: 512\n`);
     writeFileSync(join(appDir, 'out', 'index.html'), '<main>voice note</main>');
     writeFileSync(join(isolated, 'acp-token'), `${CONFIGURED_TOKEN}\n`);
-    await fileBackend.set('cred:openai.api_key', 'shared-openai-must-not-be-used');
+    await setCredentialSlotAsync('cred:openai.api_key', 'shared-openai-must-not-be-used');
     await setAppSecretValue(appSecretId('other-app', 'OPENAI_API_KEY'), 'other-app-must-not-be-used');
     const fakeStt = createFakeStt();
     const observedApiKeys: string[] = [];
@@ -205,6 +209,33 @@ describe('Nexus startup bearer token', () => {
       },
     });
     if (!nexus?.httpServer) throw new Error('Nexus did not bind');
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const target = String(input);
+      const headers = new Headers(init?.headers);
+      if (target.endsWith('/files/generate-upload-url')) {
+        expect(headers.get('authorization')).toBe('Key sim-higgsfield-key-id:sim-higgsfield-secret');
+        return Response.json({ upload_url: 'https://storage.fake.invalid/upload/1', upload_headers: { 'x-sim-upload': 'signed' }, public_url: 'https://storage.fake.invalid/image/1.png' });
+      }
+      if (target === 'https://storage.fake.invalid/upload/1') {
+        expect(headers.get('authorization')).toBeNull();
+        return new Response(null, { status: 200 });
+      }
+      if (target.endsWith('/bytedance/seedance-2.0/image-to-video')) {
+        expect(headers.get('authorization')).toBe('Key sim-higgsfield-key-id:sim-higgsfield-secret');
+        expect(JSON.parse(String(init?.body))).toMatchObject({ image_url: 'https://storage.fake.invalid/image/1.png' });
+        return Response.json({ request_id: 'simulated-provider-request' }, { status: 202 });
+      }
+      if (target.endsWith('/requests/simulated-provider-request/status')) {
+        expect(headers.get('authorization')).toBe('Key sim-higgsfield-key-id:sim-higgsfield-secret');
+        return Response.json({ status: 'completed', video: { url: 'https://media.higgsfield.ai/result.mp4' } });
+      }
+      if (target === 'https://media.higgsfield.ai/result.mp4') {
+        expect(headers.get('authorization')).toBeNull();
+        return new Response(new Uint8Array([9, 8, 7]), { headers: { 'content-type': 'video/mp4', 'content-length': '3' } });
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
     try {
       const url = `${nexus.httpServer.url}/v1/apps/voice-note/actions/transcribe`;
       const audio = Buffer.from('fake-stt-contract-audio');
@@ -259,16 +290,135 @@ describe('Nexus startup bearer token', () => {
       expect(transcribedStoredAudio.status).toBe(200);
       expect(await transcribedStoredAudio.json()).toMatchObject({ ok: true, text: '안녕하세요' });
       expect(observedApiKeys).toEqual(['simulated-openai-key', 'simulated-openai-key']);
-    } finally { nexus.release(); }
+      await setAppSecretValue(appSecretId('voice-note', 'HIGGSFIELD_KEY_ID'), 'sim-higgsfield-key-id');
+      await setAppSecretValue(appSecretId('voice-note', 'HIGGSFIELD_SECRET'), 'sim-higgsfield-secret');
+      const imageUploadResponse = await fetch(`${storageUrl}/uploads`, {
+        method: 'POST', headers: { authorization: `Bearer ${CONFIGURED_TOKEN}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ key: 'products/input.png', expiresInMs: 60_000 }),
+      });
+      expect(imageUploadResponse.status).toBe(200);
+      const imageUploadUrl = (await imageUploadResponse.json() as { url: string }).url;
+      expect((await fetch(imageUploadUrl, { method: 'PUT', headers: { 'content-type': 'image/png' }, body: new Uint8Array([1, 2, 3]) })).status).toBe(201);
+      const generateResponse = await fetch(`${nexus.httpServer.url}/v1/apps/voice-note/actions/makeAd`, {
+        method: 'POST', headers: { ...authorizedHeaders, 'content-type': 'application/json' },
+        body: JSON.stringify({ text: 'Make a product clip', image: 'products/input.png', confirmSpend: true }),
+      });
+      expect(generateResponse.status).toBe(202);
+      const queued = await generateResponse.json() as { jobId: string; eventsUrl: string; status: string };
+      expect(queued).toMatchObject({ status: 'queued' });
+      const statusResponse = await fetch(`${nexus.httpServer.url}/v1/apps/voice-note/jobs/${queued.jobId}`, {
+        headers: { authorization: `Bearer ${CONFIGURED_TOKEN}` },
+      });
+      expect(statusResponse.status).toBe(200);
+      expect(await statusResponse.json()).toMatchObject({ job: { status: 'completed', resultKey: `apps/voice-note/generated/${queued.jobId}.mp4` } });
+      const eventsResponse = await fetch(`${nexus.httpServer.url}${queued.eventsUrl}`, { headers: { authorization: `Bearer ${CONFIGURED_TOKEN}` } });
+      expect(eventsResponse.status).toBe(200);
+      const eventsText = await eventsResponse.text();
+      expect(eventsText).toContain('event: job');
+      expect(eventsText).toContain('"status":"completed"');
+    } finally { globalThis.fetch = originalFetch; nexus.release(); }
+  }, 30_000);
+
+  test('live runNexus boot wires four funnel events using installation identity and hashed identifiers', async () => {
+    const identity = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
+    const identityFile = join(isolated, 'identity.json');
+    __setIdentityFileForTests(identityFile);
+    writeFileSync(identityFile, JSON.stringify({ elanous_id: identity, created_at: new Date(0).toISOString(), schema_version: 1 }));
+    const appDir = join(isolated, 'nexus', 'apps', 'voice-note');
+    mkdirSync(join(appDir, 'out'), { recursive: true });
+    writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0\nslug: voice-note\ntitle: Voice notes\nfrontend: { kind: static-export, out: out }\nroles: { owner: { via: nexus-session }, viewer: { via: share-link } }\nactions:\n  summarize:\n    builtin: summarize\n    input: { text: text }\n    output: { text: text }\n    uses: [cred:openai.api_key]\nstorage:\n  prefix: apps/voice-note/\n  quotaBytes: 5\n  upload:\n    allow: [owner]\n    types: [audio/wav]\n    maxBytes: 512\n`);
+    writeFileSync(join(appDir, 'out', 'index.html'), '<main>voice notes</main>');
+    writeFileSync(join(isolated, 'acp-token'), `${CONFIGURED_TOKEN}\n`);
+    await setAppSecretValue(appSecretId('voice-note', 'OPENAI_API_KEY'), 'isolated-summary-key');
+    const events: NexusFunnelEvent[] = [];
+    const nexus = await runNexus({
+      detachForTesting: true, skipHttpServer: false, skipRuntimeApi: false,
+      httpStartPort: 49000 + Math.floor(Math.random() * 2000), toolCwd: isolated,
+      skipSupervisor: true, mcpEnabled: false, cleanGhostTailscaleServeFn: async () => {},
+      skipPushcutChannel: true, skipPwaChannel: true, skipTelegramChannel: true,
+      skipDiscordChannel: true, skipTerminalChannel: true, skipIntentPrediction: true,
+      appActionDepsForTesting: { summarize: async ({ text }) => `summary: ${text}` },
+      funnelObserverForTesting: event => { events.push(event); },
+    }).catch(error => {
+      __setIdentityFileForTests(null);
+      __resetIdentityForTests();
+      throw error;
+    });
+    if (!nexus?.httpServer) {
+      __setIdentityFileForTests(null);
+      __resetIdentityForTests();
+      throw new Error('Nexus did not bind');
+    }
+    try {
+      const authorization = { authorization: `Bearer ${CONFIGURED_TOKEN}` };
+      const invitationResponse = await fetch(`${nexus.httpServer.url}/v1/nexus/apps/voice-note/invitations`, {
+        method: 'POST', headers: { ...authorization, 'content-type': 'application/json' },
+        body: JSON.stringify({ invitedBy: 'raw-owner-id-must-not-be-logged' }),
+      });
+      expect(invitationResponse.status).toBe(201);
+      const invitation = await invitationResponse.json() as { invitation: { token: string } };
+      const accepted = await fetch(`${nexus.httpServer.url}/__auth/accept?token=${encodeURIComponent(invitation.invitation.token)}`, {
+        headers: { host: 'voice-note.app.localhost' }, redirect: 'manual',
+      });
+      expect(accepted.status).toBe(303);
+      const appOpen = await fetch(nexus.httpServer.url, {
+        headers: { host: 'voice-note.app.localhost', cookie: accepted.headers.get('set-cookie')! },
+      });
+      expect(appOpen.status).toBe(200);
+
+      const actionUrl = `${nexus.httpServer.url}/v1/apps/voice-note/actions/summarize`;
+      for (const text of ['first successful action', 'later successful action']) {
+        const action = await fetch(actionUrl, {
+          method: 'POST', headers: { ...authorization, 'content-type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+        expect(action.status).toBe(200);
+      }
+
+      const storageUrl = `${nexus.httpServer.url}/v1/apps/voice-note/storage/uploads`;
+      const signUpload = async (key: string) => {
+        const response = await fetch(storageUrl, {
+          method: 'POST', headers: { ...authorization, 'content-type': 'application/json' },
+          body: JSON.stringify({ key, expiresInMs: 60_000, role: 'owner' }),
+        });
+        expect(response.status).toBe(200);
+        return (await response.json() as { url: string }).url;
+      };
+      const firstUpload = await fetch(await signUpload('audio/first.wav'), {
+        method: 'PUT', headers: { 'content-type': 'audio/wav' }, body: new Uint8Array([1, 2, 3, 4, 5]),
+      });
+      expect(firstUpload.status).toBe(201);
+      const overQuotaUpload = await fetch(await signUpload('audio/over-quota.wav'), {
+        method: 'PUT', headers: { 'content-type': 'audio/wav' }, body: new Uint8Array([6]),
+      });
+      expect(overQuotaUpload.status).toBe(413);
+
+      const accountHash = createHash('sha256').update(`nexus-funnel:account:${identity}`).digest('hex');
+      const appHash = createHash('sha256').update('nexus-funnel:app:voice-note').digest('hex');
+      expect(events.map(event => event.type)).toEqual(['invite-sent', 'app-open', 'first-success', 'limit-reached']);
+      expect(events.every(event => event.accountHash === accountHash)).toBe(true);
+      for (const event of events) {
+        if (event.type === 'app-open' || event.type === 'first-success' || event.type === 'limit-reached') {
+          expect(event.appHash).toBe(appHash);
+        }
+      }
+      expect(JSON.stringify(events)).not.toContain(identity);
+      expect(JSON.stringify(events)).not.toContain('voice-note');
+      expect(JSON.stringify(events)).not.toContain('raw-owner-id-must-not-be-logged');
+    } finally {
+      nexus.release();
+      __setIdentityFileForTests(null);
+      __resetIdentityForTests();
+    }
   }, 30_000);
 
   test('live Nexus dispatches manifest TTS through fake ElevenLabs and closed secret boundary', async () => {
     const appDir = join(isolated, 'nexus', 'apps', 'voice-note');
     mkdirSync(join(appDir, 'out'), { recursive: true });
-    writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0\nslug: voice-note\ntitle: Voice notes\nfrontend:\n  kind: static-export\n  out: out\nactions:\n  speak:\n    builtin: tts\n    uses: [cred:elevenlabs.api_key]\n`);
+    writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0\nslug: voice-note\ntitle: Voice notes\nfrontend:\n  kind: static-export\n  out: out\nactions:\n  speak:\n    builtin: tts\n    input: { text: text, voiceId: text }\n    output: { audioBase64: text, mimeType: text }\n    uses: [cred:elevenlabs.api_key]\n`);
     writeFileSync(join(appDir, 'out', 'index.html'), '<main>voice note</main>');
     writeFileSync(join(isolated, 'acp-token'), `${CONFIGURED_TOKEN}\n`);
-    await fileBackend.set('cred:elevenlabs.api_key', 'shared-elevenlabs-must-not-be-used');
+    await setCredentialSlotAsync('cred:elevenlabs.api_key', 'shared-elevenlabs-must-not-be-used');
     const fake = await startFakeElevenLabs({ apiKey: 'sim-elevenlabs-key' });
     const originalFetch = globalThis.fetch;
     const nexus = await runNexus({

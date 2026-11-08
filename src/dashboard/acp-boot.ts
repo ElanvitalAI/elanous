@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // UI-Core arc Phase U3c Step 2 — dashboard ACP client boot composer.
 //
 // Boots a `DashboardSession` that wraps an in-process ACP server +
@@ -23,7 +24,7 @@
 // wiring and deliberately excluded from that scan.
 
 import type { ChatMessage } from '../chat/index.js';
-import type { LLMMessage, LLMToolSpec } from '../llm.js';
+import type { LLMMessage } from '../llm.js';
 import type { RunCompactPipeline } from '../session/request-size-guard.js';
 import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import {

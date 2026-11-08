@@ -72,4 +72,4 @@ test('nine release incidents execute the real release graph and match GraphEvent
     setTestStateRoot(previous ?? null);
     rmSync(root, { recursive: true, force: true });
   }
-}, 60_000);
+}, 120_000); // Real graph execution exceeded 60s on shared train hosts.

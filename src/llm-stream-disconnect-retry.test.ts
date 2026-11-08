@@ -1,3 +1,4 @@
+import { _setStreamDisconnectRetryDelayForTest } from './llm/stream-fallback.js';
 // TUI-STREAM-RETRY — 흐르던 스트림이 소켓 끊김으로 죽으면 같은 공급자로 다시 건 «뒤에만» 폴백한다.
 // 실측(2026-10-14 06:27Z TUI): codex 200 OK·reasoning delta 뒤 «The socket connection was closed unexpectedly» →
 // llm.retry 0건 · 곧장 provider-fallback-exhausted 로 턴이 죽었다.
@@ -10,18 +11,10 @@ import { runDashboardPlainTurnStream, type DashboardPlainTurnAcpSend } from './d
 import { createTurnStreamFormatter } from './dashboard/turn-stream-formatter.js';
 import { setUserConfigOverlay } from './user-config.js';
 import { testFakeLlmProvider } from './ux-sim/fake-llm.js';
+import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import { OverloadFailoverError } from './session-runtime/retry-api.js';
 import { resetProviderCircuitForTest } from './session-runtime/provider-circuit.js';
-import {
-  _explainAndLogFallbackCandidatesForTest,
-  _setStreamDisconnectRetryDelayForTest,
-  PROVIDERS,
-  streamLLM,
-  streamLLMWithTools,
-  type LLMMessage,
-  type LLMProvider,
-  type LLMStreamEvent,
-} from './llm.js';
+import { _explainAndLogFallbackCandidatesForTest, PROVIDERS, streamLLM, streamLLMWithTools, type LLMMessage, type LLMProvider, type LLMStreamEvent } from './llm.js';
 
 type Logged = { category: string; event: string; data: Record<string, unknown> };
 
@@ -399,17 +392,18 @@ describe('retry budget is per provider', () => {
   it('tool stream skips a candidate that loses availability after a real fake HTTP 503 retry', async () => {
     let grokChecks = 0;
     let codexFetches = 0;
-    const originalFetch = globalThis.fetch;
     PROVIDERS.grok = { ...testFakeLlmProvider, name: 'grok', available: () => ++grokChecks <= 2 };
     PROVIDERS.glm = { ...testFakeLlmProvider, name: 'glm', defaultModel: 'glm-5.3', available: () => true };
     setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm,
       provider: 'openai-codex', model: 'gpt-6-sol', apiKey: 'fake-codex-test-only',
       fallbackChain: ['codex-rotate', 'grok', 'zai'] } }));
-    globalThis.fetch = Object.assign(async () => {
-      codexFetches++;
-      return new Response('{"error":{"message":"server_is_overloaded"}}', { status: 503 });
-    }, { preconnect: originalFetch.preconnect });
-    try {
+    await withFakeFetchDevice([{
+      url: '/v1/chat/completions', method: 'POST',
+      response: () => {
+        codexFetches++;
+        return Response.json({ error: { message: 'server_is_overloaded' } }, { status: 503 });
+      },
+    }], async (device) => {
       const answer = await streamLLMWithTools([{ role: 'user', content: 'go' }],
         { onText: () => {}, dispatchTool: async () => ({ ok: true }) },
         { tools: [{ name: 'probe', description: 'probe', parameters: {} }], maxTurns: 1 });
@@ -419,7 +413,9 @@ describe('retry budget is per provider', () => {
       expect(grokChecks).toBeGreaterThanOrEqual(3);
       expect(logs).toContainEqual(expect.objectContaining({ category: 'llm.router', event: 'overload-failover',
         data: expect.objectContaining({ fallbackProvider: 'glm' }) }));
-    } finally { globalThis.fetch = originalFetch; }
+      expect(device.calls().length).toBe(codexFetches);
+      expect(device.calls().every(call => call.routeId === 'route-1' && call.status === 503)).toBe(true);
+    });
   });
 
   it('rejects deterministic Claude schema incompatibility before provider fallback can catch it', async () => {

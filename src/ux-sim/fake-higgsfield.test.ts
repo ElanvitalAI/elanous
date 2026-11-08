@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createHiggsfieldBackend } from '../ad-pipeline/higgsfield-backend.js';
 import type { ShootCommand } from '../ad-pipeline/shoot-run.js';
@@ -101,6 +102,21 @@ test('SIM-FAKE-HIGGSFIELD: submission limit returns a stable classified nonzero 
   await expect(backend.submit(command)).rejects.toThrow('HIGGSFIELD_SUBMISSION_LIMIT: submission limit exceeded');
   expect(runner.ledger.submissions).toBe(1);
   expect(runner.ledger.calls.at(-1)?.argv).toContain('create');
+});
+
+test('SIM-FAKE-HIGGSFIELD: image ledger records only accepted image-backed submissions', async () => {
+  const imageBytes = Buffer.from('uploaded-image-fixture');
+  const runner = createFakeHiggsfieldRunner({ seed: 'image-ledger', deviceOptIn: true, maxSubmissions: 1,
+    imageBytes, requireImageBytes: true });
+  const argv = ['higgsfield', 'generate', 'create', 'image2video', '--image', 'apps/shop-studio/products/demo.png'];
+  expect((await runner.run(argv)).exitCode).toBe(0);
+  expect((await runner.run(argv)).exitCode).toBe(1);
+  expect(runner.ledger.submissions).toBe(1);
+  expect(runner.ledger.imageSha256).toEqual([createHash('sha256').update(imageBytes).digest('hex')]);
+
+  const imageOptionalRunner = createFakeHiggsfieldRunner({ seed: 'image-optional', deviceOptIn: true, imageBytes });
+  expect((await imageOptionalRunner.run(['higgsfield', 'generate', 'create', 'text2video'])).exitCode).toBe(0);
+  expect(imageOptionalRunner.ledger.imageSha256).toEqual([]);
 });
 
 test('SIM-FAKE-HIGGSFIELD: result URL TTL starts at first completion, not submission', async () => {

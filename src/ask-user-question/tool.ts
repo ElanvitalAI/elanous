@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // AskUserQuestion tool — Phase WF1.
 //
 // LLM calls this when it needs a structured decision from the user
@@ -11,7 +12,7 @@
 // time. When an approval is already open, AskUserQuestion rejects
 // with a clear error the LLM can retry later.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import type { DisplayCoordinator } from '../display/coordinator.js';
 import { approvalModalRouter } from '../approval-modal.js';
 import { createAskUserQuestionModal } from './modal.js';

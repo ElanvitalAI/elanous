@@ -23,10 +23,10 @@ const CHECKOUT = `Cloning into 'repo'...\nELANOUS_POD_SOURCE_VIA mirror\nELANOUS
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const temp = (prefix: string) => { const dir = mkdtempSync(join(tmpdir(), prefix)); dirs.push(dir); return dir; };
-const summary = (files: readonly string[]) => `${files.map((file) => `${file}:\n(pass) case [1.00ms]`).join('\n')}\n${files.length} pass\n0 fail\nRan ${files.length} tests across ${files.length} files.\n`;
+const summary = (files: readonly string[], fixtureHeaders = false) => `${files.map((file) => `${fixtureHeaders ? 'fixture:' : ''}${file}:\n(pass) case [1.00ms]`).join('\n')}\n${files.length} pass\n0 fail\nRan ${files.length} tests across ${files.length} files.\n`;
 
 /** A pod runner whose Job either stalls after the checkout (resolves only when stopped) or runs every part cleanly. */
-function stallRig(files: string[], stalls: (call: number) => boolean, partRc: (part: string[]) => number = () => 0) {
+function stallRig(files: string[], stalls: (call: number) => boolean, partRc: (part: string[]) => number = () => 0, fixtureHeaders = false) {
   const root = temp('gate-stall-');
   const repo = join(root, 'repo');
   mkdirSync(repo);
@@ -54,7 +54,7 @@ function stallRig(files: string[], stalls: (call: number) => boolean, partRc: (p
     live.set(o.name!, { text: `${CHECKOUT}ELANOUS_GATE_BEAT 1 test 1\n` });
     writeFileSync(join(dir, 'install.rc'), '0\n');
     parts.forEach((part, index) => {
-      writeFileSync(join(dir, `part-${index}.log`), summary(part));
+      writeFileSync(join(dir, `part-${index}.log`), summary(part, fixtureHeaders));
       writeFileSync(join(dir, `part-${index}.rc`), `${partRc(part)}\n`);
     });
     // A healthy shard that is still running when the watch polls (test output already there).
@@ -235,8 +235,10 @@ test('judgment (0.2.30): a stalled sweep lands on the ledger as an executed fail
 }, 90_000);
 
 test('a shard that prints test output is unaffected: no stop, no retry, same result and record as without the watch', async () => {
+  // These are fixture labels, not repository test files. A Bun failure diff can echo them next to this test's own
+  // reporter line; prefix only the fake reporter headers so they cannot match the parser's real-file header shape.
   const files = ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'];
-  const watched = stallRig(files, () => false);
+  const watched = stallRig(files, () => false, undefined, true);
   const { events, restore } = captureGateEvents();
   let withWatch;
   try { withWatch = await watched.runner.sweep(watched.repo, join(watched.root, 'logs'), watched.podOptions); }
@@ -244,7 +246,7 @@ test('a shard that prints test output is unaffected: no stop, no retry, same res
   expect(watched.calls).toHaveLength(1);
   expect(watched.stopped).toEqual([]);
   expect(events.some((item) => item.event === 'pod-shard-stall' || item.event === 'pod-sweep-unmeasured')).toBe(false);
-  const plain = stallRig(files, () => false);
+  const plain = stallRig(files, () => false, undefined, true);
   const off = captureGateEvents();
   let without;
   try { without = await plain.runner.sweep(plain.repo, join(plain.root, 'logs'), { pool: 'pool-test', shards: 1, stallSeconds: 0 }); }
@@ -253,8 +255,8 @@ test('a shard that prints test output is unaffected: no stop, no retry, same res
   expect(withWatch.podSweep?.id).toBeString();
   expect(without.podSweep?.id).toBeString();
   expect(withWatch.podSweep?.id).not.toBe(without.podSweep?.id);
-  expect({ ...withWatch, podSweep: { ...withWatch.podSweep, id: undefined } })
-    .toEqual({ ...without, podSweep: { ...without.podSweep, id: undefined } });
+  expect({ ...withWatch, podSweep: { ...withWatch.podSweep, id: undefined, invocationId: undefined } })
+    .toEqual({ ...without, podSweep: { ...without.podSweep, id: undefined, invocationId: undefined } });
   // stallWatch is observation only (GATE-WARM-BOOT-SCAN) — it differs by design and is checked on its own.
   const strip = (meta: Record<string, unknown>) => { const { durationMs: _d, attemptId: _a, jobName: _j, phaseTimes: _t, stallWatch: _w, sweepId: _s, ...rest } = meta; return rest; };
   const metaWith = JSON.parse(readFileSync(join(watched.root, 'logs', 'pod-0.json'), 'utf8'));

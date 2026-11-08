@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // PLAN-codex-app-server-hermes-parity §5 Phase H1·5c (2026-05-16) —
 // `elanous_obsidian_info` MCP tool. Surfaces whether an Obsidian vault
 // is resolvable + its absolute path + the resolution source (config /
@@ -9,7 +10,7 @@
 // letting the search itself fail.
 
 import { resolveObsidianRoot } from '../acp/fs-roots.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime } from './types.js';
 
 export interface ElanousObsidianInfoResult extends Record<string, unknown> {

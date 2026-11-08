@@ -5,46 +5,15 @@ import { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import * as registry from './registry.js';
-import { cronMatches } from '../domains/cron-match.js';
-import { resolveTimeZone } from '../time/time-zone.js';
+import { dueBefore } from './schedule-due.js';
+import type { CheckEntry, CheckResult, LoopCounts, LoopScope, LoopState, ScheduleFinding } from './checker-contract.js';
+import type { LoopEntry, LoopRun } from './registry-contract.js';
+export type { CheckEntry, CheckResult, LoopCounts, LoopScope, LoopState, ScheduleFinding } from './checker-contract.js';
+export type { LoopEntry, LoopRun } from './registry-contract.js';
+export { dueBefore, previousLoopFire } from './schedule-due.js';
 import type { ScheduleRow } from '../domains/schedule-registry.js';
-import type { LoopEntry, LoopRun } from './registry.js';
 
-type LoopState = 'off' | 'unregistered' | 'failing' | 'late' | 'unknown' | 'alive';
-export type LoopScope = 'graph-only' | 'registry';
-export interface CheckEntry {
-  id: string;
-  owner?: string;
-  ownerSource?: 'header' | 'config' | 'seat' | 'seat-arg' | 'default';
-  evidence?: 'log-mtime' | 'registry';
-  mode?: string;
-  expectEveryMinutes?: number;
-  /** The scheduled fire before the latest one (cron loops). A run older than this missed two scheduled fires. */
-  dueAt?: string;
-  lastRunAt?: string;
-  lastStatus?: string;
-  recentStatuses?: string[];
-  /** Inventory sighting of the scheduled registration (schedule-registry `last_seen`, refreshed on each inventory — not the first sighting); never represented as an execution. */
-  observedSince?: string;
-  /** Optional launcher evidence; absent values are not inferred from a missing heartbeat. */
-  health?: 'healthy' | 'degraded';
-  endsAt?: string;
-  installedVersion?: string;
-  expectedVersion?: string;
-  /** Registry graph path, supplied only by graph inventory. */
-  file?: string;
-  /** LOOP-PRUNE-1021-FU 판정 재료 — cron-shell·미등록 행이 실은 crontab 명세(그래프 루프에는 없다). */
-  cron?: string;
-  command?: string;
-  enabled: boolean;
-  registered: boolean;
-}
-export interface CheckResult extends CheckEntry {
-  state: LoopState;
-  reason: string;
-}
 export const LOOP_STATES = ['alive', 'late', 'failing', 'off', 'unregistered', 'unknown'] as const;
-export type LoopCounts = Record<LoopState, number>;
 
 export function checkLoops(entries: CheckEntry[], now: Date, opts: { failureStatuses?: readonly string[] } = {}): CheckResult[] {
   const failures = opts.failureStatuses ?? ['failed'];
@@ -72,9 +41,6 @@ export function checkLoops(entries: CheckEntry[], now: Date, opts: { failureStat
   });
 }
 
-export type ScheduleFinding = { id: string; owner?: string; kind: 'late' | 'failing' | 'degraded' | 'end-expired' | 'version-mismatch'; reason: string; lastRunAt?: string };
-
-/** Additional scheduler evidence is evaluated only when supplied; the six-state CLI contract stays intact. */
 export function scheduleFindings(results: CheckResult[], now: Date): ScheduleFinding[] {
   const findings: ScheduleFinding[] = [];
   for (const row of results) {
@@ -180,22 +146,6 @@ export function countLoopStates(results: CheckResult[]): LoopCounts {
   const counts: LoopCounts = { alive: 0, late: 0, failing: 0, off: 0, unregistered: 0, unknown: 0 };
   for (const result of results) counts[result.state]++;
   return counts;
-}
-
-/** Latest cron fire at or before `at` (minute resolution, scans back up to one year). */
-export function previousLoopFire(cron: string, at: Date, timeZone: string = resolveTimeZone().timeZone): string | null {
-  if (cron.trim().split(/\s+/).length !== 5) return null;
-  let minute = Math.floor(at.getTime() / 60000) * 60000;
-  for (let i = 0; i < 527040; i++, minute -= 60000) {
-    if (cronMatches(cron, new Date(minute), { timeZone })) return new Date(minute).toISOString();
-  }
-  return null;
-}
-
-/** The fire before the latest scheduled fire — a run older than this has missed two scheduled fires. */
-export function dueBefore(cron: string, now: Date, timeZone?: string): string | null {
-  const latest = previousLoopFire(cron, now, timeZone);
-  return latest ? previousLoopFire(cron, new Date(Date.parse(latest) - 60000), timeZone) : null;
 }
 
 export interface RegistryAdapterDeps {

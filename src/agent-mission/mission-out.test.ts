@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
+import { createFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
@@ -140,19 +141,19 @@ test('CLI reuses a final already appended by NEXUS when its HTTP response is los
   const store = createMissionOutStore(root);
   const record = store.create({ missionId, agent: 'codex', prompt: 'finish task', cwd: root, outputPath: join(root, 'result.tmp'), targetOutputPath: join(root, 'result.md') });
   const auth = createMissionLineStore(root).issue({ missionId, attemptId: 'attempt-lost-response', agent: 'codex', who: 'Codex', what: 'finish task' });
-  const previous = { token: process.env.ELANOUS_HAND_TOKEN, attemptId: process.env.ELANOUS_HAND_ATTEMPT_ID, finalLineId: process.env.ELANOUS_HAND_FINAL_LINE_ID, agent: process.env.ELANOUS_HAND_AGENT, url: process.env.ELANOUS_NEXUS_URL, fetch: globalThis.fetch };
+  const previous = { token: process.env.ELANOUS_HAND_TOKEN, attemptId: process.env.ELANOUS_HAND_ATTEMPT_ID, finalLineId: process.env.ELANOUS_HAND_FINAL_LINE_ID, agent: process.env.ELANOUS_HAND_AGENT, url: process.env.ELANOUS_NEXUS_URL };
   process.env.ELANOUS_HAND_TOKEN = auth.token;
   process.env.ELANOUS_HAND_ATTEMPT_ID = auth.attemptId;
   process.env.ELANOUS_HAND_FINAL_LINE_ID = auth.finalLineId;
   process.env.ELANOUS_HAND_AGENT = 'codex';
   process.env.ELANOUS_NEXUS_URL = 'http://nexus.test';
-  globalThis.fetch = (async (_input, init) => {
-    const sent = JSON.parse(String(init?.body)) as { lineId: string };
+  const device = createFakeFetchDevice([{ url: 'http://nexus.test/v1/mission-lines', method: 'POST', response: async (request) => {
+    const sent = JSON.parse(String(request.body)) as { lineId: string };
     await store.reply(missionId, 'final answer', true, {
       lineId: sent.lineId, attemptId: auth.attemptId, agent: 'codex', lineType: 'final', source: 'mission-reply', who: 'Codex', what: 'finish task',
     });
     return Response.json({ error: 'response lost after durable append' }, { status: 500 });
-  }) as typeof fetch;
+  } }]);
   try {
     const output: string[] = [];
     const cli = new Command();
@@ -163,13 +164,14 @@ test('CLI reuses a final already appended by NEXUS when its HTTP response is los
     expect(JSON.parse(output[0]!)).toMatchObject({ missionId, accepted: true, sequence: 1, done: true });
     expect(store.replies(missionId).filter((event) => event.done)).toHaveLength(1);
     expect(store.replies(missionId)[0]).toMatchObject({ who: 'Codex', what: 'finish task' });
+    expect(device.calls()).toHaveLength(1);
   } finally {
     if (previous.token === undefined) delete process.env.ELANOUS_HAND_TOKEN; else process.env.ELANOUS_HAND_TOKEN = previous.token;
     if (previous.attemptId === undefined) delete process.env.ELANOUS_HAND_ATTEMPT_ID; else process.env.ELANOUS_HAND_ATTEMPT_ID = previous.attemptId;
     if (previous.finalLineId === undefined) delete process.env.ELANOUS_HAND_FINAL_LINE_ID; else process.env.ELANOUS_HAND_FINAL_LINE_ID = previous.finalLineId;
     if (previous.agent === undefined) delete process.env.ELANOUS_HAND_AGENT; else process.env.ELANOUS_HAND_AGENT = previous.agent;
     if (previous.url === undefined) delete process.env.ELANOUS_NEXUS_URL; else process.env.ELANOUS_NEXUS_URL = previous.url;
-    globalThis.fetch = previous.fetch;
+    device.restore();
   }
 });
 

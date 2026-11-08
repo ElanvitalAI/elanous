@@ -24,7 +24,7 @@ import { debug } from '../debug/log.js';
 import { shouldAutoCompact } from '../compact/auto.js';
 import { runCompactPipeline } from '../compact/pipeline.js';
 import { getDefaultCompactProvider, type CompactProvider } from '../compact/provider.js';
-import type { ChatAutoCompactConfig } from '../user-config.js';
+import type { ChatAutoCompactConfig } from '../user-config/chat.js';
 import { loadSession, rewriteSessionMessages, type SerializedMessage } from './index.js';
 
 export interface CompactSessionOpts {

@@ -47,14 +47,38 @@ function fixture(seedPrior = true) {
 test('RELEASE-GATE-RADIUS-SHADOW records a proposed import radius beside the unchanged full result', () => {
   const source = fixture();
   const plan = planGateRadiusShadow({ ...source, version: '1.0.1', baselineVersion: '1.0.0' });
-  expect(plan).toMatchObject({ proposed: 'partial', files: ['src/a.test.ts'], totalTests: 5 });
+  expect(plan).toMatchObject({ proposed: 'partial', files: ['src/a.test.ts'], totalTests: 5,
+    lazyRequireShadow: { currentFiles: ['src/a.test.ts'], proposedFiles: ['src/a.test.ts'], cliSpawnTests: 0 } });
   const actual = shadowActual({ plan, outcome: 'regression', introduced: ['src/a.test.ts > A', 'src/c.test.ts > C'],
     cutFailures: ['src/a.test.ts > A', 'src/c.test.ts > C'], cutErrors: [], cutRc: 1, fullSweep: true });
   expect(actual.missedIntroduced).toEqual(['src/c.test.ts > C']);
+  expect(actual.lazyRequireMissedFailures).toEqual(['src/c.test.ts > C']);
+  expect(actual.lazyRequireComparison).toBe('complete');
   const path = writeGateRadiusShadow(source.ledgerRoot, { plan, actual, recordedAt: new Date().toISOString() });
   expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ plan: { proposed: 'partial' },
-    actual: { fullSweep: true, missedIntroduced: ['src/c.test.ts > C'] } });
+    actual: { fullSweep: true, missedIntroduced: ['src/c.test.ts > C'], lazyRequireMissedFailures: ['src/c.test.ts > C'], lazyRequireComparison: 'complete' } });
   expect(readdirSync(join(source.ledgerRoot, 'release/1.0.1')).filter((name) => name.startsWith('gate-radius-shadow-'))).toHaveLength(1);
+});
+
+test('RELEASE-GATE-RADIUS-SHADOW failed lazy candidate stays unmeasured after a full cut', () => {
+  const source = fixture();
+  const plan = planGateRadiusShadow({ ...source, version: '1.0.1', baselineVersion: '1.0.0' });
+  if (!plan.lazyRequireShadow) throw new Error('missing candidate shadow');
+  const actual = shadowActual({ plan: { ...plan, lazyRequireShadow: { ...plan.lazyRequireShadow, measured: false } },
+    outcome: 'regression', introduced: [], cutFailures: ['src/c.test.ts > missed'], cutErrors: [], cutRc: 1, fullSweep: true });
+  expect(actual).toMatchObject({ lazyRequireComparison: 'unmeasured', lazyRequireMissedFailures: [] });
+});
+
+test('RELEASE-GATE-RADIUS-SHADOW records a failed candidate as unmeasured, not as the current radius', () => {
+  const source = fixture();
+  const plan = planGateRadiusShadow({ ...source, version: '1.0.1', baselineVersion: '1.0.0',
+    compareCliShadow: () => ({ current: { ok: true, tests: ['src/a.test.ts'], reached: 1, opaque: 0, opaqueFiles: [] },
+      proposed: { ok: false, reason: 'candidate closure opaque' }, cliSpawnTests: [] }),
+  });
+  expect(plan).toMatchObject({ proposed: 'partial', files: ['src/a.test.ts'],
+    lazyRequireShadow: { measured: false, proposedFiles: [], reason: 'candidate-failed-closed:candidate closure opaque' } });
+  const actual = shadowActual({ plan, outcome: 'ok', introduced: [], cutFailures: [], cutErrors: [], cutRc: 0, fullSweep: true });
+  expect(actual).toMatchObject({ lazyRequireComparison: 'unmeasured', lazyRequireMissedFailures: [] });
 });
 
 test('RELEASE-GATE-RADIUS-SHADOW missing prior evidence proposes full without authorizing reuse', () => {
@@ -115,7 +139,7 @@ test('RELEASE-GATE-RADIUS-SHADOW proposed partial still runs the complete cut sw
   expect(files).toHaveLength(1);
   const shadow = JSON.parse(readFileSync(join(source.ledgerRoot, 'release/1.0.1', files[0]!), 'utf8'));
   expect(shadow).toMatchObject({ plan: { proposed: 'partial', files: ['src/a.test.ts'] },
-    actual: { outcome: 'ok', fullSweep: true } });
+    actual: { outcome: 'ok', fullSweep: true, lazyRequireComparison: 'complete', lazyRequireMissedFailures: [] } });
   process.env.GATE_SHADOW_C_FAILURE = '1';
   const priorSelections = selections.length;
   let failureResult: Awaited<ReturnType<typeof judgeGate>>;
@@ -131,7 +155,7 @@ test('RELEASE-GATE-RADIUS-SHADOW proposed partial still runs the complete cut sw
   expect(later).toHaveLength(2);
   expect(later.find((record) => record.actual.outcome === 'regression'))
     .toMatchObject({ plan: { files: ['src/a.test.ts'] }, actual: { fullSweep: true,
-      missedIntroduced: ['src/c.test.ts > c'] } });
+      missedIntroduced: ['src/c.test.ts > c'], lazyRequireMissedFailures: ['src/c.test.ts > c'], lazyRequireComparison: 'complete' } });
 });
 
 test('RELEASE-GATE-RADIUS-SHADOW does not call an anomalous cut a complete comparison', async () => {

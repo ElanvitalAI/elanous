@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── ToolSearch LLM tool (Coding Pipeline P1) ──
 //
 // Pattern adapted from claude-code-fork's `src/tools/ToolSearchTool/
@@ -46,7 +47,7 @@
 //    only when it's needed." ToolSearch is the armada's dispatcher —
 //    and a dispatcher that cannot reach the armada is not a dispatcher.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { nativeToolCatalog, type NativeToolCatalogEntry } from '../../native-tool-catalog.js';
 import { listToolRuntimes } from '../../tool-runtime/registry.js';
 import { DEFAULT_MAX_RESULTS, MAX_RESULTS_HARD_CAP, HYDRATED_TOOLS_KEY } from './tool-search-spec.js';

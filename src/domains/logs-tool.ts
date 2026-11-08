@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── logs_query — 크로스서피스 로그 조회 도구 (통합 로그 패브릭 LF3 · 2026-07-13) ──
 //
 // elanous 자신(봇 턴·자율 루프·TUI 챗)이 자기/전체 서피스의 로그를 조회한다 —
@@ -10,7 +11,7 @@
 
 import { existsSync } from 'node:fs';
 
-import type { LLMToolSpec } from '../llm.js';
+
 import {
   LogStore,
   logsDbPath,

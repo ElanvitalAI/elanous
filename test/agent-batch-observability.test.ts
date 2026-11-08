@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // ── `#7333` — 팬아웃(Agent 배치)이 «어느 진입점에서 돌든» 기록에 남는다 ──
 //
 // 왜 이 파일이 있나 (2026-08-24 전수):
@@ -15,7 +16,7 @@
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
 import { streamLLMWithTools } from '../src/llm';
 import { debug } from '../src/debug/log';
-import type { LLMProvider, LLMStreamEvent, LLMToolSpec } from '../src/llm';
+import type { LLMProvider, LLMStreamEvent } from '../src/llm';
 
 /** 한 턴에 Agent 를 N 번 부르는 provider. 두 번째 턴은 텍스트로 끝낸다. */
 function fanoutProvider(n: number): LLMProvider {

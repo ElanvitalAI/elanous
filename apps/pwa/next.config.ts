@@ -15,7 +15,7 @@ function gitShortSha(): string {
 }
 
 const BUILD_TIME = new Date().toISOString();
-const BUILD_SHA = gitShortSha();
+const BUILD_SHA = process.env.ELANOUS_PWA_BUILD_SHA || gitShortSha();
 
 /**
  * U-5 cutover (2026-05-05): static export so daemon-public-server can serve

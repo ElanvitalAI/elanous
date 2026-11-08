@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // TUI-FINAL-ANSWER-COMPLETION(S5 · 10-12 S5-01 실측 재현) — 골 루프 업무 턴을 «유효한 최종 답»으로
 // 끝내는 계약의 회귀. 생산 경로 그대로 구동한다: runGoalLoop → runCoreTurn → streamLLMWithTools
 // (llm-terminal-signal-tools 와 같은 fake-llm 무대).
@@ -7,7 +8,7 @@
 //   · 0.2.28 TUI-NO-SYNTH-FALLBACK은 «실패 때 사람 말 안내»일 뿐 — 이 계약은 실패 없이 답으로 끝낸다.
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import * as llmModule from '../llm.js';
-import type { LLMMessage, LLMProvider, LLMStreamEvent, LLMToolSpec } from '../llm.js';
+import type { LLMMessage, LLMProvider, LLMStreamEvent } from '../llm.js';
 import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';
 import { runGoalLoop } from './run-goal-loop.js';

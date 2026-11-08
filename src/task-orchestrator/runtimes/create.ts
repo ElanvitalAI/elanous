@@ -1,7 +1,8 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 /**
  * TaskCreate runtime — adds a single task to the graph.
  */
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 import {
   createTask,

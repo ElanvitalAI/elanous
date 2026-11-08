@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import { getProviderForConfig, type LLMProvider } from '../llm.js';
 import { probeProvider } from '../llm/provider-probe.js';
 import type { DetectedProvider } from '../llm/provider-detect.js';
@@ -136,23 +137,19 @@ describe('llm detect CLI handler', () => {
   });
 
   test('OpenRouter /models wire IDs reach bare detect JSON through the real discovery source', async () => {
-    const originalFetch = globalThis.fetch;
     const f = fixture();
     f.deps.detect = async () => [{ provider: 'openrouter', auth: 'apikey',
       source: 'env:OPENROUTER_API_KEY', available: true, rank: 9 }];
-    try {
-      globalThis.fetch = (async (input: RequestInfo | URL) => {
-        expect(String(input)).toBe('https://openrouter.ai/api/v1/models');
-        return new Response(JSON.stringify({ data: [
+    await withFakeFetchDevice([{ url: 'https://openrouter.ai/api/v1/models', response: new Response(JSON.stringify({ data: [
           { id: 'upstage/solar-pro4', name: 'Solar Pro 4' },
           { id: 'z-ai/glm-5.3', name: 'GLM 5.3' },
           { id: 'upstage/solar-mini4', name: 'Solar Mini 4' },
-        ] }), { status: 200, headers: { 'content-type': 'application/json' } });
-      }) as typeof fetch;
+        ] }), { status: 200, headers: { 'content-type': 'application/json' } }) }], async (device) => {
       const result = await runLlmDetect({ json: true }, f.deps);
       expect(result.upstageCandidates).toEqual(['openrouter/upstage/solar-mini4', 'openrouter/upstage/solar-pro4']);
       expect(JSON.parse(f.outputs[0]!).upstageCandidates).toEqual(result.upstageCandidates);
-    } finally { globalThis.fetch = originalFetch; }
+      expect(device.calls().map((call) => call.url)).toEqual(['https://openrouter.ai/api/v1/models']);
+    });
   });
 
   test('catalogue failure is unmeasured, empty catalogue is empty, and absent OpenRouter makes no request', async () => {
@@ -245,7 +242,6 @@ describe('llm detect CLI handler', () => {
   });
 
   test('--apply probes the exact persisted credential, endpoint and model through the real provider', async () => {
-    const originalFetch = globalThis.fetch;
     const calls: Array<{ url: string; authorization: string | null; model: string }> = [];
     const configured: UserConfig = {
       llm: {
@@ -254,19 +250,17 @@ describe('llm detect CLI handler', () => {
       },
     } as UserConfig;
     const saved: UserConfig[] = [];
-    try {
-      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = String(input);
-        const authorization = new Headers(init?.headers).get('authorization');
-        const model = (JSON.parse(String(init?.body)) as { model: string }).model;
-        calls.push({ url, authorization, model });
-        if (url !== configured.llm.baseUrl || authorization !== `Bearer ${configured.llm.apiKey}` || model !== configured.llm.model) {
+    await withFakeFetchDevice([{ url: configured.llm.baseUrl!, method: 'POST', response: (request) => {
+        const authorization = request.headers.authorization ?? null;
+        const model = (JSON.parse(request.body ?? '{}') as { model: string }).model;
+        calls.push({ url: request.url, authorization, model });
+        if (request.url !== configured.llm.baseUrl || authorization !== `Bearer ${configured.llm.apiKey}` || model !== configured.llm.model) {
           return new Response('unexpected probe settings', { status: 401 });
         }
         return new Response('data: {"choices":[{"delta":{"content":"OK"}}]}\n\ndata: [DONE]\n\n', {
           status: 200, headers: { 'content-type': 'text/event-stream' },
         });
-      }) as typeof fetch;
+      } }], async (device) => {
       const result = await runLlmDetect({ apply: true, probe: true }, {
         config: () => configured,
         detect: async () => [{ provider: 'openai', auth: 'apikey', source: 'env:OPENAI_API_KEY', available: true, rank: 0 }],
@@ -285,9 +279,8 @@ describe('llm detect CLI handler', () => {
           url: configured.llm.baseUrl!, authorization: `Bearer ${configured.llm.apiKey}`, model: configured.llm.model!,
         });
       }
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+      expect(device.calls()).toHaveLength(2);
+    });
   });
 
   test('--apply refuses a candidate when the persisted model routes it to another provider', async () => {

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // H6 P5 · AgentReply LLM tool.
 //
 // Complements `AgentHandoff` (H5 P3): where handoff launches a fresh
@@ -11,7 +12,7 @@
 // Timeouts are NOT errors — they return partial content + a
 // `'timeout-truncated'` warning so the LLM can adapt.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { debug } from '../../debug/log.js';
 import {
   findLiveSessionById,

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // Anthropic prompt-caching helpers — pure transforms, no fetch.
 //
 // Exports:
@@ -19,7 +20,7 @@
 // accepts these fields on the 2023-06-01 wire version — prompt
 // caching went GA without a version bump.
 
-import type { LLMMessage, LLMToolSpec } from '../llm.js';
+import type { LLMMessage } from '../llm.js';
 import { assertNoTopLevelToolSchemaCombinators } from '../llm-tool-schema.js';
 import {
   cacheControlFor,

@@ -19,6 +19,7 @@ test('WSL bootstrap registers a one-time resume before requesting distro install
       run: (command, args) => { calls.push([command, ...args]); events.push('install'); return { status: 0 }; },
     } });
   expect(result).toMatchObject({ status: 'resume-pending', distribution: 'Ubuntu-24.04', user: 'user' });
+  expect(result.attempted).toBe(2);
   expect(scheduled).toContain('--resume');
   expect(scheduled).toContain('capture.json');
   expect(events).toEqual(['schedule', 'install']);
@@ -33,12 +34,13 @@ test('WSL resume creates the account, enables systemd, and reboots the guest bef
     user: 'elanous', resume: true,
     deps: {
       platform: 'win32',
+      stdinIsTTY: true,
       scheduleResume: () => ({ status: 0 }),
       run: (command, args, captureOutput) => {
         calls.push({ command, args });
         const joined = args.join(' ');
-        if (joined === '--list --quiet') return { status: 0, stdout: 'Ubuntu\r\n' };
-        if (joined.includes('/usr/bin/id -u elanous')) return { status: 1, stdout: '' };
+        if (joined === '--list --verbose') return { status: 0, stdout: '  NAME                   STATE           VERSION\r\n* Ubuntu                 Stopped         2\r\n' };
+        if (joined.includes('/usr/bin/id -u elanous')) return { status: 1, stderr: 'id: elanous: no such user' };
         if (joined.includes('/usr/bin/passwd -S elanous')) return { status: 0, stdout: 'elanous L 1970-01-01 0 99999 7 -1\n' };
         if (joined.includes('/usr/bin/passwd elanous')) { interactiveCount += 1; return { status: 0 }; }
         if (joined.includes('cat /etc/wsl.conf')) return { status: 0, stdout: '[network]\ngenerateResolvConf=false\n' };
@@ -70,7 +72,7 @@ test('WSL setup fails closed when an existing configuration cannot be read', () 
     user: 'elanous', resume: true, deps: { platform: 'win32', run: (command, args) => {
       calls.push([command, ...args]);
       const joined = args.join(' ');
-      if (joined === '--list --quiet') return { status: 0, stdout: 'Ubuntu\n' };
+      if (joined === '--list --verbose') return { status: 0, stdout: '  NAME                   STATE           VERSION\n* Ubuntu                 Stopped         2\n' };
       if (joined.includes('/usr/bin/id -u')) return { status: 0, stdout: '1000\n' };
       if (joined.includes('/usr/bin/passwd -S')) return { status: 0, stdout: 'elanous P 2026-01-01 0 99999 7 -1\n' };
       if (joined.includes('user-mod')) return { status: 0 };
@@ -89,6 +91,88 @@ test('WSL resume command quotes paths with spaces and rejects unsafe identifiers
   expect(command).toContain('"C:\\Users\\Me\\My Capture.json"');
   expect(() => applyMachineWslBootstrap({ capture: 'x', profile: 'default', distribution: 'Ubuntu', user: 'Bad User', resume: false,
     deps: { platform: 'win32', scheduleResume: () => ({ status: 0 }), run: () => ({ status: 0 }) } })).toThrow('WSL username');
+});
+
+test('WSL resume preserves the virtualization diagnostic when WSL2 cannot start', () => {
+  const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'default', distribution: 'Ubuntu',
+    user: 'elanous', resume: true, deps: { platform: 'win32', run: (_command, args) => args[0] === '--list'
+      ? { status: 1, stdout: '', stderr: 'Wsl/Service/CreateInstance/HCS_E_HYPERV_NOT_INSTALLED' }
+      : { status: 0 } } });
+  expect(result).toMatchObject({ status: 'failed', detail: 'list-distributions', attempted: 1 });
+  expect(result.failures[0]?.reason).toContain('HCS_E_HYPERV_NOT_INSTALLED');
+});
+
+test('WSL account startup preserves HCS failure instead of treating it as a missing user', () => {
+  const calls: string[] = [];
+  const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'default', distribution: 'Ubuntu',
+    user: 'elanous', resume: true, deps: { platform: 'win32', run: (_command, args) => {
+      const line = args.join(' '); calls.push(line);
+      if (line === '--list --verbose') return { status: 0, stdout: '* Ubuntu Stopped 2\n' };
+      if (line.includes('/usr/bin/id -u')) return { status: 1, stderr: 'HCS_E_HYPERV_NOT_INSTALLED' };
+      return { status: 0 };
+    } } });
+  expect(result).toMatchObject({ status: 'failed', detail: 'start-distribution', attempted: 2 });
+  expect(result.failures[0]?.reason).toContain('HCS_E_HYPERV_NOT_INSTALLED');
+  expect(calls.some(line => line.includes('/usr/sbin/useradd'))).toBe(false);
+});
+
+test('WSL account probe does not treat a root lookup error as the requested user missing', () => {
+  const calls: string[] = [];
+  const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'default', distribution: 'Ubuntu',
+    user: 'elanous', resume: true, deps: { platform: 'win32', run: (_command, args) => {
+      const line = args.join(' '); calls.push(line);
+      if (line === '--list --verbose') return { status: 0, stdout: '* Ubuntu Stopped 2\n' };
+      if (line.includes('/usr/bin/id -u')) return { status: 1, stderr: 'id: root: no such user' };
+      return { status: 0 };
+    } } });
+  expect(result).toMatchObject({ status: 'failed', detail: 'start-distribution', attempted: 2 });
+  expect(result.failures[0]?.reason).toContain('id: root: no such user');
+  expect(calls.some(line => line.includes('/usr/sbin/useradd'))).toBe(false);
+});
+
+test('WSL RunOnce registration is included in the attempted command count', () => {
+  const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'default', distribution: 'Ubuntu',
+    user: 'elanous', resume: false, deps: { platform: 'win32', scheduleResume: () => ({ status: 5 }), run: () => ({ status: 0 }) } });
+  expect(result).toMatchObject({ status: 'failed', detail: 'register-resume', attempted: 1 });
+});
+
+test('WSL resume stops on an absent distro instead of reinstalling and rescheduling forever', () => {
+  const calls: string[] = [];
+  let scheduled = false;
+  const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'default', distribution: 'Ubuntu',
+    user: 'elanous', resume: true, deps: { platform: 'win32', scheduleResume: () => { scheduled = true; return { status: 0 }; },
+      run: (_command, args) => { calls.push(args.join(' ')); return { status: 0, stdout: '  NAME STATE VERSION\n' }; } } });
+  expect(result).toMatchObject({ status: 'failed', detail: 'verify-wsl2', attempted: 1 });
+  expect(result.failures[0]?.reason).toContain('automatic reinstall is stopped');
+  expect(calls).toEqual(['--list --verbose']);
+  expect(scheduled).toBe(false);
+});
+
+test('WSL1 is rejected before account or systemd changes', () => {
+  const calls: string[] = [];
+  const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'default', distribution: 'Ubuntu',
+    user: 'elanous', resume: true, deps: { platform: 'win32', run: (_command, args) => {
+      calls.push(args.join(' '));
+      return { status: 0, stdout: '  NAME STATE VERSION\n* Ubuntu Stopped 1\n' };
+    } } });
+  expect(result).toMatchObject({ status: 'failed', detail: 'verify-wsl2', attempted: 1 });
+  expect(result.failures[0]?.reason).toContain('WSL 2 is required');
+  expect(calls).toEqual(['--list --verbose']);
+});
+
+test('WSL resume reports a TTY-less password prompt instead of hanging', () => {
+  const calls: string[] = [];
+  const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'default', distribution: 'Ubuntu',
+    user: 'elanous', resume: true, deps: { platform: 'win32', stdinIsTTY: false, run: (_command, args) => {
+      const line = args.join(' '); calls.push(line);
+      if (line === '--list --verbose') return { status: 0, stdout: '* Ubuntu Stopped 2\n' };
+      if (line.includes('/usr/bin/id -u')) return { status: 0, stdout: '1000\n' };
+      if (line.includes('/usr/bin/passwd -S')) return { status: 0, stdout: 'elanous L 1970-01-01 0 99999 7 -1\n' };
+      return { status: 0 };
+    } } });
+  expect(result).toMatchObject({ status: 'failed', detail: 'set-user-password', attempted: 3 });
+  expect(result.failures[0]?.reason).toContain('no interactive terminal');
+  expect(calls.some(line => line === '--distribution Ubuntu --user root --exec /usr/bin/passwd elanous')).toBe(false);
 });
 
 test('WSL profile apply runs apt commands inside the selected distro and aggregates failures', () => {
@@ -125,6 +209,7 @@ test('machine apply shows the selected distro before approval and prints manual 
       platform: () => 'wsl',
       wsl: {
         platform: 'win32',
+        stdinIsTTY: true,
         executable: 'C:\\Elanous\\bun.exe',
         entry: 'C:\\Elanous\\elanous.mjs',
         scheduleResume: () => { scheduled += 1; return { status: 0 }; },
@@ -132,7 +217,7 @@ test('machine apply shows the selected distro before approval and prints manual 
           calls.push([command, ...argv]);
           const line = argv.join(' ');
           if (line === '--install --distribution Debian --no-launch' || line === '--install --distribution Ubuntu --no-launch') return { status: 0 };
-          if (line === '--list --quiet') return { status: 0, stdout: 'Ubuntu\r\n' };
+          if (line === '--list --verbose') return { status: 0, stdout: '  NAME                   STATE           VERSION\r\n* Ubuntu                 Stopped         2\r\n' };
           if (line.includes('/usr/bin/id -u elanous')) return { status: 0, stdout: '1000\n' };
           if (line.includes('/usr/bin/passwd -S elanous')) return { status: 0, stdout: 'elanous P 2026-01-01 0 99999 7 -1\n' };
           if (line.includes('cat /etc/wsl.conf')) return { status: 0, stdout: '[network]\ngenerateResolvConf=false\n' };
@@ -155,7 +240,8 @@ test('machine apply shows the selected distro before approval and prints manual 
 
     output.length = 0;
     await parse(['--platform', 'wsl', '--distribution', 'Debian', '--yes']);
-    expect(output[0]).toContain('reboot and sign in to continue');
+    expect(output[0]).toContain('reboot, then sign in or run this resume command over SSH');
+    expect(output[0]).toContain('--resume');
     expect(scheduled).toBe(1);
 
     output.length = 0;

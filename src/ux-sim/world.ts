@@ -1,5 +1,5 @@
 import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
@@ -30,6 +30,12 @@ import { isTrustedPromotionPythonBody } from '../hq/promote.js';
 // Capture before runInWorld's process sandbox is installed; tests can execute worlds concurrently.
 const spawnSyncForPromotion = childProcess.spawnSync;
 import { createFakeAppHost } from './fake-app-host.js';
+import { createFakeStt } from './fake-stt.js';
+import { fakeElevenLabsAudioBytes } from './fake-elevenlabs.js';
+import { createFakeHiggsfieldRunner } from './fake-higgsfield.js';
+import { createFakeAppStorage } from './fake-app-storage.js';
+import { createAppActions } from '../nexus/apps/app-actions.js';
+import { loadNexusAppHost } from '../nexus/apps/app-host.js';
 import { runWorldChaosSchedule, type WorldChaosAction, type WorldChaosRun, type WorldChaosScheduledEvent } from './world-chaos-runtime.js';
 import { createWorldHostChaosController } from './world-host-chaos.js';
 import { createSimWorld, destroySimWorld, listSimWorlds } from './world-store.js';
@@ -108,6 +114,8 @@ export interface WorldScenarioResult {
   recovery?: WorldChaosRun;
   verdict?: 'green' | 'yellow' | 'red';
   fidelity?: Array<{ deviceId: string; verdict: 'green' | 'yellow' | 'unmeasured'; failedRecordingIds: string[] }>;
+  billing?: { provider: 'fake-higgsfield'; spendCents: number; externalNetworkAttempts: number };
+  publicShare?: { status: number; version: string; body: string };
 }
 
 function worldWatchObservations(world: SimWorld, runId: string): Array<{ event: string; verdict: string }> {
@@ -159,8 +167,16 @@ export function createSimMailbox(): SimMailbox {
 
 export function parseSimWorld(source: string): SimWorldSpec {
   const value = object(parseYaml(source), 'world');
+  if (value.steps !== undefined) {
+    if (!Array.isArray(value.steps) || value.steps.some((step, index) => !step || typeof step !== 'object' || Array.isArray(step))) {
+      throw new Error('world.steps must be a list of scenario step objects');
+    }
+  }
   const hasAppEvents = Array.isArray(value.events) && value.events.some((event) => !!event && typeof event === 'object' && 'appAction' in event);
-  const appWorld = value.apps !== undefined || hasAppEvents ? parseSimWorldSchema(source) : undefined;
+  // A scenario may be self-contained: its executable steps are not world configuration.
+  const schemaSource = 'steps' in value || 'demo' in value
+    ? JSON.stringify(Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'steps' && key !== 'demo'))) : source;
+  const appWorld = value.apps !== undefined || hasAppEvents ? parseSimWorldSchema(schemaSource) : undefined;
   const apps = appWorld?.apps;
   const id = value.world;
   if (typeof id !== 'string' || !WORLD_ID.test(id)) throw new Error('world.world must be a lowercase world id');
@@ -1041,6 +1057,169 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
           scheduledInjections, clock, baseTimeMs, hostChaos, processTable, appActions);
       });
       return { pass: recovery.evaluation?.pass ?? true, observations, devices: [...assembled.devices.keys()], ...(scheduled ? { recovery } : {}) };
+    }
+    if (steps.length === 1 && stepKeys[0] === 'observe' && steps[0]?.observe === 'app-demo-1114') {
+      const demo = object(scenario.demo, 'scenario.demo');
+      if (typeof demo.transcript !== 'string' || !demo.transcript.trim() || typeof demo.recording !== 'string' || !demo.recording.trim()) {
+        throw new Error('app-demo-1114 requires demo.transcript and demo.recording fixtures');
+      }
+      const appHost = assembled.appHost;
+      if (!appHost || !world.spec.apps?.some((app) => app.slug === 'voice-notes') || !world.spec.apps.some((app) => app.slug === 'shop-studio')) {
+        throw new Error('app-demo-1114 requires voice-notes and shop-studio app declarations');
+      }
+      const observations: WorldScenarioResult['observations'] = [];
+      const noteApp = world.spec.apps.find((app) => app.slug === 'voice-notes')!;
+      const shopApp = world.spec.apps.find((app) => app.slug === 'shop-studio')!;
+      const record = (event: string, verdict: string) => observations.push({ event, verdict });
+      const storage = createFakeAppStorage({ rootDir: join(world.root, 'app-demo-storage'), signingKey: 'sim-only-demo-signing-key' });
+
+      try {
+        appHost.deploy('voice-notes', noteApp.versions[0]!);
+        appHost.deploy('shop-studio', shopApp.versions[0]!);
+        record('demo-build-and-deploy', 'pass');
+        const productPage = appHost.fetch('shop-studio.app.sim.invalid', '/index.html');
+        if (productPage.status !== 200) throw new Error('shop-studio product page is unavailable');
+        const photo = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jw6kAAAAASUVORK5CYII=', 'base64');
+        if (photo[0] !== 0x89 || photo.toString('ascii', 1, 4) !== 'PNG') throw new Error('demo product fixture is not a PNG image');
+        const upload = storage.upload({ appSlug: 'shop-studio', key: 'products/demo.png', body: photo, contentType: 'image/png' });
+        const storedPhoto = storage.read({ appSlug: 'shop-studio', key: 'products/demo.png' }).body;
+        if (upload.status !== 201 || !storedPhoto || !Buffer.from(storedPhoto).equals(photo)) {
+          throw new Error('shop-studio product photo upload did not persist within the app scope');
+        }
+        record('product-photo-upload', 'apps/shop-studio/products/demo.png · persisted');
+
+        // App actions use the production dispatcher with only hermetic fake provider ports.
+        const fakeSecrets = new Map([
+          ['cred:openai.api_key', 'SIM-SECRET-OPENAI-DO-NOT-LEAK'],
+          ['cred:elevenlabs.api_key', 'SIM-SECRET-TTS-DO-NOT-LEAK'],
+          ['cred:higgsfield.key_id', 'SIM-SECRET-HIGGSFIELD-ID-DO-NOT-LEAK'],
+          ['cred:higgsfield.secret', 'SIM-SECRET-HIGGSFIELD-KEY-DO-NOT-LEAK'],
+        ]);
+        const recording = Buffer.from(demo.recording);
+        const recordingHash = createHash('sha256').update(recording).digest('hex');
+        const stt = createFakeStt({ transcripts: { [recordingHash]: { text: demo.transcript, language: 'ko' } } });
+        let higgsfield: ReturnType<typeof createFakeHiggsfieldRunner> | undefined;
+        const actions = createAppActions({
+          secrets: { async resolve({ appSlug, reference }) { return appSlug === 'voice-notes' || appSlug === 'shop-studio' ? fakeSecrets.get(reference) : undefined; } },
+          async readImageObject({ appSlug, reference }) {
+            const result = storage.read({ appSlug, key: reference });
+            return result.status === 200 && result.body ? { bytes: result.body, mimeType: 'image/png' } : undefined;
+          },
+          async transcribe(input) { return stt.transcribe({ audio: input.audio, language: 'ko' }); },
+          async summarize({ text }) {
+            const actionItems = text.split(/[.!?。！？]/u).map((part) => part.trim()).filter((part) => /(?:해|해주|확인해)\s*주세요$/u.test(part));
+            return `요약: ${text} · 할 일: ${actionItems.join(', ') || '없음'} · 태그: 회의`;
+          },
+          async synthesize({ text }) { return { audio: fakeElevenLabsAudioBytes(text), mimeType: 'audio/mpeg' }; },
+          async generate(input) {
+            if (!Buffer.from(input.image).equals(photo)) throw new Error('generation action did not receive the uploaded product photo');
+            higgsfield = createFakeHiggsfieldRunner({ seed: String(world.spec.seed), deviceOptIn: true, maxSubmissions: 1,
+              imageBytes: input.image, requireImageBytes: true });
+            const created = await higgsfield.run(['fake-higgsfield', 'generate', 'create', '--image', 'apps/shop-studio/products/demo.png', '--prompt', input.prompt]);
+            if (created.exitCode !== 0 || !created.stdout.trim()) throw new Error('fake Higgsfield job was not queued');
+            return { jobId: created.stdout.trim(), eventsUrl: 'https://shop-studio.app.sim.invalid/jobs/demo/events' };
+          },
+        });
+        const job = await actions.run({ appSlug: 'shop-studio', declaration: {
+          builtin: 'generate', uses: ['cred:higgsfield.key_id', 'cred:higgsfield.secret'], async: true, spend: 'owner-confirm',
+        }, payload: { text: '상품 사진으로 짧은 광고 영상을 만든다', image: 'products/demo.png', confirmSpend: true } });
+        if (!('jobId' in job) || job.status !== 'queued') throw new Error('app action did not return a queued generation job');
+        if (!higgsfield) throw new Error('fake Higgsfield runner was not created by the app action');
+        const jobStates: string[] = [];
+        for (let poll = 0; poll < 3; poll += 1) {
+          const response = await higgsfield.run(['fake-higgsfield', 'generate', 'get', job.jobId, '--json']);
+          if (response.exitCode !== 0) throw new Error('fake Higgsfield job polling failed');
+          const result = JSON.parse(response.stdout) as { status?: unknown; result_url?: unknown };
+          if (typeof result.status !== 'string') throw new Error('fake Higgsfield returned an invalid job status');
+          jobStates.push(result.status);
+          if (poll === 2 && typeof result.result_url !== 'string') throw new Error('completed fake Higgsfield job has no result URL');
+        }
+        const uploadedPhotoHash = createHash('sha256').update(photo).digest('hex');
+        if (jobStates.join(',') !== 'queued,in_progress,completed' || higgsfield.ledger.submissions !== 1
+          || !higgsfield.ledger.imageSha256.includes(uploadedPhotoHash)) {
+          throw new Error('fake Higgsfield job did not traverse the expected bounded lifecycle');
+        }
+        record('higgsfield-job', `${jobStates.join(' → ')} · fake-provider submissions=${higgsfield.ledger.submissions} · external-provider-calls=${world.networkEvents.length}`);
+
+        const transcript = await actions.run({ appSlug: 'voice-notes', declaration: { builtin: 'stt', uses: ['cred:openai.api_key'] },
+          payload: { audio: recording, mimeType: 'audio/wav', filename: 'kaist-demo.wav', language: 'ko' } });
+        if (!('text' in transcript) || transcript.text !== demo.transcript) throw new Error('app STT action did not consume the recording fixture');
+        record('recording-and-transcription', `${transcript.language}:${transcript.text}`);
+        const summary = await actions.run({ appSlug: 'voice-notes', declaration: { builtin: 'summarize', uses: ['cred:openai.api_key'] },
+          payload: { text: transcript.text } });
+        if (!('text' in summary) || !summary.text.includes(transcript.text) || !summary.text.includes('할 일')) {
+          throw new Error('app summary action did not derive notes from the transcript');
+        }
+        const speech = await actions.run({ appSlug: 'voice-notes', declaration: { builtin: 'tts', uses: ['cred:elevenlabs.api_key'] },
+          payload: { text: summary.text, voiceId: 'demo-voice' } });
+        if (!('audioBase64' in speech) || Buffer.from(speech.audioBase64, 'base64').byteLength === 0) throw new Error('app TTS action returned no audio');
+        record('summary-todos-and-tts', `transcript-derived · audio-bytes=${Buffer.from(speech.audioBase64, 'base64').byteLength}`);
+
+        const baseVersion = noteApp.versions.at(-1)!;
+        const publishedVersionId = `v3-generated-${world.spec.seed}`;
+        const noteJson = JSON.stringify({ text: summary.text });
+        const storedNote = storage.upload({ appSlug: 'voice-notes', key: 'notes/demo.json', body: Buffer.from(noteJson), contentType: 'application/json' });
+        const noteRead = storage.read({ appSlug: 'voice-notes', key: 'notes/demo.json' });
+        const persistedNote = noteRead.body ? (JSON.parse(Buffer.from(noteRead.body).toString('utf8')) as { text?: unknown }).text : undefined;
+        if (storedNote.status !== 201 || persistedNote !== summary.text) throw new Error('generated note did not persist in voice-notes storage');
+        const htmlEscape = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+        const publishedAppsDir = join(world.root, 'published-apps', publishedVersionId);
+        const publishedAppDir = join(publishedAppsDir, 'voice-notes');
+        const publishedOutDir = join(publishedAppDir, 'out');
+        mkdirSync(join(publishedOutDir, 'share'), { recursive: true });
+        writeFileSync(join(publishedAppDir, 'app.yaml'), [
+          'apiVersion: elanous.app/v0', 'slug: voice-notes', 'title: Voice notes',
+          'frontend:', '  kind: static-export', '  out: out', '',
+        ].join('\n'));
+        writeFileSync(join(publishedOutDir, 'index.html'), `${baseVersion.files['index.html'] ?? ''}\n<!-- app-version:${publishedVersionId} -->`);
+        writeFileSync(join(publishedOutDir, 'share', 'demo'),
+          `<article data-app-version="${publishedVersionId}">${htmlEscape(persistedNote as string)}</article>`);
+        const productionAppHost = loadNexusAppHost(publishedAppsDir, undefined, {
+          dir: join(world.root, 'published-app-auth'), key: 'sim-only-demo-app-host-signing-key-at-least-256-bits-long',
+        });
+        if (productionAppHost.issues.length > 0 || !productionAppHost.appHost.slugs.includes('voice-notes')) {
+          productionAppHost.appHost.close();
+          throw new Error('Nexus app host rejected the published voice-notes artifact');
+        }
+        const invitation = productionAppHost.appHost.issueInvitation('voice-notes', 'sim-demo-owner');
+        const accepted = await productionAppHost.appHost.handle(new Request(
+          `http://voice-notes.app.localhost/__auth/accept?token=${encodeURIComponent(invitation.token)}`,
+          { headers: { host: 'voice-notes.app.localhost' } },
+        ));
+        const sessionCookie = accepted?.headers.get('set-cookie')?.split(';', 1)[0];
+        if (!accepted || accepted.status !== 303 || !sessionCookie) {
+          productionAppHost.appHost.close();
+          throw new Error('Nexus app host rejected the simulated share-link invitation');
+        }
+        const productionRequest = (path: string) => productionAppHost.appHost.handle(new Request(`http://voice-notes.app.localhost${path}`, {
+          headers: { host: 'voice-notes.app.localhost', cookie: sessionCookie },
+        }));
+        try {
+          const updated = await productionRequest('/index.html');
+          const updatedBody = updated ? await updated.text() : '';
+          if (!updated || updated.status !== 200 || !updatedBody.includes(`app-version:${publishedVersionId}`)) {
+            throw new Error(`Nexus app host did not serve the published app version (status=${updated?.status ?? 'missing'}, marker=${updatedBody.includes(`app-version:${publishedVersionId}`)})`);
+          }
+          record('one-line-change-and-redeploy', `${publishedVersionId} ${createHash('sha256').update(await readFileSync(join(publishedOutDir, 'index.html'))).digest('hex')}`);
+          const shared = await productionRequest('/share/demo');
+          const sharedBody = shared ? await shared.text() : '';
+          const sharedVersion = /data-app-version="([^"]+)"/.exec(sharedBody)?.[1];
+          if (!shared || shared.status !== 200 || sharedVersion !== publishedVersionId || !sharedBody.includes(htmlEscape(persistedNote as string))) {
+            throw new Error('Nexus app host did not safely serve the published transcript share page');
+          }
+          record('public-share-link', `http://voice-notes.app.localhost/share/demo · simulated host response=${shared.status}`);
+
+          const output = JSON.stringify(observations);
+          if ([...fakeSecrets.values()].some((secret) => output.includes(secret))) throw new Error('app demo observations leaked a credential value');
+          const billing = { provider: 'fake-higgsfield' as const, spendCents: higgsfield.ledger.spendCents,
+            externalNetworkAttempts: world.networkEvents.length };
+          const pass = higgsfield.ledger.submissions === 1 && higgsfield.ledger.polls === 3 && billing.spendCents === 0
+            && billing.externalNetworkAttempts === 0 && observations.length === 7;
+          return { pass, observations, devices: [...assembled.devices.keys()], billing,
+            publicShare: { status: shared.status, version: sharedVersion, body: sharedBody } };
+        } finally { productionAppHost.appHost.close(); }
+      } finally { storage.close(); }
     }
     if (steps.length !== 2 || stepKeys[0] !== 'inject' || stepKeys[1] !== 'observe'
       || !['release-readiness', 'hq-move', 'gate-roster-second-pool'].includes(String(steps[1]?.observe))) {

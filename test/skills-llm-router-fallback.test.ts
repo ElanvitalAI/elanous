@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // Pure unit tests for the regex → LLM cascade in
 // `src/skills/llm-router.ts`. The cascade is the cost-ceiling
 // chokepoint described in HANDOFF §4.2: regex hit (1 candidate) bypasses
@@ -13,7 +14,7 @@ import {
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PROVIDERS, streamLLMWithTools, type LLMProvider, type LLMStreamEvent, type LLMToolSpec } from '../src/llm.js';
+import { PROVIDERS, streamLLMWithTools, type LLMProvider, type LLMStreamEvent } from '../src/llm.js';
 import { debug } from '../src/debug/log.js';
 import { setUserConfigOverlay } from '../src/user-config.js';
 import {

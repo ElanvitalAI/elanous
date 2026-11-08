@@ -1,6 +1,10 @@
 // Archon-port T2.1 (2026-05-08) — workflow YAML schema validator.
 
 import { describe, it, expect } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   validateWorkflow,
   topoSort,
@@ -192,11 +196,48 @@ describe('parseWorkflowYaml', () => {
     const r = parseWorkflowYaml(yaml);
     expect(r.ok).toBe(true);
     expect(r.workflow?.name).toBe('from-yaml');
+    expect(r.warnings.map(warning => warning.code)).toEqual(['no-trigger-node']);
+  });
+
+  it('returns schema errors from the lazy validator', () => {
+    const yaml = [
+      'name: from-yaml',
+      'description: parsed',
+      'nodes:',
+      '  - id: one',
+      '    bash: echo hi',
+      '    manualTrigger: {}',
+    ].join('\n');
+    const r = parseWorkflowYaml(yaml);
+    expect(r.ok).toBe(false);
+    expect(r.issues).toEqual([{ path: 'nodes[0]', message: 'node declares multiple variants (bash, manualTrigger) — pick one' }]);
+    expect(r.warnings).toEqual([]);
   });
 
   it('returns parse error for invalid YAML', () => {
     const r = parseWorkflowYaml('::: not yaml :::');
     expect(r.ok).toBe(false);
     expect(r.issues[0]?.message).toContain('YAML');
+  });
+
+  it('preserves parser results in the Bun bundle', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'workflow-parser-bundle-'));
+    try {
+      const built = await Bun.build({
+        entrypoints: [join(import.meta.dir, '../src/workflow-runtime/parser.ts')],
+        outdir: outDir,
+        target: 'bun',
+      });
+      expect(built.success).toBe(true);
+      const bundled = await import(pathToFileURL(join(outDir, 'parser.js')).href) as typeof import('../src/workflow-runtime/parser.js');
+      const inputs = [
+        ['name: from-yaml', 'description: parsed', 'nodes:', '  - id: one', '    bash: echo hi'].join('\n'),
+        ['name: from-yaml', 'description: parsed', 'nodes:', '  - id: one', '    bash: echo hi', '    manualTrigger: {}'].join('\n'),
+        '::: not yaml :::',
+      ];
+      for (const input of inputs) expect(bundled.parseWorkflowYaml(input)).toEqual(parseWorkflowYaml(input));
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
   });
 });

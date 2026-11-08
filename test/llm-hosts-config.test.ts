@@ -16,15 +16,33 @@ import {
 } from '../src/nexus/api/llm-hosts.js';
 import { handleLlmModels } from '../src/nexus/api/llm-models.js';
 import { expectMalformedJson400 } from './helpers/http-error-contract';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 type FetchFn = typeof globalThis.fetch;
-const realFetch = globalThis.fetch;
+let fakeFetch: FakeFetchDevice | undefined;
+
+function installFetch(stub: FetchFn, urls: readonly string[]): void {
+  fakeFetch?.restore();
+  const respond = (request: { url: string; method: string; headers: Readonly<Record<string, string>>; body: string | null }) =>
+    stub(request.url, {
+      method: request.method,
+      headers: { ...request.headers },
+      ...(request.body !== null ? { body: request.body } : {}),
+    });
+  fakeFetch = createFakeFetchDevice(urls.map((url) => ({ url, method: 'GET', response: respond })));
+}
+
+function expectFetchCalls(urls: readonly string[]): void {
+  const actual = (fakeFetch?.calls() ?? []).map(({ method, url }) => `${method} ${url}`).sort();
+  expect(actual).toEqual(urls.map((url) => `GET ${url}`).sort());
+}
 beforeEach(() => {
   // Reset state to clean baseline before each test (override + envs).
   setHostsOverride(null);
 });
 afterEach(() => {
-  globalThis.fetch = realFetch;
+  fakeFetch?.restore();
+  fakeFetch = undefined;
   delete process.env.ELANOUS_LLM_MODELS_ENDPOINT;
   delete process.env.ELANOUS_LLM_HOSTS;
   delete process.env.ANTHROPIC_API_KEY;
@@ -299,7 +317,7 @@ describe('Integration · /v1/llm/models honours override', () => {
       }
       return Promise.reject(new Error(`unstubbed: ${url}`));
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://override-host/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'));
     const body = (await res.json()) as {
@@ -308,6 +326,7 @@ describe('Integration · /v1/llm/models honours override', () => {
     };
     expect(body.hosts[0]?.name).toBe('override-host');
     expect(body.models[0]?.id).toBe('override-model');
+    expectFetchCalls(['http://override-host/v1/models']);
   });
 
   test('override > env → env hosts ignored while override active', async () => {
@@ -330,11 +349,12 @@ describe('Integration · /v1/llm/models honours override', () => {
       }
       return Promise.reject(new Error(`unstubbed: ${url}`));
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://override-host/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'));
     const body = (await res.json()) as { hosts: Array<{ name: string }> };
     expect(body.hosts[0]?.name).toBe('override-host');
+    expectFetchCalls(['http://override-host/v1/models']);
   });
 
   test('clear override → /v1/llm/models reverts to env', async () => {
@@ -350,10 +370,11 @@ describe('Integration · /v1/llm/models honours override', () => {
       }
       return Promise.reject(new Error(`unstubbed: ${url}`));
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://env-host/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'));
     const body = (await res.json()) as { hosts: Array<{ name: string }> };
     expect(body.hosts[0]?.name).toBe('env-host');
+    expectFetchCalls(['http://env-host/v1/models']);
   });
 });

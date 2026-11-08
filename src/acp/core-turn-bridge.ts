@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // UI-Core arc Phase U3b Step 2 — ACP server ↔ runCoreTurn bridge.
 //
 // Turns an AcpTurnContext (the minimal per-prompt shape the ACP
@@ -34,7 +35,7 @@
 // headless-core guard test asserts the bridge stays TUI-free so
 // Core really can run headless.
 
-import { nextTurnFallbackProvider, resolveDefaultProvider, type LLMMessage, type LLMProvider, type LLMToolSpec, type ContentBlock } from '../llm.js';
+import { nextTurnFallbackProvider, resolveDefaultProvider, type LLMMessage, type LLMProvider, type ContentBlock } from '../llm.js';
 import { readAutohealProviderFallback } from '../self-health/autoheal.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { CoreTurnAuthRejectedError } from '../core-turn/auth-rejected-notice.js';

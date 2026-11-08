@@ -44,7 +44,7 @@ describe('maskValueForPublic — 서버 판단 사슬·L4 원문도 같은 규�
     expect(event.what).toBe('codex 계정 default → team');
   });
   test('L4 원문 JSON 의 과금 칸은 칸째 없앤다 · 홈 경로는 ~', () => {
-    const evidence = { ts: 't', data: { account: 'third', apiEquivalentUsd: 12.5, path: '/Users/user/x' } };
+    const evidence = { ts: 't', data: { account: 'third', apiEquivalentUsd: 12.5, path: '/Users/TESTONLY/x' } };
     const masked = maskValueForPublic(evidence, ['default', 'team', 'third']) as { data: Record<string, unknown> };
     expect(masked.data.account).toBe('account-3');
     expect('apiEquivalentUsd' in masked.data).toBe(false);

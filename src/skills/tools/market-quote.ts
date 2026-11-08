@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tool: market_quote (MarketQuote)
 //
 // 단일 심볼 시세 조회. ★ C-②b(2026-07-22) — 종전 자체 EODHD/FDS HTTP 재구현("skill-essence
@@ -8,7 +9,7 @@
 //
 // Symbols: pass-through. marketQuote 의 classify 가 "AAPL.US"/"005930.KS"/".INDX"/".FOREX" 를 판별.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 export interface MarketQuoteArgs {
   symbol: string;

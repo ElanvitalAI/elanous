@@ -6,7 +6,7 @@
 // or hand a raw YAML string here.
 
 import { parse as parseYaml } from 'yaml';
-import { validateWorkflow, type ValidationResult } from './schema.js';
+import type { ValidationResult } from './schema.js';
 
 export function parseWorkflowYaml(yamlText: string): ValidationResult {
   let parsed: unknown;
@@ -24,5 +24,6 @@ export function parseWorkflowYaml(yamlText: string): ValidationResult {
       warnings: [],
     };
   }
-  return validateWorkflow(parsed);
+  const schema = require('./schema.js') as typeof import('./schema.js');
+  return schema.validateWorkflow(parsed);
 }

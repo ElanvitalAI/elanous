@@ -14,10 +14,6 @@ export interface DashboardPreviewWidgetRuntime {
     widget: DashboardPreviewWidgetLike | null | undefined,
     projection: DashboardPreviewTerminalProjection,
   ): void;
-  projectVi(
-    widget: DashboardPreviewWidgetLike | null | undefined,
-    projection: DashboardPreviewTerminalProjection,
-  ): void;
   projectPlain(
     widget: DashboardPreviewWidgetLike | null | undefined,
     projection: {
@@ -32,14 +28,6 @@ export interface DashboardPreviewWidgetRuntime {
 export function createDashboardPreviewWidgetRuntime(): DashboardPreviewWidgetRuntime {
   return {
     projectTerminal(widget, projection) {
-      if (!widget) return;
-      widget.state.text = projection.text;
-      widget.state.scroll = 0;
-      widget.state.focused = projection.focused;
-      widget.state.preformatted = true;
-      widget.character = projection.title;
-    },
-    projectVi(widget, projection) {
       if (!widget) return;
       widget.state.text = projection.text;
       widget.state.scroll = 0;

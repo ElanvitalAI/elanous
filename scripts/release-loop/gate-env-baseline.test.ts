@@ -2,8 +2,8 @@
 // and the test runner (`test:deterministic`) passes that env through to the test processes.
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { GATE_POD_ENV_BASELINE, gateEnvBaselineLine, gateShardShell } from './gate-node';
-import { gateTestBaseline } from '../lib/gate-test-env';
+import { GATE_POD_ENV_BASELINE, gateTestBaseline } from '../lib/gate-test-env';
+import { gateEnvBaselineLine, gateShardShell } from './gate-shard-shell.js';
 import { prepareIsolatedTestEnv } from '../test-deterministic';
 
 const base = { parts: [['src/a.test.ts']], cdpPatterns: [], softSeconds: 100, cachePrefix: '', installSlots: 4 };

@@ -19,9 +19,15 @@ export type WarmPoolReuseFault = 'image-pin-mismatch' | 'profile-mismatch' | 'ma
 
 const key = { context: 'pool-host-a-context', imageDigest: `sha256:${'d'.repeat(64)}`,
   lockHash: 'e'.repeat(64), architecture: 'amd64' };
+const simulationBaseImageDigest = `sha256:${'a'.repeat(64)}`;
+const simulationRuntimeContract = { baseImageDigest: simulationBaseImageDigest, bunVersion: Bun.version,
+  os: 'linux' as const, architecture: 'amd64', requiredTools: ['bun', 'git'] };
+const simulationRuntimeIdentity = { baseImageDigest: simulationBaseImageDigest, lockHash: key.lockHash,
+  os: 'linux' as const, architecture: 'amd64', bunVersion: Bun.version };
 const spec: WarmPodSpec = { name: 'warm-pool-host-a-standard-1', namespace: 'elanous-test', kubectlContext: 'pool-host-a-context',
   workerId: 'warm-pool-host-a-standard-1-generation-1', image: `registry.example/elanous@${key.imageDigest}`,
   sourceUrl: 'https://github.com/ElanvitalAI/elanous.git', cutSha: 'f'.repeat(40), key,
+  runtimeContract: simulationRuntimeContract,
   memoryLimit: '16Gi', nodeName: 'pool-host-a-server-0', hostProbeUrl: 'http://host.orb.internal:10001/health',
   prodProbeUrl: 'http://core.elanous-prod:10002/' };
 
@@ -133,7 +139,7 @@ function createProtocolBoundary(specification: WarmPodSpec, kubectl: ReturnType<
   return { request: (command: WarmWorkerCommand) => transport.request(command) };
 }
 
-export async function runWarmPoolReuseSimulation(options: { runId: string; fault?: WarmPoolReuseFault;
+export async function runWarmPoolReuseSimulation(options: { runId: string; shardCount?: number; fault?: WarmPoolReuseFault;
   transportFailure?: boolean; candidateHost?: 'pool-host-a' | 'pool-host-b'; providerConfig?: WarmPoolProviderConfig;
   drainingHosts?: readonly string[]; seedDrainingPod?: boolean;
   imagePinDigests?: { expected: string; observed: string }; runtimeContractMismatch?: boolean;
@@ -144,12 +150,15 @@ export async function runWarmPoolReuseSimulation(options: { runId: string; fault
   const baseCandidate: WarmWorkerCandidate = assembledTemplate ?? { host: candidateHost, tier: 'standard', spec: {
     ...spec, kubectlContext: `${candidateHost}-context`, nodeName: `${candidateHost}-server-0`,
     name: `warm-${candidateHost}-standard-1`, workerId: `warm-${candidateHost}-standard-1-generation-1`,
-    runtimeContract: { bunVersion: Bun.version, os: 'linux', architecture: 'amd64', requiredTools: ['bun', 'git'] },
+    runtimeContract: simulationRuntimeContract,
   } };
   const candidate: WarmWorkerCandidate = options.imagePinDigests ? { ...baseCandidate, spec: {
     ...baseCandidate.spec, key: { ...baseCandidate.spec.key, imageDigest: options.imagePinDigests.expected },
     image: `${baseCandidate.spec.image.slice(0, baseCandidate.spec.image.lastIndexOf('@') + 1)}${options.imagePinDigests.expected}`,
   } } : baseCandidate;
+  // The desired tuple belongs to the provider config, not whichever candidate survived reconciliation.
+  const targetRuntimeIdentity = options.providerConfig?.runtimeIdentity ?? (options.runtimeContractMismatch
+    ? { ...simulationRuntimeIdentity, bunVersion: '0.0.0' } : simulationRuntimeIdentity);
   const kubernetes = createFakeKubectl({ context: candidate.spec.kubectlContext, node: candidate.spec.nodeName!, podReadinessOnCreate: true });
   if (fault === 'image-pin-mismatch' || fault === 'profile-mismatch' || fault === 'detail-callback-missing' || options.imagePinDigests) {
     const manifest = warmWorkerPodManifest(candidate.spec) as Record<string, any>;
@@ -211,16 +220,18 @@ export async function runWarmPoolReuseSimulation(options: { runId: string; fault
   if (fault === 'machine-token-scope-mismatch')
     simulationMachineTokens[candidateHost] = primary.machineTokens[candidateHost === 'pool-host-a' ? 'pool-host-b' : 'pool-host-a'];
   const provider = new WarmPodProvider({ ...(options.providerConfig ?? { candidates: [candidate] }), controlUrl: primary.url,
+    ...(targetRuntimeIdentity ? { runtimeIdentity: targetRuntimeIdentity } : {}),
     ...(options.drainingHosts ? { drainingHosts: options.drainingHosts } : {}),
     memberToken: primary.memberToken,
     machineTokens: simulationMachineTokens,
+    rotationStatePath: join(prepareLockDirectory, 'rotations.json'),
     profileConfig: { pod: { warmPoolProfile: 'gate' } }, kubectl: (args, input) => {
       if (args.includes(WARM_POD_RUNTIME_PROBE)) {
         const expected = candidate.spec.runtimeContract!;
         const contractMismatch = options.runtimeContractMismatch === true
           || (fault === 'image-pin-mismatch' && !options.imagePinDigests);
         const observed = { bunVersion: contractMismatch ? '0.0.0' : expected.bunVersion,
-          os: expected.os, architecture: expected.architecture,
+          os: expected.os, architecture: expected.architecture, baseImageDigest: expected.baseImageDigest,
           tools: Object.fromEntries(expected.requiredTools.map(tool => [tool, true])) };
         return { status: 0, stdout: JSON.stringify(observed), stderr: '' };
       }
@@ -257,19 +268,36 @@ export async function runWarmPoolReuseSimulation(options: { runId: string; fault
       : await provider.reconcilePool();
     if (fault && !options.imagePinDigests) return { runId: options.runId, reconcile, selection: null, protocol,
       controlRequests: primary.requests };
-    const selection = await requestWarmPodReplay({ protocol: 1, runId: options.runId,
-      attemptId: `${options.runId}-gate-1`, cutSha: spec.cutSha, deadlineAt: Date.now() + 60_000,
-      files: ['src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts'], envProfile: 'gate-v1' }, provider);
-    if (selection.command && selection.transport.status === 'observed' && selection.transport.reason === 'complete') {
-      try { await provider.finalize(selection.command); }
-      catch (error) {
-        throw new Error(`${error instanceof Error ? error.message : String(error)}; control=${JSON.stringify(primary.requests)}`);
+    const shardCount = options.shardCount ?? 1;
+    if (!Number.isSafeInteger(shardCount) || shardCount < 1 || shardCount > 3)
+      throw new Error('gate warm shard simulation requires 1-3 shards');
+    const shardSelections: Array<{ attemptId: string; workerId: string | null; podUid: string | null;
+      transport: string; reason: string; released: boolean }> = [];
+    for (let shard = 0; shard < shardCount; shard++) {
+      const attemptId = `${options.runId}-gate-${shard + 1}`;
+      const selection = await requestWarmPodReplay({ protocol: 1, runId: options.runId,
+        attemptId, cutSha: spec.cutSha, deadlineAt: Date.now() + 60_000,
+        files: ['src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts'], envProfile: 'gate-v1' }, provider,
+      { kind: 'gate', lockHash: candidate.spec.key.lockHash, imageDigest: candidate.spec.key.imageDigest,
+        ...(candidate.spec.runtimeContract ? { runtimeContract: candidate.spec.runtimeContract } : {}),
+        ...(targetRuntimeIdentity ? { runtimeIdentity: targetRuntimeIdentity } : {}) });
+      let released = false;
+      if (selection.command && selection.transport.status === 'observed' && selection.transport.reason === 'complete') {
+        try { await provider.finalize(selection.command); released = true; }
+        catch (error) {
+          throw new Error(`${error instanceof Error ? error.message : String(error)}; control=${JSON.stringify(primary.requests)}`);
+        }
       }
+      shardSelections.push({ attemptId, workerId: selection.command?.workerId ?? null,
+        podUid: selection.command?.podUid ?? null, transport: selection.transport.status,
+        reason: selection.transport.reason, released });
+      if (!released) break;
     }
-    return { runId: options.runId, reconcile, protocol, controlRequests: primary.requests,
+    const selection = shardSelections.at(-1)!;
+    return { runId: options.runId, reconcile, protocol, shardSelections, controlRequests: primary.requests,
       deletedPodUid: deletionEvidence.podUid, selection: {
-      selected: selection.command !== null, workerId: selection.command?.workerId ?? null,
-      transport: selection.transport.status, reason: selection.transport.reason,
+      selected: selection.workerId !== null, workerId: selection.workerId,
+      transport: selection.transport, reason: selection.reason,
     } };
   } finally {
     primary.stop();
@@ -310,6 +338,7 @@ export async function simulateWarmPoolTtlRotation(options: { runId: string; ttlM
     }) as typeof fetch, { preconnect: fetch.preconnect }) as typeof fetch;
     const protocol: ProtocolEvidence = { requests: [], responses: [], acknowledgements: [] };
     const makeProvider = (leaseTtlMs: number) => new WarmPodProvider({ candidates: [candidate], controlUrl: primary.url,
+      runtimeIdentity: simulationRuntimeIdentity,
       memberToken: primary.memberToken, machineTokens: { 'pool-host-a': primary.machineTokens['pool-host-a'] },
       profileConfig: { pod: { warmPoolProfile: 'gate' } }, leaseTtlMs,
       now: clock.now,
@@ -354,7 +383,10 @@ export async function simulateWarmPoolTtlRotation(options: { runId: string; ttlM
       if (rotatedReconcile.ready === 1) {
         const result = await requestWarmPodReplay({ protocol: 1, runId: options.runId,
           attemptId: `${options.runId}-ttl-gate-1`, cutSha: spec.cutSha, deadlineAt: clock.now() + 60_000,
-          files: ['src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts'], envProfile: 'gate-v1' }, provider);
+          files: ['src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts'], envProfile: 'gate-v1' }, provider,
+        { kind: 'gate', lockHash: spec.key.lockHash, imageDigest: spec.key.imageDigest,
+          ...(spec.runtimeContract ? { runtimeContract: spec.runtimeContract } : {}),
+          runtimeIdentity: simulationRuntimeIdentity });
         selection = { selected: result.command !== null, workerId: result.command?.workerId ?? null,
           transport: result.transport.status, reason: result.transport.reason };
         if (result.command && result.transport.status === 'observed' && result.transport.reason === 'complete')
@@ -409,7 +441,8 @@ export async function simulateWarmPoolMachineLossRecovery() {
     if (!survivingMember) throw new Error('Nexus resource-ledger declaration did not retain an executable surviving mesh member');
     const providerConfig = assembleWarmPoolProviderConfig({
       config: { pod: { warmPoolProfile: 'gate', warmPool: { namespace: 'elanous-test',
-        imageRepository: 'registry.example/elanous', imageDigest: digest, lockHash: key.lockHash,
+        imageRepository: 'registry.example/elanous', imageDigest: digest, baseImageDigest: simulationBaseImageDigest,
+        lockHash: key.lockHash,
         architecture: key.architecture, hostProbeUrl: 'http://host.orb.internal:10001/health',
         prodProbeUrl: 'http://core.elanous-prod:10002/', sourceUrl: 'https://github.com/ElanvitalAI/elanous.git',
         templates: [{ host: survivingMember.host, tier: 'standard', nodeName: `${survivingMember.host}-node` }] } },

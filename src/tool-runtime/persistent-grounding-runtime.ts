@@ -1,5 +1,6 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { resolve } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import {
   groundPersistently,
   type PersistentGroundingDeps,

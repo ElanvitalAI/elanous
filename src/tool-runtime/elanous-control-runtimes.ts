@@ -1,8 +1,9 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { debug } from '../debug/log.js';
 import { canonicalizeForBoundary, isWithinBoundary, resolveHarnessBoundary } from '../harness/harness-write-boundary.js';

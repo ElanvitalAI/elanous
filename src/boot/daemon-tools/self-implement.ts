@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // SelfImplement — 데몬/ACP 툴 서피스 어댑터 (2026-07-20 · P0 막 배선).
 //
 // `elanous --acp-server`(createDaemonRuntime → toolSurface('webterm'))가 노출하는 툴에 self-build 를
@@ -16,7 +17,7 @@
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, linkSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { childLifetimeSignal } from '../../turn-abort-scope.js';
 import { buildSelfImplementSpec } from '../../self-implement/self-implement-runtime.js';
 import { runSelfImplementCliCommand, type SelfImplementCliDeps, type SelfImplementCliOpts, type SelfImplementCliOutcome } from '../../self-implement/self-implement-cli.js';

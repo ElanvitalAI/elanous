@@ -206,13 +206,14 @@ test('live OP inbox receives production gate failure and ARG repair lifecycle ev
   expect(success.bodies.some((body) => body.startsWith('✅ RLA repair completed · run=op-mail-repair-ok · node=gate-repair-'))).toBe(true);
 
   const failedRepair = await runAndReadMessages(true);
-  expect(failedRepair.state.status).toBe('failed');
+  expect(failedRepair.state.status).toBe('awaiting-approval');
+  expect(failedRepair.state.pending?.nodeId).toBe('gate-heal-decision');
   expect(failedRepair.state.adaptiveGateNodeAppends).toHaveLength(1);
   const repairFailure = failedRepair.bodies.find((body) => body.startsWith('🚨 RLA repair failed · run=op-mail-repair-fail · node=gate-repair-'));
   expect(repairFailure).toBeDefined();
   expect(repairFailure?.includes('\n')).toBe(false);
   expect(repairFailure).toContain('reason=');
-});
+}, 30_000); // full release graph runs twice — main 4066b368 baseline also timed out at the 5s default on aws1·aws2 train gates
 
 test('release event ids continue across approval resume and remain subscriber-deduplicable', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-event-resume-'));

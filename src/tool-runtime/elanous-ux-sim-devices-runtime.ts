@@ -1,5 +1,6 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { loadMockScenarioCatalog } from '../ux-sim/mock-scenario-catalog.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime } from './types.js';
 
 export interface ElanousUxSimDevicesResult extends Record<string, unknown> {

@@ -42,6 +42,40 @@ describe('fake-bin', () => {
     expect(existsSync(fakeBins.dir)).toBe(false);
   });
 
+  test('NODE_OPTIONS cannot prevent the fake from recording and returning its declared response', () => {
+    const fakeBins = createFakeBins({ tool: { stdout: 'ok\n' } });
+    try {
+      const env = { ...process.env, NODE_OPTIONS: '--require=/definitely/missing/fake-bin-node-option.cjs' };
+      const result = spawnSync(fakeBins.bin('tool'), ['inspect'], { encoding: 'utf8', env });
+      expect([result.status, result.stdout]).toEqual([0, 'ok\n']);
+      expect(fakeBins.calls()).toEqual([{ name: 'tool', argv: ['inspect'] }]);
+    } finally { fakeBins.cleanup(); }
+  });
+
+  test('PERL5OPT cannot inject a missing module before the fake shim starts', () => {
+    const fakeBins = createFakeBins({ tool: { stdout: 'ok\n' } });
+    try {
+      const env = { ...process.env, PERL5OPT: '-Mfake_bin_missing_startup_module' };
+      const result = spawnSync(fakeBins.bin('tool'), ['inspect'], { encoding: 'utf8', env });
+      expect([result.status, result.stdout]).toEqual([0, 'ok\n']);
+      expect(fakeBins.calls()).toEqual([{ name: 'tool', argv: ['inspect'] }]);
+    } finally { fakeBins.cleanup(); }
+  });
+
+  test('UTF-8 argv, recorded env and output round-trip through response matching', () => {
+    const fakeBins = createFakeBins({ tool: {
+      recordEnv: ['FAKE_UNICODE'],
+      responses: [{ argsStartWith: ['部署', '--'], stdout: '応答🙂\n' }],
+    } });
+    try {
+      const result = spawnSync(fakeBins.bin('tool'), ['部署', '--', '終'], {
+        encoding: 'utf8', env: { ...fakeBins.env, FAKE_UNICODE: '値🙂' },
+      });
+      expect([result.status, result.stdout]).toEqual([0, '応答🙂\n']);
+      expect(fakeBins.calls()).toEqual([{ name: 'tool', argv: ['部署', '--', '終'], env: { FAKE_UNICODE: '値🙂' } }]);
+    } finally { fakeBins.cleanup(); }
+  });
+
   test('whenArgsStartWith fakes only the matching subcommand and hands every other call to the real executable', () => {
     const realSh = Bun.which('sh');
     if (!realSh) throw new Error('sh unavailable');
@@ -55,6 +89,128 @@ describe('fake-bin', () => {
       expect(passed.stdout).toBe('real');
       expect(passed.stderr).toBe('');
       expect(fakeBins.calls().map((call) => call.argv)).toEqual([['-c', 'exit 7'], ['-c', 'printf real; exit 5']]);
+    } finally {
+      fakeBins.cleanup();
+    }
+  });
+
+  test('responses select output and exit status by argv prefix, then use the default for unmatched argv', () => {
+    const fakeBins = createFakeBins({
+      tool: {
+        stdout: 'default\n',
+        responses: [
+          { argsStartWith: ['auth', 'status'], stdout: 'logged-in\n', exitCode: 0 },
+          { argsStartWith: ['auth', 'login'], stderr: 'login denied\n', exitCode: 17 },
+        ],
+      },
+    });
+    try {
+      const status = spawnSync(fakeBins.bin('tool'), ['auth', 'status', '--json'], { encoding: 'utf8' });
+      const login = spawnSync(fakeBins.bin('tool'), ['auth', 'login'], { encoding: 'utf8' });
+      const other = spawnSync(fakeBins.bin('tool'), ['version'], { encoding: 'utf8' });
+      expect([status.status, status.stdout, status.stderr]).toEqual([0, 'logged-in\n', '']);
+      expect([login.status, login.stdout, login.stderr]).toEqual([17, '', 'login denied\n']);
+      expect([other.status, other.stdout, other.stderr]).toEqual([0, 'default\n', '']);
+      expect(fakeBins.calls().map((call) => call.argv)).toEqual([
+        ['auth', 'status', '--json'], ['auth', 'login'], ['version'],
+      ]);
+    } finally {
+      fakeBins.cleanup();
+    }
+  });
+
+  test('responses match argv prefixes beyond the ninth positional argument', () => {
+    const prefix = Array.from({ length: 10 }, (_, index) => `arg-${index + 1}`);
+    const fakeBins = createFakeBins({ tool: { responses: [{ argsStartWith: prefix, stdout: 'matched\n' }] } });
+    try {
+      const result = spawnSync(fakeBins.bin('tool'), [...prefix, 'tail'], { encoding: 'utf8' });
+      expect([result.status, result.stdout]).toEqual([0, 'matched\n']);
+      expect(fakeBins.calls()[0]?.argv).toEqual([...prefix, 'tail']);
+    } finally {
+      fakeBins.cleanup();
+    }
+  });
+
+  test('recordEnv captures delimiter, internal-name, empty, and absent values with each argv', () => {
+    const fakeBins = createFakeBins({ tool: { recordEnv: ['FAKE_PRESENT', 'FAKE_EMPTY', 'FAKE_ABSENT', 'rec', 'arg'] } });
+    try {
+      const env: Record<string, string | undefined> = { ...fakeBins.env, FAKE_PRESENT: 'left\u001eright', FAKE_EMPTY: '', rec: 'caller-value', arg: 'argv-loop-collision' };
+      delete env.FAKE_ABSENT;
+      const result = spawnSync(fakeBins.bin('tool'), ['inspect', 'two words'], { encoding: 'utf8', env });
+      const unsetArgEnv = { ...env };
+      delete unsetArgEnv.arg;
+      const unsetArgResult = spawnSync(fakeBins.bin('tool'), ['inspect', 'still has argv'], { encoding: 'utf8', env: unsetArgEnv });
+      expect(result.status).toBe(0);
+      expect(unsetArgResult.status).toBe(0);
+      expect(fakeBins.calls()).toEqual([
+        { name: 'tool', argv: ['inspect', 'two words'], env: { FAKE_PRESENT: 'left\u001eright', FAKE_EMPTY: '', FAKE_ABSENT: null, rec: 'caller-value', arg: 'argv-loop-collision' } },
+        { name: 'tool', argv: ['inspect', 'still has argv'], env: { FAKE_PRESENT: 'left\u001eright', FAKE_EMPTY: '', FAKE_ABSENT: null, rec: 'caller-value', arg: null } },
+      ]);
+    } finally {
+      fakeBins.cleanup();
+    }
+  });
+
+  test('long repeated argv and env values plus special and unset env names round-trip exactly', () => {
+    const repeatedArg = 'x'.repeat(16_384);
+    const repeatedEnv = 'z'.repeat(16_384);
+    const fakeBins = createFakeBins({ tool: { recordEnv: ['PWD', 'FAKE_UNSET_PWD', '__proto__', 'FAKE_LONG'] } });
+    try {
+      const env: Record<string, string | undefined> = { ...fakeBins.env, PWD: '/caller/pwd-value', FAKE_LONG: repeatedEnv };
+      delete env.FAKE_UNSET_PWD;
+      Object.defineProperty(env, '__proto__', { value: 'own-proto-value', enumerable: true, configurable: true, writable: true });
+      // Bun's spawnSync drops a `__proto__` env entry before execve. Route only
+      // this edge through Node so the test reaches the shim with the exact OS env.
+      const node = Bun.which('node');
+      if (!node) throw new Error('node unavailable for special environment key test');
+      const nodeSpawn = [
+        '-e',
+        'const { spawnSync } = require("node:child_process"); const env = JSON.parse(process.argv[1]); const result = spawnSync(process.argv[2], JSON.parse(process.argv[3]), { encoding: "utf8", env }); process.stdout.write(JSON.stringify({ status: result.status, signal: result.signal }));',
+      ];
+      const present = spawnSync(node, [...nodeSpawn, JSON.stringify(env), fakeBins.bin('tool'), JSON.stringify([repeatedArg, '--', 'after--'])], { encoding: 'utf8' });
+      const absentEnv = { ...env };
+      delete absentEnv.PWD;
+      const absent = spawnSync(node, [...nodeSpawn, JSON.stringify(absentEnv), fakeBins.bin('tool'), JSON.stringify(['unset-pwd'])], { encoding: 'utf8' });
+
+      expect(JSON.parse(present.stdout).status).toBe(0);
+      expect(JSON.parse(absent.stdout).status).toBe(0);
+      const [first, second] = fakeBins.calls();
+      expect(first?.argv).toEqual([repeatedArg, '--', 'after--']);
+      expect(first?.env?.PWD).toBe('/caller/pwd-value');
+      expect(first?.env?.FAKE_UNSET_PWD).toBeNull();
+      expect(first?.env?.FAKE_LONG).toBe(repeatedEnv);
+      expect(Object.hasOwn(first?.env ?? {}, '__proto__')).toBe(true);
+      expect(first?.env?.['__proto__']).toBe('own-proto-value');
+      expect(second?.env?.PWD).toBeNull();
+      expect(second?.env?.FAKE_UNSET_PWD).toBeNull();
+    } finally {
+      fakeBins.cleanup();
+    }
+  });
+
+  test('concurrent long argv and env records append as intact single JSON lines', async () => {
+    const fakeBins = createFakeBins({ tool: { recordEnv: ['FAKE_BULK'] } });
+    try {
+      const expected = new Map<string, string>();
+      const children = Array.from({ length: 12 }, (_, index) => {
+        const id = `call-${index}`;
+        const arg = `${id}:${'a'.repeat(16_384)}`;
+        const value = `${id}:${'b'.repeat(16_384)}`;
+        expected.set(id, value);
+        const env = { ...fakeBins.env, FAKE_BULK: value };
+        return spawn(fakeBins.bin('tool'), ['bulk', id, arg], { env, stdio: 'ignore' });
+      });
+      await Promise.all(children.map((child) => new Promise<void>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`fake child exit ${code}`)));
+      })));
+      const calls = fakeBins.calls();
+      expect(calls).toHaveLength(expected.size);
+      for (const call of calls) {
+        const id = call.argv[1]!;
+        expect(call.argv[2]).toBe(`${id}:${'a'.repeat(16_384)}`);
+        expect(call.env?.FAKE_BULK).toBe(expected.get(id));
+      }
     } finally {
       fakeBins.cleanup();
     }
@@ -80,6 +236,40 @@ describe('fake-bin', () => {
       slept.cleanup();
     }
     expect(() => createFakeBins({ tool: { killSignal: 'kill; rm' as 'KILL' } })).toThrow(/killSignal/);
+  });
+
+  test('large output is drained before sleep and signal termination', () => {
+    const payload = 'x'.repeat(256 * 1024);
+    const fakeBins = createFakeBins({
+      sleeper: { stdout: payload, sleepSeconds: 0.1 },
+      noisy: { stdout: payload, killSignal: 'TERM' },
+    });
+    try {
+      const sleeper = spawnSync(fakeBins.bin('sleeper'), [], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      expect([sleeper.status, sleeper.stdout]).toEqual([0, payload]);
+      const noisy = spawnSync(fakeBins.bin('noisy'), [], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      expect(noisy.signal).toBe('SIGTERM');
+      expect(noisy.stdout).toBe(payload);
+    } finally { fakeBins.cleanup(); }
+  });
+
+  test('delegation replaces the shim so forced termination cannot orphan the real executable', async () => {
+    const sh = Bun.which('sh');
+    if (!sh) throw new Error('sh unavailable');
+    const root = mkdtempSync(join(tmpdir(), 'fake-bin-delegate-'));
+    const marker = join(root, 'delegate-started');
+    const fakeBins = createFakeBins({ tool: { whenArgsStartWith: ['fake-only'], otherwise: sh } });
+    try {
+      const child = spawn(fakeBins.bin('tool'), ['-c', 'touch "$1"; exec sleep 30', 'sh', marker], { stdio: 'ignore' });
+      const deadline = Date.now() + 5_000;
+      while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(existsSync(marker)).toBe(true);
+      const exited = new Promise<void>((resolve) => child.once('close', () => resolve()));
+      child.kill('SIGKILL');
+      await exited;
+      expect(child.signalCode).toBe('SIGKILL');
+      expect(() => process.kill(child.pid!, 0)).toThrow();
+    } finally { fakeBins.cleanup(); rmSync(root, { recursive: true, force: true }); }
   });
 
   test('whenArgsStartWith needs an absolute otherwise executable, and otherwise needs a match', () => {

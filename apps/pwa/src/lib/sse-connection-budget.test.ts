@@ -14,8 +14,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import { DaemonClient } from './daemon-client';
-
-const realFetch = globalThis.fetch;
+import { withFakeFetchDevice } from '../test-devices/fake-fetch';
 
 /** SSE 프레임을 흘려 주는 가짜 응답. `close()` 로 스트림을 닫는다. */
 function sseResponse(frames: string[]): Response {
@@ -35,12 +34,7 @@ function frame(kind: string, detail: Record<string, unknown>): string {
 
 describe('채팅 피드백 SSE — 연결 «하나»로 두 토픽', () => {
   it('⛔ fetch 를 «한 번»만 하고, 그 URL 이 두 토픽을 다 요구한다', async () => {
-    const urls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      urls.push(String(input));
-      return sseResponse([]);
-    }) as unknown as typeof fetch;
-    try {
+    await withFakeFetchDevice([{ url: '/v1/events', response: () => sseResponse([]) }], async (device) => {
       const client = new DaemonClient({ baseUrl: 'http://localhost:31415', token: 't', provider: 'x' });
       const off = client.subscribeChatFeedbackEvents('sess-1', {
         agentStatus: { onFeedback: () => {} },
@@ -48,23 +42,19 @@ describe('채팅 피드백 SSE — 연결 «하나»로 두 토픽', () => {
       });
       await new Promise((r) => setTimeout(r, 30));
       off();
-    } finally {
-      globalThis.fetch = realFetch;
-    }
+      expect(device.calls()).toHaveLength(1);
+      expect(device.calls()[0]!.url).toContain('topics=agent.status,hud.segment');
+    });
     // 🔑 여기가 이 자의 전부다 — 둘로 열면 슬롯을 둘 먹는다.
-    expect(urls).toHaveLength(1);
-    // ⚠️ 콤마는 인코딩되지 않는다(쿼리에서 합법) — 실측한 «그대로» 문다.
-    expect(urls[0]).toContain('topics=agent.status,hud.segment');
   });
 
   it('⭐ 한 연결의 프레임이 «두 소비자»에게 다 간다 — tee 가 실제로 갈라진다', async () => {
-    globalThis.fetch = (async () => sseResponse([
-      frame('agent.status', { agentId: 'a1', status: 'working', updatedAt: 2 }),
-      frame('hud.segment', { key: 'k1', value: 'v1', phase: 'update' }),
-    ])) as unknown as typeof fetch;
     const statusKinds: string[] = [];
     const hudKinds: string[] = [];
-    try {
+    await withFakeFetchDevice([{ url: '/v1/events', response: () => sseResponse([
+      frame('agent.status', { agentId: 'a1', status: 'working', updatedAt: 2 }),
+      frame('hud.segment', { key: 'k1', value: 'v1', phase: 'update' }),
+    ]) }], async () => {
       const client = new DaemonClient({ baseUrl: 'http://localhost:31415', token: 't', provider: 'x' });
       const off = client.subscribeChatFeedbackEvents('sess-2', {
         agentStatus: { onFeedback: (env) => statusKinds.push(env.kind) },
@@ -72,18 +62,15 @@ describe('채팅 피드백 SSE — 연결 «하나»로 두 토픽', () => {
       });
       await new Promise((r) => setTimeout(r, 60));
       off();
-    } finally {
-      globalThis.fetch = realFetch;
-    }
+    });
     // ⛔ 한쪽만 오면 tee 가 아니라 «한 소비자가 스트림을 다 먹은» 것이다.
     expect(statusKinds).toEqual(['agent.status']);
     expect(hudKinds).toEqual(['hud.segment']);
   });
 
   it('⛔ 실패하면 «두 소비자 다» 알게 한다 — 한쪽만 알리면 다른 쪽은 영영 기다린다', async () => {
-    globalThis.fetch = (async () => new Response('nope', { status: 500 })) as unknown as typeof fetch;
     const errs: string[] = [];
-    try {
+    await withFakeFetchDevice([{ url: '/v1/events', response: () => new Response('nope', { status: 500 }) }], async () => {
       const client = new DaemonClient({ baseUrl: 'http://localhost:31415', token: 't', provider: 'x' });
       const off = client.subscribeChatFeedbackEvents('sess-3', {
         agentStatus: { onFeedback: () => {}, onError: (i) => errs.push(i.error) },
@@ -91,9 +78,7 @@ describe('채팅 피드백 SSE — 연결 «하나»로 두 토픽', () => {
       });
       await new Promise((r) => setTimeout(r, 40));
       off();
-    } finally {
-      globalThis.fetch = realFetch;
-    }
+    });
     expect(errs.sort()).toEqual(['agent_status_failed', 'hud_segment_failed']);
   });
 });

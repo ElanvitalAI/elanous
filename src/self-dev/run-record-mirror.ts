@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from '
 import { join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
-import type { SelfDevRunState } from './run-store.js';
+import type { SelfDevRunState } from './run-store-contract.js';
 
 export function mirrorDir(): string {
   return join(releaseLedgerRoot(), 'self-dev-runs');

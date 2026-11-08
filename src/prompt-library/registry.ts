@@ -1,6 +1,6 @@
 import { readFileSync } from 'fs';
 import { getModelFamily } from '../models/prompts.js';
-import type { ChatSystemPromptConfig } from '../user-config.js';
+import type { ChatSystemPromptConfig } from '../user-config/chat.js';
 import { ANTHROPIC_CHAT_VARIANT } from './providers/anthropic.js';
 import { CODEX_CHAT_VARIANT } from './providers/codex.js';
 import { GEMINI_CHAT_VARIANT } from './providers/gemini.js';

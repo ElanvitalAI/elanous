@@ -18,6 +18,7 @@ import {
   type DevPipelineSpec, type ResolvedDevPlan, type DevPipelineDeps, type DevChatOpts,
   type DevElanousTuiOpts, type DevDispatch } from './dev-pipeline.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import type { AgentBackend, AgentMissionResult } from '../agent-mission/driver.js';
 import { runSelfImplement, type SelfImplementResult, type SelfImplementSeams, type SelfImplementOptions } from '../self-implement/orchestrator.js';
 import type { SelfDevJobResult } from './orchestrate.js';
@@ -3183,20 +3184,21 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
 
   it('GLM alias를 role source와 무관하게 canonical OpenRouter ID로 review에 전달한다', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'dev-pipeline-review-provider-pin-'));
-    const originalFetch = globalThis.fetch;
     const originalOpenRouterKey = process.env.OPENROUTER_API_KEY;
     const requests: Array<{ url: string; model: string }> = [];
     try {
       process.env.OPENROUTER_API_KEY = 'test-review-openrouter-key';
-      globalThis.fetch = (async (input, init) => {
-        const url = String(input);
-        const body = JSON.parse(String(init?.body)) as { model: string };
-        requests.push({ url, model: body.model });
-        return new Response('data: {"choices":[{"delta":{"content":"VERDICT: PASS"}}]}\n\ndata: [DONE]\n\n', {
-          status: 200, headers: { 'content-type': 'text/event-stream' },
-        });
-      }) as typeof fetch;
       writeFileSync(join(repo, 'changed.ts'), 'export const changed = true;\n');
+      await withFakeFetchDevice([{
+        url: 'https://openrouter.ai/api/v1/chat/completions', method: 'POST',
+        response: (request) => {
+          const body = JSON.parse(request.body ?? '{}') as { model: string };
+          requests.push({ url: request.url, model: body.model });
+          return new Response('data: {"choices":[{"delta":{"content":"VERDICT: PASS"}}]}\n\ndata: [DONE]\n\n', {
+            status: 200, headers: { 'content-type': 'text/event-stream' },
+          });
+        },
+      }], async (device) => {
       for (const variant of [
         { provider: 'glm', model: 'glm-5.3' },
         { provider: 'openrouter', model: 'z-ai/glm-5.3' },
@@ -3218,8 +3220,10 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
         expect(review.reviewed).toBe(true);
         expect(requests).toEqual([{ url: 'https://openrouter.ai/api/v1/chat/completions', model: 'z-ai/glm-5.3' }]);
       }
+      expect(device.calls()).toHaveLength(4);
+      expect(device.calls().every(call => call.routeId === 'route-1' && call.status === 200)).toBe(true);
+      });
     } finally {
-      globalThis.fetch = originalFetch;
       if (originalOpenRouterKey === undefined) delete process.env.OPENROUTER_API_KEY;
       else process.env.OPENROUTER_API_KEY = originalOpenRouterKey;
       setUserConfigOverlay(null);

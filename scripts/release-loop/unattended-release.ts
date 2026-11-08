@@ -19,9 +19,23 @@ import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
 import { readReleaseGateRehearsal, readReleaseOpsPolicy, selectReleaseGateMethod } from './gate-method.js';
 import { createMacrophageRuntime } from '../../src/release-loop/macrophage-heal-node.js';
 import { createMacrophageSafeCleanup } from '../../src/release-loop/macrophage-safe-cleanup.js';
+import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
+import { runRlaScorecardReportCli } from './rla-event-response-scorecard-report.js';
 
 const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+const RLA_SCORECARD_KNOWHOW_PACK = join(import.meta.dir, '../../scenarios/ux-sim/knowhow-pack-release-heal-1107.md');
+const RLA_SCORECARD_SIM_RIG = join(import.meta.dir, '../../scenarios/ux-sim/release-sim-rig.yaml');
+
+function refreshRlaScorecardForCompletedRun(runId: string, stateRoot: string): void {
+  const path = runRlaScorecardReportCli([
+    '--run-id', runId,
+    '--knowledge-pack', RLA_SCORECARD_KNOWHOW_PACK,
+    '--release-sim-rig', RLA_SCORECARD_SIM_RIG,
+    '--state-root', stateRoot,
+  ]);
+  debug.log('release.run', 'rla-scorecard-refreshed', { runId, path });
+}
 
 export interface ReleaseLoopConfig {
   /** Mid-cycle full-gate rehearsal, hours before cut (default 12; 0 disables). */
@@ -45,9 +59,15 @@ export interface ReleaseLoopConfig {
   gateRemoteMirror?: string;
   /** RELEASE-PWA-NODE-RESILIENCE ① — SSH host the `pwa` node runs its scenario suite on (e.g. `node-b`); absent = this machine. No fallback. */
   pwaRemote?: string;
+  /** RELEASE-EXPORT-CHECK-REMOTE — non-gate SSH host for the public export + PWA build check (aws1/gcp2; default aws1). */
+  exportCheckRemote?: 'aws1' | 'gcp2';
   opsHosts?: string[];
   internalDist?: string;
   opsRestart?: boolean;
+  /** An active OP traffic hold forces human approval before the irreversible publish node. */
+  trafficHold?: boolean;
+  /** Any non-empty OP marker forces the run through approve-publish, even if metrics pass. */
+  opApprovalMarker?: string;
 }
 
 export interface ReleaseRunInput extends ReleaseLoopConfig {
@@ -65,6 +85,8 @@ export interface ReleaseRunInput extends ReleaseLoopConfig {
   publishAt?: string;
   /** RELEASE-BRANCH: version-release cuts release/<v> from main HEAD and bumps only the branch. */
   branchCut?: boolean;
+  /** MACRO-PREFLIGHT-CLI-FRESH: exact main commit checked by the CLI before graph launch. */
+  branchCutBaseCommit?: string;
 }
 
 export interface UnattendedReleaseDeps {
@@ -72,11 +94,14 @@ export interface UnattendedReleaseDeps {
   config?: ReleaseLoopConfig;
   configPath?: string;
   policyPath?: string;
-  graph?: (path: string, options: { input: ReleaseRunInput; pinChildUniverse?: boolean; deps?: { root?: string } }) => Promise<GraphRunState>;
+  graph?: (path: string, options: { runId: string; input: ReleaseRunInput; pinChildUniverse?: boolean; deps?: { root?: string } }) => Promise<GraphRunState>;
+  registerLogSink?: (surface: string) => Promise<boolean>;
   checklist?: (version: string) => Pick<ReturnType<typeof cutChecklistGate>, 'ok' | 'red' | 'undecided' | 'blocked'>;
   freezeRoot?: string;
   /** Names already taken for prerelease numbering (remote release branches and tags). */
   releaseRefs?: (base: string, kind: PrereleaseKind) => string[];
+  /** Test seam for verifying scorecard reporting is advisory after graph completion. */
+  refreshScorecard?: (runId: string, stateRoot: string) => void;
 }
 
 /** Remote `release/<base>-<kind>.*` branches and `v<base>-<kind>.*` tags — read-only. */
@@ -158,7 +183,7 @@ export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDep
 
 /** Fail closed at the entry boundary, before any graph node can change a release. */
 export async function runUnattendedRelease(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; branchCutBaseCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
   deps: UnattendedReleaseDeps = {},
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // A dry run only builds the input and mutates nothing, so it neither creates nor waits on the OP-seat lock.
@@ -169,7 +194,7 @@ export async function runUnattendedRelease(
 }
 
 async function runUnattendedReleaseLocked(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; branchCutBaseCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
   deps: UnattendedReleaseDeps,
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // RELEASE-BRANCH (10-06): the default cut is a release branch, so main keeps landing and the run no longer needs a
@@ -194,6 +219,7 @@ async function runUnattendedReleaseLocked(
   }
   if (opts.forceFreeze) input.forceFreeze = true;
   if (branchCut) input.branchCut = true;
+  if (branchCut && opts.branchCutBaseCommit !== undefined) input.branchCutBaseCommit = opts.branchCutBaseCommit;
   debug.log('release.run', 'input', { version, requested: opts.version, branchCut, prerelease: opts.prerelease ?? null, dryRun: opts.dryRun === true,
     ...(input.gateExecutor ? { gateExecutor: input.gateExecutor, gateHost: input.gateExecutor === 'host' ? input.gateRemote ?? null : null } : {}) });
   if (opts.dryRun) return { input, dryRun: true };
@@ -213,8 +239,9 @@ async function runUnattendedReleaseLocked(
   // resume that began after CLI preflight cannot slip between the ledger scan and graph start.
   if (!opts.forceNew && findActiveReleaseRun(version, root)) throw new ReleaseRunClaimConflict();
   const runId = randomUUID();
+  await (deps.registerLogSink ?? registerStandaloneLogSink)('release-loop');
   const safeCleanup = createMacrophageSafeCleanup({ repoRoot: process.cwd() });
-  const macrophage = createMacrophageRuntime({ runId, inventory: () => safeCleanup.inventory(), liveCleanup: safeCleanup.cleanup });
+  const macrophage = createMacrophageRuntime({ runId, root, inventory: () => safeCleanup.inventory(), liveCleanup: safeCleanup.cleanup });
   let state: GraphRunState;
   try { state = await (deps.graph ?? runGraph)(GRAPH, { runId, input, pinChildUniverse: true, eventBus: macrophage.eventBus, deps: { root } }); }
   finally { macrophage.dispose(); }
@@ -225,6 +252,13 @@ async function runUnattendedReleaseLocked(
       && isLandingFreezeRefusal(`${typeof node.output === 'string' ? node.output : JSON.stringify(node.output ?? '')} ${node.error ?? ''}`));
     const during = refused ? readLandingFreeze(deps.freezeRoot) : null;
     if (refused) throw new LandingFrozenError(during ?? { reason: 'frozen during the run', startedAt: new Date().toISOString(), until: null, by: 'release-run' });
+  }
+  if (state.status === 'done') {
+    try {
+      (deps.refreshScorecard ?? refreshRlaScorecardForCompletedRun)(runId, root);
+    } catch (error) {
+      debug.log('release.run', 'rla-scorecard-refresh-failed', { runId, version, error: error instanceof Error ? error.message : String(error) });
+    }
   }
   return { input, dryRun: false, state };
 }

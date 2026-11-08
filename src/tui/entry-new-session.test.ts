@@ -52,11 +52,11 @@ describe('/new command shape', () => {
 });
 
 describe('requestNewTuiSession', () => {
-  test('idle: creates a tui session, makes it active, keeps the old history, and logs from→to', () => {
+  test('idle: creates a tui session, makes it active, keeps the old history, and logs from→to', async () => {
     const from = seedTwoTurnSession();
     const log = spyOn(debug, 'log');
     try {
-      const result = requestNewTuiSession({ busy: false, from });
+      const result = await requestNewTuiSession({ busy: false, from });
       expect(result.kind).toBe('started');
       if (result.kind !== 'started') return;
       expect(result.id).not.toBe(from);
@@ -71,20 +71,20 @@ describe('requestNewTuiSession', () => {
     }
   });
 
-  test('idle with no prior session still starts one and says so', () => {
-    const result = requestNewTuiSession({ busy: false, from: null });
+  test('idle with no prior session still starts one and says so', async () => {
+    const result = await requestNewTuiSession({ busy: false, from: null });
     expect(result.kind).toBe('started');
     if (result.kind !== 'started') return;
     expect(getActiveSessionId()).toBe(result.id);
     expect(result.status).toBe('새 대화 · 이전 = 없음');
   });
 
-  test('busy: refuses without creating a session or moving the active marker', () => {
+  test('busy: refuses without creating a session or moving the active marker', async () => {
     const from = seedTwoTurnSession();
     const before = listSessions().length;
     const log = spyOn(debug, 'log');
     try {
-      const result = requestNewTuiSession({ busy: true, from });
+      const result = await requestNewTuiSession({ busy: true, from });
       expect(result).toEqual({ kind: 'rejected', status: NEW_SESSION_BUSY_STATUS });
       expect(listSessions().length).toBe(before);
       expect(getActiveSessionId()).toBe(from);

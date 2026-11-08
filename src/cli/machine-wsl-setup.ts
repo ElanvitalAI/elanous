@@ -6,6 +6,7 @@ import { buildMachineSetupPlan, type MachineSetupPlan } from './machine-setup-pl
 export interface MachineWslCommandResult {
   readonly status: number | null;
   readonly stdout?: string;
+  readonly stderr?: string;
   readonly errorCode?: string;
 }
 
@@ -24,6 +25,7 @@ export interface MachineWslSetupDeps {
   readonly run?: (command: string, args: readonly string[], captureOutput?: boolean) => MachineWslCommandResult;
   readonly platform?: string;
   readonly env?: NodeJS.ProcessEnv;
+  readonly stdinIsTTY?: boolean;
   readonly executable?: string;
   readonly entry?: string;
   readonly scheduleResume?: (commandLine: string) => MachineWslCommandResult;
@@ -35,13 +37,13 @@ const RUN_ONCE_VALUE = 'ElanousMachineSetup';
 function run(command: string, args: readonly string[], captureOutput = false): MachineWslCommandResult {
   const result = spawnSync(command, [...args], {
     encoding: 'utf8', timeout: 15 * 60_000, windowsHide: true,
-    stdio: captureOutput ? ['inherit', 'pipe', 'inherit'] : ['inherit', 'ignore', 'inherit'],
+    stdio: captureOutput ? ['inherit', 'pipe', 'pipe'] : ['inherit', 'inherit', 'inherit'],
   });
   if (result.error) {
     const errorCode = (result.error as NodeJS.ErrnoException).code;
-    return { status: null, ...(errorCode ? { errorCode } : {}) };
+    return { status: null, ...(captureOutput ? { stdout: result.stdout ?? '', stderr: result.stderr ?? '' } : {}), ...(errorCode ? { errorCode } : {}) };
   }
-  return { status: result.status, ...(captureOutput ? { stdout: result.stdout ?? '' } : {}) };
+  return { status: result.status, ...(captureOutput ? { stdout: result.stdout ?? '', stderr: result.stderr ?? '' } : {}) };
 }
 
 export function runMachineWslCommand(command: string, args: readonly string[], captureOutput = false): MachineWslCommandResult {
@@ -78,10 +80,34 @@ function validWslUser(value: string): boolean {
   return /^[a-z_][a-z0-9_-]{0,31}$/.test(value);
 }
 
-function fail(distribution: string, user: string, operation: string, result: MachineWslCommandResult): MachineWslSetupResult {
-  const reason = result.status === null && result.errorCode ? `command unavailable (${result.errorCode})` : `exit ${result.status ?? 'unknown'}`;
+function fail(distribution: string, user: string, operation: string, result: MachineWslCommandResult, attempted: number,
+  reasonOverride?: string): MachineWslSetupResult {
+  const diagnostic = [result.stderr, result.stdout].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().slice(0, 600);
+  const reason = reasonOverride ?? (diagnostic.includes('HCS_E_HYPERV_NOT_INSTALLED')
+    ? `WSL2 virtualization unavailable: ${diagnostic}`
+    : result.status === null && result.errorCode
+      ? `command unavailable (${result.errorCode})${diagnostic ? `: ${diagnostic}` : ''}`
+      : `exit ${result.status ?? 'unknown'}${diagnostic ? `: ${diagnostic}` : ''}`);
   return { kind: 'machine-wsl-setup-result', status: 'failed', distribution, user, detail: operation,
-    attempted: 1, failures: [{ operation, reason }] };
+    attempted, failures: [{ operation, reason }] };
+}
+
+function confirmsMissingWslUser(result: MachineWslCommandResult, user: string): boolean {
+  const escapedUser = user.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const diagnostic = new RegExp(`^\\s*id:\\s*['"]?${escapedUser}['"]?:\\s*(?:no such user|unknown user)\\b`, 'i');
+  return [result.stderr, result.stdout].some(value => value?.split(/\r?\n/)
+    .some(line => diagnostic.test(line.replace(/[‘’]/g, "'"))));
+}
+
+function parseWslVersionList(output: string, distribution: string): number | null {
+  for (const row of output.replaceAll('\0', '').split(/\r?\n/)) {
+    const line = row.trim().replace(/^\*\s*/, '');
+    const fields = line.split(/\s+/);
+    if (fields.length < 3 || !/^[12]$/.test(fields.at(-1) ?? '')) continue;
+    const name = fields.slice(0, -2).join(' ');
+    if (name.toLowerCase() === distribution.toLowerCase()) return Number(fields.at(-1));
+  }
+  return null;
 }
 
 export function setWslConfiguration(original: string, user: string): string {
@@ -136,56 +162,56 @@ export function applyMachineWslBootstrap(input: {
     if (!entry) throw new Error('cannot register WSL resume because the Elanous entry path is unavailable');
     const resumeCommand = buildMachineWslResumeCommand({ executable, entry, capture: input.capture,
       profile: input.profile, distribution, user });
+    attempted += 1;
     const scheduled = (deps.scheduleResume ?? registerMachineWslRunOnce)(resumeCommand);
-    if (scheduled.status !== 0) return fail(distribution, user, 'register-resume', scheduled);
-    const installed = invoke('wsl.exe', ['--install', '--distribution', distribution, '--no-launch']);
-    if (installed.status !== 0) return fail(distribution, user, 'wsl-install', installed);
+    if (scheduled.status !== 0) return fail(distribution, user, 'register-resume', scheduled, attempted);
+    const installed = invoke('wsl.exe', ['--install', '--distribution', distribution, '--no-launch'], true);
+    if (installed.status !== 0) return fail(distribution, user, 'wsl-install', installed, attempted);
     return { kind: 'machine-wsl-setup-result', status: 'resume-pending', distribution, user,
-      detail: 'WSL install requested; sign in after reboot to resume systemd and profile setup', attempted: 1, failures: [] };
+      detail: `WSL install requested; reboot, then sign in or run this resume command over SSH: ${resumeCommand}`,
+      attempted, failures: [] };
   }
 
-  const rows = invoke('wsl.exe', ['--list', '--quiet'], true);
-  const installedDistributions = (rows.stdout ?? '').replaceAll('\0', '').split(/\r?\n/).map(value => value.trim()).filter(Boolean);
-  if (rows.status !== 0 || !installedDistributions.some(value => value.toLowerCase() === distribution.toLowerCase())) {
-    const executable = deps.executable ?? process.execPath;
-    const entry = deps.entry ?? process.argv[1];
-    if (!entry) throw new Error('cannot re-register WSL resume because the Elanous entry path is unavailable');
-    const resumeCommand = buildMachineWslResumeCommand({ executable, entry, capture: input.capture,
-      profile: input.profile, distribution, user });
-    const scheduled = (deps.scheduleResume ?? registerMachineWslRunOnce)(resumeCommand);
-    if (scheduled.status !== 0) return fail(distribution, user, 'register-resume', scheduled);
-    const installed = invoke('wsl.exe', ['--install', '--distribution', distribution, '--no-launch']);
-    if (installed.status !== 0) return fail(distribution, user, 'wsl-install', installed);
-    return { kind: 'machine-wsl-setup-result', status: 'resume-pending', distribution, user,
-      detail: 'distribution is not initialized yet; install requested and resume re-registered', attempted: 1, failures: [] };
-  }
+  const rows = invoke('wsl.exe', ['--list', '--verbose'], true);
+  if (rows.status !== 0) return fail(distribution, user, 'list-distributions', rows, attempted);
+  const wslVersion = parseWslVersionList(rows.stdout ?? '', distribution);
+  if (wslVersion === null) return fail(distribution, user, 'verify-wsl2', rows, attempted,
+    `WSL distribution ${distribution} is absent or its version is unknown; automatic reinstall is stopped to avoid a resume loop`);
+  if (wslVersion !== 2) return fail(distribution, user, 'verify-wsl2', rows, attempted,
+    `WSL 2 is required for systemd; ${distribution} is WSL ${wslVersion}. Enable virtualization and install/convert this distribution to WSL 2 before resuming`);
 
   const guest = (args: readonly string[], captureOutput = false) => invoke('wsl.exe', ['--distribution', distribution, '--user', 'root', '--exec', ...args], captureOutput);
   const account = guest(['/usr/bin/id', '-u', user], true);
   if (account.status !== 0) {
-    const created = guest(['/usr/sbin/useradd', '--create-home', '--shell', '/bin/bash', user]);
-    if (created.status !== 0) return fail(distribution, user, 'create-user', created);
+    if (!confirmsMissingWslUser(account, user)) return fail(distribution, user, 'start-distribution', account, attempted);
+    const created = guest(['/usr/sbin/useradd', '--create-home', '--shell', '/bin/bash', user], true);
+    if (created.status !== 0) return fail(distribution, user, 'create-user', created, attempted);
   }
   const passwordState = guest(['/usr/bin/passwd', '-S', user], true);
   const passwordIsSet = /(?:^|\s)P(?:\s|$)/.test(passwordState.stdout ?? '');
-  if (passwordState.status !== 0 || !passwordIsSet) {
+  if (passwordState.status !== 0) return fail(distribution, user, 'check-user-password', passwordState, attempted);
+  if (!passwordIsSet) {
+    if (!(deps.stdinIsTTY ?? Boolean(process.stdin.isTTY))) {
+      return fail(distribution, user, 'set-user-password', { status: null, errorCode: 'INTERACTIVE_TERMINAL_REQUIRED' }, attempted,
+        'password is not set and this session has no interactive terminal; sign in locally and rerun resume to set it');
+    }
     const passwd = guest(['/usr/bin/passwd', user]);
-    if (passwd.status !== 0) return fail(distribution, user, 'set-user-password', passwd);
+    if (passwd.status !== 0) return fail(distribution, user, 'set-user-password', passwd, attempted);
   }
   const sudo = guest(['/usr/sbin/usermod', '--append', '--groups', 'sudo', user]);
-  if (sudo.status !== 0) return fail(distribution, user, 'grant-sudo-group', sudo);
+  if (sudo.status !== 0) return fail(distribution, user, 'grant-sudo-group', sudo, attempted);
   const original = guest(['/bin/sh', '-lc', 'if [ ! -e /etc/wsl.conf ]; then printf "__ELANOUS_WSL_CONF_MISSING__"; else cat /etc/wsl.conf; fi'], true);
-  if (original.status !== 0) return fail(distribution, user, 'read-wsl-configuration', original);
+  if (original.status !== 0) return fail(distribution, user, 'read-wsl-configuration', original, attempted);
   const existingConfig = original.stdout === '__ELANOUS_WSL_CONF_MISSING__' ? '' : original.stdout ?? '';
   const config = setWslConfiguration(existingConfig, user);
   const encoded = Buffer.from(config, 'utf8').toString('base64');
   const wrote = guest(['/bin/sh', '-lc', `printf '%s' '${encoded}' | /usr/bin/base64 --decode > /etc/wsl.conf`]);
-  if (wrote.status !== 0) return fail(distribution, user, 'configure-systemd', wrote);
+  if (wrote.status !== 0) return fail(distribution, user, 'configure-systemd', wrote, attempted);
   const stopped = invoke('wsl.exe', ['--terminate', distribution]);
-  if (stopped.status !== 0) return fail(distribution, user, 'restart-wsl-for-systemd', stopped);
+  if (stopped.status !== 0) return fail(distribution, user, 'restart-wsl-for-systemd', stopped, attempted);
   const ready = invoke('wsl.exe', ['--distribution', distribution, '--user', user, '--exec', '/usr/bin/systemctl', 'is-system-running'], true);
   const systemdState = (ready.stdout ?? '').trim();
-  if (ready.status !== 0 && !['degraded', 'starting'].includes(systemdState)) return fail(distribution, user, 'verify-systemd', ready);
+  if (ready.status !== 0 && !['degraded', 'starting'].includes(systemdState)) return fail(distribution, user, 'verify-systemd', ready, attempted);
   return { kind: 'machine-wsl-setup-result', status: 'complete', distribution, user,
     detail: `WSL account and systemd are ready after ${attempted} commands; selected profile follows`, attempted, failures: [] };
 }

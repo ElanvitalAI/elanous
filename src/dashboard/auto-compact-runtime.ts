@@ -2,7 +2,7 @@ import type { LLMMessage } from '../llm.js';
 import type { ChatMessage } from '../chat/index.js';
 import type { CompactPipelineResult } from '../compact/types.js';
 import type { CompactProvider } from '../compact/provider.js';
-import type { ChatCompactConfig, ChatAutoCompactConfig } from '../user-config.js';
+import type { ChatCompactConfig, ChatAutoCompactConfig } from '../user-config/chat.js';
 
 export interface DashboardAutoCompactDecision {
   fire: boolean;

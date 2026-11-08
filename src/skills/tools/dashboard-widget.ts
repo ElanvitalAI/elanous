@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tools: DashboardWidgetList + DashboardWidgetToggle +
 // DashboardPaneFocus — T6-K5.
 //
@@ -14,7 +15,7 @@
 //
 // The dashboard wires these to widgetHost + workingDir.focus.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 export interface WidgetInfo {
   id: string;

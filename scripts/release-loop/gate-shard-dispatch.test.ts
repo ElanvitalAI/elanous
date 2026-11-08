@@ -105,9 +105,29 @@ test('GATE-G runtime and tested blobs key same-cut repair reuse and changed-key 
   expect(missingFileHashes.every((action) => action.kind === 'run')).toBe(true);
   expect(missingFileHashes[0]?.reason).toBe('tested-file-identity-unmeasured');
   const failedReceipt = receipts.map((receipt) => receipt.id === 'pod-0' ? { ...receipt, failureIds: ['src/a.test.ts > fail'] } : receipt);
-  const failedReceiptPlan = planGateShardDispatch({ ...common, head40: priorCommit, receipts: failedReceipt });
-  expect(failedReceiptPlan.map((action) => action.kind)).toEqual(['run', 'run', 'reuse']);
-  expect(failedReceiptPlan[0]?.reason).toBe('receipt-unavailable');
+  const sameHeadBaselineFailures = ['src/a.test.ts > fail', 'src/b.test.ts > failed before repair'];
+  const failedReceiptPlan = planGateShardDispatch({ ...common, head40: priorCommit, receipts: failedReceipt,
+    sameHeadPreexistingFailureIds: sameHeadBaselineFailures });
+  expect(failedReceiptPlan.map((action) => action.kind)).toEqual(['reuse', 'reuse', 'reuse']);
+  expect(failedReceiptPlan[0]?.reason).toContain('unchanged-radius-from-');
+  const malformedBaseline = planGateShardDispatch({ ...common, head40: priorCommit, receipts: failedReceipt,
+    sameHeadPreexistingFailureIds: { invalid: true } as unknown as string[] });
+  expect(malformedBaseline[0]?.kind).toBe('run');
+  expect(malformedBaseline[0]?.reason).toBe('baseline-failure-identity-mismatch');
+  const introducedFailurePlan = planGateShardDispatch({ ...common, head40: priorCommit, receipts: failedReceipt,
+    sameHeadPreexistingFailureIds: ['src/a.test.ts > old baseline failure', 'src/b.test.ts > failed before repair'] });
+  expect(introducedFailurePlan.map((action) => action.kind)).toEqual(['run', 'reuse', 'reuse']);
+  expect(introducedFailurePlan[0]?.reason).toBe('baseline-failure-identity-mismatch');
+
+  const sameHeadHashDrift = planGateShardDispatch({ ...common, head40: priorCommit,
+    sameHeadPreexistingFailureIds: ['src/b.test.ts > failed before repair'],
+    testedFileHashesByShard: { ...hashes, 'pod-0': { 'src/a.test.ts': '9'.repeat(64) } } });
+  expect(sameHeadHashDrift.map((action) => action.kind)).toEqual(['run', 'reuse', 'reuse']);
+  expect(sameHeadHashDrift[0]?.reason).toBe('tested-file-content-mismatch');
+  const changedHeadHashDrift = planGateShardDispatch({ ...common, head40: repairCommit,
+    radiusUnchangedShardIds: shards.map((shard) => shard.id),
+    testedFileHashesByShard: { ...hashes, 'pod-0': { 'src/a.test.ts': '9'.repeat(64) } } });
+  expect(changedHeadHashDrift.map((action) => action.kind)).toEqual(['run', 'run', 'reuse']);
 });
 
 test('receipt radius carries untouched shards across an appended test file and schedules the addition', () => {

@@ -12,6 +12,7 @@ import { acquireLockSync } from '../../../storage/file-lock.js';
 import { SECRETS_VERSION, type SecretsFile } from '../types.js';
 import { secretsPath } from '../paths.js';
 import { assertSharedSecretId, isAppSecretId, type SecretBackend, type SecretBackendAvailability, type SyncReadableBackend } from './types.js';
+import { assertCredentialSlotId } from './cred-slot-schema.js';
 import { appSecretId, appSecretIdForExistingApp, appSecretLockKeyForLegacyId, beginAppSecretEvent, createAppSecretEvent, finishAppSecretEvent, hasAppSecretEventForId, hasCommittedAppSecretRevoke, recoverAppSecretEvents, syncAppSecretLedgerDurability, withAppSecretLock, withAppSecretLockSync } from './app-secret-ledger.js';
 
 function defaultSecrets(): SecretsFile {
@@ -28,7 +29,12 @@ function readSecretsFile(): SecretsFile {
       || Array.isArray(parsed.secrets) || Object.values(parsed.secrets).some(value => typeof value !== 'string')) {
       throw new Error('invalid secrets file version or contents');
     }
-    return { version: SECRETS_VERSION, secrets: parsed.secrets };
+    const receipts = (parsed as Partial<SecretsFile>).credentialRegistrationReceipts;
+    if (receipts !== undefined && (!receipts || typeof receipts !== 'object' || Array.isArray(receipts)
+      || Object.entries(receipts).some(([id, valueHash]) => !/^[a-f0-9]{64}$/.test(id) || typeof valueHash !== 'string' || !/^[a-f0-9]{64}$/.test(valueHash)))) {
+      throw new Error('invalid credential registration receipts');
+    }
+    return { version: SECRETS_VERSION, secrets: parsed.secrets, ...(receipts ? { credentialRegistrationReceipts: receipts } : {}) };
   } catch (error) {
     throw new Error(`cannot read secrets file at ${path}`, { cause: error });
   }
@@ -166,6 +172,20 @@ export function writeSecretsFileRaw(s: SecretsFile): void {
   mkdirSync(dirname(path), { recursive: true });
   const release = acquireLockSync(`${path}.lock`);
   try {
+    let current: Record<string, string>;
+    try {
+      current = readSecretsFile().secrets;
+    } catch (error) {
+      // Keep the explicit raw recovery path for a corrupt file when no
+      // app-secret ledger exists; managed values must still fail closed.
+      if (existsSync(join(dirname(path), 'app-secret-ledger.json'))) throw error;
+      current = {};
+    }
+    const currentCredentialSlots = Object.fromEntries(Object.entries(current).filter(([id]) => id.startsWith('cred:')).sort(([a], [b]) => a.localeCompare(b)));
+    const nextCredentialSlots = Object.fromEntries(Object.entries(s.secrets).filter(([id]) => id.startsWith('cred:')).sort(([a], [b]) => a.localeCompare(b)));
+    if (JSON.stringify(currentCredentialSlots) !== JSON.stringify(nextCredentialSlots)) {
+      throw new Error('ELANOUS_CREDENTIAL_SLOT_WRITER_REQUIRED');
+    }
     let existingAppSecrets: Record<string, string>;
     try {
       existingAppSecrets = Object.fromEntries(Object.entries(readSecretsFile().secrets).filter(([id]) => isAppSecretId(id)));
@@ -210,6 +230,7 @@ export function importSecretsFileRaw(
   expectedConflicts?: readonly string[],
 ): { imported: boolean; conflicts: string[]; changedSinceConfirmation: boolean } {
   if (Object.keys(secrets).some(isAppSecretId)) throw new Error('ELANOUS_APP_SECRET_LEDGER_REQUIRED');
+  if (Object.keys(secrets).some((id) => id.startsWith('cred:'))) throw new Error('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
   const path = secretsPath();
   mkdirSync(dirname(path), { recursive: true });
   const release = acquireLockSync(`${path}.lock`);
@@ -227,6 +248,28 @@ export function importSecretsFileRaw(
   } finally {
     release();
   }
+}
+
+/** @internal Atomic batch writer reserved for the canonical credential-slot API. */
+export function writeCredentialSlotBatchRaw(values: Readonly<Record<string, string>>, receipt?: { id: string; valueHash: string }): void {
+  const entries = Object.entries(values);
+  if (entries.length === 0 || entries.some(([, value]) => typeof value !== 'string' || !value.trim() || value.includes('\0'))) {
+    throw new Error('ELANOUS_CREDENTIAL_SLOT_BATCH_INVALID');
+  }
+  for (const [id] of entries) assertCredentialSlotId(id);
+  if (receipt && (!/^[a-f0-9]{64}$/.test(receipt.id) || !/^[a-f0-9]{64}$/.test(receipt.valueHash))) {
+    throw new Error('ELANOUS_CREDENTIAL_SLOT_RECEIPT_INVALID');
+  }
+  modifySecretsFile((file) => {
+    Object.assign(file.secrets, values);
+    if (receipt) file.credentialRegistrationReceipts = { ...file.credentialRegistrationReceipts, [receipt.id]: receipt.valueHash };
+    return true;
+  });
+}
+
+export function hasCredentialRegistrationReceipt(id: string, valueHash: string): boolean {
+  if (!/^[a-f0-9]{64}$/.test(id) || !/^[a-f0-9]{64}$/.test(valueHash)) return false;
+  return readSecretsFile().credentialRegistrationReceipts?.[id] === valueHash;
 }
 
 /** App-scoped mutation API. It owns the lock and durable journal so direct callers cannot bypass them. */

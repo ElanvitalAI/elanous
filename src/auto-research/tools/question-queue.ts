@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S4 P2: QuestionQueue LLM tool ──
 //
 // CRUD over <goal>/question-queue.md with the three-marker
@@ -14,7 +15,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { mkdirSync } from 'node:fs';
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   discoverObsidianVault,
   type ObsidianVault,

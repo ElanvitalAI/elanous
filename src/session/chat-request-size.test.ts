@@ -10,16 +10,17 @@ import { runTurn } from './chat.js';
 import { saveTokens } from '../oauth/store.js';
 import { createRequestSizeGuard } from './request-size-guard.js';
 import { dispatchRead } from '../code-edit/tools.js';
+import { acquireFakeFetchDevice, type FakeFetchDevice } from '../ux-sim/fake-fetch.js';
 
 type FetchCapture = { body: Record<string, unknown>; wireJson: string };
 
 let root = '';
-let previousFetch: typeof fetch;
+let fetchDevice: FakeFetchDevice | undefined;
 let captures: FetchCapture[] = [];
 const envKeys = ['HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_SESSION_ROOT', 'ELANOUS_TEST_FAKE_LLM'] as const;
 let savedEnv: Partial<Record<typeof envKeys[number], string>> = {};
 
-beforeEach(() => {
+beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'tui-request-size-compact-'));
   savedEnv = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
   process.env.HOME = root;
@@ -32,9 +33,10 @@ beforeEach(() => {
   saveTokens('openai-codex', {
     accessToken: 'test-access-token', refreshToken: 'test-refresh-token', expiresAt: null,
   }, { mirrorCodex: false, codexHome: process.env.CODEX_HOME });
-  previousFetch = globalThis.fetch;
-  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-    const wireJson = String(init?.body ?? '');
+  fetchDevice = await acquireFakeFetchDevice([{
+    url: '/backend-api/codex/responses', method: 'POST',
+    response: (request) => {
+    const wireJson = request.body ?? '';
     let body: Record<string, unknown> = {};
     try { body = JSON.parse(wireJson) as Record<string, unknown>; } catch { /* non-JSON fetches are still captured */ }
     captures.push({ body, wireJson });
@@ -53,21 +55,30 @@ beforeEach(() => {
       },
     });
     return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
-  }) as typeof fetch;
+    },
+  }]);
 });
 
 afterEach(() => {
-  globalThis.fetch = previousFetch;
-  resetAutoCompactStateForTest();
-  for (const key of envKeys) {
-    const value = savedEnv[key];
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
+  const device = fetchDevice;
+  fetchDevice = undefined;
+  try {
+    expect(device?.calls().every(call => call.routeId === 'route-1' && call.status === 200)).toBe(true);
+  } finally {
+    try { device?.restore(); }
+    finally {
+      resetAutoCompactStateForTest();
+      for (const key of envKeys) {
+        const value = savedEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
   }
-  rmSync(root, { recursive: true, force: true });
 });
 
-describe('Codex TUI request-size compact', () => {
+describe.serial('Codex TUI request-size compact', () => {
   test('preserves active instructions and user input while reducing tool output', async () => {
     const system = 'follow these instructions';
     const user = 'perform the current request';

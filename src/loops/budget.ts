@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { ORCHESTRATOR_DEFAULTS, type OrchestratorSeat } from '../user-config.js';
+import { ORCHESTRATOR_DEFAULTS, type OrchestratorSeat } from '../user-config/orchestrator.js';
 import { debug } from '../debug/log.js';
 import type { ChecklistItem } from '../release-loop/checklist.js';
 import type { TrafficCell, TrafficProcess, TrafficResult, TrafficSeatRow } from './orchestrator/traffic.js';

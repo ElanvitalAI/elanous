@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import { dlopen, FFIType } from 'bun:ffi';
 import { eligibleGateShardReceipt, gateShardRuntimeIdentityKey, type GateShardIdentity, type GateShardReceipt } from './gate-shard-dispatch.js';
 import { runtimeIdentitiesMatch } from '../../src/runtime-identity.js';
+import type { GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
+import { mergePassingGateShardResults } from './gate-shard-receipt-carry.js';
 
 export interface GateShardSavedRun {
   output: string;
@@ -18,6 +21,22 @@ export interface GateShardSavedRun {
 export interface GateShardSavedResult {
   receipt: GateShardReceipt;
   runs: GateShardSavedRun[];
+}
+
+/** A failed shard may be inherited only when the prior same-head verdict judged every failure preexisting. */
+export function reusableGateShardFailures(receipt: GateShardReceipt, head40: string,
+  preexistingIds: readonly string[] | undefined): boolean {
+  const ids = [...receipt.failureIds, ...receipt.errorIds];
+  if (!ids.length) return true;
+  if (receipt.head40 !== head40 || !Array.isArray(preexistingIds)
+    || !preexistingIds.every((id) => typeof id === 'string')) return false;
+  const files = new Set(receipt.files);
+  const baseline = preexistingIds.filter((id) => {
+    const separator = id.indexOf(' > ');
+    return separator > 0 && files.has(id.slice(0, separator));
+  });
+  return baseline.length > 0
+    && JSON.stringify([...new Set(ids)].sort()) === JSON.stringify([...new Set(baseline)].sort());
 }
 
 export function gateShardReceiptPath(root: string, shardId: string): string {
@@ -51,9 +70,20 @@ function validReceiptRecordIntegrity(value: GateShardReceipt): boolean {
 export function readGateShardManifest(root: string, shardId: string): GateShardReceipt | null {
   try {
     const value = JSON.parse(readFileSync(gateShardReceiptPath(root, shardId), 'utf8')) as GateShardReceipt;
+    const sources = value as GateShardReceipt & { sourceRunIds?: unknown; sourceEvidence?: unknown };
+    const sourceRunIdsValid = sources.sourceRunIds === undefined || (Array.isArray(sources.sourceRunIds)
+      && sources.sourceRunIds.every((id) => typeof id === 'string'));
+    const sourceEvidenceValid = sources.sourceEvidence === undefined || (Array.isArray(sources.sourceEvidence)
+      && sources.sourceEvidence.every((row) => !!row && typeof row === 'object'
+        && typeof (row as { runId?: unknown }).runId === 'string'
+        && typeof (row as { evidencePath?: unknown }).evidencePath === 'string'
+        && /^[A-Za-z0-9][A-Za-z0-9._-]*\.result\.json$/.test((row as { evidencePath: string }).evidencePath)
+        && typeof (row as { evidenceSha256?: unknown }).evidenceSha256 === 'string'
+        && /^[a-f0-9]{64}$/i.test((row as { evidenceSha256: string }).evidenceSha256)));
     return value && value.id === shardId && Array.isArray(value.files)
       && Array.isArray(value.failureIds) && value.failureIds.every((id) => typeof id === 'string')
       && Array.isArray(value.errorIds) && value.errorIds.every((id) => typeof id === 'string')
+      && sourceRunIdsValid && sourceEvidenceValid
       && (value.status === 'complete' || value.status === 'unmeasured')
       && (value.status !== 'complete' || validReceiptRecordIntegrity(value)) ? value : null;
   } catch { return null; }
@@ -108,6 +138,135 @@ function atomicJson(path: string, value: unknown): void {
   finally { if (existsSync(temp)) rmSync(temp); }
 }
 
+const RECEIPT_LOCK_EX = 2;
+const RECEIPT_LOCK_NB = 4;
+const RECEIPT_LOCK_UN = 8;
+type ReceiptFlock = (fd: number, operation: number) => number;
+let receiptFlock: ReceiptFlock | undefined;
+
+function gateReceiptFlock(): ReceiptFlock {
+  if (receiptFlock) return receiptFlock;
+  const libraries = process.platform === 'darwin'
+    ? ['/usr/lib/libSystem.B.dylib', 'libc.dylib']
+    : ['libc.so.6', `libc.musl-${process.arch === 'arm64' ? 'aarch64' : 'x86_64'}.so.1`];
+  let lastError: unknown;
+  for (const library of libraries) {
+    try {
+      const loaded = dlopen(library, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } });
+      receiptFlock = (fd, operation) => loaded.symbols.flock(fd, operation) as number;
+      return receiptFlock;
+    } catch (error) { lastError = error; }
+  }
+  throw new Error(`gate shard receipt flock unavailable: ${String(lastError)}`);
+}
+
+function withGateReceiptKernelLock<T>(path: string, action: () => T): T {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const flock = gateReceiptFlock();
+  const fd = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
+  const deadline = Date.now() + 10_000;
+  try {
+    const opened = fstatSync(fd);
+    const current = lstatSync(path);
+    if (!opened.isFile() || (opened.mode & 0o077) !== 0 || opened.ino !== current.ino || opened.dev !== current.dev)
+      throw new Error(`gate shard receipt lock is not a private regular file: ${path}`);
+    while (flock(fd, RECEIPT_LOCK_EX | RECEIPT_LOCK_NB) !== 0) {
+      if (Date.now() >= deadline) throw new Error(`gate shard receipt lock timeout: ${path}`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+    const locked = lstatSync(path);
+    if (opened.ino !== locked.ino || opened.dev !== locked.dev) throw new Error(`gate shard receipt lock changed: ${path}`);
+    return action();
+  } finally {
+    try { flock(fd, RECEIPT_LOCK_UN); } finally { closeSync(fd); }
+  }
+}
+
+function reapDeadLegacyReceiptLock(path: string): boolean {
+  try {
+    const stat = statSync(path);
+    const lockDirectory = stat.isDirectory();
+    const ownerPath = lockDirectory ? join(path, 'pid') : path;
+    const record = readFileSync(ownerPath, 'utf8');
+    const [ownerText] = record.trim().split('\n');
+    const owner = Number(ownerText);
+    if (!Number.isInteger(owner) || owner <= 0 || Date.now() - stat.mtimeMs <= 60_000) return false;
+    try { process.kill(owner, 0); return false; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return false; }
+
+    const quarantine = `${path}.reap-${process.pid}-${randomUUID()}`;
+    renameSync(path, quarantine);
+    try {
+      const movedStat = statSync(quarantine);
+      const movedRecord = readFileSync(lockDirectory ? join(quarantine, 'pid') : quarantine, 'utf8');
+      const [movedOwnerText] = movedRecord.trim().split('\n');
+      if (movedStat.dev !== stat.dev || movedStat.ino !== stat.ino || movedRecord !== record
+        || movedOwnerText !== ownerText || Date.now() - movedStat.mtimeMs <= 60_000) {
+        if (!existsSync(path)) renameSync(quarantine, path);
+        return false;
+      }
+      try { process.kill(Number(movedOwnerText), 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+          rmSync(quarantine, { recursive: lockDirectory, force: true });
+          return true;
+        }
+      }
+      if (!existsSync(path)) renameSync(quarantine, path);
+      return false;
+    } catch (error) {
+      if (!existsSync(path) && existsSync(quarantine)) {
+        try { renameSync(quarantine, path); } catch { /* retain quarantine for manual inspection */ }
+      }
+      throw error;
+    }
+  } catch { return false; }
+}
+
+function acquireReceiptLease(path: string, deadline: number): string {
+  const token = randomUUID();
+  const record = `${process.pid}\n${token}\n`;
+  const candidate = `${path}.${process.pid}.${token}.tmp`;
+  writeFileSync(candidate, record, { flag: 'wx', mode: 0o600 });
+  while (true) {
+    try { linkSync(candidate, path); return record; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') { rmSync(candidate, { force: true }); throw error; }
+      if (!reapDeadLegacyReceiptLock(path) && Date.now() >= deadline) {
+        rmSync(candidate, { force: true });
+        throw new Error(`gate shard receipt lock timeout: ${path}`);
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+}
+
+function releaseReceiptLease(path: string, candidate: string, record: string): void {
+  try { if (readFileSync(path, 'utf8') === record) unlinkSync(path); } catch { /* lease already removed */ }
+  rmSync(candidate, { force: true });
+}
+
+function withGateShardReceiptLock<T>(root: string, shardId: string, action: () => T): T {
+  mkdirSync(root, { recursive: true });
+  const receiptPath = gateShardReceiptPath(root, shardId);
+  return withGateReceiptKernelLock(`${receiptPath}.flock`, () => {
+    // Both names remain leased to exclude legacy mkdir and hard-link writers during rollout.
+    const paths = [`${receiptPath}.lock`, `${receiptPath}.lock.d`].sort();
+    const deadline = Date.now() + 10_000;
+    const leases: Array<{ path: string; candidate: string; record: string }> = [];
+    try {
+      for (const path of paths) {
+        const acquiredRecord = acquireReceiptLease(path, deadline);
+        const token = acquiredRecord.trim().split('\n')[1]!;
+        leases.push({ path, candidate: `${path}.${process.pid}.${token}.tmp`, record: acquiredRecord });
+      }
+      return action();
+    } finally {
+      for (const lease of leases.reverse()) releaseReceiptLease(lease.path, lease.candidate, lease.record);
+    }
+  });
+}
+
 export type GateShardReceiptInspection =
   | { kind: 'absent' }
   | { kind: 'invalid'; reason: string }
@@ -117,6 +276,62 @@ export type GateShardReceiptInspection =
 /** The gate treats an empty formal receipt inventory as a full-sweep fallback reason. */
 export function formalReceiptSetPresenceReason(receiptCount: number): 'formal-receipt-set-absent' | undefined {
   return receiptCount === 0 ? 'formal-receipt-set-absent' : undefined;
+}
+
+export type GateShardExecutionSummary = {
+  plannedShards: number;
+  reusedShards: number;
+  rerunShards: number;
+  unmeasuredShards: number;
+  selectedFiles: number;
+  carriedFiles: number;
+  action: 'reuse' | 'partial-sweep' | 'full-sweep' | 'unmeasured';
+};
+
+/** Summarize the latest persisted shard decisions for one gate invocation, failing closed on missing rows. */
+export function summarizeGateShardExecution(rows: readonly Pick<GateShardLedgerRow,
+  'version' | 'phase' | 'commit' | 'invocationId' | 'shardId' | 'files' | 'state' | 'attribution' | 'reuseDecision'>[], expected: {
+    version: string; phase: GateShardLedgerRow['phase']; commit: string; invocationId: string;
+    shards: readonly { shardId: string; files: readonly string[] }[];
+  }): GateShardExecutionSummary {
+  const expectedShards = [...expected.shards];
+  const expectedIds = expectedShards.map((shard) => shard.shardId);
+  const expectedFiles = new Map(expectedShards.map((shard) => [shard.shardId, [...shard.files]]));
+  const byId = new Map<string, (typeof rows)[number]>();
+  if (new Set(expectedIds).size !== expectedIds.length || expectedShards.some((shard) => !shard.files.length
+    || new Set(shard.files).size !== shard.files.length)) throw new Error('invalid expected shard inventory');
+  if (!expectedIds.length) return { plannedShards: 0, reusedShards: 0, rerunShards: 0, unmeasuredShards: 0,
+    selectedFiles: 0, carriedFiles: 0, action: 'unmeasured' };
+  for (const row of rows) {
+    if (row.version === expected.version && row.phase === expected.phase && row.commit === expected.commit
+      && row.invocationId === expected.invocationId && expectedIds.includes(row.shardId)) byId.set(row.shardId, row);
+  }
+  let reusedShards = 0;
+  let rerunShards = 0;
+  let unmeasuredShards = 0;
+  let selectedFiles = 0;
+  let carriedFiles = 0;
+  for (const id of expectedIds) {
+    const row = byId.get(id);
+    const files = expectedFiles.get(id)!;
+    if (!row || row.state !== 'done' || row.attribution !== 'complete' || !Array.isArray(row.files)
+      || JSON.stringify(row.files) !== JSON.stringify(files)) {
+      unmeasuredShards++;
+      continue;
+    }
+    if (row.reuseDecision === 'reuse') {
+      reusedShards++;
+      carriedFiles += files.length;
+    } else if (row.reuseDecision === 'rerun') {
+      rerunShards++;
+      selectedFiles += files.length;
+    } else unmeasuredShards++;
+  }
+  const plannedShards = expectedIds.length;
+  const action = unmeasuredShards ? 'unmeasured'
+    : reusedShards === plannedShards ? 'reuse'
+      : rerunShards === plannedShards ? 'full-sweep' : 'partial-sweep';
+  return { plannedShards, reusedShards, rerunShards, unmeasuredShards, selectedFiles, carriedFiles, action };
 }
 
 /** Validate the complete formal receipt set against independently recorded shard and test inventories. */
@@ -200,32 +415,52 @@ export function markGateShardUnmeasured(root: string, receipt: GateShardReceipt)
 }
 
 /** Save the actual measured bytes and bind their digest to the manifest. */
-export function saveGateShardResult(root: string, result: GateShardSavedResult): GateShardReceipt {
-  const { receipt, runs } = result;
-  if (!eligibleGateShardReceipt(receipt, receipt, receipt.head40, receipt.base40))
+function saveGateShardResultUnlocked(root: string, result: GateShardSavedResult): GateShardReceipt {
+  const { receipt: inputReceipt, runs: inputRuns } = result;
+  if (!eligibleGateShardReceipt(inputReceipt, inputReceipt, inputReceipt.head40, inputReceipt.base40))
     throw new Error('incomplete gate shard receipt metadata');
-  if (!runs.length) throw new Error('gate shard result has no measured runs');
-  const invalidRun = runs.find((run) => !Number.isSafeInteger(run.ran) || run.ran < 0
+  if (!inputRuns.length) throw new Error('gate shard result has no measured runs');
+  const invalidRun = inputRuns.find((run) => !Number.isSafeInteger(run.ran) || run.ran < 0
     || !Number.isSafeInteger(run.files) || run.files < 1);
   if (invalidRun) throw new Error(`gate shard result has invalid run counts: ran=${invalidRun.ran} files=${invalidRun.files}`);
+  const priorManifest = readGateShardManifest(root, inputReceipt.id);
+  const priorResult = priorManifest ? readGateShardResultInternal(root, { shard: priorManifest, head40: priorManifest.head40,
+    base40: priorManifest.base40, envKey: priorManifest.envKey }, true) : null;
+  const merged = mergePassingGateShardResults(priorResult, result);
+  const { receipt, runs } = merged;
   preservePreviousHead(root, receipt.id, receipt.head40);
   const payloadName = `${receipt.id}.attempt-${receipt.attempt}-${randomUUID()}.result.json`;
   const payloadBody = { runs, failureIds: receipt.failureIds, errorIds: receipt.errorIds };
   const payload = JSON.stringify(payloadBody) + '\n';
   const digest = createHash('sha256').update(payload).digest('hex');
   atomicJson(join(root, payloadName), payloadBody);
-  const record = { ...receipt, evidencePath: payloadName, evidenceSha256: digest };
+  const withSources = receipt as GateShardReceipt & {
+    sourceEvidence?: Array<{ runId: string; evidencePath: string; evidenceSha256: string }>;
+  };
+  const currentSource = { runId: receipt.graphRunId ?? 'unscoped', evidencePath: payloadName, evidenceSha256: digest };
+  const sourceEvidence = [...new Map([...(withSources.sourceEvidence ?? []), currentSource]
+    .map((evidence) => [`${evidence.runId}:${evidence.evidenceSha256}`, evidence])).values()];
+  const record = { ...receipt, sourceEvidence, evidencePath: payloadName, evidenceSha256: digest };
   const saved = { ...record, recordSha256: receiptRecordSha256(record) };
   atomicJson(gateShardReceiptPath(root, receipt.id), saved);
   return saved;
 }
 
+/** Serialize each shard's read/merge/write so concurrent successful runs retain all provenance. */
+export function saveGateShardResult(root: string, result: GateShardSavedResult): GateShardReceipt {
+  return withGateShardReceiptLock(root, result.receipt.id, () => saveGateShardResultUnlocked(root, result));
+}
+
 /** No manifest, stale identity, missing bytes or digest mismatch can become a reused pass. */
-export function readGateShardResult(root: string, expected: { shard: GateShardIdentity; head40: string; base40: string; envKey: string; receipt?: GateShardReceipt }): GateShardSavedResult | null {
+function readGateShardResultInternal(root: string, expected: { shard: GateShardIdentity; head40: string; base40: string; envKey: string; receipt?: GateShardReceipt },
+  ignoreActiveWriterLease = false): GateShardSavedResult | null {
   try {
+    if (!ignoreActiveWriterLease && (existsSync(`${gateShardReceiptPath(root, expected.shard.id)}.lock`)
+      || existsSync(`${gateShardReceiptPath(root, expected.shard.id)}.lock.d`))) return null;
     const receipt = expected.receipt ?? readGateShardManifest(root, expected.shard.id);
     if (!receipt) return null;
-    if (!eligibleGateShardReceipt(receipt, expected.shard, expected.head40, expected.base40) || receipt.envKey !== expected.envKey
+    if (!eligibleGateShardReceipt(receipt, expected.shard, expected.head40, expected.base40, false, receipt.head40 === expected.head40)
+      || receipt.envKey !== expected.envKey
       || !/^[A-Za-z0-9][A-Za-z0-9._-]*\.result\.json$/.test(receipt.evidencePath)) return null;
     const payload = readFileSync(join(root, receipt.evidencePath), 'utf8');
     if (createHash('sha256').update(payload).digest('hex') !== receipt.evidenceSha256) return null;
@@ -238,6 +473,10 @@ export function readGateShardResult(root: string, expected: { shard: GateShardId
       || JSON.stringify(parsed.errorIds) !== JSON.stringify(receipt.errorIds)) return null;
     return { receipt, runs: parsed.runs };
   } catch { return null; }
+}
+
+export function readGateShardResult(root: string, expected: { shard: GateShardIdentity; head40: string; base40: string; envKey: string; receipt?: GateShardReceipt }): GateShardSavedResult | null {
+  return readGateShardResultInternal(root, expected);
 }
 
 /** Carry a verified unchanged shard to a descendant commit without claiming it was remeasured. */

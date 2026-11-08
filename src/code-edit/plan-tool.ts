@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // update_plan tool — Phase WF2.
 //
 // Progress checklist for multi-step tasks. Adapted from codex-rs's
@@ -16,7 +17,7 @@
 //     The rejection hook is a callback the plan-mode module fills
 //     in at its init time (defaulting to null = never rejected).
 
-import type { LLMToolSpec } from '../llm.js';
+
 
 export type PlanStepStatus = 'pending' | 'in_progress' | 'completed';
 

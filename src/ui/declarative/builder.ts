@@ -1,5 +1,5 @@
 import type { BoxDecoration } from '../attributes/index.js';
-import { encodeWidgetTreeYAML } from './encode.js';
+import { encodeWidgetSpecsYAML } from './encode-specs.js';
 import type {
   WidgetChromeSpec,
   WidgetInteractionHandlerSpec,
@@ -251,7 +251,7 @@ export class WidgetBuilder {
   }
 
   async buildYAML(): Promise<string> {
-    return encodeWidgetTreeYAML([this]);
+    return encodeWidgetSpecsYAML([this.build()]);
   }
 }
 

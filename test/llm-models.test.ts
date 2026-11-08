@@ -15,11 +15,30 @@ import {
   defaultHosts,
   parseLlmHostsEnv,
 } from '../src/nexus/api/llm-hosts.js';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 type FetchFn = typeof globalThis.fetch;
-const realFetch = globalThis.fetch;
+let fakeFetch: FakeFetchDevice | undefined;
+
+function installFetch(stub: FetchFn, urls: readonly string[]): void {
+  fakeFetch?.restore();
+  const respond = (request: { url: string; method: string; headers: Readonly<Record<string, string>>; body: string | null; signal: AbortSignal | null }) =>
+    stub(request.url, {
+      method: request.method,
+      headers: { ...request.headers },
+      ...(request.body !== null ? { body: request.body } : {}),
+      signal: request.signal,
+    });
+  fakeFetch = createFakeFetchDevice([...new Set(urls)].map((url) => ({ url, method: 'GET', response: respond })));
+}
+
+function expectFetchCalls(urls: readonly string[]): void {
+  const actual = (fakeFetch?.calls() ?? []).map(({ method, url }) => `${method} ${url}`).sort();
+  expect(actual).toEqual(urls.map((url) => `GET ${url}`).sort());
+}
 afterEach(() => {
-  globalThis.fetch = realFetch;
+  fakeFetch?.restore();
+  fakeFetch = undefined;
   delete process.env.ELANOUS_LLM_MODELS_ENDPOINT;
   delete process.env.ELANOUS_LLM_HOSTS;
   delete process.env.ANTHROPIC_API_KEY;
@@ -162,7 +181,7 @@ describe('handleLlmModels · single-host (legacy default)', () => {
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       )) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://localhost:1234/v1/models']);
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'));
     expect(res.status).toBe(200);
     expect(res.headers.get('access-control-allow-origin')).toBe('*');
@@ -187,12 +206,13 @@ describe('handleLlmModels · single-host (legacy default)', () => {
     expect(json.hosts).toEqual([
       { name: 'local', kind: 'lm-studio', endpoint: 'http://localhost:1234', count: 4 },
     ]);
+    expectFetchCalls(['http://localhost:1234/v1/models']);
   });
 
   test('upstream non-2xx → ok=false + per-host error (PWA surfaces in UI)', async () => {
     const stub = (async () =>
       new Response('lm studio not reachable', { status: 503 })) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://localhost:1234/v1/models']);
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'));
     expect(res.status).toBe(200);
     const json = (await res.json()) as {
@@ -206,31 +226,38 @@ describe('handleLlmModels · single-host (legacy default)', () => {
     expect(json.hosts[0]?.error).toMatch(/upstream-http-503/);
     expect(json.hosts[0]?.count).toBe(0);
     expect(json.models).toEqual([]);
+    expectFetchCalls(['http://localhost:1234/v1/models']);
   });
 
   test('network error → ok=false + upstream-network', async () => {
     const stub = (async () => { throw new Error('econnrefused'); }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://localhost:1234/v1/models']);
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'));
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; error?: string; models: unknown[] };
     expect(json.ok).toBe(false);
     expect(json.error).toMatch(/upstream-network/);
     expect(json.models).toEqual([]);
+    expectFetchCalls(['http://localhost:1234/v1/models']);
   });
 
-  test('AbortError → upstream-timeout', async () => {
-    const stub = ((_input: unknown, init?: RequestInit) => {
-      const sig = init?.signal;
-      return new Promise<Response>((_resolve, reject) => {
-        sig?.addEventListener('abort', () => {
-          const e = new Error('aborted');
-          e.name = 'AbortError';
-          reject(e);
-        });
-      });
-    }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+  test('AbortError → upstream-timeout when the request signal aborts', async () => {
+    let observedSignal: AbortSignal | null | undefined;
+    const stub = (async (_input: Parameters<FetchFn>[0], init?: Parameters<FetchFn>[1]) => new Promise<Response>((_resolve, reject) => {
+      observedSignal = init?.signal;
+      const abort = () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      };
+      if (!init?.signal) {
+        reject(new Error('request signal was not provided'));
+        return;
+      }
+      if (init.signal.aborted) abort();
+      else init.signal.addEventListener('abort', abort, { once: true });
+    })) as unknown as FetchFn;
+    installFetch(stub, ['http://localhost:1234/v1/models']);
     const res = await handleLlmModels(
       new Request('http://x/v1/llm/models'),
       { timeoutMs: 10 },
@@ -238,18 +265,22 @@ describe('handleLlmModels · single-host (legacy default)', () => {
     expect(res.status).toBe(200);
     const json = (await res.json()) as { error?: string };
     expect(json.error).toBe('upstream-timeout');
+    expect(observedSignal).toBeInstanceOf(AbortSignal);
+    expect(observedSignal?.aborted).toBe(true);
+    expectFetchCalls(['http://localhost:1234/v1/models']);
   });
 
   test('malformed upstream JSON → empty list, ok=true (no crash)', async () => {
     const stub = (async () =>
       new Response('not json', { status: 200 })) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://localhost:1234/v1/models']);
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'));
     expect(res.status).toBe(200);
     const json = (await res.json()) as { ok: boolean; count: number; models: unknown[] };
     expect(json.ok).toBe(true);
     expect(json.count).toBe(0);
     expect(json.models).toEqual([]);
+    expectFetchCalls(['http://localhost:1234/v1/models']);
   });
 });
 
@@ -283,7 +314,7 @@ describe('handleLlmModels · multi-host fan-out', () => {
       }
       return Promise.reject(new Error(`unstubbed: ${url}`));
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://lm/v1/models', 'http://vllm/v1/models', 'http://oll/api/tags']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'), {
       hosts: [
@@ -321,6 +352,7 @@ describe('handleLlmModels · multi-host fan-out', () => {
       { name: 'vllm', kind: 'vllm', endpoint: 'http://vllm', count: 1 },
       { name: 'oll', kind: 'ollama', endpoint: 'http://oll', count: 2 },
     ]);
+    expectFetchCalls(['http://lm/v1/models', 'http://vllm/v1/models', 'http://oll/api/tags']);
   });
 
   test('partial failure → ok=true (some hosts succeeded), failed host has per-host error', async () => {
@@ -334,7 +366,7 @@ describe('handleLlmModels · multi-host fan-out', () => {
       // Reject the other host with a network error.
       return Promise.reject(new Error('econnrefused'));
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://ok/v1/models', 'http://bad/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'), {
       hosts: [
@@ -353,11 +385,12 @@ describe('handleLlmModels · multi-host fan-out', () => {
     expect(json.models[0]?.id).toBe('good-model');
     expect(json.hosts.find((h) => h.name === 'ok')?.error).toBeUndefined();
     expect(json.hosts.find((h) => h.name === 'bad')?.error).toMatch(/upstream-network/);
+    expectFetchCalls(['http://ok/v1/models', 'http://bad/v1/models']);
   });
 
   test('all hosts fail → ok=false + top-level error', async () => {
     const stub = (async () => { throw new Error('econnrefused'); }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://a/v1/models', 'http://b/api/tags']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'), {
       hosts: [
@@ -369,6 +402,7 @@ describe('handleLlmModels · multi-host fan-out', () => {
     expect(json.ok).toBe(false);
     expect(json.error).toMatch(/upstream-network/);
     expect(json.hosts).toHaveLength(2);
+    expectFetchCalls(['http://a/v1/models', 'http://b/api/tags']);
   });
 
   test('ollama without name field → falls back to model field', async () => {
@@ -380,7 +414,7 @@ describe('handleLlmModels · multi-host fan-out', () => {
           { name: 'mistral:7b' },
         ],
       }), { status: 200 })) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://oll/api/tags']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'), {
       hosts: [{ name: 'oll', kind: 'ollama', endpoint: 'http://oll' }],
@@ -394,6 +428,7 @@ describe('handleLlmModels · multi-host fan-out', () => {
       'llama3.2:latest',
       'mistral:7b',
     ]);
+    expectFetchCalls(['http://oll/api/tags']);
   });
 
   test('ELANOUS_LLM_HOSTS env → drives host config', async () => {
@@ -402,7 +437,7 @@ describe('handleLlmModels · multi-host fan-out', () => {
     ]);
     const stub = (async () =>
       new Response(JSON.stringify({ data: [{ id: 'env-model' }] }), { status: 200 })) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://envhost/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'));
     const json = (await res.json()) as {
@@ -412,13 +447,14 @@ describe('handleLlmModels · multi-host fan-out', () => {
     expect(json.hosts[0]?.name).toBe('env-host');
     expect(json.hosts[0]?.endpoint).toBe('http://envhost');
     expect(json.models[0]?.host).toBe('env-host');
+    expectFetchCalls(['http://envhost/v1/models']);
   });
 
   test('malformed ELANOUS_LLM_HOSTS → fallback + configWarning', async () => {
     process.env.ELANOUS_LLM_HOSTS = '{not json';
     const stub = (async () =>
       new Response(JSON.stringify({ data: [{ id: 'fallback-model' }] }), { status: 200 })) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://localhost:1234/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'));
     const json = (await res.json()) as {
@@ -429,6 +465,7 @@ describe('handleLlmModels · multi-host fan-out', () => {
     expect(json.ok).toBe(true);
     expect(json.configWarning).toMatch(/JSON parse failed/);
     expect(json.hosts[0]?.name).toBe('local'); // default host
+    expectFetchCalls(['http://localhost:1234/v1/models']);
   });
 });
 
@@ -452,7 +489,7 @@ describe('handleLlmModels · anthropic kind (FU.A2)', () => {
       }
       return Promise.reject(new Error(`unstubbed: ${url}`));
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['https://api.anthropic.com/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'), {
       hosts: [{
@@ -476,11 +513,12 @@ describe('handleLlmModels · anthropic kind (FU.A2)', () => {
     const opus = json.models.find((m) => m.id === 'claude-opus-4-5');
     expect(opus?.hostKind).toBe('anthropic-openai-wrap');
     expect(opus?.ownedBy).toBe('Claude Opus 4.5');
+    expectFetchCalls(['https://api.anthropic.com/v1/models']);
   });
 
   test('missing key (no host.apiKey + no env) → per-host error="missing-api-key"', async () => {
     const stub = (() => Promise.reject(new Error('should not fetch'))) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['https://api.anthropic.com/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'), {
       hosts: [{
@@ -496,6 +534,7 @@ describe('handleLlmModels · anthropic kind (FU.A2)', () => {
     // No models fetched — host failed, so ok=false (only host failed).
     expect(json.ok).toBe(false);
     expect(json.hosts[0]?.error).toMatch(/missing-api-key/);
+    expectFetchCalls([]);
   });
 
   test('ANTHROPIC_API_KEY env fallback → used when host.apiKey absent', async () => {
@@ -512,7 +551,7 @@ describe('handleLlmModels · anthropic kind (FU.A2)', () => {
       }
       return Promise.reject(new Error(`unstubbed: ${url}`));
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['https://api.anthropic.com/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'), {
       hosts: [{ name: 'anthropic', kind: 'anthropic-openai-wrap', endpoint: 'https://api.anthropic.com' }],
@@ -521,6 +560,7 @@ describe('handleLlmModels · anthropic kind (FU.A2)', () => {
     expect(json.ok).toBe(true);
     expect(json.count).toBe(1);
     expect(capturedKey).toBe('sk-ant-env-fallback');
+    expectFetchCalls(['https://api.anthropic.com/v1/models']);
   });
 
   test('host.apiKey wins over env (per-host override)', async () => {
@@ -531,7 +571,7 @@ describe('handleLlmModels · anthropic kind (FU.A2)', () => {
       capturedKey = headers['x-api-key'];
       return Promise.resolve(new Response(JSON.stringify({ data: [] }), { status: 200 }));
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['https://api.anthropic.com/v1/models']);
 
     await handleLlmModels(new Request('http://x/v1/llm/models'), {
       hosts: [{
@@ -542,12 +582,13 @@ describe('handleLlmModels · anthropic kind (FU.A2)', () => {
       }],
     });
     expect(capturedKey).toBe('sk-ant-host-winner');
+    expectFetchCalls(['https://api.anthropic.com/v1/models']);
   });
 
   test('upstream 401 → generic upstream-auth-401 (no key leak)', async () => {
     const stub = (async () =>
       new Response('{"error":"invalid x-api-key"}', { status: 401 })) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['https://api.anthropic.com/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'), {
       hosts: [{
@@ -562,6 +603,7 @@ describe('handleLlmModels · anthropic kind (FU.A2)', () => {
     expect(json.hosts[0]?.error).toBe('upstream-auth-401');
     expect(json.hosts[0]?.error).not.toContain('sk-ant');
     expect(json.hosts[0]?.error).not.toContain('invalid');
+    expectFetchCalls(['https://api.anthropic.com/v1/models']);
   });
 
   test('mixed lm-studio + anthropic in parallel → merged with hostKind tags', async () => {
@@ -579,7 +621,7 @@ describe('handleLlmModels · anthropic kind (FU.A2)', () => {
       }
       return Promise.reject(new Error(`unstubbed: ${url}`));
     }) as unknown as FetchFn;
-    globalThis.fetch = stub;
+    installFetch(stub, ['http://lm/v1/models', 'https://api.anthropic.com/v1/models']);
 
     const res = await handleLlmModels(new Request('http://x/v1/llm/models'), {
       hosts: [
@@ -601,5 +643,6 @@ describe('handleLlmModels · anthropic kind (FU.A2)', () => {
     const byId = new Map(json.models.map((m) => [m.id, m]));
     expect(byId.get('gemma-4-26b-a4b-it')?.hostKind).toBe('lm-studio');
     expect(byId.get('claude-opus-4-5')?.hostKind).toBe('anthropic-openai-wrap');
+    expectFetchCalls(['http://lm/v1/models', 'https://api.anthropic.com/v1/models']);
   });
 });

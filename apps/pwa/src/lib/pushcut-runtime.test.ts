@@ -15,36 +15,36 @@ import {
   PUSHCUT_BINDING_CHANNEL,
 } from './pushcut-runtime';
 import { DaemonClient } from './daemon-client';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../test-devices/fake-fetch';
 
-const realFetch = globalThis.fetch;
+let fakeFetch: FakeFetchDevice | undefined;
 
 interface FetchCall {
   url: string | URL;
   init?: RequestInit;
 }
 
-function mockFetch(response: {
+function mockFetch(path: string, method: string, response: {
   ok?: boolean;
   status?: number;
   jsonBody?: unknown;
 }): { calls: FetchCall[] } {
   const calls: FetchCall[] = [];
-  globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
-    calls.push({ url, init });
-    const headers = new Headers({ 'content-type': 'application/json' });
-    return {
-      ok: response.ok ?? true,
-      status: response.status ?? 200,
-      headers,
-      json: async () => response.jsonBody ?? {},
-      text: async () => JSON.stringify(response.jsonBody ?? {}),
-    } as unknown as Response;
-  }) as unknown as typeof fetch;
+  fakeFetch?.restore();
+  fakeFetch = createFakeFetchDevice([{
+    url: path,
+    method,
+    response: (request) => {
+      calls.push({ url: request.url, init: { method: request.method, headers: request.headers, body: request.body ?? undefined } });
+      return Response.json(response.jsonBody ?? {}, { status: response.status ?? 200 });
+    },
+  }]);
   return { calls };
 }
 
 afterEach(() => {
-  globalThis.fetch = realFetch;
+  fakeFetch?.restore();
+  fakeFetch = undefined;
 });
 
 function makeClient(token = 'tok-1'): DaemonClient {
@@ -57,7 +57,7 @@ function makeClient(token = 'tok-1'): DaemonClient {
 
 describe('rotatePushcutSecret', () => {
   test('POSTs {id, value} to /v1/config/secrets with Bearer auth', async () => {
-    const { calls } = mockFetch({
+    const { calls } = mockFetch('/v1/config/secrets', 'POST', {
       ok: true,
       status: 201,
       jsonBody: { stored: true, id: PUSHCUT_SECRET_ID, ref: `ref:secret:${PUSHCUT_SECRET_ID}` },
@@ -77,14 +77,14 @@ describe('rotatePushcutSecret', () => {
   });
 
   test('throws on non-OK response (per fetchJson contract)', async () => {
-    mockFetch({ ok: false, status: 400, jsonBody: { error: 'invalid-id' } });
+    mockFetch('/v1/config/secrets', 'POST', { ok: false, status: 400, jsonBody: { error: 'invalid-id' } });
     await expect(rotatePushcutSecret(makeClient(), 'whatever')).rejects.toThrow();
   });
 });
 
 describe('listPushcutBindings', () => {
   test('GETs /v1/registry/bindings with channel=pushcut filter', async () => {
-    const { calls } = mockFetch({
+    const { calls } = mockFetch('/v1/registry/bindings', 'GET', {
       ok: true,
       status: 200,
       jsonBody: {
@@ -105,7 +105,7 @@ describe('listPushcutBindings', () => {
   });
 
   test('returns empty list shape when channel has no bindings', async () => {
-    mockFetch({
+    mockFetch('/v1/registry/bindings', 'GET', {
       ok: true,
       status: 200,
       jsonBody: { channel: PUSHCUT_BINDING_CHANNEL, bindings: [] },
@@ -117,7 +117,7 @@ describe('listPushcutBindings', () => {
 
 describe('upsertPushcutBinding', () => {
   test('POST default — full body with sessionId + label', async () => {
-    const { calls } = mockFetch({
+    const { calls } = mockFetch('/v1/registry/bindings/pushcut/token-xyz', 'POST', {
       ok: true,
       status: 201,
       jsonBody: {
@@ -147,7 +147,7 @@ describe('upsertPushcutBinding', () => {
   });
 
   test('PATCH method override + mergeMeta:true', async () => {
-    const { calls } = mockFetch({
+    const { calls } = mockFetch('/v1/registry/bindings/pushcut/tok-1', 'PATCH', {
       ok: true,
       status: 200,
       jsonBody: {
@@ -168,7 +168,7 @@ describe('upsertPushcutBinding', () => {
   });
 
   test('encodes special chars in token (URL-safe key regex allows / : . - _ ~)', async () => {
-    const { calls } = mockFetch({ ok: true, status: 201, jsonBody: { binding: { key: 'a/b' }, outcome: 'created' } });
+    const { calls } = mockFetch('/v1/registry/bindings/pushcut/a%2Fb', 'POST', { ok: true, status: 201, jsonBody: { binding: { key: 'a/b' }, outcome: 'created' } });
     await upsertPushcutBinding(makeClient(), { token: 'a/b' });
     // encodeURIComponent encodes '/' to '%2F' so the daemon's parseBindingPath
     // treats it as a literal key char, not a path separator.
@@ -176,7 +176,7 @@ describe('upsertPushcutBinding', () => {
   });
 
   test('omits undefined fields from body', async () => {
-    const { calls } = mockFetch({ ok: true, status: 201, jsonBody: { binding: { key: 't' }, outcome: 'created' } });
+    const { calls } = mockFetch('/v1/registry/bindings/pushcut/t', 'POST', { ok: true, status: 201, jsonBody: { binding: { key: 't' }, outcome: 'created' } });
     await upsertPushcutBinding(makeClient(), { token: 't' });
     const body = JSON.parse(String(calls[0]?.init?.body));
     expect(Object.keys(body)).toHaveLength(0);
@@ -185,7 +185,7 @@ describe('upsertPushcutBinding', () => {
 
 describe('deletePushcutBinding', () => {
   test('DELETE /v1/registry/bindings/pushcut/<token>', async () => {
-    const { calls } = mockFetch({
+    const { calls } = mockFetch('/v1/registry/bindings/pushcut/tok-A', 'DELETE', {
       ok: true,
       status: 200,
       jsonBody: { deleted: true, channel: PUSHCUT_BINDING_CHANNEL, key: 'tok-A' },
@@ -201,7 +201,7 @@ describe('deletePushcutBinding', () => {
   });
 
   test('throws on 404 (binding-not-found surfaces via fetchJson)', async () => {
-    mockFetch({ ok: false, status: 404, jsonBody: { error: 'binding-not-found' } });
+    mockFetch('/v1/registry/bindings/pushcut/missing', 'DELETE', { ok: false, status: 404, jsonBody: { error: 'binding-not-found' } });
     await expect(deletePushcutBinding(makeClient(), 'missing')).rejects.toThrow();
   });
 });

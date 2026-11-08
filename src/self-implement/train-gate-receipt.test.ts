@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { recordPassedSelfGateReceipt, runTrainGateWithReceipts } from './train-gate-receipt.js';
 import { gateEnvFingerprint, gateLockfileHash, loadGateReceipts } from './gate-receipt-registry.js';
+import { GATE_REMOTE_DEFAULTS, type GateRemoteRunner } from './gate-remote.js';
+import { runTrainGateOnHost } from './train-gate-remote.js';
 import { planGateTrainReceiptCarry } from '../../scripts/release-loop/gate-train-receipts.js';
 
 const roots: string[] = [];
@@ -140,6 +142,79 @@ test('passed self gate records only measured changed-only interference and the r
   } finally {
     if (prior === undefined) delete process.env.ELANOUS_GATE_RECEIPT_REGISTRY_PATH;
     else process.env.ELANOUS_GATE_RECEIPT_REGISTRY_PATH = prior;
+  }
+});
+
+test('remote train gate wrapper runs the receipt CLI marker writer and harvests its cut registry for carry', async () => {
+  const { cwd } = repository();
+  writeFileSync(join(cwd, 'src/other.test.ts'), 'import { test } from "bun:test"; test("other", () => {});\n');
+  git(cwd, 'add', '-A');
+  git(cwd, 'commit', '-qm', 'base with another test to keep sweeping');
+  const base = git(cwd, 'rev-parse', 'HEAD');
+  writeFileSync(join(cwd, 'src/a.test.ts'), 'import { test } from "bun:test"; test("a", () => {});\n');
+  git(cwd, 'add', '-A');
+  git(cwd, 'commit', '-qm', 'measured test');
+  const head = git(cwd, 'rev-parse', 'HEAD');
+  const artifactDir = join(cwd, 'remote-artifacts');
+  mkdirSync(artifactDir);
+  const fakeBin = join(artifactDir, 'bin');
+  mkdirSync(fakeBin);
+  const fakeBun = join(fakeBin, 'bun');
+  const realBun = `'${process.execPath.replaceAll("'", `'\\''`)}'`;
+  writeFileSync(fakeBun, `#!/bin/sh\nif [ "$1" = "--version" ]; then exec ${realBun} --version; fi\nexit 0\n`, { mode: 0o755 });
+  const summaryPath = join(artifactDir, 'summary.json');
+  writeFileSync(summaryPath, JSON.stringify({ head40: head, base40: base, exitCode: 0, verdict: 'passed',
+    introduced: 0, unknown: 0, unrunImporters: 0, cohort: ['src/a.test.ts'],
+    typecheck: { status: 'passed', base40: base, head40: head, exitCode: 0, newErrors: 0 } }));
+  const previous = process.env.ELANOUS_GATE_RECEIPT_REGISTRY_PATH;
+  delete process.env.ELANOUS_GATE_RECEIPT_REGISTRY_PATH;
+  try {
+    const receipt = await recordPassedSelfGateReceipt({ repo: cwd, commit: head, baseSha: base,
+      changedFiles: ['src/a.test.ts'], summaryPath }, async () => ({ status: 'no-interference' }));
+    expect(receipt?.headCommit).toBe(head);
+    const artifactRegistry = join(artifactDir, 'gate-receipts.json');
+    const artifactRows = loadGateReceipts(artifactRegistry);
+    expect(Object.values(artifactRows))
+      .toMatchObject([expect.objectContaining({ headCommit: head, verdict: 'passed' })]);
+
+    // Exercise the real remote CLI marker writer and the actual wrapper harvest path; only SSH
+    // transport is simulated. Stubbed bun gate subprocesses keep this fixture fast and bounded.
+    const cutRegistry = join(cwd, '.git', 'elanous-host-regate', 'gate-receipts.json');
+    const runner: GateRemoteRunner = {
+      local(cmd, args, commandCwd) {
+        if (cmd === 'git' && args[0] === 'rev-parse' && args.at(-1)?.startsWith('origin/main'))
+          return { rc: 0, stdout: `${base}\n`, stderr: '' };
+        if (cmd === 'git' && args[0] === 'config')
+          return { rc: 0, stdout: 'git@github.com:ElanvitalAI/elanous.git\n', stderr: '' };
+        if (cmd === 'git' && args[0] === 'push') return { rc: 0, stdout: '', stderr: '' };
+        const result = spawnSync(cmd, args, { cwd: commandCwd, encoding: 'utf8' });
+        return { rc: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '',
+          ...(result.error ? { error: result.error.message } : {}) };
+      },
+      ssh(_host, script) {
+        expect(script).toContain("'bun' 'src/self-implement/train-gate-receipt.ts'");
+        const remoteEnv = { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}`,
+          ELANOUS_GATE_RECEIPT_REGISTRY_PATH: artifactRegistry };
+        const cliInput = JSON.stringify({ repo: cwd, commit: head, baseSha: base,
+          changedFiles: ['src/a.test.ts'], deletedFiles: [], scenarioTests: [] });
+        const result = spawnSync(process.execPath, [join(import.meta.dir, 'train-gate-receipt.ts'), cliInput], {
+          cwd, encoding: 'utf8', env: remoteEnv,
+        });
+        return { rc: 0, stdout: result.stdout ?? '', stderr: `${result.stderr ?? ''}\n__GATE_REMOTE_RC=${result.status ?? 1}\n` };
+      },
+    };
+    const gate = await runTrainGateOnHost({ repo: cwd, commit: head, baseSha: base, changedFiles: ['src/a.test.ts'],
+      settings: { ...GATE_REMOTE_DEFAULTS, host: 'node-b', slotWaitSeconds: 0 } }, runner, { observe: () => {} });
+    expect(gate).toMatchObject({ outcome: 'pass', rc: 0, host: 'node-b' });
+    expect(Object.values(loadGateReceipts(cutRegistry))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ headCommit: head, verdict: 'passed' }),
+    ]));
+    const carry = planGateTrainReceiptCarry({ repo: cwd, commit: head, receiptPath: cutRegistry,
+      bunVersion: process.versions.bun!, lockfileHash: gateLockfileHash(cwd), envFingerprint: gateEnvFingerprint(process.env) });
+  expect(carry?.carriedFiles, JSON.stringify(carry)).toEqual(['src/a.test.ts']);
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GATE_RECEIPT_REGISTRY_PATH;
+    else process.env.ELANOUS_GATE_RECEIPT_REGISTRY_PATH = previous;
   }
 });
 

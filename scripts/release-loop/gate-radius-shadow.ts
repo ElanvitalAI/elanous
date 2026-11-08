@@ -4,7 +4,7 @@ import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } 
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { changedFilesBetween, planPartialRegate, testFileOfId } from './gate-partial';
-import { gitClosureTree, testsReachingChanged } from './gate-closure';
+import { gitClosureTree, testsReachingChanged, testsReachingChangedCliLazyRequireShadow } from './gate-closure';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
@@ -21,12 +21,15 @@ export interface GateRadiusShadowPlan {
   files: string[];
   totalTests: number | null;
   reason: string;
+  /** Observation only; currentFiles remains the selector until a separate approval changes policy. */
+  lazyRequireShadow?: { currentFiles: string[]; proposedFiles: string[]; cliSpawnTests: number; currentTests: number; proposedTests: number; measured: boolean; reason: string };
 }
 
 export interface GateRadiusShadowRecord {
   plan: GateRadiusShadowPlan;
   actual: { commit: string; outcome: 'ok' | 'regression' | 'error'; cutRc: number | null; introduced: string[];
     cutFailures: string[]; cutErrors: string[]; missedIntroduced: string[]; fullSweep: boolean;
+    lazyRequireMissedFailures?: string[]; lazyRequireComparison?: 'complete' | 'unmeasured';
     comparison: 'complete' | 'unmeasured' };
   recordedAt: string;
 }
@@ -67,7 +70,8 @@ export function versionOnlyBumps(repo: string, from: string, to: string, version
 }
 
 export function planGateRadiusShadow(input: { repo: string; ledgerRoot: string; version: string;
-  baselineVersion: string; forCommit: string; instanceRoot?: string; expectedBaselineCommit?: string }): GateRadiusShadowPlan {
+  baselineVersion: string; forCommit: string; instanceRoot?: string; expectedBaselineCommit?: string;
+  compareCliShadow?: typeof testsReachingChangedCliLazyRequireShadow }): GateRadiusShadowPlan {
   const { repo, ledgerRoot, version, baselineVersion, forCommit } = input;
   const full = (reason: string, priorCommit: string | null = null, totalTests: number | null = null): GateRadiusShadowPlan =>
     ({ schema: 1, version, priorCommit, forCommit, proposed: 'full', files: [], totalTests, reason });
@@ -105,8 +109,14 @@ export function planGateRadiusShadow(input: { repo: string; ledgerRoot: string; 
       existsAtTip: (file) => tree.files.includes(file),
       closure: (code) => testsReachingChanged(tree, code, tests) });
     if (!result.ok) return full(result.reason, priorCommit, tests.length);
-    // Shadow only: this proposal is never passed to writePartialPlan/readPartialPlan or the sweep selector.
-    return { schema: 1, version, priorCommit, forCommit, proposed: 'partial', files: result.plan.files,
+    // Shadow only: calculate both closure radii. `files` and the live selector keep using the current radius.
+    const lazy = (input.compareCliShadow ?? testsReachingChangedCliLazyRequireShadow)(tree, effective, tests);
+    const priorFailureFiles = [...new Set([...failures.failures, ...(failures.errors ?? [])].map(testFileOfId))];
+    const proposedFiles = lazy.proposed.ok ? [...new Set([...lazy.proposed.tests, ...priorFailureFiles])].sort() : [];
+    const lazyRequireShadow = { currentFiles: result.plan.files, proposedFiles, cliSpawnTests: lazy.cliSpawnTests.length,
+      currentTests: result.plan.files.length, proposedTests: proposedFiles.length, measured: lazy.proposed.ok,
+      reason: lazy.proposed.ok ? 'shadow-comparison-only' : `candidate-failed-closed:${lazy.proposed.reason}` };
+    return { schema: 1, version, priorCommit, forCommit, proposed: 'partial', files: result.plan.files, lazyRequireShadow,
       totalTests: tests.length, reason: result.plan.kind === 'carry' ? 'zero-file candidate' : 'import radius candidate' };
   } catch (error) { return full(`shadow evidence unreadable: ${String(error)}`); }
 }
@@ -132,7 +142,12 @@ export function shadowActual(input: { plan: GateRadiusShadowPlan; outcome: 'ok' 
   const selected = new Set(input.plan.files);
   const missedIntroduced = input.plan.proposed === 'partial' && input.fullSweep
     ? input.introduced.filter((id) => { try { return !selected.has(testFileOfId(id)); } catch { return true; } }) : [];
+  const lazySelected = new Set(input.plan.lazyRequireShadow?.proposedFiles ?? []);
+  const lazyRequireMissedFailures = input.plan.lazyRequireShadow?.measured === true && input.fullSweep
+    ? [...new Set([...input.cutFailures, ...input.cutErrors])].filter((id) => { try { return !lazySelected.has(testFileOfId(id)); } catch { return true; } }) : undefined;
   return { commit: input.plan.forCommit, outcome: input.outcome, cutRc: input.cutRc, introduced: [...input.introduced],
     cutFailures: [...input.cutFailures], cutErrors: [...input.cutErrors], missedIntroduced, fullSweep: input.fullSweep,
+    ...(lazyRequireMissedFailures ? { lazyRequireMissedFailures, lazyRequireComparison: 'complete' as const }
+      : input.plan.lazyRequireShadow ? { lazyRequireMissedFailures: [], lazyRequireComparison: 'unmeasured' as const } : {}),
     comparison: input.fullSweep ? 'complete' : 'unmeasured' };
 }

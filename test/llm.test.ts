@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // ── LLM message-shape tests ──
 //
 // Covers the Phase 8 surface:
@@ -13,22 +14,7 @@ import { afterEach, beforeEach, describe, test, expect, spyOn } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import {
-  buildMessagesWithContext,
-  toOpenAIMessage,
-  toAnthropicMessage,
-  systemToAnthropicString,
-  isLikelyVisionModel,
-  streamLLM,
-  _remainingFallbackProviderNamesForTest,
-  streamLLMWithTools,
-  PROVIDERS,
-  type LLMMessage,
-  type ContentBlock,
-  type LLMProvider,
-  type LLMStreamEvent,
-  type LLMToolSpec,
-} from '../src/llm';
+import { buildMessagesWithContext, toOpenAIMessage, toAnthropicMessage, systemToAnthropicString, isLikelyVisionModel, streamLLM, _remainingFallbackProviderNamesForTest, streamLLMWithTools, PROVIDERS, type LLMMessage, type ContentBlock, type LLMProvider, type LLMStreamEvent } from '../src/llm';
 import { createContextRegistry, addAttachment } from '../src/context';
 import { setUserConfigOverlay } from '../src/user-config';
 import { debug } from '../src/debug/log';
@@ -1323,7 +1309,7 @@ describe('providerSupportsAudio (§3.4 · 2026-04-30)', () => {
   // Need a separate import block — providerSupportsAudio is in
   // src/llm.ts. We dynamically require to avoid touching the
   // existing import line.
-  const { providerSupportsAudio } = require('../src/llm');
+  const { providerSupportsAudio } = require('../src/llm/provider-capabilities');
 
   test('OpenAI gpt-4o-audio-preview → true', () => {
     expect(providerSupportsAudio('gpt-4o-audio-preview')).toBe(true);

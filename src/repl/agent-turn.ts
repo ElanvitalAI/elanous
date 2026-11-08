@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // WT-A-3b — `:agent` LLM-driven runTurn wrapper.
 //
 // Bridges the sticky-REPL `:agent <prompt>` meta-command to the daemon's
@@ -28,7 +29,7 @@ import { buildTerminalCapableTurn } from '../agent/terminal-surface.js';
 import { PTY_SHELL_TOOL_NAMES } from '../boot/daemon-tools/pty-shell.js';
 import { runGoalLoop } from '../core-turn/run-goal-loop.js';
 import type { CoreTurnContext } from '../core-turn/types.js';
-import { maybeImageBearingResult, type LLMMessage, type LLMToolSpec } from '../llm.js';
+import { maybeImageBearingResult, type LLMMessage } from '../llm.js';
 import { buildAcpPrompt, type NormalizedAttachment } from '../acp/content-blocks.js';
 import {
   collectAgentContext,

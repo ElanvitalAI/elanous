@@ -9,6 +9,7 @@ import { _setRotationConfigReaderForTesting } from '../oauth/codex-account-store
 import * as codexModule from '../oauth/codex.js';
 import { refreshCodexAccountHome } from '../oauth/codex.js';
 import { loadTokens, saveTokens } from '../oauth/store.js';
+import { createFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import {
   registerProviderCommands,
   buildCodexAccountImportGuidance as directGuidance,
@@ -222,10 +223,10 @@ describe('provider codex account refresh', () => {
     const err = spyOn(console, 'error').mockImplementation((...values: unknown[]) => { lines.push(values.join(' ')); });
     let fetches = 0;
     // ⛔ never the network — the default refresher's fetch is answered here.
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async () => {
+    const fetchDevice = createFakeFetchDevice([{ url: 'https://auth.openai.com/oauth/token', method: 'POST', response: () => {
       fetches++;
       return new Response(JSON.stringify({ access_token: jwt(240), refresh_token: 'rt-new.Zz-9_rotated-token' }), { status: 200, headers: { 'content-type': 'application/json' } });
-    }) as unknown as typeof fetch);
+    } }]);
     const prevExit = process.exitCode;
     process.exitCode = 0;
     try {
@@ -237,7 +238,7 @@ describe('provider codex account refresh', () => {
     } finally {
       process.exitCode = prevExit ?? 0;
       directSinkSeam(undefined);
-      fetchSpy.mockRestore(); err.mockRestore(); log.mockRestore();
+      fetchDevice.restore(); err.mockRestore(); log.mockRestore();
     }
   }
 

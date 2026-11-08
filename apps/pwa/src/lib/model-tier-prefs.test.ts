@@ -82,6 +82,21 @@ describe('M1-2 · localStorage round-trip', () => {
     expect(prefs.audioMinPerDay).toBe(5);
   });
 
+  test('drops embedding and vision tiers from the PWA preference schema', () => {
+    localStorage.setItem(KEY, JSON.stringify({
+      stt: 'best', embedding: 'loaded', vision: 'best', audioMinPerDay: 4,
+    }));
+    const prefs = loadModelTierPrefs();
+    expect(prefs.stt).toBe('best');
+    expect(prefs).not.toHaveProperty('embedding');
+    expect(prefs).not.toHaveProperty('vision');
+
+    saveModelTierPrefs({ llm: 'balanced' });
+    const persisted = JSON.parse(localStorage.getItem(KEY)!);
+    expect(persisted).not.toHaveProperty('embedding');
+    expect(persisted).not.toHaveProperty('vision');
+  });
+
   test('negative audioMinPerDay clamped to 0', () => {
     saveModelTierPrefs({ audioMinPerDay: -10 });
     expect(loadModelTierPrefs().audioMinPerDay).toBe(0);

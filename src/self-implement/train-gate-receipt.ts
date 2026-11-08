@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import {
   computeReceiptKey,
@@ -87,7 +87,11 @@ export async function recordPassedSelfGateReceipt(
   const interference = await detect(testFiles);
   if (interference.status !== 'no-interference') return undefined;
   const identity = identityFor(input, ['test-interference:changed-only']);
-  const path = process.env.ELANOUS_GATE_RECEIPT_REGISTRY_PATH || registryPath(input.repo);
+  // Train workers harvest this artifact-local registry after the gate process exits. The gate
+  // process itself gets the env override, but the later receipt-writer invocation may not inherit
+  // that scoped env; keep its output beside the summary so the worker can return the marker.
+  const path = process.env.ELANOUS_GATE_RECEIPT_REGISTRY_PATH
+    || join(dirname(input.summaryPath), 'gate-receipts.json');
   if (!identity || !path) return undefined;
   const receipt = passedEvidenceReceipt(identity, input.changedFiles);
   try { saveGateReceipt(path, receipt); }

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S4 P1: ResearchPlan LLM tool ──
 //
 // One entry point for every non-mutable read and mission-level write
@@ -13,7 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   appendNote,
   discoverObsidianVault,

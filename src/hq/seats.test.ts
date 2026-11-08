@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,7 @@ let temp: string;
 let home: string;
 let remote: string;
 let seed: string;
+let debugCleanups: (() => void)[] = [];
 const cli = join(import.meta.dir, '../../bin/elanous.mjs');
 function command(bin: string, args: string[], cwd = temp, env: NodeJS.ProcessEnv = process.env) {
   return spawnSync(bin, args, { cwd, env, encoding: 'utf8', timeout: 60_000 });
@@ -40,6 +41,20 @@ function captureRefreshSkipped(): { events: () => { category: string; event: str
     unregister: () => { debug.setLogDietGuard(previousGuard); unregisterSink(); },
   };
 }
+function captureRemoteOperations(): { events: () => { category: string; event: string; data?: unknown }[]; unregister: () => void } {
+  const seen: { category: string; event: string; data?: unknown }[] = [];
+  const previousGuard = debug.setLogDietGuard(null);
+  const unregisterSink = debug.registerSink({
+    name: 'hq-seat-remote-operation-test',
+    emit: rec => { seen.push({ category: rec.category, event: rec.event, data: rec.data }); },
+  });
+  const unregister = () => { debug.setLogDietGuard(previousGuard); unregisterSink(); };
+  debugCleanups.push(unregister);
+  return {
+    events: () => seen.filter(e => e.category === 'hq.seat.remote' && e.event === 'remote-operation'),
+    unregister,
+  };
+}
 function fixture() {
   remote = join(temp, 'remote.git');
   seed = join(temp, 'seed');
@@ -54,6 +69,7 @@ function fixture() {
   git(['push', '-u', 'origin', 'main'], seed);
 }
 beforeEach(() => {
+  debugCleanups = [];
   // Real path: macOS tmpdir is a /var symlink, and house.json records resolved paths.
   temp = realpathSync(mkdtempSync(join(tmpdir(), 'hq-seats-')));
   home = join(temp, 'home');
@@ -65,6 +81,7 @@ beforeEach(() => {
   fixture();
 });
 afterEach(() => {
+  for (const cleanup of debugCleanups.reverse()) cleanup();
   delete process.env.GIT_CONFIG_NOSYSTEM;
   delete process.env.GIT_CONFIG_GLOBAL;
   rmSync(temp, { recursive: true, force: true });
@@ -891,6 +908,7 @@ test('remote seat lifecycle runs on the selected SSH host and records its host w
   expect(help.stdout).toContain('--host <host>');
   expect(help.stdout).toContain('--delete');
   const calls: { host: string; script: string }[] = [];
+  const captured = captureRemoteOperations();
   const outcomes = ['created', 'refreshed', 'removed'];
   const ssh = (host: string, script: string) => {
     calls.push({ host, script });
@@ -928,6 +946,42 @@ test('remote seat lifecycle runs on the selected SSH host and records its host w
   expect(calls[2]?.script).not.toContain('config --replace-all remote.origin.fetch');
   expect(calls[2]?.script).not.toContain('update-ref --no-deref -d');
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).remoteSeats?.OP).toBeUndefined();
+  const eventList = captured.events().map(({ category, event, data }) => {
+    const fields = data as Record<string, unknown>;
+    return { category, event, op: fields.op, host: fields.host, worktree: fields.worktree, ok: fields.ok,
+      ms: typeof fields.ms === 'number' ? '<number>' : fields.ms };
+  });
+  expect(eventList).toMatchInlineSnapshot(`
+    [
+      {
+        "category": "hq.seat.remote",
+        "event": "remote-operation",
+        "host": "mshq",
+        "ms": "<number>",
+        "ok": true,
+        "op": "create",
+        "worktree": "mshq:~/elanous-hq/seats/OP",
+      },
+      {
+        "category": "hq.seat.remote",
+        "event": "remote-operation",
+        "host": "mshq",
+        "ms": "<number>",
+        "ok": true,
+        "op": "refresh",
+        "worktree": "mshq:~/elanous-hq/seats/OP",
+      },
+      {
+        "category": "hq.seat.remote",
+        "event": "remote-operation",
+        "host": "mshq",
+        "ms": "<number>",
+        "ok": true,
+        "op": "delete",
+        "worktree": "mshq:~/elanous-hq/seats/OP",
+      },
+    ]
+  `);
 }, 120_000);
 
 test('remote seat preserves SSH failure text and does not register a failed create', () => {
@@ -935,9 +989,50 @@ test('remote seat preserves SSH failure text and does not register a failed crea
   const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
     { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
   expect(init.status, init.stderr).toBe(0);
+  const captured = captureRemoteOperations();
   expect(() => hqSeat('OP', { root, host: 'mshq', ssh: () => ({ status: 255, stdout: 'stdout detail', stderr: 'ssh: connect timed out' }) }))
     .toThrow('stderr:\nssh: connect timed out\nstdout:\nstdout detail');
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).remoteSeats?.OP).toBeUndefined();
+  expect(captured.events()).toHaveLength(1);
+  expect(captured.events()[0]?.data).toMatchObject({ op: 'create', host: 'mshq', worktree: 'mshq:~/elanous-hq/seats/OP', ok: false });
+  expect(typeof (captured.events()[0]?.data as Record<string, unknown>).ms).toBe('number');
+}, 120_000);
+
+test('remote refresh and delete failures each record an unsuccessful boundary and retain registration', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  const captured = captureRemoteOperations();
+  const calls: string[] = [];
+  const ssh = (_host: string, _script: string) => {
+    const op = calls.length === 0 ? 'create' : calls.length === 1 ? 'refresh' : 'delete';
+    calls.push(op);
+    return op === 'create'
+      ? { status: 0, stdout: 'HQ_SEAT_RESULT=created\n', stderr: '' }
+      : { status: 255, stdout: '', stderr: `${op} failed` };
+  };
+  hqSeat('OP', { root, host: 'mshq', home: join(home, 'config'), ssh });
+  expect(() => hqSeat('OP', { root, refresh: true, ssh })).toThrow('refresh failed');
+  expect(() => hqSeat('OP', { root, delete: true, ssh })).toThrow('delete failed');
+  expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).remoteSeats.OP).toEqual({ host: 'mshq', path: '~/elanous-hq/seats/OP' });
+  expect(captured.events().map(event => (event.data as Record<string, unknown>).op)).toEqual(['create', 'refresh', 'delete']);
+  expect(captured.events().map(event => (event.data as Record<string, unknown>).ok)).toEqual([true, false, false]);
+}, 120_000);
+
+test('remote seat operation result is unchanged when debug logging throws', () => {
+  const root = join(home, 'elanous-hq');
+  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
+    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  expect(init.status, init.stderr).toBe(0);
+  const logSpy = spyOn(debug, 'log').mockImplementation(() => { throw new Error('log sink failed'); });
+  try {
+    expect(hqSeat('OP', { root, host: 'mshq', home: join(home, 'config'), ssh: () => ({ status: 0, stdout: 'HQ_SEAT_RESULT=created\n', stderr: '' }) }))
+      .toEqual({ path: 'mshq:~/elanous-hq/seats/OP', outcome: 'created' });
+    expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).remoteSeats.OP).toEqual({ host: 'mshq', path: '~/elanous-hq/seats/OP' });
+  } finally {
+    logSpy.mockRestore();
+  }
 }, 120_000);
 
 test('dirty seat --refresh preserves bytes and HEAD with rc 0 and one warning', () => {

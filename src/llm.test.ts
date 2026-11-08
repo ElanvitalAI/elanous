@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { debug } from './debug/log.js';
 import { _setGpt6CodexGuardFlagsForTest, _usesAdaptiveThinkingForContractTest, AnthropicProvider, billingRouteForProvider, codexOAuthAvailable, getGpt6CodexGuardFlags, getGpt6CodexGuardStats, logAgentTurnUsage, PROVIDERS, resetGpt6CodexGuardObservations, streamLLM, streamLLMWithTools, type Gpt6CodexGuardId, type LLMMessage, type LLMProvider } from './llm.js';
 import { _resetCodexBillingDecisionForTesting, noteCodexBillingDecision } from './oauth/codex-billing-route.js';
+import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
 
 test('credits-allowed Codex rotation records credit billing even when Codex auth is not inferred as OAuth', () => {
   // 인증 추론이 oauth 가 «아닌» 우주(빈 HOME·자격 미러 결손)를 고정한다 — oauth 우주에선
@@ -478,20 +479,21 @@ test('Anthropic request for Claude 5.5 includes interleaved-thinking beta', asyn
   const originalKey = process.env.ANTHROPIC_API_KEY;
   process.env.ANTHROPIC_API_KEY = 'test-key';
   const sent: { model: string; beta: string | null }[] = [];
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (_input, init) => {
-    const headers = new Headers(init?.headers);
-    sent.push({ model: JSON.parse(String(init?.body)).model, beta: headers.get('anthropic-beta') });
-    return new Response('data: {"type":"message_stop"}\n\n', { status: 200 });
-  }) as typeof fetch);
   try {
-    for await (const _event of AnthropicProvider.streamChat!([{ role: 'user', content: 'hi' }], {
-      model: 'claude-sonnet-5-5', promptCache: false,
-    })) { /* consume the response */ }
-    expect(sent).toHaveLength(1);
-    expect(sent[0]?.model).toBe('claude-sonnet-5-5');
-    expect(sent[0]?.beta?.split(',')).toContain('interleaved-thinking-2025-05-14');
+    await withFakeFetchDevice([{ url: '/v1/messages', method: 'POST', response: request => {
+      const headers = new Headers(request.headers);
+      sent.push({ model: JSON.parse(String(request.body)).model, beta: headers.get('anthropic-beta') });
+      return new Response('data: {"type":"message_stop"}\n\n', { status: 200 });
+    } }], async (device) => {
+      for await (const _event of AnthropicProvider.streamChat!([{ role: 'user', content: 'hi' }], {
+        model: 'claude-sonnet-5-5', promptCache: false,
+      })) { /* consume the response */ }
+      expect(sent).toHaveLength(1);
+      expect(sent[0]?.model).toBe('claude-sonnet-5-5');
+      expect(sent[0]?.beta?.split(',')).toContain('interleaved-thinking-2025-05-14');
+      expect(device.calls()).toHaveLength(1);
+    });
   } finally {
-    fetchSpy.mockRestore();
     if (originalKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = originalKey;
   }

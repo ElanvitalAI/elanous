@@ -5,7 +5,9 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { findTrack } from '../autopilot/mission-phase-track.js';
-import { wasIntakeEventScheduled } from './route.js';
+import { canonicalUrl, intakeLedgerDir } from './core.js';
+import { wasIntakeEventScheduled } from './event-state.js';
+export { canonicalUrl, intakeLedgerDir } from './core.js';
 
 export const INTAKE_SOURCES = ['x', 'youtube', 'github', 'telegram-saved', 'telegram-bot', 'memo', 'pwa'] as const;
 export type RegisteredIntakeSourceKind = 'rss' | 'command' | 'topic-search' | 'markdown';
@@ -56,38 +58,6 @@ export interface RawIntakeItem {
   signals?: Record<string, number>;
   axis?: string;
   judgement?: IntakeItem['judgement'];
-}
-
-const TRACKING_PARAMS = /^(utm_[a-z]+|fbclid|gclid|igshid|si|feature|ref_src|ref_url|s|mc_cid|mc_eid)$/i;
-
-/** 정규 URL — 같은 대상이 다른 모양으로 와도 같은 id 가 되게. 해석 못 하면 undefined. */
-export function canonicalUrl(raw: string): string | undefined {
-  let u: URL;
-  try { u = new URL(raw.trim()); } catch { return undefined; }
-  if (u.protocol !== 'http:' && u.protocol !== 'https:') return undefined;
-  const host = u.hostname.toLowerCase().replace(/^(www|m|mobile)\./, '');
-  const path = u.pathname.replace(/\/+$/, '');
-  // YouTube — youtu.be · shorts · live · embed · watch 를 watch?v= 로
-  const yt = host === 'youtu.be' ? path.slice(1)
-    : /(^|\.)youtube\.com$/.test(host)
-      ? (u.searchParams.get('v') ?? path.match(/^\/(?:shorts|live|embed|v)\/([^/]+)/)?.[1])
-      : undefined;
-  if (yt && /^[A-Za-z0-9_-]{11}$/.test(yt)) return `https://www.youtube.com/watch?v=${yt}`;
-  // X — 사용자 이름은 바뀔 수 있으니 status id 로
-  if (host === 'x.com' || host === 'twitter.com') {
-    const id = path.match(/\/status(?:es)?\/(\d+)/)?.[1];
-    if (id) return `https://x.com/i/status/${id}`;
-  }
-  // GitHub — 저장소 단위(owner/repo)로 · 대소문자 무시
-  if (host === 'github.com') {
-    const m = path.match(/^\/([^/]+)\/([^/]+)/);
-    if (m && !['orgs', 'topics', 'search', 'settings', 'marketplace', 'features'].includes(m[1].toLowerCase())) {
-      return `https://github.com/${m[1].toLowerCase()}/${m[2].toLowerCase().replace(/\.git$/, '')}`;
-    }
-  }
-  const params = [...u.searchParams.entries()].filter(([k]) => !TRACKING_PARAMS.test(k)).sort(([a], [b]) => a.localeCompare(b));
-  const q = params.length ? `?${new URLSearchParams(params).toString()}` : '';
-  return `https://${host}${path}${q}`;
 }
 
 function normalizedSeat(seat: unknown): string | undefined {
@@ -158,7 +128,6 @@ export function shapeIntakeItem(source: IntakeSource | RegisteredIntakeSourceKin
   };
 }
 
-export function intakeLedgerDir(instanceRoot: string): string { return join(instanceRoot, 'intake'); }
 function ledgerFile(instanceRoot: string): string { return join(intakeLedgerDir(instanceRoot), 'items.jsonl'); }
 
 /** 원장 = 덧붙이기만 하는 줄 목록 · 같은 id 는 마지막 줄이 이긴다. 깨진 줄은 건너뛰고 센다. */

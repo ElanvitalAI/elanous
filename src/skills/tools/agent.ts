@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Agent tool (Claude Code-compatible Task spawn) ──
 //
 // Lets a skill's LLM delegate a focused unit of work to a sub-agent
@@ -35,7 +36,7 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { debug } from '../../debug/log.js';
-import type { LLMToolSpec, LLMProvider } from '../../llm.js';
+import type { LLMProvider } from '../../llm.js';
 import {
   globalAgentRegistry, collectAgentText,
 } from '../../agent/registry.js';

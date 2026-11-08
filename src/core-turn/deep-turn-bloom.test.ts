@@ -1,5 +1,6 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { afterEach, describe, expect, it, mock, spyOn } from 'bun:test';
-import type { LLMToolSpec } from '../llm.js';
+
 import * as llmModule from '../llm.js';
 import { runCoreTurn } from './run-core-turn.js';
 import {

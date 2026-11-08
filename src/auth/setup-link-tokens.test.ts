@@ -1,11 +1,11 @@
 import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import * as setupLinkTokens from './setup-link-tokens.js';
-import { claimSetupLinkToken, issueSetupLinkToken, matchSetupBearer, SETUP_LINK_TTL_MS } from './setup-link-tokens.js';
+import { claimCredentialRegistrationLinkToken, claimSetupLinkToken, consumeCredentialRegistrationBearer, issueCredentialRegistrationLinkToken, issueSetupLinkToken, matchSetupBearer, revokeCredentialRegistrationLinkToken, SETUP_LINK_TTL_MS } from './setup-link-tokens.js';
 import { issueTempToken, matchTempToken } from './temp-tokens.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -62,6 +62,77 @@ describe('setup-link token storage and claim', () => {
     expect(matchSetupBearer(claimed.bearer, { now: Date.parse(claimed.expiresAt) })).toBeNull();
     expect(matchSetupBearer(issued.token, { now: now + 1 })).toBeNull();
     expect(matchSetupBearer('elsb_' + 'A'.repeat(43), { now: now + 1 })).toBeNull();
+  });
+
+  test('credential registration links bind a short-lived bearer to one slot and consume it once', () => {
+    const issued = issueCredentialRegistrationLinkToken('cred:openai.api_key', { now });
+    expect(issued.expiresAt).toBe(new Date(now + SETUP_LINK_TTL_MS).toISOString());
+    expect(() => issueCredentialRegistrationLinkToken('cred:unknown.api_key', { now })).toThrow('ELANOUS_CREDENTIAL_SLOT_UNSUPPORTED');
+    expect(claimSetupLinkToken(issued.token, { now: now + 1 })).toEqual({ ok: false, reason: 'unknown' });
+    expect(claimCredentialRegistrationLinkToken(issued.token, { now: Date.parse(issued.expiresAt) })).toEqual({ ok: false, reason: 'expired' });
+
+    const link = issueCredentialRegistrationLinkToken('cred:openai.api_key', { now });
+    const claimed = claimCredentialRegistrationLinkToken(link.token, { now: now + 1 });
+    if (!claimed.ok) throw new Error('expected successful credential link claim');
+    expect(claimed.slot).toBe('cred:openai.api_key');
+    expect(Date.parse(claimed.expiresAt)).toBe(now + 1 + 5 * 60_000);
+    expect(claimed.bearer).toMatch(/^elcr_[A-Za-z0-9_-]{43}$/);
+    expect(consumeCredentialRegistrationBearer(claimed.bearer, 'cred:elevenlabs.api_key', { now: now + 2 }))
+      .toEqual({ ok: false, reason: 'wrong-slot' });
+    expect(consumeCredentialRegistrationBearer(claimed.bearer, claimed.slot, { now: now + 2 }))
+      .toEqual({ ok: true, slot: 'cred:openai.api_key' });
+    expect(consumeCredentialRegistrationBearer(claimed.bearer, claimed.slot, { now: now + 3 }))
+      .toEqual({ ok: false, reason: 'used' });
+    expect(consumeCredentialRegistrationBearer(claimed.bearer, claimed.slot, { now: Date.parse(claimed.expiresAt) }))
+      .toEqual({ ok: false, reason: 'expired' });
+
+    const expiring = issueCredentialRegistrationLinkToken('cred:openai.api_key', { now });
+    const expiringClaim = claimCredentialRegistrationLinkToken(expiring.token, { now: now + 1 });
+    if (!expiringClaim.ok) throw new Error('expected successful credential link claim');
+    expect(consumeCredentialRegistrationBearer(expiringClaim.bearer, expiringClaim.slot, { now: Date.parse(expiringClaim.expiresAt) }))
+      .toEqual({ ok: false, reason: 'expired' });
+    expect(store()).not.toContain(link.token);
+    expect(store()).not.toContain(claimed.bearer);
+  });
+
+  test('credential claim checks expiry after waiting for the token-store lock', async () => {
+    const link = issueCredentialRegistrationLinkToken('cred:openai.api_key', { now });
+    const parsed = JSON.parse(store()) as { tokens: Array<{ hash: string; expiresAt: string }> };
+    const linkHash = createHash('sha256').update(link.token).digest('hex');
+    const entry = parsed.tokens.find((candidate) => candidate.hash === linkHash)!;
+    entry.expiresAt = new Date(Date.now() + 80).toISOString();
+    writeFileSync(join(dir, 'setup-link-tokens.json'), JSON.stringify(parsed), { mode: 0o600 });
+
+    const fixture = join(import.meta.dir, 'setup-link-tokens.fixture.ts');
+    const child = Bun.spawn([process.execPath, fixture, 'hold-for', dir, '', '', '180'], { stdout: 'pipe', stderr: 'pipe' });
+    const reader = child.stdout.getReader();
+    await reader.read();
+    const result = claimCredentialRegistrationLinkToken(link.token, { dir });
+    expect(result).toEqual({ ok: false, reason: 'expired' });
+    const [exit, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    expect(exit).toBe(0);
+    expect(stderr).toBe('');
+  });
+
+  test('owner cancellation revokes both an unclaimed link and an exchanged bearer', () => {
+    const link = issueCredentialRegistrationLinkToken('cred:openai.api_key', { now });
+    expect(revokeCredentialRegistrationLinkToken(link.token, { now: now + 1 })).toBe(true);
+    expect(claimCredentialRegistrationLinkToken(link.token, { now: now + 2 })).toEqual({ ok: false, reason: 'revoked' });
+    expect(revokeCredentialRegistrationLinkToken(link.token, { now: now + 2 })).toBe(false);
+
+    const exchanged = issueCredentialRegistrationLinkToken('cred:openai.api_key', { now });
+    const claimed = claimCredentialRegistrationLinkToken(exchanged.token, { now: now + 1 });
+    if (!claimed.ok) throw new Error('expected successful credential link claim');
+    expect(revokeCredentialRegistrationLinkToken(exchanged.token, { now: now + 2 })).toBe(true);
+    expect(consumeCredentialRegistrationBearer(claimed.bearer, claimed.slot, { now: now + 3 }))
+      .toEqual({ ok: false, reason: 'revoked' });
+
+    const nearExpiry = issueCredentialRegistrationLinkToken('cred:openai.api_key', { now });
+    const lateClaim = claimCredentialRegistrationLinkToken(nearExpiry.token, { now: now + SETUP_LINK_TTL_MS - 1 });
+    if (!lateClaim.ok) throw new Error('expected late credential link claim');
+    expect(revokeCredentialRegistrationLinkToken(nearExpiry.token, { now: now + SETUP_LINK_TTL_MS + 1 })).toBe(true);
+    expect(consumeCredentialRegistrationBearer(lateClaim.bearer, lateClaim.slot, { now: now + SETUP_LINK_TTL_MS + 2 }))
+      .toEqual({ ok: false, reason: 'revoked' });
   });
 
   test('owner temp-token storage and matching remain independent of setup links', () => {

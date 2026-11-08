@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { createGateRunner, judgeGate, readShardArtifacts, type GateRunner, type GateTools } from './gate-node.js';
 import { planStalledShardRecheck } from './gate-partial.js';
 import { gateShardRuntimeIdentityKey, planGateShardDispatch, type GateShardReceipt } from './gate-shard-dispatch.js';
+import { summarizeGateShardExecution } from './gate-shard-receipts.js';
 import { createFakeKubectl } from '../../src/ux-sim/fake-kubectl.js';
 import { createFakeGh } from '../../src/ux-sim/fake-gh.js';
 import { planPartialRegate } from './gate-partial.js';
@@ -28,9 +29,13 @@ export type GateScenario = {
   action: GateScenarioAction;
   planner?: 'dispatch' | 'partial';
   expectedDispatchKinds?: Array<'reuse' | 'run' | 'unmeasured'>;
+  expectedDispatchSummary?: ReturnType<typeof summarizeGateShardExecution>;
   expectedPartialFiles?: string[];
   dispatchInput?: { head40?: string; receipts: 'complete' | 'absent' | 'identity-mismatch'; minihAvailable: boolean;
-    msb1Available?: boolean; receiptHosts?: Record<string, string>; rerouteShard?: string };
+    msb1Available?: boolean; receiptHosts?: Record<string, string>; rerouteShard?: string;
+    failedShardIds?: string[]; testHashDriftShardIds?: string[]; missingTestHashesShardIds?: string[];
+    baselineFailureIds?: string[]; sameHeadPreexistingFailureIds?: string[];
+    shardCount?: number; reusableShardCount?: number };
   partialInput?: { kind: 'stalled'; stalledFiles: string[] } | { kind: 'changed-head'; priorCommit: string; forCommit: string; changedFiles: string[] };
 };
 
@@ -53,6 +58,12 @@ export const GATE_NODE_SIM_SCENARIOS: readonly GateScenario[] = [
   { id: 'all-hosts-down', injectedInput: 'no eligible host; preserve an unmeasured HOLD', gateInjection: 'hold', expectedOutcome: 'error', expectedError: 'simulated HOLD: no eligible host; preserve an unmeasured HOLD', action: 'HOLD', planner: 'dispatch', dispatchInput: { receipts: 'absent', minihAvailable: false, msb1Available: false }, expectedDispatchKinds: ['unmeasured', 'unmeasured'] },
   { id: 'partial-resume', injectedInput: 'resume only the stopped shard', gateInjection: 'pass', expectedOutcome: 'ok', action: 'remeasure', planner: 'partial', partialInput: { kind: 'stalled', stalledFiles: ['src/stopped.test.ts'] }, expectedPartialFiles: ['src/stopped.test.ts'] },
   { id: 'same-head-receipt', injectedInput: 'complete receipt at the same head and base with matching shard inventory', gateInjection: 'pass', expectedOutcome: 'ok', action: 'reuse', planner: 'dispatch', dispatchInput: { receipts: 'complete', minihAvailable: true }, expectedDispatchKinds: ['reuse', 'reuse'] },
+  { id: 'same-head-failure-receipt', injectedInput: 'remeasure a same-head failure without a baseline proof while reusing its healthy sibling', gateInjection: 'regression', expectedOutcome: 'regression', action: 'HOLD', planner: 'dispatch', dispatchInput: { receipts: 'complete', minihAvailable: true, failedShardIds: ['pod-0'] }, expectedDispatchKinds: ['run', 'reuse'] },
+  { id: 'same-head-preexisting-failure-receipt', injectedInput: 'reuse a same-head failure only when its exact failure ID is preexisting in the baseline', gateInjection: 'regression', expectedOutcome: 'ok', action: 'reuse', planner: 'dispatch', dispatchInput: { receipts: 'complete', minihAvailable: true, failedShardIds: ['pod-0'], baselineFailureIds: [FILE + ' > simulated failure'], sameHeadPreexistingFailureIds: [FILE + ' > simulated failure'] }, expectedDispatchKinds: ['reuse', 'reuse'] },
+  { id: 'same-head-changed-failure-receipt', injectedInput: 'remeasure a same-head failure when its failure ID differs from the baseline', gateInjection: 'regression', expectedOutcome: 'regression', action: 'HOLD', planner: 'dispatch', dispatchInput: { receipts: 'complete', minihAvailable: true, failedShardIds: ['pod-0'], baselineFailureIds: [FILE + ' > old baseline failure'], sameHeadPreexistingFailureIds: [FILE + ' > old baseline failure'] }, expectedDispatchKinds: ['run', 'reuse'] },
+  { id: 'same-head-tested-hash-drift', injectedInput: 'same commit and test inventory with legacy receipt hash values that differ', gateInjection: 'pass', expectedOutcome: 'ok', action: 'reuse', planner: 'dispatch', dispatchInput: { receipts: 'complete', minihAvailable: true, testHashDriftShardIds: ['pod-0'] }, expectedDispatchKinds: ['reuse', 'reuse'] },
+  { id: 'same-head-legacy-unhashed-receipt', injectedInput: 'legacy same-head receipt predates per-test blob hashes', gateInjection: 'pass', expectedOutcome: 'ok', action: 'reuse', planner: 'dispatch', dispatchInput: { receipts: 'complete', minihAvailable: true, missingTestHashesShardIds: ['pod-0'] }, expectedDispatchKinds: ['reuse', 'reuse'] },
+  { id: 'same-head-receipt-disposition-summary', injectedInput: '12 reused shard receipts and 69 rerun shards from one same-head gate invocation', gateInjection: 'pass', expectedOutcome: 'ok', action: 'remeasure', planner: 'dispatch', dispatchInput: { receipts: 'complete', minihAvailable: true, shardCount: 81, reusableShardCount: 12 }, expectedDispatchSummary: { plannedShards: 81, reusedShards: 12, rerunShards: 69, unmeasuredShards: 0, selectedFiles: 69, carriedFiles: 12, action: 'partial-sweep' } },
   { id: 'changed-head-outside-radius', injectedInput: 'changed head outside permitted radius', gateInjection: 'pass', expectedOutcome: 'ok', action: 'full sweep', planner: 'dispatch', dispatchInput: { head40: 'd'.repeat(40), receipts: 'complete', minihAvailable: true }, expectedDispatchKinds: ['run', 'run'] },
   { id: 'changed-head-inside-radius', injectedInput: 'changed head inside permitted radius', gateInjection: 'pass', expectedOutcome: 'ok', action: 'remeasure', planner: 'partial', partialInput: { kind: 'changed-head', priorCommit: B, forCommit: H, changedFiles: [FILE] }, expectedPartialFiles: [FILE] },
   { id: 'receipt-identity-mismatch', injectedInput: 'receipt identity differs from expected shard', gateInjection: 'pass', expectedOutcome: 'ok', action: 'remeasure', planner: 'dispatch', dispatchInput: { receipts: 'identity-mismatch', minihAvailable: true }, expectedDispatchKinds: ['run', 'reuse'] },
@@ -64,35 +75,44 @@ export const GATE_NODE_SIM_SCENARIOS: readonly GateScenario[] = [
   { id: 'partial-planner-gate-regression', injectedInput: 'partial planner proposes remeasurement while the gate reports a regression', gateInjection: 'regression', expectedOutcome: 'regression', action: 'HOLD', planner: 'partial', partialInput: { kind: 'stalled', stalledFiles: ['src/stopped.test.ts'] }, expectedPartialFiles: ['src/stopped.test.ts'] },
 ];
 
-function makeReceipt(id: string, files: string[], host: string): GateShardReceipt {
+function makeReceipt(id: string, files: string[], host: string, options: { failed?: boolean; testHashDrift?: boolean; missingTestHashes?: boolean } = {}): GateShardReceipt {
   const imageDigest = 'sha256:' + 'a'.repeat(64);
   const runtimeIdentity = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'e'.repeat(64), baseImageDigest: 'sha256:' + 'a'.repeat(64) };
   const lockfileHash = 'f'.repeat(64);
-  const testedFileHashes = Object.fromEntries(files.map((file) => [file, createHash('sha256').update(file).digest('hex')]));
+  const testedFileHashes = Object.fromEntries(files.map((file) => [file, options.testHashDrift
+    ? 'd'.repeat(64) : createHash('sha256').update(file).digest('hex')]));
   return { id, files, version: '0.2.46', graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, head40: H, base40: B, host, imageDigest, envFingerprint: runtimeIdentity.envFingerprint, runtimeIdentity,
-    lockfileHash, testedFileHashes, envKey: gateShardRuntimeIdentityKey(runtimeIdentity, lockfileHash)!, executions: [{ branch: '', attemptId: 'sim-' + id, host, imageDigest, runtimeIdentity }], status: 'complete',
-    failureIds: [], errorIds: [], evidencePath: '/sim/pod-0.json', evidenceSha256: EVIDENCE,
+    lockfileHash, ...(options.missingTestHashes ? {} : { testedFileHashes }), envKey: gateShardRuntimeIdentityKey(runtimeIdentity, lockfileHash)!, executions: [{ branch: '', attemptId: 'sim-' + id, host, imageDigest, runtimeIdentity }], status: 'complete',
+    failureIds: options.failed ? [`${files[0]} > simulated failure`] : [], errorIds: [], evidencePath: '/sim/pod-0.json', evidenceSha256: EVIDENCE,
     measuredAt: '2026-10-29T00:00:00.000Z', attempt: 1 };
 }
 type PlannerEvidence =
-  | { kind: 'dispatch'; actions: ReturnType<typeof planGateShardDispatch> }
+  | { kind: 'dispatch'; actions: ReturnType<typeof planGateShardDispatch>; summary: ReturnType<typeof summarizeGateShardExecution> }
   | { kind: 'partial'; ok: true; files: string[] }
   | { kind: 'none' };
 
 function plannerDecision(scenario: GateScenario, devices: { head40: string; minihAvailable: boolean; msb1Available: boolean }): { action: GateScenarioAction; evidence: PlannerEvidence } {
   if (scenario.planner === 'dispatch') {
     const input = scenario.dispatchInput ?? { receipts: 'complete' as const, minihAvailable: true };
-    const shards = [{ id: 'pod-0', files: [FILE] }, { id: 'pod-1', files: ['src/second.test.ts'] }];
-    const receipts = input.receipts === 'absent' ? [] : shards.map((shard) => makeReceipt(shard.id,
+    const shards = Array.from({ length: input.shardCount ?? 2 }, (_, index) => ({ id: `pod-${index}`,
+      files: [index === 0 ? FILE : `src/shard-${index}.test.ts`] }));
+    const receiptCount = input.reusableShardCount ?? (input.receipts === 'absent' ? 0 : shards.length);
+    const receipts = shards.slice(0, receiptCount).map((shard) => makeReceipt(shard.id,
       input.receipts === 'identity-mismatch' && shard.id === 'pod-0' ? ['src/other.test.ts'] : shard.files,
-      input.receiptHosts?.[shard.id] ?? 'node-c'));
+      input.receiptHosts?.[shard.id] ?? 'node-c', {
+        failed: input.failedShardIds?.includes(shard.id),
+        testHashDrift: input.testHashDriftShardIds?.includes(shard.id),
+        missingTestHashes: input.missingTestHashesShardIds?.includes(shard.id),
+      }));
+    const currentTestHashes = Object.fromEntries(shards.map((shard) => [shard.id,
+      Object.fromEntries(shard.files.map((file) => [file, createHash('sha256').update(file).digest('hex')]))]));
     const plan = planGateShardDispatch({ head40: devices.head40, base40: B,
       shards, receipts,
       hosts: [{ id: 'node-c', platform: 'linux', available: devices.minihAvailable, reserved: false },
         { id: 'node-b', platform: 'linux', available: devices.msb1Available, reserved: false }],
       graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000,
-      lockfileHash: 'f'.repeat(64), testedFileHashesByShard: Object.fromEntries(shards.map((shard) => [shard.id,
-        Object.fromEntries(shard.files.map((file) => [file, createHash('sha256').update(file).digest('hex')]))])),
+      lockfileHash: 'f'.repeat(64), testedFileHashesByShard: currentTestHashes,
+      sameHeadPreexistingFailureIds: input.sameHeadPreexistingFailureIds,
       environmentIdentity: { imageDigest: 'sha256:' + 'a'.repeat(64), bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: 'e'.repeat(64), baseImageDigest: 'sha256:' + 'a'.repeat(64) },
       ...(input.rerouteShard ? { rerouteShard: input.rerouteShard } : {}),
     });
@@ -110,7 +130,15 @@ function plannerDecision(scenario: GateScenario, devices: { head40: string; mini
     const action = dispositions.every((kind) => kind === 'reuse') ? 'reuse'
       : dispositions.every((kind) => kind === 'remeasure') ? 'full sweep'
         : dispositions.includes('HOLD') ? 'HOLD' : 'remeasure';
-    return { action, evidence: { kind: 'dispatch', actions: plan } };
+    const invocationId = 'sim-gate-run';
+    const summary = summarizeGateShardExecution(plan.map((item) => ({ version: '0.2.46', phase: 'cut' as const,
+      commit: devices.head40, invocationId, shardId: item.shardId, files: [...item.files],
+      state: item.kind === 'unmeasured' ? 'failed' as const : 'done' as const,
+      attribution: item.kind === 'unmeasured' ? 'unmeasured' as const : 'complete' as const,
+      reuseDecision: item.kind === 'reuse' ? 'reuse' as const : item.kind === 'run' ? 'rerun' as const : 'candidate' as const })),
+    { version: '0.2.46', phase: 'cut', commit: devices.head40, invocationId,
+      shards: shards.map((shard) => ({ shardId: shard.id, files: shard.files })) });
+    return { action, evidence: { kind: 'dispatch', actions: plan, summary } };
   }
   if (scenario.planner === 'partial') {
     if (scenario.partialInput?.kind === 'changed-head') {
@@ -148,12 +176,12 @@ export async function judgeInjectedGateEvent(scenario: GateScenario, bisectSimul
   outcome: string; action: GateScenarioAction; evidence: PlannerEvidence; error?: string; podCommandCalls: number;
 }> {
   const root = mkdtempSync(join(tmpdir(), 'gate-node-sim-'));
+  const dispatchInput = scenario.dispatchInput ?? { receipts: 'complete' as const, minihAvailable: true };
   const instanceRoot = join(root, 'instance');
   const ledgerRoot = join(root, 'ledger');
   mkdirSync(join(instanceRoot, 'release/1.0.0'), { recursive: true });
   writeFileSync(join(instanceRoot, 'release/1.0.0/release.json'), JSON.stringify({ sourceCommit: B }));
-  writeFileSync(join(instanceRoot, 'release/1.0.0/gate-failures.json'), JSON.stringify({ commit: B, failures: [] }));
-  const dispatchInput = scenario.dispatchInput ?? { receipts: 'complete' as const, minihAvailable: true };
+  writeFileSync(join(instanceRoot, 'release/1.0.0/gate-failures.json'), JSON.stringify({ commit: B, failures: dispatchInput.baselineFailureIds ?? [] }));
   const minihDevice = createFakeKubectl({ context: dispatchInput.minihAvailable ? 'node-c' : 'node-c-offline', node: 'worker-sim' });
   const gateDevice = createFakeKubectl({ context: 'pool-node-c', node: 'worker-sim' });
   const msb1Device = createFakeKubectl({ context: dispatchInput.msb1Available === false ? 'node-b-offline' : 'node-b', node: 'worker-sim' });

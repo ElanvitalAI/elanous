@@ -5,8 +5,9 @@ import { debug } from '../../debug/log.js';
 import { defaultListHarnessProcesses, type HarnessProcessListObservation } from '../../harness/harness-cli-command.js';
 import { getUserConfig, ORCHESTRATOR_DEFAULTS, type OrchestratorLoopConfig, type OrchestratorSeat } from '../../user-config.js';
 import { seatOfTree, TRAFFIC_SEATS } from './traffic.js';
+import { goalTargetPaths, simulationProofFromGoal, unresolvedGoalTargets } from '../../self-dev/sim-impact-wording.js';
 
-export type WorkItem = { kind: 'pr' | 'goal'; ref: string; seat: OrchestratorSeat | null; files: string[]; cells: string[]; unreadable?: true };
+export type WorkItem = { kind: 'pr' | 'goal'; ref: string; seat: OrchestratorSeat | null; files: string[]; cells: string[]; proofScenario?: string; proofScenarioFound?: boolean; unresolvedTargets?: string[]; unreadable?: true };
 export type WorkRef = Pick<WorkItem, 'kind' | 'ref' | 'seat'>;
 export type Overlap = ({ type: 'file'; path: string } | { type: 'cell'; cell: string }) & { refs: WorkRef[]; crossSeat: boolean };
 
@@ -16,6 +17,10 @@ export interface CollectWorkDeps {
   runGh?: (args: string[]) => string;
   listProcesses?: () => HarnessProcessListObservation;
   readGoal?: (path: string) => string;
+  listTrackedPaths?: (cwd: string) => string[];
+  scenarioExists?: (name: string) => boolean;
+  /** Keep draft/stalled/superseded open PRs for observational inventories that must count every open PR. */
+  includeNonReady?: boolean;
   config?: Pick<OrchestratorLoopConfig, 'seatTrees'>;
 }
 
@@ -27,7 +32,7 @@ const defaultRunGh = (args: string[]): string => execFileSync('bun', ['bin/elano
   cwd: repoRoot, encoding: 'utf8', timeout: 60_000, maxBuffer: 20 * 1024 * 1024,
   stdio: ['ignore', 'pipe', 'pipe'], env: process.env,
 });
-const cellsOf = (text: string): string[] => [...new Set([...text.matchAll(/\b0\.2\.\d+\s+칸\s+([A-Za-z][A-Za-z0-9-]*)/g)].map(match => match[1]!))];
+const cellsOf = (text: string): string[] => [...new Set([...text.matchAll(/\b0\.\d+\.\d+\s+칸\s+([A-Za-z][A-Za-z0-9-]*)/g)].map(match => match[1]!))];
 const seatOfPr = (title: string): OrchestratorSeat | null => {
   const seat = /^\s*\[(OP|TC|MK|UX)\]/.exec(title)?.[1];
   return TRAFFIC_SEATS.find(id => id === seat) ?? null;
@@ -56,11 +61,21 @@ function goalPath(command: string): string | null {
   return candidate && !candidate.startsWith('-') && /\.(?:txt|md)$/.test(candidate) ? candidate : null;
 }
 
-function goalFiles(text: string): string[] {
-  const line = text.split(/\r?\n/, 1)[0] ?? '';
-  const match = /^대상 경로:\s*(.*)$/.exec(line);
-  if (!match) return [];
-  return [...new Set(match[1]!.split(/\s*[·,]\s*/).map(file => file.trim().replace(/^`|`$/g, '')).filter(Boolean))];
+function defaultScenarioExists(name: string): boolean {
+  if (name.startsWith('신설 장치:')) return true;
+  const dir = join(repoRoot, 'scenarios', 'ux-sim');
+  try {
+    const visit = (at: string): boolean => readdirSync(at, { withFileTypes: true }).some((entry) => {
+      const path = join(at, entry.name);
+      if (entry.isDirectory()) return visit(path);
+      if (!entry.isFile() || !/\.ya?ml$/i.test(entry.name)) return false;
+      const relative = path.slice(repoRoot.length + 1);
+      if (name === relative || name === relative.replace(/\.ya?ml$/i, '')) return true;
+      const text = readFileSync(path, 'utf8');
+      return /^(?:id|kind):\s*([^\s#]+)/m.exec(text)?.[1] === name;
+    });
+    return visit(dir);
+  } catch { return false; }
 }
 
 export function collectWork(deps: CollectWorkDeps = {}): CollectWorkResult {
@@ -72,12 +87,30 @@ export function collectWork(deps: CollectWorkDeps = {}): CollectWorkResult {
     : defaultListHarnessProcesses({ include: record => goalPath(record.command) !== null, cwdOnly: true, deadlineMs: COLLECT_WORK_PROCESS_DEADLINE_MS });
   if (observation.status !== 'ok') throw new Error(`process observation ${observation.status}`);
   const cfg = deps.config ?? getUserConfig().loops?.orchestrator ?? ORCHESTRATOR_DEFAULTS;
+  const scenarioProofCache = new Map<string, boolean>();
+  const trackedPathCache = new Map<string, string[]>();
+  const trackedPaths = (cwd: string): string[] => {
+    if (deps.listTrackedPaths) return deps.listTrackedPaths(cwd);
+    const cached = trackedPathCache.get(cwd);
+    if (cached) return cached;
+    try {
+      const paths = execFileSync('git', ['ls-files'], { cwd, encoding: 'utf8', timeout: 10_000 }).split('\n').filter(Boolean);
+      trackedPathCache.set(cwd, paths);
+      return paths;
+    } catch { return []; }
+  };
+  const scenarioExists = deps.scenarioExists ?? ((name: string) => {
+    if (scenarioProofCache.has(name)) return scenarioProofCache.get(name)!;
+    const found = defaultScenarioExists(name);
+    scenarioProofCache.set(name, found);
+    return found;
+  });
   const excluded = { stalled: 0, superseded: 0, draft: 0 };
   const ready = prs.filter(pr => {
     const labels = pr.labels ?? [];
-    if (labels.some(label => label.name === 'elanous:stalled')) { excluded.stalled++; return false; }
-    if (labels.some(label => label.name === 'elanous:superseded')) { excluded.superseded++; return false; }
-    if (pr.isDraft) { excluded.draft++; return false; }
+    if (labels.some(label => label.name === 'elanous:stalled')) { excluded.stalled++; if (!deps.includeNonReady) return false; }
+    if (labels.some(label => label.name === 'elanous:superseded')) { excluded.superseded++; if (!deps.includeNonReady) return false; }
+    if (pr.isDraft) { excluded.draft++; if (!deps.includeNonReady) return false; }
     return true;
   });
   const seatsByPr = new Map<number, Set<OrchestratorSeat>>();
@@ -108,8 +141,10 @@ export function collectWork(deps: CollectWorkDeps = {}): CollectWorkResult {
   }
   const work: WorkItem[] = ready.map(pr => {
     const matched = seatsByPr.get(pr.number);
+    const proofScenario = simulationProofFromGoal(pr.body ?? '');
     return { kind: 'pr', ref: `#${pr.number}`, seat: seatOfPr(pr.title) ?? (matched?.size === 1 ? [...matched][0]! : null),
-      files: pr.files.map(file => file.path), cells: cellsOf(`${pr.title}\n${pr.body ?? ''}`) };
+      files: pr.files.map(file => file.path), cells: cellsOf(`${pr.title}\n${pr.body ?? ''}`),
+      ...(proofScenario ? { proofScenario, proofScenarioFound: scenarioExists(proofScenario) } : {}) };
   });
   for (const process of observation.records) {
     const path = goalPath(process.command);
@@ -128,7 +163,13 @@ export function collectWork(deps: CollectWorkDeps = {}): CollectWorkResult {
       work.push({ kind: 'goal', ref, seat, files: [], cells: [], unreadable: true });
       continue;
     }
-    work.push({ kind: 'goal', ref, seat, files: goalFiles(text), cells: cellsOf(text) });
+    const proofScenario = simulationProofFromGoal(text);
+    const tracked = trackedPaths(cwd ?? repoRoot);
+    const unresolvedTargets = unresolvedGoalTargets(text, tracked);
+    const files = [...new Set([...goalTargetPaths(text, tracked), ...unresolvedTargets])].sort();
+    work.push({ kind: 'goal', ref, seat, files, cells: cellsOf(text),
+      ...(unresolvedTargets.length ? { unresolvedTargets } : {}),
+      ...(proofScenario ? { proofScenario, proofScenarioFound: scenarioExists(proofScenario) } : {}) });
   }
   return { work, excluded, unreadableTrees, unreadableGoals };
 }

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── PFC-S1 P4: TeamCreate / TeamDelete / SendMessage LLM tools ──
 //
 // Thin LLM-visible wrappers around TeamMailbox (P3). These tools let a
@@ -22,7 +23,7 @@
 //     recipient in any team. Roster membership is informational, not
 //     enforced (PX-6 may tighten this).
 
-import type { LLMToolSpec } from '../llm.js';
+
 import {
   globalTeamMailbox,
   type MailboxMessage,

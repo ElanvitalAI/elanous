@@ -3,16 +3,19 @@
  *  gate host (GATE-REMOTE). It reads the previous published version and persists remote gate receipts in the release ledger.
  *  It does not touch the landing freeze or launch Pods. */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { debug } from '../debug/log.js';
 import { runSelfGateCliAsync, type SelfGateCliOptions, type SelfGateCliResult } from '../self-implement/gate-cli.js';
 import { dispatchHeavyCheck, isValidGateHost, type DispatchDeps, type DispatchOptions } from '../self-implement/gate-remote.js';
 import { latestPublishedPreviousVersion } from '../../scripts/release-loop/unattended-release.js';
 import { baseVersion, isReleaseVersion } from '../../scripts/release-loop/release-version.js';
-import type { GateOptions, GateResult, GateRunner } from '../../scripts/release-loop/gate-node.js';
+import type { GateOptions, GateResult, GateRunner } from '../../scripts/release-loop/gate-types.js';
 import { executeTuiNodeCheck, type ExecutedTuiCheck } from '../../scripts/release-loop/tui-node-checks.js';
+import { releaseLedgerRoot } from '../instance/resolve.js';
+import { gateBaselineReceipt, gateGraphPins } from '../../scripts/release-loop/gate-baseline-receipt.js';
 
 export const LIGHT_RC_ALWAYS_FILE = 'release/light-rc-always.txt';
 export const LIGHT_RC_DEFAULT_SHARDS = 4;
@@ -39,9 +42,98 @@ export interface LightRcOptions {
   fixedShardDistribution?: boolean;
   /** Release ledger root for the previous-version lookup (release run's deps.ledgerRoot). */
   ledgerRoot?: string;
+  /** Current release-loop graph run; binds the rehearsal's reusable receipt to its pinned graph/recipe. */
+  graphRunId?: string;
   log?: (line: string) => void;
   /** Rehearsal-only TUI screen check; other light-rc callers keep their current defaults. */
   rehearsalTui?: boolean;
+}
+
+/** Keep only a complete, identity-bound cut proof from the disposable host-gate instance. */
+function persistHostReceiptArtifacts(instanceRoot: string, ledgerRoot: string, version: string, graphRunId: string | undefined): boolean {
+  const versionRoot = join(instanceRoot, 'release', version);
+  let verdict: Record<string, unknown>;
+  let receipt: { valid?: unknown; executionIdentity?: unknown; commit?: unknown; graphSha?: unknown; recipeSha?: unknown; envFingerprint?: unknown } | undefined;
+  try {
+    verdict = JSON.parse(readFileSync(join(versionRoot, 'gate-verdict.json'), 'utf8')) as Record<string, unknown>;
+    receipt = verdict.baselineReceipt as typeof receipt;
+  } catch { return false; }
+  if (receipt?.valid !== true || !receipt.executionIdentity || typeof receipt.commit !== 'string'
+    || typeof receipt.graphSha !== 'string' || typeof receipt.recipeSha !== 'string' || typeof receipt.envFingerprint !== 'string') return false;
+  const source = join(versionRoot, 'gate-logs', 'cut');
+  if (!existsSync(source)) return false;
+  let failures: { commit: string; failures: string[]; errors: string[] };
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(versionRoot, 'gate-failures.json'), 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const row = parsed as { commit?: unknown; failures?: unknown; errors?: unknown };
+    const errors = row.errors === undefined ? [] : row.errors;
+    if (row.commit !== receipt.commit || !Array.isArray(row.failures) || !row.failures.every((item) => typeof item === 'string')
+      || !Array.isArray(errors) || !errors.every((item) => typeof item === 'string') || errors.length > 0) return false;
+    failures = { commit: row.commit as string, failures: row.failures as string[], errors: errors as string[] };
+  } catch { return false; }
+  const pins = gateGraphPins(ledgerRoot, graphRunId);
+  if (!pins || pins.graphSha !== receipt.graphSha || pins.recipeSha !== receipt.recipeSha) return false;
+  const versionLedger = join(ledgerRoot, 'release', version);
+  const verdictPath = join(versionLedger, 'gate-verdict.json');
+  const evidenceParent = join(versionLedger, 'light-rc-receipts');
+  const finalRoot = join(evidenceParent, `${graphRunId}-${randomUUID()}`);
+  const artifactPath = relative(ledgerRoot, finalRoot);
+  const parent = evidenceParent;
+  let stagingRoot: string | undefined;
+  try {
+    mkdirSync(parent, { recursive: true });
+    stagingRoot = mkdtempSync(join(parent, '.incoming-light-rc-'));
+    mkdirSync(join(stagingRoot, 'gate-logs'), { recursive: true });
+    cpSync(source, join(stagingRoot, 'gate-logs', 'cut'), { recursive: true, errorOnExist: true });
+    writeFileSync(join(stagingRoot, 'gate-failures.json'), JSON.stringify(failures, null, 2) + '\n', { mode: 0o600 });
+    renameSync(stagingRoot, finalRoot);
+    const persisted = gateBaselineReceipt({ root: ledgerRoot, version, commit: receipt.commit, fullSweep: true,
+      graphPins: pins, envFingerprint: receipt.envFingerprint, artifactPath });
+    if (!persisted.valid || !persisted.executionIdentity || JSON.stringify(persisted.executionIdentity) !== JSON.stringify(receipt.executionIdentity)) {
+      return false;
+    }
+    const temp = join(versionLedger, `.gate-verdict-${process.pid}-${randomUUID()}.tmp`);
+    try {
+      writeFileSync(temp, JSON.stringify({ ...verdict, baselineReceipt: persisted }, null, 2) + '\n', { mode: 0o600 });
+      renameSync(temp, verdictPath);
+    } finally { if (existsSync(temp)) rmSync(temp, { force: true }); }
+    return true;
+  } catch (error) {
+    debug.log('release.light-rc', 'receipt-copy-failed', { version, graphRunId: graphRunId ?? null,
+      error: error instanceof Error ? error.message : String(error) });
+    return false;
+  }
+  finally { if (stagingRoot && existsSync(stagingRoot)) rmSync(stagingRoot, { recursive: true, force: true }); }
+}
+
+function copyReleaseGraphRun(ledgerRoot: string, instanceRoot: string, runId: string | undefined): void {
+  if (!runId || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(runId)) return;
+  const source = join(ledgerRoot, 'graph-runs', 'release-loop', `${runId}.json`);
+  if (!existsSync(source)) return;
+  const targetDir = join(instanceRoot, 'graph-runs', 'release-loop');
+  mkdirSync(targetDir, { recursive: true });
+  const temp = join(targetDir, `.${runId}-${randomUUID()}.tmp`);
+  try { cpSync(source, temp); renameSync(temp, join(targetDir, `${runId}.json`)); }
+  finally { if (existsSync(temp)) rmSync(temp, { force: true }); }
+}
+
+function activeReleaseGraphRunId(): string | undefined {
+  const contextPath = process.env.ELANOUS_GRAPH_CONTEXT;
+  if (!contextPath) return undefined;
+  try {
+    const context = JSON.parse(readFileSync(contextPath, 'utf8')) as { graphId?: unknown; runId?: unknown };
+    return context.graphId === 'release-loop' && typeof context.runId === 'string'
+      && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(context.runId) ? context.runId : undefined;
+  } catch { return undefined; }
+}
+
+function configuredGatePodPool(): string | undefined {
+  try {
+    const { getUserConfig } = require('../user-config.js') as typeof import('../user-config.js');
+    const pool = getUserConfig().harness?.podPool;
+    return typeof pool === 'string' && pool.trim() ? pool.trim() : undefined;
+  } catch { return undefined; }
 }
 
 export interface LightRcResult {
@@ -79,6 +171,8 @@ export interface LightRcDeps {
   runGate?: (cwd: string, options: SelfGateCliOptions) => SelfGateCliResult | Promise<SelfGateCliResult>;
   /** Release gate recipe seam for explicitly selected remote rehearsal hosts. */
   runFormalHostGate?: (options: GateOptions, runner?: GateRunner) => Promise<GateResult>;
+  /** Test seam; production resolves the remote rehearsal Pod pool from harness.podPool. */
+  gatePodPool?: string;
   /** Optional runner injection for tests that exercise judgeGate itself without remote side effects. */
   formalHostGateRunner?: GateRunner;
   dispatch?: (opts: DispatchOptions, deps?: DispatchDeps) => Promise<number>;
@@ -210,17 +304,26 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
     if (resolvedBase.rc !== 0 || !SHA_RE.test(base40)) throw new Error(`release light-rc: --base does not resolve to a commit (${base})`);
     const scratch = mkdtempSync(join(tmpdir(), 'elanous-light-rc-host-gate-'));
     try {
+      const graphRunId = opts.graphRunId ?? activeReleaseGraphRunId();
+      const ledgerRoot = opts.ledgerRoot ?? releaseLedgerRoot();
+      copyReleaseGraphRun(ledgerRoot, scratch, graphRunId);
+      const gatePodPool = opts.remote ? deps.gatePodPool ?? configuredGatePodPool() : undefined;
       const previous = (() => { try { return (deps.previousVersion ?? latestPublishedPreviousVersion)(baseVersion(version), opts.ledgerRoot); } catch { return undefined; } })();
       const options: GateOptions = {
         commit: measuredCommit, version, baselineCommit: base40, ...(previous ? { baselineVersion: previous } : {}),
+        ...(graphRunId ? { graphRunId } : {}),
+        ...(gatePodPool ? { pod: { pool: gatePodPool, shards } } : {}),
         executor: 'host', remote: opts.remote, full: true, rehearsalTui: opts.rehearsalTui,
         // Keep the gate's disposable instance state isolated, but persist its receipt in the release ledger so the
         // cut gate can inherit same-head/changed-radius evidence after this rehearsal returns.
-        repo: cwd, instanceRoot: scratch, ...(opts.ledgerRoot ? { ledgerRoot: opts.ledgerRoot } : {}),
+        repo: cwd, instanceRoot: scratch, ledgerRoot: scratch, shardLedgerRoot: ledgerRoot, scratchOnly: true,
       };
       const gate = deps.runFormalHostGate
         ? await deps.runFormalHostGate(options, deps.formalHostGateRunner)
-        : await import('../../scripts/release-loop/gate-node.js').then(({ judgeGate }) => judgeGate(options, deps.formalHostGateRunner));
+        : await import('../../scripts/release-loop/gate-api-leaf.js').then(({ judgeGate }) => judgeGate(options, deps.formalHostGateRunner));
+      if (persistHostReceiptArtifacts(scratch, ledgerRoot, version, graphRunId)) {
+        debug.log('release.light-rc', 'receipt-preserved', { version, commit: measuredCommit, graphRunId: graphRunId ?? null });
+      }
       const unclassifiedCount = (gate.stalledShards?.length ?? 0) + (gate.unmeasuredErrors?.length ?? 0)
         + (gate.unmeasuredRecheckFiles?.length ?? 0) + gate.stalledEnv.length;
       const alwaysIncludeMissing = alwaysInclude.filter((path) => !existsSync(join(cwd, path)));

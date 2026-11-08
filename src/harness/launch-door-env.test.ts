@@ -1,4 +1,3 @@
-import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,10 +6,11 @@ import { Database } from 'bun:sqlite';
 import { expect, test } from 'bun:test';
 import { activeRunsForGoal, decideLaunchDoor, launchRequestId, preLaunchGate, resolveLaunchDoorEnv } from '../execution-loop/launch-gate.js';
 import { appendRunLedgerEntry } from '../self-implement/run-ledger.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
 const repo = resolve(import.meta.dir, '../..');
 
-function say(extraEnv: Record<string, string> = {}, flags: string[] = [], activeDuplicate = false) {
+async function say(extraEnv: Record<string, string> = {}, flags: string[] = [], activeDuplicate = false, mode: 'in-process' | 'spawn' = 'in-process') {
   const root = mkdtempSync(join(tmpdir(), 'launch-door-env-'));
   try {
     const state = join(root, 'state');
@@ -37,18 +37,18 @@ function say(extraEnv: Record<string, string> = {}, flags: string[] = [], active
         loadLedger: () => [{ runId, goalId: launchRequestId(sentence), event: 'start', data: {} }] as never,
       }) as readonly string[];
     }
-    const result = spawnSync(process.execPath, [
-      'bin/elanous.mjs', `--test=${state}`, 'harness', 'say', sentence,
+    const result = await simCli([
+      `--test=${state}`, 'harness', 'say', sentence,
       '--child-llm-provider', 'anthropic', '--substrate', 'local', '--no-queue', ...flags,
     ], {
-      cwd: repo, encoding: 'utf8', timeout: 90_000,
+      mode, allowPaths: [['harness', 'say']], stateRoot: state, cwd: repo,
+      ...(mode === 'spawn' ? { timeoutMs: 90_000 } : {}),
       env: {
         PATH: process.env.PATH ?? '', HOME: join(root, 'home'), XDG_CONFIG_HOME: join(root, 'config'),
         NODE_ENV: 'test', ELANOUS_LAUNCH_GATE_LIVE: '1',
         ...extraEnv,
       },
     });
-    expect(result.error).toBeUndefined();
     const ledgerDir = join(state, 'run-ledger');
     const runLedgers = existsSync(ledgerDir) ? readdirSync(ledgerDir).filter((name) => name.endsWith('.jsonl')) : [];
     const requestId = launchRequestId(sentence);
@@ -73,10 +73,10 @@ function say(extraEnv: Record<string, string> = {}, flags: string[] = [], active
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
-test('default shadow records the launch door without refusing before dispatch', () => {
-  const result = say();
+test('default shadow records the launch door without refusing before dispatch', async () => {
+  const result = await say({}, [], false, 'spawn');
   expect(result.stderr).not.toContain('launch door: blocked');
-  expect(result.status).toBe(1);
+  expect(result.exitCode).toBe(1);
   expect(result.stderr).toContain('No LLM provider available');
   expect(result.runLedgers.length).toBeGreaterThan(0);
   expect(result.launchStamps).toHaveLength(0);
@@ -85,16 +85,16 @@ test('default shadow records the launch door without refusing before dispatch', 
   ]));
 }, 300_000);
 
-test('default and empty modes use shadow while explicit permission and signal remain allowed', () => {
+test('default and empty modes use shadow while explicit permission and signal remain allowed', async () => {
   const permission = { ELANOUS_LAUNCH_DOOR_PERMISSION: 'allow', ELANOUS_LAUNCH_DOOR_SIGNAL: 'green' };
   for (const env of [permission, { ...permission, ELANOUS_LAUNCH_DOOR_MODE: '' }]) {
     const resolved = resolveLaunchDoorEnv(env);
     expect(resolved.mode).toBe('shadow');
     expect(decideLaunchDoor({ entrance: 'harness-say', actor: 'DOOR', viaQueue: false }, resolved).allowed).toBe(true);
   }
-  const emptyMode = say({ ...permission, ELANOUS_LAUNCH_DOOR_MODE: '' });
+  const emptyMode = await say({ ...permission, ELANOUS_LAUNCH_DOOR_MODE: '' });
   expect(emptyMode.stderr).not.toContain('launch door: blocked');
-  expect(emptyMode.status).toBe(1);
+  expect(emptyMode.exitCode).toBe(1);
   expect(emptyMode.runLedgers.length).toBeGreaterThan(0);
   expect(emptyMode.launchStamps).toHaveLength(0);
   expect(emptyMode.launchDoorDecisions).toEqual(expect.arrayContaining([
@@ -102,16 +102,16 @@ test('default and empty modes use shadow while explicit permission and signal re
   ]));
 }, 300_000);
 
-test('enforce refuses before dispatch with an explicit status and reason, even when --force-gate would bypass a duplicate', () => {
+test('enforce refuses before dispatch with an explicit status and reason, even when --force-gate would bypass a duplicate', async () => {
   for (const flags of [[], ['--force-gate']]) {
-    const result = say({ ELANOUS_LAUNCH_DOOR_MODE: 'enforce' }, flags, true);
+    const result = await say({ ELANOUS_LAUNCH_DOOR_MODE: 'enforce' }, flags, true);
     expect(result.duplicateRunId).toBeDefined();
     expect(result.activeDuplicateRuns).toEqual([result.duplicateRunId!]);
     const duplicate = preLaunchGate({ goalId: 'same-goal', budget: { action: 'proceed', reasons: [] } }, { activeRuns: () => result.activeDuplicateRuns });
     const forcedDuplicate = preLaunchGate({ goalId: 'same-goal', budget: { action: 'proceed', reasons: [] }, forceLaunch: true }, { activeRuns: () => result.activeDuplicateRuns });
     expect(duplicate.action).toBe('blocked-duplicate');
     expect(forcedDuplicate.action).toBe('proceed');
-    expect(result.status).toBe(3);
+    expect(result.exitCode).toBe(3);
     expect(result.stderr).toContain('launch door: blocked');
     expect(result.stderr).toContain('permission');
     expect(result.stderr).not.toContain('launch gate: blocked-duplicate');
@@ -120,12 +120,12 @@ test('enforce refuses before dispatch with an explicit status and reason, even w
   }
 });
 
-test('ordinary CLI and queue-tick admit a green signal and allow permission under enforce', () => {
+test('ordinary CLI and queue-tick admit a green signal and allow permission under enforce', async () => {
   const permission = { ELANOUS_LAUNCH_DOOR_MODE: 'enforce', ELANOUS_LAUNCH_DOOR_PERMISSION: 'allow', ELANOUS_LAUNCH_DOOR_SIGNAL: 'green' };
   for (const queue of [false, true]) {
-    const result = say({ ...permission, ...(queue ? { ELANOUS_HARNESS_QUEUE_LAUNCH: `hq-${randomUUID()}`, ELANOUS_HARNESS_SEAT: 'OP' } : {}) });
+    const result = await say({ ...permission, ...(queue ? { ELANOUS_HARNESS_QUEUE_LAUNCH: `hq-${randomUUID()}`, ELANOUS_HARNESS_SEAT: 'OP' } : {}) });
     expect(result.stderr).not.toContain('launch door: blocked');
-    expect(result.status).toBe(1);
+    expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('No LLM provider available');
     expect(result.runLedgers.length).toBeGreaterThan(0);
   }
@@ -136,8 +136,8 @@ test('ordinary CLI and queue-tick admit a green signal and allow permission unde
     { ELANOUS_HARNESS_QUEUE_LAUNCH: `hq-${randomUUID()}`, ELANOUS_HARNESS_SEAT: 'OP', ELANOUS_LAUNCH_DOOR_PERMISSION: 'deny' },
   ];
   for (const extra of deniedEnvironments) {
-    const result = say({ ...permission, ...extra });
-    expect(result.status).toBe(3);
+    const result = await say({ ...permission, ...extra });
+    expect(result.exitCode).toBe(3);
     expect(result.stderr).toContain('launch door: blocked');
     expect(result.runLedgers).toEqual([]);
   }

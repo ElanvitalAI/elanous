@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { DaemonClient } from './daemon-client';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../test-devices/fake-fetch';
 import {
   __INTERNAL_HISTORY_TAIL_LIMIT,
   extractMessageText,
@@ -123,20 +124,26 @@ describe('mapServerHistoryToChat', () => {
 
 interface FetchCall { url: string | URL }
 
-const realFetch = globalThis.fetch;
 let httpCalls: FetchCall[] = [];
+let fakeFetch: FakeFetchDevice | undefined;
 
-function mockResponse(opts: { status: number; body: unknown }): typeof fetch {
-  return ((async (input: RequestInfo | URL) => {
-    httpCalls.push({ url: input as string | URL });
-    return {
-      ok: opts.status >= 200 && opts.status < 300,
-      status: opts.status,
-      headers: new Headers({ 'content-type': 'application/json' }),
-      json: async () => opts.body,
-      text: async () => JSON.stringify(opts.body),
-    } as unknown as Response;
-  }) as unknown) as typeof fetch;
+function mockResponse(sessionId: string, opts: { status: number; body: unknown }): void {
+  fakeFetch?.restore();
+  fakeFetch = createFakeFetchDevice([{
+    url: `/v1/sessions/store/${encodeURIComponent(sessionId)}`,
+    response: (request) => {
+      httpCalls.push({ url: request.url });
+      return Response.json(opts.body, { status: opts.status });
+    },
+  }]);
+}
+
+function mockFailure(sessionId: string): void {
+  fakeFetch?.restore();
+  fakeFetch = createFakeFetchDevice([{
+    url: `/v1/sessions/store/${encodeURIComponent(sessionId)}`,
+    response: () => { throw new Error('network down'); },
+  }]);
 }
 
 function makeClient(): DaemonClient {
@@ -149,10 +156,10 @@ function makeClient(): DaemonClient {
 
 describe('fetchDockHistory — NEXUS T3 endpoint contract', () => {
   beforeEach(() => { httpCalls = []; });
-  afterEach(() => { globalThis.fetch = realFetch; });
+  afterEach(() => { fakeFetch?.restore(); fakeFetch = undefined; });
 
   it('issues a GET to /v1/sessions/store/:id with the session id encoded', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse('s-1', {
       status: 200,
       body: { ok: true, messages: [{ role: 'user', content: 'hi' }] },
     });
@@ -163,7 +170,7 @@ describe('fetchDockHistory — NEXUS T3 endpoint contract', () => {
   });
 
   it('folds store tool rows into a compact 🛠️ meta line (P4)', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse('s-1', {
       status: 200,
       body: {
         ok: true,
@@ -179,7 +186,7 @@ describe('fetchDockHistory — NEXUS T3 endpoint contract', () => {
   });
 
   it('returns null silently when the daemon returns 404 unknown_session', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse('s-fresh', {
       status: 404,
       body: { error: 'unknown_session', sessionId: 's-fresh' },
     });
@@ -188,7 +195,7 @@ describe('fetchDockHistory — NEXUS T3 endpoint contract', () => {
   });
 
   it('returns null silently when NEXUS PR k 이전 상태 (503 not-wired)', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse('s-1', {
       status: 503,
       body: { error: 'meta-api-runtime-not-wired' },
     });
@@ -197,13 +204,13 @@ describe('fetchDockHistory — NEXUS T3 endpoint contract', () => {
   });
 
   it('returns null on a network failure rather than throwing', async () => {
-    globalThis.fetch = (async () => { throw new Error('network down'); }) as unknown as typeof fetch;
+    mockFailure('s-1');
     const result = await fetchDockHistory(makeClient(), 's-1');
     expect(result).toBeNull();
   });
 
   it('returns null when the response body is missing the messages array', async () => {
-    globalThis.fetch = mockResponse({
+    mockResponse('s-1', {
       status: 200,
       body: { sessionId: 's-1' },
     });
@@ -212,14 +219,14 @@ describe('fetchDockHistory — NEXUS T3 endpoint contract', () => {
   });
 
   it('skips the fetch entirely on an empty sessionId', async () => {
-    globalThis.fetch = mockResponse({ status: 200, body: { sessionId: '', messages: [] } });
+    mockResponse('', { status: 200, body: { sessionId: '', messages: [] } });
     const result = await fetchDockHistory(makeClient(), '');
     expect(result).toBeNull();
-    expect(httpCalls.length).toBe(0);
+    expect(fakeFetch?.calls()).toEqual([]);
   });
 
   it('encodes path segments with /', async () => {
-    globalThis.fetch = mockResponse({ status: 200, body: { messages: [] } });
+    mockResponse('a/b', { status: 200, body: { messages: [] } });
     await fetchDockHistory(makeClient(), 'a/b');
     expect(String(httpCalls[0]!.url)).toBe('http://localhost:31415/v1/sessions/store/a%2Fb?ifExists=1');
   });

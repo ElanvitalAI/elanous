@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // src/autopilot/tool-registry.ts
 //
 // ROADMAP-elanous-builtin-autopilot-cascade §MB-2 (+ MB-6 + MB-11 + MB-13 polish).
@@ -43,7 +44,7 @@
 // agnostic 으로 처리 — 본 helper 는 surface 만 책임.
 
 import type { CoreTurnDispatchTool } from '../core-turn/types.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { dispatchToolByName } from '../tool-runtime/registry.js';
 import { bashRuntime } from '../tool-runtime/bash-runtime.js';

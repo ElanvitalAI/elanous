@@ -34,6 +34,9 @@ import { POD_PROVENANCE_ENV_NAMES } from './pod-provenance.js';
 import { makeScriptedKubectlDevice, type PodDeviceEvent } from '../../ux-sim/task-orchestrator-surfaces-self-implement-pod-device.js';
 import { createFakeKubectl } from '../../ux-sim/fake-kubectl.js';
 import type { PodSource } from './pod-source-receive.js';
+
+const hasLegacySelfImplementInvocation = (script: string) =>
+  script.split('\n').some((line) => line.includes('elanous self implement "$(cat /creds/feature)"'));
 import { defaultGrokModel } from '../../grok/models.js';
 import { buildPodConfigSnapshot } from './pod-config-snapshot.js';
 import { podSpawnWithSiWarm } from './pod-si-warm-entry.js';
@@ -1113,7 +1116,7 @@ esac
           writeFileSync(featureFile, secret.stringData.feature);
           const script: string = manifest.spec.template.spec.containers[0].args[0];
           const accountLine = script.split('\n').find((line) => line.startsWith('export ELANOUS_CODEX_ACCOUNT='))!;
-          const command = script.split('\n').find((line) => line.includes('elanous self implement '))!;
+          const command = script.split('\n').find((line) => line.includes('elanous self implement "$(cat /creds/feature)"'))!;
           const runnable = command.replace(/^export ELANOUS_HARNESS_ENTRANCE=self-implement; /, '');
           const child = Bun.spawnSync(['bash', '-c', `${accountLine}\n${runnable.replace('/creds/feature', featureFile).replaceAll('/tmp/si.out', outputFile)}\ncat ${outputFile}\ntail -n 1 ${outputFile}\nexit $rc`], {
             cwd: home, env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` },
@@ -1508,7 +1511,7 @@ test('a host-recorded dispatch marker reaches the actual Pod Job without alterin
   const marked = podJobManifest({ ...base, armEnv: { ELANOUS_DISPATCH_RECORDED: '1' } }) as typeof plain;
   expect(plain.spec.template.spec.containers[0]!.env.some((item) => item.name === 'ELANOUS_DISPATCH_RECORDED')).toBe(false);
   expect(marked.spec.template.spec.containers[0]!.args).toEqual(plain.spec.template.spec.containers[0]!.args);
-  expect(job.spec.template.spec.containers[0].args[0]).toContain('elanous self implement');
+  expect(hasLegacySelfImplementInvocation(job.spec.template.spec.containers[0].args[0])).toBe(true);
 });
 
 test('Pod Job preserves only the validated harness graph-growth scope', async () => {
@@ -1861,16 +1864,27 @@ test('POD-REUSE-REQUEST-CLEAN-FU: cold-job and acquire-failed requests are ledge
 describe('pod memory evidence', () => {
   const lines = [1, 2, 3, 4, 5].map((n) => `ELANOUS_MEM ${1700000000 + n} ${n * 1073741824} ${n * 1048576}:node 512:bun`);
 
+  function generatedSampler(script: string): string {
+    const start = script.lastIndexOf('stage_dir=');
+    const end = script.indexOf(' & mem_sampler_pid=$!', start) + ' & mem_sampler_pid=$!'.length;
+    return script.slice(start, end);
+  }
+
   // Exercise the generated Pod sampler with fixed ps RSS/comm/argv rows, never the host's platform-specific process list.
-  function sampleProcessRow(row: string): string {
+  function sampleProcessRow(row: string, activeStages: string[] = []): string {
     const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
-    const sampler = script.split('\n').find((line) => line.startsWith('(while :; do { mem='))!;
+    const sampler = generatedSampler(script);
     const root = mkdtempSync(join(tmpdir(), 'pod-mem-ps-'));
     try {
+      const stageDir = join(root, 'active');
+      mkdirSync(stageDir);
+      activeStages.forEach((stage, index) => { const pid = index === 0 ? process.pid : process.ppid; writeFileSync(join(stageDir, String(pid)), `${stage} ${pid} unknown active 1\n`); });
+      writeFileSync(join(root, 'stage'), 'run\n');
       const ps = join(root, 'ps');
       writeFileSync(ps, '#!/bin/sh\nprintf "%s\\n" "$PS_ROW"\n');
       chmodSync(ps, 0o755);
-      const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_ROW: row } });
+      const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_ROW: row,
+        ELANOUS_POD_MEMORY_STAGE_DIR: stageDir, ELANOUS_POD_MEMORY_STAGE_FILE: join(root, 'stage') } });
       expect(run.exitCode).toBe(0);
       return run.stdout.toString();
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -1894,17 +1908,19 @@ describe('pod memory evidence', () => {
     expect(withoutGrade.split('ELANOUS_AUTHOR_GRADE').length - 1).toBe(0);
   });
 
-  test('sampler follows setup, precedes both harness routes, redacts argv and leaves exit unchanged', () => {
+  test('sampler starts before source checkout and both harness routes, redacts argv and leaves exit unchanged', () => {
     for (const goalDoc of [undefined, 'GOAL.md']) {
       const manifest = podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, ...(goalDoc ? { goalDoc } : {}) }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } };
       const script = manifest.spec.template.spec.containers[0]!.args[0]!;
-      const start = script.indexOf('(while :; do { mem=');
+      const start = script.lastIndexOf('stage_dir=');
       expect(start).toBeGreaterThan(script.indexOf('gh auth setup-git'));
-      expect(start).toBeGreaterThan(script.indexOf('cp -- /creds/goal-doc'));
+      expect(start).toBeLessThan(script.indexOf("ELANOUS_POD_STAGE clone start"));
+      if (goalDoc) expect(start).toBeLessThan(script.indexOf('cp -- /creds/goal-doc'));
       expect(start).toBeLessThan(script.indexOf(goalDoc ? 'elanous harness ask' : 'elanous self implement'));
       expect(script).toContain('/sys/fs/cgroup/memory.current');
       expect(script).toContain('/sys/fs/cgroup/memory/memory.usage_in_bytes');
-      expect(script).toContain('ps -eo rss=,comm=,args= --sort=-rss | head -5');
+      expect(script).toContain('ps -eo rss=,comm=,args= --sort=-rss');
+      expect(script).toContain('ELANOUS_POD_MEMORY_STAGE_DIR');
       expect(script).toContain('sleep 15');
       expect(script).toContain('|| true');
       expect(script).not.toContain('ps -eo args');
@@ -1913,29 +1929,78 @@ describe('pod memory evidence', () => {
       expect(script.indexOf('kill "$mem_sampler_pid"')).toBeLessThan(script.indexOf('wait "$mem_sampler_pid"'));
       expect(script.indexOf('wait "$mem_sampler_pid"')).toBeLessThan(script.lastIndexOf('tail -n 1 /tmp/si.out'));
       expect(script.trimEnd()).toEndWith('exit $rc');
-      const sampler = script.split('\n').find((line) => line.startsWith('(while :; do { mem='))!;
-      const run = Bun.spawnSync(['bash', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"\nexit 7`]);
+      const sampler = generatedSampler(script);
+      const root = mkdtempSync(join(tmpdir(), 'pod-mem-run-'));
+      writeFileSync(join(root, 'stage'), 'run\n');
+      mkdirSync(join(root, 'active'));
+      const run = Bun.spawnSync(['bash', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"\nexit 7`], { env: { ...process.env,
+        ELANOUS_POD_MEMORY_STAGE_DIR: join(root, 'active'), ELANOUS_POD_MEMORY_STAGE_FILE: join(root, 'stage') } });
       expect(run.exitCode).toBe(7);
-      expect(parseMemSamples(run.stdout.toString())).toHaveLength(1);
+      expect(parseMemSamples(run.stdout.toString())[0]?.stage).toBe('implement');
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
   test('generated sampler emits bounded command shapes, not arbitrary argv', () => {
     const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
-    const sampler = script.split('\n').find((line) => line.startsWith('(while :; do { mem='))!;
+    const sampler = generatedSampler(script);
     const root = mkdtempSync(join(tmpdir(), 'pod-mem-names-'));
     try {
-      writeFileSync(join(root, 'ps'), '#!/bin/sh\ncat <<\'EOF\'\n 1048576 worker my worker\n 2097152 worker:shard worker:shard\n 512 percent% percent% name\nEOF\n');
+      writeFileSync(join(root, 'ps'), '#!/bin/sh\ncat <<\'EOF\'\n 1048576 worker my worker\n 2097152 worker:shard worker:shard\n 512 percent% percent% name\n 900 worker fourth worker\n 800 worker fifth worker\n 700 tsc tsc --token hidden-secret\nEOF\n');
       chmodSync(join(root, 'ps'), 0o755);
-      const run = Bun.spawnSync(['bash', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}` } });
+      const stageDir = join(root, 'active');
+      mkdirSync(stageDir);
+      writeFileSync(join(stageDir, String(process.pid)), `typecheck ${process.pid} unknown active 1\n`);
+      writeFileSync(join(root, 'stage'), 'run\n');
+      const run = Bun.spawnSync(['bash', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`,
+        ELANOUS_POD_MEMORY_STAGE_DIR: stageDir, ELANOUS_POD_MEMORY_STAGE_FILE: join(root, 'stage') } });
       expect(run.exitCode).toBe(0);
       const line = run.stdout.toString().trim();
-      expect(parseMemSamples(line)[0]?.top).toEqual([
+      expect(line).toContain('stage=typecheck');
+      expect(parseMemSamples(line)[0]).toMatchObject({ stage: 'typecheck', top: [
         { rssKb: 1048576, name: 'other', cmd: '<redacted>' },
         { rssKb: 2097152, name: 'other', cmd: '<redacted>' },
         { rssKb: 512, name: 'other', cmd: '<redacted>' },
-      ]);
+        { rssKb: 900, name: 'other', cmd: '<redacted>' },
+        { rssKb: 800, name: 'other', cmd: '<redacted>' },
+      ] });
+      expect(line).not.toContain('path-with-secret');
+      expect(line).not.toContain('tsc');
+      expect(line).not.toContain('hidden-secret');
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('overlapping different lifecycle commands leave the sample unattributed', () => {
+    const raw = sampleProcessRow(' 900 bun bun test secret.test.ts', ['test', 'typecheck']);
+    expect(parseMemSamples(raw)[0]?.stage).toBeUndefined();
+  });
+
+  test('stale PID markers are removed and failed or empty ps output keeps RSS unavailable', () => {
+    const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
+    const sampler = generatedSampler(script);
+    for (const psScript of ['exit 3', 'exit 0']) {
+      const root = mkdtempSync(join(tmpdir(), 'pod-mem-ps-unavailable-'));
+      try {
+        const stageDir = join(root, 'active');
+        mkdirSync(stageDir);
+        const staleMarker = join(stageDir, '999999999');
+        writeFileSync(staleMarker, 'test 999999999 1 active 1\n');
+        const reusedPidMarker = join(stageDir, String(process.pid));
+        writeFileSync(reusedPidMarker, `test ${process.pid} 1 active 1\n`);
+        writeFileSync(join(root, 'stage'), 'run\n');
+        const ps = join(root, 'ps');
+        writeFileSync(ps, `#!/bin/sh\n${psScript}\n`);
+        chmodSync(ps, 0o755);
+        const run = Bun.spawnSync(['bash', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], {
+          env: { ...process.env, PATH: `${root}:${process.env.PATH}`, ELANOUS_POD_MEMORY_STAGE_DIR: stageDir,
+            ELANOUS_POD_MEMORY_STAGE_FILE: join(root, 'stage') },
+        });
+        expect(run.exitCode).toBe(0);
+        expect(parseMemSamples(run.stdout.toString())[0]).toMatchObject({ stage: 'implement', top: null });
+        expect(existsSync(staleMarker)).toBe(false);
+        expect(existsSync(reusedPidMarker)).toBe(false);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    }
   });
 
   test('fixed sleep argv emits only a bounded duration shape and redacts tokens before crossing the Pod boundary', () => {
@@ -1944,18 +2009,18 @@ describe('pod memory evidence', () => {
     const gh = 'ghp_0123456789abcdefghij0123456789abcd';
     const hex = 'a'.repeat(40);
     const raw = sampleProcessRow(` 2048 sleep sleep 30 --api_key short-secret --api-key ${token} GITHUB_TOKEN=${gh} --password pass-short --secret secret-short --token token-short Bearer bearer-short SERVICE_KEY=key-short SERVICE_SECRET=secret-value SERVICE_PASSWORD=password-value ${hex}`);
-    const cmd = parseMemSamples(raw)[0]?.top[0]?.cmd;
+    const cmd = parseMemSamples(raw)[0]?.top?.[0]?.cmd;
     expect(cmd).toBe('sleep 30 <redacted>');
     expect(cmd!.length).toBeLessThanOrEqual(120);
     for (const secret of ['short-secret', token, gh, hex, '--api-key', 'GITHUB_TOKEN=', 'sk-live-', 'ghp_']) expect(raw).not.toContain(secret);
     // Changing the injected comm must change the sanitizer's decision, not just its input text.
-    expect(parseMemSamples(sampleProcessRow(' 2048 bash bash -c sleep 30 --api_key short-secret'))[0]?.top[0]?.cmd).toBe('<redacted>');
+    expect(parseMemSamples(sampleProcessRow(' 2048 bash bash -c sleep 30 --api_key short-secret'))[0]?.top?.[0]?.cmd).toBe('<redacted>');
   });
 
   test('fixed bash argv with whitespace inside a secret is redacted before crossing the Pod boundary', () => {
     // A multiword secret in shell argv must not become a partial command shape.
     const raw = sampleProcessRow(' 1024 bash bash -c sleep 30 --api_key short secret');
-    expect(parseMemSamples(raw)[0]?.top[0]).toMatchObject({ rssKb: 1024, name: 'bash', cmd: '<redacted>' });
+    expect(parseMemSamples(raw)[0]?.top?.[0]).toMatchObject({ rssKb: 1024, name: 'bash', cmd: '<redacted>' });
     expect(raw).not.toContain('short secret');
     expect(raw).not.toContain('short');
     expect(raw).not.toContain('secret');
@@ -1964,14 +2029,14 @@ describe('pod memory evidence', () => {
   test('fixed bash -c argv with an unknown secret cannot send its command to the host', () => {
     // Unknown shell payloads must be hidden without relying on known token prefixes.
     const raw = sampleProcessRow(' 4096 bash bash -c while :; do sleep 1; done # short secret');
-    expect(parseMemSamples(raw)[0]?.top[0]).toMatchObject({ rssKb: 4096, name: 'bash', cmd: '<redacted>' });
+    expect(parseMemSamples(raw)[0]?.top?.[0]).toMatchObject({ rssKb: 4096, name: 'bash', cmd: '<redacted>' });
     expect(raw).not.toContain('short secret');
   });
 
   test('fixed argv0 masquerade cannot turn bash -c secrets into an allowed sleep command', () => {
     // Kernel comm is bash even when argv0 claims sleep; classify by comm, not argv0.
     const raw = sampleProcessRow(' 8192 bash sleep -c while :; do sleep 1; done # short secret');
-    expect(parseMemSamples(raw)[0]?.top[0]).toMatchObject({ rssKb: 8192, name: 'bash', cmd: '<redacted>' });
+    expect(parseMemSamples(raw)[0]?.top?.[0]).toMatchObject({ rssKb: 8192, name: 'bash', cmd: '<redacted>' });
     expect(raw).not.toContain('short secret');
   });
 
@@ -1988,7 +2053,7 @@ describe('pod memory evidence', () => {
         ['bun --token short-value', 'bun', 'bun <redacted>'],
         ['bun run src/app.ts --api-key sk-live-abc', 'bun', 'bun run <redacted>'],
         ['bun test src/app.test.ts GITHUB_TOKEN=ghp_short', 'bun', 'bun test <redacted>'],
-        ['elanous self implement private-goal', 'elanous', 'elanous self <redacted>'],
+        ['elanous self implement private-goal', 'elanous', 'elanous self implement <redacted>'],
         ['tsc --project secret-name', 'tsc', 'tsc <redacted>'],
         ['sleep 30 --api-key sk-live-abc', 'sleep', 'sleep 30 <redacted>'],
         ['sleep 31 --api-key short-secret', 'sleep', 'sleep <redacted>'],
@@ -1997,7 +2062,7 @@ describe('pod memory evidence', () => {
         const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_ROW: argv } });
         expect(run.exitCode).toBe(0);
         const raw = run.stdout.toString();
-        expect(parseMemSamples(raw)[0]?.top[0]).toEqual({ rssKb: 512, name, cmd: visible });
+        expect(parseMemSamples(raw)[0]?.top?.[0]).toEqual({ rssKb: 512, name, cmd: visible });
         expect(raw).not.toContain('short secret');
         expect(raw).not.toContain('short-value');
         expect(raw).not.toContain('short-secret');
@@ -2035,6 +2100,16 @@ describe('pod memory evidence', () => {
     expect(podRunResultLine(withSamples, [])).toBe(withoutSamples);
     expect(podRunResultLine(withoutSamples, [])).toBe(withoutSamples);
     expect(podRunResultLine(withSamples, ['salvage/j/w'])).toBe(`${withoutSamples}\n수확할 브랜치: salvage/j/w`);
+  });
+
+  test('parses explicit lifecycle stage tags without changing legacy sample parsing', () => {
+    expect(parseMemSamples('ELANOUS_MEM 44 900 stage=typecheck 123:bun:bun%20x%20tsc%20%3Credacted%3E 77:node:node%20%3Credacted%3E'))
+      .toEqual([{ at: 44, cgroupBytes: 900, stage: 'typecheck', top: [
+        { rssKb: 123, name: 'bun', cmd: 'bun x tsc <redacted>' },
+        { rssKb: 77, name: 'node', cmd: 'node <redacted>' },
+      ] }]);
+    expect(parseMemSamples('ELANOUS_MEM 45 901 stage=typecheck rss=unavailable'))
+      .toEqual([{ at: 45, cgroupBytes: 901, stage: 'typecheck', top: null }]);
   });
 
   test('abort observation distinguishes dispatcher causes and redacts arbitrary signal reasons', () => {
@@ -2141,7 +2216,7 @@ describe('podSelfImplementSpawn', () => {
         await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {}, ...(hostSupervised === undefined ? {} : { hostSupervised }) })({ feature: 'x', spaceId: `supervise-${hostSupervised}` }).done;
         const job = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!)).find((m) => m.kind === 'Job');
         const script: string = job.spec.template.spec.containers[0].args[0];
-        expect(script.split('\n').find((line) => line.includes('elanous self implement'))!.includes("'--no-supervise'")).toBe(hostSupervised !== false);
+        expect(script.split('\n').find((line) => line.includes('elanous self implement "$(cat /creds/feature)"'))!.includes("'--no-supervise'")).toBe(hostSupervised !== false);
         expect(events).toEqual([expect.objectContaining({ hostSupervised: hostSupervised !== false, childSupervise: hostSupervised === false })]);
       } finally { off(); }
     }
@@ -2550,7 +2625,7 @@ describe('podSelfImplementSpawn', () => {
       const scripts = applied.filter((m) => m.kind === 'Job').map((m) => m.spec.template.spec.containers[0].args[0] as string);
       expect(scripts).toHaveLength(4);
       expect(scripts[0]).toContain(`elanous harness ask '${goal}' --json`);
-      expect(scripts[0]).not.toContain('elanous self implement');
+      expect(hasLegacySelfImplementInvocation(scripts[0]!)).toBe(false);
       for (const script of scripts.slice(1, 3)) {
         expect(script).not.toContain('harness ask');
         expect(script).not.toContain('/creds/goal-doc');
@@ -2727,7 +2802,7 @@ describe('podSelfImplementSpawn', () => {
       for (const job of applied.filter((m) => m.kind === 'Job')) {
         const script: string = job.spec.template.spec.containers[0].args[0];
         expect(script).toContain(`elanous harness ask '${goal}' --json`);
-        expect(script).not.toContain('elanous self implement');
+        expect(hasLegacySelfImplementInvocation(script)).toBe(false);
       }
       expect(applied.filter((m) => m.kind === 'Secret').map((m) => m.stringData.feature)).toEqual(['# original goal', ...invalidFeatures]);
       expect(modes).toEqual(['heading-top', ...invalidFeatures.map((_, index) => `heading-${index}`)].map((spaceId) =>
@@ -2765,10 +2840,10 @@ describe('podSelfImplementSpawn', () => {
       const scripts = applied.filter((m) => m.kind === 'Job').map((m) => m.spec.template.spec.containers[0].args[0] as string);
       expect(scripts).toHaveLength(6);
       expect(scripts[0]).toContain(`elanous harness ask '${goal}' --json`);
-      expect(scripts[0]).not.toContain('elanous self implement');
+      expect(hasLegacySelfImplementInvocation(scripts[0]!)).toBe(false);
       for (const script of scripts) {
         expect(script).toContain(`elanous harness ask '${goal}' --json`);
-        expect(script).not.toContain('elanous self implement');
+        expect(hasLegacySelfImplementInvocation(script)).toBe(false);
       }
       expect(secrets.map((m) => m.stringData.feature)).toEqual(features);
       expect(secrets[1].stringData.feature).not.toBe(secrets[2].stringData.feature);
@@ -2810,7 +2885,7 @@ describe('podSelfImplementSpawn', () => {
       expect(secrets[1].stringData['goal-doc']).toStartWith(document);
       for (const script of scripts) {
         expect(script).toContain(`elanous harness ask '${goal}' --json`);
-        expect(script).not.toContain('elanous self implement');
+        expect(hasLegacySelfImplementInvocation(script)).toBe(false);
       }
       expect(modes).toEqual([
         expect.objectContaining({ spaceId: 'raw', mode: 'goal-doc', reason: 'goal-doc-env' }),
@@ -2842,7 +2917,7 @@ describe('podSelfImplementSpawn', () => {
       const script = job.spec.template.spec.containers[0].args[0] as string;
       expect(secret.stringData['goal-doc']).toBe(document);
       expect(script).toContain(`elanous harness ask '${goal}' --json`);
-      expect(script).not.toContain('elanous self implement');
+      expect(hasLegacySelfImplementInvocation(script)).toBe(false);
       expect(modes).toEqual([expect.objectContaining({ spaceId: 'crlf-top', mode: 'goal-doc', reason: 'goal-doc-env' })]);
     } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
   });
@@ -7386,7 +7461,7 @@ describe('pod GitHub token watchdog (host refresher gone)', () => {
     expect(POD_GH_STALE_SECONDS).toBeGreaterThan(50 * 60);
     expect(POD_GH_STALE_SECONDS).toBeLessThan(60 * 60);
     expect(script).toContain(watch);
-    expect(script.indexOf(watch)).toBeLessThan(script.indexOf('elanous self implement'));
+    expect(script.indexOf(watch)).toBeLessThan(script.indexOf('elanous self implement "$(cat /creds/feature)"'));
     expect(script.indexOf('kill "$gh_watch_pid"')).toBeLessThan(script.indexOf(podSalvageScript()));
     expect(jobScript()).not.toContain('gh_watch_pid');
     expect(appScript({ githubStaleSeconds: 120 })).toContain('[ "$age" -ge 120 ]');
@@ -7578,7 +7653,7 @@ describe('AUTHOR-POD2 — authoring runs inside the Pod', () => {
     expect(script).toContain('ELANOUS_AUTHOR_ON_POD started host=$(hostname)');
     expect(script).toContain('ELANOUS_AUTHOR_ON_POD finished host=$(hostname) rc=$rc');
     expect(script).not.toContain('elanous harness ask');
-    expect(script).not.toContain('elanous self implement');
+    expect(hasLegacySelfImplementInvocation(script)).toBe(false);
   });
 
   test('a sentence that starts with a dash or holds quotes, $ and backticks reaches harness say as one argument', () => {

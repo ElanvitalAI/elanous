@@ -8,7 +8,7 @@ import * as publishNode from './publish-node.js';
 import * as unattendedNode from './unattended-release.js';
 
 // FREEZE1 off-state parity (OP 10-04 19:39 condition ①): with no landing-freeze file, gate · publish · unattended
-// retain their pre-freeze behavior, with the explicit release-policy gate selection added to the graph input.
+// retain their pre-freeze behavior, with explicit release-policy selection and the measured publish-process receipt.
 // An independent checkout of the pre-FREEZE1 base (parent of the first commit that brought the freeze in — or HEAD
 // before the change is committed: its own scripts and src, only node_modules shared) and this checkout run the same
 // isolated scenario; the historical capture must match GOLDEN, while current behavior may add the policy selection.
@@ -23,6 +23,8 @@ function expectedCurrentWithPolicy() {
   const expected = structuredClone(GOLDEN);
   Object.assign(expected.unattended.input, { gateExecutor: 'pod', gateImagePin: 'cut-commit' });
   Object.assign(expected.graphInput, { gateExecutor: 'pod', gateImagePin: 'cut-commit' });
+  Object.assign(expected.publish, { publishProcess: { status: 0,
+    stdout: JSON.stringify({ ok: true, published: true, tag: 'v0.2.4', assets: [] }), stderr: '' } });
   return expected;
 }
 const NODES = ['scripts/release-loop/gate-node.ts', 'scripts/release-loop/publish-node.ts', 'scripts/release-loop/unattended-release.ts'];
@@ -81,7 +83,7 @@ async function capture(mods: Mods, assertCurrentDiagnostics = false): Promise<st
   Object.assign(outputs, { 'approve-publish': approval, prepare: { outcome: 'ok', commit: 'a', out: 'dist' }, 'version-release': { commit: 'a' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' } });
   process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ nodeId: 'publish', runId, input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
   const pcalls: string[][] = [];
-  const pub = mods.runPublish((cmd: string, args: string[]) => { pcalls.push([cmd, ...args.map((a) => a.replace(/\/[^ ]*notes\.md$/, '<notes>'))]); return { status: 0, stdout: args.some((a) => a.endsWith('website/pages.json')) ? JSON.stringify({ pages: [] }) : args.includes('publish') ? JSON.stringify({ ok: true, published: true, tag: 'v0.2.4' }) : '# 0.2.4\nHello', stderr: '' }; }, undefined, undefined, proot);
+  const pub = mods.runPublish((cmd: string, args: string[]) => { pcalls.push([cmd, ...args.map((a) => a.replace(/\/[^ ]*notes\.md$/, '<notes>'))]); return { status: 0, stdout: args.some((a) => a.endsWith('website/pages.json')) ? JSON.stringify({ pages: [] }) : args.includes('publish') ? JSON.stringify({ ok: true, published: true, tag: 'v0.2.4', assets: [] }) : '# 0.2.4\nHello', stderr: '' }; }, undefined, undefined, proot);
   // unattended
   const uroot = realpathSync(mkdtempSync(join(tmpdir(), 'cap-un-'))); roots.push(uroot);
   mkdirSync(join(uroot, 'release/0.2.3'), { recursive: true });

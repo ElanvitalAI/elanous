@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { resolveInstanceName } from '../instance-identity.js';
 import type { HarnessSpaceKind } from '../harness/harness-space.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { listPtyManifestRows, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
 import { describePtyRunState } from '../pty-shell/tui-run-state.js';
 import { ptyWriteControlState } from '../pty-shell/pty-write-provenance.js';

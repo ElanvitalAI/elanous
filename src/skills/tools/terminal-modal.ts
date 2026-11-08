@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tools for main ↔ modal terminal context exchange.
 //
 // Exposes the TerminalSessionRegistry to skill-runner as a set of
@@ -11,7 +12,7 @@
 // mock registry via a follow-up accessor or avoid calling these
 // tools directly).
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { truncateOutput } from '../../output-truncation.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import type { TerminalSession, TerminalSessionRegistry } from '../../terminal/session-registry.js';

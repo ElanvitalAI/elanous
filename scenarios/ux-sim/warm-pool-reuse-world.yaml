@@ -10,7 +10,7 @@ hosts:
     pools: [si-v1]
     egress: true
   - name: pool-b
-    arch: amd64
+    arch: arm64
     cpu: 4
     pools: [si-v1]
     egress: true
@@ -42,6 +42,12 @@ events:
 injections:
   - at: "+10s"
     ledger:
+      - event: pod.reuse.si-candidate-match-score
+        data:
+          kind: implementation
+      - event: pod.reuse.si-candidate-match-score
+        data:
+          kind: implementation
       - event: pod.reuse.return-decision
         data:
           outcome: eligible
@@ -50,6 +56,9 @@ injections:
           outcome: returned
   - at: "+90s"
     ledger:
+      - event: pod.reuse.si-candidate-match-score
+        data:
+          kind: implementation
       - event: pod.reuse.clean-failed
       - event: pod.reuse.return-decision
         data:
@@ -62,6 +71,12 @@ injections:
           outcome: returned
   - at: "+2m"
     ledger:
+      - event: pod.reuse.si-candidate-match-score
+        data:
+          kind: implementation
+      - event: pod.reuse.si-candidate-match-score
+        data:
+          kind: implementation
       - event: pod.reuse.clean-failed
       - event: pod.reuse.return-decision
         data:

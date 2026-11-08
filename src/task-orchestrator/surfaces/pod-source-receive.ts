@@ -70,13 +70,15 @@ function assertRemoteBase(repoUrl: string, base: string): void {
 /** Job 스크립트의 원천 단계. 성공 갈래는 `ELANOUS_POD_SOURCE <kind> <HEAD>` 로 끝난다.
  *  `stageMarkers` — si-task Job 만: 호스트 미러 `clone --shared` 시도의 시작·성공을 `ELANOUS_POD_STAGE mirror start|end` 로 찍는다
  *  (건너뛰거나 실패하면 끝 표지가 없다 → 호스트가 missing 으로 읽는다). 기본은 꺼짐 — gate·pod-command Job 의 바이트는 그대로다. */
-export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath = '/host-mirror', options: { stageMarkers?: boolean; imageSourceDir?: string; imageCommitFile?: string; imageGitDir?: string; /** min-sync 만: 스크립트가 다루는 체크아웃 경로(기본 `repo` — Job 스크립트 관례). 상주 런타임은 절대 경로를 준다. */ checkoutDir?: string } = {}): string {
+export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath = '/host-mirror', options: { stageMarkers?: boolean; requireMirror?: boolean; imageSourceDir?: string; imageCommitFile?: string; imageGitDir?: string; /** min-sync 만: 스크립트가 다루는 체크아웃 경로(기본 `repo` — Job 스크립트 관례). 상주 런타임은 절대 경로를 준다. */ checkoutDir?: string } = {}): string {
   // 검증 우선 — 부모 resolver 가 준 baseSha 는 셸 스크립트 문자열에 삽입되기 전에 형식 검사를 통과해야 한다.
   const sourceBaseSha = source.kind === 'default' ? source.baseSha : undefined;
   const baseSha = sourceBaseSha ? assertSha(sourceBaseSha, 'base sha') : undefined;
   const mark = (edge: 'start' | 'end'): string[] => options.stageMarkers ? [siTaskPodStageShell('mirror', edge)] : [];
   const quotedUrl = `'${repoUrl.replace(/'/g, `'\\''`)}'`;
   const quotedMirror = `'${mirrorPath.replace(/'/g, `'\\''`)}'`;
+  // The configured hostPath is an operator-owned, read-only Git mirror. Pod UIDs differ from the host owner,
+  // so Git's dubious-ownership guard rejects it unless this exact mount path is trusted per command.
   const quotedImageDir = `'${(options.imageSourceDir ?? '/opt/elanous-source').replace(/'/g, `'\\''`)}'`;
   const quotedCommitFile = `'${(options.imageCommitFile ?? '/opt/elanous-source-commit').replace(/'/g, `'\\''`)}'`;
   const quotedImageGitDir = `'${(options.imageGitDir ?? '/opt/elanous-pin.git').replace(/'/g, `'\\''`)}'`;
@@ -152,7 +154,7 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     ...(source.kind === 'default' && baseSha
       ? []
       : [
-          `      if [ -d ${quotedMirror} ]; then mirror_objects=$(git -C ${quotedMirror} rev-parse --path-format=absolute --git-path objects 2>/dev/null || :); [ -z "$mirror_objects" ] || printf '%s\\n' "$mirror_objects" >> repo/.git/objects/info/alternates; fi`,
+          `      if [ -d ${quotedMirror} ]; then mirror_objects=$(git -c safe.directory=${quotedMirror} -C ${quotedMirror} rev-parse --path-format=absolute --git-path objects 2>/dev/null || :); [ -z "$mirror_objects" ] || printf '%s\\n' "$mirror_objects" >> repo/.git/objects/info/alternates; fi`,
         ]),
     `      if [ -f ${quotedImageGitDir}/shallow ]; then cp ${quotedImageGitDir}/shallow repo/.git/shallow || exit 5; fi`,
     `      if git -C repo update-ref refs/heads/main "$image_commit" && git -C repo read-tree "$image_commit" && git -C repo update-index --refresh && git -C repo diff-files --quiet && extra=$(git -C repo ls-files --others) && [ -z "$extra" ]; then`,
@@ -178,10 +180,10 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     'mirror_skip=',
     ...mark('start'),
     `if ! [ -d ${quotedMirror} ]; then mirror_skip=no-mount`,
-    `elif ! git -C ${quotedMirror} rev-parse --verify HEAD >/dev/null 2>&1; then mirror_skip=rev-parse-failed`,
+    `elif ! git -c safe.directory=${quotedMirror} -C ${quotedMirror} rev-parse --verify HEAD >/dev/null 2>&1; then mirror_skip=rev-parse-failed`,
     ...(source.kind === 'default' && baseSha
-      ? [`elif pod_source_base_sha_mirror_fetch_attempted=true; ! git init -q -b main repo || ! git -C repo fetch --quiet --no-write-fetch-head ${quotedMirror} '${baseSha}' || ! git -C repo cat-file -e '${baseSha}^{commit}' 2>/dev/null; then mirror_skip=sha-fetch-failed`]
-      : [`elif ! git clone -q --shared -- ${quotedMirror} repo || ! git -C repo rev-parse --verify HEAD >/dev/null 2>&1; then mirror_skip=clone-failed`]),
+      ? [`elif pod_source_base_sha_mirror_fetch_attempted=true; ! git init -q -b main repo || ! git -c safe.directory=${quotedMirror} -C repo fetch --quiet --no-write-fetch-head ${quotedMirror} '${baseSha}' || ! git -C repo cat-file -e '${baseSha}^{commit}' 2>/dev/null; then mirror_skip=sha-fetch-failed`]
+      : [`elif ! git -c safe.directory=${quotedMirror} clone -q --shared -- ${quotedMirror} repo || ! git -C repo rev-parse --verify HEAD >/dev/null 2>&1; then mirror_skip=clone-failed`]),
     'fi',
     'if [ -z "$mirror_skip" ]; then',
     ...mark('end').map((line) => `  ${line}`),
@@ -191,6 +193,7 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     '  source_via=mirror',
     'else',
     "  printf 'ELANOUS_POD_SOURCE_MIRROR_SKIP %s\\n' \"$mirror_skip\"",
+    ...(options.requireMirror ? ["  printf 'ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL %s\\n' \"$mirror_skip\"", '  exit 5'] : []),
     '  if [ -e repo ]; then rm -r -- repo || exit 5; fi',
     ...(source.kind === 'default' && baseSha ? [] : ['  pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))']),
     ...(source.kind === 'default' && baseSha
@@ -203,6 +206,10 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     'cd repo || exit 5',
   ];
   if (source.kind === 'default') {
+    if (options.requireMirror && !baseSha) return [
+      ...ioStart,
+      "pod_source_stage=default; pod_source_failure_code=mirror-default-pin-missing; printf 'ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL default-source-pin-missing\\n'; exit 5",
+    ].join('\n');
     if (baseSha) {
       const sha = baseSha;
       const base = source.base ?? 'main';
@@ -219,12 +226,16 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
         // debug.log 에 남겨 다음 실패에서 소스 부재와 네트워크 fallback을 구분한다.
         'pod_source_base_sha_from="$source_via"',
         `if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then`,
-        `  if [ "$pod_source_base_sha_mirror_fetch_attempted" = false ] && [ -d ${quotedMirror} ]; then pod_source_base_sha_mirror_fetch_attempted=true; if git fetch --quiet --no-write-fetch-head ${quotedMirror} '${sha}'; then pod_source_base_sha_from=mirror; else printf 'ELANOUS_POD_SOURCE_BASE_SHA_MIRROR_FETCH failed %s\\n' '${sha}'; fi; fi`,
+        `  if [ "$pod_source_base_sha_mirror_fetch_attempted" = false ] && [ -d ${quotedMirror} ]; then pod_source_base_sha_mirror_fetch_attempted=true; if git -c safe.directory=${quotedMirror} fetch --quiet --no-write-fetch-head ${quotedMirror} '${sha}'; then pod_source_base_sha_from=mirror; else printf 'ELANOUS_POD_SOURCE_BASE_SHA_MIRROR_FETCH failed %s\\n' '${sha}'; fi; fi`,
         `  if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then`,
-        '    pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
-        '    pod_source_base_sha_origin_fallback=true',
-        `    printf 'ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH start %s\\n' '${sha}'`,
-        `    if git fetch --quiet --no-write-fetch-head origin '${sha}'; then pod_source_base_sha_from=origin; source_via=origin; printf 'ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH complete %s\\n' '${sha}'; else pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH failed %s\\n' '${sha}'; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${sha}'; exit 5; fi`,
+        ...(options.requireMirror ? [
+          `    pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL base-sha-missing %s\\n' '${sha}'; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${sha}'; exit 5`,
+        ] : [
+          '    pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1))',
+          '    pod_source_base_sha_origin_fallback=true',
+          `    printf 'ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH start %s\\n' '${sha}'`,
+          `    if git fetch --quiet --no-write-fetch-head origin '${sha}'; then pod_source_base_sha_from=origin; source_via=origin; printf 'ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH complete %s\\n' '${sha}'; else pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_ORIGIN_FETCH failed %s\\n' '${sha}'; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' '${sha}'; exit 5; fi`,
+        ]),
         '  fi',
         'fi',
         `printf 'ELANOUS_POD_SOURCE_BASE_SHA_FROM %s\\n' "$pod_source_base_sha_from"`,
@@ -265,7 +276,7 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
       `  remote_branch=$(printf '%s\\n' "$remote_info" | awk '$1=="ref:" && $3=="HEAD" && $2 ~ /^refs\\/heads\\// {sub(/^refs\\/heads\\//, "", $2); print $2}')`,
       '  if ! [[ "$remote_head" =~ ^[0-9a-f]{40}$ ]]; then exit 5; fi',
       '  if [ "$remote_head" != "$(git rev-parse HEAD)" ]; then',
-      `    if [ "$source_via" = image ] && git -C ${quotedMirror} cat-file -e "$remote_head^{commit}" 2>/dev/null; then`,
+      `    if [ "$source_via" = image ] && git -c safe.directory=${quotedMirror} -C ${quotedMirror} cat-file -e "$remote_head^{commit}" 2>/dev/null; then`,
       '      git reset --hard "$remote_head" || exit 5',
       "      printf 'ELANOUS_POD_SOURCE_DELTA mirror\\n'",
       '    else',
@@ -293,13 +304,26 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     return [
       ...ioStart,
       ...start,
-      `if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --depth 1 origin ${sha} || exit 5; fi`,
+      ...(options.requireMirror ? [
+        `if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then pod_source_stage=commit; pod_source_failure_code=mirror-commit-unavailable; printf 'ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL source-commit-missing %s\\n' '${sha}'; exit 5; fi`,
+      ] : [
+        `if ! git cat-file -e '${sha}^{commit}' 2>/dev/null; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --depth 1 origin ${sha} || exit 5; fi`,
+      ]),
       `git checkout --detach ${sha} || exit 5`,
       ...(baseSha ? [
-        `if ! git cat-file -e '${baseSha}^{commit}' 2>/dev/null; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --depth 1 origin '${baseSha}' || exit 5; fi`,
+        ...(options.requireMirror ? [
+          `if ! git cat-file -e '${baseSha}^{commit}' 2>/dev/null; then pod_source_stage=base-sha; pod_source_failure_code=mirror-base-unavailable; printf 'ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL base-sha-missing %s\\n' '${baseSha}'; exit 5; fi`,
+        ] : [
+          `if ! git cat-file -e '${baseSha}^{commit}' 2>/dev/null; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --depth 1 origin '${baseSha}' || exit 5; fi`,
+        ]),
         `if ! git merge-base --is-ancestor '${baseSha}' HEAD; then`,
-        `  if [ "$(git rev-parse --is-shallow-repository)" = true ]; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --unshallow origin '${sha}' || exit 5; fi`,
-        `  git merge-base --is-ancestor '${baseSha}' HEAD || { printf 'ELANOUS_POD_SOURCE_BASE_ANCESTRY_MISSING base=%s head=%s\\n' '${baseSha}' '${sha}'; exit 5; }`,
+        ...(options.requireMirror ? [
+          `  if [ "$(git rev-parse --is-shallow-repository)" = true ]; then git fetch --unshallow --no-write-fetch-head ${quotedMirror} '${sha}' || { printf 'ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL ancestry-unavailable\\n'; exit 5; }; fi`,
+          `  git merge-base --is-ancestor '${baseSha}' HEAD || { printf 'ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL ancestry-unavailable\\n'; exit 5; }`,
+        ] : [
+          `  if [ "$(git rev-parse --is-shallow-repository)" = true ]; then pod_source_io_origin_calls=$((pod_source_io_origin_calls + 1)); git fetch --unshallow origin '${sha}' || exit 5; fi`,
+          `  git merge-base --is-ancestor '${baseSha}' HEAD || { printf 'ELANOUS_POD_SOURCE_BASE_ANCESTRY_MISSING base=%s head=%s\\n' '${baseSha}' '${sha}'; exit 5; }`,
+        ]),
         'fi',
         `printf 'ELANOUS_POD_SOURCE_BASE_ANCESTOR %s %s\\n' '${baseSha}' '${sha}'`,
       ] : []),
@@ -396,7 +420,7 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
         `  if [ "$got" != "${bundle.sha256}" ]; then printf 'ELANOUS_POD_SOURCE_MISMATCH sha256\\n'; exit 3; fi`,
         `  git fetch --quiet --no-write-fetch-head ${quote(bundle.bundlePath)} ${quote(baseSha)} || { pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' ${quote(baseSha)}; exit 5; }`,
       ] : [
-        `  if [ -d ${quotedMirror} ]; then git fetch --quiet --no-write-fetch-head ${quotedMirror} ${quote(baseSha)} || { pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' ${quote(baseSha)}; exit 5; }; else pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' ${quote(baseSha)}; exit 5; fi`,
+        `  if [ -d ${quotedMirror} ]; then git -c safe.directory=${quotedMirror} fetch --quiet --no-write-fetch-head ${quotedMirror} ${quote(baseSha)} || { pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' ${quote(baseSha)}; exit 5; }; else pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' ${quote(baseSha)}; exit 5; fi`,
       ]),
       'fi',
       `if ! git cat-file -e ${quote(`${baseSha}^{commit}`)} 2>/dev/null; then pod_source_stage=base-sha; pod_source_failure_code=base-sha-unavailable; printf 'ELANOUS_POD_SOURCE_BASE_SHA_UNAVAILABLE %s\\n' ${quote(baseSha)}; exit 5; fi`,
@@ -463,7 +487,7 @@ export function podSourceScript(source: PodSource, repoUrl: string, mirrorPath =
     'fi',
     'if [ -e repo ]; then exit 5; fi',
     ...mark('start'),
-    `if [ -d ${quotedMirror} ] && git -C ${quotedMirror} rev-parse --verify HEAD >/dev/null 2>&1 && git clone -q --shared -- ${quotedMirror} repo && git -C repo rev-parse --verify HEAD >/dev/null 2>&1; then`,
+    `if [ -d ${quotedMirror} ] && git -c safe.directory=${quotedMirror} -C ${quotedMirror} rev-parse --verify HEAD >/dev/null 2>&1 && git -c safe.directory=${quotedMirror} clone -q --shared -- ${quotedMirror} repo && git -C repo rev-parse --verify HEAD >/dev/null 2>&1; then`,
     ...mark('end').map((line) => `  ${line}`),
     `  git -C repo remote set-url origin ${quotedUrl} || exit 5`,
     '  if git -C repo bundle verify /tmp/source.bundle >/dev/null 2>&1; then',

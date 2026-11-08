@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // PLAN-codex-app-server-hermes-parity §5 Phase H1·5e (2026-05-16) —
 // `elanous_fs_read` MCP tool. Mirrors the daemon-side ACP method
 // `elanous/fs/read` (src/acp/server.ts:2015). Session-agnostic so the
@@ -18,7 +19,7 @@ import {
   type FsRootKind,
 } from '../acp/fs-roots.js';
 import { detectMime, isTextMime } from '../acp/fs-mime.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime } from './types.js';
 
 const DEFAULT_MAX_BYTES = 256 * 1024;

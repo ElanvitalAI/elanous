@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tools: DashboardWidgetSnapshot + DashboardWidgetDescribe +
 // DashboardWidgetCall — Phase 4a LLM control surface.
 //
@@ -7,7 +8,7 @@
 // `initWidgetInspectorTools({ host })` — the WidgetHost object alone
 // is enough; every lookup flows through it.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { dispatchKeyToWidget, type WidgetHostLike } from '../../widget-routing/widget-dispatcher.js';
 import { getWidgetSnapshot, getWidgetDescription } from '../../widgets/inspector.js';
 import type { Key } from '../../tui.js';

@@ -1,17 +1,113 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { gateShardLedgerBatchComplete, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { runReleaseSimGateReceiptSeam, runReleaseSimRigIfFile, runReleaseSimRigScenario } from './release-sim-rig.js';
 import { resolveScenarioFilePath } from './scenario.js';
+import { runAutoApprove } from '../../scripts/release-loop/auto-approve-node.js';
+import { writeGateVerdictRecord } from '../../scripts/release-loop/gate-node.js';
 
 function retainCases(source: string, keep: string[]): string {
   const scenario = parseYaml(source) as { cases: Array<{ id: string }> };
   scenario.cases = scenario.cases.filter((item) => keep.includes(item.id));
   return stringifyYaml(scenario);
 }
+
+test('publish hold signals route measured auto-approval to a human before the fake publisher', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-publish-hold-sim-'));
+  const repo = join(root, 'repo');
+  const out = join(root, 'release', '0.3.7', 'prepared');
+  mkdirSync(join(out, 'dist'), { recursive: true });
+  mkdirSync(repo);
+  writeFileSync(join(repo, '.bun-version'), `${Bun.version}\n`);
+  for (let index = 0; index < 5; index += 1) writeFileSync(join(out, 'dist', `file-${index}`), 'fixture');
+  const graph = parseYaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as {
+    edges: Array<{ from: string; map?: Record<string, string> }>;
+  };
+  const route = graph.edges.find((edge) => edge.from === 'auto-approve')?.map;
+  const base = {
+    runId: 'publish-hold-simulation',
+    input: { version: '0.3.7', previousVersion: '0.3.6' },
+    outputs: {
+      gate: { outcome: 'ok', introduced: [] },
+      prepare: { outcome: 'ok', out, candidate: join(out, 'dist', 'elanous.tgz'), commit: 'a'.repeat(40) },
+      upgrade: { outcome: 'ok' },
+      tui: { outcome: 'ok', regress: { pass: 7, fail: 0,
+        results: Array.from({ length: 7 }, (_, index) => ({ id: `R${index + 1}`, title: 'simulated', ok: true, reason: 'pass' })) } },
+      docs: { outcome: 'ok', notes: '/tmp/0.3.7.md' },
+      'notes-check': { outcome: 'ok' },
+      'checklist-gate': { outcome: 'ok', publishBlockingYellow: [] },
+    },
+  } as const;
+  try {
+    const cases = [
+      { name: 'traffic hold', input: { trafficHold: true } },
+      { name: 'yellow publish blocker', outputs: { 'checklist-gate': { outcome: 'ok', publishBlockingYellow: ['RELEASE-GRAPH-LIFECYCLE-PROOF'] } } },
+      { name: 'OP approval marker', input: { opApprovalMarker: 'OP: verify ledger before publish' } },
+    ];
+    for (const item of cases) {
+      const context = { ...base, input: { ...base.input, ...item.input }, outputs: { ...base.outputs, ...item.outputs } };
+      const decision = runAutoApprove(context as never, { instanceRoot: root, repo, bunVersion: Bun.version });
+      const next = decision.outcome === 'ok' ? route?.ok : route?.fail;
+      const publishCalls = next === 'publish' ? 1 : 0;
+      expect({ outcome: decision.outcome, next, publishCalls }, item.name).toEqual({ outcome: 'fail', next: 'approve-publish', publishCalls: 0 });
+    }
+    const clear = runAutoApprove(base as never, { instanceRoot: root, repo, bunVersion: Bun.version });
+    expect({ outcome: clear.outcome, next: clear.outcome === 'ok' ? route?.ok : route?.fail })
+      .toEqual({ outcome: 'ok', next: 'publish' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('release simulation merges a completed retry fragment into its incomplete original gate shard', () => {
+  const batchId = 'sim-pod-70-retry-batch';
+  const observedAt = '2026-11-07T00:00:00.000Z';
+  const files = Array.from({ length: 97 }, (_, index) => `src/pod-70-${index}.test.ts`);
+  const retryFiles = files.slice(-27);
+  const row = (overrides: Partial<GateShardLedgerRow>): GateShardLedgerRow => ({ v: 1, version: '0.3.6', phase: 'cut',
+    shardId: 'pod-70', files, host: 'aws1', executor: 'pod', imageDigest: 'sha256:' + 'a'.repeat(64),
+    commit: '3cb140ec2cef82bbe024e54d0b0ad4f939d77485', envFingerprint: 'b'.repeat(64),
+    startedAt: observedAt, endedAt: observedAt, observedAt, state: 'done', rc: 0, pass: 1021, fail: 0,
+    errors: 0, ran: 1022, failureIds: null, errorIds: null, attribution: 'unmeasured', logPath: null,
+    junitPath: null, stopReason: 'incomplete attempt recovered by retry', attemptId: 'attempt-incomplete', batchId, batchSize: 2,
+    retryGroupId: 'attempt-incomplete',
+    ...overrides });
+  const rows = [row({ unmeasuredFiles: retryFiles }), row({ shardId: 'pod-70-n', files: retryFiles, pass: 375, ran: 376,
+    failureIds: [], errorIds: [], attribution: 'complete',
+    stopReason: null, attemptId: 'attempt-retry', retryGroupId: 'attempt-incomplete', batchId: undefined, batchSize: undefined }), row({ shardId: 'pod-71', files: ['src/pod-71.test.ts'], pass: 1, ran: 1,
+    failureIds: [], errorIds: [], attribution: 'complete', stopReason: null, attemptId: 'attempt-sibling' })];
+  const expected = { batchId, version: '0.3.6', commit: '3cb140ec2cef82bbe024e54d0b0ad4f939d77485',
+    phase: 'cut' as const, observedAt, shardIds: ['pod-70', 'pod-71'] };
+  expect(gateShardLedgerBatchComplete(rows, expected)).toBe(true);
+  expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70-n'
+    ? { ...entry, fail: 1, rc: 1, failureIds: ['src/pod-70-96.test.ts > failed'] } : entry), expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70'
+    ? { ...entry, unmeasuredFiles: [...retryFiles, files[0]!] } : entry), expected)).toBe(false);
+  const runningRetry = { ...rows[1]!, state: 'running' as const, attribution: 'unmeasured' as const, endedAt: null,
+    pass: null, fail: null, errors: null, ran: null, failureIds: null, errorIds: null };
+  expect(gateShardLedgerBatchComplete([rows[0]!, runningRetry, rows[1]!, rows[2]!], expected)).toBe(true);
+  for (const changedIdentity of [{ envFingerprint: 'c'.repeat(64) }, { commit: 'd'.repeat(40) },
+    { imageDigest: 'sha256:' + 'e'.repeat(64) }, { executor: 'host' as const }]) {
+    expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70-n'
+      ? { ...entry, ...changedIdentity } : entry), expected)).toBe(false);
+  }
+  expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70-n'
+    ? { ...entry, files: retryFiles.slice(1) } : entry), expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, attemptId: 'attempt-prior-run', retryGroupId: 'attempt-prior-run' }], expected)).toBe(true);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]! }], expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete(rows.map((entry) => entry.shardId === 'pod-70-n'
+    ? { ...entry, startedAt: 'not-a-time' } : entry), expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, endedAt: 'not-a-time' }], expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, startedAt: '2026-11-07T00:01:00.000Z',
+    endedAt: '2026-11-07T00:00:00.000Z' }], expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, state: 'running', attribution: 'unmeasured', endedAt: null,
+    pass: null, fail: null, errors: null, ran: null, failureIds: null, errorIds: null }], expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, shardId: 'pod-70-n2' }], expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete([...rows, { ...rows[1]!, attemptId: 'attempt-retry-duplicate' }], expected)).toBe(false);
+  expect(gateShardLedgerBatchComplete([...rows, rows[0]!], expected)).toBe(false);
+});
 
 test('receipt seam blocks fake publish when the final injected gate outcome fails', () => {
   const commit = 'a'.repeat(40);
@@ -60,17 +156,23 @@ test('release simulation runs the real release graph with injected node outcomes
     const result = await runReleaseSimRigIfFile(scenarioPath);
     expect(result).not.toBeNull();
     if (!result) throw new Error('release graph scenario was not classified');
+    const unknownPublish = result.cases.find((item) => item.id === 'publish-status-unknown-pauses-for-approval');
+    expect(unknownPublish?.pass).toBe(true);
+    expect(unknownPublish?.status).toBe('awaiting-approval');
+    expect(unknownPublish?.path.slice(-2)).toEqual(['publish', 'approve-continue']);
+    expect(unknownPublish?.path).not.toContain('npm-publish');
+    expect(result.cases.filter((item) => !item.pass).map(({ id, status, checks }) => ({ id, status, checks }))).toEqual([]);
     expect(result.pass).toBe(true);
     expect(result.universe).toBe(root);
     expect(result.artifactPath).toBe(join(root, 'ux-sim', 'evidence', 'release-sim-rig-0241.json'));
     expect(existsSync(result.artifactPath)).toBe(true);
-    expect(result.cases).toHaveLength(25);
+    expect(result.cases).toHaveLength(26);
     expect(result.cases.every((item) => item.pass && item.unexpectedEdges.length === 0)).toBe(true);
     expect(result.cases.find((item) => item.id === 'baseline-full-graph')).toMatchObject({
       checks: { events: true }, injectedEvidence: { eventTrace: { pass: true, matched: 2, missing: [] } },
     });
     expect(result.cases.find((item) => item.id === 'gate-attribution-incomplete')).toMatchObject({
-      pass: true, status: 'failed', path: ['version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate', 'gate-triage', 'traffic-failed-restore', 'failed'],
+      pass: true, status: 'failed', path: ['version-release', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'gate-triage', 'traffic-failed-restore', 'failed'],
       injectedEvidence: { actualGateTriage: { gate: { outcome: 'error', introduced: [] }, triage: { outcome: 'ok', classification: 'unmeasured' } } },
     });
     const threeRegressions = result.cases.find((item) => item.id === 'gate-three-new-regressions')!;
@@ -202,7 +304,7 @@ test('release simulation runs the real release graph with injected node outcomes
       expect(simulated).toMatchObject({ pass: true, status: 'done', checks: {
         waiverOriginalPersisted: true, gateNotRerun: true, missingReasonRejected: true, secondWaiverRejected: true,
       } });
-      const original = simulated.injectedEvidence?.originalGateRecord as { exit?: number | null; output?: string; error?: string };
+      const original = simulated.injectedEvidence?.originalGateRecord as { exit?: number | null; executionId?: string; output?: string; error?: string };
       if (id === 'owner-waive-stopped-gate') {
         expect(original).toMatchObject({ exit: null, error: expect.stringContaining('stopped') });
         expect(original.output).toBeUndefined();
@@ -280,7 +382,7 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(JSON.parse(unattributedRun.nodes.find((node) => node.nodeId === 'gate')!.output!)).not.toHaveProperty('autoheal');
     const prefetchWarning = result.cases.find((item) => item.id === 'prefetch-warning-failure-overlaps-checklist')!;
     expect(prefetchWarning.path.indexOf('pre-gate-join')).toBeLessThan(prefetchWarning.path.indexOf('gate'));
-    expect(prefetchWarning.fanOuts?.['export-check:ok']?.branches).toMatchObject({
+    expect(prefetchWarning.fanOuts?.['cutoff:ok']?.branches).toMatchObject({
       'checklist-gate': { status: 'done' }, prefetch: { status: 'failed' },
     });
     const prefetchWarningTimings = prefetchWarning.nodeTimings!;
@@ -288,7 +390,7 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(prefetchWarningTimings.prefetch!.startedAtMs).toBeLessThan(prefetchWarningTimings['checklist-gate']!.endedAtMs);
     const needsFailure = result.cases.find((item) => item.id === 'needs-prep-required-failure-preserves-sibling')!;
     expect(needsFailure).toMatchObject({ pass: true, status: 'failed', checks: { overlap: true } });
-    expect(needsFailure.fanOuts?.['export-check:ok']?.branches).toMatchObject({
+    expect(needsFailure.fanOuts?.['cutoff:ok']?.branches).toMatchObject({
       'checklist-gate': { status: 'failed', output: expect.any(String) },
       prefetch: { status: 'done', output: expect.any(String) },
     });
@@ -338,3 +440,26 @@ test('release receipt and waiver modes reject expectations absent from the Graph
     rmSync(root, { recursive: true, force: true });
   }
 }, 30_000);
+
+
+
+test('release sim preserves a completed gate verdict when a later same-run gate is interrupted', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-gate-interrupted-verdict-sim-'));
+  const verdict = join(root, 'release', '0.3.7', 'gate-verdict.json');
+  const completed = { version: '0.3.7', commit: 'a'.repeat(40), outcome: 'regression',
+    baselineReceipt: { schema: 2, valid: true, commit: 'a'.repeat(40), shards: 80 },
+    introduced: ['src/new.test.ts > known regression'] };
+  const interrupted = { version: '0.3.7', commit: 'b'.repeat(40), outcome: 'error',
+    stalledShards: [{ id: 'pod-0', files: ['src/a.test.ts'], reason: 'timeout' }],
+    partialFailures: { failures: [], errors: [] }, partialSummary: { pass: 0, fail: 0, errors: 0, ran: 0, files: 1 },
+    baselineReceipt: { fullSweep: false, commit: 'b'.repeat(40), shards: 80 } };
+  try {
+    writeGateVerdictRecord(verdict, completed);
+    writeGateVerdictRecord(verdict, interrupted);
+    expect(JSON.parse(readFileSync(verdict, 'utf8'))).toEqual(completed);
+    const attempts = readFileSync(join(root, 'release', '0.3.7', 'gate-verdict-attempts.jsonl'), 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line));
+    expect(attempts).toContainEqual(interrupted);
+    expect(attempts).toHaveLength(2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

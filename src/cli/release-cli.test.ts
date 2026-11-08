@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -13,19 +13,35 @@ import type { RehearsalDeps } from '../release-loop/rehearsal.js';
 import type { LightRcResult } from '../release-loop/light-rc.js';
 import type { ResumeReleaseDeps } from '../../scripts/release-loop/resume-release.js';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { runGraph } from '../graph-runner/runner.js';
 import { psProcessStartMs } from '../harness/harness-stop.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
+import { codeRevision, setCodeRevisionRootForTesting } from '../version/code-revision.js';
 import { enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { fileLeaseStore, serializeLease } from '../hq/lease.js';
 import type { HqDeps } from '../hq/hq.js';
 import { formatResumeGatePlan, isPrerelease, isReleaseVersion, planPublish, prepareRelease, publishRelease, registerReleaseCommands, runReleaseInstaller, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 import { readActiveForceReleaseRun } from './release-single-flight.js';
 import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../release-loop/gate-shard-ledger.js';
-import { simInProcessCli } from '../ux-sim/in-process-cli.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 import { runGateNode } from '../../scripts/release-loop/gate-node.js';
+
+const releaseCliTestCheckout = codeRevision() ?? '';
+const verifiedMainForCliTests = releaseCliTestCheckout;
+
+function scopeReleaseCliFreshnessTestBase(): void {
+  let previous: string | undefined;
+  beforeEach(() => {
+    previous = process.env.ELANOUS_TEST_RELEASE_CLI_FRESHNESS_BASE;
+    process.env.ELANOUS_TEST_RELEASE_CLI_FRESHNESS_BASE = releaseCliTestCheckout;
+  });
+  afterEach(() => {
+    if (previous === undefined) delete process.env.ELANOUS_TEST_RELEASE_CLI_FRESHNESS_BASE;
+    else process.env.ELANOUS_TEST_RELEASE_CLI_FRESHNESS_BASE = previous;
+  });
+}
 
 const frozenGateRunner = {
   command: async () => ({ rc: 0, output: '' }),
@@ -258,14 +274,15 @@ test('recovery apply executes the real release graph from gate through gate-tria
     const cmd = new Command(); registerReleaseCommands(cmd, { ledgerRoot: root }, {}, {}, {}, rehearsalDeps, resumeDeps);
     process.exitCode = 0;
     await cmd.parseAsync(['release', 'rehearsal', 'tick', '--recovery-run', fixture.runId, '--apply', '--checkout', fixture.checkout, '--json'], { from: 'user' });
-    const result = JSON.parse(lines[0]!) as { ok: boolean; recovery: string; runId: string; status: string; state: { nodes: Array<{ nodeId: string }> } };
-    expect(result).toMatchObject({ ok: false, recovery: 'resumed', runId: fixture.runId, status: 'failed' });
-    expect(process.exitCode).toBe(1);
-    expect(visits).toEqual(['gate', 'gate-triage', 'traffic-failed-restore']);
-    expect(commands).toHaveLength(3);
+    const result = JSON.parse(lines[0]!) as { ok: boolean; recovery: string; runId: string; status: string;
+      state: { nodes: Array<{ nodeId: string }>; pending?: { nodeId: string } } };
+    expect(result).toMatchObject({ ok: true, recovery: 'resumed', runId: fixture.runId, status: 'awaiting-approval',
+      state: { pending: { nodeId: 'gate-heal-decision' } } });
+    expect(process.exitCode).toBe(0);
+    expect(visits).toEqual(['gate', 'gate-triage']);
+    expect(commands).toHaveLength(2);
     expect(commands[0]).toContain('gate-node.ts');
     expect(commands[1]).toContain('gate-triage-node.ts');
-    expect(commands[2]).toContain('traffic-node.ts traffic-failed-restore');
     expect(result.state.nodes.filter((node) => node.nodeId === 'gate')).toHaveLength(1);
     expect(result.state.nodes.filter((node) => node.nodeId === 'gate-triage')).toHaveLength(1);
     expect(result.state.nodes.filter((node) => node.nodeId === 'mac-smoke')).toHaveLength(0);
@@ -630,15 +647,16 @@ describe('release checklist CLI', () => {
   test('actual isolated skip-note exits nonzero for a stale title so dispatcher does not mark it sent', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-skip-note-cli-'));
     setElanousConfigDir(dir);
-    const run = (...args: string[]) => simInProcessCli(['release', 'checklist', '--version', '9.9.9', ...args], {
+    const run = (...args: string[]) => simCli(['release', 'checklist', '--version', '9.9.9', ...args], {
       allowPaths: [['release', 'checklist']], stateRoot: dir,
     });
-    const actualCli = (...args: string[]) => spawnSync('bun', ['bin/elanous.mjs', `--test=${dir}`, 'release', 'checklist', '--version', '9.9.9', ...args],
-      { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 60_000 });
+    const actualCli = (...args: string[]) => simCli(['--test', dir, 'release', 'checklist', '--version', '9.9.9', ...args], {
+      allowPaths: [['release', 'checklist']], stateRoot: dir, cwd: join(import.meta.dir, '..', '..'),
+    });
     try {
       expect((await run('add', 'SKIP', 'Original')).exitCode).toBe(0);
-      const stale = actualCli('skip-note', 'SKIP', 'missing path', '--expected-title', 'Old title', '--by', 'OP');
-      expect(stale.status).toBe(1);
+      const stale = await actualCli('skip-note', 'SKIP', 'missing path', '--expected-title', 'Old title', '--by', 'OP');
+      expect(stale.exitCode).toBe(1);
       expect(stale.stderr).toContain('칸 제목이 바뀌어');
       expect(JSON.parse((await run('list', '--json')).stdout).items[0]?.evidence).toBeUndefined();
       expect((await run('skip-note', 'SKIP', 'missing path', '--expected-title', 'Original', '--by', 'OP')).exitCode).toBe(0);
@@ -802,7 +820,7 @@ describe('release checklist CLI', () => {
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
       // recover-landing is part of this PR's CLI surface; keep the registered command and its help discoverable.
-      expect(release.commands.map((c) => c.name())).toEqual(['gate-shards', 'schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'recover', 'recover-landing', 'gate-history', 'rehearsal', 'auto-start']);
+      expect(release.commands.map((c) => c.name())).toEqual(['status', 'gate-shards', 'schedule', 'place', 'rebalance', 'budget', 'pull-forward', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run', 'preflight', 'light-rc', 'resume', 'recover', 'recover-landing', 'gate-history', 'rehearsal', 'auto-start']);
       expect(release.commands.find((c) => c.name() === 'recover-landing')!.helpInformation()).toContain('착지 알림 수동 재생 입구');
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
@@ -1173,6 +1191,7 @@ describe('release schedule CLI', () => {
 });
 
 describe('release run CLI', () => {
+  scopeReleaseCliFreshnessTestBase();
   test('a live graph runner ledger blocks a second CLI process with its actual run identity', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-single-flight-real-ledger-'));
     const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
@@ -1373,9 +1392,9 @@ describe('release run CLI', () => {
       await run('--if-ready', '--publish-at', '2099-10-09T20:00+09:00');
       await run();
       expect(inputs).toEqual([
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', publishAt: '2099-10-09T11:00:00.000Z', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
       ]);
       process.exitCode = 0;
       await run('--publish-at', '2099-10-09T20:00');
@@ -1402,19 +1421,21 @@ describe('release run CLI', () => {
       expect(inputs).toHaveLength(3);
     } finally { process.exitCode = before ?? 0; output.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
-  test('a direct release run while frozen fails in a real CLI process (exit 1 · JSON failure); --if-ready defers', () => {
+  test('release run while frozen fails (exit 1 · JSON failure); --if-ready defers', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-cli-freeze-proc-'));
     try {
       enableLandingFreeze({ reason: 'drill', by: 'MK' }, dir);
-      const cli = (...args: string[]) => Bun.spawnSync([process.execPath, join(import.meta.dir, '../../bin/elanous.mjs'), 'release', 'run', '--version', '0.2.4', '--json', ...args], { env: { ...process.env, ELANOUS_STATE_DIR: dir } });
-      const direct = cli();
+      const cli = (...args: string[]) => simCli(['release', 'run', '--version', '0.2.4', '--json', ...args], {
+        allowPaths: [['release', 'run']], stateRoot: dir,
+      });
+      const direct = await cli();
       expect(direct.exitCode).toBe(1);
-      expect(JSON.parse(direct.stdout.toString().trim().split('\n').at(-1)!)).toMatchObject({ ok: false, reason: 'frozen' });
-      const scheduled = cli('--if-ready');
+      expect(JSON.parse(direct.stdout.trim().split('\n').at(-1)!)).toMatchObject({ ok: false, reason: 'frozen' });
+      const scheduled = await cli('--if-ready');
       expect(scheduled.exitCode).toBe(0);
-      expect(JSON.parse(scheduled.stdout.toString().trim().split('\n').at(-1)!)).toMatchObject({ ok: true, skipped: true, reason: 'frozen' });
+      expect(JSON.parse(scheduled.stdout.trim().split('\n').at(-1)!)).toMatchObject({ ok: true, skipped: true, reason: 'frozen' });
     } finally { rmSync(dir, { recursive: true, force: true }); }
-  }, 60_000);
+  });
   test('a real graph run: the gate node refuses a freeze switched on after the run started, records it, and release run reports frozen', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-cli-freeze-realgraph-'));
     const root = join(dir, 'state');
@@ -1667,21 +1688,54 @@ describe('release run CLI', () => {
     mkdirSync(join(dir, 'release', '0.2.3'), { recursive: true });
     writeFileSync(join(dir, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
     const inputs: unknown[] = [];
+    const currentCommit = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: process.cwd(), encoding: 'utf8' }).stdout.trim();
+    expect(currentCommit).toMatch(/^[0-9a-f]{40}$/u);
     const previous = process.exitCode;
     const output = spyOn(console, 'log').mockImplementation(() => {});
     try {
       const cli = new Command(); registerReleaseCommands(cli, { ledgerRoot: dir, config: { gatePodPool: 'pool' },
         checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
         graph: async (_path, opts) => { inputs.push(opts.input); return { status: 'done' } as never; } });
-      for (const flags of [[], ['--cut-commit', 'a'.repeat(40)], ['--if-ready', '--cut-commit', 'b'.repeat(40)]])
+      for (const flags of [[], ['--cut-commit', currentCommit], ['--if-ready', '--cut-commit', currentCommit]])
         await cli.parseAsync(['release', 'run', '--version', '0.2.4', ...flags], { from: 'user' });
       expect(inputs).toEqual([
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', cutCommit: 'a'.repeat(40) },
-        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', cutCommit: 'b'.repeat(40) },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', cutCommit: currentCommit },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', cutCommit: currentCommit },
       ]);
     } finally { output.mockRestore(); process.exitCode = previous ?? 0; rmSync(dir, { recursive: true, force: true }); }
   });
+
+  test('an unresolved parent CLI revision refuses a cut before graph launch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-stale-cli-'));
+    const stalePackage = join(dir, 'cli-package.git');
+    const staleCli = '1'.repeat(40);
+    const currentCut = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: process.cwd(), encoding: 'utf8' }).stdout.trim();
+    const gitCommonDir = spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd: process.cwd(), encoding: 'utf8' }).stdout.trim();
+    expect(staleCli).toMatch(/^[0-9a-f]{40}$/u);
+    expect(currentCut).toMatch(/^[0-9a-f]{40}$/u);
+    expect(spawnSync('git', ['init', '--bare', '-q', stalePackage], { encoding: 'utf8' }).status).toBe(0);
+    writeFileSync(join(stalePackage, 'objects/info/alternates'), `${resolve(process.cwd(), gitCommonDir, 'objects')}\n`);
+    mkdirSync(join(stalePackage, 'refs/heads'), { recursive: true });
+    writeFileSync(join(stalePackage, 'refs/heads/stale-cli'), `${staleCli}\n`);
+    writeFileSync(join(stalePackage, 'HEAD'), 'ref: refs/heads/stale-cli\n');
+    mkdirSync(join(dir, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(dir, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    let graphCalls = 0;
+    const errors: string[] = [];
+    const errorOutput = spyOn(console, 'error').mockImplementation((line: string) => { errors.push(line); });
+    const previousExit = process.exitCode;
+    try {
+      setElanousConfigDir(dir);
+      setCodeRevisionRootForTesting(stalePackage);
+      const cli = new Command(); registerReleaseCommands(cli, { ledgerRoot: dir, config: { gatePodPool: 'pool' }, graph: async () => { graphCalls++; return { status: 'done' } as never; } });
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--cut-commit', currentCut], { from: 'user' });
+      expect(graphCalls).toBe(0);
+      expect(errors.join('\n')).not.toBeEmpty();
+      expect(process.exitCode).toBe(1);
+    } finally { setCodeRevisionRootForTesting(undefined); resetElanousConfigDir(); errorOutput.mockRestore(); process.exitCode = previousExit ?? 0; rmSync(dir, { recursive: true, force: true }); }
+  }, 30_000);
 
   test('--dry-run --if-ready preserves the input preview without checking readiness, running the graph or writing a lock', async () => {
     for (const blocked of [true, false]) {
@@ -1898,7 +1952,7 @@ describe('release run CLI', () => {
       graph: async (path, opts) => { expect(path).toEndWith('graphs/release/release-loop.yaml'); expect(opts.input.previousVersion).toBe('0.2.3'); graphCalls++; return { status: 'awaiting-approval', runId: 'run-1' } as never; } });
     try {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
-      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: false, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true }, state: { status: 'awaiting-approval', runId: 'run-1' } });
+      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: false, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests }, state: { status: 'awaiting-approval', runId: 'run-1' } });
       expect([checklistCalls, graphCalls]).toEqual([1, 1]);
       expect(process.exitCode ?? 0).toBe(0);
       const blocked = new Command();
@@ -1919,6 +1973,59 @@ describe('release run CLI', () => {
       expect(process.exitCode).toBe(1);
     } finally { process.exitCode = before ?? 0; write.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+describe('release CLI freshness test baseline', () => {
+  scopeReleaseCliFreshnessTestBase();
+  test('release run CLI honors test-only freshness pinning and explicit cut precedence', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'release-cli-freshness-entrypoint-'));
+    const repo = join(root, 'repo');
+    const state = join(root, 'state');
+    mkdirSync(root, { recursive: true });
+    const git = (args: string[], env: NodeJS.ProcessEnv = process.env) => {
+      const result = spawnSync('git', ['-c', 'user.name=release-cli-test', '-c', 'user.email=release-cli-test@example.invalid', ...args], { cwd: repo, encoding: 'utf8', env });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    try {
+      const clone = spawnSync('git', ['clone', '--shared', '--quiet', process.cwd(), repo], { encoding: 'utf8' });
+      expect(clone.status, clone.stderr).toBe(0);
+      const checkout = git(['rev-parse', 'HEAD']);
+      const target = 'scripts/release-loop/gate-runtime.ts';
+      const advancedFile = join(root, 'advanced-gate-runtime.ts');
+      writeFileSync(advancedFile, 'export const gateRuntime = "synthetic origin main advance";\n');
+      const blob = spawnSync('git', ['hash-object', '-w', advancedFile], { cwd: repo, encoding: 'utf8' });
+      expect(blob.status, blob.stderr).toBe(0);
+      const index = join(root, 'synthetic.index');
+      const gitEnv = { ...process.env, GIT_INDEX_FILE: index };
+      expect(git(['read-tree', 'HEAD'], gitEnv)).toBe('');
+      expect(git(['update-index', '--cacheinfo', '100644', blob.stdout.trim(), target], gitEnv)).toBe('');
+      const tree = git(['write-tree'], gitEnv);
+      const advancedCut = git(['commit-tree', tree, '-p', checkout], { ...process.env, GIT_AUTHOR_NAME: 'release-cli-test', GIT_AUTHOR_EMAIL: 'release-cli-test@example.invalid', GIT_COMMITTER_NAME: 'release-cli-test', GIT_COMMITTER_EMAIL: 'release-cli-test@example.invalid' });
+      git(['update-ref', 'refs/remotes/origin/main', advancedCut]);
+
+      const run = (nodeEnv: string, args: string[] = [], testBase = checkout) => simCli(
+        ['release', 'run', '--version', '0.2.4', '--json', ...args],
+        { allowPaths: [['release', 'run']], cwd: repo, stateRoot: state,
+          env: { NODE_ENV: nodeEnv, ELANOUS_TEST_RELEASE_CLI_FRESHNESS_BASE: testBase, HOME: root } },
+      );
+
+      const production = await run('production');
+      expect(production.exitCode).toBe(1);
+      expect(JSON.parse(production.stdout.trim().split('\n').at(-1)!)).toMatchObject({ ok: false, reason: 'stale-cli' });
+
+      enableLandingFreeze({ reason: 'freshness-integration', by: 'MVP-C' }, state);
+      const testDefault = await run('test');
+      expect(testDefault.exitCode).toBe(1);
+      expect(JSON.parse(testDefault.stdout.trim().split('\n').at(-1)!)).toMatchObject({ ok: false, reason: 'frozen' });
+
+      const explicitCut = await run('test', ['--cut-commit', advancedCut]);
+      expect(explicitCut.exitCode).toBe(1);
+      expect(JSON.parse(explicitCut.stdout.trim().split('\n').at(-1)!)).toMatchObject({ ok: false, reason: 'stale-cli' });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 90_000);
 });
 
 test('actual release resume --dry-run executable prints JSON without mutating run state or refs', () => {
@@ -2479,30 +2586,33 @@ test('every publishRelease call in this file pins both instanceRoot and ledgerRo
   expect(calls.filter((args) => !/\binstanceRoot\b/.test(args) || !/\bledgerRoot\b/.test(args))).toEqual([]);
 });
 
-test('RELEASE-REHEARSAL-RC CLI: --prerelease rc numbers the run, never reads checklist readiness (even with --if-ready), and rejects other kinds', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'release-rc-cli-'));
-  mkdirSync(join(dir, 'release', '0.2.17'), { recursive: true });
-  writeFileSync(join(dir, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: 'now' }));
-  const stdout: string[] = [];
-  const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { stdout.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
-  const error = spyOn(console, 'error').mockImplementation(() => {});
-  const before = process.exitCode;
-  const inputs: unknown[] = [];
-  try {
-    const cli = new Command();
-    registerReleaseCommands(cli, { ledgerRoot: dir, freezeRoot: dir, config: { gatePodPool: 'pool' }, releaseRefs: () => ['refs/heads/release/0.2.18-rc.0'],
-      checklist: () => { throw new Error('rc read the checklist'); },
-      graph: async (_path, opts) => { inputs.push(opts.input); return { status: 'done' } as never; } });
-    process.exitCode = 0;
-    await cli.parseAsync(['release', 'run', '--version', '0.2.18', '--prerelease', 'rc', '--if-ready', '--json'], { from: 'user' });
-    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: true, input: { version: '0.2.18-rc.1', branchCut: true } });
-    expect(inputs).toEqual([{ version: '0.2.18-rc.1', previousVersion: '0.2.17', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true }]);
-    expect(process.exitCode).toBe(0);
-    await cli.parseAsync(['release', 'run', '--version', '0.2.18', '--prerelease', 'beta', '--json'], { from: 'user' });
-    expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: false, error: '--prerelease supports rc only: beta' });
-    expect(process.exitCode).toBe(1);
-    expect(inputs).toHaveLength(1);
-  } finally { process.exitCode = before ?? 0; write.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+describe('RELEASE-REHEARSAL-RC CLI freshness scope', () => {
+  scopeReleaseCliFreshnessTestBase();
+  test('RELEASE-REHEARSAL-RC CLI: --prerelease rc numbers the run, never reads checklist readiness (even with --if-ready), and rejects other kinds', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-rc-cli-'));
+    mkdirSync(join(dir, 'release', '0.2.17'), { recursive: true });
+    writeFileSync(join(dir, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: 'now' }));
+    const stdout: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { stdout.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const before = process.exitCode;
+    const inputs: unknown[] = [];
+    try {
+      const cli = new Command();
+      registerReleaseCommands(cli, { ledgerRoot: dir, freezeRoot: dir, config: { gatePodPool: 'pool' }, releaseRefs: () => ['refs/heads/release/0.2.18-rc.0'],
+        checklist: () => { throw new Error('rc read the checklist'); },
+        graph: async (_path, opts) => { inputs.push(opts.input); return { status: 'done' } as never; } });
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.18', '--prerelease', 'rc', '--if-ready', '--json'], { from: 'user' });
+      expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: true, input: { version: '0.2.18-rc.1', branchCut: true } });
+      expect(inputs).toEqual([{ version: '0.2.18-rc.1', previousVersion: '0.2.17', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests }]);
+      expect(process.exitCode).toBe(0);
+      await cli.parseAsync(['release', 'run', '--version', '0.2.18', '--prerelease', 'beta', '--json'], { from: 'user' });
+      expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: false, error: '--prerelease supports rc only: beta' });
+      expect(process.exitCode).toBe(1);
+      expect(inputs).toHaveLength(1);
+    } finally { process.exitCode = before ?? 0; write.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe('CHECKLIST-PRED-CLEAR — set --no-predecessor', () => {

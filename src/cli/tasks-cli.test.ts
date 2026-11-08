@@ -1,8 +1,8 @@
-import { expect, spyOn, test } from 'bun:test';
+import { afterAll, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -15,6 +15,11 @@ import { GoalRunStore, goalRunDbPath } from '../self-implement/goal-run-store.js
 import { runHostRegate } from '../self-implement/host-regate.js';
 import type { LogStoreRow } from '../mss/logging/log-store.js';
 import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-hand.js';
+import { createTempDirectoryScope } from '../test-utils/temp-dir-cleanup.js';
+const tempDirectoryScope = createTempDirectoryScope();
+const mkdtempSync = tempDirectoryScope.mkdtempSync;
+
+afterAll(() => tempDirectoryScope.cleanup());
 import { readMapRun } from '../task-agent/map-run-ledger.js';
 import { rejudgeCandidates } from '../task-agent/rejudge-on-head.js';
 import { reviewResultPath } from '../task-agent/review-result-capture.js';

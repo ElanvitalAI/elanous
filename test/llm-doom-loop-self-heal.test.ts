@@ -17,16 +17,7 @@ import {
   _clearQuestionResultListenersForTesting,
 } from '../src/ask-user-question/index.js';
 import { approvalModalRouter } from '../src/approval-modal.js';
-import {
-  DOOM_LOOP_SELF_HEAL_STOP_TEXT,
-  classifyDoomLoopIntervention,
-  decideDoomLoopSelfHeal,
-  normalizeDoomLoopInterventionClass,
-  streamLLMWithTools,
-  type LLMMessage,
-  type LLMProvider,
-  type LLMStreamEvent,
-} from '../src/llm.js';
+import { DOOM_LOOP_SELF_HEAL_STOP_TEXT, classifyDoomLoopIntervention, decideDoomLoopSelfHeal, normalizeDoomLoopInterventionClass, streamLLMWithTools, type LLMMessage, type LLMProvider, type LLMStreamEvent } from '../src/llm.js';
 
 let askCalls = 0;
 

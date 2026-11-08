@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── L2 코어 앱 도구 레지스트리 (서피스·도메인 무관 · 2026-07-08) ───────────
 //
 // 툴 노출 3층 정리(대표 지시): L1 네이티브(session-runtime·Read/Grep/Bash) · **L2 코어
@@ -13,7 +14,7 @@
 
 import { existsSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { runRecall, CONTEXT_NOW_SPEC, type RecallSearch } from '../tool-runtime/self-cognition-runtimes.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';

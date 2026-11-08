@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.9 P1: QuickKillTriage LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   renderQuickKill,
   triageQuickKill,

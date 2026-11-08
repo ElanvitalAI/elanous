@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tool: mermaid_syntax — T3-A2.
 //
 // Quick reference for the 9 Mermaid diagram kinds. Companion of
@@ -21,7 +22,7 @@
 // representative template per kind with a classDef palette so
 // every diagram comes out pre-styled.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 export type MermaidDomain =
   | 'flowchart'

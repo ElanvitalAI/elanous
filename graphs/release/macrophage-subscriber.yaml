@@ -12,6 +12,10 @@ nodes:
       - { event: node-end, match: { nodeId: pre-prepare-join }, action: wake }
       - { event: node-end, match: { nodeId: release-post-publish-join }, action: wake }
       - { event: node-end, match: { nodeId: traffic-failed-restore }, action: wake }
+      - { event: node-end, match: { ok: false }, action: wake }
+      - { event: merge-train.batch, action: wake }
+      - { event: merge-train.verdict, action: wake }
+      - { event: merge-train.incident, action: wake }
   - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
 edges:
   - { from: macrophage-heal, on: outcome, map: { ok: done, fail: done, error: done } }

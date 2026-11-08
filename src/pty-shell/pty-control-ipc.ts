@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { ptyManifestDbPath, getPtyManifest, markPtyControlled, listPtyManifestRows, listPtyManifestRowsAt } from './pty-manifest.js';
 import { getHarnessRunId } from '../harness/harness-space.js';
-import { renamePty, type PtyControlTarget } from './registry.js';
+import type { PtyControlTarget } from './registry.js';
 import { resizePtyWithOutcome, writePtyWithOutcome, writePtyWithOutcomeDetail } from './pty-write-outcome.js';
 import { resetExternalWriteProvenanceForTesting } from './pty-write-provenance.js';
 import { parsePtyWriteActor, resolveRemoteControlActor, type PtyWriteActor } from './pty-write-arbiter.js';
@@ -680,7 +680,10 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
         const payload = parsePayload(row);
         if (payload === null || typeof payload !== 'object' || Array.isArray(payload) || !('nickname' in payload) || typeof payload.nickname !== 'string') result = { status: 'denied', reason: 'invalid-rename-payload' };
         // Rename changes only the label; unlike ownership transfer, both humans and agents may request it.
-        else result = renamePty(row.pty_id, payload.nickname) ? { status: 'success' } : { status: 'unknown-pty' };
+        else {
+          const { renamePty } = await import('./registry.js');
+          result = renamePty(row.pty_id, payload.nickname) ? { status: 'success' } : { status: 'unknown-pty' };
+        }
       } else if (row.action === 'takeover' || row.action === 'release') {
         // ⚠️ 소유권 전이는 아직 사람 축만이다 — `agent` 는 자기 소유(`auto`) 자식에 그냥 쓰면 되므로
         //    이 슬라이스에 agent 전이가 필요 없다. 조용히 human 으로 떨어뜨리지 않고 **거부**한다.

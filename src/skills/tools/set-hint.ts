@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tool: set_tool_hint
 //
 // Let the LLM (mid-run) register a hint that steers subsequent tool
@@ -12,7 +13,7 @@
 
 import { addHint } from '../../tool-hints/registry.js';
 import type { Hint, HintKind, HintScope } from '../../tool-hints/types.js';
-import type { LLMToolSpec } from '../../llm.js';
+
 
 export function buildSetToolHintTool(): LLMToolSpec {
   return {

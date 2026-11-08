@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { simInProcessCli } from './ux-sim/in-process-cli.js';
+import { simCli } from './ux-sim/in-process-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -92,10 +92,10 @@ async function runBinWithDelayedStdout(args: string[], env: NodeJS.ProcessEnv = 
 }
 
 // Commander registration and option rejection are S1 contracts. Keep this
-// group serial: simInProcessCli temporarily owns process globals.
+// group serial: simCli temporarily owns process globals.
 describe('CLI registered command contract (in process)', () => {
   test.each(['--resume', '--bogus-flag'])('self goal-run-search가 %s를 Commander의 unknown option으로 거부한다', async (flag) => {
-    const result = await simInProcessCli(['self', 'goal-run-search', '--limit', '1', flag, 'XYZ'], {
+    const result = await simCli(['self', 'goal-run-search', '--limit', '1', flag, 'XYZ'], {
       allowPaths: [['self', 'goal-run-search']],
     });
     expect(result.stdout + result.stderr).toContain('unknown option');
@@ -103,7 +103,7 @@ describe('CLI registered command contract (in process)', () => {
   });
 
   test('harness ask --graph is no longer accepted', async () => {
-    const result = await simInProcessCli(['harness', 'ask', '/tmp/goal.md', '--graph', 'maybe', '--dry-run'], {
+    const result = await simCli(['harness', 'ask', '/tmp/goal.md', '--graph', 'maybe', '--dry-run'], {
       allowPaths: [['harness', 'ask']],
     });
     expect(result.exitCode).toBe(1);
@@ -113,13 +113,13 @@ describe('CLI registered command contract (in process)', () => {
   });
 
   test('nexus run 도움말 끝은 등록된 숨은 옵션의 수와 이름을 알린다', async () => {
-    const result = await simInProcessCli(['nexus', 'run', '--help'], { allowPaths: [['nexus', 'run']] });
+    const result = await simCli(['nexus', 'run', '--help'], { allowPaths: [['nexus', 'run']] });
     expect(result.exitCode).toBe(0);
     expect(result.stdout + result.stderr).toMatch(/Hidden options \(7\):\s*--headless, --foreground, --bg, --http-port, --http-host, --tools, --history-dir\s*$/);
   });
 
   test('self parked 도움말은 JSON 출력의 updatedAt 필드를 명시한다', async () => {
-    const result = await simInProcessCli(['self', 'parked', '--help'], { allowPaths: [['self', 'parked']] });
+    const result = await simCli(['self', 'parked', '--help'], { allowPaths: [['self', 'parked']] });
     expect(result.exitCode).toBe(0);
     // Commander wraps help at terminal width, so compare normalized whitespace.
     // The envelope and its parked[] fields are separate contracts.

@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.1 P2: AndonList LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   buildAndonListResult,
   buildAndonPreamble,

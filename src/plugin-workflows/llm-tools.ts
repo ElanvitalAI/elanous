@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── PX-4 P5: WorkflowRun / WorkflowList / WorkflowStatus LLM tools ──
 //
 // Three tools cover the 3 verbs the LLM needs on a workflow:
@@ -11,7 +12,7 @@
 // can list workflows without owning the plugin-host's pluginEntry
 // graph. plugin-host (below) populates this at activate.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { globalWorkflowRunner } from './global-runner.js';
 import type {
   SkillWorkflow,

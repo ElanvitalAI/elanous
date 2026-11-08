@@ -1,0 +1,22 @@
+world: app-demo-1114
+seed: 1114
+clock: { start: '2100-11-14T00:00:00Z', speed: 60 }
+apps:
+  - slug: voice-notes
+    versions:
+      - id: v1
+        files:
+          index.html: '<main>녹음 · 요약 · 할 일</main>'
+      - id: v2
+        files:
+          index.html: '<main>🔴 할 일을 맨 위에</main>'
+  - slug: shop-studio
+    versions:
+      - id: v1
+        files:
+          index.html: '<main>상품 · 사진 업로드 · 광고 영상</main>'
+steps:
+  - observe: app-demo-1114
+demo:
+  recording: kaist-demo-recording
+  transcript: 상품 소개 자료를 확인해 주세요

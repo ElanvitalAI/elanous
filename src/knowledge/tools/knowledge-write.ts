@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S4.3: KnowledgeWrite LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { discoverObsidianVault, type ObsidianVault } from '../../auto-research/obsidian-bridge.js';
 import { knowledgeWrite } from '../write.js';
 import type { KnowledgeWriteInput, KnowledgeWriteResult } from '../types.js';

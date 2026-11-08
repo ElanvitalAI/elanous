@@ -9,9 +9,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { collectAxisSignals, type RawFetchers } from './regime-fetchers.js';
 import { synthesizeRegime, type RegimeVector } from './regime-synth.js';
-import { conatusPath } from './conatus-data-dir.js';
-
-export const REGIME_DB_PATH = conatusPath('regime.db');
+import { REGIME_DB_PATH } from './regime-db-path.js';
+export { REGIME_DB_PATH } from './regime-db-path.js';
 
 export function openRegimeDb(path: string = REGIME_DB_PATH): Database {
   const db = new Database(path);

@@ -1,3 +1,4 @@
+import { textOnly } from '../llm/stream-text.js';
 // ── DART 공시 다운로더 (2026-07-07 · 대표 지시 — OpenDART 직결) ────────
 //
 // 배경: firecrawl DART 모니터는 "변경 감지 1건"만 알리고 공시 내용이 없음
@@ -16,7 +17,7 @@ import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { getUserConfig } from '../user-config.js';
-import { getProviderForConfig, anyProviderAvailable, textOnly, type LLMMessage } from '../llm.js';
+import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 import { conatusPath } from './conatus-data-dir.js';
 
 const BASE = 'https://opendart.fss.or.kr/api';

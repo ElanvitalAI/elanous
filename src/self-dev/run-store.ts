@@ -19,34 +19,23 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSyn
 import { dlopen, FFIType } from 'bun:ffi';
 import { randomUUID } from 'node:crypto';
 import { debug, redactSecretText } from '../debug/log.js';
-import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { loadRunLedger, queryInterruptedRunLedgers, runLedgerDir, type RunLedgerEntry } from '../self-implement/run-ledger.js';
-import { join, resolve, sep } from 'node:path';
+import { join } from 'node:path';
 import { isPidAlive } from '../git-fs/worktree.js';
-import type { EmbodiedTransportKind } from '../agent/embodiment.js';
-import type { RunIdSource } from '../harness/harness-space.js';
 import { withFileLockSync } from '../storage/file-lock.js';
-import type { SelfDevJobResult, SelfDevGoal, SupervisorStopReason, SupervisorNext } from './run-types.js';
-import { loadMirroredRunRecord, mirrorRunRecord } from './run-record-mirror.js';
+import { loadSelfDevRun, loadSelfDevRunFromPath, runPath, selfDevRunsDir } from './run-store-checkpoint.js';
+import { mirrorRunRecord } from './run-record-mirror.js';
+import type { SelfDevRunParticipant, SelfDevRunResolution, SelfDevRunState } from './run-store-contract.js';
+import type { SelfDevGoal, SupervisorNext, SupervisorStopReason } from './run-types.js';
+export type { SelfDevRunParticipant, SelfDevRunResolution, SelfDevRunState } from './run-store-contract.js';
 
-export interface SelfDevRunParticipant {
-  id: string;
-  kind: 'agent' | 'pty' | 'acp' | 'process';
-  transports: { kind: EmbodiedTransportKind; id: string }[];
-  registeredAt: number;
-  runIdSource: RunIdSource;
-  closedAt?: number;
-  closedBy?: 'self' | 'parent';
-}
+export { loadSelfDevRun, selfDevRunsDir };
 
-interface SelfDevRunResolution {
-  reason: string;
-  resolvedAt: number;
-}
+type CheckpointDependencyGoal = Pick<SelfDevGoal, 'feature' | 'id'> & { dependsOn?: readonly string[] };
 
 /** Map each checkpoint shard ID to its declared predecessor shard IDs. */
 function selfDevRunDependencies(
-  goals: readonly { feature: string; id?: string; dependsOn?: readonly string[] }[],
+  goals: readonly CheckpointDependencyGoal[],
 ): Record<string, string[]> {
   return Object.fromEntries(goals.map((goal, index) => [goal.id ?? String(index), [...(goal.dependsOn ?? [])]]));
 }
@@ -58,58 +47,10 @@ function selfDevRunDependencies(
  */
 export function checkpointDependenciesForRun(
   prior: Pick<SelfDevRunState, 'dependencies'> | null,
-  goals: readonly { feature: string; id?: string; dependsOn?: readonly string[] }[],
+  goals: readonly CheckpointDependencyGoal[],
 ): Record<string, string[]> | undefined {
   return prior ? prior.dependencies : selfDevRunDependencies(goals);
 }
-
-export interface SelfDevRunState {
-  runId: string;
-  createdAt: number;
-  updatedAt: number;
-  results: SelfDevJobResult[];
-  /** Redacted, bounded one-line projection for loop readers; legacy checkpoints omit it. */
-  summaryLine?: string;
-  /** Undefined means a legacy checkpoint has no dependency information; each key is a shard ID and its array lists predecessor shard IDs. */
-  dependencies?: Record<string, string[]>;
-  /**
-   * ⭐⭐ 이 런을 «다시 걸려면» 필요한 goal 원형(id·feature·dependsOn·승격 플래그). 2026-08-19 신설.
-   *
-   * ⛔ **왜 필요한가 — 이것이 없으면 재개가 «원리상» 불가능하다.**
-   *   실행 의존성은 `goal.dependsOn`(orchestrate.ts)에서 오는데, CLI 로 goal «텍스트»만 주면
-   *   그 필드가 없어 조각이 «전부 동시»에 뜬다(상류 산출 없이 하류가 도는 것).
-   *   되먹이려 해도 못 잇는다 — `dependencies` 키는 shard id 이고 `results` 는 taskId 라
-   *   그 둘을 잇는 매핑이 어디에도 «없었다».
-   *   📏 2026-08-19 북극성 런에서 실측: 재개하려면 사람이 순서를 «추론»해야 했다.
-   *
-   * ⚠️ undefined = 이 필드 «이전»에 저장된 체크포인트. 그때는 종전대로 인자 goals 를 쓴다(하위호환).
-   */
-  goals?: SelfDevGoal[];
-  /** Undefined means a checkpoint predates participant tracking; [] means tracked with no participants. */
-  participants?: SelfDevRunParticipant[];
-  /** Human confirmation that this run's parked results have been handled. */
-  parkedResolution?: SelfDevRunResolution;
-  /** The closed supervisor termination reason, persisted independently from per-goal results. */
-  supervisorStopReason?: SupervisorStopReason;
-  /** Named next step at supervisor termination; legacy checkpoints omit it. */
-  next?: SupervisorNext;
-  /** ★ C(2026-07-21·HITL 정황 품질) — 이 run 을 구동하는 오케스트레이터 프로세스 pid. 살아있으면
-   *  non-terminal goal 은 **실행중(running)** 이지 막힌(interrupted) 게 아니다. 죽었으면(오케스트레이터
-   *  killed) 진짜 interrupted. isPidAlive 로 구분해 라이브 잡을 parked/repair-signals 에서 제외. */
-  pid?: number;
-  /** OS process birth identity, paired with pid to reject a recycled pid. */
-  pidStart?: string;
-  /** Seat fixed at launch; survives removal of the launch worktree. */
-  seat?: 'OP' | 'TC' | 'MK' | 'UX';
-}
-
-/** `<ELANOUS_STATE_DIR or ~/.elanous>/self-dev-runs`. */
-export function selfDevRunsDir(stateDir?: string): string {
-  const base = stateDir ?? elanousStateRoot();
-  return join(base, 'self-dev-runs');
-}
-
-const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
 /** Kernel process birth identity: Linux boot ID + start ticks or Darwin microseconds since epoch. */
 export function processBirthId(pid: number, platform: NodeJS.Platform = process.platform): string | undefined {
@@ -137,35 +78,6 @@ export function processBirthId(pid: number, platform: NodeJS.Platform = process.
     }
   } catch { /* Unreadable birth identity is not evidence of a match. */ }
   return undefined;
-}
-
-function runPath(runId: string, dir: string): string {
-  if (!RUN_ID.test(runId)) throw new Error(`invalid self-dev run ID: ${runId}`);
-  const root = resolve(dir);
-  const path = resolve(root, `${runId}.json`);
-  if (!path.startsWith(`${root}${sep}`)) throw new Error(`invalid self-dev run ID: ${runId}`);
-  return path;
-}
-
-const loggedAbsentCheckpoints = new Set<string>();
-
-function loadSelfDevRunFromPath(path: string): SelfDevRunState | null {
-  const runId = path.slice(path.lastIndexOf(sep) + 1, -'.json'.length);
-  try {
-    const o = JSON.parse(readFileSync(path, 'utf-8')) as SelfDevRunState | null;
-    if (o && typeof o.runId === 'string' && Array.isArray(o.results)) return o;
-    try { debug.log('self-dev.run-store', 'read-failed', { runId, reason: 'invalid checkpoint shape' }); } catch { /* preserve fail-soft reads */ }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      if (!loggedAbsentCheckpoints.has(runId)) {
-        loggedAbsentCheckpoints.add(runId);
-        try { debug.log('self-dev.run-store', 'checkpoint-absent', { runId }); } catch { /* preserve fail-soft reads */ }
-      }
-    } else {
-      try { debug.log('self-dev.run-store', 'read-failed', { runId, reason: String(error) }); } catch { /* preserve fail-soft reads */ }
-    }
-  }
-  return null;
 }
 
 function writeSelfDevRun(state: SelfDevRunState, dir: string): void {
@@ -243,17 +155,6 @@ export function saveSelfDevRun(state: SelfDevRunState, dir = selfDevRunsDir()): 
       mirrorRunRecord(saved, dir);
     });
   } catch { /* fail-soft — a lost checkpoint just means no resume, not a crash */ }
-}
-
-/** Load a run checkpoint by id, or null if absent/corrupt. */
-export function loadSelfDevRun(runId: string, dir = selfDevRunsDir()): SelfDevRunState | null {
-  const primary = loadSelfDevRunFromPath(runPath(runId, dir));
-  if (primary) return primary;
-  const mirrored = loadMirroredRunRecord(runId);
-  if (mirrored) {
-    try { debug.log('self-dev.run-store', 'read-from-mirror', { runId }); } catch { /* preserve fail-soft reads */ }
-  }
-  return mirrored;
 }
 
 /** Add one participant without losing registrations made by another caller for this run. */

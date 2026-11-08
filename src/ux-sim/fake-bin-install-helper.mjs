@@ -60,7 +60,7 @@ function openChildDirectory(parentFd, name) {
 try {
   const config = JSON.parse((await import('node:fs')).readFileSync(configPath, 'utf8'));
   if (actualArgv.length !== config.argv.length || actualArgv.some((arg, index) => arg !== config.argv[index])) {
-    fail('unexpected installer argv', 64);
+    fail(`unexpected installer argv: expected ${JSON.stringify(config.argv)} got ${JSON.stringify(actualArgv)}`, 64);
   } else if (process.env[config.prefixEnv] !== config.prefix) {
     fail('install prefix mismatch', 78);
   } else if (config.exitCode !== 0) {

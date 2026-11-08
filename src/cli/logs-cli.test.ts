@@ -3,6 +3,7 @@
  * DB/네트워크 미접촉 — 순수 함수만.
  */
 import { setDefaultTimeout, describe, expect, it, spyOn } from 'bun:test';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -3710,12 +3711,7 @@ describe('runLogsCli — remote /v1/logs', () => {
   });
 
   it('logs level asks the injected daemon and does not guess 31415', async () => {
-    const fetched: string[] = [];
-    const original = globalThis.fetch;
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      fetched.push(String(input));
-      return new Response(JSON.stringify({ ok: true, level: 'info', gates: {} }), { status: 200 });
-    }) as typeof fetch;
+    await withFakeFetchDevice([{ url: '/v1/logs/level', response: new Response(JSON.stringify({ ok: true, level: 'info', gates: {} }), { status: 200 }) }], async (device) => {
     const errors: string[] = [];
     const spy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
     const log = spyOn(console, 'log').mockImplementation(() => {});
@@ -3724,35 +3720,30 @@ describe('runLogsCli — remote /v1/logs', () => {
     }));
     try {
       expect(await runLogsLevel(undefined, {})).toBe(0);
-      expect(fetched).toEqual(['http://127.0.0.1:45678/v1/logs/level']);
-      expect(fetched.join(' ')).not.toContain('31415');
+      expect(device.calls().map((call) => call.url)).toEqual(['http://127.0.0.1:45678/v1/logs/level']);
+      expect(JSON.stringify(device.calls())).not.toContain('31415');
     } finally {
       setResolveDaemonEndpointForTest(null);
-      globalThis.fetch = original;
       spy.mockRestore();
       log.mockRestore();
     }
+    });
   });
 
   it('logs level with no daemon does not call 31415', async () => {
-    const fetched: string[] = [];
-    const original = globalThis.fetch;
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      fetched.push(String(input));
-      return new Response('{}', { status: 200 });
-    }) as typeof fetch;
+    await withFakeFetchDevice([{ url: '/v1/logs/level', method: 'POST', response: new Response('{}', { status: 200 }) }], async (device) => {
     const errors: string[] = [];
     const spy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
     setResolveDaemonEndpointForTest(() => null);
     try {
       expect(await runLogsLevel(undefined, {})).toBe(1);
-      expect(fetched).toEqual([]);
+      expect(device.calls()).toEqual([]);
       expect(errors.join(' ')).not.toContain('31415');
     } finally {
       setResolveDaemonEndpointForTest(null);
-      globalThis.fetch = original;
       spy.mockRestore();
     }
+    });
   });
 });
 

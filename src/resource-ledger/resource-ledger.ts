@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
 import { acquireLockSync } from '../storage/file-lock.js';
+import { evaluateHostLeasePolicy, HOST_LEASE_ALTERNATIVE_HOSTS } from '../guardian/host-lease-policy.js';
 
 export const RESOURCE_LANES = ['gate', 'train', 'ta', 'hand', 'warm', 'bench', 'unknown'] as const;
 export type ResourceLane = typeof RESOURCE_LANES[number];
@@ -35,13 +36,45 @@ export interface WarmPoolPodReceipt {
   cleanupResult: { state: 'clean' | 'unclean' | 'unknown'; procedure: string; reason: string; verifiedAt: string };
 }
 
+/** Durable host-scoped lease intent used by Guardian before remote work is dispatched. */
+export interface GuardianHostLeaseRequest {
+  requestId: string;
+  runId: string;
+  requestedBy: string;
+  consumer: string;
+  purpose: string;
+  host: string;
+  priority: string;
+  expiresAt: string;
+  releaseVersion?: string;
+}
+
+export type GuardianHostLeaseState = 'active' | 'released' | 'expired' | 'denied';
+export interface GuardianHostLeaseRecord {
+  leaseId: string;
+  request: GuardianHostLeaseRequest;
+  state: GuardianHostLeaseState;
+  at: string;
+  reason?: string;
+  alternatives?: string[];
+}
+
+export type GuardianHostLeaseEvent = { event: 'guardian-host-lease'; at: string; record: GuardianHostLeaseRecord };
+export type GuardianHostLeaseConflictEvent = { event: 'guardian-host-lease-conflict'; at: string; requestId: string; existingLeaseId: string; attemptedRequest: GuardianHostLeaseRequest };
+export type GuardianHostLeaseAdmittedEvent = { event: 'guardian-host-lease-admitted'; at: string; leaseId: string; host: string; runId: string; consumer: string };
+export type GuardianHostLeaseAdmissionDeniedEvent = { event: 'guardian-host-lease-admission-denied'; at: string; leaseId: string; host: string; runId: string; consumer: string; reason: 'lease-not-found' | 'lease-expired' | 'lease-not-active' | 'lease-owner-mismatch'; alternatives: string[] };
+
 export type ResourceLedgerEvent =
   | { event: 'lease-created'; at: string; lease: ResourceLease }
   | { event: 'lease-heartbeat'; at: string; id: string; heartbeatAt: string; resources?: ResourceLease['resources'] }
   | { event: 'lease-ended'; at: string; id: string; reason: string; stoppedBy: string }
   | { event: 'lease-reaped'; at: string; id: string; expectedHeartbeatAt: string; expectedExpiresAt: string; observedAt: string; reason: 'expired-and-absent' | 'machine-disappeared' }
   | { event: 'pool-declared'; at: string; pool: MachinePoolDeclaration }
-  | { event: 'pool-pod-receipt'; at: string; receipt: WarmPoolPodReceipt };
+  | { event: 'pool-pod-receipt'; at: string; receipt: WarmPoolPodReceipt }
+  | GuardianHostLeaseEvent
+  | GuardianHostLeaseConflictEvent
+  | GuardianHostLeaseAdmittedEvent
+  | GuardianHostLeaseAdmissionDeniedEvent;
 
 export interface ResourceMeasurement {
   host: string;
@@ -100,11 +133,142 @@ export function parseResourceLedgerEvents(text: string): ResourceLedgerEvent[] {
   return text.split(/\r?\n/).filter(Boolean).map((line, index) => {
     let value: unknown;
     try { value = JSON.parse(line); } catch { throw new Error(`resource ledger malformed at line ${index + 1}`); }
-    if (!value || typeof value !== 'object' || !['lease-created', 'lease-heartbeat', 'lease-ended', 'lease-reaped', 'pool-declared', 'pool-pod-receipt'].includes(String((value as { event?: unknown }).event))) {
+    if (!value || typeof value !== 'object' || !['lease-created', 'lease-heartbeat', 'lease-ended', 'lease-reaped', 'pool-declared', 'pool-pod-receipt', 'guardian-host-lease', 'guardian-host-lease-conflict', 'guardian-host-lease-admitted', 'guardian-host-lease-admission-denied'].includes(String((value as { event?: unknown }).event))) {
       throw new Error(`resource ledger invalid event at line ${index + 1}`);
+    }
+    if ((value as { event?: unknown }).event === 'guardian-host-lease') {
+      const row = value as { at?: unknown; record?: Partial<GuardianHostLeaseRecord> };
+      const request = row.record?.request;
+      if (!validGuardianText(row.at) || !row.record || !validGuardianText(row.record.leaseId)
+        || !['active', 'released', 'expired', 'denied'].includes(String(row.record.state))
+        || !request || !['requestId', 'runId', 'requestedBy', 'consumer', 'purpose', 'host', 'priority', 'expiresAt']
+          .every(key => validGuardianText((request as unknown as Record<string, unknown>)[key])))
+        throw new Error(`resource ledger invalid Guardian host lease at line ${index + 1}`);
+    }
+    if ((value as { event?: unknown }).event === 'guardian-host-lease-conflict') {
+      const row = value as Partial<GuardianHostLeaseConflictEvent>;
+      if (!validGuardianText(row.at) || !validGuardianText(row.requestId) || !validGuardianText(row.existingLeaseId)
+        || !row.attemptedRequest || !validGuardianText(row.attemptedRequest.host))
+        throw new Error(`resource ledger invalid Guardian host lease conflict at line ${index + 1}`);
+    }
+    if ((value as { event?: unknown }).event === 'guardian-host-lease-admitted') {
+      const row = value as Partial<GuardianHostLeaseAdmittedEvent>;
+      if (!validGuardianText(row.at) || !validGuardianText(row.leaseId) || !validGuardianText(row.host)
+        || !validGuardianText(row.runId) || !validGuardianText(row.consumer))
+        throw new Error(`resource ledger invalid Guardian host lease admission at line ${index + 1}`);
+    }
+    if ((value as { event?: unknown }).event === 'guardian-host-lease-admission-denied') {
+      const row = value as Partial<GuardianHostLeaseAdmissionDeniedEvent>;
+      if (!validGuardianText(row.at) || !validGuardianText(row.leaseId) || !validGuardianText(row.host)
+        || !validGuardianText(row.runId) || !validGuardianText(row.consumer) || !validGuardianText(row.reason)
+        || !Array.isArray(row.alternatives) || !row.alternatives.every(validGuardianText))
+        throw new Error(`resource ledger invalid Guardian host lease admission denial at line ${index + 1}`);
     }
     return value as ResourceLedgerEvent;
   });
+}
+
+/** Latest durable Guardian decision per host lease request. */
+export function guardianHostLeaseRecords(events: readonly ResourceLedgerEvent[]): GuardianHostLeaseRecord[] {
+  const records = new Map<string, GuardianHostLeaseRecord>();
+  for (const event of events) if (event.event === 'guardian-host-lease') records.set(event.record.request.requestId, event.record);
+  return [...records.values()];
+}
+
+const validGuardianText = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+/** Atomically persist the host-policy decision in the Nexus resource ledger before dispatch. */
+export function requestGuardianHostLease(request: GuardianHostLeaseRequest, now = new Date(), path?: string): GuardianHostLeaseRecord {
+  const target = path ?? resourceLedgerPath();
+  if (![request.requestId, request.runId, request.requestedBy, request.consumer, request.purpose, request.host, request.priority].every(validGuardianText)
+    || !Number.isFinite(Date.parse(request.expiresAt)) || Date.parse(request.expiresAt) <= now.getTime())
+    throw new Error('invalid Guardian host lease request');
+  let result!: GuardianHostLeaseRecord;
+  withLedgerLock(target, () => {
+    const records = guardianHostLeaseRecords(readResourceLedger(target));
+    const prior = records.find(item => item.request.requestId === request.requestId);
+    if (prior) {
+      result = JSON.stringify(prior.request) === JSON.stringify(request) ? prior : {
+        leaseId: `guardian:${request.requestId}`, request: { ...request }, state: 'denied', at: now.toISOString(),
+        reason: 'request-id-conflict', alternatives: [],
+      };
+      if (result !== prior) appendEvent({ event: 'guardian-host-lease-conflict', at: result.at,
+        requestId: request.requestId, existingLeaseId: prior.leaseId, attemptedRequest: { ...request } }, target);
+      return;
+    }
+    for (const lease of records) if (lease.state === 'active' && Date.parse(lease.request.expiresAt) <= now.getTime()) {
+      const expired = { ...lease, state: 'expired' as const, at: now.toISOString(), reason: 'lease-expired' };
+      appendEvent({ event: 'guardian-host-lease', at: expired.at, record: expired }, target);
+    }
+    const policy = evaluateHostLeasePolicy(request);
+    let reason = policy.reason;
+    if (!reason && policy.exclusive && records.some(lease => lease.state === 'active' && Date.parse(lease.request.expiresAt) > now.getTime() && lease.request.host === request.host
+      && (lease.request.consumer !== request.consumer || lease.request.runId !== request.runId))) reason = 'exclusive-lease-conflict';
+    result = { leaseId: `guardian:${request.requestId}`, request: { ...request }, state: reason ? 'denied' : 'active',
+      at: now.toISOString(), ...(reason ? { reason, alternatives: [...policy.alternatives] } : {}) };
+    appendEvent({ event: 'guardian-host-lease', at: result.at, record: result }, target);
+  });
+  return result;
+}
+
+/** Admission is fail-closed: the durable lease must still be active and match all identity fields. */
+export function admitGuardianHostLease(input: { leaseId: string; host: string; runId: string; consumer: string }, now = new Date(), path?: string): boolean {
+  if (![input.leaseId, input.host, input.runId, input.consumer].every(validGuardianText))
+    throw new Error('invalid Guardian host lease admission identity');
+  const target = path ?? resourceLedgerPath();
+  let admitted = false;
+  withLedgerLock(target, () => {
+    const current = guardianHostLeaseRecords(readResourceLedger(target)).find(record => record.leaseId === input.leaseId);
+    if (current?.state === 'active' && Date.parse(current.request.expiresAt) > now.getTime() && current.request.host === input.host
+      && current.request.runId === input.runId && current.request.consumer === input.consumer) {
+      appendEvent({ event: 'guardian-host-lease-admitted', at: now.toISOString(), leaseId: current.leaseId,
+        host: input.host, runId: input.runId, consumer: input.consumer }, target);
+      admitted = true;
+      return;
+    }
+    const expired = current?.state === 'active' && Date.parse(current.request.expiresAt) <= now.getTime();
+    if (current && expired) {
+      const record: GuardianHostLeaseRecord = { ...current, state: 'expired', at: now.toISOString(), reason: 'lease-expired' };
+      appendEvent({ event: 'guardian-host-lease', at: record.at, record }, target);
+    }
+    const policy = evaluateHostLeasePolicy({ host: input.host, consumer: input.consumer, purpose: current?.request.purpose ?? '' });
+    const reason = !current ? 'lease-not-found' : expired ? 'lease-expired'
+      : current.state !== 'active' ? 'lease-not-active' : 'lease-owner-mismatch';
+    appendEvent({ event: 'guardian-host-lease-admission-denied', at: now.toISOString(), leaseId: input.leaseId,
+      host: input.host, runId: input.runId, consumer: input.consumer, reason,
+      alternatives: policy.alternatives.length ? policy.alternatives : [...HOST_LEASE_ALTERNATIVE_HOSTS] }, target);
+  });
+  return admitted;
+}
+
+export function renewGuardianHostLease(leaseId: string, expiresAt: string, now = new Date(), path?: string): boolean {
+  if (!leaseId.trim() || !Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= now.getTime())
+    throw new Error('Guardian host lease renewal requires a future expiry');
+  const target = path ?? resourceLedgerPath();
+  let renewed = false;
+  withLedgerLock(target, () => {
+    const current = guardianHostLeaseRecords(readResourceLedger(target)).find(record => record.leaseId === leaseId);
+    if (!current || current.state !== 'active' || Date.parse(current.request.expiresAt) <= now.getTime()) return;
+    const next: GuardianHostLeaseRecord = { ...current, request: { ...current.request, expiresAt }, at: now.toISOString() };
+    delete next.reason;
+    delete next.alternatives;
+    appendEvent({ event: 'guardian-host-lease', at: next.at, record: next }, target);
+    renewed = true;
+  });
+  return renewed;
+}
+
+export function endGuardianHostLease(leaseId: string, reason: string, now = new Date(), path?: string): boolean {
+  if (!leaseId.trim() || !reason.trim()) throw new Error('Guardian host lease release requires leaseId and reason');
+  const target = path ?? resourceLedgerPath();
+  let ended = false;
+  withLedgerLock(target, () => {
+    const current = guardianHostLeaseRecords(readResourceLedger(target)).find(record => record.leaseId === leaseId);
+    if (!current || current.state !== 'active') return;
+    const released: GuardianHostLeaseRecord = { ...current, state: 'released', at: now.toISOString(), reason: reason.trim() };
+    appendEvent({ event: 'guardian-host-lease', at: released.at, record: released }, target);
+    ended = true;
+  });
+  return ended;
 }
 
 export function activeResourceLeases(events: readonly ResourceLedgerEvent[]): ResourceLease[] {

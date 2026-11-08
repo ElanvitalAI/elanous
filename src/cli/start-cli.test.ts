@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -318,14 +319,9 @@ describe('start CLI', () => {
   });
 
   test('default health probes the injected daemon and the opened address is its pwa url', async () => {
-    const healthUrls: string[] = [];
     const opened: string[] = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      healthUrls.push(String(input));
-      return new Response('{}', { status: 200 });
-    }) as typeof fetch;
-    try {
+    await withFakeFetchDevice([{ url: 'http://127.0.0.1:45678/v1/health', response: new Response('{}', { status: 200 }) }], async (device) => {
+      const healthUrls: string[] = [];
       const result = await runStart({}, {
         detect: async () => [candidate],
         resolveLlm: () => ({ usable: true, provider: 'openai-codex', via: 'login', why: 'LLM via login (openai-codex)' }),
@@ -336,24 +332,17 @@ describe('start CLI', () => {
         openGui: async (url) => { opened.push(url); return true; },
         output: () => {},
       });
-      expect(healthUrls).toContain('http://127.0.0.1:45678/v1/health');
       expect(healthUrls).toContain('recorded:http://127.0.0.1:45678/v1/health');
       expect(opened[0]).toBe('http://127.0.0.1:45678/app/');
       expect(result.steps.find((step) => step.id === 'open-gui')?.detail.startsWith('Opened http://127.0.0.1:45678/app/')).toBe(true);
       expect(healthUrls.join(' ')).not.toContain('31415');
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+      expect(device.calls().map((call) => call.url)).toEqual(['http://127.0.0.1:45678/v1/health']);
+    });
   });
 
   test('a null endpoint is treated as no daemon and never probes 31415', async () => {
-    const fetched: string[] = [];
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: string | URL | Request) => {
-      fetched.push(String(input));
-      return new Response('{}', { status: 200 });
-    }) as typeof fetch;
-    try {
+    const opened: string[] = [];
+    await withFakeFetchDevice([{ url: '/v1/health', response: new Response('{}', { status: 200 }) }], async (device) => {
       const result = await runStart({ json: true }, {
         detect: async () => [candidate],
         resolveLlm: () => ({ usable: true, provider: 'openai-codex', via: 'login', why: 'LLM via login (openai-codex)' }),
@@ -361,15 +350,14 @@ describe('start CLI', () => {
         resolveEndpoint: () => null,
         launch: async () => ({ exitCode: 0 }),
         sleep: async () => {},
-        openGui: async (url) => { fetched.push(`gui:${url}`); return true; },
+        openGui: async (url) => { opened.push(url); return true; },
         output: () => {},
       });
-      expect(fetched).toEqual([]);
+      expect(device.calls()).toEqual([]);
+      expect(opened).toEqual([]);
       expect(result.daemon).toBe('failed');
       expect(result.surface).toBe('none');
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+    });
   });
 
   test('after launch the address is resolved again, so the opened url is the daemon that just started', async () => {

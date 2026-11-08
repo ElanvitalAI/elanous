@@ -35,7 +35,7 @@ export function planGateBisect(input: {
   if (input.firstParentCommits.length === 0 || input.firstParentCommits.at(-1) !== input.cutCommit ||
       input.firstParentCommits.some((commit) => !SHA.test(commit)) || new Set(input.firstParentCommits).size !== input.firstParentCommits.length ||
       input.firstParentCommits.includes(input.baseCommit)) return { ok: false, reason: 'invalid first-parent commit list' };
-  if (!['mshq', 'node-c', 'aws1', 'gcp1'].includes(input.host))
+  if (!['mshq', 'node-c', 'aws1', 'gcp1', 'gcp2', 'aws3'].includes(input.host))
     return { ok: false, reason: 'bisect requires an eligible non-gate host' };
   let files: string[];
   try { files = [...new Set(input.introducedIds.map(testFileOfId))].sort(); }

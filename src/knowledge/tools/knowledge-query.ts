@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S4.2: KnowledgeQuery LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { discoverObsidianVault, type ObsidianVault } from '../../auto-research/obsidian-bridge.js';
 import { knowledgeQuery, queryInstalledPack } from '../query.js';
 import type { KnowledgeQueryInput, KnowledgeQueryResult } from '../types.js';

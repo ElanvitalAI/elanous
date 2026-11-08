@@ -179,9 +179,17 @@ test('FATAL-REPORT-AUTO: an actual fatal child exit is delivered once on the nex
 test('FATAL-REPORT-AUTO: the production CLI crash then restart uses its config, notifies once, and honors revoked identity consent', () => {
   const runCliRestart = (configDir: string, sentFile: string) => {
     const binUrl = new URL('../../bin/elanous.mjs', import.meta.url).href;
+    const fakeFetchUrl = new URL('../ux-sim/fake-fetch.ts', import.meta.url).href;
     const child = `delete process.env.BUN_TEST; process.env.NODE_ENV='production'; process.env.ELANOUS_FAST_ROUTER='0';
-      globalThis.fetch=async (_url, init)=>{ const fs=await import('node:fs'); fs.writeFileSync(process.env.FATAL_SENT_FILE, String(init.body)); return Response.json({reportId:'er_FAKE'}, {status:202}); };
-      process.argv=[process.execPath, new URL(${JSON.stringify(binUrl)}).pathname, '--config-dir', process.env.FATAL_TEST_CONFIG, '--help']; await import(${JSON.stringify(binUrl)});`;
+      const fs=await import('node:fs');
+      const { createFakeFetchDevice } = await import(${JSON.stringify(fakeFetchUrl)});
+      const device = createFakeFetchDevice([{url:'https://hooks.elanous.ai/v1/reports', method:'POST', response: request => {
+        fs.writeFileSync(process.env.FATAL_SENT_FILE, String(request.body)); return Response.json({reportId:'er_FAKE'}, {status:202});
+      }}]);
+      process.argv=[process.execPath, new URL(${JSON.stringify(binUrl)}).pathname, '--config-dir', process.env.FATAL_TEST_CONFIG, '--help']; await import(${JSON.stringify(binUrl)});
+      // Startup schedules the pending flush; allow slower remote CI a wider window before restoring fetch.
+      for (let i=0; i<500 && !device.calls().some(call => call.status === 202); i++) await new Promise(resolve => setTimeout(resolve, 10));
+      if (!device.calls().some(call => call.status === 202)) throw new Error('fake error-report route was not reached');`;
     return spawnSync(process.execPath, ['-e', child], { encoding: 'utf8', env: { ...process.env, FATAL_TEST_CONFIG: configDir, FATAL_SENT_FILE: sentFile, NODE_ENV: 'production', BUN_TEST: '' } });
   };
 

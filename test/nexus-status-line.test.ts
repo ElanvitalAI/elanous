@@ -1,11 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveAgentTurnToolsKind, resolveToolsKind, runNexus } from '../src/nexus/index.js';
 import { classifyNexusStatus } from '../src/nexus/status-line.js';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
-const originalFetch = globalThis.fetch;
 const originalNexusDir = process.env.ELANOUS_NEXUS_DIR;
 const proxyEnvKeys = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy'] as const;
 const originalProxyEnv = Object.fromEntries(proxyEnvKeys.map((key) => [key, process.env[key]]));
@@ -20,6 +20,7 @@ function setProxyEnv(proxyUrl: string | undefined): void {
 let root = '';
 let output: string[] = [];
 let logSpy: ReturnType<typeof spyOn>;
+let fakeFetch: FakeFetchDevice | undefined;
 
 function writeRuntime(httpHost = '127.0.0.1', httpPort = 31415): void {
   writeFileSync(join(root, 'runtime.json'), JSON.stringify({
@@ -49,7 +50,8 @@ beforeEach(() => {
 
 afterEach(() => {
   logSpy.mockRestore();
-  globalThis.fetch = originalFetch;
+  fakeFetch?.restore();
+  fakeFetch = undefined;
   for (const key of proxyEnvKeys) {
     const value = originalProxyEnv[key];
     if (value === undefined) delete process.env[key];
@@ -192,12 +194,22 @@ describe('runNexus status health wiring', () => {
     setProxyEnv('http://127.0.0.1:9');
     writeLiveLock();
     writeRuntime('192.0.2.1', 31415);
-    const proxiedFetch = mock(() => Promise.resolve(new Response(null, { status: 403 })));
-    globalThis.fetch = proxiedFetch as unknown as typeof fetch;
+    let probeSignal: AbortSignal | null | undefined;
+    fakeFetch = createFakeFetchDevice([{
+      url: 'http://192.0.2.1:31415/v1/health',
+      method: 'GET',
+      response: (request) => {
+        probeSignal = request.signal;
+        return new Response(null, { status: 403 });
+      },
+    }]);
 
     await runNexus({ status: true });
 
-    expect(proxiedFetch).toHaveBeenCalledWith('http://192.0.2.1:31415/v1/health', expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(fakeFetch.calls()).toEqual([expect.objectContaining({
+      url: 'http://192.0.2.1:31415/v1/health', method: 'GET', status: 403, routeId: 'route-1',
+    })]);
+    expect(probeSignal).toBeInstanceOf(AbortSignal);
     expect(process.env.HTTP_PROXY).toBe('http://127.0.0.1:9');
     expect(output).toContain('  status    lock alive, http silent (pid=' + process.pid + ' host=' + hostname() + ' since=2026-08-13T00:00:00.000Z)');
   });
@@ -245,11 +257,15 @@ describe('runNexus status health wiring', () => {
   });
 
   it('preserves not running and completes status output when no lock or runtime address exists', async () => {
-    globalThis.fetch = mock(() => Promise.reject(new Error('must not probe without runtime'))) as unknown as typeof fetch;
+    fakeFetch = createFakeFetchDevice([{
+      url: 'http://unused.invalid/no-probe-expected',
+      method: 'GET',
+      response: new Response(null, { status: 200 }),
+    }]);
 
     await runNexus({ status: true });
 
-    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(fakeFetch.calls()).toEqual([]);
     expect(output).toContain('  status    not running');
     expect(output).toContain('  root      ' + root);
     expect(output).toContain('  lock      ' + join(root, '.lock'));
@@ -264,11 +280,15 @@ describe('runNexus status health wiring', () => {
       nexusVersion: '0.17.0',
       phase: 'test',
     }));
-    globalThis.fetch = mock(() => Promise.reject(new Error('must not probe without address'))) as unknown as typeof fetch;
+    fakeFetch = createFakeFetchDevice([{
+      url: 'http://unused.invalid/no-probe-expected',
+      method: 'GET',
+      response: new Response(null, { status: 200 }),
+    }]);
 
     await runNexus({ status: true });
 
-    expect(globalThis.fetch).not.toHaveBeenCalled();
+    expect(fakeFetch.calls()).toEqual([]);
     expect(output).toContain('  status    lock alive, http silent (pid=' + process.pid + ' host=' + hostname() + ' since=2026-08-13T00:00:00.000Z)');
     expect(output).toContain('  version   0.17.0 (phase: test)');
   });

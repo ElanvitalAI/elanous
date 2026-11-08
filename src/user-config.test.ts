@@ -17,6 +17,7 @@ import {
   parseProjectRubricAxes,
   resolveTuiUnattended,
   resolveRoleModel,
+  resolveNexusRelayConfig,
   saveUserConfig,
 } from './user-config.js';
 import { debug } from './debug/log.js';
@@ -39,6 +40,16 @@ test('intake.briefingTopic is a trimmed config value and survives save', () => {
   expect(config.intake.briefingTopic).toBe('2027 사업계획: 호르무즈·중간선거 이후 원가·환율·물류');
   saveUserConfig(config, configPath);
   expect(buildUserConfig(configPath).intake.briefingTopic).toBe(config.intake.briefingTopic);
+});
+
+test('nexus relay config is opt-in and normalizes its connection fields', () => {
+  writeConfig({ nexus: { relay: { enabled: true, url: '  wss://relay.example.test/host  ', identityFile: ' keys/relay.json ' } } });
+  const config = buildUserConfig(configPath);
+  expect(resolveNexusRelayConfig(config)).toEqual({ enabled: true, url: 'wss://relay.example.test/host', identityFile: 'keys/relay.json' });
+  saveUserConfig(config, configPath);
+  expect(resolveNexusRelayConfig(buildUserConfig(configPath))).toEqual({ enabled: true, url: 'wss://relay.example.test/host', identityFile: 'keys/relay.json' });
+  writeConfig({ nexus: { relay: { enabled: 'yes', url: '  ' } } });
+  expect(resolveNexusRelayConfig(buildUserConfig(configPath))).toEqual({ enabled: false });
 });
 
 test('outbound quietHours accepts off and KST ranges and survives config save', () => {
@@ -372,13 +383,20 @@ describe('pod memory advice opt-in', () => {
 });
 
 describe('pod warm reuse switches', () => {
-  test('every consumer defaults off and only literal true turns a flag on', () => {
+  test('gate warm shard execution defaults live and literal false is the emergency off switch', () => {
     writeConfig({});
-    expect(buildUserConfig(configPath).pod?.warmReuse).toEqual({ gateRecheck: false, land: false, ta: false, minMatchSamples: 3 });
-    writeConfig({ pod: { warmReuse: { gateRecheck: 'true', land: 1, ta: null } } });
-    expect(buildUserConfig(configPath).pod?.warmReuse).toMatchObject({ gateRecheck: false, land: false, ta: false });
-    writeConfig({ pod: { warmReuse: { gateRecheck: true, land: true, ta: true } } });
-    expect(buildUserConfig(configPath).pod?.warmReuse).toMatchObject({ gateRecheck: true, land: true, ta: true });
+    expect(buildUserConfig(configPath).pod?.warmReuse).toEqual({ gateRecheck: false, gateShardExecution: true, land: false, ta: false, minMatchSamples: 3 });
+    writeConfig({ pod: { warmReuse: { gateRecheck: 'true', gateShardExecution: true, land: 1, ta: null } } });
+    expect(buildUserConfig(configPath).pod?.warmReuse).toMatchObject({ gateRecheck: false, gateShardExecution: true, land: false, ta: false });
+    writeConfig({ pod: { warmReuse: { gateRecheck: true, gateShardExecution: true, land: true, ta: true } } });
+    expect(buildUserConfig(configPath).pod?.warmReuse).toMatchObject({ gateRecheck: true, gateShardExecution: true, land: true, ta: true });
+  });
+
+  test('literal false disables gate warm shard execution for emergency use', () => {
+    writeConfig({ pod: { warmReuse: { gateShardExecution: false } } });
+    expect(buildUserConfig(configPath).pod?.warmReuse?.gateShardExecution).toBe(false);
+    writeConfig({ pod: { warmReuse: { gateShardExecution: 'false' } } });
+    expect(buildUserConfig(configPath).pod?.warmReuse?.gateShardExecution).toBe(true);
   });
 
   test('minMatchSamples accepts only positive safe integers', () => {
@@ -398,7 +416,7 @@ describe('pod warm reuse switches', () => {
     const raw = cfg.raw as Record<string, unknown>;
     raw.pod = { ...(raw.pod as Record<string, unknown>), warmReuse: { gateRecheck: true, minMatchSamples: 4 } };
     saveUserConfig(cfg, configPath);
-    expect(buildUserConfig(configPath).pod?.warmReuse).toEqual({ gateRecheck: true, land: false, ta: false, minMatchSamples: 4 });
+    expect(buildUserConfig(configPath).pod?.warmReuse).toEqual({ gateRecheck: true, gateShardExecution: true, land: false, ta: false, minMatchSamples: 4 });
     expect(buildUserConfig(configPath).pod?.lease?.perAccount).toBe(5);
   });
 });

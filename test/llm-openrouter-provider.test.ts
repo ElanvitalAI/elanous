@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createFakeFetchDevice, type FakeFetchDevice, type FakeFetchRouteRequest } from '../src/ux-sim/fake-fetch.js';
 
 // ⛔ 키 캐시는 프로세스당 첫 읽기를 기억한다 — llm 을 import 하기 «전»에 캐시 디렉토리를 고정한다.
 const keyDir = mkdtempSync(join(tmpdir(), 'or-keys-'));
@@ -25,21 +26,28 @@ _resetKeyCacheForTests();
 
 type Capture = { url: string; headers: Record<string, string>; body: any };
 let calls: Capture[];
-let prior: typeof fetch;
+let device: FakeFetchDevice | undefined;
+function installFetch(response: (request: FakeFetchRouteRequest) => Response): void {
+  device?.restore();
+  const route = { method: 'POST', response: (request: FakeFetchRouteRequest) => {
+      calls.push({ url: request.url, headers: { ...request.headers }, body: JSON.parse(request.body ?? 'null') });
+      return response(request);
+  } };
+  device = createFakeFetchDevice([
+    { url: '/api/v1/chat/completions', ...route },
+    { url: '/v1/chat/completions', ...route },
+  ]);
+}
 beforeEach(() => {
   calls = [];
-  prior = globalThis.fetch;
-  globalThis.fetch = (async (url: string, init: any) => {
-    const headers: Record<string, string> = {};
-    for (const [k, v] of Object.entries((init?.headers ?? {}) as Record<string, string>)) headers[k.toLowerCase()] = v;
-    calls.push({ url: String(url), headers, body: JSON.parse(init.body) });
+  installFetch(() => {
     const sse = 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n';
     return new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(sse)); c.close(); } }), {
       status: 200, headers: { 'content-type': 'text/event-stream' },
     });
-  }) as unknown as typeof fetch;
+  });
 });
-afterEach(() => { globalThis.fetch = prior; });
+afterEach(() => { device?.restore(); device = undefined; });
 beforeAll(() => {});
 afterAll(() => {
   _resetKeyCacheForTests();
@@ -90,7 +98,7 @@ describe('OpenRouter provider wire', () => {
   });
 
   test('⛔ OpenRouter 의 `delta.reasoning` 을 추론 이벤트로 낸다 — 안 내면 추론하는 동안 이벤트 0개로 유휴 타임아웃에 죽는다', async () => {
-    globalThis.fetch = (async () => {
+    installFetch(() => {
       const sse = [
         'data: {"choices":[{"delta":{"role":"assistant","content":"","reasoning":"We need","reasoning_details":[{"type":"reasoning.text","text":"We need"}]}}]}',
         'data: {"choices":[{"delta":{"content":"","reasoning":" to count"}}]}',
@@ -98,7 +106,7 @@ describe('OpenRouter provider wire', () => {
         'data: [DONE]', '',
       ].join('\n\n');
       return new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(sse)); c.close(); } }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }) as unknown as typeof fetch;
+    });
     const p = llm.getProviderForConfig(cfg({ provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3', apiKey: 'sk-or-cfg' }));
     const events: any[] = [];
     for await (const e of p.streamChat!([{ role: 'user', content: 'q' }], {})) events.push(e);
@@ -117,8 +125,7 @@ describe('OpenRouter provider wire', () => {
   });
 
   test('⛔ reasoning_details 왕복 — 조각을 이어 첫 도구 호출에 싣고, 다음 요청 어시스턴트 메시지에 되돌린다(Kimi K3 는 필수)', async () => {
-    globalThis.fetch = (async (url: string, init: any) => {
-      calls.push({ url: String(url), headers: {}, body: JSON.parse(init.body) });
+    installFetch(() => {
       const sse = [
         'data: {"choices":[{"delta":{"reasoning":"We ","reasoning_details":[{"type":"reasoning.text","text":"We ","index":0,"format":"unknown"}]}}]}',
         'data: {"choices":[{"delta":{"reasoning":"read","reasoning_details":[{"type":"reasoning.text","text":"read","index":0}]}}]}',
@@ -126,7 +133,7 @@ describe('OpenRouter provider wire', () => {
         'data: [DONE]', '',
       ].join('\n\n');
       return new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(sse)); c.close(); } }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }) as unknown as typeof fetch;
+    });
     const p = llm.getProviderForConfig(cfg({ provider: 'openrouter', model: 'openrouter/moonshotai/kimi-k3', apiKey: 'sk-or-cfg' }));
     const events: any[] = [];
     for await (const e of p.streamChat!([{ role: 'user', content: 'q' }], {})) events.push(e);

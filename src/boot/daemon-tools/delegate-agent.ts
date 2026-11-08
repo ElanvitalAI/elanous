@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // daemon tool · delegate_code_agent (2026-07-08)
 //
 // elanous(elanous-builtin)가 큰 코드 작업을 외부 코딩 에이전트(claude code / codex /
@@ -9,7 +10,7 @@
 import { homedir } from 'node:os';
 import { childLifetimeSignal } from '../../turn-abort-scope.js';
 import { mkdirSync } from 'node:fs';
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { DaemonToolDispatchCtx } from './types.js';
 import { globalDualRoleManager } from '../../acp/dual-role-manager.js';
 import { getUserConfig } from '../../user-config.js';

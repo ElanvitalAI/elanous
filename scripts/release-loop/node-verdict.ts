@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { debug } from '../../src/debug/log.js';
 import { runWithReleasePwaTraffic } from './gate-traffic-mode.js';
 
-export type NodeOutcome = 'ok' | 'fail' | 'error';
+export type NodeOutcome = 'ok' | 'fail' | 'error' | 'partial' | 'unknown' | 'recovery-required';
 export type NodeVerdict = 'pass' | 'flaky' | 'fail';
 export interface GraphContext {
   graphId?: string;
@@ -71,7 +71,7 @@ export function finishNode(node: string, version: string, result: Record<string,
     debug.log('release.node', 'failed', { node, summary, tail });
     emitNodeResult({ ...result, summary, tail });
   } else emitNodeResult(result);
-  return result.outcome === 'ok' ? 0 : result.outcome === 'fail' ? 1 : 2;
+  return result.outcome === 'ok' || result.outcome === 'partial' || result.outcome === 'unknown' ? 0 : result.outcome === 'fail' ? 1 : 2;
 }
 
 export function errorResult(error: unknown): { outcome: 'error'; verdict: 'fail'; summary: string } {

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── 자율tool 조립기 — turn 조립기 통일 Phase 1 (2026-07-22) ──
 //
 // 메신저 서피스(telegram/discord)가 노출하던 무거운 자율툴 5종의 spec 조립 + per-turn
@@ -21,7 +22,7 @@ import { dispatchRunDevHarness, buildRunDevHarnessTool, isDevHarnessModelSurface
 import { dispatchSolveMission, buildSolveMissionTool } from '../skills/tools/solve-mission.js';
 import { nestCapReached } from './nest-depth.js';
 import { wrapAutonomousTool } from './surface-ux/wrap.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ConfirmChannel } from '../hitl/confirm.js';
 import type { QuestionChannel } from '../hitl/question.js';
 import type { FileSink } from '../channel/file-sink.js';

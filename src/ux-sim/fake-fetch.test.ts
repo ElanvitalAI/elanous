@@ -1,25 +1,36 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { createFakeFetchDevice, withFakeFetchDevice } from './fake-fetch.js';
 import { loadMockScenarioCatalog } from './mock-scenario-catalog.js';
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
 
-test('fake-fetch dispatches by exact method and pathname and records request metadata', async () => {
+describe.serial('fake-fetch device fixtures', () => {
+
+test('fake-fetch dispatches by exact method and URL and records request metadata', async () => {
   await withFakeFetchDevice([
-    { url: '/v1/tasks', method: 'POST', response: (request) => Response.json({ body: request.body }, { status: 201 }) },
+    { url: 'http://daemon/v1/tasks', method: 'POST', response: (request) => Response.json({ body: request.body }, { status: 201 }) },
   ], async (device) => {
     const response = await fetch('http://daemon/v1/tasks', {
-      method: 'POST', headers: { authorization: 'Bearer token' }, body: '{"title":"demo"}',
+      method: 'POST', headers: { authorization: 'Bearer token' }, body: '{"title":"demo"}', redirect: 'error',
     });
     expect(response.status).toBe(201);
     expect(await response.json()).toEqual({ body: '{"title":"demo"}' });
     expect(device.calls()).toEqual([{
       url: 'http://daemon/v1/tasks', method: 'POST', headers: { authorization: 'Bearer token' },
-      body: '{"title":"demo"}', routeId: 'route-1', status: 201,
+      body: '{"title":"demo"}', redirect: 'error', routeId: 'route-1', status: 201,
     }]);
   });
   expect(globalThis.fetch).toBe(originalFetch);
+});
+
+test('fake-fetch records Request redirect mode and lets explicit init override it', async () => {
+  await withFakeFetchDevice([{ url: 'http://daemon/redirect', response: Response.json({ ok: true }) }], async (device) => {
+    const request = new Request('http://daemon/redirect', { redirect: 'error' });
+    await fetch(request);
+    await fetch(request, { redirect: 'manual' });
+    expect(device.calls().map((call) => call.redirect)).toEqual(['error', 'manual']);
+  });
 });
 
 test('fake-fetch rejects unmatched requests, records the boundary failure, and restores after throws', async () => {
@@ -45,6 +56,23 @@ test('fake-fetch records and rethrows route response failures', async () => {
   expect(globalThis.fetch).toBe(originalFetch);
 });
 
+test('fake-fetch route handlers receive AbortSignal without persisting it in call receipts', async () => {
+  const controller = new AbortController();
+  await withFakeFetchDevice([{
+    url: '/cancel-aware',
+    response: (request) => {
+      expect(request.signal).toBe(controller.signal);
+      return Response.json({ aborted: request.signal?.aborted ?? false });
+    },
+  }], async (device) => {
+    const response = await fetch('http://daemon/cancel-aware', { signal: controller.signal });
+    expect(await response.json()).toEqual({ aborted: false });
+    expect(device.calls()).toEqual([{
+      url: 'http://daemon/cancel-aware', method: 'GET', headers: {}, body: null, routeId: 'route-1', status: 200,
+    }]);
+  });
+});
+
 test('fake-fetch rejects overlapping devices without changing the active device', async () => {
   const active = createFakeFetchDevice([{ url: '/active', response: Response.json({ ok: true }) }]);
   try {
@@ -58,10 +86,71 @@ test('fake-fetch rejects overlapping devices without changing the active device'
   expect(globalThis.fetch).toBe(originalFetch);
 });
 
+test('fake-fetch queues concurrent leases and releases the queue after callback failures', async () => {
+  let releaseFirst!: () => void;
+  const firstMayFinish = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const order: string[] = [];
+  let firstStarted = false;
+  let secondStarted = false;
+  let thirdStarted = false;
+  const first = withFakeFetchDevice([{ url: '/first', response: Response.json({ ok: true }) }], async (device) => {
+    firstStarted = true;
+    order.push('first');
+    await firstMayFinish;
+    await fetch('http://daemon/first');
+    expect(device.calls()).toMatchObject([{ routeId: 'route-1', status: 200 }]);
+  });
+  await Bun.sleep(0);
+  expect(firstStarted).toBe(true);
+  const second = withFakeFetchDevice([{ url: '/second', response: Response.json({ ok: true }) }], async (device) => {
+    secondStarted = true;
+    order.push('second');
+    await fetch('http://daemon/second');
+    expect(device.calls()).toMatchObject([{ routeId: 'route-1', status: 200 }]);
+  });
+  const third = withFakeFetchDevice([{ url: '/third', response: Response.json({ ok: true }) }], async (device) => {
+    thirdStarted = true;
+    order.push('third');
+    await fetch('http://daemon/third');
+    expect(device.calls()).toMatchObject([{ routeId: 'route-1', status: 200 }]);
+  });
+  await Bun.sleep(0);
+  expect(secondStarted).toBe(false);
+  expect(thirdStarted).toBe(false);
+  releaseFirst();
+  await Promise.all([first, second, third]);
+  expect(secondStarted).toBe(true);
+  expect(thirdStarted).toBe(true);
+  expect(order).toEqual(['first', 'second', 'third']);
+
+  let releaseFailure!: () => void;
+  const failureMayFinish = new Promise<void>((resolve) => { releaseFailure = resolve; });
+  const failure = withFakeFetchDevice([{ url: '/throws', response: Response.json({ ok: true }) }], async () => {
+    await failureMayFinish;
+    throw new Error('scenario failed');
+  });
+  await Bun.sleep(0);
+  let afterFailureStarted = false;
+  const waitingAfterFailure = withFakeFetchDevice([{ url: '/after-failure', response: Response.json({ ok: true }) }], async (device) => {
+    afterFailureStarted = true;
+    await fetch('http://daemon/after-failure');
+    expect(device.calls()).toMatchObject([{ routeId: 'route-1', status: 200 }]);
+  });
+  await Bun.sleep(0);
+  expect(afterFailureStarted).toBe(false);
+  releaseFailure();
+  await expect(failure).rejects.toThrow('scenario failed');
+  await waitingAfterFailure;
+  expect(afterFailureStarted).toBe(true);
+  expect(globalThis.fetch).toBe(originalFetch);
+});
+
 test('fake-fetch honors Request init header replacement and records binary and form bodies', async () => {
   const request = new Request('http://daemon/body', { method: 'POST', headers: { 'x-old': 'old' }, body: 'old body' });
   const form = new FormData();
   form.set('title', 'demo');
+  form.set('multiline', 'first line\r\nsecond line');
+  form.set('file', new File([new Uint8Array([1])], 'fixture.bin', { type: 'application/octet-stream' }));
   const binary = new Uint8Array([1, 2, 3]);
   await withFakeFetchDevice([{ url: '/body', method: 'POST', response: (call) => Response.json(call) }], async (device) => {
     await fetch(request, { headers: { 'x-new': 'new' }, body: form });
@@ -70,6 +159,12 @@ test('fake-fetch honors Request init header replacement and records binary and f
     const calls = device.calls();
     expect(calls[0]?.headers).toEqual({ 'content-type': expect.stringContaining('multipart/form-data; boundary='), 'x-new': 'new' });
     expect(calls[0]?.body).toContain('form-data:');
+    const formBody = JSON.parse(calls[0]!.body!.slice('form-data:'.length)) as unknown[];
+    expect(formBody).toContainEqual(['multiline', 'first line\r\nsecond line']);
+    expect(formBody).toContainEqual(['file', {
+      name: 'fixture.bin', type: 'application/octet-stream', base64: 'AQ==',
+    }]);
+    expect(Buffer.from(calls[0]!.wireBodyBase64!, 'base64').toString('latin1')).toContain('Content-Type: application/octet-stream');
     expect(calls[1]?.body).toBe('base64:AQID');
     expect(calls[2]?.body).toBe('stream:base64:c3RyZWFt');
   });
@@ -180,4 +275,6 @@ test('fake-fetch is registered for the shared core and PWA test adapter', () => 
   expect(device?.implementation).toEqual(['src/ux-sim/fake-fetch.ts', 'apps/pwa/src/test-devices/fake-fetch.ts']);
   expect(device?.tests).toContain('src/ux-sim/fake-fetch.test.ts');
   expect(catalog.sourceModules.find((module) => module.path === 'src/ux-sim/fake-fetch.ts')?.deviceIds).toContain('fake-fetch');
+});
+
 });

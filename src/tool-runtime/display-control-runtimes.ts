@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── F6 LLM control · display-control ToolRuntime wrappers ──
 //
 // ROADMAP-ui-core-separation §4 Phase S1 (post-audit v2).
@@ -21,7 +22,7 @@
 // · GetUIState / DescribeSurface / ObserveSurface). Same shape:
 // build*Tool() + dispatch*() + *Runtime() + register*Runtimes(deps).
 
-import type { LLMToolSpec } from '../llm.js';
+
 import type { DisplayMouseEvent, HitTarget, SurfaceId } from '../display/types.js';
 import type {
   ContextMenuRegistry,

@@ -57,7 +57,7 @@ describe('PWA slash-command boundary', () => {
   });
 
   it('preserves prose and path prompts, including the second-slash invariant', async () => {
-    for (const line of ['/ 안녕', '/Users/user/x', '/Users/a/b', '/tmp/x', '/']) {
+    for (const line of ['/ 안녕', '/Users/TESTONLY/x', '/Users/a/b', '/tmp/x', '/']) {
       expect(isMetaCommand(line)).toBe(false);
       expect(await dispatchMeta(line, ctx)).toBeNull();
     }

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── list_dir tool (structured directory listing) ──
 //
 // Ports claude-code-fork's LS / Codex's list_dir tool. Use when the
@@ -22,7 +23,7 @@
 
 import { readdirSync, statSync, lstatSync, readlinkSync } from 'node:fs';
 import { isAbsolute, resolve, join } from 'node:path';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { getSessionCwd } from '../../session/working-dir.js';
 import { debug } from '../../debug/log.js';
 import { noteBroadSearch } from './search-loop-guard.js';

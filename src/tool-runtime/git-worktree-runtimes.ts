@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── EnterWorktree / ExitWorktree runtimes (GT4) ──
 //
 // Per-feature branch workflow. EnterWorktree creates a new git
@@ -6,7 +7,7 @@
 // so every subsequent tool resolves against it. ExitWorktree reverses
 // the SWD flip (worktree dir stays on disk unless `prune: true`).
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { getSessionCwd, setSessionCwd } from '../session/working-dir.js';
 import {
   createWorktree,

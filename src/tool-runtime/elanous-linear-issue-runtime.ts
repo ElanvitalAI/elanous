@@ -1,7 +1,8 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { debug } from '../debug/log.js';
 import { commentLinearIssue, createLinearTeamIssue, moveLinearIssueToStateType } from '../connectors/linear.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { getUserConfig } from '../user-config.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 

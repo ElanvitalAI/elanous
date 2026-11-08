@@ -18,10 +18,7 @@ import {
 } from '../src/core-turn/run-goal-loop.js';
 import type { GoalLoopResult } from '../src/core-turn/run-goal-loop.js';
 import type { CoreTurnContext, CoreTurnResult } from '../src/core-turn/types.js';
-import {
-  buildToolLoopPhaseRejectionMessage,
-  getToolLoopPhaseRejectedTools,
-} from '../src/llm.js';
+import { buildToolLoopPhaseRejectionMessage, getToolLoopPhaseRejectedTools } from '../src/llm.js';
 import type { LLMMessage } from '../src/llm.js';
 import { debug } from '../src/debug/log.js';
 import { getChannelBus, resetTerminalMatrix } from '../src/terminal-matrix/index.js';

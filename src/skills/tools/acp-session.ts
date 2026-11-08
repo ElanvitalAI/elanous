@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // AXON P1 — ACP Session LLM tools.
 //
 // Three tools that let the LLM drive a client-side ACP session:
@@ -15,7 +16,7 @@
 //
 // The runtime wrapper lives in `src/tool-runtime/acp-session-runtime.ts`.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { listAcpBackends } from '../../acp/backend-registry.js';
 import {
   CLIENT_NAMESPACE,

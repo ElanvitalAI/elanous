@@ -1,14 +1,24 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireL8MergeQueue, enqueueL8ShadowQueue, evaluateL8Integration, runL8MergeQueue, runL8ShadowQueue, statusL8ShadowQueue, type L8MergeQueueDeps, type L8ShadowQueueDeps } from './l8-merge-queue.js';
+import { acquireL8MergeQueue, enqueueL8ShadowQueue, evaluateL8Integration, runL8MergeQueue, runL8ShadowQueue, statusL8ShadowQueue, type L8MergeQueueDeps, type L8ShadowQueueDeps, type L8ShadowVerdict } from './l8-merge-queue.js';
 import type { TrainReachObservation } from './train-reach-grouping.js';
 import { integrateTrain, type TrainCandidate } from './merge-train.js';
+import { createMacrophageRuntime } from '../release-loop/macrophage-heal-node.js';
+import { Command } from 'commander';
+import { registerPrCommands } from '../cli/pr-cli.js';
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const originalCwd = process.cwd();
+const originalStateDir = process.env.ELANOUS_STATE_DIR;
+afterEach(() => {
+  process.chdir(originalCwd);
+  if (originalStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+  else process.env.ELANOUS_STATE_DIR = originalStateDir;
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 function git(cwd: string, ...args: string[]): string {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
   if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
@@ -495,7 +505,15 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
   };
   for (const number of [7, 8, 9, 10]) await enqueueL8ShadowQueue(cwd, number, queueDeps);
   const gateBatches: number[][] = [];
-  const verdict = await runL8ShadowQueue(cwd, {
+  const macroRoot = join(root, 'macro-state');
+  const emittedProgress: string[] = [];
+  queueDeps.emitTrainProgress = (event) => { emittedProgress.push(event.type); };
+  process.env.ELANOUS_STATE_DIR = macroRoot;
+  process.chdir(cwd);
+  const output: string[] = [];
+  const program = new Command();
+  program.exitOverride();
+  registerPrCommands(program, { out: { log: (value) => output.push(value), error: (error) => { throw new Error(error); } } }, {
     ...queueDeps,
     trainGate: (_repo, baseSha) => async (commitSha, prNumbers) => {
       gateBatches.push([...prNumbers]);
@@ -504,7 +522,14 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
       return prNumbers.includes(8) ? 'fail' : 'pass';
     },
   });
+  await program.parseAsync(['node', 'elanous', 'pr', 'queue', 'run', '--shadow']);
+  const verdict = JSON.parse(output.at(-1)!) as L8ShadowVerdict;
+  const contextsDir = join(macroRoot, 'graph-runs', 'release-loop');
+  const contextFiles = readdirSync(contextsDir).filter((name) => name.endsWith('.json.contexts'));
+  expect(contextFiles).toHaveLength(1);
+  const macroRunId = contextFiles[0]!.slice(0, -'.json.contexts'.length);
   expect(verdict).toMatchObject({ number: 7, verdict: 'pass', base: mainBefore, tests: ['test/shared.test.ts'] });
+  expect(emittedProgress).toEqual(['merge-train.batch', 'merge-train.verdict']);
   expect(verdict?.detail).toContain('reach [7,8,9]');
   expect(integratedBatches[0]?.map(({ number, title, body }) => ({ number, title, body }))).toEqual([
     { number: 7, title: 'PR 7 intent', body: 'Body for PR 7' },
@@ -530,4 +555,30 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
   expect(git(remote, 'rev-parse', 'main')).toBe(mainBefore);
   expect(git(cwd, 'rev-parse', 'HEAD')).toBe(checkoutBefore);
   for (const number of Object.keys(files)) expect(git(remote, 'rev-parse', `refs/pull/${number}/head`)).toBe(pullBefore[number]);
+  const macrophage = createMacrophageRuntime({ runId: macroRunId, root: macroRoot, mode: 'simulation' });
+  for (const [index, incident] of [
+    { kind: 'worker-start-failed', workerPid: 4102, stage: 'start', reason: 'run-id prefix collision' },
+    { kind: 'worker-no-progress', workerPid: 4102, stage: 'shard-8', remainingMs: 31_000, elapsedMs: 15 * 60_000 },
+    { kind: 'needs-solo-starvation', readyBundle: [7, 8, 9], blockingPr: 10 },
+    { kind: 'main-check-failed', checks: ['tsc', 'rules-contract'], baseSha: mainBefore },
+  ].entries()) {
+    await macrophage.eventBus.publish({ graphId: 'release-loop', runId: macroRunId,
+      eventId: `${macroRunId}:incident:${index}`, type: 'merge-train.incident',
+      source: { kind: 'runner', nodeId: 'fake-train-manager' }, data: incident });
+  }
+  expect(macrophage.decisions).toHaveLength(4);
+  expect(macrophage.decisions.map((event) => event.data?.sourceEventType)).toEqual([
+    'merge-train.incident', 'merge-train.incident', 'merge-train.incident', 'merge-train.incident',
+  ]);
+  const receiptPath = join(contextsDir, `${macroRunId}.json.contexts`, 'macrophage.jsonl');
+  const receipts = readFileSync(receiptPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  expect(receipts).toHaveLength(6);
+  const incidentEvidence = receipts.slice(2).map((entry) => entry.data.evidence as string);
+  expect(incidentEvidence).toEqual(expect.arrayContaining([
+    expect.stringContaining('"kind":"worker-start-failed"'), expect.stringContaining('"workerPid":4102'),
+    expect.stringContaining('"stage":"start"'), expect.stringContaining('"kind":"worker-no-progress"'),
+    expect.stringContaining('"stage":"shard-8"'), expect.stringContaining('"kind":"needs-solo-starvation"'),
+    expect.stringContaining('"kind":"main-check-failed"'), expect.stringContaining('"checks":["tsc","rules-contract"]'),
+  ]));
+  macrophage.dispose();
 }, 30_000);

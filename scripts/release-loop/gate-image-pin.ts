@@ -1,6 +1,7 @@
 import { constants } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 /** A gate run may execute only against one immutable image identity and its exact source tag. */
@@ -29,6 +30,46 @@ export interface PinnedGateImageSyncResult {
   images: Map<string, { ok: true; action: 'fresh'; detail: string; ms: 0; imageRef: string }>;
   tagDrifts: Array<{ event: 'image-tag-drift'; runId: string; tag: string; pinnedDigest: string;
     observedDigest: string | null; reason: 'digest-changed' | 'tag-unavailable'; context: string }>;
+}
+
+export interface GateImagePrebuildMember { context: string }
+export interface GateImagePrebuildResult { outcome: 'built' | 'reused'; digest: string; eligiblePools: string[] }
+
+/** Build the cut image before the expensive gate starts, then persist the pin the gate will consume. */
+export async function prebuildGateImagePinAtCut(input: {
+  root: string; version: string; runId: string; commit: string; image: string;
+  members: readonly GateImagePrebuildMember[];
+  probe: (member: GateImagePrebuildMember) => string | null;
+  sync: () => Promise<ReadonlyMap<string, { ok: boolean }>>;
+}): Promise<GateImagePrebuildResult> {
+  if (!/^[0-9a-f]{40}$/i.test(input.commit) || !input.members.length) throw new Error('invalid cut image prebuild identity');
+  const pinPath = gateImagePinPath(input.root, input.version, input.runId);
+  const imageTag = input.image;
+  const currentPin = existsSync(pinPath) ? readGateImagePinForRun(pinPath, input.runId, imageTag) : null;
+  const digests = () => new Map(input.members.map((member) => [member.context, normalizeGateImageDigest(input.probe(member))]));
+  let observed = digests();
+  const existing = currentPin?.commit === input.commit.toLowerCase() ? currentPin.digest
+    : [...observed.values()].find((digest): digest is string => Boolean(digest));
+  let outcome: GateImagePrebuildResult['outcome'] = 'reused';
+  let digest = existing;
+  if (!digest) {
+    const synced = await input.sync();
+    const failed = input.members.filter((member) => !synced.get(member.context)?.ok);
+    if (failed.length) throw new Error(`cut gate image prebuild failed: ${failed.map((member) => member.context).join(', ')}`);
+    observed = digests();
+    digest = [...observed.values()].find((value): value is string => Boolean(value));
+    if (!digest) throw new Error('cut gate image prebuild produced no immutable image digest');
+    outcome = 'built';
+  }
+  const eligiblePools = [...observed].filter(([, value]) => value === digest).map(([context]) => context);
+  if (!eligiblePools.length) throw new Error('cut gate image prebuild digest is unavailable in every pool');
+  if (currentPin?.commit === input.commit.toLowerCase()) {
+    if (currentPin.digest !== digest || currentPin.image !== imageTag) throw new Error('cut gate image pin changed during prebuild');
+    return { outcome: 'reused', digest, eligiblePools };
+  }
+  if (currentPin) replaceGateImagePin(pinPath, input.runId, digest, imageTag, input.commit, imageTag, currentPin.commit);
+  else writeGateImagePin(pinPath, input.runId, digest, imageTag, input.commit);
+  return { outcome, digest, eligiblePools };
 }
 
 function imageRepository(image: string): string {
@@ -192,4 +233,71 @@ export function gateImagePinPath(root: string, version: string, runId: string): 
   if (!/^\d+\.\d+\.\d+(?:-rc\.\d+)?$/.test(version) || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(runId))
     throw new Error('invalid gate image pin path identity');
   return `${root.replace(/\/$/, '')}/release/${version}/gate-image-pin-${runId}.json`;
+}
+
+export interface CutGateImagePrebuildInput { root: string; repo: string; runId: string; version: string; commit: string; pool: string }
+export type CutGateImagePrebuildOutcome = GateImagePrebuildResult | { outcome: 'skipped' | 'failed'; reason: string };
+
+/** Sync entry point used immediately after cut-branch; the child performs the asynchronous pool build. */
+export function runCutGateImagePrebuild(input: CutGateImagePrebuildInput): CutGateImagePrebuildOutcome {
+  if (!input.pool || !input.runId || !/^[0-9a-f]{40}$/i.test(input.commit)) return { outcome: 'skipped', reason: 'gate pool, run id, or cut commit absent' };
+  const script = join(import.meta.dir, 'gate-image-pin.ts');
+  const run = spawnSync('bun', [script, '--prebuild', '--root', input.root, '--repo', input.repo, '--run-id', input.runId,
+    '--version', input.version, '--commit', input.commit, '--pool', input.pool], {
+    cwd: input.repo, encoding: 'utf8', timeout: 20 * 60_000, maxBuffer: 4 * 1024 * 1024,
+  });
+  const line = (run.stdout ?? '').trim().split('\n').at(-1);
+  if (!line) return { outcome: 'failed', reason: `${run.stderr || run.error || `prebuild child exited ${run.status}`}`.trim().slice(-1000) };
+  try {
+    const result = JSON.parse(line) as CutGateImagePrebuildOutcome;
+    if (run.status !== 0 || run.error) return result.outcome === 'failed' ? result
+      : { outcome: 'failed', reason: `${run.stderr || run.error || `prebuild child exited ${run.status}`}`.trim().slice(-1000) };
+    return result;
+  } catch { return { outcome: 'failed', reason: `prebuild child returned invalid JSON: ${line.slice(0, 300)}` }; }
+}
+
+async function prebuildFromArgs(args: string[]): Promise<CutGateImagePrebuildOutcome> {
+  const values = new Map<string, string>();
+  for (let i = 0; i < args.length; i++) {
+    const key = args[i]!;
+    if (key === '--prebuild') continue;
+    const value = args[++i];
+    if (!value || !['--root', '--repo', '--run-id', '--version', '--commit', '--pool'].includes(key)) throw new Error(`invalid prebuild argument: ${key}`);
+    values.set(key, value);
+  }
+  const required = (key: string) => { const value = values.get(key); if (!value) throw new Error(`missing ${key}`); return value; };
+  const root = required('--root'), repo = required('--repo'), runId = required('--run-id'), version = required('--version');
+  const commit = required('--commit'), pool = required('--pool');
+  const [podPool, gateRadius, podCommand, fs, path, os] = await Promise.all([
+    import('../../src/task-orchestrator/surfaces/pod-pool.js'), import('./gate-radius-live.js'),
+    import('../../src/task-orchestrator/surfaces/pod-command-job.js'), import('node:fs'), import('node:path'), import('node:os'),
+  ]);
+  const { parsePodPool, syncPoolImages } = podPool;
+  const { preflightGateImageDigest } = gateRadius;
+  const { podCommandImageFor } = podCommand;
+  const { mkdtempSync } = fs;
+  const { join: pathJoin } = path;
+  const { tmpdir } = os;
+  const members = parsePodPool(pool);
+  const rawSpecs = pool.split(',').map((spec) => spec.trim()).filter(Boolean);
+  const specFor = new Map(rawSpecs.map((spec) => [spec.split(/[@:#]/, 1)[0]!, spec]));
+  const baseImage = podCommandImageFor([], true);
+  const image = `${baseImage.split(':')[0]}:${commit.slice(0, 12)}`;
+  const sourceRoot = mkdtempSync(pathJoin(tmpdir(), 'release-gate-image-prebuild-'));
+  const sourceTree = pathJoin(sourceRoot, 'cut');
+  try {
+    const clone = spawnSync('git', ['clone', '--quiet', '--shared', '--no-checkout', repo, sourceTree], { cwd: repo, encoding: 'utf8' });
+    if (clone.status !== 0) throw new Error(`cut image source clone failed: ${clone.stderr || clone.error || clone.status}`);
+    const checkout = spawnSync('git', ['checkout', '--quiet', '--detach', commit], { cwd: sourceTree, encoding: 'utf8' });
+    if (checkout.status !== 0) throw new Error(`cut image source checkout failed: ${checkout.stderr || checkout.error || checkout.status}`);
+    return await prebuildGateImagePinAtCut({ root, version, runId, commit, image, members,
+      probe: (member) => preflightGateImageDigest(specFor.get(member.context) ?? member.context, commit),
+      sync: () => syncPoolImages(members, baseImage, commit, { buildScript: pathJoin(sourceTree, 'docker', 'harness', 'build.sh') }),
+    });
+  } finally { rmSync(sourceRoot, { recursive: true, force: true }); }
+}
+
+if (import.meta.main && process.argv.includes('--prebuild')) {
+  try { console.log(JSON.stringify(await prebuildFromArgs(process.argv.slice(2)))); }
+  catch (error) { console.log(JSON.stringify({ outcome: 'failed', reason: error instanceof Error ? error.message : String(error) })); process.exitCode = 1; }
 }

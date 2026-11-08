@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // MVP M1.5 A.2 — Grep tool (daemon side).
 //
 // LLM-facing primitive that runs a regex search across the daemon's
@@ -14,7 +15,7 @@
 
 import { spawn } from 'node:child_process';
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   createSeqTracker,
   makeEnvelope,

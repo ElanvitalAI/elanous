@@ -1,7 +1,8 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { createRequire } from 'node:module';
 import { isMainThread, parentPort, Worker } from 'node:worker_threads';
 import { debug } from '../debug/log.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRunResult, ToolRuntime, ToolRuntimeContext } from './types.js';
 import { SELF_COGNITION_TOOL_NAMES } from './self-cognition-catalog.js';
 

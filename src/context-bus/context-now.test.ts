@@ -465,7 +465,10 @@ test('release adapter reads the same graph-runs/release-loop ledger as /v1/ops/r
     const facts = contextNow({}, { ...noOperations, releaseRun: undefined, now: () => new Date(at), version: () => '0.2.0',
       checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
       decisions: () => [], seatEntries: () => [], events: () => [] }).facts;
-    expect(facts[0]).toEqual({ kind: 'release', version: '0.2.1', node: '2/3 publish', status: 'running', source: 'elanous://graph-runs/release-loop/latest' });
+    expect(facts.find(fact => fact.kind === 'release' && fact.version === '0.2.1')).toMatchObject({ kind: 'release', version: '0.2.1', node: '2/3 publish', status: 'running',
+      source: 'elanous://graph-runs/release-loop/latest', phase: 'running', currentNode: null,
+      nextAction: '다음 노드 관측 대기', receiptStatus: 'absent', emergencySwitch: { state: 'unknown' },
+      landingFreeze: { state: 'off' }, expectedPublishAt: null });
   } finally {
     resetElanousConfigDir();
     if (previous.config === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previous.config;

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // AXON P5 — AnnounceCompletion LLM tool.
 //
 // The explicit "I'm done" signal. When the LLM calls this, the
@@ -11,7 +12,7 @@
 // expected to check `announcementStore.hasAnnounced()` or route
 // through `evaluateTermination()` and exit on `shouldTerminate`.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   announcementStore,
   type AnnouncementRecord,

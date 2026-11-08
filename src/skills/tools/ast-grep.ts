@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── AstGrep tool ───────────────────────────────────────────
 //
 // Structural code search backed by ast-grep. This complements Grep:
@@ -7,7 +8,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { getSessionCwd } from '../../session/working-dir.js';
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { LLMToolDef } from '../../plugins/core/types.js';
 
 const DEFAULT_MAX_RESULTS = 80;

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Capture arc — LLM tool surface (Screenshot + InspectPane) ──
 //
 // Exposes two native tools backed by the capture engine:
@@ -20,7 +21,7 @@
 //
 // See: 내부 문서 `CAPABILITIES-capture-engine` §9.3
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { captureImage, type CaptureImageResult } from './engine.js';
 import {
   createPaneSource,

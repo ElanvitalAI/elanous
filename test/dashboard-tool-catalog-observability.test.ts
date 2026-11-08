@@ -1,5 +1,6 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 import { describe, expect, test, spyOn } from 'bun:test';
-import type { LLMToolSpec } from '../src/llm.js';
+
 import { debug } from '../src/debug/log.js';
 import { buildDashboardOptionalToolSpecs } from '../src/dashboard/optional-tool-spec-runtime.js';
 import { registerDashboardCoreHostTools } from '../src/dashboard/index.js';

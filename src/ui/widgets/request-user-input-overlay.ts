@@ -13,7 +13,7 @@
 
 import type { KeyEvent } from '../../plugins/core/types.js';
 import type { WidgetChromeSpec } from '../declarative/spec.js';
-import { resolveWidgetChromeBoxViewOptions } from '../declarative/index.js';
+import { resolveWidgetChromeBoxViewOptions } from '../declarative/presentation.js';
 import { resolveModalDialogChromeSpec } from '../chrome/dialog-chrome.js';
 import { BoxView, TextView, Consumed, Ignored, type EventResult, type FocusSource, type Size, type View } from '../view.js';
 import type { Printer } from '../printer.js';

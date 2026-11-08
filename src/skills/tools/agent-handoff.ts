@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // H5 Phase 3 · AgentHandoff LLM tool.
 //
 // Thin wrapper around `src/agent/handoff.ts` that exposes the
@@ -10,7 +11,7 @@
 //   - `src/native-tool-catalog.ts` (surface advertisement)
 //   - dashboard `/handoff` slash (convenience · calls dispatchAgentHandoff)
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { handoff, type HandoffLookup, type HandoffResult } from '../../agent/handoff.js';
 import type { AgentLaunchMode } from '../../agent/embodiment.js';
 

@@ -47,26 +47,37 @@ actions:
   transcribe:
     builtin: stt
     input: { audio: object-ref }
+    output: { text: text }
     uses: [cred:openai.api_key]
   summarize:
     builtin: summarize
     input: { text: text }
+    output: { text: text }
     uses: [cred:openai.api_key]
   readAloud:
     builtin: tts
-    input: { text: text }
+    input: { text: text, voiceId: text }
+    output: { audioBase64: text, mimeType: text }
     uses: [cred:elevenlabs.api_key]
     optional: true
+  makeAd:
+    builtin: generate
+    async: true
+    input: { image: object-ref, text: text }
+    uses: [cred:higgsfield.key_id, cred:higgsfield.secret]
+    spend: owner-confirm
 
 storage:
   prefix: apps/voice-note/
   upload:
     allow: [owner]
-    types: [audio/webm, audio/wav]
+    types: [audio/webm, audio/wav, image/png, image/jpeg, image/webp]
 
 credentials:
   - cred:openai.api_key
   - cred:elevenlabs.api_key
+  - cred:higgsfield.key_id
+  - cred:higgsfield.secret
 
 simulate:
   seed: 7

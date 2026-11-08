@@ -1,7 +1,8 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 /**
  * TaskList runtime — filtered graph enumeration.
  */
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 import type { Task, TaskStatus, TaskSurfaceKind } from '../types.js';
 import { isTaskStatus, isTaskSurfaceKind } from '../types.js';

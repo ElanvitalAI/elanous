@@ -1,7 +1,7 @@
 import { basename } from 'node:path';
 import { C } from '../tui.js';
 import type { ActiveProviderInfo } from '../provider-summary.js';
-import type { ChatRenderingHudConfig, ChatSystemPromptConfig } from '../user-config.js';
+import type { ChatRenderingHudConfig, ChatSystemPromptConfig } from '../user-config/chat.js';
 import { resolveChatSystemPrompt } from '../prompt-library/registry.js';
 
 const GAUGE_GLYPHS = ['▁', '▂', '▃', '▅', '▇', '█'] as const;

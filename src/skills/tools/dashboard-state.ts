@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── GetDashboardState LLM tool ──
 //
 // On-demand structured pull of the full dashboard state snapshot.
@@ -10,7 +11,7 @@
 // only glances at the tool_result preview it still sees the key
 // facts; full structured state follows in the other fields.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   captureDashboardState,
   renderDashboardStateForSystemPrompt,

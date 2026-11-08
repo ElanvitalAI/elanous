@@ -8,32 +8,31 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { DaemonClient } from './daemon-client';
 import { SessionsStoreApi, resolveSessionPrefix } from './sessions-store-api';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../test-devices/fake-fetch';
 
 interface FetchCall { url: string; method?: string; body?: string; contentType?: string }
 
-const realFetch = globalThis.fetch;
 let calls: FetchCall[] = [];
+let fakeFetch: FakeFetchDevice | undefined;
 
 beforeEach(() => {
   calls = [];
-  globalThis.fetch = ((async (input: RequestInfo | URL, init?: RequestInit) => {
-    const headers = new Headers(init?.headers);
+  fakeFetch = createFakeFetchDevice([{
+    url: '/v1/sessions/store/abc/fork',
+    method: 'POST',
+    response: (request) => {
+      const headers = new Headers(request.headers);
     calls.push({
-      url: String(input),
-      method: init?.method,
-      body: typeof init?.body === 'string' ? init.body : undefined,
+      url: request.url,
+      method: request.method,
+      body: request.body ?? undefined,
       contentType: headers.get('content-type') ?? undefined,
     });
-    return {
-      ok: true,
-      status: 200,
-      headers: new Headers({ 'content-type': 'application/json' }),
-      json: async () => ({ ok: true, id: 'forked-id' }),
-      text: async () => JSON.stringify({ ok: true, id: 'forked-id' }),
-    } as unknown as Response;
-  }) as unknown) as typeof fetch;
+      return Response.json({ ok: true, id: 'forked-id' });
+    },
+  }]);
 });
-afterEach(() => { globalThis.fetch = realFetch; });
+afterEach(() => { fakeFetch?.restore(); fakeFetch = undefined; });
 
 function makeApi(): SessionsStoreApi {
   return new SessionsStoreApi(new DaemonClient({

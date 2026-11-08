@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tool: kr_flow_snapshot
 //
 // Skill-essence extraction of ~/.claude/skills/kr-flow/. The kr-flow
@@ -21,7 +22,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join as joinPath } from 'node:path';
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 /** Per-stock commands — require a 6-digit KRX symbol. */
 export type KrFlowSymbolCommand = 'foreign-net' | 'investor' | 'price' | 'ohlcv' | 'short-sale' | 'member' | 'estimate';

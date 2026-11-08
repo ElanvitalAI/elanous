@@ -1,13 +1,14 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { hasCliStderrSink, writeCliStderr } from './cli-stderr.js';
 import { runGitWithRetry, type GitRunner } from './retry.js';
 
 const LF = 0x0a;
 const HELP_ARGUMENTS = new Set(['--help', '-h']);
-const HELP_GUIDANCE = "[elanous git] Wraps git and automatically retries transient lock failures. A final result line such as '[git] status ok rc=0' is written to stderr. Git's own help follows.\n";
+const HELP_GUIDANCE = "[elanous git] Wraps git and automatically retries transient lock failures. Bare/default-remote pushes to an open PR owned by another seat are refused; other push forms pass through with an observation. --force-owner overrides a covered push only after a successful audit row. A final result line such as '[git] status ok rc=0' is written to stderr. Git's own help follows.\n";
 
 const GLOBAL_OPTIONS_WITH_OPERANDS = new Set([
   '-C',
@@ -117,10 +118,397 @@ function gitSubcommand(args: string[]): string {
   return '(none)';
 }
 
+type PushVerification = {
+  readonly primaryOutcome: 'CONFIRMED_APPLIED' | 'UNCONFIRMED';
+  readonly verification: 'ls-remote' | 'not-attempted';
+  readonly reason?: 'unsupported-push-shape' | 'source-ref-unreadable' | 'source-ref-changed' | 'remote-query-failed' | 'ref-mismatch';
+  readonly ref?: string;
+  readonly expectedSha?: string;
+  readonly observedSha?: string;
+};
+
+type PushTarget = { remote: string; sourceRef: string; targetRef: string; pushUrl: string; expectedSha: string; sourceReflog: string; sourceRefFile: string };
+
+/** Accept only a single explicit full branch refspec without command-side effects. */
+function explicitBranchPush(args: string[]): { remote: string; sourceRef: string; targetRef: string } | undefined {
+  let commandIndex = -1;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (GLOBAL_OPTIONS_WITH_OPERANDS.has(arg)) { index++; continue; }
+    if (arg.startsWith('-')) continue;
+    commandIndex = index;
+    break;
+  }
+  if (commandIndex < 0 || args[commandIndex] !== 'push') return undefined;
+  const operands: string[] = [];
+  const flagsWithValue = new Set(['-o', '--push-option', '--receive-pack', '--exec']);
+  const noValueFlags = new Set(['--force', '-f', '--porcelain', '--verbose', '-v', '--quiet', '-q', '--progress', '--atomic', '--signed']);
+  for (let index = commandIndex + 1; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === '--force-with-lease' || arg.startsWith('--force-with-lease=')) continue;
+    if (flagsWithValue.has(arg)) { index++; if (index >= args.length) return undefined; continue; }
+    if ([...flagsWithValue].some((flag) => arg.startsWith(`${flag}=`))) continue;
+    if (noValueFlags.has(arg)) continue;
+    if (arg.startsWith('-')) return undefined;
+    operands.push(arg);
+  }
+  if (operands.length !== 2 || operands.some((operand) => !operand || operand.startsWith('-'))) return undefined;
+  const [remote, rawRefspec] = operands as [string, string];
+  const refspec = rawRefspec.startsWith('+') ? rawRefspec.slice(1) : rawRefspec;
+  const separator = refspec.indexOf(':');
+  if (separator === 0 || separator !== refspec.lastIndexOf(':')) return undefined;
+  const sourceRef = separator < 0 ? refspec : refspec.slice(0, separator);
+  const rawTargetRef = separator < 0 ? refspec : refspec.slice(separator + 1);
+  const targetRef = rawTargetRef;
+  if (!sourceRef.startsWith('refs/heads/') || !targetRef.startsWith('refs/heads/') || targetRef === 'refs/heads/' || !sourceRef || !targetRef
+    || /[*?\[\]]/.test(sourceRef + targetRef) || sourceRef.startsWith('-')) return undefined;
+  return { remote, sourceRef, targetRef };
+}
+
+/** A direct URL query is only equivalent when no second insteadOf rewrite would change it. */
+function pushUrlIsStable(url: string, prefix: string[]): boolean {
+  const configured = spawnSync('git', [...prefix, 'config', '--null', '--get-regexp', '^url\\..*\\.insteadof$'], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  if (configured.status !== 0 && configured.status !== 1) return false;
+  let longest = '';
+  let replacement = '';
+  let conflictingRewrite = false;
+  for (const line of configured.stdout.split('\0').filter(Boolean)) {
+    const separator = line.indexOf('\n');
+    if (separator < 0) return false;
+    const key = line.slice(0, separator);
+    const value = line.slice(separator + 1);
+    const match = /^url\.(.*)\.insteadof$/i.exec(key);
+    if (match && url.startsWith(value)) {
+      const candidate = `${match[1]}${url.slice(value.length)}`;
+      if (value.length > longest.length) {
+        longest = value;
+        replacement = candidate;
+        conflictingRewrite = false;
+      } else if (value.length === longest.length && candidate !== replacement) {
+        conflictingRewrite = true;
+      }
+    }
+  }
+  return !conflictingRewrite && (!longest || replacement === url);
+}
+
+function readSourceReflog(sourceRef: string, prefix: string[]): string | undefined {
+  const reflog = spawnSync('git', [...prefix, 'reflog', 'show', '--format=%H%x09%gs', sourceRef], {
+    encoding: 'utf8', env: process.env, timeout: 10_000, maxBuffer: Infinity,
+  });
+  return reflog.status === 0 && reflog.stdout.length > 0 ? reflog.stdout : undefined;
+}
+
+/** Only confirm a loose, ordinary branch ref whose file identity and contents remain unchanged. */
+function readSourceRefFile(sourceRef: string, expectedSha: string, prefix: string[]): string | undefined {
+  const pathResult = spawnSync('git', [...prefix, 'rev-parse', '--git-path', sourceRef], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  if (pathResult.status !== 0 || !pathResult.stdout.trim()) return undefined;
+  const refPath = resolve(process.cwd(), pathResult.stdout.trim());
+  try {
+    const stat = lstatSync(refPath, { bigint: true });
+    if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
+    const contents = readFileSync(refPath);
+    if (contents.toString('utf8').trim() !== expectedSha) return undefined;
+    return [stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs, contents.toString('hex')].join(':');
+  } catch {
+    return undefined;
+  }
+}
+
+/** Capture the requested branch commit and the single effective push URL before running the push. */
+function preparePushVerification(args: string[]): PushTarget | undefined {
+  const push = explicitBranchPush(args);
+  if (!push) return undefined;
+  const prefix = globalOptionPrefix(args);
+  const source = spawnSync('git', [...prefix, 'rev-parse', '--verify', `${push.sourceRef}^{commit}`], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  const expectedSha = source.status === 0 ? source.stdout.trim() : '';
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(expectedSha)) return undefined;
+  const symbolic = spawnSync('git', [...prefix, 'symbolic-ref', '--quiet', push.sourceRef], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  if (symbolic.status !== 1) return undefined;
+  const sourceReflog = readSourceReflog(push.sourceRef, prefix);
+  if (!sourceReflog) return undefined;
+  const sourceRefFile = readSourceRefFile(push.sourceRef, expectedSha, prefix);
+  if (!sourceRefFile) return undefined;
+  const urls = spawnSync('git', [...prefix, 'remote', 'get-url', '--push', '--all', push.remote], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  const pushUrls = urls.status === 0 ? urls.stdout.trim().split(/\r?\n/).filter(Boolean) : [];
+  if (pushUrls.length !== 1) return undefined;
+  if (!pushUrlIsStable(pushUrls[0]!, prefix)) return undefined;
+  return { ...push, pushUrl: pushUrls[0]!, expectedSha, sourceReflog, sourceRefFile };
+}
+
+function sourceRefUnchanged(push: PushTarget, prefix: string[]): boolean {
+  const symbolic = spawnSync('git', [...prefix, 'symbolic-ref', '--quiet', push.sourceRef], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  if (symbolic.status !== 1) return false;
+  const source = spawnSync('git', [...prefix, 'rev-parse', '--verify', `${push.sourceRef}^{commit}`], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  return source.status === 0 && source.stdout.trim() === push.expectedSha
+    && readSourceReflog(push.sourceRef, prefix) === push.sourceReflog
+    && readSourceRefFile(push.sourceRef, push.expectedSha, prefix) === push.sourceRefFile;
+}
+
+/** Compare the unchanged source ref and exact push URL after a failed push. */
+function verifyPushAfterFailure(push: PushTarget | undefined, args: string[]): PushVerification {
+  if (!push) return { primaryOutcome: 'UNCONFIRMED', verification: 'not-attempted', reason: 'unsupported-push-shape' };
+  const prefix = globalOptionPrefix(args);
+  if (!sourceRefUnchanged(push, prefix)) {
+    return { primaryOutcome: 'UNCONFIRMED', verification: 'not-attempted', reason: 'source-ref-changed', ref: push.targetRef, expectedSha: push.expectedSha };
+  }
+  const remote = spawnSync('git', [...prefix, 'ls-remote', '--quiet', push.pushUrl, push.targetRef], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  if (remote.status !== 0) return { primaryOutcome: 'UNCONFIRMED', verification: 'ls-remote', reason: 'remote-query-failed', ref: push.targetRef, expectedSha: push.expectedSha };
+  const lines = remote.stdout.trim().split(/\r?\n/).filter(Boolean);
+  const rows = lines.map((line) => {
+    const match = /^([0-9a-f]{40}|[0-9a-f]{64})\t(\S+)$/.exec(line);
+    return match ? { sha: match[1]!, ref: match[2]! } : undefined;
+  });
+  if (rows.some((row) => row === undefined)) {
+    return { primaryOutcome: 'UNCONFIRMED', verification: 'ls-remote', reason: 'ref-mismatch', ref: push.targetRef, expectedSha: push.expectedSha };
+  }
+  const targetRows = rows.filter((row): row is { sha: string; ref: string } => row !== undefined && row.ref === push.targetRef);
+  const observedSha = targetRows.length === 1 ? targetRows[0]!.sha : undefined;
+  if (!sourceRefUnchanged(push, prefix)) {
+    return { primaryOutcome: 'UNCONFIRMED', verification: 'ls-remote', reason: 'source-ref-changed', ref: push.targetRef, expectedSha: push.expectedSha, ...(observedSha ? { observedSha } : {}) };
+  }
+  return observedSha === push.expectedSha
+    ? { primaryOutcome: 'CONFIRMED_APPLIED', verification: 'ls-remote', ref: push.targetRef, expectedSha: push.expectedSha, observedSha }
+    : { primaryOutcome: 'UNCONFIRMED', verification: 'ls-remote', reason: 'ref-mismatch', ref: push.targetRef, expectedSha: push.expectedSha, ...(observedSha ? { observedSha } : {}) };
+}
+
+function pushPartialOutcomeLine(result: PushVerification, exitCode: number): string {
+  if (result.primaryOutcome === 'CONFIRMED_APPLIED') {
+    return `[git] push PARTIAL_OUTCOME primary-outcome=CONFIRMED_APPLIED verification=ls-remote ref=${result.ref} sha=${result.expectedSha} rc=${exitCode}`;
+  }
+  return `[git] push PARTIAL_OUTCOME primary-outcome=UNCONFIRMED verification=${result.verification}${result.reason ? ` reason=${result.reason}` : ''}${result.ref ? ` ref=${result.ref}` : ''} rc=${exitCode}`;
+}
+
 function asBuffer(chunk: Buffer | string | null | undefined): Buffer {
   if (Buffer.isBuffer(chunk)) return chunk;
   if (typeof chunk === 'string') return Buffer.from(chunk);
   return Buffer.alloc(0);
+}
+
+type PushOwnershipPr = { number: number; headRefName?: string; body?: string; labels?: { name?: string }[]; headRepositoryOwner?: { login?: string }; headRepositoryFullName?: string };
+type PushOwnershipDecision = { args: string[]; notice?: string; blocked?: boolean };
+
+function gitCommandCwd(args: string[]): string {
+  let cwd = process.cwd();
+  const prefix = globalOptionPrefix(args);
+  for (let index = 0; index < prefix.length; index++) {
+    if (prefix[index] === '-C') {
+      const value = prefix[++index];
+      if (value) cwd = resolve(cwd, value);
+    }
+  }
+  return cwd;
+}
+
+function callerSeat(cwd = process.cwd()): string | undefined {
+  const fromEnv = [process.env.ELANOUS_TRACK, process.env.ELANOUS_HARNESS_SEAT]
+    .map((value) => value?.trim())
+    .find((value): value is string => Boolean(value && /^[A-Z][A-Z0-9-]{1,11}$/.test(value)));
+  if (fromEnv) return fromEnv;
+  const parts = cwd.split(/[\\/]+/);
+  const seatIndex = parts.lastIndexOf('seats');
+  const fromPath = seatIndex >= 0 ? parts[seatIndex + 1] : undefined;
+  return fromPath && /^[A-Z][A-Z0-9-]{1,11}$/.test(fromPath) ? fromPath : undefined;
+}
+
+const PUSH_OPTIONS_WITH_OPERANDS = new Set(['-o', '--push-option', '--receive-pack', '--repo', '--exec']);
+const PUSH_OPTIONS_WITH_INLINE_OPERANDS = ['--push-option=', '--receive-pack=', '--repo=', '--exec='];
+
+type ParsedPushArgs = { args: string[]; forceOwner: boolean; unsupportedOption?: string };
+
+/** Remove our override flag only when it is unambiguously an option, never when Git consumes it as a value. */
+function parsePushArgs(args: string[]): ParsedPushArgs {
+  const pushIndex = globalOptionPrefix(args).length;
+  if (args[pushIndex] !== 'push') return { args, forceOwner: false, unsupportedOption: 'push command not found' };
+  const removed = new Set<number>();
+  let forceOwner = false;
+  for (let index = pushIndex + 1; index < args.length; index++) {
+    const arg = args[index]!;
+    if (arg === '--') break;
+    if (PUSH_OPTIONS_WITH_OPERANDS.has(arg) || /^-[qv]*o$/.test(arg)) {
+      if (index + 1 >= args.length) return { args, forceOwner: false, unsupportedOption: `${arg} requires an operand` };
+      index++;
+      continue;
+    }
+    if (PUSH_OPTIONS_WITH_INLINE_OPERANDS.some((option) => arg.startsWith(option))) continue;
+    if (arg === '--force-owner') {
+      removed.add(index);
+      forceOwner = true;
+      continue;
+    }
+    if (arg.startsWith('-')) return { args, forceOwner: false, unsupportedOption: arg };
+  }
+  return { args: args.filter((_, index) => !removed.has(index)), forceOwner };
+}
+
+function pushArgs(args: string[]): string[] {
+  return args.slice(globalOptionPrefix(args).length + 1);
+}
+
+type ResolvedPushTarget = { remoteUrl: string; source: string; branch: string };
+type ResolvedPush = { targets: ResolvedPushTarget[] };
+
+function resolvePushTargets(args: string[], remote: string): ResolvedPush | undefined {
+  const prefix = globalOptionPrefix(args);
+  const dryRun = spawnSync('git', [...prefix, 'push', '--dry-run', '--porcelain', '--no-verify', remote], {
+    // Keep cwd at the caller's original directory so every relative -C is applied exactly once by Git.
+    cwd: process.cwd(), encoding: 'utf8', timeout: 15_000, maxBuffer: 8 * 1024 * 1024,
+  });
+  if (dryRun.error) return undefined;
+
+  const targets: ResolvedPushTarget[] = [];
+  const lines = [...dryRun.stdout.split(/\r?\n/), ...dryRun.stderr.split(/\r?\n/)];
+  const reportedUrls = [...new Set(lines.flatMap((line) => {
+    const header = /^To\s+(.+)$/.exec(line);
+    return header ? [header[1]!.trim()] : [];
+  }))];
+  if (reportedUrls.length !== 1) return undefined;
+  const remoteUrl = reportedUrls[0]!;
+  for (const line of lines) {
+    const match = /^[ *+=!\-]\s+(\S+):(\S+)(?:\s|$)/.exec(line);
+    const source = match?.[1];
+    const destination = match?.[2];
+    if (remoteUrl && source && destination?.startsWith('refs/heads/')) targets.push({ remoteUrl, source, branch: destination.slice('refs/heads/'.length) });
+  }
+  const unique = [...new Map(targets.map((target) => [`${target.remoteUrl}\0${target.source}\0${target.branch}`, target])).values()];
+  return unique.length > 0 ? { targets: unique } : undefined;
+}
+
+function githubRepository(remoteUrl: string): string | undefined {
+  const match = /(?:github\.com[:/])([^/]+\/[^/]+?)(?:\.git)?$/.exec(remoteUrl.replace(/[?#].*$/, ''));
+  return match?.[1];
+}
+
+function prSeat(pr: PushOwnershipPr): string | undefined {
+  const label = pr.labels?.map((item) => item.name ?? '').find((name) => /^seat:[A-Z][A-Z0-9-]{1,11}$/.test(name));
+  return label?.slice('seat:'.length);
+}
+
+type OwnedPushPr = { repository: string; pr: PushOwnershipPr };
+
+function appendPushOwnerLedger(row: Record<string, unknown>): string | undefined {
+  const path = join(elanousStateRoot(), 'git', 'push-owner-guard.jsonl');
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${JSON.stringify({ ts: new Date().toISOString(), ...row })}\n`, { encoding: 'utf8', mode: 0o600 });
+    return undefined;
+  } catch (error) {
+    return `push owner guard audit failed (${error instanceof Error ? error.message : String(error)})`;
+  }
+}
+
+function guardPushOwnership(args: string[]): PushOwnershipDecision {
+  const parsedArgs = parsePushArgs(args);
+  const forceOwner = parsedArgs.forceOwner;
+  const gitArgs = parsedArgs.args;
+  const cwd = gitCommandCwd(args);
+  const seat = callerSeat(cwd);
+  const passUncertain = (reason: string): PushOwnershipDecision => {
+    const auditFailure = appendPushOwnerLedger({ seat: seat ?? null, verdict: 'pass-uncertain', reason,
+      ...(forceOwner ? { forceOwnerRequested: true } : {}) });
+    if (forceOwner && auditFailure) return { args: gitArgs, blocked: true, notice: auditFailure };
+    return { args: gitArgs, notice: `push owner guard: ${reason}; proceeding without an ownership verdict${auditFailure ? ` · ${auditFailure}` : ''}` };
+  };
+  const supplied = pushArgs(gitArgs);
+  if (parsedArgs.unsupportedOption) return passUncertain(`unsupported push option ${parsedArgs.unsupportedOption}; arguments are passed through unchanged`);
+  const explicitRemote = supplied.length === 1 && !supplied[0]!.startsWith('-') ? supplied[0] : undefined;
+  if (!(supplied.length === 0 || explicitRemote !== undefined)) {
+    return passUncertain('only a bare push or one default-remote push is covered; explicit options and refspecs are passed through');
+  }
+
+  const prefix = globalOptionPrefix(args);
+  const branchResult = spawnSync('git', [...prefix, 'symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000 });
+  if (branchResult.status !== 0 || branchResult.error) return passUncertain('current branch is not available');
+  const currentBranch = branchResult.stdout.trim();
+  const config = (key: string) => spawnSync('git', [...prefix, 'config', '--get', key], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000 });
+  const defaultRemote = [
+    `branch.${currentBranch}.pushRemote`, 'remote.pushDefault', `branch.${currentBranch}.remote`,
+  ].map(config).find((result) => result.status === 0 && result.stdout.trim())?.stdout.trim() ?? 'origin';
+  if (explicitRemote && explicitRemote !== defaultRemote) return passUncertain(`remote ${explicitRemote} is not the configured default remote ${defaultRemote}`);
+  const urls = spawnSync('git', [...prefix, 'remote', 'get-url', '--push', '--all', defaultRemote], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000 });
+  if (urls.status !== 0 || urls.error) return passUncertain(`default remote ${defaultRemote} could not be resolved`);
+  const pushUrls = urls.stdout.split(/\r?\n/).map((url) => url.trim()).filter(Boolean);
+  if (pushUrls.length !== 1) return passUncertain(`default remote ${defaultRemote} has ${pushUrls.length} push destinations`);
+  const resolved = resolvePushTargets(args, defaultRemote);
+  if (!resolved || resolved.targets.length !== 1) return passUncertain('Git did not report exactly one push destination');
+  const target = resolved.targets[0]!;
+  if (target.branch !== currentBranch) return passUncertain(`push destination branch ${target.branch} differs from current branch ${currentBranch}`);
+  const sourceBranch = target.source === 'HEAD' ? currentBranch
+    : target.source.startsWith('refs/heads/') ? target.source.slice('refs/heads/'.length) : undefined;
+  if (sourceBranch !== currentBranch) return passUncertain(`push source ${target.source} is not the current branch ${currentBranch}`);
+  const repository = githubRepository(target.remoteUrl);
+  if (!repository || githubRepository(pushUrls[0]!)?.toLowerCase() !== repository.toLowerCase()) {
+    return passUncertain('the single push destination is not a matching GitHub remote');
+  }
+
+  const found: OwnedPushPr[] = [];
+  const repositoryResult = spawnSync('gh', ['api', `repos/${repository}`], { cwd, encoding: 'utf8', timeout: 10_000, maxBuffer: 8 * 1024 * 1024 });
+  if (repositoryResult.status !== 0 || repositoryResult.error) return passUncertain(`GitHub repository metadata unavailable for ${repository}`);
+  let parentRepository: string | undefined;
+  try {
+    const metadata = JSON.parse(repositoryResult.stdout) as { parent?: { full_name?: unknown } };
+    const parent = metadata.parent?.full_name;
+    if (typeof parent === 'string' && parent && parent !== repository) parentRepository = parent;
+  } catch { return passUncertain(`GitHub repository metadata unreadable for ${repository}`); }
+  const headOwner = repository.split('/')[0]!;
+  for (const baseRepository of [...new Set([...(parentRepository ? [parentRepository] : []), repository])]) {
+    const response = spawnSync('gh', ['api', '--method', 'GET', `repos/${baseRepository}/pulls`, '-f', 'state=open', '-f', `head=${headOwner}:${target.branch}`, '-f', 'per_page=100'], {
+      cwd, encoding: 'utf8', timeout: 10_000, maxBuffer: 8 * 1024 * 1024,
+    });
+    if (response.status !== 0 || response.error) return passUncertain(`open PR lookup failed for ${baseRepository} ${target.branch}`);
+    try {
+      const parsed: unknown = JSON.parse(response.stdout);
+      if (!Array.isArray(parsed)) throw new Error('expected PR list');
+      for (const item of parsed) {
+        if (item === null || typeof item !== 'object') continue;
+        const row = item as Record<string, unknown>;
+        const head = row.head && typeof row.head === 'object' ? row.head as Record<string, unknown> : undefined;
+        const headRepo = head?.repo && typeof head.repo === 'object' ? head.repo as Record<string, unknown> : undefined;
+        const owner = headRepo?.owner && typeof headRepo.owner === 'object' ? headRepo.owner as Record<string, unknown> : undefined;
+        const labels = Array.isArray(row.labels) ? row.labels.filter((label): label is { name?: string } => label !== null && typeof label === 'object') : [];
+        if (typeof row.number !== 'number' || head?.ref !== target.branch
+          || typeof owner?.login !== 'string' || owner.login.toLowerCase() !== headOwner.toLowerCase()) continue;
+        if (typeof headRepo?.full_name !== 'string' || !headRepo.full_name) return passUncertain(`open PR head repository unavailable for ${baseRepository} ${target.branch}`);
+        if (headRepo.full_name.toLowerCase() !== repository.toLowerCase()) continue;
+        found.push({ repository: baseRepository, pr: {
+          number: row.number, headRefName: target.branch, headRepositoryOwner: { login: headOwner },
+          headRepositoryFullName: headRepo.full_name,
+          body: typeof row.body === 'string' ? row.body : '', labels,
+        } });
+      }
+    } catch { return passUncertain(`open PR lookup unreadable for ${baseRepository} ${target.branch}`); }
+  }
+  const uniquePrs = [...new Map(found.map((row) => [`${row.repository}#${row.pr.number}`, row])).values()];
+  if (forceOwner) {
+    const auditFailure = appendPushOwnerLedger({
+      seat: seat ?? null, verdict: 'force-owner', PR: uniquePrs.map(({ repository: prRepository, pr }) => ({ repository: prRepository, number: pr.number })),
+      target: { repository, branch: target.branch }, reason: '--force-owner',
+    });
+    return auditFailure ? { args: gitArgs, blocked: true, notice: auditFailure } : { args: gitArgs };
+  }
+  const foreign = uniquePrs.find(({ pr }) => {
+    const ownerSeat = prSeat(pr);
+    return seat !== undefined && ownerSeat !== undefined && ownerSeat !== seat;
+  });
+  if (foreign) return { args: gitArgs, blocked: true, notice: `push refused: branch ${foreign.pr.headRefName ?? '(unknown)'} belongs to PR #${foreign.pr.number} in ${foreign.repository} seat:${prSeat(foreign.pr)} (current seat:${seat}); use --force-owner to override` };
+  if (uniquePrs.some(({ pr }) => !seat || !prSeat(pr))) return passUncertain('open PR or caller seat ownership is unknown');
+  return { args: gitArgs };
 }
 
 /** Execute git through the git-fs retry gateway and append a pipe-visible outcome.
@@ -135,6 +523,7 @@ export function runGitCli(args: string[]): void {
   // ⛔ 실행 «전» 스냅샷 — 이 명령이 마커를 남길 수 있는 종류일 때만 잰다(무관한 명령엔 비용 0).
   const probesForRun = SUBCOMMAND_PROBES[subcommand];
   const probesBefore = probesForRun ? probeSnapshot(args, probesForRun, process.env) : undefined;
+  const pushTarget = subcommand === 'push' ? preparePushVerification(args) : undefined;
   const stderrChunks: Buffer[] = [];
   if (HELP_ARGUMENTS.has(args[0] ?? '')) {
     if (hasCliStderrSink()) stderrChunks.push(Buffer.from(HELP_GUIDANCE));
@@ -152,11 +541,18 @@ export function runGitCli(args: string[]): void {
     // 문자열은 재시도 관문의 transient 판정(락 문구 매칭)에만 쓰고, 출력에는 절대 쓰지 않는다.
     return {
       status: command.status,
+      signal: command.signal,
+      ...(command.error ? { errorCode: (command.error as NodeJS.ErrnoException).code } : {}),
       stdout: rawStdout.toString('utf8'),
       stderr: rawStderr.toString('utf8'),
     };
   };
-  const result = runGitWithRetry(args, runner);
+  const ownership = subcommand === 'push' ? guardPushOwnership(args) : { args };
+  const result = ownership.blocked
+    ? { status: 1, stdout: '', stderr: ownership.notice ?? 'push refused by owner guard' }
+    : runGitWithRetry(ownership.args, runner);
+  if (ownership.blocked && ownership.notice) rawStderr = Buffer.from(`${ownership.notice}\n`);
+  else if (ownership.notice) stderrChunks.push(Buffer.from(`${ownership.notice}\n`));
 
   if (rawStdout.length) process.stdout.write(rawStdout);
   if (rawStderr.length) stderrChunks.push(rawStderr);
@@ -173,7 +569,11 @@ export function runGitCli(args: string[]): void {
   const endsWithoutLf = (buf: Buffer): boolean => buf.length > 0 && buf[buf.length - 1] !== LF;
   if (endsWithoutLf(rawStderr)) stderrChunks.push(Buffer.from('\n'));
 
-  const exitCode = result.status ?? 1;
+  const initialExitCode = result.status ?? 1;
+  const pushVerification = subcommand === 'push' && initialExitCode !== 0
+    ? verifyPushAfterFailure(pushTarget, args)
+    : undefined;
+  const exitCode = pushVerification?.primaryOutcome === 'CONFIRMED_APPLIED' ? 0 : initialExitCode;
   const leftKind = exitCode !== 0 && probesForRun
     ? newlyLeftState(probesBefore, probeSnapshot(args, probesForRun, process.env))
     : undefined;
@@ -181,13 +581,25 @@ export function runGitCli(args: string[]): void {
   const leftReason = leftKind
     ? `${leftKind}-${hasUnmergedPaths(args, process.env) ? 'conflict' : 'in-progress'}`
     : undefined;
-  stderrChunks.push(Buffer.from(
-    `[git] ${subcommand} ${exitCode === 0 ? 'ok' : 'FAILED'} rc=${exitCode}`
-    + (leftReason ? ` worktree-changed=yes reason=${leftReason}` : '')
-    + '\n',
-  ));
+  stderrChunks.push(Buffer.from(pushVerification
+    ? `${pushPartialOutcomeLine(pushVerification, exitCode)}\n`
+    : `[git] ${subcommand} ${exitCode === 0 ? 'ok' : 'FAILED'} rc=${exitCode}`
+      + (leftReason ? ` worktree-changed=yes reason=${leftReason}` : '')
+      + '\n'));
   writeCliStderr({ source: 'git', exitCode, raw: Buffer.concat(stderrChunks) });
   process.exitCode = exitCode;
+  if (pushVerification) {
+    debug.log('git.cli', 'partial-outcome', {
+      subcommand,
+      exitCode,
+      primaryOutcome: pushVerification.primaryOutcome,
+      ...(pushVerification.ref ? { ref: pushVerification.ref } : {}),
+      ...(pushVerification.expectedSha ? { expectedSha: pushVerification.expectedSha } : {}),
+      ...(pushVerification.observedSha ? { observedSha: pushVerification.observedSha } : {}),
+      verification: pushVerification.verification,
+      ...(pushVerification.reason ? { reason: pushVerification.reason } : {}),
+    });
+  }
   debug.log('git.cli', 'completed', {
     subcommand,
     exitCode,

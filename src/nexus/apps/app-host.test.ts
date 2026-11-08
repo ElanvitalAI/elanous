@@ -36,6 +36,8 @@ rpc:
 actions:
   transcribe:
     builtin: stt
+    input: { audio: object-ref }
+    output: { text: text }
     uses: [cred:openai.api_key]
 `;
 
@@ -77,7 +79,12 @@ test('NEXUS-APP-HOST-FS-HARDEN mounts an immutable snapshot on an isolated app o
   expect(first.appHost.slugs).toEqual(['voice-note']);
   expect((await appRequest(first.appHost)).status).toBe(401);
   expect(first.appHost.getManifest('voice-note')?.actions).toEqual({
-    transcribe: { builtin: 'stt', uses: ['cred:openai.api_key'] },
+    transcribe: {
+      builtin: 'stt',
+      input: { audio: 'object-ref' },
+      output: { text: 'text' },
+      uses: ['cred:openai.api_key'],
+    },
   });
   const state = createNexusState({ nexusVersion: 'test', phase: 'app-host-fs-harden' });
   const eventBus = new NexusEventBus();

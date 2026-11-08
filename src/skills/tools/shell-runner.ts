@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── ShellList / ShellPoll / ShellKill LLM tools (NT-C2) ──
 //
 // Three thin LLM wrappers around the ShellRegistry. They let a
@@ -15,7 +16,7 @@
 // noisy; `output` is the first-glance summary, and the structured
 // fields let the LLM pick out specifics for follow-ups.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { ShellHandle, ShellMode, ShellStatus } from '../../shell-runner/types.js';
 import type { ShellRegistry } from '../../shell-runner/registry.js';
 import type {

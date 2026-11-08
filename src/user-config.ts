@@ -1433,104 +1433,6 @@ const SHELL_DEFAULTS: ShellConfig = {
   allowDashboardOptionalTools: true,
 };
 
-// ── Chat presentation ───────────────────────────────────────────────
-// Dashboard/system-prompt level presentation heuristics. Kept under
-// user-config so every threshold is tunable and the prompt module can
-// stay pure. P1 restores the missing `chat` wrapper from the pre-#600
-// shape, then adds the first subtree: `chat.conciseness`.
-
-export interface ChatConcisenessConfig {
-  enabled: boolean;
-  finalMessageMaxLines: number;
-  preambleMaxWords: number;
-  flatBullets: boolean;
-}
-
-export interface ChatToolOutputConfig {
-  persistOnOverflow: boolean;
-  retentionDays: number;
-  previewLines: number;
-}
-
-export interface ChatAutoCompactConfig {
-  enabled: boolean;
-  triggerRatio: number;
-  preserveLastN: number;
-  /** ★ 핵심 앵커 보존(2026-07-21) — Layer 3 요약이 뭉개면 안 되는 **맨 앞 앵커**
-   *  (페이즈 프롬프트/WM/premise = 첫 user 메시지) pin 개수. 리딩 system 메시지가
-   *  앞서도 첫 user 메시지까지 자동 확장. 기본 1(첫 앵커 pin). 0=비활성(롤백 seam). */
-  preserveFirstN: number;
-  partial: boolean;
-  workingBudgetTokens: number;
-}
-
-export interface ChatSystemPromptConfig {
-  overridePath?: string;
-  taskVariant: string;
-  /** Optional builtin prompt-family override. When set, bypasses
-   *  model-family inference and forces one of the builtin variants.
-   *  Useful for A/B testing Codex vs GPT lane behavior without
-   *  patching the registry. */
-  forceBuiltinVariant?: 'gpt' | 'codex' | 'claude' | 'local';
-}
-
-export type ChatRenderingStreamingMode = 'byte' | 'line';
-
-export interface ChatRenderingStreamingConfig {
-  mode: ChatRenderingStreamingMode;
-  catchUpThresholdLines: number;
-  catchUpAgeMs: number;
-}
-
-/** Legacy exported type name; the compact boundary no longer has configurable fields. */
-export interface ChatRenderingCompactBoundaryConfig {}
-
-export interface ChatRenderingWrapConfig {
-  urlAware: boolean;
-}
-
-export type ChatRenderingToolDisplayMode = 'legacy' | 'inline-to-block';
-
-export interface ChatRenderingToolConfig {
-  displayMode: ChatRenderingToolDisplayMode;
-  blockMaxLines: number;
-}
-
-export type ChatRenderingDiffColorTier = 'auto' | 'truecolor' | '256' | 'ansi16';
-export type ChatRenderingDiffHeaderStyle = 'legacy' | 'edited';
-export type ChatRenderingDiffTurnBrowserMode = 'all' | 'files' | 'turns';
-
-export interface ChatRenderingDiffConfig {
-  colorTier: ChatRenderingDiffColorTier;
-  headerStyle: ChatRenderingDiffHeaderStyle;
-  turnBrowserHistory: number;
-  turnBrowserMode: ChatRenderingDiffTurnBrowserMode;
-}
-
-export interface ChatRenderingHudConfig {
-  gaugeWarnRatio: number;
-  gaugeDangerRatio: number;
-}
-
-export interface ChatRenderingConfig {
-  streaming: ChatRenderingStreamingConfig;
-  wrap: ChatRenderingWrapConfig;
-  tool: ChatRenderingToolConfig;
-  diff: ChatRenderingDiffConfig;
-  hud: ChatRenderingHudConfig;
-}
-
-/** PR2 (HANDOFF 2026-05-04 §5.2) — knobs for the 4-layer compact
- *  pipeline. `verifyProbe` opts into Wave 5's Gemini-style verify
- *  step before accepting a Layer 3 summary. `archive*` controls the
- *  per-session JSONL archive at ~/.elanous/compact-archive/. */
-export interface ChatCompactConfig {
-  verifyProbe: boolean;
-  archiveEnabled: boolean;
-  archiveRetentionDays: number;
-  archiveRetentionMb: number;
-}
-
 /** ER1 — 액티브 덤퍼(오류 자동 보고). 기본 켬(첫 실행 안내 한 번 · 대표 10-01) · 신원(email/telegramUser)은 따로 «예»일 때만. */
 export interface ErrorReportsConfig {
   /** false = never send. Absent retains the feature but sending waits for the first-run notice. */
@@ -1556,92 +1458,9 @@ export function parseErrorReportsConfig(raw: unknown): ErrorReportsConfig | unde
   return Object.keys(out).length ? out : undefined;
 }
 
-export interface ChatConfig {
-  factQuestion: { maxToolTurns: number };
-  /** TUI-SEAT-TURN-CAP — 자리 TUI goal loop 한정 core 턴 상한 덮어쓰기(기본값 = core-turn/seat-turn-cap.ts). 설정했을 때만 있다. */
-  seatTurnCap?: Partial<SeatTurnCapConfig>;
-  /** Short questions may receive a tool-free first reply. Default true. */
-  fastPath: boolean;
-  conciseness: ChatConcisenessConfig;
-  toolOutput: ChatToolOutputConfig;
-  autoCompact: ChatAutoCompactConfig;
-  compact: ChatCompactConfig;
-  autoCopyQaToClipboard: boolean;
-  systemPrompt: ChatSystemPromptConfig;
-  rendering: ChatRenderingConfig;
-  /** Wave 8 (2026-05-04) — tool deny list. Names matching here are
-   *  filtered out of every model's tool catalog before the LLM call.
-   *  Useful for security / budget control (e.g. block `WebFetch` in
-   *  air-gapped environments, or `mcp__github` to disable a whole
-   *  MCP server). Matching: exact tool name OR `mcp__<server>` prefix
-   *  (matches all tools from that MCP server). Empty array = no
-   *  filtering. ref/claude-code-fork `filterToolsByDenyRules` pattern
-   *  (`src/tools.ts:262-269`). */
-  toolDeny: string[];
-}
-
-const CHAT_CONCISENESS_DEFAULTS: ChatConcisenessConfig = {
-  enabled: true,
-  finalMessageMaxLines: 10,
-  preambleMaxWords: 12,
-  flatBullets: true,
-};
-
-export const CHAT_DEFAULTS: ChatConfig = {
-  factQuestion: { maxToolTurns: 6 },
-  fastPath: true,
-  conciseness: { ...CHAT_CONCISENESS_DEFAULTS },
-  toolOutput: {
-    persistOnOverflow: true,
-    retentionDays: 7,
-    previewLines: 8,
-  },
-  autoCompact: {
-    enabled: true,
-    triggerRatio: 0.85,
-    preserveLastN: 4,
-    preserveFirstN: 1,
-    partial: true,
-    workingBudgetTokens: 256_000,
-  },
-  compact: {
-    verifyProbe: false,
-    archiveEnabled: true,
-    archiveRetentionDays: 30,
-    archiveRetentionMb: 100,
-  },
-  autoCopyQaToClipboard: false,
-  systemPrompt: {
-    overridePath: undefined,
-    taskVariant: 'default',
-    forceBuiltinVariant: undefined,
-  },
-  toolDeny: [],
-  rendering: {
-    streaming: {
-      mode: 'byte',
-      catchUpThresholdLines: 50,
-      catchUpAgeMs: 200,
-    },
-    wrap: {
-      urlAware: false,
-    },
-    tool: {
-      displayMode: 'inline-to-block',
-      blockMaxLines: 8,
-    },
-    diff: {
-      colorTier: 'auto',
-      headerStyle: 'legacy',
-      turnBrowserHistory: 8,
-      turnBrowserMode: 'all',
-    },
-    hud: {
-      gaugeWarnRatio: 0.7,
-      gaugeDangerRatio: 0.85,
-    },
-  },
-};
+import { parseChatConfig, CHAT_DEFAULTS } from './user-config/chat.js';
+import type { ChatConcisenessConfig, ChatToolOutputConfig, ChatAutoCompactConfig, ChatSystemPromptConfig, ChatRenderingStreamingMode, ChatRenderingStreamingConfig, ChatRenderingCompactBoundaryConfig, ChatRenderingWrapConfig, ChatRenderingToolDisplayMode, ChatRenderingToolConfig, ChatRenderingDiffColorTier, ChatRenderingDiffHeaderStyle, ChatRenderingDiffTurnBrowserMode, ChatRenderingDiffConfig, ChatRenderingHudConfig, ChatRenderingConfig, ChatCompactConfig, ChatConfig } from './user-config/chat.js';
+export * from './user-config/chat.js';
 
 // ── Dashboard ────────────────────────────────────────────────────────
 
@@ -3758,73 +3577,9 @@ export function resolveRoleModel(role: ModelRole, config: UserConfig = getUserCo
 }
 
 
-export type OrchestratorSeat = 'OP' | 'TC' | 'MK' | 'UX';
-export interface OrchestratorLoopConfig {
-  /** ORCH1 graph mode — shadow writes observations only; live appends delegations (default shadow). */
-  mode: 'off' | 'shadow' | 'live';
-  seatTrees: Partial<Record<OrchestratorSeat, string[]>>;
-  seatCaps: Record<OrchestratorSeat, number>;
-  /** Max new delegations per tick; absent means no limit. */
-  maxDelegatePerTick?: number;
-  /** Dispatch placement preference and local concurrency lane. Defaults preserve the existing Pod preference and one local lane. */
-  dispatch: { podTarget: number; localLane: number };
-  /** Per-seat release gate; absent seats retain the spawn-budget default. */
-  releaseGate?: Partial<Record<OrchestratorSeat, number>>;
-  trafficMode: 'shadow' | 'live';
-  idleRequest?: 'off' | 'shadow' | 'live';
-  /** FINISH-RATE — the queue tick reads finish metrics before launching; shadow logs the hold only, on holds (default shadow). */
-  finishGate?: 'off' | 'shadow' | 'on';
-  /** ORCH-TA-HAND — the delegate node hands its picked cell to TASK-AGENT (`handTask`). Absent = off · shadow = card only ·
-   *  live = launch (only when the tick mode is live too; a live hand skips the seat journal so the cell launches once). */
-  handToTaskAgent?: 'off' | 'shadow' | 'live';
-  /** Demo: hand only this cell id (others keep the seat path). Absent = every delegatable cell. */
-  handToTaskAgentCell?: string;
-  /** COORD-HA — the tick CLI probes LLM ⊕ task board for the degradation ladder. Absent = shadow (probe and log only) ·
-   *  live = the tick acts on it (L1 rules only · L2 no new assignment) · off = no probe. */
-  degradationSignal?: 'off' | 'shadow' | 'live';
-}
-
-export const ORCHESTRATOR_DEFAULTS: OrchestratorLoopConfig = {
-  mode: 'shadow', seatTrees: {}, seatCaps: { TC: 8, UX: 6, MK: 6, OP: 4 }, dispatch: { podTarget: 18, localLane: 1 }, trafficMode: 'shadow', idleRequest: 'shadow', finishGate: 'shadow',
-};
-
-export function parseOrchestratorLoopConfig(raw: unknown): OrchestratorLoopConfig {
-  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
-  const rawTrees = value.seatTrees && typeof value.seatTrees === 'object' && !Array.isArray(value.seatTrees)
-    ? value.seatTrees as Record<string, unknown> : {};
-  const rawCaps = value.seatCaps && typeof value.seatCaps === 'object' && !Array.isArray(value.seatCaps)
-    ? value.seatCaps as Record<string, unknown> : {};
-  const rawGate = value.releaseGate && typeof value.releaseGate === 'object' && !Array.isArray(value.releaseGate)
-    ? value.releaseGate as Record<string, unknown> : {};
-  const seatTrees: OrchestratorLoopConfig['seatTrees'] = {};
-  const seatCaps = { ...ORCHESTRATOR_DEFAULTS.seatCaps };
-  const releaseGate: NonNullable<OrchestratorLoopConfig['releaseGate']> = {};
-  for (const seat of ['OP', 'TC', 'MK', 'UX'] as const) {
-    if (Array.isArray(rawTrees[seat])) seatTrees[seat] = rawTrees[seat].filter((path): path is string => typeof path === 'string' && isAbsolute(path));
-    const cap = rawCaps[seat];
-    if (typeof cap === 'number' && Number.isSafeInteger(cap) && cap >= 0) seatCaps[seat] = cap;
-    const gate = rawGate[seat];
-    if (typeof gate === 'number' && Number.isSafeInteger(gate) && gate >= 0) releaseGate[seat] = gate;
-  }
-  const mode = value.mode === 'off' || value.mode === 'live' ? value.mode : 'shadow';
-  const maxDelegatePerTick = value.maxDelegatePerTick;
-  const rawDispatch = value.dispatch && typeof value.dispatch === 'object' && !Array.isArray(value.dispatch)
-    ? value.dispatch as Record<string, unknown> : {};
-  const dispatch = { ...ORCHESTRATOR_DEFAULTS.dispatch };
-  for (const field of ['podTarget', 'localLane'] as const) {
-    const setting = rawDispatch[field];
-    if (typeof setting === 'number' && Number.isSafeInteger(setting) && setting >= 0) dispatch[field] = setting;
-  }
-  return { mode, seatTrees, seatCaps, dispatch,
-    ...(typeof maxDelegatePerTick === 'number' && Number.isSafeInteger(maxDelegatePerTick) && maxDelegatePerTick >= 0 ? { maxDelegatePerTick } : {}),
-    ...(Object.keys(releaseGate).length ? { releaseGate } : {}),
-    trafficMode: value.trafficMode === 'live' ? 'live' : 'shadow',
-    idleRequest: value.idleRequest === 'off' || value.idleRequest === 'live' ? value.idleRequest : 'shadow',
-    finishGate: value.finishGate === 'off' || value.finishGate === 'on' ? value.finishGate : 'shadow',
-    ...(value.handToTaskAgent === 'shadow' || value.handToTaskAgent === 'live' ? { handToTaskAgent: value.handToTaskAgent } : {}),
-    ...(typeof value.handToTaskAgentCell === 'string' && value.handToTaskAgentCell.trim() ? { handToTaskAgentCell: value.handToTaskAgentCell.trim() } : {}),
-    ...(value.degradationSignal === 'off' || value.degradationSignal === 'shadow' || value.degradationSignal === 'live' ? { degradationSignal: value.degradationSignal } : {}) };
-}
+import { ORCHESTRATOR_DEFAULTS, parseOrchestratorLoopConfig } from './user-config/orchestrator.js';
+import type { OrchestratorSeat, OrchestratorLoopConfig } from './user-config/orchestrator.js';
+export * from './user-config/orchestrator.js';
 
 export type StewardLoopMode = 'off' | 'shadow' | 'live' | 'rescue';
 
@@ -4011,7 +3766,7 @@ export interface UserConfig {
   /** Root CLI help audience; absent or invalid means owner. */
   cli?: { helpRole?: 'owner' | 'contributor' | 'general' };
   /** Daemon public demonstration mode; absent means off. */
-  nexus?: { demoMode?: boolean };
+  nexus?: { demoMode?: boolean; relay?: { enabled?: boolean; url?: string; identityFile?: string } };
   /** Execution-phase HITL answer deadline; absent means 30 minutes. */
   hitl?: { executionDeadlineMinutes?: number };
   /** Outbound notifications. quietHours is `off` or `HH:MM-HH:MM` KST; absent keeps 00:00-06:30. */
@@ -4036,7 +3791,7 @@ export interface UserConfig {
   followUp?: 'shadow' | 'live';
 };
   /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
-  pod?: { pool?: string; /** Host-local private warm provider config path. Env ELANOUS_WARM_POD_PROVIDER_CONFIG overrides this; absent path defaults to warm-pod-provider.json beside config.json. */ warmProviderConfig?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean }; /** 명령 Job 자식 로그(child.log) 상한 바이트. 양의 정수만. 넘으면 끝부분 우선. */ childLogMaxBytes?: number; /** warm Pod 재사용 실전 손잡이(소비자별 · 기본 off · 문자 그대로 true 만). 판정 = pod-warm-switch.ts `decideWarmReuse` — 증거가 모자라면 flag 가 켜져도 off. */ warmReuse?: { gateRecheck?: boolean; land?: boolean; ta?: boolean; /** 연속 일치 표본 하한(양의 정수 · 기본 3). */ minMatchSamples?: number } };
+  pod?: { pool?: string; /** Host-local private warm provider config path. Env ELANOUS_WARM_POD_PROVIDER_CONFIG overrides this; absent path defaults to warm-pod-provider.json beside config.json. */ warmProviderConfig?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number }; /** 실측 권고를 Pod 발사 기본값으로 쓸지 (기본 off). */ memory?: { adviseDefaults?: boolean }; /** 명령 Job 자식 로그(child.log) 상한 바이트. 양의 정수만. 넘으면 끝부분 우선. */ childLogMaxBytes?: number; /** Warm reuse controls: shadow consumers stay off by default; validated gate shard execution is live by default with a literal-false emergency switch. */ warmReuse?: { gateRecheck?: boolean; /** Gate warm shards default live after simulation; literal false is the emergency kill switch. */ gateShardExecution?: boolean; land?: boolean; ta?: boolean; /** 연속 일치 표본 하한(양의 정수 · 기본 3). */ minMatchSamples?: number } };
   skillRouter: SkillRouterConfig;
   llm: LLMConfig;
   skills: SkillsConfig;
@@ -4500,24 +4255,7 @@ function defaultConfig(): UserConfig {
     debug: { ...DEBUG_DEFAULTS },
     logs: { retention: { ...LOGS_DEFAULTS.retention } },
     shell: { ...SHELL_DEFAULTS },
-    chat: {
-      factQuestion: { ...CHAT_DEFAULTS.factQuestion },
-      fastPath: CHAT_DEFAULTS.fastPath,
-      conciseness: { ...CHAT_CONCISENESS_DEFAULTS },
-      toolOutput: { ...CHAT_DEFAULTS.toolOutput },
-      autoCompact: { ...CHAT_DEFAULTS.autoCompact },
-      compact: { ...CHAT_DEFAULTS.compact },
-      autoCopyQaToClipboard: CHAT_DEFAULTS.autoCopyQaToClipboard,
-      systemPrompt: { ...CHAT_DEFAULTS.systemPrompt },
-      toolDeny: [],
-      rendering: {
-        streaming: { ...CHAT_DEFAULTS.rendering.streaming },
-        wrap: { ...CHAT_DEFAULTS.rendering.wrap },
-        tool: { ...CHAT_DEFAULTS.rendering.tool },
-        diff: { ...CHAT_DEFAULTS.rendering.diff },
-        hud: { ...CHAT_DEFAULTS.rendering.hud },
-      },
-    },
+    chat: parseChatConfig(undefined),
     voice: { stt: {}, tts: {}, vad: {}, chat: {}, discord: {}, telegram: {}, pwa: {} },
     intake: { eventMax: 10, telegram: {}, discord: {} },
     dashboard: {
@@ -5168,19 +4906,6 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const dbg = (rawObj.debug ?? {}) as Record<string, unknown>;
   const logsRaw = (rawObj.logs ?? {}) as Record<string, unknown>;
   const sh = (rawObj.shell ?? {}) as Record<string, unknown>;
-  const chat = (rawObj.chat ?? {}) as Record<string, unknown>;
-  const chatFactQuestion = (chat.factQuestion && typeof chat.factQuestion === 'object' && !Array.isArray(chat.factQuestion))
-    ? chat.factQuestion as Record<string, unknown> : {};
-  const chatConciseness = (chat.conciseness ?? {}) as Record<string, unknown>;
-  const chatToolOutput = (chat.toolOutput ?? {}) as Record<string, unknown>;
-  const chatAutoCompact = (chat.autoCompact ?? {}) as Record<string, unknown>;
-  const chatCompact = (chat.compact ?? {}) as Record<string, unknown>;
-  const chatSystemPrompt = (chat.systemPrompt ?? {}) as Record<string, unknown>;
-  const chatRendering = (chat.rendering ?? {}) as Record<string, unknown>;
-  const chatRenderingStreaming = (chatRendering.streaming ?? {}) as Record<string, unknown>;
-  const chatRenderingWrap = (chatRendering.wrap ?? {}) as Record<string, unknown>;
-  const chatRenderingDiff = (chatRendering.diff ?? {}) as Record<string, unknown>;
-  const chatRenderingHud = (chatRendering.hud ?? {}) as Record<string, unknown>;
   const voice = (rawObj.voice ?? {}) as Record<string, unknown>;
   const voiceStt = (voice.stt ?? {}) as Record<string, unknown>;
   const voiceTts = (voice.tts ?? {}) as Record<string, unknown>;
@@ -5251,7 +4976,20 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     ...(rawObj.watch && typeof rawObj.watch === 'object' && !Array.isArray(rawObj.watch)
       && typeof (rawObj.watch as Record<string, unknown>).enabled === 'boolean'
       ? { watch: { enabled: (rawObj.watch as { enabled: boolean }).enabled } } : {}),
-    nexus: { demoMode: nexus.demoMode === true },
+    nexus: {
+      demoMode: nexus.demoMode === true,
+      ...(nexus.relay && typeof nexus.relay === 'object' && !Array.isArray(nexus.relay)
+        ? (() => {
+          const relay = nexus.relay as Record<string, unknown>;
+          const parsed = {
+            ...(typeof relay.enabled === 'boolean' ? { enabled: relay.enabled } : {}),
+            ...(typeof relay.url === 'string' && relay.url.trim() ? { url: relay.url.trim() } : {}),
+            ...(typeof relay.identityFile === 'string' && relay.identityFile.trim() ? { identityFile: relay.identityFile.trim() } : {}),
+          };
+          return Object.keys(parsed).length ? { relay: parsed } : {};
+        })()
+        : {}),
+    },
     ...(Object.keys(seatBudgets).length ? { org: { budget: seatBudgets } } : {}),
     pod: {
       ...(typeof legacyPod.pool === 'string' && legacyPod.pool.trim() ? { pool: legacyPod.pool.trim() } : {}),
@@ -5273,6 +5011,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
           ? (legacyPod.warmReuse as Record<string, unknown>) : {};
         return {
           gateRecheck: warm.gateRecheck === true,
+          gateShardExecution: warm.gateShardExecution !== false,
           land: warm.land === true,
           ta: warm.ta === true,
           minMatchSamples: typeof warm.minMatchSamples === 'number' && Number.isSafeInteger(warm.minMatchSamples) && warm.minMatchSamples > 0
@@ -5646,180 +5385,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       allowDashboardOptionalTools: sh.allowDashboardOptionalTools !== false,
     },
     ...((): { errorReports?: ErrorReportsConfig } => { const er = parseErrorReportsConfig(rawObj.errorReports); return er ? { errorReports: er } : {}; })(),
-    chat: {
-      factQuestion: {
-        maxToolTurns: typeof chatFactQuestion.maxToolTurns === 'number'
-          && Number.isSafeInteger(chatFactQuestion.maxToolTurns) && chatFactQuestion.maxToolTurns > 0
-          ? chatFactQuestion.maxToolTurns : CHAT_DEFAULTS.factQuestion.maxToolTurns,
-      },
-      ...((): { seatTurnCap?: Partial<SeatTurnCapConfig> } => { const c = parseSeatTurnCapConfig(chat.seatTurnCap); return c ? { seatTurnCap: c } : {}; })(),
-      fastPath: chat.fastPath === false || chat.fastPath === 'false' ? false : CHAT_DEFAULTS.fastPath,
-      conciseness: {
-        enabled: chatConciseness.enabled === false ? false : CHAT_CONCISENESS_DEFAULTS.enabled,
-        finalMessageMaxLines: clampNum(
-          chatConciseness.finalMessageMaxLines,
-          CHAT_CONCISENESS_DEFAULTS.finalMessageMaxLines,
-          1,
-          100,
-        ),
-        preambleMaxWords: clampNum(
-          chatConciseness.preambleMaxWords,
-          CHAT_CONCISENESS_DEFAULTS.preambleMaxWords,
-          1,
-          50,
-        ),
-        flatBullets: chatConciseness.flatBullets === false ? false : CHAT_CONCISENESS_DEFAULTS.flatBullets,
-      },
-      toolOutput: {
-        persistOnOverflow: chatToolOutput.persistOnOverflow === false ? false : CHAT_DEFAULTS.toolOutput.persistOnOverflow,
-        retentionDays: clampNum(
-          chatToolOutput.retentionDays,
-          CHAT_DEFAULTS.toolOutput.retentionDays,
-          1,
-          365,
-        ),
-        previewLines: clampNum(
-          chatToolOutput.previewLines,
-          CHAT_DEFAULTS.toolOutput.previewLines,
-          1,
-          500,
-        ),
-      },
-      autoCompact: {
-        enabled: chatAutoCompact.enabled === false ? false : CHAT_DEFAULTS.autoCompact.enabled,
-        triggerRatio: clampNum(
-          chatAutoCompact.triggerRatio,
-          CHAT_DEFAULTS.autoCompact.triggerRatio,
-          0.5,
-          0.99,
-        ),
-        preserveLastN: clampNum(
-          chatAutoCompact.preserveLastN,
-          CHAT_DEFAULTS.autoCompact.preserveLastN,
-          0,
-          100,
-        ),
-        preserveFirstN: clampNum(
-          chatAutoCompact.preserveFirstN,
-          CHAT_DEFAULTS.autoCompact.preserveFirstN,
-          0,
-          100,
-        ),
-        partial: chatAutoCompact.partial === false ? false : CHAT_DEFAULTS.autoCompact.partial,
-        workingBudgetTokens: positiveIntOr(
-          chatAutoCompact.workingBudgetTokens,
-          CHAT_DEFAULTS.autoCompact.workingBudgetTokens,
-        ),
-      },
-      compact: {
-        verifyProbe: chatCompact.verifyProbe === true,
-        archiveEnabled: chatCompact.archiveEnabled === false ? false : CHAT_DEFAULTS.compact.archiveEnabled,
-        archiveRetentionDays: clampNum(
-          chatCompact.archiveRetentionDays,
-          CHAT_DEFAULTS.compact.archiveRetentionDays,
-          0,
-          365,
-        ),
-        archiveRetentionMb: clampNum(
-          chatCompact.archiveRetentionMb,
-          CHAT_DEFAULTS.compact.archiveRetentionMb,
-          0,
-          10_000,
-        ),
-      },
-      autoCopyQaToClipboard:
-        chat.autoCopyQaToClipboard === true
-          ? true
-          : CHAT_DEFAULTS.autoCopyQaToClipboard,
-      // Wave 8 — toolDeny: accept readonly string[] from raw config,
-      // filter to non-empty strings, dedupe. No clamp on length —
-      // the catalog has ~150 tools, blocking ~10 is reasonable.
-      toolDeny: (() => {
-        const raw = (chat as { toolDeny?: unknown }).toolDeny;
-        if (!Array.isArray(raw)) return [];
-        const cleaned: string[] = [];
-        const seen = new Set<string>();
-        for (const item of raw) {
-          if (typeof item !== 'string') continue;
-          const trimmed = item.trim();
-          if (trimmed.length === 0) continue;
-          if (seen.has(trimmed)) continue;
-          seen.add(trimmed);
-          cleaned.push(trimmed);
-        }
-        return cleaned;
-      })(),
-      systemPrompt: {
-        overridePath: str(chatSystemPrompt.overridePath),
-        taskVariant: str(chatSystemPrompt.taskVariant) ?? CHAT_DEFAULTS.systemPrompt.taskVariant,
-        forceBuiltinVariant: (() => {
-          const raw = str(chatSystemPrompt.forceBuiltinVariant)?.toLowerCase();
-          return raw === 'gpt' || raw === 'codex' || raw === 'claude' || raw === 'local'
-            ? raw
-            : CHAT_DEFAULTS.systemPrompt.forceBuiltinVariant;
-        })(),
-      },
-      rendering: {
-        streaming: {
-          mode: normalizeChatRenderingStreamingMode(chatRenderingStreaming.mode),
-          catchUpThresholdLines: clampNum(
-            chatRenderingStreaming.catchUpThresholdLines,
-            CHAT_DEFAULTS.rendering.streaming.catchUpThresholdLines,
-            1,
-            1000,
-          ),
-          catchUpAgeMs: clampNum(
-            chatRenderingStreaming.catchUpAgeMs,
-            CHAT_DEFAULTS.rendering.streaming.catchUpAgeMs,
-            1,
-            10_000,
-          ),
-        },
-        wrap: {
-          urlAware: chatRenderingWrap.urlAware === true,
-        },
-        tool: {
-          displayMode: normalizeChatRenderingToolDisplayMode(
-            chatRendering && typeof (chatRendering as Record<string, unknown>).tool === 'object'
-              ? ((chatRendering as Record<string, unknown>).tool as Record<string, unknown>).displayMode
-              : undefined,
-          ),
-          blockMaxLines: clampNum(
-            chatRendering && typeof (chatRendering as Record<string, unknown>).tool === 'object'
-              ? ((chatRendering as Record<string, unknown>).tool as Record<string, unknown>).blockMaxLines
-              : undefined,
-            CHAT_DEFAULTS.rendering.tool.blockMaxLines,
-            1,
-            200,
-          ),
-        },
-        diff: {
-          colorTier: normalizeChatRenderingDiffColorTier(chatRenderingDiff.colorTier),
-          headerStyle: normalizeChatRenderingDiffHeaderStyle(chatRenderingDiff.headerStyle),
-          turnBrowserHistory: clampNum(
-            chatRenderingDiff.turnBrowserHistory,
-            CHAT_DEFAULTS.rendering.diff.turnBrowserHistory,
-            1,
-            20,
-          ),
-          turnBrowserMode: normalizeChatRenderingDiffTurnBrowserMode(chatRenderingDiff.turnBrowserMode),
-        },
-        hud: {
-          gaugeWarnRatio: clampNum(
-            chatRenderingHud.gaugeWarnRatio,
-            CHAT_DEFAULTS.rendering.hud.gaugeWarnRatio,
-            0,
-            1,
-          ),
-          gaugeDangerRatio: clampNum(
-            chatRenderingHud.gaugeDangerRatio,
-            CHAT_DEFAULTS.rendering.hud.gaugeDangerRatio,
-            0,
-            1,
-          ),
-        },
-      },
-    },
+    chat: parseChatConfig(rawObj.chat),
     voice: {
       // Sparse parse: only set fields the user EXPLICITLY put in the
       // config file. Missing fields stay `undefined` so resolvers can
@@ -6266,39 +5832,6 @@ function normalizeDebugLevel(v: unknown): DebugConfig['level'] {
   }
 }
 
-function normalizeChatRenderingStreamingMode(v: unknown): ChatRenderingStreamingMode {
-  return v === 'line' ? 'line' : CHAT_DEFAULTS.rendering.streaming.mode;
-}
-
-function normalizeChatRenderingToolDisplayMode(v: unknown): ChatRenderingToolDisplayMode {
-  return v === 'inline-to-block' ? 'inline-to-block' : CHAT_DEFAULTS.rendering.tool.displayMode;
-}
-
-function normalizeChatRenderingDiffColorTier(v: unknown): ChatRenderingDiffColorTier {
-  switch (v) {
-    case 'truecolor':
-    case '256':
-    case 'ansi16':
-      return v;
-    default:
-      return CHAT_DEFAULTS.rendering.diff.colorTier;
-  }
-}
-
-function normalizeChatRenderingDiffHeaderStyle(v: unknown): ChatRenderingDiffHeaderStyle {
-  return v === 'edited' ? 'edited' : CHAT_DEFAULTS.rendering.diff.headerStyle;
-}
-
-function normalizeChatRenderingDiffTurnBrowserMode(v: unknown): ChatRenderingDiffTurnBrowserMode {
-  switch (v) {
-    case 'files':
-    case 'turns':
-      return v;
-    default:
-      return CHAT_DEFAULTS.rendering.diff.turnBrowserMode;
-  }
-}
-
 /** Follow-up #7 — resolve the effective HOP_CAP for a brand from
  *  user-config. Returns `undefined` when no brand-specific and no
  *  `default` entry is set; the DRM resolver then falls back to
@@ -6340,6 +5873,20 @@ export function getUserConfig(path: string = defaultPath()): UserConfig {
   cachedPath = path;
   cachedMtimeMs = readMtimeMsOrNull(path);
   return cache;
+}
+
+/** Normalized Nexus outbound relay configuration; disabled unless explicitly enabled. */
+export function resolveNexusRelayConfig(config: UserConfig = getUserConfig()): {
+  enabled: boolean;
+  url?: string;
+  identityFile?: string;
+} {
+  const relay = config.nexus?.relay;
+  return {
+    enabled: relay?.enabled === true,
+    ...(relay?.url ? { url: relay.url } : {}),
+    ...(relay?.identityFile ? { identityFile: relay.identityFile } : {}),
+  };
 }
 
 /** Resolve the explicit TUI unattended switch: saved user config wins over the seat-launch env override. */

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── submit_trade_decision 도구 (목표 방출형 · P2a · 2026-07-09) ──────────────
 //
 // 레버리지 결정 에이전트가 최종 결정을 방출하는 구조화 출력 도구. LLM 은 "목표
@@ -10,7 +11,7 @@
 //
 // 설계: 내부 문서 `DESIGN-leverage-decision-agent-2026-07-09` §6.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import type { TradeContract } from './trade-contract.js';
 
 export interface TradeDecisionTarget {

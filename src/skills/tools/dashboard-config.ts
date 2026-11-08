@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tools: DashboardConfigGet + DashboardConfigSet — T6-K4.
 //
 // Read and (with approval) write a curated subset of dashboard
@@ -16,7 +17,7 @@
 //     • Set requires an approver (reuses T1-P2 approval modal
 //       pattern) — fail-closed when no approver is wired.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 export type ConfigKey =
   | 'dashboard.chatOnlyMode'

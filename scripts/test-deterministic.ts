@@ -30,7 +30,7 @@
 //     group. If group termination fails it falls back to the direct child and
 //     reports the failure.
 
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -803,6 +803,31 @@ export function planDeterministicTestCommands(
   return [...bulk, ...selectedMocks.map((file) => ['bun', 'test', ...soloArgs, file])];
 }
 
+function replaceOptionValue(command: string[], flag: string, value: string): string[] {
+  const out = [...command];
+  for (let index = 0; index < out.length; index++) {
+    if (out[index] === flag) { out[index + 1] = value; return out; }
+    if (out[index]!.startsWith(`${flag}=`)) { out[index] = `${flag}=${value}`; return out; }
+  }
+  throw new Error(`missing ${flag} in isolated test command`);
+}
+
+const MERGE_JUNIT_REPORTS = [
+  'import os, sys, xml.etree.ElementTree as ET',
+  'output, *inputs = sys.argv[1:]',
+  'root = ET.Element("testsuites")',
+  'for path in inputs:',
+  '    child = ET.parse(path).getroot()',
+  '    if child.tag == "testsuites": root.extend(list(child))',
+  '    elif child.tag == "testsuite": root.append(child)',
+  '    else: raise ValueError(f"unexpected JUnit root {child.tag!r}: {path}")',
+  'for key in ("tests", "failures", "errors", "skipped"):',
+  '    root.set(key, str(sum(int(suite.get(key, "0")) for suite in root)))',
+  'root.set("time", str(sum(float(suite.get("time", "0")) for suite in root)))',
+  'os.makedirs(os.path.dirname(output) or ".", exist_ok=True)',
+  'ET.ElementTree(root).write(output, encoding="utf-8", xml_declaration=True)',
+].join("\n");
+
 export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}): Promise<number> {
   const makeTemp = deps.mkdtempSync ?? mkdtempSync;
   const tempBase = deps.tmpdir ?? tmpdir;
@@ -877,15 +902,27 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
   const allTestFiles = (explicitPaths || fullBail) && mockFiles.length > 0 ? discoverTestFiles() : [];
   let commands = planDeterministicTestCommands(argv, ignoredTestPatterns, mockFiles, allTestFiles, testCwd);
   const optionTokens = bunTestOptionTokens(argv);
-  // Bun writes these outputs to one caller-selected file. Separate children
-  // would overwrite each other, so preserve the caller's single-process run.
-  const sharedOutput = optionTokens.some((arg) => arg === '--reporter-outfile' || arg.startsWith('--reporter-outfile='))
-    || bunTestOptionValues(argv, '--coverage-reporter').some((value) => value.split(',').includes('lcov'))
-    || (optionTokens.includes('--update-timings') && bunTestOptionValues(argv, '--timings').length > 0);
+  // Shared-output options need one final artifact. Preserve mock.module isolation
+  // by merging per-child JUnit reports; unsupported shared outputs fail closed.
+  const hasLcovOutput = bunTestOptionValues(argv, '--coverage-reporter').some((value) => value.split(',').includes('lcov'));
+  const hasTimingOutput = optionTokens.includes('--update-timings') && bunTestOptionValues(argv, '--timings').length > 0;
+  const hasReporterOutfile = optionTokens.some((arg) => arg === '--reporter-outfile' || arg.startsWith('--reporter-outfile='));
+  const sharedOutput = hasReporterOutfile || hasLcovOutput || hasTimingOutput;
   const sharedOutputFallback = commands.length > 1 && sharedOutput;
-  if (sharedOutputFallback) {
+  const reporterOutfiles = bunTestOptionValues(argv, '--reporter-outfile');
+  const reporters = bunTestOptionValues(argv, '--reporter').flatMap((value) => value.split(',').map((name) => name.trim()));
+  const isolateJunitOutputs = sharedOutputFallback && mockFiles.length > 0
+    && reporterOutfiles.length === 1 && reporters.length === 1 && reporters[0] === 'junit'
+    && !hasLcovOutput && !hasTimingOutput;
+  if (sharedOutputFallback && mockFiles.length > 0 && !isolateJunitOutputs) {
+    report('[test-deterministic] Cannot preserve mock.module isolation with this shared output option; use JUnit reporter-outfile or split the output options.');
+    return 1;
+  }
+  if (sharedOutputFallback && mockFiles.length === 0) {
     report('[test-deterministic] 공유 파일 출력 옵션: mock.module 분리를 끄고 단일 Bun 시험 프로세스로 실행한다.');
     commands = [['bun', 'test', ...ignoredTestPatterns.flatMap((pattern) => ['--path-ignore-patterns', pattern]), ...argv]];
+  } else if (isolateJunitOutputs) {
+    report('[test-deterministic] JUnit outputs are split per child to preserve mock.module isolation.');
   }
   const namePatterns = [
     ...bunTestOptionValues(argv, '--test-name-pattern'),
@@ -946,10 +983,18 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
       : installShutdownSignalGate(deps.signalTarget ?? process, deps.onAbsorbSignal);
     const signalPromise = deps.waitForSignal ? deps.waitForSignal() : gate!.received;
 
+    let junitMerge: { output: string; reports: string[] } | undefined;
+    const completedJunitReports: string[] = [];
+    if (isolateJunitOutputs) {
+      const output = resolve(cwd, reporterOutfiles[0]!);
+      const reports = commands.map((_, index) => join(testRoot!, `junit-${index}.xml`));
+      commands = commands.map((command, index) => replaceOptionValue(command, '--reporter-outfile', reports[index]!));
+      junitMerge = { output, reports };
+    }
     let exitCode = 0;
     let sawNameMatch = false;
     let sawNameMiss = false;
-    for (const cmd of commands) {
+    for (const [commandIndex, cmd] of commands.entries()) {
       // With a name filter, Bun gives an unmatched child exit 0 only with this
       // flag. A real failed test still exits nonzero; aggregate matches below.
       const childCmd = captureNoMatch && !cmd.includes('--pass-with-no-tests')
@@ -978,6 +1023,8 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
       if (outcome.kind === 'error') throw outcome.error;
       if (outcome.kind === 'exit') {
         const evidence = await child.stderrEvidence;
+        const completedReport = junitMerge?.reports[commandIndex];
+        if (completedReport && existsSync(completedReport)) completedJunitReports.push(completedReport);
         const passedTests = evidence?.passSummary && evidence.runSummary;
         if (captureNoMatch && evidence?.nameMissDiagnostic && !passedTests && outcome.code === 0) sawNameMiss = true;
         else if (outcome.code === 0) sawNameMatch = true;
@@ -1007,6 +1054,13 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
         await new Promise<never>(() => {});
       }
       return 1;
+    }
+    if (junitMerge) {
+      const merged = spawnSync('python3', ['-c', MERGE_JUNIT_REPORTS, junitMerge.output, ...completedJunitReports], { encoding: 'utf8' });
+      if (merged.status !== 0) {
+        reportVisible(`failed to merge isolated JUnit reports: ${merged.stderr || merged.error || `exit ${merged.status}`}`, report);
+        exitCode = 1;
+      }
     }
     if (sawNameMiss && !sawNameMatch && exitCode === 0
       && !optionTokens.includes('--pass-with-no-tests')) exitCode = 1;

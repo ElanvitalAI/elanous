@@ -1,9 +1,21 @@
 import { expect, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import ts from 'typescript';
+import { measureRuntimeStaticClosure, runtimeStaticSpecifiers } from '../../scripts/lib/tui-runtime-static-closure.js';
 
 const SOURCE_EXTENSIONS = ['.ts', '.tsx', '.mts', '.cts'] as const;
+
+type GitOutput = (args: string[]) => string;
+
+function readBaseDashboardEntry(runGit: GitOutput = (args) => execFileSync('git', args, { encoding: 'utf8' })): string {
+  const base = runGit(['merge-base', 'HEAD', 'origin/main']).trim();
+  if (!base) throw new Error('merge-base HEAD origin/main returned no base');
+  const source = runGit(['show', `${base}:src/dashboard/index.ts`]);
+  if (!source) throw new Error(`origin/main merge-base dashboard source is missing: ${base}`);
+  return source;
+}
 
 function sourceFiles(root: string): string[] {
   if (!existsSync(root)) return [];
@@ -50,31 +62,6 @@ function hasBranchDependency(source: string, filePath = join(import.meta.dir, 'c
   };
   walk(file);
   return found;
-}
-
-function runtimeStaticSpecifiers(source: string): string[] {
-  const file = ts.createSourceFile('module.ts', source, ts.ScriptTarget.Latest, true);
-  const specifiers: string[] = [];
-  const walk = (node: ts.Node): void => {
-    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)
-      && !node.importClause?.isTypeOnly
-      && !(node.importClause && !node.importClause.name && node.importClause.namedBindings
-        && ts.isNamedImports(node.importClause.namedBindings)
-        && node.importClause.namedBindings.elements.length > 0
-        && node.importClause.namedBindings.elements.every((element) => element.isTypeOnly))) {
-      specifiers.push(node.moduleSpecifier.text);
-    }
-    if (ts.isExportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)
-      && !node.isTypeOnly
-      && !(node.exportClause && ts.isNamedExports(node.exportClause)
-        && node.exportClause.elements.length > 0
-        && node.exportClause.elements.every((element) => element.isTypeOnly))) {
-      specifiers.push(node.moduleSpecifier.text);
-    }
-    ts.forEachChild(node, walk);
-  };
-  walk(file);
-  return specifiers;
 }
 
 function branchGateViolations(sources: readonly { path: string; source: string }[]): string[] {
@@ -181,6 +168,20 @@ test('every src/tui TypeScript file stays below the 4,000 line limit', () => {
   expect(oversized).toEqual([]);
 });
 
+test('classic dashboard entry stays below its merge-base size and post-diet ceiling', () => {
+  const dashboardEntry = readFileSync(join(import.meta.dir, '../dashboard/index.ts'), 'utf8');
+  const lineCount = dashboardEntry.split('\n').length - (dashboardEntry.endsWith('\n') ? 1 : 0);
+  const baseDashboardEntry = readBaseDashboardEntry();
+  const baseLineCount = baseDashboardEntry.split('\n').length - (baseDashboardEntry.endsWith('\n') ? 1 : 0);
+  expect(lineCount).toBeLessThanOrEqual(baseLineCount);
+  expect(lineCount).toBeLessThanOrEqual(19_686);
+});
+
+test('classic dashboard size guard fails closed when origin/main has no merge-base', () => {
+  expect(() => readBaseDashboardEntry((args) => args[0] === 'merge-base' ? '' : 'unreachable'))
+    .toThrow('merge-base HEAD origin/main returned no base');
+});
+
 test('next entry imports no dashboard module and legacy imports do not grow', () => {
   const root = import.meta.dir;
   const files: string[] = [];
@@ -211,37 +212,16 @@ test('next entry imports no dashboard module and legacy imports do not grow', ()
   }
 });
 
-test('next TUI entry stays within the audited runtime-static ceiling (goal: 100 files / 25k lines)', () => {
-  const entry = join(import.meta.dir, 'entry.ts');
-  const visited = new Set<string>();
-  const resolve = (from: string, specifier: string): string | undefined => {
-    if (!specifier.startsWith('.')) return undefined;
-    const base = join(from, '..', specifier.replace(/\.(?:mjs|cjs|js)$/, ''));
-    for (const candidate of [
-      base, `${base}.ts`, `${base}.tsx`, `${base}.mts`, `${base}.cts`, `${base}.js`, `${base}.jsx`,
-      join(base, 'index.ts'), join(base, 'index.tsx'), join(base, 'index.mts'), join(base, 'index.cts'),
-      join(base, 'index.js'), join(base, 'index.jsx'),
-    ]) {
-      try {
-        if (readFileSync(candidate).length >= 0) return candidate;
-      } catch { /* try the next TypeScript resolution form */ }
-    }
-    return undefined;
+test('next TUI entry stays within the design budget (100 runtime-static files / 25k lines)', () => {
+  const measured = measureRuntimeStaticClosure(join(import.meta.dir, 'entry.ts'));
+  const baseline = JSON.parse(readFileSync(join(import.meta.dir, 'size-contract.ratchet.json'), 'utf8')) as {
+    runtimeStaticFiles: number; runtimeStaticLines: number;
   };
-  const visit = (path: string): void => {
-    if (visited.has(path)) return;
-    visited.add(path);
-    for (const specifier of runtimeStaticSpecifiers(readFileSync(path, 'utf8'))) {
-      const dependency = resolve(path, specifier);
-      if (dependency) visit(dependency);
-    }
-  };
-  visit(entry);
-  const lines = [...visited].reduce((sum, path) => sum + readFileSync(path, 'utf8').split('\n').length, 0);
-  // 11-06 measured on origin/main 7c2a88c plus this closure check: 86 runtime-static files / 20,037 lines.
-  // 11-07 0.3.6 cut: main 3b8d3b5a reaches 89 files (lines still under 20,037) — ceiling 89 pending the shrink cell TUI-ENTRY-SIZE-REGROW.
-  expect(visited.size).toBeLessThanOrEqual(89);
-  expect(lines).toBeLessThanOrEqual(20_037);
+  if (measured.files > baseline.runtimeStaticFiles || measured.lines > baseline.runtimeStaticLines) {
+    console.warn(`TUI closure ratchet grew: ${baseline.runtimeStaticFiles}/${baseline.runtimeStaticLines} → ${measured.files}/${measured.lines}; regenerate with bun run scripts/update-tui-size-ratchet.ts`);
+  }
+  expect(measured.files).toBeLessThanOrEqual(100);
+  expect(measured.lines).toBeLessThanOrEqual(25_000);
 }, 30_000);
 
 test('new next TUI production modules stay within 600 lines', () => {

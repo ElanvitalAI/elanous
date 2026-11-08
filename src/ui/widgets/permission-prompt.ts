@@ -16,7 +16,7 @@ import { BoxView, type View } from '../view.js';
 import type { Printer } from '../printer.js';
 import type { KeyEvent } from '../../plugins/core/types.js';
 import type { WidgetChromeSpec } from '../declarative/spec.js';
-import { resolveWidgetChromeBoxViewOptions } from '../declarative/index.js';
+import { resolveWidgetChromeBoxViewOptions } from '../declarative/presentation.js';
 import { resolvePickerChromePresentation } from '../chrome/picker-chrome.js';
 import { SelectView, type SelectOption, type SelectViewSpec } from './select-view.js';
 import type { EventResult, FocusSource, Size } from '../view.js';

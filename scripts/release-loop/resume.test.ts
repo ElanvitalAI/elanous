@@ -3,13 +3,21 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGraph, STOPPED_NODE_ERROR, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { decideGraphApproval, runGraph, STOPPED_NODE_ERROR, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { Command } from 'commander';
 import { registerReleaseCommands } from '../../src/cli/release-cli.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
-import { resumeReleaseRun } from './resume-release.js';
+import { resumeReleaseRun as runResumeReleaseRun } from './resume-release.js';
+const resumeReleaseRun: typeof runResumeReleaseRun = (opts, deps = {}) => runResumeReleaseRun(opts, {
+  ...deps, macrophageInventory: deps.macrophageInventory ?? (() => []),
+});
 import { debug } from '../../src/debug/log.js';
 import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeGatePodPool, releaseResumeWaiver } from './resume.js';
+import { readWaiverEvents } from '../../src/release-loop/waiver-events.js';
+import { BLOCKING_METRIC_NAMES } from './auto-approve-node.js';
+import { runPublish } from './publish-node.js';
+import { runKnownIssues } from './known-issues-node.js';
+import type { GraphContext } from './node-verdict.js';
 import './resume-test-traffic.js';
 
 // End-to-end release graph fixtures can exceed Bun's default under parallel gate-test load.
@@ -143,33 +151,41 @@ if (process.argv[2] === 'rev-list') console.log('0');
 test('a waived tui whose recorded failure has exit null (killed or timed out) still carries the waiver reason into public notes when the model is unavailable', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-waiver-exit-null-'));
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
-  const bin = join(root, 'bin');
   const docsTree = join(root, 'docs-tree');
   const notes = join(docsTree, 'release/public/docs/releases', `${VERSION}.md`);
-  const runBash = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+  const waiverReason = 'The app may remain open after an interrupted launch';
+  const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
     const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     if (ctx.nodeId === 'tui') return { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}\n', stderr: '' };
     if (ctx.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${VERSION}`, worktree: docsTree }) + '\n', stderr: '' };
     if (ctx.nodeId === 'known-issues') {
-      const child = spawnSync('bash', ['-c', body], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...opts.env, PATH: `${bin}:${process.env.PATH}` } });
-      return { exitCode: child.status ?? 2, stdout: child.stdout, stderr: child.stderr };
+      const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as GraphContext;
+      const previousStateDir = process.env.ELANOUS_STATE_DIR;
+      const previousGraphContext = process.env.ELANOUS_GRAPH_CONTEXT;
+      process.env.ELANOUS_STATE_DIR = opts.env!.ELANOUS_STATE_DIR;
+      process.env.ELANOUS_GRAPH_CONTEXT = opts.env!.ELANOUS_GRAPH_CONTEXT;
+      try {
+        const result = runKnownIssues(context, (command, args) => ({
+          status: command === 'elanous' ? 3 : 0, stdout: args[0] === 'rev-list' ? '0\n' : '',
+          stderr: command === 'elanous' ? 'model unavailable' : '',
+        }));
+        return { exitCode: 0, stdout: JSON.stringify(result) + '\n', stderr: '' };
+      } finally {
+        if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+        else process.env.ELANOUS_STATE_DIR = previousStateDir;
+        if (previousGraphContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+        else process.env.ELANOUS_GRAPH_CONTEXT = previousGraphContext;
+      }
     }
     return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
   };
   const git = (args: string[]) => args[0] === 'ls-remote' ? `${SHA}\trefs/heads/release/${VERSION}` : args[0] === 'rev-parse' ? SHA : '';
   try {
     mkdirSync(join(docsTree, 'release/public/docs/releases'), { recursive: true });
-    mkdirSync(bin);
-    // The model is unavailable: every ask exits non-zero.
-    writeFileSync(join(bin, 'elanous'), '#!/usr/bin/env node\nprocess.exit(3);\n');
-    writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
-if (process.argv[2] === 'rev-list') console.log('0');
-`);
-    chmodSync(join(bin, 'elanous'), 0o755);
-    chmodSync(join(bin, 'git'), 0o755);
     writeFileSync(notes, '# Release\n');
-    const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18' }, deps: { root, runBash } });
+    const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18',
+      acceptedRegressions: [{ id: 'R2', note: 'Settings do not persist' }] }, deps: { root, runBash } });
     expect(first.status).toBe('failed');
     expect(first.path.slice(-3)).toEqual(['tui', 'traffic-failed-restore', 'failed']);
     // A killed or timed-out node is recorded with exit null; rewrite the saved ledger to that shape.
@@ -179,10 +195,11 @@ if (process.argv[2] === 'rev-list') console.log('0');
     expect(failedTui).toMatchObject({ ok: false, executed: true });
     failedTui.exit = null;
     writeFileSync(stateFile, `${JSON.stringify(saved, null, 2)}\n`);
-    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'tui', reason: 'Help does not close when requested' }, { root, graphPath, git, runBash });
+    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'tui', reason: waiverReason }, { root, graphPath, git, runBash });
     expect(resumed.state.status).toBe('done');
     expect(resumed.state.nodes.find((node) => node.nodeId === 'tui')).toMatchObject({ ok: true, executed: false, waiver: { original: { exit: null } } });
-    expect(readFileSync(notes, 'utf8')).toContain('- Help does not close when requested.');
+    expect(readFileSync(notes, 'utf8')).toContain(`- ${waiverReason}.`);
+    expect(readFileSync(notes, 'utf8')).toContain('- Known issues have been reported for this release.');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -220,7 +237,7 @@ test('accepted regressions without a waiver are persisted and delivered to the g
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('rerunning a waived tui without waiver retires only its recorded issue before known-issues', async () => {
+test('a waived tui keeps its recorded issue while failed publish waits at approve-continue', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-retire-waiver-'));
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   const docsTree = join(root, 'docs-tree');
@@ -263,24 +280,20 @@ test('rerunning a waived tui without waiver retires only its recorded issue befo
       acceptedRegressions: [{ id: 'R2', note: 'Settings do not persist' }] }, deps: { root, runBash } });
     expect(first.path.slice(-3)).toEqual(['tui', 'traffic-failed-restore', 'failed']);
     const waived = await resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'tui', reason: 'Help does not close when requested' }, deps);
-    expect(waived.state.status).toBe('failed');
+    expect(waived.state.status).toBe('awaiting-approval');
+    expect(waived.state.pending?.nodeId).toBe('approve-continue');
     expect(waived.state.path).toContain('known-issues');
     expect((waived.state.input as { acceptedRegressions: unknown[] }).acceptedRegressions).toHaveLength(2);
-    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'tui' }, deps);
-    expect(resumed.state.status).toBe('done');
-    expect(tuiVisits).toBe(2);
+    expect(tuiVisits).toBe(1);
     expect(seen.filter((ctx) => ctx.nodeId === 'known-issues').at(-1)?.input.acceptedRegressions).toEqual([
       { id: 'R2', note: 'Settings do not persist' },
+      { id: 'waive:tui', note: 'Help does not close when requested' },
     ]);
-    expect((resumed.state.input as { acceptedRegressions: unknown[] }).acceptedRegressions).toEqual([{ id: 'R2', note: 'Settings do not persist' }]);
-    expect(resumed.state.nodes.find((node) => node.nodeId === 'tui')?.waiver).toBeUndefined();
-    const saved = JSON.parse(readFileSync(join(root, 'graph-runs/release-loop', `${first.runId}.json`), 'utf8')) as GraphRunState;
-    expect(saved.input).toEqual(resumed.state.input);
-    expect(readFileSync(notes, 'utf8')).not.toContain('Help does not close when requested');
+    expect(waived.state.nodes.find((node) => node.nodeId === 'tui')?.waiver).toMatchObject({ reason: 'Help does not close when requested' });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('restarting before a waived tui (from mac-smoke) drops the waiver record and its accepted issue together', async () => {
+test('restarting before a waived tui (from mac-smoke) keeps its issue while publish awaits approval', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-retire-waiver-earlier-'));
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   const docsTree = join(root, 'docs-tree');
@@ -300,48 +313,108 @@ test('restarting before a waived tui (from mac-smoke) drops the waiver record an
       if (docsVisits === 2) writeFileSync(notes, '# Release\n');
       return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${VERSION}`, worktree: docsTree }), stderr: '' };
     }
-    if (ctx.nodeId === 'known-issues') {
-      const result = spawnSync('bash', ['-c', _body], {
-        cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...opts.env, PATH: `${join(root, 'bin')}:${process.env.PATH}` },
-      });
-      return { exitCode: result.status ?? 2, stdout: result.stdout, stderr: result.stderr };
-    }
+    if (ctx.nodeId === 'known-issues') return { exitCode: 0,
+      stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'known-issues fixture', count: 1 }) + '\n', stderr: '' };
     if (ctx.nodeId === 'publish' && docsVisits === 1) return { exitCode: 1, stdout: '{"outcome":"fail"}', stderr: '' };
     return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}', stderr: '' };
   };
   const git = (args: string[]) => args[0] === 'ls-remote' ? `${SHA}\trefs/heads/release/${VERSION}` : args[0] === 'rev-parse' ? SHA : '';
   try {
     mkdirSync(join(docsTree, 'release/public/docs/releases'), { recursive: true });
-    mkdirSync(join(root, 'bin'));
-    writeFileSync(join(root, 'bin/git'), '#!/usr/bin/env node\nif (process.argv[2] === "rev-list") console.log("0");\n');
-    writeFileSync(join(root, 'bin/elanous'), '#!/usr/bin/env node\nconsole.log(JSON.stringify({reply: JSON.stringify([{ id: "R2", bullet: "Settings do not persist after restarting." }])}));\n');
-    chmodSync(join(root, 'bin/git'), 0o755);
-    chmodSync(join(root, 'bin/elanous'), 0o755);
     writeFileSync(notes, '# Release\n');
     const deps = { root, graphPath, git, runBash };
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18',
       acceptedRegressions: [{ id: 'R2', note: 'Settings do not persist' }] }, deps: { root, runBash } });
     expect(first.path.slice(-3)).toEqual(['tui', 'traffic-failed-restore', 'failed']);
     const waived = await resumeReleaseRun({ runId: first.runId, from: 'tui', waive: 'tui', reason: 'Help does not close when requested' }, deps);
-    expect(waived.state.status).toBe('failed');
+    expect(waived.state.status).toBe('awaiting-approval');
+    expect(waived.state.pending?.nodeId).toBe('approve-continue');
     expect(waived.state.path).toContain('known-issues');
     expect((waived.state.input as { acceptedRegressions: unknown[] }).acceptedRegressions).toHaveLength(2);
     expect(waived.state.path.indexOf('pre-prepare-join')).toBeGreaterThanOrEqual(0);
     expect(waived.state.path.indexOf('pre-prepare-join')).toBeLessThan(waived.state.path.indexOf('tui'));
     expect(Object.values(waived.state.fanOuts ?? {}).some((fanout) => fanout.from === 'traffic-gate-passed'
       && Object.hasOwn(fanout.branches, 'mac-smoke') && Object.hasOwn(fanout.branches, 'pwa'))).toBe(true);
-    const resumed = await resumeReleaseRun({ runId: first.runId, from: 'pre-prepare-join' }, deps);
-    expect(resumed.state.status).toBe('done');
-    expect(tuiVisits).toBe(2);
+    expect(tuiVisits).toBe(1);
     expect(seen.filter((ctx) => ctx.nodeId === 'known-issues').at(-1)?.input.acceptedRegressions).toEqual([
       { id: 'R2', note: 'Settings do not persist' },
+      { id: 'waive:tui', note: 'Help does not close when requested' },
     ]);
-    expect((resumed.state.input as { acceptedRegressions: unknown[] }).acceptedRegressions).toEqual([{ id: 'R2', note: 'Settings do not persist' }]);
-    expect(resumed.state.nodes.find((node) => node.nodeId === 'tui')?.waiver).toBeUndefined();
-    const saved = JSON.parse(readFileSync(join(root, 'graph-runs/release-loop', `${first.runId}.json`), 'utf8')) as GraphRunState;
-    expect(saved.input).toEqual(resumed.state.input);
-    expect(readFileSync(notes, 'utf8')).not.toContain('Help does not close when requested');
+    expect(waived.state.nodes.find((node) => node.nodeId === 'tui')?.waiver).toMatchObject({ reason: 'Help does not close when requested' });
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test.each(['partial', 'unknown'] as const)('real publish entrypoint routes %s publication to approval and resumes the same run at npm-publish', async (publication) => {
+  const root = mkdtempSync(join(tmpdir(), `release-publish-${publication}-`));
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const version = '0.2.19';
+  const commit = SHA;
+  let publishCalls = 0;
+  let npmPublishCalls = 0;
+  const previousGraphContext = process.env.ELANOUS_GRAPH_CONTEXT;
+  const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+    const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as {
+      nodeId: string; runId: string; input: Record<string, unknown>; outputs: Record<string, Record<string, unknown>>;
+    };
+    if (context.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version, commit, branch: `release/${version}` }), stderr: '' };
+    if (context.nodeId === 'prepare') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit, out: root }), stderr: '' };
+    if (context.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${version}` }), stderr: '' };
+    if (context.nodeId === 'tui') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', regress: { pass: 7, fail: 0,
+      results: Array.from({ length: 7 }, (_, index) => ({ id: `R${index + 1}`, title: 'check', ok: true, reason: 'measured' })) } }), stderr: '' };
+    if (context.nodeId === 'auto-approve') return { exitCode: 0, stdout: JSON.stringify({
+      outcome: 'ok', runId: context.runId, decidedBy: 'release-loop metrics',
+      tuiSubcheck: { runId: context.runId, level: 'ok', fail: 0, failedCheckIds: [], approvalRequired: false },
+      metrics: [...BLOCKING_METRIC_NAMES.map((name) => ({ name, verdict: 'pass' })),
+        { name: 'tui-regress', verdict: 'pass' }, { name: 'mac-smoke', verdict: 'pass' }],
+    }), stderr: '' };
+    if (context.nodeId === 'publish') {
+      publishCalls++;
+      process.env.ELANOUS_GRAPH_CONTEXT = opts.env!.ELANOUS_GRAPH_CONTEXT;
+      try {
+        const result = runPublish((command, args) => {
+          if (command === 'git') return { status: 0, stdout: args[1]?.endsWith('pages.json') ? '{"pages":[]}' : `# ${version}\n\nRelease notes\n`, stderr: '' };
+          if (command === 'bun' && args[0] === 'bin/elanous.mjs') return { status: 0, stdout: JSON.stringify(publication === 'partial'
+            ? { published: true, ok: false, tag: `v${version}`, error: 'asset inventory incomplete' }
+            : { ok: false, error: 'publish response missing' }), stderr: '' };
+          throw new Error(`unexpected publish boundary: ${command} ${args.join(' ')}`);
+        }, root, undefined, root);
+        return { exitCode: 0, stdout: JSON.stringify(result), stderr: '' };
+      } finally {
+        if (previousGraphContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+        else process.env.ELANOUS_GRAPH_CONTEXT = previousGraphContext;
+      }
+    }
+    if (context.nodeId === 'npm-publish') {
+      npmPublishCalls++;
+      return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}', stderr: '' };
+    }
+    return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}', stderr: '' };
+  };
+  try {
+    const deps = { root, runBash };
+    const first = await runGraph(graphPath, { input: { version, previousVersion: '0.2.18', branchCut: true }, deps });
+    expect(first.status).toBe('awaiting-approval');
+    expect(first.pending?.nodeId).toBe('approve-continue');
+    expect(first.path.at(-2)).toBe('publish');
+    const publishRecord = first.nodes.find((node) => node.nodeId === 'publish');
+    expect(JSON.parse(String(publishRecord?.output))).toMatchObject(publication === 'partial'
+      ? { outcome: 'partial', partialPublish: { published: true } }
+      : { outcome: 'unknown', partialPublish: { published: 'unknown' } });
+    expect(publishCalls).toBe(1);
+    expect(npmPublishCalls).toBe(0);
+
+    decideGraphApproval(first.graphId, first.runId, 'approved', 'human', root);
+    const resumed = await runGraph(graphPath, { resumeRunId: first.runId, deps });
+    expect(resumed.status).toBe('done');
+    expect(resumed.runId).toBe(first.runId);
+    expect(resumed.path.filter((nodeId) => nodeId === 'publish')).toHaveLength(1);
+    expect(publishCalls).toBe(1);
+    expect(npmPublishCalls).toBe(1);
+  } finally {
+    if (previousGraphContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previousGraphContext;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('release resume CLI validates waiver JSON and pairing before opening a saved run, preserving JSON error exit', async () => {
@@ -546,6 +619,10 @@ test('release resume CLI owner waiver runs a valid malformed-schema gate through
     const result = await invoke(['--owner-waive', 'gate', '--approved-by', 'OP', '--reason', reason]);
     expect(result).toMatchObject({ ok: true, status: 'done' });
     const saved = JSON.parse(readFileSync(first.statePath, 'utf8')) as GraphRunState;
+    expect(readWaiverEvents(join(root, 'review-results', 'waiver-events.jsonl'))).toMatchObject([
+      { kind: 'gate', target: `run:${first.runId}`, head: cutTip, actor: 'OP', uses: 1, expiredBy: 'used',
+        evidence: expect.arrayContaining([expect.stringContaining('Known gate failures remain')]) },
+    ]);
     expect(saved.path).toContain('publish');
     const gate = saved.nodes.find((node) => node.nodeId === 'gate');
     expect(JSON.parse(String(gate?.output))).toMatchObject({ outcome: 'ok', verdict: 'owner-waived', approvedBy: 'OP', reason });

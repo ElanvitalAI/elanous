@@ -17,6 +17,7 @@ const { configuredOpenGatewayKeys } = await import('../src/llm/provider-credenti
 const { detectProviders } = await import('../src/llm/provider-detect.js');
 const { debug } = await import('../src/debug/log.js');
 const { defaultChildLlmModel, resolveImplementationChildModel } = await import('../src/self-dev/dev-cli.js');
+const { createFakeFetchDevice } = await import('../src/ux-sim/fake-fetch.js');
 _resetKeyCacheForTests();
 
 test('configured OpenGateway key counts as a named child credential', () => {
@@ -24,22 +25,22 @@ test('configured OpenGateway key counts as a named child credential', () => {
   expect(configuredOpenGatewayKeys({ provider: 'openai', apiKey: 'unrelated-key' })).toEqual([]);
 });
 
-let originalFetch: typeof fetch;
+let fetchDevice: ReturnType<typeof createFakeFetchDevice>;
 let request: { url: string; authorization: string | null; model: string; stream_options?: unknown; body: Record<string, unknown> } | null;
 beforeEach(() => {
   request = null;
-  originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body)) as { model: string; stream_options?: unknown };
-    request = { url: String(input), authorization: new Headers(init?.headers).get('authorization'), model: body.model, stream_options: body.stream_options, body };
+  fetchDevice = createFakeFetchDevice([{
+    url: OPENGATEWAY_API_URL, method: 'POST', response: (call) => {
+    const body = JSON.parse(call.body ?? 'null') as { model: string; stream_options?: unknown };
+    request = { url: call.url, authorization: call.headers.authorization ?? null, model: body.model, stream_options: body.stream_options, body };
     const bytes = new TextEncoder().encode('data:{"choices":[{"delta":{"content":"hello"}}]}\n\n'
       + 'data:{"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":1}}\n\n'
       + 'data:[DONE]\n\n');
     return new Response(new ReadableStream({ start(controller) { controller.enqueue(bytes); controller.close(); } }),
       { status: 200, headers: { 'content-type': 'text/event-stream' } });
-  }) as typeof fetch;
+  } }]);
 });
-afterEach(() => { globalThis.fetch = originalFetch; });
+afterEach(() => { fetchDevice.restore(); });
 afterAll(() => {
   _resetKeyCacheForTests();
   if (priorCacheDir === undefined) delete process.env.ELANOUS_KEY_CACHE_DIR; else process.env.ELANOUS_KEY_CACHE_DIR = priorCacheDir;

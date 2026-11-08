@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tools: pty_shell_{start, poll, send, kill}
 //
 // Long-running interactive process support for skills that need
@@ -18,7 +19,7 @@
 import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { ALLOWED_TERM_NAMES, getPty, listPty, ptyAvailable, startPty, unregisterPty } from '../../pty-shell/registry.js';
 // listPty is imported above — re-exported here via dispatchPtyShellList so
 // callers don't need to reach into pty-shell/registry.ts.

@@ -4,10 +4,7 @@
 // tool-call support. No fetch dependency.
 
 import { describe, test, expect } from 'bun:test';
-import {
-  parseOpenAISSELines, parseAnthropicSSELines, streamLLMWithTools, observeRequestTools,
-  type LLMStreamEvent, type LLMProvider, type LLMMessage,
-} from '../src/llm.js';
+import { parseOpenAISSELines, parseAnthropicSSELines, streamLLMWithTools, observeRequestTools, type LLMStreamEvent, type LLMProvider, type LLMMessage } from '../src/llm.js';
 import { compactForLog, debug } from '../src/debug/log.js';
 
 async function collect(gen: AsyncGenerator<LLMStreamEvent, void, unknown>): Promise<LLMStreamEvent[]> {

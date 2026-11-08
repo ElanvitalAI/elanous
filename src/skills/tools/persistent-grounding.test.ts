@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +6,7 @@ import type { CoreTurnContext } from '../../core-turn/types.js';
 import type { GoalLoopResult } from '../../core-turn/run-goal-loop.js';
 import { runGoalLoop } from '../../core-turn/run-goal-loop.js';
 import { debug } from '../../debug/log.js';
+import { withFakeFetchDevice } from '../../ux-sim/fake-fetch.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
 import { findNativeTool } from '../../native-tool-catalog.js';
 import {
@@ -654,11 +655,11 @@ describe('persistent grounding', () => {
     const originalXdg = process.env.XDG_CONFIG_HOME;
     const requests: Record<string, unknown>[] = [];
     const finished: Record<string, unknown>[] = [];
-    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    await withFakeFetchDevice([{ url: '/api/v1/chat/completions', method: 'POST', response: request => {
+      requests.push(JSON.parse(String(request.body)) as Record<string, unknown>);
       return new Response('data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
         { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }) as typeof fetch);
+    } }], async (device) => {
     try {
       delete process.env.XDG_CONFIG_HOME;
       process.env.OPENROUTER_API_KEY = 'test-key';
@@ -671,8 +672,8 @@ describe('persistent grounding', () => {
       expect(finished).toHaveLength(1);
       expect(requests[0]?.model).toBe('z-ai/glm-5.3');
       expect(finished[0]).toMatchObject({ provider: 'openrouter', model: `openrouter/${requests[0]?.model}` });
+      expect(device.calls().length).toBeGreaterThan(0);
     } finally {
-      fetchMock.mockRestore();
       debug.log = originalLog;
       resetElanousConfigDir();
       if (originalKey === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = originalKey;
@@ -680,6 +681,7 @@ describe('persistent grounding', () => {
       rmSync(root, { recursive: true, force: true });
       rmSync(configRoot, { recursive: true, force: true });
     }
+    });
   });
 
   test('근거 루프는 자식 기본 모델 대신 planning 역할 모델을 모든 턴에 전달한다', async () => {

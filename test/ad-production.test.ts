@@ -1,4 +1,7 @@
 import { expect, spyOn, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import ts from 'typescript';
 import { debug } from '../src/debug/log.js';
 import type { LogRecord } from '../src/mss/logging/record.js';
 import { assessCaptionScreens, createAdPipelineDeps, createAdPipelinePlan, PRODUCTION_STEPS, runAdPipeline, unpricedReason, type AdPipelineDeps, type AdProductionDeps } from '../src/ad-pipeline/run.js';
@@ -10,6 +13,49 @@ import type { SceneSpec } from '../src/ad-pipeline/scene-spec.js';
 type DebugEvent = { category: string; event: string; data?: Record<string, unknown> };
 
 const testRewriteVoiceover = async (input: { readonly beatDurations: readonly number[] }): Promise<readonly string[]> => input.beatDurations.map((_, index) => `새 문장 ${index + 1}`);
+
+function runtimeImports(filePath: string, text = readFileSync(filePath, 'utf8')): string[] {
+  const source = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true);
+  return source.statements.flatMap((statement) => {
+    if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
+      const clause = statement.importClause;
+      const hasRuntimeBinding = !clause?.isTypeOnly && (clause === undefined || clause.name !== undefined
+        || (clause.namedBindings && (ts.isNamespaceImport(clause.namedBindings)
+          || clause.namedBindings.elements.some((element) => !element.isTypeOnly))));
+      return hasRuntimeBinding ? [statement.moduleSpecifier.text] : [];
+    }
+    if (ts.isExportDeclaration(statement) && statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier)) {
+      const hasRuntimeBinding = !statement.isTypeOnly && (!statement.exportClause
+        || ts.isNamespaceExport(statement.exportClause)
+        || statement.exportClause.elements.some((element) => !element.isTypeOnly));
+      return hasRuntimeBinding ? [statement.moduleSpecifier.text] : [];
+    }
+    return [];
+  });
+}
+
+test('production readiness uses a shared contract without a runtime import cycle', () => {
+  const productionImports = runtimeImports(resolve(import.meta.dir, '../src/ad-pipeline/production.ts'));
+  const runImports = runtimeImports(resolve(import.meta.dir, '../src/ad-pipeline/run.ts'));
+
+  expect(productionImports).toContain('./production-contract.js');
+  expect(productionImports).not.toContain('./run.js');
+  expect(runImports).toContain('./production.js');
+  expect(runImports).toContain('./production-contract.js');
+});
+
+test('runtime import scanner includes side effects and runtime re-exports but ignores type-only edges', () => {
+  const imports = runtimeImports('fixture.ts', [
+    'import "./side-effect.js";',
+    "import type { TypeOnly } from './type-import.js';",
+    "import { type InlineType } from './inline-type.js';",
+    "export * from './star-export.js';",
+    "export { type ReExportedType } from './type-export.js';",
+    "export { value } from './value-export.js';",
+  ].join('\n'));
+
+  expect(imports).toEqual(['./side-effect.js', './star-export.js', './value-export.js']);
+});
 
 function recordDebugEvents(): { events: DebugEvent[]; restore: () => void } {
   const events: DebugEvent[] = [];

@@ -1,5 +1,5 @@
 import { applyPaneIdToRefinement } from '../../display/hit-target.js';
-import type { DashboardMouseWiringDeps } from './mouse-wiring.js';
+import type { DashboardMouseWiringDeps } from './mouse-wiring-types.js';
 
 interface LayoutCellHit {
   widgetInstanceId: string;

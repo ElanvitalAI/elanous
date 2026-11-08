@@ -1,3 +1,4 @@
+import { textOnly } from '../llm/stream-text.js';
 // ── R2 · 적응 해상도 디깅 엔진 v1 (2026-07-06 · ROADMAP-organic-signal-engine) ──
 //
 // "필요한 순간에 해상도를 알아서 올려서" — 고영향 신호(breaking_signals의
@@ -22,7 +23,7 @@ import { recallHybrid, type HybridRecall } from './kg-recall.js';
 import { US_PULSE_DB, openPulseDb, detectNotables, loadUniverse } from './us-pulse.js';
 import { existsSync } from 'node:fs';
 import { getUserConfig } from '../user-config.js';
-import { getProviderForConfig, anyProviderAvailable, textOnly, type LLMMessage } from '../llm.js';
+import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 import { conatusPath } from './conatus-data-dir.js';
 import { hoursAgo, within } from '../time/db-window.js';
 

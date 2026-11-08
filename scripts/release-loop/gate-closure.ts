@@ -4,8 +4,8 @@
 // cannot read for sure («opaque») — is re-run. Doubt never shrinks the set: a closure we cannot build is a full gate.
 //
 // Read from the tip commit's git objects, never from the working tree (the resume can run from any checkout).
-import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { createCutSnapshot } from './gate-cut-snapshot.js';
 import { dirname, join, normalize } from 'node:path/posix';
 import ts from 'typescript';
 import { sourceCandidates } from '../../src/self-implement/importer-test-index.js';
@@ -24,6 +24,7 @@ const isTestSide = (file: string): boolean => TEST_FILE.test(file) || TEST_SIDE_
   || TEST_SIDE_NAME.test((file.split('/').pop() ?? file).replace(CODE_FILE, ''));
 /** A test-side file that lists directories or tracked files reads paths we cannot see. */
 const FS_SCAN = /\b(?:readdirSync|readdir|opendirSync|opendir|globSync|Glob|walkSync)\b|\bls-files\b/;
+const FS_READ = /\b(?:readFileSync|readFile|createReadStream|openSync|open)\s*\(/;
 /** `import(x)` / `require(x)` with a non-literal argument loads a module we cannot name. */
 const NON_LITERAL_LOAD = /(?<![.\w$])(?:import|require)\s*\(\s*(?!['"`)\s])([^)]*)\)?/g;
 /** `const NAME = "literal"` bindings — `import(NAME)` with such a NAME loads that literal. */
@@ -31,8 +32,143 @@ const CONST_STRING = /\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*(?:process\.env\.[\w$]+
 /** `import(["..", "x", "y.js"].join("/"))` — a specifier spelled as joined literals. */
 const JOINED_IMPORT = /(?<![.\w$])import\s*\(\s*\[((?:\s*"[^"\n]*"\s*,?)+)\]\.join\(\s*"([^"\n]*)"\s*\)\s*\)/g;
 /** Process launches — a file that has one may run a repo path it names. */
-const SPAWNS = /(?<![\w$])(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork|Bun\.spawn|Bun\.spawnSync|Bun\.\$)\s*[(`]/;
+const SPAWN_CANDIDATE = /(?<![\w$])(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork|Bun\.spawn|Bun\.spawnSync|Bun\.\$)\s*[\x60(]|(?:node:)?child_process\b/;
 const LITERAL = /(['"`])((?:(?!\1)[^\n\\])*)\1/g;
+
+const PROCESS_MODULES = new Set(['child_process', 'node:child_process']);
+const PROCESS_APIS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
+function hasCommandSpawn(code: string, file: string): boolean {
+  if (!SPAWN_CANDIDATE.test(code)) return false;
+  const kind = /\.tsx?$/.test(file) ? (file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS) : ts.ScriptKind.JS;
+  const ast = ts.createSourceFile(file, code, ts.ScriptTarget.Latest, true, kind);
+  const direct = new Set<string>(), namespaces = new Set<string>(), declared = new Set<string>();
+  const uncertainImports = new Set<string>(), nonProcessValues = new Set<string>(), nonProcessFunctions = new Set<string>();
+  const knownTypes = new Set<string>();
+  const addBinding = (name: ts.BindingName): void => {
+    if (ts.isIdentifier(name)) declared.add(name.text);
+    else for (const item of name.elements) if (ts.isBindingElement(item)) addBinding(item.name);
+  };
+  const isProcessModule = (node: ts.Expression): boolean => ts.isStringLiteralLike(node) && PROCESS_MODULES.has(node.text);
+  const knownType = (node: ts.TypeNode | undefined): boolean => {
+    if (!node) return false;
+    if (ts.isTypeReferenceNode(node)) {
+      let root = node.typeName;
+      while (ts.isQualifiedName(root)) root = root.left;
+      return knownTypes.has(root.text);
+    }
+    if (ts.isUnionTypeNode(node) || ts.isIntersectionTypeNode(node)) return node.types.every(knownType);
+    return false;
+  };
+  const collect = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier) && node.importClause) {
+      const processModule = PROCESS_MODULES.has(node.moduleSpecifier.text), localModule = node.moduleSpecifier.text.startsWith('.');
+      const bindings = node.importClause;
+      if (bindings.name) {
+        declared.add(bindings.name.text);
+        if (processModule) namespaces.add(bindings.name.text);
+        else if (localModule) knownTypes.add(bindings.name.text);
+      }
+      if (bindings.namedBindings && ts.isNamespaceImport(bindings.namedBindings)) {
+        declared.add(bindings.namedBindings.name.text);
+        if (processModule) namespaces.add(bindings.namedBindings.name.text);
+        else if (localModule) knownTypes.add(bindings.namedBindings.name.text);
+      }
+      if (bindings.namedBindings && ts.isNamedImports(bindings.namedBindings)) for (const item of bindings.namedBindings.elements) {
+        const imported = item.propertyName?.text ?? item.name.text, alias = item.name.text;
+        declared.add(alias);
+        if (processModule && PROCESS_APIS.has(imported)) direct.add(alias);
+        else if (PROCESS_APIS.has(imported)) uncertainImports.add(alias);
+        if (localModule) knownTypes.add(alias);
+      }
+    }
+    if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)
+      && node.moduleReference.expression && isProcessModule(node.moduleReference.expression)) {
+      declared.add(node.name.text); namespaces.add(node.name.text);
+    }
+    if (ts.isVariableDeclaration(node)) {
+      addBinding(node.name);
+      if (ts.isIdentifier(node.name)) {
+        if (knownType(node.type) || (node.initializer && ts.isNewExpression(node.initializer)
+          && ts.isIdentifier(node.initializer.expression) && knownTypes.has(node.initializer.expression.text))) nonProcessValues.add(node.name.text);
+        if (node.initializer && ts.isIdentifier(node.initializer)) {
+          const from = node.initializer.text;
+          if (direct.has(from)) direct.add(node.name.text);
+          if (uncertainImports.has(from)) uncertainImports.add(node.name.text);
+          if (namespaces.has(from)) namespaces.add(node.name.text);
+          if (nonProcessValues.has(from)) nonProcessValues.add(node.name.text);
+        }
+        if (node.initializer && ts.isPropertyAccessExpression(node.initializer) && ts.isIdentifier(node.initializer.expression)
+          && namespaces.has(node.initializer.expression.text) && PROCESS_APIS.has(node.initializer.name.text)) direct.add(node.name.text);
+      }
+      if (node.initializer && ts.isIdentifier(node.initializer) && ts.isObjectBindingPattern(node.name)
+        && namespaces.has(node.initializer.text)) for (const item of node.name.elements) {
+        const imported = item.propertyName && ts.isIdentifier(item.propertyName) ? item.propertyName.text
+          : ts.isIdentifier(item.name) ? item.name.text : '';
+        if (PROCESS_APIS.has(imported) && ts.isIdentifier(item.name)) direct.add(item.name.text);
+      }
+      if (node.initializer && ts.isCallExpression(node.initializer) && ts.isIdentifier(node.initializer.expression)
+        && node.initializer.expression.text === 'require' && node.initializer.arguments.length === 1
+        && isProcessModule(node.initializer.arguments[0]!)) {
+        if (ts.isIdentifier(node.name)) namespaces.add(node.name.text);
+        else for (const item of node.name.elements) if (ts.isBindingElement(item)) {
+          const imported = item.propertyName && ts.isIdentifier(item.propertyName) ? item.propertyName.text
+            : ts.isIdentifier(item.name) ? item.name.text : '';
+          if (PROCESS_APIS.has(imported) && ts.isIdentifier(item.name)) direct.add(item.name.text);
+        }
+      }
+    }
+    if (ts.isParameter(node)) {
+      addBinding(node.name);
+      if (ts.isIdentifier(node.name) && knownType(node.type)) nonProcessValues.add(node.name.text);
+    }
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      declared.add(node.name.text); if (knownType(node.type)) nonProcessFunctions.add(node.name.text);
+    }
+    if (ts.isClassDeclaration(node) && node.name) { declared.add(node.name.text); knownTypes.add(node.name.text); }
+    if ((ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node)) && node.name) knownTypes.add(node.name.text);
+    ts.forEachChild(node, collect);
+  };
+  collect(ast);
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isTaggedTemplateExpression(node)) {
+      const tag = node.tag;
+      if (ts.isPropertyAccessExpression(tag) && ts.isIdentifier(tag.expression)
+        && tag.expression.text === 'Bun' && tag.name.text === '$') { found = true; return; }
+    }
+    if (!ts.isCallExpression(node)) { ts.forEachChild(node, visit); return; }
+    const callee = node.expression;
+    if (ts.isIdentifier(callee) && (direct.has(callee.text) || uncertainImports.has(callee.text))) found = true;
+    else if (ts.isIdentifier(callee) && PROCESS_APIS.has(callee.text) && !nonProcessValues.has(callee.text)
+      && !nonProcessFunctions.has(callee.text)) found = true;
+    else if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)
+      && callee.expression.text === 'Bun' && (callee.name.text === 'spawn' || callee.name.text === 'spawnSync' || callee.name.text === '$')) found = true;
+    else if (ts.isPropertyAccessExpression(callee) && PROCESS_APIS.has(callee.name.text)) {
+      const receiver = callee.expression;
+      if (ts.isIdentifier(receiver)) {
+        if (namespaces.has(receiver.text) || !nonProcessValues.has(receiver.text)) found = true;
+      } else if (ts.isCallExpression(receiver) && ts.isIdentifier(receiver.expression)) {
+        if (!nonProcessFunctions.has(receiver.expression.text)) found = true;
+      } else if (receiver.kind !== ts.SyntaxKind.ThisKeyword) found = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(ast);
+  return found;
+}
+function importsFileReader(code: string): boolean {
+  const imports = /\bimport\s*\{([^}]*)\}\s*from\s*(['"])(?:node:)?fs(?:\/promises)?\2/g;
+  for (const match of code.matchAll(imports)) {
+    for (const item of match[1]!.split(',')) {
+      const reader = item.trim().match(/^(?:type\s+)?(readFileSync|readFile|createReadStream|openSync|open)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/);
+      if (!reader) continue;
+      const local = reader[2] ?? reader[1]!;
+      if (new RegExp(`(?<![\\w$])${local}\\s*\\(`).test(code)) return true;
+    }
+  }
+  return false;
+}
 /** An npm package specifier (`x`, `x/sub`, `@scope/x/sub`). */
 const PACKAGE_NAME = /^(?:@[a-z0-9][\w.~-]*\/)?[a-z0-9][\w.~-]*(?:\/[^\s]*)?$/i;
 const SUFFIXES = ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'];
@@ -40,6 +176,8 @@ const SUFFIXES = ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'];
 export interface ClosureTree {
   /** Every tracked path at the tip. */
   files: readonly string[];
+  /** Optional roots for a forward-only graph. `files` remains the complete resolver/tracked inventory. */
+  roots?: readonly string[];
   /** Content at the tip (code files only are asked for); undefined = unreadable. */
   read: (path: string) => string | undefined;
   /** bun test preload files (bunfig.toml `[test].preload`), repo-relative. */
@@ -59,6 +197,8 @@ function loaderOf(file: string): 'ts' | 'tsx' | 'js' {
 export interface ClosureOptions {
   /** CLI entry files a production literal does not make a dependency of (help text, child command builders). */
   cliEntries?: readonly string[];
+  /** Shadow-only candidate: omit require edges found only inside functions; callers must retain the current verdict. */
+  omitFunctionLocalRequires?: boolean;
 }
 
 export interface ClosureGraph {
@@ -107,7 +247,12 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
   const selfStaticImports = new Set<string>();
   const opaque = new Map<string, string>();
   const blindAs = (file: string, why: string): void => { if (!opaque.has(file)) opaque.set(file, why); };
-  for (const file of tree.files) {
+  const scanQueue = [...(tree.roots ?? tree.files)];
+  const scanned = new Set<string>();
+  for (let scanIndex = 0; scanIndex < scanQueue.length; scanIndex++) {
+    const file = scanQueue[scanIndex]!;
+    if (scanned.has(file)) continue;
+    scanned.add(file);
     if (!CODE_FILE.test(file)) continue;
     const text = tree.read(file);
     if (text === undefined) { blindAs(file, 'unreadable'); continue; }
@@ -119,8 +264,47 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
     let code: string;
     try {
       const source = text.replace(/^#![^\n]*/, '');
-      specs = [...transpilers[loaderOf(file)].scanImports(source)];
-      code = transpilers[loaderOf(file)].transformSync(source).replace(JOINED_IMPORT, (_all, items: string, separator: string) => {
+      code = transpilers[loaderOf(file)].transformSync(source);
+      if (options.omitFunctionLocalRequires && !testSide) {
+        // Find and mask against the same transformed text consumed below. TS erases declarations/comments before
+        // emitting code, so source offsets cannot safely be applied to the transformed closure text.
+        const ast = ts.createSourceFile(file, code, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+        const local: Array<{ start: number; end: number; spec: string }> = [];
+        const topLevelSpecs = new Set<string>();
+        const collect = (node: ts.Node, inFunction: boolean): void => {
+          if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'require'
+            && node.arguments.length === 1 && ts.isStringLiteralLike(node.arguments[0]!)) {
+            const spec = node.arguments[0]!.text;
+            if (inFunction) local.push({ start: node.getStart(ast), end: node.end, spec }); else topLevelSpecs.add(spec);
+          }
+          ts.forEachChild(node, (child) => collect(child, inFunction || ts.isFunctionLike(node)));
+        };
+        collect(ast, false);
+        const omit = local.filter(({ spec }) => !topLevelSpecs.has(spec));
+        if (omit.length) {
+          const chars = code.split('');
+          for (const { start, end } of omit) {
+            for (let index = start; index < end; index++) if (chars[index] !== '\n' && chars[index] !== '\r') chars[index] = ' ';
+            chars[start] = '0';
+          }
+          code = chars.join('');
+          const omittedCounts = new Map<string, number>();
+          for (const { spec } of omit) omittedCounts.set(spec, (omittedCounts.get(spec) ?? 0) + 1);
+          specs = [...transpilers[loaderOf(file)].scanImports(source)].filter((item) => {
+            if (item.kind !== 'require-call') return true;
+            const count = omittedCounts.get(item.path) ?? 0;
+            if (count === 0) return true;
+            omittedCounts.set(item.path, count - 1);
+            return false;
+          });
+        } else {
+          specs = [...transpilers[loaderOf(file)].scanImports(source)];
+        }
+      } else {
+        // Preserve the existing selector's source-based import radius; emitted JS may erase unused TS value imports.
+        specs = [...transpilers[loaderOf(file)].scanImports(source)];
+      }
+      code = code.replace(JOINED_IMPORT, (_all, items: string, separator: string) => {
         const joined = [...items.matchAll(/"([^"\n]*)"/g)].map((item) => item[1]).join(separator);
         specs.push({ path: joined, kind: 'dynamic-import' });
         return `import(${JSON.stringify(joined)})`;
@@ -139,6 +323,9 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
       if (hit) specs.push({ path: bound, kind: 'dynamic-import' }); else blindAs(file, `unresolved import ${bound}`);
     }
     if (testSide && FS_SCAN.test(code)) blindAs(file, `scans (${FS_SCAN.exec(code)?.[0]})`);
+    // A code module may execute a repo script through a command or argument assembled at runtime. Its target is not
+    // necessarily recoverable from literal-path edges, so importing tests must rerun after source changes.
+    if (hasCommandSpawn(text, file)) blindAs(file, 'spawns a command with an opaque repo input');
     const eager = new Set<string>();
     for (const { path: spec, kind } of specs) {
       let hit: string | undefined;
@@ -171,7 +358,7 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
       // A path naming another test file is runner input (a list, a fixture string), not code this file loads.
       if (hit) {
         // A production file that names the CLI entry but spawns nothing only prints it (help text, a goal's command line).
-        const printsOnly = (options.cliEntries ?? []).includes(hit) && !SPAWNS.test(code);
+        const printsOnly = (options.cliEntries ?? []).includes(hit) && !hasCommandSpawn(text, file);
         if (!TEST_FILE.test(hit) && (testSide || !printsOnly)) edges.add(hit);
         continue;
       }
@@ -183,18 +370,28 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
       // is all we see — and a code file we cannot find is a path we miss.
       else if (CODE_FILE.test(plain) && !TEST_FILE.test(plain)) blindAs(file, `unresolved path ${plain}`);
     }
+    // A code module may read a repo fixture through a variable, member access, or helper call. Literal edges above
+    // are useful evidence, but cannot prove that every read's runtime-selected path is covered. Mark the module
+    // opaque so tests importing it are rerun when source inputs change.
+    if (FS_READ.test(code) || importsFileReader(code) || /\brequire\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)/.test(code))
+      blindAs(file, 'reads a file through an opaque path');
     if (eager.has(file)) selfStaticImports.add(file);
     edges.delete(file);
     eager.delete(file);
     forward.set(file, [...edges]);
     staticImports.set(file, [...eager]);
+    if (tree.roots) scanQueue.push(...edges);
   }
   return { forward, staticImports, selfStaticImports, opaque, tracked };
 }
 
 /** The tests among `tests` that can reach any of `changed` (code files) — or whose closure is opaque. */
 export function testsReachingChanged(tree: ClosureTree, changed: readonly string[], tests: readonly string[], options: ClosureOptions = {}): ClosureVerdict {
-  const { forward, staticImports, opaque, tracked } = buildClosureGraph(tree, options);
+  return testsReachingChangedFromGraph(tree, changed, tests, buildClosureGraph(tree, options));
+}
+
+function testsReachingChangedFromGraph(tree: ClosureTree, changed: readonly string[], tests: readonly string[], graph: ClosureGraph): ClosureVerdict {
+  const { forward, staticImports, opaque, tracked } = graph;
   const reverse = new Map<string, string[]>();
   for (const [from, edges] of forward) for (const to of edges) {
     const list = reverse.get(to);
@@ -236,6 +433,59 @@ export function testsReachingChanged(tree: ClosureTree, changed: readonly string
 // ledger is derived from content alone — no file, clock, or network effects.
 
 /** One PR's reach set for train grouping — the `tests` of a `testsReachingChanged` verdict (`ok: true`). */
+export interface CliLazyRequireShadow {
+  current: ClosureVerdict;
+  proposed: { ok: true; tests: string[] } | { ok: false; reason: string };
+  cliSpawnTests: string[];
+}
+
+/** Compare current reach with a conservative candidate that omits function-local require only for non-CLI tests.
+ *  The caller owns activation; this function never changes the current release decision. */
+export function testsReachingChangedCliLazyRequireShadow(tree: ClosureTree, changed: readonly string[], tests: readonly string[], options: ClosureOptions = {}): CliLazyRequireShadow {
+  const graph = buildClosureGraph(tree, { ...options, omitFunctionLocalRequires: false });
+  const current = testsReachingChangedFromGraph(tree, changed, tests, graph);
+  const reachesCliSpawn = (test: string): boolean => {
+    const seen = new Set<string>();
+    const stack = [test];
+    while (stack.length) {
+      const file = stack.pop()!;
+      if (seen.has(file)) continue;
+      seen.add(file);
+      stack.push(...(graph.forward.get(file) ?? []));
+    }
+    // Evidence is aggregated across every reachable import: a path-returning helper and the spawn helper may
+    // be different files, connected only by a call in the test. Keep these tests in the conservative CLI set.
+    let hasSpawn = false;
+    let hasCliPath = false;
+    for (const file of seen) {
+      const text = tree.read(file) ?? '';
+      hasSpawn ||= hasCommandSpawn(text, file);
+      const literals = [...text.matchAll(LITERAL)].map((match) => match[2] ?? '');
+      const pathSegments = literals.flatMap((value) => normalize(value).split('/').filter(Boolean));
+      hasCliPath ||= literals.some((value) => /(?:^|\/)bin\/elanous\.mjs$/.test(normalize(value)))
+        || pathSegments.some((segment, index) => segment === 'bin' && pathSegments[index + 1] === 'elanous.mjs');
+    }
+    return hasSpawn && hasCliPath;
+  };
+  const cliSpawnTests = tests.filter(reachesCliSpawn);
+  if (!current.ok) return { current, proposed: { ok: false, reason: current.reason }, cliSpawnTests };
+  const cli = new Set(cliSpawnTests);
+  const nonCliTests = tests.filter((file) => !cli.has(file));
+  const reduced = nonCliTests.length ? testsReachingChangedFromGraph(tree, changed, nonCliTests,
+    buildClosureGraph(tree, { ...options, omitFunctionLocalRequires: true })) : { ok: true as const, tests: [], reached: 0, opaque: 0, opaqueFiles: [] };
+  if (!reduced.ok) return { current, proposed: { ok: false, reason: reduced.reason }, cliSpawnTests };
+  const proposed = [...new Set([...current.tests.filter((file) => cli.has(file)), ...reduced.tests])].sort();
+  return { current, proposed: { ok: true, tests: proposed }, cliSpawnTests };
+}
+
+/** Live selector for receipt reuse and partial re-gates. The cut sweep itself still runs the full assigned suite. */
+export function testsReachingChangedForGateReuse(tree: ClosureTree, changed: readonly string[], tests: readonly string[], options: ClosureOptions = {}): ClosureVerdict {
+  const comparison = testsReachingChangedCliLazyRequireShadow(tree, changed, tests, options);
+  if (!comparison.current.ok) return comparison.current;
+  if (!comparison.proposed.ok) return comparison.current; // Candidate uncertainty preserves the conservative receipt radius.
+  return { ...comparison.current, tests: comparison.proposed.tests };
+}
+
 export interface TrainReach {
   /** The PR that owns this reach set (number or url). */
   readonly pr: string;
@@ -289,33 +539,19 @@ export function bunfigPreload(text: string | undefined): string[] | null {
   return [...list[1]!.matchAll(/["']([^"']+)["']/g)].map((entry) => normalize(entry[1]!).replace(/^\.\//, ''));
 }
 
-/** The tip tree from git objects (`ls-tree` ⊕ one `cat-file --batch`). Throws on any git failure. */
+/** Tip-tree planning always goes through the shared immutable snapshot; a cache miss creates it once. */
 export function gitClosureTree(repo: string, commit: string): ClosureTree {
   if (!/^[0-9a-f]{40}$/i.test(commit)) throw new Error(`not a full sha: ${commit}`);
-  // git-spawn-allow: read-only object reads of one release commit.
-  const listed = spawnSync('git', ['ls-tree', '-r', '-z', '--name-only', commit], { cwd: repo, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
-  if (listed.status !== 0 || listed.error) throw new Error(`git ls-tree failed: ${(listed.stderr || listed.error || '').toString().trim()}`);
-  const files = listed.stdout.split('\0').filter(Boolean);
-  const wanted = files.filter((file) => CODE_FILE.test(file) || file === 'bunfig.toml' || /(?:^|\/)tsconfig[\w.-]*\.json$/.test(file));
-  // git-spawn-allow: read-only object reads of one release commit.
-  const batch = spawnSync('git', ['cat-file', '--batch'], { cwd: repo, input: wanted.map((file) => `${commit}:${file}`).join('\n') + '\n', maxBuffer: 2 * 1024 * 1024 * 1024 });
-  if (batch.status !== 0 || batch.error) throw new Error(`git cat-file failed: ${(batch.stderr || batch.error || '').toString().trim()}`);
-  const out = batch.stdout as Buffer;
+  const snapshot = createCutSnapshot(repo, commit);
   const contents = new Map<string, string>();
-  let at = 0;
-  for (const file of wanted) {
-    const end = out.indexOf(10, at);
-    if (end < 0) throw new Error('git cat-file output truncated');
-    const header = out.subarray(at, end).toString('utf8');
-    const size = /^[0-9a-f]+ blob (\d+)$/.exec(header);
-    if (!size) { at = end + 1; continue; } // «missing» (a submodule or symlink target) — read() answers undefined → opaque
-    const length = Number(size[1]);
-    contents.set(file, out.subarray(end + 1, end + 1 + length).toString('utf8'));
-    at = end + 1 + length + 1;
+  for (const file of snapshot.files) {
+    const content = snapshot.read(file);
+    if (content !== undefined && (CODE_FILE.test(file) || file === 'bunfig.toml' || /(?:^|\/)tsconfig[\w.-]*\.json$/.test(file)))
+      contents.set(file, content);
   }
   const preload = bunfigPreload(contents.get('bunfig.toml'));
   if (preload === null) throw new Error('bunfig.toml [test].preload is unreadable');
-  return { files, read: (path) => contents.get(path), preload, aliases: tsconfigAliases(contents) };
+  return { files: [...snapshot.files], read: (path) => contents.get(path), preload, aliases: tsconfigAliases(contents) };
 }
 
 /** `compilerOptions.paths` entries of the form `"<prefix>*": ["<dir>/*"]` — scoped to the tsconfig's directory. */

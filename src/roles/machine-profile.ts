@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync }
 import { dirname } from 'node:path';
 import { debug } from '../debug/log.js';
 import { readPrimaryJoin } from '../control-plane/primary.js';
-import { MACHINE_NAME, machineConfigPath } from './machine-name.js';
+import { MACHINE_NAME, machineConfigPath } from './machine-profile-contract.js';
 
 export interface MachineProfile {
   id: string;

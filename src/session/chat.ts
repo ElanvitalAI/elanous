@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Session-aware chat helper ──
 //
 // Glue between the session store (Phase 4), the LLM provider resolver
@@ -20,10 +21,7 @@ import {
 import { debug } from '../debug/log.js';
 import { createRequestSizeGuard, formatRequestSizeStatus, type RequestSizeGuard } from './request-size-guard.js';
 import type { InputSourceKind } from '../input/input-source-kind.js';
-import {
-  getProviderForConfigAsync, streamLLMWithTools, type LLMMessage, type LLMOpts, type LLMProvider,
-  type LLMToolSpec, type ContentBlock,
-} from '../llm.js';
+import { getProviderForConfigAsync, streamLLMWithTools, type LLMMessage, type LLMOpts, type LLMProvider, type ContentBlock } from '../llm.js';
 import type { UserConfig } from '../user-config.js';
 import {
   estimateMessagesTokens, estimateTokens, trimToBudget, budget, formatBudget,

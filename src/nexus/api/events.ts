@@ -41,6 +41,9 @@ export function handleSseEvents(bus: NexusEventBus, url: URL): Response {
       send(`: nexus events stream (topics: ${prefixes.length > 0 ? prefixes.join(',') : '*'})\n\n`);
 
       const pushEvent = (ev: NexusEvent): void => {
+        // App rows contain tenant data. They are available only from the
+        // bearer-gated app-scoped endpoint, never from this public stream.
+        if (ev.kind.startsWith('app.row.')) return;
         send(`event: ${ev.kind}\n`);
         send(`data: ${JSON.stringify(ev)}\n\n`);
       };

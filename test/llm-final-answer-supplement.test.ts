@@ -1,12 +1,6 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 import { expect, test } from 'bun:test';
-import {
-  attachFinalAnswerSupplement,
-  streamLLMWithTools,
-  type FinalAnswerSupplementAttachment,
-  type FinalAnswerSupplementAttachmentRequest,
-  type LLMProvider,
-  type LLMToolSpec,
-} from '../src/llm.js';
+import { attachFinalAnswerSupplement, streamLLMWithTools, type FinalAnswerSupplementAttachment, type FinalAnswerSupplementAttachmentRequest, type LLMProvider } from '../src/llm.js';
 
 const noopTool: LLMToolSpec = {
   name: 'noop',

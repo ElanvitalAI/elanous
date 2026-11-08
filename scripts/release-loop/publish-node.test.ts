@@ -88,19 +88,86 @@ test('publish accepts measured TUI subchecks and mac warning, but rejects a miss
     context.outputs['auto-approve'] = auto;
     process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
     const calls: string[] = [];
-    const run = (command: string, args: string[]) => {
+    const publishTimeouts: number[] = [];
+    let publishCommandResult = { status: 0 as number | null,
+      stdout: JSON.stringify({ ok: true, published: true, tag: `v${version}`, assets: [] }), stderr: '' };
+    const run = (command: string, args: string[], _cwd?: string, timeoutMs?: number) => {
       calls.push(`${command} ${args.join(' ')}`);
       if (command === 'git' && args[0] === 'show') {
         return { status: 0, stdout: args[1]?.endsWith('website/pages.json')
           ? JSON.stringify({ pages: [] }) : `# ${version}\n\nInternal release notes.\n`, stderr: '' };
       }
       if (command === 'bun' && args.includes('publish')) {
-        return { status: 0, stdout: JSON.stringify({ ok: true, published: true, tag: `v${version}`, assets: [] }), stderr: '' };
+        if (timeoutMs !== undefined) publishTimeouts.push(timeoutMs);
+        return publishCommandResult;
       }
+      if (command === 'curl') return { status: 0, stdout: '404', stderr: '' };
       throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
     };
-    expect(runPublish(run, root)).toMatchObject({ outcome: 'ok', verdict: 'pass', tag: `v${version}` });
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'ok', verdict: 'pass', tag: `v${version}`,
+      publishProcess: { status: 0, stdout: JSON.stringify({ ok: true, published: true, tag: `v${version}`, assets: [] }), stderr: '' } });
+    expect(publishTimeouts).toEqual([1_800_000]);
     expect(calls.some((call) => call.startsWith('bun bin/elanous.mjs release publish '))).toBe(true);
+
+    publishCommandResult = { status: null,
+      stdout: JSON.stringify({ ok: false, published: true, tag: `v${version}`, error: 'process timed out' }),
+      stderr: 'publish timed out after partial success' };
+    const partial = runPublish(run, root);
+    expect(partial).toMatchObject({ outcome: 'partial', partialPublish: { tag: `v${version}`, published: true, pendingAssets: [], pendingAssetsKnown: false, assetsVerified: false },
+      publishProcess: { status: null, stdout: publishCommandResult.stdout, stderr: publishCommandResult.stderr } });
+    publishCommandResult = { status: null, stdout: '', stderr: 'publish timed out before a result was written' };
+    const publicationUnknown = runPublish(run, root);
+    expect(publicationUnknown).toMatchObject({ outcome: 'unknown',
+      publicationVerification: { state: 'unknown', commands: ['npm view elanous@0.2.4 version', 'gh release view v0.2.4 --repo ElanvitalAI/elanous', 'git ls-remote --tags https://github.com/ElanvitalAI/elanous.git refs/tags/v0.2.4'] },
+      partialPublish: { published: 'unknown', pendingAssets: [], pendingAssetsKnown: false, assetsVerified: false },
+      publishProcess: { status: null, stdout: '', stderr: publishCommandResult.stderr } });
+    publishCommandResult = { status: 0, stdout: JSON.stringify({ ok: false, error: 'publication field omitted' }), stderr: '' };
+    const publicationFieldMissing = runPublish(run, root);
+    expect(publicationFieldMissing).toMatchObject({ outcome: 'unknown',
+      partialPublish: { published: 'unknown', pendingAssetsKnown: false, assetsVerified: false },
+      publishProcess: { status: 0, stdout: publishCommandResult.stdout, stderr: '' } });
+    publishCommandResult = { status: 0, stdout: '', stderr: '' };
+    const publicationResultMissingNormal = runPublish(run, root);
+    expect(publicationResultMissingNormal).toMatchObject({ outcome: 'unknown',
+      partialPublish: { published: 'unknown', pendingAssetsKnown: false, assetsVerified: false },
+      publishProcess: { status: 0, stdout: '', stderr: '' } });
+    publishCommandResult = { status: 1, stdout: 'not-json', stderr: 'publish stopped without a result' };
+    const publicationResultMissing = runPublish(run, root);
+    expect(publicationResultMissing).toMatchObject({ outcome: 'unknown',
+      partialPublish: { published: 'unknown', pendingAssetsKnown: false, assetsVerified: false },
+      publishProcess: { status: 1, stdout: 'not-json', stderr: publishCommandResult.stderr } });
+    publishCommandResult = { status: 1, stdout: JSON.stringify({ error: 'publisher stopped before status was recorded' }), stderr: 'publisher interrupted' };
+    const publishedFieldMissing = runPublish(run, root);
+    expect(publishedFieldMissing).toMatchObject({ outcome: 'unknown',
+      partialPublish: { published: 'unknown', pendingAssetsKnown: false, assetsVerified: false },
+      publishProcess: { status: 1, stdout: publishCommandResult.stdout, stderr: publishCommandResult.stderr } });
+    publishCommandResult = { status: 0, stdout: JSON.stringify({ ok: false, published: false, error: 'publish rejected' }), stderr: '' };
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'error', publishProcess: { status: 0,
+      stdout: publishCommandResult.stdout, stderr: '' } });
+    publishCommandResult = { status: 0, stdout: JSON.stringify({ ok: true, published: true, tag: `v${version}` }), stderr: '' };
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'partial',
+      partialPublish: { published: true, pendingAssets: [], pendingAssetsKnown: false, assetsVerified: false } });
+    publishCommandResult = { status: 1,
+      stdout: JSON.stringify({ ok: false, published: false, error: 'publish rejected' }), stderr: 'publish rejected' };
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'error', publishProcess: { status: 1,
+      stdout: publishCommandResult.stdout, stderr: publishCommandResult.stderr } });
+    publishCommandResult = { status: 1,
+      stdout: JSON.stringify({ ok: false, published: true, tag: `v${version}`, assets: ['dist.tgz'], error: 'post-publish hook failed' }),
+      stderr: 'post-publish hook failed' };
+    expect(runPublish(run, root)).toMatchObject({ outcome: 'partial', partialPublish: { tag: `v${version}`, published: true,
+      pendingAssets: [], pendingAssetsKnown: false, declaredAssets: ['dist.tgz'], assetsDeclaredKnown: true, assetsVerified: false },
+      publishProcess: { status: 1, stdout: publishCommandResult.stdout, stderr: publishCommandResult.stderr } });
+    publishCommandResult = { status: 0,
+      stdout: JSON.stringify({ ok: true, published: true, tag: `v${version}`, assets: [] }), stderr: '' };
+    context.input.assetWaitSeconds = 0;
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    publishCommandResult = { status: 0,
+      stdout: JSON.stringify({ ok: true, published: true, tag: `v${version}`, publicRepo: 'elanous/elanous', assets: ['dist.tgz'] }), stderr: '' };
+    const assetsPending = runPublish(run, root);
+    expect(assetsPending).toMatchObject({ outcome: 'partial', partialPublish: { tag: `v${version}`, published: true, pendingAssets: ['dist.tgz'], pendingAssetsKnown: true, assetsVerified: false },
+      publishProcess: { status: 0, stdout: publishCommandResult.stdout, stderr: '' } });
+    publishCommandResult = { status: 0,
+      stdout: JSON.stringify({ ok: true, published: true, tag: `v${version}`, assets: [] }), stderr: '' };
 
     for (const foreign of [
       { ...auto, runId: 'another-run' },
@@ -226,7 +293,7 @@ test('publish rechecks freeze immediately before irreversible publication; only 
   let publishCalls = 0;
   const run = (_command: string, args: string[]) => {
     if (args.includes('publish')) publishCalls++;
-    return { status: 0, stdout: args.some((arg) => arg.endsWith('website/pages.json')) ? JSON.stringify({ pages: [] }) : args.includes('publish') ? JSON.stringify({ ok: true, published: true, tag: 'v0.2.4' }) : '# 0.2.4\nHello', stderr: '' };
+    return { status: 0, stdout: args.some((arg) => arg.endsWith('website/pages.json')) ? JSON.stringify({ pages: [] }) : args.includes('publish') ? JSON.stringify({ ok: true, published: true, tag: 'v0.2.4', assets: [] }) : '# 0.2.4\nHello', stderr: '' };
   };
   try {
     process.env.ELANOUS_STATE_DIR = root;
@@ -271,7 +338,7 @@ test('publish-at waits after measured auto-approval and prerequisites; omission 
     if (command === 'bun') publishTimeouts.push(timeoutMs);
     return { status: 0, stderr: '', stdout: command === 'git'
       ? args[1]?.endsWith('pages.json') ? '{"pages":[]}' : `# ${version}\n\nBody\n`
-      : JSON.stringify({ ok: true, published: true, tag: `v${version}` }) };
+      : JSON.stringify({ ok: true, published: true, tag: `v${version}`, assets: [] }) };
   };
   const clock = { now: () => now, sleep: (ms: number) => { sleeps.push(ms); now += ms; } };
   const publish = (publishAt?: string, authorized = true) => {
@@ -287,7 +354,8 @@ test('publish-at waits after measured auto-approval and prerequisites; omission 
     expect(publishTimeouts).toEqual([1_800_000]);
     expect(calls).toEqual([`git @ ${Date.parse('2099-10-09T10:59:00Z')}`, `git @ ${Date.parse('2099-10-09T10:59:00Z')}`, `bun @ ${Date.parse('2099-10-09T11:00:00Z')}`]);
     const unchanged = publish();
-    expect(unchanged).toEqual({ outcome: 'ok', verdict: 'pass', summary: `published v${version} · 0 assets downloadable`, tag: `v${version}` });
+    expect(unchanged).toEqual({ outcome: 'ok', verdict: 'pass', summary: `published v${version} · 0 assets downloadable`, tag: `v${version}`,
+      publishProcess: { status: 0, stdout: JSON.stringify({ ok: true, published: true, tag: `v${version}`, assets: [] }), stderr: '' } });
     expect(sleeps).toEqual([]);
     expect(publishTimeouts).toEqual([1_800_000, 1_800_000]);
     expect(calls.at(-1)).toBe(`bun @ ${now}`);
@@ -305,7 +373,7 @@ test('publish-at waits after measured auto-approval and prerequisites; omission 
 test('the release graph publish command can outlive the scheduled wait; the inner publish remains bounded', () => {
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
   expect(recipes['publish-command']?.command).toBe('bun scripts/release-loop/publish-node.ts');
-  expect(recipes['publish-command']?.timeout_ms).toBeUndefined();
+  expect(recipes['publish-command']?.timeout_ms).toBe(5_400_000);
 });
 
 test('REL3: waits while an asset is not served yet, then reports none pending', () => {

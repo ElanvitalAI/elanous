@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.4 P1: RunFMEA LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   buildReport,
   renderTopTable,

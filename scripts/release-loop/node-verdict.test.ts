@@ -62,6 +62,30 @@ test('failed node without a command tail keeps its reason as the tail; successfu
   expect(lastJsonObject(lines[1])).toEqual({ outcome: 'ok', verdict: 'pass', summary: 'gate passed' });
 });
 
+test('partial node keeps its named graph outcome while returning a successful process status', () => {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (line: string) => { lines.push(line); };
+  try {
+    expect(finishNode('publish', '0.3.7', { outcome: 'partial', verdict: 'fail', summary: 'release published; assets pending',
+      partialPublish: { published: true, pendingAssets: ['dist.tgz'] } })).toBe(0);
+  } finally { console.log = original; }
+  expect(lastJsonObject(lines.join('\n'))).toEqual({ outcome: 'partial', verdict: 'fail', summary: 'release published; assets pending',
+    partialPublish: { published: true, pendingAssets: ['dist.tgz'] } });
+});
+
+test('unknown publish status keeps its named graph outcome while returning a successful process status for HITL routing', () => {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (line: string) => { lines.push(line); };
+  try {
+    expect(finishNode('publish', '0.3.7', { outcome: 'unknown', verdict: 'fail', summary: 'publication status unknown',
+      publicationVerification: { state: 'unknown', commands: ['npm view elanous@0.3.7 version'] } })).toBe(0);
+  } finally { console.log = original; }
+  expect(lastJsonObject(lines.join('\n'))).toEqual({ outcome: 'unknown', verdict: 'fail', summary: 'publication status unknown',
+    publicationVerification: { state: 'unknown', commands: ['npm view elanous@0.3.7 version'] } });
+});
+
 test('context reads file input and previous outputs', () => {
   const dir = mkdtempSync(join(tmpdir(), 'release-context-'));
   try {

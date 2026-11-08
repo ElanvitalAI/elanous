@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { parseFailures } from './gate-diff.js';
 import { isCompleteOneFileGateJunit, parseXml, type XmlElement } from '../../src/self-dev/shard-aggregate.js';
-import type { WarmWorkerFileResult } from '../../src/task-orchestrator/surfaces/pod-warm-worker-protocol.js';
+import { join } from 'node:path';
+import type { WarmWorkerCommand, WarmWorkerFileResult } from '../../src/task-orchestrator/surfaces/pod-warm-worker-protocol.js';
+import type { WarmPodTransportResult } from '../../src/task-orchestrator/surfaces/pod-warm-worker-pod.js';
 
 const relative = (path: string) => path.replace(/^(?:\.\.\/)*\/?home\/ubuntu\/repo\//, '').replace(/^\.\//, '');
 const lastCount = (log: string, name: string): number | null => {
@@ -250,4 +252,48 @@ export function warmReferenceFromJobArtifacts(prefix: string, file: string, expe
     || failureIds.some(id => !id.startsWith(`${file} > `))
     || (rc === 0 ? fails !== 0 : fails === 0)) return null;
   return { file, rc, failureIds, errorIds: [], junitComplete: true };
+}
+
+
+/** Materialize only transport-validated warm artifacts into the gate's existing per-file outbox contract. */
+export function materializeWarmShardArtifacts(directory: string, command: WarmWorkerCommand,
+  transport: WarmPodTransportResult, parts: readonly (readonly string[])[]): boolean {
+  if (transport.status !== 'observed' || transport.reason !== 'complete' || !transport.reply
+    || command.files.length !== parts.length || parts.some((part, index) => part.length !== 1 || part[0] !== command.files[index])
+    || transport.reply.runId !== command.runId || transport.reply.attemptId !== command.attemptId
+    || transport.reply.cutSha !== command.cutSha || transport.reply.leaseId !== command.leaseId
+    || transport.reply.generation !== command.generation || transport.reply.workerId !== command.workerId
+    || transport.reply.envProfile !== command.envProfile || transport.reply.baselineSha !== command.baselineSha
+    || transport.reply.key.context !== command.key.context || transport.reply.key.imageDigest !== command.key.imageDigest
+    || transport.reply.key.lockHash !== command.key.lockHash || transport.reply.key.architecture !== command.key.architecture
+    || transport.reply.finishedAt > command.deadlineAt || transport.reply.files.length !== command.files.length || transport.artifacts?.length !== command.files.length) return false;
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  writeFileSync(join(directory, 'install.rc'), '0\n', { mode: 0o600 });
+  writeFileSync(join(directory, 'install.log'), '', { mode: 0o600 });
+  const suffixes = ['log', 'junit.xml', 'json', 'warm-manifest.json', 'rc'] as const;
+  for (const [index, file] of command.files.entries()) {
+    const artifact = transport.artifacts[index];
+    const reported = transport.reply.files[index];
+    if (!artifact || artifact.file !== file || !reported || reported.file !== file
+      || Object.keys(artifact.data).sort().join(',') !== [...suffixes].sort().join(',')) return false;
+    const prefix = join(directory, `warm-file-${index}`);
+    const decoded: Record<string, Buffer> = {};
+    for (const suffix of suffixes) {
+      const encoded = artifact.data[suffix];
+      if (typeof encoded !== 'string') return false;
+      const bytes = Buffer.from(encoded, 'base64');
+      if (!bytes.length || bytes.toString('base64') !== encoded) return false;
+      decoded[suffix] = bytes;
+      writeFileSync(`${prefix}.${suffix}`, bytes, { mode: 0o600 });
+    }
+    const parsed = warmReferenceFromJobArtifacts(prefix, file, { cutSha: command.cutSha, attemptId: command.attemptId });
+    if (!parsed || parsed.rc !== reported.rc || parsed.junitComplete !== reported.junitComplete
+      || JSON.stringify([...parsed.failureIds].sort()) !== JSON.stringify([...reported.failureIds].sort())
+      || JSON.stringify([...parsed.errorIds].sort()) !== JSON.stringify([...reported.errorIds].sort())) return false;
+    writeFileSync(join(directory, `part-${index}.files`), `${file}\n`, { mode: 0o600 });
+    writeFileSync(join(directory, `part-${index}.log`), decoded.log!, { mode: 0o600 });
+    writeFileSync(join(directory, `part-${index}.junit.xml`), decoded['junit.xml']!, { mode: 0o600 });
+    writeFileSync(join(directory, `part-${index}.rc`), `${parsed.rc}\n`, { mode: 0o600 });
+  }
+  return true;
 }

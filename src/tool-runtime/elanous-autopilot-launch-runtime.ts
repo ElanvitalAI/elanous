@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // PLAN-codex-app-server-hermes-parity §5 Phase H1·6b (2026-05-16) —
 // `elanous_autopilot_launch` MCP tool. Codex turn calls this to fire a
 // elanous autopilot mission against a chosen backend (claude / gemini /
@@ -30,7 +31,7 @@ import {
 } from '../autopilot/agent-loop.js';
 import { AcpTurnRunner } from '../autopilot/runner.js';
 import { heuristicPlanConfig } from '../autopilot/planner.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime } from './types.js';
 
 export interface ElanousAutopilotLaunchArgs {

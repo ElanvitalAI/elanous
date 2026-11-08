@@ -16,6 +16,12 @@ cases:
   - id: host-replacement
     event: identical-receipts-read-from-a-different-eligible-host
     expect: { carried: [pod-0, pod-1, pod-2, pod-3], rerun: [], totalPods: 0 }
+  - id: source-only-cut-image-change
+    event: source-only-descendant-cut-rebuilds-image-with-same-dependency-layer
+    expect: { carried: [pod-0, pod-1, pod-2, pod-3], rerun: [], totalPods: 0 }
+  - id: lockfile-cut-change
+    event: descendant-cut-changes-lockfile-and-dependency-layer
+    expect: { carried: [], rerun: [pod-0, pod-1, pod-2, pod-3], totalPods: 4 }
   - id: shard-payload-corruption
     event: one-result-payload-digest-mismatch
     corrupt: pod-1

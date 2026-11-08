@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // SolveMission — 기존 코딩 미션을 선택한 실행기로 solve 하는 front door LLM 툴 (P3 · 2026-07-21)
 //
 // DESIGN-cross-surface-autonomy-membrane §8 Rank1 · §10 P3 (D 북극성 교점). 대표가 지정한 **기존**
@@ -16,7 +17,7 @@
 // 배선 = RunDevHarness(#4812) 복제 — 4곳(이 파일 · native-tool-catalog · daemon-tools · monad-agent-turn).
 
 import { tierModel } from '../../llm/model-defaults.js';
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { DaemonToolDispatchCtx } from '../../boot/daemon-tools/types.js';
 import { surfaceUxFromDispatchCtx } from '../../agent/surface-ux/build.js';
 import { resolveAutoDrive } from './dev-harness.js';

@@ -1,7 +1,8 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 /**
  * TaskDispatch runtime — run a single dispatch tick.
  */
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 import { getToxRuntimeDeps } from '../runtime-deps.js';
 

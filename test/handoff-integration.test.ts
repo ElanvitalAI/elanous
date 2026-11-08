@@ -29,10 +29,11 @@ import {
 } from '../src/session/index.js';
 import { botFromConfig } from '../src/telegram.js';
 import type { UserConfig } from '../src/user-config.js';
+import { createFakeFetchDevice, type FakeFetchDevice, type FakeFetchRequest } from '../src/ux-sim/fake-fetch.js';
 
-const realFetch = globalThis.fetch;
 const savedEnv: Record<string, string | undefined> = {};
 let tmpRoot: string;
+let fakeFetch: FakeFetchDevice | undefined;
 
 function sseRes(events: unknown[]): Response {
   const enc = new TextEncoder();
@@ -48,6 +49,18 @@ function sseRes(events: unknown[]): Response {
 
 function jsonRes(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
+
+function installHandoffFetch(onLlm?: (request: FakeFetchRequest) => Response | Promise<Response>): void {
+  fakeFetch?.restore();
+  fakeFetch = createFakeFetchDevice([
+    { url: 'http://mock:1234/chat/completions', method: 'POST', response: (request) => onLlm?.(request) ?? sseRes([{ choices: [{ delta: { content: 'reply' } }] }]) },
+    ...['getMe', 'setMyCommands', 'sendMessage', 'sendChatAction', 'editMessageText'].map((method) => ({
+      url: `https://api.telegram.org/botfake-token/${method}`,
+      method: 'POST',
+      response: () => jsonRes({ ok: true, result: { message_id: 99 } }),
+    })),
+  ]);
 }
 
 function userCfg(): UserConfig {
@@ -92,11 +105,19 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  globalThis.fetch = realFetch;
-  rmSync(tmpRoot, { recursive: true, force: true });
-  for (const [k, v] of Object.entries(savedEnv)) {
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
+  try {
+    if (fakeFetch) {
+      const requests = fakeFetch.calls().map(({ method, url }) => `${method} ${url}`);
+      expect(requests).toEqual(['POST http://mock:1234/chat/completions']);
+    }
+  } finally {
+    fakeFetch?.restore();
+    fakeFetch = undefined;
+    rmSync(tmpRoot, { recursive: true, force: true });
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
   }
 });
 
@@ -128,22 +149,16 @@ describe('TUI → Telegram handoff', () => {
     // The bot's getMe + setMyCommands + sendMessage calls also go
     // through fetch; we route by URL shape.
     const llmReplies: string[] = [];
-    globalThis.fetch = (async (input: any, init?: RequestInit) => {
-      const url = typeof input === 'string' ? input : input.url;
-      if (url.includes('/chat/completions')) {
+    installHandoffFetch((request) => {
         // Read the wire payload so we can verify the LLM saw full
         // history (not just the latest message).
-        const body = init?.body ? JSON.parse(init.body as string) : {};
+        const body = request.body ? JSON.parse(request.body) : {};
         llmReplies.push(JSON.stringify(body.messages));
         return sseRes([
           { choices: [{ delta: { content: 'yes — ' } }] },
           { choices: [{ delta: { content: 'tls-only.' } }] },
         ]);
-      }
-      // Any Telegram Bot API call — edit/send/setMyCommands — we
-      // don't care about the response shape, just return ok.
-      return jsonRes({ ok: true, result: { message_id: 99 } });
-    }) as typeof fetch;
+    });
 
     const bot = botFromConfig({ userConfig: userCfg() });
 
@@ -209,13 +224,7 @@ describe('TUI → Telegram handoff', () => {
     // Confirm lookup returns null — slot is free
     expect(findSessionByTelegramChat(42)).toBeNull();
 
-    globalThis.fetch = (async (input: any) => {
-      const url = typeof input === 'string' ? input : input.url;
-      if (url.includes('/chat/completions')) {
-        return sseRes([{ choices: [{ delta: { content: 'new session reply' } }] }]);
-      }
-      return jsonRes({ ok: true, result: { message_id: 99 } });
-    }) as typeof fetch;
+    installHandoffFetch(() => sseRes([{ choices: [{ delta: { content: 'new session reply' } }] }]));
 
     const bot = botFromConfig({ userConfig: userCfg() });
     const handler = (bot as any).onMessage as (ctx: any) => Promise<string>;
@@ -252,13 +261,7 @@ describe('TUI → Telegram handoff', () => {
     const fresh = createSession({ source: 'cli', title: 'fresh laptop work' });
     attachTelegramBinding(fresh.id, 42);
 
-    globalThis.fetch = (async (input: any) => {
-      const url = typeof input === 'string' ? input : input.url;
-      if (url.includes('/chat/completions')) {
-        return sseRes([{ choices: [{ delta: { content: 'to the fresh one' } }] }]);
-      }
-      return jsonRes({ ok: true, result: { message_id: 99 } });
-    }) as typeof fetch;
+    installHandoffFetch(() => sseRes([{ choices: [{ delta: { content: 'to the fresh one' } }] }]));
 
     const bot = botFromConfig({ userConfig: userCfg() });
     const handler = (bot as any).onMessage as (ctx: any) => Promise<string>;

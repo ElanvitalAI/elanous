@@ -11,6 +11,7 @@ import {
   uploadCameraIntake,
 } from './camera-intake';
 import type { AttachmentMeta } from './upload-attachment';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../test-devices/fake-fetch';
 
 const sampleMeta: AttachmentMeta = {
   id: 'att-42',
@@ -78,37 +79,35 @@ describe('buildIntakeBodyForPhoto', () => {
 });
 
 describe('uploadCameraIntake', () => {
-  let originalFetch: typeof fetch;
+  let fakeFetch: FakeFetchDevice | undefined;
   let calls: Array<{ url: string; method?: string; body?: string; headers?: Record<string, string> }>;
 
   beforeEach(() => {
-    originalFetch = globalThis.fetch;
     calls = [];
   });
 
   afterEach(() => {
-    globalThis.fetch = originalFetch;
+    fakeFetch?.restore();
+    fakeFetch = undefined;
   });
 
   function stubFetchSequence(responses: Array<{ status: number; body: unknown }>): void {
-    let i = 0;
-    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-      const r = responses[i] ?? { status: 200, body: {} };
-      i += 1;
-      const headers: Record<string, string> = {};
-      if (init?.headers) {
-        for (const [k, v] of Object.entries(init.headers as Record<string, string>)) {
-          headers[k.toLowerCase()] = v;
-        }
-      }
-      calls.push({
-        url: String(input),
-        method: init?.method,
-        body: typeof init?.body === 'string' ? init.body : undefined,
-        headers,
-      });
-      return new Response(JSON.stringify(r.body), { status: r.status });
-    }) as unknown as typeof fetch;
+    fakeFetch?.restore();
+    const uploadResponse = responses[0] ?? { status: 200, body: {} };
+    const intakeResponse = responses[1] ?? { status: 200, body: {} };
+    const route = (path: string, method: string, getResponse: () => { status: number; body: unknown }) => ({
+      url: path,
+      method,
+      response: (request: { url: string; method: string; headers: Readonly<Record<string, string>>; body: string | null }) => {
+        calls.push({ url: request.url, method: request.method, body: request.body ?? undefined, headers: { ...request.headers } });
+        const response = getResponse();
+        return Response.json(response.body, { status: response.status });
+      },
+    });
+    fakeFetch = createFakeFetchDevice([
+      route('/v1/attachments', 'POST', () => uploadResponse),
+      route('/v1/intake', 'POST', () => intakeResponse),
+    ]);
   }
 
   test('route=session → uploads only · skips intake POST', async () => {

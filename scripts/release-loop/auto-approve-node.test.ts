@@ -39,6 +39,25 @@ test('eight measured metrics approve and write a rollback report', () => {
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test('traffic hold, a yellow publish blocker, or an OP approval marker each force manual approval', () => {
+  const f = fixture();
+  try {
+    for (const change of [
+      (context: GraphContext) => { context.input.trafficHold = true; },
+      (context: GraphContext) => { context.outputs['checklist-gate'] = { publishBlockingYellow: ['RELEASE-GRAPH-LIFECYCLE-PROOF'] }; },
+      (context: GraphContext) => { context.input.publishBlockingYellow = ['RELEASE-GRAPH-LIFECYCLE-PROOF']; },
+      (context: GraphContext) => { context.input.opApprovalMarker = 'OP: review ledger before publish'; },
+    ]) {
+      const context = structuredClone(f.context);
+      change(context);
+      const decision = runAutoApprove(context, { instanceRoot: f.root, repo: f.repo, checklistRoot: f.root });
+      expect(decision).toMatchObject({ outcome: 'fail', verdict: 'fail' });
+      expect(decision).not.toHaveProperty('decidedBy');
+      expect(decision.summary).toContain('HITL');
+    }
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('four installation files fail the installation metric', () => {
   const f = fixture();
   try {

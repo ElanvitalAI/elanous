@@ -29,7 +29,7 @@ import {
 } from '../../theme/tokens.js';
 import { DEFAULT_CLOSE_GLYPH } from '../chrome/control-glyphs.js';
 import type { WidgetChromeSpec } from '../declarative/spec.js';
-import { resolveWidgetChromeBoxViewOptions } from '../declarative/index.js';
+import { resolveWidgetChromeBoxViewOptions } from '../declarative/presentation.js';
 import { resolveModalChromeBoxOptions } from '../chrome/modal-chrome-box.js';
 import { BoxView, TextView, Consumed, Ignored, type EventResult, type FocusSource, type Size, type View } from '../view.js';
 import type { Printer } from '../printer.js';

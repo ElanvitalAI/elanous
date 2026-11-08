@@ -11,6 +11,7 @@
 // and exits 2. It never reruns the suite on the release machine.
 import { spawnSync } from 'node:child_process';
 import { debug } from '../../src/debug/log.js';
+import type { PwaHostProbe } from '../../src/release-loop/knowhow/pwa-host-heal.js';
 
 /** `[user@]host`. A leading `-` is refused separately (ssh/git would read it as an option — `-oProxyCommand=…`). */
 export const PWA_REMOTE_HOST_PATTERN = /^(?:[\w.-]+@)?[\w.-]+$/;
@@ -52,6 +53,34 @@ const defaultSpawn: PwaRemoteSpawn = (cmd, args, opts) => {
 };
 
 export const shQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+
+/** Read-only eligibility probe used by the PWA host-repair recipe. */
+export function probePwaRemoteHost(input: { host: string; slots: number; mirror?: string }, spawn: PwaRemoteSpawn = defaultSpawn): PwaHostProbe {
+  const { host, mirror } = checkPwaRemote(input.host, input.mirror);
+  if (!Number.isSafeInteger(input.slots) || input.slots < 1) throw new Error(`invalid PWA host slot cap: ${input.slots}`);
+  const script = [
+    'PATH=$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH; export PATH',
+    'bun_ok=false; command -v bun >/dev/null 2>&1 && bun_ok=true',
+    'chrome_ok=false; for p in "$ELANOUS_CHROME_BIN" /usr/bin/google-chrome /usr/bin/google-chrome-stable /usr/bin/chromium /usr/bin/chromium-browser /snap/bin/chromium "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" "/Applications/Chromium.app/Contents/MacOS/Chromium"; do if [ -n "$p" ] && [ -x "$p" ]; then chrome_ok=true; break; fi; done',
+    `repo_ok=false; git --git-dir=${remotePath(mirror)} rev-parse --is-bare-repository 2>/dev/null | grep -qx true && repo_ok=true`,
+    'system=$(uname -s 2>/dev/null); load=; if [ "$system" != Darwin ] && [ -r /proc/loadavg ]; then load=$(awk \'{print $1}\' /proc/loadavg); else load=$(uptime 2>/dev/null | sed -E \'s/.*load averages?:? *//; s/[ ,].*//\'); fi',
+    'case "$load" in ""|*[!0-9.]*|.*.*) load_ok=false; load=999999 ;; *) if awk -v x="$load" \'BEGIN { exit !(x ~ /^[0-9]+([.][0-9]+)?$/) }\'; then load_ok=true; else load_ok=false; load=999999; fi ;; esac',
+    'active=0; active_ok=false; if active_list=$(ps -axo pid=,command= 2>/dev/null); then active=$(printf \'%s\\n\' "$active_list" | awk \'function basename(path, parts, n) { n=split(path, parts, "/"); return parts[n] } function isPwaScenario(path, suffix, n) { suffix="/scripts/release-loop/pwa-scenarios-node.ts"; n=length(suffix); return path == "scripts/release-loop/pwa-scenarios-node.ts" || path == "./scripts/release-loop/pwa-scenarios-node.ts" || (length(path) >= n && substr(path, length(path)-n+1) == suffix) } basename($2) ~ /^bunx?$/ && isPwaScenario($3) { count++ } END { print count+0 }\'); case "$active" in ""|*[!0-9]*) active_ok=false; active=0 ;; *) active_ok=true ;; esac; fi',
+    'case "$active" in ""|*[!0-9]*) active_ok=false; active=0 ;; esac',
+    'awk -v b="$bun_ok" -v c="$chrome_ok" -v r="$repo_ok" -v l="$load" -v lo="$load_ok" -v a="$active" -v ao="$active_ok" \'BEGIN { printf "{\\"bun\\":%s,\\"chrome\\":%s,\\"repository\\":%s,\\"loadAverage\\":%.6f,\\"loadMeasured\\":%s,\\"activeRuns\\":%d,\\"activeRunsMeasured\\":%s}\\n", b, c, r, l+0, lo, a+0, ao }\'',
+  ].join('\n');
+  const result = spawn('ssh', ['--', host, `sh -c ${shQuote(script)}`], { cwd: '/tmp', timeoutMs: 15_000 });
+  const line = result.stdout.split('\n').reverse().find((row) => row.trim().startsWith('{'));
+  let parsed: Record<string, unknown> = {};
+  try { parsed = JSON.parse(line ?? '') as Record<string, unknown>; } catch { /* returned below as an ineligible probe */ }
+  const loadAverage = parsed.loadMeasured !== false && typeof parsed.loadAverage === 'number' && Number.isFinite(parsed.loadAverage)
+    ? parsed.loadAverage : Number.POSITIVE_INFINITY;
+  const activeRuns = parsed.activeRunsMeasured !== false && typeof parsed.activeRuns === 'number' && Number.isSafeInteger(parsed.activeRuns)
+    ? parsed.activeRuns : input.slots;
+  return { host, slots: input.slots, bun: result.rc === 0 && parsed.bun === true, chrome: result.rc === 0 && parsed.chrome === true,
+    repository: result.rc === 0 && parsed.repository === true, loadAverage, activeRuns,
+    ...(result.rc !== 0 || !line ? { detail: tail(`${result.stderr}\n${result.error ?? ''}`) || `probe rc=${result.rc}` } : {}) };
+}
 
 /** Validate the host and mirror before anything is spawned. */
 export function checkPwaRemote(host: unknown, mirror: unknown): { host: string; mirror: string } {

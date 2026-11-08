@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Showroom v2 · LaneHandoff LLM tool.
 //
 // Lets the agent invoke a structured cross-lane handoff inside the
@@ -8,7 +9,7 @@
 // Output contract matches the H6 P7 InjectCaptureToContext tool —
 // `{ output: string; metadata: object; isError?: true }`.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   executeHandoffSlash,
   type HandoffSlashDeps,

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { buildGitSnapshot } from '../git-fs/index.js';
 import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { debug } from '../debug/log.js';
@@ -21,7 +22,7 @@ import {
   type ControlSlashOutcome,
   type EnterModeOpts,
 } from './posture.js';
-import type { LLMMessage, LLMToolSpec } from '../llm.js';
+import type { LLMMessage } from '../llm.js';
 import type { LLMToolDef } from '../plugins/core/types.js';
 import type { ToolRunResult, ToolRuntime } from '../tool-runtime/types.js';
 import { blockWriteToolSearchHydration, type ToolSearchRunResult } from '../tool-runtime/tool-search-runtime.js';

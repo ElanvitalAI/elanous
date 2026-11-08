@@ -2,8 +2,9 @@
 // Shadow node: prepare a same-commit, failed-files-only plan. The gate consumer is a separate TC change.
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cachedCutSnapshot, createCutSnapshot } from './gate-cut-snapshot.js';
 import { planSameCommitRecheck, writeRecheckPlan } from './gate-partial';
 
 export interface RecheckInput {
@@ -17,8 +18,9 @@ export interface RecheckInput {
 
 /** Only a Git blob is a runnable test file; `cat-file -e` also accepts trees. */
 export function existsTestFileAtCommit(repo: string, commit: string, file: string): boolean {
-  // git-spawn-allow: read-only object type check at the exact measured release commit.
-  const found = spawnSync('git', ['cat-file', '-t', `${commit}:${file}`], { cwd: repo, encoding: 'utf8' });
+  const snapshot = cachedCutSnapshot(repo, commit);
+  if (snapshot) return snapshot.existsBlob(file);
+  const found = spawnSync('git', ['cat-file', '-t', commit + ':' + file], { cwd: repo, encoding: 'utf8' });
   if (found.error) throw found.error;
   return found.status === 0 && found.stdout.trim() === 'blob';
 }
@@ -45,7 +47,7 @@ function main(): void {
   const context = JSON.parse(readFileSync(contextPath, 'utf8')) as { input?: RecheckInput };
   const repo = resolve(import.meta.dir, '../..');
   const input = context.input as RecheckInput;
-  const result = prepareGateRecheck(input, (file) => existsTestFileAtCommit(repo, input.commit, file));
+  const result = prepareGateRecheck(input, (file) => createCutSnapshot(repo, input.commit, join(input.ledgerRoot, 'cut-snapshots')).existsBlob(file));
   console.log(JSON.stringify(result));
 }
 

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── SyncRepo ToolRuntime (Coding Pipeline P5) ──
 //
 // Clone or fetch a repository into the agent-managed cache at
@@ -29,7 +30,7 @@ import { existsSync, mkdirSync, statSync, writeFileSync, unlinkSync } from 'node
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { runGitCommand } from '../git-fs/runner.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 
 const CACHE_ROOT_DEFAULT = join(homedir(), '.cache', 'elanous-refs');

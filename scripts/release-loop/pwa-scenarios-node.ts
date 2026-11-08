@@ -23,6 +23,9 @@ import { join, resolve } from 'node:path';
 import { decideVerdict, exitCodeFor, idsToRerun, type CellRun, type NodeVerdict } from './pwa-node-verdict';
 import { envLiteral } from '../../src/platform/env-literal.js';
 import { checkPwaRemote, runPwaRemote } from './pwa-remote';
+import { probePwaRemoteHost } from './pwa-remote';
+import { getUserConfig } from '../../src/user-config.js';
+import { healPwaHostFailure, type PwaHostRunResult } from '../../src/release-loop/knowhow/pwa-host-heal.js';
 
 interface Options { commit: string; withCostly: boolean; reruns: number; json: boolean; remote?: string; remoteMirror?: string }
 
@@ -57,6 +60,15 @@ export function releasePwaNodeEnvironment(env: NodeJS.ProcessEnv = process.env):
 const NO_PROXY_ENV = releasePwaNodeEnvironment();
 const log = (msg: string) => process.stderr.write(`[pwa-node] ${msg}\n`);
 
+function activeReleaseRunId(): string | undefined {
+  const context = process.env.ELANOUS_GRAPH_CONTEXT;
+  if (!context) return undefined;
+  try {
+    const value = JSON.parse(context.trimStart().startsWith('{') ? context : readFileSync(context, 'utf8')) as { runId?: unknown };
+    return typeof value.runId === 'string' && value.runId.trim() ? value.runId : undefined;
+  } catch { return undefined; }
+}
+
 function run(cmd: string, args: string[], cwd: string, timeoutMs = 600_000) {
   const r = spawnSync(cmd, args, { cwd, env: envLiteral(NO_PROXY_ENV), encoding: 'utf8', timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
   return { rc: r.status ?? -1, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
@@ -85,9 +97,26 @@ async function main(): Promise<number> {
   const repo = resolve('.');
   if (opts.remote !== undefined) {
     log(`remote ${opts.remote} · ${opts.commit.slice(0, 10)}`);
-    const remote = runPwaRemote({ host: opts.remote, ...(opts.remoteMirror ? { mirror: opts.remoteMirror } : {}), commit: opts.commit, withCostly: opts.withCostly, reruns: opts.reruns, repo });
+    let remote: PwaHostRunResult = runPwaRemote({ host: opts.remote, ...(opts.remoteMirror ? { mirror: opts.remoteMirror } : {}), commit: opts.commit, withCostly: opts.withCostly, reruns: opts.reruns, repo });
+    const runId = activeReleaseRunId();
+    if (remote.exitCode === 2 && runId) {
+      try {
+        const hostConfig = getUserConfig().gateRemote;
+        const candidates = { ...(hostConfig?.hostCaps ?? {}), ...(hostConfig?.host && !hostConfig.hostCaps?.[hostConfig.host]
+          ? { [hostConfig.host]: hostConfig.hostCap ?? 1 } : {}) };
+        const healed = await healPwaHostFailure({ runId, failedHost: opts.remote, initial: remote, candidates,
+          maxLoadAverage: hostConfig?.loadThreshold ?? 20,
+          probe: async (host, slots) => probePwaRemoteHost({ host, slots, ...(opts.remoteMirror ? { mirror: opts.remoteMirror } : hostConfig?.mirror ? { mirror: hostConfig.mirror } : {}) }),
+          run: async (host) => runPwaRemote({ host, ...(opts.remoteMirror ? { mirror: opts.remoteMirror } : hostConfig?.mirror ? { mirror: hostConfig.mirror } : {}),
+            commit: opts.commit, withCostly: opts.withCostly, reruns: opts.reruns, repo }) });
+        remote = healed.result;
+        log(`host heal ${healed.receipt.outcome}${healed.receipt.selectedHost ? ` · ${healed.receipt.selectedHost}` : ''}`);
+      } catch (error) {
+        remote = { exitCode: 2, output: { ...remote.output, hostHealError: error instanceof Error ? error.message : String(error) } };
+      }
+    }
     if (opts.json) console.log(JSON.stringify(remote.output));
-    else console.log(`pwa-node: ${String(remote.output.verdict)} · ${opts.commit.slice(0, 10)} · host ${opts.remote}${typeof remote.output.error === 'string' ? `\n  error: ${remote.output.error}` : ''}`);
+    else console.log(`pwa-node: ${String(remote.output.verdict)} · ${opts.commit.slice(0, 10)} · host ${typeof remote.output.host === 'string' ? remote.output.host : opts.remote}${typeof remote.output.error === 'string' ? `\n  error: ${remote.output.error}` : ''}`);
     return remote.exitCode;
   }
   const work = mkdtempSync(join(tmpdir(), 'pwa-node-'));

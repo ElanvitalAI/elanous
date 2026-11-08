@@ -5,6 +5,7 @@ const CERTIFICATE_LIFETIME_MS = 90 * DAY_MS;
 const RENEWAL_WINDOW_MS = 30 * DAY_MS;
 
 export interface FakeDnsCertOptions {
+  now?: () => number;
   relayTarget?: string;
   txtPropagationDelayMs?: number;
   propagationTimeoutMs?: number;
@@ -58,6 +59,7 @@ function requireNonnegative(value: number, name: string): void {
 }
 
 export function createFakeDnsCert(options: FakeDnsCertOptions = {}): FakeDnsCertDevice {
+  const now = options.now ?? (() => Date.now());
   const relayTarget = options.relayTarget ?? 'relay-edge.elanous.net';
   const nameservers = ['ns-1.elanous.net', 'ns-2.elanous.net'] as const;
   let wildcardRecordWrites = 0;
@@ -93,7 +95,7 @@ export function createFakeDnsCert(options: FakeDnsCertOptions = {}): FakeDnsCert
   let storedIssuanceRequest = 0;
 
   function failure(code: 'propagation-timeout' | 'issuance-limit' | 'caa-rejected', message: string): FakeDnsCertResult {
-    events.push({ type: 'issuance-failed', at: Date.now(), detail: code });
+    events.push({ type: 'issuance-failed', at: now(), detail: code });
     return { status: 'failed', code, message };
   }
   async function performIssue(request: { propagationDelayMs: number; propagationTimeoutMs: number | undefined; issuanceLimit: number | undefined; caaAllowed: boolean; certificateLifetimeMs: number }, requestId: number): Promise<FakeDnsCertResult> {
@@ -101,14 +103,14 @@ export function createFakeDnsCert(options: FakeDnsCertOptions = {}): FakeDnsCert
     if (request.issuanceLimit !== undefined && issuanceAttempts >= request.issuanceLimit) return failure('issuance-limit', 'configured simulated issuance limit reached');
     issuanceAttempts += 1;
     acmeTxtWrites += 1;
-    const startedAt = Date.now();
+    const startedAt = now();
     events.push({ type: 'acme-txt-written', at: startedAt, detail: '_acme-challenge.elanous.app' });
     const waitMs = request.propagationTimeoutMs === undefined ? request.propagationDelayMs : Math.min(request.propagationDelayMs, request.propagationTimeoutMs);
     await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
     if (request.propagationTimeoutMs !== undefined && request.propagationDelayMs > request.propagationTimeoutMs) {
       return failure('propagation-timeout', `ACME TXT did not propagate within ${request.propagationTimeoutMs}ms`);
     }
-    const issuedAt = Date.now();
+    const issuedAt = now();
     const certificate: FakeDnsCertCertificate = {
       names: ['*.elanous.app'], issuedAt, expiresAt: issuedAt + request.certificateLifetimeMs, serial: nextSerial++,
     };
@@ -136,7 +138,7 @@ export function createFakeDnsCert(options: FakeDnsCertOptions = {}): FakeDnsCert
     get counters() { return { wildcardRecordWrites, acmeTxtWrites }; },
     registerApp(hostname) {
       if (!matchesWildcard(hostname)) throw new Error(`fake-dns-cert: hostname is outside *.elanous.app: ${hostname}`);
-      if (!registeredApps.has(hostname)) { registeredApps.add(hostname); events.push({ type: 'app-registered', at: Date.now(), detail: hostname }); }
+      if (!registeredApps.has(hostname)) { registeredApps.add(hostname); events.push({ type: 'app-registered', at: now(), detail: hostname }); }
     },
     apps() { return [...registeredApps].sort(); },
     matchesWildcard,
@@ -144,7 +146,7 @@ export function createFakeDnsCert(options: FakeDnsCertOptions = {}): FakeDnsCert
     renewCertificate: issue,
     async renewIfDue() {
       if (!currentCertificate) return issue();
-      if (currentCertificate.expiresAt - Date.now() > RENEWAL_WINDOW_MS) return { status: 'not-due', certificate: copyCertificate(currentCertificate) };
+      if (currentCertificate.expiresAt - now() > RENEWAL_WINDOW_MS) return { status: 'not-due', certificate: copyCertificate(currentCertificate) };
       return issue();
     },
     certificate() { return currentCertificate && copyCertificate(currentCertificate); },

@@ -1,10 +1,12 @@
-import { afterEach, expect, spyOn, test } from 'bun:test';
+import type { LLMToolSpec } from './llm/tool-spec.js';
+import { afterEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { codexStagePromptCacheKey, getProviderForConfig, type LLMToolSpec } from './llm.js';
+import { codexStagePromptCacheKey, getProviderForConfig } from './llm.js';
 import { saveTokens } from './oauth/store.js';
 import type { UserConfig } from './user-config.js';
+import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
 
 let envSnapshot: Record<string, string | undefined> = {};
 test('Codex Responses keeps a byte-stable same-stage prefix and forwards provider cache usage', async () => {
@@ -39,17 +41,16 @@ test('Codex Responses keeps a byte-stable same-stage prefix and forwards provide
     const bodies: Record<string, unknown>[] = [];
     const serializedBodies: string[] = [];
     const sessionIds: string[] = [];
-    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation((async (_input, init) => {
-      serializedBodies.push(String(init?.body));
-      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
-      sessionIds.push(new Headers(init?.headers).get('session-id') ?? '');
+    await withFakeFetchDevice([{ url: 'https://chatgpt.com/backend-api/codex/responses', method: 'POST', response: request => {
+      serializedBodies.push(String(request.body));
+      bodies.push(JSON.parse(String(request.body)) as Record<string, unknown>);
+      sessionIds.push(request.headers['session-id'] ?? '');
       const cached = bodies.length === 1 ? 0 : 512;
       return new Response(`data: ${JSON.stringify({
         type: 'response.completed',
         response: { usage: { input_tokens: 1024, output_tokens: 3, input_tokens_details: { cached_tokens: cached } } },
       })}\n\n`, { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }) as typeof fetch);
-    try {
+    } }], async (device) => {
       for (const stage of toolStages) {
         for await (const event of provider.streamChat!(messages, {
           sessionId: 'session-cache-test', tools: stage.tools,
@@ -58,9 +59,8 @@ test('Codex Responses keeps a byte-stable same-stage prefix and forwards provide
           if (event.type === 'usage') observedUsage.push(event.usage);
         }
       }
-    } finally {
-      fetchMock.mockRestore();
-    }
+      expect(device.calls()).toHaveLength(4);
+    });
     expect(bodies).toHaveLength(4);
     expect(sessionIds).toEqual(Array(4).fill('session-cache-test'));
     expect(serializedBodies[0]).toBe(serializedBodies[1]);

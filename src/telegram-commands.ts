@@ -430,7 +430,7 @@ export function defaultTelegramCommands(
     {
       name: 'release',
       description: '발행 현황 — 지금 런·노드·막힘을 한 통으로',
-      handler: async (args) => telegramReleaseStatus(args),
+      handler: async (args) => telegramReleaseStatus(args, nowDeps),
     },
     {
       name: 'away',

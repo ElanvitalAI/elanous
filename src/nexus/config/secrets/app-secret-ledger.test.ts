@@ -8,6 +8,9 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../../../elanous-con
 import { currentBackend, getSecretAsync, importSecretBatchAsync, importSecretsFileRaw, readSecrets, setSecret, setSecretAsync, useBackend, writeSecrets, deleteSecret, deleteSecretAsync, registerBackend, resetBackendRegistry } from './index.js';
 import { registerSecretCommands } from '../../../cli/secret-cli.js';
 import { deleteAppSecretValue, revokeAppSecretValues, setAppSecretValue } from './file-backend.js';
+import { deleteCredentialSlotAsync, listCredentialSlotsAsync, setCredentialSlotAsync, setCredentialSlotBatchAsync } from './cred-slots.js';
+import { removeCredentialSlotValue, writeCredentialSlotBatchValue, writeCredentialSlotValue } from './registry.js';
+import { writeCredentialSlotBatchRaw } from './file-backend.js';
 import { appSecretId, beginAppSecretEvent, finishAppSecretEvent, recoverAppSecretEvents, withAppSecretLock } from './app-secret-ledger.js';
 
 let dir: string;
@@ -19,6 +22,100 @@ test('app secret ids validate app slugs and credential names', () => {
   for (const [app, name] of [['api', 'KEY'], ['voice--note', 'KEY'], ['voice-note', 'key'], ['../escape', 'KEY']]) {
     expect(() => appSecretId(app, name)).toThrow();
   }
+});
+
+test('credential slots use a typed writer and generic secret APIs cannot bypass it', async () => {
+  useBackend('file');
+  await setCredentialSlotAsync('cred:openai.api_key', 'credential-slot-secret');
+  expect(await getSecretAsync('cred:openai.api_key')).toBe('credential-slot-secret');
+  await expect(setSecretAsync('cred:openai.api_key', 'bypass')).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_WRITER_REQUIRED');
+  await expect(importSecretBatchAsync({ 'cred:openai.api_key': 'bypass' }, true)).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
+  expect(() => importSecretsFileRaw({ 'cred:openai.api_key': 'bypass' }, true)).toThrow('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
+  expect(() => currentBackend().set('cred:openai.api_key', 'backend-bypass')).toThrow('ELANOUS_CREDENTIAL_SLOT_WRITER_REQUIRED');
+  await expect(currentBackend().delete('cred:openai.api_key')).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_WRITER_REQUIRED');
+  await expect(writeCredentialSlotValue('cred:unknown.api_key', 'bypass')).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_UNSUPPORTED');
+  await expect(removeCredentialSlotValue('cred:unknown.api_key')).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_UNSUPPORTED');
+  expect(() => writeCredentialSlotBatchValue({ 'cred:unknown.api_key': 'bypass' })).toThrow('ELANOUS_CREDENTIAL_SLOT_UNSUPPORTED');
+  expect(() => writeCredentialSlotBatchRaw({ 'cred:unknown.api_key': 'bypass' })).toThrow('ELANOUS_CREDENTIAL_SLOT_UNSUPPORTED');
+  const raw = readSecrets();
+  raw.secrets['cred:openai.api_key'] = 'raw-bypass';
+  expect(() => writeSecrets(raw)).toThrow('ELANOUS_CREDENTIAL_SLOT_WRITER_REQUIRED');
+  const row = (await listCredentialSlotsAsync()).find((slot) => slot.id === 'cred:openai.api_key');
+  expect(row).toMatchObject({ present: true, service: 'openai', field: 'api_key' });
+  expect(JSON.stringify(row)).not.toContain('credential-slot-secret');
+  expect(await deleteCredentialSlotAsync('cred:openai.api_key')).toBe(true);
+  expect(await getSecretAsync('cred:openai.api_key')).toBeUndefined();
+  await expect(setCredentialSlotAsync('cred:unknown.api_key', 'unsupported')).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_UNSUPPORTED');
+});
+
+test('typed credential batch stores multi-field slots in one operation while generic imports stay blocked', async () => {
+  useBackend('file');
+  await setCredentialSlotBatchAsync({
+    'cred:higgsfield.key_id': 'key-id-private',
+    'cred:higgsfield.secret': 'secret-private',
+  });
+  expect(await getSecretAsync('cred:higgsfield.key_id')).toBe('key-id-private');
+  expect(await getSecretAsync('cred:higgsfield.secret')).toBe('secret-private');
+  await expect(importSecretBatchAsync({
+    'cred:higgsfield.key_id': 'other-id', 'cred:higgsfield.secret': 'other-secret',
+  }, true)).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_IMPORT_UNSUPPORTED');
+  await expect(setCredentialSlotBatchAsync({
+    'cred:higgsfield.key_id': 'partial', 'cred:unknown.secret': 'invalid',
+  })).rejects.toThrow('ELANOUS_CREDENTIAL_SLOT_UNSUPPORTED');
+  expect(await getSecretAsync('cred:higgsfield.key_id')).toBe('key-id-private');
+  expect(await getSecretAsync('cred:higgsfield.secret')).toBe('secret-private');
+});
+
+test('secret set routes a cred ID through the credential slot writer and does not display its value', async () => {
+  const output: string[] = [];
+  const errors: string[] = [];
+  const writes: Array<[string, string]> = [];
+  const program = new Command();
+  program.exitOverride();
+  registerSecretCommands(program, {
+    isInteractive: () => true,
+    promptSecret: async () => 'cli-slot-secret',
+    saveSecret: async () => { throw new Error('generic writer used'); },
+    saveCredentialSlot: async (id, value) => { writes.push([id, value]); },
+    initializeBackend: () => {},
+    output: { log: (line) => output.push(line), error: (line) => errors.push(line) },
+    setExitCode: () => {},
+  });
+  await program.parseAsync(['node', 'elanous', 'secret', 'set', 'cred:openai.api_key']);
+  expect(writes).toEqual([['cred:openai.api_key', 'cli-slot-secret']]);
+  expect(output.join('\n')).not.toContain('cli-slot-secret');
+  expect(errors).toEqual([]);
+});
+
+test('secret slot list prints only status metadata and redacts listing failures', async () => {
+  const output: string[] = [];
+  const errors: string[] = [];
+  const program = new Command();
+  program.exitOverride();
+  registerSecretCommands(program, {
+    listCredentialSlots: async () => [{ id: 'cred:openai.api_key', service: 'openai', label: 'OpenAI', field: 'api_key', setupUrl: 'https://example.invalid', present: true }],
+    initializeBackend: () => {},
+    output: { log: (line) => output.push(line), error: (line) => errors.push(line) },
+    setExitCode: () => {},
+  });
+  await program.parseAsync(['node', 'elanous', 'secret', 'slot', 'list']);
+  expect(output.join('\n')).toContain('cred:openai.api_key\tOpenAI\tapi_key\tpresent');
+  expect(output.join('\n')).not.toContain('secret-value');
+  expect(errors).toEqual([]);
+
+  const failedOutput: string[] = [];
+  const failedErrors: string[] = [];
+  const failedProgram = new Command();
+  failedProgram.exitOverride();
+  registerSecretCommands(failedProgram, {
+    listCredentialSlots: async () => { throw new Error('backend leaked credential-slot-secret'); },
+    initializeBackend: () => {},
+    output: { log: (line) => failedOutput.push(line), error: (line) => failedErrors.push(line) },
+    setExitCode: () => {},
+  });
+  await failedProgram.parseAsync(['node', 'elanous', 'secret', 'slot', 'list']);
+  expect(failedErrors).toEqual(['credential slot list failed']);
+  expect([...failedOutput, ...failedErrors].join('\n')).not.toContain('credential-slot-secret');
 });
 
 test('issue and revoke ledger atomically stores lifecycle metadata only with private file permissions', () => {

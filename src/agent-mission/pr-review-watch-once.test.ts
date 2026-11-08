@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import { withFakeBins } from '../ux-sim/fake-bin.js';
-import { simInProcessCli } from '../ux-sim/in-process-cli.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
 // 장치 두 개로 돈다(TEST-AUDIT-1105): gh 는 PATH 가짜(fake-bin) · CLI 는 같은 프로세스의 등록된 Commander 트리(in-process-cli).
 // 예전엔 `bun bin/elanous.mjs` 를 세 번 띄웠다 — 판정(목록 실패 분류·빈 목록 정상 종료)은 그대로, 부팅 세 번만 뺐다.
-const reviewWatchOnce = () => simInProcessCli(
+const reviewWatchOnce = () => simCli(
   ['agent-mission', 'review-watch', '--once', '--dry-run'],
   { allowPaths: [['agent-mission', 'review-watch']] },
 );

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { registerControlCommands, runResourcesQuery } from '../cli/control-cli.js';
+import { createFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import { readPrimaryJoin, resolvePrimary, writePrimaryJoin, type PrimaryAddress, type PrimaryConfig, type ResolvePrimaryOptions } from './primary.js';
 
 const roots: string[] = [];
@@ -190,26 +191,26 @@ test('control join command verifies a file token and writes private machine memb
   writeFileSync(credential, token.member);
   const before = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = dir;
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: URL | RequestInfo, init?: RequestInit) => {
-    expect(String(input)).toBe('https://primary.example/v1/resources?machine=node-b');
-    expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${token.member}`);
+  const fetchDevice = createFakeFetchDevice([{ url: '/v1/resources', response: request => {
+    expect(request.url).toBe('https://primary.example/v1/resources?machine=node-b');
+    expect(request.headers.authorization).toBe(`Bearer ${token.member}`);
     expect(existsSync(join(dir, 'control', 'join.json'))).toBe(false);
     return Response.json({ resources: [] });
-  }) as typeof fetch);
+  } }]);
   const logSpy = spyOn(console, 'log').mockImplementation(() => {});
   try {
     const program = new Command();
     registerControlCommands(program);
     await program.parseAsync(['control', 'join', '--url', 'https://primary.example', '--machine', 'node-b', '--token-file', credential], { from: 'user' });
     expect(process.exitCode).toBe(0);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchDevice.calls()).toHaveLength(1);
     expect(readPrimaryJoin(dir)).toEqual({ url: 'https://primary.example', machine: 'node-b', tokens: { member: token.member } });
     expect(statSync(join(dir, 'control', 'join.json')).mode & 0o077).toBe(0);
     expect(existsSync(join(dir, 'control', 'tokens.json'))).toBe(false);
   } finally {
     process.exitCode = 0;
     logSpy.mockRestore();
-    fetchSpy.mockRestore();
+    fetchDevice.restore();
     if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = before;
   }
@@ -222,10 +223,10 @@ test('resources query preserves local scoped-token behavior and honors explicit 
   const before = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = dir;
   const requests: string[] = [];
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: URL | RequestInfo, init?: RequestInit) => {
-    requests.push(`${String(input)} ${new Headers(init?.headers).get('authorization')}`);
+  const fetchDevice = createFakeFetchDevice([{ url: '/v1/resources', response: request => {
+    requests.push(`${request.url} ${request.headers.authorization}`);
     return Response.json({ resources: [] });
-  }) as typeof fetch);
+  } }]);
   const logSpy = spyOn(console, 'log').mockImplementation(() => {});
   try {
     expect(await runResourcesQuery({ port: '31499', json: true })).toBe(0);
@@ -237,7 +238,7 @@ test('resources query preserves local scoped-token behavior and honors explicit 
     ]);
   } finally {
     logSpy.mockRestore();
-    fetchSpy.mockRestore();
+    fetchDevice.restore();
     if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = before;
   }
@@ -250,18 +251,18 @@ test('resources query uses joined member credential rather than local credential
   writePrimaryJoin({ url: 'https://joined.example', tokens: { member: token.member } }, dir);
   const before = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = dir;
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: URL | RequestInfo, init?: RequestInit) => {
-    expect(String(input)).toBe('https://joined.example/v1/resources');
-    expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${token.member}`);
+  const fetchDevice = createFakeFetchDevice([{ url: '/v1/resources', response: request => {
+    expect(request.url).toBe('https://joined.example/v1/resources');
+    expect(request.headers.authorization).toBe(`Bearer ${token.member}`);
     return Response.json({ resources: [] });
-  }) as typeof fetch);
+  } }]);
   const logSpy = spyOn(console, 'log').mockImplementation(() => {});
   try {
     expect(await runResourcesQuery({})).toBe(0);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchDevice.calls()).toHaveLength(1);
   } finally {
     logSpy.mockRestore();
-    fetchSpy.mockRestore();
+    fetchDevice.restore();
     if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = before;
   }
@@ -271,19 +272,19 @@ test('resources query retains local credential creation when no join exists', as
   const dir = root();
   const before = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = dir;
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: URL | RequestInfo, init?: RequestInit) => {
-    expect(String(input)).toBe('http://127.0.0.1:31413/v1/resources');
-    expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${JSON.parse(readFileSync(join(dir, 'control', 'tokens.json'), 'utf8')).query}`);
+  const fetchDevice = createFakeFetchDevice([{ url: '/v1/resources', response: request => {
+    expect(request.url).toBe('http://127.0.0.1:31413/v1/resources');
+    expect(request.headers.authorization).toBe(`Bearer ${JSON.parse(readFileSync(join(dir, 'control', 'tokens.json'), 'utf8')).query}`);
     return Response.json({ resources: [] });
-  }) as typeof fetch);
+  } }]);
   const logSpy = spyOn(console, 'log').mockImplementation(() => {});
   try {
     expect(await runResourcesQuery({ port: '31413', json: true })).toBe(0);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchDevice.calls()).toHaveLength(1);
     expect(statSync(join(dir, 'control', 'tokens.json')).mode & 0o077).toBe(0);
   } finally {
     logSpy.mockRestore();
-    fetchSpy.mockRestore();
+    fetchDevice.restore();
     if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = before;
   }
@@ -294,19 +295,19 @@ test('resources query uses the joined primary and its query credential without c
   writePrimaryJoin({ url: 'https://primary.example', tokens: { query: token.query, admin: token.admin } }, dir);
   const before = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = dir;
-  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: URL | RequestInfo, init?: RequestInit) => {
-    expect(String(input)).toBe('https://primary.example/v1/resources');
-    expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${token.query}`);
+  const fetchDevice = createFakeFetchDevice([{ url: '/v1/resources', response: request => {
+    expect(request.url).toBe('https://primary.example/v1/resources');
+    expect(request.headers.authorization).toBe(`Bearer ${token.query}`);
     return Response.json({ resources: [] });
-  }) as typeof fetch);
+  } }]);
   const logSpy = spyOn(console, 'log').mockImplementation(() => {});
   try {
     expect(await runResourcesQuery({ port: '31499', json: true })).toBe(0);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchDevice.calls()).toHaveLength(1);
     expect(existsSync(join(dir, 'control', 'tokens.json'))).toBe(false);
   } finally {
     logSpy.mockRestore();
-    fetchSpy.mockRestore();
+    fetchDevice.restore();
     if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = before;
   }

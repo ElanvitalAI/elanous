@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from './llm/tool-spec.js';
 // OR-STICKY-ROUTING (2026-10-10) — OpenRouter 요청에 세션/런 단위 고정 라우팅 키(body session_id ⊕ x-session-id).
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
-import { getProviderForConfig, openRouterStickySessionKey, streamLLMWithTools, type LLMToolSpec } from './llm.js';
+import { getProviderForConfig, openRouterStickySessionKey, streamLLMWithTools } from './llm.js';
 import type { UserConfig } from './user-config.js';
 
 const tools: LLMToolSpec[] = [{ name: 'Read', description: 'd', parameters: { type: 'object', properties: { p: { type: 'string' } } } }];

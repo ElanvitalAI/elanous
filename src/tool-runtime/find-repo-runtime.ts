@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── FindRepo ToolRuntime (Coding Pipeline P5) ──
 //
 // Extracts GitHub / GitLab / Bitbucket repository URLs from a blob of
@@ -18,7 +19,7 @@
 // lean; LLMs that don't need the discovery cycle shouldn't pay the
 // schema token cost.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 
 const DEFAULT_MAX_RESULTS = 5;

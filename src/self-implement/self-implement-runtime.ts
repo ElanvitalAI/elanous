@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // SelfImplement 네이티브 툴 런타임 (2026-07-19 · P2) — elanous 가 TUI 대화의 자연어
 // ("이 기능 구현하고 PR 올려줘")를 인식해 자율 호출하는 ToolRuntime. runSelfImplement
 // 시퀀서(fork→worktree→구현→gate→PR)를 실 seam(defaultSeams)로 구동한다.
@@ -10,7 +11,7 @@
 // 미션 무접촉: 미션 plan/build 코드와 무결합인 재사용 seam 만 호출(세션-드라이브 흐름).
 
 import { observeSelfImplementSoftStopSpace } from './soft-stop-observer.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime, ToolRuntimeContext } from '../tool-runtime/types.js';
 import type { SelfImplementProgressStage, SelfImplementResult, SelfImplementSeams } from './orchestrator.js';
 import { createSeqTracker, makeEnvelope } from '../feedback/envelope.js';

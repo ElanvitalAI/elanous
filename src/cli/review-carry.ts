@@ -7,6 +7,88 @@ import { tmpdir } from 'node:os';
 
 const SHA = /^[0-9a-f]{40}$/i;
 const MAX = 32 * 1024 * 1024;
+const SCOPE_TOTAL_MAX = 12000;
+
+function boundedSection(text: string, max = SCOPE_TOTAL_MAX): string {
+  return text.length <= max ? text
+    : `${text.slice(0, max)}\n...[scope/evidence section truncated; ${text.length - max} chars omitted]`;
+}
+
+function renderSections(sections: MarkdownSection[]): string {
+  const headers = sections.map(({ heading }) => `### ${heading}\n`);
+  const separators = Math.max(0, sections.length - 1) * 2;
+  const bodyBudget = Math.max(0, SCOPE_TOTAL_MAX - separators - headers.reduce((sum, header) => sum + header.length, 0));
+  const budgets = sections.map(() => 0);
+  let pending = sections.map((_, index) => index);
+  let remaining = bodyBudget;
+  while (pending.length) {
+    const share = Math.floor(remaining / pending.length);
+    const complete = pending.filter((index) => sections[index]!.body.length <= share);
+    if (complete.length === 0) {
+      for (const index of pending) budgets[index] = share;
+      break;
+    }
+    for (const index of complete) {
+      budgets[index] = sections[index]!.body.length;
+      remaining -= budgets[index]!;
+      pending = pending.filter((candidate) => candidate !== index);
+    }
+  }
+  return sections.map(({ body }, index) => `${headers[index]}${boundedSection(body, budgets[index]!)}`).join('\n\n');
+}
+
+function outermostMatchingSections(sections: MarkdownSection[], predicate: (heading: string) => boolean): MarkdownSection[] {
+  const matching = new Set(sections.filter(({ heading }) => predicate(heading)).map(({ index }) => index));
+  return sections.filter((section) => matching.has(section.index)
+    && !section.ancestors.some((ancestor) => matching.has(ancestor)));
+}
+
+export function buildReviewScopeContractContext(input: {
+  prBody?: string;
+  previouslyFixedFindings?: readonly string[];
+}): string {
+  const body = input.prBody?.trim() ?? '';
+  const sections = markdownSections(body);
+  const scope = outermostMatchingSections(sections, (heading) => /(?:scope boundary|intentional scope|out of scope|범위 경계|범위 밖|범위 제외|의도적 범위)/i.test(heading));
+  const declaredScope = scope.length ? scope : outermostMatchingSections(sections, (heading) =>
+    /^(?:summary|change|answer)(?:\b|\s|[:：—-]|$)/i.test(heading)
+      || /^(?:변경|요약|답변)(?:\s|[:：—-]|$)/.test(heading));
+  const evidence = outermostMatchingSections(sections, (heading) => /(?:evidence|proof|test reach|verification|validation|tests?|증거|검증 근거|검증 결과|시험)/i.test(heading));
+  const stale = [...new Set((input.previouslyFixedFindings ?? []).map((finding) => finding.trim()).filter(Boolean))];
+  return [
+    '## Intentional scope boundary',
+    declaredScope.length ? `${renderSections(declaredScope)}${scope.length ? '' : '\n\nNo explicit exclusions were stated; do not infer additional scope boundaries.'}`
+      : 'No intentional scope boundary or summary was stated in the PR body. Do not invent one; review the declared intent and diff.',
+    'Review declared exclusions. Do not require out-of-scope work unless the current diff contains a concrete correctness, safety, or data-loss defect.',
+    '## PR body evidence',
+    evidence.length ? renderSections(evidence)
+      : `No explicit evidence section was found. Treat the PR body as context, not proof.\n\n## PR body (verbatim)\n${boundedSection(body || '(PR body unavailable)')}`,
+    '## Previously closed findings',
+    stale.length
+      ? `${stale.map((finding) => `[STALE — previously closed with evidence] ${finding}`).join('\n')}\nDo not re-raise these findings unless the current diff supplies concrete contrary evidence.`
+      : 'No evidence-closed finding from the immediately preceding review is available.',
+  ].join('\n\n');
+}
+
+interface MarkdownSection { heading: string; body: string; level: number; index: number; ancestors: number[] }
+
+function markdownSections(markdown: string): MarkdownSection[] {
+  const matches = [...markdown.matchAll(/^(#{1,6})\s+(.+?)\s*#*\s*$/gm)].map((match) => ({
+    level: match[1]!.length,
+    heading: match[2]!.trim(),
+    start: match.index! + match[0].length,
+    index: match.index!,
+  }));
+  const stack: Array<{ index: number; level: number }> = [];
+  return matches.map((section, index) => {
+    while (stack.at(-1) && stack.at(-1)!.level >= section.level) stack.pop();
+    const ancestors = stack.map(({ index: ancestorIndex }) => ancestorIndex);
+    stack.push({ index: section.index, level: section.level });
+    const next = matches.slice(index + 1).find((candidate) => candidate.level <= section.level);
+    return { heading: section.heading, body: markdown.slice(section.start, next?.index ?? markdown.length).trim(),
+      level: section.level, index: section.index, ancestors };
+  });
+}
 
 export type ReviewCarryProof = { ok: true; oldBase: string; newBase: string; patchId: string; pathsModesHash: string }
   | { ok: false; reason: string };

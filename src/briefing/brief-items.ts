@@ -5,6 +5,8 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { dateKey } from '../time/calendar.js';
 import { readRequirementFunnel, type RequirementFunnelResult } from '../intake-plane/requirement-funnel.js';
+import { normalizeClaim } from './claim-key.js';
+export { normalizeClaim } from './claim-key.js';
 
 export const BRIEF_DOMAINS = ['운영', '판', '흡수', '시장', '행정', '코나투스'] as const;
 export const BRIEF_PRIORITIES = ['P0', 'P1', 'P2'] as const;
@@ -83,11 +85,6 @@ function required(value: string, field: string): string {
 
 function optional(value: string | null | undefined, field: string): string | null {
   return value == null ? null : required(value, field);
-}
-
-/** Collapse whitespace so the same claim, however spaced, counts once. */
-export function normalizeClaim(text: string): string {
-  return text.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
 function deadlineDate(deadline: string): string {

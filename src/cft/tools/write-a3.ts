@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.7 P1: WriteA3 LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { renderA3, type A3Input, type A3Report } from '../a3.js';
 
 export interface WriteA3Input extends A3Input {}

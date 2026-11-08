@@ -3,7 +3,7 @@ import { debug } from '../debug/log.js';
 import { clearLaunchRoleLlmOverrides, getUserConfig, setLaunchRoleLlmOverrides, setUserConfigOverlay } from '../user-config.js';
 import { createSelfImplementControlBrain } from './seams.js';
 import { decideInterventionStep } from './intervention-step.js';
-import { runHeadlessGoalLoopPty } from './headless-elanous-driver.js';
+import { calculateBrainTimeoutMs, runHeadlessGoalLoopPty } from './headless-elanous-driver.js';
 import { getProviderForConfig, streamLLM, type LLMProvider } from '../llm.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
@@ -146,41 +146,107 @@ function fakePty() {
   };
 }
 
-test('a 20-second brain answer succeeds by default, records duration, and does not report brain.fail', async () => {
+function createBrainDelaySimulation() {
+  let nowMs = 0;
+  let nextId = 0;
+  const pending = new Map<number, { at: number; callback: () => void; delayMs: number }>();
+  const scheduledTimers: Array<{ delayMs: number }> = [];
+  const firedDelays: number[] = [];
+  const scheduledWaiters: Array<{ delayMs: number; count: number; resolve: () => void }> = [];
+  const setTimer = ((callback: (...args: unknown[]) => void, delay = 0) => {
+    const id = ++nextId;
+    const delayMs = Number(delay);
+    scheduledTimers.push({ delayMs });
+    pending.set(id, { at: nowMs + delayMs, callback: () => callback(), delayMs });
+    for (const waiter of scheduledWaiters.splice(0)) {
+      if (scheduledTimers.filter(({ delayMs: value }) => value === waiter.delayMs).length >= waiter.count) waiter.resolve();
+      else scheduledWaiters.push(waiter);
+    }
+    return id as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout;
+  const clearTimer = ((timer: ReturnType<typeof setTimeout>) => { pending.delete(timer as unknown as number); }) as typeof clearTimeout;
+  return {
+    scheduledTimers,
+    firedDelays,
+    waitForScheduled(delayMs: number, count: number) {
+      if (scheduledTimers.filter(({ delayMs: value }) => value === delayMs).length >= count) return Promise.resolve();
+      return new Promise<void>((resolve) => scheduledWaiters.push({ delayMs, count, resolve }));
+    },
+    delay: (ms: number) => new Promise<void>((resolve) => { setTimer(resolve, ms); }),
+    advanceBy(ms: number) {
+      nowMs += ms;
+      for (const [id, timer] of [...pending]) {
+        if (timer.at > nowMs) continue;
+        pending.delete(id);
+        firedDelays.push(timer.delayMs);
+        timer.callback();
+      }
+    },
+    setTimer,
+    clearTimer,
+  };
+}
+
+test('a simulated 20-second brain answer succeeds under the default timeout without brain.fail', async () => {
   const pty = fakePty();
-  const result = await runHeadlessGoalLoopPty({
+  const clock = createBrainDelaySimulation();
+  let wallClockNowMs = 0;
+  const running = runHeadlessGoalLoopPty({
     binRoot: '/tmp/repo', cwd: '/tmp/brain-fast', featurePrompt: 'feature',
     maxWaitSec: 1, maxHardWaitSec: 40, activityGraceSec: 0, pollMs: 1,
+    wallClockNowMs: () => wallClockNowMs,
+    brainTimeoutTimers: { setTimeout: clock.setTimer, clearTimeout: clock.clearTimer },
     ptyAvailable: () => true, spawn: (() => pty) as never,
     brain: { decide: async () => {
-      await new Promise((resolve) => setTimeout(resolve, 20_000));
+      wallClockNowMs = 10_000;
+      await clock.delay(20_000);
       return { action: 'wait' };
     } },
   });
+  await clock.waitForScheduled(20_000, 1);
+  clock.advanceBy(20_000);
+  const result = await running;
   expect(result.ok).toBe(true);
   expect(logs.filter(({ event }) => event === 'brain.fail')).toHaveLength(0);
   const suggestions = logs.filter(({ event }) => event === 'brain.suggestion');
   expect(suggestions.length).toBeGreaterThan(0);
-  expect(suggestions[0]!.data.durationMs).toBeGreaterThanOrEqual(20_000);
-}, 50_000);
+  expect(clock.firedDelays).toContain(20_000);
+  const timeoutTimers = clock.scheduledTimers.filter(({ delayMs }) => delayMs !== 20_000);
+  expect(timeoutTimers).toHaveLength(1);
+  expect(timeoutTimers[0]!.delayMs).toBe(30_000);
+  expect(clock.firedDelays.some((ms) => ms > 20_000)).toBe(false);
+  expect(suggestions[0]!.data.durationMs).toBeGreaterThanOrEqual(0);
+  expect(suggestions[0]!.data.durationMs).toBeLessThan(5_000);
+}, 5_000);
 
-test('concurrent 20-second brain answers remain below 5% suggestion timeouts', async () => {
+test('concurrent simulated 20-second brain answers remain below 5% suggestion timeouts', async () => {
   const loops = 20;
-  const results = await Promise.all(Array.from({ length: loops }, (_, index) => runHeadlessGoalLoopPty({
+  const clock = createBrainDelaySimulation();
+  const runs = Array.from({ length: loops }, (_, index) => runHeadlessGoalLoopPty({
     binRoot: '/tmp/repo', cwd: `/tmp/brain-fast-${index}`, featurePrompt: 'feature',
     maxWaitSec: 1, maxHardWaitSec: 40, activityGraceSec: 0, pollMs: 1,
+    brainTimeoutTimers: { setTimeout: clock.setTimer, clearTimeout: clock.clearTimer },
     ptyAvailable: () => true, spawn: (() => fakePty()) as never,
     brain: { decide: async () => {
-      await new Promise((resolve) => setTimeout(resolve, 20_000));
+      await clock.delay(20_000);
       return { action: 'wait' };
     } },
-  })));
+  }));
+  await clock.waitForScheduled(20_000, loops);
+  clock.advanceBy(20_000);
+  const results = await Promise.all(runs);
   expect(results.every((result) => result.ok)).toBe(true);
   const failures = logs.filter(({ event, data }) => event === 'brain.fail' && data.error === 'brain suggestion timeout');
   const suggestions = logs.filter(({ event }) => event === 'brain.suggestion');
   expect(suggestions.length).toBeGreaterThanOrEqual(loops);
   expect(failures.length / (failures.length + suggestions.length)).toBeLessThan(0.05);
 }, 50_000);
+
+test('brain timeout is clamped to the remaining hard-wait budget', () => {
+  expect(calculateBrainTimeoutMs(45_000, 40_000, 10_000)).toBe(30_000);
+  expect(calculateBrainTimeoutMs(20_000, 40_000, 10_000)).toBe(20_000);
+  expect(calculateBrainTimeoutMs(45_000, 40_000, 50_000)).toBe(1);
+});
 
 test('injected brainTimeoutMs still wins, logs a timed failure, and polling continues', async () => {
   const result = await runHeadlessGoalLoopPty({

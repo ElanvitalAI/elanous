@@ -1,6 +1,6 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,11 @@ import { getUserConfig, reloadUserConfig, userConfigPath } from '../user-config.
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import type { LandWorktree, LandWorktreeFailure, LandWorktreeInput } from './land-worktree.js';
 import { decisionRaiseArgs, executeNextAction } from './actions.js';
+import { createTempDirectoryScope } from '../test-utils/temp-dir-cleanup.js';
+const tempDirectoryScope = createTempDirectoryScope();
+const mkdtempSync = tempDirectoryScope.mkdtempSync;
+
+afterAll(() => tempDirectoryScope.cleanup());
 import { CLOSE_IDLE_HOURS, CLOSE_PROTECTED_LABELS, type DraftCloseView, evaluateDraftClose, executeLiveCloseProposal, defaultPrHead, defaultRequestReview, defaultReviewRepoCandidates, executeLiveDecisionCard, executeLiveLand, executeLiveReview, type LiveDecisionCardContext, liveCloseArgs, liveLandArgs, liveReviewArgs, type PrHeadView, type ReviewRepoCandidate, resolveTaskAgentLiveMoves, TASK_AGENT_LIVE_MOVES_ENV, TASK_AGENT_LIVE_MOVES, type TaskAgentLiveMove } from './live-moves.js';
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { readTaskCard, shellQuote, writeTaskCards, type TaskCard } from './task-hand.js';

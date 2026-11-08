@@ -56,10 +56,8 @@ import { TtsVoiceIdPickerCard } from './TtsVoiceIdPickerCard';
 import { PresetCardGrid } from './PresetCardGrid';
 import { LlmCatalogCard } from './LlmCatalogCard';
 import { BudgetGuardWatcher } from './BudgetGuardWatcher';
-import { EmbeddingVisionTierCard } from './EmbeddingVisionTierCard';
 import { PersonaCard } from './PersonaCard';
 import { BuildInfoCard } from './BuildInfoCard';
-import { MenuVisibilityCard } from './MenuVisibilityCard';
 
 const PROVIDER_OPTIONS = ['', 'claude', 'gemini', 'grok', 'codex'];
 
@@ -675,13 +673,6 @@ export function SettingsPanel() {
           (10k+ voices) + 1-click preview + NL search. */}
       <TtsVoiceIdPickerCard />
 
-      {/* M3-2 (Phase 3) — Embedding + Vision tier scaffolding. Sits
-          below the voice cards because casual users almost never touch
-          these surfaces (RAG / OCR). Resolvers wired daemon-side;
-          actual call-site integration follows as RAG/vision pipelines
-          come online. */}
-      <EmbeddingVisionTierCard />
-
       <section className="space-y-3">
         <h2 className="text-sm font-medium">데몬 연결</h2>
         <label className="block space-y-1">
@@ -1157,18 +1148,6 @@ export function SettingsPanel() {
       )}
 
       <section className="space-y-3">
-        <h2 className="text-sm font-medium">대화</h2>
-        <div className="rounded-md border border-border bg-card px-3 py-2 font-mono text-xs">
-          {sessionId || '(no session yet)'}
-        </div>
-        <p className="text-xs text-muted-foreground">
-          A new session id is allocated on first load. Use Chat&rsquo;s
-          <code className="mx-1 rounded bg-muted px-1.5 py-0.5">:fork</code>
-          meta-command to start fresh once U-3 ships.
-        </p>
-      </section>
-
-      <section className="space-y-3">
         <h2 className="text-sm font-medium">Theme</h2>
         <div className="flex flex-wrap gap-2">
           {THEMES.map((t) => (
@@ -1199,11 +1178,7 @@ export function SettingsPanel() {
       {/* T4.D — Generate connect token (다른 머신 elanous nexus connect 용). */}
       <ConnectTokenCard />
 
-      {/* 빌드 정보 (2026-07-08) — 우하단 fixed 배너를 정식 카드로 이관. */}
-      <MenuVisibilityCard />
       <BuildInfoCard />
-
-      <Button onClick={() => toast.success('Settings saved')}>Saved</Button>
     </div>
   );
 }

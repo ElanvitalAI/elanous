@@ -411,6 +411,31 @@ describe('elanous pr land', () => {
     }
   });
 
+  it('runs the export drift radar after a main landing and keeps its failure fail-soft', async () => {
+    const { manager, calls } = fakeManager();
+    const sink = output();
+    const mergeCommit = 'c'.repeat(40);
+    const landed: Array<{ cwd: string; mergeCommit: string }> = [];
+    const logged = spyOn(debug, 'log').mockImplementation(() => {});
+    const run = (cmd: string, args: readonly string[]) => {
+      if (cmd === 'git' && args.join(' ') === 'remote') return { ok: true, out: 'origin\n' };
+      if (cmd === 'git' && args.join(' ') === 'remote get-url origin') return { ok: true, out: 'https://github.com/example/repo.git\n' };
+      if (cmd === 'git' && args.join(' ') === 'rev-parse --verify --quiet refs/remotes/origin/main') return { ok: true, out: 'remote-sha\n' };
+      if (cmd === 'git' && args.join(' ') === 'rev-list --left-right --count main...refs/remotes/origin/main') return { ok: true, out: '0\t0\n' };
+      if (cmd === 'gh' && args.includes('mergeCommit')) return { ok: true, out: JSON.stringify({ mergeCommit: { oid: mergeCommit } }) };
+      return { ok: false, out: '' };
+    };
+    try {
+      expect(await runPrLand({}, {
+        ...baseDeps, resolveBase: () => 'main', run, manager, out: sink.out,
+        driftRadar: (input) => { landed.push(input); throw new Error('radar offline'); },
+      })).toBe(0);
+      expect(calls).toEqual(['find', 'upsert', 'merge']);
+      expect(landed).toEqual([{ cwd: process.cwd(), mergeCommit }]);
+      expect(logged.mock.calls).toContainEqual(['pr.land', 'drift-radar-skipped', { pr: 42, reason: 'Error: radar offline' }]);
+    } finally { logged.mockRestore(); }
+  });
+
   for (const [label, gate, detail] of [
     ['fails', () => false, 'PWA 빌드 실패'],
     ['cannot measure', () => { throw new Error('apps/pwa/node_modules incomplete'); }, '못 쟀다'],
@@ -3400,6 +3425,22 @@ describe('elanous pr land', () => {
     expect(await runPrLand({}, { ...baseDeps, manager: merged.manager, out: output().out })).toBe(0);
     expect(merged.calls).toEqual(['find', 'upsert', 'merge']);
     expect(merged.upserts[0]?.draft).toBe(false);
+  });
+
+  it('records a thrown PR upsert with elapsed time before rethrowing', async () => {
+    const { manager } = fakeManager({ upsertPr: () => { throw new Error('upsert transport failed'); } });
+    const calls: unknown[][] = [];
+    const logged = spyOn(debug, 'log').mockImplementation((...args: unknown[]) => { calls.push(args); });
+    try {
+      await expect(runPrLand({ hold: true }, { ...baseDeps, manager, out: output().out }))
+        .rejects.toThrow('upsert transport failed');
+      expect(calls).toContainEqual(expect.arrayContaining([
+        'pr.land', 'upsert.threw', expect.objectContaining({ hold: true, error: 'upsert transport failed' }),
+        expect.objectContaining({ level: 'error' }),
+      ]));
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   it('dry-run --hold plans to stop before merge and still prints overlap', async () => {

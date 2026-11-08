@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, test } from 'bun:test';
 import { verifyOverlapEvidence } from './pr-land-overlap-evidence.js';
-import { proveReviewCarry } from './review-carry.js';
+import { buildReviewScopeContractContext, proveReviewCarry } from './review-carry.js';
 import type { CmdRunner } from '../autopilot/pr-manager.js';
 
 function fixture(conflict = false) {
@@ -103,3 +103,69 @@ test('REVIEW-CARRY: code commit after merge and manual conflict resolution are r
     rmSync(conflicted.cwd, { recursive: true, force: true });
   }
 }, 30_000);
+
+test('REVIEW-SCOPE-CONTRACT: six incident replays carry boundaries, PR evidence, and stale closed critiques', () => {
+  const incidents = [
+    { pr: 35647, body: '## Summary\nBreak the runtime import cycle across the PWA/Nexus show modules.\n\n## Verification\n18 test files passed; PWA build passed.', scope: 'Break the runtime import cycle', evidence: '18 test files passed; PWA build passed.', closed: 'already-fixed relative path' },
+    { pr: 35651, body: '## Summary\nBreak the checker/registry cycle without changing loop checking or scheduling.\n\n## Test reach\n16 files, zero introduced failures; six baseline failures.\n\n## Verification\nDirect guard test: 1 pass.', scope: 'Break the checker/registry cycle without changing loop checking or scheduling.', evidence: 'Direct guard test: 1 pass.', closed: 'require full 1,225-module acyclic graph' },
+    { pr: 35523, body: 'Update the release fan-out fake CLI to model held branch state and require readiness plus exact head pin before landing.', scope: 'Update the release fan-out fake CLI', closed: 'third review demands expansion beyond the fake CLI change' },
+    { pr: 35720, body: '## Answer\nAdd a receipt-side summarizer for persisted shard dispositions; this PR intentionally contains no gate-node.ts wiring.\n\n## Validation\nNine tests passed; changed test files passed remotely.', scope: 'Add a receipt-side summarizer for persisted shard dispositions; this PR intentionally contains no gate-node.ts wiring.', evidence: 'Nine tests passed; changed test files passed remotely.', closed: 'add out-of-scope producer' },
+    { pr: 35457, body: '## Change\nIsolate baseline gate failures with Pod batches and fail closed on incomplete results.\n\n## Verification\nFive tests passed; changed-file typecheck passed.', scope: 'Isolate baseline gate failures with Pod batches', evidence: 'Five tests passed; changed-file typecheck passed.', closed: 'review cap r5 exceeded' },
+    { pr: 35542, body: '## Answer\nShare runtime identity for gate replay and SI allocation; cross-architecture reuse is a separate follow-up.\n\n## Verification\nCurrent head has no fresh tests or typecheck.', scope: 'Share runtime identity for gate replay and SI allocation; cross-architecture reuse is a separate follow-up.', evidence: 'Current head has no fresh tests or typecheck.', closed: 'review-cap-exceeded' },
+  ];
+  const replay = incidents.map((incident) => buildReviewScopeContractContext({
+    prBody: incident.body,
+    previouslyFixedFindings: [incident.closed],
+  }));
+  expect(replay).toHaveLength(6);
+  for (let index = 0; index < incidents.length; index += 1) {
+    const incident = incidents[index]!;
+    const context = replay[index]!;
+    expect(context).toContain('## Intentional scope boundary');
+    expect(context).toContain(incident.scope);
+    expect(context).toContain('## PR body evidence');
+    if (incident.evidence) expect(context).toContain(incident.evidence);
+    else expect(context).toContain('No explicit evidence section was found');
+    expect(context).toContain(`[STALE — previously closed with evidence] ${incident.closed}`);
+    expect(context).toContain('Do not re-raise');
+  }
+});
+
+test('REVIEW-SCOPE-CONTRACT: Korean scope headings and nested evidence subsections survive extraction', () => {
+  const context = buildReviewScopeContractContext({ prBody: '## 요약\n한 파일의 null guard만 수정한다.\n\n## Evidence\n### Tests\n원격 회귀 시험 1건 통과.', previouslyFixedFindings: [] });
+  expect(context).toContain('### 요약\n한 파일의 null guard만 수정한다.');
+  expect(context).toContain('### Evidence\n### Tests\n원격 회귀 시험 1건 통과.');
+  expect(context).not.toContain('No explicit scope boundary or summary');
+  expect(context).not.toContain('No explicit evidence section was found');
+});
+
+test('REVIEW-SCOPE-CONTRACT: heading depth is recognized while child sections remain inside parent evidence', () => {
+  const context = buildReviewScopeContractContext({ prBody: '### 요약\nOne-file change.\n\n## Verification\n### Tests\nRemote test passed.' });
+  expect(context).toContain('### 요약\nOne-file change.');
+  expect(context).toContain('### Verification\n### Tests\nRemote test passed.');
+});
+
+test('REVIEW-SCOPE-CONTRACT: nested evidence is included once and later evidence sections survive truncation', () => {
+  const nested = 'test evidence '.repeat(220);
+  const context = buildReviewScopeContractContext({ prBody: `## Verification\n### Tests\n${nested}\n\n## Evidence\nLater independent gate result.` });
+  expect(context).toContain(nested.trim());
+  expect(context).toContain('### Evidence\nLater independent gate result.');
+  expect(context.split('### Tests').length - 1).toBe(1);
+});
+
+test('REVIEW-SCOPE-CONTRACT: short sections return unused budget and all small evidence sections survive', () => {
+  const long = 'verification detail '.repeat(220);
+  const many = Array.from({ length: 13 }, (_, index) => `## Evidence ${index + 1}\nresult-${index + 1}`).join('\n\n');
+  const context = buildReviewScopeContractContext({ prBody: `## Verification\n${long}\n\n## Evidence\nshort evidence\n\n${many}` });
+  expect(context).toContain(long.trim());
+  expect(context).toContain('short evidence');
+  expect(context).toContain('### Evidence 13\nresult-13');
+});
+
+test('REVIEW-SCOPE-CONTRACT: zero body budget truncates content when section headings alone exceed the cap', () => {
+  const largeBody = 'private-evidence-body '.repeat(50);
+  const sections = Array.from({ length: 80 }, (_, index) => `## Evidence ${index + 1} ${'heading'.repeat(25)}\n${largeBody}`);
+  const context = buildReviewScopeContractContext({ prBody: sections.join('\n\n') });
+  expect(context).toContain('[scope/evidence section truncated;');
+  expect(context).not.toContain(largeBody);
+});

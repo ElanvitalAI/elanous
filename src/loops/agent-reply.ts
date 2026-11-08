@@ -1,9 +1,10 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { existsSync, mkdirSync, realpathSync, statSync } from 'node:fs';
 import { buildCliAgentTools } from '../cli/agent-cli.js';
 import { debug, redactSecrets, redactSecretText } from '../debug/log.js';
-import type { LLMProvider, LLMToolSpec } from '../llm.js';
+import type { LLMProvider } from '../llm.js';
 import type { Message, MsgStore } from '../msg/msg-store.js';
 import { canonicalSeatId } from '../msg/msg-store.js';
 import { ensureCliSession, runTurn } from '../session/chat.js';

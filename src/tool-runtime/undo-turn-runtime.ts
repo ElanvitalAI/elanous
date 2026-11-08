@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── UndoTurn runtime (UT3) ──
 //
 // LLM-facing tool that restores the most recent ghost-commit
@@ -8,7 +9,7 @@
 // Destructive by design: a restore can wipe uncommitted changes.
 // That's the whole point — the user asked to undo the turn.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import {
   findSnapshotById,
   peekSnapshot,

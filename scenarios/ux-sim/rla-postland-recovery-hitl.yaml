@@ -1,0 +1,17 @@
+id: rla-postland-recovery-hitl
+purpose: Prove a missing repair-landing receipt is recovered from GitHub or reaches an in-run HITL node without restarting the release graph.
+fault:
+  firstLandingReceipt: unavailable
+  recoveryQueryFailures: 3
+  externalGitHub: mocked
+expected:
+  sameRun: true
+  recoveryAttempts: 3
+  pendingNode: gate-repair-recovery
+  approvalContinuesAt: gate
+  gateExecutions: 2
+  terminalStatus: failed
+boundaries:
+  productionGraphRunner: real
+  productionGateRepairNode: real
+  githubAndClock: simulated

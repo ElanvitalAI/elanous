@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Daemon-tool surface for PtyShell* interactive-terminal LLM tools.
 //
 // The PtyShell* family (skills/tools/pty.ts) is elanous's direct analog of
@@ -25,7 +26,7 @@
 // hardening (codex-style seatbelt/seccomp) is tracked separately as the
 // follow-up to this minimal exposure experiment.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 import {
   buildPtyShellStartTool,

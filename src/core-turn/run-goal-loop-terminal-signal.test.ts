@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // TUI-GOAL-LOOP-FRICTION(#25·#46·#63) — goal loop → runCoreTurn → streamLLMWithTools 배선.
 // goal loop 가 update_goal 을 «종결 신호»로 넘기고(runCoreTurn 이 그대로 전달), 그래서
 //   · 답 ⊕ update_goal(complete) 한 턴이면 모델 호출 1회로 끝난다(빈 턴 0 · [NO FINAL SYNTHESIS] 0)
@@ -6,7 +7,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import * as debugModule from '../debug/log.js';
 import * as llmModule from '../llm.js';
-import type { LLMMessage, LLMProvider, LLMStreamEvent, LLMToolSpec } from '../llm.js';
+import type { LLMMessage, LLMProvider, LLMStreamEvent } from '../llm.js';
 import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';
 import { runGoalLoop } from './run-goal-loop.js';

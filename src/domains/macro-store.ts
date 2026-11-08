@@ -10,7 +10,7 @@
 // 근거: 대표 지시 2026-07-08(매크로 인덱스 추적관찰+매매 신호).
 
 import { Database } from 'bun:sqlite';
-import { REGIME_DB_PATH } from './regime-store.js';
+import { REGIME_DB_PATH } from './regime-db-path.js';
 
 export interface MacroSnapshot {
   asOf: string;          // YYYY-MM-DD

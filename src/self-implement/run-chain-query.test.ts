@@ -313,7 +313,15 @@ describe('queryRunChain', () => {
       appendLog(store, 'dev-pipeline', 'plan', { runId: 'run-00000000-0000-4000-8000-000000000007', goalId: 'goal-old', originSession: 'origin-old' });
       appendLog(store, 'daemon-tools.self-implement', 'done', { runId: 'run-00000000-0000-4000-8000-000000000007', pr: 'https://github.com/acme/elanous/pull/9' });
       appendLog(store, 'daemon-tools.self-implement', 'dispatch', { sessionId: 'origin-old', userText: 'old request fingerprint' });
-      for (let index = 0; index < 1_000; index += 1) appendLog(store, 'daemon-tools.self-implement', 'dispatch', { sessionId: `origin-old-distractor-${index}`, userText: 'distractor' });
+      store.insertBatch(Array.from({ length: 1_000 }, (_, index) => ({
+        surface: 'test',
+        rec: {
+          ts: '2026-08-06T00:00:00.000Z',
+          category: 'daemon-tools.self-implement',
+          event: 'dispatch',
+          data: { sessionId: `origin-old-distractor-${index}`, userText: 'distractor' },
+        },
+      })));
       store.close();
       const readOnly = readonlyStore(f.logPath);
       const dispatchQueries: LogQuery[] = [];

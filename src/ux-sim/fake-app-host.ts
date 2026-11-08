@@ -20,6 +20,7 @@ export interface FakeAppResponse {
 
 export interface FakeAppHost {
   deploy(slug: string, version: FakeAppVersion | string): void;
+  deployArtifact(slug: string, version: FakeAppVersion): void;
   rollback(slug: string): void;
   fetch(host: string, path: string): FakeAppResponse;
 }
@@ -62,6 +63,23 @@ export function createFakeAppHost(apps: readonly FakeAppDeclaration[]): FakeAppH
   }
 
   return {
+    deployArtifact(slug, version) {
+      const versions = declared.get(slug);
+      if (!versions) throw new Error(`app not found: ${slug}`);
+      if (!version.id.trim() || versions.has(version.id)) throw new Error(`app artifact version already exists or is invalid: ${slug}@${version.id}`);
+      const normalized = new Map<string, string>();
+      for (const [path, content] of Object.entries(version.files)) {
+        const key = normalizeSimWorldAppPath(path);
+        if (!key) throw new Error(`invalid app file path: ${path}`);
+        if (typeof content !== 'string') throw new Error(`invalid app file content: ${slug}@${version.id}${key}`);
+        if (normalized.has(key)) throw new Error(`duplicate normalized app file path: ${slug}@${version.id}${key}`);
+        normalized.set(key, content);
+      }
+      versions.set(version.id, Object.freeze({ id: version.id, files: Object.freeze(Object.fromEntries(normalized)) }));
+      const active = current.get(slug);
+      if (active !== undefined && active !== version.id) previous.set(slug, active);
+      current.set(slug, version.id);
+    },
     deploy(slug, version) {
       const id = typeof version === 'string' ? version : version.id;
       const versions = declared.get(slug);

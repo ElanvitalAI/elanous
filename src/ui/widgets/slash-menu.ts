@@ -8,7 +8,7 @@
 import type { Printer } from '../printer.js';
 import type { KeyEvent } from '../../plugins/core/types.js';
 import type { WidgetChromeSpec } from '../declarative/spec.js';
-import { resolveWidgetChromeBoxViewOptions } from '../declarative/index.js';
+import { resolveWidgetChromeBoxViewOptions } from '../declarative/presentation.js';
 import { resolvePickerChromePresentation } from '../chrome/picker-chrome.js';
 import type { EventResult, FocusSource, Size, View } from '../view.js';
 import { BoxView } from '../view.js';

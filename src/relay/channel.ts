@@ -18,6 +18,11 @@ export interface SerializedDaemonKeyPair {
   secretKey: string;
 }
 
+/** Domain-separated relay host-auth challenge bytes shared by client and server. */
+export function challengeMessage(serverId: string, nonce: string): Uint8Array {
+  return Buffer.from(`elanous-relay-v1:${serverId}:${nonce}`, 'utf8');
+}
+
 function rejected<T>(reason: string): ChannelResult<T> {
   return { ok: false, reason };
 }

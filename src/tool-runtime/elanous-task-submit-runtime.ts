@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // `elanous_task_submit` MCP tool — another agent (Claude Code · Codex · Grok, through the
 // elanous plugin) hands a piece of work to elanous. It goes through the daemon's external
 // entrance POST /v1/tasks as provider `agent-plugin`, so it waits for approval like any
@@ -6,7 +7,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { defaultBaseUrl } from '../telegram-dispatch-forward.js';

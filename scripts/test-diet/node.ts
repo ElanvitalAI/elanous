@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { CardStore } from '../../src/task-cards/card-store.js';
-import { GATE_NIGHTLY_AUDITS } from '../release-loop/gate-node.js';
+import { GATE_NIGHTLY_AUDITS } from '../release-loop/gate-nightly-audits.js';
 import { isCredentialKey } from '../lib/deterministic-env.js';
 import { appendLedger, costTable, judge, lastLedgerLine, ledgerPath, mainFailureFiles, nightlyAuditLedgerPath, pickRange, propose, td1Dispositions, writeCardDraft, writeMainFailureDay, type LedgerLine, type MainFailureResult, type Measurement, type Td1Disposition } from './lib.js';
 import { fixedCountAssertions, flakeVerdict, sweepSlice, unreachableImports, type Mutation, type TestRun } from './effectiveness.js';

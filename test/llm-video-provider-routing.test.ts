@@ -1,3 +1,4 @@
+import { providerSupportsVideo } from '../src/llm/provider-capabilities.js';
 // PR8 (2026-05-14) — LLM provider native video routing tests.
 //
 // Invariants:
@@ -13,13 +14,7 @@
 import { describe, test, expect } from 'bun:test';
 
 import { acpPromptToLlmContent } from '../src/acp/content-blocks.js';
-import {
-  providerSupportsVideo,
-  toAnthropicMessage,
-  toOpenAIMessage,
-  messagesToGeminiInput,
-  type ContentBlock,
-} from '../src/llm.js';
+import { toAnthropicMessage, toOpenAIMessage, messagesToGeminiInput, type ContentBlock } from '../src/llm.js';
 
 describe('providerSupportsVideo', () => {
   test('Gemini 1.5+ family returns true', () => {

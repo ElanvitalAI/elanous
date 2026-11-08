@@ -22,7 +22,7 @@ import {
   renderVariantBadge,
   type VariantBadgeInput,
 } from './hud-render.js';
-import type { ChatRenderingHudConfig } from '../user-config.js';
+import type { ChatRenderingHudConfig } from '../user-config/chat.js';
 
 /** HUD key for the token context-fill gauge. PWA `<ChatHud>` recognises
  *  this key as a gauge-bar candidate (M4 `GAUGE_KEYS`). */

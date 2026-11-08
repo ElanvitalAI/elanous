@@ -10,6 +10,9 @@
 
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { githubAutomationToken } from '../auth/github-app-token.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '../nexus/api/pod-credential-api.js';
@@ -28,9 +31,24 @@ import { runSuffixKey } from '../self-implement/salvage-branches.js';
  *  이제 err 에 stderr 를 담아 upsertPr 가 실패 단계·사유를 구조화해 반환한다. */
 export interface CmdResult { ok: boolean; out: string; err?: string; /** 실제 종료 코드 — defaultCmdRunner 만 채운다(스텁은 ok 로만 판정). */ rc?: number }
 /** 명령 실행 추상화(주입형·테스트 스텁) — git/gh 를 실제로 돌리지 않고 로직 검증. */
-export type CmdRunner = (cmd: string, args: readonly string[], opts?: { cwd?: string }) => CmdResult;
+export type CmdRunner = (cmd: string, args: readonly string[], opts?: { cwd?: string; timeoutMs?: number }) => CmdResult;
 
 const GH_TOKEN_REFRESH_WINDOW_MS = 10 * 60_000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
+export const DEFAULT_PR_GH_COMMAND_TIMEOUT_MS = 45_000;
+const PROCESS_GROUP_TIMEOUT_SCRIPT = [
+  'timeout_ms=$1; timeout_marker_file=$2; shift 2',
+  'timeout_seconds=$(((timeout_ms + 999) / 1000))',
+  'command_name=$1; shift',
+  '"$command_name" "$@" &',
+  'command_pid=$!',
+  '( sleep "$timeout_seconds"; : > "$timeout_marker_file"; kill -KILL -"$$" 2>/dev/null ) >/dev/null 2>&1 &',
+  'watchdog_pid=$!',
+  'wait "$command_pid"',
+  'command_status=$?',
+  'kill "$watchdog_pid" 2>/dev/null || true',
+  'exit "$command_status"',
+].join('\n');
 let cachedRelayToken: { url: string; bearer: string; original: string | undefined; token: string; expiresAt: number } | undefined;
 
 /** The runner is synchronous; ask the host relay synchronously before starting gh. */
@@ -69,19 +87,53 @@ export function ghAutomationEnv(env: NodeJS.ProcessEnv = process.env, appToken: 
   return token ? { ...env, GH_TOKEN: token } : env;
 }
 
-/** 기본 러너 — spawnSync(dep-free). 실패/예외는 ok=false. stdout·stderr 모두 캡처. */
+export function commandResultFromSpawn(input: {
+  status: number | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  error?: NodeJS.ErrnoException | null;
+  timedOut?: boolean;
+}): CmdResult {
+  const overflow = input.error?.code === 'ENOBUFS';
+  const spawnError = input.timedOut
+    ? 'ETIMEDOUT: command exceeded its time limit'
+    : input.error ? `${input.error.code ?? 'spawn-error'}: ${input.error.message}` : '';
+  const result: CmdResult = {
+    ok: !input.error && !input.timedOut && input.status === 0 && !overflow,
+    out: (input.stdout ?? '').trim(),
+    err: [(input.stderr ?? '').trim(), spawnError, overflow ? 'output exceeded 256MiB (ENOBUFS)' : ''].filter(Boolean).join('\n'),
+  };
+  if (typeof input.status === 'number') Object.defineProperty(result, 'rc', { value: input.status, enumerable: false });
+  return result;
+}
+
+/** 기본 러너 — timeout 시 분리한 process group 전체를 끝내며 실패/예외는 ok=false. */
 export const defaultCmdRunner: CmdRunner = (cmd, args, opts) => {
   try {
     // Relay only applies to gh; without it, retain caller GH_TOKEN and the existing App fallback.
     const env = cmd === 'gh' ? ghAutomationEnv(process.env) : process.env;
     // bun ≥1.4 applies Node's 1MB default maxBuffer and silently truncates (`gh pr diff`, file lists) — raise it and
     // never read an overflow as success.
-    const r = spawnSync(cmd, [...args], { encoding: 'utf-8', timeout: 120_000, maxBuffer: 256 * 1024 * 1024, env, ...(opts?.cwd ? { cwd: opts.cwd } : {}) });
-    const overflow = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS';
-    const result: CmdResult = { ok: r.status === 0 && !overflow, out: (r.stdout ?? '').trim(), err: [(r.stderr ?? '').trim(), overflow ? 'output exceeded 256MiB (ENOBUFS)' : ''].filter(Boolean).join('\n') };
-    // Keep the historical enumerable result shape while making the exit code available to PR incidents.
-    if (typeof r.status === 'number') Object.defineProperty(result, 'rc', { value: r.status, enumerable: false });
-    return result;
+    const timeoutMs = opts?.timeoutMs ?? (cmd === 'gh' ? DEFAULT_PR_GH_COMMAND_TIMEOUT_MS : DEFAULT_COMMAND_TIMEOUT_MS);
+    const processGroupTimeout = process.platform !== 'win32';
+    const timeoutMarkerDir = processGroupTimeout ? mkdtempSync(join(tmpdir(), 'elanous-command-timeout-')) : undefined;
+    const timeoutMarkerFile = timeoutMarkerDir ? join(timeoutMarkerDir, randomUUID()) : '';
+    const executable = processGroupTimeout ? '/bin/sh' : cmd;
+    const executableArgs = processGroupTimeout
+      ? ['-c', PROCESS_GROUP_TIMEOUT_SCRIPT, 'elanous-command-timeout', String(timeoutMs), timeoutMarkerFile, cmd, ...args]
+      : [...args];
+    try {
+      const r = spawnSync(executable, executableArgs, {
+        encoding: 'utf-8', timeout: timeoutMs + (processGroupTimeout ? 5_000 : 0), killSignal: 'SIGKILL',
+        maxBuffer: 256 * 1024 * 1024, env, stdio: 'pipe',
+        ...(processGroupTimeout ? { detached: true } : {}), ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+      });
+      const timedOut = Boolean(timeoutMarkerDir && existsSync(timeoutMarkerFile));
+      return commandResultFromSpawn({ status: r.status, stdout: r.stdout, stderr: r.stderr,
+        error: r.error as NodeJS.ErrnoException | undefined, timedOut: timedOut || (r.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT' });
+    } finally {
+      if (timeoutMarkerDir) rmSync(timeoutMarkerDir, { recursive: true, force: true });
+    }
   } catch (e) { return { ok: false, out: '', err: e instanceof Error ? e.message : String(e) }; }
 };
 
@@ -718,7 +770,41 @@ export function makePrManager(
   createGuard?: (input: { cwd: string; base: string | undefined; seat: Seat | null; body: string }, run: CmdRunner) => GuardVerdict,
   recordUnmeasured: typeof recordGuardUnmeasured = recordGuardUnmeasured,
 ): PrManager {
-  const run = withGhRestFallback(runner);
+  const observedRunner: CmdRunner = (cmd, args, opts) => {
+    if (cmd !== 'gh') return runner(cmd, args, opts);
+    const timeoutMs = opts?.timeoutMs ?? DEFAULT_PR_GH_COMMAND_TIMEOUT_MS;
+    const operation = args.slice(0, 2).join(' ') || 'gh';
+    const startedAt = Date.now();
+    debug.log('autopilot.pr-manager', 'gh.command.started', {
+      operation,
+      timeoutMs,
+      cwd: opts?.cwd ?? null,
+    });
+    try {
+      const result = runner(cmd, args, { ...opts, timeoutMs });
+      const err = sanitizeCredentialText(result.err ?? '').slice(-400);
+      const timedOut = /\bETIMEDOUT\b|timed? out/i.test(err);
+      debug.log('autopilot.pr-manager', timedOut ? 'gh.command.timed-out' : 'gh.command.completed', {
+        operation,
+        timeoutMs,
+        elapsedMs: Date.now() - startedAt,
+        ok: result.ok,
+        ...(typeof result.rc === 'number' ? { rc: result.rc } : {}),
+        ...(err ? { error: err } : {}),
+      }, timedOut ? { level: 'warn' } : undefined);
+      return result;
+    } catch (error) {
+      const detail = sanitizeCredentialText(error instanceof Error ? error.message : String(error)).slice(-400);
+      debug.log('autopilot.pr-manager', 'gh.command.threw', {
+        operation,
+        timeoutMs,
+        elapsedMs: Date.now() - startedAt,
+        error: detail,
+      }, { level: 'error' });
+      throw error;
+    }
+  };
+  const run = withGhRestFallback(observedRunner);
   const checkCreate = createGuard ?? (runner === defaultCmdRunner ? defaultPrCreateGuard : undefined);
   const findPrForBranchOutcome = (branch: string, cwd?: string): FindPrForBranchOutcome => {
     // ⛔ 표식은 base 를 「생략했다」는 뜻이지 브랜치 이름이 아니다. 그대로 `gh --head` 로 넘기면

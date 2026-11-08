@@ -65,7 +65,7 @@ test('anonymous setup claim validates JSON and t before consuming the one-use li
   expect(await reused.json()).toEqual({ error: 'used' });
 });
 
-test('unknown and expired links fail 401; only POST /v1/setup/claim bypasses owner authentication', async () => {
+test('setup and credential claim routes self-verify their dedicated tokens; other setup routes still require owner auth', async () => {
   const url = start();
   const unknown = await post(url, JSON.stringify({ t: 'els_' + 'A'.repeat(43) }));
   expect(unknown.status).toBe(401);
@@ -74,6 +74,17 @@ test('unknown and expired links fail 401; only POST /v1/setup/claim bypasses own
   const expired = await post(url, JSON.stringify({ t: token }));
   expect(expired.status).toBe(401);
   expect(await expired.json()).toEqual({ error: 'expired' });
+  const credentialClaim = await fetch(`${url}/v1/setup/credential-claim`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' }, body: JSON.stringify({ t: 'els_' + 'A'.repeat(43) }),
+  });
+  expect(credentialClaim.status).toBe(401);
+  expect(await credentialClaim.json()).toEqual({ error: 'unknown' });
+  const credentialSubmit = await fetch(`${url}/v1/setup/credential-register`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' },
+    body: JSON.stringify({ slot: 'cred:openai.api_key', value: 'private-test-value' }),
+  });
+  expect(credentialSubmit.status).toBe(401);
+  expect(await credentialSubmit.json()).toEqual({ error: 'unknown' });
   for (const [method, path] of [
     ['POST', '/v1/setup/claim/extra'], ['GET', '/v1/setup/claim'], ['POST', '/v1/setup/llm-provider'],
   ]) {

@@ -10,6 +10,8 @@ interface FakeHiggsfieldOptions {
   readonly outcome?: FakeHiggsfieldOutcome;
   readonly now?: () => number;
   readonly resultUrlTtlMs?: number;
+  readonly imageBytes?: Uint8Array;
+  readonly requireImageBytes?: boolean;
 }
 
 interface FakeHiggsfieldCall {
@@ -20,6 +22,8 @@ interface FakeHiggsfieldCall {
 interface FakeHiggsfieldLedger {
   readonly submissions: number;
   readonly polls: number;
+  readonly spendCents: 0;
+  readonly imageSha256: readonly string[];
   readonly calls: readonly FakeHiggsfieldCall[];
 }
 
@@ -54,6 +58,7 @@ export function createFakeHiggsfieldRunner(options: FakeHiggsfieldOptions): Comm
 
   const jobs = new Map<string, FakeJob>();
   const calls: FakeHiggsfieldCall[] = [];
+  const imageSha256: string[] = [];
   let submissions = 0;
   let polls = 0;
 
@@ -62,6 +67,8 @@ export function createFakeHiggsfieldRunner(options: FakeHiggsfieldOptions): Comm
       return {
         submissions,
         polls,
+        spendCents: 0 as const,
+        imageSha256: [...imageSha256],
         calls: calls.map((call) => ({ ...call, argv: [...call.argv] })),
       };
     },
@@ -72,9 +79,15 @@ export function createFakeHiggsfieldRunner(options: FakeHiggsfieldOptions): Comm
       );
       const command = commandIndex >= 0 ? argv.slice(commandIndex) : [];
       if (command[0] === 'generate' && command[1] === 'create') {
+        const imageArg = command.findIndex((arg) => arg === '--image');
+        const imagePath = imageArg >= 0 ? command[imageArg + 1] : undefined;
+        if (options.requireImageBytes && (!imagePath || !options.imageBytes || options.imageBytes.byteLength === 0)) {
+          return { stdout: '', stderr: 'HIGGSFIELD_IMAGE_REQUIRED: uploaded image bytes are required', exitCode: 1 };
+        }
         if (submissions >= maxSubmissions) {
           return { stdout: '', stderr: 'HIGGSFIELD_SUBMISSION_LIMIT: submission limit exceeded', exitCode: 1 };
         }
+        if (options.imageBytes && imagePath) imageSha256.push(createHash('sha256').update(options.imageBytes).digest('hex'));
         const id = deterministicUuid(`${options.seed}:${submissions}`);
         submissions += 1;
         jobs.set(id, { polls: 0 });

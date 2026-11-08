@@ -93,13 +93,25 @@ test('clicking Select calls onPick once with that card id', async () => {
   const picked: string[] = [];
   await mount({ declared: null, onPick: (id) => picked.push(id) });
   const button = host.querySelector('[data-direction="paper"] button') as HTMLButtonElement;
+  expect(button.getAttribute('aria-pressed')).toBe('false');
   await act(async () => { button.dispatchEvent(new window.Event('click', { bubbles: true })); });
   expect(picked).toEqual(['paper']);
+
+  // The parent mutation reports its new declaration through props.
+  await mount({ declared: 'paper' });
+  const selected = host.querySelector('[data-direction="paper"]')!;
+  expect(selected.getAttribute('data-state')).toBe('selected');
+  expect(selected.querySelector('[role="status"]')?.textContent).toContain('Selected');
+  expect(selected.querySelector('button')).toBeNull();
+  const otherChoices = [...host.querySelectorAll('[data-direction]:not([data-state="selected"]) button')];
+  expect(otherChoices.length).toBe(2);
+  expect(otherChoices.every((choice) => choice.getAttribute('aria-pressed') === 'false')).toBe(true);
 });
 
 test('the declared card shows Selected and has no Select button', async () => {
   await mount({ declared: 'minimal' });
   const card = host.querySelector('[data-direction="minimal"]')!;
+  expect(card.getAttribute('data-state')).toBe('selected');
   expect(card.textContent).toContain('Selected');
   expect(card.querySelector('button')).toBeNull();
   expect(host.querySelectorAll('button').length).toBe(2);

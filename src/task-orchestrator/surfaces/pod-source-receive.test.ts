@@ -54,6 +54,59 @@ function makeBaseShaFallbackFixture(root: string, options: { originHasBase: bool
 }
 
 describe('podSourceScript', () => {
+  test('requireMirror forbids GitHub fallback when a sealed release mirror cannot be used', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-required-mirror-'));
+    try {
+      const fixture = makeBaseShaFallbackFixture(root, { originHasBase: true, withMirror: false });
+      const cwd = join(root, 'job');
+      mkdirSync(cwd);
+      const script = podSourceScript({ kind: 'default', baseSha: fixture.baseSha }, fixture.origin,
+        join(root, 'missing-mirror'), { ...fixture.imageOptions, imageCommitFile: join(root, 'absent-image-commit'), requireMirror: true });
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+      expect(result.exitCode).toBe(5);
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL no-mount');
+      expect(result.stdout.toString()).not.toContain('ELANOUS_POD_SOURCE_VIA github');
+      expect(existsSync(join(cwd, 'repo'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('requireMirror refuses a missing cut commit instead of fetching it from origin after mirror clone', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-required-mirror-commit-'));
+    try {
+      const fixture = makeBaseShaFallbackFixture(root, { originHasBase: true, withMirror: false });
+      const cwd = join(root, 'job');
+      mkdirSync(cwd);
+      const script = podSourceScript({ kind: 'commit', sha: fixture.baseSha }, fixture.origin,
+        fixture.imageOptions.imageGitDir, { ...fixture.imageOptions, imageCommitFile: join(root, 'absent-image-commit'), requireMirror: true });
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+      expect(result.exitCode).toBe(5);
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL source-commit-missing');
+      expect(script).not.toContain('git fetch --depth 1 origin');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('requireMirror rejects default source without a parent-pinned base SHA before remote HEAD lookup', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-required-mirror-default-'));
+    try {
+      const fixture = makeBaseShaFallbackFixture(root, { originHasBase: true, withMirror: false });
+      const cwd = join(root, 'job');
+      mkdirSync(cwd);
+      const script = podSourceScript({ kind: 'default' }, fixture.origin,
+        join(root, 'missing-mirror'), { ...fixture.imageOptions, imageCommitFile: join(root, 'absent-image-commit'), requireMirror: true });
+      const result = Bun.spawnSync(['bash', '-c', `set -e\n${script}`], { cwd });
+      expect(result.exitCode).toBe(5);
+      expect(result.stdout.toString()).toContain('ELANOUS_POD_SOURCE_MIRROR_REQUIRED_FAIL default-source-pin-missing');
+      expect(script).not.toContain('git ls-remote --symref origin HEAD');
+      expect(script).not.toContain('git fetch --depth 50 origin HEAD');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test('default source uses the parent-resolved base SHA from the host mirror without Pod origin calls', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-parent-base-sha-'));
     try {
@@ -406,7 +459,8 @@ describe('podSourceScript', () => {
 
   test('default prefers the mirror, restores origin and reports its route', () => {
     const script = podSourceScript({ kind: 'default' }, 'https://github.com/o/r');
-    expect(script).toContain("git clone -q --shared -- '/host-mirror' repo");
+    expect(script).toContain("git -c safe.directory='/host-mirror' clone -q --shared -- '/host-mirror' repo");
+    expect(script).toContain("git -c safe.directory='/host-mirror' -C '/host-mirror' rev-parse --verify HEAD");
     expect(script).toContain("git -C repo remote set-url origin 'https://github.com/o/r'");
     expect(script).toContain("git clone -q --depth 50 'https://github.com/o/r' repo");
     expect(script).toContain("printf 'ELANOUS_POD_SOURCE_VIA %s\\n'");

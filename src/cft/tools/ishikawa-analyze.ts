@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.6 P2: IshikawaAnalyze (Fishbone 6M) LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   buildFishbone,
   FISHBONE_CATEGORIES,

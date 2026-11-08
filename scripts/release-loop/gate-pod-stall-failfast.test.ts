@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gateShardAbortScript, gateShardShell } from './gate-node';
+import { gateShardAbortScript, gateShardShell } from './gate-shard-shell.js';
 
 setDefaultTimeout(15_000);
 

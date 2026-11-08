@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── PX-5 P4: 4 LLM tools — RouteList / Resolve / Suggest / AgentsMdRead ──
 //
 // All read-only. The Turn hook (turn-hook.ts) already surfaces routes
@@ -6,7 +7,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import { globalRouteRegistry, type RouteRegistry, tokenize } from './registry.js';
 import { getSessionCwd } from '../session/working-dir.js';
 import type { RouteTargetKind } from './types.js';

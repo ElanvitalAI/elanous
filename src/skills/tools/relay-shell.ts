@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // RelayShellPrompt — 셸 안 프롬프트를 operator 에게 릴레이하는 LLM 툴 (§6(a) · 2026-07-20)
 //
 // DESIGN-cross-surface-autonomy-membrane §6. PtyShell 안(codex/aider/claude)에서 승인/선택
@@ -12,7 +13,7 @@
 // ★ 제1원칙: 결정·주입 관측은 relayShellPrompt(harness.relay)가 이미 남긴다. 이 어댑터는
 //   ctx→SurfaceUx 변환(surfaceUxFromDispatchCtx)만 — 채널 없으면 confirm fail-closed(안전 decline).
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { DaemonToolDispatchCtx } from '../../boot/daemon-tools/types.js';
 import { surfaceUxFromDispatchCtx } from '../../agent/surface-ux/build.js';
 import { relayShellPrompt, type ShellInjector } from '../../harness/shell-relay.js';

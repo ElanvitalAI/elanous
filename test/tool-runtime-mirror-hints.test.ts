@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // ── VW-term-infra Bundle B-1 · B1-3 — mirror-hints tests ──
 
 import { describe, expect, test } from 'bun:test';
@@ -7,7 +8,7 @@ import {
   getChordHint,
   withChordHint,
 } from '../src/tool-runtime/mirror-hints.js';
-import type { LLMToolSpec } from '../src/llm.js';
+
 
 function baseSpec(): LLMToolSpec {
   return {

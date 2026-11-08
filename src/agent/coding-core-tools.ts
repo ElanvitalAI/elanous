@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── 코딩코어 조립기 — turn 조립기 통일 Phase 2 (2026-07-22) ──
 //
 // CLI(buildCliAgentTools)와 continuation-turn-runner(buildContinuationAgentTools·telegram 코딩코어)
@@ -13,7 +14,7 @@
 // 골든룰: buildCodingCoreNativeSpecs() 이름배열 = ['Read','Grep','Glob','ListDir','Edit','Write']
 //   (양 조립기 native 블록과 diff=0). coding-core-tools.test 스냅샷 가드.
 
-import type { LLMToolSpec } from '../llm.js';
+
 
 /** native 코딩코어 spec(Read/Grep/Glob/ListDir/Edit/Write) — 대시보드 'coding/turn' 서피스 프로파일과
  *  동일 경로로 해석해 CLI·continuation 이 같은 tool set·같은 가드(broad-search-block·scoped-analysis)

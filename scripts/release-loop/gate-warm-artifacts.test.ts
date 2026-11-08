@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { warmReferenceFromJobArtifacts, writeWarmJobManifest } from './gate-warm-artifacts.js';
+import { materializeWarmShardArtifacts, warmReferenceFromJobArtifacts, writeWarmJobManifest } from './gate-warm-artifacts.js';
+import { readShardArtifacts } from './gate-shard-artifacts.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -385,3 +386,27 @@ test('unhandled errors without a second diagnostic channel remain unmeasured', (
   expect(parse(noDetail, file)).toBeNull();
 });
 
+
+
+test('validated warm artifacts enter the gate per-file outbox with exact cut, attempt, and test counts', () => {
+  const source = artifacts('0', `1 pass\n0 fail\n0 errors\nRan 1 test across 1 file.`, '');
+  const command = { protocol: 1 as const, runId: 'run-1', attemptId: defaultExpected.attemptId,
+    cutSha: defaultExpected.cutSha, leaseId: 'lease-1', generation: 1, workerId: 'worker-1',
+    podUid: 'pod-uid-1', podName: 'warm-gate-1', podContext: 'pool-context',
+    image: `registry.example/gate@sha256:${'d'.repeat(64)}`,
+    key: { context: 'pool-context', imageDigest: `sha256:${'d'.repeat(64)}`, lockHash: 'e'.repeat(64), architecture: 'amd64' },
+    deadlineAt: Date.now() + 60_000, files: [file], envProfile: 'gate-v1' };
+  const data = Object.fromEntries(['log', 'junit.xml', 'json', 'warm-manifest.json', 'rc']
+    .map(suffix => [suffix, readFileSync(`${source}.${suffix}`).toString('base64')]));
+  const transport = { status: 'observed' as const, reason: 'complete' as const, artifacts: [{ file, data }],
+    reply: { protocol: 1 as const, runId: command.runId, attemptId: command.attemptId, cutSha: command.cutSha,
+      leaseId: command.leaseId, generation: command.generation, workerId: command.workerId, key: command.key,
+      envProfile: command.envProfile, startedAt: Date.now(), finishedAt: Date.now(),
+      files: [{ file, rc: 0, failureIds: [], errorIds: [], junitComplete: true }] } };
+  const output = mkdtempSync(join(tmpdir(), 'gate-warm-outbox-'));
+  dirs.push(output);
+  expect(materializeWarmShardArtifacts(output, command, transport, [[file]])).toBe(true);
+  expect(readShardArtifacts(output, [[file]])).toMatchObject({ rc: 0, finished: [file], timedOut: false });
+  const corrupt = { ...transport, artifacts: [{ file, data: { ...data, rc: Buffer.from('1').toString('base64') } }] };
+  expect(materializeWarmShardArtifacts(output, command, corrupt, [[file]])).toBe(false);
+});

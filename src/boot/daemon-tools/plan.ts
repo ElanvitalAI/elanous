@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Opportunistic followup §6.2 #4 (2026-05-13) — `agent.plan` LLM tool
 // wire. Two paired tools:
 //   - `Plan` — LLM declares an ordered step list at the start of a
@@ -23,7 +24,7 @@
 // LLM full agency over what counts as "step done" without elanous
 // guessing. Cost is one extra tool call per step — negligible.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   createSeqTracker,
   makeEnvelope,

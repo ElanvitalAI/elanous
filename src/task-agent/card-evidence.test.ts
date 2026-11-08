@@ -1,6 +1,6 @@
-import { expect, test } from 'bun:test';
+import { afterAll, expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerTasksCommands } from '../cli/tasks-cli.js';
@@ -12,6 +12,11 @@ import { bindCardEvidence, collectWiringEvidence, ledgerLoader, readCardSalvageB
 import { recordTaskAgentShadowMove } from './shadow.js';
 import { advanceMission, handMission, type PieceEvidenceReader } from './mission.js';
 import { handTask, readTaskCard, type TaskLaunchContext } from './task-hand.js';
+import { createTempDirectoryScope } from '../test-utils/temp-dir-cleanup.js';
+const tempDirectoryScope = createTempDirectoryScope();
+const mkdtempSync = tempDirectoryScope.mkdtempSync;
+
+afterAll(() => tempDirectoryScope.cleanup());
 
 const RUN = 'run-0199aaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee';
 const CHILD = 'run-0199ffff-bbbb-7ccc-8ddd-eeeeeeeeeeee';

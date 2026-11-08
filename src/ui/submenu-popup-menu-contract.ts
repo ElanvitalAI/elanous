@@ -1,4 +1,4 @@
-import { createActionPickerView, type ActionItem } from '../mouse-action-recipes.js';
+import type { ActionItem, ActionPickerViewFactory } from '../mouse-action-recipes.js';
 import type { ModalShadowSpec } from './modal-adapter.js';
 import type { ThemeTokens } from '../theme/tokens.js';
 import type { View } from './view.js';
@@ -21,8 +21,10 @@ export interface CreateSubmenuPopupMenuViewSpec<T> {
   shadow?: ModalShadowSpec;
 }
 
+/** The renderer is injected by callers so this UI contract stays below the recipe module at runtime. */
 export function createSubmenuPopupMenuView<T>(
   spec: CreateSubmenuPopupMenuViewSpec<T>,
+  createActionPickerView: ActionPickerViewFactory,
 ): View {
   return createActionPickerView({
     id: spec.id,

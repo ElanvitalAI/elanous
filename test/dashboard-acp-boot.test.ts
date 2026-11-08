@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // U3c Phase 2 — dashboard-acp-boot composer test.
 //
 // Covers the contract the research doc locked in
@@ -21,7 +22,7 @@ import * as seatBoot from '../src/dashboard/seat-boot-preamble.js';
 import type { ChatMessage } from '../src/chat/index.js';
 import { resumeInProcessDashboardSession } from '../src/dashboard/index.js';
 import { filterDashboardArgs } from '../src/index.js';
-import type { LLMMessage, LLMToolSpec } from '../src/llm.js';
+import type { LLMMessage } from '../src/llm.js';
 import { debug } from '../src/debug/log.js';
 import {
   DashboardSession,

@@ -6,6 +6,7 @@ beforeAll(async () => {
     import('../task-orchestrator/surfaces/pod-failure-reason.js')]);
 }, 120_000);
 import { debug } from '../debug/log.js';
+import { __resetCatalogForTests } from '../registry/loader.js';
 import { buildReviewIntent } from '../agent-substrate/review-intent.js';
 import { REVIEW_FINDING_KEY_VERSION, reviewFindingKey as sharedReviewFindingKey } from '../agent-substrate/review-finding-key.js';
 import { parse as parsePrComment } from '../agent-substrate/pr-comment-meta.js';
@@ -6033,13 +6034,13 @@ describe('runSelfImplement — worktree base observation', () => {
 
 describe('runSelfImplement — traversal shadow wiring', () => {
   function capturePipelineEvents(): {
-    events: Array<{ event: string; data: Record<string, unknown>; opt?: { compact?: { arrayMax?: number } } }>;
+    events: Array<{ category: string; event: string; data: Record<string, unknown>; opt?: { compact?: { arrayMax?: number } } }>;
     restore: () => void;
   } {
     const original = (debug as { log: typeof debug.log }).log;
-    const events: Array<{ event: string; data: Record<string, unknown>; opt?: { compact?: { arrayMax?: number } } }> = [];
-    (debug as { log: typeof debug.log }).log = ((_category, event, data, opt) => {
-      events.push({ event, data: data as Record<string, unknown>, opt: opt as { compact?: { arrayMax?: number } } | undefined });
+    const events: Array<{ category: string; event: string; data: Record<string, unknown>; opt?: { compact?: { arrayMax?: number } } }> = [];
+    (debug as { log: typeof debug.log }).log = ((category, event, data, opt) => {
+      events.push({ category, event, data: data as Record<string, unknown>, opt: opt as { compact?: { arrayMax?: number } } | undefined });
     }) as typeof debug.log;
     return { events, restore: () => { (debug as { log: typeof debug.log }).log = original; } };
   }
@@ -6255,6 +6256,7 @@ describe('runSelfImplement — traversal shadow wiring', () => {
 
   test('enabling additive traversal instrumentation preserves result and every existing observation', async () => {
     const run = async (observePipeline: SelfImplementSeams['observePipeline']) => {
+      __resetCatalogForTests();
       // 두 실행이 같은 런 id 를 쓴다 — 앞 실행의 autoheal «한 번» 기억이 뒤 실행의 관측을 바꾸지 않게 한다.
       resetAutohealProcessMemory();
       const { events, restore } = capturePipelineEvents();
@@ -6273,7 +6275,8 @@ describe('runSelfImplement — traversal shadow wiring', () => {
     const disabled = await run(false);
     const enabled = await run(() => {});
       expect(enabled.result).toEqual(disabled.result);
-      const withoutTerminalSequence = (entries: typeof enabled.existing) => entries.map(({ data, ...entry }) => {
+      const legacyObservations = (entries: typeof enabled.existing) => entries.filter(({ category }) => category !== 'git-fs.io');
+      const withoutTerminalSequence = (entries: typeof enabled.existing) => legacyObservations(entries).map(({ data, ...entry }) => {
         const { terminalSeq: _terminalSeq, ...existingData } = data;
         return { ...entry, data: existingData };
       });

@@ -15,6 +15,7 @@ import {
 } from '../src/workflow-runtime/index.js';
 import { validateWorkflow } from '../src/workflow-runtime/schema.js';
 import { basicAuthHeader } from '../src/workflow-runtime/nodes/http.js';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 type FetchInit = {
   method?: string;
@@ -24,23 +25,39 @@ type FetchInit = {
 };
 type FetchHandler = (input: string, init: FetchInit) => Promise<Response>;
 
-let originalFetch: typeof fetch | undefined;
+let fakeFetch: FakeFetchDevice | undefined;
 let lastInput = '';
 let lastInit: FetchInit = {};
+let expectedCalls: string[] = [];
 
-function installFetchMock(handler: FetchHandler): void {
-  originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    lastInput = typeof input === 'string' ? input : String(input);
-    lastInit = (init ?? {}) as FetchInit;
-    return handler(lastInput, lastInit);
-  }) as typeof fetch;
+function installFetchMock(handler: FetchHandler, url: string, method = 'GET'): void {
+  fakeFetch?.restore();
+  expectedCalls = [`${method} ${url}`];
+  const route = {
+    url,
+    method,
+    response: (request: { url: string; method: string; headers: Readonly<Record<string, string>>; body: string | null }) => {
+      lastInput = request.url;
+      lastInit = {
+        method: request.method,
+        headers: { ...request.headers },
+        ...(request.body !== null ? { body: request.body } : {}),
+      };
+      return handler(lastInput, lastInit);
+    },
+  };
+  fakeFetch = createFakeFetchDevice([route]);
 }
 
 function restoreFetch(): void {
-  if (originalFetch) globalThis.fetch = originalFetch;
+  if (fakeFetch) {
+    expect(fakeFetch.calls().map(({ method, url }) => `${method} ${url}`).sort()).toEqual([...expectedCalls].sort());
+  }
+  fakeFetch?.restore();
+  fakeFetch = undefined;
   lastInput = '';
   lastInit = {};
+  expectedCalls = [];
 }
 
 function makeArtifactsDir(): string {
@@ -132,7 +149,7 @@ describe('executor · http node', () => {
     installFetchMock(async () => new Response(JSON.stringify({ name: 'Alice', age: 30 }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
-    }));
+    }), 'https://api.example.com/u');
     const wf: WorkflowDefinition = {
       name: 'demo',
       description: 'd',
@@ -150,7 +167,7 @@ describe('executor · http node', () => {
     installFetchMock(async () => new Response('plain text response', {
       status: 200,
       headers: { 'content-type': 'text/plain' },
-    }));
+    }), 'https://x/');
     const wf: WorkflowDefinition = {
       name: 'demo',
       description: 'd',
@@ -167,7 +184,7 @@ describe('executor · http node', () => {
     installFetchMock(async () => new Response('{"ok":true}', {
       status: 200,
       headers: { 'content-type': 'application/json' },
-    }));
+    }), 'https://api.example.com/echo?q=hello', 'POST');
     const wf: WorkflowDefinition = {
       name: 'demo',
       description: 'd',
@@ -188,7 +205,7 @@ describe('executor · http node', () => {
       makeDeps(),
     );
     expect(lastInput).toBe('https://api.example.com/echo?q=hello');
-    expect(lastInit.headers?.['X-Token']).toBe('hello-tok');
+    expect(lastInit.headers?.['x-token']).toBe('hello-tok');
     expect(lastInit.body).toBe('{"msg":"hello"}');
     expect(lastInit.method).toBe('POST');
   });
@@ -197,7 +214,7 @@ describe('executor · http node', () => {
     installFetchMock(async () => new Response('{}', {
       status: 200,
       headers: { 'content-type': 'application/json' },
-    }));
+    }), 'https://x/');
     const wf: WorkflowDefinition = {
       name: 'demo',
       description: 'd',
@@ -214,14 +231,14 @@ describe('executor · http node', () => {
       { workflow: wf, arguments: '', artifactsDir: makeArtifactsDir() },
       makeDeps(),
     );
-    expect(lastInit.headers?.['Authorization']).toBe('Bearer abc123');
+    expect(lastInit.headers?.authorization).toBe('Bearer abc123');
   });
 
   it('attaches Basic auth header', async () => {
     installFetchMock(async () => new Response('{}', {
       status: 200,
       headers: { 'content-type': 'application/json' },
-    }));
+    }), 'https://x/');
     const wf: WorkflowDefinition = {
       name: 'demo',
       description: 'd',
@@ -238,7 +255,7 @@ describe('executor · http node', () => {
       { workflow: wf, arguments: '', artifactsDir: makeArtifactsDir() },
       makeDeps(),
     );
-    expect(lastInit.headers?.['Authorization']).toBe('Basic YWxpY2U6c2VjcmV0');
+    expect(lastInit.headers?.authorization).toBe('Basic YWxpY2U6c2VjcmV0');
   });
 
   it('returns ok=false on >=400 status with error message + body preserved', async () => {
@@ -246,7 +263,7 @@ describe('executor · http node', () => {
       status: 404,
       statusText: 'Not Found',
       headers: { 'content-type': 'text/plain' },
-    }));
+    }), 'https://x/');
     const wf: WorkflowDefinition = {
       name: 'demo',
       description: 'd',
@@ -263,7 +280,7 @@ describe('executor · http node', () => {
   });
 
   it('returns ok=false when fetch throws', async () => {
-    installFetchMock(async () => { throw new Error('network down'); });
+    installFetchMock(async () => { throw new Error('network down'); }, 'https://x/');
     const wf: WorkflowDefinition = {
       name: 'demo',
       description: 'd',
@@ -281,7 +298,7 @@ describe('executor · http node', () => {
     installFetchMock(async () => new Response('{}', {
       status: 200,
       headers: { 'content-type': 'application/json' },
-    }));
+    }), 'https://x/');
     const wf: WorkflowDefinition = {
       name: 'demo',
       description: 'd',

@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { Command } from 'commander';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { defaultTaskLauncher, registerTasksCommands, spawnDetachedConfirmed, type DetachedSpawn } from '../cli/tasks-cli.js';
@@ -27,6 +27,9 @@ import { authorGoal, inspectGoalDoneBoundary, type GoalAuthorDeps } from '../sel
 import { parseAskTargetPathHints } from '../self-dev/launch-preflight-text.js';
 import { prTitle } from '../self-implement/pr-title.js';
 import { collectDraftMetrics } from '../self-dev/draft-sweep.js';
+import { createTempDirectoryScope } from '../test-utils/temp-dir-cleanup.js';
+const tempDirectoryScope = createTempDirectoryScope();
+const mkdtempSync = tempDirectoryScope.mkdtempSync;
 
 // Keep default draft observations isolated from GitHub in the existing CLI and hand tests.
 const originalPath = process.env.PATH;
@@ -40,6 +43,7 @@ afterAll(() => {
   if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
   rmSync(fakeGhDir, { recursive: true, force: true });
 });
+afterAll(() => tempDirectoryScope.cleanup());
 
 // MS-05 + isolated temporary git: the real tasks hand CLI decides, only the external launcher is captured.
 test('tasks hand --live opt-in carries one bounded KNOWHOW pack to the first child goal without changing cards or ledgers', async () => {

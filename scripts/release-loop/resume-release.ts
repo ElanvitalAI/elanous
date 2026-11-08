@@ -10,25 +10,30 @@ import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { acquireLockAsync } from '../../src/storage/file-lock.js';
 import { lastJsonObject, runGraph, verifyReleaseCommandRoot, verifyReleaseRecipeSnapshot, type GraphRunState } from '../../src/graph-runner/runner.js';
-import type { GraphEventBus } from '../../src/graph-runner/graph-events.js';
+import type { GraphEvent, GraphEventBus } from '../../src/graph-runner/graph-events.js';
+import type { MacrophageScrap } from '../../src/release-loop/macrophage-heal.js';
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
 import { readGateShards } from '../../src/release-loop/gate-shards.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
-import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, planPartialRegate, planSameCommitRecheck, planStalledShardRecheck, testFileOfId, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
+import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, gateAppendReceiptCostsFromLedger, planPartialRegate, planSameCommitRecheck, planStalledShardRecheck, testFileOfId, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
 import { gateAssignableTestsAtCommit, gateEnvFingerprint, gateShardRecipeIdentityAtCommit, gateSourcePins, type GatePodRuntimeIdentity } from './gate-baseline-receipt.js';
 import { preflightGateExecutionIdentity } from './gate-radius-live.js';
 import { gateLockfileHashAtCommit } from './gate-reuse-identity.js';
-import { inspectGateShardReceipts, readGateShardManifest, readGateShardResult } from './gate-shard-receipts.js';
-import { gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
+import { inspectGateShardReceipts } from './gate-shard-receipts.js';
+import { stalledGateEvidence, type StalledGateEvidence } from './gate-stalled-evidence.js';
+import { gitClosureTree, testsReachingChanged, testsReachingChangedForGateReuse, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure.js';
 import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeAcceptedRegressions, releaseResumeGateWaiverCoverage, gateUnmeasuredDetail, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver, type AcceptedRegression } from './resume.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { cutReleaseBranch } from './cut-branch.js';
+import { runCutGateImagePrebuild } from './gate-image-pin.js';
 import { releaseLoopConfig } from './unattended-release.js';
 import { trafficOptionsFromConfig } from './traffic-transition.js';
 import { createMacrophageRuntime } from '../../src/release-loop/macrophage-heal-node.js';
 import { createMacrophageSafeCleanup } from '../../src/release-loop/macrophage-safe-cleanup.js';
+import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import type { GateAutohealDecision } from './gate-autoheal.js';
+import { appendWaiverEvents, consumeWaiverEvent, issueGateWaiverEvent } from '../../src/release-loop/waiver-events.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 
@@ -43,9 +48,14 @@ export interface ResumeReleaseDeps {
   root?: string;
   /** Optional structured graph-event sink, used by simulations and in-process release observers. */
   eventBus?: GraphEventBus;
+  /** Test seam: keep resume tests independent from host-wide worktree and process inventory. */
+  macrophageInventory?: (event: GraphEvent) => readonly MacrophageScrap[];
+  registerLogSink?: (surface: string) => Promise<boolean>;
   repo?: string;
   /** Runs git and returns stdout (throws on failure). */
   git?: (args: string[]) => string;
+  /** Git scoped to the resume command checkout; distinct from the operator repo used for release branch reads. */
+  commandRootGit?: (args: string[]) => string;
   /** `git merge-base --is-ancestor a b`. */
   isAncestor?: (ancestor: string, descendant: string) => boolean;
   graph?: typeof runGraph;
@@ -70,8 +80,27 @@ export interface ResumeReleaseDeps {
   trafficFile?: string;
 }
 
+/** A failed release graph branch resumes from its fan-out source; the runner reuses completed sibling receipts. */
+function releaseResumeNode(run: GraphRunState, requested: string): string {
+  for (const fanout of Object.values(run.fanOuts ?? {})) {
+    if (fanout.branches[requested]?.status === 'failed') return fanout.from;
+  }
+  return requested;
+}
+
+function validateBudgetExceededResume(run: GraphRunState, opts: ResumeReleaseOptions): void {
+  if (opts.resumeBudgetExceeded && !opts.reason?.trim()) throw new Error('--resume-budget-exceeded requires --reason');
+  if (opts.resumeBudgetExceeded && (opts.waive !== undefined || opts.ownerWaive !== undefined || opts.acceptedRegressions !== undefined))
+    throw new Error('--resume-budget-exceeded cannot be combined with a waiver');
+  if (run.status === 'budget-exceeded' && !opts.resumeBudgetExceeded)
+    throw new Error(`release run ${run.runId} is budget-exceeded — use --resume-budget-exceeded --reason <text>`);
+  if (opts.resumeBudgetExceeded && run.status !== 'budget-exceeded')
+    throw new Error(`--resume-budget-exceeded requires a budget-exceeded run (found ${run.status})`);
+}
+
 export interface ResumeReleaseOptions {
   runId: string; from: string; partial?: boolean; waive?: string; ownerWaive?: string; reason?: string;
+  resumeBudgetExceeded?: boolean;
   acceptedRegressions?: AcceptedRegression[]; approvedBy?: string; gateExecutor?: string; gateHost?: string; gatePodPool?: string;
   rerouteShard?: string; shardHost?: string; shardOs?: 'darwin' | 'linux';
   commandRoot?: string;
@@ -151,9 +180,39 @@ function gitRunner(repo: string) {
   };
 }
 
+/** Verify a real command checkout with git rooted at that checkout, not the recovery repo's injected git seam. */
+function resumeCommandRootGit(root: string, repoGit?: (args: string[]) => string,
+  commandRootGit?: (args: string[]) => string, commandRootWasSelected = false): ((args: string[]) => string) | undefined {
+  if (commandRootGit) return commandRootGit;
+  // Unit fixtures that model a checkout without creating a Git repository still use the injected seam. A real
+  // worktree explicitly selected for this resume has a .git file (or directory), and its identity/status must be
+  // read from that exact worktree. Without an explicit command root, retain the caller's repo-level test seam.
+  if (commandRootWasSelected) {
+    const probe = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: root, encoding: 'utf8' });
+    if (probe.status === 0 && !probe.error) return commandRootGitRunner(root);
+  }
+  return repoGit;
+}
+
+function verifyResumeCommandRoot(root: string, cutTip: string, repoGit?: (args: string[]) => string,
+  commandRootGit?: (args: string[]) => string, commandRootWasSelected = false): string {
+  return verifyReleaseCommandRoot(root, cutTip, resumeCommandRootGit(root, repoGit, commandRootGit, commandRootWasSelected));
+}
+
+function commandRootGitRunner(root: string) {
+  return (args: string[]): string => {
+    const result = spawnSync('git', args, { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    if (result.status !== 0 || result.error) throw new Error(`git ${args[0]} failed in command root: ${(result.stderr || result.error || 'no output').toString().trim()}`);
+    return result.stdout.trim();
+  };
+}
+
 /** Paths whose change leaves the gate verdict and the shipped artifact untouched (release tooling, docs). */
 export function isReleaseToolingPath(path: string): boolean {
-  return path.startsWith('scripts/release-loop/') || path.startsWith('graphs/release/') || path.startsWith('docs/')
+  // Gate implementation, the executable release graph, and its command recipes define the verdict itself. A
+  // repair that changes any of them must restart at the first cut consumer, even though the files are tooling.
+  if (path.startsWith('scripts/release-loop/gate-') || path.startsWith('graphs/release/') || path.endsWith('/recipes.yaml')) return false;
+  return path.startsWith('scripts/release-loop/') || path.startsWith('docs/')
     // the container upgrade probe: a release check harness, never part of the shipped package
     || path.startsWith('docker/upgrade/');
 }
@@ -176,15 +235,16 @@ export function refreshReleaseBranchTip(runId: string, deps: ResumeReleaseDeps =
   return refreshReleaseBranchTipInternal(runId, deps, from, waiverCommit, false);
 }
 
-function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps, from: string | undefined, waiverCommit: string | undefined, dryRun: boolean, expectedTip?: string): TipRefresh {
+function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps, from: string | undefined, waiverCommit: string | undefined, dryRun: boolean, expectedTip?: string, allowBudgetExceeded = false): TipRefresh {
   const root = deps.root ?? effectiveInstanceRoot();
   const statePath = join(root, 'graph-runs', 'release-loop', `${safeRunId(runId)}.json`);
   const state = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
   if (state.graphId !== 'release-loop' || state.runId !== runId) throw new Error(`run identity mismatch: ${statePath}`);
-  if (state.status !== 'failed') throw new Error(`release run ${runId} is ${state.status} — only a failed run is resumed`);
+  if (state.status !== 'failed' && !(allowBudgetExceeded && state.status === 'budget-exceeded')) throw new Error(`release run ${runId} is ${state.status} — only a failed run is resumed`);
   const branchFork = from === undefined || state.path.includes(from) ? undefined : releaseFanOutForkIndex(state, from);
-  const restartAt = from === undefined ? -1 : state.path.indexOf(from) >= 0 ? state.path.indexOf(from) : branchFork ?? -1;
-  if (from !== undefined && (restartAt < 0 || (branchFork === undefined && state.path.lastIndexOf(from) !== restartAt))) throw new Error(`--from ${from} is not a node on the saved path of ${runId}`);
+  // Repeated nodes restart at their latest visit (matches the runner), never across an earlier approval.
+  const restartAt = from === undefined ? -1 : state.path.lastIndexOf(from) >= 0 ? state.path.lastIndexOf(from) : branchFork ?? -1;
+  if (from !== undefined && restartAt < 0) throw new Error(`--from ${from} is not a node on the saved path of ${runId}`);
   const index = state.nodes.findIndex((node) => node.nodeId === 'version-release');
   const record = index >= 0 ? state.nodes[index]! : undefined;
   const output = record ? lastJsonObject(record.output) : undefined;
@@ -193,9 +253,16 @@ function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps,
   const recorded = typeof output.commit === 'string' ? output.commit : '';
   if (!isReleaseVersion(version) || !/^[0-9a-f]{40}$/i.test(recorded)) throw new Error(`release run ${runId} version-release output is not a release commit`);
   const branch = `release/${version}`;
-  // Only a run that cut release/<v> itself is re-pointed — a main-cut or --cut-commit run has no branch of its own.
-  const input = (state.input ?? {}) as { branchCut?: unknown; version?: unknown };
-  if (input.branchCut !== true || input.version !== version || output.branch !== branch) {
+  const input = (state.input ?? {}) as { branchCut?: unknown; cutCommit?: unknown; version?: unknown };
+  if (input.branchCut !== true) {
+    const cutCommit = typeof input.cutCommit === 'string' ? input.cutCommit.trim().toLowerCase() : '';
+    if (input.version !== version || !/^[0-9a-f]{7,40}$/i.test(cutCommit) || !recorded.toLowerCase().startsWith(cutCommit)) {
+      throw new Error(`release run ${runId} was not cut as ${branch} or pinned with --cut-commit (input version/cutCommit differ) — refusing to resume`);
+    }
+    // `--cut-commit` has no release/<v> ref to refresh. Keep the recorded commit as the run's immutable tip.
+    return { version, branch: 'cut-commit', from: recorded, to: recorded, changed: false, statePath };
+  }
+  if (input.version !== version || output.branch !== branch) {
     throw new Error(`release run ${runId} was not cut as ${branch} (input.branchCut/version or version-release branch differ) — refusing to resume`);
   }
   const git = deps.git ?? gitRunner(deps.repo ?? process.cwd());
@@ -376,8 +443,15 @@ function verifyResumePreflight(run: GraphRunState, opts: ResumeReleaseOptions, d
   }
 
   const recorded = nodeOutput('version-release');
-  if (recorded?.branch !== `release/${version}` || recorded.commit !== recordedCommit || !/^[0-9a-f]{40}$/i.test(currentTip)) {
-    throw new Error(`release branch tip does not match the saved version-release ledger for ${version} — remedy: inspect the branch and saved run ${opts.runId}, then resume from a node before gate only after resolving the mismatch`);
+  const cutInput = (run.input ?? {}) as { branchCut?: unknown; cutCommit?: unknown };
+  const cutCommit = typeof cutInput.cutCommit === 'string' ? cutInput.cutCommit.trim().toLowerCase() : '';
+  const pinnedCutCommit = cutInput.branchCut !== true && /^[0-9a-f]{7,40}$/i.test(cutCommit)
+    && typeof recorded?.commit === 'string' && recorded.commit.toLowerCase().startsWith(cutCommit)
+    && recorded.commit.toLowerCase() === recordedCommit.toLowerCase() && currentTip.toLowerCase() === recordedCommit.toLowerCase();
+  const releaseBranchMatches = cutInput.branchCut === true && recorded?.branch === `release/${version}`
+    && recorded.commit === recordedCommit && /^[0-9a-f]{40}$/i.test(currentTip);
+  if (!pinnedCutCommit && !releaseBranchMatches) {
+    throw new Error(`release cut tip does not match the saved version-release ledger for ${version} — remedy: inspect the pinned cut and saved run ${opts.runId} before resuming`);
   }
 }
 
@@ -389,103 +463,6 @@ export type PartialOutcome = { requested: false }
 
 /** Build (or clear) the partial re-gate plan for the new tip. Fail-closed: any doubt leaves a full gate.
  *  GATE-REUSE-BY-DIFF: `--from gate` on a moved tip plans by default (`partial: undefined`); `partial: false` opts out. */
-type StalledGateEvidence = {
-  stalledShards: Array<{ shard: number; files: string[]; reason: string }>;
-  partialSummary: { pass: number; fail: number; errors: number; ran: number; files: number };
-  partialFailures: { failures: string[]; errors: string[] };
-  preservedShardCount: number;
-};
-
-/** Recover an interrupted Pod sweep from its atomic shard receipts. No receipt or identity doubt authorizes a partial gate. */
-function stalledGateEvidence(input: { version: string; commit: string; repo: string; roots: string[];
-  gateOutput?: Record<string, unknown>; expectedBase40?: string; expectedTests?: (commit: string) => string[] | null }):
-  { ok: true; evidence: StalledGateEvidence } | { ok: false; reason: string } {
-  const fail = (reason: string) => ({ ok: false as const, reason });
-  if (input.gateOutput && (input.gateOutput.outcome !== 'error' || input.gateOutput.commit !== input.commit))
-    return fail('saved gate result is not an error for the recorded cut');
-  if (!/^[a-f0-9]{40}$/i.test(input.expectedBase40 ?? ''))
-    return fail('saved cutoff baseline is absent or invalid');
-  const fingerprint = gateEnvFingerprint(process.env);
-  let receiptDir: string | undefined;
-  for (const root of input.roots) {
-    const candidate = join(root, 'release', input.version, 'gate-logs', 'cut', 'receipts');
-    if (existsSync(candidate)) { receiptDir = candidate; break; }
-  }
-  if (!receiptDir) return fail('stalled gate receipts are absent');
-  const names = readdirSync(receiptDir).filter((name) => /^pod-\d+\.receipt\.json$/.test(name)).sort((a, b) =>
-    Number(/^pod-(\d+)/.exec(a)![1]) - Number(/^pod-(\d+)/.exec(b)![1]));
-  if (!names.length || names.some((name, index) => Number(/^pod-(\d+)/.exec(name)![1]) !== index))
-    return fail('stalled gate receipt shard set is incomplete');
-  const allFiles: string[] = [];
-  const failures: string[] = [];
-  const errors: string[] = [];
-  const stalledShards: StalledGateEvidence['stalledShards'] = [];
-  const imageDigests = new Set<string>();
-  let pass = 0, failCount = 0, errorCount = 0, ran = 0, files = 0, preservedShardCount = 0;
-  let base40: string | undefined;
-  for (const name of names) {
-    const id = name.slice(0, -'.receipt.json'.length);
-    const receipt = readGateShardManifest(receiptDir, id);
-    if (!receipt || receipt.head40 !== input.commit || !/^[a-f0-9]{40}$/i.test(receipt.base40)
-      || !receipt.files.length
-      || receipt.files.some((file) => typeof file !== 'string'
-        || !/^(?:[\w.-]+\/)*[\w.-]+\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file) || file.split('/').includes('..'))
-      || typeof receipt.envKey !== 'string' || typeof receipt.host !== 'string')
-      return fail(`stalled gate receipt identity or file list is invalid: ${id}`);
-    if (receipt.base40 !== input.expectedBase40)
-      return fail(`stalled gate receipt baseline differs from saved cutoff baseline: ${id}`);
-    if (base40 && receipt.base40 !== base40) return fail(`stalled gate receipts disagree on baseline: ${id}`);
-    base40 = receipt.base40;
-    allFiles.push(...receipt.files);
-    if (receipt.status === 'unmeasured') {
-      stalledShards.push({ shard: Number(id.slice(4)), files: [...receipt.files], reason: 'incomplete' });
-      continue;
-    }
-    if (!receipt.envKey.startsWith(`${fingerprint}:`)) return fail(`stalled gate receipt environment mismatch: ${id}`);
-    const imageDigest = receipt.envKey.slice(fingerprint.length + 1);
-    if (!/^sha256:[a-f0-9]{64}$/i.test(imageDigest)) return fail(`stalled gate receipt image identity is missing: ${id}`);
-    imageDigests.add(imageDigest.toLowerCase());
-    const result = readGateShardResult(receiptDir, { shard: { id, files: receipt.files }, head40: input.commit,
-      base40: receipt.base40, envKey: receipt.envKey });
-    if (!result) return fail(`stalled gate receipt payload is incomplete or corrupt: ${id}`);
-    const totals = result.runs.reduce((sum, run) => ({ pass: sum.pass + run.pass, fail: sum.fail + run.fail,
-      errors: sum.errors + run.errors, ran: sum.ran + run.ran, files: sum.files + run.files }),
-    { pass: 0, fail: 0, errors: 0, ran: 0, files: 0 });
-    if (!Object.values(totals).every(Number.isSafeInteger) || receipt.failureIds.length !== totals.fail
-      || receipt.errorIds.length !== totals.errors)
-      return fail(`stalled gate receipt counts do not reconcile: ${id}`);
-    pass += totals.pass; failCount += totals.fail; errorCount += totals.errors; ran += totals.ran; files += totals.files;
-    failures.push(...receipt.failureIds); errors.push(...receipt.errorIds); preservedShardCount++;
-  }
-  if (!stalledShards.length) return fail('no incomplete shard receipt identifies the interrupted work');
-  if (new Set(allFiles).size !== allFiles.length) return fail('stalled gate receipt file assignments overlap');
-  if (imageDigests.size !== 1) return fail('stalled gate completed shards do not share one executed image');
-  const expected = (input.expectedTests ?? ((commit) => gateAssignableTestsAtCommit(input.repo, commit)))(input.commit);
-  if (!expected || JSON.stringify([...expected].sort()) !== JSON.stringify([...allFiles].sort()))
-    return fail('stalled gate receipts do not cover the pinned test selection');
-  const partialSummary = { pass, fail: failCount, errors: errorCount, ran, files };
-  const partialFailures = { failures: [...new Set(failures)].sort(), errors: [...new Set(errors)].sort() };
-  const gate = input.gateOutput;
-  if (gate) {
-    const savedSummary = gate.partialSummary as Partial<StalledGateEvidence['partialSummary']> | undefined;
-    const savedFailures = gate.partialFailures as Partial<StalledGateEvidence['partialFailures']> | undefined;
-    if (savedSummary && JSON.stringify(savedSummary) !== JSON.stringify(partialSummary))
-      return fail('saved gate summary disagrees with shard receipts');
-    if (savedFailures && (JSON.stringify([...((savedFailures.failures as string[] | undefined) ?? [])].sort()) !== JSON.stringify(partialFailures.failures)
-      || JSON.stringify([...((savedFailures.errors as string[] | undefined) ?? [])].sort()) !== JSON.stringify(partialFailures.errors)))
-      return fail('saved gate failures disagree with shard receipts');
-    if (gate.preservedShardCount !== undefined && gate.preservedShardCount !== preservedShardCount)
-      return fail('saved preserved shard count disagrees with shard receipts');
-    if (Array.isArray(gate.stalledShards)) {
-      const savedStalled = gate.stalledShards.flatMap((item) => item && typeof item === 'object'
-        && Array.isArray((item as { files?: unknown }).files) ? (item as { files: string[] }).files : []).sort();
-      if (JSON.stringify(savedStalled) !== JSON.stringify(stalledShards.flatMap((item) => item.files).sort()))
-        return fail('saved stalled shard list disagrees with shard receipts');
-    }
-  }
-  return { ok: true, evidence: { stalledShards, partialSummary, partialFailures, preservedShardCount } };
-}
-
 function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean; gateExecutor?: string; gatePodPool?: string }, deps: ResumeReleaseDeps, dryRun = false): PartialOutcome {
   const root = deps.root ?? effectiveInstanceRoot();
   // Any resume starts from no plan: one without a partial plan (from whatever node) never inherits an older plan.
@@ -511,16 +488,31 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     const saved = JSON.parse(readFileSync(tip.statePath, 'utf8')) as GraphRunState;
     const gateRecord = saved.nodes.find((node) => node.nodeId === 'gate');
     const previousGate = gateRecord ? lastJsonObject(gateRecord.output) as Record<string, unknown> | undefined : undefined;
-    // `loadFlaky` is also a partial-resume cause, but it is emitted separately from
-    // shard-only interference. Carry both sets into the same affected-file recheck.
-    const interference = [...new Set([
-      ...(Array.isArray(previousGate?.interferenceErrors) ? previousGate.interferenceErrors : []),
-      ...(Array.isArray(previousGate?.loadFlaky) ? previousGate.loadFlaky : []),
-    ])];
-    if (previousGate?.outcome === 'error' && previousGate.commit === tip.to && previousGate.autoheal
-      && typeof previousGate.autoheal === 'object' && (previousGate.autoheal as { action?: unknown }).action === 'partial-resume') {
+    // Only explicit isolation/interference evidence may open this same-commit
+    // recheck path. Once open, include loadFlaky files too so none are skipped.
+    const explicitInterference = Array.isArray(previousGate?.interferenceErrors) ? previousGate.interferenceErrors : [];
+    const rawLoadFlaky = previousGate?.loadFlaky;
+    if (explicitInterference.length > 0 && rawLoadFlaky !== undefined && !Array.isArray(rawLoadFlaky))
+      return fallback('partial-resume load-flaky evidence is malformed');
+    const interference = explicitInterference.length > 0
+      ? [...new Set([...explicitInterference, ...(Array.isArray(rawLoadFlaky) ? rawLoadFlaky : [])])]
+      : [];
+    if (previousGate?.outcome === 'error' && previousGate.commit === tip.to
+      && interference.length > 0) {
       if (!Array.isArray(interference) || !interference.length || !interference.every((id) => typeof id === 'string'))
         return fallback('partial-resume has no complete interference error record');
+      const cutoffRecord = saved.nodes.find((node) => node.nodeId === 'cutoff');
+      const cutoffOutput = cutoffRecord ? lastJsonObject(cutoffRecord.output) as Record<string, unknown> | undefined : undefined;
+      const expectedBase40 = (cutoffOutput?.baseline as { sha?: unknown } | undefined)?.sha;
+      if (typeof expectedBase40 !== 'string' || !/^[a-f0-9]{40}$/i.test(expectedBase40))
+        return fallback('completed-shard interference receipts unavailable: saved cutoff baseline is absent or invalid');
+      const evidence = stalledGateEvidence({ version: tip.version, commit: tip.to, repo: deps.repo ?? process.cwd(),
+        roots: [...new Set([deps.ledgerRoot ?? releaseLedgerRoot(), root])], gateOutput: previousGate,
+        expectedBase40, expectedTests: deps.gateTestsAtCommit, allowComplete: true });
+      if (!evidence.ok) return fallback(`completed-shard interference receipts unavailable: ${evidence.reason}`);
+      if (evidence.evidence.stalledShards.length)
+        return fallback('mixed completed-shard interference and unmeasured shards require a full gate');
+      const receiptEvidence = evidence.evidence;
       let closure: ClosureTree;
       try { closure = (deps.closureTree ?? ((commit: string) => gitClosureTree(deps.repo ?? process.cwd(), commit)))(tip.to); }
       catch (error) { return fallback(`tip tree unreadable: ${String(error instanceof Error ? error.message : error).slice(0, 200)}`); }
@@ -530,7 +522,7 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
       if (!planned.ok) return fallback(planned.reason);
       // The gate consumer only executes same-cut partial work for the stalled-only recheck shape.
       // Interference files are likewise unmeasured, so mark exactly this set as the recheck boundary.
-      const partialFailures = previousGate.partialFailures as { failures?: unknown; errors?: unknown } | undefined;
+      const partialFailures = receiptEvidence?.partialFailures ?? previousGate.partialFailures as { failures?: unknown; errors?: unknown } | undefined;
       if (!Array.isArray(partialFailures?.failures) || !partialFailures.failures.every((id) => typeof id === 'string')
         || !Array.isArray(partialFailures.errors) || !partialFailures.errors.every((id) => typeof id === 'string'))
         return fallback('partial-resume has no complete prior failure record');
@@ -541,42 +533,38 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
         priorFailures = (partialFailures.failures as string[]).filter((id) => !affected.has(testFileOfId(id)));
         priorErrors = (partialFailures.errors as string[]).filter((id) => !affected.has(testFileOfId(id)));
       } catch { return fallback('partial-resume prior failure record is malformed'); }
-      const recheckPlan = { ...planned.plan, priorFailures, priorErrors, stalledFiles: planned.plan.files };
+      const recheckPlan = { ...planned.plan, priorFailures, priorErrors, stalledFiles: planned.plan.files,
+        ...(receiptEvidence ? { preservedShardCount: receiptEvidence.preservedShardCount } : {}) };
       const path = dryRun ? undefined : writeRecheckPlan(root, recheckPlan);
       debug.log('release-loop.resume', 'interference-recheck-planned', { version: tip.version, commit: tip.to,
-        remeasureFileCount: recheckPlan.files.length, fallbackReason: null, ...(path ? { path } : {}), dryRun });
+        remeasureFileCount: recheckPlan.files.length, preservedShardCount: receiptEvidence?.preservedShardCount ?? 0,
+        fallbackReason: null, ...(path ? { path } : {}), dryRun });
       return { requested: true, applied: true, files: recheckPlan.files.length, plannedFiles: recheckPlan.files, priorCommit: tip.to, ...(auto ? { auto: true as const } : {}) };
     }
-    const stalled = previousGate?.stalledShards;
-    const summary = previousGate?.partialSummary as { pass?: unknown; fail?: unknown; errors?: unknown; ran?: unknown; files?: unknown } | undefined;
-    const measured = previousGate?.partialFailures as { failures?: unknown; errors?: unknown } | undefined;
-    if (previousGate?.outcome !== 'error' || previousGate.commit !== tip.to || !Array.isArray(stalled) || !stalled.length || !summary || !measured
-      || !['pass', 'fail', 'errors', 'ran', 'files'].every((key) => Number.isSafeInteger(summary[key as keyof typeof summary]) && Number(summary[key as keyof typeof summary]) >= 0)
-      || !Array.isArray(measured.failures) || !measured.failures.every((id) => typeof id === 'string')
-      || !Array.isArray(measured.errors) || !measured.errors.every((id) => typeof id === 'string')
-      || measured.failures.length !== Number(summary.fail) || measured.errors.length !== Number(summary.errors))
-      return fallback('same-commit gate has no complete stalled-shard measurement record');
-    const stalledFiles: string[] = [];
-    for (const item of stalled) {
-      if (!item || typeof item !== 'object' || !Array.isArray((item as { files?: unknown }).files)
-        || !(item as { files: unknown[] }).files.every((file) => typeof file === 'string')
-        || !['incomplete', 'no-output', 'job-failed', 'exit-code', 'unattributed', 'timeout', 'admission-timeout', 'admission-error'].includes(String((item as { reason?: unknown }).reason)))
-        return fallback('stalled-shard record is malformed');
-      stalledFiles.push(...(item as { files: string[] }).files);
-    }
-    const closure = (deps.closureTree ?? ((commit: string) => gitClosureTree(deps.repo ?? process.cwd(), commit)))(tip.to);
+    if (previousGate?.outcome !== 'error' || previousGate.commit !== tip.to)
+      return fallback('same-commit gate result is not an interrupted error for this commit');
+    const cutoffRecord = saved.nodes.find((node) => node.nodeId === 'cutoff');
+    const cutoffOutput = cutoffRecord ? lastJsonObject(cutoffRecord.output) as Record<string, unknown> | undefined : undefined;
+    const expectedBase40 = (cutoffOutput?.baseline as { sha?: unknown } | undefined)?.sha;
+    const evidence = stalledGateEvidence({ version: tip.version, commit: tip.to, repo: deps.repo ?? process.cwd(),
+      roots: [...new Set([deps.ledgerRoot ?? releaseLedgerRoot(), root])], gateOutput: previousGate,
+      ...(typeof expectedBase40 === 'string' ? { expectedBase40 } : {}),
+      expectedTests: deps.gateTestsAtCommit });
+    if (!evidence.ok) return fallback('same-commit interrupted shard receipts unavailable: ' + evidence.reason);
+    const { stalledShards, partialFailures, preservedShardCount } = evidence.evidence;
+    const stalledFiles = stalledShards.flatMap((shard) => shard.files);
+    let closure: ClosureTree;
+    try { closure = (deps.closureTree ?? ((commit: string) => gitClosureTree(deps.repo ?? process.cwd(), commit)))(tip.to); }
+    catch (error) { return fallback('interrupted gate commit tree unreadable: ' + String(error instanceof Error ? error.message : error).slice(0, 200)); }
     const tracked = new Set(closure.files);
-    const preservedShardCount = Number.isSafeInteger(previousGate?.preservedShardCount)
-      && Number(previousGate?.preservedShardCount) >= 0 ? Number(previousGate?.preservedShardCount) : undefined;
     const planned = planStalledShardRecheck({ version: tip.version, measuredCommit: tip.to, forCommit: tip.to,
-      failures: measured.failures as string[], errors: measured.errors as string[], stalledFiles,
-      ...(preservedShardCount === undefined ? {} : { preservedShardCount }),
+      failures: partialFailures.failures, errors: partialFailures.errors, stalledFiles, preservedShardCount,
       existsAtCommit: (file) => tracked.has(file) });
     if (!planned.ok) return fallback(planned.reason);
-    const path = writeRecheckPlan(root, planned.plan);
+    const path = dryRun ? undefined : writeRecheckPlan(root, planned.plan);
     debug.log('release-loop.resume', 'stalled-recheck-planned', { version: tip.version, commit: tip.to,
       planKind: planned.plan.kind, remeasureFileCount: planned.plan.files.length,
-      preservedShardCount: planned.plan.preservedShardCount ?? 0, fallbackReason: null, path });
+      preservedShardCount: planned.plan.preservedShardCount ?? 0, fallbackReason: null, ...(path ? { path } : {}), dryRun });
     return { requested: true, applied: true, files: planned.plan.files.length, plannedFiles: [...planned.plan.files], priorCommit: tip.to,
       ...(auto ? { auto: true as const } : {}) };
   }
@@ -680,11 +668,14 @@ function preparePartial(tip: TipRefresh, opts: { from: string; partial?: boolean
     priorShards = inspected.images.map((image) => ({ imageDigest: image.imageDigest ?? null }));
   } else if (priorCutLogs) priorShards = collectExecutedPodShardImages(priorCutLogs, tip.from).map((image) => ({ imageDigest: image.imageDigest ?? null }));
   const stalledFiles = movedStalledEvidence?.stalledShards.flatMap((shard) => shard.files) ?? [];
+  const appendReceiptCosts = [...new Set([deps.ledgerRoot ?? releaseLedgerRoot(), root])]
+    .map((ledger) => gateAppendReceiptCostsFromLedger(ledger, tip.version, tip.from)).find((costs) => costs !== undefined);
   const planned = planPartialRegate({ version: tip.version, priorCommit: tip.from, forCommit: tip.to, changedFiles: [...changed, ...stalledFiles, ...invalidatedFiles],
     priorFailures: prior.failures as string[], priorErrors: (prior.errors ?? []) as string[],
     existsAtTip: (file) => tracked.has(file),
     ...((podGate || movedStalledEvidence) ? { priorShards: priorShards ?? [] } : {}),
-    closure: (changedCode) => testsReachingChanged(tree, changedCode, tests, { cliEntries: CLI_ENTRIES }) });
+    ...(appendReceiptCosts ? { receiptCosts: appendReceiptCosts } : {}),
+    closure: (changedCode) => testsReachingChangedForGateReuse(tree, changedCode, tests, { cliEntries: CLI_ENTRIES }) });
   if (!planned.ok) return fallback(planned.reason);
   if (planned.plan.files.length >= tests.length) return fallback(`every test is re-run (${tests.length}) — full gate`);
   if (planned.plan.kind === 'carry') {
@@ -734,17 +725,19 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
   const statePath = join(deps.root!, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
   const savedRun = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
   if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
+  validateBudgetExceededResume(savedRun, opts);
+  opts = { ...opts, from: releaseResumeNode(savedRun, opts.from) };
   assertReleaseResumeApprovalBoundary({ ...savedRun, statePath }, opts.from);
   if (opts.gateHost !== undefined && opts.gateExecutor === undefined) throw new Error('--gate-host requires --gate-executor host');
   if ((opts.shardHost !== undefined || opts.shardOs !== undefined) && opts.rerouteShard === undefined)
     throw new Error('--shard-host/--shard-os require --reroute-shard');
-  const hasOverrides = opts.waive !== undefined || opts.reason !== undefined || opts.acceptedRegressions !== undefined
+  const hasOverrides = opts.waive !== undefined || (opts.reason !== undefined && !opts.resumeBudgetExceeded) || opts.acceptedRegressions !== undefined
     || opts.gateExecutor !== undefined || opts.gatePodPool !== undefined || opts.rerouteShard !== undefined;
   const original = hasOverrides ? savedRun : undefined;
   if (original && opts.gateExecutor !== undefined) releaseResumeGateExecutor(original, { from: opts.from, executor: opts.gateExecutor, host: opts.gateHost });
   if (original && opts.gatePodPool !== undefined) releaseResumeGatePodPool(original, { from: opts.from, pool: opts.gatePodPool });
   if (original && opts.rerouteShard !== undefined) releaseResumeGateShardReroute(original, { from: opts.from, shard: opts.rerouteShard, host: opts.shardHost, os: opts.shardOs });
-  const waiver = original && (opts.waive !== undefined || opts.ownerWaive !== undefined || opts.reason !== undefined) ? resolveResumeWaiver(original, opts) : undefined;
+  const waiver = original && (opts.waive !== undefined || opts.ownerWaive !== undefined || (opts.reason !== undefined && !opts.resumeBudgetExceeded)) ? resolveResumeWaiver(original, opts) : undefined;
   if (original && opts.acceptedRegressions !== undefined && !waiver)
     releaseResumeAcceptedRegressions(original, opts.acceptedRegressions, opts.from);
   const attempt = reserveReleaseResumeAttempt(savedRun, deps.root!, { now: deps.now, checkOnly: true });
@@ -759,13 +752,13 @@ async function planResumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: Resu
     if (advertised?.toLowerCase() !== recorded.toLowerCase()) throw new Error('release branch moved — re-gate the new tip before waiving a node');
     waiverCommit = recorded;
   }
-  const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true);
+  const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true, undefined, opts.resumeBudgetExceeded === true);
   const fromIndex = savedRun.path.indexOf(opts.from) >= 0 ? savedRun.path.indexOf(opts.from) : releaseFanOutForkIndex(savedRun, opts.from) ?? -1;
   const gateIndex = savedRun.path.indexOf('gate');
   const gateWillRun = fromIndex >= 0 && gateIndex >= fromIndex;
   if (opts.rerouteShard !== undefined && tip.changed) throw new Error('shard reroute requires the original cut head; moved tip needs a full re-gate');
   verifyResumeRecipePin(opts.commandRoot ?? process.cwd(), savedRun.graphSnapshot, tip.version);
-  const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), tip.to, deps.git);
+  const commandRoot = verifyResumeCommandRoot(opts.commandRoot ?? process.cwd(), tip.to, deps.git, deps.commandRootGit, opts.commandRoot !== undefined);
   verifyResumePreflight(savedRun, opts, deps, tip.version, tip.from, tip.to, commandRoot);
   const autoheal = gateWillRun ? priorGateAutoheal(savedRun) : undefined;
   const autoReroute = opts.rerouteShard === undefined ? automaticReroute(savedRun, autoheal, tip.changed, opts.from) : undefined;
@@ -788,12 +781,14 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   const statePath = join(deps.root!, 'graph-runs', 'release-loop', `${safeRunId(opts.runId)}.json`);
   const savedRun = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
   if (savedRun.graphId !== 'release-loop' || savedRun.runId !== opts.runId) throw new Error(`run identity mismatch: ${statePath}`);
+  validateBudgetExceededResume(savedRun, opts);
+  opts = { ...opts, from: releaseResumeNode(savedRun, opts.from) };
   assertReleaseResumeApprovalBoundary({ ...savedRun, statePath }, opts.from);
   let waiverCommit: string | undefined;
   if (opts.gateHost !== undefined && opts.gateExecutor === undefined) throw new Error('--gate-host requires --gate-executor host');
   if ((opts.shardHost !== undefined || opts.shardOs !== undefined) && opts.rerouteShard === undefined)
     throw new Error('--shard-host/--shard-os require --reroute-shard');
-  const original = opts.waive !== undefined || opts.reason !== undefined || opts.acceptedRegressions !== undefined || opts.gateExecutor !== undefined || opts.gatePodPool !== undefined || opts.rerouteShard !== undefined
+  const original = opts.waive !== undefined || (opts.reason !== undefined && !opts.resumeBudgetExceeded) || opts.acceptedRegressions !== undefined || opts.gateExecutor !== undefined || opts.gatePodPool !== undefined || opts.rerouteShard !== undefined
     ? savedRun : undefined;
   // GATE-HOST-EXECUTOR: checked before the tip refresh writes anything; the runner checks it again under the resume lock.
   const gateExecutor = original && opts.gateExecutor !== undefined
@@ -806,7 +801,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   if (gatePodPool) debug.log('release-loop.resume', 'gate-pod-pool', {
     runId: opts.runId, from: opts.from, pool: gatePodPool.set.gatePodPool, previous: gatePodPool.previous,
   });
-  const waiver = original && (opts.waive !== undefined || opts.ownerWaive !== undefined || opts.reason !== undefined)
+  const waiver = original && (opts.waive !== undefined || opts.ownerWaive !== undefined || (opts.reason !== undefined && !opts.resumeBudgetExceeded))
     ? resolveResumeWaiver(original, opts) : undefined;
   if (waiver) debug.log('release-loop.resume', 'waiver', { runId: opts.runId, node: waiver.nodeId, reason: waiver.reason, unmeasured: waiver.unmeasured ?? null });
   const acceptedRegressions = original && opts.acceptedRegressions !== undefined && !waiver
@@ -828,12 +823,12 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
     waiverCommit = recorded;
   }
   // The read-only tip and recipe pin preflight must pass before fetch or a saved-run rewrite.
-  const previewTip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true);
+  const previewTip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, true, undefined, opts.resumeBudgetExceeded === true);
   if (shardReroute && previewTip.changed) throw new Error('shard reroute requires the original cut head; moved tip needs a full re-gate');
   verifyResumeRecipePin(opts.commandRoot ?? process.cwd(), savedRun.graphSnapshot, previewTip.version);
-  const commandRoot = verifyReleaseCommandRoot(opts.commandRoot ?? process.cwd(), previewTip.to, deps.git);
+  const commandRoot = verifyResumeCommandRoot(opts.commandRoot ?? process.cwd(), previewTip.to, deps.git, deps.commandRootGit, opts.commandRoot !== undefined);
   verifyResumePreflight(savedRun, opts, deps, previewTip.version, previewTip.from, previewTip.to, commandRoot);
-  const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, false, previewTip.to);
+  const tip = refreshReleaseBranchTipInternal(opts.runId, deps, opts.from, waiverCommit, false, previewTip.to, opts.resumeBudgetExceeded === true);
   const autoheal = priorGateAutoheal(savedRun);
   const autoReroute = !shardReroute ? automaticReroute(savedRun, autoheal, tip.changed, opts.from) : undefined;
   const automaticShardReroute = autoReroute ? releaseResumeGateShardReroute(savedRun, { from: opts.from, shard: autoReroute }) : undefined;
@@ -848,12 +843,28 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   const graphPath = deps.graphPath ?? savedGraphPath(tip.statePath) ?? GRAPH;
   const savedSource = JSON.parse(readFileSync(tip.statePath, 'utf8')) as GraphRunState;
   deps.onSource?.(`레시피 출처: graph=${graphPath} · graph sha=${savedSource.graphSnapshot?.graphSha?.slice(0, 12) ?? 'legacy'} · recipes sha=${savedSource.graphSnapshot?.recipesSha?.slice(0, 12) ?? 'legacy'} · command-root=${commandRoot} · 컷 tip=${tip.to.slice(0, 12)}`);
+  if (waiver?.nodeId === 'gate') {
+    const issuedAt = (deps.now?.() ?? new Date()).getTime();
+    const event = issueGateWaiverEvent({ mode: 'operational', target: `run:${opts.runId}`, head: tip.to,
+      evidence: [`saved-run:${tip.statePath}`, `waiver:${waiver.unmeasured ?? waiver.reason}`],
+      actor: waiver.approvedBy ?? process.env.ELANOUS_SEAT ?? process.env.USER ?? 'release-resume', issuedAt,
+      expiresAt: issuedAt + 24 * 60 * 60 * 1000 });
+    const eventPath = join(deps.ledgerRoot ?? releaseLedgerRoot(), 'review-results', 'waiver-events.jsonl');
+    const acceptedIds = new Set(waiver.acceptedRegressions.map(({ id }) => id));
+    const unacceptedMeasuredRegression = !waiver.ownerWaived
+      && (waiver.introducedIds ?? []).some((id) => !acceptedIds.has(id));
+    appendWaiverEvents(eventPath, [event, consumeWaiverEvent(event, { target: `run:${opts.runId}`, head: tip.to, now: issuedAt,
+      measuredRegression: unacceptedMeasuredRegression })]);
+  }
+  await (deps.registerLogSink ?? registerStandaloneLogSink)('release-loop');
   const safeCleanup = createMacrophageSafeCleanup({ repoRoot: process.cwd() });
-  const macrophage = createMacrophageRuntime({ runId: opts.runId, eventBus: deps.eventBus,
-    inventory: () => safeCleanup.inventory(), liveCleanup: safeCleanup.cleanup });
+  const macrophage = createMacrophageRuntime({ runId: opts.runId, root: deps.root, eventBus: deps.eventBus,
+    inventory: deps.macrophageInventory ?? (() => safeCleanup.inventory()), liveCleanup: safeCleanup.cleanup });
+  const sourceGit = resumeCommandRootGit(commandRoot, deps.git, deps.commandRootGit, opts.commandRoot !== undefined);
   let state: GraphRunState;
   try { state = await (deps.graph ?? runGraph)(graphPath, { resumeRunId: opts.runId, fromNodeId: opts.from, pinChildUniverse: true, eventBus: macrophage.eventBus,
-    releaseCommandSource: { root: commandRoot, cutTip: tip.to, ...(deps.git ? { git: deps.git } : {}) },
+    ...(opts.resumeBudgetExceeded ? { releaseBudgetExceededResume: { reason: opts.reason!.trim() } } : {}),
+    releaseCommandSource: { root: commandRoot, cutTip: tip.to, ...(sourceGit ? { git: sourceGit } : {}) },
     ...(waiver ? { releaseWaiver: { ...waiver, requestedRegressions: opts.acceptedRegressions ?? [] } } : {}),
     ...(acceptedRegressions ? { releaseAcceptedRegressions: { requested: opts.acceptedRegressions!, acceptedRegressions } } : {}),
     ...(gateExecutor ? { releaseGateExecutor: { executor: gateExecutor.set.gateExecutor, ...(opts.gateHost !== undefined ? { host: opts.gateHost } : {}) } } : {}),
@@ -867,12 +878,18 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
 }
 
 // RELEASE-RECOVER-ONE-CMD (0.2.36): a failed release run is repaired by three commands that used to be chained by
-// hand (append dry-run → append → resume --from export-check). `release recover` runs them in that order, stops the
+// hand (append dry-run → append → resume from the earliest saved cut consumer). `release recover` runs them in that order, stops the
 // moment one fails, and leaves every stage's result in the resume-attempts ledger.
 export type RecoverStageName = 'append-dry-run' | 'append' | 'resume';
 const RECOVER_STAGES: readonly RecoverStageName[] = ['append-dry-run', 'append', 'resume'];
 /** The first node that consumes the cut — a moved tip must restart no later than here, so it is the default. */
 const RECOVER_FIRST_NODE = 'export-check';
+
+function recoveryStartNode(path: readonly string[]): string {
+  return ['export-check', 'gate']
+    .filter((nodeId) => path.includes(nodeId))
+    .sort((left, right) => path.indexOf(left) - path.indexOf(right))[0] ?? RECOVER_FIRST_NODE;
+}
 
 export interface RecoverReleaseOptions {
   runId: string;
@@ -973,7 +990,7 @@ async function acquireReleaseRecoveryLock(root: string, runId: string) {
 
 /**
  * Repair a failed release run in one command: append dry-run (plan only) → append (fast-forward release/<v> onto the
- * picked repairs) → resume --from export-check (preflight plan, then the graph). A failing stage stops the command:
+ * picked repairs) → resume from the earliest saved cut consumer (preflight plan, then the graph). A failing stage stops the command:
  * the later stages never run, and the stage results are already in the ledger for the human to read.
  */
 export async function recoverReleaseRun(opts: RecoverReleaseOptions, deps: RecoverReleaseDeps = {}): Promise<RecoverReleaseResult> {
@@ -1020,7 +1037,7 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
     throw new Error(`release run ${opts.runId} has no successful version-release record — nothing to repair`);
   }
   const branch = `release/${version}`;
-  const fromNode = opts.from ?? RECOVER_FIRST_NODE;
+  const fromNode = opts.from ?? recoveryStartNode(savedRun.path);
   // RELEASE-RECOVER-PREFLIGHT (MS-02 review): the append pushes release/<v> on origin, and the resume refuses a
   // bad run only after that push. Every read-only resume rejection is checked here FIRST — a run the resume
   // would refuse never moves the branch. command-root mismatch is gone by construction: recover prepares the
@@ -1041,7 +1058,8 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
   if (firstConsumer >= 0 && restartAt > firstConsumer) {
     throw new Error(`--from ${fromNode} is later than ${savedRun.path[firstConsumer]!} — later nodes were built from the old tip; ${branch} was not moved`);
   }
-  const savedInput = (savedRun.input ?? {}) as { branchCut?: unknown; version?: unknown };
+  const savedInput = (savedRun.input ?? {}) as { branchCut?: unknown; version?: unknown; gateExecutor?: unknown;
+    gateImagePin?: unknown; gatePodPool?: unknown };
   if (savedInput.branchCut !== true || savedInput.version !== version || recorded?.branch !== branch) {
     throw new Error(`release run ${opts.runId} was not cut as ${branch} (input.branchCut/version or version-release branch differ); ${branch} was not moved`);
   }
@@ -1143,7 +1161,17 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
     }
   }
 
-  // 3/3 resume --from export-check — the read-only preflight first (its plan is the record), then the graph run.
+  if (savedInput.gateExecutor === 'pod' && savedInput.gateImagePin === 'cut-commit'
+    && typeof savedInput.gatePodPool === 'string' && savedInput.gatePodPool && /^[0-9a-f]{40}$/i.test(tip)) {
+    const gateImagePrebuild = runCutGateImagePrebuild({ root, repo: repoRoot, runId: opts.runId, version,
+      commit: tip, pool: savedInput.gatePodPool });
+    debug.log('release-loop.cut-image', 'prebuild', { runId: opts.runId, version, commit: tip,
+      outcome: gateImagePrebuild.outcome, ...(gateImagePrebuild.outcome === 'failed' ? { reason: gateImagePrebuild.reason } : {}),
+      ...(gateImagePrebuild.outcome === 'built' || gateImagePrebuild.outcome === 'reused'
+        ? { digest: gateImagePrebuild.digest, eligiblePools: gateImagePrebuild.eligiblePools } : {}) });
+  }
+
+  // 3/3 resume from the earliest saved cut consumer — the read-only preflight first (its plan is the record), then the graph run.
   // The append moved only the origin branch tip: the operator checkout is still wherever it was, and the resume
   // preflight (verifyReleaseCommandRoot) demands a checkout whose HEAD is the new tip. So recover prepares that
   // checkout itself — a temporary worktree at the tip. A human-provided --command-root stays a judgment
@@ -1166,8 +1194,9 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
     resumeOptions.commandRoot = dir;
   }
   try {
-    const plan = await planResumeReleaseRun(resumeOptions, deps);
-    const resumed = await resumeReleaseRun(resumeOptions, deps);
+    const resumeDeps = { ...deps, commandRootGit: commandRootGitRunner(resumeOptions.commandRoot!) };
+    const plan = await planResumeReleaseRun(resumeOptions, resumeDeps);
+    const resumed = await resumeReleaseRun(resumeOptions, resumeDeps);
     record({ stage: 'resume', outcome: 'ok', at: now(), from: fromNode, branch: resumed.tip.branch,
       commit: resumed.tip.to, gatePlan: plan.gatePlan.mode, status: resumed.state.status });
     deps.onSource?.(`▶ recover 3/3 resume ${fromNode}부터 · tip ${resumed.tip.to.slice(0, 12)} · gate ${plan.gatePlan.mode} → ${resumed.state.status}`);
@@ -1240,7 +1269,7 @@ async function recoverReleaseRunFromLandingLocked(opts: RecoverReleaseLandingOpt
             }
           }
           const completed = records[completedIndex]!;
-          return { runId, version, branch: `release/${version}`, fromNode: completed.from ?? opts.from ?? RECOVER_FIRST_NODE,
+          return { runId, version, branch: `release/${version}`, fromNode: completed.from ?? opts.from ?? recoveryStartNode(savedRun.path),
             stages: records.slice(cycleStart, completedIndex + 1).filter(matchesPick), duplicate: true };
         }
       }

@@ -31,7 +31,7 @@ import { HostPoolLease } from '../pod-lease/host-lease.js';
 import { createFakeKubectl } from '../ux-sim/fake-kubectl.js';
 import { createFakeGh } from '../ux-sim/fake-gh.js';
 import { withSimClock } from '../ux-sim/fake-clock.js';
-import { podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
+import { podJobName, podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { Command } from 'commander';
 import { assessRunningRuns, buildRunProgressRows, renderRunProgressTable } from '../self-implement/running-runs.js';
 import type { RunningRunsResult } from '../self-implement/running-runs.js';
@@ -2678,7 +2678,8 @@ describe.serial('harness CLI command', () => {
       const index = runs.length;
       runs.push(runSelfOrchestrateCliCommand({ goals: [{ feature: goalText }], concurrency: 1,
         runtime: { spawn: (jobInput) => {
-          const job = spawn({ ...jobInput, spaceId: `goal-${index}`, signal: controllers[index]!.signal });
+          const spaceId = `goal-${index}`;
+          const job = spawn({ ...jobInput, spaceId, signal: controllers[index]!.signal });
           jobs.push(job);
           return job;
         } },
@@ -2706,8 +2707,10 @@ describe.serial('harness CLI command', () => {
       });
       await waitForApplied(2);
       expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
-      expect(applied[0]).toContain('goal-0');
-      expect(applied[1]).toContain('goal-1');
+      // Concurrent pool admission does not promise apply completion order.
+      const firstGoalJobs = [podJobName('goal-0'), podJobName('goal-1')];
+      const firstAppliedJobs = applied.slice(0, 2);
+      expect(new Set(firstAppliedJobs)).toEqual(new Set(firstGoalJobs));
       expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
       const stayedQueued = await withSimClock(0, async (clock) => {
         let windowElapsed = false;
@@ -2724,14 +2727,16 @@ describe.serial('harness CLI command', () => {
       expect(stayedQueued).toBe(true);
       expect(applied).toHaveLength(2);
       expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
-      completed.add(applied[0]!);
-      await jobs[0]!.done;
+      const firstCompletedJob = applied[0]!;
+      completed.add(firstCompletedJob);
+      const completedGoalIndex = firstGoalJobs.indexOf(firstCompletedJob);
+      expect(completedGoalIndex).toBeGreaterThanOrEqual(0);
+      await jobs[completedGoalIndex]!.done;
       await waitForApplied(3);
-      expect(applied[2]).not.toContain('goal-0');
-      expect(applied[2]).not.toContain('goal-1');
+      expect(firstGoalJobs).not.toContain(applied[2]);
       completed.add(applied[1]!);
       completed.add(applied[2]!);
-      await Promise.all(jobs.slice(1).map((job) => job.done));
+      await Promise.all(jobs.map((job) => job.done));
       expect((await third).ok).toBe(true);
       expect((await Promise.all(runs)).every((result) => result.ok)).toBe(true);
     } finally {

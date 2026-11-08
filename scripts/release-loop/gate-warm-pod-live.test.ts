@@ -5,7 +5,7 @@ import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from '
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runPodCommand } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
-import { gateShardShell } from './gate-node.js';
+import { gateShardShell } from './gate-shard-shell.js';
 import { warmReferenceFromJobArtifacts, writeWarmJobManifest } from './gate-warm-artifacts.js';
 
 // Explicit live probe: two real Kubernetes Jobs, with no injected Pod command,

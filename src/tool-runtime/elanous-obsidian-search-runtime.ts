@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // PLAN-codex-app-server-hermes-parity §5 Phase H1·5b (2026-05-16) —
 // `elanous_obsidian_search` MCP tool. Mirrors the daemon-side ACP method
 // `elanous/obsidian/search` (src/acp/server.ts:2135). Wraps `rg --json`
@@ -13,7 +14,7 @@
 
 import { parseRgJsonMatches, rgJsonMatchesAsync } from './ripgrep-core.js';
 import { resolveObsidianRoot } from '../acp/fs-roots.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime } from './types.js';
 
 export interface ElanousObsidianSearchArgs {

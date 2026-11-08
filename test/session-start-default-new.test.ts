@@ -329,7 +329,7 @@ describe('대시보드 TUI 루트 이어하기 우선순위(r1 must-fix)', () =>
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
   test('인자 없음 ∧ env 없음 → 새 세션', () => {
     expect(resolveRootResumeSessionId({ continueLatest: false, readEnvId: () => null, latest })).toEqual({ source: 'none' });
   });

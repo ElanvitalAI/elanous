@@ -15,11 +15,16 @@ import type { PodReuseResidueFaultFixture } from './fault-pod-reuse-residue.js';
 const key = { context: 'pool-host-a-context', imageDigest: `sha256:${'d'.repeat(64)}`,
   lockHash: 'e'.repeat(64), architecture: 'amd64' };
 type WarmPoolHost = 'pool-host-a' | 'pool-host-b';
+function fakeArchitecture(value: string): 'arm64' | 'amd64' {
+  if (value !== 'arm64' && value !== 'amd64') throw new Error(`unsupported fake host architecture: ${value}`);
+  return value;
+}
 const spec: WarmPodSpec = { name: 'warm-pool-host-a-si-1', namespace: 'elanous-test',
   kubectlContext: key.context, workerId: 'warm-pool-host-a-si-1-generation-1',
   image: `registry.example/elanous@${key.imageDigest}`,
   sourceUrl: 'https://github.com/ElanvitalAI/elanous.git', cutSha: 'f'.repeat(40), key,
   memoryLimit: '16Gi', nodeName: 'pool-host-a-server-0',
+  runtimeContract: { baseImageDigest: 'sha256:' + 'a'.repeat(64), bunVersion: '1.2.3', os: 'linux', architecture: 'amd64', requiredTools: ['bun', 'git'] },
   hostProbeUrl: 'http://host.orb.internal:10001/health', prodProbeUrl: 'http://core.elanous-prod:10002/' };
 
 export interface WarmSiReuseEvidence {
@@ -32,6 +37,9 @@ export interface WarmSiReuseEvidence {
   recoveryHost: string | null;
   cleanupOutcomes: Array<'returned' | 'quarantined'>;
   controlTransitions: string[];
+  candidateMatchScores: Array<{ kind: string; runId: string; selectedWorkerId: string | null;
+    candidates: Array<{ workerId: string; kind: string; accepted: boolean; score: readonly number[] | null;
+      cutShaDistance: number; imageDigestDrift: boolean; reason: string }> }>;
   cleanupObservations: string[];
   ledgerRows: RunLedgerEntry[];
   retryAcquire: string;
@@ -63,15 +71,19 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
     ? options.residueFixture.remote.git(options.residueFixture.remote.checkout, ['rev-parse', 'HEAD']).trim()
     : undefined;
   const specA: WarmPodSpec = { ...spec, cutSha: fixtureSourceSha ?? spec.cutSha,
-    key: { ...key, architecture: options.hostArchitectures?.['pool-host-a'] ?? key.architecture } };
+    key: { ...key, architecture: options.hostArchitectures?.['pool-host-a'] ?? key.architecture },
+    runtimeContract: { ...spec.runtimeContract!, architecture: options.hostArchitectures?.['pool-host-a'] ?? key.architecture } };
   const specB: WarmPodSpec = { ...specA, name: 'warm-pool-host-b-si-1', workerId: 'warm-pool-host-b-si-1-generation-1',
     kubectlContext: 'pool-host-b-context', nodeName: 'pool-host-b-server-0',
-    key: { ...specA.key, context: 'pool-host-b-context', architecture: options.hostArchitectures?.['pool-host-b'] ?? 'arm64' } };
-  const candidates: Array<{ host: WarmPoolHost; tier: 'standard'; spec: WarmPodSpec }> = options.includeAlternateHost
-    ? [{ host: 'pool-host-a', tier: 'standard' as const, spec: specA }, { host: 'pool-host-b', tier: 'standard' as const, spec: specB }]
-    : [{ host: 'pool-host-a', tier: 'standard' as const, spec: specA }];
+    key: { ...specA.key, context: 'pool-host-b-context', architecture: options.hostArchitectures?.['pool-host-b'] ?? specA.key.architecture },
+    runtimeContract: { ...specA.runtimeContract!, architecture: options.hostArchitectures?.['pool-host-b'] ?? specA.key.architecture } };
+  const candidates: Array<{ host: WarmPoolHost; tier: 'standard'; kind: 'implementation'; spec: WarmPodSpec }> = options.includeAlternateHost
+    ? [{ host: 'pool-host-a', tier: 'standard' as const, kind: 'implementation', spec: specA },
+      { host: 'pool-host-b', tier: 'standard' as const, kind: 'implementation', spec: specB }]
+    : [{ host: 'pool-host-a', tier: 'standard' as const, kind: 'implementation', spec: specA }];
   const kubernetes = options.boundary?.kubernetes ?? new Map(candidates.map(({ spec: candidateSpec }) => {
-    const device = createFakeKubectl({ context: candidateSpec.kubectlContext, node: candidateSpec.nodeName!, podReadinessOnCreate: true });
+    const device = createFakeKubectl({ context: candidateSpec.kubectlContext, node: candidateSpec.nodeName!,
+      arch: fakeArchitecture(candidateSpec.key.architecture), podReadinessOnCreate: true });
     return [candidateSpec.kubectlContext, device] as const;
   }));
   for (const { spec: candidateSpec } of candidates) {
@@ -138,11 +150,16 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
     ledgerRows.push(row);
   };
   let activeCommand: SiWarmCommand | undefined;
+  const candidateMatchScores: WarmSiReuseEvidence['candidateMatchScores'] = [];
   const provider = new SiWarmPodProvider({ candidates,
+    selection: { kind: 'implementation', imageDigest: specA.key.imageDigest, runtimeContract: specA.runtimeContract! },
     controlUrl: primary.url, memberToken: primary.memberToken, machineTokens: primary.machineTokens,
     kubectl, fetch: primary.fetch, now,
     siRunnerReady: candidateSpec => options.hostAvailable?.(candidateSpec.kubectlContext === specA.kubectlContext ? 'pool-host-a' : 'pool-host-b') ?? true,
-    observe: (event, data) => observe(event, data),
+    observe: (event, data) => {
+      if (event === 'si-candidate-match-score') candidateMatchScores.push(data as WarmSiReuseEvidence['candidateMatchScores'][number]);
+      observe(event, data);
+    },
     decodeArtifactForTest: options.injectOversizedArtifact ? encoded => {
       artifactDecodeCalls++;
       return Buffer.from(encoded, 'base64');
@@ -213,7 +230,8 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
     coldAdmission: coldLeaseMeasure ? recommendConcurrency(coldLeaseMeasure,
       { capacity: 1, perGoalMemory: '1Gi', accounts: 1, perAccount: 1 }) : null,
     leaseGenerations: [], podUids: [],
-    leaseHosts: [], leaseArchitectures: [], recoveryHost: null, cleanupOutcomes: [], controlTransitions: [], cleanupObservations, ledgerRows,
+    leaseHosts: [], leaseArchitectures: [], recoveryHost: null, cleanupOutcomes: [], controlTransitions: [], candidateMatchScores,
+    cleanupObservations, ledgerRows,
     retryAcquire: 'not-attempted', finalPodState: undefined, artifactCapRejected: false, artifactDecodeCalls: 0,
     residueAtReturn, liveChildPidsAtReturn };
   try {
@@ -223,7 +241,7 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
         ? options.residueFixture.remote.git(options.residueFixture.remote.checkout, ['rev-parse', 'HEAD']).trim()
         : specA.cutSha;
       const acquired = await provider.acquire({ runId: `${options.runId}-${index}`, attemptId: `attempt-${index}`,
-        executionKey: 'a'.repeat(64), sourceSha, deadlineAt: now() + 60_000,
+        executionKey: 'a'.repeat(64), sourceSha, lockHash: specA.key.lockHash, deadlineAt: now() + 60_000,
         payload: new TextEncoder().encode('simulated SI payload'),
         credentialBundle: new TextEncoder().encode('simulated credential bundle'), adopt: async () => {} });
       if (acquired.status !== 'acquired') throw new Error(`SI lease acquisition failed: ${acquired.status}/${acquired.reason}`);
@@ -262,7 +280,7 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
         ? options.residueFixture.remote.git(options.residueFixture.remote.checkout, ['rev-parse', 'HEAD']).trim()
         : specA.cutSha;
       const retry = await provider.acquire({ runId: `${options.runId}-retry`, attemptId: 'attempt-retry',
-        executionKey: 'a'.repeat(64), sourceSha: retrySourceSha, deadlineAt: now() + 60_000,
+        executionKey: 'a'.repeat(64), sourceSha: retrySourceSha, lockHash: specA.key.lockHash, deadlineAt: now() + 60_000,
         payload: new TextEncoder().encode('simulated SI payload'),
         credentialBundle: new TextEncoder().encode('simulated credential bundle'), adopt: async () => {} });
       if (retry.status === 'acquired' && options.recoverOnAlternateHost) {

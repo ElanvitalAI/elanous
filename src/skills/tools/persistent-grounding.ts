@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 import { randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
@@ -6,7 +7,7 @@ import type { CoreTurnContext, CoreTurnDispatchTool } from '../../core-turn/type
 import type { GoalLoopOptions, GoalLoopResult } from '../../core-turn/run-goal-loop.js';
 import { debug } from '../../debug/log.js';
 import { selectPlanningLlm } from '../../prompt-enhance/enhance.js';
-import type { LLMMessage, LLMToolSpec } from '../../llm.js';
+import type { LLMMessage } from '../../llm.js';
 import { buildAstGrepTool, dispatchAstGrep, hasAstGrep } from './ast-grep.js';
 import { buildGlobTool, dispatchGlob } from './glob.js';
 import { buildGrepTool, dispatchGrep } from './grep.js';

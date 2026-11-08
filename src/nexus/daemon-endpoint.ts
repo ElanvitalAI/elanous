@@ -1,5 +1,6 @@
 import { join } from 'node:path';
-import { resolveNexusPwa, type ResolveNexusPwaOpts } from '../cli/nexus-show.js';
+import { resolveNexusPwa } from './pwa-resolution.js';
+import type { ResolveNexusPwaOpts } from '../cli/pwa-show-contract.js';
 import { debug } from '../debug/log.js';
 import { prodInstanceRoot } from '../instance/resolve.js';
 import { findNexusLifecycleStateAt } from './supervisor/lock.js';

@@ -22,6 +22,10 @@ export type TrainObservation = {
   gatesPerLanding: number;
   conflictPlans?: TrainConflictPlanSummary[];
 };
+/** Run-local progress emitted by the production train library through an injected observer. */
+export type TrainProgressEvent =
+  | { readonly eventId: string; readonly type: 'merge-train.batch'; readonly batch: readonly { readonly number: number; readonly head: string }[] }
+  | { readonly eventId: string; readonly type: 'merge-train.verdict'; readonly observation: TrainObservation; readonly verdicts: readonly TrainVerdict[] };
 export type TrainGit = (args: readonly string[], repo: string, env?: NodeJS.ProcessEnv) => { status: number | null; stdout: string; stderr: string };
 export type TangledPair = { first: number; then: number; failures: number };
 
@@ -279,7 +283,18 @@ export async function runTrain(batch: readonly TrainCandidate[], deps: {
   tangledPairs?: readonly TangledPair[];
   classifyCulprit?: (pr: number) => RepairPlan;
   onCulpritPlans?: (plans: { pr: number; plan: RepairPlan | { action: 'reorder'; with: number } }[]) => void | Promise<void>;
+  /**
+   * Optional simulation/live adapter hook. A stable progressId is required when emitting events.
+   * The batch event is emitted before integration; rejection aborts before train work starts.
+   * The verdict event follows observe and culprit-plan delivery; callback failure rejects the run
+   * without publishing a verdict, while verdict-sink failure rejects after train work completed.
+   */
+  progressId?: string;
+  emitProgress?: (event: TrainProgressEvent) => void | Promise<void>;
 }): Promise<{ verdicts: TrainVerdict[]; gatesRun: number; integrations: number }> {
+  if (deps.emitProgress && !deps.progressId?.trim()) throw new Error('runTrain progressId is required when emitProgress is configured');
+  if (deps.emitProgress) await deps.emitProgress({ eventId: `${deps.progressId}:batch`, type: 'merge-train.batch',
+    batch: batch.map(({ number, head }) => ({ number, head })) });
   const verdicts = new Map<number, TrainVerdict['verdict']>();
   let gatesRun = 0;
   let integrations = 0;
@@ -340,5 +355,6 @@ export async function runTrain(batch: readonly TrainCandidate[], deps: {
   }))(data);
   const culpritPlans = planCulpritDriftRepair(data, deps.tangledPairs ?? [], deps.classifyCulprit ?? (() => ({ action: 'skip', reason: 'drift repair classifier unavailable' })));
   await deps.onCulpritPlans?.(culpritPlans);
+  await deps.emitProgress?.({ eventId: `${deps.progressId}:verdict`, type: 'merge-train.verdict', observation: data, verdicts: ordered });
   return { verdicts: ordered, gatesRun, integrations };
 }

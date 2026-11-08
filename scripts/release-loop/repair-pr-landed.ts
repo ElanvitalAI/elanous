@@ -13,6 +13,14 @@ export interface RepairPrLandedEvent {
   mergedAt: string;
 }
 
+export class RepairLandingRecoveryExhaustedError extends Error {
+  constructor(message: string) { super(message); this.name = 'RepairLandingRecoveryExhaustedError'; }
+}
+
+export class RepairLandingHeadMismatchError extends Error {
+  constructor(message: string) { super(message); this.name = 'RepairLandingHeadMismatchError'; }
+}
+
 function eventPath(prNumber: number, root = effectiveInstanceRoot()): string {
   return join(root, 'release', 'repair-pr-landings', `${prNumber}.json`);
 }
@@ -52,23 +60,43 @@ export async function waitForRepairPrLanded(prNumber: number, options: {
   root?: string;
   signal?: AbortSignal;
   watchDirectory?: (directory: string, onEvent: () => void) => () => void;
+  /** Re-query the authoritative PR state when the durable event is missing. `undefined` means it is not merged yet. */
+  recover?: () => Promise<RepairPrLandedEvent | undefined>;
+  expectedHead?: string;
+  recoveryIntervalMs?: number;
+  maxRecoveryFailures?: number;
 } = {}): Promise<RepairPrLandedEvent> {
   if (!Number.isSafeInteger(prNumber) || prNumber < 1) throw new Error('repair PR number must be positive');
   const root = options.root ?? effectiveInstanceRoot();
   const directory = join(root, 'release', 'repair-pr-landings');
-  const matches = (event: RepairPrLandedEvent | undefined) => event &&
-    (options.repairRunId === undefined || event.repairRunId === options.repairRunId) ? event : undefined;
+  const matches = (event: RepairPrLandedEvent | undefined) => {
+    if (!event || (options.repairRunId !== undefined && event.repairRunId !== options.repairRunId) || event.base !== 'main') return undefined;
+    if (options.expectedHead !== undefined && event.head !== options.expectedHead) {
+      throw new RepairLandingHeadMismatchError(`repair PR #${prNumber} landed head ${event.head} differs from inspected head ${options.expectedHead}`);
+    }
+    return event;
+  };
   const existing = matches(readEvent(prNumber, root));
   if (existing) return existing;
   if (options.signal?.aborted) throw new Error('repair PR landing wait aborted');
-  mkdirSync(directory, { recursive: true });
+  const recoveryIntervalMs = options.recoveryIntervalMs ?? 30_000;
+  const maxRecoveryFailures = options.maxRecoveryFailures ?? 3;
+  if (options.recover && (!Number.isSafeInteger(recoveryIntervalMs) || recoveryIntervalMs < 1 ||
+    !Number.isSafeInteger(maxRecoveryFailures) || maxRecoveryFailures < 1)) {
+    throw new Error('repair PR landing recovery limits must be positive integers');
+  }
   return new Promise<RepairPrLandedEvent>((resolve, reject) => {
     let closeWatcher: (() => void) | undefined;
+    let recoveryTimer: ReturnType<typeof setInterval> | undefined;
+    let watchSetupError: Error | undefined;
+    let recoveryInFlight = false;
+    let consecutiveRecoveryFailures = 0;
     let closed = false;
     const cleanup = () => {
       if (closed) return;
       closed = true;
       closeWatcher?.();
+      if (recoveryTimer) clearInterval(recoveryTimer);
       options.signal?.removeEventListener('abort', aborted);
     };
     const check = () => {
@@ -78,16 +106,69 @@ export async function waitForRepairPrLanded(prNumber: number, options: {
       resolve(event);
     };
     const aborted = () => { cleanup(); reject(new Error('repair PR landing wait aborted')); };
-    options.signal?.addEventListener('abort', aborted, { once: true });
-    try {
-      if (options.watchDirectory) closeWatcher = options.watchDirectory(directory, check);
-      else {
-        const watcher = watch(directory, (_kind, filename) => {
-          if (filename === null || filename.toString() === `${prNumber}.json`) check();
-        });
-        closeWatcher = () => watcher.close();
+    const startWatcher = () => {
+      if (closed || closeWatcher) return;
+      try {
+        mkdirSync(directory, { recursive: true });
+        if (options.watchDirectory) closeWatcher = options.watchDirectory(directory, check);
+        else {
+          const watcher = watch(directory, (_kind, filename) => {
+            if (filename === null || filename.toString() === `${prNumber}.json`) check();
+          });
+          closeWatcher = () => watcher.close();
+        }
+        watchSetupError = undefined;
+        check();
+      } catch (error) {
+        watchSetupError = error instanceof Error ? error : new Error(String(error));
       }
-      check();
-    } catch (error) { cleanup(); reject(error); }
+    };
+    const recover = async () => {
+      if (!options.recover || closed || recoveryInFlight) return;
+      recoveryInFlight = true;
+      try {
+        startWatcher();
+        if (closed) return;
+        const event = await options.recover();
+        if (closed) return;
+        if (!event) {
+          if (watchSetupError) throw watchSetupError;
+          consecutiveRecoveryFailures = 0;
+        } else {
+          if (event.prNumber !== prNumber || (options.repairRunId !== undefined && event.repairRunId !== options.repairRunId)) {
+            throw new Error('recovered repair PR landing event identity mismatch');
+          }
+          if (event.base !== 'main') throw new Error('recovered repair PR landing event base mismatch');
+          if (options.expectedHead !== undefined && event.head !== options.expectedHead) {
+            throw new RepairLandingHeadMismatchError(`recovered repair PR head ${event.head} differs from inspected head ${options.expectedHead}`);
+          }
+          publishRepairPrLanded(event, root);
+          consecutiveRecoveryFailures = 0;
+          check();
+        }
+      } catch (error) {
+        if (closed) return;
+        if (error instanceof RepairLandingHeadMismatchError) {
+          cleanup();
+          reject(error);
+          return;
+        }
+        consecutiveRecoveryFailures++;
+        if (consecutiveRecoveryFailures >= maxRecoveryFailures) {
+          cleanup();
+          reject(new RepairLandingRecoveryExhaustedError(`repair PR #${prNumber} (run ${options.repairRunId ?? 'unspecified'}) landing recovery exhausted after ${consecutiveRecoveryFailures} attempts: ${String(error).slice(0, 240)}`));
+        }
+      } finally { recoveryInFlight = false; }
+    };
+    options.signal?.addEventListener('abort', aborted, { once: true });
+    startWatcher();
+    check();
+    if (watchSetupError && !options.recover) {
+      cleanup();
+      reject(watchSetupError);
+    } else if (options.recover && !closed) {
+      recoveryTimer = setInterval(() => { void recover(); }, recoveryIntervalMs);
+      void recover();
+    }
   });
 }

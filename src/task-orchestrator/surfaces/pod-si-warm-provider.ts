@@ -5,15 +5,18 @@ import { lstatSync, readFileSync } from 'node:fs';
 import type { ChildPodLease, ChildPodReuseOperations } from './pod-child-reuse.js';
 import { decodeSiWarmArtifacts, siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from './pod-si-warm-protocol.js';
 import type { SiWarmExecReceipt, SiWarmFixedRunner, SiWarmPodIdentity } from './pod-si-warm-transport.js';
-import { probeWarmPodContext, type WarmPodSpec } from './pod-warm-worker-pod.js';
+import { probeWarmPodContext, probeWarmPodRuntimeContract, warmRuntimeContractMatches,
+  type WarmPodSpec } from './pod-warm-worker-pod.js';
 import type { WarmWorkerCandidate } from './pod-warm-worker-provider.js';
 import { resolveWarmPoolProfile, resolveWarmPoolQuota } from '../../self-implement/pod-warm-pool-profile.js';
 import type { SiWarmChildAttempt, Kubectl } from './self-implement-pod.js';
 import { debug } from '../../debug/log.js';
+import { scoreWarmPodCandidates, type WarmPodKind } from './pod-warm-provenance.js';
 
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA = /^[a-f0-9]{40}$/;
 const DIGEST = /^[a-f0-9]{64}$/;
+const IMAGE_DIGEST = /^sha256:[a-f0-9]{64}$/;
 const RUNNER = '/workspace/repo/src/task-orchestrator/surfaces/pod-si-warm-runner.ts';
 const MAX_OUTPUT = 128 * 1024 * 1024;
 const MAX_LEASE_MS = 24 * 60 * 60_000;
@@ -27,6 +30,8 @@ export interface SiWarmProviderInput {
   attemptId: string;
   executionKey: string;
   sourceSha: string;
+  /** Independently resolved from sourceSha:bun.lock, never inferred from a candidate. */
+  lockHash: string;
   deadlineAt: number;
   payload: Uint8Array;
   credentialBundle: Uint8Array;
@@ -36,6 +41,11 @@ export interface SiWarmProviderInput {
 
 export interface SiWarmProviderOptions {
   candidates: readonly WarmWorkerCandidate[];
+  /** Authoritative desired identity from the provider config, separate from candidate rows. */
+  selection: { kind: WarmPodKind; imageDigest: string;
+    runtimeContract: NonNullable<WarmPodSpec['runtimeContract']> };
+  /** Test seam for the source-ancestry distance; null means the candidate is not a proven ancestor. */
+  cutShaDistance?: (candidateSha: string, requestedSha: string) => number | null;
   controlUrl: string;
   memberToken: string;
   machineTokens: Readonly<Record<string, string>>;
@@ -48,7 +58,7 @@ export interface SiWarmProviderOptions {
   /** Test seam. Observe artifact decoder calls at the provider boundary. */
   decodeArtifactForTest?: (encoded: string) => Uint8Array | null;
   /** A trusted host canary must confirm the fixed si-v1 runner in this exact source Pod. Missing proof is no entry. */
-  siRunnerReady?: (spec: WarmPodSpec) => boolean;
+  siRunnerReady?: (spec: WarmPodSpec, requestedSourceSha: string, requestedLockHash: string) => boolean;
   /** Durable host observation hook for ambiguous control-plane transitions. */
   observe?: (event: string, data: Record<string, unknown>) => void;
 }
@@ -98,6 +108,16 @@ async function defaultExec(argv: readonly string[], stdin: Uint8Array, timeoutMs
 function parseJson(bytes: Uint8Array): any | null {
   try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); } catch { return null; }
 }
+function gitCutShaDistance(candidateSha: string, requestedSha: string): number | null {
+  if (candidateSha === requestedSha) return 0;
+  const ancestor = spawnSync('git', ['--no-lazy-fetch', 'merge-base', '--is-ancestor', candidateSha, requestedSha],
+    { encoding: 'utf8', timeout: 2_000, maxBuffer: 1024 * 1024 });
+  if (ancestor.status !== 0) return null;
+  const count = spawnSync('git', ['--no-lazy-fetch', 'rev-list', '--count', `${candidateSha}..${requestedSha}`],
+    { encoding: 'utf8', timeout: 2_000, maxBuffer: 1024 * 1024 });
+  const distance = Number(count.stdout?.trim());
+  return count.status === 0 && Number.isSafeInteger(distance) && distance > 0 ? distance : null;
+}
 function decodeBytes(value: unknown): Uint8Array | null {
   if (typeof value !== 'string' || value.length > MAX_OUTPUT * 2 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) return null;
   return Buffer.from(value, 'base64');
@@ -112,7 +132,16 @@ export class SiWarmPodProvider {
     const url = new URL(options.controlUrl);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== '/'
       || !DIGEST.test(options.memberToken) || options.candidates.some(row => row.tier !== 'standard'
-        || !row.host || !safeToken(row.spec.workerId) || !SHA.test(row.spec.cutSha))) throw new Error('invalid si warm provider');
+        || !row.host || !safeToken(row.spec.workerId) || !SHA.test(row.spec.cutSha))
+      || !options.selection || options.selection.kind !== 'implementation'
+      || !IMAGE_DIGEST.test(options.selection.imageDigest)
+      || !options.selection.runtimeContract
+      || !/^\d+\.\d+\.\d+$/.test(options.selection.runtimeContract.bunVersion)
+      || options.selection.runtimeContract.os !== 'linux'
+      || options.selection.runtimeContract.architecture !== 'amd64' && options.selection.runtimeContract.architecture !== 'arm64'
+      || !Array.isArray(options.selection.runtimeContract.requiredTools)
+      || options.selection.runtimeContract.requiredTools.length === 0)
+      throw new Error('invalid si warm provider');
     this.fetcher = options.fetch ?? fetch;
     this.kubectl = options.kubectl ?? defaultKubectl;
     this.exec = options.exec ?? defaultExec;
@@ -206,13 +235,15 @@ export class SiWarmPodProvider {
   }
 
   /** A read-only canary in the exact prepared checkout; an image tag alone is not runner proof. */
-  private runnerReady(spec: WarmPodSpec): boolean {
-    if (this.options.siRunnerReady) return this.options.siRunnerReady(spec);
+  private runnerReady(spec: WarmPodSpec, requestedSourceSha: string, requestedLockHash: string): boolean {
+    if (this.options.siRunnerReady) return this.options.siRunnerReady(spec, requestedSourceSha, requestedLockHash);
     const result = this.kubectl(['--context', spec.kubectlContext, '-n', spec.namespace,
-      'exec', `pod/${spec.name}`, '-c', 'worker', '--', 'bun', RUNNER, '--probe']);
+      'exec', `pod/${spec.name}`, '-c', 'worker', '--', 'bun', RUNNER, '--probe',
+      requestedSourceSha, requestedLockHash]);
     const proof = result.status === 0 ? parseJson(Buffer.from(result.stdout)) : null;
     return proof?.protocol === 'si-v1' && proof.runner === 'ready'
       && proof.workerId === spec.workerId && proof.sourceSha === spec.cutSha
+      && proof.requestedSourceSha === requestedSourceSha && proof.requestedLockHash === requestedLockHash
       && typeof proof.podUid === 'string' && proof.podUid.length > 0;
   }
 
@@ -227,12 +258,59 @@ export class SiWarmPodProvider {
 
   async acquire(input: SiWarmProviderInput): Promise<SiWarmAcquireResult> {
     if (!safeToken(input.runId) || !safeToken(input.attemptId) || !DIGEST.test(input.executionKey)
-      || !SHA.test(input.sourceSha) || !Number.isSafeInteger(input.deadlineAt) || input.deadlineAt <= this.now()
+      || !SHA.test(input.sourceSha) || !DIGEST.test(input.lockHash)
+      || !Number.isSafeInteger(input.deadlineAt) || input.deadlineAt <= this.now()
       || !(input.payload instanceof Uint8Array) || !(input.credentialBundle instanceof Uint8Array))
       return { status: 'no-entry', reason: 'invalid-input' };
-    const matching = this.options.candidates.filter(row => row.spec.cutSha === input.sourceSha);
+    const matching = this.options.candidates;
     if (!matching.length) return { status: 'no-entry', reason: 'no-candidate' };
-    const candidates = matching.filter(row => this.runnerReady(row.spec));
+    // ALLOC-RETURN is an implementation-worker path. Use the same production matcher as
+    // the release cut gate so a gate Pod can never be leased for an implementation attempt.
+    const { kind, imageDigest, runtimeContract } = this.options.selection;
+    const runtimeIdentity = { baseImageDigest: runtimeContract.baseImageDigest ?? '', lockHash: input.lockHash,
+      os: runtimeContract.os, architecture: runtimeContract.architecture, bunVersion: runtimeContract.bunVersion };
+    const scored = scoreWarmPodCandidates({ kind, cutSha: input.sourceSha,
+      lockHash: input.lockHash, imageDigest, runtimeIdentity,
+      candidates: matching.map(candidate => {
+        const candidateRuntimeContract = candidate.spec.runtimeContract;
+        let cutShaDistance: number | null;
+        try { cutShaDistance = (this.options.cutShaDistance ?? gitCutShaDistance)(candidate.spec.cutSha, input.sourceSha); }
+        catch { cutShaDistance = null; }
+        let observed: unknown;
+        if (cutShaDistance !== null) {
+          try { observed = probeWarmPodRuntimeContract(candidate.spec, this.kubectl).observed; }
+          catch { /* An unavailable live probe fails closed in the shared matcher. */ }
+        }
+        // Runtime architecture is host-specific for a multi-arch image. Preserve the
+        // configured runtime requirements while validating the candidate against its
+        // own pinned architecture and live probe.
+        const runtimeCompatible = !!candidateRuntimeContract
+          && candidateRuntimeContract.bunVersion === runtimeContract.bunVersion
+          && candidateRuntimeContract.os === runtimeContract.os
+          && candidateRuntimeContract.architecture === runtimeContract.architecture
+          && runtimeContract.requiredTools.every(tool => candidateRuntimeContract.requiredTools.includes(tool))
+          && candidateRuntimeContract.architecture === candidate.spec.key.architecture
+          && warmRuntimeContractMatches(candidateRuntimeContract, observed);
+        return { candidate, kind: candidate.kind ?? 'gate',
+        cutSha: candidate.spec.cutSha, lockHash: candidate.spec.key.lockHash,
+        imageDigest: candidate.spec.key.imageDigest, cutShaDistance: cutShaDistance ?? -1,
+        runtimeIdentity: candidateRuntimeContract ? { baseImageDigest: candidateRuntimeContract.baseImageDigest ?? '',
+          lockHash: candidate.spec.key.lockHash, os: candidateRuntimeContract.os,
+          architecture: candidateRuntimeContract.architecture, bunVersion: candidateRuntimeContract.bunVersion } : null,
+        contractCompatible: cutShaDistance !== null && runtimeCompatible };
+      }) });
+    debug.log('pod.warm', 'candidate-match-score', { kind, runId: input.runId,
+      candidates: scored.rows.map(row => ({ workerId: row.candidate.spec.workerId, kind: row.kind,
+        accepted: row.accepted, score: row.score, reason: row.reason,
+        cutShaDistance: row.cutShaDistance, imageDigestDrift: row.imageDigestDrift })) });
+    this.options.observe?.('si-candidate-match-score', { kind, runId: input.runId,
+      selectedWorkerId: scored.selected?.spec.workerId ?? null,
+      candidates: scored.rows.map(row => ({ workerId: row.candidate.spec.workerId, kind: row.kind,
+        accepted: row.accepted, score: row.score, reason: row.reason,
+        cutShaDistance: row.cutShaDistance, imageDigestDrift: row.imageDigestDrift })) });
+    const matchedCandidates = scored.rows.filter(row => row.accepted).map(row => row.candidate);
+    if (!matchedCandidates.length) return { status: 'no-entry', reason: 'no-candidate' };
+    const candidates = matchedCandidates.filter(row => this.runnerReady(row.spec, input.sourceSha, input.lockHash));
     if (!candidates.length) return { status: 'no-entry', reason: 'runner-unavailable' };
     const leaseTtlMs = Math.max(this.options.leaseTtlMs ?? 30 * 60_000,
       input.deadlineAt - this.now() + 60_000);
@@ -281,7 +359,7 @@ export class SiWarmPodProvider {
         return { status: 'uncertain', reason: confirmed ? 'lease-worker-unmatched' : 'quarantine-unconfirmed' };
       }
       const command: SiWarmCommand = { protocol: 'si-v1', runId: input.runId, attemptId: input.attemptId,
-        executionKey: input.executionKey, sourceSha: input.sourceSha, leaseId: attrs.leaseId,
+        executionKey: input.executionKey, sourceSha: leased.spec.cutSha, leaseId: attrs.leaseId,
         generation: attrs.generation, workerId: row.name, podUid: attrs.podUid, key: leased.spec.key,
         envProfile: 'si-standard-v1', deadlineAt: input.deadlineAt,
         payloadSha256: siWarmSha256(input.payload), credentialBundleSha256: siWarmSha256(input.credentialBundle) };
@@ -423,12 +501,13 @@ export function loadSiWarmPodProvider(path: string): SiWarmPodProvider {
     const quota = resolveWarmPoolQuota(profile, candidate.host, candidate.tier);
     if (!quota || !candidate.spec.nodeName) throw new Error('unmeasured si warm pool template');
     return Array.from({ length: quota }, (_, index): WarmWorkerCandidate => ({
-      host: candidate.host, tier: candidate.tier, spec: { ...candidate.spec,
+      host: candidate.host, tier: candidate.tier, kind: candidate.kind, spec: { ...candidate.spec,
         name: `warm-${candidate.host}-${candidate.tier}-${index + 1}`,
         workerId: `${candidate.spec.workerId}-${candidate.tier}-${index + 1}` },
     }));
   });
   return new SiWarmPodProvider({ candidates: [...direct, ...expanded],
+    selection: value.siSelection as SiWarmProviderOptions['selection'],
     controlUrl: String(value.controlUrl ?? ''), memberToken: String(value.memberToken ?? ''),
     machineTokens: value.machineTokens && typeof value.machineTokens === 'object'
       ? value.machineTokens as Record<string, string> : {} });

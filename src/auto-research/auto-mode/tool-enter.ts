@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S4 P5: EnterAutoMode LLM tool ──
 //
 // Enters the autonomous research loop for a goal. Gates:
@@ -10,7 +11,7 @@
 // caller can inject it into the next LLM turn.
 
 import { existsSync, readFileSync } from 'node:fs';
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   discoverObsidianVault,
   type ObsidianVault,

@@ -29,11 +29,7 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/approvals',
   '/apps',
   '/board',
-  '/botlab',
-  '/bots',
-  '/ceo',
   '/chat',
-  '/decisions',
   '/consult',
   '/control',
   '/design-check',
@@ -147,7 +143,7 @@ const expectedGroups = [
   ['make', '만들기', true, ['/term', '/editor', '/design-check', '/apps', '/workspace']],
   ['files', '자료', false, ['/vault', '/field', '/market']],
   ['settings', '설정', false, ['/settings']],
-  ['ops', '운영🔒', false, ['/ceo', '/loops', '/loops?view=interact', '/ops/release', '/ops/checklist', '/ops/seats', '/bots', '/observatory', '/worktrees', '/control']],
+  ['ops', '운영🔒', false, ['/loops', '/loops?view=interact', '/ops/release', '/ops/checklist', '/ops/seats', '/observatory', '/worktrees', '/control']],
 ] as const;
 
 describe('NAV1a menu', () => {
@@ -163,7 +159,7 @@ describe('NAV1a menu', () => {
       '/outputs': '산출물', '/scheduler': '예약', '/live': 'Live', '/trace': 'Trace',
       '/term': '터미널', '/editor': '그래프', '/design-check': '디자인', '/apps': '앱', '/workspace': '여러 탭',
       '/vault': 'Obsidian 노트', '/field': '현장 올리기', '/market': '마켓', '/settings': '설정',
-      '/ceo': '대표 조망판', '/loops': '루프 현황', '/loops?view=interact': '루프 상호작용', '/ops/release': '릴리스', '/ops/checklist': '판별 피처', '/bots': '봇',
+      '/loops': '루프 현황', '/loops?view=interact': '루프 상호작용', '/ops/release': '릴리스', '/ops/checklist': '판별 피처',
       '/observatory': '관측', '/worktrees': '작업 트리', '/control': '제어',
     });
     for (const item of SIDEBAR_NAV_ITEMS) {
@@ -212,7 +208,7 @@ describe('NAV1a menu', () => {
     const main = visibleNavGroups(SIDEBAR_NAV_ITEMS, { showLabs: false, showHidden: false }, 'general').main;
     expect(main).toHaveLength(7);
     expect(main[0]).toMatchObject({ group: 'today', href: '/today', label: '오늘', icon: Inbox });
-    expect(main.map((item) => item.href)).toEqual(['/today', '/chat', '/live', '/term', '/editor', '/market', '/settings']);
+    expect(main.map((item) => item.href)).toEqual(["/today", "/chat", "/live", "/term", "/editor", "/market", "/settings"]);
   });
 
   test('general beta opt-in preserves seven default entries and opens beta only; other roles and ops stay unchanged', () => {
@@ -220,7 +216,7 @@ describe('NAV1a menu', () => {
     const hrefs = (role: 'general' | 'contributor' | 'owner', showBeta?: boolean, operator = false) =>
       visibleNavGroups(SIDEBAR_NAV_ITEMS, prefs, role, operator, { showBeta }).main.map((item) => item.href);
     const off = hrefs('general');
-    expect(off).toEqual(['/today', '/chat', '/live', '/term', '/editor', '/market', '/settings']);
+    expect(off).toEqual(["/today", "/chat", "/live", "/term", "/editor", "/market", "/settings"]);
     expect(hrefs('general', false)).toEqual(off);
     const on = hrefs('general', true);
     for (const path of ['/exec', '/field', '/trace', '/vault', '/intake']) expect(on).toContain(path);
@@ -276,7 +272,7 @@ describe('NAV1a menu', () => {
     expect(categoryByHref.get('/404')).toBe('error-page');
     expect(categoryByHref.get('/morning')).toBe('unwired-screen');
     expect(categoryByHref.get('/design-check')).toBeUndefined();
-    expect(categoryByHref.get('/botlab')).toBe('diagnostic-readonly');
+    expect(categoryByHref.get('/botlab')).toBeUndefined();
     expect(categoryByHref.get('/inside')).toBe('beta-direct-link');
     expect(NON_MENU_SIDEBAR_ROUTES.find((route) => route.href === '/inside')?.reason.length).toBeGreaterThan(0);
     expect(SIDEBAR_NAV_ITEMS.some((item) => item.href === '/inside')).toBe(false);

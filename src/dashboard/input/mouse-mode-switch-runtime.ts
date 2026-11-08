@@ -1,4 +1,4 @@
-import type { DashboardMouseWiringDeps } from './mouse-wiring.js';
+import type { DashboardMouseWiringDeps } from './mouse-wiring-types.js';
 
 export type DashboardInputMode = 'general' | 'sync' | 'control';
 

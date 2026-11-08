@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { appendLedger, costTable, judge, lastLedgerLine, ledgerPath, nightlyAuditLedgerPath, pickRange, propose, td1Dispositions, writeCardDraft } from './lib.js';
 import { record } from './node.js';
 import { CardStore } from '../../src/task-cards/card-store.js';
-import { GATE_NIGHTLY_AUDITS } from '../release-loop/gate-node.js';
+import { GATE_NIGHTLY_AUDITS } from '../release-loop/gate-nightly-audits.js';
 import { parse as parseYaml } from 'yaml';
 import { runGraph } from '../../src/graph-runner/runner.js';
 

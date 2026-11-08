@@ -6,21 +6,22 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { OPEN_WEIGHT_TOOL_DISCIPLINE, getProviderForConfig, streamLLMWithTools } from '../src/llm';
 import { getUserConfig } from '../src/user-config';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 let bodies: any[];
-let prior: typeof fetch;
+let device: FakeFetchDevice;
 beforeEach(() => {
   bodies = [];
-  prior = globalThis.fetch;
-  globalThis.fetch = (async (_url: string, init: any) => {
-    bodies.push(JSON.parse(init.body));
+  device = createFakeFetchDevice([{
+    url: '/api/v1/chat/completions', method: 'POST', response: (request) => {
+    bodies.push(JSON.parse(request.body ?? 'null'));
     const sse = 'data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
     return new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(sse)); c.close(); } }), {
       status: 200, headers: { 'content-type': 'text/event-stream' },
     });
-  }) as unknown as typeof fetch;
+  } }]);
 });
-afterEach(() => { globalThis.fetch = prior; });
+afterEach(() => { device.restore(); });
 
 async function firstWireBody(model: string) {
   const base = getUserConfig();

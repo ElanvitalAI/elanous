@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Control tools: tool exposure and prompt hints ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { nativeToolCatalog } from '../../native-tool-catalog.js';
 import { appendPromptHint, clearPromptHints, listPromptHints, type HintScope } from '../../prompt/hint-store.js';
 import { publishElementEvent } from '../../element-registry/index.js';

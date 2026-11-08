@@ -3,10 +3,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { restoreSnapshot } from '../undo-turn/restore.js';
 import { captureSnapshot } from '../undo-turn/snapshot.js';
 import type { Snapshot } from '../undo-turn/types.js';
-import { runGitCommand, setGitCommandRunnerForTesting, type GitCommandOptions, type GitCommandRunner } from './runner.js';
+import { _callerFromStackForTesting, _setGitIoObserverForTesting, runGitCommand, setGitCommandRunnerForTesting, type GitCommandOptions, type GitCommandRunner } from './runner.js';
 import type { GitRunResult, GitRunner } from './retry.js';
 
 const PARENT_OID = 'a'.repeat(40);
@@ -88,6 +89,280 @@ function withRunner<T>(runner: GitCommandRunner, run: () => T): T {
 }
 
 describe('runGitCommand', () => {
+  test('resolves the caller frame independently of source or bundle filenames', () => {
+    const sourceStack = [
+      'Error',
+      '    at callsite (/repo/src/git-fs/runner.ts:42:12)',
+      '    at runGitCommand (/repo/src/git-fs/runner.ts:88:20)',
+      '    at sourceConsumer (/repo/src/undo-turn/snapshot.ts:17:4)',
+    ].join('\n');
+    const bundleStack = [
+      'Error',
+      '    at callsite (/tmp/bundle-123.js:42:12)',
+      '    at runGitCommand (/tmp/bundle-123.js:88:20)',
+      '    at bundledConsumer (/tmp/application.min.js:17:4)',
+    ].join('\n');
+    expect(_callerFromStackForTesting(sourceStack)).toContain('sourceConsumer');
+    expect(_callerFromStackForTesting(bundleStack)).toContain('bundledConsumer');
+  });
+
+  test('a stale hourly timer cannot flush the new hour after a synchronous boundary crossing', () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const timers: Array<{ callback: () => void; handle: ReturnType<typeof setTimeout> }> = [];
+    const cancelled: ReturnType<typeof setTimeout>[] = [];
+    let current = new Date('2026-11-05T10:59:59.000Z');
+    const timerApi = {
+      schedule(callback: () => void) {
+        const handle = { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+        timers.push({ callback, handle });
+        return handle;
+      },
+      cancel(handle: ReturnType<typeof setTimeout>) { cancelled.push(handle); },
+    };
+    _setGitIoObserverForTesting((event, data) => events.push({ event, data }), () => current, timerApi);
+    try {
+      const runner: GitRunner = () => ({ status: 0, stdout: '', stderr: '' });
+      runGitCommand('/repo', ['-C', '/repo', 'status', '--short'], {}, runner);
+      runGitCommand('/repo', ['rev-parse', 'HEAD'], {}, () => {
+        current = new Date('2026-11-05T11:00:00.000Z');
+        return runner([]);
+      });
+
+      expect(cancelled).toContain(timers[0].handle);
+      expect(timers).toHaveLength(2);
+      expect(events.map(({ event }) => event)).toEqual(['run', 'hourly-summary', 'hourly-summary', 'run', 'hourly-summary']);
+      expect(events[0].data).toMatchObject({ subcommand: 'status', hour: '2026-11-05T10' });
+      expect(events[0].data.caller).toContain('runner.test.ts');
+      expect(events[0].data.durationMs).toBeNumber();
+      expect(events[0].data.host).toBeString();
+      expect(events[1].data).toMatchObject({ hour: '2026-11-05T10', totalCalls: 1, complete: false });
+      expect(events[2].data).toMatchObject({ hour: '2026-11-05T10', totalCalls: 1, complete: true });
+      expect(events[3].data).toMatchObject({ subcommand: 'rev-parse', hour: '2026-11-05T11' });
+      expect(events[4].data).toMatchObject({ hour: '2026-11-05T11', totalCalls: 1, complete: false });
+      expect(Object.values(events[2].data.groups as Record<string, { calls: number }>)[0].calls).toBe(1);
+
+      timers[0].callback();
+      expect(events).toHaveLength(5);
+      current = new Date('2026-11-05T12:00:00.000Z');
+      timers[1].callback();
+      expect(events[5].data).toMatchObject({ hour: '2026-11-05T11', totalCalls: 1, complete: true });
+    } finally {
+      _setGitIoObserverForTesting(undefined);
+    }
+  });
+
+  test('schedules the active hour close even when the wall clock advances during recording', () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const times = [
+      new Date('2026-11-05T10:59:59.999Z'),
+      new Date('2026-11-05T11:00:00.001Z'),
+      new Date('2026-11-05T11:00:00.002Z'),
+    ];
+    let scheduledDelay = 0;
+    let timerCallback: (() => void) | undefined;
+    const timerApi = {
+      schedule(callback: () => void, delayMs: number) {
+        timerCallback = callback;
+        scheduledDelay = delayMs;
+        return { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+      },
+      cancel() {},
+    };
+    _setGitIoObserverForTesting(
+      (event, data) => events.push({ event, data }),
+      () => times.shift() ?? new Date('2026-11-05T11:00:00.003Z'),
+      timerApi,
+    );
+    try {
+      runGitCommand('/repo', ['status'], {}, () => ({ status: 0, stdout: '', stderr: '' }));
+      expect(scheduledDelay).toBe(1);
+      timerCallback?.();
+      expect(events.at(-1)?.data).toMatchObject({ hour: '2026-11-05T10', complete: true });
+    } finally {
+      _setGitIoObserverForTesting(undefined);
+    }
+  });
+
+  test('rechecks UTC time and reschedules the timer if the wall clock moved backward', () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const callbacks: Array<() => void> = [];
+    let current = new Date('2026-11-05T10:30:00.000Z');
+    const timerApi = {
+      schedule(callback: () => void) {
+        callbacks.push(callback);
+        return { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+      },
+      cancel() {},
+    };
+    _setGitIoObserverForTesting((event, data) => events.push({ event, data }), () => current, timerApi);
+    try {
+      runGitCommand('/repo', ['status'], {}, () => ({ status: 0, stdout: '', stderr: '' }));
+      current = new Date('2026-11-05T10:40:00.000Z');
+      callbacks[0]();
+      expect(callbacks).toHaveLength(2);
+      expect(events.filter(({ event }) => event === 'hourly-summary')).toHaveLength(1);
+
+      current = new Date('2026-11-05T11:00:00.000Z');
+      callbacks[1]();
+      expect(events.at(-1)?.data).toMatchObject({ hour: '2026-11-05T10', complete: true });
+    } finally {
+      _setGitIoObserverForTesting(undefined);
+    }
+  });
+
+  test('a clock regression resumes the original hour bucket and preserves both hours', () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    let current = new Date('2026-11-05T10:59:59.000Z');
+    _setGitIoObserverForTesting((event, data) => events.push({ event, data }), () => current, {
+      schedule: () => ({ unref() {} } as unknown as ReturnType<typeof setTimeout>),
+      cancel() {},
+    });
+    try {
+      const runner: GitRunner = () => ({ status: 0, stdout: '', stderr: '' });
+      runGitCommand('/repo', ['status'], {}, runner);
+      current = new Date('2026-11-05T11:00:00.000Z');
+      runGitCommand('/repo', ['status'], {}, runner);
+      current = new Date('2026-11-05T10:59:58.000Z');
+      runGitCommand('/repo', ['status'], {}, runner);
+
+      const lastRun = events.filter(({ event }) => event === 'run').at(-1)?.data;
+      const summaries = events.filter(({ event }) => event === 'hourly-summary').map(({ data }) => data);
+      const revisitedHour = summaries.filter(({ hour }) => hour === '2026-11-05T10').at(-1);
+      const laterHour = summaries.filter(({ hour }) => hour === '2026-11-05T11').at(-1);
+      expect(lastRun).toMatchObject({ hour: '2026-11-05T10', observedHour: '2026-11-05T10', clockSkew: true });
+      expect(revisitedHour).toMatchObject({ hour: '2026-11-05T10', totalCalls: 2, clockSkew: true, revision: 3 });
+      expect(laterHour).toMatchObject({ hour: '2026-11-05T11', totalCalls: 1, revision: 2 });
+    } finally {
+      _setGitIoObserverForTesting(undefined);
+    }
+  });
+
+  test('restores an older bucket after it leaves the bounded in-memory history', () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    let current = new Date('2026-11-05T00:30:00.000Z');
+    _setGitIoObserverForTesting((event, data) => events.push({ event, data }), () => current, {
+      schedule: () => ({ unref() {} } as unknown as ReturnType<typeof setTimeout>),
+      cancel() {},
+    });
+    try {
+      const runner: GitRunner = () => ({ status: 0, stdout: '', stderr: '' });
+      runGitCommand('/repo', ['status'], {}, runner);
+      for (let hour = 1; hour <= 25; hour += 1) {
+        current = new Date(`2026-11-${hour < 24 ? '05' : '06'}T${String(hour % 24).padStart(2, '0')}:30:00.000Z`);
+        runGitCommand('/repo', ['status'], {}, runner);
+      }
+      current = new Date('2026-11-05T00:45:00.000Z');
+      runGitCommand('/repo', ['status'], {}, runner);
+      expect(events.filter(({ event }) => event === 'run').at(-1)?.data).toMatchObject({ historyTruncated: false });
+      expect(events.filter(({ event }) => event === 'hourly-summary').at(-1)?.data).toMatchObject({
+        hour: '2026-11-05T00', totalCalls: 2, revision: 3, historyTruncated: false,
+      });
+    } finally {
+      _setGitIoObserverForTesting(undefined);
+    }
+  });
+
+  test('the bundled runner reports its external caller through the real Git entry point', async () => {
+    const outDir = mkdtempSync(join(tmpdir(), 'elanous-git-runner-bundle-'));
+    try {
+      const build = await Bun.build({
+        entrypoints: [join(import.meta.dir, 'runner.ts')],
+        outdir: outDir,
+        target: 'bun',
+        format: 'esm',
+      });
+      expect(build.success).toBe(true);
+      const artifact = build.outputs.find(output => output.path.endsWith('.js'));
+      expect(artifact).toBeDefined();
+      const driver = join(outDir, 'bundle-caller-driver.ts');
+      writeFileSync(driver, `
+import { _setGitIoObserverForTesting, runGitCommand } from ${JSON.stringify(pathToFileURL(artifact!.path).href)};
+const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+_setGitIoObserverForTesting((event, data) => events.push({ event, data }));
+const result = runGitCommand('/repo', ['status'], {}, () => ({ status: 0, stdout: '', stderr: '' }));
+if (result.status !== 0) throw new Error('bundled Git command did not succeed');
+if (!String(events[0]?.data.caller).includes('bundle-caller-driver.ts')) throw new Error('caller frame did not survive bundle: ' + String(events[0]?.data.caller));
+if (String(events[0]?.data.caller).includes('runGitCommand')) throw new Error('runner frame was reported as the caller');
+`);
+      const child = spawnSync('bun', ['run', driver], { cwd: outDir, encoding: 'utf8', timeout: 30_000 });
+      expect(child.error).toBeUndefined();
+      expect(child.status, `${child.stdout}\n${child.stderr}`).toBe(0);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('records every retry attempt and includes short-lived hourly snapshots', () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    _setGitIoObserverForTesting((event, data) => events.push({ event, data }));
+    try {
+      let calls = 0;
+      const result = runGitCommand(process.cwd(), ['--config-env', 'user.name=GIT_NAME', 'status'], {}, () => {
+        calls += 1;
+        return calls === 1
+          ? { status: 1, stdout: '', stderr: 'index.lock exists' }
+          : { status: 0, stdout: '', stderr: '' };
+      });
+      expect(result.status).toBe(0);
+      expect(events.filter(({ event }) => event === 'run')).toHaveLength(2);
+      const summaries = events.filter(({ event }) => event === 'hourly-summary');
+      expect(summaries.at(-1)?.data).toMatchObject({ totalCalls: 2, complete: false });
+      expect(events[0].data.subcommand).toBe('status');
+      expect(Object.values(summaries[0].data.groups as Record<string, { calls: number }>)[0].calls).toBe(1);
+      expect(Object.values(summaries[1].data.groups as Record<string, { calls: number }>)[0].calls).toBe(2);
+      expect(summaries[0].data.revision).toBe(1);
+      expect(summaries[1].data.revision).toBe(2);
+      expect(summaries[1].data.processId).toBeNumber();
+      expect(summaries[1].data.processInstanceId).toMatch(/^[0-9a-f-]{36}$/);
+    } finally {
+      _setGitIoObserverForTesting(undefined);
+    }
+  });
+
+  test('logging failures do not replace a Git result or the original runner exception', () => {
+    _setGitIoObserverForTesting(() => { throw new Error('logger failed'); });
+    try {
+      expect(runGitCommand('/repo', ['status'], {}, () => ({ status: 0, stdout: 'ok', stderr: '' }))).toMatchObject({ status: 0, stdout: 'ok' });
+      const gitError = new Error('git runner failed');
+      expect(() => runGitCommand('/repo', ['status'], {}, () => { throw gitError; })).toThrow(gitError);
+    } finally {
+      _setGitIoObserverForTesting(undefined);
+    }
+  });
+
+  test('timer scheduling failures do not replace a Git result or the original runner exception', () => {
+    const timerApi = {
+      schedule() { throw new Error('timer unavailable'); },
+      cancel() {},
+    };
+    _setGitIoObserverForTesting(() => {}, undefined, timerApi);
+    try {
+      expect(runGitCommand('/repo', ['status'], {}, () => ({ status: 0, stdout: 'ok', stderr: '' }))).toMatchObject({ status: 0, stdout: 'ok' });
+      const gitError = new Error('git runner failed');
+      expect(() => runGitCommand('/repo', ['status'], {}, () => { throw gitError; })).toThrow(gitError);
+    } finally {
+      _setGitIoObserverForTesting(undefined);
+    }
+  });
+
+  test('caller and clock measurement failures cannot stop Git or replace its error', () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    _setGitIoObserverForTesting(
+      (event, data) => events.push({ event, data }),
+      undefined,
+      undefined,
+      { caller: () => { throw new Error('stack unavailable'); }, monotonicNow: () => { throw new Error('clock unavailable'); } },
+    );
+    try {
+      expect(runGitCommand('/repo', ['status'], {}, () => ({ status: 0, stdout: 'ok', stderr: '' }))).toMatchObject({ status: 0, stdout: 'ok' });
+      expect(events[0].data).toMatchObject({ caller: 'unknown', durationMs: 0 });
+      const gitError = new Error('git runner failed');
+      expect(() => runGitCommand('/repo', ['status'], {}, () => { throw gitError; })).toThrow(gitError);
+    } finally {
+      _setGitIoObserverForTesting(undefined);
+    }
+  });
+
   test('preserves a real Git failure status and stderr instead of turning it into empty output', () => {
     const result = runGitCommand(process.cwd(), ['definitely-not-a-git-subcommand']);
     expect(result.status).not.toBe(0);

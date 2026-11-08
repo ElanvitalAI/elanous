@@ -1,7 +1,8 @@
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { debug } from '../../src/debug/log.js';
 import { advanceGateBisectCursor, firstParentCommitsBetween, foundGateBisectCommit, nextGateBisectCommit, planGateBisect, runGateBisect, runGateBisectLinear } from './gate-bisect.js';
 import { evaluateGateBisectRun, runGateBisectSidecar } from './gate-bisect-sidecar.js';
 import { GATE_NODE_SIM_SCENARIOS, judgeInjectedGateEvent } from './gate-node-sim.js';
@@ -56,7 +57,9 @@ test('GATE-FAIL-BISECT-SIDECAR: actual sidecar evaluator transitions after three
   if (!evidence?.introducedFiles) throw new Error('release graph YAML is missing bisect regression evidence');
   const gateScenario = GATE_NODE_SIM_SCENARIOS.find((scenario) => scenario.id === 'reroute-planner-gate-regression')!;
   let launchedPlan: GateBisectPlan | undefined;
-  let sidecarRecord: { status: string; findings: Array<{ file: string; firstFailingCommit: string }>; unmeasured: unknown[] } | undefined;
+  let sidecarRecord: { status: string; ownerMailStatus: string; findings: Array<{ file: string; firstFailingCommit: string; ownerMail?: { status: string; ownerSeat: string | null } }>; ownerMail: Array<{ status: string; ownerSeat: string | null; landQueueEvidence: string }>; unmeasured: unknown[] } | undefined;
+  const sentOwnerMail: Array<{ seat: string; body: string }> = [];
+  const pendingBeforeOwnerMail: string[] = [];
   let modeState: { mode: string; agreements: number } | undefined;
   let gateVerdictBeforeSidecar: string | undefined;
   const gateVerdict = await judgeInjectedGateEvent(gateScenario, { introducedFiles: evidence.introducedFiles, onLaunch: async (rawInput, gateOutcome) => {
@@ -64,9 +67,19 @@ test('GATE-FAIL-BISECT-SIDECAR: actual sidecar evaluator transitions after three
     const input = rawInput as { plan: GateBisectPlan; repo: string; ledger: string; path: string; runId: string;
       alternatePool: string; pod: { pool: string } };
     launchedPlan = input.plan;
+    const modePath = join(input.ledger, 'release', input.plan.version, 'gate-bisect-mode.json');
+    mkdirSync(dirname(modePath), { recursive: true });
+    writeFileSync(modePath, JSON.stringify({ schema: 1, state: { mode: 'shadow', agreements: 0 } }));
     for (let index = 0; index < 3; index++) {
       await runGateBisectSidecar({ ...input, runId: `sim-run-${index}` }, async (_file, commit) =>
-        commit === input.plan.baseCommit || commit === 'c'.repeat(40) ? 'pass' : 'fail');
+        commit === input.plan.baseCommit || commit === 'c'.repeat(40) ? 'pass' : 'fail', {
+        resolveOwner: (finding) => ({ pullRequest: finding.file.includes('bisect') ? 401 : 402,
+          owner: 'fake-github-owner', ownerSeat: finding.file.includes('bisect') ? 'TC' : 'OPT' }),
+        ownerMail: { post: async (seat, body) => {
+          pendingBeforeOwnerMail.push((JSON.parse(readFileSync(input.path, 'utf8')) as { ownerMailStatus: string }).ownerMailStatus);
+          sentOwnerMail.push({ seat, body }); return { id: `sim-${sentOwnerMail.length}` };
+        } },
+      });
     }
     sidecarRecord = JSON.parse(readFileSync(input.path, 'utf8')) as typeof sidecarRecord;
     modeState = (JSON.parse(readFileSync(join(input.ledger, 'release', input.plan.version, 'gate-bisect-mode.json'), 'utf8')) as {
@@ -77,7 +90,17 @@ test('GATE-FAIL-BISECT-SIDECAR: actual sidecar evaluator transitions after three
   expect(launchedPlan?.files).toEqual([...evidence.introducedFiles].sort());
   expect(launchedPlan?.host).toBe('mshq');
   if (!launchedPlan) throw new Error('judgeGate did not launch the connected bisect sidecar');
-  expect(sidecarRecord).toMatchObject({ status: 'complete', unmeasured: [] });
+  expect(sidecarRecord).toMatchObject({ status: 'complete', ownerMailStatus: 'delivered', unmeasured: [] });
+  expect(sidecarRecord?.ownerMail).toEqual(expect.arrayContaining([
+    expect.objectContaining({ status: 'delivered', ownerSeat: 'TC', landQueueEvidence: expect.stringContaining('PR #401') }),
+    expect.objectContaining({ status: 'delivered', ownerSeat: 'OPT', landQueueEvidence: expect.stringContaining('PR #402') }),
+  ]));
+  expect(sidecarRecord?.findings.every((item) => item.ownerMail?.status === 'delivered')).toBe(true);
+  expect(sentOwnerMail).toHaveLength(2); // notices are sent only on the third run after operational transition
+  expect(sentOwnerMail.some((item) => item.body.includes('land-queue 근거: gate-failure PR #401'))).toBe(true);
+  expect(sentOwnerMail.some((item) => item.body.includes('bun test ./scripts/release-loop/gate-node.test.ts')
+    && item.body.includes("worktree remove \"$tree\"' EXIT"))).toBe(true);
+  expect(pendingBeforeOwnerMail).toEqual(['pending', 'pending']);
   expect(sidecarRecord?.findings.map(({ file, firstFailingCommit }) => ({ file, firstFailingCommit }))).toEqual([
     { file: 'scripts/release-loop/gate-bisect.test.ts', firstFailingCommit: launchedPlan.cutCommit },
     { file: 'scripts/release-loop/gate-node.test.ts', firstFailingCommit: launchedPlan.cutCommit },
@@ -87,6 +110,39 @@ test('GATE-FAIL-BISECT-SIDECAR: actual sidecar evaluator transitions after three
   expect(gateVerdict.outcome).toBe('regression');
   console.log(JSON.stringify({ gateVerdictBefore: gateVerdictBeforeSidecar, gateVerdictAfter: gateVerdict.outcome,
     sidecarStatus: sidecarRecord?.status, findings: sidecarRecord?.findings, mode: modeState }));
+});
+
+test('GATE-FAIL-BISECT-SIDECAR simulation: missing or corrupt mode state runs operational; corruption is logged', async () => {
+  const gateScenario = GATE_NODE_SIM_SCENARIOS.find((scenario) => scenario.id === 'reroute-planner-gate-regression')!;
+  for (const modeFile of ['missing', 'corrupt'] as const) {
+    let modeState: { mode: string; agreements: number } | undefined;
+    let findings: unknown[] | undefined;
+    let unreadableEventSeen = false;
+    const gateVerdict = await judgeInjectedGateEvent(gateScenario, { introducedFiles: ['scripts/release-loop/gate-bisect.test.ts'],
+      onLaunch: async (rawInput) => {
+        const input = rawInput as { plan: GateBisectPlan; repo: string; ledger: string; path: string; runId: string;
+          alternatePool: string; pod: { pool: string } };
+        const modePath = join(input.ledger, 'release', input.plan.version, 'gate-bisect-mode.json');
+        if (modeFile === 'corrupt') {
+          mkdirSync(dirname(modePath), { recursive: true });
+          writeFileSync(modePath, '{ malformed mode state');
+        }
+        await runGateBisectSidecar({ ...input, runId: `sim-${modeFile}` }, async (_file, commit) =>
+          commit === input.plan.baseCommit ? 'pass' : 'fail', {
+          resolveOwner: () => ({ pullRequest: null, owner: null, ownerSeat: null }),
+        });
+        modeState = (JSON.parse(readFileSync(modePath, 'utf8')) as { state: { mode: string; agreements: number } }).state;
+        findings = (JSON.parse(readFileSync(input.path, 'utf8')) as { findings: unknown[] }).findings;
+        unreadableEventSeen = debug.events(500).some((event) => event.category === 'release-loop.gate'
+          && event.event === 'bisect-mode-unmeasured'
+          && (event.data as { reason?: string; path?: string } | undefined)?.reason === 'mode-state-unreadable'
+          && (event.data as { path?: string } | undefined)?.path === modePath);
+      } });
+    expect(gateVerdict.outcome).toBe('regression');
+    expect(modeState).toEqual({ mode: 'operational', agreements: 0 });
+    expect(findings?.length).toBeGreaterThan(0);
+    if (modeFile === 'corrupt') expect(unreadableEventSeen).toBe(true);
+  }
 });
 
 test('GATE-FAIL-BISECT-SIDECAR: non-monotonic history stays shadow and uses the exact linear first failure', async () => {

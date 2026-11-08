@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readShardArtifacts } from './gate-node';
+import { readShardArtifacts } from './gate-shard-artifacts.js';
 import { cleanRetryVerdict, failedJunitFiles, junitFailedCaseIds, junitPassedCaseIds, junitTestcaseFiles } from './gate-shard-load-flaky';
 
 describe('same-Pod standalone retry evidence', () => {

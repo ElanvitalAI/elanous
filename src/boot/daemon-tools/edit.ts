@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Opportunistic followup §6.2 (tool.diff slot · 2026-05-13) — daemon-
 // side Edit tool with `tool.diff` envelope emit. M4 PR 1 #2486 shipped
 // `<DiffBlock>` with mock-test coverage; this is its first production
@@ -20,7 +21,7 @@
 
 import { promises as fsp } from 'fs';
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   applyEditsInMemory,
   computePatch,

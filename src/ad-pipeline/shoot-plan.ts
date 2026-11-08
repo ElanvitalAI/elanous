@@ -17,7 +17,7 @@ export type ReferenceDeliveryReadiness =
 export interface ShootCommand {
   readonly beatIndex: number;
   readonly jobType: string;
-  readonly durationSeconds: number;
+  readonly durationSeconds?: number;
   readonly trimToSeconds?: number;
   readonly args: readonly string[];
   readonly referenceReadiness?: ReferenceReadiness;

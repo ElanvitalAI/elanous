@@ -63,6 +63,13 @@ describe('resume --waive gate: only an unmeasured gate', () => {
       { from: 'gate', waive: 'gate', reason: REASON })?.unmeasured).toBe('sweep incomplete: sweep incomplete: no tests ran');
   });
 
+  test('failure-attribution incomplete accepts the simulation evidence spelling', () => {
+    const waived = releaseResumeWaiver(gateThenFailed({ exit: 2,
+      output: gateOutput({ outcome: 'error', introduced: [], error: 'failure-attribution-incomplete' }) }),
+    { from: 'gate', waive: 'gate', reason: REASON });
+    expect(waived?.unmeasured).toBe('sweep incomplete: failure-attribution-incomplete');
+  });
+
   test('a recorded release gate-triage shadow preserves unmeasured waiver and measured-gate refusal', () => {
     const unmeasured = gateThenTriaged({ exit: null, output: '[gate] sweeping shard 4/12\n', error: 'SIGTERM' });
     expect(releaseResumeWaiver(unmeasured, { from: 'gate', waive: 'gate', reason: REASON })?.unmeasured)
@@ -91,6 +98,7 @@ describe('resume --waive gate: only an unmeasured gate', () => {
       { outcome: 'error', error: 'baseline persistence: EACCES' },
       { outcome: 'error', error: 'cleanup: rm failed' },
       { outcome: 'error', error: 'pod sweep incomplete: stalled shards 1', introduced: ['src/a.test.ts > breaks'] },
+      { outcome: 'error', error: 'failure-attribution-incomplete', introduced: ['src/a.test.ts > breaks'] },
       { outcome: 'error', error: 'pod sweep incomplete: stalled shards 1', introduced: 'none' },
     ]) {
       expect(() => releaseResumeWaiver(gateThenFailed({ exit: 2, output: gateOutput(result) }), { from: 'gate', waive: 'gate', reason: REASON }))

@@ -1,8 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
 import { messagesToResponsesInput, streamCodexResponsesEvents, type LLMMessage } from '../src/llm.js';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
-const originalFetch = globalThis.fetch;
-afterEach(() => { globalThis.fetch = originalFetch; });
+let device: FakeFetchDevice | undefined;
+afterEach(() => { device?.restore(); device = undefined; });
 
 test('Codex SSE preserves message phase and explicit end_turn', async () => {
   const events = [
@@ -12,9 +13,12 @@ test('Codex SSE preserves message phase and explicit end_turn', async () => {
     { type: 'response.output_item.done', item: { id: 'rs1', type: 'reasoning', summary: [], encrypted_content: 'opaque-token' } },
     { type: 'response.completed', response: { id: 'resp1', end_turn: false } },
   ];
-  globalThis.fetch = (async () => new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n', {
-    headers: { 'content-type': 'text/event-stream' },
-  })) as unknown as typeof fetch;
+  device = createFakeFetchDevice([{
+    url: '/backend-api/codex/responses', method: 'POST',
+    response: new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    }),
+  }]);
   const received = [];
   for await (const event of streamCodexResponsesEvents('https://chatgpt.com/backend-api/codex/responses', 'token', {
     model: 'gpt-6-sol', instructions: 'sys', input: [],

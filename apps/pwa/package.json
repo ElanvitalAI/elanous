@@ -5,7 +5,9 @@
   "description": "monad-agent PWA shell — voice + chat from any browser. Phase 7 frontend (2026-04-30).",
   "scripts": {
     "dev": "next dev -p 3210",
-    "build": "next build",
+    "build": "bun scripts/static-generation.ts build",
+    "export-check": "bun scripts/static-entry.ts check",
+    "pack-static": "bun scripts/static-entry.ts pack",
     "start": "next start -p 3210",
     "lint": "next lint",
     "typecheck": "tsc --noEmit -p tsconfig.json"

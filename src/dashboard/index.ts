@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Dashboard ──
 // Working-dir workspace only (Session 10). V1..V4 views share a common
 // browser/preview/scratch/log grid; plugins such as sync swap the active
@@ -782,7 +783,7 @@ import {
   rotateNextProvider, jumpToRotationEntry, rotationEntryLabel, applyRotationEntry,
   resolveAcpHopCapFromConfig, resolveTuiUnattended,
 } from '../user-config.js';
-import { streamLLM, anyProviderAvailable, getProviderForConfig, nextReasoningLevel, reasoningLevelLabel, effectiveReasoningLevel, modelSupportsReasoning, type LLMMessage, type LLMToolSpec } from '../llm.js';
+import { streamLLM, anyProviderAvailable, getProviderForConfig, nextReasoningLevel, reasoningLevelLabel, effectiveReasoningLevel, modelSupportsReasoning, type LLMMessage } from '../llm.js';
 import { currentRouteDecision, formatRouteDecisionSummary } from '../llm/route-decision.js';
 import { recordDashboardTurnExecution, resolveDashboardActiveModel } from './acp-active-model.js';
 import { getModelFamily, getModelTier } from '../models/prompts.js';
@@ -798,7 +799,7 @@ import { runNexusShow, type NexusShowResult } from '../cli/nexus-show.js';
 import {
   type GitSegmentState,
 } from '../status/bar.js';
-import { createDashboardMouseWiring } from './input/mouse-wiring.js';
+import { loadDashboardMouseWiring } from './input/mouse-wiring-loader.js';
 import { createMouseConversationPopupRuntime } from './input/mouse-conversation-popup-runtime.js';
 import { createMouseModalHitRuntime } from './input/mouse-modal-hit-runtime.js';
 import { createMouseModalSurfaceRuntime } from './input/mouse-modal-surface-runtime.js';
@@ -1000,10 +1001,7 @@ import { bootDashboardWidgetTools } from './widget-tools-boot.js';
 import { bootDashboardViewTools } from './view-tools-boot.js';
 import { bootDashboardYoloPolicy } from './yolo-policy-boot.js';
 import { registerDashboardLayoutDisplayRuntimes } from './layout-display-runtime-registration.js';
-import {
-  loadDashboardScenarioCatalog,
-  registerDashboardScenarioRuntimes,
-} from './scenario-runtime-boot.js';
+import { bootDashboardScenarioTools } from './scenario-tools-boot.js';
 import { wireDashboardSurfaceRegistry } from './surface-registry-wiring.js';
 import { bootDashboardWidgetHost } from './widget-host-boot.js';
 import { registerDashboardWidgetRuntimes } from './widget-runtime-registration.js';
@@ -1222,7 +1220,6 @@ import {
 import { DASHBOARD_CLARIFICATION_REQUEST, consumeStreamingTopModalEscape, createEscAbortGate, createEscAbortPendingGate, createHarnessEscHint, routeStreamingEscapeKey } from '../esc-abort-gate.js';
 import { enqueueSoftStop, readSoftStopRequestStatus } from '../harness/control-inbox.js';
 import { setSelfImplementSoftStopSpaceObserver } from '../self-implement/soft-stop-observer.js';
-import { createViEditor, type ViEditorHandle } from '../vi-editor.js';
 import { launchEditor, canLaunchEditor } from '../editor-launcher.js';
 import {
   refreshRemoteWorkingDir,
@@ -3029,57 +3026,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // 같은 ref 를 써야 «stop 0»(판정)가 성립한다.
   const dashboardLoopSchedulerRef: { current: LoopScheduler | null } = { current: null };
 
-  // T3-C2 — vi-editor mounted in the preview pane. Set by the
-  // browser pane's `e` key on a file; cleared on :q / :q!. When
-  // non-null it overrides the preview pane's normal render path.
-  let viEditor: ViEditorHandle | null = null;
-  const VI_EDITOR_MAX_BYTES = 1_000_000;
-
-  const openPreviewViEditor = (absPath: string): void => {
-    try {
-      const stat = statSync(absPath);
-      if (stat.size > VI_EDITOR_MAX_BYTES) {
-      pushDebugLine(C.error(`  File too large (${fmtBytes(stat.size)}) — 1 MB max for the vi editor.`));
-      return;
-      }
-      const text = readFileSync(absPath, 'utf-8');
-      viEditor = createViEditor({ filePath: absPath, initialText: text });
-      setWorkingFocus('preview', 'vi-editor-open');
-      pushDebugLine(C.muted(`  Opened ${basename(buildDashboardEditorOpenPayload(absPath))} in vi-editor. i=insert, Esc=normal, :w=save, :q=quit.`));
-    } catch (err) {
-      pushDebugLine(C.error(`  Open editor failed: ${err instanceof Error ? err.message : String(err)}`));
-    }
-  };
-
-  const closePreviewViEditor = (): void => {
-    viEditor = null;
-    setWorkingFocus('browser', 'vi-editor-close');
-    try { refreshWorkingDirPreview(); } catch { /* may not be defined yet */ }
-  };
-
-  const handleViEditorKey = (key: import('../tui.js').Key): boolean => {
-    if (!viEditor) return false;
-    viEditor.onKey(toDashboardKeyEvent(key));
-    const s = viEditor.getState();
-    if (s.savedRequested) {
-      try {
-        writeFileSync(s.filePath, viEditor.getText(), 'utf-8');
-        s.savedRequested = false;
-        s.dirty = false;
-        s.message = `"${s.filePath}" written`;
-        pushDebugLine(C.success(`  wrote ${basename(s.filePath)}`));
-      } catch (err) {
-        s.savedRequested = false;
-        s.message = `write failed: ${err instanceof Error ? err.message : String(err)}`;
-        pushDebugLine(C.error(`  ${s.message}`));
-      }
-    }
-    if (s.quitRequested) {
-      closePreviewViEditor();
-    }
-    return true;
-  };
-
   // T2-P7 — compact-level-aware log pusher. New sites prefer pushLog
   // over chatLines.push so tabletMini / tabletTwo viewports drop
   // low-severity noise automatically. getCompactLevel reads termSize
@@ -4717,32 +4663,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     });
   } catch { /* never break boot */ }
 
-  // Presentation P5c-a (widget-team) — load the `scenarios/*.yaml`
-  // catalog once at boot + register the 4 scenario LLM tools
-  // (ListScenarios / RunScenario / GetScenarioSchema /
-  // ValidateScenarioYaml). `onMount` spawns each top-level WidgetSpec
-  // into the widget-host — nested `children` are not spawned here
-  // (WidgetHost.spawn is flat; container-style children decoded by
-  // P3 but live composite mounting is deferred to a future bundle).
-  // `last-wins` duplicate policy matches the default in catalog.ts ·
-  // plugins may override a built-in scenario of the same id.
-  const scenarioCatalog = await loadDashboardScenarioCatalog(
-    join(process.cwd(), 'scenarios'),
-  );
-  try {
-    registerDashboardScenarioRuntimes({
-      scenarioCatalog,
-      spawnWidget: (spec) => widgetHost.spawn(spec),
-      disposeWidget: (id) => { widgetHost.dispose(id); },
-      getDashboardModals: () => dashboardModals,
-      setDashboardModals: (modals) => { dashboardModals = [...modals]; },
-      getPluginLayout: () => pluginHost.activeLayout(),
-      setPluginLayout: (layout) => {
-        const active = pluginHost.active();
-        if (active) active.layout = layout;
-      },
-    });
-  } catch { /* never break boot */ }
+  // Keep shared scenario tools available while classic TUI omits presentation mounts.
+  await bootDashboardScenarioTools({
+    scenarioDir: join(process.cwd(), 'scenarios'),
+  });
 
   // VW-term-infra Bundle B-2 — Phase 6 ArtifactStore foundation.
   // Unified artifact persistence (`~/.elanous/artifacts/<kind>/`) with
@@ -9389,25 +9313,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       }
       if (terminalActive) {
         // already populated above
-      } else if (viEditor) {
-        // T3-C2 — vi-editor owns the preview pane. Render the
-        // editor's current frame (body + status) into the widget.
-        const vts = termSize();
-        const previewRowsEst = Math.max(4, Math.floor(vts.rows * 0.55));
-        const previewColsEst = Math.max(20, Math.floor((vts.cols - 1) * 0.4));
-        const state = viEditor.getState();
-        const rows = viEditor.render({
-          cols: previewColsEst,
-          rows: previewRowsEst,
-          topLine: Math.max(1, state.row - Math.floor(previewRowsEst / 2)),
-          showStatus: true,
-        });
-        const ms = state.mode === 'insert' ? 'INS' : state.mode === 'command' ? 'CMD' : 'NOR';
-        previewWidgetRuntime.projectVi(preview, {
-          text: rows.join('\n'),
-          focused: workingDir.focus === 'preview',
-          title: `vi ${ms} \u00B7 ${basename(state.filePath)}${state.dirty ? ' [+]' : ''}`,
-        });
       } else {
         previewWidgetRuntime.projectPlain(preview, {
           text: dockedPreview.previewLines.join('\n'),
@@ -10631,6 +10536,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       widgetHost.describeHitFor(widgetInstanceId, localRow, localCol),
   });
 
+  const { createDashboardMouseWiring } = await loadDashboardMouseWiring();
   const mouseWiring = createDashboardMouseWiring({
     termSize: () => termSize(),
     hoverPopupsEnabled: () => false,
@@ -14207,14 +14113,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           openTransferPicker(files, activeBrowserWidgetId());
           break;
         }
-        // T3-C2 + T4-D2 — `e` on a regular file opens the
-        // file for editing. Two paths:
-        //   • Primary: shell out to $EDITOR (yazi-style) — the
-        //     user's real vim/nvim/helix/etc. gets the full
-        //     screen. Works unless $EDITOR is unset.
-        //   • Fallback: pane-embedded mini-vi editor (T3-C1).
-        //     Explicit opt-in via ELANOUS_USE_MINI_VI=1 or auto
-        //     when no $EDITOR is available.
+        // `e` on a regular file opens the user's configured external
+        // editor. The pane-embedded mini-vi fallback was removed.
         case 'e': case 'ㄷ': {
           const browser = activeBrowserState() as WorkingDirState;
           const e = focusedEntry(browser);
@@ -14251,8 +14151,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             });
             break;
           }
-          const useMini = process.env['ELANOUS_USE_MINI_VI'] === '1';
-          if (!useMini && canLaunchEditor()) {
+          if (canLaunchEditor()) {
             // Fire-and-forget — launchEditor suspends the TUI,
             // runs $EDITOR blocking, then resumes. During that
             // window the readKey loop is paused via initTui
@@ -14273,7 +14172,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               draw();
             });
           } else {
-            openPreviewViEditor(e.absPath);
+            chatLines.push(C.warning('  No external editor is available; file editing from the browser pane is disabled.'));
+            chatScrollOffset = -1;
           }
           break;
         }
@@ -14598,15 +14498,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
 
     paneKeyRouter.register('preview', (key) => {
       // ── Preview pane ──
-      // T3-C2 — when the vi editor is mounted, it owns every
-      // keystroke except Tab (pane nav) and the top-level
-      // chords already handled above. save/quit lifecycle is
-      // driven from handleViEditorKey.
-      if (viEditor && key.name !== 'tab') {
-        handleViEditorKey(key);
-        draw();
-        return 'consumed';
-      }
       const { rows: tr } = termSize();
       const listH = Math.max(1, Math.floor(tr * 0.6) - 2);
       const halfPage = Math.max(1, Math.floor(listH / 2));

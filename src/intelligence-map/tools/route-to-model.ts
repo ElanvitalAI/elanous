@@ -1,10 +1,11 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S5 P4: RouteToModel LLM tool ──
 //
 // Wraps recommendModel with the standard catalog/system/cost context
 // load + LLM spec. Recommendation only — actual call happens via
 // RunWithModel (deferred to pfc-intelligence-runners).
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   recommendModel,
   type ModelRecommendation,

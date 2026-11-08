@@ -30,6 +30,7 @@ import { quotaSignalDir } from '../../src/budget/codex-reset-credit-state';
 import { debug } from '../../src/debug/log';
 import type { CodexAccountResolution } from '../../src/oauth/codex-account';
 import { decideFallback } from '../../src/oauth/fallback-chain';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../../src/ux-sim/fake-fetch.js';
 
 const current: CodexAccountResolution = {
   name: 'default', storeKey: 'openai-codex', home: '/h/A', source: 'default',
@@ -568,7 +569,7 @@ describe('배선 — 스토어 셸이 그 판정을 «실제로» 거친다', ()
       state: process.env.ELANOUS_STATE_DIR, home: process.env.CODEX_HOME, xdg: process.env.XDG_CONFIG_HOME,
       account: process.env.ELANOUS_CODEX_ACCOUNT, accountHome: process.env.ELANOUS_CODEX_ACCOUNT_HOME,
     };
-    const originalFetch = globalThis.fetch;
+    let fakeFetch: FakeFetchDevice | undefined;
     const originalLog = console.log;
     const output: string[] = [];
     try {
@@ -578,6 +579,7 @@ describe('배선 — 스토어 셸이 그 판정을 «실제로» 거친다', ()
       process.env.ELANOUS_CODEX_ACCOUNT = 'team';
       delete process.env.ELANOUS_CODEX_ACCOUNT_HOME;
       const teamHome = join(root, 'team-home');
+      const resetCreditsUrl = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits';
       mkdirSync(process.env.CODEX_HOME, { recursive: true });
       mkdirSync(teamHome, { recursive: true });
       const { authStorePath, saveTokens } = await import('../../src/oauth/store');
@@ -587,10 +589,14 @@ describe('배선 — 스토어 셸이 그 판정을 «실제로» 거친다', ()
       writeFileSync(join(process.env.CODEX_HOME, 'auth.json'), JSON.stringify({ tokens: { access_token: 'default-access' } }));
       writeFileSync(join(teamHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'team-access', account_id: 'team-account' } }));
       let authorization = '';
-      globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
-        authorization = new Headers(init?.headers).get('Authorization') ?? '';
-        return new Response(JSON.stringify({ credits: [], available_count: 1, total_earned_count: 0 }), { status: 200 });
-      }) as typeof fetch;
+      fakeFetch = createFakeFetchDevice([{
+        url: resetCreditsUrl,
+        method: 'GET',
+        response: (request) => {
+          authorization = request.headers.authorization ?? '';
+          return Response.json({ credits: [], available_count: 1, total_earned_count: 0 });
+        },
+      }]);
       console.log = (...args: unknown[]) => { output.push(args.join(' ')); };
 
       const { program } = await import('../../src/index');
@@ -603,8 +609,9 @@ describe('배선 — 스토어 셸이 그 판정을 «실제로» 거친다', ()
       expect(readAvailabilityState(process.env.CODEX_HOME)).toBeUndefined();
       expect(inspectCodexRotation(process.env, { storePath: store }).currentHome).toBe(teamHome);
       expect(output.some((line) => line.includes('to=1'))).toBe(true);
+      expect(fakeFetch.calls().map(({ method, url }) => `${method} ${url}`)).toEqual([`GET ${resetCreditsUrl}`]);
     } finally {
-      globalThis.fetch = originalFetch;
+      fakeFetch?.restore();
       console.log = originalLog;
       if (prior.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = prior.state;
       if (prior.home === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prior.home;

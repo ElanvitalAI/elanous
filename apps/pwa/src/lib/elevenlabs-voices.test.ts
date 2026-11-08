@@ -9,27 +9,26 @@ import {
   loadRecentVoiceIds,
   rememberRecentVoiceId,
 } from './elevenlabs-voices';
-
-const originalFetch = globalThis.fetch;
+import { createFakeFetchDevice, type FakeFetchDevice } from '../test-devices/fake-fetch';
 
 interface FetchCall { url: string; headers: Record<string, string>; }
 let calls: FetchCall[] = [];
+let fakeFetch: FakeFetchDevice | undefined;
 
 function installFetch(
   responder: (call: FetchCall) => { status?: number; body?: unknown } | Error,
 ): void {
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input);
-    const headers = (init?.headers ?? {}) as Record<string, string>;
-    const call = { url, headers };
-    calls.push(call);
-    const r = responder(call);
-    if (r instanceof Error) throw r;
-    return new Response(JSON.stringify(r.body ?? {}), {
-      status: r.status ?? 200,
-      headers: { 'content-type': 'application/json' },
-    });
-  }) as unknown as typeof fetch;
+  fakeFetch?.restore();
+  fakeFetch = createFakeFetchDevice([{
+    url: '/v1/elevenlabs/voices',
+    response: (request) => {
+      const call = { url: request.url, headers: { ...request.headers } };
+      calls.push(call);
+      const r = responder(call);
+      if (r instanceof Error) throw r;
+      return Response.json(r.body ?? {}, { status: r.status ?? 200 });
+    },
+  }]);
 }
 
 function installLocalStorage(): void {
@@ -55,7 +54,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  globalThis.fetch = originalFetch;
+  fakeFetch?.restore();
+  fakeFetch = undefined;
   delete (globalThis as unknown as { localStorage?: Storage }).localStorage;
 });
 

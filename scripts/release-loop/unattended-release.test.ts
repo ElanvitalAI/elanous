@@ -8,6 +8,8 @@ import { parseOptions } from './gate-node.js';
 import { enableLandingFreeze, disableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { opSeatFlockPath } from '../../src/steward/resync-tick.js';
+import { readLatestMorningRlaScorecard } from '../../src/domains/morning-detail.js';
+import { debug } from '../../src/debug/log.js';
 
 const instanceRoots: string[] = [];
 beforeEach(() => {
@@ -91,32 +93,96 @@ test('RELEASE-POLICY-PACK: production run input selects the measured Pod method 
     { executor: 'host', host: 'node-b' })).toThrow('gate executor host conflicts with release policy pod');
 }));
 
-test('dry run reports input but never invokes the checklist or graph; execution enforces both', async () => {
+test('dry run reports input but never invokes the checklist or graph; completed release refreshes morning RLA scorecard', async () => {
   const root = mkdtempSync(join(tmpdir(), 'unattended-release-'));
   try {
     record(root, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
     let graphCalls = 0;
     let checklistCalls = 0;
+    const runIds: string[] = [];
+    const sinkSurfaces: string[] = [];
     const pins: unknown[] = [];
     const deps = { ledgerRoot: root, config: { gatePodPool: 'pool' },
       checklist: () => { checklistCalls++; return { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
-      graph: async (_path: string, options: { input: unknown; pinChildUniverse?: boolean; deps?: { root?: string } }) => { graphCalls++; pins.push([options.pinChildUniverse, options.deps?.root]); return { input: options.input, status: 'done' } as never; } };
+      registerLogSink: async (surface: string) => { sinkSurfaces.push(surface); return false; },
+      graph: async (_path: string, options: { runId: string; input: { version: string }; pinChildUniverse?: boolean; deps?: { root?: string } }) => {
+        graphCalls++; pins.push([options.pinChildUniverse, options.deps?.root]);
+        runIds.push(options.runId);
+        const runDir = join(root, 'graph-runs', 'release-loop');
+        mkdirSync(runDir, { recursive: true });
+        writeFileSync(join(runDir, `${options.runId}.json`), JSON.stringify({ runId: options.runId, status: 'done', input: options.input }));
+        return { input: options.input, status: 'done' } as never;
+      } };
     const preview = await runUnattendedRelease({ version: '0.2.4', dryRun: true }, deps);
     expect(preview).toMatchObject({ dryRun: true, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool' } });
     expect([checklistCalls, graphCalls]).toEqual([0, 0]);
+    expect(sinkSurfaces).toEqual([]);
     const run = await runUnattendedRelease({ version: '0.2.4' }, deps);
     expect(run).toMatchObject({ dryRun: false, state: { status: 'done', input: preview.input } });
     expect([checklistCalls, graphCalls]).toEqual([1, 1]);
+    const morningScorecard = readLatestMorningRlaScorecard(join(root, 'release'));
+    expect(morningScorecard).toMatchObject({ releaseVersion: '0.2.4', runId: runIds[0], liveReleaseMeasurement: false });
+    expect(morningScorecard?.source.knowledgePackIncidentCount).toBe(33);
+    expect(morningScorecard?.scores).toHaveLength(10);
+    expect(sinkSurfaces).toEqual(['release-loop']);
     // RELEASE-LEDGER-UNIVERSE: every node subprocess is pinned to the run's universe, not re-resolved from its cwd tree.
     expect(pins).toEqual([[true, root]]);
     await expect(runUnattendedRelease({ version: '0.2.4' }, { ...deps, checklist: () => ({ ok: false, red: ['K13'], undecided: [], blocked: [], moved: [], knownIssues: [] }) })).rejects.toThrow('K13');
     expect(graphCalls).toBe(1);
+    expect(sinkSurfaces).toEqual(['release-loop']);
     for (const invalid of [{}, { gatePodPool: '  ' }]) {
       await expect(runUnattendedRelease({ version: '0.2.4' }, { ...deps, config: invalid })).rejects.toThrow('release.loop.gatePodPool');
     }
     expect(graphCalls).toBe(1);
     await expect(runUnattendedRelease({ version: '0.2.4', dryRun: true }, { ...deps, config: {} })).rejects.toThrow('release.loop.gatePodPool');
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RLA scorecard refresh failure is logged and does not change completed release verdict', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'unattended-release-scorecard-failure-'));
+  try {
+    record(root, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
+    const scorecardFailureRunIds: string[] = [];
+    const run = await runUnattendedRelease({ version: '0.2.4' }, {
+      ledgerRoot: root, config: { gatePodPool: 'pool' },
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+      registerLogSink: async () => false,
+      graph: async (_path, options) => {
+        scorecardFailureRunIds.push(options.runId);
+        const runDir = join(root, 'graph-runs', 'release-loop');
+        mkdirSync(runDir, { recursive: true });
+        writeFileSync(join(runDir, `${options.runId}.json`), JSON.stringify({ runId: options.runId, status: 'done', input: options.input }));
+        return { status: 'done', input: options.input } as never;
+      },
+      refreshScorecard: () => { throw new Error('simulated report failure'); },
+    });
+    expect(run.state?.status).toBe('done');
+    const failedEvent = debug.events(500).find(event => event.category === 'release.run' && event.event === 'rla-scorecard-refresh-failed'
+      && JSON.stringify(event).includes(scorecardFailureRunIds[0]!));
+    expect(JSON.stringify(failedEvent)).toContain(scorecardFailureRunIds[0]);
+    expect(JSON.stringify(failedEvent)).toContain('simulated report failure');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('RLA scorecard is not refreshed when the release graph has not completed', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'unattended-release-scorecard-incomplete-'));
+  let refreshCalls = 0;
+  try {
+    record(root, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
+    const run = await runUnattendedRelease({ version: '0.2.4' }, {
+      ledgerRoot: root, config: { gatePodPool: 'pool' },
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+      registerLogSink: async () => false,
+      graph: async () => ({ status: 'failed', nodes: [] } as never),
+      refreshScorecard: () => { refreshCalls++; },
+    });
+    expect(run.state?.status).toBe('failed');
+    expect(refreshCalls).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('RELEASE-BRANCH: the default run cuts a release branch; --cut-commit and --main-cut keep the main path; a freeze stays the emergency stop', async () => {

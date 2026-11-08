@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import * as gatePartial from './gate-partial';
 import { changedFilesBetween, mergePartialFailures, partialPlanPath, planPartialRegate, readPartialPlan, readPartialPlanResult, writePartialPlan, testFileOfId } from './gate-partial';
-import { bunfigPreload, gitClosureTree, testsReachingChanged, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure';
+import { buildClosureGraph, bunfigPreload, gitClosureTree, testsReachingChanged, testsReachingChangedCliLazyRequireShadow, testsReachingChangedForGateReuse, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure';
 
 const P = 'a'.repeat(40);
 const N = 'b'.repeat(40);
@@ -183,6 +183,80 @@ test('GATE-REUSE-BY-DIFF closure: a test reaching a changed file through helpers
   expect(testsReachingChanged(shared, ['src/base.test.ts'], TESTS(shared))).toMatchObject({ ok: true, tests: ['src/base.test.ts', 'src/uses.test.ts'] });
 });
 
+test('GATE-REUSE-BY-DIFF closure: type-only imports do not reach runtime code, value imports do', () => {
+  const tree = treeOf({
+    'src/contracts.ts': 'export interface Contract { value: string; }',
+    'src/runtime.ts': 'export const value = 1;',
+    'src/types-only.test.ts': "import type { Contract } from './contracts.js'; test('types', () => ({ value: 'ok' } satisfies Contract));",
+    'src/inline-type.test.ts': "import { type Contract } from './contracts.js'; test('inline type', () => ({ value: 'ok' } satisfies Contract));",
+    'src/value.test.ts': "import { value } from './runtime.js'; test('runtime', () => value);",
+  });
+  expect(testsReachingChanged(tree, ['src/contracts.ts'], TESTS(tree))).toMatchObject({ ok: true, tests: [], reached: 0, opaque: 0 });
+  expect(testsReachingChanged(tree, ['src/runtime.ts'], TESTS(tree))).toMatchObject({ ok: true, tests: ['src/value.test.ts'], reached: 1, opaque: 0 });
+});
+
+test('GATE-CLOSURE-LAZY-REQUIRE shadow simulation: only CLI-path tests retain function-local require reach', () => {
+  const tree = treeOf({
+    'bin/elanous.mjs': "import '../src/index.ts';",
+    'src/index.ts': "import { sim } from './sim-cli.ts';\ntype ErasedBeforeRuntime = { first: string; second: { nested: number } };\n// another erased offset\nexport const run: () => unknown = () => require('./sim-cli.ts');",
+    'src/sim-cli.ts': 'export const sim = true;',
+    'test/cli-spawn.test.ts': "import { spawnSync } from 'node:child_process'; spawnSync('bun', ['bin/elanous.mjs']);",
+    'test/module-import.test.ts': "import '../src/index.ts';",
+    'src/cli-spawn-helper.ts': "import { spawnSync } from 'node:child_process'; import { join } from 'node:path'; export const launch = () => spawnSync('bun', [join('bin', 'elanous.mjs')]);",
+    'test/cli-helper-spawn.test.ts': "import { launch } from '../src/cli-spawn-helper.ts'; launch();",
+    'src/cli-path-helper.ts': "export const cliPath = ['bin', 'elanous.mjs'].join('/');",
+    'src/process-launch-helper.ts': "import { spawnSync } from 'node:child_process'; export const launchPath = (path: string) => spawnSync('bun', [path]);",
+    'test/cli-split-helpers.test.ts': "import { cliPath } from '../src/cli-path-helper.ts'; import { launchPath } from '../src/process-launch-helper.ts'; launchPath(cliPath);",
+  });
+  const tests = TESTS(tree);
+  const shadow = testsReachingChangedCliLazyRequireShadow(tree, ['src/sim-cli.ts'], tests);
+  expect(shadow.current).toMatchObject({ ok: true, tests: ['test/cli-helper-spawn.test.ts', 'test/cli-spawn.test.ts', 'test/cli-split-helpers.test.ts', 'test/module-import.test.ts'], reached: 2, opaque: 2 });
+  expect(shadow.proposed).toMatchObject({ ok: true, tests: ['test/cli-helper-spawn.test.ts', 'test/cli-spawn.test.ts',
+    'test/cli-split-helpers.test.ts', 'test/module-import.test.ts'] });
+  expect(shadow.cliSpawnTests).toEqual(['test/cli-spawn.test.ts', 'test/cli-helper-spawn.test.ts', 'test/cli-split-helpers.test.ts']);
+  expect(testsReachingChangedForGateReuse(tree, ['src/sim-cli.ts'], tests)).toMatchObject({ ok: true,
+    tests: ['test/cli-helper-spawn.test.ts', 'test/cli-spawn.test.ts', 'test/cli-split-helpers.test.ts', 'test/module-import.test.ts'] });
+  const entrypoint = testsReachingChangedCliLazyRequireShadow(tree, ['bin/elanous.mjs'], tests);
+  expect(entrypoint.proposed).toMatchObject({ ok: true,
+    tests: ['test/cli-helper-spawn.test.ts', 'test/cli-spawn.test.ts', 'test/cli-split-helpers.test.ts'] });
+  // Original-source import scanning keeps the selector radius even when transpilation erases an unused TS value import.
+  if (!shadow.current.ok) throw new Error(shadow.current.reason);
+  expect(shadow.current.tests).toContain('test/module-import.test.ts');
+});
+
+test('GATE-CLOSURE-LAZY-REQUIRE shadow simulation: top-level require is never omitted', () => {
+  const tree = treeOf({
+    'src/index.ts': "require('./sim-cli.ts');",
+    'src/sim-cli.ts': 'export const sim = true;',
+    'test/module-import.test.ts': "import '../src/index.ts';",
+  });
+  const shadow = testsReachingChangedCliLazyRequireShadow(tree, ['src/sim-cli.ts'], TESTS(tree));
+  expect(shadow.proposed).toMatchObject({ ok: true, tests: ['test/module-import.test.ts'] });
+});
+
+test('GATE-CLOSURE-LAZY-REQUIRE shadow simulation: require-call-only dependency is omitted from proposed reach', () => {
+  const tree = treeOf({
+    'src/index.ts': "export const load = () => require('./lazy-only.ts');",
+    'src/lazy-only.ts': 'export const value = 1;',
+    'test/module-import.test.ts': "import '../src/index.ts';",
+  });
+  const shadow = testsReachingChangedCliLazyRequireShadow(tree, ['src/lazy-only.ts'], TESTS(tree));
+  expect(shadow.current).toMatchObject({ ok: true, tests: ['test/module-import.test.ts'] });
+  expect(shadow.proposed).toMatchObject({ ok: true, tests: [] });
+});
+
+test('GATE-CLOSURE-LAZY-REQUIRE shadow simulation: normalized resolve path to CLI stays in the conservative set', () => {
+  const tree = treeOf({
+    'bin/elanous.mjs': "import '../src/index.ts';",
+    'src/index.ts': "export const load = () => require('./lazy-only.ts');",
+    'src/lazy-only.ts': 'export const value = 1;',
+    'test/cli-resolve-path.test.ts': "import { spawnSync } from 'node:child_process'; import { resolve } from 'node:path'; spawnSync('bun', [resolve(root, 'bin/', 'elanous.mjs')]);",
+  });
+  const shadow = testsReachingChangedCliLazyRequireShadow(tree, ['src/lazy-only.ts'], TESTS(tree));
+  expect(shadow.cliSpawnTests).toEqual(['test/cli-resolve-path.test.ts']);
+  expect(shadow.proposed).toMatchObject({ ok: true, tests: ['test/cli-resolve-path.test.ts'] });
+});
+
 test('GATE-REUSE-BY-DIFF closure: literal repo paths are dependencies; a path in a comment is not', () => {
   const tree = treeOf({
     'src/c.ts': 'export const c = 1;',
@@ -191,6 +265,48 @@ test('GATE-REUSE-BY-DIFF closure: literal repo paths are dependencies; a path in
     'test/comment.test.ts': "// reads src/c.ts once\n/* and '../src/c' */ test('x', () => 1);",
   });
   expect(testsReachingChanged(tree, ['src/c.ts'], TESTS(tree))).toMatchObject({ ok: true, tests: ['test/mocks.test.ts', 'test/reads.test.ts'] });
+});
+
+test('GATE-REUSE-BY-DIFF closure: tests with runtime-selected file and command paths are opaque and rerun', () => {
+  const tree = treeOf({
+    'scripts/check.ts': 'export const check = true;',
+    'test/spawn-dynamic.test.ts': "import { spawnSync } from 'node:child_process'; const command = process.env.TEST_COMMAND; spawnSync(command, process.argv.slice(2));",
+    'test/read-dynamic.test.ts': "import { readFileSync } from 'node:fs'; readFileSync(process.env.TEST_FIXTURE, 'utf8');",
+    'test/read-bracket.test.ts': "import { readFileSync } from 'node:fs'; readFileSync(process.env['TEST_FIXTURE'], 'utf8');",
+    'test/read-helper.test.ts': "import { readFileSync } from 'node:fs'; readFileSync(resolveFixturePath(), 'utf8');",
+    'test/read-alias.test.ts': "import { readFileSync as load } from 'node:fs'; load(process.env.TEST_FIXTURE, 'utf8');",
+    'test/read-require-alias.test.ts': "const { readFileSync: load } = require('fs'); load(process.env.TEST_FIXTURE, 'utf8');",
+    'src/file-loader.ts': "import { readFileSync as load } from 'node:fs'; export const loadFixture = () => load(process.env.TEST_FIXTURE, 'utf8');",
+    'test/read-through-module.test.ts': "import { loadFixture } from '../src/file-loader'; loadFixture();",
+    'src/command-runner.ts': "import { spawnSync } from 'node:child_process'; export const run = (command: string) => spawnSync(command, []);",
+    'test/spawn-through-module.test.ts': "import { run } from '../src/command-runner'; run(process.env.TEST_COMMAND!);",
+    'test/unrelated.test.ts': 'test("plain", () => 1);',
+  });
+  expect(testsReachingChanged(tree, ['scripts/check.ts'], TESTS(tree))).toMatchObject({
+    ok: true, tests: ['test/read-alias.test.ts', 'test/read-bracket.test.ts', 'test/read-dynamic.test.ts', 'test/read-helper.test.ts',
+      'test/read-require-alias.test.ts', 'test/read-through-module.test.ts', 'test/spawn-dynamic.test.ts', 'test/spawn-through-module.test.ts'], opaque: 8,
+  });
+});
+
+
+test('GATE-REUSE-BY-DIFF closure: process launch names require a child_process binding', () => {
+  const tree = treeOf({
+    'src/session-store.ts': 'export class SessionStore { fork(id: string) { return id; } }',
+    'test/session-store.test.ts': "import { SessionStore } from '../src/session-store'; const store = new SessionStore(); store.fork('id');",
+    'test/child-process-fork.test.ts': "import { fork as childFork } from 'node:child_process'; childFork('command', []);",
+    'test/require-destructure-fork.test.ts': "const cp = require('node:child_process'); const { fork: launch } = cp; launch('command', []);",
+    'test/proxy-child-process-fork.test.ts': "const cp = new Proxy(require('node:child_process'), {}); cp.fork('command', []);",
+    'test/bun-shell-template.test.ts': 'Bun.$`echo hello`;',
+    'test/unresolved-fork.test.ts': 'function callUnknown(store: unknown) { store.fork(); }',
+  });
+  const graph = buildClosureGraph(tree);
+  expect(graph.opaque.get('src/session-store.ts')).toBeUndefined();
+  expect(graph.opaque.get('test/session-store.test.ts')).toBeUndefined();
+  expect(graph.opaque.get('test/child-process-fork.test.ts')).toBe('spawns a command with an opaque repo input');
+  expect(graph.opaque.get('test/require-destructure-fork.test.ts')).toBe('spawns a command with an opaque repo input');
+  expect(graph.opaque.get('test/proxy-child-process-fork.test.ts')).toBe('spawns a command with an opaque repo input');
+  expect(graph.opaque.get('test/bun-shell-template.test.ts')).toBe('spawns a command with an opaque repo input');
+  expect(graph.opaque.get('test/unresolved-fork.test.ts')).toBe('spawns a command with an opaque repo input');
 });
 
 test('GATE-REUSE-BY-DIFF closure: what we cannot name makes a test opaque (re-run), never reused', () => {
@@ -323,7 +439,7 @@ test('GATE-REUSE-BY-DIFF closure: the tip tree is read from git objects, not the
     expect(tree.aliases).toEqual([{ scope: 'app', prefix: '@/', target: 'app/src' }]);
     expect(testsReachingChanged(tree, ['app/src/k.ts'], TESTS(tree))).toMatchObject({ ok: true, tests: ['app/src/k.test.ts'] });
     expect(testsReachingChanged(tree, ['src/c.ts'], TESTS(tree))).toMatchObject({ ok: true, tests: ['src/a.test.ts'] });
-    expect(() => gitClosureTree(repo, 'c'.repeat(40))).toThrow('git ls-tree failed');
+    expect(() => gitClosureTree(repo, 'c'.repeat(40))).toThrow('CutSnapshot ls-tree failed');
   } finally { rmSync(repo, { recursive: true, force: true }); }
 });
 

@@ -125,7 +125,9 @@ test('multi-item tab opens its visible items; more groups files and settings, op
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href).indexOf('/ops/release')).toBeLessThan(4);
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/ops/release');
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/loops');
-  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/ceo');
+  const operatorHrefs = tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href);
+  expect(operatorHrefs).toContain('/ops/checklist');
+  expect(operatorHrefs).not.toContain('/ceo');
 });
 
 test('single visible item navigates directly without a sheet, and role/Labs hide forbidden items', () => {

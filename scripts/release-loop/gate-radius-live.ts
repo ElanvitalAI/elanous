@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { changedFilesBetween, planPartialRegate, testFileOfId, type PartialPlan } from './gate-partial.js';
 import { CODE_FILE, gitClosureTree, testsReachingChanged } from './gate-closure.js';
 import { versionOnlyBumps } from './gate-radius-shadow.js';
-import { gateAssignableTestsAtCommit, gateBaselineReceipt, gateEnvFingerprint, type GateBaselineReceipt, type GatePodRuntimeIdentity } from './gate-baseline-receipt.js';
+import { gateAssignableTestsAtCommit, gateBaselineReceipt, gateEnvFingerprint, type GateBaselineReceipt, type GateBaselineRecheck,
+  type GatePodRuntimeIdentity } from './gate-baseline-receipt.js';
 import { defaultRemoteRun, NODE_REGISTRY, parsePodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { podCommandImageFor } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { gateTestBaseline } from '../lib/gate-test-env.js';
@@ -14,6 +15,7 @@ import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 const SHA = /^[0-9a-f]{40}$/i;
 const DIGEST = /^sha256:[0-9a-f]{64}$/i;
 const TEST = /\.test\.(?:tsx?|jsx?|mts|cts)$/;
+export const HARD_REHEARSAL_POD_SHARDS = 12;
 
 export function hardRehearsalGateVersion(version: string, runId: string): string {
   const id = /^hard-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(runId)?.[1];
@@ -22,13 +24,130 @@ export function hardRehearsalGateVersion(version: string, runId: string): string
 }
 
 export function hardRehearsalGateArgs(version: string, runId: string, commit: string, previous: string, pool: string): string[] {
-  return ['scripts/release-loop/gate-node.ts', '--commit', commit, '--version', hardRehearsalGateVersion(version, runId),
-    '--baseline-version', previous, '--executor', 'pod', '--pod-pool', pool, '--pod-shards', '12', '--rehearsal-baseline', '--json'];
+  return ['scripts/release-loop/gate-node-cli.ts', '--commit', commit, '--version', hardRehearsalGateVersion(version, runId),
+    '--baseline-version', previous, '--executor', 'pod', '--pod-pool', pool, '--pod-shards', String(HARD_REHEARSAL_POD_SHARDS), '--rehearsal-baseline', '--json'];
 }
 
 export interface LiveRadiusDecision { plan: PartialPlan | null; reason: string; rehearsalRunId?: string }
 
 export interface GatePodExecutionIdentity extends GatePodRuntimeIdentity { imageDigest: string }
+
+export interface HardRehearsalRecheckResult {
+  file: string;
+  outcome: 'pass' | 'fail' | 'unmeasured';
+}
+
+export interface HardRehearsalRecheck {
+  runId: string;
+  commit: string;
+  graphSha: string;
+  recipeSha: string;
+  envFingerprint: string;
+  imageDigest: string;
+  executionIdentity: GatePodExecutionIdentity;
+  results: readonly HardRehearsalRecheckResult[];
+}
+
+/**
+ * Merge a focused same-commit run into a full hard-rehearsal receipt only when its observed
+ * runtime identity matches the full sweep and it proves every previously failing file passed.
+ */
+export function mergeHardRehearsalRecheck(input: { receipt: GateBaselineReceipt; priorFailures: readonly string[];
+  priorErrors: readonly string[]; recheck: HardRehearsalRecheck }): {
+  accepted: boolean; reason: string; receipt: GateBaselineReceipt; failures: string[]; errors: string[];
+} {
+  const priorFailures = Array.isArray(input?.priorFailures) ? [...input.priorFailures] as string[] : input?.priorFailures as unknown as string[];
+  const priorErrors = Array.isArray(input?.priorErrors) ? [...input.priorErrors] as string[] : input?.priorErrors as unknown as string[];
+  const unchanged = (reason: string) => ({ accepted: false, reason, receipt: input.receipt,
+    failures: Array.isArray(priorFailures) ? [...priorFailures] : priorFailures,
+    errors: Array.isArray(priorErrors) ? [...priorErrors] : priorErrors });
+  try {
+    const { receipt, recheck } = input;
+    const validFile = (file: unknown): file is string => typeof file === 'string'
+      && /^(?:[\w.-]+\/)*[\w.-]+\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file)
+      && !file.split('/').some((part) => part === '.' || part === '..');
+    const validRuntimeIdentity = (value: unknown): value is GatePodRuntimeIdentity => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+      const row = value as Partial<GatePodRuntimeIdentity>;
+      return typeof row.bunVersion === 'string' && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(row.bunVersion)
+        && typeof row.platform === 'string' && /^[a-z0-9_-]{1,32}$/.test(row.platform)
+        && typeof row.architecture === 'string' && /^[a-z0-9_-]{1,32}$/.test(row.architecture)
+        && typeof row.envFingerprint === 'string' && /^[0-9a-f]{64}$/i.test(row.envFingerprint)
+        && typeof row.baseImageDigest === 'string' && DIGEST.test(row.baseImageDigest);
+    };
+    const validExecutionIdentity = (value: unknown): value is GatePodExecutionIdentity => !!value
+      && typeof value === 'object' && !Array.isArray(value)
+      && typeof (value as Partial<GatePodExecutionIdentity>).imageDigest === 'string'
+      && DIGEST.test((value as Partial<GatePodExecutionIdentity>).imageDigest!) && validRuntimeIdentity(value);
+    const baselineDigest = (receipt.executionIdentity as GatePodRuntimeIdentity & { imageDigest?: string } | null)?.imageDigest;
+    if (!receipt.valid || receipt.schema !== 2 || !SHA.test(receipt.commit) || receipt.commit !== receipt.head40
+      || !/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(receipt.version)
+      || !receipt.graphSha || !/^[0-9a-f]{64}$/i.test(receipt.graphSha)
+      || !receipt.recipeSha || !/^[0-9a-f]{64}$/i.test(receipt.recipeSha)
+      || !/^[0-9a-f]{64}$/i.test(receipt.envFingerprint)
+      || !receipt.imageDigest || !DIGEST.test(receipt.imageDigest)
+      || !Number.isSafeInteger(receipt.files) || receipt.files < 1
+      || !Number.isSafeInteger(receipt.shards) || receipt.shards < 1)
+      return unchanged('full-sweep receipt identity is malformed');
+    if (!validRuntimeIdentity(receipt.executionIdentity)) return unchanged('full-sweep runtime identity is malformed');
+    if (receipt.executionIdentity.envFingerprint !== receipt.envFingerprint)
+      return unchanged('full-sweep runtime environment differs from receipt');
+    if (baselineDigest !== undefined && (!DIGEST.test(baselineDigest) || baselineDigest.toLowerCase() !== receipt.imageDigest.toLowerCase()))
+      return unchanged('full-sweep runtime image differs from receipt');
+    if (!Array.isArray(receipt.fileInventory) || receipt.fileInventory.length !== receipt.files
+      || !receipt.fileInventory.every(validFile) || new Set(receipt.fileInventory).size !== receipt.fileInventory.length)
+      return unchanged('full-sweep file inventory is malformed');
+    const inventory = new Set(receipt.fileInventory);
+    if (!recheck || typeof recheck !== 'object' || Array.isArray(recheck)
+      || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(recheck.runId) || !SHA.test(recheck.commit)
+      || recheck.commit !== receipt.commit || recheck.commit !== receipt.head40)
+      return unchanged('focused run commit or run identity differs');
+    if (!Array.isArray(input.priorFailures) || !input.priorFailures.every((id) => typeof id === 'string')
+      || !Array.isArray(input.priorErrors) || !input.priorErrors.every((id) => typeof id === 'string'))
+      return unchanged('prior failure inventory is malformed');
+    if (!/^[0-9a-f]{64}$/i.test(recheck.graphSha) || !/^[0-9a-f]{64}$/i.test(recheck.recipeSha)
+      || !/^[0-9a-f]{64}$/i.test(recheck.envFingerprint) || !DIGEST.test(recheck.imageDigest)
+      || recheck.graphSha !== receipt.graphSha || recheck.recipeSha !== receipt.recipeSha
+      || recheck.envFingerprint !== receipt.envFingerprint || recheck.imageDigest.toLowerCase() !== receipt.imageDigest.toLowerCase())
+      return unchanged('focused run graph, recipe, environment or image differs');
+    const runtime = recheck.executionIdentity;
+    const baseline = receipt.executionIdentity;
+    if (!validExecutionIdentity(runtime) || runtime.imageDigest.toLowerCase() !== receipt.imageDigest.toLowerCase()
+      || runtime.bunVersion !== baseline.bunVersion || runtime.platform !== baseline.platform
+      || runtime.architecture !== baseline.architecture || runtime.envFingerprint !== baseline.envFingerprint
+      || runtime.baseImageDigest !== baseline.baseImageDigest)
+      return unchanged('focused run runtime identity differs');
+    if (!Array.isArray(recheck.results) || recheck.results.some((result) => !result || typeof result !== 'object'
+      || !validFile(result.file) || !['pass', 'fail', 'unmeasured'].includes(result.outcome)))
+      return unchanged('focused run result inventory is malformed');
+    if (!Array.isArray(receipt.rechecks ?? []) || (receipt.rechecks ?? []).some((row) => !row || typeof row.runId !== 'string'))
+      return unchanged('prior focused-run evidence is malformed');
+    if ((receipt.rechecks ?? []).some((row) => row.runId === recheck.runId)) return unchanged('focused run already recorded');
+    if (!priorFailures.length && !priorErrors.length) return unchanged('no failed files to recheck');
+    const results = new Map<string, HardRehearsalRecheckResult['outcome']>();
+    for (const result of recheck.results) {
+      if (!inventory.has(result.file) || results.has(result.file)) return unchanged('focused run file inventory is invalid');
+      results.set(result.file, result.outcome);
+    }
+    if (!results.size || [...results.values()].some((outcome) => outcome !== 'pass'))
+      return unchanged('focused run did not pass every measured file');
+    const failedFiles: Set<string> = new Set([...priorFailures, ...priorErrors].map(testFileOfId));
+    if ([...failedFiles].some((file) => !inventory.has(file))) return unchanged('prior failure is outside the full-sweep inventory');
+    if ([...failedFiles].some((file) => results.get(file) !== 'pass'))
+      return unchanged('focused run did not pass every previously failing file');
+    const remaining = (ids: readonly string[]) => ids.filter((id) => !failedFiles.has(testFileOfId(id)));
+    const evidence: GateBaselineRecheck = {
+      runId: recheck.runId, commit: recheck.commit, graphSha: recheck.graphSha, recipeSha: recheck.recipeSha,
+      envFingerprint: recheck.envFingerprint, imageDigest: recheck.imageDigest.toLowerCase(),
+      executionIdentity: { bunVersion: runtime.bunVersion, platform: runtime.platform, architecture: runtime.architecture,
+        envFingerprint: runtime.envFingerprint, baseImageDigest: runtime.baseImageDigest },
+      files: [...results.keys()].sort(),
+    };
+    return { accepted: true, reason: 'same-identity focused pass merged into full-sweep receipt',
+      receipt: { ...receipt, rechecks: [...(receipt.rechecks ?? []), evidence] },
+      failures: remaining(priorFailures), errors: remaining(priorErrors) };
+  } catch { return unchanged('focused run input is malformed'); }
+}
 
 const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
 
@@ -70,6 +189,35 @@ function gateRegistryHostImage(member: ReturnType<typeof parsePodPool>[number], 
   return `localhost:${port}/${imageName}:${commit.slice(0, 12)}`;
 }
 
+/** Read the dependency-layer identity from the exact pinned image's OCI config label. */
+function probeGateBaseImageDigest(member: ReturnType<typeof parsePodPool>[number], imageRef: string): string | null {
+  const format = '{{index .Config.Labels "elanous.base-image-digest"}}';
+  const command = `docker image inspect ${shellQuote(imageRef)} --format '${format}'`;
+  const result = member.sshHost ? defaultRemoteRun(member.sshHost, command)
+    : spawnSync('docker', ['image', 'inspect', imageRef, '--format', format],
+      { encoding: 'utf8', timeout: 10_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+  const value = result.status === 0 ? result.stdout.trim() : '';
+  return DIGEST.test(value) ? value.toLowerCase() : null;
+}
+
+/** Every selected pool must prove the same valid label; missing metadata only disables reuse. */
+export function preflightGateBaseImageDigest(pool: string, commit: string, pinnedImageDigest: string): string | null {
+  try {
+    if (!SHA.test(commit) || !DIGEST.test(pinnedImageDigest)) return null;
+    const image = podCommandImageFor([], true);
+    const members = parsePodPool(pool);
+    if (!members.length) return null;
+    const rows = members.map((member) => {
+      const registry = member.registry ?? NODE_REGISTRY;
+      const port = /:(\d+)$/.exec(registry)?.[1];
+      if (!port) return null;
+      const imageName = image.startsWith('elanous-harness-lite:') ? 'elanous-harness-lite' : 'elanous-harness';
+      return probeGateBaseImageDigest(member, `localhost:${port}/${imageName}@${pinnedImageDigest}`);
+    });
+    return rows[0] && rows.every((row) => row === rows[0]) ? rows[0] : null;
+  } catch { return null; }
+}
+
 /** Read the immutable pushed image manifest on every candidate host. Local Docker Image IDs are diagnostic only. */
 export function preflightGateImageDigest(pool: string, commit?: string): string | null {
   try {
@@ -83,7 +231,7 @@ export function preflightGateImageDigest(pool: string, commit?: string): string 
 }
 
 /** Probe each candidate's exact gate image/runtime and deterministic environment without a Kubernetes Job. */
-export function preflightGateExecutionIdentity(pool: string, env: NodeJS.ProcessEnv, commit?: string): GatePodExecutionIdentity | null {
+export function preflightGateExecutionIdentity(pool: string, env: NodeJS.ProcessEnv, commit?: string, expectedImageDigest?: string): GatePodExecutionIdentity | null {
   try {
     if (!commit || !SHA.test(commit)) return null;
     const image = podCommandImageFor([], true);
@@ -94,10 +242,16 @@ export function preflightGateExecutionIdentity(pool: string, env: NodeJS.Process
     const script = "const {createHash}=require('node:crypto');const keys=['ELANOUS_TEST_FAKE_LLM','LANG','LC_ALL','TZ'];const e=Object.fromEntries(keys.sort().map(k=>[k,process.env[k]??'']));const envFingerprint=createHash('sha256').update(JSON.stringify(e)).digest('hex');console.log(JSON.stringify({bunVersion:Bun.version,platform:process.platform,architecture:process.arch,envFingerprint,baseImageDigest:process.env.ELANOUS_GATE_BASE_IMAGE_DIGEST??''}));";
     const rows = members.map((member): GatePodExecutionIdentity | null => {
       const imageDigest = probeGateRepoDigest(member, image, commit);
-      if (!imageDigest || !DIGEST.test(imageDigest)) return null;
-      const hostImage = gateRegistryHostImage(member, image, commit);
-      if (!hostImage) return null;
-      const args = ['run', '--rm', '--pull=never', '--network=none', ...Object.entries(baseline).flatMap(([key, value]) => ['-e', `${key}=${value}`]), '--entrypoint', 'bun', hostImage, '-e', script];
+      if (!imageDigest || !DIGEST.test(imageDigest) || (expectedImageDigest && imageDigest !== expectedImageDigest)) return null;
+      const registry = member.registry ?? NODE_REGISTRY;
+      const port = /:(\d+)$/.exec(registry)?.[1];
+      if (!port) return null;
+      const imageName = image.startsWith('elanous-harness-lite:') ? 'elanous-harness-lite' : 'elanous-harness';
+      const pinnedImage = `localhost:${port}/${imageName}@${imageDigest}`;
+      const baseImageDigest = probeGateBaseImageDigest(member, pinnedImage);
+      if (!baseImageDigest) return null;
+      const args = ['run', '--rm', '--pull=never', '--network=none', ...Object.entries({ ...baseline,
+        ELANOUS_GATE_BASE_IMAGE_DIGEST: baseImageDigest }).flatMap(([key, value]) => ['-e', `${key}=${value}`]), '--entrypoint', 'bun', pinnedImage, '-e', script];
       const result = member.sshHost
         ? defaultRemoteRun(member.sshHost, `docker ${args.map(shellQuote).join(' ')}`)
         : spawnSync('docker', args, { encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
@@ -105,7 +259,7 @@ export function preflightGateExecutionIdentity(pool: string, env: NodeJS.Process
       try {
         const row = JSON.parse(result.stdout.trim()) as Partial<GatePodRuntimeIdentity>;
         if (typeof row.bunVersion !== 'string' || typeof row.platform !== 'string' || typeof row.architecture !== 'string'
-          || row.envFingerprint !== expectedEnvFingerprint || typeof row.baseImageDigest !== 'string' || !DIGEST.test(row.baseImageDigest)) return null;
+          || row.envFingerprint !== expectedEnvFingerprint || row.baseImageDigest !== baseImageDigest) return null;
         return { imageDigest, bunVersion: row.bunVersion, platform: row.platform, architecture: row.architecture,
           envFingerprint: row.envFingerprint, baseImageDigest: row.baseImageDigest };
       } catch { return null; }
@@ -192,12 +346,8 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
       const dir = join(input.root, 'release', gateVersion);
       const verdict = JSON.parse(readFileSync(join(dir, 'gate-verdict.json'), 'utf8')) as {
         commit?: string; outcome?: string; baselineReceipt?: GateBaselineReceipt };
-      const failures = JSON.parse(readFileSync(join(dir, 'gate-failures.json'), 'utf8')) as {
-        commit?: string; failures?: string[]; errors?: string[] };
       const receipt = verdict.baselineReceipt;
-      if (verdict.commit !== stamp.sha || !(verdict.outcome === 'ok' || verdict.outcome === 'regression' || verdict.outcome === 'fail') || failures.commit !== stamp.sha
-        || !Array.isArray(failures.failures)
-        || !Array.isArray(failures.errors) || failures.errors.length !== 0
+      if (verdict.commit !== stamp.sha || !(verdict.outcome === 'ok' || verdict.outcome === 'regression' || verdict.outcome === 'fail')
         || !receipt || receipt.schema !== 2 || !receipt.valid || receipt.version !== gateVersion || receipt.commit !== stamp.sha
         || receipt.graphSha !== input.graphPins.graphSha || receipt.recipeSha !== input.graphPins.recipeSha
         || receipt.envFingerprint !== input.envFingerprint || receipt.imageDigest !== input.imageDigest.toLowerCase()
@@ -208,16 +358,24 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
         || !Number.isSafeInteger(receipt.files) || receipt.files < 1 || !Number.isSafeInteger(receipt.shards) || receipt.shards < 1)
         return full('hard rehearsal receipt or current execution identity differs');
       const recomputed = gateBaselineReceipt({ root: input.root, version: gateVersion, commit: stamp.sha,
-        fullSweep: true, graphPins: input.graphPins, envFingerprint: input.envFingerprint });
+        fullSweep: true, graphPins: input.graphPins, envFingerprint: input.envFingerprint, artifactPath: receipt.artifactPath });
       if (!recomputed.valid || recomputed.imageDigest !== receipt.imageDigest
         || JSON.stringify(recomputed.executionIdentity) !== JSON.stringify(receipt.executionIdentity) || recomputed.files !== receipt.files
         || recomputed.shards !== receipt.shards) return full(`hard rehearsal Pod proof differs: ${recomputed.reason}`);
+      const artifactRoot = join(input.root, receipt.artifactPath ?? join('release', gateVersion));
+      const failures = JSON.parse(readFileSync(join(artifactRoot, 'gate-failures.json'), 'utf8')) as {
+        commit?: string; failures?: string[]; errors?: string[] };
+      if (failures.commit !== stamp.sha || !Array.isArray(failures.failures)
+        || !Array.isArray(failures.errors)
+        || [...failures.failures, ...failures.errors].some((id) => typeof id !== 'string'))
+        return full('hard rehearsal failure inventory differs');
       const ancestor = spawnSync('git', ['merge-base', '--is-ancestor', stamp.sha, input.forCommit], { cwd: input.repo, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
       if (ancestor.status !== 0 || ancestor.error) return full('hard rehearsal commit is not an ancestor');
       const expectedFiles = gateAssignableTestsAtCommit(input.repo, stamp.sha);
-      const measuredFiles = readdirSync(join(dir, 'gate-logs', 'cut')).filter((name) => /^pod-\d+\.json$/.test(name))
+      const receiptCutDir = join(artifactRoot, 'gate-logs', 'cut');
+      const measuredFiles = readdirSync(receiptCutDir).filter((name) => /^pod-\d+\.json$/.test(name))
         .flatMap((name) => {
-          const row = JSON.parse(readFileSync(join(dir, 'gate-logs', 'cut', name), 'utf8')) as { files?: unknown };
+          const row = JSON.parse(readFileSync(join(receiptCutDir, name), 'utf8')) as { files?: unknown };
           return Array.isArray(row.files) ? row.files : [];
         });
       if (!expectedFiles || JSON.stringify(measuredFiles.sort()) !== JSON.stringify(expectedFiles)
@@ -226,13 +384,14 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
       // A validated clean full-sweep receipt for the exact cut SHA already measures every test at that SHA.
       // Keep an explicit empty carry plan so the caller skips the cut sweep instead of treating an empty radius
       // as missing evidence and silently running the entire suite again.
-      if (stamp.sha === input.forCommit && failures.failures.length) {
+      if (stamp.sha === input.forCommit && (failures.failures.length || failures.errors.length)) {
         let failedFiles: string[];
-        try { failedFiles = [...new Set(failures.failures.map(testFileOfId))].sort(); }
+        try { failedFiles = [...new Set([...failures.failures, ...failures.errors].map(testFileOfId))].sort(); }
         catch { return full('hard rehearsal failure ids unreadable'); }
+        if (failedFiles.some((file) => !expectedFiles.includes(file))) return full('hard rehearsal failure is outside measured inventory');
         return { plan: { version: input.version, priorCommit: stamp.sha, forCommit: input.forCommit, files: failedFiles,
-          priorFailures: failures.failures, priorErrors: failures.errors ?? [] },
-          reason: `same-head rehearsal receipt verified; re-measure ${failedFiles.length} failed file(s) only`, rehearsalRunId: stamp.hardGateRunId };
+          priorFailures: failures.failures, priorErrors: failures.errors },
+          reason: `same-head rehearsal receipt verified; re-measure ${failedFiles.length} failed or errored file(s) only`, rehearsalRunId: stamp.hardGateRunId };
       }
       if (stamp.sha === input.forCommit) return { plan: { kind: 'carry', version: input.version, priorCommit: stamp.sha,
         forCommit: input.forCommit, files: [], priorFailures: [], priorErrors: [] },
@@ -252,7 +411,7 @@ export function planHardRehearsalRadius(input: { root: string; repo: string; ver
         changedFiles: effective, priorFailures: failures.failures, priorErrors: failures.errors ?? [],
         existsAtTip: (file) => tree.files.includes(file),
         closure: (code) => testsReachingChanged(tree, code, tests),
-        priorCutLogs: join(dir, 'gate-logs', 'cut') });
+        priorCutLogs: receiptCutDir });
       if (!planned.ok && (effective.length || planned.reason.startsWith('executed-pod-image-digest-')))
         return full(planned.reason);
       let fileSet: string[];

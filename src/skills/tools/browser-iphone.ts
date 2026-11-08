@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tools — BI-P5.
 //
 // Exposes BI-P1 (CDP), BI-P2 (Pushcut), BI-P3 (HITL), and BI-P4
@@ -21,7 +22,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   createCdpClient,
   createCdpClientFromEndpoint,

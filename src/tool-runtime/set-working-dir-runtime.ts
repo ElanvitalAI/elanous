@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // SetWorkingDir ToolRuntime — Phase WD8.
 //
 // LLM-invoked switch of the session working directory (SWD). Every
@@ -13,7 +14,7 @@
 
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import {
   getSessionCwd,
   setSessionCwd,

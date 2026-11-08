@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { debug } from '../debug/log.js';
 import { fetchLinearIssueDescription, fetchLinearMissionIssueIdentity } from '../connectors/linear.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
@@ -5,7 +6,7 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { parseLinearSecretaryManifest, updateLinearSecretaryProgress, type LinearSecretaryCaptureInput } from '../intake-plane/linear-wish.js';
 import { submitIntakeWork, type SubmitIntakeWorkDeps } from '../intake-plane/submit-intake-work.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 
 export type ElanousLinearSecretaryArgs =

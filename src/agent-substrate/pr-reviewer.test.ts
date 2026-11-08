@@ -855,6 +855,13 @@ describe('reviewPullRequest — llmReview seam·fail-soft·reviewed 구분', () 
   });
 });
 
+it('REVIEW-SCOPE-CONTRACT is rendered in its own review prompt section', () => {
+  const prompt = buildReviewPrompt({ prDiff: '+change', phaseIntent: 'Fix one guard',
+    reviewScopeContract: 'Boundary: one file. Evidence: focused test passed. Prior item marked STALE.' });
+  expect(prompt).toContain('## Review scope contract\nBoundary: one file. Evidence: focused test passed. Prior item marked STALE.');
+  expect(prompt.indexOf('## Review scope contract')).toBeGreaterThan(prompt.indexOf('## Phase intent'));
+});
+
 describe('buildReviewPrompt / renderReview', () => {
   it('buildReviewPrompt — POST-PR·VERDICT 계약·의도 주입', () => {
     const p = buildReviewPrompt({ prDiff: '+x', phaseIntent: 'lineage helper', acceptance: 'export+test' });

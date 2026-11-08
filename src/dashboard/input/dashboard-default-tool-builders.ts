@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Step 2 next-stone (BACKLOG §8.6.b · 2026-04-30) — default dashboard
 // tool builders factory. Extracts the inline `require()` block in
 // src/dashboard/index.ts (~50 lines) that wires the standard tool
@@ -10,7 +11,7 @@
 // now the dashboard `let plainTurnSettled` site simply spreads the
 // returned object into `buildDashboardOptionalToolSpecs`.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { DashboardOptionalToolSpecRuntimeDeps } from '../optional-tool-spec-runtime.js';
 
 /** Slim subset of `DashboardOptionalToolSpecRuntimeDeps` produced by

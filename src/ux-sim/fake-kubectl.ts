@@ -41,6 +41,13 @@ export function createFakeKubectl(options: { context: string; node: string; node
     if (args[0] === 'config' && args[1] === 'get-contexts')
       return args[2] === options.context ? { status: 0, stdout: `${options.context}\n`, stderr: '' } : missing('context');
     if (args[0] !== '--context' || args[1] !== options.context) return missing('context');
+    if (args.includes('exec') && args.includes('--probe')) return ok({ protocol: 'si-v1', runner: 'ready',
+      workerId: 'worker-1', sourceSha: 'a'.repeat(40), requestedSourceSha: args.at(-2), requestedLockHash: args.at(-1),
+      podUid: 'uid-1', bunVersion: '1.2.3', os: 'linux',
+      architecture: options.arch ?? 'amd64', tools: { bun: true, git: true } });
+    if (args.includes('exec') && args.includes('-e')) return ok({ bunVersion: '1.2.3', os: 'linux',
+      architecture: options.arch ?? 'amd64', baseImageDigest: `sha256:${'f'.repeat(64)}`,
+      tools: { bun: true, git: true } });
     if (args.includes('apply') && input) {
       let manifest: Record<string, any>;
       try { manifest = JSON.parse(input); } catch { return missing('invalid manifest'); }

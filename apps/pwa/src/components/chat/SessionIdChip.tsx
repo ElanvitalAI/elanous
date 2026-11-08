@@ -18,7 +18,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Copy, Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { copyToClipboard, shortSessionId } from './SessionPill';
+import { copyToClipboard, shortSessionId } from './session-id-utils';
 import { debugLog } from '@/lib/debug';
 
 const COPY_FEEDBACK_MS = 1200;

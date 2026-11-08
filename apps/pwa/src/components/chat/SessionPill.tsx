@@ -42,6 +42,9 @@ import {
 } from 'lucide-react';
 import { debugLog } from '@/lib/debug';
 import { SessionIdChip } from './SessionIdChip';
+import { copyToClipboard, shortSessionId } from './session-id-utils';
+
+export { copyToClipboard, shortSessionId } from './session-id-utils';
 
 const ARM_TIMEOUT_MS = 4000;
 const COPY_FEEDBACK_MS = 1200;
@@ -61,33 +64,6 @@ export interface SessionPillProps {
   onAttachRequest?: () => void;
   /** Dropdown 의 "이 세션 잊기" 가 호출. 미지정 시 menu item 미표시. */
   onForgetRequest?: () => void;
-}
-
-/** Copy `value` to clipboard. Returns true on success — false on
- *  permission/insecure-context failure. Pure helper exported for unit
- *  test of the success-path branch. */
-export async function copyToClipboard(value: string): Promise<boolean> {
-  if (!value) return false;
-  if (typeof navigator === 'undefined' || !navigator.clipboard) return false;
-  try {
-    await navigator.clipboard.writeText(value);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Truncate sessionId for display: first 8 chars + ellipsis when the
- *  full ID is longer than 8 chars · "—" when empty. Ellipsis 가 명시
- *  적이라 사용자가 "이게 전체 ID 인지 단축인지" 헷갈리지 않음
- *  (2026-05-07 dogfood feedback). 8자 이하 짧은 ID 는 ellipsis 없이
- *  그대로 (전체 = 표시값). 새 세션은 `crypto.randomUUID()` (UUID v4 ·
- *  128-bit · `apps/pwa/src/lib/daemon-session.ts:9`) 라 항상 36자
- *  → 항상 ellipsis 붙음. Pure helper exported for unit test. */
-export function shortSessionId(sid: string | null | undefined): string {
-  if (!sid) return '—';
-  if (sid.length <= 8) return sid;
-  return `${sid.slice(0, 8)}…`;
 }
 
 export function SessionPill(props: SessionPillProps = {}) {

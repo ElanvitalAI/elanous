@@ -1,4 +1,5 @@
-import type { LLMToolSpec } from '../llm.js';
+import type { LLMToolSpec } from '../llm/tool-spec.js';
+
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import { debug } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';

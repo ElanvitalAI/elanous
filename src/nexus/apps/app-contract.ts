@@ -41,6 +41,24 @@ const TOP_LEVEL_KEYS = new Set([
 // Host-name reservation examples named by 내부 문서 `nexus-backend-in-a-box` §③b.
 const RESERVED_SLUGS = new Set(['www', 'docs', 'api', 'admin', 'relay', 'mail']);
 const BUILTINS = new Set(['stt', 'summarize', 'tts', 'generate', 'translate']);
+const ACTION_IO_CONTRACTS = {
+  stt: {
+    input: { required: { audio: 'object-ref' }, optional: { language: 'text' } },
+    output: { required: { text: 'text' }, optional: { language: 'text', durationMs: 'number' } },
+  },
+  summarize: {
+    input: { required: { text: 'text' }, optional: {} },
+    output: { required: { text: 'text' }, optional: {} },
+  },
+  tts: {
+    input: { required: { text: 'text', voiceId: 'text' }, optional: { modelId: 'text' } },
+    output: { required: { audioBase64: 'text', mimeType: 'text' }, optional: {} },
+  },
+  translate: {
+    input: { required: { text: 'text', sourceLanguage: 'text', targetLanguage: 'text' }, optional: {} },
+    output: { required: { text: 'text' }, optional: {} },
+  },
+} as const;
 const DDL_WORDS = new Set(['CREATE', 'DROP', 'ALTER', 'ATTACH', 'PRAGMA']);
 const SQL_TABLE_KEYWORDS = new Set(['FROM', 'JOIN', 'INTO', 'UPDATE']);
 
@@ -75,6 +93,30 @@ function isMimeType(value: unknown): value is string {
 
 function push(errors: AppContractIssue[], path: string, reason: string): void {
   errors.push({ path, reason });
+}
+
+function validateActionIo(
+  raw: RecordValue,
+  path: string,
+  field: 'input' | 'output',
+  contract: { readonly required: Readonly<Record<string, string>>; readonly optional: Readonly<Record<string, string>> },
+  errors: AppContractIssue[],
+): void {
+  const value = raw[field];
+  if (!isRecord(value)) {
+    push(errors, `${path}/${field}`, `${field} 는 내장 동작 계약 맵이어야 한다`);
+    return;
+  }
+  for (const [key, type] of Object.entries(contract.required)) {
+    if (!Object.hasOwn(value, key)) push(errors, `${path}/${field}`, `${field} 필수 필드가 빠졌다`);
+    else if (value[key] !== type) push(errors, `${path}/${field}`, `${field} 필드 형식이 실행 계약과 다르다`);
+  }
+  for (const [key, type] of Object.entries(contract.optional)) {
+    if (Object.hasOwn(value, key) && value[key] !== type) push(errors, `${path}/${field}`, `${field} 필드 형식이 실행 계약과 다르다`);
+  }
+  if (Object.keys(value).some(key => !Object.hasOwn(contract.required, key) && !Object.hasOwn(contract.optional, key))) {
+    push(errors, `${path}/${field}`, `${field} 에 실행 계약에 없는 필드가 있다`);
+  }
 }
 
 function mapEntryPath(parent: string, index: number): string {
@@ -300,6 +342,11 @@ function validateManifest(
       const path = mapEntryPath('/actions', index);
       if (!isRecord(raw)) { push(errors, path, '동작 선언은 맵이어야 한다'); continue; }
       if (typeof raw.builtin !== 'string' || !BUILTINS.has(raw.builtin)) push(errors, `${path}/builtin`, '허용된 내장 동작(stt, summarize, tts, generate, translate) 중 하나여야 한다');
+      else if (Object.hasOwn(ACTION_IO_CONTRACTS, raw.builtin)) {
+        const contract = ACTION_IO_CONTRACTS[raw.builtin as keyof typeof ACTION_IO_CONTRACTS];
+        validateActionIo(raw, path, 'input', contract.input, errors);
+        validateActionIo(raw, path, 'output', contract.output, errors);
+      }
       if (raw.uses !== undefined) validateCredentialList(raw.uses, `${path}/uses`, errors, false);
       if (raw.async === true && raw.builtin === 'generate' && !nonEmptyString(raw.spend)) push(errors, `${path}/spend`, '비동기 generate 는 spend 선언이 필요하다');
     }

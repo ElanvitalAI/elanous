@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { AppManifest, AppStorageDeclaration } from './app-contract.js';
 import { appObjectKey, createObjectStore, resolveStorageConfig, type ObjectStore, type RunFn, type StorageConfig } from '../../storage/object-store.js';
+import { emitNexusFunnelEvent, type NexusFunnelRuntime } from './funnel-observe.js';
 
 const DEFAULT_QUOTA_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
@@ -26,6 +27,7 @@ type AppStorageResponse = {
 };
 
 export interface AppStorageOptions {
+  readonly funnel?: NexusFunnelRuntime;
   readonly store?: ObjectStore;
   readonly config?: StorageConfig;
   readonly run?: RunFn;
@@ -305,7 +307,14 @@ export function createAppStorage(manifests: readonly AppManifest[], options: App
       } catch { return reject(input.appSlug, 503, 'anonymous upload rate limit unavailable', true); }
     }
     try {
-      if (!reserveAndPut(input.appSlug, fullKey, input.body, contentType, quota)) return reject(input.appSlug, 413, 'app storage quota exceeded');
+      if (!reserveAndPut(input.appSlug, fullKey, input.body, contentType, quota)) {
+        if (options.funnel) {
+          emitNexusFunnelEvent(options.funnel, {
+            type: 'limit-reached', accountHash: options.funnel.accountHash, appHash: options.funnel.appHash(input.appSlug),
+          });
+        }
+        return reject(input.appSlug, 413, 'app storage quota exceeded');
+      }
       return record(input.appSlug, input.body.byteLength, { status: 201, bytes: input.body.byteLength });
     } catch (error) {
       const failure = store.provider === 'local' ? { status: 500 as const, retryable: false } : providerFailure(error);

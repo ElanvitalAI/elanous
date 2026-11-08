@@ -9,6 +9,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSyn
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { cutChecklistGate, listChecklist, type ChecklistItem } from '../../src/release-loop/checklist.js';
 import { getSchedule, formatKst, type ReleaseSchedule } from '../../src/release-loop/release-schedule.js';
 import { readLandingFreeze, landingFreezeMessage, type LandingFreeze } from '../../src/release-loop/landing-freeze.js';
@@ -18,7 +19,9 @@ import { releaseReadiness } from './release-readiness.js';
 import { latestPublishedPreviousVersion, runUnattendedRelease, type UnattendedReleaseDeps } from './unattended-release.js';
 import { gitIgnoredExportFiles, loadExportConfig, run as runPublicExport, selectExportFiles } from '../public-export.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
-import { NODE_REGISTRY, parsePodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { defaultRemoteRun, NODE_REGISTRY, parsePodPool, registryImageRef } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { podSourceScript } from '../../src/task-orchestrator/surfaces/pod-source-receive.js';
+import { createRuntimeIdentity, runtimeIdentityKey, type RuntimeIdentityInput } from '../../src/runtime-identity.js';
 
 export type PreflightLevel = 'ok' | 'warn' | 'block';
 export type PreflightCheck = 'checklist' | 'postpub' | 'run-input' | 'freeze' | 'schedule' | 'export' | 'notes' | 'cut-tree' | 'gate-slot' | 'release-notes'
@@ -135,8 +138,8 @@ export interface PreflightDeps {
   pwaBuildCheck?: (commit: string) => Promise<{ ok: boolean; detail: string; commit?: string }>;
   /** Release cut −60: count export-gitignored hits against the exact cutoff tree. */
   gitIgnoredExportCheck?: (commit: string) => Promise<number | null>;
-  /** Release cut −60: prove the candidate's immutable commit tag exists in at least one configured gate pool. */
-  gateImageTagCheck?: (commit: string, poolSpec: string) => { checked: boolean; pools: string[]; detail?: string };
+  /** Release cut −60: prove every configured pool can run the cutoff-pinned image with matching runtime identity. */
+  gateImageRuntimeCheck?: (commit: string, poolSpec: string) => { checked: boolean; pools: string[]; detail?: string };
   /** Countdown T−120/T−60/T0: the cut manifest `cutoff.ts` pinned (default `<instance>/release/<v>/manifest.json`). */
   manifest?: (version: string) => CountdownManifest | null;
   /** Countdown T−60: the «node-b» gate-slot record (default `<instance>/release/<v>/gate-slot.json`). */
@@ -155,6 +158,37 @@ function runGit(cwd: string, args: string[]): string {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 << 20 });
   if (result.status !== 0) throw new Error(`git ${args.join(' ')} 실패 rc=${result.status}: ${(result.stderr ?? '').trim().slice(0, 300)}`);
   return (result.stdout ?? '').trim();
+}
+
+const RELEASE_CLI_PATHS = ['src/release-loop', 'scripts/release-loop', 'graphs/release'] as const;
+
+export interface ReleaseCliFreshness {
+  ok: true;
+  cliCommit: string;
+  cutCommit: string;
+  changedPaths: [];
+}
+
+/** Refuse to start a cut run when this CLI's release implementation differs from the candidate cut. */
+export function assertReleaseCliFresh(repoRoot: string, cliRevision: string | undefined, cutRevision?: string): ReleaseCliFreshness {
+  if (!cliRevision || !/^[0-9a-f]{40}$/iu.test(cliRevision)) throw new Error('release run preflight: CLI revision is unknown; refusing to launch');
+  const cliCommit = runGit(repoRoot, ['rev-parse', '--verify', `${cliRevision}^{commit}`]);
+  const requestedCut = cutRevision?.trim() || 'origin/main';
+  let cutCommit: string;
+  try { cutCommit = runGit(repoRoot, ['rev-parse', '--verify', `${requestedCut}^{commit}`]); }
+  catch { throw new Error(`release run preflight: cut revision cannot be resolved (${requestedCut}); refusing to launch`); }
+  const cutIncludedByCli = spawnSync('git', ['merge-base', '--is-ancestor', cutCommit, cliCommit], {
+    cwd: repoRoot, encoding: 'utf8', timeout: 10_000, maxBuffer: 1 << 20,
+  });
+  if (cutIncludedByCli.error || (cutIncludedByCli.status !== 0 && cutIncludedByCli.status !== 1)) {
+    throw new Error(`release run preflight: cannot verify CLI/cut ancestry (CLI ${cliCommit.slice(0, 12)} · cut ${cutCommit.slice(0, 12)}); refusing to launch`);
+  }
+  const changedPaths = cutIncludedByCli.status === 0 ? [] : runGit(repoRoot, ['diff', '--name-only', '--no-renames', cliCommit, cutCommit, '--', ...RELEASE_CLI_PATHS])
+    .split('\n').filter(Boolean).sort();
+  if (changedPaths.length) {
+    throw new Error(`release run preflight: stale CLI ${cliCommit.slice(0, 12)} is missing cut ${cutCommit.slice(0, 12)} release changes: ${changedPaths.join(', ')}`);
+  }
+  return { ok: true, cliCommit, cutCommit, changedPaths: [] };
 }
 
 /** Avoid partial-clone promisor remotes turning a missing fixture/cut SHA into an implicit network fetch. */
@@ -295,42 +329,63 @@ export async function scanPwaBuildAtCommit(commit: string): Promise<{ ok: boolea
   }
 }
 
-/** Read pool tags with a bounded SSH timeout; local pools use the image's immutable commit label. */
-export function scanGateImageTag(commit: string, poolSpec: string): { checked: boolean; pools: string[]; detail?: string } {
+const shellQuote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+
+interface GateImagePreflightProbe extends RuntimeIdentityInput { checkoutSha: string; sourceLockHash: string }
+
+/** Read the candidate lock/Bun pins from the exact cutoff commit, never from the caller's working tree. */
+interface GateImagePreflightIO {
+  gitShow?: (commit: string, path: string) => { status: number | null; stdout: string };
+  remoteRun?: typeof defaultRemoteRun;
+  localRun?: (command: string, args: string[]) => { status: number | null; stdout: string; stderr?: string };
+}
+
+function expectedGateImagePins(commit: string, gitShow: GateImagePreflightIO['gitShow'] = (sha, path) => spawnSync('git', ['show', `${sha}:${path}`], { encoding: 'utf8', timeout: 10_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER })): { lockHash: string; bunVersion: string } | null {
+  const lock = gitShow(commit, 'bun.lock');
+  const bun = gitShow(commit, '.bun-version');
+  if (lock.status !== 0 || bun.status !== 0 || !lock.stdout || !bun.stdout.trim()) return null;
+  return { lockHash: createHash('sha256').update(lock.stdout).digest('hex'), bunVersion: bun.stdout.trim() };
+}
+
+/** Runtime identity and source checkout must both be measurable inside the actual pool image. */
+function probeGateImage(member: ReturnType<typeof parsePodPool>[number], commit: string, io: GateImagePreflightIO): GateImagePreflightProbe | null {
+  const remoteRun = io.remoteRun ?? defaultRemoteRun;
+  const image = member.sshHost
+    ? registryImageRef(member, commit, remoteRun, 'elanous-harness:local')
+    : 'elanous-harness:local';
+  if (!image) return null;
+  const source = podSourceScript({ kind: 'commit', sha: commit }, 'https://github.com/ElanvitalAI/elanous');
+  const measure = `\nbun -e ${shellQuote("const {createHash}=require('node:crypto');const {readFileSync}=require('node:fs');const {execFileSync}=require('node:child_process');const hash=p=>createHash('sha256').update(readFileSync(p)).digest('hex');console.log('ELANOUS_GATE_IMAGE_PREFLIGHT '+JSON.stringify({baseImageDigest:process.env.ELANOUS_GATE_BASE_IMAGE_DIGEST??'',lockHash:hash('/opt/elanous-gate-deps/bun.lock'),sourceLockHash:hash('bun.lock'),os:process.platform,architecture:process.arch,bunVersion:Bun.version,checkoutSha:execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim()}));")}`;
+  const command = ['run', '--rm', member.sshHost ? '--pull=always' : '--pull=never', '--entrypoint', 'bash', image, '-lc', `${source}${measure}`];
+  const result = member.sshHost
+    ? remoteRun(member.sshHost, `docker ${command.map(shellQuote).join(' ')}`)
+    : (io.localRun ?? ((cmd, args) => spawnSync(cmd, args, { encoding: 'utf8', timeout: 90_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER })))('docker', command);
+  if (result.status !== 0) return null;
+  const line = result.stdout.split(/\r?\n/).find((value) => value.startsWith('ELANOUS_GATE_IMAGE_PREFLIGHT '));
+  if (!line) return null;
+  try {
+    const row = JSON.parse(line.slice('ELANOUS_GATE_IMAGE_PREFLIGHT '.length)) as GateImagePreflightProbe;
+    return createRuntimeIdentity(row) && /^[0-9a-f]{40}$/i.test(row.checkoutSha) && /^[0-9a-f]{64}$/i.test(row.sourceLockHash) ? row : null;
+  } catch { return null; }
+}
+
+/** A source tag/digest may differ; only the shared runtime identity and actual Pod checkout must match. */
+export function scanGateImageRuntimeIdentity(commit: string, poolSpec: string, io: GateImagePreflightIO = {}): { checked: boolean; pools: string[]; detail?: string } {
   if (!/^[0-9a-f]{40}$/i.test(commit)) return { checked: false, pools: [], detail: 'cutoff commit is not pinned' };
   try {
+    const expected = expectedGateImagePins(commit, io.gitShow);
+    if (!expected) return { checked: false, pools: [], detail: 'cutoff Bun or lockfile pin could not be measured' };
     const members = parsePodPool(poolSpec);
     if (!members.length) return { checked: false, pools: [], detail: 'gate pool is empty' };
-    const pools: string[] = [];
-    const errors: string[] = [];
-    for (const member of members) {
-      if (!member.sshHost) {
-        const local = spawnSync('docker', ['image', 'inspect', 'elanous-harness:local', '--format', '{{index .Config.Labels "elanous.commit"}}'], { encoding: 'utf8', timeout: 10_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
-        if (local.status === 0 && local.stdout.trim() === commit) pools.push(member.context);
-        else if (local.error || local.status === null) errors.push(`${member.context}: ${local.error?.message ?? 'docker inspection unavailable'}`);
-        continue;
-      }
-      const registry = member.registry ?? NODE_REGISTRY;
-      const portMatch = /:(\d+)$/.exec(registry);
-      if (!portMatch) {
-        errors.push(`${member.context}: registry port is missing (${registry})`);
-        continue;
-      }
-      // Remote registry tags use the 12-character prefix per pod-pool.ts; local elanous.commit labels are full SHAs.
-      const port = portMatch[1]!;
-      const image = 'elanous-harness';
-      const remote = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', member.sshHost,
-        `curl -fsS --max-time 5 http://localhost:${port}/v2/${image}/tags/list 2>/dev/null`], { encoding: 'utf8', timeout: 12_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
-      if (remote.status !== 0) {
-        errors.push(`${member.context}: registry query failed${remote.error ? ` (${remote.error.message})` : ` (rc=${remote.status})`}`);
-        continue;
-      }
-      try {
-        const tags = (JSON.parse(remote.stdout) as { tags?: string[] }).tags ?? [];
-        if (tags.includes(commit.slice(0, 12))) pools.push(member.context);
-      } catch { errors.push(`${member.context}: registry tag response was not valid JSON`); }
-    }
-    return { checked: errors.length === 0, pools, ...(errors.length ? { detail: errors.join('; ') } : {}) };
+    const rows = members.map((member) => ({ member, probe: probeGateImage(member, commit, io) }));
+    if (rows.some(({ probe }) => !probe)) return { checked: false, pools: [], detail: 'gate image runtime identity or Pod source checkout could not be measured' };
+    const probes = rows.map(({ probe }) => probe!);
+    const keys = probes.map((probe) => runtimeIdentityKey(probe));
+    const compatible = probes.every((probe) => probe.checkoutSha.toLowerCase() === commit.toLowerCase()
+      && probe.lockHash === expected.lockHash && probe.sourceLockHash === expected.lockHash && probe.bunVersion === expected.bunVersion)
+      && keys[0] !== null && keys.every((key) => key === keys[0]);
+    if (!compatible) return { checked: false, pools: [], detail: 'gate image runtime identity or candidate checkout differs from cutoff' };
+    return { checked: true, pools: rows.map(({ member }) => member.context) };
   } catch (error) {
     return { checked: false, pools: [], detail: error instanceof Error ? error.message : String(error) };
   }
@@ -589,14 +644,14 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
     }
 
     const imageCheck = gatePodPool
-      ? (deps.gateImageTagCheck ?? scanGateImageTag)(candidateCommit, gatePodPool)
+      ? (deps.gateImageRuntimeCheck ?? scanGateImageRuntimeIdentity)(candidateCommit, gatePodPool)
       : { checked: false, pools: [], detail: 'release run 입력에서 gatePodPool을 얻지 못했다' };
     findings.push(imageCheck.checked && imageCheck.pools.length > 0
-      ? { level: 'ok', check: 'gate-image', message: `컷 후보 gate 이미지 태그 ${candidateCommit.slice(0, 12)} 확인 · 풀 ${imageCheck.pools.join(', ')}` }
+      ? { level: 'ok', check: 'gate-image', message: `gate runtime identity 일치 ⊕ Pod checkout ${candidateCommit.slice(0, 12)} 확인 · 풀 ${imageCheck.pools.join(', ')}` }
       : { level: 'block', check: 'gate-image', message: imageCheck.checked
-        ? `컷 후보 gate 이미지 태그 ${candidateCommit.slice(0, 12) || '(SHA 없음)'}가 어느 풀에도 없다`
-        : `컷 후보 gate 이미지 태그를 확인하지 못했다 · ${imageCheck.detail ?? '원인 미상'}`,
-        suggestion: `컷 후보 ${candidateCommit.slice(0, 12) || '(SHA 없음)'}의 gate 이미지를 하나 이상의 풀에 빌드·반입한 뒤 preflight 를 다시 실행한다` });
+        ? `gate runtime identity 와 Pod checkout SHA 를 확인한 풀이 없다`
+        : `gate runtime identity 또는 Pod checkout SHA 를 확인하지 못했다 · ${imageCheck.detail ?? '원인 미상'}`,
+        suggestion: `컷 후보 ${candidateCommit.slice(0, 12) || '(SHA 없음)'}와 lock hash 가 맞는 gate 런타임 이미지를 하나 이상의 풀에 준비한 뒤 preflight 를 다시 실행한다` });
   }
 
   // 4. Landing freeze (emergency switch since RELEASE-BRANCH): when on, `release run` refuses.

@@ -1,10 +1,11 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 import { describe, expect, test } from 'bun:test';
 import { ENTRANCE_REGISTRY, NATIVE_TOOL_BY_ENTRANCE_ID } from '../src/self-dev/entrance-registry.js';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { LLMToolSpec } from '../src/llm.js';
+
 import type { LLMToolDef } from '../src/plugins/core/types.js';
 import type { ToolRuntime } from '../src/tool-runtime/types.js';
 import { buildSessionRuntimeToolSpecs, filterAvailableToolSpecs } from '../src/session-runtime/index.js';

@@ -8,6 +8,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import { directiveHash } from './directive.js';
 import {
   ALERTS_FILE,
@@ -206,7 +207,7 @@ describe('COORD-DIRECTIVE-AUDIT — GREEN: 원장·로그를 바로잡으면 수
 });
 
 describe('COORD-DIRECTIVE-AUDIT — 네트워크·시크릿 미접촉', () => {
-  test('감사 한 바퀴에 fetch 를 건드리지 않는다', () => {
+  test('감사 한 바퀴에 fetch 를 건드리지 않는다', async () => {
     const s = stage(
       {
         'CEO-VERBATIM-2026-10-22.jsonl': `${verbatimLine(TEXT)}\n`,
@@ -216,13 +217,10 @@ describe('COORD-DIRECTIVE-AUDIT — 네트워크·시크릿 미접촉', () => {
       },
       [],
     );
-    const originalFetch = globalThis.fetch;
-    let calls = 0;
-    globalThis.fetch = (async () => { calls++; throw new Error('audit must not touch the network'); }) as unknown as typeof fetch;
-    try {
+    await withFakeFetchDevice([{ url: '/never-requested', response: Response.json({ unused: true }) }], (device) => {
       runDirectiveAudit(s.deps());
-      expect(calls).toBe(0);
-    } finally { globalThis.fetch = originalFetch; close(s); }
+      expect(device.calls()).toEqual([]);
+    }).finally(() => close(s));
   });
 
   test('원장·원문 로그가 없으면 아무것도 쓰지 않고 조용히 끝난다', () => {

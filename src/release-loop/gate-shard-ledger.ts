@@ -6,6 +6,8 @@ import { releaseLedgerRoot } from '../instance/resolve.js';
 
 export interface GateShardLedgerRow {
   v: 1;
+  /** Invocation identity used to prevent shard summaries from mixing repeated same-head gates. */
+  invocationId?: string;
   version: string;
   phase: 'cut' | 'baseline';
   shardId: string;
@@ -41,6 +43,10 @@ export interface GateShardLedgerRow {
   batchId?: string;
   /** Number of shard rows expected in this completed batch. */
   batchSize?: number;
+  /** Files whose first attempt was not measured and therefore must be covered by a successful retry row. */
+  unmeasuredFiles?: string[];
+  /** Shared identity of the parent attempt and the retry rows that recover it. */
+  retryGroupId?: string;
 }
 
 export interface GateShardLedgerBatchExpectation {
@@ -52,17 +58,66 @@ export interface GateShardLedgerBatchExpectation {
   shardIds: readonly string[];
 }
 
+function retryRecoverableUnmeasuredRow(row: GateShardLedgerRow): boolean {
+  return row.attribution === 'unmeasured' && !!row.retryGroupId && !!row.unmeasuredFiles?.length
+    && new Set(row.unmeasuredFiles).size === row.unmeasuredFiles.length
+    && row.unmeasuredFiles.every((file) => row.files.includes(file))
+    && row.rc === 0 && row.pass !== null && row.fail === 0 && row.errors === 0 && row.ran !== null && row.ran >= row.pass
+    && row.failureIds === null && row.errorIds === null;
+}
+
 /** Validate the persisted batch marker and the exact shard set expected by this gate invocation. */
 export function gateShardLedgerBatchComplete(rows: readonly GateShardLedgerRow[], expected: GateShardLedgerBatchExpectation): boolean {
   if (!expected.shardIds.length || new Set(expected.shardIds).size !== expected.shardIds.length) return false;
   const batch = rows.filter((row) => row.batchId === expected.batchId);
-  if (!batch.length) return false;
-  const actualIds = batch.map((row) => row.shardId);
-  return batch.length === expected.shardIds.length
-    && batch.every((row) => row.version === expected.version && row.commit === expected.commit && row.phase === expected.phase
-      && row.observedAt === expected.observedAt && row.batchSize === expected.shardIds.length && row.state === 'done' && row.attribution === 'complete')
-    && new Set(actualIds).size === actualIds.length
-    && expected.shardIds.every((id) => actualIds.includes(id));
+  if (batch.length !== expected.shardIds.length || new Set(batch.map((row) => row.shardId)).size !== batch.length
+    || !batch.every((row) => row.version === expected.version && row.commit === expected.commit && row.phase === expected.phase
+      && row.observedAt === expected.observedAt && row.batchSize === expected.shardIds.length && row.state === 'done')
+    || expected.shardIds.some((id) => !batch.some((row) => row.shardId === id))) return false;
+
+  for (const parent of batch) {
+    if (parent.attribution !== 'complete' && !retryRecoverableUnmeasuredRow(parent)) return false;
+    const missing = parent.unmeasuredFiles ?? [];
+    const parentStart = parent.startedAt ? Date.parse(parent.startedAt) : NaN;
+    const parentEnd = parent.endedAt ? Date.parse(parent.endedAt) : NaN;
+    const retryIds = parent.retryGroupId ? [...new Set(rows.map((row) => row.shardId).filter((shardId) =>
+      shardId.startsWith(`${parent.shardId}-n`) && /^\d*$/.test(shardId.slice(parent.shardId.length + 2))))] : [];
+    if (parent.attribution !== 'complete' && (!Number.isFinite(parentStart) || !Number.isFinite(parentEnd) || !retryIds.length)) return false;
+    if (retryIds.length && (!Number.isFinite(parentStart) || !Number.isFinite(parentEnd) || parent.retryGroupId !== parent.attemptId)) return false;
+    const covered = new Set(parent.files.filter((file) => !missing.includes(file)));
+    const attempts = new Set<string>();
+    for (const retryId of retryIds) {
+      const groupHistory = rows.filter((row) => row.phase === parent.phase && row.shardId === retryId && row.retryGroupId === parent.retryGroupId);
+      if (!groupHistory.length || groupHistory.some((row) => {
+        const startedAt = row.startedAt === null ? null : row.startedAt ? Date.parse(row.startedAt) : NaN;
+        const endedAt = row.endedAt === null ? null : row.endedAt ? Date.parse(row.endedAt) : NaN;
+        if (startedAt === null ? row.state !== 'pending' : !Number.isFinite(startedAt) || startedAt < parentStart || startedAt > parentEnd) return true;
+        if (endedAt === null) return row.state !== 'pending' && row.state !== 'running';
+        return !Number.isFinite(endedAt) || startedAt === null || endedAt < startedAt || endedAt > parentEnd || endedAt < parentStart;
+      })) return false;
+      const history = groupHistory.filter((row) => row.version === parent.version && row.commit === parent.commit
+        && row.envFingerprint === parent.envFingerprint && row.executor === parent.executor && row.imageDigest === parent.imageDigest
+        && row.measuredImageDigest === parent.measuredImageDigest && row.currentImageDigest === parent.currentImageDigest);
+      if (history.length !== groupHistory.length) return false;
+      const attemptIds = new Set(history.map((row) => row.attemptId).filter((id): id is string => !!id));
+      const completed = history.filter((row) => row.state === 'done' && row.attribution === 'complete');
+      const retry = history.at(-1);
+      if (attemptIds.size !== 1 || completed.length !== 1 || !retry || retry !== completed[0]
+        || retry.state !== 'done' || retry.attribution !== 'complete'
+        || retry.rc !== 0 || retry.fail !== 0 || retry.errors !== 0 || retry.pass === null || retry.ran === null || retry.ran < retry.pass
+        || !retry.attemptId || attempts.has(retry.attemptId) || (parent.attemptId !== null && retry.attemptId === parent.attemptId)
+        || retry.version !== parent.version || retry.commit !== parent.commit || retry.envFingerprint !== parent.envFingerprint
+        || retry.executor !== parent.executor || retry.imageDigest !== parent.imageDigest
+        || retry.measuredImageDigest !== parent.measuredImageDigest || retry.currentImageDigest !== parent.currentImageDigest
+        || !retry.failureIds || retry.failureIds.length > 0 || !retry.errorIds || retry.errorIds.length > 0
+        || !retry.files.length || retry.files.some((file) => !parent.files.includes(file))) return false;
+      attempts.add(retry.attemptId);
+      retry.files.forEach((file) => covered.add(file));
+    }
+    if (missing.some((file) => !parent.files.includes(file))
+      || parent.files.some((file) => !covered.has(file))) return false;
+  }
+  return true;
 }
 
 export function gateShardLedgerPath(version: string, root = releaseLedgerRoot()): string {
@@ -102,7 +157,8 @@ export function appendGateShardLedgerBatch(path: string, rows: readonly GateShar
     if (new Set(shardIds).size !== shardIds.length) throw new Error('duplicate shard id in result batch');
     for (const row of rows) {
       if (row.version !== rows[0]!.version || row.commit !== rows[0]!.commit || row.phase !== 'cut'
-        || row.state !== 'done' || row.ran === null || row.attribution !== 'complete')
+        || row.state !== 'done' || row.ran === null
+        || (row.attribution !== 'complete' && !retryRecoverableUnmeasuredRow(row)))
         throw new Error('incomplete remote shard result batch');
       if (!/^[a-f0-9]{40}$/i.test(row.commit) || !/^[a-f0-9]{64}$/i.test(row.envFingerprint)) throw new Error('invalid shard ledger identity');
       if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(row.shardId) || row.files.some((file) => file.startsWith('/') || file.split('/').includes('..'))) throw new Error('invalid shard ledger path');
@@ -134,12 +190,17 @@ export function readGateShardLedger(path: string): { rows: GateShardLedgerRow[];
   const batches = new Map<string, GateShardLedgerRow[]>();
   for (const row of rows) if (row.batchId) batches.set(row.batchId, [...(batches.get(row.batchId) ?? []), row]);
   const sizeUnknownBatches = [...batches].filter(([, batch]) => batch.every((row) => row.batchSize === undefined)).map(([batchId]) => batchId);
-  const incompleteBatches = [...batches].filter(([, batch]) => {
+  const incompleteBatches = [...batches].filter(([batchId, batch]) => {
     const size = batch[0]?.batchSize;
-    return !batch.every((row) => row.batchSize === undefined) && (!Number.isSafeInteger(size) || size! < 1 || batch.length !== size
-      || batch.some((row) => row.batchSize !== size || row.state !== 'done' || row.attribution !== 'complete'
+    if (batch.every((row) => row.batchSize === undefined)) return false;
+    if (!Number.isSafeInteger(size) || size! < 1 || batch.length !== size
+      || batch.some((row) => row.batchSize !== size || row.state !== 'done'
+        || (row.attribution !== 'complete' && !retryRecoverableUnmeasuredRow(row))
         || row.version !== batch[0]!.version || row.commit !== batch[0]!.commit || row.phase !== batch[0]!.phase)
-      || new Set(batch.map((row) => row.shardId)).size !== batch.length);
+      || new Set(batch.map((row) => row.shardId)).size !== batch.length) return true;
+    const first = batch[0]!;
+    return !gateShardLedgerBatchComplete(rows, { batchId, version: first.version, commit: first.commit, phase: first.phase,
+      observedAt: first.observedAt, shardIds: batch.map((row) => row.shardId) });
   }).map(([batchId]) => batchId);
   return { rows, malformed, incompleteBatches, sizeUnknownBatches, trailingPartial };
 }
@@ -149,4 +210,41 @@ export function latestGateShardLedger(rows: readonly GateShardLedgerRow[]): Gate
   const latest = new Map<string, GateShardLedgerRow>();
   for (const row of rows) latest.set(`${row.phase}:${row.shardId}`, row);
   return [...latest.values()].sort((a, b) => a.phase.localeCompare(b.phase) || a.shardId.localeCompare(b.shardId, undefined, { numeric: true }));
+}
+
+/** Return a completed cut batch only when HQ has the exact current shard plan and execution identity. */
+export function reusableGateShardLedgerBatch(input: {
+  path: string;
+  version: string;
+  commit: string;
+  envFingerprint: string;
+  imageDigest: string | null;
+  shards: readonly { shardId: string; files: readonly string[] }[];
+}): Map<string, GateShardLedgerRow> | undefined {
+  if (!input.shards.length || !input.envFingerprint || !input.imageDigest) return undefined;
+  const ledger = readGateShardLedger(input.path);
+  if (!ledger || ledger.trailingPartial || ledger.malformed > 0) return undefined;
+  const expected = new Map(input.shards.map((shard) => [shard.shardId, [...shard.files]]));
+  if (expected.size !== input.shards.length) return undefined;
+  const batches = new Map<string, GateShardLedgerRow[]>();
+  for (const row of ledger.rows) if (row.batchId) batches.set(row.batchId, [...(batches.get(row.batchId) ?? []), row]);
+  const candidates = [...batches.entries()].reverse();
+  for (const [batchId, rows] of candidates) {
+    if (rows.length !== expected.size) continue;
+    const first = rows[0]!;
+    if (!gateShardLedgerBatchComplete(ledger.rows, { batchId, version: input.version, commit: input.commit,
+      phase: 'cut', observedAt: first.observedAt, shardIds: [...expected.keys()] })) continue;
+    const matches = rows.every((row) => {
+      const files = expected.get(row.shardId);
+      return !!files && row.files.length === files.length && row.files.every((file, index) => file === files[index])
+        && row.envFingerprint === input.envFingerprint && row.executor === 'pod'
+        && row.currentImageDigest === input.imageDigest && row.measuredImageDigest === input.imageDigest
+        && row.imageDigest === input.imageDigest && (row.rc === 0 || row.rc === 1) && row.pass !== null && row.fail !== null
+        && row.errors !== null && row.ran !== null && row.failureIds !== null && row.errorIds !== null
+        && row.fail === row.failureIds.length && row.errors === row.errorIds.length
+        && row.rc === (row.fail + row.errors > 0 ? 1 : 0) && row.attribution === 'complete';
+    });
+    if (matches) return new Map(rows.map((row) => [row.shardId, row]));
+  }
+  return undefined;
 }

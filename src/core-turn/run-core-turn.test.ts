@@ -1,5 +1,6 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
-import type { LLMMessage, LLMToolSpec, StreamWithToolsHandlers } from '../llm.js';
+import type { LLMMessage, StreamWithToolsHandlers } from '../llm.js';
 import * as llmModule from '../llm.js';
 import * as surfaceModule from '../session-runtime/index.js';
 import * as deferredModule from '../session-runtime/tier-flip.js';

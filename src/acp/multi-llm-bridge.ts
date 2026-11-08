@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // CV-3 DM-1 — Daemon Multi-LLM dispatch bridge.
 //
 // Companion to `bridgeCoreTurnToAcp` (single-LLM path). When the
@@ -20,7 +21,7 @@
 // See also: 내부 문서 `PLAN-cv-3-daemon-multi-llm-2026-05-08` (RFC v2 ·
 // 13 D 결정)
 
-import type { LLMMessage, LLMToolSpec } from '../llm.js';
+import type { LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { runCoreTurn } from '../core-turn/run-core-turn.js';
 import type { CoreTurnDispatchTool } from '../core-turn/types.js';

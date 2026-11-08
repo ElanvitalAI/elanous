@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '../nexus/api/pod-credential-api.js';
-import { ghAutomationEnv, defaultCmdRunner, defaultPrCreateGuard, makePrManager, configuredHunkOverlapMode, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, recordPrCreateFailureIncident, sanitizeCredentialText, stderrTailOf, type PrCreateFailureIncident, type CmdRunner, type CmdResult } from './pr-manager.js';
+import { ghAutomationEnv, defaultCmdRunner, commandResultFromSpawn, defaultPrCreateGuard, makePrManager, configuredHunkOverlapMode, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, recordPrCreateFailureIncident, sanitizeCredentialText, stderrTailOf, type PrCreateFailureIncident, type CmdRunner, type CmdResult } from './pr-manager.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { debug } from '../debug/log.js';
 import { cardIdFromBody, guardNewPr } from '../pr-tool/census.js';
@@ -1613,6 +1613,52 @@ describe('defaultCmdRunner — bun ≥1.4 1MB maxBuffer', () => {
     const r = defaultCmdRunner(process.execPath, ['-e', "process.stdout.write('x'.repeat(2_000_000))"]);
     expect(r.ok).toBe(true);
     expect(r.out.length).toBe(2_000_000);
+  });
+});
+
+describe('PR Manager bounded GitHub commands', () => {
+  it('applies the GH timeout, logs the exact operation, and preserves ETIMEDOUT as failure detail', () => {
+    let timeoutMs: number | undefined;
+    const manager = makePrManager((cmd, args, opts) => {
+      expect(cmd).toBe('gh');
+      expect(args.slice(0, 2)).toEqual(['pr', 'list']);
+      timeoutMs = opts?.timeoutMs;
+      return { ok: false, out: '', err: 'spawnSync gh ETIMEDOUT' };
+    });
+
+    const result = manager.findPrForBranchOutcome('hang-observation-probe', '/tmp/opt-hang-probe');
+    expect(result.status).toBe('FAILED');
+    expect(timeoutMs).toBe(45_000);
+    const events = debug.events(500).filter((event) => event.category === 'autopilot.pr-manager' &&
+      event.data && typeof event.data === 'object' && 'operation' in event.data && event.data.operation === 'pr list');
+    expect(events.some((event) => event.event === 'gh.command.started')).toBe(true);
+    expect(events.some((event) => event.event === 'gh.command.timed-out' &&
+      JSON.stringify(event.data).includes('ETIMEDOUT'))).toBe(true);
+  });
+
+  it('force-kills a child that ignores SIGTERM and returns timeout as failure', () => {
+    const startedAt = Date.now();
+    const result = defaultCmdRunner(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], { timeoutMs: 30 });
+    expect(result.ok).toBe(false);
+    expect(result.err).toMatch(/ETIMEDOUT/i);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+
+  it('kills a timed-out command process group when descendants inherit its output pipes', () => {
+    const startedAt = Date.now();
+    const code = 'const { spawn } = require("node:child_process"); spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "inherit" }); setInterval(() => {}, 1000);';
+    const result = defaultCmdRunner(process.execPath, ['-e', code], { timeoutMs: 30 });
+    expect(result.ok).toBe(false);
+    expect(result.err).toMatch(/ETIMEDOUT/i);
+    expect(Date.now() - startedAt).toBeLessThan(2_500);
+  });
+
+  it('treats a spawn error as failure even when the child status is zero', () => {
+    const result = commandResultFromSpawn({ status: 0, stdout: 'looks successful',
+      error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) });
+    expect(result.ok).toBe(false);
+    expect(result.out).toBe('looks successful');
+    expect(result.err).toContain('ETIMEDOUT');
   });
 });
 

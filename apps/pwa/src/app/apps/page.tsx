@@ -1,7 +1,10 @@
 'use client';
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
+import Link from 'next/link';
 import { useDaemon } from '@/components/providers/DaemonProvider';
+import { AppSimLiveView, type AppSimReceipt } from '@/components/apps/AppSimLiveView';
+import { useNexusClient } from '@/nexus/hooks/use-nexus-context';
 
 type AppEnvironment = {
   status: 'not-created' | 'ready' | 'running' | 'passed' | 'failed' | 'live' | 'paused';
@@ -39,6 +42,7 @@ export default function AppsPage() {
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
   const [description, setDescription] = useState('');
+  const [selectedApp, setSelectedApp] = useState<AppTile | null>(null);
   const requestVersion = useRef(0);
   const clientGeneration = useRef(0);
   const actionVersion = useRef(0);
@@ -52,6 +56,7 @@ export default function AppsPage() {
       requestVersion.current += 1;
       actionVersion.current += 1;
       actionLocked.current = false;
+      setSelectedApp(null);
     }
   }, [client]);
 
@@ -79,6 +84,16 @@ export default function AppsPage() {
   }, [client, loadApps]);
 
   const viewStatus = loadedClientGeneration === clientGeneration.current ? status : 'loading';
+
+  if (selectedApp) {
+    const receipt: AppSimReceipt[] = selectedApp.simulation.receipt ? [{
+      id: selectedApp.simulation.receipt,
+      outcome: selectedApp.simulation.status === 'passed' ? 'passed'
+        : selectedApp.simulation.status === 'failed' ? 'failed' : 'unknown',
+      summary: `마지막 시뮬레이션 · ${simulationLabels[selectedApp.simulation.status]}`,
+    }] : [];
+    return <AppSimulationDetails app={selectedApp} receipts={receipt} onBack={() => setSelectedApp(null)} />;
+  }
 
   async function createApp(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -154,13 +169,19 @@ export default function AppsPage() {
     <main className="mx-auto w-full max-w-5xl space-y-8 px-5 py-10 sm:py-16">
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div className="space-y-2">
-          <h1 className="text-2xl font-semibold tracking-tight">내 앱</h1>
-          <p className="text-sm text-muted-foreground">앱마다 시뮬레이션과 정식 환경을 한곳에서 관리합니다.</p>
+          <p className="text-xs font-medium uppercase tracking-[0.18em] text-primary">Elanous · App Studio</p>
+          <h1 className="text-2xl font-semibold tracking-tight">앱 스튜디오</h1>
+          <p className="max-w-2xl text-sm text-muted-foreground">앱을 만들고, 시뮬레이션으로 확인한 뒤 정식 환경으로 이어가세요.</p>
         </div>
-        <button type="button" disabled={viewStatus !== 'ready'} onClick={() => { setCreating((value) => !value); setError(''); }}
-          className="rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-          {creating ? '닫기' : '새 앱'}
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <Link href="/design-check" className="rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            디자인 방향 고르기
+          </Link>
+          <button type="button" disabled={viewStatus !== 'ready'} onClick={() => { setCreating((value) => !value); setError(''); }}
+            className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
+            {creating ? '닫기' : '새 앱 만들기'}
+          </button>
+        </div>
       </header>
 
       {creating && <form onSubmit={(event) => void createApp(event)} aria-label="새 앱 만들기" className="grid gap-3 rounded-xl border border-border bg-card p-5 sm:grid-cols-2">
@@ -185,7 +206,14 @@ export default function AppsPage() {
       {viewStatus === 'loading' && <p role="status" className="text-sm text-muted-foreground">앱을 불러오는 중…</p>}
       {viewStatus === 'error' && <div className="flex flex-wrap items-center gap-3 text-sm text-muted-foreground"><p>연결을 확인한 뒤 다시 시도하세요.</p><button type="button" onClick={() => void loadApps()} className="underline underline-offset-4">다시 불러오기</button></div>}
       {viewStatus === 'ready' && (apps.length === 0
-        ? <p className="rounded-xl border border-dashed border-border px-5 py-12 text-center text-sm text-muted-foreground">아직 앱이 없습니다. 새 앱을 만들어 시뮬레이션을 시작하세요.</p>
+        ? <section className="rounded-xl border border-dashed border-border bg-card/50 px-5 py-12 text-center">
+          <h2 className="text-lg font-semibold">첫 앱을 시작해 보세요</h2>
+          <p className="mx-auto mt-2 max-w-md text-sm text-muted-foreground">디자인 방향을 둘러볼 수 있습니다. 앱을 만든 뒤에는 시뮬레이션과 정식 환경을 여기서 관리합니다.</p>
+          <div className="mt-5 flex flex-wrap justify-center gap-2">
+            <Link href="/design-check" className="rounded-lg border border-border px-4 py-2 text-sm font-medium hover:bg-muted">디자인 방향 둘러보기</Link>
+            <button type="button" onClick={() => setCreating(true)} className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground">새 앱 만들기</button>
+          </div>
+        </section>
         : <ul aria-label="앱 타일" className="grid gap-4 md:grid-cols-2">
           {apps.map((app) => <li key={app.slug}>
             <article className="h-full space-y-5 rounded-xl border border-border bg-card p-5 shadow-sm">
@@ -203,6 +231,9 @@ export default function AppsPage() {
                   <h3 className="text-sm font-semibold">🧪 시뮬레이션</h3>
                   <p className="text-sm text-muted-foreground">{simulationLabels[app.simulation.status]}</p>
                   {app.simulation.receipt && <p className="text-xs text-muted-foreground">최근 영수증 · {app.simulation.receipt}</p>}
+                  <button type="button" onClick={() => setSelectedApp(app)} className="inline-block text-sm font-medium text-primary underline-offset-4 hover:underline">
+                    시뮬레이션 보기
+                  </button>
                   {app.simulation.href && <a href={app.simulation.href} className="inline-block text-sm font-medium text-primary underline-offset-4 hover:underline">열기</a>}
                 </section>
                 <section aria-label={`${app.name} 정식 환경`} className="space-y-2 rounded-lg border border-border p-3">
@@ -218,4 +249,9 @@ export default function AppsPage() {
         </ul>)}
     </main>
   );
+}
+
+function AppSimulationDetails({ app, receipts, onBack }: { app: AppTile; receipts: readonly AppSimReceipt[]; onBack: () => void }) {
+  const client = useNexusClient();
+  return <AppSimLiveView appId={app.slug} appName={app.name} client={client} receipts={receipts} onBack={onBack} />;
 }

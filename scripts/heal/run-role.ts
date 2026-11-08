@@ -16,7 +16,7 @@ import {
   type HealTriageHistory,
   type PathExists,
 } from '../../src/self-implement/heal-triage.js';
-import { appendRunLedgerEntry, loadRunLedger, runLedgerDir, type RunLedgerEntry, type RunLedgerWriter } from '../../src/self-implement/run-ledger.js';
+import { appendRunLedgerEntry, loadRunLedger, parseNamespacedRunId, runLedgerDir, type RunLedgerEntry, type RunLedgerWriter } from '../../src/self-implement/run-ledger.js';
 import { readDoctorVisits } from '../../src/self-implement/doctor-visit.js';
 
 interface GraphContext {
@@ -394,9 +394,14 @@ export function roleResult(role: string, ctx: GraphContext, deps: HealRoleDeps =
     case 'observe-deeper': {
       const runId = typeof input.runId === 'string' ? input.runId : '';
       if (!runId) return withAddedFacts({ outcome: 'empty', reason: 'not-wired' }, []);
+      const namespaced = runId.includes('/') ? parseNamespacedRunId(runId) : null;
+      if (runId.includes('/') && !namespaced) {
+        return withAddedFacts({ outcome: 'fail', reason: `unsupported-namespaced-runId:${runId}` }, []);
+      }
+      const ledgerRunId = namespaced?.uuid ?? runId;
       const entries = deps.loadLedger
-        ? deps.loadLedger(runId)
-        : loadRunLedger(runId, deps.ledgerDir ?? (process.env.ELANOUS_STATE_DIR ? runLedgerDir(process.env.ELANOUS_STATE_DIR) : undefined));
+        ? deps.loadLedger(ledgerRunId)
+        : loadRunLedger(ledgerRunId, deps.ledgerDir ?? (process.env.ELANOUS_STATE_DIR ? runLedgerDir(process.env.ELANOUS_STATE_DIR) : undefined));
       const filled = fillMissingGateFacts(signature, entries ?? []);
       if (filled.added.length === 0) return withAddedFacts({ outcome: 'empty', reason: 'no-new-facts' }, []);
       return withAddedFacts({ outcome: 'ok', signature: filled.signature }, filled.added);

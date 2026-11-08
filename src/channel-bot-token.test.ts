@@ -1,4 +1,5 @@
 import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -609,19 +610,19 @@ test('verify reports failure without exposing the token or fetch error', async (
     'telegram:1': { tokenRef: 'ref:secret:tg' },
   } }));
   setSecret('tg', marker);
-  const previousFetch = globalThis.fetch;
   const originalError = console.error;
   const lines: string[] = [];
-  globalThis.fetch = (async () => { throw new Error(marker); }) as unknown as typeof fetch;
   console.error = (...args) => { lines.push(args.join(' ')); };
   try {
-    const { verifyChannelBotTokens } = await import('../scripts/ops/channel-bot-token-migrate.js');
-    expect(await verifyChannelBotTokens()).toBe(false);
-    expect(lines).toEqual(['telegram: verification failed']);
-    expect(lines.join(' ')).not.toContain(marker);
+    await withFakeFetchDevice([{ url: `/bot${marker}/getMe`, response: () => { throw new Error(marker); } }], async (device) => {
+      const { verifyChannelBotTokens } = await import('../scripts/ops/channel-bot-token-migrate.js');
+      expect(await verifyChannelBotTokens()).toBe(false);
+      expect(lines).toEqual(['telegram: verification failed']);
+      expect(lines.join(' ')).not.toContain(marker);
+      expect(device.calls()).toHaveLength(1);
+    });
   } finally {
     console.error = originalError;
-    globalThis.fetch = previousFetch;
   }
 });
 
@@ -632,17 +633,12 @@ test('verify calls platform APIs with resolved tokens and prints only bot names'
   }, telegram: { botToken: 'stale' }, discord: { botToken: 'stale' } }));
   setSecret('tg', marker);
   setSecret('dc', marker);
-  const previousFetch = globalThis.fetch;
   const seen: string[] = [];
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    seen.push(String(input).includes('/getMe') ? 'telegram' : 'discord');
-    if (seen.at(-1) === 'telegram') expect(String(input)).toContain(`/bot${marker}/getMe`);
-    expect(init?.headers).toEqual(seen.at(-1) === 'discord' ? { Authorization: `Bot ${marker}` } : undefined);
-    return new Response(JSON.stringify(seen.at(-1) === 'telegram'
-      ? { ok: true, result: { username: 'tg_bot' } }
-      : { username: 'dc_bot' }), { status: 200 });
-  }) as typeof fetch;
-  try {
+  await withFakeFetchDevice([
+    { url: `/bot${marker}/getMe`, response: (request) => { seen.push('telegram'); expect(request.headers.authorization).toBeUndefined(); return Response.json({ ok: true, result: { username: 'tg_bot' } }); } },
+    { url: 'https://discord.com/api/v10/users/@me', response: (request) => { seen.push('discord'); expect(request.headers.authorization).toBe(`Bot ${marker}`); return Response.json({ username: 'dc_bot' }); } },
+  ], async (device) => {
+    {
     const { verifyChannelBotTokens } = await import('../scripts/ops/channel-bot-token-migrate.js');
     const originalLog = console.log;
     const lines: string[] = [];
@@ -651,5 +647,7 @@ test('verify calls platform APIs with resolved tokens and prints only bot names'
     expect(seen).toEqual(['telegram', 'discord']);
     expect(lines).toEqual(['telegram: tg_bot', 'discord: dc_bot']);
     expect(lines.join(' ')).not.toContain(marker);
-  } finally { globalThis.fetch = previousFetch; }
+    expect(device.calls()).toHaveLength(2);
+    }
+  });
 });

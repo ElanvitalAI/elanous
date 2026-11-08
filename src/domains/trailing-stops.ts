@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── 다이나믹 트레일링 손절 (일반화 · 도구화 · P2c · 2026-07-09) ─────────
 //
 // koru-trailing.ts §4의 트레일링 손절을 임의 레버리지 종목에 적용 가능하게
@@ -7,7 +8,7 @@
 // P3 에서 koru-trailing 익절 래더·state 와 완전 통합 예정. 여기선 손절 계산+도구화.
 // 설계: 내부 문서 `DESIGN-leverage-decision-agent-2026-07-09` §9(P2c).
 
-import type { LLMToolSpec } from '../llm.js';
+
 
 // 기준 손절 폭(koru-trailing §4 유래). tightness 로 변조.
 export const BASE_TRIM25_PCT = 0.05;   // 고가 -5%  → 25% 현금화

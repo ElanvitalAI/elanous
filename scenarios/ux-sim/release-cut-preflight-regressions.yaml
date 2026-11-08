@@ -1,0 +1,31 @@
+id: release-cut-preflight-regressions
+title: 0.3.6 cut failures are blocked before live gate work
+cases:
+  - id: stale-cli-image-pin
+    trigger: legacy graph CLI omits gateImagePin
+    expected: "blocked · gateImagePin cut-commit is required for a policy-selected release gate"
+    productionTest: "scripts/release-loop/gate-node.test.ts :: release policy gate image pin is explicit and rejects unsupported policies"
+  - id: foreign-release-branch-owner
+    trigger: release branch tip belongs to another graph run
+    expected: "blocked · refusing to replace a foreign release branch"
+    productionTest: "scripts/release-loop/release-branch.test.ts :: RELEASE-NODE-IDEMPOTENT foreign run"
+  - id: gate-run-scope-missing
+    trigger: policy-selected Pod gate has no graph run scope
+    expected: "blocked · pod-gate-missing-run-scope"
+    productionTest: "scripts/release-loop/gate-node.test.ts :: image-pin-unscoped entry guard"
+  - id: hq-shard-ledger-missing
+    trigger: remote Pod pool is configured without HQ ledger path and environment fingerprint
+    expected: "blocked · remote gate refused: HQ shard ledger is not configured"
+    productionTest: "scripts/release-loop/gate-node.test.ts :: remote shard ledger preflight"
+  - id: cut-change-invalidates-all-shards
+    trigger: cut diff from 63ff4cc9 to d4df149e contains non-TypeScript docs and scenario inputs, so production impact analysis fails closed to the full test inventory
+    expected: "blocked reuse · 0/81 receipts reused · 81/81 radius-invalidated"
+    priorHead: 63ff4cc9ea8cf1c0c5ad451c8b35a34224a89507
+    receiptRosterHead: d4df149e3ae9e8862033ebbb1a1d52c0ff65ffd0
+    receiptRosterFixture: scenarios/ux-sim/fixtures/release-cut-0306-shards.json
+    changedFiles:
+      - docs/TECH-harness-map-2026-10-06.md
+      - scenarios/ux-sim/rla-arg-adaptive-heal.yaml
+      - scripts/release-loop/gate-node.ts
+      - src/graph-runner/runner.ts
+    productionPath: changedFilesBetween -> gateReceiptChangedFileImpact(changed-non-ts-input) -> planGateReceiptRadius -> planGateShardDispatch(radius-invalidated)

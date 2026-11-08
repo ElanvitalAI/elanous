@@ -1,6 +1,6 @@
 import { resolveModelContextWindow } from '../models/context-window.js';
 import { estimateMessagesTokens, type MessageLike } from '../tokens.js';
-import type { ChatAutoCompactConfig } from '../user-config.js';
+import type { ChatAutoCompactConfig } from '../user-config/chat.js';
 
 export interface AutoCompactDecision {
   fire: boolean;

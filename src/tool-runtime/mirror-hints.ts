@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── VW-term-infra Bundle B-1 · B1-3 — mirror hint metadata ──
 //
 // Phase 5 "user chord ↔ LLM tool" symmetry 의 첫 단계 — **metadata
@@ -14,7 +15,7 @@
 // 단방향 metadata · symmetry registry 는 나중 · 지금은 LLM 응답에
 // "이 tool 사용시 user 는 ^B p 로도 부를 수 있음" 힌트 공급만.
 
-import type { LLMToolSpec } from '../llm.js';
+
 
 /** Marker field added to LLMToolSpec when a chord hint is attached.
  *  Underscore prefix · type widening avoids clashing with user-supplied

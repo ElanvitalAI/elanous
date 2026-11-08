@@ -1,5 +1,6 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { expect, test } from 'bun:test';
-import type { LLMProvider, LLMToolSpec } from '../llm.js';
+import type { LLMProvider } from '../llm.js';
 import type { AgentSpawnOpts } from './types.js';
 import { createGlobalSubagentCallable } from './subagent-callable.js';
 import type { AgentRegistry } from './registry.js';

@@ -83,7 +83,8 @@ export function createHiggsfieldBackend(options: HiggsfieldBackendOptions): Shoo
 
   return {
     async submit(command: ShootCommand): Promise<string> {
-      const argv = [cliPath, 'generate', 'create', command.jobType, ...command.args, '--duration', String(command.durationSeconds)];
+      const argv = [cliPath, 'generate', 'create', command.jobType, ...command.args,
+        ...(command.durationSeconds === undefined ? [] : ['--duration', String(command.durationSeconds)])];
       requirePrompt(command.args);
       requireSpendAllowed(argv, allowSpend);
       return parseJobId(await runOrThrow(options.runner, argv, { timeoutMs: submitTimeoutMs }));

@@ -7,7 +7,6 @@ body-dynamic-import	apps/pwa/src/components/live/LiveBoard.test.tsx	4
 body-dynamic-import	apps/pwa/src/components/live/LiveMaxStage.public.test.tsx	4
 body-dynamic-import	apps/pwa/src/components/observatory/subject-list.test.ts	4
 body-dynamic-import	apps/pwa/src/components/ops/ReleaseFlow.test.tsx	3
-body-dynamic-import	apps/pwa/src/components/settings/MenuVisibilityCard.test.tsx	1
 body-dynamic-import	apps/pwa/src/components/terminal/PtyLiveView.test.tsx	5
 body-dynamic-import	apps/pwa/src/components/terminal/TerminalPanel.interaction.test.tsx	6
 body-dynamic-import	apps/pwa/src/components/terminal/TerminalPanel.test.tsx	5
@@ -40,7 +39,6 @@ body-dynamic-import	src/autopilot/pty-control-loop.test.ts	2
 body-dynamic-import	src/autopilot/system-escalate-surface.test.ts	3
 body-dynamic-import	src/boot/daemon-tools/index.test.ts	2
 body-dynamic-import	src/channel-bot-token.test.ts	4
-body-dynamic-import	src/cli/autopilot-cli.test.ts	1
 body-dynamic-import	src/cli/config-test-sync.test.ts	1
 body-dynamic-import	src/cli/connector-cli.test.ts	1
 body-dynamic-import	src/cli/msg-cli.test.ts	7
@@ -48,11 +46,9 @@ body-dynamic-import	src/cli/pod-cli.test.ts	2
 body-dynamic-import	src/cli/provider-cli.test.ts	2
 body-dynamic-import	src/cli/pty-drive-size.test.ts	2
 body-dynamic-import	src/cli/pty-record-cli.test.ts	5
-body-dynamic-import	src/cli/pty-takeover-cli.test.ts	1
 body-dynamic-import	src/cli/release-cli-parity.test.ts	2
-body-dynamic-import	src/cli/release-cli.test.ts	1
 body-dynamic-import	src/cli/schedule-cli.test.ts	3
-body-dynamic-import	src/cli/tasks-cli.test.ts	2
+body-dynamic-import	src/cli/tasks-cli.test.ts	1
 body-dynamic-import	src/domains/conatus-backtest.test.ts	5
 body-dynamic-import	src/domains/conatus-panel.test.ts	3
 body-dynamic-import	src/domains/conatus-trend.test.ts	4
@@ -61,16 +57,13 @@ body-dynamic-import	src/domains/finance-conatus-native.test.ts	9
 body-dynamic-import	src/execution-loop/dispatch-task-entrances.test.ts	1
 body-dynamic-import	src/execution-loop/gates.test.ts	1
 body-dynamic-import	src/harness/draft-metric-adapter.test.ts	1
-body-dynamic-import	src/harness/harness-cli-command.test.ts	5
 body-dynamic-import	src/harness/harness-pod-dispatch.test.ts	1
 body-dynamic-import	src/hq/hq.test.ts	1
 body-dynamic-import	src/hq/promote.test.ts	1
-body-dynamic-import	src/index.test.ts	25
 body-dynamic-import	src/intake-plane/sketch-ledger.test.ts	1
 body-dynamic-import	src/llm/judge-layer.test.ts	1
 body-dynamic-import	src/llm/local-manager/benchmark/benchmark.test.ts	3
 body-dynamic-import	src/llm/zai-coding-plan.test.ts	1
-body-dynamic-import	src/loops/orchestrator/tick.test.ts	3
 body-dynamic-import	src/nexus/api/ops-api.test.ts	3
 body-dynamic-import	src/nexus/api/seat-requests.test.ts	1
 body-dynamic-import	src/nexus/index.test.ts	1
@@ -95,10 +88,8 @@ body-dynamic-import	src/self-implement/repo-provision.test.ts	6
 body-dynamic-import	src/self-implement/seams.test.ts	2
 body-dynamic-import	src/steward/rejudge-tick.test.ts	1
 body-dynamic-import	src/steward/rescue.test.ts	1
-body-dynamic-import	src/task-agent/actions.test.ts	1
 body-dynamic-import	src/task-agent/live-moves.test.ts	14
 body-dynamic-import	src/task-agent/run-adopt.test.ts	2
-body-dynamic-import	src/task-orchestrator/generator-prompt.test.ts	3
 body-dynamic-import	src/task-orchestrator/surfaces/pod-child-default.test.ts	1
 body-dynamic-import	src/task-orchestrator/surfaces/pod-ledger-prod-sink.test.ts	1
 body-dynamic-import	src/task-orchestrator/surfaces/pod-ta-land-owner.test.ts	1
@@ -123,9 +114,7 @@ body-dynamic-import	test/daemon-multi-llm-persona-binding.test.ts	3
 body-dynamic-import	test/daemon-runtime-read-through.test.ts	3
 body-dynamic-import	test/dashboard-data.test.ts	3
 body-dynamic-import	test/dashboard-seat-local-instructions.test.ts	1
-body-dynamic-import	test/dashboard-slash-registry.test.ts	1
 body-dynamic-import	test/dashboard-turn-typeahead-echo.test.ts	1
-body-dynamic-import	test/dashboard-voice-chat-realtime-toggle.test.ts	2
 body-dynamic-import	test/discord-self-message.test.ts	3
 body-dynamic-import	test/discord/webhook-persona-adapter.test.ts	1
 body-dynamic-import	test/dispatch/continuation-turn-runner.test.ts	1
@@ -133,7 +122,6 @@ body-dynamic-import	test/elanous-config-dir.test.ts	3
 body-dynamic-import	test/elanous-daemon-lock.test.ts	3
 body-dynamic-import	test/elanous-state-dir-isolation.test.ts	5
 body-dynamic-import	test/global-test-flag.test.ts	4
-body-dynamic-import	test/goal-supervisor-fill.test.ts	1
 body-dynamic-import	test/icon-migration-batch.test.ts	6
 body-dynamic-import	test/identity-env.test.ts	6
 body-dynamic-import	test/instance-provision.test.ts	4
@@ -207,9 +195,7 @@ chdir-without-restore	src/agent-mission/driver-workdir.test.ts	2
 chdir-without-restore	src/agent/coding-core-tools.test.ts	1
 chdir-without-restore	src/cli/logs-cli.test.ts	1
 chdir-without-restore	src/cli/machine-cli.test.ts	1
-chdir-without-restore	src/cli/release-cli.test.ts	5
 chdir-without-restore	src/cli/repo-cli.test.ts	1
-chdir-without-restore	src/dashboard/index.test.ts	1
 chdir-without-restore	src/harness/harness-write-boundary.test.ts	1
 chdir-without-restore	src/index.test.ts	1
 chdir-without-restore	src/nexus/api/health.test.ts	1
@@ -251,5 +237,6 @@ env-without-restore	test/undo-turn-apply-integration.test.ts	3
 env-without-restore	test/undo-turn.test.ts	3
 short-child-timeout	scripts/webclone/measure-fidelity.test.ts	1
 short-child-timeout	src/autopilot/build/integrity-gate.test.ts	3
+short-child-timeout	src/autopilot/pr-manager.test.ts	2
 short-child-timeout	src/webclone/archive-run.test.ts	1
 short-child-timeout	test/tsc-baseline-comparison.test.ts	1

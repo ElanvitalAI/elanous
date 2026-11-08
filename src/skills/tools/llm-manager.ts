@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // H6 P2 Bundle 1 · Local LLM Manager LLM tools.
 //
 // 2 read-only T1 tools for surfacing the Tailscale fleet inventory:
@@ -9,7 +10,7 @@
 // Output contract matches the rest of the H6 family:
 //   `{ output: string; metadata: object; isError?: true }`.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   getInventory,
   refreshInventory,

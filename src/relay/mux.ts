@@ -5,9 +5,10 @@ export type MuxFrame =
   | { streamId: number; kind: 'open'; protocol: 'http'; method: string; path: string; headers: Record<string, string> }
   | { streamId: number; kind: 'open'; protocol: 'ws'; path: string; headers: Record<string, string> }
   | { streamId: number; kind: 'data'; data: Uint8Array }
+  | { streamId: number; kind: 'end' }
   | { streamId: number; kind: 'close'; reason: string };
 
-// u32 BE length (remaining bytes), u32 BE stream ID, u8 kind (1=open, 2=data, 3=close).
+// u32 BE length (remaining bytes), u32 BE stream ID, u8 kind (1=open, 2=data, 3=close, 4=end).
 // Open: u8 protocol (1=http, 2=ws), [http: u16 method bytes + UTF-8 method],
 // u32 path bytes + UTF-8 path, u16 header count, then u16 name bytes + UTF-8 name,
 // u16 value bytes + UTF-8 value per header. Data: remaining raw bytes.
@@ -71,11 +72,31 @@ function validId(id: number): boolean { return Number.isInteger(id) && id >= 0 &
 
 /** Share one instance between the encoder and decoder of a single endpoint. */
 export class MuxStreamState {
-  private readonly active = new Set<number>();
+  private readonly active = new Map<number, { outboundClosed: boolean; inboundClosed: boolean }>();
 
-  isOpen(id: number): boolean { return this.active.has(id); }
-  opened(id: number): void { this.active.add(id); }
-  closed(id: number): void { this.active.delete(id); }
+  isOpen(id: number): boolean {
+    return this.active.has(id);
+  }
+
+  canSend(id: number, direction: 'outbound' | 'inbound'): boolean {
+    const state = this.active.get(id);
+    return !!state && !state[direction === 'outbound' ? 'outboundClosed' : 'inboundClosed'];
+  }
+
+  opened(id: number): void {
+    if (!this.active.has(id)) this.active.set(id, { outboundClosed: false, inboundClosed: false });
+  }
+
+  ended(id: number, direction: 'outbound' | 'inbound'): void {
+    const state = this.active.get(id);
+    if (!state) return;
+    if (direction === 'outbound') state.outboundClosed = true;
+    else state.inboundClosed = true;
+  }
+
+  closed(id: number): void {
+    this.active.delete(id);
+  }
 }
 
 /** No network I/O; shares stream IDs with the receiving decoder when supplied a state. */
@@ -84,8 +105,10 @@ export class MuxEncoder {
 
   encode(frame: MuxFrame): Result<Uint8Array> {
     if (!frame || !validId(frame.streamId)) return reject('invalid stream ID');
-    if (frame.kind !== 'open' && frame.kind !== 'data' && frame.kind !== 'close') return reject('unknown frame kind');
-    if (frame.kind === 'open' ? this.streams.isOpen(frame.streamId) : !this.streams.isOpen(frame.streamId)) {
+    if (frame.kind !== 'open' && frame.kind !== 'data' && frame.kind !== 'close' && frame.kind !== 'end') return reject('unknown frame kind');
+    if (frame.kind === 'open' ? this.streams.isOpen(frame.streamId)
+      : frame.kind === 'close' ? !this.streams.isOpen(frame.streamId)
+        : !this.streams.canSend(frame.streamId, 'outbound')) {
       return reject(frame.kind === 'open' ? 'stream already open' : 'stream not open');
     }
     const writer = new Writer();
@@ -111,12 +134,15 @@ export class MuxEncoder {
     } else if (frame.kind === 'close') {
       writer.number(3, 1);
       if (!writer.text(frame.reason, 2)) return reject('invalid reason');
+    } else if (frame.kind === 'end') {
+      writer.number(4, 1);
     }
     if (writer.length > MAX_MUX_FRAME_BYTES) return reject('frame exceeds 1MB');
     const out = writer.finish();
     new DataView(out.buffer).setUint32(0, out.length - 4, false);
     if (frame.kind === 'open') this.streams.opened(frame.streamId);
-    if (frame.kind === 'close') this.streams.closed(frame.streamId);
+    else if (frame.kind === 'close') this.streams.closed(frame.streamId);
+    else if (frame.kind === 'end') this.streams.ended(frame.streamId, 'outbound');
     return { ok: true, value: out };
   }
 }
@@ -134,8 +160,10 @@ export class MuxDecoder {
     if (length !== bytes.length - 4) return reject(length > bytes.length - 4 ? 'truncated frame' : 'trailing frame bytes');
     const streamId = reader.number(4)!;
     const kind = reader.number(1)!;
-    if (kind !== 1 && kind !== 2 && kind !== 3) return reject('unknown frame kind');
-    if (kind === 1 ? this.streams.isOpen(streamId) : !this.streams.isOpen(streamId)) {
+    if (kind !== 1 && kind !== 2 && kind !== 3 && kind !== 4) return reject('unknown frame kind');
+    if (kind === 1 ? this.streams.isOpen(streamId)
+      : kind === 3 ? !this.streams.isOpen(streamId)
+        : !this.streams.canSend(streamId, 'inbound')) {
       return reject(kind === 1 ? 'stream already open' : 'stream not open');
     }
     try {
@@ -166,14 +194,17 @@ export class MuxDecoder {
       } else if (kind === 2) {
         frame = { streamId, kind: 'data', data: bytes.slice(reader.offset) };
         reader.offset = bytes.length;
-      } else {
+      } else if (kind === 3) {
         const reason = reader.text(2);
         if (reason === undefined) return reject('truncated frame');
         frame = { streamId, kind: 'close', reason };
+      } else {
+        frame = { streamId, kind: 'end' };
       }
       if (reader.offset !== bytes.length) return reject('trailing frame bytes');
       if (kind === 1) this.streams.opened(streamId);
-      if (kind === 3) this.streams.closed(streamId);
+      else if (kind === 3) this.streams.closed(streamId);
+      else if (kind === 4) this.streams.ended(streamId, 'inbound');
       return { ok: true, value: frame };
     } catch {
       return reject('invalid UTF-8 frame');

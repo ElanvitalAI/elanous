@@ -7,8 +7,17 @@ import { getDefaultLogStore, logsDbPath, type LogStoreRow } from './log-store.js
 import { readLogInstances } from './instance-registry.js';
 import { redactLogRecord } from './redaction.js';
 import type { LogRecord } from './record.js';
-import { matchIngestAuthorization, revokeIngestToken } from '../../nexus/api/ingest-token.js';
 import { acquireLockAsync, withFileLockSync } from '../../storage/file-lock.js';
+
+type IngestTokenApi = {
+  matchIngestAuthorization(request: Request): { name: string } | null;
+  revokeIngestToken(name: string): boolean;
+};
+
+function ingestTokenApi(): IngestTokenApi {
+  const modulePath: string = '../../nexus/api/ingest-token.js';
+  return require(modulePath) as IngestTokenApi;
+}
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const BATCH_LIMIT = 200;
@@ -257,7 +266,7 @@ export async function handleLogFederationBatch(req: Request, deps: {
   authorize?: (request: Request) => string | null;
   store?: () => ReturnType<typeof getDefaultLogStore>;
 } = {}): Promise<Response> {
-  const instance = (deps.authorize ?? ((request) => matchIngestAuthorization(request)?.name ?? null))(req);
+  const instance = (deps.authorize ?? ((request) => ingestTokenApi().matchIngestAuthorization(request)?.name ?? null))(req);
   if (!instance) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'content-type': 'application/json' } });
   if (req.method !== 'POST') return new Response(JSON.stringify({ error: 'method not allowed' }), { status: 405, headers: { 'content-type': 'application/json' } });
   let body: unknown;
@@ -321,12 +330,12 @@ export async function handleLogFederationRevoke(req: Request, deps: { authorize?
   const bearer = /^Bearer ([A-Za-z0-9_-]+)$/.exec(authorization)?.[1];
   if (!bearer) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'content-type': 'application/json' } });
   const tokenHash = createHash('sha256').update(bearer).digest('hex');
-  const instance = (deps.authorize ?? ((request) => matchIngestAuthorization(request)?.name ?? null))(req);
+  const instance = (deps.authorize ?? ((request) => ingestTokenApi().matchIngestAuthorization(request)?.name ?? null))(req);
   if (instance) {
     const receipts = readRevocationReceipts();
     receipts[tokenHash] = instance;
     writePrivate(revocationReceiptsPath(), JSON.stringify({ receipts }, null, 2) + '\n');
-    revokeIngestToken(instance);
+    ingestTokenApi().revokeIngestToken(instance);
     return new Response(JSON.stringify({ ok: true, revoked: instance }), { status: 200, headers: { 'content-type': 'application/json' } });
   }
   const revokedInstance = readRevocationReceipts()[tokenHash];

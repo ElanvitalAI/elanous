@@ -1,5 +1,7 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { simCli } from '../../src/ux-sim/in-process-cli.js';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,7 +11,7 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-co
 import { setSchedule } from '../../src/release-loop/release-schedule.js';
 import { releaseReadiness } from './release-readiness.js';
 import { cutChecklistGate } from '../../src/release-loop/checklist.js';
-import { cadencePublishAt, formatCountdown, formatPreflight, formatReleaseCountdown, isPostPublishCell, releaseCountdown as scheduleReleaseCountdown, releaseGateMeasure, releasePreflight, runReleaseCountdown, type PreflightDeps } from './preflight.js';
+import { assertReleaseCliFresh, cadencePublishAt, formatCountdown, formatPreflight, formatReleaseCountdown, isPostPublishCell, releaseCountdown as scheduleReleaseCountdown, releaseGateMeasure, releasePreflight, runReleaseCountdown, scanGateImageRuntimeIdentity, type PreflightDeps } from './preflight.js';
 
 async function isolated(fn: (root: string) => Promise<void>): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-'));
@@ -21,6 +23,38 @@ async function isolated(fn: (root: string) => Promise<void>): Promise<void> {
 
 /** The real release-loop path shape (checklist-gate «and» gate) — copied from a finished 0.2.17 run. */
 const RELEASE_PATH = ['version-release', 'cutoff', 'checklist-gate', 'gate', 'mac-smoke', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'done'];
+
+test('gate image preflight accepts source-layer SHA changes only when every pool runtime and checkout match', () => {
+  const commit = 'a'.repeat(40);
+  const lock = 'candidate lockfile';
+  const lockHash = createHash('sha256').update(lock).digest('hex');
+  const pool = 'pool-a@aws1:1#k3d-elanous-registry:5051,pool-b@aws2:1#k3d-elanous-registry:5052';
+  const scan = (rows: Record<string, { checkoutSha?: string; baseImageDigest?: string } | null>) => {
+    const dockerRefs: string[] = [];
+    const result = scanGateImageRuntimeIdentity(commit, pool, {
+      gitShow: (_sha, path) => path === 'bun.lock' ? { status: 0, stdout: lock } : { status: 0, stdout: '1.4.2\n' },
+      remoteRun: (host, command) => {
+        if (command.includes('/tags/list')) return { status: 0, stdout: JSON.stringify({ tags: [commit.slice(0, 12)] }), stderr: '' };
+        dockerRefs.push(command);
+        const row = rows[host];
+        if (!row) return { status: 1, stdout: '', stderr: 'image unavailable' };
+        return { status: 0, stderr: '', stdout: `ELANOUS_GATE_IMAGE_PREFLIGHT ${JSON.stringify({
+          baseImageDigest: row.baseImageDigest ?? `sha256:${'c'.repeat(64)}`, lockHash, sourceLockHash: lockHash,
+          os: 'linux', architecture: 'x64', bunVersion: '1.4.2', checkoutSha: row.checkoutSha ?? commit,
+        })}` };
+      },
+    });
+    return { result, dockerRefs };
+  };
+
+  const ready = scan({ aws1: {}, aws2: {} });
+  expect(ready.result).toMatchObject({ checked: true, pools: ['pool-a', 'pool-b'] });
+  expect(ready.dockerRefs.every((command) => command.includes(`elanous-harness:${commit.slice(0, 12)}`) && command.includes('--pull=always'))).toBe(true);
+  expect(scan({ aws1: {}, aws2: { checkoutSha: 'd'.repeat(40) } }).result.checked).toBe(false);
+  expect(scan({ aws1: {}, aws2: { baseImageDigest: `sha256:${'e'.repeat(64)}` } }).result.checked).toBe(false);
+  expect(scan({ aws1: {}, aws2: null }).result.checked).toBe(false);
+  expect(scanGateImageRuntimeIdentity(commit, pool, { gitShow: () => ({ status: 1, stdout: '' }) }).checked).toBe(false);
+});
 
 /** A finished release-loop run whose `gate` node took `gateSeconds`: contexts/<n>.json is written when node n starts (mtime). */
 function fakeRun(runs: string, runId: string, version: string, startedAt: string, gateSeconds: number): void {
@@ -38,6 +72,62 @@ function fakeRun(runs: string, runId: string, version: string, startedAt: string
 }
 
 const NOW = new Date('2026-10-06T20:30:00.000Z');
+
+function gitAt(root: string, ...args: string[]): string {
+  const result = spawnSync('git', args, { cwd: root, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@example.invalid' } });
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+test('release run preflight rejects a parent CLI missing any release-path change in the cut', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-cli-fresh-'));
+  try {
+    gitAt(root, 'init', '-q', '-b', 'main');
+    mkdirSync(join(root, 'src/release-loop'), { recursive: true });
+    writeFileSync(join(root, 'src/release-loop/runner.ts'), 'const version = 1;\n');
+    gitAt(root, 'add', '.');
+    gitAt(root, 'commit', '-qm', 'parent CLI');
+    const cliCommit = gitAt(root, 'rev-parse', 'HEAD');
+    writeFileSync(join(root, 'src/release-loop/runner.ts'), 'const version = 2;\n');
+    gitAt(root, 'commit', '-qam', 'cut release change');
+    const cutCommit = gitAt(root, 'rev-parse', 'HEAD');
+
+    expect(() => assertReleaseCliFresh(root, cliCommit, cutCommit)).toThrow(/stale CLI.*src\/release-loop\/runner\.ts/u);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('release run preflight accepts a parent CLI with matching release files despite unrelated cut changes', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-cli-fresh-'));
+  try {
+    gitAt(root, 'init', '-q', '-b', 'main');
+    mkdirSync(join(root, 'graphs/release'), { recursive: true });
+    writeFileSync(join(root, 'graphs/release/release-loop.yaml'), 'entry_node: gate\n');
+    gitAt(root, 'add', '.');
+    gitAt(root, 'commit', '-qm', 'parent CLI');
+    const cliCommit = gitAt(root, 'rev-parse', 'HEAD');
+    writeFileSync(join(root, 'README.md'), 'unrelated\n');
+    gitAt(root, 'add', 'README.md');
+    gitAt(root, 'commit', '-qm', 'unrelated cut change');
+    const cutCommit = gitAt(root, 'rev-parse', 'HEAD');
+
+    expect(assertReleaseCliFresh(root, cliCommit, cutCommit)).toMatchObject({ ok: true, cliCommit, cutCommit, changedPaths: [] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('release run preflight fails closed when either CLI or cut revision cannot be established', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-cli-fresh-'));
+  try {
+    gitAt(root, 'init', '-q', '-b', 'main');
+    mkdirSync(join(root, 'src/release-loop'), { recursive: true });
+    writeFileSync(join(root, 'src/release-loop/runner.ts'), 'const version = 1;\n');
+    gitAt(root, 'add', '.');
+    gitAt(root, 'commit', '-qm', 'parent CLI');
+    const cliCommit = gitAt(root, 'rev-parse', 'HEAD');
+
+    expect(() => assertReleaseCliFresh(root, undefined, cliCommit)).toThrow(/CLI revision is unknown/u);
+    expect(() => assertReleaseCliFresh(root, cliCommit, 'f'.repeat(40))).toThrow(/cut revision cannot be resolved/u);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('release countdown lays out T−120/T−60/T−30/T0 and never claims that a step ran', () => {
   const cutAt = '2026-10-07T06:00:00.000Z';
@@ -65,7 +155,7 @@ function deps(root: string, extra: Partial<PreflightDeps> = {}): PreflightDeps {
     gitIgnoredExportCheck: async () => 0,
     releaseNotesCheck: async () => 1,
     pwaBuildCheck: async () => ({ ok: true, detail: 'fixture build passed', commit: 'b'.repeat(40) }),
-    gateImageTagCheck: () => ({ checked: true, pools: ['pool-test'] }),
+    gateImageRuntimeCheck: () => ({ checked: true, pools: ['pool-test'] }),
     releaseRunDeps: { freezeRoot: root },
     publishAt: '2026-10-06T23:30:00.000Z',
     ...extra,
@@ -128,8 +218,8 @@ test('RELEASE-PREFLIGHT-CATCH-FOUR: each missing/corrupt cutoff prerequisite blo
   }));
   expect(mismatchedBuild.findings.find((finding) => finding.check === 'pwa-build')).toMatchObject({ level: 'block', message: expect.stringContaining('SHA 불일치') });
 
-  const image = await releasePreflight('0.2.18', deps(root, { ...base, countdown: true, gateImageTagCheck: () => ({ checked: true, pools: [] }) }));
-  expect(image.findings.find((finding) => finding.check === 'gate-image')).toMatchObject({ level: 'block', message: expect.stringContaining('어느 풀에도 없다') });
+  const image = await releasePreflight('0.2.18', deps(root, { ...base, countdown: true, gateImageRuntimeCheck: () => ({ checked: true, pools: [] }) }));
+  expect(image.findings.find((finding) => finding.check === 'gate-image')).toMatchObject({ level: 'block', message: expect.stringContaining('확인한 풀이 없다') });
 }));
 
 test('RELEASE-PREFLIGHT-CATCH-FOUR: countdown assigns all four findings to T−60', () => isolated(async (root) => {
@@ -332,13 +422,13 @@ test('real CLI: without release.loop.gatePodPool, preflight surfaces the actual 
   writeFileSync(join(root, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: '2026-10-06T11:47:18.214Z' }));
   try {
     const repo = join(import.meta.dir, '../..');
-    const env = { ...process.env, HOME: home, ELANOUS_STATE_DIR: root };
-    const cli = (...args: string[]) => spawnSync('bun', [join(repo, 'bin/elanous.mjs'), '--config-dir', root, 'release', ...args], { cwd: repo, encoding: 'utf8', env });
-    const dry = cli('run', '--version', '0.2.18', '--dry-run', '--json');
+    const env = { HOME: home };
+    const cli = (...args: string[]) => simCli(['--config-dir', root, 'release', ...args], { allowPaths: [['release', 'preflight'], ['release', 'run']], cwd: repo, env });
+    const dry = await cli('run', '--version', '0.2.18', '--dry-run', '--json');
     const dryError = (JSON.parse(dry.stdout.trim().split('\n').at(-1)!) as { error: string }).error;
     expect(dryError).toContain('release.loop.gatePodPool is required');
-    const run = cli('preflight', '--version', '0.2.18', '--json');
-    expect(run.status).toBe(1);
+    const run = await cli('preflight', '--version', '0.2.18', '--json');
+    expect(run.exitCode).toBe(1);
     const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { findings: Array<{ check: string; level: string; message: string }> };
     const finding = result.findings.find((f) => f.check === 'run-input')!;
     expect(finding.level).toBe('block');
@@ -370,7 +460,7 @@ test('a scheduled-start checklist that refuses more than the cut judgement is st
   expect(finding.message).toContain('releaseReadiness');
 }));
 
-test('real CLI: a valid release.loop config passes the run-input check end to end', () => {
+test('real CLI: a valid release.loop config passes the run-input check end to end', async () => {
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-cli-ok-'));
   const root = join(home, '.elanous');
   mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
@@ -378,7 +468,7 @@ test('real CLI: a valid release.loop config passes the run-input check end to en
   writeFileSync(join(root, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: '2026-10-06T11:47:18.214Z' }));
   try {
     const repo = join(import.meta.dir, '../..');
-    const run = spawnSync('bun', [join(repo, 'bin/elanous.mjs'), '--config-dir', root, 'release', 'preflight', '--version', '0.2.18', '--json'], { cwd: repo, encoding: 'utf8', env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: root } });
+    const run = await simCli(['--config-dir', root, 'release', 'preflight', '--version', '0.2.18', '--json'], { allowPaths: [['release', 'preflight'], ['release', 'run']], cwd: repo, env: { HOME: home } });
     const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { previousVersion: string; findings: Array<{ check: string; level: string; message: string }> };
     const finding = result.findings.find((f) => f.check === 'run-input')!;
     expect(finding.level).toBe('ok');
@@ -387,7 +477,7 @@ test('real CLI: a valid release.loop config passes the run-input check end to en
   } finally { rmSync(home, { recursive: true, force: true }); }
 }, 180_000);
 
-test('a live run.lock (already-running) refuses the scheduled start → ⛔ and the CLI exits 1', () => {
+test('a live run.lock (already-running) refuses the scheduled start → ⛔ and the CLI exits 1', async () => {
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-running-'));
   const root = join(home, '.elanous');
   mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
@@ -397,12 +487,12 @@ test('a live run.lock (already-running) refuses the scheduled start → ⛔ and 
   writeFileSync(join(root, 'release', '0.2.18', 'run.lock'), JSON.stringify({ pid: process.pid }));
   try {
     const repo = join(import.meta.dir, '../..');
-    const run = spawnSync('bun', [join(repo, 'bin/elanous.mjs'), '--config-dir', root, 'release', 'preflight', '--version', '0.2.18', '--json'], { cwd: repo, encoding: 'utf8', env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: root } });
+    const run = await simCli(['--config-dir', root, 'release', 'preflight', '--version', '0.2.18', '--json'], { allowPaths: [['release', 'preflight'], ['release', 'run']], cwd: repo, env: { HOME: home } });
     const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { verdict: string; findings: Array<{ check: string; level: string; message: string }> };
     const finding = result.findings.find((f) => f.message.includes('already-running'))!;
     expect(finding.level).toBe('block');
     expect(result.verdict).toBe('block');
-    expect(run.status).toBe(1);
+    expect(run.exitCode).toBe(1);
   } finally { rmSync(home, { recursive: true, force: true }); }
 }, 180_000);
 
@@ -421,7 +511,7 @@ test('run after the cut: judges at the stored cut, not now (land-by between cut 
   expect(finding.message).not.toContain('releaseReadiness');
 }));
 
-test('real preflight CLI scans the pinned origin/main tree and blocks its exported crown comment', () => {
+test('real preflight CLI scans the pinned origin/main tree and blocks its exported crown comment', async () => {
   const privateMarker = String.fromCodePoint(0x1f451);
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-main-cli-'));
   const repo = join(home, 'repo');
@@ -453,9 +543,8 @@ test('real preflight CLI scans the pinned origin/main tree and blocks its export
     const workingTreeContent = `// ${privateMarker} working-tree-only marker\nexport const safe = true;\nexport const marker = '${privateMarker}';\n`;
     writeFileSync(join(repo, 'src/leak.ts'), workingTreeContent);
     const mainStatus = git(['status', '--porcelain']);
-    const sourceRepo = join(import.meta.dir, '../..');
-    const result = spawnSync('bun', [join(sourceRepo, 'bin/elanous.mjs'), '--config-dir', config, 'release', 'preflight', '--version', '0.2.18', '--json'], {
-      cwd: repo, encoding: 'utf8', env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: config, ELANOUS_EXPORT_REDACTIONS: redactions },
+    const result = await simCli(['--config-dir', config, 'release', 'preflight', '--version', '0.2.18', '--json'], {
+      allowPaths: [['release', 'preflight'], ['release', 'run']], cwd: repo, env: { HOME: home, ELANOUS_EXPORT_REDACTIONS: redactions },
     });
     const output = JSON.parse(result.stdout.trim().split('\n').at(-1)!) as { exportCheck: { mainSha: string; leaks: number; codeLiterals: number }; findings: Array<{ check: string; level: string; message?: string }> };
     expect(output.exportCheck).toMatchObject({ mainSha, leaks: 1, codeLiterals: 1 });
@@ -464,7 +553,7 @@ test('real preflight CLI scans the pinned origin/main tree and blocks its export
     expect(git(['rev-parse', 'origin/main'])).toBe(mainSha);
     expect(git(['status', '--porcelain'])).toBe(mainStatus);
     expect(readFileSync(join(repo, 'src/leak.ts'), 'utf8')).toBe(workingTreeContent);
-    expect(result.status).toBe(1);
+    expect(result.exitCode).toBe(1);
   } finally { rmSync(home, { recursive: true, force: true }); }
 }, 60_000);
 
@@ -590,7 +679,7 @@ test('RELEASE-COUNTDOWN-SEQUENCE: T−120 노트 0줄은 ⛔ notes-empty, T−60
   expect(formatCountdown(slotRed).at(-1)).toStartWith('⛔ 판정: 평가 중지 — T-60 빨강');
 }));
 
-test('real CLI: release preflight --countdown 은 생산 진입점에서 T−120→T0 단계와 판정 한 줄을 낸다', () => {
+test('real CLI: release preflight --countdown 은 생산 진입점에서 T−120→T0 단계와 판정 한 줄을 낸다', async () => {
   const home = mkdtempSync(join(tmpdir(), 'release-countdown-cli-'));
   const root = join(home, '.elanous');
   mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
@@ -604,8 +693,8 @@ test('real CLI: release preflight --countdown 은 생산 진입점에서 T−120
   resetElanousConfigDir();
   try {
     const repo = join(import.meta.dir, '../..');
-    const run = spawnSync('bun', [join(repo, 'bin/elanous.mjs'), '--config-dir', root, 'release', 'preflight', '--version', '0.2.18', '--countdown', '--json'], {
-      cwd: repo, encoding: 'utf8', timeout: 180_000, env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: root },
+    const run = await simCli(['--config-dir', root, 'release', 'preflight', '--version', '0.2.18', '--countdown', '--json'], {
+      mode: 'spawn', allowPaths: [['release', 'preflight'], ['release', 'run']], cwd: repo, env: { HOME: home }, timeoutMs: 180_000,
     });
     const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as {
       steps: Array<{ stage: string; level: string; skipped: boolean }>; verdict: string; nonconformance: unknown[]; manualCancel: { totalResponsibleSeconds: number };
@@ -615,6 +704,6 @@ test('real CLI: release preflight --countdown 은 생산 진입점에서 T−120
       totalResponsibleSeconds: 8, ldSeconds: 5,
       windowEndAt: '2026-10-06T21:00:00.000Z', windowStartAt: '2026-10-06T20:59:47.000Z',
     });
-    expect(run.status).toBe(result.verdict === 'block' ? 1 : 0);
+    expect(run.exitCode).toBe(result.verdict === 'block' ? 1 : 0);
   } finally { rmSync(home, { recursive: true, force: true }); }
 }, 240_000);

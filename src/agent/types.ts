@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Agent runtime types ──
 //
 // Phase B: types only. No side effects — just the shapes shared between
@@ -7,7 +8,7 @@
 // Keep this file provider-agnostic: it depends on src/llm.ts for the
 // ContentBlock / LLMMessage shape, nothing else.
 
-import type { LLMMessage, LLMToolSpec, LLMProvider } from '../llm.js';
+import type { LLMMessage, LLMProvider } from '../llm.js';
 import type { AgentUri } from '../mss/uri/brand.js';
 
 /** Declarative description of an agent — what model to run, what

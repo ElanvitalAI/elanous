@@ -690,7 +690,7 @@ export function buildCliAgentTools(
   },
   trustedWorkingDirectory?: string,
 ): {
-  specs: import('../llm.js').LLMToolSpec[];
+  specs: import('../llm/tool-spec.js').LLMToolSpec[];
   dispatch: (name: string, args: Record<string, unknown>, context?: { signal?: AbortSignal }) => Promise<unknown>;
   workingDirectory: string;
 } {
@@ -700,7 +700,7 @@ export function buildCliAgentTools(
   const workingDirectory = trustedWorkingDirectory ?? process.cwd();
   const dispatchWorkingDirectory = (): string => trustedWorkingDirectory ?? process.cwd();
   const defaultSearchPath = trustedWorkingDirectory;
-  const specs: import('../llm.js').LLMToolSpec[] = [];
+  const specs: import('../llm/tool-spec.js').LLMToolSpec[] = [];
   const dispatchByName = new Map<string, (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>>();
   const resolveChildPath = (value: unknown): unknown =>
     typeof value === 'string' && !value.startsWith('/') ? resolve(dispatchWorkingDirectory(), value) : value;

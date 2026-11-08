@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // PLAN-codex-app-server-hermes-parity §5 Phase H1·6a (2026-05-16) —
 // `elanous_showroom_broadcast` MCP tool. Codex turn calls this with a
 // prompt + backend list; the daemon fans the prompt to each backend
@@ -14,7 +15,7 @@ import {
   type BroadcastInvocation,
   type BroadcastResult,
 } from '../showroom/daemon-broadcast.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime } from './types.js';
 
 export interface ElanousShowroomBroadcastArgs {

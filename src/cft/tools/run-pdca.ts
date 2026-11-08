@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.8 P1: RunPDCA LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   PDCA_PHASES,
   renderPdcaPhase,

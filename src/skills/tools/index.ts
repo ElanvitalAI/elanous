@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Skill execution tools ──
 //
 // A tool bridge for `executeSkill` so Claude Code-style SKILL.md files
@@ -36,7 +37,7 @@
 //     responsible for cleanup.
 
 import { spawn } from 'node:child_process';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { harnessCommandWriteReject, notifyHarnessCommandStart } from '../../harness/harness-write-boundary.js';
 import {
   createSeqTracker,

@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { streamCodexResponsesEvents } from '../src/llm';
 import { debug } from '../src/debug/log';
 import { isShapeRelevantRejection } from '../src/llm-request-shape';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 const endpoint = 'https://chatgpt.com/backend-api/codex/responses';
 const SECRET = 'SECRET-PROMPT-한글-7f3a9c';
@@ -11,20 +12,22 @@ const SECRET_ARG = 'SECRET-TOOL-ARG-b81e';
 const SECRET_OUT = 'SECRET-TOOL-OUTPUT-c42d';
 const SECRET_SYS = 'SECRET-INSTRUCTIONS-d913';
 
-let priorFetch: typeof fetch;
+let fetchDevice: FakeFetchDevice | undefined;
 let sentBodies: string[] = [];
 let priorRunId: string | undefined;
 let priorHostId: string | undefined;
 
 function installStatus(status: number, bodyText: string): void {
-  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
-    sentBodies.push(String(init?.body ?? ''));
+  fetchDevice?.restore();
+  fetchDevice = createFakeFetchDevice([{
+    url: '/backend-api/codex/responses', method: 'POST', response: (request) => {
+    sentBodies.push(request.body ?? '');
     if (status === 200) {
       const sse = 'data: {"type":"response.output_text.delta","delta":"ok"}\n\ndata: [DONE]\n\n';
       return new Response(new TextEncoder().encode(sse), { status: 200, headers: { 'content-type': 'text/event-stream' } });
     }
     return new Response(bodyText, { status, headers: { 'content-type': 'application/json' } });
-  }) as unknown as typeof fetch;
+  } }]);
 }
 
 const input = [
@@ -68,7 +71,6 @@ const shapeEvents = (seen: Array<{ category: string; event: string; data?: unkno
   seen.filter((r) => r.category === 'llm.codex' && r.event === 'request-rejected-shape');
 
 beforeEach(() => {
-  priorFetch = globalThis.fetch;
   sentBodies = [];
   priorRunId = process.env.ELANOUS_RUN_ID;
   delete process.env.ELANOUS_RUN_ID;
@@ -77,7 +79,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  globalThis.fetch = priorFetch;
+  fetchDevice?.restore();
+  fetchDevice = undefined;
   if (priorRunId === undefined) delete process.env.ELANOUS_RUN_ID;
   else process.env.ELANOUS_RUN_ID = priorRunId;
   if (priorHostId === undefined) delete process.env.ELANOUS_HOST_ID;

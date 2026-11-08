@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── Input-policy LLM tools — Phase 6 of the unified-input plan ──
 //
 // Three tools:
@@ -15,7 +16,7 @@
 // LLM as a structured error so the model can reason about why its
 // rebind was rejected without having to parse prose.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   setMode,
   activeMode,

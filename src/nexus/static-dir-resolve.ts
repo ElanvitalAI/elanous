@@ -39,7 +39,7 @@ export function resolvePwaStaticDir(opts: ResolvePwaStaticDirOpts = {}): string 
   if (!opts.candidates && explicit && exists(explicit)) return explicit;
   const candidates = opts.candidates ?? defaultCandidates(opts.argvBin ?? process.argv[1] ?? '');
   for (const path of candidates) {
-    if (exists(path)) return path;
+    if (exists(path)) return safeRealpath(path);
   }
   return undefined;
 }

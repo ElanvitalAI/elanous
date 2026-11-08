@@ -24,6 +24,10 @@ function captureCmd(argv: string[], patterns: string[]): Promise<string[]> {
     // This fixture observes CDP forwarding. Mock-module child splitting has
     // its own contract in scripts/test-deterministic.test.ts.
     deriveMockModuleFiles: () => [],
+    // These command-capture cases do not exercise repository-wide test discovery.
+    // Letting the default path scan thousands of files and parse their ASTs
+    // made each fixture depend on host load, with roughly 3.5s spent there alone.
+    deriveTestFiles: () => [],
     spawn,
     report: () => {},
     waitForSignal: () => new Promise<never>(() => {}),

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // ── Tier flip primitive tests (Coding Pipeline P1 followup) ──
 //
 // Exercises splitDeferredToolSpecs + buildDeferredToolsPromptBlock.
@@ -11,7 +12,7 @@ import {
   buildDeferredToolsPromptBlock,
   applyDeferredTools,
 } from '../src/session-runtime/tier-flip.js';
-import type { LLMToolSpec } from '../src/llm.js';
+
 import type { NativeToolCatalogEntry } from '../src/native-tool-catalog.js';
 
 function makeSpec(name: string): LLMToolSpec {

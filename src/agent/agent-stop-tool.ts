@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── AgentStop LLM tool (ROADMAP-agent-surface-deferred-tools Wave 1 · W1.2) ──
 //
 // Sends an abort signal to a live AgentTask owned by the global agent
@@ -19,7 +20,7 @@
 // concurrently is meaningless; cancelling unrelated tasks is fine via
 // separate calls.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { globalAgentRegistry } from './registry.js';
 import type { AgentRegistry } from './registry.js';

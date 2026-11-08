@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // UI-Core arc Phase U3b Step 1 — core-turn types.
 //
 // `runCoreTurn` (run-core-turn.ts) is the dashboard-independent entry
@@ -15,7 +16,7 @@
 // folds dashboard onto `runCoreTurn` once the core event set is
 // proven sufficient.
 
-import type { LLMMessage, LLMOpts, LLMProvider, LLMToolSpec } from '../llm.js';
+import type { LLMMessage, LLMOpts, LLMProvider } from '../llm.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 
 /** Stop reasons exposed by `runCoreTurn`. Mirrors the ACP

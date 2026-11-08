@@ -1,8 +1,9 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // External graph control uses the same wizard, editor run API, and runner as the local UI.
 // The MCP HTTP boundary filters mutating tools by token scope before dispatch.
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { generateGraphFromPrompt } from '../graph-wizard/generate.js';

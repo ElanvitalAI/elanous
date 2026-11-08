@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // H6 P2 Bundle 2 B · LlmRequestInstall LLM tool.
 //
 // Single T2 mutating tool that downloads a model to a target node
@@ -9,7 +10,7 @@
 // Output contract matches the rest of the H6 family:
 //   `{ output: string; metadata: object; isError?: true }`.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   requestInstall,
   type InstallerDeps,

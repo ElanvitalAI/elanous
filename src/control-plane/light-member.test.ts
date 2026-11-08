@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { runLightMember } from './light-member.js';
 import { writeMachineProfile } from '../roles/machine-profile.js';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 
 type RequestRow = { path: string; body: Record<string, unknown>; authorization: string | null; method: string };
 const roots: string[] = [];
@@ -168,12 +169,13 @@ test('heartbeat 404 re-registers the joined resource on the next tick', async ()
 test('default probe GETs each URL with a deadline and records HTTP failure as unreachable', async () => {
   const root = joined();
   const requests: Array<{ url: string; method: string | undefined; signal: AbortSignal | undefined }> = [];
-  const probeFetch = spyOn(globalThis, 'fetch').mockImplementation((async (input, init) => {
-    requests.push({ url: String(input), method: init?.method, signal: init?.signal ?? undefined });
-    return new Response(null, { status: 503 });
-  }) as typeof fetch);
   const registrations: Array<Record<string, unknown>> = [];
-  try {
+  await withFakeFetchDevice([
+    { url: 'http://127.0.0.1:5050/', response: (request) => {
+      requests.push({ url: request.url, method: request.method, signal: request.signal ?? undefined });
+      return new Response(null, { status: 503 });
+    } },
+  ], async (device) => {
     await runLightMember({ root, once: true, resources: [{ kind: 'image', name: 'registry', url: 'http://127.0.0.1:5050' }],
       fetch: async (_input, init) => {
         registrations.push(JSON.parse(init!.body as string));
@@ -184,7 +186,8 @@ test('default probe GETs each URL with a deadline and records HTTP failure as un
     expect(requests[0]).toMatchObject({ url: 'http://127.0.0.1:5050/', method: 'GET' });
     expect(requests[0]!.signal).toBeInstanceOf(AbortSignal);
     expect(registrations[1]).toMatchObject({ attrs: { reachable: false, bind: 'loopback' } });
-  } finally { probeFetch.mockRestore(); }
+    expect(device.calls()).toHaveLength(1);
+  });
 });
 
 test('Tailscale IPv6 /48 bind is tailnet in registration and result, neighboring /48 is other', async () => {

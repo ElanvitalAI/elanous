@@ -14,7 +14,7 @@ export interface AppSimLiveEvent {
 
 export interface AppSimReceipt {
   id: string;
-  createdAt: string | number;
+  createdAt?: string | number;
   outcome: 'passed' | 'failed' | 'blocked' | 'unknown';
   summary?: string;
   runId?: string;
@@ -40,6 +40,12 @@ function eventBelongsToApp(event: AppSimLiveEvent, appId: string): boolean {
 function formatTime(value: number | string): string {
   const date = typeof value === 'number' ? new Date(value) : new Date(value);
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
+function receiptTime(value: number | string | undefined): number {
+  if (value === undefined) return Number.NEGATIVE_INFINITY;
+  const parsed = typeof value === 'number' ? value : Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
 }
 
 function eventLabel(event: AppSimLiveEvent): string {
@@ -72,9 +78,7 @@ export function AppSimLiveView({ appId, appName, client, receipts, onBack, initi
   }, [appId, client, initialEvents]);
 
   const recentReceipts = [...receipts].sort((a, b) => {
-    const aTime = typeof a.createdAt === 'number' ? a.createdAt : Date.parse(a.createdAt);
-    const bTime = typeof b.createdAt === 'number' ? b.createdAt : Date.parse(b.createdAt);
-    return bTime - aTime;
+    return receiptTime(b.createdAt) - receiptTime(a.createdAt);
   }).slice(0, 5);
 
   return (
@@ -121,7 +125,9 @@ export function AppSimLiveView({ appId, appName, client, receipts, onBack, initi
                 <div className="min-w-0">
                   <p className="break-all font-medium">{receipt.id}</p>
                   {receipt.summary && <p className="text-sm text-muted-foreground">{receipt.summary}</p>}
-                  <time className="text-xs text-muted-foreground" dateTime={new Date(receipt.createdAt).toISOString()}>{formatTime(receipt.createdAt)}</time>
+                  {receipt.createdAt !== undefined && Number.isFinite(receiptTime(receipt.createdAt)) && (
+                    <time className="text-xs text-muted-foreground" dateTime={new Date(receipt.createdAt).toISOString()}>{formatTime(receipt.createdAt)}</time>
+                  )}
                 </div>
                 <span className="shrink-0 rounded-full border px-2 py-1 text-xs">{receipt.outcome}</span>
               </li>

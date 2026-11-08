@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { calculateSeatBaseShares } from './seat-share.js';
-import { ORCHESTRATOR_DEFAULTS } from '../../user-config.js';
+import { ORCHESTRATOR_DEFAULTS } from '../../user-config/orchestrator.js';
 
 const seatCaps = ORCHESTRATOR_DEFAULTS.seatCaps;
 const yellow = (owner: string) => ({ owner, status: 'yellow' as const });

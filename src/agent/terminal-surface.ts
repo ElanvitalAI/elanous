@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // PLAN-multi-surface-pty-shell M1 — shared terminal-surface layer.
 //
 // Telegram proved four surface adapters are what turn "PtyShell is
@@ -21,7 +22,7 @@
 // telegram / discord / dashboard imports (the FileSink seam carries the
 // per-surface image channel).
 
-import type { LLMOpts, LLMToolSpec } from '../llm.js';
+import type { LLMOpts } from '../llm.js';
 import type { FileSink } from '../channel/file-sink.js';
 import { PTY_SHELL_TOOL_NAMES } from '../boot/daemon-tools/pty-shell.js';
 import { killNonDetached as killNonDetachedPty } from '../pty-shell/registry.js';

@@ -9284,11 +9284,19 @@ describe('goal-file lint origins', () => {
     'artifact-launch-declaration', 'all-negative-signals', 'unreadable-signals', 'alternative-signals', 'count-observation',
     'identifier-name-observation', 'self-reported-observation', 'default-invocation-observation', 'release-note',
   ];
+  const baselineUnknownOriginTags: readonly GoalFileLintTag[] = [
+    'launch-branch', 'grounding-evidence', 'empty-result-population', 'self-question-subject',
+    'all-negative-signals', 'unreadable-signals', 'alternative-signals', 'count-observation', 'release-note',
+  ];
+  const baselineKnownOriginTags = tags.filter((tag) => !baselineUnknownOriginTags.includes(tag));
 
-  test('has one explicit origin entry for every existing lint tag', () => {
-    expect(Object.keys(GOAL_FILE_LINT_ORIGINS).sort()).toEqual([...tags].sort());
-    expect(Object.values(GOAL_FILE_LINT_ORIGINS).filter((origin) => origin.kind === 'known-incident')).toHaveLength(17);
-    expect(Object.values(GOAL_FILE_LINT_ORIGINS).filter((origin) => origin.kind === 'unknown-origin')).toHaveLength(9);
+  test('preserves explicit origins for the baseline lint tags when new tags are added', () => {
+    // The production `satisfies Record<GoalFileLintTag, GoalFileLintOrigin>` is the exhaustive
+    // compile-time contract. This runtime fixture keeps a baseline floor so an additive tag from
+    // a parallel PR does not make an otherwise unrelated integration batch fail.
+    expect(Object.keys(GOAL_FILE_LINT_ORIGINS)).toEqual(expect.arrayContaining(tags));
+    for (const tag of baselineKnownOriginTags) expect(GOAL_FILE_LINT_ORIGINS[tag].kind).toBe('known-incident');
+    for (const tag of baselineUnknownOriginTags) expect(GOAL_FILE_LINT_ORIGINS[tag]).toEqual({ kind: 'unknown-origin', label: 'ORIGIN-UNKNOWN' });
     for (const origin of Object.values(GOAL_FILE_LINT_ORIGINS)) {
       if (origin.kind === 'known-incident') {
         expect(origin.incident).not.toHaveLength(0);

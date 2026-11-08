@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── AgentOutput LLM tool (ROADMAP-agent-surface-deferred-tools Wave 1 · W1.1) ──
 //
 // Reads the final result of an AgentTask owned by the global agent
@@ -21,7 +22,7 @@
 //
 // Read-only. No approver, no sandbox, no network.
 
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { globalAgentRegistry } from './registry.js';
 import type { AgentRegistry } from './registry.js';

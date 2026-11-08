@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // Tier 2 · across-turn goal-execution loop (2026-07-19 goal-exec 아크).
 //
 // `runCoreTurn` 은 ONE within-turn 툴 루프(모델이 툴 호출을 멈추고 최종 텍스트를
@@ -28,7 +29,7 @@ import { extractRecentUserText, runCoreTurn } from './run-core-turn.js';
 import type { CoreTurnContext, CoreTurnResult, CoreTurnStopReason } from './types.js';
 import { getToolLoopPhaseRejectedTools, TOOL_LOOP_MAX_TURNS_DEFAULT } from '../llm.js';
 import { DELEGATE_HINT, shouldHintDelegate } from '../agent/delegate-hint.js';
-import type { LLMMessage, ContentBlock, LLMToolSpec } from '../llm.js';
+import type { LLMMessage, ContentBlock } from '../llm.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 import { debug } from '../debug/log.js';
 import { publishGoalLifecycle } from '../goals/loop.js';

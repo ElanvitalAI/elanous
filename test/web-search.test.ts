@@ -20,6 +20,9 @@ import { _resetKeyCacheForTests } from '../src/config';
 import { buildFirecrawlWebSearchProvider } from '../src/web-search/firecrawl';
 import { resetUserConfig } from '../src/user-config';
 import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
+
+let fetchDevice: FakeFetchDevice | undefined;
 
 function stubProvider(overrides: Partial<WebSearchProvider> = {}): WebSearchProvider {
   return {
@@ -84,7 +87,6 @@ afterAll(() => {
 
 describe('Firecrawl web-search provider', () => {
   let configDir = '';
-  const realFetch = globalThis.fetch;
 
   function writeFirecrawlConfig(apiKey: string): void {
     mkdirSync(configDir, { recursive: true });
@@ -103,7 +105,8 @@ describe('Firecrawl web-search provider', () => {
   });
 
   afterEach(() => {
-    globalThis.fetch = realFetch;
+    fetchDevice?.restore();
+    fetchDevice = undefined;
     resetElanousConfigDir();
     rmSync(configDir, { recursive: true, force: true });
     configDir = '';
@@ -111,7 +114,8 @@ describe('Firecrawl web-search provider', () => {
   });
 
   afterAll(() => {
-    globalThis.fetch = realFetch;
+    fetchDevice?.restore();
+    fetchDevice = undefined;
     resetUserConfig();
   });
 
@@ -133,10 +137,10 @@ describe('Firecrawl web-search provider', () => {
     writeFirecrawlConfig('fc-config');
     process.env.FIRECRAWL_API_KEY = 'fc-env';
     let authorization = '';
-    globalThis.fetch = (async (_url, init) => {
-      authorization = (init?.headers as Record<string, string>).Authorization;
+    fetchDevice = createFakeFetchDevice([{ url: '/v1/search', method: 'POST', response: (request) => {
+      authorization = request.headers.authorization ?? '';
       return new Response(JSON.stringify({ data: [] }), { status: 200 });
-    }) as typeof fetch;
+    } }]);
 
     await buildFirecrawlWebSearchProvider().search({ query: 'configuration precedence' });
 
@@ -150,10 +154,10 @@ describe('Firecrawl web-search provider', () => {
       return { apiKey: 'fc-injected' };
     });
     let authorization = '';
-    globalThis.fetch = (async (_url, init) => {
-      authorization = (init?.headers as Record<string, string>).Authorization;
+    fetchDevice = createFakeFetchDevice([{ url: '/v1/search', method: 'POST', response: (request) => {
+      authorization = request.headers.authorization ?? '';
       return new Response(JSON.stringify({ data: [] }), { status: 200 });
-    }) as typeof fetch;
+    } }]);
 
     expect(provider.available()).toBe(true);
     await provider.search({ query: 'injected resolver' });

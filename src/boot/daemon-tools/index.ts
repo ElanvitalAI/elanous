@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // MVP M1.5 A.2 — daemon tool surface registry.
 //
 // Single entry the daemon-runtime imports. `toolSurface(kind)`
@@ -7,7 +8,7 @@
 // (List · Snapshot · Input) so a PWA-only `elanous serve` agent can
 // drive web terminals without booting the dashboard TUI.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import { recordToolCatalog } from '../../dashboard/tool-catalog-observability.js';
 import {
   buildBrowserNavigateTool,

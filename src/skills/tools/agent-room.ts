@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // AgentRoomCompose returns an unsupported error; list and close retain their registry behavior.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   getDefaultAgentRoomRegistry,
   type AgentRoomRegistry,

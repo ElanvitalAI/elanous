@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // IDX-6 Phase 7 / FU J — LLM theme control tools.
 //
 // Exposes the ThemeService surface to the LLM so PFC / TO / other
@@ -24,7 +25,7 @@
 //   - GetActiveTheme + ListThemes + PreviewTheme are read-only,
 //     no audit needed.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { LLMToolDef } from '../../plugins/core/types.js';
 import type { ThemeService } from '../../theme/service.js';
 import type { ThemeTokens } from '../../theme/tokens.js';

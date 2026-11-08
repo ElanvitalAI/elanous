@@ -89,7 +89,7 @@
 //   B-1.b (#1455) — 6 tiny standalone cases (fork · ctoggle · dashboard ·
 //                   sync · skill-reload)
 //   B-1.c         — 8 small standalone cases (cache · attach-pin · attach-
-//                   unpin · attach-clear · rebind · perf · pty-list/ptys ·
+//                   unpin · attach-clear · perf · pty-list/ptys ·
 //                   sweep-tool-results)
 //   B-1.d         — 9 deferred skill-tool slashes that share an identical
 //                   fire-and-forget dynamic-import shape (budget/b · route
@@ -271,12 +271,11 @@
 // of circular dependency on dashboard/index.ts.
 
 import { renderTuiNow, tuiNowSlash } from '../../context-bus/context-now-surfaces.js';
-import { contextNowInWorker } from '../../context-bus/context-now.js';
+import { contextNow, contextNowInWorker } from '../../context-bus/context-now.js';
 import { handleTuiChatPersona, type TuiChatPersonaSelection } from './chat-persona.js';
 import { createWishCard } from '../../intake-plane/wish-card.js';
 import { CardStore } from '../../task-cards/card-store.js';
 import type { ContextNowDeps } from '../../context-bus/context-now.js';
-import { runRebindCommand } from '../../input-core/index.js';
 // B4 (TUI half) — /design reuses the CLI's own resolution so the three
 // surfaces (CLI, PWA panel, this) cannot answer differently.
 import { resolveRepositoryDesignCheck } from '../../cli/repo-cli.js';
@@ -313,12 +312,7 @@ import { selfOrchestrateRuntime } from '../../self-dev/self-orchestrate-runtime.
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import { listSkillNames, describeSkill } from '../../skills/runner.js';
-import {
-  REASONING_CYCLE,
-  effectiveReasoningLevel,
-  nextReasoningLevel,
-  reasoningLevelLabel,
-} from '../../llm.js';
+import { REASONING_CYCLE, effectiveReasoningLevel, nextReasoningLevel, reasoningLevelLabel } from '../../llm.js';
 import type { ReasoningLevel } from '../../user-config.js';
 import {
   armSessionQuickControl,
@@ -1197,8 +1191,8 @@ export const DASHBOARD_SLASH_CATALOG_BASELINE = {
     'dash', 'dashboard', 'debug', 'default', 'delta', 'design', 'design-check', 'diffs',
     'directive', 'export', 'fork', 'gemini', 'handoff', 'hist', 'history', 'inject', 'inputs',
     'lane', 'll', 'local', 'log', 'loops', 'p', 'paste', 'persona', 'plan', 'plugin',
-    'plugins', 'prompt', 'prompts', 'provider', 'qc', 'r', 'reasoning', 'rebind', 'relay',
-    'reply', 'research', 'resume-turn', 'rewind', 'rs', 'run', 'run-skill', 's', 'showroom',
+    'plugins', 'prompt', 'prompts', 'provider', 'qc', 'r', 'reasoning', 'relay',
+    'reply', 'release', 'research', 'resume-turn', 'rewind', 'rs', 'run', 'run-skill', 's', 'showroom',
     'surface', 'sync', 'tablet', 'telegram', 'term', 'terminal', 'tg', 'theme', 'think',
     'widget', 'widgets', 'wish',
   ],
@@ -1309,6 +1303,12 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     const lines = nowDeps ? tuiNowSlash(args, nowDeps)
       : renderTuiNow(await contextNowInWorker({ topic: args.join(' ').trim() }));
     for (const line of lines) ctx.pushChatLine(line);
+  });
+
+  registry.register(['release'], async (_args, ctx) => {
+    const answer = nowDeps ? contextNow({ topic: '발행 상황' }, nowDeps)
+      : await contextNowInWorker({ topic: '발행 상황' });
+    for (const line of renderTuiNow(answer)) ctx.pushChatLine(line);
   });
 
   registry.register('loops', async (args, ctx) => {
@@ -1701,25 +1701,6 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     }
     ctx.setChatScrollOffset(-1);
   });
-
-  registry.register('rebind', (args, ctx) => {
-    // R3 + R7 — runtime binding management. Touches only the runtime
-    // layer; user-config file is not modified.
-    const outcome = runRebindCommand(args);
-    for (const ln of outcome.lines) {
-      const painted =
-        ln.tone === 'error'   ? ctx.error(ln.text)
-      : ln.tone === 'warn'    ? ctx.warning(ln.text)
-      : ln.tone === 'success' ? ctx.success(ln.text)
-      : ln.tone === 'muted'   ? ctx.muted(ln.text)
-      :                         ctx.text(ln.text);
-      ctx.chatLines.push(painted);
-    }
-    ctx.setChatScrollOffset(-1);
-  });
-
-
-
 
   // ── B-1.d ─────────────────────────────────────────────────────────
   // 9 deferred skill-tool slashes. All share the fire-and-forget

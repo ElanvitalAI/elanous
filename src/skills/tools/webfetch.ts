@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── WebFetch tool (Claude Code-compatible URL fetcher) ──
 //
 // Ports claude-code-fork/src/tools/WebFetchTool. Fetches a URL,
@@ -29,7 +30,7 @@
 // by streamLLMWithTools). Timeouts, DNS failures, 4xx/5xx all throw
 // with short actionable messages.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 const TIMEOUT_MS = 60_000;
 const MAX_BYTES = 10 * 1024 * 1024;

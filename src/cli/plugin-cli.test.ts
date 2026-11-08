@@ -5,7 +5,7 @@ import { generateIndexKeyPair, signIndex } from '../market/signed-index.js';
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { simInProcessCli } from '../ux-sim/in-process-cli.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -40,7 +40,7 @@ async function withInProcessTurn<T>(run: () => Promise<T>): Promise<T> {
 }
 async function inProcessCli(root: string, args: string[]) {
   return withInProcessTurn(async () => {
-    const result = await simInProcessCli(['plugin', ...args], { allowPaths: pluginPaths, stateRoot: root });
+    const result = await simCli(['plugin', ...args], { allowPaths: pluginPaths, stateRoot: root });
     return { code: result.exitCode, output: result.stdout, stderr: result.stderr };
   });
 }
@@ -50,7 +50,7 @@ async function cliWithFetch(root: string, args: string[], fetcher: FetchHandler)
     const previousFetch = globalThis.fetch;
     globalThis.fetch = fetcher as typeof fetch;
     try {
-      const result = await simInProcessCli(['plugin', ...args], { allowPaths: pluginPaths, stateRoot: root });
+      const result = await simCli(['plugin', ...args], { allowPaths: pluginPaths, stateRoot: root });
       return { code: result.exitCode, output: result.stdout, stderr: result.stderr };
     } finally { globalThis.fetch = previousFetch; }
   });

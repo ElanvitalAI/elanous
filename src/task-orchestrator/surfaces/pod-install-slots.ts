@@ -43,6 +43,16 @@ export function podInstallSlotsVolume(hostPath: string = POD_INSTALL_SLOTS_HOST_
 const SAFE_HOST_PATH = /^\/[A-Za-z0-9._/-]+$/;
 const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 export const HOST_DIRS_PREP_LIMIT_MS = 30_000;
+export const GATE_EXTERNAL_VOLUME_SNAPSHOT_LIMIT_MS = 900_000;
+export const GATE_EXTERNAL_VOLUME_SNAPSHOT_ROOT = '/var/lib/elanous/gate-volume-snapshots';
+
+export const gateExternalVolumeSnapshotDirectoryCheckScript = 'snapshot_uid() { stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null || true; }\nsnapshot_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null || true; }\nsecure_snapshot_dir() { [ ! -L "$1" ] || return 1; if [ -e "$1" ]; then [ -d "$1" ] || return 1; else mkdir "$1" || return 1; chown 0:0 "$1" || return 1; chmod 0755 "$1" || return 1; fi; mode=$(snapshot_mode "$1"); [ "$(snapshot_uid "$1")" = 0 ] && [ -n "$mode" ] && [ $((0$mode & 022)) -eq 0 ]; }';
+
+/** Host-side verifier for a copied k3d-node tree before this preparation attempt is trusted. */
+const gateVolumeSnapshotHashScript = `const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');const root=fs.realpathSync(process.argv[1]),names=[];const walk=d=>{for(const n of fs.readdirSync(d)){const f=path.join(d,n),r=path.relative(root,f).split(path.sep).join('/');if(r==='.elanous-volume-ref.json')continue;const s=fs.lstatSync(f);names.push(r);if(s.isDirectory())walk(f)}};walk(root);names.sort((a,b)=>Buffer.compare(Buffer.from(a),Buffer.from(b)));const h=crypto.createHash('sha256'),add=v=>{const b=Buffer.from(String(v)),n=Buffer.alloc(8);n.writeBigUInt64BE(BigInt(b.length));h.update(n);h.update(b)};for(const r of names){const f=path.join(root,...r.split('/')),s=fs.lstatSync(f);add(r);add(String(s.mode&0o555));if(s.isDirectory())add('directory');else if(s.isFile()){add('file');add(String(s.size));const fd=fs.openSync(f,'r'),buf=Buffer.allocUnsafe(1048576);try{let n;while((n=fs.readSync(fd,buf,0,buf.length,null))>0)h.update(buf.subarray(0,n))}finally{fs.closeSync(fd)}}else if(s.isSymbolicLink()){const t=fs.readlinkSync(f);if(path.isAbsolute(t))throw Error('volume-symlink-escapes-root:'+r);const resolved=fs.realpathSync(f),rel=path.relative(root,resolved);if(rel==='..'||rel.startsWith('..'+path.sep)||path.isAbsolute(rel))throw Error('volume-symlink-escapes-root:'+r);add('symlink');add(t)}else throw Error('volume-special-file:'+r)}process.stdout.write(h.digest('hex'));`;
+
+/** Quarantine only the exact stale generation; keep its inode immutable for Pods that already mounted it. */
+export const gateExternalVolumeSnapshotInvalidateScript = 'if [ -n "$2" ] && { [ -e "$1" ] || [ -L "$1" ]; }; then q="$1.invalid.$$"; if mv -T "$1" "$q" 2>/dev/null; then g=$(stat -c %d:%i "$q" 2>/dev/null || true); marker=$(cat "$q/.complete" 2>/dev/null || true); if [ ! -L "$q" ] && { [ "$g" != "$2" ] || [ "$marker" != "$3" ]; }; then if [ ! -e "$1" ] && [ ! -L "$1" ]; then mv -T "$q" "$1" 2>/dev/null || true; fi; fi; fi; fi';
 
 /** Child-shell line: report (never fail on) a mounted host directory the uid-1000 child cannot write. */
 /** Root hand-over inside the Pod — only for runs whose hostPath dirs could not be prepared on the node (no pool member ·
@@ -113,6 +123,106 @@ export function hostShellWithin(host: string | undefined, script: string, limitM
 }
 
 const prepared = new Map<string, Promise<HostDirsPrepResult>>();
+type ExternalVolumeSnapshotOutcome = { ok: true; host: string; ms: number } | { ok: false; host: string; ms: number; detail: string };
+const externalVolumeSnapshots = new Map<string, Promise<ExternalVolumeSnapshotOutcome>>();
+
+export function gateExternalVolumeSnapshotNodeScript(cluster: string,
+  refs: ReadonlyArray<{ kind: string; hostPath: string; contentSha256: string; identitySha256: string }>,
+  snapshotRoot = GATE_EXTERNAL_VOLUME_SNAPSHOT_ROOT): string {
+  if (!SAFE_NAME.test(cluster)) throw new Error(`invalid k3d cluster: ${cluster}`);
+  if (!SAFE_HOST_PATH.test(snapshotRoot) || snapshotRoot.split('/').includes('..')) throw new Error('invalid gate volume snapshot root');
+  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`;
+  const inner: string[] = ['set -eu', `base=${quote(snapshotRoot)}`, gateExternalVolumeSnapshotDirectoryCheckScript];
+  for (const ref of [...refs].sort((a, b) => a.identitySha256.localeCompare(b.identitySha256))) {
+    if (!SAFE_HOST_PATH.test(ref.hostPath) || ref.hostPath.split('/').includes('..')
+      || !/^[a-z][a-z0-9_-]{0,40}$/.test(ref.kind) || !/^[0-9a-f]{64}$/.test(ref.contentSha256)
+      || !/^[0-9a-f]{64}$/.test(ref.identitySha256)) throw new Error(`invalid-volume-ref:${ref.kind}`);
+    const source = quote(ref.hostPath), identityParentPath = `${snapshotRoot}/${ref.identitySha256}`;
+    const snapshotDirs: string[] = [];
+    let pathPrefix = '';
+    for (const component of snapshotRoot.split('/').filter(Boolean)) { pathPrefix += `/${component}`; snapshotDirs.push(pathPrefix); }
+    for (const dir of [...snapshotDirs, identityParentPath, `${identityParentPath}/${ref.kind}`]) {
+      inner.push(`secure_snapshot_dir ${quote(dir)} || { echo "external-volume-snapshot-parent-untrusted:${ref.kind}:${dir}" >&2; exit 5; }`);
+    }
+    const parent = `"$base/${ref.identitySha256}/${ref.kind}"`;
+    inner.push(`expected=${quote(`${ref.contentSha256} ${ref.identitySha256}`)}`);
+    // Symlinks commonly report mode 0777 even when their root-owned targets are immutable.
+    // Check write bits on non-links only; ownership still covers every entry including links.
+    inner.push(`snapshot_valid() { [ ! -L ${parent}/snapshot ] && [ -d ${parent}/snapshot/tree ] && [ "$(cat ${parent}/snapshot/.complete 2>/dev/null || true)" = "$expected" ] && [ "$(stat -c %u ${parent}/snapshot 2>/dev/null || true)" = 0 ] && [ -z "$(find ${parent}/snapshot ! -type l -perm /222 -print -quit 2>/dev/null)" ] && [ -z "$(find ${parent}/snapshot -not -uid 0 -print -quit 2>/dev/null)" ]; }`);
+    inner.push(`snapshot_path=${parent}/snapshot`, 'existing_generation=$(stat -c %d:%i "$snapshot_path" 2>/dev/null || true)');
+    inner.push(`if { [ -e "$snapshot_path" ] || [ -L "$snapshot_path" ]; } && ! snapshot_valid; then sh -c ${quote(gateExternalVolumeSnapshotInvalidateScript)} sh "$snapshot_path" "$existing_generation" "$expected" || { echo "external-volume-snapshot-invalidate-failed:${ref.kind}" >&2; exit 5; }; fi`);
+    inner.push(`if [ -e ${parent}/snapshot ] || [ -L ${parent}/snapshot ]; then snapshot_valid || { echo "external-volume-snapshot-conflict:${ref.kind}" >&2; exit 5; }; else`);
+    inner.push(`  tmp=${parent}/.snapshot.$$.tmp; mkdir "$tmp"`);
+    inner.push(`  [ -d ${source} ] || { echo "external-volume-source-missing:${ref.kind}" >&2; exit 5; }`);
+    inner.push(`  mkdir "$tmp/tree"; cp -a ${source}/. "$tmp/tree/"`);
+    inner.push('  printf "%s\\n" "$expected" > "$tmp/.complete"');
+    inner.push('  chown -R 0:0 "$tmp"; chmod -R a-w "$tmp"',
+      `  if mv -T "$tmp" ${parent}/snapshot 2>/dev/null; then :; else rm -rf "$tmp"; snapshot_valid || { echo "external-volume-snapshot-publish-conflict:${ref.kind}" >&2; exit 5; }; fi`,
+      'fi');
+  }
+  inner.push('exit 0');
+  const verify: string[] = ['verify_root=$(mktemp -d) || exit 2', 'verify_index=0', 'for n in $nodes; do'];
+  for (const ref of [...refs].sort((a, b) => a.identitySha256.localeCompare(b.identitySha256))) {
+    const snapshot = `${snapshotRoot}/${ref.identitySha256}/${ref.kind}/snapshot`;
+    verify.push('  mkdir "$verify_root/$verify_index"');
+    verify.push(`  snapshot_generation=$(docker exec "$n" sh -c 'stat -c %d:%i "$1"' sh ${quote(snapshot)} 2>/dev/null || true)`);
+    verify.push(`  if ! docker cp "$n:${snapshot}/tree" "$verify_root/$verify_index/" >/dev/null 2>&1; then echo 'external-volume-snapshot-copyback-failed:${ref.kind}' >&2; rc=1; else`);
+    verify.push(`    actual=$(node -e ${quote(gateVolumeSnapshotHashScript)} "$verify_root/$verify_index/tree" 2>/dev/null || true)`);
+    verify.push(`    if [ "$actual" != ${quote(ref.contentSha256)} ]; then docker exec -i "$n" sh -c ${quote(gateExternalVolumeSnapshotInvalidateScript)} sh ${quote(snapshot)} "$snapshot_generation" ${quote(`${ref.contentSha256} ${ref.identitySha256}`)} >/dev/null 2>&1 || true; echo 'external-volume-snapshot-content-mismatch:${ref.kind}' >&2; rc=1; fi`);
+    verify.push('  fi', '  verify_index=$((verify_index + 1))');
+  }
+  verify.push('done', 'chmod -R u+w "$verify_root" 2>/dev/null || true', 'rm -rf "$verify_root"', 'exit $rc');
+  const nodes = podHostDirsNodeIdsScript(cluster);
+  return `nodes=$(${nodes})\n[ -n "$nodes" ] || { echo 'no k3d node'; exit 2; }\nrc=0\nfor n in $nodes; do\n  docker exec -i "$n" sh <<'ELANOUS_GATE_VOLUME_SNAPSHOT' || rc=1\n${inner.join('\n')}\nELANOUS_GATE_VOLUME_SNAPSHOT\ndone\n${verify.join('\n')}\n`;
+}
+
+/** Snapshot hostPath inputs once per k3d node generation into a root-owned, non-writable, content-addressed tree.
+ * Pods mount that tree read-only, so later changes to the source hostPath cannot race preflight and use. */
+export async function prepareGateExternalVolumeSnapshotsOnce<T extends { kind: string; hostPath: string; contentSha256: string; identitySha256: string }>(o: {
+  member: { sshHost?: string; k3dCluster: string };
+  refs: ReadonlyArray<T>;
+  shell?: HostShell;
+  limitMs?: number;
+}): Promise<{ ok: true; refs: Array<T>; ms: number }
+  | { ok: false; host: string; ms: number; detail: string }> {
+  const start = Date.now();
+  const host = o.member.sshHost;
+  const shell = o.shell ?? hostShellWithin;
+  const limitMs = o.limitMs ?? GATE_EXTERNAL_VOLUME_SNAPSHOT_LIMIT_MS;
+  const ids = await shell(host, podHostDirsNodeIdsScript(o.member.k3dCluster), limitMs)
+    .catch(() => ({ rc: 2, output: '' }));
+  const generation = ids.rc === 0 && ids.output.trim() ? ids.output.trim() : null;
+  if (!generation) return { ok: false, host: host ?? 'local', ms: Date.now() - start, detail: 'k3d-node-generation-unmeasured' };
+  const refs = [...o.refs].sort((a, b) => a.identitySha256.localeCompare(b.identitySha256));
+  const key = `${host ?? 'local'}\0${o.member.k3dCluster}\0${generation}\0${refs.map((r) => `${r.kind}:${r.identitySha256}`).join(',')}`;
+  let pending = externalVolumeSnapshots.get(key);
+  if (!pending) {
+    const script = gateExternalVolumeSnapshotNodeScript(o.member.k3dCluster, refs);
+    const run: Promise<ExternalVolumeSnapshotOutcome> = shell(host, script, limitMs)
+      .then((result): ExternalVolumeSnapshotOutcome => result.rc === 0
+        ? { host: host ?? 'local', ok: true, ms: Date.now() - start }
+        : { host: host ?? 'local', ok: false, ms: Date.now() - start, detail: result.output.trim().slice(-300) || `rc=${result.rc}` })
+      .catch((error: unknown): ExternalVolumeSnapshotOutcome => ({ host: host ?? 'local', ok: false, ms: Date.now() - start, detail: String(error).slice(0, 300) }))
+      .then((result) => { if (!result.ok) externalVolumeSnapshots.delete(key); return result; });
+    pending = run;
+    externalVolumeSnapshots.set(key, pending);
+  }
+  const result = await pending;
+  if (result.ok === false) return { ...result, ms: Date.now() - start };
+  return { ok: true, ms: Date.now() - start, refs: refs.map((ref) => ({ ...ref,
+    hostPath: `${GATE_EXTERNAL_VOLUME_SNAPSHOT_ROOT}/${ref.identitySha256}/${ref.kind}/snapshot/tree` })) };
+}
+
+/** A Pod preflight rejection proves a previously memoized node snapshot is no longer trustworthy. */
+export function invalidateGateExternalVolumeSnapshotMemo(o: { member: { sshHost?: string; k3dCluster: string }; refs: ReadonlyArray<{ kind: string; identitySha256: string }> }): void {
+  const prefix = `${o.member.sshHost ?? 'local'}\0${o.member.k3dCluster}\0`;
+  const identities = new Set(o.refs.map((ref) => `${ref.kind}:${ref.identitySha256}`));
+  for (const key of externalVolumeSnapshots.keys()) {
+    if (!key.startsWith(prefix)) continue;
+    const recorded = key.split('\0')[3]?.split(',') ?? [];
+    if (recorded.some((entry) => identities.has(entry))) externalVolumeSnapshots.delete(key);
+  }
+}
 
 /**
  * Hand `hostPaths` to uid 1000 on the member's k3d nodes once per (host, cluster, node generation, path) in this process — every shard Job

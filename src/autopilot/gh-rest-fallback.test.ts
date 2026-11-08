@@ -21,7 +21,7 @@ const sha = 'a'.repeat(40);
 
 function fake(failure: CmdResult = limit) {
   const calls: string[][] = [];
-  const options: Array<{ cwd?: string } | undefined> = [];
+  const options: Array<{ cwd?: string; timeoutMs?: number } | undefined> = [];
   const run: CmdRunner = (cmd, args, opts) => {
     const call = [cmd, ...args];
     calls.push(call);
@@ -63,7 +63,8 @@ describe('GraphQL REST fallback', () => {
       expect(calls).toContainEqual(['gh', 'api', '--method', 'PUT', 'repos/o/r/pulls/17/merge', '-f', 'merge_method=squash', '-f', `sha=${sha}`]);
       expect(calls.some((call) => call[0] === 'gh' && call[1] === 'repo')).toBe(false);
       expect(calls.filter((call) => call[0] === 'gh' && call[1] === 'api').every((call) => !call.includes('graphql'))).toBe(true);
-      expect(options[calls.findIndex((call) => call[0] === 'gh' && call[1] === 'api' && call[2]?.startsWith('repos/o/r/pulls?'))]).toEqual({ cwd: '/wt' });
+      expect(options[calls.findIndex((call) => call[0] === 'gh' && call[1] === 'api' && call[2]?.startsWith('repos/o/r/pulls?'))])
+        .toEqual({ cwd: '/wt', timeoutMs: 45_000 });
       expect(log).toHaveBeenCalledWith('autopilot.pr', 'rest-fallback', { sub: 'merge', ok: true });
       expect(stderr).toHaveBeenCalledWith('[gh] REST 폴백: pr merge\n');
     } finally { stderr.mockRestore(); log.mockRestore(); }

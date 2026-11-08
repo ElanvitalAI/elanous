@@ -16,10 +16,10 @@
 // is recorded in runtime.json + printed in boot banner.
 
 import { setInProcessOutbound } from '../../domains/outbound-alert.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig, resolveNexusRelayConfig } from '../../user-config.js';
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { spawnSync } from 'node:child_process';
-import { isAbsolute, join, dirname, relative } from 'node:path';
+import { isAbsolute, join, dirname, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { readdirSync, realpathSync, statSync } from 'node:fs';
 import { createProject, listProjects } from '../../project/project-store.js';
@@ -39,6 +39,10 @@ import { machineForToken } from '../../control-plane/member-tokens.js';
 import { handleResourceLedgerPoolDeclarationPost, handleResourceLedgerPoolsApi } from './resource-ledger.js';
 import { handleMissionLineRequest, MissionLineHttpError } from '../../agent-mission/mission-line.js';
 import type { NexusAppHost } from '../apps/app-host.js';
+import type { AppLifecycleSnapshot } from '../apps/app-lifecycle-ledger.js';
+import { consoleAddress, simulationPreviewAddress } from '../apps/console-address.js';
+import { connectRelayHost, loadOrCreateRelayHostIdentity, type RelayHostConnection } from '../../relay/host-connector.js';
+import { elanousConfigDir } from '../config/paths.js';
 
 export { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
 import type { TabRegistry } from '../state/tab-registry.js';
@@ -178,6 +182,7 @@ import { handleLlmModels } from './llm-models.js';
 import { handleLlmHostsConfig } from './llm-hosts-config.js';
 import { handleLlmRotationGet, handleLlmRotationNext } from './llm-rotation.js';
 import { handleSetupClaim } from './setup-claim.js';
+import { handleCredentialRegistrationClaim, handleCredentialRegistrationLinkCreate, handleCredentialRegistrationLinkRevoke, handleCredentialRegistrationSubmit, handleCredentialSlotsGet } from './setup-credentials.js';
 import { handleSetupCodexLoginGet, handleSetupCodexLoginPost } from './setup-codex-login.js';
 import {
   handleLlmProvidersList,
@@ -571,8 +576,12 @@ export interface NexusHttpServerOpts {
   /** NEXUS-APP-HOST-S1 — app static exports are routed only on their dedicated
    *  `<slug>.app.localhost` hostname. Known app hosts never fall through to PWA/API routes. */
   appHost?: NexusAppHost;
+  /** Durable lifecycle projection used by app tiles; missing rows remain null rather than inventing state. */
+  appLifecycleSnapshot?: (appSlug: string) => AppLifecycleSnapshot | null;
   /** Ordered app-scoped route handlers. Backends register here so host dispatch stays centralized. */
   appRoutes?: readonly ((request: Request) => Response | undefined | Promise<Response | undefined>)[];
+  /** Stable, non-identifying install-derived owner label used by the proposed simulation preview host. */
+  appPreviewUserSlug?: string;
   /** P-2D.2 — runtime mutable ref for the dev-proxy upstream.
    *  Replaced the static `devProxy: {upstream}` option so admin
    *  HTTP calls (`POST /v1/nexus/admin/pwa-dev-proxy`) can flip the
@@ -832,11 +841,78 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
 
   const url = `http://${hostname}:${resolvedPort}`;
   const stopInsideRelay = startInsideEventRelay();
+  let serverStopped = false;
+  let relayConnection: RelayHostConnection | undefined;
+  let relayAttemptController: AbortController | undefined;
+  let relayRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let relayRetryDelayMs = 1_000;
+  let relayConnecting = false;
+  const relayConfig = resolveNexusRelayConfig(getUserConfig());
+  if (relayConfig.enabled) {
+    if (!opts.appHost || !relayConfig.url) {
+      debug.log('nexus.relay-host', 'disabled', { reason: !opts.appHost ? 'app-host-not-wired' : 'relay-url-missing' });
+    } else {
+      const identityPath = relayConfig.identityFile
+        ? (isAbsolute(relayConfig.identityFile) ? relayConfig.identityFile : resolve(elanousConfigDir(), relayConfig.identityFile))
+        : undefined;
+      const scheduleRelayRetry = () => {
+        if (serverStopped || relayRetryTimer) return;
+        const delay = relayRetryDelayMs;
+        relayRetryDelayMs = Math.min(relayRetryDelayMs * 2, 30_000);
+        relayRetryTimer = setTimeout(() => {
+          relayRetryTimer = undefined;
+          void startRelayConnection();
+        }, delay);
+        relayRetryTimer.unref?.();
+      };
+      const startRelayConnection = async () => {
+        if (serverStopped || relayConnecting) return;
+        relayConnecting = true;
+        const controller = new AbortController();
+        relayAttemptController = controller;
+        try {
+          const identity = await loadOrCreateRelayHostIdentity(identityPath);
+          const connection = await connectRelayHost({
+            relayUrl: relayConfig.url!,
+            daemonKeys: identity.daemonKeys,
+            hostSigningKey: identity.hostSigningKey,
+            handleRequest: request => opts.appHost!.handle(request),
+            onError: error => debug.log('nexus.relay-host', 'request-error', { serverId: identity.serverId, errorType: error.name }),
+            onClose: scheduleRelayRetry,
+            signal: controller.signal,
+          });
+          if (serverStopped) connection.close();
+          else {
+            relayConnection = connection;
+            relayRetryDelayMs = 1_000;
+            debug.log('nexus.relay-host', 'connected', { serverId: connection.serverId });
+          }
+        } catch (error) {
+          debug.log('nexus.relay-host', 'connection-failed', {
+            errorType: error instanceof Error ? error.name : typeof error,
+            errorCode: error && typeof error === 'object' && 'code' in error ? String((error as { code: unknown }).code) : undefined,
+          });
+          scheduleRelayRetry();
+        } finally {
+          if (relayAttemptController === controller) relayAttemptController = undefined;
+          relayConnecting = false;
+        }
+      };
+      void startRelayConnection();
+    }
+  }
   return {
     port: resolvedPort,
     hostname,
     url,
     stop() {
+      serverStopped = true;
+      if (relayRetryTimer) clearTimeout(relayRetryTimer);
+      relayRetryTimer = undefined;
+      relayAttemptController?.abort();
+      relayAttemptController = undefined;
+      relayConnection?.close();
+      relayConnection = undefined;
       stopInsideRelay();
       try { server!.stop(true); } catch { /* idempotent */ }
       loopEdgesDataSource.close();
@@ -1010,6 +1086,41 @@ export async function routeRequest(
   const resolvedAppResponse = appResponse instanceof Promise ? await appResponse : appResponse;
   if (resolvedAppResponse) return resolvedAppResponse;
   const requestPath = new URL(req.url).pathname;
+  if (requestPath === '/v1/apps') {
+    if (req.method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (!opts.appHost) return jsonResponse({ error: 'app-host-not-wired' }, 503);
+    const requestOrigin = new URL(req.url).origin;
+    const requestHost = new URL(req.url).hostname;
+    const consoleTarget = requestHost === 'console.elanous.ai' || requestHost.endsWith('.elanous.ai')
+      ? { kind: 'hosted' as const }
+      : { kind: 'local' as const, nexusOrigin: requestOrigin };
+    let lifecycleBySlug: Map<string, AppLifecycleSnapshot | null>;
+    try { lifecycleBySlug = new Map(opts.appHost.slugs.map(slug => [slug, opts.appLifecycleSnapshot?.(slug) ?? null])); }
+    catch { return jsonResponse({ error: 'app-lifecycle-unavailable' }, 503); }
+    const apps = opts.appHost.slugs.flatMap(slug => {
+      const manifest = opts.appHost!.getManifest(slug);
+      if (!manifest) return [];
+      let simulationHref: string | undefined;
+      try {
+        if (opts.appPreviewUserSlug) {
+          simulationHref = simulationPreviewAddress({ appSlug: slug, userSlug: opts.appPreviewUserSlug });
+        }
+      }
+      catch { /* An app slug may be valid locally but too long for the public relay host. */ }
+      return [{
+        slug,
+        name: manifest.title,
+        description: typeof manifest.description === 'string' ? manifest.description : '',
+        lifecycle: lifecycleBySlug.get(slug) ?? null,
+        // Environment-specific status stays conservative; the durable shared lifecycle projection is returned separately.
+        simulation: { status: 'not-created', ...(simulationHref ? { href: simulationHref } : {}) },
+        production: { status: 'not-created', href: consoleAddress(consoleTarget) },
+      }];
+    });
+    return jsonResponse({ apps });
+  }
   // Signed app-storage uploads use their own path so the bearer-authenticated
   // app API never shares credentials with the object PUT, but both endpoints
   // are consumers of the same appRoutes registry.
@@ -2018,6 +2129,22 @@ export async function routeRequest(
     if (pathname === '/v1/setup/claim' && (method === 'POST' || method === 'OPTIONS')) {
       return method === 'OPTIONS' ? corsPreflight('POST, OPTIONS') : handleSetupClaim(req);
     }
+    if (pathname === '/v1/setup/credential-claim' && method === 'POST') {
+      return handleCredentialRegistrationClaim(req);
+    }
+    if (pathname === '/v1/setup/credential-register' && method === 'POST') {
+      return handleCredentialRegistrationSubmit(req);
+    }
+    if (pathname === '/v1/credentials/registration-links' && method === 'POST') {
+      return handleCredentialRegistrationLinkCreate(req, {
+        authorizeOwner: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) && !setupBearerScopeDenied(request, opts.metaApi),
+      });
+    }
+    if (pathname === '/v1/credentials/registration-links/revoke' && method === 'POST') {
+      return handleCredentialRegistrationLinkRevoke(req, {
+        authorizeOwner: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) && !setupBearerScopeDenied(request, opts.metaApi),
+      });
+    }
     // PWA `/setup` wizard Phase 1 (2026-05-19) — LLM provider 첫 셋업.
     // POST 는 mutation 블록 안에서 등록 (memory `feedback_post_route_must_be_in_method_block`).
     // GET sibling 은 아래 GET-only 블록에 등록.
@@ -2901,6 +3028,11 @@ export async function routeRequest(
   if (pathname === '/v1/setup/codex-login') {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return handleSetupCodexLoginGet();
+  }
+  if (pathname === '/v1/credentials/slots' && method === 'GET') {
+    return handleCredentialSlotsGet(req, {
+      authorizeOwner: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) && !setupBearerScopeDenied(request, opts.metaApi),
+    });
   }
   if (pathname === '/v1/setup/llm-providers') {
     return handleLlmProvidersList(req);

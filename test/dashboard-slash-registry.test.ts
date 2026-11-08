@@ -1010,15 +1010,6 @@ describe('B-1.c · 8 small standalone case migrations', () => {
     expect(state.blockAttachLog).toEqual([{ op: 'clear' }]);
     expect(state.debugLines[0]).toContain('all 5 attachments detached');
   });
-
-  test('rebind dispatches to runRebindCommand and pushes painted lines', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx } = makeFakeCtx();
-    const r = await reg.dispatch('rebind', [], ctx);
-    expect(r.kind).toBe('continue');
-    expect(ctx.chatLines.length).toBeGreaterThan(0);
-  });
-
 });
 
 // Wait for fire-and-forget IIFE inside `runDeferredSkillToolSlash` to flush.

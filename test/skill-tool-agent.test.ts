@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // ── Agent tool (P1 — Task spawn for skills) ──
 //
 // Covers buildAgentTool spec shape + dispatchAgent end-to-end behaviour
@@ -18,7 +19,7 @@ import {
 } from '../src/skills/tools/agent';
 import { globalAgentRegistry } from '../src/agent/registry';
 import type { AgentDefinition } from '../src/agent/types';
-import type { LLMProvider, LLMStreamEvent, LLMToolSpec } from '../src/llm';
+import type { LLMProvider, LLMStreamEvent } from '../src/llm';
 import { debug } from '../src/debug/log';
 
 // ── Fakes ──

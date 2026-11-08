@@ -1,14 +1,16 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { streamCodexResponsesEvents } from '../src/llm';
 import { debug } from '../src/debug/log';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 const endpoint = 'https://chatgpt.com/backend-api/codex/responses';
-let priorFetch: typeof fetch;
+let fetchDevice: FakeFetchDevice | undefined;
 let priorRunId: string | undefined;
 
 function installSse(sse: string): void {
-  priorFetch = globalThis.fetch;
-  globalThis.fetch = (async () => {
+  fetchDevice?.restore();
+  fetchDevice = createFakeFetchDevice([{
+    url: '/backend-api/codex/responses', method: 'POST', response: () => {
     const encoder = new TextEncoder();
     const stream = new ReadableStream({
       start(controller) {
@@ -17,7 +19,7 @@ function installSse(sse: string): void {
       },
     });
     return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
-  }) as unknown as typeof fetch;
+  } }]);
 }
 
 async function streamFailure(payload: object): Promise<Error> {
@@ -45,7 +47,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  globalThis.fetch = priorFetch;
+  fetchDevice?.restore();
+  fetchDevice = undefined;
   if (priorRunId === undefined) delete process.env.ELANOUS_RUN_ID;
   else process.env.ELANOUS_RUN_ID = priorRunId;
   if (priorHostId === undefined) delete process.env.ELANOUS_HOST_ID;

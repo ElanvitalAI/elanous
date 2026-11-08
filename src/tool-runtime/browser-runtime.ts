@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── BrowserNavigate + BrowserRead ToolRuntime (BCO Phase D4) ──
 //
 // The first two LLM-callable entry points into the Browser Context
@@ -27,7 +28,7 @@ import type { CdpClient } from '../browser-cdp/client.js';
 import { createCdpClient, CdpUnavailable } from '../browser-cdp/client.js';
 import { getBrowserCdpAvailability } from '../browser-cdp/availability.js';
 import { defaultControlSignalBus } from '../input/control-signal.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import { debug } from '../debug/log.js';
 import { getHarnessRunId } from '../harness/harness-space.js';
 import { decideTypeAction } from '../harness/browser-act-type.js';

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── Skill execution engine ──
 // Discover SKILL.md files under ~/.claude/skills/, parse their YAML frontmatter,
 // substitute template variables, and run them through the selected LLM provider.
@@ -10,11 +11,7 @@ import { readFileSync, readdirSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { LOCAL_SKILLS_DIR } from '../config.js';
 import { applyToolPolicy } from '../tool-runtime/tool-policy.js';
-import {
-  getProvider, resolveDefaultProvider, isModelCompatible, streamLLM, streamLLMWithTools,
-  buildMessagesWithContext, isLikelyVisionModel,
-  type LLMMessage, type LLMProvider, type LLMToolSpec,
-} from '../llm.js';
+import { getProvider, resolveDefaultProvider, isModelCompatible, streamLLM, streamLLMWithTools, buildMessagesWithContext, isLikelyVisionModel, type LLMMessage, type LLMProvider } from '../llm.js';
 import { loadAllAttachments } from '../extractors.js';
 import { listAttachments, type ContextRegistry } from '../context.js';
 import { buildBashTool, dispatchBash } from './tools/index.js';

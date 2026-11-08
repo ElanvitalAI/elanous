@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // TUI-TOKEN-GUARD-WIRE — the #32254 request-size cap on the production TUI path.
 //
 // The TUI runs DashboardSession → bridgeCoreTurnToAcp → runCoreTurn, not
@@ -16,7 +17,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { PROVIDERS, streamLLMWithTools, type LLMMessage, type LLMToolSpec } from '../src/llm.js';
+import { PROVIDERS, streamLLMWithTools, type LLMMessage } from '../src/llm.js';
 import type { ChatMessage } from '../src/chat/index.js';
 import type { AcpTurnContext } from '../src/acp/server.js';
 import { debug } from '../src/debug/log.js';

@@ -60,8 +60,16 @@ export function runChecklistGate(context: GraphContext = readGraphContext(), now
   }
   if (carryFailure) gate.ok = false;
   const counts = summarizeChecklist(data);
+  // Auto-approval runs after this snapshot. Keep the yellow rows that still block publication in its node output,
+  // including postpub rows (which are intentionally excluded from the pre-cut gate itself).
+  const publishBlockingYellow = [...new Set([
+    ...gate.blocked,
+    ...gate.undecided,
+    ...data.items.filter((item) => item.kind === 'postpub' && item.status === 'yellow').map((item) => item.id),
+  ])];
   const summary = `${carryFailure ? `${carryFailure} · ` : ''}확인표 🟢${counts.green} 🟡${counts.yellow}(이동 ${gate.moved.length} · 알려진 문제 ${gate.knownIssues.length} · 막음 ${gate.blocked.length} · 판정 없음 ${gate.undecided.length}) 🔴${counts.red}${gate.red.length ? ` (${gate.red.join(', ')})` : ''}${gate.parity?.length ? ` · ⚠ 짝 경고 ${gate.parity.length}(${gate.parity.map((p) => p.id).join(', ')})` : ''} · 이월 ${carried.length}(${carried.join(', ') || '-'})`;
-  return { outcome: gate.ok ? 'ok' as const : 'fail' as const, verdict: gate.ok ? 'pass' as const : 'fail' as const, summary, ...gate, carried };
+  return { outcome: gate.ok ? 'ok' as const : 'fail' as const, verdict: gate.ok ? 'pass' as const : 'fail' as const,
+    summary, ...gate, publishBlockingYellow, carried };
 }
 
 if (import.meta.main) {

@@ -3,12 +3,62 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gateImagePinPath, pinnedGateImageSync, readGateImagePin, replaceGateImagePin, resolveGateImagePin, supersedeGateImagePin,
-  writeGateImagePin } from './gate-image-pin.js';
+  prebuildGateImagePinAtCut, writeGateImagePin } from './gate-image-pin.js';
 import { podCommandJobManifest } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 
 const digestA = `sha256:${'a'.repeat(64)}`;
 const digestB = `sha256:${'b'.repeat(64)}`;
 const digestC = `sha256:${'c'.repeat(64)}`;
+
+it('GATE-IMAGE-PREBUILD-AT-CUT sim: builds after cut and persists the exact run pin', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-image-prebuild-sim-'));
+  const commit = 'd'.repeat(40);
+  const image = `elanous-harness:${commit.slice(0, 12)}`;
+  const members = [{ context: 'pool-a' }, { context: 'pool-b' }];
+  const seen = new Map<string, string | null>();
+  let builds = 0;
+  const options = {
+    root, version: '0.3.6', runId: 'cut-run', commit, image, members,
+    probe: (member: { context: string }) => seen.get(member.context) ?? null,
+    sync: async () => {
+      builds++;
+      for (const member of members) seen.set(member.context, digestA);
+      return new Map(members.map((member) => [member.context, { ok: true }])) as Map<string, { ok: boolean }>;
+    },
+  };
+  try {
+    const prebuilt = await prebuildGateImagePinAtCut(options);
+    expect(prebuilt).toEqual({ outcome: 'built', digest: digestA, eligiblePools: ['pool-a', 'pool-b'] });
+    expect(builds).toBe(1);
+    const pinPath = gateImagePinPath(root, '0.3.6', 'cut-run');
+    expect(readGateImagePin(pinPath, 'cut-run', image, commit)?.digest).toBe(digestA);
+
+    const reused = await prebuildGateImagePinAtCut(options);
+    expect(reused).toEqual({ outcome: 'reused', digest: digestA, eligiblePools: ['pool-a', 'pool-b'] });
+    expect(builds).toBe(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('GATE-IMAGE-PREBUILD-AT-CUT append refreshes the run pin for the new cut commit', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-image-prebuild-append-'));
+  const firstCommit = 'd'.repeat(40), nextCommit = 'e'.repeat(40);
+  const members = [{ context: 'pool-a' }];
+  const seen = new Map<string, string>();
+  let builds = 0;
+  const input = (commit: string, digest: string) => ({ root, version: '0.3.6', runId: 'append-run', commit,
+    image: `elanous-harness:${commit.slice(0, 12)}`, members,
+    probe: (member: { context: string }) => seen.get(`${commit}:${member.context}`) ?? null,
+    sync: async () => { builds++; seen.set(`${commit}:pool-a`, digest); return new Map([['pool-a', { ok: true }]]); },
+  });
+  try {
+    await prebuildGateImagePinAtCut(input(firstCommit, digestA));
+    const appended = await prebuildGateImagePinAtCut(input(nextCommit, digestB));
+    expect(appended).toEqual({ outcome: 'built', digest: digestB, eligiblePools: ['pool-a'] });
+    expect(builds).toBe(2);
+    expect(readGateImagePin(gateImagePinPath(root, '0.3.6', 'append-run'), 'append-run',
+      `elanous-harness:${nextCommit.slice(0, 12)}`, nextCommit)?.digest).toBe(digestB);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 describe('resolveGateImagePin', () => {
   it('selects one immutable digest for the first sweep and excludes pools without it', () => {

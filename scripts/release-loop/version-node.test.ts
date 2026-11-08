@@ -1,9 +1,9 @@
-import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterAll, afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative, resolve, sep } from 'node:path';
-import { nextDevVersion } from './version-node';
+import { dirname, join, resolve } from 'node:path';
+import { main as versionNodeMain, nextDevVersion } from './version-node';
 import { createTempGitRemote } from '../../src/ux-sim/temp-git-remote';
 import { runGraph } from '../../src/graph-runner/runner';
 import { parseOptions } from './gate-node';
@@ -14,6 +14,34 @@ setDefaultTimeout(60_000);
 
 const scratch: string[] = [];
 afterEach(() => { for (const path of scratch.splice(0)) rmSync(path, { recursive: true, force: true }); });
+let devBumpSourceRemote: string | undefined;
+let devBumpSourceRoot: string | undefined;
+afterAll(() => {
+  if (devBumpSourceRoot) rmSync(devBumpSourceRoot, { recursive: true, force: true });
+});
+
+test('cut-branch prebuilds the cut-commit image for the same graph run before returning', () => {
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  const runId = 'gate-image-cut-run';
+  const commit = 'c'.repeat(40);
+  const calls: unknown[] = [];
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ runId, input: { version: '0.3.6', gateExecutor: 'pod',
+    gateImagePin: 'cut-commit', gatePodPool: 'pool-a@aws1:1' }, outputs: {} });
+  try {
+    const output = versionNodeMain(['cut-branch', '--version', '0.3.6', '--base', 'a'.repeat(40), '--pick', 'b'.repeat(40)], process.cwd(), {
+      cutBranch: () => ({ branch: 'release/0.3.6', commit, dryRun: false }),
+      prebuildGateImage: (input) => {
+        calls.push(input);
+        return { outcome: 'built', digest: `sha256:${'d'.repeat(64)}`, eligiblePools: ['pool-a'] };
+      },
+    });
+    expect(calls).toEqual([{ root: expect.any(String), repo: process.cwd(), runId, version: '0.3.6', commit, pool: 'pool-a@aws1:1' }]);
+    expect(output).toMatchObject({ outcome: 'ok', commit, gateImagePrebuild: { outcome: 'built', eligiblePools: ['pool-a'] } });
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
 
 const fakeGit = `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -38,13 +66,22 @@ else if (args[0] === 'rev-parse' && args[1] === '--verify') {
 }
 else if (args[0] === 'merge-base') {
   const key = args.slice(1).join(' ');
+  if (state.mergeBaseOutput && key in state.mergeBaseOutput) console.log(state.mergeBaseOutput[key]);
   if (state.ancestor && key in state.ancestor) process.exit(state.ancestor[key] ? 0 : 1);
   process.exit(state.onMain === false ? 1 : 0);
 }
+else if (args[0] === 'log' && args.includes('--grep=^Cut from main ')) console.log(state.recordedCutBase ? (state.cutCommit || 'e'.repeat(40)) + '\\x1fCut from main ' + state.recordedCutBase + '.' : '');
 else if (args[0] === 'rev-list' && args[1] === '--parents') {
   const sha = args.at(-1);
   const parents = (state.parents || {})[sha] || [];
   console.log([sha].concat(parents).join(' '));
+}
+else if (args[0] === 'cherry-pick') {
+  if (state.cherryPickFails) { console.error(state.cherryPickError || 'simulated cherry-pick failure'); process.exit(1); }
+  process.exit(0);
+}
+else if (args[0] === 'diff' && args[1] === '--name-only' && args[2] === '--diff-filter=U') {
+  for (const path of state.unmergedFiles || []) console.log(path);
 }
 else if (args[0] === 'show-ref') process.exit(state.localBranch ? 0 : 1);
 else if (args[0] === 'ls-remote' && args[1] === '--tags') {
@@ -395,6 +432,127 @@ test('graph cutCommit selects the supplied main ancestor or release branch tip, 
   }
 });
 
+test('branch cut uses the CLI-verified main SHA when origin/main advances before version-release', () => {
+  const pinned = 'a'.repeat(40);
+  const advancedMain = 'b'.repeat(40);
+  const { root, run } = fixture('0.2.4-dev.0');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, sha: advancedMain,
+    revParse: { [`${pinned}^{commit}`]: pinned, [`${advancedMain}^{commit}`]: advancedMain } }));
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', branchCut: true, branchCutBaseCommit: pinned } });
+  try {
+    const { status, output, calls } = run('release', '--json');
+    expect(status).toBe(0);
+    expect(output.outcome).toBe('ok');
+    const worktreeAdd = calls.split('\n').find((line) => line.startsWith('git worktree add --detach '));
+    expect(worktreeAdd).toEndWith(` ${pinned}`);
+    expect(worktreeAdd).not.toEndWith(` ${advancedMain}`);
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+test('an existing release branch remains reusable after its release commit reaches main', () => {
+  const recordedBase = 'a'.repeat(40);
+  const verifiedMain = 'b'.repeat(40);
+  const tip = 'c'.repeat(40);
+  const { root, run } = fixture('0.2.4-dev.0');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, sha: verifiedMain, chosen: tip, chosenVersion: '0.2.4', branchTip: tip,
+    recordedCutBase: recordedBase,
+    cutCommit: 'e'.repeat(40),
+    revParse: { [`refs/remotes/origin/release/0.2.4^{commit}`]: tip, [`${recordedBase}^{commit}`]: recordedBase, [`${'e'.repeat(40)}^`]: recordedBase },
+    mergeBaseOutput: { [`origin/main ${tip}`]: tip },
+    ancestor: { [`--is-ancestor ${recordedBase} ${verifiedMain}`]: true } }));
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', branchCut: true, branchCutBaseCommit: verifiedMain } });
+  try {
+    const { status, output } = run('release', '--json');
+    expect(status).toBe(0);
+    expect(output).toMatchObject({ outcome: 'ok', existing: true, commit: tip });
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+test('an existing release branch remains reusable when main advances independently of its cut', () => {
+  const recordedBase = 'a'.repeat(40);
+  const verifiedMain = 'b'.repeat(40);
+  const tip = 'c'.repeat(40);
+  const cutCommit = 'e'.repeat(40);
+  const { root, run } = fixture('0.2.4-dev.0');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, sha: verifiedMain, chosen: tip, chosenVersion: '0.2.4', branchTip: tip,
+    recordedCutBase: recordedBase, cutCommit,
+    revParse: { [`refs/remotes/origin/release/0.2.4^{commit}`]: tip, [`${recordedBase}^{commit}`]: recordedBase, [`${cutCommit}^`]: recordedBase },
+    mergeBaseOutput: { [`origin/main ${tip}`]: recordedBase },
+    ancestor: { [`--is-ancestor ${recordedBase} ${verifiedMain}`]: true } }));
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', branchCut: true, branchCutBaseCommit: verifiedMain } });
+  try {
+    const { status, output } = run('release', '--json');
+    expect(status).toBe(0);
+    expect(output).toMatchObject({ outcome: 'ok', existing: true, commit: tip });
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+test('an existing release branch refuses a cut record whose commit parent differs from its recorded SHA', () => {
+  const recordedBase = 'a'.repeat(40);
+  const actualFork = 'd'.repeat(40);
+  const verifiedMain = 'b'.repeat(40);
+  const tip = 'c'.repeat(40);
+  const { root, run } = fixture('0.2.4-dev.0');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, sha: verifiedMain, chosen: tip, chosenVersion: '0.2.4', branchTip: tip,
+    recordedCutBase: recordedBase,
+    cutCommit: 'e'.repeat(40),
+    revParse: { [`refs/remotes/origin/release/0.2.4^{commit}`]: tip, [`${recordedBase}^{commit}`]: recordedBase, [`${'e'.repeat(40)}^`]: actualFork },
+    mergeBaseOutput: { [`origin/main ${tip}`]: actualFork },
+    ancestor: { [`--is-ancestor ${recordedBase} ${verifiedMain}`]: true } }));
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', branchCut: true, branchCutBaseCommit: verifiedMain } });
+  try {
+    const { status, output, calls } = run('release', '--json');
+    expect(status).toBe(1);
+    expect(output.error).toContain('parent');
+    expect(calls).not.toContain('git push');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
+test('an existing release branch refuses when its recorded base is not in the verified main history', () => {
+  const recordedBase = 'a'.repeat(40);
+  const verifiedMain = 'b'.repeat(40);
+  const tip = 'c'.repeat(40);
+  const cutCommit = 'e'.repeat(40);
+  const { root, run } = fixture('0.2.4-dev.0');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, sha: verifiedMain, chosen: tip, chosenVersion: '0.2.4', branchTip: tip,
+    recordedCutBase: recordedBase, cutCommit,
+    revParse: { [`refs/remotes/origin/release/0.2.4^{commit}`]: tip, [`${recordedBase}^{commit}`]: recordedBase, [`${cutCommit}^`]: recordedBase },
+    mergeBaseOutput: { [`origin/main ${tip}`]: tip },
+    ancestor: { [`--is-ancestor ${recordedBase} ${verifiedMain}`]: false } }));
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', branchCut: true, branchCutBaseCommit: verifiedMain } });
+  try {
+    const { status, output, calls } = run('release', '--json');
+    expect(status).toBe(1);
+    expect(output.error).toContain('is not an ancestor of the CLI-verified main commit');
+    expect(calls).not.toContain('git push');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previous;
+  }
+});
+
 test('release branch tip absent locally is fetched before selecting its commit', () => {
   const { root, run } = fixture('0.2.5');
   const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
@@ -671,6 +829,131 @@ test('dev-bump transitions draft PR through ready before pinned merge of the sam
   }
 });
 
+function cloneDevBumpSourceSnapshot(sourceRoot: string, snapshotSource: string, sourceRemote: string, env: NodeJS.ProcessEnv = process.env): string {
+  const snapshot = spawnSync('git', ['clone', '--bare', snapshotSource, sourceRemote], {
+    cwd: sourceRoot, env, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
+  });
+  if (snapshot.status !== 0 || snapshot.error) {
+    rmSync(sourceRoot, { recursive: true, force: true });
+    throw new Error(`could not cache dev-bump simulation source: ${snapshot.stderr}`);
+  }
+  return sourceRemote;
+}
+
+function cacheDevBumpSourceSnapshot(
+  sourceRoot: string,
+  snapshotSource: string,
+  sourceRemote: string,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const cachedSourceRemote = cloneDevBumpSourceSnapshot(sourceRoot, snapshotSource, sourceRemote, env);
+  devBumpSourceRoot = sourceRoot;
+  devBumpSourceRemote = cachedSourceRemote;
+}
+
+function prepareTrackedCheckoutSnapshotIndex(project: string, indexPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const runGit = (args: string[], env = baseEnv, input?: string): string => {
+    const result = spawnSync('git', args, { cwd: project, env, input, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
+      stdio: ['pipe', 'pipe', 'pipe'] });
+    if (result.status !== 0 || result.error) throw new Error(`git ${args[0]} failed: ${result.stderr || result.error}`);
+    return result.stdout.trim();
+  };
+  const runGitPaths = (args: string[], env = baseEnv): string[] => {
+    const result = spawnSync('git', args, { cwd: project, env, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'] });
+    if (result.status !== 0 || result.error) throw new Error(`git ${args[0]} failed: ${result.stderr || result.error}`);
+    return result.stdout.split('\0').filter(Boolean);
+  };
+  const sourceHead = runGit(['rev-parse', 'HEAD']);
+  const snapshotEnv = { ...baseEnv, GIT_INDEX_FILE: indexPath };
+  runGit(['read-tree', sourceHead], snapshotEnv);
+  // Reapply exactly the currently tracked checkout delta (staged plus unstaged) onto HEAD.
+  // Disable rename detection so staged rename source and destination both reconcile the index.
+  const trackedPaths = new Set(runGitPaths(['ls-files', '-z']));
+  const assumeUnchangedPaths = runGitPaths(['ls-files', '-v', '-z'])
+    .filter((entry) => /^[a-z] /.test(entry))
+    .map((entry) => entry.slice(2));
+  const changedPaths = new Set([
+    ...runGitPaths(['diff', '--no-renames', '--cached', '--name-only', '-z', 'HEAD', '--']),
+    ...runGitPaths(['diff-files', '--no-renames', '--name-only', '-z', '--']),
+    // Check only assume-unchanged entries against our clean index; the caller's index hides their edits.
+    ...(assumeUnchangedPaths.length
+      ? runGitPaths(['diff-files', '--no-renames', '--name-only', '-z', '--', ...assumeUnchangedPaths.map((path) => `:(literal)${path}`)], snapshotEnv)
+      : []),
+  ]);
+  const addPaths: string[] = [];
+  const removePaths: string[] = [];
+  for (const file of changedPaths) {
+    const path = join(project, file);
+    let pathExists = false;
+    try { lstatSync(path); pathExists = true; } catch { /* a tracked deletion */ }
+    if (trackedPaths.has(file) && pathExists) addPaths.push(`:(literal)${file}`);
+    else removePaths.push(`:(literal)${file}`);
+  }
+  if (removePaths.length) runGit(['rm', '--cached', '--ignore-unmatch', '--', ...removePaths], snapshotEnv);
+  if (addPaths.length) runGit(['add', '-f', '--', ...addPaths], snapshotEnv);
+  return snapshotEnv;
+}
+
+test('source snapshot tree preserves staged and unstaged tracked changes, renames, deletions, and dangling links', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dev-bump-source-tree-'));
+  scratch.push(root);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const run = (args: string[], input?: string, env: NodeJS.ProcessEnv = process.env): string => {
+    const result = spawnSync('git', args, { cwd: repo, env, input, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+    if (result.status !== 0 || result.error) throw new Error(`git ${args[0]} failed: ${result.stderr || result.error}`);
+    return result.stdout.trim();
+  };
+  run(['init', '-q']);
+  run(['config', 'user.name', 'CENSUS test']);
+  run(['config', 'user.email', 'census@example.invalid']);
+  for (const [file, content] of Object.entries({
+    'staged.txt': 'before staged\n',
+    'unstaged.txt': 'before unstaged\n',
+    'deleted.txt': 'remove me\n',
+    'rename-from.txt': 'renamed content\n',
+    'assume-unchanged.txt': 'before assume\n',
+    'replace-me': 'file before directory replacement\n',
+    ':(exclude)special.txt': 'before special\n',
+    '.gitignore': 'ignored-new.txt\n',
+  })) writeFileSync(join(repo, file), content);
+  run(['add', '.']);
+  run(['commit', '-qm', 'base']);
+
+  run(['update-index', '--assume-unchanged', 'assume-unchanged.txt']);
+  writeFileSync(join(repo, 'assume-unchanged.txt'), 'after assume\n');
+  writeFileSync(join(repo, 'staged.txt'), 'after staged\n');
+  run(['add', 'staged.txt']);
+  writeFileSync(join(repo, 'unstaged.txt'), 'after unstaged\n');
+  run(['rm', '-q', 'deleted.txt']);
+  run(['mv', 'rename-from.txt', 'rename-to.txt']);
+  run(['rm', '-q', 'replace-me']);
+  mkdirSync(join(repo, 'replace-me'));
+  writeFileSync(join(repo, 'replace-me', 'child.txt'), 'directory replacement\n');
+  run(['add', '--all', '--', 'replace-me']);
+  symlinkSync('missing-target', join(repo, 'dangling-link'));
+  run(['add', 'dangling-link']);
+  writeFileSync(join(repo, ':(exclude)special.txt'), 'after special\n');
+  writeFileSync(join(repo, 'ignored-new.txt'), 'force tracked\n');
+  run(['add', '-f', '--', 'ignored-new.txt']);
+
+  const snapshotEnv = prepareTrackedCheckoutSnapshotIndex(repo, join(root, 'snapshot.index'), process.env);
+  const tree = run(['write-tree'], undefined, snapshotEnv);
+  expect(run(['show', `${tree}:assume-unchanged.txt`])).toBe('after assume');
+  expect(run(['show', `${tree}:staged.txt`])).toBe('after staged');
+  expect(run(['show', `${tree}:unstaged.txt`])).toBe('after unstaged');
+  expect(spawnSync('git', ['cat-file', '-e', `${tree}:deleted.txt`], { cwd: repo }).status).not.toBe(0);
+  expect(spawnSync('git', ['cat-file', '-e', `${tree}:rename-from.txt`], { cwd: repo }).status).not.toBe(0);
+  expect(run(['ls-tree', tree, 'replace-me'])).toMatch(/^040000 tree /);
+  expect(run(['show', `${tree}:replace-me/child.txt`])).toBe('directory replacement');
+  expect(run(['show', `${tree}:rename-to.txt`])).toBe('renamed content');
+  expect(run(['ls-tree', tree, 'dangling-link'])).toMatch(/^120000 blob /);
+  expect(run(['show', `${tree}:dangling-link`])).toBe('missing-target');
+  expect(run(['show', `${tree}::(exclude)special.txt`])).toBe('after special');
+  expect(run(['show', `${tree}:ignored-new.txt`])).toBe('force tracked');
+});
+
 function runRealDevBumpCliScenario(failReady = false) {
   const project = resolve(import.meta.dir, '../..');
   const previousAuthorDate = process.env.GIT_AUTHOR_DATE;
@@ -683,11 +966,27 @@ function runRealDevBumpCliScenario(failReady = false) {
   if (previousCommitterDate === undefined) delete process.env.GIT_COMMITTER_DATE;
   else process.env.GIT_COMMITTER_DATE = previousCommitterDate;
   scratch.push(fixtureRemote.root);
-  const { seed, checkout, remote, git, gitEnv } = fixtureRemote;
+  const { checkout, remote, git, gitEnv } = fixtureRemote;
   const statePath = join(fixtureRemote.root, 'fake-gh-state.json');
   const callsPath = join(fixtureRemote.root, 'fake-gh-calls.jsonl');
   const fakeBin = join(fixtureRemote.root, 'fake-bin');
   mkdirSync(fakeBin);
+  const fakeBunPath = join(fakeBin, 'bun');
+  writeFileSync(fakeBunPath, `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+// Reuse the preinstalled project dependencies; package installation is outside this CLI lifecycle contract.
+if (args[0] === "install" && args.includes("--frozen-lockfile")) {
+  const modules = path.join(process.cwd(), "node_modules");
+  if (!fs.existsSync(modules)) fs.symlinkSync(path.join(${JSON.stringify(project)}, "node_modules"), modules, "dir");
+  process.exit(0);
+}
+const result = spawnSync(${JSON.stringify(process.execPath)}, args, { cwd: process.cwd(), stdio: "inherit" });
+process.exit(result.status ?? 1);
+`);
+  chmodSync(fakeBunPath, 0o755);
   const fakeSshPath = join(fakeBin, 'ssh-local-git-transport');
   writeFileSync(fakeSshPath, `#!/usr/bin/env node
 const { spawnSync } = require('node:child_process');
@@ -757,23 +1056,48 @@ console.error('unsupported fake gh: ' + args.join(' ')); process.exit(2);
 `);
   chmodSync(fakeGhPath, 0o755);
 
-  // Build a full source fixture so the production CLI's real checks see the same files. Git pushes
-  // and fetches stay inside the temporary bare remote; only GitHub's `gh` boundary is faked.
-  const excluded = new Set(['.git', '.elanous', '.elanous-test', '.gate-artifacts', 'node_modules', 'coverage', 'dist', '.next', '.turbo']);
-  cpSync(project, seed, { recursive: true, filter: (source) => {
-    const path = relative(project, source);
-    return !path || !path.split(sep).some((part) => excluded.has(part));
-  } });
-  const packageJson = JSON.parse(readFileSync(join(project, 'package.json'), 'utf8')) as { version: string };
-  packageJson.version = '0.2.4';
-  writeFileSync(join(seed, 'package.json'), `${JSON.stringify(packageJson, null, 2)}\n`);
-  git(seed, ['add', '-A']);
-  const committed = spawnSync('git', ['commit', '-m', 'simulation source fixture'], {
-    cwd: seed, env: { ...process.env, ...gitEnv, GIT_AUTHOR_DATE: '2000-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2000-01-01T00:00:00Z' },
-    stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
-  });
-  if (committed.status !== 0 || committed.error) throw new Error(`could not commit dev-bump simulation source: ${committed.stderr}`);
-  git(seed, ['push', 'origin', 'main']);
+  // Both real-CLI scenarios share one immutable source snapshot. Build its release-version
+  // commit from the existing Git tree so retry setup does not copy ~27k files and run git add -A.
+  if (!devBumpSourceRemote) {
+    const runGit = (args: string[], env: NodeJS.ProcessEnv = process.env, input?: string): string => {
+      const result = spawnSync('git', args, { cwd: project, env, input, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+      if (result.status !== 0 || result.error) throw new Error(`git ${args[0]} failed: ${result.stderr || result.error}`);
+      return result.stdout.trim();
+    };
+    const snapshotIndex = join(fixtureRemote.root, 'source-snapshot.index');
+    const snapshotEnv = prepareTrackedCheckoutSnapshotIndex(project, snapshotIndex, { ...process.env, ...gitEnv });
+    const packageJson = JSON.parse(readFileSync(join(project, 'package.json'), 'utf8')) as { version: string };
+    packageJson.version = '0.2.4';
+    const packageBlob = runGit(['hash-object', '-w', '--stdin'], snapshotEnv, `${JSON.stringify(packageJson, null, 2)}\n`);
+    runGit(['update-index', '--cacheinfo', `100644,${packageBlob},package.json`], snapshotEnv);
+    const publicExport = [
+      'include:',
+      '  - package.json',
+      '  - server.json',
+      '  - integrations/acp-registry/elanous/agent.json',
+      'exclude: []',
+      'replace: {}',
+      '',
+    ].join('\n');
+    const exportBlob = runGit(['hash-object', '-w', '--stdin'], snapshotEnv, publicExport);
+    runGit(['update-index', '--add', '--cacheinfo', `100644,${exportBlob},release/public-export.yaml`], snapshotEnv);
+    const snapshotTree = runGit(['write-tree'], snapshotEnv);
+    const snapshotCommit = runGit(['commit-tree', snapshotTree], {
+      ...snapshotEnv,
+      GIT_AUTHOR_DATE: '2000-01-01T00:00:00Z',
+      GIT_COMMITTER_DATE: '2000-01-01T00:00:00Z',
+    }, 'simulation source fixture\n');
+    runGit(['push', remote, `${snapshotCommit}:refs/heads/census-source`], snapshotEnv);
+    runGit(['--git-dir', remote, 'update-ref', 'refs/heads/main', snapshotCommit], snapshotEnv);
+    const sourceRoot = mkdtempSync(join(tmpdir(), 'dev-bump-source-'));
+    const sourceRemote = join(sourceRoot, 'source.git');
+    cacheDevBumpSourceSnapshot(sourceRoot, remote, sourceRemote, { ...process.env, ...gitEnv });
+  } else {
+    const imported = spawnSync('git', ['--git-dir', remote, 'fetch', devBumpSourceRemote, '+refs/heads/main:refs/heads/main'], {
+      cwd: fixtureRemote.root, env: { ...process.env, ...gitEnv }, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
+    });
+    if (imported.status !== 0 || imported.error) throw new Error(`could not reuse dev-bump simulation source: ${imported.stderr}`);
+  }
   git(checkout, ['remote', 'set-url', 'origin', 'git@github.com:example/repo.git']);
   gitEnv.GIT_SSH_COMMAND = fakeSshPath;
   gitEnv.GIT_ALLOW_PROTOCOL = 'file:ssh';
@@ -819,6 +1143,31 @@ console.error('unsupported fake gh: ' + args.join(' ')); process.exit(2);
     Object.assign(process.env, priorEnv);
   }
 }
+
+test('source snapshot clone failure leaves the next real CLI scenario able to retry', () => {
+  const savedSourceRoot = devBumpSourceRoot;
+  const savedSourceRemote = devBumpSourceRemote;
+  devBumpSourceRoot = undefined;
+  devBumpSourceRemote = undefined;
+  let failedSourceRoot = '';
+  try {
+    failedSourceRoot = mkdtempSync(join(tmpdir(), 'dev-bump-source-failure-'));
+    expect(() => cacheDevBumpSourceSnapshot(
+      failedSourceRoot, join(failedSourceRoot, 'missing-source.git'), join(failedSourceRoot, 'source.git'),
+    )).toThrow('could not cache dev-bump simulation source:');
+    expect(existsSync(failedSourceRoot)).toBe(false);
+    expect(devBumpSourceRoot).toBeUndefined();
+    expect(devBumpSourceRemote).toBeUndefined();
+    const retry = runRealDevBumpCliScenario();
+    if (retry.status !== 0) throw new Error(`dev-bump retry failed: ${JSON.stringify({ output: retry.output, stderr: retry.stderr })}`);
+    expect(retry.status).toBe(0);
+    expect(retry.output).toMatchObject({ outcome: 'ok', kind: 'dev-bump', version: '0.2.5-dev.0', pr: 42 });
+  } finally {
+    if (devBumpSourceRoot && devBumpSourceRoot !== savedSourceRoot) rmSync(devBumpSourceRoot, { recursive: true, force: true });
+    devBumpSourceRoot = savedSourceRoot;
+    devBumpSourceRemote = savedSourceRemote;
+  }
+}, 180_000);
 
 test('dev-bump runs the real CLI draft, ready, and pinned merge path against only a fake GitHub boundary', () => {
   const { status, output, calls, state, mainPackage } = runRealDevBumpCliScenario();
@@ -1162,6 +1511,7 @@ test('RELEASE-APPEND-BASE-AUTO: cut-branch --append with base omitted resolves t
     expect(output).toMatchObject({ outcome: 'ok', kind: 'release', version: '0.2.4', commit: null, pr: null, branch: 'release/0.2.4' });
     expect(stdout).toContain(`release/0.2.4: ${cutSha} + ${pickSha} (append) (dry-run) · base ${mainSha}`);
     expect(calls).toContain(`git rev-list --parents -n 1 ${cutSha}`);
+    expect(calls).toContain(`git cherry-pick ${pickSha}`);
   } finally {
     if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
     else process.env.ELANOUS_GRAPH_CONTEXT = previous;
@@ -1188,6 +1538,7 @@ test('RELEASE-APPEND-BASE-AUTO: cut-branch --append with a cut commit --base cor
     expect(stdout).toContain(`그 부모 ${mainSha} 를 쓰라`);
     expect(stdout).toContain(`· base ${mainSha}`);
     expect(calls).toContain(`git rev-list --parents -n 1 ${cutSha}`);
+    expect(calls).toContain(`git cherry-pick ${pickSha}`);
   } finally {
     if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
     else process.env.ELANOUS_GRAPH_CONTEXT = previous;

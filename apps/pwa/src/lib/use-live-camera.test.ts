@@ -15,12 +15,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { uploadAttachment } from './upload-attachment';
 import { useLiveCamera } from './use-live-camera';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../test-devices/fake-fetch';
 
-const realFetch = globalThis.fetch;
-
-afterEach(() => {
-  globalThis.fetch = realFetch;
-});
+let fakeFetch: FakeFetchDevice | undefined;
 
 describe('useLiveCamera module surface', () => {
   test('export is callable', () => {
@@ -29,30 +26,28 @@ describe('useLiveCamera module surface', () => {
 });
 
 describe('frame upload helper — used by useLiveCamera capture loop', () => {
-  let capturedFormData: FormData | null = null;
   let capturedAuth: string | undefined;
 
   beforeEach(() => {
-    capturedFormData = null;
+    fakeFetch?.restore();
     capturedAuth = undefined;
-    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
-      capturedFormData = init?.body as FormData;
-      const headers = (init?.headers ?? {}) as Record<string, string>;
-      capturedAuth = headers.authorization;
-      return {
-        ok: true,
-        status: 201,
-        json: async () => ({
+    fakeFetch = createFakeFetchDevice([{
+      url: '/v1/attachments',
+      method: 'POST',
+      response: (request) => {
+        capturedAuth = request.headers.authorization;
+        return Response.json({
           id: 'att-frame-1',
           filename: 'live-frame.jpg',
           mediaType: 'image/jpeg',
           size: 100,
           downloadUrl: '/v1/attachments/att-frame-1',
-        }),
-        text: async () => '',
-      } as unknown as Response;
-    }) as unknown as typeof fetch;
+        }, { status: 201 });
+      },
+    }]);
   });
+
+  afterEach(() => { fakeFetch?.restore(); fakeFetch = undefined; });
 
   test('ships JPEG blob under "file" form field with filename', async () => {
     const blob = new Blob([new Uint8Array(100)], { type: 'image/jpeg' });
@@ -64,8 +59,11 @@ describe('frame upload helper — used by useLiveCamera capture loop', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) throw new Error('unreachable');
     expect(r.meta.id).toBe('att-frame-1');
-    expect(capturedFormData).not.toBeNull();
-    expect(capturedFormData!.get('filename')).toBe('live-frame-12345.jpg');
+    const body = fakeFetch?.calls()[0]?.body;
+    expect(body).not.toBeNull();
+    const fields = JSON.parse(body!.slice('form-data:'.length)) as Array<[string, unknown]>;
+    expect(fields).toContainEqual(['filename', 'live-frame-12345.jpg']);
+    expect(fields).toContainEqual(['file', expect.objectContaining({ name: 'live-frame-12345.jpg' })]);
   });
 
   test('attaches Bearer auth header when token is set', async () => {
@@ -88,12 +86,8 @@ describe('frame upload helper — used by useLiveCamera capture loop', () => {
   });
 
   test('returns ok=false on non-OK response', async () => {
-    globalThis.fetch = (async () => ({
-      ok: false,
-      status: 500,
-      json: async () => ({ error: 'server error' }),
-      text: async () => 'server error',
-    } as unknown as Response)) as unknown as typeof fetch;
+    fakeFetch?.restore();
+    fakeFetch = createFakeFetchDevice([{ url: '/v1/attachments', method: 'POST', response: () => Response.json({ error: 'server error' }, { status: 500 }) }]);
     const r = await uploadAttachment({
       baseUrl: 'http://localhost:31415',
       file: new Blob(['x']),

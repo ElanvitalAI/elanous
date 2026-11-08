@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── §5-③ Phase C2b: continuation turn runner ──
 //
 // Adapts the CLI agent turn (chat.ts runTurn + the Read/Grep/Glob/
@@ -10,7 +11,7 @@
 // scheduler that calls this is default-off. See docs §5-③.
 
 import { runTurn, ensureCliSession } from '../session/chat.js';
-import { getProviderForConfig, type LLMToolSpec } from '../llm.js';
+import { getProviderForConfig } from '../llm.js';
 import type { UserConfig } from '../user-config.js';
 import { compactSessionHistory } from '../session/compact-session.js';
 import { buildTerminalCapableTurn } from '../agent/terminal-surface.js';

@@ -2,10 +2,7 @@
 // 대조군(z-ai/glm-5.1 · moonshotai/kimi-k3)으로 «DeepSeek 가 아닌 모델은 그대로» 를 같이 문다.
 import { expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
-import {
-  getProviderForConfig, parseOpenAISSELines, streamLLMWithTools, toOpenAIMessages, OPEN_WEIGHT_TOOL_DISCIPLINE,
-  type LLMMessage, type LLMOpts, type LLMStreamEvent,
-} from './llm.js';
+import { getProviderForConfig, parseOpenAISSELines, streamLLMWithTools, toOpenAIMessages, OPEN_WEIGHT_TOOL_DISCIPLINE, type LLMMessage, type LLMOpts, type LLMStreamEvent } from './llm.js';
 import { getModelFamily } from './models/prompts.js';
 import {
   isOpenRouterDeepSeekV4WireModel, nonEmptyReasoningDetails, openRouterDeepSeekCatalogEffort, openRouterDeepSeekEffort,

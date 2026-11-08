@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { debug } from '../debug/log.js';
 import * as harnessSkillExec from '../harness/skill-exec.js';
 import { invokeResearch } from '../research-bridge/invoke.js';
@@ -6,7 +7,7 @@ import type { SkillIndexEntry } from '../skills/index.js';
 import { dirname } from 'node:path';
 import { resolveSkillName } from '../skills/name-match.js';
 import { getUserConfig } from '../user-config.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime } from './types.js';
 
 /** Whole nested-skill budget; the inner LLM idle timer only bounds one stream. */

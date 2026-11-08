@@ -1,4 +1,5 @@
 import { withFileLockSync } from '../../storage/file-lock.js';
+import { spawn } from 'node:child_process';
 import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { CardStore, taskCardsDir, type TaskCard } from '../../task-cards/card-store.js';
@@ -30,10 +31,12 @@ import { runAskOpContextInbox, runCoordinatorAgentInbox, type CoordinatorInboxRe
 import type { KnowhowOptions } from './knowhow-pack.js';
 import { loadAgentRolePack, type AgentReplyInput } from '../agent-reply.js';
 import type { LLMProvider } from '../../llm.js';
+import { runSimImpactAudit, type SimImpactGap } from './sim-impact-audit.js';
 
 export type Window = '08' | '12' | '18';
 export type Node = 'intake' | 'split' | 'place' | 'delegate' | 'launch' | 'reconcile' | 'report';
 export type Mode = 'off' | 'shadow' | 'live';
+export type SimImpactAuditDispatch = { scheduled: boolean; pid?: number; logPath?: string };
 const SEAT_LOOP_IDS: Readonly<Record<string, string>> = { OP: 'op-seat', MK: 'cmo-seat', TC: 'tc-seat', UX: 'ux-seat' };
 export interface Cell { id: string; title: string; kind?: string; seat?: string; host?: string; gridHost?: boolean; version?: string; cardId: string; origin: 'candidate' | 'flow1a'; priority?: 'P0' | 'P1' | 'P2' | 'P3' | 'P4'; predecessors?: string[]; consensusProposalId?: string }
 export interface TickState {
@@ -88,6 +91,10 @@ export interface TickDeps {
   loadAdapter?: (path: string, name: string) => Promise<unknown>;
   checklist?: (version: string) => Pick<ChecklistItem, 'id' | 'status'>[];
   observe?: (event: string, data: { loopId: string; runId: string; window: Window; node: Node; reason: string; count: number; targetLoopId?: string }) => void;
+  /** Inline SIM-IMPACT seam for deterministic tests and injected callers; the resident CLI defers its default audit. */
+  simImpactAudit?: (window: Window, root: string) => SimImpactGap[] | Promise<SimImpactGap[]>;
+  /** Production keeps the census outside the report tick; tests can observe the deferred handoff. */
+  scheduleSimImpactAudit?: (window: Window, root: string, runId: string) => SimImpactAuditDispatch;
   print?: (line: string) => void;
   /** ORCH-TA-HAND seams — absent = config `loops.orchestrator.handToTaskAgent(Cell)` · real `handTask` · `defaultTaskLauncher`. */
   handToTaskAgent?: 'off' | 'shadow' | 'live';
@@ -527,6 +534,7 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
   const root = deps.root ?? effectiveInstanceRoot();
   const runId = deps.runId ?? graphRunId() ?? `${kstDay(now)}-${window}`;
   const path = stateFile(root, runId);
+  let scheduleSimImpactAuditAfterReport = false;
   const consensus = new ConsensusEngine({ stateDir: root });
   const consensusAllows = (cell: Cell): boolean => {
     if (cell.kind !== 'cross-branch-change' && !cell.consensusProposalId) return true;
@@ -1039,6 +1047,16 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
           if (audit.alerts.length > 0) observe('directive-audit', `alerts:${audit.alerts.length}`, audit.alerts.length);
           for (const proposal of audit.proposals) observe('directive-audit', `repair-proposal:${proposal.id}`, 1);
         } catch (error) { observe('directive-audit-failed', String(error).slice(0, 160), 0); }
+        if (window === '08' || window === '18') {
+          if (deps.simImpactAudit) {
+            try {
+              const gaps = await deps.simImpactAudit(window, root);
+              if (gaps.length) observe('exchange', `sim-impact-not-considered:${gaps.length}`, gaps.length);
+            } catch (error) { observe('sim-impact-audit-failed', String(error).slice(0, 160), 0); }
+          } else if (deps.scheduleSimImpactAudit || import.meta.main) {
+            scheduleSimImpactAuditAfterReport = true;
+          }
+        }
       }
       (deps.print ?? console.log)(reportLine(state));
     }
@@ -1059,6 +1077,20 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
     const boardWrittenAt = state.boardWrittenAt ?? readCompletionHeartbeat(root)?.boardWrittenAt ?? null;
     recordCompletionHeartbeat(root, { runId, node, window, mode, boardWrittenAt, tickCompletedAt: currentTime().toISOString() });
   }
+  if (scheduleSimImpactAuditAfterReport) {
+    try {
+      const dispatch = deps.scheduleSimImpactAudit
+        ? deps.scheduleSimImpactAudit(window, root, runId)
+        : scheduleSimImpactAuditInBackground(window, root, runId);
+      try {
+        if (dispatch.scheduled) debug.log('loop.orchestrator', 'sim-impact-audit-scheduled', { runId, window, ...dispatch });
+        else debug.log('loop.orchestrator', 'sim-impact-audit-not-scheduled', { runId, window, ...dispatch }, { level: 'warn' });
+      } catch { /* audit dispatch does not turn a completed report node into a failure */ }
+    } catch (error) {
+      try { debug.log('loop.orchestrator', 'sim-impact-audit-schedule-failed', { runId, window, error: String(error).slice(0, 160) }, { level: 'warn' }); }
+      catch { /* a missing diagnostic sink cannot block the report node */ }
+    }
+  }
   return state;
   } catch (error) {
     nodeError = error;
@@ -1067,6 +1099,71 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (mode !== 'off') pulse(nodeError === undefined ? 'healthy' : 'degraded', currentTime());
   }
+}
+
+export function simImpactAuditLogPath(root: string, runId: string): string {
+  const safeRunId = runId.replace(/[^a-zA-Z0-9._-]/g, '_');
+  return join(root, 'loop', 'orchestrator', 'sim-impact-audit', `${safeRunId}.log`);
+}
+
+export function runSimImpactAuditWorker(window: Window, root: string, runId: string,
+  audit: (window: Window, root: string) => SimImpactGap[] = runSimImpactAudit): number {
+  const logPath = simImpactAuditLogPath(root, runId);
+  mkdirSync(dirname(logPath), { recursive: true });
+  const startedAt = new Date().toISOString();
+  appendFileSync(logPath, `${JSON.stringify({ event: 'started', at: startedAt, runId, window })}\n`);
+  try { debug.log('loop.orchestrator', 'sim-impact-audit-started', { runId, window, logPath }); } catch { /* log output is best-effort */ }
+  try {
+    const gaps = audit(window, root);
+    const result = { event: 'exited', at: new Date().toISOString(), runId, window, exitCode: 0, gapCount: gaps.length };
+    appendFileSync(logPath, `${JSON.stringify(result)}\n`);
+    try { debug.log('loop.orchestrator', 'sim-impact-audit-exited', { ...result, logPath }); } catch { /* audit result stays on disk */ }
+    return 0;
+  } catch (error) {
+    const result = { event: 'exited', at: new Date().toISOString(), runId, window, exitCode: 1, error: String(error).slice(0, 1000) };
+    appendFileSync(logPath, `${JSON.stringify(result)}\n`);
+    try { debug.log('loop.orchestrator', 'sim-impact-audit-exited', { ...result, logPath }, { level: 'error' }); } catch { /* audit result stays on disk */ }
+    return 1;
+  }
+}
+
+function scheduleSimImpactAuditInBackground(window: Window, root: string, runId: string): SimImpactAuditDispatch {
+  const script = process.argv[1];
+  if (!script) return { scheduled: false };
+  const logPath = simImpactAuditLogPath(root, runId);
+  mkdirSync(dirname(logPath), { recursive: true });
+  appendFileSync(logPath, `${JSON.stringify({ event: 'scheduled', at: new Date().toISOString(), runId, window })}\n`);
+  const stdout = openSync(logPath, 'a');
+  const stderr = openSync(logPath, 'a');
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    child = spawn(process.execPath, [script, 'sim-impact-audit', '--window', window], {
+      cwd: process.cwd(), env: { ...process.env, ELANOUS_SIM_IMPACT_AUDIT_RUN_ID: runId,
+        ELANOUS_SIM_IMPACT_AUDIT_ROOT: root }, detached: true, stdio: ['ignore', stdout, stderr],
+    });
+  } catch (error) {
+    const result = { event: 'spawn-error', at: new Date().toISOString(), runId, window, exitCode: null, error: String(error).slice(0, 1000) };
+    try { appendFileSync(logPath, `${JSON.stringify(result)}\n`); } catch { /* debug.log below may still retain it */ }
+    try { debug.log('loop.orchestrator', 'sim-impact-audit-spawn-error', { ...result, logPath }, { level: 'error' }); } catch { /* no synchronous fallback */ }
+    return { scheduled: false, logPath };
+  } finally {
+    closeSync(stdout);
+    closeSync(stderr);
+  }
+  if (!child) return { scheduled: false, logPath };
+  child.once('error', (error) => {
+    const result = { event: 'spawn-error', at: new Date().toISOString(), runId, window, exitCode: null, error: String(error).slice(0, 1000) };
+    try { appendFileSync(logPath, `${JSON.stringify(result)}\n`); } catch { /* debug.log below may still retain it */ }
+    try { debug.log('loop.orchestrator', 'sim-impact-audit-spawn-error', { ...result, logPath }, { level: 'error' }); } catch { /* no synchronous fallback */ }
+  });
+  child.once('exit', (code, signal) => {
+    const result = { event: 'child-exit', at: new Date().toISOString(), runId, window, exitCode: code, signal };
+    try { appendFileSync(logPath, `${JSON.stringify(result)}\n`); } catch { /* child worker records its own result too */ }
+    try { debug.log('loop.orchestrator', 'sim-impact-audit-child-exit', { ...result, logPath }, { level: code === 0 ? 'info' : 'error' }); }
+    catch { /* the detached worker writes its own final debug event */ }
+  });
+  child.unref();
+  return { scheduled: true, ...(child.pid ? { pid: child.pid } : {}), logPath };
 }
 
 /** COORD-HA — the production supply of `TickDeps.degradation` (config `loops.orchestrator.degradationSignal`). Shadow (the
@@ -1097,7 +1194,22 @@ if (import.meta.main) {
   const window = index < 0 ? process.env.ELANOUS_ORCH_WINDOW : process.argv[index + 1];
   // A given flag (even without a value) or a set variable must name a real window — never fall back to «now».
   const windowGiven = index >= 0 || process.env.ELANOUS_ORCH_WINDOW !== undefined;
-  if (!['intake', 'split', 'place', 'delegate', 'launch', 'reconcile', 'report'].includes(node ?? '') ||
+  if (node === 'sim-impact-audit') {
+    if (!['08', '12', '18'].includes(window ?? '')) {
+      console.error('orchestrator: sim-impact-audit requires --window 08|12|18');
+      process.exitCode = 2;
+    } else {
+      void (async () => {
+        try { await (await import('../../domains/standalone-log-sink.js')).registerStandaloneLogSink('orchestrator'); }
+        catch { /* file log remains authoritative if debug sink setup fails */ }
+        try {
+          const root = process.env.ELANOUS_SIM_IMPACT_AUDIT_ROOT ?? effectiveInstanceRoot();
+          const runId = process.env.ELANOUS_SIM_IMPACT_AUDIT_RUN_ID ?? `${kstDay(new Date())}-${window}-manual-audit`;
+          process.exitCode = runSimImpactAuditWorker(window as Window, root, runId);
+        } catch (error) { console.error(`orchestrator sim-impact-audit: ${String(error)}`); process.exitCode = 1; }
+      })();
+    }
+  } else if (!['intake', 'split', 'place', 'delegate', 'launch', 'reconcile', 'report'].includes(node ?? '') ||
       (windowGiven && !['08', '12', '18'].includes(window ?? ''))) {
     console.error('orchestrator: expected <intake|split|place|delegate|launch|reconcile|report> [--window 08|12|18] (or ELANOUS_ORCH_WINDOW=08|12|18)');
     process.exitCode = 2;

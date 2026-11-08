@@ -7,10 +7,7 @@
 // ⛔ 이 축은 «공통»이다 — xhigh 를 못 받는 모델에 그대로 보내면 400 이다. 그래서 이 자는
 //    「넣었나」보다 ***「상한이 낮으면 깎이나」***를 먼저 문다.
 import { describe, expect, it } from 'bun:test';
-import {
-  _claudeSupportsThinkingForContractTest, REASONING_CYCLE, effectiveReasoningLevel,
-  mapReasoningLevelToCodex, modelSupportsReasoning, nextReasoningLevel, reasoningLevelLabel,
-} from './llm.js';
+import { _claudeSupportsThinkingForContractTest, REASONING_CYCLE, effectiveReasoningLevel, mapReasoningLevelToCodex, modelSupportsReasoning, nextReasoningLevel, reasoningLevelLabel } from './llm.js';
 import { reasoningEffortCeiling } from './intelligence-map/model-catalog.js';
 import { parseReasoningLevel } from './user-config.js';
 

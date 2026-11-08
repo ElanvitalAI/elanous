@@ -1,5 +1,6 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { afterEach, beforeEach, expect, mock, spyOn, test } from 'bun:test';
-import type { LLMToolSpec } from '../llm.js';
+
 import * as llmModule from '../llm.js';
 import { debug } from '../debug/log.js';
 import * as surfaceModule from '../session-runtime/index.js';

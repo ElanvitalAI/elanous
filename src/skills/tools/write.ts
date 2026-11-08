@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── file_write tool (explicit create / overwrite) ──
 //
 // Ports claude-code-fork's FileWriteTool. Use when the LLM wants to
@@ -27,7 +28,7 @@
 import { writeFileSync, statSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { resolvePathWithPolicy, type PathPolicy } from '../../agent/path-policy.js';
-import type { LLMToolSpec } from '../../llm.js';
+
 import { getSessionBoundary, getSessionCwd, isWriteAllowedInBoundary } from '../../session/working-dir.js';
 import { harnessMainTreeReject } from '../../harness/harness-write-boundary.js';
 

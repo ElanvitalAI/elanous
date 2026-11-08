@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // ── PFC-S3.6 P3: ParetoAnalyze (80/20) LLM tool ──
 
-import type { LLMToolSpec } from '../../llm.js';
+
 import {
   computePareto,
   renderPareto,

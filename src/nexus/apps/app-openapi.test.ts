@@ -16,8 +16,8 @@ rpc:
     params: { limit: { type: int, max: 200, default: 50 } }
     allow: [owner, viewer]
 actions:
-  transcribe: { builtin: stt, input: { audio: object-ref }, uses: [cred:openai.api_key] }
-  summarize: { builtin: summarize, input: { text: text }, uses: [cred:openai.api_key] }
+  transcribe: { builtin: stt, input: { audio: object-ref }, output: { text: text }, uses: [cred:openai.api_key] }
+  summarize: { builtin: summarize, input: { text: text }, output: { text: text }, uses: [cred:openai.api_key] }
 credentials: [cred:openai.api_key]
 `;
 

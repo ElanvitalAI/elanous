@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── schedule_manage 공유 도구 (2026-07-07) — 전 표면 상속 ─────────────────
 //
 // 대표 지시: 스케줄/크론 CRUD를 텔레그램뿐 아니라 elanous 채팅(CLI)·PWA·iPad 등
@@ -10,7 +11,7 @@
 
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import {
   openSchedulesDb, inventoryCrontab, inventoryInternalSchedules, listSchedules, readCrontab,
   buildCronLine, addLineToCrontab, removeLineFromCrontab, setLineEnabled, applyCrontab, setScheduleMission,

@@ -368,26 +368,34 @@ function hqRemoteSeat(role: HqSeatRole, root: string, options: { host?: string; 
     const action = options.delete ? 'delete' : options.refresh ? 'refresh' : 'create';
     if (action !== 'create' && !registered) throw new Error(`remote seat ${role} is not registered in house.json`);
     const origin = callerOrigin();
-    const result = (options.ssh ?? remoteSeatRunner)(host, remoteSeatScript(role, action, origin));
-    if (result.status !== 0) {
-      const details = [
-        result.stderr.length > 0 ? `stderr:\n${result.stderr}` : '',
-        result.stdout.length > 0 ? `stdout:\n${result.stdout}` : '',
-        result.error ? `spawn error:\n${result.error}` : '',
-      ].filter(Boolean).join('\n');
-      const reason = details || 'remote command returned no output';
-      try { debug.log('hq.seat', 'remote-operation-failed', { role, host, action, status: result.status, reason }); } catch { /* observation must not change the verdict */ }
-      throw new Error(`remote hq seat ${role} on ${host} (exit ${result.status})\n${reason}`);
+    const worktree = `${host}:~/elanous-hq/seats/${role}`;
+    const startedAt = Date.now();
+    let ok = false;
+    try {
+      const result = (options.ssh ?? remoteSeatRunner)(host, remoteSeatScript(role, action, origin));
+      if (result.status !== 0) {
+        const details = [
+          result.stderr.length > 0 ? `stderr:\n${result.stderr}` : '',
+          result.stdout.length > 0 ? `stdout:\n${result.stdout}` : '',
+          result.error ? `spawn error:\n${result.error}` : '',
+        ].filter(Boolean).join('\n');
+        const reason = details || 'remote command returned no output';
+        try { debug.log('hq.seat', 'remote-operation-failed', { role, host, action, status: result.status, reason }); } catch { /* observation must not change the verdict */ }
+        throw new Error(`remote hq seat ${role} on ${host} (exit ${result.status})\n${reason}`);
+      }
+      const marker = /^HQ_SEAT_RESULT=(created|unchanged|refreshed|dirty|removed)$/m.exec(result.stdout)?.[1] as RemoteSeatOutcome | undefined;
+      if (!marker) throw new Error(`remote hq seat ${role} on ${host}: missing operation result marker\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+      updateLedgerLocked(root, current => {
+        current.remoteSeats ??= {};
+        if (marker === 'removed') delete current.remoteSeats[role];
+        else current.remoteSeats[role] = { host, path: `~/elanous-hq/seats/${role}` };
+      });
+      try { debug.log('hq.seat', 'remote-operation', { role, host, action, outcome: marker }); } catch { /* observation must not change the verdict */ }
+      ok = true;
+      return { path: worktree, outcome: marker };
+    } finally {
+      try { debug.log('hq.seat.remote', 'remote-operation', { op: action, host, worktree, ok, ms: Math.max(0, Date.now() - startedAt) }); } catch { /* observation must not change the verdict */ }
     }
-    const marker = /^HQ_SEAT_RESULT=(created|unchanged|refreshed|dirty|removed)$/m.exec(result.stdout)?.[1] as RemoteSeatOutcome | undefined;
-    if (!marker) throw new Error(`remote hq seat ${role} on ${host}: missing operation result marker\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
-    updateLedgerLocked(root, current => {
-      current.remoteSeats ??= {};
-      if (marker === 'removed') delete current.remoteSeats[role];
-      else current.remoteSeats[role] = { host, path: `~/elanous-hq/seats/${role}` };
-    });
-    try { debug.log('hq.seat', 'remote-operation', { role, host, action, outcome: marker }); } catch { /* observation must not change the verdict */ }
-    return { path: `${host}:~/elanous-hq/seats/${role}`, outcome: marker };
   }, 1_830_000);
 }
 

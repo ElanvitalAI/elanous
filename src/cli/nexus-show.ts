@@ -12,12 +12,12 @@
 // stripped of `/app/`) so loopback + tailnet variants line up
 // automatically.
 
-import { runPwaShow, type PwaShowOpts, type PwaShowResult } from './pwa-show.js';
-import { listPwaInstances } from './pwa-registry.js';
-import { resolve as resolvePath } from 'node:path';
-
-import { nexusRootDir } from '../nexus/paths.js';
-import { findNexusLifecycleState, type NexusLifecycleState } from '../nexus/supervisor/lock.js';
+import { runPwaShow } from './pwa-show.js';
+import type { PwaShowOpts, PwaShowResult, NexusShowUrls, NexusShowResult } from './pwa-show-contract.js';
+import { deriveNexusShowUrls, resolveNexusPwa } from '../nexus/pwa-resolution.js';
+export { resolveNexusPwa, toLoopbackUrl } from '../nexus/pwa-resolution.js';
+export type { NexusShowUrls, NexusShowResult, NexusShowStatus, NexusPwaResolution, NexusPwaUnavailableReason, NexusPwaLinkSource, ResolveNexusPwaOpts } from './pwa-show-contract.js';
+import { type NexusLifecycleState } from '../nexus/supervisor/lock.js';
 import { debug } from '../debug/log.js';
 import { runGitCommand, type GitCommandRunner } from '../git-fs/runner.js';
 import type { GitRunResult } from '../git-fs/retry.js';
@@ -52,72 +52,6 @@ export interface NexusHealthProbeResult {
   readonly daemonSha?: string;
 }
 
-export interface NexusShowUrls {
-  pwa: { loopback: string; tailnet?: string };
-  rest: { loopback: string; tailnet?: string };
-  sse: { loopback: string; tailnet?: string };
-}
-
-export type NexusShowStatus = 'registered' | 'unregistered' | 'absent';
-
-export interface NexusShowResult {
-  exitCode: number;
-  status: NexusShowStatus;
-  instance?: PwaShowResult['instance'];
-  urls?: NexusShowUrls;
-}
-
-export type NexusPwaUnavailableReason = 'daemon-absent' | 'pwa-url-unknown' | 'pwa-query-failed';
-
-export type NexusPwaLinkSource = 'local' | 'tailnet';
-
-export type NexusPwaResolution =
-  | { readonly status: 'registered'; readonly loopback: string; readonly url: string; readonly source: NexusPwaLinkSource; readonly tailnetRecordedAt?: string }
-  | { readonly status: 'unregistered'; readonly loopback: string; readonly url: string; readonly pid: number; readonly source: NexusPwaLinkSource; readonly tailnetRecordedAt?: string }
-  | { readonly status: 'absent'; readonly reason: Extract<NexusPwaUnavailableReason, 'daemon-absent' | 'pwa-query-failed'> }
-  | { readonly status: 'unregistered'; readonly reason: Extract<NexusPwaUnavailableReason, 'pwa-url-unknown'>; readonly pid: number };
-
-export interface ResolveNexusPwaOpts {
-  cwd?: string;
-  listFn?: PwaShowOpts['listFn'];
-  lifecycleFn?: () => NexusLifecycleState | null;
-  nexusRootFn?: () => string;
-  pwaResult?: Pick<PwaShowResult, 'instance' | 'urls'>;
-}
-
-/** 바인드 «와일드카드»(`0.0.0.0` · `[::]`)는 접속 주소가 아니다 — 루프백 URL 은 127.0.0.1 로.
- *  🩸 2026-09-24: 운영 데몬이 `ELANOUS_NEXUS_HTTP_HOST=0.0.0.0` 로 돌 때 `nexus show` 가 `http://0.0.0.0:31415/…` 를
- *  «loopback» 으로 냈고, 데몬은 그 Host 를 **403** 으로 거절한다 — `nexus restart-needed` 가 「데몬 무응답」으로 읽었다. */
-export function toLoopbackUrl(url: string | undefined): string | undefined {
-  return url?.replace(/^(https?:\/\/)(?:0\.0\.0\.0|\[::\])(?=[:/]|$)/, '$1127.0.0.1');
-}
-
-/** Strip `/app/` (or trailing slash) → bare `http(s)://host:port` so
- *  callers can append their own paths. */
-function urlBase(pwaUrl: string): string {
-  return pwaUrl.replace(/\/app\/?$/, '');
-}
-
-function deriveUrls(pwaUrls: { loopback: string; tailnet?: string }): NexusShowUrls {
-  const loopbackBase = urlBase(pwaUrls.loopback);
-  const tailnetBase = pwaUrls.tailnet ? urlBase(pwaUrls.tailnet) : undefined;
-  return {
-    pwa: {
-      loopback: pwaUrls.loopback,
-      ...(pwaUrls.tailnet ? { tailnet: pwaUrls.tailnet } : {}),
-    },
-    rest: {
-      loopback: `${loopbackBase}/v1/`,
-      ...(tailnetBase ? { tailnet: `${tailnetBase}/v1/` } : {}),
-    },
-    sse: {
-      loopback: `${loopbackBase}/v1/events`,
-      ...(tailnetBase ? { tailnet: `${tailnetBase}/v1/events` } : {}),
-    },
-  };
-}
-
-/** Join REST base (`…/v1/` or `…/v1`) to a health path without a doubled slash. */
 export function joinRestHealthUrl(restBase: string, healthPath = '/health'): string {
   return `${restBase.replace(/\/+$/, '')}/${healthPath.replace(/^\/+/, '')}`;
 }
@@ -202,141 +136,6 @@ async function readRevisionLine(
   return formatRevisionLine(health, sha ? resolveRevisionFreshness(cwd, sha, gitFn) : undefined);
 }
 
-function isValidHttpHost(host: string): boolean {
-  if (/^\[([0-9A-Fa-f:.]+)\]$/.test(host)) return true;
-  if (/^[0-9.]+$/.test(host)) {
-    const octets = host.split('.');
-    return octets.length === 4 && octets.every((octet) => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255);
-  }
-  return host.length <= 253 && host.split('.').every((label) => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label));
-}
-
-function isCurrentLifecycleRoot(lifecycleRoot: string, currentRoot: string): boolean {
-  const resolvedLifecycleRoot = resolvePath(lifecycleRoot);
-  const resolvedCurrentRoot = resolvePath(currentRoot);
-  return resolvedLifecycleRoot === resolvedCurrentRoot
-    || resolvePath(resolvedLifecycleRoot, 'nexus') === resolvedCurrentRoot;
-}
-
-export function resolveNexusPwa(opts: ResolveNexusPwaOpts = {}): NexusPwaResolution {
-  const cwd = opts.cwd ?? process.cwd();
-  const pwaResult = opts.pwaResult;
-  let registered: { loopback: string } | undefined;
-  try {
-    registered = pwaResult
-      ? pwaResult.instance && pwaResult.urls ? { loopback: pwaResult.urls.loopback } : undefined
-      : (() => {
-          const instance = (opts.listFn ?? listPwaInstances)({ prune: true }).find((entry) => entry.cwd === cwd);
-          const port = instance?.ports[0];
-          return typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65_535
-            ? { loopback: `http://127.0.0.1:${port}/app/` }
-            : undefined;
-        })();
-  } catch {
-    return { status: 'absent', reason: 'pwa-query-failed' };
-  }
-  const lifecycle = (opts.lifecycleFn ?? findNexusLifecycleState)();
-  const currentRoot = (opts.nexusRootFn ?? nexusRootDir)();
-  const currentLifecycle = lifecycle && isCurrentLifecycleRoot(lifecycle.root, currentRoot)
-    ? lifecycle
-    : undefined;
-  const lifecycleUrl = currentLifecycle && lifecyclePwaUrl(currentLifecycle);
-  const loopback = toLoopbackUrl(registered?.loopback ?? lifecycleUrl?.loopback);
-  if (!loopback) {
-    if (!currentLifecycle) return { status: 'absent', reason: 'daemon-absent' };
-    return { status: 'unregistered', reason: 'pwa-url-unknown', pid: currentLifecycle.lock.pid };
-  }
-  const sameRuntimeInstance = !registered || registered.loopback === lifecycleUrl?.loopback;
-  const recordedTailnet = sameRuntimeInstance ? lifecycleUrl?.tailnet : undefined;
-  const liveTailnet = registered && pwaResult
-    ? parseTailnetPwaUrl(pwaResult.urls?.tailnet)
-    : undefined;
-  const tailnet = recordedTailnet ?? liveTailnet;
-  const source: NexusPwaLinkSource = tailnet ? 'tailnet' : 'local';
-  const url = tailnet ?? loopback;
-  const tailnetRecordedAt = recordedTailnet ? lifecycleUrl?.tailnetRecordedAt : undefined;
-  debug.log('nexus.pwa-link', 'resolved', {
-    source,
-    status: registered ? 'registered' : 'unregistered',
-    ...(tailnetRecordedAt ? { tailnetRecordedAt } : {}),
-  });
-  if (registered) {
-    return { status: 'registered', loopback, url, source, ...(tailnetRecordedAt ? { tailnetRecordedAt } : {}) };
-  }
-  return { status: 'unregistered', loopback, url, pid: currentLifecycle!.lock.pid, source, ...(tailnetRecordedAt ? { tailnetRecordedAt } : {}) };
-}
-
-function lifecyclePwaUrl(lifecycle: NexusLifecycleState): { loopback: string; tailnet?: string; tailnetRecordedAt?: string } | undefined {
-  const runtime = lifecycle.runtime;
-  const urls = lifecycleHttpUrls(lifecycle);
-  if (!runtime || runtime.pid !== lifecycle.lock.pid || !urls) return undefined;
-  const tailnet = parseTailnetPwaUrl(runtime.tailnetUrl);
-  const tailnetRecordedAt = parseIsoTimestamp(runtime.tailnetRecordedAt);
-  return {
-    loopback: urls.pwa.loopback,
-    ...(tailnet ? { tailnet } : {}),
-    ...(tailnet && tailnetRecordedAt ? { tailnetRecordedAt } : {}),
-  };
-}
-
-function parseTailnetPwaUrl(value: unknown): string | undefined {
-  if (typeof value !== 'string' || !value.trim()) return undefined;
-  try {
-    const url = new URL(value);
-    return url.protocol === 'https:' && !url.username && !url.password
-      && url.pathname === '/app/' && !url.search && !url.hash
-      ? url.toString()
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function parseIsoTimestamp(value: unknown): string | undefined {
-  if (typeof value !== 'string' || !value.trim()) return undefined;
-  const match = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.exec(value);
-  if (!match) return undefined;
-  if (Number.isNaN(Date.parse(value))) return undefined;
-  // `Date.parse` rejects month 13 and day 32 but silently *normalizes* a day that
-  // overflows its own month (2026-02-30 → 2026-03-02), so the calendar date has to
-  // be confirmed against the components as written. Time-of-day needs no such check.
-  const [, year, month, day] = match;
-  const probe = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
-  const roundTrips = probe.getUTCFullYear() === Number(year)
-    && probe.getUTCMonth() === Number(month) - 1
-    && probe.getUTCDate() === Number(day);
-  return roundTrips ? value : undefined;
-}
-
-function lifecycleHttpUrls(lifecycle: NexusLifecycleState): NexusShowUrls | undefined {
-  const runtime = lifecycle.runtime;
-  const httpPort = runtime?.httpPort;
-  if (!runtime || runtime.pid !== lifecycle.lock.pid || typeof httpPort !== 'number'
-    || !Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65_535
-    || typeof runtime.httpHost !== 'string') {
-    return undefined;
-  }
-
-  const host = runtime.httpHost.trim();
-  const bracketedIpv6 = host.startsWith('[');
-  if (!isValidHttpHost(host)) return undefined;
-
-  try {
-    const url = new URL(`http://${host}:${httpPort}/app/`);
-    const hostnameMatches = bracketedIpv6
-      ? /^\[[0-9a-f:.]+\]$/i.test(url.hostname)
-      : url.hostname.toLowerCase() === host.toLowerCase();
-    const portMatches = url.port === String(httpPort) || (httpPort === 80 && url.port === '');
-    if (url.username || url.password || url.pathname !== '/app/' || url.search || url.hash
-      || !hostnameMatches || !portMatches) {
-      return undefined;
-    }
-    return deriveUrls({ loopback: url.toString() });
-  } catch {
-    return undefined;
-  }
-}
-
 export async function runNexusShow(opts: NexusShowOpts = {}): Promise<NexusShowResult> {
   const out = opts.out ?? console;
   const format = opts.format ?? 'human';
@@ -365,7 +164,7 @@ export async function runNexusShow(opts: NexusShowOpts = {}): Promise<NexusShowR
 
     if (pwa.status === 'unregistered') {
       const urls = 'loopback' in pwa
-        ? deriveUrls({ loopback: pwa.loopback, ...(pwa.source === 'tailnet' ? { tailnet: pwa.url } : {}) })
+        ? deriveNexusShowUrls({ loopback: pwa.loopback, ...(pwa.source === 'tailnet' ? { tailnet: pwa.url } : {}) })
         : undefined;
       const httpKnown = urls !== undefined;
       if (format === 'json') {
@@ -419,12 +218,12 @@ export async function runNexusShow(opts: NexusShowOpts = {}): Promise<NexusShowR
   const resolvedPwa = resolveNexusPwa({ ...opts, pwaResult });
   // Only the resolver-validated tailnet reaches `urls`. Re-inserting the raw
   // `pwaResult.urls.tailnet` here would contradict `link.source: 'local'` on the
-  // very inputs the resolver rejected, and `deriveUrls` would then slice a
+  // very inputs the resolver rejected, and `deriveNexusShowUrls` would then slice a
   // malformed URL into the rest/sse variants.
   const resolvedTailnet = resolvedPwa.status === 'registered' && resolvedPwa.source === 'tailnet'
     ? resolvedPwa.url
     : undefined;
-  const urls = deriveUrls({
+  const urls = deriveNexusShowUrls({
     loopback: pwaResult.urls.loopback,
     ...(resolvedTailnet ? { tailnet: resolvedTailnet } : {}),
   });

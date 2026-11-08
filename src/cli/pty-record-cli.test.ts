@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import type { PreviewTerminal } from '../preview/terminal.js';
 import type { AcpServerHandle } from '../acp/server.js';
 import { registerPtyRecordCommand, runPtyRecord, type PtyRecordDeps } from './pty-record-cli.js';
-import { simInProcessCli } from '../ux-sim/in-process-cli.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
 // CLI and web-terminal integration paths can exceed Bun's 5 s default under gate-pod load.
 setDefaultTimeout(60_000);
@@ -143,7 +143,7 @@ test('default web terminal exposes owner control, preserves ACP output, and reco
 });
 
 test('registered pty record help is captured through the isolated in-process CLI', async () => {
-  const result = await simInProcessCli(['pty', 'record', '--help'], { allowPaths: [['pty', 'record']] });
+  const result = await simCli(['pty', 'record', '--help'], { allowPaths: [['pty', 'record']] });
   expect(result.exitCode).toBe(0);
   expect(result.stdout).toContain('--stop');
   expect(result.stdout).toContain('--json');

@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // SelfOrchestrate 네이티브 툴 런타임 (D · front door · 2026-07-21) — elanous 가 자연어("이것들 병렬로
 // 구현해줘")를 인식해 **병렬 self-dev 오케스트레이터**(orchestrateSelfDev)를 자율 호출하는 ToolRuntime.
 //
@@ -10,7 +11,7 @@
 //   커지므로(TUI/스킬) 안전 기본이 핵심. 진행표시(board)+막 릴레이는 후속(PLAN-harness-cell-roles D).
 
 import { posix as posixPath } from 'node:path';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime, ToolRuntimeContext } from '../tool-runtime/types.js';
 import { orchestrateSelfDev, type SelfDevJobResult, type OrchestrateSelfDevOptions, type SelfDevGoal } from './orchestrate.js';
 import { processBirthId, type SelfDevRunParticipant, type SelfDevRunState } from './run-store.js';

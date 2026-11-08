@@ -28,7 +28,10 @@ describe('AWAY-MODE-1 — 텔레그램 /away · /release', () => {
   });
 
   test('/release 는 원장을 못 읽으면 「없다」가 아니라고 말한다', () => {
-    expect(telegramReleaseStatus([], () => 'unavailable')).toContain('「없다」가 아니다');
+    expect(telegramReleaseStatus([], { releaseRun: () => { throw new Error('원장 접근 불가'); },
+      version: () => '0.0.0', checklist: version => ({ version, released: '', dev: version, history: [], items: [] }),
+      runningRuns: () => [], lateSchedules: () => null, decisions: () => [], seatEntries: () => [], events: () => [] }))
+      .toContain('못 읽음');
     expect(telegramReleaseStatus(['x'])).toBe('사용법: /release');
   });
 

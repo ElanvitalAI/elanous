@@ -31,7 +31,7 @@ import type {
 import type { ContextMenuActionItem } from './view.js';
 import type { ThemeTokens } from '../theme/tokens.js';
 import { computePopupBounds } from '../status/popups.js';
-import { type ActionItem } from '../mouse-action-recipes.js';
+import { createActionPickerView, type ActionItem } from '../mouse-action-recipes.js';
 import { MenuTreeController } from './widgets/menu-tree-controller.js';
 import type { View } from './view.js';
 import { mountSubmenuPopupPairSurface } from './submenu-popup-pair.js';
@@ -376,7 +376,7 @@ function buildContextMenuTreePopup(spec: {
     onCancel: spec.onCancel,
     theme: parentTheme,
     shadow: spec.shadow,
-  });
+  }, createActionPickerView);
   const childView = (): View => createSubmenuPopupMenuView({
     id: 'context-menu-tree:child',
     title: childTitle(),
@@ -399,7 +399,7 @@ function buildContextMenuTreePopup(spec: {
     onCancel: spec.onCancel,
     theme: childTheme,
     shadow: spec.shadow,
-  });
+  }, createActionPickerView);
 
   return mountSubmenuPopupPairSurface({
     id: spec.surfaceId ?? `${spec.idPrefix}:${spec.anchorRow}:${spec.anchorCol}`,

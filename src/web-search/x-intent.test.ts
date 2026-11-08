@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, test, spyOn } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { dispatchWebSearch as dispatchModelWebSearch } from '../skills/tools/web-search.js';
 import { dispatchWebSearch as dispatchDaemonWebSearch } from '../boot/daemon-tools/web-search.js';
 import { buildGrokWebSearchProvider } from './grok.js';
 import { _resetWebSearchProvidersForTests, addWebSearchProvider, searchWeb } from './index.js';
 import { wantsGrokSearch, wantsXSearch } from './x-intent.js';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 
 const xQuery = { query: 'X에서 엘라누스 반응' };
 
@@ -122,15 +123,15 @@ describe('X search intent', () => {
     let searchCallType: 'web_search_call' | 'x_search_call' = 'web_search_call';
     let sourceUrl = 'https://example.org/news';
     let webSources: Array<{ url: string }> = [];
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-      requests.push(JSON.parse(String(init?.body)));
+    try {
+      await withFakeFetchDevice([{ url: 'https://api.x.ai/v1/responses', method: 'POST', response: request => {
+      requests.push(JSON.parse(String(request.body)));
       return new Response(JSON.stringify({ output: [
         ...(webSources.length ? [{ type: 'web_search_call', action: { sources: webSources } }] : []),
         { type: searchCallType, action: { sources: [{ url: sourceUrl, title: 'Source' }] } },
         { type: 'message', content: [{ type: 'output_text', text: 'Answer', annotations: [] }] },
       ] }), { status: 200 });
-    }) as typeof fetch);
-    try {
+      } }], async (device) => {
       _resetWebSearchProvidersForTests(false);
       addWebSearchProvider({
         id: 'firecrawl', displayName: 'firecrawl fake', available: () => true,
@@ -164,8 +165,9 @@ describe('X search intent', () => {
       const daemonVerified = await dispatchDaemonWebSearch(xQuery, { cwd: process.cwd(), signal: new AbortController().signal });
       expect(daemonVerified.xSearch).toBe('grok');
       expect(daemonVerified.hits[0].url).toBe('https://x.com/elanous/status/9');
+      expect(device.calls()).toHaveLength(7);
+      });
     } finally {
-      fetchSpy.mockRestore();
       if (oldKey === undefined) delete process.env.XAI_API_KEY;
       else process.env.XAI_API_KEY = oldKey;
       if (oldKeep === undefined) delete process.env.ELANOUS_KEEP_ENV_KEYS;

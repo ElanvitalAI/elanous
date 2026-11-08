@@ -6,7 +6,7 @@ import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { decideGraphApproval, latestGraphRun, listGraphRuns, manageGraphRun, resolveUnit, runGraph, runGraphClassifyNode, verifyReleaseCommandRoot, type GraphRunOptions } from './runner.js';
+import { decideGraphApproval, latestGraphRun, listGraphRuns, manageGraphRun, releaseNodeFailureDetail, resolveUnit, runGraph, runGraphClassifyNode, verifyReleaseCommandRoot, type GraphRunOptions } from './runner.js';
 import { classifyReworkBudgetShadow } from '../self-implement/classify-shadow.js';
 import { createReworkBudgetJudgment, REWORK_BUDGET_JUDGMENT } from '../self-implement/rework-budget-judgment.js';
 import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
@@ -18,9 +18,87 @@ import { runSelfImplement } from '../self-implement/orchestrator.js';
 import { seams } from '../self-implement/test-seams.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
 import { createGraphEventBus, publishNodeGraphEvent } from './graph-events.js';
+import { classifyGateShadow } from '../../scripts/release-loop/gate-triage-node.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test('release export-check failure detail classifies marker, tool and timeout and scrubs absolute paths', () => {
+  expect(releaseNodeFailureDetail(JSON.stringify({ outcome: 'fail', summary: 'export failed', tail: 'absolute-home-path /Users/alice/work/repo/src/app.ts:17' }), '/Users/alice/work/repo', (value) => value))
+    .toMatchObject({ kind: 'export-detection', markers: ['absolute-home-path'], locations: ['<repo>/src/app.ts:17'] });
+  expect(releaseNodeFailureDetail(JSON.stringify({ outcome: 'error', summary: 'export tool failed', diagnostics: ['scripts/public-export.ts:42 TS9999: missing input'] }), '/repo', (value) => value))
+    .toMatchObject({ kind: 'tool-error', markers: [], locations: ['scripts/public-export.ts:42'] });
+  expect(releaseNodeFailureDetail(JSON.stringify({ outcome: 'fail', summary: 'PWA build timed out', tail: 'ETIMEDOUT after 300000ms' }), '/repo', (value) => value))
+    .toMatchObject({ kind: 'timeout', stderrTail: 'ETIMEDOUT after 300000ms', markers: [], locations: [] });
+});
+
+test('release export-check failures preserve scrubbed details in run output and debug events', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-failure-detail-sim-'));
+  dirs.push(root);
+  const previousState = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = root;
+  const pluginDir = join(root, 'plugins', 'local', 'failure-detail-plugin', '1.0.0');
+  const graphsDir = join(pluginDir, 'graphs');
+  mkdirSync(graphsDir, { recursive: true });
+  writeFileSync(join(pluginDir, 'plugin.ts'), 'export default {}');
+  writeFileSync(join(pluginDir, 'plugin.json'), JSON.stringify({ id: 'failure-detail-plugin', version: '1.0.0', main: './plugin.ts',
+    contributes: { connectors: [{ id: 'service', fields: [{ name: 'TOKEN', env: 'FAILURE_DETAIL_TOKEN' }] }] } }));
+  setPluginCredentials('failure-detail-plugin', { TOKEN: 'secret-token' }, root);
+  writeFileSync(join(graphsDir, 'recipes.yaml'), 'export-check:\n  command: "fake export check"\n');
+  const graph = join(graphsDir, 'failure-detail.yaml');
+  writeFileSync(graph, [
+    'graph_id: release-failure-detail-sim', 'version: 1', 'entry_node: export-check', 'terminal_nodes: [done, failed]', 'nodes:',
+    '  - { node_id: export-check, kind: agent, recipe: "cmd:export-check", max_visits: 1 }',
+    '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
+    '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }',
+    'edges:', '  - { from: export-check, on: outcome, map: { ok: done, fail: failed } }', '',
+  ].join('\n'));
+  const cases: Array<{ runId: string; payload: Record<string, unknown>; kind: string; marker?: string; location?: string; extraLocations?: string[] }> = [
+    { runId: 'export-marker', payload: { outcome: 'fail', summary: 'export detected leaks', tail: 'absolute-home-path /Users/alice/private/repo/src/app.ts:17 token=secret-token', 'secret-token': 'credential as object key', nested: { '/tmp/a/file.ts': 'first path value', '/tmp/b/file.ts': 'second path value' } }, kind: 'export-detection', marker: 'absolute-home-path' },
+    { runId: 'tool-error', payload: { outcome: 'error', summary: 'export tool failed', diagnostics: ['/tmp/build/src/export.ts:42 TS5101: missing input', 'C:\\Users\\builder\\work\\src\\export.ts:44 TS1001: windows path', '\\\\server\\private\\src\\export.ts:45 TS1002: network path', 'diagnostic:/tmp/build/src/entry.ts:43 TS1003: colon path', 'diagnostic->/tmp/secret-token/src/leak.ts:46 TS1004: secret path'] }, kind: 'tool-error', location: '<absolute-path>/export.ts:42', extraLocations: ['<absolute-path>/export.ts:44', '<absolute-path>/entry.ts:43', '<absolute-path>/leak.ts:46'] },
+    { runId: 'timeout', payload: { outcome: 'fail', summary: 'PWA build timeout', tail: 'ETIMEDOUT /tmp/private/build.ts:9 token=secret-token' }, kind: 'timeout', location: '<absolute-path>/build.ts:9' },
+  ];
+  (cases[1]!.payload.diagnostics as string[]).push('diagnostic-/tmp/private/file.ts:47 TS1005: hyphen separator');
+  (cases[1]!.payload.diagnostics as string[]).push('diagnostic./tmp/private/dot.ts:48 TS1006: dot separator');
+  cases[1]!.extraLocations!.push('<absolute-path>/file.ts:47', '<absolute-path>/dot.ts:48');
+  try {
+    for (const item of cases) {
+      const result = await runGraph(graph, { runId: item.runId, deps: { root, runBash: async () => ({ stdout: JSON.stringify(item.payload), stderr: '', exitCode: 1 }) } });
+      const node = result.nodes.find((record) => record.nodeId === 'export-check');
+      const output = JSON.parse(String(node?.output ?? '{}')) as Record<string, any>;
+      expect(output.failureDetail).toMatchObject({ kind: item.kind });
+      if (item.marker) expect(output.failureDetail.markers).toContain(item.marker);
+      if (item.location) expect(output.failureDetail.locations).toContain(item.location);
+      for (const location of item.extraLocations ?? []) expect(output.failureDetail.locations).toContain(location);
+      if (item.runId === 'export-marker') {
+        expect(Object.values(output.nested as Record<string, string>).sort()).toEqual(['first path value', 'second path value']);
+      }
+      expect(JSON.stringify(node)).not.toContain('secret-token');
+      expect(JSON.stringify(node)).not.toContain('/Users/');
+      expect(JSON.stringify(node)).not.toContain('/tmp/');
+      const event = debug.events(500).find((entry) => entry.category === 'release-loop.node' && entry.event === 'failed' && (entry.data as any)?.runId === item.runId);
+      expect(event?.data).toMatchObject({ kind: item.kind, markers: output.failureDetail.markers, locations: output.failureDetail.locations });
+      expect((event?.data as any)?.stderrTail).toBeTruthy();
+      if (item.marker) expect((event?.data as any)?.markers).toContain(item.marker);
+      if (item.location) expect((event?.data as any)?.locations).toContain(item.location);
+      for (const location of item.extraLocations ?? []) expect((event?.data as any)?.locations).toContain(location);
+      expect((event?.data as any)?.stderrTail).toContain(item.marker ?? (item.runId === 'timeout' ? 'ETIMEDOUT' : 'TS5101'));
+      expect(JSON.stringify(event?.data)).not.toContain('secret-token');
+      expect(JSON.stringify(event?.data)).not.toContain('/Users/');
+      expect(JSON.stringify(event?.data)).not.toContain('/tmp/');
+    }
+    const longSuccess = await runGraph(graph, { runId: 'long-success', deps: { root, runBash: async () => ({ stdout: JSON.stringify({ outcome: 'ok', note: 'x'.repeat(1_500) }), stderr: '', exitCode: 0 }) } });
+    const longOutput = JSON.parse(String(longSuccess.nodes.find((record) => record.nodeId === 'export-check')?.output ?? '{}')) as Record<string, string>;
+    expect(longOutput.note).toHaveLength(1_500);
+  } finally {
+    if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousState;
+  }
+  expect(releaseNodeFailureDetail(JSON.stringify({ outcome: 'fail', summary: 'already scrubbed', tail: '<repo>/src/app.ts:17' }), '/Users/alice/work/repo', (value) => value))
+    .toMatchObject({ locations: ['<repo>/src/app.ts:17'], stderrTail: '<repo>/src/app.ts:17' });
+  expect(releaseNodeFailureDetail(JSON.stringify({ outcome: 'fail', summary: 'already scrubbed', tail: '<absolute-path>/app.ts:17' }), '/Users/alice/work/repo', (value) => value))
+    .toMatchObject({ locations: ['<absolute-path>/app.ts:17'], stderrTail: '<absolute-path>/app.ts:17' });
+});
 
 function runGraphWithGrowthScope(path: string, options: GraphRunOptions = {}): ReturnType<typeof runGraph> {
   return runGraph(path, { ...options, deps: { ...options.deps, growthScope: 'task-agent' } });
@@ -456,6 +534,51 @@ test('runGraph publishes ordered node lifecycle events and dispatches matching n
   expect(edgeProposalResults.filter((result) => result === 'added')).toHaveLength(4);
 });
 
+test('appended wake continuation keeps normal, fail-closed, and recovery-only routes', async () => {
+  for (const repairOutcome of ['ok', 'fail', 'error', 'recovery-required'] as const) {
+    const { graph, root } = fixture('printf first');
+    writeFileSync(join(root, 'recipes.yaml'), `second:\n  command: "printf second"\nrepair:\n  command: "printf repair"\nrepair-recovery:\n  approval: "recover only after bounded receipt lookup exhaustion?"\n`);
+    const yaml = readFileSync(graph, 'utf8').replace(
+      '- { node_id: first, kind: agent, recipe: \'cmd:first\', max_visits: 1 }',
+      "- node_id: first\n    kind: agent\n    recipe: handler:append-event\n    max_visits: 1\n    emits: [release.test.append-wake]").replace(
+      '- { node_id: second, kind: agent, recipe: \'cmd:second\', max_visits: 1 }',
+      "- node_id: second\n    kind: agent\n    recipe: 'cmd:second'\n    max_visits: 2\n    subscribes: [{ event: release.test.append-wake, match: { nodeId: first }, action: wake }]").replace(
+      '- { node_id: failed, kind: gate, max_visits: 1 }',
+      "- { node_id: failed, kind: gate, max_visits: 1 }\n  - { node_id: recover, kind: hitl, recipe: 'approval:repair-recovery', max_visits: 1 }");
+    writeFileSync(graph, yaml);
+    const state = await runGraph(graph, { runId: `append-wake-${repairOutcome}`, deps: {
+      root,
+      inProcessHandlers: { 'append-event': async (context) => {
+        await context.emitEvent?.('release.test.append-wake', {});
+        return { ok: true, outcome: 'ok' };
+      } },
+      runBash: async (command) => command.includes('repair') && repairOutcome !== 'ok'
+        ? { exitCode: repairOutcome === 'fail' ? 1 : 2, stdout: JSON.stringify({ outcome: repairOutcome }), stderr: 'injected repair failure' }
+        : { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' },
+      dispatchGraphSubscription: async (dispatch) => {
+        if (!dispatch.appendGraph) throw new Error('append graph port was not provided');
+        const result = await dispatch.appendGraph({
+          nodes: [{ nodeId: 'repair', kind: 'agent', recipe: 'cmd:repair', maxVisits: 1 }],
+          edges: [{ from: 'repair', on: 'outcome', map: { ok: 'second', fail: 'failed', error: 'failed', 'recovery-required': 'recover' } }],
+          entryNodeId: 'repair', returnTo: 'second', failureTo: 'failed', reason: 'exercise appended wake continuation',
+        });
+        expect(result.disposition).toBe('appended');
+      },
+    } });
+    expect(state.path).toContain('repair');
+    const expectedEnd = repairOutcome === 'recovery-required' ? 'awaiting-approval'
+      : repairOutcome === 'ok' ? 'done' : 'failed';
+    if (expectedEnd === 'awaiting-approval') {
+      expect(state.status).toBe(expectedEnd);
+      expect(state.path.at(-1)).toBe('recover');
+      continue;
+    }
+    if (state.path.at(-1) !== expectedEnd) throw new Error(`expected ${expectedEnd}, received ${JSON.stringify({ status: state.status, path: state.path,
+      reason: state.reason, nodes: state.nodes.map((node) => ({ nodeId: node.nodeId, ok: node.ok, exit: node.exit,
+        reason: node.reason, error: node.error, output: node.output })) })}`);
+  }
+});
+
 test('runGraph publishes release.gate.failed only with complete triage evidence', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-gate-triage-event-'));
   dirs.push(root);
@@ -571,6 +694,104 @@ test('runGraph publishes release.gate.failed only with complete triage evidence'
   expect(legacyGateVisits).toBe(2);
   expect(legacyEvents).toHaveLength(1);
   expect(legacyResumed.nodes.filter((record) => record.nodeId === 'gate').at(-1)?.executionId).toEqual(expect.any(String));
+});
+
+test('failed adaptive repair waits at HITL on the same run', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-adaptive-resume-'));
+  dirs.push(root);
+  const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const runId = 'adaptive-repair-resume-same-run';
+  const commit = 'd'.repeat(40);
+  const failureId = 'src/example.test.ts > introduced regression';
+  let gateVisits = 0;
+  let repairVisits = 0;
+  const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (command, opts) => {
+    if (command.includes('gate-node.ts --json')) {
+      gateVisits++;
+      return gateVisits === 1
+        ? { exitCode: 1, stdout: JSON.stringify({ outcome: 'regression', commit, introduced: [failureId], preexisting: 0,
+          fixed: null, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 10 }), stderr: '' }
+        : { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit, introduced: [] }), stderr: '' };
+    }
+    if (command.includes('gate-triage-node.ts')) {
+      const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { input: Record<string, unknown> };
+      const triage = classifyGateShadow({ outcome: 'regression', commit, introduced: [failureId], preexisting: 0,
+        fixed: null, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 10 });
+      return { exitCode: 0, stdout: JSON.stringify({ ...triage, gateExecutionId: context.input.adaptiveGateExecutionId }), stderr: '' };
+    }
+    if (command.includes('gate-repair-node.ts')) {
+      repairVisits++;
+      return { exitCode: 1, stdout: JSON.stringify({ outcome: 'fail' }), stderr: 'injected repair failure' };
+    }
+    return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
+  };
+  const input = { version: '0.3.7', previousVersion: '0.3.6', gateExecutor: 'pod' };
+
+  const first = await runGraph(graph, { runId, input, deps: { root, runBash } });
+  expect(first.status).toBe('awaiting-approval');
+  expect(first.pending?.nodeId).toBe('gate-heal-decision');
+  expect(first.path).toContain('gate-heal-decision');
+  const repairId = first.path.find((nodeId) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId));
+  expect(repairId).toBeTruthy();
+  expect(first.path).toContain(repairId!);
+  expect(first.adaptiveGateNodeAppends).toHaveLength(1);
+  expect(repairVisits).toBe(1);
+  expect(gateVisits).toBe(1);
+  expect(first.adaptiveGateNodeAppends).toMatchObject([{ request: { node: { nodeId: repairId } } }]);
+});
+
+test('release resume validates the adaptive repair return edge after a failed retried gate', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-adaptive-return-resume-'));
+  dirs.push(root);
+  const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const runId = 'adaptive-return-resume-same-run';
+  const commit = 'e'.repeat(40);
+  const failureId = 'src/example.test.ts > introduced regression';
+  let gateVisits = 0;
+  let repairVisits = 0;
+  const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (command, opts) => {
+    if (command.includes('gate-node.ts --json')) {
+      gateVisits++;
+      return gateVisits < 3
+        ? { exitCode: 1, stdout: JSON.stringify({ outcome: 'regression', commit, introduced: [failureId], preexisting: 0,
+          fixed: null, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 10 }), stderr: '' }
+        : { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit, introduced: [] }), stderr: '' };
+    }
+    if (command.includes('gate-triage-node.ts')) {
+      const context = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { input: Record<string, unknown> };
+      const triage = classifyGateShadow({ outcome: 'regression', commit, introduced: [failureId], preexisting: 0,
+        fixed: null, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 10 });
+      return { exitCode: 0, stdout: JSON.stringify({ ...triage, gateExecutionId: context.input.adaptiveGateExecutionId }), stderr: '' };
+    }
+    if (command.includes('gate-repair-node.ts')) {
+      repairVisits++;
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
+    }
+    return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
+  };
+  const input = { version: '0.3.7', previousVersion: '0.3.6', gateExecutor: 'pod' };
+
+  const first = await runGraph(graph, { runId, input, deps: { root, runBash } });
+  expect(first.status).toBe('failed');
+  const repairId = first.path.find((nodeId) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId));
+  expect(repairId).toBeTruthy();
+  expect(first.path.lastIndexOf('gate')).toBe(first.path.indexOf(repairId!) + 1);
+  expect(gateVisits).toBe(2);
+  expect(repairVisits).toBe(1);
+
+  const savedState = readFileSync(first.statePath, 'utf8');
+  const mismatched = JSON.parse(savedState) as { subscriptionGraphAppends: Array<{ eventId: string }> };
+  mismatched.subscriptionGraphAppends[0]!.eventId = 'mismatched-adaptive-event';
+  writeFileSync(first.statePath, `${JSON.stringify(mismatched, null, 2)}\n`);
+  await expect(runGraph(graph, { resumeRunId: runId, fromNodeId: 'version-release', input, deps: { root, runBash } }))
+    .rejects.toThrow('saved run path does not follow graph edges');
+  writeFileSync(first.statePath, savedState);
+
+  const resumed = await runGraph(graph, { resumeRunId: runId, fromNodeId: 'version-release', input, deps: { root, runBash } });
+  expect(resumed.runId).toBe(runId);
+  expect(resumed.status).toBe('done');
+  expect(gateVisits).toBe(3);
+  expect(repairVisits).toBe(1);
 });
 
 test('runGraph routes on a matching live adaptive event vocabulary edge and keeps unmatched proposals off-path', async () => {
@@ -798,6 +1019,53 @@ edges:
     .not.toBe(successfulBranch.completionReceipt?.inputSha256);
   expect(resumed.path).toEqual(['version-release', 'start', 'joined', 'landed']);
 }, 30_000);
+
+test('pre-prepare join failure includes the failed branch run, node, and first output line', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-pre-prepare-join-diagnostic-'));
+  dirs.push(root);
+  const graph = join(root, 'graph.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), [
+    'start:', '  command: start',
+    'prepare-code:', '  command: prepare-code',
+    'prepare-docs:', '  command: prepare-docs', '',
+  ].join('\n'));
+  writeFileSync(graph, `graph_id: graph-join-diagnostic
+version: 1
+entry_node: start
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: start, kind: agent, recipe: 'cmd:start', max_visits: 1 }
+  - { node_id: prepare-code, kind: agent, recipe: 'cmd:prepare-code', max_visits: 1 }
+  - { node_id: prepare-docs, kind: agent, recipe: 'cmd:prepare-docs', max_visits: 1 }
+  - { node_id: pre-prepare-join, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: start, on: outcome, branches: { ok: [prepare-code, prepare-docs] }, join: pre-prepare-join }
+  - { from: pre-prepare-join, on: outcome, map: { ok: done, fail: failed } }
+`);
+  const deps = { root, runBash: async (command: string) => {
+    if (command === 'prepare-code') return { stdout: '{"outcome":"fail","diagnostic":"prepare failed: src/example.ts:14 TS2304"}\nsecond output line', stderr: '', exitCode: 1 };
+    if (command === 'prepare-docs') return { stdout: '{"outcome":"fail","diagnostic":"prepare failed: docs/example.md:8 missing reference"}\nsecond docs output line', stderr: '', exitCode: 1 };
+    return { stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 };
+  } };
+  const run = await runGraph(graph, { runId: 'pre-prepare-join-diagnostic', deps });
+  expect(run.status).toBe('failed');
+  const branches = run.fanOuts?.['start:ok']?.branches;
+  expect(branches?.['prepare-code']).toMatchObject({ status: 'failed', runId: expect.any(String) });
+  expect(branches?.['prepare-docs']).toMatchObject({ status: 'failed', runId: expect.any(String) });
+  const joinRecord = run.nodes.find((node) => node.nodeId === 'pre-prepare-join');
+  expect(joinRecord).toMatchObject({ ok: false });
+  const diagnostics = JSON.parse(joinRecord!.reason!.replace(/^join failed: /, '')).failedBranches;
+  expect(diagnostics).toEqual([
+    { nodeId: 'prepare-code', runId: branches!['prepare-code']!.runId, error: 'bash exit 1',
+      outputFirstLine: '{"outcome":"fail","diagnostic":"prepare failed: src/example.ts:14 TS2304"}' },
+    { nodeId: 'prepare-docs', runId: branches!['prepare-docs']!.runId, error: 'bash exit 1',
+      outputFirstLine: '{"outcome":"fail","diagnostic":"prepare failed: docs/example.md:8 missing reference"}' },
+  ]);
+  expect(joinRecord!.reason).not.toContain('second output line');
+  expect(joinRecord!.reason).not.toContain('second docs output line');
+});
 
 test('explicit fan-out reruns a completed branch when current source commit differs from its receipt', async () => {
   const root = mkdtempSync(join(tmpdir(), 'graph-fanout-source-commit-'));
@@ -1998,6 +2266,34 @@ test('failed run restarts at saved node, keeps preceding output, and reports nod
   expect(logs.filter((entry) => entry.event === 'node-start' && entry.data.nodeId === 'first')).toHaveLength(1);
 });
 
+test('budget-exceeded release resume requires a reason and records the reset execution counter', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-runner-budget-resume-'));
+  dirs.push(root);
+  const graph = join(root, 'graph.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), "cutoff:\n  command: 'bun scripts/release-loop/node-verdict.ts cutoff'\n");
+  writeFileSync(graph, [
+    'graph_id: release-loop', 'version: 1', 'entry_node: cutoff', 'terminal_nodes: [done, failed]', 'nodes:',
+    "  - { node_id: cutoff, kind: agent, recipe: 'cmd:cutoff', max_visits: 1 }",
+    '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
+    '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }', 'edges:',
+    '  - { from: cutoff, on: outcome, map: { ok: done, fail: failed, error: failed } }', '',
+  ].join('\n'));
+  let calls = 0;
+  const deps = { root, runBash: async () => ({ stdout: '', stderr: '', exitCode: ++calls === 1 ? 1 : 0 }) };
+  const stopped = await runGraph(graph, { runId: 'budget-resume', deps });
+  const saved = JSON.parse(readFileSync(stopped.statePath, 'utf8')) as Record<string, unknown>;
+  saved.status = 'budget-exceeded';
+  writeFileSync(stopped.statePath, JSON.stringify(saved));
+  await expect(runGraph(graph, { resumeRunId: stopped.runId, fromNodeId: 'cutoff', deps }))
+    .rejects.toThrow('use --resume-budget-exceeded --reason');
+  const resumed = await runGraph(graph, { resumeRunId: stopped.runId, fromNodeId: 'cutoff',
+    releaseBudgetExceededResume: { reason: 'resume after explicit budget review' }, deps });
+  expect(resumed.status).toBe('done');
+  expect(resumed.resume).toMatchObject({ previousStatus: 'budget-exceeded', budgetReset: {
+    reason: 'resume after explicit budget review', priorExecuted: 1, resumedPrefixExecuted: 0, priorUnitCalls: 0, resumedPrefixUnitCalls: 0,
+  } });
+});
+
 test('restart preserves a failed warning-only predecessor but refuses a branching failure', async () => {
   for (const advisory of [true, false]) {
     const { graph, root } = fixture('exit 1');
@@ -2170,6 +2466,43 @@ test('real release-loop failed node writes one heal inbox line without running d
     source: 'release-run', kind: 'graph-run', ref: `${result.graphId}/${result.runId}`,
     summary: `Graph ${result.graphId}/${result.runId} failed at failed`, at: result.finishedAt!,
   }]);
+});
+
+test('failed heal-loop sends one OP alert and does not enqueue a recursive heal', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-heal-loop-alert-'));
+  dirs.push(root);
+  const graph = join(root, 'heal-loop.yaml');
+  writeFileSync(graph, ['graph_id: heal-loop', 'version: 1', 'entry_node: failed', 'terminal_nodes: [failed]', 'nodes:',
+    '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }', 'edges:', ''].join('\n'));
+  writeFileSync(join(root, 'recipes.yaml'), '{}\n');
+  const alerts: string[] = [];
+  const result = await runGraph(graph, { runId: 'heal-loop-test-run', deps: { root, postOpAlert: (body) => alerts.push(body) } });
+  expect(result.status).toBe('failed');
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]).toContain('heal-loop-test-run');
+  expect(alerts[0]).toContain('Graph heal-loop/heal-loop-test-run failed at failed');
+  expect(JSON.parse(readFileSync(result.statePath, 'utf8')).status).toBe('failed');
+  expect(existsSync(join(root, 'heal', 'inbox.jsonl'))).toBe(false);
+});
+
+test('heal-loop no-edge failure remains persisted when its OP alert callback throws', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-heal-loop-no-edge-alert-'));
+  dirs.push(root);
+  const graph = join(root, 'heal-loop.yaml');
+  writeFileSync(graph, ['graph_id: heal-loop', 'version: 1', 'entry_node: first', 'terminal_nodes: [done, failed]', 'nodes:',
+    "  - { node_id: first, kind: agent, recipe: 'cmd:first', max_visits: 1 }",
+    '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
+    '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }', 'edges:', ''].join('\n'));
+  writeFileSync(join(root, 'recipes.yaml'), 'first:\n  command: "fake first command"\n');
+  let alerts = 0;
+  const result = await runGraph(graph, { runId: 'heal-loop-no-edge-run', deps: { root,
+    runBash: async () => ({ stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 }),
+    postOpAlert: () => { alerts++; throw new Error('mailbox unavailable'); },
+  } });
+  expect(result.status).toBe('failed');
+  expect(JSON.parse(readFileSync(result.statePath, 'utf8')).status).toBe('failed');
+  expect(alerts).toBe(1);
+  expect(existsSync(join(root, 'heal', 'inbox.jsonl'))).toBe(false);
 });
 
 test('release-loop with no outgoing edge records the failed run exactly once', async () => {

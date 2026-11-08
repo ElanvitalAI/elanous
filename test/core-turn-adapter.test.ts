@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
 // UI-Core arc Phase U3b Step 1 — core-turn-adapter test.
 //
 // Locks in two promises that downstream phases (U3b Step 2 = ACP
@@ -18,7 +19,7 @@
 
 import { describe, expect, test, mock, spyOn, beforeEach, afterEach } from 'bun:test';
 
-import type { LLMMessage, LLMToolSpec, StreamWithToolsHandlers } from '../src/llm.js';
+import type { LLMMessage, StreamWithToolsHandlers } from '../src/llm.js';
 import * as llmModule from '../src/llm.js';
 import { debug, getAmbientSessionId, setAmbientSessionId } from '../src/debug/log.js';
 

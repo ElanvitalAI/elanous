@@ -121,7 +121,7 @@ test('fake pr land accepts hold, ready, and the same pinned branch head in order
   } finally { harness.cleanup(); }
 });
 
-test('SIM-RELEASE-CHAIN: post-publish fan-out runs the graph CLIs concurrently, preserves both results at join, then enters verify', async () => {
+test('SIM-RELEASE-CHAIN: post-publish fan-out serializes shared-checkout writers, preserves both results, then enters verify', async () => {
   const root = mkdtempSync(join(tmpdir(), 'sim-release-post-publish-'));
   const bin = join(root, 'bin');
   const home = join(root, 'home');
@@ -134,6 +134,9 @@ test('SIM-RELEASE-CHAIN: post-publish fan-out runs the graph CLIs concurrently, 
   const trace = join(root, 'boundary-trace.jsonl');
   const mainVersion = join(root, 'main-version.txt');
   const docsLanded = join(root, 'docs-landed');
+  const postPublishWriterIntervals = new Map<string, { startedAtMs: number; endedAtMs?: number }>();
+  let activePostPublishWriters = 0;
+  let maxActivePostPublishWriters = 0;
   const fakeGit = join(bin, 'git');
   const fakeBun = join(bin, 'bun');
   const preload = join(root, 'test-config-preload.ts');
@@ -235,8 +238,21 @@ exec ${JSON.stringify(bun)} "$@"
       }
       const env = { ...options.env, PATH: `${bin}${delimiter}${process.env.PATH ?? ''}`, HOME: home,
         ELANOUS_STATE_DIR: stateRoot, SIM_RELEASE_CONFIG_ROOT: configRoot, SIM_RELEASE_TRACE: trace };
-      const result = await child(command, env, REPO);
-      return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+      const tracksWriter = nodeId === 'docs-land' || nodeId === 'version-dev-bump';
+      if (tracksWriter) {
+        activePostPublishWriters++;
+        maxActivePostPublishWriters = Math.max(maxActivePostPublishWriters, activePostPublishWriters);
+        postPublishWriterIntervals.set(nodeId, { startedAtMs: Date.now() });
+      }
+      try {
+        const result = await child(command, env, REPO);
+        return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+      } finally {
+        if (tracksWriter) {
+          postPublishWriterIntervals.get(nodeId)!.endedAtMs = Date.now();
+          activePostPublishWriters--;
+        }
+      }
     }
 
     const result: Record<string, unknown> = { outcome: 'ok', nodeId };
@@ -271,8 +287,14 @@ exec ${JSON.stringify(bun)} "$@"
     };
     const docsInterval = interval('docs-land');
     const bumpInterval = interval('version-dev-bump');
-    expect(docsInterval.end).toBeGreaterThan(bumpInterval.start);
-    expect(bumpInterval.end).toBeGreaterThan(docsInterval.start);
+    expect(maxActivePostPublishWriters).toBe(1);
+    const docsWriter = postPublishWriterIntervals.get('docs-land')!;
+    const bumpWriter = postPublishWriterIntervals.get('version-dev-bump')!;
+    expect(docsWriter.endedAtMs).toBeDefined();
+    expect(bumpWriter.endedAtMs).toBeDefined();
+    expect(docsWriter.endedAtMs! <= bumpWriter.startedAtMs || bumpWriter.endedAtMs! <= docsWriter.startedAtMs).toBe(true);
+    // Both branches share the main-write lock: their protected fetch/write windows must not overlap.
+    expect(docsInterval.end <= bumpInterval.start || bumpInterval.end <= docsInterval.start).toBe(true);
     expect(readFileSync(mainVersion, 'utf8').trim()).toBe(NEXT_DEV);
     expect(existsSync(docsLanded)).toBe(true);
   } finally {

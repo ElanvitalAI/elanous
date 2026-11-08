@@ -28,7 +28,7 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-di
 import { readHarnessScreen } from '../harness/harness-screen.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DEFAULT_TUI_TEST_READY_TIMEOUT_MS } from '../self-implement/elanous-tui-spawn.js';
-import { simInProcessCli } from '../ux-sim/in-process-cli.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -4429,7 +4429,7 @@ describe.concurrent('dev completion guard — 실물 거부 경로에서 «오�
     }
   }
   async function runInProcessCli(args: string[]): Promise<{ code: number; stderr: string; stdout: string }> {
-    const result = await simInProcessCli(args, { allowPaths: [['dev'], ['drive']] });
+    const result = await simCli(args, { allowPaths: [['dev'], ['drive']] });
     return { code: result.exitCode, stderr: result.stderr, stdout: result.stdout };
   }
 

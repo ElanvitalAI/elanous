@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { buildUserConfig } from '../user-config.js';
 import type { LLMProvider, LLMStreamEvent } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import {
   activeZaiLimit, appendZaiLedger, buildZaiUsageView, classifyZaiError, decideZaiAction, extractZaiPlanLimitSignal, isZaiPeak,
   makeZaiCodingPlanProvider, parseZaiQuota, readZaiLedger, sumZaiLocalWindows, zaiCredits, zaiWireModel,
@@ -375,23 +376,25 @@ describe('공급자 흐름 — 적산·폴백·멈춤', () => {
 describe('wire 본문 — 실제 호환 공급자로 보낸 HTTP 요청', () => {
   test('코딩 엔드포인트 · Bearer 키 · glm-5.3 · reasoning_effort · max_tokens 없음 · 위장 헤더 없음', async () => {
     const seen: Array<{ url: string; headers: Record<string, string>; body: Record<string, unknown> }> = [];
-    const original = globalThis.fetch;
-    globalThis.fetch = (async (url: string, init: RequestInit) => {
-      seen.push({ url: String(url), headers: { ...(init.headers as Record<string, string>) }, body: JSON.parse(String(init.body)) });
+    await withFakeFetchDevice([{
+      url: ZAI_CODING_PLAN_URL, method: 'POST',
+      response: (request) => {
+      seen.push({ url: request.url, headers: { ...request.headers }, body: JSON.parse(request.body ?? '{}') as Record<string, unknown> });
       const sse = 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\ndata: [DONE]\n\n';
       return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }) as typeof fetch;
-    try {
+      },
+    }], async (device) => {
       const p = makeZaiCodingPlanProvider({ provider: 'glm', reasoningLevel: 'high' } as never, {
         key: () => SECRET, ledgerPath: join(tmp('zai-wire-'), 'l.jsonl'), gate: new ZaiConcurrencyGate(() => 3), quotaSnapshot: () => null,
       });
       const evs = await drain(p.streamChat!([{ role: 'user', content: 'hi' }], {}));
       expect(evs.some((e) => e.type === 'text')).toBe(true);
-    } finally { globalThis.fetch = original; }
+      expect(device.calls()).toMatchObject([{ method: 'POST', routeId: 'route-1', status: 200 }]);
+    });
     expect(seen.length).toBe(1);
     expect(seen[0]!.url).toBe(ZAI_CODING_PLAN_URL);
-    expect(seen[0]!.headers.Authorization).toBe(`Bearer ${SECRET}`);
-    expect(Object.keys(seen[0]!.headers).sort()).toEqual(['Authorization', 'Content-Type']);
+    expect(seen[0]!.headers.authorization).toBe(`Bearer ${SECRET}`);
+    expect(seen[0]!.headers).toEqual({ authorization: `Bearer ${SECRET}`, 'content-type': 'application/json' });
     expect(seen[0]!.body).toMatchObject({ model: 'glm-5.3', reasoning_effort: 'high', stream: true });
     expect('max_tokens' in seen[0]!.body).toBe(false);
     expect('temperature' in seen[0]!.body).toBe(false);

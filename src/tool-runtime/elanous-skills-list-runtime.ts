@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // PLAN-codex-app-server-hermes-parity §5 Phase H1·5a (2026-05-16) —
 // `elanous_skills_list` MCP tool. Mirrors the daemon-side ACP method
 // `elanous/skills/list` (src/acp/server.ts:2241) but session-agnostic so
@@ -16,7 +17,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { defaultSkillDirs } from '../user-config.js';
 import { SKILLS_LIST_DESCRIPTION } from '../onboarding/entry-hints.js';
 import { normalizeSkillName } from '../skills/name-match.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import type { ToolRuntime } from './types.js';
 
 export interface ElanousSkillsListArgs {

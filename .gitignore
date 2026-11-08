@@ -1,6 +1,11 @@
+# Dependencies and generated output are not source files.
 node_modules/
 dist/
 data/
+
+# PWA static exports are immutable runtime generations; keep active and old server targets in place.
+apps/pwa/out
+apps/pwa/.pwa-generations/
 !apps/android/app/src/test/kotlin/com/elanvitalai/elanous/android/data/
 !apps/android/app/src/test/kotlin/com/elanvitalai/elanous/android/data/RemoteImageLoaderTest.kt
 log/

@@ -1,7 +1,8 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 /**
  * TaskKill runtime — cancel a task (+ optional downstream cascade).
  */
-import type { LLMToolSpec } from '../../llm.js';
+
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 import type { Task } from '../types.js';
 import { isTerminalStatus } from '../types.js';

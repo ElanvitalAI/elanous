@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 // ── VW-term Bundle P7-E-α · WatchPane LLM tool ──
 //
 // Time-boxed observation window on a single pane. LLM use cases:
@@ -14,7 +15,7 @@
 
 import { createTwoFilesPatch } from 'diff';
 import { stripAnsi } from '../tui.js';
-import type { LLMToolSpec } from '../llm.js';
+
 import {
   dispatchObserveSurface,
   type ObserveSurfaceEventOut,

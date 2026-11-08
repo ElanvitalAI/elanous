@@ -1,8 +1,9 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { afterAll, afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ContentBlock, LLMMessage, LLMOpts, LLMProvider, LLMToolSpec, StreamWithToolsHandlers } from '../llm.js';
+import type { ContentBlock, LLMMessage, LLMOpts, LLMProvider, StreamWithToolsHandlers } from '../llm.js';
 import * as actualLlm from '../llm.js';
 import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import { PTY_BUDGET_GRANT, TERMINAL_MISSION_DISCIPLINE } from '../agent/terminal-surface.js';
@@ -14,7 +15,7 @@ import { compactSessionHistory } from './compact-session.js';
 import { appendMessage, createSession, loadSession, rewriteSessionMessages } from './index.js';
 import { resetAutoCompactStateForTest } from '../compact/auto-state.js';
 import type { CompactProvider } from '../compact/provider.js';
-import type { ChatAutoCompactConfig } from '../user-config.js';
+import type { ChatAutoCompactConfig } from '../user-config/chat.js';
 
 const streamCalls: Array<{
   messages: LLMMessage[];

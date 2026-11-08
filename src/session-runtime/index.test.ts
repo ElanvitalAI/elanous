@@ -1,8 +1,9 @@
+import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { afterEach, expect, mock, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { LLMMessage, LLMToolSpec } from '../llm.js';
+import type { LLMMessage } from '../llm.js';
 import type { ToolRuntime } from '../tool-runtime/types.js';
 import * as llmModule from '../llm.js';
 import * as deferredModule from './tier-flip.js';

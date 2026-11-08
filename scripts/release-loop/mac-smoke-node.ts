@@ -6,7 +6,7 @@ import { debug } from '../../src/debug/log.js';
 import { getUserConfig } from '../../src/user-config.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
-import { baselineCommit } from './gate-node.js';
+import { baselineCommit } from './gate-baseline-manifest.js';
 import { diffFailures, junitFailures } from './gate-diff.js';
 import { finishNode, readGraphContext, runCommand, type CommandResult, type CommandRunner, type GraphContext } from './node-verdict.js';
 

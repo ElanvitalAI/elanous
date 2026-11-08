@@ -1,6 +1,7 @@
+import type { LLMToolSpec } from './llm/tool-spec.js';
 // OR-ANTHROPIC-CACHE (2026-10-10) — OpenRouter 뒤 anthropic/* · moonshotai/* 에만 cache_control 중단점을 싣는다.
 import { expect, spyOn, test } from 'bun:test';
-import { getProviderForConfig, type LLMMessage, type LLMToolSpec } from './llm.js';
+import { getProviderForConfig, type LLMMessage } from './llm.js';
 import { applyOpenRouterCacheControl, openRouterPromptCacheFamily } from './prompt-cache/openrouter.js';
 import type { UserConfig } from './user-config.js';
 

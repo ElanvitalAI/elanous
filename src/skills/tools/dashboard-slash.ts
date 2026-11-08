@@ -1,3 +1,4 @@
+import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // Native tool: DashboardSlashExecute — T6-K3.
 //
 // Programmatically fire a slash command. The LLM in dashboard-
@@ -13,7 +14,7 @@
 // host-registered handler that DOES the dispatch. Dashboard wires
 // `initDashboardSlashExecutor(handler)` at init.
 
-import type { LLMToolSpec } from '../../llm.js';
+
 
 export interface SlashExecuteRequest {
   name: string;

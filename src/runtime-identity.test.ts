@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { createRuntimeIdentity, runtimeIdentitiesMatch, runtimeIdentityKey } from './runtime-identity.js';
+import { createRuntimeIdentity, runtimeArchitecturesMatch, runtimeIdentitiesMatch, runtimeIdentityKey } from './runtime-identity.js';
 
 const identity = {
   baseImageDigest: `sha256:${'a'.repeat(64)}`,
@@ -20,6 +20,7 @@ describe('shared runtime identity', () => {
     expect(runtimeIdentitiesMatch(identity, { ...identity, lockHash: 'd'.repeat(64) })).toBe(false);
     expect(runtimeIdentitiesMatch(identity, { ...identity, os: 'darwin' })).toBe(false);
     expect(runtimeIdentitiesMatch(identity, { ...identity, architecture: 'arm64' })).toBe(false);
+    expect(runtimeIdentitiesMatch(identity, { ...identity, architecture: 'arm64' }, ['amd64', 'arm64'])).toBe(true);
     expect(runtimeIdentitiesMatch(identity, { ...identity, bunVersion: '1.4.3' })).toBe(false);
   });
 
@@ -39,4 +40,14 @@ describe('shared runtime identity', () => {
     for (const value of newlineTainted) expect(runtimeIdentityKey(value)).toBeNull();
     expect(runtimeIdentitiesMatch({ ...identity, lockHash: '' }, { ...identity, lockHash: '' })).toBe(false);
   });
+});
+
+it('runtime architecture matching is exact by default and requires both sides allowlisted for cross-arch', () => {
+  expect(runtimeArchitecturesMatch('amd64', 'amd64')).toBe(true);
+  expect(runtimeArchitecturesMatch('amd64', 'arm64')).toBe(false);
+  expect(runtimeArchitecturesMatch('amd64', 'arm64', ['amd64'])).toBe(false);
+  expect(runtimeArchitecturesMatch('amd64', 'arm64', ['amd64', 'arm64'])).toBe(true);
+  expect(runtimeArchitecturesMatch('amd64', 'armv7', ['amd64', 'arm64'])).toBe(false);
+  expect(runtimeArchitecturesMatch('amd64', 'armv7', ['amd64', 'armv7'])).toBe(false);
+  expect(runtimeArchitecturesMatch('amd64', 'ppc64le', ['amd64', 'ppc64le'])).toBe(false);
 });
