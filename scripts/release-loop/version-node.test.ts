@@ -2,8 +2,8 @@ import { setDefaultTimeout, afterAll, afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { main as versionNodeMain, nextDevVersion } from './version-node';
+import { dirname, join, relative, resolve, sep } from 'node:path';
+import { cutReleaseBranchForRun, main as versionNodeMain, nextDevVersion } from './version-node';
 import { createTempGitRemote } from '../../src/ux-sim/temp-git-remote';
 import { runGraph } from '../../src/graph-runner/runner';
 import { parseOptions } from './gate-node';
@@ -46,7 +46,7 @@ test('cut-branch prebuilds the cut-commit image for the same graph run before re
 const fakeGit = `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
-const root = process.env.VERSION_NODE_TEST_ROOT;
+const root = process.env.VERSION_NODE_TEST_ROOT || process.cwd();
 const stateFile = path.join(root, 'state.json');
 const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
 const args = process.argv.slice(2);
@@ -66,11 +66,13 @@ else if (args[0] === 'rev-parse' && args[1] === '--verify') {
 }
 else if (args[0] === 'merge-base') {
   const key = args.slice(1).join(' ');
+  if (key === 'origin/main ' + state.branchTip) { console.log('base-sha'); process.exit(0); }
   if (state.mergeBaseOutput && key in state.mergeBaseOutput) console.log(state.mergeBaseOutput[key]);
   if (state.ancestor && key in state.ancestor) process.exit(state.ancestor[key] ? 0 : 1);
   process.exit(state.onMain === false ? 1 : 0);
 }
-else if (args[0] === 'log' && args.includes('--grep=^Cut from main ')) console.log(state.recordedCutBase ? (state.cutCommit || 'e'.repeat(40)) + '\\x1fCut from main ' + state.recordedCutBase + '.' : '');
+else if (args[0] === 'log' && args.includes('--grep=^Cut from main ')) console.log(state.recordedCutBase ? (state.cutCommit || 'e'.repeat(40)) + '\x1fCut from main ' + state.recordedCutBase + '.' : '');
+else if (args[0] === 'log') process.stdout.write(state.branchOwner ? 'Elanous-Release-Run: ' + state.branchOwner + '\\nElanous-Release-Attempt: 0\\n' : '');
 else if (args[0] === 'rev-list' && args[1] === '--parents') {
   const sha = args.at(-1);
   const parents = (state.parents || {})[sha] || [];
@@ -245,6 +247,55 @@ test('nextDevVersion increments patch without changing major/minor', () => {
   expect(nextDevVersion('0.2.3')).toBe('0.2.4-dev.0');
   expect(nextDevVersion('1.9.99')).toBe('1.9.100-dev.0');
   expect(() => nextDevVersion('0.2.3-dev.0')).toThrow();
+});
+
+test('incident 0306: a new run adopts a verified stable cut from a failed gate run', () => {
+  const { root } = fixture('0.2.4-dev.0');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  const cut = 'a'.repeat(40);
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, branchTip: cut, branchOwner: 'prior-cut-run', chosen: cut,
+    chosenVersion: '0.2.4', onMain: false }));
+  const priorRun = join(root, 'graph-runs', 'release-loop', 'prior-cut-run.json');
+  mkdirSync(dirname(priorRun), { recursive: true });
+  writeFileSync(priorRun, JSON.stringify({ graphId: 'release-loop', runId: 'prior-cut-run', status: 'failed',
+    input: { version: '0.2.4', branchCut: true }, nodes: [{ nodeId: 'version-release', ok: true,
+      output: JSON.stringify({ outcome: 'ok', version: '0.2.4', commit: cut, branch: 'release/0.2.4' }) }] }));
+
+  const previousPath = process.env.PATH;
+  const previousRoot = process.env.VERSION_NODE_TEST_ROOT;
+  process.env.PATH = `${join(root, 'bin')}:${previousPath}`;
+  process.env.VERSION_NODE_TEST_ROOT = root;
+  try {
+    expect(cutReleaseBranchForRun(root, '0.2.4', { runId: 'new-run-after-gate-failure', root, freeze: () => null }))
+      .toMatchObject({ outcome: 'ok', version: '0.2.4', commit: cut, branch: 'release/0.2.4', existing: true });
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousRoot === undefined) delete process.env.VERSION_NODE_TEST_ROOT; else process.env.VERSION_NODE_TEST_ROOT = previousRoot;
+  }
+});
+
+test('incident 0306: a live foreign run does not lend its cut to a replacement run', () => {
+  const { root } = fixture('0.2.4-dev.0');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  const cut = 'b'.repeat(40);
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, branchTip: cut, branchOwner: 'live-cut-run',
+    chosen: cut, chosenVersion: '0.2.4', onMain: false }));
+  const liveRun = join(root, 'graph-runs', 'release-loop', 'live-cut-run.json');
+  mkdirSync(dirname(liveRun), { recursive: true });
+  writeFileSync(liveRun, JSON.stringify({ graphId: 'release-loop', runId: 'live-cut-run', status: 'running',
+    input: { version: '0.2.4', branchCut: true }, nodes: [{ nodeId: 'version-release', ok: true,
+      output: JSON.stringify({ outcome: 'ok', version: '0.2.4', commit: cut, branch: 'release/0.2.4' }) }] }));
+  const previousPath = process.env.PATH;
+  const previousRoot = process.env.VERSION_NODE_TEST_ROOT;
+  process.env.PATH = `${join(root, 'bin')}:${previousPath}`;
+  process.env.VERSION_NODE_TEST_ROOT = root;
+  try {
+    expect(() => cutReleaseBranchForRun(root, '0.2.4', { runId: 'replacement-run', root, freeze: () => null }))
+      .toThrow('refusing to replace a foreign release branch');
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousRoot === undefined) delete process.env.VERSION_NODE_TEST_ROOT; else process.env.VERSION_NODE_TEST_ROOT = previousRoot;
+  }
 });
 
 test('release lands once from -dev.N, installs first, and returns the merged commit and PR', () => {

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAULT-NEEDS-HUMAN-REASON-REPAIR-TS",
+  "path": "src/ux-sim/fault-needs-human-reason-repair.ts",
+  "boundary": "fault needs human reason repair: Runs the production supervisor with one injected failure per repair reason.",
+  "deviceIds": [
+    "fault-injection"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

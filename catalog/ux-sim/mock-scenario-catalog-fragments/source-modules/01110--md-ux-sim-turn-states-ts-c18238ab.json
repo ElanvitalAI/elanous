@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TURN-STATES-TS",
+  "path": "src/ux-sim/turn-states.ts",
+  "boundary": "Models observed TUI turn phases and runs the production footer, line-rendering and typeahead transitions for each simulated phase.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

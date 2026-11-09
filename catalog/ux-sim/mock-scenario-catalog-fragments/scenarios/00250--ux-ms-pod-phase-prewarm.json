@@ -1,0 +1,22 @@
+{
+  "id": "UX-MS-POD-PHASE-PREWARM",
+  "name": "Release phase Pod prewarm and restore",
+  "kind": "release-pod-phase",
+  "device": "pod-phase-prewarm-sim",
+  "implementation": [
+    "src/ux-sim/pod-phase-prewarm-sim.ts",
+    "src/task-orchestrator/surfaces/pod-warm-switch.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts"
+  ],
+  "tests": [
+    "src/ux-sim/pod-phase-prewarm-sim.test.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts"
+  ],
+  "trigger": "A release schedule approaches rehearsal, cut gate, publication, then normal operation.",
+  "observe": [
+    "adjacent release schedules choose the active phase",
+    "gate SHA and lock mismatch leaves the gate target cold",
+    "reconcile returns target shortfall and reason"
+  ],
+  "expected": "Phase targets follow the active schedule; only exact gate identity is prewarmed, and unavailable targets are reported for cold fallback."
+}

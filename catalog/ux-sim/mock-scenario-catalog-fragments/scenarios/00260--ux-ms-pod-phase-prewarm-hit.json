@@ -1,0 +1,20 @@
+{
+  "id": "UX-MS-POD-PHASE-PREWARM-HIT",
+  "name": "Prewarmed gate handles its first request",
+  "kind": "release-pod-phase",
+  "device": "pod-phase-prewarm-hit-sim",
+  "implementation": [
+    "src/ux-sim/pod-phase-prewarm-sim.ts",
+    "src/task-orchestrator/surfaces/pod-warm-switch.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts"
+  ],
+  "tests": [
+    "src/ux-sim/pod-phase-prewarm-sim.test.ts"
+  ],
+  "trigger": "A cut-gate schedule causes production reconciliation to complete a gate prewarm, then the first gate request is issued.",
+  "observe": [
+    "production phase reconcile target, actual count, and prewarm duration",
+    "first gate request selects the prepared Pod and completes through provider transport"
+  ],
+  "expected": "The first eligible gate request reuses the completed phase-prewarmed Pod; no cold fallback or duplicate preparation occurs."
+}

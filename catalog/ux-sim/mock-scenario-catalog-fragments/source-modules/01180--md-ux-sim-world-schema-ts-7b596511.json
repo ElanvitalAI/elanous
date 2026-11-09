@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-WORLD-SCHEMA-TS",
+  "path": "src/ux-sim/world-schema.ts",
+  "boundary": "Parses RFC A2 world declarations, declared process targets, arbitrary ledger/log injection rows and scheduled monkey/recovery budgets, validating references and field errors without writing.",
+  "deviceIds": [
+    "sim-universe-world-yaml-schema"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

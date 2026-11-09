@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-EVENT-MONKEY-TS",
+  "path": "src/ux-sim/event-monkey.ts",
+  "boundary": "Declares the run-ledger fault-event catalog and seeded monkey/gorilla/kong attack kinds consumed by the grid chaos simulator.",
+  "deviceIds": [
+    "product-devices",
+    "author-reviewer-precheck"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

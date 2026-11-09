@@ -2,8 +2,178 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { readShardArtifacts } from './gate-shard-artifacts.js';
-import { cleanRetryVerdict, failedJunitFiles, junitFailedCaseIds, junitPassedCaseIds, junitTestcaseFiles } from './gate-shard-load-flaky';
+import { createGateRunner, readGateInterferencePairs, shardParts, writeGateVerdictRecord } from './gate-runtime.js';
+import { cleanRetryVerdict, coLocateInterferencePairs, failedJunitFiles, interferencePairsFromRetries, junitFailedCaseIds, junitPassedCaseIds,
+  junitTestcaseFiles, planInterferenceSupplement } from './gate-shard-load-flaky';
+import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+
+test('pair-only interference expands the dirty set and keeps both files in one process group', () => {
+  const pairMap = interferencePairsFromRetries([
+    { id: 'src/a.test.ts > transient error', cause: 'isolation', peers: ['src/b.test.ts'] },
+    { id: 'src/a.test.ts > transient error', cause: 'isolation', peers: ['src/b.test.ts'] },
+    { id: 'src/c.test.ts > timed out', cause: 'timeout', peers: ['src/a.test.ts'] },
+  ]);
+  expect(pairMap).toEqual([{ files: ['src/a.test.ts', 'src/b.test.ts'] }]);
+
+  // Fake world: either file passes alone, the pair fails. A's dirty selection must re-run the
+  // recorded neighbor B in one process, where the pair-only failure becomes observable again.
+  const plan = planInterferenceSupplement(['src/a.test.ts'],
+    ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], pairMap);
+  expect(plan.files).toEqual(['src/a.test.ts', 'src/b.test.ts']);
+  expect(plan.groups).toEqual([['src/a.test.ts', 'src/b.test.ts']]);
+  expect(plan.groups.map((group) => group.length > 1)).toEqual([true]);
+  expect(shardParts(plan.files, () => 1, 120, plan.pairs)).toEqual([['src/a.test.ts', 'src/b.test.ts']]);
+  const shards = coLocateInterferencePairs([{ files: ['src/a.test.ts'], plannedSeconds: 1 },
+    { files: ['src/b.test.ts', 'src/c.test.ts'], plannedSeconds: 2 }], plan.pairs);
+  expect(shards.some((shard) => shard.files.includes('src/a.test.ts') && shard.files.includes('src/b.test.ts'))).toBe(true);
+  expect(shards.flatMap((shard) => shard.files).sort()).toEqual(['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts']);
+  const pairFails = (files: readonly string[]) => files.includes('src/a.test.ts') && files.includes('src/b.test.ts');
+  expect(pairFails(['src/a.test.ts'])).toBe(false);
+  expect(pairFails(['src/b.test.ts'])).toBe(false);
+  expect(plan.groups.some(pairFails)).toBe(true);
+});
+
+test('overlapping interference edges remain in one shard component', () => {
+  const pairs = [{ files: ['src/a.test.ts', 'src/b.test.ts'] as [string, string] },
+    { files: ['src/a.test.ts', 'src/c.test.ts'] as [string, string] }];
+  const shards = coLocateInterferencePairs([{ files: ['src/a.test.ts', 'src/b.test.ts'] },
+    { files: ['src/c.test.ts', 'src/d.test.ts', 'src/e.test.ts'] }], pairs);
+  expect(shards.some(({ files }) => ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'].every((file) => files.includes(file)))).toBe(true);
+  expect(shards.flatMap(({ files }) => files).sort()).toEqual(['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts', 'src/d.test.ts', 'src/e.test.ts']);
+  expect(pairs.every(({ files: [left, right] }) => shards.some((shard) => shard.files.includes(left) && shard.files.includes(right)))).toBe(true);
+});
+
+test('production gate sweep runs a lone dirty test, then its recorded interference neighbor in one real test process', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-interference-live-path-'));
+  const repo = join(root, 'repo');
+  const files = ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts', 'src/d.test.ts'];
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  writeFileSync(join(repo, 'package.json'), '{"name":"gate-interference-sim","version":"1.0.1"}\n');
+  writeFileSync(join(repo, 'bun.lock'), 'lockfileVersion = 1\n');
+  for (const file of files) writeFileSync(join(repo, file), `test('${file}', () => expect(true).toBe(true));\n`);
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr || `git ${args.join(' ')} failed`);
+    return result.stdout.trim();
+  };
+  const events: string[][] = [];
+  const gate = join(root, 'release/1.0.1/gate-logs/cut');
+  const verdict = join(root, 'release/1.0.1/gate-verdict.json');
+  const imageDigest = `sha256:${'a'.repeat(64)}`;
+  // Source: 내부 문서 `GOAL-scripts-release-loop-gate-node-ts-scripts-release-loop-gate-node-f99bf544-2026-10-22` — injected fake Pod boundary for production gate-path simulations.
+  const scheduler = new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]);
+  let podIndex = 0;
+  try {
+    git('init', '-q'); git('config', 'user.name', 'Gate interference sim'); git('config', 'user.email', 'gate-sim@example.invalid');
+    git('add', '.'); git('commit', '-qm', 'gate interference sim');
+    const commit = git('rev-parse', 'HEAD');
+    const command = async (cmd: string, args: readonly string[], cwd: string) => {
+      if (cmd === 'rg') return { rc: 1, output: '' };
+      if (cmd === 'git') {
+        const result = spawnSync('git', [...args], { cwd, encoding: 'utf8' });
+        return { rc: result.status ?? 2, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+      }
+      return { rc: 0, output: '' };
+    };
+    const podCommand = async (options: { command: readonly string[] }) => {
+      const source = options.command.join(' ');
+      const selected = files.filter((file) => source.includes(`./${file}`));
+      events.push(selected);
+      const pairFails = selected.includes(files[0]!) && selected.includes(files[1]!);
+      const artifactsDir = join(root, `pod-${podIndex++}`);
+      mkdirSync(artifactsDir);
+      const junitCase = (file: string, fail: boolean) => `<testsuite file="${file}" tests="1"${fail ? ' failures="1"' : ''}><testcase name="${file}" file="${file}">${fail ? '<failure>pair-only</failure>' : ''}</testcase></testsuite>`;
+      const log = pairFails
+        ? selected.map((file) => `${file}:\n(fail) pair-only [1ms]\n`).join('') + `0 pass\n${selected.length} fail\n0 errors\nRan ${selected.length} tests across ${selected.length} files.\n`
+        : `${selected.length} pass\n0 fail\n0 errors\nRan ${selected.length} tests across ${selected.length} files.\n`;
+      const junit = `<testsuites>${selected.map((file) => junitCase(file, pairFails)).join('')}</testsuites>`;
+      writeFileSync(join(artifactsDir, 'install.rc'), '0\n');
+      writeFileSync(join(artifactsDir, 'install.log'), '');
+      writeFileSync(join(artifactsDir, 'part-0.rc'), pairFails ? '1\n' : '0\n');
+      writeFileSync(join(artifactsDir, 'part-0.log'), log);
+      writeFileSync(join(artifactsDir, 'part-0.junit.xml'), junit);
+      writeFileSync(join(artifactsDir, 'shard.rc'), pairFails ? '1\n' : '0\n');
+      writeFileSync(join(artifactsDir, 'shard.log'), log);
+      writeFileSync(join(artifactsDir, 'junit.xml'), junit);
+      if (pairFails) {
+        writeFileSync(join(artifactsDir, 'part-0.retry-files'), `${files[0]}\n${files[1]}\n`);
+        for (const [index, file] of [files[0]!, files[1]!].entries()) {
+          writeFileSync(join(artifactsDir, `part-0.retry-${index}.started`), '');
+          writeFileSync(join(artifactsDir, `part-0.retry-${index}.rc`), '0\n');
+          writeFileSync(join(artifactsDir, `part-0.retry-${index}.log`), `1 pass\n0 fail\n0 errors\nRan 1 test across 1 file.\n`);
+          writeFileSync(join(artifactsDir, `part-0.retry-${index}.junit.xml`), `<testsuites>${junitCase(file, false)}</testsuites>`);
+        }
+      }
+      return { exitCode: 0, artifactsDir, job: `fake-${podIndex}` };
+    };
+    const runner = createGateRunner(repo, undefined, command, podCommand as never, scheduler, undefined, {
+      remoteRun: () => ({ status: 0, stdout: 'Linux\n', stderr: '' }), podImageDigest: () => imageDigest,
+    });
+    const logDir = join(gate, 'attempts');
+    const shardsPath = join(gate, 'shards.json');
+    const pod = { pool: 'pool-test', shards: 1, shardsFile: { path: shardsPath, version: '1.0.1', ledgerPath: join(root, 'shards.jsonl'), envFingerprint: 'sim-env' } };
+    const first = await runner.sweep(repo, logDir, pod, [files[0]!]);
+    expect(first.rc).toBe(0);
+    expect(events).toEqual([[files[0]!]]);
+    const second = await runner.sweep(repo, logDir, pod, [files[1]!]);
+    expect(second.rc).toBe(0);
+    expect(events[1]).toEqual([files[1]!]);
+
+    writeGateVerdictRecord(verdict, { commit, outcome: 'ok', retryPass: [
+      { id: `${files[0]} > pair-only`, cause: 'isolation', peers: [files[1]!] },
+      { id: `${files[2]} > prior-pair`, cause: 'isolation', peers: [files[3]!] },
+    ], baselineReceipt: { schema: 2, valid: true, commit } });
+    expect(readGateInterferencePairs(verdict)).toEqual([
+      { files: [files[0]!, files[1]!] }, { files: [files[2]!, files[3]!] },
+    ]);
+    const supplemented = await runner.sweep(repo, logDir, pod, [files[0]!]);
+    expect(events[2]).toEqual([files[0], files[1]]);
+    expect(supplemented.rc).toBe(1);
+    expect(supplemented.output).toContain('(fail) pair-only');
+    expect(supplemented.retryPass).toMatchObject([
+      { id: `${files[0]} > ${files[0]}`, cause: 'isolation', peers: [files[1]] },
+      { id: `${files[1]} > ${files[1]}`, cause: 'isolation', peers: [files[0]] },
+    ]);
+    writeGateVerdictRecord(verdict, { commit, outcome: 'ok', retryPass: supplemented.retryPass!,
+      baselineReceipt: { schema: 2, valid: true, commit } });
+    expect(readGateInterferencePairs(verdict)).toEqual([
+      { files: [files[0]!, files[1]!] }, { files: [files[2]!, files[3]!] },
+    ]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('only complete verdict records seed the interference map', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gate-interference-map-'));
+  const path = join(dir, 'gate-verdict.json');
+  try {
+    const row = { id: 'src/a.test.ts > transient error', cause: 'isolation', peers: ['src/b.test.ts'] };
+    writeFileSync(path, JSON.stringify({ outcome: 'error', commit: 'a'.repeat(40), retryPass: [row],
+      baselineReceipt: { schema: 2, valid: false, commit: 'a'.repeat(40) } }));
+    expect(readGateInterferencePairs(path)).toEqual([]);
+    writeFileSync(path, JSON.stringify({ outcome: 'ok', commit: 'a'.repeat(40), retryPass: [row],
+      baselineReceipt: { schema: 2, valid: true, commit: 'a'.repeat(40) } }));
+    expect(readGateInterferencePairs(path)).toEqual([{ files: ['src/a.test.ts', 'src/b.test.ts'] }]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the complete verdict interference map accumulates sweep and supplement discoveries', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gate-interference-map-growth-'));
+  const path = join(dir, 'gate-verdict.json');
+  const record = (commit: string, rows: unknown[]) => writeGateVerdictRecord(path, {
+    outcome: 'ok', commit, retryPass: rows,
+    baselineReceipt: { schema: 2, valid: true, commit },
+  });
+  try {
+    record('a'.repeat(40), [{ id: 'src/a.test.ts > transient', cause: 'isolation', peers: ['src/b.test.ts'] }]);
+    record('b'.repeat(40), [{ id: 'src/c.test.ts > transient', cause: 'isolation', peers: ['src/d.test.ts'] }]);
+    expect(readGateInterferencePairs(path)).toEqual([
+      { files: ['src/a.test.ts', 'src/b.test.ts'] },
+      { files: ['src/c.test.ts', 'src/d.test.ts'] },
+    ]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 describe('same-Pod standalone retry evidence', () => {
   test('selects only attributed failed files from the shard allowlist', () => {

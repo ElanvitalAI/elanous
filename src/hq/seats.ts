@@ -320,7 +320,13 @@ echo HQ_SEAT_RESULT=removed
   }
   const actionBody = action === 'create'
     ? String.raw`if [ -e "$path" ]; then
-${registered}  echo HQ_SEAT_RESULT=unchanged
+${registered}  if git -C "$path" symbolic-ref --quiet HEAD >/dev/null; then
+    echo "seat HEAD is attached to a branch; refusing to reuse: $path" >&2; exit 1
+  else
+    rc=$?
+    if [ "$rc" -ne 1 ]; then echo "cannot verify detached seat HEAD: $path" >&2; exit "$rc"; fi
+  fi
+  echo HQ_SEAT_RESULT=unchanged
 else
   git --git-dir="$repo" worktree add --detach "$path" refs/remotes/origin/main
   echo HQ_SEAT_RESULT=created

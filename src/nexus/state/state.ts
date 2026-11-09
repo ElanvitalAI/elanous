@@ -107,6 +107,7 @@ export interface NexusEvent {
     // FeedbackEnvelope so `<StatusChip>` hydrates wherever chat is
     // rendered (PWA tab · iOS native · future Telegram bot).
     | 'agent.status'
+    | 'app.sim.step'
     | 'ta.repair.completed'
     // PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M2 — HudStore
     // (process-wide HUD segment map) lifecycle. The bridge in

@@ -1,0 +1,22 @@
+{
+  "id": "AUTHOR-PRECHECK-APPLIED",
+  "name": "Exact ask-bound reviewer correction is applied",
+  "kind": "goal-author-reviewer-precheck",
+  "device": "author-reviewer-precheck",
+  "implementation": [
+    "src/ux-sim/author-reviewer-precheck-device.ts",
+    "src/ux-sim/scenario.ts",
+    "scenarios/ux-sim/author-reviewer-precheck-applied.yaml"
+  ],
+  "tests": [
+    "src/ux-sim/scenario.test.ts"
+  ],
+  "trigger": "ScenarioV0 fake LLM returns exact complete sentence from original ask with matching fixEvidence",
+  "observe": [
+    "CLI runId equals authorRunId",
+    "completed status",
+    "appliedFixCount=1",
+    "one runId-scoped log row"
+  ],
+  "expected": "PASS; one grounded fix applied, no unapplied items"
+}

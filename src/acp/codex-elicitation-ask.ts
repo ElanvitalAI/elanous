@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 /** ⛔⭐⭐⭐ E-트랙 — 코덱스의 «물음»을 사람에게 닿게 한다.
  *
  *  📏 2026-08-21 전수 실측 (`[F]` 15차):
@@ -40,10 +41,6 @@ interface SchemaProperty {
   enum?: unknown;
   title?: unknown;
   description?: unknown;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function text(value: unknown): string | undefined {

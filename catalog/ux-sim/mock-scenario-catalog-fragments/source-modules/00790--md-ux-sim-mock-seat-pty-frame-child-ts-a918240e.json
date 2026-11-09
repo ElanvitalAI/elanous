@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-MOCK-SEAT-PTY-FRAME-CHILD-TS",
+  "path": "src/ux-sim/mock-seat-pty-frame-child.ts",
+  "boundary": "Real-PTY child probe that initializes the production TUI, renders a first frame, reads one key and emits run-correlated lifecycle markers.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

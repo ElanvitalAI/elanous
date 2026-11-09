@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { TelegramBot } from '../src/telegram.js';
 import type { FieldReelRunner } from '../src/field/field-reel.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { debug } from '../src/debug/log.js';
 import { buildUserConfig, saveUserConfig } from '../src/user-config.js';
 

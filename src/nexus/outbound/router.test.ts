@@ -3,7 +3,7 @@ import { openDeliveryDb } from './delivery-ledger.js';
 import { normalizeOutbound, outboundAdapters, receiveChannelEvent, registerOutboundAdapter, routeOutbound, type ChannelAdapter, type ChannelEnvelope, type OutboundMsg } from './router.js';
 import { toTelegramEvent } from '../api/telegram-trigger-bot.js';
 import { toDiscordEvent } from '../api/discord-trigger-bot.js';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 
 const cfg = (outbound?: unknown) => ({ raw: outbound ? { outbound } : {} }) as UserConfig;
 const msg = { text: 'channel check', kind: 'alert', markdown: false };

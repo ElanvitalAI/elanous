@@ -9,7 +9,8 @@ import { writeStdoutJson } from '../cli/stdout-json.js';
 import { debug } from '../debug/log.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
-import { getUserConfig, type HqConfig, type HqFenceRole } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { HqConfig, HqFenceRole } from '../user-config/types.js';
 import { fenceOutcomeDir, recordFenceOutcome } from './fence-outcomes.js';
 import { promoteHq, proposeHqPromotion, writeOpSeatRequest } from './promote.js';
 import type { HqOpRequestWriter, PromoteResult } from './promote.js';
@@ -33,6 +34,29 @@ export function registerHqMovePlanCommand(hqCmd: Command): void {
         if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
         else console.log(formatMovePlan(result));
       } catch (error) { console.error(`hq move-plan: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+    });
+  hqCmd.command('repo-maintenance').description('HQ bare 미러 만료 ref dry-run 계획 · 비파괴 메타데이터 정리 (기본 dry-run)')
+    .option('--root <dir>', 'HQ 폴더 (기본 ~/elanous-hq)')
+    .option('--dry-run', '변경 없이 계측 (기본)')
+    .option('--apply', 'ref 삭제 없이 pack/ref 메타데이터만 저우선 정리')
+    .option('--expire-refs', '24시간·보호 근거가 확인된 ref만 삭제 (--apply 필수, 기본 꺼짐)')
+    .option('--json', 'JSON 출력')
+    .action(async (opts: { root?: string; dryRun?: boolean; apply?: boolean; expireRefs?: boolean; json?: boolean }) => {
+      try {
+        if (opts.dryRun && (opts.apply || opts.expireRefs)) throw new Error('--dry-run cannot be combined with --apply or --expire-refs');
+        const { maintainHqRepo, REF_EXPIRY_CONCURRENCY_WARNING } = await import('./repo-maintenance.js');
+        if (opts.expireRefs) console.error('WARNING: ' + REF_EXPIRY_CONCURRENCY_WARNING);
+        const result = maintainHqRepo(opts);
+        if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+        else {
+          const candidates = result.refExpiryPlan.candidates.map(({ ref, reason }) => ref + ':' + reason).join(',') || 'none';
+          console.log('hq repo-maintenance: ' + result.outcome + ' ' + result.repo + '\nrefs ' + result.before.refs + '→' + result.after.refs + ', packs ' + result.before.packs + '→' + result.after.packs + ', fetch ' + result.before.fetchMs + '→' + result.after.fetchMs + ' ms\nexpiry candidates=' + result.refExpiryPlan.candidates.length + ' [' + candidates + '] protected=' + result.refExpiryPlan.protectedRefs.length + ' warnings=' + (result.refExpiryPlan.warnings.join(',') || 'none') + '\nref deletions=' + result.maintenance.deletedRefs.length + ' [' + result.maintenance.deletedRefs.join(',') + '] expiry-applied=' + result.refExpiryPlan.applied);
+        }
+        if (result.capAlerts.length) {
+          for (const alert of result.capAlerts) console.error('CAP ALERT: ' + alert.metric + ' ' + alert.observed + ' > ' + alert.limit);
+          process.exitCode = 2;
+        }
+      } catch (error) { console.error(`hq repo-maintenance: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
     });
 }
 

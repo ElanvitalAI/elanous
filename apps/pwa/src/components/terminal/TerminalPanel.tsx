@@ -17,12 +17,13 @@ import { TerminalTabs, type InitialTerminalState } from './TerminalTabs';
 import { CompactTerminalBar } from './CompactTerminalBar';
 import { useCompactMode } from '@/lib/compact-mode';
 import { initialTerminalNotice } from './initial-terminal-notice';
-import { TuiMirrorView } from './TuiMirrorView';
+import { TuiMirrorViewLazy as TuiMirrorView } from './TuiMirrorView.lazy';
 import { TerminalControls } from './TerminalControls';
 import { ModifierBar } from './ModifierBar';
 import { MultiDeviceIndicator } from './MultiDeviceIndicator';
 import { TerminalDropZone } from './TerminalDropZone';
-import { TerminalChatDock, type TerminalChatDockHandle } from './TerminalChatDock';
+import { TerminalChatDockLazy as TerminalChatDock } from './TerminalChatDock.lazy';
+import type { TerminalChatDockHandle } from './TerminalChatDock';
 import { TailscaleSecurityBanner } from '@/components/voice/TailscaleSecurityBanner';
 import { usePointerCapability } from '@/lib/use-pointer-capability';
 import { useDaemon } from '@/components/providers/DaemonProvider';
@@ -172,6 +173,8 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   const { isCoarsePointer } = usePointerCapability();
   const { compact } = useCompactMode();
   const [terminalId, setTerminalId] = useState<string | null>(null);
+  const terminalIdRef = useRef(terminalId);
+  terminalIdRef.current = terminalId;
   const [clearRequests, setClearRequests] = useState<Readonly<Record<string, number>>>({});
   const [tabIds, setTabIds] = useState<readonly string[]>([]);
   const [liveDismissed, setLiveDismissed] = useState(false);
@@ -438,7 +441,36 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   const handleTabIntent = useCallback((intent: 'next' | 'prev' | number): void => {
     setTabIntent({ intent, nonce: Date.now() });
   }, []);
-  const dockRef = useRef<TerminalChatDockHandle>(null);
+  const dockHandleRef = useRef<TerminalChatDockHandle | null>(null);
+  const dockHandleTerminalIdRef = useRef<string | null>(null);
+  const pendingDockVoiceRef = useRef<Array<{ terminalId: string; text: string }>>([]);
+  const onDockHandleReady = useCallback((callbackTerminalId: string, handle: TerminalChatDockHandle | null): void => {
+    if (!handle) {
+      if (dockHandleTerminalIdRef.current === callbackTerminalId) {
+        dockHandleRef.current = null;
+        dockHandleTerminalIdRef.current = null;
+      }
+      pendingDockVoiceRef.current = pendingDockVoiceRef.current.filter(
+        (item) => item.terminalId !== callbackTerminalId,
+      );
+      return;
+    }
+    if (callbackTerminalId !== terminalIdRef.current) return;
+    dockHandleRef.current = handle;
+    const targetTerminalId = terminalIdRef.current;
+    dockHandleTerminalIdRef.current = targetTerminalId;
+    const queued = pendingDockVoiceRef.current;
+    pendingDockVoiceRef.current = [];
+    if (!targetTerminalId) return;
+    for (const item of queued) {
+      if (item.terminalId === targetTerminalId) handle.submitVoiceTranscript(item.text);
+    }
+  }, []);
+  useEffect(() => () => {
+    dockHandleRef.current = null;
+    dockHandleTerminalIdRef.current = null;
+    pendingDockVoiceRef.current = [];
+  }, []);
   // Phase 2 (webterm voice control · PLAN v1.1) — TerminalPanel is
   // voice owner. Single useVoiceController instance · 3 mic entry
   // points share it · activeMicSource decides STT-final routing:
@@ -449,9 +481,6 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   const [activeMicSource, setActiveMicSource] = useState<'none' | 'dock' | 'controls'>('none');
   const activeMicSourceRef = useRef(activeMicSource);
   activeMicSourceRef.current = activeMicSource;
-  const terminalIdRef = useRef(terminalId);
-  terminalIdRef.current = terminalId;
-
   const handleVoiceTranscript = useCallback((text: string): void => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -470,7 +499,17 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
       }
       debugLog('webterm.voice.stdin-inject', { len: trimmed.length, terminalId: tid });
     } else if (source === 'dock') {
-      dockRef.current?.submitVoiceTranscript(trimmed);
+      const targetTerminalId = terminalIdRef.current;
+      if (!targetTerminalId) return;
+      const handle = dockHandleRef.current;
+      if (handle && dockHandleTerminalIdRef.current === targetTerminalId) {
+        handle.submitVoiceTranscript(trimmed);
+      } else {
+        pendingDockVoiceRef.current = pendingDockVoiceRef.current.filter(
+          (item) => item.terminalId === targetTerminalId,
+        );
+        pendingDockVoiceRef.current.push({ terminalId: targetTerminalId, text: trimmed });
+      }
     } else {
       debugLog('webterm.voice.transcript-no-source', { len: trimmed.length });
     }
@@ -885,10 +924,10 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
       </div>
       {terminalId && !panelsMinimized && panelView === 'terminal' && !livePty && (!initialPtyId || liveDismissed) && (
         <TerminalChatDock
-          ref={dockRef}
           terminalId={terminalId}
           open={chatDockOpen}
           onTabIntent={handleTabIntent}
+          onVoiceTranscriptSubmitReady={onDockHandleReady}
           voice={dockVoiceProp}
         />
       )}

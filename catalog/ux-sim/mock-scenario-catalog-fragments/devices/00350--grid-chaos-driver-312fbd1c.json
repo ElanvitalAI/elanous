@@ -1,0 +1,36 @@
+{
+  "id": "grid-chaos-driver",
+  "name": "Seeded grid chaos driver",
+  "implementation": [
+    "src/ux-sim/grid-chaos-driver.ts",
+    "src/ux-sim/grid-ledger.ts",
+    "src/ux-sim/fault-pod-death.ts",
+    "src/ux-sim/fake-clock.ts"
+  ],
+  "tests": [
+    "src/ux-sim/grid-chaos-driver.test.ts",
+    "src/ux-sim/grid-ledger.test.ts",
+    "src/ux-sim/grid-sim-s12-chaos.test.ts"
+  ],
+  "target": "seeded monkey, gorilla and kong injection through the actual in-memory grid-ledger seam, including the S12 whole-grid lease-loss scenario",
+  "inputs": [
+    "unsigned 32-bit seed",
+    "HQ and worker-grid topology",
+    "fake clock",
+    "required pod-death fixtures"
+  ],
+  "observations": [
+    "ordered target grid/hosts/sessions",
+    "actual selected lease end transitions and untouched active leases",
+    "Pod-death decision rows",
+    "duplicate lease losses",
+    "ledger adapter is the only mutation boundary",
+    "S12 gorilla checkpoint changes every lease in the target grid and leaves non-target grid leases unchanged"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/grid-chaos-driver.test.ts src/ux-sim/grid-ledger.test.ts src/ux-sim/grid-sim-s12-chaos.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

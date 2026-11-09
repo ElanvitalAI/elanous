@@ -1,3 +1,4 @@
+import { isRecord } from '../../primitives/guards.js';
 import { isMap, isScalar, parseDocument } from 'yaml';
 import { validateAppSimulation } from './app-simulate.js';
 
@@ -77,10 +78,6 @@ function shannonEntropy(value: string): number {
     const probability = count / symbols.length;
     return entropy - probability * Math.log2(probability);
   }, 0);
-}
-
-function isRecord(value: unknown): value is RecordValue {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -242,6 +239,18 @@ function sqlIsSafe(sql: string, params: unknown, declaredTables: Set<string>): b
 
   const words = tokens.filter(token => token.type === 'word').map(token => token.value.toUpperCase());
   if (words.some(word => DDL_WORDS.has(word))) return false;
+  const allowedStatements = new Set(['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'REPLACE']);
+  const firstStatement = words[0];
+  let mainStatement = firstStatement;
+  if (firstStatement === 'WITH') {
+    let depth = 0;
+    for (const token of tokens) {
+      if (token.value === '(') depth++;
+      else if (token.value === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0 && token.type === 'word' && allowedStatements.has(token.value.toUpperCase())) mainStatement = token.value.toUpperCase();
+    }
+  }
+  if (!mainStatement || !allowedStatements.has(mainStatement)) return false;
   if (tokens.some(token => token.value === '||')) return false;
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i]?.value === '+' && (tokens[i - 1]?.type === 'string' || tokens[i + 1]?.type === 'string')) return false;
@@ -269,6 +278,14 @@ function sqlIsSafe(sql: string, params: unknown, declaredTables: Set<string>): b
     if (!knownTables.has(tableName.toLowerCase())) return false;
   }
   return true;
+}
+
+function sqlIsReadOnly(sql: string): boolean {
+  const tokens = tokenizeSql(sql);
+  if (!tokens) return false;
+  const words = tokens.filter(token => token.type === 'word').map(token => token.value.toUpperCase());
+  return (words[0] === 'SELECT' || words[0] === 'WITH')
+    && !words.some(word => ['INSERT', 'UPDATE', 'DELETE', 'REPLACE'].includes(word));
 }
 
 function validateCredentialList(value: unknown, path: string, errors: AppContractIssue[], mustBeArray: boolean): void {
@@ -321,6 +338,7 @@ function validateManifest(
   if (doc.tables !== undefined && !isRecord(doc.tables)) push(errors, '/tables', 'tables 는 맵이어야 한다');
   const roles = isRecord(doc.roles) ? new Set(Object.keys(doc.roles)) : new Set<string>();
   if (doc.roles !== undefined && !isRecord(doc.roles)) push(errors, '/roles', 'roles 는 맵이어야 한다');
+  const publicRole = isRecord(doc.roles) && isRecord(doc.roles.public) && doc.roles.public.via === 'public-read';
 
   if (doc.rpc !== undefined && !isRecord(doc.rpc)) push(errors, '/rpc', 'rpc 는 맵이어야 한다');
   if (isRecord(doc.rpc)) {
@@ -329,6 +347,9 @@ function validateManifest(
       const path = mapEntryPath('/rpc', index);
       if (!isRecord(raw)) { push(errors, path, 'RPC 선언은 맵이어야 한다'); continue; }
       if (typeof raw.sql !== 'string' || !sqlIsSafe(raw.sql, raw.params, declaredTables)) push(errors, `${path}/sql`, 'SQL 문·바인딩·DDL·테이블 선언을 확인하라');
+      if (publicRole && Array.isArray(raw.allow) && raw.allow.includes('public') && typeof raw.sql === 'string' && !sqlIsReadOnly(raw.sql)) {
+        push(errors, `${path}/allow`, 'public-read 역할에는 읽기 전용 SQL만 허용된다');
+      }
       if (!Array.isArray(raw.allow) || raw.allow.length === 0 || raw.allow.some(role => typeof role !== 'string' || !roles.has(role))) {
         push(errors, `${path}/allow`, 'allow 은 선언된 역할만 포함하는 비어 있지 않은 목록이어야 한다');
       }
@@ -366,6 +387,9 @@ function validateManifest(
           if (!Array.isArray(doc.storage.upload.allow) || doc.storage.upload.allow.length === 0
             || doc.storage.upload.allow.some(role => typeof role !== 'string' || !roles.has(role))) {
             push(errors, '/storage/upload/allow', 'storage.upload.allow 는 선언된 역할을 하나 이상 포함해야 한다');
+          }
+          if (publicRole && Array.isArray(doc.storage.upload.allow) && doc.storage.upload.allow.includes('public')) {
+            push(errors, '/storage/upload/allow', 'public-read 역할은 업로드를 허용할 수 없다');
           }
           if (!Array.isArray(doc.storage.upload.types) || doc.storage.upload.types.length === 0
             || doc.storage.upload.types.some(type => !isMimeType(type))) {

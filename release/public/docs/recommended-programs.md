@@ -235,7 +235,7 @@ tailscale serve status --json
 
 `elanous nexus pwa share enable` forwards the Nexus web app through Tailscale
 Serve's TLS-terminated TCP mode on the daemon's port, mounted under
-`/app/showroom/`. A successful command prints the share URL with your
+`/app/`. A successful command prints the share URL with your
 tailnet's MagicDNS name for the host; use that exact URL on another device
 in the same tailnet. The port is part of the URL. In the Serve
 status JSON, find `TCP["<port>"]` using the port printed in that URL; its

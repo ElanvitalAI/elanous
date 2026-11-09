@@ -13,7 +13,6 @@ describe('buildDashboardOptionalToolSpecs', () => {
           allowDashboardTerminalInject: true,
           allowDashboardApiCall: true,
           allowDashboardRunShell: true,
-          allowDashboardState: true,
         },
       } as any,
       ptyAvailable: true,
@@ -43,7 +42,7 @@ describe('buildDashboardOptionalToolSpecs', () => {
     ]);
   });
 
-  test('skips gated specs when features are disabled', () => {
+  test('skips gated specs when features are disabled (DashboardState is always on)', () => {
     const specs = buildDashboardOptionalToolSpecs({
       userConfig: {
         shell: {
@@ -52,7 +51,6 @@ describe('buildDashboardOptionalToolSpecs', () => {
           allowDashboardTerminalInject: false,
           allowDashboardApiCall: false,
           allowDashboardRunShell: false,
-          allowDashboardState: false,
         },
       } as any,
       ptyAvailable: false,
@@ -67,6 +65,6 @@ describe('buildDashboardOptionalToolSpecs', () => {
       buildTerminalModalTools: () => [{ name: 'tm-list' } as any],
     });
 
-    expect(specs.map((spec: any) => spec.name)).toEqual(['tm-list']);
+    expect(specs.map((spec: any) => spec.name)).toEqual(['state', 'tm-list']);
   });
 });

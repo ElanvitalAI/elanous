@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { budgetModel } from '../../src/llm/model-defaults.js';
 import { lookupLlmTierSpec } from '../../src/model-tier/index.js';
-import type { LLMProviderName } from '../../src/user-config.js';
+import type { LLMProviderName } from '../../src/user-config/types.js';
 
 describe('budgetModel', () => {
   test('resolves each explicit provider through its budget tier', () => {

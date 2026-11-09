@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-DATA-GUARD-BOUNDARY-TS",
+  "path": "src/ux-sim/fake-data-guard-boundary.ts",
+  "boundary": "Captures scripted public and local HTTP calls, records unknown destinations, refuses anything unregistered, and restores global fetch without network fallback.",
+  "deviceIds": [
+    "fake-data-guard-boundary"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

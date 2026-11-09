@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-BOOT-DAEMON-TOOLS-PTY-SHELL-DEVICE-TS",
+  "path": "src/ux-sim/boot-daemon-tools-pty-shell-device.ts",
+  "boundary": "Stages and inspects production PTY-shell startup, including argv validation and launch outcomes.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

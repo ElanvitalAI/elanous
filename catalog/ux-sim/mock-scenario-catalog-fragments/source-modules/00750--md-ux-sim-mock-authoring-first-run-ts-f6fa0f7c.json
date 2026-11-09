@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-MOCK-AUTHORING-FIRST-RUN-TS",
+  "path": "src/ux-sim/mock-authoring-first-run.ts",
+  "boundary": "Creates an isolated HOME/PATH, launches the real first-run child probe, checks its config/root/provider receipt and hashes, and returns timing plus reproducible evidence.",
+  "deviceIds": [
+    "first-run-and-seminar"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

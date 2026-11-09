@@ -2,7 +2,8 @@ import { markdownSection, parseGoalType, tracedPathReferences, verbatimOriginalA
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 import type { GoalType } from '../self-implement/goal-author.js';
 import type { ModelTier } from '../model-tier/types.js';
-import { ROLE_MODEL_DEFAULTS, type RoleLlmResolution } from '../user-config.js';
+import { ROLE_MODEL_DEFAULTS } from '../user-config.js';
+import type { RoleLlmResolution } from '../user-config/types.js';
 
 export interface DifficultySignals {
   targetPathCount: number;

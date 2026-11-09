@@ -1,5 +1,6 @@
 import { PROVIDERS, streamLLM } from '../llm.js';
-import { getUserConfig, resolveRoleLlm, type UserConfig } from '../user-config.js';
+import { getUserConfig, resolveRoleLlm } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import type { GrowthProposal, GrowthProposer } from './graph-grow.js';
 
 type GrowthLLM = (prompt: string) => Promise<string>;

@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/fake-app-drive-world.test.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/fake-app-drive-world.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Synthetic tenant fixtures stay in memory; no external Google calls or credential persistence occur.",
+  "deviceId": "fake-app-drive-world",
+  "scenarioIds": [
+    "APP-WEB-DRIVE-TENANT"
+  ]
+}

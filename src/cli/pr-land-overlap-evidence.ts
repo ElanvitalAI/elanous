@@ -26,10 +26,12 @@
  */
 import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { debug } from '../debug/log.js';
 import type { CmdRunner } from '../autopilot/pr-manager.js';
 import { parseReviewResultOutput } from '../task-agent/review-result-capture.js';
 import { verifyVirtualRebasePatch } from './pr-land-virtual-rebase.js';
+import { parseMergeTreeConflictPaths } from './pr-land-conflict-merge.js';
 import { proveReviewCarry } from './review-carry.js';
 import { buildTypefixCarryCandidate, loadTypefixCarryContext as loadProductionTypefixCarryContext, proveTypefixCarry, writeTypefixCarryReceipt, type ProveTypefixCarryInput, type TypefixCarryContextOptions, type TypefixCarryDeps, type TypefixCarryReceipt } from './review-typefix-carry.js';
 
@@ -59,6 +61,71 @@ export type OverlapEvidenceVerdict =
 /** Resolve CLI-supplied evidence against the selected repository, not the caller's shell cwd. */
 export function resolveOverlapEvidencePath(evidencePath: string, cwd: string): string {
   return resolve(cwd, evidencePath);
+}
+
+export type PrPushConflictForecast = {
+  schema: 'conflict-forecast.v1'; at: string; kind: 'pr-overlap' | 'pr-conflict'; detector: 'overlap-evidence';
+  pr: number | null; head: string | null; base: string; otherPr: number | null; files: string[]; conflict: true | false | null; owner: string | null;
+  unmeasuredReason?: string;
+};
+export type PrPushConflictPeer = { pr: number; head: string; files: readonly string[]; owner?: string | null };
+function appendDefaultPrPushConflictForecast(row: PrPushConflictForecast): void {
+  const home = process.env.HOME;
+  if (!home) throw new Error('HOME is unavailable for conflict forecast');
+  const path = join(home, 'elanous-hq/seat-state/OP/train-manager/conflict-forecast.jsonl');
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, `${JSON.stringify(row)}\n`, { encoding: 'utf8', mode: 0o600 });
+}
+
+/** Persist an explicit unknown row when the PR census or candidate HEAD could not be measured. */
+export function recordUnmeasuredPrPushConflict(input: {
+  pr: number | null; head: string | null; base: string; owner?: string | null; reason: string;
+  now?: () => Date; append?: (row: PrPushConflictForecast) => void;
+}): PrPushConflictForecast {
+  const row: PrPushConflictForecast = {
+    schema: 'conflict-forecast.v1', at: (input.now?.() ?? new Date()).toISOString(), kind: 'pr-overlap',
+    detector: 'overlap-evidence', pr: input.pr, head: input.head, base: input.base, otherPr: null,
+    files: [], conflict: null, owner: input.owner ?? null, unmeasuredReason: input.reason,
+  };
+  (input.append ?? appendDefaultPrPushConflictForecast)(row);
+  return row;
+}
+
+/** Read-only PR-push observer. Incomplete Git measurements are recorded as conflict:null. */
+export function forecastPrPushConflicts(input: {
+  cwd: string; pr: number | null; head: string; base: string; owner?: string | null; peers: readonly PrPushConflictPeer[];
+  run: CmdRunner; now?: () => Date; append?: (row: PrPushConflictForecast) => void;
+}): { measured: boolean; rows: PrPushConflictForecast[] } {
+  const write = input.append ?? appendDefaultPrPushConflictForecast;
+  const candidate = input.run('git', ['diff', '--name-only', '-z', `${input.base}...${input.head}`], { cwd: input.cwd });
+  const candidateFiles = candidate.ok ? candidate.out.split('\0').filter(Boolean) : [];
+  const rows: PrPushConflictForecast[] = [];
+  let measured = candidate.ok;
+  for (const peer of input.peers) {
+    const files = candidate.ok ? candidateFiles.filter(path => peer.files.includes(path)).sort() : [];
+    if (candidate.ok && files.length === 0) continue;
+    let peerHead = input.run('git', ['rev-parse', '--verify', '--quiet', peer.head], { cwd: input.cwd }).ok ? peer.head : '';
+    if (!peerHead) {
+      const fetched = input.run('git', ['fetch', '--no-tags', 'origin', `refs/pull/${peer.pr}/head`], { cwd: input.cwd });
+      const resolved = fetched.ok ? input.run('git', ['rev-parse', '--verify', '--quiet', 'FETCH_HEAD'], { cwd: input.cwd }) : null;
+      if (resolved?.ok && resolved.out.trim().toLowerCase() === peer.head.toLowerCase()) peerHead = peer.head;
+    }
+    const merge = peerHead
+      ? input.run('git', ['merge-tree', '--write-tree', '-z', input.head, peerHead], { cwd: input.cwd })
+      : { ok: false, out: '' };
+    const conflictPaths = parseMergeTreeConflictPaths(merge.out, merge.ok ? 0 : 1);
+    const cleanTree = merge.ok && /^[a-f0-9]{40,64}$/i.test(merge.out.trim());
+    const conflict = cleanTree ? false : conflictPaths.measured ? conflictPaths.paths.length > 0 : null;
+    if (conflict === null) measured = false;
+    const row: PrPushConflictForecast = {
+      schema: 'conflict-forecast.v1', at: (input.now?.() ?? new Date()).toISOString(),
+      kind: conflict === true ? 'pr-conflict' : 'pr-overlap', detector: 'overlap-evidence', pr: input.pr,
+      head: input.head, base: input.base, otherPr: peer.pr, files: conflictPaths.measured ? [...new Set([...files, ...conflictPaths.paths])].sort() : files,
+      conflict, owner: input.owner ?? null,
+    };
+    write(row); rows.push(row);
+  }
+  return { measured, rows };
 }
 
 export interface VerifyOverlapEvidenceInput {

@@ -38,10 +38,12 @@ import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { machineForToken } from '../../control-plane/member-tokens.js';
 import { handleResourceLedgerPoolDeclarationPost, handleResourceLedgerPoolsApi } from './resource-ledger.js';
 import { handleMissionLineRequest, MissionLineHttpError } from '../../agent-mission/mission-line.js';
-import type { NexusAppHost } from '../apps/app-host.js';
+import { resolveVerifiedOwner, type NexusAppHost } from '../apps/app-host.js';
 import type { AppLifecycleSnapshot } from '../apps/app-lifecycle-ledger.js';
-import { consoleAddress, simulationPreviewAddress } from '../apps/console-address.js';
+import type { AppSimulationSnapshot } from '../apps/app-simulation.js';
+import { consoleAddress, publicAppAddress, simulationPreviewAddress } from '../apps/console-address.js';
 import { connectRelayHost, loadOrCreateRelayHostIdentity, type RelayHostConnection } from '../../relay/host-connector.js';
+import { resolvePublicAppUserId } from '../../relay/relay-server.js';
 import { elanousConfigDir } from '../config/paths.js';
 
 export { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
@@ -380,6 +382,7 @@ import { syncInstalledPluginNodes } from '../../graph-kinds/installed-plugin-nod
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { handlePluginsIndexGet, handlePluginsGet, handlePluginsMarketRefresh, handlePluginsInstall, handlePluginsRemove, handlePluginWizardList, handlePluginWizardSave } from './plugins-market.js';
 import { handlePluginsCredentialsGet, handlePluginsCredentialsPut } from './plugins-credentials-api.js';
+import { createConfiguredMembersApi, type MembersApi } from '../members/members-api.js';
 import {
   handleWorkflowsList,
 } from './workflows.js';
@@ -434,9 +437,31 @@ import {
   handleShowroomLayoutsList,
   parseShowroomLayoutPath,
 } from './showroom-layouts.js';
+import { createAppHostScopedResolver } from './app-host-scoped-resolver.js';
 
 /** Process-wide DRAFT-METRIC cache (one background collection per TTL, shared by every page load). */
 let sharedDraftMetrics: DraftMetricsSource | undefined;
+const defaultMembersApi = createAppHostScopedResolver((appHost?: object) => {
+  try {
+    const nexusAppHost = appHost as NexusAppHost | undefined;
+    return createConfiguredMembersApi(nexusAppHost
+      ? {
+        issueOwnerSession: (appId, memberId) => nexusAppHost.issueOwnerSession(appId, memberId),
+        resolveVerifiedOwner: (appSlug, credential, members) => resolveVerifiedOwner(nexusAppHost, appSlug, credential, members),
+        publicAppUrl: slot => {
+          try {
+            const userSlug = resolvePublicAppUserId();
+            if (!userSlug || !nexusAppHost.slugs.includes(slot.appSlug)) return null;
+            return `${publicAppAddress({ appSlug: slot.appSlug, userSlug })}/`;
+          }
+          catch { return null; }
+        },
+      }
+      : {});
+  } catch {
+    return null;
+  }
+});
 
 export const NEXUS_HTTP_PORT_RANGE = 16;     // try 31415..31430
 /** Short timeout for the pre-bind localhost occupancy probe. */
@@ -546,6 +571,8 @@ export interface NexusHttpServerOpts {
    *  omitted, every meta-API path returns 503 (handlers wired but no
    *  caller). PR i / PR j boot rewire flips this on. */
   metaApi?: MetaApiOpts;
+  /** Public member signup API is self-authenticated by OAuth state and member session. */
+  membersApi?: MembersApi;
   /** Resolves the asynchronously booted configured MCP clients on each resource request. */
   getMcpClients?: () => McpClientsHandle | undefined;
   /** 대표 2026-09-10 — `POST /v1/nexus/admin/mcp-reload` 의 실행부.
@@ -578,6 +605,8 @@ export interface NexusHttpServerOpts {
   appHost?: NexusAppHost;
   /** Durable lifecycle projection used by app tiles; missing rows remain null rather than inventing state. */
   appLifecycleSnapshot?: (appSlug: string) => AppLifecycleSnapshot | null;
+  /** Simulation-only UI projection, isolated from the live lifecycle ledger. */
+  appSimulationSnapshot?: (appSlug: string) => AppSimulationSnapshot;
   /** Ordered app-scoped route handlers. Backends register here so host dispatch stays centralized. */
   appRoutes?: readonly ((request: Request) => Response | undefined | Promise<Response | undefined>)[];
   /** Stable, non-identifying install-derived owner label used by the proposed simulation preview host. */
@@ -1099,6 +1128,10 @@ export async function routeRequest(
     let lifecycleBySlug: Map<string, AppLifecycleSnapshot | null>;
     try { lifecycleBySlug = new Map(opts.appHost.slugs.map(slug => [slug, opts.appLifecycleSnapshot?.(slug) ?? null])); }
     catch { return jsonResponse({ error: 'app-lifecycle-unavailable' }, 503); }
+    const simulationBySlug = new Map<string, AppSimulationSnapshot>(opts.appHost.slugs.map(slug => {
+      try { return [slug, opts.appSimulationSnapshot?.(slug) ?? { status: 'not-created', events: [], receipts: [] }]; }
+      catch { return [slug, { status: 'unavailable', events: [], receipts: [] }]; }
+    }));
     const apps = opts.appHost.slugs.flatMap(slug => {
       const manifest = opts.appHost!.getManifest(slug);
       if (!manifest) return [];
@@ -1114,8 +1147,10 @@ export async function routeRequest(
         name: manifest.title,
         description: typeof manifest.description === 'string' ? manifest.description : '',
         lifecycle: lifecycleBySlug.get(slug) ?? null,
-        // Environment-specific status stays conservative; the durable shared lifecycle projection is returned separately.
-        simulation: { status: 'not-created', ...(simulationHref ? { href: simulationHref } : {}) },
+        backup: opts.appHost!.databaseBackupStatus?.(slug) ?? null,
+        // Simulation records live in a separate store and never change operational lifecycle state.
+        simulation: { ...simulationBySlug.get(slug)!, receipt: simulationBySlug.get(slug)!.receipts[0]?.id,
+          ...(simulationHref ? { href: simulationHref } : {}) },
         production: { status: 'not-created', href: consoleAddress(consoleTarget) },
       }];
     });
@@ -1278,6 +1313,13 @@ export async function routeRequest(
       }
       debug.log('nexus.auth', 'ingest-token', { name, pathname });
     }
+  }
+  if (pathname.startsWith('/v1/members')) {
+    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost);
+    if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
+    const networkKey = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
+    const response = await membersApi.handle(req, networkKey ?? 'unknown');
+    if (response) return response;
   }
   // OAuth 동적 클라이언트 등록(RFC 7591) — Elanous 는 OAuth 를 쓰지 않는다. 405 대신 «이렇게 등록하라»를 돌려준다.
   if (method === 'POST' && pathname === '/register') {

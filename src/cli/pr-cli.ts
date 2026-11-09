@@ -67,15 +67,17 @@ import { registerPrLandOptions } from './pr-land-options.js';
 import { landingFreezeMessage } from '../release-loop/landing-freeze.js';
 import type { VerifyOverlapEvidenceInput } from './pr-land-overlap-evidence.js';
 import { classifyTypecheckDrift, executeDriftPlan, planDriftRepair, resolveDriftAutorepairMode, type DriftDeps } from './pr-land-drift-repair.js';
+import { needsConductorMapRefresh, openConductorMapRefreshPr } from './pr-land-conductor-map.js';
 import { runTypeDriftRadarAfterLanding } from './pr-land-drift-radar.js';
 import { loadGateReceipts } from '../self-implement/gate-receipt-registry.js';
 import { getUserConfig } from '../user-config.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { spawnElanousSync as defaultSpawnElanousSync } from '../instance/spawn-elanous.js';
-import { classifyPrLandRefusal, observeDirectPrLandRefusal, observePrLandRefusal, type PrLandRefusalContext } from './pr-land-refusal.js';
+import { classifyPrLandRefusal, mayLaunchPrLandDriftRepair, observeDirectPrLandRefusal, observePrLandRefusal, type PrLandRefusalContext } from './pr-land-refusal.js';
 import { bindPrLandRefusalToRecover, PR_LAND_CARD_ID_ENV } from './pr-land-recovery.js';
 import type { HeavyRemoteInput, HeavyRemoteResult } from './pr-land-heavy-remote.js';
+import { runPrLandRemoteGit, type PrLandRemoteGitInput, type PrLandRemoteGitResult } from './pr-land-remote-git.js';
 import { readPrBaseNameWithRetry } from './pr-land-base-read.js';
 import { integrateTrain } from '../self-implement/merge-train.js';
 import type { LandingPodShadowInput, LandingPodShadowVerdict } from './pr-land-pod-shadow-job.js';
@@ -272,6 +274,8 @@ export interface PrLandDeps {
   manager?: PrManager;
   /** Confirmed merge cleanup; failures are observed and never undo the merge. */
   onMergedSupersede?: (number: number, cwd: string) => Promise<void>;
+  /** Confirmed fragment-only landing; opens a generated-only CONDUCTOR refresh PR. */
+  onMergedConductorCellFragments?: (number: number, cwd: string) => Promise<string | undefined>;
   /** 병합 재시도 사이 대기(시험 주입용 · 기본 실제 대기). */
   sleep?: (ms: number) => Promise<void>;
   run?: CmdRunner;
@@ -321,6 +325,8 @@ export interface PrLandDeps {
   runIosGate?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => boolean;
   runPwaGate?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => boolean;
   runHeavyRemote?: (input: HeavyRemoteInput) => HeavyRemoteResult;
+  /** Remote Git transport seam; production uses the SSH worker and verifies its receipts on HQ. */
+  runRemoteGit?: (input: PrLandRemoteGitInput) => PrLandRemoteGitResult;
   runLandingPodShadow?: (input: LandingPodShadowInput) => Promise<LandingPodShadowVerdict>;
   isInteractive?: () => boolean;
   /** Clock for the recent-landings window (test seam · default Date.now). */
@@ -2044,8 +2050,29 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     }
   }
 
+  const readPrBaseRepository = (): string | undefined => {
+    if (!opts.heavyRemote || opts.pr === undefined) return undefined;
+    const result = run('gh', ['pr', 'view', String(opts.pr), '--json', 'url'], { cwd });
+    if (!result.ok) return undefined;
+    try {
+      const value = JSON.parse(result.out) as { url?: unknown };
+      const match = typeof value.url === 'string'
+        ? /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/\d+\/?$/iu.exec(value.url)
+        : null;
+      return match?.[1];
+    } catch { return undefined; }
+  };
   const currentMain = (): string | undefined => {
-    // The landing pair names the remote's current tip, not a possibly stale tracking ref.
+    // Pin the target repository's main. HQ origin may be the PR author's fork and
+    // must not decide whether a base-repository release is current.
+    if (opts.heavyRemote) {
+      const baseRepository = readPrBaseRepository();
+      if (!baseRepository) return undefined;
+      const remote = run('gh', ['api', `repos/${baseRepository}/git/ref/heads/main`, '--jq', '.object.sha'], { cwd });
+      const sha = remote.ok ? remote.out.trim() : '';
+      return /^[a-f0-9]{40}$/iu.test(sha) ? sha : undefined;
+    }
+    // The legacy measured path names the remote's current tip, not a stale tracking ref.
     const fetched = run('git', ['fetch', '--quiet', 'origin', 'main'], { cwd });
     if (!fetched.ok) return undefined;
     const tip = run('git', ['rev-parse', '--verify', 'origin/main'], { cwd });
@@ -2165,6 +2192,38 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     verifiedHeavyBase = main;
     out.log(`✓ heavy-remote: host=${verdict.host ?? 'unknown'} head=${opts.expectedHead!.slice(0, 12)} main=${main.slice(0, 12)} source=${verdict.source} elapsed=${verdict.elapsedMs}ms`);
     out.log(`✓ typecheck-roots: ${JSON.stringify(verdict.rootPlan ?? { mode: 'not-applicable', roots: null, promoted: false, reason: 'no-root-plan-in-gate-output' })}`);
+    // Existing tests inject the heavy gate and keep their earlier path. Production and
+    // remote-Git integration tests cross this boundary before any merge admission.
+    if (opts.heavyRemote) {
+      const source = run('gh', ['pr', 'view', String(opts.pr), '--json', 'headRefOid,headRefName,headRepository,headRepositoryOwner'], { cwd });
+      let repo = '';
+      try {
+        const value = JSON.parse(source.out) as { headRefOid?: string; headRefName?: string;
+          headRepository?: { name?: string }; headRepositoryOwner?: { login?: string } };
+        if (source.ok && value.headRefOid?.toLowerCase() === opts.expectedHead!.toLowerCase()
+          && value.headRefName === pinnedBranch && value.headRepository?.name && value.headRepositoryOwner?.login) {
+          repo = `${value.headRepositoryOwner.login}/${value.headRepository.name}`;
+        }
+      } catch { /* Unreadable source identity is a refusal, never a local fallback. */ }
+      const baseRepository = readPrBaseRepository() ?? '';
+      if (!repo || !baseRepository || !verdict.host) {
+        refuseDirect('✗ remote-git: PR base/source repository or selected host unmeasured — no local fallback.');
+        return 1;
+      }
+      const input: PrLandRemoteGitInput = { pr: Number(opts.pr), repository: repo, baseRepository,
+        headRef: `refs/heads/${pinnedBranch}`, head: opts.expectedHead!, main,
+        host: verdict.host, cwd };
+      const result = (deps.runRemoteGit ?? ((value) => runPrLandRemoteGit(value, {
+        run, observe: (event, data) => debug.log('pr.land', event, data),
+      })))(input);
+      record('remote-git', result.ok, { pr: Number(opts.pr), host: verdict.host, head: opts.expectedHead,
+        main, reason: result.ok ? null : result.reason });
+      if (!result.ok || result.resultHead.toLowerCase() !== opts.expectedHead!.toLowerCase()) {
+        refuseDirect(`✗ remote-git: ${result.ok ? 'result-head-mismatch' : result.reason} — no local fallback.`);
+        return 1;
+      }
+      out.log(`✓ remote-git: host=${result.host} head=${result.resultHead.slice(0, 12)} · authenticated GitHub API source-ref check matched`);
+    }
     if (opts.heavyOnPodShadow) {
       const { runHeavyOnPodShadow } = await import('./pr-land-pod-shadow.js');
       const warmReuse = await import('../task-orchestrator/surfaces/warm-reuse-evidence.js');
@@ -2302,8 +2361,9 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
         const launch = deps.driftAutorepair?.launch ?? ((goal: string, boundaryFiles: readonly string[]) =>
           launchDriftRepairThroughTaskCard({ pr: Number(opts.pr), head: opts.expectedHead!, repo: cwd,
             branch: pinnedBranch ?? '', goal: `${goal}\n\n경계 파일: ${boundaryFiles.join(', ')}` }));
-        if (repair.action === 'launch' && mode === 'live') (deps.driftAutorepair?.recordAttempt ?? recordDriftAttempt)(Number(opts.pr), opts.expectedHead!);
-        await executeDriftPlan(repair, mode, launch,
+        const liveLaunchAllowed = mayLaunchPrLandDriftRepair({ mode, verdict: verdict.verdict, action: repair.action });
+        if (liveLaunchAllowed) (deps.driftAutorepair?.recordAttempt ?? recordDriftAttempt)(Number(opts.pr), opts.expectedHead!);
+        await executeDriftPlan(repair, liveLaunchAllowed ? 'live' : mode === 'live' ? 'shadow' : mode, launch,
           deps.driftAutorepair?.escalate ?? (mail => debug.log('pr.land', 'drift-repair-escalated', { mail })));
       }
     } catch (error) { debug.log('pr.land', 'drift-repair-launch-failed', { pr: Number(opts.pr), head: opts.expectedHead,
@@ -2801,6 +2861,17 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
   if (opts.forceFreeze) debug.log('release-loop.freeze', 'force-merge', { pr: prNumber, reason: opts.forceFreeze.trim() });
   record('merge', true, { result: merged.kind, ...(merged.remoteBranchDeletion ? { remoteBranchDeletion: merged.remoteBranchDeletion.detail } : {}) });
+  if (Number.isSafeInteger(prNumber) && prNumber > 0 && needsConductorMapRefresh(changedPaths)) {
+    try {
+      const refreshPr = await (deps.onMergedConductorCellFragments ?? openConductorMapRefreshPr)(prNumber, cwd);
+      if (refreshPr) out.log(`✓ conductor-map: fragment 착지 뒤 생성 전용 PR을 열었습니다 · ${refreshPr}`);
+      else out.log('✓ conductor-map: fragment 착지 뒤 생성 결과가 이미 최신입니다.');
+    } catch (error) {
+      try { debug.log('pr.land', 'conductor-map-refresh-pr-unavailable', { pr: prNumber, error: String(error).slice(0, 240) }, { level: 'warn' }); }
+      catch { /* post-land regeneration cannot undo a confirmed merge */ }
+      out.error(`⚠ conductor-map: #${prNumber} 착지는 확인됐으나 생성 전용 후속 PR 생성 실패 · ${String(error).slice(0, 180)}`);
+    }
+  }
   if (!branch.startsWith('release-docs/')) {
     try {
       const landed = run('gh', ['pr', 'view', String(prNumber), '--json', 'title,headRefOid,baseRefName,mergedAt,mergeCommit'], { cwd });
@@ -2854,10 +2925,18 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     } catch { /* unreadable is not a match */ }
     let firstParent = '';
     if (/^[a-f0-9]{40}$/i.test(mergeOid)) {
-      const fetched = run('git', ['fetch', '--quiet', 'origin', mergeOid], { cwd });
-      if (fetched.ok) {
-        const parent = run('git', ['rev-parse', '--verify', `${mergeOid}^1`], { cwd });
-        if (parent.ok && /^[a-f0-9]{40}$/i.test(parent.out.trim())) firstParent = parent.out.trim();
+      if (!deps.runHeavyRemote || deps.runRemoteGit) {
+        const baseRepository = readPrBaseRepository();
+        if (baseRepository) {
+          const parent = run('gh', ['api', `repos/${baseRepository}/git/commits/${mergeOid}`, '--jq', '.parents[0].sha'], { cwd });
+          if (parent.ok && /^[a-f0-9]{40}$/i.test(parent.out.trim())) firstParent = parent.out.trim();
+        }
+      } else {
+        const fetched = run('git', ['fetch', '--quiet', 'origin', mergeOid], { cwd });
+        if (fetched.ok) {
+          const parent = run('git', ['rev-parse', '--verify', `${mergeOid}^1`], { cwd });
+          if (parent.ok && /^[a-f0-9]{40}$/i.test(parent.out.trim())) firstParent = parent.out.trim();
+        }
       }
     }
     if (state === 'MERGED' && firstParent.toLowerCase() === verifiedHeavyBase.toLowerCase()) {

@@ -6,6 +6,7 @@ import { eligibleGateShardReceipt, gateShardRuntimeIdentityKey, type GateShardId
 import { runtimeIdentitiesMatch } from '../../src/runtime-identity.js';
 import type { GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
 import { mergePassingGateShardResults } from './gate-shard-receipt-carry.js';
+import { gateFileReceiptKeyFromClosureDigest, type GateFileReceipt, type GateFileReceiptEnvelope } from './gate-file-receipts.js';
 
 export interface GateShardSavedRun {
   output: string;
@@ -14,6 +15,7 @@ export interface GateShardSavedRun {
   fail: number;
   errors: number;
   ran: number;
+  skipped?: number;
   files: number;
   passedIds: string[];
 }
@@ -21,6 +23,114 @@ export interface GateShardSavedRun {
 export interface GateShardSavedResult {
   receipt: GateShardReceipt;
   runs: GateShardSavedRun[];
+}
+
+/** A failure is suppressible only when its exact test identity has an owning checklist cell. */
+export interface KnownFailOwnerRecord {
+  failureId: string;
+  checklistCellId: string;
+  firstSeenCommit: string;
+}
+
+export interface KnownFailOwnerLedgerSnapshot { records: unknown[]; writable: boolean; }
+
+function knownFailOwnerLedgerPath(root: string): string {
+  return join(root, 'graph-runs', 'release-loop', 'known-fail-owner-ledger.json');
+}
+
+export function readKnownFailOwnerLedger(root: string): KnownFailOwnerLedgerSnapshot {
+  const path = knownFailOwnerLedgerPath(root);
+  if (!existsSync(path)) return { records: [], writable: true };
+  try {
+    const value = JSON.parse(readFileSync(path, 'utf8')) as { schema?: unknown; records?: unknown };
+    if (value?.schema !== 'known-fail-owner-ledger-v1' || !Array.isArray(value.records))
+      return { records: [], writable: false };
+    return { records: value.records, writable: true };
+  } catch { return { records: [], writable: false }; }
+}
+
+export function appendKnownFailOwnerLedger(root: string, records: readonly unknown[]): void {
+  const path = knownFailOwnerLedgerPath(root);
+  mkdirSync(dirname(path), { recursive: true });
+  const lock = `${path}.lock.d`;
+  const deadline = Date.now() + 10_000;
+  for (let attempt = 1; attempt <= 100; attempt++) {
+    const token = `${process.pid}:${randomUUID()}`;
+    try {
+      mkdirSync(lock);
+      writeFileSync(join(lock, 'owner'), `${token}\n`);
+      try {
+        const snapshot = readKnownFailOwnerLedger(root);
+        if (!snapshot.writable) throw new Error('known-fail owner ledger is unreadable; refusing to replace it');
+        const additions = records.filter(isKnownFailOwnerRecord);
+        const combined = [...snapshot.records];
+        for (const addition of additions) {
+          const existingForId = combined.filter(isKnownFailOwnerRecord).filter(item => item.failureId === addition.failureId);
+          if (existingForId.some(item => item.checklistCellId === addition.checklistCellId)) continue;
+          if (combined.some(item => JSON.stringify(item) === JSON.stringify(addition))) continue;
+          combined.push(addition);
+        }
+        atomicJson(path, { schema: 'known-fail-owner-ledger-v1', records: combined });
+        return;
+      } finally {
+        try {
+          if (readFileSync(join(lock, 'owner'), 'utf8').trim() === token) rmSync(lock, { recursive: true, force: true });
+        } catch { /* a stale-lock recovery or filesystem error already changed the lock */ }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      try {
+        const observed = statSync(lock);
+        const owner = readFileSync(join(lock, 'owner'), 'utf8').trim();
+        const pid = Number(owner.split(':', 1)[0]);
+        if (Date.now() - observed.mtimeMs > 60_000 && Number.isInteger(pid) && pid > 0) {
+          try { process.kill(pid, 0); }
+          catch (probeError) {
+            if ((probeError as NodeJS.ErrnoException).code === 'ESRCH'
+              && readFileSync(join(lock, 'owner'), 'utf8').trim() === owner
+              && statSync(lock).ino === observed.ino) {
+              try { renameSync(lock, `${lock}.stale.${process.pid}.${attempt}.${randomUUID()}`); } catch { /* holder may have released */ }
+            }
+          }
+        }
+      } catch { /* unknown or incomplete locks are not reaped */ }
+      if (attempt === 100 || Date.now() >= deadline) throw new Error(`known-fail owner ledger lock timeout: ${lock}`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+  }
+  throw new Error(`known-fail owner ledger lock timeout: ${lock}`);
+}
+
+export function isKnownFailOwnerRecord(value: unknown): value is KnownFailOwnerRecord {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.failureId !== 'string' || !record.failureId.trim()) return false;
+  const [sourcePath, ...testPath] = record.failureId.split(' > ');
+  const validTestIdentity = !!sourcePath && !sourcePath.startsWith('/') && !sourcePath.split('/').includes('..')
+    && /\.(?:test|spec)\.[cm]?[jt]sx?$/.test(sourcePath) && testPath.length > 0
+    && testPath.every(part => !!part.trim());
+  return validTestIdentity
+    && typeof record.checklistCellId === 'string' && /^[A-Z0-9][A-Z0-9-]*$/.test(record.checklistCellId)
+    && typeof record.firstSeenCommit === 'string' && /^[a-f0-9]{40}$/i.test(record.firstSeenCommit);
+}
+
+/** Invalid, duplicate, or ownerless records never cover a measured failure. */
+export function auditKnownFailFailures(failureIds: readonly string[], value: unknown): {
+  covered: KnownFailOwnerRecord[]; residual: string[];
+} {
+  const rows = Array.isArray(value) ? value : [];
+  const idCounts = new Map<string, number>();
+  const validById = new Map<string, KnownFailOwnerRecord>();
+  for (const row of rows) {
+    const id = row && typeof row === 'object' && !Array.isArray(row)
+      && typeof (row as Record<string, unknown>).failureId === 'string'
+      ? (row as Record<string, string>).failureId : undefined;
+    if (id) idCounts.set(id, (idCounts.get(id) ?? 0) + 1);
+    if (isKnownFailOwnerRecord(row)) validById.set(row.failureId, row);
+  }
+  const ids = [...new Set(failureIds)].sort();
+  const covered = ids.flatMap(id => idCounts.get(id) === 1 && validById.has(id) ? [validById.get(id)!] : []);
+  return { covered, residual: ids.filter(id => idCounts.get(id) !== 1 || !validById.has(id)) };
 }
 
 /** A failed shard may be inherited only when the prior same-head verdict judged every failure preexisting. */
@@ -42,6 +152,96 @@ export function reusableGateShardFailures(receipt: GateShardReceipt, head40: str
 export function gateShardReceiptPath(root: string, shardId: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(shardId)) throw new Error('invalid shard id');
   return join(root, `${shardId}.receipt.json`);
+}
+
+function gateFileReceiptPath(root: string, key: string): string {
+  if (!/^[a-f0-9]{64}$/i.test(key)) throw new Error('invalid gate file receipt key');
+  return join(root, 'files', `${key.toLowerCase()}.json`);
+}
+
+function gateFileReceiptHistoryPath(root: string, key: string, recordSha256: string): string {
+  if (!/^[a-f0-9]{64}$/i.test(key) || !/^[a-f0-9]{64}$/i.test(recordSha256)) throw new Error('invalid gate file receipt history key');
+  return join(root, 'files', `${key.toLowerCase()}.${recordSha256.toLowerCase()}.json`);
+}
+
+function fileReceiptRecordSha256(receipt: GateFileReceipt): string {
+  return createHash('sha256').update(JSON.stringify(receipt)).digest('hex');
+}
+
+function validFileFailureIds(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length > 0 && value.every((id) => typeof id === 'string' && id.trim().length > 0);
+}
+
+function validGateFileReceiptMeasurement(value: unknown): value is GateFileReceipt {
+  if (!value || typeof value !== 'object') return false;
+  const receipt = value as Partial<GateFileReceipt>;
+  return typeof receipt.file === 'string' && Array.isArray(receipt.closureFiles)
+    && receipt.closureFiles.every((file) => typeof file === 'string') && receipt.closureFiles.includes(receipt.file)
+    && typeof receipt.closureDigest === 'string' && /^[a-f0-9]{64}$/i.test(receipt.closureDigest)
+    && typeof receipt.imageDigest === 'string' && /^sha256:[a-f0-9]{64}$/i.test(receipt.imageDigest)
+    && typeof receipt.key === 'string' && /^[a-f0-9]{64}$/i.test(receipt.key)
+    && receipt.key === gateFileReceiptKeyFromClosureDigest(receipt.file, receipt.closureDigest, receipt.imageDigest)
+    && typeof receipt.sourceHead40 === 'string' && /^[a-f0-9]{40}$/i.test(receipt.sourceHead40)
+    && (receipt.carriedToHead40 === undefined || (typeof receipt.carriedToHead40 === 'string' && /^[a-f0-9]{40}$/i.test(receipt.carriedToHead40)))
+    && (receipt.lane === undefined || ['train', 'cut', 'isolated-recheck'].includes(receipt.lane))
+    && (receipt.opaqueReasons === undefined || (Array.isArray(receipt.opaqueReasons)
+      && receipt.opaqueReasons.length > 0 && receipt.opaqueReasons.every((reason) => typeof reason === 'string' && !!reason.trim())))
+    && (receipt.owner === undefined || typeof receipt.owner === 'string')
+    && (receipt.outcome === 'pass' || (receipt.outcome === 'fail' && typeof receipt.owner === 'string'
+      && !!receipt.owner.trim() && validFileFailureIds(receipt.failureIds))
+      || (receipt.outcome === 'error' && typeof receipt.owner === 'string' && !!receipt.owner.trim() && validFileFailureIds(receipt.errorIds)));
+}
+
+/** Persist the latest file result and archive every distinct measurement for the same content key. */
+export function saveGateFileReceipt(root: string, receipt: GateFileReceipt): GateFileReceiptEnvelope {
+  if (!validGateFileReceiptMeasurement(receipt)) throw new Error('incomplete gate file receipt');
+  return withGateShardReceiptLock(root, `file-${receipt.key}`, () => {
+    const path = gateFileReceiptPath(root, receipt.key);
+    mkdirSync(dirname(path), { recursive: true });
+    if (existsSync(path)) {
+      const existing = readGateFileReceipt(root, receipt.key);
+      if (!existing || existing.file !== receipt.file || existing.closureDigest !== receipt.closureDigest
+        || existing.imageDigest !== receipt.imageDigest)
+        throw new Error(`gate file receipt CAS collision: ${receipt.file}`);
+      const { recordSha256: _recordSha256, ...existingReceipt } = existing;
+      if (fileReceiptRecordSha256(existingReceipt) === fileReceiptRecordSha256(receipt)) return existing;
+      const archivePath = gateFileReceiptHistoryPath(root, existing.key, existing.recordSha256);
+      if (!existsSync(archivePath)) atomicJson(archivePath, existing);
+    }
+    const envelope = { ...receipt, recordSha256: fileReceiptRecordSha256(receipt) };
+    atomicJson(path, envelope);
+    return envelope;
+  });
+}
+
+function readValidGateFileReceipt(path: string, key: string): GateFileReceiptEnvelope | null {
+  try {
+    const row = JSON.parse(readFileSync(path, 'utf8')) as GateFileReceiptEnvelope;
+    const { recordSha256, ...receipt } = row;
+    if (!/^[a-f0-9]{64}$/i.test(recordSha256) || fileReceiptRecordSha256(receipt) !== recordSha256
+      || !validGateFileReceiptMeasurement(receipt) || receipt.key !== key) return null;
+    return row;
+  } catch { return null; }
+}
+
+/** Read current and archived measurements without treating an archive as the current result. */
+export function readGateFileReceiptHistory(root: string, key: string): GateFileReceiptEnvelope[] {
+  try {
+    const directory = join(root, 'files');
+    const prefix = `${key.toLowerCase()}.`;
+    const paths = [gateFileReceiptPath(root, key), ...readdirSync(directory)
+      .filter((name) => name.startsWith(prefix) && name !== `${key.toLowerCase()}.json`).map((name) => join(directory, name))];
+    return paths.flatMap((path) => {
+      const row = readValidGateFileReceipt(path, key);
+      return row ? [row] : [];
+    });
+  } catch { return []; }
+}
+
+/** Read only the current self-consistent receipt; history never substitutes for a damaged current record. */
+export function readGateFileReceipt(root: string, key: string): GateFileReceiptEnvelope | null {
+  try { return readValidGateFileReceipt(gateFileReceiptPath(root, key), key); }
+  catch { return null; }
 }
 
 const HISTORY_HEADS_PER_SHARD = 5;
@@ -468,7 +668,11 @@ function readGateShardResultInternal(root: string, expected: { shard: GateShardI
     if (!Array.isArray(parsed.runs) || parsed.runs.length === 0 || parsed.runs.some((run) =>
       typeof run.output !== 'string' || !Number.isSafeInteger(run.rc) || !Number.isSafeInteger(run.ran)
       || !Number.isSafeInteger(run.files) || !Array.isArray(run.passedIds) || !Number.isSafeInteger(run.pass)
-      || run.pass < 0 || run.passedIds.length !== run.pass || run.pass + run.fail + run.errors !== run.ran || new Set(run.passedIds).size !== run.passedIds.length || run.passedIds.some((id) => typeof id !== 'string' || !id.trim()))
+      || !Number.isSafeInteger(run.fail) || !Number.isSafeInteger(run.errors)
+      || (run.skipped !== undefined && (!Number.isSafeInteger(run.skipped) || run.skipped < 0))
+      || run.pass < 0 || run.fail < 0 || run.errors < 0 || run.passedIds.length !== run.pass
+      || run.pass + run.fail + run.errors + (run.skipped ?? 0) !== run.ran
+      || new Set(run.passedIds).size !== run.passedIds.length || run.passedIds.some((id) => typeof id !== 'string' || !id.trim()))
       || JSON.stringify(parsed.failureIds) !== JSON.stringify(receipt.failureIds)
       || JSON.stringify(parsed.errorIds) !== JSON.stringify(receipt.errorIds)) return null;
     return { receipt, runs: parsed.runs };

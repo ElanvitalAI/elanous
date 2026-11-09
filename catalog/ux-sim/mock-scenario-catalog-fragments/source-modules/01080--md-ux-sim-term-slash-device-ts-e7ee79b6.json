@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TERM-SLASH-DEVICE-TS",
+  "path": "src/ux-sim/term-slash-device.ts",
+  "boundary": "term slash device: Run the fast command matrix through the same production handler used by TUI.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

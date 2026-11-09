@@ -5,8 +5,8 @@ import * as llmTools from './llm-tools.js';
 
 describe('surface LLM tools import boundary', () => {
   test('the current runtime import graph keeps the barrel and tools out of one non-trivial SCC', () => {
-    const graph = runtimeSccBoundaryGraph();
     const members = ['src/surface/index.ts', 'src/surface/llm-tools.ts'];
+    const graph = runtimeSccBoundaryGraph(members);
     for (const member of members) expect(RUNTIME_SCC_BOUNDARY_ROOTS.has(member), `${member} is a graph root`).toBe(true);
     for (const member of members) expect(graph.tracked.has(member), member).toBe(true);
     const reverse = new Map<string, string[]>();

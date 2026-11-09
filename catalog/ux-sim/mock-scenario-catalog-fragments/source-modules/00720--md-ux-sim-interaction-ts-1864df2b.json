@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-INTERACTION-TS",
+  "path": "src/ux-sim/interaction.ts",
+  "boundary": "Exercises the real Escape abort gate and agent-registry typeahead against a simulated mounted-modal stack in mount order.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

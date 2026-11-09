@@ -30,7 +30,8 @@ import {
 import { basename, join } from 'node:path';
 import { LOCAL_AGENTS_DIR } from '../config.js';
 import type { AgentDefinition } from './types.js';
-import { parseSkillMd, type SkillManifest } from '../skills/runner.js';
+import { parseSkillMd } from '../skills/skill-manifest.js';
+import type { SkillManifest } from '../skills/runner.js';
 import { isAgentDisabled } from '../plugin-state/disabled.js';
 
 // ── Frontmatter parser ──

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SERVICE-KEY-SETUP-TS",
+  "path": "src/ux-sim/service-key-setup.ts",
+  "boundary": "Routes production Codex login fetch requests through fake OpenAI and device-OAuth endpoints; unknown URLs fail closed and no external request is sent.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -225,4 +225,28 @@ describe('createObjectStore', () => {
     bare.put('k.txt', 'hi');
     expect(missing.calls[0]!.bin).toBe('gcloud');
   });
+  test("delete removes a local object", () => {
+    const dir = mkdtempSync(join(tmpdir(), "objstore-delete-"));
+    const cfg: StorageConfig = { provider: "local", localDir: dir, bucket: "", publicBucket: "", prefix: "monad" };
+    const store = createObjectStore(cfg);
+    store.put("notes/a.txt", "hello");
+    expect(store.head("notes/a.txt").exists).toBe(true);
+    store.delete("notes/a.txt");
+    expect(store.head("notes/a.txt").exists).toBe(false);
+  });
+
+  test("delete invokes each remote provider command with the object key", () => {
+    const s3 = callsOf();
+    createObjectStore({ provider: "s3", localDir: "/tmp/x", bucket: "priv", publicBucket: "", prefix: "monad" }, { run: s3.run, which: name => name }).delete("apps/a/db-backups/old.json");
+    expect(s3.calls[0]!.args.slice(0, 3)).toEqual(["s3", "rm", "s3://priv/apps/a/db-backups/old.json"]);
+
+    const gcs = callsOf();
+    createObjectStore({ provider: "gcs", localDir: "/tmp/x", bucket: "bucket", publicBucket: "", prefix: "monad" }, { run: gcs.run, which: name => name }).delete("apps/a/db-backups/old.json");
+    expect(gcs.calls[0]!.args).toEqual(["storage", "rm", "gs://bucket/apps/a/db-backups/old.json"]);
+
+    const azure = callsOf();
+    createObjectStore({ provider: "azure", localDir: "/tmp/x", bucket: "container", publicBucket: "", prefix: "monad", azure: { account: "acct" } }, { run: azure.run, which: name => name }).delete("apps/a/db-backups/old.json");
+    expect(azure.calls[0]!.args).toEqual(["storage", "blob", "delete", "--account-name", "acct", "--container-name", "container", "--name", "apps/a/db-backups/old.json", "--auth-mode", "login"]);
+  });
+
 });

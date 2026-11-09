@@ -1,0 +1,8 @@
+{
+  "path": "test/fixtures/acp-initialize-stub.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun test test/acp-client-observability.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "The consuming ACP test asserts protocol behavior; fixture emits no app logs.db row.",
+  "excludeReason": "Protocol fixture only; no independent scenario entry."
+}

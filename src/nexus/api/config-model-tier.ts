@@ -20,12 +20,8 @@
 // Omitting a key preserves the existing value · supplying `null`
 // clears the sub-tree (sparse default).
 
-import {
-  buildUserConfig,
-  saveUserConfig,
-  userConfigPath,
-  type UserConfig,
-} from '../../user-config.js';
+import { buildUserConfig, saveUserConfig, userConfigPath } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 
 // Tiny local `jsonResponse` so this module doesn't transitively pull
 // `http-server.ts` (which imports `web-push` — irrelevant here and

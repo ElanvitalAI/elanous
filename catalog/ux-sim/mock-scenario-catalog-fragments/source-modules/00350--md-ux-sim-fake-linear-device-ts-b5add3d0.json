@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-LINEAR-DEVICE-TS",
+  "path": "src/ux-sim/fake-linear-device.ts",
+  "boundary": "Implements the Linear API response boundary used by the production browser-hand coordinator, capturing requests without network access.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

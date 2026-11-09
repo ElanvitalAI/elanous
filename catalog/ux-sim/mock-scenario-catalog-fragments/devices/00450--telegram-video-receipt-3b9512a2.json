@@ -1,0 +1,32 @@
+{
+  "id": "telegram-video-receipt",
+  "name": "Telegram video delivery receipt",
+  "implementation": [
+    "src/ux-sim/fake-telegram-video.ts",
+    "src/video-pipeline/telegram-video-sender.ts",
+    "scripts/video-pipeline.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-telegram-video.test.ts"
+  ],
+  "target": "Production explainer-line sendVideo callback with an in-memory Telegram Bot API response boundary",
+  "inputs": [
+    "API base and token",
+    "chat ID",
+    "MP4 bytes and caption",
+    "injected Telegram success or rejection"
+  ],
+  "observations": [
+    "exact sendVideo endpoint and POST method",
+    "multipart chat_id/video/caption",
+    "file name/type/byte length",
+    "Telegram message ID receipt",
+    "rejection description with no claimed delivery"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-telegram-video.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

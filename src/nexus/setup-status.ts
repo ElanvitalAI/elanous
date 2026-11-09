@@ -1,7 +1,8 @@
 import { existsSync } from 'node:fs';
 
 import { debug } from '../debug/log.js';
-import { buildUserConfig, resolveSkillSources, type UserConfig as MainUserConfig } from '../user-config.js';
+import { buildUserConfig, resolveSkillSources } from '../user-config.js';
+import type { UserConfig as MainUserConfig } from '../user-config/types.js';
 import { decideProviderForConfig } from '../llm.js';
 import { resolveGrokCredential } from '../grok/credential.js';
 import { loadTokens } from '../oauth/store.js';

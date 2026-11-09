@@ -1,0 +1,30 @@
+{
+  "id": "git-worktree-accel-measure",
+  "name": "Same-cut git checkout acceleration matrix",
+  "implementation": [
+    "scripts/measure-git-checkout-accel.ts",
+    "src/ux-sim/fixtures/git-worktree-accel-linux.json"
+  ],
+  "tests": [
+    "scripts/measure-git-checkout-accel.test.ts"
+  ],
+  "target": "Deterministic fixture demonstration of the production same-cut cold/warm comparison contract for worktree-add, remote-gate-clone, and pod-source-image; values are not host performance claims; candidate safety reasons and independently unavailable fseventsd counter",
+  "inputs": [
+    "full cut SHA",
+    "route × candidate × cold/warm observations",
+    "duration/disk/file/fsevent measurements or explicit unavailable reason",
+    "alternates GC and sparse-dependency safety facts"
+  ],
+  "observations": [
+    "18 rows share one full cut SHA",
+    "cold/warm costs remain separate",
+    "unavailable fseventsd data is explicit and does not become a fabricated zero",
+    "unsafe alternates/sparse candidates carry refusal reasons"
+  ],
+  "entryCommands": [
+    "bun scripts/measure-git-checkout-accel.ts --input src/ux-sim/fixtures/git-worktree-accel-linux.json --table"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

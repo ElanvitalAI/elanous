@@ -1,0 +1,28 @@
+{
+  "id": "fake-fleet",
+  "name": "Fake multi-host fleet device",
+  "implementation": [
+    "src/ux-sim/fake-fleet.ts",
+    "src/ux-sim/fake-kubectl.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-fleet.test.ts"
+  ],
+  "target": "composable multi-host SSH and multi-context/multi-node Kubernetes boundaries",
+  "inputs": [
+    "host/context/node inventory",
+    "ordered per-host SSH scripts",
+    "latency and failures"
+  ],
+  "observations": [
+    "per-context Kubernetes state",
+    "per-host SSH calls and responses",
+    "timeout and unreachable-host outcomes"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-fleet.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

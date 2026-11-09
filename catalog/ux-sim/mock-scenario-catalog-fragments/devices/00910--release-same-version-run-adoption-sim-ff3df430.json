@@ -1,0 +1,30 @@
+{
+  "id": "release-same-version-run-adoption-sim",
+  "name": "Same-version release run adoption simulator",
+  "implementation": [
+    "src/ux-sim/release-same-version-run-adoption-sim.ts",
+    "scripts/release-loop/unattended-release.ts",
+    "src/graph-runner/runner.ts"
+  ],
+  "tests": [
+    "src/ux-sim/release-same-version-run-adoption-sim.test.ts"
+  ],
+  "target": "The real graph runner records a failed gate, then the next same-version release request resumes that run from the failed gate and completes without a second run-ledger entry.",
+  "inputs": [
+    "isolated temporary Git remote and prior published release",
+    "real release-loop graph runner with a simulated failing then passing gate command",
+    "same-version restart with the legacy gate-image input absent"
+  ],
+  "observations": [
+    "same graph run ID resumes from gate and completes",
+    "resume input patch restores gateImagePin",
+    "existing release branch is adopted by the same run owner",
+    "graph-run ledger contains one run"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/release-same-version-run-adoption-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

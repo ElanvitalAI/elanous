@@ -16,8 +16,10 @@ afterEach(() => { delete process.env.GIT_TRACE; for (const root of roots.splice(
 test('GATE-CUT-SNAPSHOT sim: repeated planning consumers share one ls-tree and one cat-file batch', () => {
   const repo = mkdtempSync(join(tmpdir(), 'gate-cut-snapshot-')); roots.push(repo);
   const trace = join(repo, 'git-trace.log');
+  const cliEntryPath = ['bin', ['elanous', 'mjs'].join('.')].join('/');
   const files: Record<string, string> = {
     'scripts/example.test.ts': 'export const fixture = true;\n',
+    [cliEntryPath]: 'export const cli = true;\n',
     'bun.lock': 'lock-root\n', 'apps/pwa/bun.lock': 'lock-pwa\n',
     'graphs/release/release-loop.yaml': 'node_id: gate\n', 'graphs/release/recipes.yaml': 'gate:\n  command: bun test\n  timeout_ms: 1000\n',
   };
@@ -31,10 +33,12 @@ test('GATE-CUT-SNAPSHOT sim: repeated planning consumers share one ls-tree and o
   };
   git('init', '-q'); git('config', 'user.name', 'Cut snapshot test'); git('config', 'user.email', 'cut-snapshot@example.invalid');
   git('add', '.'); git('commit', '-qm', 'seed cut snapshot');
+  writeFileSync(join(repo, cliEntryPath), 'export const cli = false;');
   const commit = git('rev-parse', 'HEAD');
   process.env.GIT_TRACE = trace;
   const snapshot = createCutSnapshot(repo, commit, join(repo, 'artifacts'));
   expect(createCutSnapshot(repo, commit)).toBe(snapshot);
+  expect(snapshot.read(cliEntryPath)).toContain('export const cli = true;');
   expect(gateAssignableTestsAtCommit(repo, commit)).toEqual(['scripts/example.test.ts']);
   expect(gateAssignableTestsAtCommit(repo, commit)).toEqual(['scripts/example.test.ts']);
   expect(gateLockfileHashAtCommit(repo, commit)).toBeTruthy();
@@ -48,6 +52,35 @@ test('GATE-CUT-SNAPSHOT sim: repeated planning consumers share one ls-tree and o
   expect((calls.match(/git cat-file/g) ?? []).length).toBe(1);
 });
 
+
+
+test('GATE-CUT-SNAPSHOT sim: a legacy same-commit artifact is rebuilt with mjs and cjs entries', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'gate-cut-snapshot-legacy-')); roots.push(repo);
+  const files: Record<string, string> = {
+    'bin/entry.mjs': 'export const mjsEntry = true;',
+    'bin/entry.cjs': 'exports.cjsEntry = true;',
+    'scripts/example.test.ts': 'export const fixture = true;',
+  };
+  for (const [path, contents] of Object.entries(files)) {
+    const target = join(repo, path); mkdirSync(join(target, '..'), { recursive: true }); writeFileSync(target, contents);
+  }
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  git('init', '-q'); git('config', 'user.name', 'Cut snapshot test'); git('config', 'user.email', 'cut-snapshot@example.invalid');
+  git('add', '.'); git('commit', '-qm', 'seed legacy snapshot');
+  const commit = git('rev-parse', 'HEAD');
+  const artifactDir = join(repo, 'artifacts');
+  mkdirSync(artifactDir, { recursive: true });
+  const artifactPath = join(artifactDir, commit + '.json');
+  writeFileSync(artifactPath, JSON.stringify({ commit, entries: {}, files: Object.keys(files).sort() }));
+  const snapshot = createCutSnapshot(repo, commit, artifactDir);
+  expect(snapshot.read('bin/entry.mjs')).toContain('mjsEntry');
+  expect(snapshot.read('bin/entry.cjs')).toContain('cjsEntry');
+  expect(JSON.parse(readFileSync(artifactPath, 'utf8')).formatVersion).toBe(2);
+});
 
 test('GATE-CUT-SNAPSHOT sim: 80 shard consumers use one snapshot, then same-commit planning spawns no Git', () => {
   const repo = mkdtempSync(join(tmpdir(), 'gate-cut-snapshot-80-')); roots.push(repo);

@@ -1,6 +1,6 @@
 // DEC-TG — 디스코드 운반(운영 봇 · 대표 DM). 판단은 decision-cards.ts. 버튼 = MESSAGE_COMPONENT · 메모 = 모달.
 import type { DiscordBot } from '../discord.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { debug } from '../debug/log.js';
 import { DECISION_DATA_PREFIX, DecisionCardService, ghPrReplier, type CardTransport, type CardView } from './decision-cards.js';
 

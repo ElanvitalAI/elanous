@@ -1,5 +1,9 @@
 import { test, expect, describe } from 'bun:test';
-import { assembleDetailMarkdown, uploadMorningReport } from './morning-detail.js';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { assembleDetailMarkdown, readLatestMorningWaiverEvents, uploadMorningReport } from './morning-detail.js';
+import { appendWaiverEvent, gateWaiverEvidence, issueGateWaiverEvent } from '../release-loop/waiver-events.js';
 import type { MorningSources } from './morning-synthesis.js';
 
 function fakeSources(over: Partial<MorningSources> = {}): MorningSources {
@@ -41,6 +45,41 @@ describe('morning-detail — assembleDetailMarkdown', () => {
     expect(md).not.toContain('미국장');
     expect(md).not.toContain('커뮤니티 버즈');
     expect(md).toContain('# 🌅 Conatus 상세 아침 브리핑');   // 헤더는 항상
+  });
+  test('자동 아침 보고에 최근·활성 게이트 면제 사건을 표로 싣는다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'morning-waiver-events-'));
+    try {
+      const now = Date.now();
+      appendWaiverEvent(join(root, 'review-results', 'waiver-events.jsonl'), issueGateWaiverEvent({
+        mode: 'operational', target: 'run:morning-waiver-sim', head: 'a'.repeat(40),
+        evidence: gateWaiverEvidence({ reason: 'unmeasured gate wait', actor: 'OP', unmeasured: 'no structured receipt' }),
+        actor: 'OP', issuedAt: now - 1_000, expiresAt: now + 60_000,
+      }));
+      const events = readLatestMorningWaiverEvents(now, root);
+      const md = assembleDetailMarkdown(fakeSources(), null, events);
+      expect(md).toContain('## 🧾 게이트 면제 사건');
+      expect(md).toContain('run:morning-waiver-sim');
+      expect(md).toContain('unmeasured gate wait');
+      expect(md).toContain('active');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  test('활성 면제는 만료 전만 포함하고 손상된 원장은 읽기 실패로 드러낸다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'morning-waiver-expiry-'));
+    try {
+      const now = Date.now();
+      const event = (id: string, expiresAt: number) => issueGateWaiverEvent({
+        mode: 'operational', target: `run:${id}`, head: 'b'.repeat(40),
+        evidence: gateWaiverEvidence({ reason: id, actor: 'OP' }), actor: 'OP',
+        issuedAt: now - 2 * 24 * 60 * 60 * 1000, expiresAt,
+      });
+      appendWaiverEvent(join(root, 'review-results', 'waiver-events.jsonl'), event('active', now + 60_000));
+      appendWaiverEvent(join(root, 'review-results', 'waiver-events.jsonl'), event('expired', now - 1));
+      expect(readLatestMorningWaiverEvents(now, root).map((item) => item.target)).toEqual(['run:active']);
+      const broken = join(root, 'broken', 'review-results', 'waiver-events.jsonl');
+      mkdirSync(join(root, 'broken', 'review-results'), { recursive: true });
+      writeFileSync(broken, '{not-json}\n');
+      expect(() => readLatestMorningWaiverEvents(now, join(root, 'broken'))).toThrow('invalid waiver event ledger row');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

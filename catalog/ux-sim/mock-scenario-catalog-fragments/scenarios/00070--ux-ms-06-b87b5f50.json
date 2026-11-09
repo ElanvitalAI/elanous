@@ -1,0 +1,19 @@
+{
+  "id": "UX-MS-06",
+  "name": "Landing train rejection",
+  "kind": "train-rejection",
+  "device": "fake-land-queue",
+  "implementation": [
+    "src/ux-sim/fake-land-queue.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-land-queue.test.ts"
+  ],
+  "trigger": "Inject a full queue, failed gate, conflicting head or closed cut window.",
+  "observe": [
+    "queue decision",
+    "rejection reason",
+    "slot state"
+  ],
+  "expected": "the queue refuses with a reason and does not grant a slot"
+}

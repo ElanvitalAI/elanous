@@ -4,8 +4,8 @@ import { REGIME_DB_PATH as PUBLIC_REGIME_DB_PATH } from './regime-store.js';
 import { REGIME_DB_PATH as LEAF_REGIME_DB_PATH } from './regime-db-path.js';
 
 test('regime stores and fetchers are not in one runtime SCC', () => {
-  const graph = runtimeSccBoundaryGraph();
   const members = ['src/domains/macro-store.ts', 'src/domains/regime-fetchers.ts', 'src/domains/regime-store.ts'];
+  const graph = runtimeSccBoundaryGraph(members);
   for (const member of members) expect(RUNTIME_SCC_BOUNDARY_ROOTS.has(member), `${member} is a graph root`).toBe(true);
   for (const member of members) expect(graph.tracked.has(member), member).toBe(true);
   const reachableFrom = (start: string): Set<string> => {

@@ -1,16 +1,15 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { CliUserError } from '../cli/cli-user-error.js';
 import { resolveRepositoryName } from '../harness/repository-name.js';
-import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
-import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { userConfigPath } from '../user-config.js';
 import { addItem, checklistHistory, listChecklist, ownerMatches, parseOwner, setItem, validateCeoLoad, type ChecklistItem } from './checklist.js';
 import { assignedVersions, move, releasedVersion } from './feature-store.js';
 import { debug } from '../debug/log.js';
+import { placementConfig, validCeoCap, type CeoCalendar } from './placement-config.js';
+import { ceoOverload as evaluateCeoOverload, checkScheduleCeoLoad as checkScheduleCeoLoadWithDeps } from './placement-ceo-load.js';
 import { kstDay, listSchedules, type ReleaseSchedule } from './release-schedule.js';
 import { parseRubric, rubricScore, type rubricGrade } from './rubric.js';
+export type { CeoCalendar } from './placement-config.js';
+type CeoWork = Pick<ChecklistItem, 'id' | 'ceoMinutes' | 'ceoDate'>;
 
 export type PlacementPriority = 'P0' | 'P1' | 'P2';
 export interface PlacementCell { id: string; title: string; owner: string; priority: PlacementPriority; grade?: ReturnType<typeof rubricGrade>; predecessors: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean }
@@ -89,27 +88,7 @@ export function mergedPrsLast24h(now = new Date()): number {
   return rows.filter((row) => Date.parse(row.mergedAt) >= Date.parse(since) && Date.parse(row.mergedAt) <= now.getTime()).length;
 }
 
-export interface CeoCalendar {
-  /** KST inclusive term ranges. A term cap can tighten the normal daily budget. */
-  terms?: Array<{ from: string; to: string; dailyCap: number }>;
-  /** KST event days explicitly override the term/normal cap, including exceptions with extra time. */
-  events?: Record<string, number>;
-}
-
-function placementConfig(root?: string): { seatCap?: Record<string, number>; ceoDailyCap?: number; ceoCalendar?: CeoCalendar } {
-  const path = root !== undefined ? join(root, 'config.json')
-    : getElanousConfigDirOverride() ? join(effectiveInstanceRoot(), 'config.json') : userConfigPath();
-  if (!existsSync(path)) return {};
-  const raw = JSON.parse(readFileSync(path, 'utf8')) as { release?: { placement?: { seatCap?: Record<string, number>; ceoDailyCap?: number; ceoCalendar?: CeoCalendar } } };
-  return raw.release?.placement ?? {};
-}
-
 export function placementSeatCap(): Record<string, number> { return placementConfig().seatCap ?? {}; }
-function validCeoCap(cap: number): number {
-  if (!Number.isSafeInteger(cap) || cap < 0) throw new CliUserError('잘못된 대표 하루 상한: release.placement.ceoDailyCap');
-  return cap;
-}
-
 export function placementCeoDailyCap(): number { return validCeoCap(placementConfig().ceoDailyCap ?? 30); }
 
 /** One configuration snapshot for the read-only pull-forward caller. */
@@ -118,69 +97,15 @@ export function pullForwardPlacementConfig(): { seatCap: Record<string, number>;
   return { seatCap: config.seatCap ?? {}, ceoDailyCap: validCeoCap(config.ceoDailyCap ?? 30), ceoCalendar: config.ceoCalendar ?? {} };
 }
 
-function validDay(day: string): boolean {
-  return typeof day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isFinite(Date.parse(`${day}T00:00:00Z`))
-    && new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) === day;
+function ceoOverload(item: Pick<ChecklistItem, 'id' | 'ceoMinutes' | 'ceoDate'>, row: ReleaseSchedule,
+  snapshots: Map<string, { items: Pick<ChecklistItem, 'id' | 'ceoMinutes' | 'ceoDate'>[] }>, schedules: ReleaseSchedule[], cap: number,
+  calendar: CeoCalendar = {}): string | null {
+  return evaluateCeoOverload(item, row, snapshots, schedules, cap, kstDay, calendar);
 }
 
-function calendarCap(day: string, cap: number, calendar: CeoCalendar): number {
-  if (!calendar || (calendar.terms !== undefined && !Array.isArray(calendar.terms))
-    || (calendar.events !== undefined && (!calendar.events || typeof calendar.events !== 'object' || Array.isArray(calendar.events))))
-    throw new CliUserError('잘못된 대표 달력: release.placement.ceoCalendar');
-  let effective = cap;
-  for (const term of calendar.terms ?? []) {
-    if (!term || typeof term !== 'object') throw new CliUserError('잘못된 대표 학기 달력: release.placement.ceoCalendar.terms');
-    if (!validDay(term.from) || !validDay(term.to) || term.from > term.to) throw new CliUserError('잘못된 대표 학기 달력 날짜: release.placement.ceoCalendar.terms');
-    validCeoCap(term.dailyCap);
-    if (term.from <= day && day <= term.to) effective = Math.min(effective, term.dailyCap);
-  }
-  for (const [date, eventCap] of Object.entries(calendar.events ?? {})) {
-    if (!validDay(date)) throw new CliUserError('잘못된 대표 행사 달력 날짜: release.placement.ceoCalendar.events');
-    validCeoCap(eventCap);
-  }
-  return calendar.events?.[day] ?? effective;
-}
-
-/** Explicit day wins; otherwise a cell uses the target release's landing day in KST. */
-function ceoDay(item: { ceoDate?: string }, row: ReleaseSchedule): string {
-  return item.ceoDate ?? kstDay(row.landBy!);
-}
-
-type CeoWork = Pick<ChecklistItem, 'id' | 'ceoMinutes' | 'ceoDate'>;
-function ceoOverload(item: CeoWork, row: ReleaseSchedule, snapshots: Map<string, { items: CeoWork[] }>, schedules: ReleaseSchedule[], cap: number, calendar: CeoCalendar = {}): string | null {
-  if (!item.ceoMinutes) return null;
-  const day = ceoDay(item, row);
-  const limit = calendarCap(day, cap, calendar);
-  const peers = [...snapshots].flatMap(([version, snapshot]) => {
-    const schedule = schedules.find((candidate) => candidate.version === version);
-    return snapshot.items.filter((other) => other.id !== item.id && other.ceoMinutes
-      && (other.ceoDate === day || (!other.ceoDate && schedule?.landBy && ceoDay(other, schedule) === day)));
-  });
-  const total = item.ceoMinutes + peers.reduce((sum, other) => sum + other.ceoMinutes!, 0);
-  if (total <= limit) return null;
-  const reason = `대표 손 과부하 ${day} KST: ${[...peers.map((peer) => `${peer.id} ${peer.ceoMinutes}분`), `${item.id} ${item.ceoMinutes}분`].join(' + ')} = ${total}분 > 하루 상한 ${limit}분 — 늦추기(다음 날짜/판) · 자리 대행(대표 분량 축소) · 묶기(촬영·승인 합산 분량 축소)를 제안`;
-  debug.log('release.placement', 'ceo-overload', { day, id: item.id, total, cap: limit, reason });
-  return reason;
-}
-
-/** Called by setSchedule before a landing-day change can overload an already placed cell. */
+/** Backward-compatible placement API; the schedule writer calls the dependency leaf directly. */
 export function checkScheduleCeoLoad(version: string, landBy: string, root?: string): void {
-  const schedules = listSchedules(root);
-  const proposed = schedules.some((row) => row.version === version)
-    ? schedules.map((row) => row.version === version ? { ...row, landBy } : row)
-    : [...schedules, { version, cutAt: landBy, landBy, updatedAt: '', updatedBy: '' }];
-  const target = proposed.find((row) => row.version === version)!;
-  const targetItems = listChecklist(version, root).items;
-  const changed = targetItems.filter((item) => item.ceoMinutes && !item.ceoDate);
-  if (!changed.length) return;
-  const versions = [...new Set([...proposed.map((row) => row.version), ...assignedVersions(root)])];
-  const snapshots = new Map(versions.map((v) => [v, { items: v === version ? targetItems : listChecklist(v, root).items }]));
-  const config = placementConfig(root);
-  const cap = validCeoCap(config.ceoDailyCap ?? 30);
-  for (const item of changed) {
-    const issue = ceoOverload(item, target, snapshots, proposed, cap, config.ceoCalendar);
-    if (issue) throw new CliUserError(issue);
-  }
+  return checkScheduleCeoLoadWithDeps(version, landBy, root, { listSchedules, kstDay });
 }
 
 function dependencyViolation(

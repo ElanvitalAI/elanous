@@ -22,7 +22,7 @@ import {
 import { loadMachineLedger, validateMachineLedger } from '../machines/machine-ledger.js';
 import type { ResourceView } from '../control-plane/ledger.js';
 import { debug } from '../debug/log.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 const PLATFORM_PROBES: Record<string, string> = {
   'uname -s': 'Linux',

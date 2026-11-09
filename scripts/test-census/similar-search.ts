@@ -7,6 +7,7 @@ import {
 } from '../../src/domains/knowledge.js';
 import { createKnowledgeCard } from '../../src/knowledge/kgs/intake.js';
 import { KgsSqliteStore } from '../../src/knowledge/kgs/sqlite-store.js';
+import type { NumericCandidateProvenance } from '../test-census.js';
 
 export interface CensusCase {
   id?: string;
@@ -21,6 +22,7 @@ export interface CensusCase {
   module?: string;
   owner?: string;
   recentPrs?: number[];
+  numericCandidateProvenance?: NumericCandidateProvenance[] | null;
 }
 
 export interface GoldPair {
@@ -63,8 +65,13 @@ function caseId(row: CensusCase): string {
   return row.id ?? `${row.file}#${row.name}`;
 }
 
-function searchableText(row: CensusCase): string {
-  return [row.file, row.name, row.assertions, row.targetSummary, row.contractSummary]
+export function searchableText(row: CensusCase): string {
+  const numericEvidence = row.numericCandidateProvenance?.map((candidate) => [
+    `numeric literal ${candidate.literal} at line ${candidate.line}`,
+    `blame commit ${candidate.blameCommit ?? 'unknown'}`,
+    `commit reason ${candidate.reason ?? 'unknown'}`,
+  ].join('; ')).join('\n');
+  return [row.file, row.name, row.assertions, row.targetSummary, row.contractSummary, numericEvidence]
     .filter((part): part is string => Boolean(part?.trim()))
     .join('\n');
 }

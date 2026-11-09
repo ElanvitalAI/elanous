@@ -21,9 +21,7 @@ function legacyDirs(cfg: UserConfig, sharedHome: string, connected: string[] = [
     else if (sk.dirs.length > 0) base = [...sk.dirs];
   } else if (sk.dirs.length > 0) base = [...sk.dirs];
   const shared = join(sharedHome, '.agents', 'skills');
-  if (sk.includeSharedAgentSkills !== false) {
-    try { if (statSync(shared).isDirectory() && !base.includes(shared)) base.push(shared); } catch { /* absent */ }
-  }
+  try { if (statSync(shared).isDirectory() && !base.includes(shared)) base.push(shared); } catch { /* absent */ }
   for (const dir of connected) if (!base.includes(dir)) base.push(dir);
   return base;
 }
@@ -46,7 +44,6 @@ describe('EN5 skills.sources — one model, old configs unchanged', () => {
       { activeSet: 'codex' },
       { activeSet: 'custom', dirs: ['/a', '/b'] },
       { activeSet: 'custom', dirs: [] },
-      { activeSet: 'claudecode', includeSharedAgentSkills: false },
       { activeSet: 'custom', dirs: [join(home, '.agents', 'skills')] },
     ];
     for (const skills of cases) {

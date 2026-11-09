@@ -7,6 +7,7 @@ import { SearchParamsContext } from 'next/dist/shared/lib/hooks-client-context.s
 import { createNexusClient } from '@/nexus/client';
 import { NexusProvider } from '@/nexus/hooks/use-nexus-context';
 import LiveRunPage from './page';
+import { withFakeFetchDevice } from '../../test-devices/fake-fetch';
 
 const AUTO_FOLLOW_VALUE = '__auto_follow_latest__';
 const client = createNexusClient({
@@ -20,7 +21,6 @@ let restoreBrowser: (() => void) | undefined;
 
 function installConnectBrowser(hash: string, initial: Record<string, string> = {}) {
   const values = new Map(Object.entries(initial));
-  const requests: Array<{ url: string; init: RequestInit }> = [];
   const replacements: string[] = [];
   const local = {
     getItem: (key: string) => values.get(key) ?? null,
@@ -46,23 +46,15 @@ function installConnectBrowser(hash: string, initial: Record<string, string> = {
   } as unknown as Window;
   const oldWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
   const oldStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
-  const oldFetch = globalThis.fetch;
   Object.defineProperty(globalThis, 'window', { configurable: true, value: browserWindow });
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: local });
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    requests.push({ url: String(input), init: init ?? {} });
-    return new Response(JSON.stringify({
-      scope: 'setup', bearer: 'elsb_fresh-device-bearer', expiresAt: Date.now() + 86_400_000,
-    }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as typeof fetch;
   restoreBrowser = () => {
     if (oldWindow) Object.defineProperty(globalThis, 'window', oldWindow);
     else delete (globalThis as { window?: unknown }).window;
     if (oldStorage) Object.defineProperty(globalThis, 'localStorage', oldStorage);
     else delete (globalThis as { localStorage?: unknown }).localStorage;
-    globalThis.fetch = oldFetch;
   };
-  return { values, requests, replacements };
+  return { values, replacements };
 }
 
 async function renderPage(strict = false) {
@@ -126,24 +118,49 @@ test('auto-follow route keeps the no-daemon guidance when Nexus is unavailable',
 
 
 test('an incoming link replaces a saved expired token and claims against the link host', async () => {
-  const browser = installConnectBrowser('#t=els_fresh-link-token', {
-    'elanous.nexus.baseUrl': 'https://old-nexus.example',
-    'elanous.daemon.token': 'elsb_' + 'A'.repeat(43),
-    'elanous.daemon.setupScopeExpiresAt': String(Date.now() - 1),
+  await withFakeFetchDevice([
+    { url: '/v1/setup/claim', method: 'POST', response: () => new Response(JSON.stringify({
+      scope: 'setup', bearer: 'elsb_fresh-device-bearer', expiresAt: Date.now() + 86_400_000,
+    }), { status: 200, headers: { 'content-type': 'application/json' } }) },
+    { url: '/v1/me', method: 'GET', response: () => Response.json({ operator: false }) },
+  ], async (device) => {
+    const browser = installConnectBrowser('#t=els_fresh-link-token', {
+      'elanous.nexus.baseUrl': 'https://old-nexus.example',
+      'elanous.daemon.token': 'elsb_' + 'A'.repeat(43),
+      'elanous.daemon.setupScopeExpiresAt': String(Date.now() - 1),
+    });
+    await renderPage();
+    const calls = device.calls();
+    const [request] = calls.filter((call) => call.method === 'POST' && new URL(call.url).pathname === '/v1/setup/claim');
+    const operatorChecks = calls.filter((call) => call.method === 'GET' && new URL(call.url).pathname === '/v1/me');
+    expect(calls.map((call) => call.routeId)).not.toContain(null);
+    expect(operatorChecks.some((call) => call.status === 200)).toBe(true);
+    expect(operatorChecks.every((call) => call.status === 200)).toBe(true);
+    expect(calls.filter((call) => call.method === 'POST' && new URL(call.url).pathname === '/v1/setup/claim')).toHaveLength(1);
+    expect(request!.url).toBe('https://new-nexus.example/v1/setup/claim');
+    expect(JSON.parse(request!.body!)).toEqual({ t: 'els_fresh-link-token' });
+    expect(browser.values.get('elanous.nexus.baseUrl')).toBe('https://new-nexus.example');
+    expect(browser.values.get('elanous.daemon.token')).toBe('elsb_fresh-device-bearer');
+    expect(browser.replacements).toEqual(['/app/live-run']);
   });
-  await renderPage();
-  expect(browser.requests).toHaveLength(1);
-  expect(browser.requests[0]!.url).toBe('https://new-nexus.example/v1/setup/claim');
-  expect(JSON.parse(browser.requests[0]!.init.body as string)).toEqual({ t: 'els_fresh-link-token' });
-  expect(browser.values.get('elanous.nexus.baseUrl')).toBe('https://new-nexus.example');
-  expect(browser.values.get('elanous.daemon.token')).toBe('elsb_fresh-device-bearer');
-  expect(browser.replacements).toEqual(['/app/live-run']);
 });
 
 test('StrictMode effect replay claims once and saves the bearer', async () => {
-  const browser = installConnectBrowser('#t=els_strict-mode-token');
-  await renderPage(true);
-  expect(browser.requests).toHaveLength(1);
-  expect(browser.values.get('elanous.daemon.token')).toBe('elsb_fresh-device-bearer');
-  expect(browser.replacements).toEqual(['/app/live-run']);
+  await withFakeFetchDevice([
+    { url: '/v1/setup/claim', method: 'POST', response: () => new Response(JSON.stringify({
+      scope: 'setup', bearer: 'elsb_fresh-device-bearer', expiresAt: Date.now() + 86_400_000,
+    }), { status: 200, headers: { 'content-type': 'application/json' } }) },
+    { url: '/v1/me', method: 'GET', response: () => Response.json({ operator: false }) },
+  ], async (device) => {
+    const browser = installConnectBrowser('#t=els_strict-mode-token');
+    await renderPage(true);
+    const calls = device.calls();
+    const operatorChecks = calls.filter((call) => call.method === 'GET' && new URL(call.url).pathname === '/v1/me');
+    expect(calls.map((call) => call.routeId)).not.toContain(null);
+    expect(operatorChecks.some((call) => call.status === 200)).toBe(true);
+    expect(operatorChecks.every((call) => call.status === 200)).toBe(true);
+    expect(calls.filter((call) => call.method === 'POST' && new URL(call.url).pathname === '/v1/setup/claim')).toHaveLength(1);
+    expect(browser.values.get('elanous.daemon.token')).toBe('elsb_fresh-device-bearer');
+    expect(browser.replacements).toEqual(['/app/live-run']);
+  });
 });

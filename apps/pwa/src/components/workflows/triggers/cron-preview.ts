@@ -28,30 +28,30 @@ export function previewCron(expr: string): CronPreview {
   const trimmed = expr.trim();
   if (!trimmed) return { text: '(empty expression)', matched: false };
 
-  const m1 = MINUTE.exec(trimmed);
+  const m1 = trimmed.match(MINUTE);
   if (m1) {
     const n = Number(m1[1]);
     return { text: `Every ${n} minute${n === 1 ? '' : 's'}`, matched: true };
   }
-  const m2 = HOUR.exec(trimmed);
+  const m2 = trimmed.match(HOUR);
   if (m2) {
     const n = Number(m2[1]);
     return { text: `Every ${n} hour${n === 1 ? '' : 's'}`, matched: true };
   }
-  const m3 = WEEKDAYS.exec(trimmed);
+  const m3 = trimmed.match(WEEKDAYS);
   if (m3) {
     return { text: `Every weekday at ${pad2(Number(m3[2]))}:${pad2(Number(m3[1]))}`, matched: true };
   }
-  const m4 = WEEKLY.exec(trimmed);
+  const m4 = trimmed.match(WEEKLY);
   if (m4) {
     const day = DAY_NAMES[Number(m4[3])];
     return { text: `Every ${day} at ${pad2(Number(m4[2]))}:${pad2(Number(m4[1]))}`, matched: true };
   }
-  const m5 = DAILY.exec(trimmed);
+  const m5 = trimmed.match(DAILY);
   if (m5) {
     return { text: `Every day at ${pad2(Number(m5[2]))}:${pad2(Number(m5[1]))}`, matched: true };
   }
-  const m6 = MONTHLY.exec(trimmed);
+  const m6 = trimmed.match(MONTHLY);
   if (m6) {
     return {
       text: `Day ${Number(m6[3])} of every month at ${pad2(Number(m6[2]))}:${pad2(Number(m6[1]))}`,

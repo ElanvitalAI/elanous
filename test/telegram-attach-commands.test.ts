@@ -22,7 +22,7 @@ import {
   attachTelegramBinding,
   findSessionByTelegramChat,
 } from '../src/session/index.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import type { TgIncoming } from '../src/telegram.js';
 
 let tmp: string;

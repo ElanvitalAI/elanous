@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { parsePublicAppHost } from '../../relay/relay-server.js';
-import { consoleAddress, simulationPreviewAddress } from './console-address.js';
+import { consoleAddress, publicAppAddress, simulationPreviewAddress } from './console-address.js';
 
 describe('NEXUS-CONSOLE-ADDRESS simulation contract', () => {
   test('keeps the hosted management console on its isolated domain and local console on its Nexus PWA origin', () => {
@@ -20,8 +20,11 @@ describe('NEXUS-CONSOLE-ADDRESS simulation contract', () => {
     const previewUrl = new URL(preview);
 
     expect(preview).toBe('https://voice-note-sim--alice.elanous.app');
-    expect(parsePublicAppHost(previewUrl.host)).toEqual({ app: 'voice-note-sim', user: 'alice' });
+    expect(parsePublicAppHost(previewUrl.host, 'elanous.app')).toEqual({ app: 'voice-note-sim', user: 'alice' });
+    expect(publicAppAddress({ appSlug: 'voice-note', userSlug: 'alice' })).toBe('https://voice-note--alice.elanous.app');
     expect(previewUrl.origin).not.toBe(consoleAddress({ kind: 'hosted' }));
+    expect(previewUrl.hostname.endsWith('.elanous.app')).toBe(true);
+    expect(new URL(consoleAddress({ kind: 'hosted' })).hostname.endsWith('.elanous.ai')).toBe(true);
   });
 
   test('rejects origins and app/user labels that cannot form a safe public address', () => {

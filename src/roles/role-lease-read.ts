@@ -76,6 +76,7 @@ export async function readRoleLeaseAsync(bucket: string, { run = runGcloud }: {
   debug.log('control.lease', 'read', {
     kind: result.kind, holder: result.kind === 'present' ? result.doc.holder : null,
     generation: result.kind === 'present' ? result.doc.generation : null, ms: Date.now() - started,
+    reason: result.kind === 'unmeasured' ? result.why : null,
   });
   return result;
 }

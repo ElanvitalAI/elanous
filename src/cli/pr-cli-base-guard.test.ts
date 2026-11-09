@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
 import { runPrLand as realRunPrLand, type PrLandDeps, type PrLandOpts } from './pr-cli.js';
 import type { HeavyRemoteInput, HeavyRemoteResult } from './pr-land-heavy-remote.js';
+import { runPrLandRemoteGit, type PrLandRemoteGitInput, type PrLandRemoteGitResult } from './pr-land-remote-git.js';
 import { debug } from '../debug/log.js';
 
 // LAND-BASE-MAIN-GUARD: 10-11 #26022 was squash-merged into bench/base-night-* because the base was read only AFTER the merge.
@@ -32,6 +33,7 @@ const passingHeavyRemote: (input: HeavyRemoteInput) => HeavyRemoteResult = (inpu
   source: 'remote',
   elapsedMs: 0,
   evidencePath: `${input.pr}.json`,
+  host: 'node-b',
 });
 const failingHeavyRemote: (input: HeavyRemoteInput) => HeavyRemoteResult = (input) => ({
   ok: false,
@@ -47,6 +49,11 @@ function land(
   baseReads: Array<{ ok: boolean; out: string; err?: string }> = [],
   finalBaseReads: Array<{ ok: boolean; out: string; err?: string }> = [],
   runHeavyRemote: (input: HeavyRemoteInput) => HeavyRemoteResult = passingHeavyRemote,
+  runRemoteGit?: (input: PrLandRemoteGitInput) => PrLandRemoteGitResult,
+  remoteIdentity: { head: string; main: string; sourceRepository: string; baseRepository: string } = {
+    head: 'a'.repeat(40), main: 'b'.repeat(40),
+    sourceRepository: 'example/repo', baseRepository: 'example/repo',
+  },
 ) {
   const lines: string[] = [];
   const waits: number[] = [];
@@ -54,18 +61,32 @@ function land(
   let baseRead = 0;
   let finalBaseRead = 0;
   const finalBaseTargets: string[] = [];
+  const gitCommands: string[] = [];
+  const ghCommands: string[] = [];
   const deps: PrLandDeps = {
     prodFreezeRoot: freezeRoot,
     sleep: async (ms) => { waits.push(ms); },
     currentBranch: () => 'feat/guard',
     resolveBase: (_run, _cwd, explicit) => explicit ?? 'origin/main',
     run: (command, args) => {
-      if (command === 'git' && args[0] === 'remote') return { ok: true, out: args[1] === 'get-url' ? 'https://github.com/example/repo.git' : 'origin' };
-      if (command === 'git' && args[0] === 'rev-parse') return { ok: true, out: args[1] === 'HEAD' ? 'a'.repeat(40) : args[2] === `${'c'.repeat(40)}^1` || args[2] === 'origin/main' ? 'b'.repeat(40) : '/tmp/guard-test' };
+      if (command === 'git') gitCommands.push(args.join(' '));
+      if (command === 'gh') ghCommands.push(args.join(' '));
+      if (command === 'git' && args[0] === 'ls-remote') return { ok: true, out: `${remoteIdentity.main}\trefs/heads/main\n` };
+      if (command === 'gh' && args[0] === 'pr' && args[1] === 'view' && args[args.indexOf('--json') + 1] === 'url') {
+        return { ok: true, out: JSON.stringify({ url: `https://github.com/${remoteIdentity.baseRepository}/pull/26022` }) };
+      }
+      if (command === 'gh' && args[0] === 'api' && String(args[1] ?? '').includes('/pulls/')) return { ok: true, out: `${remoteIdentity.baseRepository}\n` };
+      if (command === 'gh' && args[0] === 'api') return { ok: true, out: remoteIdentity.main };
+      if (command === 'git' && args[0] === 'remote') return { ok: true, out: args[1] === 'get-url' ? `https://github.com/${remoteIdentity.sourceRepository}.git` : 'origin' };
+      if (command === 'git' && args[0] === 'rev-parse') return { ok: true, out: args[1] === 'HEAD' ? remoteIdentity.head : args[2] === `${'c'.repeat(40)}^1` || args[2] === 'origin/main' ? remoteIdentity.main : '/tmp/guard-test' };
       if (command === 'gh' && args.some((arg) => arg.includes('mergeCommit'))) return { ok: true, out: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: 'c'.repeat(40) } }) };
       if (command === 'git' && args[0] === 'diff' && args[1] === '--name-only') return { ok: true, out: 'src/cli/x.ts\n' };
       if (command === 'gh' && opts.heavyRemote && args.includes('--json') && args.some((arg) => arg.includes('headRefOid'))) {
-        return { ok: true, out: JSON.stringify({ headRefOid: 'a'.repeat(40), headRefName: 'feat/guard', baseRefName: prBase, state: 'OPEN', isDraft: false, url: PR_URL }) };
+        const [headOwner, headName] = remoteIdentity.sourceRepository.split('/');
+        return { ok: true, out: JSON.stringify({ headRefOid: remoteIdentity.head, headRefName: 'feat/guard',
+          headRepository: { name: headName }, headRepositoryOwner: { login: headOwner },
+          baseRefName: prBase, state: 'OPEN', isDraft: false,
+          url: `https://github.com/${remoteIdentity.baseRepository}/pull/26022` }) };
       }
       if (command === 'gh' && opts.heavyRemote && args.includes('--json') && args.some((arg) => arg.includes('baseRefName')) && args[args.indexOf('--json') + 1] === 'baseRefName,url') {
         if (merges > 0) finalBaseTargets.push(args[2] ?? '');
@@ -90,16 +111,103 @@ function land(
     runPwaGate: () => true,
     runIosGate: () => true,
     runHeavyRemote,
+    runRemoteGit: runRemoteGit ?? ((input) => ({ ok: true, resultHead: input.head, host: input.host })),
     listOpenPrs: () => [],
     out: { log: (line) => lines.push(line), error: (line) => lines.push(line) },
     manager: {
-      findPrForBranchOutcome: () => opts.pr ? { status: 'ok OUTPUT', url: PR_URL } : ({ status: 'NOT_FOUND' }),
-      upsertPr: () => ({ ok: true, url: PR_URL, reused: true }),
+      findPrForBranchOutcome: () => opts.pr ? { status: 'ok OUTPUT', url: `https://github.com/${remoteIdentity.baseRepository}/pull/26022` } : ({ status: 'NOT_FOUND' }),
+      upsertPr: () => ({ ok: true, url: `https://github.com/${remoteIdentity.baseRepository}/pull/26022`, reused: true }),
       mergePrOutcome: () => { merges++; return { ok: true, kind: 'merged' }; },
     } as unknown as PrLandDeps['manager'],
   };
-  return realRunPrLand({ body: 'Human-requested atomic PR landing.', ...opts }, deps).then((code) => ({ code, lines, merges: () => merges, waits, baseReads: baseRead, finalBaseReads: finalBaseRead, finalBaseTargets }));
+  return realRunPrLand({ body: 'Human-requested atomic PR landing.', ...opts }, deps).then((code) => ({ code, lines, merges: () => merges, waits, baseReads: baseRead, finalBaseReads: finalBaseRead, finalBaseTargets, gitCommands, ghCommands }));
 }
+
+test('real land orchestration sends pinned identity to remote Git and refuses its failure without HQ fetch or merge', async () => {
+  const calls: PrLandRemoteGitInput[] = [];
+  const remote = (input: PrLandRemoteGitInput): PrLandRemoteGitResult => {
+    calls.push(input);
+    return { ok: false, reason: 'remote-git-worktree-failed:ssh unavailable', host: input.host };
+  };
+  const heavy = (input: HeavyRemoteInput): HeavyRemoteResult => ({ ...passingHeavyRemote(input), host: 'node-b' });
+  const result = await land('main', { heavyRemote: true, pr: '26022', base: 'main', expectedHead: 'a'.repeat(40) }, [], [], heavy, remote);
+  expect(result.code).toBe(1);
+  expect(result.merges()).toBe(0);
+  expect(calls).toEqual([expect.objectContaining({ pr: 26022, repository: 'example/repo', baseRepository: 'example/repo',
+    headRef: 'refs/heads/feat/guard',
+    head: 'a'.repeat(40), main: 'b'.repeat(40), host: 'node-b' })]);
+  expect(result.gitCommands.some((command) => command.startsWith('fetch '))).toBe(false);
+  expect(result.lines.some((line) => line.includes('remote-git-worktree-failed'))).toBe(true);
+});
+
+test('matching remote Git result lets real land orchestration reach merge without HQ fetch', async () => {
+  const remote = (input: PrLandRemoteGitInput): PrLandRemoteGitResult => ({ ok: true, resultHead: input.head, host: input.host });
+  const heavy = (input: HeavyRemoteInput): HeavyRemoteResult => ({ ...passingHeavyRemote(input), host: 'node-b' });
+  const result = await land('main', { heavyRemote: true, pr: '26022', base: 'main', expectedHead: 'a'.repeat(40) }, [], [], heavy, remote);
+  expect(result.code).toBe(0);
+  expect(result.merges()).toBe(1);
+  expect(result.gitCommands.some((command) => command.startsWith('fetch '))).toBe(false);
+  expect(result.lines.some((line) => line.startsWith('✓ remote-git: host=node-b'))).toBe(true);
+});
+
+test('real land path runs the real remote Git worker with fork head and upstream base boundaries', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'pr-land-fork-integration-'));
+  const source = join(scratch, 'source');
+  const sourceBare = join(scratch, 'fork.git');
+  const baseBare = join(scratch, 'upstream.git');
+  const git = (args: string[], cwd = source) => {
+    const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  try {
+    expect(spawnSync('git', ['init', '-q', source]).status).toBe(0);
+    git(['config', 'user.name', 'PR Land Integration']);
+    git(['config', 'user.email', 'pr-land@example.test']);
+    git(['commit', '--allow-empty', '-qm', 'base']);
+    const main = git(['rev-parse', 'HEAD']);
+    git(['branch', '-M', 'main']);
+    git(['checkout', '-qb', 'feature/topic']);
+    git(['commit', '--allow-empty', '-qm', 'feature']);
+    const head = git(['rev-parse', 'HEAD']);
+    expect(spawnSync('git', ['init', '--bare', '-q', sourceBare]).status).toBe(0);
+    expect(spawnSync('git', ['init', '--bare', '-q', baseBare]).status).toBe(0);
+    git(['push', '-q', sourceBare, 'HEAD:refs/heads/feat/guard']);
+    git(['push', '-q', baseBare, 'main']);
+
+    const sourceUrl = 'git@github.com:contributor/elanous-agent.git';
+    const baseUrl = 'https://github.com/ElanvitalAI/elanous.git';
+    const remoteGit = (input: PrLandRemoteGitInput) => runPrLandRemoteGit(input, {
+      ssh: (_host, script) => {
+        const mapped = script.replaceAll(sourceUrl, sourceBare).replaceAll(baseUrl, baseBare);
+        // Source: #35917 follows docker/harness/build.test.ts 20s bound for subprocess-based hermetic tests.
+        const result = spawnSync('sh', ['-s'], { input: mapped, encoding: 'utf8', timeout: 20_000 });
+        return { rc: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+      },
+      run: (command, args) => {
+        expect(command).toBe('gh');
+        expect(args).toEqual(['api', 'repos/contributor/elanous-agent/git/ref/heads/feat/guard', '--jq', '.object.sha']);
+        const result = spawnSync('git', ['ls-remote', '--heads', sourceBare, 'refs/heads/feat/guard'], { cwd: source, encoding: 'utf8' });
+        return { ok: result.status === 0, out: result.stdout?.split(/\s/u)[0] ?? '', err: result.stderr ?? '' };
+      },
+    });
+    const result = await land('main', { heavyRemote: true, pr: '26022', base: 'main', expectedHead: head },
+      [], [], (input) => ({ ...passingHeavyRemote(input), host: 'node-b' }), remoteGit, {
+        head, main, sourceRepository: 'contributor/elanous-agent', baseRepository: 'ElanvitalAI/elanous',
+      });
+    expect(result.code).toBe(0);
+    expect(result.merges()).toBe(1);
+    expect(result.lines.some((line) => line.includes('authenticated GitHub API source-ref check matched'))).toBe(true);
+    expect(result.ghCommands).toContain('api repos/ElanvitalAI/elanous/git/ref/heads/main --jq .object.sha');
+    expect(result.ghCommands).toContain(`api repos/ElanvitalAI/elanous/git/commits/${'c'.repeat(40)} --jq .parents[0].sha`);
+    expect(result.ghCommands.some((command) => command.includes('repos/:owner/:repo/git/commits/'))).toBe(false);
+    expect(result.gitCommands).not.toContain('ls-remote --heads origin refs/heads/main');
+    expect(result.gitCommands).not.toContain('rev-parse --verify origin/main');
+    expect(git(['ls-remote', '--heads', sourceBare, 'refs/heads/main'])).toBe('');
+    expect(git(['ls-remote', '--heads', baseBare, 'refs/heads/main']).split(/\s+/u)[0]).toBe(main);
+    expect(git(['ls-remote', '--heads', sourceBare, 'refs/heads/feat/guard']).split(/\s+/u)[0]).toBe(head);
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+});
 
 test('failed heavy remote gate refuses production landing before merge', async () => {
   const result = await land('main', { heavyRemote: true, pr: '26022', base: 'main', expectedHead: 'a'.repeat(40) }, [], [], failingHeavyRemote);

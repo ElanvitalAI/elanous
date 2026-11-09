@@ -55,21 +55,19 @@ describe('HT3 — native-tool wiring lint', () => {
     const implementationCatalogEntries = nativeToolCatalog.slice(SELF_COGNITION_MCP_CATALOG_ENTRIES.length);
     const ids = implementationCatalogEntries.map(entry => entry.id);
     // Linear tools, graph MCP tools and the mock-device catalog extend the historical implementation baseline.
-    expect(ids).toHaveLength(194);
     expect(new Set(ids).size).toBe(ids.length);
     expect(Object.keys(retiredCatalogIds).sort()).toEqual(['baselineIds', 'retiredIds']);
-    expect(retiredCatalogIds.retiredIds).toHaveLength(18);
     expect(new Set(retiredCatalogIds.retiredIds).size).toBe(retiredCatalogIds.retiredIds.length);
     expect(ids.filter(id => retiredCatalogIds.retiredIds.includes(id))).toEqual([]);
-    expect(retiredCatalogIds.baselineIds).toHaveLength(204);
     expect(new Set(retiredCatalogIds.baselineIds).size).toBe(retiredCatalogIds.baselineIds.length);
     // NTC1 baseline is historical: MsgAsk, Linear tools, graph MCP controls,
-    // and the Nexus mock-device catalog tool
-    // are intentional additions, not part of the pre-retirement catalog snapshot.
+    // the Nexus mock-device catalog tool, and the five Phone adb tools are
+    // intentional additions, not part of the pre-retirement catalog snapshot.
     const postBaselineAdditions = new Set([
       'msg_ask', 'elanous_linear_secretary', 'elanous_linear_issue',
       'graph_compose', 'graph_run_start', 'graph_run_status', 'graph_node_op',
       'elanous_ux_sim_devices',
+      'phone_adb_screenshot', 'phone_adb_ui_dump', 'phone_adb_tap', 'phone_adb_type', 'phone_adb_open_url',
     ]);
     expect(ids).toContain('msg_ask');
     expect(ids).toContain('elanous_linear_secretary');

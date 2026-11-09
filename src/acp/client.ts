@@ -303,24 +303,24 @@ const ACP_FORCED_BILLING_ENV_BY_BACKEND: Readonly<Record<string, Readonly<Record
 };
 
 function scrubAcpBillingEnv(spec: AcpBackendSpec, env: NodeJS.ProcessEnv): AcpBillingEnvScrubObservation {
-  const billingEnvScrubEnabled = spec.id === 'claude' || getUserConfig().acp.scrubBillingEnv !== false;
+  // CONFIG-ALWAYS-TRUE-OUT 11-05 — the acp.scrubBillingEnv opt-out was removed (never set false):
+  // billing credentials are always scrubbed. `billingEnvScrubEnabled` stays in the observation
+  // so existing log readers keep their field.
   const scrubbedBillingEnv: string[] = [];
   const forcedBillingEnv: string[] = [];
-  if (billingEnvScrubEnabled) {
-    for (const key of acpBillingEnvByBackend()[spec.id] ?? []) {
-      if (key in env) {
-        delete env[key];
-        scrubbedBillingEnv.push(key);
-      }
-    }
-    for (const [key, value] of Object.entries(ACP_FORCED_BILLING_ENV_BY_BACKEND[spec.id] ?? {})) {
-      if (!(key in env)) {
-        env[key] = value;
-        forcedBillingEnv.push(key);
-      }
+  for (const key of acpBillingEnvByBackend()[spec.id] ?? []) {
+    if (key in env) {
+      delete env[key];
+      scrubbedBillingEnv.push(key);
     }
   }
-  return { billingEnvScrubEnabled, scrubbedBillingEnv, forcedBillingEnv };
+  for (const [key, value] of Object.entries(ACP_FORCED_BILLING_ENV_BY_BACKEND[spec.id] ?? {})) {
+    if (!(key in env)) {
+      env[key] = value;
+      forcedBillingEnv.push(key);
+    }
+  }
+  return { billingEnvScrubEnabled: true, scrubbedBillingEnv, forcedBillingEnv };
 }
 
 function observeAcpAuthEnv(spec: AcpBackendSpec, env: NodeJS.ProcessEnv): AcpAuthEnvObservation {

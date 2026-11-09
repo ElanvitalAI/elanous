@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAULT-TUI-400-AUTOHEAL-TS",
+  "path": "src/ux-sim/fault-tui-400-autoheal.ts",
+  "boundary": "Supplies captured Codex 400 tool-history mismatch responses to the TUI autoheal path and observes the real recovery decision.",
+  "deviceIds": [
+    "fault-injection"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

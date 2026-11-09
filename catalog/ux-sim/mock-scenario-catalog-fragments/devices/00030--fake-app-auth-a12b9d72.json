@@ -1,0 +1,28 @@
+{
+  "id": "fake-app-auth",
+  "name": "Fake app invitation and session authentication",
+  "implementation": [
+    "src/ux-sim/fake-app-auth.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-app-auth.test.ts"
+  ],
+  "target": "Signed app-scoped invitation acceptance and temporary-token-backed host-only sessions",
+  "inputs": [
+    "app slug",
+    "inviter identity",
+    "signed invitation and expiry",
+    "session verification or revocation"
+  ],
+  "observations": [
+    "invitation acceptance status and inviter record",
+    "__Host- Secure Path=/ cookie without Domain",
+    "tampered, cross-app, expired, uninvited and revoked requests rejected"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-app-auth.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

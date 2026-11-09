@@ -1,9 +1,10 @@
 import { readFileSync } from 'node:fs';
-import { lastJsonObject, STOPPED_NODE_ERROR, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { lastJsonObject, STOPPED_NODE_ERROR } from '../../src/graph-runner/runner-primitives.js';
+import type { GraphRunState } from '../../src/graph-runner/runner-types.js';
 import { publicWaiverReason } from './known-issues-node.js';
-import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
-
-export interface AcceptedRegression { id: string; note: string }
+import { checkGateExecutorChoice } from './gate-executor.js';
+import type { AcceptedRegression, GateExecutorOverride, GatePodPoolOverride, GateShardRerouteOverride } from './resume-types.js';
+export type { AcceptedRegression, GateExecutorOverride, GatePodPoolOverride, GateShardRerouteOverride } from './resume-types.js';
 
 /** Return the saved fork-node index when --from names a failed fan-out branch rather than a parent-path node. */
 export function releaseFanOutForkIndex(state: GraphRunState, branchId: string): number | undefined {
@@ -87,7 +88,9 @@ function printedVerdict(output: unknown): boolean {
 /** A failed release may execute its warning-only traffic restore before the terminal failure. */
 function failedAfterTrafficRestore(state: GraphRunState, index: number): boolean {
   if (state.nodes.length !== state.path.length || state.path.at(-1) !== 'failed' || state.nodes.at(-1)?.nodeId !== 'failed') return false;
-  if (index === state.path.length - 2) return true;
+  if (state.nodes[index]?.nodeId !== state.path[index]) return false;
+  if (index === state.path.length - 2) return state.path[index] === 'gate'
+    || (state.path[index] === 'gate-triage' && state.nodes[index]?.executed === true);
   return index === state.path.length - 3 && state.path[index + 1] === 'traffic-failed-restore'
     && state.nodes[index + 1]?.nodeId === 'traffic-failed-restore' && state.nodes[index + 1]?.executed === true;
 }
@@ -95,8 +98,17 @@ function failedAfterTrafficRestore(state: GraphRunState, index: number): boolean
 /** Gate may also pass through its executed triage shadow before the traffic restore. */
 function failedAfterGate(state: GraphRunState, index: number): boolean {
   if (failedAfterTrafficRestore(state, index)) return true;
-  return state.path[index + 1] === 'gate-triage'
-    && state.nodes[index + 1]?.nodeId === 'gate-triage' && state.nodes[index + 1]?.executed === true
+  const nextNode = state.path[index + 1];
+  const nextRecord = state.nodes[index + 1];
+  if (nextNode === 'emergency-switch' && nextRecord?.nodeId === 'emergency-switch' && nextRecord.executed === true) {
+    const triage = state.nodes[index + 2];
+    return state.path[index + 2] === 'gate-triage' && triage?.nodeId === 'gate-triage' && triage.executed === true
+      && failedAfterTrafficRestore(state, index + 2);
+  }
+  // The receipt-audit edge may fail closed before restoring traffic; it does not change which gate failed.
+  if (nextNode === 'receipt-audit' && nextRecord?.nodeId === 'receipt-audit' && nextRecord.executed === true)
+    return failedAfterTrafficRestore(state, index + 1);
+  return nextNode === 'gate-triage' && nextRecord?.nodeId === 'gate-triage' && nextRecord.executed === true
     && failedAfterTrafficRestore(state, index + 1);
 }
 
@@ -137,7 +149,7 @@ export interface GateWaiverCoverage {
   reason?: string;
 }
 
-/** A measured gate waiver is allowed only for a complete regression verdict whose every introduced test ID was explicitly accepted. */
+/** Report exact coverage for a measured gate verdict; coverage never makes that verdict waivable. */
 export function releaseResumeGateWaiverCoverage(
   state: GraphRunState,
   acceptedRegressions: AcceptedRegression[],
@@ -194,10 +206,14 @@ export function releaseResumeWaiver(
     if (index < 0 || state.path.lastIndexOf(opts.ownerWaive) !== index || record?.nodeId !== opts.ownerWaive || record.ok !== false || record.executed !== true || !failedAfterGate(state, index)) throw new Error('owner waiver requires the failed executable gate on the saved path');
     const reason = opts.reason.trim();
     const gateResult = lastJsonObject(record.output);
+    if (hasRecordedMeasuredGateRegressions(gateResult)) throw new Error('measured gate regressions cannot be waived');
+    const unmeasured = gateUnmeasuredDetail(state, index);
+    if (unmeasured === undefined) throw new Error('owner gate waiver requires an unmeasured gate');
     const introducedIds = Array.isArray(gateResult?.introduced) && gateResult.introduced.length > 0
       && gateResult.introduced.every((id) => typeof id === 'string' && id.trim())
       && new Set(gateResult.introduced).size === gateResult.introduced.length ? gateResult.introduced as string[] : undefined;
-    return { nodeId: opts.ownerWaive, reason, approvedBy, ...(introducedIds ? { introducedIds } : {}), ownerWaived: true,
+    if (introducedIds) throw new Error('measured gate regressions cannot be waived');
+    return { nodeId: opts.ownerWaive, reason, approvedBy, unmeasured, ...(introducedIds ? { introducedIds } : {}), ownerWaived: true,
       acceptedRegressions: releaseResumeAcceptedRegressions(state, [...(opts.acceptedRegressions ?? []), { id: 'waive:gate', note: reason }]) };
   }
   if ((opts.waive === undefined) !== (opts.reason === undefined)) throw new Error('--waive <node> and --reason <text> must be supplied together');
@@ -216,6 +232,8 @@ export function releaseResumeWaiver(
     throw new Error(`--waive ${opts.waive} requires the failed executable node on the saved path`);
   }
   if (opts.waive === 'gate') {
+    const gateOutput = lastJsonObject(state.nodes[index]?.output);
+    if (hasRecordedMeasuredGateRegressions(gateOutput)) throw new Error('measured gate regressions cannot be waived');
     const unmeasured = gateUnmeasuredDetail(state, index);
     if (unmeasured !== undefined) {
       return { nodeId: 'gate', reason, unmeasured,
@@ -227,6 +245,7 @@ export function releaseResumeWaiver(
       throw new Error('cannot waive a safety, side-effect or approval node');
     }
     const coverage = releaseResumeGateWaiverCoverage(state, opts.acceptedRegressions ?? []);
+    if (coverage.introducedIds.length > 0) throw new Error('measured gate regressions cannot be waived');
     if (!opts.acceptedRegressions?.length && coverage.introducedIds.length === 0) {
       throw new Error('only an unmeasured gate — stopped, killed or sweep incomplete — may be waived');
     }
@@ -252,33 +271,16 @@ export function releaseResumeWaiver(
     [...(opts.acceptedRegressions ?? []), { id: `waive:${opts.waive}`, note: reason }]) };
 }
 
+/** Any non-empty regression signal is measured evidence; malformed evidence must fail closed too. */
+function hasRecordedMeasuredGateRegressions(result: Record<string, unknown> | undefined): boolean {
+  if (!result) return false;
+  if (Array.isArray(result.introduced) && result.introduced.length > 0) return true;
+  if (typeof result.introduced === 'number' && result.introduced > 0) return true;
+  if (Array.isArray(result.introducedIds) && result.introducedIds.some((id) => typeof id === 'string' && id.trim().length > 0)) return true;
+  return typeof result.introducedIds === 'number' && result.introducedIds > 0;
+}
+
 /** GATE-HOST-EXECUTOR — one explicit executor switch, recorded on the run (`GraphRunState.inputOverrides`). */
-export interface GateExecutorOverride {
-  kind: 'gate-executor';
-  at: string;
-  from: string;
-  set: { gateExecutor: GateExecutor; gateRemote?: string };
-  /** Input keys removed — switching back to pod drops the host an earlier override added (the original had none). */
-  unset?: Array<'gateRemote'>;
-  previous: { gateExecutor: unknown; gateRemote: unknown };
-}
-
-/** RESUME-GATE-POOL-OVERRIDE — replace the saved pool for a gate that will be re-run. */
-export interface GatePodPoolOverride {
-  kind: 'gate-pod-pool';
-  at: string;
-  from: string;
-  set: { gatePodPool: string };
-  previous: { gatePodPool: unknown };
-}
-
-/** One shard keeps its component identity while the run-time scheduler chooses a compatible member. */
-export interface GateShardRerouteOverride {
-  kind: 'gate-shard-reroute'; at: string; from: string;
-  set: { gateRerouteShard: string; gateShardHost?: string; gateShardCapabilities?: Record<string, { os: 'darwin' | 'linux' }> };
-  previous: { gateRerouteShard: unknown; gateShardHost: unknown; gateShardCapabilities: unknown };
-}
-
 export function releaseResumeGateShardReroute(state: GraphRunState, opts: {
   from: string; shard: unknown; host?: unknown; os?: unknown; at?: string;
 }): GateShardRerouteOverride {

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAULT-POD-REUSE-RESIDUE-TS",
+  "path": "src/ux-sim/fault-pod-reuse-residue.ts",
+  "boundary": "Seeds repeatable local Git and credential residue, with fake-ps process inventory consumed by production POD cleanup; the clean-state integration test adds a live child process.",
+  "deviceIds": [
+    "pod-reuse-residue-fault"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

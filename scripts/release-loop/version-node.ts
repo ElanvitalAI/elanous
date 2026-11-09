@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -84,7 +85,7 @@ function fetchMain(repo: string): void {
       continue;
     }
     // Report the URL's transport, never its value (or the socket path).
-    const remote = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: repo, encoding: 'utf8' });
+    const remote = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     const url = remote.status === 0 ? remote.stdout.trim() : '';
     const remoteKind = /^(?:ssh:\/\/|[^\s@]+@[^\s:]+:)/i.test(url) ? 'ssh'
       : /^https:\/\//i.test(url) ? 'https' : 'unknown';
@@ -194,6 +195,23 @@ function priorRunOwnsTip(version: string, tip: string, owner: { runId: string; a
   }) ?? false;
 }
 
+/** A terminal prior run may lend its verified stable cut to a replacement run; a foreign or live run may not. */
+function completedRunOwnsTip(version: string, tip: string, owner: { runId: string }, root: string): boolean {
+  const path = join(root, 'graph-runs', 'release-loop', `${owner.runId}.json`);
+  if (!existsSync(path)) return false;
+  const state = JSON.parse(readFileSync(path, 'utf8')) as { graphId?: unknown; runId?: unknown; status?: unknown;
+    input?: { version?: unknown; branchCut?: unknown }; nodes?: Array<{ nodeId?: unknown; ok?: unknown; output?: unknown }> };
+  if (state.graphId !== 'release-loop' || state.runId !== owner.runId || (state.status !== 'done' && state.status !== 'failed')
+    || state.input?.version !== version || state.input?.branchCut !== true) return false;
+  return state.nodes?.some((node) => {
+    if (node.nodeId !== 'version-release' || node.ok !== true || typeof node.output !== 'string') return false;
+    try {
+      const result = JSON.parse(node.output.trim().split('\n').at(-1)!) as { commit?: unknown; branch?: unknown };
+      return result.commit === tip && result.branch === `release/${version}`;
+    } catch { return false; }
+  }) ?? false;
+}
+
 function preserveForeignBranch(repo: string, version: string, tip: string): string {
   const backupBranch = `release-backup/${version}/${tip}`;
   const ref = `refs/heads/${backupBranch}`;
@@ -256,7 +274,9 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
     const recordedOwner = owner ? recordedBranchOwner(repo, tip) : undefined;
     const ledgerOwned = owner && !recordedOwner
       ? priorRunOwnsTip(version, tip, owner, deps.root ?? effectiveInstanceRoot()) : false;
-    if (owner && recordedOwner?.runId !== owner.runId && !ledgerOwned) {
+    const completedPriorCut = owner && recordedOwner && recordedOwner.runId !== owner.runId && prereleaseKind(version) === null
+      ? completedRunOwnsTip(version, tip, recordedOwner, deps.root ?? effectiveInstanceRoot()) : false;
+    if (owner && recordedOwner?.runId !== owner.runId && !ledgerOwned && !completedPriorCut) {
       const backupBranch = preserveForeignBranch(repo, version, tip);
       throw new Error(`${branch} belongs to ${recordedOwner?.runId ?? 'an unknown run'}; preserved ${tip} at ${backupBranch}; refusing to replace a foreign release branch`);
     }
@@ -344,9 +364,13 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string,
   fetchMain(repo);
   if (kind === 'release' && cutCommit !== undefined) {
     if (!/^[0-9a-f]{7,40}$/i.test(cutCommit)) throw new Error(`invalid cut commit SHA: ${cutCommit}`);
-    const local = spawnSync('git', ['rev-parse', '--verify', `${cutCommit}^{commit}`], { cwd: repo, encoding: 'utf8' });
+    const local = spawnSync('git', ['rev-parse', '--verify', `${cutCommit}^{commit}`], {
+      cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+    });
     let chosen = local.status === 0 ? local.stdout.trim() : '';
-    const onMain = chosen ? spawnSync('git', ['merge-base', '--is-ancestor', chosen, 'origin/main'], { cwd: repo }) : null;
+    const onMain = chosen ? spawnSync('git', ['merge-base', '--is-ancestor', chosen, 'origin/main'], {
+      cwd: repo, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+    }) : null;
     if (onMain && onMain.status !== 0 && onMain.status !== 1) throw new Error(`git merge-base failed: ${onMain.error || onMain.stderr || 'unknown'}`);
     if (onMain?.status !== 0) {
       const remote = git(repo, 'ls-remote', '--heads', 'origin', `refs/heads/release/${releaseVersion}`);

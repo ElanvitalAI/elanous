@@ -13,7 +13,7 @@ if (startAt < 0 || endAt < 0 || endAt < startAt) {
 }
 const generated = [
   begin,
-  '> 이 표는 `src/ux-sim/mock-scenario-catalog.json`에서 생성한다. 갱신: `bun scripts/generate-ux-sim-device-manual.ts`.',
+  '> 이 표는 `catalog/ux-sim/mock-scenario-catalog-fragments/`에서 생성한다. 갱신: `bun scripts/generate-ux-sim-device-manual.ts`.',
   '',
   ...renderMockScenarioDeviceMarkdownTable(loadMockScenarioCatalog()),
   end,

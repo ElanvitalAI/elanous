@@ -1,3 +1,4 @@
+import { isNonEmptyString, isRecord } from '../primitives/guards.js';
 /** Neutral data contract for associating a research request, questions, and returned evidence. */
 export interface ResearchQuestion {
   id: string;
@@ -88,7 +89,7 @@ export function parseSixLevelResearchQuestionLadder(
       return { ok: false, reason: `questions[${index}] requires a unique level from 1 to 6` };
     }
     if (!Array.isArray(raw.searchTerms) || raw.searchTerms.length === 0
-      || !raw.searchTerms.every(isNonEmptyString)) {
+      || !raw.searchTerms.every((term) => isNonEmptyString(term))) {
       return { ok: false, reason: `questions[${index}] requires search terms` };
     }
     levels.add(raw.level);
@@ -143,14 +144,6 @@ export function attachResearchEvidence(
     return { ok: false, reason: 'evidence envelope is invalid' };
   }
   return { ok: true, value: { ...ladder, evidence: [...ladder.evidence, { ...envelope }] } };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function isBloomLevel(value: unknown): value is BloomLevel {

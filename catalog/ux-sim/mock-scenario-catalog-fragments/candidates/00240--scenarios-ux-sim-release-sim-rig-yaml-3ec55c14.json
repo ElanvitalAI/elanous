@@ -1,0 +1,13 @@
+{
+  "path": "scenarios/ux-sim/release-sim-rig.yaml",
+  "disposition": "already-indexed",
+  "entryCommand": "bun bin/elanous.mjs --test sim run scenarios/ux-sim/release-sim-rig.yaml",
+  "logsRecorded": "yes",
+  "logsDetail": "ScenarioV0 completion row is stored in isolated test logs.db; the evidence artifact is a separate JSON file.",
+  "deviceId": "release-graph-rig",
+  "scenarioIds": [
+    "UX-MS-02",
+    "RELEASE-GRAPH-PREPUB-FANOUT",
+    "RELEASE-MACROPHAGE-HEAL"
+  ]
+}

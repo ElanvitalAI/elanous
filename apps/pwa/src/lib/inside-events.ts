@@ -1,4 +1,5 @@
 import type { DaemonClient } from './daemon-client';
+import { parseSseBlock } from './daemon-client';
 import { subscribeSharedEventSource } from './shared-event-source';
 import { parseDecision, type PtyDecision } from '../components/inside/pty-decisions';
 
@@ -74,6 +75,88 @@ export interface InsideRun {
 export interface RunsState {
   currentRunId: string | null;
   runs: Record<string, InsideRun>;
+}
+
+export interface ReleaseGateProgressEvent {
+  graphId: 'release-loop'; runId: string; at?: string; eventId?: string;
+  phase: string; shard?: string; state?: string; decision?: 'reuse' | 'rerun'; reason?: string;
+  shardIndex?: number; shardTotal?: number; reuseCount?: number; rerunCount?: number;
+  radiusInvalidatedCount?: number; failureCount?: number;
+  rerunReasons?: Record<string, number>;
+}
+
+export function fromReleaseGateProgress(value: unknown): ReleaseGateProgressEvent | null {
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value) as unknown; } catch { return null; }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const frame = value as Record<string, unknown>;
+  const data = frame.data && typeof frame.data === 'object' && !Array.isArray(frame.data)
+    ? frame.data as Record<string, unknown> : frame;
+  if (frame.kind !== 'release.gate.progress' || frame.graphId !== 'release-loop' || typeof frame.runId !== 'string' || !frame.runId
+    || typeof data.phase !== 'string' || !data.phase) return null;
+  const numericKeys = ['shardIndex', 'shardTotal', 'reuseCount', 'rerunCount', 'radiusInvalidatedCount', 'failureCount'] as const;
+  const numbers = Object.fromEntries(numericKeys.flatMap((key) => typeof data[key] === 'number' && Number.isFinite(data[key]) && data[key] >= 0
+    ? [[key, data[key]]] : []));
+  const rerunReasons = data.rerunReasons && typeof data.rerunReasons === 'object' && !Array.isArray(data.rerunReasons)
+    ? Object.fromEntries(Object.entries(data.rerunReasons as Record<string, unknown>)
+      .filter(([reason, count]) => reason.length <= 160 && typeof count === 'number' && Number.isSafeInteger(count) && count >= 0)) as Record<string, number> : undefined;
+  return {
+    graphId: 'release-loop', runId: frame.runId,
+    ...(typeof data.at === 'string' ? { at: data.at } : typeof frame.at === 'string' ? { at: frame.at } : {}), phase: data.phase,
+    ...(typeof data.eventId === 'string' ? { eventId: data.eventId } : typeof frame.eventId === 'string' ? { eventId: frame.eventId } : {}),
+    ...(typeof data.shard === 'string' ? { shard: data.shard } : {}),
+    ...(typeof data.state === 'string' ? { state: data.state } : {}),
+    ...(data.decision === 'reuse' || data.decision === 'rerun' ? { decision: data.decision } : {}),
+    ...(typeof data.reason === 'string' ? { reason: data.reason } : {}), ...numbers,
+    ...(rerunReasons && Object.keys(rerunReasons).length ? { rerunReasons } : {}),
+  };
+}
+
+/** Authenticated, run-scoped stream. Operator events use fetch because EventSource cannot send the daemon bearer. */
+export function subscribeReleaseGateProgress(
+  client: Pick<DaemonClient, 'fetchResponse'>, runId: string,
+  onEvent: (event: ReleaseGateProgressEvent) => void, onForbidden?: () => void,
+): () => void {
+  const controller = new AbortController();
+  let disposed = false;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  const connect = async (): Promise<void> => {
+    try {
+      const response = await client.fetchResponse(`/v1/ops/release/runs/${encodeURIComponent(runId)}/events`, {
+        method: 'GET', headers: { accept: 'text/event-stream' }, signal: controller.signal,
+      });
+      if (response.status === 403) { onForbidden?.(); return; }
+      if (!response.ok || !response.body) throw new Error(`release progress stream ${response.status}`);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) break;
+        buffer += decoder.decode(next.value, { stream: true }).replace(/\r\n/g, '\n');
+        let boundary = buffer.indexOf('\n\n');
+        while (boundary >= 0) {
+          const frame = parseSseBlock(buffer.slice(0, boundary));
+          buffer = buffer.slice(boundary + 2);
+          if (frame?.event === 'release.gate.progress') {
+            const event = fromReleaseGateProgress(frame.data);
+            if (event?.runId === runId) onEvent(event);
+          }
+          boundary = buffer.indexOf('\n\n');
+        }
+      }
+    } catch {
+      if (disposed || controller.signal.aborted) return;
+    }
+    if (!disposed && !controller.signal.aborted) retryTimer = setTimeout(() => { void connect(); }, 1_500);
+  };
+  void connect();
+  return () => {
+    disposed = true;
+    if (retryTimer !== undefined) clearTimeout(retryTimer);
+    controller.abort();
+  };
 }
 
 export const EMPTY_RUNS: RunsState = { currentRunId: null, runs: {} };

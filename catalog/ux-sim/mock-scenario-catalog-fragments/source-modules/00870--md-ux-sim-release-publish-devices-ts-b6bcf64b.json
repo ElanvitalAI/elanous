@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-RELEASE-PUBLISH-DEVICES-TS",
+  "path": "src/ux-sim/release-publish-devices.ts",
+  "boundary": "Provides isolated test-world command, npm registry, publish, artifact, and receipt boundaries used by production release-publish graph nodes without external publishing.",
+  "deviceIds": [
+    "release-graph-rig"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

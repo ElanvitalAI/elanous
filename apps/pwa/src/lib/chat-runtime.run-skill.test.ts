@@ -1,9 +1,8 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 import { DaemonClient } from './daemon-client';
 import { dispatchMeta, META_COMMANDS, type ChatRuntimeContext } from './chat-runtime';
+import { withFakeFetchDevice, type FakeFetchCall } from '../test-devices/fake-fetch';
 
-const originalFetch = globalThis.fetch;
-afterEach(() => { globalThis.fetch = originalFetch; });
 const ctx: ChatRuntimeContext = {
   sessionId: 'test', provider: 'anthropic', setSessionId: () => {},
   client: new DaemonClient({ baseUrl: 'http://fake', token: 'secret', provider: 'anthropic' }),
@@ -11,58 +10,63 @@ const ctx: ChatRuntimeContext = {
 };
 const id = '123e4567-e89b-12d3-a456-426614174000';
 
-function wire(status: unknown): string[] {
-  const urls: string[] = [];
-  globalThis.fetch = (async (input: RequestInfo | URL) => {
-    urls.push(String(input));
-    return Response.json(urls.length % 2 ? { id } : status, { status: urls.length % 2 ? 202 : 200 });
-  }) as unknown as typeof fetch;
-  return urls;
+function withSkillRunResponses<T>(
+  results: readonly unknown[],
+  run: (calls: () => FakeFetchCall[]) => T | Promise<T>,
+): Promise<T> {
+  let resultIndex = 0;
+  return withFakeFetchDevice([
+    { url: '/v1/skills/exec', method: 'POST', response: () => Response.json({ id }, { status: 202 }) },
+    { url: `/v1/skills/exec/${id}`, method: 'GET', response: () => Response.json(results[resultIndex++]) },
+  ], async (device) => {
+    const result = await run(device.calls);
+    for (const call of device.calls()) expect(call.headers.authorization).toBe('Bearer secret');
+    return result;
+  });
 }
 
 describe('PWA /run-skill', () => {
   it('shows one usage line for zero or one argument without fetching', async () => {
-    globalThis.fetch = (async () => { throw new Error('unexpected fetch'); }) as unknown as typeof fetch;
-    for (const line of ['/run-skill', '/run-skill omni-crawl', '/rs', '/run name']) {
-      expect(await dispatchMeta(line, ctx)).toEqual({ text: '쓰는 법: /run-skill <이름> <할 일>' });
-    }
-    expect(META_COMMANDS).toContainEqual({ name: 'run-skill', description: '이름을 댄 스킬 하나 바로 실행 (/run-skill <이름> <할 일>)' });
+    await withFakeFetchDevice([{ url: '/never', response: Response.json({}) }], async (device) => {
+      for (const line of ['/run-skill', '/run-skill omni-crawl', '/rs', '/run name']) {
+        expect(await dispatchMeta(line, ctx)).toEqual({ text: '쓰는 법: /run-skill <이름> <할 일>' });
+      }
+      expect(device.calls()).toEqual([]);
+      expect(META_COMMANDS).toContainEqual({ name: 'run-skill', description: '이름을 댄 스킬 하나 바로 실행 (/run-skill <이름> <할 일>)' });
+    });
   });
 
   it('dispatches all three slash names to one authenticated client and formats the answer', async () => {
-    const bodies: unknown[] = [];
-    const urls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      urls.push(String(input));
-      if (init?.body) bodies.push(JSON.parse(String(init.body)));
-      expect((init?.headers as Record<string, string>).authorization).toBe('Bearer secret');
-      return Response.json(init?.body ? { id } : { status: 'done', ok: true, output: '답' }, { status: init?.body ? 202 : 200 });
-    }) as unknown as typeof fetch;
-    for (const name of ['/run-skill', '/rs', '/run']) expect(await dispatchMeta(`${name} omni-crawl 오늘 AI 뉴스`, ctx)).toEqual({ text: '답' });
-    expect(bodies).toEqual(Array(3).fill({ skill: 'omni-crawl', task: '오늘 AI 뉴스' }));
-    expect(urls).toEqual(Array(3).fill(['http://fake/v1/skills/exec', `http://fake/v1/skills/exec/${id}`]).flat());
+    await withSkillRunResponses([
+      { status: 'done', ok: true, output: '답' },
+      { status: 'done', ok: true, output: '답' },
+      { status: 'done', ok: true, output: '답' },
+    ], async (calls) => {
+      for (const name of ['/run-skill', '/rs', '/run']) expect(await dispatchMeta(`${name} omni-crawl 오늘 AI 뉴스`, ctx)).toEqual({ text: '답' });
+      const observed = calls();
+      expect(observed.filter((call) => call.method === 'POST').map((call) => JSON.parse(String(call.body)))).toEqual(Array(3).fill({ skill: 'omni-crawl', task: '오늘 AI 뉴스' }));
+      expect(observed.map((call) => call.url)).toEqual(Array(3).fill(['http://fake/v1/skills/exec', `http://fake/v1/skills/exec/${id}`]).flat());
+    });
   });
 
   it('waits through a running poll before returning one answer', async () => {
-    const statuses = [{ id }, { status: 'running' }, { status: 'done', ok: true, output: '완료' }];
-    const calls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      calls.push(String(input));
-      return Response.json(statuses.shift(), { status: calls.length === 1 ? 202 : 200 });
-    }) as unknown as typeof fetch;
-    expect(await dispatchMeta('/run-skill omni-crawl 오늘 AI 뉴스', ctx)).toEqual({ text: '완료' });
-    expect(calls).toEqual(['http://fake/v1/skills/exec', `http://fake/v1/skills/exec/${id}`, `http://fake/v1/skills/exec/${id}`]);
+    await withSkillRunResponses([{ status: 'running' }, { status: 'done', ok: true, output: '완료' }], async (calls) => {
+      expect(await dispatchMeta('/run-skill omni-crawl 오늘 AI 뉴스', ctx)).toEqual({ text: '완료' });
+      expect(calls().map((call) => call.url)).toEqual(['http://fake/v1/skills/exec', `http://fake/v1/skills/exec/${id}`, `http://fake/v1/skills/exec/${id}`]);
+    });
   });
 
   it('formats rejection, failure, unsuccessful work and truncation', async () => {
-    wire({ status: 'rejected', reason: 'not-allowlisted' });
-    expect(await dispatchMeta('/run-skill forbidden 할 일', ctx)).toEqual({ text: '이 스킬은 바로 실행할 수 없습니다 — 대화로 «forbidden 으로 …» 라고 부탁해 보세요' });
-    wire({ status: 'failed', error: 'daemon-restarted' });
-    expect(await dispatchMeta('/rs skill task', ctx)).toEqual({ text: '스킬 실행을 확인하지 못했습니다(daemon-restarted)' });
-    wire({ status: 'done', ok: false, output: '실패' });
-    expect(await dispatchMeta('/run skill task', ctx)).toEqual({ text: '스킬이 실패했습니다\n실패' });
-    wire({ status: 'done', ok: true, output: 'x'.repeat(8001) });
-    expect(await dispatchMeta('/run skill task', ctx)).toEqual({ text: `${'x'.repeat(8000)}… (잘림)` });
+    for (const [result, line, expected] of [
+      [{ status: 'rejected', reason: 'not-allowlisted' }, '/run-skill forbidden 할 일', '이 스킬은 바로 실행할 수 없습니다 — 대화로 «forbidden 으로 …» 라고 부탁해 보세요'],
+      [{ status: 'failed', error: 'daemon-restarted' }, '/rs skill task', '스킬 실행을 확인하지 못했습니다(daemon-restarted)'],
+      [{ status: 'done', ok: false, output: '실패' }, '/run skill task', '스킬이 실패했습니다\n실패'],
+      [{ status: 'done', ok: true, output: 'x'.repeat(8001) }, '/run skill task', `${'x'.repeat(8000)}… (잘림)`],
+    ] as const) {
+      await withSkillRunResponses([result], async () => {
+        expect(await dispatchMeta(line, ctx)).toEqual({ text: expected });
+      });
+    }
   });
 
   it('logs skill and kind only, preserving other meta commands and TUI-only names', async () => {
@@ -70,11 +74,14 @@ describe('PWA /run-skill', () => {
     const original = console.debug;
     console.debug = ((label: string, value: unknown) => { if (label.includes('webterm.chat.run-skill')) seen.push(value); }) as typeof console.debug;
     try {
-      wire({ status: 'done', ok: true, output: 'private output' });
-      expect(await dispatchMeta('/run-skill skill private task', ctx)).toEqual({ text: 'private output' });
+      await withSkillRunResponses([{ status: 'done', ok: true, output: 'private output' }], async () => {
+        expect(await dispatchMeta('/run-skill skill private task', ctx)).toEqual({ text: 'private output' });
+      });
       expect(seen).toEqual([{ skill: 'skill', kind: 'done' }]);
-      wire({ status: 'rejected', reason: 'not-allowlisted' });
-      await dispatchMeta('/rs skill private task', ctx);
+      expect(JSON.stringify(seen)).not.toContain('private');
+      await withSkillRunResponses([{ status: 'rejected', reason: 'not-allowlisted' }], async () => {
+        await dispatchMeta('/rs skill private task', ctx);
+      });
       expect(seen[1]).toEqual({ skill: 'skill', kind: 'rejected' });
       expect(JSON.stringify(seen)).not.toContain('private');
       expect((await dispatchMeta('/mission', ctx))?.text).toContain('모르는 명령입니다: /mission');

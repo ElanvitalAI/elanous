@@ -1,0 +1,31 @@
+{
+  "id": "fake-app-realtime",
+  "name": "Fake app realtime contract matrix",
+  "implementation": [
+    "src/ux-sim/fake-app-realtime.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-app-realtime.test.ts"
+  ],
+  "target": "App-slug-scoped row-change SSE contract matrix run on the real NexusEventBus reference port (createNexusEventBusAppRealtimePortFactory) and injected port factories",
+  "inputs": [
+    "insert, update, and delete changes",
+    "subscriber count and latency limit",
+    "Last-Event-ID reconnection",
+    "slow subscriber buffer limit",
+    "explicit subscriber, latency, and buffer limits"
+  ],
+  "observations": [
+    "NexusEventBus app.row.* events carried by the real bus",
+    "SSE id, event, and data frames",
+    "delivery latency",
+    "app isolation and replay",
+    "slow subscriber disconnection and cleanup"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-app-realtime.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -31,11 +31,16 @@ describe('heal-loop standard template', () => {
 
   test('간선의 결과 키는 그 노드 역할이 낼 수 있는 결과다', () => {
     const recipeOf = new Map(parsed.template!.nodes.map((n) => [n.nodeId, n.recipe]));
+    const nodeOf = new Map(parsed.template!.nodes.map((n) => [n.nodeId, n]));
     const bad: string[] = [];
     for (const edge of parsed.template!.edges) {
       if (!edge.map) continue;
       const role = catalog.roles.get(recipeOf.get(edge.from) ?? '');
-      for (const key of Object.keys(edge.map)) if (!role?.outcomes.includes(key)) bad.push(`${edge.from}:${key}`);
+      for (const key of Object.keys(edge.map)) {
+        const runnerFailure = key === 'fail' || key === 'error';
+        const approvalDecision = nodeOf.get(edge.from)?.kind === 'hitl' && ['ok', 'fail', 'error'].includes(key);
+        if (!runnerFailure && !approvalDecision && !role?.outcomes.includes(key)) bad.push(`${edge.from}:${key}`);
+      }
     }
     expect(bad).toEqual([]);
   });
@@ -61,9 +66,12 @@ describe('heal-loop standard template', () => {
     expect(stuck).toEqual([]);
   });
 
-  test('사람(failed)으로 가는 길은 사다리 끝(exhausted)과 골 개정 실패뿐이다', () => {
+  test('사람(failed)으로 가는 길은 사다리 끝·골 개정 실패·면밀 관측 실패뿐이다', () => {
     const toFailed = parsed.template!.edges.flatMap((e) => Object.entries(e.map ?? {}).filter(([, t]) => t === 'failed').map(([k]) => `${e.from}:${k}`));
-    expect(toFailed.sort()).toEqual(['replan:fail', 'triage:exhausted']);
+    expect(toFailed.sort()).toEqual(['observe-deeper-human:error', 'observe-deeper-human:fail', 'observe-deeper-human:ok', 'replan:fail', 'triage:exhausted']);
+    const observeFailure = parsed.template!.edges.find((e) => e.from === 'observe-deeper')!;
+    expect(observeFailure.map).toMatchObject({ fail: 'observe-deeper-human', error: 'observe-deeper-human' });
+    expect(parsed.template!.nodes.find((n) => n.nodeId === 'observe-deeper-human')).toMatchObject({ kind: 'hitl', recipe: 'approval:observe-deeper-failure' });
   });
 });
 

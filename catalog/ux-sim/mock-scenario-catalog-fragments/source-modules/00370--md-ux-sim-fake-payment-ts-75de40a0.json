@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-PAYMENT-TS",
+  "path": "src/ux-sim/fake-payment.ts",
+  "boundary": "In-process payment gateway simulator: validates integer minor-unit amounts, signs and verifies idempotent webhooks, advances subscription retry/grace states from an injected clock, and bounds refunds without external payment or network access.",
+  "deviceIds": [
+    "fake-payment"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

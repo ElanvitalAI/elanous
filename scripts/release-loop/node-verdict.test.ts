@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { lastJsonObject } from '../../src/graph-runner/runner.js';
 import { debug } from '../../src/debug/log.js';
-import { cutoffNotesEmpty, emitNodeResult, finishNode, readGraphContext, runNodeVerdict } from './node-verdict.js';
+import { cutoffNotesEmpty, emitNodeResult, finishNode, latestGateOutput, readGraphContext, runNodeVerdict } from './node-verdict.js';
 
 test('emitted last line is read unchanged by graph runner', () => {
   const lines: string[] = [];
@@ -161,4 +161,15 @@ test('the real PWA node entry fails closed before invoking scenarios when policy
     expect(code).toBe(2);
     expect(lastJsonObject(lines.join('\n'))).toMatchObject({ outcome: 'error', verdict: 'fail' });
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test('latest gate output follows ordered re-entry history and fails closed on a missing latest output', () => {
+  const stale = { outcome: 'ok' };
+  const current = { outcome: 'fail', introduced: ['new failure'] };
+  expect(latestGateOutput({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { gate: current, 'residual-run': stale },
+    nodeHistory: [{ nodeId: 'residual-run', output: stale }, { nodeId: 'gate', output: current }] })).toBe(current);
+  expect(latestGateOutput({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { gate: current } })).toBe(current);
+  expect(latestGateOutput({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { gate: current },
+    nodeHistory: [{ nodeId: 'gate', output: current }, { nodeId: 'residual-run' }] })).toBeUndefined();
 });

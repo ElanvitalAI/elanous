@@ -1,0 +1,128 @@
+scenario: release-day-0307-replay
+version: 0.3.7
+runId: release-sim-release-day-0307-replay-replay
+manifest: ../../graphs/release/plugin.json
+policies:
+  gate.plan.promoteToFull: [dep-layer, verdict-files, opaque-closure, cost-crossover]
+events:
+  - id: A1
+    type: release.cut.appended
+    action: append-repaired-commits
+    mechanism: recipe
+    recipe: cut-append
+    binding: cut-append
+    rationale: Landed S1 repair commits belong to the active cut.
+    pickShas: [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]
+  - id: A2
+    type: release.resume.blocked
+    action: resume-same-run
+    mechanism: recipe
+    recipe: rla-release-recover
+    binding: rla-release-recover
+    rationale: Resume the first unfinished node while preserving run identity.
+    runId: release-sim-release-day-0307-replay-replay
+    pickShas: [dddddddddddddddddddddddddddddddddddddddd]
+  - id: A3
+    type: release.gate.regression.measured
+    action: accept-explicit-regressions
+    mechanism: domain-pack
+    binding: release-gate:generation-based-expiry
+    rationale: Accept only listed measured baseline failures and expire by release generations.
+    introduced: [src/a.test.ts > failure A, src/b.test.ts > failure B]
+  - id: A4
+    type: release.repair.land.requested
+    action: land-s1-repair-prs
+    mechanism: recipe
+    recipe: gate-triage
+    binding: gate-triage
+    rationale: Express landing is limited to reviewed one-line S1 repairs.
+  - id: A5
+    type: release.gate.repair-assigned
+    action: assign-repair-seats
+    mechanism: recipe
+    recipe: gate-triage
+    binding: gate-triage
+    rationale: Attribute failures to source files before assigning a repair seat and ladder step.
+  - id: A6
+    type: release.export-check.failed
+    action: diagnose-export-check
+    mechanism: recipe
+    recipe: export-check
+    binding: export-check
+    rationale: Preserve the first error and distinguish OOM from host-specific failure.
+  - id: A7
+    type: release.gate.independent
+    action: run-gate-independent-of-export
+    mechanism: edge
+    binding: outcome
+    rationale: The gate routes into receipt auditing independently of export-check.
+    from: gate
+    to: receipt-audit
+  - id: A8
+    type: release.cut.appended
+    action: append-radius-recheck
+    mechanism: recipe
+    recipe: gate-same-run-recheck
+    binding: gate-same-run-recheck
+    rationale: Recheck the changed-file radius and promote to a full sweep only by declared policy.
+    changedFiles: [scripts/release-loop/hand-response-node.ts]
+    pickShas: [cccccccccccccccccccccccccccccccccccccccc]
+    dependencyLayerChanged: false
+    verdictFilesChanged: false
+    closureOpaque: false
+    receiptCosts: { partialMs: 3, fullMs: 5, source: simulation-same-ledger }
+  - id: A9
+    type: release.gate.bisect-mode.selected
+    action: choose-bisect-mode
+    mechanism: recipe
+    recipe: gate-triage
+    binding: gate-triage
+    rationale: Select the declared bisect mode from repeated measured agreement.
+  - id: A10
+    type: release.gate.host.selected
+    action: select-execution-host
+    mechanism: recipe
+    recipe: gate
+    binding: gate
+    rationale: Select an available host from guardian resource evidence.
+  - id: A11
+    type: release.export-prerequisites.provisioned
+    action: provision-export-prerequisites
+    mechanism: recipe
+    recipe: export-check
+    binding: export-check
+    rationale: Provision only required inputs and keep their contents out of logs.
+  - id: A12
+    type: release.cut.tree-synced
+    action: sync-cut-tree-and-recipe-sha
+    mechanism: recipe
+    recipe: cut-append
+    binding: cut-append
+    rationale: Pin the cut tree and recipe identity as part of append handling.
+  - id: A13
+    type: release.gate.image-identity-checked
+    action: validate-gate-image-identity
+    mechanism: recipe
+    recipe: gate
+    binding: gate
+    rationale: Verify the actual gate image identity at node execution.
+  - id: A14
+    type: release.train.worker-restarted
+    action: maintain-train-workers
+    mechanism: recipe
+    recipe: rla-train-worker-restart
+    binding: rla-train-worker-restart
+    rationale: Replace workers from train and guardian resource evidence.
+  - id: A15
+    type: release.publish.approval-requested
+    action: approve-publication
+    mechanism: hitl
+    binding: approve-publish
+    rationale: Public publication is the declared human approval boundary.
+allowed:
+  recipes: [version-release, traffic-cut-start, cutoff, checklist-gate, tsc, ratchet, gate, traffic-gate-passed, traffic-npm-published, traffic-failed-restore, gate-triage, mac-smoke, export-check, pwa, prepare, upgrade, tui, docs, known-issues, notes-check, notes-repair, notes-recheck, auto-approve, publish, continue-publish, repair-recovery, publish-command, npm-publish, docs-land, verify, traffic-verify-complete, vault-note, release-story, ops-upgrade, rla-release-autostart, rla-train-worker-restart, rla-release-recover, gate-heal-decision, rla-rehearsal-retry, rla-cloud-join, rla-cloud-leave, rla-focused-verify, rla-rail-now, rla-nexus-restart, rla-nexus-build, gate-repair, gate-image-repair, cut-append, gate-accept-regression]
+  skills: [rla-release-operations]
+  domainPacks: [release-graph, release-gate]
+  hitlNodes: [approve-publish, approve-continue, gate-repair-recovery, gate-heal-decision]
+edgeVocabulary: [outcome, heal, retry, detour, rejoin, append-recheck, accept, escalate]
+terminalStates: [done, failed]

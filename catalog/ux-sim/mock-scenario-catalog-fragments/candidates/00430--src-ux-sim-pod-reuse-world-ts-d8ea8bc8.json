@@ -1,0 +1,8 @@
+{
+  "path": "src/ux-sim/pod-reuse-world.ts",
+  "disposition": "already-indexed",
+  "entryCommand": "bun test src/ux-sim/pod-reuse-world.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Integrated deterministic pod reuse world result asserted by test.",
+  "deviceId": "pod-reuse-residue-fault"
+}

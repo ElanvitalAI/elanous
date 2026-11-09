@@ -44,6 +44,8 @@ export interface SharedPayload {
   text: string;
   url: string;
   files: File[];
+  /** Cache keys aligned by index with `files` for partial acknowledgement. */
+  fileKeys: string[];
   /** Combined text the existing Level 1 flow already feeds into
    *  `/chat` as a prefill — we keep that contract so behaviour
    *  stays identical when no files are attached. */
@@ -78,7 +80,7 @@ function buildCombinedText(m: ShareManifest): string {
  *  store anything for this id (cache miss · stale link · SW not
  *  controlling the page yet). Drains the manifest + files on
  *  success so a reload doesn't re-pop the same payload. */
-export async function takeSharedPayload(id: string): Promise<SharedPayload | null> {
+export async function takeSharedPayload(id: string, options: { drain?: boolean } = {}): Promise<SharedPayload | null> {
   if (!id) return null;
   const cache = await findShareCache();
   if (!cache) {
@@ -93,6 +95,7 @@ export async function takeSharedPayload(id: string): Promise<SharedPayload | nul
   }
   const manifest = (await manifestRes.json()) as ShareManifest;
   const files: File[] = [];
+  const fileKeys: string[] = [];
   for (const meta of manifest.files) {
     const fileRes = await cache.match(meta.cacheUrl);
     if (!fileRes) {
@@ -101,11 +104,11 @@ export async function takeSharedPayload(id: string): Promise<SharedPayload | nul
     }
     const blob = await fileRes.blob();
     files.push(new File([blob], meta.filename, { type: meta.type || blob.type }));
+    fileKeys.push(meta.cacheUrl);
   }
-  // Drain — once delivered, never serve again from this cache.
-  await cache.delete(manifestUrl);
-  for (const meta of manifest.files) {
-    await cache.delete(meta.cacheUrl);
+  if (options.drain !== false) {
+    await cache.delete(manifestUrl);
+    for (const meta of manifest.files) await cache.delete(meta.cacheUrl);
   }
   debugLog('pwa.share.l2.delivered', {
     id,
@@ -119,8 +122,31 @@ export async function takeSharedPayload(id: string): Promise<SharedPayload | nul
     text: manifest.text,
     url: manifest.url,
     files,
+    fileKeys,
     combinedText: buildCombinedText(manifest),
   };
+}
+
+/** Remove only acknowledged uploads; failed files remain available for retry. */
+export async function acknowledgeSharedPayloadFiles(id: string, fileKeys: readonly string[]): Promise<void> {
+  const cache = await findShareCache();
+  if (!cache) return;
+  const manifestUrl = `/__share/${id}/manifest.json`;
+  const manifestRes = await cache.match(manifestUrl);
+  if (!manifestRes) return;
+  const manifest = (await manifestRes.json()) as ShareManifest;
+  const acknowledged = new Set(fileKeys);
+  for (const meta of manifest.files) {
+    if (acknowledged.has(meta.cacheUrl)) await cache.delete(meta.cacheUrl);
+  }
+  const remaining = manifest.files.filter((meta) => !acknowledged.has(meta.cacheUrl));
+  if (remaining.length === 0) {
+    await cache.delete(manifestUrl);
+  } else if (acknowledged.size > 0) {
+    await cache.put(manifestUrl, new Response(JSON.stringify({ ...manifest, files: remaining }), {
+      headers: { 'content-type': 'application/json' },
+    }));
+  }
 }
 
 /** Test seam — synthesize a manifest in the Share Cache so unit tests

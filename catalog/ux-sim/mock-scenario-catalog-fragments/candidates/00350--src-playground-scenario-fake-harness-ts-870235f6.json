@@ -1,0 +1,8 @@
+{
+  "path": "src/playground-scenario/fake-harness.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun test src/playground-scenario/",
+  "logsRecorded": "no",
+  "logsDetail": "In-memory test harness consumed by Playground tests.",
+  "excludeReason": "Test helper, no independent reusable mock interface."
+}

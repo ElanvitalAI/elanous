@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-DASHBOARD-EVENT-LOOP-STALL-MONITOR-DEVICE-TS",
+  "path": "src/ux-sim/dashboard-event-loop-stall-monitor-device.ts",
+  "boundary": "Advances a staged clock through due monitor tasks and streamed keypress samples, recording event-loop lag and task ordering from the production monitor path.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

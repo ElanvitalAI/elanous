@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GATE-ROSTER-SECOND-POOL-TS",
+  "path": "src/ux-sim/gate-roster-second-pool.ts",
+  "boundary": "Runs production judgeGate, createGateRunner.sweep, PodPoolScheduler and runPodCommand in an isolated world; only repository, image and kubectl remote edges are simulated.",
+  "deviceIds": [
+    "world-runtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

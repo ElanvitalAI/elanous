@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAULT-POD-CHILD-RESULT-TS",
+  "path": "src/ux-sim/fault-pod-child-result.ts",
+  "boundary": "fault pod child result: Replays a successful Kubernetes Job carrying a failed/partial child result.",
+  "deviceIds": [
+    "fault-injection"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

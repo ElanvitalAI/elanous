@@ -245,6 +245,7 @@ export async function judgeInjectedGateEvent(scenario: GateScenario, bisectSimul
       const read = readShardArtifacts(artifacts, [[FILE]]);
       return { rc: read.rc ?? 2, output: read.output ?? '',
         ...(read.loadFlaky ? { loadFlaky: read.loadFlaky } : {}),
+        ...(read.retryPass ? { retryPass: read.retryPass } : {}),
         ...(read.loadFlakyAttemptedFiles ? { loadFlakyAttemptedFiles: read.loadFlakyAttemptedFiles } : {}) };
     }
     const ids = tree.endsWith('/cut') && scenario.gateInjection === 'regression'

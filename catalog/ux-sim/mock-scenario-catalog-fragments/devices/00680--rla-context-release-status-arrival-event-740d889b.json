@@ -1,0 +1,28 @@
+{
+  "id": "rla-context-release-status-arrival-event",
+  "name": "Release context status from live graph node-arrival",
+  "implementation": [
+    "src/ux-sim/rla-context-release-status-arrival-event.ts",
+    "src/context-bus/context-now.ts"
+  ],
+  "tests": [
+    "src/ux-sim/rla-context-release-status-arrival-event.test.ts"
+  ],
+  "target": "Production release graph runner node-arrival delivery into release context status, CLI, TUI and Telegram surfaces",
+  "inputs": [
+    "Isolated one-node release graph",
+    "Real graph-runner node-arrival event and durable context event adapter"
+  ],
+  "observations": [
+    "Release currentNode and phase at node-arrival before node-start",
+    "CLI, TUI and Telegram release status from the same event-derived fact"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/rla-context-release-status-arrival-event.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [
+    "release graph node-arrival"
+  ],
+  "recentUse": null
+}

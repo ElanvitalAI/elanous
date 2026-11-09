@@ -16,7 +16,7 @@ import {
   defaultTelegramCommands,
 } from '../src/telegram-commands.js';
 import type { TgIncoming } from '../src/telegram.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
 
 let tmp: string;

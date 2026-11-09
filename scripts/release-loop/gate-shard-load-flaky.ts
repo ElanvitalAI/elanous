@@ -53,6 +53,90 @@ function stripCommentsAndCdata(xml: string): string | null {
 
 type JunitCase = { file?: string; id?: string; failures: number; errors: number; skipped: number };
 type JunitDocument = { cases: JunitCase[]; suiteFailed: boolean; unattributedSuiteFailure: boolean };
+
+export type GateInterferencePair = { files: [string, string] };
+export type GateInterferenceRetry = { id: string; cause: string; peers?: readonly string[] };
+
+/** A clean standalone retry of one member of a failed multi-file part is evidence to sweep it with its co-runners. */
+export function interferencePairsFromRetries(rows: readonly GateInterferenceRetry[]): GateInterferencePair[] {
+  const pairs = new Map<string, GateInterferencePair>();
+  for (const row of rows) {
+    if (row.cause !== 'isolation' || !Array.isArray(row.peers)) continue;
+    const file = row.id.split(' > ', 1)[0]!;
+    if (!file || !/^(?:[\w.-]+\/)*[\w.-]+\.test\.[cm]?[jt]sx?$/.test(file)) continue;
+    for (const peer of row.peers) {
+      if (typeof peer !== 'string' || peer === file || !/^(?:[\w.-]+\/)*[\w.-]+\.test\.[cm]?[jt]sx?$/.test(peer)) continue;
+      const files = [file, peer].sort() as [string, string];
+      pairs.set(files.join('\0'), { files });
+    }
+  }
+  return [...pairs.values()].sort((a, b) => a.files[0].localeCompare(b.files[0]) || a.files[1].localeCompare(b.files[1]));
+}
+
+/** Expand a dirty selection only by recorded pair neighbors, keeping the recorded edges for same-process grouping. */
+export function planInterferenceSupplement(dirtyFiles: readonly string[], inventory: readonly string[], pairs: readonly GateInterferencePair[]): {
+  files: string[]; pairs: GateInterferencePair[]; groups: string[][];
+} {
+  const allowed = new Set(inventory);
+  const dirty = new Set(dirtyFiles.filter((file) => allowed.has(file)));
+  const selected = new Set(dirty);
+  const validPairs = pairs.filter(({ files }) => files.length === 2 && files[0] !== files[1]
+    && files.every((file) => allowed.has(file)) && (dirty.has(files[0]) || dirty.has(files[1])));
+  for (const { files } of validPairs) { selected.add(files[0]); selected.add(files[1]); }
+  const files = inventory.filter((file) => selected.has(file));
+  const parent = new Map(files.map((file) => [file, file]));
+  const find = (file: string): string => {
+    const p = parent.get(file)!;
+    if (p === file) return file;
+    const root = find(p); parent.set(file, root); return root;
+  };
+  for (const { files: pair } of validPairs) {
+    const left = find(pair[0]), right = find(pair[1]);
+    if (left !== right) parent.set(right, left);
+  }
+  const byRoot = new Map<string, string[]>();
+  for (const file of files) {
+    const root = find(file), group = byRoot.get(root) ?? [];
+    group.push(file); byRoot.set(root, group);
+  }
+  return { files, pairs: validPairs, groups: [...byRoot.values()] };
+}
+
+/** Keep every recorded pair in one sweep shard; this does not add a Pod or raise the shard concurrency. */
+export function coLocateInterferencePairs<T extends { files: string[] }>(shards: readonly T[], pairs: readonly GateInterferencePair[]): T[] {
+  const result = shards.map((shard) => ({ ...shard, files: [...shard.files] }));
+  const parent = new Map<string, string>();
+  const find = (file: string): string => {
+    const current = parent.get(file);
+    if (!current) { parent.set(file, file); return file; }
+    if (current === file) return file;
+    const root = find(current); parent.set(file, root); return root;
+  };
+  for (const { files } of pairs) {
+    if (files.length !== 2 || files[0] === files[1]) continue;
+    const left = find(files[0]), right = find(files[1]);
+    if (left !== right) parent.set(right, left);
+  }
+  const components = new Map<string, Set<string>>();
+  for (const file of parent.keys()) {
+    const root = find(file), members = components.get(root) ?? new Set<string>();
+    members.add(file); components.set(root, members);
+  }
+  for (const component of components.values()) {
+    if (component.size < 2) continue;
+    const indexes = result.map((shard, index) => shard.files.some((file) => component.has(file)) ? index : -1).filter((index) => index >= 0);
+    if (indexes.length < 2) continue;
+    const targetIndex = indexes.reduce((best, index) => {
+      const bestCount = result[best]!.files.filter((file) => component.has(file)).length;
+      const count = result[index]!.files.filter((file) => component.has(file)).length;
+      return count > bestCount ? index : best;
+    }, indexes[0]!);
+    const kept = result[targetIndex]!.files.filter((file) => component.has(file));
+    for (const shard of result) shard.files = shard.files.filter((file) => !component.has(file));
+    result[targetIndex]!.files.push(...[...component].filter((file) => !kept.includes(file)), ...kept);
+  }
+  return result.filter((shard) => shard.files.length > 0);
+}
 function parseJunit(xml: string): JunitDocument | null {
   if (/<!DOCTYPE/i.test(xml)) return null;
   for (const character of xml) {

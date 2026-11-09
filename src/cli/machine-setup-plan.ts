@@ -41,9 +41,14 @@ interface PackageChoice {
   readonly manager: 'brew' | 'apt-get' | 'cargo' | 'manual';
   readonly purpose: string;
   readonly profile: MachineSetupProfile;
+  readonly platforms?: readonly MachineSetupPlatform[];
 }
 
 const PACKAGE_CHOICES: readonly PackageChoice[] = [
+  { name: 'build-essential', manager: 'apt-get', purpose: 'native build tools required by WSL developer packages', profile: 'default', platforms: ['linux', 'wsl'] },
+  { name: 'curl', manager: 'apt-get', purpose: 'download the verified Elanous installer in WSL', profile: 'default', platforms: ['linux', 'wsl'] },
+  { name: 'python3-venv', manager: 'apt-get', purpose: 'Python virtual environments for the WSL developer profile', profile: 'default', platforms: ['linux', 'wsl'] },
+  { name: 'unzip', manager: 'apt-get', purpose: 'extract the official Bun bootstrap archive', profile: 'default', platforms: ['linux', 'wsl'] },
   { name: 'zsh', manager: 'brew', purpose: 'Elanous default interactive shell', profile: 'default' },
   { name: 'neovim', manager: 'brew', purpose: 'terminal editor with the captured Neovim config', profile: 'default' },
   { name: 'yazi', manager: 'brew', purpose: 'terminal file manager; the `y` shell shortcut follows in a later apply slice', profile: 'default' },
@@ -76,6 +81,10 @@ const PACKAGE_CHOICES: readonly PackageChoice[] = [
   { name: 'cocoapods', manager: 'brew', purpose: 'dependency manager for legacy iOS projects', profile: 'developer' },
   { name: 'tree-sitter-cli', manager: 'brew', purpose: 'parser generation and inspection for developer tooling', profile: 'developer' },
   { name: 'python@3.14', manager: 'brew', purpose: 'explicit Python runtime for scripts and test tooling', profile: 'developer' },
+  { name: 'docker-ce', manager: 'apt-get', purpose: 'official Docker Engine for k3d in WSL; skipped when a working Docker Desktop integration is already available', profile: 'developer', platforms: ['wsl'] },
+  { name: 'docker-ce-cli', manager: 'apt-get', purpose: 'Docker CLI paired with Docker CE', profile: 'developer', platforms: ['wsl'] },
+  { name: 'containerd.io', manager: 'apt-get', purpose: 'container runtime required by Docker CE', profile: 'developer', platforms: ['wsl'] },
+  { name: 'docker-buildx-plugin', manager: 'apt-get', purpose: 'Docker Buildx plugin for local image builds', profile: 'developer', platforms: ['wsl'] },
   { name: 'awscli', manager: 'brew', purpose: 'HQ cloud operations client; never copies its credentials', profile: 'headquarters' },
   { name: 'gcloud-cli', manager: 'brew', purpose: 'HQ Google Cloud operations client; never copies its credentials', profile: 'headquarters' },
   { name: 'k3d', manager: 'brew', purpose: 'local Kubernetes clusters for isolated machine exercises', profile: 'headquarters' },
@@ -223,9 +232,10 @@ export function buildMachineSetupPlan(input: {
   const capturePlatform = input.capture && typeof input.capture === 'object'
     ? (input.capture as { platform?: unknown }).platform : undefined;
   const captureMatchesTarget = capturePlatform === (platform === 'macos' ? 'darwin' : 'linux');
-  const profileChoices = PACKAGE_CHOICES.filter((choice) => choice.profile === 'default'
+  const profileChoices = PACKAGE_CHOICES.filter((choice) => (!choice.platforms || choice.platforms.includes(platform))
+    && (choice.profile === 'default'
     || profile === 'developer' && choice.profile === 'developer'
-    || profile === 'headquarters' && (choice.profile === 'developer' || choice.profile === 'headquarters'));
+    || profile === 'headquarters' && (choice.profile === 'developer' || choice.profile === 'headquarters')));
   const selected = profileChoices.filter(choice => !(platform === 'wsl' && choice.name === 'ghostty'));
   const packages = selected.map((choice) => {
     const route = packageRoute(choice, platform);
@@ -267,10 +277,18 @@ export function buildMachineSetupPlan(input: {
     operations.push(
       { id: 'wsl-install', phase: 'host', kind: 'install', manager: 'wsl.exe', command: ['wsl.exe', '--install', '--distribution', distribution, '--no-launch'], privilege: 'administrator', consent: 'explicit', reason: `Create the ${distribution} WSL distribution without launching its first-run prompt; a Windows reboot may be required.` },
       { id: 'wsl-reboot-checkpoint', phase: 'host', kind: 'checkpoint', manager: 'manual', privilege: 'none', consent: 'explicit', reason: 'Pause after Windows requests a reboot; resume setup after the new distribution is initialized.' },
-      { id: 'wsl-systemd', phase: 'guest', kind: 'configure', manager: 'manual', privilege: 'sudo', consent: 'explicit', reason: 'Enable systemd in /etc/wsl.conf in the Ubuntu guest before installing long-running services.' },
+      { id: 'wsl-systemd', phase: 'guest', kind: 'configure', manager: 'manual', privilege: 'none', consent: 'explicit', reason: 'Enable systemd in /etc/wsl.conf as the WSL root user; no guest password or sudo prompt is required.' },
+      { id: 'wsl-eln-install', phase: 'guest', kind: 'install', manager: 'manual', command: ['bash', '-lc', 'set -o pipefail; curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash -s -- --yes --no-setup'], privilege: 'user', consent: 'explicit', reason: 'Install the latest eln release inside the selected WSL guest after its first-run setup.' },
+      { id: 'wsl-eln-version-check', phase: 'guest', kind: 'checkpoint', manager: 'manual', command: ['bash', '-lc', 'prefix="${XDG_DATA_HOME:-$HOME/.local/share}/elanous"; test -x "$prefix/bin/eln" && resolved="$(type -P eln)" && test "$prefix/bin/eln" -ef "$resolved" && "$prefix/bin/eln" --version'], privilege: 'user', consent: 'explicit', reason: 'Verify eln resolves to the installer-owned guest path and reports that installed version before continuing the profile.' },
     );
+    if (profile === 'developer' || profile === 'headquarters') {
+      operations.push(
+        { id: 'wsl-docker-engine', phase: 'guest', kind: 'configure', manager: 'wsl.exe', command: ['docker', 'info'], privilege: 'none', consent: 'explicit', reason: 'Use a working Docker API engine if already available (including Docker Desktop WSL integration); otherwise install Docker CE and enable its systemd service as WSL root. k3d documents Podman support as experimental; rootless Podman also needs a user socket, linger, DOCKER_HOST, and a Podman-specific registry network (https://k3d.io/v5.8.3/usage/advanced/podman/).'},
+        { id: 'wsl-k3d-install', phase: 'guest', kind: 'install', manager: 'wsl.exe', command: ['k3d'], privilege: 'none', consent: 'explicit', reason: 'Install k3d with its official installer as WSL root after the container engine responds, then verify its CLI.' },
+      );
+    }
   }
-  if (platform !== 'macos') operations.push({ id: `${platform}-apt-refresh`, phase: platform === 'wsl' ? 'guest' : 'local', kind: 'configure', manager: 'apt-get', command: ['sudo', 'apt-get', 'update'], privilege: 'sudo', consent: 'explicit', reason: 'Refresh package metadata before any package installation is applied.' });
+  if (platform !== 'macos') operations.push({ id: `${platform}-apt-refresh`, phase: platform === 'wsl' ? 'guest' : 'local', kind: 'configure', manager: 'apt-get', command: platform === 'wsl' ? ['apt-get', 'update'] : ['sudo', 'apt-get', 'update'], privilege: platform === 'wsl' ? 'none' : 'sudo', consent: 'explicit', reason: platform === 'wsl' ? 'Refresh package metadata through the WSL root execution boundary; no sudo prompt is required.' : 'Refresh package metadata before any package installation is applied.' });
   if (platform !== 'macos' && selected.some((choice) => choice.name === 'tailscale')) operations.push({ id: 'tailscale-repository-preflight', phase: platform === 'wsl' ? 'guest' : 'local', kind: 'manual', manager: 'manual', privilege: 'sudo', consent: 'explicit', reason: 'Tailscale uses its official distribution repository; verify that repository and package source before applying its install step.' });
   if (platform !== 'macos' && selected.some((choice) => choice.name === 'gh')) operations.push({ id: 'gh-source-preflight', phase: platform === 'wsl' ? 'guest' : 'local', kind: 'manual', manager: 'manual', privilege: 'sudo', consent: 'explicit', reason: 'GitHub CLI install sources vary by distribution; verify the approved package source before applying its install step.' });
   if (packages.some((item) => item.presence === 'unknown')) operations.push({ id: 'confirm-unknown-inventory', phase: platform === 'wsl' ? 'guest' : 'local', kind: 'manual', manager: 'manual', privilege: 'user', consent: 'explicit', reason: 'Some capture inventories are unavailable or belong to another platform; inspect and confirm those packages before applying a plan.' });
@@ -291,10 +309,10 @@ export function buildMachineSetupPlan(input: {
       manager: manager as MachineSetupOperation['manager'],
       packageKind: kind,
       packages: [name],
-      ...(manager === 'apt-get' ? { command: ['sudo', 'apt-get', 'install', '--dry-run', name] } : {}),
+      ...(manager === 'apt-get' ? { command: platform === 'wsl' ? ['apt-get', 'install', '--dry-run', name] : ['sudo', 'apt-get', 'install', '--dry-run', name] } : {}),
       ...(manager === 'brew' ? { command: ['brew', 'install', ...(kind === 'cask' ? ['--cask'] : []), name] } : {}),
       ...(manager === 'cargo' ? { command: ['cargo', 'install', '--locked', name] } : {}),
-      privilege: manager === 'apt-get' ? 'sudo' : manager === 'manual' ? 'none' : 'user',
+      privilege: manager === 'apt-get' ? platform === 'wsl' ? 'none' : 'sudo' : manager === 'manual' ? 'none' : 'user',
       consent: manager === 'manual' ? 'explicit' : 'none',
       reason: manager === 'manual'
         ? `Source-specific or manually reviewed packages from the ${profile} profile; confirm their installer before apply.`

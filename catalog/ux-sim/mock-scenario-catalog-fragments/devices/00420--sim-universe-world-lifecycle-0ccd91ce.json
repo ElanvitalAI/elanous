@@ -1,0 +1,32 @@
+{
+  "id": "sim-universe-world-lifecycle",
+  "name": "Isolated simulation world lifecycle",
+  "implementation": [
+    "src/ux-sim/world-store.ts",
+    "src/ux-sim/world-snapshot.ts",
+    "src/ux-sim/device-catalog-snapshot-fragments.ts"
+  ],
+  "tests": [
+    "src/ux-sim/world-store.test.ts",
+    "src/ux-sim/world-snapshot.test.ts",
+    "src/cli/sim-cli.test.ts"
+  ],
+  "target": "test-root-contained world create/list/destroy lifecycle and ownership checks",
+  "inputs": [
+    "isolated test state root",
+    "world ID",
+    "optional worlds directory"
+  ],
+  "observations": [
+    "created world manifest",
+    "listed world IDs",
+    "destroyed world directory",
+    "rejected ownership and path-boundary violations"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/world-store.test.ts src/ux-sim/world-snapshot.test.ts src/cli/sim-cli.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

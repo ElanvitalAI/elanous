@@ -1,0 +1,29 @@
+{
+  "id": "fake-payment",
+  "name": "Fake payment gateway",
+  "implementation": [
+    "src/ux-sim/fake-payment.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-payment.test.ts"
+  ],
+  "target": "In-process payment gateway, signed webhooks, subscription recovery and bounded refunds",
+  "inputs": [
+    "checkout approval, decline or cancellation",
+    "HMAC-signed webhook events",
+    "injected billing time and card validity",
+    "integer minor-unit payment and refund amounts"
+  ],
+  "observations": [
+    "payment outcomes and webhook idempotency",
+    "forged webhook rejection without state changes",
+    "retry, grace, suspension and card-update recovery",
+    "full, partial and refused excess refunds"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-payment.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GRID-CHAOS-DRIVER-TS",
+  "path": "src/ux-sim/grid-chaos-driver.ts",
+  "boundary": "Builds seeded fault attacks and applies them through the production in-memory grid-ledger decision seam, including whole-grid lease loss.",
+  "deviceIds": [
+    "grid-chaos-driver"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

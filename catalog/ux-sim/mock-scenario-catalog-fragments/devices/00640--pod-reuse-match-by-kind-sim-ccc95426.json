@@ -1,0 +1,37 @@
+{
+  "id": "pod-reuse-match-by-kind-sim",
+  "name": "Kind-aware warm Pod candidate matching",
+  "implementation": [
+    "src/ux-sim/pod-reuse-match-by-kind-sim.ts",
+    "src/task-orchestrator/surfaces/pod-warm-provenance.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-pod.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts",
+    "src/task-orchestrator/surfaces/pod-si-warm-provider.ts",
+    "src/ux-sim/warm-si-reuse-sim.ts"
+  ],
+  "tests": [
+    "src/ux-sim/pod-reuse-match-by-kind-sim.test.ts"
+  ],
+  "target": "One production candidate scorer selects exact Pod kind; gate reuse requires exact cut SHA, lock hash, and image digest while runtime architecture is exact unless an explicit amd64/arm64 allowlist is configured",
+  "inputs": [
+    "exact cut SHA",
+    "lockfile hash",
+    "runtime contract and observed Bun/OS/architecture/tools",
+    "exact architecture by default and explicit amd64/arm64 allowlist",
+    "image digest drift",
+    "gate versus implementation candidate kind"
+  ],
+  "observations": [
+    "implementation and gate paths reject a candidate of the other kind",
+    "gate path rejects any cut SHA, lock hash, or image digest mismatch",
+    "cross-architecture candidates fail closed by default and match only when both architectures are allowlisted",
+    "implementation ALLOC-RETURN reaches two lease generations on the same cleaned Pod UID through the shared scorer",
+    "implementation digest drift is observed; gate mismatch reasons are explicit"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/pod-reuse-match-by-kind-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

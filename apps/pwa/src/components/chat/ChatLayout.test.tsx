@@ -1,11 +1,15 @@
 import { afterEach, expect, test } from 'bun:test';
 import { useLayoutEffect, useState } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import { renderToStaticMarkup } from 'react-dom/server';
+import type { PromptStreamHandlers } from '@/lib/daemon-client';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { ChatLayout } from './ChatLayout';
 import { assertTuiSeatAskRestartContract } from '../../../../../test/seat-ask-tui-restart-contract';
 import { ChatPanel } from './ChatPanel';
 import { ChatHistory } from './ChatHistory';
+import { DeployConfirmCard } from './DeployConfirmCard';
+import { ChatMessageView } from './ChatMessage';
 import { ChatInput } from './ChatInput';
 import { ChatQueueChips } from './ChatQueueChips';
 import { NowSpeakButton } from './NowSpeakButton';
@@ -20,14 +24,16 @@ import { ChatApprovalsChip } from './ChatApprovalsChip';
 import { ChatDecisionsChip } from './ChatDecisionsChip';
 import { ChatPendingDecision } from './ChatPendingDecision';
 import { HideInPublicCapture } from '@/lib/public-capture';
-import { SHARE_PREFILL_KEY } from '@/lib/share-prefill';
+import { SHARE_PREFILL_KEY, writeSharePrefill } from '@/lib/share-prefill';
 import { MAX_CHAT_FILE_BYTES, MAX_CHAT_FILES } from '@/lib/chat-paste-drop';
+import type { AttachmentMeta } from '@/lib/upload-attachment';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
 const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
 const originalLocalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+const originalCaches = Object.getOwnPropertyDescriptor(globalThis, 'caches');
 const originalFetch = globalThis.fetch;
 let tree: ReactTestRenderer | undefined;
 
@@ -41,13 +47,18 @@ afterEach(async () => {
   else delete (globalThis as { document?: Document }).document;
   if (originalLocalStorage) Object.defineProperty(globalThis, 'localStorage', originalLocalStorage);
   else delete (globalThis as { localStorage?: Storage }).localStorage;
+  if (originalCaches) Object.defineProperty(globalThis, 'caches', originalCaches);
+  else delete (globalThis as { caches?: CacheStorage }).caches;
 });
 
-function storage(): Storage {
+function storage(failSetKey?: string): Storage {
   const values = new Map<string, string>();
   return {
     getItem: (key) => values.get(key) ?? null,
-    setItem: (key, value) => { values.set(key, value); },
+    setItem: (key, value) => {
+      if (key === failSetKey) throw new Error(`storage write rejected: ${key}`);
+      values.set(key, value);
+    },
     removeItem: (key) => { values.delete(key); },
     clear: () => { values.clear(); },
     key: (index) => [...values.keys()][index] ?? null,
@@ -55,14 +66,25 @@ function storage(): Storage {
   };
 }
 
-async function mount(opts: { acp: boolean; prefill?: string; width?: number; capture?: boolean; leading?: boolean; deferred?: boolean; mobileSimple?: boolean; actions?: boolean }) {
-  const sessionStorage = storage();
+function sharedCardAttachmentFixture(): AttachmentMeta {
+  const source = new File(['card'], 'card.jpg', { type: 'image/jpeg' });
+  return { id: 'shared-card', filename: source.name, size: source.size, mediaType: source.type, downloadUrl: '/v1/attachments/shared-card' };
+}
+
+async function mount(opts: { acp: boolean; prefill?: string; width?: number; capture?: boolean; leading?: boolean; deferred?: boolean; mobileSimple?: boolean; actions?: boolean; search?: string; failStorageKey?: string; sessionStore?: Storage; localDraft?: string; cardOutcome?: 'done' | 'failed' }) {
+  const sessionStorage = opts.sessionStore ?? storage(opts.failStorageKey);
   const localStorage = storage();
+  if (opts.localDraft !== undefined) localStorage.setItem('elanous.pwa.snapshot.chatInput.singleton', JSON.stringify(opts.localDraft));
+  const historyCalls: URL[] = [];
   if (opts.prefill) sessionStorage.setItem(SHARE_PREFILL_KEY, opts.prefill);
   const events = new EventTarget();
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
-    value: Object.assign(events, { sessionStorage, localStorage, innerWidth: opts.width ?? 1200, location: { search: opts.capture ? '?capture=public' : '' } }),
+    value: Object.assign(events, {
+      sessionStorage, localStorage, innerWidth: opts.width ?? 1200,
+      location: { search: opts.search ?? (opts.capture ? '?capture=public' : ''), href: `http://localhost:31415/app/chat${opts.search ?? (opts.capture ? '?capture=public' : '')}` },
+      history: { state: null, replaceState(_state: unknown, _title: string, url: URL) { historyCalls.push(new URL(url.toString())); } },
+    }),
   });
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: localStorage });
   Object.defineProperty(globalThis, 'document', { configurable: true, value: new EventTarget() });
@@ -70,6 +92,7 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
   const streams: unknown[] = [];
   const turns: Array<{ resolve: (result: { sessionId: string; text: string; stopReason: string }) => void; reject: (reason: Error) => void; signal: AbortSignal }> = [];
   const uploads: Array<{ file: Blob; filename: string }> = [];
+  let observerHandlers: PromptStreamHandlers | undefined;
   let inbound: ((payload: unknown) => Promise<unknown>) | undefined;
   const acp = {
     on: () => () => {},
@@ -102,8 +125,17 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
     voiceWsUrl: () => '',
     voiceCost: async () => ({}),
     fetchJson: async () => ({ messages: [] }),
-    fetchResponse: async (path: string) => new Response(JSON.stringify(path === '/v1/decisions?status=open' ? { decisions: opts.actions ? [{ id: 'd1', title: '결정', situation: '상황', options: [{ id: 'yes', label: '진행' }], recommendation: { option: 'yes', why: '필요' } }] : [] } : { items: opts.actions ? [{ graphId: 'g', runId: 'r', nodeId: 'n', message: '승인', since: '', path: [], recent: [] }] : [] }), { status: 200 }),
-    subscribeChatEvents: () => () => {},
+    fetchResponse: async (path: string) => {
+      if (path === '/v1/card-followup') return new Response(JSON.stringify({ id: 'card-followup-1' }), { status: 200 });
+      if (path === '/v1/card-followup/card-followup-1') return new Response(JSON.stringify(opts.cardOutcome === 'done'
+        ? { status: 'done', replies: ['이름', '회사', '요약'] }
+        : { status: 'failed' }), { status: 200 });
+      return new Response(JSON.stringify(path === '/v1/decisions?status=open' ? { decisions: opts.actions ? [{ id: 'd1', title: '결정', situation: '상황', options: [{ id: 'yes', label: '진행' }], recommendation: { option: 'yes', why: '필요' } }] : [] } : { items: opts.actions ? [{ graphId: 'g', runId: 'r', nodeId: 'n', message: '승인', since: '', path: [], recent: [] }] : [] }), { status: 200 });
+    },
+    subscribeChatEvents: (_sessionId: string, handlers: PromptStreamHandlers) => {
+      observerHandlers = handlers;
+      return () => { observerHandlers = undefined; };
+    },
     subscribeChatFeedbackEvents: () => () => {},
     promptStream: async (body: unknown, options?: { signal?: AbortSignal }) => {
       streams.push(body);
@@ -121,13 +153,20 @@ async function mount(opts: { acp: boolean; prefill?: string; width?: number; cap
     setConfig: () => {},
   };
   await act(async () => {
-    tree = create(<DaemonContext.Provider value={daemon}><ChatLayout {...(opts.leading ? { leading: <button aria-label="대화 목록">☰</button> } : {})} {...(opts.mobileSimple ? { mobileSimple: true, mobileActivity: { kind: 'active' as const, run: { subjectId: 'task', runId: 'run-1', origin: 'system' as const, progressLine: '구현 중', progressStatus: 'running' as const, href: '/observatory' }, extraLiveCount: 0 }, conversationButton: <button aria-label="대화 목록">☰</button> } : {})} /></DaemonContext.Provider>);
+    tree = create(<DaemonContext.Provider value={daemon}><ChatLayout {...(opts.leading ? { leading: <button aria-label="대화 목록">☰</button> } : {})} {...(opts.mobileSimple ? { mobileSimple: true, mobileActivity: { kind: 'active' as const, run: { subjectId: 'task', runId: 'run-1', origin: 'system' as const, progressLine: '구현 중', progressStatus: 'running' as const, href: '/live-run?run=run-1' }, extraLiveCount: 0 }, conversationButton: <button aria-label="대화 목록">☰</button> } : {})} /></DaemonContext.Provider>);
   });
   const input = tree!.root.findByType(ChatInput);
-  return { requests, streams, turns, uploads, input, sessionStorage, receiveAsk: (payload: unknown) => inbound!(payload) };
+  return { requests, streams, turns, uploads, input, sessionStorage, historyCalls,
+    observer: () => observerHandlers!, receiveAsk: (payload: unknown) => inbound!(payload) };
 }
 
 test('TUI reconnect recovers CTO seat answers and overdue notices', assertTuiSeatAskRestartContract);
+
+test('share target text is staged in the composer on the retained Chat screen', async () => {
+  const { input, historyCalls } = await mount({ acp: false, search: '?title=Shared&text=hello&url=https%3A%2F%2Fexample.test&session=session-1' });
+  expect(input.findByType('textarea').props.value).toBe('Shared\n\nhello\n\nhttps://example.test');
+  expect(historyCalls.at(-1)?.search).toBe('?session=session-1');
+});
 
 test('PCH-12 submitted skill command runs through ChatLayout without a plain ACP or prompt turn', async () => {
   const { input, requests, streams } = await mount({ acp: false });
@@ -352,12 +391,14 @@ test('compact header fits one 44px row with navigation, session, and expandable 
   expect(root.findAllByProps({ id: 'chat-header-more' })).toHaveLength(0);
 });
 
-test('390px standalone chat has one status row with live work and menu-only controls', async () => {
+test('390px standalone chat folds live work into details and keeps menu controls', async () => {
   await mount({ acp: false, width: 390, mobileSimple: true });
   const root = tree!.root;
   const status = root.findByType(MobileChatStatus);
   expect(root.findAllByProps({ 'data-elanous-mobile-chat-status': '' })).toHaveLength(1);
-  expect(root.findByProps({ 'data-elanous-mobile-chat-status': '' }).findAllByType('span').map((span) => span.children.join(''))).toEqual(['지금 도는 일 · 구현 중', '대기 결정 · 0']);
+  const statusRow = root.findByProps({ 'data-elanous-mobile-chat-status': '' });
+  expect(statusRow.findByType('details').findByType('summary').children).toEqual(['자세히']);
+  expect(statusRow.findByProps({ role: 'status' }).children.join('')).toContain('구현 중');
   expect(status.props.activity.run.progressLine).toBe('구현 중');
   expect(root.findAllByProps({ 'data-elanous-chat-compact-header': '' })).toHaveLength(0);
   expect(root.findAllByType(SeatsNowStrip)).toHaveLength(0);
@@ -371,7 +412,7 @@ test('390px standalone chat has one status row with live work and menu-only cont
   expect(menu.findAllByType(ChatCurrentProject)).toHaveLength(1);
   expect(menu.findAllByType(NowSpeakButton)).toHaveLength(1);
   expect(menu.findAllByProps({ 'aria-label': '대화 목록' })).toHaveLength(1);
-  expect(menu.findByProps({ 'aria-label': '채팅 이동' }).findAllByType('a').map((link) => link.props.href)).toEqual(['/', '/workspace', '/settings']);
+  expect(menu.findByProps({ 'aria-label': '채팅 이동' }).findAllByType('a').map((link) => link.props.href)).toEqual(['/', '/settings']);
   expect(root.findByType(ChatApprovalsChip).props.mobileOpen).toBe(false);
   expect(root.findByType(ChatDecisionsChip).props.mobileOpen).toBe(false);
   expect(root.findByType(ChatHistory).props.mobileSimple).toBe(true);
@@ -577,11 +618,134 @@ test('mounted chat falls back to SSE when ACP is unavailable', async () => {
   expect(streams).toEqual([{ sessionId: 'session-1', userText: 'fallback', provider: 'anthropic' }]);
 });
 
+test('mounted minimal chat folds interrupted and abnormal SSE prose', async () => {
+  const { observer } = await mount({ acp: false });
+  await act(async () => {
+    observer().onTurnBegin?.({ sessionId: 'session-1' });
+    observer().onTextDelta?.({ delta: '진행 중', full: '진행 중' });
+    observer().onTurnBegin?.({ sessionId: 'session-1' });
+    observer().onTextDelta?.({ delta: '부분 답', full: '부분 답' });
+    observer().onTurnEnd?.({ sessionId: 'session-1', text: '부분 답', stopReason: 'aborted' });
+  });
+  const messages = tree!.root.findByType(ChatHistory).props.messages.filter((message: { role: string }) => message.role === 'assistant');
+  expect(messages).toHaveLength(2);
+  expect(messages[0].incomplete).toBe(true);
+  expect(messages[1].incomplete).toBe(true);
+  for (const message of messages) {
+    const html = renderToStaticMarkup(<ChatMessageView message={message} minimal />);
+    const partial = message.blocks?.find((block: { kind: string }) => block.kind === 'text')?.text ?? message.text;
+    expect(html.split('<details')[0]).not.toContain(partial);
+    expect(html).toContain('자세히');
+  }
+});
+
 test('share text is displayed in the mounted composer and consumed once', async () => {
   const { sessionStorage } = await mount({ acp: true, prefill: 'Shared question' });
   const textarea = tree!.root.findByType('textarea');
   expect(textarea.props.value).toBe('Shared question');
   expect(sessionStorage.getItem(SHARE_PREFILL_KEY)).toBeNull();
+});
+
+test('a completed Share Target handoff reaches a composer that mounted before the upload finished', async () => {
+  const { sessionStorage } = await mount({ acp: false });
+  await act(async () => { writeSharePrefill('text from completed handoff'); });
+  expect(tree!.root.findByType('textarea').props.value).toBe('text from completed handoff');
+  expect(sessionStorage.getItem(SHARE_PREFILL_KEY)).toBeNull();
+});
+
+test('a late Share Target text handoff preserves text the user has already typed', async () => {
+  const { input, sessionStorage } = await mount({ acp: false });
+  const textarea = input.findByType('textarea');
+  await act(async () => { textarea.props.onChange({ target: { value: 'my draft' } }); });
+  await act(async () => { writeSharePrefill('late shared text'); });
+  expect(tree!.root.findByType('textarea').props.value).toBe('my draft');
+  expect(sessionStorage.getItem(SHARE_PREFILL_KEY)).toBe('late shared text');
+});
+
+test('a URL Share Target handoff preserves a restored composer draft and remains staged', async () => {
+  const { sessionStorage } = await mount({
+    acp: false,
+    search: '?title=Shared&text=hello&url=https%3A%2F%2Fexample.test',
+    localDraft: 'draft restored from snapshot',
+  });
+  expect(tree!.root.findByType('textarea').props.value).toBe('draft restored from snapshot');
+  expect(sessionStorage.getItem(SHARE_PREFILL_KEY)).toBe('Shared\n\nhello\n\nhttps://example.test');
+});
+
+test('uploaded Share Target attachments survive a Chat remount after source cache acknowledgement', async () => {
+  const id = 'chat-layout-refresh-after-upload';
+  const fileKey = `/__share/${id}/0/shared.txt`;
+  const entries = new Map<string, Response>();
+  const cache = {
+    match: async (key: string) => entries.get(key)?.clone(),
+    put: async (key: string, response: Response) => { entries.set(key, response.clone()); },
+    delete: async (key: string) => entries.delete(key),
+  };
+  Object.defineProperty(globalThis, 'caches', {
+    configurable: true,
+    value: { keys: async () => ['elanous-pwa-share-target-test'], open: async () => cache },
+  });
+  entries.set(`/__share/${id}/manifest.json`, new Response(JSON.stringify({
+    id, ts: 1, title: '', text: '', url: '',
+    files: [{ index: ''.length, cacheUrl: fileKey, filename: 'shared.txt', type: 'text/plain', size: 'shared'.length }],
+  }), { headers: { 'content-type': 'application/json' } }));
+  entries.set(fileKey, new Response('shared'));
+  const sessionStore = storage();
+
+  await mount({ acp: false, search: `?shared=${id}`, sessionStore });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  const staged = JSON.parse(sessionStore.getItem('elanous.pwa.shareAttachments') ?? '[]') as AttachmentMeta[];
+  expect(staged).toHaveLength(1);
+  expect(entries.has(fileKey)).toBe(false);
+
+  await act(async () => { tree!.unmount(); });
+  tree = undefined;
+  await mount({ acp: false, sessionStore });
+  expect(tree!.root.findByType(ChatInput).props.attachments).toEqual(staged);
+});
+
+test('Share Target file stays in Cache Storage when attachment metadata cannot be persisted', async () => {
+  const id = 'chat-layout-storage-failure';
+  const fileKey = `/__share/${id}/0/shared.txt`;
+  const entries = new Map<string, Response>();
+  const cache = {
+    match: async (key: string) => entries.get(key)?.clone(),
+    put: async (key: string, response: Response) => { entries.set(key, response.clone()); },
+    delete: async (key: string) => entries.delete(key),
+  };
+  Object.defineProperty(globalThis, 'caches', {
+    configurable: true,
+    value: { keys: async () => ['elanous-pwa-share-target-test'], open: async () => cache },
+  });
+  entries.set(`/__share/${id}/manifest.json`, new Response(JSON.stringify({
+    id, ts: 1, title: '', text: '', url: '',
+    files: [{ index: ''.length, cacheUrl: fileKey, filename: 'shared.txt', type: 'text/plain', size: 'shared'.length }],
+  }), { headers: { 'content-type': 'application/json' } }));
+  entries.set(fileKey, new Response('shared'));
+
+  await mount({ acp: false, search: `?shared=${id}`, failStorageKey: 'elanous.pwa.shareAttachments' });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  expect(entries.has(fileKey)).toBe(true);
+  expect(entries.has(`/__share/${id}/manifest.json`)).toBe(true);
+});
+
+test('failed business-card followup keeps the staged Share Target attachment metadata', async () => {
+  const sessionStore = storage();
+  const attachment = sharedCardAttachmentFixture();
+  sessionStore.setItem('elanous.pwa.shareAttachments', JSON.stringify([attachment]));
+  const { input } = await mount({ acp: false, sessionStore, cardOutcome: 'failed' });
+  await act(async () => { await input.props.onSubmit('명함'); });
+  expect(sessionStore.getItem('elanous.pwa.shareAttachments')).toBe(JSON.stringify([attachment]));
+  expect(input.props.attachments).toContainEqual(attachment);
+});
+
+test('completed business-card followup consumes the staged Share Target attachment metadata', async () => {
+  const sessionStore = storage();
+  const attachment = sharedCardAttachmentFixture();
+  sessionStore.setItem('elanous.pwa.shareAttachments', JSON.stringify([attachment]));
+  const { input } = await mount({ acp: false, sessionStore, cardOutcome: 'done' });
+  await act(async () => { await input.props.onSubmit('명함'); });
+  expect(sessionStore.getItem('elanous.pwa.shareAttachments')).toBeNull();
 });
 
 test('outer chat paste preserves text and uploads file items as queued attachments', async () => {
@@ -687,4 +851,26 @@ test('Chat about this fills the composer after mount', async () => {
   expect(await result).toEqual({ answers: {}, cancelled: true });
   expect(tree!.root.findByType('textarea').props.value).toBe('[ Q: What now? ]\n\n');
   expect(sessionStorage.getItem(SHARE_PREFILL_KEY)).toBeNull();
+});
+
+test('deployment confirmation uses its own chat card and defaults to N', async () => {
+  const { receiveAsk, input, requests } = await mount({ acp: true });
+  await act(async () => { input.props.onSubmit('배포해줘'); });
+  expect(requests).toContainEqual({ method: 'session/prompt', body: {
+    sessionId: 'session-1', prompt: [{ type: 'text', text: '배포해줘' }],
+  } });
+  const { AskQuestionSheet } = await import('@/components/ask-user-question/AskQuestionSheet');
+  const payload = { id: 'deploy-confirm', request: { questions: [{ id: 'confirm', header: '배포', question: '시뮬레이션 PASS. 공개 발행할까요?',
+    options: [{ label: 'y', description: '' }, { label: 'N', description: '' }], includeOther: false, default: 'N' }] } };
+  let reply!: Promise<unknown>;
+  await act(async () => { reply = receiveAsk(payload); });
+  expect(tree!.root.findByType(AskQuestionSheet).props.request).toBeNull();
+  const card = tree!.root.findByType(DeployConfirmCard);
+  expect(card.props.question).toContain('시뮬레이션 PASS');
+  await act(async () => { card.props.onNo(); });
+  expect(await reply).toEqual({ answers: { confirm: 'N' } });
+  expect(tree!.root.findAllByType(DeployConfirmCard)).toHaveLength(0);
+  await act(async () => { reply = receiveAsk({ ...payload, id: 'deploy-confirm-2' }); });
+  await act(async () => { tree!.root.findByType(DeployConfirmCard).props.onYes(); });
+  expect(await reply).toEqual({ answers: { confirm: 'y' } });
 });

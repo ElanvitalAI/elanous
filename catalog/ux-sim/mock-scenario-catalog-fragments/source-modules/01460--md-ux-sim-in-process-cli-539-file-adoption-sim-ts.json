@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-IN-PROCESS-CLI-539-FILE-ADOPTION-SIM-TS",
+  "path": "src/ux-sim/in-process-cli-539-file-adoption-sim.ts",
+  "boundary": "Records observed child-process lifecycle events and validates the one-child adoption contract for migrated CLI test files.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

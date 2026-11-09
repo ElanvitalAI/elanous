@@ -1,5 +1,4 @@
 import { expect, setDefaultTimeout, test } from 'bun:test';
-import { spawnSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -8,6 +7,7 @@ import { resolveUnit } from '../../src/graph-runner/runner.js';
 import { observeDialogueNode } from './units/author-dialogue/observe.js';
 import { runArrivalElaboration } from '../../src/self-implement/goal-elaborate.js';
 import { runFirstRoundRefine } from '../../src/self-implement/goal-refine.js';
+import { runTestCli } from '../../test/helpers/cli.js';
 
 const graphPath = join(import.meta.dir, 'ta-journey.yaml');
 setDefaultTimeout(60_000);
@@ -18,13 +18,17 @@ function journeyUnitSource(repoRoot: string, id: string): string {
   return existsSync(local) ? local : join(repoRoot, 'graphs', 'units', id);
 }
 
-test('TA journey dry-run traverses the entire declared success path without effects', () => {
+async function runGraphCli(temp: string, args: string[], env: Record<string, string | undefined> = {}) {
+  const result = await runTestCli(args, {
+    cwd: temp, env: { NODE_ENV: 'test', HOME: temp, ...env }, allowPaths: [['graph', 'run']],
+  });
+  return { status: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+}
+
+test('TA journey dry-run traverses the entire declared success path without effects', async () => {
   const temp = mkdtempSync(join(tmpdir(), 'ta-journey-dry-'));
   try {
-    const cli = spawnSync(Bun.which('bun')!, [
-      join(resolve(import.meta.dir, '../..'), 'bin/elanous.mjs'),
-      `--test=${join(temp, 'config')}`, 'graph', 'run', graphPath, '--dry-run', '--json',
-    ], { cwd: temp, encoding: 'utf8', env: { ...process.env, NODE_ENV: 'test', HOME: temp }, timeout: 30_000 });
+    const cli = await runGraphCli(temp, [`--test=${join(temp, 'config')}`, 'graph', 'run', graphPath, '--dry-run', '--json']);
     expect(cli.status, cli.stderr).toBe(0);
     const state = JSON.parse(cli.stdout) as { status: string; path: string[]; executed: number; dryRun: boolean };
     expect(state.status).toBe('done');
@@ -92,7 +96,7 @@ test('TA journey resolves the shared entry and dispatch-pod units with the imple
   }
 });
 
-test('entry and dispatch-pod original recipes execute only read-only commands and route unsafe observations to needs-human', () => {
+test('entry and dispatch-pod original recipes execute only read-only commands and route unsafe observations to needs-human', async () => {
   const temp = mkdtempSync(join(tmpdir(), 'ta-journey-owned-units-'));
   const repoRoot = resolve(import.meta.dir, '../..');
   const pin = '0123456789ab';
@@ -122,10 +126,10 @@ test('entry and dispatch-pod original recipes execute only read-only commands an
       const graphPathCopy = join(graphDir, `${fixture.id}.yaml`);
       writeFileSync(graphPathCopy, readFileSync(join(sourceDir, `${fixture.id}.yaml`), 'utf8'));
       cpSync(join(sourceDir, 'recipes.yaml'), join(graphDir, 'recipes.yaml'));
-      const cli = spawnSync(Bun.which('bun')!, [
-        join(repoRoot, 'bin/elanous.mjs'), `--test=${join(temp, `config-${fixture.id}-${index}`)}`,
+      const cli = await runGraphCli(temp, [
+        `--test=${join(temp, `config-${fixture.id}-${index}`)}`,
         'graph', 'run', graphPathCopy, '--input', JSON.stringify({ ask: 'fixture', context: {}, prior: {} }), '--json',
-      ], { cwd: temp, encoding: 'utf8', env: { ...process.env, ...fixture.env, PATH: `${join(temp, 'bin')}:${process.env.PATH}`, FIXTURE_CALL_LOG: commandLog, FIXTURE_IMAGE_PIN: 'imagePin' in fixture ? fixture.imagePin : pin, NODE_ENV: 'test', HOME: temp }, timeout: 30_000 });
+      ], { ...fixture.env, PATH: `${join(temp, 'bin')}:${process.env.PATH}`, FIXTURE_CALL_LOG: commandLog, FIXTURE_IMAGE_PIN: 'imagePin' in fixture ? fixture.imagePin : pin });
       expect(cli.status, `${fixture.id}: ${cli.stderr} ${cli.stdout}`).toBe(0);
       const state = JSON.parse(cli.stdout) as { status: string; path: string[]; executed: number; nodes: Array<{ nodeId: string; output?: string }> };
       expect(state.status, `${fixture.id}/${index}: path=${state.path} calls=${readFileSync(commandLog, 'utf8')}`).toBe('done');
@@ -156,7 +160,7 @@ test('entry and dispatch-pod command recipe bodies parse without executing obser
   }
 });
 
-test('journey branch scenarios preserve harvest done, rework, and needs-human outcomes in isolated test runs', () => {
+test('journey branch scenarios preserve harvest done, rework, and needs-human outcomes in isolated test runs', async () => {
   const temp = mkdtempSync(join(tmpdir(), 'ta-journey-scenarios-'));
   const repoRoot = resolve(import.meta.dir, '../..');
   const fixtures = [
@@ -201,10 +205,10 @@ test('journey branch scenarios preserve harvest done, rework, and needs-human ou
         writeFileSync(unitPath, stringifyYaml(unit));
       }
 
-      const cli = spawnSync(Bun.which('bun')!, [
-        join(repoRoot, 'bin/elanous.mjs'), `--test=${join(temp, `config-${index}`)}`,
+      const cli = await runGraphCli(temp, [
+        `--test=${join(temp, `config-${index}`)}`,
         'graph', 'run', join(graphDir, 'ta-journey.yaml'), ...(fixture.id === 'harvest' ? ['--input', JSON.stringify({ ask: 'isolated harvest exit fixture', context: {}, prior: {} })] : ['--dry-run']), '--json',
-      ], { cwd: temp, encoding: 'utf8', env: { ...process.env, NODE_ENV: 'test', HOME: temp }, timeout: 30_000 });
+      ]);
       expect(cli.status, `${fixture.id}/${fixture.exit}: ${cli.stderr} ${cli.stdout}`).toBe(fixture.exit === 'done' ? 0 : 1);
       const state = JSON.parse(cli.stdout) as { status: string; reason?: string; path: string[]; executed: number };
       expect(state.status).toBe(fixture.exit === 'done' ? 'done' : 'failed');
@@ -215,7 +219,7 @@ test('journey branch scenarios preserve harvest done, rework, and needs-human ou
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });
 
-test('reflect wait re-enters with prior result attempts and reaches needs-human at the cap', () => {
+test('reflect wait re-enters with prior result attempts and reaches needs-human at the cap', async () => {
   const temp = mkdtempSync(join(tmpdir(), 'ta-journey-reflect-retry-'));
   const repoRoot = resolve(import.meta.dir, '../..');
   const graphDir = join(temp, 'graphs', 'journey');
@@ -260,10 +264,10 @@ if (unit === 'reflect') {
     const commandRecipe = reflectUnit.nodes.find(node => node.node_id === reflectUnit.entry_node)!.recipe.replace(/^cmd:/, '');
     writeFileSync(join(unitDir, 'recipes.yaml'), `${commandRecipe}:\n  command: bun ${fixtureScript} reflect ${tracePath}\n`);
 
-    const cli = spawnSync(Bun.which('bun')!, [
-      join(repoRoot, 'bin/elanous.mjs'), `--test=${join(temp, 'config')}`,
+    const cli = await runGraphCli(temp, [
+      `--test=${join(temp, 'config')}`,
       'graph', 'run', join(graphDir, 'ta-journey.yaml'), '--json', '--input', JSON.stringify({ ask: 'fixture request', context: {} }),
-    ], { cwd: temp, encoding: 'utf8', env: { ...process.env, NODE_ENV: 'test', HOME: temp }, timeout: 30_000 });
+    ]);
     expect(cli.status, cli.stderr).toBe(1);
     const state = JSON.parse(cli.stdout || JSON.stringify({ stderr: cli.stderr })) as { status: string; reason?: string; path: string[]; nodes: Array<{ nodeId: string; output?: string }> };
     expect(state.status, cli.stderr + JSON.stringify(state)).toBe('failed');
@@ -382,11 +386,11 @@ test('graph runner executes author-dialogue: E1 success reaches dispatch-pod wit
     writeFileSync(join(graphDir, 'recipes.yaml'), done('seed') + done('dispatch-pod'));
     cpSync(join(repoRoot, 'graphs', 'journey', 'units', 'author-dialogue'), join(unitsDir, 'author-dialogue'), { recursive: true });
 
-    const cli = spawnSync(Bun.which('bun')!, [
-      join(repoRoot, 'bin/elanous.mjs'), `--test=${join(temp, 'config')}`,
+    const cli = await runGraphCli(temp, [
+      `--test=${join(temp, 'config')}`,
       'graph', 'run', join(graphDir, 'ta-journey.yaml'), '--json',
       '--input', JSON.stringify({ ask: 'E1 dialogue run', context: { observations }, prior: {} }),
-    ], { cwd: temp, encoding: 'utf8', env: { ...process.env, NODE_ENV: 'test', HOME: temp }, timeout: 60_000 });
+    ]);
     const state = JSON.parse(cli.stdout || JSON.stringify({ stderr: cli.stderr })) as {
       status: string; path: string[];
       unitCalls?: Array<{ nodeId: string; exit?: string; path?: string[] }>;
@@ -468,11 +472,11 @@ test('graph runner executes the refine back-edge once: first-round findings -> a
     writeFileSync(join(graphDir, 'recipes.yaml'), done('seed') + done('dispatch-pod'));
     cpSync(join(repoRoot, 'graphs', 'journey', 'units', 'author-dialogue'), join(unitsDir, 'author-dialogue'), { recursive: true });
 
-    const cli = spawnSync(Bun.which('bun')!, [
-      join(repoRoot, 'bin/elanous.mjs'), `--test=${join(temp, 'config')}`,
+    const cli = await runGraphCli(temp, [
+      `--test=${join(temp, 'config')}`,
       'graph', 'run', join(graphDir, 'ta-journey.yaml'), '--json',
       '--input', JSON.stringify({ ask: 'E3 refine run', context, prior: {} }),
-    ], { cwd: temp, encoding: 'utf8', env: { ...process.env, NODE_ENV: 'test', HOME: temp }, timeout: 60_000 });
+    ]);
     const state = JSON.parse(cli.stdout || JSON.stringify({ stderr: cli.stderr })) as {
       status: string; path: string[]; unitCalls?: Array<{ node: string; exit?: string; steps?: number }>;
     };

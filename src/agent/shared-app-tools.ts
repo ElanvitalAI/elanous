@@ -20,7 +20,8 @@ import { skillExecRuntime } from '../tool-runtime/skill-exec-runtime.js';
 import type { SkillExecArgs } from '../tool-runtime/skill-exec-runtime.js';
 import { buildElanousSkillsListTool, dispatchElanousSkillsList } from '../tool-runtime/elanous-skills-list-runtime.js';
 import type { ElanousSkillsListArgs } from '../tool-runtime/elanous-skills-list-runtime.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
+import { appDeployPluginSpec, runAppDeploy } from './app-deploy-plugin.js';
 
 
 export interface SharedAppTools {
@@ -35,10 +36,12 @@ export function buildSharedAppTools(cfg?: UserConfig): SharedAppTools {
   const fin = cfg && financeEnabled(cfg) ? buildFinanceTools() : null;
   const skillsList = buildElanousSkillsListTool();
   const skill = skillExecRuntime;
-  const specs: LLMToolSpec[] = [...core.specs, ...(fin ? fin.specs : []), skillsList, skill.spec];
-  const names = new Set<string>([...core.names, ...(fin ? fin.names : []), skillsList.name, skill.id]);
+  const deploy = appDeployPluginSpec();
+  const specs: LLMToolSpec[] = [...core.specs, ...(fin ? fin.specs : []), skillsList, skill.spec, deploy];
+  const names = new Set<string>([...core.names, ...(fin ? fin.names : []), skillsList.name, skill.id, deploy.name]);
   // context(B5) — 기억 조회 같은 긴 코어 도구가 진행 한 줄(emitFeedback)을 낼 수 있게 코어까지 넘긴다.
   const dispatch = async (name: string, args: Record<string, unknown>, context?: ToolRuntimeContext): Promise<unknown> =>
+    name === deploy.name ? runAppDeploy(args, context) :
     name === skillsList.name ? dispatchElanousSkillsList(args as ElanousSkillsListArgs) :
       name === skill.id ? skill.run(args as unknown as SkillExecArgs, { surface: context?.surface ?? 'skill', signal: context?.signal }) :
         fin && fin.names.has(name) ? fin.dispatch(name, args) : core.dispatch(name, args, undefined, context);

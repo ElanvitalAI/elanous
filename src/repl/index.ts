@@ -36,12 +36,8 @@ import {
   setActiveSessionId,
   getActiveSessionId,
 } from '../session/index.js';
-import {
-  reloadUserConfig,
-  saveUserConfig,
-  jumpToRotationEntry,
-  type UserConfig,
-} from '../user-config.js';
+import { reloadUserConfig, saveUserConfig, jumpToRotationEntry } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { setAmbientSessionId, debug } from '../debug/log.js';
 import { buildInstalledSkillCatalogMessage, type InstalledSkillSummary } from '../dashboard/skill-catalog-preamble.js';
 import { resolveModelContextWindow } from '../models/context-window.js';
@@ -194,6 +190,10 @@ function buildReplTools(): {
   const bashMod = require('../skills/tools/index.js') as typeof import('../skills/tools/index.js');
   specs.push(bashMod.buildBashTool());
   dispatchByName.set('Bash', async (args) => bashMod.dispatchBash(args, { cwd: process.cwd() }));
+  const appDeploy = require('../agent/app-deploy-plugin.js') as typeof import('../agent/app-deploy-plugin.js');
+  const appDeploySpec = appDeploy.appDeployPluginSpec();
+  specs.push(appDeploySpec);
+  dispatchByName.set(appDeploySpec.name, (args) => appDeploy.runAppDeploy(args));
   // TUI-NEXT-QUEUE-AND-WAKE: the next TUI parent opens an IPC hop only for its own REPL children;
   // the classic ScheduleWakeup spec is advertised and each call is answered by the parent's scheduler.
   const wakeMod = require('../tui-client/next-wakeup.js') as typeof import('../tui-client/next-wakeup.js');

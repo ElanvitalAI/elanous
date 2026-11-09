@@ -33,7 +33,7 @@ function runPreloadFixture(env: Record<string, string | undefined>, body: string
   }
 }
 
-function readFixtureEnvironment(stdout: string): Record<string, string | undefined> {
+function readFixtureEnvironment(stdout: string): Record<string, unknown> {
   const match = stdout.match(/PRELOAD_ENV=(\{.*\})/);
   expect(match).not.toBeNull();
   return JSON.parse(match![1]!);
@@ -122,6 +122,7 @@ describe('preload-isolation contract', () => {
       import { test } from 'bun:test';
       import { debug } from ${JSON.stringify(join(REPO_ROOT, 'src/debug/log.ts'))};
       const scrubbed = debug.events().find((event) => event.category === 'test.preload' && event.event === 'env-scrubbed');
+      const scrubbedData = scrubbed?.data as { keys?: string[]; prefixes?: string[] } | undefined;
       const seen = {
         podName: process.env.ELANOUS_POD_NAME,
         podFutureName: process.env.ELANOUS_POD_SOME_FUTURE_NAME,
@@ -129,7 +130,11 @@ describe('preload-isolation contract', () => {
         entrance: process.env.ELANOUS_HARNESS_ENTRANCE,
         seat: process.env.ELANOUS_HARNESS_SEAT,
         nearMiss: process.env.ELANOUS_PODIUM,
-        scrubbedKeys: (scrubbed?.data as { keys?: string[] } | undefined)?.keys ?? null,
+        scrubbedCategory: scrubbed?.category,
+        scrubbedEvent: scrubbed?.event,
+        scrubbedFields: scrubbedData ? Object.keys(scrubbedData).sort() : null,
+        scrubbedPrefixes: scrubbedData?.prefixes ?? null,
+        scrubbedKeys: scrubbedData?.keys ?? null,
       };
       process.env.ELANOUS_POD_POOL = 'fake:1';
       console.log('PRELOAD_ENV=' + JSON.stringify({ ...seen, testSet: process.env.ELANOUS_POD_POOL }));
@@ -143,6 +148,10 @@ describe('preload-isolation contract', () => {
     expect(readFixtureEnvironment(result.stdout)).toEqual({
       podName: undefined, podFutureName: undefined, k8sHost: undefined, entrance: undefined, seat: undefined,
       nearMiss: 'kept',
+      scrubbedCategory: 'test.preload',
+      scrubbedEvent: 'env-scrubbed',
+      scrubbedFields: ['keys', 'prefixes'],
+      scrubbedPrefixes: ['ELANOUS_POD_', 'KUBERNETES_', 'ELANOUS_HARNESS_'],
       scrubbedKeys: expect.arrayContaining(['ELANOUS_POD_NAME', 'ELANOUS_POD_SOME_FUTURE_NAME', 'KUBERNETES_SERVICE_HOST',
         'ELANOUS_HARNESS_ENTRANCE', 'ELANOUS_HARNESS_SEAT']),
       testSet: 'fake:1',

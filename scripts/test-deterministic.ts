@@ -978,6 +978,7 @@ export async function runDeterministicTests(deps: DeterministicRunnerDeps = {}):
   try {
     testRoot = makeTemp(join(tempBase(), TEMP_ROOT_PREFIX));
     const env = prepareIsolatedTestEnv(deps.env ?? process.env, testRoot);
+    env.ELANOUS_INSTALL_TEST_TIER = 'deterministic';
     gate = deps.waitForSignal
       ? undefined
       : installShutdownSignalGate(deps.signalTarget ?? process, deps.onAbsorbSignal);

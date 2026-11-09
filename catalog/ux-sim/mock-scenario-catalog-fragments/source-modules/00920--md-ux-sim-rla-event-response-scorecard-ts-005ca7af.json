@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-RLA-EVENT-RESPONSE-SCORECARD-TS",
+  "path": "src/ux-sim/rla-event-response-scorecard.ts",
+  "boundary": "Writes a concrete per-incident fault fixture into the private simulation world, lets a responder inspect and update that state, verifies event-specific recovery postconditions from persisted world state, and records response stages through world-runtime; the fixture is simulation evidence, not a production RLA observation.",
+  "deviceIds": [
+    "rla-event-response-scorecard"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

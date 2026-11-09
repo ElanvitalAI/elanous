@@ -1,0 +1,5 @@
+{
+  "id": "RLA-ER-04",
+  "name": "Worker death (STOP_AT)",
+  "description": "Measure next-tick worker restart."
+}

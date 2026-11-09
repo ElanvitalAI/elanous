@@ -1,0 +1,28 @@
+{
+  "id": "device-fidelity",
+  "name": "Recorded device fidelity comparison",
+  "implementation": [
+    "src/ux-sim/device-fidelity.ts"
+  ],
+  "tests": [
+    "src/ux-sim/device-fidelity.test.ts"
+  ],
+  "target": "Compare recorded real GitHub API responses against replay through the production fake-github device and gate sim verdicts by device fidelity",
+  "inputs": [
+    "versioned JSON real-response recording",
+    "device id, request argv and recorded response",
+    "isolated test universe"
+  ],
+  "observations": [
+    "per-call response hashes and match verdict",
+    "durable per-recording/device status",
+    "sim world green to yellow downgrade for a mismatched device"
+  ],
+  "entryCommands": [
+    "eln --test sim fidelity compare <recording.json>",
+    "eln --test sim fidelity status <device-id>"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

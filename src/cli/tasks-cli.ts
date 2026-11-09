@@ -8,6 +8,7 @@ import { loadGoalAskRecords } from '../self-implement/goal-ask-store.js';
 import { dirname, join, resolve } from 'node:path';
 import { InvalidArgumentError, Option, type Command } from 'commander';
 import { debug } from '../debug/log.js';
+import { acquireLockAsync } from '../storage/file-lock.js';
 import { readRunExits } from '../harness/harness-incidents.js';
 import { checklistDevVersion, listChecklist, setItemIfSnapshot } from '../release-loop/checklist.js';
 import { assignedVersions, releasedVersion, validateVersion } from '../release-loop/feature-store.js';
@@ -23,7 +24,7 @@ import { mapInventory, renderMapReduceTable, type MapInventory, type MapItem, ty
 import type { MapRecipe, MapRunRow } from '../task-agent/map-run-ledger.js';
 import { createMapHostLauncher, type HostMapItem } from '../task-agent/map-host-adapter.js';
 import { excludeGatePoolHosts, readTrafficDispatchSnapshot, releaseGateTrafficActive, resolveSshHostIdentity, type TrafficDispatchSnapshot } from '../task-orchestrator/surfaces/gate-pod-pool-policy.js';
-import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner.js';
+import type { GraphRunOptions, GraphRunState } from '../graph-runner/runner-types.js';
 import type { PluginWizardDeps } from '../graph-wizard/mission-compose.js';
 import type { TaskPluginWizardHostPorts } from './task-plugin-wizard-host.js';
 import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
@@ -153,6 +154,51 @@ export interface TasksCliDeps {
   hostRegate?: (input: import('../self-implement/host-regate.js').HostRegateInput) => Promise<import('../self-implement/host-regate.js').HostRegateResult>;
   /** Isolated regate-run tests can disable the asynchronous completion callback explicitly. */
   regateCompletion?: false;
+}
+
+interface TaLandCountSnapshot {
+  count: number | null;
+  active: string[];
+  terminal: string[];
+  unknown: string[];
+  error?: string;
+}
+
+/** Shared source of truth for the read-only land-count surface and the live dispatcher guard. */
+async function readTaLandCountSnapshot(statePath: string, deps: TasksCliDeps): Promise<TaLandCountSnapshot> {
+  const active: string[] = [];
+  const terminal: string[] = [];
+  const unknown: string[] = [];
+  try {
+    if (!existsSync(statePath)) throw new Error('TA 카드 원장 없음');
+    const state = readTaskAgentState<{ tasks?: Record<string, TaskCard> }>(statePath);
+    if (!state.tasks || typeof state.tasks !== 'object') throw new Error('TA 카드 원장 형식 오류');
+    const root = dirname(statePath);
+    for (const card of Object.values(state.tasks)) {
+      if (card.status !== 'launched' || card.taLand !== true) continue;
+      if (!card.runId) { unknown.push(card.id); continue; }
+      try {
+        if (card.parentHost) {
+          if (deps.remoteLedgerMirror) deps.remoteLedgerMirror(card);
+          else {
+            const { mirrorRemoteRunLedgers } = await import('../task-agent/parent-host.js');
+            mirrorRemoteRunLedgers(card.parentHost, card.runId, root);
+          }
+        }
+        const dir = card.parentHost ? remoteLedgerMirrorDir(root, card.parentHost.host) : runLedgerDir(root);
+        const ledger = loadRunLedgerSync(card.runId, dir);
+        if (!ledger) { unknown.push(card.id); continue; }
+        const status = [...ledger].reverse().find((entry) => entry.event === 'run-status' && typeof entry.data.runStatus === 'string');
+        if (status && ['completed', 'failed', 'cancelled', 'parked'].includes(String(status.data.runStatus))) terminal.push(card.id);
+        else active.push(card.id);
+      } catch { unknown.push(card.id); }
+    }
+    active.sort(); terminal.sort(); unknown.sort();
+    return { count: unknown.length ? null : active.length, active, terminal, unknown };
+  } catch (error) {
+    return { count: null, active, terminal, unknown,
+      error: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 /** `<조각id>=<값>` 반복 인자. */
@@ -2241,6 +2287,11 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--plugin-market-dir <dir>', '스마트 플러그인 마법사가 읽을 신뢰 마켓 인덱스 디렉터리')
     .option('--live', '실제로 발사한다(기본은 shadow — 명령만 출력)')
     .option('--ta-land', 'TA-LIVE-LAND-2 — 호스트는 재게이트만 하고 병합은 TASK-AGENT 의 propose-land(`pr land --expected-head`)에 맡긴다 · 카드 taLand ⊕ 발사 env ELANOUS_TA_LAND=1 · taskAgent.liveMoves 에 propose-land 가 없으면 종전대로 호스트가 병합')
+    .option('--ta-land-max <n>', 'TA 착지 동시 상한 — --ta-land --live 와 함께 필수', (value: string) => {
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new InvalidArgumentError('--ta-land-max 는 양의 정수여야 한다');
+      return parsed;
+    })
     .option('--child-llm <provider/model>', 'TASKS-HAND-CHILD-LLM — 구현 자식 LLM(예: grok/grok-4.7) → 발사 인자 --child-llm-provider <provider> --child-llm-model <model> · «첫» `/` 에서만 가른다(모델 id 의 `/` 는 보존) · openrouter 는 모델 id 가 openrouter/ 접두를 포함하므로 전체를 모델로(openrouter/z-ai/glm-5.3 → --child-llm-model openrouter/z-ai/glm-5.3) · 카드 childLlm · 안 주면 명령·카드 무변경')
     .option('--child-llm-effort <level>', '구현 자식 추론 노력 → 발사 인자 --child-llm-effort(검증은 하니스 · --child-llm 과 함께)')
     .option('--role-llm <role=provider[/tier]>', 'TA 부모 역할 LLM(반복 가능 · planning|classify|audit|review만). 정확한 모델은 role={"provider":"openrouter","model":"openrouter/z-ai/glm-5.3"}; 자식 모델은 --child-llm', (value: string, previous: string[] = []) => [...previous, value])
@@ -2248,7 +2299,7 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
     .option('--tag <k=v>', 'RUN-IDENTITY-TAGS — 출생 신분을 덮는다(class|care|rights|protect 의 k=v · 반복: --tag class=gate --tag protect=true) — 카드 원장 identity 에 남는다', (value: string, previous: string[] | undefined) => [...(previous ?? []), value])
     .option('--draft-claim <pr>', 'DRAFT-CLAIM-AUTO-2-FU — PR 를 관측(gh pr view)해 draftClaim 을 조립해 넘긴다 · 관측한 PR 머리에서 `elanous self review <pr> --json` 로 손 수확을 먼저 확정한다(확정 못 하면 claim 문면을 만들지 않는다) · claim 문면을 실제 PR 댓글로 게시(gh pr comment)한다 · 같은 PR 의 살아 있는 claim 기록(카드 draftClaim)이 있으면 거부한다')
     .option('--json', 'JSON 출력')
-    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; missingTool?: string; pluginMarketDir?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; childLlm?: string; childLlmEffort?: string; roleLlm?: string[]; tier?: TaskCard['tier']; tag?: string[]; draftClaim?: string; json?: boolean }) => {
+    .action(async (text: string | undefined, opts: { seat?: TaskSeat; checklist?: string; version?: string; completion?: CompletionKind; mission?: string; project?: string; target?: string; missingTool?: string; pluginMarketDir?: string; goal?: string; milestone?: string; live?: boolean; taLand?: boolean; taLandMax?: number; childLlm?: string; childLlmEffort?: string; roleLlm?: string[]; tier?: TaskCard['tier']; tag?: string[]; draftClaim?: string; json?: boolean }) => {
       const suppliedText = text !== undefined;
       /** RUN-IDENTITY-TAGS — 칸을 찾은 판(출생 신분이 그 판의 칸 우선순위를 읽는다 · 개발 판 밖 칸도). */
       let birthBoardVersion: string | undefined;
@@ -2332,6 +2383,23 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       }
       if (opts.mission !== undefined && (opts.completion !== undefined || opts.project !== undefined || opts.goal !== undefined || opts.milestone !== undefined || opts.taLand === true || opts.childLlm !== undefined || opts.childLlmEffort !== undefined || opts.roleLlm !== undefined || opts.tier !== undefined || opts.tag !== undefined)) {
         out('--completion/--project/--target/--goal/--milestone/--ta-land/--child-llm/--role-llm/--tier/--tag 는 과제 한 줄에만 준다 — --mission 조각은 종전처럼 code-pr 이다');
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.taLandMax !== undefined && (opts.taLand !== true || opts.live !== true)) {
+        out('--ta-land-max 는 --ta-land --live 와 함께 준다 · 발사 0');
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.taLand === true && opts.live === true && opts.taLandMax === undefined) {
+        out('--ta-land --live 는 명시적 --ta-land-max N 이 필요하다 · 발사 0');
+        try { debug.log('task-agent.hand', 'ta-land-count-refused', { reason: 'target-missing', launched: false }); } catch { /* fail-soft */ }
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.taLand === true && opts.live === true && opts.draftClaim === undefined && (opts.tier === '상' || opts.tier === '특')) {
+        out('--ta-land --live 는 한 호출의 다중 조각 발사를 상한별로 제어할 수 없어 --tier 상/특을 거부한다 · 발사 0');
+        try { debug.log('task-agent.hand', 'ta-land-count-refused', { reason: 'multi-launch-mode-unsupported', tier: opts.tier, launched: false }); } catch { /* fail-soft */ }
         process.exitCode = 1;
         return;
       }
@@ -2481,9 +2549,41 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
         if (draftClaimPr !== undefined && opts.live && (opts.tier === '상' || opts.tier === '특')) {
           try { debug.log('task-agent.hand', 'tier-split-bypassed', { reason: 'draft-claim', pr: draftClaimPr, tier: opts.tier }); } catch { /* fail-soft */ }
         }
-        const handed = draftClaimPr !== undefined
-          ? { kind: 'whole' as const, result: await handDraftClaim({ ...handOpts, pr: draftClaimPr, gh: deps.draftClaimGh ?? defaultDraftClaimGhPorts() }) }
-          : await (await import('../task-agent/tier-split.js')).handTaskWithTierSplit({ ...handOpts, ...('tierSizedDecompose' in deps ? { decompose: deps.tierSizedDecompose } : {}) });
+        let taLandDispatchLock: Awaited<ReturnType<typeof acquireLockAsync>> | undefined;
+        if (opts.taLand === true && opts.live === true && opts.taLandMax !== undefined) {
+          const statePath = deps.taskStatePath ?? taskStatePathDefault();
+          try {
+            taLandDispatchLock = await acquireLockAsync(`${statePath}.ta-land-dispatch.lock`, { breakDeadHolder: true });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            try { debug.log('task-agent.hand', 'ta-land-count-refused', { reason: 'dispatch-lock-unavailable', error: message, launched: false }); } catch { /* fail-soft */ }
+            out(`TA 착지 발사 거부 · dispatch-lock-unavailable · ${message} · 발사 0`);
+            process.exitCode = 1;
+            return;
+          }
+          const snapshot = await readTaLandCountSnapshot(statePath, deps);
+          const refusal = snapshot.count === null ? 'count-unavailable'
+            : snapshot.count >= opts.taLandMax ? 'capacity-full' : undefined;
+          try {
+            debug.log('task-agent.hand', refusal ? 'ta-land-count-refused' : 'ta-land-count-admitted', {
+              reason: refusal ?? 'capacity-available', active: snapshot.active.length, target: opts.taLandMax,
+              activeIds: snapshot.active, unknownIds: snapshot.unknown, launched: false,
+            });
+          } catch { /* observation must not change dispatch behavior */ }
+          if (refusal) {
+            taLandDispatchLock.release();
+            out(`TA 착지 발사 거부 · ${refusal}${snapshot.error ? ` · ${snapshot.error}` : ''} · 활성 ${snapshot.active.length}/${opts.taLandMax} · 발사 0`);
+            process.exitCode = 1;
+            return;
+          }
+        }
+        const handed = await (async () => {
+          try {
+            return draftClaimPr !== undefined
+              ? { kind: 'whole' as const, result: await handDraftClaim({ ...handOpts, pr: draftClaimPr, gh: deps.draftClaimGh ?? defaultDraftClaimGhPorts() }) }
+              : await (await import('../task-agent/tier-split.js')).handTaskWithTierSplit({ ...handOpts, ...('tierSizedDecompose' in deps ? { decompose: deps.tierSizedDecompose } : {}) });
+          } finally { taLandDispatchLock?.release(); }
+        })();
         if (handed.kind === 'split') {
           // TIER-SPLIT-BEFORE-LAUNCH — 상·특 hand 를 조각으로 나눠 쐈다: 첫 줄 = 묶음 · 조각마다 한 줄(미션 출력과 같은 꼴).
           if (opts.json) out(JSON.stringify(handed));
@@ -2646,6 +2746,18 @@ export function registerTasksCommands(program: Command, deps: TasksCliDeps = {})
       out(`하니스 부모 ${report.scanned} · 나이 ≥ ${hours}h 중 낡음 후보 ${report.rows.length}${report.podRunsMeasured ? '' : ' · ⚠ Pod 목록 못 잼(원장 근거만)'} — 읽기 전용(죽이지 않는다)`);
       out('pid\t나이h\t자리\t판\t런\t사유');
       for (const row of report.rows) out([row.pid, row.ageHours, row.seat ?? '-', row.version ?? '-', row.runId ?? '-', row.reasons.join(',')].join('\t'));
+    });
+
+  tasks.command('land-count')
+    .description('디스패처 TA 착지 동시 계수: launched taLand 카드의 부모 런 원장 기준(못 읽으면 계수 미확정)')
+    .option('--json', 'JSON 출력')
+    .action(async (opts: { json?: boolean }) => {
+      const result = await readTaLandCountSnapshot(deps.taskStatePath ?? taskStatePathDefault(), deps);
+      if (opts.json) out(JSON.stringify(result));
+      else out(result.count === null
+        ? `TA 착지 계수 못 잼 · 활성 ≥${result.active.length} · 원장 누락 ${result.unknown.join(',')}${result.error ? ` · ${result.error}` : ''}`
+        : String(result.count));
+      if (result.count === null) process.exitCode = 1;
     });
 
   tasks.command('adopt-pr <number>')

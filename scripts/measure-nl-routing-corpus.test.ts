@@ -2,10 +2,19 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { main as runCorpusMain, NL_ROUTING_UNSAFE_RUN_ENV, resolveCorpusRunSafety } from './measure-nl-routing-corpus.js';
+import { main as runCorpusMain, NL_ROUTING_UNSAFE_RUN_ENV, resolveCorpusRunSafety, summarizeRoutingOutcomes } from './measure-nl-routing-corpus.js';
 import type { EvalPromptResult } from '../src/eval-prompt-cli.js';
 
 const resolveCorpusRunSafetyFromProcessEnv = (surfaceToolNames: readonly string[]) => resolveCorpusRunSafety(process.env, undefined, surfaceToolNames);
+
+test('routing rates keep unexpected tools separate from explicitly rejected tools', () => {
+  expect(summarizeRoutingOutcomes([
+    { outcome: 'pass' },
+    { outcome: 'wrong-tool' },
+    { outcome: 'rejected-tool' },
+  ])).toEqual({ accuracy: 1 / 3, wrongToolRate: 1 / 3, rejectedToolRate: 1 / 3 });
+  expect(summarizeRoutingOutcomes([])).toEqual({ accuracy: null, wrongToolRate: null, rejectedToolRate: null });
+});
 
 async function withRunnerEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<T> {
   const originalArgv = process.argv;
@@ -38,7 +47,7 @@ describe('measure-nl-routing-corpus runner cwd safety', () => {
     expect(corpusLoads).toBe(0);
   });
 
-  test('uses the final corpus surface for the single safety decision instead of a provisional cli surface', async () => {
+  test('uses the final corpus surface and measurement routes for the single safety decision', async () => {
     const outDir = mkdtempSync(resolve(tmpdir(), 'nl-routing-out-'));
     const out = resolve(outDir, 'corpus.json');
     const safetyInputs: string[][] = [];
@@ -65,7 +74,7 @@ describe('measure-nl-routing-corpus runner cwd safety', () => {
           (surface) => (surface === 'chat' ? ['Read'] : ['Bash']),
         );
       });
-      expect(safetyInputs).toEqual([['Read']]);
+      expect(safetyInputs).toEqual([['Read', 'ReleaseStatus', 'ReleaseGraphStart', 'ObserveLogs', 'ObserveOpsStatus']]);
       const output = JSON.parse(readFileSync(out, 'utf8')) as { surface: string; exposedMutatingTools: string[]; records: unknown[] };
       expect(output.surface).toBe('chat');
       expect(output.exposedMutatingTools).toEqual([]);

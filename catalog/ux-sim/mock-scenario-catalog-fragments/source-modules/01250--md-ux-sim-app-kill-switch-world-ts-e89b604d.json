@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-APP-KILL-SWITCH-WORLD-TS",
+  "path": "src/ux-sim/app-kill-switch-world.ts",
+  "boundary": "Exercises the production app kill-switch with local incident events and no live relay.",
+  "deviceIds": [
+    "fake-app-traffic"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

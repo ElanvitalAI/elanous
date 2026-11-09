@@ -1633,6 +1633,7 @@ export class PluginHost {
         ...tool,
         description: manifest.description || tool.description,
         parameters: manifest.parameters ?? (manifest.schema ? this.loadAIToolSchema(entry, manifest.schema) : tool.parameters),
+        ...(manifest.route ? { pluginId: entry.manifest.id, route: manifest.route } : {}),
       };
     });
     const runtimeNames = new Set(runtimeTools.map(tool => tool.name));
@@ -1643,6 +1644,7 @@ export class PluginHost {
         description: manifest.description,
         parameters: manifest.parameters ?? (manifest.schema ? this.loadAIToolSchema(entry, manifest.schema) : { type: 'object', properties: {} }),
         handler: await this.loadAIToolHandler(entry, manifest.handler, manifest.name),
+        ...(manifest.route ? { pluginId: entry.manifest.id, route: manifest.route } : {}),
       });
     }
     return resolved;

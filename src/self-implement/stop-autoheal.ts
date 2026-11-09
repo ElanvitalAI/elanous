@@ -41,6 +41,7 @@ export type AutohealMode = 'shadow' | 'live';
 export const DEFAULT_AUTOHEAL_MODE: AutohealMode = 'shadow';
 
 export type AutohealAction =
+  | 'attempt-repair'
   | 'clean-workspace-regate'
   | 'rebase-regate'
   | 'resume-from-salvage'
@@ -80,6 +81,7 @@ export const AUTOHEAL_ACTION_BY_CLASS: Readonly<Record<RunStopClass, AutohealAct
 
 /** 처방 노드 id 로 인정하는 이름 — 오버레이가 더한 노드 중 이 넷만 처방으로 읽는다. */
 const HEAL_ACTION_NODE_IDS: ReadonlySet<string> = new Set<Exclude<AutohealAction, 'needs-owner'>>([
+  'attempt-repair',
   'clean-workspace-regate', 'rebase-regate', 'resume-from-salvage', 'derive-evidence-rejudge', 'review-round-reauthor',
   'reauthor-from-materialized', 'switch-provider', 'retry-provider', 'wait-release', 'remeasure-gate',
 ]);
@@ -111,7 +113,11 @@ function loadDefaultLadder(): AutohealLadder {
  * ⛔ 오버레이가 없거나 · 조건 키가 없거나 · 로드·적용이 실패하거나 · 처방 노드가 정확히 하나가 아니면
  *    «조용히» 코드 표로 간다 — 그 사실은 `source` 가 말한다. 던지지 않는다.
  */
-export function pickAutohealAction(cls: RunStopClass, loadLadder: () => AutohealLadder = loadDefaultLadder): AutohealPick {
+export function pickAutohealActionForState(
+  cls: RunStopClass,
+  state: Readonly<Record<string, unknown>>,
+  loadLadder: () => AutohealLadder = loadDefaultLadder,
+): AutohealPick {
   const codeDefault: AutohealPick = {
     action: AUTOHEAL_ACTION_BY_CLASS[cls] ?? 'needs-owner', source: 'code-default',
     ...(cls === 'review-budget-exhausted' ? { fallbackReason: 'declared-node-unavailable: review-round-reauthor' } : {}),
@@ -119,7 +125,7 @@ export function pickAutohealAction(cls: RunStopClass, loadLadder: () => Autoheal
   try {
     const { template, overlays } = loadLadder();
     if (!template) return codeDefault;
-    const { applied } = selectOverlays(overlays, { graphId: template.graphId, stage: 'heal', state: { stop_class: cls } });
+    const { applied } = selectOverlays(overlays, { graphId: template.graphId, stage: 'heal', state });
     const declared = new Set(template.nodes.map((node) => node.nodeId));
     for (const overlay of applied) {
       const result = applyGraphOverlays(template, [overlay]);
@@ -134,6 +140,10 @@ export function pickAutohealAction(cls: RunStopClass, loadLadder: () => Autoheal
     observe('ladder-unreadable', { stopClass: cls, error: error instanceof Error ? error.message : String(error) });
   }
   return codeDefault;
+}
+
+export function pickAutohealAction(cls: RunStopClass, loadLadder: () => AutohealLadder = loadDefaultLadder): AutohealPick {
+  return pickAutohealActionForState(cls, { stop_class: cls }, loadLadder);
 }
 
 /** 설정 원값 → 모드. 모르는 값은 «좁은 쪽»(shadow). */

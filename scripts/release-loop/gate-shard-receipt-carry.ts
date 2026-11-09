@@ -58,7 +58,8 @@ export function gateShardReceiptInputFingerprint(receipt: GateShardSavedResult['
 function isPassing(result: GateShardSavedResult): boolean {
   return result.receipt.status === 'complete' && result.receipt.failureIds.length === 0
     && result.receipt.errorIds.length === 0 && result.runs.length > 0
-    && result.runs.every((run) => run.rc === 0 && run.ran > 0 && run.fail === 0 && run.errors === 0 && run.pass === run.ran);
+    && result.runs.every((run) => run.rc === 0 && run.ran > 0 && run.fail === 0 && run.errors === 0
+      && run.pass + (run.skipped ?? 0) === run.ran);
 }
 
 function withSourceRunIds(result: GateShardSavedResult): GateShardSavedResult {

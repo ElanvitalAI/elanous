@@ -6,14 +6,15 @@
 //   자기 이름(`elanous`)으로 신고한 agent 는 list·get·wait·read·알림은 되지만 prompt 는
 //   `agent_not_ready: … is not an active named agent` 로 늘 거부된다.
 // 그래서 같은 의미를 여기서 낸다:
-//   ① `herdr agent get` — 신고 라벨이 elanous 이고 idle/done 인지(blocked/working/unknown 은 입력 0 으로 거부)
+//   ① 직접 CLI 는 `herdr agent get` 으로 신고 라벨·상태를 확인한다. 저장 우편 깨움은 `herdr pane list` 의
+//      구조 행에서 지원 agent(claude/codex/elanous)·정확한 pane id·idle 을 확인한다(unknown/working/done 은 입력 0).
 //   ② `herdr pane run <pane> <문장>` — agent prompt 와 «같은 바이트»: herdr 의 `pane run` 은 pane 의 bracketed-paste
 //      모드를 따라 `ESC[200~문장ESC[201~` ⊕ Enter 를 한 번에 쓴다(격리 세션 실측 · `pane send-text` 는 날 바이트라 쓰지 않는다)
 //   ③ --wait — 제출 뒤 활동 창(5000ms) 안에 working/blocked 를 관측해야 하고(아니면 agent_prompt_stalled),
 //      그 뒤 idle/done/blocked 정착까지 기다린다. 호출자 timeout 이 먼저 끝나면 timeout. herdr agent prompt --wait 의미 그대로.
 // 관측: debug.log('pty.herdr', 'prompt', { target, paneId, accepted, reason, status, ms }) 한 줄.
 // 호출자 둘: CLI `eln herdr prompt`(라벨 elanous 만) ⊕ 우편 깨움 `src/loops/msg-wake.ts`(anyAgent · beforeSubmit 으로 재해석·opt-in·마감 관문).
-// 신고 계약(herdr-agent-report.ts)은 건드리지 않는다 — 이 명령은 그 신고(working/idle)를 «읽기만» 한다.
+// 신고 계약(herdr-agent-report.ts)은 건드리지 않는다 — 이 명령은 Herdr 상태를 «읽기만» 한다.
 
 import { spawn } from 'node:child_process';
 
@@ -45,9 +46,10 @@ export interface HerdrPromptOpts {
    * 제출(`pane run`)은 그대로다. CLI(`eln herdr prompt`)는 켜지 않는다 — herdr 내장 kind 는 herdr agent prompt 몫.
    */
   readonly anyAgent?: boolean;
-  /** `agent get` 이 agent_not_found 면 `pane get` 의 agent_status 로 떨어진다(우편 깨움 · #30261 전 경로와 같은 관문).
-   *  10-22 cct 아래 Claude 자리가 agent get 에서 간헐적으로 안 잡혀 깨움 18건이 failed 됐다. */
+  /** Legacy agent-get fallback for callers that explicitly need pane.get metadata. Durable wakes use requirePaneListStatus. */
   readonly paneFallback?: boolean;
+  /** Message wakes trust only an exact pane-list row with a supported agent label and idle status. */
+  readonly requirePaneListStatus?: boolean;
 }
 
 /** 상태 확인을 통과한 대상 — `beforeSubmit` 이 본다. */
@@ -140,6 +142,22 @@ function paneViewOf(r: HerdrCliResult): AgentView | undefined {
   }
 }
 
+/** Message wake eligibility comes from Herdr's structured pane inventory, never rendered text. */
+function paneListViewOf(r: HerdrCliResult, paneId: string): AgentView | undefined {
+  if (herdrError(r)) return undefined;
+  try {
+    const panes = (JSON.parse(r.stdout.trim()) as { result?: { panes?: unknown } }).result?.panes;
+    if (!Array.isArray(panes)) return undefined;
+    const p = panes.find(row => row && typeof row === 'object' && (row as Record<string, unknown>).pane_id === paneId) as Record<string, unknown> | undefined;
+    if (!p || typeof p.agent_status !== 'string') return undefined;
+    return { agent: typeof p.agent === 'string' ? p.agent : '', status: p.agent_status, paneId, seq: 0 };
+  } catch { return undefined; }
+}
+
+function supportedWakeAgent(agent: string): boolean {
+  return ['claude', 'codex', 'elanous', 'grok', 'eln'].includes(agent.trim().toLowerCase());
+}
+
 /** 기본 러너 — HERDR_BIN_PATH(없으면 PATH 의 herdr). HERDR_SOCKET_PATH 등 env 는 그대로 넘긴다. */
 export function defaultHerdrCliRunner(env: NodeJS.ProcessEnv = process.env): HerdrCliRunner {
   const bin = env.HERDR_BIN_PATH?.trim() || 'herdr';
@@ -197,29 +215,55 @@ export async function herdrPrompt(opts: HerdrPromptOpts, deps: HerdrPromptDeps =
 
   if (opts.text.length === 0) return done(false, false, 'empty_agent_prompt', 'prompt text must not be empty');
 
-  // ① 대상 확인
-  const got = await run(['agent', 'get', opts.target], callCap());
-  const getErr = herdrError(got);
-  if (getErr) {
-    if (!(opts.paneFallback && getErr.code === 'agent_not_found')) return done(false, false, getErr.code, getErr.message);
-    const pane = paneViewOf(await run(['pane', 'get', opts.target], callCap()));
-    if (!pane) return done(false, false, getErr.code, getErr.message);
-    log('prompt-pane-fallback', { target: opts.target, paneId: pane.paneId, agent: pane.agent, status: pane.status });
-    view = pane;
-  } else view = agentOf(got);
+  const readPaneList = async (target: string): Promise<AgentView | undefined> => {
+    const workspace = target.includes(':') ? target.split(':', 1)[0] : undefined;
+    const listed = await run(['pane', 'list', ...(workspace ? ['--workspace', workspace] : [])], callCap());
+    return paneListViewOf(listed, target);
+  };
+
+  // ① 대상 확인. Durable message wakes use only Herdr's structured inventory: exact pane,
+  // supported agent label, and idle status. Rendered screen wording is never an input signal.
+  if (opts.requirePaneListStatus) {
+    view = await readPaneList(opts.target);
+    if (!view) return done(false, false, 'agent_unknown', 'pane list did not report the registered pane');
+    if (!supportedWakeAgent(view.agent)) return done(false, false, 'agent_unknown', 'pane list has no supported agent label');
+    if (view.status !== 'idle') {
+      const reason = view.status === 'working' ? 'agent_working' : view.status === 'blocked' ? 'agent_blocked' : 'agent_unknown';
+      return done(false, false, reason, `pane list agent_status ${view.status} is not idle`);
+    }
+  } else {
+    const got = await run(['agent', 'get', opts.target], callCap());
+    const getErr = herdrError(got);
+    if (getErr) {
+      if (!(opts.paneFallback && getErr.code === 'agent_not_found')) return done(false, false, getErr.code, getErr.message);
+      const pane = paneViewOf(await run(['pane', 'get', opts.target], callCap()));
+      if (!pane) return done(false, false, getErr.code, getErr.message);
+      log('prompt-pane-fallback', { target: opts.target, paneId: pane.paneId, agent: pane.agent, status: pane.status });
+      view = pane;
+    } else view = agentOf(got);
+  }
   if (!view) return done(false, false, 'unparseable_agent_get');
   if (!opts.anyAgent && view.agent !== HERDR_PROMPT_AGENT) {
     return done(false, false, 'not_elanous', `agent label ${view.agent || '(none)'} — use herdr agent prompt for herdr-supported agents`);
   }
   if (view.status === 'blocked') return done(false, false, 'agent_blocked', 'agent is blocked and requires interactive input');
   if (view.status === 'working') return done(false, false, 'agent_working', 'agent is working — wait for idle first');
-  if (view.status !== 'idle' && view.status !== 'done') return done(false, false, 'agent_unknown', `agent status ${view.status}`);
-  const seq0 = view.seq;
+  if (!opts.requirePaneListStatus && view.status !== 'idle' && view.status !== 'done') return done(false, false, 'agent_unknown', `agent status ${view.status}`);
+  let seq0 = view.seq;
   const paneId = view.paneId;
+  if (opts.requirePaneListStatus) {
+    const latest = await readPaneList(paneId);
+    if (!latest || latest.paneId !== view.paneId || latest.agent !== view.agent || latest.status !== 'idle') {
+      const reason = latest?.status === 'working' ? 'agent_working' : latest?.status === 'blocked' ? 'agent_blocked' : 'agent_unknown';
+      return done(false, false, reason, 'pane list readiness changed before submission');
+    }
+    view = latest;
+  }
+
+  // ② Submit only after an exact structured idle-pane check.
+  // Revalidate opt-in, address binding, and deadline after all reads, immediately before input.
   const veto = deps.beforeSubmit?.({ agent: view.agent, status: view.status, paneId });
   if (veto !== undefined) return done(false, false, veto);
-
-  // ② 제출 — agent prompt 와 같은 bracketed text ⊕ Enter 한 번
   const sent = await run(['pane', 'run', paneId, opts.text], callCap());
   const sendErr = herdrError(sent);
   if (sendErr) return done(false, false, sendErr.code, sendErr.message);

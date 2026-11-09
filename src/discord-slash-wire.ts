@@ -15,7 +15,7 @@
 // 보안: 인터랙션은 DiscordBot의 메시지 게이트(allowlist·채널스코프)를
 // 우회해 도착하므로 여기서 allowlist를 직접 강제한다.
 
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import { SLASH_COMMANDS } from './chat/index.js';
 import type { DiscordBot, DcIncoming, DcMessageStreamer } from './discord.js';
 import { makeCommandRest } from './discord/slash-registry.js';

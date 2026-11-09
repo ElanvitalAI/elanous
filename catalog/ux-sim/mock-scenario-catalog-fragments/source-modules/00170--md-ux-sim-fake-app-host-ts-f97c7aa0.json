@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-FAKE-APP-HOST-TS",
+  "path": "src/ux-sim/fake-app-host.ts",
+  "boundary": "Serves declared in-memory app versions through the simulated app-host fetch boundary, including deploy, rollback, content type and content digest behavior.",
+  "deviceIds": [
+    "sim-universe-world-yaml-schema",
+    "world-runtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

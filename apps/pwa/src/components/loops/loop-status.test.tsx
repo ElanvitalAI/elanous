@@ -1,12 +1,5 @@
 import { expect, test } from 'bun:test';
-import { renderToStaticMarkup } from 'react-dom/server';
-import { LoopStatusContent, LoopStatusPanel } from './LoopStatusPanel';
-import { Suspense } from 'react';
-import LoopsPage from '@/app/loops/page';
-import { LoopsView } from './LoopsView';
 import { createLoopRowsRefresh, loadLoopRows, loopRows, LOOP_SCHEDULES_PATH, LOOPS_PATH, type LoopSchedule } from './loop-status';
-import { routeMaturity } from '@/lib/route-maturity';
-import { SIDEBAR_NAV_ITEMS } from '@/components/shell/sidebar-nav-items';
 
 const now = Date.parse('2026-10-04T12:00:00.000Z');
 const job = (patch: Partial<LoopSchedule> = {}): LoopSchedule => ({
@@ -19,12 +12,6 @@ test('past twice the interval turns red 늦음, but exactly twice stays alive', 
   const rows = loopRows([job()], now + 1);
   expect(rows[0]?.verdict).toBe('늦음');
   expect(loopRows([job()], now)[0]?.verdict).toBe('살아 있음');
-  const html = renderToStaticMarkup(<LoopStatusContent rows={rows} state="ready" />);
-  expect(html).toContain('data-loop-verdict="늦음"');
-  expect(html).toContain('bg-red-500/15 text-red-300');
-  expect(html).toContain('md:table');
-  expect(html).toContain('md:hidden');
-  for (const header of ['루프 · 층', '주인(자리)', '모드', '마지막 실행 시각', '판정']) expect(html).toContain(header);
 });
 
 // 리뷰 must-fix(GOODHART): 데몬 stale 은 크론에만 — 크론 없는 일정은 stale 이어도 «2× 간격» 규칙으로(#23684 판정 복원).
@@ -43,7 +30,6 @@ test('shared verdict classifies cron without fixed cadence, failed/off and unkno
   expect(rows.map((row) => row.owner)).toEqual(Array(8).fill('미지정'));
   expect(rows[3]?.layer).toBe('crontab');
   expect(rows[3]?.lastRun).toBeNull();
-  expect(renderToStaticMarkup(<LoopStatusContent rows={rows} state="ready" />)).toContain('data-loop-verdict="판정 불가"');
 });
 
 test('reads existing schedule and recorded-loop GETs with injected transport, including off entries', async () => {
@@ -107,30 +93,6 @@ test('overlapping refreshes apply only the newest request including errors and d
   expect(results).toHaveLength(2);
 });
 
-test('operational beta page is reachable from the operations navigation and mounts the status panel', () => {
-  expect(routeMaturity('/loops')).toBe('beta');
-  expect(SIDEBAR_NAV_ITEMS.find((item) => item.href === '/loops')).toMatchObject({ group: 'ops', label: '루프 현황' });
-  // 정적 export — 보기 갈래(`?view=`)는 Suspense 안 클라이언트에서 읽고, 기본 보기가 이 패널이다(LoopsView.test).
-  const page = LoopsPage();
-  expect(page.type).toBe(Suspense);
-  expect(page.props.children.type).toBe(LoopsView);
-});
-
-test('빈 루프 화면은 쉬운말 풀이 한 줄을 보인다', () => {
-  const empty = renderToStaticMarkup(<LoopStatusContent rows={[]} state="ready" />);
-  expect(empty).toContain('등록된 루프·크론이 없습니다.');
-  expect(empty).toContain('data-plain-lead="loop"');
-  expect(empty).toContain('당번');
-  expect(renderToStaticMarkup(<LoopStatusContent rows={[loopRows([job()], now)[0]!]} state="ready" />)).not.toContain('data-plain-lead');
-});
-
-test('no registry entries and fetch failure are not shown as healthy', () => {
-  expect(renderToStaticMarkup(<LoopStatusContent rows={[]} state="ready" />)).toContain('등록된 루프·크론이 없습니다');
-  const failed = renderToStaticMarkup(<LoopStatusContent rows={[]} state="error" />);
-  expect(failed).toContain('일부 레지스트리 조회가 실패했습니다');
-  expect(failed).not.toContain('등록된 루프·크론이 없습니다');
-});
-
 test('cron schedules follow daemon live or stale state without inferring fixed cadence from next runs', () => {
   const at = Date.parse('2026-10-05T08:00:00.000Z');
   const daily = job({ id: 'morning', cron: '*/10 9 * * *', intervalMs: null, state: 'live',
@@ -166,5 +128,4 @@ test('injected registries use shared verdict precedence and preserve display met
     ['loop:unjudged-loop', '판정 불가'], ['loop:off-loop', '꺼짐'],
   ]);
   expect(rows[7]).toMatchObject({ layer: 'reflect', owner: '미지정', mode: 'armed', lastRun: '2026-10-04T11:59:00.000Z' });
-  expect(renderToStaticMarkup(<LoopStatusContent rows={rows} state="ready" />)).toContain('data-loop-verdict="판정 불가"');
 });

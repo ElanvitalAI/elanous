@@ -32,7 +32,7 @@ import { readPresence } from '../../away/presence.js';
 import { debug } from '../../debug/log.js';
 import { sendTelegramReport } from '../../telegram-report.js';
 import { getPushcutClient } from '../../pushcut/client.js';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 import { formatForChannel, type OutboundChannelType, type OutboundMsg } from './format.js';
 import { spillLongContent } from '../../storage/content-spill.js';
 import {

@@ -1,7 +1,8 @@
 'use client';
 
 import { usePathname } from 'next/navigation';
-import { RouteGuidanceList } from '@/components/welcome/WelcomeHome';
+import Link from 'next/link';
+import { SIDEBAR_NAV_ITEMS } from '@/components/shell/sidebar-nav-items';
 
 export default function NotFound() {
   const pathname = usePathname();
@@ -13,11 +14,15 @@ export default function NotFound() {
         <header className="flex flex-col gap-3">
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">elanous PWA</p>
           <h1 className="text-3xl font-bold leading-tight sm:text-4xl">여기엔 없습니다</h1>
-          <p className="text-sm text-muted-foreground">
-            <code>{missingPath}</code> 주소는 이 앱에 없습니다. 아래에서 지금 갈 수 있는 곳을 선택하거나 참고 주소의 사유를 확인하세요.
-          </p>
+          <p className="text-sm text-muted-foreground"><code>{missingPath}</code> 주소는 이 앱에 없습니다. 갈 수 있는 화면을 선택하세요.</p>
         </header>
-        <RouteGuidanceList ariaLabel="이동 가능한 주소와 참고 주소" />
+        <nav aria-label="이동 가능한 화면">
+          <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {SIDEBAR_NAV_ITEMS.map(({ href, label }) => <li key={href}>
+              <Link href={href} className="block rounded-lg border border-border bg-card p-4 font-medium hover:border-primary">{label}</Link>
+            </li>)}
+          </ul>
+        </nav>
       </div>
     </main>
   );

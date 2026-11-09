@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TOOL-ASYNC-FAIL-LOOP-TS",
+  "path": "src/ux-sim/tool-async-fail-loop.ts",
+  "boundary": "Replays the declared SelfImplement retry incident through the production model tool loop and daemon adapter, with scenario state isolated in a temporary repository.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

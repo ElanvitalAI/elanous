@@ -194,6 +194,8 @@ describe('checkReadiness', () => {
       pathEntries: ['/usr/bin', '/home/user/.local/bin'],
     }, 'install-path');
     expect(item.status).toBe('fixable');
+    expect(item.evidence).toContain('in this shell');
+    expect(item.evidence).toContain('open a new shell');
     expect(item.remedy).toBe(`export PATH='/home/user/.local/share/elanous/bin':\"$PATH\"`);
   });
 
@@ -374,7 +376,9 @@ describe('checkReadiness', () => {
     const by = (d: Parameters<typeof checkReadiness>[0]) => checkReadiness(d).items.find((entry) => entry.id === 'bun-tmpdir')!;
     const split = by({ platform: 'linux', tmpdirSameFsAsBunCache: false });
     expect(split.status).toBe('fixable');
-    expect(split.remedy).toContain('export TMPDIR=~/tmp-bun');
+    expect(split.remedy).toContain('export TMPDIR=');
+    expect(split.remedy).toContain('BUN_INSTALL_CACHE_DIR');
+    expect(split.remedy).toContain('re-run the installer');
     expect(by({ platform: 'linux', tmpdirSameFsAsBunCache: true }).status).toBe('ok');
     expect(by({ platform: 'linux', tmpdirSameFsAsBunCache: null }).status).toBe('unknown');
     expect(by({ platform: 'linux' }).status).toBe('unknown');

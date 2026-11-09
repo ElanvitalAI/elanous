@@ -6,11 +6,13 @@ import {
   UNATTENDED_INLINE_CHOICE_TIMEOUT_MS,
 } from './inline-resolver.js';
 
-test('unattended inline prompts use only explicit config or the exact seat-launch env value', () => {
-  expect(resolveUnattendedInlineChoiceTimeoutMs({ tui: { unattended: false } }, { ELANOUS_TUI_UNATTENDED: '1' })).toBeUndefined();
-  expect(resolveUnattendedInlineChoiceTimeoutMs({ tui: { unattended: true } }, { ELANOUS_TUI_UNATTENDED: '0' })).toBe(UNATTENDED_INLINE_CHOICE_TIMEOUT_MS);
+test('unattended inline prompts use the exact seat-launch env value, ignoring retired config', () => {
+  expect(resolveUnattendedInlineChoiceTimeoutMs({ tui: { unattended: false } }, { ELANOUS_TUI_UNATTENDED: '1' })).toBe(UNATTENDED_INLINE_CHOICE_TIMEOUT_MS);
+  expect(resolveUnattendedInlineChoiceTimeoutMs({ tui: { unattended: true } }, { ELANOUS_TUI_UNATTENDED: '0' })).toBeUndefined();
   expect(resolveUnattendedInlineChoiceTimeoutMs({}, { ELANOUS_TUI_UNATTENDED: '1' })).toBe(UNATTENDED_INLINE_CHOICE_TIMEOUT_MS);
   expect(resolveUnattendedInlineChoiceTimeoutMs({}, { ELANOUS_TUI_UNATTENDED: 'true' })).toBeUndefined();
+  expect(resolveUnattendedInlineChoiceTimeoutMs({}, {})).toBeUndefined();
+  expect(resolveUnattendedInlineChoiceTimeoutMs({}, { ELANOUS_TUI_UNATTENDED: ' 1' })).toBeUndefined();
 });
 
 test('AskUserQuestion can collect sequential single/multi choices through PTY text without a modal', async () => {

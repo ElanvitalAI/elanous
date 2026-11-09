@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/fake-temp-cleanup.ts",
+  "reason": "TMP-DIR-LEAK: suite-scoped fake temp filesystem verifies test-owned directory cleanup and preservation of unrelated roots."
+}

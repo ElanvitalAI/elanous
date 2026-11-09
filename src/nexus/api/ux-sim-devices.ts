@@ -1,3 +1,4 @@
+import { isRecord } from '../../primitives/guards.js';
 import { loadMockScenarioCatalog } from '../../ux-sim/mock-scenario-catalog.js';
 import { getTestStateRoot } from '../paths.js';
 import { listMockDeviceRequests, MockDeviceRequestInputError, requestMockDevice } from '../../ux-sim/mock-device-requests.js';
@@ -48,10 +49,6 @@ export async function handleUxSimDevices(req: Request): Promise<Response> {
       detail: error instanceof Error ? error.message : String(error),
     }, 500);
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 async function bodyToJson(req: Request): Promise<unknown> {

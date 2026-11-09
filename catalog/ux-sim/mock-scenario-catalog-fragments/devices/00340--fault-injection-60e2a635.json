@@ -1,0 +1,49 @@
+{
+  "id": "fault-injection",
+  "name": "Fault injection devices",
+  "implementation": [
+    "src/ux-sim/fault-cred-expiry.ts",
+    "src/ux-sim/fault-glm-no-credential.ts",
+    "src/ux-sim/fault-needs-human-reason-repair.ts",
+    "src/ux-sim/fault-nextmove-dispatch.ts",
+    "src/ux-sim/fault-pod-child-result.ts",
+    "src/ux-sim/fault-pod-codex-503.ts",
+    "src/ux-sim/fault-pod-death.ts",
+    "src/ux-sim/fault-pool-cap.ts",
+    "src/ux-sim/fault-scope-escape-lift.ts",
+    "src/ux-sim/fault-sqlite-busy.ts",
+    "src/ux-sim/fault-tui-400-autoheal.ts",
+    "src/ux-sim/gate-shard-host-reroute.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fault-cred-expiry.test.ts",
+    "src/ux-sim/fault-glm-no-credential.test.ts",
+    "src/ux-sim/fault-needs-human-reason-repair.test.ts",
+    "src/ux-sim/fault-nextmove-dispatch.test.ts",
+    "src/ux-sim/fault-pod-child-result.test.ts",
+    "src/ux-sim/fault-pod-codex-503.test.ts",
+    "src/ux-sim/fault-pod-death.test.ts",
+    "src/ux-sim/fault-pool-cap.test.ts",
+    "src/ux-sim/fault-scope-escape-lift.test.ts",
+    "src/ux-sim/fault-sqlite-busy.test.ts",
+    "src/ux-sim/fault-tui-400-autoheal.test.ts",
+    "src/ux-sim/gate-shard-host-reroute.test.ts"
+  ],
+  "target": "credential, Pod, pool, routing, autoheal, scope and persistence failure boundaries",
+  "inputs": [
+    "explicit fault kind",
+    "isolated fixture",
+    "clock or resource outcome"
+  ],
+  "observations": [
+    "production decision function output",
+    "reason/event",
+    "recovery or refusal"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fault-cred-expiry.test.ts src/ux-sim/fault-glm-no-credential.test.ts src/ux-sim/fault-needs-human-reason-repair.test.ts src/ux-sim/fault-nextmove-dispatch.test.ts src/ux-sim/fault-pod-child-result.test.ts src/ux-sim/fault-pod-codex-503.test.ts src/ux-sim/fault-pod-death.test.ts src/ux-sim/fault-pool-cap.test.ts src/ux-sim/fault-scope-escape-lift.test.ts src/ux-sim/fault-sqlite-busy.test.ts src/ux-sim/fault-tui-400-autoheal.test.ts src/ux-sim/gate-shard-host-reroute.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

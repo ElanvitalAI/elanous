@@ -514,7 +514,7 @@ export interface GoalAuthorGroundingDeps {
 /** Compact prompt view of the canonical catalog; detailed run evidence stays in the catalog itself. */
 export function renderGoalAuthorMockScenarioCatalog(catalog: MockScenarioCatalog = loadMockScenarioCatalog()): string {
   return [
-    'Reusable mock devices (src/ux-sim/mock-scenario-catalog.json):',
+    'Reusable mock devices (catalog/ux-sim/mock-scenario-catalog-fragments/):',
     ...catalog.devices.map((device) => `- ${device.id} (${device.name}): target=${device.target}; inputs=${device.inputs.join(', ')}; observes=${device.observations.join(', ')}; entry=${device.entryCommands.join(' | ')}`),
     'Reusable event-injection scenarios:',
     ...catalog.scenarios.map((scenario) => `- ${scenario.id} (${scenario.kind}, device=${scenario.device}): trigger=${scenario.trigger}; observe=${scenario.observe.join(', ')}; expected=${scenario.expected}`),
@@ -6616,7 +6616,7 @@ async function authorGoalWithSupersededRootIntent(
     try {
       observeGoalAuthor('goal-author', 'mock-scenario-catalog-injected', {
         authorRunId,
-        source: 'src/ux-sim/mock-scenario-catalog.json',
+        source: 'catalog/ux-sim/mock-scenario-catalog-fragments/',
         availableConsumers: ['ground', 'enhance', 'reviewer-precheck'],
         contextChars: deps.mockScenarioCatalog.length,
       });

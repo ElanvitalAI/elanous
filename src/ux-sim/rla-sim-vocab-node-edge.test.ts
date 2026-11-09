@@ -7,6 +7,7 @@ import { readGraphContext } from '../../scripts/release-loop/node-verdict.js';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { createGraphEventBus } from '../graph-runner/graph-events.js';
 import { listGraphRuns, runGraph } from '../graph-runner/runner.js';
+import { createIncidentPolicyHandler } from '../release-loop/incident-policy-handler.js';
 
 interface IncidentCase {
   id: string;
@@ -15,7 +16,6 @@ interface IncidentCase {
   nodeId: string;
   rationale: string;
 }
-
 test('release graph learns incident vocabulary and appends a node and live edge for each simulated event', async () => {
   const scenarioPath = join(import.meta.dir, 'scenarios/rla-sim-vocab-node-edge.yaml');
   const scenario = parseYaml(readFileSync(scenarioPath, 'utf8')) as {
@@ -32,8 +32,8 @@ test('release graph learns incident vocabulary and appends a node and live edge 
   };
   const gateTriage = graphDocument.nodes.find((node) => node.node_id === 'gate-triage');
   if (!gateTriage) throw new Error('production release graph is missing gate-triage');
-  gateTriage.subscribes = scenario.cases.map(({ eventType }) => ({ event: eventType,
-    match: { nodeId: 'gate' }, action: 'reroute' }));
+  expect(gateTriage.subscribes).toEqual(scenario.cases.map(({ eventType }) => ({ event: eventType,
+    match: { nodeId: 'gate' }, action: 'reroute' })));
   graphDocument.entry_node = 'gate';
 
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'rla-sim-vocab-node-edge-'));
@@ -41,11 +41,14 @@ test('release graph learns incident vocabulary and appends a node and live edge 
   setTestStateRoot(root);
   try {
     for (const item of scenario.cases) {
-      const execute = async (proposeLiveEdge: boolean) => {
-        const runId = `rla-sim-vocab-${item.id}-${proposeLiveEdge ? 'live-edge' : 'no-edge'}`;
+      const execute = async () => {
+        const runId = `rla-sim-vocab-${item.id}-live-edge`;
         const bus = createGraphEventBus();
-        const edgeResults: string[] = [];
-        const appendResults: Array<{ disposition: string; nodeId?: string; reason?: string }> = [];
+        const incidentPolicy = createIncidentPolicyHandler(async (dispatch) => ({
+          vocabularyLine: dispatch.event.type,
+          repairSummary: item.description,
+          rationale: item.rationale,
+        }));
         const state = await runGraph(releaseGraphPath, {
           graphSource: stringifyYaml(graphDocument), runId,
           input: scenario.input, pinChildUniverse: true, quiet: true, eventBus: bus,
@@ -66,23 +69,9 @@ test('release graph learns incident vocabulary and appends a node and live edge 
               expect(dispatch.nodeId).toBe('gate-triage');
               expect(dispatch.action).toBe('reroute');
               expect(dispatch.event.source.nodeId).toBe('gate');
-              // The dispatcher is the deterministic simulated agent output. The runner still
-              // owns event matching, reroute validation, persistence, append execution, and routing.
-              dispatch.eventVocabulary.registerType(item.eventType);
-              if (!dispatch.proposeEdge || !dispatch.appendGraph) throw new Error('release incident subscription ports are unavailable');
-              const append = await dispatch.appendGraph({
-                nodes: [{ nodeId: item.nodeId, kind: 'agent', recipe: 'cmd:gate-repair', maxVisits: 1 }],
-                edges: [{ from: item.nodeId, on: 'outcome', map: { ok: 'done', fail: 'failed', error: 'failed' } }],
-                entryNodeId: item.nodeId, returnTo: 'done', failureTo: 'failed', reason: item.rationale,
-              });
-              appendResults.push({ disposition: append.disposition,
-                ...('nodeId' in append ? { nodeId: append.nodeId } : {}),
-                ...('reason' in append ? { reason: append.reason } : {}) });
-              if (proposeLiveEdge) {
-                const edge = await dispatch.proposeEdge({ from: 'gate', to: 'gate-triage', triggerEvent: item.eventType,
-                  rationale: item.rationale, mode: 'live' });
-                edgeResults.push(edge.disposition);
-              }
+              // A deterministic simulated agent proposal is passed through the production policy handler;
+              // runner still owns validation, persistence, append execution, and routing.
+              await incidentPolicy(dispatch);
             },
           },
         });
@@ -94,36 +83,22 @@ test('release graph learns incident vocabulary and appends a node and live edge 
           path: state.path,
         });
         expect(persisted?.adaptiveGraphEdges ?? []).toEqual(state.adaptiveGraphEdges ?? []);
-        return { state, edgeResults, appendResults };
+        return state;
       };
 
-      if (item.id === scenario.cases[0]?.id) {
-        const control = await execute(false);
-        expect(control.state.status).toBe('done');
-        expect(control.state.path).not.toContain('gate-triage');
-        expect(control.state.path).toContain(item.nodeId);
-        expect(control.state.adaptiveGraphVocabulary).toContain(item.eventType);
-        expect(control.state.subscriptionGraphAppends).toEqual(expect.arrayContaining([
-          expect.objectContaining({ proposal: expect.objectContaining({ entryNodeId: item.nodeId }) }),
-        ]));
-        expect(control.state.adaptiveGraphEdges ?? []).toHaveLength(0);
-        expect(control.state.subscriptionActions).toEqual(expect.arrayContaining([
-          expect.objectContaining({ nodeId: 'gate-triage', action: 'reroute', outcome: 'rejected' }),
-        ]));
-      }
-
-      const { state, edgeResults, appendResults } = await execute(true);
+      const state = await execute();
 
       expect(state.status).toBe('done');
-      expect(appendResults).toEqual([{ disposition: 'appended', nodeId: item.nodeId }]);
-      expect(edgeResults).toEqual(['added']);
       expect(state.adaptiveGraphVocabulary).toContain(item.eventType);
       expect(state.adaptiveGraphEdges).toEqual([expect.objectContaining({ from: 'gate', to: 'gate-triage',
         triggerEvent: item.eventType, rationale: item.rationale })]);
+      const appendedNodeId = state.subscriptionGraphAppends?.[0]?.proposal.entryNodeId;
+      if (!appendedNodeId) throw new Error('incident policy did not persist its repair node');
+      expect(appendedNodeId).toMatch(/^gate-repair-[a-f0-9]{12}$/);
       expect(state.subscriptionGraphAppends).toEqual([expect.objectContaining({ proposal: expect.objectContaining({
-        entryNodeId: item.nodeId, reason: item.rationale, nodes: [expect.objectContaining({ nodeId: item.nodeId })],
+        entryNodeId: appendedNodeId, reason: expect.stringContaining(item.rationale), nodes: [expect.objectContaining({ nodeId: appendedNodeId })],
       }) })]);
-      expect(state.path).toEqual(['gate', 'gate-triage', item.nodeId, 'done']);
+      expect(state.path).toEqual(['gate', 'gate-triage', appendedNodeId, 'done']);
       expect(state.subscriptionActions).toEqual(expect.arrayContaining([
         expect.objectContaining({ nodeId: 'gate-triage', action: 'reroute', outcome: 'handled' }),
       ]));

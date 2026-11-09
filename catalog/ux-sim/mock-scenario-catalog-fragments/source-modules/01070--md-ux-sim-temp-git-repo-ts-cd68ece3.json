@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TEMP-GIT-REPO-TS",
+  "path": "src/ux-sim/temp-git-repo.ts",
+  "boundary": "Throwaway Git repositories with real commits for simulation tests that need history (simulation boundary).",
+  "deviceIds": [
+    "temp-git-repo"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

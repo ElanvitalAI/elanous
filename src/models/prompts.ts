@@ -117,7 +117,7 @@ export function usesCodexBehaviorGuards(modelId: string | undefined): boolean {
 //     prefix, plus community MLX/GGUF models (gemma/llama/qwen on
 //     localhost).
 
-import type { LLMProviderName } from '../user-config.js';
+import type { LLMProviderName } from '../user-config/types.js';
 import type { SkillTier } from '../skills/skill-tier.js';
 import { LLM_TIER_MAP_BY_PROVIDER, TIER_PROVIDERS } from '../model-tier/llm-tier-map.js';
 

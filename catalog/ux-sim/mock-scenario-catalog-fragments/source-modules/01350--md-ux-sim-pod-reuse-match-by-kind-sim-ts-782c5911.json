@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-POD-REUSE-MATCH-BY-KIND-SIM-TS",
+  "path": "src/ux-sim/pod-reuse-match-by-kind-sim.ts",
+  "boundary": "Runs the production kind-aware Pod candidate scorer and runtime-contract predicate against deterministic fixtures without cluster or network access.",
+  "deviceIds": [
+    "pod-reuse-match-by-kind-sim"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

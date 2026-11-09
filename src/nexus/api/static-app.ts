@@ -8,8 +8,7 @@
 //   1. exact file (`/app/foo.css` → `<root>/foo.css`)
 //   2. directory index (`/app/chat/` → `<root>/chat/index.html`) —
 //      Next.js export trailingSlash 페이지 호환
-//   3. SPA fallback (`/app/anything-unknown` → `<root>/index.html`) —
-//      hash-routed deep link 도 hydrate 가능
+//   3. exported 404 page (`/app/anything-unknown` → `<root>/404.html`)
 //
 // Path traversal: resolve() + prefix 비교로 차단.
 // gzip/cache header / CDN 통합 = ROADMAP §9.7 (v2 개선).
@@ -40,8 +39,8 @@ const MIME_BY_EXT: Record<string, string> = {
   '.map': 'application/json',
 };
 
-function notFound(): Response {
-  return new Response(JSON.stringify({ error: 'not-found' }), {
+function notFound(body = JSON.stringify({ error: 'not-found' })): Response {
+  return new Response(body, {
     status: 404,
     headers: { 'content-type': 'application/json' },
   });
@@ -73,9 +72,11 @@ export function handleStaticAppRequest(
     if (existsSync(dirIndex)) filePath = dirIndex;
   }
   if (!existsSync(filePath) || !statSync(filePath).isFile()) {
-    // SPA fallback.
-    filePath = joinPath(root, 'index.html');
-    if (!existsSync(filePath)) return notFound();
+    const notFoundPath = joinPath(root, '404.html');
+    if (!existsSync(notFoundPath) || !statSync(notFoundPath).isFile()) return notFound();
+    return new Response(readFileSync(notFoundPath), {
+      status: 404, headers: { 'content-type': MIME_BY_EXT['.html'] },
+    });
   }
   const buf = readFileSync(filePath);
   const ext = extname(filePath).toLowerCase();

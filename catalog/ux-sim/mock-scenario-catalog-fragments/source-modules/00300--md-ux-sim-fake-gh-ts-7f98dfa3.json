@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-GH-TS",
+  "path": "src/ux-sim/fake-gh.ts",
+  "boundary": "fake gh: GitHub data at the CLI boundary; sweep decisions remain in the production callers.",
+  "deviceIds": [
+    "fake-github"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

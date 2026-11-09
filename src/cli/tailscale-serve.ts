@@ -48,7 +48,7 @@ export interface TailscaleServeOpts {
    *  public-facing port (mode.port == upstreamPort by convention).
    *  For `https-443` this is the only varying field per host. */
   upstreamPort: number;
-  /** Path component of the surfaced URL (default `/app/showroom/`). */
+  /** Path component of the surfaced URL (default `/app/`). */
   urlPath?: string;
   /** Mutation privilege policy: by default try without sudo, then retry
    *  once with `sudo -n` only on a permission error. `true` uses sudo
@@ -139,7 +139,7 @@ export interface CleanGhostTailscaleServeResult {
 }
 
 const STATE_FILE_VERSION = 1;
-const DEFAULT_URL_PATH = '/app/showroom/';
+const DEFAULT_URL_PATH = '/app/';
 const SUDO_PROMPT_HINT =
   'Tailscale Serve mutation needs sudo. Cached credentials are missing or expired.\n' +
   '  Run once interactively, then retry:\n' +

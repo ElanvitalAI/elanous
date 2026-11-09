@@ -1,0 +1,34 @@
+{
+  "id": "fake-google-drive-world",
+  "name": "Fake Google Drive metadata-only files.list world",
+  "checklistCells": [
+    "APP-OAUTH-ONE"
+  ],
+  "implementation": [
+    "src/ux-sim/fake-google-drive-world.ts",
+    "src/ux-sim/fake-google-oauth.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-google-drive-world.test.ts"
+  ],
+  "target": "Drive files.list pagination and metadata scope against an in-memory, network-free read-only world",
+  "inputs": [
+    "synthetic file metadata",
+    "granted OAuth scopes",
+    "pageSize and opaque pageToken",
+    "Bearer token and HTTP method"
+  ],
+  "observations": [
+    "only id/name/mimeType/modifiedTime metadata is returned",
+    "readonly scope is required",
+    "write methods are rejected without mutation",
+    "unknown hosts and endpoints fail closed",
+    "captured requests never retain bearer values"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-google-drive-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

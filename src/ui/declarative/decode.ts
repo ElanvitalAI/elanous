@@ -1,3 +1,4 @@
+import { isObject } from '../../primitives/guards.js';
 // ── Presentation P3 · decodeWidgetTree (JSON/YAML → WidgetSpec[]) ──
 //
 // Accepts a declarative tree and produces a flat list of WidgetSpec
@@ -86,10 +87,6 @@ type RawRoot =
   | { layout?: unknown; widgets?: unknown }
   | RawNode[]
   | RawNode;
-
-function isObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === 'object' && !Array.isArray(v);
-}
 
 /** Normalize the root-level shape into a flat node array · empty array
  *  when the shape is unrecognizable. */

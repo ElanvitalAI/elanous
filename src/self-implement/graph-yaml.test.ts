@@ -127,8 +127,8 @@ edges:
     expect(parsed.errors).toEqual([]);
     expect(parsed.template?.edges.filter((edge) => edge.branches).map((edge) => ({ from: edge.from, branches: edge.branches, join: edge.join })))
       .toEqual([
-        { from: 'export-check', branches: { ok: ['checklist-gate', 'prefetch'] }, join: 'pre-gate-join' },
-        { from: 'traffic-gate-passed', branches: { ok: ['mac-smoke', 'pwa'], fail: ['mac-smoke', 'pwa'], error: ['mac-smoke', 'pwa'] }, join: 'pre-prepare-join' },
+        { from: 'cutoff', branches: { ok: ['checklist-gate', 'prefetch'] }, join: 'pre-gate-join' },
+        { from: 'traffic-gate-passed', branches: { ok: ['export-check', 'mac-smoke', 'pwa'], fail: ['export-check', 'mac-smoke', 'pwa'], error: ['export-check', 'mac-smoke', 'pwa'] }, join: 'pre-prepare-join' },
         { from: 'traffic-npm-published', branches: { ok: ['docs-land', 'version-dev-bump'], fail: ['docs-land', 'version-dev-bump'], error: ['docs-land', 'version-dev-bump'] }, join: 'release-post-publish-join' },
       ]);
   });

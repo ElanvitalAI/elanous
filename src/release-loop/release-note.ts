@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -37,10 +38,6 @@ export interface PublicReleaseFacts {
   version: string;
   facts: PublicReleaseFact[];
   problems: string[];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
 function validReleaseFactEvidence(value: unknown): value is ReleaseFactEvidence {

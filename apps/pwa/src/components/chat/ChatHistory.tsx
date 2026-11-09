@@ -18,8 +18,6 @@ import {
 interface Props {
   messages: ChatMessage[];
   pending: boolean;
-  /** BACKLOG #3 — workspace tab id for scroll-position snapshot. */
-  tabId?: string;
   mobileSimple?: boolean;
 }
 
@@ -29,10 +27,10 @@ const SCROLL_PERSIST_DEBOUNCE_MS = 250;
  *  📏 실측 2026-08-21: 컴포저 83px · 스크롤러 paddingBottom «0px» ⇒ 마지막 줄이 입력창에 붙었다. */
 const COMPOSER_CLEARANCE = 'pb-24';
 
-export function ChatHistory({ messages, pending, tabId, mobileSimple = false }: Props) {
+export function ChatHistory({ messages, pending, mobileSimple = false }: Props) {
   const endRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
-  const persistKey = snapshotKey('chatScroll', tabId);
+  const persistKey = snapshotKey('chatScroll');
 
   // BACKLOG #3 — restore the persisted scrollTop on first mount so an
   // LRU-frozen tab returns to the same vertical position the user left
@@ -245,17 +243,9 @@ export function ChatHistory({ messages, pending, tabId, mobileSimple = false }: 
       <ScrollArea className="h-full">
         <div className={`flex flex-col gap-1 pt-2 ${COMPOSER_CLEARANCE}`}>
           {messages.map((m) => (
-            <ChatMessageView key={m.id} message={m} mobileSimple={mobileSimple} />
+            <ChatMessageView key={m.id} message={m} mobileSimple={mobileSimple} minimal />
           ))}
           {!mobileSimple && <ChatPendingDecision />}
-          {pending && (
-            <div className="flex justify-start px-4 py-3">
-              <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm text-muted-foreground">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
-                thinking…
-              </div>
-            </div>
-          )}
           <div ref={endRef} />
         </div>
       </ScrollArea>

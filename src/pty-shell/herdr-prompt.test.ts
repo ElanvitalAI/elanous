@@ -4,7 +4,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { createFakeHerdr, type FakeHerdr } from '../ux-sim/fake-herdr.js';
-import { herdrPrompt, HERDR_PROMPT_ACTIVITY_WINDOW_MS } from './herdr-prompt.js';
+import { herdrPrompt, HERDR_PROMPT_ACTIVITY_WINDOW_MS, type HerdrCliRunner } from './herdr-prompt.js';
 
 function tuiTurn(herdr: FakeHerdr, paneId: string, turnMs = 15): void {
   // 실제 TUI 처럼: 입력을 받으면 working 신고 → 턴이 끝나면 idle 신고.
@@ -154,6 +154,7 @@ describe('paneFallback — agent get 이 agent_not_found 면 pane get agent_stat
       if (argv[0] === 'pane' && argv[1] === 'get') return paneStatus === null
         ? { code: 1, stdout: '', stderr: `${JSON.stringify({ error: { code: 'pane_not_found', message: 'no pane' }, id: 'cli:pane:get' })}\n` }
         : { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: 'wK:p5', agent: 'claude', agent_status: paneStatus } } }), stderr: '' };
+      if (argv[0] === 'pane' && argv[1] === 'read') return { code: 0, stdout: '❯ \n', stderr: '' };
       if (argv[0] === 'pane' && argv[1] === 'run') return { code: 0, stdout: '{}', stderr: '' };
       return { code: 1, stdout: '', stderr: 'unexpected' };
     };
@@ -179,5 +180,67 @@ describe('paneFallback — agent get 이 agent_not_found 면 pane get agent_stat
     expect(await herdrPrompt({ target: 'wK:p5', text: 'hi', anyAgent: true, paneFallback: true }, { run: busy.run, log: () => {} }))
       .toMatchObject({ accepted: false, reason: 'agent_working' });
     expect(busy.calls).not.toContain('pane run');
+  });
+});
+
+describe('message wake pane-list guard — 구조 상태로만 입력 자격을 판정한다', () => {
+  type Row = { agent: string; agent_status: string; pane_id: string };
+  const runner = (rows: Row[] | Row[][]): { run: HerdrCliRunner; calls: string[][] } => {
+    const calls: string[][] = [];
+    let lists = 0;
+    const snapshots = Array.isArray(rows[0]) ? rows as Row[][] : [rows as Row[]];
+    const run: HerdrCliRunner = async argv => {
+      calls.push([...argv]);
+      if (argv[0] === 'pane' && argv[1] === 'list') {
+        const current = snapshots[Math.min(lists++, snapshots.length - 1)]!;
+        return { code: 0, stdout: JSON.stringify({ result: { panes: current } }), stderr: '' };
+      }
+      if (argv[0] === 'pane' && argv[1] === 'run') return { code: 0, stdout: '', stderr: '' };
+      return { code: 2, stdout: '', stderr: 'unexpected command' };
+    };
+    return { run, calls };
+  };
+  const row = (agent: string, agent_status: string): Row => ({ agent, agent_status, pane_id: 'wK:p5' });
+
+  test('지원 agent 의 idle pane 을 두 번 확인한 뒤 pane run 으로 제출하고 화면 read 는 하지 않는다', async () => {
+    const f = runner([[row('claude', 'idle')], [row('claude', 'idle')]]);
+    const result = await herdrPrompt({ target: 'wK:p5', text: 'wake line', anyAgent: true, requirePaneListStatus: true }, { run: f.run, log: () => {} });
+    expect(result).toMatchObject({ accepted: true, reason: 'submitted', agent: 'claude', status: 'idle' });
+    expect(f.calls.filter(argv => argv[0] === 'pane' && argv[1] === 'list')).toHaveLength(2);
+    expect(f.calls[0]).toEqual(['pane', 'list', '--workspace', 'wK']);
+    expect(f.calls.some(argv => argv[0] === 'pane' && argv[1] === 'read')).toBe(false);
+  });
+
+  test.each([
+    ['working', 'claude', 'agent_working'],
+    ['blocked', 'codex', 'agent_blocked'],
+    ['done', 'elanous', 'agent_unknown'],
+    ['unknown', 'claude', 'agent_unknown'],
+  ] as const)('agent_status=%s 는 주입하지 않는다', async (status, agent, reason) => {
+    const f = runner([row(agent, status)]);
+    const result = await herdrPrompt({ target: 'wK:p5', text: 'wake line', anyAgent: true, requirePaneListStatus: true }, { run: f.run, log: () => {} });
+    expect(result).toMatchObject({ accepted: false, reason, status });
+    expect(f.calls.some(argv => argv[0] === 'pane' && argv[1] === 'run')).toBe(false);
+  });
+
+  test.each(['', 'remote', 'other'])('지원되지 않는 agent(%s)는 idle 이어도 주입하지 않는다', async agent => {
+    const f = runner([row(agent, 'idle')]);
+    const result = await herdrPrompt({ target: 'wK:p5', text: 'wake line', anyAgent: true, requirePaneListStatus: true }, { run: f.run, log: () => {} });
+    expect(result).toMatchObject({ accepted: false, reason: 'agent_unknown' });
+    expect(f.calls.some(argv => argv[0] === 'pane' && argv[1] === 'run')).toBe(false);
+  });
+
+  test('pane list 재확인에서 idle 이 아니게 되면 입력하지 않는다', async () => {
+    const f = runner([[row('codex', 'idle')], [row('codex', 'working')]]);
+    const result = await herdrPrompt({ target: 'wK:p5', text: 'wake line', anyAgent: true, requirePaneListStatus: true }, { run: f.run, log: () => {} });
+    expect(result).toMatchObject({ accepted: false, reason: 'agent_working' });
+    expect(f.calls.some(argv => argv[0] === 'pane' && argv[1] === 'run')).toBe(false);
+  });
+
+  test('pane list 에 등록 pane 이 없으면 fail-closed 한다', async () => {
+    const f = runner([[]]);
+    const result = await herdrPrompt({ target: 'wK:p5', text: 'wake line', anyAgent: true, requirePaneListStatus: true }, { run: f.run, log: () => {} });
+    expect(result).toMatchObject({ accepted: false, reason: 'agent_unknown' });
+    expect(f.calls.some(argv => argv[0] === 'pane' && argv[1] === 'run')).toBe(false);
   });
 });

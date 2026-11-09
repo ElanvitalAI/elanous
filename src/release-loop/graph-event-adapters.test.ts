@@ -9,9 +9,10 @@ import { listCoordEvents } from '../context-bus/coord-events.js';
 import { recordExternalEvent } from '../context-bus/external-events.js';
 import { createGraphEventBus } from '../graph-runner/graph-events.js';
 import { registerGraphSubscriptions, type GraphSubgraphAppendProposal } from '../graph-runner/graph-subscriptions.js';
-import { registerReleaseGraphEventAdapters } from './graph-event-adapters.js';
+import { registerReleaseGraphEventAdapters, RELEASE_RUN_OP_SUMMARY_INTERVAL_MS } from './graph-event-adapters.js';
 import { decideGraphApproval, runGraph, type GraphRunOptions } from '../graph-runner/runner.js';
 import { classifyGateShadow } from '../../scripts/release-loop/gate-triage-node.js';
+import { writeReleaseGraphFixture } from '../../test/helpers/release-graph-fixture.js';
 
 test('release graph events reach OP inbox, context journal and TC stage mail once per scoped event', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-event-adapters-'));
@@ -62,6 +63,48 @@ test('release graph events reach OP inbox, context journal and TC stage mail onc
   } finally {
     dispose();
     contextDb.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('release run status fact is sent to OP every five minutes and timer cleanup stops further summaries', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-run-summary-mail-'));
+  mkdirSync(join(root, 'msg'), { recursive: true });
+  const bus = createGraphEventBus();
+  let tick: (() => void) | undefined;
+  let cancelled = false;
+  let now = RELEASE_RUN_OP_SUMMARY_INTERVAL_MS;
+  const dispose = registerReleaseGraphEventAdapters(bus, { graphId: 'release-loop', runId: 'summary-run' }, {
+    root,
+    releaseSummary: () => '0.3.8 · gate · running · 다음 gate 완료 대기 · ETA 12m',
+    now: () => now,
+    startSummaryTimer: (callback, intervalMs) => {
+      expect(intervalMs).toBe(RELEASE_RUN_OP_SUMMARY_INTERVAL_MS);
+      tick = callback;
+      return () => { cancelled = true; };
+    },
+  });
+  try {
+    tick?.();
+    tick?.(); // Same five-minute window is idempotent.
+    await bus.flush();
+    let store = openMsgStore(join(root, 'msg', 'messages.db'));
+    try {
+      const messages = store.listByRecipient('OP').filter(message => message.from === 'RLA');
+      expect(messages).toHaveLength(1);
+      expect(messages[0]?.body).toBe('RLA 5-minute release summary · run=summary-run · 0.3.8 · gate · running · 다음 gate 완료 대기 · ETA 12m');
+    } finally { store.close(); }
+
+    now += RELEASE_RUN_OP_SUMMARY_INTERVAL_MS;
+    tick?.();
+    await bus.flush();
+    dispose();
+    store = openMsgStore(join(root, 'msg', 'messages.db'));
+    try { expect(store.listByRecipient('OP').filter(message => message.from === 'RLA')).toHaveLength(2); }
+    finally { store.close(); }
+    expect(cancelled).toBe(true);
+  } finally {
+    dispose();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -120,7 +163,7 @@ test('release run attaches live subscriber adapters to its actual graph event tr
   try {
     writeFileSync(join(root, 'recipes.yaml'), '{}\n');
     const graph = join(root, 'release-loop.yaml');
-    writeFileSync(graph, [
+    writeReleaseGraphFixture(graph, [
       'graph_id: release-loop', 'version: 1', 'entry_node: done', 'terminal_nodes: [done, failed]', 'nodes:',
       '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
       '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }', '',
@@ -222,7 +265,7 @@ test('release event ids continue across approval resume and remain subscriber-de
   try {
     writeFileSync(join(root, 'recipes.yaml'), 'publish:\n  approval: "Publish now?"\n');
     const graph = join(root, 'release-loop.yaml');
-    writeFileSync(graph, [
+    writeReleaseGraphFixture(graph, [
       'graph_id: release-loop', 'version: 1', 'entry_node: approve-publish', 'terminal_nodes: [done, failed]', 'nodes:',
       '  - { node_id: approve-publish, kind: judge, recipe: approval:publish, max_visits: 1 }',
       '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
@@ -326,7 +369,7 @@ test('runGraph restores queued subscriber actions across approval resume and reg
   try {
     writeFileSync(join(root, 'recipes.yaml'), 'publish:\n  approval: "Continue?"\n');
     const approvalGraph = join(root, 'approval.yaml');
-    writeFileSync(approvalGraph, [
+    writeReleaseGraphFixture(approvalGraph, [
       'graph_id: release-loop', 'version: 1', 'entry_node: approve-publish', 'terminal_nodes: [done, failed]', 'nodes:',
       '  - { node_id: approve-publish, kind: judge, recipe: approval:publish, max_visits: 1 }',
       '  - { node_id: done, kind: gate, recipe: none, max_visits: 1, subscribes: [{ event: release-stage, match: { nodeId: approve-publish, state: wait }, action: wake }] }',
@@ -385,7 +428,7 @@ test('replayed event does not enqueue the same subscriber action twice', async (
   try {
     writeFileSync(join(root, 'recipes.yaml'), 'publish:\n  approval: "Continue repair"\n');
     const graph = join(root, 'release-loop.yaml');
-    writeFileSync(graph, [
+    writeReleaseGraphFixture(graph, [
       'graph_id: release-loop', 'version: 1', 'entry_node: approve-publish', 'terminal_nodes: [done, failed]', 'nodes:',
       '  - { node_id: approve-publish, kind: judge, recipe: approval:publish, max_visits: 1 }',
       '  - node_id: pre-gate-join\n    kind: gate\n    recipe: none\n    max_visits: 2\n    subscribes:\n      - event: release-stage\n        match: { state: wait }\n        action: wake',
@@ -504,7 +547,7 @@ test('failed release-stage delivery replays the same event envelope before appro
   try {
     writeFileSync(join(root, 'recipes.yaml'), 'publish:\n  approval: "Continue?"\n');
     const graph = join(root, 'release-loop.yaml');
-    writeFileSync(graph, [
+    writeReleaseGraphFixture(graph, [
       'graph_id: release-loop', 'version: 1', 'entry_node: approve-publish', 'terminal_nodes: [done, failed]', 'nodes:',
       '  - { node_id: approve-publish, kind: judge, recipe: approval:publish, max_visits: 1 }',
       '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }', '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }',

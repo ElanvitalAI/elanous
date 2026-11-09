@@ -125,13 +125,15 @@ export function checklistDevVersion(version = devVersion()): string {
   return version.replace(/-dev\.\d+$/, '');
 }
 
-const MANUAL_CHECKLIST_SEATS = new Set(['MVP-D', 'MVP-*', 'NM-*', 'NT-*', 'GATE-G']);
+// MVP-A..Z are retained for checklist history compatibility; ROSTER-0.3.7 names A-D as currently active.
+const MVP_CHECKLIST_SEATS = Array.from({ length: 26 }, (_, index) => `MVP-${String.fromCharCode(65 + index)}`);
+const MANUAL_CHECKLIST_SEATS = new Set([...MVP_CHECKLIST_SEATS, 'MVP-*', 'NM-*', 'NT-*', 'GATE-G']);
 
 export function parseOwner(value: string): { seat: string; sub?: string } {
   const match = /^([A-Z]{2,8}(?:-(?:[A-Z0-9]{1,8}|\*))?)(?:\/([a-z][a-z0-9-]{0,31}))?$/.exec(value);
   const seat = match?.[1];
   const legacySeat = seat !== undefined && /^[A-Z]{2,8}(?:-[0-9]{1,8})?$/.test(seat);
-  if (!match || match[0] !== value || (!legacySeat && !MANUAL_CHECKLIST_SEATS.has(seat!)))
+  if (!match || match[0] !== value || (!legacySeat && !MANUAL_CHECKLIST_SEATS.has(seat!) ))
     throw new CliUserError(`잘못된 담당: ${value}`, '자리 이름(예: TC-1, MVP-D, MVP-*, GATE-G) 또는 자리/하위자리(예: TC/rel)');
   return match[2] ? { seat: seat!, sub: match[2] } : { seat: seat! };
 }
@@ -575,8 +577,13 @@ function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>
   });
 }
 
-export function claimItem(v: string, id: string, by: string, options: { force?: boolean } = {}): Checklist {
+export function claimItem(v: string, id: string, by: string, options: { force?: boolean; actor?: string; reason?: string } = {}): Checklist {
   const requested = parseOwner(by);
+  const actor = process.env.ELANOUS_TRACK ?? options.actor ?? '';
+  let actorSeat: string | undefined;
+  try { actorSeat = parseOwner(actor).seat; } catch { actorSeat = undefined; }
+  if (options.force && process.env.ELANOUS_TRACK !== 'OP') throw new CliUserError('--force 는 OP 서명으로만 사용할 수 있다');
+  if (options.force && !options.reason?.trim()) throw new CliUserError('--force 에는 --reason 이 필요하다');
   let outcome: 'claimed' | 'same' | 'refused' = 'refused';
   let from: string | null = null;
   try {
@@ -585,15 +592,19 @@ export function claimItem(v: string, id: string, by: string, options: { force?: 
       if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
       from = item.owner ?? null;
       if (from === by) { outcome = 'same'; return false; }
-      if (from && !options.force && !(from === requested.seat && requested.sub)) {
-        throw new CliUserError(`지금 주인: ${from} — --force 로만 바꾼다`);
+      const currentOwner = from ? parseOwner(from) : undefined;
+      if (process.env.ELANOUS_TRACK !== 'OP' && (!currentOwner || currentOwner.seat !== actorSeat)) {
+        throw new CliUserError(`칸 주인 또는 OP만 claim 할 수 있다 (caller: ${actor || 'unknown'})`);
+      }
+      if (currentOwner && process.env.ELANOUS_TRACK !== 'OP' && currentOwner.seat !== actorSeat) {
+        throw new CliUserError(`지금 주인: ${from} — 칸 주인 또는 OP만 claim 할 수 있다`);
       }
       const at = new Date().toISOString();
       item.owner = by;
       item.updatedAt = at;
-      item.updatedBy = by;
-      data.history.push({ at, by, id, field: 'claim', from, to: options.force ? { owner: by, force: true } : by,
-        released: data.released, dev: data.dev });
+      item.updatedBy = options.force ? actor : by;
+      data.history.push({ at, by: options.force ? actor : by, id, field: 'claim', from, to: options.force ? { owner: by, force: true, actor, reason: options.reason!.trim() } : by,
+        released: data.released, dev: data.dev, ...(options.force ? { force: true as const, reason: options.reason!.trim() } : {}) });
       outcome = 'claimed';
       return true;
     });

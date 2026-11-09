@@ -62,6 +62,9 @@ export type NativeToolKind =
  *  the model can't leverage. Interpretation lives in `src/tool-hints/gate.ts` (P4). */
 export type NativeToolTier = 'T1' | 'T2' | 'T3';
 
+/** Evidence category for loading a tool schema in the native core each turn. */
+export type NativeToolCoreReason = 'N1' | 'N2' | 'N3' | 'N4';
+
 /** Registration-time capability probe. Result is cached in-process; gate consults
  *  it when filtering the catalog each turn. */
 export type ProbeSpec =
@@ -83,6 +86,8 @@ export interface NativeToolCatalogEntry {
   safety: NativeToolSafety[];
   supportsParallel: boolean;
   defaultEnabled: boolean;
+  /** Native-core admission evidence; absent means this entry is not core. */
+  coreReason?: NativeToolCoreReason;
   requires?: string[];
   /** When true, the skill-discipline prompt names this tool as
    *  "prefer this over composing shell equivalents". Typical for
@@ -171,6 +176,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['process', 'mutating'],
     supportsParallel: false,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'coding',
   },
   {
@@ -185,6 +191,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     // Mutating tools run serially by catalog contract — matches Bash.
     supportsParallel: false,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'coding',
   },
   // NT-C1b-2 (session nt) — ShellRunner auxiliary tools. Read-only
@@ -239,6 +246,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['process'],
     supportsParallel: false,
     defaultEnabled: true,
+    coreReason: 'N2',
     intentScope: 'ops-fleet',
   },
   {
@@ -325,6 +333,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['read-only'],
     supportsParallel: true,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'ops-fleet',
   },
   // ROADMAP-agent-surface-deferred-tools Wave 1 · W1.2 — send abort
@@ -341,6 +350,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['mutating'],
     supportsParallel: false,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'ops-fleet',
   },
   // PFC-S1 P4: team-mailbox LLM tools. Group subagent spawns and
@@ -960,6 +970,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['read-only'],
     supportsParallel: true,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'coding',
     cleanerFitThanShell: true,
   },
@@ -974,6 +985,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['mutating'],
     supportsParallel: false,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'coding',
     cleanerFitThanShell: true,
     // Arc G — opt-in tsc baseline check after each Edit. Default
@@ -991,6 +1003,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['mutating'],
     supportsParallel: false,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'coding',
     cleanerFitThanShell: true,
     // Arc G — opt-in tsc baseline check after each Write. Default
@@ -1011,6 +1024,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['permission'],
     supportsParallel: false,
     defaultEnabled: true,
+    coreReason: 'N2',
     intentScope: 'coding',
   },
   {
@@ -1237,6 +1251,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['read-only'],
     supportsParallel: true,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'coding',
     requires: ['rg'],
     cleanerFitThanShell: true,
@@ -1252,6 +1267,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['read-only'],
     supportsParallel: true,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'coding',
     requires: ['rg'],
     cleanerFitThanShell: true,
@@ -1267,6 +1283,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['read-only'],
     supportsParallel: true,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'coding',
     cleanerFitThanShell: true,
   },
@@ -1356,6 +1373,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['agent'],
     supportsParallel: false,
     defaultEnabled: true,
+    coreReason: 'N1',
     intentScope: 'coding',
   },
   {
@@ -1673,6 +1691,49 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     defaultEnabled: true,
     intentScope: 'ops-fleet',
     minTier: 'T2',
+  },
+  // PHONE-ADB-MCP-TOOLS: fixed adb actions for Android Fold inspection.
+  // Mutating operations raise a DecisionLedger card and are inert until a
+  // human approves that exact action; the dispatcher has no shell tool.
+  {
+    id: 'phone_adb_screenshot', kind: 'other',
+    aliases: ['PhoneAdbScreenshot', 'phone_adb_screenshot'],
+    displayName: 'PhoneAdbScreenshot',
+    description: 'Capture a PNG from an attached Android USB/emulator or loopback/tailnet adb device.',
+    promptSummary: '`PhoneAdbScreenshot` (inspect Android screen)',
+    host: ['skill'], safety: ['read-only'], supportsParallel: false, defaultEnabled: true, intentScope: 'ops-ui',
+  },
+  {
+    id: 'phone_adb_ui_dump', kind: 'other',
+    aliases: ['PhoneAdbUiDump', 'phone_adb_ui_dump'],
+    displayName: 'PhoneAdbUiDump',
+    description: 'Read Android UI hierarchy with password and secret values redacted.',
+    promptSummary: '`PhoneAdbUiDump` (inspect Android UI labels)',
+    host: ['skill'], safety: ['read-only'], supportsParallel: false, defaultEnabled: true, intentScope: 'ops-ui',
+  },
+  {
+    id: 'phone_adb_tap', kind: 'other',
+    aliases: ['PhoneAdbTap', 'phone_adb_tap'],
+    displayName: 'PhoneAdbTap',
+    description: 'Tap an in-bounds Android screen coordinate only after a human decision card is approved.',
+    promptSummary: '`PhoneAdbTap` (human-approved Android tap)',
+    host: ['skill'], safety: ['permission', 'mutating', 'process'], supportsParallel: false, defaultEnabled: true, intentScope: 'ops-ui',
+  },
+  {
+    id: 'phone_adb_type', kind: 'other',
+    aliases: ['PhoneAdbType', 'phone_adb_type'],
+    displayName: 'PhoneAdbType',
+    description: 'Type non-sensitive plain text only after a human decision card is approved.',
+    promptSummary: '`PhoneAdbType` (human-approved Android typing)',
+    host: ['skill'], safety: ['permission', 'mutating', 'process'], supportsParallel: false, defaultEnabled: true, intentScope: 'ops-ui',
+  },
+  {
+    id: 'phone_adb_open_url', kind: 'other',
+    aliases: ['PhoneAdbOpenUrl', 'phone_adb_open_url'],
+    displayName: 'PhoneAdbOpenUrl',
+    description: 'Open a loopback or tailnet HTTP(S) URL only after a human decision card is approved.',
+    promptSummary: '`PhoneAdbOpenUrl` (human-approved Android URL launch)',
+    host: ['skill'], safety: ['permission', 'mutating', 'process'], supportsParallel: false, defaultEnabled: true, intentScope: 'ops-ui',
   },
   // ── P12: terminal modal context exchange ──
   {
@@ -2878,6 +2939,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     defaultEnabled: true,
     alwaysLoad: true,
     toolSearchable: false,
+    coreReason: 'N3',
     intentScope: 'always',
   },
 

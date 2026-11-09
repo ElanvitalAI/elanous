@@ -104,11 +104,11 @@ describe('AcpAgent billing environment scrub', () => {
     expect(JSON.stringify(spawn)).not.toContain(SECRET);
   });
 
-  test('forces Grok API-key authentication off only under the shared subscription policy', () => {
+  test('forces Grok API-key authentication off; the removed acp.scrubBillingEnv key is ignored (CONFIG-ALWAYS-TRUE-OUT)', () => {
     expect(childEnv('grok', {})).toMatchObject({ GROK_DISABLE_API_KEY_AUTH: '1' });
 
     writeConfig({ scrubBillingEnv: false });
-    expect(childEnv('grok', {})).not.toHaveProperty('GROK_DISABLE_API_KEY_AUTH');
+    expect(childEnv('grok', {})).toMatchObject({ GROK_DISABLE_API_KEY_AUTH: '1' });
   });
 
   test('does not force Grok API-key policy for Claude or Gemini', () => {

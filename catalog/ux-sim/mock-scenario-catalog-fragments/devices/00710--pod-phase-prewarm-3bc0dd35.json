@@ -1,0 +1,33 @@
+{
+  "id": "pod-phase-prewarm",
+  "name": "Release-phase warm Pod prewarm",
+  "implementation": [
+    "src/ux-sim/pod-phase-prewarm.ts",
+    "src/task-orchestrator/surfaces/pod-warm-switch.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts"
+  ],
+  "tests": [
+    "src/ux-sim/pod-phase-prewarm.test.ts",
+    "src/task-orchestrator/surfaces/pod-warm-switch.test.ts"
+  ],
+  "target": "Move the simulated release clock through gate prewarm, gate, and steady phases; select only exact cut/lock/image candidates and verify cold fallback after failed preparation.",
+  "inputs": [
+    "private-provider phase schedule with rehearsal, gate, publish, and steady targets",
+    "cut SHA, lock hash, and image digest for the gate window",
+    "candidate pool and fake preparation outcomes",
+    "simulated phase-boundary timestamps"
+  ],
+  "observations": [
+    "phase target and ready candidate counts",
+    "exact gate image and lock identity admission",
+    "first gate request warm hit after successful prewarm",
+    "cold fallback reason after failed prewarm",
+    "implementation target restoration after gate window"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/pod-phase-prewarm.test.ts src/task-orchestrator/surfaces/pod-warm-switch.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

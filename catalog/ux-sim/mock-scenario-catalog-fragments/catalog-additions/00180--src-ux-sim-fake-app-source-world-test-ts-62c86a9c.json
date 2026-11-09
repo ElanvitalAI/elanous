@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/fake-app-source-world.test.ts",
+  "reason": "APP-SOURCE-SNAPSHOT preexisting source-inventory omission registered while advancing the simulator catalog version."
+}

@@ -14,9 +14,15 @@ export type ChainLandInput = {
   /** One external gate-host result per production integrated-gate attempt. */
   readonly gateOutcomes: readonly ChainGateOutcome[];
   readonly staleLock?: boolean;
+  /** Require the production queue fixture to carry the world-verified retest commit. */
+  readonly expectedHead?: string;
+  /** Invoke the real queue on subsequent ticks until every enqueued PR has a receipt or a gate blocks it. */
+  readonly drainQueue?: boolean;
 };
 export type ChainLandResult = {
   readonly enqueued: number[];
+  readonly head: string;
+  readonly headReceipts: { number: number; head: string }[];
   readonly pending: number[];
   readonly gateRuns: { host: string; outcome: ChainGateOutcome }[];
   readonly verdicts: L8ShadowVerdict[];
@@ -48,14 +54,16 @@ function createGitFixture(root: string, prNumbers: readonly number[]): { cwd: st
   writeFile(seed, 'src/feature.ts', 'export const feature = 0;\n');
   writeFile(seed, 'test/feature.test.ts', "import { expect, test } from 'bun:test';\nimport { feature } from '../src/feature.js';\ntest('feature', () => expect(feature).toBe(1));\n");
   git(seed, 'add', '.');
-  git(seed, 'commit', '-qm', 'main baseline');
+  execFileSync('git', ['commit', '-qm', 'main baseline'], { cwd: seed,
+    env: { ...process.env, GIT_AUTHOR_DATE: '2026-11-05T00:00:00Z', GIT_COMMITTER_DATE: '2026-11-05T00:00:00Z' } });
   const base = git(seed, 'rev-parse', 'HEAD');
   git(seed, 'remote', 'add', 'origin', remote);
   git(seed, 'push', '-q', 'origin', 'main');
   git(seed, 'checkout', '-qb', 'queued-change');
   writeFile(seed, 'src/feature.ts', 'export const feature = 1;\n');
   git(seed, 'add', '.');
-  git(seed, 'commit', '-qm', 'queued feature');
+  execFileSync('git', ['commit', '-qm', 'queued feature'], { cwd: seed,
+    env: { ...process.env, GIT_AUTHOR_DATE: '2026-11-05T00:00:01Z', GIT_COMMITTER_DATE: '2026-11-05T00:00:01Z' } });
   const head = git(seed, 'rev-parse', 'HEAD');
   const files = git(seed, 'diff', '--name-only', `${base}...${head}`).split('\n').filter(Boolean);
   for (const number of prNumbers) git(seed, 'push', '-q', 'origin', `HEAD:refs/pull/${number}/head`);
@@ -82,6 +90,7 @@ export async function simulateChainLand(input: ChainLandInput): Promise<ChainLan
   let ghDevice: ReturnType<typeof makeGhAndBin> | undefined;
   try {
     const fixture = createGitFixture(root, input.prNumbers);
+    if (input.expectedHead && fixture.head !== input.expectedHead) throw new Error(`production queue head differs from world retest: ${fixture.head}`);
     ghDevice = makeGhAndBin(input.prNumbers, fixture.head, fixture.files);
     let integrationCalls = 0;
     const command: NonNullable<L8ShadowQueueDeps['command']> = (bin, args, cwd) => {
@@ -119,6 +128,7 @@ export async function simulateChainLand(input: ChainLandInput): Promise<ChainLan
       command,
       lock: { waitMs: 0 },
       observeEnqueue: () => {},
+      observe: () => {},
       trainGateRunner: gateRunner,
       trainGateSettings: gateSettings,
     };
@@ -132,8 +142,17 @@ export async function simulateChainLand(input: ChainLandInput): Promise<ChainLan
     if (input.staleLock) mkdirSync(staleLockDir);
 
     let lock: ChainLandResult['lock'] = 'acquired';
-    let disposition: L8ShadowVerdict | null;
-    try { disposition = await runL8ShadowQueue(fixture.cwd, deps); }
+    let disposition: L8ShadowVerdict | null = null;
+    try {
+      let attempts = 0;
+      do {
+        const next = await runL8ShadowQueue(fixture.cwd, deps);
+        if (next) disposition = next;
+        attempts++;
+        const snapshot = await statusL8ShadowQueue(fixture.cwd, deps);
+        if (!input.drainQueue || snapshot.pending.length === 0 || attempts >= input.prNumbers.length || next?.verdict !== 'pass') break;
+      } while (true);
+    }
     catch (error) {
       if (!input.staleLock || !String(error).includes('merge queue occupied')) throw error;
       lock = 'stale';
@@ -143,6 +162,8 @@ export async function simulateChainLand(input: ChainLandInput): Promise<ChainLan
     const state = await statusL8ShadowQueue(fixture.cwd, deps);
     return {
       enqueued,
+      head: fixture.head,
+      headReceipts: input.prNumbers.map((number) => ({ number, head: fixture.head })),
       pending: state.pending.map(({ number }) => number),
       gateRuns,
       verdicts: state.verdicts,

@@ -5,6 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import { MARKDOWN_REMARK_PLUGINS } from '@/lib/markdown-render';
 import { extractElanousCards } from '@/lib/elanous-card';
 import { ElanousCard } from './ElanousCard';
+import { DeployResultCard } from './DeployResultCard';
 import { ContextSourcesCard } from './ContextSourcesCard';
 import { HarnessAskCard } from './HarnessAskCard';
 import { cn } from '@/lib/utils';
@@ -24,6 +25,7 @@ const MARKDOWN_COMPONENTS = { pre: CollapsibleCodeBlock };
 interface Props {
   message: ChatMessageT;
   mobileSimple?: boolean;
+  minimal?: boolean;
 }
 
 /** REL9p — cards only in daemon-side messages; a user's own text is shown exactly as typed. */
@@ -135,6 +137,9 @@ function BlocksBody({ blocks, showCards, mobileSimple = false }: { blocks: ChatB
   return (
     <div className="flex flex-col gap-2">
       {blocks.map((block, idx) => {
+        if (block.kind === 'deploy_result') {
+          return <DeployResultCard key={`${block.toolId}-${idx}`} result={block.result} />;
+        }
         if (block.kind === 'harness_ask') {
           return <HarnessAskCard key={`${block.acceptanceId}-${idx}`} acceptanceId={block.acceptanceId} />;
         }
@@ -202,13 +207,78 @@ function BlocksBody({ blocks, showCards, mobileSimple = false }: { blocks: ChatB
   );
 }
 
-export function ChatMessageView({ message, mobileSimple = false }: Props) {
+/** Keep the transcript intact while showing only speech, final prose, and result surfaces. */
+function MinimalAssistantBody({ message, mobileSimple }: { message: ChatMessageT; mobileSimple: boolean }) {
+  const blocks = message.blocks ?? [];
+  const completed = !message.streaming && !message.incomplete;
+  const finalText = completed ? message.text.slice(message.finalTextStart ?? 0) : '';
+  const priorText = completed ? message.text.slice(0, message.finalTextStart ?? 0) : message.text;
+  const visible = blocks.filter((block) =>
+    block.kind === 'harness_ask' || block.kind === 'image' || block.kind === 'mcp_app' || block.kind === 'deploy_result',
+  );
+  const hidden = blocks.filter((block) =>
+    block.kind === 'tool_use' || block.kind === 'agent_thinking' || block.kind === 'agent_status'
+    || block.kind === 'agent_plan' || block.kind === 'tool_diff'
+    || block.kind === 'tool_search_hits' || block.kind === 'tool_progress'
+    || block.kind === 'perf_session' || block.kind === 'debug_session',
+  );
+  // Tool result card text is separate from the cumulative assistant prose.
+  const cardCandidates = blocks
+    .filter((block): block is Extract<ChatBlock, { kind: 'text' }> => block.kind === 'text' && (message.streaming || block.text !== message.text))
+    .flatMap((block) => extractElanousCards(block.text).cards)
+    .concat(!message.streaming || !blocks.some((block) => block.kind === 'text' && block.text === message.text)
+      ? extractElanousCards(priorText).cards : []);
+  const renderedCardKeys = new Set(extractElanousCards(finalText).cards.map((card) => JSON.stringify(card)));
+  const cards = cardCandidates.filter((card) => {
+    const key = JSON.stringify(card);
+    if (renderedCardKeys.has(key)) return false;
+    renderedCardKeys.add(key);
+    return true;
+  });
+  const hiddenResultText = blocks
+    .filter((block): block is Extract<ChatBlock, { kind: 'text' }> => block.kind === 'text' && block.text !== message.text)
+    .map((block) => extractElanousCards(block.text).text)
+    .filter((text) => text.trim().length > 0);
+  const hasDetails = hidden.length > 0 || priorText.trim().length > 0 || hiddenResultText.length > 0 || !!message.incomplete;
+  if (!finalText.trim() && visible.length === 0 && cards.length === 0 && !hasDetails) return null;
+  return (
+    <div className="flex flex-col gap-2">
+      {message.incomplete && <span role="status" className="text-xs text-muted-foreground">
+        {message.meta?.stopReason === 'aborted' ? '응답 중단됨' : '응답 오류'}
+      </span>}
+      {finalText.trim() && <CardTextBody text={finalText} showCards />}
+      {visible.length > 0 && <BlocksBody blocks={visible} showCards mobileSimple={mobileSimple} />}
+      {cards.map((card, index) => <ElanousCard key={`stream-card-${index}`} card={card} />)}
+      {hasDetails && <details className="text-xs text-muted-foreground" data-elanous-minimal-details>
+        <summary className="cursor-pointer select-none">자세히</summary>
+        <div className="mt-2 flex flex-col gap-2">
+          {message.incomplete && message.meta?.stopReason && <p>{message.meta.stopReason}</p>}
+          {priorText.trim() && <MarkdownBody text={priorText} />}
+          {hiddenResultText.map((text, index) => <MarkdownBody key={`result-text-${index}`} text={text} />)}
+          <BlocksBody blocks={hidden.filter((block) => block.kind !== 'debug_session')} showCards={false} mobileSimple={mobileSimple} />
+          {hidden.filter((block): block is Extract<ChatBlock, { kind: 'debug_session' }> => block.kind === 'debug_session')
+            .map((block) => <pre key={block.blockId} className="whitespace-pre-wrap break-all">{JSON.stringify(block.lines, null, 2)}</pre>)}
+        </div>
+      </details>}
+    </div>
+  );
+}
+
+export function ChatMessageView({ message, mobileSimple = false, minimal = false }: Props) {
   const isUser = message.role === 'user';
   const isMeta = message.role === 'meta';
   const isSystem = message.role === 'system';
   const time = new Date(message.timestamp).toLocaleTimeString();
 
   if (isMeta) {
+    if (minimal) return <div className="px-4 py-1">
+      {message.blocks?.some((block) => block.kind === 'harness_ask') &&
+        <BlocksBody blocks={message.blocks.filter((block) => block.kind === 'harness_ask')} showCards={false} mobileSimple={mobileSimple} />}
+      <details className="text-xs text-muted-foreground" data-elanous-minimal-details>
+        <summary className="cursor-pointer select-none">자세히</summary>
+        <pre className="mt-1 whitespace-pre-wrap font-mono">{message.text}</pre>
+      </details>
+    </div>;
     return (
       <div className="px-2 py-1 text-[11px] text-muted-foreground italic">
         <pre className="whitespace-pre-wrap font-mono text-[11px]">{message.text}</pre>
@@ -224,6 +294,12 @@ export function ChatMessageView({ message, mobileSimple = false }: Props) {
   // be loud enough to distinguish from a normal agent reply but not so
   // loud that an `:agent error — abort` looks like a fatal runtime crash.
   if (isSystem) {
+    if (minimal && message.meta?.systemLevel !== 'error') return <div className="px-4 py-1">
+      <details className="text-xs text-muted-foreground" data-elanous-minimal-details>
+        <summary className="cursor-pointer select-none">자세히</summary>
+        <pre className="mt-1 whitespace-pre-wrap font-mono">{message.text}</pre>
+      </details>
+    </div>;
     const level = message.meta?.systemLevel ?? 'note';
     const isError = level === 'error';
     return (
@@ -254,6 +330,16 @@ export function ChatMessageView({ message, mobileSimple = false }: Props) {
   // it instead of the flat text. Empty blocks fall back to the text
   // path so a placeholder message (B-1) still streams correctly.
   const useBlocks = Array.isArray(message.blocks) && message.blocks.length > 0;
+
+  if (minimal && !isUser) {
+    const hasContent = message.text.trim().length > 0 || useBlocks || message.incomplete;
+    if (!hasContent) return null;
+    return <div className="flex justify-start px-4 py-3">
+      <div className="max-w-[85%] rounded-lg border border-border bg-card px-3 py-2 text-sm text-card-foreground shadow-sm">
+        <MinimalAssistantBody message={message} mobileSimple={mobileSimple} />
+      </div>
+    </div>;
+  }
 
   return (
     <div className={cn('flex gap-3 px-4 py-3', isUser ? 'justify-end' : 'justify-start')}>

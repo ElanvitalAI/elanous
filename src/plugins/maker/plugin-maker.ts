@@ -1,3 +1,4 @@
+import { isRecord } from '../../primitives/guards.js';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -15,7 +16,6 @@ import { generateWizardFiles, type WizardResearchDraft } from './wizard-generate
 import { bundleInstalledWizardPlugin, type MarketBundleResult } from './market-bundle.js';
 
 const CAPABILITIES = ['fs:workdir', 'proc:bun', 'proc:elanous'];
-const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 export interface WizardStepEvent {
   ts: string;

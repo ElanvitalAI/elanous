@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-PTY-KEY-MODIFIERS-DEVICE-TS",
+  "path": "src/ux-sim/pty-key-modifiers-device.ts",
+  "boundary": "Sends modifier-key sequences through a real PTY to the production TUI parser and records parsed key events and rendered output.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

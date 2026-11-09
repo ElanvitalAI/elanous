@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-COMPUTER-USE-TS",
+  "path": "src/ux-sim/computer-use.ts",
+  "boundary": "Feeds declared click trajectories into the production computer-use dispatcher and records action attribution and observations without inventing coordinates.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

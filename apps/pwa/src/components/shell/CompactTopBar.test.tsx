@@ -8,7 +8,6 @@ import { MobileBottomTabs } from './MobileBottomTabs';
 import ChatPage from '@/app/chat/page';
 import { MobileChatStatus } from '@/components/chat/MobileChatStatus';
 import { ChatPanel } from '@/components/chat/ChatPanel';
-import { WorkspaceProvider } from '@/components/workspace/WorkspaceProvider';
 import { TopBar } from './TopBar';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { DaemonClient } from '@/lib/daemon-client';
@@ -246,17 +245,16 @@ describe('CompactTopBar', () => {
     expect(renderer!.root.findByProps({ role: 'dialog' }).findAllByProps({ 'data-elanous-component': 'topbar-activity' })).toHaveLength(1);
   });
 
-  test('workspace route names its active tab without adding a second header row', async () => {
+  test('retained terminal screen names its route without adding a second header row', async () => {
     const config = { baseUrl: '', token: '', provider: '' };
     const daemon = { config, client: new DaemonClient(config), sessionId: 'session-1', setSessionId() {}, setConfig() {} };
     await act(async () => { renderer = create(createElement(DaemonContext.Provider, { value: daemon },
-      createElement(ThemeProvider, null, createElement(PathnameContext.Provider, { value: '/workspace' },
+      createElement(ThemeProvider, null, createElement(PathnameContext.Provider, { value: '/term' },
         createElement(AppRouterContext.Provider, { value: { push() {}, replace() {}, refresh() {}, back() {}, forward() {}, prefetch() {} } as never },
           createElement(AppShell, { activity: { kind: 'quiet' }, children: createElement('p', null, 'room') })))))); });
-    const workspace = renderer!.root.findByType(CompactTopBar);
-    expect(renderer!.root.findAllByType(WorkspaceProvider)).toHaveLength(1);
-    expect(workspace.findByType('header').findAllByType('span').some((span) => span.children.includes('여러 탭'))).toBe(true);
-    expect(workspace.findByType('header').findAllByType('button')).toHaveLength(2);
+    const topBar = renderer!.root.findByType(CompactTopBar);
+    expect(topBar.findByType('header').findAllByType('span').some((span) => span.children.includes('터미널'))).toBe(true);
+    expect(topBar.findByType('header').findAllByType('button')).toHaveLength(2);
   });
 
   test('menu toggles and the sheet dismisses without dropping the compact row', () => {

@@ -5,7 +5,7 @@ import { CliUserError } from '../cli/cli-user-error.js';
 import { debug } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { readSchedule, readSchedules, releasedVersion, writeSchedule, type ScheduleRow } from './feature-store.js';
-import { checkScheduleCeoLoad } from './placement.js';
+import { checkScheduleCeoLoad } from './placement-ceo-load.js';
 
 export type ReleaseSchedule = ScheduleRow;
 
@@ -26,7 +26,7 @@ function newerVersion(version: string, published: string): boolean {
   return false;
 }
 
-/** A scheduler tick observes due cuts; it does not directly start a release run. */
+/** cutAt is the earliest poll constraint; readiness inside runUnattendedRelease decides when the graph starts. */
 export function dueReleaseCutEvents(now: string, root = releaseLedgerRoot()): ReleaseCutDueEvent[] {
   const at = Date.parse(now);
   if (!Number.isFinite(at)) throw new Error(`invalid schedule tick time: ${now}`);
@@ -85,8 +85,11 @@ export async function emitDueReleaseCutEvents(now: string, emit: (event: Release
       await emit(event);
       writeFileSync(path, JSON.stringify({ ...event, subscriptionId, status: 'emitted', pid: process.pid }) + '\n', { mode: 0o600 });
       debug.log('release.schedule', 'cut-due', { version: event.version, cutAt: event.cutAt, eventId: event.id, subscriptionId });
+      debug.log('release.schedule', 'cut-event-emitted', { version: event.version, eventId: event.id, observedAt: event.at, eta: null });
       emitted.push(event);
     } catch (error) {
+      debug.log('release.schedule', 'countdown-held', { version: event.version, runId: event.id, observedAt: event.at,
+        eta: null, holdReason: error instanceof Error ? error.message : String(error) });
       if (existsSync(path)) unlinkSync(path);
       throw error;
     }
@@ -135,7 +138,7 @@ export function setSchedule(version: string, patch: { cutAt?: string; landBy?: s
   if (landing !== undefined) {
     const previous = readSchedule(version, root);
     // Check the landing against the same ledger and configuration root that writeSchedule will use.
-    if (!previous?.landBy || kstDay(previous.landBy) !== kstDay(landing)) checkScheduleCeoLoad(version, landing, root);
+    if (!previous?.landBy || kstDay(previous.landBy) !== kstDay(landing)) checkScheduleCeoLoad(version, landing, root, { listSchedules, kstDay });
   }
   const schedule = writeSchedule(version, {
     ...(patch.cutAt !== undefined ? { cutAt: utcIso(patch.cutAt) } : {}),

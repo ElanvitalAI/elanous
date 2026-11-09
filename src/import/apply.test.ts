@@ -2,7 +2,7 @@ import { afterEach, expect, test } from 'bun:test';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SkillSource } from '../user-config.js';
+import type { SkillSource } from '../user-config/types.js';
 import { applyImport, formatApplied, readImportManifest, undoImport, type ApplyDeps } from './apply.js';
 import { planImport } from './plan.js';
 

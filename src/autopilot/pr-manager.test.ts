@@ -13,13 +13,20 @@ import { prBody } from '../self-implement/orchestrator.js';
 
 const originalHarnessEnv = Object.fromEntries(Object.entries(process.env)
   .filter(([key]) => key === 'ELANOUS_TASK_CARD_ID' || key === 'ELANOUS_SUBSTRATE' || key.startsWith('ELANOUS_POD_')));
+const originalHome = process.env.HOME;
+let prManagerTestHome = '';
 beforeAll(() => {
+  prManagerTestHome = mkdtempSync(join(tmpdir(), 'pr-manager-test-home-'));
+  process.env.HOME = prManagerTestHome;
   for (const key of Object.keys(originalHarnessEnv)) delete process.env[key];
 });
 afterAll(() => {
   for (const key of ['ELANOUS_TASK_CARD_ID', 'ELANOUS_SUBSTRATE', ...Object.keys(process.env).filter(key => key.startsWith('ELANOUS_POD_'))])
     delete process.env[key];
   Object.assign(process.env, originalHarnessEnv);
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  rmSync(prManagerTestHome, { recursive: true, force: true });
 });
 
 /** 호출 기록 + 프로그램된 응답을 주는 스텁 러너. */
@@ -201,6 +208,118 @@ describe('makePrManager.upsertPr — 기존 PR 재활용(대표 2026-07-12)', ()
     branch: 'se/apm-x-abc', worktreePath: '/wt', title: '[SE] x', body: 'b', base: 'main',
     commitMessage: 'm', excludePaths: ['node_modules', 'apps/pwa/out'], reuseComment: '🔄 재구현',
   };
+
+  function forecastRunner(options: { census: 'unknown' | 'empty' | 'peer' | 'self-and-peer'; headUnavailable?: boolean }) {
+    const calls: string[][] = [];
+    const run: CmdRunner = (cmd, args) => {
+      calls.push([cmd, ...args]);
+      if (cmd === 'git' && args.includes('push')) return { ok: true, out: '' };
+      if (cmd === 'git' && args.includes('rev-list')) return { ok: true, out: '1' };
+      if (cmd === 'git' && args.includes('diff') && args.includes('--name-only'))
+        return { ok: true, out: args.includes('-z') ? 'src/shared.ts\0' : 'src/shared.ts\n' };
+      if (cmd === 'git' && args.includes('rev-parse') && args.at(-1) === 'HEAD' && options.headUnavailable)
+        return { ok: false, out: '', err: 'injected head lookup failure' };
+      if (cmd === 'git' && args.includes('rev-parse')) return { ok: true, out: 'a'.repeat(40) };
+      if (cmd === 'git' && args.includes('merge-tree')) return { ok: false, out: '' };
+      const inventoryNumbers = options.census === 'self-and-peer' ? [13, 14] : options.census === 'peer' ? [13] : [];
+      if (cmd === 'gh' && args[0] === 'api') return options.census === 'unknown'
+        ? { ok: false, out: '', err: 'injected census failure' }
+        : { ok: true, out: JSON.stringify(inventoryNumbers.map(number => ({ number, state: 'open', draft: false,
+          head: { ref: `peer-${number}`, sha: number === 13 ? 'c'.repeat(40) : 'b'.repeat(40) }, labels: [],
+          title: `peer ${number}`, updated_at: '2026-11-08T00:00:00Z', body: '' }))) };
+      if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'list' && args.includes('--limit')) return {
+        ok: true, out: JSON.stringify(inventoryNumbers.map(number => ({ number, changedFiles: 1, files: [{ path: 'src/shared.ts' }] }))),
+      };
+      if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'create') return { ok: true, out: 'https://github.com/o/r/pull/99' };
+      return { ok: true, out: '' };
+    };
+    return { run, calls };
+  }
+
+  it('census 미측정을 conflict:null 원장에 남기고 push는 계속한다', () => {
+    const home = mkdtempSync(join(tmpdir(), 'pr-push-forecast-census-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const { run, calls } = forecastRunner({ census: 'unknown' });
+      const manager = makePrManager(run);
+      const result = manager.upsertPr(input);
+      const path = join(home, 'elanous-hq/seat-state/OP/train-manager/conflict-forecast.jsonl');
+      const row = JSON.parse(readFileSync(path, 'utf8').trim());
+      expect(result).toMatchObject({ ok: true, reused: false });
+      expect(row).toMatchObject({ schema: 'conflict-forecast.v1', conflict: null, otherPr: null,
+        head: 'a'.repeat(40), unmeasuredReason: 'open-pr-census-unavailable' });
+      expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('HEAD 확인 실패도 conflict:null 원장에 남기고 push는 계속한다', () => {
+    const home = mkdtempSync(join(tmpdir(), 'pr-push-forecast-head-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const { run, calls } = forecastRunner({ census: 'empty', headUnavailable: true });
+      const manager = makePrManager(run);
+      const result = manager.upsertPr(input);
+      const path = join(home, 'elanous-hq/seat-state/OP/train-manager/conflict-forecast.jsonl');
+      const row = JSON.parse(readFileSync(path, 'utf8').trim());
+      expect(result).toMatchObject({ ok: true, reused: false });
+      expect(row).toMatchObject({ schema: 'conflict-forecast.v1', conflict: null, otherPr: null,
+        head: null, unmeasuredReason: 'candidate-head-unavailable' });
+      expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('push 대상 PR 자신은 peer 예보에서 제외하면서 PR manager push는 실제 호출한다', () => {
+    const home = mkdtempSync(join(tmpdir(), 'pr-push-forecast-self-'));
+    const previousHome = process.env.HOME;
+    const previousBoundPr = process.env.ELANOUS_TASK_BOUND_PR;
+    process.env.HOME = home;
+    process.env.ELANOUS_TASK_BOUND_PR = '13';
+    try {
+      const { run, calls } = forecastRunner({ census: 'self-and-peer' });
+      const result = makePrManager(run).upsertPr(input);
+      const path = join(home, 'elanous-hq/seat-state/OP/train-manager/conflict-forecast.jsonl');
+      const rows = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(result).toMatchObject({ ok: true, reused: false });
+      expect(rows.map((row: { otherPr: number | null }) => row.otherPr)).toEqual([14]);
+      expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(true);
+    } finally {
+      if (previousBoundPr === undefined) delete process.env.ELANOUS_TASK_BOUND_PR;
+      else process.env.ELANOUS_TASK_BOUND_PR = previousBoundPr;
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('기본 원장 writer 실패도 PR manager push를 막지 않는다', () => {
+    const home = mkdtempSync(join(tmpdir(), 'pr-push-forecast-writer-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const blocker = join(home, 'elanous-hq/seat-state/OP/train-manager');
+    mkdirSync(join(home, 'elanous-hq/seat-state/OP'), { recursive: true });
+    writeFileSync(blocker, 'not a directory');
+    try {
+      const { run, calls } = forecastRunner({ census: 'peer' });
+      const manager = makePrManager(run);
+      const result = manager.upsertPr(input);
+      expect(result).toMatchObject({ ok: true, reused: false });
+      expect(calls.some(call => call[0] === 'git' && call.includes('push'))).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 
   it('카드 후보 inventory 미측정은 새 draft로 관측하고 기존 가지를 강제 push하지 않는다', () => {
     const { run, calls } = stubRunner({ 'pr list': { ok: true, out: '' }, 'pr create': { ok: true, out: 'https://github.com/o/r/pull/91' } });

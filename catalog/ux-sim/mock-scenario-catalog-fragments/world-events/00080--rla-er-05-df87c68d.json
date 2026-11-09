@@ -1,0 +1,5 @@
+{
+  "id": "RLA-ER-05",
+  "name": "Host outage or load",
+  "description": "Measure automatic cell and pool adjustment."
+}

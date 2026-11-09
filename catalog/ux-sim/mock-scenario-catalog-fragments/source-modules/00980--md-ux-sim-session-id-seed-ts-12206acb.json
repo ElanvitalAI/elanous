@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SESSION-ID-SEED-TS",
+  "path": "src/ux-sim/session-id-seed.ts",
+  "boundary": "Seeds a session transcript and index row under a chosen ID for long-session and resume-picker fixtures.",
+  "deviceIds": [
+    "first-run-and-seminar"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

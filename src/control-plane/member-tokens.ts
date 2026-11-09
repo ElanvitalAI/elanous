@@ -1,9 +1,11 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, fsyncSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
+import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 
-interface MemberTokenEntry { sha256: string; issuedAt: string }
+export const MEMBER_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // cloud-join 하루 주기
+interface MemberTokenEntry { sha256: string; issuedAt: string; expiresAt?: string }
 type MemberTokenStore = Record<string, MemberTokenEntry>;
 
 function pathFor(root: string): string {
@@ -18,6 +20,17 @@ function checkMachine(machine: string): void {
   if (!validMachine(machine)) throw new Error('invalid control machine');
 }
 
+function validTokenEntry(entry: unknown): entry is MemberTokenEntry {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const keys = Object.keys(entry);
+  const legacy = keys.length === 2 && keys.every(key => ['sha256', 'issuedAt'].includes(key));
+  const expiring = keys.length === 3 && keys.every(key => ['sha256', 'issuedAt', 'expiresAt'].includes(key));
+  const token = entry as Partial<MemberTokenEntry>;
+  return (legacy || expiring) && typeof token.sha256 === 'string' && /^[a-f0-9]{64}$/.test(token.sha256) &&
+    typeof token.issuedAt === 'string' && !Number.isNaN(Date.parse(token.issuedAt)) &&
+    (token.expiresAt === undefined || (typeof token.expiresAt === 'string' && !Number.isNaN(Date.parse(token.expiresAt))));
+}
+
 function readStore(root: string): MemberTokenStore {
   const path = pathFor(root);
   let contents: string;
@@ -28,11 +41,7 @@ function readStore(root: string): MemberTokenStore {
   }
   const parsed: unknown = JSON.parse(contents);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
-      !Object.entries(parsed).every(([machine, entry]) =>
-        validMachine(machine) && entry !== null && typeof entry === 'object' && !Array.isArray(entry) &&
-        Object.keys(entry).length === 2 &&
-        typeof (entry as MemberTokenEntry).sha256 === 'string' && /^[a-f0-9]{64}$/.test((entry as MemberTokenEntry).sha256) &&
-        typeof (entry as MemberTokenEntry).issuedAt === 'string' && !Number.isNaN(Date.parse((entry as MemberTokenEntry).issuedAt)))) {
+      !Object.entries(parsed).every(([machine, entry]) => validMachine(machine) && validTokenEntry(entry))) {
     throw new Error('invalid control member tokens file');
   }
   const entries = parsed as MemberTokenStore;
@@ -60,7 +69,9 @@ export function issueMemberToken(machine: string, root: string = effectiveInstan
   checkMachine(machine);
   const entries = readStore(root);
   const token = randomBytes(32).toString('hex');
-  entries[machine] = { sha256: createHash('sha256').update(token).digest('hex'), issuedAt: new Date().toISOString() };
+  const issuedAt = Date.now();
+  entries[machine] = { sha256: createHash('sha256').update(token).digest('hex'), issuedAt: new Date(issuedAt).toISOString(),
+    expiresAt: new Date(issuedAt + MEMBER_TOKEN_TTL_MS).toISOString() };
   writeStore(root, entries);
   return token;
 }
@@ -80,7 +91,9 @@ export function issueMemberTokenToFile(machine: string, tokenFile: string, root:
       fsyncSync(fd);
     } finally { closeSync(fd); }
     const entries = readStore(root);
-    entries[machine] = { sha256: createHash('sha256').update(token).digest('hex'), issuedAt: new Date().toISOString() };
+    const issuedAt = Date.now();
+    entries[machine] = { sha256: createHash('sha256').update(token).digest('hex'), issuedAt: new Date(issuedAt).toISOString(),
+      expiresAt: new Date(issuedAt + MEMBER_TOKEN_TTL_MS).toISOString() };
     writeStore(root, entries);
   } catch (error) {
     if (outputCreated) try { unlinkSync(tokenFile); } catch { /* retain the original failure */ }
@@ -103,9 +116,14 @@ export function listMemberTokens(root: string = effectiveInstanceRoot()): Array<
 
 export function machineForToken(token: string, root: string = effectiveInstanceRoot()): string | undefined {
   const digest = createHash('sha256').update(token).digest();
+  const now = Date.now();
   let match: string | undefined;
-  for (const [machine, { sha256 }] of Object.entries(readStore(root))) {
-    if (timingSafeEqual(digest, Buffer.from(sha256, 'hex'))) match = machine;
+  for (const [machine, { sha256, expiresAt }] of Object.entries(readStore(root))) {
+    if (!timingSafeEqual(digest, Buffer.from(sha256, 'hex'))) continue;
+    if (expiresAt === undefined) {
+      debug.log('resource-ledger.auth', 'legacy-machine-token-without-exp', { machine });
+      match = machine;
+    } else if (Date.parse(expiresAt) > now) match = machine;
   }
   return match;
 }

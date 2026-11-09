@@ -6,7 +6,7 @@ import { onSessionCreated } from '../src/session/index.js';
 import { buildDiscordVoiceWire } from '../src/discord-voice-wire.js';
 import type { DcIncoming } from '../src/discord.js';
 import type { runTurn } from '../src/session/chat.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { createStubDiscordVoiceChannelAdapter } from '../src/voice/channel-adapters/discord-voice-channel-adapter.js';
 import { createDiscordVoiceStickyContextRuntime } from '../src/voice/channel-adapters/discord-voice-sticky-context.js';
 

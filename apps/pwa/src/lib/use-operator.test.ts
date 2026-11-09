@@ -90,9 +90,10 @@ test('SidebarNav gates operations separately from role/Labs and remembers group 
   operator = true;
   await act(async () => { for (const listener of listeners.get('storage') ?? []) listener({ key: null } as StorageEvent); });
   expect(root().findAllByProps({ 'aria-label': '운영🔒' })).toHaveLength(1);
-  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/bots');
-  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/ops/release');
-  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/ops/checklist');
+  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/bots');
+  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/loops');
+  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/ops/release');
+  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/ops/checklist');
   // NAV1b: a group with one visible item renders that item alone (no group header) — «대화» here has only /chat.
   expect(root().findAllByType('button').filter((button) => button.props['aria-controls'] === 'nav-group-talk')).toHaveLength(0);
   expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/chat');
@@ -107,8 +108,9 @@ test('SidebarNav gates operations separately from role/Labs and remembers group 
   await act(async () => { renderer!.unmount(); renderer = create(createElement(() => SidebarNav({ compact: true }))); });
   expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/chat');
   expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/exec');
-  // CEO-VIEW (#24088) put /ceo first in the ops group, so the collapsed compact rail shows it instead of /loops.
-  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/ceo');
+  // Retired ops screens are absent; the surviving ops destination is /loops.
+  expect(root().findAllByType('a').map((link) => link.props.href)).toContain('/loops');
+  expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/ceo');
   expect(root().findAllByType('a').map((link) => link.props.href)).not.toContain('/ops/checklist');
   operator = false;
   await act(async () => { for (const listener of listeners.get('storage') ?? []) listener({ key: null } as StorageEvent); });

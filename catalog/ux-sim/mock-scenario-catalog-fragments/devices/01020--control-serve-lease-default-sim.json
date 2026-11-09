@@ -1,0 +1,14 @@
+{
+  "id": "control-serve-lease-default-sim",
+  "name": "Control serve primary lease admission and fail-closed states",
+  "checklistCells": ["WARM-LEASE-PRIMARY-WIRE"],
+  "implementation": ["src/cli/control-cli.ts", "src/control-plane/lease-holder.ts"],
+  "tests": ["src/ux-sim/control-serve-lease-default-sim.test.ts"],
+  "target": "Exercise the production control serve HTTP boundary with isolated state and injected lease reads; no cloud, GCS, or HQ host is contacted.",
+  "inputs": ["measured current GCS lease", "absent GCS lease", "permission-denied GCS lease read", "malformed GCS lease", "unsupported GCS expiresAt", "absent HQ lease", "permission-denied HQ lease read", "malformed HQ lease", "HQ expiresAt metadata with a fresh TTL lease", "expired HQ lease"],
+  "observations": ["measured GCS and HQ leases permit registration", "absent, unreadable, malformed, and expired lease states return unknown primary and reject registration", "GCS client-side expiresAt is rejected; HQ authority is computed from renewedAt and ttlSeconds", "unmeasured reason is observable with the source and is not converted into authority"],
+  "entryCommands": ["bun test src/ux-sim/control-serve-lease-default-sim.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": ["control.primary.lease-observed"],
+  "recentUse": null
+}

@@ -1,0 +1,37 @@
+{
+  "id": "fake-adb-phone-world",
+  "name": "Fake Android Fold adb device",
+  "checklistCells": [
+    "PHONE-ADB-MCP-TOOLS",
+    "DEMO-1114-PHONE-PWA-SELFHEAL"
+  ],
+  "implementation": [
+    "src/ux-sim/fake-adb-phone-world.ts",
+    "src/skills/tools/phone-adb.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-adb-phone-world.test.ts",
+    "src/skills/tools/phone-adb.test.ts"
+  ],
+  "target": "Exercise Fold-sized dimensions and the five phone adb operations through a fixed-argv fake boundary, with no adb binary, physical phone, or external network",
+  "inputs": [
+    "fake adb serial and reported Fold screen dimensions",
+    "screenshot PNG and UI hierarchy bytes",
+    "tap, type and localhost/tailnet URL arguments"
+  ],
+  "observations": [
+    "screen dimensions are discovered from adb instead of a hardcoded resolution",
+    "screenshot and UI hierarchy are returned from the fake device boundary",
+    "tap, type and open-url use fixed argv without shell interpolation",
+    "the simulator records zero external network attempts"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-adb-phone-world.test.ts src/skills/tools/phone-adb.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "phone.adb/action",
+    "phone.adb/refused"
+  ],
+  "recentUse": null
+}

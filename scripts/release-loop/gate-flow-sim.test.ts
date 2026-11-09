@@ -10,10 +10,11 @@
 // 생산 진입점은 그대로다: 그래프 노드 → deps.runBash → `runGateNode(['--json'], env, runner)`.
 import { afterEach, expect, setDefaultTimeout, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGateRunner, runGateNode, type GateRunner, type GateTools } from './gate-node';
+import { savePassingGateFileReceipts } from './gate-runtime';
 import { withSimClock } from '../../src/ux-sim/fake-clock';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { runGraph } from '../../src/graph-runner/runner.js';
@@ -99,8 +100,12 @@ function fakeCheckout(repo: string): { base: string; cut: string } {
   mkdirSync(join(repo, 'src'), { recursive: true });
   mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
   mkdirSync(join(repo, 'node_modules'), { recursive: true });
-  writeFileSync(join(repo, 'src/broken.test.ts'), "import { test } from 'bun:test';\ntest('breaks', () => { throw new Error('boom'); });\n");
-  writeFileSync(join(repo, 'src/ok.test.ts'), "import { test } from 'bun:test';\ntest('works', () => {});\n");
+  mkdirSync(join(repo, 'apps/pwa/node_modules'), { recursive: true });
+  writeFileSync(join(repo, 'apps/pwa/.sim-pwa'), '');
+  mkdirSync(join(repo, 'scripts/release-loop'), { recursive: true });
+  copyFileSync(join(REPOSITORY_ROOT, 'scripts/release-loop/remote-worktree-setup.sh'), join(repo, 'scripts/release-loop/remote-worktree-setup.sh'));
+  writeFileSync(join(repo, 'src/broken.test.ts'), "test('breaks', () => { throw new Error('boom'); });\n");
+  writeFileSync(join(repo, 'src/ok.test.ts'), "test('works', () => {});\n");
   const git = (...args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
   expect(git('init', '-q').status).toBe(0);
   expect(git('add', '.').status).toBe(0);
@@ -156,6 +161,7 @@ test('GATE-FLOW-SIM S1: fake clock ⊕ fake Pod reproduce the gate node transiti
       // the gate's own clock starts there — every later second comes only from the Pods below, through the seam. The
       // global clock is never advanced, so a gate that read `Date.now` instead would measure 0 ms and this fails.
       let progressTick: (() => void) | undefined;
+      let heartbeatTick: (() => void) | undefined;
       // ② the fake Pod: the production shard shell, fake bun/timeout, one artifacts dir per Job.
       const podCalls: Array<{ commit: string; files: string[] }> = [];
       const shells: string[] = [];
@@ -169,11 +175,13 @@ test('GATE-FLOW-SIM S1: fake clock ⊕ fake Pod reproduce the gate node transiti
         // This Pod's wall time, in the gate's clock.
         clock.tick(POD_SECONDS * 1000);
         progressTick?.();
+        heartbeatTick?.();
         const home = join(root, `pod-home-${podCalls.length}`);
         mkdirSync(home, { recursive: true });
         const run = spawnSync('bash', ['-c', shell.replace(/^(pod_age|boot_age)=\$\(awk.*$/gm, (_line, name: string) => `${name}=0`)], {
           cwd: repo, encoding: 'utf8', timeout: 30_000,
-          env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, HOME: home, GATE_SIM_FAIL_FILE: commit === CUT ? 'src/broken.test.ts' : '' },
+          env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, HOME: home,
+            GATE_SIM_FAIL_FILE: commit === CUT ? 'src/broken.test.ts' : '' },
         });
         if (run.status !== 0) throw new Error(`fake Pod shell failed (rc=${run.status}): ${run.stderr || run.stdout}`);
         return { exitCode: 0, artifactsDir: join(home, 'outbox'), job: `gate-flow-sim-${podCalls.length}` };
@@ -193,6 +201,7 @@ test('GATE-FLOW-SIM S1: fake clock ⊕ fake Pod reproduce the gate node transiti
       const runner = createGateRunner(repo, undefined, command, undefined, undefined, undefined,
         { now: () => clock.now(), podCommand: pod, kubectl, ssh, remoteRun,
           progressScheduler: (tick, intervalMs) => { expect(intervalMs).toBe(60_000); progressTick = tick; return () => { progressTick = undefined; }; },
+          heartbeatScheduler: (tick, intervalMs) => { expect(intervalMs).toBe(60_000); heartbeatTick = tick; return () => { heartbeatTick = undefined; }; },
           podImageDigest: () => IMAGE_DIGEST,
           admission: { acquire: async () => () => {}, waitReason: () => null } });
 
@@ -244,6 +253,16 @@ edges:
       const phaseNames = progressLogSpy.mock.calls
         .filter(([category, event]) => category === 'release-loop.gate' && typeof event === 'string' && event.startsWith('phase-'))
         .map(([, event]) => String(event).slice('phase-'.length));
+      const correlationFields = ['runId', 'invocation', 'batch', 'shard', 'attempt', 'phase', 'host', 'podJob', 'file', 'evidenceLevel'];
+      const correlatedGateEvents = debug.events(500).filter((event) => event.category === 'release-loop.gate'
+        && (event.data as Record<string, unknown> | undefined)?.runId === RUN_ID);
+      expect(correlatedGateEvents.length).toBeGreaterThan(0);
+      expect(correlatedGateEvents.filter((event) => {
+        const data = event.data as Record<string, unknown> | undefined;
+        return !data || correlationFields.some((field) => !Object.hasOwn(data, field));
+      })).toEqual([]);
+      expect(correlatedGateEvents.some((event) => event.event === 'phase-heartbeat'
+        && typeof (event.data as Record<string, unknown> | undefined)?.phase === 'string')).toBe(true);
       for (const phaseName of ['shard-planning', 'shards-running', 'collection', 'classification', 'verdict'])
         expect(phaseNames).toContain(phaseName);
       expect(phaseNames.indexOf('shard-planning')).toBeLessThan(phaseNames.indexOf('shards-running'));
@@ -263,7 +282,9 @@ edges:
         // ① exactly three Pods, each ninety seconds on the injected clock: no real (or global) clock produces this.
         durationMs: POD_SECONDS * 1000 * 3,
         baselineSource: 'instance', baselineCache: { hits: 0, misses: 1 }, selectionMs: 0,
-        trainReceiptReuse: { carried: 0, total: 2, receipts: 0, reasons: ['gate receipt registry empty'] },
+        // The exact-file CAS planner is active even with no prior receipts: both uncovered files rerun, with no fallback reason.
+        trainReceiptReuse: { source: 'file-cas', carried: 0, total: 2, remeasure: 2, selectedFiles: 2,
+          receipts: 0, receiptKeys: [], reasons: [], reasonCounts: {}, planReasons: [] },
         summary: '게이트 regression: 1 new regressions · 환경 알려진 실패 0 · 재활용 웜 Pod 0',
         executor: 'pod', host: null,
       });
@@ -291,6 +312,15 @@ edges:
       const shard = JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-logs/cut/pod-0.json'), 'utf8')) as
         { durationMs: number; rc: number; files: string[]; commit: string };
       expect(shard).toMatchObject({ durationMs: POD_SECONDS * 1000, rc: 1, files: FILES, commit: CUT });
+      const fileReceiptDirectory = join(instanceRoot, 'release/1.0.1/gate-logs/cut/receipts/files');
+      // The file CAS records measured outcomes, including failures; this cut must leave one receipt per test file.
+      const fileReceipts = (existsSync(fileReceiptDirectory) ? readdirSync(fileReceiptDirectory) : [])
+        .map((name) => JSON.parse(readFileSync(join(fileReceiptDirectory, name), 'utf8')) as { file: string; outcome: string })
+        .map(({ file, outcome }) => ({ file, outcome })).sort((a, b) => a.file.localeCompare(b.file));
+      expect(fileReceipts).toEqual([
+        { file: 'src/broken.test.ts', outcome: 'fail' },
+        { file: 'src/ok.test.ts', outcome: 'pass' },
+      ]);
       expect(JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-verdict.json'), 'utf8')))
         .toMatchObject({ version: '1.0.1', commit: CUT, outcome: 'regression', introduced: [FAILURE], knownEnv: [] });
       const ledgerPath = join(instanceRoot, 'release/1.0.1/gate-logs/shard-ledger.jsonl');
@@ -299,6 +329,7 @@ edges:
       expect(completedReceipt).toMatchObject({ invocationId: expect.any(String), reuseDecision: 'rerun' });
       const ledgerSummary = progressLogSpy.mock.calls.find(([category, event]) => category === 'release-loop.gate' && event === 'shard-ledger-summary');
       expect(ledgerSummary?.[2]).toMatchObject({ invocationId: completedReceipt.invocationId, disposition: { reused: 0, rerun: 1, unmeasured: 0 } });
+
     });
   } finally {
     if (previousPath === undefined) delete process.env.PATH;
@@ -379,4 +410,34 @@ edges:
     && event.data?.path === 'graph' && event.data.decision === 'allow')).toBe(true);
   const gateNode = run!.nodes.find((node) => node.nodeId === 'gate')!;
   expect(String(gateNode.output)).toContain('host-not-in-pod-pool');
+});
+
+test('file receipt writer requires every file PASS ID and records fresh and carried heads atomically', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-file-receipt-writer-sim-'));
+  dirs.push(root);
+  const repo = join(root, 'repo');
+  mkdirSync(repo, { recursive: true });
+  const { base, cut } = fakeCheckout(repo);
+  const passedIds = ['src/broken.test.ts > works', 'src/ok.test.ts > works'];
+  const input = (receiptRoot: string, sourceHead40?: string, ids = passedIds) => ({
+    repo, root: receiptRoot, files: FILES, commit: cut, ...(sourceHead40 ? { sourceHead40 } : {}),
+    imageDigest: IMAGE_DIGEST, runs: [{ rc: 0, pass: ids.length, fail: 0, errors: 0, passedIds: ids }],
+    shardId: 'pod-0', attempt: 1, host: 'sim-host', runtimeIdentity: { os: 'linux', bunVersion: 'sim' },
+  });
+
+  const freshRoot = join(root, 'fresh');
+  expect(savePassingGateFileReceipts(input(freshRoot))).toBe(FILES.length);
+  const fresh = readdirSync(join(freshRoot, 'files')).map((name) => JSON.parse(readFileSync(join(freshRoot, 'files', name), 'utf8')) as Record<string, unknown>);
+  expect(fresh).toHaveLength(FILES.length);
+  expect(fresh.every((receipt) => receipt.outcome === 'pass' && receipt.sourceHead40 === cut && !receipt.carriedToHead40)).toBe(true);
+
+  const carriedRoot = join(root, 'carried');
+  expect(savePassingGateFileReceipts(input(carriedRoot, base))).toBe(FILES.length);
+  const carried = readdirSync(join(carriedRoot, 'files')).map((name) => JSON.parse(readFileSync(join(carriedRoot, 'files', name), 'utf8')) as Record<string, unknown>);
+  expect(carried).toHaveLength(FILES.length);
+  expect(carried.every((receipt) => receipt.outcome === 'pass' && receipt.sourceHead40 === base && receipt.carriedToHead40 === cut)).toBe(true);
+
+  const incompleteRoot = join(root, 'incomplete');
+  expect(savePassingGateFileReceipts(input(incompleteRoot, undefined, ['src/broken.test.ts > works']))).toBe(0);
+  expect(existsSync(join(incompleteRoot, 'files'))).toBe(false);
 });

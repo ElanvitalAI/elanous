@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/seminar-rehearsal.test.ts",
+  "reason": "Post-inventory catalog addition for backlog SW-FREEZE; it extends the existing first-run-and-seminar device and records the repeated-run freeze scenario."
+}

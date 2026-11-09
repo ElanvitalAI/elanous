@@ -11,7 +11,7 @@ import {
 import { SLASH_COMMANDS } from '../src/chat/index.js';
 import { FEATURE_MATURITY } from '../src/maturity/feature-maturity.js';
 import type { DcIncoming } from '../src/discord.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 
 const cfg = { discord: { botToken: 'tok' } } as unknown as UserConfig;
 

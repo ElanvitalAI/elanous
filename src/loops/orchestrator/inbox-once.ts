@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { resolveConfiguredAgentRoleLlm } from '../../user-config.js';
-import type { RoleLlmSpec } from '../../user-config.js';
+import type { RoleLlmSpec } from '../../user-config/types.js';
 import { loadAgentRolePack } from '../agent-reply.js';
 import type { MsgStore } from '../../msg/msg-store.js';
 import { runAskOpContextInbox, runCoordinatorAgentInbox, type AskOpContextInboxOptions, type CoordinatorInboxResult } from './inbox.js';

@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
@@ -10,10 +11,13 @@ import { parseOptions } from './gate-node.js';
 import { registerAdaptiveGateHealAdapter, RELEASE_GATE_FAILED_EVENT, type AdaptiveGateHealAppendNodeRequest } from './adaptive-gate-heal-adapter.js';
 import { classifyGateShadow } from './gate-triage-node.js';
 import { readGraphContext } from './node-verdict.js';
+import { runGateFileReceiptAuditNode } from './gate-file-receipt-audit-node.js';
+import { gateFileReceiptIdentityFromClosure, gateFileReceiptKey, type GateFileReceipt } from './gate-file-receipts.js';
 import { runGateImageRepairNode } from './gate-image-repair-node.js';
 import { gateImagePinPath } from './gate-image-pin.js';
 import { syncPoolImages } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import type { GateRunner } from './gate-node.js';
+import { writeReleaseGraphFixture } from '../../test/helpers/release-graph-fixture.js';
 
 const gateFailure = (): GateResult => ({ outcome: 'regression', commit: 'a'.repeat(40),
   introduced: ['src/release.test.ts > introduced failure'], preexisting: 0, fixed: null, knownEnv: 0,
@@ -180,7 +184,7 @@ test('RLA-ARG-ADAPTIVE-HEAL runner: real release event appends, runs once, and r
     expect(state.adaptiveGateNodeAppends).toHaveLength(1);
     expect(state.adaptiveGateNodeAppends?.[0]).toMatchObject({ graphRevision: 2,
       request: { runId: 'arg-runner-integration', visitState: { gate: 1, gateTriage: 1 }, maxRepairRetries: 1 } });
-    expect(state.path.indexOf(state.adaptiveGateNodeAppends![0]!.request.node.nodeId)).toBe(state.path.indexOf('gate') + 2);
+    expect(state.path.indexOf(state.adaptiveGateNodeAppends![0]!.request.node.nodeId)).toBe(state.path.indexOf('gate') + 3);
     expect(state.path[state.path.indexOf(state.adaptiveGateNodeAppends![0]!.request.node.nodeId) + 1]).toBe('gate');
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -191,8 +195,8 @@ test('RLA-ALL-LIVE sim: production prescription is consumed and failed repair wa
   const root = mkdtempSync(join('/tmp', 'rla-all-live-hitl-'));
   const commit = 'd'.repeat(40);
   let gateVisits = 0;
-  let liveTriage: Record<string, unknown> | undefined;
   let triageFailure = '';
+  let liveTriage: Record<string, unknown> | undefined;
   const commands: string[] = [];
   try {
     const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
@@ -211,7 +215,7 @@ test('RLA-ALL-LIVE sim: production prescription is consumed and failed repair wa
         if (child.status !== 0) { triageFailure = `exit=${child.status} stdout=${child.stdout} stderr=${child.stderr}`;
           return { exitCode: child.status ?? 1, stdout: child.stdout, stderr: child.stderr }; }
         liveTriage = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as Record<string, unknown>;
-        return { exitCode: 0, stdout: child.stdout, stderr: child.stderr };
+        return { exitCode: 0, stdout: child.stdout, stderr: '' };
       }
       if (body.includes('gate-repair-node.ts')) return { exitCode: 1,
         stdout: JSON.stringify({ outcome: 'fail', error: 'simulated repair failure' }), stderr: '' };
@@ -263,11 +267,89 @@ test('RLA-ALL-LIVE runner: malformed macrophage ladder fails closed at the HITL 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('RLA-ALL-LIVE sim: receipt audit rejects host attribution gaps and residual run retries on Pod in the same run', async () => {
+  const root = mkdtempSync(join('/tmp', 'rla-all-live-pod-retry-'));
+  const commit = 'e'.repeat(40);
+  const imageDigest = 'sha256:' + 'a'.repeat(64);
+  const testFile = 'src/release/receipt-audit-pod.test.ts';
+  const testSource = 'test("pod receipt", () => expect(true).toBe(true));\n';
+  const closureTree = { files: [testFile], preload: [], read: (path: string) => path === testFile ? testSource : undefined };
+  const identity = gateFileReceiptIdentityFromClosure(closureTree, testFile, imageDigest)!;
+  const closureDigest = createHash('sha256').update(JSON.stringify(identity.closureFiles.map((path) => [path, identity.contentHashes[path]]))).digest('hex');
+  let podReceipt: (GateFileReceipt & { recordSha256: string }) | undefined;
+  const gateExecutors: unknown[] = [];
+  const auditOutcomes: string[] = [];
+  const auditCoverage: number[] = [];
+  let gateVisits = 0;
+  const graphDir = join(root, 'graphs', 'release');
+  const graphPath = join(graphDir, 'release-loop.yaml');
+  try {
+    const productionGraph = readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8');
+    // Isolate receipt-audit recovery in a declared fixture; an undeclared YAML sibling under
+    // graphs/release is correctly denied by the production graph asset manifest.
+    const productionErrorEdge = 'error: gate-triage }';
+    expect(productionGraph).toContain(productionErrorEdge);
+    const receiptAuditGraph = productionGraph.replace(productionErrorEdge, 'error: receipt-audit }');
+    expect(receiptAuditGraph).not.toBe(productionGraph);
+    writeReleaseGraphFixture(graphPath, receiptAuditGraph);
+    copyFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), join(graphDir, 'recipes.yaml'));
+    const cwd = join(import.meta.dir, '../..');
+    const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (body, opts) => {
+      if (body.includes('version-node.ts release --json'))
+        return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit }), stderr: '' };
+      if (body.includes('gate-node.ts --json')) {
+        gateVisits++;
+        const context = readGraphContext(opts.env!);
+        gateExecutors.push(context.input.gateExecutor);
+        if (gateVisits === 1) return { exitCode: 2, stdout: JSON.stringify({ outcome: 'error', commit, introduced: [], stalledEnv: [], error: 'failure attribution incomplete' }), stderr: '' };
+        expect(context.input.gateExecutor).toBe('pod');
+        podReceipt = { file: testFile, closureFiles: [...identity.closureFiles], closureDigest, imageDigest,
+          key: gateFileReceiptKey(identity)!, sourceHead40: commit, outcome: 'pass',
+          evidence: { producer: 'simulated-pod-gate', runId: context.runId }, recordSha256: 'b'.repeat(64) };
+        return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit, introduced: [], stalledEnv: [] }), stderr: '' };
+      }
+      if (body.includes('gate-file-receipt-audit-node.ts')) {
+        const context = readGraphContext(opts.env!);
+        const { result, exitCode } = runGateFileReceiptAuditNode(context, {
+          repo: cwd, roots: { instance: root, ledger: root }, testsAtCommit: () => [testFile],
+          closureTree: () => closureTree, pinnedImage: () => imageDigest,
+          readReceipt: (_receiptRoot, key) => key === podReceipt?.key ? podReceipt : null,
+          finish: (_node, _version, value) => value.outcome === 'ok' ? 0 : value.outcome === 'fail' ? 1 : 2,
+        });
+        auditOutcomes.push(result.outcome);
+        auditCoverage.push(result.measurement.coveredFiles);
+        return { exitCode, stdout: JSON.stringify(result), stderr: '' };
+      }
+      if (body.includes('gate-triage-node.ts')) {
+        const child = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], { cwd, encoding: 'utf8', env: {
+          ...process.env, ...opts.env, ELANOUS_STATE_DIR: root,
+        } });
+        if (child.status !== 0) return { exitCode: child.status ?? 1, stdout: child.stdout, stderr: child.stderr };
+        return { exitCode: 0, stdout: child.stdout, stderr: child.stderr };
+      }
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
+    };
+    const state = await runGraph(graphPath, { runId: 'rla-all-live-pod-retry', input: {
+      version: '0.3.7', previousVersion: '0.3.6', gateExecutor: 'host', gatePodPool: 'pool-aws2@aws2:1', gateImagePin: 'cut-commit',
+    }, deps: { root, runBash } });
+    expect(gateVisits).toBe(2);
+    expect(gateExecutors).toEqual(['host', 'pod']);
+    expect(auditOutcomes).toEqual(['fail', 'ok']);
+    expect(auditCoverage).toEqual([0, 1]);
+    expect(state.path.filter((nodeId) => nodeId === 'gate' || nodeId === 'residual-run')).toHaveLength(2);
+    expect(state.path).toContain('receipt-audit');
+    expect(state.path).toContain('residual-run');
+    expect(state.path).toContain('receipt-audit-recheck');
+    expect(state.status).toBe('done');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the same run then waits at HITL', async () => {
   const root = mkdtempSync(join('/tmp', 'rla-all-live-pod-retry-'));
   const commit = 'e'.repeat(40);
   const gateExecutors: unknown[] = [];
   let gateVisits = 0;
+  let liveTriage: Record<string, unknown> | undefined;
   try {
     const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
     const cwd = join(import.meta.dir, '../..');
@@ -287,6 +369,7 @@ test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the sam
           ...process.env, ...opts.env, ELANOUS_STATE_DIR: root,
         } });
         if (child.status !== 0) return { exitCode: child.status ?? 1, stdout: child.stdout, stderr: child.stderr };
+        liveTriage = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as Record<string, unknown>;
         return { exitCode: 0, stdout: child.stdout, stderr: child.stderr };
       }
       return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
@@ -296,11 +379,14 @@ test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the sam
     }, deps: { root, runBash } });
     expect(gateVisits).toBe(2);
     expect(gateExecutors).toEqual(['host', 'pod']);
+    expect(liveTriage?.prescription).toMatchObject({ action: 'decision-required' });
     expect(state.path.filter((nodeId) => nodeId === 'gate')).toHaveLength(2);
+    expect(state.path).not.toContain('emergency-switch');
     expect(state.path).toContain('gate-heal-decision');
     expect(state.pending?.nodeId).toBe('gate-heal-decision');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
 
 test('RELEASE-RUN-HEAL-IMAGE-MISSING sim: same run builds and pins cut image, then reruns gate', async () => {
   const root = mkdtempSync(join('/tmp', 'release-image-missing-heal-'));

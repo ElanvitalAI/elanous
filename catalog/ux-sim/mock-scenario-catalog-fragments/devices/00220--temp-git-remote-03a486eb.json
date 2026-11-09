@@ -1,0 +1,24 @@
+{
+  "id": "temp-git-remote",
+  "name": "Temporary Git remote",
+  "implementation": [
+    "src/ux-sim/temp-git-remote.ts"
+  ],
+  "tests": [
+    "src/ux-sim/temp-git-remote.test.ts"
+  ],
+  "target": "real local git bare/clone boundary without GitHub",
+  "inputs": [
+    "temporary refs and commits"
+  ],
+  "observations": [
+    "local remote state",
+    "branch and commit result"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/temp-git-remote.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

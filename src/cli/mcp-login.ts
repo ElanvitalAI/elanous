@@ -1,7 +1,8 @@
 import { execFile } from 'node:child_process';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { promisify } from 'node:util';
-import { getUserConfig, reloadUserConfig, saveUserConfig, type McpServerSpec } from '../user-config.js';
+import { getUserConfig, reloadUserConfig, saveUserConfig } from '../user-config.js';
+import type { McpServerSpec } from '../user-config/types.js';
 import {
   discoverMcpOAuth,
   exchangeAuthorizationCode,

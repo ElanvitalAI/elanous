@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { sendTelegramDirect } from '../domains/outbound-alert.js';
 import { DEFAULT_KIND_ROLES, isTradingKind } from '../domains/telegram-kind-route.js';
 

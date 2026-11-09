@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-POD-PHASE-PREWARM-TS",
+  "path": "src/ux-sim/pod-phase-prewarm.ts",
+  "boundary": "Replays the production warm-Pod phase resolver and candidate admission against a simulated release clock; no host or cluster is contacted.",
+  "deviceIds": [
+    "pod-phase-prewarm"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

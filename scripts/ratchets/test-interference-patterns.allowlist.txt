@@ -2,13 +2,8 @@
 # 형식: <꼴>\t<파일>\t<개수> · 개수가 «늘면» scripts/ratchets/test-interference-patterns.test.ts 가 실패한다.
 # ⛔ 새 위반을 여기 더하지 마라 — 꼴의 처방대로 고친다. 줄었으면 다시 쓴다:
 # bun scripts/ratchets/test-interference-patterns.ts --update-allowlist
-body-dynamic-import	apps/pwa/src/components/design/MakeMySystem.test.tsx	2
-body-dynamic-import	apps/pwa/src/components/live/LiveBoard.test.tsx	4
-body-dynamic-import	apps/pwa/src/components/live/LiveMaxStage.public.test.tsx	4
-body-dynamic-import	apps/pwa/src/components/observatory/subject-list.test.ts	4
 body-dynamic-import	apps/pwa/src/components/ops/ReleaseFlow.test.tsx	3
 body-dynamic-import	apps/pwa/src/components/terminal/PtyLiveView.test.tsx	5
-body-dynamic-import	apps/pwa/src/components/terminal/TerminalPanel.interaction.test.tsx	6
 body-dynamic-import	apps/pwa/src/components/terminal/TerminalPanel.test.tsx	5
 body-dynamic-import	apps/pwa/src/components/terminal/TerminalTabs.interaction.test.tsx	1
 body-dynamic-import	apps/pwa/src/components/vault/MermaidDiagram.integration.test.tsx	3

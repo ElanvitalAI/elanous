@@ -194,6 +194,62 @@ describe('DaemonClient.subscribeChatEvents — fetch wiring', () => {
 });
 
 describe('runChatTurnObserver — placeholder lifecycle', () => {
+  it('carries the app_deploy receipt through the SSE observer', async () => {
+    const receipt = { kind: 'site-deploy', status: 'published', publicUrl: 'https://demo--alice.elanous.app/' };
+    globalThis.fetch = mockObserverResponse([
+      `event: turn-begin\ndata: {"sessionId":"sess-deploy"}\n\n`,
+      `event: tool-call\ndata: {"id":"d1","name":"app_deploy","args":{"appId":"demo"}}\n\n`,
+      `event: tool-result\ndata: ${JSON.stringify({ id: 'd1', name: 'app_deploy', ok: true, result: receipt })}\n\n`,
+      `event: turn-end\ndata: {"sessionId":"sess-deploy","text":"배포 완료","stopReason":"end_turn"}\n\n`,
+    ]);
+    let final: ChatMessage | undefined;
+    const dispose = runChatTurnObserver(makeClient(), 'sess-deploy', {
+      onPlaceholder: () => 'p-deploy',
+      onPartialBlocks: () => {},
+      onFinalize: (_id, message) => { final = message; },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    dispose();
+    expect(final?.blocks?.find((block) => block.kind === 'deploy_result')).toEqual({ kind: 'deploy_result', toolId: 'd1',
+      result: { status: 'published', publicUrl: receipt.publicUrl } });
+  });
+  it('uses turn-end text as the final answer even without a post-tool delta', async () => {
+    globalThis.fetch = mockObserverResponse([
+      `event: turn-begin\ndata: {"sessionId":"sess-final"}\n\n`,
+      `event: text-delta\ndata: {"delta":"진행 중","full":"진행 중"}\n\n`,
+      `event: tool-call\ndata: {"id":"t1","name":"Read"}\n\n`,
+      `event: turn-end\ndata: {"sessionId":"sess-final","text":"최종 답","stopReason":"end_turn"}\n\n`,
+    ]);
+    let final: ChatMessage | undefined;
+    const dispose = runChatTurnObserver(makeClient(), 'sess-final', {
+      onPlaceholder: () => 'p-final',
+      onPartialBlocks: () => {},
+      onFinalize: (_id, message) => { final = message; },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    dispose();
+    expect(final?.text).toBe('최종 답');
+    expect(final?.incomplete).toBeUndefined();
+  });
+
+  it('keeps abnormal turn-end prose folded', async () => {
+    globalThis.fetch = mockObserverResponse([
+      `event: turn-begin\ndata: {"sessionId":"sess-abort"}\n\n`,
+      `event: text-delta\ndata: {"delta":"부분 답","full":"부분 답"}\n\n`,
+      `event: turn-end\ndata: {"sessionId":"sess-abort","text":"부분 답","stopReason":"aborted"}\n\n`,
+    ]);
+    let final: ChatMessage | undefined;
+    const dispose = runChatTurnObserver(makeClient(), 'sess-abort', {
+      onPlaceholder: () => 'p-abort',
+      onPartialBlocks: () => {},
+      onFinalize: (_id, message) => { final = message; },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    dispose();
+    expect(final?.incomplete).toBe(true);
+    expect(final?.meta?.stopReason).toBe('aborted');
+  });
+
   it('synthesizes a placeholder on turn-begin and finalizes on turn-end', async () => {
     globalThis.fetch = mockObserverResponse([
       `event: subscribed\ndata: {"sessionId":"sess-rem"}\n\n`,
@@ -333,6 +389,7 @@ describe('runChatTurnObserver — placeholder lifecycle', () => {
       `event: turn-end\ndata: {"sessionId":"sess-reset","text":"second","stopReason":"end_turn"}\n\n`,
     ]);
     const placeholders: string[] = [];
+    const interrupted: string[] = [];
     let finalMsg: ChatMessage | null = null;
     const client = makeClient();
     const dispose = runChatTurnObserver(client, 'sess-reset', {
@@ -343,11 +400,13 @@ describe('runChatTurnObserver — placeholder lifecycle', () => {
       },
       onPartialBlocks: () => {},
       onFinalize: (_pid, msg) => { finalMsg = msg; },
+      onInterrupted: (id) => { interrupted.push(id); },
     });
     await new Promise((r) => setTimeout(r, 30));
     dispose();
     // Two placeholders allocated (one per turn-begin).
     expect(placeholders).toEqual(['p-0', 'p-1']);
+    expect(interrupted).toEqual(['p-0']);
     // Final text = second turn's content (not "firstsecond").
     const final = finalMsg as unknown as ChatMessage | null;
     expect(final!.text).toBe('second');

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-BURST-READY-LADDER-SIM-TS",
+  "path": "src/ux-sim/burst-ready-ladder-sim.ts",
+  "boundary": "Runs the purpose-specific burst warm-up and TTL scenario through the production fake-cloud-vm state machine and fake clock without provider calls.",
+  "deviceIds": [
+    "fake-cloud-vm"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

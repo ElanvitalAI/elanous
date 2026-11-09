@@ -113,23 +113,17 @@ describe('defaultSkillDirs — shared agent skills', () => {
       expect(defaultSkillDirs(cfgWith({ activeSet: 'custom', dirs: ['/first'], includeClaudePackageSkills: true }), opts))
         .toEqual(['/first', shared, join(pkg, 'skills'), bundledSkillsDir(home)]);
       expect(defaultSkillDirs(cfgWith({ activeSet: 'custom', dirs: [shared] }), opts)).toEqual([shared, bundledSkillsDir(home)]);
-      expect(defaultSkillDirs(cfgWith({ activeSet: 'custom', dirs: ['/first'], includeSharedAgentSkills: false }), opts))
-        .toEqual(['/first', bundledSkillsDir(home)]);
       const before = readdirSync(shared);
       defaultSkillDirs(cfgWith({}), opts);
       expect(readdirSync(shared)).toEqual(before);
     });
   });
 
-  test('config parsing retains explicit false through config load; omission defaults true', () => {
+  test('removed skills.includeSharedAgentSkills key is ignored on load (CONFIG-ALWAYS-TRUE-OUT)', () => {
     withTempRoot((root) => {
       const path = join(root, 'config.json');
       writeFileSync(path, JSON.stringify({ skills: { includeSharedAgentSkills: false } }));
-      expect(buildUserConfig(path).skills.includeSharedAgentSkills).toBe(false);
-      writeFileSync(path, JSON.stringify({ skills: {} }));
-      expect(buildUserConfig(path).skills.includeSharedAgentSkills).toBe(true);
-      writeFileSync(path, JSON.stringify({ skills: { includeSharedAgentSkills: true } }));
-      expect(buildUserConfig(path).skills.includeSharedAgentSkills).toBe(true);
+      expect('includeSharedAgentSkills' in buildUserConfig(path).skills).toBe(false);
     });
   });
 });

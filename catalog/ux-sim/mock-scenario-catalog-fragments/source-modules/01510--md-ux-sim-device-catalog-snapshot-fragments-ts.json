@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-DEVICE-CATALOG-SNAPSHOT-FRAGMENTS-TS",
+  "path": "src/ux-sim/device-catalog-snapshot-fragments.ts",
+  "boundary": "Reconstructs immutable per-version UX simulation device membership from catalog fragments and the released history baseline; performs no external calls.",
+  "deviceIds": [
+    "sim-universe-world-lifecycle"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

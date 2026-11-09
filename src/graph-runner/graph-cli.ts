@@ -101,13 +101,16 @@ export function registerGraphCommands(program: Command, runsDeps: {
     .option('--json', 'Print run state as JSON')
     .option('--resume <run_id>', 'Resume a persisted run awaiting approval or restart a failed path with --from')
     .option('--from <node_id>', 'Restart a failed run at a node on its saved path (requires --resume)')
+    .option('--from-visit <execution_id>', 'Restart a failed run at one exact saved node visit')
     .option('--use-current-graph', 'Use the installed graph rather than the run snapshot')
     .option('--input <json>', 'JSON object passed to the graph run')
-    .action(async (file: string, opts: { dryRun?: boolean; json?: boolean; resume?: string; from?: string; input?: string; useCurrentGraph?: boolean }) => {
+    .action(async (file: string, opts: { dryRun?: boolean; json?: boolean; resume?: string; from?: string; fromVisit?: string; input?: string; useCurrentGraph?: boolean }) => {
       try {
         await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
         if (opts.resume && opts.dryRun) throw new Error('--resume cannot be combined with --dry-run');
         if (opts.from && !opts.resume) throw new Error('--from requires --resume');
+        if (opts.fromVisit && !opts.resume) throw new Error('--from-visit requires --resume');
+        if (opts.from && opts.fromVisit) throw new Error('--from and --from-visit cannot be combined');
         let input: Record<string, unknown> | undefined;
         if (opts.input !== undefined) {
           let parsed: unknown;
@@ -116,7 +119,7 @@ export function registerGraphCommands(program: Command, runsDeps: {
           if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('--input must be a JSON object');
           input = parsed as Record<string, unknown>;
         }
-        const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from ? { fromNodeId: opts.from } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }) });
+        const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from ? { fromNodeId: opts.from } : {}), ...(opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }) });
         if (opts.json) await writeStdoutJson(JSON.stringify(state) + '\n');
         else console.log(`${state.graphId} ${state.runId}: ${state.status} (${(state.plannedPath ?? state.path).join(' → ')}, executed: ${state.executed})${state.pending ? ` — ${state.pending.message}` : ''}`);
         if (state.status !== 'done' && state.status !== 'awaiting-approval') process.exitCode = 1;
@@ -374,8 +377,16 @@ export function registerGraphCommands(program: Command, runsDeps: {
           const { graphTick } = await import('./graph-tick.js');
           const result = await graphTick(releaseGraph, { resumeRunId: runId, deps: { root: runsDeps.root, runBash: runsDeps.runBash } });
           console.log(`${state.graphId} ${state.runId}: ${state.pending?.decision} · ${result.action} ${result.status ?? ''}`.trim());
+          if (opts.reject) {
+            console.error(`${state.graphId} ${state.runId}: approval rejected${opts.by ? ` by ${opts.by}` : ''}`);
+            process.exitCode = 1;
+          }
         } else {
           console.log(`${state.graphId} ${state.runId}: ${state.pending?.decision}`);
+          if (opts.reject) {
+            console.error(`${state.graphId} ${state.runId}: approval rejected${opts.by ? ` by ${opts.by}` : ''}`);
+            process.exitCode = 1;
+          }
         }
       } catch (error) {
         console.error(`graph approve: ${error instanceof Error ? error.message : String(error)}`);
@@ -424,6 +435,22 @@ export function registerGraphCommands(program: Command, runsDeps: {
           if (matches.length !== 1) throw new Error(matches.length ? `ambiguous run id: ${runId}\n${matches.map(state => `${state.graphId}/${state.runId}`).join('\n')}` : `no run: ${runId}`);
           const saved = matches[0]!;
           const state = manageGraphRun(saved.graphId, saved.runId, action, runsDeps.root, runsDeps.processStartMs);
+          if (action === 'stop' && saved.graphId === 'release-loop' && saved.input && typeof saved.input === 'object') {
+            const version = (saved.input as Record<string, unknown>).version;
+            if (typeof version === 'string') {
+              const { gateShardsPath, markGateShardsStopRequested } = await import('../release-loop/gate-shards.js');
+              const path = gateShardsPath(version, runsDeps.root);
+              const requested = markGateShardsStopRequested(path, saved.runId);
+              if (requested) {
+                const { appendGateShardLifecycleState, gateShardLedgerPath } = await import('../release-loop/gate-shard-ledger.js');
+                const ids = requested.shards.filter((shard) => shard.state === 'stop-requested').map((shard) => shard.id);
+                const attemptIds = new Map(requested.shards.flatMap((shard) => shard.attemptId ? [[shard.id, shard.attemptId] as const] : []));
+                const ledgerErrors = appendGateShardLifecycleState(gateShardLedgerPath(version, runsDeps.root), ids, 'stop-requested', new Date().toISOString(), null, attemptIds);
+                debug.log('graph.runs', 'shard-stop-requested', { graphId: saved.graphId, runId: saved.runId, version,
+                  shards: ids.length, terminalConfirmed: false, ledgerErrors });
+              } else debug.log('graph.runs', 'shard-stop-unmeasured', { graphId: saved.graphId, runId: saved.runId, version }, { level: 'warn' });
+            }
+          }
           console.log(`${state.graphId} ${state.runId}: ${action === 'stop' ? state.status : 'destroyed'}`);
           warning(unreadable);
         } catch (error) {
@@ -434,10 +461,11 @@ export function registerGraphCommands(program: Command, runsDeps: {
   }
   runs.command('resume <run_id>')
     .option('--from <node_id>', 'Restart at this node on the saved path')
+    .option('--from-visit <execution_id>', 'Restart at one exact saved node visit')
     .option('--use-current-graph', 'Use the installed graph and enforce the original hash')
     .option('--file <path>', 'Graph file for a legacy run without a recorded graph path')
     .option('--json', 'Print run state as JSON')
-    .action(async (runId: string, opts: { from?: string; useCurrentGraph?: boolean; file?: string; json?: boolean }) => {
+    .action(async (runId: string, opts: { from?: string; fromVisit?: string; useCurrentGraph?: boolean; file?: string; json?: boolean }) => {
       try {
         await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
         if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(runId) || runId === '.' || runId === '..') throw new Error(`invalid run id: ${runId}`);
@@ -452,15 +480,17 @@ export function registerGraphCommands(program: Command, runsDeps: {
           return;
         }
         const saved = matches[0]!;
+        if (opts.from && opts.fromVisit) throw new Error('--from and --from-visit cannot be combined');
         if (saved.graphSnapshot && opts.file && (!saved.graphPath || resolve(opts.file) !== resolve(saved.graphPath))) {
           throw new Error('--file cannot change the graph path of a snapshot run (이 런은 시작 때 그래프 사본이 있다 — --file 대신 --use-current-graph)');
         }
-        const from = opts.from ?? (saved.status === 'failed' ? [...saved.nodes].reverse().find((node) => !node.ok)?.nodeId : undefined);
+        const from = opts.fromVisit ? undefined : opts.from ?? (saved.status === 'failed' ? [...saved.nodes].reverse().find((node) => !node.ok)?.nodeId : undefined);
         const file = saved.graphSnapshot
           ? saved.graphPath
           : opts.file ?? (saved.graphPath && existsSync(saved.graphPath) ? saved.graphPath : undefined) ?? findGraphFile(saved.graphId);
         if (!file) throw new Error(`graph file not found for ${saved.graphId}/${saved.runId}; provide --file`);
         const state = await runGraph(file, { resumeRunId: saved.runId, resumeGraphId: saved.graphId, fromNodeId: from,
+          ...(opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}),
           useCurrentGraph: opts.useCurrentGraph, deps: { root: runsDeps.root } });
         if (opts.json) await writeStdoutJson(JSON.stringify(state) + '\n');
         else console.log(`${state.graphId} ${state.runId}: ${state.status} (${state.path.join(' → ')}, executed: ${state.executed})`);

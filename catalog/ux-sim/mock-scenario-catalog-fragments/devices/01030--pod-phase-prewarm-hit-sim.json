@@ -1,0 +1,33 @@
+{
+  "id": "pod-phase-prewarm-hit-sim",
+  "name": "Release phase prewarm to first gate warm hit",
+  "implementation": [
+    "src/ux-sim/pod-phase-prewarm-sim.ts",
+    "src/task-orchestrator/surfaces/pod-warm-switch.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts"
+  ],
+  "tests": [
+    "src/ux-sim/pod-phase-prewarm-sim.test.ts"
+  ],
+  "target": "Production WarmPodProvider reconciliation followed by its first gate replay request",
+  "inputs": [
+    "release schedule and simulated clock",
+    "gate cut SHA and lock identity",
+    "in-memory Kubernetes and lease control plane"
+  ],
+  "observations": [
+    "phase target and actual prewarmed gate count",
+    "prewarm duration emitted by the production phase event",
+    "first gate request reuses the prepared Pod and completes through the provider transport"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/pod-phase-prewarm-sim.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "task-orchestrator.pod-phase/reconcile",
+    "pod.warm/request-selection",
+    "pod.reuse/warm-worker-selected"
+  ],
+  "recentUse": null
+}

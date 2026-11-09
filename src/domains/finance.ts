@@ -12,7 +12,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { elanousDaemonDir } from '../elanous-daemon.js';
 import { isKrHoliday, isUsHoliday, isUsEarlyClose, US_MARKET_TIME_ZONE } from './market-holidays.js';
 

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-TEMP-CLEANUP-TS",
+  "path": "src/ux-sim/fake-temp-cleanup.ts",
+  "boundary": "Creates isolated task-agent temporary roots through the shared suite tracker, simulates successful or exceptional suite teardown, and verifies unrelated host paths remain untouched.",
+  "deviceIds": [
+    "fake-temp-cleanup"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

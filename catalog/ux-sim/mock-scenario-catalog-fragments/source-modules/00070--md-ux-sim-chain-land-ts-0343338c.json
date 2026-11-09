@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-CHAIN-LAND-TS",
+  "path": "src/ux-sim/chain-land.ts",
+  "boundary": "Runs the production merge-train planning, integration and failure attribution; remote gate, queue lock, park and merge effects are injected boundaries.",
+  "deviceIds": [
+    "fake-land-queue"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

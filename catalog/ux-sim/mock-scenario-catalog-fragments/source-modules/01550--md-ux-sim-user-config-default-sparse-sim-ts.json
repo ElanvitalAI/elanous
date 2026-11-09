@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-USER-CONFIG-DEFAULT-SPARSE-SIM-TS",
+  "path": "src/ux-sim/user-config-default-sparse-sim.ts",
+  "boundary": "Exercises sparse user-config defaults and preserves explicit values in an isolated configuration simulation.",
+  "deviceIds": ["product-devices"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

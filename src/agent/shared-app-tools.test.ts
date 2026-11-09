@@ -9,7 +9,7 @@ import { buildSkillExecTool } from '../tool-runtime/skill-exec-runtime.js';
 import { setResearchInvoker } from '../research-bridge/invoke.js';
 import { resetUserConfig } from '../user-config.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 const cfg = (financeOn: boolean): UserConfig => ({ finance: { enabled: financeOn } } as unknown as UserConfig);
 

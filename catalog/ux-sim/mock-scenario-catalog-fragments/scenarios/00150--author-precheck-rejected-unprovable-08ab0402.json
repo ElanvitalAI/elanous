@@ -1,0 +1,22 @@
+{
+  "id": "AUTHOR-PRECHECK-REJECTED-UNPROVABLE",
+  "name": "Unsupported reviewer correction is rejected without applying text",
+  "kind": "goal-author-reviewer-precheck",
+  "device": "author-reviewer-precheck",
+  "implementation": [
+    "src/ux-sim/author-reviewer-precheck-device.ts",
+    "src/ux-sim/scenario.ts",
+    "scenarios/ux-sim/author-reviewer-precheck-rejected-unprovable.yaml"
+  ],
+  "tests": [
+    "src/ux-sim/scenario.test.ts"
+  ],
+  "trigger": "ScenarioV0 fake LLM proposes a sentence absent from the original ask",
+  "observe": [
+    "CLI runId equals authorRunId",
+    "revision-rejected status",
+    "appliedFixCount=0",
+    "one unapplied item"
+  ],
+  "expected": "PASS; unsupported correction is rejected-soft and original document remains unchanged"
+}

@@ -4,7 +4,7 @@ import { getUserConfig, resetUserConfig, setUserConfigOverlay } from '../../user
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 import { roleForKind } from '../../domains/telegram-kind-route.js';
 import { createNexusState } from '../state/state.js';
 import { TabRegistry } from '../state/tab-registry.js';

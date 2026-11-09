@@ -36,7 +36,7 @@ import type { CategorizeCallable } from './categorize.js';
 import type { AlignCallable } from './goal-align.js';
 import type { SingleSynthCallable } from './multi-spec.js';
 import type { IntakeCompareCaller, IntakePreprocessCaller } from './check.js';
-import type { ModelRole } from '../user-config.js';
+import type { ModelRole } from '../user-config/types.js';
 
 // ──────────────────── Public surface ─────────────────────────────────
 

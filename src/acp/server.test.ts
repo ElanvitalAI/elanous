@@ -51,6 +51,46 @@ test('DEBUG-GATE-INSIDE-LOG: lazy payload evaluation waits for logger gates', ()
   }
 });
 
+test('webterm :agent broadcasts ordered turn boundaries after its stream', async () => {
+  const bridge = createInProcessAcpBridge();
+  const abort = new AbortController();
+  const updates: Array<{ sessionUpdate: string; content?: { text?: string }; text?: string; stopReason?: string }> = [];
+  const server = runAcpServer({
+    shutdownSignal: abort.signal,
+    transportFactory: async (onConnection: AcpConnectionHandler): Promise<AcpTransportServer> => {
+      void onConnection({ readable: bridge.a.readable, writable: bridge.a.writable,
+        peerId: 'turn-end-test', close: async () => { try { await bridge.a.writable.close(); } catch {} } });
+      return { kind: 'in-process', address: 'test://turn-end',
+        close: async () => { try { await bridge.a.writable.close(); } catch {} } };
+    },
+    runTurn: async () => {},
+    runAgentTurn: async ({ sessionId, onTextDelta, onToolCall, onToolResultMeta }) => {
+      onTextDelta?.('초안', '초안');
+      onToolCall?.({ id: 'tool-1', name: 'demo', args: {} });
+      onToolResultMeta?.({ id: 'tool-1', name: 'demo', ok: true, summary: 'done' });
+      onTextDelta?.(' 최종', '초안 최종');
+      return { sessionId, markdown: '초안 최종', modelLabel: 'test', stopReason: 'end_turn', contextLines: 0 };
+    },
+  });
+  const client = new ClientSideConnection(() => ({
+    async sessionUpdate(notification: { update: unknown }) { updates.push(notification.update as typeof updates[number]); },
+    async requestPermission() { return { outcome: { outcome: 'cancelled' as const } }; },
+  }), ndJsonStream(bridge.b.writable, bridge.b.readable));
+  try {
+    await client.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const { sessionId } = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
+    await client.extMethod('terminal/repl/exec', { sessionId, terminalId: 'term-test', line: ':agent hi' });
+    expect(updates.map((update) => update.sessionUpdate)).toEqual([
+      'elanous_turn_begin', 'agent_message_chunk', 'tool_call', 'tool_call_update',
+      'agent_message_chunk', 'elanous_turn_end',
+    ]);
+    expect(updates.at(-1)).toMatchObject({ text: '초안 최종', stopReason: 'end_turn' });
+  } finally {
+    abort.abort();
+    await server;
+  }
+});
+
 test('runAcpServer routes filtered and enabled terminal attachment diagnostics through debug.log', async () => {
   const bridge = createInProcessAcpBridge();
   const abort = new AbortController();

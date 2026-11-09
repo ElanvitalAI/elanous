@@ -15,7 +15,7 @@
 import { describe, expect, test } from 'bun:test';
 import { createDashboardMouseWiring } from '../src/dashboard/input/mouse-wiring.js';
 import { createContextKeyService } from '../src/input-core/context-keys.js';
-import type { RotationEntry } from '../src/user-config.js';
+import type { RotationEntry } from '../src/user-config/types.js';
 import type { ActiveProviderInfo } from '../src/provider-summary.js';
 import type { ModalSurface } from '../src/display/modal-stack.js';
 import type { DisplayMouseEvent, HitTarget } from '../src/display/types.js';

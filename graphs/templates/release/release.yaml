@@ -1,0 +1,24 @@
+graph_id: release-template
+loop:
+  title: Release
+  description: Cut, test, approve, publish, and verify a caller's version.
+  trigger: { events: [manual] }
+version: 1
+entry_node: cut
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: cut, kind: git, recipe: 'cmd:cut', max_visits: 1 }
+  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 2 }
+  - { node_id: triage, kind: judge, recipe: 'cmd:triage', max_visits: 1 }
+  - { node_id: approve-publish, kind: hitl, recipe: 'approval:publish', max_visits: 1 }
+  - { node_id: publish, kind: git, recipe: 'cmd:publish-command', max_visits: 1 } # Publish once per instance; release-step owns the side effect.
+  - { node_id: verify, kind: gate, recipe: 'cmd:verify', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: cut, on: outcome, map: { ok: gate, fail: failed, error: failed } }
+  - { from: gate, on: outcome, map: { ok: approve-publish, fail: triage, error: triage } }
+  - { from: triage, on: outcome, map: { ok: gate, fail: failed, error: failed } }
+  - { from: approve-publish, on: outcome, map: { ok: publish, fail: failed, error: failed } }
+  - { from: publish, on: outcome, map: { ok: verify, fail: failed, error: failed } }
+  - { from: verify, on: outcome, map: { ok: done, fail: failed, error: failed } }

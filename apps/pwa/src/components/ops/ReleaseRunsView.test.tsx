@@ -2,10 +2,9 @@ import { describe, expect, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { act, create } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
-import { currentNodeId, ReleaseRunsContent, ReleaseRunsView } from './ReleaseRunsView';
-import { ReleaseStrip } from './ReleaseStrip';
-import ReleasePage from '../../app/ops/release/page';
+import { currentNodeId, mergeReleaseGateProgress, ReleaseRunsContent, ReleaseRunsView } from './ReleaseRunsView';
 import type { ReleaseRun, OpsResult } from '@/lib/ops-api';
+import type { ReleaseGateProgressEvent } from '@/lib/inside-events';
 
 // Put a global back exactly as it was (descriptor, not value) — re-defining it with `{ value }` leaves a
 // non-writable global behind, and the next file in the same bun process then fails on a plain assignment.
@@ -25,9 +24,14 @@ function render(result: OpsResult<ReleaseRun[]> | null, openedNodeId: string | n
     onVersion={() => {}} onRun={() => {}} onNode={() => {}} />);
 }
 describe('OPS1 release runs', () => {
-  test('direct release route mounts the release runs view', () => {
-    const page = ReleasePage();
-    expect(page).toMatchObject({ type: ReleaseRunsView });
+  test('merges persisted and live gate events one-to-one without collapsing same-source duplicates', () => {
+    const event = (eventId?: string): ReleaseGateProgressEvent => ({ graphId: 'release-loop', runId: 'r1', phase: 'shard-decision', shard: 's1',
+      decision: 'rerun', reason: 'radius-invalidated', at: '2026-11-07T00:00:00Z', ...(eventId ? { eventId } : {}) });
+    const stored = [event('stable-1'), event(), event()];
+    const live = [event('stable-1'), event(), event()];
+    expect(mergeReleaseGateProgress(stored, live)).toEqual(live);
+    expect(mergeReleaseGateProgress([event('stored-id')], [event('different-live-id')])).toHaveLength(2);
+    expect(mergeReleaseGateProgress([event()], [event(), event()])).toHaveLength(2);
   });
   test('current is first null in path order, falling back to last path node', () => {
     expect(currentNodeId(run)).toBe('waiting');
@@ -77,17 +81,15 @@ describe('OPS1 release runs', () => {
     expect(html).toContain('런이 달라 못 잼');
     expect(html).not.toContain('aria-label="발행 진행"');
   });
-  test('ambiguous ledger run ids cannot mix the strip and flow; a matching run uses one id', () => {
+  test('ambiguous ledger run ids cannot mix the selected run and flow', () => {
     const duplicate = { ...run, status: 'failed', path: ['other'], nodes: [{ nodeId: 'other', ok: false, summary: '다른 런' }] };
     const view = (data: ReleaseRun[]) => renderToStaticMarkup(<ReleaseRunsContent result={{ kind: 'ready', data }}
       version="0.2.9" selectedRun={run} openedNodeId={null} log={null}
-      onVersion={() => {}} onRun={() => {}} onNode={() => {}} onStripRun={() => {}} />);
+      onVersion={() => {}} onRun={() => {}} onNode={() => {}} />);
     const mixed = view([run, duplicate]);
     expect(mixed).toContain('런이 달라 못 잼');
-    expect(mixed).not.toContain('aria-label="발행 진행"');
     expect(mixed).not.toContain('aria-label="노드 진행"');
     const matched = view([run]);
-    expect(matched).toContain('aria-label="발행 진행" data-run-id="r1"');
     expect(matched).toContain('aria-label="노드 진행" data-run-id="r1"');
     expect(matched).not.toContain('못 잼');
   });
@@ -132,8 +134,6 @@ describe('OPS1 release runs', () => {
       await act(async () => { for (const tick of timers.values()) tick(); });
       expect(timers.size).toBe(0);
       expect(calls).toHaveLength(6);
-      const polledStrip = tree!.root.findByProps({ 'aria-label': '발행 진행' });
-      expect(polledStrip.findAllByType('span').some((span) => span.children.some((child) => typeof child === 'string' && child.includes('끝남')))).toBe(true);
       expect(tree!.root.findByProps({ 'aria-label': '노드 흐름' }).findAllByProps({ title: 'waiting' })).toHaveLength(1);
       await act(async () => { tree!.unmount(); });
       response = 'forbidden';
@@ -147,7 +147,7 @@ describe('OPS1 release runs', () => {
       restoreGlobal('document', originalDocument);
     }
   });
-  test('selected run stays identical in strip and flow after polling a different latest run', async () => {
+  test('selected run stays pinned in the graph after polling a different latest run', async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
     const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
@@ -175,31 +175,22 @@ describe('OPS1 release runs', () => {
       await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ReleaseRunsView /></DaemonContext.Provider>); });
       expect(calls).toEqual(['/v1/ops/release/runs']);
       expect(timers.size).toBe(1);
-      const strip = () => tree!.root.findByProps({ 'aria-label': '발행 진행' });
       const flow = () => tree!.root.findByProps({ 'aria-label': '노드 흐름' });
       const sameRun = (id: string) => {
-        expect(strip().props['data-run-id']).toBe(id);
         expect(tree!.root.findByProps({ 'aria-label': '노드 진행' }).props['data-run-id']).toBe(id);
       };
-      const chips = () => strip().findByProps({ 'aria-label': '발행 노드 순서' }).findAllByType('span')
-        .filter((chip) => chip.props.className?.includes('rounded-full')).map((chip) => chip.children.join(''));
       sameRun('latest');
-      expect(chips()).toEqual(['✓ first', 'waiting', 'last']);
       expect(flow().findAllByType('li').map((node) => node.props['data-node-state'])).toEqual(['done', 'current', 'pending']);
       const buttons = tree!.root.findByProps({ 'aria-label': '런 목록' }).findAllByType('button');
       await act(async () => { buttons[1]!.props.onClick(); });
       expect(tree!.root.findByProps({ 'aria-label': '런 목록' }).findAllByType('button')[1]!.props['aria-pressed']).toBe(true);
       sameRun('selected');
-      expect(strip().findAllByType('p').some((p) => p.children.join('') === '상태: failed')).toBe(true);
-      expect(chips()).toEqual(['✓ first', '✗ waiting', 'last']);
       expect(flow().findAllByType('li').map((node) => node.props['data-node-state'])).toEqual(['done', 'failed', 'pending']);
       expect(flow().findAllByType('span').some((span) => span.children.includes('01:45–02:00 · 15분'))).toBe(true);
       runs = [latest, { ...selected, status: 'completed', nodes: selected.nodes.map((node) => ({ ...node, ok: true })) }];
       await act(async () => { for (const tick of [...timers.values()]) tick(); });
       expect(calls).toEqual(['/v1/ops/release/runs', '/v1/ops/release/runs']);
       sameRun('selected');
-      expect(strip().findByType('p').children.join('')).toBe('상태: completed');
-      expect(chips()).toEqual(['✓ first', '✓ waiting', '✓ last']);
       expect(flow().findAllByType('li').map((node) => node.props['data-node-state'])).toEqual(['done', 'done', 'done']);
       expect(tree!.root.findByProps({ 'aria-label': '런 목록' }).findAllByType('button')[1]!.props['aria-pressed']).toBe(true);
     } finally {
@@ -207,14 +198,6 @@ describe('OPS1 release runs', () => {
       restoreGlobal('window', originalWindow);
       restoreGlobal('document', originalDocument);
     }
-  });
-  test('strip rejects an id different from the flow rather than showing nodes from another run', () => {
-    const another = { ...run, runId: 'another', path: ['other-node'], nodes: [{ nodeId: 'other-node', ok: null, summary: '다른 런' }] };
-    const html = renderToStaticMarkup(<ReleaseStrip result={{ kind: 'ready', data: [another] }} selectedRun={another}
-      expectedRunId="r1" onSelect={() => {}} />);
-    expect(html).toContain('런이 달라 못 잼');
-    expect(html).not.toContain('aria-label="발행 진행"');
-    expect(html).not.toContain('other-node');
   });
   test('a selected run removed by polling is not silently replaced by the latest run', async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -231,11 +214,9 @@ describe('OPS1 release runs', () => {
     let tree: ReturnType<typeof create> | undefined;
     try {
       await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ReleaseRunsView /></DaemonContext.Provider>); });
-      expect(tree!.root.findByProps({ 'aria-label': '발행 진행' }).props['data-run-id']).toBe('r1');
       runs = [other];
       await act(async () => { for (const tick of [...timers.values()]) tick(); });
       expect(JSON.stringify(tree!.toJSON())).toContain('런이 달라 못 잼');
-      expect(tree!.root.findAllByProps({ 'aria-label': '발행 진행' })).toHaveLength(0);
       expect(tree!.root.findAllByProps({ 'aria-label': '노드 진행' })).toHaveLength(0);
     } finally {
       if (tree) await act(async () => { tree!.unmount(); });
@@ -243,7 +224,7 @@ describe('OPS1 release runs', () => {
       restoreGlobal('document', originalDocument);
     }
   });
-  test('seat strip deep link opens the requested run even when its version is not the first run version', async () => {
+  test('run deep link opens the requested run even when its version is not the first run version', async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
     const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
@@ -262,13 +243,8 @@ describe('OPS1 release runs', () => {
       expect(calls).toEqual(['/v1/ops/release/runs']);
       expect(tree!.root.findByProps({ 'aria-label': '판' }).props.value).toBe('0.2.9');
       expect(tree!.root.findAllByType('button').filter((button) => button.props['aria-pressed'] === true)).toHaveLength(1);
-      const strip = tree!.root.findByProps({ 'aria-label': '발행 진행' });
       const flow = tree!.root.findByProps({ 'aria-label': '노드 흐름' });
-      expect(strip.props['data-run-id']).toBe('r1');
       expect(tree!.root.findByProps({ 'aria-label': '노드 진행' }).props['data-run-id']).toBe('r1');
-      expect(strip.findByProps({ 'aria-label': '발행 노드 순서' }).findAllByType('span')
-        .filter((chip) => chip.props.className?.includes('rounded-full')).map((chip) => chip.children.join(''))).toEqual(['✓ first', 'waiting', 'last']);
-      expect(strip.findByType('p').children.join('')).toBe('상태: running');
       expect(flow.findAllByType('li').map((node) => node.props['data-node-state'])).toEqual(['done', 'current', 'pending']);
       expect(flow.findAllByProps({ title: 'waiting' })).toHaveLength(1);
     } finally {
@@ -277,7 +253,7 @@ describe('OPS1 release runs', () => {
       restoreGlobal('document', originalDocument);
     }
   });
-  test('the strip and flow follow the same run across latest, list selection and version changes', async () => {
+  test('the graph follows the selected run across latest, list selection and version changes', async () => {
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
     const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
@@ -291,27 +267,21 @@ describe('OPS1 release runs', () => {
     let tree: ReturnType<typeof create> | undefined;
     try {
       await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ReleaseRunsView /></DaemonContext.Provider>); });
-      const stripNode = () => tree!.root.findByProps({ 'aria-label': '발행 노드 순서' });
       const flowNode = () => tree!.root.findByProps({ 'aria-label': '노드 흐름' });
       const sameRun = (id: string) => {
-        expect(tree!.root.findByProps({ 'aria-label': '발행 진행' }).props['data-run-id']).toBe(id);
         expect(tree!.root.findByProps({ 'aria-label': '노드 진행' }).props['data-run-id']).toBe(id);
       };
       sameRun('recent');
-      expect(stripNode().findAllByType('span').some((chip) => chip.children.includes('recent-node'))).toBe(true);
       expect(flowNode().findAllByProps({ title: 'recent-node' })).toHaveLength(1);
       const otherButton = tree!.root.findByProps({ 'aria-label': '런 목록' }).findAllByType('button').find((button) => button.props['aria-pressed'] === false)!;
       await act(async () => { otherButton.props.onClick(); });
       sameRun('same-version');
-      expect(stripNode().findAllByType('span').some((chip) => chip.children.includes('same-version-node'))).toBe(true);
       expect(flowNode().findAllByProps({ title: 'same-version-node' })).toHaveLength(1);
       await act(async () => { tree!.root.findByProps({ 'aria-label': '판' }).props.onChange({ target: { value: '0.2.9' } }); });
       sameRun('older');
-      expect(stripNode().findAllByType('span').some((chip) => chip.children.includes('older-node'))).toBe(true);
       expect(flowNode().findAllByProps({ title: 'older-node' })).toHaveLength(1);
       expect(flowNode().findAllByProps({ title: 'recent-node' })).toHaveLength(0);
       await act(async () => { tree!.root.findByProps({ 'aria-label': '판' }).props.onChange({ target: { value: '0.4.0' } }); });
-      expect(tree!.root.findAllByProps({ 'aria-label': '발행 진행' })).toHaveLength(0);
       expect(tree!.root.findAllByProps({ 'aria-label': '노드 흐름' })).toHaveLength(0);
     } finally {
       if (tree) await act(async () => { tree!.unmount(); });

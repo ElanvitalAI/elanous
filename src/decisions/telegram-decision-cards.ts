@@ -1,7 +1,7 @@
 // DEC-TG — 텔레그램 운반(운영 봇 DM). 판단은 decision-cards.ts 에 있고 여기는 «보내고·고치고·누름을 넘긴다»만 한다.
 // ⛔ 카드는 «폴링하는» 본 봇만 보낸다(넥서스가 폴링 없는 봇을 따로 세울 수 있다 — 두 번 가면 안 된다).
 import type { TelegramBot, TgCallbackQuery } from '../telegram.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { debug } from '../debug/log.js';
 import { DECISION_DATA_PREFIX, DecisionCardService, ghPrReplier, type CardTransport, type CardView } from './decision-cards.js';
 

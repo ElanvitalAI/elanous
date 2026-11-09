@@ -1,0 +1,11 @@
+{
+  "path": "scripts/release-loop/gate-bisect.test.ts",
+  "disposition": "device",
+  "entryCommand": "bun test scripts/release-loop/gate-bisect.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Simulated two-file regression bisect, three shadow agreements, and unchanged release verdict.",
+  "deviceId": "release-graph-rig",
+  "scenarioIds": [
+    "UX-MS-02"
+  ]
+}

@@ -1,6 +1,7 @@
 import { debug } from '../debug/log.js';
 import { readFileSync } from 'node:fs';
-import { getUserConfig, parseEventsConfig, userConfigPath, type EventsConfig } from '../user-config.js';
+import { getUserConfig, parseEventsConfig, userConfigPath } from '../user-config.js';
+import type { EventsConfig } from '../user-config/types.js';
 import { dispatchHook, type HookWake } from './dispatch.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { HookQueue, type QueuedHook } from './queue.js';

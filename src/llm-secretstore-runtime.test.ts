@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { getProviderForConfigAsync } from './llm.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
 
 test('setup service key resolves from SecretStore into the mocked production provider request only', async () => {

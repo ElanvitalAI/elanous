@@ -9,7 +9,7 @@ import {
   buildOutboundSubstrate,
   expandHome,
 } from '../src/notifications/outbound-boot.js';
-import type { ApnsUserConfig } from '../src/user-config.js';
+import type { ApnsUserConfig } from '../src/user-config/types.js';
 import type { ApnsTransportOpts } from '../src/notification-apns.js';
 import type { ApnsTransport } from '../src/showroom/outbound/channels/ios-push.js';
 

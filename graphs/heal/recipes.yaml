@@ -15,5 +15,7 @@ revise-goal:
   command: "bun scripts/heal/run-role.ts revise-goal"
 observe-deeper:
   command: "bun scripts/heal/run-role.ts observe-deeper"
+observe-deeper-failure:
+  approval: "observe-deeper failed; inspect the failure signature and decide whether to close this heal run for human follow-up."
 ground-external:
   command: "bun scripts/heal/run-role.ts ground-external"

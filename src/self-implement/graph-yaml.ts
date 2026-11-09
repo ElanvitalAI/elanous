@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 import { parseGraphRunContract, type GraphRunContractSpec } from './graph-run-contract.js';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -580,10 +581,6 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     },
     errors, warnings,
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {

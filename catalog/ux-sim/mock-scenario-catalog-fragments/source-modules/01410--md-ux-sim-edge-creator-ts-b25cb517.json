@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-EDGE-CREATOR-TS",
+  "path": "src/ux-sim/edge-creator.ts",
+  "boundary": "Builds a deterministic pairwise plan across graph outcome, interruption, mutation, and environment axes while retaining incident seed tuples; runs E5 through production graph-runner control and interrupted same-run resume processes, checking append, receipt, and fake idempotency evidence.",
+  "deviceIds": [
+    "edge-creator"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

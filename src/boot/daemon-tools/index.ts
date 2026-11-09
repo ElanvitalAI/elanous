@@ -399,6 +399,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
         signal: ctx.signal,
         ...(ctx.requestOrigin ? { requestOrigin: ctx.requestOrigin } : {}),
         ...(ctx.verifiedOwner ? { verifiedOwner: ctx.verifiedOwner } : {}),
+        ...(ctx.appDeploymentSession ? { appDeploymentSession: ctx.appDeploymentSession } : {}),
         ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
         ...(ctx.surfaceHitlChannels ? { confirmChannels: ctx.surfaceHitlChannels } : {}),
         ...(ctx.toolCallId ? { toolCallId: ctx.toolCallId } : {}),

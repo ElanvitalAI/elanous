@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dispatchReleaseStatus } from '../domains/release-tool.js';
@@ -7,9 +7,10 @@ import { buildDashboardSlashRegistry, type DashboardSlashContext } from '../dash
 import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import { writeSchedule } from '../release-loop/feature-store.js';
 import { enableLandingFreeze } from '../release-loop/landing-freeze.js';
-import { contextNow, releaseFactSummary, type ContextFact, type ContextNowDeps } from './context-now.js';
+import { contextNow, releaseFactSummary, releaseRunContextSummary, type ContextFact, type ContextNowDeps } from './context-now.js';
 import { renderTelegramNow, renderTuiNow } from './context-now-surfaces.js';
 import { defaultTelegramCommands, parseTelegramSlash } from '../telegram-commands.js';
+import { createSweepCertificate, writeSweepCertificate } from '../../scripts/release-loop/sweep-cert.js';
 
 async function telegramReleaseReply(deps: ContextNowDeps): Promise<string> {
   const command = parseTelegramSlash('/release', defaultTelegramCommands(deps));
@@ -38,9 +39,11 @@ test('RLA-CONTEXT-BUS-RELEASE-STATUS: Telegram, TUI and release_status share one
     mkdirSync(runs, { recursive: true });
     writeFileSync(join(runs, `${runId}.json`), JSON.stringify({ graphId: 'release-loop', runId, startedAt: at,
       status: 'running', path: ['cut', 'gate'], currentNode: { nodeId: 'gate', startedAt: at },
-      input: { version, publishAt: '2026-11-06T08:00:00.000Z' }, nodes: [
+      input: { version, publishAt: '2026-11-06T08:00:00.000Z' }, etaMinutes: 120, nodes: [
         { nodeId: 'cut', ok: true, exit: 0, executed: true, output: { outcome: 'ok' },
           waiver: { reason: 'accepted simulated issue', approvedBy: 'OP', at } },
+        { nodeId: 'receipt-audit', ok: null, startedAt: at, output: { measurement: { complete: false, totalFiles: 3, coveredFiles: 2 } } },
+        { nodeId: 'residual-run', ok: null, startedAt: at, output: { measurement: { totalFiles: 99, coveredFiles: 0, unmeasuredFiles: 99 } } },
       ] }) + '\n');
     const shards = join(root, 'release', version, 'gate-logs', 'cut');
     const shardsFile = join(shards, 'shards.json');
@@ -50,6 +53,12 @@ test('RLA-CONTEXT-BUS-RELEASE-STATUS: Telegram, TUI and release_status share one
         { id: 'pod-0', state: 'done', rc: 0, plannedMin: 1 },
         { id: 'pod-1', state: 'running', startedAt: at, plannedMin: 10 },
       ] }) + '\n');
+    const certificateRoot = join(shards, 'receipts');
+    const certificate = createSweepCertificate({ sourceCommit: 'a'.repeat(40), imageDigest: 'sha256:' + 'c'.repeat(64),
+      expectedFiles: ['test/a.test.ts'], measuredFileKeys: { 'test/a.test.ts': 'd'.repeat(64) },
+      requestedConcurrency: 1, observedConcurrency: 1, measuredAt: Date.parse(at), runSucceeded: true,
+      maxAgeMs: Number.MAX_SAFE_INTEGER, maxDirtyRatio: Number.EPSILON, thresholdSource: 'sim' });
+    writeSweepCertificate(certificateRoot, certificate);
     mkdirSync(join(root, 'release', version), { recursive: true });
     const gateVerdictPath = join(root, 'release', version, 'gate-verdict.json');
     writeFileSync(gateVerdictPath, JSON.stringify({ version, commit: 'a'.repeat(40), outcome: 'regression',
@@ -65,12 +74,16 @@ test('RLA-CONTEXT-BUS-RELEASE-STATUS: Telegram, TUI and release_status share one
       seatEntries: () => [], events: () => [], runningRuns: () => [], lateSchedules: () => null };
     const answer = contextNow({ topic: '발행 상황' }, deps);
     const release = answer.facts.find(fact => fact.kind === 'release');
-    expect(release).toMatchObject({ kind: 'release', version, phase: 'gate', currentNode: 'gate',
-      nextAction: 'gate 완료 대기', gateProgress: { completed: 1, total: 2 },
+    expect(releaseRunContextSummary(runId, { stateRoot: root, ledgerRoot: root, events: [], now: new Date(at) }))
+      .toBe(releaseFactSummary(release as Extract<ContextFact, { kind: 'release' }>));
+    expect(release).toMatchObject({ kind: 'release', version, phase: 'running', currentNode: null,
+      nextAction: '다음 노드 관측 대기', gateProgress: { completed: 1, total: 2 },
       regressions: { introduced: 2, preexisting: 1 }, receiptStatus: 'valid',
       waiverEvents: ['cut: accepted simulated issue · 승인 OP'], emergencySwitch: { state: 'unknown' },
       landingFreeze: { state: 'on', reason: 'simulated emergency hold' },
-      expectedPublishAt: '2026-11-06T08:00:00.000Z' });
+      expectedPublishAt: '2026-11-06T08:00:00.000Z', etaMinutes: 120,
+      auditCoverage: { uncoveredFiles: 1, totalFiles: 3 }, residualRuns: 1, sweepCertificateAgeMinutes: 0,
+      failureCounts: { introduced: 2, preexisting: 1, undetermined: null } });
 
     const telegram = await telegramReleaseReply(deps);
     const tuiLines = await tuiReleaseReply(deps);
@@ -87,10 +100,34 @@ test('RLA-CONTEXT-BUS-RELEASE-STATUS: Telegram, TUI and release_status share one
         'receipt-status=elanous://release/9.8.7/gate-verdict',
         'waivers=elanous://graph-runs/release-loop/release-sim-1',
         'landing-freeze=elanous://landing-freeze',
-        'expected-publish-at=elanous://release/9.8.7/schedule']) {
+        'expected-publish-at=elanous://release/9.8.7/schedule',
+        'ETA 120m', '미덮임 1/3', 'residual 실행 1', 'sweep 증명서 나이 0m',
+        '실패 introduced 2 / preexisting 1 / 미판정 ?']) {
         expect(output).toContain(token);
       }
     }
+
+    const invalidAuditRunPath = join(runs, `${runId}.json`);
+    const invalidAuditRun = JSON.parse(readFileSync(invalidAuditRunPath, 'utf8'));
+    const auditNode = invalidAuditRun.nodes.find((node: { nodeId: string }) => node.nodeId === 'receipt-audit');
+    auditNode.output.measurement.coveredFiles = -1;
+    delete auditNode.output.measurement.unmeasuredFiles;
+    writeFileSync(invalidAuditRunPath, JSON.stringify(invalidAuditRun) + '\n');
+    const invalidAudit = contextNow({ topic: '발행 상황' }, deps).facts.find(fact => fact.kind === 'release');
+    expect(invalidAudit).toMatchObject({ auditCoverage: null });
+    expect(releaseFactSummary(invalidAudit!)).toContain('미덮임 ?/?');
+
+    const malformedAuditPath = join(runs, `${runId}.json`);
+    const malformedAuditRun = JSON.parse(readFileSync(malformedAuditPath, 'utf8'));
+    const malformedAuditNode = malformedAuditRun.nodes.find((node: { nodeId: string }) => node.nodeId === 'receipt-audit');
+    malformedAuditNode.output.measurement.unmeasuredFiles = -1;
+    const invalidExplicitAudit = contextNow({ topic: '발행 상황' }, deps).facts.find(fact => fact.kind === 'release');
+    expect(invalidExplicitAudit).toMatchObject({ auditCoverage: null });
+    malformedAuditNode.output.measurement = { totalFiles: 3, coveredFiles: -1 };
+    writeFileSync(malformedAuditPath, JSON.stringify(malformedAuditRun) + '\n');
+    const invalidDerivedAudit = contextNow({ topic: '발행 상황' }, deps).facts.find(fact => fact.kind === 'release');
+    expect(invalidDerivedAudit).toMatchObject({ auditCoverage: null });
+    expect(releaseFactSummary(invalidDerivedAudit!)).toContain('미덮임 ?/?');
 
     writeSchedule(version, { cutAt: at, publishAt: '2026-11-06T09:00:00.000Z' }, 'sim-update', root);
     const rescheduled = contextNow({ topic: '발행 상황' }, deps).facts.find(fact => fact.kind === 'release');
@@ -99,12 +136,37 @@ test('RLA-CONTEXT-BUS-RELEASE-STATUS: Telegram, TUI and release_status share one
     expect(await telegramReleaseReply(deps)).toContain('09:00');
     expect((await tuiReleaseReply(deps)).join('\n')).toContain('09:00');
 
-    rmSync(join(runs, `${runId}.json`));
+    const runLedgerPath = join(runs, `${runId}.json`);
+    const runLedger = JSON.parse(readFileSync(runLedgerPath, 'utf8'));
+    delete runLedger.etaMinutes;
+    runLedger.nodes[0].output = { outcome: 'ok', introduced: [null], undetermined: 4 };
+    runLedger.nodes[2].output = { outcome: 'running', introduced: 3, preexisting: 3, undetermined: 1.5 };
+    writeFileSync(runLedgerPath, JSON.stringify(runLedger) + '\n');
+    rmSync(gateVerdictPath);
+    rmSync(shardsFile);
+    const withoutVerdict = contextNow({ topic: '발행 상황' }, deps).facts.find(fact => fact.kind === 'release');
+    expect(withoutVerdict).toMatchObject({ etaMinutes: null, failureCounts: { introduced: 3, preexisting: 3, undetermined: 4 } });
+
+    delete runLedger.nodes;
+    writeFileSync(runLedgerPath, JSON.stringify(runLedger) + '\n');
+    const withoutNodes = contextNow({ topic: '발행 상황' }, deps).facts.find(fact => fact.kind === 'release');
+    expect(withoutNodes).toMatchObject({ residualRuns: null });
+    expect(releaseFactSummary(withoutNodes!)).toContain('residual 실행 ?');
+
+    rmSync(runLedgerPath);
+    rmSync(certificateRoot, { recursive: true, force: true });
     const withoutRun = contextNow({ topic: '발행 상황' }, deps).facts.find(fact => fact.kind === 'release');
     expect(withoutRun).toMatchObject({ status: 'no-run', node: '런 없음', expectedPublishAt: '2026-11-06T09:00:00.000Z',
       landingFreeze: { state: 'on' } });
     expect(withoutRun?.sourceRefs?.some(ref => ref.signal === 'expected-publish-at' && ref.source === 'elanous://release/9.8.7/schedule')).toBe(true);
     expect(withoutRun?.sourceRefs?.some(ref => ref.signal === 'landing-freeze' && ref.source === 'elanous://landing-freeze')).toBe(true);
+    expect(withoutRun).toMatchObject({ etaMinutes: null, auditCoverage: null, residualRuns: null, failureCounts: null });
+    const unknownSummary = releaseFactSummary(withoutRun!);
+    expect(unknownSummary).toContain('ETA 미측정');
+    expect(unknownSummary).toContain('미덮임 ?/?');
+    expect(unknownSummary).toContain('residual 실행 ?');
+    expect(unknownSummary).toContain('sweep 증명서 나이 ?');
+    expect(unknownSummary).toContain('실패 introduced ? / preexisting ? / 미판정 ?');
     expect(dispatchReleaseStatus({ topic: 'ops' }, { contextNow: options => contextNow(options, deps) }).text).toContain('no-run');
     expect(await telegramReleaseReply(deps)).toContain('no-run');
     expect((await tuiReleaseReply(deps)).join('\n')).toContain('no-run');

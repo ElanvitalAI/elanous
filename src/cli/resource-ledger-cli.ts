@@ -1,4 +1,10 @@
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { parse } from 'yaml';
+import { readNexusRuntime } from '../nexus/runtime.js';
+import { ensureAuthToken } from '../auth/acp-token.js';
+import { parseMachinePoolDeclarations, type MachinePoolDeclaration } from '../resource-ledger/machine-pool-inventory.js';
+import { assertResourceLedgerUrl } from '../../scripts/resource-ledger-url.js';
 import type { Command } from 'commander';
 import { getUserConfig } from '../user-config.js';
 import { parsePodPool, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
@@ -201,9 +207,63 @@ export function buildResourceLedgerSnapshot(deps: Required<Pick<ResourceLedgerCl
   return { ledgerPath: resourceLedgerPath(), observedAt: deps.now().toISOString(), readStatus: 'ok' as const, matrix, leases: selectedLeases, recentReclaims, measurements: selectedMeasurements, findings };
 }
 
+export async function postResourcePoolDeclaration(pool: MachinePoolDeclaration, options: {
+  baseUrl: string; bearerToken: string; fetch?: typeof fetch;
+}): Promise<boolean> {
+  if (!options.bearerToken) throw new Error('owner bearer unavailable');
+  let endpoint: URL;
+  try {
+    const base = new URL(options.baseUrl);
+    if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash)
+      throw new Error();
+    endpoint = new URL('/v1/resource-ledger/pools', base);
+    assertResourceLedgerUrl(endpoint.toString());
+  } catch { throw new Error('invalid Nexus base URL'); }
+  let response: Response;
+  try {
+    response = await (options.fetch ?? fetch)(endpoint, {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + options.bearerToken, 'content-type': 'application/json' },
+      body: JSON.stringify({ pool }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch { throw new Error('resource pool declaration endpoint unavailable'); }
+  if (response.status === 201) return true;
+  if (response.status === 200) return false;
+  throw new Error('resource pool declaration rejected (HTTP ' + response.status + ')');
+}
+
 export function registerResourceLedgerCommands(resources: Command, overrides: ResourceLedgerCliDeps = {}): void {
   const deps = { events: overrides.events ?? readResourceLedger, hosts: overrides.hosts ?? defaultResourceHosts,
     run: overrides.run ?? defaultResourceRun, now: overrides.now ?? (() => new Date()) };
+  resources.command('declare-pool').description('owner-auth Nexus 원장에 기계 풀 선언을 추가 (YAML/JSON pools 입력)')
+    .requiredOption('--file <path>', 'pools 배열이 있는 YAML/JSON 선언 파일')
+    .option('--url <url>', 'Nexus base URL (기본: ELANOUS_NEXUS_URL 또는 실행 중인 로컬 Nexus)')
+    .option('--json', 'JSON 출력')
+    .action(async (opts: { file: string; url?: string; json?: boolean }) => {
+      try {
+        const parsed = parse(readFileSync(opts.file, 'utf8')) as unknown;
+        const pools = parseMachinePoolDeclarations(parsed);
+        if (pools.length === 0) throw new Error('pool declarations are empty');
+        const runtime = readNexusRuntime();
+        const baseUrl = opts.url ?? process.env.ELANOUS_NEXUS_URL
+          ?? (runtime?.httpPort ? 'http://127.0.0.1:' + runtime.httpPort : undefined);
+        if (!baseUrl) throw new Error('Nexus URL unavailable');
+        const bearerToken = ensureAuthToken().token;
+        const results: Array<{ purpose: string; fanoutGroupId: string; created: boolean }> = [];
+        for (const pool of pools) {
+          const created = await postResourcePoolDeclaration(pool, { baseUrl, bearerToken });
+          results.push({ purpose: pool.purpose, fanoutGroupId: pool.fanoutGroupId, created });
+        }
+        if (opts.json) console.log(JSON.stringify({ ok: true, declarations: results }));
+        else console.log('resource pools declared=' + results.filter(row => row.created).length
+          + ' existing=' + results.filter(row => !row.created).length);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'unknown error';
+        console.error('resource pool declaration failed: ' + message);
+        process.exitCode = 1;
+      }
+    });
   resources.command('reassign-pools').description('현재 호스트의 활성 풀 선언을 이전 대상 호스트로 원장에 재지정')
     .requiredOption('--from-host <host>', '이전 호스트').requiredOption('--to-host <host>', '대상 호스트').option('--json', 'JSON 출력')
     .action((opts: { fromHost: string; toHost: string; json?: boolean }) => {

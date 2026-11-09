@@ -1,9 +1,10 @@
 import { setDefaultTimeout, afterEach, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { createHash } from 'node:crypto';
 import { parse as parseYaml } from 'yaml';
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
+import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createGateRunner, createGateRootLimiter, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, mismatchedGateRosterImagePools, parseOptions, readIsolatedRun, readShardArtifacts, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, releaseGatePoolStartBlock, runGateNode, runWarmPrecutCanary, warmCommandMatchesRequest, warmEvidenceFromVerdicts, withWarmGateHooks, resolveWarmProviderConfig, warmProviderTarget, type WarmGateControlDependencies, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, gateAdmissionWaitSeconds, gateReceiptReuseKey, planGateRiskLaneShards, reconcileStaleGateShardBoard, parseGateInstallSlotWaitMs, gatePreparationTimings, gateVolumeRefOutput, type GateAdmission, type GateOptions, type GateRunner, sameHeadPreexistingFailureIds, writeGateVerdictRecord } from './gate-node';
@@ -11,12 +12,14 @@ import { cleanRetryVerdict, failedJunitFiles } from './gate-shard-load-flaky';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { buildUserConfig, getUserConfig, resetUserConfig } from '../../src/user-config.js';
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
+import { simCli } from '../../src/ux-sim/in-process-cli.js';
 import { debug } from '../../src/debug/log.js';
 import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { planPartialRegate, planStalledShardRecheck, writePartialPlan, writeRecheckPlan } from './gate-partial';
 import { hardRehearsalGateVersion } from './gate-radius-live';
 import { gateBaselineReceipt, gateEnvFingerprint, gateSourcePins } from './gate-baseline-receipt';
 import { beginGateShardAttempt } from '../../src/release-loop/gate-shards.js';
+import { DEFAULT_SELF_GATE_SHARD_TIMEOUT_MS } from '../../src/self-dev/shard-run.js';
 import { gateShardRuntimeIdentityKey, planGateShardDispatch, type GateShardReceipt } from './gate-shard-dispatch.js';
 import { parseFailures, parseTimedOutFailures } from './gate-diff';
 import { parsePodCpu, runPodCommand, type RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
@@ -36,6 +39,7 @@ import { isGateSpawnLaneFile, planGateSpawnSeparatedShards } from './spawn-lane'
 import { gateImagePinPath, writeGateImagePin } from './gate-image-pin.js';
 import { computeReceiptKey, gateEnvFingerprint as registryEnvFingerprint, gateLockfileHash, saveGateReceipt, type GateReceipt } from '../../src/self-implement/gate-receipt-registry.js';
 import { gateLockfileHashAtCommit, gateTestedFileHashesAtCommit } from './gate-reuse-identity.js';
+import { summarizeSelectedGateReceiptPlan } from './gate-runtime.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -87,6 +91,26 @@ test('GATE-NODE-STALE-RUNNING: retry start drops the previous Job pointer while 
   expect(retry.startedAt).not.toBe(prior.startedAt);
   expect({ job: retry.job, host: retry.host, resultFile: retry.resultFile, attemptId: retry.attemptId, endedAt: retry.endedAt })
     .toEqual({ job: undefined, host: undefined, resultFile: undefined, attemptId: undefined, endedAt: undefined });
+});
+
+test('GATE-OBS-GAPS-1108 sim: stop-requested shards remain unmeasured while a Job lives and close only on terminal status', () => {
+  const board = [
+    { id: 'pod-live', state: 'stop-requested' as const, startedAt: new Date().toISOString(), job: 'job-still-live', host: 'minim5' },
+    { id: 'pod-ended', state: 'stop-requested' as const, job: 'job-ended', host: 'minim5' },
+  ];
+  const calls: string[][] = [];
+  const result = reconcileStaleGateShardBoard({ version: '0.3.8', board, now: new Date(), kubectl: ((args: readonly string[]) => {
+    calls.push([...args]);
+    return { status: 0, stderr: '', stdout: JSON.stringify({ items: [
+      { metadata: { name: 'job-still-live' }, status: { conditions: [] } },
+      { metadata: { name: 'job-ended' }, status: { conditions: [{ type: 'Failed', status: 'True' }] } },
+    ] }) };
+  }) as never });
+  expect(result.board.map((shard) => shard.state)).toEqual(['stop-requested', 'failed']);
+  expect(result.finalized.map(({ shard, state, source }) => ({ shard, state, source }))).toEqual([
+    { shard: 'pod-ended', state: 'failed', source: 'kubernetes-job-terminal' },
+  ]);
+  expect(calls).toEqual([['--context', 'minim5', '-n', 'elanous-test', 'get', 'jobs', 'job-still-live', 'job-ended', '-o', 'json']]);
 });
 
 test('freeze prevents starting the release gate before runner side effects', async () => {
@@ -329,6 +353,172 @@ test('judgeGate skips the cut sweep when a complete clean hard rehearsal receipt
   expect(graphGateResult(result, true).summary).toContain('same-head clean rehearsal receipt verified; zero tests rerun');
 });
 const options = (instanceRoot: string) => ({ commit: CUT, version: '1.0.1', baselineVersion: '1.0.0', instanceRoot, ledgerRoot: join(dirname(instanceRoot), 'machine-ledger') });
+
+test('M4.5 judgeGate sends only uncovered closures through the production warm Pod replay path', async () => {
+  const f = fake([], [], false);
+  const repo = join(f.root, 'train-file-cas-repo');
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  writeFileSync(join(repo, 'src/a.ts'), 'export const a = 1;\n');
+  writeFileSync(join(repo, 'src/b.ts'), 'export const b = 1;\n');
+  writeFileSync(join(repo, 'src/a.test.ts'), "import { a } from './a.js'; void a;\n");
+  writeFileSync(join(repo, 'src/b.test.ts'), "import { b } from './b.js'; void b;\n");
+  writeFileSync(join(repo, 'bun.lock'), 'lockfileVersion = 1\n');
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  git('init', '-q'); git('config', 'user.name', 'Gate CAS test'); git('config', 'user.email', 'gate-cas@example.invalid');
+  git('add', '.'); git('commit', '-qm', 'initial gate CAS inventory');
+  let commit = git('rev-parse', 'HEAD');
+  const imageDigest = `sha256:${'c'.repeat(64)}`;
+  const lockHash = createHash('sha256').update('lockfileVersion = 1\n').digest('hex');
+  const executionIdentity = { imageDigest, baseImageDigest: `sha256:${'a'.repeat(64)}`, platform: 'linux' as const,
+    architecture: 'amd64', bunVersion: Bun.version, envFingerprint: 'f'.repeat(64) };
+  const expected = ['src/a.test.ts', 'src/b.test.ts'];
+  const warmRequests: string[][] = [];
+  // 출처: #35963 — the CAS fixture models one pod slot for one selected scheduler member.
+  const pool = new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }], {
+    status: () => ({ recommended: 1 } as never), occupancy: () => ({}), memberMemory: () => [],
+  });
+  const realRunner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    const run = spawnSync(cmd, args, { cwd, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+    return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}` };
+  },
+    async () => { throw new Error('CAS warm replay must not launch a cold Job'); }, pool, undefined,
+    { podImageDigest: () => imageDigest, kubectl: () => ({ status: 1, stdout: '', stderr: 'mock' }) });
+  const add = f.runner.add.bind(f.runner);
+  const remove = f.runner.remove.bind(f.runner);
+  const sweep = f.runner.sweep.bind(f.runner);
+  f.runner.add = async (tree, sha) => /\/cut(?:-partial)?$/.test(tree) ? realRunner.add(tree, sha) : add(tree, sha);
+  f.runner.remove = async (tree) => /\/cut(?:-partial)?$/.test(tree) ? realRunner.remove(tree) : remove(tree);
+  f.runner.sweep = async (tree, logDir, pod, only, onProgress) => /\/cut(?:-partial)?$/.test(tree)
+    ? realRunner.sweep(tree, logDir, pod, only, onProgress) : sweep(tree, logDir, pod, only, onProgress);
+  const warmReplay: NonNullable<NonNullable<GateOptions['pod']>['warmReplay']> = async (request) => {
+    warmRequests.push([...request.files]);
+    const dir = mkdtempSync(join(f.root, 'cas-warm-artifacts-'));
+    const artifacts = request.files.map((file, index) => {
+      const prefix = join(dir, `pod-${index}`);
+      const caseName = `case-${index}`;
+      const junit = `<testsuites tests="1"><testsuite name="${file}" file="${file}" tests="1"><testcase name="${caseName}" file="${file}"/></testsuite></testsuites>`;
+      const log = `[warm-worker] file=${file}\n[warm-worker] cut=${request.cutSha} attempt=${request.attemptId}\nbun test v${Bun.version}\n${file}:\n(pass) ${caseName} [1.00ms]\n1 pass\n0 fail\n0 errors\nRan 1 test across 1 file.\n`;
+      writeFileSync(`${prefix}.rc`, '0\n');
+      writeFileSync(`${prefix}.junit.xml`, junit);
+      writeFileSync(`${prefix}.json`, JSON.stringify({ rc: 0, files: [file], commit: request.cutSha,
+        attemptId: request.attemptId, jobExitCode: 0, jobFailed: false }));
+      writeFileSync(`${prefix}.log`, log + `[warm-worker] junit-sha256=${createHash('sha256').update(junit).digest('hex')}\n`);
+      expect(writeWarmJobManifest(prefix, file, request.cutSha, request.attemptId)).toBe(true);
+      const data = Object.fromEntries(['log', 'junit.xml', 'json', 'warm-manifest.json', 'rc']
+        .map((suffix) => [suffix, readFileSync(`${prefix}.${suffix}`).toString('base64')]));
+      return { file, data };
+    });
+    const command: WarmWorkerCommand = { ...request, leaseId: `lease-${warmRequests.length}`, generation: 1,
+      workerId: 'cas-warm-worker', podUid: 'cas-pod-uid', podName: 'cas-warm-pod', podContext: 'pool-test',
+      image: `registry.example/gate@${imageDigest}`,
+      key: { context: 'pool-test', imageDigest, lockHash, architecture: 'amd64' } };
+    return { command, transport: { status: 'observed', reason: 'complete', artifacts: artifacts.map(({ file, data }) => ({ file, data })),
+      reply: { protocol: 1, runId: request.runId, attemptId: request.attemptId, cutSha: request.cutSha,
+        leaseId: command.leaseId, generation: command.generation, workerId: command.workerId, key: command.key,
+        envProfile: request.envProfile, startedAt: Date.now(), finishedAt: Date.now(),
+        files: request.files.map((file) => ({ file, rc: 0, failureIds: [], errorIds: [], junitComplete: true })) } } };
+  };
+  const gateOptions = (head: string) => ({ ...options(f.instanceRoot), commit: head, baselineCommit: head,
+    repo, graphRunId: 'train-file-cas-runtime', pod: { pool: 'pool-test', shards: 1, warmReplay,
+      warmFinalize: async () => {}, warmQuarantine: async () => {}, warmProducerEnabled: true, warmShardExecutionEnabled: true,
+      pinnedImageDigest: imageDigest, pinnedRunId: 'cas-warm-run', executionIdentity,
+      shardsFile: { path: join(f.root, 'cas-shards.json'), version: '1.0.1', executionIdentity } } });
+  const probe = () => imageDigest;
+
+  const first = await judgeGate(gateOptions(commit), f.runner, probe);
+  expect(first).toMatchObject({ outcome: 'ok', trainReceiptReuse: { source: 'file-cas', carried: 0, total: 2, remeasure: 2 } });
+  expect(warmRequests).toEqual([['src/a.test.ts'], ['src/b.test.ts']]);
+  const receiptDir = join(f.ledgerRoot, 'release/1.0.1/gate-logs/cut/receipts/files');
+  expect(readdirSync(receiptDir).filter((name) => name.endsWith('.json'))).toHaveLength(2);
+
+  const second = await judgeGate(gateOptions(commit), f.runner, probe);
+  expect(second).toMatchObject({ outcome: 'ok', trainReceiptReuse: { source: 'file-cas', carried: 2, total: 2, remeasure: 0 } });
+  expect(warmRequests).toEqual([['src/a.test.ts'], ['src/b.test.ts']]);
+
+  writeFileSync(join(repo, 'src/a.ts'), 'export const a = 2;\n');
+  git('add', '.'); git('commit', '-qm', 'change only a test closure'); commit = git('rev-parse', 'HEAD');
+  const third = await judgeGate(gateOptions(commit), f.runner, probe);
+  // source: #35963 — this commit changes only src/a.ts, so exactly one test closure is remeasured.
+  expect(third).toMatchObject({ outcome: 'ok', partial: { files: 1 },
+    trainReceiptReuse: { source: 'file-cas', carried: 1, total: 2, remeasure: 1 } });
+  expect(warmRequests).toEqual([['src/a.test.ts'], ['src/b.test.ts'], ['src/a.test.ts']]);
+  const tracePath = process.env.ELANOUS_TRAIN_CAS_SIM_TRACE;
+  if (tracePath) appendFileSync(tracePath, JSON.stringify({ warmRequests }) + '\n');
+});
+
+test('M4.5 judgeGate refuses CAS receipts when isolated rc=1 has no attributable failure IDs', async () => {
+  const f = fake([A], [], false);
+  const repo = join(f.root, 'train-file-cas-rc-only-repo');
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  writeFileSync(join(repo, 'src/a.test.ts'), 'test("a", () => expect(true).toBe(true));\n');
+  writeFileSync(join(repo, 'bun.lock'), 'lockfileVersion = 1\n');
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  git('init', '-q'); git('config', 'user.name', 'Gate CAS test'); git('config', 'user.email', 'gate-cas@example.invalid');
+  git('add', '.'); git('commit', '-qm', 'initial rc-only inventory');
+  const commit = git('rev-parse', 'HEAD');
+  const imageDigest = `sha256:${'d'.repeat(64)}`;
+  const command = f.runner.command.bind(f.runner);
+  f.runner.command = async (cmd, args, cwd, limitMs) => cmd === 'bun' && args[0] === 'run' && args[1] === 'test:deterministic'
+    ? { rc: 1, output: 'src/a.test.ts:\n1 pass\n0 fail\n0 errors\nRan 1 test across 1 file.\n' }
+    : command(cmd, args, cwd, limitMs);
+  f.runner.sweep = async (tree) => {
+    const isCut = tree.endsWith('/cut');
+    return { rc: isCut ? 1 : 0, output: isCut ? runOutput([A])
+      : 'src/a.test.ts:\n1 pass\n0 fail\n0 errors\nRan 1 test across 1 file.\n',
+      ...(isCut ? { podSweep: { id: 'rc-only-cut', shards: 1, files: ['src/a.test.ts'], imageDigests: [imageDigest] } } : {}) };
+  };
+  const identity = { imageDigest, baseImageDigest: `sha256:${'a'.repeat(64)}`, platform: 'linux' as const,
+    architecture: 'amd64', bunVersion: Bun.version, envFingerprint: 'e'.repeat(64) };
+  const result = await judgeGate({ ...options(f.instanceRoot), commit, baselineCommit: commit, repo,
+    graphRunId: 'train-file-cas-rc-only', pod: { pool: 'pool-test', shards: 1, executionIdentity: identity } },
+    f.runner, () => imageDigest, () => identity);
+  expect(result).toMatchObject({ outcome: 'error', error: 'train-file-cas-measurement-incomplete' });
+  expect(result.rcNonzeroNoFailures).toHaveLength(1);
+  const receiptDir = join(f.ledgerRoot, 'release/1.0.1/gate-logs/cut/receipts/files');
+  expect(existsSync(receiptDir) ? readdirSync(receiptDir).filter((name) => name.endsWith('.json')) : []).toEqual([]);
+});
+
+test('M4.5 judgeGate refuses CAS receipts when the Pod sweep itself exits rc=1 without failures', async () => {
+  const f = fake([], [], false);
+  const repo = join(f.root, 'train-file-cas-sweep-rc-only-repo');
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  writeFileSync(join(repo, 'src/a.test.ts'), 'test("a", () => expect(true).toBe(true));\n');
+  writeFileSync(join(repo, 'bun.lock'), 'lockfileVersion = 1\n');
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  git('init', '-q'); git('config', 'user.name', 'Gate CAS test'); git('config', 'user.email', 'gate-cas@example.invalid');
+  git('add', '.'); git('commit', '-qm', 'initial sweep rc-only inventory');
+  const commit = git('rev-parse', 'HEAD');
+  const imageDigest = `sha256:${'e'.repeat(64)}`;
+  f.runner.sweep = async (tree) => {
+    const isCut = tree.endsWith('/cut');
+    return { rc: isCut ? 1 : 0,
+      output: 'src/a.test.ts:\n1 pass\n0 fail\n0 errors\nRan 1 test across 1 file.\n',
+      ...(isCut ? { podSweep: { id: 'sweep-rc-only', shards: 1, files: ['src/a.test.ts'], imageDigests: [imageDigest] } } : {}) };
+  };
+  const identity = { imageDigest, baseImageDigest: `sha256:${'a'.repeat(64)}`, platform: 'linux' as const,
+    architecture: 'amd64', bunVersion: Bun.version, envFingerprint: 'e'.repeat(64) };
+  const result = await judgeGate({ ...options(f.instanceRoot), commit, baselineCommit: commit, repo,
+    graphRunId: 'train-file-cas-sweep-rc-only', pod: { pool: 'pool-test', shards: 1, executionIdentity: identity } },
+    f.runner, () => imageDigest, () => identity);
+  expect(result.outcome).toBe('error');
+  expect(result.error).toContain('cut sweep incomplete (rc=1');
+  expect(result.rcNonzeroNoFailures).toEqual([]);
+  const receiptDir = join(f.ledgerRoot, 'release/1.0.1/gate-logs/cut/receipts/files');
+  expect(existsSync(receiptDir) ? readdirSync(receiptDir).filter((name) => name.endsWith('.json')) : []).toEqual([]);
+});
 
 test('GATE-CUT-SNAPSHOT entry sim: runGateNode planning writes one tree and blob batch artifact', async () => {
   const { root, instanceRoot } = fixture();
@@ -1022,7 +1212,8 @@ test('RELEASE-GATE-REUSE-TRAIN-RECEIPTS uses receipt-selected files, records car
   const result = await judgeGate({ ...options(f.instanceRoot), repo, commit, baselineCommit: baseCommit,
     graphRunId: 'train-receipt-sim', pod: { pool: 'linux' } }, f.runner, imageProbe);
   expect(result).toMatchObject({ outcome: 'ok', partial: { priorCommit: baseCommit, files: 1 },
-    trainReceiptReuse: { carried: 1, total: 2, receipts: 1 } });
+    trainReceiptReuse: { source: 'train-receipts', carried: 1, total: 2, remeasure: 1, receipts: 1,
+      reasons: [], reasonCounts: {}, planReasons: [] } });
   expect(graphGateResult(result, true).trainReceiptReuse).toMatchObject({ carried: 1, total: 2 });
   expect(f.calls.some((call) => call.includes('only=src/other/b.test.ts'))).toBe(true);
 
@@ -1030,10 +1221,78 @@ test('RELEASE-GATE-REUSE-TRAIN-RECEIPTS uses receipt-selected files, records car
   const full = await judgeGate({ ...options(f.instanceRoot), repo, commit, baselineCommit: baseCommit,
     graphRunId: 'train-receipt-sim', pod: { pool: 'linux' }, full: true }, f.runner, imageProbe);
   expect(full.partial).toBeUndefined();
-  expect(full.trainReceiptReuse).toBeUndefined();
+  expect(full.trainReceiptReuse).toMatchObject({ source: 'full-sweep', carried: 0, total: 2,
+    remeasure: 2, receipts: 0, planReasons: ['explicit-full-sweep'] });
   expect(f.calls.slice(before).some((call) => /sweep @.*\/cut(?:\s|$)/.test(call) && !call.includes('only='))).toBe(true);
 });
 
+test('GATE-OBS-GAPS: real runGateNode logs train receipt plan reason with its run id', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-reuse-observation-'));
+  scratch.push(root);
+  const repo = join(root, 'repo');
+  const stateRoot = join(root, 'state');
+  mkdirSync(join(repo, 'src'), { recursive: true });
+  mkdirSync(join(stateRoot, 'release/0.3.7'), { recursive: true });
+  writeFileSync(join(repo, 'package.json'), '{"name":"gate-observation-fixture","version":"0.3.8"}\n');
+  writeFileSync(join(repo, 'bun.lock'), 'lockfileVersion = 1\n');
+  writeFileSync(join(repo, 'bunfig.toml'), '[test]\n');
+  writeFileSync(join(repo, 'src/a.test.ts'), 'import { test } from "bun:test"; test("a", () => {});\n');
+  writeFileSync(join(repo, 'src/b.test.ts'), 'import { test } from "bun:test"; test("b", () => {});\n');
+  const git = (...args: string[]) => {
+    const run = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (run.status !== 0) throw new Error(run.stderr);
+    return run.stdout.trim();
+  };
+  expect(spawnSync('git', ['init', '-q'], { cwd: repo }).status).toBe(0);
+  git('config', 'user.name', 'gate observation test');
+  git('config', 'user.email', 'gate-observation@example.invalid');
+  git('add', '.');
+  git('commit', '-qm', 'receipt rejection fixture');
+  const commit = git('rev-parse', 'HEAD');
+  writeFileSync(join(stateRoot, 'release/0.3.7/release.json'), JSON.stringify({ sourceCommit: commit }));
+  writeFileSync(join(stateRoot, 'release/0.3.7/gate-failures.json'), JSON.stringify({ commit, failures: [] }));
+  const context = join(root, 'graph-context.json');
+  const runId = 'sim-run-receipt-rejects-1108';
+  writeFileSync(context, JSON.stringify({ runId, input: { commit, version: '0.3.8', previousVersion: '0.3.7',
+    gateExecutor: 'host', gateRemote: 'simhost', gateRemoteMirror: '/tmp/gate-observation.git' }, outputs: {} }));
+  const env = { PATH: process.env.PATH ?? '', HOME: root, ELANOUS_STATE_DIR: stateRoot,
+    ELANOUS_CONFIG_DIR: stateRoot, ELANOUS_GRAPH_CONTEXT: context };
+  const correctFingerprint = registryEnvFingerprint(env);
+  const rejectedFingerprint = correctFingerprint === 'a'.repeat(64) ? 'b'.repeat(64) : 'a'.repeat(64);
+  const bunVersion = spawnSync('bun', ['--version'], { encoding: 'utf8' }).stdout.trim();
+  const registry = join(repo, '.git/elanous-host-regate/gate-receipts.json');
+  for (const file of ['src/a.test.ts', 'src/b.test.ts']) {
+    const identity = { headCommit: commit, baseCommit: commit, bunVersion, lockfileHash: gateLockfileHash(repo),
+      radiusFiles: [file], checks: ['test-interference:with-neighbours'], envFingerprint: rejectedFingerprint };
+    saveGateReceipt(registry, { ...identity, schema: 1, key: computeReceiptKey(identity, 'passed'), verdict: 'passed',
+      savedAt: new Date().toISOString() } satisfies GateReceipt);
+  }
+  const sinkModule = resolve(import.meta.dir, '../../src/domains/standalone-log-sink.ts');
+  const runtimeModule = resolve(import.meta.dir, './gate-runtime.ts');
+  const script = `const { registerStandaloneLogSink } = await import(${JSON.stringify(sinkModule)});\n`
+    + `const { runGateNode, summarizeSelectedGateReceiptPlan } = await import(${JSON.stringify(runtimeModule)});\n`
+    + `await registerStandaloneLogSink('release-loop');\n`
+    + `const runner = { command: async (command, args) => ({ rc: 0, output: args.includes('--is-bare-repository') ? 'true\\n' : command === 'mktemp' ? '/tmp/release-gate-test\\n' : '' }), localCommand: async () => ({ rc: 0, output: '' }), `
+    + `add: async () => {}, remove: async () => {}, snapshot: async () => {}, removeSnapshot: async () => {}, `
+    + `sweep: async (_tree, _logDir, _pod, only) => { const n = only?.length ?? 2; return { rc: 0, output: '0 fail\\nRan ' + n + ' tests across ' + n + ' files.\\n' }; } };\n`
+    + `process.exitCode = await runGateNode(['--json'], process.env, runner, undefined, () => 'sha256:${'f'.repeat(64)}');\n`
+    + `const reasons = Array(81).fill('radius-invalidated');\n`
+    + `const plan = summarizeSelectedGateReceiptPlan({ partial: null, total: 81, full: false, train: { priorCommit: '${'f'.repeat(40)}', files: [], summary: { source: 'train-receipts', carried: 0, total: 81, remeasure: 81, selectedFiles: 81, receipts: 0, receiptKeys: [], reasons, reasonCounts: { 'radius-invalidated': 81 }, planReasons: ['no safe receipt coverage'] } } });\n`
+    + `const judge = async (opts) => ({ outcome: 'ok', commit: opts.commit, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1, trainReceiptReuse: plan });\n`
+    + `process.exitCode = await runGateNode(['--json'], process.env, runner, judge, () => 'sha256:${'f'.repeat(64)}');\n`;
+  const cwd = resolve(import.meta.dir, '../..');
+  const simulated = spawnSync('bun', ['-e', script], { cwd: repo, env, encoding: 'utf8', timeout: DEFAULT_SELF_GATE_SHARD_TIMEOUT_MS });
+  expect(simulated.status, simulated.stderr || simulated.stdout).toBe(0);
+  const query = await simCli(['logs', '--all', '--include-test', '--category', 'release-loop.gate',
+    '--event', 'train-receipt-plan', '--json', '--json-data', '--since', '2h', '--limit', '20'],
+  { allowPaths: [['logs']], mode: 'spawn', timeoutMs: DEFAULT_SELF_GATE_SHARD_TIMEOUT_MS, cwd, env, stateRoot });
+  expect(query.exitCode, query.stderr || query.stdout).toBe(0);
+  const row = query.stdout.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    .filter((item) => item.data?.runId === runId).at(-1);
+  expect(row?.data).toMatchObject({ runId, source: 'full-sweep', carried: 0, total: 81, remeasure: 81,
+    reasonCounts: { 'radius-invalidated': 81 }, reasons: Array(81).fill('radius-invalidated'), planReasons: ['no safe receipt coverage'],
+    receipts: [], receiptCount: 0, selectedFiles: 81 });
+});
 
 test('a multi-file part after a warm one-file part has no source stamp', () => {
   const shell = gateShardShell({ parts: [['src/warm-reference.test.ts'], ['src/a.test.ts', 'src/b.test.ts']],
@@ -3867,7 +4126,8 @@ test('judgeGate plans cut and swept baseline from the prior ledger JUnit; the lo
     expect(board.shards).toHaveLength(2);
     expect(board.shards.map((row) => row.plannedMin)).toEqual([1.7, 0.1]);
     for (const row of board.shards) {
-      expect(Object.keys(row).sort()).toEqual(['endedAt', 'id', 'plannedMin', 'rc', 'startedAt', 'state']);
+      expect(Object.keys(row).sort()).toEqual(['endedAt', 'id', 'plannedMin', 'rc', 'reuseDecision', 'reuseReason', 'startedAt', 'state']);
+      expect(row).toMatchObject({ reuseDecision: 'rerun', reuseReason: expect.any(String) });
       expect(Number.isFinite(Date.parse(String(row.startedAt)))).toBe(true);
       expect(row.state).toBe('done');
     }
@@ -5302,6 +5562,8 @@ test('GATE-PARTIAL: the plan made by planPartialRegate re-runs exactly the chang
   expect(sweeps[0]!.logDir).toEndWith(join('gate-logs', 'cut-partial'));
   // A still fails (as in the baseline) and C is fixed: no new regression, and the verdict says it was partial.
   expect(result).toMatchObject({ outcome: 'ok', introduced: [], preexisting: 1, partial: { priorCommit: 'c'.repeat(40), files: 2 } });
+  expect(result.trainReceiptReuse).toMatchObject({ source: 'existing-partial', remeasure: 2, receipts: 0,
+    planReasons: ['selected-existing-partial-plan'] });
   expect(graphGateResult(result, true).summary).toStartWith('부분 재검 2파일');
   expect(JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'), 'utf8'))).toMatchObject({ commit: CUT, failures: [A] });
 });
@@ -5643,7 +5905,8 @@ test('GATE-INTRO-RECHECK: a timed-out new failure that passes the 60 s re-run is
     expect(result).toMatchObject({ outcome: 'ok', introduced: [], loadFlaky: [B] });
     expect(rechecks).toEqual([`run test:deterministic ./src/b.test.ts --timeout ${GATE_TIMEOUT_RECHECK_MS} @${join(dirname(rechecks[0]!.split(' @')[1]!), 'cut')} limit=${GATE_ISOLATED_TIMEOUT_MS}`]);
     expect(graphGateResult(result, true)).toMatchObject({ verdict: 'pass' });
-    expect(graphGateResult(result, true).summary).toContain('부하 흔들림 1');
+    expect(graphGateResult(result, true).summary).toContain('시간 초과 1');
+    expect(result.retryPass).toEqual([{ id: B, cause: 'timeout' }]);
     expect(events).toContainEqual({ category: 'release-loop.gate', event: 'timeout-recheck', data: { file: 'src/b.test.ts', shaped: 1, flaky: 1, recheck: 'read', remote: 'local', limitMs: GATE_TIMEOUT_RECHECK_MS } });
     expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8'))).toMatchObject({
       introduced: [], knownEnv: [], preexisting: [], loadFlaky: [B],
@@ -5753,17 +6016,53 @@ test('same-Pod standalone pass removes only the failed file from introduced and 
   writeFileSync(join(artifacts, 'part-0.retry-0.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
   writeFileSync(join(artifacts, 'part-0.retry-0.junit.xml'), '<testsuites tests="1"><testsuite file="src/b.test.ts" tests="1"><testcase name="B"/></testsuite></testsuites>');
   const cutArtifacts = readShardArtifacts(artifacts, [['src/a.test.ts', 'src/b.test.ts']]);
-  expect(cutArtifacts).toMatchObject({ loadFlaky: [B], loadFlakyAttemptedFiles: ['src/b.test.ts'] });
+  expect(cutArtifacts).toMatchObject({ loadFlaky: [B], retryPass: [{ id: B, cause: 'isolation' }], loadFlakyAttemptedFiles: ['src/b.test.ts'] });
   const sweep = runner.sweep.bind(runner);
   runner.sweep = async (tree, logDir, pod, only) => {
     const result = await sweep(tree, logDir, pod, only);
     return tree.endsWith('/cut') ? { ...result, ...cutArtifacts } : result;
   };
-  const result = await judgeGate(options(instanceRoot), runner);
-  expect(result).toMatchObject({ outcome: 'ok', introduced: [], loadFlaky: [B] });
+  const judgedEvents: unknown[] = [];
+  const judgedSpy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate' && event === 'judged') judgedEvents.push(data);
+  });
+  let result: Awaited<ReturnType<typeof judgeGate>>;
+  try { result = await judgeGate(options(instanceRoot), runner); }
+  finally { judgedSpy.mockRestore(); }
+  expect(result).toMatchObject({ outcome: 'ok', introduced: [], loadFlaky: [B], retryPass: [{ id: B, cause: 'isolation' }] });
+  expect(judgedEvents).toContainEqual(expect.objectContaining({ retryPass: [{ id: B, cause: 'isolation' }] }));
+  expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8')).retryPass).toEqual([{ id: B, cause: 'isolation' }]);
+  expect(graphGateResult(result, true).summary).toContain('격리 1 · 시간 초과 0 · 부하 0 · 원인 미측정 0');
   expect(calls.some((call) => call.includes('--timeout 60000'))).toBe(false);
   const rows = readFileSync(loadFlakyCensusPath(join(root, 'machine-ledger')), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-  expect(rows).toEqual([expect.objectContaining({ version: '1.0.1', commit: CUT, id: B, retry: 'same-pod-standalone' })]);
+  expect(rows).toEqual([expect.objectContaining({ version: '1.0.1', commit: CUT, id: B, retry: 'same-pod-standalone', cause: 'isolation' })]);
+
+  const legacy = fake([B], []);
+  const legacySweep = legacy.runner.sweep.bind(legacy.runner);
+  legacy.runner.sweep = async (tree, logDir, pod, only) => {
+    const measured = await legacySweep(tree, logDir, pod, only);
+    return tree.endsWith('/cut') ? { ...measured, ...cutArtifacts, retryPass: undefined } : measured;
+  };
+  const legacyResult = await judgeGate(options(legacy.instanceRoot), legacy.runner);
+  expect(legacyResult).toMatchObject({ outcome: 'ok', loadFlaky: [B] });
+  expect(graphGateResult(legacyResult, true).summary).toContain('원인 미측정 1');
+  expect(JSON.parse(readFileSync(join(legacy.root, 'machine-ledger/release/1.0.1/gate-verdict.json'), 'utf8')).retryPass).toBeUndefined();
+  expect(JSON.parse(readFileSync(loadFlakyCensusPath(join(legacy.root, 'machine-ledger')), 'utf8').trim()).cause).toBe('unmeasured');
+});
+
+test('single-file same-limit retry pass is classified as load', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-retry-load-'));
+  writeFileSync(join(root, 'install.rc'), '0\n');
+  writeFileSync(join(root, 'install.log'), '');
+  writeFileSync(join(root, 'part-0.rc'), '1\n');
+  writeFileSync(join(root, 'part-0.log'), 'src/b.test.ts:\n(fail) B [1.00ms]\n0 pass\n1 fail\nRan 1 test across 1 file.\n');
+  writeFileSync(join(root, 'part-0.junit.xml'), '<testsuite file="src/b.test.ts" tests="1" failures="1"><testcase name="B"><failure/></testcase></testsuite>');
+  writeFileSync(join(root, 'part-0.retry-files'), 'src/b.test.ts\n');
+  writeFileSync(join(root, 'part-0.retry-0.started'), '');
+  writeFileSync(join(root, 'part-0.retry-0.rc'), '0\n');
+  writeFileSync(join(root, 'part-0.retry-0.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
+  writeFileSync(join(root, 'part-0.retry-0.junit.xml'), '<testsuite file="src/b.test.ts" tests="1"><testcase name="B"/></testsuite>');
+  expect(readShardArtifacts(root, [['src/b.test.ts']]).retryPass).toEqual([{ id: B, cause: 'load' }]);
 });
 
 test('same-Pod retry from the real shard collector reaches judgeGate without a timeout-only recheck', async () => {
@@ -5774,6 +6073,7 @@ test('same-Pod retry from the real shard collector reaches judgeGate without a t
   writeFileSync(join(repo, 'release/gate-batch-safe.json'), JSON.stringify({ env: 'linux-pod',
     tests: files.map((file) => ({ file, evidence: 'synthetic timeout/retry fixture' })) }));
   let jobs = 0;
+  let cutLogDir: string | undefined;
   let collected: Awaited<ReturnType<GateRunner['sweep']>> | undefined;
   const collector = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
     if (cmd === 'rg') return { rc: 1, output: '' };
@@ -5789,7 +6089,7 @@ test('same-Pod retry from the real shard collector reaches judgeGate without a t
     const timeoutPartRc = 124;
     writeFileSync(join(artifacts, 'part-0.rc'), `${timeoutPartRc}\n`);
     expect(readFileSync(join(artifacts, 'part-0.rc'), 'utf8').trim()).toBe(String(timeoutPartRc));
-    writeFileSync(join(artifacts, 'part-0.log'), 'src/b.test.ts:\n(fail) B [1.00ms]\n1 pass\n1 fail\nRan 2 tests across 2 files.\n');
+    writeFileSync(join(artifacts, 'part-0.log'), 'src/b.test.ts:\n(fail) B [1.00ms]\n  ^ this test timed out after 100ms.\n1 pass\n1 fail\nRan 2 tests across 2 files.\n');
     writeFileSync(join(artifacts, 'part-0.junit.xml'), '<testsuites tests="2"><testsuite file="src/a.test.ts" tests="1"><testcase name="A"/></testsuite><testsuite file="src/b.test.ts" tests="1" failures="1"><testcase name="B"><failure/></testcase></testsuite></testsuites>');
     writeFileSync(join(artifacts, 'part-0.retry-files'), 'src/b.test.ts\n');
     writeFileSync(join(artifacts, 'part-0.retry-0.started'), '');
@@ -5800,15 +6100,20 @@ test('same-Pod retry from the real shard collector reaches judgeGate without a t
   }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
   runner.sweep = async (...args) => {
     collected = await collector.sweep(...args);
+    if (args[0].endsWith('/cut')) cutLogDir = args[1];
     return collected;
   };
   const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 1 } }, runner);
-  expect(collected).toMatchObject({ rc: 1, output: expect.stringContaining('(fail) B'), loadFlaky: [B] });
-  expect(result).toMatchObject({ outcome: 'ok', introduced: [], loadFlaky: [B] });
+  expect(collected).toMatchObject({ rc: 1, output: expect.stringContaining('(fail) B'), loadFlaky: [B], retryPass: [{ id: B, cause: 'timeout' }] });
+  expect(result).toMatchObject({ outcome: 'ok', introduced: [], loadFlaky: [B], retryPass: [{ id: B, cause: 'timeout' }] });
+  expect(cutLogDir).toBeTruthy();
+  expect(JSON.parse(readFileSync(join(cutLogDir!, 'pod-0.json'), 'utf8')).retryPass).toEqual([{ id: B, cause: 'timeout' }]);
+  const resumed = await collector.sweep(repo, cutLogDir, { pool: 'pool-test', shards: 1 });
+  expect(resumed.retryPass).toEqual([{ id: B, cause: 'timeout' }]);
   expect(jobs).toBe(1);
   expect(calls.some((call) => call.includes('--timeout 60000'))).toBe(false);
   const rows = readFileSync(loadFlakyCensusPath(join(root, 'machine-ledger')), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-  expect(rows).toEqual([expect.objectContaining({ version: '1.0.1', commit: CUT, id: B, retry: 'same-pod-standalone' })]);
+  expect(rows).toEqual([expect.objectContaining({ version: '1.0.1', commit: CUT, id: B, retry: 'same-pod-standalone', cause: 'timeout' })]);
 
   const control = fake([B], []);
   const controlSweep = control.runner.sweep.bind(control.runner);
@@ -6199,11 +6504,12 @@ test('GATE-WARM-POOL-SHARDS: sweep adopts multi-file warm artifacts and refuses 
     shardsFile: { path: join(root, 'shards.json'), version: '0.3.8', executionIdentity },
     warmReplay: async (request: Parameters<NonNullable<NonNullable<Parameters<NonNullable<typeof runner.recheckPod>>[2]>['warmReplay']>>[0]) => {
       replays++;
+      expect(request.files).toHaveLength(1);
       const dir = mkdtempSync(join(tmpdir(), 'gate-warm-shard-fixture-'));
       scratch.push(dir);
       const artifacts = request.files.map((file, index) => {
         const prefix = join(dir, 'pod-' + index);
-        const caseName = index === 0 ? 'one' : 'two';
+        const caseName = file.includes('/one.') ? 'one' : 'two';
         const junit = '<testsuites tests="1"><testsuite name="' + file + '" file="' + file
           + '" tests="1"><testcase name="' + caseName + '" file="' + file + '"/></testsuite></testsuites>';
         const log = '[warm-worker] file=' + file + '\n[warm-worker] cut=' + request.cutSha + ' attempt=' + request.attemptId
@@ -6245,16 +6551,17 @@ test('GATE-WARM-POOL-SHARDS: sweep adopts multi-file warm artifacts and refuses 
   });
   try {
     const result = await runner.sweep(root, undefined, pod, files);
-    expect(logs.filter(row => row.event.startsWith('warm-shard')).map(row => row.event)).toContain('warm-shard-reused');
+    expect(logs.map(row => row.event)).toContain('warm-shard-reused');
     expect(logs.find(row => row.event === 'warm-shard-reused')?.data.files).toBe(2);
     expect(result.rc).toBe(0);
     expect(coldJobLaunches).toBe(0);
-    expect(finalized).toBe(1);
+    expect(finalized).toBe(2);
+    expect(replays).toBe(2);
     corruptWarmCommand = true;
     failQuarantine = true;
     await expect(runner.sweep(root, undefined, pod, files)).rejects.toThrow('pod sweep incomplete');
     expect(coldJobLaunches).toBe(0);
-    expect(replays).toBe(2);
+    expect(replays).toBe(3);
     expect(quarantineAttempts).toBe(2);
   } finally { spy.mockRestore(); }
 });
@@ -7677,6 +7984,10 @@ test('GATE-SHARD-RESUME: previousShardResult accepts only the same commit, run k
   const key = 'k'.repeat(64);
   write({ commit: CUT, files, rc: 1, durationMs: 1234, runKey: key, jobExitCode: 0, jobFailed: false });
   expect(previousShardResult(dir, 'pod-0', CUT, files, key)).toEqual({ output: 'Ran 1 tests across 1 files.\n', rc: 1, durationMs: 1234 });
+  write({ commit: CUT, files, rc: 1, durationMs: 1234, runKey: key, jobExitCode: 0, jobFailed: false,
+    loadFlaky: [B], retryPass: [{ id: B, cause: 'isolation' }], samePodRetryFiles: ['src/b.test.ts'] });
+  expect(previousShardResult(dir, 'pod-0', CUT, files, key)).toMatchObject({ loadFlaky: [B],
+    retryPass: [{ id: B, cause: 'isolation' }], loadFlakyAttemptedFiles: ['src/b.test.ts'] });
   expect(previousShardResult(dir, 'pod-0', BASE, files, key)).toBeUndefined();
   expect(previousShardResult(dir, 'pod-0', CUT, files, 'other')).toBeUndefined();
   expect(previousShardResult(dir, 'pod-0', CUT, [...files].reverse(), key)).toBeUndefined();

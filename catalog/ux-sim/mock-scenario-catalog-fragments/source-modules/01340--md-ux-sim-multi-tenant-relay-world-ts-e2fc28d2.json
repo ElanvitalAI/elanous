@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-MULTI-TENANT-RELAY-WORLD-TS",
+  "path": "src/ux-sim/multi-tenant-relay-world.ts",
+  "boundary": "Creates isolated fake OAuth users, Nexus relays, app data, storage, and injected incidents without any live Google calls.",
+  "deviceIds": [
+    "world-runtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

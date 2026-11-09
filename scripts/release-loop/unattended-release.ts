@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -9,7 +10,7 @@ import { cutChecklistGate } from '../../src/release-loop/checklist.js';
 import { getSchedule } from '../../src/release-loop/release-schedule.js';
 import { isLandingFreezeRefusal, readLandingFreeze, LandingFrozenError } from '../../src/release-loop/landing-freeze.js';
 import { debug } from '../../src/debug/log.js';
-import { runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { lastJsonObject, listGraphRuns, runGraph, type GraphRunState } from '../../src/graph-runner/runner.js';
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
 import { ReleaseRunClaimConflict, findActiveReleaseRun } from '../../src/cli/release-single-flight.js';
 import { releaseRunUniverse } from './release-universe.js';
@@ -19,10 +20,13 @@ import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
 import { readReleaseGateRehearsal, readReleaseOpsPolicy, selectReleaseGateMethod } from './gate-method.js';
 import { createMacrophageRuntime } from '../../src/release-loop/macrophage-heal-node.js';
 import { createMacrophageSafeCleanup } from '../../src/release-loop/macrophage-safe-cleanup.js';
+import { createIncidentPolicyHandler } from '../../src/release-loop/incident-policy-handler.js';
+import type { GraphSubscriptionHandler } from '../../src/graph-runner/graph-subscriptions.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { runRlaScorecardReportCli } from './rla-event-response-scorecard-report.js';
 
 const VERSION = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
+const REPOSITORY_ROOT = join(import.meta.dir, '../..');
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 const RLA_SCORECARD_KNOWHOW_PACK = join(import.meta.dir, '../../scenarios/ux-sim/knowhow-pack-release-heal-1107.md');
 const RLA_SCORECARD_SIM_RIG = join(import.meta.dir, '../../scenarios/ux-sim/release-sim-rig.yaml');
@@ -35,6 +39,26 @@ function refreshRlaScorecardForCompletedRun(runId: string, stateRoot: string): v
     '--state-root', stateRoot,
   ]);
   debug.log('release.run', 'rla-scorecard-refreshed', { runId, path });
+}
+
+function gitOutput(repo: string, args: string[]): string {
+  const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+  if (result.status !== 0 || result.error) throw new Error(`git ${args[0]} failed while checking release CLI freshness`);
+  return result.stdout.trim();
+}
+
+/** A stale installed/seat CLI must not start a release graph with recipes that differ from main. */
+export function assertReleaseCliCurrent(repo: string, cutCommit?: string): void {
+  if (gitOutput(repo, ['status', '--porcelain', '--untracked-files=all'])) {
+    throw new Error('release CLI checkout has uncommitted changes');
+  }
+  const head = gitOutput(repo, ['rev-parse', 'HEAD']);
+  const remoteMain = gitOutput(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0];
+  if (!remoteMain || !/^[0-9a-f]{40,64}$/i.test(remoteMain)) throw new Error('cannot resolve origin/main for release CLI freshness check');
+  const cutParent = cutCommit ? gitOutput(repo, ['rev-parse', `${cutCommit}^{commit}^`]) : undefined;
+  if (head !== remoteMain && head !== cutParent) {
+    throw new Error(`stale release CLI: HEAD ${head} does not match origin/main ${remoteMain}${cutParent ? ` or cut parent ${cutParent}` : ''}`);
+  }
 }
 
 export interface ReleaseLoopConfig {
@@ -94,7 +118,11 @@ export interface UnattendedReleaseDeps {
   config?: ReleaseLoopConfig;
   configPath?: string;
   policyPath?: string;
-  graph?: (path: string, options: { runId: string; input: ReleaseRunInput; pinChildUniverse?: boolean; deps?: { root?: string } }) => Promise<GraphRunState>;
+  graphPath?: string;
+  graph?: (path: string, options: { input: ReleaseRunInput; runId?: string; resumeRunId?: string; useCurrentGraph?: boolean;
+    resumeInputPatch?: Record<string, unknown>; fromNodeId?: string; pinChildUniverse?: boolean;
+    deps?: { root?: string; dispatchGraphSubscription?: GraphSubscriptionHandler } }) => Promise<GraphRunState>;
+  assertCliCurrent?: (repo: string, cutCommit?: string) => void;
   registerLogSink?: (surface: string) => Promise<boolean>;
   checklist?: (version: string) => Pick<ReturnType<typeof cutChecklistGate>, 'ok' | 'red' | 'undecided' | 'blocked'>;
   freezeRoot?: string;
@@ -107,7 +135,9 @@ export interface UnattendedReleaseDeps {
 /** Remote `release/<base>-<kind>.*` branches and `v<base>-<kind>.*` tags — read-only. */
 export function remoteReleaseRefs(base: string, kind: PrereleaseKind, repo = process.cwd()): string[] {
   // git-spawn-allow: read-only ls-remote to number a prerelease.
-  const result = spawnSync('git', ['ls-remote', 'origin', `refs/heads/release/${base}-${kind}.*`, `refs/tags/v${base}-${kind}.*`], { cwd: repo, encoding: 'utf8' });
+  const result = spawnSync('git', ['ls-remote', 'origin', `refs/heads/release/${base}-${kind}.*`, `refs/tags/v${base}-${kind}.*`], {
+    cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   if (result.status !== 0 || result.error) throw new Error(`git ls-remote failed: ${(result.stderr || result.error || 'no output').toString().trim()}`);
   return result.stdout.split('\n').map((line) => line.split(/\s+/)[1] ?? '').filter(Boolean);
 }
@@ -182,6 +212,46 @@ export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDep
 }
 
 /** Fail closed at the entry boundary, before any graph node can change a release. */
+function stableResumeValue(value: unknown): string {
+  if (value === undefined) return "undefined";
+  if (Array.isArray(value)) return "[" + value.map(stableResumeValue).join(",") + "]";
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return "{" + Object.keys(record).sort().map((key) => JSON.stringify(key) + ":" + stableResumeValue(record[key])).join(",") + "}";
+  }
+  return JSON.stringify(value);
+}
+
+function assertReleaseResumeCompatible(savedInput: unknown, requestedInput: ReleaseRunInput, runId: string): void {
+  if (!savedInput || typeof savedInput !== "object" || Array.isArray(savedInput))
+    throw new Error("cannot resume release run " + runId + ": saved input is not an object");
+  const saved = { ...(savedInput as Record<string, unknown>) };
+  const requested = requestedInput as unknown as Record<string, unknown>;
+  // Older cuts omitted this pin; the resume patch below repairs only that known legacy omission.
+  if (saved.gateImagePin === undefined && requested.gateImagePin === "cut-commit") saved.gateImagePin = "cut-commit";
+  const keys = [...new Set([...Object.keys(saved), ...Object.keys(requested)])].sort();
+  const mismatches = keys.filter((key) => stableResumeValue(saved[key]) !== stableResumeValue(requested[key]));
+  if (mismatches.length) throw new Error("cannot resume release run " + runId + ": incompatible input fields: " + mismatches.join(", "));
+}
+
+function releaseResumeBoundary(run: GraphRunState): string {
+  const failed = [...run.nodes].reverse().find((node) => !node.ok && node.nodeId !== "failed" && node.nodeId !== "done");
+  const boundary = failed?.nodeId ?? [...run.path].reverse().find((nodeId) => nodeId !== "failed" && nodeId !== "done");
+  if (!boundary) throw new Error("cannot resume release run " + run.runId + ": no executable restart node");
+  return boundary;
+}
+
+function assertReleaseCutCompatible(run: GraphRunState, requested: ReleaseRunInput): void {
+  const cut = run.nodes.find((node) => node.nodeId === 'version-release' && node.ok);
+  const output = cut?.output && typeof cut.output === 'object' && !Array.isArray(cut.output)
+    ? cut.output as Record<string, unknown> : lastJsonObject(cut?.output);
+  if (!output || output.version !== requested.version || typeof output.commit !== 'string' || !/^[0-9a-f]{40}$/i.test(output.commit) ||
+      (requested.branchCut === true && output.branch !== `release/${requested.version}`) ||
+      (typeof requested.cutCommit === 'string' && output.commit !== requested.cutCommit)) {
+    throw new Error(`cannot resume release run ${run.runId}: saved version-release cut is incompatible with current input`);
+  }
+}
+
 export async function runUnattendedRelease(
   opts: { version: string; dryRun?: boolean; cutCommit?: string; branchCutBaseCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
   deps: UnattendedReleaseDeps = {},
@@ -223,6 +293,7 @@ async function runUnattendedReleaseLocked(
   debug.log('release.run', 'input', { version, requested: opts.version, branchCut, prerelease: opts.prerelease ?? null, dryRun: opts.dryRun === true,
     ...(input.gateExecutor ? { gateExecutor: input.gateExecutor, gateHost: input.gateExecutor === 'host' ? input.gateRemote ?? null : null } : {}) });
   if (opts.dryRun) return { input, dryRun: true };
+  (deps.assertCliCurrent ?? assertReleaseCliCurrent)(REPOSITORY_ROOT, opts.cutCommit);
   if (opts.prerelease) {
     // A rehearsal neither judges nor carries the stable version's checklist cells.
     debug.log('release.run', 'checklist-skipped', { version, reason: 'prerelease' });
@@ -237,13 +308,34 @@ async function runUnattendedReleaseLocked(
   const root = releaseRunUniverse({ root: deps.ledgerRoot });
   // Resume and fresh runs share the OP-seat flock. Recheck under that flock so a
   // resume that began after CLI preflight cannot slip between the ledger scan and graph start.
-  if (!opts.forceNew && findActiveReleaseRun(version, root)) throw new ReleaseRunClaimConflict();
-  const runId = randomUUID();
+  if (findActiveReleaseRun(version, root)) throw new ReleaseRunClaimConflict();
+  const runInventory = listGraphRuns(root);
+  if (runInventory.unreadable > 0) throw new Error(`cannot safely claim release ${version}: ${runInventory.unreadable} graph run ledger(s) are unreadable`);
+  const priorRuns = runInventory.runs.filter((run) => run.graphId === 'release-loop'
+    && !!run.input && typeof run.input === 'object' && !Array.isArray(run.input)
+    && (run.input as Record<string, unknown>).version === version);
+  const completed = priorRuns.find((run) => run.status === 'done' || run.status === 'awaiting-approval');
+  if (completed) return { input, dryRun: false, state: completed };
+  const budgetExceeded = priorRuns.find((run) => run.status === 'budget-exceeded');
+  if (budgetExceeded && !opts.forceNew) throw new Error("release run " + budgetExceeded.runId + " exceeded its graph budget; explicit reasoned resume is required");
+  if (!opts.forceNew && priorRuns.some((run) => run.status === 'running')) {
+    throw new Error(`release run ${version} is recorded as running without an active owner; inspect it or use --force-new`);
+  }
+  const resumable = opts.forceNew ? undefined : priorRuns.find((run) => run.status === 'failed');
+  if (resumable) {
+    assertReleaseResumeCompatible(resumable.input, input, resumable.runId);
+    assertReleaseCutCompatible(resumable, input);
+  }
+  const resumeFromNodeId = resumable ? releaseResumeBoundary(resumable) : undefined;
+  const runId = resumable?.runId ?? randomUUID();
   await (deps.registerLogSink ?? registerStandaloneLogSink)('release-loop');
-  const safeCleanup = createMacrophageSafeCleanup({ repoRoot: process.cwd() });
+  const safeCleanup = createMacrophageSafeCleanup({ repoRoot: REPOSITORY_ROOT });
   const macrophage = createMacrophageRuntime({ runId, root, inventory: () => safeCleanup.inventory(), liveCleanup: safeCleanup.cleanup });
   let state: GraphRunState;
-  try { state = await (deps.graph ?? runGraph)(GRAPH, { runId, input, pinChildUniverse: true, eventBus: macrophage.eventBus, deps: { root } }); }
+  try { state = await (deps.graph ?? runGraph)(deps.graphPath ?? GRAPH, resumable
+    ? { resumeRunId: runId, fromNodeId: resumeFromNodeId, useCurrentGraph: true, input, resumeInputPatch: { ...(input.gateImagePin ? { gateImagePin: input.gateImagePin } : {}) },
+      pinChildUniverse: true, eventBus: macrophage.eventBus, deps: { root, dispatchGraphSubscription: createIncidentPolicyHandler() } }
+    : { runId, input, pinChildUniverse: true, eventBus: macrophage.eventBus, deps: { root, dispatchGraphSubscription: createIncidentPolicyHandler() } }); }
   finally { macrophage.dispose(); }
   // A freeze switched on while the graph ran stops gate or publish inside it. Only a failed gate/publish node whose own
   // record is the freeze refusal is reported as the freeze; any other failure keeps its own reason.

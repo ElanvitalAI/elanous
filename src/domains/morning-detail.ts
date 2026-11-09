@@ -14,6 +14,7 @@ import { marketClock } from './finance.js';
 import { feedBySource } from './morning-synthesis.js';
 import type { MorningSources } from './morning-synthesis.js';
 import type { SignalDetection } from './signal-board.js';
+import { readWaiverEvents, type WaiverEvent } from '../release-loop/waiver-events.js';
 
 export interface MorningRlaScorecard {
   readonly schema: 'elanous.rla-event-response-scorecard.v1';
@@ -83,6 +84,25 @@ export function renderRlaScorecardSection(report: MorningRlaScorecard): string {
   return `## 🧪 ${report.label}\n\n_판 ${report.releaseVersion} · run ${report.runId} · 노하우팩 ${report.source.knowledgePackIncidentCount}건 · release-sim-rig ${report.source.releaseSimRigCaseCount}종 · 분류 대기 ${unclassified}건(계획 결과는 JSON에 보존) · 생성 ${report.generatedAt} · 시간/실발행 결과는 미측정_\n\n| 사건 | 입력 수 | 계획 가능 | 처방 불가 | 점수(계획 가능 비율) |\n|---|---:|---:|---:|---:|\n${rows}`;
 }
 
+/** Active and last-day waiver events for the automatic morning audit section. */
+export function readLatestMorningWaiverEvents(now = Date.now(), stateRoot = elanousStateRoot()): WaiverEvent[] {
+  const events = readWaiverEvents(join(stateRoot, 'review-results', 'waiver-events.jsonl'));
+  const recentAfter = now - 24 * 60 * 60 * 1000;
+  return events.filter((event) => event.issuedAt >= recentAfter
+    || (event.uses < event.maxUses && event.expiredBy === undefined && event.expiresAt > now))
+    .sort((a, b) => b.issuedAt - a.issuedAt || a.eventId.localeCompare(b.eventId)).slice(0, 20);
+}
+
+export function renderGateWaiverEventsSection(events: readonly WaiverEvent[]): string {
+  if (!events.length) return '## 🧾 게이트 면제 사건\n\n최근 24시간·활성 사건 없음.';
+  const rows = events.map((event) => {
+    const status = event.expiredBy ?? (event.uses >= event.maxUses ? 'used' : 'active');
+    const reason = event.evidence.find((item) => item.startsWith('gate-waiver:reason:'))?.slice('gate-waiver:reason:'.length) ?? '—';
+    return `| ${event.eventId} | ${event.kind}/${event.mode} | ${event.target} | ${event.head.slice(0, 12)} | ${status} | ${reason.replaceAll('|', '\\|')} |`;
+  }).join('\n');
+  return `## 🧾 게이트 면제 사건\n\n최근 24시간 또는 활성 사건 ${events.length}건\n\n| 사건 ID | 종류/모드 | 대상 | head | 상태 | 사유 |\n|---|---|---|---|---|---|\n${rows}`;
+}
+
 /** 코드펜스로 감싼 monospace 블록(sqlite -column 정렬 보존). 빈 문자열이면 ''. */
 function fenced(label: string, table: string): string {
   const t = (table || '').trim();
@@ -98,7 +118,8 @@ function bullets(rows: SignalDetection[], max: number): string {
 }
 
 /** 밤사이 소스 번들 → 풀 디테일 Markdown. */
-export function assembleDetailMarkdown(src: MorningSources, rlaScorecard?: MorningRlaScorecard | null): string {
+export function assembleDetailMarkdown(src: MorningSources, rlaScorecard?: MorningRlaScorecard | null,
+  waiverEvents?: readonly WaiverEvent[]): string {
   const { buzz, dig, signal, reflection } = feedBySource(src.board);
   const parts: string[] = [
     `# 🌅 Conatus 상세 아침 브리핑 — ${src.dateKr}`,
@@ -143,6 +164,7 @@ export function assembleDetailMarkdown(src: MorningSources, rlaScorecard?: Morni
   if (reflection.length) parts.push(`## 🧠 회고·기억 루프\n\n${bullets(reflection, 8)}`);
 
   if (rlaScorecard) parts.push(renderRlaScorecardSection(rlaScorecard));
+  if (waiverEvents) parts.push(renderGateWaiverEventsSection(waiverEvents));
 
   parts.push('\n---\n_출처: elanous finance 종합 (밤사이 자율 루프 산출물 종합). 매매는 verify+HITL._');
 

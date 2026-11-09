@@ -44,6 +44,18 @@ test('SIM-CHAIN-APP rehearses the KAIST voice-note and shop flow hermetically', 
     ]);
     expect(result.observations.find((row) => row.event === 'higgsfield-job')?.verdict).toContain('fake-provider submissions=1');
     expect(result.observations.find((row) => row.event === 'higgsfield-job')?.verdict).toContain('external-provider-calls=0');
+    expect(result.appSimulation?.runId).toMatch(/^app-demo-1114-1114-[0-9a-f-]{36}$/);
+    expect(result.appSimulation?.events).toHaveLength(result.observations.length);
+    expect(result.appSimulation?.events.map((event) => event.data.step)).toEqual(result.observations.map((row) => row.event));
+    expect(result.appSimulation?.events.find((event) => event.data.step === 'recording-and-transcription'))
+      .toMatchObject({ kind: 'app.sim.step', appId: 'voice-notes' });
+    expect(result.appSimulation?.events.find((event) => event.data.step === 'higgsfield-job'))
+      .toMatchObject({ kind: 'app.sim.step', appId: 'shop-studio' });
+    expect(result.appSimulation?.receipts).toEqual([
+      expect.objectContaining({ appId: 'voice-notes', outcome: 'passed', summary: expect.stringContaining('완료') }),
+      expect.objectContaining({ appId: 'shop-studio', outcome: 'passed', summary: expect.stringContaining('완료') }),
+    ]);
+    expect(result.appSimulation?.events.every((event) => event.runId === result.appSimulation?.runId)).toBe(true);
     expect(original.publicShare).toMatchObject({ status: 200, version: 'v3-generated-1114' });
     expect(result.publicShare).toMatchObject({ status: 200, version: 'v3-generated-1114' });
     expect(result.publicShare?.body).not.toBe(original.publicShare?.body);

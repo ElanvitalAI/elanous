@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/graph-resume-any-entry.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/graph-resume-any-entry.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "The simulator writes graph-run state only under isolated temporary worlds and inspects returned run results.",
+  "deviceId": "release-graph-rig",
+  "scenarioIds": [
+    "GRAPH-RESUME-ANY-ENTRY-SIM"
+  ]
+}

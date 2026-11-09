@@ -3,7 +3,8 @@ import { isAbsolute, join } from 'node:path';
 import { SKILL_PRESETS } from '../../onboarding.js';
 import { debug } from '../../debug/log.js';
 import { resolveObsidianRoot } from '../../acp/fs-roots.js';
-import { getUserConfig, saveUserConfig, type SkillSetName } from '../../user-config.js';
+import { getUserConfig, saveUserConfig } from '../../user-config.js';
+import type { SkillSetName } from '../../user-config/types.js';
 
 export interface ObsidianSkillsState {
   obsidian: { vault: string; exists: boolean; looksLikeVault: boolean };

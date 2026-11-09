@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-APP-DRIVE-WORLD-TS",
+  "path": "src/ux-sim/fake-app-drive-world.ts",
+  "boundary": "In-memory tenant-partitioned Google Drive files.list simulation; synthetic tokens, page-token binding, expiry and revocation are exercised without network or credential persistence.",
+  "deviceIds": [
+    "fake-app-drive-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

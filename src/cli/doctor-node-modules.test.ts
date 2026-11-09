@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { checkNodeModules } from './doctor-node-modules.js';
 import { registerDoctorCommand, runDoctor } from './doctor-cli.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { debug } from '../debug/log.js';
 
 const roots: string[] = [];

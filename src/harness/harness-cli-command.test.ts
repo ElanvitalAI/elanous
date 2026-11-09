@@ -17,7 +17,7 @@ import { debug } from '../debug/log.js';
 import { DISPATCH_SHADOW_COMPARE_ENV } from './dispatch-shadow-compare.js';
 import { addHarnessQueue, listHarnessQueue, removeHarnessQueue, tickHarnessQueue, type HarnessQueueDeps } from './harness-queue.js';
 import { getUserConfig, setUserConfigOverlay } from '../user-config.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { runSelfOrchestrateCliCommand } from '../self-dev/orchestrate-cli.js';

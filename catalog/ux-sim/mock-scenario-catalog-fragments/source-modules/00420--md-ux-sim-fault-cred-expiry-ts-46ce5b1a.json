@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAULT-CRED-EXPIRY-TS",
+  "path": "src/ux-sim/fault-cred-expiry.ts",
+  "boundary": "Grok subscription expiry: temporary HOME credentials, fake-clock refresh outcomes, and production grokLaunchReadiness/podGrokSubscriptionUsable decisions.",
+  "deviceIds": [
+    "fault-injection"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

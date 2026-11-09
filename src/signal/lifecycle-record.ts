@@ -1,3 +1,4 @@
+import { isObject, isStringArray } from '../primitives/guards.js';
 // ── Signal exchange · LifecycleRecord (S1) ──
 //
 // Structured lifecycle declarations over the local ChannelBus. This
@@ -110,14 +111,6 @@ const TRUNCATABLE_FIELDS_BY_NAME: Record<LifecycleName, ReadonlySet<string>> = {
  *  structurally (returns false) rather than blowing the stack — the
  *  boundary contract is "malformed → null, never throw". */
 const MAX_PAYLOAD_DEPTH = 32;
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function isStringArray(value: unknown): value is readonly string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === 'string');
-}
 
 function isJsonValue(value: unknown, ancestors: ReadonlySet<object> = new Set(), depth = 0): value is JsonValue {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;

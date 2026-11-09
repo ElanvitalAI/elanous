@@ -1,0 +1,39 @@
+{
+  "id": "fake-land-queue",
+  "name": "Fake landing queue",
+  "implementation": [
+    "src/ux-sim/fake-land-queue.ts",
+    "src/ux-sim/chain-land.ts",
+    "src/ux-sim/fake-gh.ts",
+    "src/ux-sim/fake-bin.ts",
+    "src/self-implement/l8-merge-queue.ts",
+    "src/self-implement/merge-train.ts",
+    "src/ux-sim/train-manager-decision-sim.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-land-queue.test.ts",
+    "src/ux-sim/chain-land.test.ts",
+    "src/ux-sim/train-manager-decision-sim.test.ts"
+  ],
+  "target": "production runL8ShadowQueue end-to-end with real temporary Git, fake GitHub CLI and simulated remote gate responses",
+  "inputs": [
+    "PR queue entries",
+    "multi-host integrated gate outcomes",
+    "failed or unmeasured remote gate",
+    "real stale queue-lock directory"
+  ],
+  "observations": [
+    "production queue ledger readback",
+    "real Git integration commands",
+    "per-host gate calls",
+    "persisted per-PR verdicts",
+    "stale lock leaves queue pending"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-land-queue.test.ts",
+    "bun test src/ux-sim/chain-land.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

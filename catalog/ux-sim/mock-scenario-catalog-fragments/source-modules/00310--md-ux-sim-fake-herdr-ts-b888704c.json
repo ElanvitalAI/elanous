@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-FAKE-HERDR-TS",
+  "path": "src/ux-sim/fake-herdr.ts",
+  "boundary": "Models herdr pane lifecycle, agent reports, missing-report faults and handoff timeouts without starting panes.",
+  "deviceIds": [
+    "fake-herdr",
+    "seat-mail-wake"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

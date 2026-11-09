@@ -1,0 +1,20 @@
+{
+  "id": "RLA-LAUNCH-COUNTDOWN-1107",
+  "name": "Readiness countdown · 11-07 delayed release",
+  "kind": "launch-countdown",
+  "device": "readiness-countdown",
+  "implementation": [
+    "src/ux-sim/readiness-countdown.ts"
+  ],
+  "tests": [
+    "src/ux-sim/readiness-countdown.test.ts"
+  ],
+  "trigger": "Inject delayed prerequisite PR landing, gate duration, host readiness and hold events around the reported 06:00 fixed-time constraint.",
+  "observe": [
+    "cutoff/gate/publish/announcement GO or NO-GO",
+    "ETA change notice",
+    "T-minus host reservation expiry",
+    "explicit hold reason"
+  ],
+  "expected": "fixed clock does not trigger launch; readiness controls GO, ETA updates and reservation extension"
+}

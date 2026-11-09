@@ -1011,9 +1011,10 @@ test('--completion <kind> 는 카드에 종결 종류를 싣고 모르는 값은
 
 test('TA-LIVE-LAND-2: task hand --ta-land --live writes card taLand and marks the tasks-hand admission entry', async () => {
   const path = statePath();
+  writeTaskCards(path, []);
   const text = liveGoal('ship it');
   const calls: Array<{ args: string[]; context?: TaskLaunchContext }> = [];
-  const { lines, code } = await cli(['task', 'hand', text, '--ta-land', '--live'], {
+  const { lines, code } = await cli(['task', 'hand', text, '--ta-land', '--ta-land-max', '1', '--live'], {
     taskStatePath: path,
     taskLauncher: (args, _cwd, context) => { calls.push({ args, context }); return { runId: context!.runId }; },
   });

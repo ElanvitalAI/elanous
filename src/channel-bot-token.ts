@@ -5,7 +5,7 @@ import { getSecret, setSecretAsync, currentBackendId } from './nexus/config/secr
 import { userConfigPath, secretsPath } from './nexus/config/paths.js';
 import { isSecretRef, makeSecretRef, secretIdFromRef } from './nexus/config/types.js';
 import { acquireLockAsync } from './storage/file-lock.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 
 export type ChannelBotPlatform = 'telegram' | 'discord';
 export type ChannelBotTokenSource = 'tokenRef' | 'env' | 'botToken' | 'channels.main';

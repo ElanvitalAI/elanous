@@ -3,7 +3,7 @@ import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 import { getProviderForConfig, type LLMProvider } from '../llm.js';
 import { probeProvider } from '../llm/provider-probe.js';
 import type { DetectedProvider } from '../llm/provider-detect.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { runLlmDetect, type LlmDetectDeps } from './llm-detect-cli.js';
 
 const key = 'secret-test-key';

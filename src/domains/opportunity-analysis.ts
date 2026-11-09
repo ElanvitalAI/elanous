@@ -12,7 +12,7 @@
 // is only reached when finance.autoLoop.enabled is true OR an operator passes
 // --arm-once; disarmed is the default. Bounded to one turn per signal.
 
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { makeContinuationRunTurn } from '../dispatch/continuation-turn-runner.js';
 import type { OpportunitySignal } from './finance-opportunity.js';
 

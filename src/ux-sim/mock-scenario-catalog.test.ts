@@ -24,11 +24,16 @@ const catalog = loadMockScenarioCatalog();
 test('catalog schema, scenario/device links, evidence contract, and all ux-sim simulation worlds are indexed', () => {
   expect(parseMockScenarioCatalog(catalog)).toEqual(catalog);
   expect(catalog.scenarios.map((scenario) => scenario.id)).toEqual([
-    'APP-CONTRACT-SECRET-ENTROPY', 'UX-MS-01', 'UX-MS-02', 'RELEASE-MACROPHAGE-HEAL', 'RELEASE-GRAPH-PREPUB-FANOUT', 'UX-MS-03', 'UX-MS-04', 'UX-MS-05', 'UX-MS-06',
+    'UX-MS-01', 'UX-MS-02', 'RELEASE-MACROPHAGE-HEAL', 'RELEASE-GRAPH-PREPUB-FANOUT', 'ARG-MACRO-CANVAS-SIM',
+    'RELEASE-GRAPH-ABSORB-ALL-0307', 'MACRO-CHAIN-E2E', 'RLA-REHEARSAL-CLOUD-RESUME', 'UX-MS-03', 'UX-MS-04', 'UX-MS-05', 'UX-MS-06',
     'UX-MS-07', 'UX-MS-08', 'UX-MS-09', 'UX-MS-11', 'UX-MS-12', 'NIGHT-TRAIN-DEAD-PID-LOCK', 'AUTHOR-PRECHECK-APPLIED',
     'AUTHOR-PRECHECK-REJECTED-UNPROVABLE', 'SAFE-PUBLIC-COPY-PUBLISH-REDACTION', 'SW-FREEZE', 'SIM-HQ-MOVE', 'SIM-CHAIN-LAND',
-    'UX-MS-13', 'RLA-LAUNCH-COUNTDOWN-1107', 'APP-WEB-DRIVE-TENANT', 'APP-SOURCE-SNAPSHOT', 'GOOGLE-DRIVE-LIST-READONLY',
-    'GIT-PUSH-TIMEOUT-PARTIAL-OUTCOME-REMOTE-VERIFY', 'TASK-TEMP-CLEANUP',
+    'UX-MS-13', 'APP-CONTRACT-SECRET-ENTROPY', 'APP-SOURCE-SNAPSHOT', 'APP-WEB-DRIVE-TENANT', 'GIT-PUSH-TIMEOUT-PARTIAL-OUTCOME-REMOTE-VERIFY',
+    'GOOGLE-DRIVE-LIST-READONLY', 'UX-MS-POD-PHASE-PREWARM', 'RLA-LAUNCH-COUNTDOWN-1107', 'UX-MS-POD-PHASE-PREWARM-HIT',
+    'TASK-TEMP-CLEANUP', 'SIM-RELEASE-SAME-VERSION-RUN-ADOPTION',
+    'GRAPH-RESUME-ANY-ENTRY-SIM',
+    'FLUTTER-DEPLOY-JOURNEY',
+    'SEAT-MAIL-WAKE-ALL-ADDRESSES',
   ]);
   expect(catalog.runEvidence.scope).toContain('ScenarioV0 YAML runs only');
   expect(catalog.worldEvents.map((event) => event.id)).toEqual(['EV-0042', 'EV-0107', 'hq-move',
@@ -45,19 +50,18 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim s
   expect(catalog.candidateAudit.sourceRows).toBe(36);
   expect(catalog.candidateAudit.existingPaths).toBe(35);
   expect(catalog.candidateAudit.excludedPaths).toBe(catalog.candidateAudit.candidates.filter((candidate) => candidate.disposition === 'excluded').length);
-  expect(catalog.candidateAudit.candidates).toHaveLength(58);
+  expect(catalog.candidateAudit.candidates).toHaveLength(62);
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/safe-public-copy-publish.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/seminar-rehearsal.test.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'scripts/release-loop/gate-bisect.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'scripts/release-loop/gate-bisect.test.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'scripts/release-loop/gate-bisect-sidecar.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/release-loop/macrophage-heal.ts' }));
-  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/fake-google-drive-world.ts' }));
-  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/fake-google-drive-world.test.ts' }));
-  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts' }));
-  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/fake-temp-cleanup.ts' }));
-  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/fake-temp-cleanup.test.ts' }));
-  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(58);
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/release-same-version-run-adoption-sim.ts' }));
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/release-same-version-run-adoption-sim.test.ts' }));
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/graph-resume-any-entry.ts' }));
+  expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/graph-resume-any-entry.test.ts' }));
+  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(62);
   expect(catalog.candidateAudit.sourceExclusions).toHaveLength(1);
   expect(catalog.candidateAudit.sourceExclusions[0]).toMatchObject({ path: 'scenarios/ux-sim/MK-MS-01.yaml' });
   expect(catalog.candidateAudit.sourceExclusions[0]?.reason).toContain('#34039');
@@ -85,6 +89,13 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim s
   const sourceModules = new Map(catalog.sourceModules.map((module) => [module.path, module]));
   const worldFiles = listSourceModuleFiles(join(REPO, 'src/ux-sim')).filter((path) => path.endsWith('-world.ts'));
   expect([...sourceModules.keys()].filter((path) => path.endsWith('-world.ts')).sort()).toEqual(worldFiles.sort());
+  expect(sourceModules.get('src/ux-sim/smart-merge-world.ts')).toMatchObject({
+    id: 'MD-UX-SIM-SMART-MERGE-WORLD-TS',
+    deviceIds: ['smart-merge-world'],
+  });
+  expect(sourceModules.get('src/ux-sim/ta-land-count-dispatcher-sim.ts')?.deviceIds).toEqual(['ta-land-count-dispatcher-sim']);
+  expect(sourceModules.get('src/ux-sim/fake-bin-args-sim.ts')?.deviceIds).toEqual(['fake-bin-args-sim']);
+  expect(sourceModules.get('src/ux-sim/pr-land-drift-autorepair-device.ts')?.deviceIds).toEqual(['pr-land-drift-autorepair-device']);
   for (const module of catalog.sourceModules) {
     expect(module.id).toMatch(/^MD-UX-SIM-/);
     expect(module.boundary.length).toBeGreaterThan(0);
@@ -170,7 +181,7 @@ test('GOOGLE-DRIVE-LIST-READONLY catalogs the synthetic metadata-only Google Dri
   const device = catalog.devices.find((entry) => entry.id === 'fake-google-drive-world');
   expect(device).toMatchObject({
     checklistCells: ['APP-OAUTH-ONE'],
-    implementation: ['src/ux-sim/fake-google-drive-world.ts'],
+    implementation: ['src/ux-sim/fake-google-drive-world.ts', 'src/ux-sim/fake-google-oauth.ts'],
     tests: ['src/ux-sim/fake-google-drive-world.test.ts'],
   });
   expect(catalog.scenarios.find((entry) => entry.id === 'GOOGLE-DRIVE-LIST-READONLY'))
@@ -266,7 +277,7 @@ test('generated manual catalog block matches the canonical JSON in memory', () =
   const actual = manual.slice(startAt, endAt + end.length);
   const expected = [
     begin,
-    '> 이 표는 `src/ux-sim/mock-scenario-catalog.json`에서 생성한다. 갱신: `bun scripts/generate-ux-sim-device-manual.ts`.',
+    '> 이 표는 `catalog/ux-sim/mock-scenario-catalog-fragments/`에서 생성한다. 갱신: `bun scripts/generate-ux-sim-device-manual.ts`.',
     '',
     ...renderMockScenarioDeviceMarkdownTable(catalog),
     end,
@@ -399,7 +410,7 @@ test('MS-01, MS-04, and MS-07 ask registered devices for independent and disting
 
 test('list and show render registered scenarios and unknown ids fail closed', () => {
   expect(renderMockScenarioList(catalog).join('\n')).toContain('UX-MS-01\treport-deficit');
-  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 58/59');
+  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 62/63');
   expect(renderMockScenarioDetails(catalog, 'UX-MS-11').join('\n')).toContain('request-shape 400');
   expect(() => renderMockScenarioDetails(catalog, 'UX-MS-99')).toThrow('unknown mock scenario id');
 });
@@ -411,7 +422,7 @@ test('ux-sim list/show/devices CLI exposes the catalog without launching a simul
   expect(list.stdout).toContain('UX-MS-07');
   expect(list.stdout).toContain('UX-MS-11');
   expect(list.stdout).toContain('UX-MS-12');
-  expect(list.stdout).toContain('후보 감사 58/59');
+  expect(list.stdout).toContain('후보 감사 62/63');
 
   const show = spawnSync('bun', ['scripts/ux-sim.ts', 'show', 'UX-MS-11'], { cwd: REPO, encoding: 'utf8' });
   expect(show.status).toBe(0);

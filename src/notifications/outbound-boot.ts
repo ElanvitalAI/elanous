@@ -36,7 +36,7 @@ import { resolve } from 'node:path';
 
 import { createApnsTransport } from '../notification-apns.js';
 import type { ApnsTransportOpts } from '../notification-apns.js';
-import type { ApnsUserConfig } from '../user-config.js';
+import type { ApnsUserConfig } from '../user-config/types.js';
 import {
   createIosPushChannel,
   type ApnsTransport,

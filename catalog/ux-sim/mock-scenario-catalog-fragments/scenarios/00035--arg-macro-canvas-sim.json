@@ -1,0 +1,21 @@
+{
+  "id": "ARG-MACRO-CANVAS-SIM",
+  "name": "ARG and macrophage repair proposal policy and graph reachability",
+  "kind": "release-graph-arg-macrophage-canvas",
+  "device": "release-graph-rig",
+  "implementation": [
+    "src/ux-sim/arg-macro-canvas-sim.ts",
+    "scenarios/ux-sim/arg-macro-canvas.yaml"
+  ],
+  "tests": [
+    "src/ux-sim/arg-macro-canvas-sim.test.ts"
+  ],
+  "trigger": "Inject five release-repair cases through the proposal canvas and evaluate each proposed recipe against the production R0-R4 policy before adding graph nodes.",
+  "observe": [
+    "an approved proposal adds an edge from afterNodeId to the repair entry node",
+    "only a policy-approved repair is represented as executed",
+    "policy-denied repairs route to HITL and policy no-ops do not append a recipe",
+    "ledger events distinguish policy denial and policy no-op from execution"
+  ],
+  "expected": "Approved proposals are reachable from their prior node; denied or no-op decisions never masquerade as executed repair recipes."
+}

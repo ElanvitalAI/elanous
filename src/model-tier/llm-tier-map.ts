@@ -23,7 +23,7 @@
 // Token cost projection is deferred to Phase 3 (BudgetGuard) — Phase 2
 // surfaces tier label + model id + per-turn rationale only.
 
-import type { LLMProviderName, ReasoningLevel } from '../user-config.js';
+import type { LLMProviderName, ReasoningLevel } from '../user-config/types.js';
 import { OPENGATEWAY_DEFAULT_MODEL } from '../llm/opengateway-models.js';
 import type { ModelTier } from './types.js';
 

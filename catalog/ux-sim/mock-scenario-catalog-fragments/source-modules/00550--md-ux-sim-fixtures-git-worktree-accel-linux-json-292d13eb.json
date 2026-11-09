@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FIXTURES-GIT-WORKTREE-ACCEL-LINUX-JSON",
+  "path": "src/ux-sim/fixtures/git-worktree-accel-linux.json",
+  "boundary": "Deterministic Linux fixture for same-cut cold/warm checkout route comparisons, with candidate measurements and explicit unavailable metrics; not host performance claims.",
+  "deviceIds": [
+    "git-worktree-accel-measure"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

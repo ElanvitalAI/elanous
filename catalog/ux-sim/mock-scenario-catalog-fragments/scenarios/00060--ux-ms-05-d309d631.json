@@ -1,0 +1,20 @@
+{
+  "id": "UX-MS-05",
+  "name": "TUI and gate worker stall",
+  "kind": "stall",
+  "device": "product-devices",
+  "implementation": [
+    "src/ux-sim/dashboard-event-loop-stall-monitor-device.ts"
+  ],
+  "tests": [
+    "src/ux-sim/dashboard-event-loop-stall-monitor-device.test.ts",
+    "scripts/release-loop/gate-pod-stall.test.ts"
+  ],
+  "trigger": "Delay the UI event loop or stop gate shard output.",
+  "observe": [
+    "typing lag/stall sample",
+    "stalled shard reason",
+    "bounded completion"
+  ],
+  "expected": "stall is named and unrelated work can finish"
+}

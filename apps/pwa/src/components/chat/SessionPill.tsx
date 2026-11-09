@@ -14,8 +14,7 @@
 //
 // 본 fix 이전 design context (보존):
 //
-// Image-pipeline followup #3 (2026-05-05) — fork affordance + PR #4.5
-// 강화 (preview text · origin pill · attach/forget dropdown).
+// Image-pipeline followup #3 (2026-05-05) — fork affordance and preview metadata.
 //
 // Click on the GitFork icon uses two-step armed pattern:
 //   1. First click sets `confirmArmed=true` for 4s; the button paints
@@ -24,20 +23,15 @@
 //      a brief "(forked)" via the title.
 //   3. Idle 4s → armed state clears, no fork happens.
 //
-// PR #4.5 추가:
-// - sessionId prop — workspace 의 chat 탭이 자기 sessionId 를 명시
-//   override (단일 탭 `/chat` 은 무지정 = DaemonProvider sessionId 사용)
-// - SessionsService 에서 preview / origin 가져와 라벨로 표시
-// - `⌄` dropdown — "다른 세션 attach" / "이 세션 잊기" callback 노출
-//   (callback 미지정 시 dropdown item 자체가 안 보임 — single-tab 페이지
-//   의 동작 보존)
+// SessionsService supplies the preview/origin labels; `sessionId` is optional
+// for the standalone chat and terminal chat surfaces.
 
 import { useEffect, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { forkSession } from '@/lib/daemon-session';
 import { useSessions } from '@/lib/use-sessions';
 import {
-  GitFork, ChevronDown, Trash2, ListTree, Info, MessageSquarePlus,
+  GitFork, ChevronDown, Info, MessageSquarePlus,
   Copy, Check,
 } from 'lucide-react';
 import { debugLog } from '@/lib/debug';
@@ -57,13 +51,7 @@ const ORIGIN_LABEL: Record<string, string> = {
 };
 
 export interface SessionPillProps {
-  /** workspace chat 탭 — 자기 탭의 sessionId 를 명시. 미지정 시
-   *  DaemonProvider 의 default 사용 (single-tab `/chat` 동작 보존). */
   sessionId?: string;
-  /** Dropdown 의 "다른 세션 attach" 가 호출. 미지정 시 menu item 미표시. */
-  onAttachRequest?: () => void;
-  /** Dropdown 의 "이 세션 잊기" 가 호출. 미지정 시 menu item 미표시. */
-  onForgetRequest?: () => void;
 }
 
 export function SessionPill(props: SessionPillProps = {}) {
@@ -247,20 +235,6 @@ export function SessionPill(props: SessionPillProps = {}) {
               </span>
             </span>
           </button>
-          {props.onAttachRequest && (
-            <button
-              type="button"
-              role="menuitem"
-              onClick={() => {
-                props.onAttachRequest!();
-                setMenuOpen(false);
-              }}
-              className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-secondary"
-            >
-              <ListTree className="h-3.5 w-3.5 text-muted-foreground" />
-              다른 대화로 전환
-            </button>
-          )}
           {/* 세션 정보 — full ID + Copy + 메시지 카운트. pill 의 short
               ID 만으로 식별 안 될 때 (e.g. 같은 prefix 다른 세션) 전체
               ID 확인 + 복사 path. */}
@@ -295,23 +269,6 @@ export function SessionPill(props: SessionPillProps = {}) {
               {summary?.origin && ` · ${ORIGIN_LABEL[summary.origin] ?? summary.origin}`}
             </div>
           </div>
-          {props.onForgetRequest && (
-            <>
-              <div className="my-1 border-t border-border" />
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  props.onForgetRequest!();
-                  setMenuOpen(false);
-                }}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-rose-500 hover:bg-rose-500/10"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                이 대화 지우기
-              </button>
-            </>
-          )}
         </div>
       )}
     </div>

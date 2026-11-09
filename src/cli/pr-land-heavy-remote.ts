@@ -389,21 +389,19 @@ export function ensurePrLandHeavyRemote(input: HeavyRemoteInput, deps: HeavyRemo
   return { ok: true, host: selectedHost, source: 'remote', elapsedMs, evidencePath: path, rootPlan: evidence.rootPlan, interferenceMeasured: evidence.interferenceMeasured };
 }
 
-/** Design contract for moving pr land's local git work to an allowlisted host.
- *
- * This contract is deliberately not wired into the landing flow yet. GIT-IO-METER
- * must land before a measured HQ-cost threshold can select remote execution.
- */
+/** Identity contract for pinned pr land's remote Git phases. */
 export const PR_LAND_GIT_REMOTE_HOSTS = PR_LAND_HEAVY_HOSTS;
 export type PrLandGitRemoteHost = typeof PR_LAND_GIT_REMOTE_HOSTS[number];
 export type PrLandGitPhase = 'fetch' | 'worktree' | 'rebase' | 'push';
 
 /** Immutable identity envelope: remote work is tied to the reviewed head and measured main tip. */
 export interface PrLandRemoteGitRequest {
-  schema: 1;
+  schema: 2;
   pr: number;
   /** GitHub repository whose origin ref HQ will inspect after the remote push. */
   repository: string;
+  /** PR base repository whose pinned main is the rebase target (may differ for forks). */
+  baseRepository: string;
   /** Full PR source ref, for example refs/heads/feature/topic; never infer it from a local branch. */
   headRef: string;
   head: string;
@@ -414,9 +412,10 @@ export interface PrLandRemoteGitRequest {
 
 /** A remote receipt is a claim; HQ must still compare its SHAs with ls-remote. */
 export interface PrLandRemoteGitReceipt {
-  schema: 1;
+  schema: 2;
   pr: number;
   repository: string;
+  baseRepository: string;
   headRef: string;
   head: string;
   main: string;
@@ -464,14 +463,14 @@ export function validatePrLandRemoteGitReceipt(
   receipt: unknown,
   observedRemoteHead?: string,
 ): PrLandRemoteGitReceiptVerdict {
-  if (request.schema !== 1 || !Number.isSafeInteger(request.pr) || request.pr <= 0
-    || !isRepository(request.repository) || !isHeadRef(request.headRef)
+  if (request.schema !== 2 || !Number.isSafeInteger(request.pr) || request.pr <= 0
+    || !isRepository(request.repository) || !isRepository(request.baseRepository) || !isHeadRef(request.headRef)
     || !isValidSha(request.head) || !isValidSha(request.main) || !isGitPhase(request.phase)
     || !isRemoteHost(request.host)) return { ok: false, reason: 'invalid-request-identity' };
   if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return { ok: false, reason: 'receipt-unmeasured' };
   const value = receipt as Partial<PrLandRemoteGitReceipt>;
-  if (value.schema !== 1 || !Number.isSafeInteger(value.pr) || value.pr !== request.pr || value.head !== request.head || value.main !== request.main
-    || value.repository !== request.repository || value.headRef !== request.headRef
+  if (value.schema !== 2 || !Number.isSafeInteger(value.pr) || value.pr !== request.pr || value.head !== request.head || value.main !== request.main
+    || value.repository !== request.repository || value.baseRepository !== request.baseRepository || value.headRef !== request.headRef
     || !isGitPhase(value.phase) || !isRemoteHost(value.host)
     || value.phase !== request.phase || value.host !== request.host) return { ok: false, reason: 'receipt-identity-mismatch' };
   if (value.ok !== true) return { ok: false, reason: typeof value.reason === 'string' && value.reason.trim() ? value.reason : 'remote-git-failed' };

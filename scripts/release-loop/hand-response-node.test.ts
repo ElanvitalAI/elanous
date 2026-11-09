@@ -39,6 +39,16 @@ test('release auto-start and recover map to their existing guarded CLI operation
     '--pick', '0123456789abcdef0123456789abcdef01234567', '--json']);
 });
 
+test('cut-append uses the release graph input and is dry-run until explicitly approved', () => {
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  expect(planHandResponseAction('cut-append', context('cut-append', { pickShas: [sha] }))
+    .args).toEqual(['release', 'cut-branch', '--version', '0.3.7', '--append', '--pick', sha, '--dry-run', '--json']);
+  expect(planHandResponseAction('cut-append', context('cut-append', approved('cut-append', { pickShas: [sha] })))
+    .args).toEqual(['release', 'cut-branch', '--version', '0.3.7', '--append', '--pick', sha, '--json']);
+  expect(() => planHandResponseAction('cut-append', context('cut-append', approved('cut-append', { pickShas: ['bad'] }))))
+    .toThrow('full commit SHAs');
+});
+
 test('worker restart uses the named K-OP-147 script path and bounded worker environment', () => {
   const plan = planHandResponseAction('rla-train-worker-restart', context('rla-train-worker-restart', approved('rla-train-worker-restart', {
     host: 'aws1', slot: '2', stopAt: '202611080700',

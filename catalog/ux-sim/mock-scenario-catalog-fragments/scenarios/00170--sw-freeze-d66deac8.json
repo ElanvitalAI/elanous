@@ -1,0 +1,20 @@
+{
+  "id": "SW-FREEZE",
+  "name": "Three-pass same-build seminar rehearsal freeze",
+  "kind": "rehearsal-freeze-state-machine",
+  "device": "first-run-and-seminar",
+  "implementation": [
+    "src/ux-sim/seminar-rehearsal.ts"
+  ],
+  "tests": [
+    "src/ux-sim/seminar-rehearsal.test.ts"
+  ],
+  "trigger": "Run the real seven-scene seminar verdict three times in one isolated sim world with the same build id, then submit a changed build with and without an owner receipt.",
+  "observe": [
+    "three passes persisted across a world-store reload",
+    "a later same-build failure does not release the freeze",
+    "an unapproved build change is refused before rehearsal",
+    "a matching owner approval records the next build and starts its pass count"
+  ],
+  "expected": "The third consecutive same-build pass freezes the rehearsal state; a changed build is refused until a matching owner approval receipt is supplied."
+}

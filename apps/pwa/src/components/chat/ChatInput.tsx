@@ -5,7 +5,7 @@ import { Send, Paperclip, X, Mic, MicOff } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { isMetaCommand, META_COMMANDS } from '@/lib/chat-runtime';
-import { takeSharePrefill } from '@/lib/share-prefill';
+import { SHARE_PREFILL_EVENT, takeSharePrefill } from '@/lib/share-prefill';
 import { cn } from '@/lib/utils';
 import { CameraAttachButton } from '@/components/terminal/CameraAttachButton';
 import { FileAttachButton } from '@/components/terminal/FileAttachButton';
@@ -160,9 +160,6 @@ interface Props {
   attachments?: AttachmentMeta[];
   onAttached?: (entries: AttachmentMeta[]) => void;
   onRemoveAttachment?: (id: string) => void;
-  /** BACKLOG #3 — workspace tab id for chat-input snapshot persistence.
-   *  Falls back to 'singleton' when absent (single-tab `/chat` page). */
-  tabId?: string;
   /** Phase 1 — voice controller state mirror (optional · falls back to
    *  no mic button when ChatInput is mounted outside ChatLayout, e.g.
    *  legacy callsites). */
@@ -202,7 +199,6 @@ export function ChatInput({
   attachments = EMPTY_ATTACHMENTS,
   onAttached,
   onRemoveAttachment,
-  tabId,
   voice,
   onListFiles,
   onListSkills,
@@ -258,11 +254,14 @@ export function ChatInput({
     }).catch(() => { /* chat stays available when the seat endpoint is unavailable */ });
     return () => { active = false; };
   }, [client]);
-  const persistKey = snapshotKey('chatInput', tabId);
+  const persistKey = snapshotKey('chatInput');
   const [value, setValue] = useState<string>(() => {
     const stash = loadSnapshot<string>(persistKey);
     return typeof stash === 'string' ? stash : '';
   });
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const userEditedRef = useRef(false);
 
   // PWA Phase 1·E+H — promptHistory state (cross-session via localStorage).
   // historyIndex: -1 = current draft · 0+ = recall index.
@@ -385,22 +384,45 @@ export function ChatInput({
       setSkillSelectedIndex(0);
     }
   }, [skillQuery]);
-  // WT-N-6 — when the share-target page (/app/share/) stashed text in
+  // WT-N-6 — when a share handoff stashed text in
   // sessionStorage we prefill the textarea on mount. One-shot: drain
-  // the key so a manual reload doesn't re-prefill. Toast hint so the
-  // user understands where the unexpected text came from. Share prefill
-  // wins over snapshot (explicit user intent vs ambient persistence).
+  // the key after the composer accepts it. Toast hint so the user
+  // understands where the unexpected text came from. Existing drafts win.
   useEffect(() => {
+    // A persisted snapshot is an in-progress user draft, so a second share
+    // must stay staged instead of replacing it on remount.
+    if (userEditedRef.current || valueRef.current.length > 0) return;
     const stash = takeSharePrefill();
     if (stash) {
       setValue(stash);
+      valueRef.current = stash;
       toast.success('📥 공유 받음 — 검토 후 보내세요');
     }
   }, []);
 
   useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const receiveSharePrefill = (): void => {
+      // A completed upload may notify the composer after the user has
+      // started typing. Keep that draft and leave the handoff in storage.
+      if (userEditedRef.current || valueRef.current.length > 0) return;
+      const stash = takeSharePrefill();
+      if (!stash) return;
+      setValue(stash);
+      valueRef.current = stash;
+      toast.success('📥 공유 받음 — 검토 후 보내세요');
+    };
+    window.addEventListener(SHARE_PREFILL_EVENT, receiveSharePrefill);
+    return () => window.removeEventListener(SHARE_PREFILL_EVENT, receiveSharePrefill);
+  }, []);
+
+  useEffect(() => {
     if (!prefill) return;
+    // A restored snapshot or user keystroke is already the user's draft.
+    // Leave the share handoff in sessionStorage so it can be recovered later.
+    if (userEditedRef.current || valueRef.current.length > 0) return;
     setValue(prefill.text);
+    valueRef.current = prefill.text;
     takeSharePrefill();
   }, [prefill]);
 
@@ -508,6 +530,8 @@ export function ChatInput({
     }
     onSubmit(trimmed);
     setValue('');
+    valueRef.current = '';
+    userEditedRef.current = false;
     clearSnapshot(persistKey);
   };
 
@@ -1009,7 +1033,7 @@ export function ChatInput({
         </div>
         <textarea
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => { userEditedRef.current = true; setValue(e.target.value); }}
           onKeyDown={onKey}
           placeholder="메시지 · :help 명령 목록"
           rows={2}

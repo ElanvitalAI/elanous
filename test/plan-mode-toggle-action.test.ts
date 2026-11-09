@@ -70,7 +70,7 @@ describe('plan-mode-toggle-action', () => {
     startGoal({ objective: 'x' });
     expect(getCurrentGoal()?.status).toBe('active');
     await togglePlanModeAction();
-    // pauseOnPlanModeEnter defaults to true, so goal should be paused
+    // plan-mode entry always pauses an active goal (goals.pauseOnPlanModeEnter removed)
     expect(getCurrentGoal()?.status).toBe('paused');
   });
 

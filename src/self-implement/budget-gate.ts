@@ -7,12 +7,8 @@ import { codexPolicyAllowsCredits, codexPolicyAllowsFallback } from '../oauth/co
 import { getUsageStore } from '../budget/usage-store.js';
 import type { UsageSnapshot } from '../budget/types.js';
 import { debug } from '../debug/log.js';
-import {
-  DEFAULT_BUDGET_GATE_MAX_USED_PERCENT,
-  LAUNCH_GROK_USED_PERCENT_CAP,
-  type BudgetGateMaxUsedPercent,
-  type BudgetGateOnShortfall,
-} from '../user-config.js';
+import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, LAUNCH_GROK_USED_PERCENT_CAP } from '../user-config.js';
+import type { BudgetGateMaxUsedPercent, BudgetGateOnShortfall } from '../user-config/types.js';
 import {
   resolveChildLlmPreference,
   type ChildLlmPreferenceInput,

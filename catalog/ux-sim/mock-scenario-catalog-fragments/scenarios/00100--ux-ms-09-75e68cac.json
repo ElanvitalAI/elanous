@@ -1,0 +1,22 @@
+{
+  "id": "UX-MS-09",
+  "name": "Draft triage 200-case safety inventory",
+  "kind": "draft-inventory-triage",
+  "device": "draft-inventory",
+  "implementation": [
+    "src/ux-sim/draft-inventory-builder.ts",
+    "src/ux-sim/scenario.ts"
+  ],
+  "tests": [
+    "src/ux-sim/draft-inventory-builder.test.ts",
+    "src/ux-sim/scenario.test.ts"
+  ],
+  "trigger": "Evaluate deterministic twin, duplicate, harvest, landed-file, protected-label, running, and stale draft cases.",
+  "observe": [
+    "200 production decideDraft results",
+    "draftClaimState for running samples",
+    "protected/running close count",
+    "runId-linked assessment and completion events"
+  ],
+  "expected": "scenario completes PASS with the intended case distribution, no mismatches, and no protected/running draft closed"
+}

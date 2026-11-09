@@ -1,0 +1,9 @@
+apiVersion: elanous.dev/domain-pack/v1
+id: release-gate
+numericAssertions:
+  - { id: counts-from-identities, rule: Derive counts from unique failure or receipt identities; reject hand-entered totals. }
+  - { id: complete-receipts-only, rule: Count a shard only when its receipt is complete and matches the pinned run and head. }
+  - { id: fail-unmeasured-disjoint, rule: Keep failed and unmeasured outcomes disjoint; missing evidence is never a pass. }
+  - { id: paired-baseline, rule: Compare baseline and candidate on the same test set and record both outcomes. }
+  - { id: measured-time-budget, rule: Compare elapsed duration with the declared timeout from the same execution. }
+  - { id: generation-based-expiry, rule: Expire accepted regressions by release-run generations, not wall-clock guesses. }

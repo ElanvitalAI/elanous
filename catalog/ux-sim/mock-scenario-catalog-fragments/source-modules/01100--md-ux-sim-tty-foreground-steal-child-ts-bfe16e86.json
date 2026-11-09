@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TTY-FOREGROUND-STEAL-CHILD-TS",
+  "path": "src/ux-sim/tty-foreground-steal-child.ts",
+  "boundary": "Real-PTY reproducer for login-shell foreground-process-group theft; runs legacy/current shell capture and reports terminal group IDs.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

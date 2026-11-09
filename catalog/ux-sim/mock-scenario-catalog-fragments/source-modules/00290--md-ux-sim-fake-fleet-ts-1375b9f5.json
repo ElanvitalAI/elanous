@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-FLEET-TS",
+  "path": "src/ux-sim/fake-fleet.ts",
+  "boundary": "Composes independent host SSH scripts and per-context Kubernetes fixtures, recording ordered calls, latency and failures for multi-host release-gate tests.",
+  "deviceIds": [
+    "fake-fleet"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

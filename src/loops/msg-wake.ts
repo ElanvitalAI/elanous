@@ -22,17 +22,20 @@
 //    재두드림 «전»에 그 주소 미읽음을 잰다 — 0 이면 두드리지 않고 줄을 지운다(`dropped-read` · H4-FOLLOW ③).
 
 import { Database } from 'bun:sqlite';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
+import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
-import { readUnreadCount } from '../msg/msg-store.js';
+import { canonicalSeatId, readUnreadCount } from '../msg/msg-store.js';
 import { herdrPrompt, type HerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { listPtyManifestRows } from '../pty-shell/pty-manifest.js';
-import { messageRouteFor, type MessageWake } from './msg-address.js';
+import { messageRouteFor, SEAT_MESSAGE_ROUTES, type MessageWake } from './msg-address.js';
+import { acquireLockSync } from '../storage/file-lock.js';
+import { readSeatRegistry, seatRegistryEntry, seatRegistryPath, type SeatRegistryEntry } from './seat-registry.js';
 
 export const WAKE_DEBOUNCE_MS = 5 * 60_000;
 export const WAKE_TIMEOUT_MS = 3_000;
@@ -49,7 +52,9 @@ export interface WakeResolution {
   /** pty id (pty-inject) or herdr pane id (herdr). */
   target?: string;
   /** Where the answer came from — `unresolved` means «모름», not a measured absence. */
-  source: 'loop-table' | 'pty-name' | 'pty.ref' | 'herdr.pane' | 'unresolved';
+  source: 'loop-table' | 'seat-registry' | 'pty-name' | 'pty.ref' | 'herdr.pane' | 'unresolved';
+  /** Registered execution host; `local` uses the current process and any other value is an SSH alias. */
+  host?: string;
   reason?: string;
   /** For a seat-folder target: the seat opted in to injection (`<seat>/wake-inject` exists). Absent = not a seat target. */
   optIn?: boolean;
@@ -78,6 +83,12 @@ export interface WakeDeps {
   ptyInjector?: () => Promise<(ptyId: string, line: string) => Promise<void>>;
   /** The herdr CLI runner `herdrPrompt` drives (`agent get` · `pane run`). Default: the real `herdr` (HERDR_BIN_PATH · PATH). */
   herdrRun?: HerdrCliRunner;
+  /** Builds a herdr runner for a registered remote SSH host. No shell is used for host or argv values. */
+  herdrRunForHost?: (host: string) => HerdrCliRunner;
+  /** Registry path override; defaults to <seatStateRoot>/seat-registry.json. */
+  registryPath?: string;
+  /** Test seam for the central registry reader. */
+  readRegistry?: () => ReturnType<typeof readSeatRegistry>;
   warn?: (line: string) => void;
   /** Unread count for an address before a deferred re-knock (H4-FOLLOW ③). null = «모름» (never drops). Default: the msg ledger. */
   readUnread?: (address: string) => number | null;
@@ -88,26 +99,54 @@ function isLive(deps: WakeDeps): boolean {
   return effectiveInstanceRoot() === prodInstanceRoot() || process.env.ELANOUS_MSG_WAKE_LIVE === '1';
 }
 
-function seatStateRoot(deps: WakeDeps): string {
+export function resolveSeatStateRoot(deps: WakeDeps = {}): string {
   if (deps.seatStateRoot) return deps.seatStateRoot;
   const root = effectiveInstanceRoot();
   return root === prodInstanceRoot() ? join(homedir(), 'elanous-hq', 'seat-state') : join(root, 'seat-state');
 }
 
-/** The opt-in must be a regular file — a directory, a symlink or anything else at that name does not open injection. */
-function isRegularFile(path: string): boolean {
-  // lstat — 링크는 따라가지 않는다(자리 자체의 일반 파일만 opt-in).
-  try { return lstatSync(path).isFile(); } catch { return false; }
+function registryFor(deps: WakeDeps) {
+  return deps.readRegistry?.() ?? readSeatRegistry(deps.registryPath ?? seatRegistryPath(resolveSeatStateRoot(deps)));
 }
 
-/** The seat's own opt-in, read independently of whatever target the seat folder points at now. */
-function seatOptedIn(address: string, deps: WakeDeps): boolean {
-  return (deps.hasOptIn ?? isRegularFile)(join(seatStateRoot(deps), address.trim().toUpperCase(), WAKE_OPT_IN_FILE));
+function wakeResolutionForSeat(entry: SeatRegistryEntry): WakeResolution {
+  return { wake: entry.wake, ...(entry.target ? { target: entry.target } : {}), source: 'seat-registry',
+    host: entry.host, optIn: entry.optIn, ...(entry.wake === 'none' ? { reason: 'registry-wake-disabled' } : {}) };
 }
 
-function readPaneFile(path: string): string | null {
-  try { return existsSync(path) ? readFileSync(path, 'utf8').trim() || null : null; }
-  catch { return null; }
+/** Reply-body policy shares the same address registry used for wake routing. */
+export function messageReplyBodyFor(address: string, deps: WakeDeps = {}): string | null {
+  const loopRoute = messageRouteFor(address);
+  if (loopRoute?.wake) return loopRoute.replyBody ?? null;
+  const registry = registryFor(deps);
+  if (registry.status !== 'ready') return null;
+  return seatRegistryEntry(registry.registry, address)?.replyBody ?? null;
+}
+
+/** POSIX-shell quote argv because OpenSSH transmits its remote command as text. */
+export function quoteRemoteHerdrCommand(argv: readonly string[]): string {
+  const escapedQuote = String.fromCharCode(39, 92, 39, 39);
+  return ['herdr', ...argv].map(value => String.fromCharCode(39) + value.replaceAll(String.fromCharCode(39), escapedQuote) + String.fromCharCode(39)).join(' ');
+}
+
+/** Default SSH transport for a registered remote herdr host. */
+export function remoteHerdrRunner(host: string): HerdrCliRunner {
+  if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(host)) throw new Error('invalid registered SSH host');
+  return (argv, timeoutMs) => new Promise(resolve => {
+    let child: ReturnType<typeof spawn>;
+    try { child = spawn('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3', host, quoteRemoteHerdrCommand(argv)],
+      { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); }
+    catch (error) { resolve({ code: null, stdout: '', stderr: error instanceof Error ? error.message : String(error) }); return; }
+    let stdout = ''; let stderr = ''; let settled = false;
+    const finish = (result: { code: number | null; stdout: string; stderr: string }) => {
+      if (settled) return; settled = true; clearTimeout(timer); resolve(result);
+    };
+    const timer = setTimeout(() => { child.kill(); finish({ code: null, stdout, stderr: stderr || 'remote herdr timed out' }); }, Math.max(1, timeoutMs));
+    child.stdout?.on('data', chunk => { if (stdout.length < 64 * 1024) stdout += String(chunk); });
+    child.stderr?.on('data', chunk => { if (stderr.length < 64 * 1024) stderr += String(chunk); });
+    child.on('error', error => finish({ code: null, stdout, stderr: error.message }));
+    child.on('close', code => finish({ code, stdout, stderr }));
+  });
 }
 
 /** How a post to `address` would wake its reader — table first, then a live pty named after the seat, then herdr. */
@@ -116,23 +155,96 @@ export function resolveWake(address: string, deps: WakeDeps = {}): WakeResolutio
   if (name === 'ALL') return { wake: 'none', source: 'unresolved', reason: 'topic' };
   const route = messageRouteFor(name);
   if (route?.wake) return { wake: route.wake, source: 'loop-table' };
-  // 호스트 해석은 표에 선언된 자리 줄(wakeFrom: 'host')만 — 모르는 주소는 같은 이름의 pty 가 있어도 깨우지 않는다.
-  if (route?.wakeFrom !== 'host') return { wake: 'none', source: 'unresolved', reason: 'undeclared-address' };
-  // ⭐ 별명은 «정확히» 같은 것만 — pty ref 해석의 부분 일치(op ⊂ opt)로 남의 TUI 에 넣지 않는다.
-  const lower = name.toLowerCase();
-  let ptys: ReturnType<NonNullable<WakeDeps['listPtys']>> = [];
-  try { ptys = (deps.listPtys ?? listPtyManifestRows)(); } catch { ptys = []; }
-  const named = ptys.filter(row => row.alive && (row.nickname ?? '').toLowerCase() === lower);
-  const optIn = seatOptedIn(name, deps);
-  if (named.length === 1) return { wake: 'pty-inject', target: named[0]!.id, source: 'pty-name', optIn };
-  // seat-inbox.sh 와 같은 자리 폴더 파일: pty.ref(살아 있는 행의 id·별명과 정확히 같을 때만) → herdr.pane.
-  const readSeatFile = deps.readPane ?? readPaneFile;
-  const ref = readSeatFile(join(seatStateRoot(deps), name, 'pty.ref'))?.toLowerCase();
-  const byRef = ref ? ptys.filter(row => row.alive && (row.id.toLowerCase() === ref || (row.nickname ?? '').toLowerCase() === ref)) : [];
-  if (byRef.length === 1) return { wake: 'pty-inject', target: byRef[0]!.id, source: 'pty.ref', optIn };
-  const pane = readSeatFile(join(seatStateRoot(deps), name, 'herdr.pane'));
-  if (pane) return { wake: 'herdr', target: pane, source: 'herdr.pane', optIn };
-  return { wake: 'none', source: 'unresolved', reason: named.length > 1 ? `pty-name-ambiguous:${named.length}` : 'no-pty-name-no-herdr-pane' };
+  // Registered seat addresses are resolved from one operational SSOT. Once present, the file is
+  // authoritative: an absent row never falls through to a similarly named pane or seat folder.
+  const registry = registryFor(deps);
+  if (registry.status === 'invalid') return { wake: 'none', source: 'unresolved', reason: `invalid-seat-registry:${registry.reason}` };
+  if (registry.status === 'ready') {
+    const entry = seatRegistryEntry(registry.registry, name);
+    return entry ? wakeResolutionForSeat(entry) : { wake: 'none', source: 'unresolved', reason: 'undeclared-address' };
+  }
+  return { wake: 'none', source: 'unresolved', reason: 'seat-registry-missing' };
+}
+
+export interface RegisterSeatPaneOptions {
+  address: string;
+  paneId: string;
+  host: string;
+  enableWake?: boolean;
+  replace?: boolean;
+}
+
+export interface RegisterSeatPaneResult {
+  address: string;
+  paneId: string;
+  host: string;
+  registryFile: string;
+  changed: boolean;
+  wakeEnabled: boolean;
+}
+
+function atomicPrivateWrite(path: string, contents: string, replace = false): void {
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(temp, 'wx', 0o600);
+    writeFileSync(fd, contents, 'utf8');
+    closeSync(fd);
+    fd = undefined;
+    if (replace) renameSync(temp, path);
+    else { linkSync(temp, path); unlinkSync(temp); }
+  } catch (error) {
+    if (fd !== undefined) closeSync(fd);
+    try { unlinkSync(temp); } catch { /* no temporary file remains */ }
+    throw error;
+  }
+}
+
+/**
+ * The first registration snapshots existing statically declared seat routes once; after that,
+ * seat-registry.json is authoritative. New seats are admitted by this command without changing code.
+ */
+export function registerSeatPaneAddress(input: RegisterSeatPaneOptions, deps: WakeDeps = {}): RegisterSeatPaneResult {
+  const address = canonicalSeatId(input.address);
+  if (messageRouteFor(address)?.wake) throw new Error(`loop address is not a seat: ${address}`);
+  const host = input.host.trim();
+  if (!host) throw new Error('host is required (use local or an SSH alias)');
+  if (host === 'unknown' || !/^(?:local|[A-Za-z0-9][A-Za-z0-9.-]{0,252})$/.test(host)) throw new Error('invalid host (use local or an SSH alias)');
+  const paneId = input.paneId.trim();
+  if (!/^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/.test(paneId)) throw new Error('invalid herdr pane ID');
+  const root = resolveSeatStateRoot(deps);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const registryFile = deps.registryPath ?? seatRegistryPath(root);
+  try { if (lstatSync(registryFile).isSymbolicLink()) throw new Error('seat registry must not be a symlink'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  // A local PID check can mistake a live lock owner on another shared-registry host for a dead process.
+  const unlock = acquireLockSync(`${registryFile}.lock`, { breakDeadHolder: false, staleMs: 5 * 60_000 });
+  try {
+    const currentRead = readSeatRegistry(registryFile);
+    if (currentRead.status === 'invalid') throw new Error(`invalid seat registry: ${currentRead.reason}`);
+    let seats = currentRead.status === 'ready' ? [...currentRead.registry.seats] : [];
+    if (currentRead.status === 'absent') {
+      // Preserve static address/reply policy only; pane IDs and opt-in are host-local.
+      for (const legacyAddress of Object.keys(SEAT_MESSAGE_ROUTES)) {
+        if (legacyAddress !== address) seats.push({ address: legacyAddress, host: 'unknown', wake: 'none', replyBody: SEAT_MESSAGE_ROUTES[legacyAddress]?.replyBody ?? 'none', optIn: false });
+      }
+    }
+    const previous = seats.find(entry => entry.address === address);
+    const changed = previous?.target !== paneId || previous.host !== host || previous.wake !== 'herdr';
+    const hasBinding = previous !== undefined && (previous.target !== undefined || previous.wake !== 'none');
+    if (hasBinding && changed && !input.replace) throw new Error(`seat ${address} already points to ${previous.host}:${previous.target ?? '(none)'}; pass --replace to update`);
+    const entry: SeatRegistryEntry = {
+      address, host, target: paneId, wake: 'herdr', replyBody: previous?.replyBody ?? 'agent',
+      // Rebinding revokes consent unless this command explicitly opts the new target in.
+      optIn: input.enableWake === true ? true : changed ? false : previous?.optIn ?? false,
+    };
+    const nextSeats = [...seats.filter(row => row.address !== address), entry].sort((a, b) => a.address.localeCompare(b.address));
+    const next = JSON.stringify({ version: 1, seats: nextSeats }, null, 2) + '\n';
+    const oldContents = currentRead.status === 'ready' ? JSON.stringify(currentRead.registry, null, 2) + '\n' : null;
+    const changedFile = oldContents !== next;
+    if (changedFile) atomicPrivateWrite(registryFile, next, currentRead.status === 'ready');
+    return { address, paneId, host, registryFile, changed: changedFile, wakeEnabled: entry.optIn };
+  } finally { unlock(); }
 }
 
 function claimDbPath(deps: WakeDeps): string {
@@ -230,8 +342,8 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
         // 로드 사이 별명·pty.ref 가 다른 행으로 옮겨 갔으면 넣지 않는다 — 주소→대상을 다시 푼다.
         const again = resolveWake(address, deps);
         // opt-in 은 주입 직전에 «먼저» 다시 본다 — 기다리는 사이 `wake-inject` 를 지웠으면(대상이 바뀌었어도) 주입 0.
-        if (!seatOptedIn(address, deps)) { resolution = { ...resolution, optIn: false }; return done('skipped', 'human-pane-no-opt-in'); }
-        if (again.wake !== 'pty-inject' || again.target !== resolution.target) return done('busy', `target-moved:${again.target ?? again.wake}`);
+        if (again.optIn !== true) { resolution = { ...resolution, optIn: false }; return done('skipped', 'human-pane-no-opt-in'); }
+        if (again.wake !== 'pty-inject' || again.target !== resolution.target || again.host !== resolution.host) return done('busy', `target-moved:${again.target ?? again.wake}`);
         const row = (deps.listPtys ?? listPtyManifestRows)().find(item => item.id === resolution.target);
         if (!row?.alive || row.turnState !== 'idle') return done('busy', `turn=${row?.alive === false ? 'dead' : row?.turnState ?? 'unknown'}`);
         // ⛔ 마감이 지났으면 새 주입을 시작하지 않는다.
@@ -239,17 +351,20 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
         injecting = true;
         await inject(resolution.target!, line);
       } else {
-        // `eln herdr prompt` 와 같은 생산 함수 — 상태 확인(idle·done 만) → 제출 앞 관문 → bracketed `pane run` 한 번.
-        // 라벨은 묻지 않는다(anyAgent): 자리 폴더가 이미 대상을 정했고, claude/codex pane 도 예전처럼 깨운다.
+        // 구조 pane list 확인(지원 agent · idle 만) → 제출 앞 관문 → bracketed `pane run` 한 번.
+        // 화면 문구는 빈 입력 판정에 쓰지 않는다 — placeholder 와 사용자가 친 같은 문장을 구별할 수 없다.
         const target = resolution.target!;
-        const prompted = await herdrPrompt({ target, text: line, anyAgent: true, paneFallback: true, timeoutMs: Math.max(1, deadline - Date.now()) }, {
-          ...(deps.herdrRun ? { run: deps.herdrRun } : {}),
+        const prompted = await herdrPrompt({ target, text: line, anyAgent: true, requirePaneListStatus: true,
+          timeoutMs: Math.max(1, deadline - Date.now()) }, {
+          ...((resolution.host && resolution.host !== 'local')
+            ? { run: (deps.herdrRunForHost ?? remoteHerdrRunner)(resolution.host) }
+            : deps.herdrRun ? { run: deps.herdrRun } : {}),
           beforeSubmit: () => {
             // opt-in 은 주입 직전에 «먼저» 다시 본다 — 기다리는 사이 `wake-inject` 를 지웠으면(대상이 바뀌었어도) 주입 0.
-            if (!seatOptedIn(address, deps)) { resolution = { ...resolution, optIn: false }; return 'human-pane-no-opt-in'; }
-            // 조회 사이 자리의 pane 이 바뀌었으면 옛 pane 에 넣지 않는다 — 주소→대상을 다시 푼다.
             const again = resolveWake(address, deps);
-            if (again.wake !== 'herdr' || again.target !== target) return `target-moved:${again.target ?? again.wake}`;
+            if (again.optIn !== true) { resolution = { ...resolution, optIn: false }; return 'human-pane-no-opt-in'; }
+            // 조회 사이 자리의 pane 이 바뀌었으면 옛 pane 에 넣지 않는다 — 주소→대상을 다시 푼다.
+            if (again.wake !== 'herdr' || again.target !== target || again.host !== resolution.host) return `target-moved:${again.host ?? again.target ?? again.wake}`;
             // ⛔ 마감은 «주입 바로 앞»에서 — 재해석이 늦어 넘겼어도 새 주입 0.
             if (expired()) return 'timeout';
             injecting = true;
@@ -295,7 +410,7 @@ export async function wakeRecipient(address: string, msgId: number, message: { f
     if (outcome.result === 'no-wake') (deps.warn ?? (line => console.error(line)))(
       outcome.source === 'unresolved' ? `${NO_WAKE_NOTICE} (wake=none · 모름: ${outcome.reason})` : `${NO_WAKE_NOTICE} (wake=none)`);
     debug.log('msg.wake', outcome.result === 'skipped' ? 'skipped' : outcome.wake, { address, msgId, wake: outcome.wake, result: outcome.result, reason: outcome.reason ?? outcome.source,
-      ...(outcome.target ? { target: outcome.target } : {}) });
+      ...(outcome.target ? { target: outcome.target } : {}), ...(outcome.host ? { host: outcome.host } : {}) });
   } catch { /* reporting never turns a wake outcome into a throw */ }
   try { settlePending(outcome, message.from, deps); } catch { /* the deferral ledger never turns a post into a throw */ }
   return outcome;

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-APP-DB-WORLD-TS",
+  "path": "src/ux-sim/fake-app-db-world.ts",
+  "boundary": "Creates isolated in-memory SQLite app tables and runs declared RPCs with role and parameter checks.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

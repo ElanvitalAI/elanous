@@ -1,0 +1,14 @@
+version: 1
+kind: release-graph
+id: macro-chain-e2e
+isolation: test
+input:
+  version: '0.3.8'
+  previousVersion: '0.3.7'
+cases:
+  - id: receipt-audit-repair-resume
+    mode: macro-chain-e2e
+    expect:
+      status: done
+      mustVisit: [gate, receipt-audit, residual-run, gate-triage, done]
+      mustNotVisit: [failed]

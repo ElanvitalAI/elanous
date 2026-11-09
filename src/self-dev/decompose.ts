@@ -15,11 +15,8 @@
  * Cf. PLAN-parallel-self-dev-orchestrator-2026-07-21 §6 (S2).
  */
 import { debug } from '../debug/log.js';
-import {
-  resolveRoleModel,
-  type ModelResolutionSource,
-  type UserConfig,
-} from '../user-config.js';
+import { resolveRoleModel } from '../user-config.js';
+import type { ModelResolutionSource, UserConfig } from '../user-config/types.js';
 import {
   gradePhaseCompletability,
   type CompletabilitySizeSignals,

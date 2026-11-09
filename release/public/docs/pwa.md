@@ -17,24 +17,24 @@ Stop a daemon you started by hand with `elanous nexus stop`.
 
 ## What is in it
 
-**Status** comes from one maturity table that every surface reads. **Stable** screens are shown to everyone. **Experimental** and **Tool** screens are hidden until you set the screen role to **Contributor** in Setup (`/setup` → screen role); **Operator** screens are for the person who runs the machine (**Owner**). Experimental screens work, but their layout and behaviour may still change.
+The home address redirects to Chat. The current screen menu contains six surfaces:
 
 | Menu | Status | What it does |
 |---|---|---|
 | **Chat** | Stable | Talk to elanous with streaming replies, pick a session, a backend and a surface, and see the running budget. Voice input is available where the browser allows microphone access. See [Chat](pwa-chat.md). |
 | **Terminal** | Stable | Live terminals from your machine in the browser — several tabs, a modifier-key bar for touch keyboards, file and camera attachments, a mirror of the terminal UI, and a live view of an agent's terminal from a link. See [Terminal](pwa-terminal.md). |
-| **Editor** | Stable | *Since 0.2.21 in the default menu (Create).* Write and edit workflows and harness run graphs on a canvas — add nodes, connect them, and save them. Starting a run from the editor and watching each node's status needs operator access. |
-| **Intake** | Experimental | *Since 0.2.3.* One box for anything you want elanous to take — a link, a memo, a list or an instruction. It shows as you type how it reads the text, then you absorb it into your notes or send it to the harness. See [Tasks and intake](tasks-and-intake.md). |
-| **Approvals** | Tool | Things waiting for you: loop steps that ask a person before they go on, and pull requests held for your approval — each with its summary, changed files and checks. Approve, and the pull request is merged. |
-| **Live** | Stable | Your harness runs as they happen — stage bars, a stream of decisions (what, why, where to), gauges and the raw log. Everyday mode costs almost nothing; **Full show** records more and animates it, and switches itself off after 30 minutes. See [Live](pwa-live.md). |
-| **Trace** | Experimental | Follow one run from the whole fleet down to a single decision and the log line behind it. Filters stack up as a lens you can peel back one chip at a time, and the address keeps the view so you can share it. See [Trace](pwa-trace.md). |
-| **Missions** | Experimental | Mission lineage and the task board in one menu; you can also hand a new goal from here. In the Missions list, a mission with no update for at least 14 days and a non-terminal status shows an amber “N일 멈춤 · 마지막 갱신 YYYY-MM-DD” label; an autonomous mission in that state also shows **닫기 제안**. Done, completed, failed, disarmed, rejected and cancelled missions do not get this inactivity label. |
-| **Design** | Tool | Pick a design system, see drafts, or derive one from a URL. See [Design systems](design.md). |
+| **Live run** | Experimental | Inspect a harness run as it progresses, or replay a selected run. |
+| **Editor** | Stable | Write and edit workflows and harness run graphs on a canvas — add nodes, connect them, and save them. |
 | **Vault** | Experimental | Browse your Obsidian vault, read and edit notes, create new ones, and explore tags and the link graph. See [Vault](pwa-vault.md). |
-| **마켓** (Market) | Stable | Browse the signed plugin marketplaces, read a plugin's capabilities, install and remove plugins. See [Plugins](plugins.md). |
-| **Schedules** | Operator | Every scheduled job in one list — cron, the background service and loop triggers. |
-| **Settings** | Experimental (always shown) | Models and tiers, voice and text-to-speech, persona, notifications, theme and daemon health. |
-| **Setup** (`/setup`) | Stable | First-time setup in the browser. Today it covers the LLM provider; the other wizard steps still run in the terminal with `elanous onboarding`. |
+| **Settings** | Experimental · always shown | Daemon connection, model and voice preferences, persona, notifications, theme and diagnostics. |
+
+## App Studio
+
+The six core screens are accompanied by two App Studio destinations for the 11-14 demo: **Apps** (`/apps`) shows simulation and operating status, and **Design direction** (`/design-check`) selects an app's visual direction. Both are intentionally retained.
+
+## App Studio
+
+Two additional routes support the 11-14 demo flow: **Apps** (`/apps`) shows app simulation and operating status, and **Design direction** (`/design-check`) selects an app's visual direction. These are intentionally retained alongside the six core screens.
 
 ## Use it from another device
 

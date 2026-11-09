@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GATE-SHARD-HOST-REROUTE-TS",
+  "path": "src/ux-sim/gate-shard-host-reroute.ts",
+  "boundary": "gate shard host reroute: S1 device for a release gate's shard dispatch. It replaces host execution, not planning or reduction.",
+  "deviceIds": [
+    "fault-injection"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

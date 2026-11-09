@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,6 +19,7 @@ import { seams } from '../self-implement/test-seams.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
 import { createGraphEventBus, publishNodeGraphEvent } from './graph-events.js';
 import { classifyGateShadow } from '../../scripts/release-loop/gate-triage-node.js';
+import { writeReleaseGraphFixture } from '../../test/helpers/release-graph-fixture.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -402,6 +403,17 @@ test('resuming an already completed visit does not emit a duplicate lifecycle', 
   expect(initialEvents.at(-1)).toBe('done:leave');
 });
 
+test('resume input patches persist when restarting from a failed node', async () => {
+  const { graph, root } = fixture('exit 1');
+  const first = await runGraph(graph, { input: { baseline: true }, deps: { root } });
+  expect(first.status).toBe('failed');
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'first', useCurrentGraph: true,
+    resumeInputPatch: { gateImagePin: 'cut-commit' }, deps: { root,
+      runBash: async () => ({ stdout: JSON.stringify({ outcome: 'ok' }), stderr: '', exitCode: 0 }) } });
+  expect(resumed.status).toBe('done');
+  expect(resumed.input).toMatchObject({ baseline: true, gateImagePin: 'cut-commit' });
+});
+
 test('lifecycle envelope ids and sequence continue across a resumed run', async () => {
   const { graph, root } = fixture('exit 1');
   const firstEvents: Array<{ eventId: string; seq: number }> = [];
@@ -526,7 +538,8 @@ test('runGraph publishes ordered node lifecycle events and dispatches matching n
     expect(dispatches.filter((dispatch) => dispatch.runId === runId).map((dispatch) => dispatch.sourceNodeId))
       .toEqual(['first', 'first']);
   }
-  expect(events.map((event) => event.sequence)).toEqual(events.map((_event, index) => index + 1));
+  const durableEvents = events.filter((event) => event.sequence > 0);
+  expect(durableEvents.map((event) => event.sequence)).toEqual(durableEvents.map((_event, index) => index + 1));
   expect(dispatches.map(({ nodeId, action }) => [nodeId, action])).toEqual([
     ['second', 'wake'], ['second', 'wake'], ['second', 'wake'], ['second', 'wake'],
   ]);
@@ -588,7 +601,7 @@ test('runGraph publishes release.gate.failed only with complete triage evidence'
     'gate:', '  command: "bun scripts/release-loop/gate-node.ts --json"',
     'gate-triage:', '  command: "bun scripts/release-loop/gate-triage-node.ts"',
   ].join('\n') + '\n');
-  writeFileSync(graph, [
+  writeReleaseGraphFixture(graph, [
     'graph_id: release-loop', 'version: 1', 'entry_node: gate', 'terminal_nodes: [done, failed]', 'nodes:',
     "  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 2 }",
     "  - { node_id: gate-triage, kind: judge, recipe: 'cmd:gate-triage', max_visits: 1 }",
@@ -610,9 +623,16 @@ test('runGraph publishes release.gate.failed only with complete triage evidence'
     const events: string[] = [];
     const progressPhases: string[] = [];
     const progressHosts: Array<unknown> = [];
+    const relayedGateEvents: Array<Record<string, unknown>> = [];
+    const stopRelaying = subscribeInsideEvent((event) => {
+      if (event.kind === 'release.gate.progress') relayedGateEvents.push(event as unknown as Record<string, unknown>);
+    });
+    let releasePartialProgressRead!: () => void;
+    const partialProgressRead = new Promise<void>((resolve) => { releasePartialProgressRead = resolve; });
     bus.subscribe((event) => { if (event.type === 'release.gate.failed') events.push(event.eventId); });
     bus.subscribe((event) => { if (event.type === 'release.gate.progress') {
       progressPhases.push(String(event.data?.phase)); progressHosts.push(event.data?.host);
+      if (index === 0 && event.data?.phase === 'shard-planning') releasePartialProgressRead();
     } });
     const state = await runGraph(graph, { runId: `triage-evidence-${index}`, input: { version: '0.3.5', previousVersion: '0.3.4' }, eventBus: bus,
       deps: { root, releaseGraphEventAdapters: false, runBash: async (command, opts) => {
@@ -624,21 +644,30 @@ test('runGraph publishes release.gate.failed only with complete triage evidence'
         const progressPath = opts.env?.ELANOUS_GATE_PROGRESS_FILE;
         if (progressPath) {
           const rows = ['shard-planning', 'collection', 'classification', 'verdict']
-            .map((phase) => JSON.stringify({ phase, shardIndex: 1, shardTotal: 1, host: index === 0 ? 'node-c-호스트' : 'sim-host', durationMs: 10,
+            .map((phase) => JSON.stringify({ phase, shardIndex: 1, shardTotal: 1, host: index === 0 ? 'node-c-호스트' : 'sim-host',
+              reason: 'token=progress-secret', rerunReasons: { 'api_key=progress-key': 1 }, durationMs: 10,
               failureCount: 0, introduced: 0, preexisting: 0, unmeasured: 0 }));
           const payload = Buffer.from(`${rows.join('\n')}\n`);
           if (index === 0) {
-            const splitAt = payload.indexOf(Buffer.from('호스트')) + 1;
+            const firstRowEnd = payload.indexOf(0x0a) + 1;
+            const partialHostStart = payload.indexOf(Buffer.from('호스트'), firstRowEnd);
+            const splitAt = partialHostStart + 1;
             writeFileSync(progressPath, payload.subarray(0, splitAt));
-            await new Promise((resolve) => setTimeout(resolve, 150));
+            await partialProgressRead;
             appendFileSync(progressPath, payload.subarray(splitAt));
           } else writeFileSync(progressPath, payload);
         }
         return { exitCode: 1, stdout: `${JSON.stringify({ outcome: 'fail', commit: sha, introduced: ['src/example.test.ts > fails'] })}\n`, stderr: '' };
       } } });
+    stopRelaying();
     expect(state.status, item.name).toBe('done');
     expect(events, item.name).toHaveLength(item.publishes ? 1 : 0);
     expect(progressPhases).toEqual(['shard-planning', 'collection', 'classification', 'verdict']);
+    const livePhases = relayedGateEvents.map((event) => (event.data as Record<string, unknown>).phase);
+    expect(livePhases).toEqual(progressPhases);
+    expect(JSON.stringify(relayedGateEvents)).not.toContain('progress-secret');
+    expect(JSON.stringify(relayedGateEvents)).not.toContain('progress-key');
+    expect(relayedGateEvents.every((event) => event.runId === `triage-evidence-${index}`)).toBe(true);
     if (index === 0) expect(progressHosts).toContain('node-c-호스트');
   }
 
@@ -653,7 +682,7 @@ test('runGraph publishes release.gate.failed only with complete triage evidence'
       if (command.includes('gate-triage-node.ts')) staleTriageRuns++;
       return { exitCode: 0, stdout: `${JSON.stringify({ classification: 'load', commit: sha,
         introduced: ['src/example.test.ts > fails'], outcome: 'ok' })}\n`, stderr: '' };
-    } } })).rejects.toThrow('gate output execution id does not match the current gate execution');
+    } } })).rejects.toThrow('gate output execution id does not match the current gate execution (gate or residual-run)');
   expect(staleTriageRuns).toBe(0);
   expect(staleGateEvents).toEqual([]);
 
@@ -689,11 +718,118 @@ test('runGraph publishes release.gate.failed only with complete triage evidence'
   oldGate.output = JSON.stringify(oldGateOutput);
   writeFileSync(legacyPath, `${JSON.stringify({ ...legacySaved, status: 'running' }, null, 2)}\n`);
   const legacyResumed = await runGraph(graph, { resumeRunId: legacyRunId, input: { version: '0.3.5', previousVersion: '0.3.4' },
+    resumeInputPatch: { gateImagePin: 'cut-commit' },
     eventBus: legacyBus, deps: legacyDeps });
   expect(legacyResumed.status).toBe('done');
+  expect(legacyResumed.input).toMatchObject({ version: '0.3.5', gateImagePin: 'cut-commit' });
   expect(legacyGateVisits).toBe(2);
   expect(legacyEvents).toHaveLength(1);
   expect(legacyResumed.nodes.filter((record) => record.nodeId === 'gate').at(-1)?.executionId).toEqual(expect.any(String));
+});
+
+test('GATE-OBS-GAPS-1108 S1: graph runner alerts with the run envelope when a runGateNode child exits mid-heartbeat', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-gate-heartbeat-child-exit-'));
+  dirs.push(root);
+  const graph = join(root, 'release-loop.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), 'gate:\n  command: "bun scripts/release-loop/gate-node.ts --json"\n');
+  writeFileSync(graph, [
+    'graph_id: release-loop', 'version: 1', 'entry_node: gate', 'terminal_nodes: [done, failed]', 'nodes:',
+    "  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1 }",
+    "  - { node_id: done, kind: gate, recipe: 'none', max_visits: 1 }",
+    "  - { node_id: failed, kind: gate, recipe: 'none', max_visits: 1 }", 'edges:',
+    '  - { from: gate, on: outcome, map: { ok: done, fail: failed, error: failed } }', '',
+  ].join('\n'));
+
+  const runId = 'gate-heartbeat-child-exit-run';
+  const bus = createGraphEventBus();
+  const alerts: Array<{ data?: Record<string, unknown>; sequence?: number }> = [];
+  const progressSequences: number[] = [];
+  bus.subscribe((event) => { if (event.type === 'release.gate.heartbeat-interrupted') alerts.push(event as typeof alerts[number]); });
+  bus.subscribe((event) => {
+    if (event.type === 'release.gate.progress' && event.data?.event === 'phase-heartbeat') {
+      progressSequences.push(event.sequence);
+      throw new Error('simulated progress subscriber failure');
+    }
+  });
+  const runtimeUrl = new URL('../../scripts/release-loop/gate-runtime.ts', import.meta.url).href;
+  const childSource = `
+    const { runGateNode } = await import(${JSON.stringify(runtimeUrl)});
+    const runner = { heartbeatScheduler: (tick, intervalMs) => { if (intervalMs !== 60_000) throw new Error('unexpected heartbeat interval'); tick(); return () => {}; } };
+    setInterval(() => {}, 1_000);
+    await runGateNode([], process.env, runner, () => new Promise(() => {}));
+  `;
+  const state = await runGraph(graph, { runId, input: { version: '0.3.7-rc.1', previousVersion: '0.3.6',
+    gatePodPool: 'pool-sim:1', gateImagePin: 'cut-commit' }, eventBus: bus,
+  deps: { root, releaseGraphEventAdapters: false, runBash: async (_command, options) => {
+    const progressPath = options.env?.ELANOUS_GATE_PROGRESS_FILE;
+    if (!progressPath || !options.env) throw new Error('gate child lacks its run-scoped progress path');
+    const childEnv = { ...options.env };
+    delete childEnv.ELANOUS_GATE_EVIDENCE_LEVEL;
+    delete childEnv.ELANOUS_GATE_HOST;
+    const child = spawn(process.execPath, ['-e', childSource], { cwd: process.cwd(), env: childEnv, stdio: 'ignore' });
+    return await new Promise((resolve) => {
+      let requestedTermination = false;
+      const deadline = setTimeout(() => { if (!requestedTermination) child.kill('SIGTERM'); }, 5_000);
+      const poll = setInterval(() => {
+        try {
+          if (readFileSync(progressPath, 'utf8').includes('"event":"phase-heartbeat"')) {
+            requestedTermination = true;
+            child.kill('SIGTERM');
+          }
+        } catch { /* the child has not written its first heartbeat yet */ }
+      }, 10);
+      child.once('error', (error) => {
+        clearTimeout(deadline); clearInterval(poll);
+        resolve({ exitCode: 2, stdout: '', stderr: String(error) });
+      });
+      child.once('exit', (code, signal) => {
+        clearTimeout(deadline); clearInterval(poll);
+        resolve({ exitCode: code ?? 128, stdout: '', stderr: signal ? `terminated by ${signal}` : '' });
+      });
+    });
+  } } });
+
+  expect(state.status).toBe('failed');
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]?.sequence).toBe(0);
+  expect(progressSequences.length).toBeGreaterThan(0);
+  expect(progressSequences.every((sequence) => sequence === 0)).toBe(true);
+  const alert = alerts[0]!.data!;
+  expect(alert).toMatchObject({ event: 'heartbeat-interrupted', reason: 'child-exited', runId,
+    invocation: expect.any(String), batch: expect.any(String), host: null, evidenceLevel: 'unknown' });
+  for (const field of ['runId', 'invocation', 'batch', 'shard', 'attempt', 'phase', 'host', 'podJob', 'file', 'evidenceLevel'])
+    expect(Object.hasOwn(alert, field)).toBe(true);
+
+  const beforeFirstBeatRunId = 'gate-heartbeat-before-first-beat-run';
+  const beforeFirstBeatBus = createGraphEventBus();
+  const beforeFirstBeatAlerts: Array<{ data?: Record<string, unknown>; sequence?: number }> = [];
+  beforeFirstBeatBus.subscribe((event) => {
+    if (event.type === 'release.gate.heartbeat-interrupted') beforeFirstBeatAlerts.push(event as typeof beforeFirstBeatAlerts[number]);
+  });
+  const beforeFirstBeat = await runGraph(graph, { runId: beforeFirstBeatRunId, input: { version: '0.3.7-rc.1', previousVersion: '0.3.6' },
+    eventBus: beforeFirstBeatBus, deps: { root, releaseGraphEventAdapters: false, runBash: async (_command, options) => {
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], {
+        cwd: process.cwd(), env: options.env, stdio: 'ignore',
+      });
+      return await new Promise((resolve) => {
+        const deadline = setTimeout(() => child.kill('SIGTERM'), 25);
+        child.once('error', (error) => {
+          clearTimeout(deadline);
+          resolve({ exitCode: 2, stdout: '', stderr: String(error) });
+        });
+        child.once('exit', (code, signal) => {
+          clearTimeout(deadline);
+          resolve({ exitCode: code ?? 128, stdout: '', stderr: signal ? `terminated by ${signal}` : '' });
+        });
+      });
+    } } });
+  expect(beforeFirstBeat.status).toBe('failed');
+  expect(beforeFirstBeatAlerts).toHaveLength(1);
+  expect(beforeFirstBeatAlerts[0]?.sequence).toBe(0);
+  expect(beforeFirstBeatAlerts[0]?.data).toMatchObject({ event: 'heartbeat-interrupted', reason: 'first-heartbeat-missing',
+    runId: beforeFirstBeatRunId, invocation: expect.any(String), batch: expect.any(String), phase: 'startup', evidenceLevel: 'unknown' });
+  for (const field of ['runId', 'invocation', 'batch', 'shard', 'attempt', 'phase', 'host', 'podJob', 'file', 'evidenceLevel'])
+    expect(Object.hasOwn(beforeFirstBeatAlerts[0]!.data!, field)).toBe(true);
 });
 
 test('failed adaptive repair waits at HITL on the same run', async () => {
@@ -1927,6 +2063,26 @@ test('bash recipes pass through an explicit timeout_ms unchanged', async () => {
   expect(timeoutMs).toBe(1234);
 });
 
+test('bash recipes accept timeout_ms zero as an explicit unbounded wait', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(join(root, 'recipes.yaml'), `first:\n  command: "exit 0"\n  timeout_ms: 0\nsecond:\n  command: "exit 0"\n`);
+  let timeoutMs: number | undefined;
+  const result = await runGraph(graph, { deps: { root, runBash: async (_body, opts) => {
+    timeoutMs ??= opts.timeoutMs;
+    return { stdout: '', stderr: '', exitCode: 0 };
+  } } });
+  expect(result.status).toBe('done');
+  expect(timeoutMs).toBe(0);
+});
+
+test('bash recipe timeout_ms zero reaches the real child process as no timeout', async () => {
+  const { graph, root } = fixture('sleep 0.05; printf timeout-zero-ok');
+  writeFileSync(join(root, 'recipes.yaml'), `first:\n  command: "sleep 0.05; printf timeout-zero-ok"\n  timeout_ms: 0\nsecond:\n  command: "exit 0"\n`);
+  const result = await runGraph(graph, { runId: 'timeout-zero-real-child', deps: { root } });
+  expect(result.status).toBe('done');
+  expect(result.nodes[0]).toMatchObject({ nodeId: 'first', executed: true, output: 'timeout-zero-ok', ok: true });
+});
+
 test('failed command-spawn nodes persist exit and masked stderr tail on node-end', async () => {
   const { graph, root } = fixture('exit 0');
   const previousState = process.env.ELANOUS_STATE_DIR;
@@ -2060,6 +2216,12 @@ test('GRAPH-NODE-TIMES: a stopped node keeps its start and ends at the stop', as
   expect(stopped.nodes[0]).toMatchObject({ nodeId: 'first', error: 'stopped before node completed', endedAt: stopped.stoppedAt });
   expectNodeTimes(stopped.nodes[0]);
   expect(stopped.currentNode).toBeUndefined();
+  const visitId = stopped.nodes[0]!.executionId!;
+  expect(visitId).toBeTruthy();
+  const resumed = await runGraph(graph, { resumeRunId: stopped.runId, fromVisitId: visitId,
+    deps: { root, runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }) } });
+  expect(resumed.status).toBe('done');
+  expect(resumed.resume).toMatchObject({ from: 'first', visitId });
 });
 
 test('GRAPH-NODE-TIMES: stopping a run whose older runner never named the running node records only the stop as its end', async () => {
@@ -2129,8 +2291,9 @@ second:
   } });
   expect(seen).toHaveLength(2);
   expect(seen[0]?.path).not.toBe(seen[1]?.path);
-  expect(seen[0]?.context).toEqual({ graphId: 'test-graph', runId: 'context-run', startedAt: result.startedAt, executionId: expect.any(String), nodeId: 'first', input: { request: 'hello' }, outputs: {} });
-  expect(seen[1]?.context).toEqual({ graphId: 'test-graph', runId: 'context-run', startedAt: result.startedAt, executionId: expect.any(String), nodeId: 'second', input: { request: 'hello' }, outputs: { first: 'first-output' } });
+  expect(seen[0]?.context).toMatchObject({ graphId: 'test-graph', runId: 'context-run', startedAt: result.startedAt, executionId: expect.any(String), nodeId: 'first', input: { request: 'hello' }, outputs: {} });
+  expect(seen[1]?.context).toMatchObject({ graphId: 'test-graph', runId: 'context-run', startedAt: result.startedAt, executionId: expect.any(String), nodeId: 'second', input: { request: 'hello' }, outputs: { first: 'first-output' } });
+  expect(seen.map(({ context }) => (context as { nodeHistory?: unknown[] }).nodeHistory)).toEqual([[], []]);
   expect(result.input).toEqual({ request: 'hello' });
   expect(result.nodes.slice(0, 2).map((node) => node.output)).toEqual(['first-output', 'second-output']);
   expect(JSON.parse(readFileSync(result.statePath, 'utf8')).input).toEqual({ request: 'hello' });
@@ -2234,9 +2397,11 @@ second:
 `);
   const result = await runGraph(graph, { input: ['payload'], deps: { root } });
   expect(result.status).toBe('done');
-  expect(JSON.parse(result.nodes[1]?.output as string)).toEqual({
+  const context = JSON.parse(result.nodes[1]?.output as string) as Record<string, unknown>;
+  expect(context).toMatchObject({
     graphId: result.graphId, runId: result.runId, startedAt: result.startedAt, executionId: expect.any(String), nodeId: 'second', input: ['payload'], outputs: { first: 'first-output' },
   });
+  expect(context.nodeHistory).toEqual([]);
 });
 
 test('failed run restarts at saved node, keeps preceding output, and reports node progress', async () => {
@@ -2266,12 +2431,66 @@ test('failed run restarts at saved node, keeps preceding output, and reports nod
   expect(logs.filter((entry) => entry.event === 'node-start' && entry.data.nodeId === 'first')).toHaveLength(1);
 });
 
+test('GRAPH-RESUME-ANY-ENTRY-SIM restarts the selected visit of a repeated node', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(graph, [
+    'graph_id: test-graph', 'version: 1', 'entry_node: first', 'terminal_nodes: [done, failed]', 'nodes:',
+    "  - { node_id: first, kind: agent, recipe: 'cmd:first', max_visits: 3 }",
+    "  - { node_id: second, kind: agent, recipe: 'cmd:second', max_visits: 2 }",
+    '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
+    '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }', 'edges:',
+    '  - { from: first, on: outcome, map: { again: second, ok: done, fail: failed } }',
+    '  - { from: second, to: first }', '',
+  ].join('\n'));
+  let firstVisits = 0;
+  const deps = { root, runBash: async (body: string) => ({
+    stdout: body === 'exit 0' ? JSON.stringify({ outcome: ++firstVisits === 1 ? 'again' : 'fail' }) : '',
+    stderr: '', exitCode: 0,
+  }) };
+  const failed = await runGraph(graph, { deps });
+  expect(failed.path).toEqual(['first', 'second', 'first', 'failed']);
+  const firstVisit = failed.nodes[0]!.executionId!;
+  const secondVisit = failed.nodes[2]!.executionId!;
+  expect(firstVisit).not.toBe(secondVisit);
+  await expect(runGraph(graph, { resumeRunId: failed.runId, fromVisitId: 'missing', deps }))
+    .rejects.toThrow('--from-visit must identify one saved node execution');
+  const resumed = await runGraph(graph, { resumeRunId: failed.runId, fromVisitId: firstVisit,
+    deps: { root, runBash: async () => ({ stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 }) } });
+  expect(resumed.status).toBe('done');
+  expect(resumed.path).toEqual(['first', 'done']);
+  expect(resumed.resume).toMatchObject({ from: 'first', visitId: firstVisit });
+  expect(resumed.nodes[0]!.executionId).not.toBe(firstVisit);
+});
+
+test('GRAPH-RESUME-ANY-ENTRY-SIM resumes the grown ARG visit itself before following its route', async () => {
+  const { graph, root } = fixture('exit 0');
+  writeFileSync(graph, `grow: on\n${readFileSync(graph, 'utf8')}`);
+  let commandCalls = 0;
+  const failed = await runGraphWithGrowthScope(graph, { deps: { root,
+    runBash: async () => ({ stdout: ++commandCalls === 1 ? '{"outcome":"new"}' : '',
+      stderr: '', exitCode: commandCalls === 2 ? 1 : 0 }),
+    // 출처: #35956 시뮬 fixture 그래프가 각 노드를 한 번 방문하도록 두는 테스트 계약.
+    growthProposer: () => ({ node: { nodeId: 'arg-repair', kind: 'agent', recipe: 'none', maxVisits: 1,
+      contract: { inputs: [], tools: 'read-only', outputs: [] } }, returnTo: 'second', reason: 'ARG repair' }),
+  } });
+  expect(failed.path).toEqual(['first', 'arg-repair', 'second', 'failed']);
+  const repairVisit = failed.nodes[1]!.executionId!;
+  const repaired = await runGraph(graph, { resumeRunId: failed.runId, fromVisitId: repairVisit,
+    deps: { root, runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      growthProposer: () => { throw new Error('growth must not be proposed again'); } } });
+  expect(repaired.status).toBe('done');
+  expect(repaired.path).toEqual(['first', 'arg-repair', 'second', 'done']);
+  expect(repaired.resume).toMatchObject({ from: 'arg-repair', visitId: repairVisit });
+  expect(repaired.nodes[1]!.executionId).not.toBe(repairVisit);
+  expect(repaired.growth).toHaveLength(1);
+});
+
 test('budget-exceeded release resume requires a reason and records the reset execution counter', async () => {
   const root = mkdtempSync(join(tmpdir(), 'graph-runner-budget-resume-'));
   dirs.push(root);
   const graph = join(root, 'graph.yaml');
   writeFileSync(join(root, 'recipes.yaml'), "cutoff:\n  command: 'bun scripts/release-loop/node-verdict.ts cutoff'\n");
-  writeFileSync(graph, [
+  writeReleaseGraphFixture(graph, [
     'graph_id: release-loop', 'version: 1', 'entry_node: cutoff', 'terminal_nodes: [done, failed]', 'nodes:',
     "  - { node_id: cutoff, kind: agent, recipe: 'cmd:cutoff', max_visits: 1 }",
     '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
@@ -2511,14 +2730,14 @@ test('release-loop with no outgoing edge records the failed run exactly once', a
   const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   const source = readFileSync(graph, 'utf8').replace('ok: traffic-cut-start, fail: failed, error: failed', 'fail: failed, error: failed');
   const local = join(root, 'release-loop.yaml');
-  writeFileSync(local, source);
+  writeReleaseGraphFixture(local, source);
   writeFileSync(join(root, 'recipes.yaml'), readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8'));
   const run = await runGraph(local, { deps: { root, runBash: async () => ({ stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 }) } });
   expect(run.status).toBe('failed');
-  expect(run.path).toEqual(['version-release']);
+  expect(run.path).toEqual(['version-release', 'readiness-countdown']);
   expect(readFailureInbox({}, root)).toEqual([{
     source: 'release-run', kind: 'graph-run', ref: `${run.graphId}/${run.runId}`,
-    summary: `Graph ${run.graphId}/${run.runId} failed after version-release (no outgoing edge)`, at: run.finishedAt!,
+    summary: `Graph ${run.graphId}/${run.runId} failed after readiness-countdown (no outgoing edge)`, at: run.finishedAt!,
   }]);
   expect(readFileSync(join(root, 'heal', 'inbox.jsonl'), 'utf8').trimEnd().split('\n')).toHaveLength(1);
 });
@@ -2529,7 +2748,7 @@ test('a broken heal inbox does not replace either persisted release failure verd
     dirs.push(root);
     const graph = join(root, 'release-loop.yaml');
     const source = readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8');
-    writeFileSync(graph, branch === 'no-edge' ? source.replace('ok: traffic-cut-start, fail: failed, error: failed', 'fail: failed, error: failed') : source);
+    writeReleaseGraphFixture(graph, branch === 'no-edge' ? source.replace('ok: traffic-cut-start, fail: failed, error: failed', 'fail: failed, error: failed') : source);
     writeFileSync(join(root, 'recipes.yaml'), readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8'));
     mkdirSync(join(root, 'heal'));
     writeFileSync(join(root, 'heal', 'inbox.jsonl'), '{invalid-json}\n');
@@ -2769,10 +2988,13 @@ test('resume keeps persisted input and exposes pre-approval outputs to the next 
   decideGraphApproval(first.graphId, first.runId, 'approved', 'reviewer', root);
   const resumed = await runGraph(graph, { resumeRunId: first.runId, input: { original: false }, deps });
   expect(resumed.input).toEqual({ original: true });
-  expect(contexts).toEqual([
+  expect(contexts).toMatchObject([
     { graphId: first.graphId, runId: first.runId, startedAt: first.startedAt!, executionId: expect.any(String), nodeId: 'a', input: { original: true }, outputs: {} },
     { graphId: first.graphId, runId: first.runId, startedAt: first.startedAt!, executionId: expect.any(String), nodeId: 'b', input: { original: true }, outputs: { a: 'output-1', gate: expect.objectContaining({ outcome: 'approved', decidedBy: 'reviewer' }) } },
   ]);
+  expect(contexts[0]?.nodeHistory).toEqual([]);
+  expect(contexts[1]?.nodeHistory).toMatchObject([{ nodeId: 'gate', executionId: expect.any(String),
+    output: expect.objectContaining({ outcome: 'approved', decidedBy: 'reviewer' }) }]);
   expect(JSON.parse(readFileSync(resumed.statePath, 'utf8')).input).toEqual({ original: true });
 });
 

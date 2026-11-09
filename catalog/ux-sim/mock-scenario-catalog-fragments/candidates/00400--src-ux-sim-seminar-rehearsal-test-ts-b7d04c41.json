@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/seminar-rehearsal.test.ts",
+  "disposition": "scenario",
+  "entryCommand": "bun test src/ux-sim/seminar-rehearsal.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "The test drives simSeminarRehearsal and createSimWorld in a fake-clock scope; persisted state is inspected under an isolated --test root.",
+  "deviceId": "first-run-and-seminar",
+  "scenarioIds": [
+    "SW-FREEZE"
+  ]
+}

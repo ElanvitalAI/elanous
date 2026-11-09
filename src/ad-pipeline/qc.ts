@@ -1,3 +1,4 @@
+import { isFiniteNumber } from '../primitives/guards.js';
 export interface QcMeasurements {
   readonly audioPeakDb?: number;
   readonly dialogueLufs?: number;
@@ -93,10 +94,6 @@ const VERDICT_PRIORITY: Readonly<Record<QcVerdict, number>> = {
 
 function addFinding(findings: QcFinding[], name: string, verdict: QcFinding['verdict'], reason?: string): void {
   findings.push(reason === undefined ? { name, verdict } : { name, verdict, reason });
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value);
 }
 
 function isNonNegativeInteger(value: unknown): value is number {

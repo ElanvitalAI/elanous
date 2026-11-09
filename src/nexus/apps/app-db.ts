@@ -1,5 +1,6 @@
 import { Database } from 'bun:sqlite';
-import { mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { AppManifest } from './app-contract.js';
 import { projectAppLifecycleSnapshot, validateAppLifecycleEvent, type AppLifecycleEvent, type AppLifecycleSnapshot } from './app-lifecycle-ledger.js';
@@ -7,6 +8,7 @@ import { appObjectKey } from '../../storage/object-store.js';
 import { getElanousConfigDir } from '../../elanous-config-dir.js';
 import { nexusRootDir } from '../paths.js';
 import { sqlNowIso } from '../../time/db-window.js';
+import { createAppDbBackupService, type AppDbBackupOptions, type AppDbBackupService, type AppDbBackupStatus } from './app-db-backup.js';
 
 type Column = { type?: unknown; primary?: unknown; default?: unknown };
 type Rpc = { sql?: unknown; allow?: unknown; params?: unknown };
@@ -16,6 +18,9 @@ const LEGACY_CURRENT_TIMESTAMP = ['CURRENT', '_TIMESTAMP'].join('');
 export interface AppDatabase {
   rpc(slug: string, name: string, params: Readonly<Record<string, unknown>> | undefined, role: string): unknown[];
   close(): void;
+  backupStatus?(slug: string): AppDbBackupStatus | null;
+  createBackupSnapshot?(slug: string): boolean;
+  restoreBackup?(slug: string, targetPath: string): ReturnType<AppDbBackupService['restoreTo']>;
 }
 
 export interface AppLifecycleStore {
@@ -250,6 +255,56 @@ function rebuildForDynamicDefaults(db: Database, table: string, current: Existin
   }
 }
 
+const WRITE_SQL_VERBS = new Set(['INSERT', 'UPDATE', 'DELETE', 'REPLACE']);
+function isWriteSql(sql: string): boolean {
+  let index = 0, depth = 0, firstTopLevelWord = '', mainVerb = '';
+  let pendingCteBody = false, cteBodyDepth = 0, afterCteBody = false;
+  while (index < sql.length) {
+    const char = sql[index]!, next = sql[index + 1];
+    if (/\s/.test(char)) { index++; continue; }
+    if (char === '-' && next === '-') { index += 2; while (index < sql.length && sql[index] !== '\n') index++; continue; }
+    if (char === '/' && next === '*') { const close = sql.indexOf('*/', index + 2); if (close < 0) return false; index = close + 2; continue; }
+    if (char === "'" || char === '"' || char === '`' || char === '[') {
+      const endQuote = char === '[' ? ']' : char;
+      index++;
+      while (index < sql.length) {
+        if (sql[index] === endQuote) {
+          if (endQuote !== ']' && sql[index + 1] === endQuote) { index += 2; continue; }
+          index++; break;
+        }
+        index++;
+      }
+      continue;
+    }
+    if (char === '(') {
+      if (firstTopLevelWord === 'WITH' && depth === 0 && pendingCteBody) cteBodyDepth = 1;
+      depth++; index++; continue;
+    }
+    if (char === ')') {
+      if (cteBodyDepth > 0 && depth === cteBodyDepth) { cteBodyDepth = 0; afterCteBody = true; pendingCteBody = false; }
+      depth = Math.max(0, depth - 1); index++; continue;
+    }
+    if (char === ',') {
+      if (depth === 0 && firstTopLevelWord === 'WITH' && afterCteBody) afterCteBody = false;
+      index++; continue;
+    }
+    if (/[A-Za-z_]/.test(char)) {
+      const match = /^[A-Za-z_][A-Za-z0-9_$]*/.exec(sql.slice(index))!;
+      const word = match[0].toUpperCase();
+      if (depth === 0) {
+        if (!firstTopLevelWord) { firstTopLevelWord = word; mainVerb = word; }
+        else if (firstTopLevelWord === 'WITH') {
+          if (afterCteBody) return WRITE_SQL_VERBS.has(word);
+          if (word === 'AS') pendingCteBody = true;
+        }
+      }
+      index += match[0].length; continue;
+    }
+    index++;
+  }
+  return WRITE_SQL_VERBS.has(mainVerb);
+}
+
 function containsAttachOrDetach(sql: string): boolean {
   // Scan comments and quoted regions in SQLite order; regex stripping can misread `--` inside
   // a block comment and accidentally hide a following ATTACH token.
@@ -385,11 +440,12 @@ function schema(db: Database, manifest: Manifest): void {
 /** Opens durable, app-isolated SQLite files and executes only contract-declared RPCs. */
 export function createAppDatabase(
   manifests: readonly AppManifest[],
-  options: { readonly directory?: string } = {},
+  options: { readonly directory?: string; readonly backup?: Omit<AppDbBackupOptions, 'appSlug' | 'databasePath' | 'database'> } = {},
 ): AppDatabase {
   const root = options.directory ?? join(getElanousConfigDir(), 'nexus', 'apps');
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const apps = new Map<string, { db: Database; rpc: Map<string, Rpc> }>();
+  const backups = new Map<string, AppDbBackupService>();
   try {
     for (const value of manifests) {
       const manifest = value as Manifest;
@@ -397,18 +453,47 @@ export function createAppDatabase(
         throw new Error('invalid app slug');
       }
       if (apps.has(manifest.slug)) throw new Error(`duplicate app slug: ${manifest.slug}`);
-      const db = new Database(join(root, `${manifest.slug}.db`));
-      try {
+      const databasePath = join(root, `${manifest.slug}.db`);
+      const databaseWasPresent = existsSync(databasePath);
+      const recoveryMarker = databasePath + '.backup-restore-required';
+      if (!databaseWasPresent && options.backup && options.backup.store.provider !== 'local' && !existsSync(recoveryMarker)) {
+        writeFileSync(recoveryMarker, 'restore required\n', { flag: 'wx', mode: 0o600 });
+      }
+      const db = new Database(databasePath);
+      let backup: AppDbBackupService | undefined;
+      let databaseInitialized = false;
+      const initializeDatabase = () => {
+        if (databaseInitialized) return;
         db.exec('PRAGMA journal_mode = WAL');
         db.exec('PRAGMA foreign_keys = ON');
         schema(db, manifest);
+        databaseInitialized = true;
+      };
+      try {
+        if (options.backup) {
+          backup = createAppDbBackupService({ ...options.backup, appSlug: manifest.slug, databasePath, database: db, databaseWasPresent, initializeDatabase,
+            schemaVersion: String(manifest.apiVersion ?? 'unknown'),
+            schemaHash: createHash('sha256').update(JSON.stringify({ tables: manifest.tables ?? {}, rpc: manifest.rpc ?? {} })).digest('hex'),
+          });
+          backup.initialize();
+          backups.set(manifest.slug, backup);
+        }
+        // Backup preflight decides whether this is a recoverable replacement host before schema or journal writes.
+        if (!backup?.recoveryPending()) {
+          const initializedByBackup = databaseInitialized;
+          initializeDatabase();
+          if (!initializedByBackup) backup?.createSnapshot();
+        }
       } catch (error) {
+        backup?.close();
+        backups.delete(manifest.slug);
         db.close();
         throw error;
       }
       apps.set(manifest.slug, { db, rpc: new Map(Object.entries(manifest.rpc ?? {})) });
     }
   } catch (error) {
+    for (const backup of backups.values()) backup.close();
     for (const app of apps.values()) app.db.close();
     throw error;
   }
@@ -434,12 +519,27 @@ export function createAppDatabase(
         bound[`:${key}`] = bindValue(value, spec.type, slug);
       }
       if (Object.keys(params).some(key => !Object.hasOwn(specs, key))) throw new Error('rpc parameter unknown');
+      const backup = backups.get(slug);
+      backup?.assertAvailable();
+      const writeRpc = isWriteSql(declaration.sql);
+      if (writeRpc) backup?.assertWritesAllowed();
       const statement = app.db.query(declaration.sql);
-      return statement.all(bound as never) as unknown[];
+      const rows = statement.all(bound as never) as unknown[];
+      if (writeRpc) backups.get(slug)?.captureWal();
+      return rows;
+    },
+    backupStatus(slug) { return backups.get(slug)?.status() ?? null; },
+    createBackupSnapshot(slug) { return backups.get(slug)?.createSnapshot() ?? false; },
+    restoreBackup(slug, targetPath) {
+      const backup = backups.get(slug);
+      if (!backup) throw new Error('app database backup is not configured');
+      return backup.restoreTo(targetPath);
     },
     close() {
       if (closed) return;
       closed = true;
+      for (const backup of backups.values()) backup.close();
+      backups.clear();
       for (const app of apps.values()) app.db.close();
       apps.clear();
     },

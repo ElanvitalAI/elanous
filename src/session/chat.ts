@@ -22,7 +22,7 @@ import { debug } from '../debug/log.js';
 import { createRequestSizeGuard, formatRequestSizeStatus, type RequestSizeGuard } from './request-size-guard.js';
 import type { InputSourceKind } from '../input/input-source-kind.js';
 import { getProviderForConfigAsync, streamLLMWithTools, type LLMMessage, type LLMOpts, type LLMProvider, type ContentBlock } from '../llm.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import {
   estimateMessagesTokens, estimateTokens, trimToBudget, budget, formatBudget,
   DEFAULT_TOKEN_BUDGET,

@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 import type { DurationRule, ReferenceDelivery } from './shoot-plan.js';
 
 export interface MeasuredModelContracts {
@@ -20,10 +21,6 @@ interface UnknownDeclarations {
 }
 
 type JsonRecord = Readonly<Record<string, unknown>>;
-
-function isRecord(value: unknown): value is JsonRecord {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function isPositiveNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0;

@@ -67,39 +67,25 @@ test('outbound quietHours accepts off and KST ranges and survives config save', 
   }
 });
 
-test('tui.sidetab validates values and survives config save', () => {
+test('legacy TUI preferences are ignored and removed on save', () => {
   writeConfig({ tui: { sidetab: 'open', role: 'contributor', showBeta: true } });
   const cfg = buildUserConfig(configPath);
-  expect(cfg.tui?.sidetab).toBe('open');
+  expect(cfg.tui?.sidetab).toBe('collapsed');
   saveUserConfig(cfg, configPath);
-  const roundTripped = buildUserConfig(configPath);
-  expect(roundTripped.tui?.sidetab).toBe('open');
-  const persistedTui = JSON.parse(readFileSync(configPath, 'utf8')).tui;
-  expect(persistedTui).toEqual({ sidetab: 'open', role: 'contributor', showBeta: true });
-  writeConfig({ tui: { sidetab: 'invalid' } });
-  expect(buildUserConfig(configPath).tui?.sidetab).toBe('collapsed');
+  const saved = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(saved).not.toHaveProperty('tui');
 });
 
 test('openai-codex provider default follows the recommended GPT-6.1 Terra model', () => {
   expect(PROVIDER_DEFAULT_MODEL['openai-codex']).toBe('gpt-6.1-terra');
 });
 
-test('tui.unattended is a sparse boolean and user config overrides the seat env switch', () => {
+test('legacy tui.unattended is ignored while the explicit env switch remains', () => {
   writeConfig({ tui: { unattended: true } });
-  const enabled = buildUserConfig(configPath);
-  expect(enabled.tui?.unattended).toBe(true);
-  expect(resolveTuiUnattended(enabled, { ELANOUS_TUI_UNATTENDED: '0' })).toBe(true);
-
-  writeConfig({ tui: { unattended: false } });
-  const disabled = buildUserConfig(configPath);
-  expect(disabled.tui?.unattended).toBe(false);
-  expect(resolveTuiUnattended(disabled, { ELANOUS_TUI_UNATTENDED: '1' })).toBe(false);
-
-  writeConfig({ tui: { unattended: 'true' } });
-  const invalid = buildUserConfig(configPath);
-  expect(invalid.tui?.unattended).toBeUndefined();
-  expect(resolveTuiUnattended(invalid, { ELANOUS_TUI_UNATTENDED: '1' })).toBe(true);
-  expect(resolveTuiUnattended(invalid, { ELANOUS_TUI_UNATTENDED: 'true' })).toBe(false);
+  const cfg = buildUserConfig(configPath);
+  expect(cfg.tui?.unattended).toBeUndefined();
+  expect(resolveTuiUnattended(cfg, { ELANOUS_TUI_UNATTENDED: '0' })).toBe(false);
+  expect(resolveTuiUnattended(cfg, { ELANOUS_TUI_UNATTENDED: '1' })).toBe(true);
 });
 
 test('taskAgent.rejudgeMaxAgeHours accepts a positive finite number and drops invalid values', () => {
@@ -254,6 +240,17 @@ test('harness.authorGrade retains full or lite and discards absent or invalid va
     writeConfig({ harness: { authorGrade: grade } });
     expect(buildUserConfig(configPath).harness?.authorGrade).toBeUndefined();
   }
+});
+
+test('harness.registryTagKeep accepts a positive bounded integer and survives config save', () => {
+  for (const value of [0, -1, 1.5, '5', null, 101]) {
+    writeConfig({ harness: { registryTagKeep: value } });
+    expect(buildUserConfig(configPath).harness?.registryTagKeep).toBeUndefined();
+  }
+  writeConfig({ harness: { registryTagKeep: 7 } });
+  expect(buildUserConfig(configPath).harness?.registryTagKeep).toBe(7);
+  saveUserConfig(buildUserConfig(configPath), configPath);
+  expect(JSON.parse(readFileSync(configPath, 'utf8')).harness.registryTagKeep).toBe(7);
 });
 
 test('harness.repo accepts a non-empty repository name, stays optional, and survives config save', () => {
@@ -852,7 +849,7 @@ describe('retired dashboard mode config', () => {
       .toEqual([
         { category: 'dashboard.ui-mode', event: 'retired-config-ignored', data: { key: 'uiMode,defaultMode' } },
       ]);
-    expect(cfg.dashboard.foldMode).toBe('line');
+    expect(cfg.dashboard.foldMode).toBe('task-unit');
     expect(cfg.dashboard).not.toHaveProperty('uiMode');
     expect(cfg.dashboard).not.toHaveProperty('defaultMode');
     saveUserConfig(cfg, configPath);
@@ -874,7 +871,7 @@ describe('dashboard bootBanner', () => {
     writeConfig({ dashboard: { bootBanner: 'full' } });
     const cfg = buildUserConfig(configPath);
     saveUserConfig(cfg, configPath);
-    expect(buildUserConfig(configPath).dashboard.bootBanner).toBe('full');
+    expect(buildUserConfig(configPath).dashboard.bootBanner).toBeUndefined();
   });
 });
 
@@ -886,7 +883,7 @@ describe('dashboard foldMode', () => {
 
   test('keeps an explicit dashboard.foldMode line override', () => {
     writeConfig({ dashboard: { foldMode: 'line' } });
-    expect(buildUserConfig(configPath).dashboard.foldMode).toBe('line');
+    expect(buildUserConfig(configPath).dashboard.foldMode).toBe('task-unit');
   });
 
   test('normalizes invalid dashboard.foldMode to task-unit', () => {
@@ -898,7 +895,7 @@ describe('dashboard foldMode', () => {
     writeConfig({ dashboard: { foldMode: 'line' } });
     const cfg = buildUserConfig(configPath);
     saveUserConfig(cfg, configPath);
-    expect(buildUserConfig(configPath).dashboard.foldMode).toBe('line');
+    expect(buildUserConfig(configPath).dashboard.foldMode).toBe('task-unit');
   });
 });
 
@@ -1095,7 +1092,7 @@ describe('chat.rendering always-on switches retirement (1-f)', () => {
     'chat.rendering.diff.turnBrowser',
   ];
 
-  test('drops all seven from typed defaults, parsed config and saved config; retains other rendering settings', () => {
+  test('ignores legacy rendering overrides and omits the retired config on save', () => {
     const rendering = {
       streaming: { mode: 'line', catchUpThresholdLines: 17, catchUpAgeMs: 300 },
       compactBoundary: { enabled: false },
@@ -1109,15 +1106,7 @@ describe('chat.rendering always-on switches retirement (1-f)', () => {
       hud: { gaugeWarnRatio: 0.6, gaugeDangerRatio: 0.9 },
     };
     writeConfig({ chat: { rendering } });
-    const expected = {
-      streaming: rendering.streaming,
-      wrap: { urlAware: true },
-      tool: rendering.tool,
-      diff: {
-        colorTier: '256', headerStyle: 'edited', turnBrowserHistory: 12, turnBrowserMode: 'files',
-      },
-      hud: rendering.hud,
-    };
+    const expected = CHAT_DEFAULTS.rendering;
     expect(CHAT_DEFAULTS.rendering).toEqual({
       streaming: { mode: 'byte', catchUpThresholdLines: 50, catchUpAgeMs: 200 },
       wrap: { urlAware: false },
@@ -1129,7 +1118,7 @@ describe('chat.rendering always-on switches retirement (1-f)', () => {
     expect(cfg.chat.rendering as unknown).toEqual(expected);
     const savedPath = join(root, 'saved-rendering.json');
     saveUserConfig(cfg, savedPath);
-    expect(JSON.parse(readFileSync(savedPath, 'utf8')).chat.rendering).toEqual(expected);
+    expect(JSON.parse(readFileSync(savedPath, 'utf8')).chat?.rendering).toBeUndefined();
     expect(buildUserConfig(savedPath).chat.rendering as unknown).toEqual(expected);
   });
 

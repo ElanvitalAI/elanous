@@ -30,6 +30,9 @@ import {
   trackEscAbortToolCall,
   settleEscAbortToolCall,
   cancelDelegatedToolOnEscape,
+  createDashboardPluginRouteBridge,
+  buildClassicDashboardTuiTurnTools,
+  buildNextDashboardTuiTurnTools,
   activeEscDelegatedPty,
   registerDashboardFinderAndHistoryKeys,
   activeDashboardTypeaheadSessionId,
@@ -45,6 +48,8 @@ import {
 import { buildAdRunSetup } from '../ad-pipeline/ad-run-setup.js';
 import type { CommandRunner } from '../ad-pipeline/higgsfield-backend.js';
 import { dispatchDashboardSessionRuntimeTool } from './session-runtime-dispatch.js';
+import { buildSessionRuntimeToolSpecs } from '../session-runtime/index.js';
+import { applyDeferredTools } from '../session-runtime/tier-flip.js';
 import { runDashboardChatMainPlainTurn, type DashboardChatMainPlainTurnRuntimeDeps } from './input/chat-main-plain-turn-runtime.js';
 import { HYDRATED_TOOLS_KEY } from '../skills/tools/tool-search-spec.js';
 import { toolSearchRuntime } from '../tool-runtime/tool-search-runtime.js';
@@ -1200,6 +1205,48 @@ test('TUI-LEGACY-STREAM-CANCEL-TERM: Esc waits for delegated child termination b
 });
 
 describe('dashboard tool dispatch signal observation', () => {
+  test('classic and ACP-next TUI entry bridge routes real turns and dispatches native handlers', async () => {
+    const coreCalls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const pluginCalls: string[] = [];
+    const bridge = createDashboardPluginRouteBridge({
+      pluginRoot: resolve(import.meta.dir, '../../plugins'),
+      dispatchCore: async (name, args) => {
+        coreCalls.push({ name, args });
+        return { name, args };
+      },
+      dispatchPlugin: async (name) => {
+        pluginCalls.push(name);
+        return { ok: false, error: 'unexpected plugin handler path' };
+      },
+    });
+    const buildTurnTools = [
+      (options: Parameters<typeof buildSessionRuntimeToolSpecs>[0]) => buildClassicDashboardTuiTurnTools(bridge, options),
+      (options: Parameters<typeof buildSessionRuntimeToolSpecs>[0]) => buildNextDashboardTuiTurnTools(bridge, options),
+    ];
+
+    for (const buildTools of buildTurnTools) {
+      for (const [query, toolName, coreName] of [
+        ['발행 어디까지?', 'ReleaseStatus', 'release_status'],
+        ['로그 보여줘', 'ObserveLogs', 'logs_query'],
+        ['운영 상태 알려줘', 'ObserveOpsStatus', 'ops_status'],
+      ]) {
+        const specs = buildTools({ userText: query, hostTools: [] });
+        const turn = applyDeferredTools([{ role: 'user', content: query }], specs, { userText: query });
+        expect(turn.tools.map((tool) => tool.name)).toContain(toolName);
+        const args = { query };
+        await expect(bridge.dispatch(toolName, args)).resolves.toEqual({
+          ok: true,
+          result: { name: coreName, args },
+        });
+      }
+    }
+    expect(coreCalls.map(({ name }) => name)).toEqual([
+      'release_status', 'logs_query', 'ops_status',
+      'release_status', 'logs_query', 'ops_status',
+    ]);
+    expect(pluginCalls).toEqual([]);
+  });
+
   test('records signal provenance on a separate category before the existing runtime dispatch call', () => {
     const helper = dashboard.slice(
       dashboard.indexOf('export function observeDashboardToolDispatchSignal'),

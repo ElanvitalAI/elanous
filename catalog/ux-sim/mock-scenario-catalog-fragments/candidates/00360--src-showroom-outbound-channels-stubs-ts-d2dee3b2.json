@@ -1,0 +1,8 @@
+{
+  "path": "src/showroom/outbound/channels/stubs.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun test src/showroom/outbound/channels/",
+  "logsRecorded": "no",
+  "logsDetail": "Stub results asserted by channel tests.",
+  "excludeReason": "Outbound channel stub, not a UX simulation device."
+}

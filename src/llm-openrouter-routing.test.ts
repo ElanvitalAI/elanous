@@ -8,7 +8,7 @@ import { buildUserConfig, saveUserConfig } from './user-config.js';
 import { getProviderForConfig, sanitizeToolSchemaForKimi } from './llm.js';
 import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
 import { isOpenRouterGrokModel, sanitizeToolSchemaForGrok } from './llm-tool-schema.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 
 const schema = {
   type: 'object',
@@ -24,7 +24,7 @@ async function captureRequest(provider: string, model: string, preferences?: Rec
   const bodies: Record<string, any>[] = [];
   const urls: string[] = [];
   const url = provider === 'openrouter' ? 'https://openrouter.ai/api/v1/chat/completions'
-    : provider === 'grok' ? 'https://api.x.ai/v1/chat/completions'
+    : provider === 'grok' ? 'https://fake-grok.invalid/v1/chat/completions'
       : provider === 'local' ? 'http://localhost:1234/v1/chat/completions'
         : 'https://api.openai.com/v1/chat/completions';
   const respond = (request: { url: string; body: string | null }) => {
@@ -35,7 +35,11 @@ async function captureRequest(provider: string, model: string, preferences?: Rec
   await withFakeFetchDevice([
     { url, method: 'POST', response: respond },
   ], async () => {
-    const config = { llm: { provider, model, apiKey: 'test-key', ...(provider === 'local' ? { baseUrl: 'http://localhost:1234/v1' } : {}), ...(preferences ? { openrouter: { providerPreferences: preferences } } : {}) } } as UserConfig;
+    // Give Grok an explicit fake gateway so a host subscription cannot replace
+    // this test's URL with cli-chat-proxy.grok.com during credential resolution.
+    const baseUrl = provider === 'grok' ? 'https://fake-grok.invalid/v1'
+      : provider === 'local' ? 'http://localhost:1234/v1' : undefined;
+    const config = { llm: { provider, model, apiKey: 'test-key', ...(baseUrl ? { baseUrl } : {}), ...(preferences ? { openrouter: { providerPreferences: preferences } } : {}) } } as UserConfig;
     for await (const _ of getProviderForConfig(config).streamChat!(messages, { tools: requestTools })) { /* consume */ }
   });
   return { body: bodies[0]!, url: urls[0] };
@@ -169,7 +173,8 @@ test('only OpenRouter moonshotai tools are sanitized in the serialized request',
     ['grok', 'grok-4.7'],
     ['local', 'local-model'],
   ]) {
-    const { body } = await captureRequest(provider!, model!);
+    const { body, url } = await captureRequest(provider!, model!);
+    if (provider === 'grok') expect(url).toBe('https://fake-grok.invalid/v1/chat/completions');
     expect(body.tools[0].function.parameters.properties.a).toEqual({ $ref: '#/x', description: 'd' });
     expect(body.tools[0].function.parameters.properties.b.items).toEqual(schema.properties.b.items);
     if (provider !== 'openrouter') expect(body.provider).toBeUndefined();

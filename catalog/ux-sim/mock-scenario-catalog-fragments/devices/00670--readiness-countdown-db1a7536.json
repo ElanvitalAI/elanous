@@ -1,0 +1,31 @@
+{
+  "id": "readiness-countdown",
+  "name": "Release readiness countdown simulation",
+  "implementation": [
+    "src/ux-sim/readiness-countdown.ts"
+  ],
+  "tests": [
+    "src/ux-sim/readiness-countdown.test.ts"
+  ],
+  "target": "Readiness gates, hold, ETA notices and host reservation extensions against a fixed-time constraint",
+  "inputs": [
+    "fake PR land events",
+    "gate duration",
+    "host readiness",
+    "manual hold",
+    "milestone completion"
+  ],
+  "observations": [
+    "GO/NO-GO at cutoff, gate, publish and announcement",
+    "ETA change notifications",
+    "T-minus host reservation expiry",
+    "11-07 06:00 constraint to 07:xx readiness replay"
+  ],
+  "entryCommands": [
+    "bun scripts/ux-sim.ts readiness-countdown",
+    "bun test src/ux-sim/readiness-countdown.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

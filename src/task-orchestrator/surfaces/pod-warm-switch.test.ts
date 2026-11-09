@@ -4,6 +4,8 @@ import {
   decideWarmReuse,
   DEFAULT_WARM_MIN_MATCH_SAMPLES,
   resolveWarmMinMatchSamples,
+  resolveWarmPodPhasePlan,
+  selectWarmPodPhaseCandidates,
   WARM_REUSE_CONSUMER_ORDER,
   type WarmReuseEvidence,
   type WarmReuseEvidenceByConsumer,
@@ -137,5 +139,73 @@ describe('decideWarmReuse — observation', () => {
     expect(lines[0]![0]).toBe('pod.warm');
     expect(lines[0]![1]).toBe('switch-decision');
     expect(lines[0]![2]).toMatchObject({ consumer: 'ta', live: false, reason: 'predecessor-off:land', flag: true, minMatchSamples: 3, samples: 3, recentMismatchCount: 2 });
+  });
+});
+
+describe('POD-PHASE-PREWARM phase plan', () => {
+  const startAtMs = 10_000_000;
+  const schedule = {
+    steadyTargets: { gate: 1, implementation: 3 },
+    windows: [{ phase: 'gate' as const, startAtMs, endAtMs: startAtMs + 60 * 60_000,
+      targets: { gate: 2, implementation: 1 }, cutSha: 'a'.repeat(40), lockHash: 'b'.repeat(64),
+      imageDigest: `sha256:${'c'.repeat(64)}` }],
+  };
+
+  test('phase boundaries prewarm the exact cut and restore steady implementation targets after the gate', () => {
+    expect(resolveWarmPodPhasePlan(startAtMs - 30 * 60_000, schedule)).toMatchObject({ phase: 'gate-prewarm', targets: { gate: 2, implementation: 1 } });
+    expect(resolveWarmPodPhasePlan(startAtMs, schedule)).toMatchObject({ phase: 'gate', targets: { gate: 2, implementation: 1 } });
+    expect(resolveWarmPodPhasePlan(startAtMs + 60 * 60_000, schedule)).toEqual({ phase: 'steady', targets: { gate: 1, implementation: 3 } });
+  });
+
+  test('adds measured BURST-HOST-JIT preparation time to the 30-minute lead and defaults only when absent', () => {
+    const measured = { ...schedule, measuredPrepareDurationMs: 5 * 60_000 };
+    expect(resolveWarmPodPhasePlan(startAtMs - 35 * 60_000, measured).phase).toBe('gate-prewarm');
+    expect(resolveWarmPodPhasePlan(startAtMs - 35 * 60_000 - 1, measured).phase).toBe('steady');
+    expect(resolveWarmPodPhasePlan(startAtMs - 30 * 60_000, schedule).phase).toBe('gate-prewarm');
+    expect(() => resolveWarmPodPhasePlan(startAtMs, { ...schedule, measuredPrepareDurationMs: -1 }))
+      .toThrow('invalid measured warm Pod preparation duration');
+  });
+
+  test('an upcoming gate prewarms during an active rehearsal phase', () => {
+    const rehearsal = { phase: 'rehearsal' as const, startAtMs: startAtMs - 10 * 60_000,
+      endAtMs: startAtMs, targets: { gate: 0, implementation: 1 } };
+    const withRehearsal = { ...schedule, measuredPrepareDurationMs: 5 * 60_000,
+      windows: [rehearsal, schedule.windows[0]!] };
+    expect(resolveWarmPodPhasePlan(startAtMs - 1, withRehearsal)).toMatchObject({
+      phase: 'gate-prewarm', targets: { gate: 2, implementation: 1 },
+      gateIdentity: { cutSha: 'a'.repeat(40) },
+    });
+    expect(resolveWarmPodPhasePlan(startAtMs + 1, withRehearsal)).toMatchObject({
+      phase: 'gate', targets: { gate: 2, implementation: 1 },
+    });
+  });
+
+  test('blocked early candidates do not consume a phase target before eligible candidates', () => {
+    const plan = resolveWarmPodPhasePlan(startAtMs - 1, schedule);
+    const candidates = [
+      { kind: 'gate' as const, blocked: true, spec: { workerId: 'gate-a-blocked', cutSha: 'a'.repeat(40), key: { lockHash: 'b'.repeat(64), imageDigest: `sha256:${'c'.repeat(64)}` } } },
+      { kind: 'gate' as const, blocked: false, spec: { workerId: 'gate-b-usable', cutSha: 'a'.repeat(40), key: { lockHash: 'b'.repeat(64), imageDigest: `sha256:${'c'.repeat(64)}` } } },
+    ];
+    expect(selectWarmPodPhaseCandidates(candidates, plan, row => !row.blocked).map(row => row.spec.workerId))
+      .toEqual(['gate-b-usable']);
+  });
+
+  test('gate prewarm excludes candidates unless cut, lock, and image digest match exactly', () => {
+    const plan = resolveWarmPodPhasePlan(startAtMs - 1, schedule);
+    const candidates = [
+      { kind: 'gate' as const, spec: { workerId: 'gate-a', cutSha: 'a'.repeat(40), key: { lockHash: 'b'.repeat(64), imageDigest: `sha256:${'c'.repeat(64)}` } } },
+      { kind: 'gate' as const, spec: { workerId: 'gate-wrong-lock', cutSha: 'a'.repeat(40), key: { lockHash: 'd'.repeat(64), imageDigest: `sha256:${'c'.repeat(64)}` } } },
+      { kind: 'gate' as const, spec: { workerId: 'gate-wrong-image', cutSha: 'a'.repeat(40), key: { lockHash: 'b'.repeat(64), imageDigest: `sha256:${'e'.repeat(64)}` } } },
+      { kind: 'implementation' as const, spec: { workerId: 'impl-a', cutSha: 'a'.repeat(40), key: { lockHash: 'b'.repeat(64), imageDigest: `sha256:${'c'.repeat(64)}` } } },
+    ];
+    expect(selectWarmPodPhaseCandidates(candidates, plan).map(row => row.spec.workerId)).toEqual(['gate-a', 'impl-a']);
+  });
+
+  test('rejects overlapping phases and gate windows without a pinned identity', () => {
+    expect(() => resolveWarmPodPhasePlan(1, { ...schedule, windows: [
+      schedule.windows[0]!, { ...schedule.windows[0]!, phase: 'publish', startAtMs: startAtMs + 1 },
+    ] })).toThrow('invalid or overlapping');
+    expect(() => resolveWarmPodPhasePlan(1, { ...schedule, windows: [{ ...schedule.windows[0]!, lockHash: undefined }] }))
+      .toThrow('requires exact cut, lock, and image identity');
   });
 });

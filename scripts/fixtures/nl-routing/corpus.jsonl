@@ -1,0 +1,17 @@
+{"type":"meta","description":"한국어 우선 내장 라우트 선택 코퍼스. 발행 상태/실행, 로그/운영 상태 구분과 부정 대조 문항을 함께 둔다.","surface":"chat","tiers":{"release-status":"읽기 전용 발행 체크리스트 상태 라우트","release-start":"명시적 시작 의도 라우트","observe-logs":"운영 로그 검색 라우트","ops-status":"운영 상태 요약 라우트","confounder":"유사 표현·부정 조건 대조군"}}
+{"id":"kr-release-status-01","tier":"release-status","prompt":"0.3.8 발행 준비와 체크리스트가 지금 어디까지 왔는지 알려 줘.","accept":["ReleaseStatus"],"reject":["ReleaseGraphStart"]}
+{"id":"kr-release-status-02","tier":"release-status","prompt":"릴리즈 진행 상태만 확인해 줘. 그래프는 시작하지 마.","accept":["ReleaseStatus"],"reject":["ReleaseGraphStart"]}
+{"id":"kr-release-status-03","tier":"release-status","context_dependent":true,"context":"현재 보고 있는 릴리즈 판은 0.3.8이다.","prompt":"이 판의 체크리스트 상태를 읽어 줘.","accept":["ReleaseStatus"],"reject":["ReleaseGraphStart"]}
+{"id":"kr-release-start-01","tier":"release-start","prompt":"승인 완료됐어. 릴리즈 그래프를 지금 시작해.","accept":["ReleaseGraphStart"],"reject":["ReleaseStatus"]}
+{"id":"kr-release-start-02","tier":"release-start","prompt":"명시적으로 발행 컷 시작을 승인할게. 그래프를 실행해.","accept":["ReleaseGraphStart"],"reject":["ReleaseStatus"]}
+{"id":"en-release-start-01","tier":"release-start","prompt":"Approval is granted. Start the release graph now.","accept":["ReleaseGraphStart"],"reject":["ReleaseStatus"]}
+{"id":"kr-observe-logs-01","tier":"observe-logs","prompt":"최근 릴리즈 오류 로그를 찾아서 보여 줘.","accept":["ObserveLogs"],"reject":["ObserveOpsStatus"]}
+{"id":"kr-observe-logs-02","tier":"observe-logs","prompt":"운영 로그에서 마지막 gate failure 이벤트를 검색해 줘.","accept":["ObserveLogs"],"reject":["ObserveOpsStatus"]}
+{"id":"en-observe-logs-01","tier":"observe-logs","prompt":"Search the latest operational logs for release errors.","accept":["ObserveLogs"],"reject":["ObserveOpsStatus"]}
+{"id":"kr-ops-status-01","tier":"ops-status","prompt":"현재 운영 상태를 한눈에 요약해 줘.","accept":["ObserveOpsStatus"],"reject":["ObserveLogs"]}
+{"id":"kr-ops-status-02","tier":"ops-status","prompt":"서비스와 배포가 지금 정상인지 운영 현황을 읽어 줘.","accept":["ObserveOpsStatus"],"reject":["ObserveLogs"]}
+{"id":"kr-ops-status-03","tier":"ops-status","context_dependent":true,"context":"최근 배포 내역은 이미 확인했다.","prompt":"지금 전체 운영 상태를 확인해 줘.","accept":["ObserveOpsStatus"],"reject":["ObserveLogs"]}
+{"id":"kr-confounder-status-not-start","tier":"confounder","prompt":"발행을 시작하지 말고 현재 체크리스트 상태만 알려 줘.","accept":["ReleaseStatus"],"reject":["ReleaseGraphStart"]}
+{"id":"kr-confounder-ops-not-logs","tier":"confounder","prompt":"로그 검색 말고 지금 운영 상태 요약을 보여 줘.","accept":["ObserveOpsStatus"],"reject":["ObserveLogs"]}
+{"id":"kr-confounder-logs-not-start","tier":"confounder","prompt":"릴리즈 관련 최근 오류 로그를 찾아 줘. 발행을 시작하라는 뜻은 아니야.","accept":["ObserveLogs"],"reject":["ReleaseGraphStart"]}
+{"id":"kr-confounder-status-logs","tier":"confounder","prompt":"발행 상태를 확인하되 로그 검색이나 그래프 실행은 하지 마.","accept":["ReleaseStatus"],"reject":["ObserveLogs","ReleaseGraphStart"]}

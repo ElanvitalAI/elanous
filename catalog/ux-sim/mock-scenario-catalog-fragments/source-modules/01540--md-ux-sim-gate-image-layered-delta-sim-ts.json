@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-GATE-IMAGE-LAYERED-DELTA-SIM-TS",
+  "path": "src/ux-sim/gate-image-layered-delta-sim.ts",
+  "boundary": "Simulates layered gate image deltas and their release graph outcomes in an isolated world.",
+  "deviceIds": ["release-graph-rig"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

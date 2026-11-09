@@ -11,7 +11,7 @@ import type { WorkspaceHost } from '../../display/workspace-host.js';
 import type { ConversationPopupHost } from '../../conv-dash/popup-host.js';
 import type { ConversationPopupSummary, GitSegmentState, RunningBuildState, ShellRollupSummary, BackgroundJobsSummary, VwSummary } from '../../status/bar.js';
 import type { StatusProviderInfo } from '../../status/status-provider-info.js';
-import type { RotationEntry } from '../../user-config.js';
+import type { RotationEntry } from '../../user-config/types.js';
 import type { PaneWindowPreset, SurfaceCatalogPreset, ShellRollupEntry, ViewPreset } from '../../mouse-action-recipes.js';
 
 export type DockItemBound =

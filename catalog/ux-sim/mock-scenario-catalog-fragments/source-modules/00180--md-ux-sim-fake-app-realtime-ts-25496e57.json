@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-APP-REALTIME-TS",
+  "path": "src/ux-sim/fake-app-realtime.ts",
+  "boundary": "App-slug-scoped row-change SSE contract matrix run on the real NexusEventBus reference port (createNexusEventBusAppRealtimePortFactory) and injected port factories (simulation boundary).",
+  "deviceIds": [
+    "fake-app-realtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -4,6 +4,12 @@ import { GATE_NODE_SIM_SCENARIOS, judgeInjectedGateEvent } from './gate-node-sim
 
 setDefaultTimeout(60_000);
 
+test('retry-pass simulation uses the measured shard artifact and remains nonblocking', async () => {
+  const scenario = GATE_NODE_SIM_SCENARIOS.find((row) => row.id === 'retry-pass')!;
+  const result = await judgeInjectedGateEvent(scenario);
+  expect(result).toMatchObject({ outcome: 'ok', action: 'reuse', podCommandCalls: 0 });
+});
+
 test('GATE-MOCK-EVENT-SCENARIOS: distinct injected evidence pins gate judgements and planner recovery choices', async () => {
   const rows: Array<{ scenario: string; injectedInput: string; expected: string; actual: string; outcome: string }> = [];
   await withSimClock(Date.parse('2026-10-29T00:00:00.000Z'), async (clock) => {

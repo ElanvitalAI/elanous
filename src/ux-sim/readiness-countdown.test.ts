@@ -2,6 +2,149 @@ import { describe, expect, test } from 'bun:test';
 import { readinessCountdown1107Scenario, readinessCountdownPhasesScenario, simulateReadinessCountdown } from './readiness-countdown.js';
 
 describe('readiness countdown contract probe · RLA-LAUNCH-COUNTDOWN-PHASES', () => {
+  test('cutoff requires the exact simulated PR-land identity', () => {
+    const t = Date.parse('2026-11-07T06:00:00+09:00');
+    const rows = simulateReadinessCountdown({
+      fixedTimeConstraint: t,
+      countdownMilliseconds: 0,
+      hostReservationLeadMilliseconds: 0,
+      hostReservationBufferMilliseconds: 0,
+      requirements: [{ id: 'cut-branch', gates: ['cutoff'], expectedReadyAt: t, pr: { number: 35841, headSha: 'abc123' } }],
+      events: [
+        { at: t, type: 'pr-landed', number: 35840, headSha: 'abc123' },
+        { at: t, type: 'milestone-complete', gate: 'cutoff' },
+        { at: t + 1, type: 'pr-landed', number: 35841, headSha: 'wrong' },
+        { at: t + 1, type: 'milestone-complete', gate: 'cutoff' },
+        { at: t + 2, type: 'pr-landed', number: 35841, headSha: 'abc123' },
+        { at: t + 2, type: 'milestone-complete', gate: 'cutoff' },
+      ],
+    });
+
+    expect(rows[2]?.completed).not.toContain('cutoff');
+    expect(rows[4]?.completed).not.toContain('cutoff');
+    expect(rows.at(-1)?.completed).toContain('cutoff');
+  });
+
+  test('generic readiness events cannot satisfy a PR-bound prerequisite', () => {
+    const t = Date.parse('2026-11-07T06:00:00+09:00');
+    const rows = simulateReadinessCountdown({
+      fixedTimeConstraint: t,
+      countdownMilliseconds: 0,
+      hostReservationLeadMilliseconds: 0,
+      hostReservationBufferMilliseconds: 0,
+      requirements: [{ id: 'cut-branch', gates: ['cutoff'], expectedReadyAt: t, pr: { number: 35841, headSha: 'abc123' } }],
+      events: [
+        { at: t, type: 'requirement-ready', id: 'cut-branch' },
+        { at: t, type: 'milestone-complete', gate: 'cutoff' },
+      ],
+    });
+
+    expect(rows[1]?.noGo).toContain('cut-branch');
+    expect(rows.at(-1)?.completed).not.toContain('cutoff');
+  });
+
+  test('scrubs to next cycle when distinct hold count reaches its configured limit', () => {
+    const t = Date.parse('2026-11-07T06:00:00+09:00');
+    const rows = simulateReadinessCountdown({
+      fixedTimeConstraint: t,
+      countdownMilliseconds: 0,
+      hostReservationLeadMilliseconds: 0,
+      hostReservationBufferMilliseconds: 0,
+      maxHoldsBeforeNextCycle: 2,
+      requirements: [],
+      events: [
+        { at: t, type: 'hold', reason: 'prerequisite delay' },
+        { at: t + 1, type: 'hold', reason: 'duplicate hold' },
+        { at: t + 2, type: 'release-hold' },
+        { at: t + 3, type: 'hold', reason: 'scrub threshold reached' },
+        { at: t + 4, type: 'release-hold' },
+        { at: t + 5, type: 'milestone-complete', gate: 'cutoff' },
+      ],
+    });
+
+    expect(rows[1]?.holdCount).toBe(1);
+    expect(rows[2]?.holdCount).toBe(1);
+    expect(rows[4]?.holdCount).toBe(2);
+    expect(rows[4]?.disposition).toBe('next-cycle');
+    expect(rows.at(-1)?.completed).not.toContain('cutoff');
+    expect(rows.at(-1)?.disposition).toBe('next-cycle');
+  });
+
+  test('requires a positive integer hold limit when next-cycle scrubbing is enabled', () => {
+    const base = {
+      fixedTimeConstraint: 0,
+      countdownMilliseconds: 0,
+      hostReservationLeadMilliseconds: 0,
+      hostReservationBufferMilliseconds: 0,
+      requirements: [],
+      events: [],
+    } as const;
+
+    for (const maxHoldsBeforeNextCycle of [0, -1, 1.5]) {
+      expect(() => simulateReadinessCountdown({ ...base, maxHoldsBeforeNextCycle })).toThrow(RangeError);
+    }
+  });
+
+  test('sends coordinator ETA changes promptly and material-delay notice only beyond threshold', () => {
+    const t = Date.parse('2026-11-07T06:00:00+09:00');
+    const rows = simulateReadinessCountdown({
+      fixedTimeConstraint: t,
+      countdownMilliseconds: 0,
+      hostReservationLeadMilliseconds: 0,
+      hostReservationBufferMilliseconds: 0,
+      materialDelayThresholdMilliseconds: 30 * 60_000,
+      requirements: [{ id: 'ready', gates: ['cutoff'], expectedReadyAt: t }],
+      events: [
+        { at: t + 10 * 60_000, type: 'requirement-ready', id: 'ready' },
+        { at: t + 20 * 60_000, type: 'hold', reason: 'short delay' },
+        { at: t + 25 * 60_000, type: 'clock-tick' },
+        { at: t + 30 * 60_000, type: 'clock-tick' },
+        { at: t + 30 * 60_000 + 1, type: 'clock-tick' },
+      ],
+    });
+
+    const belowThreshold = rows.find((row) => row.at === t + 25 * 60_000)!;
+    const atThreshold = rows.find((row) => row.at === t + 30 * 60_000)!;
+    const aboveThreshold = rows.find((row) => row.at === t + 30 * 60_000 + 1)!;
+    expect(belowThreshold.notifications).toContainEqual({ type: 'eta-changed', eta: belowThreshold.eta });
+    expect(belowThreshold.notifications.some((notice) => notice.type === 'material-delay')).toBe(false);
+    expect(atThreshold.eta - t).toBe(30 * 60_000);
+    expect(atThreshold.notifications.some((notice) => notice.type === 'material-delay')).toBe(false);
+    expect(aboveThreshold.notifications).toContainEqual({ type: 'material-delay', eta: aboveThreshold.eta });
+  });
+
+  test('uses even-sized historical median and the maximum of history and current gate duration', () => {
+    const t = Date.parse('2026-11-07T06:00:00+09:00');
+    const base = {
+      fixedTimeConstraint: t,
+      countdownMilliseconds: 0,
+      hostReservationLeadMilliseconds: 0,
+      hostReservationBufferMilliseconds: 0,
+      priorGateDurationsMilliseconds: [4 * 60_000, 8 * 60_000],
+      requirements: [],
+    } as const;
+    const atHistoricalMedian = simulateReadinessCountdown({
+      ...base,
+      events: [
+        { at: t, type: 'host-ready', host: 'gate-host' },
+        { at: t, type: 'milestone-complete', gate: 'cutoff' },
+      ],
+    }).at(-1)!;
+    const withCurrentMeasurement = simulateReadinessCountdown({
+      ...base,
+      events: [
+        { at: t, type: 'host-ready', host: 'gate-host' },
+        { at: t, type: 'milestone-complete', gate: 'cutoff' },
+        { at: t + 1, type: 'gate-duration', milliseconds: 9 * 60_000 },
+      ],
+    }).at(-1)!;
+
+    expect(atHistoricalMedian.gateDurationEstimateMilliseconds).toBe(6 * 60_000);
+    expect(atHistoricalMedian.eta).toBe(t + 6 * 60_000);
+    expect(withCurrentMeasurement.gateDurationEstimateMilliseconds).toBe(9 * 60_000);
+    expect(withCurrentMeasurement.eta).toBe(t + 9 * 60_000);
+  });
+
   test('simulates T−11h through T0 with two explicit holds and blocks premature gate completion', () => {
     const scenario = readinessCountdownPhasesScenario();
     const rows = simulateReadinessCountdown(scenario);

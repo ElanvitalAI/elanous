@@ -4,7 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
 import { applyDecidedApprovals, raiseApprovalCard, type GraphApprovalCardDeps } from './graph-approval-card.js';
-import type { GraphRunState } from './runner.js';
+import type { GraphRunState } from './runner-types.js';
 
 export interface GraphNotificationEvent {
   id: string;

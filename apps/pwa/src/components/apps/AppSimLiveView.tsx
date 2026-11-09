@@ -9,6 +9,7 @@ export interface AppSimLiveEvent {
   appId?: string;
   runId?: string;
   data?: Record<string, unknown>;
+  detail?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -34,7 +35,27 @@ const APP_EVENT_PREFIX = 'app.sim.';
 const EMPTY_EVENTS: readonly AppSimLiveEvent[] = [];
 
 function eventBelongsToApp(event: AppSimLiveEvent, appId: string): boolean {
-  return event.appId === appId || event.data?.appId === appId;
+  return event.appId === appId || event.data?.appId === appId || event.detail?.appId === appId;
+}
+
+function normalizeEvent(event: AppSimLiveEvent): AppSimLiveEvent {
+  const detail = event.detail;
+  return {
+    ...event,
+    ...(typeof event.appId === 'string' ? {} : typeof detail?.appId === 'string' ? { appId: detail.appId } : {}),
+    ...(typeof event.runId === 'string' ? {} : typeof detail?.runId === 'string' ? { runId: detail.runId } : {}),
+    ...(event.data ? {} : detail?.data && typeof detail.data === 'object' ? { data: detail.data as Record<string, unknown> } : {}),
+  };
+}
+
+function eventIdentity(event: AppSimLiveEvent): string {
+  const step = typeof event.data?.step === 'string' ? event.data.step : '';
+  return `${event.runId ?? ''}:${event.ts}:${step}:${event.kind}`;
+}
+
+function appendUnique(events: readonly AppSimLiveEvent[], event: AppSimLiveEvent): AppSimLiveEvent[] {
+  if (events.some(existing => eventIdentity(existing) === eventIdentity(event))) return [...events];
+  return [...events, event].slice(-MAX_EVENTS);
 }
 
 function formatTime(value: number | string): string {
@@ -67,11 +88,11 @@ export function AppSimLiveView({ appId, appName, client, receipts, onBack, initi
     return client.subscribeEvents({
       topics: [APP_EVENT_PREFIX],
       onEvent: (event) => {
-        const appEvent = event as AppSimLiveEvent;
+        const appEvent = normalizeEvent(event as AppSimLiveEvent);
         if (!eventBelongsToApp(appEvent, appId)) return;
         setEventState((current) => ({
           appId,
-          events: [...(current.appId === appId ? current.events : []), appEvent].slice(-MAX_EVENTS),
+          events: appendUnique(current.appId === appId ? current.events : [], appEvent),
         }));
       },
     });

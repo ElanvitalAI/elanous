@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
 
-import type { RotationEntry } from '../src/user-config.js';
+import type { RotationEntry } from '../src/user-config/types.js';
 import { createMousePickerRuntime } from '../src/dashboard/input/mouse-picker-runtime.js';
 
 const ROTATION_ENTRY: RotationEntry = { provider: 'openai', model: 'gpt-5' };

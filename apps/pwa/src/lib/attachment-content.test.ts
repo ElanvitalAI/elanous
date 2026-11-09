@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { AttachmentMeta } from './upload-attachment';
+import { withFakeFetchDevice } from '../test-devices/fake-fetch';
 import {
   buildPromptUserContentFromAttachments,
   isImageAttachment,
@@ -11,21 +12,14 @@ import {
 } from './attachment-content';
 
 const baseUrl = 'https://daemon.local';
-// Bun's `fetch` global is mockable per test by overriding globalThis.fetch.
-// `data:` URI shortcut keeps the test deterministic — every fetch returns
-// the canned bytes ('TINY') regardless of input. We restore after each test.
 function withMockFetch<T>(body: ArrayBuffer | string, ok: boolean, run: () => Promise<T>): Promise<T> {
-  const orig = globalThis.fetch;
   const ab = typeof body === 'string'
     ? new TextEncoder().encode(body).buffer
     : body;
-  globalThis.fetch = (async () => ({
-    ok,
-    status: ok ? 200 : 500,
-    arrayBuffer: async () => ab,
-    text: async () => 'mock',
-  })) as unknown as typeof fetch;
-  return run().finally(() => { globalThis.fetch = orig; });
+  return withFakeFetchDevice([
+    { url: '/v1/attachments/img-1', response: () => new Response(ab, { status: ok ? 200 : 500 }) },
+    { url: '/v1/attachments/img-2', response: () => new Response(ab, { status: ok ? 200 : 500 }) },
+  ], run);
 }
 
 const imageAttachment: AttachmentMeta = {
@@ -178,25 +172,16 @@ describe('buildPromptUserContentFromAttachments — Q1=B order + image base64', 
 
   test('forwards bearer token via Authorization header', async () => {
     let observedHeader: string | undefined;
-    const orig = globalThis.fetch;
-    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
-      observedHeader = (init?.headers as Record<string, string> | undefined)?.authorization;
-      return {
-        ok: true,
-        status: 200,
-        arrayBuffer: async () => new ArrayBuffer(0),
-        text: async () => '',
-      };
-    }) as typeof fetch;
-    try {
+    await withFakeFetchDevice([{ url: '/v1/attachments/img-1', response: (request) => {
+      observedHeader = request.headers.authorization;
+      return new Response(new ArrayBuffer(0));
+    } }], async () => {
       await buildPromptUserContentFromAttachments(
         '',
         [imageAttachment],
         { baseUrl, token: 'tok-xyz' },
       );
-    } finally {
-      globalThis.fetch = orig;
-    }
+    });
     expect(observedHeader).toBe('Bearer tok-xyz');
   });
 });

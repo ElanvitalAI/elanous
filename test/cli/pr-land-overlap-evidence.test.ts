@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, realpathSync, readdirSync, readFileSync, rmSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CmdRunner } from '../../src/autopilot/pr-manager.js';
-import { verifyAncestorAutoPass, verifyOverlapEvidence } from '../../src/cli/pr-land-overlap-evidence.js';
+import { forecastPrPushConflicts, verifyAncestorAutoPass, verifyOverlapEvidence } from '../../src/cli/pr-land-overlap-evidence.js';
 
 const run: CmdRunner = (cmd, args, opts) => {
   const r = spawnSync(cmd, [...args], { cwd: opts?.cwd, encoding: 'utf8' });
@@ -69,6 +69,59 @@ const verify = (evidencePath: string, head: string, cwd = work) => verifyOverlap
 });
 
 describe('OVERLAP-EVIDENCE-BASE-WINDOW — real git', () => {
+  it('기본 HOME 원장 경로에 JSONL 행을 반복 append 한다', () => {
+    const home = mkdtempSync(join(tmpdir(), 'conflict-forecast-home-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const base = git(work, 'rev-parse', 'HEAD');
+      git(work, 'checkout', '-q', '-b', 'candidate');
+      commit(work, 'src/shared.ts', 'candidate\n');
+      const candidateHead = git(work, 'rev-parse', 'HEAD');
+      git(work, 'checkout', '-q', 'main');
+      commit(work, 'src/shared.ts', 'peer\n');
+      const peerHead = git(work, 'rev-parse', 'HEAD');
+      const forecast = () => forecastPrPushConflicts({
+        cwd: work, pr: 12, head: candidateHead, base,
+        peers: [{ pr: 13, head: peerHead, files: ['src/shared.ts'] }], run,
+      });
+
+      expect(forecast().rows).toHaveLength(1);
+      expect(forecast().rows).toHaveLength(1);
+      const path = join(home, 'elanous-hq/seat-state/OP/train-manager/conflict-forecast.jsonl');
+      const rows = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toMatchObject({ schema: 'conflict-forecast.v1', pr: 12, otherPr: 13, files: ['src/shared.ts'] });
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('forecasts overlapping PR push paths with real merge-tree and appends conflict evidence', () => {
+    const base = git(work, 'rev-parse', 'HEAD');
+    git(work, 'checkout', '-q', '-b', 'candidate');
+    commit(work, 'src/shared.ts', 'candidate\n');
+    const candidateHead = git(work, 'rev-parse', 'HEAD');
+    git(work, 'checkout', '-q', 'main');
+    commit(work, 'src/shared.ts', 'peer\n');
+    const peerHead = git(work, 'rev-parse', 'HEAD');
+    const rows: Array<Record<string, unknown>> = [];
+    const result = forecastPrPushConflicts({
+      cwd: work, pr: 12, head: candidateHead, base, owner: 'MVP-D',
+      peers: [{ pr: 13, head: peerHead, files: ['src/shared.ts'] }],
+      run: (command, args, opts) => {
+        const r = spawnSync(command, [...args], { cwd: opts?.cwd, encoding: 'utf8' });
+        return { ok: r.status === 0, out: `${r.stdout ?? ''}` };
+      },
+      now: () => new Date('2026-11-08T00:00:00.000Z'),
+      append: row => { rows.push(row); },
+    });
+    expect(result.measured).toBe(true);
+    expect(rows).toEqual([expect.objectContaining({ schema: 'conflict-forecast.v1', kind: 'pr-conflict', pr: 12, otherPr: 13, files: ['src/shared.ts'], conflict: true, owner: 'MVP-D' })]);
+  });
+
   it('accepts when every window commit is disjoint from the PR files', () => {
     const { tip, gateBase, head, evidencePath } = scenario(['docs/a.md', 'src/other.ts']);
     expect(verify(evidencePath, head)).toEqual({

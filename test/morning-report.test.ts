@@ -28,7 +28,7 @@ function stageMorningReportMocks(): void {
     registerStandaloneLogSink: async (_label: string): Promise<void> => {},
   }));
   mock.module(`${REPO_ROOT}/src/user-config.js`, () => ({
-    getUserConfig: () => ({ finance: { morningHeatmapImage: false, morningNarrative: false } }),
+    getUserConfig: () => ({ finance: {} }),
   }));
   mock.module(`${REPO_ROOT}/src/registry/discovery/config.js`, () => ({
     getFirecrawlConfig: () => ({}),

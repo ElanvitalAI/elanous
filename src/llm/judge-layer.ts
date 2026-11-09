@@ -1,5 +1,6 @@
 import { debug } from '../debug/log.js';
-import { resolveRoleLlm, type UserConfig } from '../user-config.js';
+import { resolveRoleLlm } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import type { ResolveRoleProviderFn, StreamLlmFn } from '../intake-plane/runtime-callables.js';
 
 interface JudgeReply {

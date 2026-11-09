@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-INSTALL-CONSENT-DEVICE-TS",
+  "path": "src/ux-sim/install-consent-device.ts",
+  "boundary": "Runs the real release installer consent refusal and release verify installer invocation through fake command runners; no network or installation.",
+  "deviceIds": [
+    "install-consent"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

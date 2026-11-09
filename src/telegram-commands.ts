@@ -12,7 +12,7 @@
 // the host-side CLI + dashboard.
 
 import type { TgIncoming, TgMessageStreamer } from './telegram.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import { botCommandsToTelegram } from './bots/command-surface.js';
 import { SLASH_COMMANDS, type SlashCommand } from './chat/index.js';
 import { FEATURE_MATURITY, type Maturity } from './maturity/feature-maturity.js';

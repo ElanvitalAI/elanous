@@ -1,0 +1,8 @@
+{
+  "path": "scripts/lib/pwa-scenarios/cdp-driver.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun scripts/pwa-scenarios.ts --base-url http://127.0.0.1:31455 --shots ./shots",
+  "logsRecorded": "no",
+  "logsDetail": "Writes optional screenshots and cell output through the PWA runner; no logs.db row.",
+  "excludeReason": "Live-browser PWA runner support; not a mock device."
+}

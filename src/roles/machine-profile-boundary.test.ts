@@ -2,7 +2,9 @@ import { RUNTIME_SCC_BOUNDARY_ROOTS, runtimeSccBoundaryGraph } from '../../test/
 import { expect, test } from 'bun:test';
 
 test('machine name and profile are not in the same runtime import SCC', () => {
-  const graph = runtimeSccBoundaryGraph();
+  const machineName = 'src/roles/machine-name.ts';
+  const machineProfile = 'src/roles/machine-profile.ts';
+  const graph = runtimeSccBoundaryGraph([machineName, machineProfile]);
   const reaches = (from: string, to: string): boolean => {
     const visited = new Set([from]);
     const queue = [from];
@@ -18,8 +20,6 @@ test('machine name and profile are not in the same runtime import SCC', () => {
     return false;
   };
 
-  const machineName = 'src/roles/machine-name.ts';
-  const machineProfile = 'src/roles/machine-profile.ts';
   for (const member of [machineName, machineProfile]) expect(RUNTIME_SCC_BOUNDARY_ROOTS.has(member), `${member} is a graph root`).toBe(true);
   expect(reaches(machineName, machineProfile)).toBe(true);
   expect(reaches(machineProfile, machineName)).toBe(false);

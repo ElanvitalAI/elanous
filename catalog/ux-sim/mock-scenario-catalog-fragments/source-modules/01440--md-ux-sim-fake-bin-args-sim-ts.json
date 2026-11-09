@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-BIN-ARGS-SIM-TS",
+  "path": "src/ux-sim/fake-bin-args-sim.ts",
+  "boundary": "Simulates exact fake executable argv results, validates run-bound receipts and isolated evidence roots, and makes zero real tool or shell executions.",
+  "deviceIds": [
+    "fake-bin-args-sim"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

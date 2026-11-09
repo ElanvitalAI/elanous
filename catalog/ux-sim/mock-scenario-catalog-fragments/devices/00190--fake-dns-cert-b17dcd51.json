@@ -1,0 +1,30 @@
+{
+  "id": "fake-dns-cert",
+  "name": "Fake DNS and DNS-01 certificate device",
+  "implementation": [
+    "src/ux-sim/fake-dns-cert.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-dns-cert.test.ts"
+  ],
+  "target": "Isolated wildcard DNS zone and DNS-01 certificate issuance, failure, and renewal contracts",
+  "inputs": [
+    "relay edge target",
+    "TXT propagation delay and timeout",
+    "simulated issuance limit and CAA policy",
+    "fake-clock time"
+  ],
+  "observations": [
+    "single wildcard record and write counters",
+    "single-label wildcard matching",
+    "ACME TXT writes and certificate result",
+    "failure card and preserved certificate",
+    "renewal at the 30-day boundary"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-dns-cert.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

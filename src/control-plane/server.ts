@@ -97,6 +97,8 @@ export interface ControlServerOptions {
   allowClusterBind?: boolean;
   leaseView?: LeaseHolderView;
   requireKnownLeaseForWrites?: boolean;
+  /** Remote followers may write their local ledger, but cannot advertise themselves as an HQ lease authority. */
+  authoritativePrimary?: boolean;
 }
 
 export function startControlServer(opts: ControlServerOptions = {}): {
@@ -121,6 +123,16 @@ export function startControlServer(opts: ControlServerOptions = {}): {
         const url = new URL(req.url);
         const path = url.pathname;
         const method = req.method;
+        if (path === '/v1/primary/authorized' && method === 'GET') {
+          const authorization = req.headers.get('authorization');
+          const token = authorization?.startsWith('Bearer ') ? authorization.slice(7) : '';
+          try { if (!token || !machineForToken(token, root)) return json({ error: 'unauthorized' }, 401); }
+          catch { return json({ error: 'unauthorized' }, 401); }
+          const current = await opts.leaseView?.get({ fresh: true });
+          responseLease = current;
+          return json({ holder: current?.holder ?? null, generation: current?.generation ?? null,
+            known: current?.known ?? false, serving: opts.authoritativePrimary !== false && current?.known === true && current.iAmHolder });
+        }
         if (path === '/v1/primary' && method === 'GET') return json({
           holder: lease?.holder ?? null, generation: lease?.generation ?? null, known: lease?.known ?? false,
         });

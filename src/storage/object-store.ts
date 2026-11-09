@@ -3,7 +3,7 @@
 // 자격·서명 URL 은 관측에 싣지 않는다.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, copyFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, copyFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { dirname, join } from 'node:path';
@@ -41,6 +41,7 @@ export interface PutOptions {
 export interface ObjectStore {
   provider: StorageProvider;
   put(key: string, body: string | Uint8Array, opts?: PutOptions): void;
+  delete(key: string): void;
   get(key: string, localPath: string): void;
   head(key: string): ObjectHead;
   list(prefix: string): string[];
@@ -181,7 +182,7 @@ export function resolveBucket(cfg: StorageConfig, key: string, forcePublic = fal
   return { kind, bucket };
 }
 
-function logOp(event: 'put' | 'get' | 'failed', data: { provider: StorageProvider; bucketKind: BucketKind; key: string; ms: number }): void {
+function logOp(event: 'put' | 'get' | 'delete' | 'failed', data: { provider: StorageProvider; bucketKind: BucketKind; key: string; ms: number }): void {
   try { debug.log('storage.object', event, data); } catch { /* 관측 실패가 흐름을 막지 않는다 */ }
 }
 
@@ -235,7 +236,7 @@ export function createObjectStore(config: StorageConfig, deps: ObjectStoreDeps =
   const which = deps.which ?? ((name: string) => defaultWhich(name, deps.cliBin));
   const now = deps.now ?? Date.now;
 
-  function timed<T>(event: 'put' | 'get', kind: BucketKind, key: string, fn: () => T): T {
+  function timed<T>(event: 'put' | 'get' | 'delete', kind: BucketKind, key: string, fn: () => T): T {
     const t0 = now();
     try {
       const out = fn();
@@ -313,6 +314,31 @@ export function createObjectStore(config: StorageConfig, deps: ObjectStoreDeps =
       timed('put', kind, key, () => {
         if (config.provider === 'local') putLocal(key, body, opts);
         else putRemote(key, body, opts);
+      });
+    },
+    delete(key) {
+      const { kind, bucket } = resolveBucket(config, key);
+      timed('delete', kind, key, () => {
+        if (config.provider === 'local') {
+          rmSync(localObjectPath(config, bucket, key), { force: true });
+          return;
+        }
+        if (config.provider === 's3' || config.provider === 'r2') {
+          run(which('aws'), ['s3', 'rm', 's3://' + bucket + '/' + key, '--only-show-errors', ...awsExtra(config)], { timeoutMs: 30_000 });
+          return;
+        }
+        if (config.provider === 'gcs') {
+          run(which('gcloud'), ['storage', 'rm', 'gs://' + bucket + '/' + key], { timeoutMs: 30_000 });
+          return;
+        }
+        if (config.provider === 'azure') {
+          const account = config.azure?.account ?? '';
+          if (!account) throw new Error('azure.account 가 설정되지 않았다');
+          run(which('az'), [
+            'storage', 'blob', 'delete', '--account-name', account, '--container-name', bucket,
+            '--name', key, '--auth-mode', 'login',
+          ], { timeoutMs: 30_000 });
+        }
       });
     },
     get(key, localPath) {

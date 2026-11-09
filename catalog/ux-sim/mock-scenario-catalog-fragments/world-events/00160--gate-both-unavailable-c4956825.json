@@ -1,0 +1,5 @@
+{
+  "id": "gate-both-unavailable",
+  "name": "Gate pools unavailable",
+  "description": "Inject outages on both pools and observe production gate execution classify the sweep as unmeasured."
+}

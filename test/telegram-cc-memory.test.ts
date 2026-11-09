@@ -27,7 +27,7 @@ import {
 import { _resetTurnRunnerCachesForTests } from '../src/acp/turn-runner.js';
 import { _resetAcpSessionStoreForTests } from '../src/acp/session-store.js';
 import { _resetAcpAgentManagerForTests } from '../src/acp/agent-manager.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import type { TgIncoming } from '../src/telegram.js';
 import type { SessionMeta } from '../src/session/index.js';
 

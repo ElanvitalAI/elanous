@@ -43,6 +43,42 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     why: 'operator signal only (draw the ops area or not); false unless operator.enabled, no other data',
   },
   {
+    method: 'POST', match: 'exact', path: '/v1/members', selfVerified: true,
+    why: 'member signup starts a server-side state+PKCE Google OAuth flow; consent and code inputs are validated by member API',
+  },
+  {
+    method: 'GET', match: 'exact', path: '/v1/members', selfVerified: true,
+    why: 'member profile uses only the revocable HttpOnly member-session cookie',
+  },
+  {
+    method: 'GET', match: 'exact', path: '/v1/members/app-slot', selfVerified: true,
+    why: 'member app slot is scoped by the revocable HttpOnly member-session cookie',
+  },
+  {
+    method: 'GET', match: 'exact', path: '/v1/members/owner', selfVerified: true,
+    why: 'verified owner context is resolved from an app-bound session cookie or bearer by the member API',
+  },
+  {
+    method: 'POST', match: 'exact', path: '/v1/members/app-slot', selfVerified: true,
+    why: 'creating the one event-coded member app slot verifies its own member session',
+  },
+  {
+    method: 'POST', match: 'exact', path: '/v1/members/app-slot/session', selfVerified: true,
+    why: 'mobile owner session verifies a Google ID token against the configured native audiences and resolves subject, member, and app slot server-side',
+  },
+  {
+    method: 'DELETE', match: 'exact', path: '/v1/members', selfVerified: true,
+    why: 'member deletion request verifies and revokes its own member session',
+  },
+  {
+    method: 'POST', match: 'exact', path: '/v1/members/validate-code', selfVerified: true,
+    why: 'pre-signup referral and event code validation returns no member data',
+  },
+  {
+    method: 'GET', match: 'exact', path: '/v1/members/oauth/google/callback', selfVerified: true,
+    why: 'Google OAuth callback consumes one-use state and PKCE verifier before creating a member session',
+  },
+  {
     method: 'GET',
     match: 'exact',
     path: '/v1/nexus/connect-info',

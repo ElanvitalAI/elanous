@@ -28,6 +28,9 @@ export function useDesignCheck(opts: { enabled?: boolean } = {}) {
     queryKey: nexusKeys.designCheck(),
     queryFn: () => client.getDesignCheck(),
     enabled: opts.enabled ?? true,
+    // A missing daemon is a visible connection state, not a multi-second
+    // loading screen. The regular 30s poll still retries after transient failure.
+    retry: false,
     refetchInterval: 30_000,
   });
 }

@@ -1,0 +1,31 @@
+{
+  "id": "repo-git-maintenance",
+  "name": "Safe HQ repository maintenance simulation",
+  "implementation": [
+    "src/ux-sim/repo-maintenance.ts",
+    "src/hq/repo-maintenance.ts"
+  ],
+  "tests": [
+    "src/ux-sim/repo-maintenance.test.ts"
+  ],
+  "target": "Runs the production bare-repository maintenance path against an isolated synthetic repository view and injected external Git facts; verifies dry-run candidates, the explicit expiry transaction, live-ref preservation, six-hour maintenance policy, and pack compaction.",
+  "inputs": [
+    "synthetic origin/main and merged remote refs",
+    "open PR, queued train, active worktree, and expired train-ref facts",
+    "pack count before and after repack"
+  ],
+  "observations": [
+    "dry-run lists only expired refs as candidates",
+    "explicit expiry deletes only the expired unprotected train ref",
+    "main, open PR, queued train, and live worktree refs survive",
+    "gc.auto and maintenance.auto are disabled before measurement and packing",
+    "pack count decreases from 4471 to 4"
+  ],
+  "entryCommands": [
+    "bun scripts/ux-sim.ts --repo-maintenance",
+    "bun test src/ux-sim/repo-maintenance.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

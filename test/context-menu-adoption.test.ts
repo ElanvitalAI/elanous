@@ -32,7 +32,7 @@ import { __resetDashboardContextKeysForTests, getDashboardContextKeys } from '..
 import { createDashboardMouseWiring } from '../src/dashboard/input/mouse-wiring.js';
 import type { ActiveProviderInfo } from '../src/provider-summary.js';
 import type { ModalSurface } from '../src/display/modal-stack.js';
-import type { RotationEntry } from '../src/user-config.js';
+import type { RotationEntry } from '../src/user-config/types.js';
 import type { PillName } from '../src/status/pills.js';
 
 const PROVIDER: ActiveProviderInfo = { provider: 'anthropic', model: 'Opus 4.7' };

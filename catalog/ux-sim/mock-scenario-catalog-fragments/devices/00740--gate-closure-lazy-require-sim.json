@@ -1,0 +1,36 @@
+{
+  "id": "gate-closure-lazy-require-sim",
+  "name": "Gate lazy-require shadow radius simulation",
+  "checklistCells": [
+    "GATE-CLOSURE-LAZY-REQUIRE"
+  ],
+  "implementation": [
+    "scripts/release-loop/gate-closure.ts",
+    "scripts/release-loop/formal-receipt-radius.ts",
+    "scripts/release-loop/gate-runtime.ts",
+    "src/ux-sim/gate-closure-lazy-require-sim.ts"
+  ],
+  "tests": [
+    "src/ux-sim/gate-closure-lazy-require-sim.test.ts",
+    "src/ux-sim/gate-closure-lazy-require-cut-comparison-sim.test.ts"
+  ],
+  "target": "Prove production formal-receipt fallback consumes the measured lazy-require candidate, preserves CLI-spawn tests, surfaces omitted full-sweep failures, and fails closed to full gate on opaque closure.",
+  "inputs": [
+    "a changed lazy-require target module",
+    "a module-import-only test and a real CLI-spawn test",
+    "an opaque dynamic-require target"
+  ],
+  "observations": [
+    "the conservative current radius includes both the CLI-spawn and module-import tests",
+    "the measured candidate keeps the CLI-spawn test and removes only the require-only module-import test",
+    "an opaque dynamic require in the test preload makes the production selector fail closed to a full gate",
+    "The production formal-receipt fallback selects the measured candidate files and carries prior failure IDs; an opaque graph returns no fallback and an explicit full-gate reason."
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/gate-closure-lazy-require-sim.test.ts",
+    "bun test src/ux-sim/gate-closure-lazy-require-cut-comparison-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

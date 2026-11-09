@@ -1,6 +1,10 @@
 version-release:
   command: 'bun scripts/release-loop/version-node.ts release --json'
   timeout_ms: 1800000
+readiness-countdown:
+  command: 'bun scripts/release-loop/release-readiness.ts --image-t60-hold'
+  # Missing image readiness is a fail-closed hold, not a 24h failure; 0 disables the command timeout.
+  timeout_ms: 0
 traffic-cut-start:
   command: 'bun scripts/release-loop/traffic-node.ts traffic-cut-start'
   timeout_ms: 30000
@@ -20,6 +24,15 @@ gate:
   command: 'bun scripts/release-loop/gate-node.ts --json'
   # 4h — the Pod gate took 2h02m on 09-30 (G1f ②) and the 0.2.5 loop was cut at exactly 2h with no verdict; K9 (≤15 min) is the real fix.
   timeout_ms: 14400000
+emergency-switch:
+  command: 'bun scripts/release-loop/emergency-publish-switch-sim.ts'
+  timeout_ms: 30000
+emergency-gate:
+  command: 'bun scripts/release-loop/emergency-publish-gate-node.ts'
+  timeout_ms: 30000
+receipt-audit:
+  command: 'bun scripts/release-loop/gate-file-receipt-audit-node.ts'
+  timeout_ms: 1800000
 traffic-gate-passed:
   command: 'bun scripts/release-loop/traffic-node.ts traffic-gate-passed'
   timeout_ms: 30000
@@ -31,6 +44,9 @@ traffic-failed-restore:
   timeout_ms: 30000
 gate-triage:
   command: 'bun scripts/release-loop/gate-triage-node.ts'
+  timeout_ms: 60000
+gate-skip-by-evidence:
+  command: 'bun scripts/release-loop/gate-skip-by-evidence-node.ts'
   timeout_ms: 60000
 mac-smoke:
   command: 'bun scripts/release-loop/mac-smoke-node.ts'
@@ -108,6 +124,9 @@ rla-release-autostart:
 rla-train-worker-restart:
   command: 'bun scripts/release-loop/hand-response-node.ts rla-train-worker-restart'
   timeout_ms: 30000
+cut-append:
+  command: 'bun scripts/release-loop/hand-response-node.ts cut-append'
+  timeout_ms: 1800000
 rla-release-recover:
   command: 'bun scripts/release-loop/hand-response-node.ts rla-release-recover'
   timeout_ms: 1800000

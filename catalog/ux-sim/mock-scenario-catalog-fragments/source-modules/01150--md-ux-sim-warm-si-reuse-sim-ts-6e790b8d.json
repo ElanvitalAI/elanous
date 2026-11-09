@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-WARM-SI-REUSE-SIM-TS",
+  "path": "src/ux-sim/warm-si-reuse-sim.ts",
+  "boundary": "Runs the production SI warm provider and child cleanup/return chain against an isolated primary lease API, fake Kubernetes and a simulated fixed-runner boundary.",
+  "deviceIds": [
+    "warm-si-reuse-sim"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

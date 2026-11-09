@@ -466,10 +466,12 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     const first = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'),
       { input: { version: '0.2.18', previousVersion: '0.2.17', gatePodPool: 'pool', branchCut: true }, deps: { root: state, runBash } });
     expect(first.status).toBe('failed');
-    expect(first.path.slice(0, 6)).toEqual(['version-release', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'gate-triage']);
+    expect(first.path.slice(0, 8)).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
+      'pre-gate-join', 'gate', 'emergency-switch', 'gate-triage']);
     const cut = git(f.origin, 'rev-parse', 'release/0.2.18');
-    expect(seen.map((item) => item.nodeId)).toEqual(['traffic-cut-start', 'cutoff', 'checklist-gate', 'prefetch', 'gate', 'gate-triage', 'traffic-failed-restore']);
-    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut, cut, cut, cut]);
+    expect(seen.map((item) => item.nodeId)).toEqual(['readiness-countdown', 'traffic-cut-start', 'cutoff', 'checklist-gate',
+      'prefetch', 'gate', 'emergency-switch', 'gate-triage', 'traffic-failed-restore']);
+    expect(seen.map((item) => item.commit)).toEqual([cut, cut, cut, cut, cut, cut, cut, cut, cut]);
     const fix = f.land('fix.ts', 'export const fix = true;\n');
     const base = git(f.origin, 'rev-parse', `${cut}^`);
     cutReleaseBranch({ version: '0.2.18', base, pick: [fix], append: true, repoRoot: f.repo, log: () => {} });
@@ -553,6 +555,8 @@ test('RELEASE-POSTPUB: a wrongly saved post-gate binding is rejected before any 
     const recipes = readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8');
     writeFileSync(graphPath, graph);
     writeFileSync(recipePath, recipes);
+    for (const file of ['plugin.json', 'release-graph.schema.yaml', 'release-edge-vocabulary.yaml', 'release-gate-domain-pack.yaml'])
+      copyFileSync(join(import.meta.dir, '../../graphs/release', file), join(releaseDir, file));
     let childCalls = 0;
     const runBash = async () => { childCalls++; return { exitCode: 1, stdout: '{"outcome":"fail"}\n', stderr: '' }; };
     const { runGraph } = await import('../../src/graph-runner/runner.js');

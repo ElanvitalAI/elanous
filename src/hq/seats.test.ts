@@ -1,15 +1,20 @@
-import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, expect, spyOn, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { hqSeat, hqWork } from './seats.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 
 let temp: string;
 let home: string;
 let remote: string;
 let seed: string;
+let fixtureTemplate: string;
+// Bun executes this suite serially; this queue also prevents two in-process CLI calls here from
+// overlapping while they temporarily own process.cwd() and HOME. Do not mark these cases concurrent.
+let inProcessTurn: Promise<void> = Promise.resolve();
 let debugCleanups: (() => void)[] = [];
 const cli = join(import.meta.dir, '../../bin/elanous.mjs');
 function command(bin: string, args: string[], cwd = temp, env: NodeJS.ProcessEnv = process.env) {
@@ -23,12 +28,28 @@ function git(args: string[], cwd = temp): string {
   expect(r.status, `${args.join(' ')}: ${r.stderr}`).toBe(0);
   return r.stdout.trim();
 }
-function hq(...args: string[]) {
-  return command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', ...args], temp, { ...process.env, HOME: home,
-    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+async function inProcess(args: string[], cwd = seed, stateRoot = join(home, 'test-state')) {
+  const turn = inProcessTurn;
+  let release!: () => void;
+  inProcessTurn = new Promise<void>((resolve) => { release = resolve; });
+  await turn;
+  try {
+    const result = await simCli(args, {
+      cwd,
+      stateRoot,
+      env: { HOME: home },
+      allowPaths: [['hq', 'init'], ['hq', 'seat'], ['hq', 'work', 'new'], ['hq', 'work', 'done'], ['hq', 'lease'], ['hq', 'fence'], ['hq', 'fence-wrapper'], ['hq', 'fence-audit']],
+    });
+    return { status: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+  } finally {
+    release();
+  }
 }
-// The CLI child writes observations to its own log file; in-process hqSeat calls are captured
-// through a registered sink instead. The diet guard is disabled for the window: one event must stay one event.
+function hq(...args: string[]) { return inProcess(['hq', ...args], temp); }
+function initInProcess(cwd = seed, ...args: string[]) { return inProcess(['hq', 'init', ...args], cwd); }
+function initProjectTest(cwd = seed) { return inProcess(['hq', 'init'], cwd, join(cwd, '.elanous-test')); }
+// hqSeat emits the refresh skip through the registered debug sink. The diet guard is disabled
+// for this window so one decision remains one event.
 function captureRefreshSkipped(): { events: () => { category: string; event: string; data?: unknown }[]; unregister: () => void } {
   const seen: { category: string; event: string; data?: unknown }[] = [];
   const previousGuard = debug.setLogDietGuard(null);
@@ -40,6 +61,10 @@ function captureRefreshSkipped(): { events: () => { category: string; event: str
     events: () => seen.filter(e => e.category === 'hq.seat' && e.event === 'refresh-skipped'),
     unregister: () => { debug.setLogDietGuard(previousGuard); unregisterSink(); },
   };
+}
+function fixtureGit(cwd: string, args: string[]): void {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } });
+  if (result.status !== 0) throw new Error(`fixture git ${args.join(' ')} failed: ${result.stderr}`);
 }
 function captureRemoteOperations(): { events: () => { category: string; event: string; data?: unknown }[]; unregister: () => void } {
   const seen: { category: string; event: string; data?: unknown }[] = [];
@@ -55,30 +80,36 @@ function captureRemoteOperations(): { events: () => { category: string; event: s
     unregister,
   };
 }
-function fixture() {
-  remote = join(temp, 'remote.git');
-  seed = join(temp, 'seed');
-  git(['init', '--bare', remote]);
-  git(['init', '-b', 'main', seed]);
-  git(['config', 'user.name', 'Fixture'], seed);
-  git(['config', 'user.email', 'fixture@example.test'], seed);
-  writeFileSync(join(seed, 'README'), 'base\n');
-  git(['add', 'README'], seed);
-  git(['commit', '-m', 'base'], seed);
-  git(['remote', 'add', 'origin', remote], seed);
-  git(['push', '-u', 'origin', 'main'], seed);
-}
+beforeAll(() => {
+  fixtureTemplate = mkdtempSync(join(tmpdir(), 'hq-seats-template-'));
+  const templateRemote = join(fixtureTemplate, 'remote.git');
+  const templateSeed = join(fixtureTemplate, 'seed');
+  fixtureGit(fixtureTemplate, ['init', '--bare', templateRemote]);
+  fixtureGit(fixtureTemplate, ['init', '-b', 'main', templateSeed]);
+  fixtureGit(templateSeed, ['config', 'user.name', 'Fixture']);
+  fixtureGit(templateSeed, ['config', 'user.email', 'fixture@example.test']);
+  writeFileSync(join(templateSeed, 'README'), 'base\n');
+  fixtureGit(templateSeed, ['add', 'README']);
+  fixtureGit(templateSeed, ['commit', '-m', 'base']);
+  fixtureGit(templateSeed, ['remote', 'add', 'origin', '../remote.git']);
+  fixtureGit(templateSeed, ['push', '-u', 'origin', 'main']);
+});
+afterAll(() => { if (fixtureTemplate) rmSync(fixtureTemplate, { recursive: true, force: true }); });
+
 beforeEach(() => {
   debugCleanups = [];
   // Real path: macOS tmpdir is a /var symlink, and house.json records resolved paths.
   temp = realpathSync(mkdtempSync(join(tmpdir(), 'hq-seats-')));
   home = join(temp, 'home');
   mkdirSync(home);
-  // In-process hqSeat/hqWork spawns inherit process.env: isolate them from the pod's global
+  // In-process CLI Git calls inherit process.env: isolate them from the pod's global
   // gitconfig too (its core.hooksPath override would silence fixture hooks, incl. post-checkout).
   process.env.GIT_CONFIG_NOSYSTEM = '1';
   process.env.GIT_CONFIG_GLOBAL = join(temp, 'empty-gitconfig');
-  fixture();
+  remote = join(temp, 'remote.git');
+  seed = join(temp, 'seed');
+  cpSync(join(fixtureTemplate, 'remote.git'), remote, { recursive: true });
+  cpSync(join(fixtureTemplate, 'seed'), seed, { recursive: true });
 });
 afterEach(() => {
   for (const cleanup of debugCleanups.reverse()) cleanup();
@@ -87,7 +118,7 @@ afterEach(() => {
   rmSync(temp, { recursive: true, force: true });
 }, 120_000);
 
-test('empty HOME: init → seat → work new → merge into bare remote → done, with premerge refusal', () => {
+test('empty HOME: init → seat → work new → merge into bare remote → done, with premerge refusal', async () => {
   const root = join(home, 'elanous-hq');
   // init reads the source remote of the invoking checkout; this fixture invokes from a local seed checkout.
   const actualHouse = join(home, 'configured-house');
@@ -107,10 +138,10 @@ test('empty HOME: init → seat → work new → merge into bare remote → done
     { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
   expect(again.status, again.stderr).toBe(0);
   expect(again.stdout).toContain('already exists');
-  expect(hq('seat', 'TC').status).toBe(0);
+  expect((await hq('seat', 'TC')).status).toBe(0);
   const seat = join(root, 'seats', 'TC');
   expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], seat)).toBe('HEAD');
-  expect(hq('seat', 'TC', '--refresh').status).toBe(0);
+  expect((await hq('seat', 'TC', '--refresh')).status).toBe(0);
   // Seats are disposable: a seat folder deleted by hand is recreated by the same command.
   rmSync(seat, { recursive: true, force: true });
   // The remote moved on since the last fetch: a newly created seat must start from the new origin/main.
@@ -118,12 +149,12 @@ test('empty HOME: init → seat → work new → merge into bare remote → done
   git(['add', 'ahead'], seed);
   git(['commit', '-m', 'ahead'], seed);
   git(['push', 'origin', 'main'], seed);
-  const recreated = hq('seat', 'TC');
+  const recreated = await hq('seat', 'TC');
   expect(recreated.status, recreated.stderr).toBe(0);
   expect(recreated.stdout).toContain('created');
   expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], seat)).toBe('HEAD');
   expect(git(['rev-parse', 'HEAD'], seat)).toBe(git(['rev-parse', 'HEAD'], seed));
-  expect(hq('work', 'new', 'TC', 'fix1').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'fix1')).status).toBe(0);
   const work = join(root, 'work', 'TC-fix1');
   const ledger = JSON.parse(readFileSync(join(root, 'house.json'), 'utf8'));
   expect(ledger.home).toEqual({ kind: 'home', path: actualHouse, source: 'cli-resolved' });
@@ -137,7 +168,7 @@ test('empty HOME: init → seat → work new → merge into bare remote → done
   writeFileSync(join(work, 'fix'), 'fixed\n');
   git(['add', 'fix'], work);
   git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'fix1'], work);
-  const refused = hq('work', 'done', 'TC', 'fix1');
+  const refused = await hq('work', 'done', 'TC', 'fix1');
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain('not merged');
   expect(existsSync(work)).toBe(true);
@@ -145,11 +176,11 @@ test('empty HOME: init → seat → work new → merge into bare remote → done
   git(['fetch', 'hq-work', 'work/TC-fix1'], seed);
   git(['merge', '--ff-only', 'FETCH_HEAD'], seed);
   git(['push', 'origin', 'main'], seed);
-  const done = hq('work', 'done', 'TC', 'fix1');
+  const done = await hq('work', 'done', 'TC', 'fix1');
   expect(done.status, done.stderr).toBe(0);
   expect(existsSync(work)).toBe(false);
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes).toEqual({});
-  expect(hq('seat', 'TC', '--refresh').status).toBe(0);
+  expect((await hq('seat', 'TC', '--refresh')).status).toBe(0);
   expect(git(['rev-parse', 'HEAD'], seat)).toBe(git(['rev-parse', 'HEAD'], seed));
   // The printed cron command itself, run with cron's minimal environment, fetches and advances the seat.
   writeFileSync(join(seed, 'cron'), 'cron\n');
@@ -162,12 +193,11 @@ test('empty HOME: init → seat → work new → merge into bare remote → done
   expect(git(['rev-parse', 'HEAD'], seat)).toBe(git(['rev-parse', 'HEAD'], seed));
 }, 120_000);
 
-test('work done accepts a clean squash-landed tip with a nonempty changed-file list', () => {
+test('work done accepts a clean squash-landed tip with a nonempty changed-file list', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'squash').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'squash')).status).toBe(0);
   const work = join(root, 'work', 'TC-squash');
   writeFileSync(join(work, 'squashed'), 'landed\n');
   git(['add', 'squashed'], work);
@@ -179,18 +209,17 @@ test('work done accepts a clean squash-landed tip with a nonempty changed-file l
   git(['commit', '-m', 'squash landed'], seed);
   git(['push', 'origin', 'main'], seed);
   expect(git(['rev-parse', 'HEAD'], seed)).not.toBe(tip);
-  const done = hq('work', 'done', 'TC', 'squash');
+  const done = await hq('work', 'done', 'TC', 'squash');
   expect(done.status, done.stderr).toBe(0);
   expect(existsSync(work)).toBe(false);
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeUndefined();
 }, 120_000);
 
-test('work done reclaims a squash landed before main subsequently edits the same path', () => {
+test('work done reclaims a squash landed before main subsequently edits the same path', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'older-squash').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'older-squash')).status).toBe(0);
   const work = join(root, 'work', 'TC-older-squash');
   writeFileSync(join(work, 'feature'), 'landed\n');
   git(['add', 'feature'], work);
@@ -202,18 +231,17 @@ test('work done reclaims a squash landed before main subsequently edits the same
   git(['add', 'feature'], seed);
   git(['commit', '-m', 'later edit'], seed);
   git(['push', 'origin', 'main'], seed);
-  const done = hq('work', 'done', 'TC', 'older-squash');
+  const done = await hq('work', 'done', 'TC', 'older-squash');
   expect(done.status, done.stderr).toBe(0);
   expect(existsSync(work)).toBe(false);
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes).toEqual({});
 }, 120_000);
 
-test('work done refuses paths matching main at different times but never together', () => {
+test('work done refuses paths matching main at different times but never together', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'partial').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'partial')).status).toBe(0);
   const work = join(root, 'work', 'TC-partial');
   writeFileSync(join(work, 'first'), 'a\n');
   writeFileSync(join(work, 'second'), 'b\n');
@@ -228,7 +256,7 @@ test('work done refuses paths matching main at different times but never togethe
   git(['add', 'first', 'second'], seed);
   git(['commit', '-m', 'only second'], seed);
   git(['push', 'origin', 'main'], seed);
-  const refused = hq('work', 'done', 'TC', 'partial');
+  const refused = await hq('work', 'done', 'TC', 'partial');
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain('not merged');
   expect(existsSync(work)).toBe(true);
@@ -236,12 +264,11 @@ test('work done refuses paths matching main at different times but never togethe
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
 }, 120_000);
 
-test('work done reclaims a detached landed PR head differing from the registered work branch', () => {
+test('work done reclaims a detached landed PR head differing from the registered work branch', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'pr-head').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'pr-head')).status).toBe(0);
   const work = join(root, 'work', 'TC-pr-head');
   const ownTip = git(['rev-parse', 'HEAD'], work);
   git(['switch', '-c', 'work/TC-pr-head-from-pr'], work);
@@ -254,7 +281,7 @@ test('work done reclaims a detached landed PR head differing from the registered
   git(['add', 'feature'], seed);
   git(['commit', '-m', 'squash landed'], seed);
   git(['push', 'origin', 'main'], seed);
-  const done = hq('work', 'done', 'TC', 'pr-head');
+  const done = await hq('work', 'done', 'TC', 'pr-head');
   expect(done.status, done.stderr).toBe(0);
   expect(existsSync(work)).toBe(false);
   expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-pr-head-from-pr'])).toBe(head);
@@ -263,12 +290,11 @@ test('work done reclaims a detached landed PR head differing from the registered
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes).toEqual({});
 }, 120_000);
 
-test('work done restores a detached landed head if removal is blocked by an index lock', () => {
+test('work done restores a detached landed head if removal is blocked by an index lock', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'detached-busy').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'detached-busy')).status).toBe(0);
   const work = join(root, 'work', 'TC-detached-busy');
   const ownTip = git(['rev-parse', 'HEAD'], work);
   git(['checkout', '--detach'], work);
@@ -282,7 +308,7 @@ test('work done restores a detached landed head if removal is blocked by an inde
   git(['push', 'origin', 'main'], seed);
   const lock = join(git(['rev-parse', '--absolute-git-dir'], work), 'index.lock');
   writeFileSync(lock, '');
-  const refused = hq('work', 'done', 'TC', 'detached-busy');
+  const refused = await hq('work', 'done', 'TC', 'detached-busy');
   rmSync(lock);
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain('index.lock');
@@ -291,16 +317,15 @@ test('work done restores a detached landed head if removal is blocked by an inde
   expect(command('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], work).status).toBe(1);
   expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-detached-busy'])).toBe(ownTip);
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toEqual({ kind: 'sandbox', path: join(work, '.elanous-test'), owner: 'TC' });
-  expect(hq('work', 'done', 'TC', 'detached-busy').status).toBe(0);
+  expect((await hq('work', 'done', 'TC', 'detached-busy')).status).toBe(0);
   expect(existsSync(work)).toBe(false);
 }, 120_000);
 
-test('work done refuses an unlanded detached PR head even when the registered branch landed', () => {
+test('work done refuses an unlanded detached PR head even when the registered branch landed', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'unfinished-head').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'unfinished-head')).status).toBe(0);
   const work = join(root, 'work', 'TC-unfinished-head');
   const ownTip = git(['rev-parse', 'HEAD'], work);
   git(['switch', '--detach'], work);
@@ -308,7 +333,7 @@ test('work done refuses an unlanded detached PR head even when the registered br
   git(['add', 'unfinished'], work);
   git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'unfinished'], work);
   const head = git(['rev-parse', 'HEAD'], work);
-  const refused = hq('work', 'done', 'TC', 'unfinished-head');
+  const refused = await hq('work', 'done', 'TC', 'unfinished-head');
   expect(refused.status).toBe(1);
   expect(existsSync(work)).toBe(true);
   expect(git(['rev-parse', 'HEAD'], work)).toBe(head);
@@ -316,12 +341,11 @@ test('work done refuses an unlanded detached PR head even when the registered br
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
 }, 120_000);
 
-test('work done keeps a worktree whose different attached branch has an unlanded current tip', () => {
+test('work done keeps a worktree whose different attached branch has an unlanded current tip', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'switched').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'switched')).status).toBe(0);
   const work = join(root, 'work', 'TC-switched');
   writeFileSync(join(work, 'landed'), 'landed\n');
   git(['add', 'landed'], work);
@@ -336,7 +360,7 @@ test('work done keeps a worktree whose different attached branch has an unlanded
   git(['add', 'not-landed'], work);
   git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'unfinished'], work);
   const currentTip = git(['rev-parse', 'HEAD'], work);
-  const refused = hq('work', 'done', 'TC', 'switched');
+  const refused = await hq('work', 'done', 'TC', 'switched');
   expect(refused.status).toBe(1);
   expect(existsSync(work)).toBe(true);
   expect(git(['symbolic-ref', '--short', 'HEAD'], work)).toBe('work/TC-different');
@@ -345,12 +369,11 @@ test('work done keeps a worktree whose different attached branch has an unlanded
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
 }, 120_000);
 
-test('work done keeps an unlanded registered tip even if a different attached tip landed', () => {
+test('work done keeps an unlanded registered tip even if a different attached tip landed', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'own-unlanded').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'own-unlanded')).status).toBe(0);
   const work = join(root, 'work', 'TC-own-unlanded');
   writeFileSync(join(work, 'unfinished'), 'keep this branch\n');
   git(['add', 'unfinished'], work);
@@ -365,7 +388,7 @@ test('work done keeps an unlanded registered tip even if a different attached ti
   git(['add', 'finished'], seed);
   git(['commit', '-m', 'squash finished'], seed);
   git(['push', 'origin', 'main'], seed);
-  const refused = hq('work', 'done', 'TC', 'own-unlanded');
+  const refused = await hq('work', 'done', 'TC', 'own-unlanded');
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain('not merged');
   expect(existsSync(work)).toBe(true);
@@ -375,12 +398,11 @@ test('work done keeps an unlanded registered tip even if a different attached ti
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
 }, 120_000);
 
-test('work done on a different attached branch proves its tip and preserves that branch', () => {
+test('work done on a different attached branch proves its tip and preserves that branch', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'switched-done').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'switched-done')).status).toBe(0);
   const work = join(root, 'work', 'TC-switched-done');
   const originalTip = git(['rev-parse', 'HEAD'], work);
   git(['switch', '-c', 'work/TC-landed'], work);
@@ -392,7 +414,7 @@ test('work done on a different attached branch proves its tip and preserves that
   git(['add', 'landed'], seed);
   git(['commit', '-m', 'squashed tip'], seed);
   git(['push', 'origin', 'main'], seed);
-  const done = hq('work', 'done', 'TC', 'switched-done');
+  const done = await hq('work', 'done', 'TC', 'switched-done');
   expect(done.status, done.stderr).toBe(0);
   expect(existsSync(work)).toBe(false);
   expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-landed'])).toBe(currentTip);
@@ -401,12 +423,11 @@ test('work done on a different attached branch proves its tip and preserves that
   expect(currentTip).not.toBe(originalTip);
 }, 120_000);
 
-test('work done keeps a different attached branch when checkout is blocked by its work lock', () => {
+test('work done keeps a different attached branch when checkout is blocked by its work lock', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'other-busy').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'other-busy')).status).toBe(0);
   const work = join(root, 'work', 'TC-other-busy');
   const ownTip = git(['rev-parse', 'HEAD'], work);
   git(['switch', '-c', 'work/TC-other-busy-tip'], work);
@@ -420,7 +441,7 @@ test('work done keeps a different attached branch when checkout is blocked by it
   git(['push', 'origin', 'main'], seed);
   const lock = join(git(['rev-parse', '--absolute-git-dir'], work), 'index.lock');
   writeFileSync(lock, '');
-  const refused = hq('work', 'done', 'TC', 'other-busy');
+  const refused = await hq('work', 'done', 'TC', 'other-busy');
   rmSync(lock);
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain('index.lock');
@@ -431,12 +452,11 @@ test('work done keeps a different attached branch when checkout is blocked by it
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
 }, 120_000);
 
-test('work done resumes an interrupted different-branch removal using the recorded checkout tip', () => {
+test('work done resumes an interrupted different-branch removal using the recorded checkout tip', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'resume-switched').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'resume-switched')).status).toBe(0);
   const work = join(root, 'work', 'TC-resume-switched');
   const ownTip = git(['rev-parse', 'HEAD'], work);
   git(['switch', '-c', 'work/TC-resume-landed'], work);
@@ -454,19 +474,18 @@ test('work done resumes an interrupted different-branch removal using the record
     checkoutBranch: 'work/TC-resume-landed', checkoutTip };
   writeFileSync(ledgerFile, JSON.stringify(ledger));
   git(['checkout', '--quiet', '--detach'], work);
-  const resumed = hq('work', 'done', 'TC', 'resume-switched');
+  const resumed = await hq('work', 'done', 'TC', 'resume-switched');
   expect(resumed.status, resumed.stderr).toBe(0);
   expect(existsSync(work)).toBe(false);
   expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', 'refs/heads/work/TC-resume-landed'])).toBe(checkoutTip);
   expect(JSON.parse(readFileSync(ledgerFile, 'utf8')).sandboxes[work]).toBeUndefined();
 }, 120_000);
 
-test('work done refuses an empty changed-file list when main moves past an empty work commit', () => {
+test('work done refuses an empty changed-file list when main moves past an empty work commit', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'empty').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'empty')).status).toBe(0);
   const work = join(root, 'work', 'TC-empty');
   git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-m', 'empty'], work);
   const tip = git(['rev-parse', 'HEAD'], work);
@@ -474,7 +493,7 @@ test('work done refuses an empty changed-file list when main moves past an empty
   git(['add', 'main-only'], seed);
   git(['commit', '-m', 'advance main'], seed);
   git(['push', 'origin', 'main'], seed);
-  const refused = hq('work', 'done', 'TC', 'empty');
+  const refused = await hq('work', 'done', 'TC', 'empty');
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain('not merged');
   expect(existsSync(work)).toBe(true);
@@ -482,12 +501,11 @@ test('work done refuses an empty changed-file list when main moves past an empty
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
 }, 120_000);
 
-test('work done rejects a clean unlanded change despite equal unrelated paths and keeps branch and ledger', () => {
+test('work done rejects a clean unlanded change despite equal unrelated paths and keeps branch and ledger', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'unlanded').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'unlanded')).status).toBe(0);
   const work = join(root, 'work', 'TC-unlanded');
   writeFileSync(join(work, 'missing'), 'not landed\n');
   git(['add', 'missing'], work);
@@ -497,7 +515,7 @@ test('work done rejects a clean unlanded change despite equal unrelated paths an
   git(['add', 'unrelated'], seed);
   git(['commit', '-m', 'unrelated'], seed);
   git(['push', 'origin', 'main'], seed);
-  const refused = hq('work', 'done', 'TC', 'unlanded');
+  const refused = await hq('work', 'done', 'TC', 'unlanded');
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain('not merged');
   expect(existsSync(work)).toBe(true);
@@ -506,12 +524,11 @@ test('work done rejects a clean unlanded change despite equal unrelated paths an
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
 }, 120_000);
 
-test('work done refuses a branch that gained an unmerged commit after its merge, keeping work and branch', () => {
+test('work done refuses a branch that gained an unmerged commit after its merge, keeping work and branch', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'late').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'late')).status).toBe(0);
   const work = join(root, 'work', 'TC-late');
   const commit = (file: string) => {
     writeFileSync(join(work, file), `${file}\n`);
@@ -525,7 +542,7 @@ test('work done refuses a branch that gained an unmerged commit after its merge,
   git(['push', 'origin', 'main'], seed);
   commit('unmerged');
   const tip = git(['rev-parse', 'HEAD'], work);
-  const refused = hq('work', 'done', 'TC', 'late');
+  const refused = await hq('work', 'done', 'TC', 'late');
   expect(refused.status).toBe(1);
   expect(refused.stderr).toContain('not merged');
   expect(existsSync(work)).toBe(true);
@@ -533,10 +550,9 @@ test('work done refuses a branch that gained an unmerged commit after its merge,
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
 }, 120_000);
 
-test('failed ledger saves roll back work new and done, and done reconciles a vanished registered work', () => {
+test('failed ledger saves roll back work new and done, and done reconciles a vanished registered work', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const bare = join(root, 'repo.git');
   const work = join(root, 'work', 'TC-retry');
@@ -631,33 +647,31 @@ test('failed ledger saves roll back work new and done, and done reconciles a van
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[orphan]).toBeDefined();
 }, 120_000);
 
-test('work done refuses a merged worktree that hq work new did not register', () => {
+test('work done refuses a merged worktree that hq work new did not register', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const manual = join(root, 'work', 'TC-manual');
   git(['--git-dir', join(root, 'repo.git'), 'worktree', 'add', '-b', 'work/TC-manual', manual, 'refs/remotes/origin/main']);
-  const result = hq('work', 'done', 'TC', 'manual');
+  const result = await hq('work', 'done', 'TC', 'manual');
   expect(result.status).toBe(1);
   expect(result.stderr).toContain('not registered in house.json');
   expect(existsSync(manual)).toBe(true);
   expect(git(['symbolic-ref', '--short', 'HEAD'], manual)).toBe('work/TC-manual');
 }, 120_000);
 
-test('work done removes nothing when the branch gains a commit after the merge check', () => {
+test('work done removes nothing when the branch gains a commit after the merge check', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'race').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'race')).status).toBe(0);
   const work = join(root, 'work', 'TC-race');
   const bare = join(root, 'repo.git');
   // done detaches the work after its merge check; this hook lands a racing commit on the branch at that moment.
   const hook = join(bare, 'hooks', 'post-checkout');
   writeFileSync(hook, '#!/bin/sh\nc=$(git -c user.name=Race -c user.email=race@example.test commit-tree "HEAD^{tree}" -p HEAD -m race) && git update-ref refs/heads/work/TC-race "$c"\n');
   chmodSync(hook, 0o755);
-  const result = hq('work', 'done', 'TC', 'race');
+  const result = await hq('work', 'done', 'TC', 'race');
   rmSync(hook);
   expect(result.status).toBe(1);
   expect(result.stderr).toContain('work branch moved after the merge check');
@@ -668,30 +682,28 @@ test('work done removes nothing when the branch gains a commit after the merge c
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
 }, 120_000);
 
-test('work done removes nothing while another git process holds the work lock', () => {
+test('work done removes nothing while another git process holds the work lock', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'busy').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'busy')).status).toBe(0);
   const work = join(root, 'work', 'TC-busy');
   const lock = join(git(['rev-parse', '--absolute-git-dir'], work), 'index.lock');
   writeFileSync(lock, '');
-  const result = hq('work', 'done', 'TC', 'busy');
+  const result = await hq('work', 'done', 'TC', 'busy');
   rmSync(lock);
   expect(result.status).toBe(1);
   expect(existsSync(work)).toBe(true);
   expect(git(['symbolic-ref', '--short', 'HEAD'], work)).toBe('work/TC-busy');
   expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', '--verify', 'refs/heads/work/TC-busy'])).not.toBe('');
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).sandboxes[work]).toBeDefined();
-  expect(hq('work', 'done', 'TC', 'busy').status).toBe(0);
+  expect((await hq('work', 'done', 'TC', 'busy')).status).toBe(0);
   expect(existsSync(work)).toBe(false);
 }, 120_000);
 
-test('work done resumes from each interrupted removal state (states built by hand, not by killing a process)', () => {
+test('work done resumes from each interrupted removal state (states built by hand, not by killing a process)', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const bare = join(root, 'repo.git');
   const ledgerFile = join(root, 'house.json');
@@ -701,7 +713,7 @@ test('work done resumes from each interrupted removal state (states built by han
     writeFileSync(ledgerFile, JSON.stringify(ledger));
   };
   // ① killed after the branch was deleted, before the worktree was removed (its locks left behind by a dead pid).
-  expect(hq('work', 'new', 'TC', 'killed1').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'killed1')).status).toBe(0);
   const first = join(root, 'work', 'TC-killed1');
   const tip1 = git(['rev-parse', 'HEAD'], first);
   record(first, tip1);
@@ -710,40 +722,39 @@ test('work done resumes from each interrupted removal state (states built by han
   const admin = git(['rev-parse', '--absolute-git-dir'], first);
   for (const name of ['HEAD.lock', 'index.lock']) writeFileSync(join(admin, name), 'hq-done 2147483646\n');
   // Locks left by the stopped done are never removed automatically; the error names them and nothing changes.
-  const blocked = hq('work', 'done', 'TC', 'killed1');
+  const blocked = await hq('work', 'done', 'TC', 'killed1');
   expect(blocked.status).toBe(1);
   expect(blocked.stderr).toContain('stale lock from a stopped hq work done (pid 2147483646)');
   expect(existsSync(first)).toBe(true);
   for (const name of ['HEAD.lock', 'index.lock']) rmSync(join(admin, name));
-  const resumed = hq('work', 'done', 'TC', 'killed1');
+  const resumed = await hq('work', 'done', 'TC', 'killed1');
   expect(resumed.status, resumed.stderr).toBe(0);
   expect(existsSync(first)).toBe(false);
   expect(JSON.parse(readFileSync(ledgerFile, 'utf8')).sandboxes[first]).toBeUndefined();
   // ⓪ stopped right after detaching, before the branch delete: branch still at the recorded tip.
-  expect(hq('work', 'new', 'TC', 'killed0').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'killed0')).status).toBe(0);
   const zeroth = join(root, 'work', 'TC-killed0');
   record(zeroth, git(['rev-parse', 'HEAD'], zeroth));
   git(['checkout', '--quiet', '--detach'], zeroth);
-  const resumed0 = hq('work', 'done', 'TC', 'killed0');
+  const resumed0 = await hq('work', 'done', 'TC', 'killed0');
   expect(resumed0.status, resumed0.stderr).toBe(0);
   expect(existsSync(zeroth)).toBe(false);
   expect(spawnSync('git', ['--git-dir', bare, 'rev-parse', '--verify', '--quiet', 'refs/heads/work/TC-killed0']).status).toBe(1);
   // ② killed after the worktree was removed, before the registration was dropped.
-  expect(hq('work', 'new', 'TC', 'killed2').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'killed2')).status).toBe(0);
   const second = join(root, 'work', 'TC-killed2');
   const tip2 = git(['rev-parse', 'HEAD'], second);
   record(second, tip2);
   git(['--git-dir', bare, 'worktree', 'remove', '--force', second]);
   git(['--git-dir', bare, 'update-ref', '-d', 'refs/heads/work/TC-killed2', tip2]);
-  const reconciled = hq('work', 'done', 'TC', 'killed2');
+  const reconciled = await hq('work', 'done', 'TC', 'killed2');
   expect(reconciled.status, reconciled.stderr).toBe(0);
   expect(JSON.parse(readFileSync(ledgerFile, 'utf8')).sandboxes).toEqual({});
 }, 120_000);
 
 test('parallel work new retains both roles in house.json across processes', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const lock = join(root, 'house.json.lock');
   mkdirSync(lock);
@@ -823,14 +834,22 @@ test('concurrent init with different homes registers exactly one home under the 
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).home.path).toBe(winners[0]);
 }, 120_000);
 
-test('init resolves a relative local origin against the calling checkout', () => {
+test('init resolves a relative local origin against the calling checkout', async () => {
   const root = join(home, 'elanous-hq');
   git(['remote', 'set-url', 'origin', '../remote.git'], seed);
   // From a subdirectory: git resolves the relative origin from the checkout's top level, and so must init.
   mkdirSync(join(seed, 'sub'));
   git(['fetch', 'origin'], join(seed, 'sub'));
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], join(seed, 'sub'),
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(join(seed, 'sub'));
+  expect(init.status, init.stderr).toBe(0);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'remote', 'get-url', 'origin'])).toBe(remote);
+  expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', '--verify', 'refs/remotes/origin/main'])).toBe(git(['rev-parse', 'HEAD'], seed));
+}, 120_000);
+
+test('init preserves an absolute local origin', async () => {
+  const root = join(home, 'elanous-hq');
+  git(['remote', 'set-url', 'origin', remote], seed);
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   expect(git(['--git-dir', join(root, 'repo.git'), 'remote', 'get-url', 'origin'])).toBe(remote);
   expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', '--verify', 'refs/remotes/origin/main'])).toBe(git(['rev-parse', 'HEAD'], seed));
@@ -852,19 +871,17 @@ test('init refuses a different resolved home without changing the house ledger',
   expect(readFileSync(join(root, 'house.json'), 'utf8')).toBe(registered);
 }, 120_000);
 
-test('failed initial fetch can be retried after the bare remote becomes available', () => {
+test('failed initial fetch can be retried after the bare remote becomes available', async () => {
   const root = join(home, 'elanous-hq');
   const missing = join(temp, 'remote-temporarily-unavailable.git');
   git(['remote', 'set-url', 'origin', missing], seed);
-  const first = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const first = await initInProcess(seed);
   expect(first.status).toBe(1);
   expect(first.stderr).toContain('fetch origin');
   expect(existsSync(join(root, 'repo.git', 'HEAD'))).toBe(true);
   expect(existsSync(join(root, 'house.json'))).toBe(false);
   renameSync(remote, missing);
-  const retried = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const retried = await initInProcess(seed);
   expect(retried.status, retried.stderr).toBe(0);
   expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', '--verify', 'refs/remotes/origin/main'])).toBe(git(['rev-parse', 'HEAD'], seed));
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).home.path).toBe(join(home, 'test-state'));
@@ -898,12 +915,12 @@ test('mirror fetch tracks main only and removes stale remote-tracking branch ref
   expect(git(['--git-dir', repo, 'rev-parse', 'refs/remotes/origin/main'])).toBe(git(['rev-parse', 'refs/remotes/origin/main'], seed));
 }, 120_000);
 
-test('remote seat lifecycle runs on the selected SSH host and records its host without copying credentials', () => {
+test('remote seat lifecycle runs on the selected SSH host and records its host without copying credentials', async () => {
   const root = join(home, 'elanous-hq');
   const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
     { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
   expect(init.status, init.stderr).toBe(0);
-  const help = hq('seat', '--help');
+  const help = await hq('seat', '--help');
   expect(help.status, help.stderr).toBe(0);
   expect(help.stdout).toContain('--host <host>');
   expect(help.stdout).toContain('--delete');
@@ -984,6 +1001,55 @@ test('remote seat lifecycle runs on the selected SSH host and records its host w
   `);
 }, 120_000);
 
+test('remote seat script clones, refreshes, and removes a real worktree on the selected host', () => {
+  const root = join(home, 'controller-hq');
+  const remoteHome = join(temp, 'remote-home');
+  const shim = join(temp, 'remote-bin');
+  mkdirSync(remoteHome);
+  mkdirSync(shim);
+  writeFileSync(join(shim, 'gh'), '#!/bin/sh\n[ "$1 $2" = "auth setup-git" ]\n');
+  chmodSync(join(shim, 'gh'), 0o755);
+  const ssh = (host: string, script: string) => {
+    expect(host).toBe('mshq');
+    const result = command('bash', ['-c', script], temp, {
+      ...process.env, HOME: remoteHome, PATH: `${shim}:${process.env.PATH}`,
+      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig'),
+    });
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  };
+  const previous = process.cwd();
+  try {
+    process.chdir(seed);
+    const created = hqSeat('OP', { root, host: 'mshq', home: join(home, 'config'), ssh });
+    expect(created.outcome).toBe('created');
+    const repo = join(remoteHome, 'elanous-hq', 'repo.git');
+    const seat = join(remoteHome, 'elanous-hq', 'seats', 'OP');
+    expect(existsSync(join(seat, '.git'))).toBe(true);
+    expect(git(['--git-dir', repo, 'config', '--get-all', 'remote.origin.fetch'])).toBe('+refs/heads/main:refs/remotes/origin/main');
+    expect(git(['--git-dir', repo, 'rev-parse', '--is-shallow-repository'])).toBe('false');
+    expect(git(['rev-parse', 'HEAD'], seat)).toBe(git(['rev-parse', 'HEAD'], seed));
+    expect(hqSeat('OP', { root, ssh }).outcome).toBe('unchanged');
+    git(['switch', '-c', 'work/OP-local'], seat);
+    const attachedHead = git(['rev-parse', 'HEAD'], seat);
+    expect(() => hqSeat('OP', { root, ssh })).toThrow('seat HEAD is attached to a branch; refusing to reuse');
+    expect(() => hqSeat('OP', { root, refresh: true, ssh })).toThrow('seat HEAD is attached to a branch; refusing to refresh');
+    expect(git(['symbolic-ref', '--short', 'HEAD'], seat)).toBe('work/OP-local');
+    expect(git(['rev-parse', 'HEAD'], seat)).toBe(attachedHead);
+    git(['switch', '--detach'], seat);
+    writeFileSync(join(seed, 'next'), 'next\n');
+    git(['add', 'next'], seed);
+    git(['commit', '-m', 'next'], seed);
+    git(['push', 'origin', 'main'], seed);
+    expect(hqSeat('OP', { root, refresh: true, ssh }).outcome).toBe('refreshed');
+    expect(git(['rev-parse', 'HEAD'], seat)).toBe(git(['rev-parse', 'HEAD'], seed));
+    expect(hqSeat('OP', { root, delete: true, ssh }).outcome).toBe('removed');
+    expect(existsSync(seat)).toBe(false);
+    expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).remoteSeats?.OP).toBeUndefined();
+  } finally {
+    process.chdir(previous);
+  }
+}, 120_000);
+
 test('remote seat preserves SSH failure text and does not register a failed create', () => {
   const root = join(home, 'elanous-hq');
   const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
@@ -1035,12 +1101,12 @@ test('remote seat operation result is unchanged when debug logging throws', () =
   }
 }, 120_000);
 
-test('dirty seat --refresh preserves bytes and HEAD with rc 0 and one warning', () => {
+test('dirty seat --refresh preserves bytes and HEAD with rc 0 and one warning', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, '--test', 'hq', 'init'], seed, { ...process.env, HOME: home });
+  const init = await initProjectTest();
   expect(init.status, init.stderr).toBe(0);
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).home.path).toBe(join(seed, '.elanous-test'));
-  expect(hq('seat', 'TC').status).toBe(0);
+  expect((await hq('seat', 'TC')).status).toBe(0);
   const seat = join(root, 'seats', 'TC');
   const head = git(['rev-parse', 'HEAD'], seat);
   writeFileSync(join(seat, 'README'), 'do not overwrite\n');
@@ -1048,7 +1114,7 @@ test('dirty seat --refresh preserves bytes and HEAD with rc 0 and one warning', 
   git(['add', 'next'], seed);
   git(['commit', '-m', 'next'], seed);
   git(['push', 'origin', 'main'], seed);
-  const result = hq('seat', 'TC', '--refresh');
+  const result = await hq('seat', 'TC', '--refresh');
   expect(result.status, result.stderr).toBe(0);
   expect(result.stderr.trim().split('\n')).toHaveLength(1);
   expect(result.stderr).toContain('dirty — refresh skipped');
@@ -1057,11 +1123,11 @@ test('dirty seat --refresh preserves bytes and HEAD with rc 0 and one warning', 
   expect(existsSync(join(seat, 'next'))).toBe(false);
 }, 120_000);
 
-test('dirty seat refresh skip records one hq.seat refresh-skipped event with reason and behind count', () => {
+test('dirty seat refresh skip records one hq.seat refresh-skipped event with reason and behind count', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, '--test', 'hq', 'init'], seed, { ...process.env, HOME: home });
+  const init = await initProjectTest();
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('seat', 'TC').status).toBe(0);
+  expect((await hq('seat', 'TC')).status).toBe(0);
   const seat = join(root, 'seats', 'TC');
   const head = git(['rev-parse', 'HEAD'], seat);
   writeFileSync(join(seat, 'README'), 'do not overwrite\n');
@@ -1086,11 +1152,11 @@ test('dirty seat refresh skip records one hq.seat refresh-skipped event with rea
   expect(existsSync(join(seat, 'next2'))).toBe(false);
 }, 120_000);
 
-test('unlanded detached HEAD refresh skip records one refresh-skipped event and keeps the seat untouched', () => {
+test('unlanded detached HEAD refresh skip records one refresh-skipped event and keeps the seat untouched', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, '--test', 'hq', 'init'], seed, { ...process.env, HOME: home });
+  const init = await initProjectTest();
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('seat', 'TC').status).toBe(0);
+  expect((await hq('seat', 'TC')).status).toBe(0);
   const seat = join(root, 'seats', 'TC');
   git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-m', 'on seat'], seat);
   const local = git(['rev-parse', 'HEAD'], seat);
@@ -1111,63 +1177,58 @@ test('unlanded detached HEAD refresh skip records one refresh-skipped event and 
   expect(existsSync(join(seat, 'next'))).toBe(false);
 }, 120_000);
 
-test('seat refresh rejects a clean checkout owned by another repository without changing it', () => {
+test('seat refresh rejects a clean checkout owned by another repository without changing it', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const seat = join(root, 'seats', 'TC');
   mkdirSync(join(root, 'seats'));
   git(['clone', '--branch', 'main', remote, seat]);
   const head = git(['rev-parse', 'HEAD'], seat);
   const before = readFileSync(join(seat, 'README'), 'utf8');
-  const result = hq('seat', 'TC', '--refresh');
+  const result = await hq('seat', 'TC', '--refresh');
   expect(result.status).toBe(1);
   expect(result.stderr).toContain(`not a worktree of ${join(root, 'repo.git')}`);
   expect(git(['rev-parse', 'HEAD'], seat)).toBe(head);
   expect(readFileSync(join(seat, 'README'), 'utf8')).toBe(before);
 }, 120_000);
 
-test('seat refresh rejects a symlink to another registered worktree without detaching that work', () => {
+test('seat refresh rejects a symlink to another registered worktree without detaching that work', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'fix1').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'fix1')).status).toBe(0);
   const work = join(root, 'work', 'TC-fix1');
   mkdirSync(join(root, 'seats'));
   symlinkSync(work, join(root, 'seats', 'TC'));
-  const result = hq('seat', 'TC', '--refresh');
+  const result = await hq('seat', 'TC', '--refresh');
   expect(result.status).toBe(1);
   expect(result.stderr).toContain('not a worktree of');
   expect(git(['symbolic-ref', '--short', 'HEAD'], work)).toBe('work/TC-fix1');
 }, 120_000);
 
-test('seat refresh refuses a same-repository work moved into the seat path', () => {
+test('seat refresh refuses a same-repository work moved into the seat path', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
-  expect(hq('work', 'new', 'TC', 'fix1').status).toBe(0);
+  expect((await hq('work', 'new', 'TC', 'fix1')).status).toBe(0);
   const seat = join(root, 'seats', 'TC');
   mkdirSync(join(root, 'seats'));
   git(['--git-dir', join(root, 'repo.git'), 'worktree', 'move', join(root, 'work', 'TC-fix1'), seat]);
-  const result = hq('seat', 'TC', '--refresh');
+  const result = await hq('seat', 'TC', '--refresh');
   expect(result.status).toBe(1);
   expect(result.stderr).toContain('not a seat');
   expect(git(['symbolic-ref', '--short', 'HEAD'], seat)).toBe('work/TC-fix1');
 }, 120_000);
 
-test('init refuses an existing mirror of another repository, and refresh keeps commits made on a seat', () => {
+test('init refuses an existing mirror of another repository, and refresh keeps commits made on a seat', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const other = join(temp, 'other');
   git(['init', '-b', 'main', other]);
   git(['remote', 'add', 'origin', join(temp, 'other-remote.git')], other);
-  const wrong = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], other,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const wrong = await initInProcess(other);
   expect(wrong.status).toBe(1);
   expect(wrong.stderr).toContain('refusing to reuse');
   expect(git(['--git-dir', join(root, 'repo.git'), 'remote', 'get-url', 'origin'])).toBe(remote);
@@ -1175,22 +1236,21 @@ test('init refuses an existing mirror of another repository, and refresh keeps c
   const foreignRoot = join(temp, 'foreign-hq');
   git(['clone', '--bare', remote, join(foreignRoot, 'repo.git')]);
   git(['--git-dir', join(foreignRoot, 'repo.git'), 'remote', 'remove', 'origin']);
-  const adopted = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init', '--root', foreignRoot], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const adopted = await initInProcess(seed, '--root', foreignRoot);
   expect(adopted.status).toBe(1);
   expect(adopted.stderr).toContain('refusing to adopt');
-  expect(hq('seat', 'TC').status).toBe(0);
+  expect((await hq('seat', 'TC')).status).toBe(0);
   const seat = join(root, 'seats', 'TC');
   git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-m', 'on seat'], seat);
   const local = git(['rev-parse', 'HEAD'], seat);
-  const refreshed = hq('seat', 'TC', '--refresh');
+  const refreshed = await hq('seat', 'TC', '--refresh');
   expect(refreshed.status, refreshed.stderr).toBe(0);
   expect(refreshed.stderr).toContain('refresh skipped');
   expect(git(['rev-parse', 'HEAD'], seat)).toBe(local);
 }, 120_000);
 
-test('HQ lease status command help and local status remain available unchanged', () => {
-  const help = hq('lease', '--help');
+test('HQ lease status command help and local status remain available unchanged', async () => {
+  const help = await hq('lease', '--help');
   expect(help.status, help.stderr).toBe(0);
   expect(help.stdout).toContain('Usage: elanous hq lease [options] <action>');
   expect(help.stdout).toContain('--expected-generation <number>');
@@ -1201,7 +1261,7 @@ test('HQ lease status command help and local status remain available unchanged',
   expect(status.status, status.stderr).toBe(0);
   expect(JSON.parse(status.stdout.trim().split('\n').at(-1)!)).toEqual({ ok: true, action: 'status', record: null, ageSeconds: null, expired: null });
   for (const name of ['fence', 'fence-wrapper', 'fence-audit']) {
-    const cmd = hq(name, '--help');
+    const cmd = await hq(name, '--help');
     expect(cmd.status, cmd.stderr).toBe(0);
     expect(cmd.stdout).toContain(`elanous hq ${name}`);
   }

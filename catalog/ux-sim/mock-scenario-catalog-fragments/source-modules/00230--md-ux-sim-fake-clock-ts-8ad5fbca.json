@@ -1,0 +1,12 @@
+{
+  "id": "MD-UX-SIM-FAKE-CLOCK-TS",
+  "path": "src/ux-sim/fake-clock.ts",
+  "boundary": "Replaces process-local Date and timers with an explicitly advanced clock for deterministic scheduled-callback and elapsed-time behavior.",
+  "deviceIds": [
+    "fake-clock",
+    "fake-cloud-vm",
+    "grid-chaos-driver"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

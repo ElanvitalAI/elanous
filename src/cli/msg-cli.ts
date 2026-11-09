@@ -1,10 +1,11 @@
 import type { Command } from 'commander';
 import { formatMessage, registerMsgListCommand } from './msg-list-cli.js';
 import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { canonicalMessageAddress, canonicalSeatId, openMsgStore, openMsgStoreReadOnly, type Message, type MsgStore } from '../msg/msg-store.js';
+import { canonicalMessageAddress, canonicalSeatId, defaultMsgStorePath, openMsgStore, openMsgStoreReadOnly, type Message, type MsgStore } from '../msg/msg-store.js';
+import { buildMsgHookOutput, seatFromCwd, type MsgHookEvent, type MsgHookFormat } from '../msg/msg-hook.js';
 import { clearPostOffice, ensurePostOffice, writePostOffice } from '../msg/msg-post-office.js';
 import { acquireLockSync } from '../storage/file-lock.js';
 import { GitHubMsgMirrorTransport } from '../msg/msg-mirror-github.js';
@@ -13,9 +14,11 @@ import { JsonMsgMirrorStateStore } from '../msg/msg-mirror-state.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
 import { debug } from '../debug/log.js';
 import type { AgentReplyAddress, AgentReplyInput, AgentReplyResult } from '../loops/agent-reply.js';
-import { messageRouteFor, noReplyBodyNotice, unsupportedLoopAddressNotice } from '../loops/msg-address.js';
-import { resolveWake, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
-import { getUserConfig, type RoleLlmSpec } from '../user-config.js';
+import { noReplyBodyNotice, unsupportedLoopAddressNotice } from '../loops/msg-address.js';
+import { messageReplyBodyFor, registerSeatPaneAddress, resolveWake, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
+import { getUserConfig } from '../user-config.js';
+import type { RoleLlmSpec } from '../user-config/types.js';
+import { postReleaseOpCommand, postReleaseOpQuestion } from '../release-loop/op-channel.js';
 
 /** The loop rows whose reply body is an LLM agent: `--agent-reply` picks one of these. */
 const AGENT_REPLY_ROLES = { COORDINATOR: 'coordinator', GUARDIAN: 'guardian' } as const;
@@ -33,6 +36,7 @@ export interface MsgCliDeps {
   mirrorTarget?: MirrorTarget | null;
   mirrorState?: MsgMirrorStateStore;
   mirrorTransport?: MsgMirrorTransport;
+  hookStateDir?: string;
   /** Wake-path resolution for `msg route` (tests inject; default reads pty manifest ⊕ seat folders). */
   wakeDeps?: WakeDeps;
   /** Attach the logs.db sink so `msg.wake` reaches `elanous logs` (a short CLI otherwise writes only the file trail). */
@@ -318,6 +322,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       if (unsupported) out.error(unsupported);
       if (opts.to === undefined) throw new Error('--to is required');
       const to = canonicalMessageAddress(opts.to);
+      debug.log('msg.post', 'caller-runtime', { runtime: process.env.ELANOUS_AGENT_RUNTIME?.trim() || 'unknown', to });
       // Validate the auto-reply target before saving — a mismatched flag must not leave a stored message behind.
       const agentAddress = agentReplyAddress(opts.agentReply);
       if (agentAddress !== null) requireAgentTarget(agentAddress, to);
@@ -331,7 +336,8 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
         : store.appendWithProvenance(envelope, opts.originKey));
       emit(posted, opts.json, () => out.log(formatMessage(posted)));
       await handleTaMessage(posted); // msg post: process the durable TA request (including pending retry).
-      const noBody = noReplyBodyNotice(to);
+      const replyBody = messageReplyBodyFor(to, deps.wakeDeps);
+      const noBody = replyBody === 'none' ? noReplyBodyNotice(to) ?? '이 주소는 읽는 몸이 없다 — 지금은 OP' : null;
       if (noBody) out.error(noBody);
       // 저장 «뒤» 한 번 — 읽는 몸이 없다는 안내가 이미 나갔으면 깨움 경고는 겹쳐 내지 않는다.
       // 깨움은 post 의 성패를 바꾸지 않는다 — 동기 예외까지 여기서 막는다.
@@ -358,10 +364,38 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .action((address: string, opts: CommonOptions) => run(() => {
       const to = canonicalMessageAddress(address);
       const wake = resolveWake(to, deps.wakeDeps);
-      const row = { msgAddress: to, replyBody: messageRouteFor(to)?.replyBody ?? null, ...wake };
+      const row = { msgAddress: to, replyBody: messageReplyBodyFor(to, deps.wakeDeps), ...wake };
       emit(row, opts.json, () => out.log(`${to}\treplyBody=${row.replyBody ?? '모름'}\twake=${wake.wake}`
-        + `${wake.target ? `\ttarget=${wake.target}` : ''}${wake.optIn === undefined ? '' : `\toptIn=${wake.optIn ? 'yes' : 'no(주입 0)'}`}`
+        + `${wake.host ? `\thost=${wake.host}` : ''}${wake.target ? `\ttarget=${wake.target}` : ''}${wake.optIn === undefined ? '' : `\toptIn=${wake.optIn ? 'yes' : 'no(주입 0)'}`}`
         + `\t(${wake.source}${wake.reason ? `: ${wake.reason}` : ''})`));
+    })());
+
+  msg.command('address').description('Manage the central seat address registry')
+    .command('register <seat>').description('Register a seat in the central seat address registry')
+    .requiredOption('--herdr-pane <pane>', 'Herdr pane ID, for example wJ:p10')
+    .requiredOption('--host <host>', 'local or remote SSH alias')
+    .option('--wake', 'allow this registered seat to receive message wake prompts')
+    .option('--replace', 'replace an existing pane address')
+    .option('--json')
+    .action((rawSeat: string, opts: { herdrPane: string; host: string; wake?: boolean; replace?: boolean; json?: boolean }) => run(() => {
+      const result = registerSeatPaneAddress({
+        address: canonicalSeatId(rawSeat), paneId: opts.herdrPane, host: opts.host,
+        ...(opts.wake ? { enableWake: true } : {}), ...(opts.replace ? { replace: true } : {}),
+      }, deps.wakeDeps);
+      emit(result, opts.json, () => out.log(`${result.address}\t${result.host}:${result.paneId}\t${result.changed ? 'registered' : 'unchanged'}\twake=${result.wakeEnabled ? 'on' : 'off'}`));
+    })());
+
+  msg.command('rla <command...>').description('Send an RLA question or release-loop command')
+    .option('--from <seat>', 'operator address', 'OP').option('--json')
+    .action((parts: string[], opts: CommonOptions & { from?: string }) => run(() => {
+      const command = parts.join(' ');
+      const isQuestion = parts[0] === 'ask';
+      const body = isQuestion ? parts.slice(1).join(' ') : command;
+      const posted = withStore(store => isQuestion
+        ? postReleaseOpQuestion(store, seat(opts.from, '--from'), body)
+        : postReleaseOpCommand(store, seat(opts.from, '--from'), command));
+      emit({ address: 'RLA', ...(isQuestion ? { question: body } : { command }), messageId: posted.id, queued: true }, opts.json,
+        () => out.log(`RLA ${isQuestion ? 'question' : 'command'} queued · #${posted.id} · ${body}`));
     })());
 
   const group = msg.command('group').description('Manage local message group subscriptions');
@@ -393,6 +427,29 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     })());
 
   registerMsgListCommand(msg, { openStore: open, cacheReads: deps.openStore === undefined, out, setExitCode });
+
+  msg.command('hook').description('Emit turn-boundary inbox context for Claude or Codex hooks')
+    .requiredOption('--event <event>')
+    .requiredOption('--format <format>')
+    .option('--seat <seat>', 'seat ID or auto:cwd', 'auto:cwd')
+    .action((opts: { event: MsgHookEvent; format: MsgHookFormat; seat: string }) => run(async () => {
+      let input: Record<string, unknown> = {};
+      try { input = JSON.parse(await readStdin()) as Record<string, unknown>; } catch { /* empty input falls back to process context */ }
+      const cwd = typeof input.cwd === 'string' && input.cwd.trim() ? input.cwd : process.cwd();
+      const seat = opts.seat === 'auto:cwd' ? seatFromCwd(cwd) : canonicalSeatId(opts.seat);
+      if (!seat || seat === 'ALL') return;
+      const sessionId = typeof input.session_id === 'string' && input.session_id.trim() ? input.session_id : typeof input.sessionId === 'string' && input.sessionId.trim() ? input.sessionId : undefined;
+      const output = withStore(store => buildMsgHookOutput({
+        event: opts.event,
+        format: opts.format,
+        cwd,
+        sessionId,
+        seat,
+        messages: store.listByRecipient(seat, store.getCursor(seat)),
+        stateDir: deps.hookStateDir ?? join(dirname(defaultMsgStorePath()), 'hook-state'),
+      }));
+      if (output !== null) out.log(output);
+    })());
 
   msg.command('ack [id]').description('Acknowledge one message with --id, or acknowledge through --through')
     .option('--to <seat>').option('--id <id>', 'acknowledge exactly one message').option('--through <id>', 'acknowledge all messages through this ID').option('--json')

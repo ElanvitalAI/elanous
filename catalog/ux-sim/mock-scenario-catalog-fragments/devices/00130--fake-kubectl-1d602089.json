@@ -1,0 +1,28 @@
+{
+  "id": "fake-kubectl",
+  "name": "Fake kubectl",
+  "implementation": [
+    "src/ux-sim/fake-kubectl.ts",
+    "src/ux-sim/world-host-chaos.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-kubectl.test.ts",
+    "src/ux-sim/world-host-chaos.test.ts"
+  ],
+  "target": "Pod and Job query/termination boundary",
+  "inputs": [
+    "Pod/Job fixtures",
+    "query result or failure"
+  ],
+  "observations": [
+    "kubectl argv",
+    "returned resource state",
+    "failure"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-kubectl.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

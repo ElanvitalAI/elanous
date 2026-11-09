@@ -1,0 +1,36 @@
+id: rla-rehearsal-cloud-resume-sim
+version: 1
+purpose: Exercise the release graph resume contract with cloud-join incidents as operational-tool inputs and fake cloud lifecycle boundaries.
+sameRun:
+  processRestart: false
+  resumeInvocation: saved-graph-cli
+  resumeCli: true
+boundaries:
+  externalCloud: true
+  cloudProvider: fake-cloud-vm
+  cloudJoinImplementation: operational-tool-contract-input
+incidents:
+  aws3PublicIpChangedWhileJoining:
+    instanceId: i-08f7e3976c47a563a
+    previousPublicIp: 3.38.148.224
+    currentPublicIp: 54.117.99.58
+    observedAt: 2026-11-08T04:01:50+09:00
+    expectedContract: reconnect-to-current-public-ip
+  workerStartReportedFailureButPidfilesAlive:
+    reportedStarted: 0
+    reportedFailed: 3
+    pidfileWorkers:
+      - { id: aws3-1, pid: 86041 }
+      - { id: aws3-2, pid: 86043 }
+      - { id: aws3-3, pid: 86045 }
+    expectedContract: classify-from-live-pidfile-evidence
+cloud:
+  id: aws3
+  imageDigest: sha256:rla-rehearsal-simulation
+  hourlyCost: 36
+  expectedLifecycle: [create-from-image, ready, lease-opened, lease-closed, stop]
+resume:
+  command: release resume
+  preservesRunId: true
+  skipsCompletedNodes: true
+  resumesFailedNode: true

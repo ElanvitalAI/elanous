@@ -1,3 +1,4 @@
+import type { LLMToolRouteMetadata } from '../../llm/tool-spec.js';
 // ── Plugin system core types ──
 // Phase 2: full plugin contract. Plugins are plain TS modules whose
 // default export implements ElanousPlugin. The plugin-host loads them
@@ -150,6 +151,9 @@ export interface LLMToolDef {
   name: string;
   description: string;
   parameters: Record<string, unknown>;   // JSONSchema (OpenAI / Anthropic tools compatible)
+  /** Optional route metadata copied from plugin.json and used only for lazy schema selection. */
+  pluginId?: string;
+  route?: LLMToolRouteMetadata;
   handler(args: Record<string, unknown>, ctx: PluginContext): Promise<unknown>;
 }
 

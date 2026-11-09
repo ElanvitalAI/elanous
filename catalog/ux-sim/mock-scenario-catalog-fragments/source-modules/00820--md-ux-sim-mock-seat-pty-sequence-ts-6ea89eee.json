@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-MOCK-SEAT-PTY-SEQUENCE-TS",
+  "path": "src/ux-sim/mock-seat-pty-sequence.ts",
+  "boundary": "Drives a real TUI child through PTY keys and frame-text predicates, capturing frames until the declared terminal condition.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

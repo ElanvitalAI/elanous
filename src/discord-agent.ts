@@ -8,7 +8,7 @@
 // screenshot attachments; no `tgChat` ⇒ active-delegation arming stays
 // off until M4b ports the interweaving stack).
 
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import type { runTurn } from './session/chat.js';
 import { makeElanousAgentRunTurn } from './agent/monad-agent-turn.js';
 

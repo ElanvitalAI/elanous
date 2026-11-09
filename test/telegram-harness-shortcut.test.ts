@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, mock, test } from 'bun:test';
 import type { TgIncoming } from '../src/telegram.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import * as channelCommandModule from '../src/intake-plane/channel-command.js';
 
 const intakeCalls: Array<{ args: string[]; text: string }> = [];

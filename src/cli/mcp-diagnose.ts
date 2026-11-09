@@ -28,7 +28,7 @@ import { McpServerError,
 } from '../mcp/client.js';
 import { loadStoredAccessToken } from '../mcp/mcp-oauth.js';
 import { getUserConfig } from '../user-config.js';
-import type { McpServerSpec } from '../user-config.js';
+import type { McpServerSpec } from '../user-config/types.js';
 
 export interface McpDiagnoseOpts {
   /** Optional id from user-config `mcp.servers[]`. When omitted, every

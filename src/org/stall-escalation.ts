@@ -1,6 +1,6 @@
 import type { Checklist, ChecklistItem } from '../release-loop/checklist.js';
 import { parseOwner } from '../release-loop/checklist.js';
-import type { SeatLoopConfig } from '../user-config.js';
+import type { SeatLoopConfig } from '../user-config/types.js';
 
 export interface StallEscalation {
   item: ChecklistItem;

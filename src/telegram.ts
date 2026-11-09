@@ -2581,7 +2581,7 @@ import { makeChunkProducer } from './session/streaming/chunk-producer.js';
 import { getUserConfig } from './user-config.js';
 import { runTurn } from './session/chat.js';
 import { submitIntent } from './intent-gate/gate.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import type { ContentBlock } from './llm.js';
 import { extractPdf, extractDocx, extractXlsx, readText } from './extractors.js';
 import { loadImageAsAttachment } from './image/utils.js';

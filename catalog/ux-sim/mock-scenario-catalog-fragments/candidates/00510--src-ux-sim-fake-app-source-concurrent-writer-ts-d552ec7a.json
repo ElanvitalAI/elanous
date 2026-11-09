@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/fake-app-source-concurrent-writer.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/fake-app-source-world.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Local fake object store and concurrent workers expose only synthetic source snapshots and records.",
+  "deviceId": "fake-app-source-world",
+  "scenarioIds": [
+    "APP-SOURCE-SNAPSHOT"
+  ]
+}

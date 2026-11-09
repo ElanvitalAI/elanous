@@ -1,3 +1,7 @@
+import { createMouseStatusLine } from './mouse-status-line.js';
+import { DEFAULT_PILL_TOOLTIPS, pillHoverTarget } from './mouse-pill-hover.js';
+export { pillHoverTarget } from './mouse-pill-hover.js';
+export { fitStatusSegments, statusSegmentKind, truncateToVisibleWidth, clampPillsToWidth } from './mouse-status-line.js';
 import type { DashboardInputHitTarget, DashboardModalHitTarget, DashboardMousePreflightInputClassifier, DashboardMousePreflightModalClassifier, DashboardMousePreflightPaneClassifier, DashboardMouseWiring, DashboardMouseWiringDeps, DashboardPaneHitTarget, DashboardStatusInput, DockItemBound } from './mouse-wiring-types.js';
 export type { DashboardInputHitTarget, DashboardModalHitTarget, DashboardMousePreflightInputClassifier, DashboardMousePreflightModalClassifier, DashboardMousePreflightPaneClassifier, DashboardMouseWiring, DashboardMouseWiringDeps, DashboardPaneHitTarget, DashboardStatusInput, DockItemBound } from './mouse-wiring-types.js';
 // MX11b — dashboard-side wiring for mouse-driven status-bar pills.
@@ -23,7 +27,7 @@ export type { DashboardInputHitTarget, DashboardModalHitTarget, DashboardMousePr
 // cross-cutting concern. Unit-testable in isolation.
 
 import chalk from 'chalk';
-import { ctp, stripAnsi, truncate, visibleWidth } from '../../tui.js';
+import { stripAnsi, visibleWidth } from '../../tui.js';
 import { debug } from '../../debug/log.js';
 import {
   modalMoveThreshold,
@@ -67,35 +71,9 @@ import type { ContextKeyService } from '../../input-core/context-keys.js';
 import type { ThemeTokens } from '../../theme/tokens.js';
 import type { WorkspaceHost } from '../../display/workspace-host.js';
 import type { ConversationPopupHost } from '../../conv-dash/popup-host.js';
-import {
-  contextUsageSegment,
-  type ConversationPopupSummary,
-  hostSegment,
-  sessionCwdSegment,
-  conversationPopupSegment,
-  gitSegment,
-  modelSegment,
-  elapsedSegment,
-  modeSegment,
-  ptyShellCountSegment,
-  runningAgentsSegment,
-  backgroundJobsSegment,
-  runningBuildSegment,
-  controllerSegment,
-  shellRollupSegment,
-  sshSegment,
-  STATUS_SEGMENT_SEPARATOR,
-  tmuxSegment,
-  vwSegment,
-  type GitSegmentState,
-  type RunningBuildState,
-  type ShellRollupSummary,
-  type BackgroundJobsSummary,
-  type StatusBarRenderOptions,
-  type VwSummary,
-} from '../../status/bar.js';
 import type { StatusProviderInfo } from '../../status/status-provider-info.js';
-import { modelDisplayForRotationEntry, type RotationEntry } from '../../user-config.js';
+import { modelDisplayForRotationEntry } from '../../user-config.js';
+import type { RotationEntry } from '../../user-config/types.js';
 import {
   createWdPickerRecipe,
   createShellRollupPopupRecipe,
@@ -124,26 +102,6 @@ type DockItemSeed =
   | { kind: 'vw-mover-right'; enabled: boolean }
   | { kind: 'view' }
   | { kind: 'workspace-dock'; surfaceId: string; label: string };
-/** Tag the git pill with an axis label (`트리`) without touching the caller's state. */
-function labelGitState(state: GitSegmentState | string | null | undefined, label: string | undefined): GitSegmentState | string | undefined {
-  if (!label || state === null || state === undefined) return state ?? undefined;
-  return typeof state === 'string' ? { branch: state, label } : { ...state, label };
-}
-
-/** IDX-5 Phase 1 — default pill tooltip map. Explained to the user:
- *  what the pill IS, what clicking IT DOES. Terse (single line)
- *  because Tooltip widget paints as `▕ text` — no wrap. */
-const DEFAULT_PILL_TOOLTIPS: Readonly<Record<PillName, string>> = {
-  workingDir: 'Working directory — click to switch to a recent cwd',
-  model: 'Active model — click to pick from rotation',
-  mode: 'Operating mode — click to switch (general / sync / control)',
-  shellRollup: 'Shell handles — click to attach or inspect',
-  virtualWindow: 'Virtual window — click to open window picker',
-  workspaceDock: 'Parked windows — click to inspect docked or dormant entries',
-  conversationPopup: 'Conversation popups — click to focus or restore',
-  acpSending: 'ACP sticky send — click to inspect in-flight ACP surface state',
-};
-
 function dockKindIcon(kind: WorkspaceDesktopEntry['kind']): string {
   switch (kind) {
     case 'popup': return '◫';
@@ -232,33 +190,6 @@ function appendDockDivider(
   parts.push(render);
 }
 
-/** IDX-5 Phase 1 — compute the HoverTarget for a mouse position over
- *  the status-bar row. `statusRow` and `row` are 1-indexed (matches
- *  DisplayMouseEvent.row). Returns null for anything outside the
- *  status bar, including the neighbouring row. Exported for tests. */
-export function pillHoverTarget(
-  pills: readonly PillBound[],
-  statusRow: number | null,
-  row: number,
-  col: number,
-  tooltipFor: (name: PillName) => string | null = (n) => DEFAULT_PILL_TOOLTIPS[n] ?? null,
-): HoverTarget | null {
-  if (statusRow === null) return null;
-  // Accept status row exact or one-above — matches the click tolerance
-  // (see openPillPopup's nearStatusRow rule). Avoids flicker when the
-  // visual top edge of a pill cell emits row-1.
-  if (row !== statusRow && row !== statusRow - 1) return null;
-  const col0 = col - 1;
-  const hit = pillAtColumn(pills, col0);
-  if (!hit) return null;
-  const tt = tooltipFor(hit.name);
-  return {
-    id: `pill:${hit.name}`,
-    kind: 'status-bar-pill',
-    tooltipText: tt ?? undefined,
-  };
-}
-
 type PopupMouseRoutingResult =
   | 'consumed'
   | 'dismissed-consumed'
@@ -341,62 +272,6 @@ function createPopupAuthority(deps: {
       return activePopup ? activePopup.surface.id : null;
     },
   };
-}
-
-/** 상태줄 세그먼트를 폭 `budget` 안에 순서대로 놓는다 — 넘치는 세그먼트는 건너뛰고(뒤의 작은 것은
- *  들어가면 넣는다) `required` 세그먼트(첫 칸 ⊕ 호출자가 지정한 필수 표시)는 늘 둔다: 선택 세그먼트는
- *  «뒤에 남은 필수 세그먼트 몫» 을 남겨 둘 수 있을 때만 들어간다. 필수만으로 넘치면 `width > budget`
- *  으로 드러나고 호출자가 잘라 낸다. tf-bg-ghost(10-17): 폭을 넘긴 마지막 줄이 화면을 스크롤해 유령 줄을 남겼다. */
-export function fitStatusSegments(
-  widths: readonly number[],
-  sepWidth: number,
-  budget: number,
-  required: readonly boolean[] = [],
-): { placed: Array<{ index: number; startCol: number; width: number }>; dropped: number[]; width: number } {
-  const isRequired = (i: number): boolean => i === 0 || required[i] === true;
-  const w = (i: number): number => Math.max(0, widths[i] ?? 0);
-  // reserve[i] = i 뒤(제외)에 남은 필수 세그먼트가 차지할 폭(구분자 포함).
-  const reserve: number[] = new Array(widths.length + 1).fill(0);
-  for (let i = widths.length - 1; i >= 0; i--) {
-    reserve[i] = reserve[i + 1]! + (isRequired(i + 1) && i + 1 < widths.length ? sepWidth + w(i + 1) : 0);
-  }
-  const placed: Array<{ index: number; startCol: number; width: number }> = [];
-  const dropped: number[] = [];
-  let col = 0;
-  for (let i = 0; i < widths.length; i++) {
-    const start = placed.length > 0 ? col + sepWidth : 0;
-    if (!isRequired(i) && start + w(i) + reserve[i]! > budget) {
-      dropped.push(i);
-      continue;
-    }
-    placed.push({ index: i, startCol: start, width: w(i) });
-    col = start + w(i);
-  }
-  return { placed, dropped, width: col };
-}
-
-/** 세그먼트 «종류» — 렌더 문자열의 첫 낱말(🐚 · ctx · 🖥 · ⧗ …). 관측 키에 값이 섞이지 않게. */
-export function statusSegmentKind(render: string): string {
-  return stripAnsi(render).trim().split(/\s+/)[0] ?? '';
-}
-
-/** `line` 을 실폭(visibleWidth) `budget` 이하가 될 때까지 자른다 — 상한 없는 축소 · 0 이면 빈 문자열.
- *  `truncate` 는 코드포인트 폭(isWide)으로 세서 이모지에서 어긋날 수 있어 실폭으로 다시 잰다. */
-export function truncateToVisibleWidth(line: string, budget: number): string {
-  if (budget <= 0) return '';
-  if (visibleWidth(line) <= budget) return line;
-  for (let max = budget; max > 0; max--) {
-    const cut = truncate(line, max);
-    if (visibleWidth(cut) <= budget) return cut;
-  }
-  return '';
-}
-
-/** 잘린 상태줄에 맞춰 pill 경계를 보이는 폭 안으로 줄인다(화면 밖 pill 은 뺀다). */
-export function clampPillsToWidth(pills: readonly PillBound[], shown: number): PillBound[] {
-  return pills
-    .filter((p) => p.startCol < shown)
-    .map((p) => ({ ...p, endCol: Math.min(p.endCol, shown) }));
 }
 
 export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): DashboardMouseWiring {
@@ -528,123 +403,14 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
     }
   }
 
-  let lastStatusOverflowKey = '';
+  const statusLine = createMouseStatusLine({
+    termSize: deps.termSize,
+    conversationPopupHost: deps.conversationPopupHost,
+  });
   const buildStatusLine = (input: DashboardStatusInput): string => {
-    // 2026-05-05 — narrow-width gate. modelSegment honours
-    // `compact: true` to truncate model id at the first parameter-size
-    // marker (e.g. qwen3.6-35b-a3b-ud-mlx → qwen3.6-35b). Threshold
-    // 100 cols matches typical "narrow terminal vs comfortable wide
-    // terminal" boundary; everything above stays full-width.
-    const { cols } = deps.termSize();
-    const opts: StatusBarRenderOptions = { theme: input.theme, compact: cols < 100 };
-    const segments: Array<{ name: PillName | null; render: string; required?: boolean }> = [
-      { name: 'workingDir', render: sessionCwdSegment(input.swd, opts) },
-      { name: null,         render: gitSegment(input.swd, labelGitState(input.gitState, input.runningBuild ? '트리' : undefined), opts) },
-    ];
-    const runningBuildRender = runningBuildSegment(input.runningBuild, opts);
-    if (runningBuildRender) segments.push({ name: null, render: runningBuildRender });
-    segments.push({ name: 'model', render: modelSegment(input.providerInfo, opts) });
-    const runningAgentsRender = runningAgentsSegment(input.runningAgents ?? 0, opts);
-    if (runningAgentsRender) segments.push({ name: null, render: runningAgentsRender });
-    const controllerRender = controllerSegment(input.controller, opts);
-    if (controllerRender) segments.push({ name: null, render: controllerRender });
-    // TUI-BG-JOB-VISIBILITY (#71) — turn-outliving work sits with the agents/controller
-    // «activity» cluster (controller stays immediately after agents).
-    const backgroundJobsRender = backgroundJobsSegment(input.backgroundJobs ?? null, opts);
-    // 폭이 모자라도 이 표시는 건너뛰지 않는다(필수) — 다른 세그먼트를 먼저 건너뛴다.
-    if (backgroundJobsRender) segments.push({ name: null, render: backgroundJobsRender, required: true });
-    // A1 — mode pill between model and elapsed. `'general'` yields
-    // empty render so the pill disappears by default; only sync /
-    // control get painted. Name 'mode' is always set so click still
-    // has a target once the segment is visible.
-    const modeRender = modeSegment(input.mode ?? 'general', opts);
-    if (modeRender) segments.push({ name: 'mode', render: modeRender });
-    if (typeof input.contextUsedTokens === 'number') {
-      segments.push({ name: null, render: contextUsageSegment(input.contextUsedTokens, opts) });
-    }
-    if (input.host) {
-      segments.push({ name: null, render: hostSegment(input.host, opts) });
-    }
-    if (input.tmuxLabel) {
-      segments.push({ name: null, render: tmuxSegment(input.tmuxLabel, opts) });
-    } else if (input.sshLabel) {
-      segments.push({ name: null, render: sshSegment(input.sshLabel, opts) });
-    }
-    if (typeof input.elapsedSec === 'number') {
-      segments.push({ name: null, render: elapsedSegment(input.elapsedSec, opts) });
-    }
-    const shellCount = input.shellCount ?? 0;
-    if (shellCount > 0) {
-      segments.push({ name: null, render: ptyShellCountSegment(shellCount, opts) });
-    }
-    if (input.shellRollup) {
-      const render = shellRollupSegment(input.shellRollup, opts);
-      // SRF-4 — tag rollup as a pill so clicks route to the handle popup.
-      if (render) segments.push({ name: 'shellRollup', render });
-    }
-    // VW-U1 — virtual-window pill sits to the right of shell-count so
-    // the eye lands on "session identity (wd+git+model)" first, then
-    // on "runtime activity (shells, vw)". vwSegment itself decides to
-    // render '' when there's only one window + one pane.
-    const vwRender = vwSegment(input.vw ?? null, opts);
-    if (vwRender) {
-      segments.push({ name: 'virtualWindow', render: vwRender });
-    }
-    if (deps.conversationPopupHost) {
-      const render = conversationPopupSegment(input.conversationPopups ?? null, opts);
-      if (render) {
-        segments.push({ name: 'conversationPopup', render });
-      }
-    }
-
-
-    // Compute column positions as segments concatenate with the same
-    // separator string the renderer uses. `visibleWidth` counts cells
-    // (wide-char aware), so the pill bounds stay correct.
-    //
-    // TUI-BG-JOB-VISIBILITY 라이브 결함(tf-bg-ghost · 10-17) — 상태줄은 «마지막 줄» 이라 폭을 넘으면
-    //   터미널 자동 줄바꿈이 화면 전체를 한 줄 위로 «스크롤» 한다. 차분 렌더러(`render`)는 그걸 모르고
-    //   안 바뀐 줄을 다시 안 써서, 스피너 줄이 ChatLog 아래 유령으로 남고 머리 줄이 사라졌다.
-    //   ⇒ 프레임 폭(cols-1 · composeVertical 의 totalW)을 넘는 세그먼트는 «건너뛴다»(순서 유지 ·
-    //   뒤의 작은 세그먼트는 들어갈 수 있으면 넣는다). 관측 = status.bar/overflow-fit(건너뛴 집합이 바뀔 때만).
-    const nextPills: PillBound[] = [];
-    const parts: string[] = [];
-    const budget = Math.max(0, cols - 1);
-    const fit = fitStatusSegments(
-      segments.map((seg) => visibleWidth(stripAnsi(seg.render))),
-      visibleWidth(stripAnsi(STATUS_SEGMENT_SEPARATOR)),
-      budget,
-      segments.map((seg) => seg.required === true),
-    );
-    for (const placed of fit.placed) {
-      const seg = segments[placed.index]!;
-      if (seg.name) nextPills.push({ name: seg.name, startCol: placed.startCol, endCol: placed.startCol + placed.width });
-      parts.push(seg.render);
-    }
-    // 키 = 건너뛴 세그먼트 «종류»(첫 낱말 · 🐚·ctx·🖥 …)의 중복 없는 정렬 집합 — 폭·리사이즈·값(ctx 15k→16k)·같은 종류 수는 키가 아니다.
-    const droppedKinds = [...new Set(fit.dropped.map((i) => statusSegmentKind(segments[i]!.render)))].sort();
-    const droppedKey = droppedKinds.join(' ');
-    if (droppedKey !== lastStatusOverflowKey) {
-      lastStatusOverflowKey = droppedKey;
-      try {
-        debug.log('status.bar', 'overflow-fit', {
-          cols,
-          budget,
-          dropped: droppedKinds,
-          width: fit.width,
-        });
-      } catch { /* 관측 실패가 상태줄을 막지 않는다 */ }
-    }
-    pills = nextPills;
-    const line = parts.join(STATUS_SEGMENT_SEPARATOR);
-    // 첫 칸 하나만으로도 넘치는 아주 좁은 화면 — 잘라서라도 한 줄 안에 둔다.
-    if (fit.width <= budget) return line;
-    //   `truncate` 는 코드포인트 폭(isWide)으로 세서 이모지에서 한두 칸 어긋날 수 있다 — 실폭(visibleWidth)으로 다시 잰다.
-    const cut = truncateToVisibleWidth(line, budget);
-    // pill 경계도 실제로 보이는 범위로 줄인다(잘린 뒤의 클릭·호버가 화면 밖을 가리키지 않게).
-    const shown = visibleWidth(cut);
-    pills = clampPillsToWidth(nextPills, shown);
-    return cut;
+    const line = statusLine.build(input);
+    pills = [...statusLine.pills()];
+    return line;
   };
 
   const setStatusRow = (row: number | null): void => {

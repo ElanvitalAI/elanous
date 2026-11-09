@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-PWA-RETAINED-ROUTES-WORLD-TS",
+  "path": "src/ux-sim/pwa-retained-routes-world.ts",
+  "boundary": "Exercises PWA route retention and navigation using an isolated local world without live browser or network services.",
+  "deviceIds": [
+    "world-runtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

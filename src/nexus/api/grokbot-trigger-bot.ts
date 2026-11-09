@@ -3,7 +3,7 @@ import { debug } from '../../debug/log.js';
 import { receiveChannelEvent } from '../outbound/router.js';
 import { registerGrokbotAdapter } from '../outbound/grokbot-adapter.js';
 import { createSession, listSessions } from '../../session/index.js';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 import type { runTurn } from '../../session/chat.js';
 import type { ChannelEnvelope } from '../outbound/router.js';
 

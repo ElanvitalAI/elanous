@@ -15,7 +15,7 @@ import type { CeoCommandDeps } from '../../seat-dispatch/ceo-commands.js';
 import { MsgStore, type MessageEnvelope } from '../../msg/msg-store.js';
 import { handleTelegramSeatWork } from '../../intake-plane/telegram-seat-work.js';
 import { answerSeatAsk, DEFAULT_ASK_TIMEOUT_MS, deliverSeatAnswers, listSeatAskRoundTrips, type AskOrigin } from '../../seat-dispatch/seat-ask.js';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 import { resolveAttachmentPath, saveAttachmentBlob } from '../../boot/attachment-store.js';
 
 const roots: string[] = [];

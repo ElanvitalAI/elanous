@@ -1,3 +1,4 @@
+import { isObject } from '../primitives/guards.js';
 // Archon-port T2.1 (2026-05-08) — workflow YAML validation.
 //
 // Hand-rolled validator (no zod dep — keeps this module self-contained
@@ -997,10 +998,6 @@ export function validateWorkflow(raw: unknown): ValidationResult {
   // workflows. Caller can ignore (issues stays empty) or render the
   // warnings panel + apply suggestions.
   return { ok: true, workflow, issues: [], warnings: buildWarnings(workflow) };
-}
-
-function isObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 /** M4-3.2 (FU8 PR #8 · 2026-05-12) — extract the recognised

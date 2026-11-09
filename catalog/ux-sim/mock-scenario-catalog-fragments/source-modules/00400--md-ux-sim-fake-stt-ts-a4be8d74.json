@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-STT-TS",
+  "path": "src/ux-sim/fake-stt.ts",
+  "boundary": "Deterministic SHA-256 recording-to-transcript fixture with language, failure, delay, empty-result, and reusable contract cases.",
+  "deviceIds": [
+    "SIM-FAKE-PROVIDERS-AV"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

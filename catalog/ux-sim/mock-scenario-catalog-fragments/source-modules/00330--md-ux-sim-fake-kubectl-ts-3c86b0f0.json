@@ -1,0 +1,12 @@
+{
+  "id": "MD-UX-SIM-FAKE-KUBECTL-TS",
+  "path": "src/ux-sim/fake-kubectl.ts",
+  "boundary": "Provides a mutable in-memory Kubernetes API for production pool-admission and warm-provider callers, including per-node readiness and reversible API outages; unknown kubectl operations fail closed.",
+  "deviceIds": [
+    "fake-kubectl",
+    "warm-pool-reuse-sim",
+    "fake-fleet"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

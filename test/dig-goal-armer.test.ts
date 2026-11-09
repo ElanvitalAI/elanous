@@ -18,7 +18,7 @@ import {
   getAutoModeState, setAutoModeState, resetAutoModeForTest,
 } from '../src/auto-research/auto-mode/session.js';
 import { INACTIVE_AUTO_MODE_STATE } from '../src/auto-research/auto-mode/types.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import type { ObsidianVault } from '../src/auto-research/obsidian-bridge.js';
 
 const cfgWith = (autoGoal: unknown): UserConfig =>
@@ -180,8 +180,9 @@ describe('wire (source-level)', () => {
   });
 
   test('user-config parses finance.dig.autoGoal with strict-true + clamps', () => {
-    const src = readFileSync(join(import.meta.dir, '..', 'src/user-config.ts'), 'utf-8');
-    expect(src).toMatch(/dig\?: \{ autoGoal\?:/);
-    expect(src).toMatch(/autoGoal[\s\S]{0,200}enabled === true/);
+    const types = readFileSync(join(import.meta.dir, '..', 'src/user-config/types.ts'), 'utf-8');
+    const reader = readFileSync(join(import.meta.dir, '..', 'src/user-config.ts'), 'utf-8');
+    expect(types).toMatch(/dig\?: \{ autoGoal\?:/);
+    expect(reader).toMatch(/autoGoal[\s\S]{0,200}enabled === true/);
   });
 });

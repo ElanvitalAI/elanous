@@ -10,10 +10,13 @@ export interface ReadinessRequirement {
   readonly id: string;
   readonly gates: readonly CountdownGate[];
   readonly expectedReadyAt: number;
+  /** If present, this requirement is satisfied only by the matching simulated PR-land event. */
+  readonly pr?: { readonly number: number; readonly headSha: string };
 }
 
 export type ReadinessEvent =
   | { readonly at: number; readonly type: 'requirement-ready'; readonly id: string }
+  | { readonly at: number; readonly type: 'pr-landed'; readonly number: number; readonly headSha: string }
   | { readonly at: number; readonly type: 'hold'; readonly reason: string }
   | { readonly at: number; readonly type: 'release-hold' }
   | { readonly at: number; readonly type: 'host-ready'; readonly host: string }
@@ -30,6 +33,12 @@ export interface ReadinessCountdownInput {
   readonly countdownMilliseconds: number;
   readonly hostReservationLeadMilliseconds: number;
   readonly hostReservationBufferMilliseconds: number;
+  /** Stop this simulated launch and disposition it to the next cycle at this distinct-hold count. */
+  readonly maxHoldsBeforeNextCycle?: number;
+  /** Notify the principal once when ETA moves beyond the fixed constraint by this much. */
+  readonly materialDelayThresholdMilliseconds?: number;
+  /** Historical gate durations used to estimate the next gate's duration. */
+  readonly priorGateDurationsMilliseconds?: readonly number[];
 }
 
 export interface ReadinessSnapshot {
@@ -43,10 +52,12 @@ export interface ReadinessSnapshot {
   readonly milestoneBlockers: readonly string[];
   readonly holdReason: string | null;
   readonly eta: number;
-  readonly notifications: readonly { readonly type: 'eta-changed'; readonly eta: number }[];
+  readonly notifications: readonly { readonly type: 'eta-changed' | 'material-delay'; readonly eta: number }[];
   readonly host: string | null;
   readonly hostReservedUntil: number | null;
   readonly completed: readonly CountdownGate[];
+  readonly disposition: 'active' | 'next-cycle';
+  readonly gateDurationEstimateMilliseconds: number;
 }
 
 const GATES: readonly CountdownGate[] = ['cutoff', 'gate', 'publish', 'announcement'];
@@ -57,6 +68,9 @@ function pendingRequirements(requirements: readonly ReadinessRequirement[], read
 
 /** Replays the release launch checks from boundary events in event-time order. */
 export function simulateReadinessCountdown(input: ReadinessCountdownInput): ReadinessSnapshot[] {
+  if (input.maxHoldsBeforeNextCycle !== undefined && (!Number.isInteger(input.maxHoldsBeforeNextCycle) || input.maxHoldsBeforeNextCycle <= 0)) {
+    throw new RangeError('maxHoldsBeforeNextCycle must be a positive integer');
+  }
   const events = [...input.events].sort((a, b) => a.at - b.at);
   const ready = new Map<string, number>();
   const completed = new Set<CountdownGate>();
@@ -77,9 +91,16 @@ export function simulateReadinessCountdown(input: ReadinessCountdownInput): Read
   let reservedUntil: number | null = null;
   let launchPhase: LaunchCountdownPhase = 'T-11h';
   let holdCount = 0;
+  let disposition: ReadinessSnapshot['disposition'] = 'active';
+  let materialDelayNotified = false;
+  const priorDurations = (input.priorGateDurationsMilliseconds ?? []).filter((duration) => Number.isFinite(duration) && duration >= 0).sort((a, b) => a - b);
+  const priorGateMedian = priorDurations.length === 0 ? 0 : priorDurations.length % 2 === 1
+    ? priorDurations[Math.floor(priorDurations.length / 2)]!
+    : (priorDurations[priorDurations.length / 2 - 1]! + priorDurations[priorDurations.length / 2]!) / 2;
 
   const currentGate = () => GATES.find((candidate) => !completed.has(candidate)) ?? null;
-  const stageDuration = (gate: CountdownGate): number => Math.max(input.countdownMilliseconds, gate === 'gate' ? measuredGateDuration : 0);
+  const gateDurationEstimate = (): number => Math.max(priorGateMedian, measuredGateDuration);
+  const stageDuration = (gate: CountdownGate): number => Math.max(input.countdownMilliseconds, gate === 'gate' ? gateDurationEstimate() : 0);
   const stageElapsed = (): number => countdownStartedAt === null ? 0 : Math.max(0, now - countdownStartedAt - countdownPausedMilliseconds - (countdownPausedAt === null ? 0 : now - countdownPausedAt));
   const stageRemaining = (gate: CountdownGate): number => countdownStartedAt === null
     ? stageDuration(gate)
@@ -118,7 +139,12 @@ export function simulateReadinessCountdown(input: ReadinessCountdownInput): Read
     const remaining = gate ? stageRemaining(gate) : 0;
     // A fixed clock constrains the earliest start; it never fires a launch by itself.
     const eta = Math.max(input.fixedTimeConstraint, expectedReadyAt) + remaining;
-    const notifications = previousEta !== null && previousEta !== eta ? [{ type: 'eta-changed' as const, eta }] : [];
+    const notifications: ReadinessSnapshot['notifications'][number][] = previousEta !== null && previousEta !== eta ? [{ type: 'eta-changed', eta }] : [];
+    const materiallyDelayed = eta - input.fixedTimeConstraint > (input.materialDelayThresholdMilliseconds ?? Number.POSITIVE_INFINITY);
+    if (materiallyDelayed && !materialDelayNotified) {
+      notifications.push({ type: 'material-delay', eta });
+      materialDelayNotified = true;
+    }
     if (previousEta !== eta) previousEta = eta;
     if (gate !== 'gate' || !hostReady) reservationStarted = false;
     else if (eta - now <= input.hostReservationLeadMilliseconds) reservationStarted = true;
@@ -143,17 +169,31 @@ export function simulateReadinessCountdown(input: ReadinessCountdownInput): Read
       host: hostReady ? host : null,
       hostReservedUntil: hostReady ? reservedUntil : null,
       completed: [...completed],
+      disposition,
+      gateDurationEstimateMilliseconds: gateDurationEstimate(),
     };
   };
 
   snapshots.push(snapshot());
   for (const event of events) {
+    if (disposition === 'next-cycle') break;
     now = event.at;
     switch (event.type) {
-      case 'requirement-ready': ready.set(event.id, event.at); break;
+      case 'requirement-ready':
+        if (!input.requirements.some((requirement) => requirement.id === event.id && requirement.pr)) ready.set(event.id, event.at);
+        break;
+      case 'pr-landed':
+        for (const requirement of input.requirements) {
+          if (requirement.pr?.number === event.number && requirement.pr.headSha === event.headSha) ready.set(requirement.id, event.at);
+        }
+        break;
       case 'hold':
         // A repeated hold signal is idempotent while the same no-go is active.
-        if (holdReason === null) { holdReason = event.reason; holdCount++; }
+        if (holdReason === null) {
+          holdReason = event.reason;
+          holdCount++;
+          if (input.maxHoldsBeforeNextCycle !== undefined && holdCount >= input.maxHoldsBeforeNextCycle) disposition = 'next-cycle';
+        }
         break;
       case 'release-hold': holdReason = null; break;
       case 'host-ready': host = event.host; hostReady = true; hostReadyAt = event.at; break;

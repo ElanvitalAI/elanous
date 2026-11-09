@@ -232,7 +232,7 @@ test('handleAppUploads gates requests and returns storage list failures as 503',
 
   const unavailable = createAppUpload({
     store: {
-      provider: 'local', put() {}, get() {}, head() { return { exists: false }; }, list() { throw new Error('offline'); }, publicUrl() { return null; },
+      provider: 'local', put() {}, delete() {}, get() {}, head() { return { exists: false }; }, list() { throw new Error('offline'); }, publicUrl() { return null; },
     },
   });
   expect((await handleAppUploads(new Request(url), { appUpload: unavailable, authorize: () => true })).status).toBe(503);

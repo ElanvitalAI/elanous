@@ -7,6 +7,7 @@ import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { Command } from 'commander';
 import { registerGraphCommands } from './graph-cli.js';
 import { runGraph } from './runner.js';
+import { writeReleaseGraphFixture } from '../../test/helpers/release-graph-fixture.js';
 import { simCli } from '../ux-sim/in-process-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -366,7 +367,7 @@ test('release graph approve resumes publish immediately and rejection takes rest
     const releaseDir = join(graphRoot, 'release');
     mkdirSync(releaseDir, { recursive: true });
     const graphPath = join(releaseDir, 'release-loop.yaml');
-    writeFileSync(graphPath, `graph_id: release-loop
+    writeReleaseGraphFixture(graphPath, `graph_id: release-loop
 version: 1
 entry_node: approve-publish
 terminal_nodes: [done, failed]
@@ -515,11 +516,13 @@ edges:
   expect(rejectedFirst.code).toBe(0);
   const rejectedId = JSON.parse(rejectedFirst.stdout).runId as string;
   const rejection = await runGraphInProcess(stateRoot, 'approve', 'cli-approval', rejectedId, '--reject', '--by', 'reviewer');
-  expect(rejection.code).toBe(0);
+  expect(rejection.code).toBe(1);
+  expect(rejection.stderr).toContain(`cli-approval ${rejectedId}: approval rejected by reviewer`);
   const failed = await runGraphInProcess(stateRoot, 'run', graph, '--resume', rejectedId, '--json');
   expect(failed.code).toBe(1);
   expect(JSON.parse(failed.stdout).status).toBe('failed');
   expect(JSON.parse(failed.stdout).nodes[1]).toMatchObject({ nodeId: 'gate', ok: false, decidedBy: 'reviewer' });
+  expect(JSON.parse(failed.stdout).nodes[1].failure.message).toBe('approval rejected by reviewer');
   expect(readFileSync(join(dir, 'executions'), 'utf8')).toBe('aba');
   const unnamedFirst = await runGraphInProcess(stateRoot, 'run', graph, '--json');
   expect(unnamedFirst.code).toBe(0);
@@ -643,6 +646,15 @@ test('CLI --resume --from restarts the failed path and writes progress only to s
   expect(JSON.parse(resumed.stdout)).toMatchObject({ status: 'done', path: ['first', 'second', 'done'], resume: { from: 'second', previousStatus: 'failed' } });
   expect(readFileSync(marker, 'utf8')).toBe('ab');
   expect((await spawnGraph(stateRoot, 'run', graph, '--from', 'second')).stderr).toContain('--from requires --resume');
+  rmSync(join(dir, 'ready'));
+  const next = JSON.parse((await spawnGraph(stateRoot, 'run', graph, '--json')).stdout);
+  const visitId = next.nodes[1].executionId as string;
+  expect((await spawnGraph(stateRoot, 'run', graph, '--resume', next.runId, '--from', 'second', '--from-visit', visitId)).stderr)
+    .toContain('--from and --from-visit cannot be combined');
+  writeFileSync(join(dir, 'ready'), 'yes');
+  const byVisit = await spawnGraph(stateRoot, 'run', graph, '--resume', next.runId, '--from-visit', visitId, '--json');
+  expect(byVisit.code).toBe(0);
+  expect(JSON.parse(byVisit.stdout)).toMatchObject({ status: 'done', resume: { from: 'second', visitId } });
 }, 30000);
 
 test('spawned graph run rejects --input unless it is a JSON object before writing a run', async () => {

@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
+import { publishInsideEvent } from './inside-events.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
 import { resetUserConfig } from '../../user-config.js';
 import { createNexusState } from '../state/state.js';
@@ -60,8 +61,8 @@ function fixture(enabled: boolean | undefined) {
   chmodSync(join(dir, 'secret'), 0o600);
   const state = createNexusState({ nexusVersion: 'test', phase: 'test' });
   const opts = { state, registry: new TabRegistry(state), eventBus: new NexusEventBus(), metaApi: { bearerToken: OWNER, noAuth: false } };
-  const send = (path: string, headers: Record<string, string> = {}, method = 'GET') => {
-    const request = new Request(`http://ops.test${path}`, { method, headers: { 'sec-fetch-site': 'cross-site', ...headers } });
+  const send = (path: string, headers: Record<string, string> = {}, method = 'GET', signal?: AbortSignal) => {
+    const request = new Request(`http://ops.test${path}`, { method, signal, headers: { 'sec-fetch-site': 'cross-site', ...headers } });
     return routeRequest(request, opts, {} as never, null, createDevProxyRuntimeRef());
   };
   const run = (id: string, startedAt: string, version = '0.2.9', output: unknown = JSON.stringify({ summary: 'ok' })) => {
@@ -335,11 +336,14 @@ test('enabled and correct proxy header serves redacted run summaries and node lo
   const response = await send('/v1/ops/release/runs?version=0.2.9', headers);
   expect(response?.status).toBe(200);
   expect(response?.headers.get('cache-control')).toBe('no-store');
-  const runs = await response?.json() as Array<{ runId: string; status: string; startedAt: string; version: string; path: string[]; nodes: Array<{ nodeId: string; ok: boolean; summary: string }> }>;
-  expect(runs).toEqual([{
+  const runs = await response?.json() as Array<{ runId: string; status: string; startedAt: string; version: string; path: string[];
+    graph?: { nodes: Array<{ nodeId: string; kind: string }> }; nodes: Array<{ nodeId: string; ok: boolean; summary: string }> }>;
+  const { graph, ...runSummary } = runs[0]!;
+  expect([runSummary]).toEqual([{
     runId: 'run-1', status: 'running', startedAt: '2026-10-02T00:00:00Z', version: '0.2.9', path: ['version-release'],
     nodes: [{ nodeId: 'version-release', ok: true, summary: `sk-*** ${'a'.repeat(293)}` }],
   }]);
+  expect(graph?.nodes.some((node) => node.nodeId === 'gate' && node.kind === 'gate')).toBe(true);
   expect(JSON.stringify(runs)).not.toContain(API_KEY);
   const logResponse = await send('/v1/ops/release/runs/run-1/nodes/version-release/log', headers);
   expect(logResponse?.status).toBe(200);
@@ -363,11 +367,15 @@ test('run list redacts secrets in stored metadata without a version filter', asy
   expect(response?.status).toBe(200);
   const body = await response?.text() ?? '';
   expect(body).not.toContain(API_KEY);
-  expect(JSON.parse(body)).toEqual([{
+  const parsedRuns = JSON.parse(body) as Array<{ graph?: { nodes: Array<{ nodeId: string; kind: string }> }; runId: string;
+    status: string; startedAt: string; version: string | null; path: string[]; nodes: Array<{ nodeId: string; ok: boolean; summary: string }> }>;
+  const { graph, ...runSummary } = parsedRuns[0]!;
+  expect([runSummary]).toEqual([{
     runId: 'run-1', status: 'running sk-***', startedAt: '2026-10-02T00:00:00Z sk-***',
     version: null, path: ['version-release sk-***'],
     nodes: [{ nodeId: 'version-release sk-***', ok: true, summary: 'ok' }],
   }]);
+  expect(graph?.nodes.some((node) => node.nodeId === 'gate' && node.kind === 'gate')).toBe(true);
   writeFileSync(join(folder, `${API_KEY}.json`), JSON.stringify({
     status: 'running', path: [], startedAt: '2026-10-01T00:00:00Z',
     input: { version: '0.2.9' }, nodes: [],
@@ -524,7 +532,7 @@ test('GATE-LIVE-OBS: a run sitting on gate carries the shard table of its own ve
     writeFileSync(join(folder, 'no-file.json'), gate('0.2.21'));
     writeFileSync(join(folder, 'publishing.json'), JSON.stringify({ status: 'running', path: ['gate', 'publish'], startedAt: '2026-10-06T00:00:00.000Z',
       input: { version: '0.2.20' }, nodes: [{ nodeId: 'gate', ok: true, output: '' }], currentNode: { nodeId: 'publish', startedAt: '2026-10-06T01:00:00.000Z' } }));
-    writeGateShards(gateShardsPath('0.2.20', root), { v: 1, version: '0.2.20', updatedAt: '2026-10-07T00:30:00.000Z', shards: [
+    writeGateShards(gateShardsPath('0.2.20', root), { v: 1, version: '0.2.20', runId: 'on-gate', updatedAt: '2026-10-07T00:30:00.000Z', shards: [
       { id: 'pod-0', state: 'running', startedAt: '2026-10-07T00:20:00.000Z', plannedMin: 20 },
       { id: 'pod-1', state: 'pending', waitReason: 'CPU 부족 31.2/32', plannedMin: 10 },
     ] });
@@ -536,6 +544,47 @@ test('GATE-LIVE-OBS: a run sitting on gate carries the shard table of its own ve
     expect(runs.find((run) => run.runId === 'no-file')?.gateShards).toBeUndefined();
     expect(runs.find((run) => run.runId === 'publishing')?.gateShards).toBeUndefined();
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('release gate progress is bounded, ordered, redacted, run-owned, and streamed only to its matching run', async () => {
+  const { dir, send } = fixture(true);
+  const folder = join(dir, 'graph-runs', 'release-loop');
+  const runId = 'run-a';
+  const startedAt = '2026-10-07T00:02:00.000Z';
+  mkdirSync(join(folder, `${runId}.json.contexts`), { recursive: true });
+  writeFileSync(join(folder, `${runId}.json`), JSON.stringify({ graphId: 'release-loop', runId, status: 'running',
+    path: ['gate'], startedAt, input: { version: '0.3.7' }, nodes: [], currentNode: { nodeId: 'gate', startedAt } }));
+  writeFileSync(join(folder, 'other-run.json'), JSON.stringify({ graphId: 'release-loop', runId: 'other-run', status: 'running',
+    path: ['gate'], startedAt, input: { version: '0.3.7' }, nodes: [], currentNode: { nodeId: 'gate', startedAt } }));
+  writeFileSync(join(folder, `${runId}.json.contexts`, '10.json.gate-progress.jsonl'), `${JSON.stringify({
+    phase: 'shard-decision', eventId: 'event-10', at: '2026-10-07T00:03:10.000Z', shard: 'pod-1', decision: 'rerun', reason: 'token=private-value',
+  })}\n`);
+  writeFileSync(join(folder, `${runId}.json.contexts`, '2.json.gate-progress.jsonl'), `${JSON.stringify({
+    phase: 'shard-plan', eventId: 'event-2', at: '2026-10-07T00:03:02.000Z', rerunReasons: { 'api_key=private-key': 1 },
+  })}\n`);
+  writeGateShards(gateShardsPath('0.3.7', dir), { v: 1, version: '0.3.7', runId,
+    updatedAt: '2026-10-07T00:03:10.000Z', shards: [{ id: 'pod-1', state: 'running', reuseReason: 'token=private-value' }] });
+  const headers = { 'x-elanous-operator': SECRET };
+  const list = await (await send('/v1/ops/release/runs', headers))?.json() as Array<Record<string, unknown>>;
+  const run = list.find((item) => item.runId === runId)!;
+  const serialized = JSON.stringify(run);
+  expect(serialized).not.toContain('private-value');
+  expect(serialized).not.toContain('private-key');
+  expect((run.gateProgress as Array<{ eventId: string }>).map((event) => event.eventId)).toEqual(['event-2', 'event-10']);
+  expect(list.find((item) => item.runId === 'other-run')?.gateShards).toBeUndefined();
+
+  const controller = new AbortController();
+  const response = await send(`/v1/ops/release/runs/${runId}/events`, headers, 'GET', controller.signal);
+  expect(response?.status).toBe(200);
+  const reader = response!.body!.getReader();
+  await reader.read(); // connected frame
+  publishInsideEvent({ kind: 'release.gate.progress', graphId: 'release-loop', runId: 'other-run', eventId: 'wrong-run', data: {} });
+  publishInsideEvent({ kind: 'release.gate.progress', graphId: 'release-loop', runId, eventId: 'live-event', data: { phase: 'shard-plan' } });
+  const frame = new TextDecoder().decode((await reader.read()).value);
+  expect(frame).toContain('live-event');
+  expect(frame).not.toContain('wrong-run');
+  await reader.cancel();
+  controller.abort();
 });
 
 test('resources: bearerless 401, stale cache answered immediately, and the injected collector/ssh path is never called', async () => {

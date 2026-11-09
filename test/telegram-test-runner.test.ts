@@ -4,7 +4,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { buildTelegramTestConfig } from '../src/telegram-test-runner.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 
 function prodCfg(): UserConfig {
   return {

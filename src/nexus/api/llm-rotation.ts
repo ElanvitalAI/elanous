@@ -16,17 +16,8 @@
 // Empty rotation list = 200 OK with entries:[], activeIndex:-1. POST /next
 // on empty list = 409 'no-rotation-configured'.
 
-import {
-  getUserConfig,
-  saveUserConfig,
-  reloadUserConfig,
-  rotateNextProvider,
-  currentRotationIndex,
-  modelDisplayForRotationEntry,
-  rotationEntryLabel,
-  type RotationEntry,
-  type UserConfig,
-} from '../../user-config.js';
+import { getUserConfig, saveUserConfig, reloadUserConfig, rotateNextProvider, currentRotationIndex, modelDisplayForRotationEntry, rotationEntryLabel } from '../../user-config.js';
+import type { RotationEntry, UserConfig } from '../../user-config/types.js';
 
 interface RotationEntryWire {
   /** Stable index (position in the user's rotation array). */

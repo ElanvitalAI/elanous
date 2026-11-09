@@ -47,7 +47,8 @@ import { arcIdForPhase } from './mission-arc.js';
 import { TaskStore } from '../task-orchestrator/store.js';
 import { buildSelfHealContext, formatSelfHealContextForPrompt } from './mission-selfheal-context.js';
 import { persistMissionRouteDecision, routeDecisionFromExecutionBackend } from './mission-route-decision.js';
-import { getUserConfig, type LlmRoutePolicyConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { LlmRoutePolicyConfig } from '../user-config/types.js';
 
 export type PhaseKind = 'implementation' | 'operational';
 

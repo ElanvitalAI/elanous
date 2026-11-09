@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import ts from 'typescript';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -28,77 +29,65 @@ export interface CutBranchDependencyPick {
 type NamedImport = { source: string; symbol: string; local: string };
 type ImportDeclaration = { startLine: number; endLine: number; imports: NamedImport[] };
 
+function sourceFile(text: string): ts.SourceFile {
+  return ts.createSourceFile('cut-append-module.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+}
+
+function modifier(node: ts.Node, kind: ts.SyntaxKind): boolean {
+  return ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((item) => item.kind === kind);
+}
+
+function bindingNames(name: ts.BindingName, into: Set<string>): void {
+  if (ts.isIdentifier(name)) { into.add(name.text); return; }
+  for (const element of name.elements) if (!ts.isOmittedExpression(element)) bindingNames(element.name, into);
+}
+
 function importDeclarations(text: string): ImportDeclaration[] {
   const result: ImportDeclaration[] = [];
-  for (const match of text.matchAll(/import\s+(?:type\s+)?\{([\s\S]*?)\}\s*from\s*['"]([^'"]+)['"]/g)) {
-    const before = text.slice(0, match.index);
-    const startLine = before.split('\n').length - 1;
-    const endLine = startLine + match[0]!.split('\n').length - 1;
+  for (const statement of sourceFile(text).statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
+    const startLine = statement.getSourceFile().getLineAndCharacterOfPosition(statement.getStart()).line;
+    const endLine = statement.getSourceFile().getLineAndCharacterOfPosition(statement.end).line;
     const imports: NamedImport[] = [];
-    for (const entry of match[1]!.split(',')) {
-      const parts = entry.trim().replace(/^type\s+/, '').split(/\s+as\s+/).map((part) => part.trim());
-      const symbol = parts[0];
-      const local = parts.at(-1);
-      if (symbol && local && /^[\w$]+$/.test(symbol) && /^[\w$]+$/.test(local)) imports.push({ source: match[2]!, symbol, local });
+    const bindings = statement.importClause?.namedBindings;
+    if (statement.importClause?.name) imports.push({ source: statement.moduleSpecifier.text, symbol: 'default', local: statement.importClause.name.text });
+    if (bindings && ts.isNamedImports(bindings)) {
+      for (const element of bindings.elements) imports.push({
+        source: statement.moduleSpecifier.text,
+        symbol: element.propertyName?.text ?? element.name.text,
+        local: element.name.text,
+      });
     }
     if (imports.length) result.push({ startLine, endLine, imports });
-  }
-  for (const match of text.matchAll(/\bimport\s+(?:type\s+)?([\w$]+)(?:\s*,\s*\{[^}]*\})?\s+from\s*['"]([^'"]+)['"]/g)) {
-    const before = text.slice(0, match.index);
-    const startLine = before.split('\n').length - 1;
-    const endLine = startLine + match[0]!.split('\n').length - 1;
-    result.push({ startLine, endLine, imports: [{ source: match[2]!, symbol: 'default', local: match[1]! }] });
   }
   return result;
 }
 
 function exportedDeclarations(text: string): Set<string> {
-  const symbols = new Set([...text.matchAll(/\bexport\s+(?:(?:declare|abstract|async)\s+)*(?:function|class|const|let|var|enum|interface|type)\s+([\w$]+)/g)]
-    .map((match) => match[1]!));
-  if (/\bexport\s+default\b/.test(text)) symbols.add('default');
+  const symbols = new Set<string>();
+  for (const statement of sourceFile(text).statements) {
+    if (ts.isExportAssignment(statement) && !statement.isExportEquals) symbols.add('default');
+    if (!modifier(statement, ts.SyntaxKind.ExportKeyword)) continue;
+    const isDefault = modifier(statement, ts.SyntaxKind.DefaultKeyword);
+    if (isDefault) symbols.add('default');
+    if (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) || ts.isEnumDeclaration(statement) ||
+        ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) {
+      if (statement.name && !isDefault) symbols.add(statement.name.text);
+    } else if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) bindingNames(declaration.name, symbols);
+    }
+  }
   return symbols;
 }
 
 function localDeclarations(text: string): Set<string> {
-  const names = new Set([...text.matchAll(/^[ \t]*(?:(?:export|declare|abstract|async)[ \t]+)*(?:function|class|enum|interface|type)[ \t]+([\w$]+)/gm)]
-    .map((match) => match[1]!));
-  const lines = text.split(/\r?\n/);
-  for (let line = 0; line < lines.length; line += 1) {
-    const match = lines[line]!.match(/^[ \t]*(?:(?:export|declare)[ \t]+)*(?:const|let|var)[ \t]+(.+)$/);
-    if (!match) continue;
-    let declaration = match[1]!;
-    let depth = 0;
-    let quote = '';
-    const scan = (value: string): void => {
-      for (let index = 0; index < value.length; index += 1) {
-        const char = value[index]!;
-        if (quote) {
-          if (char === quote && value[index - 1] !== '\\') quote = '';
-        } else if (char === '"' || char === "'" || char === '`') quote = char;
-        else if (char === '(' || char === '[' || char === '{') depth += 1;
-        else if (char === ')' || char === ']' || char === '}') depth -= 1;
-      }
-    };
-    scan(declaration);
-    while (line + 1 < lines.length && (depth > 0 || declaration.trimEnd().endsWith(','))) {
-      declaration += `\n${lines[++line]!}`;
-      scan(lines[line]!);
-    }
-    let start = 0;
-    depth = 0;
-    quote = '';
-    for (let index = 0; index <= declaration.length; index += 1) {
-      const char = declaration[index] ?? ',';
-      if (quote) {
-        if (char === quote && declaration[index - 1] !== '\\') quote = '';
-      } else if (char === '"' || char === "'" || char === '`') quote = char;
-      else if (char === '(' || char === '[' || char === '{') depth += 1;
-      else if (char === ')' || char === ']' || char === '}') depth -= 1;
-      else if (char === ',' && depth === 0) {
-        const name = declaration.slice(start, index).match(/^\s*([\w$]+)(?:\s*:\s*[^=,;]+)?\s*(?:=|;|$)/)?.[1];
-        if (name) names.add(name);
-        start = index + 1;
-      }
+  const names = new Set<string>();
+  for (const statement of sourceFile(text).statements) {
+    if (ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) || ts.isEnumDeclaration(statement) ||
+        ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) {
+      if (statement.name) names.add(statement.name.text);
+    } else if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) bindingNames(declaration.name, names);
     }
   }
   return names;
@@ -106,14 +95,11 @@ function localDeclarations(text: string): Set<string> {
 
 function namedExportLists(text: string): Array<{ entries: Array<{ source: string; exported: string }>; module?: string }> {
   const lists: Array<{ entries: Array<{ source: string; exported: string }>; module?: string }> = [];
-  for (const match of text.matchAll(/\bexport\s*(?:type\s+)?\{([^}]+)\}(?:\s*from\s*['"]([^'"]+)['"])?/g)) {
-    const entries = match[1]!.split(',').flatMap((entry) => {
-      const parts = entry.trim().replace(/^type\s+/, '').split(/\s+as\s+/).map((part) => part.trim());
-      const source = parts[0];
-      const exported = parts.at(-1);
-      return source && exported && /^[\w$]+$/.test(source) && /^[\w$]+$/.test(exported) ? [{ source, exported }] : [];
-    });
-    lists.push({ entries, ...(match[2] === undefined ? {} : { module: match[2] }) });
+  for (const statement of sourceFile(text).statements) {
+    if (!ts.isExportDeclaration(statement) || !statement.exportClause || !ts.isNamedExports(statement.exportClause)) continue;
+    const entries = statement.exportClause.elements.map((element) => ({ source: element.propertyName?.text ?? element.name.text, exported: element.name.text }));
+    const module = statement.moduleSpecifier && ts.isStringLiteral(statement.moduleSpecifier) ? statement.moduleSpecifier.text : undefined;
+    lists.push({ entries, ...(module === undefined ? {} : { module }) });
   }
   return lists;
 }
@@ -141,8 +127,9 @@ function modulePathAtRef(repo: string, ref: string, importer: string, specifier:
 function reexportPaths(repo: string, ref: string, path: string): string[] {
   const text = fileAtRef(repo, ref, path) ?? '';
   const paths: string[] = [];
-  for (const match of text.matchAll(/\bexport\s*(?:type\s+)?(?:\*|\{[^}]*\})\s*from\s*['"]([^'"]+)['"]/g)) {
-    const resolved = modulePathAtRef(repo, ref, path, match[1]!);
+  for (const statement of sourceFile(text).statements) {
+    if (!ts.isExportDeclaration(statement) || !statement.moduleSpecifier || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
+    const resolved = modulePathAtRef(repo, ref, path, statement.moduleSpecifier.text);
     if (resolved) paths.push(resolved);
   }
   for (const { source } of importDeclarations(text).flatMap(({ imports }) => imports)) {
@@ -186,9 +173,15 @@ function exportedSymbolsAtRef(repo: string, ref: string, path: string, seen = ne
       }
     }
   }
-  for (const match of text.matchAll(/\bexport\s*(?:type\s+)?\*\s*from\s*['"]([^'"]+)['"]/g)) {
-    const child = modulePathAtRef(repo, ref, path, match[1]!);
-    if (child) for (const symbol of exportedSymbolsAtRef(repo, ref, child, new Set(seen))) if (symbol !== 'default') symbols.add(symbol);
+  for (const statement of sourceFile(text).statements) {
+    if (!ts.isExportDeclaration(statement) || !statement.moduleSpecifier || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
+    const child = modulePathAtRef(repo, ref, path, statement.moduleSpecifier.text);
+    if (!child) continue;
+    if (!statement.exportClause) {
+      for (const symbol of exportedSymbolsAtRef(repo, ref, child, new Set(seen))) if (symbol !== 'default') symbols.add(symbol);
+    } else if (ts.isNamespaceExport(statement.exportClause)) {
+      symbols.add(statement.exportClause.name.text);
+    }
   }
   return symbols;
 }

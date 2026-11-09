@@ -6,6 +6,7 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync,
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { validateWarmHostProbeUrl } from './warm-host-probe.js';
 import type { Kubectl } from './self-implement-pod.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { debug } from '../../debug/log.js';
@@ -46,7 +47,7 @@ export interface WarmPodSpec {
   cutSha: string;
   key: WarmWorkerKey;
   /** Runtime prerequisites independent of the image digest; source code is checked out separately. */
-  runtimeContract?: { baseImageDigest?: string; bunVersion: string; os: 'linux'; architecture: string; requiredTools: readonly string[] };
+  runtimeContract?: { baseImageDigest?: string; lockHash?: string; bunVersion: string; os: 'linux'; architecture: string; requiredTools: readonly string[] };
   /** Resident worker tier. A lite Pod is capped at 2 GiB, including each request exec. */
   memoryLimit?: '2Gi' | '16Gi';
   /** Caller resolves the live host daemon endpoint; no guessed port. */
@@ -76,14 +77,12 @@ if (!(await warmIsolationEnforced())) throw new Error('warm Pod isolation not en
 
 /** Clone and verify source while the private mirror is mounted only here. */
 export const WARM_POD_PREPARE = `import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 const checked = (argv) => { const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); if (r.status !== 0) throw new Error(argv[0] + ': ' + r.stderr); return r.stdout.trim(); };
 checked(['git', 'clone', '--quiet', '--no-checkout', process.env.WARM_SOURCE_URL, '/workspace/repo']);
 checked(['git', '-C', '/workspace/repo', 'checkout', '--detach', '--quiet', process.env.WARM_CUT_SHA]);
 if (checked(['git', '-C', '/workspace/repo', 'rev-parse', 'HEAD']) !== process.env.WARM_CUT_SHA) throw new Error('warm source SHA mismatch');
-const lock = createHash('sha256').update(readFileSync('/workspace/repo/bun.lock')).digest('hex');
-if (lock !== process.env.WARM_LOCK_HASH) throw new Error('warm lock mismatch');
+const { gateLockfileHash } = await import('/workspace/repo/src/self-implement/gate-receipt-registry.ts');
+if (gateLockfileHash('/workspace/repo') !== process.env.WARM_LOCK_HASH) throw new Error('warm lock mismatch');
 checked(['git', '-C', '/workspace/repo', 'remote', 'remove', 'origin']);`;
 
 /** Install after the checkout init container and its private mirror mount have exited. */
@@ -94,6 +93,7 @@ checked(['bun', 'install', '--frozen-lockfile', '--cwd', '/workspace/repo']);
 checked(['chmod', '-R', 'a+rX', '/workspace/repo']);`;
 
 /** Each exec starts a short-lived Bun process; the Pod, checkout and installed dependencies remain warm. */
+// ELANOUS_GATE_BASE_IMAGE_DIGEST is baked into the image by docker/harness/Dockerfile; never override it in the Pod spec.
 export const WARM_POD_EXEC = `import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -104,7 +104,9 @@ if (command.workerId !== process.env.WARM_WORKER_ID || command.cutSha !== proces
   || command.key?.context !== process.env.WARM_CONTEXT
   || command.key?.imageDigest !== process.env.WARM_IMAGE_DIGEST
   || command.key?.lockHash !== process.env.WARM_LOCK_HASH
-  || command.key?.architecture !== process.env.WARM_ARCHITECTURE)
+  || command.key?.architecture !== process.env.WARM_ARCHITECTURE
+  || !/^sha256:[a-f0-9]{64}$/.test(process.env.ELANOUS_GATE_BASE_IMAGE_DIGEST ?? '')
+  || command.baseImageDigest !== process.env.ELANOUS_GATE_BASE_IMAGE_DIGEST)
   throw new Error('warm command differs from Pod identity');
 chmodSync('/workspace/data', 0o755);
 if (statSync('/workspace/data').uid !== Number(process.env.WARM_BRIDGE_UID)) throw new Error('warm data owner changed');
@@ -140,11 +142,12 @@ if (realpathSync(git(['rev-parse', '--show-toplevel'])) !== realpathSync('/works
   || git(['status', '--porcelain', '--untracked-files=no'])
   || tracked.some(entry => !entry.startsWith('H ')))
   throw new Error('warm source changed');
-if (createHash('sha256').update(readFileSync('/workspace/repo/bun.lock')).digest('hex') !== process.env.WARM_LOCK_HASH)
-  throw new Error('warm lock changed');
+const { gateLockfileHash } = await import(pathToFileURL('/workspace/repo/src/self-implement/gate-receipt-registry.ts').href);
+if (gateLockfileHash('/workspace/repo') !== process.env.WARM_LOCK_HASH) throw new Error('warm lock changed');
 const { WarmWorkerRuntime } = await import(pathToFileURL('/workspace/repo/src/task-orchestrator/surfaces/pod-warm-worker-runtime.ts').href);
 const { runWarmWorkerFile } = await import(pathToFileURL('/workspace/repo/src/task-orchestrator/surfaces/pod-warm-worker-runner.ts').href);
 const runtime = new WarmWorkerRuntime({ repoDir: '/workspace/repo', scratchDir: '/workspace/data/scratch', artifactsRoot: '/workspace/data/artifacts', workerId: process.env.WARM_WORKER_ID,
+  baseImageDigest: process.env.ELANOUS_GATE_BASE_IMAGE_DIGEST ?? '',
   runFile: runWarmWorkerFile });
 const result = await runtime.handle(command);
 const names = ['log', 'junit.xml', 'json', 'warm-manifest.json', 'rc'];
@@ -183,7 +186,8 @@ const tools = Object.fromEntries(request.requiredTools.map((tool) => {
   return [tool, found];
 }));
 const architecture = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch;
-process.stdout.write(JSON.stringify({ bunVersion: Bun.version, os: process.platform, architecture, tools }));`;
+const { gateLockfileHash } = await import('/workspace/repo/src/self-implement/gate-receipt-registry.ts');
+process.stdout.write(JSON.stringify({ bunVersion: Bun.version, os: process.platform, architecture, tools, lockHash: gateLockfileHash('/workspace/repo') }));`;
 
 function imageRepositoryAndDigest(image: unknown): { repository: string; digest: string } | null {
   if (typeof image !== 'string') return null;
@@ -208,7 +212,7 @@ export function warmRuntimeContractMatches(expected: NonNullable<WarmPodSpec['ru
   const value = observed as Record<string, unknown>;
   const tools = value.tools;
   return value.bunVersion === expected.bunVersion && value.os === expected.os
-    && value.architecture === expected.architecture && !!tools && typeof tools === 'object' && !Array.isArray(tools)
+    && value.architecture === expected.architecture && (expected.lockHash === undefined || value.lockHash === expected.lockHash) && !!tools && typeof tools === 'object' && !Array.isArray(tools)
     && expected.requiredTools.every(tool => (tools as Record<string, unknown>)[tool] === true);
 }
 
@@ -227,8 +231,12 @@ export function probeWarmPodRuntimeContract(spec: WarmPodSpec, kubectl: Kubectl)
   }
   try {
     const observed = JSON.parse(result.stdout) as unknown;
-    return { status: warmRuntimeContractMatches(expected, observed) ? 'compatible' : 'incompatible', observed };
+    return { status: warmRuntimeContractMatches({ ...expected, lockHash: spec.key.lockHash }, observed) ? 'compatible' : 'incompatible', observed };
   } catch { return { status: 'unavailable' }; }
+}
+
+function validWarmHostProbeUrl(value: string): boolean {
+  try { validateWarmHostProbeUrl(value); return true; } catch { return false; }
 }
 
 function validateSpec(spec: WarmPodSpec): void {
@@ -246,9 +254,11 @@ function validateSpec(spec: WarmPodSpec): void {
     || !spec.workerId || !SHA.test(spec.cutSha) || !DIGEST.test(spec.key.imageDigest)
     || !/^[a-f0-9]{64}$/.test(spec.key.lockHash) || !spec.key.context || !spec.key.architecture
     || !spec.image.endsWith(`@${spec.key.imageDigest}`)
-    || (spec.runtimeContract !== undefined && (typeof spec.runtimeContract.bunVersion !== 'string'
+    || (spec.runtimeContract !== undefined && ((spec.runtimeContract.lockHash !== undefined && spec.runtimeContract.lockHash !== spec.key.lockHash)
+      || typeof spec.runtimeContract.bunVersion !== 'string'
       || !/^\d+\.\d+\.\d+$/.test(spec.runtimeContract.bunVersion)
       || spec.runtimeContract.os !== 'linux' || spec.runtimeContract.architecture !== spec.key.architecture
+      || (spec.runtimeContract.baseImageDigest !== undefined && !DIGEST.test(spec.runtimeContract.baseImageDigest))
       || !Array.isArray(spec.runtimeContract.requiredTools) || spec.runtimeContract.requiredTools.length === 0
       || new Set(spec.runtimeContract.requiredTools).size !== spec.runtimeContract.requiredTools.length
       || spec.runtimeContract.requiredTools.some(tool => typeof tool !== 'string' || !/^[a-zA-Z0-9._+-]+$/.test(tool))))
@@ -256,7 +266,7 @@ function validateSpec(spec: WarmPodSpec): void {
     || (spec.sourceUrl !== undefined && !publicHttpsSource(spec.sourceUrl))
     || (spec.sourceMirrorHostPath !== undefined && (!isAbsolute(spec.sourceMirrorHostPath)
       || normalize(spec.sourceMirrorHostPath) !== spec.sourceMirrorHostPath || !spec.nodeName))
-    || !probeValid(spec.hostProbeUrl, 'host.orb.internal')
+    || !validWarmHostProbeUrl(spec.hostProbeUrl)
     || !probeValid(spec.prodProbeUrl, 'core.elanous-prod')
     || (spec.memoryLimit !== undefined && spec.memoryLimit !== '2Gi' && spec.memoryLimit !== '16Gi')
     || (spec.nodeName !== undefined && !DNS.test(spec.nodeName.replace(/\./g, '-')))) throw new Error('invalid warm Pod spec');

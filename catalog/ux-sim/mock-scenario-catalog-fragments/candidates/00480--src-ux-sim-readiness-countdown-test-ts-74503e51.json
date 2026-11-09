@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/readiness-countdown.test.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/readiness-countdown.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Asserts 11-07 fixed-time constraint, no-go/hold, ETA notification and host lease extension.",
+  "deviceId": "readiness-countdown",
+  "scenarioIds": [
+    "RLA-LAUNCH-COUNTDOWN-1107"
+  ]
+}

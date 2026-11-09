@@ -16,6 +16,7 @@
  * 풀을 안 주면 종전처럼 «현재 컨텍스트» 하나다(동작 불변).
  */
 import { spawn, spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../util/spawn-sync-output.js';
 import { randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from 'node:fs';
@@ -87,7 +88,9 @@ function localImageCommit(image: string, inspect: LocalImageInspect = defaultLoc
 }
 
 function defaultLocalImageInspect(image: string): { status: number | null; stdout: string } {
-  const r = spawnSync('docker', ['image', 'inspect', image, '--format', '{{index .Config.Labels "elanous.commit"}}'], { encoding: 'utf8', timeout: 30_000 });
+  const r = spawnSync('docker', ['image', 'inspect', image, '--format', '{{index .Config.Labels "elanous.commit"}}'], {
+    encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   return { status: r.status, stdout: r.stdout ?? '' };
 }
 
@@ -748,6 +751,7 @@ export function runProcessGroupPipeline(pipeline: string, opts: { timeoutMs: num
     timeout: opts.timeoutMs,
     killSignal: 'SIGTERM',
     env: { ...process.env, ELANOUS_PIPE_CMD: pipeline, ELANOUS_PIPE_PARENT: String(opts.parentPid ?? process.pid), ELANOUS_PIPE_WATCH: String(opts.watchIntervalSec ?? 2) },
+    maxBuffer: SPAWN_SYNC_MAX_BUFFER,
   });
   const timedOut = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
   return { status: r.status, stderr: (r.stderr ?? '') + (timedOut ? ` · timed out after ${opts.timeoutMs}ms (process group killed)` : r.error ? ` · ${String(r.error)}` : ''), timedOut };
@@ -760,7 +764,9 @@ function defaultImageShip(member: PodPoolMember, image: string): { status: numbe
 
 /** This machine's image ID (`sha256:…` — `docker save | docker load` keeps it). Null when unreadable. */
 function defaultLocalImageId(image: string): { status: number | null; stdout: string } {
-  const r = spawnSync('docker', ['image', 'inspect', image, '--format', '{{.Id}}'], { encoding: 'utf8', timeout: 30_000 });
+  const r = spawnSync('docker', ['image', 'inspect', image, '--format', '{{.Id}}'], {
+    encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   return { status: r.status, stdout: r.stdout ?? '' };
 }
 
@@ -776,7 +782,9 @@ export function remoteImageId(member: PodPoolMember, image: string, run: RemoteR
 }
 
 export function defaultRemoteRun(host: string, script: string): { status: number | null; stdout: string; stderr: string } {
-  const r = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, `export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.orbstack/bin:$PATH; unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; ${script}`], { encoding: 'utf8', timeout: REMOTE_RUN_TIMEOUT_MS });
+  const r = spawnSync('ssh', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, `export PATH=/opt/homebrew/bin:/usr/local/bin:$HOME/.orbstack/bin:$PATH; unset HTTPS_PROXY https_proxy HTTP_PROXY http_proxy ALL_PROXY all_proxy; ${script}`], {
+    encoding: 'utf8', timeout: REMOTE_RUN_TIMEOUT_MS, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   return { status: r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + (r.error ? String(r.error) : '') };
 }
 
@@ -931,8 +939,12 @@ export function checkPodPool(members: readonly PodPoolMember[], kubectl: PoolKub
 export type PoolImageSync = { ok: boolean; action: 'local' | 'fresh' | 'built' | 'shipped' | 'failed'; detail: string; ms: number; /** 노드 레지스트리의 이 판 이미지(있으면 Pod 가 pull). */ imageRef?: string };
 
 /** 이미지 빌드 스크립트 — 발사한 트리의 것(판이 HEAD 와 같다). 없으면 null(통째 전송으로 떨어진다). */
-export function podImageBuildScript(cwd: string = process.cwd()): string | null {
-  const top = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8' }).stdout?.trim();
+export function podImageBuildScript(cwd: string = process.cwd(),
+  probe: (root: string) => { status: number | null; stdout?: string | null; error?: Error } = (root) => spawnSync('git', ['rev-parse', '--show-toplevel'], {
+    cwd: root, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  })): string | null {
+  const result = probe(cwd);
+  const top = result.status === 0 && !result.error ? result.stdout?.trim() : undefined;
   for (const root of [top, resolve(import.meta.dir, '..', '..', '..')]) {
     if (root && existsSync(join(root, 'docker', 'harness', 'build.sh'))) return join(root, 'docker', 'harness', 'build.sh');
   }
@@ -1021,6 +1033,20 @@ export function runBuildScript(script: string, env: NodeJS.ProcessEnv): Promise<
       clearTimeout(timer);
       stderrPartial += stderrDecoder.end();
       if (stderrPartial) acceptStderrLine(stderrPartial);
+      const registryGc = out.split(/\r?\n/u).reverse().find((line) => line.startsWith('[registry-gc] '));
+      if (registryGc) {
+        const field = (name: string): string | null => new RegExp(`(?:^|\\s)${name}=([^\\s]+)`, 'u').exec(registryGc)?.[1] ?? null;
+        const reclaimedRaw = field('reclaimed_bytes');
+        const reclaimedBytes = reclaimedRaw && /^\d+$/u.test(reclaimedRaw) ? Number(reclaimedRaw) : null;
+        debug.log('pod.pool', 'registry-tag-gc', {
+          host: env.ELANOUS_BUILD_REMOTE ?? null,
+          image: env.ELANOUS_BUILD_IMAGE ?? null,
+          deletedTags: Number(field('deleted_tags')) || 0,
+          preservedTags: Number(field('preserved_tags')) || 0,
+          reclaimedBytes,
+          skipped: field('reason'),
+        });
+      }
       if (code !== 0 && stderrLineCount > 0) {
         const safeFirstError = stderrFirstError === null ? null : redactSecretText(stderrFirstError).slice(0, BUILD_STDERR_LINE_LIMIT);
         const safeTailLines = stderrTail.map((line) => redactSecretText(line).slice(0, BUILD_STDERR_LINE_LIMIT));
@@ -1064,7 +1090,11 @@ function defaultPoolPack(script: string): PoolPack {
 
 function defaultRemoteBuild(script: string, image: string): RemoteBuild {
   return (host, cluster, registry, packedTgz, sharedBuildId) => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { getUserConfig } = require('../../user-config.js') as typeof import('../../user-config.js');
     const env: NodeJS.ProcessEnv = { ...process.env, ELANOUS_BUILD_REMOTE: host, ELANOUS_L2_CLUSTER: cluster, ELANOUS_BUILD_IMAGE: image === 'elanous-harness-lite:local' ? 'lite' : 'full' };
+    const registryTagKeep = getUserConfig().harness?.registryTagKeep;
+    if (registryTagKeep !== undefined) env.ELANOUS_BUILD_REGISTRY_TAG_KEEP = String(registryTagKeep);
     if (sharedBuildId) env.ELANOUS_BUILD_LOCAL_ID = sharedBuildId;
     delete env.ELANOUS_BUILD_REGISTRY;
     if (registry) env.ELANOUS_BUILD_REGISTRY = registry;

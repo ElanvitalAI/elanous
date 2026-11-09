@@ -1,0 +1,27 @@
+{
+  "id": "fake-llm",
+  "name": "Fake LLM",
+  "implementation": [
+    "src/ux-sim/fake-llm.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-llm.test.ts"
+  ],
+  "target": "LLM response and streaming boundary",
+  "inputs": [
+    "fixed or scripted response",
+    "delay",
+    "error/status"
+  ],
+  "observations": [
+    "captured calls",
+    "stream chunks",
+    "completion or failure"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-llm.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

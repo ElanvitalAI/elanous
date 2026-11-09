@@ -109,6 +109,7 @@ function agentInfo(p: FakeHerdrPane): Record<string, unknown> {
 export function createFakeHerdr(opts: FakeHerdrOpts): FakeHerdr {
   const panes = new Map<string, FakeHerdrPane>();
   for (const p of opts.panes) panes.set(p.paneId, { ...p, stateChangeSeq: 1 });
+  const composers = new Map<string, string>(opts.panes.map(p => [p.paneId, '']));
   const subs: FakeHerdrSubmission[] = [];
   const argvLog: string[][] = [];
   const waiters = new Set<{ paneId: string; until: readonly FakeHerdrStatus[]; resolve: () => void }>();
@@ -206,10 +207,48 @@ export function createFakeHerdr(opts: FakeHerdrOpts): FakeHerdr {
           waiters.add(waiter);
         });
       }
+      if (group === 'pane' && cmd === 'list') {
+        const rows = [...panes.values()].map(p => ({
+          pane_id: p.paneId, agent: p.agent, agent_status: p.status, revision: p.stateChangeSeq,
+        }));
+        return { code: 0, stdout: `${JSON.stringify({ id: 'cli:pane:list', result: { panes: rows, type: 'pane_list' } })}\n`, stderr: '' };
+      }
+      if (group === 'pane' && cmd === 'get' && target !== undefined) {
+        const p = panes.get(target);
+        if (!p) return errorBody('cli:pane:get', 'pane_not_found', `pane ${target} not found`);
+        return { code: 0, stdout: `${JSON.stringify({ id: 'cli:pane:get', result: { pane: { pane_id: p.paneId, agent: p.agent, agent_status: p.status } } })}\n`, stderr: '' };
+      }
+      if (group === 'pane' && cmd === 'read' && target !== undefined) {
+        const p = panes.get(target);
+        if (!p) return errorBody('cli:pane:read', 'pane_not_found', `pane ${target} not found`);
+        const marker = p.agent.toLowerCase() === 'claude' ? '❯' : '›';
+        const composer = composers.get(p.paneId) ?? '';
+        const placeholder = composer || (p.agent.toLowerCase() === 'claude' ? 'What can I help with?' : 'Ask anything');
+        return { code: 0, stdout: `${marker} ${placeholder}\n`, stderr: '' };
+      }
+      if (group === 'pane' && cmd === 'send-text' && target !== undefined) {
+        const p = panes.get(target);
+        if (!p) return errorBody('cli:pane:send-text', 'pane_not_found', `pane ${target} not found`);
+        composers.set(p.paneId, rest[0] ?? '');
+        return { code: 0, stdout: '', stderr: '' };
+      }
+      if (group === 'pane' && cmd === 'send-keys' && target !== undefined && rest[0] === 'enter') {
+        const p = panes.get(target);
+        if (!p) return errorBody('cli:pane:send-keys', 'pane_not_found', `pane ${target} not found`);
+        const text = composers.get(p.paneId) ?? '';
+        if (text) {
+          composers.set(p.paneId, '');
+          const submission = { paneId: p.paneId, text };
+          subs.push(submission);
+          opts.onRun?.(submission, herdr);
+        }
+        return { code: 0, stdout: '', stderr: '' };
+      }
       if (group === 'pane' && cmd === 'run' && target !== undefined) {
         const p = panes.get(target);
         if (!p) return errorBody('cli:pane:run', 'pane_not_found', `pane ${target} not found`);
         const submission = { paneId: p.paneId, text: rest[0] ?? '' };
+        composers.set(p.paneId, '');
         subs.push(submission);
         opts.onRun?.(submission, herdr);
         return { code: 0, stdout: '', stderr: '' };

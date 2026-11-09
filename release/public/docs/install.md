@@ -5,7 +5,14 @@ elanous runs on **Bun** (not Node) on macOS, Linux and WSL2; Windows native Powe
 ## One line
 
 ```bash
-curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
+(
+  tmp="$(mktemp)" &&
+  trap 'rm -f "$tmp"' EXIT &&
+  curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh -o "$tmp" &&
+  test -s "$tmp" &&
+  bash -n "$tmp" &&
+  bash "$tmp" --yes
+)
 ```
 
 The npm path is two commands:
@@ -38,7 +45,14 @@ elanous doctor        # what this machine still needs — a report, not a gate
 Pin a version with `ELANOUS_VERSION` (Elanous releases start at 0.2.0):
 
 ```bash
-curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | ELANOUS_VERSION=0.2.0 bash
+(
+  tmp="$(mktemp)" &&
+  trap 'rm -f "$tmp"' EXIT &&
+  curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh -o "$tmp" &&
+  test -s "$tmp" &&
+  bash -n "$tmp" &&
+  ELANOUS_VERSION=0.2.0 bash "$tmp" --yes
+)
 ```
 
 ## Windows (native PowerShell) — experimental

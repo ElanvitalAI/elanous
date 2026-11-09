@@ -1,0 +1,61 @@
+{
+  "id": "fake-cloud-vm",
+  "name": "Fake cloud VM control plane",
+  "implementation": [
+    "src/ux-sim/fake-cloud-vm.ts",
+    "src/ux-sim/fake-clock.ts",
+    "src/ux-sim/grid-ready-tiers.ts",
+    "src/ux-sim/burst-ready-ladder-sim.ts",
+    "scripts/ux-sim.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-cloud-vm.test.ts",
+    "src/ux-sim/grid-ready-tiers.test.ts",
+    "src/fleet/burst-ready-ladder.test.ts",
+    "src/ux-sim/burst-ready-ladder-sim.test.ts",
+    "src/ux-sim/scenario.test.ts"
+  ],
+  "target": "image create, resume, stop-after draining, termination protection, powered-on cost, hot/warm/cold capacity choice, and purpose-specific one-hour warm-up with 2h/4h TTL without provider access",
+  "inputs": [
+    "pinned image digest",
+    "remaining demand",
+    "one-time cold approval",
+    "purpose gate/implementation/execution",
+    "scheduled admission time",
+    "2h or 4h TTL",
+    "fake-clock time",
+    "burst stopAfter deadline"
+  ],
+  "observations": [
+    "selected tier and action",
+    "VM state",
+    "warm-up time",
+    "premature admission refusal",
+    "VM ready state before admission",
+    "lease admission",
+    "TTL deadline and draining state",
+    "post-expiry admission refusal",
+    "lease drain and stop event",
+    "powered-on duration",
+    "estimated cost",
+    "approval consumption",
+    "forbidden terminate event"
+  ],
+  "entryCommands": [
+    "bun scripts/ux-sim.ts grid-ready",
+    "bun test src/ux-sim/grid-ready-tiers.test.ts src/ux-sim/fake-cloud-vm.test.ts",
+    "eln --test sim run scenarios/ux-sim/burst-ready-ladder.yaml",
+    "bun test src/fleet/burst-ready-ladder.test.ts src/ux-sim/burst-ready-ladder-sim.test.ts src/ux-sim/scenario.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "fleet.burst/ready-ladder-completed"
+  ],
+  "recentUse": {
+    "observedAt": "2026-11-03T13:59:33Z",
+    "runId": "79e3ac56-5b14-472d-82e5-4718f4d610b1",
+    "event": "fleet.burst/ready-ladder-completed",
+    "scenarioId": "burst-ready-ladder",
+    "command": "bun bin/elanous.mjs --test=<isolated-test-state> sim run scenarios/ux-sim/burst-ready-ladder.yaml"
+  }
+}

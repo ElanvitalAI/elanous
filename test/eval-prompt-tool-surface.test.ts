@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { nativeToolCatalog } from '../src/native-tool-catalog.js';
 import { splitDeferredToolSpecs } from '../src/session-runtime/tier-flip.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import {
   EVAL_PROMPT_TOOL_SURFACES,
   buildEvalPromptToolSurface,
@@ -74,11 +74,11 @@ describe('elanous repro tool surface selection', () => {
     expect((result as { matched?: string[] }).matched).toContain('Read');
   });
 
-  test('webterm derives deferred daemon specs from catalog metadata and injects ToolSearch', () => {
+  test('webterm derives deferred daemon specs from catalog and plugin routes, then injects ToolSearch', () => {
     const selected = buildEvalPromptToolSurface('webterm', 'claude', cfg);
     const expectedDeferred = selected.specs.flatMap((spec) => {
       const catalogEntry = nativeToolCatalog.find((tool) => tool.displayName === spec.name);
-      return catalogEntry?.alwaysLoad === false && catalogEntry.shouldDefer === true
+      return (catalogEntry?.alwaysLoad === false && catalogEntry.shouldDefer === true) || (!!spec.pluginId && !!spec.route)
         ? [spec.name]
         : [];
     });
@@ -86,6 +86,7 @@ describe('elanous repro tool surface selection', () => {
     const deferred = split.deferred.map((tool) => tool.name);
 
     expect(deferred).toEqual(expectedDeferred);
+    expect(deferred).toContain('app_deploy');
     expect(split.active.map((tool) => tool.name)).toContain('SelfImplement');
     expect(split.active.map((tool) => tool.name)).toContain('ToolSearch');
   });
@@ -140,6 +141,58 @@ describe('elanous repro tool surface selection', () => {
     //     daemon 경유의 고유 증거인 **하이드레이션 이벤트**로 단언한다 — 이건 소환이
     //     실제 서피스 풀에서 스키마를 찾아 tier-flip 에 흡수됐을 때만 발생한다.
     expect(r.eventCounts['tool-hydrated'] ?? 0).toBeGreaterThanOrEqual(1);
+  }, 20000);
+
+  test('measurement dispatch keeps denied schemas out of ToolSearch and blocks unexpected tools', async () => {
+    let call = 0;
+    let finalHistory = '';
+    const provider = {
+      name: 'scripted',
+      defaultModel: 'gpt-5.5',
+      available: () => true,
+      async *streamChat(messages: unknown[]) {
+        call++;
+        if (call === 1) {
+          yield {
+            type: 'tool_call', id: 'search', name: 'ToolSearch',
+            args: { query: 'select:ReleaseStatus,ObserveLogs' },
+          };
+        } else if (call === 2) {
+          yield { type: 'tool_call', id: 'denied', name: 'ReleaseStatus', args: {} };
+        } else if (call === 3) {
+          yield { type: 'tool_call', id: 'allowed', name: 'ObserveLogs', args: {} };
+        } else if (call === 4) {
+          yield { type: 'tool_call', id: 'unexpected', name: 'SelfImplement', args: {} };
+        } else {
+          finalHistory = JSON.stringify(messages);
+          yield { type: 'text', delta: 'done' };
+        }
+      },
+      async *chat() {},
+    };
+    const measurementRouteTools = [
+      { name: 'ReleaseStatus', description: 'Denied route', parameters: { type: 'object', properties: {} } },
+      { name: 'ObserveLogs', description: 'Allowed route', parameters: { type: 'object', properties: {} } },
+    ];
+
+    await runEvalPrompt({
+      prompt: 'probe',
+      tools: 'webterm',
+      silent: true,
+      // Source: #36042 measurement scenario below — four tool calls plus one final-response turn.
+      maxTurns: 5,
+      provider: provider as never,
+      measurementRouteTools,
+      toolDeny: ['ReleaseStatus'],
+    });
+
+    expect(call).toBe(5);
+    expect(finalHistory).toContain('1 matched, 1 unknown (ReleaseStatus)');
+    expect(finalHistory).toContain('Allowed route');
+    expect(finalHistory).not.toContain('Denied route');
+    expect(finalHistory).toContain('INVALID TOOL');
+    expect(finalHistory).toContain('measurementOnly');
+    expect(finalHistory).toContain("measurement mode blocks unexpected tool 'SelfImplement'");
   }, 20000);
 
   test('min/max assertions reject unavailable surface tools before measurement', async () => {

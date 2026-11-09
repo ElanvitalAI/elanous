@@ -1,13 +1,26 @@
 import { expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { simulateTrainManagerDecision } from './train-manager-decision-sim.js';
 import type { TrainDecisionInput } from '../loops/train/decisions.js';
+import type { TrainVerdictInput } from '../../scripts/release-loop/train-verdict.js';
 
 type DecisionFixture = {
   schema: string;
   provenance: { source: string; sha256: string; method: string };
   input: Parameters<typeof simulateTrainManagerDecision>[0];
   expected: ReturnType<typeof simulateTrainManagerDecision>;
+  retryFileMapIncident: {
+    id: string;
+    source: string;
+    failure: string;
+    members: string[];
+    excludedPrs: string[];
+    primaryPrFiles: Record<string, string[]>;
+    expected: { retryMembers: string[]; retryPrFiles: Record<string, string[]>; gateRetry: 'retry' | 'skip' };
+    decisionInput: TrainDecisionInput;
+    decisionExpected: ReturnType<typeof simulateTrainManagerDecision>;
+  };
 };
 
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/train-manager-decision-v1.json', import.meta.url), 'utf8')) as DecisionFixture;
@@ -19,6 +32,100 @@ test('train manager decisions preserve the captured assignment, park, and expres
     sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
   });
   expect(simulateTrainManagerDecision(fixture.input)).toEqual(fixture.expected);
+});
+
+test('train retry preserves primary PR file attribution when no PR was isolated', () => {
+  const scenario = fixture.retryFileMapIncident;
+  expect(scenario.id).toBe('unattributed-intact-retry-keeps-primary-file-map');
+  expect(scenario.source).toBe('seat-state/OPT/train-batch-live.py');
+  expect(scenario.failure).toContain('retry_pr_files');
+  expect(scenario.excludedPrs).toEqual([]);
+  expect(scenario.expected.retryPrFiles).toEqual(scenario.primaryPrFiles);
+  expect(scenario.expected.gateRetry).toBe('retry');
+  expect(simulateTrainManagerDecision(scenario.decisionInput)).toEqual(scenario.decisionExpected);
+  expect(scenario.decisionExpected.assignments).toEqual([
+    { stage: 'group', host: 'gcp2', slot: 1, prs: ['35964'] },
+  ]);
+});
+
+const verdictBase = 'a'.repeat(40);
+const verdictHead = 'b'.repeat(40);
+const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
+const simChangedPaths = (paths: string[]) => {
+  const diffOutput = paths.join('\0') + (paths.length ? '\0' : '');
+  return { source: 'git-diff' as const, complete: true, base: verdictBase, head: verdictHead, paths, diffOutput, artifactSha256: sha256(diffOutput) };
+};
+const simTimeoutEvidence = (failures: Array<{ id: string; file: string }>) => {
+  const artifactJson = JSON.stringify({ schema: 'train-timeout-attribution/v1', base: verdictBase, head: verdictHead, failures });
+  return { source: 'gate-artifact' as const, complete: true, base: verdictBase, head: verdictHead, artifactSha256: sha256(artifactJson), artifactJson, failures };
+};
+const simRemeasure = (fields: { exit: number; failures: Array<{ id: string; file: string }> }) => {
+  const artifactJson = JSON.stringify({ schema: 'train-timeout-attribution/v1', base: verdictBase, head: verdictHead, failures: fields.failures });
+  return { complete: true, host: 'aws2', primaryHost: 'minim5', base: verdictBase, head: verdictHead, exit: fields.exit,
+    failuresComplete: true, artifactSha256: sha256(artifactJson), artifactJson, failures: fields.failures };
+};
+const verdictEvidence = (overrides: Partial<TrainVerdictInput> = {}): TrainVerdictInput => ({
+  base: verdictBase,
+  head: verdictHead,
+  changedPaths: simChangedPaths(['src/changed.ts']),
+  batch: { base: verdictBase, head: verdictHead, complete: true, exit: 0, introduced: 0, unknown: 0,
+    preconditionUnmet: 0, unrunImporters: 0, typecheck: 'pass', alwaysRatchets: 'pass', preexisting: 0, timeouts: 0,
+    timeoutEvidence: simTimeoutEvidence([]) },
+  ...overrides,
+});
+
+function simWithTrainVerdict(evidence: TrainVerdictInput) {
+  return simulateTrainManagerDecision({ base: verdictBase,
+    queue: [{ pr: '90001', head: verdictHead, state: 'open', gate: 'evidence' }], activePrs: [], refusals: [], lastParks: [],
+    slots: [{ host: 'aws2', slot: 1, expressOnly: false }], groupLimit: 1, gateVerdicts: { '90001': evidence } });
+}
+
+test('train-decision simulation #35709: bound baseline-only failure remains assignable', () => {
+  const batch = verdictEvidence().batch;
+  const result = simWithTrainVerdict(verdictEvidence({ batch: { ...batch, exit: 1, preexisting: 1,
+    preexistingEvidence: { complete: true, base: verdictBase, head: verdictHead, sha: verdictHead, ids: ['baseline-known'] },
+    preexistingBuildEvidence: { base: verdictBase, head: verdictHead, sha: verdictHead, valid: true } } }));
+  expect(result.assignments.map((row) => row.prs)).toEqual([['90001']]);
+});
+
+test('train-decision simulation #35252: timeout passing on alternate host remains assignable', () => {
+  const batch = verdictEvidence().batch;
+  const result = simWithTrainVerdict(verdictEvidence({ batch: { ...batch, exit: 1, timeouts: 1,
+    timeoutEvidence: simTimeoutEvidence([{ id: 'test/old.test.ts#slow', file: 'test/old.test.ts' }]) },
+    remeasure: simRemeasure({ exit: 0, failures: [] }) }));
+  expect(result.assignments.map((row) => row.prs)).toEqual([['90001']]);
+});
+
+test('train-decision simulation passes measured alternate-host timeout failure on an unchanged path', () => {
+  const batch = verdictEvidence().batch;
+  const timeoutFailure = { id: 'test/old.test.ts#slow', file: 'test/old.test.ts' };
+  const result = simWithTrainVerdict(verdictEvidence({ batch: { ...batch, exit: 1, timeouts: 1, timeoutEvidence: simTimeoutEvidence([timeoutFailure]) },
+    remeasure: simRemeasure({ exit: 1, failures: [timeoutFailure] }) }));
+  expect(result.assignments.map((row) => row.prs)).toEqual([['90001']]);
+});
+
+test('train-decision simulation rejects alternate-host timeout intersecting a changed file', () => {
+  const batch = verdictEvidence().batch;
+  const timeoutFailure = { id: 'src/changed.ts#slow', file: 'src/changed.ts' };
+  const result = simWithTrainVerdict(verdictEvidence({ batch: { ...batch, exit: 1, timeouts: 1, timeoutEvidence: simTimeoutEvidence([timeoutFailure]) },
+    remeasure: simRemeasure({ exit: 1, failures: [timeoutFailure] }) }));
+  expect(result.assignments).toEqual([]);
+  expect(result.waiting).toEqual([{ pr: '90001', reason: 'gate-not-ready' }]);
+});
+
+test('train-decision simulation keeps introduced and unknown failure counts blocked', () => {
+  const result = simWithTrainVerdict(verdictEvidence({ batch: { ...verdictEvidence().batch, introduced: 1, unknown: 1 } }));
+  expect(result.assignments).toEqual([]);
+  expect(result.waiting).toEqual([{ pr: '90001', reason: 'gate-not-ready' }]);
+});
+
+test('train-decision simulation fails closed on unmeasured timeout and mandatory ratchet failure', () => {
+  const batch = verdictEvidence().batch;
+  const unmeasured = simWithTrainVerdict(verdictEvidence({ batch: { ...batch, exit: 1, timeouts: 1,
+    timeoutEvidence: simTimeoutEvidence([{ id: 'test/old.test.ts#slow', file: 'test/old.test.ts' }]) } }));
+  const ratchet = simWithTrainVerdict(verdictEvidence({ batch: { ...batch, alwaysRatchets: 'fail' } }));
+  expect(unmeasured.assignments).toEqual([]);
+  expect(ratchet.assignments).toEqual([]);
 });
 
 test('same current head refusals count across bases, while an active PR cannot be parked', () => {

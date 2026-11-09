@@ -13,7 +13,7 @@
 import type { RunSupervisor, ControlDecision, ControlObservation } from './pty-control-loop.js';
 import { formatStallContext } from './stall-context.js';
 import type { LLMMessage } from '../llm.js';
-import type { LLMProviderName, ReasoningLevel } from '../user-config.js';
+import type { LLMProviderName, ReasoningLevel } from '../user-config/types.js';
 import { debug } from '../debug/log.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { MAX_PTY_KEY_REPEAT } from '../pty-shell/pty-mouse.js';

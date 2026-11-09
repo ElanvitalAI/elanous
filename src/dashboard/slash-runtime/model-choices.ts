@@ -5,7 +5,7 @@
 // A tier is «model ⊕ reasoning level» — on several ladders better and best share a model and differ only
 // in reasoning (codex gpt-6-sol medium/high · opus medium/medium), so a human word also carries the tier's
 // reasoning level; otherwise 보통 and 깊음 would be the same choice. Code names leave reasoning alone.
-import type { LLMProviderName, ReasoningLevel } from '../../user-config.js';
+import type { LLMProviderName, ReasoningLevel } from '../../user-config/types.js';
 import { lookupLlmTierSpec } from '../../model-tier/index.js';
 import type { ModelTier } from '../../model-tier/types.js';
 import type { ModelExecutionActual } from '../../status/bar.js';

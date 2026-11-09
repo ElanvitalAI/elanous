@@ -12,7 +12,7 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 
 import { runTurn, ensureCliSession } from '../session/chat.js';
 import { getProviderForConfig } from '../llm.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { compactSessionHistory } from '../session/compact-session.js';
 import { buildTerminalCapableTurn } from '../agent/terminal-surface.js';
 import { debug } from '../debug/log.js';

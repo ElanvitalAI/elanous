@@ -1,0 +1,12 @@
+{
+  "id": "MD-UX-SIM-WORLD-HOST-CHAOS-TS",
+  "path": "src/ux-sim/world-host-chaos.ts",
+  "boundary": "Runs gorilla host failure through measured placement and the shared fake ps inventory.",
+  "deviceIds": [
+    "world-runtime",
+    "fake-kubectl",
+    "fake-ps"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-RESUME-PICKER-DEVICE-TS",
+  "path": "src/ux-sim/resume-picker-device.ts",
+  "boundary": "resume picker device: `picker` (default): the list → pick flow. `boot-resume`: start with `--resume <id>` on a synthetic 379-row session.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

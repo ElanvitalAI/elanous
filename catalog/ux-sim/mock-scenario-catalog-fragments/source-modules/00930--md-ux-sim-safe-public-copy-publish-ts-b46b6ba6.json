@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SAFE-PUBLIC-COPY-PUBLISH-TS",
+  "path": "src/ux-sim/safe-public-copy-publish.ts",
+  "boundary": "Runs production redaction, publish handlers, rendering and artifact storage with an upload seam that records and refuses external writes.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

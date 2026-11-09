@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 /**
  * GRAPH-WIZARD — 말 한 줄(또는 대화 한 턴)에서 그래프 YAML 을 짓는다.
  *
@@ -110,10 +111,6 @@ export interface GraphVariantGrowthTrace {
 export type GraphVariantDesignResult =
   | { readonly mode: 'variant'; readonly status: 'composed'; readonly reason: 'composed'; readonly plan: GraphVariantPlan; readonly variant: Extract<GraphVariantResult, { ok: true }>; readonly growth?: GraphVariantGrowthTrace }
   | { readonly mode: 'variant'; readonly status: 'fallback-standard'; readonly template: GraphTemplateSpec; readonly reason: string; readonly growth?: GraphVariantGrowthTrace };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
 
 /** 설계자 출력에서 조작 growth 의 좌표만 읽는다 — 모양이 틀려도 «어느 from 이었나»는 남긴다. */
 function growthTraceOf(record: Record<string, unknown> | null): GraphVariantGrowthTrace | undefined {

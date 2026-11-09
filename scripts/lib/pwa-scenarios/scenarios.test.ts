@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, test, spyOn } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { runInNewContext } from 'node:vm';
 import { createScenarios, createScenariosWithReplay, selectScenarios, validateBaseUrl } from './scenarios.js';
 import { runScenarios, type PageDriver } from './runner.js';
+import { withFakeFetchDevice } from '../../../src/ux-sim/fake-fetch.js';
 
 const ids = ['T1', 'T1b', 'T4a', 'T5', 'T5b', 'C1', 'C2a', 'C2b', 'N1', 'N5a', 'N6a'];
 
@@ -203,18 +204,17 @@ describe('PWA scenario data and port isolation', () => {
     const captured = { first: ids, second: ids, third: ids };
     const requested: string[] = [];
     let rows = [{ id: 'term-a', producer: 'process' }, { id: 'term-a', producer: 'web-registration' }];
-    const fetchFake = Object.assign(async (request: URL | RequestInfo) => {
-      requested.push(String(request));
+    await withFakeFetchDevice([{ url: '/v1/terminals', response: (request) => {
+      requested.push(request.url);
       return Response.json({ terminals: rows });
-    }, { preconnect: () => {} });
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(fetchFake);
-    try {
+    } }], async (fetchDevice) => {
       expect(await check.predicate(ids, 'http://127.0.0.1:31455', captured)).toBe(true);
       expect(await check.predicate(ids, 'http://127.0.0.1:31455', { ...captured, second: { ...ids, terminalId: 'term-b' } })).toBe(false);
       rows = [...rows, { id: 'term-a', producer: 'web-registration' }];
       expect(await check.predicate(ids, 'http://127.0.0.1:31455', captured)).toBe(false);
       expect(requested).toEqual(['http://127.0.0.1:31455/v1/terminals', 'http://127.0.0.1:31455/v1/terminals']);
-    } finally { fetchSpy.mockRestore(); }
+      expect(fetchDevice.calls()).toHaveLength(requested.length);
+    });
   });
 
   test('T5 fails when reloads change the active tab ID despite one row for the final ID', async () => {
@@ -226,18 +226,16 @@ describe('PWA scenario data and port isolation', () => {
         ? { sessionId: 'session-a', terminalId: `term-${opens}` } : true,
       screenshot: async () => Buffer.from('png'), llmCallCursor: async () => 0,
     };
-    const fetchFake = Object.assign(async () => Response.json({ terminals: [
+    await withFakeFetchDevice([{ url: '/v1/terminals', response: () => Response.json({ terminals: [
       { id: 'term-3', producer: 'web-registration' },
-    ] }), { preconnect: () => {} });
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(fetchFake);
-    try {
+    ] }) }], async (fetchDevice) => {
       const [result] = await runScenarios(driver, [{ ...t5, hostCheck: [{ ...t5.hostCheck![0]!, timeoutMs: 0 }] }], 'http://127.0.0.1:31455');
       expect(opens).toBe(3);
       expect(result?.pass).toBe(false);
       expect(result?.failure).toContain('same tab ID on three opens');
       expect(result?.evidence.filter((line) => line.includes('(capture)'))).toHaveLength(3);
-      expect(fetchSpy).not.toHaveBeenCalled();
-    } finally { fetchSpy.mockRestore(); }
+      expect(fetchDevice.calls()).toHaveLength(0);
+    });
   });
 
   test('operational port 31415 refused, lease port 31455 allowed, explicit --allow-port overrides', () => {

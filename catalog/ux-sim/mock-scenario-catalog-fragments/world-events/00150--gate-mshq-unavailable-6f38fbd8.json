@@ -1,0 +1,5 @@
+{
+  "id": "gate-mshq-unavailable",
+  "name": "Gate sweep with mshq unavailable",
+  "description": "Inject an mshq host outage and observe production gate execution continue on the surviving pool."
+}

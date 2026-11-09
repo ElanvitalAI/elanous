@@ -27,6 +27,6 @@ test('root layout places the route-selected banner before every page', async () 
   expect(ts.isJsxSelfClosingElement(children[0]!) && children[0]!.tagName.getText(file) === 'MaturityBanner').toBe(true);
   expect(ts.isJsxExpression(children[1]!) && children[1]!.expression?.getText(file) === 'children').toBe(true);
   expect(routeMaturity('/settings')).toBe('beta');
-  expect(routeMaturity('/morning')).toBe('broken');
+  expect(routeMaturity('/morning')).toBeUndefined();
   expect(routeMaturity('/chat')).toBe('stable');
 });

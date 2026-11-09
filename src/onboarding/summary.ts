@@ -21,7 +21,7 @@
 // flow, called from `runOnboarding()` between the last askDiscord
 // and saveUserConfig.
 
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import type { WizardIO } from '../onboarding.js';
 import { chooseFrom, type ChoiceOption } from './io-extended.js';
 

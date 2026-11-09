@@ -12,8 +12,7 @@ import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { _resetSessionsServiceSingletonForTest } from '@/lib/sessions-service';
 import { SessionDeleteConfirm } from './SessionDeleteConfirm';
 import { SessionIdChip } from './SessionIdChip';
-import { SessionPicker } from './SessionPicker';
-import { SessionPill, copyToClipboard, shortSessionId, type SessionPillProps } from './SessionPill';
+import { SessionPill, copyToClipboard, shortSessionId } from './SessionPill';
 
 describe('shortSessionId — pill display 의 short ID + 단축 cue', () => {
   it('full UUID 의 첫 8자 + ellipsis 반환 (단축 visual cue)', () => {
@@ -108,7 +107,6 @@ describe('대화 화면 문면과 기존 동작', () => {
   let tree: ReactTestRenderer | undefined;
   let selected: string[];
   let requests: number;
-  let forgotten: string[];
   const client = {
     fetchJson: async () => {
       requests += 1;
@@ -130,7 +128,6 @@ describe('대화 화면 문면과 기존 동작', () => {
 
   beforeEach(() => {
     selected = [];
-    forgotten = [];
     requests = 0;
     Object.defineProperty(globalThis, 'document', { configurable: true, value: documentStub });
     Object.defineProperty(globalThis, 'window', { configurable: true, value: new EventTarget() });
@@ -148,47 +145,22 @@ describe('대화 화면 문면과 기존 동작', () => {
     else delete (globalThis as { localStorage?: Storage }).localStorage;
   });
 
-  it('pill 메뉴의 새 대화·전환·지우기 문면은 대화 용어이고 콜백과 ID는 유지된다', async () => {
+  it('pill 메뉴는 대화 ID와 새 대화를 제공하고 workspace 전환·삭제 액션은 노출하지 않는다', async () => {
     await act(async () => { tree = create(
       createElement(DaemonContext.Provider, { value: daemon },
-        createElement<SessionPillProps>(SessionPill, { onAttachRequest: () => { forgotten.push('attach'); }, onForgetRequest: () => { forgotten.push('forget'); } })),
+        createElement(SessionPill)),
     ); });
     const buttons = () => tree!.root.findAllByType('button');
     expect(buttons().find((b) => b.props['aria-label'] === '대화 메뉴')).toBeDefined();
     await act(async () => buttons().find((b) => b.props['aria-label'] === '대화 메뉴')!.props.onClick());
-    expect(renderedText(tree!)).toContain('다른 대화로 전환');
-    expect(renderedText(tree!)).toContain('이 대화 지우기');
+    expect(renderedText(tree!)).not.toContain('다른 대화로 전환');
+    expect(renderedText(tree!)).not.toContain('이 대화 지우기');
     expect(renderedText(tree!)).toContain('대화 ID');
     expect(renderedText(tree!)).toContain('새 대화 시작 (두 번 클릭)');
     expect(renderedText(tree!)).not.toContain('세션');
-    await act(async () => buttons().find((b) => b.children.includes('다른 대화로 전환'))!.props.onClick());
-    expect(forgotten).toEqual(['attach']);
-    await act(async () => buttons().find((b) => b.props['aria-label'] === '대화 메뉴')!.props.onClick());
-    await act(async () => buttons().find((b) => b.children.includes('이 대화 지우기'))!.props.onClick());
-    expect(forgotten).toEqual(['attach', 'forget']);
-    await act(async () => buttons().find((b) => b.props['aria-label'] === '대화 메뉴')!.props.onClick());
     await act(async () => buttons().find((b) => b.findAllByType('span').some((s) => s.children.includes('새 대화 시작')))!.props.onClick());
     expect(selected).toHaveLength(1);
     expect(selected[0]).not.toBe(currentId);
-  });
-
-  it('picker의 새 대화·기존 대화 전환·지우기 버튼과 빈 상태 문면', async () => {
-    const picked: unknown[] = [];
-    await act(async () => { tree = create(
-      createElement(DaemonContext.Provider, { value: daemon },
-        createElement(SessionPicker, { open: true, onClose: () => {}, onPick: (pick) => { picked.push(pick); }, attachedSessions: new Map() })),
-    ); });
-    expect(requests).toBeGreaterThan(0);
-    expect(renderedText(tree!)).toContain('새 대화 시작');
-    expect(renderedText(tree!)).not.toContain('세션');
-    const buttons = () => tree!.root.findAllByType('button');
-    await act(async () => buttons().find((b) => b.findAllByType('div').some((d) => d.children.includes('새 대화 시작')))!.props.onClick());
-    expect(picked).toMatchObject([{ kind: 'new', sessionId: expect.any(String) }]);
-    await act(async () => buttons().find((b) => b.props.className?.includes('flex min-w-0 flex-1 flex-col'))!.props.onClick());
-    expect(picked[1]).toEqual({ kind: 'existing', sessionId: currentId });
-    await act(async () => buttons().find((b) => b.props['aria-label'] === `대화 ${currentId} 지우기`)!.props.onClick({ stopPropagation: () => {} }));
-    expect(renderedText(tree!)).toContain('대화 지우기');
-    expect(renderedText(tree!)).not.toContain('세션');
   });
 
   it('ID 칩과 삭제 확인창은 대화로 안내하고 동일 ID·확인 콜백을 유지한다', async () => {

@@ -1,0 +1,19 @@
+{
+  "id": "TASK-TEMP-CLEANUP",
+  "name": "Task-agent test temporary directory cleanup",
+  "kind": "suite-temp-root-cleanup",
+  "device": "fake-temp-cleanup",
+  "implementation": [
+    "src/ux-sim/fake-temp-cleanup.ts",
+    "src/test-utils/temp-dir-cleanup.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-temp-cleanup.test.ts"
+  ],
+  "trigger": "Task-agent suites create their temporary roots, then complete normally or throw after writing nested artifacts.",
+  "observe": [
+    "all roots registered by the suite-scoped tracker are absent after cleanup",
+    "an unrelated temporary root remains present"
+  ],
+  "expected": "Suite teardown removes every directory it registered on both success and failure while preserving paths it did not create."
+}

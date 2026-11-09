@@ -1,3 +1,4 @@
+import { asRecord } from '../../primitives/guards.js';
 import { extname } from 'node:path';
 import chalk from 'chalk';
 import { summarizeToolCall, toolOperationKind } from '../../log-entry.js';
@@ -116,7 +117,7 @@ interface ToolRenderModelOptions {
 /** MsgPost 오류 — `llm.ts` 가 throw 를 `{ error }` 로 감싼 형태와, `ok: false` 결과. */
 function isMsgPostErrorResult(result: unknown): boolean {
   if (extractErrorText(result)) return true;
-  const rec = asRecord(result);
+  const rec = asRecord(result, { fallback: 'null', allowArrays: true });
   return rec?.ok === false;
 }
 
@@ -132,7 +133,7 @@ function buildToolRenderModel(
   config?: ToolRenderConfig,
   options?: ToolRenderModelOptions,
 ): ToolRenderModel {
-  const resultRecord = asRecord(call.result);
+  const resultRecord = asRecord(call.result, { fallback: 'null', allowArrays: true });
   const errorText = extractErrorText(call.result);
   const bodyLines = errorText
     ? errorText.split('\n')
@@ -227,7 +228,7 @@ function summarizeCollapsedToolResult(
     case 'UpdatePlan': {
       const plan = Array.isArray(resultRecord?.plan) ? resultRecord.plan : null;
       if (!plan) return undefined;
-      const done = plan.filter((s) => asRecord(s)?.status === 'completed').length;
+      const done = plan.filter((s) => asRecord(s, { fallback: 'null', allowArrays: true })?.status === 'completed').length;
       return `${done}/${plan.length} done`;
     }
     // 스냅샷형 — 크기를 말하는 것이 뜻이 없다. 명시적으로 안 준다(⑵).
@@ -247,9 +248,9 @@ function summarizeToolCallForRender(
   if (kind === 'MsgPost') return summarizeMsgPostCall(args, result);
   if (kind === 'UpdatePlan') {
     const plan = Array.isArray(args.plan) ? args.plan : [];
-    const current = plan.find((step) => asRecord(step)?.status === 'in_progress');
-    const currentText = typeof asRecord(current)?.step === 'string'
-      ? String(asRecord(current)?.step)
+    const current = plan.find((step) => asRecord(step, { fallback: 'null', allowArrays: true })?.status === 'in_progress');
+    const currentText = typeof asRecord(current, { fallback: 'null', allowArrays: true })?.step === 'string'
+      ? String(asRecord(current, { fallback: 'null', allowArrays: true })?.step)
       : null;
     return currentText
       ? `${plan.length} step${plan.length === 1 ? '' : 's'} — ${truncate(currentText, 48)}`
@@ -268,14 +269,14 @@ function summarizeToolCallForRender(
 /** MsgPost 머리글 — 행위(`post`)·수신자·id. 펼치기 전에도 세 가지가 한 줄에 다 있다. */
 function summarizeMsgPostCall(args: Record<string, unknown>, result?: unknown): string {
   const to = typeof args.to === 'string' ? args.to.trim() : '';
-  const id = msgPostMessage(asRecord(result))?.id;
+  const id = msgPostMessage(asRecord(result, { fallback: 'null', allowArrays: true }))?.id;
   const route = to ? `post → ${to}` : 'post';
   return typeof id === 'string' || typeof id === 'number' ? `${route} #${id}` : route;
 }
 
 /** 결과 페이로드의 `message` 레코드. 모양을 못 읽으면 `null` — 없는 필드를 지어내지 않는다. */
 function msgPostMessage(resultRecord: Record<string, unknown> | null): Record<string, unknown> | null {
-  return asRecord(resultRecord?.message);
+  return asRecord(resultRecord?.message, { fallback: 'null', allowArrays: true });
 }
 
 /** MsgPost 결과 본문. 접힌 행은 비우고 펼친 변형에는 원래 결과 전체를 한 번만 싣는다. */
@@ -511,10 +512,6 @@ function highlightPreviewLine(line: string, ext: string): string {
   return line;
 }
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
-}
-
 interface RenderEditResult {
   ok: boolean;
   file_path: string;
@@ -526,7 +523,7 @@ interface RenderEditResult {
 }
 
 function isEditResult(value: unknown): value is RenderEditResult {
-  const rec = asRecord(value);
+  const rec = asRecord(value, { fallback: 'null', allowArrays: true });
   return !!rec
     && typeof rec.ok === 'boolean'
     && typeof rec.file_path === 'string'
@@ -538,11 +535,11 @@ function isEditResult(value: unknown): value is RenderEditResult {
 }
 
 function asPlanState(value: unknown): PlanState | null {
-  const rec = asRecord(value);
+  const rec = asRecord(value, { fallback: 'null', allowArrays: true });
   if (!rec || !Array.isArray(rec.steps)) return null;
   const steps = rec.steps
     .map((step) => {
-      const s = asRecord(step);
+      const s = asRecord(step, { fallback: 'null', allowArrays: true });
       if (!s) return null;
       if (typeof s.step !== 'string') return null;
       if (s.status !== 'pending' && s.status !== 'in_progress' && s.status !== 'completed') return null;

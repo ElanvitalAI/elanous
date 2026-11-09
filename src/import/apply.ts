@@ -5,7 +5,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, write
 import { join } from 'node:path';
 import { convertMcpEntry } from '../skills/connect-claude-plugin.js';
 import { withConnectedSource } from '../skills/connect.js';
-import type { SkillSource } from '../user-config.js';
+import type { SkillSource } from '../user-config/types.js';
 import type { ImportItem, ImportPlan } from './plan.js';
 
 export type ImportMode = 'ref' | 'link' | 'copy';

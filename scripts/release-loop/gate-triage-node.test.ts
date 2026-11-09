@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { assessIntroducedMainFixedPick, chooseGatePrescription, classifyGateShadow, gateTriageShadowFromContext, gateTriageShadowFromSavedVerdict, logGateTriageShadow, priorGateDecisionsFromLedger } from './gate-triage-node';
+import { assessIntroducedMainFixedPick, assignRepeatedUnmeasuredFailures, chooseGatePrescription, classifyGateShadow, gateTriageShadowFromContext, gateTriageShadowFromSavedVerdict, logGateTriageShadow, priorGateDecisionsFromLedger } from './gate-triage-node';
 import type { GateResult } from './gate-types.js';
 import { debug } from '../../src/debug/log';
 import { spawnSync } from 'node:child_process';
@@ -121,6 +121,35 @@ test('standalone entrypoint succeeds with structured classification', () => {
       repairNode: { input: { runId: 'run-shadow', failureIds: ['src/a.test.ts: fails'] } } } });
 });
 
+test('live gate-triage CLI reads owner records and persists assignments for the next run', () => {
+  const root = mkdtempSync(join(tmpdir(), 'known-fail-live-ledger-'));
+  const owned = 'src/a.test.ts > known failure';
+  const repeated = 'src/b.test.ts > repeated unmeasured test';
+  const owner = { failureId: owned, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'd'.repeat(40) };
+  const prior = ['a', 'b'].map(commit => ({ classification: 'unmeasured', commit: commit.repeat(40),
+    failureIds: [owned, repeated, 'src/b.test.ts'] }));
+  const invoke = (runId: string, gateOutput: Record<string, unknown>, gateTriageEvidence?: Record<string, unknown>) => {
+    const context = { runId, input: { version: '0.3.8', previousVersion: '0.3.7',
+      ...(gateTriageEvidence ? { gateTriageEvidence } : {}) }, outputs: { gate: gateOutput } };
+    const run = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], { cwd: process.cwd(), encoding: 'utf8',
+      env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_GRAPH_CONTEXT: JSON.stringify(context) } });
+    expect(run.status).toBe(0);
+    return JSON.parse(run.stdout.trim().split('\n').at(-1)!) as Record<string, unknown>;
+  };
+  const first = invoke('known-fail-first', gate({ outcome: 'error', commit: 'c'.repeat(40), introduced: [owned, repeated],
+    stalledShards: [{ shard: 0, files: ['src/b.test.ts'], reason: 'timeout' }] }) as unknown as Record<string, unknown>, {
+    knownFailOwners: [owner], ownerCellByFailureId: { [owned]: 'PREEXIST-TRIAGE-27', [repeated]: 'PREEXIST-TRIAGE-27' }, priorDecisions: prior,
+  } as unknown as Record<string, unknown>);
+  expect(first).toMatchObject({ knownFailAudit: { covered: [owner] }, unmeasuredOwnerAssignments: [
+    { failureId: owned, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) },
+    { failureId: repeated, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) },
+  ] });
+  const second = invoke('known-fail-second', gate({ outcome: 'regression', commit: 'c'.repeat(40), introduced: [owned, repeated] }) as unknown as Record<string, unknown>);
+  expect(second).toMatchObject({ knownFailAudit: { covered: [
+    owner, { failureId: repeated, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) },
+  ], residual: [] } });
+});
+
 test('successful triage still follows the release failure restoration edge', () => {
   const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as {
     edges: Array<{ from: string; map: Record<string, string> }> };
@@ -202,6 +231,26 @@ test('actual saved release runs supply repeated symptom decisions to the live tr
   const triage = gateTriageShadowFromContext(context, undefined, history);
   expect(triage.classification).toBe('exhausted');
   expect(chooseGatePrescription(context, triage).action).toBe('decision-card');
+});
+
+test('known-fail audit leaves ownerless failures residual and routes only exact test IDs after three unmeasured runs', () => {
+  const owned = 'src/a.test.ts > known failure';
+  const ownerless = 'src/b.test.ts > unexplained failure';
+  const owners = [{ failureId: owned, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) }];
+  expect(classifyGateShadow(gate({ outcome: 'regression', introduced: [owned, ownerless] }),
+    { knownFailOwners: owners }).knownFailAudit).toEqual({ covered: owners, residual: [ownerless] });
+
+  const prior = ['a', 'b'].map(commit => ({ classification: 'unmeasured' as const,
+    commit: commit.repeat(40), failureIds: [owned] }));
+  expect(assignRepeatedUnmeasuredFailures([owned], prior, 'c'.repeat(40),
+    { [owned]: 'PREEXIST-TRIAGE-27' })).toEqual([{
+    failureId: owned, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40),
+  }]);
+  const stalled = 'src/c.test.ts';
+  const timeout = gate({ outcome: 'error', commit: 'c'.repeat(40),
+    stalledShards: [{ shard: 0, files: [stalled], reason: 'timeout' }] });
+  expect(classifyGateShadow(timeout, { priorDecisions: prior,
+    ownerCellByFailureId: { [stalled]: 'PREEXIST-TRIAGE-27' } }).unmeasuredOwnerAssignments).toEqual([]);
 });
 
 test('GATE-INTRODUCED-MAIN-FIXED-PICK sim: only a measured first-parent transition with an intact rolling receipt is suggested', () => {

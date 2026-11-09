@@ -3,7 +3,7 @@ import { computePrimaryStatusPills, pillAtColumn } from '../src/status/pills.js'
 import { computePopupBounds, createModelPickerPopup, createWdPickerPopup } from '../src/status/popups.js';
 import type { StatusBarState } from '../src/status/bar.js';
 import type { ActiveProviderInfo } from '../src/provider-summary.js';
-import type { RotationEntry } from '../src/user-config.js';
+import type { RotationEntry } from '../src/user-config/types.js';
 import type { DisplayMouseEvent } from '../src/display/types.js';
 
 const PROVIDER: ActiveProviderInfo = { provider: 'anthropic', model: 'Opus 4.7' };

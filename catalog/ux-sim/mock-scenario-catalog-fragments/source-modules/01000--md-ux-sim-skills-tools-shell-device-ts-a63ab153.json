@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SKILLS-TOOLS-SHELL-DEVICE-TS",
+  "path": "src/ux-sim/skills-tools-shell-device.ts",
+  "boundary": "Exercises the RunShell policy: rejects HQ heavy-gate commands before spawn with a remote alternative and isolated log event, while recording safe fake-spawn outcomes.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,33 @@
+{
+  "id": "release-graph-receipt-audit",
+  "name": "Release graph receipt audit simulation",
+  "checklistCells": ["RELEASE-GRAPH-RECEIPT-AUDIT"],
+  "implementation": [
+    "scripts/release-loop/gate-file-receipts.ts",
+    "src/ux-sim/release-graph-receipt-audit.test.ts"
+  ],
+  "tests": [
+    "src/ux-sim/release-graph-receipt-audit.test.ts"
+  ],
+  "target": "Replay four historical release gate runs through receipt audit, residual retry, evidence skip, parallel artifact join, and publish approval.",
+  "inputs": [
+    "four 0.3.7 gate run IDs and their pinned commits",
+    "valid, missing, and corrupt per-file receipt records",
+    "incomplete batches, host lease failure, and rejected recovery",
+    "parallel artifact outcome and release commit"
+  ],
+  "observations": [
+    "the production receipt planner selects the uncovered or invalid receipt files for residual measurement",
+    "a repaired batch is audited again until every test file is covered",
+    "ledger-only defects pass only with complete same-commit evidence, zero introduced failures, and no other failures",
+    "receipt audit and artifact branches rendezvous through a deterministic start barrier",
+    "the join starts only after both branches end and artifact failure blocks publish approval",
+    "the old gate-same-run-recheck path is not used"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/release-graph-receipt-audit.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -1,6 +1,6 @@
 # Vault — your Obsidian notes in the browser
 
-> **Experimental.** This screen is hidden by default. Set the screen role to **Contributor** in Setup (`/setup` → screen role) to show it. It works, but its layout and behaviour may still change.
+**Experimental.**
 
 The **Vault** menu of the web app opens your Obsidian vault. You can browse
 it, search it, read and edit notes, create new ones, and explore tags and

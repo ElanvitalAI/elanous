@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import type { SpawnSyncOptions } from 'node:child_process';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { PassThrough } from 'node:stream';
 import { Command } from 'commander';
@@ -20,6 +21,7 @@ import { renderBaseline } from '../../scripts/ci-public-leak-gate.js';
 import type { CmdRunner, FindPrForBranchOutcome, MergePrOutcome, PrManager, UpsertPrInput, UpsertPrOutcome } from '../../src/autopilot/pr-manager.js';
 import type { FederatedUnfinishedRunLedgerEntry, FederatedUnfinishedRunLedgerQuery } from '../../src/self-implement/run-ledger.js';
 import type { RunningRunsResult } from '../../src/self-implement/running-runs.js';
+import { simCli } from '../../src/ux-sim/in-process-cli.js';
 
 function fakeManager(overrides: Partial<PrManager> = {}) {
   const calls: string[] = [];
@@ -48,9 +50,132 @@ function output() {
 
 function git(cwd: string, ...args: string[]): string {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
-  expect(result.status).toBe(0);
+  expect(result.status, result.stderr).toBe(0);
   return result.stdout.trim();
 }
+
+function setRemoteMain(cwd: string, remote: string, commit: string): void {
+  git(cwd, '--git-dir', remote, 'fetch', cwd, `${commit}:refs/heads/main`);
+  git(cwd, 'update-ref', 'refs/remotes/origin/main', commit);
+}
+
+function snapshotDirectory(root: string, directory = root): Array<{ path: string; kind: string; content?: string }> {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    const relativePath = path.slice(root.length + 1);
+    if (entry.isDirectory()) return [{ path: relativePath, kind: 'directory' }, ...snapshotDirectory(root, path)];
+    if (entry.isFile()) return [{ path: relativePath, kind: 'file', content: createHash('sha256').update(readFileSync(path)).digest('hex') }];
+    return [{ path: relativePath, kind: entry.isSymbolicLink() ? 'symlink' : 'other' }];
+  }).sort((left, right) => left.path.localeCompare(right.path));
+}
+
+describe('production CLI launch-goal filesystem isolation', () => {
+  it('writes launch-door goals only inside the temporary checkout', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-cli-launch-goal-isolation-'));
+    const checkout = join(root, 'checkout');
+    const goals = join(checkout, 'docs', 'goals');
+    const state = join(root, 'state');
+    const home = join(root, 'home');
+    const config = join(root, 'config');
+    const brokenCheckout = join(root, 'broken-checkout');
+    const brokenGoals = join(brokenCheckout, 'docs', 'goals');
+    const brokenState = join(root, 'broken-state');
+    const brokenConfig = join(root, 'broken-config');
+    const realGoals = resolve(import.meta.dir, '../../docs/goals');
+    const realGoalFilesBefore = new Set(readdirSync(realGoals).filter((name) => name.startsWith('GOAL-launch-door-') && name.endsWith('.md')));
+    const realGoalsEntriesBefore = readdirSync(realGoals);
+    const realGoalsSnapshot = new Map(readdirSync(realGoals, { withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => [entry.name, readFileSync(join(realGoals, entry.name))]));
+    const realGoalsTreeBefore = snapshotDirectory(realGoals);
+    const observedRealWrites: string[] = [];
+    const expectGoalRoute = (goalPath: string | undefined, expectedDirectory: string): void => {
+      expect(goalPath).toBeTruthy();
+      expect(resolve(goalPath!)).toBe(join(expectedDirectory, basename(goalPath!)));
+    };
+    const expectNoLaunchGoalWrites = (directory: string, before: Array<{ path: string; kind: string; content?: string }>): void => {
+      expect(snapshotDirectory(directory)).toEqual(before);
+    };
+    let reportedGoalPath: string | undefined;
+    const watcher = fs.watch(realGoals, (_event, filename) => {
+      const name = filename?.toString();
+      if (name?.startsWith('GOAL-launch-door-') && name.endsWith('.md')) observedRealWrites.push(name);
+    });
+    try {
+      mkdirSync(goals, { recursive: true });
+      mkdirSync(brokenGoals, { recursive: true });
+      const brokenOriginalGoalsBefore = snapshotDirectory(brokenGoals);
+      mkdirSync(home, { recursive: true });
+      git(checkout, 'init', '-b', 'main');
+      git(brokenCheckout, 'init', '-b', 'main');
+      const sentence = `launch door ${randomUUID()}\\n대상 경로: test/cli/pr-cli.test.ts`;
+      const result = await simCli([`--test=${state}`, '--config-dir', config, 'harness', 'say', sentence,
+        '--child-llm-provider', 'anthropic', '--substrate', 'local', '--no-queue',
+      ], { mode: 'spawn', entrypoint: join(import.meta.dir, '../../bin/elanous.mjs'), stateRoot: state, configRoot: config,
+        allowPaths: [['harness', 'say']],
+        cwd: checkout,
+        env: {
+          PATH: process.env.PATH ?? '', HOME: home, XDG_CONFIG_HOME: join(root, 'config'),
+          NODE_ENV: 'test', ELANOUS_LAUNCH_GATE_LIVE: '1',
+        },
+      });
+      const stderr = result.stderr;
+      const exitCode = result.exitCode;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      reportedGoalPath = stderr.match(/\[ask\] 저작됨: ([^\r\n]+)/)?.[1]?.trim();
+      const fixtureGoalFiles = readdirSync(goals).filter((name) => name.startsWith('GOAL-launch-door-') && name.endsWith('.md'));
+      const realGoalFilesAfter = readdirSync(realGoals).filter((name) => name.startsWith('GOAL-launch-door-') && name.endsWith('.md'));
+      const realFilesCreated = realGoalFilesAfter.filter((name) => !realGoalFilesBefore.has(name));
+      expect([...new Set([...observedRealWrites, ...realFilesCreated])]).toEqual([]);
+      expect(readdirSync(realGoals)).toEqual(realGoalsEntriesBefore);
+      expectNoLaunchGoalWrites(realGoals, realGoalsTreeBefore);
+      for (const [name, contents] of realGoalsSnapshot) expect(readFileSync(join(realGoals, name))).toEqual(contents);
+      expectGoalRoute(reportedGoalPath, goals);
+      expect(fixtureGoalFiles).toContain(basename(reportedGoalPath!));
+      expect(exitCode).toBe(1);
+
+      const brokenResult = await simCli([`--test=${brokenState}`, '--config-dir', brokenConfig, 'harness', 'say',
+        `launch door broken isolation ${randomUUID()}\\n대상 경로: test/cli/pr-cli.test.ts`,
+        '--child-llm-provider', 'anthropic', '--substrate', 'local', '--no-queue',
+      ], { mode: 'spawn', entrypoint: join(import.meta.dir, '../../bin/elanous.mjs'), stateRoot: brokenState, configRoot: brokenConfig,
+        allowPaths: [['harness', 'say']],
+        cwd: brokenCheckout,
+        env: {
+          PATH: process.env.PATH ?? '', HOME: home, XDG_CONFIG_HOME: join(root, 'config'),
+          NODE_ENV: 'test', ELANOUS_LAUNCH_GATE_LIVE: '1',
+        },
+      });
+      const brokenExitCode = brokenResult.exitCode;
+      const brokenGoalPath = brokenResult.stderr.match(/\[ask\] 저작됨: ([^\r\n]+)/)?.[1]?.trim();
+      expect(brokenExitCode).toBe(1);
+      expect(brokenGoalPath).toBeTruthy();
+      let brokenRouteRejected = false;
+      try {
+        expectGoalRoute(brokenGoalPath, goals);
+      } catch (error) {
+        brokenRouteRejected = error instanceof Error && error.message.includes('expect(received).toBe(expected)');
+      }
+      expect(brokenRouteRejected).toBe(true);
+      expectGoalRoute(brokenGoalPath, brokenGoals);
+      expect(readdirSync(brokenGoals)).toContain(basename(brokenGoalPath!));
+      let brokenWriteRejected = false;
+      let brokenWriteFailure = '';
+      try {
+        expectNoLaunchGoalWrites(brokenGoals, brokenOriginalGoalsBefore);
+      } catch (error) {
+        brokenWriteFailure = error instanceof Error ? error.message : String(error);
+        brokenWriteRejected = brokenWriteFailure.includes('toEqual');
+      }
+      expect(brokenWriteRejected, brokenWriteFailure).toBe(true);
+      expect(snapshotDirectory(realGoals)).toEqual(realGoalsTreeBefore);
+    } finally {
+      watcher.close();
+      if (reportedGoalPath?.startsWith(`${realGoals}/`)) {
+        const name = basename(reportedGoalPath);
+        if (!realGoalFilesBefore.has(name)) rmSync(reportedGoalPath, { force: true });
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+});
 
 const baseLookupRun = (cmd: string, args: readonly string[]) =>
   cmd === 'git' && args.join(' ') === 'remote'
@@ -1582,7 +1707,7 @@ describe('elanous pr land', () => {
         git(repo, 'commit', '-m', 'old base');
         const oldTip = git(repo, 'rev-parse', 'HEAD');
         git(repo, 'remote', 'add', 'origin', remote);
-        git(repo, 'push', '-u', 'origin', 'main');
+        setRemoteMain(repo, remote, oldTip);
         git(repo, 'switch', '-c', 'feat/land');
         writeFileSync(join(repo, 'feature.txt'), 'feature\n');
         git(repo, 'add', 'feature.txt');
@@ -1593,7 +1718,7 @@ describe('elanous pr land', () => {
         git(repo, 'add', 'base.txt');
         git(repo, 'commit', '-m', 'new base');
         const newTip = git(repo, 'rev-parse', 'HEAD');
-        git(repo, 'push', 'origin', 'main');
+        setRemoteMain(repo, remote, newTip);
         git(repo, 'update-ref', 'refs/remotes/origin/main', oldTip);
         git(repo, 'branch', 'origin/main', newTip);
         git(repo, 'switch', 'feat/land');
@@ -1648,8 +1773,9 @@ describe('elanous pr land', () => {
         writeFileSync(file, lines.join(''));
         git(repo, 'add', '.');
         git(repo, 'commit', '-m', 'base');
+        const baseTip = git(repo, 'rev-parse', 'HEAD');
         git(repo, 'remote', 'add', 'origin', remote);
-        git(repo, 'push', '-u', 'origin', 'main');
+        setRemoteMain(repo, remote, baseTip);
         git(repo, 'switch', '-c', 'feat/land');
         lines[25] = 'feature line\n';
         writeFileSync(file, lines.join(''));
@@ -1660,7 +1786,8 @@ describe('elanous pr land', () => {
         lines[2] = 'main line\n';
         writeFileSync(file, lines.join(''));
         git(repo, 'commit', '-am', 'chore: land another PR');
-        git(repo, 'push', 'origin', 'main');
+        const firstMain = git(repo, 'rev-parse', 'HEAD');
+        setRemoteMain(repo, remote, firstMain);
         git(repo, 'switch', 'feat/land');
         const reviewDir = join(root, 'review-results');
         mkdirSync(reviewDir);
@@ -1677,10 +1804,11 @@ describe('elanous pr land', () => {
           const result = spawnSync(command, [...args], { cwd: options?.cwd ?? repo, encoding: 'utf8' });
           return { ok: result.status === 0, out: result.stdout ?? '', err: result.stderr ?? '' };
         };
-        expect(await runPrLand({ pr: '51', expectedHead: head, dryRun: true, cwd: repo, base: 'main' }, {
+        const dryRunCode = await runPrLand({ pr: '51', expectedHead: head, dryRun: true, cwd: repo, base: 'main' }, {
           ...baseDeps, run, resolveBase: () => 'main', reviewResultsDir: reviewDir,
           manager: pinnedManager().manager, out: sink.out,
-        })).toBe(0);
+        });
+        expect(dryRunCode, sink.errors.join(' | ')).toBe(0);
         expect(sink.logs.join('\n')).toContain('virtual-rebase');
         expect(git(repo, 'show-ref')).toBe(refs);
         expect(git(repo, 'count-objects', '-v')).toBe(objects);
@@ -1730,7 +1858,7 @@ describe('elanous pr land', () => {
         git(repo, 'commit', '-m', 'base');
         const gateBase = git(repo, 'rev-parse', 'HEAD');
         git(repo, 'remote', 'add', 'origin', remote);
-        git(repo, 'push', '-u', 'origin', 'main');
+        setRemoteMain(repo, remote, gateBase);
         git(repo, 'switch', '-c', 'feat/land');
         lines[25] = 'feature line\n';
         writeFileSync(file, lines.join(''));
@@ -1742,7 +1870,7 @@ describe('elanous pr land', () => {
         writeFileSync(file, lines.join(''));
         git(repo, 'commit', '-am', 'chore: land another PR');
         const firstMain = git(repo, 'rev-parse', 'HEAD');
-        git(repo, 'push', 'origin', 'main');
+        setRemoteMain(repo, remote, firstMain);
         lines[1] = 'later main line\n';
         writeFileSync(file, lines.join(''));
         git(repo, 'commit', '-am', 'chore: land later PR');
@@ -1775,8 +1903,7 @@ describe('elanous pr land', () => {
           runHeavyRemote: ({ main }) => {
             gatedBases.push(main);
             if (main === firstMain) {
-              git(repo, 'push', 'origin', `${laterMain}:refs/heads/main`);
-              git(repo, 'update-ref', 'refs/remotes/origin/main', laterMain);
+              setRemoteMain(repo, remote, laterMain);
             }
             return { ok: true, host: 'node-b', source: 'remote', elapsedMs: 1, evidencePath: '/tmp/virtual-late-heavy.json' };
           },

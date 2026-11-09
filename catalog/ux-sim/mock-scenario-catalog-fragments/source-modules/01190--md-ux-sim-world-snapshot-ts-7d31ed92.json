@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-WORLD-SNAPSHOT-TS",
+  "path": "src/ux-sim/world-snapshot.ts",
+  "boundary": "Creates, verifies, restores, and forks isolated simulation world snapshots inside the explicit test universe; world-runtime exercises migration boundaries and sim-universe-world-lifecycle owns snapshot lifecycle behavior.",
+  "deviceIds": [
+    "world-runtime",
+    "sim-universe-world-lifecycle"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GOAL-DEVICE-TS",
+  "path": "src/ux-sim/goal-device.ts",
+  "boundary": "Feeds work intervals and load samples to the production goal-progress classifier, including its minimum evidence sample.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

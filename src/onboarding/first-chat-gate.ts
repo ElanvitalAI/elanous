@@ -1,6 +1,6 @@
 import { debug } from '../debug/log.js';
 import { needsFirstRun, needsOnboarding } from '../onboarding.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import type { FirstRunDeps, runFirstRun } from './first-run.js';
 import { UNATTENDED_SETUP_COMMAND } from './entry-hints.js';
 

@@ -1,0 +1,28 @@
+{
+  "id": "fake-ps",
+  "name": "Fake process table",
+  "implementation": [
+    "src/ux-sim/fake-ps.ts",
+    "src/ux-sim/world-host-chaos.ts"
+  ],
+  "tests": [
+    "src/ux-sim/world-host-chaos.test.ts",
+    "src/ux-sim/world-chaos-runtime.test.ts"
+  ],
+  "target": "world process inventory used by monkey signals and host-wide gorilla failure",
+  "inputs": [
+    "declared processes",
+    "process kill and re-registration operations"
+  ],
+  "observations": [
+    "live process rows by host",
+    "PID liveness",
+    "declared process fingerprints after host recovery"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/world-host-chaos.test.ts src/ux-sim/world-chaos-runtime.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

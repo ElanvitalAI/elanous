@@ -528,7 +528,10 @@ test('rehearsal leak-check diagnostic names the pattern, source file and line', 
   ] }), '')).toBe('1 hit(s) · ceo-mark src/private-secret.txt:1');
   expect(rehearsalLeakFailureDetail(JSON.stringify({ leaks: 1, hits: [
     { marker: 'made-up-marker', file: 'src/.env', line: 1 },
-  ] }), '')).toBe('leak-check produced no structured diagnostic');
+  ] }), '')).toBe('1 hit(s) · unknown-marker: made-up-marker src/.env:1');
+  expect(rehearsalLeakFailureDetail(JSON.stringify({ leaks: 3, hits: [
+    { marker: 'private-redaction-identifier', file: 'src/ux-sim/warm-pool-reuse-sim.test.ts', line: 65, text: 'node-b' },
+  ] }), '')).toBe('3 hit(s) · unknown-marker: private-redaction-identifier src/ux-sim/warm-pool-reuse-sim.test.ts:65');
 });
 
 test('persisted leak paths must be tracked and included by that checkout manifest', () => {
@@ -540,6 +543,8 @@ test('persisted leak paths must be tracked and included by that checkout manifes
     .toBe('leak-check produced no structured diagnostic');
   expect(sanitizeRehearsalLeakDetail('1 hit(s) · kr-mobile-phone src/leak.txt:1', included))
     .toBe('leak-check produced no structured diagnostic');
+  expect(sanitizeRehearsalLeakDetail('1 hit(s) · unknown-marker: private-redaction-identifier src/leak.txt:1', included))
+    .toBe('1 hit(s) · unknown-marker: private-redaction-identifier src/leak.txt:1');
   for (const control of ['\r', '\u001b']) {
     expect(sanitizeRehearsalLeakDetail(`1 hit(s) · ceo-mark src/leak${control}.txt:1`))
       .toBe('leak-check produced no structured diagnostic');

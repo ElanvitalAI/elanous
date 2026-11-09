@@ -17,7 +17,7 @@ import { resolveAutoRoute, type AutoRouteDeps } from './auto-route.js';
 import { lookupLlmTierSpec } from './llm-tier-map.js';
 import type { RouteTierOpts } from './task-router.js';
 import { DEFAULT_MODEL_TIER, type ModelTier } from './types.js';
-import type { ReasoningLevel } from '../user-config.js';
+import type { ReasoningLevel } from '../user-config/types.js';
 
 export interface SetupModelSuggestion {
   provider: string;

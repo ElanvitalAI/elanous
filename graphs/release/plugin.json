@@ -1,0 +1,34 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "release-day",
+  "version": "0.3.8",
+  "description": "Declared release graph template and its execution capabilities.",
+  "extensions": {
+    "ai.elanous": {
+      "identity": "elanous-0.x-release",
+      "inputs": ["manual", "release.cut.due"],
+      "graphs": ["./release-loop.yaml"],
+      "graphManifests": {
+        "release-loop": {
+          "purpose": "Run the Elanous 0.x release workflow as one policy-bound graph instance.",
+          "allow": {
+            "recipes": ["version-release", "readiness-countdown", "traffic-cut-start", "cutoff", "checklist-gate", "tsc", "ratchet", "gate", "emergency-switch", "emergency-gate", "receipt-audit", "traffic-gate-passed", "traffic-npm-published", "traffic-failed-restore", "gate-triage", "mac-smoke", "export-check", "pwa", "prepare", "upgrade", "tui", "docs", "known-issues", "notes-check", "notes-repair", "notes-recheck", "auto-approve", "publish", "continue-publish", "repair-recovery", "publish-command", "npm-publish", "docs-land", "verify", "traffic-verify-complete", "vault-note", "release-story", "ops-upgrade", "version-dev-bump", "rla-release-autostart", "rla-train-worker-restart", "rla-release-recover", "gate-heal-decision", "gate-same-run-recheck", "rla-rehearsal-retry", "rla-cloud-join", "rla-cloud-leave", "rla-focused-verify", "rla-rail-now", "rla-nexus-restart", "rla-nexus-build", "gate-repair", "gate-image-repair", "cut-append", "gate-accept-regression"],
+            "skills": ["rla-release-operations"],
+            "domainPacks": ["release-graph", "release-gate"]
+          },
+          "policy": {
+            "gate.plan.promoteToFull": { "type": "enum[]", "default": ["dep-layer", "verdict-files", "opaque-closure", "cost-crossover"], "values": ["dep-layer", "verdict-files", "opaque-closure", "cost-crossover"] }
+          },
+          "hitl": ["approve-publish", "approve-continue", "gate-repair-recovery", "gate-heal-decision"],
+          "terminal": { "done": "success", "failed": "failure" },
+          "observe": { "categories": ["release-loop.*", "release.gate.*"] }
+        }
+      },
+      "graphSchema": "./release-graph.schema.yaml",
+      "vocab": ["./release-edge-vocabulary.yaml"],
+      "capabilities": ["proc:bun", "proc:elanous", "fs:read:release-context", "fs:write:run-context"],
+      "domainPackFiles": ["./release-gate-domain-pack.yaml"],
+      "edgeVocabulary": "./release-edge-vocabulary.yaml"
+    }
+  }
+}

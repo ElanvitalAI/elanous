@@ -11,6 +11,7 @@ export type FakeLandQueueInput = {
   readonly expedite?: number;
   readonly eject?: readonly number[];
   readonly conflicting?: readonly number[];
+  readonly landedFiles?: readonly string[];
   readonly gates?: readonly ('pass' | 'fail' | 'unmeasured')[];
 };
 export type FakeLandQueueResult = {
@@ -20,6 +21,8 @@ export type FakeLandQueueResult = {
   readonly ejected: readonly number[];
   readonly stoppedAtCut: boolean;
   readonly verdicts: readonly TrainVerdict[];
+  readonly receipts: readonly { number: number; head: string; verdict: TrainVerdict['verdict'] }[];
+  readonly conflicts: readonly { number: number; files: string[] }[];
 };
 
 /** Hysteresis prevents slot oscillation: below 60% expand; at/above 80% contract. */
@@ -30,15 +33,16 @@ export function fakeLandSlots(load: number, previous: 2 | 3 = 2): 2 | 3 {
   return previous;
 }
 
-function syntheticGit(conflicting: ReadonlySet<number>, prByHead: ReadonlyMap<string, number>): TrainGit {
+function syntheticGit(conflicting: ReadonlyMap<number, readonly string[]>, prByHead: ReadonlyMap<string, number>): TrainGit {
   let commit = 0;
   const sha = (n: number) => n.toString(16).padStart(40, '0');
   return (args) => {
     const command = args.find((arg) => arg === 'merge-tree' || arg === 'commit-tree' || arg === 'ls-tree');
     if (command === 'merge-tree') {
       const pr = prByHead.get(args.at(-1) ?? '');
-      return pr !== undefined && conflicting.has(pr)
-        ? { status: 1, stdout: `${sha(900 + (pr ?? 0))}\0src/conflict.ts\0\0`, stderr: '' }
+      const files = pr === undefined ? [] : conflicting.get(pr) ?? [];
+      return files.length
+        ? { status: 1, stdout: `${sha(900 + pr!)}\0${files.join('\0')}\0\0`, stderr: '' }
         : { status: 0, stdout: `${sha(900 + (pr ?? 0))}\0`, stderr: '' };
     }
     if (command === 'commit-tree') return { status: 0, stdout: sha(++commit), stderr: '' };
@@ -59,14 +63,22 @@ export async function simulateFakeLandQueue(input: FakeLandQueueInput): Promise<
   }
   const slots = fakeLandSlots(input.load, input.previousSlots);
   if (input.cutWindowOpen === false) return {
-    slots, departed: [], waiting: queue.map((item) => item.number), ejected: [...ejected], stoppedAtCut: true, verdicts: [],
+    slots, departed: [], waiting: queue.map((item) => item.number), ejected: [...ejected], stoppedAtCut: true, verdicts: [], receipts: [], conflicts: [],
   };
 
+  const landedFiles = new Set(input.landedFiles ?? []);
+  const conflicts = new Map(queue.flatMap((item) => {
+    const overlapping = item.files.filter((file) => landedFiles.has(file));
+    return (overlapping.length || input.conflicting?.includes(item.number))
+      ? [[item.number, overlapping.length ? overlapping : ['src/conflict.ts']] as const] : [];
+  }));
+  const conflictReceipts = [...conflicts].map(([number, files]) => ({ number, files: [...files] }));
   const departed: number[][] = [];
   const waiting: number[] = [];
   const verdicts: TrainVerdict[] = [];
+  const receipts: { number: number; head: string; verdict: TrainVerdict['verdict'] }[] = [];
   const gates = [...(input.gates ?? [])];
-  const git = syntheticGit(new Set(input.conflicting ?? []), new Map(queue.map((item) => [item.head, item.number])));
+  const git = syntheticGit(conflicts, new Map(queue.map((item) => [item.head, item.number])));
   while (queue.length) {
     const batch: FakeLandQueueItem[] = [];
     const occupied = new Set<string>();
@@ -86,6 +98,12 @@ export async function simulateFakeLandQueue(input: FakeLandQueueInput): Promise<
       observe: () => {},
     });
     verdicts.push(...train.verdicts);
+    const verdictByPr = new Map(train.verdicts.map((verdict) => [verdict.number, verdict.verdict]));
+    for (const item of batch) {
+      const verdict = verdictByPr.get(item.number);
+      if (verdict) receipts.push({ number: item.number, head: item.head, verdict });
+    }
   }
-  return { slots, departed, waiting: [...waiting, ...queue.map((item) => item.number)], ejected: [...ejected], stoppedAtCut: false, verdicts };
+  return { slots, departed, waiting: [...waiting, ...queue.map((item) => item.number)], ejected: [...ejected], stoppedAtCut: false,
+    verdicts, receipts, conflicts: conflictReceipts };
 }

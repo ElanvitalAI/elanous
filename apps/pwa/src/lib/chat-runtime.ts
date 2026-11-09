@@ -4,6 +4,7 @@
  */
 
 import { cardTextFromToolOutput } from './elanous-card';
+import { parseDeployResult, type DeployResult } from './chat-deploy';
 import { contextSources, type ContextSource } from '../components/chat/context-sources';
 import type {
   AcpConnection,
@@ -126,6 +127,12 @@ export function dispatchHudSegmentEnvelope(env: FeedbackEnvelopeWire): void {
 
 export type ChatRole = 'user' | 'assistant' | 'system' | 'meta';
 
+/** An interrupted turn has no final answer for the minimal chat surface. */
+export function isIncompleteChatStopReason(reason: string | undefined): boolean {
+  return reason !== undefined
+    && !['end_turn', 'stop_sequence', 'completed', 'refusal'].includes(reason);
+}
+
 /** Phase B-2 / B-3 (PWA chat streaming · 2026-05-06) — multimodal
  *  block primitives.
  *
@@ -168,6 +175,16 @@ export function pushToolCards(blocks: ChatBlock[], rawOutput: unknown): boolean 
   const text = cardTextFromToolOutput(rawOutput);
   if (!text || blocks.some((b) => b.kind === 'text' && b.text === text)) return false;
   blocks.push({ kind: 'text', text });
+  return true;
+}
+
+export function pushDeployResult(blocks: ChatBlock[], toolId: string, toolName: string, rawOutput: unknown): boolean {
+  const result = parseDeployResult(toolName, rawOutput);
+  if (!result) return false;
+  const index = blocks.findIndex((block) => block.kind === 'deploy_result' && block.toolId === toolId);
+  const block: ChatBlock = { kind: 'deploy_result', toolId, result };
+  if (index < 0) blocks.push(block);
+  else blocks[index] = block;
   return true;
 }
 
@@ -223,6 +240,7 @@ export function parseMcpAppPayload(rawOutput: unknown, screenUrl: string): McpAp
 
 export type ChatBlock =
   | { kind: 'harness_ask'; acceptanceId: string }
+  | { kind: 'deploy_result'; toolId: string; result: DeployResult }
   | { kind: 'text'; text: string }
   | { kind: 'image'; src: string; mediaType: string; alt?: string }
   | {
@@ -378,6 +396,12 @@ export interface ChatMessage {
    *  `blocks` is present + non-empty, ChatMessageView renders the
    *  blocks union and ignores `text`. */
   text: string;
+  /** This assistant placeholder is still receiving chunks. */
+  streaming?: boolean;
+  /** Partial text from a stopped or failed turn must stay folded. */
+  incomplete?: boolean;
+  /** End of interim prose before the last tool call. */
+  finalTextStart?: number;
   /** Multimodal block list (Phase B-2). Absent on legacy messages.
    *  Used by `runChatTurnStreaming` to attach image content emitted
    *  via the SSE `image-block` event. */
@@ -959,6 +983,7 @@ export async function runChatTurnStreaming(
           blocks[idx] = updated;
         }
         pushToolCards(blocks, rawOutput);
+        pushDeployResult(blocks, id, name, rawOutput);
         if (typeof resourceUri === 'string' && resourceUri.trim().length > 0) {
           mcpAppCount += 1;
           const payload = parseMcpAppPayload(rawOutput, resourceUri);
@@ -1000,6 +1025,7 @@ export async function runChatTurnStreaming(
     id: `m-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     role: 'assistant',
     text: res.text ?? '',
+    ...(isIncompleteChatStopReason(res.stopReason) ? { incomplete: true } : {}),
     timestamp: Date.now(),
     meta: { provider: ctx.provider, stopReason: res.stopReason },
     ...(hasNonTextBlock ? { blocks: snapshot() } : {}),
@@ -1063,6 +1089,8 @@ export interface ChatObserverHandlers {
    *  Host typically tags the placeholder with stopReason='error' or
    *  drops it. */
   onError?: (placeholderId: string, info: { error: string; message?: string }) => void;
+  /** A new turn began before this placeholder received turn-end. */
+  onInterrupted?: (placeholderId: string) => void;
   /** Dedupe gate — when the host has a local POST in flight for this
    *  session, return `true` and the observer drops the duplicate
    *  events. Default `false` (no dedupe) lets every event through. */
@@ -1116,6 +1144,7 @@ export function runChatTurnObserver(
       // If a previous remote turn never received turn-end (rare —
       // disconnect mid-stream), wipe its in-flight state before
       // starting the new turn so blocks don't carry over.
+      if (placeholderId !== null && !dropCurrentTurn) handlers.onInterrupted?.(placeholderId);
       resetTurn();
       // Dedupe — local POST owns this turn's bubble.
       if (handlers.isLocalTurnInFlight?.()) {
@@ -1201,6 +1230,7 @@ export function runChatTurnObserver(
         blocks[idx] = updated;
       }
       pushToolCards(blocks, rawOutput);
+      pushDeployResult(blocks, id, name, rawOutput);
       if (typeof resourceUri === 'string' && resourceUri.trim().length > 0) {
         mcpAppCount += 1;
         const payload = parseMcpAppPayload(rawOutput, resourceUri);
@@ -1260,6 +1290,7 @@ export function runChatTurnObserver(
         id: `m-obs-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         role: 'assistant',
         text: res.text ?? '',
+        ...(isIncompleteChatStopReason(res.stopReason) ? { incomplete: true } : {}),
         timestamp: Date.now(),
         meta: {
           ...(handlers.provider ? { provider: handlers.provider } : {}),
@@ -1321,6 +1352,7 @@ export async function runChatTurnAcp(
   }
   const blocks: ChatBlock[] = [];
   let textIdx = -1;
+  let finalTextStart = 0;
   let imageCount = 0;
   let toolCount = 0;
   // ⭐ 스트리밍 경로와 «같은 이름»으로 센다 — 두 경로를 한 조회로 비교할 수 있어야 한다.
@@ -1443,6 +1475,7 @@ export async function runChatTurnAcp(
         handlers.onPartialBlocks?.(snapshot());
       }
     } else if (update.sessionUpdate === 'tool_call' && typeof update.toolCallId === 'string') {
+      finalTextStart = cumulativeText.length;
       toolCount += 1;
       blocks.push({
         kind: 'tool_use',
@@ -1490,6 +1523,8 @@ export async function runChatTurnAcp(
       //  ⛔ 「두 경로가 같은 일을 한다」고 «가정»하지 않는다 — 이 저장소에서 그 가정이 여러 번 틀렸다.
       // ⭐ 결과에 이미지가 있으면 «그려서» 보여 준다 — 링크만 남기지 않는다(대표 2026-08-21).
       pushToolCards(blocks, update.rawOutput);
+      pushDeployResult(blocks, update.toolCallId,
+        idx >= 0 ? (blocks[idx] as Extract<ChatBlock, { kind: 'tool_use' }>).name : update.title ?? '', update.rawOutput);
       for (const img of mcpResultImages(update.rawOutput)) {
         if (blocks.some((b) => b.kind === 'image' && b.src === img.src)) continue;
         imageCount += 1;
@@ -1591,6 +1626,8 @@ export async function runChatTurnAcp(
       id: `m-acp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       role: 'assistant',
       text: cumulativeText,
+      finalTextStart,
+      ...(isIncompleteChatStopReason(stopReason) ? { incomplete: true } : {}),
       timestamp: Date.now(),
       meta: { provider: ctx.provider, stopReason },
       ...(hasNonTextBlock ? { blocks: snapshot() } : {}),
@@ -1642,12 +1679,8 @@ export async function runChatTurnAcp(
  *  SSE observer (`runChatTurnObserver`) is mid-bubble for a foreign chat
  *  tab — supply `isRemoteSseTurnInFlight` to suppress double mirror.
  *
- *  Turn boundary heuristic — webterm `:agent` does NOT broadcast a
- *  turn-end notification (only `agent_message_chunk` / `tool_call` /
- *  `tool_call_update`). We arm an idle timer per chunk; after `idleMs`
- *  with no further chunks the placeholder is considered finalized and
- *  the host's `onFinalize` fires. Default 3000ms. Subsequent foreign
- *  turns allocate a fresh placeholder.
+ *  Webterm `:agent` announces begin/end explicitly. Legacy ACP streams
+ *  without those signals retain the idle fallback.
  */
 export interface AcpForeignTurnHandlers {
   /** Allocate an empty assistant placeholder for the foreign turn and
@@ -1657,7 +1690,7 @@ export interface AcpForeignTurnHandlers {
   onPartialBlocks: (placeholderId: string, blocks: ChatBlock[]) => void;
   /** Optional — fires after the idle timer elapses. Host typically just
    *  logs; the placeholder stays in history as a regular message. */
-  onFinalize?: (placeholderId: string) => void;
+  onFinalize?: (placeholderId: string, info?: { stopReason: string; finalTextStart: number }) => void;
   /** Dedupe: chat-tab's own POST owns this turn — drop ACP fanout. */
   isLocalTurnInFlight?: () => boolean;
   /** Dedupe: SSE observer (`runChatTurnObserver`) is mid-bubble for a
@@ -1689,6 +1722,8 @@ interface AcpSessionUpdate {
    *  ACP 경로가 그것을 볼 수 없었고, 그래서 MCP Apps 위젯이 영영 안 떴다.
    *  ⇒ 「타입에 없다」가 「값이 없다」로 «조용히» 바뀐 자리다. */
   rawOutput?: unknown;
+  text?: string;
+  stopReason?: string;
 }
 
 interface AcpSessionUpdateParams {
@@ -1707,6 +1742,8 @@ export function runAcpForeignTurnObserver(
   let textIdx = -1;
   let imageCount = 0;
   let toolCount = 0;
+  let explicitTurn = false;
+  let finalTextStart = 0;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
   const reset = (): void => {
@@ -1719,9 +1756,12 @@ export function runAcpForeignTurnObserver(
     textIdx = -1;
     imageCount = 0;
     toolCount = 0;
+    explicitTurn = false;
+    finalTextStart = 0;
   };
 
   const armIdle = (): void => {
+    if (explicitTurn) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       const ph = placeholderId;
@@ -1755,6 +1795,14 @@ export function runAcpForeignTurnObserver(
     return true;
   };
 
+  const finishIncomplete = (): void => {
+    const ph = placeholderId;
+    if (!ph) return;
+    debugLog('webterm.chat.acp.foreign-turn.end', { id: ph, images: imageCount, tools: toolCount });
+    reset();
+    handlers.onFinalize?.(ph, { stopReason: 'error', finalTextStart: 0 });
+  };
+
   const off = acp.on('sessionUpdate', (frame: AcpFrame) => {
     if (handlers.isLocalTurnInFlight?.()) return;
     if (handlers.isRemoteSseTurnInFlight?.()) return;
@@ -1762,6 +1810,42 @@ export function runAcpForeignTurnObserver(
     if (!params || params.sessionId !== sessionId) return;
     const update = params.update;
     if (!update) return;
+
+    if (update.sessionUpdate === 'elanous_turn_begin') {
+      // The server now owns this boundary. Do not infer completion from silence.
+      if (placeholderId !== null) finishIncomplete();
+      explicitTurn = true;
+      ensurePlaceholder();
+      return;
+    }
+    if (update.sessionUpdate === 'elanous_turn_end') {
+      if (!explicitTurn) return;
+      const ph = placeholderId;
+      let finalStart = finalTextStart;
+      const finalTextIsAuthoritative = typeof update.text === 'string'
+        && (update.text.length > 0 || !isIncompleteChatStopReason(update.stopReason));
+      if (ph && finalTextIsAuthoritative && typeof update.text === 'string') {
+        const authoritativeText = update.text;
+        const streamedText = textIdx === -1 ? '' : (blocks[textIdx] as Extract<ChatBlock, { kind: 'text' }>).text;
+        // Keep the pre-tool boundary only when that exact prose is still the
+        // beginning of the server's final body. The post-tool prose may change.
+        if (!authoritativeText.startsWith(streamedText.slice(0, finalTextStart))) finalStart = 0;
+        if (textIdx === -1) {
+          textIdx = blocks.length;
+          blocks.push({ kind: 'text', text: authoritativeText });
+        } else {
+          blocks[textIdx] = { kind: 'text', text: authoritativeText };
+        }
+        handlers.onPartialBlocks(ph, snapshot());
+      } else if (update.text === '') {
+        // A cancelled/failed runner may have streamed a useful partial answer.
+        finalStart = 0;
+      }
+      if (ph) debugLog('webterm.chat.acp.foreign-turn.end', { id: ph, images: imageCount, tools: toolCount });
+      reset();
+      if (ph) handlers.onFinalize?.(ph, { stopReason: update.stopReason ?? 'error', finalTextStart: finalStart });
+      return;
+    }
 
     let consumed = false;
 
@@ -1796,6 +1880,7 @@ export function runAcpForeignTurnObserver(
       }
     } else if (update.sessionUpdate === 'tool_call' && typeof update.toolCallId === 'string') {
       if (!ensurePlaceholder()) return;
+      if (explicitTurn && textIdx !== -1) finalTextStart = (blocks[textIdx] as Extract<ChatBlock, { kind: 'text' }>).text.length;
       toolCount += 1;
       blocks.push({
         kind: 'tool_use',
@@ -1832,6 +1917,8 @@ export function runAcpForeignTurnObserver(
           ...(update.title ? { summary: update.title } : {}),
         };
       }
+      pushDeployResult(blocks, update.toolCallId,
+        idx >= 0 ? (blocks[idx] as Extract<ChatBlock, { kind: 'tool_use' }>).name : update.title ?? '', update.rawOutput);
       consumed = true;
     }
 
@@ -1840,7 +1927,13 @@ export function runAcpForeignTurnObserver(
     armIdle();
   });
 
+  const offState = typeof acp.onState === 'function'
+    ? acp.onState((state) => { if ((state === 'FAILED' || state === 'CLOSED') && explicitTurn) finishIncomplete(); })
+    : () => {};
+
   return () => {
+    if (explicitTurn) finishIncomplete();
+    offState();
     off();
     if (idleTimer) {
       clearTimeout(idleTimer);

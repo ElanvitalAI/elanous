@@ -9,7 +9,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { ensureGateHostReservationDirectory, gateHostReservationRoot, inspectReleaseGateHost, readGateHostResourcesForHost, type GateHostResourceReading } from '../release-loop/gate-host-reservation.js';
-import type { GateRemoteConfig } from '../user-config.js';
+import type { GateRemoteConfig } from '../user-config/types.js';
 
 export type GateRemoteTool = 'self-gate' | 'ci-typecheck-changed' | 'public-export-test-run';
 
@@ -168,6 +168,9 @@ export const SLOT_DIR = '/tmp/elanous-gate-remote-slots';
 const BUSY = '__GATE_REMOTE_BUSY';
 const HEARTBEAT = '__GATE_REMOTE_HEARTBEAT=';
 const REMOTE_RUN_LIMIT_SECONDS = 105 * 60;
+// The silent-child check bounds wall-limit overshoot; TERM grace lets cooperative workers exit before KILL.
+const SUPERVISOR_POLL_INTERVAL_SECONDS = 5;
+const SUPERVISOR_TERM_GRACE_SECONDS = 2;
 
 /** Shell lines that run "$W/run.sh" under the first free of `cap` slot locks, or print the busy marker and exit 98.
  *  run.sh must create "$W/started" first: that is how a lock refusal is told apart from the run's own exit code. */
@@ -194,8 +197,13 @@ export function hostSlotScript(cap: number, dir = SLOT_DIR, tools: readonly Slot
 /** A slot holder owns exactly one new process group. On a lost SSH shell or wall limit it signals only that group,
  *  after checking its unreaped direct child's PGID. The heartbeat also detects a severed SSH output pipe while
  *  a silent test is running; runOnRemote removes only these transport lines from the tool's stderr. */
-export function remoteSupervisorScript(limitSeconds = REMOTE_RUN_LIMIT_SECONDS): string {
+export function remoteSupervisorScript(
+  limitSeconds = REMOTE_RUN_LIMIT_SECONDS,
+  timing: { pollIntervalSeconds?: number; termGraceSeconds?: number } = {},
+): string {
   const limit = Number.isSafeInteger(limitSeconds) && limitSeconds > 0 ? limitSeconds : REMOTE_RUN_LIMIT_SECONDS;
+  const pollInterval = Number.isFinite(timing.pollIntervalSeconds) && (timing.pollIntervalSeconds ?? 0) > 0 ? timing.pollIntervalSeconds! : SUPERVISOR_POLL_INTERVAL_SECONDS;
+  const termGrace = Number.isFinite(timing.termGraceSeconds) && (timing.termGraceSeconds ?? 0) > 0 ? timing.termGraceSeconds! : SUPERVISOR_TERM_GRACE_SECONDS;
   return [
     '#!/bin/sh',
     'child=',
@@ -207,7 +215,7 @@ export function remoteSupervisorScript(limitSeconds = REMOTE_RUN_LIMIT_SECONDS):
     // Our direct child stays unreaped until the caller waits, so its PID/PGID cannot be reused here.
     '  [ "$ready" -eq 1 ] && owned_group || return 0',
     '  kill -TERM -- "-$child" 2>/dev/null || kill -TERM "-$child" 2>/dev/null || :',
-    '  sleep 2',
+    `  sleep ${termGrace}`,
     // The leader remains our unreaped child until the caller waits, so its PGID cannot be reused here. A TERM-ignoring
     // grandchild may outlive the leader; rechecking only the leader would miss that member of the same owned group.
     '  kill -KILL -- "-$child" 2>/dev/null || kill -KILL "-$child" 2>/dev/null || :',
@@ -229,7 +237,7 @@ export function remoteSupervisorScript(limitSeconds = REMOTE_RUN_LIMIT_SECONDS):
     '  if [ "$(($(date +%s) - started))" -ge ' + limit + ' ]; then reap; wait "$child" 2>/dev/null || :; : > "$W/supervisor-timeout"; exit 124; fi',
     '  if ! kill -0 "$GATE_REMOTE_SSH_SHELL" 2>/dev/null; then reap; wait "$child" 2>/dev/null || :; : > "$W/supervisor-infra"; exit 125; fi',
     '  if ! printf "\\n' + HEARTBEAT + '%s\\n" "$W" >&2; then reap; wait "$child" 2>/dev/null || :; : > "$W/supervisor-infra"; exit 125; fi',
-    '  sleep 5',
+    `  sleep ${pollInterval}`,
     'done',
     'wait "$child"; rc=$?',
     'trap - HUP INT TERM EXIT',
@@ -385,7 +393,9 @@ export function remoteScript(input: { mirror: string; commit: string; fetchShas:
     'if [ "$free_kib" -lt 8388608 ]; then infra "disk-low:${free_kib}KiB"; fi',
     'W=$(mktemp -d /var/tmp/elanous-gate-remote-XXXXXXXX) || infra mktemp',
     'export W',
-    'trap \'rm -rf "$W"\' EXIT',
+    'ELANOUS_MODULE_ROOT=$(dirname "$(readlink -f "$(command -v eln)")")/../current/node_modules/elanous; export ELANOUS_MODULE_ROOT',
+    'log_cleanup_failure() { ELANOUS_STATE_DIR="$HOME/.elanous" ELANOUS_MODULE_ROOT="$ELANOUS_MODULE_ROOT" bun -e \'const root=process.env.ELANOUS_MODULE_ROOT; const {debug}=await import(`${root}/src/debug/log.ts`); debug.log("git-fs.worktree", "dependency-scratch.cleanup-failed", {target:"gate-remote", reason:"scratch-cleanup-failed"}, {level:"warn"});\' >/dev/null 2>&1 || :; }',
+    'cleanup() { status=$?; trap - EXIT; cd "$HOME" || :; parent=$(realpath -e /var/tmp 2>/dev/null) || parent=; target=$(realpath -e "$W" 2>/dev/null) || target=; if [ -n "$parent" ] && [ -n "$target" ] && [ -d "$W" ] && [ ! -L "$W" ] && [ "$(dirname "$target")" = "$parent" ] && [ "$(basename "$target")" = "$(basename "$W")" ]; then find -P "$target" -type d -exec chmod u+rwx {} \\; >/dev/null 2>&1 || :; rm -rf -- "$target" || log_cleanup_failure; else [ -e "$W" ] && log_cleanup_failure || :; fi; exit "$status"; }; trap cleanup EXIT',
     'command -v perl >/dev/null 2>&1 && command -v ps >/dev/null 2>&1 || infra supervisor-tool',
     'GATE_REMOTE_SSH_SHELL=$$; export GATE_REMOTE_SSH_SHELL',
     ...payloadLines,

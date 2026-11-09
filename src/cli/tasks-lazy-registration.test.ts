@@ -146,20 +146,35 @@ describe('tasks light route keeps the legacy output contract', () => {
   ];
   const stateRoot = join(root, 'state');
   const allowPaths = [['tasks'], ['tasks', 'list'], ['tasks', 'show'], ['tasks', 'hand'], ['tasks', 'advance'], ['pr', 'land'], ['pty', 'list'], ['release', 'checklist', 'set'], ['release', 'checklist', 'landed-but-yellow']] as const;
+  const inProcess = (args: string[]) => simCli(args, { allowPaths: [[], ...allowPaths], stateRoot, configRoot: root, cwd, env });
+  const inProcessCases = cases.filter(([command, ...tail]) =>
+    (command === 'tasks' || command === 'pr') && ['--help', '-h'].includes(tail.at(-1) ?? ''));
 
   test('real root entry keeps fast and full-router output contracts for every covered path', async () => {
     for (const args of cases) {
       const fast = await simCli(args, {
         mode: 'spawn', injectTestFlag: false, allowPaths, stateRoot, configRoot: root, cwd,
-        env: { ...env, ELANOUS_FAST_ROUTER: '1', ELANOUS_TEST_FLAG_AUDIT: '0' }, timeoutMs: 60_000,
+        env: { ...env, ELANOUS_FAST_ROUTER: '1', ELANOUS_TEST_FLAG_AUDIT: '0' },
       });
       const legacy = await simCli(args, {
         mode: 'spawn', injectTestFlag: false, allowPaths, stateRoot, configRoot: root, cwd,
-        env: { ...env, ELANOUS_FAST_ROUTER: '0', ELANOUS_TEST_FLAG_AUDIT: '0' }, timeoutMs: 60_000,
+        env: { ...env, ELANOUS_FAST_ROUTER: '0', ELANOUS_TEST_FLAG_AUDIT: '0' },
       });
       expect({ args, fast: [fast.exitCode, fast.stdout, fast.stderr] })
         .toEqual({ args, fast: [legacy.exitCode, legacy.stdout, legacy.stderr] });
     }
   }, 600_000);
 
+  test('command paths remain callable through the shared in-process CLI helper', async () => {
+    // Only supported task/PR help routes use in-process dispatch; other contracts stay on the real-entry path.
+    for (const args of inProcessCases) {
+      const legacy = await simCli(args, {
+        mode: 'spawn', injectTestFlag: false, allowPaths, stateRoot, configRoot: root, cwd,
+        env: { ...env, ELANOUS_FAST_ROUTER: '0', ELANOUS_TEST_FLAG_AUDIT: '0' },
+      });
+      const result = await inProcess(args);
+      expect({ args, inProcess: [result.exitCode, result.stdout, result.stderr] })
+        .toEqual({ args, inProcess: [legacy.exitCode, legacy.stdout, legacy.stderr] });
+    }
+  }, 120_000);
 });

@@ -1,3 +1,4 @@
+import { asRecord } from '../../primitives/guards.js';
 // NEXUS · /v1/setup/child-llm (PWA 설정 카드 — 자식 LLM 선호 · 예산 부족 행동)
 //
 // 해석은 resolveChildLlmPreference 한 함수만 부른다. 키를 직접 읽어 판정하지 않는다.
@@ -10,15 +11,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { debug } from '../../debug/log.js';
 import { DASHBOARD_PROVIDER_SETUP_OPTIONS } from '../../dashboard/setup-inline.js';
 import { resolveChildLlmPreference, type ResolvedChildLlmPreference } from '../../self-implement/child-llm-preference.js';
-import {
-  getUserConfig,
-  parseChildLlmPreference,
-  parseHarnessBudgetGate,
-  reloadUserConfig,
-  userConfigPath,
-  type ChildLlmPreferenceConfig,
-  type HarnessBudgetGateConfig,
-} from '../../user-config.js';
+import { getUserConfig, parseChildLlmPreference, parseHarnessBudgetGate, reloadUserConfig, userConfigPath } from '../../user-config.js';
+import type { ChildLlmPreferenceConfig, HarnessBudgetGateConfig } from '../../user-config/types.js';
 
 export interface ChildLlmSetupGetResponse {
   resolved: ResolvedChildLlmPreference;
@@ -107,10 +101,6 @@ function budgetGateDropReason(raw: unknown, parsed: HarnessBudgetGateConfig): st
   return reasons.length > 0 ? reasons.join('; ') : null;
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? { ...(value as Record<string, unknown>) } : {};
-}
-
 /** 디스크의 tools.selfImplement.childLlm 와 harness.budgetGate 만 바꾼다. */
 function writeChildLlmKeys(
   childLlm: ChildLlmPreferenceConfig | undefined,
@@ -119,19 +109,19 @@ function writeChildLlmKeys(
   const path = userConfigPath();
   let parsed: unknown = {};
   try { parsed = JSON.parse(readFileSync(path, 'utf8')); } catch { parsed = {}; }
-  const disk = asRecord(parsed);
-  const tools = asRecord(disk.tools);
-  const selfImplement = asRecord(tools.selfImplement);
+  const disk = asRecord(parsed, { fallback: 'empty', clone: true });
+  const tools = asRecord(disk.tools, { fallback: 'empty', clone: true });
+  const selfImplement = asRecord(tools.selfImplement, { fallback: 'empty', clone: true });
   if (childLlm) selfImplement.childLlm = childLlm;
   else delete selfImplement.childLlm;
   tools.selfImplement = selfImplement;
   disk.tools = tools;
   if (budgetGate) {
-    const harness = asRecord(disk.harness);
+    const harness = asRecord(disk.harness, { fallback: 'empty', clone: true });
     // 카드가 아는 두 칸만 합친다 — parseHarnessBudgetGate 가 채운 기본값(maxUsedPercent 등)으로
     // 사용자가 정해 둔 다른 칸을 덮지 않는다(🅣 P15 · 2026-09-27 합의).
     harness.budgetGate = {
-      ...asRecord(harness.budgetGate),
+      ...asRecord(harness.budgetGate, { fallback: 'empty', clone: true }),
       minHeadroomPercent: budgetGate.minHeadroomPercent,
       onShortfall: budgetGate.onShortfall,
     };

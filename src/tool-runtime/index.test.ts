@@ -6,7 +6,7 @@
 // 사람이 없다」(F38)를 시험이 못 문다.
 
 import { afterEach, describe, expect, test } from 'bun:test';
-import type { McpServerSpec } from '../user-config.js';
+import type { McpServerSpec } from '../user-config/types.js';
 import { registerAllDefaultToolRuntimes, type RegisterAllDefaultToolRuntimesOpts } from './index.js';
 import type { McpToolIndex } from '../nexus/boot/register-mcp-clients.js';
 import {

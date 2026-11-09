@@ -95,18 +95,6 @@ export interface SeatRequestsResponse {
 }
 export interface SeatRequestReceipt { receiptId: string; seat: string; queuedAt: string; attachments?: number; channel?: string }
 
-export interface FieldUploadResult {
-  event: string;
-  count: number;
-}
-
-export interface FieldReelStatus {
-  event: string;
-  state: string;
-  items: number;
-  url?: string;
-}
-
 export type ExecRequestStatus = 'planning' | 'running' | 'done' | 'failed';
 export type ExecSeatStatus = 'waiting' | 'running' | 'done' | 'failed';
 export interface ExecRequestSeat {
@@ -488,58 +476,6 @@ export class DaemonClient {
 
   async health(): Promise<{ ok: boolean }> {
     return this.fetchJson<{ ok: boolean }>('/v1/health');
-  }
-
-  async fieldDefaultEvent(): Promise<{ defaultEvent: string }> {
-    return this.fetchJson('/v1/field/uploads');
-  }
-
-  async fieldReelStatus(event: string): Promise<FieldReelStatus> {
-    return this.fetchJson(`/v1/field/reel?event=${encodeURIComponent(event)}`);
-  }
-
-  /** Browser upload progress needs XHR; the same daemon URL and bearer are used as fetchJson. */
-  uploadField(event: string, files: File[], caption: string, onProgress: (percent: number) => void): Promise<FieldUploadResult> {
-    const form = new FormData();
-    files.forEach((file) => form.append('file', file, file.name));
-    files.forEach(() => form.append('capturedAt', ''));
-    const query = new URLSearchParams({ event, device: 'pwa' });
-    if (caption.trim()) {
-      query.set('caption', caption.trim());
-      form.append('caption', caption.trim());
-    }
-    const path = `/v1/field/uploads?${query}`;
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', this.url(path));
-      if (this.cfg.token) xhr.setRequestHeader('authorization', `Bearer ${this.cfg.token}`);
-      xhr.upload.onprogress = (progress) => {
-        if (progress.lengthComputable && progress.total > 0) {
-          onProgress(Math.min(100, Math.round(progress.loaded * 100 / progress.total)));
-        }
-      };
-      xhr.onerror = () => reject(new Error('field upload: network error'));
-      xhr.onload = () => {
-        if (xhr.status === 401) reportAuthRequired(path);
-        let body: { ok?: boolean; error?: string; reason?: string; event?: string; count?: number };
-        try { body = JSON.parse(xhr.responseText); }
-        catch { reject(new Error(`field upload ${xhr.status}: invalid response`)); return; }
-        if (typeof body !== 'object' || body === null) {
-          reject(new Error(`field upload ${xhr.status}: invalid response`));
-          return;
-        }
-        if (xhr.status < 200 || xhr.status >= 300 || body.ok !== true) {
-          reject(new Error(body.reason ?? body.error ?? `field upload ${xhr.status}`));
-          return;
-        }
-        if (typeof body.event !== 'string' || typeof body.count !== 'number') {
-          reject(new Error(`field upload ${xhr.status}: invalid response`));
-          return;
-        }
-        resolve({ event: body.event, count: body.count });
-      };
-      xhr.send(form);
-    });
   }
 
   async submitConsultRequest(request: ConsultRequest): Promise<ConsultRequestResult> {

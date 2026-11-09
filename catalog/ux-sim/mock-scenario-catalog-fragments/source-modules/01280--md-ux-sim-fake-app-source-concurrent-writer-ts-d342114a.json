@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-APP-SOURCE-CONCURRENT-WRITER-TS",
+  "path": "src/ux-sim/fake-app-source-concurrent-writer.ts",
+  "boundary": "APP-SOURCE-SNAPSHOT preexisting simulator module: fake-app-source-concurrent-writer.ts.",
+  "deviceIds": [
+    "fake-app-source-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

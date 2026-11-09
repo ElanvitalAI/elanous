@@ -1,0 +1,26 @@
+{
+  "id": "SIM-HQ-MOVE",
+  "name": "Move HQ from mbp to Studio with safe host fencing",
+  "kind": "hq-move",
+  "device": "world-runtime",
+  "implementation": [
+    "src/ux-sim/hq-move-sim.ts",
+    "src/hq/transfer.ts",
+    "src/hq/hq.ts",
+    "src/hq/promote.ts",
+    "src/resource-ledger/machine-pool-inventory.ts",
+    "scenarios/ux-sim/sim-hq-move.yaml"
+  ],
+  "tests": [
+    "src/ux-sim/hq-move-sim.test.ts",
+    "src/ux-sim/world.test.ts"
+  ],
+  "trigger": "The real HQ transfer runbook promotes MacStudioB1 under injected remote host, arbiter, standby-volume, and clock boundaries.",
+  "observe": [
+    "lease generation advances from mbp to Studio",
+    "old HQ is fenced and new HQ is allowed",
+    "promotion copy completes or an injected failure remains visible",
+    "gate/simulation capacity belongs to the new host"
+  ],
+  "expected": "transfer converges with old-host fencing; injected faults are observed without unsafe dual ownership"
+}

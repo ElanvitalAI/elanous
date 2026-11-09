@@ -1,0 +1,5 @@
+{
+  "id": "RLA-ER-10",
+  "name": "TA Pod gate host intrusion",
+  "description": "Measure reservation and blocking through event hook."
+}

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAULT-SQLITE-BUSY-TS",
+  "path": "src/ux-sim/fault-sqlite-busy.ts",
+  "boundary": "SQLite write lock: hold a real local BEGIN IMMEDIATE lock across LogStore.insertBatch, then observe buffered-row recovery.",
+  "deviceIds": [
+    "fault-injection"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

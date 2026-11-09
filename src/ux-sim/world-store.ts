@@ -1,8 +1,10 @@
 import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { getTestStateRoot } from '../nexus/paths.js';
 import { loadMockScenarioCatalog, type MockScenarioSourceModule } from './mock-scenario-catalog.js';
+import { loadDeviceCatalogSnapshotsFromRoot } from './device-catalog-snapshot-fragments.js';
 
 /**
  * Threat model: worlds live under an explicit private test root; other OS users
@@ -13,7 +15,7 @@ import { loadMockScenarioCatalog, type MockScenarioSourceModule } from './mock-s
  */
 const WORLD_FORMAT = 1;
 const WORLD_ID = /^[a-z0-9](?:[a-z0-9-]{0,62})$/;
-const DEVICE_CATALOGS_BY_VERSION = JSON.parse(readFileSync(new URL('../sim-world-device-catalogs.json', import.meta.url), 'utf8')) as Record<string, string[]>;
+const DEVICE_CATALOGS_BY_VERSION = loadDeviceCatalogSnapshotsFromRoot(fileURLToPath(new URL('../..', import.meta.url)));
 
 export interface SimWorld {
   readonly id: string;

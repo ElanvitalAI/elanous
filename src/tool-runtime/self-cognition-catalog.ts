@@ -19,5 +19,6 @@ export const SELF_COGNITION_MCP_CATALOG_ENTRIES = SELF_COGNITION_TOOL_NAMES.map(
   safety: ['read-only'] as ['read-only'],
   supportsParallel: true,
   defaultEnabled: true,
+  ...(name === 'context_now' ? { coreReason: 'N4' as const } : {}),
   intentScope: 'ops-ui',
 } as const));

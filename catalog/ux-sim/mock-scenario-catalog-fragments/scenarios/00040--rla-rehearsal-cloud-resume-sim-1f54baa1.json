@@ -1,0 +1,22 @@
+{
+  "id": "RLA-REHEARSAL-CLOUD-RESUME",
+  "name": "Cloud join incidents and same-run release resume",
+  "kind": "release-rehearsal-cloud-resume",
+  "device": "release-graph-rig",
+  "implementation": [
+    "src/ux-sim/fake-cloud-vm.ts",
+    "scenarios/ux-sim/rla-rehearsal-cloud-resume-sim.yaml",
+    "scripts/release-loop/resume-release.ts"
+  ],
+  "tests": [
+    "scripts/release-loop/resume-release.test.ts"
+  ],
+  "trigger": "Replay cloud public-IP rotation and a worker-start error contradicted by live pidfile evidence.",
+  "observe": [
+    "the approved operational cloud-join command plan",
+    "fake host creation, readiness, lease open and close, and stop events",
+    "persisted release graph run identity across CLI resume",
+    "completed cloud-join and gate nodes are not repeated"
+  ],
+  "expected": "Only the fake cloud boundary performs lifecycle effects; release resume preserves the original run, skips completed nodes, and continues the failed node."
+}

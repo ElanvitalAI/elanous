@@ -8,12 +8,10 @@ import type { DaemonLogEntry } from '@/lib/daemon-client';
 import {
   activityAriaLabel,
   buildActivitySnapshot,
-  observatoryHref,
   selectLiveActivity,
   type ShellActivitySnapshot,
 } from './activity-snapshot';
 import { fetchActivitySnapshot } from './fetch-activity-snapshot';
-import { FabricStageHeader } from './FabricStageHeader';
 import { TopBarActivityIndicator } from './TopBarActivityIndicator';
 import * as realNavigation from 'next/navigation';
 import * as realNexusContext from '@/nexus/hooks/use-nexus-context';
@@ -71,7 +69,7 @@ const LIVE_RUN = {
   origin: 'system' as const,
   progressLine: '● orchestrator.ts에서 중단 산출 보존 훅',
   progressStatus: 'complete' as const,
-  href: '/observatory#subject%3Aself_82122f50',
+  href: '/live-run?run=self_82122f50',
 };
 
 const ACTIVE: Extract<ShellActivitySnapshot, { kind: 'active' }> = {
@@ -186,9 +184,6 @@ describe('shell activity snapshot model', () => {
     expect(selected?.extraLiveCount).toBe(1);
   });
 
-  test('observatory href encodes the subject id', () => {
-    expect(observatoryHref('subject:run/1')).toBe('/observatory#subject%3Arun%2F1');
-  });
 });
 
 describe('fetchActivitySnapshot', () => {
@@ -252,7 +247,7 @@ describe('TopBarActivityIndicator render — quiet/loading/error/active', () => 
     const name = activityAriaLabel(ACTIVE);
     const link = findLinkByName(html, name);
     expect(link).not.toBeNull();
-    expect(link?.href).toBe('/observatory#subject%3Aself_82122f50');
+    expect(link?.href).toBe('/live-run?run=self_82122f50');
     expect(html).toContain('data-activity-kind="active"');
     expect(html).toContain('self_82122f50');
     expect(html).toContain(LIVE_RUN.progressLine);
@@ -362,7 +357,7 @@ describe('AppShell wiring on a non-observatory room', () => {
     expect(html).toContain('term room');
     expect(html).not.toContain('data-testid="fabric-stage-header"');
     const link = findLinkByName(html, activityAriaLabel(ACTIVE));
-    expect(link?.href).toBe('/observatory#subject%3Aself_82122f50');
+    expect(link?.href).toBe('/live-run?run=self_82122f50');
     expect(html).toContain('data-run-id="self_82122f50"');
     expect(html).toContain(LIVE_RUN.progressLine);
     expect(html).not.toContain('takeover');
@@ -381,17 +376,7 @@ describe('AppShell wiring on a non-observatory room', () => {
   });
 });
 
-describe('preservation — fabric breadcrumb and observatory API stay themselves', () => {
-  test('FabricStageHeader is still a Mission Fabric breadcrumb, not activity', () => {
-    const html = renderToStaticMarkup(<FabricStageHeader active="tasks" />);
-    expect(html).toContain('Mission Fabric');
-    expect(html).not.toContain('href="/autopilot"');
-    expect(html).toContain('href="/tasks"');
-    expect(html).toContain('href="/scheduler"');
-    expect(html).not.toContain('data-elanous-component="topbar-activity"');
-    expect(html).not.toContain('useShellActivity');
-  });
-
+describe('preservation — observatory API stays independent from shell activity', () => {
   test('observatory classifySubject is unchanged and still used by the shell model', () => {
     const live = subject({ screen: { ptyIds: ['pty-1'], liveCount: 1 } });
     const inactive = subject({ screen: { ptyIds: ['pty-old'], liveCount: 0 } });

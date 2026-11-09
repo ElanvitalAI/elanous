@@ -3,6 +3,12 @@ export function gitPushTimeoutAfterRemoteApplyShim(): string {
   return [
     '#!/bin/sh',
     'if [ "$1" = "push" ]; then',
+    '  if [ "$ELANOUS_SIM_PUSH_TIMEOUT_MODE" = "move-source-then-apply" ]; then',
+    '    "$ELANOUS_SIM_REAL_GIT" -c user.name=Simulator -c user.email=simulator@example.test commit --allow-empty -m "move source during push" >/dev/null',
+    '    "$ELANOUS_SIM_REAL_GIT" "$@" || exit $?',
+    '    printf "%s\\n" "simulated transport timeout after ref moved and remote accepted push" >&2',
+    '    exit 1',
+    '  fi',
     '  if [ "$ELANOUS_SIM_PUSH_TIMEOUT_MODE" = "before-apply-ref-cycle" ]; then',
     '    "$ELANOUS_SIM_REAL_GIT" update-ref -d "$ELANOUS_SIM_PUSH_SOURCE_REF"',
     '    "$ELANOUS_SIM_REAL_GIT" symbolic-ref "$ELANOUS_SIM_PUSH_SOURCE_REF" "$ELANOUS_SIM_PUSH_SYMBOLIC_TARGET"',

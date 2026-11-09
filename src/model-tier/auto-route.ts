@@ -14,13 +14,13 @@
 // see the runner gate. When enabled it returns a concrete model +
 // reasoningLevel drawn from the chosen tier.
 
-import type { LLMProviderName } from '../user-config.js';
+import type { LLMProviderName } from '../user-config/types.js';
 import { lookupLlmTierSpec } from './llm-tier-map.js';
 import { adjustTier, detectNuanceDelta } from './nuance-adjust.js';
 import type { LlmRunner } from './preset-suggest-llm.js';
 import { routeTier, type RouteTierOpts, type RouterInput, type TierRouteSource } from './task-router.js';
 import type { ModelTier } from './types.js';
-import type { ReasoningLevel } from '../user-config.js';
+import type { ReasoningLevel } from '../user-config/types.js';
 
 export interface AutoRouteDeps {
   /** Active provider — the tier ladder is provider-specific. */

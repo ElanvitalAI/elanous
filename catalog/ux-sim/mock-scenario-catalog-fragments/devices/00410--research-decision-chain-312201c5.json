@@ -1,0 +1,30 @@
+{
+  "id": "research-decision-chain",
+  "name": "Second-order research decision-chain simulation",
+  "implementation": [
+    "src/ux-sim/research-decision-chain.ts"
+  ],
+  "tests": [
+    "src/ux-sim/research-decision-chain.test.ts"
+  ],
+  "target": "production research-turn second-order decision trigger and persisted event path",
+  "inputs": [
+    "fixed decision and neutral questions",
+    "deterministic fake LLM and native-search evidence",
+    "isolated test state root"
+  ],
+  "observations": [
+    "decision chain stages",
+    "neutral control with no chain",
+    "runId-scoped research.lens events in isolated logs.db"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/research-decision-chain.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "research.lens/second-order-applied",
+    "research.lens/second-order-skipped"
+  ],
+  "recentUse": null
+}

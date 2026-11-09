@@ -27,7 +27,7 @@ import {
   type DiscordVoiceChannelSession,
   type DiscordVoiceJoinOpts,
 } from './discord-voice-channel-adapter.js';
-import type { VoiceDiscordChannelListenFilter } from '../../user-config.js';
+import type { VoiceDiscordChannelListenFilter } from '../../user-config/types.js';
 
 export interface DiscordVoiceChannelDispatcherDeps {
   adapter: DiscordVoiceChannelAdapter;

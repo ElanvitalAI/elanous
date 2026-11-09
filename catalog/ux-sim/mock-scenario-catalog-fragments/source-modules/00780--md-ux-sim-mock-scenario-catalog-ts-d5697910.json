@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-MOCK-SCENARIO-CATALOG-TS",
+  "path": "src/ux-sim/mock-scenario-catalog.ts",
+  "boundary": "Parses and validates the declarative simulator catalog, resolves devices/scenarios, and renders read-only list/show/device and generated-manual views.",
+  "deviceIds": [
+    "scenario-runner",
+    "sim-universe-world-yaml-schema"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,19 @@
+{
+  "id": "GIT-PUSH-TIMEOUT-PARTIAL-OUTCOME-REMOTE-VERIFY",
+  "name": "Remote-applied push with client timeout",
+  "kind": "partial-outcome",
+  "device": "git-push-timeout-partial-outcome-remote-verify",
+  "implementation": [
+    "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+    "src/git-fs/git-cli.ts"
+  ],
+  "tests": [
+    "src/git-fs/git-cli.test.ts"
+  ],
+  "trigger": "The fake transport delegates push to a local bare remote, then exits with a timeout failure after the remote ref changed.",
+  "observe": [
+    "remote ref from ls-remote",
+    "production CLI return code and PARTIAL_OUTCOME status receipt"
+  ],
+  "expected": "When ls-remote on the single effective push URL matches the pre-push commit and the ordinary loose source ref identity, contents, and reflog remain unchanged, the CLI reports CONFIRMED_APPLIED with rc=0; source or symbolic movement, unmatched refs, and ambiguous shapes remain unconfirmed."
+}

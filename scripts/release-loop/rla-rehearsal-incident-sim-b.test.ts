@@ -252,7 +252,7 @@ test('GATE-REPAIR-MULTI-FILE sim: coupled source attribution routes to HITL befo
       return { ok: false };
     } });
     expect(result).toMatchObject({ outcome: 'fail', verdict: 'fail', repairedFiles: [],
-      remainingFailureIds: ['src/shared.test.ts > introduced regression', 'src/shared.test.ts > introduced regression'] });
+      remainingFailureIds: ['src/shared.test.ts > introduced regression'] });
     expect(result.summary).toContain('HITL needed');
     expect(result.humanRequired?.length).toBe(2);
     expect(result.humanRequired?.every(({ reason }) => reason.includes('does not prove independent failing tests'))).toBe(true);
@@ -283,8 +283,7 @@ test('GATE-REPAIR-MULTI-FILE sim: separate tests with overlapping source closure
       return { ok: false };
     } });
     expect(result).toMatchObject({ outcome: 'fail', verdict: 'fail', repairedFiles: [],
-      remainingFailureIds: ['src/a.test.ts > regression', 'src/a.test.ts > regression',
-        'src/b.test.ts > regression', 'src/b.test.ts > regression'] });
+      remainingFailureIds: ['src/a.test.ts > regression', 'src/b.test.ts > regression'] });
     expect(result.humanRequired?.map(({ file }) => file)).toEqual(['src/a.ts', 'src/shared.ts', 'src/b.ts']);
     expect(result.humanRequired?.every(({ reason }) => reason.includes('does not prove independent failing tests'))).toBe(true);
     expect(childCalls).toBe(0);
@@ -446,8 +445,7 @@ test('GATE-REPAIR-MULTI-FILE sim: tangled and failed files go to HITL while land
     if (result.outcome !== 'fail') throw new Error('partial repairs must leave unresolved files for HITL');
     expect(result.outcome).toBe('fail');
     expect(result.repairedFiles).toEqual(['src/fixed.ts']);
-    expect(result.remainingFailureIds).toEqual(failureIds.filter((id) => !id.startsWith('src/fixed.ts >'))
-      .map((id) => id.slice(id.indexOf(' > ') + 3)));
+    expect(result.remainingFailureIds).toEqual(['src/shared.test.ts > regression', 'src/failed.test.ts > regression']);
     expect(result.humanRequired.map(({ file }) => file).sort()).toEqual(['src/failed.ts', 'src/shared.ts', 'src/tangled.ts']);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -525,6 +523,7 @@ test('RLA rehearsal incident SIM-B uses release.gate.failed ARG append and same-
   let repairPrOpened = 0;
   let repairPrInspected = 0;
   let repairLandEventsConsumed = 0;
+  let receiptAuditVisits = 0;
   const repairPrLifecycle: string[] = [];
   const gateExecutionIds: string[] = [];
   const measuredGateShas: string[] = [];
@@ -707,9 +706,18 @@ test('RLA rehearsal incident SIM-B uses release.gate.failed ARG append and same-
     }
     if (body.includes('version-node.ts release --json'))
       return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit: 'e'.repeat(40) }), stderr: '' };
+    if (body.includes('gate-file-receipt-audit-node.ts')) {
+      receiptAuditVisits++;
+      const context = readGraphContext(options.env);
+      expect(context.nodeId).toBe('receipt-audit');
+      expect(context.runId).toBe(runId);
+      expect(context.outputs.gate).toMatchObject({ outcome: 'ok', commit: 'f'.repeat(40) });
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit: 'f'.repeat(40) }), stderr: '' };
+    }
     const recognizedCommand = [
-      'version-node.ts release --json', 'traffic-node.ts traffic-cut-start', 'node-verdict.ts cutoff',
+      'version-node.ts release --json', 'release-readiness.ts', 'traffic-node.ts traffic-cut-start', 'node-verdict.ts cutoff',
       'checklist-gate-node.ts', 'docs-node.ts --json', 'export-check-node.ts', 'gate-node.ts --json',
+      'emergency-publish-switch-sim.ts', 'gate-file-receipt-audit-node.ts',
       'gate-triage-node.ts', 'gate-repair-node.ts',
       'traffic-node.ts traffic-gate-passed', 'mac-smoke-node.ts', 'node-verdict.ts pwa',
       'prepare-node.ts', 'upgrade-node.ts', 'docs-node.ts --json', 'known-issues-node.ts',
@@ -735,6 +743,8 @@ test('RLA rehearsal incident SIM-B uses release.gate.failed ARG append and same-
     const repairNode = state.path.find((nodeId) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId));
     expect(state.status).toBe('done');
     expect(state.path).toContain('gate-triage');
+    expect(state.path).toContain('receipt-audit');
+    expect(state.path).not.toContain('residual-run');
     const rlaPath = state.path.filter((nodeId) => nodeId === 'gate' || nodeId === 'gate-triage' || /^gate-repair-[a-f0-9]{12}$/.test(nodeId))
       .map((nodeId) => nodeId.startsWith('gate-repair-') ? 'gate-repair' : nodeId);
     expect(rlaPath).toEqual(scenario.expected.pathContains);
@@ -742,9 +752,10 @@ test('RLA rehearsal incident SIM-B uses release.gate.failed ARG append and same-
     expect(state.path.filter((nodeId) => nodeId === 'gate-triage-shadow')).toHaveLength(scenario.expected.shadowTriageVisits);
     expect(repairNode).toBeDefined();
     expect(state.path.filter((nodeId) => nodeId === repairNode)).toHaveLength(scenario.expected.repairVisits);
-    expect(state.path.indexOf(repairNode!)).toBe(state.path.indexOf('gate') + 2);
+    expect(state.path.indexOf(repairNode!)).toBe(state.path.indexOf('gate-triage') + 1);
     expect(state.path[state.path.indexOf(repairNode!) + 1]).toBe('gate');
     expect(gateVisits).toBe(scenario.expected.gateVisits);
+    expect(receiptAuditVisits).toBe(1);
     expect(repairVisits).toBe(scenario.expected.repairVisits);
     expect(repairPrOpened).toBe(1);
     expect(repairPrInspected).toBe(1);

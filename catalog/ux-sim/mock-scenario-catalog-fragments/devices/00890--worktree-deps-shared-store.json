@@ -1,0 +1,33 @@
+{
+  "id": "worktree-deps-shared-store",
+  "name": "Lockfile-scoped shared worktree dependency store",
+  "checklistCells": [
+    "WORKTREE-DEPS-SHARED-STORE"
+  ],
+  "implementation": [
+    "src/ux-sim/worktree-deps-shared-store.ts",
+    "src/git-fs/worktree.ts",
+    "src/harness/harness-worktree-add.ts"
+  ],
+  "tests": [
+    "src/ux-sim/worktree-deps-shared-store.test.ts"
+  ],
+  "target": "Same-lock worktrees reuse one isolated store while changed locks install independently, interrupted locks recover, and concurrent creators publish one complete copy",
+  "inputs": [
+    "source and target lockfile bytes",
+    "simulated worktree creation time",
+    "concurrent linker starts and interrupted lock owner"
+  ],
+  "observations": [
+    "same-lock worktrees resolve to the same shared dependency store",
+    "changed-lock worktrees use an independent install",
+    "dead-owner locks recover and concurrent copies serialize",
+    "source dependency bytes remain unchanged and createdAt provenance is persisted"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/worktree-deps-shared-store.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

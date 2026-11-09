@@ -441,7 +441,7 @@ describe('STOP-AUTOHEAL ladder declaration (graphs/overlays/stop-heal-ladder.yam
     const graphId = GRAPH_SPECS['self-implement']!.graphId;
     const overlays = loadGraphOverlays(defaultOverlaysDir()).overlays;
     expect(overlays.filter((overlay) => overlay.overlayId.startsWith('stop-heal-ladder-')).map((overlay) => overlay.stage))
-      .toHaveLength(12);
+      .toHaveLength(13);
     expect(overlays.filter((overlay) => overlay.overlayId.startsWith('stop-heal-ladder-')).every((overlay) => overlay.stage === 'heal')).toBe(true);
     for (const cls of RUN_STOP_CLASSES) {
       for (const stage of ['launch', 'runtime'] as const) {

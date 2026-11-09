@@ -1,0 +1,33 @@
+{
+  "id": "pod-reuse-residue-fault",
+  "name": "POD reuse residue fault injection",
+  "implementation": [
+    "src/ux-sim/fault-pod-reuse-residue.ts",
+    "src/ux-sim/temp-git-remote.ts",
+    "src/ux-sim/fake-ps.ts",
+    "src/task-orchestrator/surfaces/pod-child-reuse.ts",
+    "src/ux-sim/pod-reuse-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fault-pod-reuse-residue.test.ts",
+    "src/ux-sim/pod-reuse-clean-state.test.ts"
+  ],
+  "target": "POD child reuse cleanup: inject prior-round residue, run the production cleanup path, and observe lease return eligibility",
+  "inputs": [
+    "safe run IDs",
+    "real temporary Git checkout",
+    "real child processes",
+    "fake-ps process inventory"
+  ],
+  "observations": [
+    "tracked and untracked Git residue before cleanup",
+    "run credential and live child process before cleanup",
+    "empty Git, credential, fake-ps, and child-process observations before each lease return"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fault-pod-reuse-residue.test.ts src/ux-sim/pod-reuse-clean-state.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

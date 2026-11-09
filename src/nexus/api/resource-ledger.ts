@@ -1,5 +1,5 @@
 import { buildResourceLedgerSnapshot, defaultResourceHosts, defaultResourceRun } from '../../cli/resource-ledger-cli.js';
-import { activeResourcePools, declareResourcePool, latestWarmPoolPodReceipts, readResourceLedger } from '../../resource-ledger/resource-ledger.js';
+import { activeResourcePools, declareResourcePool, latestWarmPoolPodReceipts, readResourceLedger, readResourceLedgerWithObservations, resourcePoolsForMachine } from '../../resource-ledger/resource-ledger.js';
 import { redactSecretText } from '../../debug/log.js';
 import { jsonResponse } from './json-response.js';
 
@@ -41,8 +41,13 @@ export function handleResourceLedgerApi(): Response {
 /** Minimal machine-authenticated view used by warm-pool providers; it exposes only declarations for pools that include this machine. */
 export function handleResourceLedgerPoolsApi(machine: string): Response {
   try {
-    const pools = activeResourcePools(readResourceLedger()).filter(pool => pool.members.some(member => member.host === machine));
-    const response = jsonResponse({ pools }); response.headers.set('cache-control', 'no-store'); return response;
+    const { events, unknownEvents } = readResourceLedgerWithObservations();
+    const pools = resourcePoolsForMachine(events, machine);
+    const observations = unknownEvents.map(({ eventType, count }) => ({
+      kind: 'unknown-ledger-event-skipped' as const, eventType, count,
+    }));
+    const response = jsonResponse({ pools, ...(observations.length ? { observations } : {}) });
+    response.headers.set('cache-control', 'no-store'); return response;
   } catch { return jsonResponse({ error: 'resource-ledger-unavailable' }, 503); }
 }
 
@@ -53,7 +58,7 @@ export async function handleResourceLedgerPoolDeclarationPost(req: Request): Pro
   try {
     const raw = body && typeof body === 'object' && !Array.isArray(body) ? (body as { pool?: unknown }).pool : undefined;
     if (!raw) return jsonResponse({ error: 'pool-required' }, 400);
-    declareResourcePool(raw as Parameters<typeof declareResourcePool>[0]);
-    const response = jsonResponse({ ok: true }, 201); response.headers.set('cache-control', 'no-store'); return response;
+    const created = declareResourcePool(raw as Parameters<typeof declareResourcePool>[0]);
+    const response = jsonResponse({ ok: true, created }, created ? 201 : 200); response.headers.set('cache-control', 'no-store'); return response;
   } catch (error) { return jsonResponse({ error: error instanceof Error ? error.message : 'invalid-pool' }, 400); }
 }

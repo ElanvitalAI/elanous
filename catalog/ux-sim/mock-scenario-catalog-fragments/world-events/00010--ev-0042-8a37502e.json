@@ -1,0 +1,5 @@
+{
+  "id": "EV-0042",
+  "name": "Dead process lock",
+  "description": "Inject a stale process lock into a simulated world."
+}

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GRAPH-ENGINE-SIM-TS",
+  "path": "src/ux-sim/graph-engine-sim.ts",
+  "boundary": "Selects graph components from synthetic component results and renders the graph observation; it executes no nodes or external effects.",
+  "deviceIds": [
+    "graph-engine-selector"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

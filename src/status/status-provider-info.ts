@@ -9,7 +9,8 @@
 //   그렇지 않아도 `maxAgeMs` 마다 다시 판정한다(auto 공급자는 자격 유무로 갈리므로). 표시 전용이라 2s 지연은 허용.
 
 import { inspectActiveProvider, type ActiveProviderInfo } from '../provider-summary.js';
-import { getUserConfig, type UserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { currentRouteDecision, currentRouteExecution } from '../llm/route-decision.js';
 import type { ModelExecutionActual } from './bar.js';
 

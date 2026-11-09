@@ -1,0 +1,5 @@
+{
+  "id": "gate-no-pinned-image",
+  "name": "Gate image pin unavailable",
+  "description": "Inject missing image digests from both pools and observe production gate image-pin resolution fail closed."
+}

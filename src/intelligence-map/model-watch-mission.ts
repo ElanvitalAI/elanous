@@ -19,7 +19,7 @@ import { streamLLM, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { lookupLlmTierSpec } from '../model-tier/index.js';
 import type { LlmRunner } from '../model-tier/preset-suggest-llm.js';
-import type { LLMProviderName } from '../user-config.js';
+import type { LLMProviderName } from '../user-config/types.js';
 import { getUserConfig } from '../user-config.js';
 import {
   detectPriceChanges,

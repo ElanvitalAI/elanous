@@ -1,5 +1,5 @@
 import type { LLMMessage } from '../llm.js';
-import type { ChatConcisenessConfig } from '../user-config.js';
+import type { ChatConcisenessConfig } from '../user-config/chat.js';
 
 export interface BuildConcisenessSystemMessagesOpts {
   enabled: boolean;

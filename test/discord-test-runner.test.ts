@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildDiscordTestConfig } from '../src/discord-test-runner.js';
 import { buildUserConfig } from '../src/user-config.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 
 function prodCfg(): UserConfig {
   return {

@@ -19,7 +19,8 @@ import {
   type GroundingSourceSync,
   type GroundingSourcesConfig,
 } from './sources.js';
-import { getUserConfig, saveUserConfig, type UserConfig } from '../user-config.js';
+import { getUserConfig, saveUserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 const KINDS: readonly GroundingSourceKind[] = ['local-repo', 'local-docs', 'web', 'dev-index', 'url'];
 

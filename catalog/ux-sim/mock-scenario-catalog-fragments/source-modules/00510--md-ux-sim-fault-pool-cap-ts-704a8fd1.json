@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAULT-POOL-CAP-TS",
+  "path": "src/ux-sim/fault-pool-cap.ts",
+  "boundary": "Pod pool capacity: compare omitted :N default capacity with explicit caps through production parsePodPool and recommendConcurrency.",
+  "deviceIds": [
+    "fault-injection"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

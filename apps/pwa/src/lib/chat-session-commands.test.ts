@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { DaemonClient } from './daemon-client';
 import { formatSessionList, handleSessionCommand, parseSessionCommand, resolveResume } from './chat-session-commands';
 import { dispatchMeta } from './chat-runtime';
 import { SessionsService, type SessionSummary } from './sessions-service';
+import { createFakeFetchDevice, type FakeFetchDevice } from '../test-devices/fake-fetch';
 
 const now = Date.parse('2026-10-03T04:00:00Z');
 const sessions: SessionSummary[] = [
@@ -12,25 +13,35 @@ const sessions: SessionSummary[] = [
 ];
 const client = new DaemonClient({ baseUrl: 'http://localhost:31415', token: 'tok', provider: 'anthropic' });
 const ctx = { client, sessionId: 'efgh2222-current' };
-const realFetch = globalThis.fetch;
 let requests: string[] = [];
 let unavailable = false;
+let responseForRequest: () => Response = () => Response.json({ ok: false, error: 'not configured' }, { status: 500 });
+let fetchDevice: FakeFetchDevice | undefined;
 
 function serve(cards: readonly SessionSummary[]): void {
-  globalThis.fetch = (async (input: RequestInfo | URL) => {
-    requests.push(String(input));
-    if (unavailable) return { ok: false, status: 503, headers: new Headers({ 'content-type': 'application/json' }), json: async () => ({ error: 'down' }) } as Response;
-    return {
-      ok: true, status: 200, headers: new Headers({ 'content-type': 'application/json' }),
-      json: async () => ({ ok: true, sessions: cards.map((s) => ({
-        id: s.id, messageCount: s.msgCount, updatedAt: s.lastTurnAt, preview: s.lastMsgPreview ?? '',
-      })) }),
-    } as Response;
-  }) as typeof fetch;
+  responseForRequest = () => unavailable
+    ? Response.json({ error: 'down' }, { status: 503 })
+    : Response.json({ ok: true, sessions: cards.map((s) => ({
+      id: s.id, messageCount: s.msgCount, updatedAt: s.lastTurnAt, preview: s.lastMsgPreview ?? '',
+    })) });
 }
 
+beforeEach(() => {
+  requests = [];
+  unavailable = false;
+  responseForRequest = () => Response.json({ ok: false, error: 'not configured' }, { status: 500 });
+  fetchDevice = createFakeFetchDevice([{
+    url: '/v1/sessions/store',
+    response: (request) => {
+      requests.push(request.url);
+      return responseForRequest();
+    },
+  }]);
+});
+
 afterEach(() => {
-  globalThis.fetch = realFetch;
+  fetchDevice?.restore();
+  fetchDevice = undefined;
   requests = [];
   unavailable = false;
 });
@@ -105,15 +116,12 @@ describe('PWA session commands', () => {
 
   it('uses one successful snapshot even when the daemon changes the next response', async () => {
     let reads = 0;
-    globalThis.fetch = (async (_input: RequestInfo | URL) => {
+    responseForRequest = () => {
       reads++;
-      return {
-        ok: true, status: 200, headers: new Headers({ 'content-type': 'application/json' }),
-        json: async () => ({ ok: true, sessions: (reads === 1 ? sessions : []).map((s) => ({
-          id: s.id, messageCount: s.msgCount, updatedAt: s.lastTurnAt, preview: s.lastMsgPreview ?? '',
-        })) }),
-      } as Response;
-    }) as typeof fetch;
+      return Response.json({ ok: true, sessions: (reads === 1 ? sessions : []).map((s) => ({
+        id: s.id, messageCount: s.msgCount, updatedAt: s.lastTurnAt, preview: s.lastMsgPreview ?? '',
+      })) });
+    };
     expect(await handleSessionCommand(parseSessionCommand('resume', ['abcd1']), ctx)).toEqual({
       newSessionId: 'abcd1111-other', text: 'abcd1111 대화로 옮겼습니다',
     });

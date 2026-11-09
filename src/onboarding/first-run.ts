@@ -10,10 +10,8 @@ import { getSecretAsync, setSecretAsync } from '../nexus/config/secrets/index.js
 import { probeProvider } from '../llm/provider-probe.js';
 import { createSecretPrompt } from './secret-prompt.js';
 import { parseMenuAnswer as parseNumericMenuAnswer } from './menu-answer.js';
-import {
-  getUserConfig, saveUserConfig, userConfigPath,
-  type LLMProviderName, type UserConfig,
-} from '../user-config.js';
+import { getUserConfig, saveUserConfig, userConfigPath } from '../user-config.js';
+import type { LLMProviderName, UserConfig } from '../user-config/types.js';
 
 export interface FirstRunDeps {
   config?: UserConfig;

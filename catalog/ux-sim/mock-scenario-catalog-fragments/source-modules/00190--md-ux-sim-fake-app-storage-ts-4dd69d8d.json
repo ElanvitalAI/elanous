@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-APP-STORAGE-TS",
+  "path": "src/ux-sim/fake-app-storage.ts",
+  "boundary": "Runs app-scoped storage decisions through the production ObjectStore local provider or an injected provider RunFn; uses temporary storage, injected time, and no external network.",
+  "deviceIds": [
+    "fake-app-storage"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

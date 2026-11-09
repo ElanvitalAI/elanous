@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-PR-LAND-DRIFT-AUTOREPAIR-DEVICE-TS",
+  "path": "src/ux-sim/pr-land-drift-autorepair-device.ts",
+  "boundary": "Replays live typecheck drift observations through bounded repair, kill-switch, false-positive, missed-drift, and cost-cap decisions.",
+  "deviceIds": [
+    "pr-land-drift-autorepair-device"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

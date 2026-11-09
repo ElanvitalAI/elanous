@@ -1,0 +1,4 @@
+{
+  "path": "scripts/release-loop/gate-bisect.test.ts",
+  "reason": "Post-inventory simulation coverage for GATE-FAIL-BISECT-SIDECAR."
+}

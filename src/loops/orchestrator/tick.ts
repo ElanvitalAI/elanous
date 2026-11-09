@@ -1186,44 +1186,51 @@ export async function degradationDeps(node: Node, deps: { config?: () => Partial
 // 구현 본체: src/loops/orchestrator/coordinator-shadow.ts · 완료 경계 시험: tick.test.ts.
 import { tick as runCoordinatorShadowTick } from './coordinator-shadow.js';
 
-if (import.meta.main) {
-  const node = process.argv[2];
-  const index = process.argv.indexOf('--window');
+export async function runOrchestratorCli(
+  args: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env,
+  options: { cwd?: string } = {},
+): Promise<number> {
+  const node = args[0];
+  const index = args.indexOf('--window');
   // ORCH-LIVE-1008: `graph run` recipes pass no flags, so a manual/rehearsal tick picks its window through the
   // environment (`ELANOUS_ORCH_WINDOW=08 elanous graph run graphs/orchestrator/orchestrator.yaml`). The flag wins.
-  const window = index < 0 ? process.env.ELANOUS_ORCH_WINDOW : process.argv[index + 1];
+  const window = index < 0 ? env.ELANOUS_ORCH_WINDOW : args[index + 1];
   // A given flag (even without a value) or a set variable must name a real window — never fall back to «now».
-  const windowGiven = index >= 0 || process.env.ELANOUS_ORCH_WINDOW !== undefined;
+  const windowGiven = index >= 0 || env.ELANOUS_ORCH_WINDOW !== undefined;
   if (node === 'sim-impact-audit') {
     if (!['08', '12', '18'].includes(window ?? '')) {
       console.error('orchestrator: sim-impact-audit requires --window 08|12|18');
-      process.exitCode = 2;
-    } else {
-      void (async () => {
-        try { await (await import('../../domains/standalone-log-sink.js')).registerStandaloneLogSink('orchestrator'); }
-        catch { /* file log remains authoritative if debug sink setup fails */ }
-        try {
-          const root = process.env.ELANOUS_SIM_IMPACT_AUDIT_ROOT ?? effectiveInstanceRoot();
-          const runId = process.env.ELANOUS_SIM_IMPACT_AUDIT_RUN_ID ?? `${kstDay(new Date())}-${window}-manual-audit`;
-          process.exitCode = runSimImpactAuditWorker(window as Window, root, runId);
-        } catch (error) { console.error(`orchestrator sim-impact-audit: ${String(error)}`); process.exitCode = 1; }
-      })();
+      return 2;
     }
+    try { await (await import('../../domains/standalone-log-sink.js')).registerStandaloneLogSink('orchestrator'); }
+    catch { /* file log remains authoritative if debug sink setup fails */ }
+    try {
+      const root = env.ELANOUS_SIM_IMPACT_AUDIT_ROOT ?? effectiveInstanceRoot();
+      const runId = env.ELANOUS_SIM_IMPACT_AUDIT_RUN_ID ?? `${kstDay(new Date())}-${window}-manual-audit`;
+      return runSimImpactAuditWorker(window as Window, root, runId);
+    } catch (error) { console.error(`orchestrator sim-impact-audit: ${String(error)}`); return 1; }
   } else if (!['intake', 'split', 'place', 'delegate', 'launch', 'reconcile', 'report'].includes(node ?? '') ||
       (windowGiven && !['08', '12', '18'].includes(window ?? ''))) {
     console.error('orchestrator: expected <intake|split|place|delegate|launch|reconcile|report> [--window 08|12|18] (or ELANOUS_ORCH_WINDOW=08|12|18)');
-    process.exitCode = 2;
+    return 2;
   } else {
-    void (async () => {
+    try {
       try { await (await import('../../domains/standalone-log-sink.js')).registerStandaloneLogSink('orchestrator'); }
       catch { /* local execution can still use the per-run file */ }
       // 관측(그림자 틱)은 본 루프를 봉쇄할 수 없다: 파손 원장 등으로 reject 하면 원인만 warn 로그로 남기고 본 노드 실행은 계속한다.
-      try { await runCoordinatorShadowTick({}); }
+      try { await runCoordinatorShadowTick({ root: options.cwd ?? process.cwd() }); }
       catch (error) {
         try { debug.log('loop.orchestrator', 'coordinator-shadow-tick-failed', { node, error: String(error).slice(0, 200) }, { level: 'warn' }); }
         catch { /* even the diagnostic sink must not block the node */ }
       }
       await runOrchestratorNode(node as Node, { window: window as Window | undefined, ...await degradationDeps(node as Node) });
-    })().catch(error => { console.error(`orchestrator ${node}: ${String(error)}`); process.exitCode = 1; });
+      return 0;
+    } catch (error) {
+      console.error(`orchestrator ${node}: ${String(error)}`);
+      return 1;
+    }
   }
 }
+
+if (import.meta.main) void runOrchestratorCli().then(exitCode => { process.exitCode = exitCode; });

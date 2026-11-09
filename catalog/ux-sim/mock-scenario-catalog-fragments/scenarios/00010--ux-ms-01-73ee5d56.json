@@ -1,0 +1,19 @@
+{
+  "id": "UX-MS-01",
+  "name": "Child report deficit with later harvest",
+  "kind": "report-deficit",
+  "device": "fault-injection",
+  "implementation": [
+    "src/ux-sim/fault-pod-child-result.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fault-pod-child-result.test.ts"
+  ],
+  "trigger": "A child completes with report-deficit while a later child has a harvestable PR.",
+  "observe": [
+    "failure classification remains report-deficit",
+    "Pod terminal data stays attached",
+    "later harvest remains independent"
+  ],
+  "expected": "report-deficit is preserved and harvest result is visible"
+}

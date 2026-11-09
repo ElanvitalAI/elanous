@@ -513,14 +513,14 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
   }, 15_000);
 
   // 실제 셸 제어 루프는 임시 cwd 에서만 구동한다. 자격증명 없이도 자식 종료 코드를 전파한다.
-  it('drive subprocess는 성공 자식의 exit 0 도 그대로 전파한다', async () => {
-    const r = await runSpawn(['drive', 'true', '--goal', 'finish', '--poll-ms', '0', '--cwd', childRoot]);
-    expect(r.code, r.out).toBe(0);
-  }, 30_000);
-
   it('drive subprocess는 실제 shell child exit code를 그대로 전파한다', async () => {
     const r = await runSpawn(['drive', 'exit 7', '--goal', 'finish', '--poll-ms', '0', '--cwd', childRoot]);
     expect(r.code, r.out).toBe(7);
+  }, 30_000);
+
+  it('drive subprocess는 성공 자식의 exit 0 도 그대로 전파한다', async () => {
+    const r = await runSpawn(['drive', 'true', '--goal', 'finish', '--poll-ms', '0', '--cwd', childRoot]);
+    expect(r.code, r.out).toBe(0);
   }, 30_000);
 
   it('drive 는 무인 완결을 끄는 --no-* 를 받지 않고 기존처럼 거부한다', async () => {
@@ -612,7 +612,7 @@ describe('은퇴 입구가 «사람 눈에» 닿는다 (subprocess · RFC-one-do
   //   ⇒ 진짜 CLI 를 띄워 --help 를 읽는다. 2026-08-17 사고가 정확히 「선언은 있는데 표면이 조용」이었다.
 
   it('elanous harness dogfood --help 가 은퇴 사실과 «갈 곳»을 둘 다 말한다', async () => {
-    const help = await runIsolatedCli(['harness', 'dogfood', '--help']);
+    const help = await runIsolatedCli(['harness', 'dogfood', '--help'], undefined, 'spawn');
     expect(help.code, help.out).toBe(0);
     expect(help.out).toContain('DEPRECATED');
     expect(help.out).toContain('cli-harness-dogfood');       // 어느 입구인지 «이름»으로

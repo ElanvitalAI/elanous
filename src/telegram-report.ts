@@ -14,7 +14,7 @@ import { explainReportRoute, isTradingKind, kindRouteTarget, logKindRouteFallbac
 export { explainReportRoute } from './domains/telegram-kind-route.js';
 export { DEFAULT_KIND_ROLES, roleForKind } from './domains/telegram-kind-route.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import { findSessionByTelegramChat, createSession, appendMessage } from './session/index.js';
 import { debug } from './debug/log.js';
 // Observations go through debug.log only: a standalone caller (cron morning-report) registers its own

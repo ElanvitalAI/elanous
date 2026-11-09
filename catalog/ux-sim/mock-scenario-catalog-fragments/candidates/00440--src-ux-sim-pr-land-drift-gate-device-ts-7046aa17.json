@@ -1,0 +1,8 @@
+{
+  "path": "src/ux-sim/pr-land-drift-gate-device.ts",
+  "disposition": "already-indexed",
+  "entryCommand": "bun test src/ux-sim/pr-land-drift-gate-device.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Synthetic remote output exercises production assessment and refusal classification without SSH.",
+  "deviceId": "pr-land-drift-gate"
+}

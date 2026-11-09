@@ -3,7 +3,8 @@ import { serviceKeyStatus, storeServiceKeys, verifyServiceKey, type ParsedServic
 import { detectProviders } from '../llm/provider-detect.js';
 import { loginWithCodex } from '../oauth/codex.js';
 import type { FirstRunProviderSetupResult } from '../onboarding/first-run.js';
-import { MODEL_ROLES, resolveRoleLlm, type LLMProviderName, type UserConfig } from '../user-config.js';
+import { MODEL_ROLES, resolveRoleLlm } from '../user-config.js';
+import type { LLMProviderName, UserConfig } from '../user-config/types.js';
 import { parseMenuAnswer } from '../onboarding/menu-answer.js';
 import { isHeadlessEnv } from '../acp/codex-auth.js';
 

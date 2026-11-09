@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-DEVICE-FIDELITY-TS",
+  "path": "src/ux-sim/device-fidelity.ts",
+  "boundary": "Replays recorded real GitHub API request/response pairs through the production fake-github adapter and records hashed fidelity verdicts; test-universe state only.",
+  "deviceIds": [
+    "device-fidelity"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

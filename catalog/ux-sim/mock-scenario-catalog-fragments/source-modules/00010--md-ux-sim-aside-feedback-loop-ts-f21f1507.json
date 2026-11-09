@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-ASIDE-FEEDBACK-LOOP-TS",
+  "path": "src/ux-sim/aside-feedback-loop.ts",
+  "boundary": "Runs the deterministic aside feedback loop through the production Linear secretary and topic-subscription paths, with research, capture, network and schedule edges injected.",
+  "deviceIds": [
+    "aside-feedback-loop"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

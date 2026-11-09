@@ -259,13 +259,21 @@ describe('durable message log and cursor', () => {
       const first = store.appendWithProvenance(input, 'coord:65001:MK');
       const duplicate = store.appendWithProvenance(input, 'coord:65001:MK');
       const otherRecipient = store.appendWithProvenance({ ...input, to: 'UX' }, 'coord:65001:UX');
+      const releaseEvent = store.appendWithProvenance({ from: 'RLA', to: 'OP', body: 'release event' }, 'release-event:run_node_state:OP');
+      const heldEvent = store.appendWithProvenance({ from: 'RLA', to: 'RLA', body: 'held event' }, 'rla-held-event:run_node_state:RLA');
+      const commandReply = store.appendWithProvenance({ from: 'RLA', to: 'OP', body: 'command reply' }, 'rla-command-reply:1:OP');
+      const questionReply = store.appendWithProvenance({ from: 'RLA', to: 'OP', body: 'question reply' }, 'rla-question-reply:2:OP');
 
       expect(duplicate).toEqual(first);
       expect(otherRecipient.id).not.toBe(first.id);
       expect(store.listByRecipient('MK')).toEqual([first]);
       expect(store.listByRecipient('UX')).toEqual([otherRecipient]);
+      expect(store.listByRecipient('OP')).toEqual([releaseEvent, commandReply, questionReply]);
+      expect(store.listByRecipient('RLA')).toEqual([heldEvent]);
       expect(store.db.query('SELECT provenance_key FROM msg_provenance ORDER BY provenance_key').all())
-        .toEqual([{ provenance_key: 'coord:65001:MK' }, { provenance_key: 'coord:65001:UX' }]);
+        .toEqual([{ provenance_key: 'coord:65001:MK' }, { provenance_key: 'coord:65001:UX' },
+          { provenance_key: 'release-event:run_node_state:OP' }, { provenance_key: 'rla-command-reply:1:OP' },
+          { provenance_key: 'rla-held-event:run_node_state:RLA' }, { provenance_key: 'rla-question-reply:2:OP' }]);
       expect(() => store.appendWithProvenance(input, 'coord:65001:UX')).toThrow('provenance recipient does not match message recipient');
       expect(() => store.appendWithProvenance(input, 'coord:65001')).toThrow('invalid message provenance key');
     } finally { store.close(); }

@@ -1,3 +1,4 @@
+import { isPlainObject } from '../primitives/guards.js';
 // ── Debug log — runtime tracer for LLM calls + plugin dispatch ──
 //
 // This module centralizes runtime debug-event capture, enrichment, and delivery to configured sinks.
@@ -82,6 +83,7 @@ import { isRenderCategory } from '../mss/logging/render-categories.js';
 import type { LogSource, LogLevel } from '../mss/logging/record.js';
 import { cleanupLogDir } from '../mss/logging/retention.js';
 import { LogDietGuard, type LogDietSummary } from './log-diet.js';
+import { correlateGateLog } from '../mss/logging/gate-correlation.js';
 
 /** DebugEvent is the legacy shape. Pre-MSS callers only read/write
  *  `ts` / `category` / `event` / `data`. MSS M2.1 adds four optional
@@ -617,11 +619,12 @@ class DebugLog {
       : this._verboseEnabled
         ? data
         : compactForLog(data, opts?.compact);
+    const correlatedPayload = correlateGateLog(category, event, payload);
     let rec: DebugEvent = {
       ts: new Date().toISOString(),
       category,
       event,
-      ...(payload !== undefined ? { data: payload } : {}),
+      ...(correlatedPayload !== undefined ? { data: correlatedPayload } : {}),
       ...(opts?.level ? { level: opts.level } : {}),
     };
     // MSS M2.1 enrichment — append trace/elanous context when live.
@@ -723,12 +726,6 @@ export function getAmbientSessionId(): string | null {
   return ambientSessionStorage.getStore() ?? ambientSessionId;
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== 'object') return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
 /** Append MSS context fields (trace_id / span_id / parent_span_id /
  *  elanous_id) onto an existing DebugEvent. No-op when `MSS_ENABLED=false`
  *  so the legacy JSONL shape is byte-identical to pre-MSS output. */
@@ -744,7 +741,7 @@ function enrichDebugRecord(rec: DebugEvent): void {
     if (runId) {
       if (rec.data === undefined) {
         rec.runId = runId;
-      } else if (isPlainObject(rec.data)) {
+      } else if (isPlainObject(rec.data, true, false)) {
         if (!Object.hasOwn(rec.data, 'runId')) rec.data = { ...rec.data, runId };
       } else {
         rec.runId = runId;
@@ -755,7 +752,7 @@ function enrichDebugRecord(rec: DebugEvent): void {
     const substrate = process.env.ELANOUS_SUBSTRATE;
     const armId = process.env.ELANOUS_ARM_ID;
     const hostId = process.env.ELANOUS_HOST_ID;
-    if ((substrate || armId || hostId) && isPlainObject(rec.data)) {
+    if ((substrate || armId || hostId) && isPlainObject(rec.data, true, false)) {
       const data: Record<string, unknown> = rec.data;
       rec.data = {
         ...data,

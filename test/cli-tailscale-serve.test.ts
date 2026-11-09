@@ -73,7 +73,7 @@ describe('mountTailscaleServe — mode dispatch', () => {
       serveCmdFn: makeServeCmd([{ exitCode: 0 }], calls),
     });
     expect(res.ok).toBe(true);
-    expect(res.url).toBe('https://mbp.tailnet.ts.net/app/showroom/');
+    expect(res.url).toBe('https://mbp.tailnet.ts.net/app/');
     expect(calls).toHaveLength(1);
     expect(calls[0].args).toEqual([
       'serve', '--bg', '--https=443', 'http://localhost:31415',
@@ -89,7 +89,7 @@ describe('mountTailscaleServe — mode dispatch', () => {
       serveCmdFn: makeServeCmd([{ exitCode: 0 }], calls),
     });
     expect(res.ok).toBe(true);
-    expect(res.url).toBe('https://mbp.tailnet.ts.net:31420/app/showroom/');
+    expect(res.url).toBe('https://mbp.tailnet.ts.net:31420/app/');
     expect(calls[0].args).toEqual([
       'serve', '--bg', '--tls-terminated-tcp', '31420', 'tcp://localhost:31420',
     ]);

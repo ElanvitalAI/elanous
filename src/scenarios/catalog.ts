@@ -1,3 +1,4 @@
+import { isObject } from '../primitives/guards.js';
 // ── Presentation P5a · Scenario catalog loader ──
 //
 // Reads `scenarios/*.yaml` (or any directory the caller points to),
@@ -23,10 +24,6 @@ export interface LoadScenarioCatalogOptions {
 }
 
 const DEFAULT_EXTENSIONS = ['.yaml', '.yml'] as const;
-
-function isObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === 'object' && !Array.isArray(v);
-}
 
 function validateShape(
   parsed: unknown,

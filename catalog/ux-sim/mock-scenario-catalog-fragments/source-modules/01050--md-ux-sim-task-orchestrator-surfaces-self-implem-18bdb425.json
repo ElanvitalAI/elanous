@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TASK-ORCHESTRATOR-SURFACES-SELF-IMPLEMENT-POD-DEVICE-TS",
+  "path": "src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.ts",
+  "boundary": "Scripts Kubernetes Job termination, OOM, deadline, premature-result and post-GC lookup faults at the production pod-result reader; no cluster is contacted.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

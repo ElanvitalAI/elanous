@@ -15,7 +15,6 @@
 import { debug } from '../debug/log.js';
 import { dispatchEnterPlanMode, getPlanModeState } from '../plan-mode/index.js';
 import { isGoalActive, setStatus as setGoalStatus } from '../goals/index.js';
-import { getUserConfig } from '../user-config.js';
 
 export type PlanToggleOutcome =
   | { kind: 'entered'; lines: string[]; sessionId: string; planFilePath: string }
@@ -46,9 +45,8 @@ export async function togglePlanModeAction(opts: {
   }
 
   // Plan-mode UX D5 (PLAN doc) — pause active goal on plan-mode entry
-  // (Codex pattern). Honored when goals.pauseOnPlanModeEnter=true.
-  const cfg = getUserConfig();
-  if (cfg.goals.pauseOnPlanModeEnter && isGoalActive()) {
+  // (Codex pattern). Always on (CONFIG-ALWAYS-TRUE-OUT 11-05 removed goals.pauseOnPlanModeEnter).
+  if (isGoalActive()) {
     setGoalStatus('paused', 'plan-mode-enter');
     debug.log('plan-mode', 'toggle.goal-paused', { reason: 'plan-mode-enter' });
   }

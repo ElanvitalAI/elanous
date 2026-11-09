@@ -36,7 +36,7 @@ import {
   generateAutoModeSessionId,
 } from '../auto-research/auto-mode/session.js';
 import { INACTIVE_AUTO_MODE_STATE } from '../auto-research/auto-mode/types.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 /** 골당 토큰 캡 — driver의 budgetExhausted() 화로가드가 읽는 budget.json spec. */
 const GOAL_TOKEN_CAP = 150_000;

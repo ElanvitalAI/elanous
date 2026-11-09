@@ -1,0 +1,8 @@
+{
+  "path": "scripts/release-loop/tui-sim-node.ts",
+  "disposition": "excluded",
+  "entryCommand": "called by release-loop tui-sim graph node; no standalone CLI",
+  "logsRecorded": "no",
+  "logsDetail": "Node result/artifact only.",
+  "excludeReason": "Graph-node adapter for TUI measurements, not an independent mock device."
+}

@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/fake-google-drive-world.test.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/fake-google-drive-world.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Scenario assertions use synthetic file metadata and no live Google endpoint.",
+  "deviceId": "fake-google-drive-world",
+  "scenarioIds": [
+    "GOOGLE-DRIVE-LIST-READONLY"
+  ]
+}

@@ -14,7 +14,7 @@ const map = `# MAP
 | P2 | 설정 | SETTINGS | 0.2 | /settings beta | ✅ | #12 | 사 |
 | P2 | 다중 단계 | CHAT·PENDING | 0.2 | /chat stable | ✅ | #18 | 사 |
 | P3 | 도구 | TOOL | 0.2 | /approvals tool | — | #13 | — |
-| P4 | 근거 없는 줄 | EMPTY | 0.2 | /today stable | ✅ | #14 | 사 |
+| P4 | 근거 없는 줄 | EMPTY | 0.2 | /chat stable | ✅ | #14 | 사 |
 | P5 | 숨겨야 할 기능 이름 | SECRET | 0.2 | /chat stable | 특허 보류 | #15 | 사 |
 | P5 | 근거열 비공개 기능 | CITATION | 0.2 | /chat stable | ✅ | 특허 보류 · #19 | 사 |
 | P5 | 체크리스트 비공개 기능 | CHECKHELD | 0.2 | /chat stable | ✅ | #20 | 사 |
@@ -71,7 +71,7 @@ test('the real section 2 rows use map maturity and evidence only when no checkli
 | P1 | 명함 한 장 → 영업 전략 | card-followup | 플러그인 0.2.9 | — (플러그인) | ✅ «약 2분» | 진행표 실측 약 2분 · 0.2.10: 텔레그램에 명함 사진 한 장(키워드 없이도) → 자동 시작(CARD1 #22860 ⊕ «명함처럼 보일 때만» CARD1b #22865 · Mac 호스트에서만 판별) — ⏳ 설치본 실물 명함 1회 뒤 «사진 한 장»으로 | 행 세 |
 | P2 | 체크리스트 기능 | CHAT | 0.2.x | /chat stable | ✅ | 지도에는 #999 | 사 |
 | P2 | 미공개 지도 기능 | — | 0.2.x | beta(cli) | ⏳ 보류 | #444 | 문 |
-| P2 | 공개 베타 기능 | nonexistent | 0.2.x | /trace beta | ✅ «실험» | #555 | 문 |
+| P2 | 공개 베타 기능 | nonexistent | 0.2.x | /live-run beta | ✅ «실험» | #555 | 문 |
 | P2 | 지도 특허 기능 | — | 0.2.x | stable(cli) | ✅ 특허 보류 | #666 | 사 |
 `;
   const result = generateFeatureMap({ map: source, items: [item('CHAT', 'green', '#11')], registry: FEATURE_MATURITY, version: '0.2.18' });
@@ -83,6 +83,12 @@ test('the real section 2 rows use map maturity and evidence only when no checkli
   expect(result).toContain('| 공개 베타 기능 | 베타 | 지도 판정 | #555 |');
   expect(result).toContain('| 개념 | 로드맵 | — | 근거 없음 |');
   expect(result).not.toContain('#666');
+});
+
+test('the marketing map no longer treats retired PWA routes as feature maturity evidence', () => {
+  const source = readFileSync(join(import.meta.dir, '../../docs/marketing/MAP-value-props-to-features.md'), 'utf8');
+  for (const route of ['/consult', '/field', '/market', '/pitch', '/showroom']) expect(source).not.toContain('`' + route + '`');
+  expect(source).toContain('beta (Telegram)');
 });
 
 test('the CLI generates the real marketing map with at least one current capability, excluding internal sections', () => {
@@ -99,6 +105,23 @@ test('the CLI generates the real marketing map with at least one current capabil
     expect(result).not.toContain('AI 임원이 하위 조직을 거느린다');
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('real marketing PWA route hints reference only registered routes', () => {
+  const source = readFileSync(join(import.meta.dir, '../../docs/marketing/MAP-value-props-to-features.md'), 'utf8');
+  const section = source.split(/^## 2\./m)[1]?.split(/^## /m)[0] ?? '';
+  const rows = section.split(/\r?\n/).filter((line) => line.startsWith('|')).slice(2);
+  const referencedRoutes = rows.flatMap((line) => {
+    const columns = line.slice(1, -1).split(/(?<!\\)\|/).map((cell) => cell.trim());
+    const path = /^`?(\/[^\s`]+)`?\s+(?:stable|beta)\b/i.exec(columns[4] ?? '')?.[1];
+    return path ? [path] : [];
+  });
+
+  expect(referencedRoutes).not.toContain('/field');
+  expect(referencedRoutes).not.toContain('/trace');
+  for (const route of referencedRoutes) {
+    expect(Object.hasOwn(FEATURE_MATURITY.pwaRoute, route), route).toBe(true);
   }
 });
 

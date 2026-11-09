@@ -1,8 +1,10 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { carryGateShardResult, gateShardReceiptPath, inspectGateShardReceipts, markGateShardUnmeasured, readGateShardResult, reusableGateShardFailures, saveGateShardResult, summarizeGateShardExecution } from './gate-shard-receipts.js';
+import { appendKnownFailOwnerLedger, auditKnownFailFailures, carryGateShardResult, gateShardReceiptPath, inspectGateShardReceipts, isKnownFailOwnerRecord, markGateShardUnmeasured, readGateShardResult, readKnownFailOwnerLedger, reusableGateShardFailures, saveGateShardResult, summarizeGateShardExecution } from './gate-shard-receipts.js';
 import { gateShardRuntimeIdentityKey, type GateShardReceipt } from './gate-shard-dispatch.js';
 import type { GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
 
@@ -14,9 +16,81 @@ const receipt = (): GateShardReceipt => {
   const imageDigest = `sha256:${'c'.repeat(64)}`;
   return ({ version: '1.0.1', graphSha: 'e'.repeat(64), recipeSha: 'f'.repeat(64), graphEntry: 'gate-entry-v1', recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000, id: 'pod-0', files: ['src/a.test.ts'], head40: 'a'.repeat(40), base40: 'b'.repeat(40),
   host: 'node-b', envKey: gateShardRuntimeIdentityKey(runtimeIdentity, lockfileHash)!, envFingerprint: 'd'.repeat(64), imageDigest, lockfileHash,
-  runtimeIdentity, testedFileHashes: { 'src/a.test.ts': 'a'.repeat(64) }, executions: [{ branch: '', attemptId: 'attempt-1', host: 'node-b', imageDigest, runtimeIdentity }], status: 'complete', failureIds: [], errorIds: [], evidencePath: 'pending',
+  runtimeIdentity, runtimeSourceFingerprint: '8'.repeat(64), testedFileHashes: { 'src/a.test.ts': 'a'.repeat(64) }, executions: [{ branch: '', attemptId: 'attempt-1', host: 'node-b', imageDigest, runtimeIdentity }], status: 'complete', failureIds: [], errorIds: [], evidencePath: 'pending',
   evidenceSha256: '0'.repeat(64), measuredAt: '2026-10-27T00:00:00.000Z', attempt: 1 });
 };
+
+test('known-fail audit covers only unique exact IDs with a valid owner cell and first-seen commit', () => {
+  const owned = 'src/a.test.ts > known failure';
+  const ownerless = 'src/b.test.ts > unexplained failure';
+  const conflicted = 'src/c.test.ts > duplicate owner';
+  const ambiguous = 'src/d.test.ts > ownerless duplicate';
+  const ledger = [{ failureId: owned, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) },
+    { failureId: ownerless, checklistCellId: '', firstSeenCommit: 'b'.repeat(40) },
+    { failureId: conflicted, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) },
+    { failureId: conflicted, checklistCellId: 'OTHER-CELL', firstSeenCommit: 'b'.repeat(40) },
+    { failureId: ambiguous, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) },
+    { failureId: ambiguous, checklistCellId: '', firstSeenCommit: 'b'.repeat(40) }];
+  expect(isKnownFailOwnerRecord(ledger[0])).toBe(true);
+  expect(isKnownFailOwnerRecord({ failureId: 'src/f.test.ts', checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) })).toBe(false);
+  expect(isKnownFailOwnerRecord(ledger[1])).toBe(false);
+  expect(auditKnownFailFailures([owned, ownerless, conflicted, ambiguous], ledger)).toEqual({
+    covered: [ledger[0]], residual: [ownerless, conflicted, ambiguous],
+  });
+});
+
+test('known-fail owner ledger reads and appends without dropping ambiguous prior rows', () => {
+  const root = mkdtempSync(join(tmpdir(), 'known-fail-ledger-')); roots.push(root);
+  const owned = { failureId: 'src/a.test.ts > existing failure', checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) };
+  const conflicting = { failureId: owned.failureId, checklistCellId: 'OTHER-CELL', firstSeenCommit: 'b'.repeat(40) };
+  expect(readKnownFailOwnerLedger(root)).toMatchObject({ records: [], writable: true });
+  appendKnownFailOwnerLedger(root, [owned, conflicting]);
+  expect(readKnownFailOwnerLedger(root)).toEqual({ records: [owned, conflicting], writable: true });
+  expect(auditKnownFailFailures([owned.failureId], readKnownFailOwnerLedger(root).records).residual).toEqual([owned.failureId]);
+});
+
+test('an unreadable known-fail ledger stays fail-closed and is never overwritten', () => {
+  const root = mkdtempSync(join(tmpdir(), 'known-fail-ledger-corrupt-')); roots.push(root);
+  const path = join(root, 'graph-runs', 'release-loop', 'known-fail-owner-ledger.json');
+  mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
+  writeFileSync(path, '{invalid');
+  expect(readKnownFailOwnerLedger(root)).toEqual({ records: [], writable: false });
+  expect(() => appendKnownFailOwnerLedger(root, [{ failureId: 'src/a.test.ts > failure',
+    checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'a'.repeat(40) }])).toThrow('refusing to replace');
+  expect(readFileSync(path, 'utf8')).toBe('{invalid');
+});
+
+test('concurrent triage appends serialize the ledger read-modify-write', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'known-fail-ledger-race-'));
+  roots.push(root);
+  const start = join(root, 'start');
+  const moduleUrl = pathToFileURL(join(import.meta.dir, 'gate-shard-receipts.ts')).href;
+  const runner = join(root, 'concurrent-append.ts');
+  writeFileSync(runner, `import { existsSync, writeFileSync } from 'node:fs';
+import { appendKnownFailOwnerLedger } from ${JSON.stringify(moduleUrl)};
+const [root, ready, id] = process.argv.slice(2);
+writeFileSync(ready, 'ready');
+while (!existsSync(${JSON.stringify(start)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+appendKnownFailOwnerLedger(root!, [{ failureId: id!, checklistCellId: 'PREEXIST-TRIAGE-27', firstSeenCommit: 'c'.repeat(40) }]);
+`);
+  const children = ['src/a.test.ts > first', 'src/b.test.ts > second'].map((failureId, index) => {
+    const ready = join(root, `ready-${index}`);
+    const child = spawn(process.execPath, [runner, root, ready, failureId], { stdio: 'ignore' });
+    return { child, ready };
+  });
+  const readyDeadline = Date.now() + 10_000;
+  while (children.some(item => !existsSync(item.ready)) && Date.now() < readyDeadline)
+    await new Promise(resolve => setTimeout(resolve, 10));
+  expect(children.every(item => existsSync(item.ready))).toBe(true);
+  writeFileSync(start, 'go');
+  const exits = await Promise.all(children.map(({ child }) => new Promise<number>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', code => resolve(code ?? -1));
+  })));
+  expect(exits).toEqual([0, 0]);
+  expect(readKnownFailOwnerLedger(root).records.map(record => (record as { failureId: string }).failureId).sort())
+    .toEqual(['src/a.test.ts > first', 'src/b.test.ts > second']);
+});
 
 test('receipt reads require the exact recorded baseline; moved heads need radius planning', () => {
   const root = mkdtempSync(join(tmpdir(), 'gate-receipt-')); roots.push(root);
@@ -83,6 +157,32 @@ test('receipt payload rejects incomplete passed IDs and inconsistent execution c
   saveGateShardResult(root, { receipt: inconsistent,
     runs: [{ output: '1 pass\n0 fail\nRan 2 tests across 1 file.\n', rc: 0, pass: 1, fail: 0, errors: 0, ran: 2, files: 1, passedIds: ['src/b.test.ts > pass'] }] });
   expect(readGateShardResult(root, { shard: inconsistent, head40: inconsistent.head40, base40: inconsistent.base40, envKey: inconsistent.envKey })).toBeNull();
+});
+
+test('Bun skipped tests are part of the receipt run count and can carry when the run passes', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-receipt-skipped-')); roots.push(root);
+  const original = receipt();
+  const saved = saveGateShardResult(root, { receipt: original,
+    runs: [{ output: '3 pass\n0 fail\n2 skipped\nRan 5 tests across 1 file.\n', rc: 0, pass: 3, fail: 0,
+      errors: 0,
+      skipped: 2,
+      ran: 5,
+      files: new Set(['src/a.test.ts']).size,
+      passedIds: ['src/a.test.ts > one', 'src/a.test.ts > two', 'src/a.test.ts > three'] }] });
+  const measured = readGateShardResult(root, { shard: saved, head40: saved.head40, base40: saved.base40, envKey: saved.envKey });
+  expect(measured?.runs[0]).toMatchObject({ pass: 3, skipped: 2, ran: 5 });
+  const second = saveGateShardResult(root, { receipt: { ...original, attempt: 2,
+    executions: original.executions!.map((execution) => ({ ...execution, attemptId: 'attempt-2' })) },
+  runs: [{ output: '3 pass\n0 fail\n2 skipped\nRan 5 tests across 1 file.\n', rc: 0, pass: 3, fail: 0,
+    errors: 0,
+    skipped: 2,
+    ran: 5,
+    files: new Set(['src/a.test.ts']).size,
+    passedIds: ['src/a.test.ts > one', 'src/a.test.ts > two', 'src/a.test.ts > three'] }] });
+  expect(second.executions).toHaveLength(2);
+  const carried = carryGateShardResult(root, readGateShardResult(root, { shard: second, head40: second.head40, base40: second.base40, envKey: second.envKey })!, '9'.repeat(40));
+  const carriedResult = readGateShardResult(root, { shard: original, head40: '9'.repeat(40), base40: original.base40, envKey: original.envKey });
+  expect(carriedResult?.runs[0]).toMatchObject({ pass: 3, skipped: 2, ran: 5 });
 });
 
 test('receipt execution summary matches the latest persisted reuse and rerun decisions', () => {

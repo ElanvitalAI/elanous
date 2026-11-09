@@ -6,11 +6,12 @@ import type { LLMToolSpec } from './llm/tool-spec.js';
 //   · finish_reason=length with tool calls → `tool-args-maybe-truncated` observation
 //   · valid args → event identical to the pre-fix parser (byte-identical)
 //   · other providers (grok · openai compat) → unchanged: broken args still become `{}` with no flag
-// Fake fetch via spyOn (never mock.module) · no network.
+// Shared fake-fetch device blocks unmatched provider requests; no network.
 import { expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
 import { buildInvalidToolArgsMessage, getProviderForConfig, parseOpenAISSELines, streamLLMWithTools, type LLMMessage, type LLMProvider, type LLMStreamEvent } from './llm.js';
-import type { UserConfig } from './user-config.js';
+import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import type { UserConfig } from './user-config/types.js';
 
 const tools: LLMToolSpec[] = [{ name: 'Write', description: 'write', parameters: { type: 'object', properties: { file_path: { type: 'string' } } } }];
 
@@ -103,14 +104,15 @@ test('parser invariant: without the flag, broken args still collapse to {} with 
 // ── provider wiring (fake fetch) ──────────────────────────────────────────────
 
 async function streamFrom(llm: Record<string, unknown>, lines: string[]): Promise<LLMStreamEvent[]> {
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async () =>
-    new Response(lines.map((l) => `${l}\n\n`).join(''), { status: 200 })) as unknown as typeof fetch);
-  try {
+  return withFakeFetchDevice([
+    { url: '/api/v1/chat/completions', method: 'POST', response: () => new Response(lines.map((l) => `${l}\n\n`).join(''), { status: 200 }) },
+    { url: '/v1/chat/completions', method: 'POST', response: () => new Response(lines.map((l) => `${l}\n\n`).join(''), { status: 200 }) },
+  ], async (device) => {
     const provider = getProviderForConfig({ llm } as unknown as UserConfig);
-    return await collect(provider.streamChat!([{ role: 'user', content: 'hi' }], { tools }));
-  } finally {
-    mock.mockRestore();
-  }
+    const events = await collect(provider.streamChat!([{ role: 'user', content: 'hi' }], { tools }));
+    expect(device.calls()).toHaveLength(1);
+    return events;
+  });
 }
 
 test('provider: OpenRouter stream flags broken tool args', async () => {

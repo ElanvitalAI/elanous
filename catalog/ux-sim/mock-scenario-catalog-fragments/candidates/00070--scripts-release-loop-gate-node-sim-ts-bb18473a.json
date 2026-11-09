@@ -1,0 +1,11 @@
+{
+  "path": "scripts/release-loop/gate-node-sim.ts",
+  "disposition": "device",
+  "entryCommand": "bun test scripts/release-loop/gate-node-sim.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Pure decision result asserted by test; no persistent event.",
+  "deviceId": "release-graph-rig",
+  "scenarioIds": [
+    "UX-MS-02"
+  ]
+}

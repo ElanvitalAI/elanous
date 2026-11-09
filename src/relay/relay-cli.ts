@@ -36,7 +36,7 @@ async function withAppKillSwitch<T>(options: RelayCommandOptions,
 }
 
 export function validateRelayPublicOptions(opts: RelayPublicOptions): void {
-  if (opts.publicDomain && opts.publicDomain !== 'elanous.app') throw new Error('public domain must be elanous.app');
+  if (opts.publicDomain && !['elanous.app', 'elanous.ai'].includes(opts.publicDomain)) throw new Error('public domain must be elanous.app or elanous.ai');
   if (!!opts.publicDomain !== (!!opts.publicServerId && !!opts.publicUserId)
     || (!!opts.publicServerId !== !!opts.publicUserId)) {
     throw new Error('--public-domain, --public-server-id, and --public-user-id must be supplied together');
@@ -51,16 +51,18 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
     .description('Serve private relay connections and optionally the invited Nexus app public domain')
     .requiredOption('--trusted-host-keys <file>', 'JSON object of X25519-derived serverId to Ed25519 public key (base64url)')
     .option('--port <port>', 'Listening port', '8765')
-    .option('--public-domain <domain>', 'Enable the single-host public app proxy for elanous.app (TLS must terminate at the local edge proxy)')
+    .option('--public-domain <domain>', 'Enable the single-host public app proxy for elanous.app or elanous.ai (TLS must terminate at the local edge proxy)')
     .option('--public-server-id <id>', 'Pinned Nexus host serverId that receives its configured public user app hosts')
     .option('--public-user-id <id>', 'User label bound to this single Nexus host; multi-user dispatch belongs to the ops relay')
     .action(async (opts: { trustedHostKeys: string; port: string; publicDomain?: string; publicServerId?: string; publicUserId?: string }) => {
       const port = Number(opts.port);
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid relay port');
-      validateRelayPublicOptions(opts);
-      const { loadTrustedHostKeys, startRelayServer } = await import('./relay-server.js');
+      const { loadTrustedHostKeys, resolvePublicAppUserId, startRelayServer } = await import('./relay-server.js');
+      const publicUserId = opts.publicDomain ? resolvePublicAppUserId(opts.publicUserId) : opts.publicUserId;
+      const resolvedOpts = { ...opts, ...(publicUserId ? { publicUserId } : {}) };
+      validateRelayPublicOptions(resolvedOpts);
       const relay = startRelayServer({ port, hostname: '127.0.0.1', trustedHostKeys: loadTrustedHostKeys(opts.trustedHostKeys),
-        ...(opts.publicDomain ? { publicDomain: 'elanous.app' as const, publicServerId: opts.publicServerId!, publicUserId: opts.publicUserId! } : {}) });
+        ...(opts.publicDomain ? { publicDomain: opts.publicDomain as 'elanous.app' | 'elanous.ai', publicServerId: opts.publicServerId!, publicUserId: publicUserId! } : {}) });
       console.log(`relay listening on 127.0.0.1:${relay.port}${opts.publicDomain ? ' (public TLS edge required)' : ''}`);
       process.once('SIGINT', () => { relay.stop(); });
       process.once('SIGTERM', () => { relay.stop(); });

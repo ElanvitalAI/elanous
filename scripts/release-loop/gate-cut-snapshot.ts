@@ -4,7 +4,8 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const SHA40 = /^[a-f0-9]{40}$/i;
-const SNAPSHOT_FILE = /(?:\.test\.(?:tsx?|jsx?|mts|cts)$|\.(?:tsx?|jsx?|mts|cts|jsonc?|ya?ml|toml)$|(?:^|\/)package\.json$|(?:^|\/)bun\.lock(?:b)?$|(?:^|\/)Dockerfile$)/i;
+const SNAPSHOT_FORMAT_VERSION = 2;
+const SNAPSHOT_FILE = /(?:\.test\.(?:tsx?|jsx?|mts|cts)$|\.(?:[cm]?[jt]sx?|jsonc?|ya?ml|toml)$|(?:^|\/)package\.json$|(?:^|\/)bun\.lock(?:b)?$|(?:^|\/)Dockerfile$)/i;
 export interface CutSnapshotEntry { blob: string; size: number; sha256: string; content: string }
 export interface CutSnapshot { commit: string; entries: ReadonlyMap<string, CutSnapshotEntry>; files: readonly string[]; read(path: string): string | undefined; existsBlob(path: string): boolean }
 const cache = new Map<string, CutSnapshot>();
@@ -17,9 +18,10 @@ export function createCutSnapshot(repo: string, commit: string, artifactDir?: st
   const cached = cache.get(key);
   if (cached) return cached;
   const artifact = artifactDir ? join(artifactDir, `${commit}.json`) : undefined;
-  let data: { commit: string; entries: Record<string, CutSnapshotEntry>; files: string[] } | undefined;
+  let data: { formatVersion: number; commit: string; entries: Record<string, CutSnapshotEntry>; files: string[] } | undefined;
   if (artifact) {
-    try { const saved = JSON.parse(readFileSync(artifact, 'utf8')) as typeof data; if (saved?.commit === commit) data = saved; } catch { /* missing or stale artifact: rebuild below */ }
+    try { const saved = JSON.parse(readFileSync(artifact, 'utf8')) as typeof data;
+      if (saved?.commit === commit && saved.formatVersion === SNAPSHOT_FORMAT_VERSION) data = saved; } catch { /* missing or stale artifact: rebuild below */ }
   }
   if (!data) {
     const listed = spawnSync('git', ['ls-tree', '-r', '-z', commit], { cwd: repo, encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
@@ -49,7 +51,7 @@ export function createCutSnapshot(repo: string, commit: string, artifactDir?: st
       entries[row.path] = { blob: row.oid, size, sha256: createHash('sha256').update(content).digest('hex'), content: content.toString('base64') };
       offset = end + 1;
     }
-    data = { commit, entries, files: files.sort() };
+    data = { formatVersion: SNAPSHOT_FORMAT_VERSION, commit, entries, files: files.sort() };
     if (artifact) {
       mkdirSync(dirname(artifact), { recursive: true });
       const tmp = `${artifact}.${process.pid}.tmp`;

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-PR-LAND-DRIFT-GATE-DEVICE-TS",
+  "path": "src/ux-sim/pr-land-drift-gate-device.ts",
+  "boundary": "Calls the production pinned-main delta assessment and refusal classifier with synthetic remote output; no SSH is opened.",
+  "deviceIds": [
+    "pr-land-drift-gate"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

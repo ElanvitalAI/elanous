@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-WARM-POOL-REUSE-SWITCH-SIM-TS",
+  "path": "src/ux-sim/warm-pool-reuse-switch-sim.ts",
+  "boundary": "Exercises a real warm-pod provider lease, fresh-versus-warm comparison and evidence journal through isolated fake Kubernetes and primary-control boundaries.",
+  "deviceIds": [
+    "warm-pool-reuse-sim",
+    "warm-si-reuse-sim"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

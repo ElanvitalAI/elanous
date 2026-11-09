@@ -14,14 +14,13 @@
 import { describe, expect, test } from 'bun:test';
 import {
   createDashboardMouseWiring,
-  pillHoverTarget,
 } from '../src/dashboard/input/mouse-wiring.js';
 import { createHoverTracker } from '../src/ui/hover-tracker.js';
 import { createHoverPresenter } from '../src/ui/hover-presenter.js';
 import { createContextKeyService } from '../src/input-core/context-keys.js';
 import { stripAnsi } from '../src/tui.js';
 import type { PillBound } from '../src/status/pills.js';
-import type { RotationEntry } from '../src/user-config.js';
+import type { RotationEntry } from '../src/user-config/types.js';
 import type { ActiveProviderInfo } from '../src/provider-summary.js';
 import type { ModalSurface } from '../src/display/modal-stack.js';
 
@@ -50,44 +49,6 @@ function fakeScheduler() {
     size: () => queue.length,
   };
 }
-
-describe('pillHoverTarget', () => {
-  const pills: PillBound[] = [
-    { name: 'workingDir', startCol: 0,  endCol: 10 },
-    { name: 'model',      startCol: 12, endCol: 22 },
-  ];
-
-  test('returns null when statusRow is null', () => {
-    expect(pillHoverTarget(pills, null, 5, 5)).toBeNull();
-  });
-
-  test('returns null when row is neither statusRow nor statusRow-1', () => {
-    expect(pillHoverTarget(pills, 23, 10, 5)).toBeNull();
-  });
-
-  test('returns null for a column between pills', () => {
-    expect(pillHoverTarget(pills, 23, 23, 12)).toBeNull();  // col=12 → col0=11 gap
-  });
-
-  test('returns target with default tooltip for a pill hit', () => {
-    const t = pillHoverTarget(pills, 23, 23, 6);  // col0=5 falls inside workingDir
-    expect(t).not.toBeNull();
-    expect(t!.id).toBe('pill:workingDir');
-    expect(t!.kind).toBe('status-bar-pill');
-    expect(t!.tooltipText).toContain('Working directory');
-  });
-
-  test('accepts statusRow-1 with one-row tolerance', () => {
-    const t = pillHoverTarget(pills, 23, 22, 6);  // row=22 == statusRow-1
-    expect(t).not.toBeNull();
-  });
-
-  test('custom tooltipFor can hide a pill via returning null', () => {
-    const t = pillHoverTarget(pills, 23, 23, 6, () => null);
-    expect(t).not.toBeNull();
-    expect(t!.tooltipText).toBeUndefined();
-  });
-});
 
 describe('dashboard-mouse-wiring hover integration', () => {
   function buildHarness() {

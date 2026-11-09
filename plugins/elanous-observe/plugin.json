@@ -1,0 +1,41 @@
+{
+  "id": "elanous-observe",
+  "name": "Elanous Observe",
+  "version": "0.3.8",
+  "description": "Built-in route index for read-only operational observation tools.",
+  "main": "./plugin.ts",
+  "activationEvents": ["onRoute"],
+  "contributes": {
+    "aiTools": [
+      {
+        "name": "ObserveLogs",
+        "description": "Search operational logs and return matching observations.",
+        "handler": "native:logs_query",
+        "parameters": { "type": "object", "properties": {} },
+        "route": {
+          "triggers": ["로그 보여줘", "로그 검색", "show logs"],
+          "examples": ["최근 릴리즈 오류 로그 보여줘", "show me the operation logs"],
+          "sideEffects": "read-only",
+          "risk": "low",
+          "cost": "cheap",
+          "requiresConfirm": false
+        }
+      },
+      {
+        "name": "ObserveOpsStatus",
+        "description": "Read the current operational status summary.",
+        "handler": "native:ops_status",
+        "parameters": { "type": "object", "properties": {} },
+        "route": {
+          "triggers": ["운영 상태", "ops status"],
+          "examples": ["현재 운영 상태 알려줘"],
+          "sideEffects": "read-only",
+          "risk": "low",
+          "cost": "cheap",
+          "requiresConfirm": false
+        }
+      }
+    ]
+  },
+  "capabilities": []
+}

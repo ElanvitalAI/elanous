@@ -8,7 +8,7 @@ import { loadTokens } from '../oauth/store.js';
 import { serviceKeyStatus, verifyServiceKey, type ServiceKeyVerification } from '../setup/service-keys.js';
 import { importServiceKeys, runFirstRunProviderSetup } from '../cli/setup-keys.js';
 import { formatCodexDeviceLoginFailure, runCodexDeviceLoginWait } from '../cli/codex-device-login-wait.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { withSimClock } from './fake-clock.js';
 import {
   createFakeCodexDeviceOAuth,

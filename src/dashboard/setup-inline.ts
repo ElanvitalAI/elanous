@@ -1,11 +1,6 @@
 import { DiscordBot } from '../discord.js';
-import {
-  addRotationEntry,
-  rotationEntryLabel,
-  type LLMProviderName,
-  type RotationEntry,
-  type UserConfig,
-} from '../user-config.js';
+import { addRotationEntry, rotationEntryLabel } from '../user-config.js';
+import type { LLMProviderName, RotationEntry, UserConfig } from '../user-config/types.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import type { ModelEntry } from '../intelligence-map/types.js';
 import { getInventory } from '../llm/local-manager/manager.js';

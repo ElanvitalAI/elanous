@@ -197,11 +197,6 @@ export function parseChatConfig(raw: unknown): ChatConfig {
   const chatAutoCompact = (chat.autoCompact ?? {}) as Record<string, unknown>;
   const chatCompact = (chat.compact ?? {}) as Record<string, unknown>;
   const chatSystemPrompt = (chat.systemPrompt ?? {}) as Record<string, unknown>;
-  const chatRendering = (chat.rendering ?? {}) as Record<string, unknown>;
-  const chatRenderingStreaming = (chatRendering.streaming ?? {}) as Record<string, unknown>;
-  const chatRenderingWrap = (chatRendering.wrap ?? {}) as Record<string, unknown>;
-  const chatRenderingDiff = (chatRendering.diff ?? {}) as Record<string, unknown>;
-  const chatRenderingHud = (chatRendering.hud ?? {}) as Record<string, unknown>;
   return {
       factQuestion: {
         maxToolTurns: typeof chatFactQuestion.maxToolTurns === 'number'
@@ -315,99 +310,7 @@ export function parseChatConfig(raw: unknown): ChatConfig {
             : CHAT_DEFAULTS.systemPrompt.forceBuiltinVariant;
         })(),
       },
-      rendering: {
-        streaming: {
-          mode: normalizeChatRenderingStreamingMode(chatRenderingStreaming.mode),
-          catchUpThresholdLines: clampNum(
-            chatRenderingStreaming.catchUpThresholdLines,
-            CHAT_DEFAULTS.rendering.streaming.catchUpThresholdLines,
-            1,
-            1000,
-          ),
-          catchUpAgeMs: clampNum(
-            chatRenderingStreaming.catchUpAgeMs,
-            CHAT_DEFAULTS.rendering.streaming.catchUpAgeMs,
-            1,
-            10_000,
-          ),
-        },
-        wrap: {
-          urlAware: chatRenderingWrap.urlAware === true,
-        },
-        tool: {
-          displayMode: normalizeChatRenderingToolDisplayMode(
-            chatRendering && typeof (chatRendering as Record<string, unknown>).tool === 'object'
-              ? ((chatRendering as Record<string, unknown>).tool as Record<string, unknown>).displayMode
-              : undefined,
-          ),
-          blockMaxLines: clampNum(
-            chatRendering && typeof (chatRendering as Record<string, unknown>).tool === 'object'
-              ? ((chatRendering as Record<string, unknown>).tool as Record<string, unknown>).blockMaxLines
-              : undefined,
-            CHAT_DEFAULTS.rendering.tool.blockMaxLines,
-            1,
-            200,
-          ),
-        },
-        diff: {
-          colorTier: normalizeChatRenderingDiffColorTier(chatRenderingDiff.colorTier),
-          headerStyle: normalizeChatRenderingDiffHeaderStyle(chatRenderingDiff.headerStyle),
-          turnBrowserHistory: clampNum(
-            chatRenderingDiff.turnBrowserHistory,
-            CHAT_DEFAULTS.rendering.diff.turnBrowserHistory,
-            1,
-            20,
-          ),
-          turnBrowserMode: normalizeChatRenderingDiffTurnBrowserMode(chatRenderingDiff.turnBrowserMode),
-        },
-        hud: {
-          gaugeWarnRatio: clampNum(
-            chatRenderingHud.gaugeWarnRatio,
-            CHAT_DEFAULTS.rendering.hud.gaugeWarnRatio,
-            0,
-            1,
-          ),
-          gaugeDangerRatio: clampNum(
-            chatRenderingHud.gaugeDangerRatio,
-            CHAT_DEFAULTS.rendering.hud.gaugeDangerRatio,
-            0,
-            1,
-          ),
-        },
-      },
+      rendering: structuredClone(CHAT_DEFAULTS.rendering),
     };
-}
-
-function normalizeChatRenderingStreamingMode(v: unknown): ChatRenderingStreamingMode {
-  return v === 'line' ? 'line' : CHAT_DEFAULTS.rendering.streaming.mode;
-}
-
-function normalizeChatRenderingToolDisplayMode(v: unknown): ChatRenderingToolDisplayMode {
-  return v === 'inline-to-block' ? 'inline-to-block' : CHAT_DEFAULTS.rendering.tool.displayMode;
-}
-
-function normalizeChatRenderingDiffColorTier(v: unknown): ChatRenderingDiffColorTier {
-  switch (v) {
-    case 'truecolor':
-    case '256':
-    case 'ansi16':
-      return v;
-    default:
-      return CHAT_DEFAULTS.rendering.diff.colorTier;
-  }
-}
-
-function normalizeChatRenderingDiffHeaderStyle(v: unknown): ChatRenderingDiffHeaderStyle {
-  return v === 'edited' ? 'edited' : CHAT_DEFAULTS.rendering.diff.headerStyle;
-}
-
-function normalizeChatRenderingDiffTurnBrowserMode(v: unknown): ChatRenderingDiffTurnBrowserMode {
-  switch (v) {
-    case 'files':
-    case 'turns':
-      return v;
-    default:
-      return CHAT_DEFAULTS.rendering.diff.turnBrowserMode;
-  }
 }
 

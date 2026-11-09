@@ -9,7 +9,9 @@ import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, rmSync, wri
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { CODE_FILE, TRACEABLE_RELEASE_JSON, type ClosureVerdict } from './gate-closure';
+import { loadReleaseGraphManifest, selectAppendRecheckEdge } from '../../src/graph-runner/release-graph-manifest.js';
 
 export interface PartialPlan {
   /** A verified docs-only append carries the completed, clean cut without starting a test Pod. */
@@ -216,6 +218,7 @@ export type GateAppendReceiptCosts = { partialMs: number; fullMs: number; source
 
 const DEPENDENCY_LAYER_FILE = /(?:^|\/)(?:bun\.lock(?:b)?|package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|tsconfig(?:\.[^/]+)?\.json|Dockerfile)$/i;
 const VERDICT_AFFECTING_FILE = /^(?:scripts\/release-loop\/(?:gate-[^/]+\.ts|resume-release\.ts|node-verdict\.ts)|src\/release-loop\/gate-[^/]+\.ts|graphs\/release\/(?:recipes|release-policies)\.yaml)$/;
+const RELEASE_GRAPH_MANIFEST = loadReleaseGraphManifest(join(import.meta.dir, '../../graphs/release/plugin.json'));
 
 export function selectGateAppendRecheckEdge(input: {
   changedFiles: readonly string[];
@@ -224,25 +227,26 @@ export function selectGateAppendRecheckEdge(input: {
   receiptCosts?: GateAppendReceiptCosts;
   promoteToFull?: readonly string[];
 }): { edge: 'append-recheck' | 'full-recheck'; promoted: GateAppendPromotionCondition[]; reason: string } {
-  const allowed = new Set<string>(DEFAULT_GATE_APPEND_PROMOTE_TO_FULL);
-  const policy = input.promoteToFull ?? DEFAULT_GATE_APPEND_PROMOTE_TO_FULL;
-  if (!Array.isArray(policy) || new Set(policy).size !== policy.length || policy.some((item) => !allowed.has(item)))
+  const policy = input.promoteToFull ?? RELEASE_GRAPH_MANIFEST.policies['gate.plan.promoteToFull']?.default;
+  if (!Array.isArray(policy) || new Set(policy).size !== policy.length
+    || policy.some((item) => !(DEFAULT_GATE_APPEND_PROMOTE_TO_FULL as readonly unknown[]).includes(item)))
     return { edge: 'full-recheck', promoted: [], reason: 'invalid gate.plan.promoteToFull policy' };
-  const promoted = new Set<GateAppendPromotionCondition>();
-  if (policy.includes('dep-layer') && input.changedFiles.some((file) => DEPENDENCY_LAYER_FILE.test(file))) promoted.add('dep-layer');
-  if (policy.includes('verdict-files') && input.changedFiles.some((file) => VERDICT_AFFECTING_FILE.test(file))) promoted.add('verdict-files');
   const docsOnly = input.changedFiles.length > 0 && input.changedFiles.every(isInert);
-  if (policy.includes('opaque-closure') && (input.closureOpaque || (!input.radiusFiles.length && !docsOnly))) promoted.add('opaque-closure');
-  if (input.receiptCosts) {
-    const { partialMs, fullMs, source } = input.receiptCosts;
-    if (source !== 'same-ledger-receipts' || !Number.isFinite(partialMs) || !Number.isFinite(fullMs) || partialMs < 0 || fullMs < 0)
-      return { edge: 'full-recheck', promoted: [], reason: 'append receipt costs require non-negative same-ledger measurements' };
-    if (policy.includes('cost-crossover') && input.radiusFiles.length > 0 && partialMs >= fullMs) promoted.add('cost-crossover');
+  try {
+    const decision = selectAppendRecheckEdge(RELEASE_GRAPH_MANIFEST, {
+      radiusFiles: input.radiusFiles,
+      dependencyLayerChanged: input.changedFiles.some((file) => DEPENDENCY_LAYER_FILE.test(file)),
+      verdictFilesChanged: input.changedFiles.some((file) => VERDICT_AFFECTING_FILE.test(file)),
+      closureOpaque: input.closureOpaque ?? (!input.radiusFiles.length && docsOnly ? false : undefined),
+      ...(input.receiptCosts ? { receiptCosts: { ...input.receiptCosts, source: 'same-ledger-receipts' as const } } : {}),
+      policyOverrides: { 'gate.plan.promoteToFull': policy },
+    });
+    const promoted = decision.promoted as GateAppendPromotionCondition[];
+    return { edge: decision.edge, promoted, reason: promoted.length
+      ? 'structural promotion: ' + promoted.join(', ') : 'radius is eligible for append recheck' };
+  } catch (error) {
+    return { edge: 'full-recheck', promoted: [], reason: error instanceof Error ? error.message : String(error) };
   }
-  const reasons = [...promoted];
-  return reasons.length
-    ? { edge: 'full-recheck', promoted: reasons, reason: 'structural promotion: ' + reasons.join(', ') }
-    : { edge: 'append-recheck', promoted: [], reason: 'radius is eligible for append recheck' };
 }
 
 /** Read actual full and partial shard durations from one release ledger and one measured commit. */
@@ -429,7 +433,9 @@ export function mergePartialFailures(plan: PartialPlan, measured: { failures: st
  *  Markdown name still shows the source path that disappeared. */
 export function changedFilesBetween(repo: string, from: string, to: string): string[] {
   // git-spawn-allow: read-only diff of two release commits.
-  const result = spawnSync('git', ['diff', '--name-only', '--no-renames', `${from}..${to}`], { cwd: repo, encoding: 'utf8' });
+  const result = spawnSync('git', ['diff', '--name-only', '--no-renames', `${from}..${to}`], {
+    cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   if (result.status !== 0 || result.error) throw new Error(`git diff failed: ${(result.stderr || result.error || 'no output').toString().trim()}`);
   return result.stdout.split(/\r?\n/).filter(Boolean);
 }

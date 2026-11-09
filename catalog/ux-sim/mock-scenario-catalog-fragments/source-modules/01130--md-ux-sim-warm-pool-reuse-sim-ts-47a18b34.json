@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-WARM-POOL-REUSE-SIM-TS",
+  "path": "src/ux-sim/warm-pool-reuse-sim.ts",
+  "boundary": "Runs production warm-provider reconcile and gate selection against isolated fake Kubernetes and token-authorized lease-control boundaries.",
+  "deviceIds": [
+    "warm-pool-reuse-sim"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

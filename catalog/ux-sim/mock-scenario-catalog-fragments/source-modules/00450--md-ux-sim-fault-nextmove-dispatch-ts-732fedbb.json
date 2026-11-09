@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAULT-NEXTMOVE-DISPATCH-TS",
+  "path": "src/ux-sim/fault-nextmove-dispatch.ts",
+  "boundary": "Injects nextmove-dispatch fixtures into the production decision path and renders the observed classification with its evidence command.",
+  "deviceIds": [
+    "fault-injection"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

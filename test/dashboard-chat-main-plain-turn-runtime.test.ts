@@ -948,7 +948,7 @@ describe('runDashboardChatMainPlainTurn', () => {
     }, { authMode: 'chatgpt', mirrorCodex: false });
     setUserConfigOverlay(config => ({ ...config,
       llm: { ...config.llm, provider: 'openai-codex', model: 'gpt-6-sol',
-        baseUrl: 'https://test.invalid/backend-api/codex', codexStore: false },
+        baseUrl: 'https://test.invalid/backend-api/codex' },
     }));
     globalThis.fetch = (async (_url, init) => {
       bodies.push(JSON.parse(String(init?.body)) as { input: Array<Record<string, unknown>> });

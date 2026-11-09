@@ -5,7 +5,7 @@
 // Only the runner that actually owns a model decision writes this record.
 
 import type { RouteDecision } from '../llm/route-decision.js';
-import type { LLMProviderName } from '../user-config.js';
+import type { LLMProviderName } from '../user-config/types.js';
 import { TaskStore } from '../task-orchestrator/store.js';
 
 const PREFIX = '[ROUTE-DECISION] ';

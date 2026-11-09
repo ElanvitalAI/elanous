@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
@@ -8,7 +8,7 @@ import { runGitWithRetry, type GitRunner } from './retry.js';
 
 const LF = 0x0a;
 const HELP_ARGUMENTS = new Set(['--help', '-h']);
-const HELP_GUIDANCE = "[elanous git] Wraps git and automatically retries transient lock failures. Bare/default-remote pushes to an open PR owned by another seat are refused; other push forms pass through with an observation. --force-owner overrides a covered push only after a successful audit row. A final result line such as '[git] status ok rc=0' is written to stderr. Git's own help follows.\n";
+const HELP_GUIDANCE = "[elanous git] Wraps git and automatically retries transient lock failures. Pushes to another seat's open PR are passed through with an audit warning, even if the audit write fails; uncertain push forms pass through with an observation. --force-owner records an override request. A final result line such as '[git] status ok rc=0' is written to stderr. Git's own help follows.\n";
 
 const GLOBAL_OPTIONS_WITH_OPERANDS = new Set([
   '-C',
@@ -127,10 +127,11 @@ type PushVerification = {
   readonly observedSha?: string;
 };
 
-type PushTarget = { remote: string; sourceRef: string; targetRef: string; pushUrl: string; expectedSha: string; sourceReflog: string; sourceRefFile: string };
+type PushTarget = { remote: string; sourceRef: string; targetRef: string; refspecIndex: number; forceRefspec: boolean;
+  pushUrl: string; expectedSha: string; sourceReflog: string; sourceRefFile: string };
 
 /** Accept only a single explicit full branch refspec without command-side effects. */
-function explicitBranchPush(args: string[]): { remote: string; sourceRef: string; targetRef: string } | undefined {
+function explicitBranchPush(args: string[]): { remote: string; sourceRef: string; targetRef: string; refspecIndex: number; forceRefspec: boolean } | undefined {
   let commandIndex = -1;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
@@ -141,6 +142,7 @@ function explicitBranchPush(args: string[]): { remote: string; sourceRef: string
   }
   if (commandIndex < 0 || args[commandIndex] !== 'push') return undefined;
   const operands: string[] = [];
+  const operandIndexes: number[] = [];
   const flagsWithValue = new Set(['-o', '--push-option', '--receive-pack', '--exec']);
   const noValueFlags = new Set(['--force', '-f', '--porcelain', '--verbose', '-v', '--quiet', '-q', '--progress', '--atomic', '--signed']);
   for (let index = commandIndex + 1; index < args.length; index++) {
@@ -151,6 +153,7 @@ function explicitBranchPush(args: string[]): { remote: string; sourceRef: string
     if (noValueFlags.has(arg)) continue;
     if (arg.startsWith('-')) return undefined;
     operands.push(arg);
+    operandIndexes.push(index);
   }
   if (operands.length !== 2 || operands.some((operand) => !operand || operand.startsWith('-'))) return undefined;
   const [remote, rawRefspec] = operands as [string, string];
@@ -162,7 +165,55 @@ function explicitBranchPush(args: string[]): { remote: string; sourceRef: string
   const targetRef = rawTargetRef;
   if (!sourceRef.startsWith('refs/heads/') || !targetRef.startsWith('refs/heads/') || targetRef === 'refs/heads/' || !sourceRef || !targetRef
     || /[*?\[\]]/.test(sourceRef + targetRef) || sourceRef.startsWith('-')) return undefined;
-  return { remote, sourceRef, targetRef };
+  return { remote, sourceRef, targetRef, refspecIndex: operandIndexes[1]!, forceRefspec: rawRefspec.startsWith('+') };
+}
+
+/** Snapshot the resolved pre-push hook path and whether it is executable. */
+type PrePushHookState = { path: string; executable: boolean };
+function prePushHookState(args: string[]): PrePushHookState | undefined {
+  const prefix = globalOptionPrefix(args);
+  const configuredPath = spawnSync('git', [...prefix, 'config', '--path', '--get', 'core.hooksPath'], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  if (configuredPath.status === 0 && resolve(configuredPath.stdout.trim()) === '/dev/null')
+    return { path: '/dev/null', executable: false };
+  if (configuredPath.status !== 0 && configuredPath.status !== 1) return undefined;
+  const hookPath = spawnSync('git', [...prefix, 'rev-parse', '--path-format=absolute', '--git-path', 'hooks/pre-push'], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  const path = hookPath.status === 0 ? hookPath.stdout.trim() : '';
+  if (!path) return undefined;
+  try {
+    const hook = statSync(path);
+    return { path, executable: hook.isFile() && (hook.mode & 0o111) !== 0 };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? { path, executable: false } : undefined;
+  }
+}
+
+function samePrePushHookState(left: PrePushHookState, right: PrePushHookState | undefined): boolean {
+  return right !== undefined && left.path === right.path && left.executable === right.executable;
+}
+
+/** Git must consume the commit we measured, even when the source is packed or its loose ref changes in place. */
+function pinPushSource(args: string[], target: PushTarget | undefined): { args: string[]; error?: string; hookState?: PrePushHookState } {
+  const push = explicitBranchPush(args);
+  if (!push) return { args };
+  const source = target ? undefined : spawnSync('git', [...globalOptionPrefix(args), 'rev-parse', '--verify', `${push.sourceRef}^{commit}`], {
+    encoding: 'utf8', env: process.env, timeout: 10_000,
+  });
+  const sha = target?.expectedSha ?? (source?.status === 0 ? source.stdout.trim() : '');
+  if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha))
+    return { args, error: `push source pin refused: cannot resolve ${push.sourceRef} to a commit` };
+  const hookState = prePushHookState(args);
+  if (!hookState)
+    return { args, error: 'push source pin refused: cannot verify the pre-push hook contract' };
+  if (hookState.executable)
+    return { args, error: `push source pin refused: an executable pre-push hook requires the original local ref ${push.sourceRef}` };
+  const pinned = [...args];
+  pinned[push.refspecIndex] = `${push.forceRefspec ? '+' : ''}${sha}:${push.targetRef}`;
+  return { args: pinned, hookState };
 }
 
 /** A direct URL query is only equivalent when no second insteadOf rewrite would change it. */
@@ -327,46 +378,64 @@ function callerSeat(cwd = process.cwd()): string | undefined {
   return fromPath && /^[A-Z][A-Z0-9-]{1,11}$/.test(fromPath) ? fromPath : undefined;
 }
 
-const PUSH_OPTIONS_WITH_OPERANDS = new Set(['-o', '--push-option', '--receive-pack', '--repo', '--exec']);
-const PUSH_OPTIONS_WITH_INLINE_OPERANDS = ['--push-option=', '--receive-pack=', '--repo=', '--exec='];
+const PUSH_OPTIONS_WITH_OPERANDS = new Set(['-o', '--push-option', '--receive-pack', '--repo', '--exec', '--recurse-submodules']);
+const PUSH_OPTIONS_WITHOUT_OPERANDS = new Set(['-u', '--set-upstream', '-f', '--force', '--dry-run', '--no-dry-run', '--porcelain', '--delete', '--prune', '--mirror', '--all', '--tags', '--follow-tags', '--atomic', '--no-verify', '--thin', '--no-thin', '--quiet', '-q', '--verbose', '-v', '--progress', '--no-progress', '--signed', '--no-signed', '--ipv4', '--ipv6', '--force-with-lease']);
+const PUSH_OPTIONS_WITH_INLINE_OPERANDS = ['--push-option=', '--receive-pack=', '--repo=', '--exec=', '--force-with-lease='];
 
-type ParsedPushArgs = { args: string[]; forceOwner: boolean; unsupportedOption?: string };
+type ParsedPushArgs = { args: string[]; forceOwner: boolean; guardOptions: string[]; unsupportedOption?: string };
 
 /** Remove our override flag only when it is unambiguously an option, never when Git consumes it as a value. */
 function parsePushArgs(args: string[]): ParsedPushArgs {
   const pushIndex = globalOptionPrefix(args).length;
-  if (args[pushIndex] !== 'push') return { args, forceOwner: false, unsupportedOption: 'push command not found' };
+  if (args[pushIndex] !== 'push') return { args, forceOwner: false, guardOptions: [], unsupportedOption: 'push command not found' };
   const removed = new Set<number>();
   let forceOwner = false;
+  let unsupportedOption: string | undefined;
+  const guardOptions: string[] = [];
   for (let index = pushIndex + 1; index < args.length; index++) {
     const arg = args[index]!;
     if (arg === '--') break;
     if (PUSH_OPTIONS_WITH_OPERANDS.has(arg) || /^-[qv]*o$/.test(arg)) {
-      if (index + 1 >= args.length) return { args, forceOwner: false, unsupportedOption: `${arg} requires an operand` };
-      index++;
+      if (index + 1 >= args.length) { unsupportedOption ??= `${arg} requires an operand`; continue; }
+      guardOptions.push(arg, args[++index]!);
       continue;
     }
-    if (PUSH_OPTIONS_WITH_INLINE_OPERANDS.some((option) => arg.startsWith(option))) continue;
+    if (PUSH_OPTIONS_WITH_INLINE_OPERANDS.some((option) => arg.startsWith(option))) { guardOptions.push(arg); continue; }
     if (arg === '--force-owner') {
       removed.add(index);
       forceOwner = true;
       continue;
     }
-    if (arg.startsWith('-')) return { args, forceOwner: false, unsupportedOption: arg };
+    if (PUSH_OPTIONS_WITHOUT_OPERANDS.has(arg)) { if (arg !== '--no-dry-run') guardOptions.push(arg); continue; }
+    if (arg.startsWith('-')) { unsupportedOption ??= arg; guardOptions.push(arg); continue; }
   }
-  return { args: args.filter((_, index) => !removed.has(index)), forceOwner };
+  return { args: args.filter((_, index) => !removed.has(index)), forceOwner, guardOptions, ...(unsupportedOption ? { unsupportedOption } : {}) };
 }
 
 function pushArgs(args: string[]): string[] {
   return args.slice(globalOptionPrefix(args).length + 1);
 }
 
+function pushPositionals(args: string[]): string[] {
+  const values = pushArgs(args);
+  const positionals: string[] = [];
+  for (let index = 0; index < values.length; index++) {
+    const value = values[index]!;
+    if (value === '--') { positionals.push(...values.slice(index + 1)); break; }
+    if (PUSH_OPTIONS_WITH_OPERANDS.has(value) || /^-[qv]*o$/.test(value)) { index++; continue; }
+    if (PUSH_OPTIONS_WITH_INLINE_OPERANDS.some((option) => value.startsWith(option))) continue;
+    if (value.startsWith('-')) continue;
+    positionals.push(value);
+  }
+  return positionals;
+}
+
 type ResolvedPushTarget = { remoteUrl: string; source: string; branch: string };
 type ResolvedPush = { targets: ResolvedPushTarget[] };
 
-function resolvePushTargets(args: string[], remote: string): ResolvedPush | undefined {
+function resolvePushTargets(args: string[], remote: string, refspecs: string[] = [], pushOptions: string[] = []): ResolvedPush | undefined {
   const prefix = globalOptionPrefix(args);
-  const dryRun = spawnSync('git', [...prefix, 'push', '--dry-run', '--porcelain', '--no-verify', remote], {
+  const dryRun = spawnSync('git', [...prefix, 'push', ...pushOptions, '--dry-run', '--porcelain', '--no-verify', remote, ...refspecs], {
     // Keep cwd at the caller's original directory so every relative -C is applied exactly once by Git.
     cwd: process.cwd(), encoding: 'utf8', timeout: 15_000, maxBuffer: 8 * 1024 * 1024,
   });
@@ -425,12 +494,12 @@ function guardPushOwnership(args: string[]): PushOwnershipDecision {
     if (forceOwner && auditFailure) return { args: gitArgs, blocked: true, notice: auditFailure };
     return { args: gitArgs, notice: `push owner guard: ${reason}; proceeding without an ownership verdict${auditFailure ? ` · ${auditFailure}` : ''}` };
   };
-  const supplied = pushArgs(gitArgs);
-  if (parsedArgs.unsupportedOption) return passUncertain(`unsupported push option ${parsedArgs.unsupportedOption}; arguments are passed through unchanged`);
-  const explicitRemote = supplied.length === 1 && !supplied[0]!.startsWith('-') ? supplied[0] : undefined;
-  if (!(supplied.length === 0 || explicitRemote !== undefined)) {
-    return passUncertain('only a bare push or one default-remote push is covered; explicit options and refspecs are passed through');
-  }
+  const supplied = pushPositionals(gitArgs);
+  const explicitRemote = supplied.length > 0 && !supplied[0]!.includes(':') ? supplied[0] : undefined;
+  const hasRemote = explicitRemote !== undefined;
+  const refspecs = hasRemote ? supplied.slice(1) : supplied;
+  if (parsedArgs.guardOptions.includes('--repo') || parsedArgs.guardOptions.includes('--exec')) return passUncertain('push option changes repository or receive-pack executable');
+
 
   const prefix = globalOptionPrefix(args);
   const branchResult = spawnSync('git', [...prefix, 'symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000 });
@@ -440,21 +509,17 @@ function guardPushOwnership(args: string[]): PushOwnershipDecision {
   const defaultRemote = [
     `branch.${currentBranch}.pushRemote`, 'remote.pushDefault', `branch.${currentBranch}.remote`,
   ].map(config).find((result) => result.status === 0 && result.stdout.trim())?.stdout.trim() ?? 'origin';
-  if (explicitRemote && explicitRemote !== defaultRemote) return passUncertain(`remote ${explicitRemote} is not the configured default remote ${defaultRemote}`);
+  if (hasRemote && explicitRemote !== defaultRemote) return passUncertain(`remote ${explicitRemote} is not the configured default remote ${defaultRemote}`);
   const urls = spawnSync('git', [...prefix, 'remote', 'get-url', '--push', '--all', defaultRemote], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000 });
   if (urls.status !== 0 || urls.error) return passUncertain(`default remote ${defaultRemote} could not be resolved`);
   const pushUrls = urls.stdout.split(/\r?\n/).map((url) => url.trim()).filter(Boolean);
   if (pushUrls.length !== 1) return passUncertain(`default remote ${defaultRemote} has ${pushUrls.length} push destinations`);
-  const resolved = resolvePushTargets(args, defaultRemote);
-  if (!resolved || resolved.targets.length !== 1) return passUncertain('Git did not report exactly one push destination');
-  const target = resolved.targets[0]!;
-  if (target.branch !== currentBranch) return passUncertain(`push destination branch ${target.branch} differs from current branch ${currentBranch}`);
-  const sourceBranch = target.source === 'HEAD' ? currentBranch
-    : target.source.startsWith('refs/heads/') ? target.source.slice('refs/heads/'.length) : undefined;
-  if (sourceBranch !== currentBranch) return passUncertain(`push source ${target.source} is not the current branch ${currentBranch}`);
-  const repository = githubRepository(target.remoteUrl);
-  if (!repository || githubRepository(pushUrls[0]!)?.toLowerCase() !== repository.toLowerCase()) {
-    return passUncertain('the single push destination is not a matching GitHub remote');
+  if (!githubRepository(pushUrls[0]!)) return passUncertain('default remote is not a GitHub repository');
+  const resolved = resolvePushTargets(args, defaultRemote, refspecs, parsedArgs.guardOptions);
+  if (!resolved || resolved.targets.length === 0) return passUncertain('Git did not report any push destination');
+  const repository = githubRepository(pushUrls[0]!);
+  if (!repository || resolved.targets.some((target) => githubRepository(target.remoteUrl)?.toLowerCase() !== repository.toLowerCase())) {
+    return passUncertain('push destinations do not match the configured GitHub remote');
   }
 
   const found: OwnedPushPr[] = [];
@@ -467,7 +532,7 @@ function guardPushOwnership(args: string[]): PushOwnershipDecision {
     if (typeof parent === 'string' && parent && parent !== repository) parentRepository = parent;
   } catch { return passUncertain(`GitHub repository metadata unreadable for ${repository}`); }
   const headOwner = repository.split('/')[0]!;
-  for (const baseRepository of [...new Set([...(parentRepository ? [parentRepository] : []), repository])]) {
+  for (const target of resolved.targets) for (const baseRepository of [...new Set([...(parentRepository ? [parentRepository] : []), repository])]) {
     const response = spawnSync('gh', ['api', '--method', 'GET', `repos/${baseRepository}/pulls`, '-f', 'state=open', '-f', `head=${headOwner}:${target.branch}`, '-f', 'per_page=100'], {
       cwd, encoding: 'utf8', timeout: 10_000, maxBuffer: 8 * 1024 * 1024,
     });
@@ -495,18 +560,24 @@ function guardPushOwnership(args: string[]): PushOwnershipDecision {
     } catch { return passUncertain(`open PR lookup unreadable for ${baseRepository} ${target.branch}`); }
   }
   const uniquePrs = [...new Map(found.map((row) => [`${row.repository}#${row.pr.number}`, row])).values()];
-  if (forceOwner) {
-    const auditFailure = appendPushOwnerLedger({
-      seat: seat ?? null, verdict: 'force-owner', PR: uniquePrs.map(({ repository: prRepository, pr }) => ({ repository: prRepository, number: pr.number })),
-      target: { repository, branch: target.branch }, reason: '--force-owner',
-    });
-    return auditFailure ? { args: gitArgs, blocked: true, notice: auditFailure } : { args: gitArgs };
-  }
   const foreign = uniquePrs.find(({ pr }) => {
     const ownerSeat = prSeat(pr);
     return seat !== undefined && ownerSeat !== undefined && ownerSeat !== seat;
   });
-  if (foreign) return { args: gitArgs, blocked: true, notice: `push refused: branch ${foreign.pr.headRefName ?? '(unknown)'} belongs to PR #${foreign.pr.number} in ${foreign.repository} seat:${prSeat(foreign.pr)} (current seat:${seat}); use --force-owner to override` };
+  if (foreign) {
+    const row = { seat: seat ?? null, verdict: 'foreign-owner-warning', PR: uniquePrs.map(({ repository: prRepository, pr }) => ({ repository: prRepository, number: pr.number, branch: pr.headRefName ?? null, seat: prSeat(pr) ?? null })),
+      targets: resolved.targets.map(({ branch }) => ({ repository, branch })), reason: 'push to another seat open PR branch', ...(parsedArgs.unsupportedOption ? { unsupportedOption: parsedArgs.unsupportedOption } : {}), ...(forceOwner ? { forceOwnerRequested: true } : {}) };
+    const auditFailure = appendPushOwnerLedger(row);
+    const notice = `push owner guard warning: ${uniquePrs.filter(({ pr }) => prSeat(pr) !== seat).map(({ pr, repository: prRepository }) => `branch ${pr.headRefName ?? '(unknown)'} belongs to PR #${pr.number} in ${prRepository} seat:${prSeat(pr)}`).join('; ')} (current seat:${seat}); proceeding${auditFailure ? ` · audit write failed: ${auditFailure}` : ''}`;
+    return { args: gitArgs, notice };
+  }
+  if (forceOwner) {
+    const auditFailure = appendPushOwnerLedger({
+      seat: seat ?? null, verdict: 'force-owner', PR: uniquePrs.map(({ repository: prRepository, pr }) => ({ repository: prRepository, number: pr.number })),
+      targets: resolved.targets.map(({ branch }) => ({ repository, branch })), reason: '--force-owner',
+    });
+    return auditFailure ? { args: gitArgs, blocked: true, notice: auditFailure } : { args: gitArgs };
+  }
   if (uniquePrs.some(({ pr }) => !seat || !prSeat(pr))) return passUncertain('open PR or caller seat ownership is unknown');
   return { args: gitArgs };
 }
@@ -523,7 +594,6 @@ export function runGitCli(args: string[]): void {
   // ⛔ 실행 «전» 스냅샷 — 이 명령이 마커를 남길 수 있는 종류일 때만 잰다(무관한 명령엔 비용 0).
   const probesForRun = SUBCOMMAND_PROBES[subcommand];
   const probesBefore = probesForRun ? probeSnapshot(args, probesForRun, process.env) : undefined;
-  const pushTarget = subcommand === 'push' ? preparePushVerification(args) : undefined;
   const stderrChunks: Buffer[] = [];
   if (HELP_ARGUMENTS.has(args[0] ?? '')) {
     if (hasCliStderrSink()) stderrChunks.push(Buffer.from(HELP_GUIDANCE));
@@ -532,8 +602,16 @@ export function runGitCli(args: string[]): void {
   let attempts = 0;
   let rawStdout: Buffer = Buffer.alloc(0);
   let rawStderr: Buffer = Buffer.alloc(0);
+  let pinnedHookState: PrePushHookState | undefined;
+  let pushHookCheckArgs: string[] | undefined;
   const runner: GitRunner = (gitArgs) => {
     attempts++;
+    if (pinnedHookState && pushHookCheckArgs
+      && !samePrePushHookState(pinnedHookState, prePushHookState(pushHookCheckArgs))) {
+      const refusal = 'push source pin refused: pre-push hook state changed before git push';
+      rawStderr = Buffer.from(`${refusal}\n`);
+      return { status: 1, stdout: '', stderr: refusal };
+    }
 
     const command = spawnSync('git', gitArgs, { maxBuffer: Infinity });
     rawStdout = asBuffer(command.stdout);
@@ -548,10 +626,18 @@ export function runGitCli(args: string[]): void {
     };
   };
   const ownership = subcommand === 'push' ? guardPushOwnership(args) : { args };
+  const pushTarget = subcommand === 'push' && !ownership.blocked ? preparePushVerification(ownership.args) : undefined;
+  const sourcePin: { args: string[]; error?: string; hookState?: PrePushHookState } = subcommand === 'push' && !ownership.blocked
+    ? pinPushSource(ownership.args, pushTarget) : { args: ownership.args };
+  pinnedHookState = sourcePin.hookState;
+  pushHookCheckArgs = sourcePin.hookState ? ownership.args : undefined;
+  const sourcePinError = sourcePin.error;
   const result = ownership.blocked
     ? { status: 1, stdout: '', stderr: ownership.notice ?? 'push refused by owner guard' }
-    : runGitWithRetry(ownership.args, runner);
-  if (ownership.blocked && ownership.notice) rawStderr = Buffer.from(`${ownership.notice}\n`);
+    : sourcePinError ? { status: 1, stdout: '', stderr: sourcePinError }
+      : runGitWithRetry(sourcePin.args, runner);
+  if (sourcePinError) rawStderr = Buffer.from(`${sourcePinError}\n`);
+  else if (ownership.blocked && ownership.notice) rawStderr = Buffer.from(`${ownership.notice}\n`);
   else if (ownership.notice) stderrChunks.push(Buffer.from(`${ownership.notice}\n`));
 
   if (rawStdout.length) process.stdout.write(rawStdout);
@@ -570,7 +656,7 @@ export function runGitCli(args: string[]): void {
   if (endsWithoutLf(rawStderr)) stderrChunks.push(Buffer.from('\n'));
 
   const initialExitCode = result.status ?? 1;
-  const pushVerification = subcommand === 'push' && initialExitCode !== 0
+  const pushVerification = subcommand === 'push' && initialExitCode !== 0 && !ownership.blocked && !sourcePinError
     ? verifyPushAfterFailure(pushTarget, args)
     : undefined;
   const exitCode = pushVerification?.primaryOutcome === 'CONFIRMED_APPLIED' ? 0 : initialExitCode;

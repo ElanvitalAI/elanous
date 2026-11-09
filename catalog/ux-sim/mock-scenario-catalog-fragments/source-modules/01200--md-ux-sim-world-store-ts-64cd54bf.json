@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-WORLD-STORE-TS",
+  "path": "src/ux-sim/world-store.ts",
+  "boundary": "Creates private test-root worlds with one catalog-derived metadata file per MD source module; verifies the complete assembly and ownership before listing or deleting.",
+  "deviceIds": [
+    "sim-universe-world-lifecycle"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

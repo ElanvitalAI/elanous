@@ -3,7 +3,7 @@ import {
   createMcpProxyRuntime,
   createMcpToolAuthorizer,
 } from '../mcp/proxy-runtime.js';
-import type { McpServerSpec } from '../user-config.js';
+import type { McpServerSpec } from '../user-config/types.js';
 import { registerAllDefaultToolRuntimes } from './index.js';
 import {
   bootstrapMcpProxyRuntimes,

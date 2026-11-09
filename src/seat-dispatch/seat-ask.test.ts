@@ -10,7 +10,7 @@ import { DiscordBot } from '../discord.js';
 import { handleDiscordSeatWork, type DiscordSeatWorkDeps } from '../intake-plane/discord-seat-work.js';
 import { handleSeatRequests } from '../nexus/api/seat-requests.js';
 import { resolveDashboardChatMainSubmitIntent } from '../dashboard/input/chat-main-submit-route.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { acknowledgeSeatAnswers, answerSeatAsk, askSeat, askSeatAs, deliverSeatAnswers, getTuiSeatAskClientId, listSeatAskRoundTrips, parseSeatAsk, type AskOrigin, type SeatAskDeps } from './seat-ask.js';
 import { tuiSourceText } from '../../test/helpers/dashboard-source.js';
 

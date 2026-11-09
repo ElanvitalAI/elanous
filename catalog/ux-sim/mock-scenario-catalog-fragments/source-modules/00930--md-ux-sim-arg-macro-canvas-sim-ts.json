@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-ARG-MACRO-CANVAS-SIM-TS",
+  "path": "src/ux-sim/arg-macro-canvas-sim.ts",
+  "boundary": "Runs release ARG and macrophage repair proposals through production policy decisions, graph append planning, and simulated HITL/no-op routing without executing external commands.",
+  "deviceIds": [
+    "release-graph-rig"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

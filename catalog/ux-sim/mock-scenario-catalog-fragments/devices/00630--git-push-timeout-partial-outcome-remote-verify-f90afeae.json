@@ -1,0 +1,31 @@
+{
+  "id": "git-push-timeout-partial-outcome-remote-verify",
+  "name": "Git push timeout remote verification",
+  "implementation": [
+    "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+    "src/git-fs/git-cli.ts"
+  ],
+  "tests": [
+    "src/git-fs/git-cli.test.ts"
+  ],
+  "target": "Production git CLI push after a transport timeout, verified against one stable push URL, unchanged ordinary loose branch ref identity/content, and unchanged reflog.",
+  "inputs": [
+    "one explicit full branch refspec",
+    "remote accepts the ref update before the client reports timeout",
+    "ordinary source ref moves or moves away-and-back are refused",
+    "symbolic source refs and symbolic transitions during push are refused"
+  ],
+  "observations": [
+    "ls-remote target ref and pre-push commit",
+    "CLI status line and PARTIAL_OUTCOME receipt",
+    "source ref file identity/content and reflog remain stable"
+  ],
+  "entryCommands": [
+    "bun test src/git-fs/git-cli.test.ts -t \"confirms a timed-out push\""
+  ],
+  "logsRecorded": "no",
+  "eventNames": [
+    "git.cli/partial-outcome"
+  ],
+  "recentUse": null
+}

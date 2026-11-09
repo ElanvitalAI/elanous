@@ -1,13 +1,16 @@
 import { afterEach, expect, setDefaultTimeout, spyOn, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Command } from 'commander';
+import { registerMsgCommands } from '../cli/msg-cli.js';
 import { debug } from '../debug/log.js';
 import { MsgStore } from '../msg/msg-store.js';
+import { SEAT_MESSAGE_ROUTES, messageRouteFor } from './msg-address.js';
 import { spawn } from 'node:child_process';
 import type { HerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { createFakeHerdr, type FakeHerdrStatus } from '../ux-sim/fake-herdr.js';
-import { claimWake, MAX_REDELIVER_ATTEMPTS, PENDING_WAKE_TTL_MS, redeliverLine, redeliverPendingWakes, resolveWake, startPendingWakePoller, wakeLine, wakeRecipient, WAKE_DEBOUNCE_MS, type WakeDeps } from './msg-wake.js';
+import { claimWake, MAX_REDELIVER_ATTEMPTS, PENDING_WAKE_TTL_MS, redeliverLine, redeliverPendingWakes, registerSeatPaneAddress, resolveWake, startPendingWakePoller, wakeLine, wakeRecipient, WAKE_DEBOUNCE_MS, type WakeDeps } from './msg-wake.js';
 
 // Real Bun subprocesses can exceed Bun's 5 s default under gate-pod load.
 setDefaultTimeout(60_000);
@@ -15,9 +18,23 @@ setDefaultTimeout(60_000);
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
+async function runMessageCli(dbPath: string, hookStateDir: string, args: string[]): Promise<string[]> {
+  const output: string[] = [];
+  const program = new Command();
+  program.exitOverride();
+  registerMsgCommands(program, {
+    openStore: () => new MsgStore(dbPath),
+    openReadStore: () => new MsgStore(dbPath, { readOnly: true }),
+    hookStateDir,
+    out: { log: line => { output.push(String(line)); }, error: line => { throw new Error(line); } },
+  });
+  await program.parseAsync(['node', 'test', 'msg', ...args]);
+  return output;
+}
+
 // herdr 깨움은 `eln herdr prompt` 의 생산 함수(herdrPrompt)를 탄다 — 장치 = fake-herdr(`agent get` · `pane run`).
 // ⛔ 실 herdr 를 부르지 않는다: 모든 fixture 가 herdrRun 을 주입한다(wrap 은 그 위에 지연·부작용만 얹는다).
-function fixture(over: Partial<WakeDeps> = {}, opts: { wrap?: (run: HerdrCliRunner) => HerdrCliRunner; agent?: string } = {}) {
+function fixture(over: Partial<WakeDeps> = {}, opts: { wrap?: (run: HerdrCliRunner) => HerdrCliRunner; agent?: string; paneId?: string; status?: FakeHerdrStatus } = {}) {
   const stateRoot = mkdtempSync(join(tmpdir(), 'msg-wake-'));
   dirs.push(stateRoot);
   const injected: Array<[string, string]> = [];
@@ -25,42 +42,155 @@ function fixture(over: Partial<WakeDeps> = {}, opts: { wrap?: (run: HerdrCliRunn
   const warned: string[] = [];
   let now = 1_000_000;
   let turn: 'busy' | 'idle' | undefined = 'idle';
+  const paneId = opts.paneId ?? 'wJ:p1';
+  const configuredPtys = over.listPtys ?? (() => [{ id: 'tui:1', nickname: 'opt', alive: true, ...(turn ? { turnState: turn } : {}) }]);
+  const configuredReadPane = Object.hasOwn(over, 'readPane') ? over.readPane ?? ((path: string) => { try { return readFileSync(path, 'utf8').trim() || null; } catch { return null; } }) : ((path: string) => path.endsWith(join('MK', 'herdr.pane')) ? paneId : null);
+  const configuredOptIn = Object.hasOwn(over, 'hasOptIn') ? over.hasOptIn ?? (path => { try { return lstatSync(path).isFile(); } catch { return false; } }) : (() => true);
   const fake = createFakeHerdr({
-    panes: [{ paneId: 'wJ:p1', agent: opts.agent ?? 'elanous', status: 'idle' }, { paneId: 'wJ:p9', agent: opts.agent ?? 'elanous', status: 'idle' }],
+    panes: [{ paneId, agent: opts.agent ?? 'elanous', status: opts.status ?? 'idle' }, { paneId: 'wJ:p9', agent: opts.agent ?? 'elanous', status: 'idle' }],
     onRun: submission => { herdr.push([submission.paneId, submission.text]); },
   });
   const deps: WakeDeps = {
     stateRoot, seatStateRoot: join(stateRoot, 'seats'), live: true, now: () => now,
-    listPtys: () => [{ id: 'tui:1', nickname: 'opt', alive: true, ...(turn ? { turnState: turn } : {}) }],
-    readPane: path => path.endsWith(join('MK', 'herdr.pane')) ? 'wJ:p1' : null,
+    listPtys: configuredPtys,
+    readPane: configuredReadPane,
     // Focused tests opt every seat in; the human-pane guard has its own tests below.
-    hasOptIn: () => true,
+    hasOptIn: configuredOptIn,
     ptyInjector: async () => async (id, line) => { injected.push([id, line]); },
     herdrRun: opts.wrap ? opts.wrap(fake.run) : fake.run,
     warn: line => warned.push(line),
+    readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: Object.keys(SEAT_MESSAGE_ROUTES).map(address => {
+      const route = SEAT_MESSAGE_ROUTES[address as keyof typeof SEAT_MESSAGE_ROUTES]!;
+      const seatDir = join(over.seatStateRoot ?? join(stateRoot, 'seats'), address);
+      const pane = configuredReadPane(join(seatDir, 'herdr.pane'));
+      const ptys = configuredPtys();
+      const named = ptys.filter(row => row.alive && (row.nickname ?? '').toLowerCase() === address.toLowerCase());
+      const ref = configuredReadPane(join(seatDir, 'pty.ref'))?.toLowerCase();
+      const byRef = ref ? ptys.filter(row => row.alive && (row.id.toLowerCase() === ref || (row.nickname ?? '').toLowerCase() === ref)) : [];
+      const target = pane ?? (named.length === 1 ? named[0]!.id : byRef.length === 1 ? byRef[0]!.id : undefined);
+      const wake = pane ? 'herdr' as const : !pane && (named.length === 1 || byRef.length === 1) ? 'pty-inject' as const : 'none' as const;
+      return { address, host: 'local', ...(target ? { target } : {}), wake, replyBody: route.replyBody ?? 'agent', optIn: configuredOptIn(join(seatDir, 'wake-inject')) };
+    }) } }),
     ...over,
   };
   return { deps, injected, herdr, warned, fake,
     advance: (ms: number) => { now += ms; },
     setTurn: (value: typeof turn) => { turn = value; },
-    setPane: (value: FakeHerdrStatus) => { fake.setStatus('wJ:p1', value); } };
+    setPane: (value: FakeHerdrStatus) => { fake.setStatus(paneId, value); } };
 }
 
 test('resolves loop rows from the table, seats by exact pty name, then herdr pane, else unknown none', () => {
   const f = fixture();
   expect(resolveWake('COORDINATOR', f.deps)).toEqual({ wake: 'cron', source: 'loop-table' });
   expect(resolveWake('GUARDIAN', f.deps)).toEqual({ wake: 'none', source: 'loop-table' });
-  expect(resolveWake('OPT', f.deps)).toEqual({ wake: 'pty-inject', target: 'tui:1', source: 'pty-name', optIn: true });
+  expect(resolveWake('OPT', f.deps)).toEqual({ wake: 'pty-inject', target: 'tui:1', source: 'seat-registry', host: 'local', optIn: true });
   // `op` is a substring of `opt` — never wake the neighbouring seat.
-  expect(resolveWake('OP', f.deps)).toMatchObject({ wake: 'none', source: 'unresolved' });
-  expect(resolveWake('MK', f.deps)).toEqual({ wake: 'herdr', target: 'wJ:p1', source: 'herdr.pane', optIn: true });
+  expect(resolveWake('OP', f.deps)).toMatchObject({ wake: 'none', source: 'seat-registry', reason: 'registry-wake-disabled' });
+  expect(resolveWake('MK', f.deps)).toEqual({ wake: 'herdr', target: 'wJ:p1', source: 'seat-registry', host: 'local', optIn: true });
   // seat-inbox.sh's pty.ref wins over herdr when it names a live row exactly; a dead ref falls through.
   const withRef = fixture({ readPane: path => path.endsWith(join('TC', 'pty.ref')) ? 'TUI:1' : path.endsWith(join('UX', 'pty.ref')) ? 'tui:404' : null });
-  expect(resolveWake('TC', withRef.deps)).toEqual({ wake: 'pty-inject', target: 'tui:1', source: 'pty.ref', optIn: true });
-  expect(resolveWake('UX', withRef.deps)).toMatchObject({ wake: 'none', source: 'unresolved' });
+  expect(resolveWake('TC', withRef.deps)).toEqual({ wake: 'pty-inject', target: 'tui:1', source: 'seat-registry', host: 'local', optIn: true });
+  expect(resolveWake('UX', withRef.deps)).toMatchObject({ wake: 'none', source: 'seat-registry', reason: 'registry-wake-disabled' });
   // An address outside the table is never resolved on the host, even with a same-named pty.
   const stray = fixture({ listPtys: () => [{ id: 'tui:9', nickname: 'wakeprobe', alive: true, turnState: 'idle' }] });
   expect(resolveWake('WAKEPROBE', stray.deps)).toEqual({ wake: 'none', source: 'unresolved', reason: 'undeclared-address' });
+});
+
+test('explicit herdr registration is not shadowed by a same-named PTY', () => {
+  const f = fixture({
+    readPane: path => path.endsWith(join('OPT', 'herdr.pane')) ? 'wJ:p42' : null,
+    listPtys: () => [{ id: 'tui:1', nickname: 'opt', alive: true, turnState: 'idle' }],
+  });
+  expect(resolveWake('OPT', f.deps)).toEqual({ wake: 'herdr', target: 'wJ:p42', source: 'seat-registry', host: 'local', optIn: true });
+});
+
+test('unknown migration host cannot be used as an active registration', () => {
+  const f = fixture({ readRegistry: undefined });
+  expect(() => registerSeatPaneAddress({ address: 'MK', paneId: 'wJ:p2', host: 'unknown', enableWake: true }, f.deps)).toThrow('invalid host');
+});
+
+test('replacing a registered pane revokes old wake consent unless fresh --wake is explicit', () => {
+  const seats = mkdtempSync(join(tmpdir(), 'msg-wake-replace-'));
+  dirs.push(seats);
+  const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined, listPtys: () => [], readRegistry: undefined });
+  expect(registerSeatPaneAddress({ address: 'MK', paneId: 'wJ:p1', host: 'local', enableWake: true }, f.deps).wakeEnabled).toBe(true);
+  const replaced = registerSeatPaneAddress({ address: 'MK', paneId: 'wJ:p2', host: 'local', replace: true }, f.deps);
+  expect(replaced.wakeEnabled).toBe(false);
+  expect(resolveWake('MK', f.deps)).toMatchObject({ wake: 'herdr', target: 'wJ:p2', optIn: false });
+  const reconsented = registerSeatPaneAddress({ address: 'MK', paneId: 'wJ:p3', host: 'local', replace: true, enableWake: true }, f.deps);
+  expect(reconsented.wakeEnabled).toBe(true);
+  expect(resolveWake('MK', f.deps)).toMatchObject({ wake: 'herdr', target: 'wJ:p3', optIn: true });
+});
+
+test('all registered addresses reach a pane consumer for ten messages per Codex, Claude, and remote route', async () => {
+  const registered = Object.keys(SEAT_MESSAGE_ROUTES);
+  expect(registered).toContain('NT-1');
+  expect(registered).toContain('NT-3');
+  expect(registered).toContain('LEDGER');
+  for (const address of registered) expect(messageRouteFor(address)?.wakeFrom).toBe('host');
+
+  const runtimes = [
+    { name: 'Codex' as const, agent: 'codex', status: 'idle' as const },
+    { name: 'Claude' as const, agent: 'claude', status: 'idle' as const },
+    // The pane is remote by workspace, while Herdr still identifies its runtime as supported.
+    { name: 'remote' as const, agent: 'claude', status: 'idle' as const },
+  ];
+  for (const address of registered) for (const runtime of runtimes) {
+    const paneId = 'wJ:' + address.toLowerCase() + '-' + runtime.name.toLowerCase();
+    const f = fixture({
+      listPtys: () => [],
+      readPane: path => path.endsWith(join(address, 'herdr.pane')) ? paneId : null,
+    }, { agent: runtime.agent, paneId, status: runtime.status });
+    const dbPath = join(f.deps.stateRoot!, 'messages.db');
+    const hookStateDir = join(f.deps.stateRoot!, 'hook-state');
+    const store = new MsgStore(dbPath);
+    const completed: number[] = [];
+    // This simulated pane consumer invokes the production message hook after successful submission.
+    // A rejected pane run does neither the hook read nor acknowledgement.
+    f.deps.herdrRun = async (argv, timeoutMs) => {
+      const result = await f.fake.run(argv, timeoutMs);
+      if (result.code === 0 && argv[0] === 'pane' && argv[1] === 'run') {
+        const sender = address === 'OP' ? 'MK' : 'OP';
+        const hookOutput = await runMessageCli(dbPath, hookStateDir, [
+          'hook', '--event', 'user-prompt-submit', '--format', runtime.name === 'Codex' ? 'codex' : 'claude', '--seat', address,
+        ]);
+        const hookContext = JSON.parse(hookOutput[0]!) as { hookSpecificOutput?: { additionalContext?: string } };
+        const deliveredIds = [...(hookContext.hookSpecificOutput?.additionalContext ?? '').matchAll(new RegExp(`#(\\d+) ${sender}→`, 'g'))].map(match => match[1]!);
+        for (const id of deliveredIds) await runMessageCli(dbPath, hookStateDir, ['ack', '--id', id, '--to', address]);
+      }
+      return result;
+    };
+    try {
+      for (let index = 0; index < 10; index++) {
+        const sender = address === 'OP' ? 'MK' : 'OP';
+        const message = store.post({ from: sender, to: address, body: runtime.name + ' task ' + (index + 1) });
+        const wake = await wakeRecipient(address, message.id, { from: sender }, f.deps);
+        expect(wake.result).toBe('injected');
+        expect(store.unreadCount(address)).toBe(0);
+        completed.push(message.id);
+        f.advance(WAKE_DEBOUNCE_MS);
+      }
+      expect(completed).toHaveLength(10);
+      expect(store.unreadCount(address)).toBe(0);
+      expect(f.herdr).toHaveLength(10);
+      expect(f.herdr.every(([pane]) => pane === paneId)).toBe(true);
+    } finally { store.close(); }
+  }
+});
+
+test('a rejected production pane submission does not run the message hook or acknowledge unread mail', async () => {
+  const f = fixture();
+  const store = new MsgStore(join(f.deps.stateRoot!, 'messages.db'));
+  try {
+    const message = store.post({ from: 'OP', to: 'MK', body: 'leave unread when the pane rejects submission' });
+    f.deps.herdrRun = async (argv, timeoutMs) => {
+      if (argv[0] === 'pane' && argv[1] === 'run') return { code: 1, stdout: '', stderr: 'submission rejected' };
+      return f.fake.run(argv, timeoutMs);
+    };
+    expect((await wakeRecipient('MK', message.id, { from: 'OP' }, f.deps)).result).toBe('failed');
+    expect(store.unreadCount('MK')).toBe(1);
+    expect(f.herdr).toEqual([]);
+  } finally { store.close(); }
 });
 
 test('post wakes an idle pty once, logs msg.wake, and debounces the address for five minutes', async () => {
@@ -72,7 +202,7 @@ test('post wakes an idle pty once, logs msg.wake, and debounces the address for 
     expect(f.injected).toEqual([['tui:1', wakeLine('OP', 'OPT', 7)]]);
     expect(f.injected[0]![1]).toBe('[우편 깨움] OP → OPT #7 — eln msg list --to OPT 로 읽고 처리');
     expect(log.mock.calls.filter(call => call[0] === 'msg.wake')).toEqual([
-      ['msg.wake', 'pty-inject', { address: 'OPT', msgId: 7, wake: 'pty-inject', result: 'injected', reason: 'pty-name', target: 'tui:1' }],
+      ['msg.wake', 'pty-inject', { address: 'OPT', msgId: 7, wake: 'pty-inject', result: 'injected', reason: 'seat-registry', host: 'local', target: 'tui:1' }],
     ]);
     expect((await wakeRecipient('OPT', 8, { from: 'OP' }, f.deps)).result).toBe('debounced');
     f.advance(WAKE_DEBOUNCE_MS);
@@ -96,18 +226,21 @@ test('busy or unrecorded turn and non-idle herdr panes inject nothing', async ()
   expect(f.herdr).toEqual([['wJ:p1', wakeLine('OP', 'MK', 4)]]);
 });
 
-test('herdr wake goes through the eln herdr prompt producer: agent get ⊕ pane run, blocked waits, built-in agents too', async () => {
+test('herdr wake uses pane-list idle status before pane run, blocked waits, built-in agents too', async () => {
   const f = fixture();
   expect((await wakeRecipient('MK', 1, { from: 'OP' }, f.deps)).result).toBe('injected');
-  // 같은 생산 함수(herdrPrompt) — 상태는 `agent get`, 제출은 bracketed `pane run` 한 번(pane get · send-text 아님).
-  expect(f.fake.calls()).toEqual([['agent', 'get', 'wJ:p1'], ['pane', 'run', 'wJ:p1', wakeLine('OP', 'MK', 1)]]);
+  // Herdr structure is checked immediately before the bracketed `pane run`.
+  expect(f.fake.calls()).toEqual([
+    ['pane', 'list', '--workspace', 'wJ'], ['pane', 'list', '--workspace', 'wJ'],
+    ['pane', 'run', 'wJ:p1', wakeLine('OP', 'MK', 1)],
+  ]);
   f.advance(WAKE_DEBOUNCE_MS);
   f.setPane('blocked');
   expect(await wakeRecipient('MK', 2, { from: 'OP' }, f.deps)).toMatchObject({ wake: 'herdr', result: 'busy', reason: 'agent_status=blocked' });
   f.setPane('done');
-  // done = 턴이 끝나 정착한 상태(herdr agent prompt 도 받는다) — 넣는다.
-  expect((await wakeRecipient('MK', 3, { from: 'OP' }, f.deps)).result).toBe('injected');
-  expect(f.herdr.map(([, line]) => line)).toEqual([wakeLine('OP', 'MK', 1), wakeLine('OP', 'MK', 3)]);
+  // Only idle is eligible; done is not treated as an empty input state.
+  expect(await wakeRecipient('MK', 3, { from: 'OP' }, f.deps)).toMatchObject({ result: 'busy', reason: 'agent_status=done' });
+  expect(f.herdr.map(([, line]) => line)).toEqual([wakeLine('OP', 'MK', 1)]);
   // 자리 폴더가 대상을 정했으니 라벨은 묻지 않는다 — claude/codex pane 도 예전처럼 깨운다(not_elanous 로 막지 않음).
   const claude = fixture({}, { agent: 'claude' });
   expect((await wakeRecipient('MK', 4, { from: 'OP' }, claude.deps)).result).toBe('injected');
@@ -124,7 +257,7 @@ test('herdr wake logs loops.msg-wake herdr-prompt; a herdr error is failed and g
     expect(lines[0]).toMatchObject({ seat: 'MK', msgId: 1, target: 'wJ:p1', result: 'injected', accepted: true, reason: 'submitted', status: 'idle', agent: 'elanous' });
     expect(typeof lines[0]!.ms).toBe('number');
     const gone = fixture({ readPane: path => path.endsWith(join('MK', 'herdr.pane')) ? 'wZ:p404' : null });
-    expect(await wakeRecipient('MK', 2, { from: 'OP' }, gone.deps)).toMatchObject({ result: 'failed', reason: 'agent_not_found' });
+    expect(await wakeRecipient('MK', 2, { from: 'OP' }, gone.deps)).toMatchObject({ result: 'busy', reason: 'agent_status=unknown' });
     expect(gone.herdr).toEqual([]);
     // 아무것도 안 들어갔으니 창을 돌려준다 — pane 을 고치면 다음 글이 바로 깨운다.
     const fixed = fixture({ stateRoot: gone.deps.stateRoot });
@@ -144,8 +277,8 @@ test('replies and self-addressed notes never wake; cron defers; the test univers
 
 test('an unresolved seat is none plus «모름», a known none says so, and failures or hangs only return a result', async () => {
   const f = fixture();
-  expect(await wakeRecipient('UX', 1, { from: 'OP' }, f.deps)).toMatchObject({ wake: 'none', source: 'unresolved', result: 'no-wake' });
-  expect(f.warned.at(-1)).toContain('모름');
+  expect(await wakeRecipient('UX', 1, { from: 'OP' }, f.deps)).toMatchObject({ wake: 'none', source: 'seat-registry', reason: 'registry-wake-disabled', result: 'no-wake' });
+  expect(f.warned.at(-1)).not.toContain('모름');
   expect((await wakeRecipient('GUARDIAN', 2, { from: 'OP' }, f.deps)).result).toBe('no-wake');
   expect(f.warned.at(-1)).not.toContain('모름');
   const failing = fixture({ ptyInjector: async () => async () => { throw new Error('denied'); } });
@@ -172,11 +305,12 @@ test('concurrent posts to one address inject once — the claim is atomic, not r
 test('a timeout stops a late injection and gives the window back even when the status query never settles', async () => {
   let release: () => void = () => {};
   const slow = fixture({ timeoutMs: 10 }, { wrap: run => async (argv, ms) => {
-    if (argv[1] === 'get') await new Promise<void>(resolve => { release = resolve; });
+    if (argv[0] === 'pane' && argv[1] === 'list') await new Promise<void>(resolve => { release = resolve; });
     return run(argv, ms);
   } });
   expect((await wakeRecipient('MK', 1, { from: 'OP' }, slow.deps)).result).toBe('timeout');
-  const hung = fixture({ stateRoot: slow.deps.stateRoot, timeoutMs: 10 }, { wrap: run => (argv, ms) => argv[1] === 'get' ? new Promise(() => {}) : run(argv, ms) });
+  // Source: #35385 hung pane lookup uses a short timeout to verify wake window recovery.
+  const hung = fixture({ stateRoot: slow.deps.stateRoot, timeoutMs: 10 }, { wrap: run => (argv, ms) => argv[0] === 'pane' && argv[1] === 'list' ? new Promise(() => {}) : run(argv, ms) });
   expect((await wakeRecipient('MK', 2, { from: 'OP' }, hung.deps)).result).toBe('timeout');
   // The window was returned at the timeout itself — the hung query is never awaited for it.
   const fast = fixture({ stateRoot: slow.deps.stateRoot });
@@ -210,8 +344,12 @@ test('a seat name that moves to another pty while the module loads gets no injec
 test('a herdr pane that changes during the status query gets no injection into the old pane', async () => {
   let pane = 'wJ:p1';
   const f = fixture({ readPane: path => path.endsWith(join('MK', 'herdr.pane')) ? pane : null },
-    { wrap: run => (argv, ms) => { if (argv[1] === 'get') pane = 'wJ:p9'; return run(argv, ms); } });
-  expect(await wakeRecipient('MK', 1, { from: 'OP' }, f.deps)).toMatchObject({ result: 'busy', reason: 'target-moved:wJ:p9' });
+    { wrap: run => async (argv, ms) => {
+      const result = await run(argv, ms);
+      if (argv[0] === 'pane' && argv[1] === 'list') pane = 'wJ:p9';
+      return result;
+    } });
+  expect(await wakeRecipient('MK', 1, { from: 'OP' }, f.deps)).toMatchObject({ result: 'busy', reason: 'target-moved:local' });
   expect(f.herdr).toEqual([]);
   expect(resolveWake('ALL', f.deps)).toEqual({ wake: 'none', source: 'unresolved', reason: 'topic' });
 });
@@ -271,8 +409,8 @@ test('a human pane without the wake-inject opt-in gets no injection, only msg.wa
     }
     const skipped = log.mock.calls.filter(call => call[0] === 'msg.wake' && call[1] === 'skipped');
     expect(skipped.map(call => call[2])).toEqual([
-      { address: 'OPT', msgId: 1, wake: 'pty-inject', result: 'skipped', reason: 'human-pane-no-opt-in', target: 'tui:1' },
-      { address: 'MK', msgId: 1, wake: 'herdr', result: 'skipped', reason: 'human-pane-no-opt-in', target: 'wJ:p1' },
+      { address: 'OPT', msgId: 1, wake: 'pty-inject', result: 'skipped', reason: 'human-pane-no-opt-in', host: 'local', target: 'tui:1' },
+      { address: 'MK', msgId: 1, wake: 'herdr', result: 'skipped', reason: 'human-pane-no-opt-in', host: 'local', target: 'wJ:p1' },
     ]);
   } finally { log.mockRestore(); }
 });
@@ -291,25 +429,43 @@ test('the opt-in is the seat-folder wake-inject file: present injects once, abse
   expect(on.herdr).toEqual([['wJ:p1', wakeLine('UX', 'MK', 2)]]);
 });
 
+test('the opt-in is checked after final pane-list status, immediately before Herdr input', async () => {
+  const seats = mkdtempSync(join(tmpdir(), 'msg-wake-optin-final-'));
+  dirs.push(seats);
+  mkdirSync(join(seats, 'MK'), { recursive: true });
+  writeFileSync(join(seats, 'MK', 'herdr.pane'), 'wJ:p1\n');
+  writeFileSync(join(seats, 'MK', 'wake-inject'), '');
+  let lists = 0;
+  const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined }, { agent: 'claude', wrap: run => async (argv, ms) => {
+    const result = await run(argv, ms);
+    if (argv[0] === 'pane' && argv[1] === 'list' && ++lists === 2) rmSync(join(seats, 'MK', 'wake-inject'));
+    return result;
+  } });
+  expect(await wakeRecipient('MK', 3, { from: 'UX' }, f.deps)).toMatchObject({ result: 'skipped', reason: 'human-pane-no-opt-in', optIn: false });
+  expect(f.herdr).toEqual([]);
+});
+
 test('a real wake-inject file deleted while waiting means no injection and a skipped log, even if the target moved', async () => {
   const seats = mkdtempSync(join(tmpdir(), 'msg-wake-seats-del-'));
   dirs.push(seats);
   mkdirSync(join(seats, 'MK'), { recursive: true });
   writeFileSync(join(seats, 'MK', 'herdr.pane'), 'wJ:p1\n');
   writeFileSync(join(seats, 'MK', 'wake-inject'), '');
+  let lists = 0;
   const log = spyOn(debug, 'log');
   try {
-    const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined }, { wrap: run => (argv, ms) => {
-      if (argv[1] === 'get') {
+    const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined }, { wrap: run => async (argv, ms) => {
+      const result = await run(argv, ms);
+      if (argv[0] === 'pane' && argv[1] === 'list' && ++lists === 1) {
         rmSync(join(seats, 'MK', 'wake-inject'));
         writeFileSync(join(seats, 'MK', 'herdr.pane'), 'wJ:p9\n');
       }
-      return run(argv, ms);
+      return result;
     } });
     expect(await wakeRecipient('MK', 1, { from: 'UX' }, f.deps)).toMatchObject({ result: 'skipped', reason: 'human-pane-no-opt-in', optIn: false });
     expect(f.herdr).toEqual([]);
     expect(log.mock.calls.filter(call => call[0] === 'msg.wake' && call[1] === 'skipped').map(call => call[2]))
-      .toEqual([{ address: 'MK', msgId: 1, wake: 'herdr', result: 'skipped', reason: 'human-pane-no-opt-in', target: 'wJ:p1' }]);
+      .toEqual([{ address: 'MK', msgId: 1, wake: 'herdr', result: 'skipped', reason: 'human-pane-no-opt-in', host: 'local', target: 'wJ:p1' }]);
   } finally { log.mockRestore(); }
   // The pty path re-checks the same way after its module load.
   mkdirSync(join(seats, 'OPT'), { recursive: true });
@@ -347,7 +503,7 @@ test('pty targets follow the same wake-inject file: named pty and pty.ref inject
     writeFileSync(join(seats, address, 'wake-inject'), '');
     const on = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined,
       listPtys: () => [{ id: 'tui:1', nickname: address === 'OPT' ? 'opt' : 'other', alive: true, turnState: 'idle' }] });
-    expect(await wakeRecipient(address, 2, { from: 'UX' }, on.deps)).toMatchObject({ result: 'injected', source: address === 'OPT' ? 'pty-name' : 'pty.ref' });
+    expect(await wakeRecipient(address, 2, { from: 'UX' }, on.deps)).toMatchObject({ result: 'injected', source: 'seat-registry' });
     expect(on.injected).toHaveLength(1);
   }
 });
@@ -380,12 +536,14 @@ test('opt-in and target removed together while waiting still reads as skipped, n
   writeFileSync(join(seats, 'MK', 'wake-inject'), '');
   const log = spyOn(debug, 'log');
   try {
-    const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined }, { wrap: run => (argv, ms) => {
-      if (argv[1] === 'get') {
+    let lists = 0;
+    const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined }, { wrap: run => async (argv, ms) => {
+      const result = await run(argv, ms);
+      if (argv[0] === 'pane' && argv[1] === 'list' && ++lists === 1) {
         rmSync(join(seats, 'MK', 'wake-inject'));
         rmSync(join(seats, 'MK', 'herdr.pane'));
       }
-      return run(argv, ms);
+      return result;
     } });
     expect(await wakeRecipient('MK', 1, { from: 'UX' }, f.deps)).toMatchObject({ result: 'skipped', reason: 'human-pane-no-opt-in', optIn: false });
     expect(f.herdr).toEqual([]);
@@ -634,25 +792,14 @@ test('without an injected reader the re-knock reads the real msg ledger beside t
   } finally { store.close(); }
 });
 
-// 10-22 운영: cct 아래 Claude 자리(OPC wK:p5) 로 가는 깨움 18건이 `agent get` 의 agent_not_found 로 failed —
-// 같은 순간 `pane get` 에는 agent_status 가 있었고, #30261 전(pane get → pane run)에는 깨웠다. 그 꼴로 떨어진다.
-test('herdr agent get agent_not_found → pane get agent_status 로 떨어져 idle 이면 주입한다(paneFallback)', async () => {
-  const notFound = (argv: readonly string[]) => argv[0] === 'agent' && argv[1] === 'get';
-  const paneGet = (argv: readonly string[]) => argv[0] === 'pane' && argv[1] === 'get';
-  let status = 'idle';
-  const f = fixture({}, { wrap: run => async (argv, timeoutMs) => {
-    if (notFound(argv)) return { code: 1, stdout: '', stderr: `${JSON.stringify({ error: { code: 'agent_not_found', message: `agent target ${argv[2]} not found` }, id: 'cli:agent:get' })}\n` };
-    if (paneGet(argv)) return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: argv[2], agent: 'claude', agent_status: status } } }), stderr: '' };
-    return run(argv, timeoutMs);
-  } });
+test('message wake relies on pane-list supported-agent idle status', async () => {
+  const f = fixture({}, { agent: 'claude' });
   const ok = await wakeRecipient('MK', 41, { from: 'OP' }, f.deps);
   expect(ok.result).toBe('injected');
   expect(f.herdr).toHaveLength(1);
-  expect(f.herdr[0]![0]).toBe('wJ:p1');
-  // 바쁘면(working) 넣지 않는다 — 예전 pane get 경로와 같은 관문.
-  status = 'working';
-  f.advance(10 * 60_000);
+  f.advance(WAKE_DEBOUNCE_MS);
+  f.setPane('working');
   const busy = await wakeRecipient('MK', 42, { from: 'OP' }, f.deps);
-  expect(busy.result).toBe('busy');
+  expect(busy).toMatchObject({ result: 'busy', reason: 'agent_status=working' });
   expect(f.herdr).toHaveLength(1);
 });

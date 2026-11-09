@@ -1,0 +1,28 @@
+{
+  "id": "install-consent",
+  "name": "Release installer consent simulation",
+  "implementation": [
+    "scripts/lib/install-test-tier.ts",
+    "src/ux-sim/install-consent-device.ts"
+  ],
+  "tests": [
+    "src/ux-sim/install-consent-device.test.ts"
+  ],
+  "target": "Release install consent refusal and production release verify installer arguments",
+  "inputs": [
+    "isolated HOME and prefix",
+    "fake command runner",
+    "release verify inputs"
+  ],
+  "observations": [
+    "refusal creates no install prefix",
+    "e2e and release verify pass installer consent flags"
+  ],
+  "entryCommands": [
+    "bun scripts/ux-sim.ts install-consent",
+    "bun test src/ux-sim/install-consent-device.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

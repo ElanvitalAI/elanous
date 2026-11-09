@@ -9,6 +9,15 @@ export type PrLandRefusal = 'draft' | 'head-branch' | 'not-ancestor' | 'review-m
 export type PrLandTypecheckDrift = 'drift' | 'drift-unmeasured' | 'drift-unrelated';
 export type PrLandRefusalContext = { isDraft?: boolean; typecheckDrift?: PrLandTypecheckDrift };
 
+/** Live repair is allowed only for a measured drift verdict and a bounded launch plan. */
+export function mayLaunchPrLandDriftRepair(input: {
+  mode: 'off' | 'shadow' | 'live';
+  verdict: PrLandTypecheckDrift;
+  action: 'launch' | 'escalate' | 'skip';
+}): boolean {
+  return input.mode === 'live' && input.verdict === 'drift' && input.action === 'launch';
+}
+
 export function classifyPrLandRefusal(message: string, context: PrLandRefusalContext = {}): PrLandRefusal {
   if (context.isDraft === true && message.startsWith('✗ expected-head: PR OPEN non-draft')) return 'draft';
   if (message.startsWith('✗ branch: PR head branch와 현재 브랜치가 다릅니다.')) return 'head-branch';

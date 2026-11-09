@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/fake-temp-cleanup.test.ts",
+  "reason": "TMP-DIR-LEAK: normal and exceptional suite teardown scenarios exercise the tracked temp-root cleanup helper."
+}

@@ -58,7 +58,7 @@ export function extractLanguage(node: ReactNode): string | null {
   }
   const props = (node as { props?: { className?: string; children?: ReactNode } }).props;
   if (props?.className && typeof props.className === 'string') {
-    const m = /language-([\w+-]+)/.exec(props.className);
+    const m = props.className.match(/language-([\w+-]+)/);
     if (m) return m[1] ?? null;
   }
   if (props?.children) return extractLanguage(props.children);

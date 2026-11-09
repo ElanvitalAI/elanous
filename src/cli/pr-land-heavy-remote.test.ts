@@ -64,20 +64,22 @@ test('typecheck drift evidence does not cross a remote head or host identity mis
 
 test('remote git receipt contract requires matching pinned identity and result SHAs', () => {
   const request: PrLandRemoteGitRequest = {
-    schema: 1, pr: 123, repository: 'ElanvitalAI/elanous', headRef: 'refs/heads/feature/topic',
+    schema: 2, pr: 123, repository: 'ElanvitalAI/elanous',
+    baseRepository: 'ElanvitalAI/elanous', headRef: 'refs/heads/feature/topic',
     head: HEAD, main: MAIN, phase: 'rebase', host: 'node-b',
   };
   const receipt = { ...request, ok: true, resultHead: HEAD, mergeSha: MAIN };
   expect(validatePrLandRemoteGitReceipt(request, receipt)).toEqual({ ok: true, resultHead: HEAD, mergeSha: MAIN, remoteHeadVerification: 'pending-push' });
   expect(validatePrLandRemoteGitReceipt(request, { ...receipt, pr: 124 })).toEqual({ ok: false, reason: 'receipt-identity-mismatch' });
   expect(validatePrLandRemoteGitReceipt(request, { ...receipt, host: 'untrusted' })).toEqual({ ok: false, reason: 'receipt-identity-mismatch' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, baseRepository: 'other/repo' })).toEqual({ ok: false, reason: 'receipt-identity-mismatch' });
   expect(validatePrLandRemoteGitReceipt({ ...request, host: 'untrusted' as PrLandRemoteGitRequest['host'] }, receipt))
     .toEqual({ ok: false, reason: 'invalid-request-identity' });
-  expect(validatePrLandRemoteGitReceipt({ ...request, schema: 2 as 1 }, receipt))
+  expect(validatePrLandRemoteGitReceipt({ ...request, schema: 3 as 2 }, receipt))
     .toEqual({ ok: false, reason: 'invalid-request-identity' });
   expect(validatePrLandRemoteGitReceipt({ ...request, phase: 'clone' as PrLandRemoteGitRequest['phase'] }, receipt))
     .toEqual({ ok: false, reason: 'invalid-request-identity' });
-  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, schema: 2 })).toEqual({ ok: false, reason: 'receipt-identity-mismatch' });
+  expect(validatePrLandRemoteGitReceipt(request, { ...receipt, schema: 1 })).toEqual({ ok: false, reason: 'receipt-identity-mismatch' });
   expect(validatePrLandRemoteGitReceipt(request, { ...receipt, phase: 'clone' })).toEqual({ ok: false, reason: 'receipt-identity-mismatch' });
   expect(validatePrLandRemoteGitReceipt({ ...request, repository: 'bad repo' }, receipt))
     .toEqual({ ok: false, reason: 'invalid-request-identity' });

@@ -7,6 +7,12 @@ import { DEFAULT_CONTROL_PORT, ensureControlTokens } from '../control-plane/serv
 import { issueMemberToken, machineForToken } from '../control-plane/member-tokens.js';
 import { simCli } from '../ux-sim/in-process-cli.js';
 import { withSimClock } from '../ux-sim/fake-clock.js';
+import { debug } from '../debug/log.js';
+import { startControlServer } from '../control-plane/server.js';
+import { writePrimaryJoin } from '../control-plane/primary.js';
+import { readRoleLeaseAsync } from '../roles/role-lease-read.js';
+import { readHqLease } from '../hq/hq.js';
+import { fileLeaseStore } from '../hq/lease.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -350,6 +356,364 @@ test('real CLI --follow-lease reports its bucket and keeps serving when GCS cann
   } finally { reader.releaseLock(); child.kill('SIGTERM'); await child.exited; }
 }, 45_000);
 
+test('control serve defaults to configured role lease: present, absent, unsupported expiry metadata and read failure', async () => {
+  const dir = root();
+  const previousRoot = process.env.ELANOUS_STATE_DIR;
+  const previousBucket = process.env.ELANOUS_BACKUP_BUCKET;
+  process.env.ELANOUS_STATE_DIR = dir;
+  process.env.ELANOUS_BACKUP_BUCKET = 'gs://example-bucket';
+  const lines: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation(line => { lines.push(String(line)); });
+  const warnings: string[] = [];
+  const warn = spyOn(console, 'error').mockImplementation(line => { warnings.push(String(line)); });
+  const events = spyOn(debug, 'log').mockImplementation(() => {});
+  const cases = [
+    { name: 'present', read: () => ({ kind: 'present' as const, doc: { holder: 'mbp', generation: 7, state: 'held' as const, renewedAt: 123 } }), known: true, status: 200 },
+    { name: 'absent', read: () => ({ kind: 'absent' as const }), known: false, status: 409 },
+    { name: 'unsupported-expiry-metadata', read: (bucket: string) => {
+      const replies = [
+        { code: 0, stdout: '5', said: '' },
+        { code: 0, stdout: JSON.stringify({ holder: 'mbp', generation: 7, state: 'held', renewedAt: 123, expiresAt: 124 }), said: '' },
+        { code: 0, stdout: '5', said: '' },
+      ];
+      return readRoleLeaseAsync(bucket, { run: async () => replies.shift()! });
+    }, known: false, status: 409 },
+    { name: 'read failure', read: (): never => { throw new Error('permission denied'); }, known: false, status: 409 },
+  ];
+  try {
+    for (const scenario of cases) {
+      const controller = new AbortController();
+      const active = runControlServe({ port: '0', machine: 'mbp', read: scenario.read, signal: controller.signal });
+      try {
+        const line = lines.shift()!;
+        expect(line, scenario.name).toContain('임대 따름 · gs://example-bucket');
+        const port = line.match(/관제부 127\.0\.0\.1:(\d+)/)![1]!;
+        const primary = await fetch(`http://127.0.0.1:${port}/v1/primary`);
+        expect((await primary.json() as { known: boolean }).known, scenario.name).toBe(scenario.known);
+        const registered = await fetch(`http://127.0.0.1:${port}/v1/resources/register`, {
+          method: 'POST', headers: { authorization: `Bearer ${ensureControlTokens(dir).member}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ id: scenario.name, kind: 'instance', machine: 'mbp', name: scenario.name, attrs: {}, ttlMs: 30_000 }),
+        });
+        expect(registered.status, scenario.name).toBe(scenario.status);
+      } finally { controller.abort(); await active; }
+    }
+    expect(warnings).toEqual(['관제부 primary 임대 미측정: client-side expiration is not supported', '관제부 primary 임대 미측정: permission denied']);
+    expect(events).toHaveBeenCalledWith('control.primary', 'lease-observed', {
+      source: 'gcs', bucket: 'gs://example-bucket', url: null, machine: 'mbp', kind: 'unmeasured', holder: null, generation: null, reason: 'permission denied',
+    });
+  } finally {
+    events.mockRestore();
+    warn.mockRestore();
+    log.mockRestore();
+    if (previousRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousRoot;
+    if (previousBucket === undefined) delete process.env.ELANOUS_BACKUP_BUCKET;
+    else process.env.ELANOUS_BACKUP_BUCKET = previousBucket;
+  }
+}, 15_000);
+
+test('control serve stops writes when the GCS lease object expires at the storage boundary', async () => {
+  const dir = root();
+  const previousRoot = process.env.ELANOUS_STATE_DIR;
+  const previousBucket = process.env.ELANOUS_BACKUP_BUCKET;
+  process.env.ELANOUS_STATE_DIR = dir;
+  process.env.ELANOUS_BACKUP_BUCKET = 'gs://example-bucket';
+  const lines: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation(line => { lines.push(String(line)); });
+  try {
+    await withSimClock(Date.now(), async clock => {
+      const expiresAt = clock.now() + 1_000;
+      const commands: string[][] = [];
+      const read = (bucket: string) => readRoleLeaseAsync(bucket, { run: async args => {
+        commands.push(args);
+        if (clock.now() >= expiresAt) return { code: 1, stdout: '', said: 'The following URLs matched no objects or files' };
+        if (args[1] === 'cat') return { code: 0, stdout: JSON.stringify({ holder: 'mbp', generation: 7,
+          state: 'held', renewedAt: clock.now() }), said: '' };
+        return { code: 0, stdout: '5', said: '' };
+      } });
+      const controller = new AbortController();
+      const active = runControlServe({ port: '0', machine: 'mbp', read, signal: controller.signal });
+      try {
+        const port = lines.shift()!.match(/관제부 127\.0\.0\.1:(\d+)/)![1]!;
+        const register = () => fetch(`http://127.0.0.1:${port}/v1/resources/register`, {
+          method: 'POST', headers: { authorization: `Bearer ${ensureControlTokens(dir).member}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ id: 'gcs-expiry', kind: 'instance', machine: 'mbp', name: 'gcs-expiry', attrs: {}, ttlMs: 30_000 }),
+        });
+        expect((await register()).status).toBe(200);
+        const before = commands.length;
+        clock.tick(1_001);
+        const warm = await fetch(`http://127.0.0.1:${port}/v1/workers/pod`, {
+          method: 'POST', headers: { authorization: `Bearer ${issueMemberToken('mbp', dir)}`, 'content-type': 'application/json' },
+          body: JSON.stringify({ workerId: 'warm-mbp-expired-standard-1', machine: 'mbp', podUid: 'pod-expired',
+            key: { context: 'mbp', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' }, ttlMs: 30_000 }),
+        });
+        expect(warm.status).toBe(409);
+        clock.tick(10_050);
+        expect((await register()).status).toBe(409);
+        expect(commands.slice(before)).toEqual(Array.from({ length: 2 }, () => ['storage', 'objects', 'describe',
+          'gs://example-bucket/lease/control-primary.json', '--format=value(generation)']));
+      } finally { controller.abort(); await active; }
+    });
+  } finally {
+    log.mockRestore();
+    if (previousRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousRoot;
+    if (previousBucket === undefined) delete process.env.ELANOUS_BACKUP_BUCKET;
+    else process.env.ELANOUS_BACKUP_BUCKET = previousBucket;
+  }
+}, 15_000);
+
+test('control-serve-lease-default-sim: remote HQ primary permits only its holder and fails closed on loss or denied token', async () => {
+  const hqRoot = root();
+  const workerRoot = root();
+  const previousRoot = process.env.ELANOUS_STATE_DIR;
+  const previousBucket = process.env.ELANOUS_BACKUP_BUCKET;
+  process.env.ELANOUS_STATE_DIR = workerRoot;
+  delete process.env.ELANOUS_BACKUP_BUCKET;
+  let holder: string | null = 'mbp';
+  let known = true;
+  const hq = startControlServer({ root: hqRoot, port: 0, leaseView: { async get() {
+    return { holder, generation: known ? 4 : null, iAmHolder: holder === 'mbp', known };
+  } } });
+  const tokenFile = join(workerRoot, 'hq-member-token');
+  const token = issueMemberToken('aws1', hqRoot);
+  writeFileSync(tokenFile, `${token}\n`, { mode: 0o600 });
+  const lines: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation(line => { lines.push(String(line)); });
+  const warnings: string[] = [];
+  const warn = spyOn(console, 'error').mockImplementation(line => { warnings.push(String(line)); });
+  const controller = new AbortController();
+  const active = runControlServe({ port: '0', machine: 'aws1', followRemotePrimary: hq.url,
+    primaryTokenFile: tokenFile, signal: controller.signal });
+  try {
+    const line = lines.shift()!;
+    expect(line).toContain('원격 primary 따름');
+    const port = line.match(/관제부 127\.0\.0\.1:(\d+)/)![1]!;
+    const register = () => fetch(`http://127.0.0.1:${port}/v1/resources/register`, {
+      method: 'POST', headers: { authorization: `Bearer ${ensureControlTokens(workerRoot).member}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'remote', kind: 'instance', machine: 'aws1', name: 'remote', attrs: {}, ttlMs: 30_000 }),
+    });
+    expect((await register()).status).toBe(200);
+    const warm = await fetch(`http://127.0.0.1:${port}/v1/workers/pod`, {
+      method: 'POST', headers: { authorization: `Bearer ${issueMemberToken('aws1', workerRoot)}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ workerId: 'warm-aws1-standard-instance-1', machine: 'aws1', podUid: 'pod-1',
+        key: { context: 'aws1', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' }, ttlMs: 30_000 }),
+    });
+    expect(warm.status).toBe(200);
+    const followerToken = issueMemberToken('observer', workerRoot);
+    const advertised = await fetch(`http://127.0.0.1:${port}/v1/primary/authorized`, {
+      headers: { authorization: `Bearer ${followerToken}` },
+    });
+    expect(await advertised.json()).toMatchObject({ holder: 'mbp', known: true, serving: false });
+    writeFileSync(tokenFile, `${'f'.repeat(64)}\n`, { mode: 0o600 });
+    expect((await register()).status).toBe(409); // no 10-second stale authority window
+    writeFileSync(tokenFile, `${token}\n`, { mode: 0o600 });
+    await withSimClock(Date.now(), async clock => {
+      holder = 'other';
+      clock.tick(10_050);
+      expect((await register()).status).toBe(409);
+      expect(await (await fetch(`http://127.0.0.1:${port}/v1/primary`)).json()).toEqual({ holder: null, generation: null, known: false });
+      holder = null; known = false;
+      clock.tick(10_050);
+      expect((await register()).status).toBe(409);
+      expect(await (await fetch(`http://127.0.0.1:${port}/v1/primary`)).json()).toEqual({ holder: null, generation: null, known: false });
+      holder = 'mbp'; known = true;
+      writeFileSync(tokenFile, `${'f'.repeat(64)}\n`, { mode: 0o600 });
+      clock.tick(10_050);
+      expect((await register()).status).toBe(409);
+      writeFileSync(tokenFile, `${token}\n`, { mode: 0o600 });
+      hq.stop();
+      clock.tick(10_050);
+      expect((await register()).status).toBe(409);
+    });
+    expect(warnings).toContain('관제부 primary 임대 미측정: HQ primary unknown or expired');
+    expect(warnings).toContain('관제부 primary 임대 미측정: HQ control is not the primary holder');
+    expect(warnings).toContain('관제부 primary 임대 미측정: HQ primary HTTP 401');
+  } finally {
+    controller.abort(); await active; hq.stop(); log.mockRestore(); warn.mockRestore();
+    if (previousRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousRoot;
+    if (previousBucket === undefined) delete process.env.ELANOUS_BACKUP_BUCKET;
+    else process.env.ELANOUS_BACKUP_BUCKET = previousBucket;
+  }
+}, 15_000);
+
+test('cloud join private member credential automatically wires control serve to remote HQ primary', async () => {
+  const hqRoot = root();
+  const workerRoot = root();
+  const previousRoot = process.env.ELANOUS_STATE_DIR;
+  const previousBucket = process.env.ELANOUS_BACKUP_BUCKET;
+  process.env.ELANOUS_STATE_DIR = workerRoot;
+  delete process.env.ELANOUS_BACKUP_BUCKET;
+  const hq = startControlServer({ root: hqRoot, port: 0, leaseView: { async get() {
+    return { holder: 'mbp', generation: 3, iAmHolder: true, known: true };
+  } } });
+  writePrimaryJoin({ url: hq.url, tokens: { member: issueMemberToken('aws1', hqRoot) } }, workerRoot);
+  const lines: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation(line => { lines.push(String(line)); });
+  const controller = new AbortController();
+  const active = runControlServe({ port: '0', machine: 'aws1', signal: controller.signal });
+  try {
+    const line = lines.shift()!;
+    expect(line).toContain('원격 primary 따름');
+    const port = line.match(/관제부 127\.0\.0\.1:(\d+)/)![1]!;
+    expect(await (await fetch(`http://127.0.0.1:${port}/v1/primary`)).json()).toEqual({ holder: 'mbp', generation: 3, known: true });
+    const registered = await fetch(`http://127.0.0.1:${port}/v1/resources/register`, {
+      method: 'POST', headers: { authorization: `Bearer ${ensureControlTokens(workerRoot).member}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'joined', kind: 'instance', machine: 'aws1', name: 'joined', attrs: {}, ttlMs: 30_000 }),
+    });
+    expect(registered.status).toBe(200);
+    expect((await fetch(`${hq.url}/v1/primary/authorized`)).status).toBe(401);
+  } finally {
+    controller.abort(); await active; hq.stop(); log.mockRestore();
+    if (previousRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousRoot;
+    if (previousBucket === undefined) delete process.env.ELANOUS_BACKUP_BUCKET;
+    else process.env.ELANOUS_BACKUP_BUCKET = previousBucket;
+  }
+}, 15_000);
+
+test('control serve follows the advertised HQ holder across a move and fences when all advertisements fail', async () => {
+  const dir = root();
+  const previousRoot = process.env.ELANOUS_STATE_DIR;
+  const previousBucket = process.env.ELANOUS_BACKUP_BUCKET;
+  process.env.ELANOUS_STATE_DIR = dir;
+  delete process.env.ELANOUS_BACKUP_BUCKET;
+  const candidates = [
+    { machine: 'mbp', url: 'https://mbp.example:8413', token: 'a'.repeat(64) },
+    { machine: 'node-b', url: 'https://node-b.example:8413', token: 'b'.repeat(64) },
+  ];
+  const candidatesFile = join(dir, 'primary-candidates.json');
+  writeFileSync(candidatesFile, JSON.stringify(candidates), { mode: 0o600 });
+  let holder = 'mbp';
+  let generation = 7;
+  let oldOffline = false;
+  let newOffline = false;
+  const fetchPrimary: typeof fetch = async (input, init) => {
+    const machine = String(input).includes('node-b') ? 'node-b' : 'mbp';
+    expect((init?.headers as Record<string, string>).authorization).toBe(`Bearer ${machine === 'mbp' ? candidates[0]!.token : candidates[1]!.token}`);
+    if (machine === 'mbp' && oldOffline || machine === 'node-b' && newOffline) throw new Error('offline');
+    return Response.json({ holder, generation, known: true, serving: holder === machine });
+  };
+  const logs: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation(line => { logs.push(String(line)); });
+  const controller = new AbortController();
+  const active = runControlServe({ port: '0', machine: 'aws1', primaryCandidatesFile: candidatesFile, fetchPrimary, signal: controller.signal });
+  try {
+    for (let i = 0; !logs.length && i < 100; i++) await Bun.sleep(10);
+    const port = /관제부 127\.0\.0\.1:(\d+)/.exec(logs[0] ?? '')?.[1];
+    expect(port).toBeDefined();
+    const register = () => fetch(`http://127.0.0.1:${port}/v1/resources/register`, {
+      method: 'POST', headers: { authorization: `Bearer ${ensureControlTokens(dir).member}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'moving', kind: 'instance', machine: 'aws1', name: 'moving', attrs: {}, ttlMs: 30_000 }),
+    });
+    expect((await register()).status).toBe(200);
+    holder = 'node-b'; generation = 8;
+    expect((await register()).status).toBe(200);
+    oldOffline = true;
+    expect((await register()).status).toBe(200);
+    oldOffline = false; newOffline = true; holder = 'mbp'; generation = 7;
+    expect((await register()).status).toBe(409);
+    expect(JSON.parse(readFileSync(join(dir, 'control', 'primary-generation.json'), 'utf8'))).toBe(8);
+    oldOffline = true;
+    expect((await register()).status).toBe(409);
+  } finally {
+    controller.abort(); await active; log.mockRestore();
+    if (previousRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousRoot;
+    if (previousBucket === undefined) delete process.env.ELANOUS_BACKUP_BUCKET;
+    else process.env.ELANOUS_BACKUP_BUCKET = previousBucket;
+  }
+}, 15_000);
+
+test('concurrent registration cannot accept an older HQ generation after the newer one is recorded', async () => {
+  const dir = root();
+  const previousRoot = process.env.ELANOUS_STATE_DIR;
+  const previousBucket = process.env.ELANOUS_BACKUP_BUCKET;
+  process.env.ELANOUS_STATE_DIR = dir;
+  delete process.env.ELANOUS_BACKUP_BUCKET;
+  const file = join(dir, 'candidates.json');
+  writeFileSync(file, JSON.stringify([
+    { machine: 'mbp', url: 'https://mbp.example:8413', token: 'a'.repeat(64) },
+    { machine: 'node-b', url: 'https://node-b.example:8413', token: 'b'.repeat(64) },
+  ]), { mode: 0o600 });
+  const delayed: Array<(response: Response) => void> = [];
+  let calls = 0;
+  const fetchPrimary: typeof fetch = async input => {
+    const index = calls++;
+    if (index < 2) return new Promise<Response>(resolve => { delayed.push(resolve); });
+    return Response.json({ holder: 'node-b', generation: 8, known: true, serving: String(input).includes('node-b') });
+  };
+  const logs: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation(line => { logs.push(String(line)); });
+  const controller = new AbortController();
+  const active = runControlServe({ port: '0', machine: 'aws1', primaryCandidatesFile: file, fetchPrimary, signal: controller.signal });
+  try {
+    for (let i = 0; !logs.length && i < 100; i++) await Bun.sleep(10);
+    const port = /관제부 127\.0\.0\.1:(\d+)/.exec(logs[0] ?? '')?.[1];
+    expect(port).toBeDefined();
+    const register = (id: string) => fetch(`http://127.0.0.1:${port}/v1/resources/register`, {
+      method: 'POST', headers: { authorization: `Bearer ${ensureControlTokens(dir).member}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ id, kind: 'instance', machine: 'aws1', name: id, attrs: {}, ttlMs: 30_000 }),
+    });
+    const old = register('old');
+    for (let i = 0; delayed.length < 2 && i < 100; i++) await Bun.sleep(1);
+    expect(delayed).toHaveLength(2);
+    expect((await register('new')).status).toBe(200);
+    delayed[0]!(Response.json({ holder: 'mbp', generation: 7, known: true, serving: true }));
+    delayed[1]!(Response.json({ holder: 'mbp', generation: 7, known: true, serving: false }));
+    expect((await old).status).toBe(409);
+  } finally {
+    controller.abort(); await active; log.mockRestore();
+    if (previousRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousRoot;
+    if (previousBucket === undefined) delete process.env.ELANOUS_BACKUP_BUCKET;
+    else process.env.ELANOUS_BACKUP_BUCKET = previousBucket;
+  }
+}, 15_000);
+
+test('explicit remote primary cannot reuse a joined token for a different URL', async () => {
+  const dir = root();
+  const previousRoot = process.env.ELANOUS_STATE_DIR;
+  const previousBucket = process.env.ELANOUS_BACKUP_BUCKET;
+  const previousExitCode = process.exitCode;
+  process.env.ELANOUS_STATE_DIR = dir;
+  delete process.env.ELANOUS_BACKUP_BUCKET;
+  writePrimaryJoin({ url: 'https://hq.example', tokens: { member: 'a'.repeat(64) } }, dir);
+  const errors: string[] = [];
+  const error = spyOn(console, 'error').mockImplementation(line => { errors.push(String(line)); });
+  try {
+    await runControlServe({ port: '0', machine: 'aws1', followRemotePrimary: 'https://different.example' });
+    expect(process.exitCode).toBe(2);
+    expect(errors).toContain('원격 primary member 토큰 파일이 필요함 (--primary-token-file)');
+    expect(errors.join('\n')).not.toContain('a'.repeat(64));
+    await runControlServe({ port: '0', machine: 'aws1', followRemotePrimary: 'http://100.64.1.2:61235' });
+    expect(errors).toContain('원격 primary URL은 HTTPS여야 함 (로컬 루프백 제외)');
+  } finally {
+    error.mockRestore(); process.exitCode = previousExitCode ?? 0;
+    if (previousRoot === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousRoot;
+    if (previousBucket === undefined) delete process.env.ELANOUS_BACKUP_BUCKET;
+    else process.env.ELANOUS_BACKUP_BUCKET = previousBucket;
+  }
+});
+
+test('real CLI --no-follow-lease explicitly disables a configured bucket', async () => {
+  const dir = root();
+  const previousBucket = process.env.ELANOUS_BACKUP_BUCKET;
+  process.env.ELANOUS_BACKUP_BUCKET = 'gs://example-bucket';
+  const child = launch(dir, 'control', 'serve', '--port', '0', '--no-follow-lease');
+  const reader = child.stdout.getReader();
+  try {
+    const line = await readStartupLine(reader, 'no-follow-lease startup timeout');
+    expect(line).not.toContain('임대 따름');
+  } finally {
+    reader.releaseLock(); child.kill('SIGTERM'); await child.exited;
+    if (previousBucket === undefined) delete process.env.ELANOUS_BACKUP_BUCKET;
+    else process.env.ELANOUS_BACKUP_BUCKET = previousBucket;
+  }
+}, 45_000);
+
 test('control serve follows the lease only when opted in', async () => {
   const dir = root();
   const previous = process.env.ELANOUS_STATE_DIR;
@@ -455,6 +819,48 @@ test('control serve HQ lease unreadable rejects warm worker registration', async
   await withHqControl(() => { throw new Error('unreadable'); }, async (port, dir) => {
     const response = await registerWarm(port, dir);
     expect(response.status).toBe(409);
+  });
+});
+
+test('control serve reads an actually expired HQ lease file and rejects warm worker registration', async () => {
+  const leaseRoot = root();
+  const leasePath = join(leaseRoot, 'hq-lease.json');
+  writeFileSync(leasePath, JSON.stringify({ holder: 'mbp', generation: 4, acquiredAt: 90, renewedAt: 100, ttlSeconds: 60 }));
+  let now = 150;
+  const read = () => readHqLease({ store: fileLeaseStore(leasePath, () => now),
+    hostPath: join(leaseRoot, 'host'), config: { hostName: 'mbp' } });
+  expect(read()).toMatchObject({ record: { holder: 'mbp', generation: 4 }, expired: false });
+  await withHqControl(read, async (port, dir) => {
+    const token = issueMemberToken('aws1', dir);
+    const primary = () => fetch(`http://127.0.0.1:${port}/v1/primary/authorized`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(await (await primary()).json()).toMatchObject({ known: true, serving: true });
+    now = 161; // Transition before the normal 10-second cache refresh.
+    expect(read()).toMatchObject({ expired: true });
+    expect(await (await primary()).json()).toMatchObject({ known: false, serving: false });
+    expect((await registerWarm(port, dir)).status).toBe(409);
+    const workerRoot = root();
+    const previousRoot = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = workerRoot;
+    const tokenFile = join(workerRoot, 'hq-token');
+    writeFileSync(tokenFile, `${issueMemberToken('aws1', dir)}\n`, { mode: 0o600 });
+    const lines: string[] = [];
+    const log = spyOn(console, 'log').mockImplementation(line => { lines.push(String(line)); });
+    const controller = new AbortController();
+    const active = runControlServe({ port: '0', machine: 'aws1', followRemotePrimary: `http://127.0.0.1:${port}`,
+      primaryTokenFile: tokenFile, signal: controller.signal });
+    try {
+      const workerPort = lines.shift()!.match(/관제부 127\.0\.0\.1:(\d+)/)![1]!;
+      const response = await fetch(`http://127.0.0.1:${workerPort}/v1/resources/register`, {
+        method: 'POST', headers: { authorization: `Bearer ${ensureControlTokens(workerRoot).member}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ id: 'expired-hq', kind: 'instance', machine: 'aws1', name: 'expired-hq', attrs: {}, ttlMs: 30_000 }),
+      });
+      expect(response.status).toBe(409);
+    } finally {
+      controller.abort(); await active; log.mockRestore();
+      process.env.ELANOUS_STATE_DIR = previousRoot;
+    }
   });
 });
 

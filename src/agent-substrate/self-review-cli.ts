@@ -30,7 +30,8 @@ import { buildManualReviewIntent, intentFromPr, prIntentSectionCoverage, reviewI
 import { buildReviewScopeContractContext } from '../cli/review-carry.js';
 import { NO_VERDICT_LINE_REASON, budgetReviewerContext, isNoneSentinelFinding, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
 import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js';
-import { getUserConfig, type LLMProviderName, type ReviewerMixSpec, type RoleLlmSpec, type SubscriptionReviewerSpec } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { LLMProviderName, ReviewerMixSpec, RoleLlmSpec, SubscriptionReviewerSpec } from '../user-config/types.js';
 import { loadLlmPolicy } from '../policy/llm-policy.js';
 import { listRunLedgers, lookupPrGoalAcceptance, lookupRunLedger, type PrGoalAcceptanceLookup, type RunLedgerEntry, type RunLedgerLookup } from '../self-implement/run-ledger.js';
 

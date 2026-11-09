@@ -1,6 +1,6 @@
 import { decisionListSince } from './decision-list-since.js';
 
-export type LightCliRoute = 'msg' | 'decisions' | 'release' | 'release-set' | 'release-landed' | 'tasks' | 'tasks-read' | 'tasks-advance' | 'pr-land' | 'pty' | 'logs' | 'config';
+export type LightCliRoute = 'msg' | 'decisions' | 'release' | 'release-set' | 'release-landed' | 'tasks' | 'tasks-read' | 'tasks-advance' | 'pr-land' | 'pty' | 'logs' | 'config' | 'q';
 
 const VALUE_FLAGS = new Set(['--config-dir', '--test-state-dir']);
 const HOT_ROOTS = new Set(['msg', 'decisions', 'pty', 'logs', 'tasks']);
@@ -73,6 +73,9 @@ export function selectLightCliRoute(args: readonly string[]): LightCliRoute | un
     if (token.startsWith('-')) break;
     command.push(token);
   }
+
+  if ((command[0] === 'q' || command[0] === 'shell-init')
+    && args.slice(index + 1).every(token => !token.startsWith('-') || ['--', '--raw', '-h', '--help'].includes(token))) return 'q';
 
   // These operational roots are the hot router. Keep all root flags and
   // every leading-option form on the full entry so its isolation/bootstrap

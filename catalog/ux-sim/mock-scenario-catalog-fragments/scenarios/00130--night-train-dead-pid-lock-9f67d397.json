@@ -1,0 +1,21 @@
+{
+  "id": "NIGHT-TRAIN-DEAD-PID-LOCK",
+  "name": "Night train recovers readiness from an injected dead-pid lock",
+  "kind": "world-event-injection",
+  "device": "world-runtime",
+  "implementation": [
+    "src/ux-sim/world.ts",
+    "scripts/sim-world-runner.ts",
+    "scenarios/ux-sim/night-train-dead-pid-lock.yaml"
+  ],
+  "tests": [
+    "src/ux-sim/world.test.ts"
+  ],
+  "trigger": "Create the night-train world and inject a dead-pid run.lock fixture before the real releaseReadiness function reads it.",
+  "observe": [
+    "live and dead owner readiness verdicts",
+    "world-scoped fixture path",
+    "network guard events"
+  ],
+  "expected": "A live owner blocks readiness while the dead owner does not, the scenario expectation passes, and OS policy denies all network access."
+}

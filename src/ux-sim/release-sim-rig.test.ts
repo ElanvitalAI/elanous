@@ -1,11 +1,14 @@
+import { releasePwaNodeEnvironment } from '../../scripts/release-loop/pwa-scenarios-node.js';
+import { resolveCdpAttachTimeoutMs } from '../browser-cdp/client.js';
 import { expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { gateShardLedgerBatchComplete, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
-import { runReleaseSimGateReceiptSeam, runReleaseSimRigIfFile, runReleaseSimRigScenario } from './release-sim-rig.js';
+import { runReleaseSimGateReceiptSeam, runReleaseSimRigIfFile, runReleaseSimRigScenario, runReleaseSimRigScenarioWithExecutor } from './release-sim-rig.js';
 import { resolveScenarioFilePath } from './scenario.js';
 import { runAutoApprove } from '../../scripts/release-loop/auto-approve-node.js';
 import { writeGateVerdictRecord } from '../../scripts/release-loop/gate-node.js';
@@ -166,7 +169,20 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(result.universe).toBe(root);
     expect(result.artifactPath).toBe(join(root, 'ux-sim', 'evidence', 'release-sim-rig-0241.json'));
     expect(existsSync(result.artifactPath)).toBe(true);
-    expect(result.cases).toHaveLength(26);
+    expect(result.cases.some((item) => item.id === 'pwa-cdp-attach-timeout')).toBe(true);
+    expect(result.cases.some((item) => item.id === 'fanout-branch-resume-refused')).toBe(true);
+    expect(result.cases.find((item) => item.id === 'non-owner-production-launches-refused-before-release-graph')).toMatchObject({
+      pass: true, status: 'failed', path: [], dispatchedNodes: [],
+      injectedEvidence: { universe: 'production', incidentRunIds: ['a8cdf30b', '28b034de', '443a89b8'], launchCount: 0 },
+    });
+    const seatGuard = result.cases.find((item) => item.id === 'non-owner-production-launches-refused-before-release-graph')!;
+    const cliResults = seatGuard.injectedEvidence.cliResults as Array<{
+      exitCode: number | null; output: Record<string, unknown>; seat: string; incidentRunId: string;
+    }>;
+    expect(cliResults.map(({ incidentRunId }) => incidentRunId)).toEqual(['a8cdf30b', '28b034de', '443a89b8']);
+    expect(cliResults.every(({ seat }) => seat === 'POD-REUSE-2')).toBe(true);
+    expect(cliResults.every((attempt) => attempt.exitCode === 1 && attempt.output.reason === 'seat-launch-refused'
+      && typeof attempt.output.error === 'string' && attempt.output.error.includes('--test'))).toBe(true);
     expect(result.cases.every((item) => item.pass && item.unexpectedEdges.length === 0)).toBe(true);
     expect(result.cases.find((item) => item.id === 'baseline-full-graph')).toMatchObject({
       checks: { events: true }, injectedEvidence: { eventTrace: { pass: true, matched: 2, missing: [] } },
@@ -264,6 +280,11 @@ test('release simulation runs the real release graph with injected node outcomes
     expect(appendEvidence.appendA).toMatchObject({ aggregate: 'complete', plan: { rerunShardIds: ['pod-0'] }, receiptIds: expect.arrayContaining(['pod-1', 'pod-80']) });
     expect(appendEvidence.appendB.plan.carriedShardIds).toHaveLength(80);
     expect(appendEvidence.appendB).toMatchObject({ aggregate: 'complete', plan: { rerunShardIds: ['pod-1'] }, receiptIds: expect.arrayContaining(['pod-0', 'pod-80']) });
+    const casEvidence = appendReceiptCase.injectedEvidence as { fileCasReplayOk: boolean; fileCasRuns: Array<{ nodeId: string; sourceRunId: string }> };
+    expect(casEvidence.fileCasReplayOk).toBe(true);
+    expect(casEvidence.fileCasRuns.map(({ nodeId, sourceRunId }) => [nodeId, sourceRunId])).toEqual([
+      ['gate-cut', 'c159bb8d'], ['gate-a', '1475eed8'], ['gate-b', 'c159bb8d'],
+    ]);
     expect(result.cases.find((item) => item.id === 'cut-tip-moved-after-resume')).toMatchObject({
       status: 'resume-refused', dispatchedNodes: ['version-release'], checks: { mustVisit: true, mustNotVisit: true },
     });
@@ -333,6 +354,14 @@ test('release simulation runs the real release graph with injected node outcomes
       expect(JSON.stringify(persisted)).toBe(JSON.stringify(simulated.injectedEvidence?.persistedWaiver));
     }
     expect(unmeasuredStatePaths.size).toBe(3);
+    const ownerWaiveDownstreamFailure = result.cases.find((item) => item.id === 'owner-waive-downstream-node-fails')!;
+    expect(ownerWaiveDownstreamFailure).toMatchObject({ pass: true, status: 'failed', checks: { failedJoin: true },
+      path: expect.arrayContaining(['gate', 'pre-prepare-join', 'traffic-failed-restore', 'failed']),
+      injectedEvidence: { ownerRecordOk: true, publishReached: false, releaseTailOk: true } });
+    expect(ownerWaiveDownstreamFailure.fanOuts?.['traffic-gate-passed:ok']?.branches.pwa).toMatchObject({ status: 'failed' });
+    const failedWaiverLedger = JSON.parse(readFileSync(ownerWaiveDownstreamFailure.statePath, 'utf8')) as { nodes: Array<{ nodeId: string; ok?: boolean; waiver?: { ownerWaived?: boolean; approvedBy?: string } }> };
+    expect(failedWaiverLedger.nodes.find((node) => node.nodeId === 'pre-prepare-join')?.ok).toBe(false);
+    expect(failedWaiverLedger.nodes.find((node) => node.nodeId === 'gate')?.waiver).toMatchObject({ ownerWaived: true, approvedBy: 'OP' });
     const fixtureOwnerCase = result.cases.find((item) => item.id === 'owner-waive-0246-verdict-fixture')!;
     expect(fixtureOwnerCase).toMatchObject({ pass: true, status: 'done', injectedEvidence: {
       ownerRecordOk: true, releaseTailOk: true, publishReached: true, actualGateTriage: { classification: 'exhausted' },
@@ -405,9 +434,21 @@ test('release simulation runs the real release graph with injected node outcomes
     const exportFailure = result.cases.find((item) => item.id === 'public-export-leak')!;
     expect(exportFailure.path).not.toContain('prefetch');
     expect(exportFailure.path).toContain('traffic-failed-restore');
+    const fanoutResume = result.cases.find((item) => item.id === 'fanout-branch-resume-refused')!;
+    expect(fanoutResume).toMatchObject({ pass: true, status: 'resume-refused', checks: { status: true, mustVisit: true, completeFanoutRetained: true },
+      injectedEvidence: { branchFailed: true, source: 'traffic-gate-passed', branchFailedAfter: true, sourceRetainedAfter: true, completeFanoutRetained: true } });
+    expect(fanoutResume.injectedEvidence?.refusal).toContain("--from cannot resume fan-out branch 'pwa'");
     const pwaFailure = result.cases.find((item) => item.id === 'pwa-node-times-out')!;
     expect(pwaFailure.fanOuts?.['traffic-gate-passed:ok']?.branches.pwa).toMatchObject({ status: 'failed' });
     expect(pwaFailure.path).toContain('traffic-failed-restore');
+    const cdpTimeout = result.cases.find((item) => item.id === 'pwa-cdp-attach-timeout')!;
+    const pwaEnv = releasePwaNodeEnvironment({ PATH: '/bin' });
+    expect(pwaEnv).toMatchObject({ ELANOUS_CDP_ATTACH_TIMEOUT_MS: '30000' });
+    expect(resolveCdpAttachTimeoutMs(undefined, pwaEnv)).toBe(30_000);
+    expect(cdpTimeout).toMatchObject({ pass: true, status: 'failed' });
+    expect(cdpTimeout.injectedEvidence).toMatchObject({ phase: 'cdp-attach', attachTimeoutMs: 30000, restoreTraffic: true });
+    expect(cdpTimeout.fanOuts?.['traffic-gate-passed:ok']?.branches.pwa).toMatchObject({ status: 'failed' });
+    expect(cdpTimeout.path).toContain('traffic-failed-restore');
     const pwaFailurePreservesSibling = result.cases.find((item) => item.id === 'pwa-failure-preserves-mac-smoke-result')!;
     expect(pwaFailurePreservesSibling).toMatchObject({ pass: true, status: 'failed', checks: { overlap: true, events: true } });
     expect(pwaFailurePreservesSibling.fanOuts?.['traffic-gate-passed:ok']?.branches).toMatchObject({
@@ -418,6 +459,35 @@ test('release simulation runs the real release graph with injected node outcomes
     rmSync(root, { recursive: true, force: true });
   }
 }, 300_000);
+
+test('seat-guard simulation keeps all incident attempts outside the injected graph boundary', () => {
+  const ledgerRoot = mkdtempSync(join(realpathSync(tmpdir()), 'release-seat-guard-boundary-'));
+  try {
+    const childEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '',
+      NODE_ENV: process.env.NODE_ENV ?? 'test', ELANOUS_TRACK: 'POD-REUSE-2' };
+    if (process.env.TMPDIR) childEnv.TMPDIR = process.env.TMPDIR;
+    const child = spawnSync(process.execPath, [join(import.meta.dir, 'release-sim-rig-seat-guard-child.ts'), ledgerRoot], {
+      // 출처: R-TST36 (.rules/30-harness/testing-gates.md); mirrors scripts/release-loop/gate-node-log-sink.test.ts:20.
+      cwd: process.cwd(), encoding: 'utf8', timeout: 60_000,
+      env: childEnv,
+    });
+    expect(child.status).toBe(0);
+    const result = JSON.parse(child.stdout.trim().split('\n').at(-1) ?? '') as {
+      graphStarts: number; results: Array<{ incidentRunId: string; exitCode: number | null; output: Record<string, unknown>;
+        debugEvents: Array<{ category: string; event: string; data: Record<string, unknown> }> }>;
+    };
+    expect(result.graphStarts).toBe(0);
+    expect(result.results.map(({ incidentRunId }) => incidentRunId)).toEqual(['a8cdf30b', '28b034de', '443a89b8']);
+    expect(result.results.every(({ exitCode, output }) => exitCode === 1 && output.ok === false
+      && output.reason === 'seat-launch-refused' && typeof output.error === 'string' && output.error.includes('--test'))).toBe(true);
+    expect(result.results.every(({ debugEvents }) => debugEvents.length === 1 && debugEvents.every(({ category, event, data }) =>
+      category === 'release.run' && event === 'seat-launch-refused' && data.seat === 'POD-REUSE-2'
+      && typeof data.cwd === 'string' && typeof data.reason === 'string' && data.reason.includes('--test')))).toBe(true);
+    expect(existsSync(join(ledgerRoot, 'graph-runs', 'release-loop'))).toBe(false);
+  } finally {
+    rmSync(ledgerRoot, { recursive: true, force: true });
+  }
+});
 
 test('release receipt and waiver modes reject expectations absent from the GraphEventBus trace', async () => {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'release-event-negative-test-'));
@@ -462,4 +532,87 @@ test('release sim preserves a completed gate verdict when a later same-run gate 
     expect(attempts).toContainEqual(interrupted);
     expect(attempts).toHaveLength(2);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('real release graph replays file receipt CAS on the cut and both append gate nodes', async () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'release-file-cas-graph-test-'));
+  const previous = getTestStateRoot();
+  setTestStateRoot(root);
+  try {
+    const scenarioPath = resolveScenarioFilePath('scenarios/ux-sim/release-sim-rig.yaml');
+    const source = readFileSync(scenarioPath, 'utf8');
+    const replay = await runReleaseSimRigScenario(retainCases(source, ['append-receipt-set-absent-and-continuous-radius']));
+    const item = replay.cases.find((row) => row.id === 'append-receipt-set-absent-and-continuous-radius');
+    expect(replay.pass).toBe(true);
+    expect(item?.pass).toBe(true);
+    expect(item?.injectedEvidence).toMatchObject({ fileCasReplayOk: true, fileCasRuns: [
+      { nodeId: 'gate-cut', sourceRunId: 'c159bb8d' },
+      { nodeId: 'gate-a', sourceRunId: '1475eed8' },
+      { nodeId: 'gate-b', sourceRunId: 'c159bb8d' },
+    ] });
+  } finally {
+    setTestStateRoot(previous ?? null);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// 출처: RFC-release-gate-file-receipts § supplemental execution must match the certificate's fixed Pod profile.
+const EXPECTED_GATE_EXECUTOR_CONCURRENCY = 24;
+const MISMATCHED_GATE_EXECUTOR_CONCURRENCY = 23;
+
+test('real release graph blocks receipt reuse when its executor reports 23 workers against a 24-worker certificate', async () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'release-file-cas-concurrency-test-'));
+  const previous = getTestStateRoot();
+  setTestStateRoot(root);
+  try {
+    const source = readFileSync(resolveScenarioFilePath('scenarios/ux-sim/release-sim-rig.yaml'), 'utf8');
+    const replay = await runReleaseSimRigScenarioWithExecutor(retainCases(source, ['append-receipt-set-absent-and-continuous-radius']),
+      { executorConcurrency: MISMATCHED_GATE_EXECUTOR_CONCURRENCY });
+    const item = replay.cases.find((row) => row.id === 'append-receipt-set-absent-and-continuous-radius')!;
+    const evidence = item.injectedEvidence as { fileCasRuns: Array<{ nodeId: string; observation: {
+      appendInvalidation: { supplementalConcurrency: number };
+      supplementalGate: { gateOutcome: string; executedConcurrency: number; publishDecision: string };
+      certificateRefreshBlocked: boolean; refreshedSweepCertificate?: unknown;
+    } }> };
+    const cutGate = evidence.fileCasRuns.find((row) => row.nodeId === 'gate-cut')!;
+    expect(replay.pass).toBe(false);
+    expect(cutGate.observation.appendInvalidation.supplementalConcurrency).toBe(EXPECTED_GATE_EXECUTOR_CONCURRENCY);
+    expect(cutGate.observation.supplementalGate.gateOutcome).toBe('unmeasured');
+    expect(cutGate.observation.supplementalGate.executedConcurrency).toBe(MISMATCHED_GATE_EXECUTOR_CONCURRENCY);
+    expect(cutGate.observation.supplementalGate.publishDecision).toBe('blocked');
+    expect(cutGate.observation.certificateRefreshBlocked).toBe(true);
+    expect(cutGate.observation.refreshedSweepCertificate).toBeUndefined();
+    expect(item.status).toBe('failed');
+    expect(item.path).not.toContain('publish');
+  } finally {
+    setTestStateRoot(previous ?? null);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('real release graph blocks publish when supplemental file work fails', async () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'release-file-cas-supplemental-fail-test-'));
+  const previous = getTestStateRoot();
+  setTestStateRoot(root);
+  try {
+    const source = readFileSync(resolveScenarioFilePath('scenarios/ux-sim/release-sim-rig.yaml'), 'utf8');
+    const replay = await runReleaseSimRigScenarioWithExecutor(retainCases(source, ['append-receipt-set-absent-and-continuous-radius']),
+      { supplementalFailureAt: 'gate-b' });
+    const item = replay.cases.find((row) => row.id === 'append-receipt-set-absent-and-continuous-radius')!;
+    const evidence = item.injectedEvidence as { fileCasRuns: Array<{ nodeId: string; observation: {
+      supplementalGate: { gateOutcome: string; publishDecision: string };
+      certificateRefreshBlocked: boolean; refreshedSweepCertificate?: unknown;
+    } }> };
+    const finalAppendGate = evidence.fileCasRuns.find((row) => row.nodeId === 'gate-b')!;
+    expect(replay.pass).toBe(false);
+    expect(item.status).toBe('failed');
+    expect(item.path).not.toContain('publish');
+    expect(finalAppendGate.observation.supplementalGate.gateOutcome).toBe('fail');
+    expect(finalAppendGate.observation.supplementalGate.publishDecision).toBe('blocked');
+    expect(finalAppendGate.observation.certificateRefreshBlocked).toBe(true);
+    expect(finalAppendGate.observation.refreshedSweepCertificate).toBeUndefined();
+  } finally {
+    setTestStateRoot(previous ?? null);
+    rmSync(root, { recursive: true, force: true });
+  }
 });

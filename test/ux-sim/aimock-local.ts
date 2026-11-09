@@ -1,7 +1,7 @@
 /** OpenAI wire mock for UX tests. The app still runs its real local provider adapter. */
 import { LLMock } from '@copilotkit/aimock';
 import { getProviderForConfig, type LLMProvider } from '../../src/llm.js';
-import type { UserConfig } from '../../src/user-config.js';
+import type { UserConfig } from '../../src/user-config/types.js';
 
 export interface AimockLocalSession {
   mock: LLMock;

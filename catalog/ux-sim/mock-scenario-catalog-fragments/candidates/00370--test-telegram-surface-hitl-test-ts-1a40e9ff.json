@@ -1,0 +1,8 @@
+{
+  "path": "test/telegram-surface-hitl.test.ts",
+  "disposition": "already-indexed",
+  "entryCommand": "bun test test/telegram-surface-hitl.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "The test drives an in-memory fake TelegramBot and asserts captured interactions; it does not write app logs.db.",
+  "deviceId": "support-fakes"
+}

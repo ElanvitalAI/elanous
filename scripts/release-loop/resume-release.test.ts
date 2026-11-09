@@ -1,4 +1,4 @@
-import { afterAll, expect, setDefaultTimeout, test } from 'bun:test';
+import { afterAll, afterEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,7 @@ import { planResumeReleaseRun, recoverLandingPartialOption, recoverReleaseRun, r
 import { type CutBranchOptions } from './cut-branch.js';
 import { Command } from 'commander';
 import { registerReleaseCommands } from '../../src/cli/release-cli.js';
+import { runHandResponseNode } from './hand-response-node.js';
 import { reserveReleaseResumeAttempt } from './resume-cap.js';
 import { partialPlanPath } from './gate-partial.js';
 import { DecisionLedger } from '../../src/decisions/decision-ledger.js';
@@ -23,6 +24,8 @@ import { gateImagePinPath, writeGateImagePin } from './gate-image-pin.js';
 import { gateLockfileHashAtCommit, gateTestedFileHashesAtCommit } from './gate-reuse-identity.js';
 import { prepareSameRunGateRecheck } from './gate-same-run-recheck-node.js';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { withSimClock } from '../../src/ux-sim/fake-clock.js';
+import { createFakeCloudVm } from '../../src/ux-sim/fake-cloud-vm.js';
 
 // SIGTERM lifecycle fixtures launch a real Bun child and can exceed Bun's 5 s default under parallel gate-test load.
 setDefaultTimeout(15_000);
@@ -30,6 +33,13 @@ setDefaultTimeout(15_000);
 const SHA = 'a'.repeat(40);
 const VERSION = '0.2.19';
 const releaseGraphDir = join(import.meta.dir, '../../graphs/release');
+
+// Async test finalizers can run after Bun's timeout cleanup. Keep cwd restoration at
+// the test boundary so one interrupted resume simulation cannot contaminate later tests.
+const resumeTestCwd = process.cwd();
+afterEach(() => {
+  if (process.cwd() !== resumeTestCwd) process.chdir(resumeTestCwd);
+});
 
 // The Pod gate checkout installs root packages but intentionally omits apps/pwa dependencies. Most resume tests use
 // the real checkout as commandRoot while stubbing graph execution; provide the directory-only preflight fixture they
@@ -51,7 +61,8 @@ function configureTraffic(root: string): void {
 function installReleaseRecipes(checkout: string): void {
   const target = join(checkout, 'graphs/release');
   mkdirSync(target, { recursive: true });
-  for (const name of ['release-loop.yaml', 'recipes.yaml']) copyFileSync(join(releaseGraphDir, name), join(target, name));
+  for (const name of ['release-loop.yaml', 'recipes.yaml', 'plugin.json', 'release-graph.schema.yaml',
+    'release-edge-vocabulary.yaml', 'release-gate-domain-pack.yaml']) copyFileSync(join(releaseGraphDir, name), join(target, name));
 }
 
 function createPreflightCommandRoot(root: string): string {
@@ -80,7 +91,8 @@ function installCutCommitResumeSimulation(checkout: string): string {
     '  - { from: cutoff, on: outcome, map: { ok: gate, fail: failed, error: failed } }',
     '  - { from: gate, on: outcome, map: { ok: tui, fail: failed, error: failed } }',
     '  - { from: tui, on: outcome, map: { ok: known-issues, fail: failed, error: failed } }',
-    '  - { from: known-issues, on: outcome, map: { ok: done, fail: failed, error: failed } }', '',
+    '  - { from: known-issues, on: outcome, map: { ok: done, fail: failed, error: failed } }',
+    'loop: { trigger: { events: [] } }', '',
   ].join('\n'));
   writeFileSync(join(graphDir, 'recipes.yaml'), [
     "version-release: { command: 'bun scripts/release-loop/version-node.ts release --json' }",
@@ -89,6 +101,22 @@ function installCutCommitResumeSimulation(checkout: string): string {
     "docs: { command: 'bun scripts/release-loop/docs-node.ts --json' }",
     "known-issues: { command: 'bun scripts/release-loop/known-issues-node.ts' }", '',
   ].join('\n'));
+  writeFileSync(join(graphDir, 'plugin.json'), JSON.stringify({
+    name: 'release-loop-resume-sim', version: '0.3.8', extensions: { 'ai.elanous': {
+      identity: 'elanous-0.x-release', inputs: [], graphs: ['./release-loop.yaml'], graphSchema: './release-graph.schema.yaml',
+      edgeVocabulary: './release-edge-vocabulary.yaml', domainPackFiles: [],
+      graphManifests: { 'release-loop': { purpose: 'Resume lifecycle simulation fixture.',
+        allow: { recipes: ['version-release', 'cutoff', 'gate', 'docs', 'known-issues'], skills: [], domainPacks: [] },
+        policy: {}, hitl: [], terminal: { done: 'success', failed: 'failure' }, observe: { categories: [] } } },
+    } },
+  }, null, 2));
+  writeFileSync(join(graphDir, 'release-graph.schema.yaml'), [
+    'apiVersion: elanous.dev/release-graph-schema/v1', 'graphId: release-loop',
+    'requiredGraphFields: [graph_id, version, entry_node, terminal_nodes, nodes, edges]',
+    'nodeKinds: [git, judge, gate, agent]', 'edgeTriggers: [outcome]', 'terminalStates: [done, failed]',
+    'recipePrefixes: [cmd]', '',
+  ].join('\n'));
+  writeFileSync(join(graphDir, 'release-edge-vocabulary.yaml'), 'apiVersion: elanous.dev/release-graph-edges/v1\nedges:\n  outcome: { terminal: true }\n');
   return graphPath;
 }
 
@@ -179,6 +207,7 @@ import { PodPoolScheduler } from ${JSON.stringify(poolUrl)};
 import { setElanousConfigDir } from ${JSON.stringify(new URL('../../src/elanous-config-dir.js', import.meta.url).href)};
 import { gateImagePinPath, writeGateImagePin } from ${JSON.stringify(new URL('./gate-image-pin.js', import.meta.url).href)};
 import { gateEnvFingerprint } from ${JSON.stringify(new URL('./gate-baseline-receipt.js', import.meta.url).href)};
+import { readGateShardManifest } from ${JSON.stringify(new URL('./gate-shard-receipts.js', import.meta.url).href)};
 const root = ${JSON.stringify(root)}, base40 = 'b'.repeat(40);
 const repo = join(root, 'fixture-repo');
 const files = ['src/complete.test.ts', 'src/stalled.test.ts'], imageDigest = 'sha256:' + 'c'.repeat(64);
@@ -234,14 +263,12 @@ const podCommand = async (options) => {
   if (!lease) throw new Error('fixture pool did not grant the shard slot');
   const text = options.command[2] || '';
   if (options.provenance.shard === '2-of-2') {
-    const completedReceipt = join(root, 'release', ${JSON.stringify(VERSION)}, 'gate-logs', 'cut', 'receipts', 'pod-0.receipt.json');
+    const receiptRoot = join(root, 'release', ${JSON.stringify(VERSION)}, 'gate-logs', 'cut', 'receipts');
     const receiptDeadline = Date.now() + 10_000;
     let complete = false;
     while (Date.now() < receiptDeadline) {
-      if (existsSync(completedReceipt)) {
-        try { complete = JSON.parse(readFileSync(completedReceipt, 'utf8')).status === 'complete'; } catch { /* atomic write may be in progress */ }
-        if (complete) break;
-      }
+      try { complete = readGateShardManifest(receiptRoot, 'pod-0')?.status === 'complete'; } catch { /* receipt append may be in progress */ }
+      if (complete) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     if (!complete) throw new Error('completed shard receipt did not appear before the stalled shard signal');
@@ -707,8 +734,9 @@ test('GATE-RESUME-STALLED-ONLY: moved-tip resume refuses partial reuse when a fo
   await sigtermActualGate(root);
   const head40 = readFileSync(join(root, 'fixture-head'), 'utf8').trim();
   const receiptDir = join(root, 'release', VERSION, 'gate-logs', 'cut', 'receipts');
-  const completed = JSON.parse(readFileSync(join(receiptDir, 'pod-0.receipt.json'), 'utf8')) as { files: string[]; status: string };
-  const stalled = JSON.parse(readFileSync(join(receiptDir, 'pod-1.receipt.json'), 'utf8')) as { files: string[]; status: string };
+  const { readGateShardManifest } = await import('./gate-shard-receipts.js');
+  const completed = readGateShardManifest(receiptDir, 'pod-0')!;
+  const stalled = readGateShardManifest(receiptDir, 'pod-1')!;
   expect(completed.status).toBe('complete');
   expect(stalled.status).toBe('unmeasured');
   writeFailedRun(root, 'r', JSON.stringify({ outcome: 'error', commit: head40,
@@ -998,6 +1026,215 @@ test('release-loop simulation resumes the same cut-commit run, skips completed n
     expect(gitCalls.some((args) => args.includes(`refs/heads/release/${VERSION}`))).toBe(false);
     expect(resumed.tip).toMatchObject({ branch: 'cut-commit', from: cut, to: cut, changed: false });
   } finally { resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RLA-REHEARSAL-INCIDENT-GRAPH sim: graph-run cloud boundary persists and the release resume CLI continues the same run', async () => {
+  const scenarioPath = join(import.meta.dir, '../../scenarios/ux-sim/rla-rehearsal-cloud-resume-sim.yaml');
+  const scenario = parseYaml(await Bun.file(scenarioPath).text()) as {
+    sameRun: { processRestart: boolean; resumeCli: boolean; resumeInvocation: string };
+    boundaries: { externalCloud: boolean; cloudJoinImplementation: string };
+    incidents: {
+      aws3PublicIpChangedWhileJoining: { instanceId: string; previousPublicIp: string; currentPublicIp: string; observedAt: string; expectedContract: string };
+      workerStartReportedFailureButPidfilesAlive: { reportedFailed: number; pidfileWorkers: Array<{ id: string; pid: number }>; expectedContract: string };
+    };
+    cloud: { id: string; imageDigest: string; hourlyCost: number };
+  };
+  expect(scenario.sameRun).toEqual({ processRestart: false, resumeCli: true, resumeInvocation: 'saved-graph-cli' });
+  expect(scenario.boundaries).toMatchObject({ externalCloud: true, cloudJoinImplementation: 'operational-tool-contract-input' });
+  expect(scenario.incidents.aws3PublicIpChangedWhileJoining).toEqual({ instanceId: 'i-08f7e3976c47a563a',
+    previousPublicIp: '3.38.148.224', currentPublicIp: '54.117.99.58', observedAt: '2026-11-08T04:01:50+09:00',
+    expectedContract: 'reconnect-to-current-public-ip' });
+  expect(scenario.incidents.workerStartReportedFailureButPidfilesAlive).toMatchObject({ reportedFailed: 3,
+    pidfileWorkers: [{ id: 'aws3-1', pid: 86041 }, { id: 'aws3-2', pid: 86043 }, { id: 'aws3-3', pid: 86045 }],
+    expectedContract: 'classify-from-live-pidfile-evidence' });
+
+  const root = mkdtempSync(join(tmpdir(), 'rla-rehearsal-cloud-resume-cli-'));
+  setElanousConfigDir(root);
+  const commandRoot = createPreflightCommandRoot(root);
+  const graphDir = join(commandRoot, 'graphs', 'release');
+  mkdirSync(graphDir, { recursive: true });
+  const graphPath = join(graphDir, 'release-loop.yaml');
+  writeFileSync(graphPath, [
+    'graph_id: release-loop', 'version: 1', 'entry_node: version-release', 'terminal_nodes: [done, failed]', 'max_parallel_nodes: 1', 'nodes:',
+    "  - { node_id: version-release, kind: git, recipe: 'cmd:version-release', max_visits: 1 }",
+    "  - { node_id: cutoff, kind: judge, recipe: 'cmd:cutoff', max_visits: 1 }",
+    "  - node_id: rla-cloud-join", "    kind: agent", "    recipe: 'cmd:cloud-join'", "    max_visits: 1",
+    "    input: { host: aws3, apply: true, approvedAction: rla-cloud-join }",
+    "  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1 }",
+    "  - { node_id: tui, kind: gate, recipe: 'cmd:docs', max_visits: 1 }",
+    "  - { node_id: known-issues, kind: agent, recipe: 'cmd:known-issues', max_visits: 1 }",
+    '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
+    '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }', 'edges:',
+    '  - { from: version-release, on: outcome, map: { ok: cutoff, fail: failed, error: failed } }',
+    '  - { from: cutoff, on: outcome, map: { ok: rla-cloud-join, fail: failed, error: failed } }',
+    '  - { from: rla-cloud-join, on: outcome, map: { ok: gate, fail: failed, error: failed } }',
+    '  - { from: gate, on: outcome, map: { ok: tui, fail: failed, error: failed } }',
+    '  - { from: tui, on: outcome, map: { ok: known-issues, fail: failed, error: failed } }',
+    '  - { from: known-issues, on: outcome, map: { ok: done, fail: failed, error: failed } }', '',
+  ].join('\n'));
+  // This scenario graph deliberately has no HITL nodes. Keep its copied plugin
+  // manifest aligned so the production manifest validator tests the fixture,
+  // not the unrelated production release-loop HITL declaration.
+  const pluginPath = join(graphDir, 'plugin.json');
+  const plugin = JSON.parse(readFileSync(pluginPath, 'utf8'));
+  plugin.extensions['ai.elanous'].graphManifests['release-loop'].hitl = [];
+  plugin.extensions['ai.elanous'].graphManifests['release-loop'].allow.recipes.push('cloud-join');
+  writeFileSync(pluginPath, `${JSON.stringify(plugin, null, 2)}\n`);
+  writeFileSync(join(graphDir, 'recipes.yaml'), [
+    "version-release: { command: 'bun scripts/release-loop/version-node.ts release --json' }",
+    "cutoff: { command: 'bun scripts/release-loop/node-verdict.ts cutoff' }",
+    "cloud-join: { command: 'bun scripts/release-loop/hand-response-node.ts rla-cloud-join' }",
+    "gate: { command: 'bun scripts/release-loop/gate-node.ts --json' }",
+    "docs: { command: 'bun scripts/release-loop/docs-node.ts --json' }",
+    "known-issues: { command: 'bun scripts/release-loop/known-issues-node.ts' }", '',
+  ].join('\n'));
+  mkdirSync(join(commandRoot, 'src'), { recursive: true });
+  writeFileSync(join(commandRoot, 'src', 'rehearsal-gate.test.ts'), "import { test, expect } from 'bun:test';\ntest('fixture gate', () => expect(true).toBe(true));\n");
+  seatGit(commandRoot, 'init', '-q');
+  seatGit(commandRoot, 'config', 'user.name', 'RLA rehearsal simulation');
+  seatGit(commandRoot, 'config', 'user.email', 'rla-rehearsal@example.invalid');
+  seatGit(commandRoot, 'add', 'graphs', 'src');
+  seatGit(commandRoot, 'commit', '-q', '-m', 'rehearsal cut simulation');
+  const cut = seatGit(commandRoot, 'rev-parse', 'HEAD');
+  configureTraffic(root);
+  mkdirSync(join(root, 'release', '0.2.18'), { recursive: true });
+  writeFileSync(join(root, 'release', '0.2.18', 'release.json'), JSON.stringify({ sourceCommit: cut }));
+  writeFileSync(join(root, 'release', '0.2.18', 'gate-failures.json'), JSON.stringify({ commit: cut, failures: [] }));
+  const gateMirror = join(root, 'sim-cloud-gate.git');
+  expect(spawnSync('git', ['init', '--bare', gateMirror], { encoding: 'utf8' }).status).toBe(0);
+  expect(spawnSync('git', ['--git-dir', gateMirror, 'fetch', commandRoot,
+    `${cut}:refs/elanous/gate/${cut}`], { encoding: 'utf8' }).status).toBe(0);
+  const nodeCalls: string[] = [];
+  const gateNodeCalls: Array<{ graphRunId: string | null; outcome: string }> = [];
+  const gateRunner = createGateRunner(commandRoot, 'sim-cloud-gate', async (command, args, cwd) => {
+    if (command === 'sh') return { rc: 0, output: '/home/sim-gate\n' };
+    if (command === 'mktemp') return { rc: 0, output: `${mkdtempSync(join('/tmp', 'release-gate-sim-'))}\n` };
+    if (command === 'git' && args[0] === '--git-dir' && args[1] === gateMirror) {
+      const result = spawnSync(command, args, { cwd, encoding: 'utf8' });
+      return { rc: result.status ?? 1, output: result.stdout ?? '' };
+    }
+    if (command === 'git') {
+      const result = spawnSync(command, args, { cwd, encoding: 'utf8' });
+      return { rc: result.status ?? 1, output: result.stdout ?? '' };
+    }
+    return { rc: 0, output: '' };
+  });
+  gateRunner.localCommand = async (command, args, cwd) => command === 'git' && args[0] === 'push'
+    ? { rc: 0, output: '' }
+    : (() => { const result = spawnSync(command, args, { cwd, encoding: 'utf8' });
+      return { rc: result.status ?? 1, output: result.stdout ?? '' }; })();
+  gateRunner.sweep = async () => ({ rc: 0, output: '1 pass\n0 fail\nRan 1 test across 1 file.\n' });
+  const fleet = createFakeCloudVm();
+  let cloudBoundaryCall: { command: string; args: string[] } | undefined;
+  let tuiFails = true;
+  const runBash: NonNullable<NonNullable<Parameters<typeof runGraph>[1]>['deps']>['runBash'] = async (body, options) => {
+    const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
+    const context = contextPath ? JSON.parse(readFileSync(contextPath, 'utf8')) as {
+      nodeId?: string; input?: { cloudJoinIncidents?: typeof scenario.incidents };
+    } : {};
+    const nodeId = String(context.nodeId ?? 'unknown');
+    nodeCalls.push(nodeId);
+    if (nodeId === 'rla-cloud-join') {
+      expect(body).toBe('bun scripts/release-loop/hand-response-node.ts rla-cloud-join');
+      const oldLog = console.log;
+      let stdout = '';
+      console.log = (...args: unknown[]) => { stdout = args.map(String).join(' '); };
+      try {
+        const exitCode = await runHandResponseNode('rla-cloud-join', options.env!, {
+          run: async (command, args) => {
+            cloudBoundaryCall = { command, args };
+            expect(command).toBe('zsh');
+            expect(args).toEqual(['/sim/op-tools/cloud-join.sh', 'aws3']);
+            const incidents = context.input?.cloudJoinIncidents;
+            expect(incidents).toEqual(scenario.incidents);
+            // This is the fake external cloud command boundary selected by the real hand-response node.
+            fleet.createFromImage({ ...scenario.cloud, readyAfterMs: 0 });
+            expect(fleet.status(scenario.cloud.id).state).toBe('ready');
+            for (const _worker of incidents!.workerStartReportedFailureButPidfilesAlive.pidfileWorkers) fleet.openLease(scenario.cloud.id);
+            expect(fleet.status(scenario.cloud.id).activeLeases).toBe(3);
+            for (const _worker of incidents!.workerStartReportedFailureButPidfilesAlive.pidfileWorkers) fleet.closeLease(scenario.cloud.id);
+            expect(fleet.stop(scenario.cloud.id)).toMatchObject({ state: 'parked', activeLeases: 0 });
+            return { status: 0, stdout: '', stderr: '' };
+          },
+          env: { ...options.env, ELANOUS_HQ_OP_TOOLS_DIR: '/sim/op-tools' },
+        });
+        expect(exitCode).toBe(0);
+        return { exitCode, stdout, stderr: '' };
+      } finally { console.log = oldLog; }
+    }
+    if (nodeId === 'gate') {
+      expect(body).toBe('bun scripts/release-loop/gate-node.ts --json');
+      const oldLog = console.log;
+      let stdout = '';
+      console.log = (...args: unknown[]) => { stdout = args.map(String).join(' '); };
+      try {
+        const exitCode = await runGateNode(['--json'], options.env!, gateRunner);
+        const result = JSON.parse(stdout) as { outcome?: string };
+        const graphRunId = contextPath
+          ? (JSON.parse(readFileSync(contextPath, 'utf8')) as { runId?: string }).runId ?? null : null;
+        gateNodeCalls.push({ graphRunId, outcome: result.outcome ?? 'missing' });
+        expect(exitCode).toBe(0);
+        expect(result).toMatchObject({ outcome: 'ok' });
+        return { exitCode, stdout, stderr: '' };
+      } finally { console.log = oldLog; }
+    }
+    if (nodeId === 'tui' && tuiFails) {
+      tuiFails = false;
+      return { exitCode: 1, stdout: JSON.stringify({ outcome: 'fail', reason: 'simulated interrupted run before resume' }), stderr: '' };
+    }
+    return { exitCode: 0, stdout: JSON.stringify(nodeId === 'version-release'
+      ? { outcome: 'ok', version: VERSION, commit: cut, branch: `release/${VERSION}` }
+      : nodeId === 'cutoff' ? { outcome: 'ok', baseline: { sha: cut }, cutoff: { sha: cut } }
+        : { outcome: 'ok', nodeId }), stderr: '' };
+  };
+  const resumeGit = (args: string[]) => args[0] === 'ls-remote' ? `${cut}\trefs/heads/release/${VERSION}`
+    : args[0] === 'rev-parse' ? cut : '';
+  const runId = 'rla-cloud-resume-run';
+  const previousCwd = process.cwd();
+  try {
+    process.chdir(commandRoot);
+    {
+      const first = await runGraph(graphPath, {
+        runId,
+        input: { version: VERSION, previousVersion: '0.2.18', branchCut: false, cutCommit: cut,
+          gateExecutor: 'host', gateRemote: 'sim-cloud-gate', gateRemoteMirror: gateMirror, cloudJoinIncidents: scenario.incidents },
+        deps: { root, runBash },
+      });
+      expect(first.status).toBe('failed');
+      expect(first.runId).toBe(runId);
+      expect(first.nodes.filter((node) => node.executed).map((node) => node.nodeId)).toEqual(['version-release', 'cutoff', 'rla-cloud-join', 'gate', 'tui']);
+      expect(first.nodes.find((node) => node.nodeId === 'rla-cloud-join')).toMatchObject({ ok: true, executed: true });
+      expect(first.nodes.find((node) => node.nodeId === 'gate')).toMatchObject({ ok: true, executed: true });
+      expect(gateNodeCalls).toEqual([{ graphRunId: runId, outcome: 'ok' }]);
+      expect(cloudBoundaryCall).toEqual({ command: 'zsh', args: ['/sim/op-tools/cloud-join.sh', 'aws3'] });
+      expect(fleet.events().map((event) => event.type)).toEqual([
+        'create-from-image', 'ready', 'lease-opened', 'lease-opened', 'lease-opened',
+        'lease-closed', 'lease-closed', 'lease-closed', 'stop',
+      ]);
+
+      const lines: string[] = [];
+      const write = process.stdout.write;
+      process.stdout.write = ((value: string | Uint8Array) => { lines.push(String(value).trim()); return true; }) as typeof process.stdout.write;
+      try {
+        process.exitCode = 0;
+        const cmd = new Command();
+        registerReleaseCommands(cmd, {}, {}, {}, {}, {}, {
+          root,
+          git: resumeGit,
+          graphPath,
+          runBash,
+        });
+        await cmd.parseAsync(['release', 'resume', '--run', runId, '--from', 'tui', '--command-root', commandRoot, '--json'], { from: 'user' });
+      } finally { process.stdout.write = write; }
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ status: 'done', runId });
+      expect(nodeCalls).toEqual(['version-release', 'cutoff', 'rla-cloud-join', 'gate', 'tui', 'tui', 'known-issues']);
+      const persisted = JSON.parse(readFileSync(first.statePath, 'utf8')) as typeof first;
+      expect(persisted.status).toBe('done');
+      expect(persisted.runId).toBe(runId);
+      expect(persisted.nodes.map((node) => node.nodeId)).toEqual(['version-release', 'cutoff', 'rla-cloud-join', 'gate', 'tui', 'known-issues', 'done']);
+      expect(persisted.nodes.filter((node) => node.nodeId === 'rla-cloud-join')).toHaveLength(1);
+    }
+  } finally { process.chdir(previousCwd); resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('resume dry-run surfaces checkout preflight ENOBUFS and leaves retry state untouched', async () => {
@@ -1503,13 +1740,13 @@ test('the resumed Bash process reads from the verified command checkout', async 
     mkdirSync(fakeBin);
     writeFileSync(join(fakeBin, 'bun'), '#!/bin/sh\npwd\ncat marker\nprintf \'{"outcome":"fail"}\\n\'\n');
     chmodSync(join(fakeBin, 'bun'), 0o755);
-    const oldPath = process.env.PATH;
-    let resumed;
-    try {
-      process.env.PATH = `${fakeBin}:${oldPath ?? ''}`;
-      resumed = await runGraph(graphPath, { resumeRunId: first.runId, fromNodeId: 'cutoff',
-        releaseCommandSource: { root: checkoutAlias, cutTip: cut }, deps: { root } });
-    } finally { process.env.PATH = oldPath; }
+    const resumed = await runGraph(graphPath, { resumeRunId: first.runId, fromNodeId: 'cutoff',
+      releaseCommandSource: { root: checkoutAlias, cutTip: cut }, deps: { root, runBash: async (body, options) => {
+        // Use an absolute fixture path so this assertion cannot race with process-global PATH changes.
+        const command = body.replace(/^bun /, `${fakeBin}/bun `);
+        const result = spawnSync('/bin/bash', ['-c', command], { cwd: options?.cwd, env: options?.env, encoding: 'utf8' });
+        return { exitCode: result.status ?? 1, stdout: result.stdout, stderr: result.stderr };
+      } } });
     const output = String(resumed.nodes.find((node) => node.nodeId === 'cutoff')?.output ?? '');
     expect(output).toContain(realpathSync(checkout));
     expect(output).toContain('cut recipe');
@@ -1720,7 +1957,8 @@ function buildRecoverSeat(root: string, options: { partialTestChange?: boolean }
   seatGit(work, 'config', 'core.hooksPath', noHooks);
   seatGit(origin, 'config', 'core.hooksPath', noHooks);
   mkdirSync(join(work, 'graphs', 'release'), { recursive: true });
-  for (const file of ['release-loop.yaml', 'recipes.yaml'])
+  for (const file of ['release-loop.yaml', 'recipes.yaml', 'plugin.json', 'release-graph.schema.yaml',
+    'release-edge-vocabulary.yaml', 'release-gate-domain-pack.yaml'])
     copyFileSync(join(import.meta.dir, '../../graphs/release', file), join(work, 'graphs', 'release', file));
   mkdirSync(join(work, 'node_modules'), { recursive: true });
   mkdirSync(join(work, 'apps', 'pwa', 'node_modules'), { recursive: true });

@@ -7,7 +7,7 @@ import { debug } from '../debug/log.js';
 import { writeAuthoredGoal, type GoalAuthorDeps } from './goal-author.js';
 import { resolveGoalDocumentsDir, type GoalDocumentsDirReason } from './goal-documents-dir.js';
 import { queryFederatedUnfinishedRunLedgers, queryUnfinishedRunLedgers } from './run-ledger.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 const temporaryDirectories: string[] = [];
 

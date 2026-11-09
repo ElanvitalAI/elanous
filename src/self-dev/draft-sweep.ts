@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
 import { debug } from '../debug/log.js';
 import { assessDraftTriage, decideDraft, draftClaimComment, draftClaimState, draftIntentHoldReason, draftIntentHoldRejection, draftReleaseComment, harvestDeferredMarker, laterMergedTwins, parseDraftIntentHold, sameGoalPr, PROTECTED_LABELS, type DraftTriageAssessment, type DraftTriagePr, type DraftTriageReviewState } from './draft-triage-rules.js';
@@ -398,8 +399,6 @@ const HUMAN_HAND_LABELS: ReadonlySet<string> = new Set(PR_LABELS
   .filter((entry) => entry.sweep.action === 'exclude' || (entry.axis === 'state' && entry.sweep.action === 'none')
     || (entry.axis === 'origin' && (entry.appliedBy as readonly string[]).includes('human')))
   .map((entry) => entry.name));
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 /** Unwraps a Pod-forwarded row (`originalData` as a JSON string or object); null when the payload is unreadable. */
 export function overlapPreflightPayload(data: unknown): Record<string, unknown> | null {

@@ -4,6 +4,8 @@ import { parseGatePodRuntimeIdentity } from './gate-baseline-receipt.js';
 import { testFileOfId } from './gate-partial.js';
 import { cleanRetryVerdict, junitFailedCaseIds, junitTestcaseCount, junitTestcaseFiles } from './gate-shard-load-flaky.js';
 import { lastMatch, summaryCount, stripSummary } from './gate-test-summary.js';
+import { parseTimedOutFailures } from './gate-diff.js';
+import type { RetryPassEvidence } from './gate-types.js';
 
 export interface ShardArtifacts {
   /** GATE-POD-STALL-FAILFAST (OP) — every unfinished part ended with a complete clean summary (0 fail · 0 error) but an exit
@@ -22,6 +24,7 @@ export interface ShardArtifacts {
   runtimeIdentity?: ReturnType<typeof parseGatePodRuntimeIdentity>;
   /** Original failure ids whose one same-Pod standalone retry completed cleanly. */
   loadFlaky?: string[];
+  retryPass?: RetryPassEvidence[];
   /** Files for which a same-Pod retry completed, even if it remained failing. */
   loadFlakyAttemptedFiles?: string[];
 }
@@ -42,7 +45,7 @@ export function readShardArtifacts(dir: string, parts: readonly (readonly string
   const timedOut = read('shard.timeout') !== undefined;
   if (installRc !== 0) return { output: install, ...(installRc !== undefined ? { rc: installRc } : {}),
     ...(runtimeIdentity ? { runtimeIdentity } : {}), timedOut, finished: [] };
-  const good: Array<{ log: string; junit?: string; rc: 0 | 1; files: readonly string[]; loadFlaky?: string[]; loadFlakyAttemptedFiles?: string[] }> = [];
+  const good: Array<{ log: string; junit?: string; rc: 0 | 1; files: readonly string[]; loadFlaky?: string[]; retryPass?: RetryPassEvidence[] }> = [];
   const bad: string[] = [];
   const exitAnomaly: string[] = [];
   const attemptedFiles = new Set<string>();
@@ -78,7 +81,7 @@ export function readShardArtifacts(dir: string, parts: readonly (readonly string
     if (clean !== undefined && ((rc === 0 || rc === 1) || timedOutComplete) && summary) {
       const junit = read(`part-${index}.junit.xml`);
       const retryFiles = retryManifest;
-      const loadFlaky = retryFiles.flatMap((file, retryIndex) => {
+      const retryPass = retryFiles.flatMap((file, retryIndex): RetryPassEvidence[] => {
         if (!files.includes(file)) return [];
         const retryRc = rcOf(read(`part-${index}.retry-${retryIndex}.rc`));
         const retryLog = read(`part-${index}.retry-${retryIndex}.log`);
@@ -86,9 +89,14 @@ export function readShardArtifacts(dir: string, parts: readonly (readonly string
         const originalFailures = (junitFailedCaseIds(junit ?? '') ?? []).filter((id) => testFileOfId(id) === file);
         const verdict = cleanRetryVerdict(retryRc, retryLog, retryJunit, file, originalFailures);
         if (!verdict.clean) return [];
-        return originalFailures;
+        // A multi-file part that passes alone points to isolation/order contamination. A single-file
+        // part that passes under the same retry limit points to load. A timed-out original is timeout.
+        const timedOutIds = new Set(parseTimedOutFailures(clean));
+        return originalFailures.map((id) => ({ id,
+          cause: timedOutIds.has(id) ? 'timeout' : files.length > 1 ? 'isolation' : 'load' }));
       });
-      good.push({ log: clean, rc: rc === 0 ? 0 : 1, files, ...(junit !== undefined ? { junit } : {}), ...(loadFlaky.length ? { loadFlaky } : {}) });
+      good.push({ log: clean, rc: rc === 0 ? 0 : 1, files, ...(junit !== undefined ? { junit } : {}),
+        ...(retryPass.length ? { loadFlaky: retryPass.map((row) => row.id), retryPass } : {}) });
       return;
     }
     if (log !== undefined) bad.push(`# part ${index} (${rc === undefined ? 'unfinished' : `rc=${rc}`})\n${log}`);
@@ -116,10 +124,11 @@ export function readShardArtifacts(dir: string, parts: readonly (readonly string
     finished: good.flatMap((part) => [...part.files]),
     ...([ ...new Set(good.flatMap((part) => part.loadFlaky ?? [])) ].length
       ? { loadFlaky: [...new Set(good.flatMap((part) => part.loadFlaky ?? []))].sort() } : {}),
+    ...(good.some((part) => part.retryPass?.length)
+      ? { retryPass: good.flatMap((part) => part.retryPass ?? []).sort((a, b) => a.id.localeCompare(b.id)) } : {}),
     ...(attemptedFiles.size ? { loadFlakyAttemptedFiles: [...attemptedFiles].sort() } : {}),
     ...(bad.length ? { unfinishedLog: bad.join('\n') } : {}),
     ...(exitAnomaly.length && !otherBad ? { exitCodeOnly: exitAnomaly } : {}),
     ...(runtimeIdentity ? { runtimeIdentity } : {}),
   };
 }
-

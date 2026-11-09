@@ -16,6 +16,9 @@ interface ScreeningEvaluation {
   toolBreakdown?: Record<string, unknown>;
   turnCount: number;
   durationMs: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  firstTokenMs?: number | null;
   /** 자식이 낸 답문. ⭐ 러너는 이미 이것을 쥐고 있었고 **버리고 있었다**(`I-16`). */
   text?: string;
 }
@@ -48,6 +51,10 @@ export interface ScreeningRecord {
   outcome: RoutingOutcome;
   turns: number;
   ms: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  firstTokenMs?: number | null;
+  tokensPerTurn?: number;
   /**
    * ⭐ **미발사(`no-fire`) 런의 답문 원문** — `I-16`.
    *
@@ -123,6 +130,12 @@ export async function measureScreeningRun(
       ...noFire,
       turns: result.turnCount,
       ms: result.durationMs,
+      ...(result.inputTokens !== undefined ? { inputTokens: result.inputTokens } : {}),
+      ...(result.outputTokens !== undefined ? { outputTokens: result.outputTokens } : {}),
+      ...(result.firstTokenMs !== undefined ? { firstTokenMs: result.firstTokenMs } : {}),
+      ...(result.inputTokens !== undefined && result.outputTokens !== undefined && result.turnCount > 0
+        ? { tokensPerTurn: (result.inputTokens + result.outputTokens) / result.turnCount }
+        : {}),
       machineLoad: load,
       loadAtStart,
       loadAtEnd,

@@ -7,7 +7,7 @@ import { Command } from 'commander';
 import { LogStore } from '../mss/logging/log-store.js';
 import { buildDoctorBundle, redactForBundle } from './doctor-bundle.js';
 import { registerDoctorCommand, runDoctor } from './doctor-cli.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 const now = new Date('2026-10-01T12:34:56.000Z');
 const report = { ok: true, credentials: [{ name: 'BOT_TOKEN', resolved: false, source: 'unresolved' as const, note: 'not configured' }], externalCommands: [] };

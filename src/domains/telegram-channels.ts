@@ -8,7 +8,7 @@
 //   dedup 해서 중복 폴러(→ 409 자기충돌·2026-07-09 버그)를 원천 차단한다.
 // ★ 변경은 재시작 시 적용(정적) — 런타임 핫리로드는 폴러 레이스 위험이라 미채택.
 
-import type { TelegramChannel, TelegramConfig } from '../user-config.js';
+import type { TelegramChannel, TelegramConfig } from '../user-config/types.js';
 
 export type { TelegramChannel };
 

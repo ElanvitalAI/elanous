@@ -1,0 +1,78 @@
+version: 1
+kind: release-graph-simulation
+id: arg-macro-canvas
+canvas:
+  graph: graphs/release/release-loop.yaml
+  macrophage: graphs/release/macrophage-subscriber.yaml
+  graphId: release-loop
+  runId: sim-arg-macro-canvas
+inject:
+  failureId: src/release.test.ts > injected regression
+  commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+expect:
+  declared:
+    gateFailure: gate-triage
+    macrophageWake: { event: node-end, nodeId: gate, action: wake }
+    argReturn: gate
+  macrophage:
+    sourceNode: gate
+    signature: unknown
+  path:
+    beforeResume: [gate, gate-triage]
+    afterResume: [gate, traffic-gate-passed]
+manifest:
+  graphId: release-loop
+  edgeRef: scenarios/ux-sim/arg-macro-canvas.yaml#manifest
+  appendAfter: [gate-triage]
+  appendRecipes: [cmd:parked-pr-repair, cmd:preexisting-remeasure, cmd:pod-digest-diagnose, cmd:installed-hang-diagnose, cmd:review-cap-diagnose]
+  allowRecipes: [cmd:parked-pr-repair, cmd:preexisting-remeasure, cmd:pod-digest-diagnose, cmd:installed-hang-diagnose, cmd:review-cap-diagnose]
+  maxDepth: 1
+  allowance: 5
+  hitlNode: gate-repair-recovery
+  rejoinNode: gate
+cases:
+  - id: parked-pr
+    scrap: { id: parked-pr, kind: parked-pr, owner: OP, evidence: { repairRecipe: cmd:parked-pr-repair } }
+    signal: { id: parked-pr, source: release-graph, signature: parked-pr, evidence: introduced, failureIds: [pr-parked], sourceFiles: [src/release-loop/parked-pr.ts] }
+    ladder: { evidence: introduced, failureIds: [pr-parked], sourceFiles: [src/release-loop/parked-pr.ts], changeKind: fixture, repairChildrenUsed: 0, elapsedMs: 0, minutesToCut: 180, estimatedStepMs: 300000 }
+    afterNodeId: gate-triage
+    recipe: cmd:parked-pr-repair
+    recipeOutcome: passed
+    simulatedTerminal: healed
+    expect: { macrophageAction: attempt-repair, policy: { label: fix, step: R1-single-file }, ladder: { action: repair-plan, step: R1-single-file } }
+  - id: preexisting-failure
+    scrap: { id: preexisting-failure, kind: repeated-failing-test, owner: OP, evidence: { consecutiveFailures: 3 } }
+    signal: { id: preexisting-failure, source: release-graph, signature: preexisting-failure, evidence: preexisting, retryable: true, failureIds: [known-test-failure], sourceFiles: [test/known.test.ts] }
+    ladder: { evidence: load-flaky, failureIds: [known-test-failure], sourceFiles: [test/known.test.ts], r0Attempts: 0, repairChildrenUsed: 0, elapsedMs: 0, minutesToCut: 180, estimatedStepMs: 300000 }
+    afterNodeId: gate-triage
+    recipe: cmd:preexisting-remeasure
+    recipeOutcome: passed
+    simulatedTerminal: healed
+    expect: { macrophageAction: open-cell, policy: { label: noise, step: R0-remeasure }, ladder: { action: remeasure-same-slice, step: R0-remeasure } }
+  - id: warm-pod-digest-mismatch
+    scrap: { id: warm-pod-digest-mismatch, kind: release-node-failure, owner: OP, evidence: { nodeId: gate, failureSignature: unknown, failureDetail: warm Pod digest mismatch } }
+    signal: { id: warm-pod-digest-mismatch, source: release-graph, signature: warm-pod-digest-mismatch, evidence: unmeasured, failureIds: [warm-pod-digest-mismatch] }
+    ladder: { evidence: image-drift, failureIds: [warm-pod-digest-mismatch], r0Attempts: 0, repairChildrenUsed: 0, elapsedMs: 0, minutesToCut: 180, estimatedStepMs: 300000 }
+    afterNodeId: gate-triage
+    recipe: cmd:pod-digest-diagnose
+    recipeOutcome: failed
+    simulatedTerminal: hitl
+    expect: { macrophageAction: notify-owner, policy: { label: hitl, step: R4-hitl }, ladder: { action: remeasure-same-slice, step: R0-remeasure } }
+  - id: installed-copy-hang
+    scrap: { id: installed-copy-hang, kind: release-node-failure, owner: OP, evidence: { nodeId: gate, failureSignature: unknown, failureDetail: installed copy hung } }
+    signal: { id: installed-copy-hang, source: release-graph, signature: installed-copy-hang, evidence: unmeasured, failureIds: [installed-copy-hang] }
+    ladder: { evidence: unmeasured, failureIds: [installed-copy-hang], repairChildrenUsed: 0, elapsedMs: 0, minutesToCut: 180, estimatedStepMs: 300000 }
+    afterNodeId: gate-triage
+    recipe: cmd:installed-hang-diagnose
+    recipeOutcome: failed
+    simulatedTerminal: hitl
+    expect: { macrophageAction: notify-owner, policy: { label: hitl, step: R4-hitl }, ladder: { action: raise-decision, step: R4-hitl } }
+  - id: review-cap-double-verdict
+    scrap: { id: review-cap-double-verdict, kind: release-node-failure, owner: OP, evidence: { nodeId: gate, failureSignature: unknown, failureDetail: review cap double verdict } }
+    signal: { id: review-cap-double-verdict, source: release-graph, signature: review-cap-double-verdict, evidence: unmeasured, failureIds: [review-cap-double-verdict] }
+    ladder: { evidence: unmeasured, failureIds: [review-cap-double-verdict], repairChildrenUsed: 0, elapsedMs: 0, minutesToCut: 180, estimatedStepMs: 300000 }
+    afterNodeId: gate-triage
+    recipe: cmd:review-cap-diagnose
+    recipeOutcome: failed
+    simulatedTerminal: hitl
+    expect: { macrophageAction: notify-owner, policy: { label: hitl, step: R4-hitl }, ladder: { action: raise-decision, step: R4-hitl } }

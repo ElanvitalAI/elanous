@@ -38,13 +38,24 @@ test('POD-REUSE-SIM-WORLD rejects residue injection before scheduled recovery', 
 });
 
 test('POD-REUSE-SIM-SI-CHAIN proves two fenced SI leases reuse one cleaned Pod UID', async () => {
-  const evidence = await runWarmSiReuseSimulation({ runId: 'si-chain-clean' });
-  expect(evidence.leaseGenerations).toEqual([1, 2]);
-  expect(evidence.podUids).toEqual(['si-warm-pod-uid-1', 'si-warm-pod-uid-1']);
-  expect(evidence.cleanupOutcomes).toEqual(['returned', 'returned']);
-  expect(evidence.finalPodState).toBe('idle');
-  expect(evidence.controlTransitions.filter(path => path.includes('/release:200'))).toHaveLength(2);
-  expect(evidence.controlTransitions.filter(path => path.includes('/sanitize:200'))).toHaveLength(2);
+  const root = mkdtempSync(join(tmpdir(), 'si-chain-clean-'));
+  try {
+    const evidence = await runWarmSiReuseSimulation({ runId: 'si-chain-clean', stateRoot: root });
+    expect(evidence.leaseGenerations).toEqual([1, 2]);
+    expect(evidence.podUids).toEqual(['si-warm-pod-uid-1', 'si-warm-pod-uid-1']);
+    expect(evidence.cleanupOutcomes).toEqual(['returned', 'returned']);
+    expect(evidence.returnedChildProofs).toHaveLength(2);
+    expect(evidence.ledgerRows.filter(row => row.event === 'pod.reuse.return-decision' && row.data.outcome === 'returned'))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ runId: 'si-chain-clean', data: expect.objectContaining({ childRunId: 'si-chain-clean-1', childAttemptId: 'attempt-1' }) }),
+        expect.objectContaining({ runId: 'si-chain-clean', data: expect.objectContaining({ childRunId: 'si-chain-clean-2', childAttemptId: 'attempt-2' }) }),
+      ]));
+    expect(evidence.finalPodState).toBe('idle');
+    expect(evidence.controlTransitions.filter(path => path.includes('/release:200'))).toHaveLength(2);
+    expect(evidence.controlTransitions.filter(path => path.includes('/sanitize:200'))).toHaveLength(2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('POD-REUSE-SIM-SI-CHAIN quarantines process residue before a second lease', async () => {

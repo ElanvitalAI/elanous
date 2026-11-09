@@ -1,0 +1,21 @@
+{
+  "id": "APP-SOURCE-SNAPSHOT",
+  "name": "App source snapshot restore integrity",
+  "kind": "source-snapshot-integrity",
+  "device": "fake-app-source-world",
+  "implementation": [
+    "src/ux-sim/fake-app-source-concurrent-writer.ts",
+    "src/ux-sim/fake-app-source-world.ts",
+    "src/nexus/apps/app-source-snapshot.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-app-source-world.test.ts"
+  ],
+  "trigger": "Snapshot a deployment source tree, restore a matching snapshot, then exercise mismatched, missing, corrupt and concurrent-writer cases.",
+  "observe": [
+    "restore matches the recorded source fingerprint",
+    "mismatch or corrupt state refuses before changing the target",
+    "concurrent writers retain isolated object keys and ledger results"
+  ],
+  "expected": "A deployment source can be restored only from the matching immutable snapshot; invalid or racing writes cannot silently replace another deployment revision."
+}

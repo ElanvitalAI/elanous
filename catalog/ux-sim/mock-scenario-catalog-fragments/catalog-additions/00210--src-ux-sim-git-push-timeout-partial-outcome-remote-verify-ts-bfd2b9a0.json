@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+  "reason": "GIT-PUSH-FALSE-FAIL: simulates a transport timeout after a local remote accepts a branch ref so the production CLI can verify the partial outcome."
+}

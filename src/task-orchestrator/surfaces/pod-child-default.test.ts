@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import * as podChildDefault from './pod-child-default.js';
 import { buildPodConfigSnapshot } from './pod-config-snapshot.js';
 const { POD_CHILD_DEFAULT, resolvePodChildDefault } = podChildDefault;
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 import { podChildLlmArgs, podNamedChildProvider } from './self-implement-pod.js';
 
 // SUBSCRIPTION-EXHAUST-REROUTE (0.2.24 · P0) — a Pod launch with no child model no longer falls to codex.

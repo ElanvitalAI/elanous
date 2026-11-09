@@ -1,0 +1,31 @@
+{
+  "id": "rla-event-response-scorecard",
+  "name": "RLA event response scorecard",
+  "implementation": [
+    "src/ux-sim/rla-event-response-scorecard.ts"
+  ],
+  "tests": [
+    "src/ux-sim/mock-scenario-catalog.test.ts"
+  ],
+  "target": "Inject the ten RFC §A12 incident classes into an isolated Nexus world and compare observed response timings and recovery outcomes against each 0.3.5 baseline and 0.3.6 target over three samples per incident.",
+  "inputs": [
+    "registered RLA-ER-01 through RLA-ER-10 world events",
+    "a responder fixture returning detection, judgment, recovery, action, and success observations",
+    "fake clock and isolated Nexus state root"
+  ],
+  "observations": [
+    "RFC §A12 0.3.5 hand-operated baseline alongside measured 0.3.6 response",
+    "four ordered response stages per sample in run ledger and logs.db",
+    "per-incident mean detection, judgment, attribution, and recovery times",
+    "detection and recovery mode, verified success count/rate, and per-sample target verdict"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/mock-scenario-catalog.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "rla-event-response-stage",
+    "release-loop.event-response injected/detected/judged/recovered"
+  ],
+  "recentUse": null
+}

@@ -14,7 +14,7 @@ import { spawnSync } from 'node:child_process';
 import { extname } from 'node:path';
 import { debug } from '../../../debug/log.js';
 import { getUserConfig } from '../../../user-config.js';
-import type { LspLanguageConfig } from '../../../user-config.js';
+import type { LspLanguageConfig } from '../../../user-config/types.js';
 
 export type LspLanguageName = 'typescript' | 'python' | 'rust';
 

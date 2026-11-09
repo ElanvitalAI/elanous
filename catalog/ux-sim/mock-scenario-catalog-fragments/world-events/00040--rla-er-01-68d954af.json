@@ -1,0 +1,5 @@
+{
+  "id": "RLA-ER-01",
+  "name": "Gate regression introduced>0",
+  "description": "Detect gate regressions and measure automatic attribution, judgment, and recovery."
+}

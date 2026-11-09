@@ -1,0 +1,22 @@
+{
+  "id": "SEAT-MAIL-WAKE-ALL-ADDRESSES",
+  "name": "Ten messages wake and complete for Codex, Claude and remote seats",
+  "kind": "seat-mail-wake",
+  "device": "seat-mail-wake",
+  "implementation": [
+    "src/cli/msg-cli.ts",
+    "src/loops/msg-address.ts",
+    "src/loops/msg-wake.ts"
+  ],
+  "tests": [
+    "src/cli/msg-cli.test.ts",
+    "src/loops/msg-wake.test.ts"
+  ],
+  "trigger": "Deliver ten unread messages to registered seat addresses with Codex, Claude and remote pane routes.",
+  "observe": [
+    "all registered seat addresses resolve to a host wake route and generate private pane-address files",
+    "each runtime accepts a wake after idle/input-state verification",
+    "all ten message IDs are read and acknowledged per runtime kind"
+  ],
+  "expected": "no seat address remains undeclared and all 30 message deliveries complete"
+}

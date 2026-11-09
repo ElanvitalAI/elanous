@@ -15,7 +15,7 @@ import {
 } from '../src/nexus/outbound/router.js';
 import { formatForChannel } from '../src/nexus/outbound/format.js';
 import { openDeliveryDb, deliveryDedupKey, recentlyDelivered, recordDelivery, markRead, listUnread } from '../src/nexus/outbound/delivery-ledger.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 
 const cfgWith = (outbound: unknown): UserConfig =>
   ({ raw: outbound === undefined ? {} : { outbound } }) as unknown as UserConfig;

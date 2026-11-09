@@ -167,14 +167,18 @@ export function rehearsalLeakFailureDetail(stdout: string, stderr: string, spawn
 /** Validate before evidence persistence: JSON and injected checkers are both untrusted diagnostic inputs. */
 export function sanitizeRehearsalLeakDetail(detail: string, checkout?: string): string {
   if (detail === 'leak-check produced no structured diagnostic') return detail;
-  const parsed = /^(?<count>\d+) hit\(s\) · (?<marker>[a-z][a-z0-9-]{0,63}) (?<file>.+):(?<line>[1-9]\d*)$/.exec(detail);
+  const parsed = /^(?<count>\d+) hit\(s\) · (?<marker>(?:unknown-marker: )?[a-z][a-z0-9-]{0,63}) (?<file>.+):(?<line>[1-9]\d*)$/.exec(detail);
   if (!parsed?.groups) return 'leak-check produced no structured diagnostic';
-  const { count, marker, file, line } = parsed.groups;
+  const { count, file, line } = parsed.groups;
+  const rawMarker = parsed.groups.marker!.replace(/^unknown-marker: /, '');
+  const markerKnown = LEAK_MARKERS.some(item => item.marker === rawMarker) && !parsed.groups.marker!.startsWith('unknown-marker: ');
+  const marker = markerKnown ? rawMarker : `unknown-marker: ${rawMarker}`;
+  if (!/^[a-z][a-z0-9-]{0,63}$/.test(rawMarker)) return 'leak-check produced no structured diagnostic';
   const countValue = Number(count), lineValue = Number(line);
   if (!Number.isSafeInteger(countValue) || countValue < 1 || !Number.isSafeInteger(lineValue) || lineValue < 1)
     return 'leak-check produced no structured diagnostic';
   const parts = file!.split('/');
-  if (!LEAK_MARKERS.some(item => item.marker === marker) || file!.startsWith('/')
+  if (file!.startsWith('/')
     || /[\p{Cc}]/u.test(file!) || parts.some(part => !part || part === '.' || part === '..'))
     return 'leak-check produced no structured diagnostic';
   if (checkout) {
@@ -188,8 +192,8 @@ export function sanitizeRehearsalLeakDetail(detail: string, checkout?: string): 
       if (!realFile.startsWith(`${checkoutRoot}/`))
         return 'leak-check produced no structured diagnostic';
       const sourceLine = readFileSync(realFile, 'utf8').split(/\r?\n/)[lineValue - 1];
-      const markerPattern = LEAK_MARKERS.find(item => item.marker === marker)?.pattern;
-      if (!sourceLine || !markerPattern?.test(sourceLine)) return 'leak-check produced no structured diagnostic';
+      const markerPattern = markerKnown ? LEAK_MARKERS.find(item => item.marker === rawMarker)?.pattern : undefined;
+      if (!sourceLine || (markerKnown && !markerPattern?.test(sourceLine))) return 'leak-check produced no structured diagnostic';
     } catch { return 'leak-check produced no structured diagnostic'; }
   }
   return `${countValue} hit(s) · ${marker} ${file}:${lineValue}`;

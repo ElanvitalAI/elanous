@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { ensureGateHostReservationDirectory, inspectReleaseGateHost, readGateHostResourcesForHost, reserveReleaseGateHosts } from '../../src/release-loop/gate-host-reservation.js';
 import { debug } from '../../src/debug/log.js';
@@ -207,23 +208,29 @@ export function writeRollingMainState(path: string, state: RollingMainState): vo
 }
 
 function readMainTip(repo: string): string {
-  const fetch = spawnSync('git', ['fetch', 'origin', 'main'], { cwd: repo, encoding: 'utf8', timeout: 60_000 });
+  const fetch = spawnSync('git', ['fetch', 'origin', 'main'], {
+    cwd: repo, encoding: 'utf8', timeout: 60_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   if (fetch.status !== 0) throw new Error(`could not refresh origin/main: ${(fetch.stderr || fetch.error)?.toString().trim()}`);
-  const tip = spawnSync('git', ['rev-parse', 'origin/main'], { cwd: repo, encoding: 'utf8' });
+  const tip = spawnSync('git', ['rev-parse', 'origin/main'], { cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   const commit = tip.status === 0 ? tip.stdout.trim() : '';
   if (!SHA.test(commit)) throw new Error('origin/main tip is unreadable');
   return commit;
 }
 
 function readFirstParentChain(repo: string, mainTip: string): string[] {
-  const history = spawnSync('git', ['rev-list', '--first-parent', mainTip], { cwd: repo, encoding: 'utf8', timeout: 30_000 });
+  const history = spawnSync('git', ['rev-list', '--first-parent', mainTip], {
+    cwd: repo, encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   if (history.status !== 0) throw new Error(`origin/main first-parent history is unreadable: ${(history.stderr || history.error)?.toString().trim()}`);
   return history.stdout.trim().split(/\r?\n/).filter(Boolean);
 }
 
 async function runRollingBisectSidecar(input: { repo: string; root: string; version: string; previousVersion: string;
   baseCommit: string; cutCommit: string; introduced: readonly string[]; host: string }): Promise<{ path: string }> {
-  const history = spawnSync('git', ['rev-list', '--first-parent', '--parents', input.cutCommit], { cwd: input.repo, encoding: 'utf8', timeout: 15_000 });
+  const history = spawnSync('git', ['rev-list', '--first-parent', '--parents', input.cutCommit], {
+    cwd: input.repo, encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   if (history.status !== 0) throw new Error(`bisect first-parent history unavailable: ${(history.stderr || history.error)?.toString().trim()}`);
   const chain = history.stdout.trim().split(/\r?\n/).filter(Boolean).map((line) => line.split(/\s+/)[0]!);
   const range = firstParentCommitsBetween(chain, input.baseCommit, input.cutCommit);
@@ -251,17 +258,19 @@ function gateOwnerMail(recordPath: string, commit: string): void {
     // The sidecar exposes owner cards only after shadow and operational attribution agree.
     const findings: Array<{ file: string; firstFailingCommit: string; pullRequest?: number | null; owner?: string | null }> = record.findings ?? [];
     for (const finding of findings) {
-      const subject = spawnSync('git', ['show', '-s', '--format=%s', finding.firstFailingCommit], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000 });
+      const subject = spawnSync('git', ['show', '-s', '--format=%s', finding.firstFailingCommit], {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 10_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+      });
       const pr = finding.pullRequest ?? (subject.status === 0 ? Number(/#(\d{4,})\b/.exec(subject.stdout)?.[1]) || null : null);
       const ownerResult = pr ? spawnSync('gh', ['pr', 'view', String(pr), '--json', 'assignees,author', '--jq', '.assignees[0].login // .author.login'],
-        { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000 }) : null;
+        { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER }) : null;
       const owner = finding.owner ?? (ownerResult?.status === 0 ? ownerResult.stdout.trim() || null : null);
       const recipient = owner && /^[A-Za-z0-9_-]+$/.test(owner) ? owner : 'OP';
       const body = `GATE-ROLLING-MAIN ${commit.slice(0, 12)} introduced ${finding.file}; first failing ${finding.firstFailingCommit}; PR ${pr ? `#${pr}` : 'unresolved'}; owner ${owner ?? 'unresolved'}. Evidence: ${recordPath}`;
       const posted = spawnSync('eln', ['msg', 'post', '--from', 'GATE-G', '--to', recipient, '--kind', 'report', '--body', body],
-        { encoding: 'utf8', timeout: 15_000 });
+        { encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
       if (posted.status !== 0 && recipient !== 'OP') spawnSync('eln', ['msg', 'post', '--from', 'GATE-G', '--to', 'OP', '--kind', 'report', '--body', body],
-        { encoding: 'utf8', timeout: 15_000 });
+        { encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     }
   } catch (error) { debug.log('release-loop.rolling-main', 'owner-mail-unmeasured', { commit, recordPath, error: String(error) }); }
 }

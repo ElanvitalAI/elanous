@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/fake-temp-cleanup.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/fake-temp-cleanup.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Uses isolated OS temporary roots and verifies post-run filesystem state without writing production logs.",
+  "deviceId": "fake-temp-cleanup",
+  "scenarioIds": [
+    "TASK-TEMP-CLEANUP"
+  ]
+}

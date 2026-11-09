@@ -19,10 +19,8 @@ import { chooseFrom } from '../onboarding/io-extended.js';
 import {
   CODEX_MODELS, findCodexModel, defaultCodexModel,
 } from './models.js';
-import {
-  getUserConfig, saveUserConfig, markOnboardingComplete,
-  type UserConfig,
-} from '../user-config.js';
+import { getUserConfig, saveUserConfig, markOnboardingComplete } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import type { WizardIO } from '../onboarding.js';
 
 /** Auth modes:

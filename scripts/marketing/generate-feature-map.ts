@@ -18,11 +18,17 @@ function clean(text: string): string {
   return text.replace(/\*\*/g, '').replace(/\s+/g, ' ').trim();
 }
 
+function hintedPwaRoutes(hint: string): string[] {
+  return [...hint.matchAll(/(?:^|[\s⊕,;|])`?(\/[^\s`·⊕,;|]+)`?/g)].map((match) => match[1]!);
+}
+
 function gradeFor(feature: string, hint: string, registry: Registry): Maturity | undefined {
   // A surface alone ("cli", "telegram") does not identify a feature in the registry.
-  const key = /\/(?:[\w-]+)(?:\/[\w-]+)*/.exec(hint)?.[0];
-  if (key && Object.prototype.hasOwnProperty.call(registry.pwaRoute, key))
-    return registry.pwaRoute[key as keyof Registry['pwaRoute']].pwa;
+  const routes = hintedPwaRoutes(hint);
+  if (routes.length) {
+    if (routes.some((route) => !Object.prototype.hasOwnProperty.call(registry.pwaRoute, route))) return undefined;
+    return registry.pwaRoute[routes[0]! as keyof Registry['pwaRoute']].pwa;
+  }
   const named = /\b(cliRoot|tuiSlash|telegramCommand|discordCommand):([\w:-]+)/.exec(hint);
   if (named) {
     const group = registry[named[1] as Exclude<keyof Registry, 'pwaRoute'>] as Record<string, Maturity>;
@@ -63,10 +69,12 @@ export function generateFeatureMap(input: { map: string; items: readonly Checkli
     const matched = ids.map((part) => green.get(part)).filter((item): item is ChecklistItem => !!item);
     const complete = ids.length > 0 && ids.every((part) => green.has(part));
     const maturity = hasChecklistCell ? gradeFor(feature, hint!, input.registry) : undefined;
-    const mapMaturity = /^(?:\/\S+\s+)?(stable|beta)\b/i.exec(clean(hint!))?.[1]?.toLowerCase();
-    const grade: Grade = hasChecklistCell
+    const mapMaturity = /^(?:\/\S+\s+)?(stable|beta)\b/i.exec(clean(hint!).replace(/`/g, ''))?.[1]?.toLowerCase();
+    const hintedRoutes = hintedPwaRoutes(hint!);
+    const routeIsRegistered = hintedRoutes.every((route) => Object.prototype.hasOwnProperty.call(input.registry.pwaRoute, route));
+    const grade: Grade = !routeIsRegistered ? '로드맵' : hasChecklistCell
       ? complete && maturity === 'stable' ? '된다' : complete && maturity === 'beta' ? '베타' : '로드맵'
-      : !clean(publication!).startsWith('✅') ? '로드맵'
+      : !clean(publication!).startsWith('✅') || !routeIsRegistered ? '로드맵'
         : mapMaturity === 'stable' ? '된다' : mapMaturity === 'beta' ? '베타' : '로드맵';
     const evidencePrs = hasChecklistCell
       ? [...new Set(matched.flatMap((item) => prs(item.evidence ?? '')))] : prs(evidence!);

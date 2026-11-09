@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/fake-google-drive-world.ts",
+  "reason": "APP-OAUTH-ONE: synthetic Google Drive files.list readonly fake world; no live OAuth or API call."
+}

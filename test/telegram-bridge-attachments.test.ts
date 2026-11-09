@@ -14,7 +14,7 @@ import type { ContentBlock as AcpContentBlock } from '@agentclientprotocol/sdk';
 
 import { bootAcpServer } from '../src/boot/acp-server.js';
 import { createTelegramAcpBridge } from '../src/telegram-acp-bridge.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { waitForSocket } from './helpers/wait-for-socket.js';
 
 let tmp: string;

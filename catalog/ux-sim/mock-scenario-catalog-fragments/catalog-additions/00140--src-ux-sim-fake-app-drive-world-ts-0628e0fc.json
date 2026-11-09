@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/fake-app-drive-world.ts",
+  "reason": "APP-WEB-DRIVE-TENANT: tenant-isolated read-only Drive fake world for the D5-preapproval contract."
+}

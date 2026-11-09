@@ -10,7 +10,8 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { discoverChromeBinary } from '../browser-cdp/client.js';
 import { resolveUsableLlm, type UsableLlm } from '../llm/usable-llm.js';
 import { detectLocale } from '../expression/locale.js';
-import { findRetiredConfigKeysInFile, getUserConfig, type RetiredConfigKey, type UserConfig } from '../user-config.js';
+import { findRetiredConfigKeysInFile, getUserConfig } from '../user-config.js';
+import type { RetiredConfigKey, UserConfig } from '../user-config/types.js';
 import { codeRevision } from '../version/code-revision.js';
 import {
   checkReadiness,

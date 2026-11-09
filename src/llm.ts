@@ -16,7 +16,7 @@ import type { LLMUsage } from './prompt-cache/types.js';
 import { applyOpenRouterCacheControl, openRouterPromptCacheFamily } from './prompt-cache/openrouter.js';
 import { detectLocale, type Locale } from './expression/locale.js';
 import { format, getMessages } from './expression/i18n/index.js';
-import type { ModelRole } from './user-config.js';
+import type { ModelRole } from './user-config/types.js';
 // ⭐ grok 자격 해석 — 구독(OAuth) 1순위 · API 키 2순위. ACP 경로와 «같은» 규칙.
 import { isGrokUnauthorized, refreshGrokSubscriptionToken, resolveFreshGrokCredential, resolveGrokCredential } from './grok/credential.js';
 import {
@@ -11698,7 +11698,7 @@ export async function streamLLMWithTools(
 // /v1/chat/completions; callers wanting a self-hosted proxy set
 // `baseUrl` in config.
 
-import type { LLMConfig as UCLLMConfig, UserConfig } from './user-config.js';
+import type { LLMConfig as UCLLMConfig, UserConfig } from './user-config/types.js';
 import { loadTokens, readCodexMirrorTokens } from './oauth/store.js';
 import { resolveCodexAccount, effectiveCodexHome } from './oauth/codex-account.js';
 import { codexCreditSpendReason } from './oauth/codex-billing-route.js';
@@ -12090,7 +12090,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
           ? (cfgBase.endsWith('/responses') ? cfgBase : `${cfgBase.replace(/\/$/, '')}/responses`)
           : `${CODEX_API_BASE_URL}/responses`;
         const endpointSupportsStore = !responsesUrl.includes('chatgpt.com/backend-api');
-        const useStore = endpointSupportsStore && cfg.codexStore !== false;
+        const useStore = endpointSupportsStore;
         // Image-pipeline P3 (2026-05-05) — gate the function_call_output
         // ContentItem[] wire on the active model. gpt-5 family supports
         // image_url in tool results; legacy gpt-4 / non-vision routes

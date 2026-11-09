@@ -1,3 +1,4 @@
+import { asRecord } from '../../primitives/guards.js';
 import { defaultHerdrCliRunner, type HerdrCliRunner } from '../../pty-shell/herdr-prompt.js';
 import type { SidetabRow } from '../../sidetab-core/model.js';
 
@@ -41,19 +42,15 @@ export interface HerdrSidetabPortal {
   sendKey(paneId: string, key: string): Promise<void>;
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
-
 function paneRowsFromSnapshot(value: unknown): HerdrPaneSnapshot[] {
-  const root = asRecord(value);
-  const result = asRecord(root?.result);
+  const root = asRecord(value, { fallback: 'undefined' });
+  const result = asRecord(root?.result, { fallback: 'undefined' });
   if (!result) throw new Error('Herdr snapshot 형식 오류 · result 객체가 없습니다');
-  const session = asRecord(result?.session_snapshot);
+  const session = asRecord(result?.session_snapshot, { fallback: 'undefined' });
   const panes = result?.panes ?? session?.panes;
   if (!Array.isArray(panes)) throw new Error('Herdr snapshot 형식 오류 · panes 배열이 없습니다');
   const invalidPane = panes.findIndex((candidate) => {
-    const pane = asRecord(candidate);
+    const pane = asRecord(candidate, { fallback: 'undefined' });
     return typeof pane?.pane_id !== 'string' || pane.pane_id.length === 0;
   });
   if (invalidPane >= 0) throw new Error(`Herdr snapshot 형식 오류 · panes[${invalidPane}].pane_id가 없습니다`);
@@ -117,7 +114,7 @@ function commandOutput(result: { code: number | null; stdout: string; stderr: st
     let message = body || `herdr exited with rc=${result.code ?? 'unknown'}`;
     if (body.startsWith('{')) {
       try {
-        const error = asRecord(asRecord(JSON.parse(body))?.error);
+        const error = asRecord(asRecord(JSON.parse(body), { fallback: 'undefined' })?.error, { fallback: 'undefined' });
         if (typeof error?.message === 'string') message = error.message;
       } catch { /* preserve stderr */ }
     }
@@ -126,7 +123,7 @@ function commandOutput(result: { code: number | null; stdout: string; stderr: st
   const text = result.stdout.trim();
   if (!text.startsWith('{')) return text;
   try {
-    const resultEnvelope = asRecord(asRecord(JSON.parse(text))?.result);
+    const resultEnvelope = asRecord(asRecord(JSON.parse(text), { fallback: 'undefined' })?.result, { fallback: 'undefined' });
     for (const key of ['text', 'output', 'screen', 'content'] as const) {
       if (typeof resultEnvelope?.[key] === 'string') return resultEnvelope[key] as string;
     }

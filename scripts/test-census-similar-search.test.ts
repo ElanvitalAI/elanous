@@ -3,12 +3,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildSimilarSearchReport, caseRowsFromSelection, parseArgs, runSimilarSearchCli } from './test-census-similar-search.js';
+import { searchableText } from './test-census/similar-search.js';
 import type { EmbedFn } from '../src/domains/knowledge.js';
 
 describe('test-census similar-search CLI input', () => {
   test('selects exact file and case identities from the census and derives source-module context', () => {
     const cases = caseRowsFromSelection({ rows: [
-      { file: 'src/auth/token.test.ts', name: 'refresh keeps session', contract: 'toEqual', owner: 'SEC' },
+      { file: 'src/auth/token.test.ts', name: 'refresh keeps session', contract: 'toEqual', owner: 'SEC', numericCandidateProvenance: [{ literal: '4', line: 12, blameCommit: 'a'.repeat(40), reason: 'Provider permits four retries.' }] },
       { file: 'src/ledger/receipt.test.ts', name: 'commit writes receipt', contract: 'toBe' },
       { file: 'src/cli/options.test.ts', suitePath: ['remote option entrypoint'], name: 'rejects an unknown option', contract: 'toThrow' },
     ] }, ['src/auth/token.test.ts > refresh keeps session', 'src/cli/options.test.ts > remote option entrypoint > rejects an unknown option']);
@@ -20,6 +21,7 @@ describe('test-census similar-search CLI input', () => {
       targetSummary: 'toEqual',
       module: 'src/auth',
       owner: 'SEC',
+      numericCandidateProvenance: [{ literal: '4', line: 12, blameCommit: 'a'.repeat(40), reason: 'Provider permits four retries.' }],
     }, {
       id: 'src/cli/options.test.ts#remote option entrypoint > rejects an unknown option',
       file: 'src/cli/options.test.ts',
@@ -29,6 +31,10 @@ describe('test-census similar-search CLI input', () => {
       module: 'src/cli',
       owner: undefined,
     }]);
+    const indexedText = searchableText(cases[0]!);
+    expect(indexedText).toContain('numeric literal 4 at line 12');
+    expect(indexedText).toContain(`blame commit ${'a'.repeat(40)}`);
+    expect(indexedText).toContain('commit reason Provider permits four retries.');
   });
 
   test('rejects duplicate and missing rows instead of silently shrinking the measurement', () => {
@@ -54,7 +60,7 @@ describe('test-census similar-search CLI input', () => {
   test('builds fixed top-three output through all indexes with an injected embedder', async () => {
     const embed: EmbedFn = async () => ({ vector: new Float32Array([1, 0, 0, 0]), model: 'fixture' });
     const report = await buildSimilarSearchReport([
-      { id: 'a', file: 'src/auth/a.test.ts', name: 'session refresh preserves caller', assertions: 'toEqual session', targetSummary: 'session stays active', module: 'src/auth', contractId: 'auth' },
+      { id: 'a', file: 'src/auth/a.test.ts', name: 'session refresh preserves caller', assertions: 'toEqual session', targetSummary: 'session stays active', module: 'src/auth', contractId: 'auth', numericCandidateProvenance: [{ literal: '4', line: 12, blameCommit: 'a'.repeat(40), reason: 'Provider permits four retries.' }] },
       { id: 'b', file: 'src/auth/b.test.ts', name: 'credential renewal retains context', assertions: 'toEqual caller', targetSummary: 'session remains active', module: 'src/auth', contractId: 'auth' },
       { id: 'c', file: 'src/ledger/c.test.ts', name: 'write durable receipt', assertions: 'toBe receipt', targetSummary: 'receipt persisted', module: 'src/ledger', contractId: 'ledger' },
       { id: 'd', file: 'src/queue/d.test.ts', name: 'retry failed job', assertions: 'toHaveBeenCalled', targetSummary: 'job retry', module: 'src/queue', contractId: 'queue' },
@@ -62,7 +68,9 @@ describe('test-census similar-search CLI input', () => {
     expect(report.casesIndexed).toBe(4);
     expect(report.candidateLimit).toBe(3);
     expect(report.interpretation).toContain('union');
+    expect(report.auditQuestions.expectedValueJustification).toContain('Which git blame commit introduced the literal, and what reason does that commit record?');
     expect(report.cases).toHaveLength(4);
+    expect(report.cases.find((result) => result.caseId === 'a')?.numericCandidateProvenance).toEqual([{ literal: '4', line: 12, blameCommit: 'a'.repeat(40), reason: 'Provider permits four retries.' }]);
     for (const result of report.cases) {
       expect(result.top3.bm25.length).toBeLessThanOrEqual(3);
       expect(result.top3.vector.length).toBeLessThanOrEqual(3);

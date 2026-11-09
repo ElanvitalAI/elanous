@@ -11,7 +11,8 @@ import { join } from 'node:path';
 import { debug } from './debug/log.js';
 import { getProviderForConfig, openRouterToolChoice, toChatToolChoice, toResponsesToolChoice, type ToolChoice } from './llm.js';
 import { saveTokens } from './oauth/store.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
+import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
 
 const tools: LLMToolSpec[] = [{ name: 'demo', description: 'demo', parameters: { type: 'object', properties: { a: { type: 'string' } } } }];
 const messages = [{ role: 'user' as const, content: 'hello' }];
@@ -73,11 +74,12 @@ async function withCodexResponsesCredential(run: () => Promise<void>): Promise<v
 
 async function captureBody(llm: Record<string, unknown>, opts: { toolChoice?: ToolChoice; tools?: LLMToolSpec[] | null }) {
   const bodies: string[] = [];
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-    bodies.push(String(init?.body));
-    return new Response('data: [DONE]\n\n', { status: 200 });
-  }) as typeof fetch);
-  try {
+  const routes = ['/api/v1/chat/completions', '/v1/messages', '/v1/chat/completions', '/backend-api/codex/responses']
+    .map((url) => ({ url, method: 'POST' as const, response: (request: import('./ux-sim/fake-fetch.js').FakeFetchRouteRequest) => {
+      bodies.push(request.body ?? '');
+      return new Response('data: [DONE]\n\n', { status: 200 });
+    } }));
+  await withFakeFetchDevice(routes, async (fetchDevice) => {
     const provider = getProviderForConfig({ llm } as unknown as UserConfig);
     const streamOpts = {
       ...(opts.tools === null ? {} : { tools: opts.tools ?? tools }),
@@ -85,10 +87,9 @@ async function captureBody(llm: Record<string, unknown>, opts: { toolChoice?: To
     };
     for await (const _ of provider.streamChat!(messages, streamOpts)) { /* consume */ }
     expect(bodies.length).toBeGreaterThan(0);
-    return bodies[0]!;
-  } finally {
-    mock.mockRestore();
-  }
+    expect(fetchDevice.calls()).toHaveLength(bodies.length);
+  });
+  return bodies[0]!;
 }
 
 const OR_GLM = { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3', apiKey: 'test-key' };

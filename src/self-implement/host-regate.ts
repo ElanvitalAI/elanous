@@ -270,7 +270,9 @@ function slotOwnerAlive(slot: string): boolean {
 }
 
 export async function acquireSlot(repoRoot: string, opts: { waitMs?: number; pollMs?: number; now?: () => number } = {}): Promise<(() => void) & { worktree: string }> {
-  const gitDir = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: repoRoot, encoding: 'utf8' });
+  const gitDir = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+    cwd: repoRoot, encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER,
+  });
   if (gitDir.status !== 0 || !gitDir.stdout.trim()) throw new Error('git common directory unavailable for host regate lock');
   const root = join(gitDir.stdout.trim(), 'elanous-host-regate');
   mkdirSync(root, { recursive: true });
@@ -299,7 +301,9 @@ export async function acquireSlot(repoRoot: string, opts: { waitMs?: number; pol
 }
 
 function removeBrokenSlotRegistration(repoRoot: string, worktree: string): void {
-  const gitDir = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: repoRoot, encoding: 'utf8' });
+  const gitDir = spawnSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+    cwd: repoRoot, encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER,
+  });
   if (gitDir.status !== 0 || !gitDir.stdout.trim()) throw new Error('git common directory unavailable for slot repair');
   const registrations = join(gitDir.stdout.trim(), 'worktrees');
   if (!existsSync(registrations)) return;

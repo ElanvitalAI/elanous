@@ -25,6 +25,7 @@ import { cardIdFromBody, cellIdFromBody, guardNewPr, hasCardMarker, parseDiffHun
 import { labelsForAxis, PR_LABEL_NAMES } from '../github/pr-labels.js';
 import { getUserConfig } from '../user-config.js';
 import { runSuffixKey } from '../self-implement/salvage-branches.js';
+import { forecastPrPushConflicts, recordUnmeasuredPrPushConflict } from '../cli/pr-land-overlap-evidence.js';
 
 /** ★ stderr 캡처(대표 2026-07-21·관측 갭) — 종전엔 stdout 만 담아 git/gh 실패 사유가 소실됐다
  *  (705308: makePr 실패가 bare null 로 뭉뚱그려져 triage 가 "인증·네트워크"로 환각 오라우팅).
@@ -1065,6 +1066,43 @@ export function makePrManager(
       const pushArgs = candidateCardId
         ? ['-C', cwd, 'push', '-u', 'origin', input.branch]
         : ['-C', cwd, 'push', '--force', '-u', 'origin', input.branch];
+      // PR-PUSH-CONFLICT-DRYRUN: forecast only; measurement/storage failures never change push behavior.
+      if (comparisonBase) {
+        const bound = process.env.ELANOUS_TASK_BOUND_PR;
+        const candidatePr = bound && /^[1-9]\d*$/u.test(bound) ? Number(bound) : null;
+        const owner = input.seat ?? seatFromEnvironment();
+        let observedHead: string | null = null;
+        const recordUnknown = (reason: string) => {
+          try {
+            recordUnmeasuredPrPushConflict({ pr: candidatePr, head: observedHead, base: comparisonBase!, owner, reason });
+          } catch (error) {
+            debug.log('pr-manager', 'push-conflict-forecast-unmeasured', {
+              reason,
+              error: error instanceof Error ? error.message : 'unknown',
+            }, { level: 'warn' });
+          }
+        };
+        try {
+          const inventory = readOpenPrs(run, { cwd,
+            ...(runner === defaultCmdRunner ? { runParallel: defaultCensusParallelRunner, diffCache: sharedCensusDiffCache } : {}),
+          });
+          const head = run('git', ['-C', cwd, 'rev-parse', 'HEAD'], opts);
+          observedHead = head.ok && head.out.trim() ? head.out.trim() : null;
+          if (inventory.status === 'checked' && observedHead) {
+            forecastPrPushConflicts({
+              cwd, pr: candidatePr, head: observedHead, base: comparisonBase,
+              owner, peers: inventory.prs.filter(pr => pr.number !== candidatePr)
+                .map(pr => ({ pr: pr.number, head: pr.headSha, files: pr.files, owner: pr.seat })),
+              run,
+            });
+          } else {
+            recordUnknown(inventory.status === 'checked' ? 'candidate-head-unavailable' : 'open-pr-census-unavailable');
+          }
+        } catch (error) {
+          recordUnknown('forecast-unavailable');
+          debug.log('pr-manager', 'push-conflict-forecast-unmeasured', { error: error instanceof Error ? error.message : 'unknown' }, { level: 'warn' });
+        }
+      }
       let pushR = runGitWrite(pushArgs);
       let pushAttempts = 1;
       while (!pushR.ok && pushAttempts < MAX_PUSH_ATTEMPTS && isTransientPushFailure(detailOf(pushR))) {

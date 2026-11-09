@@ -16,7 +16,7 @@
 // the legacy dashboard.
 
 import { getElanousConfigDir } from '../elanous-config-dir.js';
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { hostname } from 'node:os';
 import { request as httpRequest } from 'node:http';
 import { isIP } from 'node:net';
@@ -119,8 +119,21 @@ import { discoverWorkflows as discoverWorkflowsForDaemon } from '../workflow-run
 import { buildDefaultWorkflowDeps as buildWorkflowDaemonDeps } from './api/workflows.js';
 import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } from './api/http-server.js';
 import { loadNexusAppHost } from './apps/app-host.js';
+import { createAppPublishServerAdapter } from './apps/app-publish.js';
+import {
+  createAppSiteDeployRoute,
+  fetchAppMemberOwner,
+  createLectureScrapDeploymentOperations,
+  type AppSiteDeploymentOperations,
+} from './apps/app-site-deploy.js';
+import { publicAppAddress } from './apps/console-address.js';
+import { resolvePublicAppUserId } from '../relay/relay-server.js';
+export { resolveAppDeploymentOwner } from './apps/app-deployment-owner.js';
+export { resolveVerifiedOwner, type VerifiedAppOwner } from './apps/app-host.js';
 import { createAppLifecycleEvent } from './apps/app-lifecycle-ledger.js';
 import { createAppLifecycleStore, type AppLifecycleStore } from './apps/app-db.js';
+import { createAppSimulationStore, type AppSimulationStore } from './apps/app-simulation-db.js';
+import { createAppSimulationRoute } from './apps/app-simulation-route.js';
 import {
   claimNexusFunnelFirstSuccess,
   tryCreateNexusFunnelRuntime,
@@ -132,7 +145,8 @@ import { createAppStorage, type AppStorage } from './apps/app-storage.js';
 import { createAppStorageRoute } from './apps/app-storage-route.js';
 import { createAppJobLedger, createAppJobs, createAppJobsGenerateAction, handleAppJobRequest, type AppGenerationRuntime } from './apps/app-jobs.js';
 import { createHiggsfieldAppBackend, downloadHiggsfieldResult } from './apps/higgsfield-backend.js';
-import { resolveStorageConfig } from '../storage/object-store.js';
+import { createObjectStore, resolveStorageConfig } from '../storage/object-store.js';
+import { APP_DB_BACKUP_HISTORY_KEY_REF, APP_DB_BACKUP_KEY_REF } from './apps/app-db-backup.js';
 import { checkAuth } from './api/meta-api.js';
 import { startControlServer } from '../control-plane/server.js';
 import { nexusMemberMachine, startMemberHeartbeat } from '../control-plane/member.js';
@@ -158,6 +172,7 @@ import {
 } from '../notes/daily-reflection-scheduler.js';
 import { type ScheduleRunnerHandle } from '../domains/schedule-runner.js';
 import { startWatchDefaultScheduler } from '../domains/watch-default-scheduler.js';
+import { startEdgeCreatorNightlyScheduler, type EdgeCreatorNightlySchedulerHandle } from '../ux-sim/edge-creator-nightly.js';
 import { resolvePwaStaticDir } from './static-dir-resolve.js';
 import {
   createHitlPendingCallbacks,
@@ -240,7 +255,8 @@ import { globalAcpAgentManager } from '../acp/agent-manager.js';
 import { fetchCodexPlugins } from '../acp/codex-plugins.js';
 import { globalAgentCliConversationStore } from './api/agent-cli-conversation-store.js';
 import { globalMissionRouter } from '../llm/mission-router.js';
-import { getUserConfig, type UserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { debug } from '../debug/log.js';
 import { createNotificationActionLoopback } from '../web-push/notification-action-loopback.js';
@@ -264,7 +280,7 @@ import {
   type PwaVoiceAdapter,
 } from '../voice/channel-adapters/pwa-voice-adapter.js';
 import { getIntakeStore } from '../intake-plane/runtime.js';
-import { join as joinPath } from 'node:path';
+import { join as joinPath, resolve as resolvePath } from 'node:path';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import type { SupervisorSpawnBackend } from './supervisor/spawn.js';
 import type { HealthProbeBackend } from './supervisor/health.js';
@@ -689,6 +705,8 @@ export interface RunNexusOptions {
   funnelObserverForTesting?: NexusFunnelEventSink;
   /** Injected app generation queue/provider; tests use fake Higgsfield and production adapters are configured separately. */
   appGenerationRuntime?: AppGenerationRuntime;
+  /** Server-side app deployment stages; the route never accepts deployment callbacks from an app request. */
+  appSiteDeploymentOperations?: AppSiteDeploymentOperations;
   registerMcpClientsFn?: typeof registerMcpClients;
   getMcpUserConfigForTesting?: typeof getUserConfig;
   reloadUserConfigForTesting?: typeof import('../user-config.js').reloadUserConfig;
@@ -1332,6 +1350,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   let httpServer: NexusHttpServer | undefined;
   let appStorageService: AppStorage | undefined;
   let appLifecycleStore: AppLifecycleStore | undefined;
+  let appSimulationStore: AppSimulationStore | undefined;
   let appGenerationRuntime = opts.appGenerationRuntime;
   let appFunnelRuntime: NexusFunnelRuntime | undefined;
   let appAuthSigningKey: string | undefined;
@@ -1428,6 +1447,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   // it. Tests with detachForTesting set leave this undefined.
   let dailyReflectionScheduler: DailyReflectionSchedulerHandle | undefined;
   let watchDefaultScheduler: ReturnType<typeof startWatchDefaultScheduler> | undefined;
+  let edgeCreatorNightlyScheduler: EdgeCreatorNightlySchedulerHandle | undefined;
   // RFC #2161 FU A8 (2026-05-11) — discovery cron via NEXUS. Dormant
   // by default (opt-in via `ELANOUS_DISCOVERY_CRON_INTERVAL_MS`); when
   // configured, fires runDiscovery every interval and pushes the
@@ -2290,6 +2310,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     if (!appFunnelRuntime) {
       debug.log('nexus.funnel', 'identity-unavailable', {}, { level: 'warn' });
     }
+    const appPublicUserSlug = resolvePublicAppUserId();
     try {
       const keyId = 'nexus.app-auth-signing-key';
       let key = await getSecretAsync(keyId);
@@ -2298,15 +2319,52 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         await setSecretAsync(keyId, key);
       }
       appAuthSigningKey = key;
+      let backupKey: Buffer | undefined;
+      const historicalBackupKeys = new Map<string, Buffer>();
+      try {
+        const backupSecret = await getSecretAsync(APP_DB_BACKUP_KEY_REF);
+        if (backupSecret) backupKey = createHash("sha256").update(backupSecret).digest();
+        else debug.log("nexus.app-db-backup", "credential-missing", { keyRef: APP_DB_BACKUP_KEY_REF }, { level: "error" });
+        // Rotation contract: the shared credential slot contains JSON { keyId: base64url(32-byte derived key) }.
+        // Values stay in the credential manager and are never logged; only well-formed, self-identifying keys load.
+        const historySecret = await getSecretAsync(APP_DB_BACKUP_HISTORY_KEY_REF);
+        if (historySecret) {
+          const parsed: unknown = JSON.parse(historySecret);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            for (const [id, encoded] of Object.entries(parsed)) {
+              if (typeof encoded !== "string") continue;
+              const material = Buffer.from(encoded, "base64url");
+              if (material.byteLength === 32 && createHash("sha256").update(material).digest("hex").slice(0, 24) === id) historicalBackupKeys.set(id, material);
+              else material.fill(0);
+            }
+          }
+        }
+      } catch (error) {
+        debug.log("nexus.app-db-backup", "credential-unavailable", {
+          keyRef: APP_DB_BACKUP_KEY_REF,
+          errorType: error instanceof Error ? error.name : "unknown",
+        }, { level: "error" });
+      }
+      const databaseBackup = {
+        store: createObjectStore(resolveStorageConfig(getUserConfig() as Parameters<typeof resolveStorageConfig>[0])),
+        key: backupKey,
+        historicalKeys: historicalBackupKeys,
+      };
       appHostLoad = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'), undefined, {
-        dir: joinPath(nexusRootDir(), 'app-session-tokens'), key, funnel: appFunnelRuntime,
-      });
+        dir: joinPath(nexusRootDir(), 'app-session-tokens'), key, funnel: appFunnelRuntime, databaseBackup,
+      }, appPublicUserSlug);
     } catch (error) {
       debug.log('nexus.app-auth', 'signing-key-unavailable', { reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
       // App hosts stay mounted as a reserved origin but fail closed with 503 until auth storage works.
-      appHostLoad = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'));
+      appHostLoad = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'), undefined, undefined, appPublicUserSlug);
     }
     const { appHost, issues: appHostIssues } = appHostLoad;
+    const appPublishAdapter = appPublicUserSlug ? createAppPublishServerAdapter(appHost, {
+      getManifest: slug => appHost.getManifest(slug),
+      authorizeOwner: request => !!metaApiOpts && checkAuth(request, metaApiOpts),
+      originForApp: slug => publicAppAddress({ appSlug: slug, userSlug: appPublicUserSlug }),
+    }) : undefined;
+    const publicAppHost = appPublishAdapter?.appHost ?? appHost;
     try {
       appLifecycleStore = createAppLifecycleStore(joinPath(nexusRootDir(), 'app-lifecycle.sqlite'));
       for (const slug of appHost.slugs) {
@@ -2316,6 +2374,12 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       debug.log('nexus.app-lifecycle', 'store-unavailable', { reason: error instanceof Error ? error.message : 'unknown' }, { level: 'error' });
       try { appLifecycleStore?.close(); } catch { /* best-effort */ }
       appLifecycleStore = undefined;
+    }
+    try { appSimulationStore = createAppSimulationStore(joinPath(nexusRootDir(), 'app-simulation.sqlite')); }
+    catch (error) {
+      debug.log('nexus.app-simulation', 'store-unavailable', { reason: error instanceof Error ? error.message : 'unknown' }, { level: 'error' });
+      try { appSimulationStore?.close(); } catch { /* best-effort */ }
+      appSimulationStore = undefined;
     }
     for (const issue of appHostIssues) {
       debug.log('nexus.app-host', 'app-mount-rejected', issue, { level: 'warn' });
@@ -3237,11 +3301,39 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       },
       run: input => appActionExecutor.run(input),
     });
+    const appPublishRoute = appPublishAdapter
+      ? (request: Request) => appPublishAdapter.handleApiRequest(request)
+      : undefined;
+    const appSiteDeploymentOperations = opts.appSiteDeploymentOperations ?? createLectureScrapDeploymentOperations({
+      appsRoot: joinPath(nexusRootDir(), 'apps'),
+      templatesRoot: resolvePath(import.meta.dir, '../../templates'),
+    });
+    const appSiteDeployRoute = appPublicUserSlug ? createAppSiteDeployRoute({
+      ...appSiteDeploymentOperations,
+      configuredPublicUserId: appPublicUserSlug,
+      resolveOwner: (request, appSlug) => httpServer
+        ? fetchAppMemberOwner(request, appSlug, httpServer.url)
+        : Promise.resolve(null),
+      publish: async input => {
+        await appSiteDeploymentOperations.publish(input);
+        appHost.mountDirectory(input.appSlug);
+      },
+      discard: async source => {
+        if (source.appSlug) appHost.unmountDirectory(source.appSlug);
+        await appSiteDeploymentOperations.discard?.(source);
+      },
+    }) : undefined;
     const appStorageRoute = createAppStorageRoute({
       storage: appStorageService,
       getManifest: appSlug => appHost.getManifest(appSlug),
       authorize: candidate => !!metaApiOpts && checkAuth(candidate, metaApiOpts),
     });
+    const appSimulationRoute = appSimulationStore ? createAppSimulationRoute({
+      store: appSimulationStore,
+      authorize: candidate => !!metaApiOpts && checkAuth(candidate, metaApiOpts),
+      hasApp: slug => appHost.slugs.includes(slug),
+      publish: event => { pushEvent(state, event); },
+    }) : undefined;
     const appJobRoute = appGenerationRuntime
       ? (request: Request) => handleAppJobRequest(request, {
         jobs: appGenerationRuntime!.jobs,
@@ -3302,13 +3394,17 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       reloadMcpClients,
       ...(getMcpWidgetServerId ? { getMcpWidgetServerId } : {}),
       ...(pwaStaticDir ? { staticDir: pwaStaticDir } : {}),
-      appHost,
+      appHost: publicAppHost,
       appLifecycleSnapshot: (slug: string) => {
         if (!appLifecycleStore) throw new Error('app lifecycle store is unavailable');
         return appLifecycleStore.snapshot(slug);
       },
-      ...(appFunnelRuntime ? { appPreviewUserSlug: appFunnelRuntime.accountHash.slice(0, 20) } : {}),
-      appRoutes: [appActionRoute, appStorageRoute, ...(appJobRoute ? [appJobRoute] : [])],
+      appSimulationSnapshot: (slug: string) => {
+        if (!appSimulationStore) throw new Error('app simulation store is unavailable');
+        return appSimulationStore.snapshot(slug);
+      },
+      ...(appPublicUserSlug ? { appPreviewUserSlug: appPublicUserSlug } : {}),
+      appRoutes: [...(appPublishRoute ? [appPublishRoute] : []), ...(appSiteDeployRoute ? [appSiteDeployRoute] : []), appActionRoute, ...(appSimulationRoute ? [appSimulationRoute] : []), appStorageRoute, ...(appJobRoute ? [appJobRoute] : [])],
       ...(runtimeIntentPrediction ? { intentPrediction: runtimeIntentPrediction } : {}),
       // next-fluent(태스크 완료 → 다음 액션 1-클릭 칩·2026-07-15) — mission-fabric-aware source +
       // 항상 켜진 라우트(기본 ON). personas 만 선택 사항이며, route 는 503(not-wired) 안 냄.
@@ -3508,6 +3604,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       void scheduleRunner; // 은퇴(undefined 유지)
       try { watchDefaultScheduler = startWatchDefaultScheduler(); }
       catch (error) { debug.log('watch.default', 'failed', { stage: 'boot', reason: error instanceof Error ? error.message : String(error) }); }
+      try { edgeCreatorNightlyScheduler = startEdgeCreatorNightlyScheduler(); }
+      catch (error) { debug.log('ux-sim.edge-creator', 'nightly-scheduler-boot-failed', { reason: error instanceof Error ? error.message : String(error) }); }
     }
   }
 
@@ -3649,6 +3747,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     if (watchDefaultScheduler) {
       try { watchDefaultScheduler.stop(); } catch { /* swallow */ }
     }
+    if (edgeCreatorNightlyScheduler) {
+      try { edgeCreatorNightlyScheduler.stop(); } catch { /* swallow */ }
+    }
     if (scheduleRunner) {
       try { scheduleRunner.stop(); } catch { /* swallow */ }
     }
@@ -3783,6 +3884,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     httpServer?.stop();
     try { appGenerationRuntime?.jobs.close(); } catch { /* best-effort shutdown */ }
     try { appLifecycleStore?.close(); } catch { /* best-effort shutdown */ }
+    try { appSimulationStore?.close(); } catch { /* best-effort shutdown */ }
     appLifecycleStore = undefined;
     if (appStorageService) {
       try { appStorageService.close(); } catch { /* best-effort shutdown */ }

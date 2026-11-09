@@ -4,7 +4,8 @@ import { isScalar, parseDocument } from 'yaml';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { DEFAULT_FALLBACK_CHAIN, isFallbackStep, type FallbackStep } from '../oauth/fallback-chain.js';
 import { isCodexQuotaPolicy } from '../oauth/codex-quota-policy.js';
-import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, MODEL_ROLES, RUNTIME_LLM_PROVIDER_NAMES, parseReviewerMixSpec, parseRoleLlmEntry, parseSubscriptionReviewerSpec, type RoleLlmConfig, type SubscriptionReviewerSpec } from '../user-config.js';
+import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, MODEL_ROLES, RUNTIME_LLM_PROVIDER_NAMES, parseReviewerMixSpec, parseRoleLlmEntry, parseSubscriptionReviewerSpec } from '../user-config.js';
+import type { RoleLlmConfig, SubscriptionReviewerSpec } from '../user-config/types.js';
 
 export interface LlmPolicy {
   version: 1;

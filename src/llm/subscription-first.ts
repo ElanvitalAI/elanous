@@ -12,7 +12,7 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { LLMProviderName } from '../user-config.js';
+import type { LLMProviderName } from '../user-config/types.js';
 
 /** 구독이 어디서 확인됐나 — ⛔ 값 옆에 «출처»를 둔다. */
 export type SubscriptionSource = 'elanous-auth-store' | 'provider-home' | 'none';

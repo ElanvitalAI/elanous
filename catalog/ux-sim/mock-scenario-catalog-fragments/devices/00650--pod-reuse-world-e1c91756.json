@@ -1,0 +1,28 @@
+{
+  "id": "pod-reuse-world",
+  "name": "POD reuse lifecycle world",
+  "implementation": [
+    "src/ux-sim/pod-reuse-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/pod-reuse-world.test.ts"
+  ],
+  "target": "Run shared Pod reuse lifecycle, warm worker selection and mismatch, read-only source reference/copy measurements, and production admission and Job boundaries in the isolated test universe",
+  "inputs": [
+    "safe simulation run ID",
+    "shared fake Kubernetes world",
+    "production warm-worker compatibility inputs"
+  ],
+  "observations": [
+    "world scenario result",
+    "worker provider hit and mismatch",
+    "reference and copy bytes, digest, and local setup time",
+    "admission recommendation and production Job manifest"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/pod-reuse-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

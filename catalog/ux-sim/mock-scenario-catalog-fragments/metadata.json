@@ -1,0 +1,36 @@
+{
+  "version": 2,
+  "deviceCatalogVersion": 25,
+  "runEvidence": {
+    "scope": "ScenarioV0 YAML runs only; catalog entries reference reusable devices/tests, and list/show/devices do not execute them",
+    "runId": "uuid per execution",
+    "event": {
+      "category": "ux.sim.scenario",
+      "name": "completed"
+    },
+    "persistence": "ScenarioV0 and device logsRecorded=yes refer to rows persisted in the isolated test instance logs/logs.db (not production ~/.elanous/logs.db); eventNames lists persisted category/event pairs only, while debug-spy-only observations do not count.",
+    "artifact": "<test-state>/ux-sim/evidence/<scenario>-seed-<seed>-run-<runId>.json"
+  },
+  "discovery": {
+    "trackedRoot": "src/ux-sim/*.ts runtime modules",
+    "candidateRoots": [
+      "scripts/*sim*.ts",
+      "scripts/release-loop/*sim*.ts",
+      "scripts/lib/pwa-scenarios/*.ts",
+      "test/**/*fake*",
+      "test/**/*stub*",
+      "test/scenarios/**/*",
+      "scenarios/**/*.yaml",
+      "src/playground-scenario/*.ts",
+      "src/showroom/outbound/channels/stubs.ts"
+    ],
+    "limits": "sourceModules is a curated runtime index; every src/ux-sim/**/*-world.ts simulation world must be registered, while other runtime modules may be indexed selectively."
+  },
+  "candidateAudit": {
+    "source": "~/elanous-hq/seat-state/OP/MOCK-DEVICES-INVENTORY-1031.md §3 + targeted fake-Telegram consumer scan",
+    "baseCommit": "533845484cf2c901cfee902a3586354278e7cae8",
+    "sourceRows": 36,
+    "existingPaths": 35,
+    "excludedPaths": 27
+  }
+}

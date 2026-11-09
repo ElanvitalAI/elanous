@@ -6,7 +6,7 @@
 
 import { describe, it, expect } from 'bun:test';
 import { getProviderForConfig } from './llm.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 
 const cfg = (over: Record<string, unknown> = {}): UserConfig =>
   ({ llm: { provider: 'grok', model: 'grok-config-default', apiKey: 'k', ...over } }) as unknown as UserConfig;

@@ -1,4 +1,6 @@
-export type TrainGateState = 'passed' | 'unmeasured' | 'conflict' | 'failed';
+import { decideTrainVerdict, type TrainVerdictInput } from '../../../scripts/release-loop/train-verdict.js';
+
+export type TrainGateState = 'passed' | 'unmeasured' | 'conflict' | 'failed' | 'evidence';
 
 export interface TrainQueueEntry {
   pr: string;
@@ -38,6 +40,8 @@ export interface TrainDecisionInput {
   lastParks: readonly TrainParkRecord[];
   slots: readonly TrainWorkerSlot[];
   groupLimit: number;
+  /** Exact train-verdict evidence for queue rows whose gate state is `evidence`. */
+  gateVerdicts?: Readonly<Record<string, TrainVerdictInput>>;
 }
 
 export interface TrainAssignment {
@@ -98,6 +102,13 @@ function validate(input: TrainDecisionInput): void {
  */
 export function planTrainDecisions(input: TrainDecisionInput): TrainDecisionResult {
   validate(input);
+  const gatePassed = (row: TrainQueueEntry): boolean => {
+    if (row.gate === 'passed') return true;
+    if (row.gate !== 'evidence') return false;
+    const evidence = input.gateVerdicts?.[row.pr];
+    return !!evidence && evidence.base === input.base && evidence.head === row.head
+      && decideTrainVerdict(evidence).verdict === 'pass';
+  };
   const active = new Set(input.activePrs);
   const queueByPr = new Map(input.queue.map((row) => [row.pr, row]));
   const lastParkByPrHead = new Map<string, number>();
@@ -138,7 +149,7 @@ export function planTrainDecisions(input: TrainDecisionInput): TrainDecisionResu
     if (row.state !== 'open') skipped.push({ pr: row.pr, reason: 'not-open' });
     else if (active.has(row.pr)) skipped.push({ pr: row.pr, reason: 'active' });
     else if (!parked.has(row.pr) && row.gate === 'conflict') waiting.push({ pr: row.pr, reason: 'main-merge-conflict' });
-    else if (!parked.has(row.pr) && row.gate !== 'passed' && !(row.gate === 'unmeasured' && row.expressRank !== undefined)) {
+    else if (!parked.has(row.pr) && !gatePassed(row) && !(row.gate === 'unmeasured' && row.expressRank !== undefined)) {
       waiting.push({ pr: row.pr, reason: 'gate-not-ready' });
     }
   }
@@ -147,7 +158,7 @@ export function planTrainDecisions(input: TrainDecisionInput): TrainDecisionResu
   const assignments: TrainAssignment[] = [];
   const expressRows = input.queue
     .filter((row) => row.state === 'open' && !active.has(row.pr) && !parked.has(row.pr)
-      && row.expressRank !== undefined && (row.gate === 'passed' || row.gate === 'unmeasured'))
+      && row.expressRank !== undefined && (gatePassed(row) || row.gate === 'unmeasured'))
     .sort((a, b) => (a.expressRank! - b.expressRank!) || input.queue.indexOf(a) - input.queue.indexOf(b));
   for (const row of expressRows) {
     const slotIndex = freeSlots.findIndex((slot) => slot.expressOnly);
@@ -163,7 +174,7 @@ export function planTrainDecisions(input: TrainDecisionInput): TrainDecisionResu
 
   for (const slot of freeSlots.filter((candidate) => !candidate.expressOnly)) {
     const group = input.queue.filter((row) => row.state === 'open' && !active.has(row.pr) && !parked.has(row.pr)
-      && !assigned.has(row.pr) && row.expressRank === undefined && row.gate === 'passed').slice(0, input.groupLimit);
+      && !assigned.has(row.pr) && row.expressRank === undefined && gatePassed(row)).slice(0, input.groupLimit);
     if (group.length === 0) break;
     assignments.push({ stage: 'group', host: slot.host, slot: slot.slot, prs: group.map((row) => row.pr) });
     for (const row of group) assigned.add(row.pr);
@@ -174,7 +185,7 @@ export function planTrainDecisions(input: TrainDecisionInput): TrainDecisionResu
   // slot; only the final unassigned rows are waiting for capacity.
   for (const row of input.queue) {
     if (row.state !== 'open' || active.has(row.pr) || parked.has(row.pr) || assigned.has(row.pr)) continue;
-    if (row.gate !== 'passed' || row.expressRank !== undefined) continue;
+    if (!gatePassed(row) || row.expressRank !== undefined) continue;
     waiting.push({ pr: row.pr, reason: 'no-free-slot' });
   }
 

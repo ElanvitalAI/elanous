@@ -1,0 +1,37 @@
+{
+  "id": "warm-pool-declare-path-sim",
+  "name": "Warm pool owner declaration and machine ledger projection",
+  "implementation": [
+    "src/ux-sim/warm-pool-declare-path-sim.ts",
+    "src/resource-ledger/resource-ledger.ts",
+    "src/task-orchestrator/surfaces/warm-host-probe.ts"
+  ],
+  "tests": [
+    "src/ux-sim/warm-pool-declare-path-sim.test.ts",
+    "src/cli/resource-ledger-cli.test.ts",
+    "scripts/warm-pool-provider-config.test.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-pod.test.ts"
+  ],
+  "target": "Owner-auth pool declaration is idempotently recorded in the authoritative ledger and visible only to declared machine members; host probes allow private node addresses and fail closed for public URLs",
+  "inputs": [
+    "sourced gate pool declaration",
+    "owner bearer",
+    "duplicate declaration",
+    "conflicting digest/capacity",
+    "private ClusterIP/node probe"
+  ],
+  "observations": [
+    "pool-declared event appended once",
+    "machine-scoped declaration projection matches ledger",
+    "conflicts rejected without mutation",
+    "public probe URL rejected"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/warm-pool-declare-path-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [
+    "pool-declared"
+  ],
+  "recentUse": null
+}

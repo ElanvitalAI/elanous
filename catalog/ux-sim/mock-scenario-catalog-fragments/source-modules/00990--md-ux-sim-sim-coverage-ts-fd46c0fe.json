@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SIM-COVERAGE-TS",
+  "path": "src/ux-sim/sim-coverage.ts",
+  "boundary": "Records code paths, observed event kinds and device implementation fingerprints for successful world runs; reports uncovered catalog paths and requests missing devices inside the explicit test universe.",
+  "deviceIds": [
+    "world-runtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

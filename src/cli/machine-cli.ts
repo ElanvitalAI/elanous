@@ -6,6 +6,7 @@ import { readMachineProfile, seatRank, validSeatRank, writeMachineProfile } from
 import { registerMachineCaptureCommand } from './machine-capture.js';
 import { registerMachineSetupApplyCommand } from './machine-setup-apply.js';
 import { registerMachineApplyFromCaptureCommand } from './machine-apply-from-capture.js';
+import { registerMachineWslDiagnosisCommand } from './machine-wsl-diagnosis.js';
 import { registerMachineSetupPlanCommand } from './machine-setup-plan.js';
 import { registerMachineMembershipCommands } from './machine-membership.js';
 
@@ -67,6 +68,7 @@ export function registerMachineCommands(program: Command, root?: string): void {
   registerMachineSetupPlanCommand(setup.command('plan').description('Plan profile setup for macOS, Linux, or WSL without applying changes'));
   registerMachineSetupApplyCommand(setup.command('apply').description('Apply a setup plan after explicit --yes confirmation'));
   registerMachineApplyFromCaptureCommand(machine.command('apply').description('Apply a curated profile using a captured source machine profile'));
+  registerMachineWslDiagnosisCommand(machine.command('diagnose'));
   registerMachineCaptureCommand(machine.command('capture').description('Capture a machine profile without reading credential values'));
   registerMachineMembershipCommands(machine, { root });
 }

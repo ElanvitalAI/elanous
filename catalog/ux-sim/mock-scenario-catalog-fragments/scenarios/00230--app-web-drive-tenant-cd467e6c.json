@@ -1,0 +1,21 @@
+{
+  "id": "APP-WEB-DRIVE-TENANT",
+  "name": "Tenant-isolated Drive files.list read contract",
+  "kind": "tenant-drive-read-isolation",
+  "device": "fake-app-drive-world",
+  "implementation": [
+    "src/ux-sim/fake-app-drive-world.ts",
+    "src/nexus/apps/drive-contract.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-app-drive-world.test.ts"
+  ],
+  "trigger": "Create two verified issuer/subject accounts with same-name synthetic files; interleave listing, page-token reuse, expiry, refresh, logout, revoke and missing-scope requests.",
+  "observe": [
+    "each tenant receives only its own file IDs",
+    "continuation tokens cannot cross tenants",
+    "refresh and revocation affect only the selected tenant",
+    "Google API and credential persistence capabilities remain absent"
+  ],
+  "expected": "The read-only listFiles contract isolates both datasets and credentials by tenant, rejects cross-tenant context and page tokens, and performs no real Google call or credential persistence."
+}

@@ -18,6 +18,8 @@ const jsxDEV = jsx;
 const stub = (testId: string) => () => react.createElement('div', { 'data-testid': testId });
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(HERE, 'TerminalPanel.tsx'), 'utf8');
+const DOCK_LAZY_SRC = readFileSync(join(HERE, 'TerminalChatDock.lazy.tsx'), 'utf8');
+const MIRROR_LAZY_SRC = readFileSync(join(HERE, 'TuiMirrorView.lazy.tsx'), 'utf8');
 
 // R-TST23 — 아래 mock.module 은 프로세스 전역이다. 원본을 잡아 두고 파일 끝에 되돌린다(`@/lib/testing/restore-module-mocks`).
 await restoreModuleMocksAfterAll([
@@ -30,12 +32,12 @@ await restoreModuleMocksAfterAll([
   '@/voice/voice-phase-styles',
   '@/components/terminal/XtermView',
   '@/components/terminal/XtermView.lazy',
-  '@/components/terminal/TuiMirrorView',
+  '@/components/terminal/TuiMirrorView.lazy',
   '@/components/terminal/TerminalControls',
   '@/components/terminal/ModifierBar',
   '@/components/terminal/TerminalDropZone',
   '@/components/terminal/MultiDeviceIndicator',
-  '@/components/terminal/TerminalChatDock',
+  '@/components/terminal/TerminalChatDock.lazy',
 ], (specifier) => import(specifier));
 
 mock.module('react/jsx-dev-runtime', () => ({
@@ -68,12 +70,12 @@ mock.module('@/voice/voice-phase-styles', () => ({ VOICE_DOT_COLOR: { idle: '' }
 mock.module('@/components/terminal/XtermView', () => ({ XtermView: stub('xterm-view') }));
 // TerminalPanel renders the lazy boundary (TERM1); stand it in with the same stub so the SSR contract still counts panes.
 mock.module('@/components/terminal/XtermView.lazy', () => ({ XtermViewLazy: stub('xterm-view') }));
-mock.module('@/components/terminal/TuiMirrorView', () => ({ TuiMirrorView: stub('tui-mirror-view') }));
+mock.module('@/components/terminal/TuiMirrorView.lazy', () => ({ TuiMirrorViewLazy: stub('tui-mirror-view') }));
 mock.module('@/components/terminal/TerminalControls', () => ({ TerminalControls: stub('terminal-controls') }));
 mock.module('@/components/terminal/ModifierBar', () => ({ ModifierBar: stub('modifier-bar') }));
 mock.module('@/components/terminal/TerminalDropZone', () => ({ TerminalDropZone: stub('terminal-drop-zone') }));
 mock.module('@/components/terminal/MultiDeviceIndicator', () => ({ MultiDeviceIndicator: stub('multi-device-indicator') }));
-mock.module('@/components/terminal/TerminalChatDock', () => ({ TerminalChatDock: stub('terminal-chat-dock') }));
+mock.module('@/components/terminal/TerminalChatDock.lazy', () => ({ TerminalChatDockLazy: stub('terminal-chat-dock') }));
 
 describe('TerminalPanel · initial SSR render contract', () => {
   test('renders three mode buttons with terminal as the only active initial view', async () => {
@@ -206,5 +208,14 @@ describe('TerminalPanel · source wiring only; not behavior validation', () => {
     expect(SRC).toContain('client.renameTerminal(terminal.id, name)');
     expect(SRC).toContain('renameOutcomeMessage(result)');
     expect(SRC).toContain('이름 변경은 되돌릴 수 있으므로 별도 확인 없이 진행한다.');
+  });
+
+  test('keeps chat and TUI-observer feature trees behind client-only lazy boundaries', () => {
+    expect(SRC).toContain("from './TerminalChatDock.lazy'");
+    expect(SRC).toContain("from './TuiMirrorView.lazy'");
+    expect(DOCK_LAZY_SRC).toContain("import('./TerminalChatDock')");
+    expect(DOCK_LAZY_SRC).toContain('{ ssr: false, loading: () => null }');
+    expect(MIRROR_LAZY_SRC).toContain("import('./TuiMirrorView')");
+    expect(MIRROR_LAZY_SRC).toContain('{ ssr: false, loading: () => null }');
   });
 });

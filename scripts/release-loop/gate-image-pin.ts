@@ -2,7 +2,8 @@ import { constants } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 
 /** A gate run may execute only against one immutable image identity and its exact source tag. */
 export interface GateImagePin { runId: string; digest: string; image: string; commit: string }
@@ -34,6 +35,18 @@ export interface PinnedGateImageSyncResult {
 
 export interface GateImagePrebuildMember { context: string }
 export interface GateImagePrebuildResult { outcome: 'built' | 'reused'; digest: string; eligiblePools: string[] }
+
+/** Stable, host-independent cache key for the source-free gate runtime layer. */
+export function gateImageLayerRuntimeKey(input: { baseImageDigest: string; lockHash: string; architecture: string; bunVersion: string;
+  buildRecipeHash: string; gateDepsDigest: string; skillsDigest: string }): string {
+  const baseImageDigest = normalizeGateImageDigest(input.baseImageDigest);
+  if (!baseImageDigest || !/^[a-f0-9]{64}$/i.test(input.lockHash) || !/^[a-z0-9._-]+$/i.test(input.architecture)
+    || !/^\d+\.\d+\.\d+$/i.test(input.bunVersion) || !/^[a-f0-9]{64}$/i.test(input.buildRecipeHash)
+    || !/^[a-f0-9]{12}$/i.test(input.gateDepsDigest) || !(input.skillsDigest === 'none' || /^[a-f0-9]{16}$/i.test(input.skillsDigest)))
+    throw new Error('gate image runtime cache identity is incomplete');
+  return createHash('sha256').update([baseImageDigest, input.lockHash.toLowerCase(), input.architecture.toLowerCase(), input.bunVersion,
+    input.buildRecipeHash.toLowerCase(), input.gateDepsDigest.toLowerCase(), input.skillsDigest.toLowerCase()].join('\n')).digest('hex').slice(0, 40);
+}
 
 /** Build the cut image before the expensive gate starts, then persist the pin the gate will consume. */
 export async function prebuildGateImagePinAtCut(input: {
@@ -164,7 +177,7 @@ export function readGateImagePinForRun(path: string, expectedRunId: string, expe
   const image = typeof parsed.image === 'string' ? parsed.image : '';
   const imageRepo = imageRepository(image);
   if (parsed.version !== 2 || parsed.runId !== expectedRunId || !commit || !normalizeGateImageDigest(parsed.digest)
-    || !imageRepo || imageRepo !== imageRepository(expectedImage) || image !== `${imageRepo}:${commit.slice(0, 12)}`)
+    || !imageRepo || imageRepo !== imageRepository(expectedImage) || !/^[a-f0-9]{12}$/i.test(image.split(':').at(-1) ?? ''))
     throw new Error(`invalid gate image pin: ${path}`);
   return { runId: expectedRunId, digest: normalizeGateImageDigest(parsed.digest)!, image, commit };
 }
@@ -273,6 +286,7 @@ async function prebuildFromArgs(args: string[]): Promise<CutGateImagePrebuildOut
     import('../../src/task-orchestrator/surfaces/pod-command-job.js'), import('node:fs'), import('node:path'), import('node:os'),
   ]);
   const { parsePodPool, syncPoolImages } = podPool;
+  const { defaultRemoteRun } = podPool;
   const { preflightGateImageDigest } = gateRadius;
   const { podCommandImageFor } = podCommand;
   const { mkdtempSync } = fs;
@@ -282,17 +296,75 @@ async function prebuildFromArgs(args: string[]): Promise<CutGateImagePrebuildOut
   const rawSpecs = pool.split(',').map((spec) => spec.trim()).filter(Boolean);
   const specFor = new Map(rawSpecs.map((spec) => [spec.split(/[@:#]/, 1)[0]!, spec]));
   const baseImage = podCommandImageFor([], true);
-  const image = `${baseImage.split(':')[0]}:${commit.slice(0, 12)}`;
   const sourceRoot = mkdtempSync(pathJoin(tmpdir(), 'release-gate-image-prebuild-'));
   const sourceTree = pathJoin(sourceRoot, 'cut');
   try {
-    const clone = spawnSync('git', ['clone', '--quiet', '--shared', '--no-checkout', repo, sourceTree], { cwd: repo, encoding: 'utf8' });
+    const clone = spawnSync('git', ['clone', '--quiet', '--shared', '--no-checkout', repo, sourceTree], {
+      cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+    });
     if (clone.status !== 0) throw new Error(`cut image source clone failed: ${clone.stderr || clone.error || clone.status}`);
-    const checkout = spawnSync('git', ['checkout', '--quiet', '--detach', commit], { cwd: sourceTree, encoding: 'utf8' });
+    const checkout = spawnSync('git', ['checkout', '--quiet', '--detach', commit], {
+      cwd: sourceTree, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+    });
     if (checkout.status !== 0) throw new Error(`cut image source checkout failed: ${checkout.stderr || checkout.error || checkout.status}`);
+    const lockHash = createHash('sha256').update(readFileSync(pathJoin(sourceTree, 'bun.lock'))).digest('hex');
+    const bunVersion = readFileSync(pathJoin(sourceTree, '.bun-version'), 'utf8').trim();
+    const depsStage = pathJoin(sourceRoot, 'gate-deps');
+    const stagedDeps = spawnSync('bun', [pathJoin(sourceTree, 'src/task-orchestrator/surfaces/pod-gate-deps.ts'), 'stage', depsStage], {
+      cwd: sourceTree, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+    });
+    if (stagedDeps.status !== 0 || stagedDeps.error) throw new Error(`gate image dependency inputs could not be measured: ${stagedDeps.stderr || stagedDeps.error || stagedDeps.status}`);
+    const gateDepsDigest = /(?:^|\s)digest=([a-f0-9]{12})(?:\s|$)/i.exec(stagedDeps.stdout)?.[1]?.toLowerCase();
+    if (!gateDepsDigest) throw new Error('gate image dependency digest is unmeasured');
+    const skillsStage = pathJoin(sourceRoot, 'skills-extra');
+    const stagedSkills = spawnSync('bun', [pathJoin(sourceTree, 'src/task-orchestrator/surfaces/pod-skills.ts'), 'stage', skillsStage], {
+      cwd: sourceTree, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+    });
+    if (stagedSkills.status !== 0 || stagedSkills.error) throw new Error(`gate image skill inputs could not be measured: ${stagedSkills.stderr || stagedSkills.error || stagedSkills.status}`);
+    const skillsDigest = /(?:^|\s)digest=([a-f0-9]{16}|none)(?:\s|$)/i.exec(stagedSkills.stdout)?.[1]?.toLowerCase();
+    if (!skillsDigest) throw new Error('gate image skill digest is unmeasured');
+    const recipeHash = createHash('sha256');
+    for (const relative of ['docker/harness/Dockerfile', 'docker/harness/build.sh', 'scripts/install.sh',
+      'src/task-orchestrator/surfaces/pod-gate-deps.ts', 'src/task-orchestrator/surfaces/pod-skills.ts']) {
+      recipeHash.update(relative).update('\0').update(readFileSync(pathJoin(sourceTree, relative))).update('\0');
+    }
+    const layerIdentities = members.map((member) => {
+      const probe = member.sshHost ? defaultRemoteRun(member.sshHost,
+        "docker pull ubuntu:24.04 >/dev/null && docker image inspect --format '{{index .RepoDigests 0}}' ubuntu:24.04 && uname -m")
+        : spawnSync('sh', ['-c', "docker pull ubuntu:24.04 >/dev/null && docker image inspect --format '{{index .RepoDigests 0}}' ubuntu:24.04 && uname -m"],
+          { cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+      if (probe.status !== 0) return null;
+      const lines = probe.stdout.trim().split(/\r?\n/);
+      const digest = /@?(sha256:[a-f0-9]{64})$/i.exec(lines[0] ?? '')?.[1]?.toLowerCase();
+      const architecture = lines.at(-1)?.trim();
+      return digest && architecture ? { digest, architecture } : null;
+    });
+    if (layerIdentities.some((identity) => !identity)
+      || new Set(layerIdentities.map((identity) => `${identity!.digest}\n${identity!.architecture}`)).size !== 1)
+      throw new Error('gate runtime base digest or architecture could not be measured consistently across pools');
+    const layerIdentity = layerIdentities[0]!;
+    const runtimeKey = gateImageLayerRuntimeKey({ baseImageDigest: layerIdentity.digest, lockHash,
+      architecture: layerIdentity.architecture, bunVersion, buildRecipeHash: recipeHash.digest('hex'), gateDepsDigest, skillsDigest });
+    const image = `${imageRepository(baseImage)}:${runtimeKey.slice(0, 12)}`;
     return await prebuildGateImagePinAtCut({ root, version, runId, commit, image, members,
-      probe: (member) => preflightGateImageDigest(specFor.get(member.context) ?? member.context, commit),
-      sync: () => syncPoolImages(members, baseImage, commit, { buildScript: pathJoin(sourceTree, 'docker', 'harness', 'build.sh') }),
+      probe: (member) => preflightGateImageDigest(specFor.get(member.context) ?? member.context, runtimeKey),
+      sync: () => {
+        const priorLayerOnly = process.env.ELANOUS_BUILD_GATE_LAYER_ONLY;
+        const priorImageKey = process.env.ELANOUS_BUILD_IMAGE_KEY;
+        const priorExpectedBase = process.env.ELANOUS_BUILD_EXPECTED_BASE_IMAGE_DIGEST;
+        process.env.ELANOUS_BUILD_GATE_LAYER_ONLY = '1';
+        process.env.ELANOUS_BUILD_IMAGE_KEY = runtimeKey;
+        process.env.ELANOUS_BUILD_EXPECTED_BASE_IMAGE_DIGEST = layerIdentity.digest;
+        return syncPoolImages(members, baseImage, runtimeKey,
+          { buildScript: pathJoin(sourceTree, 'docker', 'harness', 'build.sh') }).finally(() => {
+            if (priorLayerOnly === undefined) delete process.env.ELANOUS_BUILD_GATE_LAYER_ONLY;
+            else process.env.ELANOUS_BUILD_GATE_LAYER_ONLY = priorLayerOnly;
+            if (priorImageKey === undefined) delete process.env.ELANOUS_BUILD_IMAGE_KEY;
+            else process.env.ELANOUS_BUILD_IMAGE_KEY = priorImageKey;
+            if (priorExpectedBase === undefined) delete process.env.ELANOUS_BUILD_EXPECTED_BASE_IMAGE_DIGEST;
+            else process.env.ELANOUS_BUILD_EXPECTED_BASE_IMAGE_DIGEST = priorExpectedBase;
+          });
+      },
     });
   } finally { rmSync(sourceRoot, { recursive: true, force: true }); }
 }

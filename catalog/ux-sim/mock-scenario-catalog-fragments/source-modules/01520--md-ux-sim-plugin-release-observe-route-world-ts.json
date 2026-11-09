@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-PLUGIN-RELEASE-OBSERVE-ROUTE-WORLD-TS",
+  "path": "src/ux-sim/plugin-release-observe-route-world.ts",
+  "boundary": "Runs the release plugin route through an isolated simulation world without live plugin or release services.",
+  "deviceIds": [
+    "world-runtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

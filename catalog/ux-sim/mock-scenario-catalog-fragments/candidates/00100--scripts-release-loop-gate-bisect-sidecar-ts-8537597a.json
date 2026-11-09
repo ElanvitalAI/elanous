@@ -1,0 +1,11 @@
+{
+  "path": "scripts/release-loop/gate-bisect-sidecar.ts",
+  "disposition": "device",
+  "entryCommand": "bun test scripts/release-loop/gate-bisect.test.ts",
+  "logsRecorded": "yes",
+  "logsDetail": "Detached release sidecar emits bisect plan, step, transition and repair-card events.",
+  "deviceId": "release-graph-rig",
+  "scenarioIds": [
+    "UX-MS-02"
+  ]
+}

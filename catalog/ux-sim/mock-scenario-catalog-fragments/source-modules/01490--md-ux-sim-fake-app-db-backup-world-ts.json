@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-APP-DB-BACKUP-WORLD-TS",
+  "path": "src/ux-sim/fake-app-db-backup-world.ts",
+  "boundary": "Provides an isolated fake object store and SQLite app database for backup and restore failure scenarios.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

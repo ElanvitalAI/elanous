@@ -7,7 +7,6 @@ import { MoreHorizontal, X } from 'lucide-react';
 import { usePwaRole } from '@/lib/pwa-role';
 import { routeMaturity } from '@/lib/route-maturity';
 import { useShowBeta } from '@/lib/show-beta';
-import { useOperator } from '@/lib/use-operator';
 import { NAV_GROUPS, NAV_SHOW_HIDDEN_KEY, NAV_SHOW_LABS_KEY, SIDEBAR_NAV_ITEMS, visibleNavGroups, type NavGroupId } from './sidebar-nav-items';
 import { NAV_PREFS_EVENT, readFlag } from './nav-visibility-prefs';
 
@@ -15,7 +14,6 @@ export function MobileBottomTabs() {
   const pathname = usePathname();
   const role = usePwaRole();
   const { showBeta } = useShowBeta();
-  const operator = useOperator();
   const [prefs, setPrefs] = useState({ showLabs: false, showHidden: false });
   const [open, setOpen] = useState<NavGroupId | 'more' | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -55,14 +53,14 @@ export function MobileBottomTabs() {
     };
   }, [open]);
 
-  const visible = visibleNavGroups(SIDEBAR_NAV_ITEMS, prefs, role, operator, { showBeta });
+  const visible = visibleNavGroups(SIDEBAR_NAV_ITEMS, prefs, role, { showBeta });
   const allowed = new Set([...visible.main, ...visible.labs, ...visible.hidden]);
   const items = SIDEBAR_NAV_ITEMS.filter((item) => allowed.has(item));
   const groups = NAV_GROUPS.map((group) => ({ ...group, items: items.filter((item) => item.group === group.id) }))
     .filter((group) => group.items.length > 0);
   const tabs = groups.filter((group) => group.bottomTab);
   // 운영자에게 «더보기» 시트는 운영 칸이 맨 위다 — 맨 아래면 폰 폭에서 접혀 «릴리스»를 못 찾는다(10-07 피드백).
-  const extra = groups.filter((group) => !group.bottomTab).sort((a, b) => Number(b.id === 'ops') - Number(a.id === 'ops'));
+  const extra = groups.filter((group) => !group.bottomTab);
   const path = (pathname ?? '/').replace(/\/+$/, '') || '/';
   const isActive = (item: typeof items[number]) => path === item.href || (item.href !== '/' && path.startsWith(`${item.href}/`))
     || (item.activeAlso ?? []).some((href) => path === href || path.startsWith(`${href}/`));

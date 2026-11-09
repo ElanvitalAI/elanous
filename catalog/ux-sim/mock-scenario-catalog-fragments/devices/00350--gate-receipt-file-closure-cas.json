@@ -1,0 +1,35 @@
+{
+  "id": "GATE-RECEIPT-FILE-CLOSURE-CAS",
+  "name": "Gate file import-closure receipt CAS",
+  "checklistCells": ["GATE-RECEIPT-FILE-CLOSURE-CAS"],
+  "implementation": [
+    "src/ux-sim/gate-receipt-file-closure-cas.ts",
+    "scripts/release-loop/gate-file-receipts.ts"
+  ],
+  "tests": [
+    "src/ux-sim/gate-receipt-file-closure-cas.test.ts",
+    "src/ux-sim/release-sim-rig.test.ts"
+  ],
+  "target": "Release gate per-test-file receipt reuse, sweep certificate invalidation, train-to-cut carry, and isolated recheck",
+  "inputs": [
+    "prior receipts for 6,674 measured test files",
+    "three appended commits including a changed shared import and a new test",
+    "pinned image digest and exact import-closure content hashes"
+  ],
+  "observations": [
+    "only tests whose import closure changed are remeasured",
+    "matching file receipts carry to the cut without overwriting their measured source head",
+    "sweep certificate records source commit, image digest, all file keys, and measurement-derived age/dirty thresholds",
+    "append compares the new key set, then runs the dirty set and interference neighbors once at sweep concurrency",
+    "image change, dirty-ratio overflow, or certificate age forces a full sweep",
+    "removed tests invalidate old keys without being scheduled for execution; a successful supplemental run refreshes the certificate",
+    "missing closure hashes and image changes fail closed",
+    "the real isolated release-sim-rig graph replays c159bb8d and 1475eed8 through its production gate seam; injected supplemental failure prevents certificate refresh"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/gate-receipt-file-closure-cas.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -1,3 +1,4 @@
+import { isObject } from '../../primitives/guards.js';
 import { debug } from '../../debug/log.js';
 import { mcpMediaJobs, type MediaJob } from '../../feedback/media.js';
 import type { FeedbackEnvelope } from '../../feedback/envelope.js';
@@ -178,10 +179,6 @@ async function readJsonBody(req: Request): Promise<unknown> {
 
 function isLocalToolName(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/.test(value);
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /** 클라이언트가 준 «화면에 보이는 그대로»의 사용자 줄. 문자열이 아니면 없는 것으로 본다. */

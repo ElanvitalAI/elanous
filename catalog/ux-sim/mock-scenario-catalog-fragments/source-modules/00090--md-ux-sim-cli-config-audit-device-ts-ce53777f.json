@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-CLI-CONFIG-AUDIT-DEVICE-TS",
+  "path": "src/ux-sim/cli-config-audit-device.ts",
+  "boundary": "Runs the real CLI config-audit command with controlled config fixtures and records its warnings, proposed edits and command result.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -16,7 +16,7 @@ import { DEFAULT_THEME_TOKENS } from '../src/theme/tokens.js';
 import { ToastStack } from '../src/ui/widgets/toast-stack.js';
 import { Printer } from '../src/ui/printer.js';
 import type { PopupPlacement } from '../src/status/popups.js';
-import type { RotationEntry } from '../src/user-config.js';
+import type { RotationEntry } from '../src/user-config/types.js';
 import type { DisplayMouseEvent } from '../src/display/types.js';
 import { stripAnsi } from '../src/tui.js';
 

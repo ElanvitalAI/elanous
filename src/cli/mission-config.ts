@@ -12,7 +12,7 @@
 // spawning a subprocess — the index.ts Commander wiring is the only
 // piece that calls saveUserConfig/reloadUserConfig.
 
-import type { MissionRoutingConfig } from '../user-config.js';
+import type { MissionRoutingConfig } from '../user-config/types.js';
 
 export type MissionKind = 'plan' | 'build' | 'review' | 'research' | 'quick' | 'vision';
 

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-ONBOARDING-FIRST-RUN-DEVICE-TS",
+  "path": "src/ux-sim/onboarding-first-run-device.ts",
+  "boundary": "Counts and checks English and Korean first-run provider chooser frames from the production onboarding renderer.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

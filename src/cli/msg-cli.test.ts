@@ -1,6 +1,6 @@
 import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -9,6 +9,10 @@ import { MsgStore, type Message } from '../msg/msg-store.js';
 import { readPostOffice, writePostOffice } from '../msg/msg-post-office.js';
 import { startMsgSseServer } from '../msg/msg-sse-server.js';
 import { formatMessage, registerMsgCommands, type MsgCliDeps } from './msg-cli.js';
+import { drainControlInbox, enqueueControlMemo, enqueueSoftStop, inspectControlInbox, readSoftStopRequest } from '../harness/control-inbox.js';
+import { runSelfImplement } from '../self-implement/orchestrator.js';
+import { seams } from '../self-implement/test-seams.js';
+import { appendRunLedgerEntry, loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -58,6 +62,51 @@ test('post reads piped stdin, accepts literal body and kind; human and JSON outp
   f.stdout.length = 0;
   await f.run('post', '--body', 'from flag', '--from', 'OP', '--to', 'MK', '--json');
   expect(JSON.parse(f.stdout[0]!).body).toBe('from flag');
+});
+
+test('msg hook CLI derives seat from cwd, loads unread messages, and emits no duplicate bundle', async () => {
+  const f = fixture(JSON.stringify({ cwd: '/tmp/elanous-hq/seats/OP', session_id: 'hook-cli-1' }), ({ path }) => ({ hookStateDir: join(dirname(path), 'hooks') }));
+  const store = f.store();
+  let firstId: number;
+  try {
+    firstId = store.post({ from: 'MK', to: 'OP', body: 'already acked', kind: 'coord' }).id;
+    store.post({ from: 'TC', to: 'OP', body: 'attention', kind: 'coord' });
+    store.ackMessage('OP', firstId);
+  }
+  finally { store.close(); }
+  await f.run('hook', '--event', 'user-prompt-submit', '--format', 'claude');
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: expect.stringContaining('#2 TC→OP [coord] attention') } });
+  expect(f.stdout[0]).not.toContain('#1 MK→OP');
+  f.stdout.length = 0;
+  await f.run('hook', '--event', 'stop', '--format', 'claude');
+  expect(f.stdout).toEqual([]);
+  const newMail = f.store();
+  try { newMail.post({ from: 'MK', to: 'OP', body: 'arrived after prompt' }); }
+  finally { newMail.close(); }
+  await f.run('hook', '--event', 'stop', '--format', 'claude');
+  expect(JSON.parse(f.stdout[0]!)).toEqual({ decision: 'block', reason: '새 우편 2통(#2, #3) — 처리 후 ack' });
+  expect(f.stderr).toEqual([]);
+});
+
+test('msg hook CLI honors an explicit seat outside a seat worktree', async () => {
+  const f = fixture(JSON.stringify({ cwd: '/tmp/repo', session_id: 'hook-cli-explicit-seat' }), ({ path }) => ({ hookStateDir: join(dirname(path), 'hooks') }));
+  const store = f.store();
+  try { store.post({ from: 'MK', to: 'OP', body: 'explicit recipient' }); }
+  finally { store.close(); }
+  await f.run('hook', '--event', 'user-prompt-submit', '--format', 'claude', '--seat', 'OP');
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ hookSpecificOutput: { additionalContext: expect.stringContaining('#1 MK→OP') } });
+  expect(f.stderr).toEqual([]);
+});
+
+test('msg hook CLI does not emit an unkeyed Stop block that could loop forever', async () => {
+  const f = fixture(JSON.stringify({ cwd: '/tmp/elanous-hq/seats/OP' }), ({ path }) => ({ hookStateDir: join(dirname(path), 'hooks') }));
+  const store = f.store();
+  try { store.post({ from: 'MK', to: 'OP', body: 'new mail' }); }
+  finally { store.close(); }
+  await f.run('hook', '--event', 'stop', '--format', 'claude');
+  await f.run('hook', '--event', 'stop', '--format', 'claude');
+  expect(f.stdout).toEqual([]);
+  expect(f.stderr).toEqual([]);
 });
 
 test('MSG-CHANNELS CLI creates groups, gates delivery by subscriptions, and accepts seat: DM addresses', async () => {
@@ -155,7 +204,7 @@ test('post with the real wake warns once for an unresolved seat and stays quiet 
   const f = fixture('', () => ({ wake: undefined, wakeDeps: { listPtys: () => [], readPane: () => null, live: false } }));
   await f.run('post', 'hello', '--from', 'OP', '--to', 'UX');
   expect(f.exits).toEqual([]);
-  expect(f.stderr).toEqual(['이 주소는 깨울 길이 없다 — 받는 몸이 스스로 읽을 때까지 쌓인다 (wake=none · 모름: no-pty-name-no-herdr-pane)']);
+  expect(f.stderr).toEqual(['이 주소는 깨울 길이 없다 — 받는 몸이 스스로 읽을 때까지 쌓인다 (wake=none · 모름: seat-registry-missing)']);
   await f.run('post', 'hello', '--from', 'OP', '--to', 'GUARDIAN');
   expect(f.stderr.at(-1)).toBe('이 주소는 읽는 몸이 없다 — 지금은 OP');
   expect(f.stderr).toHaveLength(2);
@@ -168,11 +217,47 @@ test('route shows reply body and resolved wake for loop and seat addresses', asy
   await f.run('route', 'ux', '--json');
   expect(f.stdout.map(line => JSON.parse(line))).toEqual([
     { msgAddress: 'COORDINATOR', replyBody: 'rules', wake: 'cron', source: 'loop-table' },
-    { msgAddress: 'OPT', replyBody: 'agent', wake: 'pty-inject', target: 'tui:9', source: 'pty-name', optIn: false },
-    { msgAddress: 'UX', replyBody: 'agent', wake: 'none', source: 'unresolved', reason: 'no-pty-name-no-herdr-pane' },
+    { msgAddress: 'OPT', replyBody: null, wake: 'none', source: 'unresolved', reason: 'seat-registry-missing' },
+    { msgAddress: 'UX', replyBody: null, wake: 'none', source: 'unresolved', reason: 'seat-registry-missing' },
   ]);
   await f.run('route', 'opt');
-  expect(f.stdout.at(-1)).toBe('OPT\treplyBody=agent\twake=pty-inject\ttarget=tui:9\toptIn=no(주입 0)\t(pty-name)');
+  expect(f.stdout.at(-1)).toBe('OPT\treplyBody=모름\twake=none\t(unresolved: seat-registry-missing)');
+});
+
+test('address register writes one private central registry row with explicit wake opt-in', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-seat-address-'));
+  dirs.push(seatStateRoot);
+  const f = fixture('', () => ({ wakeDeps: { seatStateRoot, listPtys: () => [] } }));
+  await f.run('address', 'register', 'NT-1', '--herdr-pane', 'wJ:p10', '--host', 'mshq', '--wake', '--json');
+  const result = JSON.parse(f.stdout[0]!);
+  expect(result).toMatchObject({ address: 'NT-1', paneId: 'wJ:p10', host: 'mshq', changed: true, wakeEnabled: true });
+  const registryPath = join(seatStateRoot, 'seat-registry.json');
+  expect(lstatSync(registryPath).isFile()).toBe(true);
+  expect(JSON.parse(readFileSync(registryPath, 'utf8')).seats.find((row: { address: string }) => row.address === 'OPT'))
+    .toEqual({ address: 'OPT', host: 'unknown', wake: 'none', replyBody: 'agent', optIn: false });
+  expect(JSON.parse(readFileSync(registryPath, 'utf8')).seats.find((row: { address: string }) => row.address === 'NT-1'))
+    .toEqual({ address: 'NT-1', host: 'mshq', target: 'wJ:p10', wake: 'herdr', replyBody: 'agent', optIn: true });
+  expect(existsSync(join(seatStateRoot, 'NT-1'))).toBe(false);
+  await f.run('route', 'nt-1', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ msgAddress: 'NT-1', replyBody: 'agent', wake: 'herdr', target: 'wJ:p10', host: 'mshq', optIn: true });
+  await f.run('address', 'register', 'NT-1', '--herdr-pane', 'wJ:p10', '--host', 'mshq', '--wake', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ changed: false, wakeEnabled: true });
+  await f.run('address', 'register', 'NT-1', '--herdr-pane', 'wJ:p11', '--host', 'mshq', '--wake');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(JSON.parse(readFileSync(registryPath, 'utf8')).seats.find((row: { address: string }) => row.address === 'NT-1').target).toBe('wJ:p10');
+});
+
+test('address register refuses a symlinked central registry and leaves its target untouched', async () => {
+  const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-seat-address-link-'));
+  const outside = mkdtempSync(join(tmpdir(), 'msg-seat-address-outside-'));
+  dirs.push(seatStateRoot, outside);
+  const outsideRegistry = join(outside, 'seat-registry.json');
+  writeFileSync(outsideRegistry, '{"version":1,"seats":[]}\n');
+  symlinkSync(outsideRegistry, join(seatStateRoot, 'seat-registry.json'));
+  const f = fixture('', () => ({ wakeDeps: { seatStateRoot, listPtys: () => [] } }));
+  await f.run('address', 'register', 'NT-1', '--herdr-pane', 'wJ:p10', '--host', 'local');
+  expect(f.exits.at(-1)).toBe(2);
+  expect(readFileSync(outsideRegistry, 'utf8')).toBe('{"version":1,"seats":[]}\n');
 });
 
 test('post --origin-key deduplicates a channel mirror, accepts a loop address, and rejects a mismatched key', async () => {
@@ -857,7 +942,6 @@ test('TA stops automatic Pod memo retry when transport failure leaves publicatio
 test('TA leaves a local memo transport error uncertain without a second send', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'msg-cli-ta-memo-retry-'));
   dirs.push(dir);
-  const { inspectControlInbox } = await import('../harness/control-inbox.js');
   const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
     text: 'task', createdAt: new Date().toISOString(), history: [] };
   let attempts = 0;
@@ -887,7 +971,6 @@ test('TA leaves a local memo transport error uncertain without a second send', a
 test('TA leaves a failed stop send uncertain without repeating it', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'msg-cli-ta-stop-retry-'));
   dirs.push(dir);
-  const { inspectControlInbox } = await import('../harness/control-inbox.js');
   const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
     text: 'task', createdAt: new Date().toISOString(), history: [] };
   let attempts = 0;
@@ -916,7 +999,6 @@ test('TA leaves a failed stop send uncertain without repeating it', async () => 
 test('TA local run inbox receives exactly one memo and stop; invalid card never controls a run', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'msg-cli-ta-inbox-'));
   dirs.push(dir);
-  const { inspectControlInbox } = await import('../harness/control-inbox.js');
   const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
     text: 'task', createdAt: new Date().toISOString(), history: [] };
   const f = fixture('', () => ({
@@ -925,11 +1007,9 @@ test('TA local run inbox receives exactly one memo and stop; invalid card never 
     runScreen: () => ({ screenKey: 'local-card-space', logStoreStatus: 'read' }) as ReturnType<NonNullable<MsgCliDeps['runScreen']>>,
     screenAlive: space => space === 'local-card-space',
     sendMemo: (space, memo) => {
-      const { enqueueControlMemo } = require('../harness/control-inbox.js') as typeof import('../harness/control-inbox.js');
       return enqueueControlMemo(space, memo, { env: { ELANOUS_STATE_DIR: dir } });
     },
     sendStop: space => {
-      const { enqueueSoftStop } = require('../harness/control-inbox.js') as typeof import('../harness/control-inbox.js');
       enqueueSoftStop(space, { env: { ELANOUS_STATE_DIR: dir } });
     },
   }));
@@ -946,7 +1026,6 @@ test('TA local run inbox receives exactly one memo and stop; invalid card never 
     expect(store.listReplies(requests[2]!.id)[0]!.body).toContain('카드 없음');
   } finally { store.close(); }
   expect(inspectControlInbox('local-card-space', { env: { ELANOUS_STATE_DIR: dir } })).toMatchObject({ memoCount: 1, stop: true });
-  const { drainControlInbox, readSoftStopRequest } = await import('../harness/control-inbox.js');
   const inbox = drainControlInbox('local-card-space', { env: { ELANOUS_STATE_DIR: dir } });
   expect(inbox).toMatchObject({ stop: true, receivedCount: 1, memos: ['check next step'] });
   expect(readSoftStopRequest('local-card-space', { env: { ELANOUS_STATE_DIR: dir } })?.version).toBe(1);
@@ -958,8 +1037,6 @@ test('a running card run honors TA CLI stop before its gate and records its term
   const oldState = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = dir;
   try {
-    const { runSelfImplement } = await import('../self-implement/orchestrator.js');
-    const { seams } = await import('../self-implement/test-seams.js');
     const card = { id: 'ta-20261015-a1b2c3', status: 'launched' as const, runId: 'run-card-1',
       text: 'task', createdAt: new Date().toISOString(), history: [] };
     const f = fixture('', () => ({
@@ -968,7 +1045,6 @@ test('a running card run honors TA CLI stop before its gate and records its term
       runScreen: () => ({ screenKey: 'local-card-space', logStoreStatus: 'read' }) as ReturnType<NonNullable<MsgCliDeps['runScreen']>>,
       screenAlive: space => space === 'local-card-space',
     }));
-    const { appendRunLedgerEntry, loadRunLedger, runLedgerDir } = await import('../self-implement/run-ledger.js');
     let gateCalls = 0;
     const result = await runSelfImplement({
       feature: 'TA stop running card', runId: card.runId,

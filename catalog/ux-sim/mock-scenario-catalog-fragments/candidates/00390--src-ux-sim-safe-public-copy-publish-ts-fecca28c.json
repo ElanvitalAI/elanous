@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/safe-public-copy-publish.ts",
+  "disposition": "scenario",
+  "entryCommand": "bun test src/ux-sim/safe-public-copy-publish.test.ts test/nexus/api/markdown-publish.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "The test captures the production handler receipt and temporary artifact; fake S3 returns unavailable, with no logs.db or external writes.",
+  "deviceId": "support-fakes",
+  "scenarioIds": [
+    "SAFE-PUBLIC-COPY-PUBLISH-REDACTION"
+  ]
+}

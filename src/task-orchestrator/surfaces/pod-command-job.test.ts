@@ -16,6 +16,7 @@ import {
   podCommandScript,
   podCommandSecretKeys,
   podCommandTargetCommit,
+  readPodCommandGitHead,
   podCommandJobFailureInfo,
   podCpuMillis,
   resolvePodCpu,
@@ -1786,6 +1787,31 @@ describe('podCommandTargetCommit', () => {
   });
   test('대조군: 이 기계(원격 아님)는 종전대로 로컬 이미지 판', () => {
     expect(podCommandTargetCommit({ remote: false, gitHead: () => 'head123', localImageCommit: () => 'old30f' })).toBe('old30f');
+  });
+
+  test('git HEAD overflow rejects partial stdout instead of returning a commit', () => {
+    const error = Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' });
+    expect(() => readPodCommandGitHead(() => ({ status: null, error, stdout: `${'a'.repeat(40)}\n` })))
+      .toThrow('pod command: git HEAD lookup failed (spawnSync git ENOBUFS)');
+  });
+
+  test('runPodCommand stops before image sync or Job apply when remote HEAD lookup overflows', async () => {
+    // 근거: #35971 bounds this regression fixture to one synthetic pool member.
+    const member: PodPoolMember = { context: 'pool-git-head-overflow', sshHost: 'remote-test', capacity: 1, k3dCluster: 'test' };
+    const poolScheduler = new PodPoolScheduler([member], { occupancy: () => ({ [member.context]: { occupied: 0 } }) });
+    const error = Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' });
+    const applied: unknown[] = [];
+    let imageSyncCalls = 0;
+    await expect(runPodCommand({ command: ['true'], name: 'git-head-overflow', poolScheduler,
+      readGitHead: () => readPodCommandGitHead(() => ({ status: null, error, stdout: `${'a'.repeat(40)}\n` })),
+      syncImages: async () => { imageSyncCalls++; return new Map(); },
+      kubectl: (_args, input) => {
+        if (input) applied.push(JSON.parse(input));
+        return { status: 0, stdout: '', stderr: '' };
+      }, env: {}, configHostMirror: () => undefined, artifactsRoot: '/tmp/pod-git-head-overflow',
+    })).rejects.toThrow('pod command: git HEAD lookup failed (spawnSync git ENOBUFS)');
+    expect(imageSyncCalls).toBe(0);
+    expect(applied).toEqual([]);
   });
 });
 

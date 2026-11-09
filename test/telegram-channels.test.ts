@@ -5,7 +5,7 @@ import {
   interactivePollerTokens,
   channelForRole,
 } from '../src/domains/telegram-channels.js';
-import type { TelegramConfig } from '../src/user-config.js';
+import type { TelegramConfig } from '../src/user-config/types.js';
 
 function tg(over: Partial<TelegramConfig> = {}): TelegramConfig {
   return { enabled: true, allowedUsers: [111], ...over };

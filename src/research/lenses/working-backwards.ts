@@ -1,3 +1,4 @@
+import { isNonEmptyString, isRecord } from '../../primitives/guards.js';
 /** Output contract selected before a research ladder is generated. */
 export interface WorkingBackwardsSection {
   id: string;
@@ -52,7 +53,7 @@ export function parseWorkingBackwardsContract(value: unknown): ParseWorkingBackw
     sections.push({ id, title: raw.title.trim(), purpose: raw.purpose.trim() });
   }
   if (!Array.isArray(value.completionCriteria) || value.completionCriteria.length === 0
-    || !value.completionCriteria.every(isNonEmptyString)) {
+    || !value.completionCriteria.every((criterion) => isNonEmptyString(criterion))) {
     return { ok: false, reason: 'at least one non-empty completion criterion is required' };
   }
   return {
@@ -78,12 +79,4 @@ export function formatWorkingBackwardsLadderContext(contract: WorkingBackwardsOu
     ...contract.completionCriteria.map(criterion => `- ${criterion}`),
     'Generate research questions for evidence gaps in these sections; do not fill gaps with unsupported claims.',
   ].join('\n');
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0;
 }

@@ -16,7 +16,7 @@ const key = { context: 'node-b', imageDigest: `sha256:${'b'.repeat(64)}`, lockHa
 const command = (cutSha: string, lockHash: string, attemptId: string): WarmWorkerCommand => ({
   protocol: 1, runId: 'run-1', attemptId, cutSha, leaseId: 'lease-1',
   generation: 1, workerId: 'worker-1', key: { ...key, lockHash }, deadlineAt: Date.now() + 60_000,
-  files: [file], envProfile: 'gate-v1',
+  baseImageDigest: key.imageDigest, files: [file], envProfile: 'gate-v1',
 });
 function root(parentDir?: string) {
   const dir = mkdtempSync(join(parentDir ?? tmpdir(), 'warm-runtime-'));
@@ -36,6 +36,7 @@ function root(parentDir?: string) {
   mkdirSync(join(dir, 'node_modules'), { recursive: true });
   writeFileSync(join(dir, 'node_modules', '.elanous-installed-lock-hash'), `${lockHash}\n`);
   return { repoDir: dir, scratchDir: join(dir, 'scratch[1]'), artifactsRoot: join(dir, 'artifacts[1]'), workerId: 'worker-1',
+    baseImageDigest: key.imageDigest,
     request: (attemptId: string) => command(cutSha, lockHash, attemptId) };
 }
 function complete(request: WarmWorkerRunFile) {
@@ -77,6 +78,8 @@ test('two commands execute sequentially with distinct private HOME/state/tmp/XDG
   expect(first.reason).toBe('complete');
   expect(second.reason).toBe('complete');
   expect(first.reply?.files).toEqual([{ file, rc: 0, failureIds: [], errorIds: [], junitComplete: true }]);
+  expect(first.reply?.resetReceipt).toEqual({ baseImageDigest: key.imageDigest,
+    resetMethod: 'git-reset-clean-status-v1', postRunDiff: [] });
   expect(second.reply?.files).toEqual(first.reply?.files);
   expect(first.artifactsDir).not.toBe(second.artifactsDir);
   expect(existsSync(join(first.artifactsDir!, 'reply.json'))).toBe(true);
@@ -137,6 +140,17 @@ test('cleans each request back to its pinned base before the next request', asyn
   expect((await runtime.handle(options.request('attempt-1'))).reason).toBe('complete');
   expect((await runtime.handle(options.request('attempt-2'))).reason).toBe('complete');
   expect(calls).toBe(2);
+});
+
+test('a base-image digest mismatch against the Pod pin quarantines before executing work', async () => {
+  const options = root();
+  let calls = 0;
+  const runtime = new WarmWorkerRuntime({ ...options, runFile: async request => { calls++; complete(request); return 0; } });
+  const changed = options.request('wrong-base');
+  changed.baseImageDigest = `sha256:${'0'.repeat(64)}`;
+  expect(await runtime.handle(changed)).toMatchObject({ reply: null, quarantineWorker: true, reason: 'quarantined' });
+  expect(await runtime.handle(options.request('retry-after-mismatch'))).toMatchObject({ quarantineWorker: true, reason: 'quarantined' });
+  expect(calls).toBe(0);
 });
 
 test('resets a changed HEAD at the request boundary before quarantining source drift', async () => {
@@ -737,12 +751,12 @@ test('POD-REUSE-MIN-SYNC: 같은 웜 Pod 로 들어온 새 base 요청은 직렬
   roots.push(mirrorRoot);
   const mirror = join(mirrorRoot, 'mirror.git');
   const seeded = spawnSync('git', ['clone', '-q', '--bare', options.repoDir, mirror], { encoding: 'utf8' });
-  if (seeded.status !== 0) throw new Error(seeded.stderr);
+  if (seeded.status !== 0) throw new Error(seeded.stderr.toString());
   // 새 base 는 별도 클론에서 만들어 미러로만 흘린다 — 상주 체크아웃은 그 커밋을 모른다(미러 fetch 경로).
   const work = mkdtempSync(join(tmpdir(), 'warm-min-sync-base2-'));
   roots.push(work);
   const cloned = spawnSync('git', ['clone', '-q', options.repoDir, work], { encoding: 'utf8' });
-  if (cloned.status !== 0) throw new Error(cloned.stderr);
+  if (cloned.status !== 0) throw new Error(cloned.stderr.toString());
   writeFileSync(join(work, 'src/example/next.ts'), 'second base\n');
   for (const args of [['add', '--', 'src/example/next.ts'], ['-c', 'user.name=TC', '-c', 'user.email=tc@example.test', 'commit', '-qm', 'second base']]) {
     const result = spawnSync('git', ['-C', work, ...args], { encoding: 'utf8' });
@@ -791,14 +805,14 @@ test('POD-REUSE-MIN-SYNC: 같은 런타임의 두 요청 사이 bun.lock 변경�
   roots.push(mirrorRoot);
   const mirror = join(mirrorRoot, 'mirror.git');
   const seeded = spawnSync('git', ['clone', '-q', '--bare', options.repoDir, mirror]);
-  if (seeded.status !== 0) throw new Error(seeded.stderr);
+  if (seeded.status !== 0) throw new Error(seeded.stderr.toString());
   const work = mkdtempSync(join(tmpdir(), 'warm-lock-change-base2-'));
   roots.push(work);
   const cloned = spawnSync('git', ['clone', '-q', options.repoDir, work]);
-  if (cloned.status !== 0) throw new Error(cloned.stderr);
+  if (cloned.status !== 0) throw new Error(cloned.stderr.toString());
   writeFileSync(join(work, 'bun.lock'), 'pinned-lock-2\n');
   writeFileSync(join(work, 'src/example/next.ts'), 'second base\n');
-  for (const args of [['add', '--', 'bun.lock', 'src/example/next.ts'], ['-c', 'user.name=TC', '-c', 'user.email=tc@example.test', 'commit', '-qm', 'second base changes lock']]) {
+  for (const args of [['add', '--', 'bun.lock', 'src/example/next.ts'], ['-c', 'user.name=TC', '-c', 'user.email=tc@example.test', 'commit', '-qm', 'second base changes lock']] as string[][]) {
     const result = spawnSync('git', ['-C', work, ...args], { encoding: 'utf8' });
     if (result.status !== 0) throw new Error(result.stderr);
   }
@@ -814,7 +828,7 @@ test('POD-REUSE-MIN-SYNC: 같은 런타임의 두 요청 사이 bun.lock 변경�
   writeFileSync(join(fakeBin, 'bun'), `#!/bin/sh\necho install >> '${installCalls}'\nexit 0\n`);
   chmodSync(join(fakeBin, 'bun'), 0o755);
   const runMinSync = (script: string) => {
-    const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}` };
+    const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}` };
     for (const name of Object.keys(env)) if (name.startsWith('GIT_')) delete env[name];
     const result = spawnSync('bash', ['-c', script], { cwd: options.repoDir, env, encoding: 'utf8' });
     return { status: result.status, stdout: result.stdout, stderr: result.stderr };

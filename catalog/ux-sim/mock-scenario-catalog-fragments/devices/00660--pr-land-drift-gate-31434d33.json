@@ -1,0 +1,32 @@
+{
+  "id": "pr-land-drift-gate",
+  "name": "Pinned main TSC drift refusal simulation",
+  "checklistCells": [
+    "LAND-DRIFT-GATE-PRODUCER"
+  ],
+  "implementation": [
+    "src/ux-sim/pr-land-drift-gate-device.ts",
+    "src/cli/pr-land-heavy-remote.ts",
+    "src/cli/pr-land-refusal.ts"
+  ],
+  "tests": [
+    "src/ux-sim/pr-land-drift-gate-device.test.ts"
+  ],
+  "target": "Pinned main typecheck delta producer and refusal classification",
+  "inputs": [
+    "expected main SHA",
+    "remote delta summary and diagnostics",
+    "heavy-gate refusal line"
+  ],
+  "observations": [
+    "drift only for matching base SHA with explicit positive diagnostics",
+    "zero new diagnostics classified unrelated",
+    "missing or mismatched base proof remains unmeasured"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/pr-land-drift-gate-device.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

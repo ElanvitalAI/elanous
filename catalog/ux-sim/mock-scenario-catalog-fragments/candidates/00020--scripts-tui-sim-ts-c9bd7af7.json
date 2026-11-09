@@ -1,0 +1,8 @@
+{
+  "path": "scripts/tui-sim.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun scripts/tui-sim.ts start --id mock-catalog-example --test",
+  "logsRecorded": "conditional",
+  "logsDetail": "Writes its own simulation artifacts, not ScenarioV0 logs.",
+  "excludeReason": "Standalone TUI driver; separate artifact contract."
+}

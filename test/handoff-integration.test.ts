@@ -28,7 +28,7 @@ import {
   findSessionByTelegramChat,
 } from '../src/session/index.js';
 import { botFromConfig } from '../src/telegram.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { createFakeFetchDevice, type FakeFetchDevice, type FakeFetchRequest } from '../src/ux-sim/fake-fetch.js';
 
 const savedEnv: Record<string, string | undefined> = {};

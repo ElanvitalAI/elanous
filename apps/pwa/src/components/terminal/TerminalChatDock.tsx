@@ -47,8 +47,8 @@ const HISTORY_LIMIT = 200;
 export interface TerminalChatDockHandle {
   /** Phase 2 (webterm voice control) — TerminalPanel-owned voice
    *  controller routes STT `final` transcripts here when activeMicSource
-   *  === 'dock'. Skips the call when a turn is already in flight (B2
-   *  risk mitigation, mirrors ChatLayout `pendingRef`). */
+   *  === 'dock'. Voice turns are serialized so an in-flight ACP request
+   *  cannot drop a later transcript. */
   submitVoiceTranscript: (text: string) => void;
 }
 
@@ -71,6 +71,7 @@ interface Props {
   terminalId: string;
   open: boolean;
   onTabIntent?: (intent: 'next' | 'prev' | number) => void;
+  onVoiceTranscriptSubmitReady?: (terminalId: string, handle: TerminalChatDockHandle | null) => void;
   /** Parent-measured vertical allocation; absent or invalid values keep the legacy CSS budget. */
   height?: number;
   voice?: TerminalChatDockVoiceProps;
@@ -86,7 +87,7 @@ function normalizeMetaOutput(raw: string | undefined): string {
 }
 
 export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(function TerminalChatDock(
-  { terminalId, open, onTabIntent, height, voice },
+  { terminalId, open, onTabIntent, onVoiceTranscriptSubmitReady, height, voice },
   ref,
 ) {
   const externalHeight = typeof height === 'number' && Number.isFinite(height) && height > 0
@@ -105,8 +106,21 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
   // controller callback always reaches the latest handleSubmit closure
   // (which closes over latest pending/messages each render).
   const latestSubmitRef = useRef<(text: string) => Promise<void>>(async () => {});
-  const pendingRef = useRef(false);
-  pendingRef.current = pending;
+  const voiceTranscriptQueueRef = useRef<Array<{ terminalId: string; generation: number; text: string }>>([]);
+  const drainingVoiceTranscriptQueueRef = useRef(false);
+  const voiceScopeRef = useRef({ terminalId: open ? terminalId : null, generation: 0 });
+  const voiceTargetTerminalId = open ? terminalId : null;
+  if (voiceScopeRef.current.terminalId !== voiceTargetTerminalId) {
+    voiceScopeRef.current = {
+      terminalId: voiceTargetTerminalId,
+      generation: voiceScopeRef.current.generation + 1,
+    };
+    voiceTranscriptQueueRef.current = [];
+  }
+  useEffect(() => () => {
+    voiceScopeRef.current = { terminalId: null, generation: voiceScopeRef.current.generation + 1 };
+    voiceTranscriptQueueRef.current = [];
+  }, []);
 
   // ACP streaming Phase C+D (PLAN v1.2 · 2026-05-07) — placeholder id
   // for the in-flight assistant turn. The session/update listener (mounted
@@ -210,19 +224,29 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
   // activeMicSource === 'dock'. ref-based dispatch keeps the handle
   // identity stable across renders (no re-create on handleSubmit
   // identity change).
-  useImperativeHandle(ref, () => ({
-    submitVoiceTranscript: (text: string): void => {
-      const trimmed = text.trim();
-      if (!trimmed) return;
-      if (pendingRef.current) {
-        debugLog('webterm.terminal-chat.voice.skip-pending', { len: trimmed.length });
-        return;
+  const submitVoiceTranscript = useCallback((text: string): void => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const scope = voiceScopeRef.current;
+    if (!open || scope.terminalId !== terminalId) return;
+    debugLog('webterm.terminal-chat.voice.auto-send', { len: trimmed.length });
+    voiceTranscriptQueueRef.current.push({ terminalId, generation: scope.generation, text: trimmed });
+    if (drainingVoiceTranscriptQueueRef.current) return;
+    drainingVoiceTranscriptQueueRef.current = true;
+    void (async () => {
+      try {
+        while (voiceTranscriptQueueRef.current.length > 0) {
+          const next = voiceTranscriptQueueRef.current.shift()!;
+          const currentScope = voiceScopeRef.current;
+          if (next.terminalId !== currentScope.terminalId || next.generation !== currentScope.generation) continue;
+          await latestSubmitRef.current(next.text);
+        }
+      } finally {
+        drainingVoiceTranscriptQueueRef.current = false;
       }
-      debugLog('webterm.terminal-chat.voice.auto-send', { len: trimmed.length });
-      void latestSubmitRef.current(trimmed);
-    },
-  }), []);
-
+    })();
+  }, [open, terminalId]);
+  useImperativeHandle(ref, () => ({ submitVoiceTranscript }), [submitVoiceTranscript]);
   const ensureAcp = useCallback(() => {
     const sid = latestSessionIdRef.current;
     if (!sid) return null;
@@ -467,6 +491,15 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
     latestSubmitRef.current = handleSubmit;
   }, [handleSubmit]);
 
+  // Publish the imperative handle only after the submit ref is ready. Panel may
+  // flush transcripts synchronously from this callback; exposing it earlier can
+  // drain the first item through the initial no-op ref and skip that turn.
+  useEffect(() => {
+    if (!open || !onVoiceTranscriptSubmitReady) return;
+    onVoiceTranscriptSubmitReady(terminalId, { submitVoiceTranscript });
+    return () => onVoiceTranscriptSubmitReady(terminalId, null);
+  }, [onVoiceTranscriptSubmitReady, open, submitVoiceTranscript, terminalId]);
+
   if (!open) return null;
 
   return (
@@ -601,14 +634,13 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
         )}
         {...(externalHeight === undefined ? {} : { style: { height: externalHeight } })}
       >
-        <ChatHistory messages={messages} pending={pending} tabId={`dock-${terminalId}`} />
+        <ChatHistory messages={messages} pending={pending} />
         <ChatInput
           onSubmit={handleSubmit}
           disabled={pending}
           attachments={pendingAttachments}
           onAttached={handleAttached}
           onRemoveAttachment={handleRemoveAttachment}
-          tabId={`dock-${terminalId}`}
           {...(voice ? { voice } : {})}
         />
       </div>

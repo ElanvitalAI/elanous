@@ -1,0 +1,22 @@
+{
+  "id": "SIM-RELEASE-SAME-VERSION-RUN-ADOPTION",
+  "name": "Same-version release run adoption after an interrupted cut",
+  "kind": "release-run-adoption",
+  "device": "release-same-version-run-adoption-sim",
+  "implementation": [
+    "src/ux-sim/release-same-version-run-adoption-sim.ts",
+    "scripts/release-loop/unattended-release.ts",
+    "src/graph-runner/runner.ts"
+  ],
+  "tests": [
+    "src/ux-sim/release-same-version-run-adoption-sim.test.ts"
+  ],
+  "trigger": "Run the real release-loop graph runner until its simulated gate fails, then issue the same stable version again through the production unattended release coordinator.",
+  "observe": [
+    "production coordinator resumes the original run ID from the failed gate",
+    "resumeInputPatch restores the missing gateImagePin before the gate runs",
+    "the simulated gate passes and the real graph reaches done",
+    "the existing release branch is adopted and the graph-run ledger remains one entry"
+  ],
+  "expected": "The real graph runner fails at gate on its first pass and completes at gate on the second request, keeping one run ID and one ledger row."
+}

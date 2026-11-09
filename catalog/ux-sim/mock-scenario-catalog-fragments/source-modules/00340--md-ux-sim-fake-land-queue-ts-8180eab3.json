@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-LAND-QUEUE-TS",
+  "path": "src/ux-sim/fake-land-queue.ts",
+  "boundary": "fake land queue: In-process LAND-QUEUE simulator. Scheduling and verdict logic use the production train functions; only git's merge-tree/commit-tree and the remote gate are replaced.",
+  "deviceIds": [
+    "fake-land-queue"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

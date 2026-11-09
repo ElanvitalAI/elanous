@@ -12,4 +12,4 @@ cases:
       status: resume-refused
       mustVisit: [version-release, gate]
       mustNotVisit: [known-issues, publish]
-      refusalIncludes: waived node must reach known-issues before publication
+      refusalIncludes: measured gate regressions cannot be waived

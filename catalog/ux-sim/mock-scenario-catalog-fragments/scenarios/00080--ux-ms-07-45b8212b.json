@@ -1,0 +1,21 @@
+{
+  "id": "UX-MS-07",
+  "name": "Pod pool capacity and query errors",
+  "kind": "pod-pool-error",
+  "device": "fault-injection",
+  "implementation": [
+    "src/ux-sim/fault-pool-cap.ts",
+    "src/ux-sim/fake-kubectl.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fault-pool-cap.test.ts",
+    "src/ux-sim/fake-kubectl.test.ts"
+  ],
+  "trigger": "Omit a pool limit, saturate members, or inject a kubectl query failure.",
+  "observe": [
+    "recommended concurrency",
+    "limitedBy",
+    "query error"
+  ],
+  "expected": "known running counts are capped; a query failure preserves unknown occupancy and emits no concurrency recommendation"
+}

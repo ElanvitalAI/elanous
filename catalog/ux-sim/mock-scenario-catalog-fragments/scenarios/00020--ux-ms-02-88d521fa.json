@@ -1,0 +1,30 @@
+{
+  "id": "UX-MS-02",
+  "name": "Release gate regression routing",
+  "kind": "gate-regression",
+  "device": "release-graph-rig",
+  "implementation": [
+    "src/ux-sim/release-sim-rig.ts",
+    "scripts/release-loop/gate-node-sim.ts",
+    "scripts/release-loop/gate-bisect.ts",
+    "scripts/release-loop/gate-bisect-sidecar.ts",
+    "scripts/release-loop/gate-autoheal-sim-evidence.ts",
+    "scenarios/ux-sim/release-sim-rig.yaml"
+  ],
+  "tests": [
+    "src/ux-sim/release-sim-rig.test.ts",
+    "scripts/release-loop/release-graph-fanout-mock.test.ts",
+    "scripts/release-loop/gate-node-sim.test.ts",
+    "scripts/release-loop/gate-bisect.test.ts",
+    "scripts/release-loop/gate-flow-sim.test.ts"
+  ],
+  "trigger": "Inject release node outcomes including concurrent warning and required branches.",
+  "observe": [
+    "visited graph nodes",
+    "fan-out join branch outcomes",
+    "start-time overlap",
+    "unexpected edge list",
+    "terminal status"
+  ],
+  "expected": "warning failures remain visible but pass the join; required failures route to failed"
+}

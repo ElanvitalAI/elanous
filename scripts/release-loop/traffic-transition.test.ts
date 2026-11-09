@@ -17,8 +17,7 @@ setDefaultTimeout(60_000);
 
 test('named release graph lowers traffic after gate and restores it only after verify succeeds', async () => {
   const graph = parseYaml(readFileSync(GRAPH, 'utf8')) as {
-    nodes: Array<{ node_id: string; kind: string; recipe?: string }>;
-    nodes: Array<{ node_id: string; needs?: string[] }>;
+    nodes: Array<{ node_id: string; kind: string; recipe?: string; needs?: string[] }>;
     edges: Array<{ from: string; on: string; map: Record<string, string>; branches?: Record<string, string[]>; join?: string; warning_branches?: string[] }>;
   };
   const recipes = parseYaml(readFileSync(RECIPES, 'utf8')) as Record<string, { command: string }>;
@@ -28,7 +27,7 @@ test('named release graph lowers traffic after gate and restores it only after v
 
   expect(edge('gate')).toMatchObject({ ok: gateTraffic, fail: 'gate-triage', error: 'gate-triage' });
   expect(graph.edges.find((item) => item.from === gateTraffic)).toMatchObject({ warning_branches: ['mac-smoke'] });
-  expect(graph.nodes.find((node) => node.node_id === 'pre-prepare-join')?.needs).toEqual(['mac-smoke', 'pwa']);
+  expect(graph.nodes.find((node) => node.node_id === 'pre-prepare-join')?.needs).toEqual(['mac-smoke', 'pwa', 'export-check']);
   expect(edge('verify')).toMatchObject({ ok: verifyTraffic, fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
   expect(edge(verifyTraffic)).toEqual({ ok: 'vault-note', fail: 'vault-note', error: 'vault-note' });
 

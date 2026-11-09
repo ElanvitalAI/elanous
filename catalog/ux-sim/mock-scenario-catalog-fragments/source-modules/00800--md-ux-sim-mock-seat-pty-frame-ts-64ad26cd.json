@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-MOCK-SEAT-PTY-FRAME-TS",
+  "path": "src/ux-sim/mock-seat-pty-frame.ts",
+  "boundary": "Drives the real first-run TUI through a PTY with injected clock, host, HOME, size and key input; captures frames and lifecycle markers.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

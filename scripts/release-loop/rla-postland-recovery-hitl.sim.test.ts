@@ -41,6 +41,8 @@ test('same release run parks on HITL after bounded landing recovery fails, then 
   const graphSlice = { ...productionGraph, entry_node: 'gate' };
   writeFileSync(graphPath, stringifyYaml(graphSlice));
   writeFileSync(join(graphDir, 'recipes.yaml'), await Bun.file(join(import.meta.dir, '../../graphs/release/recipes.yaml')).text());
+  for (const file of ['plugin.json', 'release-graph.schema.yaml', 'release-edge-vocabulary.yaml', 'release-gate-domain-pack.yaml'])
+    writeFileSync(join(graphDir, file), await Bun.file(join(import.meta.dir, `../../graphs/release/${file}`)).text());
 
   const runId = 'postland-recovery-hitl';
   let gateVisits = 0;
@@ -130,10 +132,12 @@ test('same release run parks on HITL after bounded landing recovery fails, then 
     expect(failedRun.path.at(-1)).toBe('gate-heal-decision');
 
     repairMode = 'command-error';
+    gateVisits = 0;
     const commandErrorRun = await runGraph(graphPath, { runId: `${runId}-command-error`, input: { version: '0.3.7', previousVersion: '0.3.6' },
       deps: { root, runBash }, signal: new AbortController().signal });
-    expect(commandErrorRun.status).toBe('failed');
+    expect(commandErrorRun.status).toBe('awaiting-approval');
+    expect(commandErrorRun.pending?.nodeId).toBe('gate-heal-decision');
     expect(commandErrorRun.path).not.toContain(scenario.expected.pendingNode);
-    expect(commandErrorRun.path.at(-1)).toBe('failed');
+    expect(commandErrorRun.path.at(-1)).toBe('gate-heal-decision');
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, { timeout: 15_000 });

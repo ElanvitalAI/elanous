@@ -1,0 +1,61 @@
+{
+  "id": "product-devices",
+  "name": "Product and task-agent devices",
+  "implementation": [
+    "src/ux-sim/boot-daemon-tools-pty-shell-device.ts",
+    "src/ux-sim/cli-config-audit-device.ts",
+    "src/ux-sim/computer-use.ts",
+    "src/ux-sim/dashboard-event-loop-stall-monitor-device.ts",
+    "src/ux-sim/event-monkey.ts",
+    "src/ux-sim/goal-device.ts",
+    "src/ux-sim/goal-interim-trace.ts",
+    "src/ux-sim/onboarding-first-run-device.ts",
+    "src/ux-sim/resume-picker-device.ts",
+    "src/ux-sim/skills-tools-shell-device.ts",
+    "src/ux-sim/subagent-tools-device.ts",
+    "src/ux-sim/task-agent-parent-host-device.ts",
+    "src/ux-sim/task-agent-rejudge-on-head-device.ts",
+    "src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.ts",
+    "src/ux-sim/tool-async-fail-loop.ts",
+    "src/ux-sim/user-config-default-sparse-sim.ts"
+  ],
+  "tests": [
+    "src/ux-sim/boot-daemon-tools-pty-shell-device.test.ts",
+    "src/ux-sim/cli-config-audit-device.test.ts",
+    "src/ux-sim/computer-use.test.ts",
+    "src/ux-sim/dashboard-event-loop-stall-monitor-device.test.ts",
+    "src/ux-sim/event-monkey.test.ts",
+    "src/ux-sim/goal-device.test.ts",
+    "src/ux-sim/onboarding-first-run-device.test.ts",
+    "src/ux-sim/resume-picker-device.test.ts",
+    "src/ux-sim/self-implement-author-clarification.test.ts",
+    "src/ux-sim/skills-tools-shell-device.test.ts",
+    "src/ux-sim/subagent-tools-device.test.ts",
+    "src/ux-sim/task-agent-parent-host-device.test.ts",
+    "src/ux-sim/task-agent-rejudge-on-head-device.test.ts",
+    "src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.test.ts",
+    "src/ux-sim/tool-async-fail-loop.test.ts",
+    "src/ux-sim/user-config-default-sparse-sim.test.ts"
+  ],
+  "target": "selected product, PTY, agent and orchestration seams",
+  "inputs": [
+    "UI state",
+    "task outcome",
+    "host/review decision",
+    "tool result"
+  ],
+  "observations": [
+    "rendered state",
+    "decision result",
+    "event sequence",
+    "stop reason"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/boot-daemon-tools-pty-shell-device.test.ts src/ux-sim/cli-config-audit-device.test.ts src/ux-sim/computer-use.test.ts src/ux-sim/dashboard-event-loop-stall-monitor-device.test.ts src/ux-sim/event-monkey.test.ts src/ux-sim/goal-device.test.ts src/ux-sim/onboarding-first-run-device.test.ts src/ux-sim/resume-picker-device.test.ts src/ux-sim/self-implement-author-clarification.test.ts src/ux-sim/skills-tools-shell-device.test.ts src/ux-sim/subagent-tools-device.test.ts src/ux-sim/task-agent-parent-host-device.test.ts src/ux-sim/task-agent-rejudge-on-head-device.test.ts src/ux-sim/task-orchestrator-surfaces-self-implement-pod-device.test.ts",
+    "bun test src/ux-sim/tool-async-fail-loop.test.ts",
+    "bun test src/ux-sim/user-config-default-sparse-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

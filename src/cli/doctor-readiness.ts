@@ -345,7 +345,7 @@ function installPath(deps: ReadinessDeps): ReadinessItem {
   return item(
     'install-path',
     'fixable',
-    `installed at ${shown} but ${shownBin} is not on PATH`,
+    `installed at ${shown} but ${shownBin} is not on PATH in this shell; open a new shell to read the installer PATH update`,
     windows ? `$env:PATH = '${bin.replace(/'/g, "''")}' + [IO.Path]::PathSeparator + $env:PATH` : `export PATH=${shellQuote(bin)}:"$PATH"`,
   );
 }
@@ -513,7 +513,7 @@ function serviceFile(deps: ReadinessDeps): ReadinessItem {
 }
 
 /** Read-only readiness. Callers inject every lookup; this function performs none. */
-const BUN_TMPDIR_REMEDY = 'mkdir -p ~/tmp-bun && export TMPDIR=~/tmp-bun  # then re-run the install';
+const BUN_TMPDIR_REMEDY = 'cache="${BUN_INSTALL_CACHE_DIR:-${BUN_INSTALL:-$HOME/.bun}/install/cache}"; tmp="$cache/elanous-tmp"; mkdir -p "$tmp" && export TMPDIR="$tmp"  # then re-run the installer';
 
 /** bun 판 — 설치기·Pod 이미지·doctor 가 `.bun-version` 한 칸을 따른다(09-25 결정 · 판이 갈리면 같은 코드가 기계마다 다르게 돈다). */
 function bunVersionItem(deps: ReadinessDeps): ReadinessItem {

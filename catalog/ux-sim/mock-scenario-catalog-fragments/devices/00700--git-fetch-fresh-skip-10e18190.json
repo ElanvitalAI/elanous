@@ -1,0 +1,30 @@
+{
+  "id": "git-fetch-fresh-skip",
+  "name": "Fresh Git base fetch skip and coalescing",
+  "implementation": [
+    "src/git-fs/worktree.ts",
+    "src/ux-sim/temp-git-repo.ts"
+  ],
+  "tests": [
+    "src/git-fs/worktree.test.ts"
+  ],
+  "target": "Production createWorktree against a disposable local remote; the current advertised commit is fetched once, then later creations reuse only that exact local commit object.",
+  "inputs": [
+    "same repository and remote branch",
+    "exact remote tip SHA from ls-remote",
+    "initial object miss followed by object availability",
+    "ten consecutive createWorktree calls"
+  ],
+  "observations": [
+    "legacy fetch count 10 versus current fetch count 1",
+    "skip/coalesce events include the simulation runId",
+    "cache or lock uncertainty falls back to the original fetch path",
+    "all ten worktrees resolve to the advertised SHA"
+  ],
+  "entryCommands": [
+    "bun test src/git-fs/worktree.test.ts -t \"실제 createWorktree 10회\""
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

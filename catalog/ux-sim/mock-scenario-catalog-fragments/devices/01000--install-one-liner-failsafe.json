@@ -1,0 +1,31 @@
+{
+  "id": "install-one-liner-failsafe",
+  "name": "Public one-line installer HTTP failure safety",
+  "implementation": [
+    "src/ux-sim/install-one-liner-failsafe-device.ts",
+    "release/public/docs/install.md"
+  ],
+  "tests": [
+    "src/ux-sim/install-one-liner-failsafe-device.test.ts"
+  ],
+  "target": "Execute the documented public install command against a fake curl boundary and prove HTTP 504 cannot become success or start the installer.",
+  "inputs": [
+    "documented one-line shell command",
+    "fake HTTP 504 response with curl exit 22, a 504 body with curl exit 0 when -f is absent, and an empty error body with curl exit 0",
+    "isolated temporary installer path"
+  ],
+  "observations": [
+    "HTTP 504 is returned as non-zero and the installer is never started",
+    "an empty error response is rejected even if curl reports success",
+    "removing curl -f makes the 504 response exit differently and fails the simulation",
+    "empty and partial downloads are removed on failure",
+    "syntax checks and installer execution are recorded as distinct invocations",
+    "a valid download runs with --yes and is also removed afterward"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/install-one-liner-failsafe-device.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

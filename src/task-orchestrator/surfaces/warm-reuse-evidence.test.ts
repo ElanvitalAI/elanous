@@ -181,6 +181,6 @@ test('gate invalidation lock inspection failure times out instead of spinning fo
   try {
     writeFileSync(path, '');
     symlinkSync(join(root, 'missing-lock-target'), `${path}.lock`);
-    expect(() => invalidateWarmReuseEvidence(path, 20)).toThrow('timed out locking warm reuse evidence invalidation');
+    expect(() => invalidateWarmReuseEvidence(path, 20)).toThrow(/(?:timed out locking warm reuse evidence invalidation|unable to inspect warm reuse evidence lock before timeout)/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

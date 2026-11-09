@@ -1,0 +1,23 @@
+{
+  "id": "RELEASE-GRAPH-PREPUB-FANOUT",
+  "name": "Pre-gate and pre-prepare required/warning fan-out",
+  "kind": "release-graph-fanout",
+  "device": "release-graph-rig",
+  "implementation": [
+    "graphs/release/release-loop.yaml",
+    "src/ux-sim/release-sim-rig.ts",
+    "scenarios/ux-sim/release-sim-rig.yaml"
+  ],
+  "tests": [
+    "scripts/release-loop/release-graph-fanout-mock.test.ts",
+    "src/ux-sim/release-sim-rig.test.ts"
+  ],
+  "trigger": "Run export-check with prefetch and mac-smoke with pwa concurrently before gate/prepare.",
+  "observe": [
+    "branch start-time overlap",
+    "warning branch failure preserved",
+    "required branch failure at join",
+    "join outcome and next node"
+  ],
+  "expected": "prefetch/mac-smoke failures continue; export-check/pwa failures route through release failure"
+}

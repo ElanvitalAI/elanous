@@ -15,7 +15,7 @@
 // (2026-07-12); that module remains as a thin compat shim.
 
 import { existsSync } from 'node:fs';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { runTurn, type RunTurnOpts } from '../session/chat.js';
 import type { SessionSource } from '../session/index.js';
 import type { CoreTurnDispatchTool } from '../core-turn/types.js';

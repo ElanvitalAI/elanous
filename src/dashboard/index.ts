@@ -1316,7 +1316,8 @@ import { renderDebugEventDetail, renderDebugEventRows, renderDebugStack, renderP
 import { buildDebugCallStack } from '../debug/call-stack.js';
 import { buildAstGrepHostTool } from '../skills/tools/ast-grep.js';
 import { buildLspHostTool } from '../skills/tools/lsp/index.js';
-import { PluginHost } from '../plugins/core/host.js';
+import { BUILTIN_DIR, PluginHost } from '../plugins/core/host.js';
+import { createDashboardPluginRouteAdapter, type DashboardPluginRouteAdapter, type DashboardPluginRouteBridge } from './plugin-route-adapter.js';
 
 /** Keep wake notifications immediate; display completed results only when a turn drains them. */
 export function subscribeDashboardAgentResults(
@@ -1339,7 +1340,7 @@ export function subscribeDashboardAgentResults(
 }
 
 /** Register the same L2 host tools used by the live TUI before each turn's catalog is assembled. */
-export function registerDashboardCoreHostTools(host: Pick<PluginHost, 'registerHostTool'>): void {
+export function registerDashboardCoreHostTools(host: Pick<PluginHost, 'registerHostTool'>): (name: string, args: Record<string, unknown>) => Promise<unknown> {
   const coreMod = require('../domains/core-tools.js') as typeof import('../domains/core-tools.js');
   const core = coreMod.buildCoreTools();
   for (const spec of core.specs) {
@@ -1350,6 +1351,41 @@ export function registerDashboardCoreHostTools(host: Pick<PluginHost, 'registerH
       handler: async (args) => core.dispatch(spec.name, args as Record<string, unknown>),
     });
   }
+  return (name, args) => core.dispatch(name, args);
+}
+
+/** The shared production bridge used by classic and ACP-next TUI turns. */
+export function createDashboardPluginRouteBridge(options: {
+  pluginRoot: string;
+  dispatchCore(name: string, args: Record<string, unknown>): Promise<unknown>;
+  dispatchPlugin(name: string, args: Record<string, unknown>): Promise<
+    { ok: true; result: unknown } | { ok: false; error: string }
+  >;
+}): DashboardPluginRouteBridge {
+  const adapter = createDashboardPluginRouteAdapter(options);
+  return {
+    classicHostTools: adapter.classicHostTools,
+    nextHostTools: adapter.nextHostTools,
+    async dispatch(name, args, confirmed) {
+      return await adapter.dispatch(name, args, confirmed) ?? options.dispatchPlugin(name, args);
+    },
+  };
+}
+
+/** Tool-catalog assembly invoked by the production classic chat-turn path. */
+export function buildClassicDashboardTuiTurnTools(
+  adapter: DashboardPluginRouteAdapter,
+  options: Parameters<typeof buildSessionRuntimeToolSpecs>[0],
+) {
+  return buildSessionRuntimeToolSpecs({ ...options, hostTools: adapter.classicHostTools(options.hostTools) });
+}
+
+/** Tool-catalog assembly invoked by the production ACP-next chat-turn path. */
+export function buildNextDashboardTuiTurnTools(
+  adapter: DashboardPluginRouteAdapter,
+  options: Parameters<typeof buildSessionRuntimeToolSpecs>[0],
+) {
+  return buildSessionRuntimeToolSpecs({ ...options, hostTools: adapter.nextHostTools(options.hostTools) });
 }
 import { registerDashboardPaneHostTools } from './panes/host-tools.js';
 import { type ThemeTokens } from '../theme/tokens.js';
@@ -4472,6 +4508,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     }
   };
   let pluginHost: PluginHost;
+  let pluginRouteAdapter: DashboardPluginRouteBridge;
   let lastThemeLoadError = '';
   let lastThemeResolutionName: string | null = null;
   let lastPluginThemeAppliedDebugKey: string | null = null;
@@ -9487,9 +9524,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   //   fact_check)를 TUI 채팅에도 host tool 로 상속. 노출 게이트는 session-runtime 의 'self-ops'
   //   family(전 surface 기본) — 이로써 TUI 에서도 "P2 왜 실패?" 를 엘라누스가 툴로 상황판단한다.
   //   fail-soft: 코어 도구 로드 실패가 대시보드 부팅을 막지 않는다.
-  try {
-    registerDashboardCoreHostTools(pluginHost);
-  } catch { /* fail-soft */ }
+  let dispatchCore: (name: string, args: Record<string, unknown>) => Promise<unknown> = async (name) => ({ error: `core tool unavailable: ${name}` });
+  try { dispatchCore = registerDashboardCoreHostTools(pluginHost); } catch { /* fail-soft */ }
+  pluginRouteAdapter = createDashboardPluginRouteBridge({
+    pluginRoot: BUILTIN_DIR,
+    dispatchCore,
+    dispatchPlugin: (name, args) => pluginHost.dispatchTool(name, args),
+  });
   // LSP (Phase L3 of 내부 문서 `ROADMAP-lsp-integration`) — structural /
   // symbol-level source queries via typescript-language-server. Pool
   // kept alive per cwd; reaped on 10-min idle. See
@@ -14714,7 +14755,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           const turnUserConfig = getUserConfig();
           const activeModel = inspectActiveProvider().model;
           const tools = runtime
-            ? buildSessionRuntimeToolSpecs({
+            ? buildNextDashboardTuiTurnTools(pluginRouteAdapter, {
                 userText,
                 hostTools: pluginHost.hostLLMTools(),
                 runtimeTools: runtime.listToolRuntimes('tui'),
@@ -14758,7 +14799,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         getTools: ({ userText }) => {
           const runtime = acpToolRuntime;
           if (!runtime) return [];
-          const tools = buildSessionRuntimeToolSpecs({
+          const tools = buildNextDashboardTuiTurnTools(pluginRouteAdapter, {
             userText,
             hostTools: pluginHost.hostLLMTools(),
             runtimeTools: runtime.listToolRuntimes('tui'),
@@ -14878,7 +14919,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 // availability and dangerous-tool policy checks.
                 buildChildToolCatalog: (childCwd) => {
                   const childCatalog = buildSubagentSessionRuntimeToolSpecs({
-                    hostTools: pluginHost.hostLLMTools(),
+                    hostTools: pluginRouteAdapter.nextHostTools(pluginHost.hostLLMTools()),
                     // Runtime can disappear between the parent turn and a child
                     // spawn. In that case keep the captured TUI host catalog below.
                     runtimeTools: runtime?.listToolRuntimes('tui') ?? [],
@@ -14907,8 +14948,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                     ? acpDispatchToolSelf(childName, childArgs, ctx)
                     : Promise.resolve({ error: 'parent dispatcher unavailable' }),
               }),
-            dispatchPluginTool: (toolName, input) =>
-              pluginHost.dispatchTool(toolName, input),
+            dispatchPluginTool: async (toolName, input) => pluginRouteAdapter.dispatch(toolName, input),
           });
           if (ctx?.callId && (name === 'Bash' || name === 'RunShell')) {
             escDelegatedShellResultsByCallId.set(ctx.callId, dispatchPromise);
@@ -17811,7 +17851,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               // pass-through here.
               const runtime = acpToolRuntime;
               const tools = runtime
-                ? buildSessionRuntimeToolSpecs({
+                ? buildClassicDashboardTuiTurnTools(pluginRouteAdapter, {
                     userText: args.userText,
                     hostTools: pluginHost.hostLLMTools(),
                     runtimeTools: runtime.listToolRuntimes('tui'),

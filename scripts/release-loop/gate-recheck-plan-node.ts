@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { cachedCutSnapshot, createCutSnapshot } from './gate-cut-snapshot.js';
 import { planSameCommitRecheck, writeRecheckPlan } from './gate-partial';
 
@@ -20,7 +21,9 @@ export interface RecheckInput {
 export function existsTestFileAtCommit(repo: string, commit: string, file: string): boolean {
   const snapshot = cachedCutSnapshot(repo, commit);
   if (snapshot) return snapshot.existsBlob(file);
-  const found = spawnSync('git', ['cat-file', '-t', commit + ':' + file], { cwd: repo, encoding: 'utf8' });
+  const found = spawnSync('git', ['cat-file', '-t', commit + ':' + file], {
+    cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   if (found.error) throw found.error;
   return found.status === 0 && found.stdout.trim() === 'blob';
 }

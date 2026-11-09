@@ -1,3 +1,4 @@
+import { isFiniteNumber } from '../primitives/guards.js';
 import { debug } from '../debug/log.js';
 import { adversarialPlanCritique } from '../harness/adversarial-plan.js';
 import { classifyHeft, adversarialThreshold } from '../harness/harness-seams.js';
@@ -159,10 +160,6 @@ function goalSliceSizePrompt(objective: string, steps: readonly string[]): strin
 export type RecentStepCountReader = () => readonly number[];
 
 type LogStoreLike = { query: (q?: { events?: string[] }) => readonly { data: string | null }[] };
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value);
-}
 
 /** Parse valid `stepCount` values; malformed rows are ignored and `[]` is a successful read. */
 export function parseRecentStepCountsFromLogRows(rows: readonly { data: string | null }[]): number[] {

@@ -1,0 +1,8 @@
+{
+  "path": "scripts/voice-dogfood-sim.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun run scripts/voice-dogfood-sim.ts",
+  "logsRecorded": "no",
+  "logsDetail": "No ScenarioV0 logs.db contract.",
+  "excludeReason": "Product dogfood script, not a reusable fake-device contract."
+}

@@ -1,0 +1,11 @@
+{
+  "path": "scenarios/ux-sim/provider-4xx-no-provider.yaml",
+  "disposition": "scenario",
+  "entryCommand": "bun bin/elanous.mjs --test sim run scenarios/ux-sim/provider-4xx-no-provider.yaml",
+  "logsRecorded": "yes",
+  "logsDetail": "ux.sim.scenario/completed in test logs.db; expects llm.codex/request-rejected-shape.",
+  "deviceId": "scenario-runner",
+  "scenarioIds": [
+    "UX-MS-11"
+  ]
+}

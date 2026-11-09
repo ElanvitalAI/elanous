@@ -44,7 +44,8 @@ import type { IngestionEntry } from '../agent-substrate/execution/ingestion-poli
 import type { ReviewerContextItem } from '../agent-substrate/pr-reviewer.js';
 import { resolveRunIdentity, type RunIdSource } from '../harness/harness-space.js';
 import { addSelfDevRunParticipant, processBirthId, saveSelfDevRun } from './run-store.js';
-import { getUserConfig, resolveRoleLlm, type RoleLlmSource } from '../user-config.js';
+import { getUserConfig, resolveRoleLlm } from '../user-config.js';
+import type { RoleLlmSource } from '../user-config/types.js';
 import { applyGlmCredentialFallback, GlmChildCredentialError } from './glm-credential-guard.js';
 import { reviewReasoningEffort } from '../model-tier/review-effort.js';
 import { getProvider, getProviderForConfig, inferProviderFromModel } from '../llm.js';

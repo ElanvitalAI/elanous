@@ -38,11 +38,11 @@ describe('ElanousCard', () => {
 
   test('state · owner · due line, and only http(s) or same-origin links become links', () => {
     const html = render(card('release-checklist', [
-      item('safe', 1, { url: '/ops/checklist', state: 'yellow', owner: 'UX' }),
+      item('safe', 1, { url: '/example', state: 'yellow', owner: 'UX' }),
       item('bad', 2, { url: 'javascript:alert(1)' }),
     ]));
     expect(html).toContain('yellow · UX · 2026-10-05');
-    expect(html).toContain('href="/ops/checklist"');
+    expect(html).toContain('href="/example"');
     expect(html).not.toContain('javascript:');
   });
 

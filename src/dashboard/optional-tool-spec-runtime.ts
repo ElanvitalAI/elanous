@@ -1,6 +1,6 @@
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { debug } from '../debug/log.js';
 
 export interface DashboardOptionalToolSpecRuntimeDeps {
@@ -27,34 +27,6 @@ export function buildDashboardOptionalToolSpecs(
   // native-tool-catalog PtyShell aliases only resolve names to these registered
   // runtimes in getToolRuntime(); they are not another spec source.
   deps.registerAllDefaultToolRuntimes();
-  // Umbrella kill-switch — when `shell.allowDashboardOptionalTools`
-  // is explicitly false, return ZERO dashboard-scoped optional tools.
-  // Stabilization mode (2026-05-03 PM++): TUI tool exposure
-  // (DashboardState always-on + TerminalModal always-added)
-  // diverges from JSON-test (`elanous repro`) tool exposure and
-  // confounds codex behavior measurement. Flipping this off makes
-  // TUI use ONLY host tools — same set the JSON path uses.
-  if (deps.userConfig.shell.allowDashboardOptionalTools === false) {
-    // Umbrella off — but keep Bash alive when its dedicated toggle is
-    // on. User-stated invariant (2026-05-04): "Bash must survive even
-    // when the umbrella drops everything else, since Read+Bash form
-    // the minimum file-IO+command surface needed for chatlog
-    // debugging." `shell.allowDashboardBash` still gates the survival
-    // — explicit user opt-out wins over the umbrella exception.
-    const survivors: LLMToolSpec[] = [];
-    if (deps.userConfig.shell.allowDashboardBash === true) {
-      survivors.push(deps.buildBashTool());
-    }
-    if (debug.enabled) {
-      debug.log('llm.tool-exposure', 'dashboard-optional-specs.short-circuited', {
-        reason: 'allowDashboardOptionalTools=false',
-        survivors: survivors.map(s => s.name),
-        bashSurvived: survivors.some(s => s.name === 'Bash'),
-        bashGate: deps.userConfig.shell.allowDashboardBash === true,
-      });
-    }
-    return survivors;
-  }
   const specs: LLMToolSpec[] = [];
   const decisions: Record<string, { enabled: boolean; reason?: string; count?: number }> = {};
 
@@ -86,12 +58,8 @@ export function buildDashboardOptionalToolSpecs(
     decisions.runShell = { enabled: false, reason: 'allowDashboardRunShell=false' };
   }
 
-  if (deps.userConfig.shell.allowDashboardState !== false) {
-    specs.push(deps.buildDashboardStateTool());
-    decisions.dashboardState = { enabled: true, count: 1 };
-  } else {
-    decisions.dashboardState = { enabled: false, reason: 'allowDashboardState=false' };
-  }
+  specs.push(deps.buildDashboardStateTool());
+  decisions.dashboardState = { enabled: true, count: 1 };
 
   // TerminalModalTools — currently unconditionally added when umbrella
   // is on. Future per-tool flag could gate this too; logged here so

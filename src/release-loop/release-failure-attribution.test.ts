@@ -127,6 +127,216 @@ test('returns unmeasured when the previous release tag is not on the cut first-p
   } finally { rmSync(repo, { recursive: true, force: true }); }
 });
 
+test('resolves cut-local tsconfig path aliases including inherited config before assigning a source PR', () => {
+  const repo = repository();
+  try {
+    put(repo, 'tsconfig.base.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@app/*': ['src/*'] } } }));
+    put(repo, 'test/tsconfig.json', JSON.stringify({ extends: '../tsconfig.base.json' }));
+    put(repo, 'test/fixtures/alias.test.ts', "import { check } from '@app/check';\n");
+    put(repo, 'src/check.ts', 'export const check = true;\n');
+    const base = commit(repo, 'fixture baseline');
+    git(repo, 'tag', 'release/0.3.5', base);
+    put(repo, 'src/check.ts', 'export const check = false;\n');
+    commit(repo, 'fix: aliased source regression (#12401)');
+    const cut = git(repo, 'rev-parse', 'HEAD');
+
+    expect(attributeReleaseFailures({ repo, previousTag: 'release/0.3.5', cutCommit: cut,
+      failureIds: ['test/fixtures/alias.test.ts > alias regression'] })).toMatchObject([
+      { testFile: 'test/fixtures/alias.test.ts', sourceFiles: ['src/check.ts'], causePrs: [12401],
+        unresolvedImports: [], confidence: 'high', method: 'first-parent-source-overlap' },
+    ]);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('prefers TypeScript source over a same-base JavaScript file for a .js path alias', () => {
+  const repo = repository();
+  try {
+    put(repo, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: { '@fixture/*': ['src/*'] } } }));
+    put(repo, 'test/js-substitution.test.ts', "import { codec } from '@fixture/codec.js';\n");
+    put(repo, 'src/codec.js', 'export const codec = "runtime old";\n');
+    put(repo, 'src/codec.ts', 'export const codec = "typed old";\n');
+    const base = commit(repo, 'fixture baseline');
+    git(repo, 'tag', 'release/0.3.5', base);
+    put(repo, 'src/codec.ts', 'export const codec = "typed changed";\n');
+    commit(repo, 'fix: aliased TypeScript implementation regression (#12411)');
+    const cut = git(repo, 'rev-parse', 'HEAD');
+
+    expect(attributeReleaseFailures({ repo, previousTag: 'release/0.3.5', cutCommit: cut,
+      failureIds: ['test/js-substitution.test.ts > codec alias regression'] })).toMatchObject([
+      { sourceFiles: ['src/codec.ts'], causePrs: [12411], unresolvedImports: [], confidence: 'high' },
+    ]);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('resolves a workspace package import through its cut-local source entry before assigning its source PR', () => {
+  const repo = repository();
+  try {
+    put(repo, 'package.json', JSON.stringify({ workspaces: ['packages/*'] }));
+    put(repo, 'test/workspace.test.ts', "import { normalize } from '@fixture/codec';\n");
+    put(repo, 'packages/codec/package.json', JSON.stringify({ name: '@fixture/codec', source: './src/index.ts' }));
+    put(repo, 'packages/codec/src/index.ts', 'export const normalize = (value: string) => value.trim();\n');
+    const base = commit(repo, 'fixture baseline');
+    git(repo, 'tag', 'release/0.3.5', base);
+    put(repo, 'packages/codec/src/index.ts', 'export const normalize = (value: string) => value.toLowerCase().trim();\n');
+    commit(repo, 'fix: workspace source regression (#12402)');
+    const cut = git(repo, 'rev-parse', 'HEAD');
+
+    expect(attributeReleaseFailures({ repo, previousTag: 'release/0.3.5', cutCommit: cut,
+      failureIds: ['test/workspace.test.ts > workspace regression'] })).toMatchObject([
+      { testFile: 'test/workspace.test.ts', sourceFiles: ['packages/codec/src/index.ts'], causePrs: [12402],
+        unresolvedImports: [], confidence: 'high', method: 'first-parent-source-overlap' },
+    ]);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('honors a matching TypeScript path alias before a same-named workspace package', () => {
+  const repo = repository();
+  try {
+    put(repo, 'package.json', JSON.stringify({ workspaces: ['packages/*'] }));
+    put(repo, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: {
+      '@fixture/codec': ['src/alias-codec.ts'] } } }));
+    put(repo, 'test/alias-precedence.test.ts', "import { codec } from '@fixture/codec';\n");
+    put(repo, 'src/alias-codec.ts', 'export const codec = "alias";\n');
+    put(repo, 'packages/codec/package.json', JSON.stringify({ name: '@fixture/codec', source: './src/index.ts' }));
+    put(repo, 'packages/codec/src/index.ts', 'export const codec = "workspace";\n');
+    const base = commit(repo, 'fixture baseline');
+    git(repo, 'tag', 'release/0.3.5', base);
+    put(repo, 'src/alias-codec.ts', 'export const codec = "changed alias";\n');
+    commit(repo, 'fix: aliased implementation regression (#12403)');
+    put(repo, 'packages/codec/src/index.ts', 'export const codec = "changed workspace";\n');
+    commit(repo, 'fix: unrelated workspace implementation (#12404)');
+    const cut = git(repo, 'rev-parse', 'HEAD');
+
+    expect(attributeReleaseFailures({ repo, previousTag: 'release/0.3.5', cutCommit: cut,
+      failureIds: ['test/alias-precedence.test.ts > alias wins'] })).toMatchObject([
+      { sourceFiles: ['src/alias-codec.ts'], causePrs: [12403], unresolvedImports: [], confidence: 'high' },
+    ]);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('uses the most specific TypeScript path pattern when its target is missing', () => {
+  const repo = repository();
+  try {
+    put(repo, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: {
+      '*': ['src/fallback/*'], '@fixture/*': ['src/specific/*'] } } }));
+    put(repo, 'test/path-pattern.test.ts', "import { codec } from '@fixture/codec';\n");
+    put(repo, 'src/fallback/codec.ts', 'export const codec = "fallback";\n');
+    const base = commit(repo, 'fixture baseline');
+    git(repo, 'tag', 'release/0.3.5', base);
+    put(repo, 'src/fallback/codec.ts', 'export const codec = "changed fallback";\n');
+    commit(repo, 'fix: broad fallback regression (#12406)');
+    put(repo, 'packages/codec/src/index.ts', 'export const codec = "changed workspace";\n');
+    commit(repo, 'fix: workspace regression (#12407)');
+    const cut = git(repo, 'rev-parse', 'HEAD');
+
+    expect(attributeReleaseFailures({ repo, previousTag: 'release/0.3.5', cutCommit: cut,
+      failureIds: ['test/path-pattern.test.ts > specific alias is unresolved'] })).toMatchObject([
+      { sourceFiles: [], causePrs: [], unresolvedImports: ['test/path-pattern.test.ts -> @fixture/codec'],
+        confidence: 'unmeasured', method: 'unmeasured' },
+    ]);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('falls back to a workspace package when the configured alias target is missing', () => {
+  const repo = repository();
+  try {
+    put(repo, 'package.json', JSON.stringify({ workspaces: ['packages/*'] }));
+    put(repo, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: {
+      '@fixture/*': ['src/missing/*'] } } }));
+    put(repo, 'test/alias-workspace-fallback.test.ts', "import { codec } from '@fixture/codec';\n");
+    put(repo, 'packages/codec/package.json', JSON.stringify({ name: '@fixture/codec', source: './src/index.ts' }));
+    put(repo, 'packages/codec/src/index.ts', 'export const codec = "old";\n');
+    const base = commit(repo, 'fixture baseline');
+    git(repo, 'tag', 'release/0.3.5', base);
+    put(repo, 'packages/codec/src/index.ts', 'export const codec = "new";\n');
+    commit(repo, 'fix: workspace reached after missing alias target (#12409)');
+    const cut = git(repo, 'rev-parse', 'HEAD');
+
+    expect(attributeReleaseFailures({ repo, previousTag: 'release/0.3.5', cutCommit: cut,
+      failureIds: ['test/alias-workspace-fallback.test.ts > alias target absent but workspace exists'] })).toMatchObject([
+      { sourceFiles: ['packages/codec/src/index.ts'], causePrs: [12409], unresolvedImports: [],
+        confidence: 'high', method: 'first-parent-source-overlap' },
+    ]);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('keeps declaration order when matching TypeScript path patterns have equal prefixes', () => {
+  const repo = repository();
+  try {
+    put(repo, 'tsconfig.json', JSON.stringify({ compilerOptions: { baseUrl: '.', paths: {
+      '@fixture/*': ['src/missing/*'], '@fixture/*.js': ['src/second/*'] } } }));
+    put(repo, 'test/path-tie.test.ts', "import { codec } from '@fixture/codec.js';\n");
+    put(repo, 'src/second/codec.js', 'export const codec = "old";\n');
+    const base = commit(repo, 'fixture baseline');
+    git(repo, 'tag', 'release/0.3.5', base);
+    put(repo, 'src/second/codec.js', 'export const codec = "changed";\n');
+    commit(repo, 'fix: less-specific tied alias target (#12408)');
+    const cut = git(repo, 'rev-parse', 'HEAD');
+
+    expect(attributeReleaseFailures({ repo, previousTag: 'release/0.3.5', cutCommit: cut,
+      failureIds: ['test/path-tie.test.ts > first matching alias target is missing'] })).toMatchObject([
+      { sourceFiles: [], causePrs: [], unresolvedImports: ['test/path-tie.test.ts -> @fixture/codec.js'],
+        confidence: 'unmeasured', method: 'unmeasured' },
+    ]);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('resolves wildcard workspace exports and preserves missing or duplicate package entries as unmeasured', () => {
+  const repo = repository();
+  try {
+    put(repo, 'package.json', JSON.stringify({ dependencies: { '@fixture/duplicate': '^1.0.0', '@fixture/missing': '^1.0.0' },
+      workspaces: ['packages/*'] }));
+    put(repo, 'test/workspace-edges.test.ts', "import { feature } from '@fixture/codec/features/format';\nimport { duplicate } from '@fixture/duplicate';\nimport { missing } from '@fixture/missing';\n");
+    put(repo, 'packages/codec/package.json', JSON.stringify({ name: '@fixture/codec', exports: {
+      './features/*': { import: './src/features/*.ts', default: './src/features/*.ts' } } }));
+    put(repo, 'packages/codec/src/features/format.ts', 'export const feature = "old";\n');
+    put(repo, 'packages/duplicate-a/package.json', JSON.stringify({ name: '@fixture/duplicate', source: './src/index.ts' }));
+    put(repo, 'packages/duplicate-b/package.json', JSON.stringify({ name: '@fixture/duplicate', source: './src/index.ts' }));
+    put(repo, 'packages/duplicate-a/src/index.ts', 'export const duplicate = "a";\n');
+    put(repo, 'packages/duplicate-b/src/index.ts', 'export const duplicate = "b";\n');
+    put(repo, 'packages/missing/package.json', JSON.stringify({ name: '@fixture/missing' }));
+    const base = commit(repo, 'fixture baseline');
+    git(repo, 'tag', 'release/0.3.5', base);
+    put(repo, 'packages/codec/src/features/format.ts', 'export const feature = "new";\n');
+    commit(repo, 'fix: wildcard workspace source regression (#12405)');
+    const cut = git(repo, 'rev-parse', 'HEAD');
+
+    expect(attributeReleaseFailures({ repo, previousTag: 'release/0.3.5', cutCommit: cut,
+      failureIds: ['test/workspace-edges.test.ts > ambiguous and missing workspace entries'] })).toMatchObject([
+      { sourceFiles: ['packages/codec/src/features/format.ts'], causePrs: [12405],
+        unresolvedImports: ['test/workspace-edges.test.ts -> @fixture/duplicate', 'test/workspace-edges.test.ts -> @fixture/missing'],
+        confidence: 'unmeasured', method: 'unmeasured' },
+    ]);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test('selects the most specific nested workspace export pattern', () => {
+  const repo = repository();
+  try {
+    put(repo, 'package.json', JSON.stringify({ workspaces: ['packages/*'] }));
+    put(repo, 'test/nested-export.test.ts', "import { feature } from '@fixture/codec/features/internal/format';\n");
+    put(repo, 'packages/codec/package.json', JSON.stringify({ name: '@fixture/codec', exports: {
+      './features/*': './src/features/*.ts',
+      './features/internal/*': './src/internal-features/*.ts',
+    } }));
+    put(repo, 'packages/codec/src/features/internal/format.ts', 'export const feature = "broad old";\n');
+    put(repo, 'packages/codec/src/internal-features/format.ts', 'export const feature = "specific old";\n');
+    const base = commit(repo, 'fixture baseline');
+    git(repo, 'tag', 'release/0.3.5', base);
+    put(repo, 'packages/codec/src/features/internal/format.ts', 'export const feature = "broad changed";\n');
+    commit(repo, 'fix: broad workspace export source (#12412)');
+    put(repo, 'packages/codec/src/internal-features/format.ts', 'export const feature = "specific changed";\n');
+    commit(repo, 'fix: nested workspace export source (#12413)');
+    const cut = git(repo, 'rev-parse', 'HEAD');
+
+    expect(attributeReleaseFailures({ repo, previousTag: 'release/0.3.5', cutCommit: cut,
+      failureIds: ['test/nested-export.test.ts > nested workspace export regression'] })).toMatchObject([
+      { sourceFiles: ['packages/codec/src/internal-features/format.ts'], causePrs: [12413],
+        unresolvedImports: [], confidence: 'high' },
+    ]);
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
 test('gate repair consumes source-to-PR attribution and writes the source file and owner into its simulated child request', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-gate-attribution-consumer-'));
   const repo = join(root, 'repo');

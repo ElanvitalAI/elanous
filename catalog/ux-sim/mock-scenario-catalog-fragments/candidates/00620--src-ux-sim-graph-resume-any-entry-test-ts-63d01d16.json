@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/graph-resume-any-entry.test.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/graph-resume-any-entry.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Assertions inspect production graph runner outputs for five isolated resume scenarios.",
+  "deviceId": "release-graph-rig",
+  "scenarioIds": [
+    "GRAPH-RESUME-ANY-ENTRY-SIM"
+  ]
+}

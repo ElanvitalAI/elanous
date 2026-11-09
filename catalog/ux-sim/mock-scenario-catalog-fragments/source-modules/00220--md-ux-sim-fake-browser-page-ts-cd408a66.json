@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-BROWSER-PAGE-TS",
+  "path": "src/ux-sim/fake-browser-page.ts",
+  "boundary": "CDP page navigation: inject fake page lifecycle, evaluate, click, and screenshot at BrowserActionDeps while production browser actions run.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

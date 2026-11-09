@@ -20,6 +20,7 @@ export type HitlChannelName = 'telegram' | 'discord' | 'pushcut' | 'terminal' | 
 
 export interface ConfirmRequest {
   prompt: string;
+  header?: string;
   detail?: string;
   yesLabel?: string;     // default 'Yes'
   noLabel?: string;      // default 'No'
@@ -57,6 +58,7 @@ export interface ConfirmChannel {
 
 export interface ConfirmOpts {
   prompt: string;
+  header?: string;
   detail?: string;
   yesLabel?: string;
   noLabel?: string;
@@ -156,6 +158,7 @@ export async function requestConfirmation(opts: ConfirmOpts): Promise<ConfirmRes
     : allChannels;
   const req: ConfirmRequest = {
     prompt: opts.prompt,
+    header: opts.header,
     detail: opts.detail,
     yesLabel: opts.yesLabel ?? 'Yes',
     noLabel: opts.noLabel ?? 'No',

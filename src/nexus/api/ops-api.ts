@@ -1,12 +1,14 @@
 import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { parse as parseYaml } from 'yaml';
 import { debug, redactSecretText } from '../../debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../instance/resolve.js';
 import { gateShardsPath, readGateShards, summarizeShards, type GateShardsFile, type GateShardsSummary } from '../../release-loop/gate-shards.js';
 import { listChecklist } from '../../release-loop/checklist.js';
 import { getSchedule } from '../../release-loop/release-schedule.js';
 import { jsonResponse } from './json-response.js';
+import { subscribeInsideEvent } from './inside-events.js';
 import { operatorSignal } from './operator.js';
 import { createSeatsCache, todayKst } from './ops-seats.js';
 import { liveSeatsSources } from './ops-seats-sources.js';
@@ -40,6 +42,7 @@ export function setOverviewCacheForTest(cache: ReturnType<typeof createOverviewC
   overviewCache = cache;
 }
 const LOG_PATH = /^\/v1\/ops\/release\/runs\/([^/]+)\/nodes\/([^/]+)\/log$/;
+const RELEASE_EVENTS_PATH = /^\/v1\/ops\/release\/runs\/([A-Za-z0-9-]+)\/events$/;
 
 interface RunNode { nodeId: string; ok?: unknown; output?: unknown; startedAt?: unknown; endedAt?: unknown }
 interface RunRecord {
@@ -146,20 +149,157 @@ export function releaseNodeFacts(output: unknown): ReleaseNodeFacts {
 }
 export interface ReleaseRunView {
   runId: string; status: string; startedAt: string; version: string | null; path: string[]; nodes: ReleaseRunNodeView[];
+  graph?: ReleaseRunGraph;
+  gateProgress?: Array<{ kind: 'release.gate.progress'; graphId: 'release-loop'; runId: string; at?: string;
+    data: Record<string, unknown> }>;
   /** Explicit project ownership. The release ledger does not currently populate this field. */
   projectId?: string;
-  /** GATE-LIVE-OBS — 지금 gate 노드에 있는 런에만 싣는다(발행 원장 `gate-logs/cut/shards.json`). 파일이 없으면 생략. */
+  /** GATE-LIVE-OBS — 해당 런의 시간대에 기록된 발행 원장 shard board. 파일이 없거나 다른 런이면 생략. */
   gateShards?: GateShardsFile & { summary: GateShardsSummary };
 }
 
+export interface ReleaseRunGraph {
+  nodes: Array<{ nodeId: string; kind: string; needs: string[] }>;
+}
+
+let cachedReleaseRunGraph: ReleaseRunGraph | null | undefined;
+function releaseRunGraph(): ReleaseRunGraph | undefined {
+  if (cachedReleaseRunGraph !== undefined) return cachedReleaseRunGraph ?? undefined;
+  try {
+    const raw = parseYaml(readFileSync(join(import.meta.dir, '../../../graphs/release/release-loop.yaml'), 'utf8')) as unknown;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { cachedReleaseRunGraph = null; return undefined; }
+    const nodes = (raw as Record<string, unknown>).nodes;
+    if (!Array.isArray(nodes)) { cachedReleaseRunGraph = null; return undefined; }
+    const viewNodes = nodes.flatMap((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+      const node = entry as Record<string, unknown>;
+      if (typeof node.node_id !== 'string' || typeof node.kind !== 'string') return [];
+      const needs = Array.isArray(node.needs) ? node.needs.filter((value): value is string => typeof value === 'string') : [];
+      return [{ nodeId: redactSecretText(node.node_id), kind: redactSecretText(node.kind), needs }];
+    });
+    cachedReleaseRunGraph = viewNodes.length ? { nodes: viewNodes } : null;
+    return cachedReleaseRunGraph ?? undefined;
+  } catch {
+    cachedReleaseRunGraph = null;
+    return undefined;
+  }
+}
+
+function releaseRunEvents(req: Request, runId: string): Response {
+  const encoder = new TextEncoder();
+  let unsubscribe = () => {};
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let closed = false;
+  let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true;
+    if (heartbeat !== undefined) clearInterval(heartbeat);
+    unsubscribe();
+    req.signal.removeEventListener('abort', close);
+  };
+  const close = () => {
+    cleanup();
+    try { controllerRef?.close(); } catch { /* already cancelled */ }
+  };
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controllerRef = controller;
+      if (req.signal.aborted) { close(); return; }
+      unsubscribe = subscribeInsideEvent((event) => {
+        if (event.kind !== 'release.gate.progress' || event.graphId !== 'release-loop' || event.runId !== runId) return;
+        const frame = `event: release.gate.progress\ndata: ${JSON.stringify(event)}\n\n`;
+        const bytes = encoder.encode(frame);
+        if ((controller.desiredSize ?? 0) <= 0) { close(); return; }
+        try { controller.enqueue(bytes); } catch { close(); }
+      });
+      heartbeat = setInterval(() => {
+        if ((controller.desiredSize ?? 0) <= 0) { close(); return; }
+        try { controller.enqueue(encoder.encode(': ping\n\n')); } catch { close(); }
+      }, 15_000);
+      req.signal.addEventListener('abort', close, { once: true });
+      if (!closed) controller.enqueue(encoder.encode(': connected\n\n'));
+    },
+    cancel() { cleanup(); },
+  }, { highWaterMark: 8, size: () => 1 });
+  return new Response(stream, { headers: { 'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform', 'x-accel-buffering': 'no', connection: 'keep-alive' } });
+}
+
 /** 도는 gate 노드의 조각 표 — 다른 판의 파일을 붙이지 않게 version 이 같을 때만. */
-function gateShardsFor(version: string | null, status: string, nodes: ReleaseRunNodeView[], ledgerRoot: string, now: number):
+function gateShardsFor(version: string | null, runId: string, status: string, nodes: ReleaseRunNodeView[], ledgerRoot: string, now: number):
   ReleaseRunView['gateShards'] | undefined {
-  if (!version || status !== 'running' || !nodes.some((node) => node.nodeId === 'gate' && node.ok === null)) return undefined;
+  if (!version) return undefined;
+  const gateNode = nodes.find((node) => node.nodeId === 'gate');
+  if (!gateNode) return undefined;
+  const gateStartedAt = Date.parse(gateNode.startedAt ?? '');
+  const gateEndedAt = Date.parse(gateNode.endedAt ?? '');
+  const activeGate = status === 'running' && gateNode.ok === null;
+  // A completed gate may still be shown only when its own time window is recorded. Without an
+  // end time, a later run's shard board could be attached to a run that has already moved on.
+  const completedGate = gateNode.ok !== null && Number.isFinite(gateEndedAt);
+  if (!activeGate && !completedGate) return undefined;
   const file = readGateShards(gateShardsPath(version, ledgerRoot));
-  if (!file || file.version !== version) return undefined;
-  return { ...file, shards: file.shards.map((shard) => shard.waitReason ? { ...shard, waitReason: redactSecretText(shard.waitReason) } : shard),
-    summary: summarizeShards(file, now) };
+  if (!file || file.version !== version || file.runId !== runId) return undefined;
+  const updatedAt = Date.parse(file.updatedAt);
+  if (!Number.isFinite(updatedAt) || !Number.isFinite(gateStartedAt) || updatedAt < gateStartedAt) return undefined;
+  if (Number.isFinite(gateEndedAt) && updatedAt > gateEndedAt) return undefined;
+  const shards = file.shards.map((shard) => Object.fromEntries(Object.entries(shard).map(([key, value]) =>
+    [key, typeof value === 'string' ? redactSecretText(value).slice(0, 240) : value])) as typeof shard);
+  const safeFile = { ...file, runId: redactSecretText(file.runId), shards };
+  return { ...safeFile, summary: summarizeShards(safeFile, now) };
+}
+
+/** Persisted gate phase events live beside the run context. Keep only the operator graph contract. */
+function gateProgressFor(runId: string, runDirectory: string): ReleaseRunView['gateProgress'] {
+  const contexts = join(runDirectory, `${runId}.json.contexts`);
+  let names: string[];
+  try {
+    names = readdirSync(contexts).filter((name) => /^\d+\.json\.gate-progress\.jsonl$/.test(name))
+      .sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10)).slice(-32);
+  }
+  catch { return undefined; }
+  const events: NonNullable<ReleaseRunView['gateProgress']> = [];
+  let bytesRead = 0;
+  const maxBytes = 1_048_576;
+  const maxFileBytes = 262_144;
+  for (const name of names) {
+    if (events.length >= 512) break;
+    const path = join(contexts, name);
+    try {
+      const size = statSync(path).size;
+      if (size > maxFileBytes || bytesRead + size > maxBytes) break;
+      bytesRead += size;
+      for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
+        if (events.length >= 512) break;
+        if (!line.trim()) continue;
+        let raw: unknown;
+        try { raw = JSON.parse(line) as unknown; } catch { continue; }
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+        const row = raw as Record<string, unknown>;
+        if (row.phase !== 'shard-plan' && row.phase !== 'shard-decision') continue;
+        const data: Record<string, unknown> = { phase: row.phase };
+        for (const key of ['shard', 'decision', 'reason'] as const) {
+          const value = row[key];
+          if (typeof value === 'string' && value.length <= 240) data[key] = redactSecretText(value);
+        }
+        for (const key of ['shardIndex', 'shardTotal', 'reuseCount', 'rerunCount', 'radiusInvalidatedCount'] as const) {
+          const value = row[key];
+          if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) data[key] = value;
+        }
+        if (row.rerunReasons && typeof row.rerunReasons === 'object' && !Array.isArray(row.rerunReasons)) {
+          const reasons = Object.fromEntries(Object.entries(row.rerunReasons as Record<string, unknown>)
+            .filter(([reason, count]) => reason.length <= 160 && typeof count === 'number' && Number.isSafeInteger(count) && count >= 0)
+            .map(([reason, count]) => [redactSecretText(reason), count]));
+          if (Object.keys(reasons).length) data.rerunReasons = reasons;
+        }
+        events.push({ kind: 'release.gate.progress', graphId: 'release-loop', runId: redactSecretText(runId),
+          ...(typeof row.eventId === 'string' ? { eventId: row.eventId } : {}),
+          ...(typeof row.at === 'string' && Number.isFinite(Date.parse(row.at)) ? { at: row.at } : {}), data });
+      }
+    } catch { /* partial or retired context files do not erase the run or its other events */ }
+  }
+  return events.length ? events : undefined;
 }
 
 /** The release run ledger as `/v1/ops/release/runs` serves it (newest 20) — shared with Telegram /release and away mode
@@ -168,6 +308,7 @@ export function readReleaseRuns(version: string | null = null,
   dir: string = join(effectiveInstanceRoot(), 'graph-runs', 'release-loop'),
   opts: { facts?: boolean; ledgerRoot?: string; now?: number } = {}): ReleaseRunView[] | 'unavailable' {
   let filenames: string[];
+  const graph = releaseRunGraph();
   try {
     filenames = readdirSync(dir, { withFileTypes: true })
       .filter((entry) => entry.isFile() && entry.name.endsWith('.json')
@@ -188,12 +329,14 @@ export function readReleaseRuns(version: string | null = null,
       summary: nodeSummary(node.output), ...nodeTimes(node),
       ...(opts.facts ? { facts: releaseNodeFacts(node.output) } : {}),
     })), ...runningNode(run, run.nodes.length)];
-    const gateShards = gateShardsFor(v, run.status, nodes, opts.ledgerRoot ?? releaseLedgerRoot(), opts.now ?? Date.now());
+    const runId = filename.slice(0, -5);
+    const gateShards = gateShardsFor(v, runId, run.status, nodes, opts.ledgerRoot ?? releaseLedgerRoot(), opts.now ?? Date.now());
+    const gateProgress = gateProgressFor(runId, dir);
     return [{
-      runId: redactSecretText(filename.slice(0, -5)), status: redactSecretText(run.status),
+      runId: redactSecretText(runId), status: redactSecretText(run.status),
       startedAt: redactSecretText(run.startedAt), version: v,
       path: run.path.filter((step): step is string => typeof step === 'string').map(redactSecretText),
-      nodes, ...(gateShards ? { gateShards } : {}),
+      nodes, ...(graph ? { graph } : {}), ...(gateShards ? { gateShards } : {}), ...(gateProgress ? { gateProgress } : {}),
     }];
   }).sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 20);
 }
@@ -334,6 +477,8 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
     if (runs === 'unavailable') return jsonResponse({ error: 'runs-unavailable' }, 500);
     return served(jsonResponse(runs));
   }
+  const eventsMatch = RELEASE_EVENTS_PATH.exec(pathname);
+  if (eventsMatch) return served(releaseRunEvents(req, eventsMatch[1]!));
   // WHATWG URL normalizes a literal runs/../nodes/... before routing.
   if (pathname.startsWith('/v1/ops/release/nodes/')) return jsonResponse({ error: 'invalid-id' }, 400);
   if (pathname.startsWith('/v1/ops/release/runs/')) {

@@ -1,3 +1,4 @@
+import { isNonEmptyString } from '../primitives/guards.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, normalize } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -419,10 +420,6 @@ function isTerminationRule(value: unknown): value is TerminationRule {
     case 'custom': return isNonEmptyString(rule.command) && (rule.timeoutMs === undefined || isPositiveInteger(rule.timeoutMs));
     default: return false;
   }
-}
-
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function isPositiveInteger(value: unknown): value is number {

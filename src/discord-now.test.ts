@@ -4,7 +4,7 @@ import { buildDiscordSlashWire, ELANOUS_SLASH_COMMANDS, synthesizeCommandText } 
 import { contextNow, type ContextNowDeps } from './context-bus/context-now.js';
 import { renderTelegramNow } from './context-bus/context-now-surfaces.js';
 import type { DcIncoming, DiscordBot } from './discord.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import type { runTurn } from './session/chat.js';
 
 const at = '2026-10-03T04:00:00.000Z';

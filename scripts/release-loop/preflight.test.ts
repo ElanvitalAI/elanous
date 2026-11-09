@@ -2,16 +2,17 @@ import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { simCli } from '../../src/ux-sim/in-process-cli.js';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { addItem, listChecklist, setItem } from '../../src/release-loop/checklist.js';
 import { enableLandingFreeze } from '../../src/release-loop/landing-freeze.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { setSchedule } from '../../src/release-loop/release-schedule.js';
 import { releaseReadiness } from './release-readiness.js';
 import { cutChecklistGate } from '../../src/release-loop/checklist.js';
-import { assertReleaseCliFresh, cadencePublishAt, formatCountdown, formatPreflight, formatReleaseCountdown, isPostPublishCell, releaseCountdown as scheduleReleaseCountdown, releaseGateMeasure, releasePreflight, runReleaseCountdown, scanGateImageRuntimeIdentity, type PreflightDeps } from './preflight.js';
+import { assertReleaseCliFresh, cadencePublishAt, formatCountdown, formatPreflight, formatReleaseCountdown, isPostPublishCell, releaseCountdown as scheduleReleaseCountdown, releaseGateMeasure, releasePreflight, releaseRunLaunchRefusal, runReleaseCountdown, scanGateImageRuntimeIdentity, type PreflightDeps } from './preflight.js';
 
 async function isolated(fn: (root: string) => Promise<void>): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-'));
@@ -72,6 +73,131 @@ function fakeRun(runs: string, runId: string, version: string, startedAt: string
 }
 
 const NOW = new Date('2026-10-06T20:30:00.000Z');
+
+test('RELEASE-RUN-LAUNCH-SEAT-GUARD refuses non-owner production launches and /tmp source trees', () => {
+  const productionRoot = '/sim/home/.elanous';
+  expect(releaseRunLaunchRefusal({ seat: 'POD-REUSE-2', instanceRoot: productionRoot, productionRoot,
+    sourcePath: '/Users/user/worktrees/release' })).toContain('--test');
+  expect(releaseRunLaunchRefusal({ seat: '', instanceRoot: productionRoot, productionRoot,
+    sourcePath: '/Users/user/worktrees/release' })).toContain('미설정');
+  expect(releaseRunLaunchRefusal({ seat: '  ', instanceRoot: productionRoot, productionRoot,
+    sourcePath: '/Users/user/worktrees/release' })).toContain('미설정');
+  expect(releaseRunLaunchRefusal({ instanceRoot: productionRoot, productionRoot,
+    sourcePath: '/Users/user/worktrees/release' })).toContain('미설정');
+  expect(releaseRunLaunchRefusal({ seat: 'OP', instanceRoot: productionRoot, productionRoot,
+    sourcePath: '/private/tmp/pod-reuse-2-main.K2pGJE' })).toContain('/tmp 소스 경로');
+  expect(releaseRunLaunchRefusal({ seat: 'OP', instanceRoot: '/sim/test/.elanous', productionRoot,
+    sourcePath: '/private/tmp/pod-reuse-2-main.K2pGJE' })).toBeNull();
+  expect(releaseRunLaunchRefusal({ seat: 'OP', instanceRoot: productionRoot, productionRoot,
+    sourcePath: '/Users/user/elanous-hq/repo.git' })).toBeNull();
+});
+
+test('RELEASE-RUN-LAUNCH-SEAT-GUARD keeps read-only preflight diagnostics for non-owner seats', () => isolated(async (root) => {
+  let inputChecked = false;
+  const result = await releasePreflight('0.2.18', deps(root, {
+    launchContext: { seat: 'NT-3', instanceRoot: '/sim/prod/.elanous', productionRoot: '/sim/prod/.elanous' },
+    sourcePath: '/Users/user/elanous-hq/src/cli/release-cli.ts',
+    runInput: async () => { inputChecked = true; return { input: { previousVersion: '0.2.17', gatePodPool: 'pool-test' } }; },
+  }));
+  expect(result.findings.find((finding) => finding.check === 'run-input')).toMatchObject({ level: 'block', message: expect.stringContaining('OP 자리만') });
+  expect(result.findings.find((finding) => finding.check === 'export')).toMatchObject({ level: 'ok' });
+  expect(inputChecked).toBe(false);
+}));
+
+test('RELEASE-RUN-LAUNCH-SEAT-GUARD lets countdown report diagnostics and blocks only run-input for non-owner seats', () => isolated(async (root) => {
+  addItem('0.2.18', { id: 'A1', title: 'cell A1', owner: 'TC' });
+  setItem('0.2.18', 'A1', { status: 'green' }, 'TC');
+  fakeRun(join(root, 'graph-runs', 'release-loop'), 'r1', '0.2.17', '2026-10-06T09:00:00.000Z', 600);
+  let inputChecked = false;
+  const result = await runReleaseCountdown('0.2.18', deps(root, {
+    countdown: true,
+    launchContext: { seat: 'NT-3', instanceRoot: '/sim/prod/.elanous', productionRoot: '/sim/prod/.elanous' },
+    sourcePath: '/Users/user/elanous-hq/src/cli/release-cli.ts',
+    runInput: async () => { inputChecked = true; return { input: { previousVersion: '0.2.17', gatePodPool: 'pool-test' } }; },
+    manifest: () => ({ cutoff: { sha: 'b'.repeat(40) }, fragments: { byPr: 1, byNextMd: 1, unlinked: 0, unknown: 0 }, escalate: [] }),
+    gateSlot: () => ({ dispatcherPaused: true, podTargetFrom: 6, podTargetTo: 2 }),
+  }));
+  const t60 = result.steps.find((step) => step.stage === 'T-60')!;
+  expect(result.steps[0]?.level).not.toBe('block');
+  expect(t60.findings.find((finding) => finding.check === 'run-input')).toMatchObject({ level: 'block', message: expect.stringContaining('OP 자리만') });
+  expect(result.steps.find((step) => step.stage === 'T-30')?.skipped).toBe(true);
+  expect(inputChecked).toBe(false);
+}));
+
+test('RELEASE-RUN-LAUNCH-SEAT-GUARD checks the executing module when argv points outside its checkout', () => {
+  const previousArgv = process.argv[1];
+  process.argv[1] = '/Users/user/elanous-hq/bin/wrapper.mjs';
+  try {
+    const modulePath = fileURLToPath(import.meta.url);
+    const temporaryModule = ['/tmp/', '/private/tmp/'].some((prefix) => modulePath.startsWith(prefix));
+    const refusal = releaseRunLaunchRefusal({ seat: 'OP', instanceRoot: '/sim/home/.elanous', productionRoot: '/sim/home/.elanous' });
+    if (temporaryModule) expect(refusal).toContain('/tmp 소스 경로');
+    else expect(refusal).toBeNull();
+  } finally {
+    if (previousArgv === undefined) delete process.argv[1]; else process.argv[1] = previousArgv;
+  }
+});
+
+test('RELEASE-RUN-LAUNCH-SEAT-GUARD refuses a /tmp CLI imported by an outside wrapper when preflight is linked outside /tmp', () => {
+  const repositoryRoot = process.cwd();
+  const sourceRoot = mkdtempSync(join('/tmp', 'release-guard-source-'));
+  const wrapperRoot = mkdtempSync(join(homedir(), '.release-guard-wrapper-'));
+  try {
+    expect(['/tmp/', '/private/tmp/'].some((prefix) => sourceRoot.startsWith(prefix))).toBe(true);
+    expect(['/tmp/', '/private/tmp/'].some((prefix) => wrapperRoot.startsWith(prefix))).toBe(false);
+
+    const mirrorWithLinks = (source: string, target: string, excluded: Set<string>) => {
+      mkdirSync(target, { recursive: true });
+      for (const entry of readdirSync(source, { withFileTypes: true })) {
+        if (excluded.has(entry.name)) continue;
+        symlinkSync(join(source, entry.name), join(target, entry.name), entry.isDirectory() ? 'dir' : 'file');
+      }
+    };
+    copyFileSync(join(repositoryRoot, 'package.json'), join(sourceRoot, 'package.json'));
+    symlinkSync(join(repositoryRoot, 'node_modules'), join(sourceRoot, 'node_modules'), 'dir');
+    mkdirSync(join(sourceRoot, 'src'));
+    mirrorWithLinks(join(repositoryRoot, 'src'), join(sourceRoot, 'src'), new Set(['cli']));
+    mirrorWithLinks(join(repositoryRoot, 'src/cli'), join(sourceRoot, 'src/cli'), new Set(['release-cli.ts']));
+    copyFileSync(join(repositoryRoot, 'src/cli/release-cli.ts'), join(sourceRoot, 'src/cli/release-cli.ts'));
+    mkdirSync(join(sourceRoot, 'scripts'));
+    mirrorWithLinks(join(repositoryRoot, 'scripts'), join(sourceRoot, 'scripts'), new Set(['release-loop']));
+    mirrorWithLinks(join(repositoryRoot, 'scripts/release-loop'), join(sourceRoot, 'scripts/release-loop'), new Set(['preflight.ts']));
+    symlinkSync(join(repositoryRoot, 'scripts/release-loop/preflight.ts'), join(sourceRoot, 'scripts/release-loop/preflight.ts'), 'file');
+
+    const wrapper = join(wrapperRoot, 'launch.mjs');
+    const script = [
+      "import { createRequire } from 'node:module';",
+      `const { Command } = createRequire(${JSON.stringify(join(sourceRoot, 'package.json'))})('commander');`,
+      "import { registerReleaseCommands } from '../release-guard-source/src/cli/release-cli.ts';",
+      "import { prodInstanceRoot } from '../release-guard-source/src/instance/resolve.js';",
+      "import { setElanousConfigDir } from '../release-guard-source/src/elanous-config-dir.js';",
+      'setElanousConfigDir(prodInstanceRoot());',
+      "process.env.ELANOUS_TRACK = 'OP';",
+      'let graphStarts = 0;',
+      'const cli = new Command();',
+      "registerReleaseCommands(cli, { ledgerRoot: prodInstanceRoot(), freezeRoot: prodInstanceRoot(), graph: async () => { graphStarts++; throw new Error('graph must stay closed'); } });",
+      "const command = process.argv[2] === 'preflight' ? ['release', 'preflight', '--version', '0.3.7', '--json'] : ['release', 'run', '--version', '0.3.7', '--json'];",
+      "await cli.parseAsync(command, { from: 'user' });",
+      "process.stdout.write(`GRAPH_STARTS=${graphStarts}\\n`);",
+    ].join('\n');
+    const outsideWrapperSource = script.replaceAll('../release-guard-source', sourceRoot);
+    writeFileSync(wrapper, outsideWrapperSource);
+    for (const command of ['run', 'preflight']) {
+      // 출처: R-TST36 (.rules/30-harness/testing-gates.md); mirrors scripts/release-loop/gate-flow-sim.test.ts:394.
+      const result = spawnSync('bun', [wrapper, command], { cwd: wrapperRoot, encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, ELANOUS_TRACK: 'OP', ELANOUS_STATE_DIR: '', NODE_ENV: 'production' } });
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(result.status).toBe(1);
+      expect(output).toContain('/tmp 소스 경로');
+      if (command === 'run') expect(output).toContain('seat-launch-refused');
+      else expect(output).toContain('"check":"run-input"');
+      expect(output).toContain('GRAPH_STARTS=0');
+    }
+  } finally {
+    rmSync(sourceRoot, { recursive: true, force: true });
+    rmSync(wrapperRoot, { recursive: true, force: true });
+  }
+});
 
 function gitAt(root: string, ...args: string[]): string {
   const result = spawnSync('git', args, { cwd: root, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 'test@example.invalid', GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 'test@example.invalid' } });
@@ -414,7 +540,7 @@ test('post-publish detection reads the id or a title that starts with the marker
 
 test('real CLI: without release.loop.gatePodPool, preflight surfaces the actual release run --dry-run error and exits 1', async () => {
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-cli-'));
-  const root = join(home, '.elanous');
+  const root = join(home, '.elanous-test');
   mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
   writeFileSync(join(root, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: '2026-10-06T11:47:18.214Z' }));
   writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: {} } }));
@@ -462,7 +588,7 @@ test('a scheduled-start checklist that refuses more than the cut judgement is st
 
 test('real CLI: a valid release.loop config passes the run-input check end to end', async () => {
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-cli-ok-'));
-  const root = join(home, '.elanous');
+  const root = join(home, '.elanous-test');
   mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
   writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: { gatePodPool: 'pool-cli-test' } } }));
   writeFileSync(join(root, 'release', '0.2.17', 'release.json'), JSON.stringify({ version: '0.2.17', publishedAt: '2026-10-06T11:47:18.214Z' }));
@@ -479,7 +605,7 @@ test('real CLI: a valid release.loop config passes the run-input check end to en
 
 test('a live run.lock (already-running) refuses the scheduled start → ⛔ and the CLI exits 1', async () => {
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-running-'));
-  const root = join(home, '.elanous');
+  const root = join(home, '.elanous-test');
   mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
   mkdirSync(join(root, 'release', '0.2.18'), { recursive: true });
   writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: { gatePodPool: 'pool-cli-test' } } }));
@@ -515,7 +641,7 @@ test('real preflight CLI scans the pinned origin/main tree and blocks its export
   const privateMarker = String.fromCodePoint(0x1f451);
   const home = mkdtempSync(join(tmpdir(), 'release-preflight-main-cli-'));
   const repo = join(home, 'repo');
-  const config = join(home, '.elanous');
+  const config = join(home, '.elanous-test');
   const redactions = join(home, 'redactions.tsv');
   mkdirSync(repo, { recursive: true });
   mkdirSync(config, { recursive: true });
@@ -681,7 +807,7 @@ test('RELEASE-COUNTDOWN-SEQUENCE: T−120 노트 0줄은 ⛔ notes-empty, T−60
 
 test('real CLI: release preflight --countdown 은 생산 진입점에서 T−120→T0 단계와 판정 한 줄을 낸다', async () => {
   const home = mkdtempSync(join(tmpdir(), 'release-countdown-cli-'));
-  const root = join(home, '.elanous');
+  const root = join(home, '.elanous-test');
   mkdirSync(join(root, 'release', '0.2.17'), { recursive: true });
   mkdirSync(join(root, 'release', '0.2.18'), { recursive: true });
   writeFileSync(join(root, 'config.json'), JSON.stringify({ release: { loop: { gatePodPool: 'pool-cli-test' } } }));

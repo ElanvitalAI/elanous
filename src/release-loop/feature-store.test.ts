@@ -554,7 +554,13 @@ test('제목 변경은 상태와 이전 이력을 보존하며 빈 제목 거부
 test('setItem 으로 바꾼 owner·kind 가 features 표에도 반영되어 details 와 체크리스트가 같은 값을 낸다', () => {
   setup(); fixture('0.2.9');
   // ORG2 (#23061): changing an existing owner goes through claim --force; set only adds kind here.
-  claimItem('0.2.9', 'L13e', 'TC', { force: true });
+  const previousTrack = process.env.ELANOUS_TRACK;
+  try {
+    process.env.ELANOUS_TRACK = 'OP';
+    claimItem('0.2.9', 'L13e', 'TC', { force: true, actor: 'OP', reason: 'legacy feature-store test setup' });
+  } finally {
+    if (previousTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previousTrack;
+  }
   setItem('0.2.9', 'L13e', { kind: 'screen' }, 'OP');
   expect(listChecklist('0.2.9').items.find((item) => item.id === 'L13e')).toMatchObject({ owner: 'TC', kind: 'screen' });
   expect(features.details('L13e')).toMatchObject({ owner: 'TC', kind: 'screen' });

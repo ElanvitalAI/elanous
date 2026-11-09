@@ -34,5 +34,33 @@
     ],
     "waiting": [{ "pr": "10005", "reason": "main-merge-conflict" }],
     "skipped": [{ "pr": "10004", "reason": "active" }]
+  },
+  "retryFileMapIncident": {
+    "id": "unattributed-intact-retry-keeps-primary-file-map",
+    "source": "seat-state/OPT/train-batch-live.py",
+    "failure": "UnboundLocalError: retry_pr_files referenced before assignment when the batch retries without excluded PRs",
+    "members": ["35964"],
+    "excludedPrs": [],
+    "primaryPrFiles": { "35964": ["src/ledger/resource-ledger-tailnet-cli.ts"] },
+    "expected": {
+      "retryMembers": ["35964"],
+      "retryPrFiles": { "35964": ["src/ledger/resource-ledger-tailnet-cli.ts"] },
+      "gateRetry": "retry"
+    },
+    "decisionInput": {
+      "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "queue": [{ "pr": "35964", "head": "4c9cda2cf96ff08cee2533306f50570f34906072", "state": "open", "gate": "passed" }],
+      "activePrs": [],
+      "refusals": [],
+      "lastParks": [],
+      "slots": [{ "host": "gcp2", "slot": 1, "expressOnly": false }],
+      "groupLimit": 1
+    },
+    "decisionExpected": {
+      "parked": [],
+      "assignments": [{ "stage": "group", "host": "gcp2", "slot": 1, "prs": ["35964"] }],
+      "waiting": [],
+      "skipped": []
+    }
   }
 }

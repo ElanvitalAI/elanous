@@ -37,7 +37,7 @@ import {
   generateAutoModeSessionId,
 } from '../auto-research/auto-mode/session.js';
 import { INACTIVE_AUTO_MODE_STATE } from '../auto-research/auto-mode/types.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 /** 좀비 골 TTL — active인 채 이 시간을 넘기면 강제 해제(싱글턴 웨지 방지). 리플레이는
  *  저턴이라 dig(2h)보다 짧게. */

@@ -1,7 +1,7 @@
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { resolveLlmTier, type LlmTierSource } from './tier-resolver.js';
 import type { ModelTier } from './types.js';
-import type { ReasoningLevel } from '../user-config.js';
+import type { ReasoningLevel } from '../user-config/types.js';
 
 export type TurnReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 const REASONING_EFFORT: Record<ReasoningLevel, TurnReasoningEffort> = { off: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' };

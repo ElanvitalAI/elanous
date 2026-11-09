@@ -11,7 +11,7 @@ import {
 import { getAutoModeState, setAutoModeState } from '../auto-research/auto-mode/session.js';
 import { INACTIVE_AUTO_MODE_STATE } from '../auto-research/auto-mode/types.js';
 import type { ObsidianVault } from '../auto-research/obsidian-bridge.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 // 최소 cfg — 함수들이 cfg.finance?.replay?.autoGoal 만 읽는다.
 function cfg(over: Record<string, unknown> = {}): UserConfig {

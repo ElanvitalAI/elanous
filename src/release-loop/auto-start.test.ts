@@ -1,8 +1,9 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { debug } from '../debug/log.js';
 import { autoStartScheduledRelease, selectScheduledCut } from './auto-start.js';
 import { listSchedules, setSchedule } from './release-schedule.js';
 
@@ -15,13 +16,15 @@ function setup() {
 }
 afterEach(() => { resetElanousConfigDir(); if (root) rmSync(root, { recursive: true, force: true }); root = ''; });
 
-test('cut window includes the exact cut and its last millisecond; excludes before and after', () => {
+test('look-ahead starts before cut and overdue schedules remain eligible until published', () => {
   setup();
   const schedules = listSchedules(root);
-  expect(selectScheduledCut(schedules, new Date('2026-10-04T03:59:59.999Z'), 15)).toBeNull();
+  expect(selectScheduledCut(schedules, new Date('2026-10-04T03:44:59.999Z'), 15)).toBeNull();
+  expect(selectScheduledCut(schedules, new Date('2026-10-04T03:45:00.000Z'), 15)?.version).toBe('0.2.8');
+  expect(selectScheduledCut(schedules, new Date('2026-10-04T03:59:59.999Z'), 15)?.version).toBe('0.2.8');
   expect(selectScheduledCut(schedules, new Date(cut), 15)?.version).toBe('0.2.8');
   expect(selectScheduledCut(schedules, new Date('2026-10-04T04:15:00.000Z'), 15)?.version).toBe('0.2.8');
-  expect(selectScheduledCut(schedules, new Date('2026-10-04T04:15:00.001Z'), 15)).toBeNull();
+  expect(selectScheduledCut(schedules, new Date('2026-10-05T04:00:00.000Z'), 15)?.version).toBe('0.2.8');
   expect(() => selectScheduledCut(schedules, new Date(cut), 0)).toThrow('windowMinutes');
   expect(() => selectScheduledCut(schedules, new Date(cut), Number.NaN)).toThrow('windowMinutes');
 });
@@ -45,8 +48,41 @@ test('default is read-only; apply launches once and forwards the selected versio
   expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now, apply: true,
     readiness: () => ({ ready: true, reason: 'ready', details: { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] } }), launch })).toEqual({ status: 'started', version: '0.2.8', cutAt: cut });
   expect(called).toEqual(['0.2.8']);
-  expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date('2026-10-04T04:15:00.001Z'), apply: true, launch })).toEqual({ status: 'no-cut' });
+  expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date('2026-10-04T04:15:00.001Z'), apply: true,
+    readiness: () => ({ ready: false, reason: 'checklist-blocked', details: { ok: false, red: [], undecided: ['P0'], blocked: [] } }), launch }))
+    .toEqual({ status: 'skipped', version: '0.2.8', reason: 'checklist-blocked' });
   expect(called).toEqual(['0.2.8']);
+});
+
+test('pre-cut auto-start records a plan before launch and starts only after launch succeeds', async () => {
+  setup();
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  let launched = false;
+  try {
+    expect(await autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date('2026-10-04T03:50:00.000Z'), apply: true,
+      launch: () => {
+        expect(log).toHaveBeenCalledWith('release.schedule', 'countdown-planned', expect.objectContaining({ version: '0.2.8', expectedEta: cut }));
+        expect(log).not.toHaveBeenCalledWith('release.schedule', 'countdown-started', expect.anything());
+        launched = true;
+      } })).toEqual({ status: 'started', version: '0.2.8', cutAt: cut });
+    expect(launched).toBe(true);
+    expect(log).toHaveBeenCalledWith('release.schedule', 'countdown-started', expect.objectContaining({
+      version: '0.2.8', eta: cut, phase: 'pre-cut',
+    }));
+  } finally { log.mockRestore(); }
+});
+
+test('launch rejection records countdown-launch-failed and its reason without a started event', async () => {
+  setup();
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    await expect(autoStartScheduledRelease({ ledgerRoot: root, windowMinutes: 15, now: new Date('2026-10-04T03:50:00.000Z'), apply: true,
+      launch: () => { throw new Error('graph start refused'); } })).rejects.toThrow('graph start refused');
+    expect(log).toHaveBeenCalledWith('release.schedule', 'countdown-launch-failed', expect.objectContaining({
+      version: '0.2.8', reason: 'graph start refused',
+    }));
+    expect(log).not.toHaveBeenCalledWith('release.schedule', 'countdown-started', expect.anything());
+  } finally { log.mockRestore(); }
 });
 
 test('a live run lock for the selected version is refused as already-running without launching or changing its lock', async () => {

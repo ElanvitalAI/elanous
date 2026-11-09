@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { anyProviderAvailable, getProvider, getProviderForConfig, streamLLM } from '../llm.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { _resetKeyCacheForTests } from '../config.js';
 import * as grokCredential from '../grok/credential.js';
 import {

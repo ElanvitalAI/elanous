@@ -1,0 +1,27 @@
+{
+  "id": "fake-github",
+  "name": "Fake GitHub CLI and API",
+  "implementation": [
+    "src/ux-sim/fake-gh.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-gh.test.ts"
+  ],
+  "target": "PR list/edit/review/merge responses",
+  "inputs": [
+    "PR records",
+    "pagination",
+    "injected API failure"
+  ],
+  "observations": [
+    "requested operations",
+    "deterministic response",
+    "mutated fake state"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-gh.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

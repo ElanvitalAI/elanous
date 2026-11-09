@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-POD-REUSE-SHARED-FAKE-BOUNDARY-TS",
+  "path": "src/ux-sim/pod-reuse-shared-fake-boundary.ts",
+  "boundary": "Shares one isolated primary-control server and host-keyed fake Kubernetes stores across production SI warm leases; host-mirror adapter reads the production Job manifest readOnly flag, counts simulated mount reads, and rejects writes.",
+  "deviceIds": [
+    "warm-si-reuse-sim"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

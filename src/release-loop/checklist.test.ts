@@ -838,17 +838,24 @@ describe('release checklist ledger', () => {
       if (category === 'release-loop.checklist' && event === 'claim') logs.push(data);
     });
     try {
-      claimItem(version, 'A', 'TC/rel');
+      claimItem(version, 'A', 'TC/rel', { actor: 'TC' });
       expect(listChecklist(version).history.at(-1)).toMatchObject({ field: 'claim', from: 'TC', to: 'TC/rel' });
       const same = listChecklist(version);
-      claimItem(version, 'A', 'TC/rel');
+      claimItem(version, 'A', 'TC/rel', { actor: 'TC' });
       expect(listChecklist(version)).toEqual(same);
       for (const [id, by, current] of [['B', 'TC/docs', 'TC/rel'], ['C', 'TC/rel', 'MK'], ['A', 'TC', 'TC/rel']] as const) {
         const previous = listChecklist(version);
-        expect(() => claimItem(version, id, by)).toThrow(`지금 주인: ${current} — --force 로만 바꾼다`);
+        expect(() => claimItem(version, id, by, { actor: 'UX' })).toThrow(/칸 주인 또는 OP만 claim/);
         expect(listChecklist(version)).toEqual(previous);
       }
-      const forced = claimItem(version, 'C', 'TC/rel', { force: true });
+      const previousTrack = process.env.ELANOUS_TRACK;
+      let forced: ReturnType<typeof claimItem>;
+      try {
+        process.env.ELANOUS_TRACK = 'OP';
+        forced = claimItem(version, 'C', 'TC/rel', { force: true, actor: 'OP', reason: 'authorized test transfer' });
+      } finally {
+        if (previousTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previousTrack;
+      }
       expect(forced.history.at(-1)).toMatchObject({ field: 'claim', from: 'MK', to: 'TC/rel', force: true });
       expect(listChecklist(version).items.find((item) => item.id === 'C')?.owner).toBe('TC/rel');
       expect(listChecklist(version).history.at(-1)).toMatchObject({ field: 'claim', from: 'MK', to: 'TC/rel', force: true });
@@ -857,7 +864,14 @@ describe('release checklist ledger', () => {
       const afterAdd = addItem(version, { id: 'E', title: 'later' });
       expect(afterAdd.history.find((entry) => entry.id === 'C' && entry.field === 'claim')).toMatchObject({ to: 'TC/rel', force: true });
       removeItem(version, 'E', 'TC');
-      claimItem(version, 'D', 'UX');
+      expect(() => claimItem(version, 'D', 'UX', { actor: 'UX' })).toThrow(/칸 주인 또는 OP만 claim/);
+      const previousTrackForUnassigned = process.env.ELANOUS_TRACK;
+      try {
+        process.env.ELANOUS_TRACK = 'OP';
+        claimItem(version, 'D', 'UX', { actor: 'OP' });
+      } finally {
+        if (previousTrackForUnassigned === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previousTrackForUnassigned;
+      }
       expect(listChecklist(version).items.find((item) => item.id === 'D')?.owner).toBe('UX');
       expect(listChecklist(version).history.at(-1)).toMatchObject({ field: 'claim', from: null, to: 'UX' });
       expect(summarize(version)).toMatchObject({ byOwner: { 'TC/rel': 3, UX: 1 }, bySeat: { TC: 3, UX: 1 } });

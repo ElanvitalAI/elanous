@@ -9,7 +9,7 @@
 // catching real regressions.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { takeSharedPayload } from './share-target-store';
+import { acknowledgeSharedPayloadFiles, takeSharedPayload } from './share-target-store';
 
 const realCaches = (globalThis as { caches?: unknown }).caches;
 
@@ -172,6 +172,28 @@ describe('takeSharedPayload', () => {
     // Drained — second take returns null.
     const second = await takeSharedPayload(id);
     expect(second).toBe(null);
+  });
+
+  test('partial acknowledgement keeps failed share files available for retry', async () => {
+    const cache = await stubCaches.caches.open('elanous-pwa-share-target-v2');
+    const id = 'id-partial';
+    const firstKey = `/__share/${id}/0/ok.jpg`;
+    const secondKey = `/__share/${id}/1/retry.jpg`;
+    await cache.put(`/__share/${id}/manifest.json`, makeJsonResponse({
+      id, ts: 1, title: '', text: '', url: '',
+      files: [
+        { index: ''.length, cacheUrl: firstKey, filename: 'ok.jpg', type: 'image/jpeg', size: 'x'.length },
+        { index: 'x'.length, cacheUrl: secondKey, filename: 'retry.jpg', type: 'image/jpeg', size: 'x'.length },
+      ],
+    }));
+    await cache.put(firstKey, makeBlobResponse(new Blob(['ok'], { type: 'image/jpeg' })));
+    await cache.put(secondKey, makeBlobResponse(new Blob(['retry'], { type: 'image/jpeg' })));
+
+    const first = await takeSharedPayload(id, { drain: false });
+    expect(first?.files.map((file) => file.name)).toEqual(['ok.jpg', 'retry.jpg']);
+    await acknowledgeSharedPayloadFiles(id, [first!.fileKeys[0]!]);
+    const retry = await takeSharedPayload(id, { drain: false });
+    expect(retry?.files.map((file) => file.name)).toEqual(['retry.jpg']);
   });
 
   test('skips file entries whose blob is missing from cache', async () => {

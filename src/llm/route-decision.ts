@@ -6,7 +6,7 @@
 // later trace/ACP consumers).  Callers still own execution and must preserve
 // an explicit model pin.
 
-import type { LLMProviderName, ReasoningLevel, LlmRoutePolicyConfig } from '../user-config.js';
+import type { LLMProviderName, ReasoningLevel, LlmRoutePolicyConfig } from '../user-config/types.js';
 import { classifyMissionTier1, type MissionKind } from './mission-router.js';
 import type { SessionSource } from '../session/index.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';

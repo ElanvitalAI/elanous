@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/readiness-countdown.ts",
+  "disposition": "device",
+  "entryCommand": "bun scripts/ux-sim.ts readiness-countdown",
+  "logsRecorded": "no",
+  "logsDetail": "Deterministic event replay; external boundaries are injected.",
+  "deviceId": "readiness-countdown",
+  "scenarioIds": [
+    "RLA-LAUNCH-COUNTDOWN-1107"
+  ]
+}

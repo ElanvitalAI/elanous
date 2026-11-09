@@ -1,0 +1,20 @@
+{
+  "id": "UX-MS-11",
+  "name": "Codex request-shape 400 recovery boundary",
+  "kind": "provider-request-rejected",
+  "device": "scenario-runner",
+  "implementation": [
+    "scenarios/ux-sim/provider-4xx-no-provider.yaml",
+    "src/ux-sim/scenario.ts"
+  ],
+  "tests": [
+    "src/ux-sim/scenario.test.ts"
+  ],
+  "trigger": "Run the test-universe ScenarioV0 fixture with two injected HTTP 400 responses for the Codex request-shape boundary.",
+  "observe": [
+    "llm.codex/request-rejected-shape debug event",
+    "response status and count",
+    "ScenarioV0 completion event and runId evidence artifact"
+  ],
+  "expected": "The isolated scenario records one request-rejected-shape event and one runId-scoped completion row."
+}

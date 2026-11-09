@@ -30,11 +30,11 @@ test('lease reads log their measured kind, holder, generation and elapsed millis
     const replies = [ok('5'), ok(doc), ok('5')];
     await readRoleLeaseAsync(bucket, { run: async () => replies.shift()! });
     expect(log).toHaveBeenCalledWith('control.lease', 'read', {
-      kind: 'present', holder: 'node-b', generation: 7, ms: expect.any(Number),
+      kind: 'present', holder: 'node-b', generation: 7, ms: expect.any(Number), reason: null,
     });
     await readRoleLeaseAsync(bucket, { run: async () => { throw new Error('timeout (8s)'); } });
     expect(log).toHaveBeenCalledWith('control.lease', 'read', {
-      kind: 'unmeasured', holder: null, generation: null, ms: expect.any(Number),
+      kind: 'unmeasured', holder: null, generation: null, ms: expect.any(Number), reason: 'timeout (8s)',
     });
   } finally { log.mockRestore(); }
 });

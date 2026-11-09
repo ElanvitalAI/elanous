@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { debug } from '../../src/debug/log.js';
 import { runWithReleasePwaTraffic } from './gate-traffic-mode.js';
 
-export type NodeOutcome = 'ok' | 'fail' | 'error' | 'partial' | 'unknown' | 'recovery-required';
+export type NodeOutcome = 'ok' | 'fail' | 'error' | 'partial' | 'unknown' | 'recovery-required' | 'switch' | 'stay-normal';
 export type NodeVerdict = 'pass' | 'flaky' | 'fail';
 export interface GraphContext {
   graphId?: string;
@@ -16,6 +16,25 @@ export interface GraphContext {
   input: { version: string; previousVersion: string; [key: string]: unknown };
   nodeInput?: Record<string, unknown>;
   outputs: Record<string, Record<string, unknown>>;
+  /** Ordered executions let re-entered nodes select the verdict from the latest gate visit. */
+  nodeHistory?: Array<{ nodeId: string; executionId?: string; output?: unknown }>;
+}
+
+export function latestGateOutput(context: GraphContext): Record<string, unknown> | undefined {
+  const latest = [...(context.nodeHistory ?? [])].reverse().find((node) =>
+    (node.nodeId === 'gate' || node.nodeId === 'residual-run'));
+  if (latest) {
+    if (latest.output === undefined) return undefined;
+    const output = latest.output;
+    if (output && typeof output === 'object' && !Array.isArray(output)) return output as Record<string, unknown>;
+    if (typeof output === 'string') {
+      try { const parsed: unknown = JSON.parse(output);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+      } catch { /* malformed output remains unavailable */ }
+    }
+    return undefined;
+  }
+  return context.outputs.gate ?? context.outputs['residual-run'];
 }
 
 export function readGraphContext(env: NodeJS.ProcessEnv = process.env): GraphContext {
@@ -35,7 +54,8 @@ export function readGraphContext(env: NodeJS.ProcessEnv = process.env): GraphCon
     input: input as GraphContext['input'],
     ...(context.nodeInput && typeof context.nodeInput === 'object' && !Array.isArray(context.nodeInput)
       ? { nodeInput: context.nodeInput as Record<string, unknown> } : {}),
-    outputs: context.outputs && typeof context.outputs === 'object' ? context.outputs as GraphContext['outputs'] : {} };
+    outputs: context.outputs && typeof context.outputs === 'object' ? context.outputs as GraphContext['outputs'] : {},
+    ...(Array.isArray(context.nodeHistory) ? { nodeHistory: context.nodeHistory as GraphContext['nodeHistory'] } : {}) };
 }
 
 export function nodeOutput(context: GraphContext, node: string, key: string): string {

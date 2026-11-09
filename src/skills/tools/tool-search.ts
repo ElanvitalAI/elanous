@@ -51,6 +51,8 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 import { nativeToolCatalog, type NativeToolCatalogEntry } from '../../native-tool-catalog.js';
 import { listToolRuntimes } from '../../tool-runtime/registry.js';
 import { DEFAULT_MAX_RESULTS, MAX_RESULTS_HARD_CAP, HYDRATED_TOOLS_KEY } from './tool-search-spec.js';
+import { buildToolRouteIndex, routeToolIntentWithFallback } from '../../tool-router/index.js';
+import { debug } from '../../debug/log.js';
 
 export { buildToolSearchTool, TOOL_SEARCH_NAME } from './tool-search-spec.js';
 
@@ -68,6 +70,8 @@ export interface ToolSearchOpts {
    *  hydrate their own deferred tools. Omit for registry-only lookup
    *  (dashboard behaviour, unchanged). */
   specs?: readonly LLMToolSpec[];
+  /** Optional surface label for route-decision observations. */
+  surface?: string;
 }
 
 export interface ToolSearchResult {
@@ -283,6 +287,30 @@ function renderFunctionsBlock(specs: LLMToolSpec[]): string {
   return `<functions>\n${specs.map(renderFunctionLine).join('\n')}\n</functions>`;
 }
 
+/** Hydrate a route selected from the caller's surface-local manifest index.
+ *  The plugin id stays attached through selection so duplicate names cannot
+ *  substitute another plugin's schema. This explicit route path is separate
+ *  from broad native-catalog keyword search. */
+export function dispatchToolSearchRoute(
+  routes: readonly { pluginId: string; name: string }[],
+  surfaceSpecs: readonly LLMToolSpec[],
+): ToolSearchResult {
+  const selected: LLMToolSpec[] = [];
+  for (const route of routes) {
+    const spec = surfaceSpecs.find((candidate) => candidate.pluginId === route.pluginId
+      && candidate.name === route.name && candidate.route !== undefined);
+    if (spec && !selected.some((candidate) => candidate.pluginId === route.pluginId && candidate.name === route.name)) {
+      selected.push(spec);
+    }
+  }
+  return {
+    content: `# ToolSearch: ${selected.length} matched\n\n` + renderFunctionsBlock(selected),
+    matched: selected.map((spec) => spec.name),
+    unknown: [],
+    [HYDRATED_TOOLS_KEY]: selected,
+  };
+}
+
 /** Dispatch entrypoint. Pure (no I/O) — looks up tool specs directly
  *  from the runtime registry so tests can exercise it by registering
  *  fake runtimes. */
@@ -290,11 +318,35 @@ export function dispatchToolSearch(
   args: ToolSearchArgs,
   opts: ToolSearchOpts = {},
 ): ToolSearchResult {
-  const parsed = parseToolSearchQuery(args.query);
   const maxResults = Math.min(
     Math.max(1, Math.floor(args.max_results ?? DEFAULT_MAX_RESULTS)),
     MAX_RESULTS_HARD_CAP,
   );
+  if (/^route:\s*/i.test(args.query)) {
+    const intent = args.query.replace(/^route:\s*/i, '').trim();
+    const routeSpecs = (opts.specs ?? []).filter((spec) => spec.pluginId && spec.route);
+    const enabledPluginIds = new Set(routeSpecs.map((spec) => spec.pluginId!));
+    const decision = routeToolIntentWithFallback(intent, () => buildToolRouteIndex(routeSpecs.map((spec) => ({
+      pluginId: spec.pluginId!,
+      tools: [{ name: spec.name, description: spec.description, route: spec.route! }],
+    }))), { enabledPluginIds, limit: args.max_results === undefined ? 1 : maxResults });
+    const routes: { pluginId: string; name: string }[] = [];
+    const seenRouteNames = new Set<string>();
+    for (const match of decision.matches) {
+      if (seenRouteNames.has(match.name)) continue;
+      seenRouteNames.add(match.name);
+      routes.push({ pluginId: match.pluginId, name: match.name });
+      if (routes.length >= (args.max_results === undefined ? 1 : maxResults)) break;
+    }
+    const result = dispatchToolSearchRoute(routes, routeSpecs);
+    debug.log('tool.route', 'route-decision', {
+      surface: opts.surface ?? 'tool-search-direct', queryLength: intent.length,
+      mode: decision.mode, miss: decision.miss,
+      matches: decision.matches.map(({ pluginId, name, score }) => ({ pluginId, name, score })),
+    });
+    return result;
+  }
+  const parsed = parseToolSearchQuery(args.query);
   const entries = listSearchCandidates(opts.specs);
 
   if (parsed.kind === 'select') {

@@ -10,12 +10,14 @@
 // because elanous's primary surface runs native git.
 
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync, rmSync, symlinkSync, lstatSync, unlinkSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync, rmSync, rmdirSync, symlinkSync, lstatSync, unlinkSync, renameSync, readlinkSync, statSync, type Dirent } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { findGitDir } from './locate.js';
 import { isTransientGitError } from './retry.js';
 import { runGitCommand } from './runner.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
 import { GATE_DEPS_DIR, GATE_DEPS_TREES, projectDepsManifest } from '../task-orchestrator/surfaces/pod-gate-deps.js';
@@ -24,6 +26,9 @@ const GIT_TIMEOUT_MS = 30_000;
 /** 얕은 클론(Pod `git clone --depth 50` · docker/harness/job.yaml)에서 base 를 가져올 깊이 — 클론과 같은 값.
  *  ⛔ 깊이 없이 얕은 저장소로 다른 브랜치를 fetch 하면 그 브랜치의 «전 이력»을 받는다(실측 193s vs 4s · 30s 에 SIGTERM). */
 const SHALLOW_BASE_FETCH_DEPTH = 50;
+const BASE_FETCH_COALESCE_WINDOW_MS = 30_000;
+const BASE_FETCH_LOCK_WAIT_MS = GIT_TIMEOUT_MS + 5_000;
+const BASE_FETCH_LOCK_STALE_MS = GIT_TIMEOUT_MS * 2;
 const WORKTREE_ADD_TIMEOUT_MS = 5 * 60_000;
 const WORKTREE_ADD_TIMEOUT_PER_TRACKED_FILE_MS = 600_000 / 25_000;
 const WORKTREE_ADD_TIMEOUT_MAX_MS = 15 * 60_000;
@@ -33,6 +38,7 @@ export interface WorktreeAddDeps {
   spawn?: (command: string, args: string[], options: { cwd: string; encoding: 'utf8'; timeout: number; maxBuffer: number }) => SpawnSyncReturns<string>;
   installDependencies?: (cwd: string, timeoutMs: number) => { status: number | null; stderr?: string | null; error?: Error };
   countTrackedFiles?: (repoRoot: string, ref?: string) => number | null;
+  sharedDependencyStoreRoot?: string;
 }
 
 function countTrackedFiles(repoRoot: string, ref?: string): number | null {
@@ -277,11 +283,366 @@ export interface WorktreeDependencyLinkResult {
   linked: string[];
   skippedMissingSource: string[];
   skippedExistingTarget: string[];
+  skippedLockMismatch: string[];
+  skippedUnshareableSource: string[];
   failed: Array<{ path: string; reason: string }>;
 }
 
 export interface WorktreeDependencyLinkDeps {
   symlink?: (target: string, path: string, type: 'dir') => void;
+  sharedStoreRoot?: string;
+  copyTree?: (source: string, destination: string) => void;
+  /** Deterministic lock-protocol seams for simulation tests. */
+  testHooks?: {
+    lockWaitMs?: number;
+    afterLockQuarantined?: (lockPath: string) => void;
+    onRecoveryGateWait?: (gatePath: string) => void;
+  };
+}
+
+function worktreeDependencyStoreRoot(override?: string): string {
+  return override ?? process.env.ELANOUS_WORKTREE_DEPS_DIR ?? join(elanousStateRoot(), 'worktree-deps');
+}
+
+function worktreeDependencyRepoScope(repoRoot: string): string {
+  let identity = resolve(repoRoot);
+  try { identity = realpathSync(findGitDir(repoRoot)?.commonGitDir ?? repoRoot); } catch { /* use resolved repo root */ }
+  return createHash('sha256').update(identity).digest('hex').slice(0, 16);
+}
+
+function dependencyLockfile(root: string, relativePath: string): string {
+  const rootPath = resolve(root);
+  let current = resolve(rootPath, dirname(relativePath));
+  while (current === rootPath || current.startsWith(`${rootPath}${sep}`)) {
+    const candidate = join(current, 'bun.lock');
+    if (existsSync(candidate)) return candidate;
+    if (current === rootPath) break;
+    current = dirname(current);
+  }
+  return join(rootPath, 'bun.lock');
+}
+
+function hasExternalDependencySymlink(directory: string): boolean {
+  let root: string;
+  try { root = realpathSync(directory); } catch { return false; }
+  const pending = [directory];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    let entries: Dirent[];
+    try { entries = readdirSync(current, { withFileTypes: true }); } catch { return true; }
+    for (const entry of entries) {
+      const path = join(current, entry.name);
+      if (entry.isSymbolicLink()) {
+        try {
+          // cp -R preserves absolute links verbatim, including links back into
+          // the mutable source tree. A shared copy must not retain that alias.
+          if (isAbsolute(readlinkSync(path))) return true;
+          const resolvedLink = realpathSync(path);
+          if (resolvedLink !== root && !resolvedLink.startsWith(`${root}${sep}`)) return true;
+        } catch { return true; }
+      } else if (entry.isDirectory()) pending.push(path);
+    }
+  }
+  return false;
+}
+
+const WORKTREE_DEPENDENCY_LOCK_WAIT_MS = 15 * 60_000;
+const WORKTREE_DEPENDENCY_ORPHAN_LOCK_GRACE_MS = 30_000;
+
+function dependencyStoreLockIsStale(lockPath: string): boolean {
+  let lockStat;
+  try {
+    lockStat = lstatSync(lockPath);
+    if (!lockStat.isDirectory()) return false;
+  } catch { return false; }
+  if (Date.now() - lockStat.mtimeMs <= WORKTREE_DEPENDENCY_ORPHAN_LOCK_GRACE_MS) return false;
+
+  let owner: { pid?: unknown } | undefined;
+  try {
+    owner = JSON.parse(readFileSync(join(lockPath, 'owner.json'), 'utf8')) as { pid?: unknown };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    // An absent/partially-written owner marker can be reclaimed only after the
+    // directory grace period above. Permission and other I/O failures stay shut.
+    if (code !== 'ENOENT' && !(error instanceof SyntaxError)) return false;
+  }
+  const pid = owner?.pid;
+  if (typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0) return true;
+  try { process.kill(pid, 0); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException)?.code === 'ESRCH'; }
+}
+
+function releaseOwnedDependencyLock(lockPath: string, token: string): void {
+  try {
+    const owner = JSON.parse(readFileSync(join(lockPath, 'owner.json'), 'utf8')) as { token?: unknown };
+    if (owner.token === token) rmSync(lockPath, { recursive: true, force: true });
+  } catch { /* never remove a lock whose ownership cannot be proven */ }
+}
+
+/** Atomically move an aged orphan directory away; callers revalidate after the rename. */
+function quarantineStaleDependencyLock(lockPath: string): string | null {
+  if (!dependencyStoreLockIsStale(lockPath)) return null;
+  const quarantinePath = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
+  try { renameSync(lockPath, quarantinePath); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT' || code === 'EEXIST' || code === 'ENOTEMPTY') return null;
+    throw error;
+  }
+  // Recheck the atomically moved directory before discarding it. If a competing
+  // claimant replaced the observed lock between inspection and rename, restore
+  // it when possible and leave all data intact.
+  if (!dependencyStoreLockIsStale(quarantinePath)) {
+    try { renameSync(quarantinePath, lockPath); }
+    catch { /* preserve the moved lock in quarantine rather than deleting it */ }
+    return null;
+  }
+  return quarantinePath;
+}
+
+/** Acquire an atomic gate that serializes stale-lock recovery with every new lock claimant. */
+function acquireDependencyRecoveryGate(gatePath: string): string | null {
+  try {
+    mkdirSync(gatePath);
+    const token = randomUUID();
+    writeFileSync(join(gatePath, 'owner.json'), JSON.stringify({ pid: process.pid, startedAt: Date.now(), token }), { flag: 'wx' });
+    return token;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
+    // Do not recursively reap the recovery gate: it is the mutex that makes
+    // stale-lock recovery safe. If its owner died, stop for explicit recovery.
+    return null;
+  }
+}
+
+function dependencyRecoveryGateExists(lockPath: string): boolean {
+  try { lstatSync(`${lockPath}.recovery`); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException)?.code !== 'ENOENT'; }
+}
+
+/** Atomically quarantine an aged orphan while the recovery gate excludes other claimants. */
+function recoverDependencyStoreLock(
+  lockPath: string,
+  afterLockQuarantined?: (lockPath: string) => void,
+): boolean {
+  if (!dependencyStoreLockIsStale(lockPath)) return false;
+  const gatePath = `${lockPath}.recovery`;
+  const token = acquireDependencyRecoveryGate(gatePath);
+  if (!token) return false;
+  try {
+    // A contender may have installed a fresh owner while this process acquired
+    // the gate. Recheck under the gate before changing the claim path.
+    if (!dependencyStoreLockIsStale(lockPath)) return false;
+    const quarantinePath = quarantineStaleDependencyLock(lockPath);
+    if (!quarantinePath) return false;
+    afterLockQuarantined?.(lockPath);
+    rmSync(quarantinePath, { recursive: true, force: true });
+    return true;
+  } finally {
+    // A failed recovery leaves quarantined contents available for inspection.
+    releaseOwnedDependencyLock(gatePath, token);
+  }
+}
+
+function isManagedDependencyLink(target: string, repoRoot: string, relativePath: string, storeRoot: string): boolean {
+  try {
+    if (!lstatSync(target).isSymbolicLink()) return false;
+    const link = readlinkSync(target);
+    const resolved = resolve(dirname(target), link);
+    const direct = resolve(repoRoot, relativePath);
+    if (resolved === direct || resolved === resolve(storeRoot, worktreeDependencyRepoScope(repoRoot), createHash('sha256').update(readFileSync(dependencyLockfile(repoRoot, relativePath))).digest('hex'), relativePath.replaceAll('/', '__'))) return true;
+    const scopePrefix = `${resolve(storeRoot, worktreeDependencyRepoScope(repoRoot))}${sep}`;
+    return resolved.startsWith(scopePrefix) && basename(resolved) === relativePath.replaceAll('/', '__');
+  } catch { return false; }
+}
+
+function detachManagedDependencyLink(target: string, repoRoot: string, relativePath: string, storeRoot: string): boolean {
+  try {
+    if (!lstatSync(target).isSymbolicLink()) return true;
+    if (!isManagedDependencyLink(target, repoRoot, relativePath, storeRoot)) return false;
+    unlinkSync(target);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+}
+
+/** Serialize creation of one lock-scoped copy; aged orphan locks are atomically recovered. */
+function withWorktreeDependencyStoreLock<T>(
+  storePath: string,
+  action: () => T,
+  testHooks: WorktreeDependencyLinkDeps['testHooks'] = {},
+): T {
+  const lockPath = `${storePath}.lock`;
+  const recoveryPath = `${lockPath}.recovery`;
+  const deadline = Date.now() + (testHooks.lockWaitMs ?? WORKTREE_DEPENDENCY_LOCK_WAIT_MS);
+  const token = randomUUID();
+  for (;;) {
+    if (dependencyRecoveryGateExists(lockPath)) {
+      testHooks.onRecoveryGateWait?.(recoveryPath);
+      if (dependencyStoreLockIsStale(recoveryPath)) {
+        throw new Error(`stale dependency-store recovery gate; manual recovery required: ${recoveryPath}`);
+      }
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for dependency-store recovery gate: ${recoveryPath}`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+      continue;
+    }
+    try {
+      mkdirSync(lockPath);
+      writeFileSync(join(lockPath, 'owner.json'), JSON.stringify({ pid: process.pid, startedAt: Date.now(), token }), { flag: 'wx' });
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (recoverDependencyStoreLock(lockPath, testHooks.afterLockQuarantined)) continue;
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for dependency-store lock: ${lockPath}`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  // A recovery gate may have appeared after the initial check but before our
+  // mkdir. Keep the newly-created lock idle until that recovery transaction ends.
+  while (dependencyRecoveryGateExists(lockPath)) {
+    testHooks.onRecoveryGateWait?.(recoveryPath);
+    if (dependencyStoreLockIsStale(recoveryPath)) {
+      releaseOwnedDependencyLock(lockPath, token);
+      throw new Error(`stale dependency-store recovery gate; manual recovery required: ${recoveryPath}`);
+    }
+    if (Date.now() >= deadline) {
+      releaseOwnedDependencyLock(lockPath, token);
+      throw new Error(`timed out waiting for dependency-store recovery gate: ${recoveryPath}`);
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  try { return action(); }
+  finally { releaseOwnedDependencyLock(lockPath, token); }
+}
+
+function ensureSharedDependencyStoreCopy(
+  source: string,
+  directSource: string,
+  copyTree: (source: string, destination: string) => void,
+  testHooks: WorktreeDependencyLinkDeps['testHooks'] = {},
+): 'ready' | 'unshareable' {
+  return withWorktreeDependencyStoreLock(source, () => {
+    const marker = `${source}.complete.json`;
+    try {
+      const expected = JSON.parse(readFileSync(marker, 'utf8')) as { digest?: unknown };
+      if (lstatSync(source).isDirectory() && typeof expected.digest === 'string' && digestDependencyTree(source) === expected.digest) return 'ready';
+    } catch { /* a missing, malformed, or unreadable completion marker requires rebuilding */ }
+    removeDependencyTree(source);
+    rmSync(marker, { force: true });
+    if (hasExternalDependencySymlink(directSource)) return 'unshareable';
+    const staging = `${source}.building-${process.pid}`;
+    removeDependencyTree(staging);
+    mkdirSync(dirname(source), { recursive: true });
+    try {
+      copyTree(realpathSync(directSource), staging);
+      const digest = digestDependencyTree(staging);
+      makeDependencyTreeReadOnly(staging);
+      renameSync(staging, source);
+      writeFileSync(marker, JSON.stringify({ digest }), { flag: 'wx' });
+    } catch (error) {
+      removeDependencyTree(staging);
+      removeDependencyTree(source);
+      rmSync(marker, { force: true });
+      throw error;
+    }
+    return 'ready';
+  }, testHooks);
+}
+
+function digestDependencyTree(root: string): string {
+  const hash = createHash('sha256');
+  const visit = (path: string, relative: string): void => {
+    const stat = lstatSync(path);
+    hash.update(`${relative}\0${stat.mode & ~0o222}\0`);
+    if (stat.isSymbolicLink()) hash.update(`link:${readlinkSync(path)}\0`);
+    else if (stat.isDirectory()) {
+      hash.update('dir\0');
+      for (const name of readdirSync(path).sort()) visit(join(path, name), relative ? `${relative}/${name}` : name);
+    } else hash.update(`file:${readFileSync(path).toString('base64')}\0`);
+  };
+  visit(root, '');
+  return hash.digest('hex');
+}
+
+function removeDependencyTree(root: string): void {
+  try {
+    const stat = lstatSync(root);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) { rmSync(root, { force: true }); return; }
+    chmodSync(root, stat.mode | 0o700);
+    for (const entry of readdirSync(root, { withFileTypes: true })) removeDependencyTree(join(root, entry.name));
+    rmdirSync(root);
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+}
+
+/**
+ * Remove a disposable scratch path only when its real path is inside this run's
+ * scratch root. Shared dependency stores can be symlink targets, so this boundary
+ * deliberately rejects symlink roots and never resolves a link for deletion.
+ * Cleanup errors are observable but fail soft so an EXIT trap cannot replace the
+ * gate's measured exit status.
+ */
+export function removeWorktreeDependencyScratch(targetPath: string, scratchRoot: string): boolean {
+  const logFailure = (reason: string): false => {
+    debug.log('git-fs.worktree', 'dependency-scratch.cleanup-failed', {
+      target: basename(targetPath), reason,
+    }, { level: 'warn' });
+    return false;
+  };
+
+  try {
+    const scratchStat = lstatSync(scratchRoot);
+    if (scratchStat.isSymbolicLink() || !scratchStat.isDirectory()) return logFailure('invalid-scratch-root');
+    const lexicalRoot = resolve(scratchRoot);
+    const cwd = process.cwd();
+    const rawTarget = isAbsolute(targetPath) ? targetPath : `${cwd === sep ? '' : cwd}${sep}${targetPath}`;
+    if (rawTarget !== lexicalRoot && !rawTarget.startsWith(`${lexicalRoot}${sep}`)) return logFailure('target-outside-scratch');
+    let current = lexicalRoot;
+    const rawRelative = rawTarget === lexicalRoot ? '' : rawTarget.slice(lexicalRoot.length + 1);
+    for (const part of rawRelative ? rawRelative.split(sep) : []) {
+      if (!part || part === '.') continue;
+      if (part === '..') {
+        current = dirname(current);
+        if (current !== lexicalRoot && !current.startsWith(`${lexicalRoot}${sep}`)) return logFailure('target-outside-scratch');
+        continue;
+      }
+      current = join(current, part);
+      if (lstatSync(current).isSymbolicLink()) return logFailure('target-path-contains-symlink');
+    }
+    const targetStat = lstatSync(targetPath);
+    if (targetStat.isSymbolicLink()) return logFailure('target-is-symlink');
+
+    const canonicalScratch = realpathSync(scratchRoot);
+    const canonicalTarget = realpathSync(targetPath);
+    if (canonicalScratch !== lexicalRoot) return logFailure('scratch-root-path-contains-symlink');
+    if (canonicalTarget !== canonicalScratch && !canonicalTarget.startsWith(`${canonicalScratch}${sep}`)) {
+      return logFailure('target-outside-scratch');
+    }
+    removeDependencyTree(canonicalTarget);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    return logFailure((error as NodeJS.ErrnoException).code ?? 'cleanup-error');
+  }
+}
+
+function makeDependencyTreeReadOnly(root: string): void {
+  const pending = [root];
+  const directories: string[] = [];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const stat = lstatSync(current);
+    if (stat.isSymbolicLink()) continue;
+    if (stat.isDirectory()) {
+      directories.push(current);
+      for (const entry of readdirSync(current, { withFileTypes: true })) pending.push(join(current, entry.name));
+    } else chmodSync(current, stat.mode & ~0o222);
+  }
+  for (const directory of directories.reverse()) {
+    const stat = lstatSync(directory);
+    chmodSync(directory, stat.mode & ~0o222);
+  }
 }
 
 /** Untracked dependency locations every elanous worktree shares from its source checkout. */
@@ -305,13 +666,78 @@ export function linkWorktreeDependencies(
     linked: [],
     skippedMissingSource: [],
     skippedExistingTarget: [],
+    skippedLockMismatch: [],
+    skippedUnshareableSource: [],
     failed: [],
   };
   const link = deps.symlink ?? ((source, target, type) => symlinkSync(source, target, type));
+  const copyTree = deps.copyTree ?? ((source, destination) => {
+    const copy = spawnSync('cp', process.platform === 'darwin' ? ['-cR', source, destination] : ['-R', source, destination], { encoding: 'utf8', timeout: WORKTREE_DEPENDENCY_INSTALL_TIMEOUT_MS });
+    if (copy.status !== 0 || copy.error) throw new Error((copy.stderr || copy.error?.message || `cp exited ${copy.status}`).trim());
+  });
   const plannedPaths = [...new Set([...DEFAULT_WORKTREE_DEPENDENCY_PATHS, ...relativePaths])];
+  const sharedStoreRoot = worktreeDependencyStoreRoot(deps.sharedStoreRoot);
   for (const relativePath of plannedPaths) {
-    const source = join(repoRoot, relativePath);
     const target = join(worktreePath, relativePath);
+    // Root and nested workspaces can have independent lockfiles. Resolve the
+    // nearest lockfile for each dependency path before choosing its store key.
+    const sourceLock = dependencyLockfile(repoRoot, relativePath);
+    const targetLock = dependencyLockfile(worktreePath, relativePath);
+    let sourceLockBytes: Buffer | null = null;
+    let targetLockBytes: Buffer | null = null;
+    try { sourceLockBytes = readFileSync(sourceLock); } catch { /* fail closed on unreadable lockfiles */ }
+    try { targetLockBytes = readFileSync(targetLock); } catch { /* missing target lock cannot safely share */ }
+    const lockMismatch = !sourceLockBytes || !targetLockBytes || !sourceLockBytes.equals(targetLockBytes);
+    let sharedStore: string | null = null;
+    let sharedStoreError: string | null = null;
+    if (!lockMismatch && sourceLockBytes) {
+      const lockHash = createHash('sha256').update(sourceLockBytes).digest('hex');
+      sharedStore = join(sharedStoreRoot, worktreeDependencyRepoScope(repoRoot), lockHash);
+      try { mkdirSync(sharedStore, { recursive: true }); }
+      catch (error) { sharedStoreError = String(error); }
+    }
+    const directSource = join(repoRoot, relativePath);
+    const detachManaged = (): boolean => detachManagedDependencyLink(target, repoRoot, relativePath, sharedStoreRoot);
+    if (lockMismatch) {
+      try {
+        if (!detachManaged()) result.failed.push({ path: relativePath, reason: 'existing dependency symlink is not managed; preserving it' });
+      } catch (error) { result.failed.push({ path: relativePath, reason: String(error) }); }
+      if (!result.skippedUnshareableSource.includes(relativePath)) result.skippedLockMismatch.push(relativePath);
+      continue;
+    }
+    const source = sharedStore ? join(sharedStore, relativePath.replaceAll('/', '__')) : directSource;
+    if (sharedStoreError) {
+      try { if (!detachManaged()) result.failed.push({ path: relativePath, reason: 'existing dependency symlink is not managed; preserving it' }); }
+      catch (error) { result.failed.push({ path: relativePath, reason: String(error) }); }
+      result.failed.push({ path: relativePath, reason: sharedStoreError });
+      continue;
+    }
+    if (sharedStore && existsSync(directSource)) {
+      try {
+        const storeStatus = ensureSharedDependencyStoreCopy(source, directSource, copyTree, deps.testHooks);
+        if (storeStatus === 'unshareable') {
+          try { if (!detachManaged()) result.failed.push({ path: relativePath, reason: 'existing dependency symlink is not managed; preserving it' }); }
+          catch (error) { result.failed.push({ path: relativePath, reason: String(error) }); }
+          result.skippedUnshareableSource.push(relativePath);
+          continue;
+        }
+      } catch (error) {
+        try { if (!detachManaged()) result.failed.push({ path: relativePath, reason: 'existing dependency symlink is not managed; preserving it' }); }
+        catch (unlinkError) { result.failed.push({ path: relativePath, reason: String(unlinkError) }); }
+        result.failed.push({ path: relativePath, reason: String(error) });
+        continue;
+      }
+    }
+    try {
+      if (lstatSync(target).isSymbolicLink() && readlinkSync(target) !== source) {
+        if (!detachManaged()) {
+          result.failed.push({ path: relativePath, reason: 'existing dependency symlink is not managed; preserving it' });
+          continue;
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { result.failed.push({ path: relativePath, reason: String(error) }); continue; }
+    }
     if (!existsSync(source)) {
       result.skippedMissingSource.push(relativePath);
       continue;
@@ -379,10 +805,37 @@ export function prepareWorktreeDependencies(repoRoot: string, worktreePath: stri
         worktreePath, path: relativePath, source, fallback, installed, ok, error, method,
       }, ok ? undefined : { level: 'warn' });
     };
-    if (existsSync(target)) { report(false, true, null, existsSync(source) ? 'source' : 'existing'); continue; }
-    try { if (lstatSync(target).isSymbolicLink()) unlinkSync(target); } catch (error) {
+    // Detach only links created by this mechanism. User-owned dependency links
+    // survive lock changes and missing lockfiles unchanged.
+    try {
+      if (lstatSync(target).isSymbolicLink()) {
+        const storeRoot = worktreeDependencyStoreRoot(deps.sharedDependencyStoreRoot);
+        const linkedTo = resolve(dirname(target), readlinkSync(target));
+        let locksMatch = false;
+        try { locksMatch = readFileSync(dependencyLockfile(repoRoot, relativePath)).equals(readFileSync(dependencyLockfile(worktreePath, relativePath))); }
+        catch { /* no lock contract means cached links are stale */ }
+        let linkedToCurrentStore = false;
+        try {
+          const sourceLock = readFileSync(dependencyLockfile(repoRoot, relativePath));
+          const targetLock = readFileSync(dependencyLockfile(worktreePath, relativePath));
+          linkedToCurrentStore = isManagedDependencyLink(target, repoRoot, relativePath, storeRoot)
+            && linkedTo === resolve(storeRoot, worktreeDependencyRepoScope(repoRoot), createHash('sha256').update(targetLock).digest('hex'), relativePath.replaceAll('/', '__'))
+            && sourceLock.equals(targetLock);
+        } catch { /* missing lockfiles make an old store link stale */ }
+        const linkedToCurrentDirect = linkedTo === resolve(source) && locksMatch;
+        const linkedToCurrentFallback = linkedTo === resolve(fallback) && bakedDependenciesMatch(targetTree, fallbackTree);
+        const managed = linkedTo === resolve(source) || linkedTo === resolve(fallback) || isManagedDependencyLink(target, repoRoot, relativePath, storeRoot);
+        if (linkedToCurrentStore || linkedToCurrentDirect || linkedToCurrentFallback) { /* retain the current managed link */ }
+        else if (managed) unlinkSync(target);
+        else {
+          report(false, false, 'existing dependency symlink is not managed; preserving it', 'conflict');
+          continue;
+        }
+      }
+    } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
+    if (existsSync(target)) { report(false, true, null, existsSync(source) ? 'source' : 'existing'); continue; }
     // Plain git repositories without a Bun lockfile have no dependency contract.
     if (!existsSync(join(targetTree, 'package.json')) || !existsSync(join(targetTree, 'bun.lock'))) {
       report(false, true, null, 'not-required');
@@ -503,6 +956,72 @@ export interface CreateWorktreeResult {
  *  ⛔ 결과 타입을 따로 export 하지 않는다 — 외부 소비자가 없다(dead surface 금지·리뷰 should-fix). */
 export type GitRunner = (args: string[]) => { status: number | null; signal?: NodeJS.Signals | null; stdout: string; stderr: string };
 
+type BaseFetchMarker = { branch: string; sha: string; fetchedAt: number };
+
+function baseFetchPaths(commonGitDir: string, branch: string): { marker: string; lock: string } {
+  const key = createHash('sha256').update(branch).digest('hex');
+  const root = join(commonGitDir, 'elanous-fetch-coalesce');
+  // FETCH_HEAD is shared by all branches in a repository, so the lock is repository-wide.
+  return { marker: join(root, `${key}.json`), lock: join(root, 'repository-fetch.lock') };
+}
+
+type BaseFetchMarkerRead = { state: 'missing' } | { state: 'valid'; marker: BaseFetchMarker } | { state: 'invalid'; reason: string };
+
+function readBaseFetchMarker(path: string): BaseFetchMarkerRead {
+  try {
+    const value = JSON.parse(readFileSync(path, 'utf8')) as Partial<BaseFetchMarker>;
+    if (typeof value.branch !== 'string' || typeof value.sha !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value.sha)
+      || typeof value.fetchedAt !== 'number' || !Number.isFinite(value.fetchedAt)) return { state: 'invalid', reason: 'malformed' };
+    return { state: 'valid', marker: value as BaseFetchMarker };
+  } catch (error) {
+    if (isAbsent(error)) return { state: 'missing' };
+    return { state: 'invalid', reason: error instanceof Error ? error.name : 'unreadable' };
+  }
+}
+
+function recentBaseFetch(markerPath: string, branch: string, sha: string, now: number): { recent: boolean; ageMs: number | null } {
+  const read = readBaseFetchMarker(markerPath);
+  if (read.state !== 'valid' || read.marker.branch !== branch || read.marker.sha !== sha) return { recent: false, ageMs: null };
+  const ageMs = now - read.marker.fetchedAt;
+  return { recent: ageMs >= 0 && ageMs <= BASE_FETCH_COALESCE_WINDOW_MS, ageMs };
+}
+
+/** Cross-process per-repository/per-branch lock. If lock state is unreadable or cannot be
+ * acquired within the fetch bound, callers retain the old fetch path instead of trusting cache. */
+function acquireBaseFetchLock(path: string): (() => void) | null {
+  const parent = dirname(path);
+  const deadline = Date.now() + BASE_FETCH_LOCK_WAIT_MS;
+  try { mkdirSync(parent, { recursive: true }); } catch { return null; }
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  while (Date.now() <= deadline) {
+    try {
+      mkdirSync(path);
+      return () => { try { rmSync(path, { recursive: true, force: true }); } catch { /* stale lock recovery */ } };
+    } catch {
+      try {
+        if (Date.now() - statSync(path).mtimeMs > BASE_FETCH_LOCK_STALE_MS) {
+          rmSync(path, { recursive: true, force: true });
+          continue;
+        }
+      } catch { /* lock vanished; retry */ }
+      Atomics.wait(sleeper, 0, 0, 25);
+    }
+  }
+  return null;
+}
+
+function writeBaseFetchMarker(path: string, marker: BaseFetchMarker): void {
+  const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(temp, JSON.stringify(marker), { flag: 'wx', mode: 0o600 });
+    renameSync(temp, path);
+  } finally { try { rmSync(temp, { force: true }); } catch { /* best effort */ } }
+}
+
+function gitHasCommit(git: (...args: string[]) => ReturnType<GitRunner>, sha: string): boolean {
+  return git('cat-file', '-e', `${sha}^{commit}`).status === 0;
+}
+
 export function resolveDefaultBranchBase(repoRoot: string): string | null {
   const run = (...args: string[]) => spawnSync('git', args, { cwd: repoRoot, encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
   const exists = (candidate: string): boolean => run('rev-parse', '--verify', '--quiet', `${candidate}^{commit}`).status === 0;
@@ -572,50 +1091,116 @@ export function syncBaseWithRemote(
     debug.log('git-fs.worktree', 'base.remote-unreachable', { base, err: (ls.stderr || '').trim().slice(0, 160) }, { level: 'warn' });
     return { checkout: base, freshness: 'remote-unreachable' };
   }
-  const hasRemote = (ls.stdout || '').split('\n').some((line) => line.trim().split(/\s+/)[1] === wanted);
+  const remoteRows = (ls.stdout || '').split('\n').map((line) => line.trim().split(/\s+/)).filter((parts) => parts.length >= 2 && parts[1] === wanted);
+  const hasRemote = remoteRows.length > 0;
   // ⭐ 원격에 그 이름의 브랜치가 **있으면** hex 이름이어도 브랜치다 — SHA 로 새지 않는다.
   // 원격이 "그런 브랜치 없다" 고 답했다 ⇒ 축약 hex 여도 모호하지 않다.
   if (!hasRemote) return asSha(false) ?? { checkout: base, freshness: 'local-only' };
+
+  // The branch name is never a freshness signal: skip only when the exact advertised commit exists.
+  const advertisedSha = remoteRows[0]?.[0] ?? '';
+  let releaseFetchLock: (() => void) | null = null;
+  let markerPath: string | null = null;
+  const logFetchSkip = (reason: 'sha-present' | 'coalesced', ageMs: number | null) => {
+    const runId = process.env.ELANOUS_RUN_ID;
+    debug.log('git-fs.worktree', 'base.fetch-skipped', {
+      base, branch: remoteBranch, sha: advertisedSha, reason, ageMs, ...(runId ? { runId } : {}),
+    });
+  };
+  // A shallow checkout may have this tip but still lack the requested depth=50
+  // history. Preserve the existing depth fetch there; optimize only known-full repos.
+  const shallowProbe = git('rev-parse', '--is-shallow-repository');
+  const shallowAnswer = shallowProbe.status === 0 ? (shallowProbe.stdout || '').trim() : '';
+  const shallow: boolean | 'unknown' = shallowAnswer === 'true' ? true : shallowAnswer === 'false' ? false : 'unknown';
+  if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(advertisedSha) && shallow === false) {
+    try {
+      const located = findGitDir(repoRoot);
+      if (located) {
+        const paths = baseFetchPaths(located.commonGitDir, remoteBranch);
+        markerPath = paths.marker;
+        const marker = readBaseFetchMarker(paths.marker);
+        if (marker.state === 'invalid') {
+          debug.log('git-fs.worktree', 'base.fetch-optimization-fallback', { base, reason: `marker-${marker.reason}` }, { level: 'warn' });
+          markerPath = null;
+        } else if (gitHasCommit(git, advertisedSha)) {
+          const recent = recentBaseFetch(paths.marker, remoteBranch, advertisedSha, Date.now());
+          logFetchSkip(recent.recent ? 'coalesced' : 'sha-present', recent.ageMs);
+          return { checkout: advertisedSha, freshness: 'remote-synced' };
+        }
+        // Serialize cache misses across linked worktrees/processes, then recheck after the lock.
+        releaseFetchLock = acquireBaseFetchLock(paths.lock);
+        if (releaseFetchLock) {
+          const markerAfterLock = readBaseFetchMarker(paths.marker);
+          if (markerAfterLock.state === 'invalid') {
+            debug.log('git-fs.worktree', 'base.fetch-optimization-fallback', { base, reason: `marker-${markerAfterLock.reason}` }, { level: 'warn' });
+            markerPath = null;
+          } else if (markerPath && gitHasCommit(git, advertisedSha)) {
+              const recent = recentBaseFetch(paths.marker, remoteBranch, advertisedSha, Date.now());
+              logFetchSkip(recent.recent ? 'coalesced' : 'sha-present', recent.ageMs);
+              releaseFetchLock();
+              releaseFetchLock = null;
+              return { checkout: advertisedSha, freshness: 'remote-synced' };
+          }
+        } else {
+          debug.log('git-fs.worktree', 'base.fetch-optimization-fallback', { base, reason: 'lock-timeout' }, { level: 'warn' });
+        }
+      } else {
+        debug.log('git-fs.worktree', 'base.fetch-optimization-fallback', { base, reason: 'git-dir-unavailable' }, { level: 'warn' });
+      }
+    } catch (error) {
+      // Cache/lock/marker failures retain the original fetch path.
+      debug.log('git-fs.worktree', 'base.fetch-optimization-fallback', {
+        base, reason: error instanceof Error ? error.name : 'unknown',
+      }, { level: 'warn' });
+      try { releaseFetchLock?.(); } catch { /* best effort */ }
+      releaseFetchLock = null;
+      markerPath = null;
+    }
+  }
 
   // ⭐ 얕은 저장소면 깊이를 묶는다 — 아니면 그 브랜치의 전 이력을 받느라 GIT_TIMEOUT_MS 를 넘긴다
   //    (Pod 클론은 `--depth 50` · 비-main base 런이 전부 여기서 SIGTERM 으로 죽었다). 받은 tip 에서 갈리므로
   //    이후 merge-base(HEAD ↔ 그 tip)는 tip 자체라 깊이 50 으로 족하다. 얕지 않으면 종전 인자 그대로다.
   //    probe 를 못 읽으면 종전 경로로 간다(값은 'unknown' 으로 관측에 남긴다).
-  const shallowProbe = git('rev-parse', '--is-shallow-repository');
-  const shallowAnswer = shallowProbe.status === 0 ? (shallowProbe.stdout || '').trim() : '';
-  const shallow: boolean | 'unknown' = shallowAnswer === 'true' ? true : shallowAnswer === 'false' ? false : 'unknown';
   const depth = shallow === true ? SHALLOW_BASE_FETCH_DEPTH : null;
   const fetchArgs = depth === null ? ['fetch', 'origin', wanted] : ['fetch', `--depth=${depth}`, 'origin', wanted];
-  const fetchStartedAt = Date.now();
-  // Only the no-runner fallback joins the shared retry seam; injected runners remain
-  // an exact test/caller seam with their prior command count.
-  const fetched = runner
-    ? git(...fetchArgs)
-    : runGitCommand(repoRoot, fetchArgs, { encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
-  const fetchMs = Date.now() - fetchStartedAt;
-  debug.log('git-fs.worktree', 'base.fetch', { base, shallow, depth, ms: fetchMs, ok: fetched.status === 0, signal: fetched.signal ?? null }, fetched.status === 0 ? undefined : { level: 'warn' });
-  if (fetched.status !== 0) {
-    // origin 에 있는 것을 확인했는데 못 가져왔다 ⇒ 낡은 로컬로 진행하면 조용히 틀린다.
-    // spawnSync 의 timeout 은 SIGTERM 으로 끝난다 — 「실패」와 「시간 초과」를 문면에서 가른다.
-    const timedOut = fetched.status === null && fetched.signal === 'SIGTERM';
-    const what = timedOut
-      ? `fetch timed out after ${GIT_TIMEOUT_MS / 1000}s (shallow=${shallow}${depth === null ? '' : `, depth=${depth}`})`
-      : 'fetch failed';
-    throw new Error(`git worktree base sync failed — origin/${remoteBranch} exists but ${what}: status=${fetched.status}, signal=${fetched.signal ?? 'none'}, stdout=${JSON.stringify((fetched.stdout || '').trim().slice(0, 200))}, stderr=${JSON.stringify((fetched.stderr || '').trim().slice(0, 200))}`);
+  try {
+    const fetchStartedAt = Date.now();
+    // Only the no-runner fallback joins the shared retry seam; injected runners remain
+    // an exact test/caller seam with their prior command count.
+    const fetched = runner
+      ? git(...fetchArgs)
+      : runGitCommand(repoRoot, fetchArgs, { encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
+    const fetchMs = Date.now() - fetchStartedAt;
+    debug.log('git-fs.worktree', 'base.fetch', { base, shallow, depth, ms: fetchMs, ok: fetched.status === 0, signal: fetched.signal ?? null }, fetched.status === 0 ? undefined : { level: 'warn' });
+    if (fetched.status !== 0) {
+      // origin 에 있는 것을 확인했는데 못 가져왔다 ⇒ 낡은 로컬로 진행하면 조용히 틀린다.
+      // spawnSync 의 timeout 은 SIGTERM 으로 끝난다 — 「실패」와 「시간 초과」를 문면에서 가른다.
+      const timedOut = fetched.status === null && fetched.signal === 'SIGTERM';
+      const what = timedOut
+        ? `fetch timed out after ${GIT_TIMEOUT_MS / 1000}s (shallow=${shallow}${depth === null ? '' : `, depth=${depth}`})`
+        : 'fetch failed';
+      throw new Error(`git worktree base sync failed — origin/${remoteBranch} exists but ${what}: status=${fetched.status}, signal=${fetched.signal ?? 'none'}, stdout=${JSON.stringify((fetched.stdout || '').trim().slice(0, 200))}, stderr=${JSON.stringify((fetched.stderr || '').trim().slice(0, 200))}`);
+    }
+    // ⭐ **가져온 것**에서 갈린다 — FETCH_HEAD 가 방금 받은 tip 이다.
+    const fetchedTip = git('rev-parse', '--verify', 'FETCH_HEAD^{commit}');
+    if (fetchedTip.status !== 0 || !(fetchedTip.stdout || '').trim()) {
+      throw new Error(`git worktree base sync failed — fetched origin/${base} but FETCH_HEAD is unreadable`);
+    }
+    const remoteSha = fetchedTip.stdout.trim();
+    if (markerPath && releaseFetchLock && remoteSha === advertisedSha) {
+      try { writeBaseFetchMarker(markerPath, { branch: remoteBranch, sha: remoteSha, fetchedAt: Date.now() }); }
+      catch { debug.log('git-fs.worktree', 'base.fetch-marker-write-failed', { base, sha: remoteSha }, { level: 'warn' }); }
+    }
+    const localRef = git('rev-parse', '--verify', `${base}^{commit}`);
+    const localSha = localRef.status === 0 ? (localRef.stdout || '').trim() : '';
+    if (localSha && localSha !== remoteSha) {
+      debug.log('git-fs.worktree', 'base.stale-local', { base, localSha: localSha.slice(0, 9), remoteSha: remoteSha.slice(0, 9) }, { level: 'warn' });
+    }
+    return { checkout: remoteSha, freshness: 'remote-synced' };
+  } finally {
+    try { releaseFetchLock?.(); } catch { /* best effort */ }
   }
-  // ⭐ **가져온 것**에서 갈린다(리뷰 must-fix ②) — ls-remote 로 먼저 읽은 SHA 를 쓰면 그 사이 원격이
-  //    전진했을 때 "원격 tip" 계약이 깨진다. FETCH_HEAD 가 방금 받은 tip 이다.
-  const fetchedTip = git('rev-parse', '--verify', 'FETCH_HEAD^{commit}');
-  if (fetchedTip.status !== 0 || !(fetchedTip.stdout || '').trim()) {
-    throw new Error(`git worktree base sync failed — fetched origin/${base} but FETCH_HEAD is unreadable`);
-  }
-  const remoteSha = fetchedTip.stdout.trim();
-  const localRef = git('rev-parse', '--verify', `${base}^{commit}`);
-  const localSha = localRef.status === 0 ? (localRef.stdout || '').trim() : '';
-  if (localSha && localSha !== remoteSha) {
-    debug.log('git-fs.worktree', 'base.stale-local', { base, localSha: localSha.slice(0, 9), remoteSha: remoteSha.slice(0, 9) }, { level: 'warn' });
-  }
-  return { checkout: remoteSha, freshness: 'remote-synced' };
 }
 
 /** Return the worktree that currently holds a branch named in git's add failure.
@@ -812,7 +1397,7 @@ export function createWorktree(opts: CreateWorktreeOpts, deps: WorktreeAddDeps =
       // ⭐ 재사용 — 트리를 **건드리지 않는다**(지우지도, 리셋하지도, base 를 다시 확정하지도 않는다).
       //   공통 의존성 링크만 idempotent 하게 다시 확인한다(없으면 걸고, 있으면 건너뛴다).
       debug.log('git-fs.worktree', 'add.branch-held-reused', { branch, worktreePath: branchHolder, owner: gate.owner }, { level: 'warn' });
-      const reusedLinks = linkWorktreeDependencies(repoRoot, branchHolder);
+      const reusedLinks = linkWorktreeDependencies(repoRoot, branchHolder, [], { sharedStoreRoot: deps.sharedDependencyStoreRoot });
       debug.log('git-fs.worktree', 'dependencies.linked', { branch, worktreePath: branchHolder, dependencyLinks: reusedLinks });
       if (opts.requireDependencies) prepareWorktreeDependencies(repoRoot, branchHolder, opts, deps);
       const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: branchHolder, encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
@@ -907,7 +1492,7 @@ export function createWorktree(opts: CreateWorktreeOpts, deps: WorktreeAddDeps =
   // ★ 공통 의존성 링크 — git worktree 는 untracked dependency directories를 공유하지 않는다.
   //   중앙 계획의 모든 위치를 symlink 해 worktree 가 즉시 실행 가능하게 한다(복사 아님·저비용·
   //   idempotent). fail-soft — 링크 실패해도 worktree 자체는 유효(caller 가 필요시 install).
-  const dependencyLinks = linkWorktreeDependencies(repoRoot, wtPath);
+  const dependencyLinks = linkWorktreeDependencies(repoRoot, wtPath, [], { sharedStoreRoot: deps.sharedDependencyStoreRoot });
   debug.log('git-fs.worktree', 'dependencies.linked', { branch, worktreePath: wtPath, dependencyLinks });
   if (opts.requireDependencies) {
     try { prepareWorktreeDependencies(repoRoot, wtPath, opts, deps); }

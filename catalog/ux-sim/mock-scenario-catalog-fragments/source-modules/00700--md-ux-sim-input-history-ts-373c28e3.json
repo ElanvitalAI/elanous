@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-INPUT-HISTORY-TS",
+  "path": "src/ux-sim/input-history.ts",
+  "boundary": "Creates and inspects isolated temporary input-history state to verify queued records and temp-directory containment.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

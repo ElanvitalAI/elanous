@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { appendRunLedgerEntry, runLedgerDir } from '../../self-implement/run-ledger.js';
 import { packageVersion } from '../../version/code-revision.js';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 import { podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 import { POD_LAUNCH_FINISHED_EVENT, POD_LAUNCH_STARTED_EVENT, readPodLaunchHistory } from './pod-launch-history.js';
 

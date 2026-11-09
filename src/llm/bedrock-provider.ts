@@ -6,7 +6,7 @@
 //   호출 때 동적 import 한다 — llm.ts 가 이 모듈을 정적으로 import 해도 로드 순서가 꼬이지 않는다.
 
 import type { LLMProvider } from '../llm.js';
-import type { LLMConfig as UCLLMConfig } from '../user-config.js';
+import type { LLMConfig as UCLLMConfig } from '../user-config/types.js';
 import { debug, redactSecrets } from '../debug/log.js';
 import { ApiHttpError, fetchApiWithRetry, type FetchApiWithRetryOpts } from '../session-runtime/retry-api.js';
 import { isVisionCapableModel } from '../llm-vision-capability.js';

@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-WORLD-TS",
+  "path": "src/ux-sim/world.ts",
+  "boundary": "Parses world YAML, resolves catalog devices, assembles their fakes, and runs scheduled injections through the production event writer under the isolated test root.",
+  "deviceIds": [
+    "world-runtime",
+    "sim-mailbox"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

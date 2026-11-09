@@ -17,8 +17,8 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SPAWN_SYNC_MAX_BUFFER } from '../../util/spawn-sync-output.js';
 import { debug } from '../../debug/log.js';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../util/spawn-sync-output.js';
 import { memberHasRegistry, registryImageRef, syncPoolImages, parsePodPool, type PodPoolMember, type RemoteRun } from './pod-pool.js';
 
 const POD_IMAGE = 'elanous-harness';
@@ -120,12 +120,27 @@ export async function putPodShelfImage(ref: string, pool: string, deps: {
       ...(deps.sync ? {} : { ship: () => ({ ok: false, action: 'failed' as const, detail: 'shelf build failed; local image fallback prohibited' }) }),
       remoteBuild: deps.sync ? undefined : async (host, cluster, registry) => {
         const { spawn } = await import('node:child_process');
+        const { getUserConfig } = await import('../../user-config.js');
+        const registryTagKeep = getUserConfig().harness?.registryTagKeep;
         return new Promise((done) => {
-          const child = spawn('bash', [join(dir, 'docker/harness/build.sh')], { env: { ...process.env, ELANOUS_BUILD_REMOTE: host, ELANOUS_L2_CLUSTER: cluster, ...(registry ? { ELANOUS_BUILD_REGISTRY: registry } : {}) }, stdio: ['ignore', 'pipe', 'pipe'] });
+          const child = spawn('bash', [join(dir, 'docker/harness/build.sh')], { env: { ...process.env, ELANOUS_BUILD_REMOTE: host, ELANOUS_L2_CLUSTER: cluster, ...(registry ? { ELANOUS_BUILD_REGISTRY: registry } : {}), ...(registryTagKeep !== undefined ? { ELANOUS_BUILD_REGISTRY_TAG_KEEP: String(registryTagKeep) } : {}) }, stdio: ['ignore', 'pipe', 'pipe'] });
           let output = '';
           child.stdout.on('data', (chunk) => { output += chunk; });
           child.stderr.on('data', (chunk) => { output += chunk; });
-          child.on('close', (code) => done({ ok: code === 0, detail: output.slice(-300) }));
+          child.on('close', (code) => {
+            const line = output.split(/\r?\n/u).reverse().find((value) => value.startsWith('[registry-gc] '));
+            if (line) {
+              const field = (name: string): string | null => new RegExp(`(?:^|\\s)${name}=([^\\s]+)`, 'u').exec(line)?.[1] ?? null;
+              const reclaimed = field('reclaimed_bytes');
+              debug.log('pod.pool', 'registry-tag-gc', {
+                host, image: 'elanous-harness', deletedTags: Number(field('deleted_tags')) || 0,
+                preservedTags: Number(field('preserved_tags')) || 0,
+                reclaimedBytes: reclaimed && /^\d+$/u.test(reclaimed) ? Number(reclaimed) : null,
+                skipped: field('reason'),
+              });
+            }
+            done({ ok: code === 0, detail: output.slice(-300) });
+          });
           child.on('error', (error) => done({ ok: false, detail: error.message }));
         });
       },

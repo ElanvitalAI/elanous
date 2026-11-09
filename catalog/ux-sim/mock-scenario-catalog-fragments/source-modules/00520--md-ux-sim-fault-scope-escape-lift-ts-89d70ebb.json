@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAULT-SCOPE-ESCAPE-LIFT-TS",
+  "path": "src/ux-sim/fault-scope-escape-lift.ts",
+  "boundary": "Builds child-result fixtures for abandoned, scope-stop and implementation-deficit classifications to test production result lifting.",
+  "deviceIds": [
+    "fault-injection"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

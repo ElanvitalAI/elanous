@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-READINESS-COUNTDOWN-TS",
+  "path": "src/ux-sim/readiness-countdown.ts",
+  "boundary": "Replays readiness events, holds, ETA changes and T-minus host reservation from injected inputs without wall time or external I/O.",
+  "deviceIds": [
+    "readiness-countdown"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -39,7 +39,7 @@ test('world coverage records private per-run paths, events and device fingerprin
     expect(result.receipt.devices.some((device) => device.id === 'fake-github')).toBe(false);
     expect(result.receipt.devices.some((device) => device.id === 'world-runtime')).toBe(false);
     expect(result.receipt.codePaths).toContain('src/ux-sim/fake-clock.ts');
-    expect(result.receipt.codePaths).toContain('src/ux-sim/mock-scenario-catalog.json');
+    expect(result.receipt.codePaths).toContain('src/ux-sim/mock-scenario-catalog.ts');
     expect(result.receipt.codePaths).not.toContain('src/cli/sim-cli.ts');
     expect(result.receipt.codePathCoveragePercent).toBeGreaterThan(0);
     expect(result.report.runCount).toBe(1);
@@ -75,7 +75,7 @@ test('failed uncovered-path request does not persist a successful world receipt'
       catalog: {
         ...catalog,
         sourceModules: [{
-          id: 'missing-owner-module', path: 'src/ux-sim/mock-scenario-catalog.json',
+          id: 'missing-owner-module', path: 'src/ux-sim/mock-scenario-catalog.ts',
           boundary: 'test failure path', deviceIds: ['missing-device'],
           integrityCertificatePresent: false, integrityCertificatePath: null,
         }],
@@ -98,7 +98,7 @@ test('device fingerprint changes when a catalog implementation path omitted from
     setTestStateRoot(stateRoot);
     mkdirSync(join(repoRoot, 'src/ux-sim'), { recursive: true });
     mkdirSync(join(repoRoot, 'scripts'), { recursive: true });
-    writeFileSync(join(repoRoot, 'src/ux-sim/mock-scenario-catalog.json'), '{"version":1}\n');
+    writeFileSync(join(repoRoot, 'src/ux-sim/mock-scenario-catalog.ts'), 'export const version = 1;\n');
     const omittedImplementationPath = join(repoRoot, 'scripts/ux-sim.ts');
     writeFileSync(omittedImplementationPath, 'export const version = 1;\n');
 
@@ -107,10 +107,10 @@ test('device fingerprint changes when a catalog implementation path omitted from
     const fixtureCatalog = {
       ...catalog,
       devices: catalog.devices.map((device) => device.id === scenarioRunner.id
-        ? { ...device, implementation: ['src/ux-sim/mock-scenario-catalog.json', 'scripts/ux-sim.ts'] }
+        ? { ...device, implementation: ['src/ux-sim/mock-scenario-catalog.ts', 'scripts/ux-sim.ts'] }
         : device),
       sourceModules: [{
-        id: 'scenario-runner-catalog', path: 'src/ux-sim/mock-scenario-catalog.json',
+        id: 'scenario-runner-catalog', path: 'src/ux-sim/mock-scenario-catalog.ts',
         boundary: 'coverage fixture', deviceIds: [scenarioRunner.id],
         integrityCertificatePresent: false, integrityCertificatePath: null,
       }],

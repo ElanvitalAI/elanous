@@ -7,6 +7,7 @@ import { gateAppendReceiptCostsFromLedger, planPartialRegate, selectGateAppendRe
 const simple = {
   changedFiles: ['src/changed.test.ts'],
   radiusFiles: ['src/changed.test.ts'],
+  closureOpaque: false,
 };
 
 test('GATE-APPEND-RADIUS-RECHECK sim: one changed test file takes append-recheck without a numeric radius cap', () => {

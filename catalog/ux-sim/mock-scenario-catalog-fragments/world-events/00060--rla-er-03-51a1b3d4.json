@@ -1,0 +1,5 @@
+{
+  "id": "RLA-ER-03",
+  "name": "Stale generated artifact",
+  "description": "Measure detection and regeneration commit behavior."
+}

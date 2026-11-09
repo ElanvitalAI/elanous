@@ -7,11 +7,15 @@ import { dlopen, read, type Pointer } from 'bun:ffi';
 import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { debug } from '../../debug/log.js';
+import { listSchedules } from '../../release-loop/release-schedule.js';
+import { allocatePodPhaseCandidates, resolvePodPhasePlan, podPhaseGateIdentityMatches,
+  type PodKind, type PodPhasePrewarmConfig } from './pod-warm-switch.js';
 import { getUserConfig } from '../../user-config.js';
 import { resolveWarmPoolProfile, resolveWarmPoolQuota, type WarmPoolProfile, type WarmPoolTier } from '../../self-implement/pod-warm-pool-profile.js';
 import { WarmPodTransport, probeWarmPodContext, probeWarmPodRuntimeContract, imageReferencesDifferOnlyByDigest, warmWorkerPodManifest, type WarmPodSpec, type WarmPodTransportResult } from './pod-warm-worker-pod.js';
-import type { WarmWorkerCommand } from './pod-warm-worker-protocol.js';
+import { parseWarmWorkerReply, type WarmWorkerCommand } from './pod-warm-worker-protocol.js';
 import { runtimeArchitecturesMatch, type RuntimeIdentityInput } from '../../runtime-identity.js';
+import { resolveWarmPodPhasePlan, selectWarmPodPhaseCandidates, type WarmPodPhasePlan, type WarmPodPhaseSchedule } from './pod-warm-switch.js';
 import { patchWarmLeaseMetadata, scoreWarmPodCandidates, warmLeaseMetadata, type WarmPodKind } from './pod-warm-provenance.js';
 import type { LogStore } from '../../mss/logging/log-store.js';
 
@@ -70,6 +74,8 @@ export interface WarmPodProviderOptions {
   /** Only the trusted producer host has these credentials; consumers may omit them. */
   machineTokens?: Readonly<Record<string, string>>;
   profileConfig?: unknown;
+  /** Release calendar and phase targets are read from the same private provider config. */
+  phaseSchedule?: WarmPodPhaseSchedule;
   /** Optional multi-arch image policy. Omitted means exact runtime architecture only. */
   allowedArchitectures?: readonly ('amd64' | 'arm64')[];
   /** Trusted target tuple; absent or malformed identity disables reuse. */
@@ -86,6 +92,8 @@ export interface WarmPodProviderOptions {
   prepareLockDirectory?: string;
   /** Private durable slot-generation file. Set by loadWarmPodProvider for production reconciliation. */
   rotationStatePath?: string;
+  /** Private durable phase fence shared by the reconciler and replay processes. */
+  phaseFenceStatePath?: string;
   /** Test-only loopback API endpoint for exercising the production DeleteOptions request. */
   kubectlProxyUrlForTest?: string;
   /** Test-only quota resolver injection; omitted keeps the production measured-host table. */
@@ -100,6 +108,10 @@ export interface WarmPodProviderOptions {
   pairingGateFile?: string;
   /** Test-only correlation for isolated reconcile simulations. */
   observationRunIdForTest?: string;
+  /** Test-only deterministic release phase inputs; production reads config and release ledger. */
+  phasePrewarmForTest?: PodPhasePrewarmConfig;
+  releaseSchedulesForTest?: readonly import('../../release-loop/release-schedule.js').ReleaseSchedule[];
+  scheduleLookupErrorForTest?: boolean;
 }
 type WarmPodProviderRuntimeOverrides = Pick<WarmPodProviderOptions, 'controlUrl' | 'fetch' | 'kubectl' | 'prepareLockDirectory'>;
 export interface WarmPodProviderLoadOptions {
@@ -309,11 +321,19 @@ export class WarmPodProvider {
   /** While quarantine is settling, reject only that Pod incarnation after acquisition. */
   private readonly quarantiningPods = new Set<string>();
   private readonly standingWorkers = new Map<string, Promise<boolean>>();
+  private lastPhaseObservationKey = '';
+  /** Failed gate prewarms stay unavailable through the gate window for the same immutable cut identity. */
+  private readonly phasePrepareFailures = new Map<string, string>();
+  private phaseGateIdentityKey = '';
   /** This instance's prepare-lease flock binding; null means the platform cannot lock and every slot fails. */
   private readonly prepareFlock: WarmPrepareFlock | null;
   /** Quarantine-state synchronization uses the real platform lock, independent of prepare test injection. */
   private readonly quarantineStateFlock: WarmPrepareFlock | null;
   private readonly quotaResolver: typeof resolveWarmPoolQuota;
+  private readonly configuredDrainingHosts = new Set<string>();
+  private readonly phaseUnavailableHosts = new Set<string>();
+  private readonly phaseFenceStatePath?: string;
+  private phaseFencePersistenceFailed = false;
   constructor(private readonly options: WarmPodProviderOptions) {
     const url = new URL(options.controlUrl);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash
@@ -324,11 +344,20 @@ export class WarmPodProvider {
         || new Set(options.allowedArchitectures).size !== options.allowedArchitectures.length))
       throw new Error('invalid warm Pod allowed architectures');
     this.quotaResolver = options.quotaResolverForTest ?? resolveWarmPoolQuota;
+    this.phaseFenceStatePath = options.phaseFenceStatePath;
+    for (const host of options.drainingHosts ?? []) this.configuredDrainingHosts.add(host);
     const profile = resolveWarmPoolProfile(options.profileConfig ?? getUserConfig());
     this.profile = profile;
     const templates = options.poolTemplates ?? [];
-    if (new Set(templates.map(candidate => `${candidate.host}/${candidate.tier}`)).size !== templates.length)
-      throw new Error('duplicate warm pool template');
+    const templateKinds = new Map<string, Set<PodKind | undefined>>();
+    for (const candidate of templates) {
+      const slot = `${candidate.host}/${candidate.tier}`;
+      const kinds = templateKinds.get(slot) ?? new Set<PodKind | undefined>();
+      if (kinds.has(candidate.kind) || kinds.has(undefined) || candidate.kind === undefined && kinds.size > 0)
+        throw new Error('duplicate warm pool template kind or untyped host/tier slot');
+      kinds.add(candidate.kind);
+      templateKinds.set(slot, kinds);
+    }
     const templateSlots = templates.map(candidate => {
       const measuredQuota = this.quotaResolver(profile, candidate.host, candidate.tier);
       if (!Number.isSafeInteger(measuredQuota) || measuredQuota < 1) throw new Error('unmeasured warm pool template');
@@ -351,9 +380,9 @@ export class WarmPodProvider {
         host: candidate.host, tier: candidate.tier, ...(candidate.kind ? { kind: candidate.kind } : {}),
         spec: {
           ...candidate.spec,
-          name: `warm-${candidate.host}-${candidate.tier}-${index + 1}`,
+          name: `warm-${candidate.host}-${candidate.tier}-${candidate.kind ? `${candidate.kind}-` : ''}${index + 1}`,
           // The template worker ID is a generation token. Rotate it when a slot is quarantined.
-          workerId: `${candidate.spec.workerId}-${candidate.tier}-${index + 1}`,
+          workerId: `${candidate.spec.workerId}-${candidate.kind ? `${candidate.kind}-` : ''}${candidate.tier}-${index + 1}`,
         },
       }));
     });
@@ -403,7 +432,20 @@ export class WarmPodProvider {
     });
     let value: any = null;
     try { value = await response.json(); } catch { /* A missing body is a failed admission. */ }
+    if (response.status === 404 || response.status === 503) {
+      const runId = typeof body?.runId === 'string' ? body.runId : this.observationRunId();
+      debug.log('pod.warm.provider', 'control-http-failure', { runId, method: body ? 'POST' : 'GET', path,
+        status: response.status }, { level: 'warn' });
+    }
     return { status: response.status, value };
+  }
+
+  private syncPhaseFailureScope(plan?: WarmPodPhasePlan): void {
+    const key = plan?.gateIdentity ? JSON.stringify(plan.gateIdentity) : '';
+    if (key !== this.phaseGateIdentityKey) {
+      this.phasePrepareFailures.clear();
+      this.phaseGateIdentityKey = key;
+    }
   }
 
   private async controlBounded(path: string, credential: string, body: Record<string, unknown> | undefined,
@@ -747,6 +789,37 @@ export class WarmPodProvider {
     }
   }
 
+  private readPhaseFence(): Set<string> {
+    const path = this.phaseFenceStatePath;
+    if (!path || !existsSync(path)) throw new Error('warm phase fence state unavailable');
+    const info = lstatSync(path);
+    const uid = typeof process.getuid === 'function' ? process.getuid() : userInfo().uid;
+    if (!info.isFile() || info.isSymbolicLink() || info.uid !== uid || (info.mode & 0o077) !== 0)
+      throw new Error('unsafe warm phase fence state');
+    const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+      || (parsed as { schema?: unknown }).schema !== 1
+      || !Array.isArray((parsed as { workerIds?: unknown }).workerIds)
+      || (parsed as { workerIds: unknown[] }).workerIds.some(id => typeof id !== 'string' || !workerId(id)))
+      throw new Error('invalid warm phase fence state');
+    return new Set((parsed as { workerIds: string[] }).workerIds);
+  }
+
+  private writePhaseFence(workerIds: readonly string[]): void {
+    const path = this.phaseFenceStatePath;
+    if (!path) return;
+    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(temporary, JSON.stringify({ schema: 1, workerIds: [...new Set(workerIds)].sort() }),
+      { mode: 0o600, flag: 'wx' });
+    try {
+      const temporaryFd = openSync(temporary, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      try { fsyncSync(temporaryFd); } finally { closeSync(temporaryFd); }
+      renameSync(temporary, path);
+      const directoryFd = openSync(dirname(path), constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
+      try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); }
+    } catch (error) { rmSync(temporary, { force: true }); throw error; }
+  }
+
   private async deletePodWithUid(spec: WarmPodSpec, uid: string): Promise<boolean> {
     const deleteOptions: WarmPodDeleteOptions = {
       apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid },
@@ -1065,31 +1138,33 @@ export class WarmPodProvider {
   }
 
   /** Retire only a ledger-idle Pod whose UID still matches; active work is left for normal finalize. */
-  private async retireDrainedWorker(candidate: WarmWorkerCandidate): Promise<void> {
+  private async retireDrainedWorker(candidate: WarmWorkerCandidate): Promise<boolean> {
     const { host } = candidate;
     const spec = this.runtimeSpec(candidate);
     this.observedPodUids.delete(spec.workerId);
     const credential = this.options.machineTokens?.[host];
-    if (!token(credential) || !this.options.rotationStatePath) return;
+    if (!token(credential) || !this.options.rotationStatePath) return false;
     const kubectl = (args: readonly string[]) => this.options.kubectl
       ? this.options.kubectl(['--context', spec.kubectlContext, '-n', spec.namespace, ...args])
       : spawnSync('kubectl', ['--context', spec.kubectlContext, '-n', spec.namespace, ...args],
         { encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
     const pod = kubectl(['get', 'pod', spec.name, '-o', 'json']);
-    if (pod.status !== 0) return;
+    if (pod.status !== 0) return /notfound|not found/i.test(pod.stderr);
     let value: any;
-    try { value = JSON.parse(pod.stdout); } catch { return; }
+    try { value = JSON.parse(pod.stdout); } catch { return false; }
     const uid = value?.metadata?.uid;
-    if (typeof uid !== 'string' || !uid) return;
+    if (typeof uid !== 'string' || !uid) return false;
     this.observedPodUids.set(spec.workerId, uid);
     const retired = await this.controlBounded(`/v1/leases/pod-worker/${encodeURIComponent(spec.workerId)}/retire`,
       credential, { podUid: uid }, WARM_CONTROL_REQUEST_TIMEOUT_MS);
-    if (retired.status !== 200) return; // leased, stale UID, or control-plane uncertainty: never delete.
+    if (retired.status !== 200) return false; // leased, stale UID, or control-plane uncertainty: never delete.
     const reapCandidate = { ...candidate, spec };
     if (await this.reapQuarantinedWorker(reapCandidate)) {
       this.observedImagePins.delete(spec.workerId);
       candidate.spec = { ...candidate.spec, workerId: reapCandidate.spec.workerId };
+      return true;
     }
+    return false;
   }
 
   private async coldPrepare(candidate: WarmWorkerCandidate,
@@ -1116,7 +1191,8 @@ export class WarmPodProvider {
       ? configured.spec.name.slice(prefix.length + 1) : '';
     if (!configured || !configured.spec.nodeName
       || (configured.spec.name !== prefix && !/^[1-9][0-9]*$/.test(suffix)
-        && !/^(lite|standard)-[1-9][0-9]*$/.test(suffix))
+        && !/^(lite|standard)-[1-9][0-9]*$/.test(suffix)
+        && !/^(lite|standard)-(gate|implementation)-[1-9][0-9]*$/.test(suffix))
       || candidate.spec.name !== configured.spec.name || candidate.spec.nodeName !== configured.spec.nodeName)
       return fail('slot-validation', 'candidate-mismatch');
     throwIfPrepareAborted(signal);
@@ -1547,20 +1623,98 @@ export class WarmPodProvider {
   /** One bounded reconciliation pass. Failed slots stay unavailable until a fresh worker ID is configured. */
   async reconcilePool(): Promise<WarmPoolReconcileResult> {
     this.refreshQuarantineState();
+    const startedAt = this.now();
+    const rawPodConfig = getUserConfig().pod as Record<string, unknown> | undefined;
+    const phaseConfig = this.options.phasePrewarmForTest ?? rawPodConfig?.phasePrewarm as PodPhasePrewarmConfig | undefined;
+    let prewarmPlan = null as ReturnType<typeof resolvePodPhasePlan> | null;
+    let phaseFailure: string | undefined;
+    if (phaseConfig) {
+      try {
+        if (this.options.scheduleLookupErrorForTest) throw new Error('injected-schedule-lookup-failure');
+        prewarmPlan = resolvePodPhasePlan(this.options.releaseSchedulesForTest ?? listSchedules(), startedAt, phaseConfig);
+      }
+      catch (error) { phaseFailure = error instanceof Error ? error.message : String(error); }
+    }
+    if (phaseConfig && !prewarmPlan) for (const candidate of this.candidates) this.phaseUnavailableHosts.add(candidate.host);
+    else this.phaseUnavailableHosts.clear();
+    this.options.drainingHosts = [...new Set([...this.configuredDrainingHosts, ...this.phaseUnavailableHosts])];
     const failed: string[] = [];
     let ready = 0;
+    const prewarmStartedAt = this.now();
+    let phasePlan: WarmPodPhasePlan | undefined;
+    let phaseCandidates = this.candidates;
+    if (this.options.phaseSchedule) {
+      try {
+        phasePlan = resolveWarmPodPhasePlan(this.now(), this.options.phaseSchedule);
+        this.syncPhaseFailureScope(phasePlan);
+        phaseCandidates = selectWarmPodPhaseCandidates(this.candidates, phasePlan, candidate =>
+          !this.options.drainingHosts?.includes(candidate.host)
+          && !this.quarantineBlockedWorkerIds.has(candidate.spec.workerId));
+      } catch (error) {
+        this.syncPhaseFailureScope(undefined);
+        phaseCandidates = [];
+        debug.log('task-orchestrator.pod-phase', 'schedule-invalid', {
+          reason: error instanceof Error ? error.message : String(error), fallback: 'cold-start',
+        }, { level: 'warn' });
+      }
+    }
     const occupancyRows: { candidate: WarmWorkerCandidate; prepared: boolean; podUid: string | null }[] = [];
-    const available = this.warmReuseDisabled ? [] : this.candidates.filter(candidate => !this.options.drainingHosts?.includes(candidate.host)
+    const kindOf = (candidate: WarmWorkerCandidate): PodKind => candidate.kind ?? (this.profile === 'gate' ? 'gate' : 'implementation');
+    const fallbackTarget = phaseConfig
+      ? prewarmPlan?.target ?? resolvePodPhasePlan([], startedAt, phaseConfig).target
+      : undefined;
+    const nonDraining = phaseCandidates.filter(candidate => !this.options.drainingHosts?.includes(candidate.host)
       && !this.quarantineBlockedWorkerIds.has(candidate.spec.workerId));
-    for (const candidate of this.candidates.filter(row => this.options.drainingHosts?.includes(row.host)
-      || this.warmReuseDisabled || this.quarantineBlockedWorkerIds.has(row.spec.workerId))) {
+    const phaseAssignments = phaseConfig
+      ? prewarmPlan ? allocatePodPhaseCandidates(nonDraining.map(candidate => ({ candidate,
+        kind: candidate.kind, cutSha: candidate.spec.cutSha, lockHash: candidate.spec.key.lockHash })), fallbackTarget!, phaseConfig)
+        .map(row => ({ candidate: row.candidate.candidate, kind: row.kind })) : []
+      : null;
+    const phased = phaseAssignments ? phaseAssignments.map(row => row.candidate) : nonDraining;
+    const assignedKind = new Map(phaseAssignments?.map(row => [row.candidate.spec.workerId, row.kind] as const) ?? []);
+    const effectiveKind = (candidate: WarmWorkerCandidate): PodKind => assignedKind.get(candidate.spec.workerId) ?? kindOf(candidate);
+    const selected = new Set(phased.map(candidate => candidate.spec.workerId));
+    if (phaseConfig) {
+      try {
+        // Fence every slot before preparation; a second process sees cold until
+        // the complete phase target has been prepared and explicitly admitted.
+        this.writePhaseFence(this.candidates.map(row => row.spec.workerId));
+        this.phaseFencePersistenceFailed = false;
+      } catch (error) {
+        this.phaseFencePersistenceFailed = true;
+        failed.push(`phase-fence-state-unavailable:${error instanceof Error ? error.message : String(error)}`);
+        for (const candidate of this.candidates) this.phaseUnavailableHosts.add(candidate.host);
+        this.options.drainingHosts = [...new Set([...this.configuredDrainingHosts, ...this.phaseUnavailableHosts])];
+      }
+    } else {
+      try { this.writePhaseFence([]); this.phaseFencePersistenceFailed = false; }
+      catch (error) { this.phaseFencePersistenceFailed = true;
+        failed.push(`phase-fence-state-unavailable:${error instanceof Error ? error.message : String(error)}`); }
+    }
+    const unavailable = this.candidates.filter(row => this.phaseFencePersistenceFailed
+      || this.options.drainingHosts?.includes(row.host)
+      || this.warmReuseDisabled || this.quarantineBlockedWorkerIds.has(row.spec.workerId)
+      || !selected.has(row.spec.workerId));
+    const available = this.phaseFencePersistenceFailed || this.warmReuseDisabled ? [] : phased;
+    for (const candidate of unavailable) {
       if (this.warmReuseDisabled || this.quarantineBlockedWorkerIds.has(candidate.spec.workerId)) {
         failed.push(candidate.spec.workerId);
         occupancyRows.push({ candidate, prepared: false, podUid: this.observedPodUids.get(candidate.spec.workerId) ?? null });
         continue;
       }
-      try { await this.retireDrainedWorker(candidate); }
+      try {
+        const retired = await this.retireDrainedWorker(candidate);
+        if (!retired && ((prewarmPlan && !this.configuredDrainingHosts.has(candidate.host) && !this.phaseUnavailableHosts.has(candidate.host)
+          && !selected.has(candidate.spec.workerId)) || this.phaseUnavailableHosts.has(candidate.host))) {
+          failed.push(`phase-retire-unconfirmed:${candidate.spec.workerId}`);
+          debug.log('task-orchestrator.pod-phase', 'retire-unconfirmed', { phase: prewarmPlan?.phase ?? 'schedule-unavailable',
+            workerId: candidate.spec.workerId, kind: candidate.kind ?? 'shared', reason: 'uid-pinned-retire-not-confirmed' }, { level: 'warn' });
+        }
+      }
       catch (error) {
+        if ((prewarmPlan && !this.configuredDrainingHosts.has(candidate.host) && !this.phaseUnavailableHosts.has(candidate.host)
+          && !selected.has(candidate.spec.workerId)) || this.phaseUnavailableHosts.has(candidate.host))
+          failed.push(`phase-retire-unconfirmed:${candidate.spec.workerId}`);
         debug.log('pod.warm.provider', 'drain-retire-deferred', { host: candidate.host,
           workerId: candidate.spec.workerId,
           reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
@@ -1584,6 +1738,7 @@ export class WarmPodProvider {
           ]) };
       }
       if (prepared) {
+        this.phasePrepareFailures.delete(candidate.spec.workerId);
         const clusterState = this.readClusterQuarantineState(candidate);
         if (clusterState === 'quarantined' || clusterState === 'unavailable') {
           prepared = false;
@@ -1600,6 +1755,9 @@ export class WarmPodProvider {
       if (prepared) ready++;
       else {
         failed.push(candidate.spec.workerId);
+        if (phasePlan?.gateIdentity && (phasePlan.phase === 'gate-prewarm' || phasePlan.phase === 'gate')
+          && (candidate.kind ?? 'gate') === 'gate')
+          this.phasePrepareFailures.set(candidate.spec.workerId, decision?.reason ?? 'prepare-refused');
         debug.log('pod.warm.provider', 'prepare-refused', { reason: decision?.reason ?? 'decision-unavailable',
           host: candidate.host, slot: candidate.spec.workerId,
           ...(this.options.observationRunIdForTest ? { runId: this.options.observationRunIdForTest } : {}) }, { level: 'warn' });
@@ -1614,8 +1772,65 @@ export class WarmPodProvider {
         host: candidate.host, tier: candidate.tier, workerId: candidate.spec.workerId,
         pod: candidate.spec.name, ready: prepared }, { level: prepared ? 'info' : 'warn' });
     }
-    const target = this.candidates.filter(candidate => !this.options.drainingHosts?.includes(candidate.host)).length;
-    const result = { profile: this.profile, target, ready, failed };
+    const plannedTarget = phasePlan ? Object.values(phasePlan.targets).reduce((sum, count) => sum + (count ?? 0), 0) : undefined;
+    if (plannedTarget !== undefined && phaseCandidates.length < plannedTarget)
+      failed.push(`phase-target-unconfigured:${plannedTarget - phaseCandidates.length}`);
+    const desiredTarget = fallbackTarget ? fallbackTarget.gate + fallbackTarget.implementation
+      : plannedTarget ?? this.candidates.filter(candidate => !this.options.drainingHosts?.includes(candidate.host)).length;
+    if (phaseConfig && !prewarmPlan) failed.push('phase-schedule-unavailable:cold-fallback');
+    if (phaseConfig) for (const kind of ['gate', 'implementation'] as const) {
+      const assignedCount = phaseAssignments?.filter(row => row.kind === kind).length ?? 0;
+      if (assignedCount < fallbackTarget![kind]) {
+        if (kind === 'gate' && fallbackTarget!.gate > 0) {
+          const exactCount = nonDraining.filter(candidate => podPhaseGateIdentityMatches({ cutSha: candidate.spec.cutSha,
+            lockHash: candidate.spec.key.lockHash }, phaseConfig)).length;
+          if (!phaseConfig.gateIdentity?.cutSha || !phaseConfig.gateIdentity.lockHash)
+            failed.push(`phase-gate-identity-unconfigured:${assignedCount}/${fallbackTarget![kind]}`);
+          else if (nonDraining.length > exactCount) failed.push(`phase-gate-identity-mismatch:${assignedCount}/${fallbackTarget![kind]}`);
+          else failed.push(`phase-target-unmet:gate:${assignedCount}/${fallbackTarget![kind]}`);
+        } else failed.push(`phase-target-unmet:${kind}:${assignedCount}/${fallbackTarget![kind]}`);
+      }
+    }
+    if (phaseConfig && !this.phaseFencePersistenceFailed && failed.length === 0 && ready === desiredTarget) {
+      try { this.writePhaseFence(this.candidates.filter(row => !selected.has(row.spec.workerId)).map(row => row.spec.workerId)); }
+      catch (error) {
+        this.phaseFencePersistenceFailed = true;
+        failed.push(`phase-fence-state-unavailable:${error instanceof Error ? error.message : String(error)}`);
+        for (const candidate of this.candidates) this.phaseUnavailableHosts.add(candidate.host);
+        this.options.drainingHosts = [...new Set([...this.configuredDrainingHosts, ...this.phaseUnavailableHosts])];
+      }
+    }
+    const result = { profile: this.profile,
+      target: desiredTarget, ready, failed };
+    if (prewarmPlan) {
+      const actual = { gate: 0, implementation: 0 };
+      for (const row of occupancyRows) if (row.prepared) actual[effectiveKind(row.candidate)]++;
+      debug.log('task-orchestrator.pod-phase', 'reconcile', { phase: prewarmPlan.phase,
+      version: prewarmPlan.version, target: prewarmPlan.target, actual,
+      prewarmMs: Math.max(0, this.now() - startedAt), cutAt: prewarmPlan.cutAt,
+      ...(prewarmPlan.phase === 'cut-gate' && (!phaseConfig?.gateIdentity?.cutSha || !phaseConfig.gateIdentity.lockHash)
+        ? { reason: 'gate-identity-unconfigured:cold-fallback' } : {}),
+      ...(failed.length ? { reason: `prewarm-failed:${failed.join(',')}` } : {}),
+      }, { level: failed.length ? 'warn' : 'info' });
+    } else if (phaseConfig) {
+      const actual = { gate: 0, implementation: ready };
+      debug.log('task-orchestrator.pod-phase', 'reconcile', { phase: 'schedule-unavailable', target: fallbackTarget,
+        actual, prewarmMs: Math.max(0, this.now() - startedAt),
+        reason: `schedule-unavailable:cold-fallback:${phaseFailure ?? 'unknown'}` }, { level: 'warn' });
+    }
+    if (phasePlan) {
+      const target = plannedTarget ?? 0;
+      const actual = Object.fromEntries(['gate', 'implementation'].map(kind => [kind,
+        occupancyRows.filter(row => (row.candidate.kind ?? 'gate') === kind && row.prepared).length]));
+      const observationKey = JSON.stringify({ ...phasePlan, target });
+      if (observationKey !== this.lastPhaseObservationKey) {
+        this.lastPhaseObservationKey = observationKey;
+        debug.log('task-orchestrator.pod-phase', 'target', { phase: phasePlan.phase, target: phasePlan.targets,
+          actual, prewarmDurationMs: Math.max(0, this.now() - prewarmStartedAt),
+          ...(failed.length ? { reason: [...this.phasePrepareFailures.values()][0] ?? failed[0] } : {}) },
+        { level: failed.length ? 'warn' : 'info' });
+      }
+    }
     debug.log('pod.warm', 'pool-reconcile', result, { level: failed.length ? 'warn' : 'info' });
     await this.logPoolOccupancy(occupancyRows);
     return result;
@@ -1630,17 +1845,64 @@ export class WarmPodProvider {
       || !input.files.length || !Number.isFinite(input.deadlineAt) || input.deadlineAt <= this.now()) return fallback('no-candidate');
     this.refreshQuarantineState();
     if (this.warmReuseDisabled) return fallback('no-candidate');
-    const matches = this.candidates.filter(row => row.spec.cutSha === input.cutSha
+    const kind = selection?.kind ?? 'gate';
+    let phaseFenced: Set<string>;
+    let phaseEligible: Set<string> | null = null;
+    if (this.phaseFencePersistenceFailed) return fallback('no-candidate');
+    const rawPodConfig = getUserConfig().pod as Record<string, unknown> | undefined;
+    const phaseConfig = this.options.phasePrewarmForTest ?? rawPodConfig?.phasePrewarm as PodPhasePrewarmConfig | undefined;
+    if (phaseConfig && !this.phaseFenceStatePath) return fallback('no-candidate');
+    if (phaseConfig) {
+      try {
+        if (this.options.scheduleLookupErrorForTest) throw new Error('injected-schedule-lookup-failure');
+        const phasePlan = resolvePodPhasePlan(this.options.releaseSchedulesForTest ?? listSchedules(), this.now(), phaseConfig);
+        if (!phasePlan) return fallback('no-candidate');
+        phaseEligible = new Set(allocatePodPhaseCandidates(this.candidates.map(candidate => ({ candidate,
+          kind: candidate.kind, cutSha: candidate.spec.cutSha, lockHash: candidate.spec.key.lockHash })),
+          phasePlan.target, phaseConfig).filter(row => row.kind === 'gate')
+          .map(row => row.candidate.candidate.spec.workerId));
+      } catch { return fallback('no-candidate'); }
+    }
+    try { phaseFenced = !phaseConfig && !this.phaseFenceStatePath ? new Set() : this.readPhaseFence(); }
+    catch { return fallback('no-candidate'); }
+    let phaseEligibleIds: Set<string> | undefined;
+    let phasePlan: WarmPodPhasePlan | undefined;
+    if (this.options.phaseSchedule) {
+      try {
+        phasePlan = resolveWarmPodPhasePlan(this.now(), this.options.phaseSchedule);
+        this.syncPhaseFailureScope(phasePlan);
+        phaseEligibleIds = new Set(selectWarmPodPhaseCandidates(this.candidates, phasePlan, candidate =>
+          !this.options.drainingHosts?.includes(candidate.host)
+          && !this.quarantineBlockedWorkerIds.has(candidate.spec.workerId)).map(row => row.spec.workerId));
+      } catch (error) {
+        this.syncPhaseFailureScope(undefined);
+        debug.log('task-orchestrator.pod-phase', 'schedule-invalid', {
+          reason: error instanceof Error ? error.message : String(error), fallback: 'cold-start',
+        }, { level: 'warn' });
+        return fallback('no-candidate');
+      }
+    }
+    const matches = this.candidates.filter(row => !phaseFenced.has(row.spec.workerId)
+      && (phaseEligible === null || phaseEligible.has(row.spec.workerId))
+      && (!phaseEligibleIds || phaseEligibleIds.has(row.spec.workerId))
+      && (row.kind ?? 'gate') === kind
+      && row.spec.cutSha === input.cutSha
+      && !(phasePlan && (phasePlan.phase === 'gate-prewarm' || phasePlan.phase === 'gate')
+        && this.phasePrepareFailures.has(row.spec.workerId))
       && !this.quarantineBlockedWorkerIds.has(row.spec.workerId)
       && !this.options.drainingHosts?.includes(row.host));
-    if (!matches.length) return fallback('no-candidate');
+    if (!matches.length) {
+      if (phasePlan && (phasePlan.phase === 'gate-prewarm' || phasePlan.phase === 'gate'))
+        debug.log('task-orchestrator.pod-phase', 'cold-fallback', { phase: phasePlan.phase,
+          reason: [...this.phasePrepareFailures.values()][0] ?? 'prewarm-target-not-ready', runId: input.runId }, { level: 'warn' });
+      return fallback('no-candidate');
+    }
     let lastFallback: WarmReplayResult = fallback('lease-unavailable');
     // The control plane chooses an idle worker within a host/key. Probe each distinct
     // host/key once so a busy first host cannot strand an idle second pool.
     const tried = new Set<string>();
     // Cross-cut checkout refresh is owned by POD-PREP-IO-MIN. Live gate acquisition
     // sees only exact-cut candidates; the scorer still rejects an injected cut mismatch.
-    const kind = selection?.kind ?? 'gate';
     // Production gate requests must carry the cut's lock hash and pinned image digest.
     // Inferring either from a candidate would let a stale first slot define its own target.
     if (kind === 'gate' && (!selection?.lockHash || !selection.imageDigest))
@@ -1803,8 +2065,8 @@ export class WarmPodProvider {
       lastFallback = fallback('lease-unavailable');
       continue;
     }
-    if (acquired.status !== 200) return fallback('lease-unavailable');
     const row = acquired.value;
+    if (acquired.status !== 200) return fallback('lease-unavailable');
     const leasedId = row?.attrs?.leaseId;
     const generation = row?.attrs?.generation;
     const podUid = row?.attrs?.podUid;
@@ -1844,7 +2106,8 @@ export class WarmPodProvider {
     const command: WarmWorkerCommand = { ...input, leaseId: leasedId, generation, podUid,
       podName: leasedSpec.name, podContext: leasedSpec.kubectlContext, image: leasedSpec.image,
       requestedAt: new Date(this.now()).toISOString(),
-      workerId: row.name, key: leasedSpec.key };
+      workerId: row.name, key: leasedSpec.key,
+      baseImageDigest: leasedSpec.runtimeContract?.baseImageDigest ?? leasedSpec.key.imageDigest };
     if (command.deadlineAt <= this.now()) {
       debug.log('pod.warm', 'lease-response-after-deadline', { workerId: command.workerId,
         leaseId: command.leaseId, generation: command.generation, podUid: command.podUid,
@@ -1898,6 +2161,20 @@ export class WarmPodProvider {
     if (transport.status !== 'observed' || transport.reason !== 'complete') {
       await this.quarantine(command, transport.reason);
       return { command, transport };
+    }
+    const reply = parseWarmWorkerReply(transport.reply);
+    const reset = reply?.resetReceipt;
+    if (!reply || reply.runId !== command.runId || reply.attemptId !== command.attemptId
+      || reply.cutSha !== command.cutSha || reply.leaseId !== command.leaseId
+      || reply.generation !== command.generation || reply.workerId !== command.workerId
+      || !reset || reset.baseImageDigest !== command.baseImageDigest
+      || reset.resetMethod !== 'git-reset-clean-status-v1' || reset.postRunDiff.length !== 0
+      || reply.key.imageDigest !== command.key.imageDigest || reply.key.lockHash !== command.key.lockHash) {
+      debug.log('pod.reuse', 'reset-receipt-invalid', { workerId: command.workerId,
+        leaseId: command.leaseId, generation: command.generation, podUid: command.podUid,
+        reason: !reset ? 'missing' : reset.postRunDiff.length ? 'post-run-diff' : 'identity-mismatch' }, { level: 'warn' });
+      await this.quarantine(command, 'reset-receipt-invalid');
+      return { command, transport: { status: 'fallback', reason: 'exec-failed', reply: null } };
     }
     // The runtime reports complete only after reset/whitelist-clean/status verification.
     // Bind that receipt to the exact fenced lease; finalize must not make an arbitrary
@@ -2093,7 +2370,9 @@ export function loadWarmPodProvider(path: string, pairingGateFileOrOptions?: str
     if (!pairingGateFile.trim()) throw new Error('warm provider pairing gate file must not be empty');
     options.pairingGateFile = pairingGateFile;
   }
-  return new WarmPodProvider({ ...options, ...runtimeOverrides, rotationStatePath: options.rotationStatePath ?? `${path}.rotations` });
+  return new WarmPodProvider({ ...options, ...runtimeOverrides,
+    rotationStatePath: options.rotationStatePath ?? `${path}.rotations`,
+    phaseFenceStatePath: options.phaseFenceStatePath ?? `${path}.phase-fence` });
 }
 function currentProvider(): WarmPodProvider | null {
   if (configuredProvider) return configuredProvider;
@@ -2227,7 +2506,7 @@ export async function runWarmPodProviderCli(argv: readonly string[] = process.ar
     catch { /* An invalid private config is a failed pass, never a Pod mutation. */ }
     write(JSON.stringify(result ?? { target: 0, ready: 0, failed: ['config-unavailable'] }) + '\n');
     if (provider) emitPairs(provider);
-    return { exitCode: !result || result.ready !== result.target ? 2 : 0, result };
+    return { exitCode: !result || result.ready !== result.target || result.failed.length > 0 ? 2 : 0, result };
   } else if (action === '--prepare') {
     let prepared = false;
     let provider: WarmPodProvider | null = null;

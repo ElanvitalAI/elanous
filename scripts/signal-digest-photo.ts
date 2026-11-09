@@ -1,4 +1,4 @@
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { getUserConfig } from '../src/user-config.js';
 import { sendReportPhotoBuffer } from '../src/telegram-report.js';
 

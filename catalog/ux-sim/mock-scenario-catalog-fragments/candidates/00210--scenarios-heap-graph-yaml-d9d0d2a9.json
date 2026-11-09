@@ -1,0 +1,8 @@
+{
+  "path": "scenarios/heap-graph.yaml",
+  "disposition": "excluded",
+  "entryCommand": "not-applicable: consumed by the Playground renderer; no direct scenario CLI",
+  "logsRecorded": "runner-dependent",
+  "logsDetail": "No standalone command or UX ScenarioV0 completion contract.",
+  "excludeReason": "Graph/playground scenario, outside UX mock-device scope."
+}

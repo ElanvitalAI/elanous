@@ -1,3 +1,4 @@
+import { isPlainObject } from '../primitives/guards.js';
 // TUI-LOG-SESSION-TAG (0.2.36 · 10-23) — tell TUIs apart in one logs.db.
 //
 // Several TUIs (classic `elanous` / `--legacy` and `--tui next`) on one host write to the same logs.db
@@ -23,12 +24,6 @@ export interface TuiLogTag {
   session?: () => string | null | undefined;
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== 'object') return false;
-  const p = Object.getPrototypeOf(value);
-  return p === Object.prototype || p === null;
-}
-
 /** Pure — returns the record with the tag applied (a new object when changed). */
 export function tagTuiRecord(rec: LogRecord, tag: TuiLogTag): LogRecord {
   let session: string | null | undefined;
@@ -38,7 +33,7 @@ export function tagTuiRecord(rec: LogRecord, tag: TuiLogTag): LogRecord {
   if (name) add.tuiName = name;
   if (session) add.tuiSession = session;
   if (rec.data === undefined) return { ...rec, data: add };
-  if (!isPlainObject(rec.data)) return rec;
+  if (!isPlainObject(rec.data, true, false)) return rec;
   const data = rec.data;
   const missing = Object.entries(add).filter(([k]) => !Object.hasOwn(data, k));
   if (missing.length === 0) return rec;

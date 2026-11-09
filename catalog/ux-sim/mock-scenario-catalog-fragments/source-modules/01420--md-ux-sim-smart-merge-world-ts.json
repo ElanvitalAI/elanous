@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SMART-MERGE-WORLD-TS",
+  "path": "src/ux-sim/smart-merge-world.ts",
+  "boundary": "Composes test-only train and release lifecycle incidents, checking their expected transitions, evidence, and zero-human-intervention outcomes.",
+  "deviceIds": [
+    "smart-merge-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

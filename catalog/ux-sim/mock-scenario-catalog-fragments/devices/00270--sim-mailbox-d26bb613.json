@@ -1,0 +1,27 @@
+{
+  "id": "sim-mailbox",
+  "name": "Isolated simulation world mailbox",
+  "implementation": [
+    "src/ux-sim/world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/world.test.ts"
+  ],
+  "target": "world-local post/list/ack message boundary; never calls the real seat inbox",
+  "inputs": [
+    "sender",
+    "recipient",
+    "kind",
+    "body"
+  ],
+  "observations": [
+    "recipient-scoped messages",
+    "acknowledged state"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

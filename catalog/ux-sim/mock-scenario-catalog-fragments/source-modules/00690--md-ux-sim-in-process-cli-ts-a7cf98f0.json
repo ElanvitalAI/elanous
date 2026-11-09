@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-IN-PROCESS-CLI-TS",
+  "path": "src/ux-sim/in-process-cli.ts",
+  "boundary": "Invokes an allow-listed registered Commander action inside this process with isolated config/state roots, captures stdout/stderr and exit code, then restores CLI and process singletons.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -33,6 +33,31 @@ const PHASES: TurnPhase[] = [
 
 const argv = process.argv.slice(2);
 
+if (argv[0] === 'release-world') {
+  if (argv.length !== 1) { console.error('usage: bun scripts/ux-sim.ts release-world'); process.exit(2); }
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { getTestStateRoot, setTestStateRoot } = await import('../src/nexus/paths.js');
+  const { runReleaseSimRigIfFile } = await import('../src/ux-sim/release-sim-rig.js');
+  const root = mkdtempSync(join(tmpdir(), 'ux-sim-release-world-'));
+  const previous = getTestStateRoot();
+  setTestStateRoot(root);
+  let exitCode = 1;
+  try {
+    const result = await runReleaseSimRigIfFile(join(import.meta.dir, '..', 'scenarios/ux-sim/release-sim-rig.yaml'));
+    if (!result) throw new Error('release simulation scenario was not classified');
+    console.log(JSON.stringify({ id: result.id, universe: 'temporary isolated test state', pass: result.pass,
+      cases: result.cases.map(({ id, pass, status, path, injectedEvidence }) => ({ id, pass, status, path,
+        ...(typeof injectedEvidence?.refusal === 'string' ? { refusal: injectedEvidence.refusal, resumeFrom: injectedEvidence.source } : {}) })) }, null, 2));
+    exitCode = result.pass ? 0 : 1;
+  } finally {
+    setTestStateRoot(previous ?? null);
+    rmSync(root, { recursive: true, force: true });
+  }
+  process.exit(exitCode);
+}
+
 if (argv[0] === 'list') {
   if (argv.length !== 1) { console.error('usage: bun scripts/ux-sim.ts list'); process.exit(2); }
   console.log(renderMockScenarioList(loadMockScenarioCatalog()).join('\n'));
@@ -42,6 +67,13 @@ if (argv[0] === 'devices') {
   if (argv.length !== 1) { console.error('usage: bun scripts/ux-sim.ts devices'); process.exit(2); }
   console.log(renderMockScenarioDevices(loadMockScenarioCatalog()).join('\n'));
   process.exit(0);
+}
+if (argv[0] === 'light-rc-long-run') {
+  if (argv.length !== 1) { console.error('usage: bun scripts/ux-sim.ts light-rc-long-run'); process.exit(2); }
+  const { runLightRcLongRunSimulation } = await import('../src/ux-sim/light-rc-long-run-device.js');
+  const result = await runLightRcLongRunSimulation();
+  console.log(JSON.stringify(result, null, 2));
+  process.exit(result.pass ? 0 : 1);
 }
 if (argv[0] === 'install-consent') {
   if (argv.length !== 1) { console.error('usage: bun scripts/ux-sim.ts install-consent'); process.exit(2); }
@@ -176,7 +208,7 @@ if (argv[0] === 'seat-seq') {
 //     ***영영 모른다*** — 오늘 이 저장소가 같은 함정을 다른 도구에서 이미 한 번 고쳤다.
 //  ⛔ 그래서 「알려진 플래그」를 «한 곳»에 두고, 그 밖의 `--` 인자는 거부한다.
 const KNOWN_FLAGS = new Set([
-  '--list', '--list-trajectories', '--computer-use', '--trajectory', '--from-run', '--seminar-rehearsal',
+  '--list', '--list-trajectories', '--computer-use', '--trajectory', '--from-run', '--seminar-rehearsal', '--repo-maintenance',
   '--save-trajectory', '--esc', '--queue', '--width', '--height', '--draft', '--fault',
 ]);
 {
@@ -189,6 +221,14 @@ const KNOWN_FLAGS = new Set([
   }
 }
 if (argv.includes('--list')) { console.log([...PHASES, 'computer-use: normal | capture-stalls | capture-fails | target-missing'].join('\n')); process.exit(0); }
+
+if (argv.includes('--repo-maintenance')) {
+  if (argv.length !== 1) { console.error('usage: bun scripts/ux-sim.ts --repo-maintenance'); process.exit(2); }
+  const { simRepoMaintenance } = await import('../src/ux-sim/repo-maintenance.js');
+  const result = simRepoMaintenance();
+  console.log(JSON.stringify(result, null, 2));
+  process.exit(result.pass ? 0 : 1);
+}
 
 if (argv.includes('--seminar-rehearsal')) {
   if (argv.length !== 1) {

@@ -120,11 +120,11 @@ test('release HITL approval waits inside the live orchestration and continues th
       skippedNodeIds,
     };
     console.info(`[release-cut-measurement] ${JSON.stringify(cutMeasurement)}`);
-    expect(cutMeasurement.reused).toBe(14);
-    expect(skippedNodeIds).toHaveLength(14);
+    expect(cutMeasurement.reused).toBe(13);
+    expect(skippedNodeIds).toHaveLength(13);
     expect(cutMeasurement.rerun).toBe(0);
     expect(skippedNodeIds).toEqual([
-      'version-release', 'traffic-cut-start', 'cutoff', 'export-check', 'pre-gate-join', 'gate',
+      'version-release', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate',
       'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check',
     ]);
     expect(rerunNodeIds).toEqual([]);

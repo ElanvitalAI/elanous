@@ -1,0 +1,33 @@
+{
+  "id": "aside-feedback-loop",
+  "name": "Aside-Elanous feedback loop simulation",
+  "implementation": [
+    "src/ux-sim/aside-feedback-loop.ts",
+    "src/tool-runtime/elanous-linear-secretary-runtime.ts",
+    "src/intake-plane/actions.ts"
+  ],
+  "tests": [
+    "src/ux-sim/aside-feedback-loop.test.ts"
+  ],
+  "target": "deterministic aside feedback flow using real secretary runtime and topic subscription functions, with external network and schedule edges injected",
+  "inputs": [
+    "question and source URL",
+    "research evidence",
+    "bounded capture and optional browser-runtime runId",
+    "valid, Markdown-escaped, or unrelated-child Linear manifest",
+    "recurring schedule result and immediate intake success/failure"
+  ],
+  "observations": [
+    "strict stage order",
+    "separate loop/session/browser run ids",
+    "timeout cancellation only on explicit cancelled result",
+    "real Linear parser and exact one-line unrelated-child refusal",
+    "schedule ID and immediate intake outcome reported separately"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/aside-feedback-loop.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

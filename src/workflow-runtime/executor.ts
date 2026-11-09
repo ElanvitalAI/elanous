@@ -43,7 +43,6 @@ import { readWorkflowPin } from './pin-data.js';
 import { WORKFLOW_CORE_KINDS } from '../graph-kinds/registry.js';
 import { workflowToGraph, walkWorkflowGraph } from '../graph-unify/wf-to-graph.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
 import { checkModelRequires } from '../registry/resolver.js';
 import { validateJudgmentContract, validateJudgmentVerdict } from './judgment-contract.js';
 import { signalBus } from '../signal-bus/index.js';
@@ -115,8 +114,7 @@ export async function* runWorkflow(
     // WF2G supplies the graph cursor. The compatibility adapter owns workflow
     // events, substitution, pins and persistence; graph-runner's file/command
     // recipes do not execute workflow nodes yet.
-    const graphEnabled = getUserConfig().raw.workflowGraphEnabled !== false;
-    const conversion = graphEnabled ? workflowToGraph(opts.workflow) : null;
+    const conversion = workflowToGraph(opts.workflow);
     if (conversion?.ok) {
       try {
         order = walkWorkflowGraph(conversion.graph);

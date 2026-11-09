@@ -1,3 +1,6 @@
+# GRAPH-TEMPLATE-INSTANCE: current Elanous release graph is the compatibility instance.
+# General template: graphs/templates/release/plugin.json; product additions: graphs/release/derive.json.
+# Loader migration binds version/cut/host overrides per run; this file retains current launch semantics until then.
 # Inputs gateRemote (SSH host, e.g. node-b) and gateRemoteMirror (bare mirror path, default ~/mirror/elanous-agent.git): run gate sweeps in temporary remote clones without a matching caller checkout; omit gateRemote for local execution.
 # Optional opsHosts: ['local', '<ssh-host>']; omit for no operational upgrades. Optional internalDist publishes the release checkout to the internal feed first; opsRestart: true explicitly allows daemon restarts.
 graph_id: release-loop
@@ -9,12 +12,14 @@ loop:
 triggers:
   schedule: { type: cron, cron: '* * * * *' }
 version: 1
+# The runner's real node-arrival hook reads OP commands addressed to RLA before each release node.
 max_parallel_nodes: 2
 entry_node: version-release
 dry_run_await_approval: true
 terminal_nodes: [done, failed]
 nodes:
   - { node_id: version-release, kind: git, recipe: 'cmd:version-release', max_visits: 1 }
+  - { node_id: readiness-countdown, kind: gate, recipe: 'cmd:readiness-countdown', max_visits: 1 }
   - { node_id: traffic-cut-start, kind: gate, recipe: 'cmd:traffic-cut-start', max_visits: 1 }
   - { node_id: cutoff, kind: judge, recipe: 'cmd:cutoff', max_visits: 1 }
   - { node_id: checklist-gate, kind: gate, recipe: 'cmd:checklist-gate', max_visits: 1, needs: [cutoff] }
@@ -23,11 +28,26 @@ nodes:
   - { node_id: export-check, kind: gate, recipe: 'cmd:export-check', max_visits: 1, needs: [traffic-gate-passed] }
   - { node_id: prefetch, kind: agent, recipe: 'cmd:docs', max_visits: 1, needs: [cutoff] }
   - { node_id: pre-gate-join, kind: gate, recipe: none, max_visits: 1, needs: [checklist-gate, prefetch] }
-  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 2, notify: { on: [fail] } }
+  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 4, notify: { on: [fail] } }
+  # Source: mirror the normal gate's four-visit retry budget so each failed gate attempt evaluates the disabled switch once.
+  - { node_id: emergency-switch, kind: judge, recipe: 'cmd:emergency-switch', max_visits: 4 }
+  # Source: this fail-closed stub needs one visit; the measured emergency gate is deferred.
+  - { node_id: emergency-gate, kind: gate, recipe: 'cmd:emergency-gate', max_visits: 1 }
+  - { node_id: receipt-audit, kind: gate, recipe: 'cmd:receipt-audit', max_visits: 3 }
+  # A failed file audit reruns the same pinned gate recipe, which reuses complete shards and fills receipt gaps.
+  - { node_id: residual-run, kind: gate, recipe: 'cmd:gate', max_visits: 3 }
+  - { node_id: receipt-audit-recheck, kind: gate, recipe: 'cmd:receipt-audit', max_visits: 3 }
   # Deterministic, best-effort traffic transition; it never changes the release verdict.
   - { node_id: traffic-gate-passed, kind: gate, recipe: 'cmd:traffic-gate-passed', max_visits: 1 }
   # Live ARG planning records a bounded repair/append/resume plan; this release remains fail-closed until a later graph run executes it.
-  - { node_id: gate-triage, kind: judge, recipe: 'cmd:gate-triage', max_visits: 2 }
+  - node_id: gate-triage
+    kind: judge
+    recipe: 'cmd:gate-triage'
+    max_visits: 3
+    subscribes:
+      - { event: release.incident.generated-artifact-stale, match: { nodeId: gate }, action: reroute }
+      - { event: release.incident.host-lost, match: { nodeId: gate }, action: reroute }
+      - { event: release.incident.receipt-fragment-damaged, match: { nodeId: gate }, action: reroute }
   - { node_id: mac-smoke, kind: gate, recipe: 'cmd:mac-smoke', max_visits: 1, needs: [traffic-gate-passed] }
   - { node_id: pwa, kind: gate, recipe: 'cmd:pwa', max_visits: 1, notify: { on: [fail] }, needs: [traffic-gate-passed] }
   - { node_id: pre-prepare-join, kind: gate, recipe: none, max_visits: 1, needs: [mac-smoke, pwa, export-check] }
@@ -63,7 +83,8 @@ nodes:
   - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
   - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
 edges:
-  - { from: version-release, on: outcome, map: { ok: traffic-cut-start, fail: failed, error: failed } }
+  - { from: version-release, on: outcome, map: { ok: readiness-countdown, fail: failed, error: failed } }
+  - { from: readiness-countdown, on: outcome, map: { ok: traffic-cut-start, fail: failed, error: failed } }
   # Advisory traffic writes report failure to OP; release steps still proceed on fail/error.
   - { from: traffic-cut-start, on: outcome, map: { ok: cutoff, fail: cutoff, error: cutoff } }
   - from: cutoff
@@ -73,13 +94,18 @@ edges:
     warning_branches: [prefetch]
   # The cutoff fans checklist-gate and prefetch out together; export-check is deliberately not their prerequisite.
   - { from: pre-gate-join, on: outcome, map: { ok: gate, fail: traffic-failed-restore, error: traffic-failed-restore } }
-  - { from: gate, on: outcome, map: { ok: traffic-gate-passed, fail: gate-triage, error: gate-triage } }
+  - { from: gate, on: outcome, map: { ok: receipt-audit, fail: emergency-switch, error: gate-triage } }
+  - { from: emergency-switch, on: outcome, map: { switch: emergency-gate, stay-normal: gate-triage, ok: gate-triage, fail: gate-triage, error: gate-triage } }
+  - { from: emergency-gate, on: outcome, map: { ok: receipt-audit, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: receipt-audit, on: outcome, map: { ok: traffic-gate-passed, fail: residual-run, error: traffic-failed-restore } }
+  - { from: residual-run, on: outcome, map: { ok: receipt-audit-recheck, fail: gate-triage, error: gate-triage } }
+  - { from: receipt-audit-recheck, on: outcome, map: { ok: traffic-gate-passed, fail: gate-triage, error: traffic-failed-restore } }
   # Export, mac-smoke, and PWA run after the gate in parallel. Export only gates the pre-prepare join; mac-smoke stays warning-only.
   - from: traffic-gate-passed
     on: outcome
     warning_branches: [mac-smoke]
   - { from: gate-triage, on: outcome, map: { ok: traffic-failed-restore, fail: gate-heal-decision, error: gate-heal-decision } }
-  - { from: gate-repair-recovery, on: outcome, map: { ok: gate, fail: failed, error: failed } }
+  - { from: gate-repair-recovery, on: outcome, map: { ok: gate, fail: traffic-failed-restore, error: traffic-failed-restore } }
   - { from: gate-heal-decision, on: outcome, map: { ok: gate-same-run-recheck, fail: traffic-failed-restore, error: traffic-failed-restore } }
   - { from: gate-same-run-recheck, on: outcome, map: { ok: gate, fail: traffic-failed-restore, error: traffic-failed-restore } }
   # Warning-only: a macOS failure or unmeasured run never blocks publishing — auto-approve shows it as a warning row.

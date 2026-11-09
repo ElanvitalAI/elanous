@@ -3,7 +3,7 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import ts from 'typescript';
+import * as ts from 'typescript';
 import { readCommit } from './generate-graph-anatomy.js';
 
 export interface RenderCliAnatomyInput {

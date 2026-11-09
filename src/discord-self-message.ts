@@ -30,7 +30,7 @@
 // components via questionChannelFor (PERMISSION stays auto-approved —
 // QUESTION-only philosophy).
 
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import type { runTurn } from './session/chat.js';
 import type { DiscordBot, DcMessageHandler, DcIncoming, DcMessageStreamer } from './discord.js';
 import {
@@ -63,7 +63,7 @@ import { makeChunkProducer } from './session/streaming/chunk-producer.js';
 import { getUserConfig } from './user-config.js';
 import { detectCard, runCardFollowup, NotACardError } from './card-followup/core.js';
 import { localOcrText } from './telegram-card-followup.js';
-import type { runGraph } from './graph-runner/runner.js';
+import type { GraphRun } from './graph-runner/runner-types.js';
 import { readSlashContextNow, renderContextFirstNow, renderTelegramNow } from './context-bus/context-now-surfaces.js';
 import { contextNow, type ContextNowDeps } from './context-bus/context-now.js';
 import { createContextFirstGate, renderContextFirst, takeContextFirstOpening } from './context-bus/context-first.js';
@@ -143,7 +143,7 @@ export interface DiscordSelfMessageDeps {
    *  (legacy). */
   questionChannelFor?: (channelId: string) => import('./hitl/question.js').QuestionChannel;
   log?: (msg: string) => void;
-  cardFollowupDeps?: { ocrText?: (path: string) => Promise<string | null>; runGraph?: typeof runGraph; rootDir?: () => string };
+  cardFollowupDeps?: { ocrText?: (path: string) => Promise<string | null>; runGraph?: GraphRun; rootDir?: () => string };
   nowDeps?: ContextNowDeps;
   /** Override the clock for the context-first gate in isolated message-path tests. */
   contextFirstNow?: () => number;

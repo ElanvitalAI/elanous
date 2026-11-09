@@ -38,7 +38,11 @@ export function buildRelease(opts: ReleaseOptions): ReleaseResult {
   if (tarballs.length !== 1) throw new Error(`bun pm pack produced ${tarballs.length} tarballs`);
   renameSync(join(out, tarballs[0]!), join(out, 'elanous.tgz'));
   copyFileSync(join(root, 'scripts/install.sh'), join(out, 'install.sh'));
-  copyFileSync(join(root, 'scripts/install.ps1'), join(out, 'install.ps1'));
+  const pinnedBunVersion = readFileSync(join(root, '.bun-version'), 'utf8').trim();
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(pinnedBunVersion)) throw new Error(`invalid .bun-version: ${pinnedBunVersion}`);
+  const powershellInstaller = readFileSync(join(root, 'scripts/install.ps1'), 'utf8');
+  if (powershellInstaller.split('__ELANOUS_BUN_VERSION__').length !== 2) throw new Error('install.ps1 must contain exactly one Bun version placeholder');
+  writeFileSync(join(out, 'install.ps1'), powershellInstaller.replace('__ELANOUS_BUN_VERSION__', pinnedBunVersion));
   // 2026-09-25: 설치기의 짝 — 공개 사용자가 `curl …/releases/latest/download/uninstall.sh | bash` 로 제거한다.
   copyFileSync(join(root, 'scripts/uninstall.sh'), join(out, 'uninstall.sh'));
   const files = ['install.ps1', 'install.sh', 'elanous.tgz', 'uninstall.sh'].map((name) => {

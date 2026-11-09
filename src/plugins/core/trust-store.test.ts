@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decidePluginInstallation, enabledPluginHooks, PluginTrustStore } from './trust-store.js';
@@ -23,4 +23,16 @@ test('ephemeral security decisions and hook consent never alter persisted trust 
   expect(enabledPluginHooks([hook], 'user')).toEqual([hook]);
   expect(readFileSync(file, 'utf8')).toBe(before);
   expect(JSON.parse(before)).toEqual({ version: 1, records: [{ pluginId: 'sample', scope: 'user', trusted: true, updatedAt: '2026-01-01T00:00:00.000Z' }] });
+});
+
+
+test('plugin trust store filters records that fail the persisted record schema', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'trust-record-guards-')); dirs.push(dir);
+  const file = join(dir, 'trust.json');
+  writeFileSync(file, JSON.stringify({ version: 1, records: [
+    { pluginId: 'good', scope: 'user', trusted: true, updatedAt: '2026-01-01T00:00:00.000Z' },
+    { pluginId: 'missing-trusted', scope: 'user', updatedAt: '2026-01-01T00:00:00.000Z' },
+  ] }));
+
+  expect(new PluginTrustStore(file).list().map((record) => record.pluginId)).toEqual(['good']);
 });

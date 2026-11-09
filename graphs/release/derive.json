@@ -1,0 +1,37 @@
+{
+  "id": "elanous-release",
+  "base": {
+    "id": "release-template",
+    "version": "1.0.0"
+  },
+  "policyDefaults": {
+    "executor": "pod-pool",
+    "pod.warmPool": true,
+    "pod.pool": "gate"
+  },
+  "additions": [
+    {
+      "slot": "after-publish",
+      "nodes": [
+        {
+          "nodeId": "npm-publish",
+          "kind": "git",
+          "recipe": "cmd:npm-publish",
+          "maxVisits": 1,
+          "contract": {
+            "inputs": [
+              "version"
+            ],
+            "tools": "proc:bun",
+            "outputs": [
+              "published"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "recipes": [
+    "cmd:npm-publish"
+  ]
+}

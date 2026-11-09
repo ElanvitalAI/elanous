@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FLUTTER-DEPLOY-JOURNEY-TS",
+  "path": "src/ux-sim/flutter-deploy-journey.ts",
+  "boundary": "Runs the Flutter create, APK build, simulated deployment, explicit ACP confirmation, and publish journey through injected ports.",
+  "deviceIds": [
+    "flutter-deploy-journey"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

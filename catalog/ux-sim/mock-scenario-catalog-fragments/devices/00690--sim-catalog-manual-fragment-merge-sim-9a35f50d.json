@@ -1,0 +1,30 @@
+{
+  "id": "sim-catalog-manual-fragment-merge-sim",
+  "name": "Independent device fragments regenerate the merged catalog and manual",
+  "checklistCells": [
+    "HOTDOC-FRAGMENTS"
+  ],
+  "implementation": [
+    "src/self-implement/merge-train.ts",
+    "scripts/ux-sim-merge-driver.mjs"
+  ],
+  "tests": [
+    "src/self-implement/ux-sim-merge-driver.test.ts"
+  ],
+  "target": "Serialized merge-train integration of independent simulator-device fragments",
+  "inputs": [
+    "two PR branches each adding a separate device JSON fragment",
+    "one base-pinned catalog and manual generator"
+  ],
+  "observations": [
+    "both device IDs appear in the merged catalog",
+    "generated manual block equals the rendered merged catalog",
+    "duplicate device IDs refuse integration"
+  ],
+  "entryCommands": [
+    "bun test src/self-implement/ux-sim-merge-driver.test.ts --test-name-pattern SIM-CATALOG-MANUAL-FRAGMENT-MERGE"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

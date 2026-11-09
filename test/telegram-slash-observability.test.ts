@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { TelegramBot } from '../src/telegram.js';
 import { debug } from '../src/debug/log.js';
 import { setUserConfigOverlay } from '../src/user-config.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 
 const config = {} as UserConfig;
 type Event = { category: string; event: string; data?: any };

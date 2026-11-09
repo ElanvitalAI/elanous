@@ -3,12 +3,25 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gateImagePinPath, pinnedGateImageSync, readGateImagePin, replaceGateImagePin, resolveGateImagePin, supersedeGateImagePin,
-  prebuildGateImagePinAtCut, writeGateImagePin } from './gate-image-pin.js';
+  gateImageLayerRuntimeKey, prebuildGateImagePinAtCut, writeGateImagePin } from './gate-image-pin.js';
 import { podCommandJobManifest } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 
 const digestA = `sha256:${'a'.repeat(64)}`;
 const digestB = `sha256:${'b'.repeat(64)}`;
 const digestC = `sha256:${'c'.repeat(64)}`;
+
+it('keys the reusable source-free layer only by measured runtime identity', () => {
+  const identity = { baseImageDigest: digestA, lockHash: 'b'.repeat(64), architecture: 'x86_64', bunVersion: '1.4.2',
+    buildRecipeHash: 'c'.repeat(64), gateDepsDigest: 'd'.repeat(12), skillsDigest: 'e'.repeat(16) };
+  const key = gateImageLayerRuntimeKey(identity);
+  expect(key).toMatch(/^[a-f0-9]{40}$/);
+  expect(gateImageLayerRuntimeKey(identity)).toBe(key);
+  expect(gateImageLayerRuntimeKey({ ...identity, architecture: 'aarch64' })).not.toBe(key);
+  expect(gateImageLayerRuntimeKey({ ...identity, buildRecipeHash: 'f'.repeat(64) })).not.toBe(key);
+  expect(gateImageLayerRuntimeKey({ ...identity, gateDepsDigest: 'a'.repeat(12) })).not.toBe(key);
+  expect(gateImageLayerRuntimeKey({ ...identity, skillsDigest: 'none' })).not.toBe(key);
+  expect(() => gateImageLayerRuntimeKey({ ...identity, lockHash: '' })).toThrow('identity is incomplete');
+});
 
 it('GATE-IMAGE-PREBUILD-AT-CUT sim: builds after cut and persists the exact run pin', async () => {
   const root = mkdtempSync(join(tmpdir(), 'gate-image-prebuild-sim-'));

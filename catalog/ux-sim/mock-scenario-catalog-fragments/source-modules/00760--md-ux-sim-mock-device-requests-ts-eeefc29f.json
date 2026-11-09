@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-MOCK-DEVICE-REQUESTS-TS",
+  "path": "src/ux-sim/mock-device-requests.ts",
+  "boundary": "Validates, stores and lists typed requests for registered mock devices; records discovery requests without executing a simulator.",
+  "deviceIds": [
+    "scenario-runner"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

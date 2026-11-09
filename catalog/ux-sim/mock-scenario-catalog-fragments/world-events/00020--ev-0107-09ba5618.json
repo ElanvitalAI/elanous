@@ -1,0 +1,5 @@
+{
+  "id": "EV-0107",
+  "name": "Host reboot",
+  "description": "Inject a host reboot into a simulated world."
+}

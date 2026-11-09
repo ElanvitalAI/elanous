@@ -52,12 +52,14 @@ describe('T5.A · handleStaticAppRequest', () => {
     cleanup();
   });
 
-  test('SPA fallback for unknown path → root index.html', async () => {
+  test('unknown path serves the exported 404 page with 404 status', async () => {
     const { dir, cleanup } = mkStaticRoot();
     writeFileSync(joinPath(dir, 'index.html'), '<html>root</html>');
+    writeFileSync(joinPath(dir, '404.html'), '<html>missing</html>');
     const r = handleStaticAppRequest(new URL('http://x/app/anything-unknown'), { staticDir: dir });
-    expect(r.status).toBe(200);
-    expect(await r.text()).toBe('<html>root</html>');
+    expect(r.status).toBe(404);
+    expect(await r.text()).toBe('<html>missing</html>');
+    expect(r.headers.get('content-type')).toBe('text/html; charset=utf-8');
     cleanup();
   });
 

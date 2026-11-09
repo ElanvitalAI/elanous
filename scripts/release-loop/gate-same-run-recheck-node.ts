@@ -9,11 +9,13 @@ import { readGraphContext, finishNode, type GraphContext } from './node-verdict.
 import { stalledGateEvidence } from './gate-stalled-evidence.js';
 import { gateImagePinPath, readGateImagePin } from './gate-image-pin.js';
 import { gateLockfileHashAtCommit } from './gate-reuse-identity.js';
+import { gateAssignableTestsAtCommit } from './gate-baseline-receipt.js';
 
 type Result = { outcome: 'ok' | 'error'; verdict: 'pass' | 'fail'; summary: string; planPath?: string;
-  reusedShardCount?: number; remeasureFiles?: string[]; skipped?: boolean };
+  reusedShardCount?: number; remeasureFiles?: string[]; skipped?: boolean; fullSweepFallback?: boolean };
 type Deps = { repo?: string; roots?: string[]; ledgerRoot?: string;
   inspect?: typeof stalledGateEvidence; write?: typeof writeRecheckPlan;
+  testsAtCommit?: (repo: string, commit: string) => string[] | null;
   pinnedImageDigest?: (root: string, version: string, runId: string, commit: string) => string | null;
   lockfileHash?: (repo: string, commit: string) => string | null;
   existsAtCommit?: (repo: string, commit: string, file: string) => boolean };
@@ -31,6 +33,22 @@ export function prepareSameRunGateRecheck(context: GraphContext, deps: Deps = {}
   const baseline = context.outputs.cutoff?.baseline as { sha?: unknown } | undefined;
   const repo = deps.repo ?? resolve(import.meta.dir, '../..');
   const ledgerRoot = deps.ledgerRoot ?? releaseLedgerRoot();
+  const fullSweepFallback = (reason: string): Result => {
+    let tests: string[] | null;
+    try { tests = (deps.testsAtCommit ?? gateAssignableTestsAtCommit)(repo, commit); }
+    catch (error) { tests = null; reason += `; test inventory failed: ${String(error)}`; }
+    if (!tests?.length) return { outcome: 'error', verdict: 'fail', summary: `same-run receipts rejected; full sweep unavailable: ${reason}` };
+    const files = [...new Set(tests)].sort();
+    const plan = { kind: 'recheck' as const, version, priorCommit: commit, forCommit: commit,
+      files, stalledFiles: files, priorFailures: [], priorErrors: [], preservedShardCount: 0 };
+    try {
+      const planPath = (deps.write ?? writeRecheckPlan)(ledgerRoot, plan);
+      return { outcome: 'ok', verdict: 'pass', planPath, reusedShardCount: 0, remeasureFiles: files,
+        fullSweepFallback: true, summary: `same-run receipts rejected (${reason}); remeasure full gate: ${files.length} test files` };
+    } catch (error) {
+      return { outcome: 'error', verdict: 'fail', summary: `same-run receipts rejected; full-sweep plan write failed: ${String(error)}` };
+    }
+  };
   const roots = deps.roots ?? [...new Set([ledgerRoot, effectiveInstanceRoot()])];
   let expectedImageDigest: string | null, expectedLockfileHash: string | null;
   try {
@@ -40,24 +58,24 @@ export function prepareSameRunGateRecheck(context: GraphContext, deps: Deps = {}
     }))(ledgerRoot, version, context.runId, commit);
     expectedLockfileHash = (deps.lockfileHash ?? gateLockfileHashAtCommit)(repo, commit);
   } catch (error) {
-    return { outcome: 'error', verdict: 'fail', summary: `same-run runtime identity unavailable: ${String(error instanceof Error ? error.message : error)}` };
+    return fullSweepFallback(`runtime identity unavailable: ${String(error instanceof Error ? error.message : error)}`);
   }
   if (!expectedImageDigest || !expectedLockfileHash)
-    return { outcome: 'error', verdict: 'fail', summary: 'same-run image pin or cut lockfile identity is unavailable' };
+    return fullSweepFallback('image pin or cut lockfile identity is unavailable');
   let evidence: ReturnType<typeof stalledGateEvidence>;
   try {
     evidence = (deps.inspect ?? stalledGateEvidence)({ version, commit, repo, roots, gateOutput: gate,
       ...(typeof baseline?.sha === 'string' ? { expectedBase40: baseline.sha } : {}), expectedRunId: context.runId,
       expectedImageDigest, expectedLockfileHash });
   } catch (error) {
-    return { outcome: 'error', verdict: 'fail', summary: `same-run receipt inspection failed: ${String(error instanceof Error ? error.message : error)}` };
+    return fullSweepFallback(`receipt inspection failed: ${String(error instanceof Error ? error.message : error)}`);
   }
-  if (!evidence.ok) return { outcome: 'error', verdict: 'fail', summary: `same-run shard receipts rejected: ${evidence.reason}` };
+  if (!evidence.ok) return fullSweepFallback(evidence.reason);
   const { stalledShards, partialFailures, preservedShardCount } = evidence.evidence;
   const stalledFiles = stalledShards.flatMap((shard) => shard.files);
   let snapshot: ReturnType<typeof cachedCutSnapshot>;
   try { snapshot = cachedCutSnapshot(repo, commit); }
-  catch (error) { return { outcome: 'error', verdict: 'fail', summary: `same-run cut snapshot unavailable: ${String(error instanceof Error ? error.message : error)}` }; }
+  catch (error) { return fullSweepFallback(`cut snapshot unavailable: ${String(error instanceof Error ? error.message : error)}`); }
   const existsAtCommit = deps.existsAtCommit ?? ((root: string, sha: string, file: string) => {
     snapshot ??= createCutSnapshot(root, sha, join(ledgerRoot, 'cut-snapshots'));
     return snapshot.existsBlob(file);
@@ -65,13 +83,13 @@ export function prepareSameRunGateRecheck(context: GraphContext, deps: Deps = {}
   const planned = planStalledShardRecheck({ version, measuredCommit: commit, forCommit: commit,
     failures: partialFailures.failures, errors: partialFailures.errors, stalledFiles, preservedShardCount,
     existsAtCommit: (file) => existsAtCommit(repo, commit, file) });
-  if (!planned.ok) return { outcome: 'error', verdict: 'fail', summary: `same-run recheck plan rejected: ${planned.reason}` };
+  if (!planned.ok) return fullSweepFallback(`recheck plan rejected: ${planned.reason}`);
   try {
     const planPath = (deps.write ?? writeRecheckPlan)(ledgerRoot, planned.plan);
     return { outcome: 'ok', verdict: 'pass', planPath, reusedShardCount: preservedShardCount,
       remeasureFiles: planned.plan.files, summary: `same-run receipts preserved ${preservedShardCount} shards; remeasure ${planned.plan.files.length} stalled files` };
   } catch (error) {
-    return { outcome: 'error', verdict: 'fail', summary: `same-run recheck plan write failed: ${String(error instanceof Error ? error.message : error)}` };
+    return fullSweepFallback(`recheck plan write failed: ${String(error instanceof Error ? error.message : error)}`);
   }
 }
 

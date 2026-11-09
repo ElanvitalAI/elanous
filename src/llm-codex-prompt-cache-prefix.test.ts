@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { codexStagePromptCacheKey, getProviderForConfig } from './llm.js';
 import { saveTokens } from './oauth/store.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
 
 let envSnapshot: Record<string, string | undefined> = {};

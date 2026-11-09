@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { cpSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { parseAppManifest } from './app-contract.js';
+import { createAppSimulationStore } from './app-simulation-db.js';
+import { createAppSimulationRoute } from './app-simulation-route.js';
+import { runRegisteredAppSimulation } from './app-simulation-runner.js';
 
 const validYaml = `apiVersion: elanous.app/v0
 slug: voice-note
@@ -42,6 +48,50 @@ const errorsOf = (result: ParseResult) => result.ok ? [] : result.errors;
 const warningsOf = (result: ParseResult) => result.ok ? result.warnings : [];
 
 describe('NEXUS-APP-CONTRACT', () => {
+  test('KAIST lecture-scrap static build is served at canonical routes by the registered simulation and receipt route', async () => {
+    const root = join(import.meta.dir, '../../../templates/next-app-lecture-scrap');
+    const generatedRoot = mkdtempSync(join(tmpdir(), 'kaist-lecture-scrap-app-'));
+    try {
+      const generatedApp = join(generatedRoot, 'generated-app');
+      cpSync(root, generatedApp, { recursive: true });
+      const manifest = parseAppManifest(readFileSync(join(generatedApp, 'app.yaml'), 'utf8'));
+      expect(manifest.ok).toBe(true);
+      if (!manifest.ok) return;
+      expect(manifest.manifest).toMatchObject({ slug: 'lecture-scrap', frontend: { kind: 'static-export' },
+        roles: { owner: { via: 'nexus-session' }, public: { via: 'public-read' } },
+        tables: { scraps: expect.anything(), lecture_notes: expect.anything() },
+        rpc: { listScraps: { allow: ['owner', 'public'] }, addLectureNote: { allow: ['owner'] }, searchLibrary: { allow: ['owner', 'public'] } } });
+      expect(JSON.parse(readFileSync(join(generatedApp, 'package.json'), 'utf8'))).toMatchObject({
+        name: 'next-app-lecture-scrap', scripts: { build: 'next build' },
+      });
+      const simulation = createAppSimulationStore(join(generatedRoot, 'simulation.sqlite'));
+      let builtFiles: Readonly<Record<string, string>> | undefined;
+      let simulationError: unknown;
+      try {
+        const route = createAppSimulationRoute({ store: simulation, authorize: () => true, hasApp: slug => slug === 'lecture-scrap',
+          publish: () => undefined, runSimulation: () => runRegisteredAppSimulation('lecture-scrap', {
+            onStaticExport: files => { builtFiles = files; },
+          }), observeError: error => { simulationError = error; } });
+        const response = await route(new Request('http://nexus.invalid/v1/apps/lecture-scrap/simulations/run', { method: 'POST' }));
+        expect(response?.status, String(simulationError)).toBe(200);
+        const responseBody = await response?.json() as { simulation: { runId: string } };
+        const snapshot = simulation.snapshot('lecture-scrap');
+        expect(snapshot).toMatchObject({ status: 'passed', runId: responseBody.simulation.runId, receipts: [{ outcome: 'passed' }] });
+        expect(builtFiles).toBeDefined();
+        const artifactPaths = ['index.html', 'notes/new.html', 'search.html'] as const;
+        const expectedHashes = artifactPaths.map(path => createHash('sha256').update(builtFiles![path]!).digest('hex'));
+        expect(snapshot.events.map((event) => ({ step: event.data.step, path: event.data.path, status: event.data.status, assetCount: event.data.assetCount, artifactSha256: event.data.artifactSha256 }))).toEqual([
+          { step: 'screen-list', path: '/', status: 200, assetCount: expect.any(Number), artifactSha256: expectedHashes[0] },
+          { step: 'screen-note-create', path: '/notes/new', status: 200, assetCount: expect.any(Number), artifactSha256: expectedHashes[1] },
+          { step: 'screen-search', path: '/search', status: 200, assetCount: expect.any(Number), artifactSha256: expectedHashes[2] },
+        ]);
+        expect(snapshot.events.every(event => Number(event.data.assetCount) > 0)).toBe(true);
+      } finally { simulation.close(); }
+    } finally {
+      rmSync(generatedRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test('NEXUS-APP-CONTRACT: RFC 정본의 적용 범위를 §2꼴·§2 «검증 규칙» 표·§3내장 동작 다섯·§4', () => {
     expect(errorsOf(parseAppManifest(validYaml))).toEqual([]);
     const checks = [
@@ -79,6 +129,17 @@ describe('NEXUS-APP-CONTRACT', () => {
     ]) {
       expect(errorsOf(parseAppManifest(invalid)).length).toBeGreaterThan(0);
     }
+  });
+
+  test('public-read is limited to read-only RPCs and cannot upload objects', () => {
+    const source = validYaml
+      .replace('viewer: { via: share-link }', 'public: { via: public-read }')
+      .replace('allow: [owner, viewer]', 'allow: [owner, public]');
+    expect(parseAppManifest(source).ok).toBe(true);
+    const publicWrite = source.replace('sql: SELECT id FROM notes WHERE id = :id', 'sql: INSERT INTO notes (id) VALUES (:id)');
+    expect(errorsOf(parseAppManifest(publicWrite)).map(issue => issue.path)).toContain('/rpc/@entry:0/allow');
+    const publicUpload = source.replace('  prefix: apps/voice-note/\n', '  prefix: apps/voice-note/\n  upload: { allow: [owner, public], types: [audio/wav] }\n');
+    expect(errorsOf(parseAppManifest(publicUpload)).map(issue => issue.path)).toContain('/storage/upload/allow');
   });
 
   test('accepts translate as a builtin with text and source/target language declarations', () => {
@@ -165,6 +226,8 @@ describe('NEXUS-APP-CONTRACT', () => {
       ['sql: SELECT id FROM notes WHERE id = :id', 'sql: SELECT id FROM notes; DELETE FROM notes'],
       ['sql: SELECT id FROM notes WHERE id = :id', 'sql: SELECT id FROM notes WHERE id = ?'],
       ['sql: SELECT id FROM notes WHERE id = :id', 'sql: DROP TABLE notes'],
+      ['sql: SELECT id FROM notes WHERE id = :id', 'sql: PRAGMA user_version = 7'],
+      ['sql: SELECT id FROM notes WHERE id = :id', 'sql: VACUUM'],
       ['sql: SELECT id FROM notes WHERE id = :id', 'sql: SELECT id FROM notes WHERE id = :id || :id'],
       ['sql: SELECT id FROM notes WHERE id = :id', 'sql: SELECT id FROM missing_table WHERE id = :id'],
       ['sql: SELECT id FROM notes WHERE id = :id', 'sql: SELECT id FROM notes, missing_table WHERE id = :id'],

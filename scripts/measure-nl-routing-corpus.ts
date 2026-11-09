@@ -6,15 +6,61 @@ import { getModelFamily } from '../src/models/prompts.js';
 import { NoLlmProviderAvailableError, resolveDefaultProvider } from '../src/llm.js';
 import { filterToolsByDeny } from '../src/tool-runtime/tool-deny.js';
 import { getUserConfig } from '../src/user-config.js';
+import type { LLMToolSpec } from '../src/llm/tool-spec.js';
+import { loadPluginManifestFromDir } from '../src/plugins/core/manifest.js';
 import { resolveObserveOnlyDecision, type ObserveOnlyDecision } from '../src/self-implement/observe-only.js';
-import { selectCorpusItems, corpusFiltersFromEnv, passSummary, positiveInteger, positiveIntegerList, unavailableExpectedToolIds, wilsonInterval } from './lib/nl-routing-measurement.js';
+import { selectCorpusItems, corpusFiltersFromEnv, assertGradableItems, normalizeCorpusItems, passSummary, positiveInteger, positiveIntegerList, unavailableExpectedToolIds, wilsonInterval } from './lib/nl-routing-measurement.js';
 import { machineLoad, measureScreeningRun, screeningFailureReason, type MachineLoad, type ScreeningRecord } from './lib/nl-routing-screening.js';
 
-interface CorpusItem { id: string; tier: string; prompt: string; accept: string[]; context_dependent?: boolean; context?: string }
+interface CorpusItem { id: string; tier: string; prompt: string; accept: string[]; reject?: string[]; context_dependent?: boolean; context?: string }
 interface Corpus { description: string; surface: string; tiers: Record<string, string>; items: CorpusItem[] }
+export type CorpusRoutingStrategy = 'native-all' | 'index';
+
+export function corpusRoutingStrategyFromEnv(env: NodeJS.ProcessEnv = process.env): CorpusRoutingStrategy {
+  const strategy = env.CORPUS_STRATEGY ?? 'native-all';
+  if (strategy !== 'native-all' && strategy !== 'index') {
+    throw new Error(`Invalid CORPUS_STRATEGY ${JSON.stringify(strategy)}; valid values: native-all, index.`);
+  }
+  return strategy;
+}
+
+const CORPUS_ROUTE_PLUGIN_IDS = ['elanous-release', 'elanous-observe'] as const;
+
+/** Read only built-in manifest schemas. EvalPrompt dispatches these names to its no-op measurement stub. */
+export function corpusMeasurementRouteTools(): LLMToolSpec[] {
+  return CORPUS_ROUTE_PLUGIN_IDS.flatMap((id) => {
+    const { manifest } = loadPluginManifestFromDir(resolve(import.meta.dir, '../plugins', id), { id });
+    return (manifest.contributes.aiTools ?? []).flatMap((tool) => tool.route ? [{
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters ?? { type: 'object', properties: {} },
+      pluginId: manifest.id,
+      route: tool.route,
+    }] : []);
+  });
+}
+
+export function filterCorpusMeasurementToolNames(
+  surfaceToolNames: readonly string[],
+  routeToolNames: readonly string[],
+  denyList: readonly string[],
+): string[] {
+  const candidates = [...new Set([...surfaceToolNames, ...routeToolNames])].map((name) => ({ name }));
+  return (filterToolsByDeny(candidates, denyList) ?? candidates).map((tool) => tool.name);
+}
 
 function formatPercent(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
+}
+
+export function summarizeRoutingOutcomes(records: readonly Pick<ScreeningRecord, 'outcome'>[]) {
+  const count = (outcome: ScreeningRecord['outcome']) => records.filter((record) => record.outcome === outcome).length;
+  const rate = (value: number) => records.length === 0 ? null : value / records.length;
+  return {
+    accuracy: rate(count('pass')),
+    wrongToolRate: rate(count('wrong-tool')),
+    rejectedToolRate: rate(count('rejected-tool')),
+  };
 }
 
 function promptForItem(item: Pick<CorpusItem, 'prompt' | 'context_dependent' | 'context'>): string {
@@ -23,11 +69,30 @@ function promptForItem(item: Pick<CorpusItem, 'prompt' | 'context_dependent' | '
 export const NL_ROUTING_UNSAFE_RUN_ENV = 'ELANOUS_NL_ROUTING_ALLOW_UNSAFE_RUN';
 const CORPUS_ALWAYS_MUTATING_TOOL_NAMES = ['Bash', 'Edit', 'Write'] as const;
 const CORPUS_MUTATING_TOOL_NAMES = ['SelfImplement', ...CORPUS_ALWAYS_MUTATING_TOOL_NAMES] as const;
+const CORPUS_MEASUREMENT_DENY = [...CORPUS_MUTATING_TOOL_NAMES];
+
+function corpusToolDeny(): string[] {
+  return [...new Set([...getUserConfig().chat.toolDeny, ...CORPUS_MEASUREMENT_DENY])];
+}
+
+export function parseCorpusText(text: string): Corpus {
+  const trimmed = text.trim();
+  try { return JSON.parse(trimmed) as Corpus; } catch { /* JSONL rows are parsed below. */ }
+  const lines = trimmed.split(/\r?\n/u).filter((line) => line.trim().length > 0);
+  const first = JSON.parse(lines[0]!) as Record<string, unknown>;
+  if (first.type !== 'meta') throw new Error('JSONL corpus must start with a type=meta row.');
+  return {
+    description: String(first.description ?? ''),
+    surface: String(first.surface ?? ''),
+    tiers: first.tiers as Record<string, string>,
+    items: lines.slice(1).map((line) => JSON.parse(line) as CorpusItem),
+  };
+}
 
 function readCorpusFromEnv(env: NodeJS.ProcessEnv = process.env): Corpus {
   const corpusPath = env.CORPUS_PATH;
   if (!corpusPath) throw new Error('CORPUS_PATH is required; provide the corpus JSON path to measure.');
-  return JSON.parse(readFileSync(resolve(process.cwd(), corpusPath), 'utf8')) as Corpus;
+  return parseCorpusText(readFileSync(resolve(process.cwd(), corpusPath), 'utf8'));
 }
 
 function resolveCorpusCwdFromEnv(env: NodeJS.ProcessEnv = process.env): string {
@@ -285,7 +350,7 @@ function authoritativeSurfaceToolNames(surface: EvalPromptToolSurface): string[]
   }
   const modelFamily = getModelFamily(resolveReproModelId(undefined, providerDefaultModel));
   const { specs } = buildEvalPromptToolSurface(surface, modelFamily, cfg);
-  const tools = filterToolsByDeny(specs, cfg.chat.toolDeny) ?? specs;
+  const tools = filterToolsByDeny(specs, [...new Set([...cfg.chat.toolDeny, ...CORPUS_MEASUREMENT_DENY])]) ?? specs;
   return tools.map((tool) => tool.name);
 }
 
@@ -307,6 +372,7 @@ export async function main(
       + '설정은 환경변수다: CORPUS_CWD=<툴 작업 디렉토리> · CORPUS_PATH=<코퍼스 JSON 경로> · CORPUS_OUT=<원자료 JSON 경로> · CORPUS_TIERS · CORPUS_IDS · CORPUS_REPEATS · CORPUS_BUDGETS · CORPUS_CONCURRENCY · CORPUS_V5=1 (v5 28문항 경로·복합 처리 채점)');
   }
   const corpusCwd = resolveCorpusCwdFromEnv();
+  const routingStrategy = corpusRoutingStrategyFromEnv();
   const requestedSurface = process.env.CORPUS_SURFACE;
   if (requestedSurface !== undefined && !isEvalPromptToolSurface(requestedSurface)) {
     throw new Error(`Invalid CORPUS_SURFACE ${JSON.stringify(requestedSurface)}; valid values: ${EVAL_PROMPT_TOOL_SURFACES.join(', ')}.`);
@@ -317,20 +383,31 @@ export async function main(
     throw new Error(`Invalid corpus surface ${JSON.stringify(surfaceCandidate)}; valid values: ${EVAL_PROMPT_TOOL_SURFACES.join(', ')}.`);
   }
   const surface = surfaceCandidate;
-  const surfaceToolNames = [...resolveSurfaceTools(surface)];
-  const safety = resolveSafety(surfaceToolNames);
+  const candidateRouteTools = corpusMeasurementRouteTools();
+  const candidateSurfaceToolNames = resolveSurfaceTools(surface);
+  const safety = resolveSafety([...candidateSurfaceToolNames, ...candidateRouteTools.map((tool) => tool.name)]);
+  const toolDeny = corpusToolDeny();
+  const surfaceToolNames = filterCorpusMeasurementToolNames(
+    candidateSurfaceToolNames,
+    candidateRouteTools.map((tool) => tool.name),
+    toolDeny,
+  );
+  const allowedToolNames = new Set(surfaceToolNames);
+  const measurementRouteTools = candidateRouteTools.filter((tool) => allowedToolNames.has(tool.name));
   const repeats = positiveInteger(process.env.CORPUS_REPEATS, 'CORPUS_REPEATS', 3);
   const budgets = positiveIntegerList(process.env.CORPUS_BUDGETS, 'CORPUS_BUDGETS', [6]);
   const concurrency = positiveInteger(process.env.CORPUS_CONCURRENCY, 'CORPUS_CONCURRENCY', 4);
   // ★ MEAS-T8 — 문항 판단은 N≥10 집중 프로브로만 한다. 그것을 **같은 러너**에서 할 수 있게
   //   `CORPUS_IDS` 를 붙인다(다른 자로 재면 기준선과 비교 불가 · 형태 F3).
-  const items = selectCorpusItems(corpus.items, corpusFiltersFromEnv(process.env));
+  const corpusItems = normalizeCorpusItems(corpus.items);
+  assertGradableItems(corpusItems);
+  const items = selectCorpusItems(corpusItems, corpusFiltersFromEnv(process.env));
   const unmeasurableIds = unavailableExpectedToolIds(items, surfaceToolNames);
   const isUnmeasurable = new Set(unmeasurableIds);
   const measurableItems = items.filter((item) => !isUnmeasurable.has(item.id));
   const load = machineLoad();
 
-  console.log(`[corpus] ${items.length} 문항 × ${repeats}회 × 예산 ${budgets.join('/')} · 서피스 ${surface} (유효 목록 ${EVAL_PROMPT_TOOL_SURFACES.indexOf(surface) + 1}/${EVAL_PROMPT_TOOL_SURFACES.length}) · tool-cwd ${corpusCwd} · ${formatMachineLoad(load)} · observe-only ${safety.observeOnly.enabled} (${safety.observeOnly.source}) · exposed-mutating-tools ${safety.exposedMutatingTools.length > 0 ? safety.exposedMutatingTools.join(',') : '(none)'} · unsafe-bypass ${safety.bypassed}`);
+  console.log(`[corpus] ${items.length} 문항 × ${repeats}회 × 예산 ${budgets.join('/')} · strategy ${routingStrategy} · 서피스 ${surface} (유효 목록 ${EVAL_PROMPT_TOOL_SURFACES.indexOf(surface) + 1}/${EVAL_PROMPT_TOOL_SURFACES.length}) · tool-cwd ${corpusCwd} · ${formatMachineLoad(load)} · observe-only ${safety.observeOnly.enabled} (${safety.observeOnly.source}) · exposed-mutating-tools ${safety.exposedMutatingTools.length > 0 ? safety.exposedMutatingTools.join(',') : '(none)'} · unsafe-bypass ${safety.bypassed}`);
   console.log('[corpus] 이 수는 LLM 실행 확률의 표본이라 런마다 움직인다. 문항·티어 모두 k/n 원자료와 95% Wilson 구간으로만 보고하며 티어 비교 결론은 내리지 않는다.\n');
 
   if (unmeasurableIds.length > 0) {
@@ -343,9 +420,17 @@ export async function main(
   for (let index = 0; index < jobs.length; index += concurrency) {
     const settled = await Promise.all(jobs.slice(index, index + concurrency).map(async ({ item, budget, rep }) => {
       const record = await measureScreeningRun(item, budget, rep, async (candidate, maxTurns) => {
-        const result = await runPrompt({ prompt: promptForItem(candidate), maxTurns, tools: surface, silent: true, cwd: corpusCwd });
+        const result = await runPrompt({ prompt: promptForItem(candidate), maxTurns, tools: surface, silent: true, cwd: corpusCwd, routingStrategy, measurementRouteTools, measurementOnlyToolNames: surfaceToolNames, toolDeny });
         // ⭐ `I-16` — 답문을 버리지 않고 넘긴다. 보존 여부·상한은 심이 정하고, 여기서는 해석하지 않는다.
-        return { toolBreakdown: result.toolBreakdown, turnCount: result.turnCount, durationMs: result.durationMs, text: result.text };
+        return {
+          toolBreakdown: result.toolBreakdown,
+          turnCount: result.turnCount,
+          durationMs: result.durationMs,
+          ...(result.inputTokens !== undefined ? { inputTokens: result.inputTokens } : {}),
+          ...(result.outputTokens !== undefined ? { outputTokens: result.outputTokens } : {}),
+          ...(result.firstTokenMs !== undefined ? { firstTokenMs: result.firstTokenMs } : {}),
+          text: result.text,
+        };
       }, load);
       // ⛔⭐ 실패는 **이유와 함께** 적는다(2026-07-30) — 종전엔 *"측정 불가"* 만 나와
       //    30/30 이 죽어도 원인을 사람이 처음부터 다시 찾아야 했다(실측: 워크트리 node_modules 누락).
@@ -424,11 +509,22 @@ export async function main(
 
   const errored = jobs.length - records.length;
   if (errored > 0) console.log(`⚠️ 실행 실패 ${errored}건은 측정 가능 표본의 누락 실행이며 관측된 k/n 분모에서 제외했다.`);
+  const outcomeMetrics = summarizeRoutingOutcomes(records);
+  const tokenRows = records.filter((record) => record.tokensPerTurn !== undefined);
+  const firstTokenRows = records.filter((record) => record.firstTokenMs !== undefined && record.firstTokenMs !== null);
+  const metrics = {
+    ...outcomeMetrics,
+    meanTokensPerTurnApprox: tokenRows.length === 0 ? null : tokenRows.reduce((sum, record) => sum + record.tokensPerTurn!, 0) / tokenRows.length,
+    meanFirstTokenMs: firstTokenRows.length === 0 ? null : firstTokenRows.reduce((sum, record) => sum + record.firstTokenMs!, 0) / firstTokenRows.length,
+    measuredRuns: records.length,
+    failedRuns: errored,
+  };
+  console.log(`[routing-metrics] ${routingStrategy} · accuracy ${metrics.accuracy === null ? 'unavailable' : `${(metrics.accuracy * 100).toFixed(1)}%`} · wrong-tool ${metrics.wrongToolRate === null ? 'unavailable' : `${(metrics.wrongToolRate * 100).toFixed(1)}%`} · rejected-tool ${metrics.rejectedToolRate === null ? 'unavailable' : `${(metrics.rejectedToolRate * 100).toFixed(1)}%`} · tokens/turn approx ${metrics.meanTokensPerTurnApprox?.toFixed(1) ?? 'unavailable'} · first-token ${metrics.meanFirstTokenMs?.toFixed(0) ?? 'unavailable'}ms · runs ${records.length}/${jobs.length}`);
   const out = process.env.CORPUS_OUT;
   // ⛔⭐ 최상위 `machineLoad` 는 **런 시작 스냅샷**이고 이름은 그대로 둔다(기존 원자료가 그 뜻으로 쓰였다).
   //    레코드의 실제 부하는 `records[].loadAtStart`·`loadAtEnd` 다(`MEAS-T15` · 타입 주석에 표로 있다).
   //    ⛔ 별칭 필드를 나란히 두지 않는다 — 소비자 없는 중복은 **죽은 공개 필드**다(리뷰 must-fix 수용).
-  if (out) writeFileSync(out, JSON.stringify({ surface, repeats, budgets, machineLoad: load, observeOnly: safety.observeOnly, unsafeBypass: safety.bypassed, exposedMutatingTools: safety.exposedMutatingTools, surfaceToolNames, unmeasurableIds, ...(v5 ? { v5 } : {}), records }, null, 2));
+  if (out) writeFileSync(out, JSON.stringify({ surface, routingStrategy, routeToolNames: measurementRouteTools.map((tool) => tool.name), deniedToolNames: toolDeny, repeats, budgets, machineLoad: load, observeOnly: safety.observeOnly, unsafeBypass: safety.bypassed, exposedMutatingTools: safety.exposedMutatingTools, surfaceToolNames, unmeasurableIds, metrics, ...(v5 ? { v5 } : {}), records }, null, 2));
 }
 
 if (import.meta.main) await main();

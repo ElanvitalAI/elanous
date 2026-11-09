@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type { GraphRunState } from '../../src/graph-runner/runner.js';
+import type { GraphRunState } from '../../src/graph-runner/runner-types.js';
 import { isReleaseVersion } from './release-version.js';
 
 /** Called under the OP seat flock, before any branch-tip or graph-run mutation. */

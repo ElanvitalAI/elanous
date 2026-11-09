@@ -1,0 +1,27 @@
+{
+  "id": "graph-engine-selector",
+  "name": "Graph engine selection simulator",
+  "implementation": [
+    "src/ux-sim/graph-engine-sim.ts"
+  ],
+  "tests": [
+    "src/ux-sim/graph-engine-sim.test.ts"
+  ],
+  "target": "production graph edge selection and growth policy from a synthetic component outcome",
+  "inputs": [
+    "graph",
+    "component exit label",
+    "optional growth"
+  ],
+  "observations": [
+    "selected edge",
+    "growth applied",
+    "source graph unchanged"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/graph-engine-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -5,7 +5,8 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { createLinearIssue, commentLinearIssue, findLinearDecisionIssue, moveLinearIssueToStateType, resolveLinearProjectId } from '../connectors/linear.js';
 import { debug } from '../debug/log.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
-import { getUserConfig, type UserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { DecisionLedger, type DecisionEntry } from './decision-ledger.js';
 
 interface ProjectionRecord { issue: string; closedAt?: string; commentPosted?: boolean }

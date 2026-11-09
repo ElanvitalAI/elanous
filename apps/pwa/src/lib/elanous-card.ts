@@ -41,7 +41,7 @@ export function extractElanousCards(text: string): { text: string; cards: Elanou
     const content = line.replace(/\r?\n$/, '');
 
     if (!open) {
-      const opening = FENCE_OPEN.exec(content);
+      const opening = content.match(FENCE_OPEN);
       if (opening && !(opening[1][0] === '`' && opening[2].includes('`'))) {
         open = {
           marker: opening[1],
@@ -53,7 +53,7 @@ export function extractElanousCards(text: string): { text: string; cards: Elanou
       continue;
     }
 
-    const closing = FENCE_CLOSE.exec(content);
+    const closing = content.match(FENCE_CLOSE);
     if (!closing || closing[1][0] !== open.marker[0] || closing[1].length < open.marker.length) continue;
 
     if (open.isCard) {

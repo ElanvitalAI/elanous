@@ -1,0 +1,58 @@
+{
+  "id": "tui-interaction",
+  "name": "TUI interaction and rendering",
+  "implementation": [
+    "src/ux-sim/interaction.ts",
+    "src/ux-sim/turn-states.ts",
+    "src/core-turn/run-goal-loop.ts",
+    "src/core-turn/seat-turn-cap.ts",
+    "src/ux-sim/render-frame.ts",
+    "src/ux-sim/headless-tui.ts",
+    "src/ux-sim/input-history.ts",
+    "src/ux-sim/slash-menu-frames.ts",
+    "src/ux-sim/mock-seat-pty-frame.ts",
+    "src/ux-sim/mock-seat-pty-frame-child.ts",
+    "src/ux-sim/mock-seat-pty-sequence.ts",
+    "src/ux-sim/mock-seat-pty-sequence-child.ts",
+    "src/ux-sim/pty-key-modifiers-device.ts",
+    "src/ux-sim/tty-foreground-steal-child.ts",
+    "src/ux-sim/user-config-tui-diet-sim.ts"
+  ],
+  "tests": [
+    "src/ux-sim/interaction.test.ts",
+    "src/ux-sim/turn-states.test.ts",
+    "src/ux-sim/render-frame.test.ts",
+    "src/ux-sim/headless-tui.test.ts",
+    "src/ux-sim/input-history.test.ts",
+    "src/ux-sim/slash-menu-frames.test.ts",
+    "src/ux-sim/mock-seat-pty-frame.test.ts",
+    "src/ux-sim/mock-seat-pty-sequence.test.ts",
+    "src/ux-sim/pty-key-modifiers-device.test.ts",
+    "src/ux-sim/agent-output-seat-cap.test.ts",
+    "src/ux-sim/user-config-tui-diet-sim.test.ts"
+  ],
+  "target": "TUI event, state, frame, input history and PTY boundaries",
+  "inputs": [
+    "keys",
+    "turn phase",
+    "PTY bytes",
+    "frame dimensions",
+    "queued input"
+  ],
+  "observations": [
+    "production renderer output",
+    "state transitions",
+    "PTY input/output",
+    "event history",
+    "seat cap returns max_turns before the next iteration; idle draft input and turn-only Esc are accepted",
+    "20-minute cap interrupts a blocking AgentOutput wait while the child remains available"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/interaction.test.ts src/ux-sim/turn-states.test.ts src/ux-sim/render-frame.test.ts src/ux-sim/headless-tui.test.ts src/ux-sim/input-history.test.ts src/ux-sim/slash-menu-frames.test.ts src/ux-sim/mock-seat-pty-frame.test.ts src/ux-sim/mock-seat-pty-sequence.test.ts src/ux-sim/pty-key-modifiers-device.test.ts",
+    "bun test src/ux-sim/agent-output-seat-cap.test.ts",
+    "bun test src/ux-sim/user-config-tui-diet-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -1,0 +1,52 @@
+{
+  "id": "fake-executable",
+  "name": "Fake executable and PATH",
+  "implementation": [
+    "src/ux-sim/fake-bin.ts",
+    "src/ux-sim/fake-bin-install-helper.mjs"
+  ],
+  "tests": [
+    "src/ux-sim/fake-bin.test.ts"
+  ],
+  "target": "PATH-injected external executable boundary with per-run result receipts",
+  "inputs": [
+    "registered executable name",
+    "stdout",
+    "stderr",
+    "exit code",
+    "signal",
+    "delay",
+    "argv",
+    "argv response rules",
+    "allowlisted environment variable names",
+    "caller PATH",
+    "exact install prefix",
+    "declared relative installation artifacts",
+    "canonical exact install prefix",
+    "installer argv",
+    "deterministic inherited-pipe barrier for path replacement tests"
+  ],
+  "observations": [
+    "spawn arguments",
+    "argv-selected stdout/stderr/exit responses",
+    "selected environment values (unset recorded as null)",
+    "stdout/stderr when piped",
+    "exit code or signal",
+    "spawn error",
+    "unknown executable/stdout capture refusal",
+    "no parent-PATH fallback after shim cleanup",
+    "temporary PATH cleanup",
+    "install-prefix mismatch refusal",
+    "fixture artifacts confined to the exact configured prefix",
+    "installer argv mismatch refusal",
+    "prefix and artifact symlink refusal",
+    "install failure and write failure receipts",
+    "ancestor symlink replacement cannot redirect descriptor-relative O_NOFOLLOW artifact writes"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-bin.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

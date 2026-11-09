@@ -1,0 +1,22 @@
+{
+  "id": "UX-MS-12",
+  "name": "Graph runtime overlay event-stream dispatch",
+  "kind": "graph-runtime-event-stream",
+  "device": "sim-event-log-path",
+  "implementation": [
+    "src/ux-sim/graph-runtime-overlay-event-path.ts",
+    "src/ux-sim/graph-runtime-overlay-event-path-worker.ts",
+    "src/ux-sim/scenario.ts",
+    "scenarios/ux-sim/graph-runtime-overlay-event-stream.yaml"
+  ],
+  "tests": [
+    "src/ux-sim/scenario.test.ts"
+  ],
+  "trigger": "Run a real self-implement runtime overlay decision in an isolated worker with safe test seams, then dispatch its production observer event.",
+  "observe": [
+    "applied runtime overlay",
+    "self-implement/graph-overlay-decision in isolated --test logs.db",
+    "runId-scoped scenario completion"
+  ],
+  "expected": "The isolated event row identifies the generated runId, runtime stage, and applied overlay; the worker has an isolated state root and no live model is used."
+}

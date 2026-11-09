@@ -1,6 +1,6 @@
 // 발송 목적(kind) → 텔레그램 채널 역할 · 대상. 가벼운 모듈(telegram.ts 를 import 하지 않는다 — outbound-alert 순환 방지).
 // 명시적으로 매매 kind 인 경우만 trading; 나머지는 system. 역할 채널이 없으면 다른 역할로 폴백하지 않는다.
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { debug } from '../debug/log.js';
 import { resolveTelegramChannels } from './telegram-channels.js';

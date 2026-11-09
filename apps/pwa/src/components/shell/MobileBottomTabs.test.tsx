@@ -81,7 +81,8 @@ test('compact AppShell reserves space for four tabs and more, wide shell has no 
   const daemon = { config, client: new DaemonClient(config), sessionId: 's', setSessionId() {}, setConfig() {} };
   mount(createElement(DaemonContext.Provider, { value: daemon }, createElement(ThemeProvider, null,
     createElement(AppShell, { activity: { kind: 'quiet' }, children: createElement('p', null, 'body') }))));
-  expect(bottomNav().findAllByType('button').map((node) => node.props['aria-label'])).toEqual(['오늘', '대화', '일', '만들기', '더보기']);
+  expect(bottomNav().findAllByType('button').map((node) => node.props['aria-label'])).toEqual(['오늘', '일', '만들기', '더보기']);
+  expect(bottomNav().findAllByType('a').map((node) => [node.props['aria-label'], node.props.href])).toContainEqual(['대화', '/chat']);
   expect(bottomNav().props.className).toContain('h-[calc(3.5rem+env(safe-area-inset-bottom))]');
   expect(bottomNav().props.className).toContain('pb-[env(safe-area-inset-bottom)]');
   expect(bottomNav().findByType('div').props.className).toContain('h-full');
@@ -107,11 +108,11 @@ test('active group follows direct, nested and activeAlso routes, including more'
   expect(bottomNav().findByProps({ 'aria-label': '일' }).props.className).not.toContain('text-primary');
 });
 
-test('multi-item tab opens its visible items; more groups files and settings, operator alone adds ops', () => {
+test('today tab opens its remaining destinations; more groups files and settings, operator alone adds ops', () => {
   mount();
-  const talk = open('대화');
-  expect(talk.findAllByType('a').map((node) => node.props.href)).toEqual(['/chat', '/exec']);
-  act(() => talk.findByProps({ 'aria-label': '메뉴 닫기', className: 'rounded-md p-2' }).props.onClick());
+  const today = open('오늘');
+  expect(today.findAllByType('a').map((node) => node.props.href)).toEqual(['/today', '/intake']);
+  act(() => today.findByProps({ 'aria-label': '메뉴 닫기', className: 'rounded-md p-2' }).props.onClick());
   const more = open('더보기');
   expect(more.findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['자료', '설정']);
   expect(more.findAllByType('a').map((node) => node.props.href)).toContain('/settings');
@@ -120,13 +121,11 @@ test('multi-item tab opens its visible items; more groups files and settings, op
   act(() => tree!.unmount());
   operator = true;
   mount();
-  // RELEASE-LIVE2: 운영자에겐 운영 칸이 시트 맨 위 — 홈에서 «더보기 → 릴리스» 2탭이 접힘 없이 닿는다.
   expect(open('더보기').findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['운영🔒', '자료', '설정']);
-  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href).indexOf('/ops/release')).toBeLessThan(4);
-  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/ops/release');
+  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).not.toContain('/ops/release');
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/loops');
   const operatorHrefs = tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href);
-  expect(operatorHrefs).toContain('/ops/checklist');
+  expect(operatorHrefs).not.toContain('/ops/checklist');
   expect(operatorHrefs).not.toContain('/ceo');
 });
 
@@ -149,9 +148,9 @@ test('single visible item navigates directly without a sheet, and role/Labs hide
   act(() => tree!.unmount());
   store.set(PWA_ROLE_KEY, 'owner');
   mount();
-  expect(open('만들기').findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/design-check', '/apps']);
+  expect(open('만들기').findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor']);
   act(() => { store.set(NAV_SHOW_LABS_KEY, '1'); window.dispatchEvent(new Event(NAV_PREFS_EVENT)); });
-  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/design-check', '/apps', '/workspace', '/showroom']);
+  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/workspace', '/showroom']);
   act(() => { store.set(NAV_SHOW_HIDDEN_KEY, '1'); window.dispatchEvent(new Event(NAV_PREFS_EVENT)); });
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).not.toContain('/control');
   act(() => tree!.root.findByProps({ role: 'dialog' }).findByProps({ 'aria-label': '메뉴 닫기', className: 'rounded-md p-2' }).props.onClick());

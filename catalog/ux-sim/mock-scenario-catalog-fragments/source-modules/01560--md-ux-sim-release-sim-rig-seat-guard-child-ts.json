@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-RELEASE-SIM-RIG-SEAT-GUARD-CHILD-TS",
+  "path": "src/ux-sim/release-sim-rig-seat-guard-child.ts",
+  "boundary": "Provides the child-process seat guard used by the isolated release simulation rig.",
+  "deviceIds": ["release-graph-rig"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

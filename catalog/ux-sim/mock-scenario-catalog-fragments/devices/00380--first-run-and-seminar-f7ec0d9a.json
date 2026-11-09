@@ -1,0 +1,50 @@
+{
+  "id": "first-run-and-seminar",
+  "name": "First-run authoring and seminar scenarios",
+  "implementation": [
+    "src/ux-sim/mock-authoring-first-run.ts",
+    "src/ux-sim/mock-authoring-first-run-child.ts",
+    "src/ux-sim/seminar-rehearsal.ts",
+    "src/ux-sim/classic-tui-seat-scenarios.ts",
+    "src/ux-sim/next-tui-seat-scenarios.ts",
+    "src/ux-sim/session-id-seed.ts"
+  ],
+  "tests": [
+    "src/ux-sim/mock-authoring-first-run.test.ts",
+    "src/ux-sim/seminar-rehearsal.test.ts",
+    "src/ux-sim/classic-tui-seat-scenarios.test.ts",
+    "src/ux-sim/next-tui-seat-scenarios.test.ts"
+  ],
+  "target": "first-run and authoring, scripted classic/next TUI flows, busy classic Escape abort with FIFO inputs, persisted same-build seminar freeze state, and first-screen noise regression through a real isolated PTY",
+  "inputs": [
+    "mock author response",
+    "scenario steps",
+    "seeded session id",
+    "build identifier",
+    "three consecutive rehearsal verdicts",
+    "owner approval receipt",
+    "private simulation world",
+    "first-run Enter skip",
+    "classic busy-turn Escape abort and two-input FIFO ordering"
+  ],
+  "observations": [
+    "step result",
+    "TUI snapshot",
+    "completion and failure markers",
+    "persisted same-build pass count",
+    "frozen state after the third pass",
+    "changed build rejected before rehearsal without owner approval",
+    "approved build transition and owner receipt",
+    "internal prompt-bank event absent from the screen",
+    "daemon setup command absent from the screen",
+    "human web setup guidance visible",
+    "Doctor start event absent after Enter skip",
+    "classic PTY escape abort event and queued user-input order"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/mock-authoring-first-run.test.ts src/ux-sim/seminar-rehearsal.test.ts src/ux-sim/classic-tui-seat-scenarios.test.ts src/ux-sim/next-tui-seat-scenarios.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

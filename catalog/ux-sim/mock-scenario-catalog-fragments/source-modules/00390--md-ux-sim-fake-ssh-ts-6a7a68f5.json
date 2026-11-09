@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-SSH-TS",
+  "path": "src/ux-sim/fake-ssh.ts",
+  "boundary": "Implements GateTools.ssh with scripted host responses, latency, timeout and SCP disconnect outcomes; it opens no SSH connection.",
+  "deviceIds": [
+    "fake-ssh"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

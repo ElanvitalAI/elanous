@@ -1,3 +1,4 @@
+import { isPlainObject } from '../../primitives/guards.js';
 // 5-layer config merge — Layer 1 (framework defaults) → Layer 2
 // (theme preset) → Layer 3 (answer file / config file) → Layer 4
 // (env var override) → Layer 5 (interactive prompt). Each layer is a
@@ -76,7 +77,7 @@ function deepMerge(
       continue;
     }
     const prev = out[key];
-    if (isPlainObject(prev) && isPlainObject(next)) {
+    if (isPlainObject(prev, false, true) && isPlainObject(next, false, true)) {
       out[key] = deepMerge(
         prev as Record<string, unknown>,
         next as Record<string, unknown>,
@@ -97,16 +98,7 @@ function walkAssign(
   for (const key of Object.keys(obj)) {
     const v = obj[key];
     const path = prefix ? `${prefix}.${key}` : key;
-    if (isPlainObject(v)) walkAssign(v as Record<string, unknown>, path, visit);
+    if (isPlainObject(v, false, true)) walkAssign(v as Record<string, unknown>, path, visit);
     else visit(path);
   }
-}
-
-function isPlainObject(v: unknown): boolean {
-  return (
-    typeof v === 'object' &&
-    v !== null &&
-    !Array.isArray(v) &&
-    Object.getPrototypeOf(v) === Object.prototype
-  );
 }

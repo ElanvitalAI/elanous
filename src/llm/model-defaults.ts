@@ -11,7 +11,8 @@
 
 import { lookupLlmTierSpec } from '../model-tier/index.js';
 import type { ModelTier } from '../model-tier/types.js';
-import { getUserConfig, type LLMProviderName, type ReasoningLevel } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { LLMProviderName, ReasoningLevel } from '../user-config/types.js';
 
 /** Provider used for tier defaults. Model-env mismatches are named in
  *  user-config at selection time; this layer stays on the provider ladder

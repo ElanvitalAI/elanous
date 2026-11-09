@@ -61,6 +61,65 @@ test('platform inference distinguishes WSL from ordinary Linux', () => {
   expect(currentMachineSetupPlatform({}, 'win32')).toBe('wsl');
 });
 
+test('Windows WSL setup recommends Windows Codex login and keeps credential mirroring out of scope', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'machine-apply-wsl-guidance-'));
+  const capturePath = join(root, 'capture.json');
+  writeFileSync(capturePath, JSON.stringify(sourceCapture));
+  const output: string[] = [];
+  let calls = 0;
+  const program = new Command();
+  registerMachineApplyFromCaptureCommand(program.command('apply'), {
+    platform: () => 'wsl',
+    wsl: { platform: 'win32', run: () => { calls += 1; return { status: 0 }; } },
+    out: { log: value => output.push(value) },
+  });
+  try {
+    await program.parseAsync(['node', 'eln', 'apply', '--from', capturePath, '--platform', 'wsl']);
+    expect(output[0]).toContain('codex login --device-auth on Windows');
+    expect(output[0]).toContain('Windows owns Codex credentials');
+    expect(output[0]).toContain('WSL setup does not create or refresh them');
+    expect(output[0]).toContain('mirror delivery is a follow-up');
+    expect(output[0]).toContain('No commands executed. Add --yes to apply.');
+    expect(calls).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Windows Codex guidance is printed before scheduling unattended WSL setup', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'machine-apply-wsl-guidance-order-'));
+  const capturePath = join(root, 'capture.json');
+  writeFileSync(capturePath, JSON.stringify(sourceCapture));
+  const output: string[] = [];
+  const calls: string[] = [];
+  let scheduled = 0;
+  const program = new Command();
+  registerMachineApplyFromCaptureCommand(program.command('apply'), {
+    platform: () => 'wsl',
+    wsl: {
+      platform: 'win32', stdinIsTTY: true, executable: 'C:\\Elanous\\bun.exe', entry: 'C:\\Elanous\\elanous.mjs',
+      scheduleResume: () => { scheduled += 1; return { status: 0 }; },
+      run: (command, args) => {
+        calls.push(`${command} ${args.join(' ')}`);
+        return command === 'systeminfo.exe'
+          ? { status: 0, stdout: 'System Manufacturer: Microsoft Corporation\nSystem Model: Windows 11\n' }
+          : { status: 0 };
+      },
+    },
+    out: { log: value => output.push(value) },
+  });
+  try {
+    await program.parseAsync(['node', 'eln', 'apply', '--from', capturePath, '--platform', 'wsl', '--yes']);
+    expect(output[0]).toContain('codex login --device-auth on Windows');
+    expect(output[1]).toContain('WSL install requested');
+    expect(scheduled).toBe(1);
+    expect(calls.some(call => call.includes('--install --distribution Ubuntu --no-launch'))).toBe(true);
+    expect(calls.join('\n')).not.toMatch(/codex login|auth\.json|refresh token/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('machine apply CLI prints reviewable dry-run plan and aggregates package failures', async () => {
   const root = mkdtempSync(join(tmpdir(), 'machine-apply-cli-'));
   const capturePath = join(root, 'capture.json');

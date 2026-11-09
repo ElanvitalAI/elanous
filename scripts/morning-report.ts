@@ -20,14 +20,14 @@ await registerStandaloneLogSink('morning-report');
 
 const dry = process.argv.includes('--dry');
 const cfg = getUserConfig();
-const narrate = cfg.finance.morningNarrative !== false && !process.argv.includes('--no-narrate');
+const narrate = !process.argv.includes('--no-narrate');
 const upload = !process.argv.includes('--no-upload');
 // --narrative-model X / =X — 값이 없으면 parseNarrativeModelArg 가 throw(기본 모델로 조용히 대체하지 않는다).
 const model = parseNarrativeModelArg(process.argv.slice(2));
 
 // finviz S&P 히트맵 이미지 — HTML 상세 리포트에 임베드 + 텔레그램 포토로도 발송. 키 있을 때만.
 let heatmapImageUrl: string | undefined;
-if (cfg.finance.morningHeatmapImage !== false) {
+{ // CONFIG-ALWAYS-TRUE-OUT 11-05 — finance.morningHeatmapImage removed (never set false)
   try {
     const apiKey = getFirecrawlConfig(cfg).apiKey;
     if (apiKey) heatmapImageUrl = (await captureFinvizMapImageUrl(apiKey)) || undefined;

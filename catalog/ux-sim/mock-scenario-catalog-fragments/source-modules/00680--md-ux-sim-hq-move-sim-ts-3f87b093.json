@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-HQ-MOVE-SIM-TS",
+  "path": "src/ux-sim/hq-move-sim.ts",
+  "boundary": "Calls the production HQ move-plan, lease/CAS, transfer, fence, promote, and machine-pool capacity paths; only remote host, standby volume, and clock edges are simulated.",
+  "deviceIds": [
+    "world-runtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

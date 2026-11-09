@@ -24,6 +24,10 @@ describe('createAcpConfirmChannel — confirm→2옵션 ask', () => {
     const ch = createAcpConfirmChannel('s1', pusher({ answers: {}, cancelled: true }));
     expect(await ch.request({ prompt: 'PR?' })).toBeNull();
   });
+  test('agent-authored confirmation cannot approve a public deploy', async () => {
+    const ch = createAcpConfirmChannel('s1', pusher({ answers: { confirm: 'y' }, answeredBy: 'agent' }));
+    expect(await ch.request({ prompt: '배포?', header: '배포', yesLabel: 'y', noLabel: 'N' })).toBeNull();
+  });
   test('2옵션 payload 형태(includeOther=false·prompt+detail)', async () => {
     let seen: any;
     const ch = createAcpConfirmChannel('s1', pusher({ answers: { confirm: 'Yes' } }, (p) => { seen = p; }));

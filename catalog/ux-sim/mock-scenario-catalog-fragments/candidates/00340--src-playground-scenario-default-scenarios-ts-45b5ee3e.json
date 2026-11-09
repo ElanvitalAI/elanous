@@ -1,0 +1,8 @@
+{
+  "path": "src/playground-scenario/default-scenarios.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun test src/playground-scenario/",
+  "logsRecorded": "no",
+  "logsDetail": "Scenario constants consumed by Playground tests.",
+  "excludeReason": "Product demo inputs, not mock-device implementation."
+}

@@ -7,7 +7,7 @@ import type { ChoiceOption } from '../src/onboarding/io-extended.js';
 import { nonInteractiveIO } from '../src/onboarding/non-interactive.js';
 import type { LLMProvider } from '../src/llm.js';
 import type { LlmDetectDeps } from '../src/cli/llm-detect-cli.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { pickCodexAuthMode } from '../src/codex/setup.js';
 import { saveTokens } from '../src/oauth/store.js';
 

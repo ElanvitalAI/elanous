@@ -1,0 +1,67 @@
+{
+  "id": "support-fakes",
+  "name": "Additional fake and in-process CLI fixtures",
+  "implementation": [
+    "test/ux-sim/aimock-local.ts",
+    "src/ux-sim/in-process-cli.ts",
+    "src/ux-sim/in-process-cli-539-file-adoption-sim.ts",
+    "src/ux-sim/browser-hand.ts",
+    "src/ux-sim/fake-browser-page.ts",
+    "src/ux-sim/fake-linear-device.ts",
+    "src/ux-sim/service-key-setup.ts",
+    "src/ux-sim/term-slash-device.ts",
+    "src/ux-sim/safe-public-copy-publish.ts",
+    "src/nexus/api/markdown-publish.ts",
+    "src/publishing/markdown-publisher.ts",
+    "src/publishing/markdown-renderer.ts",
+    "src/publishing/artifact-store.ts",
+    "src/debug/log.ts",
+    "src/ux-sim/fake-app-db-world.ts",
+    "src/ux-sim/fake-relay-world.ts",
+    "src/ux-sim/fake-app-db-backup-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/aimock-local.test.ts",
+    "src/ux-sim/in-process-cli.test.ts",
+    "src/ux-sim/in-process-cli-539-file-adoption-sim.test.ts",
+    "src/ux-sim/browser-hand.test.ts",
+    "src/ux-sim/service-key-setup.test.ts",
+    "src/ux-sim/term-slash-device.test.ts",
+    "test/telegram-surface-hitl.test.ts",
+    "src/ux-sim/safe-public-copy-publish.test.ts",
+    "src/ux-sim/install-consent-device.test.ts",
+    "test/nexus/api/markdown-publish.test.ts",
+    "src/ux-sim/fake-app-db-world.test.ts",
+    "src/ux-sim/fake-relay-world.test.ts"
+  ],
+  "target": "local fake LLM server, browser/linear fakes, service-key setup, terminal slash device and test CLI instance; safe launch-copy redaction and real Markdown publish/serve handlers with isolated storage",
+  "inputs": [
+    "test state root",
+    "fake endpoint response",
+    "temporary git repository",
+    "browser/page and service state",
+    "secret-bearing launch-copy draft",
+    "isolated publish artifact root",
+    "fake unavailable public-upload response"
+  ],
+  "observations": [
+    "isolated CLI result",
+    "server requests",
+    "repository state",
+    "fake device interactions",
+    "redacted private source and served HTML",
+    "production publish receipt and GET /d/:id response",
+    "zero external writes"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/aimock-local.test.ts",
+    "bun test src/ux-sim/in-process-cli-539-file-adoption-sim.test.ts",
+    "bun test test/telegram-surface-hitl.test.ts",
+    "bun test src/ux-sim/safe-public-copy-publish.test.ts test/nexus/api/markdown-publish.test.ts",
+    "bun test src/ux-sim/install-consent-device.test.ts",
+    "bun test src/ux-sim/fake-app-db-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

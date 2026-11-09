@@ -8,7 +8,7 @@ import type {
   RouterDeps,
 } from './router.js';
 import type { OutboundMsg } from './format.js';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 
 export interface GrokbotAdapterOptions {
   sendPrompt: (agent: string, prompt: string) => Promise<{ preview?: string }>;

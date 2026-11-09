@@ -1,0 +1,28 @@
+{
+  "id": "heal-reauthor-materialized",
+  "name": "Materialized-path heal reauthor simulator",
+  "implementation": [
+    "src/ux-sim/heal-reauthor-materialized.ts"
+  ],
+  "tests": [
+    "src/ux-sim/heal-reauthor-materialized.test.ts"
+  ],
+  "target": "Production heal-intake and heal-loop graph boundary with isolated state; relaunch dispatch is intercepted.",
+  "inputs": [
+    "materialized path mismatch",
+    "zero materialized paths",
+    "run id"
+  ],
+  "observations": [
+    "goal-refined event",
+    "reauthor relaunch request/result",
+    "relaunch call count",
+    "isolated run ledger"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/heal-reauthor-materialized.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

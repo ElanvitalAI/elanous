@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaultMsgStorePath, openMsgStore } from '../msg/msg-store.js';
 import { runGraph } from '../graph-runner/runner.js';
+import { writeReleaseGraphFixture } from '../../test/helpers/release-graph-fixture.js';
 import { emitReleaseStageTransition, postReleaseStageMail, startReleaseStageStallWatch, type ReleaseStageState } from './stage-mail.js';
 
 const scratch: string[] = [];
@@ -104,7 +105,7 @@ test('release graph runner emits start and terminal result transitions through t
   const root = mkdtempSync(join(tmpdir(), 'release-stage-runner-')); scratch.push(root);
   const graph = join(root, 'release-loop.yaml');
   writeFileSync(join(root, 'recipes.yaml'), '{}\n');
-  writeFileSync(graph, [
+  writeReleaseGraphFixture(graph, [
     'graph_id: release-loop', 'version: 1', 'entry_node: done', 'terminal_nodes: [done, failed]', 'nodes:',
     '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }',
     '  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }', '',
@@ -131,7 +132,7 @@ test('release graph default stage mail stays in the graph runner state root', as
     expect(externalStorePath).toBe(join(foreignStateRoot, 'msg', 'messages.db'));
     const graph = join(root, 'release-loop.yaml');
     writeFileSync(join(root, 'recipes.yaml'), '{}\n');
-    writeFileSync(graph, [
+    writeReleaseGraphFixture(graph, [
       'graph_id: release-loop', 'version: 1', 'entry_node: done', 'terminal_nodes: [done]', 'nodes:',
       '  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }', '',
     ].join('\n'));
@@ -139,7 +140,8 @@ test('release graph default stage mail stays in the graph runner state root', as
     expect(run.status).toBe('done');
     const isolated = openMsgStore(join(root, 'msg', 'messages.db'));
     try {
-      expect(isolated.listByRecipient('OP')).toHaveLength(2);
+      expect(isolated.listByRecipient('OP').filter(message => message.from === 'TC')).toHaveLength(2);
+      expect(isolated.listByRecipient('OP').filter(message => message.from === 'RLA')).toHaveLength(2);
       expect(isolated.listByRecipient('TC')).toHaveLength(0);
       expect(readdirSync(foreignStateRoot)).toEqual(externalEntriesBefore);
       expect(existsSync(externalStorePath)).toBe(false);

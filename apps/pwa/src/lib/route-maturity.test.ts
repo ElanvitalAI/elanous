@@ -1,19 +1,20 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, readdirSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { ROUTE_MATURITY, routeMaturity, visibleForRole } from './route-maturity';
 import { FEATURE_MATURITY, visibleOn } from '../../../../src/maturity/feature-maturity';
-import { SIDEBAR_NAV_ITEMS, visibleNavGroups } from '../components/shell/sidebar-nav-items';
+import { SIDEBAR_NAV_ITEMS } from '../components/shell/sidebar-nav-items';
 
 const app = resolve(dirname(import.meta.path), '../app');
+const retainedRoutes = ['/', '/404', '/apps', '/chat', '/design-check', '/editor', '/live-run', '/settings', '/setup', '/setup/done', '/term', '/vault'];
 
-function builtPages(directory: string): string[] {
+function builtPages(directory = app): string[] {
   const pages: string[] = [];
-  const walk = (dir: string) => {
+  const walk = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const file = join(dir, entry.name);
       if (entry.isDirectory()) walk(file);
-      else if (entry.isFile() && /^page\.(?:tsx?|jsx?)$/.test(entry.name)) {
+      else if (entry.isFile() && /^page\.(?:ts|tsx|jsx?)$/.test(entry.name)) {
         const segments = relative(directory, dir).split(sep).filter((part) => part && !/^\(.+\)$/.test(part));
         pages.push(segments.length ? `/${segments.join('/')}` : '/');
       }
@@ -23,131 +24,47 @@ function builtPages(directory: string): string[] {
   return [...pages, '/404'];
 }
 
-// The public export omits private pages; this scoped PR also withdraws resources UI while retaining its route grade for the follow-up.
-const exportExcludedPages = ['/pitch', '/ops/resources'].filter(page => !existsSync(join(app, page.slice(1), 'page.tsx')));
-
-describe('PWA route maturity', () => {
-  test('every graded App Router page is classified exactly once (including nested and dynamic pages)', () => {
-    const built = builtPages(app);
+describe('PWA route maturity after screens-out', () => {
+  test('the nine retained pages and generated 404 are the complete classified route set', () => {
+    const built = builtPages();
     expect(new Set(built).size).toBe(built.length);
-    expect(routeMaturity('/exec')).toBe('beta');
-    expect(routeMaturity('/loops')).toBe('beta');
-    expect(routeMaturity('/field')).toBe('beta');
-    expect(Object.keys(ROUTE_MATURITY).sort()).toEqual([...built, ...exportExcludedPages].sort());
+    expect(built.sort()).toEqual([...retainedRoutes].sort());
+    expect(Object.keys(ROUTE_MATURITY).sort()).toEqual([...retainedRoutes].sort());
     expect(ROUTE_MATURITY).toEqual(Object.fromEntries(
       Object.entries(FEATURE_MATURITY.pwaRoute).map(([path, grade]) => [path, grade.pwa]),
     ));
-    expect(ROUTE_MATURITY['/share']).toBe('system');
-    expect(ROUTE_MATURITY['/morning']).toBe('broken');
-    expect(ROUTE_MATURITY['/settings/devices']).toBe('broken');
-    expect(ROUTE_MATURITY['/workflows/chat-ui']).toBe('broken');
-    expect(ROUTE_MATURITY['/scheduler']).toBe('ops');
-    expect(ROUTE_MATURITY['/ops/release']).toBe('ops');
-    expect(ROUTE_MATURITY['/ops/seats']).toBe('ops');
-    expect(ROUTE_MATURITY['/ops/checklist']).toBe('ops');
-    expect(ROUTE_MATURITY['/ceo']).toBeUndefined();
-    expect(ROUTE_MATURITY["/settings"]).toBe("beta");
-    expect(ROUTE_MATURITY['/approvals']).toBe('tool');
-    expect(ROUTE_MATURITY['/chat']).toBe('stable');
-    expect(ROUTE_MATURITY['/today']).toBe('stable');
     for (const item of SIDEBAR_NAV_ITEMS) expect(routeMaturity(item.href)).toBeDefined();
+    for (const removed of ['/autopilot', '/missions/[id]', '/workspace', '/scheduler', '/ops/release']) {
+      expect(routeMaturity(removed)).toBeUndefined();
+    }
   });
 
-  test('role exposure follows the matrix, including settings accessible for everyone', () => {
+  test('role visibility follows the retained routes and preserves beta opt-in', () => {
     for (const [path, maturity] of Object.entries(ROUTE_MATURITY)) {
       const general = visibleForRole('general', path);
       const contributor = visibleForRole('contributor', path);
-      const owner = visibleForRole('owner', path);
-      expect(owner).toBe(true);
-      if (general) expect(contributor).toBe(true);
-      if (contributor) expect(owner).toBe(true);
-      if (maturity === 'broken' || maturity === 'ops') {
-        expect(general).toBe(false);
-        expect(contributor).toBe(false);
-      }
-      if (maturity === 'tool') {
-        expect(contributor).toBe(true);
-        expect(general).toBe(false);
-      }
+      expect(visibleForRole('owner', path)).toBe(true);
       if (maturity === 'stable') expect(general).toBe(true);
-      if (maturity === 'beta') {
-        expect(contributor).toBe(true);
-        expect(general).toBe(path === '/settings');
-      }
-    }
-    expect(visibleForRole('general', '/settings')).toBe(true);
-    expect(visibleForRole('general', '/settings?tab=theme')).toBe(true);
-    expect(visibleForRole('general', '/settings/')).toBe(true);
-    expect(visibleForRole('owner', '/share')).toBe(true);
-    expect(visibleForRole('general', '/share')).toBe(false);
-    expect(visibleForRole('contributor', '/share')).toBe(false);
-    expect(visibleForRole('general', '/unknown')).toBe(false);
-    expect(visibleForRole('general', '/chat')).toBe(true);
-    expect(routeMaturity('/today?view=compact#top')).toBe('stable');
-    expect(visibleForRole('general', '/today')).toBe(true);
-    expect(visibleForRole('contributor', '/today')).toBe(true);
-    expect(visibleForRole('owner', '/today')).toBe(true);
-    expect(visibleForRole('contributor', '/editor')).toBe(true);
-    expect(visibleForRole('general', '/editor')).toBe(true); // EDITOR-NAV-PUBLIC — 편집기는 stable
-    expect(visibleForRole('owner', '/morning')).toBe(true);
-    for (const [path, grade] of Object.entries(FEATURE_MATURITY.pwaRoute)) {
-      expect(routeMaturity(path)).toBe(grade.pwa);
+      if (maturity === 'beta') expect(general).toBe(path === '/settings');
+      expect(visibleForRole('general', path, { showBeta: true })).toBe(maturity === 'beta' || general);
+      expect(contributor).toBe(true);
       for (const role of ['owner', 'contributor', 'general'] as const) {
         expect(visibleForRole(role, path)).toBe(visibleOn(path, 'pwa', role));
       }
     }
-    expect(routeMaturity('/missions/123')).toBeUndefined();
-    expect(visibleForRole('contributor', '/missions/123?view=detail')).toBe(false);
-    expect(routeMaturity('/workflows/chat-ui/')).toBe('broken');
-    expect(visibleForRole('contributor', '/workflows/chat-ui')).toBe(false);
+    expect(visibleForRole('general', '/setup')).toBe(true);
+    expect(visibleForRole('general', '/setup/done')).toBe(true);
+    expect(visibleForRole('general', '/settings')).toBe(true);
+    expect(visibleForRole('general', '/live-run')).toBe(false);
+    expect(visibleForRole('general', '/live-run', { showBeta: true })).toBe(true);
   });
 
-  test('general beta opt-in adds only beta routes without changing other roles or unclassified routes', () => {
-    for (const [path, maturity] of Object.entries(ROUTE_MATURITY)) {
-      const baseline = visibleForRole('general', path);
-      expect(visibleForRole('general', path, { showBeta: false })).toBe(baseline);
-      expect(visibleForRole('general', path, { showBeta: true })).toBe(maturity === 'beta' || baseline);
-      for (const role of ['owner', 'contributor'] as const) {
-        expect(visibleForRole(role, path, { showBeta: true })).toBe(visibleForRole(role, path));
-      }
-    }
-    for (const path of ['/unknown', '/missions/123', '/missions/123/extra', '/share', '/morning', '/approvals', '/scheduler']) {
-      expect(visibleForRole('general', path, { showBeta: true })).toBe(false);
-    }
-    expect(visibleForRole('general', '/missions/123?view=detail', { showBeta: true })).toBe(false);
-    expect(visibleForRole('general', '/settings', { showBeta: false })).toBe(true);
-  });
-
-  test('route lookup preserves exact, normalized, dynamic, and unknown results', () => {
-    for (const [route, { pwa }] of Object.entries(FEATURE_MATURITY.pwaRoute)) {
-      expect(routeMaturity(route)).toBe(pwa);
-      expect(routeMaturity(`${route}?view=compact#top`)).toBe(pwa);
-    }
-    expect(routeMaturity('/missions/123/')).toBeUndefined();
-    expect(routeMaturity('/missions/123?view=detail')).toBeUndefined();
-    for (const route of ['/unknown', '/missions/123/extra', '/chat/extra', '/toString', '/__proto__']) {
+  test('lookup normalizes query and trailing slash but rejects removed or nested routes', () => {
+    expect(routeMaturity('/chat?view=compact#top')).toBe('stable');
+    expect(routeMaturity('/setup/')).toBe('stable');
+    for (const route of ['/unknown', '/workspace', '/autopilot', '/missions/123', '/chat/extra']) {
       expect(routeMaturity(route)).toBeUndefined();
-      for (const role of ['owner', 'contributor', 'general'] as const) {
-        expect(visibleForRole(role, route)).toBe(false);
-      }
+      for (const role of ['owner', 'contributor', 'general'] as const) expect(visibleForRole(role, route)).toBe(false);
     }
-  });
-
-  test('sidebar groups never reintroduce hidden-for-role destinations', () => {
-    const prefs = { showLabs: true, showHidden: true };
-    const hrefs = (role: 'owner' | 'contributor' | 'general') => {
-      const groups = visibleNavGroups(SIDEBAR_NAV_ITEMS, prefs, role);
-      return [...groups.main, ...groups.labs, ...groups.hidden].map((item) => item.href);
-    };
-    const general = hrefs('general');
-    const contributor = hrefs('contributor');
-    const owner = hrefs('owner');
-    expect(general).toContain('/settings');
-    expect(general).not.toContain('/approvals');
-    expect(contributor).toContain('/approvals');
-    expect(contributor).not.toContain('/scheduler');
-    expect(owner).toContain('/scheduler');
-    for (const href of general) expect(contributor).toContain(href);
-    for (const href of contributor) expect(owner).toContain(href);
   });
 });

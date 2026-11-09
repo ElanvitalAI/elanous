@@ -42,6 +42,7 @@ export interface WarmSiReuseEvidence {
       cutShaDistance: number; imageDigestDrift: boolean; reason: string }> }>;
   cleanupObservations: string[];
   ledgerRows: RunLedgerEntry[];
+  returnedChildProofs: Array<{ parentRunId: string; childRunId: string; attemptId: string; leaseId: string; podUid: string }>;
   retryAcquire: string;
   finalPodState: string | undefined;
   artifactCapRejected: boolean;
@@ -130,6 +131,8 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
 
   const cleanupObservations: string[] = [];
   const ledgerRows: RunLedgerEntry[] = [];
+  const returnedChildProofs: WarmSiReuseEvidence['returnedChildProofs'] = [];
+  let activeCommand: SiWarmCommand | undefined;
   const residueAtReturn: Array<ReturnType<PodReuseResidueFaultFixture['residue']>> = [];
   const liveChildPidsAtReturn: number[][] = [];
   let ledgerRowSequence = 0;
@@ -142,14 +145,20 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
     debug.log('pod.reuse', event, data, {
       level: event === 'return-decision' && (data.outcome === 'eligible' || data.outcome === 'returned') ? 'info' : 'warn',
     });
+    const returnedChild = event === 'return-decision' && data.outcome === 'returned' && activeCommand
+      ? { parentRunId: options.ledgerRunId ?? options.runId, childRunId: activeCommand.runId,
+        attemptId: activeCommand.attemptId, leaseId: activeCommand.leaseId, podUid: activeCommand.podUid }
+      : undefined;
+    if (returnedChild) returnedChildProofs.push(returnedChild);
     if (!options.stateRoot) return;
     const row: RunLedgerEntry = { runId: options.ledgerRunId ?? options.runId, event: `pod.reuse.${event}`,
-      data: { ...data, injectionRowId: `${options.ledgerRowPrefix ?? options.runId}:${++ledgerRowSequence}` },
+      data: { ...data, ...(returnedChild ? { childRunId: returnedChild.childRunId,
+        childAttemptId: returnedChild.attemptId, leaseId: returnedChild.leaseId, podUid: returnedChild.podUid } : {}),
+        injectionRowId: `${options.ledgerRowPrefix ?? options.runId}:${++ledgerRowSequence}` },
       timestamp: new Date(now()).toISOString() };
     appendRunLedgerEntry(row, runLedgerDir(options.stateRoot));
     ledgerRows.push(row);
   };
-  let activeCommand: SiWarmCommand | undefined;
   const candidateMatchScores: WarmSiReuseEvidence['candidateMatchScores'] = [];
   const provider = new SiWarmPodProvider({ candidates,
     selection: { kind: 'implementation', imageDigest: specA.key.imageDigest, runtimeContract: specA.runtimeContract! },
@@ -231,7 +240,7 @@ export async function runWarmSiReuseSimulation(options: { runId: string; process
       { capacity: 1, perGoalMemory: '1Gi', accounts: 1, perAccount: 1 }) : null,
     leaseGenerations: [], podUids: [],
     leaseHosts: [], leaseArchitectures: [], recoveryHost: null, cleanupOutcomes: [], controlTransitions: [], candidateMatchScores,
-    cleanupObservations, ledgerRows,
+    cleanupObservations, ledgerRows, returnedChildProofs,
     retryAcquire: 'not-attempted', finalPodState: undefined, artifactCapRejected: false, artifactDecodeCalls: 0,
     residueAtReturn, liveChildPidsAtReturn };
   try {

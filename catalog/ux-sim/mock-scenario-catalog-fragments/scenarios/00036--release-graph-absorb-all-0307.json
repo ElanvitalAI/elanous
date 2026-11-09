@@ -1,0 +1,24 @@
+{
+  "id": "RELEASE-GRAPH-ABSORB-ALL-0307",
+  "name": "0.3.7 publication-day intervention replay",
+  "kind": "release-graph-publication-day-replay",
+  "device": "release-graph-rig",
+  "implementation": [
+    "graphs/release/plugin.json",
+    "graphs/release/release-loop.yaml",
+    "graphs/release/recipes.yaml",
+    "scenarios/ux-sim/release-day-0307-replay.yaml",
+    "src/ux-sim/release-day-0307-replay.ts"
+  ],
+  "tests": [
+    "src/ux-sim/release-day-0307-replay.test.ts"
+  ],
+  "trigger": "Replay all 15 ordered 0.3.7 publication-day interventions through the actual release-loop graph and its declared recipe, policy, edge, and HITL boundaries.",
+  "observe": [
+    "A1-A15 retain incident order, rationale, and one runId",
+    "every recipe and domain-pack binding is declared by the real release graph manifest",
+    "gate remains independent of export-check",
+    "the graph run reaches approve-publish and no other HITL node"
+  ],
+  "expected": "The release graph simulator accounts for all 15 interventions with RLA evidence and pauses at the declared publication approval boundary."
+}

@@ -25,7 +25,7 @@ export function hardRehearsalGateVersion(version: string, runId: string): string
 
 export function hardRehearsalGateArgs(version: string, runId: string, commit: string, previous: string, pool: string): string[] {
   return ['scripts/release-loop/gate-node-cli.ts', '--commit', commit, '--version', hardRehearsalGateVersion(version, runId),
-    '--baseline-version', previous, '--executor', 'pod', '--pod-pool', pool, '--pod-shards', String(HARD_REHEARSAL_POD_SHARDS), '--rehearsal-baseline', '--json'];
+    '--baseline-version', previous, '--run-id', runId, '--executor', 'pod', '--pod-pool', pool, '--pod-shards', String(HARD_REHEARSAL_POD_SHARDS), '--rehearsal-baseline', '--json'];
 }
 
 export interface LiveRadiusDecision { plan: PartialPlan | null; reason: string; rehearsalRunId?: string }

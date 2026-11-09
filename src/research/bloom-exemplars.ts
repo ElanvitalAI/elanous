@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 import { readFileSync, statSync } from 'node:fs';
 import { BLOOM_2D_SCOPED, isBloom2DScoped, type Bloom2D } from '../knowledge/kgs/types.js';
 
@@ -120,9 +121,6 @@ export function getBloomExemplarContext(request: string, packPath = process.env.
   return { domain, domainSignal, source, count: selected.length, levels, context };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
 function isDomain(value: unknown): value is BloomExemplarDomain {
   return typeof value === 'string' && (BLOOM_EXEMPLAR_DOMAINS as readonly string[]).includes(value);
 }

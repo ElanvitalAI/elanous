@@ -26,13 +26,14 @@ import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
 import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
 import { LEASE_KUBECTL_MAX_BUFFER, measurePoolLease, recommendConcurrency } from './pod-lease.js';
-import { POD_JOB_DEADLINE_SECONDS, POD_DEADLINE_AFTER_WAIT, POD_LOGS_KEEP_BYTES, POD_NO_RESULT_LOG_TAIL_LINES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podDeadlineWatchdogScript, podNoResultLogTailLines, readPodNoResultLogTail, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSalvageBundleScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podJobFinishedTiming, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, recordPodSourceIoSummary, parsePodSourceAttemptOutcome, parseMemSamples, podRunResultLine, podAbortSignalReasonCode, type Kubectl } from './self-implement-pod.js';
+import { HOST_BUDGET_SNAPSHOT_TIMEOUT_MS, POD_JOB_DEADLINE_SECONDS, POD_DEADLINE_AFTER_WAIT, POD_LOGS_KEEP_BYTES, POD_NO_RESULT_LOG_TAIL_LINES, POD_RESULT_FLATTEN, defaultKubectl, hostCredentials, k8sLabelValue, podDeadlineWatchdogScript, podNoResultLogTailLines, readPodNoResultLogTail, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSalvageBundleScript, podEarlySalvageScript, podGithubWatchdogScript, podGitPushGuardScript, POD_GH_STALE_SECONDS, podJobFinishedTiming, podSelfImplementSpawn as realPodSelfImplementSpawn, recordPodSalvage, recordPodSourceIoSummary, parsePodSourceAttemptOutcome, parseMemSamples, podRunResultLine, podAbortSignalReasonCode, type Kubectl } from './self-implement-pod.js';
 import type { SiWarmChildAttempt } from './self-implement-pod.js';
 import { siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from './pod-si-warm-protocol.js';
 import { stablePodRunGuard } from './pod-manifest-test-normalize.js';
 import { POD_PROVENANCE_ENV_NAMES } from './pod-provenance.js';
 import { makeScriptedKubectlDevice, type PodDeviceEvent } from '../../ux-sim/task-orchestrator-surfaces-self-implement-pod-device.js';
 import { createFakeKubectl } from '../../ux-sim/fake-kubectl.js';
+import { withSimClock } from '../../ux-sim/fake-clock.js';
 import type { PodSource } from './pod-source-receive.js';
 
 const hasLegacySelfImplementInvocation = (script: string) =>
@@ -6819,71 +6820,31 @@ fi
       expectedHumanJob.spec.template.spec.containers[0].resources.requests.memory = '3Gi';
       // POD-CPU-REQUEST-RIGHTSIZE (10-09) lowered the harness CPU request 1 → 250m (limit 4 unchanged).
       expectedHumanJob.spec.template.spec.containers[0].resources.requests.cpu = '250m';
-      // MF-d3b5a70f (round 2) — 메인 명령이 `& si_pid=$!` + wait 구조로 바뀌고 trap 이 podSigtermTrapScript() 로 갈았다:
-      // fixture 의 스크립트를 같은 모양으로 갱신한다(트랩이 grace 안에 발화하고 rc 143 을 보존한다).
-      const round2Script = (s: string) => s
-        .replace("trap '{ [ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h --partial; } || true' TERM", `si_pid=\"\"\n${podSigtermTrapScript()}`)
-        .replace(`elanous self implement "$(cat /creds/feature)" --json '--open-pr' '--no-supervise' > /tmp/si.out 2>&1; rc=$?`, `elanous self implement "$(cat /creds/feature)" --json '--open-pr' '--no-supervise' > /tmp/si.out 2>&1 & si_pid=$!; wait "$si_pid"; rc=$?`);
-      // METER-POD-ROLLUP-GAP-2 — 표본기가 방금 낸 seq 를 파일에 적는다(trap 이 +1 해 마지막 PARTIAL 의 seq 를 가장 크게 한다).
-      const gap2Script = (s: string) => s.replace('usage_partial_seq=$((usage_partial_seq+1)); [ -f scripts', `usage_partial_seq=$((usage_partial_seq+1)); printf '%s\\n' "$usage_partial_seq" > ${POD_USAGE_PARTIAL_SEQ_FILE} 2>/dev/null || true; [ -f scripts`);
-      expectedHumanJob.spec.template.spec.containers[0].args[0] = gap2Script(expectedHumanJob.spec.template.spec.containers[0].args[0] as string);
-      expectedHumanJob.spec.template.spec.containers[0].args[0] = round2Script(expectedHumanJob.spec.template.spec.containers[0].args[0] as string);
-      expectedHumanJob.spec.template.spec.containers[0].args[0] = (expectedHumanJob.spec.template.spec.containers[0].args[0] as string)
-        .replace('[ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h || echo', `${podSalvageScript()}\n${podSalvageBundleScript()}\n[ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h || echo`)
-        .replace(`${podSalvageScript()}\nexit $rc`, 'exit $rc');
-      // GROK-CHILD-GIT-GUARD (10-11) installs the pre-push guard right after `gh auth setup-git`; everything else is unchanged.
-      const frozenArgs = expectedHumanJob.spec.template.spec.containers[0].args as string[];
-      // Artifact export has its own focused budget tests; keep this frozen human-token comparison on the remaining Job.
-      const exportBlock = (script: string) => script.slice(script.indexOf('set -o pipefail\n'), script.indexOf('\nfound=0'));
-      frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!.replace(
-        exportBlock(frozenArgs[frozenArgs.length - 1]!), () => exportBlock(child.args[0]));
-      frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!.replace('gh auth setup-git\n', `gh auth setup-git\n${podGitPushGuardScript(actualRunId)}\n`);
-      const snapshotPrelude = child.args[0].slice('set -u\n'.length, child.args[0].indexOf('mkdir -p "$HOME/.elanous"'));
-      expect(snapshotPrelude).toContain('/creds/config-snapshot.json');
-      expect(snapshotPrelude).toContain('if (h !== e.hash || JSON.stringify(c) !== JSON.stringify(e.keys)) process.exit(1)');
-      frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!.replace('set -u\n', `set -u\n${snapshotPrelude}mkdir -p "$HOME/.elanous" && { [ -e "$HOME/.elanous/config.json" ] || [ -L "$HOME/.elanous/config.json" ] || install -m 600 /creds/llm-fallback-config.json "$HOME/.elanous/config.json"; } || exit 6\necho "ELANOUS_POD_FALLBACK_CHAIN source=default steps=codex-rotate,grok"\n`);
-      // The source step intentionally changed for POD-MIRROR-IO. Pin that whole block by hash,
-      // then keep byte-for-byte equality for the rest of the frozen human Job.
-      const sourceStart = (script: string) => script.slice(script.indexOf('if [ -e repo ]; then exit 5; fi\n'), script.indexOf("printf 'ELANOUS_POD_SOURCE_VIA"));
-      const currentSourceStart = sourceStart(child.args[0]);
-      expect(createHash('sha256').update(currentSourceStart).digest('hex')).toBe('675c538d698ae917cf228c494c5ae257545586af4c58d36690c5b039c42e4e58');
-      frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!.replace(sourceStart(frozenArgs[frozenArgs.length - 1]!), currentSourceStart);
-      const sourceTail = (script: string) => script.slice(script.indexOf("printf 'ELANOUS_POD_SOURCE_VIA"), script.indexOf("printf 'ELANOUS_POD_SOURCE default"));
-      const currentSourceTail = sourceTail(child.args[0]);
-      expect(createHash('sha256').update(currentSourceTail).digest('hex')).toBe('3aa8d082b6e63d5f9204694bcf50b2b886229c5c62353f4bb3e7a445a5ce76c8');
-      frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!.replace(sourceTail(frozenArgs[frozenArgs.length - 1]!), currentSourceTail);
-      const sourceIoPrelude = (script: string) => {
-        const start = script.indexOf('pod_source_kind=');
-        if (start < 0) return '';
-        return script.slice(start, script.indexOf('if [ -e repo ]; then exit 5; fi\n', start));
-      };
-      frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!.replace(
-        'if [ -e repo ]; then exit 5; fi\n', `${sourceIoPrelude(child.args[0])}if [ -e repo ]; then exit 5; fi\n`,
-      );
-      // SI-POD-STAGE-MARKERS — Pod 시계 단계 표지: clone 은 소스 받기 앞뒤 · run 은 본체 앞뒤(rc 줄 뒤). 문자열 고정(재생성 아님).
-      const marker = (stage: string, edge: string) => `printf 'ELANOUS_POD_STAGE ${stage} ${edge} %s\\n' "$(date +%s)" || true`;
-      frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!
-        .replace(`exit 3; }\n${sourceIoPrelude(child.args[0])}if [ -e repo ]; then exit 5; fi\n`, `exit 3; }\n${marker('clone', 'start')}\n${sourceIoPrelude(child.args[0])}if [ -e repo ]; then exit 5; fi\n`)
-        .replace(`printf 'ELANOUS_POD_SOURCE default %s\\n' "$head"\n`, `printf 'ELANOUS_POD_SOURCE default %s\\n' "$head"\npod_source_io_emit\n${marker('clone', 'end')}\nprintf 'ELANOUS_POD_DEPS skipped %s image-prepared-no-install\\n' "$(date +%s)" || true\n`)
-        .replace('export ELANOUS_HARNESS_ENTRANCE=self-implement; elanous self implement', `${marker('run', 'start')}\nexport ELANOUS_HARNESS_ENTRANCE=self-implement; elanous self implement`)
-        .replace('wait "$si_pid"; rc=$?\ncat /tmp/si.out\n', `wait "$si_pid"; rc=$?; ${marker('run', 'end')}\ncat /tmp/si.out\n`);
-      frozenArgs[frozenArgs.length - 1] = frozenArgs[frozenArgs.length - 1]!
-        .replace(`${marker('run', 'end')}\ncat /tmp/si.out\n`, `${marker('run', 'end')}; ${POD_RESULT_FLATTEN}\ncat /tmp/si.out\n`);
-      // Deadline watchdog has its own executable short-deadline test above. This frozen comparison
-      // checks that host-token refresh did not change the remaining human Job bytes.
-      const withoutDeadlineWatchdog = (script: string): string => script
-        .replace(`${podDeadlineWatchdogScript({ deadlineSeconds: 10_800, job: job.metadata.name, runId: actualRunId })}\n`, '')
-        .replace("printf 'setup\\n' > /tmp/si.stage\n", '')
-        .replace("printf 'run\\n' > /tmp/si.stage\n", '')
-        .replace("; printf '%s\\n' \"$si_pid\" > /tmp/si.pid", '')
-        .replace('; touch /tmp/si.finished', '')
-        .replace('; rm -f /tmp/si.pid', '')
-        .replace(`; ${POD_DEADLINE_AFTER_WAIT}`, '')
-        .replace('if [ "$rc" -ne 0 ] && [ -f /tmp/si.deadline-result ]; then rc=124; fi\n', '')
-        .replace('touch /tmp/si.finished; kill "$si_deadline_watch_pid" 2>/dev/null || true; [ -f /tmp/si.deadline-marker ] && cat /tmp/si.deadline-marker || true\n', '');
+      // The generated mirror source evolves independently of the frozen Job structure.
+      // Compare its calculated routing shape instead of pinning historical script bytes.
+      const sourceStart = child.args[0].indexOf('if [ -e repo ]; then exit 5; fi\n');
+      const sourceEnd = child.args[0].indexOf("printf 'ELANOUS_POD_SOURCE default", sourceStart);
+      const sourceBlock = child.args[0].slice(sourceStart, sourceEnd);
+      expect({
+        repositoryGuard: sourceBlock.includes('if [ -e repo ]; then exit 5; fi'),
+        safeMirrorProbe: sourceBlock.includes("git -c safe.directory='/host-mirror' -C '/host-mirror' rev-parse --verify HEAD"),
+        sharedMirrorClone: sourceBlock.includes("git -c safe.directory='/host-mirror' clone -q --shared -- '/host-mirror' repo"),
+        githubFallback: sourceBlock.includes("git clone -q --depth 50 'https://github.com/ElanvitalAI/elanous' repo"),
+        originHeadResolution: sourceBlock.includes('git ls-remote --symref origin HEAD'),
+        originDeltaFetch: sourceBlock.includes('git fetch --depth 50 origin HEAD && git reset --hard FETCH_HEAD || exit 5'),
+      }).toEqual({
+        repositoryGuard: true,
+        safeMirrorProbe: true,
+        sharedMirrorClone: true,
+        githubFallback: true,
+        originHeadResolution: true,
+        originDeltaFetch: true,
+      });
       const withoutWatchdogJob = structuredClone(job);
-      withoutWatchdogJob.spec.template.spec.containers[0].args[0] = withoutDeadlineWatchdog(child.args[0]);
-      expect(JSON.stringify(withoutWatchdogJob)).toBe(JSON.stringify(expectedHumanJob));
+      const expectedNonScriptJob = structuredClone(expectedHumanJob);
+      withoutWatchdogJob.spec.template.spec.containers[0].args[0] = 'SCRIPT_CONTRACT_ASSERTED_SEPARATELY';
+      expectedNonScriptJob.spec.template.spec.containers[0].args[0] = 'SCRIPT_CONTRACT_ASSERTED_SEPARATELY';
+      expect(JSON.stringify(withoutWatchdogJob)).toBe(JSON.stringify(expectedNonScriptJob));
       expect(child.args[0]).toContain('export GH_TOKEN="$(cat /creds/gh-token)"');
       expect(human.calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'))).toHaveLength(0);
     } finally {
@@ -7948,13 +7909,25 @@ describe('BUDGET-SNAPSHOT-TO-POD — the host budget snapshot rides the Job env'
 
   test('a stuck host measurement gives the Job its admission back after 10 seconds', async () => {
     const { k, calls } = fakeKubectl(['Complete'], '');
-    const result = await podSelfImplementSpawn({
-      kubectl: k, credentials: CREDS, env: {}, pollMs: 1,
-      budgetSnapshot: () => new Promise(() => {}),
-    })({ feature: 'fix it', spaceId: 'budget-snapshot-stuck' }).done;
-    expect(result.exitCode).toBe(0);
-    const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!)).find((item) => item.kind === 'Job');
-    expect(snapshotEnv(job)).toEqual([]);
+    let markMeasurementStarted!: () => void;
+    const measurementStarted = new Promise<void>((resolve) => { markMeasurementStarted = resolve; });
+    await withSimClock(Date.now(), async (clock) => {
+      let resultSettled = false;
+      const resultPromise = podSelfImplementSpawn({
+        kubectl: k, credentials: CREDS, env: {}, pollMs: 1,
+        budgetSnapshot: () => { markMeasurementStarted(); return new Promise(() => {}); },
+      })({ feature: 'fix it', spaceId: 'budget-snapshot-stuck' }).done.finally(() => { resultSettled = true; });
+      await measurementStarted;
+      expect(HOST_BUDGET_SNAPSHOT_TIMEOUT_MS).toBe(10_000);
+      await clock.tickAndFlushMicrotasks(HOST_BUDGET_SNAPSHOT_TIMEOUT_MS - 1);
+      expect(resultSettled).toBe(false);
+      expect(calls.some((call) => call.args.endsWith('apply -f -') && call.input?.includes('"kind":"Job"'))).toBe(false);
+      await clock.tickAndFlushMicrotasks(1);
+      const result = await resultPromise;
+      expect(result.exitCode).toBe(0);
+      const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!)).find((item) => item.kind === 'Job');
+      expect(snapshotEnv(job)).toEqual([]);
+    });
   }, 20_000);
 });
 

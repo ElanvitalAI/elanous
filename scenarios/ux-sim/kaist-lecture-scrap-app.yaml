@@ -1,0 +1,14 @@
+world: kaist-lecture-scrap-app
+seed: 1114
+clock: { start: '2100-11-14T00:00:00Z', speed: 60 }
+apps:
+  - slug: lecture-scrap
+    versions:
+      - id: v1
+        files:
+          index.html: '<main><h1>스크랩 목록</h1><article>분산 시스템 특강</article></main>'
+          notes/new.html: '<main><h1>노트 작성</h1><textarea aria-label="강의 노트"></textarea></main>'
+          search.html: '<main><h1>검색</h1><input aria-label="자료 검색"></main>'
+steps:
+  - observe: kaist-lecture-scrap
+    staticBuildRequired: true

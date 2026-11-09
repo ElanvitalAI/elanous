@@ -1,0 +1,23 @@
+{
+  "id": "backend-tier-device",
+  "name": "Backend tier advice host profiles",
+  "implementation": [
+    "src/ux-sim/backend-tier-device.ts"
+  ],
+  "tests": [
+    "src/ux-sim/backend-tier-device.test.ts"
+  ],
+  "target": "Fake host profiles drive backend tier advice without probing or changing the machine",
+  "inputs": [
+    "host profile (cores, memory, disk)"
+  ],
+  "observations": [
+    "recommended backend tier and reason"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/backend-tier-device.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

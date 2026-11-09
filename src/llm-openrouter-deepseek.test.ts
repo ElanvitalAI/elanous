@@ -10,10 +10,11 @@ import {
 } from './llm/openrouter-deepseek.js';
 import { DEFAULT_OPENROUTER_UPSTREAM_PINS } from './llm/openrouter-upstream-pins.config.js';
 import { buildUserConfig } from './user-config.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withFakeFetchDevice, type FakeFetchRouteRequest } from './ux-sim/fake-fetch.js';
 
 const FLASH = 'openrouter/deepseek/deepseek-v4.1-flash';
 const PRO = 'openrouter/deepseek/deepseek-v4-pro-0813';
@@ -24,6 +25,14 @@ function sse(chunks: unknown[]): Response {
   return new Response(text, { status: 200, headers: { 'content-type': 'text/event-stream' } });
 }
 
+function llmFetchRoutes(onRequest: (request: FakeFetchRouteRequest) => void, response: () => Response = () => sse([])) {
+  return ['/api/v1/chat/completions', '/v1/messages', '/v1/chat/completions', '/backend-api/codex/responses']
+    .map((url) => ({ url, method: 'POST' as const, response: (request: FakeFetchRouteRequest) => {
+      onRequest(request);
+      return response();
+    } }));
+}
+
 async function capture(
   model: string,
   messages: LLMMessage[],
@@ -31,18 +40,13 @@ async function capture(
   llmExtra: Record<string, unknown> = {},
 ): Promise<Record<string, any>> {
   const bodies: string[] = [];
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-    bodies.push(String(init?.body));
-    return new Response('data: [DONE]\n\n', { status: 200 });
-  }) as typeof fetch);
-  try {
+  await withFakeFetchDevice(llmFetchRoutes((request) => bodies.push(request.body ?? '')), async (device) => {
     const config = { llm: { provider: 'openrouter', model, apiKey: 'test-key', ...llmExtra } } as unknown as UserConfig;
     for await (const _ of getProviderForConfig(config).streamChat!(messages, opts)) { /* consume */ }
     expect(bodies.length).toBe(1);
-    return JSON.parse(bodies[0]!);
-  } finally {
-    mock.mockRestore();
-  }
+    expect(device.calls()).toHaveLength(bodies.length);
+  });
+  return JSON.parse(bodies[0]!);
 }
 
 const hello: LLMMessage[] = [{ role: 'user', content: 'hello' }];
@@ -57,17 +61,13 @@ test('① openrouter/deepseek/* → open-weight 군 · 맨 deepseek/* (LM Studio
 
 test('① 실 OpenRouter 배선: deepseek 요청에 open-weight 도구 규율이 실린다', async () => {
   const bodies: any[] = [];
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-    bodies.push(JSON.parse(String(init?.body)));
-    return sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }]);
-  }) as typeof fetch);
-  try {
+  await withFakeFetchDevice(llmFetchRoutes((request) => bodies.push(JSON.parse(request.body ?? '{}')),
+    () => sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }])), async (device) => {
     const provider = getProviderForConfig({ llm: { provider: 'openrouter', model: FLASH, apiKey: 'k' } } as unknown as UserConfig);
     await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' },
       { provider, tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }], maxTurns: 2, model: FLASH });
-  } finally {
-    mock.mockRestore();
-  }
+    expect(device.calls()).toHaveLength(bodies.length);
+  });
   const sys = (bodies[0].messages as any[]).filter((m) => m.role === 'system').map((m) => String(m.content));
   expect(sys.some((t) => t.includes(OPEN_WEIGHT_TOOL_DISCIPLINE))).toBe(true);
   expect(bodies[0].model).toBe('deepseek/deepseek-v4.1-flash');
@@ -80,17 +80,13 @@ const TUNE_IMPL_LINE = '- 구현을 끝냈다고 말하기 전에 바꾼 파일�
 
 async function captureToolBodies(model: string): Promise<string[]> {
   const bodies: string[] = [];
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-    bodies.push(String(init?.body));
-    return sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }]);
-  }) as typeof fetch);
-  try {
+  await withFakeFetchDevice(llmFetchRoutes((request) => bodies.push(request.body ?? ''),
+    () => sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }])), async (device) => {
     const provider = getProviderForConfig({ llm: { provider: 'openrouter', model, apiKey: 'k' } } as unknown as UserConfig);
     await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' },
       { provider, tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }], maxTurns: 2, model });
-  } finally {
-    mock.mockRestore();
-  }
+    expect(device.calls()).toHaveLength(bodies.length);
+  });
   return bodies;
 }
 
@@ -108,17 +104,13 @@ test('①-a GLM(open-weight) 요청에 튜닝 두 줄이 실린다 — 상수 �
 test('①-a 대조: codex·claude 요청에는 튜닝 두 줄이 실리지 않는다', async () => {
   for (const [provider, model] of [['openai-codex', 'gpt-5.6-terra'], ['anthropic', 'claude-sonnet-4-5']] as const) {
     const bodies: string[] = [];
-    const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-      bodies.push(String(init?.body));
-      return sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }]);
-    }) as typeof fetch);
-    try {
+    await withFakeFetchDevice(llmFetchRoutes((request) => bodies.push(request.body ?? ''),
+      () => sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }])), async (device) => {
       const prov = getProviderForConfig({ llm: { provider, model, apiKey: 'k' } } as unknown as UserConfig);
       await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' },
         { provider: prov, tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }], maxTurns: 1, model });
-    } finally {
-      mock.mockRestore();
-    }
+      expect(device.calls()).toHaveLength(bodies.length);
+    });
     expect(bodies.length).toBeGreaterThan(0);
     const all = bodies.join('\n');
     expect(all).not.toContain('[open-weight tool-use discipline]');
@@ -217,16 +209,14 @@ test('④ 파서: 텍스트만 낸 턴의 추론은 플래그가 있을 때만 �
 });
 
 test('④ 도구 루프: deepseek 최종 텍스트 턴이 추론을 들고 history 로 나가고, 다음 요청에 되돌아간다', async () => {
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async () => sse(reasoningChunks)) as unknown as typeof fetch);
   let turnMessages: LLMMessage[] = [];
-  try {
+  await withFakeFetchDevice(llmFetchRoutes(() => {}, () => sse(reasoningChunks)), async (device) => {
     const provider = getProviderForConfig({ llm: { provider: 'openrouter', model: FLASH, apiKey: 'k' } } as unknown as UserConfig);
     await streamLLMWithTools([{ role: 'user', content: 'go' }],
       { onText() {}, dispatchTool: async () => 'ok', onTurnComplete: (m) => { turnMessages = m; } },
       { provider, tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }], maxTurns: 2, model: FLASH });
-  } finally {
-    mock.mockRestore();
-  }
+    expect(device.calls()).toHaveLength(1);
+  });
   const last = turnMessages.at(-1)!;
   expect(last.role).toBe('assistant');
   expect(last.content).toEqual([{ type: 'text', text: 'answer', providerMeta: { reasoningDetails: [{ type: 'reasoning.text', index: 0, text: 'think' }] } }]);
@@ -235,16 +225,14 @@ test('④ 도구 루프: deepseek 최종 텍스트 턴이 추론을 들고 histo
 });
 
 test('④ 대조: GLM 도구 루프의 최종 텍스트 턴엔 providerMeta 가 없다', async () => {
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async () => sse(reasoningChunks)) as unknown as typeof fetch);
   let turnMessages: LLMMessage[] = [];
-  try {
+  await withFakeFetchDevice(llmFetchRoutes(() => {}, () => sse(reasoningChunks)), async (device) => {
     const provider = getProviderForConfig({ llm: { provider: 'openrouter', model: GLM, apiKey: 'k' } } as unknown as UserConfig);
     await streamLLMWithTools([{ role: 'user', content: 'go' }],
       { onText() {}, dispatchTool: async () => 'ok', onTurnComplete: (m) => { turnMessages = m; } },
       { provider, tools: [{ name: 'Read', description: 'd', parameters: { type: 'object' } }], maxTurns: 2, model: GLM });
-  } finally {
-    mock.mockRestore();
-  }
+    expect(device.calls()).toHaveLength(1);
+  });
   expect(turnMessages.at(-1)!.content).toEqual([{ type: 'text', text: 'answer' }]);
 });
 

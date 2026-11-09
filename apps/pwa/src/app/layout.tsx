@@ -17,7 +17,7 @@ const geist = Geist({ subsets: ['latin'], variable: '--font-sans' });
 
 export const metadata: Metadata = {
   title: 'elanous',
-  description: 'elanous — voice · chat · intake · control · terminal.',
+  description: 'elanous — terminal · chat · live run · vault · settings · graph editor.',
   manifest: '/app/manifest.webmanifest',
   applicationName: 'elanous',
   // 대표 확정 아이콘 V6 «엘랑 소용돌이» — 원천 docs/brand/icon/ (2026-09-30)

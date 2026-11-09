@@ -10,6 +10,7 @@ import { displayedSlashCommandNames, filterSlashCommands, SLASH_COMMANDS, type S
 import { createPickerState, type PickerBufferView } from '../src/chat/pickers/state.js';
 import { setUserConfigOverlay } from '../src/user-config.js';
 import { FEATURE_MATURITY } from '../src/maturity/feature-maturity.js';
+import { readTuiSlashAudience, slashVisibleFor } from '../src/maturity/tui-slash-maturity.js';
 
 describe('MAT1c slash picker visibility', () => {
   afterEach(() => setUserConfigOverlay(null));
@@ -33,67 +34,72 @@ describe('MAT1c slash picker visibility', () => {
     expect(displayedSlashCommandNames()).not.toContain('directive');
   });
 
-  it('lets only the owner discover and select the hidden ops /directive command', async () => {
+  it('legacy role preferences cannot hide the local owner /directive command', async () => {
     const state = picker();
-    setAudience({ role: 'owner' });
-    expect(state.slashFiltered(buf('/dir')).map(({ name }) => name)).toEqual(['directive']);
-    expect(await state.dispatch({ name: 'tab' } as import('../src/tui.js').Key, buf('/dir'))).toMatchObject({
-      consumed: true, action: { kind: 'splice', text: '/directive' },
-    });
-    for (const role of ['general', 'contributor'] as const) {
-      setAudience({ role });
-      expect(state.slashFiltered(buf('/dir'))).toEqual([]);
+    const ownerNames = names(state);
+    for (const role of ['owner', 'general', 'contributor'] as const) {
+      for (const showBeta of [false, true]) {
+        setAudience({ role, showBeta });
+        expect(names(state)).toEqual(ownerNames);
+        expect(readTuiSlashAudience()).toEqual({ role: 'owner', showBeta: false });
+        expect(state.slashFiltered(buf('/dir')).map(({ name }) => name)).toEqual(['directive']);
+        expect(await state.dispatch({ name: 'tab' } as import('../src/tui.js').Key, buf('/dir'))).toMatchObject({
+          consumed: true, action: { kind: 'splice', text: '/directive' },
+        });
+      }
     }
   });
 
-  it('preserves a supplied command absent from the maturity catalogue for owner only', async () => {
+  it('owner picker preserves supplied commands absent from the maturity catalogue', async () => {
     const state = createPickerState({ commands: [{ name: 'ghost', description: 'External registered slash' }] });
-    for (const role of ['general', 'contributor'] as const) {
+    for (const role of ['owner', 'general', 'contributor'] as const) {
       setAudience({ role });
-      expect(state.slashFiltered(buf('/ghost')).map(({ name }) => name)).not.toContain('ghost');
-      expect(await state.dispatch({ name: 'tab' } as import('../src/tui.js').Key, buf('/gh'))).toEqual({ consumed: false });
-      expect(await state.dispatch({ name: 'enter' } as import('../src/tui.js').Key, buf('/ghost'))).toEqual({ consumed: false });
+      expect(state.slashFiltered(buf('/ghost')).map(({ name }) => name)).toEqual(['ghost']);
+      expect(await state.dispatch({ name: 'tab' } as import('../src/tui.js').Key, buf('/gh'))).toMatchObject({
+        consumed: true, action: { kind: 'splice', text: '/ghost' },
+      });
     }
-    setAudience({ role: 'owner' });
-    expect(state.slashFiltered(buf('/ghost')).map(({ name }) => name)).toEqual(['ghost']);
-    expect(await state.dispatch({ name: 'tab' } as import('../src/tui.js').Key, buf('/gh'))).toMatchObject({
-      consumed: true, action: { kind: 'splice', text: '/ghost' },
-    });
   });
 
-  it('general hides tool and ops; showBeta adds beta only', () => {
-    setAudience({ role: 'general' });
+  it('general visibility policy remains explicit while legacy general settings do not change the owner picker', () => {
     const state = picker();
-    expect(names(state)).toContain('help');
-    expect(names(state)).not.toContain('research');
-    for (const name of names(state)) expect(FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash]).toBe('stable');
+    const ownerNames = names(state);
+    setAudience({ role: 'general' });
+    expect(names(state)).toEqual(ownerNames);
+    expect(ownerNames).toContain('directive');
     setAudience({ role: 'general', showBeta: true });
-    expect(names(state)).not.toContain('research');
-    for (const name of names(state)) expect(['stable', 'beta']).toContain(FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash]);
-    expect(names(state)).not.toContain('debug');
-    expect(names(state)).not.toContain('directive');
+    expect(names(state)).toEqual(ownerNames);
+    expect(slashVisibleFor('help', 'general', { showBeta: false })).toBe(true);
+    expect(slashVisibleFor('directive', 'general', { showBeta: true })).toBe(false);
+    expect(slashVisibleFor('research', 'general', { showBeta: false })).toBe(false);
+    expect(slashVisibleFor('research', 'general', { showBeta: true })).toBe(true);
+    expect(slashVisibleFor('debug', 'general', { showBeta: true })).toBe(false);
   });
 
-  it('contributor sees tool and beta but not ops', () => {
+  it('contributor visibility policy remains explicit while legacy contributor settings do not change the owner picker', () => {
+    const ownerNames = names(picker());
     setAudience({ role: 'contributor' });
-    const visible = names(picker());
-    expect(visible).toContain('help');
-    expect(visible).not.toContain('research');
-    expect(visible).not.toContain('debug');
-    expect(visible).not.toContain('directive');
-    for (const name of visible) expect(FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash]).not.toBe('ops');
+    expect(names(picker())).toEqual(ownerNames);
+    expect(slashVisibleFor('help', 'contributor', { showBeta: false })).toBe(true);
+    expect(slashVisibleFor('directive', 'contributor', { showBeta: false })).toBe(false);
+    for (const name of Object.keys(FEATURE_MATURITY.tuiSlash)) {
+      const grade = FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash];
+      if (grade === 'tool' || grade === 'beta') expect(slashVisibleFor(name, 'contributor', { showBeta: false })).toBe(true);
+    }
   });
 
-  it('hidden slash is not suggested or autocompleted but exact typed name passes through Enter', async () => {
+  it('owner sees and autocompletes /directive even with a retired general preference', async () => {
     setAudience({ role: 'general' });
     const state = picker();
     const typed = buf('/directive');
     await state.refresh(typed);
-    expect(state.slashFiltered(typed)).toEqual([]);
-    expect(await state.dispatch({ name: 'tab' } as import('../src/tui.js').Key, typed)).toEqual({ consumed: false });
-    expect(await state.dispatch({ name: 'enter' } as import('../src/tui.js').Key, typed)).toEqual({ consumed: false });
+    expect(state.slashFiltered(typed).map(({ name }) => name)).toEqual(['directive']);
+    expect(await state.dispatch({ name: 'tab' } as import('../src/tui.js').Key, buf('/dir'))).toMatchObject({
+      consumed: true, action: { kind: 'splice', text: '/directive' },
+    });
     expect(state.mode(typed)).toBe('slash');
   });
+
 });
 
 describe('filterSlashCommands', () => {

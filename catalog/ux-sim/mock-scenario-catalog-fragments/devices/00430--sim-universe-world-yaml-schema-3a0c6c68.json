@@ -1,0 +1,35 @@
+{
+  "id": "sim-universe-world-yaml-schema",
+  "name": "Simulation world YAML schema",
+  "implementation": [
+    "src/ux-sim/world-schema.ts",
+    "src/ux-sim/event-monkey.ts",
+    "src/ux-sim/fake-app-host.ts",
+    "src/ux-sim/mock-scenario-catalog.ts"
+  ],
+  "tests": [
+    "src/ux-sim/world-schema.test.ts",
+    "src/ux-sim/mock-scenario-catalog.test.ts"
+  ],
+  "target": "RFC A2 world declaration, arbitrary ledger/log injections and chaos/recovery shape plus catalog-backed device and event reference validation",
+  "inputs": [
+    "world YAML",
+    "arbitrary ledger/log injection declarations",
+    "chaos fault schedule",
+    "expect.recovers budgets",
+    "registered mock device IDs",
+    "registered world event IDs"
+  ],
+  "observations": [
+    "normalized world specification",
+    "field-path shape errors",
+    "fault and recovery budget validation",
+    "unknown device and event reference errors"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/world-schema.test.ts src/ux-sim/mock-scenario-catalog.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

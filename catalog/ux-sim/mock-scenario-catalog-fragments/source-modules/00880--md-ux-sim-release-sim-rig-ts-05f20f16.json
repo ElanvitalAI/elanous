@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-RELEASE-SIM-RIG-TS",
+  "path": "src/ux-sim/release-sim-rig.ts",
+  "boundary": "Parses release rehearsal cases and runs production release-decision stages against injected records without publishing a release.",
+  "deviceIds": [
+    "release-graph-rig"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

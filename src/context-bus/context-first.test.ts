@@ -13,7 +13,7 @@ import { appendMessage, createSession, findSessionByTelegramChat, loadSession } 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 test('first note is pending once; recent utterances do not re-arm; six hours of silence re-arms', () => {
   let time = 0;

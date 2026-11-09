@@ -1,3 +1,4 @@
+import { isStringArray } from '../primitives/guards.js';
 /**
  * run-checkpoint/v1 묶음 스키마 — 런의 «체크포인트» 스냅샷을 판 번호 있는 타입으로 직렬화한다.
  *
@@ -116,7 +117,6 @@ export function bundleSha256(bundle: Omit<RunCheckpointBundle, 'sha256'>): strin
   return sha256Hex(rest);
 }
 
-const isStringArray = (v: unknown): boolean => Array.isArray(v) && v.every((x) => typeof x === 'string');
 const isNullableString = (v: unknown): boolean => v === null || typeof v === 'string';
 
 /**

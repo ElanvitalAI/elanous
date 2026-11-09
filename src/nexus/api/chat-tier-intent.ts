@@ -38,7 +38,8 @@ import {
   type NlTierApplyPlan,
   type NlTierDetection,
 } from '../../model-tier/index.js';
-import { buildUserConfig, userConfigPath, type UserConfig } from '../../user-config.js';
+import { buildUserConfig, userConfigPath } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {

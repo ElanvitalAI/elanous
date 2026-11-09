@@ -1,0 +1,28 @@
+{
+  "id": "flutter-deploy-journey",
+  "name": "Flutter app create, simulate, confirm, and publish journey",
+  "implementation": [
+    "src/ux-sim/flutter-deploy-journey.ts"
+  ],
+  "tests": [
+    "src/ux-sim/flutter-deploy-journey.test.ts"
+  ],
+  "target": "Create a Flutter app, build its APK, require a passing simulation and explicit confirmation, then publish only to the assigned app origin.",
+  "inputs": [
+    "spoken app request",
+    "simulated deployment result",
+    "ACP confirmation answer"
+  ],
+  "observations": [
+    "create and APK build calls",
+    "simulation receipt",
+    "confirmation outcome",
+    "published URL bound to the created app origin"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/flutter-deploy-journey.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -19,7 +19,7 @@ import {
   releaseTurn,
 } from '../src/session/session-input-arbiter.js';
 import { createTelegramAcpBridge } from '../src/telegram-acp-bridge.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { waitForSocket } from './helpers/wait-for-socket.js';
 
 let tmp: string;

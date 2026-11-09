@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-RESEARCH-DECISION-CHAIN-TS",
+  "path": "src/ux-sim/research-decision-chain.ts",
+  "boundary": "Runs the production Think Lens decision chain in a worker with captured event/log evidence, then checks stage output and evidence ancestry markers.",
+  "deviceIds": [
+    "research-decision-chain"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

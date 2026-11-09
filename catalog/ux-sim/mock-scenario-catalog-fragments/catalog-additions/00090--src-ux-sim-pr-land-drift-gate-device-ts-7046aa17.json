@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/pr-land-drift-gate-device.ts",
+  "reason": "LAND-DRIFT-GATE-PRODUCER simulation device uses production pinned-base drift parsing and refusal classification."
+}

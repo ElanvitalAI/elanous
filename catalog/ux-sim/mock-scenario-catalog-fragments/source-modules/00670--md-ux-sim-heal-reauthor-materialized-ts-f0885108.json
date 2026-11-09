@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-HEAL-REAUTHOR-MATERIALIZED-TS",
+  "path": "src/ux-sim/heal-reauthor-materialized.ts",
+  "boundary": "heal reauthor materialized: 진짜 heal-loop와 role 스크립트를 돌린다. 재작성 뒤 dispatch만 가짜로 받아 외부 구현 런은 만들지 않는다.",
+  "deviceIds": [
+    "heal-reauthor-materialized"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

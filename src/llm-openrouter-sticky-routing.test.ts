@@ -1,8 +1,9 @@
 import type { LLMToolSpec } from './llm/tool-spec.js';
 // OR-STICKY-ROUTING (2026-10-10) — OpenRouter 요청에 세션/런 단위 고정 라우팅 키(body session_id ⊕ x-session-id).
-import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { getProviderForConfig, openRouterStickySessionKey, streamLLMWithTools } from './llm.js';
-import type { UserConfig } from './user-config.js';
+import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import type { UserConfig } from './user-config/types.js';
 
 const tools: LLMToolSpec[] = [{ name: 'Read', description: 'd', parameters: { type: 'object', properties: { p: { type: 'string' } } } }];
 const messages = [{ role: 'system' as const, content: 'sys' }, { role: 'user' as const, content: 'hello' }];
@@ -13,17 +14,15 @@ afterEach(() => { if (savedRunId === undefined) delete process.env.ELANOUS_RUN_I
 
 async function capture(provider: string, model: string, opts: Record<string, unknown> = {}, prefs?: Record<string, unknown>) {
   const out: { raw: string; headers: Record<string, string> }[] = [];
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-    out.push({ raw: String(init?.body), headers: Object.fromEntries(new Headers(init?.headers as HeadersInit).entries()) });
-    return new Response('data: [DONE]\n\n', { status: 200 });
-  }) as typeof fetch);
-  try {
+  await withFakeFetchDevice([
+    { url: '/api/v1/chat/completions', method: 'POST', response: (request) => { out.push({ raw: request.body ?? '', headers: { ...request.headers } }); return new Response('data: [DONE]\n\n', { status: 200 }); } },
+    { url: '/v1/chat/completions', method: 'POST', response: (request) => { out.push({ raw: request.body ?? '', headers: { ...request.headers } }); return new Response('data: [DONE]\n\n', { status: 200 }); } },
+  ], async (device) => {
     const config = { llm: { provider, model, apiKey: 'test-key', ...(provider === 'local' ? { baseUrl: 'http://localhost:1234/v1' } : {}), ...(prefs ? { openrouter: { providerPreferences: prefs } } : {}) } } as UserConfig;
     for await (const _ of getProviderForConfig(config).streamChat!(messages, { tools, ...opts })) { /* consume */ }
-    return { ...out[0]!, body: JSON.parse(out[0]!.raw) as Record<string, any> };
-  } finally {
-    mock.mockRestore();
-  }
+    expect(device.calls()).toHaveLength(1);
+  });
+  return { ...out[0]!, body: JSON.parse(out[0]!.raw) as Record<string, any> };
 }
 
 test('key: session id wins over run id; neither → null', () => {
@@ -108,23 +107,21 @@ test('tool loop: streamLLMWithTools carries the same sessionId into every OpenRo
   const bodies: Record<string, any>[] = [];
   const resolved: string[] = [];
   let call = 0;
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-    bodies.push(JSON.parse(String(init?.body)));
+  await withFakeFetchDevice([{ url: '/api/v1/chat/completions', method: 'POST', response: (request) => {
+    bodies.push(JSON.parse(request.body ?? 'null'));
     call++;
     const sse = call === 1
       ? 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"Read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: [DONE]\n\n'
       : 'data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
     return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
-  }) as typeof fetch);
-  try {
+  } }], async (device) => {
     const provider = getProviderForConfig({ llm: { provider: 'openrouter', model: 'openrouter/z-ai/glm-5.3', apiKey: 'k' } } as UserConfig);
     await streamLLMWithTools([{ role: 'user', content: 'go' }], { onText() {}, dispatchTool: async () => 'ok' }, {
       provider, tools, maxTurns: 3, sessionId: 'sess-loop',
       onResolvedProvider: (actualProvider, actualModel) => resolved.push(`${actualProvider}/${actualModel}`),
     });
-  } finally {
-    mock.mockRestore();
-  }
+    expect(device.calls()).toHaveLength(2);
+  });
   expect(bodies.length).toBeGreaterThanOrEqual(2);
   for (const b of bodies) expect(b.session_id).toBe('sess-loop');
   expect(resolved).toContain('openrouter/openrouter/z-ai/glm-5.3');

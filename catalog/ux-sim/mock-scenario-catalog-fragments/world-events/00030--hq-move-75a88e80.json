@@ -1,0 +1,5 @@
+{
+  "id": "hq-move",
+  "name": "HQ host move",
+  "description": "Run the real HQ lease, promotion, fence, and pool-capacity paths against isolated host boundaries."
+}

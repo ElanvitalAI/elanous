@@ -24,7 +24,7 @@ import { createPublicKey } from 'node:crypto';
 import { loadOrCreateRelayHostIdentity } from '../../relay/host-connector.js';
 import { startRelayServer } from '../../relay/relay-server.js';
 import { loadNexusAppHost } from '../apps/app-host.js';
-import { createAppLifecycleEvent, projectAppLifecycleSnapshot } from '../apps/app-lifecycle-ledger.js';
+import { createAppLifecycleEvent, projectAppLifecycleSnapshot, type AppLifecycleSnapshot } from '../apps/app-lifecycle-ledger.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -808,12 +808,19 @@ test('GET /v1/apps returns the apps page contract using mounted manifests and ad
       : { slug, title: 'Long Name', description: '' },
     handle: () => undefined,
     issueInvitation: () => { throw new Error('unused'); },
+    databaseBackupStatus: (slug: string) => slug === 'voice-note' ? { databaseId: 'app:voice-note', state: 'healthy', keyRef: 'NEXUS_BACKUP_KEY' } : null,
+    restoreDatabaseBackup: () => { throw new Error('unused'); },
     close: () => undefined,
   };
   const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
     metaApi: { bearerToken: 'auth', noAuth: false },
     appHost: appHost as never,
     appLifecycleSnapshot: slug => slug === 'voice-note' ? lifecycle : null,
+    appSimulationSnapshot: slug => slug === 'voice-note' ? { status: 'passed', runId: 'sim-run-1',
+      events: [{ id: 'sim-event-1', kind: 'app.sim.step', appId: slug, runId: 'sim-run-1', ts: 100,
+        data: { step: 'transcription', message: '받아쓰기 확인', receiptId: 'sim-receipt-1' } }],
+      receipts: [{ id: 'sim-receipt-1', appId: slug, runId: 'sim-run-1', createdAt: '2026-11-08T12:00:00.000Z', outcome: 'passed', summary: '완료' }] }
+      : { status: 'not-created', events: [], receipts: [] },
     appPreviewUserSlug: '1234567890abcdef1234',
   });
   try {
@@ -825,13 +832,19 @@ test('GET /v1/apps returns the apps page contract using mounted manifests and ad
       {
         slug: 'voice-note', name: 'Voice Note', description: 'Capture notes',
         lifecycle,
-        simulation: { status: 'not-created', href: 'https://voice-note-sim--1234567890abcdef1234.elanous.app' },
+        backup: { databaseId: 'app:voice-note', state: 'healthy', keyRef: 'NEXUS_BACKUP_KEY' },
+        simulation: { status: 'passed', runId: 'sim-run-1', receipt: 'sim-receipt-1',
+          events: [{ id: 'sim-event-1', kind: 'app.sim.step', appId: 'voice-note', runId: 'sim-run-1', ts: 100,
+            data: { step: 'transcription', message: '받아쓰기 확인', receiptId: 'sim-receipt-1' } }],
+          receipts: [{ id: 'sim-receipt-1', appId: 'voice-note', runId: 'sim-run-1', createdAt: '2026-11-08T12:00:00.000Z', outcome: 'passed', summary: '완료' }],
+          href: 'https://voice-note-sim--1234567890abcdef1234.elanous.app' },
         production: { status: 'not-created', href: new URL(server.url).origin },
       },
       {
         slug: 'a'.repeat(21), name: 'Long Name', description: '',
         lifecycle: null,
-        simulation: { status: 'not-created' },
+        backup: null,
+        simulation: { status: 'not-created', events: [], receipts: [] },
         production: { status: 'not-created', href: new URL(server.url).origin },
       },
     ] });
@@ -851,6 +864,8 @@ test('GET /v1/apps still lists mounted apps when its preview identity is unavail
     getManifest: () => ({ slug: 'voice-note', title: 'Voice Note', description: 'Capture notes' }),
     handle: () => undefined,
     issueInvitation: () => { throw new Error('unused'); },
+    databaseBackupStatus: (slug: string) => slug === 'voice-note' ? { databaseId: 'app:voice-note', state: 'healthy', keyRef: 'NEXUS_BACKUP_KEY' } : null,
+    restoreDatabaseBackup: () => { throw new Error('unused'); },
     close: () => undefined,
   };
   const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
@@ -863,9 +878,37 @@ test('GET /v1/apps still lists mounted apps when its preview identity is unavail
     expect(await response.json()).toEqual({ apps: [{
       slug: 'voice-note', name: 'Voice Note', description: 'Capture notes',
       lifecycle: null,
-      simulation: { status: 'not-created' },
+      backup: { databaseId: "app:voice-note", state: "healthy", keyRef: "NEXUS_BACKUP_KEY" },
+      simulation: { status: 'not-created', events: [], receipts: [] },
       production: { status: 'not-created', href: new URL(server.url).origin },
     }] });
+  } finally { server.stop(); }
+});
+
+test('GET /v1/apps keeps live apps available when simulation storage is unavailable', async () => {
+  const appHost = {
+    slugs: ['voice-note'],
+    getManifest: () => ({ slug: 'voice-note', title: 'Voice Note', description: '' }),
+    handle: () => undefined,
+    issueInvitation: () => { throw new Error('unused'); },
+    close: () => undefined,
+  };
+  const lifecycle = projectAppLifecycleSnapshot('voice-note', [createAppLifecycleEvent({
+    appId: 'voice-note', action: 'promoted', environment: 'live', actor: 'system',
+  }, { id: () => 'published-1' })]);
+  const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+    metaApi: { bearerToken: 'auth', noAuth: false }, appHost: appHost as never,
+    appLifecycleSnapshot: () => lifecycle,
+    appSimulationSnapshot: () => { throw new Error('simulation database unavailable'); },
+  });
+  try {
+    const response = await fetch(`${server.url}/v1/apps`, { headers: {
+      'sec-fetch-site': 'cross-site', authorization: 'Bearer auth',
+    } });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { apps: Array<{ lifecycle: AppLifecycleSnapshot | null; simulation: { status: string } }> };
+    expect(body.apps[0]?.lifecycle).toEqual(lifecycle);
+    expect(body.apps[0]?.simulation).toMatchObject({ status: 'unavailable', events: [], receipts: [] });
   } finally { server.stop(); }
 });
 

@@ -91,6 +91,11 @@ nodes:
       inputs: [failure-signature]
       outputs: [observations]
 
+  - node_id: observe-deeper-human
+    kind: hitl
+    recipe: approval:observe-deeper-failure
+    max_visits: 1
+
   - node_id: ground-external
     kind: observe
     recipe: ground-external         # omni-crawl · fc-dev · 공식 문서 — 근거를 인용으로 (해상도 +2)
@@ -149,7 +154,11 @@ edges:
 
   - from: observe-deeper
     on: outcome
-    map: { ok: triage, empty: triage }
+    map: { ok: triage, empty: triage, fail: observe-deeper-human, error: observe-deeper-human }
+
+  - from: observe-deeper-human
+    on: outcome
+    map: { ok: failed, fail: failed, error: failed }
 
   - from: ground-external
     on: outcome

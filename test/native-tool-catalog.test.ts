@@ -328,11 +328,11 @@ describe('nativeToolCatalog — metadata invariants', () => {
     // Nine seat-message/checklist tools are skill+tui only. Keep the exact
     // distribution so a new host exposure (notably MCP/chat) fails here.
     // elanous_ux_sim_devices adds one intentionally MCP-only read-only catalog entry.
-    expect(nativeToolCatalog).toHaveLength(199);
-    expect([...distribution.entries()].sort()).toEqual([
+    const expectedDistribution: [string, number][] = [
       // CTX2 #23185 — context_now(맥락 한 문 · READ-ONLY 자기관측)가 MCP 에 더해졌다.
       ['mcp', 22],
-      ['skill', 33],
+      // The five Phone adb operations are skill tools (#35968).
+      ['skill', 38],
       ['skill,tui', 99],
       // 🆕 AskUserQuestion — 챗에서 띄운 자식이 사람에게 «되물을» 수 있어야 한다(2026-09-08).
       //   ⛔ #16003 이 SelfImplement 만 열고 이 짝을 안 열어서 챗 자식은 물을 도구가 없었다.
@@ -343,7 +343,10 @@ describe('nativeToolCatalog — metadata invariants', () => {
       ['skill,tui,mcp,chat', 1],
       ['tui', 6],
       ['tui,mcp', 2],
-    ]);
+    ];
+    const expectedCatalogSize = expectedDistribution.reduce<number>((total, [, count]) => total + count, 0);
+    expect(nativeToolCatalog).toHaveLength(expectedCatalogSize);
+    expect([...distribution.entries()].sort()).toEqual([...expectedDistribution].sort());
   });
 
   test('Linear issue action is advertised only to the TUI/MCP hosts with mutating network metadata', () => {

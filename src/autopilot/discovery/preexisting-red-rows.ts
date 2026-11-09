@@ -1,3 +1,4 @@
+import { isRecord } from '../../primitives/guards.js';
 // ── Self-Evolution SE1 · gate.baseline 로그 조회 → 스캐너 행 변환 ────────
 //
 // 로그 조회 산출을 받아 scanPreexistingRed 가 먹을 수 있는 행 목록과 셈을 낸다.
@@ -22,10 +23,6 @@ export interface PreexistingRedRowsResult {
   readonly unreadable: number;
   /** 조회 절단 표시. 없으면 거짓 — 「모른다」로 두지 않는다. */
   readonly truncated: boolean;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function isMetaLine(item: unknown): item is { readonly _meta: Record<string, unknown> } {

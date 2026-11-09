@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/release-same-version-run-adoption-sim.test.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/release-same-version-run-adoption-sim.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Assertions inspect real graph-runner failure and resume states, the restored gate input, and isolated ledger count.",
+  "deviceId": "release-same-version-run-adoption-sim",
+  "scenarioIds": [
+    "SIM-RELEASE-SAME-VERSION-RUN-ADOPTION"
+  ]
+}

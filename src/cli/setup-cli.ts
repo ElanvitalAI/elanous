@@ -9,7 +9,8 @@ import { applyClaudePluginSetup, planClaudePluginSetup } from './claude-plugin-s
 import { recommendedSetup } from './setup-recommend.js';
 import { detectSkillCliAuth, type CliAuthStatus } from '../onboarding/cli-auth-status.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig, saveUserConfig, userConfigPath, type UserConfig } from '../user-config.js';
+import { getUserConfig, saveUserConfig, userConfigPath } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { collectServiceKeys, printKeySetupReport } from '../onboarding/key-setup.js';
 import { getSecretAsync, setSecretAsync } from '../nexus/config/secrets/index.js';
 import { probeProvider } from '../llm/provider-probe.js';

@@ -3,7 +3,7 @@ import { Command } from 'commander';
 import { formatDoctorReport, registerDoctorCommand, runDoctor } from './doctor-cli.js';
 import { formatDoctorLocalLlm, localInventory, probeDoctorLocalLlm } from './doctor-local-llm.js';
 import type { LlmInventory, LlmModel, LlmNode } from '../llm/local-manager/types.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 const node: LlmNode = {
   id: 'local', label: 'local', isLocal: true, lastProbedAt: 1, reachable: true,

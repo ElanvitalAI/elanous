@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-APP-AUTH-TS",
+  "path": "src/ux-sim/fake-app-auth.ts",
+  "boundary": "Signed app-scoped invitation acceptance and temporary-token-backed host-only sessions (simulation boundary).",
+  "deviceIds": [
+    "fake-app-auth"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

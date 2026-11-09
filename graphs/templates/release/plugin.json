@@ -1,0 +1,133 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "release-graph",
+  "version": "1.0.0",
+  "description": "General release graph template for application and service publishers.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [
+        "./release.yaml"
+      ],
+      "capabilities": [
+        "fs:workdir",
+        "proc:bun",
+        "proc:git"
+      ],
+      "pricing": {
+        "model": "free"
+      },
+      "trust": "official",
+      "category": "Development",
+      "graphManifests": {
+        "release-template": {
+          "id": "release-template",
+          "version": "1.0.0",
+          "purpose": "Cut, test, triage, approve, publish and verify a caller's release.",
+          "allow": {
+            "recipes": [
+              "cmd:cut",
+              "cmd:gate",
+              "cmd:triage",
+              "cmd:publish-command",
+              "cmd:npm-publish",
+              "cmd:verify",
+              "approval:publish"
+            ],
+            "skills": [],
+            "domainPacks": [],
+            "maxSideEffects": "publish"
+          },
+          "policy": {
+            "executor": {
+              "type": "enum",
+              "default": "local",
+              "bounds": [
+                "local",
+                "remote-hosts",
+                "pod-pool"
+              ]
+            },
+            "shards": {
+              "type": "int",
+              "default": 1,
+              "bounds": [
+                1,
+                32
+              ]
+            },
+            "fanout.hosts": {
+              "type": "ref",
+              "default": "none"
+            },
+            "fanout.hostTags": {
+              "type": "ref",
+              "default": "none"
+            },
+            "pod.warmPool": {
+              "type": "boolean",
+              "default": false
+            },
+            "pod.reuse": {
+              "type": "boolean",
+              "default": false
+            },
+            "receipt.reuse": {
+              "type": "boolean",
+              "default": true
+            },
+            "gate.bisect.mode": {
+              "type": "enum",
+              "default": "shadow",
+              "bounds": [
+                "shadow",
+                "operational"
+              ]
+            },
+            "heal.maxAttempts": {
+              "type": "int",
+              "default": 2,
+              "bounds": [
+                1,
+                3
+              ]
+            },
+            "gate.accept.list": {
+              "type": "accept-item[]",
+              "default": [],
+              "scope": "instance"
+            },
+            "pod.pool": {
+              "type": "ref",
+              "default": "none"
+            }
+          },
+          "hitl": [
+            "approve-publish"
+          ],
+          "resources": {
+            "tier": "gate",
+            "hostTags": [],
+            "podPools": []
+          },
+          "observe": {
+            "categories": [
+              "release",
+              "graph"
+            ]
+          },
+          "terminal": {
+            "done": "success",
+            "failed": "failure"
+          },
+          "extensionPoints": {
+            "after-publish": {
+              "after": "publish",
+              "before": "verify",
+              "failure": "failed"
+            }
+          }
+        }
+      }
+    }
+  }
+}

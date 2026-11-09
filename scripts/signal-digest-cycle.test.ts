@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { unknownCronFlag } from '../src/domains/cron-flag-contract.js';
 import { auditCronFlags } from './cron-flag-audit.js';
 import { createDigestPhotoSender } from './signal-digest-photo.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);

@@ -1,0 +1,30 @@
+{
+  "scenario": "DEMO-1114-PHONE-PWA-SELFHEAL",
+  "source": "simulator",
+  "liveDevice": false,
+  "viewport": {
+    "width": 360,
+    "height": 800,
+    "device": "fake-fold"
+  },
+  "frames": [
+    {
+      "id": "before-repair",
+      "ctaLeft": 300,
+      "ctaRight": 460,
+      "verdict": "clipped"
+    },
+    {
+      "id": "after-repair",
+      "ctaLeft": 184,
+      "ctaRight": 344,
+      "verdict": "visible"
+    }
+  ],
+  "graph": [
+    "phone-observe",
+    "viewport-judge",
+    "responsive-repair",
+    "phone-reobserve"
+  ]
+}

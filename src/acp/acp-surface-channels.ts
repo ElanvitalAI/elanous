@@ -35,14 +35,15 @@ export function createAcpConfirmChannel(sessionId: string, pusher: AcpAskPusher)
         id: nextAskId(sessionId, req.requestId),
         request: {
           questions: [{
-            id: 'confirm', header: '승인', question,
+            id: 'confirm', header: req.header ?? '승인', question,
             options: [{ label: yes, description: '' }, { label: no, description: '' }],
+            ...(req.header === '배포' ? { recommendedIndex: 1 } : {}),
             includeOther: false,
           }],
         },
       };
       const result = await pusher(sessionId, payload);
-      if (!result || result.cancelled) {
+      if (!result || result.cancelled || result.answeredBy === 'agent') {
         debug.log('acp.surface-channel', 'confirm-drop', { sessionId, reason: result ? 'cancelled' : 'no-peer' });
         return null; // drop → requestConfirmation fail-closed
       }

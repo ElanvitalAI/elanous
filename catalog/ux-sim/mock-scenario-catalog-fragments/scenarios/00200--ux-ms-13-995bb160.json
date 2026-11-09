@@ -1,0 +1,25 @@
+{
+  "id": "UX-MS-13",
+  "name": "Second release-gate pool pin and host failover",
+  "kind": "gate-roster-failover",
+  "device": "fault-injection",
+  "implementation": [
+    "src/ux-sim/gate-roster-second-pool.ts",
+    "scripts/release-loop/gate-node.ts",
+    "scripts/release-loop/gate-image-pin.ts",
+    "src/task-orchestrator/surfaces/pod-pool.ts",
+    "src/task-orchestrator/surfaces/gate-pod-pool-policy.ts"
+  ],
+  "tests": [
+    "src/ux-sim/gate-roster-second-pool.test.ts",
+    "src/task-orchestrator/surfaces/gate-pod-pool-policy.test.ts"
+  ],
+  "trigger": "Run the gate with node-b and mshq image fingerprints, then inject one host loss or both host losses.",
+  "observe": [
+    "same pinned digest eligibility across both pools",
+    "surviving pool receives retried shards after one host loss",
+    "both-host loss ends as measurement unavailable",
+    "gate hosts are excluded from the concurrent harness task pool"
+  ],
+  "expected": "both matching pools participate; one failed host is removed and the other completes the sweep; two failed hosts never produce a reduced-roster pass; image digest mismatch is refused"
+}

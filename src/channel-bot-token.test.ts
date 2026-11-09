@@ -12,7 +12,7 @@ import { resolveReportTarget } from './telegram-report.js';
 import { startTelegramPollers, setTelegramPollLockForTesting } from './telegram-run.js';
 import { wireNexusTelegramQaPollers } from './nexus/index.js';
 import { getUserConfig, resetUserConfig, saveUserConfig } from './user-config.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-CLASSIC-TUI-SEAT-SCENARIOS-TS",
+  "path": "src/ux-sim/classic-tui-seat-scenarios.ts",
+  "boundary": "Runs the classic TUI first-run, authoring and scripted interaction scenarios against the real CLI in a pinned isolated universe, then captures screen and persisted-state evidence.",
+  "deviceIds": [
+    "first-run-and-seminar"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

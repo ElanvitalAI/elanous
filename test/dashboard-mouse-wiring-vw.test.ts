@@ -6,7 +6,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import { createDashboardMouseWiring } from '../src/dashboard/input/mouse-wiring.js';
-import type { RotationEntry } from '../src/user-config.js';
+import type { RotationEntry } from '../src/user-config/types.js';
 import type { ActiveProviderInfo } from '../src/provider-summary.js';
 import type { ModalSurface } from '../src/display/modal-stack.js';
 import { createWorkspaceHost } from '../src/display/workspace-host.js';

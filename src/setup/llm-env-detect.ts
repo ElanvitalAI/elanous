@@ -17,7 +17,7 @@
 // in the runtime, not by the LLM picker.
 
 import { debug } from '../debug/log.js';
-import type { LLMProviderName } from '../user-config.js';
+import type { LLMProviderName } from '../user-config/types.js';
 
 export type DetectableProvider = Exclude<LLMProviderName, 'auto'>;
 

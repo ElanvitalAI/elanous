@@ -1,3 +1,4 @@
+import { isFiniteNumber, isNonEmptyString, isRecord, isStringArray } from '../primitives/guards.js';
 // ── market_posture 저장소 어댑터 (RFC §S3 · 2026-07-14) ────────────────────
 //
 // MarketPosture v2 계약(src/domains/market-posture.ts)의 유일한 canonical sink.
@@ -62,33 +63,17 @@ export interface PublishResult {
 
 const VALID_FRESHNESS: ReadonlySet<FreshnessStatus> = new Set(['FRESH', 'STALE', 'UNKNOWN']);
 
-function isFiniteNumber(v: unknown): v is number {
-  return typeof v === 'number' && Number.isFinite(v);
-}
-
-function isNonEmptyString(v: unknown): v is string {
-  return typeof v === 'string' && v.length > 0;
-}
-
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return !!v && typeof v === 'object' && !Array.isArray(v);
-}
-
-function isStringArray(v: unknown): v is readonly string[] {
-  return Array.isArray(v) && v.every(x => typeof x === 'string');
-}
-
 /**
  * MarketPosture v2 계약을 엄격히 검증한다(중첩 필드·enum·타임스탬프·defcon 유한성/범위).
  * 유효하면 그 객체를, 아니면 null 을 반환한다(예외를 던지지 않음 — fail-soft).
  */
 export function validateMarketPosture(value: unknown): MarketPosture | null {
-  if (!isPlainObject(value)) return null;
+  if (!isRecord(value)) return null;
 
   // version 검증: 정확히 알려진 schemaVersion 만 허용.
   if (value.schemaVersion !== MARKET_POSTURE_SCHEMA_VERSION) return null;
 
-  if (!isNonEmptyString(value.asOf)) return null;
+  if (!isNonEmptyString(value.asOf, false)) return null;
 
   // defcon: 유한 + 정수 + 허용 범위 1..5.
   const defcon = value.defcon;
@@ -98,7 +83,7 @@ export function validateMarketPosture(value: unknown): MarketPosture | null {
 
   // response 중첩 검증: cadence/해상도/알림만 허용하며 방향성 집행 필드는 없다.
   const response = value.response;
-  if (!isPlainObject(response)) return null;
+  if (!isRecord(response)) return null;
   if (![1, 2, 5, 15, 30].includes(response.cadenceMultiplier as number)) return null;
   if (!['rules', 'gate2', 'cross-check', 'deep', 'emergency'].includes(response.depth as string)) return null;
   if (!['batch', 'priority', 'immediate'].includes(response.alertMode as string)) return null;
@@ -106,32 +91,32 @@ export function validateMarketPosture(value: unknown): MarketPosture | null {
 
   // provenance 중첩 검증.
   const prov = value.provenance;
-  if (!isPlainObject(prov)) return null;
+  if (!isRecord(prov)) return null;
   if (!isStringArray(prov.sources)) return null;
-  if (!isNonEmptyString(prov.calculatedBy)) return null;
+  if (!isNonEmptyString(prov.calculatedBy, false)) return null;
 
   // freshness 중첩 검증(enum + 타임스탬프 + 유한 나이).
   const fresh = value.freshness;
-  if (!isPlainObject(fresh)) return null;
+  if (!isRecord(fresh)) return null;
   if (typeof fresh.status !== 'string' || !VALID_FRESHNESS.has(fresh.status as FreshnessStatus)) {
     return null;
   }
-  if (!isNonEmptyString(fresh.observedAt) || Number.isNaN(Date.parse(fresh.observedAt))) return null;
+  if (!isNonEmptyString(fresh.observedAt, false) || Number.isNaN(Date.parse(fresh.observedAt))) return null;
   if (!isFiniteNumber(fresh.ageMs) || fresh.ageMs < 0) return null;
 
   // regime 중첩 검증.
   const regime = value.regime;
-  if (!isPlainObject(regime)) return null;
+  if (!isRecord(regime)) return null;
   if (!isFiniteNumber(regime.composite)) return null;
-  if (!isNonEmptyString(regime.label)) return null;
+  if (!isNonEmptyString(regime.label, false)) return null;
   if (typeof regime.transition !== 'boolean') return null;
   if (!isStringArray(regime.transitionAxes)) return null;
-  if (!isNonEmptyString(regime.asOf)) return null;
+  if (!isNonEmptyString(regime.asOf, false)) return null;
 
   // leverage 중첩 검증.
   const lev = value.leverage;
-  if (!isPlainObject(lev)) return null;
-  if (!isNonEmptyString(lev.regime)) return null;
+  if (!isRecord(lev)) return null;
+  if (!isNonEmptyString(lev.regime, false)) return null;
   if (!isFiniteNumber(lev.effectiveExposure)) return null;
 
   // 여기까지 통과 = 계약을 만족. 원본을 좁혀 그대로 반환.

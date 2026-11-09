@@ -2,9 +2,10 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import * as ceoCommands from '../src/seat-dispatch/ceo-commands.js';
 import * as intakeWork from '../src/intake-plane/submit-intake-work.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { probeDiscordSeatWork, runbookTexts, runProbeCli } from './discord-seat-probe.js';
 import { assertTuiSeatAskRestartContract } from '../test/seat-ask-tui-restart-contract.js';
+import { withFakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 const config = { raw: { decisions: { discordOwnerId: '11111' } }, discord: { allowedUsers: ['11111'] } } as unknown as UserConfig;
 
@@ -21,12 +22,12 @@ describe('Discord seat probe', () => {
       effects.push('submit');
       throw Error('real submit invoked');
     }) as typeof intakeWork.submitIntakeWork);
-    const send = spyOn(globalThis, 'fetch').mockImplementation((async (_input: RequestInfo | URL, _init?: RequestInit) => {
+    await withFakeFetchDevice([{ url: '/unexpected-discord-send', response: () => {
       effects.push('Discord send');
       throw Error('Discord send invoked');
-    }) as unknown as typeof fetch);
-    const log = spyOn(console, 'log').mockImplementation(() => {});
-    try {
+    } }], async (fetchDevice) => {
+      const log = spyOn(console, 'log').mockImplementation(() => {});
+      try {
       const [result] = await runProbeCli(['--text', '@cmo 내일 행사 공지 써 줘', '--dm', '--json'], config);
       // #24523: a seat task travels the seat-ask path (so the answer can come back), so the probe records `ask`.
       expect(result?.route).toBe('ask');
@@ -44,13 +45,13 @@ describe('Discord seat probe', () => {
       expect(effects).toEqual([]);
       expect(dispatch).toHaveBeenCalledTimes(0);
       expect(submit).toHaveBeenCalledTimes(0);
-      expect(send).toHaveBeenCalledTimes(0);
-    } finally {
-      log.mockRestore();
-      send.mockRestore();
-      submit.mockRestore();
-      dispatch.mockRestore();
-    }
+      expect(fetchDevice.calls()).toHaveLength(0);
+      } finally {
+        log.mockRestore();
+        submit.mockRestore();
+        dispatch.mockRestore();
+      }
+    });
   });
 
   test('unaddressed chat goes to none; unknown seat replies without dispatch, submission or sending', async () => {

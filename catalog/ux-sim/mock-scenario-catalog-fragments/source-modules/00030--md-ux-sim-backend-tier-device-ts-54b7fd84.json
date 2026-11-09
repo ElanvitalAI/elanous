@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-BACKEND-TIER-DEVICE-TS",
+  "path": "src/ux-sim/backend-tier-device.ts",
+  "boundary": "Fake host profiles drive backend tier advice without probing or changing the machine (simulation boundary).",
+  "deviceIds": [
+    "backend-tier-device"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

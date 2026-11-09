@@ -1,0 +1,33 @@
+{
+  "id": "fake-app-drive-world",
+  "name": "Tenant-isolated fake Google Drive read world",
+  "checklistCells": [
+    "APP-WEB-DRIVE-TENANT"
+  ],
+  "implementation": [
+    "src/ux-sim/fake-app-drive-world.ts",
+    "src/nexus/apps/drive-contract.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-app-drive-world.test.ts"
+  ],
+  "target": "Read-only Google Drive files.list contract with per-identity tenant boundaries and no Google or credential-store dependency",
+  "inputs": [
+    "verified issuer and subject identities",
+    "synthetic file metadata and granted scopes",
+    "token expiry, refresh, logout and revoke events",
+    "page size and opaque continuation token"
+  ],
+  "observations": [
+    "tenant-separated file lists and page tokens",
+    "scope, expiry, refresh, logout and revoke outcomes",
+    "Google API adapter absent",
+    "credential persistence adapter absent"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-app-drive-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

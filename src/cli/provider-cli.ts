@@ -4,14 +4,8 @@ import * as ui from '../ui.js';
 import { debug } from '../debug/log.js';
 import { shellQuoteRemote } from '../ssh/ssh-fs.js';
 import { writeStdoutJson } from './stdout-json.js';
-import {
-  getUserConfig, reloadUserConfig, userConfigPath, saveUserConfig,
-  backupUserConfig, restoreUserConfig, backupConfigPath,
-  rotateNextProvider, jumpToRotationEntry, addRotationEntry,
-  removeRotationEntry, rotationEntryLabel, currentRotationIndex,
-  type RotationEntry,
-  PROVIDER_DEFAULT_MODEL as USER_CONFIG_PROVIDER_DEFAULT_MODEL,
-} from '../user-config.js';
+import { getUserConfig, reloadUserConfig, userConfigPath, saveUserConfig, backupUserConfig, restoreUserConfig, backupConfigPath, rotateNextProvider, jumpToRotationEntry, addRotationEntry, removeRotationEntry, rotationEntryLabel, currentRotationIndex, PROVIDER_DEFAULT_MODEL as USER_CONFIG_PROVIDER_DEFAULT_MODEL } from '../user-config.js';
+import type { RotationEntry } from '../user-config/types.js';
 import { renderProviderStatus } from '../provider-summary.js';
 import { getCatalog } from '../registry/loader.js';
 import { defaultModelFor } from '../registry/resolver.js';

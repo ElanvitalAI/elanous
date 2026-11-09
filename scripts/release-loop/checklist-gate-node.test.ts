@@ -286,7 +286,7 @@ test('GATE-ENTRY-ALIGN: release run entry check judges like the node — past th
   setElanousConfigDir(root);
   try {
     let graphs = 0;
-    const deps = { ledgerRoot: root, freezeRoot: root, config: { gatePodPool: 'pool' }, graph: async () => { graphs++; return { status: 'done' } as never; } };
+    const deps = { ledgerRoot: root, freezeRoot: root, assertCliCurrent: () => {}, config: { gatePodPool: 'pool' }, graph: async () => { graphs++; return { status: 'done' } as never; } };
     // The entry check reads the real clock, so the deadline is set relative to now (already passed).
     const hour = 3_600_000;
     setSchedule('0.2.6', { cutAt: new Date(Date.now() - hour).toISOString(), landBy: new Date(Date.now() - 2 * hour).toISOString() }, 'OP');

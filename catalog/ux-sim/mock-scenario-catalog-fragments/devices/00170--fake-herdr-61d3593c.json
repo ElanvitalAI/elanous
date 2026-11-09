@@ -1,0 +1,27 @@
+{
+  "id": "fake-herdr",
+  "name": "Fake herdr",
+  "implementation": [
+    "src/ux-sim/fake-herdr.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-herdr.test.ts"
+  ],
+  "target": "pane lifecycle and report-agent handoff",
+  "inputs": [
+    "pane transitions",
+    "missing report",
+    "timeout"
+  ],
+  "observations": [
+    "pane state",
+    "handoff result",
+    "timeout classification"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-herdr.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

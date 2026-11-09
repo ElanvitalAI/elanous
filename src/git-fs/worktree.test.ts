@@ -2,17 +2,32 @@
 // 재실행/재구현 시 안정 브랜치명(se/…-<phaseHex>)이 이전 세대에서 고아로 남아도
 // SE 격리가 하드 실패("branch already exists") 대신 흡수해야 한다(dogfood: KGS 즉사).
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, lstatSync, chmodSync, readFileSync, realpathSync, utimesSync } from 'node:fs';
+import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, lstatSync, chmodSync, readFileSync, realpathSync, utimesSync, symlinkSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { createWorktree, gateWorktreeReuse, isUnbornHeadError, linkWorktreeDependencies, worktreeParentDir, worktreeDirName, observeGitResidue, gateGitResidue, removeWorktree, syncBaseWithRemote, DEFAULT_BRANCH_WORKTREE_BASE, DEFAULT_WORKTREE_DEPENDENCY_PATHS, WorktreeDependencyPreparationError, type GitRunner, type WorktreeAddDeps, type WorktreeReuseExpectation } from './worktree.js';
+import { createWorktree, gateWorktreeReuse, isUnbornHeadError, linkWorktreeDependencies, prepareWorktreeDependencies, worktreeParentDir, worktreeDirName, observeGitResidue, gateGitResidue, removeWorktree, syncBaseWithRemote, DEFAULT_BRANCH_WORKTREE_BASE, DEFAULT_WORKTREE_DEPENDENCY_PATHS, WorktreeDependencyPreparationError, type GitRunner, type WorktreeAddDeps, type WorktreeReuseExpectation } from './worktree.js';
 import { recordHarnessWorktreeProvenance } from '../harness/harness-worktree-add.js';
 import { isTransientGitError } from './retry.js';
 import { setGitCommandRunnerForTesting } from './runner.js';
 import { debug } from '../debug/log.js';
 import { buildUserConfig, resetUserConfig } from '../user-config.js';
+
+function removeTempTree(path: string): void {
+  const pending = [path];
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const stat = lstatSync(current);
+    if (stat.isSymbolicLink()) continue;
+    if (stat.isDirectory()) {
+      chmodSync(current, stat.mode | 0o700);
+      pending.push(...readdirSync(current).map((name) => join(current, name)));
+    } else chmodSync(current, stat.mode | 0o600);
+  }
+  rmSync(path, { recursive: true, force: true });
+}
 import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import { reviewScopeDiff } from '../self-implement/seams.js';
 import { createTempGitRepo, type TempGitRepo } from '../ux-sim/temp-git-repo.js';
@@ -344,16 +359,24 @@ describe('createWorktree — elanous dev 기본 브랜치 분기', () => {
 
 describe('linkWorktreeDependencies — 항목별 fail-soft 결과', () => {
   let tmp: string, repo: string, worktree: string;
+  const originalDependencyStore = process.env.ELANOUS_WORKTREE_DEPS_DIR;
   beforeEach(() => {
     tmp = mkdtempSync(join(tmpdir(), 'wt-deps-'));
+    process.env.ELANOUS_WORKTREE_DEPS_DIR = join(tmp, 'shared-deps');
     repo = join(tmp, 'repo');
     worktree = join(tmp, 'worktree');
     mkdirSync(repo, { recursive: true });
     mkdirSync(worktree, { recursive: true });
   });
-  afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+  afterEach(() => {
+    if (originalDependencyStore === undefined) delete process.env.ELANOUS_WORKTREE_DEPS_DIR;
+    else process.env.ELANOUS_WORKTREE_DEPS_DIR = originalDependencyStore;
+    removeTempTree(tmp);
+  });
 
   test('원본 유무와 기존 대상을 구분해 반환하고 대상 부모를 만든다', () => {
+    writeFileSync(join(repo, 'bun.lock'), 'fixture-lock\n');
+    writeFileSync(join(worktree, 'bun.lock'), 'fixture-lock\n');
     mkdirSync(join(repo, 'present', 'package'), { recursive: true });
     mkdirSync(join(worktree, 'already'), { recursive: true });
     mkdirSync(join(repo, 'already'), { recursive: true });
@@ -364,12 +387,16 @@ describe('linkWorktreeDependencies — 항목별 fail-soft 결과', () => {
       linked: ['present/package'],
       skippedMissingSource: [...DEFAULT_WORKTREE_DEPENDENCY_PATHS, 'missing/package'],
       skippedExistingTarget: ['already'],
+      skippedLockMismatch: [],
+      skippedUnshareableSource: [],
       failed: [],
     });
     expect(lstatSync(join(worktree, 'present', 'package')).isSymbolicLink()).toBe(true);
   });
 
   test('주입한 심링크 실패는 모든 항목에 기록되고 다음 항목을 계속 시도한다', () => {
+    writeFileSync(join(repo, 'bun.lock'), 'fixture-lock\n');
+    writeFileSync(join(worktree, 'bun.lock'), 'fixture-lock\n');
     mkdirSync(join(repo, 'first'), { recursive: true });
     mkdirSync(join(repo, 'second'), { recursive: true });
     const attempted: string[] = [];
@@ -389,6 +416,158 @@ describe('linkWorktreeDependencies — 항목별 fail-soft 결과', () => {
       { path: 'second', reason: `Error: denied: ${join(worktree, 'second')}` },
     ]);
   });
+
+  test('bun.lock을 읽어 비교할 수 없는 트리는 의존성 공유를 건너뛴다', () => {
+    mkdirSync(join(repo, 'node_modules', 'pkg'), { recursive: true });
+    const result = linkWorktreeDependencies(repo, worktree);
+    expect(result.linked).toEqual([]);
+    expect(result.skippedLockMismatch).toEqual([...DEFAULT_WORKTREE_DEPENDENCY_PATHS]);
+    expect(result.failed).toEqual([]);
+    expect(existsSync(join(worktree, 'node_modules'))).toBe(false);
+  });
+
+  test('동일 bun.lock은 해시별 호스트 저장소를 공유하고 lockfile 변경 worktree는 설치를 소유한다', () => {
+    const store = join(tmp, 'shared-deps');
+    writeFileSync(join(repo, 'bun.lock'), 'lock-v1\n');
+    writeFileSync(join(worktree, 'bun.lock'), 'lock-v1\n');
+    mkdirSync(join(repo, 'node_modules', 'pkg'), { recursive: true });
+    writeFileSync(join(repo, 'node_modules', 'pkg', 'index.js'), 'ok');
+    mkdirSync(join(repo, 'apps', 'pwa', 'node_modules'), { recursive: true });
+
+    const shared = linkWorktreeDependencies(repo, worktree, [], { sharedStoreRoot: store });
+    const hash = createHash('sha256').update('lock-v1\n').digest('hex');
+    const repoHash = createHash('sha256').update(realpathSync(repo)).digest('hex').slice(0, 16);
+    const storeModules = join(store, repoHash, hash, 'node_modules');
+    expect(shared.linked).toEqual([...DEFAULT_WORKTREE_DEPENDENCY_PATHS]);
+    expect(readFileSync(join(worktree, 'node_modules', 'pkg', 'index.js'), 'utf8')).toBe('ok');
+    expect(realpathSync(join(worktree, 'node_modules'))).toBe(realpathSync(storeModules));
+    expect(existsSync(storeModules)).toBe(true);
+    writeFileSync(join(repo, 'node_modules', 'pkg', 'index.js'), 'source changed');
+    expect(readFileSync(join(worktree, 'node_modules', 'pkg', 'index.js'), 'utf8')).toBe('ok');
+
+    removeTempTree(storeModules);
+    const repaired = linkWorktreeDependencies(repo, worktree, [], { sharedStoreRoot: store });
+    expect(repaired.linked).toEqual([]);
+    expect(repaired.skippedExistingTarget).toContain('node_modules');
+    expect(readFileSync(join(worktree, 'node_modules', 'pkg', 'index.js'), 'utf8')).toBe('source changed');
+    expect(existsSync(storeModules)).toBe(true);
+
+    const otherRepo = join(tmp, 'other-repo');
+    const otherWorktree = join(tmp, 'other-worktree');
+    mkdirSync(join(otherRepo, 'node_modules', 'pkg'), { recursive: true });
+    mkdirSync(otherWorktree, { recursive: true });
+    writeFileSync(join(otherRepo, 'bun.lock'), 'lock-v1\n');
+    writeFileSync(join(otherWorktree, 'bun.lock'), 'lock-v1\n');
+    writeFileSync(join(otherRepo, 'node_modules', 'pkg', 'index.js'), 'other repo');
+    linkWorktreeDependencies(otherRepo, otherWorktree, [], { sharedStoreRoot: store });
+    expect(realpathSync(join(otherWorktree, 'node_modules'))).not.toBe(realpathSync(storeModules));
+
+    writeFileSync(join(worktree, 'bun.lock'), 'lock-v2\n');
+    const changed = linkWorktreeDependencies(repo, worktree, [], { sharedStoreRoot: store });
+    expect(changed.skippedLockMismatch).toEqual([...DEFAULT_WORKTREE_DEPENDENCY_PATHS]);
+    expect(changed.linked).toEqual([]);
+    expect(existsSync(join(worktree, 'node_modules'))).toBe(false);
+  });
+
+  test('lockfile 변경 뒤 dependency preparation은 공유 링크를 떼고 worktree 전용 install로 간다', () => {
+    const store = join(tmp, 'shared-deps');
+    writeFileSync(join(repo, 'bun.lock'), 'lock-v1\n');
+    writeFileSync(join(worktree, 'bun.lock'), 'lock-v1\n');
+    writeFileSync(join(repo, 'package.json'), '{"name":"fixture"}');
+    writeFileSync(join(worktree, 'package.json'), '{"name":"fixture"}');
+    mkdirSync(join(repo, 'node_modules', 'pkg'), { recursive: true });
+    linkWorktreeDependencies(repo, worktree, [], { sharedStoreRoot: store });
+    writeFileSync(join(worktree, 'bun.lock'), 'lock-v2\n');
+    const installs: string[] = [];
+
+    prepareWorktreeDependencies(repo, worktree, {}, {
+      sharedDependencyStoreRoot: store,
+      installDependencies: (cwd) => {
+        installs.push(cwd);
+        mkdirSync(join(cwd, 'node_modules'), { recursive: true });
+        return { status: 0 };
+      },
+    });
+
+    expect(installs).toEqual([worktree]);
+    expect(existsSync(join(worktree, 'node_modules', 'pkg'))).toBe(false);
+    expect(lstatSync(join(worktree, 'node_modules')).isSymbolicLink()).toBe(false);
+    const repoHash = createHash('sha256').update(realpathSync(repo)).digest('hex').slice(0, 16);
+    expect(existsSync(join(store, repoHash, createHash('sha256').update('lock-v1\n').digest('hex'), 'node_modules', 'pkg'))).toBe(true);
+  });
+
+  test('workspace 상대 링크가 의존성 디렉터리 밖을 가리키면 공용 복사를 건너뛴다', () => {
+    writeFileSync(join(repo, 'bun.lock'), 'lock-v1\n');
+    writeFileSync(join(worktree, 'bun.lock'), 'lock-v1\n');
+    mkdirSync(join(repo, 'packages', 'workspace'), { recursive: true });
+    mkdirSync(join(repo, 'node_modules', '@fixture'), { recursive: true });
+    symlinkSync('../../packages/workspace', join(repo, 'node_modules', '@fixture', 'workspace'), 'dir');
+
+    const result = linkWorktreeDependencies(repo, worktree, [], { sharedStoreRoot: join(tmp, 'shared-deps') });
+    expect(result.skippedUnshareableSource).toEqual(['node_modules']);
+    expect(result.linked).toEqual([]);
+    expect(existsSync(join(worktree, 'node_modules'))).toBe(false);
+  });
+
+  test('기존 직접 심링크는 lock 불일치 때 분리한다', () => {
+    writeFileSync(join(repo, 'bun.lock'), 'lock-v1\n');
+    writeFileSync(join(worktree, 'bun.lock'), 'lock-v2\n');
+    mkdirSync(join(repo, 'node_modules'), { recursive: true });
+    symlinkSync(join(repo, 'node_modules'), join(worktree, 'node_modules'), 'dir');
+
+    const result = linkWorktreeDependencies(repo, worktree);
+    expect(result.skippedLockMismatch).toEqual([...DEFAULT_WORKTREE_DEPENDENCY_PATHS]);
+    expect(existsSync(join(worktree, 'node_modules'))).toBe(false);
+  });
+
+  test('기존 직접 심링크는 lock이 같으면 해시 저장소 링크로 옮긴다', () => {
+    const store = join(tmp, 'shared-deps');
+    writeFileSync(join(repo, 'bun.lock'), 'lock-v1\n');
+    writeFileSync(join(worktree, 'bun.lock'), 'lock-v1\n');
+    mkdirSync(join(repo, 'node_modules', 'pkg'), { recursive: true });
+    writeFileSync(join(repo, 'node_modules', 'pkg', 'index.js'), 'ok');
+    symlinkSync(join(repo, 'node_modules'), join(worktree, 'node_modules'), 'dir');
+
+    const result = linkWorktreeDependencies(repo, worktree, [], { sharedStoreRoot: store });
+    expect(result.linked).toContain('node_modules');
+    expect(realpathSync(join(worktree, 'node_modules'))).not.toBe(realpathSync(join(repo, 'node_modules')));
+    expect(readFileSync(join(worktree, 'node_modules', 'pkg', 'index.js'), 'utf8')).toBe('ok');
+  });
+
+  test('복제 실패는 staging을 치우고 이후 같은 해시의 재시도를 허용한다', () => {
+    const store = join(tmp, 'shared-deps');
+    writeFileSync(join(repo, 'bun.lock'), 'lock-v1\n');
+    writeFileSync(join(worktree, 'bun.lock'), 'lock-v1\n');
+    mkdirSync(join(repo, 'node_modules', 'pkg'), { recursive: true });
+    const staging = join(store, createHash('sha256').update(realpathSync(repo)).digest('hex').slice(0, 16), createHash('sha256').update('lock-v1\n').digest('hex'), 'node_modules.building-');
+    const failed = linkWorktreeDependencies(repo, worktree, [], {
+      sharedStoreRoot: store,
+      copyTree: (_source, destination) => { mkdirSync(destination, { recursive: true }); writeFileSync(join(destination, 'partial'), 'x'); throw new Error('copy failed'); },
+    });
+    expect(failed.failed.some((item) => item.path === 'node_modules' && item.reason.includes('copy failed'))).toBe(true);
+    expect(readdirSync(dirname(staging)).filter((name) => name.startsWith('node_modules.building-'))).toEqual([]);
+
+    const retry = linkWorktreeDependencies(repo, worktree, [], { sharedStoreRoot: store });
+    expect(retry.linked).toContain('node_modules');
+    expect(existsSync(join(worktree, 'node_modules', 'pkg'))).toBe(true);
+  });
+
+  test('prepare detaches managed links when the target lockfile was removed', () => {
+    writeFileSync(join(repo, 'bun.lock'), 'lock-v1\n');
+    writeFileSync(join(repo, 'package.json'), '{"name":"fixture"}');
+    writeFileSync(join(worktree, 'package.json'), '{"name":"fixture"}');
+    mkdirSync(join(repo, 'node_modules'), { recursive: true });
+    symlinkSync(join(repo, 'node_modules'), join(worktree, 'node_modules'), 'dir');
+    let installs = 0;
+
+    prepareWorktreeDependencies(repo, worktree, {}, {
+      installDependencies: (cwd) => { installs += 1; mkdirSync(join(cwd, 'node_modules'), { recursive: true }); return { status: 0 }; },
+    });
+
+    expect(installs).toBe(0);
+    const dependencyPath = join(worktree, 'node_modules');
+    expect(existsSync(dependencyPath) && lstatSync(dependencyPath).isSymbolicLink()).toBe(false);
+  });
 });
 
 describe('createWorktree — node_modules 링크(시스템 보강 2026-07-21·리뷰 오판 방지)', () => {
@@ -401,22 +580,25 @@ describe('createWorktree — node_modules 링크(시스템 보강 2026-07-21·�
     git(repo, 'config', 'user.name', 't');
     writeFileSync(join(repo, 'f.txt'), 'x');
     writeFileSync(join(repo, '.gitignore'), 'node_modules\n');
+    writeFileSync(join(repo, 'bun.lock'), 'fixture-lock\n');
     git(repo, 'add', '.');
     git(repo, 'commit', '-qm', 'init');
   });
-  afterEach(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch { /* */ } });
+  afterEach(() => { try { removeTempTree(tmp); } catch { /* */ } });
 
   test('★ 중앙 계획의 루트·PWA node_modules 를 worktree 에 symlink(자식 통합검증 가능)', () => {
     mkdirSync(join(repo, 'node_modules', 'somepkg'), { recursive: true });
     mkdirSync(join(repo, 'apps', 'pwa', 'node_modules', 'pwa-pkg'), { recursive: true });
     writeFileSync(join(repo, 'node_modules', 'somepkg', 'index.js'), 'module.exports=1');
     writeFileSync(join(repo, 'apps', 'pwa', 'node_modules', 'pwa-pkg', 'index.js'), 'module.exports=2');
-    const res = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/nm', base: 'HEAD', resetExisting: true });
+    const res = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/nm', base: 'HEAD', resetExisting: true }, {
+      sharedDependencyStoreRoot: join(tmp, 'shared-deps'),
+    });
 
     for (const relativePath of DEFAULT_WORKTREE_DEPENDENCY_PATHS) {
       const target = join(res.path, relativePath);
       expect(lstatSync(target).isSymbolicLink()).toBe(true);
-      expect(realpathSync(target)).toBe(realpathSync(join(repo, relativePath)));
+      expect(realpathSync(target)).not.toBe(realpathSync(join(repo, relativePath)));
     }
     expect(existsSync(join(res.path, 'node_modules', 'somepkg', 'index.js'))).toBe(true);
     expect(existsSync(join(res.path, 'apps', 'pwa', 'node_modules', 'pwa-pkg', 'index.js'))).toBe(true);
@@ -534,17 +716,17 @@ describe('createWorktree — node_modules 링크(시스템 보강 2026-07-21·�
 
   test('설치 시간 초과도 구조화 오류로 구별하고 지정 상한을 기록한다', () => {
     commitDependencyContract();
-    let timeoutSeen: number | null = null;
+    const timeoutObservation: { value?: number } = {};
     let error: unknown;
     try {
       createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/timeout-deps', base: 'HEAD', requireDependencies: true, dependencyFallbackRoot: join(tmp, 'missing'), dependencyInstallTimeoutMs: 1234 }, {
         installDependencies: (_cwd, timeoutMs) => {
-          timeoutSeen = timeoutMs;
+          timeoutObservation.value = timeoutMs;
           return { status: null, error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) };
         },
       });
     } catch (caught) { error = caught; }
-    expect(timeoutSeen).toBe(1234);
+    expect(timeoutObservation.value).toBe(1234);
     expect(error).toBeInstanceOf(WorktreeDependencyPreparationError);
     expect((error as WorktreeDependencyPreparationError).reason).toBe('install timed out after 1234ms');
   });
@@ -564,15 +746,17 @@ describe('createWorktree — node_modules 링크(시스템 보강 2026-07-21·�
 
   test('재사용 worktree도 중앙 계획의 새 하위 앱 의존성을 idempotent 하게 연결한다', () => {
     mkdirSync(join(repo, 'node_modules'), { recursive: true });
-    const created = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/reuse-deps', base: 'HEAD', resetExisting: true });
+    const sharedDependencyStoreRoot = join(tmp, 'shared-deps');
+    const deps = { sharedDependencyStoreRoot };
+    const created = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/reuse-deps', base: 'HEAD', resetExisting: true }, deps);
     mkdirSync(join(repo, 'apps', 'pwa', 'node_modules', 'pwa-pkg'), { recursive: true });
     recordHarnessWorktreeProvenance(created.path, { owner: 'dev:reuse-deps', command: 'elanous dev', createdAt: '2026-08-16T00:00:00.000Z' });
 
-    const reused = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/reuse-deps', reuseOwnedWorktree: true });
+    const reused = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'se/reuse-deps', reuseOwnedWorktree: true }, deps);
 
     expect(reused.reused).toBe(true);
     expect(lstatSync(join(reused.path, 'apps', 'pwa', 'node_modules')).isSymbolicLink()).toBe(true);
-    expect(realpathSync(join(reused.path, 'apps', 'pwa', 'node_modules'))).toBe(realpathSync(join(repo, 'apps', 'pwa', 'node_modules')));
+    expect(realpathSync(join(reused.path, 'apps', 'pwa', 'node_modules'))).not.toBe(realpathSync(join(repo, 'apps', 'pwa', 'node_modules')));
   });
 });
 
@@ -647,7 +831,19 @@ describe('observeGitResidue — 공유 저장소 중단 상태 관측', () => {
     repo = join(tmp, 'repo');
     git(tmp, 'init', '-q', 'repo');
   });
-  afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+  afterEach(() => {
+    const pending = [tmp];
+    while (pending.length > 0) {
+      const path = pending.pop()!;
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) {
+        chmodSync(path, stat.mode | 0o700);
+        pending.push(...readdirSync(path).map((name) => join(path, name)));
+      } else chmodSync(path, stat.mode | 0o600);
+    }
+    rmSync(tmp, { recursive: true, force: true });
+  });
 
   test('residue-present: 종류별 마커를 구분하고 판정은 저장소를 바꾸지 않는다', async () => {
     const gitDir = join(repo, '.git');
@@ -1100,6 +1296,15 @@ describe('syncBaseWithRemote — 실패 분기 (seam)', () => {
     git(repo, 'commit', '-qm', 'init');
     git(repo, 'remote', 'add', 'origin', origin);
     git(repo, 'push', '-q', '-u', 'origin', 'feat');
+    // Keep the desired remote tip out of `repo` so the fetch retry tests exercise
+    // the miss path instead of the new exact-object skip path.
+    const publisher = join(tmp, 'publisher');
+    git(tmp, 'clone', '-q', origin, publisher);
+    git(publisher, 'checkout', '-q', '-b', 'feat', 'origin/feat');
+    git(publisher, 'config', 'user.email', 'publisher@t.test');
+    git(publisher, 'config', 'user.name', 'publisher');
+    git(publisher, 'commit', '--allow-empty', '-qm', 'advance remote tip');
+    git(publisher, 'push', '-q', 'origin', 'feat');
     return { repo, dispose: () => rmSync(tmp, { recursive: true, force: true }) };
   }
 
@@ -1198,6 +1403,207 @@ describe('syncBaseWithRemote — 실패 분기 (seam)', () => {
     const r = syncBaseWithRemote('/r', 'abc1234', false, runner({ showRef: ok(), lsRemote: fail() }));
     expect(r.freshness).not.toBe('sha');
     expect(r.freshness).toBe('remote-unreachable');
+  });
+});
+
+describe('syncBaseWithRemote — 원격 SHA fetch 생략·합치기', () => {
+  const REMOTE = 'd'.repeat(40);
+  let fixture: TempGitRepo;
+  beforeEach(() => { fixture = createTempGitRepo(); });
+  afterEach(() => { fixture.cleanup(); });
+
+  test('같은 저장소·같은 가지 요청 10회는 새 SHA를 한 번만 fetch하고 이후 coalesced 관측을 남긴다', () => {
+    let objectPresent = false;
+    let fetches = 0;
+    const gitRunner: GitRunner = (args) => {
+      if (args[0] === 'show-ref') return { status: 1, stdout: '', stderr: '' };
+      if (args[0] === 'ls-remote') return { status: 0, stdout: `${REMOTE}\trefs/heads/feat\n`, stderr: '' };
+      if (args[0] === 'cat-file') return { status: objectPresent ? 0 : 1, stdout: '', stderr: '' };
+        if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'false\n', stderr: '' };
+      if (args[0] === 'fetch') { fetches++; objectPresent = true; return { status: 0, stdout: '', stderr: '' }; }
+      if (args[0] === 'rev-parse' && args[2] === 'FETCH_HEAD^{commit}') return { status: 0, stdout: `${REMOTE}\n`, stderr: '' };
+      return { status: 1, stdout: '', stderr: '' };
+    };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const results = Array.from({ length: 10 }, () => syncBaseWithRemote(fixture.repo, 'feat', false, gitRunner));
+      expect(results.every((result) => result.checkout === REMOTE && result.freshness === 'remote-synced')).toBe(true);
+      expect(fetches).toBe(1);
+      expect(log.mock.calls.filter((call) => call[1] === 'base.fetch-skipped').map((call) => call[2])).toContainEqual(
+        expect.objectContaining({ branch: 'feat', sha: REMOTE, reason: 'coalesced' }),
+      );
+    } finally { log.mockRestore(); }
+  });
+
+  test('실제 createWorktree 10회: 원격 tip 객체를 한 번만 받고 skip 관측에 runId를 붙인다', () => {
+    const legacyRepo = join(fixture.root, 'legacy-fetches');
+    git(fixture.root, 'clone', '-q', fixture.remote, legacyRepo);
+    const publisher = join(fixture.root, 'publisher');
+    git(fixture.root, 'clone', '-q', fixture.remote, publisher);
+    git(publisher, 'config', 'user.name', 'Test Publisher');
+    git(publisher, 'config', 'user.email', 'publisher@example.test');
+    git(publisher, 'commit', '--allow-empty', '-qm', 'advance remote main');
+    git(publisher, 'push', '-q', 'origin', 'main');
+    const advertised = fixture.git(publisher, ['rev-parse', 'HEAD']).trim();
+
+    let repeatedFetchCommands = 0;
+    for (let index = 0; index < 10; index++) {
+      const fetched = spawnSync('git', ['fetch', 'origin', 'refs/heads/main'], { cwd: legacyRepo, encoding: 'utf8' });
+      if (fetched.status !== 0) throw new Error(`legacy git fetch failed: ${fetched.stderr}`);
+      repeatedFetchCommands++;
+    }
+
+    const priorRunId = process.env.ELANOUS_RUN_ID;
+    const runId = 'git-fetch-fresh-skip-sim-10';
+    process.env.ELANOUS_RUN_ID = runId;
+    let fetches = 0;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    setGitCommandRunnerForTesting((cwd, args, options) => {
+      if (args[0] === 'fetch') fetches++;
+      const result = spawnSync('git', args, { ...options, cwd });
+      return { status: result.status, stdout: String(result.stdout ?? ''), stderr: String(result.stderr ?? '') };
+    });
+    try {
+      const created = Array.from({ length: 10 }, (_, index) => createWorktree({
+        repoRoot: fixture.repo,
+        branch: `se/fresh-fetch-${index}`,
+        worktreeRoot: join(fixture.root, 'worktrees'),
+        base: 'origin/main',
+      }));
+      expect(created).toHaveLength(10);
+      expect(created.every((worktree) => worktree.resolvedBase === advertised)).toBe(true);
+      // Legacy 10 is inferred from the previous one-fetch-per-request path; this reference loop
+      // measures ten real git fetch commands, while the optimized production path is instrumented.
+      expect(repeatedFetchCommands).toBe(10);
+      expect(fetches).toBe(1);
+      const skips = log.mock.calls.filter((call) => call[0] === 'git-fs.worktree' && call[1] === 'base.fetch-skipped');
+      expect(skips).toHaveLength(9);
+      expect(skips.every((call) => (call[2] as { runId?: string }).runId === runId)).toBe(true);
+    } finally {
+      setGitCommandRunnerForTesting(undefined);
+      log.mockRestore();
+      if (priorRunId === undefined) delete process.env.ELANOUS_RUN_ID;
+      else process.env.ELANOUS_RUN_ID = priorRunId;
+    }
+  });
+
+  test('이미 존재하는 SHA는 fetch를 생략하고, git 메타데이터를 못 찾으면 기존 fetch 경로를 유지한다', () => {
+    const existingSha = fixture.git(fixture.repo, ['rev-parse', 'HEAD']).trim();
+    const seen: string[][] = [];
+    const hasObjectRunner: GitRunner = (args) => {
+      seen.push([...args]);
+      if (args[0] === 'show-ref') return { status: 1, stdout: '', stderr: '' };
+      if (args[0] === 'ls-remote') return { status: 0, stdout: `${existingSha}\trefs/heads/feat\n`, stderr: '' };
+        if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'false\n', stderr: '' };
+      if (args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
+      return { status: 1, stdout: '', stderr: '' };
+    };
+    expect(syncBaseWithRemote(fixture.repo, 'feat', false, hasObjectRunner)).toEqual({ checkout: existingSha, freshness: 'remote-synced' });
+    expect(seen.some((args) => args[0] === 'fetch')).toBe(false);
+
+    const fallbackCalls: string[][] = [];
+    const fallbackRunner: GitRunner = (args) => {
+      fallbackCalls.push([...args]);
+      if (args[0] === 'show-ref') return { status: 1, stdout: '', stderr: '' };
+      if (args[0] === 'ls-remote') return { status: 0, stdout: `${REMOTE}\trefs/heads/feat\n`, stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'false\n', stderr: '' };
+      if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse' && args[2] === 'FETCH_HEAD^{commit}') return { status: 0, stdout: `${REMOTE}\n`, stderr: '' };
+      return { status: 1, stdout: '', stderr: '' };
+    };
+    expect(syncBaseWithRemote('/not-a-git-repo', 'feat', false, fallbackRunner)).toEqual({ checkout: REMOTE, freshness: 'remote-synced' });
+    expect(fallbackCalls.some((args) => args[0] === 'fetch')).toBe(true);
+  });
+
+  test('30초보다 오래된 표지는 coalesced 로 판정하지 않는다', () => {
+    const existingSha = fixture.git(fixture.repo, ['rev-parse', 'HEAD']).trim();
+    const directory = join(fixture.repo, '.git', 'elanous-fetch-coalesce');
+    mkdirSync(directory, { recursive: true });
+    const key = createHash('sha256').update('feat').digest('hex');
+    writeFileSync(join(directory, `${key}.json`), JSON.stringify({ branch: 'feat', sha: existingSha, fetchedAt: Date.now() - 30_001 }));
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const r = syncBaseWithRemote(fixture.repo, 'feat', false, (args) => {
+        if (args[0] === 'show-ref') return { status: 1, stdout: '', stderr: '' };
+        if (args[0] === 'ls-remote') return { status: 0, stdout: `${existingSha}\trefs/heads/feat\n`, stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'false\n', stderr: '' };
+        if (args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
+        return { status: 1, stdout: '', stderr: '' };
+      });
+      expect(r).toEqual({ checkout: existingSha, freshness: 'remote-synced' });
+      expect(log.mock.calls.find((call) => call[1] === 'base.fetch-skipped')?.[2]).toMatchObject({ reason: 'sha-present' });
+    } finally { log.mockRestore(); }
+  });
+
+  test('shallow 저장소는 같은 tip 객체가 있어도 depth=50 fetch를 유지한다', () => {
+    const calls: string[][] = [];
+    const r = syncBaseWithRemote(fixture.repo, 'feat', false, (args) => {
+      calls.push(args);
+      if (args[0] === 'show-ref') return { status: 1, stdout: '', stderr: '' };
+      if (args[0] === 'ls-remote') return { status: 0, stdout: `${REMOTE}\trefs/heads/feat\n`, stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'true\n', stderr: '' };
+      if (args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'fetch') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'rev-parse' && args[2] === 'FETCH_HEAD^{commit}') return { status: 0, stdout: `${REMOTE}\n`, stderr: '' };
+      return { status: 1, stdout: '', stderr: '' };
+    });
+    expect(r).toEqual({ checkout: REMOTE, freshness: 'remote-synced' });
+    expect(calls.find((args) => args[0] === 'fetch')).toEqual(['fetch', '--depth=50', 'origin', 'refs/heads/feat']);
+  });
+
+  test('서로 다른 브랜치의 동시 fetch도 각자 광고된 tip을 반환한다', async () => {
+    // Two processes share one common git dir; the repository-wide fetch lock protects FETCH_HEAD.
+    const publisher = join(fixture.root, 'parallel-publisher');
+    git(fixture.root, 'clone', '-q', fixture.remote, publisher);
+    git(publisher, 'config', 'user.name', 'Test Publisher');
+    git(publisher, 'config', 'user.email', 'publisher@example.test');
+    git(publisher, 'checkout', '-qb', 'feat/alpha');
+    git(publisher, 'commit', '--allow-empty', '-qm', 'alpha tip');
+    const alphaSha = fixture.git(publisher, ['rev-parse', 'HEAD']).trim();
+    git(publisher, 'push', '-q', 'origin', 'feat/alpha');
+    git(publisher, 'checkout', '-qb', 'feat/beta', 'main');
+    git(publisher, 'commit', '--allow-empty', '-qm', 'beta tip');
+    const betaSha = fixture.git(publisher, ['rev-parse', 'HEAD']).trim();
+    git(publisher, 'push', '-q', 'origin', 'feat/beta');
+
+    const moduleUrl = new URL('./worktree.ts', import.meta.url).href;
+    const source = `import { syncBaseWithRemote } from ${JSON.stringify(moduleUrl)}; console.log(JSON.stringify(syncBaseWithRemote(process.env.REPO!, process.env.BRANCH!, false)));`;
+    const run = (branch: string): Promise<string> => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['-e', source], {
+        cwd: fixture.repo,
+        env: { ...process.env, REPO: fixture.repo, BRANCH: branch },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+      child.once('error', reject);
+      child.once('close', (code) => code === 0 ? resolve(stdout.trim()) : reject(new Error(`child exited ${code}: ${stderr}`)));
+    });
+
+    const [alpha, beta] = await Promise.all([run('feat/alpha'), run('feat/beta')]);
+    expect(JSON.parse(alpha)).toEqual({ checkout: alphaSha, freshness: 'remote-synced' });
+    expect(JSON.parse(beta)).toEqual({ checkout: betaSha, freshness: 'remote-synced' });
+  });
+
+  test('손상된 coalesce 표지는 cache miss로 접지 않고 fetch 폴백한다', () => {
+    const directory = join(fixture.repo, '.git', 'elanous-fetch-coalesce');
+    mkdirSync(directory, { recursive: true });
+    const key = createHash('sha256').update('feat').digest('hex');
+    writeFileSync(join(directory, `${key}.json`), '{broken');
+    let fetches = 0;
+    const r = syncBaseWithRemote(fixture.repo, 'feat', false, (args) => {
+      if (args[0] === 'show-ref') return { status: 1, stdout: '', stderr: '' };
+      if (args[0] === 'ls-remote') return { status: 0, stdout: `${REMOTE}\trefs/heads/feat\n`, stderr: '' };
+      if (args[0] === 'rev-parse' && args[1] === '--is-shallow-repository') return { status: 0, stdout: 'false\n', stderr: '' };
+      if (args[0] === 'cat-file') return { status: 0, stdout: '', stderr: '' };
+      if (args[0] === 'fetch') { fetches++; return { status: 0, stdout: '', stderr: '' }; }
+      if (args[0] === 'rev-parse' && args[2] === 'FETCH_HEAD^{commit}') return { status: 0, stdout: `${REMOTE}\n`, stderr: '' };
+      return { status: 1, stdout: '', stderr: '' };
+    });
+    expect(r).toEqual({ checkout: REMOTE, freshness: 'remote-synced' });
+    expect(fetches).toBe(1);
   });
 });
 

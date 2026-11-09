@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-HEADLESS-TUI-TS",
+  "path": "src/ux-sim/headless-tui.ts",
+  "boundary": "Runs the production dashboard frame renderer serially in a headless process and captures snapshots while isolating its process-global frame cache.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

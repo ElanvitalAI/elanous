@@ -13,7 +13,7 @@
 // ⛔ 키 값은 어떤 로그·오류·요약에도 싣지 않는다 — 관측은 «있음/없음»만.
 
 import type { LLMProvider, LLMStreamEvent, LLMOpts, LLMMessage } from '../llm.js';
-import type { LLMConfig as UCLLMConfig } from '../user-config.js';
+import type { LLMConfig as UCLLMConfig } from '../user-config/types.js';
 import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';

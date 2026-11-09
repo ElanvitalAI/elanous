@@ -20,6 +20,27 @@
 # 📌 한 번만 시도한다(원장 가드와 같은 규율) — 그래서 maxVisits 1 이다.
 # 📌 들어오는 간선 = `heal` 이 stop_class 로 가른다 · 나가는 간선 = 처방 결과(healed → 재발사 · needs-owner → 종결).
 ---
+overlay_id: stop-heal-ladder-release-type-error
+target: self-implement
+stage: heal
+applies_when: failure_signature == type-error
+patch:
+  - op: add
+    path: /nodes/-
+    value:
+      nodeId: attempt-repair
+      kind: judge
+      recipe: stop-autoheal:attempt-repair
+      maxVisits: 1
+      journeyStage: recover
+      contract: { inputs: [failure-evidence], tools: read-only, outputs: [repair-prescription, owner-notice] }
+  - op: add
+    path: /edges/-
+    value: { from: heal, on: failure_signature, map: { type-error: attempt-repair } }
+  - op: add
+    path: /edges/-
+    value: { from: attempt-repair, on: outcome, map: { healed: dispatch, needs-owner: stopped } }
+---
 overlay_id: stop-heal-ladder-env-unrelated
 target: self-implement
 stage: heal

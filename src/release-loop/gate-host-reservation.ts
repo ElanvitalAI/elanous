@@ -307,7 +307,11 @@ export function inspectReleaseGateHost(root: string, host: string, options: { re
     if (live === 'dead') {
       if (options.reclaimDead !== false) {
         try { rmSync(path); } catch { /* a confirmed dead process cannot still own the host */ }
-        debug.log('release-loop.gate', 'host-claim-reclaimed', { runId: claim.runId, hosts: claim.hosts, path });
+        const ageMs = claim.reservedAt === undefined ? null : Math.max(0, Date.now() - claim.reservedAt);
+        const orphanedLongEnough = ageMs !== null && ageMs >= 2 * 60 * 60 * 1000;
+        debug.log('release-loop.gate', orphanedLongEnough ? 'orphan-host-claim-alert' : 'host-claim-reclaimed', {
+          runId: claim.runId, hosts: claim.hosts, path, pid: claim.pid, ageMs,
+        }, { level: orphanedLongEnough ? 'error' : 'info' });
       }
       continue;
     }

@@ -34,11 +34,8 @@
 import { Buffer } from 'node:buffer';
 import { Readable, PassThrough } from 'node:stream';
 import { debug } from '../../debug/log.js';
-import {
-  getUserConfig,
-  VOICE_HARDCODED_DEFAULTS,
-  type VoiceDiscordChannelListenFilter,
-} from '../../user-config.js';
+import { getUserConfig, VOICE_HARDCODED_DEFAULTS } from '../../user-config.js';
+import type { VoiceDiscordChannelListenFilter } from '../../user-config/types.js';
 import {
   pcm48kStereoTo16kMono,
   pcm24kMonoTo48kStereo,

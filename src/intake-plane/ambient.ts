@@ -5,7 +5,7 @@ import { ingestIntakeRecord } from './service.js';
 import type { IntakeStore } from './store.js';
 import type { RawIntakeRecord } from './types.js';
 import type { NormalizedAttachment } from '../acp/content-blocks.js';
-import type { IntakeAmbientCaptureMode } from '../user-config.js';
+import type { IntakeAmbientCaptureMode } from '../user-config/types.js';
 
 type AmbientSurface = 'telegram' | 'discord';
 

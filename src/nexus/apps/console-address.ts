@@ -27,11 +27,15 @@ export function consoleAddress(target: ConsoleAddressTarget): string {
  * Address proposal from user-simulation-kit §5c. The -sim suffix is not reserved by this helper:
  * collision rejection remains pending the D2 decision and must be enforced by a later policy layer.
  */
-export function simulationPreviewAddress(input: { readonly appSlug: string; readonly userSlug: string }): string {
+export function publicAppAddress(input: { readonly appSlug: string; readonly userSlug: string }): string {
   const productionHost = `${input.appSlug}--${input.userSlug}.${PUBLIC_APP_DOMAIN}`;
-  if (!parsePublicAppHost(productionHost)) throw new Error('appSlug or userSlug cannot form a public app address');
+  if (!parsePublicAppHost(productionHost, PUBLIC_APP_DOMAIN)) throw new Error('appSlug or userSlug cannot form a public app address');
+  return `https://${productionHost}`;
+}
 
+export function simulationPreviewAddress(input: { readonly appSlug: string; readonly userSlug: string }): string {
+  publicAppAddress(input);
   const previewHost = `${input.appSlug}-sim--${input.userSlug}.${PUBLIC_APP_DOMAIN}`;
-  if (!parsePublicAppHost(previewHost)) throw new Error('appSlug or userSlug cannot form a simulation preview address');
+  if (!parsePublicAppHost(previewHost, PUBLIC_APP_DOMAIN)) throw new Error('appSlug or userSlug cannot form a simulation preview address');
   return `https://${previewHost}`;
 }

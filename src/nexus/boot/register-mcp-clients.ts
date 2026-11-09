@@ -27,7 +27,7 @@
 //     child processes get SIGTERM (+ SIGKILL fallback) before
 //     daemon exit.
 
-import type { AsideConfig, McpServerSpec } from '../../user-config.js';
+import type { AsideConfig, McpServerSpec } from '../../user-config/types.js';
 import { asideTargetSshCommand, beginAsideRemoteTargetsConfiguration, createAsideRemoteRouter, sanitizeAsideObservabilityValue, sanitizeAsideObservabilityText, setAsideRemoteRouter, setAsideRemoteTargetsConfigured, type AsideTargetHealth } from '../../aside/remote-targets.js';
 import { McpClient, McpConnectionError, type McpCallMeta, type McpTool, type McpToolCallResult } from '../../mcp/client.js';
 import {

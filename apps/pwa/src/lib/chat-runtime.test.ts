@@ -199,6 +199,17 @@ describe('parseMcpAppPayload', () => {
 });
 
 describe('runChatTurnStreaming — block accumulator (Phase B-2)', () => {
+  it('turns an app_deploy SSE receipt into a dedicated public URL block', async () => {
+    const receipt = { kind: 'site-deploy', status: 'published', publicUrl: 'https://demo--alice.elanous.app/' };
+    globalThis.fetch = mockSseResponseChunks([
+      `event: turn-begin\ndata: {"sessionId":"sess-deploy"}\n\n`,
+      `event: tool-call\ndata: {"id":"d1","name":"app_deploy","args":{"appId":"demo"}}\n\n`,
+      `event: tool-result\ndata: ${JSON.stringify({ id: 'd1', name: 'app_deploy', ok: true, result: receipt })}\n\n`,
+      `event: turn-end\ndata: {"sessionId":"sess-deploy","text":"배포 완료","stopReason":"end_turn"}\n\n`,
+    ]);
+    const result = await runChatTurnStreaming('배포해줘', makeCtx('sess-deploy'));
+    expect(result.message.blocks?.find((block) => block.kind === 'deploy_result')).toEqual({ kind: 'deploy_result', toolId: 'd1', result: { status: 'published', publicUrl: receipt.publicUrl } });
+  });
   it('text-only turn returns ChatMessage without `.blocks` (legacy text path preserved)', async () => {
     globalThis.fetch = mockSseResponseChunks([
       `event: turn-begin\ndata: {"sessionId":"sess-A"}\n\n`,
@@ -455,8 +466,9 @@ describe('runChatTurnStreaming — block accumulator (Phase B-2)', () => {
 // dedupe gates (local POST + remote SSE), session filter, idle timer
 // finalize + fresh placeholder for next turn, tool_call lifecycle.
 
-function makeMockAcp(): { acp: AcpConnection; emit: (frame: AcpFrame) => void } {
+function makeMockAcp(): { acp: AcpConnection; emit: (frame: AcpFrame) => void; emitState: (state: 'FAILED' | 'CLOSED') => void } {
   const handlers = new Set<AcpFrameHandler>();
+  const stateHandlers = new Set<(state: 'FAILED' | 'CLOSED') => void>();
   const acp: AcpConnection = {
     send: async () => null,
     on: (kind, cb) => {
@@ -470,7 +482,7 @@ function makeMockAcp(): { acp: AcpConnection; emit: (frame: AcpFrame) => void } 
     // 🩸 `AcpConnection` 이 `#11378`(13일 전)에서 셋을 더했는데 이 목이 «안 따라갔다» — 🅕 46차가 tsc 게이트에서 잡았다.
     //    ⛔ 그 뒤로 ***이 파일을 안 건드리는 변경도*** 저장소 범위 tsc 에서 막혔다.
     onRequest: () => () => {},
-    onState: () => () => {},
+    onState: (cb) => { stateHandlers.add(cb); return () => { stateHandlers.delete(cb); }; },
     state: 'OPEN',
     close: () => {},
     readyState: 1,
@@ -479,6 +491,7 @@ function makeMockAcp(): { acp: AcpConnection; emit: (frame: AcpFrame) => void } 
   return {
     acp,
     emit: (frame) => handlers.forEach((h) => h(frame)),
+    emitState: (state) => stateHandlers.forEach((h) => h(state)),
   };
 }
 
@@ -570,6 +583,29 @@ function chunkUpdate(sessionId: string, update: Record<string, unknown>): AcpFra
 }
 
 describe('runChatTurnAcp — CV-1b chat self-turn ACP path', () => {
+  it('shows an app_deploy ACP receipt without relying on the final prose', async () => {
+    const handle = makeProgrammableAcp();
+    handle.programNext('session/prompt', [chunkUpdate('sess-deploy', {
+      sessionUpdate: 'tool_call', toolCallId: 'd1', title: 'app_deploy',
+    }), chunkUpdate('sess-deploy', {
+      sessionUpdate: 'tool_call_update', toolCallId: 'd1', status: 'completed', title: '배포 완료',
+      rawOutput: { kind: 'site-deploy', status: 'rejected' },
+    })], { stopReason: 'end_turn' });
+    const result = await runChatTurnAcp(handle.acp, '배포해줘', makeAcpCtx('sess-deploy'));
+    expect(result.message.blocks?.find((block) => block.kind === 'deploy_result')).toEqual({ kind: 'deploy_result', toolId: 'd1', result: { status: 'rejected' } });
+  });
+  it('keeps pre-tool prose out of the final answer and preserves a normal refusal', async () => {
+    const handle = makeProgrammableAcp();
+    handle.programNext('session/prompt', [
+      chunkUpdate('sess-minimal', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '확인 중…' } }),
+      chunkUpdate('sess-minimal', { sessionUpdate: 'tool_call', toolCallId: 'check', title: 'Check' }),
+      chunkUpdate('sess-minimal', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '도와드릴 수 없습니다.' } }),
+    ], { stopReason: 'refusal' });
+    const { message } = await runChatTurnAcp(handle.acp, '질문', makeAcpCtx('sess-minimal'));
+    expect(message.text.slice(message.finalTextStart)).toBe('도와드릴 수 없습니다.');
+    expect(message.incomplete).toBeUndefined();
+  });
+
   it('dispatches session/prompt with sessionId + text prompt block, accumulates text deltas via onPartial', async () => {
     const handle = makeProgrammableAcp();
     handle.programNext(
@@ -764,6 +800,112 @@ describe('runChatTurnAcp — CV-1b chat self-turn ACP path', () => {
 });
 
 describe('runAcpForeignTurnObserver — CV-1 cross-surface mirror', () => {
+  it('waits for the explicit webterm turn end despite a long quiet gap', async () => {
+    const { acp, emit } = makeMockAcp();
+    const finalized: string[] = [];
+    let latest: ChatBlock[] = [];
+    const dispose = runAcpForeignTurnObserver(acp, 'sess-signal', {
+      idleFinalizeMs: 20,
+      onPlaceholder: () => 'ph-signal',
+      onPartialBlocks: (_id, blocks) => { latest = blocks; },
+      onFinalize: (id) => { finalized.push(id); },
+    });
+    emit(chunkUpdate('sess-signal', { sessionUpdate: 'elanous_turn_begin' }));
+    emit(chunkUpdate('sess-signal', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '초안' } }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(finalized).toEqual([]);
+    emit(chunkUpdate('sess-signal', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' 최종' } }));
+    emit(chunkUpdate('sess-signal', { sessionUpdate: 'elanous_turn_end', text: '초안 최종', stopReason: 'end_turn' }));
+    expect(finalized).toEqual(['ph-signal']);
+    expect(latest).toEqual([{ kind: 'text', text: '초안 최종' }]);
+    dispose();
+  });
+  it('uses server text on cancelled turns and resets an invalid final prose boundary', () => {
+    const { acp, emit } = makeMockAcp();
+    let latest: ChatBlock[] = [];
+    let completion: { stopReason: string; finalTextStart: number } | undefined;
+    const dispose = runAcpForeignTurnObserver(acp, 'sess-cancel', {
+      onPlaceholder: () => 'ph-cancel',
+      onPartialBlocks: (_id, blocks) => { latest = blocks; },
+      onFinalize: (_id, info) => { completion = info; },
+    });
+    emit(chunkUpdate('sess-cancel', { sessionUpdate: 'elanous_turn_begin' }));
+    emit(chunkUpdate('sess-cancel', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '진행 중' } }));
+    emit(chunkUpdate('sess-cancel', { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'tool' }));
+    emit(chunkUpdate('sess-cancel', { sessionUpdate: 'elanous_turn_end', text: '서버의 부분 답', stopReason: 'cancelled' }));
+    expect(latest.find((block) => block.kind === 'text')).toEqual({ kind: 'text', text: '서버의 부분 답' });
+    expect(completion).toEqual({ stopReason: 'cancelled', finalTextStart: 0 });
+    dispose();
+  });
+  it('keeps the pre-tool prose boundary when final markdown changes only after that prefix', () => {
+    const { acp, emit } = makeMockAcp();
+    let completion: { stopReason: string; finalTextStart: number } | undefined;
+    const dispose = runAcpForeignTurnObserver(acp, 'sess-rewrite', {
+      onPlaceholder: () => 'ph-rewrite', onPartialBlocks: () => {},
+      onFinalize: (_id, info) => { completion = info; },
+    });
+    emit(chunkUpdate('sess-rewrite', { sessionUpdate: 'elanous_turn_begin' }));
+    emit(chunkUpdate('sess-rewrite', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '같은 시작' } }));
+    emit(chunkUpdate('sess-rewrite', { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'tool' }));
+    emit(chunkUpdate('sess-rewrite', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' 다른 끝' } }));
+    emit(chunkUpdate('sess-rewrite', { sessionUpdate: 'elanous_turn_end', text: '같은 시작 새 결론', stopReason: 'end_turn' }));
+    expect(completion?.finalTextStart).toBe('같은 시작'.length);
+    dispose();
+  });
+  it('keeps streamed partial text when an incomplete turn ends with empty text', () => {
+    const { acp, emit } = makeMockAcp();
+    let latest: ChatBlock[] = [];
+    const dispose = runAcpForeignTurnObserver(acp, 'sess-empty', {
+      onPlaceholder: () => 'ph-empty',
+      onPartialBlocks: (_id, blocks) => { latest = blocks; },
+    });
+    emit(chunkUpdate('sess-empty', { sessionUpdate: 'elanous_turn_begin' }));
+    emit(chunkUpdate('sess-empty', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '부분 답변' } }));
+    emit(chunkUpdate('sess-empty', { sessionUpdate: 'elanous_turn_end', text: '', stopReason: 'cancelled' }));
+    expect(latest).toEqual([{ kind: 'text', text: '부분 답변' }]);
+    dispose();
+  });
+  it('accepts an empty authoritative final answer on a completed turn', () => {
+    const { acp, emit } = makeMockAcp();
+    let latest: ChatBlock[] = [];
+    const dispose = runAcpForeignTurnObserver(acp, 'sess-empty-done', {
+      onPlaceholder: () => 'ph-empty-done',
+      onPartialBlocks: (_id, blocks) => { latest = blocks; },
+    });
+    emit(chunkUpdate('sess-empty-done', { sessionUpdate: 'elanous_turn_begin' }));
+    emit(chunkUpdate('sess-empty-done', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '초안' } }));
+    emit(chunkUpdate('sess-empty-done', { sessionUpdate: 'elanous_turn_end', text: '', stopReason: 'end_turn' }));
+    expect(latest).toEqual([{ kind: 'text', text: '' }]);
+    dispose();
+  });
+  it('marks an explicit turn incomplete when the ACP connection closes', () => {
+    const { acp, emit, emitState } = makeMockAcp();
+    const completed: Array<{ id: string; reason?: string }> = [];
+    const dispose = runAcpForeignTurnObserver(acp, 'sess-close', {
+      onPlaceholder: () => 'ph-close',
+      onPartialBlocks: () => {},
+      onFinalize: (id, info) => { completed.push({ id, reason: info?.stopReason }); },
+    });
+    emit(chunkUpdate('sess-close', { sessionUpdate: 'elanous_turn_begin' }));
+    emitState('CLOSED');
+    expect(completed).toEqual([{ id: 'ph-close', reason: 'error' }]);
+    dispose();
+    expect(completed).toHaveLength(1);
+  });
+  it('keeps an app_deploy receipt when the completion title changes', () => {
+    const { acp, emit } = makeMockAcp();
+    let latest: ChatBlock[] = [];
+    const dispose = runAcpForeignTurnObserver(acp, 'sess-deploy-foreign', {
+      onPlaceholder: () => 'p-deploy',
+      onPartialBlocks: (_id, blocks) => { latest = blocks; },
+    });
+    emit(chunkUpdate('sess-deploy-foreign', { sessionUpdate: 'tool_call', toolCallId: 'd1', title: 'app_deploy' }));
+    emit(chunkUpdate('sess-deploy-foreign', { sessionUpdate: 'tool_call_update', toolCallId: 'd1', title: '공개 완료', status: 'completed',
+      rawOutput: { kind: 'site-deploy', status: 'published', publicUrl: 'https://demo--alice.elanous.app/' } }));
+    expect(latest.find((block) => block.kind === 'deploy_result')).toEqual({ kind: 'deploy_result', toolId: 'd1',
+      result: { status: 'published', publicUrl: 'https://demo--alice.elanous.app/' } });
+    dispose();
+  });
   it('routes agent_message_chunk text deltas into a freshly allocated placeholder', () => {
     const { acp, emit } = makeMockAcp();
     const placeholders: string[] = [];

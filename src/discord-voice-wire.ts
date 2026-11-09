@@ -34,7 +34,7 @@
 // GUILD_VOICE_STATES intent change) and /voice-* replies explain the
 // gate. Production behavior is unchanged until the operator opts in.
 
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
 import type { runTurn } from './session/chat.js';
 import type { DiscordBot, DcIncoming, DiscordVoiceDispatchTap } from './discord.js';

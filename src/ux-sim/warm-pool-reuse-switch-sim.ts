@@ -43,7 +43,9 @@ export async function runWarmPoolReuseSwitchSimulation(input: {
       const reply: WarmWorkerReply = { protocol: 1, runId: command.runId, attemptId: command.attemptId,
         cutSha: command.cutSha, ...(command.baselineSha ? { baselineSha: command.baselineSha } : {}),
         leaseId: command.leaseId, generation: command.generation, workerId: command.workerId,
-        key: command.key, envProfile: command.envProfile, startedAt: now, finishedAt: now + 1, files };
+        key: command.key, envProfile: command.envProfile, startedAt: now, finishedAt: now + 1, files,
+        resetReceipt: { baseImageDigest: command.baseImageDigest ?? key.imageDigest,
+          resetMethod: "git-reset-clean-status-v1", postRunDiff: [] } };
       return { status: 'observed', reason: 'complete', reply };
     } }),
   });
@@ -78,5 +80,104 @@ export async function runWarmPoolReuseSwitchSimulation(input: {
   } finally {
     primary.stop();
     rmSync(prepareLockDirectory, { recursive: true, force: true });
+  }
+}
+
+/** Inject a valid-but-dirty reset receipt, then prove only a new Pod incarnation can be reused. */
+export async function runWarmResetReceiptReplacementSimulation(runId = `warm-reset-replacement-${Date.now()}`) {
+  const stateRoot = mkdtempSync(join(tmpdir(), 'warm-reset-replacement-sim-'));
+  const replacementSpec: WarmPodSpec = { ...spec, name: 'warm-pool-host-a-standard-2',
+    workerId: 'warm-pool-host-a-standard-2-generation-1' };
+  const candidates: WarmWorkerCandidate[] = [
+    { host, tier: 'standard', spec: { ...spec } },
+    { host, tier: 'standard', spec: replacementSpec },
+  ];
+  const kubernetes = createFakeKubectl({ context: spec.kubectlContext, node: spec.nodeName!,
+    podReadinessOnCreate: true, uniquePodUids: true });
+  const primary = await createFakePrimaryControl();
+  const kubernetesFetch = (podName: string): typeof fetch => Object.assign(
+    async (_input: Parameters<typeof fetch>[0], init: Parameters<typeof fetch>[1]) => {
+      const uid = (JSON.parse(String(init?.body ?? '{}')) as { preconditions?: { uid?: string } }).preconditions?.uid ?? '';
+      return new Response('{}', { status: kubernetes.deletePod(podName, uid) ? 200 : 409 });
+    },
+    { preconnect: () => { throw new Error('fake Kubernetes fetch: preconnect is blocked'); } },
+  );
+  let injectDirtyReceipt = true;
+  const provider = new WarmPodProvider({ candidates, controlUrl: primary.url,
+    memberToken: primary.memberToken, machineTokens: { [host]: primary.machineTokens[host] },
+    profileConfig: { pod: { warmPoolProfile: 'gate' } }, kubectl: kubernetes.kubectl,
+    kubectlProxyUrlForTest: 'http://127.0.0.1:1',
+    kubernetesFetch: kubernetesFetch(spec.name),
+    fetch: primary.fetch, prepareLockDirectory: stateRoot, rotationStatePath: join(stateRoot, 'rotations.json'),
+    quotaResolverForTest: () => 2,
+    transport: () => ({ request: async (command) => {
+      const dirty = injectDirtyReceipt;
+      injectDirtyReceipt = false;
+      const now = Date.now();
+      const files: WarmWorkerFileResult[] = command.files.map((file) => ({ file, rc: 0,
+        failureIds: [], errorIds: [], junitComplete: true }));
+      const reply: WarmWorkerReply = { protocol: 1, runId: command.runId, attemptId: command.attemptId,
+        cutSha: command.cutSha, ...(command.baselineSha ? { baselineSha: command.baselineSha } : {}),
+        leaseId: command.leaseId, generation: command.generation, workerId: command.workerId,
+        key: command.key, envProfile: command.envProfile, startedAt: now, finishedAt: now + 1, files,
+        resetReceipt: { baseImageDigest: command.baseImageDigest ?? runtimeContract.baseImageDigest,
+          resetMethod: 'git-reset-clean-status-v1', postRunDiff: dirty ? ['src/dirty.fixture'] : [] } };
+      return { status: 'observed', reason: 'complete', reply };
+    } }),
+  });
+  try {
+    const initial = await provider.reconcilePool();
+    if (initial.ready !== 2 || initial.failed.length) throw new Error('initial warm Pods did not become ready');
+    const selection = { kind: 'gate' as const, lockHash: key.lockHash, imageDigest: key.imageDigest,
+      runtimeContract, runtimeIdentity };
+    const request = (suffix: string) => ({ protocol: 1 as const, runId: `${runId}-${suffix}`,
+      attemptId: `${runId}-${suffix}-attempt`, cutSha: spec.cutSha, deadlineAt: Date.now() + 60_000,
+      files: ['src/ux-sim/warm-pool-reuse-evidence-sim.test.ts'], envProfile: 'gate-v1' });
+    const contaminated = await requestWarmPodReplay(request('dirty'), provider, selection);
+    if (!contaminated.command || contaminated.transport.status !== 'fallback' || contaminated.transport.reason !== 'exec-failed')
+      throw new Error('dirty reset receipt was not refused');
+    const quarantined = primary.requests.some((row) => row.path.endsWith('/quarantine') && row.status === 200);
+    if (!quarantined) throw new Error('dirty Pod was not quarantined');
+
+    const replacementProvider = new WarmPodProvider({ candidates: [candidates[1]!], controlUrl: primary.url,
+      memberToken: primary.memberToken, machineTokens: { [host]: primary.machineTokens[host] },
+      profileConfig: { pod: { warmPoolProfile: 'gate' } }, kubectl: kubernetes.kubectl,
+      kubectlProxyUrlForTest: 'http://127.0.0.1:1',
+      kubernetesFetch: kubernetesFetch(replacementSpec.name),
+      fetch: primary.fetch, prepareLockDirectory: stateRoot, rotationStatePath: join(stateRoot, 'rotations.json'),
+      quotaResolverForTest: () => 2,
+      transport: () => ({ request: async (command) => {
+        const now = Date.now();
+        const files: WarmWorkerFileResult[] = command.files.map((file) => ({ file, rc: 0,
+          failureIds: [], errorIds: [], junitComplete: true }));
+        const reply: WarmWorkerReply = { protocol: 1, runId: command.runId, attemptId: command.attemptId,
+          cutSha: command.cutSha, ...(command.baselineSha ? { baselineSha: command.baselineSha } : {}),
+          leaseId: command.leaseId, generation: command.generation, workerId: command.workerId,
+          key: command.key, envProfile: command.envProfile, startedAt: now, finishedAt: now + 1, files,
+          resetReceipt: { baseImageDigest: command.baseImageDigest ?? runtimeContract.baseImageDigest,
+            resetMethod: 'git-reset-clean-status-v1', postRunDiff: [] } };
+        return { status: 'observed', reason: 'complete', reply };
+      } }),
+    });
+    const replacementReady = await replacementProvider.reconcilePool();
+    if (replacementReady.ready !== 1 || replacementReady.failed.length)
+      throw new Error(`replacement provider did not adopt the clean worker: ${JSON.stringify(replacementReady)}`);
+    const clean = await requestWarmPodReplay(request('clean'), replacementProvider, selection);
+    if (!clean.command || clean.command.workerId === contaminated.command.workerId
+      || clean.command.podUid === contaminated.command.podUid
+      || clean.transport.status !== 'observed' || clean.transport.reason !== 'complete')
+      throw new Error('replacement Pod did not accept a clean receipt');
+    const receipt = (clean.transport.reply as WarmWorkerReply | null)?.resetReceipt;
+    if (!receipt || receipt.baseImageDigest !== runtimeContract.baseImageDigest
+      || receipt.resetMethod !== 'git-reset-clean-status-v1' || receipt.postRunDiff.length !== 0)
+      throw new Error('replacement receipt fields are incomplete or dirty');
+    await replacementProvider.finalize(clean.command);
+    return { dirtyReceiptQuarantined: quarantined,
+      originalPodUid: contaminated.command.podUid, replacementPodUid: clean.command.podUid,
+      originalWorkerId: contaminated.command.workerId, replacementWorkerId: clean.command.workerId,
+      replacementReady: replacementReady.ready, receipt };
+  } finally {
+    primary.stop();
+    rmSync(stateRoot, { recursive: true, force: true });
   }
 }

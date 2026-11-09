@@ -1,5 +1,6 @@
 import { decideProviderForConfig, type ProviderDecision } from '../llm.js';
-import { getUserConfig, type UserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 export interface UsableLlm {
   usable: boolean;

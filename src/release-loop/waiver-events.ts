@@ -36,6 +36,16 @@ export interface WaiverEventDecision {
   expiredBy?: WaiverEventExpiry;
 }
 
+export function gateWaiverEvidence(input: { reason: string; actor: string; unmeasured?: string }): string[] {
+  return [`gate-waiver:reason:${input.reason}`, `gate-waiver:actor:${input.actor}`,
+    ...(input.unmeasured === undefined ? [] : [`gate-waiver:unmeasured:${input.unmeasured}`])];
+}
+
+/** A one-use waiver is bound to its complete evidence set; subset matching can revive stale grants. */
+export function hasExactWaiverEvidence(event: Pick<WaiverEvent, 'evidence'>, expected: readonly string[]): boolean {
+  return event.evidence.length === expected.length && expected.every((item, index) => event.evidence[index] === item);
+}
+
 const HASH = /^[a-f0-9]{40}$/i;
 const MAX_TTL: Record<WaiverEventKind, number> = {
   'op-waiver': 72 * 60 * 60 * 1000,
@@ -224,6 +234,28 @@ export function appendWaiverEvent(path: string, event: WaiverEvent): void {
 /** Append a related event transition under one lock, so issuance and consumption cannot be split by a crash. */
 export function appendWaiverEvents(path: string, events: WaiverEvent[]): void {
   if (events.length === 0) return;
+  const lockFd = acquireLedgerLock(path);
+  try { appendWaiverEventsUnderLock(path, events); }
+  finally { releaseLedgerLock(path, lockFd); }
+}
+
+/** Match and consume under one ledger lock so concurrent graph workers cannot authorize stale snapshots. */
+export function consumeWaiverEventFromLedger(path: string, matches: (event: WaiverEvent) => boolean, context: {
+  target: string; head: string; now: () => number; measuredRegression?: boolean; releaseEnded?: boolean;
+}): WaiverEvent {
+  const lockFd = acquireLedgerLock(path);
+  try {
+    const decisionContext = { ...context, now: context.now() };
+    const eligible = readWaiverEvents(path).filter(matches)
+      .filter((event) => evaluateWaiverEvent(event, decisionContext).allowed);
+    if (eligible.length !== 1) throw new Error('release gate waiver event missing, ambiguous, or mismatched; graph transition refused');
+    const consumed = consumeWaiverEvent(eligible[0]!, decisionContext);
+    appendWaiverEventsUnderLock(path, [consumed]);
+    return consumed;
+  } finally { releaseLedgerLock(path, lockFd); }
+}
+
+function acquireLedgerLock(path: string): number {
   const directory = dirname(path);
   const lockPath = `${path}.lock`;
   if (process.platform === 'win32') {
@@ -234,7 +266,16 @@ export function appendWaiverEvents(path: string, events: WaiverEvent[]): void {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     syncCreatedDirectoryParents(createdDirectories);
   }
-  const lockFd = acquireEventLock(lockPath);
+  return acquireEventLock(lockPath);
+}
+
+function releaseLedgerLock(path: string, lockFd: number): void {
+  closeSync(lockFd);
+  unlinkSync(`${path}.lock`);
+}
+
+function appendWaiverEventsUnderLock(path: string, events: WaiverEvent[]): void {
+  const directory = dirname(path);
   let temporary: string | undefined;
   try {
     const current = new Map(readWaiverEvents(path).map((item) => [item.eventId, item]));
@@ -264,8 +305,6 @@ export function appendWaiverEvents(path: string, events: WaiverEvent[]): void {
     syncDirectory(directory);
   } finally {
     if (temporary) try { unlinkSync(temporary); } catch { /* an interrupted append leaves only an ignored temp file */ }
-    closeSync(lockFd);
-    unlinkSync(lockPath);
   }
 }
 

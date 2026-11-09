@@ -1,0 +1,80 @@
+{
+  "entryCommands": [
+    "bun test src/ux-sim/world.test.ts",
+    "bun test src/ux-sim/world-snapshot.test.ts",
+    "bun test src/ux-sim/world.test.ts src/ux-sim/world-chaos-runtime.test.ts src/ux-sim/world-host-chaos.test.ts src/ux-sim/world-snapshot.test.ts src/ux-sim/event-monkey.test.ts",
+    "bun test src/ux-sim/world.test.ts src/ux-sim/world-chaos-runtime.test.ts src/ux-sim/event-monkey.test.ts",
+    "bun test src/ux-sim/world-host-chaos.test.ts",
+    "bun test src/ux-sim/warm-si-reuse-sim.test.ts",
+    "bun test src/ux-sim/fake-app-host.test.ts",
+    "bun test src/ux-sim/gate-roster-second-pool.test.ts"
+  ],
+  "eventNames": [
+    "pod.reuse/uncertain-exec-injected"
+  ],
+  "id": "world-runtime",
+  "implementation": [
+    "src/ux-sim/world.ts",
+    "src/cli/sim-cli.ts",
+    "scripts/sim-world-runner.ts",
+    "scenarios/ux-sim/night-train-dead-pid-lock.yaml",
+    "src/ux-sim/world-snapshot.ts",
+    "src/ux-sim/world-chaos-runtime.ts",
+    "src/ux-sim/event-monkey.ts",
+    "src/self-implement/run-ledger.ts",
+    "src/ux-sim/world-host-chaos.ts",
+    "src/ux-sim/sim-coverage.ts",
+    "src/task-orchestrator/surfaces/self-implement-pod.ts",
+    "src/task-orchestrator/surfaces/pod-si-warm-transport.ts",
+    "scenarios/ux-sim/warm-pool-reuse-world.yaml",
+    "src/ux-sim/hq-move-sim.ts",
+    "scenarios/ux-sim/sim-hq-move.yaml",
+    "src/ux-sim/fake-app-host.ts",
+    "src/ux-sim/gate-roster-second-pool.ts",
+    "src/ux-sim/world-watch.ts",
+    "src/ux-sim/multi-tenant-relay-world.ts",
+    "src/ux-sim/plugin-release-observe-route-world.ts",
+    "src/ux-sim/pwa-retained-routes-world.ts"
+  ],
+  "inputs": [
+    "world YAML",
+    "catalog device ids",
+    "dead-pid-lock event",
+    "scheduled arbitrary ledger/log injections",
+    "declared monkey schedule, injection schedule and recovery budget",
+    "warm SI timeout, connection loss, missing result, and uncertain cleanup",
+    "dead-pid-lock or hq-move event",
+    "optional migration fault",
+    "gate-roster-world scenarios",
+    "pool image pin, cross-pool shard placement, host outage and retry"
+  ],
+  "logsRecorded": "yes",
+  "name": "Isolated simulation world assembly and lifecycle",
+  "observations": [
+    "world directory lifecycle",
+    "blocked network attempts",
+    "release readiness verdict",
+    "convergence time, HITL events and lost ledger rows",
+    "per-world run code paths, event kinds, device fingerprints, and coverage report",
+    "SI reconcile-only classification, no duplicate cold Job, quarantine, and preserved verified PR disposition",
+    "lease generation and old/new host fences",
+    "state-copy result and migrated pool owner",
+    "actual judgeGate outcome and error",
+    "same-file mshq failure to node-b completion"
+  ],
+  "recentUse": null,
+  "target": "named catalog-device assembly, test-root world lifecycle, OS-enforced network denial, declared monkey faults on a shared fake-time timeline, and arbitrary world injections through the production ledger writer; SI uncertain-exec injection uses L0 fault records through production host transport and reconcile-only boundary; named catalog-device assembly, test-root lifecycle and OS-enforced network denial; dead-pid-lock and HQ transfer scenarios under fake host/clock edges; shared-timeline monkey faults, ledger/log injections, and app-host deploy/rollback; production gate roster cut, pinned image and same-shard host failover",
+  "tests": [
+    "src/ux-sim/world.test.ts",
+    "src/ux-sim/world-snapshot.test.ts",
+    "src/ux-sim/world-chaos-runtime.test.ts",
+    "src/ux-sim/event-monkey.test.ts",
+    "src/ux-sim/world-host-chaos.test.ts",
+    "src/ux-sim/warm-si-reuse-sim.test.ts",
+    "src/ux-sim/fake-app-host.test.ts",
+    "src/ux-sim/gate-roster-second-pool.test.ts",
+    "src/ux-sim/multi-tenant-relay-world.test.ts",
+    "src/ux-sim/plugin-release-observe-route-world.test.ts",
+    "src/ux-sim/pwa-retained-routes-world.test.ts"
+  ]
+}

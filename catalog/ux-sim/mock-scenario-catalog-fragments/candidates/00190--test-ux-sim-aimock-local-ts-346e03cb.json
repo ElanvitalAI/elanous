@@ -1,0 +1,8 @@
+{
+  "path": "test/ux-sim/aimock-local.ts",
+  "disposition": "already-indexed",
+  "entryCommand": "bun test src/ux-sim/aimock-local.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Test server interactions are asserted by tests, not app logs.db.",
+  "deviceId": "support-fakes"
+}

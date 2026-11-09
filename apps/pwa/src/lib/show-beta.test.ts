@@ -57,7 +57,7 @@ afterEach(() => {
   else (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = previousAct;
 });
 
-test('the general-only switch updates desktop and mobile beta menus and badges immediately', () => {
+test('the general-only switch updates beta entries in the six-screen desktop and mobile menus', () => {
   store.set(PWA_ROLE_KEY, 'general');
   const router = { push() {}, replace() {}, refresh() {}, back() {}, forward() {}, prefetch() {} } as never;
   act(() => { tree = create(createElement(PathnameContext.Provider, { value: '/chat' },
@@ -69,40 +69,32 @@ test('the general-only switch updates desktop and mobile beta menus and badges i
   const sheet = () => root.findByProps({ role: 'dialog' });
   const open = (label: string) => act(() => root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('button').find((node) => node.props['aria-label'] === label)!.props.onClick({ currentTarget: null }));
   const close = () => act(() => sheet().findAllByProps({ 'aria-label': '메뉴 닫기' })[0]!.props.onClick());
-  expect(hrefs()).toEqual(['/today', '/chat', '/live', '/term', '/editor', '/market', '/settings']);
+  expect(hrefs()).toEqual(['/chat', '/term', '/editor', '/settings']);
   expect(root.findAllByProps({ role: 'switch' })).toHaveLength(1);
   expect(root.findByProps({ role: 'switch' }).props.checked).toBe(false);
-  expect(root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('a').find((link) => link.props['aria-label'] === '오늘')?.props.href).toBe('/today');
+  expect(root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('a').map((link) => link.props.href)).toEqual(['/chat']);
   act(() => root.findByProps({ role: 'switch' }).props.onChange({ currentTarget: { checked: true } }));
   expect(root.findByProps({ role: 'switch' }).props.checked).toBe(true);
-  for (const path of ['/exec', '/field', '/trace', '/vault', '/intake']) {
+  for (const path of ['/live-run', '/vault']) {
     expect(hrefs()).toContain(path);
     expect(sidebar().findAllByType('a').find((link) => link.props.href === path)!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(true);
   }
-  for (const path of ['/approvals', '/scheduler', '/ops/release', '/design-check']) expect(hrefs()).not.toContain(path);
+  expect(hrefs()).toContain('/apps');
+  for (const path of ['/workspace', '/scheduler', '/ops/release', '/design-check']) expect(hrefs()).not.toContain(path);
   expect(sidebar().findAllByType('a').find((link) => link.props.href === '/settings')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(false);
-  // NAV2c (#23048): «오늘» holds /today ⊕ the beta /intake → a sheet, with the beta badge on /intake only
-  open('오늘');
-  expect(sheet().findAllByType('a').map((link) => link.props.href)).toEqual(['/today', '/intake']);
-  expect(sheet().findAllByType('a').find((link) => link.props.href === '/intake')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(true);
-  close();
-  open('대화');
-  expect(sheet().findAllByType('a').map((link) => link.props.href)).toEqual(['/chat', '/exec']);
-  expect(sheet().findAllByType('a').find((link) => link.props.href === '/exec')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(true);
-  close();
   open('더보기');
-  expect(sheet().findAllByType('a').map((link) => link.props.href)).toEqual(['/vault', '/field', '/market', '/settings']);
+  expect(sheet().findAllByType('a').map((link) => link.props.href)).toEqual(['/vault', '/settings']);
+  expect(sheet().findAllByType('a').find((link) => link.props.href === '/vault')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(true);
   close();
   act(() => root.findByProps({ role: 'switch' }).props.onChange({ currentTarget: { checked: false } }));
-  expect(hrefs()).toEqual(['/today', '/chat', '/live', '/term', '/editor', '/market', '/settings']);
-  expect(root.findByProps({ 'aria-label': '아래 탭' }).findAllByType('a').find((link) => link.props['aria-label'] === '오늘')?.props.href).toBe('/today');
+  expect(hrefs()).toEqual(['/chat', '/term', '/editor', '/settings']);
   act(() => { store.set(PWA_ROLE_KEY, 'contributor'); window.dispatchEvent(new Event(PWA_ROLE_EVENT)); });
   expect(root.findAllByProps({ role: 'switch' })).toHaveLength(0);
-  expect(hrefs()).toContain('/exec');
-  expect(sidebar().findAllByType('a').find((link) => link.props.href === '/exec')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(false);
+  expect(hrefs()).toEqual(['/chat', '/live-run', '/term', '/editor', '/apps', '/design-check', '/vault', '/settings']);
+  expect(sidebar().findAllByType('a').find((link) => link.props.href === '/live-run')!.findAllByType('span').some((node) => node.children.includes('실험'))).toBe(false);
   act(() => { store.set(PWA_ROLE_KEY, 'owner'); window.dispatchEvent(new Event(PWA_ROLE_EVENT)); });
   expect(root.findAllByProps({ role: 'switch' })).toHaveLength(0);
-  expect(hrefs()).toContain('/scheduler');
+  expect(hrefs()).toEqual(['/chat', '/live-run', '/term', '/editor', '/apps', '/design-check', '/vault', '/settings']);
 });
 
 test('defaults off, synchronizes every mounted hook and remembers opt-in across mounts', () => {

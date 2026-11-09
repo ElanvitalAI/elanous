@@ -1,0 +1,20 @@
+{
+  "id": "GRAPH-RESUME-ANY-ENTRY-SIM",
+  "name": "Resume graph execution from each supported entry point",
+  "kind": "graph-resume-lifecycle",
+  "device": "release-graph-rig",
+  "implementation": [
+    "src/ux-sim/graph-resume-any-entry.ts",
+    "src/graph-runner/runner.ts"
+  ],
+  "tests": [
+    "src/ux-sim/graph-resume-any-entry.test.ts"
+  ],
+  "trigger": "Run the release graph runner in isolated worlds that resume after approval, budget exhaustion, repeated approval, a healed edge, and an ARG child instance.",
+  "observe": [
+    "each resume path reaches its expected terminal node",
+    "persisted receipts and execution identities remain stable across resumes",
+    "the runner applies the production resume guards and state transitions"
+  ],
+  "expected": "All five supported resume entry points complete through the production graph runner and satisfy their path-specific invariants."
+}

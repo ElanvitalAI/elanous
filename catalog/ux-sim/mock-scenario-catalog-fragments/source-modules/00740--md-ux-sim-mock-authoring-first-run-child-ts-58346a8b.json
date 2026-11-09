@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-MOCK-AUTHORING-FIRST-RUN-CHILD-TS",
+  "path": "src/ux-sim/mock-authoring-first-run-child.ts",
+  "boundary": "Child-process probe for production first-run onboarding: consumes a fixture, runs provider/config selection in isolation and emits a structured receipt.",
+  "deviceIds": [
+    "first-run-and-seminar"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-ELEVENLABS-TS",
+  "path": "src/ux-sim/fake-elevenlabs.ts",
+  "boundary": "Loopback-only ElevenLabs-compatible TTS responses with deterministic audio, authentication, rate limiting, delay, and reusable contract cases.",
+  "deviceIds": [
+    "SIM-FAKE-PROVIDERS-AV"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-FAULT-POD-DEATH-TS",
+  "path": "src/ux-sim/fault-pod-death.ts",
+  "boundary": "Replays pod termination and partial-output variants, then observes production classification of final, partial, missing and unparsable child results.",
+  "deviceIds": [
+    "fault-injection",
+    "grid-chaos-driver"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

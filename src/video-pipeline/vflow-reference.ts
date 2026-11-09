@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 import { readFileSync } from 'node:fs';
 
 export interface VflowPromptRow {
@@ -43,8 +44,6 @@ export type VflowSearchResult =
   | { available: true; rows: VflowPromptRow[]; read: number; skipped: number; matches: number }
   | { available: false; reason: string };
 
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
 // ⚠️ 원천은 «모르는 칸»을 null 로 낸다(10-01 전수: spec.duration·video.isoDuration 이 53% null) — null 을 거부하면 줄째로 버려진다.
 const optionalString = (value: unknown): boolean => value == null || typeof value === 'string';
 const optionalStrings = (value: unknown): boolean =>

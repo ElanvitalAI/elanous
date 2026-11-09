@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { showSummaryRecap } from '../src/onboarding/summary.js';
 import { scriptedIO } from '../src/onboarding.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 
 const baseCfg: UserConfig = {
   llm: { provider: 'openai', model: 'gpt-4o', apiKey: 'sk-x' },

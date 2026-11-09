@@ -1,0 +1,26 @@
+{
+  "id": "SAFE-PUBLIC-COPY-PUBLISH-REDACTION",
+  "name": "Safe launch copy redaction and local publish receipt",
+  "kind": "safe-public-copy-publish",
+  "device": "support-fakes",
+  "implementation": [
+    "src/ux-sim/safe-public-copy-publish.ts",
+    "src/nexus/api/markdown-publish.ts",
+    "src/publishing/markdown-publisher.ts",
+    "src/publishing/markdown-renderer.ts",
+    "src/publishing/artifact-store.ts",
+    "src/debug/log.ts"
+  ],
+  "tests": [
+    "src/ux-sim/safe-public-copy-publish.test.ts",
+    "test/nexus/api/markdown-publish.test.ts"
+  ],
+  "trigger": "Redact a secret-bearing launch-copy fixture, POST it through the real Markdown publish handler, then read the generated artifact through GET /d/:id.",
+  "observe": [
+    "HTTP 201 local publish receipt and HTTP 200 served HTML",
+    "secret marker absent from stored Markdown and rendered HTML",
+    "unsafe inline script removed by the production renderer",
+    "public upload seam returns unavailable and performs no external write"
+  ],
+  "expected": "The sanitized copy is atomically stored and served with a receipt; the secret is absent, unsafe script is stripped, and no public upload occurs."
+}

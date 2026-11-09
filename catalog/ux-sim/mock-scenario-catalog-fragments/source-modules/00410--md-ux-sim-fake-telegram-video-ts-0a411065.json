@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-TELEGRAM-VIDEO-TS",
+  "path": "src/ux-sim/fake-telegram-video.ts",
+  "boundary": "Implements an in-memory Telegram sendVideo endpoint that records multipart requests and returns scripted delivery receipts or rejection responses.",
+  "deviceIds": [
+    "telegram-video-receipt"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -6,7 +6,12 @@ import { fileURLToPath } from 'node:url';
 import { userConfigPath } from '../src/user-config.js';
 import type { WarmWorkerCandidate } from '../src/task-orchestrator/surfaces/pod-warm-worker-provider.js';
 import type { RuntimeIdentityInput } from '../src/runtime-identity.js';
+import { resolveWarmPodPhasePlan, type WarmPodPhaseKind, type WarmPodPhaseSchedule } from '../src/task-orchestrator/surfaces/pod-warm-switch.js';
+import type { PodKind } from '../src/task-orchestrator/surfaces/pod-warm-switch.js';
 import { machinePoolCapacity, parseMachinePoolDeclarations, readMachinePoolDeclarations, type MachinePoolDeclaration } from '../src/resource-ledger/machine-pool-inventory.js';
+import { debug } from '../src/debug/log.js';
+import { assertResourceLedgerUrl, type ResourceLedgerUrlValidationOptions } from './resource-ledger-url.js';
+import { validateWarmHostProbeUrl } from '../src/task-orchestrator/surfaces/warm-host-probe.js';
 
 const TOKEN = /^[a-f0-9]{64}$/;
 const SHA = /^[a-f0-9]{40}$/;
@@ -43,6 +48,7 @@ export interface WarmPoolProviderConfig {
     };
   }>;
   profileConfig: { pod: { warmPoolProfile: string } };
+  phaseSchedule?: WarmPodPhaseSchedule;
   /** Cross-architecture reuse is opt-in; omission keeps exact architecture matching. */
   allowedArchitectures?: Array<'amd64' | 'arm64'>;
   runtimeIdentity?: RuntimeIdentityInput;
@@ -65,18 +71,21 @@ export interface AssembleWarmPoolProviderConfigInput {
 
 /** Keep a deployment canary to one explicit worker instead of expanding its profile quota. */
 export function selectSingleWarmPoolCandidate(config: WarmPoolProviderConfig, selection: string): WarmPoolProviderConfig {
-  const match = /^([a-zA-Z0-9][a-zA-Z0-9._-]*)\/(lite|standard)$/.exec(selection);
-  if (!match) throw new Error('--single-candidate must be HOST/lite or HOST/standard');
-  const [, host, tier] = match;
-  const template = config.poolTemplates.find(candidate => candidate.host === host && candidate.tier === tier);
-  if (!template) throw new Error(`warm pool template not found: ${host}/${tier}`);
+  const match = /^([a-zA-Z0-9][a-zA-Z0-9._-]*)\/(lite|standard)(?:\/(gate|implementation))?$/.exec(selection);
+  if (!match) throw new Error('--single-candidate must be HOST/lite, HOST/standard, or HOST/<tier>/<kind>');
+  const [, host, tier, kind] = match;
+  const matches = config.poolTemplates.filter(candidate => candidate.host === host && candidate.tier === tier
+    && (kind === undefined || candidate.kind === kind));
+  if (!matches.length) throw new Error(`warm pool template not found: ${host}/${tier}`);
+  if (matches.length > 1) throw new Error(`warm pool template kind required; use ${host}/${tier}/gate or ${host}/${tier}/implementation`);
+  const template = matches[0]!;
   const index = 1;
   return {
     ...config,
-    candidates: [{ host, tier: tier as 'lite' | 'standard', spec: {
+    candidates: [{ host, tier: tier as 'lite' | 'standard', ...(template.kind ? { kind: template.kind } : {}), spec: {
       ...template.spec,
-      name: `warm-${host}-${tier}-${index}`,
-      workerId: `${template.spec.workerId}-${tier}-${index}`,
+      name: `warm-${host}-${tier}-${template.kind ? `${template.kind}-` : ''}${index}`,
+      workerId: `${template.spec.workerId}-${template.kind ? `${template.kind}-` : ''}${tier}-${index}`,
     } }],
     poolTemplates: [],
   };
@@ -121,6 +130,79 @@ function controlUrl(value: unknown): string {
   } catch { throw new Error('controlUrl must be an http or https URL with an explicit port'); }
 }
 
+
+const PHASE_KINDS: readonly WarmPodPhaseKind[] = ['gate', 'implementation'];
+const PHASES = new Set(['rehearsal', 'gate', 'publish']);
+
+function strictKeys(value: JsonObject, allowed: readonly string[], label: string): void {
+  const unknown = Object.keys(value).find(key => !allowed.includes(key));
+  if (unknown) throw new Error(`${label}.${unknown} is not supported`);
+}
+
+function nonNegativeInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error(`${label} must be a non-negative integer`);
+  return value as number;
+}
+
+function phaseTargets(value: unknown, label: string): Partial<Record<WarmPodPhaseKind, number>> {
+  const targets = object(value, label);
+  strictKeys(targets, PHASE_KINDS, label);
+  const parsed: Partial<Record<WarmPodPhaseKind, number>> = {};
+  for (const kind of PHASE_KINDS) {
+    if (targets[kind] !== undefined) parsed[kind] = nonNegativeInteger(targets[kind], `${label}.${kind}`);
+  }
+  return parsed;
+}
+
+function isoUtcMilliseconds(value: unknown, label: string): number {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value))
+    throw new Error(`${label} must be an ISO-8601 UTC timestamp`);
+  const milliseconds = Date.parse(value);
+  if (!Number.isSafeInteger(milliseconds)) throw new Error(`${label} must be an ISO-8601 UTC timestamp`);
+  const canonical = new Date(milliseconds).toISOString();
+  const inputCanonical = value.replace(/(?:\.(\d{1,3}))?Z$/, (_match, fraction: string | undefined) => `.${(fraction ?? '').padEnd(3, '0')}Z`);
+  if (canonical !== inputCanonical) throw new Error(`${label} must be a valid ISO-8601 UTC timestamp`);
+  return milliseconds;
+}
+
+/** Strictly convert the one private phaseSchedule field from ISO timestamps to the provider's millisecond plan. */
+function parseWarmPodPhaseSchedule(value: unknown): WarmPodPhaseSchedule | undefined {
+  if (value === undefined) return undefined;
+  const label = 'pod.warmPool.phaseSchedule';
+  const schedule = object(value, label);
+  strictKeys(schedule, ['windows', 'steadyTargets', 'measuredPrepareDurationMs'], label);
+  if (!Array.isArray(schedule.windows) || schedule.windows.length === 0)
+    throw new Error(`${label}.windows must be a non-empty array`);
+  const windows = schedule.windows.map((raw, index) => {
+    const windowLabel = `${label}.windows[${index}]`;
+    const window = object(raw, windowLabel);
+    strictKeys(window, ['phase', 'startAt', 'endAt', 'targets', 'cutSha', 'lockHash', 'imageDigest'], windowLabel);
+    const phase = text(window.phase, `${windowLabel}.phase`);
+    if (!PHASES.has(phase)) throw new Error(`${windowLabel}.phase is not supported`);
+    const startAtMs = isoUtcMilliseconds(window.startAt, `${windowLabel}.startAt`);
+    const endAtMs = isoUtcMilliseconds(window.endAt, `${windowLabel}.endAt`);
+    const targets = phaseTargets(window.targets, `${windowLabel}.targets`);
+    if (phase === 'gate') {
+      const cutSha = text(window.cutSha, `${windowLabel}.cutSha`);
+      const lockHash = text(window.lockHash, `${windowLabel}.lockHash`);
+      const imageDigest = text(window.imageDigest, `${windowLabel}.imageDigest`);
+      if (!SHA.test(cutSha) || !LOCK_HASH.test(lockHash) || !DIGEST.test(imageDigest))
+        throw new Error(`${windowLabel} gate phase requires exact cut, lock, and image identity`);
+      return { phase: 'gate' as const, startAtMs, endAtMs, targets, cutSha, lockHash, imageDigest };
+    }
+    if (window.cutSha !== undefined || window.lockHash !== undefined || window.imageDigest !== undefined)
+      throw new Error(`${windowLabel} non-gate phase cannot carry a gate image identity`);
+    return { phase: phase as 'rehearsal' | 'publish', startAtMs, endAtMs, targets };
+  });
+  const measuredPrepareDurationMs = schedule.measuredPrepareDurationMs === undefined ? undefined
+    : nonNegativeInteger(schedule.measuredPrepareDurationMs, `${label}.measuredPrepareDurationMs`);
+  const parsed: WarmPodPhaseSchedule = { windows, steadyTargets: phaseTargets(schedule.steadyTargets, `${label}.steadyTargets`),
+    ...(measuredPrepareDurationMs !== undefined ? { measuredPrepareDurationMs } : {}) };
+  // Reuse the runtime resolver's overlap, identity, target, and measurement checks at config admission.
+  resolveWarmPodPhasePlan(0, parsed);
+  return parsed;
+}
+
 function privateSource(pool: JsonObject): Pick<WarmPoolProviderConfig['poolTemplates'][number]['spec'], 'sourceUrl' | 'sourceMirrorHostPath'> {
   const mirror = pool.sourceMirrorHostPath;
   const source = pool.sourceUrl;
@@ -145,6 +227,7 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
   const harness = object(root.harness, 'harness');
   const profile = text(pod.warmPoolProfile, 'pod.warmPoolProfile');
   const pool = object(pod.warmPool, 'pod.warmPool');
+  const phaseSchedule = parseWarmPodPhaseSchedule(pool.phaseSchedule);
   const cutSha = text(harness.imageCommit, 'harness.imageCommit');
   if (!SHA.test(cutSha)) throw new Error('harness.imageCommit must be a 40-character commit SHA');
   const kubectlContext = text(harness.podPool, 'harness.podPool');
@@ -176,7 +259,7 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
   const architecture = text(pool.architecture, 'pod.warmPool.architecture');
   const bunVersion = readFileSync(fileURLToPath(new URL('../.bun-version', import.meta.url)), 'utf8').trim();
   if (!/^\d+\.\d+\.\d+$/.test(bunVersion)) throw new Error('.bun-version must be a semantic version');
-  const hostProbeUrl = httpUrl(pool.hostProbeUrl, 'pod.warmPool.hostProbeUrl', 'host.orb.internal');
+  const hostProbeUrl = validateWarmHostProbeUrl(text(pool.hostProbeUrl, 'pod.warmPool.hostProbeUrl'), 'pod.warmPool.hostProbeUrl');
   const prodProbeUrl = httpUrl(pool.prodProbeUrl, 'pod.warmPool.prodProbeUrl', 'core.elanous-prod');
   const source = privateSource(pool);
   const templates = pool.templates;
@@ -206,12 +289,15 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
     const host = text(row.host, `pod.warmPool.templates[${index}].host`);
     const tier = text(row.tier, `pod.warmPool.templates[${index}].tier`);
     if (!TIERS.has(tier)) throw new Error(`pod.warmPool.templates[${index}].tier must be lite or standard`);
+    const kind = row.kind;
+    if (kind !== undefined && kind !== 'gate' && kind !== 'implementation')
+      throw new Error(`pod.warmPool.templates[${index}].kind must be gate or implementation`);
     const nodeName = text(row.nodeName, `pod.warmPool.templates[${index}].nodeName`);
     const declared = declaredMembers.get(host);
     if (input.machinePools && !declared) throw new Error('machine pool declaration missing ' + purpose + ' member for ' + host);
     if (declared && declared.count === 0) throw new Error('machine pool member cannot execute provider jobs: ' + host);
     if (declared && declared.digest !== imageDigest) throw new Error('machine pool digest mismatch for ' + host);
-    const identity = `${host}/${tier}`;
+    const identity = `${host}/${tier}/${kind ?? 'untyped'}`;
     if (seen.has(identity)) throw new Error(`duplicate pod.warmPool template ${identity}`);
     seen.add(identity);
     machineTokens[host] = token(input.machineTokens[host], `machine token for ${host}`);
@@ -223,7 +309,7 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
     return {
       host,
       tier: tier as 'lite' | 'standard',
-      kind: profile === 'feature' ? 'implementation' as const : 'gate' as const,
+      kind: kind ?? (profile === 'feature' ? 'implementation' as const : 'gate' as const),
       ...(slotCount !== undefined ? { slotCount } : {}),
       spec: {
         name: `warm-${host}-${tier}-template`, namespace, kubectlContext,
@@ -238,6 +324,7 @@ export function assembleWarmPoolProviderConfig(input: AssembleWarmPoolProviderCo
   });
   return { candidates: [], expandPoolTemplatesToQuota: expandPoolTemplatesToQuota === true, drainingHosts,
     poolTemplates, profileConfig: { pod: { warmPoolProfile: profile } },
+    ...(phaseSchedule ? { phaseSchedule } : {}),
     ...(allowedArchitectures ? { allowedArchitectures } : {}),
     ...(baseImageDigest ? { runtimeIdentity: { baseImageDigest, lockHash, os: 'linux', architecture, bunVersion } } : {}),
     siSelection: { kind: 'implementation', imageDigest,
@@ -309,7 +396,7 @@ function parseArgs(argv: readonly string[]): CliOptions {
     throw new Error('usage: --config ABSOLUTE --control-url URL --member-token-file ABSOLUTE --machine-token HOST=ABSOLUTE [--resource-ledger-url URL] [--output ABSOLUTE] [--single-candidate HOST/TIER] [--dry-run|--serve]');
   if (Object.values(machineTokenFiles).some(file => !isAbsolute(file))) throw new Error('machine token files must be absolute');
   if (machinePoolsFile && !isAbsolute(machinePoolsFile)) throw new Error('--machine-pools path must be absolute');
-  if (resourceLedgerUrl && !/^https?:\/\//.test(resourceLedgerUrl)) throw new Error('--resource-ledger-url must be http(s)');
+  if (resourceLedgerUrl) assertResourceLedgerUrl(resourceLedgerUrl);
   if (dryRun && serve) throw new Error('--dry-run and --serve cannot be combined');
   return { configPath, controlUrl, memberTokenFile, machineTokenFiles, machinePoolsFile, resourceLedgerUrl,
     output: output || join(dirname(configPath), 'warm-pod-provider.json'), dryRun, serve, singleCandidate };
@@ -324,11 +411,53 @@ export function requireAuthoritativeMachinePoolSource(resourceLedgerUrl?: string
   if (!resourceLedgerUrl) throw new Error('--resource-ledger-url is required for authoritative machine-pool declarations');
 }
 
-export async function fetchMachinePoolDeclarationsFromNexus(url: string, memberToken: string, fetcher: typeof fetch = fetch): Promise<MachinePoolDeclaration[]> {
-  const response = await fetcher(url, { headers: { authorization: 'Bearer ' + memberToken } });
-  if (!response.ok) throw new Error('Nexus resource-ledger request failed: HTTP ' + response.status);
-  const body = await response.json() as { pools?: unknown };
-  return parseMachinePoolDeclarations({ pools: body.pools });
+export async function fetchMachinePoolDeclarationsFromNexus(url: string, memberToken: string, fetcher: typeof fetch = fetch,
+): Promise<MachinePoolDeclaration[]> {
+  const urlValidation = (fetcher as typeof fetch & {
+    resourceLedgerUrlValidationForTest?: ResourceLedgerUrlValidationOptions;
+  }).resourceLedgerUrlValidationForTest ?? {};
+  return fetchMachinePoolDeclarationsForHost(url, memberToken, fetcher, undefined, urlValidation);
+}
+
+async function fetchMachinePoolDeclarationsForHost(url: string, memberToken: string, fetcher: typeof fetch,
+  host?: string, urlValidation: ResourceLedgerUrlValidationOptions = {}): Promise<MachinePoolDeclaration[]> {
+  try { assertResourceLedgerUrl(url, urlValidation); }
+  catch (error) {
+    debug.log('pod.warm.provider-config', 'resource-ledger-read-failed', {
+      ...(host ? { host } : {}), status: null, reason: 'invalid-resource-ledger-url',
+    }, { level: 'warn' });
+    throw error;
+  }
+  let response: Response;
+  try { response = await fetcher(url, { headers: { authorization: 'Bearer ' + memberToken }, redirect: 'error' }); }
+  catch {
+    debug.log('pod.warm.provider-config', 'resource-ledger-read-failed', {
+      ...(host ? { host } : {}), status: null, reason: 'request-failed',
+    }, { level: 'warn' });
+    throw new Error('Nexus resource-ledger request failed: network error');
+  }
+  if (!response.ok) {
+    const reason = response.status === 401 ? 'unauthorized' : response.status === 404 ? 'not-found' : 'http-error';
+    debug.log('pod.warm.provider-config', 'resource-ledger-read-failed', {
+      ...(host ? { host } : {}), status: response.status, reason,
+    }, { level: 'warn' });
+    throw new Error('Nexus resource-ledger request failed: HTTP ' + response.status);
+  }
+  let body: { pools?: unknown };
+  try { body = await response.json() as { pools?: unknown }; }
+  catch {
+    debug.log('pod.warm.provider-config', 'resource-ledger-read-failed', {
+      ...(host ? { host } : {}), status: response.status, reason: 'invalid-json',
+    }, { level: 'warn' });
+    throw new Error('Nexus resource-ledger response invalid');
+  }
+  try { return parseMachinePoolDeclarations({ pools: body.pools }); }
+  catch {
+    debug.log('pod.warm.provider-config', 'resource-ledger-read-failed', {
+      ...(host ? { host } : {}), status: response.status, reason: 'invalid-pool-declaration',
+    }, { level: 'warn' });
+    throw new Error('Nexus resource-ledger response invalid');
+  }
 }
 
 export async function runWarmPoolProviderConfig(argv: readonly string[]): Promise<void> {
@@ -342,10 +471,10 @@ export async function runWarmPoolProviderConfig(argv: readonly string[]): Promis
   const memberToken = readPrivateToken(options.memberTokenFile, 'member token');
   let fromNexus: MachinePoolDeclaration[] | undefined;
   if (options.resourceLedgerUrl) {
-    const hostCredentials = Object.values(machineTokens);
+    const hostCredentials = Object.entries(machineTokens);
     if (hostCredentials.length === 0) throw new Error('--resource-ledger-url requires at least one host machine token');
-    const declarations = await Promise.all(hostCredentials.map(credential =>
-      fetchMachinePoolDeclarationsFromNexus(options.resourceLedgerUrl!, credential)));
+    const declarations = await Promise.all(hostCredentials.map(([host, credential]) =>
+      fetchMachinePoolDeclarationsForHost(options.resourceLedgerUrl!, credential, fetch, host)));
     const byIdentity = new Map<string, MachinePoolDeclaration>();
     for (const pool of declarations.flat()) {
       const identity = `${pool.purpose}/${pool.fanoutGroupId}`;

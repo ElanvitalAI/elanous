@@ -2,6 +2,7 @@
 // The saved version-release output is re-pointed at the new branch tip (fast-forward only, state backed up first), so
 // every later node reads the repaired commit without anyone hand-editing the run state.
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { createHash } from 'node:crypto';
 import { accessSync, closeSync, constants, copyFileSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -33,7 +34,7 @@ import { createMacrophageRuntime } from '../../src/release-loop/macrophage-heal-
 import { createMacrophageSafeCleanup } from '../../src/release-loop/macrophage-safe-cleanup.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import type { GateAutohealDecision } from './gate-autoheal.js';
-import { appendWaiverEvents, consumeWaiverEvent, issueGateWaiverEvent } from '../../src/release-loop/waiver-events.js';
+import { appendWaiverEvents, evaluateWaiverEvent, gateWaiverEvidence, hasExactWaiverEvidence, issueGateWaiverEvent, readWaiverEvents } from '../../src/release-loop/waiver-events.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 
@@ -174,7 +175,7 @@ export interface TipRefresh { version: string; branch: string; from: string; to:
 function gitRunner(repo: string) {
   return (args: string[]): string => {
     // git-spawn-allow: read-only fetch / ls-remote / rev-parse against release/<v>; nothing is pushed or checked out.
-    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     if (result.status !== 0 || result.error) throw new Error(`git ${args[0]} failed: ${(result.stderr || result.error || 'no output').toString().trim()}`);
     return result.stdout.trim();
   };
@@ -188,7 +189,7 @@ function resumeCommandRootGit(root: string, repoGit?: (args: string[]) => string
   // worktree explicitly selected for this resume has a .git file (or directory), and its identity/status must be
   // read from that exact worktree. Without an explicit command root, retain the caller's repo-level test seam.
   if (commandRootWasSelected) {
-    const probe = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: root, encoding: 'utf8' });
+    const probe = spawnSync('git', ['rev-parse', '--git-dir'], { cwd: root, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     if (probe.status === 0 && !probe.error) return commandRootGitRunner(root);
   }
   return repoGit;
@@ -219,7 +220,9 @@ export function isReleaseToolingPath(path: string): boolean {
 
 function ancestorRunner(repo: string) {
   return (ancestor: string, descendant: string): boolean => {
-    const result = spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd: repo });
+    const result = spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], {
+      cwd: repo, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+    });
     if (result.status !== 0 && result.status !== 1) throw new Error(`git merge-base failed: ${result.error || result.stderr || 'unknown'}`);
     return result.status === 0;
   };
@@ -842,19 +845,32 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   // Resume the graph at the path it was started from (its snapshot is used); only tests inject another path.
   const graphPath = deps.graphPath ?? savedGraphPath(tip.statePath) ?? GRAPH;
   const savedSource = JSON.parse(readFileSync(tip.statePath, 'utf8')) as GraphRunState;
+  const savedCutCommit = lastJsonObject(savedSource.nodes.find((record) => record.nodeId === 'version-release')?.output)?.commit;
+  if (waiver?.nodeId === 'gate' && (typeof savedCutCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(savedCutCommit)
+    || savedCutCommit.toLowerCase() !== tip.to.toLowerCase())) {
+    throw new Error('release gate waiver head differs from the saved version-release cut; refusing to issue waiver event');
+  }
   deps.onSource?.(`레시피 출처: graph=${graphPath} · graph sha=${savedSource.graphSnapshot?.graphSha?.slice(0, 12) ?? 'legacy'} · recipes sha=${savedSource.graphSnapshot?.recipesSha?.slice(0, 12) ?? 'legacy'} · command-root=${commandRoot} · 컷 tip=${tip.to.slice(0, 12)}`);
   if (waiver?.nodeId === 'gate') {
     const issuedAt = (deps.now?.() ?? new Date()).getTime();
-    const event = issueGateWaiverEvent({ mode: 'operational', target: `run:${opts.runId}`, head: tip.to,
-      evidence: [`saved-run:${tip.statePath}`, `waiver:${waiver.unmeasured ?? waiver.reason}`],
-      actor: waiver.approvedBy ?? process.env.ELANOUS_SEAT ?? process.env.USER ?? 'release-resume', issuedAt,
-      expiresAt: issuedAt + 24 * 60 * 60 * 1000 });
     const eventPath = join(deps.ledgerRoot ?? releaseLedgerRoot(), 'review-results', 'waiver-events.jsonl');
-    const acceptedIds = new Set(waiver.acceptedRegressions.map(({ id }) => id));
-    const unacceptedMeasuredRegression = !waiver.ownerWaived
-      && (waiver.introducedIds ?? []).some((id) => !acceptedIds.has(id));
-    appendWaiverEvents(eventPath, [event, consumeWaiverEvent(event, { target: `run:${opts.runId}`, head: tip.to, now: issuedAt,
-      measuredRegression: unacceptedMeasuredRegression })]);
+    const target = `run:${opts.runId}`;
+    const waiverActor = waiver.approvedBy ?? process.env.ELANOUS_SEAT ?? process.env.USER ?? 'release-resume';
+    const waiverEvidence = gateWaiverEvidence({ reason: waiver.reason, actor: waiverActor, unmeasured: waiver.unmeasured });
+    const existing = readWaiverEvents(eventPath).filter((candidate) => candidate.kind === 'gate' && candidate.mode === 'operational'
+      && candidate.target === target && candidate.head === savedCutCommit && candidate.uses === 0 && candidate.expiredBy === undefined
+      && candidate.actor === waiverActor && hasExactWaiverEvidence(candidate, [`saved-run:${tip.statePath}`, ...waiverEvidence])
+      && evaluateWaiverEvent(candidate, { target, head: savedCutCommit, now: issuedAt, measuredRegression: false }).allowed);
+    if (existing.length > 1) throw new Error('multiple active gate waiver events match this release run; graph transition refused');
+    if (existing.length === 0) {
+      const event = issueGateWaiverEvent({ mode: 'operational', target, head: savedCutCommit as string,
+        evidence: [`saved-run:${tip.statePath}`, ...waiverEvidence],
+        actor: waiverActor, issuedAt,
+        expiresAt: issuedAt + 24 * 60 * 60 * 1000 });
+    // The graph runner consumes this one-use authorization at the waived node. Keeping
+    // the event active until dispatch binds the route decision to the graph execution.
+      appendWaiverEvents(eventPath, [event]);
+    }
   }
   await (deps.registerLogSink ?? registerStandaloneLogSink)('release-loop');
   const safeCleanup = createMacrophageSafeCleanup({ repoRoot: process.cwd() });
@@ -863,6 +879,7 @@ async function resumeReleaseRunLocked(opts: ResumeReleaseOptions, deps: ResumeRe
   const sourceGit = resumeCommandRootGit(commandRoot, deps.git, deps.commandRootGit, opts.commandRoot !== undefined);
   let state: GraphRunState;
   try { state = await (deps.graph ?? runGraph)(graphPath, { resumeRunId: opts.runId, fromNodeId: opts.from, pinChildUniverse: true, eventBus: macrophage.eventBus,
+    waiverLedgerRoot: deps.ledgerRoot ?? releaseLedgerRoot(),
     ...(opts.resumeBudgetExceeded ? { releaseBudgetExceededResume: { reason: opts.reason!.trim() } } : {}),
     releaseCommandSource: { root: commandRoot, cutTip: tip.to, ...(sourceGit ? { git: sourceGit } : {}) },
     ...(waiver ? { releaseWaiver: { ...waiver, requestedRegressions: opts.acceptedRegressions ?? [] } } : {}),

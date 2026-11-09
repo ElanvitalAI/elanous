@@ -66,7 +66,7 @@ test('seat fields persist through save while steward and unknown loop keys survi
   cfg.loops!.seat = { mode: 'on', seats: ['TC'], podPool: 'pool-x', reportPr: 12 };
   saveUserConfig(cfg, path);
   const saved = JSON.parse(readFileSync(path, 'utf8')).loops;
-  expect(saved).toEqual({ ...ownership, orchestrator, steward: { mode: 'shadow', linearTeam: ' team ', futureSteward: 'keep' }, futureLoop: { enabled: true }, seat: { ...cfg.loops!.seat, questions: 'shadow' } });
+  expect(saved).toEqual({ steward: { mode: 'shadow', linearTeam: ' team ', futureSteward: 'keep' }, futureLoop: { enabled: true }, seat: cfg.loops!.seat });
   expect(buildUserConfig(path).loops).toEqual({ ...ownership, orchestrator, steward: { mode: 'shadow', linearTeam: 'team' }, persona: { enabled: false }, seat: { ...cfg.loops!.seat, questions: 'shadow' } });
   const typed = buildUserConfig(path);
   typed.loops!.steward!.mode = 'off';
@@ -93,10 +93,8 @@ test('saving typed steward mode preserves unrelated steward and loop keys', () =
   cfg.loops!.steward!.mode = 'live';
   saveUserConfig(cfg, path);
   expect(JSON.parse(readFileSync(path, 'utf8')).loops).toEqual({
-    ...ownership, orchestrator,
     steward: { mode: 'live', linearTeam: 'ELA', launch: 'shadow', futureSteward: 'keep' },
     futureLoop: { enabled: true },
-    seat: base,
   });
   expect(buildUserConfig(path).loops?.steward).toEqual({ mode: 'live', linearTeam: 'ELA', launch: 'shadow' });
 });

@@ -1,0 +1,36 @@
+{
+  "id": "author-reviewer-precheck",
+  "name": "Goal author reviewer precheck fake-LLM device",
+  "implementation": [
+    "src/ux-sim/author-reviewer-precheck-device.ts",
+    "src/ux-sim/scenario.ts",
+    "src/ux-sim/event-monkey.ts"
+  ],
+  "tests": [
+    "src/ux-sim/scenario.test.ts",
+    "src/ux-sim/event-monkey.test.ts"
+  ],
+  "target": "Production goal-author reviewer parser and exact-edit validator, with fake model transport in isolated ScenarioV0",
+  "inputs": [
+    "CLI-minted runId",
+    "applied exact ask sentence",
+    "rejected-unprovable unsupported sentence"
+  ],
+  "observations": [
+    "author.reviewer-precheck/completed",
+    "author.reviewer-precheck/revision-rejected",
+    "isolated logs.db row correlated to CLI runId",
+    "ScenarioV0 evidence artifact"
+  ],
+  "entryCommands": [
+    "bun bin/elanous.mjs --test sim run scenarios/ux-sim/author-reviewer-precheck-applied.yaml",
+    "bun bin/elanous.mjs --test sim run scenarios/ux-sim/author-reviewer-precheck-rejected-unprovable.yaml",
+    "bun bin/elanous.mjs sim kinds"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "author.reviewer-precheck/completed",
+    "author.reviewer-precheck/revision-rejected"
+  ],
+  "recentUse": null
+}

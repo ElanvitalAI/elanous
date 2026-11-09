@@ -162,7 +162,7 @@ describe('NEXUS-APP-STORAGE-S1', () => {
     const root = mkdtempSync(join(tmpdir(), 'app-storage-list-'));
     const store = {
       provider: 's3' as const,
-      put() {}, get() {}, head() { return { exists: false }; }, publicUrl() { return null; },
+      put() {}, delete() {}, get() {}, head() { return { exists: false }; }, publicUrl() { return null; },
       list() { throw new Error('503 Service Unavailable'); },
     };
     const storage = createAppStorage([manifest('notes')], {

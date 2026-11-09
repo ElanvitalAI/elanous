@@ -155,6 +155,46 @@ test('WSL plan starts with host install and reboot checkpoint before guest setup
   expect(plan.dryRun).toBe(true);
 });
 
+test('WSL developer profile includes unattended installer and native-build prerequisites', () => {
+  const wsl = buildMachineSetupPlan({ profile: 'developer', platform: 'wsl' });
+  for (const name of ['build-essential', 'curl', 'python3-venv', 'unzip']) {
+    expect(wsl.packages.find(item => item.name === name)).toMatchObject({ manager: 'apt-get', presence: 'would-install' });
+  }
+  for (const name of ['docker-ce', 'docker-ce-cli', 'containerd.io', 'docker-buildx-plugin']) {
+    expect(wsl.packages.find(item => item.name === name)).toMatchObject({ manager: 'apt-get', presence: 'would-install' });
+  }
+  expect(wsl.operations.map(item => item.id)).toContain('wsl-docker-engine');
+  expect(wsl.operations.map(item => item.id)).toContain('wsl-k3d-install');
+  expect(wsl.operations.find(item => item.id === 'wsl-systemd')?.privilege).toBe('none');
+  expect(wsl.operations.filter(item => item.manager === 'apt-get').every(item => item.privilege === 'none'
+    && !item.command?.includes('sudo'))).toBe(true);
+  expect(wsl.operations.find(item => item.id === 'wsl-k3d-install')?.reason).toContain('official installer');
+  const mac = buildMachineSetupPlan({ profile: 'developer', platform: 'macos' });
+  expect(mac.packages.some(item => item.name.startsWith('docker-') || item.name === 'containerd.io')).toBe(false);
+  expect(buildMachineSetupPlan({ profile: 'headquarters', platform: 'wsl' }).operations.some(item => item.id === 'wsl-k3d-install')).toBe(true);
+  for (const name of ['build-essential', 'curl', 'python3-venv', 'unzip']) {
+    expect(mac.packages.some(item => item.name === name)).toBe(false);
+  }
+});
+
+test('WSL profile plans an explicit guest eln install and version verification after bootstrap', () => {
+  const plan = buildMachineSetupPlan({ profile: 'default', platform: 'wsl' });
+  const install = plan.operations.find(item => item.id === 'wsl-eln-install');
+  const verify = plan.operations.find(item => item.id === 'wsl-eln-version-check');
+  expect(install).toMatchObject({ phase: 'guest', kind: 'install', manager: 'manual', privilege: 'user', consent: 'explicit' });
+  expect(install?.command?.[2]).toContain('set -o pipefail');
+  expect(install?.command?.[2]).toContain('curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash -s -- --yes --no-setup');
+  expect(verify).toMatchObject({ phase: 'guest', kind: 'checkpoint', manager: 'manual', privilege: 'user', consent: 'explicit' });
+  expect(verify?.command?.[2]).toContain('test "$prefix/bin/eln" -ef "$resolved"');
+  expect(verify?.command?.[2]).toContain('type -P eln');
+  expect(verify?.command?.[2]).toContain('"$prefix/bin/eln" --version');
+  expect(plan.operations.findIndex(item => item.id === 'wsl-eln-install'))
+    .toBeGreaterThan(plan.operations.findIndex(item => item.id === 'wsl-systemd'));
+  expect(plan.operations.findIndex(item => item.id === 'wsl-eln-version-check'))
+    .toBeGreaterThan(plan.operations.findIndex(item => item.id === 'wsl-eln-install'));
+  expect(buildMachineSetupPlan({ profile: 'default', platform: 'linux' }).operations.some(item => item.id.startsWith('wsl-eln-'))).toBe(false);
+});
+
 test('WSL plan reflects the selected distribution in its host install command', () => {
   const plan = buildMachineSetupPlan({ profile: 'default', platform: 'wsl', distribution: 'Debian' });
   expect(plan.operations[0]?.command).toEqual(['wsl.exe', '--install', '--distribution', 'Debian', '--no-launch']);

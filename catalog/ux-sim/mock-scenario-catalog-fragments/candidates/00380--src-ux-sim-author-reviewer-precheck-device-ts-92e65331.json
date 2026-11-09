@@ -1,0 +1,12 @@
+{
+  "path": "src/ux-sim/author-reviewer-precheck-device.ts",
+  "disposition": "device",
+  "entryCommand": "bun bin/elanous.mjs --test sim run scenarios/ux-sim/author-reviewer-precheck-applied.yaml",
+  "logsRecorded": "yes",
+  "logsDetail": "Production validator events are persisted in isolated test logs.db with CLI-minted runId; ScenarioV0 evidence is separate.",
+  "deviceId": "author-reviewer-precheck",
+  "scenarioIds": [
+    "AUTHOR-PRECHECK-APPLIED",
+    "AUTHOR-PRECHECK-REJECTED-UNPROVABLE"
+  ]
+}

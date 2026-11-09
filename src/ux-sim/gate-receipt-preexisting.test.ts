@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { judgeGate, sameHeadPreexistingFailureIds, type GateRunner } from '../../scripts/release-loop/gate-node';
 import { gateBaselineReceipt, gateEnvFingerprint } from '../../scripts/release-loop/gate-baseline-receipt';
+import { gateShardRuntimeIdentityKey, planGateShardDispatch, type GateShardReceipt } from '../../scripts/release-loop/gate-shard-dispatch';
 const roots: string[] = [];
 const head = 'a'.repeat(40), baseline = 'b'.repeat(40);
 const pins = { graphSha: 'c'.repeat(64), recipeSha: 'd'.repeat(64) };
@@ -33,6 +34,38 @@ test('same-head rerun persists and reads judged preexisting IDs from the product
  const resumed = await judgeGate(opts, runner);
  expect(resumed).toMatchObject({ outcome: 'regression', introduced: ['src/b.test.ts > new'], preexisting: 1 });
  expect(sameHeadPreexistingFailureIds(ledgerRoot, version, head, 'f'.repeat(40))).toBeUndefined();
+});
+test('the next same-head sweep reuses a failed shard only with the persisted preexisting verdict', () => {
+ const dir = root(), version = '0.2.34', failure = 'src/a.test.ts > stable';
+ const verdictPath = join(dir, 'release', version, 'gate-verdict.json');
+ mkdirSync(join(dir, 'release', version), { recursive: true });
+ const file = 'src/a.test.ts', imageDigest = digestA, lockfileHash = 'f'.repeat(64);
+ const receipt: GateShardReceipt = {
+  id: 'pod-0', files: [file], version, head40: head, base40: baseline,
+  graphSha: pins.graphSha, recipeSha: pins.recipeSha, graphEntry: 'gate-entry-v1',
+  recipeCommand: 'bun scripts/release-loop/gate-node.ts --json', recipeTimeoutMs: 14400000,
+  host: 'gcp1', envKey: gateShardRuntimeIdentityKey(runtimeIdentity, lockfileHash)!,
+  envFingerprint, imageDigest, runtimeIdentity, lockfileHash,
+  testedFileHashes: { [file]: '1'.repeat(64) },
+  executions: [{ branch: '', attemptId: 'first-sweep', host: 'gcp1', imageDigest, runtimeIdentity }],
+  status: 'complete', failureIds: [failure], errorIds: [], evidencePath: 'pod-0.result.json',
+  evidenceSha256: '2'.repeat(64), measuredAt: '2026-11-08T00:00:00.000Z', attempt: 1,
+ };
+ const plan = () => planGateShardDispatch({
+  head40: head, base40: baseline, shards: [{ id: 'pod-0', files: [file] }], receipts: [receipt],
+  hosts: [{ id: 'gcp1', platform: process.platform === 'linux' ? 'linux' : process.platform === 'darwin' ? 'darwin' : 'other', available: true, reserved: false }],
+  graphEntry: receipt.graphEntry, recipeCommand: receipt.recipeCommand, recipeTimeoutMs: receipt.recipeTimeoutMs,
+  environmentIdentity: { ...runtimeIdentity, imageDigest }, lockfileHash,
+  testedFileHashesByShard: { 'pod-0': receipt.testedFileHashes! },
+  sameHeadPreexistingFailureIds: sameHeadPreexistingFailureIds(dir, version, head, baseline),
+ });
+ expect(plan().map(({ kind }) => kind)).toEqual(['run']);
+ writeFileSync(verdictPath, JSON.stringify({ commit: head, baselineCommit: baseline, outcome: 'regression',
+  preexisting: [failure], introduced: ['src/b.test.ts > new'] }));
+ expect(plan().map(({ kind }) => kind)).toEqual(['reuse']);
+ writeFileSync(verdictPath, JSON.stringify({ commit: head, baselineCommit: 'c'.repeat(40), outcome: 'regression',
+  preexisting: [failure], introduced: [] }));
+ expect(plan().map(({ kind }) => kind)).toEqual(['run']);
 });
 test('a different Pod image digest cannot mint or reuse the baseline receipt', () => {
  const dir = root(), logs = join(dir, 'release', '0.2.34', 'gate-logs', 'cut'); mkdirSync(logs, { recursive: true });

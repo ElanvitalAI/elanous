@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-MOCK-SEAT-PTY-SEQUENCE-CHILD-TS",
+  "path": "src/ux-sim/mock-seat-pty-sequence-child.ts",
+  "boundary": "Real-PTY child probe that initializes the production TUI, renders after each key and exits on Ctrl+Q for parent-driven sequence tests.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

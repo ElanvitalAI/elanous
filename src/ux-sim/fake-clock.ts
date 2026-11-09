@@ -5,6 +5,7 @@ import { jest } from 'bun:test';
 
 export interface SimClock {
   tick(ms: number): void;
+  tickAndFlushMicrotasks(ms: number): Promise<void>;
   setTime(now: number | Date): void;
   now(): number;
   pendingTimers(): number;
@@ -21,6 +22,13 @@ export async function withSimClock<T>(now: number | Date, run: (clock: SimClock)
       tick(ms) {
         if (!Number.isFinite(ms) || ms < 0) throw new Error('sim clock tick must be a nonnegative finite number');
         jest.advanceTimersByTime(ms);
+      },
+      // Bun advances timer callbacks synchronously; yield one native Promise turn for their continuations.
+      // This deliberately does not claim to drain chains of asynchronous timers.
+      async tickAndFlushMicrotasks(ms) {
+        if (!Number.isFinite(ms) || ms < 0) throw new Error('sim clock tick must be a nonnegative finite number');
+        jest.advanceTimersByTime(ms);
+        await Promise.resolve();
       },
       setTime(value) { jest.setSystemTime(value); },
       now() { return Date.now(); },

@@ -1,0 +1,27 @@
+{
+  "id": "pr-land-drift-autorepair-device",
+  "name": "PR land drift bounded auto-repair simulation",
+  "implementation": [
+    "src/ux-sim/pr-land-drift-autorepair-device.ts"
+  ],
+  "tests": [
+    "src/ux-sim/pr-land-drift-autorepair-device.test.ts"
+  ],
+  "target": "Test-only simulation of live typecheck drift, bounded repair launch controls, false positives, missed drift, and cost limits.",
+  "inputs": [
+    "typecheck drift observation",
+    "repair mode and kill switch",
+    "attempt and cost limits"
+  ],
+  "observations": [
+    "repair launches remain bounded by controls",
+    "false positives and missed drift are measured",
+    "repair cost is reported against its cap"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/pr-land-drift-autorepair-device.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

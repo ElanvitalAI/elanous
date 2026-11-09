@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-RELAY-WORLD-TS",
+  "path": "src/ux-sim/fake-relay-world.ts",
+  "boundary": "Provides deterministic fake relay hosts, OAuth state, and encrypted sessions for relay-boundary simulations; no public relay or provider is contacted.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

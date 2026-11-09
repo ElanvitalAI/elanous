@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SLASH-MENU-FRAMES-TS",
+  "path": "src/ux-sim/slash-menu-frames.ts",
+  "boundary": "Drives production slash-command textInput and DisplayCoordinator with scripted keys, capturing each real TUI frame and counting full-screen clears and rewritten rows.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

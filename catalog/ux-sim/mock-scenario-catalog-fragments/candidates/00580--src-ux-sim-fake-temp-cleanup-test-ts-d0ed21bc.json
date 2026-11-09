@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/fake-temp-cleanup.test.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/fake-temp-cleanup.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Checks cleanup after successful and throwing suites while preserving an unrelated directory.",
+  "deviceId": "fake-temp-cleanup",
+  "scenarioIds": [
+    "TASK-TEMP-CLEANUP"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-GOOGLE-DRIVE-WORLD-TS",
+  "path": "src/ux-sim/fake-google-drive-world.ts",
+  "boundary": "Serves synthetic Drive files.list metadata only through an in-memory fake; enforces the metadata readonly scope and rejects writes without network or token persistence.",
+  "deviceIds": [
+    "fake-google-drive-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

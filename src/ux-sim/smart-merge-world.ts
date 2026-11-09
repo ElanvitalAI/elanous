@@ -8,7 +8,7 @@ export interface FakeReadinessHost {
   recipeState: 'ready' | 'partial' | 'failed'; leadMsByRole: Record<TrainRoleTag, number>;
 }
 export type TrainLoopSignal =
-  | { type: 'hotspot-main-drift'; pr: number; currentHead: string; mainHead: string; integratedHead: string; retestId: string; conflictDelta: string[]; priorVerdict: string }
+  | { type: 'hotspot-main-drift'; pr: number; currentHead: string; mainHead: string; integratedHead: string; retestId: string; conflictDelta: string[]; priorVerdict: string; baselineErrors?: number; integratedErrors?: number }
   | { type: 'hotspot-retest-result'; pr: number; retestId: string; head: string; result: 'passed' | 'failed'; receiptId: string }
   | { type: 'hotspot-retest-complete'; pr: number; retestId: string; integratedHead: string; verifiedHead: string; result: 'passed' | 'failed'; priorVerdict: string }
   | { type: 'human-intervention-observed'; incident: string }
@@ -34,6 +34,7 @@ type TrainLoopActionKind =
   | 'release.stage-observed' | 'guardian.reserve-gate-hosts' | 'train.reclaim-gate-slots' | 'guardian.release-gate-hosts'
   | 'train.restore-slots' | 'vm.scale-down';
 interface TrainLoopAction { kind: TrainLoopActionKind; details?: Record<string, string | number | boolean | Array<string | number>> }
+interface SmartMergeQueueCandidate { pr: number; head: string; files: string[] }
 
 /** Scenario oracle, deliberately local to this simulator and not used by runtime code. */
 export function planSimulationSignal(signal: TrainLoopSignal): TrainLoopAction[] {
@@ -74,7 +75,8 @@ export const SMART_MERGE_SCENARIOS: readonly SmartMergeScenario[] = [
   {
     id: '01-hotspot-main-drift-repair-and-front-requeue',
     signal: { type: 'hotspot-main-drift', pr: 36001, currentHead: 'a'.repeat(40), mainHead: 'b'.repeat(40),
-      integratedHead: 'c'.repeat(40), retestId: 'retest-36001-c', conflictDelta: ['scripts/release-loop/gate-node.ts'], priorVerdict: 'WARN:mustFix0' },
+      integratedHead: 'c'.repeat(40), retestId: 'retest-36001-c', conflictDelta: ['scripts/release-loop/gate-node.ts'], priorVerdict: 'WARN:mustFix0',
+      baselineErrors: 3, integratedErrors: 5 },
     followupSignals: [
       { type: 'hotspot-retest-result', pr: 36001, retestId: 'retest-36001-c', head: 'c'.repeat(40), result: 'passed', receiptId: 'receipt:36001:retest-36001-c:' + 'c'.repeat(40) },
       { type: 'hotspot-retest-complete', pr: 36001, retestId: 'retest-36001-c', integratedHead: 'c'.repeat(40), verifiedHead: 'c'.repeat(40),
@@ -195,12 +197,19 @@ export const ROLE_TAG_READINESS_SCENARIOS: readonly SmartMergeScenario[] = [
 
 export interface SmartMergeScenarioResult {
   id: string;
+  world: { revisionBefore: number; completedBefore: string[]; queueBefore: { pr: number; head: string }[];
+    revisionAfter: number; completedAfter: string[]; queueAfter: { pr: number; head: string }[] };
   observed: TrainLoopAction['kind'][];
   missing: TrainLoopAction['kind'][];
   unexpected: TrainLoopAction['kind'][];
   humanInterventions: number;
   zeroInterventionAssertion: boolean;
   finalState: { resolved: boolean; assignment: 'assigned' | 'refused' | null; selectedHost: string | null;
+    mergedMainHead: string | null; transplantedHead: string | null; landedFiles: string[]; predictedConflicts: string[]; notifiedOwner: string | null;
+    queueCandidates: SmartMergeQueueCandidate[];
+    typecheckOutput: string | null;
+    waiverHead: string | null; correctedSha: string | null; base: string | null; keptPr: number | null; closedPrs: number[];
+    retainedFindings: string[]; routedFindings: string[]; activeAssignmentRefused: boolean; idleSeatAssigned: boolean;
     retestedHead: string | null; retestId: string | null; retestReceiptId: string | null; retestEvidenceRunId: string | null; verdictInherited: boolean;
     retestPriorVerdict: string | null; requeued: boolean; writerOwners: Record<string, number[]>; writerCollision: boolean; guardianLeases: string[] };
 }
@@ -238,6 +247,24 @@ interface SmartMergeWorldFacts {
 
 function sameStrings(actual: unknown, expected: readonly string[]): boolean {
   return Array.isArray(actual) && actual.length === expected.length && actual.every((item, index) => item === expected[index]);
+}
+
+function queueCandidatesFor(signal: TrainLoopSignal, facts: SmartMergeWorldFacts, occupied: ReadonlyMap<number, string>): SmartMergeQueueCandidate[] {
+  const ready = (pr: number, files: string[] = [], head = pr.toString(16).padStart(40, '0')): SmartMergeQueueCandidate => ({ pr, head, files });
+  let candidates: SmartMergeQueueCandidate[];
+  switch (signal.type) {
+    case 'hotspot-main-drift': candidates = facts.verdictInherited && facts.requeued ? [ready(signal.pr, [...signal.conflictDelta], facts.retestPassed!.head)] : []; break;
+    case 'merge-only-head': candidates = facts.waiverHead === signal.newHead ? [ready(signal.pr, [], signal.newHead)] : []; break;
+    case 'reported-sha': candidates = facts.correctedSha === signal.actualHead ? [ready(signal.pr, [], signal.actualHead)] : []; break;
+    case 'stacked-base': candidates = facts.base === signal.main ? [ready(signal.pr)] : []; break;
+    case 'duplicate-cell-pr': candidates = facts.keptPr === signal.prs[0] ? [ready(facts.keptPr)] : []; break;
+    case 'post-land-conflict': candidates = [{ pr: signal.queuedPr, head: signal.queuedPr.toString(16).padStart(40, '0'), files: [...signal.queuedFiles] }]; break;
+    case 'generated-file-overlap': candidates = [...facts.writerOwners.entries()].flatMap(([path, owners]) => owners.length === 1 ? [ready(owners[0]!, [path])] : []); break;
+    case 'assignment-collision': candidates = facts.assignment?.pr === signal.pr ? [ready(signal.pr)] : []; break;
+    case 'hotspot-retest-result': case 'hotspot-retest-complete': case 'human-intervention-observed': case 'review-repeat':
+    case 'idle-seat': case 'worker-exit': case 'host-load': case 'role-tag-readiness': case 'release-cycle': candidates = []; break;
+  }
+  return candidates.filter(({ pr }) => !occupied.has(pr));
 }
 
 function readinessEligible(signal: Extract<TrainLoopSignal, { type: 'role-tag-readiness' }>, host: FakeReadinessHost): boolean {
@@ -317,9 +344,20 @@ function sameNumbers(actual: readonly number[], expected: readonly number[]): bo
 
 /** Run incidents through the test-only oracle and reject actions that do not change this fake world's state. */
 export async function runSmartMergeWorld(scenarios: readonly SmartMergeScenario[]): Promise<SmartMergeScenarioResult[]> {
-  return Promise.all(scenarios.map(async (scenario) => {
+  const results: SmartMergeScenarioResult[] = [];
+  const completedIncidents: string[] = [];
+  const landQueue = new Map<number, string>();
+  for (const scenario of scenarios) {
+    const revisionBefore = completedIncidents.length;
+    const completedBefore = [...completedIncidents];
+    const queueBefore = [...landQueue].map(([pr, head]) => ({ pr, head }));
     const dispatched: TrainLoopAction['kind'][] = [];
     const state: SmartMergeScenarioResult['finalState'] = { resolved: false, assignment: null, selectedHost: null,
+      mergedMainHead: null, transplantedHead: null, landedFiles: [], predictedConflicts: [], notifiedOwner: null,
+      queueCandidates: [],
+      typecheckOutput: null,
+      waiverHead: null, correctedSha: null, base: null, keptPr: null, closedPrs: [], retainedFindings: [], routedFindings: [],
+      activeAssignmentRefused: false, idleSeatAssigned: false,
       retestedHead: null, retestId: null, retestReceiptId: null, retestEvidenceRunId: null, verdictInherited: false, retestPriorVerdict: null, requeued: false,
       writerOwners: {}, writerCollision: false, guardianLeases: [] };
     const retestReceipts = new Map<string, { pr: number; retestId: string; head: string; priorVerdict: string;
@@ -614,6 +652,27 @@ export async function runSmartMergeWorld(scenarios: readonly SmartMergeScenario[
           if (facts.retestRejected) break;
         }
       }
+      state.mergedMainHead = facts.mergedMainHead;
+      state.transplantedHead = facts.transplantedHead;
+      state.landedFiles = initialSignal.type === 'post-land-conflict' ? [...initialSignal.landedFiles] : [];
+      state.predictedConflicts = [...facts.predictedConflicts];
+      state.notifiedOwner = facts.notifiedOwner;
+      state.queueCandidates = queueCandidatesFor(initialSignal, facts, landQueue);
+      state.waiverHead = facts.waiverHead;
+      state.correctedSha = facts.correctedSha;
+      state.base = facts.base;
+      state.keptPr = facts.keptPr;
+      state.closedPrs = [...facts.closedPrs];
+      state.retainedFindings = [...facts.retainedFindings];
+      state.routedFindings = [...facts.routedFindings];
+      state.activeAssignmentRefused = facts.activeAssignmentRefused;
+      state.idleSeatAssigned = facts.idleSeatAssigned;
+      if (initialSignal.type === 'hotspot-main-drift' && facts.retestPassed && initialSignal.baselineErrors !== undefined
+        && initialSignal.integratedErrors !== undefined) {
+        const newErrors = initialSignal.integratedErrors - initialSignal.baselineErrors;
+        state.typecheckOutput = `[tsc-main-delta] base=${facts.mergedMainHead} base_rc=1 head=${facts.transplantedHead} head_rc=1 baseline_errors=${initialSignal.baselineErrors} head_errors=${initialSignal.integratedErrors} new_errors=${newErrors}`
+          + (newErrors > 0 ? `\nerror: main-baseline tsc introduced ${newErrors} TypeScript diagnostic(s)` : '');
+      }
       state.guardianLeases = [...leases];
       state.writerOwners = Object.fromEntries([...facts.writerOwners.entries()].map(([path, owners]) => [path, [...owners]]));
       state.writerCollision = facts.writerCollision;
@@ -622,7 +681,13 @@ export async function runSmartMergeWorld(scenarios: readonly SmartMergeScenario[
       const unexpected = observed.filter((kind, index) => scenario.expectedActions[index] !== kind);
       const stateComplete = signals.every((signal) => worldResolved(signal, facts, state.guardianLeases, gateSlotsExpected));
       state.resolved = stateComplete;
-      return { id: scenario.id, observed, missing, unexpected, finalState: state,
-        humanInterventions, zeroInterventionAssertion: humanInterventions === 0 };
-  }));
+      for (const closedPr of state.closedPrs) landQueue.delete(closedPr);
+      for (const candidate of state.queueCandidates) landQueue.set(candidate.pr, candidate.head);
+      completedIncidents.push(scenario.id);
+      results.push({ id: scenario.id,
+        world: { revisionBefore, completedBefore, queueBefore, revisionAfter: completedIncidents.length,
+          completedAfter: [...completedIncidents], queueAfter: [...landQueue].map(([pr, head]) => ({ pr, head })) },
+        observed, missing, unexpected, finalState: state, humanInterventions, zeroInterventionAssertion: humanInterventions === 0 });
+  }
+  return results;
 }

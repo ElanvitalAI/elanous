@@ -32,8 +32,6 @@ import { useCompactMode } from '@/lib/compact-mode';
 import type { ShellActivitySnapshot } from './activity-snapshot';
 import { useShellActivity } from './use-shell-activity';
 import { InstallBanner } from '@/components/install-banner';
-import { WorkspaceProvider } from '@/components/workspace/WorkspaceProvider';
-import { SetupModeBanner } from './SetupModeBanner';
 import { AuthRequiredBanner } from './AuthRequiredBanner';
 import { SkillProblemsBanner } from './SkillProblemsBanner';
 import { useNavVisitLog } from './use-nav-visit-log';
@@ -81,15 +79,8 @@ export function AppShell({
   };
 
   return (
-    // 2026-05-07 dogfood feedback — WorkspaceProvider lifted to AppShell
-    // so the TopBar 의 inline tab strip 이 모든 route 에서 같은 워크스페이스
-    // state 를 공유. workspace/page.tsx 가 자체 Provider 를 mount 했던
-    // 것은 nested provider 가 되어 새 빈 state 를 만들지 않도록 제거됨.
-    // useWorkspaceOptional() 호출자는 영향 없음 (provider 가 항상 mount).
-    <WorkspaceProvider>
       <div className="flex h-screen w-full flex-col bg-background text-foreground">
         {!mobileChat && <AuthRequiredBanner />}
-        {!mobileChat && <SetupModeBanner />}
         {!mobileChat && <SkillProblemsBanner />}
         {!mobileChat && (compact
           ? <CompactTopBar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} activity={activity} setWide={setWide} wakeControl={wakeControl} />
@@ -131,6 +122,5 @@ export function AppShell({
         <InstallBanner />
         {compact && <MobileBottomTabs />}
       </div>
-    </WorkspaceProvider>
   );
 }

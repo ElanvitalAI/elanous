@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-DRAFT-INVENTORY-BUILDER-TS",
+  "path": "src/ux-sim/draft-inventory-builder.ts",
+  "boundary": "draft inventory builder: Deterministic synthetic inventory; both production draft triage functions run for every case.",
+  "deviceIds": [
+    "draft-inventory"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

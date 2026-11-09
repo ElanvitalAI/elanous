@@ -13,6 +13,7 @@ import { readReleaseRuns, type ReleaseRunView } from '../nexus/api/ops-api.js';
 import { gateShardsPath, readGateShards, summarizeShards } from '../release-loop/gate-shards.js';
 import { getSchedule, listSchedules } from '../release-loop/release-schedule.js';
 import { readLandingFreeze } from '../release-loop/landing-freeze.js';
+import { readSweepCertificate } from '../../scripts/release-loop/sweep-cert.js';
 import { setElanousConfigDir } from '../elanous-config-dir.js';
 import { seatDay, seatLedgerPath, type SeatEntry } from '../seat-loop/seat-loop.js';
 import { listCoordEvents, type CoordEvent } from './coord-events.js';
@@ -31,7 +32,11 @@ export type ContextFact =
       receiptStatus?: 'valid' | 'invalid' | 'absent' | 'unreadable'; waiverEvents?: string[];
       emergencySwitch?: { state: 'on' | 'off' | 'unknown'; reason?: string };
       landingFreeze?: { state: 'on' | 'off' | 'unknown'; reason?: string };
-      expectedPublishAt?: string | null; sourceRefs?: Array<{ signal: string; source: string }>;
+      expectedPublishAt?: string | null; etaMinutes?: number | null;
+      auditCoverage?: { uncoveredFiles: number; totalFiles: number } | null; residualRuns?: number | null;
+      sweepCertificateAgeMinutes?: number | null;
+      failureCounts?: { introduced: number | null; preexisting: number | null; undetermined: number | null } | null;
+      sourceRefs?: Array<{ signal: string; source: string }>;
       ledgerErrors?: Array<{ signal: string; source: string; reason: string }> }
   | { kind: 'schedule-late'; count: number | null; names: string[]; source: string; unreadable?: string };
 export type ContextEvent = { at: string; kind: string; summary: string; source: string };
@@ -131,9 +136,35 @@ export function releaseFactSummary(fact: Extract<ContextFact, { kind: 'release' 
   if (fact.emergencySwitch) parts.push(`긴급 전환 ${fact.emergencySwitch.state}${fact.emergencySwitch.reason ? ` · ${fact.emergencySwitch.reason}` : ''}`);
   if (fact.landingFreeze) parts.push(`착지 동결 ${fact.landingFreeze.state}${fact.landingFreeze.reason ? ` · ${fact.landingFreeze.reason}` : ''}`);
   if (fact.expectedPublishAt) parts.push(`예상 발행 ${fact.expectedPublishAt}`);
+  if (fact.etaMinutes !== undefined) parts.push(`ETA ${fact.etaMinutes === null ? '미측정' : `${fact.etaMinutes}m`}`);
+  if (fact.auditCoverage !== undefined) parts.push(`미덮임 ${fact.auditCoverage?.uncoveredFiles ?? '?'}/${fact.auditCoverage?.totalFiles ?? '?'}`);
+  if (fact.residualRuns !== undefined) parts.push(`residual 실행 ${fact.residualRuns ?? '?'}`);
+  if (fact.sweepCertificateAgeMinutes !== undefined) parts.push(`sweep 증명서 나이 ${fact.sweepCertificateAgeMinutes === null ? '?' : `${fact.sweepCertificateAgeMinutes}m`}`);
+  if (fact.failureCounts !== undefined) parts.push(`실패 introduced ${fact.failureCounts?.introduced ?? '?'} / preexisting ${fact.failureCounts?.preexisting ?? '?'} / 미판정 ${fact.failureCounts?.undetermined ?? '?'}`);
   if (fact.sourceRefs?.length) parts.push(`근거 ${fact.sourceRefs.slice(0, 8).map(ref => `${ref.signal}=${ref.source}`).join(', ')}${fact.sourceRefs.length > 8 ? ` · 생략 ${fact.sourceRefs.length - 8} (/release)` : ''}`);
   if (fact.ledgerErrors?.length) parts.push(`원장 오류 ${fact.ledgerErrors.slice(0, 3).map(error => `${error.signal} (${error.source}): ${error.reason}`).join(', ')}${fact.ledgerErrors.length > 3 ? ` · 생략 ${fact.ledgerErrors.length - 3} (/release)` : ''}`);
   return Array.from(parts.join(' · ')).slice(0, 1500).join('');
+}
+
+/** Render the same release fact used by context-now for one graph run, from explicit ledgers. */
+export function releaseRunContextSummary(runId: string, options: {
+  stateRoot?: string;
+  ledgerRoot?: string;
+  events?: readonly CoordEvent[];
+  now?: Date;
+} = {}): string | undefined {
+  const stateRoot = options.stateRoot ?? effectiveInstanceRoot();
+  const ledgerRoot = options.ledgerRoot ?? releaseLedgerRoot();
+  const now = options.now ?? new Date();
+  const runs = readReleaseRuns(null, join(stateRoot, 'graph-runs', 'release-loop'), {
+    facts: true, ledgerRoot, now: now.getTime(),
+  });
+  if (runs === 'unavailable') return `run=${runId} · 발행 런 원장 관측 불가`;
+  const run = runs.find(item => item.runId === runId);
+  if (!run) return undefined;
+  const version = run.version ?? '판 미기록';
+  const fact = releaseContextFact(version, run, undefined, [], options.events ?? [], now, stateRoot, ledgerRoot);
+  return fact ? releaseFactSummary(fact) : undefined;
 }
 
 // src/dashboard/slash-runtime/dashboard-handlers.ts:buildDashboardSlashRegistry /now calls contextNowInWorker;
@@ -170,7 +201,7 @@ function runningRunFacts(now: Date, queryRuns: () => QueriedRunningRunsResult = 
   return unreadable ? [...facts, { kind: 'run', goal: '', phase: '', elapsed: '', source: runSource, unreadable: '런 원장 또는 관측 대상 일부' }] : facts;
 }
 
-function releaseContextFacts(defaultVersion: string, events: readonly CoordEvent[] = []): Array<Extract<ContextFact, { kind: 'release' }>> {
+function releaseContextFacts(defaultVersion: string, events: readonly CoordEvent[] = [], now = new Date()): Array<Extract<ContextFact, { kind: 'release' }>> {
   const stateRoot = effectiveInstanceRoot();
   const ledgerRoot = releaseLedgerRoot();
   const runs = readReleaseRuns(null, join(stateRoot, 'graph-runs', 'release-loop'), { facts: true, ledgerRoot, now: Date.now() });
@@ -206,24 +237,23 @@ function releaseContextFacts(defaultVersion: string, events: readonly CoordEvent
   const versions = [...knownVersions].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   return versions.flatMap(version => {
     const run = runsByVersion.get(version) ?? (version === '판 미기록' ? latestUnversionedRun : undefined);
-    const fact = releaseContextFact(version, run, runReadError, commonErrors, events);
+    const fact = releaseContextFact(version, run, runReadError, commonErrors, events, now);
     return fact ? [fact] : [];
   });
 }
 
 function releaseContextFact(version: string, run: ReleaseRunView | undefined,
   runReadError: string | undefined, commonErrors: Array<{ signal: string; source: string; reason: string }>,
-  events: readonly CoordEvent[] = []): Extract<ContextFact, { kind: 'release' }> | null {
-  const stateRoot = effectiveInstanceRoot();
-  const ledgerRoot = releaseLedgerRoot();
+  events: readonly CoordEvent[] = [], now = new Date(), stateRoot = effectiveInstanceRoot(), ledgerRoot = releaseLedgerRoot()): Extract<ContextFact, { kind: 'release' }> | null {
   const ledgerErrors: Array<{ signal: string; source: string; reason: string }> = [...commonErrors];
   const runUnavailable = runReadError !== undefined;
   const runSourceRef = run ? `${releaseSource}/${encodeURIComponent(run.runId)}` : releaseSource;
   const sourceRefs: Array<{ signal: string; source: string }> = [{ signal: runUnavailable ? 'run-status' : 'run', source: runSourceRef }];
-  let raw: { input?: { publishAt?: unknown }; pending?: { nodeId?: unknown; message?: unknown };
-    nodes?: Array<{ nodeId?: unknown; waiver?: { reason?: unknown; approvedBy?: unknown; at?: unknown } }> } = {};
+  let raw: { input?: { publishAt?: unknown }; etaMinutes?: unknown; etaAt?: unknown; estimatedCompletionAt?: unknown; pending?: { nodeId?: unknown; message?: unknown };
+    nodes?: Array<{ nodeId?: unknown; endedAt?: unknown; output?: unknown; waiver?: { reason?: unknown; approvedBy?: unknown; at?: unknown } }> } = {};
+  let rawReadable = false;
   if (run) {
-    try { raw = JSON.parse(readFileSync(join(stateRoot, 'graph-runs', 'release-loop', `${run.runId}.json`), 'utf8')); }
+    try { raw = JSON.parse(readFileSync(join(stateRoot, 'graph-runs', 'release-loop', `${run.runId}.json`), 'utf8')); rawReadable = true; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') ledgerErrors.push({ signal: 'run', source: runSourceRef, reason: unreadableReason(error) });
     }
@@ -301,6 +331,65 @@ function releaseContextFact(version: string, run: ReleaseRunView | undefined,
   const runPublishAt = typeof raw.input?.publishAt === 'string' && Number.isFinite(Date.parse(raw.input.publishAt))
     ? new Date(raw.input.publishAt).toISOString() : null;
   const expectedPublishAt = schedule?.publishAt ?? runPublishAt;
+  const parsedOutputs = (raw.nodes ?? []).flatMap(node => {
+    const value = node.output;
+    if (value && typeof value === 'object' && !Array.isArray(value)) return [{ nodeId: node.nodeId, output: value as Record<string, unknown> }];
+    if (typeof value !== 'string') return [];
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? [{ nodeId: node.nodeId, output: parsed as Record<string, unknown> }] : [];
+    } catch { return []; }
+  });
+  const etaSources = [raw, ...parsedOutputs.map(entry => entry.output)];
+  const etaValue = etaSources.map(source => source.etaMinutes)
+    .find((value): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0);
+  const etaTimestamp = etaSources.map(source => source.etaAt ?? source.estimatedCompletionAt)
+    .find((value): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value)));
+  const etaMinutes = etaValue !== undefined ? Math.ceil(etaValue)
+    : etaTimestamp !== undefined ? Math.max(0, Math.ceil((Date.parse(etaTimestamp) - now.getTime()) / 60_000)) : null;
+  const auditMeasurement = parsedOutputs.filter(entry => entry.nodeId === 'receipt-audit').map(entry => entry.output.measurement)
+    .filter((value): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value))
+    .at(-1);
+  const auditTotal = auditMeasurement && Number.isSafeInteger(auditMeasurement.totalFiles)
+    && Number(auditMeasurement.totalFiles) >= 0 ? Number(auditMeasurement.totalFiles) : null;
+  const auditCovered = auditMeasurement && Number.isSafeInteger(auditMeasurement.coveredFiles)
+    && Number(auditMeasurement.coveredFiles) >= 0 ? Number(auditMeasurement.coveredFiles) : null;
+  const hasExplicitUnmeasured = !!auditMeasurement && Object.hasOwn(auditMeasurement, 'unmeasuredFiles');
+  const explicitUnmeasured = auditMeasurement && Number.isSafeInteger(auditMeasurement.unmeasuredFiles)
+    && Number(auditMeasurement.unmeasuredFiles) >= 0 ? Number(auditMeasurement.unmeasuredFiles) : null;
+  const auditUnmeasured = hasExplicitUnmeasured ? explicitUnmeasured
+    : auditTotal !== null && auditCovered !== null && auditCovered <= auditTotal ? auditTotal - auditCovered : null;
+  const auditCoverage = auditTotal !== null && auditUnmeasured !== null && auditUnmeasured <= auditTotal
+    ? { uncoveredFiles: auditUnmeasured, totalFiles: auditTotal } : null;
+  const measuredNodeCount = (...keys: string[]): number | null => {
+    const values = parsedOutputs.flatMap(entry => keys.map(key => entry.output[key]));
+    const lists = values.filter(Array.isArray) as unknown[][];
+    const validLists = lists.filter(list => list.every(value => typeof value === 'string'));
+    const ids = new Set(validLists.flat().filter((value): value is string => typeof value === 'string'));
+    const scalar = values.map(value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null)
+      .filter((value): value is number => value !== null).at(-1) ?? null;
+    return validLists.length ? Math.max(ids.size, scalar ?? 0) : scalar;
+  };
+  const residualRuns = run && rawReadable && !runUnavailable && Array.isArray(raw.nodes)
+    ? raw.nodes.filter(node => node.nodeId === 'residual-run' && node.endedAt == null).length : null;
+  let sweepCertificateAgeMinutes: number | null = null;
+  const sweepCertificateSource = `elanous://release/${encodeURIComponent(version)}/sweep-certificate`;
+  try {
+    if (versioned) {
+      const certificate = readSweepCertificate(join(ledgerRoot, 'release', version, 'gate-logs', 'cut', 'receipts'));
+      if (certificate && certificate.measuredAt <= now.getTime()) sweepCertificateAgeMinutes = Math.floor((now.getTime() - certificate.measuredAt) / 60_000);
+    }
+  } catch (error) {
+    ledgerErrors.push({ signal: 'sweep-certificate', source: sweepCertificateSource, reason: unreadableReason(error) });
+  }
+  const nodeIntroduced = measuredNodeCount('introduced');
+  const nodePreexisting = measuredNodeCount('preexisting');
+  const nodeUndetermined = measuredNodeCount('undetermined', 'unmeasured');
+  const failureCounts = regressions || nodeIntroduced !== null || nodePreexisting !== null || nodeUndetermined !== null ? {
+    introduced: regressions?.introduced ?? nodeIntroduced,
+    preexisting: regressions?.preexisting ?? nodePreexisting,
+    undetermined: nodeUndetermined,
+  } : null;
   const progress = gateFile?.version === version ? { completed: terminalShards, total: gateFile.shards.length,
     failed: gateFile.shards.filter(shard => shard.state === 'failed' || shard.state === 'timeout' || (shard.state === 'done' && shard.rc !== undefined && shard.rc !== 0)).length } : null;
   if (ledgerErrors.some(error => error.signal === 'schedule-index')) sourceRefs.push({ signal: 'schedule-index', source: scheduleSource });
@@ -312,6 +401,8 @@ function releaseContextFact(version: string, run: ReleaseRunView | undefined,
     { signal: 'landing-freeze', source: 'elanous://landing-freeze' });
   if (waiverEvents.length) sourceRefs.push({ signal: 'waivers', source: runSourceRef });
   if (expectedPublishAt) sourceRefs.push({ signal: 'expected-publish-at', source: schedule?.publishAt ? scheduleFactSource : runSourceRef });
+  if (auditMeasurement) sourceRefs.push({ signal: 'receipt-audit', source: runSourceRef });
+  if (sweepCertificateAgeMinutes !== null) sourceRefs.push({ signal: 'sweep-certificate', source: sweepCertificateSource });
   if (!run && !schedule && landingFreeze?.state !== 'on' && !gateFile && !regressions && receiptStatus === 'absent' && !ledgerErrors.length) return null;
   const runNode = run ? `${nodeIndex}/${run.path.length}${run.path[nodeIndex - 1] ? ` ${oneLine(run.path[nodeIndex - 1]!)}` : ''}`
     : runUnavailable ? '런 관측 불가' : '런 없음';
@@ -319,7 +410,8 @@ function releaseContextFact(version: string, run: ReleaseRunView | undefined,
     status: oneLine(run?.status ?? (runUnavailable ? 'unknown' : 'no-run')), source: runSourceRef, phase: oneLine(phase), currentNode: current?.nodeId ?? arrivalNode ?? null,
     nextAction, gateProgress: progress, regressions, receiptStatus, waiverEvents,
     // The dedicated RLA emergency-publish switch is not in the current ledger yet; do not infer it from landing-freeze.
-    emergencySwitch: { state: 'unknown' }, landingFreeze, expectedPublishAt, sourceRefs, ledgerErrors };
+    emergencySwitch: { state: 'unknown' }, landingFreeze, expectedPublishAt, etaMinutes, auditCoverage, residualRuns,
+    sweepCertificateAgeMinutes, failureCounts, sourceRefs, ledgerErrors };
 }
 
 function lateScheduleFact(now: Date): Extract<ContextFact, { kind: 'schedule-late' }> {
@@ -370,7 +462,7 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
       if (deps.releaseRun) {
         const release = deps.releaseRun();
         if (release) operational.push(release);
-      } else operational.push(...releaseContextFacts(version, chronologicalEvents));
+      } else operational.push(...releaseContextFacts(version, chronologicalEvents, now));
     } catch (error) { operational.push({ kind: 'release', version: '', node: '', status: '', source: releaseSource, unreadable: unreadableReason(error) }); }
     try { const schedules = (deps.lateSchedules ?? lateScheduleFact)(now); if (schedules) operational.push(schedules); }
     catch (error) { operational.push({ kind: 'schedule-late', count: null, names: [], source: scheduleSource, unreadable: unreadableReason(error) }); }

@@ -1,7 +1,7 @@
-import { chmodSync, cpSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { delimiter, dirname, join } from 'node:path';
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { getTestStateRoot } from '../nexus/paths.js';
 import { resetEffectiveInstanceRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
@@ -17,9 +17,12 @@ import { runPublish } from '../../scripts/release-loop/publish-node.js';
 import { resumeReleaseRun } from '../../scripts/release-loop/resume-release.js';
 import { runAutoApprove } from '../../scripts/release-loop/auto-approve-node.js';
 import { runVerify } from '../../scripts/release-loop/verify-node.js';
-import { readGraphContext, runNodeVerdict } from '../../scripts/release-loop/node-verdict.js';
+import { latestGateOutput, readGraphContext, runNodeVerdict } from '../../scripts/release-loop/node-verdict.js';
 import { runGateRepairNode } from '../../scripts/release-loop/gate-repair-node.js';
+import { auditGateFileReceipts } from '../../scripts/release-loop/gate-file-receipt-audit-node.js';
 import { resolveScenarioFilePath } from './scenario.js';
+import { makeGateFileReceiptSimulationReceipt, simGateReceiptFileClosureCas } from './gate-receipt-file-closure-cas.js';
+import { gateFileReceiptIdentityFromClosure, type GateFileReceiptIdentity } from '../../scripts/release-loop/gate-file-receipts.js';
 
 /** The sim world executes the same live subscribers against its isolated state root. */
 function runGraph(path: string, options: GraphRunOptions): ReturnType<typeof runGraphCore> {
@@ -35,9 +38,17 @@ import { createReleasePublishDevices } from './release-publish-devices.js';
 import { PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
 import { createGraphEventBus, type GraphEvent, type GraphEventBus } from '../graph-runner/graph-events.js';
 import { planMacrophageIncident, recordMacrophageGraphRecovery, simulateMacrophageRecovery, type MacrophageIncidentSignal } from '../release-loop/macrophage-incident-recovery.js';
-import { classifyGateShadow } from '../../scripts/release-loop/gate-triage-node.js';
 import { attributeReleaseFailures, type ReleaseFailureAttribution } from '../release-loop/release-failure-attribution.js';
 import { planMacrophageRepairLadder, type MacrophageRepairLadderInput, type MacrophageRepairLadderDecision } from '../release-loop/macrophage-repair-ladder.js';
+import { runArgMacroCanvasSim, type ArgMacroCanvasIncident, type ArgMacroCanvasManifest } from './arg-macro-canvas-sim.js';
+import { createIncidentPolicyHandler } from '../release-loop/incident-policy-handler.js';
+import { parseAppManifest } from '../nexus/apps/app-contract.js';
+import { createFakeAppHost } from './fake-app-host.js';
+
+/** Release rig entry for the ARG + macrophage declared-canvas simulation; delegates to the in-memory rig. */
+export function runArgMacroCanvasRig(input: { runId: string; manifest: ArgMacroCanvasManifest; incidents: readonly ArgMacroCanvasIncident[]; now?: Date }) {
+  return runArgMacroCanvasSim(input);
+}
 
 export interface MacrophageRepairLadderFiveStepCapSim {
   readonly injector: 'macrophage-repair-ladder-five-step-cap-sim';
@@ -135,6 +146,12 @@ export interface ReleaseMacrophageIncidentSimInput {
   readonly version?: string;
   readonly attributionContext?: { readonly repo: string; readonly previousTag: string; readonly cutCommit: string };
   readonly graphDrivenIncidentIds?: readonly string[];
+  /** Start with an actual receipt-key mismatch, then surface the introduced failures through residual-run. */
+  readonly receiptAuditKeyMismatchFirst?: boolean;
+  readonly repairLandingFailure?: boolean;
+  readonly repairArtifactFailure?: boolean;
+  /** Fake child copies built fixture artifacts; host effects run only after the repair PR is verified landed. */
+  readonly onRepairLanded?: (files: readonly string[], artifacts: readonly { readonly sourceFile: string; readonly files: Readonly<Record<string, string>> }[]) => void;
 }
 
 export interface ReleaseMacrophageIncidentSimCase {
@@ -194,10 +211,12 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
   readonly graphDrivenIncidentId: string;
   readonly graphRepairFailureIds: readonly string[];
   readonly graphRepairInputFailureIds: readonly string[];
+  readonly graphRepairInputGateExecutionId?: string;
   readonly graphRepairInputFiles: readonly string[];
   readonly graphRepairAttributions: readonly ReleaseFailureAttribution[];
   readonly graphRepairMeasured: boolean;
   readonly graphRepairChecks: Readonly<Record<string, boolean | number>>;
+  readonly productionTriageEvidence?: Readonly<Record<string, unknown>>;
   readonly statePath: string;
   readonly receiptPath: string;
   readonly recoveryReceiptPath: string;
@@ -264,8 +283,11 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
   const version = input.version ?? '0.3.6';
   let incidentsInjected = false;
   let gateVisits = 0;
+  let receiptAuditVisits = 0;
+  let productionTriageEvidence: Record<string, unknown> | undefined;
   let graphRepairInputFiles: string[] = [];
   let graphRepairInputFailureIds: string[] = [];
+  let graphRepairInputGateExecutionId: string | undefined;
   let graphState: GraphRunState;
   try { graphState = await runGraph(RELEASE_GRAPH, { runId: input.runId,
     input: { version, previousVersion: '0.3.5' }, eventBus: bus, pinChildUniverse: true, quiet: true,
@@ -286,31 +308,86 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
             && (item.plan.step !== 'R2-split-files' || item.plan.files.length < 2)))) {
           throw new Error('graph-driven incidents must resolve to landed repair plans');
         }
-        const commit = 'a'.repeat(40);
+        const commit = cutTip();
         const introduced = graphDriven.flatMap(({ signal, plan }) => signal.failureIds?.length
           ? signal.failureIds : plan.files.map((file) => `${file}.test.ts > injected R2 regression in ${file}`));
-        const gate = gateVisits === 1
+        const gate = gateVisits === 1 && !input.receiptAuditKeyMismatchFirst
           ? { outcome: 'fail', commit, introduced, preexisting: 0, fixed: null,
             knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 }
           : { outcome: 'ok', commit, introduced: [], preexisting: 0, fixed: null,
             knownEnv: 0, knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
-        return { exitCode: gateVisits === 1 ? 1 : 0, stdout: `${JSON.stringify(gate)}\n`,
-          stderr: gateVisits === 1 ? 'TypeScript TS2322: simulated gate regression' : '' };
+        return { exitCode: gate.outcome === 'fail' ? 1 : 0, stdout: `${JSON.stringify(gate)}\n`,
+          stderr: gate.outcome === 'fail' ? 'TypeScript TS2322: simulated gate regression' : '' };
+      }
+      if (nodeId === 'receipt-audit' && input.receiptAuditKeyMismatchFirst) {
+        receiptAuditVisits++;
+        const context = readGraphContext(options.env);
+        const file = 'scripts/release-loop/macro-chain-fixture.test.ts';
+        const source = "test('receipt fixture', () => {});\n";
+        const tree = { files: [file], read: (path: string) => path === file ? source : undefined, preload: [] as string[] };
+        const imageDigest = `sha256:${'a'.repeat(64)}`;
+        const identity = gateFileReceiptIdentityFromClosure(tree, file, imageDigest);
+        if (!identity) throw new Error('macro-chain receipt fixture has an opaque closure');
+        const repairCommit = Object.entries(context.outputs).filter(([id, output]) => /^gate-repair-[a-f0-9]{12}$/.test(id)
+          && output.outcome === 'ok' && typeof output.commit === 'string').at(-1)?.[1]?.commit;
+        const commit = typeof repairCommit === 'string' ? repairCommit
+          : context.outputs.cutoff?.commit ?? context.outputs['version-release']?.commit;
+        if (typeof commit !== 'string' || !/^[a-f0-9]{40}$/i.test(commit)) throw new Error('macro-chain receipt audit has no pinned commit');
+        const receipt = makeGateFileReceiptSimulationReceipt(identity, commit, input.runId, 'cut');
+        const badKey = `${receipt.key[0] === '0' ? '1' : '0'}${receipt.key.slice(1)}`;
+        const selectedReceipt = receiptAuditVisits === 1 ? { ...receipt, key: badKey } : receipt;
+        const audit = auditGateFileReceipts(context, {
+          repo: root, roots: { instance: join(root, 'instance'), ledger: join(root, 'ledger') },
+          testsAtCommit: () => [file], closureTree: () => tree, pinnedImage: () => imageDigest,
+          readReceipt: () => ({ ...selectedReceipt, recordSha256: 'b'.repeat(64) }),
+        });
+        if (receiptAuditVisits === 1 && audit.summary.includes('identity mismatch') === false
+          && audit.summary.includes('invalid content key') === false) {
+          throw new Error(`receipt-key fault did not reach the production audit: ${audit.summary}`);
+        }
+        return { exitCode: audit.outcome === 'ok' ? 0 : 1, stdout: `${JSON.stringify(audit)}\n`,
+          stderr: audit.outcome === 'ok' ? '' : audit.summary };
+      }
+      if (nodeId === 'residual-run' && input.receiptAuditKeyMismatchFirst) {
+        const graphDriven = cases.filter(({ signal }) => graphDrivenIncidentIds.has(signal.id));
+        const commit = cutTip();
+        const introduced = graphDriven.flatMap(({ signal, plan }) => signal.failureIds?.length
+          ? signal.failureIds : plan.files.map((file) => `${file}.test.ts > injected R2 regression in ${file}`));
+        return { exitCode: 1, stdout: `${JSON.stringify({ outcome: 'fail', commit, introduced,
+          preexisting: 0, fixed: null, knownEnv: 0, knownEnvCleared: [], stalledEnv: [],
+          rcNonzeroNoFailures: [], durationMs: 1 })}\n`, stderr: 'TypeScript TS2322: simulated introduced regression after receipt-key mismatch' };
       }
       if (nodeId === 'gate-triage') {
-        const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
-        if (!contextPath) throw new Error('gate-triage simulation requires its graph context');
-        const context = JSON.parse(readFileSync(contextPath, 'utf8')) as { input: Record<string, unknown>; outputs: { gate?: Record<string, unknown> } };
-        if (!context.outputs.gate) throw new Error('gate-triage simulation did not receive the current gate output');
-        const triage = classifyGateShadow(context.outputs.gate as never);
-        return { exitCode: 0, stdout: `${JSON.stringify({ ...triage,
-          gateExecutionId: context.input.adaptiveGateExecutionId })}\n`, stderr: '' };
+        const context = readGraphContext(options.env);
+        const latest = latestGateOutput(context);
+        if (!latest) throw new Error('gate-triage simulation did not receive the latest gate or residual-run output');
+        const child = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
+          cwd: REPOSITORY_ROOT, env: { ...process.env, ...options.env }, encoding: 'utf8', maxBuffer: 1024 * 1024,
+        });
+        let result: Record<string, unknown> = {};
+        try { result = record(JSON.parse((child.stdout ?? '').trim().split('\n').at(-1) ?? 'null'), 'production gate-triage output'); }
+        catch { /* Preserve child diagnostics in the graph node result. */ }
+        const latestExecutionId = typeof latest.executionId === 'string' ? latest.executionId : undefined;
+        const priorGate = [...(context.nodeHistory ?? [])].reverse().find((entry) => entry.nodeId === 'gate');
+        const priorGateExecutionId = typeof priorGate?.executionId === 'string' ? priorGate.executionId : undefined;
+        const triageFailureIds = Array.isArray(result.failureIds) ? result.failureIds.filter((id): id is string => typeof id === 'string') : [];
+        const latestFailureIds = Array.isArray(latest.introduced) ? latest.introduced.filter((id): id is string => typeof id === 'string') : [];
+        const latestNode = [...(context.nodeHistory ?? [])].reverse().find((entry) => entry.nodeId === 'gate' || entry.nodeId === 'residual-run')?.nodeId;
+        productionTriageEvidence = { exitCode: child.status, latestNode, priorGateExecutionId,
+          latestExecutionId, triageExecutionId: result.gateExecutionId, latestFailureIds, triageFailureIds,
+          matched: child.status === 0 && latestNode === 'residual-run' && !!latestExecutionId
+            && !!priorGateExecutionId && priorGateExecutionId !== latestExecutionId && result.gateExecutionId === latestExecutionId
+            && JSON.stringify([...triageFailureIds].sort()) === JSON.stringify([...latestFailureIds].sort()),
+          stderr: child.stderr ?? '' };
+        return { exitCode: child.status ?? 2, stdout: child.stdout ?? '', stderr: child.stderr ?? '' };
       }
       if (/^gate-repair-[a-f0-9]{12}$/.test(nodeId)) {
         const graphDriven = cases.filter(({ signal }) => graphDrivenIncidentIds.has(signal.id));
         if (graphDriven.length === 0 || graphDriven.some(({ signal }) => !repairLanded.has(signal.id))) throw new Error('repair PR landing was not supplied to the graph-driven incident');
         const graphContext = readGraphContext(options.env);
         const failureIds = graphContext.nodeInput?.failureIds;
+        graphRepairInputGateExecutionId = typeof graphContext.nodeInput?.gateExecutionId === 'string'
+          ? graphContext.nodeInput.gateExecutionId : undefined;
         const expectedFailureIds = graphDriven.flatMap(({ signal, plan }) => signal.failureIds?.length
           ? signal.failureIds : plan.files.map((file) => `${file}.test.ts > injected R2 regression in ${file}`));
         if (!Array.isArray(failureIds) || expectedFailureIds.some((id) => !failureIds.includes(id))) {
@@ -340,6 +417,7 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
           .map((file) => `${file} > ${row.failureId}`)))];
         if (!attributedRepairFailureIds.length) throw new Error('production attribution produced no repairable source files');
         const repairPrFiles = new Map<number, string>();
+        const repairArtifactDirs = new Map<number, string>();
         let nextRepairPr = 90000;
         const repairContext = { ...graphContext, nodeInput: { ...graphContext.nodeInput, failureIds: attributedRepairFailureIds,
           independenceEvidence: attributions.map(({ failureId, sourceFiles, unresolvedImports }) => ({ failureId, sourceFiles, unresolvedImports })) } };
@@ -353,6 +431,17 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
             if (!file) throw new Error('production repair feature omitted its attributed source file');
             const prNumber = nextRepairPr++;
             repairPrFiles.set(prNumber, file);
+            const fixtureName = file === 'templates/next-app-lecture-scrap/app/page.jsx' ? 'home'
+              : file === 'templates/next-app-lecture-scrap/app/search/page.jsx' ? input.repairArtifactFailure ? 'bad-search' : 'search' : undefined;
+            if (fixtureName) {
+              const artifactName = fixtureName === 'home' ? 'index.html' : fixtureName === 'search' ? 'search/index.html' : 'search.html';
+              const artifactSource = join(REPOSITORY_ROOT, 'src/ux-sim/fixtures/kaist-child-artifacts', fixtureName, artifactName);
+              const artifactDir = join(root, 'release', 'repair-child-artifacts', input.runId, `pr-${prNumber}`, 'out');
+              const publishedName = fixtureName === 'bad-search' ? 'missing-search.html' : artifactName;
+              mkdirSync(dirname(join(artifactDir, publishedName)), { recursive: true });
+              writeFileSync(join(artifactDir, publishedName), readFileSync(artifactSource), { mode: 0o600 });
+              repairArtifactDirs.set(prNumber, artifactDir);
+            }
             return { ok: true, prNumber, prUrl: `https://github.com/ElanvitalAI/elanous/pull/${prNumber}` };
           },
           inspectRepairPr: async (prNumber) => {
@@ -363,6 +452,7 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
           waitForLanded: async (prNumber) => {
             const file = repairPrFiles.get(prNumber);
             if (!file) throw new Error(`unknown simulated landing PR ${prNumber}`);
+            if (input.repairLandingFailure) throw new Error(`simulated repair PR #${prNumber} did not land`);
             return { schema: 1, prNumber, repairRunId: input.runId,
               head: createHash('sha1').update(file).digest('hex'), mergeSha: 'f'.repeat(40), base: 'main', mergedAt: '2026-11-07T00:00:00.000Z' };
           },
@@ -371,6 +461,19 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
         });
         if (repairResult.outcome !== 'ok') throw new Error(`production repair entrypoint did not land every attributed file: ${repairResult.summary}`);
         graphRepairInputFiles = repairResult.repairs.map(({ file }) => file).sort();
+        const landedArtifacts = repairResult.repairs.filter((repair) => repair.status === 'repaired').map((repair) => {
+          const artifactDir = repairArtifactDirs.get(repair.prNumber);
+          const files = artifactDir ? Object.fromEntries((function walk(directory: string, prefix = ''): Array<[string, string]> {
+            return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+              const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+              const fullPath = join(directory, entry.name);
+              return entry.isDirectory() ? walk(fullPath, relative)
+                : [[relative, readFileSync(fullPath, 'utf8')] as [string, string]];
+            });
+          })(artifactDir)) : {};
+          return { sourceFile: repair.file, files };
+        });
+        input.onRepairLanded?.(repairResult.repairedFiles, landedArtifacts);
         for (const item of graphDriven) {
           const itemAttributions = attributions.filter((row) => item.signal.failureIds?.includes(row.failureId)
             || (!item.signal.failureIds?.length && item.plan.files.some((file) => row.sourceFiles.includes(file))));
@@ -446,10 +549,11 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
   const runtimeFailureDetected = runtimeDecisions.some((decision) => {
     const sourceEventId = decision.data?.sourceEventId;
     const sourceEvent = typeof sourceEventId === 'string' ? eventTrace.find((event) => event.eventId === sourceEventId) : undefined;
-    return decision.data?.sourceNodeId === 'gate' && decision.data.action === 'attempt-repair'
+    const expectedFailureNode = input.receiptAuditKeyMismatchFirst ? 'residual-run' : 'gate';
+    return decision.data?.sourceNodeId === expectedFailureNode && decision.data.action === 'attempt-repair'
       && decision.data.failureSignature === 'type-error' && decision.data.applied === false
       && sourceEvent?.type === 'node-end' && sourceEvent.data?.ok === false
-      && sourceEvent.source.kind === 'node' && sourceEvent.source.nodeId === 'gate';
+      && sourceEvent.source.kind === 'node' && sourceEvent.source.nodeId === expectedFailureNode;
   });
   const finalized = cases.map((item) => {
     if (graphDrivenIncidentIds.has(item.signal.id) && graphDrivenRepairMeasured) {
@@ -475,8 +579,9 @@ export async function runReleaseMacrophageIncidentSim(input: ReleaseMacrophageIn
       && jsonlRows.length === finalized.filter((item) => item.resumed).length
       && readFileSync(recoveryReceiptPath, 'utf8') === jsonlRows.join(''),
     runId: input.runId, graphState, graphDrivenIncidentId: [...graphDrivenIncidentIds][0] ?? GRAPH_DRIVEN_MACROPHAGE_INCIDENT,
-    graphRepairFailureIds, graphRepairInputFailureIds, graphRepairInputFiles, graphRepairAttributions, graphRepairMeasured: graphDrivenRepairMeasured,
+    graphRepairFailureIds, graphRepairInputFailureIds, graphRepairInputGateExecutionId, graphRepairInputFiles, graphRepairAttributions, graphRepairMeasured: graphDrivenRepairMeasured,
     graphRepairChecks,
+    productionTriageEvidence,
     statePath, receiptPath, recoveryReceiptPath, cases: finalized, eventTrace, runtimeDecisions, jsonl: jsonlRows.join('') };
 }
 
@@ -508,10 +613,25 @@ function cutTip(): string {
   return cachedCutTip;
 }
 
+function createResumeCommandRoot(root: string): string {
+  const commandRoot = join(root, 'resume-command-root');
+  mkdirSync(join(commandRoot, 'node_modules'), { recursive: true });
+  mkdirSync(join(commandRoot, 'apps/pwa/node_modules'), { recursive: true });
+  mkdirSync(join(commandRoot, 'graphs/release'), { recursive: true });
+  for (const name of ['release-loop.yaml', 'recipes.yaml']) {
+    copyFileSync(join(REPOSITORY_ROOT, 'graphs/release', name), join(commandRoot, 'graphs/release', name));
+  }
+  return commandRoot;
+}
+
 
 export interface ReleaseSimRigCase {
   id: string;
-  mode?: 'baseline' | 'cut-tip-moved-after-resume' | 'approval-graph-path-mismatch' | 'pwa-costly-opt-in-required' | 'cutoff-cli-notes-empty' | 'docs-node-cli-in-sim' | 'gate-waive-introduced-regression' | 'owner-waive-unmeasured-gate' | 'owner-waive-0246-fixture' | 'append-receipt-continuity' | 'macrophage-heal' | 'old-graph-measured-waiver' | 'appended-tip-regate-before-waiver';
+  mode?: 'baseline' | 'cut-tip-moved-after-resume' | 'approval-graph-path-mismatch' | 'pwa-costly-opt-in-required' | 'cutoff-cli-notes-empty' | 'docs-node-cli-in-sim' | 'gate-waive-introduced-regression' | 'owner-waive-unmeasured-gate' | 'owner-waive-missing-schema' | 'owner-waive-0246-fixture' | 'owner-waive-downstream-failure' | 'append-receipt-continuity' | 'resume-fanout-branch-refused' | 'macrophage-heal' | 'macro-chain-e2e' | 'kaist-selfheal-stage' | 'old-graph-measured-waiver' | 'appended-tip-regate-before-waiver' | 'prod-seat-launch-refused' | 'incident-policy-handler';
+  repairFault?: 'bad-artifact' | 'unlanded';
+  incidentEventType?: string;
+  incidentDescription?: string;
+  incidentRationale?: string;
   unmeasuredGateShape?: 'stopped' | 'sweep-incomplete' | 'killed';
   fault?: { node: string; outcome: 'fail' | 'error' | 'timeout'; evidence?: Record<string, unknown> };
   nodeOutcomes?: Record<string, { outcome: 'ok' | 'fail' | 'error' | 'unknown'; delayMs?: number }>;
@@ -529,6 +649,19 @@ export interface ReleaseSimGateReceiptStage {
   formalGateRun?: { outcome: 'ok' | 'regression' | 'error'; formalReceiptDecision?: string; cutSweepCount: number; fullSweep: boolean; baselineVersion?: string };
   gateOutcome: 'pass' | 'fail' | 'unmeasured';
   publishDecision: 'eligible' | 'blocked';
+  requestedSweepConcurrency?: number;
+  observedSweepConcurrency?: number;
+}
+
+function runSimulatedGateWorkerPool(files: readonly string[], workerCount: number): number {
+  if (!Number.isSafeInteger(workerCount) || workerCount < 1) throw new Error('invalid simulated gate worker count');
+  const workers = Array.from({ length: workerCount }, () => ({ completedFiles: [] as string[], run(file: string) { this.completedFiles.push(file); } }));
+  files.forEach((file, index) => workers[index % workerCount]!.run(file));
+  const completedFiles = workers.flatMap((worker) => worker.completedFiles);
+  if (completedFiles.length !== files.length || files.some((file) => !completedFiles.includes(file)))
+    throw new Error('simulated gate worker pool lost a file');
+  // The executor reports its allocated Pod worker profile after dispatching the selected work.
+  return workers.length;
 }
 
 /** Production receipt-radius planner seam. The optional final hook is reserved for p13's gate fault helper. */
@@ -538,6 +671,8 @@ export function runReleaseSimGateReceiptSeam(input: {
   priorCommit: string;
   commit: string;
   selectedFiles: string[];
+  requestedSweepConcurrency?: number;
+  executorWorkerCount?: number;
   stage: string;
   formalReceiptInspection?: GateShardReceiptInspection;
   formalGateRun?: ReleaseSimGateReceiptStage['formalGateRun'];
@@ -576,6 +711,9 @@ export function runReleaseSimGateReceiptSeam(input: {
     : measuredOutcome === 'unmeasured' || formalGateOutcome === 'unmeasured' ? 'unmeasured' : 'pass';
   const planned: ReleaseSimGateReceiptStage = { name: input.stage, commit: input.commit,
     selectedFiles: [...input.selectedFiles], plan: { carriedShardIds, rerunShardIds, fullSweep },
+    ...(input.requestedSweepConcurrency !== undefined ? { requestedSweepConcurrency: input.requestedSweepConcurrency } : {}),
+    ...(input.executorWorkerCount !== undefined
+      ? { observedSweepConcurrency: runSimulatedGateWorkerPool(input.selectedFiles, input.executorWorkerCount) } : {}),
     receiptIds: reduction.status === 'complete' ? reduction.receipts.map((receipt) => receipt.id) : [],
     ...(input.formalGateRun ? { formalGateRun: input.formalGateRun } : {}),
     ...(input.formalGateRun?.formalReceiptDecision === 'formal-receipt-set-absent'
@@ -648,6 +786,10 @@ async function runProductionMissingReceiptGate(root: string, tests: string[], ve
 const SIM_BASE_COMMIT = 'b'.repeat(40);
 const SIM_IMAGE_DIGEST = `sha256:${'a'.repeat(64)}`;
 const SIM_ENV_FINGERPRINT = 'c'.repeat(64);
+// 출처: RFC-release-gate-file-receipts § dirty-ratio threshold is 0.1; two changed files must stay below it.
+const SIM_FILE_CAS_SWEEP_FILE_COUNT = 40;
+// 출처: RFC-release-gate-file-receipts § sweep and supplemental use the same fixed Pod profile.
+const SIM_GATE_EXECUTOR_CONCURRENCY = 24;
 const SIM_RUNTIME_IDENTITY = { bunVersion: '1.4.2', platform: 'linux', architecture: 'x64', envFingerprint: SIM_ENV_FINGERPRINT,
   baseImageDigest: `sha256:${'d'.repeat(64)}` };
 const SIM_LOCKFILE_BODY = 'lockfileVersion = 1\n';
@@ -731,7 +873,8 @@ async function simulatePersistedSameCommitCarry(root: string, version: string) {
     carriedShardIds, rerunShardIds: podCalls > 0 ? shards.map((shard) => shard.id) : [], totalPods: podCalls, output: result.output, events };
 }
 
-async function runAppendReceiptCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase, root: string): Promise<ReleaseSimRigCaseResult> {
+async function runAppendReceiptCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase, root: string,
+  executorConcurrency = SIM_GATE_EXECUTOR_CONCURRENCY, supplementalFailureAt?: string): Promise<ReleaseSimRigCaseResult> {
   const tests = Array.from({ length: 81 }, (_, index) => `test/shard-${String(index).padStart(2, '0')}.test.ts`);
   const cut = 'a'.repeat(40), appendA = 'c'.repeat(40), appendB = 'd'.repeat(40);
   const graphId = `release-sim-${scenario.id}-append-continuity`;
@@ -761,6 +904,7 @@ async function runAppendReceiptCase(scenario: ReleaseSimRigScenario, item: Relea
   let selectedFiles: string[] = [];
   let receipts: GateShardReceipt[] = [];
   const stages: ReleaseSimGateReceiptStage[] = [];
+  const fileCasRuns: Array<{ nodeId: string; sourceRunId: string; changedIndex: number; observation: ReturnType<typeof simGateReceiptFileClosureCas> }> = [];
   const runBash = async (_command: string, options: { env?: NodeJS.ProcessEnv }) => {
     const { nodeId } = parseContext(options.env ?? process.env);
     if (nodeId === 'append-a') { previousCommit = cut; currentCommit = appendA; selectedFiles = [tests[0]!]; }
@@ -769,9 +913,50 @@ async function runAppendReceiptCase(scenario: ReleaseSimRigScenario, item: Relea
       ledgerEvents.push({ event: 'resume', stage: nodeId, priorCommit: previousCommit, commit: currentCommit, selectedFiles: [...selectedFiles], radiusOnly: true });
     }
     if (nodeId.startsWith('gate-')) {
+      const changedIndex = nodeId === 'gate-cut' ? 0 : nodeId === 'gate-a' ? 1 : 2;
+      const sourceRunId = nodeId === 'gate-a' ? '1475eed8' : 'c159bb8d';
+      const priorFiles: GateFileReceiptIdentity[] = Array.from({ length: SIM_FILE_CAS_SWEEP_FILE_COUNT }, (_, index) => {
+        const file = `test/append-cas-${index}.test.ts`;
+        const closureFiles = [file, `apps/pwa/config-${index}.json`, `src/release/module-${index}.ts`].sort();
+        const contentHashes = Object.fromEntries(closureFiles.map((path) => [path, createHash('sha256').update(path).digest('hex')]));
+        return { file, closureFiles, contentHashes, imageDigest: SIM_IMAGE_DIGEST };
+      });
+      const appendedFiles = priorFiles.map((identity, index) => {
+        if (index !== changedIndex) return identity;
+        const changedPath = sourceRunId === 'c159bb8d' ? `apps/pwa/config-${index}.json` : `src/release/module-${index}.ts`;
+        return { ...identity, contentHashes: { ...identity.contentHashes,
+          [changedPath]: createHash('sha256').update(`${changedPath}:append`).digest('hex') } };
+      });
+      appendedFiles.push({ file: 'test/append-cas-new.test.ts', closureFiles: ['src/release/new.ts', 'test/append-cas-new.test.ts'],
+        contentHashes: { 'src/release/new.ts': createHash('sha256').update('src/release/new.ts').digest('hex'),
+          'test/append-cas-new.test.ts': createHash('sha256').update('test/append-cas-new.test.ts').digest('hex') }, imageDigest: SIM_IMAGE_DIGEST });
+      const neighborIndex = (changedIndex + 1) % priorFiles.length;
+      const receiptFileCas = simGateReceiptFileClosureCas({ sourceRunId, trainHead40: 'e'.repeat(40), cutHead40: currentCommit,
+        imageDigest: SIM_IMAGE_DIGEST, prior: priorFiles,
+        priorReceipts: priorFiles.map((identity) => makeGateFileReceiptSimulationReceipt(identity, 'e'.repeat(40), 'baseline-sweep')),
+        appended: appendedFiles, isolated: [appendedFiles[changedIndex]!, appendedFiles.at(-1)!],
+        interference: { [priorFiles[changedIndex]!.file]: [priorFiles[neighborIndex]!.file] },
+        ...(nodeId === supplementalFailureAt ? { supplementalOutcome: 'fail' as const } : {}),
+        runSupplemental: (input, outcome) => {
+          const supplemental = runReleaseSimGateReceiptSeam({ stage: `${nodeId}-append-supplemental`, tests: input.tests,
+            receipts: [], priorCommit: input.priorCommit, commit: input.commit, selectedFiles: input.selectedFiles,
+            requestedSweepConcurrency: input.concurrency, executorWorkerCount: executorConcurrency },
+          () => ({ gateOutcome: outcome }));
+          return { aggregate: supplemental.aggregate === 'complete' ? 'complete' as const : 'incomplete' as const,
+            gateOutcome: supplemental.gateOutcome, publishDecision: supplemental.publishDecision,
+            executedConcurrency: supplemental.observedSweepConcurrency ?? 0,
+            plan: { fullSweep: supplemental.plan.fullSweep, rerunShardIds: supplemental.plan.rerunShardIds } };
+        } });
+      fileCasRuns.push({ nodeId, sourceRunId, changedIndex, observation: receiptFileCas });
+      ledgerEvents.push({ event: 'file-cas-replay', nodeId, sourceRunId, supplementalOutcome: receiptFileCas.supplementalGate.gateOutcome,
+        requestedConcurrency: receiptFileCas.appendInvalidation.supplementalConcurrency,
+        observedConcurrency: receiptFileCas.supplementalGate.executedConcurrency,
+        dirtyFiles: receiptFileCas.appendInvalidation.dirtyFiles, supplementalFiles: receiptFileCas.appendInvalidation.supplementalFiles,
+        certificateRefreshed: receiptFileCas.refreshedSweepCertificate !== undefined });
       const stage = runReleaseSimGateReceiptSeam({ stage: nodeId, tests, receipts,
       priorCommit: previousCommit, commit: currentCommit, selectedFiles,
-        ...(nodeId === 'gate-cut' ? { formalReceiptInspection, formalGateRun } : {}) });
+        ...(nodeId === 'gate-cut' ? { formalReceiptInspection, formalGateRun } : {}) },
+      () => ({ gateOutcome: receiptFileCas.supplementalGate.gateOutcome }));
       stages.push(stage);
       receipts = [...receipts.filter((receipt) => stage.plan.carriedShardIds.includes(receipt.id)).map((receipt) => ({ ...receipt, head40: currentCommit })),
         ...stage.plan.rerunShardIds.map((id) => simulatedReceipt(id, tests[Number(id.slice(4))]!, currentCommit))];
@@ -821,15 +1006,30 @@ async function runAppendReceiptCase(scenario: ReleaseSimRigScenario, item: Relea
     && appendStageA.aggregate === 'complete' && appendStageA.receiptIds.length === 81
     && appendStageB?.plan.carriedShardIds.length === 80 && appendStageB.plan.rerunShardIds.join() === 'pod-1'
     && appendStageB.aggregate === 'complete' && appendStageB.receiptIds.length === 81;
+  // 출처: 내부 문서 `RFC-release-gate-file-receipts-2026-11-08` §6 requires two replay events and one failed supplemental run.
+  const fileCasReplayOk = fileCasRuns.length === 3
+    && fileCasRuns[0]?.sourceRunId === 'c159bb8d' && fileCasRuns[0].observation.supplementalGate.gateOutcome === 'pass'
+    && !fileCasRuns[0].observation.appendInvalidation.fullSweepRequired
+    && fileCasRuns[0].observation.appendInvalidation.supplementalFiles.join() === ['test/append-cas-0.test.ts', 'test/append-cas-1.test.ts', 'test/append-cas-new.test.ts'].sort().join()
+    && fileCasRuns[0].observation.refreshedSweepCertificate?.sourceHead40 === cut
+    && fileCasRuns[0].observation.measuredAfterAppend.every((receipt) => receipt.sourceHead40 === cut)
+    && fileCasRuns[1]?.sourceRunId === '1475eed8' && fileCasRuns[1].observation.supplementalGate.gateOutcome === 'pass'
+    && !fileCasRuns[1].observation.appendInvalidation.fullSweepRequired
+    && fileCasRuns[1].observation.refreshedSweepCertificate?.sourceHead40 === appendA
+    && fileCasRuns[1].observation.measuredAfterAppend.every((receipt) => receipt.sourceHead40 === appendA)
+    && fileCasRuns[0].observation.appendInvalidation.dirtyFiles.join() !== fileCasRuns[1].observation.appendInvalidation.dirtyFiles.join()
+    && fileCasRuns[2]?.observation.supplementalGate.gateOutcome === 'pass'
+    && !fileCasRuns[2].observation.certificateRefreshBlocked && fileCasRuns[2].observation.refreshedSweepCertificate !== undefined;
   const publishOk = stages.at(-1)?.publishDecision === 'eligible' && path.includes('publish');
   const ledgerOk = ledgerEvents.some((row) => row.event === 'node-start') && ledgerEvents.some((row) => row.event === 'node-end')
     && ledgerEvents.some((row) => row.event === 'append') && ledgerEvents.filter((row) => row.event === 'resume').length === 2;
   const eventTrace = checkExpectedEvents(item.expect.events, ledgerEvents);
-  const pass = statusOk && visitOk && notVisitOk && receiptFlowOk && sameCommitCarryOk && publishOk && ledgerOk && (eventTrace?.pass ?? true) && edgeIssues.length === 0;
+  const pass = statusOk && visitOk && notVisitOk && receiptFlowOk && fileCasReplayOk && sameCommitCarryOk && publishOk
+    && ledgerOk && (eventTrace?.pass ?? true) && edgeIssues.length === 0;
   return { id: item.id, pass, status: state.status, path, dispatchedNodes: path.filter((node) => nodeSequence.includes(node)),
     unexpectedEdges: edgeIssues, checks: { status: statusOk, mustVisit: visitOk, mustNotVisit: notVisitOk, overlap: true, ledgerEvents: ledgerOk, ...(eventTrace ? { events: eventTrace.pass } : {}) },
     injectedEvidence: { universe: 'test', releaseVersion: scenario.input.version, formalReceiptInspection, receiptCase, appendA: appendStageA, appendB: appendStageB,
-      sameCommitResume, sameCommitCarryOk, carryRegressionFixture, appendedOnlyChangedTestRadius: receiptFlowOk, fakePublish: stages.at(-1)?.publishDecision,
+      sameCommitResume, sameCommitCarryOk, carryRegressionFixture, appendedOnlyChangedTestRadius: receiptFlowOk, fileCasReplayOk, fileCasRuns, fakePublish: stages.at(-1)?.publishDecision,
       executionStatePath: state.statePath, ...(eventTrace ? { eventTrace } : {}) }, fanOuts: state.fanOuts, ledgerEvents, statePath: state.statePath };
 }
 
@@ -849,7 +1049,9 @@ export interface ReleaseSimRigCaseResult {
   path: string[];
   dispatchedNodes: string[];
   unexpectedEdges: Array<{ from: string; to: string; outcome: string; expectedTo?: string }>;
-  checks: { status: boolean; mustVisit: boolean; mustNotVisit: boolean; overlap: boolean; ledgerEvents: boolean; events?: boolean; adaptiveRepair?: boolean };
+  checks: { status: boolean; mustVisit: boolean; mustNotVisit: boolean; overlap: boolean; ledgerEvents: boolean; events?: boolean; adaptiveRepair?: boolean;
+    productionTriage?: boolean; repairInputMatchesResidualExecution?: boolean; receiptMismatchRoutedToResidual?: boolean;
+    appBugDetected?: boolean; appRepairRoutesGreen?: boolean; oneSameRunReceipt?: boolean };
   fanOuts?: GraphRunState['fanOuts'];
   nodeTimings?: Record<string, { startedAtMs: number; endedAtMs: number }>;
   injectedEvidence: Record<string, unknown>;
@@ -859,23 +1061,28 @@ export interface ReleaseSimRigCaseResult {
 }
 
 function unexpectedEdges(path: string[], state: GraphRunState, edges: Map<string, Record<string, unknown>>): ReleaseSimRigCaseResult['unexpectedEdges'] {
-  const nodes = new Map(state.nodes.map((node) => [node.nodeId, node]));
+  const nodes = new Map<string, typeof state.nodes[number][]>();
+  for (const node of state.nodes) nodes.set(node.nodeId, [...(nodes.get(node.nodeId) ?? []), node]);
+  const visits = new Map<string, number>();
   const issues: ReleaseSimRigCaseResult['unexpectedEdges'] = [];
   for (let index = 0; index + 1 < path.length; index++) {
     const from = path[index]!;
     const to = path[index + 1]!;
+    const visit = visits.get(from) ?? 0;
+    visits.set(from, visit + 1);
     const adaptiveAppend = state.adaptiveGateNodeAppends?.some(({ request }) =>
       (from === request.afterNodeId && to === request.node.nodeId)
       || (from === request.node.nodeId && to === request.rerunGateAt));
     if (adaptiveAppend) continue;
     const edge = edges.get(from);
     if (edge?.branches && edge.join === to) continue; // The runner records a fan-out's barrier as the parent-path successor.
-    const output = nodes.get(from)?.output;
+    const node = nodes.get(from)?.[visit] ?? nodes.get(from)?.at(-1);
+    const output = node?.output;
     let parsed: Record<string, unknown> = {};
     if (typeof output === 'string') {
       try { parsed = record(JSON.parse(output.trim().split('\n').at(-1) ?? ''), `${from} output`); } catch { /* use runner fallback below */ }
     } else if (output && typeof output === 'object' && !Array.isArray(output)) parsed = output as Record<string, unknown>;
-    const named = typeof parsed.outcome === 'string' ? parsed.outcome : nodes.get(from)?.ok ? 'ok' : 'fail';
+    const named = typeof parsed.outcome === 'string' ? parsed.outcome : node?.ok ? 'ok' : 'fail';
     const map = edge?.map && typeof edge.map === 'object' ? edge.map as Record<string, unknown> : {};
     const mappedOutcome = named === 'pass(owner-waived)' ? 'ok' : named;
     const expectedTo = typeof map[mappedOutcome] === 'string' ? map[mappedOutcome] as string : typeof map[mappedOutcome === 'ok' ? 'ok' : 'fail'] === 'string'
@@ -904,6 +1111,74 @@ function createReleaseTraceBus(events: Array<Record<string, unknown>>): GraphEve
       ...event.data, eventId: event.eventId, sequence: event.sequence, observedBy: 'GraphEventBus' });
   });
   return bus;
+}
+
+async function runIncidentPolicyHandlerCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase, root: string): Promise<ReleaseSimRigCaseResult> {
+  const eventType = item.incidentEventType;
+  const description = item.incidentDescription;
+  const rationale = item.incidentRationale;
+  if (!eventType || !description || !rationale) throw new Error('incident-policy-handler case requires event type, description, and rationale');
+  const graphDocument = parseYaml(readFileSync(RELEASE_GRAPH, 'utf8')) as Record<string, unknown> & { nodes: Array<Record<string, unknown>> };
+  const gateTriage = graphDocument.nodes.find((node) => node.node_id === 'gate-triage');
+  const expectedSubscription = { event: eventType, match: { nodeId: 'gate' }, action: 'reroute' };
+  const subscriptions = Array.isArray(gateTriage?.subscribes) ? gateTriage.subscribes : [];
+  const subscriptionOk = subscriptions.some((row) => {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+    const subscription = row as Record<string, unknown>;
+    const match = subscription.match;
+    return subscription.event === eventType && subscription.action === 'reroute'
+      && !!match && typeof match === 'object' && !Array.isArray(match)
+      && (match as Record<string, unknown>).nodeId === 'gate';
+  });
+  graphDocument.entry_node = 'gate';
+
+  const runId = `release-sim-${scenario.id}-${item.id}`;
+  const ledgerEvents: Array<Record<string, unknown>> = [];
+  const eventBus = createReleaseTraceBus(ledgerEvents);
+  const incidentPolicy = createIncidentPolicyHandler(async (dispatch) => ({
+    vocabularyLine: dispatch.event.type,
+    repairSummary: description,
+    rationale,
+  }));
+  const state = await runGraph(RELEASE_GRAPH, {
+    graphSource: stringifyYaml(graphDocument), runId, input: scenario.input, pinChildUniverse: true, quiet: true, eventBus,
+    deps: {
+      root,
+      runBash: async (_command, options) => {
+        const { nodeId } = readGraphContext(options.env ?? process.env);
+        if (nodeId === 'gate') {
+          await eventBus.publish({ graphId: 'release-loop', runId, type: eventType,
+            source: { kind: 'node', nodeId: 'gate' }, data: { incidentId: item.id, description } });
+          await eventBus.flush({ graphId: 'release-loop', runId });
+        }
+        return { exitCode: 0, stdout: '{"outcome":"ok"}\n', stderr: '' };
+      },
+      dispatchGraphSubscription: async (dispatch) => incidentPolicy(dispatch),
+    },
+  });
+  const persisted = listGraphRuns(root).runs.find((run) => run.graphId === 'release-loop' && run.runId === runId);
+  const appendedNodeId = state.subscriptionGraphAppends?.[0]?.proposal.entryNodeId;
+  const appendedReason = state.subscriptionGraphAppends?.[0]?.proposal.reason;
+  const expectedPath = appendedNodeId ? ['gate', 'gate-triage', appendedNodeId, 'done'] : [];
+  const mutationOk = state.adaptiveGraphVocabulary?.includes(eventType) === true
+    && state.adaptiveGraphEdges?.some((edge) => edge.from === 'gate' && edge.to === 'gate-triage' && edge.triggerEvent === eventType && edge.rationale === rationale) === true
+    && !!appendedNodeId && /^gate-repair-[a-f0-9]{12}$/.test(appendedNodeId)
+    && state.subscriptionGraphAppends?.length === 1 && appendedReason === `${description}: ${rationale}`;
+  const persistenceOk = !!persisted
+    && JSON.stringify(persisted.adaptiveGraphVocabulary) === JSON.stringify(state.adaptiveGraphVocabulary)
+    && JSON.stringify(persisted.subscriptionGraphAppends) === JSON.stringify(state.subscriptionGraphAppends)
+    && JSON.stringify(persisted.adaptiveGraphEdges ?? []) === JSON.stringify(state.adaptiveGraphEdges ?? []);
+  const pathOk = !!appendedNodeId && JSON.stringify(state.path) === JSON.stringify(expectedPath);
+  const busEventOk = ledgerEvents.some((event) => event.event === eventType && event.runId === runId && event.observedBy === 'GraphEventBus');
+  const statusOk = state.status === item.expect.status && state.status === 'done';
+  const mustVisit = item.expect.mustVisit.every((nodeId) => state.path.includes(nodeId)) && pathOk;
+  const mustNotVisit = item.expect.mustNotVisit.every((nodeId) => !state.path.includes(nodeId));
+  recordObservedEdges(state.path, ledgerEvents);
+  const pass = subscriptionOk && mutationOk && persistenceOk && statusOk && mustVisit && mustNotVisit && busEventOk;
+  return { id: item.id, pass, status: state.status, path: state.path, dispatchedNodes: state.path, unexpectedEdges: [],
+    checks: { status: statusOk, mustVisit, mustNotVisit, overlap: true, ledgerEvents: busEventOk && persistenceOk, events: subscriptionOk && mutationOk },
+    injectedEvidence: { universe: 'test', eventType, subscriptionOk, mutationOk, persistenceOk, appendedNodeId, statePath: state.statePath },
+    ledgerEvents, statePath: state.statePath };
 }
 
 export interface ReleaseSimRigResult {
@@ -979,13 +1254,25 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
   const ids = new Set<string>();
   const cases = rawCases.map((raw, index): ReleaseSimRigCase => {
     const row = record(raw, `scenario.cases[${index}]`);
-    exactKeys(row, ['id', 'mode', 'fault', 'nodeOutcomes', 'unmeasuredGateShape', 'expect'], `scenario.cases[${index}]`);
+    exactKeys(row, ['id', 'mode', 'fault', 'repairFault', 'nodeOutcomes', 'unmeasuredGateShape', 'incidentEventType', 'incidentDescription', 'incidentRationale', 'expect'], `scenario.cases[${index}]`);
     if (typeof row.id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(row.id) || ids.has(row.id)) throw new Error(`scenario.cases[${index}].id must be unique lowercase text`);
     ids.add(row.id);
     let mode: ReleaseSimRigCase['mode'];
     if (row.mode !== undefined) {
-      if (row.mode !== 'baseline' && row.mode !== 'cut-tip-moved-after-resume' && row.mode !== 'approval-graph-path-mismatch' && row.mode !== 'pwa-costly-opt-in-required' && row.mode !== 'cutoff-cli-notes-empty' && row.mode !== 'docs-node-cli-in-sim' && row.mode !== 'gate-waive-introduced-regression' && row.mode !== 'owner-waive-unmeasured-gate' && row.mode !== 'owner-waive-0246-fixture' && row.mode !== 'append-receipt-continuity' && row.mode !== 'macrophage-heal' && row.mode !== 'old-graph-measured-waiver' && row.mode !== 'appended-tip-regate-before-waiver') throw new Error(`scenario.cases[${index}].mode is unregistered`);
+      if (row.mode !== 'baseline' && row.mode !== 'cut-tip-moved-after-resume' && row.mode !== 'approval-graph-path-mismatch' && row.mode !== 'pwa-costly-opt-in-required' && row.mode !== 'cutoff-cli-notes-empty' && row.mode !== 'docs-node-cli-in-sim' && row.mode !== 'gate-waive-introduced-regression' && row.mode !== 'owner-waive-unmeasured-gate' && row.mode !== 'owner-waive-missing-schema' && row.mode !== 'owner-waive-0246-fixture' && row.mode !== 'owner-waive-downstream-failure' && row.mode !== 'append-receipt-continuity' && row.mode !== 'resume-fanout-branch-refused' && row.mode !== 'macrophage-heal' && row.mode !== 'macro-chain-e2e' && row.mode !== 'kaist-selfheal-stage' && row.mode !== 'old-graph-measured-waiver' && row.mode !== 'appended-tip-regate-before-waiver' && row.mode !== 'prod-seat-launch-refused' && row.mode !== 'incident-policy-handler') throw new Error(`scenario.cases[${index}].mode is unregistered`);
       mode = row.mode;
+    }
+    const incidentEventType = row.incidentEventType;
+    const incidentDescription = row.incidentDescription;
+    const incidentRationale = row.incidentRationale;
+    if (mode === 'incident-policy-handler') {
+      if (typeof incidentEventType !== 'string' || !/^release\.incident\.[a-z0-9][a-z0-9.-]{0,100}$/.test(incidentEventType)
+        || typeof incidentDescription !== 'string' || !incidentDescription.trim()
+        || typeof incidentRationale !== 'string' || !incidentRationale.trim()) {
+        throw new Error(`scenario.cases[${index}] incident-policy-handler requires a release incident event, description, and rationale`);
+      }
+    } else if (incidentEventType !== undefined || incidentDescription !== undefined || incidentRationale !== undefined) {
+      throw new Error(`scenario.cases[${index}] incident fields require incident-policy-handler mode`);
     }
     const unmeasuredGateShape = row.unmeasuredGateShape;
     if (unmeasuredGateShape !== undefined && unmeasuredGateShape !== 'stopped' && unmeasuredGateShape !== 'sweep-incomplete' && unmeasuredGateShape !== 'killed') {
@@ -1000,7 +1287,13 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
       if (parsed.outcome !== 'fail' && parsed.outcome !== 'error' && parsed.outcome !== 'timeout') throw new Error(`scenario.cases[${index}].fault.outcome is unregistered`);
       fault = { node: parsed.node, outcome: parsed.outcome, ...(parsed.evidence === undefined ? {} : { evidence: record(parsed.evidence, `scenario.cases[${index}].fault.evidence`) }) };
     }
+    if (mode === 'incident-policy-handler' && fault !== undefined) throw new Error(`scenario.cases[${index}] incident-policy-handler does not accept fault`);
     if ((mode === undefined) === (fault === undefined)) throw new Error(`scenario.cases[${index}] requires exactly one of mode or fault`);
+    const repairFault = row.repairFault;
+    if (repairFault !== undefined && (mode !== 'kaist-selfheal-stage'
+      || (repairFault !== 'bad-artifact' && repairFault !== 'unlanded'))) {
+      throw new Error(`scenario.cases[${index}].repairFault is only valid for KAIST self-heal and must be bad-artifact or unlanded`);
+    }
     const nodeOutcomes: ReleaseSimRigCase['nodeOutcomes'] = {};
     if (row.nodeOutcomes !== undefined) {
       const rawOutcomes = record(row.nodeOutcomes, `scenario.cases[${index}].nodeOutcomes`);
@@ -1015,6 +1308,9 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
     }
     const expected = record(row.expect, `scenario.cases[${index}].expect`);
     exactKeys(expected, ['status', 'mustVisit', 'mustNotVisit', 'overlap', 'refusalIncludes', 'events'], `scenario.cases[${index}].expect`);
+    if (mode === 'incident-policy-handler' && (row.nodeOutcomes !== undefined || expected.overlap !== undefined || expected.events !== undefined)) {
+      throw new Error(`scenario.cases[${index}] incident-policy-handler does not accept nodeOutcomes, overlap, or events expectations`);
+    }
     if (expected.status !== 'done' && expected.status !== 'failed' && expected.status !== 'resume-refused' && expected.status !== 'awaiting-approval') throw new Error(`scenario.cases[${index}].expect.status is invalid`);
     const mustVisit = stringList(expected.mustVisit, `scenario.cases[${index}].expect.mustVisit`);
     const mustNotVisit = stringList(expected.mustNotVisit, `scenario.cases[${index}].expect.mustNotVisit`);
@@ -1047,7 +1343,9 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
     const expectedNodeIds = mode === 'append-receipt-continuity' ? new Set([...nodeIds, ...RECEIPT_SIM_NODE_IDS]) : nodeIds;
     for (const id of [...mustVisit, ...mustNotVisit]) if (!expectedNodeIds.has(id)) throw new Error(`scenario.cases[${index}] names unknown release node ${id}`);
     if (mustVisit.some((id) => mustNotVisit.includes(id))) throw new Error(`scenario.cases[${index}] visits and excludes the same node`);
-    return { id: row.id, ...(mode ? { mode } : {}), ...(fault ? { fault } : {}), ...(Object.keys(nodeOutcomes).length ? { nodeOutcomes } : {}),
+    return { id: row.id, ...(mode ? { mode } : {}), ...(fault ? { fault } : {}), ...(repairFault ? { repairFault } : {}), ...(mode === 'incident-policy-handler' ? {
+      incidentEventType: incidentEventType as string, incidentDescription: incidentDescription as string, incidentRationale: incidentRationale as string,
+    } : {}), ...(Object.keys(nodeOutcomes).length ? { nodeOutcomes } : {}),
       ...(unmeasuredGateShape ? { unmeasuredGateShape } : {}),
       expect: { status: expected.status, mustVisit, mustNotVisit, ...(overlap ? { overlap } : {}), ...(typeof refusalIncludes === 'string' ? { refusalIncludes } : {}), ...(events ? { events } : {}) } };
   });
@@ -1112,12 +1410,13 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
     root = join(root, runId);
     mkdirSync(root, { recursive: true });
   }
-  const ownerWaived = (item.mode === 'owner-waive-unmeasured-gate' && item.unmeasuredGateShape === undefined) || item.mode === 'owner-waive-0246-fixture';
-  const fixtureOwnerWaiver = item.mode === 'owner-waive-0246-fixture';
+  const downstreamFailure = item.mode === 'owner-waive-downstream-failure';
+  const ownerWaived = (item.mode === 'owner-waive-unmeasured-gate' && item.unmeasuredGateShape === undefined) || item.mode === 'owner-waive-0246-fixture' || downstreamFailure;
+  const fixtureOwnerWaiver = item.mode === 'owner-waive-0246-fixture' || downstreamFailure;
   let input: { version: string; previousVersion: string; branchCut?: boolean; [key: string]: unknown } = fixtureOwnerWaiver ? { ...scenario.input, version: '0.2.46', previousVersion: '0.2.45', branchCut: true }
     : ownerWaived ? { ...scenario.input, version: '0.2.45', previousVersion: '0.2.44' }
       : item.unmeasuredGateShape ? { ...scenario.input, branchCut: true } : { ...scenario.input };
-  const gateFixture = fixtureOwnerWaiver
+  const gateFixture = item.mode === 'owner-waive-0246-fixture'
     ? JSON.parse(readFileSync(join(REPOSITORY_ROOT, 'scripts/release-loop/fixtures/gate-verdict-0.2.46.json'), 'utf8')) as Record<string, unknown>
     : undefined;
   const fixtureIntroducedIds = Array.isArray(gateFixture?.introduced) ? gateFixture.introduced as string[] : [];
@@ -1144,6 +1443,11 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
     dispatchedNodes.push(nodeId);
     if (!resumedPhase) firstAttemptDispatchedNodes.push(nodeId);
     const startedAtMs = performance.now();
+    if (resumedPhase && downstreamFailure && nodeId === 'pwa') {
+      const failed = resultForNode(nodeId, { node: nodeId, outcome: 'fail', evidence: { source: 'owner-waive-downstream-failure' } }, input.version);
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      return { exitCode: failed.exitCode, stdout: failed.stdout, stderr: failed.stderr };
+    }
     if (nodeId === 'gate') {
       nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
       if (item.unmeasuredGateShape === 'killed' || (item.unmeasuredGateShape && shared && shared.initialRuns === 0)) {
@@ -1161,7 +1465,7 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
           stalledEnv: [], stalledShards: [{ shard: 3, files: ['a.test.ts'], reason: 'no-output' }], durationMs: 1, error: 'pod sweep incomplete: stalled shards 3' }
         : { outcome: 'error', verdict: 'fail', commit: cutTip(), introduced: [], preexisting: 0, fixed: null,
           knownEnv: 0, knownEnvCleared: [], stalledEnv: [], durationMs: 1, error: 'failure attribution incomplete' };
-      return { exitCode: 1, stdout: `${JSON.stringify(item.unmeasuredGateShape ? unmeasuredGateResult : item.mode === 'owner-waive-unmeasured-gate' ? unmeasuredGateResult : { outcome: 'fail', verdict: 'fail', commit: cutTip(), introduced: [introducedId],
+      return { exitCode: 1, stdout: `${JSON.stringify(item.unmeasuredGateShape ? unmeasuredGateResult : item.mode === 'owner-waive-unmeasured-gate' || downstreamFailure ? unmeasuredGateResult : { outcome: 'fail', verdict: 'fail', commit: cutTip(), introduced: [introducedId],
         preexisting: 0, knownEnv: 0, durationMs: 1, stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [], unmeasuredErrors: [], rcNonzeroNoFailures: [], abortedShards: 0 })}
 `, stderr: '' };
     }
@@ -1171,6 +1475,11 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
       return { exitCode: 0, stdout: `${JSON.stringify(value)}\n`, stderr: '' };
     }
     if (nodeId === 'gate-triage') {
+      if (downstreamFailure) {
+        const triage = resultForNode(nodeId, undefined, input.version);
+        nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+        return { exitCode: triage.exitCode, stdout: triage.stdout, stderr: triage.stderr };
+      }
       const child = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
         cwd: REPOSITORY_ROOT, env: { ...process.env, ...options.env }, encoding: 'utf8', maxBuffer: 1024 * 1024,
       });
@@ -1403,7 +1712,7 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
   const resumed = fixtureOwnerWaiver || item.unmeasuredGateShape
     ? (await resumeReleaseRun({ runId, from: 'gate', ...(fixtureOwnerWaiver ? { ownerWaive: 'gate' as const, acceptedRegressions: [] }
       : { waive: 'gate' as const, acceptedRegressions }), reason, approvedBy: 'OP',
-      partial: false, commandRoot: REPOSITORY_ROOT }, {
+      partial: false, commandRoot: downstreamFailure ? createResumeCommandRoot(root) : REPOSITORY_ROOT }, {
       root, repo: REPOSITORY_ROOT, graphPath: RELEASE_GRAPH, runBash, trafficFile, ledgerRoot: root,
       eventBus,
       git, isAncestor: () => true,
@@ -1422,9 +1731,9 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
   const edgeIssues = unexpectedEdges(path, resumed, edges);
   const gate = resumed.nodes.find((node) => node.nodeId === 'gate');
   const issueRows = Array.isArray(knownIssuesAccepted) ? knownIssuesAccepted as Array<{ id?: unknown; note?: unknown }> : [];
-  const knownIssueOk = (ownerWaived ? !issueRows.some((issue) => issue.id === introducedId) : issueRows.some((issue) => issue.id === introducedId))
-    && issueRows.some((issue) => issue.id === 'waive:gate' && issue.note === reason);
-  const ownerNotes = ownerWaived ? readFileSync(join(root, 'owner-waive-docs', 'release/public/docs/releases', `${input.version}.md`), 'utf8') : '';
+  const knownIssueOk = downstreamFailure || ((ownerWaived ? !issueRows.some((issue) => issue.id === introducedId) : issueRows.some((issue) => issue.id === introducedId))
+    && issueRows.some((issue) => issue.id === 'waive:gate' && issue.note === reason));
+  const ownerNotes = ownerWaived && resumed.path.includes('docs') ? readFileSync(join(root, 'owner-waive-docs', 'release/public/docs/releases', `${input.version}.md`), 'utf8') : '';
   const docsOutput = resumed.nodes.find((node) => node.nodeId === 'docs')?.output;
   const docsWorktree = typeof docsOutput === 'string' ? record(JSON.parse(docsOutput), 'release docs output').worktree : undefined;
   const releaseNotes = item.unmeasuredGateShape && typeof docsWorktree === 'string'
@@ -1444,10 +1753,12 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
   const expectedOwnerIds = fixtureOwnerWaiver ? fixtureIntroducedIds : [];
   const ownerRecordOk = !ownerWaived || (ownerLedgerHasApproval && ownerLedger?.ownerWaived === true && ownerLedger.approvedBy === 'OP'
     && ownerLedger.reason === reason && JSON.stringify(ownerLedger.introducedIds ?? []) === JSON.stringify(expectedOwnerIds)
-    && audit?.type === 'release-owner-waiver' && audit.approvedBy === 'OP' && audit.reason === reason
-    && JSON.stringify(audit.introducedIds ?? []) === JSON.stringify(expectedOwnerIds)
-    && Array.isArray(knownIssuesResult.bullets) && knownIssuesResult.bullets.includes(reason));
-  const statusOk = resumed.status === item.expect.status && resumed.path.includes('publish');
+    && (downstreamFailure || (audit?.type === 'release-owner-waiver' && audit.approvedBy === 'OP' && audit.reason === reason
+      && JSON.stringify(audit.introducedIds ?? []) === JSON.stringify(expectedOwnerIds)
+      && Array.isArray(knownIssuesResult.bullets) && knownIssuesResult.bullets.includes(reason))));
+  const failedJoin = resumed.nodes.find((node) => node.nodeId === 'pre-prepare-join');
+  const statusOk = resumed.status === item.expect.status
+    && (downstreamFailure ? failedJoin?.ok === false && !resumed.path.includes('prepare') : resumed.path.includes('publish'));
   const visitOk = item.expect.mustVisit.every((id) => visited.has(id));
   const notVisitOk = item.expect.mustNotVisit.every((id) => !visited.has(id));
   const ledgerOk = ledgerEvents.some((row) => row.event === 'node-start') && ledgerEvents.some((row) => row.event === 'node-end')
@@ -1472,7 +1783,8 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
     && JSON.stringify(gate.waiver.original) === JSON.stringify(originalWaiverRecord)
     && JSON.stringify(unmeasuredLedgerGate.waiver) === JSON.stringify(gate.waiver));
   const gateNotRerun = !item.unmeasuredGateShape || !dispatchedNodes.includes('gate');
-  const releaseTailOk = !fixtureOwnerWaiver || (dispatchedNodes.includes('publish') && dispatchedNodes.includes('npm-publish') && dispatchedNodes.includes('verify')
+  const releaseTailOk = downstreamFailure ? !dispatchedNodes.includes('prepare') && !dispatchedNodes.includes('publish') && !dispatchedNodes.includes('npm-publish')
+    : !fixtureOwnerWaiver || (dispatchedNodes.includes('publish') && dispatchedNodes.includes('npm-publish') && dispatchedNodes.includes('verify')
     && (npmPublishEvidence?.publishNodeResult as { outcome?: string } | undefined)?.outcome === 'ok'
     && Array.isArray(npmPublishEvidence?.publishNodeExternalCalls)
     && npmPublishEvidence?.result !== undefined && (npmPublishEvidence.result as { outcome?: string; npm?: string }).outcome === 'ok'
@@ -1485,12 +1797,12 @@ async function runGateWaiveCase(scenario: ReleaseSimRigScenario, item: ReleaseSi
   const result: ReleaseSimRigCaseResult = { id: item.id, pass, status: resumed.status, path, dispatchedNodes, unexpectedEdges: edgeIssues,
     checks: { status: statusOk, mustVisit: visitOk && knownIssueOk && waiverOk && unmeasuredLedgerOk && ownerRecordOk, mustNotVisit: notVisitOk, overlap: true, ledgerEvents: ledgerOk,
       ...(item.unmeasuredGateShape ? { waiverOriginalPersisted: unmeasuredLedgerOk, gateNotRerun, missingReasonRejected, secondWaiverRejected } : {}),
-      ...(eventTrace ? { events: eventTrace.pass } : {}) },
+      ...(eventTrace ? { events: eventTrace.pass } : {}), ...(downstreamFailure ? { failedJoin: failedJoin?.ok === false } : {}) },
     injectedEvidence: { introducedId, introducedIds: fixtureIntroducedIds, acceptedRegressions, reason, waived: waiverOk,
       actualGateTriage, waiverResult: waiver, knownIssuesAccepted, initialStatus: first.status, initialPath: first.path,
       ...(item.unmeasuredGateShape ? { originalGateRecord, persistedWaiver: unmeasuredLedgerGate?.waiver,
         sharedInitialGraphRuns: shared?.initialRuns, sharedRunId: shared?.runId, releaseNotes, releaseNotesOk } : {}),
-      initialDispatchedNodes: firstAttemptDispatchedNodes, publishReached: path.includes('publish'), npmPublishEvidence,
+      initialDispatchedNodes: firstAttemptDispatchedNodes, publishReached: path.includes('publish'), failedJoin: failedJoin ? { ok: failedJoin.ok, exit: failedJoin.exit, error: failedJoin.error } : undefined, npmPublishEvidence,
       verifyEvidence, ownerNotes, ownerRecordOk, releaseTailOk, ownerLedgerPath: ownerWaived ? resumed.statePath : undefined,
       ...(eventTrace ? { eventTrace } : {}) },
     fanOuts: resumed.fanOuts, nodeTimings, ledgerEvents, statePath: resumed.statePath };
@@ -1723,8 +2035,44 @@ async function runAppendedTipReGateCase(scenario: ReleaseSimRigScenario, item: R
 
 async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase, root: string,
   edges: Map<string, Record<string, unknown>>, sharedUnmeasuredGateFixture: SharedUnmeasuredGateFixture,
+  executorConcurrency: number, supplementalFailureAt?: string,
 ): Promise<ReleaseSimRigCaseResult> {
-  if (item.mode === 'append-receipt-continuity') return runAppendReceiptCase(scenario, item, root);
+  if (item.mode === 'incident-policy-handler') return runIncidentPolicyHandlerCase(scenario, item, root);
+  if (item.mode === 'prod-seat-launch-refused') {
+    const attempts = ['a8cdf30b', '28b034de', '443a89b8'];
+    const home = join(root, `${scenario.id}-seat-launch-home`);
+    mkdirSync(home, { recursive: true });
+    const childEnv: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '',
+      NODE_ENV: process.env.NODE_ENV ?? 'test', ELANOUS_TRACK: 'POD-REUSE-2' };
+    if (process.env.TMPDIR) childEnv.TMPDIR = process.env.TMPDIR;
+    const child = spawnSync(process.execPath, [join(import.meta.dir, 'release-sim-rig-seat-guard-child.ts'), join(home, '.elanous')], {
+      cwd: process.cwd(), encoding: 'utf8', timeout: 60_000,
+      env: childEnv,
+    });
+    let childEvidence: { graphStarts: number; results: Array<{ incidentRunId: string; seat: string; exitCode: number | null;
+      output: Record<string, unknown>; stderr: string; error: string | null;
+      debugEvents: Array<{ category: string; event: string; data: Record<string, unknown> }> }> } = { graphStarts: -1, results: [] };
+    try { childEvidence = record(JSON.parse(child.stdout.trim().split('\n').at(-1) ?? ''), 'seat guard child result') as typeof childEvidence; }
+    catch { /* the failed child output is retained in injected evidence below */ }
+    const { graphStarts, results } = childEvidence;
+    const path: string[] = [];
+    const launchCount = graphStarts;
+    const statusOk = item.expect.status === 'failed';
+    const mustVisit = item.expect.mustVisit.length === 0;
+    const mustNotVisit = launchCount === 0 && item.expect.mustNotVisit.every((nodeId) => !path.includes(nodeId));
+    const denied = results.every(({ exitCode, output, debugEvents }) => exitCode === 1 && output.reason === 'seat-launch-refused'
+      && typeof output.error === 'string' && output.error.includes('--test') && debugEvents.length === 1
+      && debugEvents.every(({ category, event, data }) => category === 'release.run' && event === 'seat-launch-refused'
+        && data.seat === 'POD-REUSE-2' && typeof data.cwd === 'string'
+        && typeof data.reason === 'string' && data.reason.includes('--test')));
+    const checks = { status: statusOk, mustVisit, mustNotVisit, overlap: true, ledgerEvents: launchCount === 0 };
+    return { id: item.id, pass: child.status === 0 && statusOk && mustVisit && mustNotVisit && denied, status: launchCount ? 'done' : 'failed',
+      path, dispatchedNodes: [], unexpectedEdges: [], checks,
+      injectedEvidence: { universe: 'production', incidentRunIds: attempts, launchCount, cliResults: results,
+        childExitCode: child.status, childError: child.error?.message ?? child.stderr ?? null },
+      ledgerEvents: [], statePath: '' };
+  }
+  if (item.mode === 'append-receipt-continuity') return runAppendReceiptCase(scenario, item, root, executorConcurrency, supplementalFailureAt);
   if (item.mode === 'old-graph-measured-waiver') return runOldGraphMeasuredWaiverCase(scenario, item, root, edges);
   if (item.mode === 'appended-tip-regate-before-waiver') return runAppendedTipReGateCase(scenario, item, root, edges);
   if (item.mode === 'macrophage-heal') {
@@ -1792,6 +2140,133 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
       injectedEvidence: { scrapCount: inventory.length, active, live: liveEvents, simulation, expectedApplied,
         overlap: { expected: expectedOverlap, actual: actualOverlap } }, ledgerEvents,
       statePath: state.statePath };
+  }
+  if (item.mode === 'macro-chain-e2e' || item.mode === 'kaist-selfheal-stage') {
+    const kaist = item.mode === 'kaist-selfheal-stage';
+    const sourceFiles = kaist ? ['templates/next-app-lecture-scrap/app/page.jsx', 'templates/next-app-lecture-scrap/app/search/page.jsx']
+      : ['scripts/release-loop/gate-node.ts', 'scripts/release-loop/gate-partial.ts', 'scripts/release-loop/gate-repair-node.ts'];
+    const incidentId = kaist ? 'kaist-lecture-scrap-search-route-regression' : 'receipt-audit-repair-resume';
+    const draftManifest = `apiVersion: elanous.app/v0\nslug: lecture-scrap\ntitle: 강의 스크랩 노트\ntemplate: next-app-lecture-scrap\nfrontend: { kind: static-export, out: out/, routes: [/, /notes/new, /search] }\ntables:\n  notes:\n    columns:\n      id: { type: text, primary: true }\n      title: { type: text }\n      body: { type: text }\nroles:\n  owner: { via: nexus-session }\n`;
+    const templateManifestPath = join(REPOSITORY_ROOT, 'templates/next-app-lecture-scrap/app.yaml');
+    const manifestSource = kaist && existsSync(templateManifestPath) ? readFileSync(templateManifestPath, 'utf8') : draftManifest;
+    const appManifest = kaist ? parseAppManifest(manifestSource) : undefined;
+    const parsedAppManifest = appManifest?.ok ? appManifest.manifest : undefined;
+    if (kaist && !parsedAppManifest) throw new Error('KAIST draft app.yaml is invalid');
+    const appSlug = parsedAppManifest?.slug ?? 'lecture-scrap';
+    const frontend = parsedAppManifest ? record(parsedAppManifest.frontend, 'KAIST app.yaml frontend') : undefined;
+    const design = parsedAppManifest?.design ? record(parsedAppManifest.design, 'KAIST app.yaml design') : undefined;
+    const appRoutes = Array.isArray(frontend?.routes)
+      ? frontend.routes.filter((route): route is string => typeof route === 'string')
+      : Array.isArray(design?.screens) ? design.screens.map((screen) => record(screen, 'KAIST app.yaml screen').path).filter((route): route is string => typeof route === 'string') : undefined;
+    const expectedAppRoutes = ['/', '/notes/new', '/search'];
+    if (kaist && (appSlug !== 'lecture-scrap' || parsedAppManifest?.template !== 'next-app-lecture-scrap'
+      || frontend?.kind !== 'static-export' || frontend.out !== 'out/' || !Array.isArray(appRoutes)
+      || JSON.stringify([...appRoutes].sort()) !== JSON.stringify([...expectedAppRoutes].sort()))) {
+      throw new Error('KAIST app.yaml must declare the lecture-scrap static export route contract');
+    }
+    const appInitialFiles = { 'index.html': '<main>스크랩 목록</main>', 'notes/new': '<main>노트 작성</main>' };
+    const appHost = kaist ? createFakeAppHost([{ slug: appSlug, current: 'bug-injected', versions: [
+      { id: 'bug-injected', files: appInitialFiles },
+    ] }]) : undefined;
+    const appHostName = `${appSlug}.app.sim.invalid`;
+    const appUrl = kaist ? `https://${appHostName}` : undefined;
+    const beforeSearch = kaist ? appHost!.fetch(appHostName, '/search') : undefined;
+    const beforeHome = kaist ? appHost!.fetch(appHostName, '/') : undefined;
+    const failureIds = kaist && beforeSearch?.status === 404 && !beforeHome?.body.includes('/search')
+      ? [`${sourceFiles[0]}.test.ts > /search navigation link is missing`, `${sourceFiles[1]}.test.ts > injected /search route returned 404`]
+      : sourceFiles.map((file, index) => `${file}.test.ts > injected macro-chain failure ${index + 1}`);
+    const incident: MacrophageIncidentSignal = { id: incidentId, source: 'release-graph',
+      signature: kaist ? 'KAIST lecture-scrap injected missing search route detected by fake app-host probe'
+        : 'receipt-audit key mismatch followed by complete introduced failure collection',
+      evidence: kaist && beforeSearch?.status !== 404 ? 'unmeasured' : 'introduced',
+      failureIds, sourceFiles, independentFiles: true, causePr: kaist ? 36051 : 36027 };
+    const runId = `release-sim-${scenario.id}-${item.id}-${randomUUID()}`;
+    let deployedRepairFiles: string[] = [];
+    let deployedRepairArtifactPaths: string[] = [];
+    const macro = await runReleaseMacrophageIncidentSim({ runId, incidents: [incident], repairLandedIds: [incidentId],
+      hitlApprovedIds: [], version: scenario.input.version, graphDrivenIncidentIds: [incidentId], receiptAuditKeyMismatchFirst: true,
+      repairLandingFailure: item.repairFault === 'unlanded',
+      repairArtifactFailure: item.repairFault === 'bad-artifact',
+      ...(kaist ? {
+        onRepairLanded: (files: readonly string[], artifacts: readonly { readonly sourceFile: string; readonly files: Readonly<Record<string, string>> }[]) => {
+          if (!sourceFiles.every((file) => files.includes(file) && artifacts.some((artifact) => artifact.sourceFile === file
+            && Object.keys(artifact.files).length > 0))) return;
+          const repairedFiles: Record<string, string> = { ...appInitialFiles };
+          for (const artifact of artifacts) Object.assign(repairedFiles, artifact.files);
+          appHost!.deployArtifact(appSlug, { id: 'repair-landed', files: repairedFiles });
+          deployedRepairFiles = [...files];
+          deployedRepairArtifactPaths = artifacts.flatMap((artifact) => Object.keys(artifact.files));
+        },
+      } : {}) });
+    const appRouteChecks = kaist ? [
+      ['/', appHost!.fetch(appHostName, '/')],
+      ['/notes/new', appHost!.fetch(appHostName, '/notes/new')],
+      ['/search', appHost!.fetch(appHostName, '/search')],
+    ] as const : [];
+    const appChecks = !kaist || (beforeSearch?.status === 404 && beforeHome?.status === 200 && !beforeHome.body.includes('/search') && appRouteChecks.length === 3
+      && appRouteChecks.every(([, response]) => response.status === 200)
+      && JSON.stringify(appRouteChecks.map(([route]) => route).sort()) === JSON.stringify([...(appRoutes as string[])].sort())
+      && appRouteChecks[0]?.[1].body.includes('/search') === true
+      && deployedRepairFiles.length === sourceFiles.length && sourceFiles.every((file) => deployedRepairFiles.includes(file))
+      && deployedRepairArtifactPaths.includes('index.html') && deployedRepairArtifactPaths.includes('search/index.html')
+      && appUrl === 'https://lecture-scrap.app.sim.invalid');
+    const kaistReceipts = kaist ? macro.jsonl.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { runId?: string; incidentId?: string; disposition?: string }) : [];
+    const oneSameRunReceipt = !kaist || (kaistReceipts.length === 1 && kaistReceipts[0]?.runId === macro.runId
+      && kaistReceipts[0]?.incidentId === incidentId && kaistReceipts[0]?.disposition === 'resumed-after-land'
+      && macro.cases.length === 1 && macro.cases[0]?.receipt?.runId === macro.runId
+      && macro.cases[0]?.receipt?.incidentId === incidentId && macro.cases[0]?.receipt?.disposition === 'resumed-after-land'
+      && macro.cases[0]?.receipt?.gateVisit === 2
+      && JSON.stringify(macro.cases[0]?.receipt?.rerunFiles) === JSON.stringify(sourceFiles));
+    const path = macro.graphState.path;
+    const gate = path.indexOf('gate');
+    const firstAudit = path.indexOf('receipt-audit');
+    const residual = path.indexOf('residual-run', firstAudit + 1);
+    const triage = path.indexOf('gate-triage', residual + 1);
+    const repair = path.findIndex((nodeId) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId));
+    const repairGate = path.indexOf('gate', repair + 1);
+    const secondAudit = path.indexOf('receipt-audit', repairGate + 1);
+    const pathOk = gate >= 0 && firstAudit > gate && residual > firstAudit && triage > residual && repair > triage
+      && repairGate > repair && secondAudit > repairGate && path.filter((nodeId) => nodeId === 'receipt-audit').length === 2;
+    const statusOk = macro.graphState.status === item.expect.status;
+    const mustVisit = item.expect.mustVisit.every((nodeId) => path.includes(nodeId));
+    const mustNotVisit = item.expect.mustNotVisit.every((nodeId) => !path.includes(nodeId));
+    const edgeIssues = unexpectedEdges(path, macro.graphState, edges);
+    const firstReceiptAudit = outputRecord(macro.graphState.nodes.find((node) => node.nodeId === 'receipt-audit')?.output);
+    const receiptAuditEdge = edges.get('receipt-audit')?.map;
+    const receiptAuditFailTarget = receiptAuditEdge && typeof receiptAuditEdge === 'object' && !Array.isArray(receiptAuditEdge)
+      ? (receiptAuditEdge as Record<string, unknown>).fail : undefined;
+    const injectedMismatchRoutedToResidual = firstReceiptAudit?.outcome === 'fail'
+      && receiptAuditFailTarget === 'residual-run' && path.indexOf('residual-run') > firstAudit && edgeIssues.length === 0;
+    const sameRun = macro.runId === runId && macro.graphState.runId === runId
+      && macro.cases.every((entry) => entry.receipt?.runId === runId && entry.receipt.gateVisit === 2);
+    const applied = macro.runtimeDecisions.some((event) => event.runId === runId && event.data?.applied === true);
+    const triageMatched = macro.productionTriageEvidence?.matched === true;
+    const repairInputMatchesResidualExecution = typeof macro.productionTriageEvidence?.latestExecutionId === 'string'
+      && macro.graphRepairInputGateExecutionId === macro.productionTriageEvidence.latestExecutionId;
+    const pass = macro.pass && pathOk && statusOk && mustVisit && mustNotVisit && sameRun && applied && triageMatched
+      && repairInputMatchesResidualExecution
+      && injectedMismatchRoutedToResidual && edgeIssues.length === 0 && appChecks && oneSameRunReceipt;
+    return { id: item.id, pass, status: macro.graphState.status, path,
+      dispatchedNodes: macro.graphState.nodes.map((node) => node.nodeId), unexpectedEdges: edgeIssues,
+      checks: { status: statusOk, mustVisit, mustNotVisit, overlap: true, ledgerEvents: macro.eventTrace.length > 0,
+        adaptiveRepair: pathOk && sameRun && applied, productionTriage: triageMatched,
+        repairInputMatchesResidualExecution,
+        receiptMismatchRoutedToResidual: injectedMismatchRoutedToResidual, events: macro.pass,
+        ...(kaist ? { appBugDetected: beforeSearch?.status === 404 && !beforeHome?.body.includes('/search'), appRepairRoutesGreen: appChecks, oneSameRunReceipt } : {}) },
+      injectedEvidence: { runId, receiptAuditKeyMismatchFirst: true, sourceFiles, failureIds,
+        ...(kaist ? { app: { slug: appSlug, source: existsSync(templateManifestPath) ? 'template app.yaml' : 'app.yaml draft fixture', manifestValid: appManifest?.ok === true,
+          simulatedUrl: appUrl, externalNetworkAttempts: 0, injectedSearchResponse: beforeSearch?.status,
+          injectedHomeHasSearchLink: beforeHome?.body.includes('/search') ?? false,
+          deployedRepairFiles, deployedRepairArtifactPaths, repairedRouteStatuses: Object.fromEntries(appRouteChecks.map(([route, response]) => [route, response.status])), oneSameRunReceipt },
+          incidentPlan: macro.cases.map(({ plan }) => ({ label: plan.label, step: plan.step, files: plan.files })) } : {}),
+        receiptAuditFirstOutcome: firstReceiptAudit?.outcome, receiptAuditFailTarget,
+        graphRepairChecks: macro.graphRepairChecks, graphRepairFailureIds: macro.graphRepairFailureIds,
+        graphRepairInputFiles: macro.graphRepairInputFiles, graphRepairInputGateExecutionId: macro.graphRepairInputGateExecutionId,
+        ...(kaist ? { repairNodeResults: macro.graphState.nodes.filter((node) => /^gate-repair-[a-f0-9]{12}$/.test(node.nodeId))
+          .map((node) => ({ nodeId: node.nodeId, output: outputRecord(node.output) })) } : {}),
+        productionTriageEvidence: macro.productionTriageEvidence,
+        graphPath: path, runtimeDecisions: macro.runtimeDecisions },
+      ledgerEvents: macro.eventTrace as unknown as Array<Record<string, unknown>>, statePath: macro.graphState.statePath ?? '' };
   }
   const runId = `release-sim-${scenario.id}-${item.id}`;
   const ledgerEvents: Array<Record<string, unknown>> = [];
@@ -2032,7 +2507,7 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
   };
   const capture = (event: string, data: Record<string, unknown>) => ledgerEvents.push({ event, ...data });
 
-  if (item.mode === 'gate-waive-introduced-regression' || item.mode === 'owner-waive-unmeasured-gate' || item.mode === 'owner-waive-0246-fixture') return runGateWaiveCase(scenario, item, root, edges,
+  if (item.mode === 'gate-waive-introduced-regression' || item.mode === 'owner-waive-unmeasured-gate' || item.mode === 'owner-waive-0246-fixture' || item.mode === 'owner-waive-downstream-failure') return runGateWaiveCase(scenario, item, root, edges,
     item.unmeasuredGateShape ? sharedUnmeasuredGateFixture : undefined);
 
   if (item.mode === 'approval-graph-path-mismatch') {
@@ -2114,6 +2589,27 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
     nodeTimings[overlapPair[1]]!.startedAtMs < nodeTimings[overlapPair[0]]!.endedAtMs);
   const ledgerOk = ledgerEvents.some((row) => row.event === 'node-start') && ledgerEvents.some((row) => row.event === 'node-end')
     && ledgerEvents.filter((row) => row.event === 'edge-observed').length === Math.max(0, path.length - 1);
+  if (item.mode === 'resume-fanout-branch-refused') {
+    const beforeResume = JSON.parse(readFileSync(state.statePath, 'utf8')) as GraphRunState;
+    const beforeFanouts = JSON.stringify(beforeResume.fanOuts ?? {});
+    let refusal = '';
+    try {
+      await runGraph(RELEASE_GRAPH, { resumeRunId: runId, fromNodeId: 'pwa', input: scenario.input, pinChildUniverse: true, quiet: true,
+        deps: { root, runBash, log: capture } });
+    } catch (error) { refusal = error instanceof Error ? error.message : String(error); }
+    const refused = item.expect.status === 'resume-refused'
+      && refusal.includes(item.expect.refusalIncludes ?? "--from cannot resume fan-out branch 'pwa'");
+    const persisted = JSON.parse(readFileSync(state.statePath, 'utf8')) as GraphRunState;
+    const persistedFanout = persisted.fanOuts?.['traffic-gate-passed:ok'];
+    const branchFailed = persistedFanout?.branches.pwa?.status === 'failed';
+    const sourceRetained = persistedFanout?.from === 'traffic-gate-passed';
+    const completeFanoutRetained = JSON.stringify(persisted.fanOuts ?? {}) === beforeFanouts;
+    const pass = refused && branchFailed && sourceRetained && completeFanoutRetained && visitOk && notVisitOk && ledgerOk && edgeIssues.length === 0;
+    return { id: item.id, pass, status: 'resume-refused', path, dispatchedNodes, unexpectedEdges: edgeIssues,
+      checks: { status: refused, mustVisit: visitOk && branchFailed && sourceRetained, mustNotVisit: notVisitOk, overlap: true, ledgerEvents: ledgerOk, completeFanoutRetained },
+      injectedEvidence: { refusal, branchFailed, source: persistedFanout?.from, branchFailedAfter: branchFailed, sourceRetainedAfter: sourceRetained, completeFanoutRetained },
+      fanOuts: state.fanOuts, nodeTimings, ledgerEvents, statePath: state.statePath };
+  }
   const eventTrace = checkExpectedEvents(item.expect.events, ledgerEvents);
   const actualGateOutput = state.nodes.find((node) => node.nodeId === 'gate')?.output;
   const actualTriageOutput = state.nodes.find((node) => node.nodeId === 'gate-triage')?.output;
@@ -2152,6 +2648,10 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
 }
 
 export async function runReleaseSimRigScenario(source: string): Promise<ReleaseSimRigResult> {
+  return runReleaseSimRigScenarioWithExecutor(source);
+}
+
+export async function runReleaseSimRigScenarioWithExecutor(source: string, options: { executorConcurrency?: number; supplementalFailureAt?: string } = {}): Promise<ReleaseSimRigResult> {
   const scenario = parseReleaseSimRigScenario(source);
   const root = getTestStateRoot();
   if (!root) throw new Error('release simulation rig requires --test isolated mode');
@@ -2160,7 +2660,8 @@ export async function runReleaseSimRigScenario(source: string): Promise<ReleaseS
   const sharedUnmeasuredGateFixture: SharedUnmeasuredGateFixture = {
     runId: `release-sim-${scenario.id}-unmeasured-gate-shared`, initialRuns: 0,
   };
-  for (const item of scenario.cases) cases.push(await runCase(scenario, item, root, edges, sharedUnmeasuredGateFixture));
+  for (const item of scenario.cases) cases.push(await runCase(scenario, item, root, edges, sharedUnmeasuredGateFixture,
+    options.executorConcurrency ?? SIM_GATE_EXECUTOR_CONCURRENCY, options.supplementalFailureAt));
   const result: ReleaseSimRigResult = { id: scenario.id, pass: cases.every((item) => item.pass), universe: root, cases,
     table: cases.map((item) => ({ scenario: item.id, path: item.path.join(' → '), status: item.status,
       unexpectedEdges: item.unexpectedEdges.length ? JSON.stringify(item.unexpectedEdges) : 'none' })),

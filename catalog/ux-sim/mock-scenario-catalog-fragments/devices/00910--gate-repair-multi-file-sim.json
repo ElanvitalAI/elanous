@@ -1,0 +1,14 @@
+{
+  "id": "gate-repair-multi-file-sim",
+  "name": "Gate repair multi-file parallel, coupled and partial-recovery simulation",
+  "checklistCells": ["GATE-REPAIR-MULTI-FILE"],
+  "implementation": ["src/ux-sim/gate-repair-multi-file-sim.ts", "scripts/release-loop/gate-repair-node.ts"],
+  "tests": ["src/ux-sim/gate-repair-multi-file-sim.test.ts", "scripts/release-loop/gate-repair-node.test.ts"],
+  "target": "Run the production gate repair coordinator with fake attribution and PR boundaries for 15 source files",
+  "inputs": ["15 attributed source files", "two coupled files sharing failing tests", "one failed repair child among otherwise successful children"],
+  "observations": ["each independent source starts exactly one child with at most two concurrent children", "coupled files do not start children", "repair feature files stay under an isolated temporary root", "successful repairs remain recorded while only failed and coupled files go to HITL with unique IDs", "landing-recovery output deduplicates repeated attribution"],
+  "entryCommands": ["bun test src/ux-sim/gate-repair-multi-file-sim.test.ts scripts/release-loop/gate-repair-node.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

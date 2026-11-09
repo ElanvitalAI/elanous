@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 import type { PoolDnsProbe } from './pod-lease.js';
 import { podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 import { decideMinihDrain, minihLocationFrom, minihStandardCapacity, parsePodPool, PodPoolScheduler, type PoolKubectl } from './pod-pool.js';

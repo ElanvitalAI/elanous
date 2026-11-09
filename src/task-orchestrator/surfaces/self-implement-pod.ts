@@ -143,6 +143,7 @@ export { POD_CHILD_REQUESTS } from './pod-lease.js';
 import { measurePoolLease, recommendConcurrency, POD_CHILD_REQUESTS, POD_SI_ADMISSION_CAP_BYTES, POD_HOST_LEASE_ANNOTATION, POD_JOB_TTL_AFTER_FINISHED_SECONDS, LEASE_KUBECTL_MAX_BUFFER, memoryQuantityBytes } from './pod-lease.js';
 import { ACTUAL_SUBSTRATE_ENV, RUN_CONTRACT_ENV, carryRunContract, completionFloorFor } from '../../self-implement/graph-run-contract.js';
 import { execFile, execFileSync, spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../util/spawn-sync-output.js';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -181,7 +182,8 @@ import { normalizeFallbackChain, type FallbackStep } from '../../oauth/fallback-
 import { goalTypeOf, type GoalType } from '../../../scripts/measure-pod-memory-by-goal.js';
 import { declaredGoalType, type GoalType as DeclaredGoalType } from '../../self-implement/goal-author.js';
 import { readPodMemoryAdvice, type PodMemoryAdvice } from '../../cli/pod-memory-advice.js';
-import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, getUserConfig, resolveRoleLlm, roleLlmEnvName, type UserConfig } from '../../user-config.js';
+import { DEFAULT_BUDGET_GATE_MAX_USED_PERCENT, getUserConfig, resolveRoleLlm, roleLlmEnvName } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 import { worktreeAddTimeoutSec } from '../../git-fs/worktree.js';
 import { podChildProviderOf, podChildProviderRefusal, type PodChildProvider } from './pod-child-providers.js';
 import { BEDROCK_POD_EGRESS_LABEL, bedrockPodEnv, checkBedrockPodSecret, type BedrockPodSpec } from './pod-bedrock-child.js';
@@ -406,6 +408,8 @@ export function podJobName(spaceId: string): string {
 /** The child LLM the Pod's delegated `harness say/ask` will be launched with — the question the host verdict answers. */
 export interface PodBudgetChildLlm { provider?: string; model?: string }
 
+export const HOST_BUDGET_SNAPSHOT_TIMEOUT_MS = 10_000;
+
 /** The one host-side budget verdict a Pod Job carries (BUDGET-SNAPSHOT-TO-POD). Fail-soft: no snapshot means the Pod marks the budget unmeasured. */
 function hostBudgetSnapshot(childLlm: PodBudgetChildLlm, options: PodSpawnOptions, env: NodeJS.ProcessEnv, job: string): Promise<BudgetSnapshot | undefined> | BudgetSnapshot | undefined {
   const unavailable = (error: unknown): undefined => {
@@ -419,7 +423,7 @@ function hostBudgetSnapshot(childLlm: PodBudgetChildLlm, options: PodSpawnOption
   if (!(measurement instanceof Promise)) return measurement;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<undefined>((resolve) => {
-    timer = setTimeout(() => resolve(unavailable(new Error('host budget snapshot timed out after 10s'))), 10_000);
+    timer = setTimeout(() => resolve(unavailable(new Error(`host budget snapshot timed out after ${HOST_BUDGET_SNAPSHOT_TIMEOUT_MS / 1_000}s`))), HOST_BUDGET_SNAPSHOT_TIMEOUT_MS);
   });
   return Promise.race([measurement, deadline]).catch(unavailable).finally(() => { if (timer) clearTimeout(timer); });
 }
@@ -774,7 +778,7 @@ function defaultReadKeyCache(name: string): string | undefined {
 }
 
 export function defaultGhToken(): string {
-  const r = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8' });
+  const r = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (r.status !== 0 || !r.stdout.trim()) throw new Error('gh auth token 실패 — 호스트에서 gh auth login');
   return r.stdout.trim();
 }
@@ -1554,7 +1558,9 @@ async function waitForRunningPod(kubectl: Kubectl, namespace: string, job: strin
 }
 
 function defaultGhComment(prNumber: number, body: string): void {
-  const r = spawnSync('gh', ['pr', 'comment', String(prNumber), '--body', body], { cwd: findGitDir(process.cwd())?.root ?? process.cwd(), encoding: 'utf8', timeout: 60_000 });
+  const r = spawnSync('gh', ['pr', 'comment', String(prNumber), '--body', body], {
+    cwd: findGitDir(process.cwd())?.root ?? process.cwd(), encoding: 'utf8', timeout: 60_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   if (r.status !== 0) throw new Error((r.stderr || r.error?.message || `gh exited ${r.status}`).trim().slice(0, 200));
 }
 
@@ -4721,7 +4727,9 @@ export function podImageFreshness(deps: {
   /** 지금 설정의 Pod 스킬 세트 해시(pod-skills.ts). 생략 시 — run 을 주입한 시험이면 대조하지 않고, 아니면 실제로 잰다. */
   skillsDigest?: () => string;
 } = {}): PodImageFreshness {
-  const run = deps.run ?? ((cmd, args) => { const r = spawnSync(cmd, [...args], { encoding: 'utf8', timeout: 20_000, ...(deps.cwd ? { cwd: deps.cwd } : {}) }); return { status: r.status, stdout: r.stdout ?? '' }; });
+  const run = deps.run ?? ((cmd, args) => { const r = spawnSync(cmd, [...args], {
+    encoding: 'utf8', timeout: 20_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER, ...(deps.cwd ? { cwd: deps.cwd } : {}),
+  }); return { status: r.status, stdout: r.stdout ?? '' }; });
   const image = deps.image ?? 'elanous-harness:local';
   const head = run('git', ['rev-parse', 'HEAD']);
   const headCommit = head.status === 0 ? head.stdout.trim() || null : null;

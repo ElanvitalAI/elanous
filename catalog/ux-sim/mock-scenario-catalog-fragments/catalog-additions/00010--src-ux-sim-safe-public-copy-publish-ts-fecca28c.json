@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/safe-public-copy-publish.ts",
+  "reason": "Post-inventory registration for SW-PUBLIC-COPY-LIVE-FU; the source snapshot and base commit remain unchanged."
+}

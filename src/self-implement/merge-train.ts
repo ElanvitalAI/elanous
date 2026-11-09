@@ -1,10 +1,11 @@
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
 import { planCulpritDriftRepair, type RepairPlan } from '../cli/pr-land-drift-repair.js';
 import { addedLines, checkTheirsLinesKept, collectConflictAnalysis, parseMergeTreeConflictPaths, planConflictRepair, type ConflictRepairPlan } from '../cli/pr-land-conflict-merge.js';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 
 export type TrainCandidate = { number: number; head: string; title?: string; body?: string; files?: string[]; filesUnmeasured?: boolean };
 export type TrainDeferred = { number: number; reason: 'overlap' | 'files-unknown'; with?: number[] };
@@ -87,14 +88,204 @@ function regularTextMode(revision: string, path: string, run: (args: string[]) =
   if (!match || match[2] !== path || (match[1] !== '100644' && match[1] !== '100755')) return undefined;
   return match[1];
 }
-const UX_SIM_CATALOG = 'src/ux-sim/mock-scenario-catalog.json';
+const UX_SIM_FRAGMENTS = 'catalog/ux-sim/mock-scenario-catalog-fragments';
+const SIM_WORLD_DEVICE_FRAGMENTS = 'catalog/sim-world-device-catalog-fragments';
 const UX_SIM_GENERATOR = 'scripts/generate-ux-sim-device-manual.ts';
+const SIM_WORLD_CATALOG_GENERATOR = 'scripts/generate-sim-world-device-catalogs.ts';
+const SIM_WORLD_CATALOG_HISTORY = 'src/sim-world-device-catalog-history.json';
 const UX_SIM_MODULE = 'src/ux-sim/mock-scenario-catalog.ts';
 const UX_SIM_MANUAL = 'docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md';
+const CLI_ANATOMY_GENERATOR = 'scripts/docs/generate-cli-anatomy.ts';
+const CLI_ANATOMY_OUTPUT = 'docs/generated/cli-anatomy.md';
+const UX_TRUSTED_GENERATOR_CODE = [UX_SIM_GENERATOR, SIM_WORLD_CATALOG_GENERATOR, UX_SIM_MODULE] as const;
+const CLI_TRUSTED_GENERATOR_CODE = [
+  CLI_ANATOMY_GENERATOR,
+  'scripts/docs/generate-graph-anatomy.ts',
+  'src/graph-kinds/registry.ts',
+  'src/self-implement/graph-yaml.ts',
+  'src/self-implement/graph-run-contract.ts',
+  'src/self-implement/graph-overlay-condition.ts',
+  'src/self-implement/graph-unit-resolver.ts',
+  'src/self-implement/graph-unit-flatten.ts',
+  'src/elanous-config-dir.ts',
+  'src/debug/log.ts',
+] as const;
+const UX_SIM_GENERATOR_OUTPUTS = [UX_SIM_MANUAL] as const;
+const SIM_WORLD_GENERATOR_OUTPUTS = [SIM_WORLD_CATALOG_HISTORY] as const;
+const CLI_ANATOMY_GENERATOR_OUTPUTS = [CLI_ANATOMY_OUTPUT] as const;
+const GENERATED_OUTPUTS = [...UX_SIM_GENERATOR_OUTPUTS, ...SIM_WORLD_GENERATOR_OUTPUTS, ...CLI_ANATOMY_GENERATOR_OUTPUTS] as const;
 
-/** Run the base-pinned real generator against merged data without checking out or changing a ref. */
-function regenerateUxSimManual(repo: string, baseSha: string, tree: string, run: (args: string[], env?: NodeJS.ProcessEnv) => ReturnType<TrainGit>): string {
+const CONDUCTOR_CELLS = 'docs/conductor/cells';
+const CONDUCTOR_GENERATOR = 'scripts/generate-conductor-cell-map.ts';
+const CONDUCTOR_DOCUMENT = 'docs/conductor/CONDUCTOR.md';
+
+function conductorCellFragmentPaths(paths: ReadonlySet<string>): string[] {
+  const prefix = `${CONDUCTOR_CELLS}/`;
+  return [...paths].filter((path) => path.startsWith(prefix) && path.endsWith('.md'));
+}
+
+function simWorldDeviceFragmentPaths(paths: ReadonlySet<string>): string[] {
+  const prefix = `${SIM_WORLD_DEVICE_FRAGMENTS}/`;
+  return [...paths].filter((path) => path.startsWith(prefix) && path.endsWith('.json'));
+}
+
+function withoutGeneratedManualBlock(text: string): string {
+  const begin = '<!-- BEGIN GENERATED MOCK DEVICE CATALOG -->';
+  const end = '<!-- END GENERATED MOCK DEVICE CATALOG -->';
+  const start = text.indexOf(begin);
+  const finish = text.indexOf(end, start + begin.length);
+  if (start < 0 || finish < 0 || text.indexOf(begin, start + begin.length) >= 0
+      || text.indexOf(end, finish + end.length) >= 0) {
+    throw new Error('UX simulation manual has an invalid generated-block boundary');
+  }
+  return `${text.slice(0, start)}<GENERATED>${text.slice(finish + end.length)}`;
+}
+
+function readGeneratedOutput(worktree: string, path: string): string | undefined {
+  const root = realpathSync(worktree);
+  let current = root;
+  const segments = path.split('/');
+  for (const [index, segment] of segments.entries()) {
+    current = join(current, segment);
+    let stat;
+    try {
+      stat = lstatSync(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) throw new Error(`generated output path contains a symbolic link: ${path}`);
+    const isFile = index === segments.length - 1;
+    if (isFile ? !stat.isFile() : !stat.isDirectory()) {
+      throw new Error(`generated output path has an unexpected filesystem entry: ${path}`);
+    }
+  }
+  return readFileSync(current, 'utf8');
+}
+
+type GeneratorSpawnResult = { status: number | null; stdout: string; stderr: string; error?: NodeJS.ErrnoException };
+type GeneratorSpawn = (command: string, args: string[], options: SpawnSyncOptionsWithStringEncoding) => GeneratorSpawnResult;
+
+export function runGeneratorWithTimeout(
+  script: string,
+  options: SpawnSyncOptionsWithStringEncoding,
+  spawn: GeneratorSpawn = (command, args, spawnOptions) => spawnSync(command, args, {
+    ...spawnOptions,
+    maxBuffer: spawnOptions.maxBuffer ?? SPAWN_SYNC_MAX_BUFFER,
+  }),
+): GeneratorSpawnResult {
+  return spawn(process.execPath, [script], options);
+}
+
+/** Run the fixed generator allowlist against the exact full integrated tree in a disposable git worktree. */
+function regenerateUxSimArtifacts(repo: string, inputBaseSha: string, parentSha: string, tree: string, run: (args: string[], env?: NodeJS.ProcessEnv) => ReturnType<TrainGit>): string {
   const workspace = mkdtempSync(join(tmpdir(), 'elanous-ux-sim-train-'));
+  const indexPath = join(workspace, 'index');
+  const worktree = join(workspace, 'integrated');
+  const env = { ...process.env, GIT_INDEX_FILE: indexPath };
+  const readTreeFile = (path: string, revision = tree) => {
+    const result = run(['show', `${revision}:${path}`]);
+    if (result.status !== 0) throw new Error(`merged tree is missing ${path}: ${result.stderr || result.stdout}`);
+    return result.stdout;
+  };
+  let addedWorktree = false;
+  try {
+    const temporaryCommit = run(['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost',
+      'commit-tree', tree, '-p', parentSha, '-m', 'Temporary integrated tree for generated outputs']);
+    if (temporaryCommit.status !== 0 || !SHA.test(temporaryCommit.stdout.trim())) {
+      throw new Error(`could not materialize integrated generator tree: ${temporaryCommit.stderr || temporaryCommit.stdout}`);
+    }
+    const changed = run(['diff', '--name-only', `${inputBaseSha}..${temporaryCommit.stdout.trim()}`]);
+    if (changed.status !== 0) throw new Error(`could not inspect generator changes: ${changed.stderr || changed.stdout}`);
+    const changedInputs = new Set(changed.stdout.split('\n').filter(Boolean));
+    const uxCodeChanged = UX_TRUSTED_GENERATOR_CODE.some((path) => changedInputs.has(path));
+    const cliCodeChanged = CLI_TRUSTED_GENERATOR_CODE.some((path) => changedInputs.has(path))
+      || [...changedInputs].some((path) => path.startsWith('src/') && !path.startsWith('src/cli/'));
+    const worktreeAdd = run(['worktree', 'add', '--detach', worktree, temporaryCommit.stdout.trim()]);
+    if (worktreeAdd.status !== 0) throw new Error(`could not create integrated generator worktree: ${worktreeAdd.stderr || worktreeAdd.stdout}`);
+    addedWorktree = true;
+    // Execute only generator code from the trusted base. Candidate fragments and CLI source remain data inputs.
+    const trustedCode = [...new Set([
+      ...(!uxCodeChanged ? UX_TRUSTED_GENERATOR_CODE : []),
+      ...(!cliCodeChanged ? CLI_TRUSTED_GENERATOR_CODE : []),
+    ])].filter((path) => regularTextMode(inputBaseSha, path, (args) => run(args)) !== undefined);
+    if (trustedCode.length) {
+      const restore = run(['-C', worktree, 'restore', '--source', inputBaseSha, '--worktree', '--', ...trustedCode]);
+      if (restore.status !== 0) throw new Error(`could not restore trusted generator code: ${restore.stderr || restore.stdout}`);
+    }
+    const dependencies = join(repo, 'node_modules');
+    if (existsSync(dependencies)) symlinkSync(realpathSync(dependencies), join(worktree, 'node_modules'), 'dir');
+    mkdirSync(join(workspace, '.bun'), { recursive: true });
+
+    const generatorOptions: SpawnSyncOptionsWithStringEncoding = {
+      cwd: worktree,
+      env: { PATH: '/usr/bin:/bin', HOME: workspace, TMPDIR: workspace, BUN_INSTALL_CACHE_DIR: join(workspace, '.bun'), NODE_ENV: 'production' },
+      encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+    };
+    const generatedPaths = new Set<string>();
+    const snapshotOutputs = () => new Map((GENERATED_OUTPUTS as readonly string[]).map((path) => [
+      path, readGeneratedOutput(worktree, path),
+    ]));
+    const changedTreePaths = () => {
+      const changed = run(['-C', worktree, 'ls-files', '--modified', '--others', '--exclude-standard']);
+      if (changed.status !== 0) throw new Error(`could not inspect generated tree changes: ${changed.stderr || changed.stdout}`);
+      return new Set(changed.stdout.split('\n').map((line) => line.trim()).filter(Boolean));
+    };
+    const runJob = (script: string, label: string, allowedOutputs: readonly string[]) => {
+      const before = snapshotOutputs();
+      const pathsBefore = changedTreePaths();
+      const generator = runGeneratorWithTimeout(script, generatorOptions);
+      if (generator.status !== 0) throw new Error(`${label} failed: ${generator.stderr || generator.stdout || generator.error?.message}`);
+      const after = snapshotOutputs();
+      const modifiedOutputs = [...after.keys()].filter((path) => before.get(path) !== after.get(path));
+      const forbiddenOutputs = modifiedOutputs.filter((path) => !allowedOutputs.includes(path));
+      if (forbiddenOutputs.length) throw new Error(`${label} changed outputs outside its generator allowlist: ${forbiddenOutputs.join(', ')}`);
+      const unexpected = [...changedTreePaths()].filter((path) => !pathsBefore.has(path) && !(GENERATED_OUTPUTS as readonly string[]).includes(path));
+      if (unexpected.length) throw new Error(`${label} changed paths outside output allowlist: ${unexpected.join(', ')}`);
+      for (const path of modifiedOutputs) generatedPaths.add(path);
+    };
+    if (!uxCodeChanged) {
+      runJob(UX_SIM_GENERATOR, 'UX simulation manual generator', UX_SIM_GENERATOR_OUTPUTS);
+      const afterManual = readFileSync(join(worktree, UX_SIM_MANUAL), 'utf8');
+      if (withoutGeneratedManualBlock(readTreeFile(UX_SIM_MANUAL)) !== withoutGeneratedManualBlock(afterManual)) {
+        throw new Error('UX simulation manual generator changed human-authored content outside generated block');
+      }
+      runJob(SIM_WORLD_CATALOG_GENERATOR, 'simulation world device catalog generator', SIM_WORLD_GENERATOR_OUTPUTS);
+    }
+    const shouldGenerateCli = [...changedInputs].some((path) => path.startsWith('src/cli/'));
+    if (shouldGenerateCli && !cliCodeChanged) {
+      runJob(CLI_ANATOMY_GENERATOR, 'CLI anatomy generator', CLI_ANATOMY_GENERATOR_OUTPUTS);
+    }
+    const changedPaths = [...generatedPaths].sort();
+    if (changedPaths.length === 0) return tree;
+
+    const generatedFiles = changedPaths.map((path) => ({
+      path,
+      file: join(worktree, path),
+    }));
+    const blobs = generatedFiles.map(({ path, file }) => {
+      const result = run(['hash-object', '-w', '--', file]);
+      if (result.status !== 0 || !SHA.test(result.stdout.trim())) throw new Error(`git hash-object ${path}: ${result.stderr || result.stdout}`);
+      return { path, oid: result.stdout.trim() };
+    });
+    const readIndex = run(['read-tree', tree], env);
+    if (readIndex.status !== 0) throw new Error(`git read-tree: ${readIndex.stderr || readIndex.stdout}`);
+    for (const { path, oid } of blobs) {
+      const update = run(['update-index', '--add', '--cacheinfo', `100644,${oid},${path}`], env);
+      if (update.status !== 0) throw new Error(`git update-index ${path}: ${update.stderr || update.stdout}`);
+    }
+    const regeneratedTree = run(['write-tree'], env);
+    if (regeneratedTree.status !== 0 || !SHA.test(regeneratedTree.stdout.trim())) throw new Error(`git write-tree: ${regeneratedTree.stderr || regeneratedTree.stdout}`);
+    return regeneratedTree.stdout.trim();
+  } finally {
+    if (addedWorktree) run(['worktree', 'remove', '--force', worktree]);
+    rmSync(workspace, { recursive: true, force: true });
+  }
+}
+
+/** Regenerate the shared conductor index from trusted code and merged per-document fragments. */
+function regenerateConductorCellMap(repo: string, baseSha: string, tree: string, run: (args: string[], env?: NodeJS.ProcessEnv) => ReturnType<TrainGit>): string {
+  const workspace = mkdtempSync(join(tmpdir(), 'elanous-conductor-cells-train-'));
   const indexPath = join(workspace, 'index');
   const env = { ...process.env, GIT_INDEX_FILE: indexPath };
   const readTreeFile = (path: string, revision = tree) => {
@@ -103,29 +294,34 @@ function regenerateUxSimManual(repo: string, baseSha: string, tree: string, run:
     return result.stdout;
   };
   try {
-    for (const file of [UX_SIM_GENERATOR, UX_SIM_MODULE, UX_SIM_CATALOG, UX_SIM_MANUAL]) {
+    for (const file of [CONDUCTOR_GENERATOR, CONDUCTOR_DOCUMENT]) {
       const destination = join(workspace, file);
       mkdirSync(join(destination, '..'), { recursive: true });
-      // Execute only the generator and renderer module from the pinned base. PR-controlled
-      // catalog JSON and manual text are data inputs, never executable code.
-      writeFileSync(destination, readTreeFile(file, file === UX_SIM_GENERATOR || file === UX_SIM_MODULE ? baseSha : tree));
+      writeFileSync(destination, readTreeFile(file, file === CONDUCTOR_GENERATOR ? baseSha : tree));
     }
-    // A PR may change generator code. The train deliberately runs the trusted base version;
-    // generator changes are exercised by that PR's tests and become the trusted version after landing.
+    const cellPaths = run(['ls-tree', '-r', '--name-only', tree, '--', CONDUCTOR_CELLS]);
+    if (cellPaths.status !== 0) throw new Error(`merged conductor cell fragments are unreadable: ${cellPaths.stderr || cellPaths.stdout}`);
+    const files = cellPaths.stdout.split('\n').filter((path) => path.endsWith('.md'));
+    if (!files.length) throw new Error('merged conductor cell fragments are empty');
+    for (const file of files) {
+      const destination = join(workspace, file);
+      mkdirSync(join(destination, '..'), { recursive: true });
+      writeFileSync(destination, readTreeFile(file));
+    }
     const generatorOptions: SpawnSyncOptionsWithStringEncoding = {
       cwd: workspace,
       env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: workspace, TMPDIR: workspace, NODE_ENV: 'production' },
       encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
     };
-    const generator = spawnSync('bun', [UX_SIM_GENERATOR], generatorOptions);
-    if (generator.status !== 0) throw new Error(`UX simulation manual generator failed: ${generator.stderr || generator.stdout || generator.error?.message}`);
+    const generator = spawnSync('bun', [CONDUCTOR_GENERATOR], generatorOptions);
+    if (generator.status !== 0) throw new Error(`conductor cell-map generator failed: ${generator.stderr || generator.stdout || generator.error?.message}`);
 
-    const generatedManual = join(workspace, UX_SIM_MANUAL);
-    const blob = run(['hash-object', '-w', '--', generatedManual]);
+    const generatedDocument = join(workspace, CONDUCTOR_DOCUMENT);
+    const blob = run(['hash-object', '-w', '--', generatedDocument]);
     if (blob.status !== 0 || !SHA.test(blob.stdout.trim())) throw new Error(`git hash-object: ${blob.stderr || blob.stdout}`);
     const readIndex = run(['read-tree', tree], env);
     if (readIndex.status !== 0) throw new Error(`git read-tree: ${readIndex.stderr || readIndex.stdout}`);
-    const update = run(['update-index', '--add', '--cacheinfo', `100644,${blob.stdout.trim()},${UX_SIM_MANUAL}`], env);
+    const update = run(['update-index', '--add', '--cacheinfo', `100644,${blob.stdout.trim()},${CONDUCTOR_DOCUMENT}`], env);
     if (update.status !== 0) throw new Error(`git update-index: ${update.stderr || update.stdout}`);
     const regeneratedTree = run(['write-tree'], env);
     if (regeneratedTree.status !== 0 || !SHA.test(regeneratedTree.stdout.trim())) throw new Error(`git write-tree: ${regeneratedTree.stderr || regeneratedTree.stdout}`);
@@ -140,7 +336,6 @@ function regenerateUxSimManual(repo: string, baseSha: string, tree: string, run:
 function uxSimMergeDriverArgs(repo: string): string[] {
   const driver = resolve(repo, 'scripts/ux-sim-merge-driver.mjs');
   return [
-    '-c', `merge.uxsim-catalog.driver=node \"${driver}\" catalog \"%O\" \"%A\" \"%B\"`,
     '-c', `merge.uxsim-manual.driver=node \"${driver}\" manual \"%O\" \"%A\" \"%B\"`,
   ];
 }
@@ -235,11 +430,18 @@ export function integrateTrain(repo: string, baseSha: string, batch: readonly Tr
         if (basePathsResult.status !== 0 || mergedPathsResult.status !== 0) return { conflicts: [...conflicts, { number: item.number, reason: 'conflict', files: parsed.paths }], conflictPlans: conflictPlans.map((entry) => entry.number === item.number ? { ...entry, repairPlan: { decision: 'escalate', reason: 'generated-input-inventory-unmeasured' } } : entry), unmeasured: true };
         const basePaths = new Set(basePathsResult.stdout.split('\n'));
         const mergedPaths = new Set(mergedPathsResult.stdout.split('\n'));
-        if (basePaths.has(UX_SIM_CATALOG)) {
-          for (const path of [UX_SIM_GENERATOR, UX_SIM_MODULE, UX_SIM_CATALOG, UX_SIM_MANUAL]) {
+        if (basePaths.has(`${UX_SIM_FRAGMENTS}/metadata.json`)) {
+          const simWorldFragments = simWorldDeviceFragmentPaths(basePaths);
+          for (const path of [`${UX_SIM_FRAGMENTS}/metadata.json`, UX_SIM_MANUAL, SIM_WORLD_CATALOG_HISTORY,
+            ...simWorldFragments, `${SIM_WORLD_DEVICE_FRAGMENTS}/metadata.json`]) {
             if (!basePaths.has(path) || !mergedPaths.has(path)) return { conflicts: [...conflicts, { number: item.number, reason: 'conflict', files: parsed.paths }], conflictPlans: conflictPlans.map((entry) => entry.number === item.number ? { ...entry, repairPlan: { decision: 'escalate', reason: `generated-input-missing:${path}` } } : entry), unmeasured: true };
           }
-          integratedTree = regenerateUxSimManual(repo, baseSha, integratedTree, (args, generatorEnv) => git(args, repo, generatorEnv));
+        }
+        const conductorPaths = conductorCellFragmentPaths(basePaths);
+        if (conductorPaths.length > 0) {
+          for (const path of [CONDUCTOR_GENERATOR, CONDUCTOR_DOCUMENT, ...conductorPaths]) {
+            if (!basePaths.has(path) || !mergedPaths.has(path)) return { conflicts: [...conflicts, { number: item.number, reason: 'conflict', files: parsed.paths }], conflictPlans: conflictPlans.map((entry) => entry.number === item.number ? { ...entry, repairPlan: { decision: 'escalate', reason: `generated-input-missing:${path}` } } : entry), unmeasured: true };
+          }
         }
         const commit = run(['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost', 'commit-tree', integratedTree, '-p', current, '-p', item.head, '-m', 'Integrate append-only conflict in merge train shadow']);
         if (commit.status !== 0 || !SHA.test(commit.stdout.trim())) return { conflicts: [...conflicts, { number: item.number, reason: 'conflict', files: parsed.paths }], conflictPlans: conflictPlans.map((entry) => entry.number === item.number ? { ...entry, repairPlan: { decision: 'escalate', reason: 'merged-commit-write-failed' } } : entry), unmeasured: true };
@@ -258,19 +460,63 @@ export function integrateTrain(repo: string, baseSha: string, batch: readonly Tr
     }
     const basePaths = new Set(basePathsResult.stdout.split('\n'));
     const mergedPaths = new Set(mergedPathsResult.stdout.split('\n'));
-    const baseHasCatalog = basePaths.has(UX_SIM_CATALOG);
-    const mergedHasCatalog = mergedPaths.has(UX_SIM_CATALOG);
-    if (baseHasCatalog && !mergedHasCatalog) throw new Error('merged UX simulation catalog was removed');
-    if (!baseHasCatalog && mergedHasCatalog) throw new Error('UX simulation catalog requires a trusted generator in the train base');
-    if (baseHasCatalog) {
-      for (const path of [UX_SIM_GENERATOR, UX_SIM_MODULE, UX_SIM_MANUAL]) {
+    const baseHasFragments = basePaths.has(`${UX_SIM_FRAGMENTS}/metadata.json`);
+    const mergedHasFragments = mergedPaths.has(`${UX_SIM_FRAGMENTS}/metadata.json`);
+    if (baseHasFragments && !mergedHasFragments) throw new Error('merged UX simulation fragments were removed');
+    if (baseHasFragments) {
+      const simWorldFragments = simWorldDeviceFragmentPaths(basePaths);
+      for (const path of [`${UX_SIM_FRAGMENTS}/metadata.json`, UX_SIM_MANUAL, SIM_WORLD_CATALOG_HISTORY,
+        `${SIM_WORLD_DEVICE_FRAGMENTS}/metadata.json`, ...simWorldFragments]) {
         if (!basePaths.has(path) || !mergedPaths.has(path)) throw new Error(`UX simulation generation input missing from train tree: ${path}`);
       }
-      tree = regenerateUxSimManual(repo, baseSha, tree, (args, env) => git(args, repo, env));
+    }
+    const baseConductorPaths = conductorCellFragmentPaths(basePaths);
+    const mergedConductorPaths = conductorCellFragmentPaths(mergedPaths);
+    if (baseConductorPaths.length > 0 && mergedConductorPaths.length === 0) throw new Error('merged conductor cell fragments were removed');
+    if (baseConductorPaths.length > 0) {
+      for (const path of [CONDUCTOR_GENERATOR, CONDUCTOR_DOCUMENT, ...baseConductorPaths]) {
+        if (!basePaths.has(path) || !mergedPaths.has(path)) throw new Error(`conductor cell-map generation input missing from train tree: ${path}`);
+      }
     }
     const commit = run(['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost', 'commit-tree', tree, '-p', current, '-p', item.head, '-m', 'Integrate PR for merge train shadow evaluation']);
     if (commit.status !== 0 || !SHA.test(commit.stdout.trim())) throw new Error(`git commit-tree: ${commit.stderr || commit.stdout}`);
     current = commit.stdout.trim();
+  }
+  const integratedTree = run(['rev-parse', `${current}^{tree}`]);
+  if (integratedTree.status !== 0 || !SHA.test(integratedTree.stdout.trim())) {
+    throw new Error(`cannot inspect final integrated train tree: ${integratedTree.stderr || integratedTree.stdout}`);
+  }
+  const initialPaths = run(['ls-tree', '-r', '--name-only', baseSha]);
+  const finalPaths = run(['ls-tree', '-r', '--name-only', integratedTree.stdout.trim()]);
+  if (initialPaths.status !== 0 || finalPaths.status !== 0) throw new Error('cannot inspect final generated-output inventory');
+  const initialPathSet = new Set(initialPaths.stdout.split('\n'));
+  const finalPathSet = new Set(finalPaths.stdout.split('\n'));
+  let finalOutputTree = integratedTree.stdout.trim();
+  if (initialPathSet.has(`${UX_SIM_FRAGMENTS}/metadata.json`)) {
+    const simWorldFragments = simWorldDeviceFragmentPaths(initialPathSet);
+    for (const path of [`${UX_SIM_FRAGMENTS}/metadata.json`, UX_SIM_MANUAL, SIM_WORLD_CATALOG_HISTORY,
+      `${SIM_WORLD_DEVICE_FRAGMENTS}/metadata.json`, ...simWorldFragments]) {
+      if (!initialPathSet.has(path) || !finalPathSet.has(path)) throw new Error(`UX simulation generation input missing from final train tree: ${path}`);
+    }
+    const regeneratedTree = regenerateUxSimArtifacts(repo, baseSha, current, finalOutputTree, (args, env) => git(args, repo, env));
+    if (regeneratedTree !== finalOutputTree) {
+      const commit = run(['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost', 'commit-tree', regeneratedTree, '-p', current, '-m', 'Regenerate generated outputs after merge train integration']);
+      if (commit.status !== 0 || !SHA.test(commit.stdout.trim())) throw new Error(`generated-output commit: ${commit.stderr || commit.stdout}`);
+      current = commit.stdout.trim();
+      finalOutputTree = regeneratedTree;
+    }
+  }
+  const initialConductorPaths = conductorCellFragmentPaths(initialPathSet);
+  if (initialConductorPaths.length > 0) {
+    for (const path of [CONDUCTOR_GENERATOR, CONDUCTOR_DOCUMENT, ...initialConductorPaths]) {
+      if (!initialPathSet.has(path) || !finalPathSet.has(path)) throw new Error(`conductor cell-map generation input missing from final train tree: ${path}`);
+    }
+    const regeneratedTree = regenerateConductorCellMap(repo, baseSha, finalOutputTree, (args, env) => git(args, repo, env));
+    if (regeneratedTree !== finalOutputTree) {
+      const commit = run(['-c', 'user.name=elanous shadow', '-c', 'user.email=shadow@localhost', 'commit-tree', regeneratedTree, '-p', current, '-m', 'Regenerate conductor cell map after merge train integration']);
+      if (commit.status !== 0 || !SHA.test(commit.stdout.trim())) throw new Error(`conductor cell-map output commit: ${commit.stderr || commit.stdout}`);
+      current = commit.stdout.trim();
+    }
   }
   return { commitSha: current, conflicts, ...(conflictPlans.length ? { conflictPlans } : {}) };
 }
@@ -283,12 +529,7 @@ export async function runTrain(batch: readonly TrainCandidate[], deps: {
   tangledPairs?: readonly TangledPair[];
   classifyCulprit?: (pr: number) => RepairPlan;
   onCulpritPlans?: (plans: { pr: number; plan: RepairPlan | { action: 'reorder'; with: number } }[]) => void | Promise<void>;
-  /**
-   * Optional simulation/live adapter hook. A stable progressId is required when emitting events.
-   * The batch event is emitted before integration; rejection aborts before train work starts.
-   * The verdict event follows observe and culprit-plan delivery; callback failure rejects the run
-   * without publishing a verdict, while verdict-sink failure rejects after train work completed.
-   */
+  /** Optional adapter hook; progressId must be stable when progress events are enabled. */
   progressId?: string;
   emitProgress?: (event: TrainProgressEvent) => void | Promise<void>;
 }): Promise<{ verdicts: TrainVerdict[]; gatesRun: number; integrations: number }> {

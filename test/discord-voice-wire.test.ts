@@ -25,7 +25,7 @@ import type { StreamingSTTOpts, StreamingSTTProvider } from '../src/voice/stream
 import type { TTSProvider } from '../src/voice/tts/tts-provider.js';
 import type { runTurn } from '../src/session/chat.js';
 import type { DcIncoming } from '../src/discord.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 
 let stateDir = '';
 const envBackup: Record<string, string | undefined> = {};

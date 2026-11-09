@@ -10,10 +10,11 @@ export interface AskBareDeps {
   trimToBudget: typeof trimToBudget;
 }
 
-export async function askBare({ text, provider, model, deps }: {
+export async function askBare({ text, provider, model, onDelta, deps }: {
   text: string;
   provider?: string;
   model?: string;
+  onDelta?: (delta: string) => void;
   deps: AskBareDeps;
 }): Promise<{ provider: string; model: string; reply: string }> {
   const messages: LLMMessage[] = [{ role: 'user', content: text }];
@@ -33,7 +34,7 @@ export async function askBare({ text, provider, model, deps }: {
   const chosenProvider = deps.getProviderForConfig(selectedConfig, model);
   let resolvedProvider = chosenProvider.name;
   let resolvedModel = selected.model;
-  const reply = await deps.streamLLM(messages, () => {}, {
+  const reply = await deps.streamLLM(messages, (delta) => onDelta?.(delta), {
     ...(provider === undefined ? { initialProvider: chosenProvider } : { provider: chosenProvider }),
     ...(selected.model === '(none)' ? {} : { model: selected.model }),
     onResolvedProvider: (name, activeModel) => { resolvedProvider = name; resolvedModel = activeModel; },

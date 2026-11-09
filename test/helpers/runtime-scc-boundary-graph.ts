@@ -13,11 +13,13 @@ export const RUNTIME_SCC_BOUNDARY_ROOTS: ReadonlySet<string> = new Set([
   'apps/pwa/src/components/chat/SessionIdChip.tsx', 'apps/pwa/src/components/chat/SessionPill.tsx',
 ]);
 
-let sharedGraph: ClosureGraph | undefined;
+const graphs = new Map<string, ClosureGraph>();
 
-/** Parse the union of the five SCC boundaries once and retain the complete tracked set for import resolution. */
-export function runtimeSccBoundaryGraph(): ClosureGraph {
-  if (sharedGraph) return sharedGraph;
+/** Follow the requested boundary's import closure while retaining all tracked files for resolution. */
+export function runtimeSccBoundaryGraph(roots: readonly string[]): ClosureGraph {
+  const key = [...roots].sort().join('\n');
+  const cached = graphs.get(key);
+  if (cached) return cached;
   const files = execFileSync('git', ['ls-files', '-co', '--exclude-standard'], {
     encoding: 'utf8', maxBuffer: 256 * 1024 * 1024,
   }).split('\n').filter(Boolean);
@@ -37,15 +39,17 @@ export function runtimeSccBoundaryGraph(): ClosureGraph {
       aliases.push({ scope, prefix: key.slice(0, -1), target: normalize(join(base, targets[0].slice(0, -1))).replace(/\/$/, '') });
     }
   }
-  sharedGraph = buildClosureGraph({
+  const graph = buildClosureGraph({
     files,
-    roots: [...RUNTIME_SCC_BOUNDARY_ROOTS],
+    roots: [...roots],
     preload: [],
     aliases,
     read: (path) => {
       try { return readFileSync(path, 'utf8'); }
       catch { return undefined; }
     },
-  });
-  return sharedGraph;
+  }, { staticImportsOnly: true });
+  if (graph.opaque.size) throw new Error(`runtime SCC import graph is incomplete: ${[...graph.opaque].map(([file, why]) => `${file}: ${why}`).join('; ')}`);
+  graphs.set(key, graph);
+  return graph;
 }

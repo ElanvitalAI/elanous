@@ -1,0 +1,27 @@
+{
+  "id": "SIM-FAKE-PROVIDERS-AV",
+  "name": "Fake ElevenLabs TTS and STT providers",
+  "implementation": [
+    "src/ux-sim/fake-elevenlabs.ts",
+    "src/ux-sim/fake-stt.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-provider-av.test.ts"
+  ],
+  "target": "Loopback ElevenLabs TTS and deterministic fingerprint-based STT provider contracts",
+  "inputs": [
+    "API key and text",
+    "recording bytes and language",
+    "failure, delay, and empty transcript variants"
+  ],
+  "observations": [
+    "TTS status, Retry-After, deterministic audio bytes, and request records",
+    "STT sha256 fingerprint, transcript, language, and error code"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-provider-av.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

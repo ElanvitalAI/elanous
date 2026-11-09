@@ -17,14 +17,14 @@ import { join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
 import { runGraph } from '../graph-runner/runner.js';
 import { psProcessStartMs } from '../harness/harness-stop.js';
-import { releaseLedgerRoot } from '../instance/resolve.js';
+import { prodInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { codeRevision, setCodeRevisionRootForTesting } from '../version/code-revision.js';
 import { enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { fileLeaseStore, serializeLease } from '../hq/lease.js';
 import type { HqDeps } from '../hq/hq.js';
-import { formatResumeGatePlan, isPrerelease, isReleaseVersion, planPublish, prepareRelease, publishRelease, registerReleaseCommands, runReleaseInstaller, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
+import { formatResumeGatePlan, GATE_SHARD_JSON_PAGE_MAX_BYTES, isPrerelease, isReleaseVersion, planPublish, prepareRelease, publishRelease, registerReleaseCommands as registerReleaseCommandsImpl, runReleaseInstaller, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 import { readActiveForceReleaseRun } from './release-single-flight.js';
-import { appendGateShardLedger, gateShardLedgerPath, type GateShardLedgerRow } from '../release-loop/gate-shard-ledger.js';
+import { appendGateShardLedger, gateShardLedgerPath, readGateShardLedger, type GateShardLedgerRow } from '../release-loop/gate-shard-ledger.js';
 import { simCli } from '../ux-sim/in-process-cli.js';
 import { runGateNode } from '../../scripts/release-loop/gate-node.js';
 
@@ -49,6 +49,11 @@ const frozenGateRunner = {
   sweep: async () => ({ rc: 0, output: '' }),
   add: async () => {}, remove: async () => {}, snapshot: async () => {}, removeSnapshot: async () => {},
 } as never;
+
+const registerReleaseCommands: typeof registerReleaseCommandsImpl = (...args) => {
+  const [program, releaseRunDeps = {}, ...rest] = args;
+  registerReleaseCommandsImpl(program, { assertCliCurrent: () => {}, ...releaseRunDeps }, ...rest);
+};
 
 test('release resume plan shows corrupt shard IDs in the partial gate label', () => {
   expect(formatResumeGatePlan('partial', undefined, { requested: true, applied: true, files: 2,
@@ -101,7 +106,7 @@ test('release gate-shards CLI names a missing ledger and reads measured rows as 
   const root = mkdtempSync(join(tmpdir(), 'release-gate-shards-cli-'));
   const command = () => { const program = new Command(); registerReleaseCommands(program, { ledgerRoot: root }); return program; };
   const lines: string[] = [];
-  const log = spyOn(console, 'log').mockImplementation((value: unknown) => { lines.push(String(value)); });
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk).trim()); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
   try {
     await expect(command().parseAsync(['release', 'gate-shards', '--version', '9.9.9', '--json'], { from: 'user' }))
       .rejects.toThrow('게이트 조각 원장 없음: 9.9.9');
@@ -116,7 +121,59 @@ test('release gate-shards CLI names a missing ledger and reads measured rows as 
     appendGateShardLedger(gateShardLedgerPath('9.9.9', root), row);
     await command().parseAsync(['release', 'gate-shards', '--version', '9.9.9', '--json'], { from: 'user' });
     expect(JSON.parse(lines.at(-1)!)).toMatchObject({ version: '9.9.9', malformed: 0, rows: [row] });
-  } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  } finally { output.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('release gate-shards JSON is paged so large shard histories stay valid and resumable', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-gate-shards-page-'));
+  const command = () => { const program = new Command(); registerReleaseCommands(program, { ledgerRoot: root }); return program; };
+  const lines: string[] = [];
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk).trim()); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+  try {
+    const path = gateShardLedgerPath('9.9.9', root);
+    for (let i = 0; i < 45; i++) appendGateShardLedger(path, {
+      v: 1, version: '9.9.9', phase: 'cut', shardId: `pod-${i}`, files: Array.from({ length: 40 }, (_, j) => `src/${'한'.repeat(35)}-${i}-${j}.test.ts`),
+      host: 'pool-test', executor: 'pod', imageDigest: `sha256:${'a'.repeat(64)}`, commit: 'b'.repeat(40), envFingerprint: 'c'.repeat(64),
+      startedAt: '2026-10-27T00:00:00Z', endedAt: '2026-10-27T00:00:01Z', observedAt: '2026-10-27T00:00:01Z',
+      state: 'done', rc: 0, pass: 40, fail: 0, errors: 0, ran: 40, failureIds: [], errorIds: [],
+      attribution: 'complete', logPath: `pod-${i}.log`, junitPath: null, stopReason: null, attemptId: `attempt-${i}`,
+    });
+    const totalRows = readGateShardLedger(path)!.rows.length;
+    const pageSizeArgument = '20';
+    const pageSize = Number(pageSizeArgument);
+    const rows: GateShardLedgerRow[] = [];
+    for (let offset = 0; offset < totalRows;) {
+      await command().parseAsync(['release', 'gate-shards', '--version', '9.9.9', '--json', '--offset', String(offset), '--limit', pageSizeArgument], { from: 'user' });
+      const json = lines.at(-1)!;
+      expect(Buffer.byteLength(json)).toBeLessThanOrEqual(GATE_SHARD_JSON_PAGE_MAX_BYTES);
+      const page = JSON.parse(json);
+      expect(page.returned).toBe(page.rows.length);
+      rows.push(...page.rows);
+      offset = page.nextOffset ?? totalRows;
+    }
+    expect(rows).toEqual(readGateShardLedger(path)!.rows);
+    expect(lines.length).toBeGreaterThan(Math.ceil(totalRows / pageSize));
+  } finally { output.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('release gate-shards JSON refuses a single row that cannot fit under the byte cap', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-gate-shards-oversize-'));
+  const command = () => { const program = new Command(); registerReleaseCommands(program, { ledgerRoot: root }); return program; };
+  const lines: string[] = [];
+  const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+  try {
+    const row: GateShardLedgerRow = {
+      v: 1, version: '9.9.9', phase: 'cut', shardId: 'oversized', files: ['한'.repeat(70_000)],
+      host: 'pool-test', executor: 'pod', imageDigest: `sha256:${'a'.repeat(64)}`, commit: 'b'.repeat(40), envFingerprint: 'c'.repeat(64),
+      startedAt: '2026-10-27T00:00:00Z', endedAt: '2026-10-27T00:00:01Z', observedAt: '2026-10-27T00:00:01Z',
+      state: 'done', rc: 0, pass: 1, fail: 0, errors: 0, ran: 1, failureIds: [], errorIds: [],
+      attribution: 'complete', logPath: 'pod-0.log', junitPath: null, stopReason: null, attemptId: 'attempt-oversized',
+    };
+    appendGateShardLedger(gateShardLedgerPath('9.9.9', root), row);
+    await expect(command().parseAsync(['release', 'gate-shards', '--version', '9.9.9', '--json'], { from: 'user' }))
+      .rejects.toThrow(`페이지 상한 ${GATE_SHARD_JSON_PAGE_MAX_BYTES}바이트`);
+    expect(lines).toEqual([]);
+  } finally { output.mockRestore(); rmSync(root, { recursive: true, force: true }); }
 });
 
 function installPinnedReleaseFiles(checkout: string) {
@@ -144,10 +201,10 @@ async function seedFailedReleaseRun(root: string, runId = 'recovery-fixture') {
   git(checkout, 'config', 'user.name', 'MK test');
   git(checkout, 'config', 'user.email', 'mk-test@example.invalid');
   mkdirSync(join(checkout, 'graphs', 'release'), { recursive: true });
-  for (const file of ['release-loop.yaml', 'recipes.yaml'])
+  for (const file of ['release-loop.yaml', 'recipes.yaml', 'plugin.json', 'release-graph.schema.yaml', 'release-edge-vocabulary.yaml', 'release-gate-domain-pack.yaml'])
     copyFileSync(join(import.meta.dir, '../../graphs/release', file), join(checkout, 'graphs', 'release', file));
   writeFileSync(join(checkout, 'release-fixture.txt'), 'local recovery fixture\n');
-  git(checkout, 'add', 'graphs/release/release-loop.yaml', 'graphs/release/recipes.yaml', 'release-fixture.txt');
+  git(checkout, 'add', 'graphs/release', 'release-fixture.txt');
   git(checkout, 'commit', '-q', '-m', 'seed local recovery fixture');
   git(checkout, 'branch', '-M', `release/${version}`);
   const sha = git(checkout, 'rev-parse', 'HEAD');
@@ -1192,6 +1249,42 @@ describe('release schedule CLI', () => {
 
 describe('release run CLI', () => {
   scopeReleaseCliFreshnessTestBase();
+  test('a non-owner seat gets a --test refusal before any production release graph starts', async () => {
+    const previousTrack = process.env.ELANOUS_TRACK;
+    const ledgerRoot = mkdtempSync(join(tmpdir(), 'release-seat-launch-guard-'));
+    const lines: string[] = [];
+    const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
+      lines.push(String(chunk).trim());
+      (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.();
+      return true;
+    }) as typeof process.stdout.write);
+    let graphStarts = 0;
+    try {
+      resetElanousConfigDir();
+      setElanousConfigDir(prodInstanceRoot());
+      process.env.ELANOUS_TRACK = 'POD-REUSE-2';
+      for (let attempt = 0; attempt < 3; attempt++) {
+        process.exitCode = 0;
+        const command = new Command();
+        registerReleaseCommands(command, { ledgerRoot, freezeRoot: ledgerRoot, graph: (async () => {
+          graphStarts++;
+          throw new Error('production graph must not start in this simulation');
+        }) as never });
+        await command.parseAsync(['release', 'run', '--version', '0.3.7', '--json'], { from: 'user' });
+        expect(process.exitCode).toBe(1);
+        expect(JSON.parse(lines.at(-1)!)).toMatchObject({ ok: false, reason: 'seat-launch-refused', error: expect.stringContaining('--test') });
+      }
+      expect(graphStarts).toBe(0);
+      expect(existsSync(join(ledgerRoot, 'graph-runs', 'release-loop'))).toBe(false);
+    } finally {
+      output.mockRestore();
+      resetElanousConfigDir();
+      if (previousTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previousTrack;
+      process.exitCode = 0;
+      rmSync(ledgerRoot, { recursive: true, force: true });
+    }
+  });
+
   test('a live graph runner ledger blocks a second CLI process with its actual run identity', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-single-flight-real-ledger-'));
     const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
@@ -1224,11 +1317,12 @@ describe('release run CLI', () => {
     const stateDir = join(dir, 'graph-runs', 'release-loop');
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(join(stateDir, `${runId}.json`), JSON.stringify({ graphId: 'release-loop', runId,
-      status: 'running', pid: process.pid, pidStartedAt, startedAt, input: { version: '0.2.34' } }));
+      status: 'running', pid: process.pid, pidStartedAt, startedAt, path: [], nodes: [], input: { version: '0.2.34' } }));
     let launches = 0;
     const errors: string[] = [];
     const consoleError = spyOn(console, 'error').mockImplementation((...parts: unknown[]) => { errors.push(parts.join(' ')); });
     const before = process.exitCode;
+    setElanousConfigDir(dir);
     try {
       for (const args of [[], ['--if-ready']]) {
         process.exitCode = 0;
@@ -1243,20 +1337,23 @@ describe('release run CLI', () => {
         expect(message).toContain(runId);
         expect(message).toContain(`pid=${process.pid}`);
         expect(message).toContain(`startedAt=${startedAt}`);
-        expect(message).toContain('--force-new');
+        expect(message).not.toContain('--force-new');
       }
       mkdirSync(join(dir, 'release', '0.2.33'), { recursive: true });
       writeFileSync(join(dir, 'release', '0.2.33', 'release.json'), JSON.stringify({ version: '0.2.33', publishedAt: startedAt }));
       process.exitCode = 0;
       const forced = new Command();
-      registerReleaseCommands(forced, { ledgerRoot: dir, freezeRoot: dir, config: { gatePodPool: 'pool' },
+      registerReleaseCommands(forced, { ledgerRoot: dir, freezeRoot: dir, assertCliCurrent: () => {}, config: { gatePodPool: 'pool' },
         checklist: () => ({ ok: true, red: [], undecided: [], blocked: [] }),
         graph: async () => { launches++; return { status: 'done' } as never; } });
       await forced.parseAsync(['release', 'run', '--version', '0.2.34', '--force-new'], { from: 'user' });
-      expect(launches).toBe(1);
-      expect(process.exitCode).toBe(0);
-    } finally { process.exitCode = before ?? 0; consoleError.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
-  });
+      expect(errors.slice(2)).toHaveLength(1);
+      expect(errors[2]).toContain(runId);
+      expect(errors[2]).not.toContain('--force-new');
+      expect(launches).toBe(0);
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = before ?? 0; consoleError.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  }, 45_000);
   test('direct --force-new rechecks checklist after its start marker before graph launch', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-force-start-recheck-'));
     const before = process.exitCode;
@@ -1427,6 +1524,7 @@ describe('release run CLI', () => {
       enableLandingFreeze({ reason: 'drill', by: 'MK' }, dir);
       const cli = (...args: string[]) => simCli(['release', 'run', '--version', '0.2.4', '--json', ...args], {
         allowPaths: [['release', 'run']], stateRoot: dir,
+        env: { ELANOUS_TEST_RELEASE_CLI_FRESHNESS_BASE: releaseCliTestCheckout },
       });
       const direct = await cli();
       expect(direct.exitCode).toBe(1);
@@ -1463,7 +1561,7 @@ describe('release run CLI', () => {
         checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
         graph: async (_path, options) => {
           enableLandingFreeze({ reason: 'mid-run', by: 'OP' }, root); // after every entry check, before the gate node
-          state = await runGraph(join(graphDir, 'release-loop.yaml'), { ...options, input: { ...options.input, commit: 'a'.repeat(40) }, deps: {
+          state = await runGraph(join(graphDir, 'release-loop.yaml'), { ...options, input: { ...(options.input as unknown as Record<string, unknown>), commit: 'a'.repeat(40) }, deps: {
             root,
             runBash: async (command, runOptions) => {
               const gateEntrypoint = join(import.meta.dir, '../../scripts/release-loop/gate-node.ts');
@@ -1949,7 +2047,7 @@ describe('release run CLI', () => {
     const cli = new Command();
     registerReleaseCommands(cli, { ledgerRoot: dir, config: { gatePodPool: 'pool' },
       checklist: (version) => { expect(version).toBe('0.2.4'); checklistCalls++; return { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
-      graph: async (path, opts) => { expect(path).toEndWith('graphs/release/release-loop.yaml'); expect(opts.input.previousVersion).toBe('0.2.3'); graphCalls++; return { status: 'awaiting-approval', runId: 'run-1' } as never; } });
+      graph: async (path, opts) => { expect(path).toEndWith('graphs/release/release-loop.yaml'); expect((opts.input as unknown as Record<string, unknown>).previousVersion).toBe('0.2.3'); graphCalls++; return { status: 'awaiting-approval', runId: 'run-1' } as never; } });
     try {
       await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
       expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: false, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', branchCut: true, branchCutBaseCommit: verifiedMainForCliTests }, state: { status: 'awaiting-approval', runId: 'run-1' } });

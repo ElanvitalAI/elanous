@@ -1,0 +1,28 @@
+{
+  "id": "RELEASE-MACROPHAGE-HEAL",
+  "name": "Release-loop macrophage shadow and simulated healing",
+  "kind": "release-macrophage-heal",
+  "device": "release-graph-rig",
+  "implementation": [
+    "src/release-loop/macrophage-heal.ts",
+    "src/release-loop/macrophage-heal-node.ts",
+    "src/release-loop/macrophage-safe-cleanup.ts",
+    "src/ux-sim/release-sim-rig.ts",
+    "scenarios/ux-sim/release-sim-rig.yaml"
+  ],
+  "tests": [
+    "src/release-loop/macrophage-heal.test.ts",
+    "src/release-loop/macrophage-heal-node.test.ts",
+    "src/release-loop/macrophage-safe-cleanup.test.ts",
+    "src/ux-sim/release-sim-rig.test.ts"
+  ],
+  "trigger": "Inject each A11 scrap type at real release node-end phase boundaries, including inactive merged worktrees and merged land-queue rows.",
+  "observe": [
+    "active phase defers all work",
+    "shadow mode writes one evidence/action/result line per scrap and applies none",
+    "simulation removes only evidence-approved items from its in-memory inventory",
+    "live runs and unverified ownership/receipts remain",
+    "only merged exact queue rows and clean inactive merged worktrees under HQ work are eligible for live cleanup"
+  ],
+  "expected": "Live cleanup is limited to the two verified safe scopes; all other cleanup remains a plan and simulation mutations stay in memory."
+}

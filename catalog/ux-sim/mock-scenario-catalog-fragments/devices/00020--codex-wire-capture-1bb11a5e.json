@@ -1,0 +1,27 @@
+{
+  "id": "codex-wire-capture",
+  "name": "Codex Responses wire capture mock",
+  "implementation": [
+    "src/ux-sim/codex-wire-capture.ts"
+  ],
+  "tests": [
+    "test/llm-codex-prompt-cache-prefix.test.ts"
+  ],
+  "target": "Codex Responses fetch boundary: exact serialized request bytes and synthetic completion usage",
+  "inputs": [
+    "wire JSON requests",
+    "optional cached_tokens completion"
+  ],
+  "observations": [
+    "captured headers and request bytes",
+    "shared byte-prefix comparison",
+    "request SHA/size events",
+    "normalized injected cache usage"
+  ],
+  "entryCommands": [
+    "bun test test/llm-codex-prompt-cache-prefix.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

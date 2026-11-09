@@ -365,11 +365,8 @@ import type { ReviewResult } from './agent-substrate/pr-reviewer.js';
 import type { ReviewVerdict } from './agent-mission/review-loop.js';
 import type { SyncMode } from './types.js';
 import type { OnboardingStepId } from './onboarding.js';
-import {
-  getUserConfig, reloadUserConfig, userConfigPath, saveUserConfig,
-  backupUserConfig, backupConfigPath, addRotationEntry, type RotationEntry,
-  resolveRoleLlm,
-} from './user-config.js';
+import { getUserConfig, reloadUserConfig, userConfigPath, saveUserConfig, backupUserConfig, backupConfigPath, addRotationEntry, resolveRoleLlm } from './user-config.js';
+import type { RotationEntry } from './user-config/types.js';
 import { reviewReasoningEffort } from './model-tier/review-effort.js';
 import { configuredOpenGatewayKeys, isKeylessProvider, resolveProviderCredential } from './llm/provider-credentials.js';
 import {
@@ -9006,6 +9003,11 @@ registerTasksCommands(program);
 registerBriefCommands(program);
 registerLabelsCommands(program);
 registerMsgCommands(program);
+
+if (!INDEX_FAST_ROOT) {
+  const { registerQCommands } = require('./cli/q-cli.js') as typeof import('./cli/q-cli.js');
+  registerQCommands(program);
+}
 
 // ── ask alias (script-friendly one-shot query) ──
 program

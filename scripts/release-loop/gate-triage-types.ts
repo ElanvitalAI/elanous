@@ -14,6 +14,10 @@ export interface GateTriageEvidence {
   environmentFailureIds?: string[];
   /** The last two actual decisions, including their measured identities. */
   priorDecisions?: Array<{ classification: GateTriageClass; commit: string; failureIds: string[] }>;
+  /** Current known-fail records. Missing or invalid owner data never suppresses failures. */
+  knownFailOwners?: unknown;
+  /** Owning checklist cell for a failure that repeatedly cannot be measured. */
+  ownerCellByFailureId?: Record<string, string>;
   /** Verified main-HEAD standalone remeasurement receipt reference for introduced-failure attribution. */
   introducedMainFixedPick?: {
     mainTip?: string;
@@ -31,6 +35,8 @@ export interface GateTriageShadow {
   introduced: string[];
   stalledFiles: string[];
   failureIds: string[];
+  knownFailAudit: { covered: Array<{ failureId: string; checklistCellId: string; firstSeenCommit: string }>; residual: string[] };
+  unmeasuredOwnerAssignments: Array<{ failureId: string; checklistCellId: string; firstSeenCommit: string }>;
   evidence: {
     highLoad: boolean | null;
     isolatedReproductions: number | null;

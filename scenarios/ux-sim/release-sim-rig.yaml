@@ -6,6 +6,12 @@ input:
   version: '0.3.1'
   previousVersion: '0.3.0'
 cases:
+  - id: non-owner-production-launches-refused-before-release-graph
+    mode: prod-seat-launch-refused
+    expect:
+      status: failed
+      mustVisit: []
+      mustNotVisit: [version-release, gate, publish]
   - id: macrophage-scrap-live-and-simulation
     mode: macrophage-heal
     expect:
@@ -180,6 +186,30 @@ cases:
             - { event: node-end, nodeId: pwa }
         - { event: node-start, nodeId: pre-prepare-join }
 
+  - id: pwa-cdp-attach-timeout
+    fault:
+      node: pwa
+      outcome: timeout
+      evidence: { phase: cdp-attach, attachTimeoutMs: 30000, restoreTraffic: true }
+    expect:
+      status: failed
+      mustVisit: [pwa, pre-prepare-join, traffic-failed-restore, failed]
+      mustNotVisit: [prepare, publish, npm-publish]
+  - id: fanout-branch-resume-refused
+    mode: resume-fanout-branch-refused
+    nodeOutcomes:
+      pwa: { outcome: fail }
+    expect:
+      status: resume-refused
+      mustVisit: [traffic-gate-passed, pwa, pre-prepare-join]
+      mustNotVisit: [prepare, publish, npm-publish]
+      refusalIncludes: "--from cannot resume fan-out branch 'pwa'; resume from fan-out source 'traffic-gate-passed' instead"
+  - id: owner-waive-malformed-gate-schema
+    mode: owner-waive-missing-schema
+    expect:
+      status: done
+      mustVisit: [gate, known-issues, publish, npm-publish, done]
+      mustNotVisit: [gate-triage, failed]
   - id: owner-waive-unmeasured-gate
     mode: owner-waive-unmeasured-gate
     expect:
@@ -213,6 +243,12 @@ cases:
       status: done
       mustVisit: [gate, known-issues, publish, npm-publish, verify, done]
       mustNotVisit: [failed]
+  - id: owner-waive-downstream-node-fails
+    mode: owner-waive-downstream-failure
+    expect:
+      status: failed
+      mustVisit: [gate, pwa, pre-prepare-join, traffic-failed-restore, failed]
+      mustNotVisit: [prepare, publish, npm-publish, done]
   - id: appended-tip-regate-before-waiver
     mode: appended-tip-regate-before-waiver
     expect:

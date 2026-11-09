@@ -1,0 +1,8 @@
+{
+  "path": "scenarios/iul-timeline-viewer.yaml",
+  "disposition": "excluded",
+  "entryCommand": "not-applicable: consumed by the IUL timeline viewer; no direct scenario CLI",
+  "logsRecorded": "runner-dependent",
+  "logsDetail": "No standalone command or UX ScenarioV0 completion contract.",
+  "excludeReason": "Graph/playground scenario, outside UX mock-device scope."
+}

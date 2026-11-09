@@ -1,3 +1,4 @@
+import { isRecord } from './primitives/guards.js';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DATA_DIR } from './config.js';
@@ -80,7 +81,7 @@ export class ExecutionHistoryStore {
       const parsed = JSON.parse(readFileSync(this.path, 'utf-8')) as Partial<ExecutionHistoryFile>;
       return {
         version: 1,
-        records: Array.isArray(parsed.records) ? parsed.records.filter(isRecord) : [],
+        records: Array.isArray(parsed.records) ? parsed.records.filter(isExecutionHistoryRecord) : [],
       };
     } catch {
       return { version: 1, records: [] };
@@ -99,8 +100,8 @@ export function defaultExecutionHistoryPath(): string {
   return join(DATA_DIR, 'execution-history.json');
 }
 
-function isRecord(value: unknown): value is ExecutionHistoryRecord {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+function isExecutionHistoryRecord(value: unknown): value is ExecutionHistoryRecord {
+  if (!isRecord(value)) return false;
   const raw = value as Record<string, unknown>;
   return typeof raw.id === 'string'
     && typeof raw.startedAt === 'string'

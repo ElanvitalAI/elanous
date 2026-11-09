@@ -7,13 +7,8 @@
 //
 // 문법:  <role>=<provider>[/<tier>]   ·   <role>=/<tier>   (tier 만)
 // 예:    implement=grok/best · review=anthropic · planning=/best
-import {
-  isModelRole,
-  parseRoleLlmEntry,
-  MODEL_ROLES,
-  type ModelRole,
-  type RoleLlmConfig,
-} from '../user-config.js';
+import { isModelRole, parseRoleLlmEntry, MODEL_ROLES } from '../user-config.js';
+import type { ModelRole, RoleLlmConfig } from '../user-config/types.js';
 
 export type RoleLlmFlagParse =
   | { ok: true; overrides: RoleLlmConfig }

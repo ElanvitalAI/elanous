@@ -57,7 +57,6 @@ export interface GoalSlashInput {
     tokenBudget: number;
     judgeModel: string;
     judgeRetries: number;
-    pauseOnPlanModeEnter: boolean;
     resumeOnPlanModeExit: boolean;
     modeDefault: GoalMode;
   };
@@ -187,7 +186,6 @@ function handleConfig(cfg: GoalSlashInput['config']): GoalSlashOutcome {
       `    tokenBudget:          ${cfg.tokenBudget.toLocaleString()}${cfg.tokenBudget === 0 ? '  (no cap)' : ''}`,
       `    judgeModel:           ${cfg.judgeModel || '(primary provider default)'}`,
       `    judgeRetries:         ${cfg.judgeRetries}`,
-      `    pauseOnPlanModeEnter: ${cfg.pauseOnPlanModeEnter}`,
       `    resumeOnPlanModeExit: ${cfg.resumeOnPlanModeExit}`,
       `    modeDefault:          ${cfg.modeDefault}`,
       '',

@@ -1,0 +1,37 @@
+{
+  "id": "fake-fetch",
+  "name": "Fake fetch route device",
+  "implementation": [
+    "src/ux-sim/fake-fetch.ts",
+    "apps/pwa/src/test-devices/fake-fetch.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-fetch.test.ts",
+    "apps/pwa/src/lib/daemon-client.seat-request.test.ts",
+    "apps/pwa/src/lib/daemon-client-tool-meta.test.ts",
+    "apps/pwa/src/lib/task-api.test.ts",
+    "apps/pwa/src/app/live-run/page.test.tsx",
+    "apps/pwa/src/lib/attachment-content.test.ts",
+    "apps/pwa/src/lib/upload-attachment.test.ts"
+  ],
+  "target": "globalThis.fetch boundary with exact method and URL/path routes; never falls through to the network",
+  "inputs": [
+    "request URL and method",
+    "route response or response factory",
+    "request headers and body"
+  ],
+  "observations": [
+    "request URL, method, headers, and body",
+    "matched route and response status",
+    "unmatched route failures",
+    "global fetch restoration after success or error"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-fetch.test.ts",
+    "bun test apps/pwa/src/lib/daemon-client.seat-request.test.ts apps/pwa/src/lib/daemon-client-tool-meta.test.ts apps/pwa/src/lib/task-api.test.ts",
+    "bun test apps/pwa/src/app/live-run/page.test.tsx apps/pwa/src/lib/attachment-content.test.ts apps/pwa/src/lib/upload-attachment.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

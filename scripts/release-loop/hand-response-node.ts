@@ -6,7 +6,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { errorResult, finishNode, readGraphContext, type GraphContext } from './node-verdict.js';
 
 export const HAND_RESPONSE_ACTIONS = [
-  'rla-release-autostart', 'rla-train-worker-restart', 'rla-release-recover', 'rla-rehearsal-retry',
+  'rla-release-autostart', 'rla-train-worker-restart', 'cut-append', 'rla-release-recover', 'rla-rehearsal-retry',
   'rla-cloud-join', 'rla-cloud-leave', 'rla-focused-verify', 'rla-rail-now', 'rla-nexus-restart', 'rla-nexus-build',
 ] as const;
 export type HandResponseAction = typeof HAND_RESPONSE_ACTIONS[number];
@@ -93,6 +93,16 @@ export function planHandResponseAction(action: HandResponseAction, context: Grap
       }
       return { command: eln, args: ['release', 'recover', '--run', runId, '--pick', ...picks as string[], '--json'],
         summary: approved ? `append main fixes and resume release run ${runId}` : `preview recover for release run ${runId}`,
+        mutatesState: true, approved };
+    }
+    case 'cut-append': {
+      const version = requiredString({ ...values, version: values.version ?? context.input.version }, 'version', /^\d+\.\d+\.\d+$/);
+      const picks = values.pickShas;
+      if (!Array.isArray(picks) || picks.length === 0 || picks.some((sha) => typeof sha !== 'string' || !SHA.test(sha)))
+        throw new Error('pickShas must contain one or more full commit SHAs');
+      return { command: eln, args: ['release', 'cut-branch', '--version', version, '--append',
+        ...picks.flatMap((sha) => ['--pick', sha as string]), ...(!approved ? ['--dry-run'] : []), '--json'],
+        summary: approved ? `append ${picks.length} landed repair commit(s) to release/${version}` : `preview cut append for release/${version}`,
         mutatesState: true, approved };
     }
     case 'rla-rehearsal-retry': {

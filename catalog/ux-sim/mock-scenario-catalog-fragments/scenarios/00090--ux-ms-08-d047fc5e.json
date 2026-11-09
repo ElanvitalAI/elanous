@@ -1,0 +1,22 @@
+{
+  "id": "UX-MS-08",
+  "name": "Delayed dashboard turn throw and queue teardown",
+  "kind": "turn-throw-teardown",
+  "device": "turn-throw-sim",
+  "implementation": [
+    "src/ux-sim/turn-throw-sim.ts",
+    "src/dashboard/input/chat-main-plain-turn-runtime.ts",
+    "src/dashboard/turn-busy-teardown.ts"
+  ],
+  "tests": [
+    "src/ux-sim/turn-throw-sim.test.ts",
+    "src/dashboard/turn-busy-teardown.test.ts"
+  ],
+  "trigger": "Configure a turn:<stage> throw with an optional delay while one external input is queued.",
+  "observe": [
+    "tui.turn turn-threw phase=turn:<stage>",
+    "turn.state idle",
+    "one queued input delivered"
+  ],
+  "expected": "the production plain-turn catch logs the configured stage, teardown restores idle, and the queued input is delivered once"
+}

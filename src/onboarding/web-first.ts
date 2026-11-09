@@ -10,7 +10,7 @@ import { issueSetupLinkToken } from '../auth/setup-link-tokens.js';
 import { debug } from '../debug/log.js';
 import { detectLocale, type Locale } from '../expression/locale.js';
 import { browserUnavailableReason } from '../oauth/browser-availability.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 export interface WebFirstSetupDeps {
   config: Pick<UserConfig, 'onboarding'>;

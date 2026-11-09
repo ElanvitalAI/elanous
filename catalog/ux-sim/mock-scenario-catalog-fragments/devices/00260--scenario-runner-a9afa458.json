@@ -1,0 +1,42 @@
+{
+  "id": "scenario-runner",
+  "name": "Scenario file runner and human CLI",
+  "implementation": [
+    "src/ux-sim/scenario.ts",
+    "src/ux-sim/mock-scenario-catalog.ts",
+    "src/ux-sim/mock-device-requests.ts",
+    "scripts/ux-sim.ts",
+    "scenarios/ux-sim/provider-4xx-no-provider.yaml"
+  ],
+  "tests": [
+    "src/ux-sim/scenario.test.ts",
+    "src/ux-sim/mock-scenario-catalog.test.ts",
+    "src/ux-sim/mock-device-requests.test.ts"
+  ],
+  "target": "registered test-only provider-response fault through the real Codex path; catalog list/show CLI",
+  "inputs": [
+    "scenario file",
+    "seed",
+    "registered HTTP/network fault",
+    "MS-id"
+  ],
+  "observations": [
+    "widget snapshot",
+    "debug event",
+    "persistent logs.db row",
+    "runId evidence artifact",
+    "catalog listing/detail"
+  ],
+  "entryCommands": [
+    "bun scripts/ux-sim.ts list",
+    "bun bin/elanous.mjs --test sim run scenarios/ux-sim/provider-4xx-no-provider.yaml",
+    "eln --test sim devices request <cellId> --boundary <boundary> --nearest <deviceId>",
+    "eln --test sim devices --missing"
+  ],
+  "logsRecorded": "conditional",
+  "eventNames": [
+    "llm.codex/request-rejected-shape",
+    "ux.sim.scenario/completed"
+  ],
+  "recentUse": null
+}

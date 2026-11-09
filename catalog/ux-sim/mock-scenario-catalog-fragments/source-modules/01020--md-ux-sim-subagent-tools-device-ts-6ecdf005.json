@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SUBAGENT-TOOLS-DEVICE-TS",
+  "path": "src/ux-sim/subagent-tools-device.ts",
+  "boundary": "Runs production subagent-tool validation against scripted requests and reports accepted, refused and malformed outcomes without spawning agents.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

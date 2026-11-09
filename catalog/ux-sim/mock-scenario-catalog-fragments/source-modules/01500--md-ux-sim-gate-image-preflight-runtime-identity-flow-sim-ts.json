@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GATE-IMAGE-PREFLIGHT-RUNTIME-IDENTITY-FLOW-SIM-TS",
+  "path": "src/ux-sim/gate-image-preflight-runtime-identity-flow-sim.ts",
+  "boundary": "Exercises production release preflight, gate image pinning, and Pod command construction with fake remote probes and fake kubectl; performs no real registry or Kubernetes calls.",
+  "deviceIds": [
+    "release-graph-rig"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

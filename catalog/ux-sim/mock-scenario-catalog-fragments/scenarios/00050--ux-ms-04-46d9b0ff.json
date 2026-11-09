@@ -1,0 +1,21 @@
+{
+  "id": "UX-MS-04",
+  "name": "Pod credential failure",
+  "kind": "pod-auth-failure",
+  "device": "fault-injection",
+  "implementation": [
+    "src/ux-sim/fault-glm-no-credential.ts",
+    "src/ux-sim/fault-pod-codex-503.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fault-glm-no-credential.test.ts",
+    "src/ux-sim/fault-pod-codex-503.test.ts"
+  ],
+  "trigger": "Remove the child credential or inject a Codex 401/503 response.",
+  "observe": [
+    "credential readiness",
+    "provider error event",
+    "launch/recovery disposition"
+  ],
+  "expected": "credential absence and temporary provider unavailability remain distinguishable"
+}

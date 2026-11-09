@@ -2,10 +2,17 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { appendGateShardLedger, appendGateShardLedgerBatch, appendGateShardLedgerForGate, gateShardLedgerBatchComplete, gateShardLedgerPath, latestGateShardLedger, readGateShardLedger, type GateShardLedgerRow } from './gate-shard-ledger.js';
+import { appendGateShardLedger, appendGateShardLedgerBatch, appendGateShardLedgerForGate, appendGateShardLifecycleState, gateShardFilesCovered, gateShardLedgerBatchComplete, gateShardLedgerBatchReusable, gateShardLedgerPath, latestGateShardLedger, latestGateShardLedgerAttempts, readGateShardLedger, type GateShardLedgerRow } from './gate-shard-ledger.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+
+test('a recovered parent is complete only when retry shards cover its exact file map', () => {
+  expect(gateShardFilesCovered(['src/a.test.ts', 'src/b.test.ts'], ['src/a.test.ts', 'src/b.test.ts'])).toBe(true);
+  expect(gateShardFilesCovered(['src/a.test.ts', 'src/b.test.ts'], ['src/a.test.ts'])).toBe(false);
+  expect(gateShardFilesCovered(['src/a.test.ts', 'src/b.test.ts'], ['src/a.test.ts', 'src/a.test.ts'])).toBe(false);
+  expect(gateShardFilesCovered(['src/a.test.ts'], ['src/a.test.ts', 'src/unexpected.test.ts'])).toBe(false);
+});
 
 test('a live reader sees each attempt and keeps the latest attributed result', () => {
   const root = mkdtempSync(join(tmpdir(), 'gate-shard-ledger-')); roots.push(root);
@@ -28,6 +35,30 @@ test('a live reader sees each attempt and keeps the latest attributed result', (
   expect(read.rows).toHaveLength(3);
   expect(read.malformed).toBe(0);
   expect(latestGateShardLedger(read.rows)[0]?.failureIds).toEqual(['src/a.test.ts > fails']);
+});
+
+test('stop intent and confirmed terminal state are appended to the operator ledger', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-shard-ledger-stop-')); roots.push(root);
+  const path = gateShardLedgerPath('0.3.8', root);
+  const running: GateShardLedgerRow = {
+    v: 1, version: '0.3.8', phase: 'cut', shardId: 'pod-0', files: ['src/a.test.ts'],
+    host: 'minim5', executor: 'pod', imageDigest: null, commit: 'a'.repeat(40), envFingerprint: 'b'.repeat(64),
+    startedAt: '2026-11-09T00:00:00Z', endedAt: null, observedAt: '2026-11-09T00:00:00Z', state: 'running', rc: null,
+    pass: null, fail: null, errors: null, ran: null, failureIds: null, errorIds: null,
+    attribution: 'unmeasured', logPath: null, junitPath: null, stopReason: null, attemptId: 'attempt-0',
+  };
+  appendGateShardLedger(path, running);
+  appendGateShardLedger(path, { ...running, invocationId: 'newer-invocation', state: 'done', attemptId: 'newer-attempt', endedAt: '2026-11-09T00:03:00Z' });
+  const attemptIds = new Map([['pod-0', 'attempt-0']]);
+  expect(appendGateShardLifecycleState(path, ['pod-0'], 'stop-requested', '2026-11-09T00:01:00Z', null, attemptIds)).toEqual([]);
+  expect(latestGateShardLedgerAttempts(readGateShardLedger(path)!.rows, attemptIds).get('pod-0'))
+    .toMatchObject({ state: 'stop-requested', endedAt: null, stopReason: 'graph-run-stop-requested', attemptId: 'attempt-0' });
+  expect(appendGateShardLifecycleState(path, ['pod-0'], 'failed', '2026-11-09T00:02:00Z', '2026-11-09T00:02:00Z', attemptIds)).toEqual([]);
+  const rows = readGateShardLedger(path)!.rows;
+  expect(latestGateShardLedgerAttempts(rows, attemptIds).get('pod-0')).toMatchObject({ state: 'failed', endedAt: '2026-11-09T00:02:00Z', attemptId: 'attempt-0' });
+  expect(rows.filter((row) => row.attemptId === 'newer-attempt')).toHaveLength(1);
+  expect(rows.find((row) => row.attemptId === 'newer-attempt')).toMatchObject({ state: 'done' });
+  expect(appendGateShardLifecycleState(path, ['pod-0'], 'failed', '2026-11-09T00:02:00Z', '2026-11-09T00:02:00Z')).toEqual(['pod-0: missing attempt identity']);
 });
 
 test('a remote gate fails closed when the HQ shard ledger cannot be written', () => {
@@ -73,8 +104,10 @@ test('remote completed shard rows append together and fail closed on write failu
     unmeasuredFiles: ['src/a.test.ts'], retryGroupId: 'attempt-1' };
   expect(appendGateShardLedgerBatch(recoverablePath, [recoverable, { ...row, shardId: 'pod-1', files: ['src/b.test.ts'] }], true)).toBeNull();
   const unrecovered = readGateShardLedger(recoverablePath)!;
-  expect(gateShardLedgerBatchComplete(unrecovered.rows, { batchId: unrecovered.rows[0]!.batchId!, version: row.version, commit: row.commit,
-    phase: 'cut', observedAt: row.observedAt, shardIds: ['pod-0', 'pod-1'] })).toBe(false);
+  const unmeasuredBatch = { batchId: unrecovered.rows[0]!.batchId!, version: row.version, commit: row.commit,
+    phase: 'cut' as const, observedAt: unrecovered.rows[0]!.observedAt, shardIds: ['pod-0', 'pod-1'] };
+  expect(gateShardLedgerBatchComplete(unrecovered.rows, unmeasuredBatch)).toBe(true);
+  expect(gateShardLedgerBatchReusable(unrecovered.rows, unmeasuredBatch)).toBe(false);
   expect(gateShardLedgerBatchComplete([...read.rows, { ...read.rows[0]!, version: '0.2.41', shardId: 'pod-extra',
     observedAt: '2026-10-27T00:02:02.000Z' }], { batchId: read.rows[0]!.batchId!, version: row.version, commit: row.commit, phase: 'cut',
     observedAt: row.observedAt, shardIds: ['pod-0', 'pod-1'] })).toBe(false);

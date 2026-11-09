@@ -1,0 +1,32 @@
+{
+  "id": "fake-app-source-world",
+  "name": "Fake app source snapshot and restore world",
+  "checklistCells": [
+    "APP-SOURCE-SNAPSHOT"
+  ],
+  "implementation": [
+    "src/ux-sim/fake-app-source-concurrent-writer.ts",
+    "src/ux-sim/fake-app-source-world.ts",
+    "src/nexus/apps/app-source-snapshot.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-app-source-world.test.ts"
+  ],
+  "target": "Production app source snapshot and restore logic backed by a private local object store, including concurrent-writer isolation.",
+  "inputs": [
+    "app slug, deployment ID and source tree",
+    "tampered, missing or mismatched snapshot state",
+    "concurrent writers"
+  ],
+  "observations": [
+    "source fingerprint and snapshot ledger records",
+    "restore refusal before target mutation",
+    "writer-specific object keys and results"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-app-source-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

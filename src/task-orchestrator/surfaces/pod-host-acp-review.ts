@@ -14,7 +14,7 @@ import { spawnSync } from 'node:child_process';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../util/spawn-sync-output.js';
 import { debug } from '../../debug/log.js';
 import type { ReviewResult } from '../../agent-substrate/pr-reviewer.js';
-import type { SubscriptionReviewerSpec } from '../../user-config.js';
+import type { SubscriptionReviewerSpec } from '../../user-config/types.js';
 import type { SubscriptionReviewerDeps, subscriptionReviewerSpawn } from '../../self-dev/review-provider-fallback.js';
 
 export const POD_HOST_ACP_REVIEW_ENV = 'ELANOUS_POD_HOST_ACP_REVIEW';

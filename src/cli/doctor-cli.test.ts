@@ -13,7 +13,7 @@ import { applySudoFixes } from './doctor-fix.js';
 import { DOCTOR_SYMPTOMS, doctorVisitIncidentRoot } from '../self-implement/doctor-visit.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { recordRunExit } from '../harness/harness-incidents.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { recommendBackendTier } from '../nexus/apps/backend-tier.js';
 
 const example = [

@@ -1,5 +1,6 @@
 import { InlineChoiceBroker } from '../tui/inline-choice.js';
-import { resolveTuiUnattended, type UserConfig } from '../user-config.js';
+import { resolveTuiUnattended } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import type { AskUserQuestionRequest, AskUserQuestionResult } from './types.js';
 
 export const UNATTENDED_INLINE_CHOICE_TIMEOUT_MS = 60_000;

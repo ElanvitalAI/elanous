@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { deleteSecret, setSecret } from '../nexus/config/secrets/index.js';
 import { debug } from '../debug/log.js';
 import { resolveReportTarget, sendReportPhoto, sendReportPhotoBuffer, sendTelegramReport } from '../telegram-report.js';

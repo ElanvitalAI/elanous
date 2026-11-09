@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/fake-google-drive-world.test.ts",
+  "reason": "APP-OAUTH-ONE: scenario exercises metadata-only pagination, scope rejection, and write refusal."
+}

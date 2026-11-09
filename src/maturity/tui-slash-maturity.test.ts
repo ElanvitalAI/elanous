@@ -9,13 +9,13 @@ describe('MAT1c TUI slash audience', () => {
     for (const raw of [undefined, null, false, [], {}, { role: 'admin' }, { role: 42 }]) {
       expect(readTuiSlashAudience(raw)).toEqual({ role: 'owner', showBeta: false });
     }
-    expect(readTuiSlashAudience({ role: 'general', showBeta: 'true' })).toEqual({ role: 'general', showBeta: false });
+    expect(readTuiSlashAudience({ role: 'general', showBeta: 'true' })).toEqual({ role: 'owner', showBeta: false });
   });
 
   test('recognized roles and exact true showBeta are read independently', () => {
-    expect(readTuiSlashAudience({ role: 'general', showBeta: true })).toEqual({ role: 'general', showBeta: true });
-    expect(readTuiSlashAudience({ role: 'contributor', showBeta: false })).toEqual({ role: 'contributor', showBeta: false });
-    expect(readTuiSlashAudience({ role: 'owner', showBeta: true })).toEqual({ role: 'owner', showBeta: true });
+    expect(readTuiSlashAudience({ role: 'general', showBeta: true })).toEqual({ role: 'owner', showBeta: false });
+    expect(readTuiSlashAudience({ role: 'contributor', showBeta: false })).toEqual({ role: 'owner', showBeta: false });
+    expect(readTuiSlashAudience({ role: 'owner', showBeta: true })).toEqual({ role: 'owner', showBeta: false });
   });
 });
 

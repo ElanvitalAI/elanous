@@ -16,6 +16,7 @@ import { debug } from '../debug/log.js';
 import { registerSkillsCommands } from '../cli/skills-cli.js';
 import { installGiftPack, installMarketKnowledgePack } from './gift-install.js';
 import { getUserConfig, reloadUserConfig, saveUserConfig } from '../user-config.js';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -354,19 +355,19 @@ test('CLI refuses an unconsented gift without an API request or email in output'
   registerSkillsCommands(program);
   const lines: string[] = [];
   const stdout = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
-  const request = spyOn(globalThis, 'fetch').mockImplementation((async () => { throw new Error('network must not be called'); }) as unknown as typeof fetch);
   const originalExit = process.exitCode;
-  try {
+  await withFakeFetchDevice([{ url: '/unexpected-gift-request', response: () => { throw new Error('network must not be called'); } }], async (fetchDevice) => {
+    try {
     await program.parseAsync(['skills', 'install', 'essential', '--code', 'ABCD-secret', '--email', email, '--json'], { from: 'user' });
     expect(process.exitCode).toBe(1);
-    expect(request).not.toHaveBeenCalled();
+    expect(fetchDevice.calls()).toHaveLength(0);
     expect(lines.join(' ')).toContain('보관');
     expect(lines.join(' ')).not.toContain(email);
   } finally {
     process.exitCode = originalExit ?? 0;
-    request.mockRestore();
     stdout.mockRestore();
-  }
+    }
+  });
 });
 
 function fakeGiftFetch(zipBytes: Buffer, sha256: string, zipHeaders: Record<string, string> = {}): typeof fetch {

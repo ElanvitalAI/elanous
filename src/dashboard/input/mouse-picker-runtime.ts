@@ -1,4 +1,4 @@
-import type { RotationEntry } from '../../user-config.js';
+import type { RotationEntry } from '../../user-config/types.js';
 import type { DashboardMouseWiringDeps } from './mouse-wiring-types.js';
 
 export interface MousePickerRuntimeDeps {

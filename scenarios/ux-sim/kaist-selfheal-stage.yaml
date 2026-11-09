@@ -1,0 +1,14 @@
+version: 1
+kind: release-graph
+id: kaist-selfheal-stage
+isolation: test
+input:
+  version: '0.3.8'
+  previousVersion: '0.3.7'
+cases:
+  - id: lecture-scrap-search-repair
+    mode: kaist-selfheal-stage
+    expect:
+      status: done
+      mustVisit: [gate, receipt-audit, residual-run, gate-triage, done]
+      mustNotVisit: [failed]

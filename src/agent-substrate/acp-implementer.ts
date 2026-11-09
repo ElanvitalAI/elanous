@@ -9,7 +9,7 @@ import { isAbsolute, relative, resolve } from 'node:path';
 import { AcpAgent, type AcpAgentOpts } from '../acp/client.js';
 import { debug } from '../debug/log.js';
 import { subscriptionReviewerSpawn } from '../self-dev/review-provider-fallback.js';
-import type { SubscriptionReviewerSpec } from '../user-config.js';
+import type { SubscriptionReviewerSpec } from '../user-config/types.js';
 import { isReadOnlyReviewTool } from './acp-reviewer.js';
 
 const WRITE_TOOL_KINDS = new Set(['edit', 'delete', 'move']);

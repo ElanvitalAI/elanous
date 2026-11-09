@@ -30,13 +30,25 @@ describe('fake LAND-QUEUE device', () => {
   });
 
   test('cut-window stop leaves every candidate waiting without a train verdict', async () => {
-    const result = await simulateFakeLandQueue({ queue: [item(1), item(2)], load: 40, cutWindowOpen: false });
-    expect(result).toMatchObject({ slots: 3, departed: [], waiting: [1, 2], stoppedAtCut: true, verdicts: [] });
+    const result = await simulateFakeLandQueue({ queue: [item(1, 'src/already-landed.ts'), item(2)], load: 40, cutWindowOpen: false,
+      landedFiles: ['src/already-landed.ts'] });
+    expect(result).toMatchObject({ slots: 3, departed: [], waiting: [1, 2], stoppedAtCut: true, verdicts: [], conflicts: [] });
   });
 
   test('overlap conflict comes from merge-train integration and isolates its PR', async () => {
     const result = await simulateFakeLandQueue({ queue: [item(1), item(2)], load: 80, conflicting: [2] });
     expect(result.departed).toEqual([[1, 2]]);
     expect(result.verdicts).toEqual([{ number: 1, verdict: 'pass' }, { number: 2, verdict: 'conflict' }]);
+  });
+
+  test('landed paths decide conflict in the fake merge-tree boundary and receipts retain candidate heads', async () => {
+    const overlap = item(7, 'src/release-loop/gate-node.ts');
+    const clear = item(8, 'src/other.ts');
+    const result = await simulateFakeLandQueue({ queue: [overlap, clear], load: 80, landedFiles: ['src/release-loop/gate-node.ts'] });
+    expect(result.conflicts).toEqual([{ number: 7, files: ['src/release-loop/gate-node.ts'] }]);
+    expect(result.receipts).toEqual([
+      { number: 7, head: overlap.head, verdict: 'conflict' },
+      { number: 8, head: clear.head, verdict: 'pass' },
+    ]);
   });
 });

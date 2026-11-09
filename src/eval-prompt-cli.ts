@@ -26,12 +26,8 @@ import { type LLMMessage, type LLMProvider, getProviderForConfig, resolveDefault
 import { buildUniversalPreamble } from './prompt-library/universal-preamble.js';
 import { elanousSelfAccessPrompt } from './agent/self-ambient.js';
 import { getModelFamily } from './models/prompts.js';
-import {
-  applyRotationEntry,
-  getUserConfig,
-  jumpToRotationEntry,
-  type UserConfig,
-} from './user-config.js';
+import { applyRotationEntry, getUserConfig, jumpToRotationEntry } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import { buildBashTool, dispatchBash } from './skills/tools/index.js';
 import { buildReadTool, dispatchRead } from './skills/tools/read.js';
 import { buildEditTool, dispatchEdit } from './skills/tools/edit.js';
@@ -54,6 +50,7 @@ import {
 import { SessionCache } from './session/cache.js';
 import { toolSurface } from './boot/daemon-tools/index.js';
 import type { DaemonToolSurface } from './boot/daemon-tools/types.js';
+import { buildToolSearchTool, TOOL_SEARCH_NAME } from './skills/tools/tool-search-spec.js';
 import { debug } from './debug/log.js';
 import { copyFileSync, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
@@ -111,6 +108,12 @@ export interface EvalPromptOpts {
   json?: boolean;
   /** Tool catalog to evaluate. Defaults to the legacy CLI-agent surface. */
   tools?: EvalPromptToolSurface;
+  /** NL-routing measurement strategy. Omitted by existing callers, which retain the live default. */
+  routingStrategy?: 'native-all' | 'index';
+  /** Manifest route specs used only by the NL-routing corpus measurement runner. They are always dispatched to a no-op observation stub. */
+  measurementRouteTools?: readonly LLMToolSpec[];
+  /** All exposed tool names are no-op dispatched by the NL-routing corpus runner. */
+  measurementOnlyToolNames?: readonly string[];
   /** ⭐ 테스트 seam — deny 목록 주입(생략 시 `cfg.chat.toolDeny`).
    *  이게 없으면 deny 경계 테스트가 로컬 user-config 에 의존해 결과가 흔들린다. */
   toolDeny?: readonly string[];
@@ -174,6 +177,11 @@ export interface EvalPromptResult {
   /** Number of tools in `surfaceToolNames`, included to make JSON audits quick. */
   surfaceToolCount: number;
   durationMs: number;
+  /** Sum of provider usage events for this run; omitted when the provider reported none. */
+  inputTokens?: number;
+  outputTokens?: number;
+  /** Milliseconds from run start to the first streamed text token; null if no text was streamed. */
+  firstTokenMs?: number | null;
   logPath: string | null;
   /** Per-guard event count parsed from log/latest after the run.
    *  Includes anchor-grep-blocked, broad-spot-blocked, dedup-blocked,
@@ -193,6 +201,19 @@ export interface EvalPromptResult {
 
 export function isEvalPromptToolSurface(value: string): value is EvalPromptToolSurface {
   return (EVAL_PROMPT_TOOL_SURFACES as readonly string[]).includes(value);
+}
+
+export function evalToolDispatchKind(
+  name: string,
+  deniedNames: ReadonlySet<string>,
+  measurementOnlyNames: ReadonlySet<string>,
+  measurementOnlyMode = false,
+): 'denied' | 'measurement-only' | 'measurement-search' | 'measurement-blocked' | 'live' {
+  if (deniedNames.has(name)) return 'denied';
+  if (measurementOnlyMode && name === TOOL_SEARCH_NAME) return 'measurement-search';
+  if (measurementOnlyNames.has(name)) return 'measurement-only';
+  if (measurementOnlyMode) return 'measurement-blocked';
+  return 'live';
 }
 
 // Wave 7 — codex-shaped tool subset for codex family. Excludes Read/
@@ -747,17 +768,33 @@ export async function runEvalPrompt(opts: EvalPromptOpts): Promise<EvalPromptRes
   // 데몬 서피스용 never-abort 신호(헤드리스에선 프로세스 kill 이 곧 중단이라 발화 없음).
   const headlessSignal = new AbortController().signal;
   const cfg = getUserConfig();
-  const { specs: assembledTools, daemon: daemonSurface } = buildEvalPromptToolSurface(
+  const { specs: surfaceTools, daemon: daemonSurface } = buildEvalPromptToolSurface(
     selectedSurface,
     modelFamily,
     cfg,
   );
+  const measurementRouteTools = opts.measurementRouteTools ?? [];
+  const denyList = opts.toolDeny ?? cfg.chat.toolDeny;
+  const { filterToolsByDeny } = await import('./tool-runtime/tool-deny.js');
+  // ToolSearch is a schema-hydration path, so its search pool must obey the
+  // same user deny list as the initial provider surface. Otherwise a denied
+  // route could be reintroduced by measurement-mode ToolSearch.
+  const measurementSearchTools = filterToolsByDeny([...measurementRouteTools], denyList) ?? measurementRouteTools;
+  const surfaceNames = new Set(surfaceTools.map((tool) => tool.name));
+  const duplicateMeasurementNames = measurementRouteTools.map((tool) => tool.name).filter((name) => surfaceNames.has(name));
+  if (duplicateMeasurementNames.length > 0) {
+    throw new Error(`measurement route tool names collide with ${selectedSurface} surface: ${[...new Set(duplicateMeasurementNames)].join(', ')}`);
+  }
+  const measurementRouteNames = new Set(measurementRouteTools.map((tool) => tool.name));
+  const measurementOnlyNames = new Set(opts.measurementOnlyToolNames ?? []);
+  const measurementOnlyDispatchNames = new Set([...measurementRouteNames, ...measurementOnlyNames]);
+  const measurementOnlyMode = opts.measurementRouteTools !== undefined || opts.measurementOnlyToolNames !== undefined;
+  const assembledTools = [...surfaceTools, ...measurementRouteTools];
   // Wave 8 (2026-05-04) — apply user-config tool deny list. Empty
   // list = no-op. ref/claude-code-fork `filterToolsByDenyRules`
   // (`src/tools.ts:262-269`) pattern.
-  const denyList = opts.toolDeny ?? cfg.chat.toolDeny;
-  const { filterToolsByDeny } = await import('./tool-runtime/tool-deny.js');
   const tools = filterToolsByDeny(assembledTools, denyList) ?? assembledTools;
+  const toolSearchAllowed = (filterToolsByDeny([buildToolSearchTool()], denyList) ?? [buildToolSearchTool()]).length > 0;
   // The assertion catalog and JSON audit fields must describe the exact
   // post-deny tool array supplied to the provider, not the candidate pool.
   const surfaceToolNames = tools.map((tool) => tool.name);
@@ -770,7 +807,8 @@ export async function runEvalPrompt(opts: EvalPromptOpts): Promise<EvalPromptRes
   // 필터로 떨어져 나간 이름 — dispatch 경계 차단에 쓴다(위 dispatchTool 참조).
   const allowedNames = new Set(tools.map((t) => t.name));
   const deniedNames = new Set(
-    assembledTools.map((t) => t.name).filter((n) => !allowedNames.has(n)),
+    [...assembledTools.map((t) => t.name).filter((n) => !allowedNames.has(n)),
+      ...(!toolSearchAllowed ? [TOOL_SEARCH_NAME] : [])],
   );
   if (!opts.silent) {
     process.stdout.write(`[ask] tools: ${tools.length} (${tools.map(t => t.name).join(', ')})\n`);
@@ -812,6 +850,10 @@ export async function runEvalPrompt(opts: EvalPromptOpts): Promise<EvalPromptRes
   let turnCount = 0;
   let toolCallCount = 0;
   let finalText = '';
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let usageEvents = 0;
+  let firstTokenMs: number | null = null;
 
   // Forensic log: mirror the headless invocation as a chat-surface
   // event so log/latest shows the entry point alongside the dashboard
@@ -832,7 +874,10 @@ export async function runEvalPrompt(opts: EvalPromptOpts): Promise<EvalPromptRes
   //   재현하지 못한다(실측: 모델이 "ToolSearch 도구는 제공되지 않았다"고 답함).
   //   ⚠️ cli 서피스는 deferred 가 0 이라 이 호출이 **no-op**이다(무회귀·실측 확인).
   const { applyDeferredTools } = await import('./session-runtime/tier-flip.js');
-  const deferredSplit = applyDeferredTools(messages, tools, { userText: opts.prompt });
+  const deferredSplit = applyDeferredTools(messages, tools, {
+    userText: opts.prompt,
+    ...(opts.routingStrategy === undefined ? {} : { enabled: opts.routingStrategy === 'index' }),
+  });
   if (!opts.silent && deferredSplit.stats.deferredCount > 0) {
     process.stdout.write(
       `[ask] tier-flip: active=${deferredSplit.stats.activeCount} deferred=${deferredSplit.stats.deferredCount}`
@@ -844,6 +889,7 @@ export async function runEvalPrompt(opts: EvalPromptOpts): Promise<EvalPromptRes
     deferredSplit.messages,
     {
       onText: (delta: string) => {
+        if (firstTokenMs === null && delta.length > 0) firstTokenMs = Date.now() - startedAt;
         finalText += delta;
         if (!opts.silent && !opts.json) {
           process.stdout.write(delta);
@@ -866,17 +912,32 @@ export async function runEvalPrompt(opts: EvalPromptOpts): Promise<EvalPromptRes
       // is observable from CLI runs (scenarios, repro, eval). Best-
       // effort import — failure doesn't block the turn.
       onUsage: (usage) => {
+        inputTokens += usage.inputTokens ?? 0;
+        outputTokens += usage.outputTokens ?? 0;
+        usageEvents += 1;
         import('./prompt-cache/metrics.js')
           .then(({ recordUsage }) => recordUsage(usage))
           .catch(() => { /* metrics best-effort */ });
       },
       dispatchTool: async (name, args) => {
+        const dispatchKind = evalToolDispatchKind(name, deniedNames, measurementOnlyDispatchNames, measurementOnlyMode);
         // ⚠️ deny-list 는 **서피스와 무관하게** dispatch 경계에서 막는다(리뷰 must-fix).
         //   spec 필터만으론 부족하다 — 프로바이더가 스펙에 없는 이름을 그냥 부를 수 있고,
         //   데몬 서피스의 ToolSearch 는 **필터 전 원본 풀**에서 스키마를 하이드레이트하므로
         //   거부된 툴이 소환→호출로 되살아난다. 두 경로 모두 여기서 차단.
-        if (deniedNames.has(name)) {
+        if (dispatchKind === 'denied') {
           return { error: `tool '${name}' is denied by chat.toolDeny` };
+        }
+        // Measurement mode is fail-closed: allowed corpus names are no-op receipts,
+        // ToolSearch can hydrate only the measured route schemas, and every other
+        // name is rejected before any host/daemon/plugin dispatch.
+        if (dispatchKind === 'measurement-only') return { measurementOnly: true, tool: name };
+        if (dispatchKind === 'measurement-search') {
+          const { routeToolSearch } = await import('./skills/tools/tool-search-route.js');
+          return routeToolSearch(args, measurementSearchTools, { surface: selectedSurface });
+        }
+        if (dispatchKind === 'measurement-blocked') {
+          return { error: `measurement mode blocks unexpected tool '${name}'` };
         }
         // 데몬 서피스 dispatch 는 ctx.signal 이 **필수 필드**라 한 번 만들어 재사용한다
         // (툴콜마다 새 AbortController 를 만들 이유가 없다).
@@ -994,6 +1055,8 @@ export async function runEvalPrompt(opts: EvalPromptOpts): Promise<EvalPromptRes
     surfaceToolNames,
     surfaceToolCount: surfaceToolNames.length,
     durationMs,
+    ...(usageEvents > 0 ? { inputTokens, outputTokens } : {}),
+    firstTokenMs,
     logPath: logPath ?? (process.env.ELANOUS_LOG_LATEST ?? 'log/latest'),
     eventCounts,
     assertions,

@@ -110,16 +110,18 @@ describe('register-mcp-clients.ts surface', () => {
 
 describe('user-config mcp surface', () => {
   const src = readSource('src/user-config.ts');
+  const types = readSource('src/user-config/types.ts');
+  const schema = readSource('src/user-config/schema.ts');
 
   test('exports McpServerSpec + McpConfig types', () => {
-    expect(src).toMatch(/export\s+type\s+McpServerSpec/);
-    expect(src).toMatch(/export\s+interface\s+McpStdioServerSpec/);
-    expect(src).toMatch(/export\s+interface\s+McpHttpServerSpec/);
-    expect(src).toMatch(/export\s+interface\s+McpConfig/);
+    expect(types).toMatch(/export\s+type\s+McpServerSpec/);
+    expect(types).toMatch(/export\s+interface\s+McpStdioServerSpec/);
+    expect(types).toMatch(/export\s+interface\s+McpHttpServerSpec/);
+    expect(types).toMatch(/export\s+interface\s+McpConfig/);
   });
 
   test('UserConfig has sparse `mcp?: McpConfig` field', () => {
-    expect(src).toMatch(/mcp\?\s*:\s*McpConfig/);
+    expect(schema).toMatch(/mcp\?\s*:\s*McpConfig/);
   });
 
   test('parseUserConfig wires `mcp` via spreadIfDefined (sparse pattern)', () => {

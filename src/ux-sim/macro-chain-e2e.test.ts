@@ -8,6 +8,10 @@ import { planGateBisect } from '../../scripts/release-loop/gate-bisect.js';
 import { runGateBisectSidecar } from '../../scripts/release-loop/gate-bisect-sidecar.js';
 import { testFileOfId } from '../../scripts/release-loop/gate-partial.js';
 import { runGateRepairNode } from '../../scripts/release-loop/gate-repair-node.js';
+import { planAdaptiveGateHeal } from '../../scripts/release-loop/adaptive-gate-heal.js';
+import { classifyGateShadow } from '../../scripts/release-loop/gate-triage-node.js';
+import { planMacrophageIncident } from '../release-loop/macrophage-incident-recovery.js';
+import { planMacrophageRepairLadder } from '../release-loop/macrophage-repair-ladder.js';
 import { runReleaseMacrophageIncidentSim } from './release-sim-rig.js';
 
 test('MACRO-CHAIN-E2E: production shard failure collection feeds bisect findings into same-run multi-file repair', async () => {
@@ -25,6 +29,36 @@ test('MACRO-CHAIN-E2E: production shard failure collection feeds bisect findings
       output: `${id.split(' > ')[0]}:\n(fail) ${id.split(' > ')[1]} [1.00ms]\n1 fail\nRan 1 test across 1 files.\n` }));
     const collected = partialFailuresOf(completeShardRuns);
     expect(collected).toEqual({ failures, errors: [] });
+
+    const contextSignal = { id: 'same-regression-different-cut-window', source: 'release-graph' as const,
+      signature: 'same introduced three-file regression', evidence: 'introduced' as const,
+      failureIds: failures, sourceFiles: failures.map((id) => testFileOfId(id).replace(/\.test\.ts$/, '')).sort(),
+      independentFiles: true };
+    const classification = planMacrophageIncident(contextSignal);
+    const ladderInput = { runId, signature: contextSignal.signature, evidence: 'introduced' as const,
+      failureIds: failures, sourceFiles: contextSignal.sourceFiles, independentFiles: true,
+      changeKind: 'production' as const, repairChildrenUsed: 0, elapsedMs: 0, estimatedStepMs: 60_000 };
+    const normalWindow = planMacrophageRepairLadder({ ...ladderInput, minutesToCut: 32 });
+    const cutoffWindow = planMacrophageRepairLadder({ ...ladderInput, minutesToCut: 31 });
+    expect(classification.label).toBe('fix');
+    expect(planMacrophageIncident({ ...contextSignal, id: 'same-regression-near-cut' }).label).toBe(classification.label);
+    expect(normalWindow).toMatchObject({ step: 'R2-split-files', action: 'repair-plan', childrenPlanned: 3 });
+    expect(cutoffWindow).toMatchObject({ step: 'R4-hitl', action: 'raise-decision', childrenPlanned: 0 });
+    expect(cutoffWindow.reason).toContain('30-minute cutoff');
+    const contextGate = { outcome: 'regression' as const, commit: 'c'.repeat(40), introduced: failures,
+      preexisting: 0, fixed: null, knownEnv: 0, knownEnvCleared: [], stalledEnv: [],
+      rcNonzeroNoFailures: [], durationMs: 1 };
+    const contextTriage = classifyGateShadow(contextGate);
+    const unconstrainedHeal = planAdaptiveGateHeal({ version: '0.3.8', runId, gate: contextGate, triage: contextTriage,
+      visitState: { gate: 1, gateTriage: 1 }, gateExecutor: 'pod', gatePodPool: 'sim-pool' });
+    const cutoffHeal = planAdaptiveGateHeal({ version: '0.3.8', runId, gate: contextGate, triage: contextTriage,
+      visitState: { gate: 1, gateTriage: 1 }, gateExecutor: 'pod', gatePodPool: 'sim-pool',
+      macrophageRepairLadder: { ...ladderInput, minutesToCut: 31 } });
+    expect(contextTriage.classification).toBe('regression');
+    expect(unconstrainedHeal.disposition.action).toBe('append-repair-and-resume');
+    expect(cutoffHeal).toMatchObject({ macrophageRepairLadder: { step: 'R4-hitl', action: 'raise-decision' },
+      disposition: { action: 'decision-required' } });
+    expect(cutoffHeal.events.some((event) => event.name === 'heal.repair-node.planned')).toBe(false);
 
     const baseCommit = 'a'.repeat(40);
     const firstBadCommit = 'b'.repeat(40);
@@ -111,12 +145,26 @@ test('MACRO-CHAIN-E2E: production shard failure collection feeds bisect findings
       signature: `bisect ${bisectedCommit}; production collect-all returned ${collected.failures.length} failures`,
       evidence: 'introduced' as const, failureIds: collected.failures, sourceFiles, independentFiles: true, causePr: 77 };
     const macro = await runReleaseMacrophageIncidentSim({ runId, incidents: [incident],
-      repairLandedIds: [incident.id], hitlApprovedIds: [], graphDrivenIncidentIds: [incident.id] });
+      repairLandedIds: [incident.id], hitlApprovedIds: [], graphDrivenIncidentIds: [incident.id],
+      receiptAuditKeyMismatchFirst: true });
     expect(macro.pass, JSON.stringify({ graphState: macro.graphState.status, path: macro.graphState.path,
       repairFailureIds: macro.graphRepairFailureIds, repairFiles: macro.graphRepairInputFiles })).toBe(true);
+    expect(macro.runtimeDecisions.some((event) => event.runId === runId && event.graphId === 'release-loop'
+      && event.data?.action === 'regenerate' && event.data.applied === true)).toBe(true);
     expect(macro.runId).toBe(runId);
     expect(macro.graphRepairFailureIds).toEqual(collected.failures);
     expect(macro.graphRepairInputFiles).toEqual(sourceFiles);
+    const firstAudit = macro.graphState.path.indexOf('receipt-audit');
+    const triage = macro.graphState.path.indexOf('gate-triage');
+    const repairNode = macro.graphState.path.findIndex((nodeId) => /^gate-repair-[a-f0-9]{12}$/.test(nodeId));
+    const repairGate = macro.graphState.path.indexOf('gate', repairNode + 1);
+    const secondAudit = macro.graphState.path.indexOf('receipt-audit', repairGate + 1);
+    expect(firstAudit).toBeGreaterThan(macro.graphState.path.indexOf('gate'));
+    expect(macro.graphState.path.indexOf('residual-run', firstAudit + 1)).toBeLessThan(triage);
+    expect(triage).toBeLessThan(repairNode);
+    expect(repairNode).toBeLessThan(repairGate);
+    expect(repairGate).toBeLessThan(secondAudit);
+    expect(macro.graphState.path.filter((nodeId) => nodeId === 'receipt-audit')).toHaveLength(2);
     const injectedIncident = macro.eventTrace.find((event) => event.type === 'release.macrophage.incident.injected'
       && (event.data?.signal as { id?: string } | undefined)?.id === incident.id);
     expect(injectedIncident?.data?.signal).toMatchObject({ signature: expect.stringContaining(bisectedCommit) });

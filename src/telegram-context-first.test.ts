@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { TelegramBot } from './telegram.js';
 import type { ContextNowAnswer, ContextNowDeps } from './context-bus/context-now.js';
 import { renderContextFirstOpening } from './context-bus/context-now-surfaces.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 
 const HOUR = 60 * 60 * 1000;
 const at = '2026-10-06T00:00:00.000Z';

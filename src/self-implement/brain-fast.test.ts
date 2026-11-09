@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveTokens } from '../oauth/store.js';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 
 const logs: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
 let logSpy: ReturnType<typeof spyOn>;
@@ -80,7 +81,6 @@ test('budget brain routes through getProviderForConfig with reasoning off despit
   const priorXdg = process.env.XDG_CONFIG_HOME;
   const priorCodexHome = process.env.CODEX_HOME;
   const priorAccount = process.env.ELANOUS_CODEX_ACCOUNT;
-  const fetchSpy = spyOn(globalThis, 'fetch');
   try {
     process.env.XDG_CONFIG_HOME = dir;
     process.env.ELANOUS_CODEX_ACCOUNT = 'brain-fast';
@@ -93,11 +93,11 @@ test('budget brain routes through getProviderForConfig with reasoning off despit
       reasoningLevel: 'high', codexReasoning: { effort: 'high', summary: 'auto' },
     } }));
     const bodies: Array<Record<string, unknown>> = [];
-    fetchSpy.mockImplementation((async (_input, init) => {
-      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    await withFakeFetchDevice([{ url: '/backend-api/codex/responses', method: 'POST', response: (request) => {
+      bodies.push(JSON.parse(request.body ?? '{}') as Record<string, unknown>);
       return new Response('data: {"type":"response.output_text.delta","delta":"{\\"action\\":\\"wait\\"}"}\n\ndata: {"type":"response.completed","response":{"id":"test-response"}}\n\n',
         { status: 200, headers: { 'content-type': 'text/event-stream' } });
-    }) as typeof fetch);
+    } }], async (fetchDevice) => {
     const configuredProvider = getProviderForConfig(getUserConfig(), 'gpt-6-luna');
     for await (const _chunk of configuredProvider.streamChat!([{ role: 'user', content: 'baseline' }], { model: 'gpt-6-luna' })) { /* drain provider stream */ }
     expect(bodies[0]).toMatchObject({ reasoning: { effort: 'high' } });
@@ -107,8 +107,9 @@ test('budget brain routes through getProviderForConfig with reasoning off despit
     expect(bodies).toHaveLength(2);
     expect(bodies[1]!.model).toBe('gpt-6-luna');
     expect(bodies[1]!.reasoning).toBeUndefined();
+      expect(fetchDevice.calls()).toHaveLength(bodies.length);
+    });
   } finally {
-    fetchSpy.mockRestore();
     if (priorXdg === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = priorXdg;
     if (priorCodexHome === undefined) delete process.env.CODEX_HOME;

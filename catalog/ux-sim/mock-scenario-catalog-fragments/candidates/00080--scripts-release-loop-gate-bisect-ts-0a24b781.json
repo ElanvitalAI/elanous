@@ -1,0 +1,11 @@
+{
+  "path": "scripts/release-loop/gate-bisect.ts",
+  "disposition": "device",
+  "entryCommand": "bun test scripts/release-loop/gate-bisect.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Production bisect planner and shadow-to-operational transition are asserted in the release simulation tests.",
+  "deviceId": "release-graph-rig",
+  "scenarioIds": [
+    "UX-MS-02"
+  ]
+}

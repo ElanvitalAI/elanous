@@ -197,5 +197,7 @@ describe('nexus /v1 default-deny', () => {
     expect(isPublicRoute('POST', '/v1/health', { setupMode: false })).toBe(false);
     expect(isPublicRoute('GET', '/app/', { setupMode: true })).toBe(false);
     expect(isPublicRoute('GET', '/', { setupMode: true })).toBe(false);
+    expect(isPublicRoute('GET', '/v1/members/owner', { setupMode: false })).toBe(true);
+    expect(isPublicRoute('POST', '/v1/members/owner', { setupMode: false })).toBe(false);
   });
 });

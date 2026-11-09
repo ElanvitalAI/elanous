@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/release-same-version-run-adoption-sim.test.ts",
+  "reason": "RELEASE-RUN-RECOGNIZE-EXISTING-CUT: regression proof that the real graph runner resumes the failed node with repaired input and no second run ledger entry."
+}

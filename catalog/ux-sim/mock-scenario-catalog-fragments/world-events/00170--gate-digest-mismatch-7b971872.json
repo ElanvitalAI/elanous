@@ -1,0 +1,5 @@
+{
+  "id": "gate-digest-mismatch",
+  "name": "Gate pool image digest mismatch",
+  "description": "Inject a differing pool image digest and observe production gate pin validation refuse the roster."
+}

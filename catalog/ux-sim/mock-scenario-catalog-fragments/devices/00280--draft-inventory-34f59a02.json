@@ -1,0 +1,38 @@
+{
+  "id": "draft-inventory",
+  "name": "Draft triage inventory simulator",
+  "implementation": [
+    "src/ux-sim/draft-inventory-builder.ts",
+    "src/ux-sim/scenario.ts"
+  ],
+  "tests": [
+    "src/ux-sim/draft-inventory-builder.test.ts",
+    "src/ux-sim/scenario.test.ts"
+  ],
+  "target": "production draft triage decision distribution and protected/running safety",
+  "inputs": [
+    "deterministic 200-draft inventory",
+    "merged twins",
+    "open duplicates",
+    "harvest references",
+    "file lineage",
+    "labels",
+    "run state",
+    "age"
+  ],
+  "observations": [
+    "real decideDraft/draftClaimState decisions",
+    "scenario screen summary",
+    "runId-scoped isolated test logs.db events",
+    "evidence artifact"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/draft-inventory-builder.test.ts src/ux-sim/scenario.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "ux.sim.draft-inventory/assessed",
+    "ux.sim.scenario/completed"
+  ],
+  "recentUse": null
+}

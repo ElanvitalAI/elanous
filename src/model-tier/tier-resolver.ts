@@ -13,7 +13,7 @@
 // model-tier package. Callers (cost-tracker / streaming-stt bridge /
 // PWA settings) read `getUserConfig().modelTier` and pass it in.
 
-import type { LLMProviderName } from '../user-config.js';
+import type { LLMProviderName } from '../user-config/types.js';
 import {
   lookupEmbeddingTierSpec,
   type EmbeddingProvider,

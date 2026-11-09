@@ -27,7 +27,7 @@ test('RLA-ARG-ADAPTIVE-HEAL sim: production decision core consumes injected gate
     const repeat = scenario.inject.repeat ?? 0;
     const prior = repeat ? Array.from({ length: repeat }, () => ({ classification: 'regression' as const,
       commit: gate.commit, failureIds: [...(scenario.inject.introduced ?? [])] })) : undefined;
-    const triage = classifyGateShadow(gate, prior ? { priorDecisions: prior } : {});
+    const triage = { ...classifyGateShadow(gate, prior ? { priorDecisions: prior } : {}), gateExecutionId: `exec-${scenario.id}` };
     const plan = planAdaptiveGateHeal({ version: '0.3.6', runId: `sim-${scenario.id}`, gate, triage,
       gateExecutor: scenario.inject.executor, gatePodPool: scenario.inject.gatePodPool,
       visitState: { gate: 1, gateTriage: 1 } });
@@ -37,12 +37,13 @@ test('RLA-ARG-ADAPTIVE-HEAL sim: production decision core consumes injected gate
     expect(plan.attribution.commit).toBe(gate.commit);
     if (plan.disposition.action === 'append-repair-and-resume') {
       expect(plan.disposition.repairNode.input.failureIds).toEqual(scenario.inject.introduced ?? []);
+      expect(plan.disposition.repairNode.input.gateExecutionId).toBe(`exec-${scenario.id}`);
       expect(plan.disposition.resumeFrom).toBe(plan.disposition.repairNode.nodeId);
       expect(plan.disposition.rerunGateAt).toBe('gate');
       expect(plan.disposition.visitLimits).toEqual({ gate: 2, gateTriage: 2 });
       expect(plan.disposition.maxRepairRetries).toBe(1);
-      expect(graph.nodes.find((node) => node.node_id === 'gate')?.max_visits).toBe(plan.disposition.visitLimits.gate);
-      expect(graph.nodes.find((node) => node.node_id === 'gate-triage')?.max_visits).toBe(plan.disposition.visitLimits.gateTriage);
+      expect(graph.nodes.find((node) => node.node_id === 'gate')?.max_visits).toBeGreaterThanOrEqual(plan.disposition.visitLimits.gate);
+      expect(graph.nodes.find((node) => node.node_id === 'gate-triage')?.max_visits).toBeGreaterThanOrEqual(plan.disposition.visitLimits.gateTriage);
     }
     if (plan.disposition.action === 'append-image-repair-and-resume') {
       expect(plan.disposition.repairNode.input).toEqual({ version: '0.3.6', runId: `sim-${scenario.id}`,

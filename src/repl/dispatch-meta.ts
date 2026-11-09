@@ -17,12 +17,8 @@
 
 import { ensureCliSession, sessionBudget } from '../session/chat.js';
 import { loadSession, setActiveSessionId } from '../session/index.js';
-import {
-  reloadUserConfig,
-  saveUserConfig,
-  jumpToRotationEntry,
-  type UserConfig,
-} from '../user-config.js';
+import { reloadUserConfig, saveUserConfig, jumpToRotationEntry } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { setAmbientSessionId } from '../debug/log.js';
 import { inspectActiveProvider } from '../provider-summary.js';
 

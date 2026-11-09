@@ -1,0 +1,17 @@
+version: 1
+kind: release-graph
+id: rla-incident-policy-host-lost-0911
+isolation: test
+input:
+  version: '0.3.8'
+  previousVersion: '0.3.7'
+cases:
+  - id: release-host-lost-policy-append
+    mode: incident-policy-handler
+    incidentEventType: release.incident.host-lost
+    incidentDescription: A release host disappeared during the cut run.
+    incidentRationale: Reassign the affected release work after detecting host loss.
+    expect:
+      status: done
+      mustVisit: [gate, gate-triage, done]
+      mustNotVisit: [failed, publish]

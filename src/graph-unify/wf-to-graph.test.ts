@@ -191,7 +191,7 @@ test('concurrent workflows fall back with a reason and preserve overlapping exec
   } finally { resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('runWorkflow reads one config switch, logs unsupported conversion, and retains wf event/output shape', async () => {
+test('runWorkflow always converts to the graph (workflowGraphEnabled removed), logs unsupported conversion, and retains wf event/output shape', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wf2g-'));
   const configDir = join(dir, 'config');
   const calls: string[] = [];
@@ -220,28 +220,8 @@ test('runWorkflow reads one config switch, logs unsupported conversion, and reta
     expect(recovered.outputs.recover?.output).toBe('recovered');
     expect(debug.events(100).filter(event => event.category === 'graph.unify' && event.event === 'wf-fallback').at(-1)?.data)
       .toMatchObject({ file: onError.name, reason: 'error routing' });
-    mkdirSync(configDir, { recursive: true });
-    writeFileSync(join(configDir, 'config.json'), JSON.stringify({ workflowGraphEnabled: false }));
-    expect(getUserConfig().raw.workflowGraphEnabled).toBe(false);
-    const disabledSupported = await run(supported);
-    expect(disabledSupported.ok).toBe(graph.ok);
-    expect(Object.fromEntries(Object.entries(disabledSupported.outputs).map(([id, value]) => [id, { ok: value.ok, output: value.output }])))
-      .toEqual(Object.fromEntries(Object.entries(graph.outputs).map(([id, value]) => [id, { ok: value.ok, output: value.output }])));
-    expect(disabledSupported.events.map(event => event.type)).toEqual(graph.events.map(event => event.type));
-    const legacyRecovered = await recover();
-    expect(legacyRecovered.ok).toBe(recovered.ok);
-    expect(Object.fromEntries(Object.entries(legacyRecovered.outputs).map(([id, value]) => [id, { ok: value.ok, output: value.output }])))
-      .toEqual(Object.fromEntries(Object.entries(recovered.outputs).map(([id, value]) => [id, { ok: value.ok, output: value.output }])));
-    expect(legacyRecovered.events.map(event => event.type)).toEqual(recovered.events.map(event => event.type));
-    const legacy = await run(unsupported);
-    expect(Object.fromEntries(Object.entries(legacy.outputs).map(([id, value]) => [id, { ok: value.ok, output: value.output }])))
-      .toEqual(Object.fromEntries(Object.entries(fallback.outputs).map(([id, value]) => [id, { ok: value.ok, output: value.output }])));
-    const legacySerial = await run(supported);
-    expect(Object.fromEntries(Object.entries(legacySerial.outputs).map(([id, value]) => [id, { ok: value.ok, output: value.output }])))
-      .toEqual(Object.fromEntries(Object.entries(graph.outputs).map(([id, value]) => [id, { ok: value.ok, output: value.output }])));
-    expect(legacySerial.events.map(event => event.type)).toEqual(graph.events.map(event => event.type));
     expect(debug.events(100).filter(event => event.category === 'graph.unify' && event.event === 'wf-fallback').length).toBe(before + 2);
-    expect(calls).toEqual(Array(10).fill('one'));
+    expect(calls).toEqual(Array(4).fill('one'));
   } finally { resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
 });
 

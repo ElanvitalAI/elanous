@@ -1,0 +1,5 @@
+{
+  "id": "RLA-ER-02",
+  "name": "Receipt shard corruption",
+  "description": "Measure isolated rerun of a damaged receipt shard."
+}

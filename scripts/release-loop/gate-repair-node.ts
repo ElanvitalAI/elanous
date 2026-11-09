@@ -3,6 +3,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
@@ -284,7 +285,7 @@ function repairInput(context: GraphContext): { version: string; previousVersion:
 
 function gitIsAncestor(ancestor: string, descendant: string, repo: string): boolean {
   const result = spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], {
-    cwd: repo, encoding: 'utf8', timeout: 30_000, env: process.env,
+    cwd: repo, encoding: 'utf8', timeout: 30_000, env: process.env, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
   });
   if (result.error || (result.status !== 0 && result.status !== 1)) {
     throw new Error(`could not verify repair merge ancestry: ${(result.stderr || result.error)?.toString().trim() ?? `git exited ${result.status}`}`);
@@ -294,13 +295,13 @@ function gitIsAncestor(ancestor: string, descendant: string, repo: string): bool
 
 function fetchMainlineHead(repo: string): string {
   const fetch = spawnSync('git', ['fetch', '--no-tags', 'origin', 'main'], {
-    cwd: repo, encoding: 'utf8', timeout: 120_000, env: process.env,
+    cwd: repo, encoding: 'utf8', timeout: 120_000, env: process.env, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
   });
   if (fetch.error || fetch.status !== 0) {
     throw new Error(`could not refresh origin/main after repair landings: ${(fetch.stderr || fetch.error)?.toString().trim() ?? `git exited ${fetch.status}`}`);
   }
   const resolved = spawnSync('git', ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], {
-    cwd: repo, encoding: 'utf8', timeout: 30_000, env: process.env,
+    cwd: repo, encoding: 'utf8', timeout: 30_000, env: process.env, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
   });
   const head = resolved.stdout.trim();
   if (resolved.error || resolved.status !== 0 || !/^[0-9a-f]{40}$/i.test(head)) {
@@ -501,17 +502,17 @@ export async function runGateRepairNode(context: GraphContext, deps: GateRepairN
   });
   const recoveryRequired = repairs.filter((repair) => repair.status === 'recovery-required');
   if (recoveryRequired.length) {
-    const remainingFailureIds = [
+    const remainingFailureIds = [...new Set([
       ...unprefixFailureIds(recoveryRequired.flatMap(({ failureIds: ids }) => ids)),
       ...unprefixFailureIds(allHumanRequired.flatMap(({ failureIds: ids }) => ids)),
-    ];
+    ])];
     return { outcome: 'recovery-required' as const, verdict: 'fail' as const,
       summary: `${presentOnMainline.length}/${files.length} repair files are verified on refreshed mainline; landing recovery required for ${recoveryRequired.map(({ file, reason }) => `${file}: ${reason}`).join('; ')}`,
       repairedFiles: presentOnMainline.map(({ file }) => file), humanRequired: allHumanRequired,
       remainingFailureIds, repairs };
   }
   if (allHumanRequired.length) {
-    const remainingFailureIds = unprefixFailureIds(allHumanRequired.flatMap(({ failureIds: ids }) => ids));
+    const remainingFailureIds = [...new Set(unprefixFailureIds(allHumanRequired.flatMap(({ failureIds: ids }) => ids)))];
     return { outcome: 'fail' as const, verdict: 'fail' as const,
       summary: `${presentOnMainline.length}/${files.length} attributed repair files are verified on refreshed mainline; HITL needed for ${allHumanRequired.map(({ file }) => file).join(', ')}`,
       repairedFiles: presentOnMainline.map(({ file }) => file),

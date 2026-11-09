@@ -6,7 +6,7 @@ import { classifyHarnessPodExit, recordClassifiedHarnessPodExit } from '../harne
 import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { podJobName, podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { POD_TERMINATION_JOB_JSONPATH, POD_TERMINATION_PODS_JSONPATH } from '../task-orchestrator/surfaces/pod-failure-reason.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 /**
  * L2 가짜 kubectl 장치 — si-task Job 실패 사건(Job BackoffLimitExceeded · child container OOMKilled ·

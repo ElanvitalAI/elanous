@@ -1081,38 +1081,11 @@ describe('B-1.d · runDeferredSkillToolSlash helper', () => {
   });
 });
 
-describe('B-1.d · remaining deferred skill-tool slash registrations', () => {
-  // Each registration is verified for two things only — that's the
-  // load-bearing per-case check at this tier:
-  //   1. The name/alias is registered (dispatch returns 'continue', not 'unregistered').
-  //   2. The handler executes synchronously (the dispatch call itself
-  //      returns immediately because the IIFE is fire-and-forget).
-  // The actual skill-tool execution is exercised in those modules' own
-  // test files; the helper's behavior is covered by the previous block.
-  const registeredNames = [
-    'agent-room',
-    'showroom',
-    'lane',
-    'relay',
-    'reply',
-    'capture',
-    'inject',
-  ] as const;
-
-  for (const name of registeredNames) {
-    test(`/${name} is registered and dispatches as 'continue'`, async () => {
-      const reg = buildDashboardSlashRegistry();
-      const { ctx } = makeFakeCtx();
-      const r = await reg.dispatch(name, [], ctx);
-      expect(r.kind).toBe('continue');
-    });
-  }
-
-  test('remaining deferred handlers are present in registry.names()', () => {
-    const reg = buildDashboardSlashRegistry();
-    const names = new Set(reg.names());
-    for (const n of registeredNames) {
-      expect(names.has(n)).toBe(true);
+describe('B-1.d · removed hidden skill-tool slashes', () => {
+  test('removed hidden wrappers are absent from the TUI registry', () => {
+    const names = new Set(buildDashboardSlashRegistry().names());
+    for (const name of ['board', 'reply', 'capture', 'inject', 'agent-room', 'showroom', 'lane', 'relay']) {
+      expect(names.has(name)).toBe(false);
     }
   });
 });

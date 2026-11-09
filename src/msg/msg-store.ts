@@ -262,7 +262,10 @@ export class MsgStore {
   /** Append once for a coordination comment, task failure, or decided notification. */
   appendWithProvenance(input: MessageEnvelope, provenanceKey: string): Message {
     if (typeof provenanceKey !== 'string' || !/^(?:coord|ta-failure|decision):[^:]+:[^:]+$/.test(provenanceKey) &&
-        !/^release-stage:[^:]+:event$/.test(provenanceKey)) {
+        !/^release-stage:[^:]+:event$/.test(provenanceKey) &&
+        !/^(?:release-event|rla-held-event):[A-Za-z0-9_-]+:(?:OP|RLA)$/.test(provenanceKey) &&
+        !/^rla-command-reply:[1-9][0-9]*:OP$/.test(provenanceKey) &&
+        !/^rla-question-reply:[1-9][0-9]*:OP$/.test(provenanceKey)) {
       throw new Error('invalid message provenance key');
     }
     const msg = validateMessageEnvelope(input);

@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-EDGE-CREATOR-NIGHTLY-TS",
+  "path": "src/ux-sim/edge-creator-nightly.ts",
+  "boundary": "Runs nightly pairwise graph-edge simulations and records same-run resume outcomes.",
+  "deviceIds": ["edge-creator"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

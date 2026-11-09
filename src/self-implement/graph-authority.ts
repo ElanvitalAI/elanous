@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, normalize } from 'node:path/posix';
 import type { GoalType } from './goal-author.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import type * as TS from 'typescript';
 import tsApi from './lazy-typescript.js';
 import {

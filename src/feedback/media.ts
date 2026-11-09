@@ -1,3 +1,4 @@
+import { asRecord } from '../primitives/guards';
 /** Surface-neutral media derivation. No `apps/` imports. */
 
 export interface MediaJob {
@@ -93,24 +94,19 @@ export function mcpAppResourceUriOf(rawOutput: unknown): MediaWidget['resourceUr
   return typeof flat === 'string' && flat.trim().length > 0 ? flat : undefined;
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  return value as Record<string, unknown>;
-}
-
 function hasMediaJobSource(rec: Record<string, unknown>): boolean {
-  return Array.isArray(rec.jobs) || Array.isArray(rec.results) || asRecord(rec.generation) !== undefined;
+  return Array.isArray(rec.jobs) || Array.isArray(rec.results) || asRecord(rec.generation, { fallback: 'undefined' }) !== undefined;
 }
 
 function structuredRecordOf(rawOutput: unknown): Record<string, unknown> | undefined {
-  const root = asRecord(rawOutput);
+  const root = asRecord(rawOutput, { fallback: 'undefined' });
   if (!root) return undefined;
-  const structuredContent = asRecord(root.structuredContent);
-  const structured = asRecord(root.structured);
+  const structuredContent = asRecord(root.structuredContent, { fallback: 'undefined' });
+  const structured = asRecord(root.structured, { fallback: 'undefined' });
   const candidates = [
-    asRecord(structuredContent?.structured),
+    asRecord(structuredContent?.structured, { fallback: 'undefined' }),
     structuredContent,
-    asRecord(structured?.structured),
+    asRecord(structured?.structured, { fallback: 'undefined' }),
     structured,
   ];
   for (const rec of candidates) {
@@ -124,7 +120,7 @@ function jobsArrayOf(rawOutput: unknown): unknown[] | undefined {
   if (!structured) return undefined;
   if (Array.isArray(structured.jobs)) return structured.jobs;
   if (Array.isArray(structured.results)) return structured.results;
-  if (asRecord(structured.generation)) return [structured.generation];
+  if (asRecord(structured.generation, { fallback: 'undefined' })) return [structured.generation];
   return undefined;
 }
 
@@ -133,14 +129,14 @@ function mediaStatusOf(value: unknown): MediaJob['status'] {
 }
 
 function mediaJobOf(entry: unknown): MediaJob | undefined {
-  const rec = asRecord(entry);
+  const rec = asRecord(entry, { fallback: 'undefined' });
   if (!rec) return undefined;
   const jobId = typeof rec.job_id === 'string' ? rec.job_id
     : typeof rec.id === 'string' ? rec.id
     : undefined;
   if (!jobId) return undefined;
   if (rec.type !== 'image' && rec.type !== 'video') return undefined;
-  const params = asRecord(rec.params);
+  const params = asRecord(rec.params, { fallback: 'undefined' });
   const prompt = typeof rec.prompt === 'string' ? rec.prompt
     : typeof params?.prompt === 'string' ? params.prompt
     : undefined;

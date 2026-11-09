@@ -18,6 +18,16 @@ describe('Bun fake clock scope', () => {
     expect(jest.isFakeTimers()).toBe(false);
   });
 
+  it('advances timer callbacks and one Promise continuation turn without waiting', async () => {
+    const epoch = Date.parse('2026-10-15T00:00:00Z');
+    await withSimClock(epoch, async (clock) => {
+      const fired = new Promise<number>((resolve) => setTimeout(() => resolve(Date.now()), 25));
+      await clock.tickAndFlushMicrotasks(25);
+      await expect(fired).resolves.toBe(epoch + 25);
+    });
+    expect(jest.isFakeTimers()).toBe(false);
+  });
+
   it('restores global timers even when the scenario throws', async () => {
     await expect(withSimClock(0, () => {
       setTimeout(() => {}, 10_000);

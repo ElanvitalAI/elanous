@@ -3,8 +3,6 @@
 import { Suspense, useEffect, useRef, useState } from 'react';
 import { usePathname } from 'next/navigation';
 import { Menu, MoreHorizontal, X } from 'lucide-react';
-import { useWorkspaceOptional } from '@/components/workspace/WorkspaceProvider';
-import { tabsInOrder } from '@/lib/workspace/store';
 import type { ShellActivitySnapshot } from './activity-snapshot';
 import { SIDEBAR_NAV_ITEMS, navItemActive } from './sidebar-nav-items';
 import { NavSearchProbe } from './NavSearchProbe';
@@ -24,14 +22,10 @@ export function CompactTopBar({ onToggleSidebar, sidebarOpen, activity, setWide,
   const moreRef = useRef<HTMLButtonElement>(null);
   const sheetRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
-  const workspace = useWorkspaceOptional();
-  const active = workspace && tabsInOrder(workspace.state).find((tab) => tab.id === workspace.state.activeId);
   const path = (pathname ?? '/').replace(/\/+$/, '') || '/';
-  const activeScreen = active?.kind === 'chat' ? active.title ?? '채팅'
-    : active?.kind === 'term' ? '터미널' : active?.kind;
   const [search, setSearch] = useState('');
   const routeScreen = SIDEBAR_NAV_ITEMS.find((item) => navItemActive(item, path, search, SIDEBAR_NAV_ITEMS))?.label;
-  const screen = path === '/workspace' && activeScreen ? activeScreen : routeScreen ?? 'elanous';
+  const screen = routeScreen ?? 'elanous';
 
   useEffect(() => {
     if (!open) return;

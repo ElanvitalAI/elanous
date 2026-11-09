@@ -2,7 +2,7 @@
 // toolSurface('chat'/'webterm', cfg) 가 financeEnabled 시 finance_* 를 노출하는지 배선 고정.
 import { test, expect, describe } from 'bun:test';
 import { toolSurface } from './index.js';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 
 // financeEnabled(cfg) = cfg.finance?.enabled === true 만 본다 → 최소 스텁으로 충분.
 const cfgWith = (enabled: boolean): UserConfig => ({ finance: { enabled } } as unknown as UserConfig);

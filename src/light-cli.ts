@@ -148,6 +148,11 @@ export async function runLightCli(route: LightCliRoute): Promise<void> {
         });
       break;
     }
+    case 'q': {
+      const { registerQCommands } = await import('./cli/q-cli.js');
+      registerQCommands(program);
+      break;
+    }
   }
 
   try {

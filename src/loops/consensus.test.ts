@@ -5,7 +5,6 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, mkdirSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
-import { spawnSync } from 'node:child_process';
 import {
   CROWN_MARK, CROWN_THRESHOLD_CATEGORIES, CONSENSUS_CATEGORIES, ConsensusEngine, MAX_REVIEW_ROUND_TRIPS,
   categoryLabel, representativeLabel, type ConsensusCategory, type ConsensusOptions, type ConsensusRepresentative, type ProposalCard,
@@ -15,6 +14,7 @@ import { registerDecisionsCommands } from '../cli/decisions-cli.js';
 import { runOrchestratorNode, type TickDeps } from './orchestrator/tick.js';
 import { splitCard } from '../flow-loop/split.js';
 import { CardStore } from '../task-cards/card-store.js';
+import { runTestCli } from '../../test/helpers/cli.js';
 
 const stateRoot = () => mkdtempSync(join(tmpdir(), 'consensus-'));
 const noVersion = () => ({ released: null, dev: null, codename: null });
@@ -200,11 +200,13 @@ describe('DUAL-ROOT-CONSENSUS — CLI 제안·응답과 tick 실행 전 관문',
   test('실제 splitter의 교차 영향 작업은 CLI의 작업 키와 같은 제안 ID로 연결되고 불합의면 배치·위임·실행 0', async () => {
     const root = stateRoot();
     const store = new CardStore(root);
-    const cli = (...args: string[]) => {
-      const child = spawnSync('bun', ['bin/elanous.mjs', `--test=${root}`, 'decisions', 'consensus', ...args, '--json'],
-        { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 120_000 });
-      expect(child.status, child.stderr).toBe(0);
-      return JSON.parse(child.stdout.trim());
+    const cli = async (...args: string[]) => {
+      const result = await runTestCli(['decisions', 'consensus', ...args, '--json'], {
+        cwd: join(import.meta.dir, '..', '..'), stateRoot: root,
+        allowPaths: [['decisions']],
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      return JSON.parse(result.stdout.trim());
     };
     const observed: string[] = [];
     let placements = 0;
@@ -234,12 +236,12 @@ describe('DUAL-ROOT-CONSENSUS — CLI 제안·응답과 tick 실행 전 관문',
       const noIdDelegated = await runOrchestratorNode('delegate', deps);
       const noIdLaunched = await runOrchestratorNode('launch', deps);
       expect({ delegated: noIdDelegated.delegated, hands, turns, launched: noIdLaunched.launched?.length }).toEqual({ delegated: 0, hands: 0, turns: 0, launched: 0 });
-      const proposed = cli('propose', '--by', 'coordinator', '--category', 'cross-branch-change', '--title', output[0]!.title,
+      const proposed = await cli('propose', '--by', 'coordinator', '--category', 'cross-branch-change', '--title', output[0]!.title,
         '--fact-id', 'obs-cross-real', '--cost', '야간 부하', '--undo', '작업 취소', '--work-key', workKey);
       expect(() => engine(root).propose({ ...proposeInput, category: 'cross-branch-change', workKey })).toThrow('already proposed');
       expect(() => engine(root).propose({ ...proposeInput, workKey })).toThrow('invalid cross-branch work key');
-      const reviewed = cli('review', proposed.id, '--by', 'guardian', '--claim', '회복 근거 부족');
-      const opposed = cli('disagree', proposed.id, '--by', 'guardian', '--claim', '회복 시간 침해');
+      const reviewed = await cli('review', proposed.id, '--by', 'guardian', '--claim', '회복 근거 부족');
+      const opposed = await cli('disagree', proposed.id, '--by', 'guardian', '--claim', '회복 시간 침해');
       expect(reviewed.roundTrips).toBe(1);
       expect(opposed.proposal).toMatchObject({ id: proposed.id, roundTrips: 2, status: 'disagreed' });
       expect(opposed.crownCard).toMatchObject({ proposalId: proposed.id, guardianClaim: '회복 시간 침해' });
@@ -356,20 +358,22 @@ describe('DUAL-ROOT-CONSENSUS — CLI 제안·응답과 tick 실행 전 관문',
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 30_000);
 
-  test('실물 CLI stdout ↔ 격리 원장: 같은 교차 영향 ID의 제안·두 응답·불합의 카드·실행 0건', () => {
+  test('CLI stdout ↔ 격리 원장: 같은 교차 영향 ID의 제안·두 응답·불합의 카드·실행 0건', async () => {
     const stateDir = stateRoot();
-    const run = (...args: string[]) => {
-      const child = spawnSync('bun', ['bin/elanous.mjs', `--test=${stateDir}`, 'decisions', 'consensus', ...args, '--json'],
-        { cwd: join(import.meta.dir, '..', '..'), encoding: 'utf8', timeout: 120_000 });
-      expect(child.status, child.stderr).toBe(0);
-      return JSON.parse(child.stdout.trim());
+    const run = async (...args: string[]) => {
+      const result = await runTestCli(['decisions', 'consensus', ...args, '--json'], {
+        cwd: join(import.meta.dir, '..', '..'), stateRoot: stateDir,
+        allowPaths: [['decisions']],
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      return JSON.parse(result.stdout.trim());
     };
     try {
-      const proposed = run('propose', '--by', 'coordinator', '--category', 'cross-branch-change', '--title', '수호자 야간 배정',
+      const proposed = await run('propose', '--by', 'coordinator', '--category', 'cross-branch-change', '--title', '수호자 야간 배정',
         '--fact-id', 'obs-live-cross', '--cost', '야간 부하', '--undo', '배정 철회');
-      const revised = run('review', proposed.id, '--by', 'guardian', '--claim', '회복 시간 근거 요청');
-      const response = run('disagree', proposed.id, '--by', 'guardian', '--claim', '야간 작업 반대');
-      const cards = run('crown');
+      const revised = await run('review', proposed.id, '--by', 'guardian', '--claim', '회복 시간 근거 요청');
+      const response = await run('disagree', proposed.id, '--by', 'guardian', '--claim', '야간 작업 반대');
+      const cards = await run('crown');
       const raw = readFileSync(join(stateDir, 'consensus', 'consensus.jsonl'), 'utf8').trim().split('\n');
       expect(revised).toMatchObject({ id: proposed.id, roundTrips: 1 });
       expect(response.proposal).toMatchObject({ id: proposed.id, roundTrips: 2, status: 'disagreed' });

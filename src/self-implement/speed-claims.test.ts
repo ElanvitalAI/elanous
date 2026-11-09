@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runTestCli } from '../../test/helpers/cli.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { measureParentSpeedClaims, measureSpeedClaims, renderSpeedClaims, type ParentSpeedClaimsEvent, type SpeedClaimsReleaseEvent } from './speed-claims.js';
 
@@ -21,10 +22,12 @@ function writeRun(dir: string, suffix: string, events: readonly { minute?: numbe
   }
 }
 
-function invoke(dir: string, json = false) {
-  return spawnSync(process.execPath, [fileURLToPath(new URL('../../bin/elanous.mjs', import.meta.url)), `--test=${dir}`, 'self', 'speed-claims', ...(json ? ['--json'] : [])], {
-    encoding: 'utf8', timeout: 60_000, env: { ...process.env, ELANOUS_STATE_DIR: dir, ELANOUS_CONFIG_DIR: dir },
+async function invoke(dir: string, json = false) {
+  const result = await runTestCli(['self', 'speed-claims', ...(json ? ['--json'] : [])], {
+    cwd: join(import.meta.dir, '../..'), stateRoot: dir, configRoot: dir,
+    env: { NODE_ENV: 'test' }, allowPaths: [['self', 'speed-claims']],
   });
+  return { status: result.exitCode, stdout: result.stdout, stderr: result.stderr };
 }
 
 describe('SPEED-CLAIMS launch-to-end census', () => {
@@ -120,7 +123,7 @@ describe('SPEED-CLAIMS launch-to-end census', () => {
     }
   }, 70_000);
 
-  it('counts three merges, one failure and one in-progress separately, with seat-specific interpolated quartiles', () => {
+  it('counts three merges, one failure and one in-progress separately, with seat-specific interpolated quartiles', async () => {
     const state = mkdtempSync(join(tmpdir(), 'speed-claims-'));
     try {
       mkdirSync(join(state, 'run-ledger'));
@@ -144,10 +147,10 @@ describe('SPEED-CLAIMS launch-to-end census', () => {
         { seat: 'OP', outcome: 'merged', count: 3, underOneMinuteCount: 0, medianMinutes: 30, q1Minutes: 20, q3Minutes: 40 },
         { seat: 'TC', outcome: 'failed', count: 1, underOneMinuteCount: 0, medianMinutes: 20, q1Minutes: 20, q3Minutes: 20 },
       ]);
-      const json = invoke(state, true);
+      const json = await invoke(state, true);
       expect(json.status, json.stderr).toBe(0);
       expect(JSON.parse(json.stdout)).toMatchObject({ completedCount: 4, inProgressCount: 1, rows: result.rows });
-      const text = invoke(state);
+      const text = await invoke(state);
       expect(text.status, text.stderr).toBe(0);
       expect(text.stdout).toContain('in progress (excluded): 1');
       expect(text.stdout).toContain('seat=OP outcome=merged count=3 underOneMinute=0 median=30m q1=20m q3=40m');
@@ -298,7 +301,7 @@ describe('SPEED-CLAIMS launch-to-end census', () => {
     } finally { rmSync(state, { recursive: true, force: true }); }
   });
 
-  it('marks a missing or unreadable ledger directory cannot-measure rather than treating it as zero runs', () => {
+  it('marks a missing or unreadable ledger directory cannot-measure rather than treating it as zero runs', async () => {
     const state = mkdtempSync(join(tmpdir(), 'speed-claims-missing-'));
     try {
       expect(measureSpeedClaims({ dir: join(state, 'absent') })).toMatchObject({ status: 'cannot-measure', rows: [], completedCount: 0 });
@@ -306,7 +309,7 @@ describe('SPEED-CLAIMS launch-to-end census', () => {
       mkdirSync(empty);
       expect(measureSpeedClaims({ dir: empty })).toMatchObject({ status: 'measured', completedCount: 0 });
       expect(measureSpeedClaims({ dir: empty, list: () => { throw new Error('unreadable'); } }).status).toBe('cannot-measure');
-      const cli = invoke(state);
+      const cli = await invoke(state);
       expect(cli.status, cli.stderr).toBe(0);
       expect(cli.stdout).toContain('status: cannot-measure');
     } finally { rmSync(state, { recursive: true, force: true }); }
@@ -453,17 +456,17 @@ describe('SPEED-CLAIMS daily 30-day landed-PR and issued-release census', () => 
     } finally { rmSync(state, { recursive: true, force: true }); }
   });
 
-  it('renders the daily section through the self speed-claims CLI', () => {
+  it('renders the daily section through the self speed-claims CLI', async () => {
     const state = mkdtempSync(join(tmpdir(), 'speed-claims-daily-cli-'));
     try {
       mkdirSync(join(state, 'run-ledger'));
-      const text = invoke(state);
+      const text = await invoke(state);
       expect(text.status, text.stderr).toBe(0);
       expect(text.stdout).toContain('daily landed PRs / issued releases (last 30 days, UTC):');
       expect(text.stdout).toContain('daily window: ');
       const rows = text.stdout.match(/^date=\d{4}-\d{2}-\d{2} landed=(?:\d+|unmeasured) released=(?:\d+|unmeasured)$/gm);
       expect(rows?.length).toBe(30);
-      const json = invoke(state, true);
+      const json = await invoke(state, true);
       expect(json.status, json.stderr).toBe(0);
       const parsed = JSON.parse(json.stdout);
       expect(parsed.daily.rows).toHaveLength(30);
@@ -472,7 +475,7 @@ describe('SPEED-CLAIMS daily 30-day landed-PR and issued-release census', () => 
     } finally { rmSync(state, { recursive: true, force: true }); }
   }, 70_000);
 
-  it('CLI counts a release by publishedAt even when its source commit predates the window; absent history is unmeasured', () => {
+  it('CLI counts a release by publishedAt even when its source commit predates the window; absent history is unmeasured', async () => {
     const state = mkdtempSync(join(tmpdir(), 'speed-claims-published-at-'));
     try {
       mkdirSync(join(state, 'run-ledger'));
@@ -483,7 +486,7 @@ describe('SPEED-CLAIMS daily 30-day landed-PR and issued-release census', () => 
         version: '0.2.27', tag: 'v0.2.27', sourceCommit: '0000000000000000000000000000000000000000',
         publishedAt,
       }));
-      const issued = invoke(state, true);
+      const issued = await invoke(state, true);
       expect(issued.status, issued.stderr).toBe(0);
       const daily = JSON.parse(issued.stdout).daily;
       expect(daily.releases.status).toBe('measured');
@@ -492,7 +495,7 @@ describe('SPEED-CLAIMS daily 30-day landed-PR and issued-release census', () => 
       const brokenDir = join(state, 'release', '0.2.26');
       mkdirSync(brokenDir);
       writeFileSync(join(brokenDir, 'release.json'), '{broken');
-      const mixed = invoke(state, true);
+      const mixed = await invoke(state, true);
       expect(mixed.status, mixed.stderr).toBe(0);
       const partialHistory = JSON.parse(mixed.stdout).daily;
       expect(partialHistory.releases.status).toBe('unmeasured');
@@ -500,7 +503,7 @@ describe('SPEED-CLAIMS daily 30-day landed-PR and issued-release census', () => 
 
       for (const damagedTime of ['not-a-date', 0]) {
         writeFileSync(join(brokenDir, 'release.json'), JSON.stringify({ version: '0.2.26', publishedAt: damagedTime }));
-        const damaged = invoke(state, true);
+        const damaged = await invoke(state, true);
         expect(damaged.status, damaged.stderr).toBe(0);
         const damagedDaily = JSON.parse(damaged.stdout).daily;
         expect(damagedDaily.releases.status).toBe('unmeasured');
@@ -508,7 +511,7 @@ describe('SPEED-CLAIMS daily 30-day landed-PR and issued-release census', () => 
       }
 
       rmSync(join(state, 'release'), { recursive: true, force: true });
-      const missing = invoke(state, true);
+      const missing = await invoke(state, true);
       expect(missing.status, missing.stderr).toBe(0);
       const noHistory = JSON.parse(missing.stdout).daily;
       expect(noHistory.releases.status).toBe('unmeasured');
@@ -517,7 +520,7 @@ describe('SPEED-CLAIMS daily 30-day landed-PR and issued-release census', () => 
       const preparedDir = join(state, 'release', '0.2.28');
       mkdirSync(preparedDir, { recursive: true });
       writeFileSync(join(preparedDir, 'release.json'), JSON.stringify({ version: '0.2.28' }));
-      const prepared = invoke(state, true);
+      const prepared = await invoke(state, true);
       expect(prepared.status, prepared.stderr).toBe(0);
       const preparedDaily = JSON.parse(prepared.stdout).daily;
       expect(preparedDaily.releases.status).toBe('measured');
@@ -525,13 +528,13 @@ describe('SPEED-CLAIMS daily 30-day landed-PR and issued-release census', () => 
 
       const missingManifestDir = join(state, 'release', '0.2.29');
       mkdirSync(missingManifestDir);
-      const missingManifest = invoke(state, true);
+      const missingManifest = await invoke(state, true);
       expect(missingManifest.status, missingManifest.stderr).toBe(0);
       expect(JSON.parse(missingManifest.stdout).daily.releases.status).toBe('unmeasured');
       rmSync(missingManifestDir, { recursive: true, force: true });
 
       writeFileSync(join(state, 'run-ledger', `${id('0099')}.jsonl`), '');
-      const emptyRun = invoke(state, true);
+      const emptyRun = await invoke(state, true);
       expect(emptyRun.status, emptyRun.stderr).toBe(0);
       const emptyRunDaily = JSON.parse(emptyRun.stdout).daily;
       expect(emptyRunDaily.landedPrs.status).toBe('unmeasured');

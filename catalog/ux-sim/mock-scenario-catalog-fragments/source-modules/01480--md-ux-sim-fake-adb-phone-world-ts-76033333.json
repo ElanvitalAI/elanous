@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-ADB-PHONE-WORLD-TS",
+  "path": "src/ux-sim/fake-adb-phone-world.ts",
+  "boundary": "Models the Fold adb argv and byte boundary in memory; records command attempts and makes no adb, device, or network calls.",
+  "deviceIds": [
+    "fake-adb-phone-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

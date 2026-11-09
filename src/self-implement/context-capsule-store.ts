@@ -1,3 +1,4 @@
+import { isStringArray } from '../primitives/guards.js';
 // ── Context Capsule durable handoff store (F2 · 2026-07-25 · [[PLAN §11-4]]) ──────
 //
 // §11 PTY 코디네이션 플릿의 **컨텍스트 교환 척추**: 상류 잡(self-dev/agent PTY)이 자기 목표-완료
@@ -20,10 +21,6 @@ const CONTEXT_CAPSULE_KIND = 'context-capsule';
  */
 export function persistContextCapsule(jobId: string, capsule: HarnessContextCapsule): void {
   writeColdSnapshot<HarnessContextCapsule>(jobId, CONTEXT_CAPSULE_KIND, capsule);
-}
-
-function isStringArray(v: unknown): v is string[] {
-  return Array.isArray(v) && v.every((x) => typeof x === 'string');
 }
 
 /** 파싱된 스냅샷이 HarnessContextCapsule 구조인지(손상·구버전 방어) — 필드 타입 + 배열 **원소** + groundingRefs

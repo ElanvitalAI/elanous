@@ -4,7 +4,7 @@ import type { GateRoutingReason } from './graph-authority.js';
 import { landingFreezeState, type LandingFreeze } from '../release-loop/landing-freeze.js';
 import type { ActiveProviderInfo } from '../provider-summary.js';
 import type { ResourceView } from '../control-plane/ledger.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 /** ⭐ RFC §5 «4단계» — `applies_when` 을 «코드»가 판정한다.
  *

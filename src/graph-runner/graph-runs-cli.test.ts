@@ -189,6 +189,14 @@ test('runs resume resolves a prefix, restarts the last failed node on the snapsh
   expect(resumed.exit).toBe(0);
   expect(JSON.parse(resumed.out[0]!)).toMatchObject({ status: 'done', path: ['first', 'second', 'done'], resume: { from: 'second', graph: 'snapshot' } });
   expect(readFileSync(marker, 'utf8')).toBe('ab');
+  rmSync(ready);
+  const another = await runGraph(graph, { runId: 'resume-by-visit', deps: { root: base } });
+  const visitId = another.nodes[1]!.executionId!;
+  expect((await cli(base, ['runs', 'resume', another.runId, '--from', 'second', '--from-visit', visitId])).exit).toBe(1);
+  writeFileSync(ready, 'yes');
+  const byVisit = await cli(base, ['runs', 'resume', another.runId, '--from-visit', visitId, '--json']);
+  expect(byVisit.exit).toBe(0);
+  expect(JSON.parse(byVisit.out[0]!)).toMatchObject({ status: 'done', resume: { from: 'second', visitId } });
 });
 
 test('runs resume --file cannot change a snapshot run origin or its relative graph directory', async () => {

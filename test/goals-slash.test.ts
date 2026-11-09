@@ -156,7 +156,7 @@ describe('goals/slash — executeGoalSlash', () => {
       config: {
         maxTurns: 25, wallClockMaxMs: 60_000, tokenBudget: 100_000,
         judgeModel: 'grok-4-fast-reasoning', judgeRetries: 2,
-        pauseOnPlanModeEnter: true, resumeOnPlanModeExit: false,
+        resumeOnPlanModeExit: false,
         modeDefault: 'judge',
       },
     });
@@ -177,7 +177,7 @@ describe('goals/slash — executeGoalSlash', () => {
         maxTurns: 20, wallClockMaxMs: 30 * 60_000, tokenBudget: 200_000,
         judgeModel: '',  // default — empty
         judgeRetries: 1,
-        pauseOnPlanModeEnter: true, resumeOnPlanModeExit: false,
+        resumeOnPlanModeExit: false,
         modeDefault: 'judge',
       },
     });
@@ -195,7 +195,7 @@ describe('goals/slash — executeGoalSlash', () => {
         maxTurns: 20, wallClockMaxMs: 30 * 60_000, tokenBudget: 200_000,
         judgeModel: 'grok-4-fast-reasoning',  // already configured
         judgeRetries: 1,
-        pauseOnPlanModeEnter: true, resumeOnPlanModeExit: false,
+        resumeOnPlanModeExit: false,
         modeDefault: 'judge',
       },
     });

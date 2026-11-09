@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
@@ -7,8 +7,20 @@ import { join } from 'node:path';
 import { gateChangedFiles } from '../../self-implement/seams.js';
 import { packSourceBundle } from './pod-source-bundle.js';
 import { podSourceScript, PodSourceShaFormatError, type PodSource } from './pod-source-receive.js';
+import { createTempGitRemote, type TempGitRemote } from '../../ux-sim/temp-git-remote.js';
 
 const TEST_SYSTEM_PATH = process.env.PATH ?? '/usr/bin:/bin';
+let sharedGitTemplate: TempGitRemote;
+
+function cloneSharedGitTemplate(root: string, name: string): string {
+  const checkout = join(root, name);
+  execFileSync('git', ['clone', '-q', '--shared', sharedGitTemplate.remote, checkout], {
+    env: { ...process.env, ...sharedGitTemplate.gitEnv },
+  });
+  sharedGitTemplate.git(checkout, ['config', 'user.email', 'pod@example.com']);
+  sharedGitTemplate.git(checkout, ['config', 'user.name', 'pod']);
+  return checkout;
+}
 
 function isolatedGitTestEnv(home: string, path = TEST_SYSTEM_PATH): NodeJS.ProcessEnv {
   const gitConfig = join(home, 'empty.gitconfig');
@@ -54,6 +66,8 @@ function makeBaseShaFallbackFixture(root: string, options: { originHasBase: bool
 }
 
 describe('podSourceScript', () => {
+  beforeAll(() => { sharedGitTemplate = createTempGitRemote(); });
+  afterAll(() => { sharedGitTemplate.cleanup(); });
   test('requireMirror forbids GitHub fallback when a sealed release mirror cannot be used', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-required-mirror-'));
     try {
@@ -472,19 +486,14 @@ describe('podSourceScript', () => {
   test('non-main clone base starts at its remote commit via mirror and fallback; missing base is refused before launch', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-src-base-'));
     try {
-      const origin = join(root, 'origin');
+      const origin = cloneSharedGitTemplate(root, 'origin');
       const mirror = join(root, 'mirror.git');
-      execFileSync('git', ['init', '-q', '-b', 'main', origin]);
-      execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
-      execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
-      writeFileSync(join(origin, 'README'), 'main\n');
-      execFileSync('git', ['-C', origin, 'add', 'README']);
-      execFileSync('git', ['-C', origin, 'commit', '-qm', 'main']);
       const main = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-      execFileSync('git', ['clone', '-q', '--bare', origin, mirror]);
+      execFileSync('git', ['clone', '-q', '--bare', '--shared', origin, mirror]);
       execFileSync('git', ['-C', origin, 'checkout', '-qb', 'bench/sample']);
       writeFileSync(join(origin, 'README'), 'bench\n');
-      execFileSync('git', ['-C', origin, 'commit', '-qam', 'bench']);
+      execFileSync('git', ['-C', origin, 'add', 'README']);
+      execFileSync('git', ['-C', origin, '-c', 'user.email=pod@example.com', '-c', 'user.name=pod', 'commit', '-qam', 'bench']);
       const bench = execFileSync('git', ['-C', origin, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
       execFileSync('git', ['-C', origin, 'checkout', '-q', 'main']);
       const source: PodSource = { kind: 'default', base: 'bench/sample' };
@@ -801,13 +810,7 @@ describe('podSourceScript', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-src-'));
     const work = mkdtempSync(join(tmpdir(), 'pod-src-run-'));
     try {
-      const origin = join(root, 'origin');
-      execFileSync('git', ['init', '-q', '-b', 'main', origin]);
-      execFileSync('git', ['-C', origin, 'config', 'user.email', 'pod@example.com']);
-      execFileSync('git', ['-C', origin, 'config', 'user.name', 'pod']);
-      writeFileSync(join(origin, 'README'), 'base\n');
-      execFileSync('git', ['-C', origin, 'add', 'README']);
-      execFileSync('git', ['-C', origin, 'commit', '-qm', 'base']);
+      const origin = cloneSharedGitTemplate(root, 'origin');
       writeFileSync(join(origin, 'README'), 'head\n');
       execFileSync('git', ['-C', origin, 'add', 'README']);
       execFileSync('git', ['-C', origin, 'commit', '-qm', 'head']);

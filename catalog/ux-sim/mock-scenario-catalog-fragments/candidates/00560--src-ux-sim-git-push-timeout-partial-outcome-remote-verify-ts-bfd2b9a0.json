@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/git-fs/git-cli.test.ts -t \"confirms a timed-out push\"",
+  "logsRecorded": "no",
+  "logsDetail": "The scenario asserts the CLI status receipt and local bare-remote ref; no production logs or network are written.",
+  "deviceId": "git-push-timeout-partial-outcome-remote-verify",
+  "scenarioIds": [
+    "GIT-PUSH-TIMEOUT-PARTIAL-OUTCOME-REMOTE-VERIFY"
+  ]
+}

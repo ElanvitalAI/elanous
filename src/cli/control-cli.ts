@@ -1,4 +1,6 @@
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
+import { chmodSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { createLeaseHolderView } from '../control-plane/lease-holder.js';
 import { resolveMachineName } from '../roles/machine-name.js';
 import { readRoleLeaseAsync } from '../roles/role-lease-read.js';
@@ -7,7 +9,8 @@ import { resolveRoleBucket } from './role-cli.js';
 import { Option, type Command } from 'commander';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { DEFAULT_CONTROL_PORT, ensureControlTokens, startControlServer } from '../control-plane/server.js';
-import { resolvePrimary } from '../control-plane/primary.js';
+import { readPrimaryJoin, resolvePrimary } from '../control-plane/primary.js';
+import { selectRemotePrimary, validateRemotePrimaryCandidates, type RemotePrimaryCandidate } from '../control-plane/remote-primary-candidates.js';
 import { runLightMember, type LightResource } from '../control-plane/light-member.js';
 import { RESOURCE_KINDS, type ResourceKind } from '../control-plane/ledger.js';
 import { runControlJoin, type ControlJoinOptions } from './control-join-cli.js';
@@ -101,7 +104,79 @@ export async function runResourcesQuery(options: { where?: string; kind?: string
   }
 }
 
+function remotePrimaryUrl(value: string): string {
+  const url = new URL(value);
+  if ((url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', '::1', '[::1]'].includes(url.hostname))) ||
+      url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('원격 primary URL은 HTTPS여야 함 (로컬 루프백 제외)');
+  return url.origin;
+}
+
+function primaryTokenFromFile(path: string): string {
+  if (!isAbsolute(path)) throw new Error('primary token file path must be absolute');
+  const info = lstatSync(path);
+  if (!info.isFile() || (info.mode & 0o077) !== 0) throw new Error('primary token file must be a private regular file (0600)');
+  const token = readFileSync(path, 'utf8').trim();
+  if (!/^[a-f0-9]{64}$/.test(token)) throw new Error('invalid primary token file');
+  return token;
+}
+
+function primaryCandidatesFromFile(path: string): RemotePrimaryCandidate[] {
+  if (!isAbsolute(path)) throw new Error('primary candidates file path must be absolute');
+  const info = lstatSync(path);
+  if (!info.isFile() || (info.mode & 0o077) !== 0) throw new Error('primary candidates file must be a private regular file (0600)');
+  const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  if (!Array.isArray(value)) throw new Error('primary candidates file must contain an array');
+  return validateRemotePrimaryCandidates(value as RemotePrimaryCandidate[]);
+}
+
+function primaryGenerationFloor(root: string): number {
+  const path = join(root, 'control', 'primary-generation.json');
+  let info: ReturnType<typeof lstatSync>;
+  try { info = lstatSync(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
+  if (!info.isFile() || (info.mode & 0o077) !== 0) throw new Error('primary generation floor file must be private');
+  const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error('invalid primary generation floor');
+  return value as number;
+}
+
+function advancePrimaryGeneration(root: string, generation: number): void {
+  if (generation <= primaryGenerationFloor(root)) return;
+  const dir = join(root, 'control');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, 'primary-generation.json');
+  const temp = `${path}.${randomBytes(8).toString('hex')}.tmp`;
+  try {
+    writeFileSync(temp, JSON.stringify(generation), { flag: 'wx', mode: 0o600 });
+    renameSync(temp, path);
+    chmodSync(path, 0o600);
+  } finally { rmSync(temp, { force: true }); }
+}
+
+async function readRemotePrimary(url: string, token: string): Promise<RoleLeaseRead> {
+  try {
+    const response = await fetch(`${url}/v1/primary/authorized`, {
+      headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) return { kind: 'unmeasured', why: `HQ primary HTTP ${response.status}` };
+    const body: unknown = await response.json();
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return { kind: 'unmeasured', why: 'invalid HQ primary response' };
+    const value = body as Record<string, unknown>;
+    if (value.known !== true) return { kind: 'unmeasured', why: 'HQ primary unknown or expired' };
+    if (value.serving !== true) return { kind: 'unmeasured', why: 'HQ control is not the primary holder' };
+    if (typeof value.holder !== 'string' || !/^[a-z0-9][a-z0-9-]{0,31}$/.test(value.holder) ||
+        !Number.isSafeInteger(value.generation) || (value.generation as number) < 1) {
+      return { kind: 'unmeasured', why: 'invalid HQ primary holder or generation' };
+    }
+    return { kind: 'present', doc: { holder: value.holder, generation: value.generation as number, state: 'held', renewedAt: Date.now() } };
+  } catch (error) { return { kind: 'unmeasured', why: reasonFor(error) }; }
+}
+
 export async function runControlServe(options: { port?: string; host?: string; allowClusterBind?: boolean; followLease?: boolean; followHqLease?: boolean; bucket?: string;
+  followRemotePrimary?: string; primaryTokenFile?: string; primaryCandidatesFile?: string; fetchPrimary?: typeof fetch;
   read?: (bucket: string) => RoleLeaseRead | Promise<RoleLeaseRead>; machine?: string;
   readHq?: typeof readControlHqLease; hqHostName?: string;
   /** 시험 seam — 이 신호로 멈춘다. ⛔ 시험이 `process.emit('SIGTERM')` 로 멈추면 같은 프로세스의 다른 SIGTERM 처리기
@@ -111,10 +186,27 @@ export async function runControlServe(options: { port?: string; host?: string; a
 }): Promise<void> {
   let port: number;
   let bucket: string | undefined;
+  let remoteUrl: string | undefined;
+  let remoteToken: string | undefined;
+  let remoteCandidates: readonly RemotePrimaryCandidate[] | undefined;
   try {
     port = controlPort(options.port);
-    if (options.followLease && options.followHqLease) throw new Error('GCS 임대와 HQ 임대는 동시에 따를 수 없음');
-    if (options.followLease) bucket = resolveRoleBucket(options.bucket);
+    const roles = getUserConfig().raw.roles;
+    const configuredBucket = roles && typeof roles === 'object' && !Array.isArray(roles)
+      ? (roles as { bucket?: unknown }).bucket : undefined;
+    const hasRoleBucket = options.bucket !== undefined || process.env.ELANOUS_BACKUP_BUCKET !== undefined || configuredBucket !== undefined;
+    remoteCandidates = options.primaryCandidatesFile ? primaryCandidatesFromFile(options.primaryCandidatesFile) : undefined;
+    const joined = !options.followRemotePrimary && !remoteCandidates && !hasRoleBucket && options.followLease !== false && !options.followHqLease
+      ? readPrimaryJoin() : undefined;
+    remoteUrl = options.followRemotePrimary ?? joined?.url;
+    if (remoteUrl) {
+      remoteUrl = remotePrimaryUrl(remoteUrl);
+      remoteToken = options.primaryTokenFile ? primaryTokenFromFile(options.primaryTokenFile) : joined?.tokens.member;
+      if (!remoteToken) throw new Error('원격 primary member 토큰 파일이 필요함 (--primary-token-file)');
+    }
+    const followLease = options.followLease ?? (hasRoleBucket && !options.followHqLease && !remoteUrl && !remoteCandidates);
+    if ([followLease, options.followHqLease, !!remoteUrl, !!remoteCandidates].filter(Boolean).length > 1) throw new Error('primary 임대 소스는 하나만 선택 가능');
+    if (followLease) bucket = resolveRoleBucket(options.bucket);
   } catch (error) { console.error(reasonFor(error)); process.exitCode = 2; return; }
   const machine = options.followHqLease ? '' : resolveMachineName({ option: options.machine }).machine;
   // HQ's holder identity is hq.hostName. A caller-controlled role machine alias cannot grant primary writes.
@@ -123,21 +215,63 @@ export async function runControlServe(options: { port?: string; host?: string; a
     try { hqHostName = options.hqHostName ?? getUserConfig().hq?.hostName; }
     catch { /* Unknown local identity must remain fail closed at the write boundary. */ }
   }
+  let lastLeaseState: string | undefined;
+  const observeLease = async (source: 'gcs' | 'remote' | 'hq', read: () => Promise<RoleLeaseRead> | RoleLeaseRead): Promise<RoleLeaseRead> => {
+      let result: RoleLeaseRead;
+      try { result = await read(); }
+      catch (error) { result = { kind: 'unmeasured', why: reasonFor(error) }; }
+      const state = result.kind === 'present' ? `present:${result.doc.holder}:${result.doc.generation}`
+        : result.kind === 'unmeasured' ? `unmeasured:${result.why}` : 'absent';
+      if (state !== lastLeaseState) {
+        debug.log('control.primary', 'lease-observed', {
+          source, bucket: bucket ?? null, url: remoteUrl ?? null, machine: source === 'hq' ? hqHostName ?? null : machine, kind: result.kind,
+          holder: result.kind === 'present' ? result.doc.holder : null,
+          generation: result.kind === 'present' ? result.doc.generation : null,
+          reason: result.kind === 'unmeasured' ? result.why : null,
+        });
+        if (result.kind === 'unmeasured') console.error(`관제부 primary 임대 미측정: ${result.why}`);
+        lastLeaseState = state;
+      }
+      return result;
+  };
+  const remoteLeaseView = (remoteUrl && remoteToken || remoteCandidates) ? createLeaseHolderView({
+    ttlMs: 0, // A revoked HQ token or lost primary must fence the next worker write immediately.
+    machine, read: () => observeLease('remote', async () => {
+      if (remoteCandidates) {
+        const root = effectiveInstanceRoot();
+        const selected = await selectRemotePrimary(options.primaryCandidatesFile
+          ? primaryCandidatesFromFile(options.primaryCandidatesFile) : remoteCandidates, options.fetchPrimary, primaryGenerationFloor(root));
+        if (selected.kind === 'unmeasured') return { kind: 'unmeasured' as const, why: selected.why };
+        advancePrimaryGeneration(root, selected.generation);
+        // A newer concurrent request may have raised the floor while this request awaited its candidates.
+        if (selected.generation < primaryGenerationFloor(root))
+          return { kind: 'unmeasured' as const, why: 'HQ primary generation 회귀' };
+        return { kind: 'present' as const, doc: { holder: selected.holder, generation: selected.generation, state: 'held' as const, renewedAt: Date.now() } };
+      }
+      return readRemotePrimary(remoteUrl!, options.primaryTokenFile ? primaryTokenFromFile(options.primaryTokenFile) : remoteToken!);
+    }),
+  }) : undefined;
   const leaseView = bucket !== undefined ? createLeaseHolderView({
-    machine, read: () => (options.read ?? readRoleLeaseAsync)(bucket),
-  }) : options.followHqLease ? createLeaseHolderView({
-    machine: hqHostName ?? '', read: () => {
+    machine, read: () => observeLease('gcs', () => (options.read ?? readRoleLeaseAsync)(bucket)),
+  }) : remoteLeaseView ? { get: async () => {
+    const snapshot = await remoteLeaseView.get({ fresh: true });
+    // The authenticated HQ holder owns the cluster lease. A worker host may write its local ledger
+    // while that HQ is serving; comparing the HQ machine name to this worker would deny every host.
+    return { ...snapshot, iAmHolder: snapshot.known };
+  } } : options.followHqLease ? createLeaseHolderView({
+    machine: hqHostName ?? '', read: () => observeLease('hq', () => {
       const { record, expired } = (options.readHq ?? readControlHqLease)();
       return hqHostName && record && expired === false
         ? { kind: 'present' as const, doc: { holder: record.holder, generation: record.generation, state: 'held' as const, renewedAt: record.renewedAt } }
         : { kind: 'unmeasured' as const, why: 'HQ lease missing or expired' };
-    },
+    }),
   }) : undefined;
   let server: ReturnType<typeof startControlServer>;
   if (options.allowClusterBind && options.host === '0.0.0.0') {
     debug.log('control-plane', 'cluster-bind-enabled', { hostname: options.host, port, exposure: 'operator-restricted-cluster-service' });
   }
-  try { server = startControlServer({ port, hostname: options.host, allowClusterBind: options.allowClusterBind, ...(leaseView ? { leaseView, requireKnownLeaseForWrites: true } : {}) }); }
+  try { server = startControlServer({ port, hostname: options.host, allowClusterBind: options.allowClusterBind,
+    authoritativePrimary: !remoteUrl && !remoteCandidates, ...(leaseView ? { leaseView, requireKnownLeaseForWrites: true } : {}) }); }
   catch (error) { console.error(`관제부 시작 실패: ${reasonFor(error)}`); process.exitCode = 2; return; }
   await new Promise<void>(resolve => {
     const stop = () => {
@@ -152,7 +286,7 @@ export async function runControlServe(options: { port?: string; host?: string; a
       if (options.signal.aborted) { stop(); return; }
       options.signal.addEventListener('abort', stop, { once: true });
     }
-    console.log(`관제부 ${new URL(server.url).host} · 토큰 ${join(effectiveInstanceRoot(), 'control', 'tokens.json')}${bucket !== undefined ? ` · 임대 따름 · ${bucket} · 나=${machine}` : options.followHqLease ? ` · HQ 임대 따름 · 나=${hqHostName ?? '미확인'}` : ''}`);
+    console.log(`관제부 ${new URL(server.url).host} · 토큰 ${join(effectiveInstanceRoot(), 'control', 'tokens.json')}${bucket !== undefined ? ` · 임대 따름 · ${bucket} · 나=${machine}` : remoteCandidates ? ` · HQ endpoint 광고 따름 · 나=${machine}` : remoteUrl ? ` · 원격 primary 따름 · ${remoteUrl} · 나=${machine}` : options.followHqLease ? ` · HQ 임대 따름 · 나=${hqHostName ?? '미확인'}` : ''}`);
   });
 }
 
@@ -221,10 +355,14 @@ export function registerControlCommands(program: Command): void {
     .option('--port <n>', '리스닝 포트(0=임시 포트)')
     .option('--host <addr>', '루프백 또는 tailnet 바인드 주소')
     .option('--allow-cluster-bind', '클러스터 내부 Service용 0.0.0.0 바인드를 명시 허용')
-    .option('--follow-lease', '임대 보유자일 때만 쓰기')
+    .option('--follow-lease', '임대 보유자일 때만 쓰기(버킷 설정 시 기본)')
+    .option('--no-follow-lease', '역할 임대 추적을 명시적으로 끄기')
     .option('--follow-hq-lease', 'HQ 임대 보유자일 때만 쓰기')
+    .option('--follow-remote-primary <url>', 'HQ control 의 primary 를 원격으로 따르기')
+    .option('--primary-candidates-file <path>', '현재 HQ 임대 보유자를 찾을 private endpoint 광고 JSON')
+    .option('--primary-token-file <path>', 'HQ member 토큰의 0600 파일')
     .option('--bucket <bucket>', 'GCS 임대 버킷')
-    .action((options: { port?: string; host?: string; allowClusterBind?: boolean; followLease?: boolean; followHqLease?: boolean; bucket?: string }) => runControlServe(options));
+    .action((options: { port?: string; host?: string; allowClusterBind?: boolean; followLease?: boolean; followHqLease?: boolean; bucket?: string; followRemotePrimary?: string; primaryTokenFile?: string; primaryCandidatesFile?: string }) => runControlServe(options));
   control.command('member').description('합류 기계의 자원을 포그라운드에서 등록·심박')
     .option('--resource <kind:name=url>', '등록할 자원', (value: string, previous: string[]) => [...previous, value], [] as string[])
     .option('--interval <seconds>', '심박 간격(초)')

@@ -3,19 +3,43 @@ import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { evaluateWaiverEvent, readWaiverEvents, type WaiverEventDecision } from '../../src/release-loop/waiver-events.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import type { GateResult } from './gate-types.js';
-import { emitNodeResult, readGraphContext, type GraphContext } from './node-verdict.js';
+import { emitNodeResult, latestGateOutput, readGraphContext, type GraphContext } from './node-verdict.js';
 import { planAdaptiveGateHeal } from './adaptive-gate-heal.js';
 import { macrophageEvidenceMatchesObservedGate, planMacrophageRepairLadder, type MacrophageRepairLadderDecision, type MacrophageRepairLadderInput } from '../../src/release-loop/macrophage-repair-ladder.js';
 import type { GateTriageClass, GateTriageEvidence, GateTriageShadow } from './gate-triage-types.js';
 import { parseRollingMainState, rollingMainReceiptIntact, type RollingMainReceipt } from './rolling-main-gate.js';
+import { loadCutKeyDiffCommits, lookupMainSameKeyReceipts, triageFailureKeyDiff,
+  type KeyDiffInput, type KeyDiffVerdict } from './gate-key-diff.js';
+import { appendKnownFailOwnerLedger, auditKnownFailFailures, isKnownFailOwnerRecord,
+  readKnownFailOwnerLedger, type KnownFailOwnerRecord } from './gate-shard-receipts.js';
 export type { GateTriageClass, GateTriageEvidence, GateTriageShadow } from './gate-triage-types.js';
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/i;
+
+/** Repeated unmeasured results are routed to their owning cell, never converted into a pass. */
+export function assignRepeatedUnmeasuredFailures(failureIds: readonly string[], prior: NonNullable<GateTriageEvidence['priorDecisions']>,
+  commit: string, ownerCellByFailureId: Record<string, string>, threshold = 3): KnownFailOwnerRecord[] {
+  if (!Number.isSafeInteger(threshold) || threshold < 1 || !COMMIT_SHA.test(commit)) return [];
+  const ids = [...new Set(failureIds)].sort();
+  return ids.flatMap(failureId => {
+    let consecutive = 1;
+    const matchingPrior: NonNullable<GateTriageEvidence['priorDecisions']> = [];
+    for (const previous of [...prior].reverse()) {
+      if (previous.classification !== 'unmeasured' || !previous.failureIds.includes(failureId)) break;
+      matchingPrior.push(previous);
+      consecutive++;
+    }
+    const candidate = { failureId, checklistCellId: ownerCellByFailureId[failureId] ?? '',
+      firstSeenCommit: matchingPrior.at(-1)?.commit ?? commit };
+    return consecutive >= threshold && isKnownFailOwnerRecord(candidate) ? [candidate] : [];
+  });
+}
 
 function supportsIntroducedMainFixedPick(version: string): boolean {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(version);
@@ -48,7 +72,38 @@ export interface IntroducedMainFixedPick {
   readonly firstParentCommits?: readonly string[];
 }
 
-type GateTriageShadowWithMainFixedPick = GateTriageShadow & { mainFixedPick?: IntroducedMainFixedPick };
+type GateTriageShadowWithMainFixedPick = GateTriageShadow & {
+  mainFixedPick?: IntroducedMainFixedPick;
+  keyDiff?: KeyDiffVerdict[];
+};
+
+/** Consume only one key comparison per measured failure; malformed or missing rows cannot silently clear it. */
+export function triageRegressionKeyDiffs(introducedIds: readonly string[], supplied: unknown,
+  gitHistory?: { repo: string; mainTip: string; mainReceiptRoot: string }): KeyDiffVerdict[] {
+  const rows = Array.isArray(supplied) ? supplied as KeyDiffInput[] : [];
+  return introducedIds.map((failureId) => {
+    const matches = rows.filter((row) => row && typeof row === 'object' && row.failureId === failureId);
+    if (matches.length !== 1 || !Array.isArray(matches[0]?.commits) || !Array.isArray(matches[0]?.mainReceipts))
+      return { status: 'unmeasured', failureId, reason: 'one complete key comparison is required per failure',
+        changedInputs: [] };
+    const row = matches[0]!;
+    // Opaque closure evidence is itself sufficient to choose the conservative bisect fallback.
+    // Do not let unavailable first-parent commit metadata erase that measured opacity.
+    if (row.base?.opaqueReason || row.cut?.opaqueReason) return triageFailureKeyDiff(row);
+    if (gitHistory) {
+      const baseCommit = (row as KeyDiffInput & { baseCommit?: unknown }).baseCommit;
+      const cutCommit = (row as KeyDiffInput & { cutCommit?: unknown }).cutCommit;
+      const commits = typeof baseCommit === 'string' && typeof cutCommit === 'string'
+        ? loadCutKeyDiffCommits(gitHistory.repo, baseCommit, cutCommit) : null;
+      if (!commits) return { status: 'unmeasured', failureId,
+        reason: 'cut first-parent append history is missing or inconsistent', changedInputs: [] };
+      const mainReceipts = lookupMainSameKeyReceipts(gitHistory.mainReceiptRoot, row.cut,
+        gitHistory.mainTip, gitHistory.repo);
+      return triageFailureKeyDiff({ ...row, commits, mainReceipts });
+    }
+    return triageFailureKeyDiff(row);
+  });
+}
 
 /** Suggest only the first measured first-parent point where a cut failure disappears. */
 export function assessIntroducedMainFixedPick(input: IntroducedMainFixedPickInput): IntroducedMainFixedPick {
@@ -170,18 +225,18 @@ function verifiedFirstParentRange(cutCommit: string, mainTip: string, supplied: 
   { baseCommit: string; commits: string[] } | null {
   if (!COMMIT_SHA.test(cutCommit) || !COMMIT_SHA.test(mainTip)
       || (supplied !== undefined && (!Array.isArray(supplied) || !supplied.every((commit) => typeof commit === 'string')))) return null;
-  const tip = spawnSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8', timeout: 15_000 });
+  const tip = spawnSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (tip.status !== 0 || tip.stdout.trim() !== mainTip) return null;
-  const remoteTip = spawnSync('git', ['ls-remote', 'origin', 'refs/heads/main'], { encoding: 'utf8', timeout: 15_000 });
+  const remoteTip = spawnSync('git', ['ls-remote', 'origin', 'refs/heads/main'], { encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (remoteTip.status !== 0 || remoteTip.stdout.trim().split(/\s+/)[0] !== mainTip) return null;
-  const mergeBase = spawnSync('git', ['merge-base', cutCommit, mainTip], { encoding: 'utf8', timeout: 15_000 });
+  const mergeBase = spawnSync('git', ['merge-base', cutCommit, mainTip], { encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   const baseCommit = mergeBase.status === 0 ? mergeBase.stdout.trim() : '';
   if (!COMMIT_SHA.test(baseCommit)) return null;
   const history = spawnSync('git', ['rev-list', '--first-parent', '--reverse', `${baseCommit}..${mainTip}`],
-    { encoding: 'utf8', timeout: 15_000 });
+    { encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (history.status !== 0) return null;
   const firstParentAncestors = spawnSync('git', ['rev-list', '--first-parent', mainTip],
-    { encoding: 'utf8', timeout: 15_000 });
+    { encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (firstParentAncestors.status !== 0 || !firstParentAncestors.stdout.split(/\r?\n/).includes(baseCommit)) return null;
   const commits = [baseCommit, ...history.stdout.trim().split(/\r?\n/).filter(Boolean)];
   return supplied === undefined || JSON.stringify(commits) === JSON.stringify(supplied) ? { baseCommit, commits } : null;
@@ -196,7 +251,7 @@ function introducedMainFixedPickFromContext(context: GraphContext, supplied: unk
   });
   const value = supplied && typeof supplied === 'object' && !Array.isArray(supplied) ? supplied as Record<string, unknown> : {};
   const cutCommit = typeof context.outputs.gate?.commit === 'string' ? context.outputs.gate.commit : '';
-  const currentMain = spawnSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8', timeout: 15_000 });
+  const currentMain = spawnSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   const mainTip = typeof value.mainTip === 'string' ? value.mainTip : currentMain.status === 0 ? currentMain.stdout.trim() : '';
   const firstParentRange = verifiedFirstParentRange(cutCommit, mainTip, value.firstParentCommits);
   if (!firstParentRange) return unmeasured('main tip or first-parent sequence does not match the local main history');
@@ -342,6 +397,7 @@ export function classifyGateShadow(gate: GateResult, evidence: GateTriageEvidenc
     reason = 'gate failure has no measured regression identity';
   }
 
+  const measuredClassification = classification;
   const repeated = failureIds.length > 0 && evidence.priorDecisions?.slice(-2).length === 2
     && evidence.priorDecisions.slice(-2).every((prior) => prior.classification === classification
       && prior.commit === gate.commit
@@ -350,7 +406,12 @@ export function classifyGateShadow(gate: GateResult, evidence: GateTriageEvidenc
     classification = 'exhausted';
     reason = 'the same class and failure identities already recurred twice';
   }
+  const knownFailAudit = auditKnownFailFailures(failureIds, evidence.knownFailOwners);
+  const unmeasuredOwnerAssignments = measuredClassification === 'unmeasured'
+    ? assignRepeatedUnmeasuredFailures(gate.introduced, evidence.priorDecisions ?? [], gate.commit,
+      evidence.ownerCellByFailureId ?? {}) : [];
   return { classification, reason, commit: gate.commit, introduced: [...gate.introduced], stalledFiles, failureIds,
+    knownFailAudit, unmeasuredOwnerAssignments,
     evidence: { highLoad: evidence.highLoad ?? null, isolatedReproductions: evidence.isolatedReproductions ?? null,
       isolatedCheckedFailureIds: evidence.isolatedCheckedFailureIds ? [...evidence.isolatedCheckedFailureIds] : null,
       isolatedPassedFiles: evidence.isolatedPassedFiles ? [...evidence.isolatedPassedFiles] : null,
@@ -393,6 +454,10 @@ export function gateTriageShadowFromContext(context: GraphContext, evidence?: Ga
       && typeof item.classification === 'string' && typeof item.commit === 'string' && Array.isArray(item.failureIds)
       && item.failureIds.every((id: unknown) => typeof id === 'string'))
       ? { priorDecisions: supplied.priorDecisions as GateTriageEvidence['priorDecisions'] } : {}),
+    ...(Array.isArray(supplied.knownFailOwners) ? { knownFailOwners: supplied.knownFailOwners } : {}),
+    ...(supplied.ownerCellByFailureId && typeof supplied.ownerCellByFailureId === 'object'
+      && !Array.isArray(supplied.ownerCellByFailureId)
+      ? { ownerCellByFailureId: supplied.ownerCellByFailureId as Record<string, string> } : {}),
   };
   if (!observed.priorDecisions && ledgerHistory.length) observed.priorDecisions = ledgerHistory;
   // The graph adapter maps a measured gate regression to `fail` for edge routing.
@@ -405,11 +470,19 @@ export function gateTriageShadowFromContext(context: GraphContext, evidence?: Ga
   }
   const shadow = { ...classifyGateShadow(gate as unknown as GateResult, observed),
     ...(typeof value.executionId === 'string' ? { gateExecutionId: value.executionId } : {}) };
+  const mainReceiptRoot = supplied.mainFileReceiptRoot;
+  const hasKeyDiffEvidence = supplied.regressionKeyDiff !== undefined && shadow.introduced.length > 0;
+  const mainTip = hasKeyDiffEvidence
+    ? spawnSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8', timeout: 15_000 }) : undefined;
+  const keyDiff = hasKeyDiffEvidence
+    ? triageRegressionKeyDiffs(shadow.introduced, supplied.regressionKeyDiff,
+      { repo: process.cwd(), mainTip: mainTip?.status === 0 ? mainTip.stdout.trim() : '',
+        mainReceiptRoot: typeof mainReceiptRoot === 'string' ? mainReceiptRoot : '' }) : undefined;
   if ((value.introduced as string[]).length > 0
       && (supplied.introducedMainFixedPick !== undefined || supportsIntroducedMainFixedPick(context.input.version)))
-    return { ...shadow, mainFixedPick: introducedMainFixedPickFromContext(context, supplied.introducedMainFixedPick,
+    return { ...shadow, ...(keyDiff ? { keyDiff } : {}), mainFixedPick: introducedMainFixedPickFromContext(context, supplied.introducedMainFixedPick,
       value.introduced as string[]) };
-  return shadow;
+  return { ...shadow, ...(keyDiff ? { keyDiff } : {}) };
 }
 
 export function logGateTriageShadow(result: GateTriageShadow, version: string): void {
@@ -471,12 +544,40 @@ if (import.meta.main) {
     const savedPath = process.argv[2] === '--gate-verdict' ? process.argv[3] : undefined;
     if (process.argv[2] && !savedPath) throw new Error('usage: gate-triage-node.ts [--gate-verdict <path>]');
     context = savedPath ? undefined : readGraphContext();
+    if (context) {
+      const currentGate = latestGateOutput(context);
+      if (currentGate) context.outputs.gate = currentGate;
+      else delete context.outputs.gate;
+    }
     errorVersion = context?.input.version ?? 'unknown';
     if (context && !context.outputs.gate) throw new Error('gate output is missing; adaptive triage is unmeasured');
     const history = context ? priorGateDecisionsFromLedger(context) : [];
+    const ownerLedger = context ? readKnownFailOwnerLedger(effectiveInstanceRoot()) : undefined;
+    const rawTriageEvidence = context?.input.gateTriageEvidence;
+    const suppliedTriageEvidence = rawTriageEvidence && typeof rawTriageEvidence === 'object'
+      && !Array.isArray(rawTriageEvidence) ? rawTriageEvidence as Record<string, unknown> : {};
     const { version, result } = savedPath
       ? gateTriageShadowFromSavedVerdict(JSON.parse(readFileSync(savedPath, 'utf8')))
-      : { version: context!.input.version, result: gateTriageShadowFromContext(context!, undefined, history) };
+      : { version: context!.input.version, result: gateTriageShadowFromContext(context!, {
+        ...suppliedTriageEvidence,
+        knownFailOwners: ownerLedger?.writable
+          ? [...ownerLedger.records, ...(Array.isArray(suppliedTriageEvidence.knownFailOwners) ? suppliedTriageEvidence.knownFailOwners : [])]
+          : [],
+      }, history) };
+    if (context && ownerLedger?.writable) {
+      try {
+        appendKnownFailOwnerLedger(effectiveInstanceRoot(), [
+          ...(Array.isArray(suppliedTriageEvidence.knownFailOwners) ? suppliedTriageEvidence.knownFailOwners : []),
+          ...result.unmeasuredOwnerAssignments,
+        ]);
+      } catch (error) {
+        debug.log('release-loop.gate', 'known-fail-owner-ledger-write-failed', { version,
+          reason: error instanceof Error ? error.message : String(error) });
+      }
+    } else if (context && ownerLedger && !ownerLedger.writable) {
+      debug.log('release-loop.gate', 'known-fail-owner-ledger-unreadable', { version,
+        reason: 'failures remain residual; refusing to overwrite the ledger' });
+    }
     logGateTriageShadow(result, version);
     const waiverEvents = readWaiverEvents(join(effectiveInstanceRoot(), 'review-results', 'waiver-events.jsonl'));
     const measuredRegression = Array.isArray(context?.outputs.gate?.introduced)
@@ -504,13 +605,15 @@ if (import.meta.main) {
       debug.log('release-loop.heal', event.name, { version, runId: context?.runId ?? null, ...event.data });
     const outcome = adaptiveHeal?.disposition.action === 'decision-required' ? 'fail' : result.outcome;
     emitNodeResult<Record<string, unknown>>({ ...result, outcome, waiverEventObservations,
-      ...(adaptiveHeal ? { prescription: adaptiveHeal.disposition, adaptiveHeal } : {}), verdict: result.outcome === 'ok' ? 'pass' : 'fail',
+      ...(adaptiveHeal ? { prescription: adaptiveHeal.disposition, adaptiveHeal } : {}),
+      verdict: result.outcome === 'ok' ? 'pass' : 'fail',
       summary: adaptiveHeal ? `gate-triage live plan: ${adaptiveHeal.disposition.action}`
         : `gate-triage shadow: ${result.classification} — ${result.reason}` });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     const result: GateTriageShadow = { outcome: 'error', classification: 'unmeasured', reason,
       commit: 'unknown', introduced: [], stalledFiles: [], failureIds: [],
+      knownFailAudit: { covered: [], residual: [] }, unmeasuredOwnerAssignments: [],
       evidence: { highLoad: null, isolatedReproductions: null, isolatedCheckedFailureIds: null,
         isolatedPassedFiles: null, environmentFailureIds: null, loadFlaky: null, stalledEnv: [] } };
     logGateTriageShadow(result, 'unknown');

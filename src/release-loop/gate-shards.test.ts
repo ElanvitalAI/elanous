@@ -1,10 +1,12 @@
-import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, expect, setDefaultTimeout, test } from 'bun:test';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { beginGateShardAttempt, finalizeTerminalGateShards, gateShardsPath, readGateShards, recordGateShardsVerdict, shardsLine, summarizeShards, writeGateShards, type GateShardsFile } from './gate-shards.js';
+import { join, resolve } from 'node:path';
+import { beginGateShardAttempt, finalizeTerminalGateShards, gateShardsPath, markGateShardsStopRequested, mergeGateShardBoardChanges, readGateShards, recordGateShardsVerdict, shardsLine, summarizeShards, updateGateShards, writeGateShards, SHARD_STATES, type GateShardsFile } from './gate-shards.js';
 
 const NOW = Date.parse('2026-10-07T12:00:00.000Z');
+setDefaultTimeout(7_000);
 const ago = (min: number) => new Date(NOW - min * 60_000).toISOString();
 
 test('stale running shard closes from either its result marker or terminal Job status, but not before watchdog age', () => {
@@ -45,9 +47,12 @@ function file(): GateShardsFile {
 
 describe('gate shards — 조각 상태 표', () => {
   test('조각 24 의 상태별 수 · 대기 이유 · 남은 시간 추정', () => {
-    const s = summarizeShards(file(), NOW);
+    const source = file();
+    const s = summarizeShards(source, NOW);
+    const expectedCounts = Object.fromEntries(SHARD_STATES.map((state) => [state, 0])) as typeof s.counts;
+    for (const shard of source.shards) expectedCounts[shard.state] += 1;
     expect(s.total).toBe(24);
-    expect(s.counts).toEqual({ pending: 8, running: 5, done: 9, retry: 0, timeout: 2, failed: 0 });
+    expect(s.counts).toEqual(expectedCounts);
     expect(s.waitReasons).toEqual([{ reason: 'CPU 부족 31.2/32', count: 8 }]);
     // 도는 조각 남은 최대 10분 + 대기 8×15분 ÷ 자리 5 = 24 → 34분
     expect(s.etaMin).toBe(34);
@@ -85,6 +90,81 @@ describe('gate shards — 조각 상태 표', () => {
       expect(readGateShards(path)?.shards).toEqual([{ id: 'b', state: 'running' }]);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+});
+
+test('stop request stays nonterminal until a Job terminal observation arrives', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-stop-requested-'));
+  try {
+    const path = gateShardsPath('0.3.8', root);
+    const board: GateShardsFile = { v: 1, version: '0.3.8', runId: 'stopped-run', updatedAt: ago(0), shards: [
+      { id: 'pod-live', state: 'running', job: 'job-live', startedAt: ago(3) },
+      { id: 'pod-pending', state: 'pending' },
+    ] };
+    writeGateShards(path, board);
+    const requested = markGateShardsStopRequested(path, 'stopped-run', new Date(NOW))!;
+    expect(requested.shards.map((shard) => shard.state)).toEqual(['stop-requested', 'stop-requested']);
+    expect(summarizeShards(requested, NOW).etaMin).toBeNull();
+    const stillLive = finalizeTerminalGateShards(requested, new Map(), new Map(), new Date(NOW));
+    expect(stillLive.shards.map((shard) => shard.state)).toEqual(['stop-requested', 'stop-requested']);
+    const resultRacedWithLiveJob = finalizeTerminalGateShards(requested, new Map(), new Map([['pod-live', {
+      completed: true, jobName: 'job-live', attemptId: requested.shards[0]!.attemptId,
+    }]]), new Date(NOW));
+    expect(resultRacedWithLiveJob.shards[0]?.state).toBe('stop-requested');
+    const failedJobConflictsWithSuccessResult = finalizeTerminalGateShards(requested,
+      new Map([['job-live', 'failed']]), new Map([['pod-live', {
+        completed: true, jobName: 'job-live', attemptId: requested.shards[0]!.attemptId, rc: 0,
+      }]]), new Date(NOW));
+    expect(failedJobConflictsWithSuccessResult.shards[0]?.state).toBe('failed');
+    const confirmed = finalizeTerminalGateShards(requested, new Map([['job-live', 'failed']]), new Map(), new Date(NOW));
+    expect(confirmed.shards.map((shard) => shard.state)).toEqual(['failed', 'stop-requested']);
+    expect(markGateShardsStopRequested(path, 'another-run')).toBeNull();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a board update fails closed on a stale lock instead of racing to unlink a new owner', () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-shard-stale-lock-'));
+  try {
+    const path = gateShardsPath('0.3.8', root);
+    const board: GateShardsFile = { v: 1, version: '0.3.8', updatedAt: ago(1), shards: [{ id: 'pod-0', state: 'running' }] };
+    writeGateShards(path, board);
+    writeFileSync(`${path}.lock`, '2147483647\n');
+    expect(() => updateGateShards(path, (current) => ({ ...current, shards: current.shards.map((shard) => ({ ...shard, state: 'stop-requested' })) }))).toThrow();
+    expect(existsSync(`${path}.lock`)).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a runner flush merges only its changed rows and preserves concurrent shard updates', () => {
+  const base: GateShardsFile = { v: 1, version: '0.3.8', updatedAt: ago(2), shards: [
+    { id: 'pod-0', state: 'running', job: 'job-0' }, { id: 'pod-1', state: 'running', job: 'job-1' },
+  ] };
+  const desired = [{ ...base.shards[0]!, state: 'done' as const }, base.shards[1]!];
+  const concurrent: GateShardsFile = { ...base, updatedAt: ago(1), verdict: { introduced: 1, preexisting: 0 }, shards: [
+    base.shards[0]!, { ...base.shards[1]!, state: 'failed', endedAt: ago(1) }, { id: 'pod-2', state: 'pending' },
+  ] };
+  const merged = mergeGateShardBoardChanges(concurrent, base.shards, desired, new Date(NOW));
+  expect(merged.shards.map(({ id, state }) => [id, state])).toEqual([['pod-0', 'done'], ['pod-1', 'failed'], ['pod-2', 'pending']]);
+  expect(merged.verdict).toEqual({ introduced: 1, preexisting: 0 });
+});
+
+test('concurrent board updates serialize and retain both shard transitions', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-shard-board-lock-'));
+  try {
+    const path = gateShardsPath('0.3.8', root);
+    writeGateShards(path, { v: 1, version: '0.3.8', updatedAt: ago(2), shards: [
+      { id: 'pod-0', state: 'running' }, { id: 'pod-1', state: 'running' },
+    ] });
+    const modulePath = resolve(import.meta.dir, './gate-shards.js');
+    const run = (id: string, state: 'done' | 'failed') => new Promise<void>((resolveRun, rejectRun) => {
+      const code = `const { updateGateShards } = await import(${JSON.stringify(modulePath)}); `
+        + `updateGateShards(${JSON.stringify(path)}, (current) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120); `
+        + `return { ...current, shards: current.shards.map((row) => row.id === ${JSON.stringify(id)} ? { ...row, state: ${JSON.stringify(state)} } : row) }; });`;
+      const child = spawn('bun', ['-e', code], { stdio: 'ignore' });
+      child.once('error', rejectRun);
+      child.once('exit', (code) => code === 0 ? resolveRun() : rejectRun(new Error(`board updater exited ${code}`)));
+    });
+    await Promise.all([run('pod-0', 'done'), run('pod-1', 'failed')]);
+    expect(readGateShards(path)?.shards.map(({ id, state }) => [id, state])).toEqual([['pod-0', 'done'], ['pod-1', 'failed']]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('a running shard past its plan says so instead of «남은 약 0분» (canary 10-07: planned 0.1 min · ran 22 min)', () => {

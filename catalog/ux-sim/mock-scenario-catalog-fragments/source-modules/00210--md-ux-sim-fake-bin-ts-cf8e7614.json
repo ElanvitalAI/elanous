@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-BIN-TS",
+  "path": "src/ux-sim/fake-bin.ts",
+  "boundary": "Creates a temporary PATH shim for declared executables, selects scripted output and exit status by argv prefix, optionally records allowlisted environment values, and records calls, signals and cleanup.",
+  "deviceIds": [
+    "fake-executable"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

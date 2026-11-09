@@ -65,6 +65,31 @@ describe('plugin manifest parser', () => {
     expect(manifestRequiredWidgets(manifest)).toEqual(['table']);
   });
 
+  test('parses first-party tool route metadata and rejects unsafe confirmation contracts', () => {
+    const tool = {
+      name: 'ReleaseStatus',
+      description: '현재 판의 발행 상태를 읽는다',
+      handler: 'native:release_status',
+      route: {
+        triggers: ['발행 상태', '릴리즈 어디까지', 'release status'],
+        examples: ['0.3.8 발행 준비 어디까지 됐어?'],
+        sideEffects: 'read-only',
+        risk: 'low',
+        cost: 'cheap',
+        requiresConfirm: false,
+      },
+    };
+    const manifest = parsePluginManifest({ id: 'elanous-release', contributes: { aiTools: [tool] } });
+    expect(manifest.contributes.aiTools?.[0]).toMatchObject({ handler: 'native:release_status', route: tool.route });
+
+    expect(() => parsePluginManifest({ id: 'elanous-release', contributes: { aiTools: [{
+      ...tool, route: { ...tool.route, requiresConfirm: false, risk: 'high' },
+    }] } })).toThrow('requiresConfirm must be true');
+    expect(() => parsePluginManifest({ id: 'elanous-release', contributes: { aiTools: [{
+      ...tool, route: { ...tool.route, triggers: ['   '] },
+    }] } })).toThrow('triggers must be a non-empty array of strings');
+  });
+
   test('parses portable classifier buckets under contributes', () => {
     const manifest = parsePluginManifest({
       id: 'portable.plugin',

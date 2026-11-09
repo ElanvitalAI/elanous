@@ -3,10 +3,8 @@ import type { LLMProvider } from '../llm.js';
 import { detectProviders, type DetectedProvider } from '../llm/provider-detect.js';
 import { probeProvider, type ProviderProbeResult } from '../llm/provider-probe.js';
 import { openrouterSource } from '../registry/discovery/sources/openrouter.js';
-import {
-  getUserConfig, reloadUserConfig, saveUserConfig, userConfigPath,
-  type UserConfig,
-} from '../user-config.js';
+import { getUserConfig, reloadUserConfig, saveUserConfig, userConfigPath } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 export interface LlmDetectOptions {
   json?: boolean;

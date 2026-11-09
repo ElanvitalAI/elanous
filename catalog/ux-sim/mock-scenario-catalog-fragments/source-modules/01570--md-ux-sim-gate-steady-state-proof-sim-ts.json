@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-GATE-STEADY-STATE-PROOF-SIM-TS",
+  "path": "src/ux-sim/gate-steady-state-proof-sim.ts",
+  "boundary": "Simulates steady-state release gate metrics and proof receipts in an isolated graph run.",
+  "deviceIds": ["release-graph-rig"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

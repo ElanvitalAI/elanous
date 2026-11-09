@@ -1,0 +1,13 @@
+{
+  "id": "MD-UX-SIM-SCENARIO-TS",
+  "path": "src/ux-sim/scenario.ts",
+  "boundary": "Parses and validates ScenarioV0 YAML, executes its registered trigger through the production path with isolated injected boundaries, checks screen/log expectations and persists run evidence.",
+  "deviceIds": [
+    "scenario-runner",
+    "draft-inventory",
+    "sim-event-log-path",
+    "author-reviewer-precheck"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-RENDER-FRAME-TS",
+  "path": "src/ux-sim/render-frame.ts",
+  "boundary": "Builds dashboard log frames from supplied widget state and optional UX fields so tests can inspect the real renderer output.",
+  "deviceIds": [
+    "tui-interaction"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -9,6 +9,7 @@ import { useDaemon } from '@/components/providers/DaemonProvider';
 import { SeatsNowStrip } from './SeatsNowStrip';
 import { NowSpeakButton } from './NowSpeakButton';
 import { ChatApprovalsChip } from './ChatApprovalsChip';
+import { DeployConfirmCard } from './DeployConfirmCard';
 import { ChatDecisionsChip } from './ChatDecisionsChip';
 import { MobileChatStatus } from './MobileChatStatus';
 import type { ShellActivitySnapshot } from '@/components/shell/activity-snapshot';
@@ -38,6 +39,7 @@ import {
   runChatTurnAcp,
   runChatTurnObserver,
   runChatTurnStreaming,
+  isIncompleteChatStopReason,
   type ChatBlock,
   type ChatMessage,
   type ChatRuntimeContext,
@@ -48,6 +50,7 @@ import { AskQuestionSheet } from '@/components/ask-user-question/AskQuestionShee
 import { useAskQuestion } from '@/components/ask-user-question/use-ask-question';
 import { ToolApprovalSheet } from '@/components/tool-approval/ToolApprovalSheet';
 import { useToolApproval } from '@/components/tool-approval/use-tool-approval';
+import { deployConfirmation } from '@/lib/chat-deploy';
 import type { AcpConnection } from '@/lib/daemon-client';
 import { VOICE_DOT_COLOR, VOICE_PHASE_LABEL } from '@/voice/voice-phase-styles';
 import { cn } from '@/lib/utils';
@@ -55,6 +58,7 @@ import { toast } from 'sonner';
 import { debugLog, setDebugForwardFallback } from '@/lib/debug';
 import { reduceTurnBusyBanner, type TurnBusyBanner } from '@/lib/turn-busy';
 import { uploadAttachments, type AttachmentMeta } from '@/lib/upload-attachment';
+import { acknowledgeSharedPayloadFiles, takeSharedPayload } from '@/lib/share-target-store';
 import { cardFollowupStorage, forgetCardFollowup, isCardRequest, readPendingCardFollowups, rememberCardFollowup, startCardFollowup, waitCardFollowup } from '@/lib/card-followup-client';
 import { extractClipboardFiles, extractDroppedFiles, hasDroppedFiles, type ChatFileExtraction } from '@/lib/chat-paste-drop';
 import {
@@ -63,17 +67,54 @@ import {
   isProviderUserMessageVisionCapable,
 } from '@/lib/attachment-content';
 
+// A route remount can create a new ChatLayout while the previous instance is
+// still uploading the same Share Target payload. Keep one handoff active per
+// id for the lifetime of this document; a full reload ends the old request.
+const activeShareHandoffs = new Set<string>();
+const SHARE_ATTACHMENTS_KEY = 'elanous.pwa.shareAttachments';
+
+function readStagedShareAttachments(): AttachmentMeta[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const parsed: unknown = JSON.parse(window.sessionStorage.getItem(SHARE_ATTACHMENTS_KEY) ?? '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((entry): entry is AttachmentMeta => entry !== null && typeof entry === 'object'
+      && typeof entry.id === 'string' && typeof entry.filename === 'string'
+      && typeof entry.mediaType === 'string' && typeof entry.size === 'number'
+      && typeof entry.downloadUrl === 'string');
+  } catch { return []; }
+}
+
+function mergeAttachments(existing: readonly AttachmentMeta[], incoming: readonly AttachmentMeta[]): AttachmentMeta[] {
+  const byId = new Map(existing.map((entry) => [entry.id, entry]));
+  for (const entry of incoming) byId.set(entry.id, entry);
+  return [...byId.values()];
+}
+
+function saveStagedShareAttachments(entries: readonly AttachmentMeta[]): void {
+  if (typeof window === 'undefined') return;
+  if (entries.length === 0) window.sessionStorage.removeItem(SHARE_ATTACHMENTS_KEY);
+  else window.sessionStorage.setItem(SHARE_ATTACHMENTS_KEY, JSON.stringify(entries));
+}
+
+function acknowledgeShareAttachmentIds(ids: readonly string[]): void {
+  if (ids.length === 0 || typeof window === 'undefined') return;
+  const submitted = new Set(ids);
+  saveStagedShareAttachments(readStagedShareAttachments().filter((entry) => !submitted.has(entry.id)));
+}
+
+function acknowledgeSubmittedShareAttachments(entries: readonly AttachmentMeta[]): void {
+  acknowledgeShareAttachmentIds(entries.map((entry) => entry.id));
+}
+
+function restoreStagedShareAttachments(previous: readonly AttachmentMeta[], candidates: readonly AttachmentMeta[]): AttachmentMeta[] {
+  const candidateIds = new Set(candidates.map((entry) => entry.id));
+  return mergeAttachments(previous, readStagedShareAttachments().filter((entry) => candidateIds.has(entry.id)));
+}
+
 export interface ChatLayoutProps {
-  /** PR #4.5 — workspace chat 탭이 SessionPill 의 attach 클릭을
-   *  workspace 의 SessionPicker 로 라우팅. 미지정 시 dropdown item 자체
-   *  안 보임 (single-tab `/chat` 동작 보존). */
-  onAttachRequest?: () => void;
-  onForgetRequest?: () => void;
   /** The daemon corrected this conversation's id; keep its mounted transcript. */
   onSessionAdopt?: (id: string) => void;
-  /** BACKLOG #3 — workspace tab id forwarded to ChatInput / ChatHistory
-   *  for surface snapshot persistence. */
-  tabId?: string;
   /** Compact header's conversation navigation, supplied by the standalone chat panel. */
   leading?: ReactNode;
   mobileSimple?: boolean;
@@ -107,6 +148,11 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   const { client, config, sessionId, setSessionId } = useDaemon();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; id: number }>();
+  const shareHandoffRef = useRef<string | null>(null);
+  const shareMountedRef = useRef(false);
+  const [shareRetryId, setShareRetryId] = useState<string | null>(null);
+  const [shareRetryFiles, setShareRetryFiles] = useState<string[]>([]);
+  const [shareRetryNonce, setShareRetryNonce] = useState(0);
   const [pending, setPending] = useState(false);
   const [queue, setQueue] = useState<ChatQueueEntry[]>([]);
   const queueRef = useRef<ChatQueueEntry[]>([]);
@@ -146,6 +192,117 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   // pushes its meta here; submit drains it into the user text and the
   // message body so the LLM sees both the path list and any caption.
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentMeta[]>([]);
+  useEffect(() => {
+    shareMountedRef.current = true;
+    return () => { shareMountedRef.current = false; };
+  }, []);
+  useEffect(() => {
+    const retry = (): void => setShareRetryNonce((value) => value + 1);
+    window.addEventListener('elanous:pwa-share-retry', retry);
+    return () => window.removeEventListener('elanous:pwa-share-retry', retry);
+  }, []);
+  // The service worker hands Share Target payloads straight to Chat, so
+  // `/share` does not need to remain a separate screen.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const sharedId = params.get('shared') ?? window.sessionStorage.getItem('elanous.pwa.shareHandoffId');
+    const text = [params.get('title'), params.get('text'), params.get('url')]
+      .filter((part): part is string => Boolean(part?.trim()))
+      .map((part) => part.trim())
+      .join('\n\n');
+    if (!sharedId && !text) return;
+    const handoffKey = sharedId ? `shared:${sharedId}` : `text:${text}`;
+    if (shareHandoffRef.current === handoffKey || (sharedId && !config.baseUrl)) return;
+    if (sharedId && activeShareHandoffs.has(sharedId)) return;
+    shareHandoffRef.current = handoffKey;
+    if (sharedId) activeShareHandoffs.add(sharedId);
+    if (sharedId) {
+      try { window.sessionStorage.setItem('elanous.pwa.shareHandoffId', sharedId); } catch { /* Keep the URL as the retry source. */ }
+    }
+    let retryNeeded = false;
+    void (async () => {
+      try {
+      // Treat URL title/text/url shares like the service-worker handoff: the
+      // composer consumes this only when it has no restored or typed draft.
+      if (text) writeSharePrefill(text);
+      if (sharedId) {
+        const payload = await takeSharedPayload(sharedId, { drain: false });
+        if (!payload) {
+          toast.error('공유한 파일을 찾지 못했습니다. 다시 공유해 주세요.');
+          if (shareMountedRef.current) setShareRetryFiles(['공유 payload']);
+          retryNeeded = true;
+        } else {
+          if (payload.combinedText) writeSharePrefill(payload.combinedText);
+          if (payload.files.length > 0) {
+            const results = await uploadAttachments(payload.files.map((file) => ({ file, filename: file.name })), {
+              baseUrl: config.baseUrl,
+              ...(config.token ? { token: config.token } : {}),
+            });
+            const uploaded: AttachmentMeta[] = [];
+            const acknowledged: string[] = [];
+            const failedNames: string[] = [];
+            results.forEach((result, index) => {
+              if (result.ok) {
+                uploaded.push(result.meta);
+                const fileKey = payload.fileKeys[index];
+                if (fileKey) acknowledged.push(fileKey);
+              } else {
+                failedNames.push(payload.files[index]?.name ?? `파일 ${index + 1}`);
+              }
+            });
+            if (uploaded.length > 0) {
+              saveStagedShareAttachments(mergeAttachments(readStagedShareAttachments(), uploaded));
+              await acknowledgeSharedPayloadFiles(sharedId, acknowledged);
+              window.dispatchEvent(new Event('elanous:pwa-share-attachments'));
+              toast.success(`${uploaded.length}개 공유 파일을 대화에 첨부했습니다.`);
+            } else {
+              await acknowledgeSharedPayloadFiles(sharedId, []);
+            }
+            if (failedNames.length > 0) {
+              retryNeeded = true;
+              if (shareMountedRef.current) setShareRetryFiles(failedNames);
+              toast.error(`공유 파일 업로드 실패: ${failedNames.join(', ')}. 실패한 파일을 보존했습니다.`);
+            }
+          } else {
+            await acknowledgeSharedPayloadFiles(sharedId, []);
+          }
+        }
+      }
+      if (retryNeeded) {
+        if (shareMountedRef.current) setShareRetryId(sharedId);
+        shareHandoffRef.current = null;
+      } else {
+        if (shareMountedRef.current) {
+          setShareRetryId(null);
+          setShareRetryFiles([]);
+        }
+        if (sharedId) {
+          try { window.sessionStorage.removeItem('elanous.pwa.shareHandoffId'); } catch { /* Query cleanup still applies. */ }
+        }
+      }
+      if (shareMountedRef.current) {
+        const cleanUrl = new URL(window.location.href);
+        for (const key of ['title', 'text', 'url']) cleanUrl.searchParams.delete(key);
+        if (!retryNeeded) cleanUrl.searchParams.delete('shared');
+        window.history.replaceState(window.history.state, '', cleanUrl);
+      }
+      } catch (error) {
+        retryNeeded = true;
+        shareHandoffRef.current = null;
+        if (shareMountedRef.current) {
+          setShareRetryId(sharedId);
+          setShareRetryFiles(['공유 파일']);
+        }
+        toast.error(`공유 파일 처리를 완료하지 못했습니다: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        if (sharedId) {
+          activeShareHandoffs.delete(sharedId);
+          if (retryNeeded && !shareMountedRef.current) window.dispatchEvent(new Event('elanous:pwa-share-retry'));
+        }
+      }
+    })();
+  }, [config.baseUrl, config.token, shareRetryNonce]);
   const cardFollowupControllerRef = useRef<AbortController | null>(null);
   const cardFollowupOwnerRef = useRef<string | null>(null);
   useEffect(() => () => {
@@ -398,30 +555,32 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     void uploadTransferFiles(extracted);
   };
 
-  // Service Worker Phase 2 — when /share/ redirects to /chat?shared=1
-  // it has already uploaded files to the daemon and stashed the
-  // resulting AttachmentMeta[] under SHARE_ATTACHMENTS_KEY. Drain it
-  // once on mount so the user sees the chips ready to send. The flag
-  // is sessionStorage-scoped so a deep-link reload doesn't re-pop.
+  // Drain attachments handed off by a Share Target upload that outlived its
+  // Chat mount. Listen as well as checking storage: the upload can finish just
+  // after this effect ran during a route transition.
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    try {
-      const raw = window.sessionStorage.getItem('elanous.pwa.shareAttachments');
-      if (!raw) return;
-      window.sessionStorage.removeItem('elanous.pwa.shareAttachments');
-      const parsed = JSON.parse(raw) as AttachmentMeta[];
-      if (!Array.isArray(parsed) || parsed.length === 0) return;
-      setPendingAttachments((prev) => [...prev, ...parsed]);
-      const labels = parsed.length === 1
-        ? `1 file shared from another app`
-        : `${parsed.length} files shared from another app`;
-      toast.success(labels);
-      debugLog('pwa.chat.share-attachments.consume', { count: parsed.length });
-    } catch (e) {
-      debugLog('pwa.chat.share-attachments.parse-failed', {
-        reason: e instanceof Error ? e.message : String(e),
-      });
-    }
+    const consume = (): void => {
+      try {
+        const raw = window.sessionStorage.getItem(SHARE_ATTACHMENTS_KEY);
+        if (!raw) return;
+        const parsed = JSON.parse(raw) as AttachmentMeta[];
+        if (!Array.isArray(parsed) || parsed.length === 0) return;
+        setPendingAttachments((prev) => mergeAttachments(prev, parsed));
+        const labels = parsed.length === 1
+          ? `1 file shared from another app`
+          : `${parsed.length} files shared from another app`;
+        toast.success(labels);
+        debugLog('pwa.chat.share-attachments.consume', { count: parsed.length });
+      } catch (e) {
+        debugLog('pwa.chat.share-attachments.parse-failed', {
+          reason: e instanceof Error ? e.message : String(e),
+        });
+      }
+    };
+    window.addEventListener('elanous:pwa-share-attachments', consume);
+    consume();
+    return () => window.removeEventListener('elanous:pwa-share-attachments', consume);
   }, []);
 
   // P3(2026-07-12): 구 S3b 핸드오프 seed(sessionStorage 전사 복사) 제거 —
@@ -457,6 +616,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
 
   const handleRemoveAttachment = useCallback((id: string): void => {
     setPendingAttachments((prev) => prev.filter((e) => e.id !== id));
+    acknowledgeShareAttachmentIds([id]);
   }, []);
 
   const ctx: ChatRuntimeContext = {
@@ -472,13 +632,13 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     setMessages((prev) => [...prev, msg]);
   };
 
-  const pollCard = async (id: string, owner: string, progressId: string, controller: AbortController, startedAt?: number): Promise<'not-card' | 'terminal'> => {
+  const pollCard = async (id: string, owner: string, progressId: string, controller: AbortController, startedAt?: number): Promise<'not-card' | 'done' | 'failed' | 'interrupted'> => {
     const result = await waitCardFollowup(client, id, {
       signal: controller.signal,
       ...(startedAt === undefined ? {} : { startedAt }),
       onStatus: (status) => debugLog('pwa.chat.card-followup', { phase: 'poll', status }),
     });
-    if (controller.signal.aborted || currentSessionRef.current !== owner) return 'terminal';
+    if (controller.signal.aborted || currentSessionRef.current !== owner) return 'interrupted';
     const storage = cardFollowupStorage();
     if (storage) forgetCardFollowup(storage, owner, id);
     if (result.status === 'not-card') {
@@ -495,12 +655,13 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         })),
       ]);
       debugLog('pwa.chat.card-followup', { phase: 'complete', status: 'done' });
+      return 'done';
     } else {
       setMessages((prev) => prev.map((m) => m.id === progressId
-        ? { ...m, text: '명함 정리에 실패했습니다 — 다시 보내 주세요' } : m));
+        ? { ...m, streaming: false, text: '명함 정리에 실패했습니다 — 다시 보내 주세요' } : m));
       debugLog('pwa.chat.card-followup', { phase: 'complete', status: 'failed' });
+      return 'failed';
     }
-    return 'terminal';
   };
 
   useEffect(() => {
@@ -511,13 +672,13 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       const controller = new AbortController();
       const progressId = `m-card-resume-${id}`;
       setMessages((prev) => prev.some((m) => m.id === progressId) ? prev : [...prev, {
-        id: progressId, role: 'assistant', text: '명함 읽는 중… 조사 중…', timestamp: startedAt,
+        id: progressId, role: 'assistant', text: '명함 읽는 중… 조사 중…', streaming: true, timestamp: startedAt,
         meta: { provider: config.provider },
       }]);
       void pollCard(id, sessionId, progressId, controller, startedAt).catch(() => {
         if (controller.signal.aborted || currentSessionRef.current !== sessionId) return;
         setMessages((prev) => prev.map((m) => m.id === progressId
-          ? { ...m, text: '명함 정리에 실패했습니다 — 다시 보내 주세요' } : m));
+          ? { ...m, streaming: false, text: '명함 정리에 실패했습니다 — 다시 보내 주세요' } : m));
       });
       return controller;
     });
@@ -560,7 +721,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       if (text.length > 0) append(newUserMessage(text));
       append(newMetaMessage(`📎 attached: ${attached.map((e) => e.filename).join(', ')}`));
       const progressId = `m-card-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      append({ id: progressId, role: 'assistant', text: '명함 읽는 중… 조사 중…', timestamp: Date.now(), meta: { provider: config.provider } });
+      append({ id: progressId, role: 'assistant', text: '명함 읽는 중… 조사 중…', streaming: true, timestamp: Date.now(), meta: { provider: config.provider } });
       setPending(true);
       debugLog('pwa.chat.card-followup', { phase: 'start', status: 'judging' });
       try {
@@ -570,11 +731,14 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         const startedAt = Date.now();
         if (storage) rememberCardFollowup(storage, { sessionId: owner, id, startedAt });
         const outcome = await pollCard(id, owner, progressId, cardController, startedAt);
-        if (outcome === 'terminal' || cardController.signal.aborted || currentSessionRef.current !== owner) return;
+        if (outcome === 'done') acknowledgeSubmittedShareAttachments(attached);
+        else if (outcome === 'failed') setPendingAttachments((prev) => restoreStagedShareAttachments(prev, attached));
+        if (outcome !== 'not-card' || cardController.signal.aborted || currentSessionRef.current !== owner) return;
       } catch {
         if (cardController.signal.aborted || currentSessionRef.current !== owner) return;
+        setPendingAttachments((prev) => restoreStagedShareAttachments(prev, attached));
         setMessages((prev) => prev.map((m) => m.id === progressId
-          ? { ...m, text: '명함 정리에 실패했습니다 — 다시 보내 주세요' } : m));
+          ? { ...m, streaming: false, text: '명함 정리에 실패했습니다 — 다시 보내 주세요' } : m));
         debugLog('pwa.chat.card-followup', { phase: 'complete', status: 'failed' });
         return;
       } finally {
@@ -683,6 +847,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       id: placeholderId,
       role: 'assistant',
       text: '',
+      streaming: true,
       timestamp: Date.now(),
       meta: { provider: config.provider },
     };
@@ -753,6 +918,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
               payload: info,
             })),
           });
+      acknowledgeSubmittedShareAttachments(attached);
       setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, { kind: 'turn-end' }));
       // Replace the placeholder bubble with the finalized message so
       // meta (stopReason) attaches without a flicker.
@@ -768,6 +934,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       // 로 flush. 사용자가 마지막 한 문장을 못 듣고 끊기는 회귀 회피.
       voiceTts.flush();
     } catch (err) {
+      setPendingAttachments((prev) => restoreStagedShareAttachments(prev, attached));
       const aborted = ac.signal.aborted;
       const msg = err instanceof Error ? err.message : String(err);
       // Phase 5 — turn 중단 (사용자 Stop / 네트워크 오류) 시 진행 중
@@ -780,16 +947,15 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         setMessages((prev) =>
           prev.map((m) =>
             m.id === placeholderId
-              ? { ...m, meta: { ...m.meta, stopReason: 'aborted' } }
+              ? { ...m, streaming: false, incomplete: true, meta: { ...m.meta, stopReason: 'aborted' } }
               : m,
           ),
         );
         debugLog('webterm.chat.runturn.stream.abort', { reason: msg });
       } else {
-        // Drop the placeholder bubble on real error — the meta error
-        // line below carries the diagnostic.
-        setMessages((prev) => prev.filter((m) => m.id !== placeholderId));
-        append(newMetaMessage(`error: ${msg}`));
+        // Preserve the partial answer for inspection without presenting it as final.
+        setMessages((prev) => prev.map((m) => m.id === placeholderId
+          ? { ...m, streaming: false, incomplete: true, meta: { ...m.meta, stopReason: msg } } : m));
         toast.error(`chat failed: ${msg}`);
         // ⛔⭐⭐⭐ **사용자가 보는 실패를 «관측에도» 남긴다.**
         //   📏 2026-08-22 실측(19차 `[F]` 라이브): 화면엔 `error: socket closed: 1006` 이 떴는데
@@ -877,6 +1043,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           id,
           role: 'assistant',
           text: '',
+          streaming: true,
           timestamp: Date.now(),
           meta: { provider: config.provider },
         };
@@ -901,6 +1068,12 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           remoteSseTurnPlaceholderRef.current = null;
         }
       },
+      onInterrupted: (placeholderId) => {
+        setMessages((prev) => prev.map((m) => m.id === placeholderId
+          ? { ...m, streaming: false, incomplete: true, meta: { ...m.meta, stopReason: 'interrupted' } }
+          : m));
+        if (remoteSseTurnPlaceholderRef.current === placeholderId) remoteSseTurnPlaceholderRef.current = null;
+      },
       onError: (placeholderId, info) => {
         setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, {
           kind: 'error',
@@ -917,6 +1090,8 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
             m.id === placeholderId
               ? {
                   ...m,
+                  streaming: false,
+                  incomplete: true,
                   meta: { ...m.meta, stopReason: info.error },
                 }
               : m,
@@ -1006,11 +1181,10 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   // Webterm `:agent` turns hit neither gate, so ACP listener is the
   // exclusive owner of those bubbles.
   //
-  // Turn boundary — webterm `:agent` does NOT broadcast turn-end, so
-  // the foreign-turn observer arms an idle timer per chunk (default
-  // 3s). On expiration the placeholder is considered finalized and
-  // stays in history as a regular message; subsequent foreign turns
-  // get a fresh placeholder.
+  // Webterm `:agent` now broadcasts explicit begin/end signals. The
+  // foreign-turn observer keeps a 3s idle fallback for older ACP streams;
+  // an explicit turn finalizes only when its end signal arrives.
+  // The finalized bubble stays in history; the next turn gets a new one.
   useEffect(() => {
     if (!sessionId) return;
     if (!config.baseUrl) return;
@@ -1065,6 +1239,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           id,
           role: 'assistant',
           text: '',
+          streaming: true,
           timestamp: Date.now(),
           meta: { provider: config.provider },
         };
@@ -1094,7 +1269,19 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           ),
         );
       },
-      onFinalize: (placeholderId) => {
+      onFinalize: (placeholderId, info) => {
+        setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, { kind: 'turn-end' }));
+        setMessages((prev) => prev.map((message) => message.id === placeholderId
+          ? {
+              ...message,
+              streaming: false,
+              ...(info ? {
+                finalTextStart: Math.min(info.finalTextStart, message.text.length),
+                incomplete: isIncompleteChatStopReason(info.stopReason),
+                meta: { ...message.meta, stopReason: info.stopReason },
+              } : {}),
+            }
+          : message));
         debugLog('webterm.chat.acp.foreign-finalize', { placeholderId });
       },
     });
@@ -1123,6 +1310,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   });
 
   const toolApproval = useToolApproval({ acp: acpForAsk, sessionId });
+  const deployConfirm = deployConfirmation(askQuestion.pendingRequest);
 
   const voiceButton = (
     <button
@@ -1158,8 +1346,12 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
 
   return (
     <div className="relative flex h-full flex-col" onPaste={handlePaste} onDragEnter={handleDragEnter} onDragLeave={handleDragLeave} onDragOver={handleDragOver} onDrop={handleDrop}>
+      {shareRetryId && <div role="alert" className="flex shrink-0 items-center justify-between gap-3 border-b border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
+        <span>공유 파일 업로드 실패: {shareRetryFiles.join(', ') || '공유 파일'}</span>
+        <button type="button" onClick={() => { shareHandoffRef.current = null; setShareRetryId(null); setShareRetryFiles([]); setShareRetryNonce((value) => value + 1); }} className="shrink-0 rounded border border-border px-2 py-1 font-medium hover:bg-accent">다시 시도</button>
+      </div>}
       {dropOverlay.visible && <ChatDropOverlay />}
-      {props.mobileSimple && compact && <MobileChatStatus activity={props.mobileActivity ?? { kind: 'loading' }} decisions={decisionCount} menu={
+      {props.mobileSimple && compact && <MobileChatStatus minimal activity={props.mobileActivity ?? { kind: 'loading' }} decisions={decisionCount} menu={
         <div ref={moreRef} className="relative shrink-0">
           <button type="button" aria-label="채팅 메뉴" aria-expanded={moreOpen} aria-controls="chat-mobile-menu" onClick={() => setMoreOpen((open) => !open)} className="rounded-lg p-1 hover:bg-muted">
             <MoreHorizontal className="h-5 w-5" aria-hidden="true" />
@@ -1167,11 +1359,10 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           {moreOpen && <div id="chat-mobile-menu" className="absolute right-0 top-full z-50 mt-2 flex max-h-[70dvh] w-[min(19rem,calc(100vw-1rem))] flex-col gap-2 overflow-y-auto rounded-lg border border-border bg-popover p-3 shadow-lg">
             <nav aria-label="채팅 이동" className="flex gap-3 text-sm">
               <Link href="/" className="rounded px-2 py-1 hover:bg-muted">홈</Link>
-              <Link href="/workspace" className="rounded px-2 py-1 hover:bg-muted">워크스페이스</Link>
               <Link href="/settings" className="rounded px-2 py-1 hover:bg-muted">설정</Link>
             </nav>
             {props.conversationButton}
-            <SessionPill sessionId={sessionId} {...(props.onAttachRequest ? { onAttachRequest: props.onAttachRequest } : {})} {...(props.onForgetRequest ? { onForgetRequest: props.onForgetRequest } : {})} />
+            <SessionPill sessionId={sessionId} />
             <ChatCurrentProject compact />
             <NowSpeakButton />
             <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
@@ -1186,8 +1377,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           <div className="min-w-0 flex-1 [&>div]:min-w-0 [&>div]:max-w-full [&>div>div:first-child]:min-w-0 [&>div>div:first-child]:max-w-full [&>div>div:first-child]:overflow-hidden [&>div>div:first-child>span:last-child]:shrink-0 [&>div>div:first-child_span]:min-w-0 [&>div>div:first-child_span]:truncate [&>div>div[role=menu]]:max-w-[calc(100vw-4rem)]">
             <SessionPill
               sessionId={sessionId}
-              {...(props.onAttachRequest ? { onAttachRequest: props.onAttachRequest } : {})}
-              {...(props.onForgetRequest ? { onForgetRequest: props.onForgetRequest } : {})}
             />
           </div>
           <div className="min-w-0 shrink-0"><ChatCurrentProject compact /></div>
@@ -1210,8 +1399,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           <div className="flex items-center gap-2">
             <SessionPill
               sessionId={sessionId}
-              {...(props.onAttachRequest ? { onAttachRequest: props.onAttachRequest } : {})}
-              {...(props.onForgetRequest ? { onForgetRequest: props.onForgetRequest } : {})}
             />
             <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
             <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
@@ -1219,7 +1406,11 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           <div className="flex min-w-0 items-center gap-2"><ChatCurrentProject /><NowSpeakButton />{voiceButton}</div>
         </div>
       ) : null}
-      {!(props.mobileSimple && compact) && <SeatsNowStrip />}
+      {!(props.mobileSimple && compact) && <details className="shrink-0 border-b border-border px-3 py-1 text-xs text-muted-foreground">
+        <summary className="cursor-pointer select-none">자세히</summary>
+        <SeatsNowStrip />
+        <ChatHud />
+      </details>}
       {props.mobileSimple && compact && (approvalCount + decisionCount > 0) && (
         <div className="shrink-0 px-3 py-1.5">
           <button type="button" aria-expanded={actionsOpen} aria-controls="chat-mobile-actions" onClick={() => setActionsOpen((open) => !open)} className="rounded-full border border-border bg-muted px-3 py-1 text-xs font-medium">
@@ -1236,12 +1427,14 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       {/* PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M4 — HUD strip.
           Empty-state renders nothing, so this row is invisible until the
           daemon mirror (M3) pushes its first segment. */}
-      {!(props.mobileSimple && compact) && <ChatHud />}
       {/* Phase 3 (voice 일원화) — relative + flex column wrapper 가
           VoiceOverlay 의 absolute positioning 컨텍스트 + ChatHistory 의
           flex-1 sizing 을 동시에 만족. voice 활성 시 overlay 가 fade-in. */}
       <div className="relative flex flex-1 min-h-0 flex-col">
-        <ChatHistory messages={messages} pending={pending} mobileSimple={!!(props.mobileSimple && compact)} {...(props.tabId ? { tabId: props.tabId } : {})} />
+        <ChatHistory messages={messages} pending={pending} mobileSimple={!!(props.mobileSimple && compact)} />
+        {deployConfirm && <DeployConfirmCard question={deployConfirm.question}
+          onNo={() => askQuestion.submit({ answers: { confirm: deployConfirm.no } })}
+          onYes={() => askQuestion.submit({ answers: { confirm: deployConfirm.yes } })} />}
         {turnBusyBanner && (
           <div
             role="alert"
@@ -1287,7 +1480,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       </div>
       {pending && abortController && (
         <div className="flex shrink-0 items-center justify-end gap-2 border-t border-border bg-muted/30 px-4 py-1.5 text-xs">
-          <span className="text-muted-foreground">streaming…</span>
           <button
             type="button"
             onClick={handleStop}
@@ -1318,7 +1510,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           disabled: !voiceConfigured,
           onToggle: () => void voice.toggle(),
         }}
-        {...(props.tabId ? { tabId: props.tabId } : {})}
         onListFiles={acpForAsk && sessionId
           ? async (query) => {
               // PWA Phase 2·A — daemon ACP `elanous/fs/list` 호출.
@@ -1381,7 +1572,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           for inbound `elanous/ask/request`. `pendingRequest` 가 non-null
           일 때만 Dialog open · close 는 cancel/submit 시 자동. */}
       <AskQuestionSheet
-        request={askQuestion.pendingRequest}
+        request={deployConfirm ? null : askQuestion.pendingRequest}
         onSubmit={askQuestion.submit}
         onCancel={askQuestion.cancel}
         onChatAboutThis={askQuestion.chatAboutThis}

@@ -189,6 +189,7 @@ test('hard rehearsal evidence uses a distinct rc path; its receipt selects only 
   const args = hardRehearsalGateArgs(input.version, 'hard-12345678-1234-1234-1234-123456789abc', input.forCommit, '1.0.0', 'node-b:1');
   expect(args[0]).toBe('scripts/release-loop/gate-node-cli.ts');
   expect(args[args.indexOf('--version') + 1]).toBe(gateVersion);
+  expect(args.slice(args.indexOf('--run-id'), args.indexOf('--run-id') + 2)).toEqual(['--run-id', 'hard-12345678-1234-1234-1234-123456789abc']);
   expect(args).toContain('--rehearsal-baseline');
   expect(planHardRehearsalRadius(input)).toMatchObject({ plan: { files: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'], priorCommit: expect.any(String) },
     reason: 'hard rehearsal receipt and import radius verified' });

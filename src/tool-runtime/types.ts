@@ -100,6 +100,8 @@ export interface ToolRuntimeContext {
   originSessionId?: string;
   /** Server-verified owner principal. Never derive this from session source, tool args, or a client-declared origin. */
   verifiedOwner?: { id: string };
+  /** Server-authenticated Nexus app session class; never supplied by tool arguments. */
+  appDeploymentSession?: 'nexus-owner' | 'member' | 'anonymous';
   /** Server-assigned provenance; omitted on existing owner tool paths. */
   requestOrigin?: RequestOrigin;
   /** Confirm through the originating chat's channels, not another user's global channel. */

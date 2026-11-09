@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGraph } from '../graph-runner/runner.js';
 import { createGraphEventBus } from '../graph-runner/graph-events.js';
+import { debug } from '../debug/log.js';
 import { createMacrophageRuntime } from './macrophage-heal-node.js';
 
 test('release phase node-end reaches the macrophage subscriber and records the actual bus trace', async () => {
@@ -89,6 +90,14 @@ test('simulation routes a real failed release node-end into one shadow decision 
   const graphPath = join(graphDir, 'release-loop.yaml');
   writeFileSync(graphPath, `graph_id: ${graphId}\nversion: 1\nentry_node: gate\nterminal_nodes: [failed]\nnodes:\n  - { node_id: gate, kind: gate, recipe: 'cmd:fail-ledger', max_visits: 1 }\n  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: gate, on: outcome, map: { ok: failed, fail: failed, error: failed } }\n`);
   const unknownNotices: Array<{ runId: string; nodeId: string; detail: string }> = [];
+  const macrophageLogs: Array<{ category: string; event: string; data?: unknown }> = [];
+  const previousFileEnabled = debug.isFileEnabled();
+  const previousMirrorEnabled = debug.isMirrorEnabled();
+  debug.setFileEnabled(false);
+  debug.setMirror(true);
+  const unregisterDebugSink = debug.registerSink({ name: 'macrophage-live-promote-test', emit: (record) => {
+    if (record.category === 'release-loop.macrophage' && record.event === 'decision') macrophageLogs.push(record);
+  } });
   let unknownNoticeAttempts = 0;
   const runtime = createMacrophageRuntime({ runId, graphId, mode: 'simulation',
     reportUnknownFailure: (notice) => {
@@ -124,9 +133,56 @@ test('simulation routes a real failed release node-end into one shadow decision 
       ['ledger-unconfigured', 'open-cell', false], ['type-error', 'attempt-repair', false],
       ['configuration-missing', 'open-cell', false], ['unknown', 'notify-owner', false],
     ]);
+    expect(runtime.decisions[1]?.data).toMatchObject({ promotionMode: 'shadow',
+      promotionReason: 'live-mode-not-explicit', rollbackReason: 'simulation-only',
+      promotionOverlayId: 'stop-heal-ladder-release-type-error' });
+    const typeErrorLog = macrophageLogs.find((record) => (record.data as { failureSignature?: string } | undefined)?.failureSignature === 'type-error');
+    expect(typeErrorLog?.data).toMatchObject({ promotionMode: 'shadow',
+      promotionReason: 'live-mode-not-explicit', rollbackReason: 'simulation-only',
+      promotionOverlayId: 'stop-heal-ladder-release-type-error' });
     expect(unknownNotices).toEqual([{ runId, nodeId: 'pwa', detail: 'unrecognized failure detail' }]);
     expect(unknownNoticeAttempts).toBe(2);
-  } finally { runtime.dispose(); rmSync(root, { recursive: true, force: true }); }
+  } finally {
+    unregisterDebugSink();
+    debug.setMirror(previousMirrorEnabled);
+    debug.setFileEnabled(previousFileEnabled);
+    runtime.dispose(); rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runtime requires explicit live mode for the type-error promotion and logs the final verdict', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'macrophage-promotion-mode-'));
+  const captured: Array<{ runId?: string; data?: unknown }> = [];
+  const previousFileEnabled = debug.isFileEnabled();
+  const previousMirrorEnabled = debug.isMirrorEnabled();
+  debug.setFileEnabled(false);
+  debug.setMirror(true);
+  const unregister = debug.registerSink({ name: 'macrophage-promotion-mode-test', emit: (record) => {
+    if (record.category === 'release-loop.macrophage' && record.event === 'decision')
+      captured.push({ runId: (record.data as { runId?: string } | undefined)?.runId, data: record.data });
+  } });
+  const explicitLive = createMacrophageRuntime({ runId: 'macro-explicit-live', root, mode: 'live' });
+  const defaultMode = createMacrophageRuntime({ runId: 'macro-default-mode', root });
+  const typeErrorEvent = (runId: string) => ({ graphId: 'release-loop', runId, type: 'node-end',
+    source: { kind: 'node' as const, nodeId: 'verify' }, data: { ok: false, reason: 'TypeScript error TS2339' } });
+  try {
+    await explicitLive.eventBus.publish(typeErrorEvent('macro-explicit-live'));
+    await defaultMode.eventBus.publish(typeErrorEvent('macro-default-mode'));
+    expect(explicitLive.decisions[0]?.data).toMatchObject({ promotionMode: 'live', promotionReason: 'type-error-policy-and-overlay-agree',
+      rollbackReason: 'none', promotionOverlayId: 'stop-heal-ladder-release-type-error' });
+    expect(defaultMode.decisions[0]?.data).toMatchObject({ promotionMode: 'shadow', rollbackReason: 'unknown-mode-setting' });
+    expect(captured.find((record) => record.runId === 'macro-explicit-live')?.data).toMatchObject({ promotionMode: 'live',
+      promotionReason: 'type-error-policy-and-overlay-agree', rollbackReason: 'none' });
+    expect(captured.find((record) => record.runId === 'macro-default-mode')?.data).toMatchObject({ promotionMode: 'shadow',
+      rollbackReason: 'unknown-mode-setting' });
+  } finally {
+    unregister();
+    debug.setMirror(previousMirrorEnabled);
+    debug.setFileEnabled(previousFileEnabled);
+    explicitLive.dispose();
+    defaultMode.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('unknown owner notice failure stays in the runner outbox and succeeds on same-run event replay', async () => {

@@ -1,0 +1,41 @@
+{
+  "id": "elanous-release",
+  "name": "Elanous Release",
+  "version": "0.3.8",
+  "description": "Built-in route index for release status and graph entry tools.",
+  "main": "./plugin.ts",
+  "activationEvents": ["onRoute"],
+  "contributes": {
+    "aiTools": [
+      {
+        "name": "ReleaseStatus",
+        "description": "Read the current release checklist, cut, and publish state.",
+        "handler": "native:release_status",
+        "parameters": { "type": "object", "properties": {} },
+        "route": {
+          "triggers": ["발행 상태", "릴리즈 어디까지", "release status"],
+          "examples": ["0.3.8 발행 준비 어디까지 됐어?"],
+          "sideEffects": "read-only",
+          "risk": "low",
+          "cost": "cheap",
+          "requiresConfirm": false
+        }
+      },
+      {
+        "name": "ReleaseGraphStart",
+        "description": "Start the declared release graph after explicit confirmation.",
+        "handler": "native:release_graph_start",
+        "parameters": { "type": "object", "properties": {} },
+        "route": {
+          "triggers": ["발행 시작", "릴리즈 시작", "컷 하자"],
+          "examples": ["발행 시작해", "release graph start"],
+          "sideEffects": "irreversible",
+          "risk": "high",
+          "cost": "spawns-run",
+          "requiresConfirm": true
+        }
+      }
+    ]
+  },
+  "capabilities": []
+}

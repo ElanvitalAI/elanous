@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GRID-READY-TIERS-TS",
+  "path": "src/ux-sim/grid-ready-tiers.ts",
+  "boundary": "Chooses how many additional work slots a grid needs and which cold/warm provisioning tier satisfies demand from the supplied readiness snapshot.",
+  "deviceIds": [
+    "fake-cloud-vm"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

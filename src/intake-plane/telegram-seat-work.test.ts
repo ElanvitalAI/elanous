@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { handleTelegramSeatWork } from './telegram-seat-work.js';
 import { TelegramBot } from '../telegram.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import type { PersonaProfile } from '../persona/types.js';
 import type { PersonaSource } from '../persona/mention-parser.js';
 import type { ContextNowAnswer } from '../context-bus/context-now.js';

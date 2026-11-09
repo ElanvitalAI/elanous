@@ -1,0 +1,21 @@
+{
+  "id": "GOOGLE-DRIVE-LIST-READONLY",
+  "name": "Google Drive files.list metadata-only scope and read-only boundary",
+  "kind": "oauth-readonly-simulation",
+  "device": "fake-google-drive-world",
+  "implementation": [
+    "src/ux-sim/fake-google-drive-world.ts",
+    "src/ux-sim/fake-google-oauth.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-google-drive-world.test.ts"
+  ],
+  "trigger": "Grant only the synthetic Drive metadata readonly scope, list three synthetic files in two pages, then attempt a write.",
+  "observe": [
+    "page token returns the remaining metadata",
+    "file content and unrequested fields are absent",
+    "write is rejected and world state remains unchanged",
+    "no external request or real credential is used"
+  ],
+  "expected": "Two pages expose only metadata under the readonly scope; write returns 403 with zero mutations."
+}

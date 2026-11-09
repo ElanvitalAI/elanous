@@ -1,0 +1,23 @@
+{
+  "id": "fake-higgsfield",
+  "name": "Fake Higgsfield generation CLI",
+  "implementation": [
+    "src/ux-sim/fake-higgsfield.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-higgsfield.test.ts"
+  ],
+  "target": "Higgsfield generation calls answered by a local fake so media pipelines run without the real service",
+  "inputs": [
+    "generate request and model"
+  ],
+  "observations": [
+    "fake job id and media URL"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-higgsfield.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

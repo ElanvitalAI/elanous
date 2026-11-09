@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-PS-TS",
+  "path": "src/ux-sim/fake-ps.ts",
+  "boundary": "Mutable fake ps process inventory shared by monkey kills, host-wide gorilla failure, and process re-registration.",
+  "deviceIds": [
+    "fake-ps"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

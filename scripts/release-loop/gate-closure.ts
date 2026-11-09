@@ -24,6 +24,7 @@ const isTestSide = (file: string): boolean => TEST_FILE.test(file) || TEST_SIDE_
   || TEST_SIDE_NAME.test((file.split('/').pop() ?? file).replace(CODE_FILE, ''));
 /** A test-side file that lists directories or tracked files reads paths we cannot see. */
 const FS_SCAN = /\b(?:readdirSync|readdir|opendirSync|opendir|globSync|Glob|walkSync)\b|\bls-files\b/;
+/** Existing live guard stays broad; only shadow measurement uses the AST-bound reader candidate. */
 const FS_READ = /\b(?:readFileSync|readFile|createReadStream|openSync|open)\s*\(/;
 /** `import(x)` / `require(x)` with a non-literal argument loads a module we cannot name. */
 const NON_LITERAL_LOAD = /(?<![.\w$])(?:import|require)\s*\(\s*(?!['"`)\s])([^)]*)\)?/g;
@@ -33,11 +34,442 @@ const CONST_STRING = /\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*(?:process\.env\.[\w$]+
 const JOINED_IMPORT = /(?<![.\w$])import\s*\(\s*\[((?:\s*"[^"\n]*"\s*,?)+)\]\.join\(\s*"([^"\n]*)"\s*\)\s*\)/g;
 /** Process launches — a file that has one may run a repo path it names. */
 const SPAWN_CANDIDATE = /(?<![\w$])(?:spawn|spawnSync|exec|execSync|execFile|execFileSync|fork|Bun\.spawn|Bun\.spawnSync|Bun\.\$)\s*[\x60(]|(?:node:)?child_process\b/;
+/** Process launch APIs — method names such as RegExp.exec() and git.fork() are not launches. */
+const CHILD_PROCESS_APIS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
+function hasProcessSpawn(code: string, file = 'gate-closure.js', includeFunctionLocal = true): boolean {
+  const kind = file.endsWith('.tsx') ? ts.ScriptKind.TSX : file.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS;
+  const ast = ts.createSourceFile(file, code, ts.ScriptTarget.Latest, true, kind);
+  const direct = new Set<string>();
+  const namespaces = new Set<string>();
+  const trackedBindings = new Set<ts.Identifier>();
+  const isChildProcess = (name: string): boolean => name === 'child_process' || name === 'node:child_process';
+  const addImport = (node: ts.ImportDeclaration): void => {
+    if (!ts.isStringLiteralLike(node.moduleSpecifier) || !isChildProcess(node.moduleSpecifier.text) || !node.importClause) return;
+    const clause = node.importClause;
+    if (clause.name) { namespaces.add(clause.name.text); trackedBindings.add(clause.name); }
+    if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) { namespaces.add(clause.namedBindings.name.text); trackedBindings.add(clause.namedBindings.name); }
+    if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+      for (const item of clause.namedBindings.elements) {
+        const imported = item.propertyName?.text ?? item.name.text;
+        if (CHILD_PROCESS_APIS.has(imported)) { direct.add(item.name.text); trackedBindings.add(item.name); }
+      }
+    }
+  };
+  const addRequire = (node: ts.VariableDeclaration): void => {
+    const init = node.initializer;
+    if (!init || !ts.isCallExpression(init) || !ts.isIdentifier(init.expression) || init.expression.text !== 'require'
+      || init.arguments.length !== 1 || !ts.isStringLiteralLike(init.arguments[0]!) || !isChildProcess(init.arguments[0]!.text)) return;
+    if (ts.isIdentifier(node.name)) { namespaces.add(node.name.text); trackedBindings.add(node.name); }
+    if (ts.isObjectBindingPattern(node.name)) {
+      for (const item of node.name.elements) {
+        const imported = item.propertyName?.getText(ast) ?? item.name.getText(ast);
+        if (CHILD_PROCESS_APIS.has(imported) && ts.isIdentifier(item.name)) { direct.add(item.name.text); trackedBindings.add(item.name); }
+      }
+    }
+  };
+  const collect = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node)) addImport(node);
+    if (ts.isVariableDeclaration(node)) addRequire(node);
+    ts.forEachChild(node, collect);
+  };
+  collect(ast);
+  const functionLocalCalls = new WeakSet<ts.Node>();
+  const isImmediateFunction = (node: ts.Node): boolean => {
+    if (!(ts.isArrowFunction(node) || ts.isFunctionExpression(node))) return false;
+    let wrapper: ts.Node = node;
+    while (true) {
+      const parent = wrapper.parent;
+      const wrapsExpression = (ts.isParenthesizedExpression(parent) && parent.expression === wrapper)
+        || (ts.isAsExpression(parent) && parent.expression === wrapper)
+        || (ts.isTypeAssertionExpression(parent) && parent.expression === wrapper)
+        || (ts.isSatisfiesExpression(parent) && parent.expression === wrapper)
+        || (ts.isNonNullExpression(parent) && parent.expression === wrapper);
+      if (!wrapsExpression) break;
+      wrapper = parent;
+    }
+    const parent = wrapper.parent;
+    return ts.isCallExpression(parent) && parent.expression === wrapper;
+  };
+  const markFunctionLocal = (node: ts.Node, inFunction = false): void => {
+    if (inFunction && (ts.isCallExpression(node) || ts.isTaggedTemplateExpression(node))) functionLocalCalls.add(node);
+    const nested = inFunction || (ts.isFunctionLike(node) && !isImmediateFunction(node));
+    ts.forEachChild(node, (child) => markFunctionLocal(child, nested));
+  };
+  markFunctionLocal(ast);
+  const hasBindingName = (binding: ts.BindingName, name: string): boolean => {
+    if (ts.isIdentifier(binding)) return binding.text === name;
+    return binding.elements.some((item) => ts.isOmittedExpression(item) ? false : hasBindingName(item.name, name));
+  };
+  const hasTrackedBindingName = (binding: ts.BindingName, name: string): boolean => {
+    if (ts.isIdentifier(binding)) return binding.text === name && trackedBindings.has(binding);
+    return binding.elements.some((item) => !ts.isOmittedExpression(item) && hasTrackedBindingName(item.name, name));
+  };
+  const isShadowed = (reference: ts.Node, name: string): boolean => {
+    let scope: ts.Node | undefined = reference.parent;
+    while (scope) {
+      if (ts.isFunctionLike(scope)) {
+        if (scope.parameters.some((parameter) => hasBindingName(parameter.name, name))) return true;
+        if (scope.name && ts.isIdentifier(scope.name) && scope.name.text === name) return true;
+      }
+      if (ts.isCatchClause(scope) && scope.variableDeclaration && hasBindingName(scope.variableDeclaration.name, name)) return true;
+      if (ts.isBlock(scope) || ts.isSourceFile(scope) || ts.isModuleBlock(scope)) {
+        for (const statement of scope.statements) {
+          if (ts.isVariableStatement(statement)) {
+            const binding = statement.declarationList.declarations.find((decl) => hasBindingName(decl.name, name));
+            if (binding) return !hasTrackedBindingName(binding.name, name);
+          }
+          if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) && statement.name?.text === name) return true;
+        }
+      }
+      scope = scope.parent;
+    }
+    return false;
+  };
+  // Preserve the conservative result through straightforward aliases (`const run = cp.spawn`, destructuring,
+  // or `const cp2 = cp`) regardless of declaration order.
+  let aliasesChanged = true;
+  while (aliasesChanged) {
+    const before = direct.size + namespaces.size;
+    const aliases = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && node.initializer) {
+        const init = node.initializer;
+        if (ts.isIdentifier(init)) {
+          if (namespaces.has(init.text) && !isShadowed(init, init.text) && ts.isIdentifier(node.name)) { namespaces.add(node.name.text); trackedBindings.add(node.name); }
+          if (direct.has(init.text) && !isShadowed(init, init.text) && ts.isIdentifier(node.name)) { direct.add(node.name.text); trackedBindings.add(node.name); }
+          if (namespaces.has(init.text) && !isShadowed(init, init.text) && ts.isObjectBindingPattern(node.name)) for (const item of node.name.elements) {
+            const imported = item.propertyName?.getText(ast) ?? item.name.getText(ast);
+            if (CHILD_PROCESS_APIS.has(imported) && ts.isIdentifier(item.name)) { direct.add(item.name.text); trackedBindings.add(item.name); }
+          }
+        }
+        if (ts.isIdentifier(init) && namespaces.has(init.text)) {
+          if (ts.isObjectBindingPattern(node.name)) for (const item of node.name.elements) {
+            const imported = item.propertyName?.getText(ast) ?? item.name.getText(ast);
+            if (CHILD_PROCESS_APIS.has(imported) && ts.isIdentifier(item.name)) { direct.add(item.name.text); trackedBindings.add(item.name); }
+          }
+        }
+        if (ts.isPropertyAccessExpression(init) && CHILD_PROCESS_APIS.has(init.name.text) && ts.isIdentifier(node.name)
+          && ((ts.isIdentifier(init.expression) && namespaces.has(init.expression.text) && !isShadowed(init.expression, init.expression.text))
+            || (ts.isCallExpression(init.expression) && ts.isIdentifier(init.expression.expression) && init.expression.expression.text === 'require'
+              && init.expression.arguments.length === 1 && ts.isStringLiteralLike(init.expression.arguments[0]!)
+              && isChildProcess(init.expression.arguments[0]!.text)))) { direct.add(node.name.text); trackedBindings.add(node.name); }
+      }
+      ts.forEachChild(node, aliases);
+    };
+    aliases(ast);
+    aliasesChanged = before !== direct.size + namespaces.size;
+  }
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      if (ts.isIdentifier(callee) && direct.has(callee.text) && !isShadowed(callee, callee.text)) if (includeFunctionLocal || !functionLocalCalls.has(node)) found = true;
+      if (ts.isPropertyAccessExpression(callee)) {
+        const object = callee.expression;
+        const method = callee.name.text;
+        if (ts.isIdentifier(object) && object.text === 'Bun' && !isShadowed(object, 'Bun') && (method === 'spawn' || method === 'spawnSync' || method === '$')) if (includeFunctionLocal || !functionLocalCalls.has(node)) found = true;
+        if (ts.isIdentifier(object) && namespaces.has(object.text) && !isShadowed(object, object.text) && CHILD_PROCESS_APIS.has(method)) if (includeFunctionLocal || !functionLocalCalls.has(node)) found = true;
+        if (ts.isCallExpression(object) && ts.isIdentifier(object.expression) && object.expression.text === 'require'
+          && object.arguments.length === 1 && ts.isStringLiteralLike(object.arguments[0]!)
+          && isChildProcess(object.arguments[0]!.text) && CHILD_PROCESS_APIS.has(method)) if (includeFunctionLocal || !functionLocalCalls.has(node)) found = true;
+      }
+      if (ts.isElementAccessExpression(callee)) {
+        const object = callee.expression;
+        // A computed method on a known child_process object cannot be proven harmless.
+        if (ts.isIdentifier(object) && namespaces.has(object.text) && !isShadowed(object, object.text)) if (includeFunctionLocal || !functionLocalCalls.has(node)) found = true;
+        if (ts.isCallExpression(object) && ts.isIdentifier(object.expression) && object.expression.text === 'require'
+          && object.arguments.length === 1 && ts.isStringLiteralLike(object.arguments[0]!)
+          && isChildProcess(object.arguments[0]!.text)) if (includeFunctionLocal || !functionLocalCalls.has(node)) found = true;
+      }
+    }
+    if (ts.isTaggedTemplateExpression(node)) {
+      const tag = node.tag;
+      if ((ts.isPropertyAccessExpression(tag) && ts.isIdentifier(tag.expression) && tag.expression.text === 'Bun'
+        && !isShadowed(tag.expression, 'Bun') && tag.name.text === '$')
+        || (ts.isIdentifier(tag) && direct.has(tag.text) && !isShadowed(tag, tag.text))) {
+        if (includeFunctionLocal || !functionLocalCalls.has(node)) found = true;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(ast);
+  return found;
+}
 const LITERAL = /(['"`])((?:(?!\1)[^\n\\])*)\1/g;
 
 const PROCESS_MODULES = new Set(['child_process', 'node:child_process']);
 const PROCESS_APIS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
-function hasCommandSpawn(code: string, file: string): boolean {
+function hasCommandSpawnCandidate(code: string, file: string, includeFunctionLocal = true): boolean {
+  if (!SPAWN_CANDIDATE.test(code) && !code.includes('Bun')) return false;
+  const kind = /\.tsx?$/.test(file) ? (file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS) : ts.ScriptKind.JS;
+  const ast = ts.createSourceFile(file, code, ts.ScriptTarget.Latest, true, kind);
+  const direct = new Set<string>(), namespaces = new Set<string>(), declared = new Set<string>();
+  const uncertainImports = new Set<string>(), nonProcessValues = new Set<string>(), nonProcessFunctions = new Set<string>();
+  const knownTypes = new Set<string>();
+  const directAliases: Array<{ name: string; source: string }> = [];
+  const addBinding = (name: ts.BindingName): void => {
+    if (ts.isIdentifier(name)) declared.add(name.text);
+    else for (const item of name.elements) if (ts.isBindingElement(item)) addBinding(item.name);
+  };
+  const isProcessModule = (node: ts.Expression): boolean => ts.isStringLiteralLike(node) && PROCESS_MODULES.has(node.text);
+  const knownType = (node: ts.TypeNode | undefined): boolean => {
+    if (!node) return false;
+    if (ts.isFunctionTypeNode(node)) return true;
+    if (ts.isTypeLiteralNode(node)) return !node.members.some((member) => ts.isPropertySignature(member)
+      && !!member.name && ts.isIdentifier(member.name) && PROCESS_APIS.has(member.name.text)
+      && !!member.type && ts.isTypeQueryNode(member.type));
+    if (ts.isTypeReferenceNode(node)) {
+      let root = node.typeName;
+      while (ts.isQualifiedName(root)) root = root.left;
+      return root.text === 'RegExp' || knownTypes.has(root.text);
+    }
+    if (ts.isUnionTypeNode(node) || ts.isIntersectionTypeNode(node)) return node.types.every(knownType);
+    return false;
+  };
+  const collect = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) && ts.isStringLiteralLike(node.moduleSpecifier) && node.importClause) {
+      const processModule = PROCESS_MODULES.has(node.moduleSpecifier.text), localModule = node.moduleSpecifier.text.startsWith('.');
+      const bindings = node.importClause;
+      if (bindings.name) {
+        declared.add(bindings.name.text);
+        if (processModule) namespaces.add(bindings.name.text);
+        else if (localModule) knownTypes.add(bindings.name.text);
+      }
+      if (bindings.namedBindings && ts.isNamespaceImport(bindings.namedBindings)) {
+        declared.add(bindings.namedBindings.name.text);
+        if (processModule) namespaces.add(bindings.namedBindings.name.text);
+        else if (localModule) knownTypes.add(bindings.namedBindings.name.text);
+      }
+      if (bindings.namedBindings && ts.isNamedImports(bindings.namedBindings)) for (const item of bindings.namedBindings.elements) {
+        const imported = item.propertyName?.text ?? item.name.text, alias = item.name.text;
+        declared.add(alias);
+        if (processModule && PROCESS_APIS.has(imported)) direct.add(alias);
+        else if (PROCESS_APIS.has(imported)) uncertainImports.add(alias);
+        if (localModule) knownTypes.add(alias);
+      }
+    }
+    if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)
+      && node.moduleReference.expression && isProcessModule(node.moduleReference.expression)) {
+      declared.add(node.name.text); namespaces.add(node.name.text);
+    }
+    if (ts.isVariableDeclaration(node)) {
+      addBinding(node.name);
+      if (node.initializer && ts.isObjectBindingPattern(node.name) && ts.isIdentifier(node.initializer)
+        && node.initializer.text === 'Bun') {
+        for (const item of node.name.elements) {
+          if (!ts.isBindingElement(item) || !ts.isIdentifier(item.name)) continue;
+          const imported = item.propertyName && ts.isIdentifier(item.propertyName) ? item.propertyName.text : item.name.text;
+          if (['spawn', 'spawnSync', '$'].includes(imported)) direct.add(item.name.text);
+        }
+      }
+      if (ts.isIdentifier(node.name) && node.initializer) {
+        let init = node.initializer;
+        while (ts.isParenthesizedExpression(init) || ts.isAsExpression(init) || ts.isTypeAssertionExpression(init)
+          || ts.isSatisfiesExpression(init) || ts.isNonNullExpression(init)) init = init.expression;
+        if (ts.isIdentifier(init)) directAliases.push({ name: node.name.text, source: init.text });
+        if (ts.isPropertyAccessExpression(init) && ts.isIdentifier(init.expression)
+          && init.expression.text === 'Bun' && ['spawn', 'spawnSync', '$'].includes(init.name.text))
+          direct.add(node.name.text);
+      }
+      if (ts.isIdentifier(node.name)) {
+        if (knownType(node.type) || (node.initializer && ts.isNewExpression(node.initializer)
+          && ts.isIdentifier(node.initializer.expression) && knownTypes.has(node.initializer.expression.text))) nonProcessValues.add(node.name.text);
+        if (node.initializer && ts.isIdentifier(node.initializer)) {
+          const from = node.initializer.text;
+          if (direct.has(from)) direct.add(node.name.text);
+          if (uncertainImports.has(from)) uncertainImports.add(node.name.text);
+          if (namespaces.has(from)) namespaces.add(node.name.text);
+          if (nonProcessValues.has(from)) nonProcessValues.add(node.name.text);
+        }
+        if (node.initializer && ts.isPropertyAccessExpression(node.initializer) && ts.isIdentifier(node.initializer.expression)
+          && namespaces.has(node.initializer.expression.text) && PROCESS_APIS.has(node.initializer.name.text)) direct.add(node.name.text);
+      }
+      if (node.initializer && ts.isIdentifier(node.initializer) && ts.isObjectBindingPattern(node.name)
+        && namespaces.has(node.initializer.text)) for (const item of node.name.elements) {
+        const imported = item.propertyName && ts.isIdentifier(item.propertyName) ? item.propertyName.text
+          : ts.isIdentifier(item.name) ? item.name.text : '';
+        if (PROCESS_APIS.has(imported) && ts.isIdentifier(item.name)) direct.add(item.name.text);
+      }
+      if (node.initializer && ts.isCallExpression(node.initializer) && ts.isIdentifier(node.initializer.expression)
+        && node.initializer.expression.text === 'require' && node.initializer.arguments.length === 1
+        && isProcessModule(node.initializer.arguments[0]!)) {
+        if (ts.isIdentifier(node.name)) namespaces.add(node.name.text);
+        else for (const item of node.name.elements) if (ts.isBindingElement(item)) {
+          const imported = item.propertyName && ts.isIdentifier(item.propertyName) ? item.propertyName.text
+            : ts.isIdentifier(item.name) ? item.name.text : '';
+          if (PROCESS_APIS.has(imported) && ts.isIdentifier(item.name)) direct.add(item.name.text);
+        }
+      }
+    }
+    if (ts.isParameter(node)) {
+      addBinding(node.name);
+      if (ts.isIdentifier(node.name) && knownType(node.type)) nonProcessValues.add(node.name.text);
+    }
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      declared.add(node.name.text); if (knownType(node.type)) nonProcessFunctions.add(node.name.text);
+    }
+    if (ts.isClassDeclaration(node) && node.name) { declared.add(node.name.text); knownTypes.add(node.name.text); }
+    if ((ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node)) && node.name) knownTypes.add(node.name.text);
+    ts.forEachChild(node, collect);
+  };
+  collect(ast);
+  let aliasesChanged = true;
+  while (aliasesChanged) {
+    const before = direct.size + uncertainImports.size + namespaces.size;
+    for (const alias of directAliases) {
+      if (direct.has(alias.source)) direct.add(alias.name);
+      if (uncertainImports.has(alias.source)) uncertainImports.add(alias.name);
+      if (namespaces.has(alias.source)) namespaces.add(alias.name);
+    }
+    aliasesChanged = before !== direct.size + uncertainImports.size + namespaces.size;
+  }
+  const functionLocalCalls = new WeakSet<ts.Node>();
+  const isImmediateFunction = (node: ts.Node): boolean => {
+    if (!(ts.isArrowFunction(node) || ts.isFunctionExpression(node))) return false;
+    let wrapper: ts.Node = node;
+    while (true) {
+      const parent = wrapper.parent;
+      const wrapsExpression = (ts.isParenthesizedExpression(parent) && parent.expression === wrapper)
+        || (ts.isAsExpression(parent) && parent.expression === wrapper)
+        || (ts.isTypeAssertionExpression(parent) && parent.expression === wrapper)
+        || (ts.isSatisfiesExpression(parent) && parent.expression === wrapper)
+        || (ts.isNonNullExpression(parent) && parent.expression === wrapper);
+      if (!wrapsExpression) break;
+      wrapper = parent;
+    }
+    const parent = wrapper.parent;
+    return ts.isCallExpression(parent) && parent.expression === wrapper;
+  };
+  const markFunctionLocal = (node: ts.Node, inFunction = false): void => {
+    if (inFunction && (ts.isCallExpression(node) || ts.isTaggedTemplateExpression(node))) functionLocalCalls.add(node);
+    const nested = inFunction || (ts.isFunctionLike(node) && !isImmediateFunction(node));
+    ts.forEachChild(node, (child) => markFunctionLocal(child, nested));
+  };
+  markFunctionLocal(ast);
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isTaggedTemplateExpression(node)) {
+      const tag = node.tag;
+      if ((ts.isPropertyAccessExpression(tag) && ts.isIdentifier(tag.expression)
+        && tag.expression.text === 'Bun' && tag.name.text === '$')
+        || (ts.isIdentifier(tag) && direct.has(tag.text))) {
+        if (includeFunctionLocal || !functionLocalCalls.has(node)) { found = true; return; }
+      }
+      ts.forEachChild(node, visit);
+      return;
+    }
+    if (!ts.isCallExpression(node)) { ts.forEachChild(node, visit); return; }
+    const callee = node.expression;
+    let isSpawn = false;
+    if (ts.isIdentifier(callee) && (direct.has(callee.text) || uncertainImports.has(callee.text))
+      && !nonProcessValues.has(callee.text) && !nonProcessFunctions.has(callee.text)) isSpawn = true;
+    else if (ts.isIdentifier(callee) && PROCESS_APIS.has(callee.text) && !nonProcessValues.has(callee.text)
+      && !nonProcessFunctions.has(callee.text)) isSpawn = true;
+    else if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)
+      && callee.expression.text === 'Bun' && (callee.name.text === 'spawn' || callee.name.text === 'spawnSync' || callee.name.text === '$')) isSpawn = true;
+    else if (ts.isPropertyAccessExpression(callee) && PROCESS_APIS.has(callee.name.text)) {
+      const receiver = callee.expression;
+      if (ts.isIdentifier(receiver)) {
+        if (!nonProcessValues.has(receiver.text)) isSpawn = true;
+      } else if (ts.isCallExpression(receiver) && ts.isIdentifier(receiver.expression)) {
+        if (!nonProcessFunctions.has(receiver.expression.text)) isSpawn = true;
+      } else if (receiver.kind !== ts.SyntaxKind.ThisKeyword) isSpawn = true;
+    }
+    if (isSpawn && (includeFunctionLocal || !functionLocalCalls.has(node))) { found = true; return; }
+    ts.forEachChild(node, visit);
+  };
+  visit(ast);
+  return found;
+}
+function importsFileReaderCandidate(code: string, file: string): boolean {
+  const readApis = new Set(['readFileSync', 'readFile', 'createReadStream', 'openSync', 'open']);
+  const modules = new Set(['fs', 'node:fs', 'fs/promises', 'node:fs/promises']);
+  const kind = /\.tsx?$/.test(file) ? (file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS) : ts.ScriptKind.JS;
+  const ast = ts.createSourceFile(file, code, ts.ScriptTarget.Latest, true, kind);
+  const direct = new Set<string>();
+  const namespaces = new Set<string>();
+  const isFsRequire = (node: ts.Expression | undefined): boolean => !!node && ts.isCallExpression(node)
+    && ts.isIdentifier(node.expression) && node.expression.text === 'require' && node.arguments.length === 1
+    && ts.isStringLiteralLike(node.arguments[0]!) && modules.has(node.arguments[0]!.text);
+  const bindRequire = (name: ts.BindingName): void => {
+    if (ts.isIdentifier(name)) namespaces.add(name.text);
+    else for (const item of name.elements) {
+      if (!ts.isBindingElement(item)) continue;
+      const imported = item.propertyName && ts.isIdentifier(item.propertyName) ? item.propertyName.text
+        : ts.isIdentifier(item.name) ? item.name.text : '';
+      if (readApis.has(imported) && ts.isIdentifier(item.name)) direct.add(item.name.text);
+    }
+  };
+  for (const statement of ast.statements) {
+    if (ts.isImportDeclaration(statement) && ts.isStringLiteralLike(statement.moduleSpecifier)
+      && modules.has(statement.moduleSpecifier.text) && statement.importClause) {
+      const bindings = statement.importClause;
+      if (bindings.name) namespaces.add(bindings.name.text);
+      if (bindings.namedBindings && ts.isNamespaceImport(bindings.namedBindings)) namespaces.add(bindings.namedBindings.name.text);
+      if (bindings.namedBindings && ts.isNamedImports(bindings.namedBindings)) for (const item of bindings.namedBindings.elements) {
+        const imported = item.propertyName?.text ?? item.name.text;
+        if (readApis.has(imported)) direct.add(item.name.text);
+        if (imported === 'promises') namespaces.add(item.name.text);
+      }
+    }
+    if (ts.isImportEqualsDeclaration(statement) && ts.isExternalModuleReference(statement.moduleReference)
+      && isFsRequire(statement.moduleReference.expression)) namespaces.add(statement.name.text);
+  }
+  const receiverIsFs = (node: ts.Expression): boolean => {
+    if (ts.isIdentifier(node)) return namespaces.has(node.text);
+    return ts.isPropertyAccessExpression(node) && node.name.text === 'promises' && receiverIsFs(node.expression);
+  };
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isVariableDeclaration(node)) {
+      if (isFsRequire(node.initializer)) bindRequire(node.name);
+      if (node.initializer && ts.isObjectBindingPattern(node.name)
+        && ((ts.isIdentifier(node.initializer) && namespaces.has(node.initializer.text)) || receiverIsFs(node.initializer))
+        && node.name.elements.some((item) => ts.isBindingElement(item)
+          && readApis.has(item.propertyName && ts.isIdentifier(item.propertyName) ? item.propertyName.text
+            : ts.isIdentifier(item.name) ? item.name.text : ''))) { found = true; return; }
+      else if (ts.isIdentifier(node.name) && node.initializer && ts.isIdentifier(node.initializer)) {
+        if (direct.has(node.initializer.text)) direct.add(node.name.text);
+        if (namespaces.has(node.initializer.text)) namespaces.add(node.name.text);
+      } else if (ts.isIdentifier(node.name) && node.initializer
+        && ts.isPropertyAccessExpression(node.initializer) && node.initializer.name.text === 'promises'
+        && receiverIsFs(node.initializer.expression)) {
+        namespaces.add(node.name.text);
+      }
+    }
+    if (ts.isIdentifier(node)) {
+      const parent = node.parent;
+      const isImportBinding = (ts.isImportSpecifier(parent) && parent.name === node)
+        || (ts.isNamespaceImport(parent) && parent.name === node)
+        || (ts.isImportClause(parent) && parent.name === node)
+        || (ts.isVariableDeclaration(parent) && parent.name === node);
+      if (!isImportBinding && direct.has(node.text)
+        && !(ts.isCallExpression(parent) && parent.expression === node)) { found = true; return; }
+      if (!isImportBinding && namespaces.has(node.text)) {
+        const isMemberReceiver = ts.isPropertyAccessExpression(parent) && parent.expression === node;
+        const isSimpleAlias = ts.isVariableDeclaration(parent) && parent.initializer === node && ts.isIdentifier(parent.name);
+        if (!isMemberReceiver && !isSimpleAlias) { found = true; return; }
+      }
+    }
+    if (ts.isPropertyAccessExpression(node) && readApis.has(node.name.text) && receiverIsFs(node.expression)
+      && !(ts.isCallExpression(node.parent) && node.parent.expression === node)) { found = true; return; }
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression;
+      if (ts.isIdentifier(callee) && direct.has(callee.text)) { found = true; return; }
+      if (ts.isPropertyAccessExpression(callee) && readApis.has(callee.name.text)) {
+        const receiver = callee.expression;
+        if (receiverIsFs(receiver) || isFsRequire(receiver)
+          || (ts.isPropertyAccessExpression(receiver) && receiver.name.text === 'promises'
+            && (receiverIsFs(receiver.expression) || isFsRequire(receiver.expression)))) { found = true; return; }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(ast);
+  return found;
+}
+function hasCommandSpawnLegacy(code: string, file: string): boolean {
   if (!SPAWN_CANDIDATE.test(code)) return false;
   const kind = /\.tsx?$/.test(file) ? (file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS) : ts.ScriptKind.JS;
   const ast = ts.createSourceFile(file, code, ts.ScriptTarget.Latest, true, kind);
@@ -157,7 +589,7 @@ function hasCommandSpawn(code: string, file: string): boolean {
   visit(ast);
   return found;
 }
-function importsFileReader(code: string): boolean {
+function importsFileReaderLegacy(code: string): boolean {
   const imports = /\bimport\s*\{([^}]*)\}\s*from\s*(['"])(?:node:)?fs(?:\/promises)?\2/g;
   for (const match of code.matchAll(imports)) {
     for (const item of match[1]!.split(',')) {
@@ -195,10 +627,16 @@ function loaderOf(file: string): 'ts' | 'tsx' | 'js' {
 }
 
 export interface ClosureOptions {
+  /** Structural SCC checks follow only eager module imports, without selector opacity or literal-path work. */
+  staticImportsOnly?: boolean;
   /** CLI entry files a production literal does not make a dependency of (help text, child command builders). */
   cliEntries?: readonly string[];
   /** Shadow-only candidate: omit require edges found only inside functions; callers must retain the current verdict. */
   omitFunctionLocalRequires?: boolean;
+  /** Shadow-only candidate: local process launches in production modules do not widen the test radius. */
+  omitFunctionLocalProcessSpawnOpacity?: boolean;
+  /** Use AST-bound reader recognition in the shadow candidate; live keeps FS_READ's broad guard. */
+  shadowCandidatePrecision?: boolean;
 }
 
 export interface ClosureGraph {
@@ -256,6 +694,29 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
     if (!CODE_FILE.test(file)) continue;
     const text = tree.read(file);
     if (text === undefined) { blindAs(file, 'unreadable'); continue; }
+    if (options.staticImportsOnly) {
+      const eager = new Set<string>();
+      try {
+        for (const { path: spec, kind } of transpilers[loaderOf(file)].scanImports(text)) {
+          if (kind !== 'import-statement') continue;
+          let hit: string | undefined;
+          if (spec.startsWith('.')) hit = resolveFrom(file, spec);
+          else {
+            const alias = tree.aliases?.find((entry) => (entry.scope === '' || file.startsWith(`${entry.scope}/`)) && spec.startsWith(entry.prefix));
+            if (alias) hit = resolveFrom(`${alias.target}/_`, `./${spec.slice(alias.prefix.length)}`);
+          }
+          if (hit) eager.add(hit);
+          else if (spec.startsWith('.') || (spec.startsWith('@') && tree.aliases?.some((entry) => spec.startsWith(entry.prefix))))
+            blindAs(file, `unresolved import ${spec}`);
+        }
+      } catch { blindAs(file, 'unparsable'); continue; }
+      if (eager.has(file)) selfStaticImports.add(file);
+      eager.delete(file);
+      forward.set(file, [...eager]);
+      staticImports.set(file, [...eager]);
+      if (tree.roots) scanQueue.push(...eager);
+      continue;
+    }
     const edges = new Set<string>();
     const testSide = isTestSide(file);
     let specs: { path: string; kind: string }[];
@@ -325,7 +786,12 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
     if (testSide && FS_SCAN.test(code)) blindAs(file, `scans (${FS_SCAN.exec(code)?.[0]})`);
     // A code module may execute a repo script through a command or argument assembled at runtime. Its target is not
     // necessarily recoverable from literal-path edges, so importing tests must rerun after source changes.
-    if (hasCommandSpawn(text, file)) blindAs(file, 'spawns a command with an opaque repo input');
+    const spawnOpacity = options.shadowCandidatePrecision
+      ? (options.omitFunctionLocalProcessSpawnOpacity && !testSide
+        ? hasProcessSpawn(text, file, false) || hasCommandSpawnCandidate(text, file, false)
+        : hasProcessSpawn(text, file) || hasCommandSpawnCandidate(text, file))
+      : hasCommandSpawnLegacy(text, file);
+    if (spawnOpacity) blindAs(file, 'spawns a command with an opaque repo input');
     const eager = new Set<string>();
     for (const { path: spec, kind } of specs) {
       let hit: string | undefined;
@@ -358,7 +824,10 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
       // A path naming another test file is runner input (a list, a fixture string), not code this file loads.
       if (hit) {
         // A production file that names the CLI entry but spawns nothing only prints it (help text, a goal's command line).
-        const printsOnly = (options.cliEntries ?? []).includes(hit) && !hasCommandSpawn(text, file);
+        const hasSpawn = options.shadowCandidatePrecision
+          ? hasProcessSpawn(text, file) || hasCommandSpawnCandidate(text, file)
+          : hasCommandSpawnLegacy(text, file);
+        const printsOnly = (options.cliEntries ?? []).includes(hit) && !hasSpawn;
         if (!TEST_FILE.test(hit) && (testSide || !printsOnly)) edges.add(hit);
         continue;
       }
@@ -373,7 +842,10 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
     // A code module may read a repo fixture through a variable, member access, or helper call. Literal edges above
     // are useful evidence, but cannot prove that every read's runtime-selected path is covered. Mark the module
     // opaque so tests importing it are rerun when source inputs change.
-    if (FS_READ.test(code) || importsFileReader(code) || /\brequire\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)/.test(code))
+    const fileReadOpaque = options.shadowCandidatePrecision
+      ? importsFileReaderCandidate(code, file)
+      : FS_READ.test(code) || importsFileReaderLegacy(code);
+    if (fileReadOpaque || /\brequire\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)/.test(code))
       blindAs(file, 'reads a file through an opaque path');
     if (eager.has(file)) selfStaticImports.add(file);
     edges.delete(file);
@@ -439,6 +911,11 @@ export interface CliLazyRequireShadow {
   cliSpawnTests: string[];
 }
 
+export interface CliLazyRequireShadowOptions extends ClosureOptions {
+  /** Enable the more selective process-spawn opacity treatment for shadow measurement only. */
+  shadowOnlyCandidate?: boolean;
+}
+
 /** Compare current reach with a conservative candidate that omits function-local require only for non-CLI tests.
  *  The caller owns activation; this function never changes the current release decision. */
 export function testsReachingChangedCliLazyRequireShadow(tree: ClosureTree, changed: readonly string[], tests: readonly string[], options: ClosureOptions = {}): CliLazyRequireShadow {
@@ -459,7 +936,7 @@ export function testsReachingChangedCliLazyRequireShadow(tree: ClosureTree, chan
     let hasCliPath = false;
     for (const file of seen) {
       const text = tree.read(file) ?? '';
-      hasSpawn ||= hasCommandSpawn(text, file);
+      hasSpawn ||= hasCommandSpawnLegacy(text, file);
       const literals = [...text.matchAll(LITERAL)].map((match) => match[2] ?? '');
       const pathSegments = literals.flatMap((value) => normalize(value).split('/').filter(Boolean));
       hasCliPath ||= literals.some((value) => /(?:^|\/)bin\/elanous\.mjs$/.test(normalize(value)))
@@ -473,6 +950,36 @@ export function testsReachingChangedCliLazyRequireShadow(tree: ClosureTree, chan
   const nonCliTests = tests.filter((file) => !cli.has(file));
   const reduced = nonCliTests.length ? testsReachingChangedFromGraph(tree, changed, nonCliTests,
     buildClosureGraph(tree, { ...options, omitFunctionLocalRequires: true })) : { ok: true as const, tests: [], reached: 0, opaque: 0, opaqueFiles: [] };
+  if (!reduced.ok) return { current, proposed: { ok: false, reason: reduced.reason }, cliSpawnTests };
+  const proposed = [...new Set([...current.tests.filter((file) => cli.has(file)), ...reduced.tests])].sort();
+  return { current, proposed: { ok: true, tests: proposed }, cliSpawnTests };
+}
+
+/** Compare current reach with a shadow-only candidate that omits function-local requires only for non-CLI tests.
+ *  The caller owns activation; this function never changes the current release decision. */
+export function testsReachingChangedCliLazyRequireCandidate(tree: ClosureTree, changed: readonly string[], tests: readonly string[], options: CliLazyRequireShadowOptions = {}): CliLazyRequireShadow {
+  const { shadowOnlyCandidate = true, ...closureOptions } = options;
+  const graph = buildClosureGraph(tree, { ...closureOptions, omitFunctionLocalRequires: false, omitFunctionLocalProcessSpawnOpacity: false });
+  const current = testsReachingChangedFromGraph(tree, changed, tests, graph);
+  // Bind CLI retention evidence to the test itself. Combining a spawn from a shared production import with a
+  // CLI path elsewhere in that closure classified thousands of module-import tests as CLI launches.
+  // Test-side split helpers remain opaque; production helpers with function-local spawns are candidate reductions
+  // and must be evaluated by full-cut comparisons before anyone considers live activation.
+  const reachesCliSpawn = (test: string): boolean => {
+    const text = tree.read(test);
+    if (text === undefined || !(hasProcessSpawn(text, test) || hasCommandSpawnCandidate(text, test))) return false;
+    const literals = [...text.matchAll(LITERAL)].map((match) => match[2] ?? '');
+    const pathSegments = literals.flatMap((value) => normalize(value).split('/').filter(Boolean));
+    return literals.some((value) => /(?:^|\/)bin\/elanous\.mjs$/.test(normalize(value)))
+      || pathSegments.some((segment, index) => segment === 'bin' && pathSegments[index + 1] === 'elanous.mjs');
+  };
+  const cliSpawnTests = tests.filter(reachesCliSpawn);
+  if (!current.ok) return { current, proposed: { ok: false, reason: current.reason }, cliSpawnTests };
+  const cli = new Set(cliSpawnTests);
+  const nonCliTests = tests.filter((file) => !cli.has(file));
+  const reduced = nonCliTests.length ? testsReachingChangedFromGraph(tree, changed, nonCliTests,
+    buildClosureGraph(tree, { ...closureOptions, omitFunctionLocalRequires: true,
+      omitFunctionLocalProcessSpawnOpacity: shadowOnlyCandidate, shadowCandidatePrecision: true })) : { ok: true as const, tests: [], reached: 0, opaque: 0, opaqueFiles: [] };
   if (!reduced.ok) return { current, proposed: { ok: false, reason: reduced.reason }, cliSpawnTests };
   const proposed = [...new Set([...current.tests.filter((file) => cli.has(file)), ...reduced.tests])].sort();
   return { current, proposed: { ok: true, tests: proposed }, cliSpawnTests };

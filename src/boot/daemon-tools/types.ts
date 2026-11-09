@@ -66,6 +66,8 @@ export interface DaemonToolDispatchCtx {
   requestOrigin?: RequestOrigin;
   /** Owner principal verified at the server request boundary, not from input source metadata. */
   verifiedOwner?: { id: string };
+  /** Server-authenticated Nexus app session class for public app deployment. */
+  appDeploymentSession?: 'nexus-owner' | 'member' | 'anonymous';
   /** Ingestion entry class. Omit for conservative external-verbatim fallback. */
   entry?: IngestionEntry;
   /** M5 PR 2 (PLAN-rich-dev-feedback-multi-surface · 2026-05-13) —

@@ -1,6 +1,7 @@
 /** Parent-only role selection for Task Agent launches. The child model is a separate axis. */
 import { parseRoleLlmFlags } from '../llm/role-llm-cli.js';
-import { isModelRole, parseRoleLlmEntry, roleLlmEnvName, type ModelRole, type RoleLlmSpec } from '../user-config.js';
+import { isModelRole, parseRoleLlmEntry, roleLlmEnvName } from '../user-config.js';
+import type { ModelRole, RoleLlmSpec } from '../user-config/types.js';
 
 const PARENT_ROLES = new Set<ModelRole>(['planning', 'classify', 'audit', 'review']);
 

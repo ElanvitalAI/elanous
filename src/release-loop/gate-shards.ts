@@ -2,11 +2,12 @@
 // 쓰는 쪽 = gate-node(TC · GATE-TIMEOUT-HEAL) · 읽는 쪽 = /v1/ops/release/runs ⊕ 외출 알림(UX).
 // 로그가 아니라 발행 원장 파일인 이유: 게이트 사건은 실행 트리의 test 우주로 가지만 원장은 운영 한 곳이다(TC·OP 10-07 19:12).
 // ⛔ 못 읽으면 `null` — 「조각 0」으로 읽지 않는다.
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 
-export const SHARD_STATES = ['pending', 'running', 'done', 'retry', 'timeout', 'failed'] as const;
+export const SHARD_STATES = ['pending', 'running', 'stop-requested', 'done', 'retry', 'timeout', 'failed'] as const;
 export type ShardState = typeof SHARD_STATES[number];
 
 export interface GateShard {
@@ -29,6 +30,9 @@ export interface GateShard {
   plannedMin?: number;
   /** GATE-MULTI-HOST — 이 조각(가장 최근 시도)이 놓인 풀 멤버(kubectl 컨텍스트). 놓이기 전엔 없다. */
   host?: string;
+  /** Gate receipt decision shown to operators; older ledger rows omit these fields. */
+  reuseDecision?: 'reuse' | 'rerun';
+  reuseReason?: string;
 }
 
 /** 게이트 노드의 판정 결과 — 끝난 조각의 rc≠0 을 «새로 생긴 실패»와 «기존 실패»로 가른 수. */
@@ -40,6 +44,8 @@ export interface GateShardsVerdict {
 export interface GateShardsFile {
   v: 1;
   version: string;
+  /** Graph run that owns this version-scoped board; absent legacy/direct boards are not run-scoped. */
+  runId?: string;
   updatedAt: string;
   shards: GateShard[];
   /** 판정이 나기 전에는 없다. 옛 파일(필드 없음)도 그대로 읽는다 — `v` 를 올리지 않는다. */
@@ -67,6 +73,8 @@ function shardOf(value: unknown): GateShard | null {
   const waitReason = str(raw.waitReason);
   const plannedMin = num(raw.plannedMin);
   const host = str(raw.host, 120);
+  const reuseDecision = raw.reuseDecision === 'reuse' || raw.reuseDecision === 'rerun' ? raw.reuseDecision : undefined;
+  const reuseReason = str(raw.reuseReason, 240);
   const job = str(raw.job, 120);
   const attemptId = str(raw.attemptId, 120);
   const resultFile = str(raw.resultFile, 200);
@@ -79,6 +87,7 @@ function shardOf(value: unknown): GateShard | null {
     ...(installSec !== undefined ? { installSec } : {}), ...(rc !== undefined ? { rc } : {}),
     ...(waitReason ? { waitReason } : {}), ...(plannedMin !== undefined ? { plannedMin } : {}),
     ...(host ? { host } : {}),
+    ...(reuseDecision ? { reuseDecision } : {}), ...(reuseReason ? { reuseReason } : {}),
   };
 }
 
@@ -107,7 +116,7 @@ export function finalizeTerminalGateShards(
   now: Date = new Date(),
   staleAfterMs = 120_000,
 ): GateShardsFile {
-  const active = file.shards.filter((shard) => shard.state === 'running' || shard.state === 'retry');
+  const active = file.shards.filter((shard) => shard.state === 'running' || shard.state === 'retry' || shard.state === 'stop-requested');
   if (!active.length) return file;
   const at = now.getTime();
   const ready = active.map((shard) => {
@@ -115,9 +124,11 @@ export function finalizeTerminalGateShards(
     const resultTerminal = result?.completed === true && result.jobName === shard.job && result.attemptId === shard.attemptId;
     const k8sTerminal = shard.job ? terminalJobs.get(shard.job) : undefined;
     const startedAt = shard.startedAt ? Date.parse(shard.startedAt) : Number.NaN;
-    if (!resultTerminal && !k8sTerminal) return undefined;
-    if (!Number.isFinite(startedAt) || at - startedAt < staleAfterMs) return undefined;
-    return { shard, result, state: resultTerminal
+    // A stop request is only intent. A completed result marker can race with a still-live Job,
+    // so cancellation is terminal only after the Kubernetes status itself is terminal.
+    if (shard.state === 'stop-requested' ? !k8sTerminal : !resultTerminal && !k8sTerminal) return undefined;
+    if (shard.state !== 'stop-requested' && (!Number.isFinite(startedAt) || at - startedAt < staleAfterMs)) return undefined;
+    return { shard, result, state: shard.state === 'stop-requested' && k8sTerminal === 'failed' ? 'failed' as const : resultTerminal
       ? (result!.reason === 'timeout' ? 'timeout' as const : result!.reason === 'stall' || result!.jobFailed === true ? 'failed' as const : 'done' as const)
       : k8sTerminal === 'failed' ? 'failed' as const : 'done' as const };
   });
@@ -147,11 +158,12 @@ export function readGateShards(path: string): GateShardsFile | null {
   const raw = parsed as Record<string, unknown>;
   if (raw.v !== 1 || !Array.isArray(raw.shards)) return null;
   const version = str(raw.version, 40);
+  const runId = str(raw.runId, 160);
   const updatedAt = str(raw.updatedAt, 40);
   if (!version || !updatedAt) return null;
   const verdict = verdictOf(raw.verdict);
   return {
-    v: 1, version, updatedAt, shards: raw.shards.map(shardOf).filter((s): s is GateShard => s !== null),
+    v: 1, version, ...(runId ? { runId } : {}), updatedAt, shards: raw.shards.map(shardOf).filter((s): s is GateShard => s !== null),
     ...(verdict ? { verdict } : {}),
   };
 }
@@ -159,9 +171,69 @@ export function readGateShards(path: string): GateShardsFile | null {
 /** tmp → rename — 읽는 쪽이 반쯤 쓴 파일을 보지 않게. */
 export function writeGateShards(path: string, file: GateShardsFile): void {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.tmp`;
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(file)}\n`);
   renameSync(tmp, path);
+}
+
+/** Serialize read/modify/write updates across gate runner, stop command, and observer processes. */
+export function updateGateShards(path: string, update: (current: GateShardsFile) => GateShardsFile | null, initial?: GateShardsFile): GateShardsFile | null {
+  mkdirSync(dirname(path), { recursive: true });
+  const lockPath = `${path}.lock`;
+  const deadline = Date.now() + 5_000;
+  let lock: number | undefined;
+  while (lock === undefined) {
+    try { lock = openSync(lockPath, 'wx', 0o600); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || Date.now() >= deadline) throw error;
+      // Never unlink an apparently stale lock: checking its owner and then unlinking is a TOCTOU
+      // race that can remove a new owner's lock. Wait for release and fail closed on timeout.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+  try {
+    writeSync(lock, `${process.pid}\n`);
+    const current = readGateShards(path) ?? initial ?? null;
+    if (!current) return null;
+    const next = update(current);
+    if (!next) return null;
+    if (next === current) return current;
+    writeGateShards(path, next);
+    return next;
+  } finally {
+    closeSync(lock);
+    try { unlinkSync(lockPath); } catch { /* lock cleanup is best effort */ }
+  }
+}
+
+/** Apply a runner snapshot's changed rows to the latest board while preserving concurrent rows and stop intent. */
+export function mergeGateShardBoardChanges(current: GateShardsFile, previous: readonly GateShard[], desired: readonly GateShard[], now = new Date(), allowStopFinalize = false): GateShardsFile {
+  const before = new Map(previous.map((shard) => [shard.id, shard]));
+  const incoming = new Map(desired.map((shard) => [shard.id, shard]));
+  const rows = new Map(current.shards.map((shard) => [shard.id, shard]));
+  for (const shard of desired) {
+    if (JSON.stringify(before.get(shard.id)) === JSON.stringify(shard)) continue;
+    const existing = rows.get(shard.id);
+    if (existing?.state === 'stop-requested' && !(allowStopFinalize && (shard.state === 'done' || shard.state === 'failed' || shard.state === 'timeout'))) continue;
+    const prior = before.get(shard.id);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(prior) && JSON.stringify(existing) !== JSON.stringify(shard)) continue;
+    rows.set(shard.id, shard);
+  }
+  for (const shard of current.shards) if (!incoming.has(shard.id)) rows.set(shard.id, shard);
+  return { ...current, updatedAt: now.toISOString(), shards: [...rows.values()] };
+}
+
+/** Record cancellation intent without claiming a still-running Kubernetes Job has terminated. */
+export function markGateShardsStopRequested(path: string, runId: string, now: Date = new Date()): GateShardsFile | null {
+  return updateGateShards(path, (file) => requestGateShardsStop(file, runId, now));
+}
+
+export function requestGateShardsStop(file: GateShardsFile, runId: string, now: Date = new Date()): GateShardsFile | null {
+  if (file.runId !== runId) return null;
+  const shards = file.shards.map((shard) => shard.state === 'running' || shard.state === 'pending' || shard.state === 'retry'
+    ? { ...shard, state: 'stop-requested' as const, waitReason: 'graph-run-stop-requested' } : shard);
+  if (shards.every((shard, index) => shard === file.shards[index])) return file;
+  return { ...file, updatedAt: now.toISOString(), shards };
 }
 
 /**
@@ -169,10 +241,7 @@ export function writeGateShards(path: string, file: GateShardsFile): void {
  * No board (a local, non-Pod gate) ⇒ false and nothing is written: a verdict never creates a board out of thin air.
  */
 export function recordGateShardsVerdict(path: string, verdict: GateShardsVerdict, now: Date = new Date()): boolean {
-  const file = readGateShards(path);
-  if (!file) return false;
-  writeGateShards(path, { ...file, updatedAt: now.toISOString(), verdict });
-  return true;
+  return updateGateShards(path, (file) => ({ ...file, updatedAt: now.toISOString(), verdict })) !== null;
 }
 
 export interface GateShardsSummary {
@@ -205,6 +274,7 @@ const minutesBetween = (fromIso: string | undefined, now: number): number | null
  * 도는 조각이 없으면 자리 1로 본다. 계획 분이 없는 조각이 하나라도 남아 있으면 null.
  */
 function estimate(shards: GateShard[], now: number): number | null {
+  if (shards.some((s) => s.state === 'stop-requested')) return null;
   const running = shards.filter((s) => s.state === 'running');
   const waiting = shards.filter((s) => s.state === 'pending' || s.state === 'retry');
   if (!running.length && !waiting.length) return 0;
@@ -220,7 +290,7 @@ export function summarizeShards(file: GateShardsFile, now: number = Date.now()):
   const reasons = new Map<string, number>();
   for (const shard of file.shards) {
     counts[shard.state] += 1;
-    if (shard.waitReason && (shard.state === 'pending' || shard.state === 'retry')) {
+    if (shard.waitReason && (shard.state === 'pending' || shard.state === 'retry' || shard.state === 'stop-requested')) {
       reasons.set(shard.waitReason, (reasons.get(shard.waitReason) ?? 0) + 1);
     }
   }
@@ -241,7 +311,7 @@ export function summarizeShards(file: GateShardsFile, now: number = Date.now()):
 }
 
 export const SHARD_WORD: Record<ShardState, string> = {
-  pending: '대기', running: '돌기', done: '끝', retry: '재시도', timeout: '잘림', failed: '실패',
+  pending: '대기', running: '돌기', 'stop-requested': '종료 확인 대기', done: '끝', retry: '재시도', timeout: '잘림', failed: '실패',
 };
 
 /**
@@ -255,7 +325,7 @@ function doneTail(summary: GateShardsSummary): string {
 
 /** 외출 알림·/release 한 줄 — «조각 24 · 돌기 5 · 대기 8(CPU 부족 8) · 잘림 2 · 끝 9(rc≠0 3 · 기존 실패 포함 · 판정 전) · 남은 약 40분». */
 export function shardsLine(summary: GateShardsSummary): string {
-  const order: ShardState[] = ['running', 'pending', 'retry', 'timeout', 'failed', 'done'];
+  const order: ShardState[] = ['running', 'stop-requested', 'pending', 'retry', 'timeout', 'failed', 'done'];
   const parts = [`조각 ${summary.total}`];
   for (const state of order) {
     const n = summary.counts[state];

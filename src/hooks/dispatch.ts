@@ -4,7 +4,7 @@ import { debug } from '../debug/log.js';
 import { runSeatLoopOnce } from '../seat-loop/seat-loop.js';
 import { getUserConfig } from '../user-config.js';
 import { openMsgStore } from '../msg/msg-store.js';
-import type { EventsConfig } from '../user-config.js';
+import type { EventsConfig } from '../user-config/types.js';
 import type { QueuedHook } from './queue.js';
 
 export type HookWake = (seat: string) => Promise<unknown>;

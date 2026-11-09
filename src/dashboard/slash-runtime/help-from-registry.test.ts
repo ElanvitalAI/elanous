@@ -16,17 +16,17 @@ const descriptions = [
 
 afterEach(() => setUserConfigOverlay(null));
 
-test('MAT1c default help audience reads tui config', () => {
+test('MAT1c ignores legacy TUI audience config', () => {
   const names = ['help', 'research', 'debug', 'directive'];
   const descriptions = names.map((name) => ({ name, description: name }));
   setUserConfigOverlay((config) => ({ ...config, raw: { ...config.raw, tui: { role: 'general', showBeta: true } } }));
   const lines = buildEssentialHelpLines({ names, descriptions, width: 80 }).join('\n');
   expect(lines).toContain('/help');
   expect(lines).toContain('/research');
-  expect(lines).not.toContain('/debug');
-  expect(lines).not.toContain('/directive');
+  expect(lines).toContain('/debug');
+  expect(lines).toContain('/directive');
   setUserConfigOverlay((config) => ({ ...config, raw: { ...config.raw, tui: { role: 'general', showBeta: false } } }));
-  expect(buildEssentialHelpLines({ names, descriptions, width: 80 }).join('\n')).not.toContain('/research');
+  expect(buildEssentialHelpLines({ names, descriptions, width: 80 }).join('\n')).toContain('/research');
 });
 
 test('SLASH-HELP-DIET lists exactly the required ten and reserve five commands', () => {
@@ -52,7 +52,7 @@ test('MAT1c registered ungraded command appears for owner but not general or con
   };
   for (const role of ['general', 'contributor'] as const) {
     setUserConfigOverlay((config) => ({ ...config, raw: { ...config.raw, tui: { role } } }));
-    expect(buildEssentialHelpLines(input).join('\n')).not.toContain('/ghost');
+    expect(buildEssentialHelpLines(input).join('\n')).toContain('/ghost');
   }
   expect(buildEssentialHelpLines({ ...input, audience: { role: 'owner', showBeta: false } }))
     .toContain('/ghost  External registered slash');

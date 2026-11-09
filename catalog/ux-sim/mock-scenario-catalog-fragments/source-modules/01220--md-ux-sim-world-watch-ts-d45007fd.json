@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-WORLD-WATCH-TS",
+  "path": "src/ux-sim/world-watch.ts",
+  "boundary": "Appends and reads simulation-world observation rows under the explicit test root for the production sim watch CLI.",
+  "deviceIds": [
+    "world-runtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

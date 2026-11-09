@@ -40,7 +40,7 @@ export interface AdaptiveGateRepairNode {
   kind: 'agent';
   recipe: 'cmd:gate-repair';
   maxVisits: 1;
-  input: { version: string; runId: string; commit: string; failureIds: string[] };
+  input: { version: string; runId: string; commit: string; gateExecutionId?: string; failureIds: string[] };
 }
 
 export interface AdaptiveGateImageRepairNode {
@@ -169,7 +169,8 @@ export function planAdaptiveGateHeal(input: AdaptiveHealInput): AdaptiveGateHeal
   if (triage.classification === 'regression' && failureIds.length > 0) {
     const nodeId = repairNodeId(triage.commit, failureIds);
     const repairNode: AdaptiveGateRepairNode = { nodeId, kind: 'agent', recipe: 'cmd:gate-repair', maxVisits: 1,
-      input: { version: input.version, runId: input.runId, commit: triage.commit, failureIds } };
+      input: { version: input.version, runId: input.runId, commit: triage.commit,
+        ...(triage.gateExecutionId ? { gateExecutionId: triage.gateExecutionId } : {}), failureIds } };
     const disposition = { action: 'append-repair-and-resume' as const, repairNode, resumeFrom: nodeId,
       rerunGateAt: 'gate' as const, visitState, visitLimits, maxRepairRetries: 1 as const };
     events.push(

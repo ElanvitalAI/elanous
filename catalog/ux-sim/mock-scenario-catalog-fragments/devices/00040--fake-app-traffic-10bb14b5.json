@@ -1,0 +1,32 @@
+{
+  "id": "fake-app-traffic",
+  "name": "Fake app traffic caps and admin kill switch",
+  "implementation": [
+    "src/ux-sim/fake-app-traffic.ts",
+    "src/ux-sim/fake-clock.ts",
+    "src/ux-sim/app-kill-switch-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-app-traffic.test.ts",
+    "src/ux-sim/fake-clock.test.ts",
+    "src/ux-sim/app-kill-switch-world.test.ts"
+  ],
+  "target": "Per-app request and response byte accounting with warning, throttle, block, window reset, and immediate admin stream termination",
+  "inputs": [
+    "app slug and request/response byte counts",
+    "accounting window and ordered traffic thresholds",
+    "admin block and unblock operations"
+  ],
+  "observations": [
+    "per-app byte totals and warning/throttle/block decisions",
+    "window reset restores the app traffic allowance",
+    "admin block rejects new requests and closes active streams",
+    "neighbor apps remain unaffected; ledger stores byte counts and status only"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-app-traffic.test.ts src/ux-sim/fake-clock.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

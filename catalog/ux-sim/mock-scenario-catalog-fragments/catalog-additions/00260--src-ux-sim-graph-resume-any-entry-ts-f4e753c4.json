@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/graph-resume-any-entry.ts",
+  "reason": "GRAPH-RESUME-ANY-ENTRY-SIM: exercises five persisted resume entry points through the production graph runner in isolated temporary worlds."
+}

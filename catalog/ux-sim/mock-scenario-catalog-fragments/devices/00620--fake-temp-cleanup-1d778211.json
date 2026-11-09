@@ -1,0 +1,36 @@
+{
+  "id": "fake-temp-cleanup",
+  "name": "Task-agent test temporary directory cleanup",
+  "checklistCells": [
+    "TMP-DIR-LEAK"
+  ],
+  "implementation": [
+    "src/ux-sim/fake-temp-cleanup.ts",
+    "src/test-utils/temp-dir-cleanup.ts",
+    "src/task-agent/task-hand.test.ts",
+    "src/task-agent/live-moves.test.ts",
+    "src/task-agent/card-evidence.test.ts",
+    "src/cli/tasks-cli.test.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-temp-cleanup.test.ts"
+  ],
+  "target": "Task-agent suites that create temporary roots, including failure teardown and preservation of unrelated host state.",
+  "inputs": [
+    "normal suite completion after creating task-hand, ta-live and task-card-evidence roots",
+    "suite failure after creating nested temporary artifacts",
+    "an unrelated untracked temporary root"
+  ],
+  "observations": [
+    "tracked temporary roots removed after teardown",
+    "unrelated temporary root remains untouched",
+    "cleanup failure is reported to the suite"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-temp-cleanup.test.ts",
+    "bun test src/cli/tasks-cli.test.ts src/task-agent/task-hand.test.ts src/task-agent/live-moves.test.ts src/task-agent/card-evidence.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

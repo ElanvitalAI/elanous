@@ -10,6 +10,7 @@ import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import ts from 'typescript';
 import { XMLParser } from 'fast-xml-parser';
+import { spawnSyncText } from '../src/util/spawn-sync-output.js';
 
 type CaseAttempt = { report: string; document: number; seconds: number | null; result: 'passed' | 'failed' | 'skipped' };
 
@@ -40,6 +41,12 @@ type SourceFacts = {
   cases: CaseSource[];
 };
 
+export type NumericCandidateLocation = { literal: string; line: number };
+export type NumericCandidateProvenance = NumericCandidateLocation & {
+  blameCommit: string | null;
+  reason: string | null;
+};
+
 type CensusRow = JunitCase & {
   sourceStatus: 'parsed' | 'missing';
   caseMatch: 'matched' | 'unmatched';
@@ -50,6 +57,7 @@ type CensusRow = JunitCase & {
   network: boolean | null;
   loops: number | null;
   numericCandidates: string[];
+  numericCandidateProvenance: NumericCandidateProvenance[] | null;
   contract: string;
   sourceLine: number | null;
 };
@@ -271,20 +279,115 @@ export function sourcePathFor(file: string, sourceRoot: string): string | undefi
   return path;
 }
 
-function bodyMetrics(body: ts.Node | undefined): { loops: number | null; numericCandidates: string[] } {
-  if (!body) return { loops: null, numericCandidates: [] };
+function bodyMetrics(body: ts.Node | undefined): { loops: number | null; numericCandidates: string[]; candidateLocations: NumericCandidateLocation[] } {
+  if (!body) return { loops: null, numericCandidates: [], candidateLocations: [] };
   let loops = 0;
-  const numbers = new Set<string>();
+  const numbers = new Map<string, NumericCandidateLocation>();
   const visit = (node: ts.Node): void => {
     if (ts.isForStatement(node) || ts.isForOfStatement(node) || ts.isForInStatement(node) || ts.isWhileStatement(node) || ts.isDoStatement(node)) loops += 1;
     if (ts.isNumericLiteral(node)) {
       const n = Number(node.text.replace(/_/g, ''));
-      if (Number.isFinite(n) && Math.abs(n) > 1) numbers.add(node.text);
+      if (Number.isFinite(n) && Math.abs(n) > 1) {
+        const source = node.getSourceFile();
+        const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+        numbers.set(`${node.text}\0${line}`, { literal: node.text, line });
+      }
     }
     ts.forEachChild(node, visit);
   };
   visit(body);
-  return { loops, numericCandidates: [...numbers].sort((a, b) => Number(a.replace(/_/g, '')) - Number(b.replace(/_/g, '')) || a.localeCompare(b)) };
+  const candidateLocations = [...numbers.values()].sort((a, b) => a.line - b.line || Number(a.literal.replace(/_/g, '')) - Number(b.literal.replace(/_/g, '')) || a.literal.localeCompare(b.literal));
+  const numericCandidates = [...new Set(candidateLocations.map(({ literal }) => literal))]
+    .sort((a, b) => Number(a.replace(/_/g, '')) - Number(b.replace(/_/g, '')) || a.localeCompare(b));
+  return { loops, numericCandidates, candidateLocations };
+}
+
+const blameCache = new Map<string, Map<number, string>>();
+const reasonCache = new Map<string, string | null>();
+const repositoryRootCache = new Map<string, string | null>();
+const shallowRepositoryCache = new Map<string, boolean>();
+
+/** Attribute each candidate literal to its introducing commit without guessing when history is unavailable. */
+export function numericCandidateEvidence(
+  sourcePath: string,
+  candidates: NumericCandidateLocation[],
+  sourceRoot: string,
+): NumericCandidateProvenance[] {
+  if (!candidates.length) return [];
+  const rootKey = resolve(sourceRoot);
+  if (!repositoryRootCache.has(rootKey)) {
+    try { repositoryRootCache.set(rootKey, spawnSyncText('git', ['rev-parse', '--show-toplevel'], { cwd: rootKey, encoding: 'utf8' }).trim()); }
+    catch { repositoryRootCache.set(rootKey, null); }
+  }
+  const repositoryRoot = repositoryRootCache.get(rootKey);
+  if (!repositoryRoot) {
+    return candidates.map((candidate) => ({ ...candidate, blameCommit: null, reason: null }));
+  }
+  if (!shallowRepositoryCache.has(repositoryRoot)) {
+    try {
+      shallowRepositoryCache.set(repositoryRoot, spawnSyncText('git', ['rev-parse', '--is-shallow-repository'], { cwd: repositoryRoot, encoding: 'utf8' }).trim() === 'true');
+    } catch { shallowRepositoryCache.set(repositoryRoot, true); }
+  }
+  const shallowRepository = shallowRepositoryCache.get(repositoryRoot) ?? true;
+  const pathFromRepository = relative(repositoryRoot, resolve(sourcePath)).replaceAll('\\', '/');
+  if (!pathFromRepository || pathFromRepository === '..' || pathFromRepository.startsWith('../') || isAbsolute(pathFromRepository)) {
+    return candidates.map((candidate) => ({ ...candidate, blameCommit: null, reason: null }));
+  }
+  const cacheKey = `${repositoryRoot}\0${pathFromRepository}`;
+  let blameByLine = blameCache.get(cacheKey);
+  if (!blameByLine) {
+    blameByLine = new Map<number, string>();
+    blameCache.set(cacheKey, blameByLine);
+  }
+  const missingLines = [...new Set(candidates.map(({ line }) => line).filter((line) => Number.isInteger(line) && line > 0 && !blameByLine!.has(line)))].sort((a, b) => a - b);
+  if (missingLines.length) {
+    const ranges: Array<[number, number]> = [];
+    for (const line of missingLines) {
+      const last = ranges.at(-1);
+      if (last && line === last[1] + 1) last[1] = line;
+      else ranges.push([line, line]);
+    }
+    try {
+      const args = ['blame', '--line-porcelain'];
+      for (const [start, end] of ranges) args.push('-L', `${start},${end}`);
+      args.push('--', pathFromRepository);
+      const blame = spawnSyncText('git', args, { cwd: repositoryRoot, encoding: 'utf8' });
+      let record: { commit: string; line: number; boundary: boolean } | undefined;
+      for (const line of blame.split('\n')) {
+        const header = /^([0-9a-f]{40}) \d+ (\d+)(?: \d+)?$/.exec(line);
+        if (header) {
+          record = { commit: header[1]!, line: Number(header[2]), boundary: false };
+          continue;
+        }
+        if (!record) continue;
+        if (line === 'boundary') record.boundary = true;
+        if (line.startsWith('\t')) {
+          blameByLine.set(record.line, record.boundary && shallowRepository ? '' : record.commit);
+          record = undefined;
+        }
+      }
+    } catch { /* Untracked or unavailable lines have no blame evidence. */ }
+    for (const line of missingLines) if (!blameByLine.has(line)) blameByLine.set(line, '');
+  }
+  return candidates.map((candidate) => {
+    const commit = blameByLine!.get(candidate.line);
+    if (!commit || /^0+$/.test(commit)) return { ...candidate, blameCommit: null, reason: null };
+    if (!reasonCache.has(commit)) {
+      try {
+        const message = spawnSyncText('git', ['show', '-s', '--format=%B', commit], { cwd: repositoryRoot, encoding: 'utf8' }).trim();
+        reasonCache.set(commit, message || null);
+      } catch { reasonCache.set(commit, null); }
+    }
+    return { ...candidate, blameCommit: commit, reason: reasonCache.get(commit) ?? null };
+  });
+}
+
+function provenanceCell(row: CensusRow, field: 'blameCommit' | 'reason'): string {
+  if (row.caseMatch === 'unmatched' || row.sourceStatus === 'missing' || row.numericCandidateProvenance === null) return '미확인';
+  return row.numericCandidateProvenance.map((candidate) => {
+    const value = candidate[field];
+    return `${candidate.literal}@${candidate.line}=${value?.replaceAll('|', '\\|').replaceAll('\n', ' ') ?? '미확인'}`;
+  }).join('<br>') || '없음';
 }
 
 function markdown(rows: CensusRow[], reportCount: number, gateDir: string, sourceRoot: string, shardStates?: Record<string, number>): string {
@@ -295,31 +398,33 @@ function markdown(rows: CensusRow[], reportCount: number, gateDir: string, sourc
   const lines = [
     `# Test census — gate 0.3.5 cut`,
     '',
-    `Source: \`${gateDir}\` · code: \`${sourceRoot}\` · JUnit reports ${reportCount} · shards ${JSON.stringify(shardStates ?? 'unknown')} · unique executed cases ${rows.length}. Import counts and call signals are static file-level indicators; loops and numeric candidates are scoped to uniquely matched case bodies. Numeric candidates require human review before classifying as magic numbers.`,
+    `Source: \`${gateDir}\` · code: \`${sourceRoot}\` · JUnit reports ${reportCount} · shards ${JSON.stringify(shardStates ?? 'unknown')} · unique executed cases ${rows.length}. Import counts and call signals are static file-level indicators; loops and numeric candidates are scoped to uniquely matched case bodies. Numeric literals greater than one are candidates, not confirmed expected values. Blame commit and its full message are provenance only; human review decides whether the rationale still justifies the assertion.`,
     '',
-    '| 파일 | suite 경로 | classname | 케이스 | 게이트 소요(s, 첫 실행) | 시도별 소요·결과 | import 수(정적/동적) | spawn/sleep/네트워크(정적 신호) | 반복 루프 | 매직 넘버 후보(>1) | 계약 요약 | 소스 상태 | 케이스 연결 |',
-    '|---|---|---|---|---:|---|---:|---|---:|---|---|---|---|',
+    '| 파일 | suite 경로 | classname | 케이스 | 게이트 소요(s, 첫 실행) | 시도별 소요·결과 | import 수(정적/동적) | spawn/sleep/네트워크(정적 신호) | 반복 루프 | 기대값 리터럴 후보(>1) | git blame 커밋 | 사유(커밋 메시지) | 계약 요약 | 소스 상태 | 케이스 연결 |',
+    '|---|---|---|---|---:|---|---:|---|---:|---|---|---|---|---|---|',
   ];
   for (const row of rows) {
     const signalNames = ['spawn', 'sleep', 'network'].filter((key) => row[key as 'spawn' | 'sleep' | 'network']);
     const staticSignals = row.sourceStatus === 'missing' ? '미확인' : signalNames.join(', ') || '없음';
-    lines.push(`| ${esc(row.file)} | ${esc(row.suitePath.join(' > '))} | ${esc(row.classname)} | ${esc(row.name)} | ${row.seconds?.toFixed(4) ?? '미측정'} | ${attempts(row)} | ${row.imports ?? '미확인'}/${row.dynamicImports ?? '미확인'} | ${staticSignals} | ${row.loops ?? '미확인'} | ${numeric(row)} | ${esc(row.contract)} | ${row.sourceStatus} | ${row.caseMatch} |`);
+    lines.push(`| ${esc(row.file)} | ${esc(row.suitePath.join(' > '))} | ${esc(row.classname)} | ${esc(row.name)} | ${row.seconds?.toFixed(4) ?? '미측정'} | ${attempts(row)} | ${row.imports ?? '미확인'}/${row.dynamicImports ?? '미확인'} | ${staticSignals} | ${row.loops ?? '미확인'} | ${numeric(row)} | ${provenanceCell(row, 'blameCommit')} | ${provenanceCell(row, 'reason')} | ${esc(row.contract)} | ${row.sourceStatus} | ${row.caseMatch} |`);
   }
   return `${lines.join('\n')}\n`;
 }
 
 function tsv(rows: CensusRow[], reportCount: number, gateDir: string, sourceRoot: string, shardStates?: Record<string, number>): string {
   const escape = (value: unknown): string => String(value ?? '').replaceAll('\\', '\\\\').replaceAll('\t', '\\t').replaceAll('\r', '').replaceAll('\n', '\\n');
-  const columns: Array<keyof CensusRow> = ['file', 'suitePath', 'classname', 'name', 'line', 'seconds', 'result', 'attempts', 'sourceStatus', 'caseMatch', 'imports', 'dynamicImports', 'spawn', 'sleep', 'network', 'loops', 'numericCandidates', 'contract', 'sourceLine'];
+  const columns: Array<keyof CensusRow> = ['file', 'suitePath', 'classname', 'name', 'line', 'seconds', 'result', 'attempts', 'sourceStatus', 'caseMatch', 'imports', 'dynamicImports', 'spawn', 'sleep', 'network', 'loops', 'numericCandidates', 'numericCandidateProvenance', 'contract', 'sourceLine'];
   const cellValue = (row: CensusRow, column: keyof CensusRow): unknown => {
     if (column === 'attempts') return JSON.stringify(row.attempts);
     if (column === 'suitePath') return row.suitePath.join(' > ');
     if (['imports', 'dynamicImports', 'spawn', 'sleep', 'network', 'loops'].includes(column) && row[column] === null) return 'unknown';
     if (column === 'numericCandidates' && (row.caseMatch === 'unmatched' || row.sourceStatus === 'missing')) return 'unknown';
+    if (column === 'numericCandidateProvenance' && (row.caseMatch === 'unmatched' || row.sourceStatus === 'missing')) return 'unknown';
+    if (column === 'numericCandidateProvenance') return JSON.stringify(row.numericCandidateProvenance);
     return Array.isArray(row[column]) ? (row[column] as string[]).join(',') : row[column];
   };
   return [
-    `# gateDir=${gateDir} sourceRoot=${sourceRoot} reports=${reportCount} cases=${rows.length} shards=${JSON.stringify(shardStates ?? 'unknown')}; imports/call-signals are static file-level indicators; loops/numeric-candidates are from uniquely matched case bodies; unknown differs from none; seconds=first report, result=last parsed attempt, attempts=all report/document timings and outcomes`,
+    `# gateDir=${gateDir} sourceRoot=${sourceRoot} reports=${reportCount} cases=${rows.length} shards=${JSON.stringify(shardStates ?? 'unknown')}; imports/call-signals are static file-level indicators; loops/numeric-candidates are from uniquely matched case bodies; numericCandidateProvenance is candidate literal + blame SHA + full commit message (unknown differs from none); seconds=first report, result=last parsed attempt, attempts=all report/document timings and outcomes`,
     columns.join('\t'),
     ...rows.map((row) => columns.map((column) => escape(cellValue(row, column))).join('\t')),
   ].join('\n') + '\n';
@@ -374,6 +479,7 @@ function main(): void {
       network: facts ? signals.has('network') : null,
       loops: metrics.loops,
       numericCandidates: metrics.numericCandidates,
+      numericCandidateProvenance: sourcePath && matched ? numericCandidateEvidence(sourcePath, metrics.candidateLocations, sourceRoot) : matched ? [] : null,
       contract,
       sourceLine: matched?.line ?? null,
     };

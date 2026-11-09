@@ -385,7 +385,7 @@ test('merge train refuses to automerge symlink conflicts instead of replacing th
   expect(git(repo, 'rev-parse', 'HEAD')).toBe(mainHead);
 });
 
-test('train integration passes UX merge drivers only to the merge-tree process', () => {
+test('train integration passes the manual merge driver only to the merge-tree process', () => {
   const { repo, base, first } = fixture();
   const calls: string[][] = [];
   const injected: TrainGit = (args, cwd, env) => {
@@ -396,7 +396,6 @@ test('train integration passes UX merge drivers only to the merge-tree process',
   const result = integrateTrain(repo, base, [{ number: 1, head: first }], injected);
   expect(result.commitSha).toMatch(/^[0-9a-f]{40}$/);
   const mergeArgs = calls.find((args) => args.includes('merge-tree'))!;
-  expect(mergeArgs).toContainEqual(expect.stringContaining('merge.uxsim-catalog.driver=node'));
   expect(mergeArgs).toContainEqual(expect.stringContaining('merge.uxsim-manual.driver=node'));
   expect(git(repo, 'config', '--local', '--list')).not.toContain('merge.uxsim-catalog.driver');
 });

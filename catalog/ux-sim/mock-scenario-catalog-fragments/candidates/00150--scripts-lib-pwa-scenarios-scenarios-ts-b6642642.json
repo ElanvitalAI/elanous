@@ -1,0 +1,8 @@
+{
+  "path": "scripts/lib/pwa-scenarios/scenarios.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun test scripts/lib/pwa-scenarios/scenarios.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Browser/E2E cell result, not ScenarioV0 logs.",
+  "excludeReason": "Live-browser PWA runner support; not a mock device."
+}

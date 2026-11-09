@@ -1,5 +1,7 @@
-import { readFileSync } from 'node:fs';
+import { isRecord } from '../primitives/guards.js';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 
 export interface MockScenarioDevice {
   id: string;
@@ -76,10 +78,6 @@ export interface MockScenarioCatalog {
     candidates: MockScenarioCandidate[];
   };
   discovery: { trackedRoot: string; candidateRoots: string[]; limits: string };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function requireString(value: unknown, path: string): string {
@@ -369,9 +367,33 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
   };
 }
 
+const FRAGMENTS_ROOT = 'catalog/ux-sim/mock-scenario-catalog-fragments';
+
+export function loadMockScenarioCatalogFromRoot(repoRoot: string): MockScenarioCatalog {
+  const root = resolve(repoRoot, FRAGMENTS_ROOT);
+  const read = (path: string): unknown => JSON.parse(readFileSync(resolve(root, path), 'utf8')) as unknown;
+  const rows = (collection: string): unknown[] => {
+    const directory = resolve(root, collection);
+    if (!existsSync(directory)) return [];
+    return readdirSync(directory).filter((name) => name.endsWith('.json')).sort().map((name) => {
+      if (!/^\d{5}--[a-z0-9][a-z0-9-]*\.json$/.test(name)) throw new Error(`${collection}/${name} must use a five-digit ordering slot and identity slug`);
+      return read(`${collection}/${name}`);
+    });
+  };
+  const metadata = read('metadata.json');
+  if (!isRecord(metadata) || !isRecord(metadata.candidateAudit)) throw new Error('catalog fragment metadata is invalid');
+  const audit = metadata.candidateAudit;
+  return parseMockScenarioCatalog({
+    candidateAudit: { source: audit.source, baseCommit: audit.baseCommit, sourceRows: audit.sourceRows, existingPaths: audit.existingPaths,
+      excludedPaths: audit.excludedPaths, catalogAdditions: rows('catalog-additions'), sourceExclusions: rows('source-exclusions'),
+      omissionCheck: { requiredPaths: rows('omission-required-paths'), missingPaths: rows('omission-missing-paths') }, candidates: rows('candidates') },
+    deviceCatalogVersion: metadata.deviceCatalogVersion, devices: rows('devices'), discovery: metadata.discovery,
+    runEvidence: metadata.runEvidence, scenarios: rows('scenarios'), sourceModules: rows('source-modules'), version: metadata.version, worldEvents: rows('world-events'),
+  });
+}
+
 export function loadMockScenarioCatalog(): MockScenarioCatalog {
-  const path = fileURLToPath(new URL('./mock-scenario-catalog.json', import.meta.url));
-  return parseMockScenarioCatalog(JSON.parse(readFileSync(path, 'utf8')) as unknown);
+  return loadMockScenarioCatalogFromRoot(fileURLToPath(new URL('../..', import.meta.url)));
 }
 
 export function renderMockScenarioList(catalog: MockScenarioCatalog): string[] {
@@ -381,7 +403,7 @@ export function renderMockScenarioList(catalog: MockScenarioCatalog): string[] {
     'Mock scenario catalog · reusable devices and scenario references',
     ...catalog.scenarios.map((scenario) => `${scenario.id}\t${scenario.kind}\t${scenario.name}`),
     `장치 ${catalog.devices.length} · 시나리오 ${catalog.scenarios.length} · 자세히: bun scripts/ux-sim.ts show <MS-id>`,
-    '후보 감사 ' + reviewedPaths + '/' + reviewedRows + ' 경로 확인 · 제외 ' + catalog.candidateAudit.excludedPaths + ' · entry/logs 근거는 mock-scenario-catalog.json',
+    '후보 감사 ' + reviewedPaths + '/' + reviewedRows + ' 경로 확인 · 제외 ' + catalog.candidateAudit.excludedPaths + ' · entry/logs 근거는 catalog/ux-sim/mock-scenario-catalog-fragments/',
   ];
 }
 

@@ -2,18 +2,15 @@
 
 import { Suspense, useEffect, useState, type ReactNode } from 'react';
 import Link from 'next/link';
-import { usePathname, useRouter } from 'next/navigation';
+import { usePathname } from 'next/navigation';
 import { ChevronDown, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { usePwaRole } from '@/lib/pwa-role';
-import { useOperator } from '@/lib/use-operator';
-import { routeMaturity, visibleForRole } from '@/lib/route-maturity';
+import { routeMaturity } from '@/lib/route-maturity';
 import { useShowBeta } from '@/lib/show-beta';
 import { NAV_SHOW_HIDDEN_KEY, NAV_SHOW_LABS_KEY, NAV_GROUPS, SIDEBAR_NAV_ITEMS, navItemActive, visibleNavGroups, type NavGroupId } from './sidebar-nav-items';
 import { NavSearchProbe } from './NavSearchProbe';
 import { NAV_PREFS_EVENT, readFlag } from './nav-visibility-prefs';
-import { SidebarWorkflowInvoker } from './SidebarWorkflowInvoker';
-import { ShowroomSidebarSection } from './ShowroomSidebarSection';
 
 const NAV_ITEMS = SIDEBAR_NAV_ITEMS;
 
@@ -42,12 +39,10 @@ interface Props {
 
 export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {}) {
   const pathname = usePathname();
-  const router = useRouter();
   const current = normalizePath(pathname ?? '/');
   const [search, setSearch] = useState('');
   const role = usePwaRole();
   const { showBeta } = useShowBeta();
-  const operator = useOperator();
   const [collapsed, setCollapsed] = useState<NavGroupId[]>([]);
   useEffect(() => {
     try {
@@ -60,18 +55,6 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
     setCollapsed(next);
     try { window.localStorage.setItem('elanous.nav.collapsedGroups', JSON.stringify(next)); } catch { /* Storage may be unavailable. */ }
   };
-  // General users follow direct links; typed beta addresses remain available even without menu opt-in.
-  const handleNavClick = (
-    item: typeof NAV_ITEMS[number],
-    e: React.MouseEvent<HTMLAnchorElement>,
-  ): void => {
-    if (item.kind === null || role === 'general') return; // General users stay on the selected direct destination.
-    // Cmd/Ctrl-click → 새 탭에서 single-page route 직접 열림 (browser default).
-    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-    e.preventDefault();
-    router.push(`/workspace?intent=${item.kind}` as never);
-    onNavigate?.();
-  };
   // 보는 사람 기기별 설정 — ⛔ 렌더 중에 읽지 않는다(정적 export 하이드레이션 · #418). 첫 렌더는 공개 탭만.
   const [prefs, setPrefs] = useState({ showLabs: false, showHidden: false });
   useEffect(() => {
@@ -81,7 +64,7 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
     window.addEventListener('storage', read);
     return () => { window.removeEventListener(NAV_PREFS_EVENT, read); window.removeEventListener('storage', read); };
   }, []);
-  const groups = visibleNavGroups(NAV_ITEMS, prefs, role, operator, { showBeta });
+  const groups = visibleNavGroups(NAV_ITEMS, prefs, role, { showBeta });
   const renderItem = (item: typeof NAV_ITEMS[number]) => {
     // Highlight nested routes and the shared Missions/Editor destinations.
     const active = navItemActive(item, current, search, NAV_ITEMS);
@@ -92,9 +75,7 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
         <Link
           href={item.href as never}
           aria-current={active ? 'page' : undefined}
-          onClick={(e) => {
-            handleNavClick(item, e);
-            if (e.defaultPrevented) return;
+          onClick={() => {
             onNavigate?.();
           }}
           title={compact ? `${item.label}${experimental ? ' · 실험' : ''} — ${item.hint}` : item.hint}
@@ -199,24 +180,6 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
       {groups.hidden.length > 0 && (
         <NavGroup label="Hidden" compact={compact}>{groups.hidden.map(renderItem)}</NavGroup>
       )}
-      {/* R6 Task 2 · §6.5 — saved Showroom layouts as 1-click switch.
-          The widget is silent when DaemonProvider is absent (SSR /
-          some dev routes) and renders nothing in compact mode.
-          Suspense wrap (2026-05-09) — useSearchParams() in this child
-          forces every page that mounts AppShell to bail out of static
-          prerender unless wrapped. Without Suspense, the static
-          export crashes on /workflows, /tasks, etc. with
-          "useSearchParams() should be wrapped in a suspense
-          boundary". */}
-      {prefs.showLabs && visibleForRole(role, '/showroom') && (
-        <Suspense fallback={null}>
-          <ShowroomSidebarSection compact={compact} onNavigate={onNavigate} />
-        </Suspense>
-      )}
-      {/* BACKLOG #3 — sticky workflow invoker. Hidden in compact rail
-          (no horizontal room). Silently absent when NexusClient is
-          missing (SSR / dev). */}
-      {prefs.showLabs && visibleForRole(role, '/workflows') && <SidebarWorkflowInvoker compact={compact} />}
     </nav>
   );
 }

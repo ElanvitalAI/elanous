@@ -1,7 +1,8 @@
 import { expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
 import { getProviderForConfig, type LLMOpts } from './llm.js';
-import type { UserConfig } from './user-config.js';
+import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import type { UserConfig } from './user-config/types.js';
 
 // OpenRouter effort request bodies and non-OpenRouter byte preservation; fetch is mocked (no API calls).
 
@@ -9,18 +10,16 @@ const messages = [{ role: 'user' as const, content: 'hello' }];
 
 async function captureRaw(provider: string, model: string, opts: LLMOpts = {}, reasoningLevel?: 'off' | 'low' | 'medium' | 'high' | 'xhigh'): Promise<string> {
   const bodies: string[] = [];
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-    bodies.push(String(init?.body));
-    return new Response('data: [DONE]\n\n', { status: 200 });
-  }) as typeof fetch);
-  try {
+  await withFakeFetchDevice([
+    { url: '/api/v1/chat/completions', method: 'POST', response: (request) => { bodies.push(request.body ?? ''); return new Response('data: [DONE]\n\n', { status: 200 }); } },
+    { url: '/v1/chat/completions', method: 'POST', response: (request) => { bodies.push(request.body ?? ''); return new Response('data: [DONE]\n\n', { status: 200 }); } },
+  ], async (device) => {
     const config = { llm: { provider, model, apiKey: 'test-key', reasoningLevel, ...(provider === 'local' ? { baseUrl: 'http://localhost:1234/v1' } : {}) } } as UserConfig;
     for await (const _ of getProviderForConfig(config).streamChat!(messages, opts)) { /* consume */ }
     expect(bodies.length).toBe(1);
-    return bodies[0]!;
-  } finally {
-    mock.mockRestore();
-  }
+    expect(device.calls()).toHaveLength(1);
+  });
+  return bodies[0]!;
 }
 
 async function captureBody(provider: string, model: string, opts: LLMOpts = {}, reasoningLevel?: 'off' | 'low' | 'medium' | 'high' | 'xhigh'): Promise<Record<string, any>> {
@@ -133,15 +132,13 @@ test('openrouter: cross-family model route preserves the resolved config effort'
     const provider = getProviderForConfig(config, model);
     expect(provider.name).toBe('openrouter');
     const bodies: string[] = [];
-    const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-      bodies.push(String(init?.body));
+    await withFakeFetchDevice([{ url: '/api/v1/chat/completions', method: 'POST', response: (request) => {
+      bodies.push(request.body ?? '');
       return new Response('data: [DONE]\n\n', { status: 200 });
-    }) as typeof fetch);
-    try {
+    } }], async (device) => {
       for await (const _ of provider.streamChat!(messages)) { /* consume */ }
-    } finally {
-      mock.mockRestore();
-    }
+      expect(device.calls()).toHaveLength(1);
+    });
     expect(bodies).toHaveLength(1);
     expect(JSON.parse(bodies[0]!).reasoning).toEqual({ effort: 'high' });
   } finally {

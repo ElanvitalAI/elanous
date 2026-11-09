@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SEMINAR-REHEARSAL-TS",
+  "path": "src/ux-sim/seminar-rehearsal.ts",
+  "boundary": "Runs the seven-scene rehearsal state machine with injected timing/evidence records, checking fallback and disclosure guards without claiming live rehearsal.",
+  "deviceIds": [
+    "first-run-and-seminar"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 import { debug } from '../debug/log.js';
-import { getUserConfig, type UserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { resolveDaemonHarnessTarget } from './harness-target.js';
 import {
   applyClarifyAnswerToDraft,

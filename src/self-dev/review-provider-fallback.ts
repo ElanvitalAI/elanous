@@ -23,7 +23,7 @@ import { spawnSync } from 'node:child_process';
 import { claudeBackend, resolveBackendSpawn } from '../agent-mission/driver.js';
 import { checkClaudeSubscription } from '../agent-mission/claude-subscription.js';
 import { getAcpBackend, type AcpBackendSpec } from '../acp/backend-registry.js';
-import type { SubscriptionReviewerSpec } from '../user-config.js';
+import type { SubscriptionReviewerSpec } from '../user-config/types.js';
 import { debug } from '../debug/log.js';
 
 export interface TeamclaudeSubscriptionProbe {

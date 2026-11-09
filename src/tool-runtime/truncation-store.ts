@@ -1,7 +1,7 @@
 import { promises as fsp } from 'fs';
 import { join, dirname } from 'path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import type { ChatToolOutputConfig } from '../user-config.js';
+import type { ChatToolOutputConfig } from '../user-config/chat.js';
 
 function defaultToolResultsRoot(): string {
   return join(effectiveInstanceRoot(), 'tool-results');

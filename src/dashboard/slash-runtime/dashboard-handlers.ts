@@ -313,7 +313,7 @@ import type { ToolRuntime } from '../../tool-runtime/types.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import { listSkillNames, describeSkill } from '../../skills/runner.js';
 import { REASONING_CYCLE, effectiveReasoningLevel, nextReasoningLevel, reasoningLevelLabel } from '../../llm.js';
-import type { ReasoningLevel } from '../../user-config.js';
+import type { ReasoningLevel } from '../../user-config/types.js';
 import {
   armSessionQuickControl,
   enterSessionControlMode,
@@ -384,8 +384,6 @@ import { registerClassicSideSlash } from '../side-basic-runtime.js';
 export { registerShellSlash } from './shell-slash.js';
 import { cronSecondDueAt, filterLoopRows, formatLoopsTable, localLoopRows, type LoopsTableRow } from './loops-table.js';
 import { loopCronVerdict } from '../../loops/verdict.js';
-import { checklistBoardSlash } from '../../release-loop/checklist-board.js';
-import type { Checklist } from '../../release-loop/checklist.js';
 import { executeImmediateDashboardSlash } from '../input/slash-executor.js';
 import {
   buildContextSlashCommand,
@@ -1034,8 +1032,6 @@ export interface DashboardSlashContext {
 
   /** Test seam for the local read-only loop and cron registry. */
   loopsLocalRows?: (now: Date) => LoopsTableRow[];
-  /** Test seam for the read-only release checklist. */
-  checklistRead?: (version: string) => Checklist;
 
   sessionSlash: {
     /** opts.remote — when the dashboard is attached to a remote daemon. */
@@ -1186,13 +1182,13 @@ export const DASHBOARD_SLASH_CATALOG_BASELINE = {
     'skills-reload', 'spend', 'squeeze',
     'tk', 'tokens',
     'undo', 'w', 'wd',
-    'ad', 'agent-room', 'api', 'api-allow',
-    'board', 'capture', 'chat', 'claude', 'codex', 'control', 'conv',
+    'ad', 'api', 'api-allow',
+    'chat', 'claude', 'codex', 'control', 'conv',
     'dash', 'dashboard', 'debug', 'default', 'delta', 'design', 'design-check', 'diffs',
-    'directive', 'export', 'fork', 'gemini', 'handoff', 'hist', 'history', 'inject', 'inputs',
-    'lane', 'll', 'local', 'log', 'loops', 'p', 'paste', 'persona', 'plan', 'plugin',
-    'plugins', 'prompt', 'prompts', 'provider', 'qc', 'r', 'reasoning', 'relay',
-    'reply', 'release', 'research', 'resume-turn', 'rewind', 'rs', 'run', 'run-skill', 's', 'showroom',
+    'directive', 'export', 'fork', 'gemini', 'handoff', 'hist', 'history', 'inputs',
+    'll', 'local', 'log', 'loops', 'p', 'paste', 'persona', 'plan', 'plugin',
+    'plugins', 'prompt', 'prompts', 'provider', 'qc', 'r', 'reasoning',
+    'release', 'research', 'resume-turn', 'rewind', 'rs', 'run', 'run-skill', 's',
     'surface', 'sync', 'tablet', 'telegram', 'term', 'terminal', 'tg', 'theme', 'think',
     'widget', 'widgets', 'wish',
   ],
@@ -1422,11 +1418,6 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     loop.schedulerRef.current = scheduler;
     ctx.pushChatLine(ctx.success(`  🔁 /loop 시작 — ${parsed.label} 간격 · 쉬는 동안만 "${prompt}"`));
     ctx.pushChatLine(ctx.muted('  멈추기: /loop stop'));
-    ctx.setChatScrollOffset(-1);
-  });
-
-  registry.register('board', (args, ctx) => {
-    for (const line of checklistBoardSlash(args, ctx.checklistRead).split('\n')) ctx.pushChatLine(line);
     ctx.setChatScrollOffset(-1);
   });
 
@@ -1703,10 +1694,8 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
   });
 
   // ── B-1.d ─────────────────────────────────────────────────────────
-  // 9 deferred skill-tool slashes. All share the fire-and-forget
-  // dynamic-import shape covered by `runDeferredSkillToolSlash`. The
-  // distinct module paths and exporter names are the only per-case
-  // variation.
+  // /remaining is the sole deferred skill-tool slash left here; it uses
+  // the fire-and-forget `runDeferredSkillToolSlash` helper.
 
   // /remaining — 명령(`elanous usage`)이 내는 구조화 산출을 그대로 읽는다. 화면 계산 없음.
   registry.register('remaining', (args, ctx) => {
@@ -1718,73 +1707,6 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     );
   });
 
-
-  // `agent-room` and `showroom` go to the same module but pass distinct
-  // names through to the executor. Two registrations keep the alias
-  // disambiguation explicit (registry handlers don't know which name
-  // matched, so we can't share a single registration).
-  registry.register('agent-room', (args, ctx) => {
-    runDeferredSkillToolSlash(
-      'agent-room',
-      async () => (await import('../../skills/tools/agent-room-slash.js')).executeAgentRoomSlash,
-      args,
-      ctx,
-    );
-  });
-
-  registry.register('showroom', (args, ctx) => {
-    runDeferredSkillToolSlash(
-      'showroom',
-      async () => (await import('../../skills/tools/agent-room-slash.js')).executeAgentRoomSlash,
-      args,
-      ctx,
-    );
-  });
-
-  registry.register('lane', (args, ctx) => {
-    runDeferredSkillToolSlash(
-      'lane',
-      async () => (await import('../../showroom/handoff-slash.js')).executeHandoffSlash,
-      args,
-      ctx,
-    );
-  });
-
-  registry.register('relay', (args, ctx) => {
-    runDeferredSkillToolSlash(
-      'relay',
-      async () => (await import('../../showroom/relay-macro.js')).executeRelaySlash,
-      args,
-      ctx,
-    );
-  });
-
-  registry.register('reply', (args, ctx) => {
-    runDeferredSkillToolSlash(
-      'reply',
-      async () => (await import('../../skills/tools/agent-reply-slash.js')).executeAgentReplySlash,
-      args,
-      ctx,
-    );
-  });
-
-  registry.register('capture', (args, ctx) => {
-    runDeferredSkillToolSlash(
-      'capture',
-      async () => (await import('../../skills/tools/capture-source-slash.js')).executeCaptureSourceSlash,
-      args,
-      ctx,
-    );
-  });
-
-  registry.register('inject', (args, ctx) => {
-    runDeferredSkillToolSlash(
-      'inject',
-      async () => (await import('../../skills/tools/capture-inject-slash.js')).executeCaptureInjectSlash,
-      args,
-      ctx,
-    );
-  });
 
 
   // ── B-1.e ─────────────────────────────────────────────────────────

@@ -1,0 +1,8 @@
+{
+  "path": "scripts/ux-sim.ts",
+  "disposition": "already-indexed",
+  "entryCommand": "bun scripts/ux-sim.ts list",
+  "logsRecorded": "conditional",
+  "logsDetail": "ScenarioV0 runs log completion; list/show are read-only.",
+  "deviceId": "scenario-runner"
+}

@@ -90,6 +90,7 @@ export function buildToolSearchTool(): LLMToolSpec {
       '  - "select:Foo,Bar,Baz" — fetch these exact tools by name or alias\n' +
       '  - "keyword text"       — keyword fuzzy search, up to max_results best matches\n' +
       '  - "+slack send"        — require "slack" in name/desc, rank by remaining terms\n' +
+      '  - "route:release status?" — route natural-language intent to the best plugin tool\n' +
       '\nResult is one `<functions>{"description":..., "name":..., "parameters":{...}}</functions>` ' +
       'block per match — same encoding as the base tool list, so once the schema ' +
       'appears the tool is callable exactly like any pre-loaded tool.',
@@ -98,7 +99,7 @@ export function buildToolSearchTool(): LLMToolSpec {
       properties: {
         query: {
           type: 'string',
-          description: 'select:-style direct selection or free-text keyword search.',
+          description: 'select:-style direct selection, route:<request>, or free-text keyword search.',
         },
         max_results: {
           type: 'number',

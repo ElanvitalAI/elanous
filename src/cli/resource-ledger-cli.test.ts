@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { buildResourceLedgerSnapshot } from './resource-ledger-cli.js';
+import { buildResourceLedgerSnapshot, postResourcePoolDeclaration } from './resource-ledger-cli.js';
 
 test('remote gate process title is matched back to its active resource lease by the ps observer', () => {
   const fp = 'fp_remote123';
@@ -73,4 +73,28 @@ test('recent reclaim view filters by host, lane, and mission and keeps only the 
     'fp_history0019', 'fp_history0017', 'fp_history0013', 'fp_history0011',
     'fp_history0007', 'fp_history0005', 'fp_history0001',
   ]);
+});
+
+test('pool declaration client posts owner bearer without exposing response bodies', async () => {
+  const calls: Request[] = [];
+  const fetcher = (async (input: URL | RequestInfo, init?: RequestInit) => {
+    calls.push(new Request(input, init));
+    return Response.json({ ok: true, created: calls.length === 1 }, { status: calls.length === 1 ? 201 : 200 });
+  }) as unknown as typeof fetch;
+  const pool = { purpose: 'gate' as const, members: [{ host: 'node-c', count: 1, digest: 'sha256:' + 'a'.repeat(64), role: 'both' as const }],
+    fanoutGroupId: 'gate-v1', fanoutGroup: { shard: { kind: 'gate' as const, input: 'in', result: 'out', fingerprint: 'fp' } },
+    fingerprint: { runtime: 'bun', environment: 'linux', skillPacks: [] }, cleanup: { procedure: 'delete', verify: 'absent' } };
+  expect(await postResourcePoolDeclaration(pool, { baseUrl: 'https://nexus.example', bearerToken: 'owner-sentinel-token', fetch: fetcher })).toBe(true);
+  expect(await postResourcePoolDeclaration(pool, { baseUrl: 'https://nexus.example', bearerToken: 'owner-sentinel-token', fetch: fetcher })).toBe(false);
+  expect(calls[0]?.url).toBe('https://nexus.example/v1/resource-ledger/pools');
+  expect(calls[0]?.headers.get('authorization')).toBe('Bearer owner-sentinel-token');
+  expect(await calls[0]?.json()).toEqual({ pool });
+  let refusedMessage = '';
+  try { await postResourcePoolDeclaration(pool, { baseUrl: 'https://nexus.example', bearerToken: 'owner-sentinel-token',
+    fetch: (async () => Response.json({ error: 'owner-sentinel-token' }, { status: 403 })) as unknown as typeof fetch }); }
+  catch (error) { refusedMessage = error instanceof Error ? error.message : ''; }
+  expect(refusedMessage).toBe('resource pool declaration rejected (HTTP 403)');
+  expect(refusedMessage).not.toContain('owner-sentinel-token');
+  await expect(postResourcePoolDeclaration(pool, { baseUrl: 'http://public.example:31415', bearerToken: 'owner-sentinel-token',
+    fetch: (async () => { throw new Error('must not send token'); }) as unknown as typeof fetch })).rejects.toThrow('invalid Nexus base URL');
 });

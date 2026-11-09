@@ -183,11 +183,9 @@ async function handleSharePost(request) {
       }),
     );
 
-    // Redirect the user to the Share page. We pass the shared id in
-    // the query so the page knows which manifest to read. The page
-    // then promotes files into the daemon's `/v1/attachments` and
-    // hands off to /chat.
-    return Response.redirect(`/app/share/?shared=${id}`, 303);
+    // Hand the shared id to Chat, which drains the manifest, uploads
+    // the files and stages them beside the message composer.
+    return Response.redirect(`/app/chat?shared=${encodeURIComponent(id)}`, 303);
   } catch (e) {
     // If anything blows up, surface a minimal HTML page so the user
     // sees a real error instead of a blank tab. The fail-safe is one

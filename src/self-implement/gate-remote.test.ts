@@ -48,6 +48,10 @@ function fakeRunner(opts: { dirty?: boolean; push?: number; ssh?: SshResult | ((
 }
 
 const settings = { ...GATE_REMOTE_DEFAULTS, slotWaitSeconds: 0 };
+// Real process-group contract tests keep the one-second wall limit, but poll and TERM grace are shortened
+// so the supervisor's five-second production polling interval does not dominate every test run.
+const TEST_SUPERVISOR_TIMING = { pollIntervalSeconds: 0.05, termGraceSeconds: 0.05 };
+const TEST_SUPERVISOR_OUTER_TIMEOUT_MS = 6_000;
 const sink = () => { const out: string[] = []; const err: string[] = []; return { out, err, write: { out: (t: string | Uint8Array) => { out.push(typeof t === 'string' ? t : Buffer.from(t).toString()); }, err: (t: string | Uint8Array) => { err.push(typeof t === 'string' ? t : Buffer.from(t).toString()); } } }; };
 
 describe('dispatch decision', () => {
@@ -267,13 +271,19 @@ describe('host lock wiring', () => {
     expect(script).toContain('while [ $n -le 2 ]');
   });
 
+  test('production supervisor defaults retain the wall-limit poll and TERM grace', () => {
+    const script = remoteSupervisorScript(1);
+    expect(script).toContain('  sleep 2');
+    expect(script).toContain('  sleep 5');
+  });
+
   test('supervisor wall limit reaps its own worker group and leaves an unrelated process alive', () => {
     expect(has('perl') && has('ps')).toBe(true);
     const w = slotDir();
     writeFileSync(join(w, 'run.sh'), 'echo $$ > "$W/worker.pid"\nsleep 30\necho done\n');
     const unrelated = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
     try {
-      const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(1), encoding: 'utf8', timeout: 12_000,
+      const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(1, TEST_SUPERVISOR_TIMING), encoding: 'utf8', timeout: TEST_SUPERVISOR_OUTER_TIMEOUT_MS,
         env: { ...process.env, W: w, GATE_REMOTE_SSH_SHELL: String(process.pid) } });
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(124);
@@ -292,7 +302,7 @@ describe('host lock wiring', () => {
     expect(has('perl') && has('ps')).toBe(true);
     const w = slotDir();
     writeFileSync(join(w, 'run.sh'), 'echo $$ > "$W/worker.pid"\ntrap "" TERM\nsleep 30\n');
-    const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(1), encoding: 'utf8', timeout: 12_000,
+    const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(1, TEST_SUPERVISOR_TIMING), encoding: 'utf8', timeout: TEST_SUPERVISOR_OUTER_TIMEOUT_MS,
       env: { ...process.env, W: w, GATE_REMOTE_SSH_SHELL: String(process.pid) } });
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(124);
@@ -304,7 +314,7 @@ describe('host lock wiring', () => {
     expect(has('perl') && has('ps')).toBe(true);
     const w = slotDir();
     writeFileSync(join(w, 'run.sh'), 'echo $$ > "$W/worker.pid"\nexec sleep 30\n');
-    const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(1), encoding: 'utf8', timeout: 12_000,
+    const result = spawnSync('sh', ['-s'], { input: remoteSupervisorScript(1, TEST_SUPERVISOR_TIMING), encoding: 'utf8', timeout: TEST_SUPERVISOR_OUTER_TIMEOUT_MS,
       env: { ...process.env, W: w, GATE_REMOTE_SSH_SHELL: String(process.pid) } });
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(124);
@@ -1052,7 +1062,11 @@ describe('remote run and fallback', () => {
     expect(script).toContain(`git update-ref refs/remotes/origin/main ${MAIN}`);
     expect(script).toContain('ELANOUS_STATE_DIR="$W/state"');
     expect(script).toContain('ELANOUS_GATE_REMOTE_CHILD=1');
-    expect(script).toContain('trap \'rm -rf "$W"\' EXIT');
+    expect(script).toContain('realpath -e "$W"');
+    expect(script).toContain('find -P "$target" -type d -exec chmod u+rwx {} \\;');
+    expect(script).toContain('ELANOUS_MODULE_ROOT=$(dirname "$(readlink -f "$(command -v eln)")")/../current/node_modules/elanous');
+    expect(script).toContain('dependency-scratch.cleanup-failed');
+    expect(script).not.toContain('$W/t/src/git-fs/worktree.ts');
     expect(script).not.toContain('apps/pwa');
     const outcome = runOnRemote({ repo: '/r', host: 'node-b', mirror: '~/mirror/elanous-agent.git', argv: ['x'], refs: ['origin/main'] }, fakeRunner());
     expect(outcome).toMatchObject({ kind: 'ran', rc: 0, commit: HEAD });
@@ -1247,7 +1261,12 @@ describe('the whole remote script, executed (no ssh)', () => {
     const home = join(root, 'home');
     mkdirSync(join(home, '.bun', 'bin'), { recursive: true });
     writeFileSync(join(home, '.bun', 'bin', 'bun'), '#!/bin/sh\necho "bun $*" >> "$W/bun.calls"\nexit 0\n', { mode: 0o755 });
-    const hostEnv = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: home };
+    const sharedStore = join(root, 'persistent-shared-store');
+    mkdirSync(sharedStore);
+    const sharedFile = join(sharedStore, 'index.js');
+    writeFileSync(sharedFile, 'persistent');
+    chmodSync(sharedFile, 0o444);
+    const hostEnv = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: home, CLEANUP_SHARED_STORE: sharedStore };
     const runner: GateRemoteRunner = {
       local(cmd, args, cwd, options) {
         // The push goes to the local bare mirror path instead of host:path.
@@ -1260,18 +1279,26 @@ describe('the whole remote script, executed (no ssh)', () => {
         return { rc: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
       },
     };
-    const tool = 'printf "%s|%s|" "$(git rev-parse HEAD)" "$(git rev-parse origin/main)"; cat marker.txt; test -s "$W/bun.calls" && echo installed; printf "tmp=%s scratch=%s\\n" "$TMPDIR" "$W"; echo "tool err" >&2; exit 3';
+    const tool = 'mkdir -p "$W/state/worktree-deps/readonly/nested"; printf cache > "$W/state/worktree-deps/readonly/nested/cache.js"; ln -s "$CLEANUP_SHARED_STORE" "$W/state/worktree-deps/shared-link"; chmod 000 "$W/state/worktree-deps/readonly/nested" "$W/state/worktree-deps/readonly" "$W/state/worktree-deps"; printf "%s|%s|" "$(git rev-parse HEAD)" "$(git rev-parse origin/main)"; cat marker.txt; test -s "$W/bun.calls" && echo installed; printf "tmp=%s scratch=%s\\n" "$TMPDIR" "$W"; echo "tool err" >&2; exit 3';
     const outcome = runOnRemote({ repo, host: 'h', mirror, argv: ['sh', '-c', tool], slotDir: join(root, 'slots') }, runner);
     expect(outcome).toMatchObject({ kind: 'ran', rc: 3, commit: head });
     if (outcome.kind !== 'ran') return;
     expect(outcome.stdout.toString().startsWith(`${head}|${base}|head\ninstalled\n`)).toBe(true);
     expect(outcome.stdout.toString()).toContain('tmp=/var/tmp scratch=/var/tmp/elanous-gate-remote-');
+    const firstScratch = outcome.stdout.toString().match(/scratch=(\S+)/)?.[1];
+    expect(firstScratch).toBeTruthy();
+    expect(existsSync(firstScratch!)).toBe(false);
+    expect(statSync(sharedFile).mode & 0o777).toBe(0o444);
     expect(outcome.stderr.toString()).toBe('tool err\n');
     writeFileSync(join(repo, 'marker.txt'), 'dirty\n');
     const pinned = runOnRemote({ repo, host: 'h', mirror, commit: base, argv: ['sh', '-c', tool], slotDir: join(root, 'slots') }, runner);
     expect(pinned).toMatchObject({ kind: 'ran', rc: 3, commit: base });
     if (pinned.kind !== 'ran') return;
     expect(pinned.stdout.toString().startsWith(`${base}|${base}|base\ninstalled\n`)).toBe(true);
+    const pinnedScratch = pinned.stdout.toString().match(/scratch=(\S+)/)?.[1];
+    expect(pinnedScratch).toBeTruthy();
+    expect(existsSync(pinnedScratch!)).toBe(false);
+    expect(statSync(sharedFile).mode & 0o777).toBe(0o444);
     expect(pinned.stdout.toString()).toContain('tmp=/var/tmp scratch=/var/tmp/elanous-gate-remote-');
   });
 });

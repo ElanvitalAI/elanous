@@ -13,7 +13,7 @@ const resumeReleaseRun: typeof runResumeReleaseRun = (opts, deps = {}) => runRes
 });
 import { debug } from '../../src/debug/log.js';
 import { assertReleaseResumeApprovalBoundary, releaseFanOutForkIndex, releaseResumeGatePodPool, releaseResumeWaiver } from './resume.js';
-import { readWaiverEvents } from '../../src/release-loop/waiver-events.js';
+import { appendWaiverEvents, gateWaiverEvidence, issueGateWaiverEvent, readWaiverEvents } from '../../src/release-loop/waiver-events.js';
 import { BLOCKING_METRIC_NAMES } from './auto-approve-node.js';
 import { runPublish } from './publish-node.js';
 import { runKnownIssues } from './known-issues-node.js';
@@ -63,7 +63,9 @@ test('waive the failed tui node on the saved release path; record the original f
   const docsTree = join(root, 'docs-tree');
   const notes = join(docsTree, 'release/public/docs/releases', `${VERSION}.md`);
   const runBash = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
-    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: Record<string, unknown> };
+    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as {
+      nodeId: string; input: Record<string, unknown>; outputs?: Record<string, { outcome?: string }>;
+    };
     seen.push(ctx);
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     if (ctx.nodeId === 'tui') return { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}\n', stderr: '' };
@@ -155,7 +157,7 @@ test('a waived tui whose recorded failure has exit null (killed or timed out) st
   const notes = join(docsTree, 'release/public/docs/releases', `${VERSION}.md`);
   const waiverReason = 'The app may remain open after an interrupted launch';
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
-    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string };
+    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; outputs?: { gate?: { outcome?: string } } };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     if (ctx.nodeId === 'tui') return { exitCode: 1, stdout: '{"outcome":"fail","summary":"help-closes"}\n', stderr: '' };
     if (ctx.nodeId === 'docs') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', branch: `release-docs/${VERSION}`, worktree: docsTree }) + '\n', stderr: '' };
@@ -215,7 +217,9 @@ test('accepted regressions without a waiver are persisted and delivered to the g
   const seen: Array<{ nodeId: string; input: Record<string, unknown> }> = [];
   let tuiVisits = 0;
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
-    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: Record<string, unknown> };
+    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as {
+      nodeId: string; input: Record<string, unknown>; outputs?: Record<string, { outcome?: string }>;
+    };
     seen.push(ctx);
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
     if (ctx.nodeId === 'tui' && ++tuiVisits === 1) return { exitCode: 1, stdout: '{"outcome":"fail"}', stderr: '' };
@@ -246,7 +250,11 @@ test('a waived tui keeps its recorded issue while failed publish waits at approv
   let docsVisits = 0;
   const seen: Array<{ nodeId: string; input: Record<string, unknown> }> = [];
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
-    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: Record<string, unknown> };
+    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as {
+      nodeId: string;
+      input: Record<string, unknown>;
+      outputs?: Record<string, { outcome?: string }>;
+    };
     seen.push(ctx);
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
     if (ctx.nodeId === 'tui') return ++tuiVisits === 1
@@ -302,7 +310,7 @@ test('restarting before a waived tui (from mac-smoke) keeps its issue while publ
   let docsVisits = 0;
   const seen: Array<{ nodeId: string; input: Record<string, unknown> }> = [];
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
-    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: Record<string, unknown> };
+    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: Record<string, unknown>; outputs?: Record<string, { outcome?: string }> };
     seen.push(ctx);
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }), stderr: '' };
     if (ctx.nodeId === 'tui') return ++tuiVisits === 1
@@ -478,12 +486,18 @@ test('release resume --gate-pod-pool updates the saved run input before re-runni
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   const gateContexts: Array<{ nodeId: string; input: Record<string, unknown> }> = [];
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
-    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: Record<string, unknown> };
+    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; input: Record<string, unknown>; outputs?: Record<string, { outcome?: string }> };
     if (ctx.nodeId === 'gate') {
       gateContexts.push(ctx);
       return gateContexts.length === 1
         ? { exitCode: 2, stdout: '{"outcome":"error","verdict":"fail","summary":"pool unavailable"}\n', stderr: '' }
         : { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
+    }
+    if (ctx.nodeId === 'receipt-audit') {
+      const gate = ctx.outputs?.['residual-run'] ?? ctx.outputs?.gate;
+      const outcome = gate?.outcome === 'error' ? 'error' : gate?.outcome === 'ok' ? 'ok' : 'fail';
+      return { exitCode: outcome === 'ok' ? 0 : outcome === 'error' ? 2 : 1,
+        stdout: JSON.stringify({ outcome, verdict: outcome === 'ok' ? 'pass' : 'fail', summary: 'fixture receipt audit' }) + '\n', stderr: '' };
     }
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
@@ -507,7 +521,7 @@ test('release resume --gate-pod-pool updates the saved run input before re-runni
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 120_000);
 
-test('gate waiver requires a complete verdict and exact coverage of every introduced ID', () => {
+test('measured gate regressions are never waivable while stopped or incomplete runs remain unmeasured', () => {
   const ids = ['src/a.test.ts > first failure', 'src/b.test.ts > second failure'];
   const reason = 'Known gate failures remain in this release. Users may encounter these issues during normal use.';
   const stateFor = (output: Record<string, unknown>, executed = true) => ({
@@ -524,7 +538,9 @@ test('gate waiver requires a complete verdict and exact coverage of every introd
   const verdict = { outcome: 'fail', verdict: 'fail', introduced: ids, preexisting: 2, knownEnv: 0, durationMs: 12_000,
     stalledEnv: [], stalledShards: [], unmeasuredRecheckFiles: [], unmeasuredErrors: [], rcNonzeroNoFailures: [], abortedShards: 0 };
   expect(() => releaseResumeWaiver(stateFor(verdict), { from: 'gate', waive: 'gate', reason, approvedBy: 'OP',
-    acceptedRegressions: [{ id: ids[0]!, note: 'Failure remains' }] })).toThrow(ids[1]!);
+    acceptedRegressions: [{ id: ids[0]!, note: 'Failure remains' }] })).toThrow('measured gate regressions cannot be waived');
+  expect(() => releaseResumeWaiver(stateFor(verdict), { from: 'gate', waive: 'gate', reason, approvedBy: 'OP',
+    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })).toThrow('measured gate regressions cannot be waived');
   const unmeasured = { ...verdict, outcome: 'error', introduced: [], error: 'pod sweep incomplete', stalledShards: [{ reason: 'no-output' }] };
   expect(releaseResumeWaiver(stateFor(unmeasured), { from: 'gate', waive: 'gate', reason,
     acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })?.unmeasured).toContain('sweep incomplete');
@@ -547,14 +563,10 @@ test('gate waiver requires a complete verdict and exact coverage of every introd
     acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })).toThrow(/failed executable node/);
   const missingCompleteness = { ...verdict }; delete (missingCompleteness as Record<string, unknown>).rcNonzeroNoFailures;
   expect(() => releaseResumeWaiver(stateFor(missingCompleteness), { from: 'gate', waive: 'gate', reason, approvedBy: 'OP',
-    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })).toThrow('complete measured regression verdict');
+    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })).toThrow('measured gate regressions cannot be waived');
   const malformedCompleteness = { ...verdict, unmeasuredErrors: 'none' };
   expect(() => releaseResumeWaiver(stateFor(malformedCompleteness), { from: 'gate', waive: 'gate', reason, approvedBy: 'OP',
-    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })).toThrow('complete measured regression verdict');
-  const waived = releaseResumeWaiver(stateFor(verdict), { from: 'gate', waive: 'gate', reason, approvedBy: 'OP',
-    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) });
-  expect(waived).toMatchObject({ nodeId: 'gate', reason, approvedBy: 'OP', introducedIds: ids, acceptedRegressions: [...ids.map((id) => ({ id, note: 'Failure remains' })),
-    { id: 'waive:gate', note: reason }] });
+    acceptedRegressions: ids.map((id) => ({ id, note: 'Failure remains' })) })).toThrow('measured gate regressions cannot be waived');
 });
 
 test('waiver rejects unrecorded nodes, unsafe side effects, invalid input and duplicate public issue IDs', () => {
@@ -583,60 +595,119 @@ test('waiver rejects unrecorded nodes, unsafe side effects, invalid input and du
 });
 
 
-test('release resume CLI owner waiver runs a valid malformed-schema gate through publish and fails closed without either approval field', async () => {
+test('release resume graph consumes the exact gate-waiver event and routes its named waived gate outcome', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-owner-waive-cli-'));
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   const trafficFile = join(root, 'traffic.json');
   const cutTip = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8' }).stdout.trim();
   const reason = 'Known gate failures remain in this release. Users may encounter these issues during normal use.';
   const lines: string[] = [];
+  let mutateSavedGateBeforeGraph = false;
+  let savedRunStatePath = '';
+  let receiptAuditRuns = 0;
   const write = process.stdout.write;
   process.stdout.write = ((value: string | Uint8Array) => { lines.push(String(value).trim()); return true; }) as typeof process.stdout.write;
   const runBash = async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
-    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string };
+    const ctx = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { nodeId: string; outputs?: { gate?: { outcome?: string } } };
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: cutTip, branch: `release/${VERSION}` }) + '\n', stderr: '' };
-    if (ctx.nodeId === 'gate') return { exitCode: 1, stdout: '{"outcome":"fail","introduced":1,"introducedIds":[]}\n', stderr: '' };
+    // The gate output may not carry a commit; the event remains bound to the saved release cut.
+    if (ctx.nodeId === 'gate') return { exitCode: 1, stdout: JSON.stringify({ outcome: 'error', commit: cutTip, introduced: [], introducedIds: [], error: 'pod sweep incomplete: worker interrupted' }) + '\n', stderr: '' };
+    // The first incomplete gate is rejected by receipt auditing; its owner-waived retry gets a complete synthetic audit.
+    if (ctx.nodeId === 'receipt-audit' && receiptAuditRuns++ === 0) return { exitCode: 2, stdout: JSON.stringify({ outcome: 'error', verdict: 'fail', summary: 'gate sweep incomplete' }) + '\n', stderr: '' };
     return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
   };
-  const deps = { root, repo: join(import.meta.dir, '../..'), graphPath, runBash, trafficFile, ledgerRoot: root, isAncestor: () => true,
+  const graph = async (...args: Parameters<typeof runGraph>) => {
+    const [path, options] = args;
+    if (mutateSavedGateBeforeGraph && options?.releaseWaiver) {
+      const diskState = JSON.parse(readFileSync(savedRunStatePath, 'utf8')) as GraphRunState;
+      const gate = diskState.nodes.find((node) => node.nodeId === 'gate')!;
+      gate.output = JSON.stringify({ outcome: 'error', commit: cutTip, introduced: [], introducedIds: [], error: 'pod sweep incomplete: a different worker stopped' }) + '\n';
+      writeFileSync(savedRunStatePath, JSON.stringify(diskState, null, 2) + '\n');
+      mutateSavedGateBeforeGraph = false;
+    }
+    return runGraph(path, options);
+  };
+  const deps = { root, repo: join(import.meta.dir, '../..'), graphPath, runBash, graph, trafficFile, ledgerRoot: root, isAncestor: () => true,
     git: (args: string[]) => args[0] === 'ls-remote' ? `${cutTip}\trefs/heads/release/${VERSION}` : args[0] === 'rev-parse' ? cutTip : '' };
   setElanousConfigDir(root);
   try {
     writeFileSync(trafficFile, '{}\n');
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18' }, deps: { root, runBash } });
+    savedRunStatePath = first.statePath;
     expect(first.status).toBe('failed');
     const before = readFileSync(first.statePath, 'utf8');
     const invoke = async (args: string[]) => {
       process.exitCode = 0; lines.length = 0;
       const command = new Command();
       registerReleaseCommands(command, {}, {}, {}, {}, {}, deps);
-      await command.parseAsync(['release', 'resume', '--run', first.runId, '--json', ...args], { from: 'user' });
+      await command.parseAsync(['release', 'resume', '--run', first.runId, '--json', ...args, '--no-partial'], { from: 'user' });
       return JSON.parse(lines.at(-1)!) as { ok?: boolean; error?: string; status?: string };
     };
     expect((await invoke(['--owner-waive', 'gate', '--reason', reason])).error).toContain('--owner-waive requires --approved-by');
     expect((await invoke(['--owner-waive', 'gate', '--approved-by', 'OP'])).error).toContain('--owner-waive requires --reason');
     expect(readFileSync(first.statePath, 'utf8')).toBe(before);
+    const actor = 'OP';
+    const expectedWaiverEvidence = gateWaiverEvidence({ reason, actor, unmeasured: 'sweep incomplete: pod sweep incomplete: worker interrupted' });
+    const issuedAt = Date.now();
+    const staleSuperset = issueGateWaiverEvent({ mode: 'operational', target: `run:${first.runId}`, head: cutTip,
+      evidence: [`saved-run:${first.statePath}`, ...expectedWaiverEvidence, 'gate-waiver:unmeasured:previous failure detail'],
+      actor, issuedAt, expiresAt: issuedAt + 86_400_000 });
+    appendWaiverEvents(join(root, 'review-results', 'waiver-events.jsonl'), [staleSuperset]);
+    mutateSavedGateBeforeGraph = true;
+    const staleRequest = await invoke(['--owner-waive', 'gate', '--approved-by', 'OP', '--reason', reason]);
+    expect(staleRequest.error).toContain('release waiver input changed before restart');
+    const staleState = JSON.parse(readFileSync(first.statePath, 'utf8')) as GraphRunState;
+    const staleEvents = readWaiverEvents(join(root, 'review-results', 'waiver-events.jsonl'));
+    expect(staleEvents.every((event) => event.uses === 0)).toBe(true);
+    expect(staleState.nodes.find((node) => node.nodeId === 'gate')?.output).toContain('different worker stopped');
+    writeFileSync(first.statePath, before);
     const result = await invoke(['--owner-waive', 'gate', '--approved-by', 'OP', '--reason', reason]);
     expect(result).toMatchObject({ ok: true, status: 'done' });
     const saved = JSON.parse(readFileSync(first.statePath, 'utf8')) as GraphRunState;
-    expect(readWaiverEvents(join(root, 'review-results', 'waiver-events.jsonl'))).toMatchObject([
-      { kind: 'gate', target: `run:${first.runId}`, head: cutTip, actor: 'OP', uses: 1, expiredBy: 'used',
-        evidence: expect.arrayContaining([expect.stringContaining('Known gate failures remain')]) },
-    ]);
+    const waiverEvents = readWaiverEvents(join(root, 'review-results', 'waiver-events.jsonl'));
+    expect(waiverEvents.find((event) => event.eventId === staleSuperset.eventId)).toMatchObject({ uses: 0 });
+    expect(waiverEvents.find((event) => event.uses === 1)).toMatchObject({
+      kind: 'gate', target: `run:${first.runId}`, head: cutTip, actor: 'OP', expiredBy: 'used',
+      evidence: expect.arrayContaining([expect.stringContaining('Known gate failures remain')]),
+    });
+    expect(waiverEvents).toHaveLength(2);
     expect(saved.path).toContain('publish');
     const gate = saved.nodes.find((node) => node.nodeId === 'gate');
     expect(JSON.parse(String(gate?.output))).toMatchObject({ outcome: 'ok', verdict: 'owner-waived', approvedBy: 'OP', reason });
-    expect(gate).toMatchObject({ ok: true, executed: false, waiver: { ownerWaived: true, approvedBy: 'OP', reason } });
+    expect(gate).toMatchObject({ ok: true, executed: false, waiver: { reason } });
+    expect(saved.path[saved.path.indexOf('gate') + 1]).toBe('receipt-audit');
+    expect(saved.nodes.find((node) => node.nodeId === 'receipt-audit')).toMatchObject({ ok: true, executed: true });
     expect(saved.fanOuts?.['traffic-gate-passed:ok']?.branches.pwa).toMatchObject({ status: 'done' });
     expect(saved.nodes.find((node) => node.nodeId === 'prepare')).toMatchObject({ ok: true, executed: true });
   } finally { process.stdout.write = write; process.exitCode = 0; resetElanousConfigDir(); rmSync(root, { recursive: true, force: true }); }
 }, 60_000);
-test('owner gate waiver accepts malformed introducedIds output only with explicit approver and reason', () => {
+test('owner gate waiver rejects every nonempty or malformed measured regression signal', () => {
   const state = { path: ['version-release', 'gate', 'gate-triage', 'failed'], nodes: [
     { nodeId: 'version-release', ok: true, executed: true },
     { nodeId: 'gate', ok: false, executed: true, exit: 1, output: '{"outcome":"fail","introduced":1,"introducedIds":[]}' },
     { nodeId: 'gate-triage', ok: true, executed: true }, { nodeId: 'failed', ok: false, executed: true },
   ], input: { version: '0.3.0', acceptedRegressions: [] } } as unknown as GraphRunState;
+  for (const signal of [
+    { introduced: 1, introducedIds: [] },
+    { introduced: ['src/a.test.ts > regression'] },
+    { introduced: ['src/a.test.ts > regression', ''] },
+    { introducedIds: ['src/a.test.ts > regression'] },
+  ]) {
+    const measured = structuredClone(state);
+    measured.nodes[1]!.output = JSON.stringify({ outcome: 'fail', ...signal });
+    expect(() => releaseResumeWaiver(measured, { from: 'gate', ownerWaive: 'gate', reason: 'Owner approved known gate risk.', approvedBy: 'OP' }))
+      .toThrow('measured gate regressions cannot be waived');
+  }
+  const completeMeasuredNoRegressions = structuredClone(state);
+  completeMeasuredNoRegressions.nodes[1]!.output = JSON.stringify({ outcome: 'fail', verdict: 'fail', introduced: [], introducedIds: [],
+    preexisting: 0, knownEnv: 0, durationMs: 1, error: '', stalledShards: [], stalledEnv: [], unmeasuredRecheckFiles: [],
+    unmeasuredErrors: [], rcNonzeroNoFailures: [], abortedShards: 0 });
+  expect(() => releaseResumeWaiver(completeMeasuredNoRegressions, { from: 'gate', ownerWaive: 'gate',
+    reason: 'Owner approved known gate risk.', approvedBy: 'OP' })).toThrow('owner gate waiver requires an unmeasured gate');
+  const unmeasured = structuredClone(state);
+  unmeasured.nodes[1]!.output = JSON.stringify({ outcome: 'error', introduced: [], introducedIds: [], error: 'pod sweep incomplete: worker interrupted' });
   expect(() => releaseResumeWaiver(state, { from: 'gate', ownerWaive: 'gate', reason: 'Owner approved known gate risk.' })).toThrow('--owner-waive requires --approved-by');
-  expect(releaseResumeWaiver(state, { from: 'gate', ownerWaive: 'gate', reason: 'Owner approved known gate risk.', approvedBy: 'OP' })).toMatchObject({ nodeId: 'gate', approvedBy: 'OP', ownerWaived: true, acceptedRegressions: [{ id: 'waive:gate', note: 'Owner approved known gate risk.' }] });
+  expect(releaseResumeWaiver(unmeasured, { from: 'gate', ownerWaive: 'gate', reason: 'Owner approved known gate risk.', approvedBy: 'OP' }))
+    .toMatchObject({ nodeId: 'gate', approvedBy: 'OP', ownerWaived: true, unmeasured: 'sweep incomplete: pod sweep incomplete: worker interrupted',
+      acceptedRegressions: [{ id: 'waive:gate', note: 'Owner approved known gate risk.' }] });
 });

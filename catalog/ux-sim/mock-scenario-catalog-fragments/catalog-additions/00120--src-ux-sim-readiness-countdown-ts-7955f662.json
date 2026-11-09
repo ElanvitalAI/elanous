@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/readiness-countdown.ts",
+  "reason": "COORD-READINESS-COUNTDOWN simulator-first contract probe for RLA-LAUNCH-COUNTDOWN-PHASES."
+}

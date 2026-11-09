@@ -1,5 +1,5 @@
 import { maybeHandleAmbientTextIntake } from '../ambient.js';
-import type { IntakeAmbientCaptureMode } from '../../user-config.js';
+import type { IntakeAmbientCaptureMode } from '../../user-config/types.js';
 
 const LINEAR_SECRETARY_INTENT = /(?:리니어|linear)(?:로|에|에다)?\s*(?:등록해(?:줘요?|주세요)?|정리해(?:줘요?|주세요)|쪼개(?:줘요?|주세요)|맡겨(?:줘요?|주세요)|만들어(?:줘요?|주세요))(?!\s*(?:라고|하던데|했는데|하라던데|해달라고|하라며))/i;
 

@@ -16,7 +16,7 @@ import {
 import { buildDiscordSelfOnMessage } from '../src/discord-self-message.js';
 import type { DcIncoming } from '../src/discord.js';
 import type { RunTurnResult } from '../src/session/chat.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 
 let root: string;
 beforeEach(() => {

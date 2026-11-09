@@ -31,11 +31,8 @@ import { isHeadlessEnv, spawnCodexLogin, type CodexLoginResult } from './acp/cod
 import { getRunContext, type RunContext } from './agent/run-context.js';
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
-import {
-  type UserConfig, type LLMProviderName, type SkillSetName,
-  saveUserConfig, markOnboardingComplete, buildUserConfig,
-  skillSetDir, SKILL_SET_NAMES, userConfigPath, urlRoutingDefaults, devRequestRoutingDefaults, defaultSkillDirs, resolveSkillSources,
-} from './user-config.js';
+import { saveUserConfig, markOnboardingComplete, buildUserConfig, skillSetDir, SKILL_SET_NAMES, userConfigPath, urlRoutingDefaults, devRequestRoutingDefaults, defaultSkillDirs, resolveSkillSources } from './user-config.js';
+import type { UserConfig, LLMProviderName, SkillSetName } from './user-config/types.js';
 import {
   GROK_MODEL, OPENAI_MODEL, ANTHROPIC_MODEL, LOCAL_LLM_MODEL, GEMINI_MODEL,
   KIMI_MODEL, QWEN_MODEL, GLM_MODEL, OPENROUTER_MODEL,

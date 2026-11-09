@@ -1,15 +1,19 @@
-import { expect, setDefaultTimeout, test } from 'bun:test';
+import { afterEach, expect, setDefaultTimeout, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createGateRunner, type GateRunner } from './gate-node.js';
-import { appendGateShardLedgerBatch, gateShardLedgerPath, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
+import { createGateRunner, parseOptions, runGateNode, type GateRunner, type GateTools } from './gate-node.js';
+import { hardRehearsalGateArgs, hardRehearsalGateVersion } from './gate-radius-live.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
+import { appendGateShardLedgerBatch, gateShardLedgerPath, readGateShardLedger, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import type { PodCommandResult } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 
 setDefaultTimeout(60_000);
+const originalCwd = process.cwd();
+afterEach(() => process.chdir(originalCwd));
 
 const BASE = 'b'.repeat(40);
 const ENV = 'c'.repeat(64);
@@ -24,8 +28,10 @@ const EXECUTION_IDENTITY = { imageDigest: IMAGE, bunVersion: '1.4.2', platform: 
 function sourceTree(root: string): string {
   const repo = join(root, 'repo');
   mkdirSync(join(repo, 'src'), { recursive: true });
+  mkdirSync(join(repo, 'apps', 'pwa'), { recursive: true });
   writeFileSync(join(repo, 'package.json'), '{"name":"gate-ledger-sim","version":"1.0.0"}\n');
   writeFileSync(join(repo, 'bun.lock'), 'lockfileVersion = 1\n');
+  writeFileSync(join(repo, 'apps', 'pwa', 'bun.lock'), '{"lockfileVersion":1,"configVersion":1,"workspaces":{"":{"name":"sim-pwa"}},"packages":{}}\n');
   writeFileSync(join(repo, TEST_FILE), "import { test } from 'bun:test';\ntest('ledger sim', () => {});\n");
   for (const args of [['init', '-q'], ['config', 'user.name', 'Gate ledger sim'], ['config', 'user.email', 'sim@example.invalid'], ['add', '.'], ['commit', '-qm', 'gate ledger simulation']]) {
     const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
@@ -38,9 +44,17 @@ function runCommit(repo: string): string {
   return spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).stdout.trim();
 }
 
-function makeRunner(repo: string, podCalls: string[], ledgerBatchFailure = false): GateRunner {
+function makeRunner(repo: string, podCalls: string[], ledgerBatchFailure = false, graphRunId?: string, runId?: string): GateRunner {
+  return createGateRunner(repo, undefined, undefined, undefined, undefined, undefined, {
+    ...makeGateTools(repo, podCalls, ledgerBatchFailure),
+    graphRunId: graphRunId ?? null, runId: runId ?? null,
+  });
+}
+
+function makeGateTools(repo: string, podCalls: string[], ledgerBatchFailure = false): GateTools {
   const command: GateRunner['command'] = async (cmd, args, cwd) => {
     if (cmd === 'bun' && args[0] === 'run') return { rc: 0, output: '1 pass\n0 fail\nRan 1 test across 1 file.\n' };
+    if (cmd === 'bun' && args[0] === 'install') return { rc: 0, output: 'simulated bun install\n' };
     if (cmd === 'rg') return { rc: 1, output: '' };
     const result = spawnSync(cmd, args, { cwd, encoding: 'utf8' });
     return { rc: result.status ?? 2, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
@@ -62,18 +76,21 @@ function makeRunner(repo: string, podCalls: string[], ledgerBatchFailure = false
     writeFileSync(join(artifactsDir, 'install.log'), '');
     return { exitCode: 0, artifactsDir, job: `sim-${podCalls.length}` };
   };
-  const tools = {
-    graphRecipePins: () => GRAPH_PINS,
-    podImageDigest: () => IMAGE,
-    remoteRun: (_host: string, script: string) => ({ status: 0, stdout: script === 'uname -s' ? 'Linux\n' : '', stderr: '' }),
-    appendShardLedgerBatch: (path: string, rows: readonly GateShardLedgerRow[], required: boolean, batchId?: ReturnType<typeof randomUUID>) => {
-      if (ledgerBatchFailure) throw new Error('simulated HQ append outage');
-      return appendGateShardLedgerBatch(path, rows, required, batchId);
-    },
+  return {
+      command,
+      podCommand,
+      poolOverride: new PodPoolScheduler([
+        // Source: #36029 gate-ledger simulation models one remote slot so shard reuse order is deterministic.
+        { context: 'gate-sim', sshHost: 'sim-remote', capacity: 1, k3dCluster: 'gate-sim' },
+      ]),
+      graphRecipePins: () => GRAPH_PINS,
+      podImageDigest: () => IMAGE,
+      remoteRun: (_host: string, script: string) => ({ status: 0, stdout: script === 'uname -s' ? 'Linux\n' : '', stderr: '' }),
+      appendShardLedgerBatch: (path: string, rows: readonly GateShardLedgerRow[], required: boolean, batchId?: ReturnType<typeof randomUUID>) => {
+        if (ledgerBatchFailure) throw new Error('simulated HQ append outage');
+        return appendGateShardLedgerBatch(path, rows, required, batchId);
+      },
   };
-  return createGateRunner(repo, undefined, command, podCommand, new PodPoolScheduler([
-    { context: 'gate-sim', sshHost: 'sim-remote', capacity: 1, k3dCluster: 'gate-sim' },
-  ]), undefined, tools);
 }
 
 function podOptions(repo: string, ledgerPath: string, logDir: string) {
@@ -123,9 +140,104 @@ test('GATE-LEDGER-HQ-SINGLE sim: append loss holds remote gates; resumed cuts us
     const invalidRcLedger = gateShardLedgerPath(VERSION, join(root, 'invalid-rc-hq'));
     expect(appendGateShardLedgerBatch(invalidRcLedger, [{ ...row, rc: 2 }], true, '00000000-0000-4000-8000-000000000002')).toBeNull();
     const invalidRcCalls: string[] = [];
-    const invalidRcRunner = makeRunner(repo, invalidRcCalls);
+    const graphRunId = 'gate-ledger-hq-single-sim-run';
+    const invalidRcRunner = makeRunner(repo, invalidRcCalls, false, graphRunId);
     const invalidRcLogDir = join(root, 'invalid-rc-logs');
     await invalidRcRunner.sweep(repo, invalidRcLogDir, podOptions(repo, invalidRcLedger, invalidRcLogDir));
     expect(invalidRcCalls, 'an HQ batch with an unexpected exit code must be rerun').toEqual(['pod']);
+    const persisted = readGateShardLedger(invalidRcLedger);
+    expect(persisted?.rows.some((entry) => entry.state === 'done' && entry.runId === graphRunId),
+      'the rerun writes a completed HQ row scoped to this release run').toBe(true);
+    expect(persisted?.rows.some((entry) => entry.runId === graphRunId), 'raw HQ JSONL row remains queryable by its release run').toBe(true);
+    expect(readFileSync(invalidRcLedger, 'utf8')).toContain(`"runId":"${graphRunId}"`);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-LEDGER-HQ-SINGLE sim: hard-rehearsal CLI run scope reaches HQ plan, execution, and reuse rows', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-ledger-hard-cli-sim-'));
+  try {
+    const repo = sourceTree(root);
+    const commit = runCommit(repo);
+    const runId = 'hard-00000000-0000-4000-8000-000000000001';
+    const args = [...hardRehearsalGateArgs('0.3.8', runId, commit, '0.3.7', 'sim-pool:1').slice(1), '--baseline-commit', commit];
+    const gateVersion = hardRehearsalGateVersion('0.3.8', runId);
+    const podCalls: string[] = [];
+    const instanceRoot = join(root, 'instance');
+    const ledgerPath = gateShardLedgerPath(gateVersion, instanceRoot);
+    const priorCwd = process.cwd();
+    const priorStateDir = process.env.ELANOUS_STATE_DIR;
+    process.chdir(repo);
+    process.env.ELANOUS_STATE_DIR = instanceRoot;
+    setElanousConfigDir(instanceRoot);
+    const gateTools = makeGateTools(repo, podCalls);
+    try {
+      // Default CLI → judge → createGateRunner → sweep path; only GateTools external boundaries are simulated.
+      expect(await runGateNode(args, { ELANOUS_STATE_DIR: instanceRoot }, undefined, undefined, () => IMAGE, undefined, gateTools)).toBe(0);
+    } finally {
+      process.chdir(priorCwd);
+      if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = priorStateDir;
+      resetElanousConfigDir();
+    }
+    const afterExecution = readGateShardLedger(ledgerPath);
+    expect(afterExecution?.malformed).toBe(0);
+    expect(afterExecution?.rows.every((row) => row.runId === runId), 'CLI run id is persisted on every HQ plan/execution event').toBe(true);
+    expect(afterExecution?.rows.some((row) => row.state === 'pending'), 'HQ ledger includes the planned event').toBe(true);
+    expect(afterExecution?.rows.some((row) => row.state === 'done' && row.ran === 1), 'HQ ledger includes measured execution').toBe(true);
+
+    // Repeat the actual direct hard-rehearsal CLI invocation. A separate graph context with the
+    // same run ID would miss regressions in direct-CLI scope propagation and HQ reuse rows.
+    const priorCwdForReuse = process.cwd();
+    const priorStateDirForReuse = process.env.ELANOUS_STATE_DIR;
+    process.chdir(repo);
+    process.env.ELANOUS_STATE_DIR = instanceRoot;
+    setElanousConfigDir(instanceRoot);
+    try {
+      // Keep the Pod shard receipt, but remove the separate file-CAS copy so the next CLI run
+      // exercises the HQ shard receipt reuse path and writes a reuseDecision row.
+      rmSync(join(instanceRoot, 'release', gateVersion, 'gate-logs', 'cut', 'receipts', 'files'), { recursive: true, force: true });
+      expect(await runGateNode(args, { ELANOUS_STATE_DIR: instanceRoot }, undefined, undefined, () => IMAGE, undefined, gateTools)).toBe(0);
+    } finally {
+      process.chdir(priorCwdForReuse);
+      if (priorStateDirForReuse === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = priorStateDirForReuse;
+      resetElanousConfigDir();
+    }
+    const afterReuse = readGateShardLedger(ledgerPath);
+    expect(afterReuse?.malformed).toBe(0);
+    expect(afterReuse?.rows.every((row) => row.runId === runId), 'hard rehearsal run id remains on reuse rows').toBe(true);
+    expect(afterReuse?.rows.some((row) => row.reuseDecision === 'reuse' && row.runId === runId), 'HQ reuse decision retains CLI run id').toBe(true);
+    expect(podCalls).toEqual(['pod']);
+
+    // Reusing a runner for an unscoped invocation must clear its previous CLI identity.
+    const priorCwdAfterRun = process.cwd();
+    const priorStateDirAfterRun = process.env.ELANOUS_STATE_DIR;
+    const beforeUnscoped = afterReuse?.rows.length ?? 0;
+    process.chdir(repo);
+    process.env.ELANOUS_STATE_DIR = instanceRoot;
+    setElanousConfigDir(instanceRoot);
+    try {
+      const unscopedArgs = args.filter((arg, index) => arg !== '--run-id' && args[index - 1] !== '--run-id');
+      const unscopedRunner = makeRunner(repo, podCalls, false, undefined, runId);
+      expect(await runGateNode(unscopedArgs, { ELANOUS_STATE_DIR: instanceRoot }, unscopedRunner, undefined, () => IMAGE)).toBe(2);
+    } finally {
+      process.chdir(priorCwdAfterRun);
+      if (priorStateDirAfterRun === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = priorStateDirAfterRun;
+      resetElanousConfigDir();
+    }
+    const afterUnscoped = readGateShardLedger(ledgerPath);
+    const unscopedRows = afterUnscoped?.rows.slice(beforeUnscoped) ?? [];
+    expect(unscopedRows.length).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('GATE-LEDGER-HQ-SINGLE sim: direct CLI parser accepts hard-rehearsal run scope', () => {
+  const runId = 'hard-00000000-0000-4000-8000-000000000001';
+  expect(parseOptions(['--commit', BASE, '--version', '0.3.8-rc.1', '--baseline-version', '0.3.7', '--run-id', runId,
+    '--executor', 'pod', '--pod-pool', 'sim-pool@sim-remote:1', '--pod-shards', '1', '--rehearsal-baseline'], {}))
+    .toMatchObject({ runId, rehearsalBaseline: true });
+  expect(() => parseOptions(['--commit', BASE, '--version', '0.3.8-rc.1', '--baseline-version', '0.3.7', '--run-id', runId,
+    '--executor', 'pod', '--pod-pool', 'sim-pool@sim-remote:1', '--pod-shards', '1'], {}))
+    .toThrow('--run-id is only valid with --rehearsal-baseline');
 });

@@ -1,0 +1,28 @@
+{
+  "id": "smart-merge-world",
+  "name": "Smart merge and train lifecycle simulation world",
+  "implementation": [
+    "src/ux-sim/smart-merge-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/smart-merge-world.test.ts"
+  ],
+  "target": "Test-only simulation of release and train incident routing, repair evidence, queue ownership, and role-tag readiness.",
+  "inputs": [
+    "typed lifecycle signals",
+    "follow-up events",
+    "fake queue state",
+    "host readiness conditions"
+  ],
+  "observations": [
+    "expected actions and retained repair evidence",
+    "unresolved evidence refuses queueing",
+    "ten lifecycle incidents and readiness cases resolve without human intervention"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/smart-merge-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

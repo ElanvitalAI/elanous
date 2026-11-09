@@ -1,10 +1,12 @@
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadavg, cpus, freemem } from 'node:os';
 import { effectiveInstanceRoot, prodInstanceRoot, treeDerivedRootFor } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
-import { buildUserConfig, getUserConfig, type UserConfig } from '../user-config.js';
+import { buildUserConfig, getUserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { resolveCodexQuotaPolicy } from '../oauth/codex-quota-policy.js';
 import { debug } from '../debug/log.js';
 import type { PoolLeaseRecommendation } from '../task-orchestrator/surfaces/pod-lease.js';
@@ -247,7 +249,9 @@ export function checkHarnessPodPool(pool: string, run?: PoolKubectl): HarnessPoo
 
 /** Only inspect the current context when no explicit pool is available. Never turn an explicit Pod selection into local. */
 export function resolveHarnessSubstrate({ flag, config, env, currentContext = () => {
-  const result = spawnSync('kubectl', ['config', 'current-context'], { encoding: 'utf8', timeout: 5000 });
+  const result = spawnSync('kubectl', ['config', 'current-context'], {
+    encoding: 'utf8', timeout: 5000, maxBuffer: SPAWN_SYNC_MAX_BUFFER,
+  });
   return result.status === 0 ? result.stdout?.trim() : undefined;
   }, autoSignals, readAutoSignals, autoReadDeps, poolCheck = checkHarnessPodPool }: {
   flag?: { substrate?: HarnessSubstrate | 'auto'; podPool?: string };

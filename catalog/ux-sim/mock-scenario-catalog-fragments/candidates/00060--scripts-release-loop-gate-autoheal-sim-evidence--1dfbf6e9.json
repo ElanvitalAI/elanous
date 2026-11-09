@@ -1,0 +1,11 @@
+{
+  "path": "scripts/release-loop/gate-autoheal-sim-evidence.ts",
+  "disposition": "device",
+  "entryCommand": "bun scripts/release-loop/gate-autoheal-sim-evidence.ts",
+  "logsRecorded": "yes",
+  "logsDetail": "Writes release-loop events to isolated logs.db with runId.",
+  "deviceId": "release-graph-rig",
+  "scenarioIds": [
+    "UX-MS-02"
+  ]
+}

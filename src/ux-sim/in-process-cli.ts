@@ -8,6 +8,7 @@ import { format } from 'node:util';
 import { spawnElanous } from '../instance/spawn-elanous.js';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
+import { recordCliChildEvent } from './in-process-cli-539-file-adoption-sim.js';
 
 export interface InProcessCliResult {
   readonly exitCode: number;
@@ -143,9 +144,16 @@ export async function simCli(args: readonly string[], options: InProcessCliOptio
         bin: entry, stateDir: stateRoot, cwd, env, stdio: ['ignore', outputFd ?? 'pipe', 'pipe'],
         detached: options.detached ?? process.platform !== 'win32',
       });
+      recordCliChildEvent('child-started', child.pid);
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
       let timedOut = false;
+      let childFinished = false;
+      const recordChildFinished = (detail: { exitCode: number | null; signal: NodeJS.Signals | null; timedOut: boolean }) => {
+        if (childFinished) return;
+        childFinished = true;
+        recordCliChildEvent('child-closed', child.pid, detail);
+      };
       let timeoutKillTimer: ReturnType<typeof setTimeout> | undefined;
       const killChild = () => {
         const signal = options.killSignal ?? 'SIGTERM';
@@ -186,6 +194,7 @@ export async function simCli(args: readonly string[], options: InProcessCliOptio
         if (timeoutKillTimer) clearTimeout(timeoutKillTimer);
         options.signal?.removeEventListener('abort', abort);
         closeOutput();
+        recordChildFinished({ exitCode: code, signal, timedOut });
         const diagnostic = timedOut ? `\nCLI spawn timed out after ${options.timeoutMs ?? 30_000}ms` : '';
         resolveResult({ exitCode: code ?? 1, signal, stdout: Buffer.concat(stdout).toString('utf8'), stderr: `${Buffer.concat(stderr).toString('utf8')}${diagnostic}`, stateRoot });
       });

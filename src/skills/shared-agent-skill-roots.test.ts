@@ -24,9 +24,8 @@ describe('sharedAgentSkillRoots', () => {
     });
   });
 
-  test('disabled returns empty without probing; probe failure is fail-soft', () => {
+  test('probe failure is fail-soft', () => {
     const exists = () => { throw new Error('unreadable'); };
-    expect(sharedAgentSkillRoots({ home: '/unused', exists, includeSharedAgentSkills: false })).toEqual([]);
     expect(sharedAgentSkillRoots({ home: '/unused', exists })).toEqual([]);
   });
 

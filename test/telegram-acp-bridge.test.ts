@@ -22,7 +22,7 @@ import {
 } from '../src/input/control-signal.js';
 import { defaultControlSignalObserver, _resetDefaultControlSignalObserverForTesting } from '../src/input/control-signal-observer.js';
 import { createTelegramAcpBridge } from '../src/telegram-acp-bridge.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { waitForSocket } from './helpers/wait-for-socket.js';
 
 let tmp: string;

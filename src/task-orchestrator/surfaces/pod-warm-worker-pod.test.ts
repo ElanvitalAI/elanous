@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { Kubectl } from './self-implement-pod.js';
 import type { WarmWorkerCommand, WarmWorkerReply } from './pod-warm-worker-protocol.js';
+import { gateLockfileHash } from '../../self-implement/gate-receipt-registry.js';
 import { WarmPodTransport, probeWarmPodContext, probeWarmPodRuntimeContract, warmWorkerPodManifest, WARM_POD_ACK, WARM_POD_EXEC, WARM_POD_INSTALL, WARM_POD_ISOLATION_PROBE, WARM_POD_PREPARE, WARM_POD_READ, WARM_POD_RUNTIME_PROBE, type WarmPodSpec } from './pod-warm-worker-pod.js';
 
 const cutSha = 'a'.repeat(40);
@@ -16,6 +17,7 @@ const spec: WarmPodSpec = { name: 'warm-worker-1', namespace: 'elanous-test', ku
   hostProbeUrl: 'http://host.orb.internal:10001/health', prodProbeUrl: 'http://core.elanous-prod:10002/' };
 const command = (attemptId: string): WarmWorkerCommand => ({ protocol: 1, runId: 'run-1', attemptId,
   cutSha, leaseId: 'lease-1', generation: 1, workerId: 'worker-1', podUid: 'pod-uid-1', key,
+  baseImageDigest: spec.runtimeContract?.baseImageDigest ?? key.imageDigest,
   deadlineAt: Date.now() + 60_000, files: ['src/example/worker.test.ts'], envProfile: 'gate-v1' });
 
 test('a missing remote-internal context retains the original kubectl error', () => {
@@ -120,12 +122,15 @@ test('manifest pins image, source SHA and lock hash; worker stays Running for la
   expect(manifest.spec.initContainers[2].volumeMounts).toEqual([{ name: 'workspace', mountPath: '/workspace' }]);
   expect(WARM_POD_EXEC).toContain("chmodSync('/workspace/data/scratch', 0o755)");
   expect(WARM_POD_EXEC).toContain('runFile: runWarmWorkerFile');
+  expect(WARM_POD_EXEC).toContain('command.baseImageDigest !== process.env.ELANOUS_GATE_BASE_IMAGE_DIGEST');
+  expect(WARM_POD_EXEC).not.toContain('WARM_BASE_IMAGE_DIGEST');
   // The worker must reset and clean this emptyDir checkout after each request.
   expect(manifest.spec.containers[0].volumeMounts[0]).toEqual({ name: 'workspace', mountPath: '/workspace/repo', subPath: 'repo' });
   expect(manifest.spec.volumes).toEqual([{ name: 'workspace', emptyDir: {} }, { name: 'runtime-data', emptyDir: {} }]);
   expect(() => warmWorkerPodManifest({ ...spec, image: 'registry.example/elanous:latest' })).toThrow();
   expect(() => warmWorkerPodManifest({ ...spec, key: { ...key, lockHash: 'wrong' } })).toThrow();
   expect(() => warmWorkerPodManifest({ ...spec, hostProbeUrl: 'http://example.test:10001/health' })).toThrow();
+  expect(warmWorkerPodManifest({ ...spec, hostProbeUrl: 'http://10.43.195.1:10001/health' })).toBeTruthy();
   const mirrorSpec = { ...spec, sourceUrl: undefined, sourceMirrorHostPath: '/srv/elanous-mirror', nodeName: 'k3d-node-b-agent-0' };
   const mirrored = warmWorkerPodManifest(mirrorSpec) as any;
   expect(mirrored.spec.nodeName).toBe('k3d-node-b-agent-0');
@@ -308,7 +313,7 @@ test('runtime compatibility probe sends its contract over exec stdin', () => {
   const result = probeWarmPodRuntimeContract(probeSpec, (args, body) => {
     commands.push([...args]); input = body;
     return { status: 0, stdout: JSON.stringify({ bunVersion: Bun.version, os: 'linux',
-      architecture: 'amd64', tools: { bun: true, git: true } }), stderr: '' };
+      architecture: 'amd64', tools: { bun: true, git: true }, lockHash: spec.key.lockHash }), stderr: '' };
   });
   expect(result.status).toBe('compatible');
   expect(commands[0]).toContain('-i');
@@ -617,6 +622,9 @@ export class WarmWorkerRuntime {
     return { reason: 'complete', quarantineWorker: false, artifactsDir: dir, reply: { files: [{ file: command.files[0], rc: 0 }] } };
   }
 }`);
+    const identityDir = join(workspace, 'repo/src/self-implement');
+    mkdirSync(identityDir, { recursive: true });
+    writeFileSync(join(identityDir, 'gate-receipt-registry.ts'), `import { createHash } from 'node:crypto';\nimport { readFileSync } from 'node:fs';\nimport { join } from 'node:path';\nexport function gateLockfileHash(repoDir) { return createHash('sha256').update(readFileSync(join(repoDir, 'bun.lock'))).digest('hex'); }`);
     writeFileSync(join(moduleDir, 'pod-warm-worker-runner.ts'), 'export const runWarmWorkerFile = async () => 0;');
     const repoDir = join(workspace, 'repo');
     const git = (args: string[]) => {
@@ -634,7 +642,7 @@ export class WarmWorkerRuntime {
     const bridgeCommand = (attemptId: string): WarmWorkerCommand => ({ ...command(attemptId), cutSha: fixtureSha, key: fixtureKey });
     const env = { ...process.env, WARM_BRIDGE_UID: String(process.getuid?.() ?? 0),
       WARM_CUT_SHA: fixtureSha, WARM_LOCK_HASH: fixtureKey.lockHash, WARM_WORKER_ID: spec.workerId,
-      WARM_CONTEXT: key.context, WARM_IMAGE_DIGEST: key.imageDigest, WARM_ARCHITECTURE: key.architecture,
+      WARM_CONTEXT: key.context, WARM_IMAGE_DIGEST: key.imageDigest, ELANOUS_GATE_BASE_IMAGE_DIGEST: key.imageDigest, WARM_ARCHITECTURE: key.architecture,
       WARM_TEST_ARTIFACTS: join(workspace, 'data/artifacts') };
     const script = WARM_POD_EXEC.replace(WARM_POD_ISOLATION_PROBE, 'async function warmIsolationEnforced() { return true; }');
     const run = (source: string, input: unknown) => spawnSync(process.execPath, ['-e', source.replaceAll('/workspace', workspace)],
@@ -673,13 +681,13 @@ test('actual bridge fences a host run because the file runner requires a dedicat
     const dirty = spawnSync('git', ['-C', repoDir, 'status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8' });
     expect(dirty.status).toBe(0);
     expect(dirty.stdout.trim()).toBe('');
-    const lockHash = sha256(readFileSync(join(repoDir, 'bun.lock')));
+    const lockHash = gateLockfileHash(repoDir);
     const files = ['src/task-orchestrator/surfaces/pod-warm-worker-protocol.test.ts'];
     const request: WarmWorkerCommand = { ...command('real-bridge'), cutSha: cut,
       key: { ...key, lockHash }, files, deadlineAt: Date.now() + 90_000 };
     const env = { ...process.env, WARM_BRIDGE_UID: String(process.getuid?.() ?? 0),
       WARM_CUT_SHA: cut, WARM_LOCK_HASH: lockHash, WARM_WORKER_ID: spec.workerId,
-      WARM_CONTEXT: key.context, WARM_IMAGE_DIGEST: key.imageDigest, WARM_ARCHITECTURE: key.architecture };
+      WARM_CONTEXT: key.context, WARM_IMAGE_DIGEST: key.imageDigest, ELANOUS_GATE_BASE_IMAGE_DIGEST: key.imageDigest, WARM_ARCHITECTURE: key.architecture };
     const script = WARM_POD_EXEC.replace(WARM_POD_ISOLATION_PROBE,
       'async function warmIsolationEnforced() { return true; }')
       .replaceAll('/workspace/repo', repoDir).replaceAll('/workspace/data', data);

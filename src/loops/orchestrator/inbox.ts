@@ -5,7 +5,7 @@ import { debug, redactSecretText } from '../../debug/log.js';
 import { LOOP_MESSAGE_ROUTES } from '../msg-address.js';
 import { replyWithAgent, type AgentReplyInput } from '../agent-reply.js';
 import { knowhowAdvice, type KnowhowAdvice, type KnowhowOptions } from './knowhow-pack.js';
-import type { RoleLlmSpec } from '../../user-config.js';
+import type { RoleLlmSpec } from '../../user-config/types.js';
 import type { LLMProvider } from '../../llm.js';
 import { askOpContextBundle, type AskOpContextBundle } from '../../context-bus/context-now.js';
 

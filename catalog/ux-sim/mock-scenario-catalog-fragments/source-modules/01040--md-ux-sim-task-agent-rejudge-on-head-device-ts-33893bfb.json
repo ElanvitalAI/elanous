@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TASK-AGENT-REJUDGE-ON-HEAD-DEVICE-TS",
+  "path": "src/ux-sim/task-agent-rejudge-on-head-device.ts",
+  "boundary": "Feeds stored review rounds and changing head SHAs to production rejudge-on-head decisions and records whether the round cap permits review.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

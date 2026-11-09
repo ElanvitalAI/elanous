@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-USER-CONFIG-TUI-DIET-SIM-TS",
+  "path": "src/ux-sim/user-config-tui-diet-sim.ts",
+  "boundary": "Simulates TUI configuration diet decisions and verifies the rendered interaction state.",
+  "deviceIds": ["tui-interaction"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

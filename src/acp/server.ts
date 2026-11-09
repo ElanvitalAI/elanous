@@ -1066,6 +1066,21 @@ function logSkippedPlainEnvelope(ctx: AcpServerContext, sessionId: string, kind:
   debug.log('acp.envelope', 'skipped-plain-client', { sessionId, kind });
 }
 
+const webtermAgentTurnTails = new Map<string, Promise<void>>();
+
+/** Keep :agent broadcasts for one session in a single, ordered turn. */
+async function acquireWebtermAgentTurn(sessionId: string): Promise<() => void> {
+  const previous = webtermAgentTurnTails.get(sessionId);
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  webtermAgentTurnTails.set(sessionId, current);
+  if (previous) await previous;
+  return () => {
+    if (webtermAgentTurnTails.get(sessionId) === current) webtermAgentTurnTails.delete(sessionId);
+    release();
+  };
+}
+
 /** Wire a single `AgentSideConnection` onto the provided ndJsonStream.
  *  Owns all per-connection state (clientUiCaps, boundConnection ref,
  *  per-peer `AcpServerHandle`) so stdio and transport paths diverge
@@ -2580,6 +2595,21 @@ function wireAcpConnection(
               output: `\x1b[31m:agent — daemon not wired with runAgentTurn (start with \`--tools webterm\` and the standard daemon-public-server)\x1b[0m\r\n`,
             };
           } else {
+            const releaseTurn = await acquireWebtermAgentTurn(p.sessionId);
+            // Callback producers are synchronous; serialize their async fanout so
+            // the turn-end signal cannot overtake a slow text/tool notification.
+            let pendingBroadcasts = Promise.resolve();
+            const queueBroadcast = (update: unknown): void => {
+              pendingBroadcasts = pendingBroadcasts.then(async () => {
+                await broadcast(p.sessionId as string, update);
+              }).catch((error: unknown) => {
+                debug.log('acp.broadcast', 'webterm-turn-update-failed', {
+                  sessionId: p.sessionId,
+                  kind: extractUpdateKind(update),
+                  error: redactSecretText(error instanceof Error ? error.message : String(error)),
+                }, { level: 'error' });
+              });
+            };
             try {
               // ACP streaming (PLAN v1.2 Phase B) — wire runDaemonPromptTurn's
               // streaming callbacks to ACP `session/update` broadcasts so every
@@ -2587,8 +2617,9 @@ function wireAcpConnection(
               // receives partial chunks live. Cross-surface mirror is automatic via
               // `broadcast()` (line 568-593) — no per-peer routing logic needed.
               const sessionId = p.sessionId;
+              await broadcast(sessionId, { sessionUpdate: 'elanous_turn_begin' });
               const emitTextChunk = (delta: string): void => {
-                void broadcast(sessionId, {
+                queueBroadcast({
                   sessionUpdate: 'agent_message_chunk',
                   content: { type: 'text', text: delta },
                 });
@@ -2602,7 +2633,7 @@ function wireAcpConnection(
                 }
               };
               const emitToolCall = (info: { id: string; name: string; args: Record<string, unknown> }): void => {
-                void broadcast(sessionId, {
+                queueBroadcast({
                   sessionUpdate: 'tool_call',
                   toolCallId: info.id,
                   rawInput: info.args,
@@ -2645,7 +2676,7 @@ function wireAcpConnection(
                     resourceUri: typeof uri === 'string' ? uri : null,
                   });
                 }
-                void broadcast(sessionId, {
+                queueBroadcast({
                   sessionUpdate: 'tool_call_update',
                   toolCallId: info.id,
                   status: info.ok ? 'completed' : 'failed',
@@ -2657,7 +2688,7 @@ function wireAcpConnection(
                 });
               };
               const emitImageBlock = (info: { src: string; mediaType: string; alt?: string }): void => {
-                void broadcast(sessionId, {
+                queueBroadcast({
                   sessionUpdate: 'agent_message_chunk',
                   content: { type: 'image', data: info.src, mimeType: info.mediaType, ...(info.alt ? { uri: info.alt } : {}) },
                 });
@@ -2675,6 +2706,12 @@ function wireAcpConnection(
                 onToolResultMeta: emitToolResult,
                 onImageBlock: emitImageBlock,
               });
+              await pendingBroadcasts;
+              await broadcast(sessionId, {
+                sessionUpdate: 'elanous_turn_end',
+                text: agentResult.markdown,
+                stopReason: agentResult.stopReason,
+              });
               // FU-2 webterm wire — flush partial sentence buffer once
               // the `:agent` turn settles (mirrors chat REST `turn-end`
               // flush). bridge 가 best-effort 라 errors swallow.
@@ -2685,10 +2722,16 @@ function wireAcpConnection(
               const head = `\x1b[2m:agent ${agentResult.modelLabel} — ${agentResult.markdown.length} chars · ${agentResult.contextLines} buffer lines (open response panel above)\x1b[0m\r\n`;
               result = { ...result, output: head };
             } catch (e) {
+              try {
+                await pendingBroadcasts;
+                await broadcast(p.sessionId, { sessionUpdate: 'elanous_turn_end', stopReason: 'error' });
+              } catch { /* original turn error remains authoritative */ }
               result = {
                 ...result,
                 output: `\x1b[31m:agent error — ${String(e instanceof Error ? e.message : e)}\x1b[0m\r\n`,
               };
+            } finally {
+              releaseTurn();
             }
           }
         }

@@ -167,6 +167,7 @@ test('auto-start --apply does not launch an already-running or out-of-window cut
     expect(errors).toHaveLength(1);
     expect(errors[0]).toBe(`⛔ 릴리스 이미 실행 중 ${version} · runId=pending pid=${process.pid} startedAt=${JSON.parse(body).startedAt} · auto-start 거부`);
     expect(readFileSync(lock, 'utf8')).toBe(body);
+    setSchedule(version, { cutAt: new Date(Date.now() + 60 * 60_000).toISOString() }, 'OP', root);
     process.exitCode = 0;
     await cli.parseAsync(['release', 'auto-start', '--window-minutes', '0.01', '--apply'], { from: 'user' });
     expect(lines.at(-1)).toBe('· 선택할 컷 없음');

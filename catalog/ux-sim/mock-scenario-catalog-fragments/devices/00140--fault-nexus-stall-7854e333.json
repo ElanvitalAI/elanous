@@ -1,0 +1,29 @@
+{
+  "id": "fault-nexus-stall",
+  "name": "Nexus synchronous stall fault",
+  "implementation": [
+    "src/ux-sim/fault-nexus-stall.ts",
+    "src/ux-sim/fake-kubectl.ts",
+    "src/ux-sim/dashboard-event-loop-stall-monitor-device.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fault-nexus-stall.test.ts"
+  ],
+  "target": "Production Nexus grid consumer with synchronous kubectl delay and unreachable faults",
+  "inputs": [
+    "finite kubectl hang duration",
+    "unreachable kubectl switch",
+    "maximum event-loop lag"
+  ],
+  "observations": [
+    "production buildGridData result",
+    "kubectl call records",
+    "event-loop ping lag samples and maximum"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fault-nexus-stall.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

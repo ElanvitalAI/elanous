@@ -1,0 +1,40 @@
+{
+  "id": "warm-pool-reuse-sim",
+  "name": "Warm pool gate reuse with fake primary control",
+  "implementation": [
+    "src/ux-sim/warm-pool-reuse-sim.ts",
+    "src/ux-sim/warm-pool-reuse-switch-sim.ts",
+    "src/ux-sim/fake-kubectl.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts",
+    "scripts/warm-pool-provider-config.ts"
+  ],
+  "tests": [
+    "src/ux-sim/warm-pool-reuse-sim.test.ts",
+    "scripts/warm-pool-provider-config.test.ts"
+  ],
+  "target": "Production warm-provider reconcile, gate selection and host-scoped resource-ledger reads against fake Kubernetes and a scope-aware fake primary lease API",
+  "inputs": [
+    "isolated runId",
+    "gate profile",
+    "five host-scoped resource-ledger pool declarations",
+    "404, invalid or expired machine credential",
+    "image/profile/token-scope fault"
+  ],
+  "observations": [
+    "pod.warm/request-selection selected=true",
+    "one pod.reuse/warm-worker-selected",
+    "runId-correlated prepare-refused reason",
+    "pod.warm.provider-config/resource-ledger-read-failed with status and reason; no credentials"
+  ],
+  "entryCommands": [
+    "bun test scripts/warm-pool-provider-config.test.ts src/ux-sim/warm-pool-reuse-sim.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "pod.warm/request-selection",
+    "pod.reuse/warm-worker-selected",
+    "pod.warm.provider/prepare-refused",
+    "pod.warm.provider-config/resource-ledger-read-failed"
+  ],
+  "recentUse": null
+}

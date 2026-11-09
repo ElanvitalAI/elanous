@@ -58,22 +58,9 @@ test('repository git ls-files spawnSync readers specify maxBuffer or use spawnSy
  * parameter, catch clause); a binding whose value is not an object literal is «unknown» and counts as unguarded.
  * Known limits (out of scope · OP #8907): namespace imports are only seen through `<ns>.spawnSync`; dynamic calls,
  * re-exports, functions stored in other variables, and `let` reassignment are not traced.
- * The allowlist only shrinks: counts must match exactly, so a fixed file has to drop its entry.
+ * There are no deferred exceptions: every in-scope Node child must state its buffer or avoid piping stdout.
  */
 const MAX_BUFFER_SCOPE = ['src/task-orchestrator', 'src/self-implement', 'scripts/release-loop', 'src/harness'];
-const DEFERRED_UNGUARDED: Record<string, { count: number; reason: string }> = {
-  'scripts/release-loop/gate-partial.ts': { count: 1, reason: 'OPEN #27819 touches this file' },
-  'scripts/release-loop/gate-recheck-plan-node.ts': { count: 1, reason: 'OPEN #27819 touches this file' },
-  'scripts/release-loop/resume-release.ts': { count: 2, reason: 'OPEN #28130 touches this file' },
-  'scripts/release-loop/unattended-release.ts': { count: 1, reason: 'OPEN #28472 · #28130 touch this file' },
-  'scripts/release-loop/version-node.ts': { count: 3, reason: 'OPEN #28293 touches this file' },
-  'src/harness/harness-substrate-default.ts': { count: 1, reason: 'OPEN #28060 touches this file' },
-  'src/self-implement/host-regate.ts': { count: 2, reason: 'OPEN #27484 touches this file' },
-  'src/task-orchestrator/surfaces/pod-command-job.ts': { count: 1, reason: 'OPEN #28370 · #27828 · #27817 · #27810 touch this file' },
-  'src/task-orchestrator/surfaces/pod-pool.ts': { count: 5, reason: 'OPEN #27664 touches this file' },
-  'src/task-orchestrator/surfaces/self-implement-pod.ts': { count: 3, reason: 'OPEN #28370 · #28277 · #28218 · #28188 and more touch this file' },
-};
-
 const propertyName = (property: ts.ObjectLiteralElementLike): string | undefined =>
   property.name && (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)) ? property.name.text : undefined;
 
@@ -177,21 +164,18 @@ function unguardedSpawnSyncLinesInText(file: string, text: string): number[] {
 const unguardedSpawnSyncLines = (file: string): number[] =>
   unguardedSpawnSyncLinesInText(file, readFileSync(resolve(ROOT, file), 'utf8'));
 
-test('harness · Pod · gate spawnSync readers specify maxBuffer (ratchet · allowlist only shrinks)', () => {
+test('harness · Pod · gate spawnSync readers specify maxBuffer (no exceptions)', () => {
   const files = execFileSync('rg', ['-l', '\\bspawnSync\\b', ...MAX_BUFFER_SCOPE,
     '-g', '*.{ts,tsx,mts,cts,js,mjs,cjs}', '-g', '!*.test.ts', '-g', '!**/fixtures/**'],
   { cwd: ROOT, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 }).trim().split('\n').filter(Boolean).sort();
   expect(files.length).toBeGreaterThan(20);
   const unguarded: Record<string, number> = {};
-  const violations: string[] = [];
   for (const file of files) {
     const lines = unguardedSpawnSyncLines(file);
     if (lines.length === 0) continue;
     unguarded[file] = lines.length;
-    if (DEFERRED_UNGUARDED[file]?.count !== lines.length) violations.push(`${file}:${lines.join(',')}`);
   }
-  expect(violations).toEqual([]);
-  expect(Object.keys(unguarded).sort()).toEqual(Object.keys(DEFERRED_UNGUARDED).sort());
+  expect(unguarded).toEqual({});
 });
 
 test('ratchet detector flags a bare spawnSync reader and accepts maxBuffer / non-piped stdout', () => {

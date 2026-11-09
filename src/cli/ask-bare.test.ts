@@ -8,22 +8,25 @@ describe('askBare', () => {
   afterEach(() => { setUserConfigOverlay(null); });
   test('forwards the unmodified text as its only message with no system prompt or tools', async () => {
     const calls: Array<{ messages: unknown; options: unknown }> = [];
+    const deltas: string[] = [];
     const deps = {
       getUserConfig: () => ({ llm: { provider: 'auto', model: '' } }),
       decideProviderForConfig: (_config: unknown, _model?: string) => ({ provider: 'auto:openai-codex', model: 'codex-model', auth: 'oauth' }),
       getProviderForConfig: () => ({ name: 'openai-codex' }),
       streamLLM: async (messages: unknown, _delta: unknown, options: unknown) => {
         calls.push({ messages, options });
+        (_delta as (delta: string) => void)('answer');
         (options as { onResolvedProvider: (name: string, model: string) => void }).onResolvedProvider('openai-codex', 'codex-model');
         return 'answer';
       },
       trimToBudget,
     } as unknown as AskBareDeps;
-    const result = await askBare({ text: '  Hello!\n', deps });
+    const result = await askBare({ text: '  Hello!\n', onDelta: delta => deltas.push(delta), deps });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.messages).toEqual([{ role: 'user', content: '  Hello!\n' }]);
     expect(calls[0]!.options).toEqual({ initialProvider: { name: 'openai-codex' }, model: 'codex-model', usageSite: 'cli.ask-bare', onResolvedProvider: expect.any(Function) });
     expect(result).toEqual({ provider: 'openai-codex', model: 'codex-model', reply: 'answer' });
+    expect(deltas).toEqual(['answer']);
   });
 
   test('passes provider and model overrides into the same provider decision', async () => {

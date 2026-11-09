@@ -1,3 +1,4 @@
+import { asRecord } from '../primitives/guards.js';
 // Shared catalog-backed LLM cost ruler.
 //
 // Prices live in the four model catalogs. This file converts tokens to
@@ -139,18 +140,12 @@ function validPricing(value: LlmPricingUsd | null | undefined): value is LlmPric
     && (value.cacheWritePerM === undefined || finiteNonNegative(value.cacheWritePerM));
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
 function parsePricingMap(value: unknown): Record<string, LlmPricingUsd> | undefined {
-  const rec = asRecord(value);
+  const rec = asRecord(value, { fallback: 'undefined' });
   if (!rec) return undefined;
   const out: Record<string, LlmPricingUsd> = {};
   for (const [model, raw] of Object.entries(rec)) {
-    const pricing = asRecord(raw);
+    const pricing = asRecord(raw, { fallback: 'undefined' });
     if (!pricing) continue;
     const candidate: LlmPricingUsd = {
       inputPerM: pricing.inputPerM as number,
@@ -171,9 +166,9 @@ export function readLlmConfigPricing(
   try {
     const source = raw ?? (getUserConfig() as { raw?: Record<string, unknown> }).raw;
     if (!source) return undefined;
-    const budget = asRecord(source.budget);
+    const budget = asRecord(source.budget, { fallback: 'undefined' });
     return parsePricingMap(budget?.llmPricing)
-      ?? parsePricingMap(asRecord(source.llm)?.pricingUsd)
+      ?? parsePricingMap(asRecord(source.llm, { fallback: 'undefined' })?.pricingUsd)
       ?? parsePricingMap(source.llmPricing);
   } catch {
     return undefined;

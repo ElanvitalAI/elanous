@@ -1,0 +1,8 @@
+{
+  "path": "test/fixtures/mock-lsp-server.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun test test/lsp-client.test.ts test/lsp-operations-dispatch.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "The consuming LSP tests assert protocol behavior; fixture emits no app logs.db row.",
+  "excludeReason": "Protocol fixture only; no independent scenario entry."
+}

@@ -1,0 +1,30 @@
+{
+  "id": "turn-throw-sim",
+  "name": "Delayed dashboard turn-body throw",
+  "implementation": [
+    "src/ux-sim/turn-throw-sim.ts",
+    "src/dashboard/input/chat-main-plain-turn-runtime.ts",
+    "src/dashboard/turn-busy-teardown.ts"
+  ],
+  "tests": [
+    "src/ux-sim/turn-throw-sim.test.ts",
+    "src/dashboard/turn-busy-teardown.test.ts"
+  ],
+  "target": "production plain-turn stage failure, turn-threw logging and busy teardown",
+  "inputs": [
+    "turn stage",
+    "delay milliseconds",
+    "queued external input"
+  ],
+  "observations": [
+    "in-memory debug capture of tui.turn/turn-threw phase=turn:<stage> (not persisted to test logs.db)",
+    "turn.state idle",
+    "one queued input delivered"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/turn-throw-sim.test.ts src/dashboard/turn-busy-teardown.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

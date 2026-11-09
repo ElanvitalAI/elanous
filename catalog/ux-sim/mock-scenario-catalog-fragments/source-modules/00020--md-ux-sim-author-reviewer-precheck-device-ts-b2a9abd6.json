@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-AUTHOR-REVIEWER-PRECHECK-DEVICE-TS",
+  "path": "src/ux-sim/author-reviewer-precheck-device.ts",
+  "boundary": "author reviewer precheck device: Uses the real reviewer parser/validator and its real event writer, with the only model boundary faked.",
+  "deviceIds": [
+    "author-reviewer-precheck"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

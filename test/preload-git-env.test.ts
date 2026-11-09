@@ -36,9 +36,10 @@ import { debug } from ${JSON.stringify(join(import.meta.dir, '../src/debug/log.t
 
 test('inherited Git location is absent after preload', () => {
   for (const key of ${JSON.stringify(GIT_LOCATION_ENV_KEYS)}) expect(process.env[key]).toBeUndefined();
-  expect(debug.events().some((event) => event.category === 'test.preload'
-    && event.event === 'git-location-env-cleared'
-    && ${JSON.stringify(GIT_LOCATION_ENV_KEYS)}.every((key) => (event.data as { keys: string[] }).keys.includes(key)))).toBe(true);
+  const event = debug.events().find((item) => item.category === 'test.preload' && item.event === 'git-location-env-cleared');
+  expect(event).toBeDefined();
+  expect(Object.keys(event!.data as object).sort()).toEqual(['keys']);
+  expect((event!.data as { keys: string[] }).keys).toEqual(${JSON.stringify(GIT_LOCATION_ENV_KEYS)});
 });
 
 test('config write from another cwd cannot reach the inherited repository; local repo writes still work', () => {

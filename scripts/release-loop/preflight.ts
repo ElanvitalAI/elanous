@@ -5,15 +5,16 @@
 // ⛔ 읽기 전용 — 칸을 옮기지도, 동결을 바꾸지도, push 하지도 않는다. 옮길 것은 «명령»으로 제안만 한다.
 // ⛔ 게이트 규칙을 다시 쓰지 않는다 — checklist-gate 노드 · release run 진입 검사 · 예약 시작 준비 검사(releaseReadiness, #24557)가
 //    함께 쓰는 단 하나의 판정 cutChecklistGate 를 그대로 부르고, 예약 시작 경로는 releaseReadiness 를 CLI 와 같은 인자로 부른다.
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, mkdtempSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { cutChecklistGate, listChecklist, type ChecklistItem } from '../../src/release-loop/checklist.js';
 import { getSchedule, formatKst, type ReleaseSchedule } from '../../src/release-loop/release-schedule.js';
 import { readLandingFreeze, landingFreezeMessage, type LandingFreeze } from '../../src/release-loop/landing-freeze.js';
-import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
+import { effectiveInstanceRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
 import { releaseReadiness } from './release-readiness.js';
 import { latestPublishedPreviousVersion, runUnattendedRelease, type UnattendedReleaseDeps } from './unattended-release.js';
@@ -51,6 +52,38 @@ export interface PreflightResult {
   gateMeasure: GateMeasure | null;
   /** When the previous release has no record: the newest measured older release, labelled with its version. */
   fallbackGateMeasure: GateMeasure | null;
+}
+
+export interface ReleaseRunLaunchContext {
+  seat?: string;
+  instanceRoot?: string;
+  productionRoot?: string;
+  /** The release CLI entry module, which may be linked independently of this guard module. */
+  sourcePath?: string;
+}
+
+function canonicalPath(path: string): string {
+  try { return realpathSync(path); } catch { return resolve(path); }
+}
+
+function isTemporarySourcePath(path: string): boolean {
+  const resolved = canonicalPath(path);
+  return resolved === '/tmp' || resolved.startsWith('/tmp/') || resolved === '/private/tmp' || resolved.startsWith('/private/tmp/');
+}
+
+/** A non-owner seat or disposable /tmp checkout must select an explicit test universe before it can launch a release graph. */
+export function releaseRunLaunchRefusal(context: ReleaseRunLaunchContext = {}): string | null {
+  const instanceRoot = canonicalPath(context.instanceRoot ?? effectiveInstanceRoot());
+  const productionRoot = canonicalPath(context.productionRoot ?? prodInstanceRoot());
+  if (instanceRoot !== productionRoot) return null;
+  const seat = (context.seat ?? process.env.ELANOUS_TRACK)?.trim();
+  if (seat !== 'OP') {
+    return `운영 우주 release run은 OP 자리만 시작할 수 있습니다(현재 ELANOUS_TRACK=${seat || '미설정'}). 격리 시험은 bun bin/elanous.mjs --test release run --version <판> 으로 실행하세요.`;
+  }
+  if (isTemporarySourcePath(context.sourcePath ?? fileURLToPath(import.meta.url))) {
+    return '운영 우주 release run은 /tmp 소스 경로에서 시작할 수 없습니다. 저장소 작업 트리에서 격리 시험 우주(--test)로 실행하세요.';
+  }
+  return null;
 }
 
 // ── RELEASE-COUNTDOWN-SEQUENCE — T−120 → T0 발사 시퀀스 ─────────────────────────────────────────
@@ -123,6 +156,10 @@ export type ReleaseCountdownStep = {
 export interface PreflightDeps {
   now?: Date;
   countdown?: boolean;
+  /** The release CLI entry module; it can be in /tmp even when this preflight module is linked elsewhere. */
+  sourcePath?: string;
+  /** Injectable release launch identity for isolated input-guard coverage. */
+  launchContext?: Omit<ReleaseRunLaunchContext, 'sourcePath'>;
   /** Planned publish time (ISO). Without it, the October cadence (07:00 · 18:00 KST) after the cut is assumed. */
   publishAt?: string;
   runInput?: (version: string) => Promise<{ input: unknown }>;
@@ -569,14 +606,19 @@ export async function releasePreflight(version: string, deps: PreflightDeps = {}
   // 3. The same input check `release run --dry-run` makes.
   let runPrevious: string | undefined;
   let gatePodPool: string | undefined;
-  try {
-    const result = await (deps.runInput ?? ((v: string) => runUnattendedRelease({ version: v, dryRun: true }, deps.releaseRunDeps ?? {})))(version);
-    const input = result.input as { previousVersion?: string; gatePodPool?: string };
-    runPrevious = input.previousVersion;
-    gatePodPool = input.gatePodPool;
-    findings.push({ level: 'ok', check: 'run-input', message: `release run --dry-run 입력 OK — 직전 판 ${input.previousVersion ?? '-'} · 게이트 풀 ${input.gatePodPool ?? '-'}` });
-  } catch (error) {
-    findings.push({ level: 'block', check: 'run-input', message: `release run --dry-run 입력 오류 — ${error instanceof Error ? error.message : String(error)}` });
+  const launchRefusal = releaseRunLaunchRefusal({ ...deps.launchContext, sourcePath: deps.sourcePath });
+  if (launchRefusal) {
+    findings.push({ level: 'block', check: 'run-input', message: launchRefusal });
+  } else {
+    try {
+      const result = await (deps.runInput ?? ((v: string) => runUnattendedRelease({ version: v, dryRun: true }, deps.releaseRunDeps ?? {})))(version);
+      const input = result.input as { previousVersion?: string; gatePodPool?: string };
+      runPrevious = input.previousVersion;
+      gatePodPool = input.gatePodPool;
+      findings.push({ level: 'ok', check: 'run-input', message: `release run --dry-run 입력 OK — 직전 판 ${input.previousVersion ?? '-'} · 게이트 풀 ${input.gatePodPool ?? '-'}` });
+    } catch (error) {
+      findings.push({ level: 'block', check: 'run-input', message: `release run --dry-run 입력 오류 — ${error instanceof Error ? error.message : String(error)}` });
+    }
   }
 
   let notesAddedLines: number | null = null;

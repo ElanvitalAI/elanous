@@ -18,7 +18,7 @@ import { join } from 'node:path';
 
 import { registerMcpClients } from '../src/nexus/boot/register-mcp-clients.js';
 import { buildUserConfig, resetUserConfig } from '../src/user-config.js';
-import type { McpServerSpec } from '../src/user-config.js';
+import type { McpServerSpec } from '../src/user-config/types.js';
 
 describe('registerMcpClients — background-boot compatible shape (PR2 C)', () => {
   test('promise resolves to a handle with shutdown() even when boot is slow', async () => {

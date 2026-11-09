@@ -1,5 +1,4 @@
 import { setDefaultTimeout, describe, expect, it } from 'bun:test';
-import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -8,15 +7,14 @@ import { LogStore, type LogStoreRow } from '../mss/logging/log-store.js';
 import { writeHarnessScreen } from '../harness/harness-screen.js';
 import { classifyRunScreenMissing, describeMissingRunLedger, formatUnattributableDetail, queryGoalSourceDistribution, queryMergeAttribution, queryRunScreenKey, queryUnfinishedRunLedgers, renderUnfinishedRunLedgers, type RunChainLogStore, type RunLedgerEntry } from './run-ledger.js';
 import { makeRunObserver, observeRunOutcome } from './orchestrator.js';
+import { runTestCli } from '../../test/helpers/cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
 
-// ⛔⭐ 이 파일이 있는 이유 — 골의 «판정 신호»가 테스트로 물리게 한다.
-//    골은 "없는 runId 를 주면 없다고 말하고 종료 코드가 성공이 아니다" 를 판정 신호로 걸었는데,
-//    그 신호를 «착지 코드에서» 무는 회귀가 없었다(무인 리뷰 should-fix).
-//    ⇒ 함수 단위 테스트는 「그 코드가 무는가」만 답하고 「그 코드가 실행 경로에 있는가」는 못 답한다.
-//      그래서 실물 argv 로 프로세스를 띄운다(src/cli/logs-cli.test.ts 와 같은 형태).
+// ⛔⭐ 이 파일이 있는 이유 — 골의 «판정 신호»를 CLI 테스트 경로에서 물리게 한다.
+//    일상 계약은 in-process gateway로 재고, argv 전달·우주 경계처럼 실제 프로세스가 필요한 경우만
+//    runTestCli(mode: 'spawn')로 남긴다. 함수 단위 테스트만으로 실행 경로 회귀를 놓친 이력이 있다.
 const sourceRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const fixtureRunIds = {
@@ -47,49 +45,46 @@ function fixtureRunId(name: keyof typeof fixtureRunIds): string {
   return fixtureRunIds[name];
 }
 
+const cliPaths = [
+  ['self', 'run-ledger'], ['self', 'goal-source-distribution'], ['self', 'screen'], ['self', 'merge-attribution'], ['self', 'unfinished-runs'],
+] as const;
+
 function runCli(stateDir: string, args: string[], env: NodeJS.ProcessEnv = {}) {
-  return spawnSync(process.execPath, [join(sourceRoot, 'bin/elanous.mjs'), 'self', 'run-ledger', ...args], {
-    encoding: 'utf8',
-    timeout: 60_000,
-    env: { ...process.env, ...env, ELANOUS_STATE_DIR: stateDir },
-  });
+  return runTestCli(['self', 'run-ledger', ...args], { stateRoot: stateDir, configRoot: stateDir, env, allowPaths: cliPaths });
 }
 
 function runGoalSourceDistributionCli(stateDir: string, args: string[] = []) {
-  return spawnSync(process.execPath, [join(sourceRoot, 'bin/elanous.mjs'), 'self', 'goal-source-distribution', ...args], {
-    encoding: 'utf8',
-    timeout: 60_000,
-    env: { ...process.env, ELANOUS_STATE_DIR: stateDir },
-  });
+  return runTestCli(['self', 'goal-source-distribution', ...args], { stateRoot: stateDir, configRoot: stateDir, allowPaths: cliPaths });
 }
 
 function runScreenCli(stateDir: string, args: string[]) {
-  return spawnSync(process.execPath, [join(sourceRoot, 'bin/elanous.mjs'), 'self', 'screen', ...args], {
-    encoding: 'utf8',
-    timeout: 60_000,
-    env: { ...process.env, ELANOUS_STATE_DIR: stateDir },
+  return runTestCli(['self', 'screen', ...args], { stateRoot: stateDir, configRoot: stateDir, allowPaths: cliPaths });
+}
+
+function runScreenCliSpawn(stateDir: string, args: string[]) {
+  return runTestCli(['self', 'screen', ...args], {
+    mode: 'spawn', entrypoint: join(sourceRoot, 'bin/elanous.mjs'), cwd: sourceRoot,
+    stateRoot: stateDir, configRoot: stateDir, injectTestFlag: false, allowPaths: cliPaths,
   });
 }
 
 function runMergeAttributionCli(stateDir: string, args: string[] = []) {
-  return spawnSync(process.execPath, [join(sourceRoot, 'bin/elanous.mjs'), 'self', 'merge-attribution', ...args], {
-    encoding: 'utf8',
-    timeout: 60_000,
-    env: { ...process.env, ELANOUS_STATE_DIR: stateDir },
+  return runTestCli(['self', 'merge-attribution', ...args], { stateRoot: stateDir, configRoot: stateDir, allowPaths: cliPaths });
+}
+
+function runCliSpawn(stateDir: string, args: string[], env: NodeJS.ProcessEnv = {}) {
+  return runTestCli(['self', 'run-ledger', ...args], {
+    mode: 'spawn', entrypoint: join(sourceRoot, 'bin/elanous.mjs'), cwd: sourceRoot,
+    stateRoot: stateDir, configRoot: stateDir, env, injectTestFlag: false, allowPaths: cliPaths,
   });
 }
 
 function runUnfinishedRunsCli(stateDir: string, cwd: string, args: string[] = []) {
-  return spawnSync(process.execPath, [join(sourceRoot, 'bin/elanous.mjs'), 'self', 'unfinished-runs', ...args], {
-    cwd,
-    encoding: 'utf8',
-    timeout: 60_000,
-    env: { ...process.env, ELANOUS_STATE_DIR: stateDir },
-  });
+  return runTestCli(['self', 'unfinished-runs', ...args], { cwd, stateRoot: stateDir, configRoot: stateDir, allowPaths: cliPaths });
 }
 
-describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () => {
-  it('원장이 없고 self-dev checkpoint가 있으면 다른 스토어와 조회 명령을 가리키며 exit 1을 보존한다', () => {
+describe('elanous self run-ledger — CLI gateway and selected spawn boundaries', () => {
+  it('원장이 없고 self-dev checkpoint가 있으면 다른 스토어와 조회 명령을 가리키며 exit 1을 보존한다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-self-dev-'));
     const runId = 'self-dev-only-run';
     try {
@@ -102,9 +97,9 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
         results: [],
       }), 'utf8');
 
-      const r = runCli(stateDir, [runId]);
+      const r = await runCliSpawn(stateDir, [runId]);
       const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
-      expect(`status=${r.status}`).toBe('status=1');
+      expect(`status=${r.exitCode}`).toBe('status=1');
       expect(out).toContain(`run ledger not found: ${join(stateDir, 'run-ledger', `${runId}.jsonl`)}`);
       expect(out).toContain(`checked 2 paths: ${join(stateDir, 'run-ledger', `${runId}.jsonl`)}; ${join(stateDir, 'self-dev-runs', `${runId}.json`)}`);
       expect(out).toContain(`self-dev run checkpoint found: ${join(stateDir, 'self-dev-runs', `${runId}.json`)}`);
@@ -141,13 +136,13 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
     }
   });
 
-  it('두 스토어에 없는 runId는 두 경로를 모두 확인했다고 말하고 exit 1을 보존한다', () => {
+  it('두 스토어에 없는 runId는 두 경로를 모두 확인했다고 말하고 exit 1을 보존한다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-missing-'));
     const runId = 'does-not-exist-run-id';
     try {
-      const r = runCli(stateDir, [runId]);
+      const r = await runCli(stateDir, [runId]);
       const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
-      expect(`status=${r.status}`).toBe('status=1');
+      expect(`status=${r.exitCode}`).toBe('status=1');
       expect(out).toContain('run ledger not found');
       expect(out).toContain(`checked 2 paths: ${join(stateDir, 'run-ledger', `${runId}.jsonl`)}; ${join(stateDir, 'self-dev-runs', `${runId}.json`)}`);
       expect(out).toContain(`self-dev run checkpoint not found: ${join(stateDir, 'self-dev-runs', `${runId}.json`)}`);
@@ -156,7 +151,7 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
     }
   });
 
-  it('원장이 있으면 그 이벤트를 산출에 싣는다', () => {
+  it('원장이 있으면 그 이벤트를 산출에 싣는다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-present-'));
     try {
       const dir = join(stateDir, 'run-ledger');
@@ -167,8 +162,8 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
       ].map((l) => JSON.stringify(l)).join('\n');
       writeFileSync(join(dir, 'r1.jsonl'), `${lines}\n`, 'utf8');
 
-      const r = runCli(stateDir, ['r1']);
-      expect(`status=${r.status}`).toBe('status=0');
+      const r = await runCli(stateDir, ['r1']);
+      expect(`status=${r.exitCode}`).toBe('status=0');
       expect(r.stdout).toContain('pipeline-node-entry');
       expect(r.stdout).toContain('run-status');
     } finally {
@@ -176,7 +171,7 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
     }
   });
 
-  it('--json은 개행 없는 UTF-8 trailing fragment를 건너뛰고 source byte count를 stderr에 낸다', () => {
+  it('--json은 개행 없는 UTF-8 trailing fragment를 건너뛰고 source byte count를 stderr에 낸다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-trailing-fragment-'));
     const runId = 'run-incomplete-trailing';
     const completeEntry = { timestamp: '2026-09-15T00:00:00.000Z', runId, event: 'start', data: { ready: true } };
@@ -189,8 +184,8 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, `${runId}.jsonl`), Buffer.concat([Buffer.from(`${JSON.stringify(completeEntry)}\n`, 'utf8'), trailingFragment]));
 
-      const r = runCli(stateDir, [runId, '--json']);
-      expect(`status=${r.status}`).toBe('status=0');
+      const r = await runCli(stateDir, [runId, '--json']);
+      expect(`status=${r.exitCode}`).toBe('status=0');
       const outputLines = r.stdout.trim().split('\n').filter(Boolean);
       expect(outputLines.map((line) => JSON.parse(line))).toEqual([completeEntry]);
       expect(r.stderr).toContain(`skipped incomplete trailing run ledger line: ${trailingFragment.length} bytes`);
@@ -199,7 +194,7 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
     }
   });
 
-  it('--json은 개행 없는 구문 손상 trailing record를 건너뛰지 않고 실패한다', () => {
+  it('--json은 개행 없는 구문 손상 trailing record를 건너뛰지 않고 실패한다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-malformed-trailing-'));
     const runId = 'run-malformed-trailing';
     const completeEntry = { timestamp: '2026-09-15T00:00:00.000Z', runId, event: 'start', data: { ready: true } };
@@ -208,8 +203,8 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, `${runId}.jsonl`), `${JSON.stringify(completeEntry)}\n{\"runId\":!}`, 'utf8');
 
-      const r = runCli(stateDir, [runId, '--json']);
-      expect(`status=${r.status}`).toBe('status=1');
+      const r = await runCli(stateDir, [runId, '--json']);
+      expect(`status=${r.exitCode}`).toBe('status=1');
       expect(r.stdout).toBe('');
       expect(r.stderr).toContain('unable to load run ledger: invalid run ledger JSON at line 2');
       expect(r.stderr).not.toContain('skipped incomplete trailing run ledger line');
@@ -218,7 +213,7 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
     }
   });
 
-  it('연합 조회는 다른 우주의 정확 ID와 유일 접두를 찾고, test 우주는 --include-test로만 포함한다', () => {
+  it('연합 조회는 다른 우주의 정확 ID와 유일 접두를 찾고, test 우주는 --include-test로만 포함한다', async () => {
     const prodStateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-prod-'));
     const otherStateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-other-'));
     const testStateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-test-'));
@@ -241,28 +236,28 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
       writeFileSync(join(testStateDir, 'run-ledger', `${testRunId}.jsonl`), `${JSON.stringify({ runId: testRunId, event: 'test-only', data: {} })}\n`, 'utf8');
       const env = { HOME: home };
 
-      const exact = runCli(prodStateDir, [runId, '--all'], env);
-      expect(`status=${exact.status}`).toBe('status=0');
+      const exact = await runCliSpawn(prodStateDir, [runId, '--all'], env);
+      expect(`status=${exact.exitCode}`).toBe('status=0');
       expect(exact.stdout).toContain('elsewhere');
       expect(exact.stdout).toContain(`run ledger found in universe: other (${join(otherStateDir, 'run-ledger')})`);
 
-      const prefix = runCli(prodStateDir, ['run-00801fba-fd19-42e2-ba1c-6bf9b5b5', '--all'], env);
-      expect(`status=${prefix.status}`).toBe('status=0');
+      const prefix = await runCliSpawn(prodStateDir, ['run-00801fba-fd19-42e2-ba1c-6bf9b5b5', '--all'], env);
+      expect(`status=${prefix.exitCode}`).toBe('status=0');
       expect(prefix.stdout).toContain('elsewhere');
 
-      const json = runCli(prodStateDir, [runId, '--all', '--json'], env);
-      expect(`status=${json.status}`).toBe('status=0');
+      const json = await runCliSpawn(prodStateDir, [runId, '--all', '--json'], env);
+      expect(`status=${json.exitCode}`).toBe('status=0');
       expect(json.stdout.trim().split('\n').map((line) => JSON.parse(line))).toEqual([
         expect.objectContaining({ runId, event: 'elsewhere' }),
       ]);
 
-      const excludedTest = runCli(prodStateDir, [testRunId, '--all'], env);
-      expect(`status=${excludedTest.status}`).toBe('status=1');
+      const excludedTest = await runCliSpawn(prodStateDir, [testRunId, '--all'], env);
+      expect(`status=${excludedTest.exitCode}`).toBe('status=1');
       expect(excludedTest.stderr).toContain('checked');
       expect(excludedTest.stderr).not.toContain(join(testStateDir, 'run-ledger', `${testRunId}.jsonl`));
 
-      const includedTest = runCli(prodStateDir, [testRunId, '--all', '--include-test'], env);
-      expect(`status=${includedTest.status}`).toBe('status=0');
+      const includedTest = await runCliSpawn(prodStateDir, [testRunId, '--all', '--include-test'], env);
+      expect(`status=${includedTest.exitCode}`).toBe('status=0');
       expect(includedTest.stdout).toContain('test-only');
       expect(includedTest.stdout).toContain(`run ledger found in universe: test:fixture (${join(testStateDir, 'run-ledger')})`);
     } finally {
@@ -270,7 +265,7 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
     }
   }, 75_000);
 
-  it('접두 모호성·중복 정확 ID·원장 읽기 실패는 후보나 오류를 내고 exit 1로 멈춘다', () => {
+  it('접두 모호성·중복 정확 ID·원장 읽기 실패는 후보나 오류를 내고 exit 1로 멈춘다', async () => {
     const prodStateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-ambiguous-prod-'));
     const otherStateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-ambiguous-other-'));
     const home = mkdtempSync(join(tmpdir(), 'run-ledger-cli-ambiguous-home-'));
@@ -291,15 +286,15 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
       writeFileSync(join(otherStateDir, 'run-ledger', `${secondRunId}.jsonl`), `${JSON.stringify({ runId: secondRunId, event: 'second', data: {} })}\n`, 'utf8');
       const env = { HOME: home };
 
-      const prefix = runCli(prodStateDir, ['run-11111111-1111-4111-8111-11111111111', '--all'], env);
-      expect(`status=${prefix.status}`).toBe('status=1');
+      const prefix = await runCliSpawn(prodStateDir, ['run-11111111-1111-4111-8111-11111111111', '--all'], env);
+      expect(`status=${prefix.exitCode}`).toBe('status=1');
       expect(prefix.stderr).toContain('run ledger lookup is ambiguous');
       expect(prefix.stderr).toContain(firstRunId);
       expect(prefix.stderr).toContain(secondRunId);
 
       writeFileSync(join(otherStateDir, 'run-ledger', `${firstRunId}.jsonl`), `${JSON.stringify({ runId: firstRunId, event: 'duplicate', data: {} })}\n`, 'utf8');
-      const duplicate = runCli(prodStateDir, [firstRunId, '--all'], env);
-      expect(`status=${duplicate.status}`).toBe('status=1');
+      const duplicate = await runCliSpawn(prodStateDir, [firstRunId, '--all'], env);
+      expect(`status=${duplicate.exitCode}`).toBe('status=1');
       expect(duplicate.stderr).toContain('run ledger lookup is ambiguous');
       expect(duplicate.stderr).toContain(`candidate runId=${firstRunId}`);
       expect(duplicate.stderr).toContain('universe=prod');
@@ -308,8 +303,8 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
       expect(duplicate.stderr).toContain(join(otherStateDir, 'run-ledger'));
 
       writeFileSync(join(otherStateDir, 'run-ledger', `${secondRunId}.jsonl`), '{broken\n', 'utf8');
-      const unreadable = runCli(prodStateDir, [secondRunId, '--all'], env);
-      expect(`status=${unreadable.status}`).toBe('status=1');
+      const unreadable = await runCliSpawn(prodStateDir, [secondRunId, '--all'], env);
+      expect(`status=${unreadable.exitCode}`).toBe('status=1');
       expect(unreadable.stderr).toContain('unable to load run ledger');
       expect(unreadable.stderr).toContain('invalid run ledger JSON');
     } finally {
@@ -317,7 +312,7 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
     }
   });
 
-  it('merge attribution은 사람 출력과 JSON에 세 귀속 사실, 제외 수, 정의역 note를 낸다', () => {
+  it('merge attribution은 사람 출력과 JSON에 세 귀속 사실, 제외 수, 정의역 note를 낸다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'merge-attribution-cli-'));
     try {
       const dir = join(stateDir, 'run-ledger');
@@ -362,8 +357,8 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
       }
       expect(queryMergeAttribution({ dir: join(stateDir, 'empty-run-ledger'), crossStoreMergedTotal: 0 }).unattributable).toEqual({ status: 'counted', count: 0 });
 
-      const text = runMergeAttributionCli(stateDir);
-      expect(`status=${text.status}`).toBe('status=0');
+      const text = await runMergeAttributionCli(stateDir);
+      expect(`status=${text.exitCode}`).toBe('status=0');
       expect(text.stdout).toContain(`ledger directory: ${dir}`);
       expect(text.stdout).toContain('elanous merged: 1');
       expect(text.stdout).toContain('handed to human (no merge attempt): 3');
@@ -378,8 +373,8 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
       expect(text.stdout).toContain('excluded ledgers: 1');
       expect(text.stdout).toContain('note: Reads only self-implement run ledgers; it does not read the log-store observations for review-loop auto-merged events or MergePullRequest tool calls.');
 
-      const json = runMergeAttributionCli(stateDir, ['--json']);
-      expect(`status=${json.status}`).toBe('status=0');
+      const json = await runMergeAttributionCli(stateDir, ['--json']);
+      expect(`status=${json.exitCode}`).toBe('status=0');
       expect(JSON.parse(json.stdout)).toMatchObject({
         elanousMergedEntries: [{ runId: fixtureRunId('elanousMerged') }],
         ledgerDirectory: dir,
@@ -402,8 +397,8 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
   });
 });
 
-describe('elanous self goal-source-distribution — 실물 argv', () => {
-  it('세 goalSource 값과 부재를 각각 세며, malformed 원장은 읽지 못한 원장으로 분리한다', () => {
+describe('elanous self goal-source-distribution — test CLI gateway', () => {
+  it('세 goalSource 값과 부재를 각각 세며, malformed 원장은 읽지 못한 원장으로 분리한다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'goal-source-distribution-'));
     try {
       const ledgerDir = join(stateDir, 'run-ledger');
@@ -420,8 +415,8 @@ describe('elanous self goal-source-distribution — 실물 argv', () => {
       writeFileSync(join(ledgerDir, `${fixtureRunId('lost')}.jsonl`), '{not json}\n', 'utf8');
       writeFileSync(join(ledgerDir, 'noncanonical.jsonl'), '{not json}\n', 'utf8');
 
-      const text = runGoalSourceDistributionCli(stateDir);
-      expect(`status=${text.status}`).toBe('status=0');
+      const text = await runGoalSourceDistributionCli(stateDir);
+      expect(`status=${text.exitCode}`).toBe('status=0');
       expect(text.stdout).toContain('runs: 5');
       expect(text.stdout).toContain('authored-goal-file: 1');
       expect(text.stdout).toContain('natural-language-dispatch: 1');
@@ -430,8 +425,8 @@ describe('elanous self goal-source-distribution — 실물 argv', () => {
       expect(text.stdout).toContain('unreadable ledgers: 1');
       expect(text.stdout).toContain('ledger directory missing: false');
 
-      const json = runGoalSourceDistributionCli(stateDir, ['--json']);
-      expect(`status=${json.status}`).toBe('status=0');
+      const json = await runGoalSourceDistributionCli(stateDir, ['--json']);
+      expect(`status=${json.exitCode}`).toBe('status=0');
       expect(JSON.parse(json.stdout)).toMatchObject({
         ledgerDirectory: ledgerDir,
         runCount: 5,
@@ -481,12 +476,12 @@ describe('elanous self goal-source-distribution — 실물 argv', () => {
     }
   });
 
-  it('없는 원장 디렉터리와 정상 빈 디렉터리를 0건과 다른 상태로 낸다', () => {
+  it('없는 원장 디렉터리와 정상 빈 디렉터리를 0건과 다른 상태로 낸다', async () => {
     const missingStateDir = mkdtempSync(join(tmpdir(), 'goal-source-distribution-missing-'));
     const emptyStateDir = mkdtempSync(join(tmpdir(), 'goal-source-distribution-empty-'));
     try {
-      const missing = runGoalSourceDistributionCli(missingStateDir, ['--json']);
-      expect(`status=${missing.status}`).toBe('status=0');
+      const missing = await runGoalSourceDistributionCli(missingStateDir, ['--json']);
+      expect(`status=${missing.exitCode}`).toBe('status=0');
       expect(JSON.parse(missing.stdout)).toMatchObject({
         runCount: 0,
         unreadableLedgerCount: 0,
@@ -494,16 +489,19 @@ describe('elanous self goal-source-distribution — 실물 argv', () => {
       });
 
       mkdirSync(join(emptyStateDir, 'run-ledger'), { recursive: true });
-      const empty = runGoalSourceDistributionCli(emptyStateDir, ['--json']);
-      expect(`status=${empty.status}`).toBe('status=0');
+      const empty = await runGoalSourceDistributionCli(emptyStateDir, ['--json']);
+      expect(`status=${empty.exitCode}`).toBe('status=0');
       expect(JSON.parse(empty.stdout)).toMatchObject({
         runCount: 0,
         unreadableLedgerCount: 0,
         ledgerDirectoryMissing: false,
       });
 
-      const help = spawnSync(process.execPath, [join(sourceRoot, 'bin/elanous.mjs'), 'self', '--help'], { encoding: 'utf8', timeout: 60_000 });
-      expect(`status=${help.status}`).toBe('status=0');
+      const help = await runTestCli(['self', '--help'], {
+        mode: 'spawn', entrypoint: join(sourceRoot, 'bin/elanous.mjs'), cwd: sourceRoot,
+        allowPaths: [['self']],
+      });
+      expect(`status=${help.exitCode}`).toBe('status=0');
       expect(help.stdout).toContain('goal-source-distribution');
     } finally {
       rmSync(missingStateDir, { recursive: true, force: true });
@@ -516,8 +514,8 @@ describe('elanous self goal-source-distribution — 실물 argv', () => {
 //    리뷰는 `src/index.ts` 의 unattributable 출력 수정을 두 라운드 「스코프 크리프」로 지적했으나,
 //    `unattributable` 이 판별 유니온이라 그 수정은 touch-clean tsc 게이트에서 «강제»된다.
 //    ⇒ 되돌리지 않고, 리뷰가 옳게 지적한 「테스트가 없다」를 여기서 닫는다.
-describe('elanous self unfinished-runs — 실물 argv', () => {
-  it('종결 기록 부재와 읽지 못한 원장을 구분하고, 마지막 브랜치 마디로 찾은 골의 경로와 탐색 범위를 낸다', () => {
+describe('elanous self unfinished-runs — test CLI gateway', () => {
+  it('종결 기록 부재와 읽지 못한 원장을 구분하고, 마지막 브랜치 마디로 찾은 골의 경로와 탐색 범위를 낸다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'unfinished-run-ledger-'));
     const cwd = mkdtempSync(join(tmpdir(), 'unfinished-run-goals-'));
     try {
@@ -578,8 +576,8 @@ describe('elanous self unfinished-runs — 실물 argv', () => {
         expect(lifecycleSummary).toContain(`${value} ${lifecycleValues.filter((each) => each === value).length}`);
       }
 
-      const textCli = runUnfinishedRunsCli(stateDir, cwd);
-      expect(`status=${textCli.status}`).toBe('status=0');
+      const textCli = await runUnfinishedRunsCli(stateDir, cwd);
+      expect(`status=${textCli.exitCode}`).toBe('status=0');
       expect(textCli.stdout).toContain('unfinished runs: 5');
       expect(textCli.stdout).toContain('unreadable ledgers: 1');
       expect(textCli.stdout).toContain(`runId=${fixtureRunId('lost')} status=ledger-unreadable branch=unknown plannedPaths=unknown`);
@@ -587,8 +585,8 @@ describe('elanous self unfinished-runs — 실물 argv', () => {
       expect(textCli.stdout).toContain(`  goal document: ${join(realpathSync(goalsDir), 'GOAL-observe-active-runs-a1b2c3d4-2026-08-06.txt')}`);
       expect(textCli.stdout).toContain(`  goal document search directory: ${realpathSync(goalsDir)}`);
 
-      const cli = runUnfinishedRunsCli(stateDir, cwd, ['--json']);
-      expect(`status=${cli.status}`).toBe('status=0');
+      const cli = await runUnfinishedRunsCli(stateDir, cwd, ['--json']);
+      expect(`status=${cli.exitCode}`).toBe('status=0');
       expect(JSON.parse(cli.stdout)).toMatchObject({
         ledgerDirectory: ledgerDir,
         goalsDirectory: realpathSync(goalsDir),
@@ -608,7 +606,7 @@ describe('elanous self unfinished-runs — 실물 argv', () => {
     }
   });
 
-  it('경로 필터는 일치 런과 경로를 읽지 못한 미상 런만 따로 세고 실물 CLI로 전달한다', () => {
+  it('경로 필터는 일치 런과 경로를 읽지 못한 미상 런만 따로 세고 test CLI gateway에 전달한다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'unfinished-run-ledger-path-filter-'));
     const cwd = mkdtempSync(join(tmpdir(), 'unfinished-run-goals-path-filter-'));
     try {
@@ -659,16 +657,16 @@ describe('elanous self unfinished-runs — 실물 argv', () => {
       });
       expect(renderUnfinishedRunLedgers(queried)).toContain('matching paths: 1\nunknown paths: 1');
 
-      const cli = runUnfinishedRunsCli(stateDir, cwd, ['--path', 'src/self-implement/goal-author.ts']);
-      expect(`status=${cli.status}`).toBe('status=0');
+      const cli = await runUnfinishedRunsCli(stateDir, cwd, ['--path', 'src/self-implement/goal-author.ts']);
+      expect(`status=${cli.exitCode}`).toBe('status=0');
       expect(cli.stdout).toContain('matching paths: 1');
       expect(cli.stdout).toContain('unknown paths: 1');
       expect(cli.stdout).toContain(`runId=${matchingRunId}`);
       expect(cli.stdout).toContain(`runId=${unknownRunId}`);
       expect(cli.stdout).not.toContain(`runId=${otherRunId}`);
 
-      const jsonCli = runUnfinishedRunsCli(stateDir, cwd, ['--path', 'src/self-implement/goal-author.ts', '--json']);
-      expect(`status=${jsonCli.status}`).toBe('status=0');
+      const jsonCli = await runUnfinishedRunsCli(stateDir, cwd, ['--path', 'src/self-implement/goal-author.ts', '--json']);
+      expect(`status=${jsonCli.exitCode}`).toBe('status=0');
       expect(JSON.parse(jsonCli.stdout)).toMatchObject({ pathFilter: 'src/self-implement/goal-author.ts', matchingPathCount: 1, unknownPathCount: 1 });
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
@@ -676,7 +674,7 @@ describe('elanous self unfinished-runs — 실물 argv', () => {
     }
   });
 
-  it('원장 goalFile을 브랜치 suffix보다 우선하고 마지막 활동 시각의 결손과 불량 값을 세 표면에서 null로 정규화한다', () => {
+  it('원장 goalFile을 브랜치 suffix보다 우선하고 마지막 활동 시각의 결손과 불량 값을 세 표면에서 null로 정규화한다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'unfinished-run-ledger-authoritative-'));
     const cwd = mkdtempSync(join(tmpdir(), 'unfinished-run-goals-authoritative-'));
     try {
@@ -702,13 +700,13 @@ describe('elanous self unfinished-runs — 실물 argv', () => {
       expect(renderUnfinishedRunLedgers(queried)).toContain(`runId=${fixtureRunId('timestampInvalid')} status=terminal-status-missing branch=unknown plannedPaths=branch-missing declaredPaths=unknown lastActivity=null lastActivityAgeMs=null lastActivityStatus=timestamp-invalid`);
       expect(renderUnfinishedRunLedgers(queried)).toContain(`runId=${fixtureRunId('timestampEmpty')} status=terminal-status-missing branch=unknown plannedPaths=branch-missing declaredPaths=unknown lastActivity=null lastActivityAgeMs=null lastActivityStatus=timestamp-invalid`);
 
-      const textCli = runUnfinishedRunsCli(stateDir, cwd);
-      expect(`status=${textCli.status}`).toBe('status=0');
+      const textCli = await runUnfinishedRunsCli(stateDir, cwd);
+      expect(`status=${textCli.exitCode}`).toBe('status=0');
       expect(textCli.stdout).toContain(`runId=${fixtureRunId('timestampMissing')} status=terminal-status-missing branch=unknown plannedPaths=branch-missing declaredPaths=unknown lastActivity=null lastActivityAgeMs=null lastActivityStatus=timestamp-missing`);
       expect(textCli.stdout).toContain(`runId=${fixtureRunId('timestampEmpty')} status=terminal-status-missing branch=unknown plannedPaths=branch-missing declaredPaths=unknown lastActivity=null lastActivityAgeMs=null lastActivityStatus=timestamp-invalid`);
 
-      const cli = runUnfinishedRunsCli(stateDir, cwd, ['--json']);
-      expect(`status=${cli.status}`).toBe('status=0');
+      const cli = await runUnfinishedRunsCli(stateDir, cwd, ['--json']);
+      expect(`status=${cli.exitCode}`).toBe('status=0');
       expect(JSON.parse(cli.stdout).entries).toEqual(expect.arrayContaining([
         expect.objectContaining({ runId: fixtureRunId('ledgerGoal'), plannedPathStatus: 'found-ledger-goal-file', goalDocumentPath: authoritativeGoal, plannedPaths: ['src/self-implement/run-ledger.ts'] }),
         expect.objectContaining({ runId: fixtureRunId('timestampMissing'), lastActivityTimestamp: null, lastActivityAgeMs: null, lastActivityStatus: 'timestamp-missing' }),
@@ -776,19 +774,19 @@ describe('elanous self unfinished-runs — 실물 argv', () => {
     }
   });
 
-  it('텍스트 CLI가 원장 디렉터리 부재와 정상 빈 원장 범위를 다르게 표시한다', () => {
+  it('텍스트 CLI가 원장 디렉터리 부재와 정상 빈 원장 범위를 다르게 표시한다', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'unfinished-run-ledger-scope-'));
     const cwd = mkdtempSync(join(tmpdir(), 'unfinished-run-goals-scope-'));
     try {
-      const missing = runUnfinishedRunsCli(stateDir, cwd);
-      expect(`status=${missing.status}`).toBe('status=0');
+      const missing = await runUnfinishedRunsCli(stateDir, cwd);
+      expect(`status=${missing.exitCode}`).toBe('status=0');
       expect(missing.stdout).toContain(`ledger directory: ${join(stateDir, 'run-ledger')}`);
       expect(missing.stdout).toContain('ledger directory status: missing (no run ledgers were scanned)');
       expect(missing.stdout).toContain('unfinished runs: 0');
 
       mkdirSync(join(stateDir, 'run-ledger'), { recursive: true });
-      const empty = runUnfinishedRunsCli(stateDir, cwd);
-      expect(`status=${empty.status}`).toBe('status=0');
+      const empty = await runUnfinishedRunsCli(stateDir, cwd);
+      expect(`status=${empty.exitCode}`).toBe('status=0');
       expect(empty.stdout).toContain('ledger directory status: present');
       expect(empty.stdout).toContain('unfinished runs: 0');
       expect(empty.stdout).not.toContain('missing (no run ledgers were scanned)');
@@ -900,7 +898,7 @@ describe('run screen key resolution', () => {
     });
   });
 
-  it('self screen --run resolves the logged key, rejects ambiguous input, and reports a missing frame without throwing', () => {
+  it('self screen --run resolves the logged key, rejects ambiguous input, and reports a missing frame without throwing', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'run-screen-cli-'));
     const runId = 'run-00000000-0000-4000-8000-000000000097';
     try {
@@ -911,8 +909,8 @@ describe('run screen key resolution', () => {
       store.close();
       writeHarnessScreen('resolved-screen', 'resolved frame', { ELANOUS_STATE_DIR: stateDir });
 
-      const resolved = runScreenCli(stateDir, ['--run', runId]);
-      expect(`status=${resolved.status}`).toBe('status=0');
+      const resolved = await runScreenCli(stateDir, ['--run', runId]);
+      expect(`status=${resolved.exitCode}`).toBe('status=0');
       expect(resolved.stdout).toContain(`하니스 화면: resolved-screen · runId=${runId}`);
       expect(resolved.stdout).toContain('resolved frame');
 
@@ -922,46 +920,46 @@ describe('run screen key resolution', () => {
       collisionStore.close();
       writeHarnessScreen('foo-old', 'wrong partial-match frame', { ELANOUS_STATE_DIR: stateDir });
 
-      const exactMissing = runScreenCli(stateDir, ['--run', collisionRunId]);
-      expect(`status=${exactMissing.status}`).toBe('status=0');
+      const exactMissing = await runScreenCli(stateDir, ['--run', collisionRunId]);
+      expect(`status=${exactMissing.exitCode}`).toBe('status=0');
       expect(exactMissing.stdout).toContain(`화면 버퍼 없음: foo (runId=${collisionRunId} 해석됨·아직 프레임 미기록)`);
       expect(exactMissing.stdout).not.toContain('wrong partial-match frame');
 
       writeHarnessScreen('foo', 'exact frame', { ELANOUS_STATE_DIR: stateDir });
-      const exact = runScreenCli(stateDir, ['--run', collisionRunId]);
-      expect(`status=${exact.status}`).toBe('status=0');
+      const exact = await runScreenCli(stateDir, ['--run', collisionRunId]);
+      expect(`status=${exact.exitCode}`).toBe('status=0');
       expect(exact.stdout).toContain(`하니스 화면: foo · runId=${collisionRunId}`);
       expect(exact.stdout).toContain('exact frame');
       expect(exact.stdout).not.toContain('wrong partial-match frame');
 
-      const ambiguous = runScreenCli(stateDir, ['--run', runId, '--space', 'resolved-screen']);
-      expect(`status=${ambiguous.status}`).toBe('status=2');
+      const ambiguous = await runScreenCli(stateDir, ['--run', runId, '--space', 'resolved-screen']);
+      expect(`status=${ambiguous.exitCode}`).toBe('status=2');
       expect(`${ambiguous.stdout}${ambiguous.stderr}`).toContain('--run 과 --space 는 함께 사용할 수 없습니다.');
 
       // ⛔⭐⭐ 리뷰 should-fix — **해석 실패가 `0` 이면 자동화가 「화면을 봤다」로 읽는다.**
       //   사람은 문장을 읽지만 스크립트는 «종료 코드»만 본다. 사유는 갈라서 내되 코드는 «0 이 아니다».
       //   ⚠️ `2` 는 위 「동시 지정」이 쓰는 «사용법 오류»다 — 해석 실패는 `1` 이다(서로 다른 값이어야 갈린다).
-      const unknownRun = runScreenCli(stateDir, ['--run', 'run-00000000-0000-4000-8000-000000000092']);
-      expect(`status=${unknownRun.status}`).toBe('status=1');
+      const unknownRun = await runScreenCli(stateDir, ['--run', 'run-00000000-0000-4000-8000-000000000092']);
+      expect(`status=${unknownRun.exitCode}`).toBe('status=1');
       expect(`${unknownRun.stdout}${unknownRun.stderr}`).toContain('이 runId의 이벤트가 없습니다. runId와 인스턴스 우주를 확인하세요. 마지막 이벤트: 없음');
 
       // ⛔⭐⭐ 리뷰 must-fix — **`--run ''` «단독»이 핵심 누출 경로다.** 종전엔 `if (opts.run)` 이
       //   truthy 라 해석을 통째로 건너뛰고 ***조용히 최신 화면(= 남의 런일 수 있다)***을 냈다.
       //   ⇒ 이 옵션이 «막으려던 바로 그 사고»를 이 옵션이 다시 만들었다. 그래서 «단독»을 따로 잰다.
-      const emptyRunAlone = runScreenCli(stateDir, ['--run', '']);
-      expect(`status=${emptyRunAlone.status}`).toBe('status=2');
+      const emptyRunAlone = await runScreenCliSpawn(stateDir, ['--run', '']);
+      expect(`status=${emptyRunAlone.exitCode}`).toBe('status=2');
       expect(`${emptyRunAlone.stdout}${emptyRunAlone.stderr}`).toContain('--run 에 빈 runId 를 줄 수 없습니다.');
       expect(emptyRunAlone.stdout).not.toContain('resolved frame');
 
       // ⛔⭐ 그리고 «충돌 조합»에서도 뚫렸다(같은 truthy 결함의 다른 얼굴).
-      const emptyRunWithSpace = runScreenCli(stateDir, ['--run', '', '--space', 'resolved-screen']);
-      expect(`status=${emptyRunWithSpace.status}`).toBe('status=2');
+      const emptyRunWithSpace = await runScreenCliSpawn(stateDir, ['--run', '', '--space', 'resolved-screen']);
+      expect(`status=${emptyRunWithSpace.exitCode}`).toBe('status=2');
       expect(`${emptyRunWithSpace.stdout}${emptyRunWithSpace.stderr}`).toContain('--run 과 --space 는 함께 사용할 수 없습니다.');
 
       const noStoreDir = mkdtempSync(join(tmpdir(), 'run-screen-cli-nostore-'));
       try {
-        const missingStore = runScreenCli(noStoreDir, ['--run', runId]);
-        expect(`status=${missingStore.status}`).toBe('status=1');
+        const missingStore = await runScreenCli(noStoreDir, ['--run', runId]);
+        expect(`status=${missingStore.exitCode}`).toBe('status=1');
         expect(`${missingStore.stdout}${missingStore.stderr}`).toContain('로그 스토어 missing');
       } finally {
         rmSync(noStoreDir, { recursive: true, force: true });
@@ -971,8 +969,8 @@ describe('run screen key resolution', () => {
       const writable = new LogStore(logPath, { instance: 'test' });
       writable.insertBatch([{ surface: 'test', rec: { ts: '2026-08-07T00:01:00.000Z', category: 'self-implement', event: 'headless.spawn', data: { runId: noFrameRunId, screenKey: 'not-yet-written' } } }]);
       writable.close();
-      const missingFrame = runScreenCli(stateDir, ['--run', noFrameRunId]);
-      expect(`status=${missingFrame.status}`).toBe('status=0');
+      const missingFrame = await runScreenCli(stateDir, ['--run', noFrameRunId]);
+      expect(`status=${missingFrame.exitCode}`).toBe('status=0');
       expect(missingFrame.stdout).toContain(`화면 버퍼 없음: not-yet-written (runId=${noFrameRunId} 해석됨·아직 프레임 미기록)`);
 
       // ⛔⭐ **계약이 바뀌었다: 해석 실패는 «0 이 아니다»**(리뷰 should-fix).
@@ -982,9 +980,9 @@ describe('run screen key resolution', () => {
       const failedStore = new LogStore(logPath, { instance: 'test' });
       failedStore.insertBatch([{ surface: 'test', rec: { ts: new Date(Date.now() - 60_000).toISOString(), category: 'dev-pipeline', event: 'error', data: { runId: noSpawnRunId } } }]);
       failedStore.close();
-      const noSpawn = runScreenCli(stateDir, ['--run', noSpawnRunId]);
+      const noSpawn = await runScreenCli(stateDir, ['--run', noSpawnRunId]);
       const noSpawnOutput = `${noSpawn.stdout}${noSpawn.stderr}`;
-      expect(`status=${noSpawn.status}`).toBe('status=1');
+      expect(`status=${noSpawn.exitCode}`).toBe('status=1');
       expect(noSpawnOutput).toContain('파이프라인이 오류로 멈췄습니다. 해당 error를 읽어 원인을 수리하세요.');
       expect(noSpawnOutput).toContain('마지막 이벤트: dev-pipeline/error');
       expect(noSpawnOutput).toContain('분 전');

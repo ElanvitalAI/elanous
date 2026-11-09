@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-NEXT-TUI-SEAT-SCENARIOS-TS",
+  "path": "src/ux-sim/next-tui-seat-scenarios.ts",
+  "boundary": "Runs next-TUI session, resume, queue, tool, goal and subagent scenarios through a real PTY child in an isolated state root, then checks rendered frames and logs.",
+  "deviceIds": [
+    "first-run-and-seminar"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

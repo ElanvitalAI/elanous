@@ -1,7 +1,9 @@
 import { expect, test } from 'bun:test';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { createPodReuseResidueFaultFixture } from './fault-pod-reuse-residue.js';
 import { loadMockScenarioCatalog } from './mock-scenario-catalog.js';
+import { loadDeviceCatalogSnapshotsFromRoot } from './device-catalog-snapshot-fragments.js';
 
 test('injects independently observable Git, credential, and child-process inventory residue into a reused worker', () => {
   const fixture = createPodReuseResidueFaultFixture();
@@ -40,6 +42,6 @@ test('registers the device implementation and immutable world catalog snapshot',
   expect(device?.tests).toContain('src/ux-sim/fault-pod-reuse-residue.test.ts');
   const sourceModuleId = 'MD-UX-SIM-FAULT-POD-REUSE-RESIDUE-TS';
   expect(catalog.sourceModules.some((entry) => entry.id === sourceModuleId)).toBe(true);
-  const snapshots = JSON.parse(readFileSync(new URL('../sim-world-device-catalogs.json', import.meta.url), 'utf8')) as Record<string, string[]>;
+  const snapshots = loadDeviceCatalogSnapshotsFromRoot(fileURLToPath(new URL('../..', import.meta.url)));
   expect(snapshots[String(catalog.deviceCatalogVersion)]).toContain(sourceModuleId);
 });

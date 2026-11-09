@@ -14,7 +14,7 @@ const SUBSCRIBER_NODE_ID = 'macrophage-heal';
 const DECISION_EVENT = 'release.macrophage.decision';
 const TRAIN_EVENTS = new Set(['merge-train.batch', 'merge-train.verdict', 'merge-train.incident']);
 const PHASE_WAKE_NODES = new Set(['pre-gate-join', 'pre-prepare-join', 'release-post-publish-join', 'traffic-failed-restore']);
-const FAILURE_WAKE_NODES = new Set(['export-check', 'gate', 'gate-triage', 'pwa', 'notes-recheck', 'verify']);
+const FAILURE_WAKE_NODES = new Set(['export-check', 'gate', 'residual-run', 'gate-triage', 'pwa', 'notes-recheck', 'verify']);
 
 export interface MacrophageRuntimeOptions {
   readonly runId: string;
@@ -212,7 +212,7 @@ export function createMacrophageRuntime(options: MacrophageRuntimeOptions): Macr
           detail: JSON.stringify(dispatch.event.data ?? {}) } }] : []),
     ];
     const result = runMacrophageHeal({ phase: 'idle', mode: options.mode ?? 'live', now: (options.now ?? (() => new Date()))(),
-      consecutiveFailureLimit: options.consecutiveFailureLimit ?? 3, inventory });
+      promotionMode: options.mode, consecutiveFailureLimit: options.consecutiveFailureLimit ?? 3, inventory });
     const rows = result.events.length ? result.events : [{ id: 'inventory', kind: 'parked-pr' as const,
       evidence: 'no scrap inventory evidence was attached to the phase event', action: 'retain' as const,
       result: 'unmeasured no cleanup applied', applied: false }];

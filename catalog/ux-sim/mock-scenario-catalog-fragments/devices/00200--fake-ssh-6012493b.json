@@ -1,0 +1,29 @@
+{
+  "id": "fake-ssh",
+  "name": "Fake SSH",
+  "implementation": [
+    "src/ux-sim/fake-ssh.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-ssh.test.ts"
+  ],
+  "target": "release-loop GateRunner SSH dependency seam with a fixed per-host session snapshot; it does not increment sessions or run concurrent connections",
+  "inputs": [
+    "fixed host session snapshot",
+    "MaxStartups limit",
+    "banner timeout threshold and fake-clock delay",
+    "scp disconnect"
+  ],
+  "observations": [
+    "host/script call capture",
+    "success or MaxStartups refusal",
+    "banner success before deadline or timeout at the first deadline",
+    "scp transport reset"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-ssh.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

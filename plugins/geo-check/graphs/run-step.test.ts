@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { runGraph } from '../../../src/graph-runner/runner.js';
+import { runTestCli } from '../../../test/helpers/cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -166,15 +167,14 @@ slowTest('fake-CLI graph run reaches done and writes one report table', async ()
   try {
     const repo = join(dir, '../../..');
     const input = { brand: 'Elanous', domain: 'elanous.ai', outDir: join(f.root, 'report'), questions: ['Which assistant is best?'] };
-    const proc = Bun.spawn(['bun', join(repo, 'bin/elanous.mjs'), `--test=${join(f.root, 'state')}`, 'graph', 'run', graphFile, '--input', JSON.stringify(input), '--json'], {
-      cwd: repo, env: { ...process.env, GEO_CHECK_ELANOUS_BIN: f.bin }, stdout: 'pipe', stderr: 'pipe',
+    const result = await runTestCli(['graph', 'run', graphFile, '--input', JSON.stringify(input), '--json'], {
+      cwd: repo, stateRoot: join(f.root, 'state'), allowPaths: [['graph', 'run']], env: { GEO_CHECK_ELANOUS_BIN: f.bin },
     });
-    const [stdout, stderr, exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-    expect(exit).toBe(0);
-    const state = JSON.parse(stdout);
+    expect(result.exitCode).toBe(0);
+    const state = JSON.parse(result.stdout);
     expect(state.status).toBe('done');
     expect(state.path).toEqual([...steps, 'done']);
-    expect(stderr).not.toContain('graph run:');
+    expect(result.stderr).not.toContain('graph run:');
     const markdown = readFileSync(join(f.root, 'report', 'report.md'), 'utf8');
     expect(markdown.match(/\| Question \| Engine \| Mention \| Citation \| Rank \| Error \|/g)).toHaveLength(1);
     const report = JSON.parse(readFileSync(join(f.root, 'report', 'report.json'), 'utf8'));
@@ -191,12 +191,11 @@ slowTest('no missing cells produce no fabricated evidence and a done report', as
   try {
     const repo = join(dir, '../../..');
     const input = { brand: 'Elanous', domain: 'https://www.elanous.ai/', outDir: join(f.root, 'complete'), questions: ['Which assistant is best?'] };
-    const proc = Bun.spawn(['bun', join(repo, 'bin/elanous.mjs'), `--test=${join(f.root, 'state')}`, 'graph', 'run', graphFile, '--input', JSON.stringify(input), '--json'], {
-      cwd: repo, env: { ...process.env, GEO_CHECK_ELANOUS_BIN: f.bin, GEO_CHECK_ALL_CITED: '1' }, stdout: 'pipe', stderr: 'pipe',
+    const result = await runTestCli(['graph', 'run', graphFile, '--input', JSON.stringify(input), '--json'], {
+      cwd: repo, stateRoot: join(f.root, 'state'), allowPaths: [['graph', 'run']], env: { GEO_CHECK_ELANOUS_BIN: f.bin, GEO_CHECK_ALL_CITED: '1' },
     });
-    const [stdout, exit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    expect(exit).toBe(0);
-    expect(JSON.parse(stdout).status).toBe('done');
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).status).toBe('done');
     const report = JSON.parse(readFileSync(join(f.root, 'complete', 'report.json'), 'utf8'));
     expect(report.table).toHaveLength(2);
     expect(report.table.every((cell: any) => cell.mention && cell.citation)).toBe(true);
@@ -211,12 +210,11 @@ async function citationRun(reply: string) {
   try {
     const repo = join(dir, '../../..');
     const input = { brand: 'Elanous', domain: 'elanous.ai', engines: ['openai-codex', 'grok'], outDir: join(f.root, 'out'), questions: ['Which assistant is best?'] };
-    const proc = Bun.spawn(['bun', join(repo, 'bin/elanous.mjs'), `--test=${join(f.root, 'state')}`, 'graph', 'run', graphFile, '--input', JSON.stringify(input), '--json'], {
-      cwd: repo, env: { ...process.env, GEO_CHECK_ELANOUS_BIN: f.bin, GEO_CHECK_NO_WEB: '1', GEO_CHECK_REPLY: reply }, stdout: 'pipe', stderr: 'pipe',
+    const result = await runTestCli(['graph', 'run', graphFile, '--input', JSON.stringify(input), '--json'], {
+      cwd: repo, stateRoot: join(f.root, 'state'), allowPaths: [['graph', 'run']], env: { GEO_CHECK_ELANOUS_BIN: f.bin, GEO_CHECK_NO_WEB: '1', GEO_CHECK_REPLY: reply },
     });
-    const [stdout, exit] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    expect(exit).toBe(0);
-    expect(JSON.parse(stdout).status).toBe('done');
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout).status).toBe('done');
     return JSON.parse(readFileSync(join(f.root, 'out', 'report.json'), 'utf8')).table[0] as { mention: boolean; citation: boolean | null };
   } finally { f.cleanup(); }
 }

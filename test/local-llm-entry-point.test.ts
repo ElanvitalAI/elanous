@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { createSession, loadSession } from '../src/session/index.js';
 import { runTurn } from '../src/session/chat.js';
 import { getProviderForConfig, LocalProvider } from '../src/llm.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 import { createFakeFetchDevice, type FakeFetchDevice } from '../src/ux-sim/fake-fetch.js';
 
 // ── Fixtures ─────────────────────────────────────────────────

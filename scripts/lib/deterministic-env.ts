@@ -144,10 +144,7 @@ export function prepareIsolatedTestEnv(sourceEnv: NodeJS.ProcessEnv, testRoot: s
   delete env.ELANOUS_CONFIG_DIR;
   // All ambient execution identities are removed by EXECUTION_ORIGIN_ENV_KEYS
   // above, before the child is spawned; logger API-shape tests need their absence.
-  // ⚠️ No `ELANOUS_TEST_DETERMINISTIC` marker is exported. Nothing reads it yet,
-  // and an env var with no consumer is a surface that looks like a contract
-  // while guaranteeing nothing — a later test could branch on it believing it
-  // means something. The tier work in PLAN-test-suite-diet introduces the
-  // signal together with the code that honours it.
+  // Install test tiering is set by the deterministic runner at its spawn
+  // boundary, where the selected suite consumes the marker.
   return envLiteral(env);
 }

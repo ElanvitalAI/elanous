@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,6 +6,7 @@ import { basename, join } from 'node:path';
 import { inspectReleaseGateHost, readGateHostResourcesForHost, reserveReleaseGateHosts, startGuardianHostLeaseHeartbeat } from './gate-host-reservation.js';
 import { podPoolHostLease, type PodPoolMember } from '../task-orchestrator/surfaces/pod-pool.js';
 import { admitGuardianHostLease, guardianHostLeaseRecords, readResourceLedger, requestGuardianHostLease, resourceLedgerPath } from '../resource-ledger/resource-ledger.js';
+import { debug } from '../debug/log.js';
 
 const roots: string[] = [];
 const root = () => { const path = mkdtempSync(join(tmpdir(), 'gate-host-reserve-')); roots.push(path); return path; };
@@ -110,6 +111,24 @@ test('read-only reservation inspection ignores dead claims without deleting them
   writeFileSync(file, JSON.stringify({ ...claim, pid: 99999999, pidStartedAt: null }));
   expect(inspectReleaseGateHost(state, 'node-b', { reclaimDead: false })).toEqual({ status: 'free' });
   expect(readdirSync(dir).filter(name => name.endsWith('.json'))).toEqual([basename(file)]);
+});
+
+test('a dead gate owner held for two hours emits a queryable orphan alert before reclamation', () => {
+  const state = root();
+  reserveReleaseGateHosts(state, 'orphaned-gate-run', ['node-b']);
+  const dir = join(state, 'release', 'gate-host-reservations');
+  const file = join(dir, readdirSync(dir).find(name => name.endsWith('.json'))!);
+  const claim = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+  writeFileSync(file, JSON.stringify({ ...claim, pid: 99999999, pidStartedAt: null,
+    reservedAt: Date.now() - 2 * 60 * 60 * 1000 - 1 }));
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    expect(inspectReleaseGateHost(state, 'node-b')).toEqual({ status: 'free' });
+    expect(log).toHaveBeenCalledWith('release-loop.gate', 'orphan-host-claim-alert', expect.objectContaining({
+      runId: 'orphaned-gate-run', hosts: ['node-b'], pid: 99999999, ageMs: expect.any(Number),
+    }), { level: 'error' });
+    expect(readdirSync(dir).filter(name => name.endsWith('.json'))).toEqual([]);
+  } finally { log.mockRestore(); }
 });
 
 test('a missing reservation directory is unmeasured, not a free host', () => {

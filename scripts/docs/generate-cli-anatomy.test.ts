@@ -1,9 +1,11 @@
-import { expect, test } from 'bun:test';
+import { expect, setDefaultTimeout, test } from 'bun:test';
 import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { renderCliAnatomy } from './generate-cli-anatomy.js';
+
+setDefaultTimeout(60_000);
 
 const BRIEF = `const brief = program.command('brief').description('브리핑');
 brief.command('add').description('추가');

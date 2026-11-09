@@ -2,15 +2,15 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runAgentMission, codexBackend, type EvidenceMode } from './driver.js';
+import { runAgentMission, codexBackend, setAgentMissionTimingForTest, type EvidenceMode } from './driver.js';
 import { emitPtyDecision, type PtyDecision } from './pty-decision.js';
 import { runPtyControlLoop } from '../autopilot/pty-control-loop.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
 import { debug } from '../debug/log.js';
 
-type Fixture = { result: Awaited<ReturnType<typeof runAgentMission>>; writes: string[]; events: PtyDecision[]; calls: number; kills: number; terminatedPids: number[] };
+type Fixture = { result: Awaited<ReturnType<typeof runAgentMission>>; writes: string[]; events: PtyDecision[]; calls: number; kills: number; terminatedPids: number[]; clockReads: number; readyCapturedAt: number | undefined };
 
-async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' | 'changing-after-interrupt' | 'question' | 'choice-question' | 'scrollback' | 'changing-question' | 'progress-after-enter' | 'failed-screen' | 'failed-no-evidence' | 'rg-screen' | 'no-success' | 'healthy', evidence: EvidenceMode = { kind: 'doc', dirRel: 'docs', glob: /output/ }, enhance?: boolean, chain?: readonly ('codex' | 'claude' | 'elanous')[]): Promise<Fixture> {
+async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' | 'changing-after-interrupt' | 'question' | 'choice-question' | 'scrollback' | 'changing-question' | 'progress-after-enter' | 'output-before-quiet' | 'continuous-output' | 'failed-screen' | 'failed-no-evidence' | 'rg-screen' | 'no-success' | 'healthy', evidence: EvidenceMode = { kind: 'doc', dirRel: 'docs', glob: /output/ }, enhance?: boolean, chain?: readonly ('codex' | 'claude' | 'elanous')[]): Promise<Fixture> {
   const dir = mkdtempSync(join(tmpdir(), 'mission-recover-'));
   const writes: string[] = [];
   const events: PtyDecision[] = [];
@@ -21,10 +21,17 @@ async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' |
   let ready = ['failed-screen', 'rg-screen', 'no-success', 'healthy'].includes(mode);
   const finished = ['failed-screen', 'failed-no-evidence', 'rg-screen', 'no-success', 'healthy'].includes(mode);
   let now = 0;
+  let clockReads = 0;
+  let readyCapturedAt: number | undefined;
   let calls = 0;
   let kills = 0;
   const terminatedPids: number[] = [];
   let changingFrame = 0;
+  let progressDelivered = false;
+  const restoreTiming = setAgentMissionTimingForTest({
+    now: () => { clockReads++; return now; },
+    sleep: async (ms) => { now += ms; },
+  });
   try {
     const result = await runAgentMission({
       mission: 'Run the command', repo: dir, branch: 'fixture', agent: codexBackend,
@@ -37,15 +44,25 @@ async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' |
       emitPtyDecision: (input) => emitPtyDecision(input, (_category, _event, row) => { events.push(row as PtyDecision); }),
       startPty: ((opts) => ({
         id: opts.id!, pid: 4242, kind: 'codex', nickname: 'fixture', accessMode: 'auto',
-        isAlive: () => true, canWrite: () => true, drainDelta: () => '',
-        renderScreen: async () => mode === 'question' ? 'Use the existing file?'
+        isAlive: () => true, canWrite: () => true, drainDelta: () => {
+          if (mode === 'continuous-output') return 'new output';
+          if (mode === 'output-before-quiet' && !progressDelivered && now >= 1_200) {
+            progressDelivered = true;
+            return 'new output';
+          }
+          return '';
+        },
+        renderScreen: async () => {
+          readyCapturedAt ??= now;
+          return mode === 'question' ? 'Use the existing file?'
           : mode === 'choice-question' ? 'Proceed? [y/N]'
           : mode === 'scrollback' ? `Proceed? [y/N]\nworking on task ${++changingFrame}`
           : mode === 'changing-question' ? `working on task ${++changingFrame}\nProceed? [y/N]`
           : mode === 'progress-after-enter' ? writes.length > 2
             ? `Proceed? [y/N]\nworking on task ${++changingFrame}` : 'Proceed? [y/N]'
           : mode === 'changing-after-interrupt' && writes.includes('\x03')
-            ? `working on task ${++changingFrame}` : screen,
+            ? `working on task ${++changingFrame}` : screen;
+        },
         renderScreenPng: async () => null,
         write: (text: string) => {
           writes.push(text);
@@ -61,15 +78,31 @@ async function fakeMission(mode: 'unlock' | 'stuck' | 'prompt-after-interrupt' |
         sleep: async () => { now += ['question', 'choice-question', 'scrollback', 'changing-question', 'progress-after-enter'].includes(mode) ? 1 : 40_000; },
       }, opts),
     });
-    return { result, writes, events, calls, kills, terminatedPids };
-  } finally { rmSync(dir, { recursive: true, force: true }); }
+    return { result, writes, events, calls, kills, terminatedPids, clockReads, readyCapturedAt };
+  } finally {
+    restoreTiming();
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 test('fake PTY frozen for 40 seconds recovers with Enter and accepts the resulting evidence', async () => {
-  const { result, writes, events } = await fakeMission('unlock');
+  const { result, writes, events, clockReads, readyCapturedAt } = await fakeMission('unlock');
   expect(result.ok).toBe(true);
+  // Source: #35339 fake PTY clock injection must be read during recovery.
+  expect(clockReads).toBeGreaterThan(0);
+  expect(readyCapturedAt).toBe(1_500);
   expect(writes.slice(2)).toEqual(['\r']);
   expect(events.filter((event): event is Extract<PtyDecision, { step: 'recover' }> => event.step === 'recover').map((event) => event.detail.action)).toEqual(['Enter']);
+});
+
+test('waitForQuiet restarts its quiet threshold after fake PTY output', async () => {
+  const { readyCapturedAt } = await fakeMission('output-before-quiet');
+  expect(readyCapturedAt).toBe(2_700);
+});
+
+test('continuous fake PTY output reaches the virtual max wait before capture', async () => {
+  const { readyCapturedAt } = await fakeMission('continuous-output');
+  expect(readyCapturedAt).toBe(20_100);
 });
 
 test('fake PTY still frozen escalates Enter, Esc, Ctrl-C plus previous command, then human with last screen', async () => {

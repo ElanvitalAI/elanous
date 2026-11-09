@@ -1,0 +1,19 @@
+{
+  "id": "FLUTTER-DEPLOY-JOURNEY",
+  "name": "Flutter app deploy requires simulation and explicit confirmation",
+  "kind": "flutter-deploy-journey",
+  "device": "flutter-deploy-journey",
+  "implementation": [
+    "src/ux-sim/flutter-deploy-journey.ts"
+  ],
+  "tests": [
+    "src/ux-sim/flutter-deploy-journey.test.ts"
+  ],
+  "trigger": "Replay a spoken Flutter app request through create, Android APK build, simulated deploy, ACP confirmation, and publish.",
+  "observe": [
+    "simulation must return a passing receipt before confirmation is requested",
+    "declined, malformed, or cancelled confirmation never publishes",
+    "published URL must match the trusted origin assigned at app creation"
+  ],
+  "expected": "The app publishes only after a passing simulation and explicit yes, and only at its assigned public origin."
+}

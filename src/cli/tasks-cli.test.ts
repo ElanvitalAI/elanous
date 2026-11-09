@@ -43,6 +43,182 @@ test('hidden parent-host contract probe emits this CLI build’s own compatibili
   expect(result.code).toBeUndefined();
 });
 
+test('TA-LAND-COUNT-FROM-LEDGER counts live parents, excludes orphaned terminal parents, and refuses missing ledgers', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-land-count-'));
+  const statePath = join(root, 'task-agent-actions.json');
+  const ledgerDir = join(root, 'run-ledger');
+  const makeCard = (id: string): TaskCard => ({ id: `ta-${id}`, text: id, createdAt: '2026-11-05T00:00:00Z',
+    status: 'launched', taLand: true, runId: `run-${id}`, history: [] });
+  try {
+    writeTaskCards(statePath, [makeCard('orphan'), makeCard('live'), makeCard('missing')]);
+    appendRunLedgerEntry({ runId: 'run-orphan', event: 'run-status', data: { runStatus: 'completed' } }, ledgerDir);
+    appendRunLedgerEntry({ runId: 'run-live', event: 'node-enter', data: { node: 'implementation' } }, ledgerDir);
+    const unknown = await run(['tasks', 'land-count', '--json'], { taskStatePath: statePath });
+    expect(unknown.code).toBe(1);
+    expect(JSON.parse(unknown.lines[0]!)).toMatchObject({ count: null, active: ['ta-live'], terminal: ['ta-orphan'], unknown: ['ta-missing'] });
+    appendRunLedgerEntry({ runId: 'run-missing', event: 'run-status', data: { runStatus: 'failed' } }, ledgerDir);
+    const measured = await run(['tasks', 'land-count', '--json'], { taskStatePath: statePath });
+    expect(measured.code ?? 0).toBe(0);
+    expect(JSON.parse(measured.lines[0]!)).toMatchObject({ count: 1, active: ['ta-live'], terminal: ['ta-missing', 'ta-orphan'], unknown: [] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('TA-LAND-COUNT-FROM-LEDGER guards the live ta-land CLI launch from its measured ledger count', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-ta-land-dispatch-'));
+  const launches: string[][] = [];
+  const observations: Array<{ event: string; data?: unknown }> = [];
+  const off = debug.registerSink({ name: 'ta-land-count-dispatch-observation', emit: (rec) => {
+    if (rec.category === 'task-agent.hand' && rec.event.startsWith('ta-land-count-')) observations.push(rec);
+  } });
+  const card = (id: string, runId: string): TaskCard => ({ id, text: id, createdAt: '2026-11-08T00:00:00Z',
+    status: 'launched', taLand: true, runId, history: [] });
+  const deps = (statePath: string): TasksCliDeps => ({ taskStatePath: statePath, registerSink: async () => true,
+    taskLauncher: (args) => { launches.push([...args]); } });
+  try {
+    const missingTarget = await run(['tasks', 'hand', 'new task', '--ta-land', '--live'], deps(join(root, 'missing/cards.json')));
+    expect(missingTarget.code).toBe(1);
+    expect(missingTarget.lines.join('\n')).toContain('명시적 --ta-land-max N');
+    expect(launches).toHaveLength(0);
+    const splitMode = await run(['tasks', 'hand', 'new task', '--ta-land', '--ta-land-max', '2', '--tier', '상', '--live'], deps(join(root, 'split/cards.json')));
+    expect(splitMode.code).toBe(1);
+    expect(splitMode.lines.join('\n')).toContain('다중 조각 발사');
+    expect(launches).toHaveLength(0);
+
+    const admittedRoot = join(root, 'admitted');
+    const admittedState = join(admittedRoot, 'task-agent-actions.json');
+    mkdirSync(admittedRoot, { recursive: true });
+    writeTaskCards(admittedState, [card('ta-active', 'run-active'), card('ta-old', 'run-terminal')]);
+    appendRunLedgerEntry({ runId: 'run-active', event: 'node-enter', data: { node: 'implementation' } }, join(admittedRoot, 'run-ledger'));
+    appendRunLedgerEntry({ runId: 'run-terminal', event: 'run-status', data: { runStatus: 'completed' } }, join(admittedRoot, 'run-ledger'));
+    const admitted = await run(['tasks', 'hand', 'new task', '--ta-land', '--ta-land-max', '2', '--live'], deps(admittedState));
+    expect(admitted.code ?? 0).toBe(0);
+    expect(launches).toHaveLength(1);
+    expect(observations).toContainEqual(expect.objectContaining({ event: 'ta-land-count-admitted', data: expect.objectContaining({ active: 1, target: 2, activeIds: ['ta-active'] }) }));
+
+    launches.length = 0;
+    const fullRoot = join(root, 'full');
+    const fullState = join(fullRoot, 'task-agent-actions.json');
+    mkdirSync(fullRoot, { recursive: true });
+    writeTaskCards(fullState, [card('ta-active-a', 'run-active-a'), card('ta-active-b', 'run-active-b')]);
+    appendRunLedgerEntry({ runId: 'run-active-a', event: 'node-enter', data: { node: 'implementation' } }, join(fullRoot, 'run-ledger'));
+    appendRunLedgerEntry({ runId: 'run-active-b', event: 'node-enter', data: { node: 'implementation' } }, join(fullRoot, 'run-ledger'));
+    const full = await run(['tasks', 'hand', 'must not launch', '--ta-land', '--ta-land-max', '2', '--live'], deps(fullState));
+    expect(full.code).toBe(1);
+    expect(full.lines.join('\n')).toContain('capacity-full');
+    expect(launches).toHaveLength(0);
+
+    const unknownRoot = join(root, 'unknown');
+    const unknownState = join(unknownRoot, 'task-agent-actions.json');
+    mkdirSync(unknownRoot, { recursive: true });
+    writeTaskCards(unknownState, [card('ta-unknown', 'run-no-ledger')]);
+    const unknown = await run(['tasks', 'hand', 'must not launch', '--ta-land', '--ta-land-max', '2', '--live'], deps(unknownState));
+    expect(unknown.code).toBe(1);
+    expect(unknown.lines.join('\n')).toContain('count-unavailable');
+    expect(launches).toHaveLength(0);
+    expect(observations).toContainEqual(expect.objectContaining({ event: 'ta-land-count-refused', data: expect.objectContaining({ reason: 'count-unavailable', unknownIds: ['ta-unknown'], launched: false }) }));
+
+    const corruptRoot = join(root, 'corrupt');
+    const corruptState = join(corruptRoot, 'task-agent-actions.json');
+    mkdirSync(corruptRoot, { recursive: true });
+    writeTaskCards(corruptState, [card('ta-corrupt', 'run-corrupt')]);
+    mkdirSync(join(corruptRoot, 'run-ledger'), { recursive: true });
+    writeFileSync(join(corruptRoot, 'run-ledger', 'run-corrupt.jsonl'), '{malformed complete record}\n');
+    const unreadable = await run(['tasks', 'hand', 'must not launch', '--ta-land', '--ta-land-max', '2', '--live'], deps(corruptState));
+    expect(unreadable.code).toBe(1);
+    expect(unreadable.lines.join('\n')).toContain('count-unavailable');
+    expect(launches).toHaveLength(0);
+    expect(observations.at(-1)).toMatchObject({ event: 'ta-land-count-refused', data: { reason: 'count-unavailable', unknownIds: ['ta-corrupt'], launched: false } });
+  } finally { off(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('TA-LAND-COUNT-FROM-LEDGER serializes concurrent live hand calls before launch', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-ta-land-dispatch-concurrent-'));
+  const statePath = join(root, 'task-agent-actions.json');
+  mkdirSync(root, { recursive: true });
+  const launches: string[][] = [];
+  const refusals: Array<Record<string, unknown>> = [];
+  const off = debug.registerSink({ name: 'ta-land-count-concurrency-observation', emit: (rec) => {
+    if (rec.category === 'task-agent.hand' && rec.event === 'ta-land-count-refused') refusals.push(rec.data as Record<string, unknown>);
+  } });
+  const deps: TasksCliDeps = { taskStatePath: statePath, registerSink: async () => true,
+    taskLauncher: async (args, _cwd, context) => {
+      launches.push([...args]);
+      if (context?.runId) appendRunLedgerEntry({ runId: context.runId, event: 'node-enter', data: { node: 'implementation' } }, join(root, 'run-ledger'));
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return context?.runId ? { runId: context.runId } : undefined;
+    } };
+  try {
+    writeTaskCards(statePath, []);
+    const argv = ['tasks', 'hand', 'concurrent task', '--ta-land', '--ta-land-max', '1', '--live'];
+    const results = await Promise.all([run(argv, deps), run(argv, deps)]);
+    expect(launches).toHaveLength(1);
+    expect(results.filter((result) => result.code === 1)).toHaveLength(1);
+    expect(refusals).toContainEqual(expect.objectContaining({ reason: 'capacity-full', launched: false }));
+  } finally { off(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('TA-LAND-COUNT-FROM-LEDGER refuses a second call after the first launch is counted active', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-ta-land-dispatch-counted-'));
+  const statePath = join(root, 'task-agent-actions.json');
+  const launches: string[][] = [];
+  const deps: TasksCliDeps = { taskStatePath: statePath, registerSink: async () => true,
+    taskLauncher: (args, _cwd, context) => { launches.push([...args]); return context?.runId ? { runId: context.runId } : undefined; } };
+  try {
+    mkdirSync(root, { recursive: true });
+    writeTaskCards(statePath, []);
+    const first = await run(['tasks', 'hand', 'first measured launch', '--ta-land', '--ta-land-max', '1', '--live', '--json'], deps);
+    expect(first.code ?? 0).toBe(0);
+    const firstCard = (JSON.parse(first.lines[0]!) as { card: TaskCard }).card;
+    expect(firstCard.runId).toBeTruthy();
+    appendRunLedgerEntry({ runId: firstCard.runId!, event: 'node-enter', data: { node: 'implementation' } }, join(root, 'run-ledger'));
+
+    const second = await run(['tasks', 'hand', 'second launch exceeds measured capacity', '--ta-land', '--ta-land-max', '1', '--live'], deps);
+    expect(second.code).toBe(1);
+    expect(second.lines.join('\n')).toContain('capacity-full');
+    expect(launches).toHaveLength(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('TA-LAND-COUNT-FROM-LEDGER fails closed when the just-launched parent ledger is not ready', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-ta-land-dispatch-ledger-delay-'));
+  const statePath = join(root, 'task-agent-actions.json');
+  const launches: string[][] = [];
+  const deps: TasksCliDeps = { taskStatePath: statePath, registerSink: async () => true,
+    taskLauncher: (args, _cwd, context) => {
+      launches.push([...args]);
+      return context?.runId ? { runId: context.runId } : undefined;
+    } };
+  try {
+    mkdirSync(root, { recursive: true });
+    writeTaskCards(statePath, []);
+    const first = await run(['tasks', 'hand', 'launch before parent ledger appears', '--ta-land', '--ta-land-max', '2', '--live', '--json'], deps);
+    expect(first.code ?? 0).toBe(0);
+    expect((JSON.parse(first.lines[0]!) as { card: TaskCard }).card.runId).toBeTruthy();
+
+    const second = await run(['tasks', 'hand', 'refuse until parent ledger exists', '--ta-land', '--ta-land-max', '2', '--live'], deps);
+    expect(second.code).toBe(1);
+    expect(second.lines.join('\n')).toContain('count-unavailable');
+    expect(launches).toHaveLength(1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('TA-LAND-COUNT-FROM-LEDGER preserves draft-claim single-launch bypass for high tier', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-ta-land-draft-claim-'));
+  const statePath = join(root, 'task-agent-actions.json');
+  mkdirSync(root, { recursive: true });
+  writeTaskCards(statePath, []);
+  let launches = 0;
+  try {
+    const result = await run(['tasks', 'hand', 'claim one draft', '--draft-claim', '123', '--ta-land', '--ta-land-max', '1', '--tier', '상', '--live'], {
+      taskStatePath: statePath, registerSink: async () => true, taskLauncher: () => { launches++; },
+      draftClaimGh: { observePr: async () => ({ labels: [], updatedAt: new Date().toISOString() }), postComment: async () => 'comment' },
+    });
+    expect(result.code ?? 0).toBe(0);
+    expect(launches).toBe(1);
+    expect(result.lines.join('\n')).not.toContain('multi-launch-mode-unsupported');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('green close current checklist scope cannot be narrowed by an old TA card', () => {
   expect(greenCloseDeclaredPaths('대상 경로: src/one.ts · src/two.ts\n완료 경계 코드: 둘 다', ['src/one.ts']))
     .toEqual(['src/one.ts', 'src/two.ts']);
@@ -1747,7 +1923,7 @@ test('index wires tasks instead of the retirement stub, and scheduler stays reti
   registerTasksCommands(program);
   const command = program.commands.find((entry) => entry.name() === 'tasks');
   expect(command?.aliases()).toContain('task');
-  expect(command?.commands.map((entry) => entry.name())).toEqual(['parent-host-contract', 'work-order', 'green-sweep', 'cover', 'repair-outcomes', 'outcomes', 'doctor', 'list', 'map', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
+  expect(command?.commands.map((entry) => entry.name())).toEqual(['parent-host-contract', 'work-order', 'green-sweep', 'cover', 'repair-outcomes', 'outcomes', 'doctor', 'list', 'map', 'hand', 'tag', 'hand-move', 'live-verified', 'close', 'parents', 'land-count', 'adopt-pr', 'adopt-runs', 'board', 'advance', 'show', 'rejudge', 'regate-run', 'repair-run', 'approve']);
   expect(command?.commands.find((entry) => entry.name() === 'map')?.commands.map((entry) => entry.name())).toEqual(['dry-run']);
   expect(command?.commands.find((entry) => entry.name() === 'work-order')?.commands.map((entry) => entry.name())).toEqual(['build']);
 });

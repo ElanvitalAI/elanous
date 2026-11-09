@@ -1,0 +1,27 @@
+{
+  "id": "fake-data-guard-boundary",
+  "name": "Fake data-guard public and local HTTP boundary",
+  "implementation": [
+    "src/ux-sim/fake-data-guard-boundary.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-data-guard-boundary.test.ts"
+  ],
+  "target": "Public, approved local-LLM, and unknown HTTP destinations in DATA-GUARD simulations; never falls through to the network",
+  "inputs": [
+    "explicit local and public origins",
+    "HTTP method, headers, and body",
+    "scripted public and local responses"
+  ],
+  "observations": [
+    "per-call destination classification, headers, and request body text",
+    "local, public, and unknown attempt counts",
+    "unknown destination refusal"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-data-guard-boundary.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

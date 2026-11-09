@@ -1,0 +1,32 @@
+{
+  "id": "pod-phase-prewarm-sim",
+  "name": "Release Pod phase prewarm schedule simulator",
+  "implementation": [
+    "src/ux-sim/pod-phase-prewarm-sim.ts",
+    "src/task-orchestrator/surfaces/pod-warm-switch.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts"
+  ],
+  "tests": [
+    "src/ux-sim/pod-phase-prewarm-sim.test.ts",
+    "src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts"
+  ],
+  "target": "Production Pod phase planner and reconcile target/fallback behavior with deterministic schedule and exact gate identity inputs",
+  "inputs": [
+    "release schedules",
+    "simulated timestamp",
+    "phase target configuration"
+  ],
+  "observations": [
+    "selected phase and per-kind desired target",
+    "gate candidates with mismatched cut or lock remain cold",
+    "target shortfall is returned with a reason"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/pod-phase-prewarm-sim.test.ts src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "task-orchestrator.pod-phase"
+  ],
+  "recentUse": null
+}

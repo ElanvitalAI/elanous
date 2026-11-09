@@ -1,0 +1,22 @@
+{
+  "id": "MACRO-CHAIN-E2E",
+  "name": "Release receipt repair and same-run recovery",
+  "kind": "release-macro-chain-e2e",
+  "device": "release-graph-rig",
+  "implementation": [
+    "graphs/release/release-loop.yaml",
+    "src/ux-sim/release-sim-rig.ts",
+    "scenarios/ux-sim/macro-chain-e2e.yaml"
+  ],
+  "tests": [
+    "src/ux-sim/macro-chain-e2e.test.ts"
+  ],
+  "trigger": "Run the production release graph in test universe with an injected receipt-key mismatch and introduced residual failures.",
+  "observe": [
+    "receipt-audit detects the mismatched key",
+    "residual-run returns complete failure evidence to ARG",
+    "applied repair node is appended on the same graph run",
+    "same-run gate and receipt-audit re-entry reach done"
+  ],
+  "expected": "One isolated test-universe graph run follows receipt-audit → residual-run → gate-triage → applied repair append → gate → receipt-audit → done and records the recovery receipt."
+}

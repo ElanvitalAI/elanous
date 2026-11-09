@@ -1,5 +1,6 @@
 # Dependencies and generated output are not source files.
 node_modules/
+/src/ux-sim/mock-scenario-catalog.json
 dist/
 data/
 

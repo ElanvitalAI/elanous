@@ -2,7 +2,8 @@ import { existsSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
 import { excludeProjectDotElanous } from '../instance/project-local-exclude.js';
-import { getUserConfig, type UserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 /** Why `resolveGoalDocumentsDir` picked the directory it returned. */
 export type GoalDocumentsDirReason = 'config' | 'existing-docs-goals' | 'default-dot-elanous';

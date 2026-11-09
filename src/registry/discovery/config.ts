@@ -14,7 +14,8 @@
 // `src/user-config.ts:RegistryConfig`). The omni-crawl bridge config
 // branch was removed in P4 when its source was retired entirely.
 
-import { getUserConfig, type UserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 
 const CRON_MIN_MS = 60_000;          // 1 minute floor (matches cron.ts clamp)
 const CRON_MAX_MS = 86_400_000;      // 24 hour ceiling (matches cron.ts clamp)

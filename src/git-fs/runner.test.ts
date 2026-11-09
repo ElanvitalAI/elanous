@@ -106,6 +106,59 @@ describe('runGitCommand', () => {
     expect(_callerFromStackForTesting(bundleStack)).toContain('bundledConsumer');
   });
 
+  test('simulation aggregates injected Git calls by caller and subcommand for a completed hour', () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const scheduled: Array<{ callback: () => void; delayMs: number }> = [];
+    let current = new Date('2026-11-09T10:05:00.000Z');
+    let currentCaller = '';
+    let monotonic = 0;
+    const timerApi = {
+      schedule(callback: () => void, delayMs: number) {
+        scheduled.push({ callback, delayMs });
+        return { unref() {} } as unknown as ReturnType<typeof setTimeout>;
+      },
+      cancel() {},
+    };
+    _setGitIoObserverForTesting((event, data) => events.push({ event, data }), () => current, timerApi, {
+      caller: () => currentCaller,
+      monotonicNow: () => monotonic,
+    });
+    try {
+      const calls = [
+        { caller: 'cli:release-status', subcommand: 'status', durationMs: 4 },
+        { caller: 'cli:release-status', subcommand: 'fetch', durationMs: 9 },
+        { caller: 'cli:release-status', subcommand: 'status', durationMs: 7 },
+        { caller: 'scripts/release-audit.ts', subcommand: 'fetch', durationMs: 6 },
+        { caller: 'scripts/release-audit.ts', subcommand: 'push', durationMs: 12 },
+        { caller: 'scripts/release-audit.ts', subcommand: 'fetch', durationMs: 8 },
+      ];
+      for (const call of calls) {
+        currentCaller = call.caller;
+        runGitCommand('/sim/repo', [call.subcommand], {}, () => {
+          monotonic += call.durationMs;
+          return { status: 0, stdout: '', stderr: '' };
+        });
+      }
+
+      expect(scheduled).toHaveLength(1);
+      expect(scheduled[0]?.delayMs).toBe(55 * 60 * 1000);
+      current = new Date('2026-11-09T11:00:00.000Z');
+      scheduled[0]?.callback();
+      const summary = events.filter(({ event }) => event === 'hourly-summary').at(-1)?.data;
+      expect(summary).toMatchObject({ hour: '2026-11-09T10', complete: true, totalCalls: 6 });
+      const groups = summary?.groups as Record<string, { calls: number; totalDurationMs: number }>;
+      expect(groups).toMatchObject({
+        'cli:release-status :: status': { calls: 2, totalDurationMs: 11 },
+        'cli:release-status :: fetch': { calls: 1, totalDurationMs: 9 },
+        'scripts/release-audit.ts :: fetch': { calls: 2, totalDurationMs: 14 },
+        'scripts/release-audit.ts :: push': { calls: 1, totalDurationMs: 12 },
+      });
+      expect(Object.values(groups).reduce((sum, group) => sum + group.calls, 0)).toBe(6);
+    } finally {
+      _setGitIoObserverForTesting(undefined);
+    }
+  });
+
   test('a stale hourly timer cannot flush the new hour after a synchronous boundary crossing', () => {
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
     const timers: Array<{ callback: () => void; handle: ReturnType<typeof setTimeout> }> = [];

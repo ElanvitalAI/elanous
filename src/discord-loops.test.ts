@@ -4,7 +4,7 @@ import { discordWireCatalog, ELANOUS_SLASH_COMMANDS, synthesizeCommandText } fro
 import { telegramLoopsStatus, type LoopsSources } from './telegram-loops-command.js';
 import type { LoopSchedule } from './loops/status-rows.js';
 import type { DcIncoming } from './discord.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import type { runTurn } from './session/chat.js';
 
 const now = Date.parse('2026-10-04T12:00:00Z');

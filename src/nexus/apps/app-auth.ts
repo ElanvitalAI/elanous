@@ -22,7 +22,7 @@ export interface AppAuthOptions {
 export interface IssueAppInvitationInput { readonly appSlug: string; readonly invitedBy: string; readonly ttlMs?: number; readonly role?: string }
 export interface IssuedAppInvitation { readonly token: string; readonly expiresAt: string; readonly appSlug: string; readonly invitedBy: string; readonly role: string }
 export interface AppAuthResponse { readonly status: 200 | 401; readonly cookie?: string; readonly sessionToken?: string; readonly role?: string }
-export interface AppSessionRecord { readonly appSlug: string; readonly invitedBy: string; readonly expiresAt: string; readonly role: string }
+export interface AppSessionRecord { readonly appSlug: string; readonly invitedBy: string; readonly expiresAt: string; readonly role: string; readonly source: 'share-link' | 'google-member' }
 
 interface SignedClaims {
   readonly v: 1;
@@ -30,6 +30,7 @@ interface SignedClaims {
   readonly appSlug: string;
   readonly invitedBy: string;
   readonly role: string;
+  readonly sessionSource?: 'share-link' | 'google-member';
   readonly exp: number;
   readonly tempToken?: string;
 }
@@ -72,6 +73,7 @@ function readSessionToken(token: string, key: string, now: number): SignedClaims
     if (parsed.v !== 1 || parsed.purpose !== 'session' || typeof parsed.appSlug !== 'string' || !isValidSlug(parsed.appSlug)
       || typeof parsed.invitedBy !== 'string' || !parsed.invitedBy.trim() || parsed.invitedBy.length > 256
       || (parsed.role !== undefined && (typeof parsed.role !== 'string' || !parsed.role))
+      || (parsed.sessionSource !== undefined && parsed.sessionSource !== 'share-link' && parsed.sessionSource !== 'google-member')
       || typeof parsed.exp !== 'number' || !Number.isSafeInteger(parsed.exp) || now >= parsed.exp
       || typeof parsed.tempToken !== 'string' || !parsed.tempToken.startsWith('elt_')) return null;
     return { ...parsed, role: parsed.role ?? 'owner' } as SignedClaims;
@@ -145,10 +147,20 @@ export function createAppAuth(options: AppAuthOptions) {
     const invite = readSignedToken(input.token, options.key, now(), 'invite');
     if (!invite || invite.appSlug !== input.appSlug) return { status: 401 };
     const issued = issueTempToken({ ttlMs: sessionTtlMs, label: appLabel(invite.appSlug), dir, now: now() });
-    const sessionToken = encryptSession({ v: 1, purpose: 'session', appSlug: invite.appSlug, invitedBy: invite.invitedBy, role: invite.role,
+    const sessionToken = encryptSession({ v: 1, purpose: 'session', appSlug: invite.appSlug, invitedBy: invite.invitedBy, role: invite.role, sessionSource: 'share-link',
       exp: Date.parse(issued.expiresAt), tempToken: issued.token }, options.key);
     const cookie = `${COOKIE_NAME}=${sessionToken}; Path=/; Secure; HttpOnly; SameSite=Lax`;
     return { status: 200, cookie, sessionToken, role: invite.role };
+  }
+
+  function issueTrustedSession(input: { appSlug: string; memberId: string; role: 'owner'; ttlMs?: number }): { sessionToken: string; expiresAt: string } {
+    if (!isValidSlug(input.appSlug)) throw new Error('appSlug must be a lowercase URL slug');
+    if (typeof input.memberId !== 'string' || !input.memberId.trim() || input.memberId.length > 256) throw new Error('memberId must be non-empty');
+    const ttlMs = positiveTtl(input.ttlMs ?? sessionTtlMs, 'session ttlMs');
+    const issued = issueTempToken({ ttlMs, label: appLabel(input.appSlug), dir, now: now() });
+    const sessionToken = encryptSession({ v: 1, purpose: 'session', appSlug: input.appSlug, invitedBy: input.memberId,
+      role: input.role, sessionSource: 'google-member', exp: Date.parse(issued.expiresAt), tempToken: issued.token }, options.key);
+    return { sessionToken, expiresAt: issued.expiresAt };
   }
 
   function sessionClaims(value: string): SignedClaims | null {
@@ -168,7 +180,8 @@ export function createAppAuth(options: AppAuthOptions) {
     if (!claims || !claims.tempToken) return null;
     const matched = matchTempToken(claims.tempToken, { dir, now: now() });
     if (!matched || matched.label !== appLabel(claims.appSlug)) return null;
-    return { appSlug: claims.appSlug, invitedBy: claims.invitedBy, expiresAt: matched.expiresAt, role: claims.role };
+    return { appSlug: claims.appSlug, invitedBy: claims.invitedBy, expiresAt: matched.expiresAt, role: claims.role,
+      source: claims.sessionSource ?? 'share-link' };
   }
 
   function revokeSession(value: string): boolean {
@@ -182,6 +195,7 @@ export function createAppAuth(options: AppAuthOptions) {
   return {
     issueInvitation,
     acceptInvitation,
+    issueTrustedSession,
     verifySession,
     revokeSession,
     getSessionRecord,

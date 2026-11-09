@@ -1,0 +1,5 @@
+{
+  "id": "gate-pools-pinned-sweep",
+  "name": "Gate sweep across pinned pools",
+  "description": "Run the production gate image-pin resolver and shard runner across both pools with one pinned digest."
+}

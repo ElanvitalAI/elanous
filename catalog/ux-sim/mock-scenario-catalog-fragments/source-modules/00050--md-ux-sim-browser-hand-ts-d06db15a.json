@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-BROWSER-HAND-TS",
+  "path": "src/ux-sim/browser-hand.ts",
+  "boundary": "browser hand: Run the real BrowserHand coordinator and performBrowserAction with only browser and Linear I/O faked.",
+  "deviceIds": [
+    "support-fakes"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

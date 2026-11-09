@@ -1,0 +1,44 @@
+{
+  "id": "warm-si-reuse-sim",
+  "name": "Implementation child SI warm Pod reuse chain",
+  "implementation": [
+    "src/ux-sim/warm-si-reuse-sim.ts",
+    "src/ux-sim/warm-pool-reuse-sim.ts",
+    "src/ux-sim/fake-kubectl.ts",
+    "src/task-orchestrator/surfaces/pod-si-warm-provider.ts",
+    "src/task-orchestrator/surfaces/pod-child-reuse.ts",
+    "src/ux-sim/warm-pool-reuse-switch-sim.ts",
+    "src/ux-sim/pod-reuse-world.ts",
+    "src/ux-sim/pod-reuse-shared-fake-boundary.ts"
+  ],
+  "tests": [
+    "src/ux-sim/warm-si-reuse-sim.test.ts",
+    "src/ux-sim/pod-reuse-world.test.ts",
+    "src/ux-sim/pod-reuse-shared-fake-k8s.test.ts"
+  ],
+  "target": "Production SI warm lease acquisition and cleanup/return against a reusable shared fake Kubernetes and primary-control boundary; production Pod source script selects a shared read-only host mirror and is compared with a non-hardlinked copy by bytes, setup time, content digest, and mount byte counter under production read-only flags",
+  "inputs": [
+    "isolated runId",
+    "registered SI worker",
+    "fixed runner maintenance receipt",
+    "optional child process residue",
+    "production Pod source script",
+    "production hostPath and read-only volume mount contract",
+    "temporary local Git origin and host mirror"
+  ],
+  "observations": [
+    "lease generation and Pod UID",
+    "release and sanitize transitions",
+    "returned or quarantined cleanup result",
+    "selected source route and read/write content equivalence",
+    "checkout-local Git object payload bytes (not network bytes) and local setup duration"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/warm-si-reuse-sim.test.ts",
+    "bun test src/ux-sim/pod-reuse-world.test.ts",
+    "bun test src/ux-sim/pod-reuse-shared-fake-k8s.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

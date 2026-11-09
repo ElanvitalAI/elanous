@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TA-LAND-COUNT-DISPATCHER-SIM-TS",
+  "path": "src/ux-sim/ta-land-count-dispatcher-sim.ts",
+  "boundary": "Parses one injected tasks land-count receipt and replays fail-closed dispatch admission without launching commands or reading a ledger.",
+  "deviceIds": [
+    "ta-land-count-dispatcher-sim"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

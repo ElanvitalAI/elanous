@@ -1,25 +1,57 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { getReleaseNodeLog, getReleaseRuns, type OpsResult, type ReleaseRun } from '@/lib/ops-api';
-import { latestReleaseRun, ReleaseStrip } from './ReleaseStrip';
 import { currentNodeId, ReleaseFlow, ReleaseNodeDetail } from './ReleaseFlow';
+import { ReleaseGraphRunView } from './ReleaseGraphRunView';
+import { subscribeReleaseGateProgress, type ReleaseGateProgressEvent } from '@/lib/inside-events';
 
 export { currentNodeId };
+const FINISHED_RECENT = new Set(['done', 'completed', 'success', 'succeeded', 'failed', 'error', 'cancelled', 'aborted']);
+const RECENT_RUN_MS = 24 * 60 * 60 * 1000;
+function latestReleaseRun(result: OpsResult<ReleaseRun[]> | null, now: number): ReleaseRun | null {
+  if (result?.kind !== 'ready') return null;
+  const latest = result.data.reduce<ReleaseRun | null>((best, run) =>
+    !best || Date.parse(run.startedAt) > Date.parse(best.startedAt) ? run : best, null);
+  if (!latest || (FINISHED_RECENT.has(latest.status.toLowerCase()) && now - Date.parse(latest.startedAt) > RECENT_RUN_MS)) return null;
+  return latest;
+}
 // 원장 상태값 실측: done · failed · running — 'done' 이 빠져 있으면 끝난 런을 10초마다 계속 다시 읽는다.
 const FINISHED_RUN = ['done', 'completed', 'failed', 'cancelled', 'aborted', 'success', 'succeeded', 'error'];
 const runClock = new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 
-export function ReleaseRunsContent({ result, version, versions = [], selectedRun, unmatchedRunId, openedNodeId, log, onVersion, onRun, onNode, onStripRun }: {
+export function mergeReleaseGateProgress(
+  persisted: ReleaseGateProgressEvent[],
+  live: ReleaseGateProgressEvent[],
+): ReleaseGateProgressEvent[] {
+  const merged = [...persisted];
+  const matchedPersisted = new Set<number>();
+  const payload = (event: ReleaseGateProgressEvent) => JSON.stringify([
+    event.phase, event.shard ?? null, event.decision ?? null, event.reason ?? null, event.state ?? null,
+    event.at ?? null, event.shardIndex ?? null, event.shardTotal ?? null, event.reuseCount ?? null,
+    event.rerunCount ?? null, event.radiusInvalidatedCount ?? null, event.failureCount ?? null,
+    event.rerunReasons ? Object.entries(event.rerunReasons).sort(([a], [b]) => a.localeCompare(b)) : null,
+  ]);
+  for (const event of live) {
+    const index = persisted.findIndex((saved, candidate) => !matchedPersisted.has(candidate)
+      && (saved.eventId && event.eventId ? saved.eventId === event.eventId : payload(saved) === payload(event)));
+    if (index < 0) merged.push(event);
+    else { merged[index] = event; matchedPersisted.add(index); }
+  }
+  return merged.map((event, index) => ({ event, index }))
+    .sort((a, b) => (a.event.at ?? '').localeCompare(b.event.at ?? '') || a.index - b.index).map(({ event }) => event);
+}
+
+export function ReleaseRunsContent({ result, version, versions = [], selectedRun, unmatchedRunId, openedNodeId, log, gateProgress = [], onVersion, onRun, onNode }: {
   result: OpsResult<ReleaseRun[]> | null;
   unmatchedRunId?: string | null;
-  onStripRun?: (run: ReleaseRun) => void;
   version: string;
   versions?: string[];
   selectedRun: ReleaseRun | null;
   openedNodeId: string | null;
   log: OpsResult<{ log: string }> | null;
+  gateProgress?: ReleaseGateProgressEvent[];
   onVersion: (version: string) => void;
   onRun: (runId: string) => void;
   onNode: (nodeId: string) => void;
@@ -33,9 +65,8 @@ export function ReleaseRunsContent({ result, version, versions = [], selectedRun
   const choices = [...new Set([...versions, ...runs.map((run) => run.version).filter((v): v is string => !!v)])];
   if (version && !choices.includes(version)) choices.push(version);
   return <main className="mx-auto w-full min-w-0 max-w-4xl space-y-6 overflow-x-hidden px-4 py-6 text-foreground">
-    {runMismatch ? <p role="status">발행 진행 · 노드 흐름: 런이 달라 못 잼</p>
-      : onStripRun && <ReleaseStrip result={result} selectedRun={selected} expectedRunId={selected?.runId} onSelect={onStripRun} />}
-    <header className="space-y-1"><p className="text-sm text-muted-foreground">운영 / 릴리스</p><h1 className="text-2xl font-semibold">릴리스</h1></header>
+    {runMismatch && <p role="status">노드 흐름: 런이 달라 못 잼</p>}
+    <header className="space-y-1"><p className="text-sm text-muted-foreground">운영 / 릴리스</p><h1 className="text-2xl font-semibold">릴리스 그래프</h1></header>
     <label className="block space-y-2 text-sm font-medium">판
       <input aria-label="판" list="ops-release-versions" className="block w-full max-w-xs rounded-md border bg-background p-2" value={version} onChange={(event) => onVersion(event.target.value)} placeholder="전체 판" />
       <datalist id="ops-release-versions">{choices.map((v) => <option key={v} value={v} />)}</datalist>
@@ -53,7 +84,9 @@ export function ReleaseRunsContent({ result, version, versions = [], selectedRun
       </section>
       {selected && !runMismatch && <section className="min-w-0 space-y-3" aria-label="노드 진행" data-run-id={selected.runId}>
         <h2 className="font-semibold">노드 흐름 <span className="text-sm font-normal text-muted-foreground">· {selected.version ?? '판 미상'} · {selected.status}</span></h2>
-        <ReleaseFlow run={selected} openedNodeId={openedNodeId} onNode={onNode} />
+        {selected.graph
+          ? <ReleaseGraphRunView run={selected} events={gateProgress} onNode={onNode} />
+          : <ReleaseFlow run={selected} openedNodeId={openedNodeId} onNode={onNode} />}
         {openedNodeId && selected.path.includes(openedNodeId)
           ? <ReleaseNodeDetail run={selected} nodeId={openedNodeId} log={log} />
           : <p className="text-sm text-muted-foreground">노드를 누르면 요약 전문과 로그 꼬리가 열립니다.</p>}
@@ -72,6 +105,7 @@ export function ReleaseRunsView(): React.ReactNode {
   const [openedNode, setOpenedNode] = useState<{ runId: string; nodeId: string } | null>(null);
   const [log, setLog] = useState<{ runId: string; nodeId: string; result: OpsResult<{ log: string }> } | null>(null);
   const [denied, setDenied] = useState(false);
+  const [gateProgressByRun, setGateProgressByRun] = useState<Record<string, ReleaseGateProgressEvent[]>>({});
   const logRequest = useRef(0);
   const permissionDenied = useRef(false);
   const newestVersion = useRef<string | null>(null);
@@ -146,6 +180,19 @@ export function ReleaseRunsView(): React.ReactNode {
     : latestReleaseRun({ kind: 'ready', data: versionRuns }, Date.now()) ?? versionRuns[0];
   const effectiveVersion = activeVersion ?? selected?.version ?? '';
   const selectedId = selected?.runId;
+  const selectedGateProgress = useMemo(() => {
+    return mergeReleaseGateProgress(selected?.gateProgress ?? [], selectedId ? gateProgressByRun[selectedId] ?? [] : []);
+  }, [selected?.gateProgress, selectedId, gateProgressByRun]);
+  useEffect(() => {
+    if (!selectedId || !selected?.graph || denied || FINISHED_RUN.includes(selected.status.toLowerCase())) return;
+    return subscribeReleaseGateProgress(client, selectedId, (event) => {
+      setGateProgressByRun((previous) => ({ ...previous,
+        [selectedId]: [...(previous[selectedId] ?? []), event] }));
+    }, () => {
+      permissionDenied.current = true;
+      setDenied(true);
+    });
+  }, [client, selectedId, selected?.status, !!selected?.graph, denied]);
   useEffect(() => {
     logRequest.current++;
     setOpenedNode(null);
@@ -158,10 +205,6 @@ export function ReleaseRunsView(): React.ReactNode {
     setVersion(next); setSelectedRunId(null); setOpenedNode(null); setLog(null);
   }, [version, latestVersion]);
   const selectRun = (runId: string) => { logRequest.current++; setSelectedRunId(runId); setOpenedNode(null); setLog(null); };
-  const selectStripRun = (run: ReleaseRun) => {
-    if (run.version !== activeVersion) { setVersion(run.version ?? ''); setLatestVersion(null); }
-    selectRun(run.runId);
-  };
   const selectNode = (nodeId: string) => {
     if (!selected || result?.kind !== 'ready') return;
     const request = ++logRequest.current;
@@ -179,5 +222,6 @@ export function ReleaseRunsView(): React.ReactNode {
   const visibleLog = log && log.runId === selectedId && log.nodeId === visibleNode ? log.result : null;
   return <ReleaseRunsContent result={result} version={effectiveVersion} versions={versions} selectedRun={selected ?? null}
     unmatchedRunId={selectedRunId && !selected ? selectedRunId : null} openedNodeId={visibleNode}
-    log={visibleLog} onVersion={selectVersion} onRun={selectRun} onNode={selectNode} onStripRun={selectStripRun} />;
+    log={visibleLog} gateProgress={selectedGateProgress}
+    onVersion={selectVersion} onRun={selectRun} onNode={selectNode} />;
 }

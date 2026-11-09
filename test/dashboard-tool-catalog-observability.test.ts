@@ -95,12 +95,10 @@ describe('dashboard tool catalog observability', () => {
     const optionalTools = buildDashboardOptionalToolSpecs({
       userConfig: {
         shell: {
-          allowDashboardOptionalTools: true,
           allowDashboardBash: false,
           allowDashboardTerminalInject: false,
           allowDashboardApiCall: false,
           allowDashboardRunShell: false,
-          allowDashboardState: false,
         },
       } as any,
       termSize: () => ({ cols: 80, rows: 24 }),
@@ -147,6 +145,7 @@ describe('dashboard tool catalog observability', () => {
       'PtyShellStart', 'PtyShellPoll', 'PtyShellSend',
       'PtyShellKill', 'PtyShellList', 'run_tests', 'elanous_skills_list', 'skill_exec',
       'PersistentGrounding', 'ToolSearch', 'elanous_linear_issue',
+      'GetDashboardState', // always on — shell.allowDashboardState removed (CONFIG-ALWAYS-TRUE-OUT)
     ]);
     expect(new Set(names).size).toBe(names.length);
     expect(records).toHaveLength(1);

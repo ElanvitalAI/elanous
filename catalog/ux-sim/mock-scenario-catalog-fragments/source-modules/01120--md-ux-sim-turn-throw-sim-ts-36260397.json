@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TURN-THROW-SIM-TS",
+  "path": "src/ux-sim/turn-throw-sim.ts",
+  "boundary": "Injects configured exceptions into the production turn path and captures the resulting throw/recovery behavior; without the explicit simulation setting it is inert.",
+  "deviceIds": [
+    "turn-throw-sim"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -3,7 +3,7 @@ import { debug } from './debug/log.js';
 import type { Project } from './project/project-store.js';
 import type { SessionMeta } from './session/index.js';
 import { TelegramBot, type TgIncoming, type TgCallbackQuery } from './telegram.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import { defaultTelegramCommands } from './telegram-commands.js';
 import { attachTelegramProjectButtons, projectCommand, type TelegramProjectCommandDeps } from './telegram-project-command.js';
 

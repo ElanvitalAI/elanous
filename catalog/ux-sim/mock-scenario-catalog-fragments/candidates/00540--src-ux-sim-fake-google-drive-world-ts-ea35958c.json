@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/fake-google-drive-world.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/fake-google-drive-world.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Synthetic OAuth token is in memory only; requests record only whether authorization was present.",
+  "deviceId": "fake-google-drive-world",
+  "scenarioIds": [
+    "GOOGLE-DRIVE-LIST-READONLY"
+  ]
+}

@@ -70,6 +70,8 @@ const sleep = (ms: number): Promise<void> => new Promise<void>((r) => setTimeout
  *  (driver.test.ts 74건 · 게이트 423 s). 시험은 `setAgentMissionTimingForTest` 로 줄이고 끝나면 되돌린다.
  *  ⛔ 운영 경로는 이 함수를 부르지 않는다 — 값은 아래 기본값 그대로다. */
 interface AgentMissionTiming {
+  /** Clock source shared by mission polling and tests using a fake clock. */
+  now: () => number;
   /** 준비·신뢰 화면이 «조용해졌다»로 보는 무출력 시간. */
   readyQuietMs: number;
   /** waitForQuiet 의 폴링 간격. */
@@ -82,6 +84,7 @@ interface AgentMissionTiming {
   sleep: (ms: number) => Promise<void>;
 }
 const DEFAULT_AGENT_MISSION_TIMING: AgentMissionTiming = {
+  now: () => Date.now(),
   readyQuietMs: 1500,
   pollMs: 300,
   keystrokeGapMs: 800,
@@ -761,12 +764,12 @@ const DEFAULT_OMNI = `${process.env.HOME}/.claude/skills/omni-crawl/scripts/main
 
 // ── PTY idle 감지 ──
 async function waitForQuiet(h: PtyHandle, quietMs: number, maxWaitMs: number): Promise<'quiet' | 'timeout' | 'exited'> {
-  const start = Date.now(); h.drainDelta(); let last = Date.now();
-  while (Date.now() - start < maxWaitMs) {
+  const start = missionTiming.now(); h.drainDelta(); let last = missionTiming.now();
+  while (missionTiming.now() - start < maxWaitMs) {
     if (!h.isAlive()) return 'exited';
     const d = h.drainDelta();
-    if (d.length > 0) last = Date.now();
-    else if (Date.now() - last >= quietMs) return 'quiet';
+    if (d.length > 0) last = missionTiming.now();
+    else if (missionTiming.now() - last >= quietMs) return 'quiet';
     await missionTiming.sleep(missionTiming.pollMs);
   }
   return 'timeout';

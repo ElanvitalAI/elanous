@@ -25,17 +25,18 @@ afterEach(() => {
   rmSync(stateDir, { recursive: true, force: true });
 });
 
-function land(taskStatePath: string, merged: boolean, onMergedSupersede?: PrLandDeps['onMergedSupersede']) {
+function land(taskStatePath: string, merged: boolean, onMergedSupersede?: PrLandDeps['onMergedSupersede'], changedFiles = ['src/cli/x.ts'], onMergedConductorCellFragments?: PrLandDeps['onMergedConductorCellFragments']) {
   const deps: PrLandDeps = {
     prodFreezeRoot: freezeRoot,
     taskStatePath,
     ...(onMergedSupersede ? { onMergedSupersede } : {}),
+    ...(onMergedConductorCellFragments ? { onMergedConductorCellFragments } : {}),
     currentBranch: () => 'feat/inflight',
     resolveBase: (_run, _cwd, explicit) => explicit ?? 'origin/main',
     run: (command, args) => {
       if (command === 'git' && args[0] === 'remote') return { ok: true, out: args[1] === 'get-url' ? 'https://github.com/example/repo.git' : 'origin' };
       if (command === 'git' && args[0] === 'rev-parse') return { ok: true, out: args[1] === 'HEAD' ? 'a'.repeat(40) : '/tmp/inflight-test' };
-      if (command === 'git' && args[0] === 'diff' && args[1] === '--name-only') return { ok: true, out: 'src/cli/x.ts\n' };
+      if (command === 'git' && args[0] === 'diff' && args[1] === '--name-only') return { ok: true, out: `${changedFiles.join('\n')}\n` };
       if (command === 'gh' && args.includes('baseRefName')) return { ok: true, out: 'main\n' };
       return { ok: true, out: '' };
     },
@@ -99,6 +100,22 @@ test('병합 확인 뒤 같은 칸 정리 훅을 호출하고, 정리 오류가 
   expect(called).toEqual([{ number: 27777, cwd: process.cwd() }]);
   called.length = 0;
   expect(await land(taskStatePath, false, async (number, cwd) => { called.push({ number, cwd }); })).toBe(1);
+  expect(called).toEqual([]);
+});
+
+test('fragment-only 착지 뒤 생성 전용 지도 PR을 열고, 초기 마이그레이션은 건너뛴다', async () => {
+  const { taskStatePath } = fixture();
+  const called: number[] = [];
+  expect(await land(taskStatePath, true, undefined, ['docs/conductor/cells/release-loop.md'], async (number) => {
+    called.push(number);
+    return 'https://github.com/example/repo/pull/99';
+  })).toBe(0);
+  expect(called).toEqual([27777]);
+  called.length = 0;
+  expect(await land(taskStatePath, true, undefined, ['docs/conductor/cells/conductor.md', 'docs/conductor/CONDUCTOR.md'], async (number) => {
+    called.push(number);
+    return undefined;
+  })).toBe(0);
   expect(called).toEqual([]);
 });
 

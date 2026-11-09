@@ -222,7 +222,7 @@ describe('fleet node setup — 원격 OS 갈래', () => {
       'sudo -n apt-get install -y -qq nodejs',
       'bun add -g @openai/codex@0.159.3',
       'git init -q --bare -b main ~/mirror/elanous-agent.git',
-      'k3d registry create elanous-registry --port 127.0.0.1:5050',
+      'k3d registry create elanous-registry --delete-enabled --volume "$HOME/.elanous/registry-data:/var/lib/registry" --port 127.0.0.1:5050',
       'k3d cluster create elanous-pool --image rancher/k3s:v1.36.4-k3s1 --no-lb --api-port 0.0.0.0:6550 --k3s-arg --tls-san=fixture-node@server:0 --registry-use k3d-elanous-registry:5050 --volume $HOME/mirror:/mirror-host:ro@server:0 --wait --timeout 300s',
     ]) expect(anyCall(r.invocations, needle), needle).toBe(true);
     for (const needle of ['command -v brew', 'brew install', 'Google Chrome', '.zshenv']) expect(anyCall(r.invocations, needle)).toBe(false);
@@ -238,11 +238,70 @@ describe('fleet node setup — 원격 OS 갈래', () => {
         ['symbolic-ref HEAD', 0, 'refs/heads/main'],
         ['bun --version', 0, Bun.version],
         ['docker port k3d-elanous-registry', 0, '127.0.0.1:5050'],
+        ['docker inspect --format', 0, '["REGISTRY_STORAGE_DELETE_ENABLED=true"]'],
       ],
     });
-    for (const line of ['✓ 기본 패키지', '✓ systemd (PID 1)', '✓ docker-ce (apt)', '✓ docker·containerd 서비스', '✓ docker 그룹', '✓ 플릿 docker 설정', '✓ k3d', '✓ kubectl v1.36.4', '✓ node', '✓ codex 0.159.3', `✓ bun ${Bun.version}`, '✓ 레지스트리 k3d-elanous-registry :5050 (루프백)', '✓ 호스트 git 미러 ~/mirror/elanous-agent.git (HEAD=main)', '✓ 클러스터 elanous-pool']) expect(r.stdout).toContain(line);
+    for (const line of ['✓ 기본 패키지', '✓ systemd (PID 1)', '✓ docker-ce (apt)', '✓ docker·containerd 서비스', '✓ docker 그룹', '✓ 플릿 docker 설정', '✓ k3d', '✓ kubectl v1.36.4', '✓ node', '✓ codex 0.159.3', `✓ bun ${Bun.version}`, '✓ 레지스트리 k3d-elanous-registry :5050 (루프백 · 삭제 지원)', '✓ 호스트 git 미러 ~/mirror/elanous-agent.git (HEAD=main)', '✓ 클러스터 elanous-pool']) expect(r.stdout).toContain(line);
     const todos = r.stdout.split('\n').filter((l) => l.startsWith('  →'));
     expect(todos.filter((l) => !/kubeconfig|base\.yaml/.test(l))).toEqual([]);   // 남는 할 일은 가짜 kubectl 이 늘 실패하는 이 맥 쪽 단계뿐
+  });
+
+  test('기존 삭제 비활성 레지스트리는 데이터를 검증 복사하고 볼륨으로 마이그레이션한다', () => {
+    const r = runNodeSetup({
+      os: 'Linux', check: false, defaultRc: 0,
+      rules: [
+        ['docker port k3d-elanous-registry', 0, '127.0.0.1:5050'],
+        ['docker inspect --format', 0, 'registry:2'],
+        ['docker cp k3d-elanous-registry:/var/lib/registry/.', 0],
+        ['docker run --rm --volumes-from', 0],
+        ['tar -cf -', 0],
+        ['k3d registry delete elanous-registry', 0],
+        ['k3d registry create elanous-registry --delete-enabled --volume', 0],
+      ],
+    });
+    expect(r.stdout).toContain('삭제 지원으로 데이터 보존 마이그레이션했다');
+    const migration = r.invocations.find((c) => c.includes('registry-data-migration')) ?? '';
+    expect(migration).toContain('docker cp "k3d-elanous-registry:/var/lib/registry/.');
+    const imageAt = migration.indexOf('docker inspect --format');
+    const stopAt = migration.indexOf('docker stop k3d-elanous-registry');
+    const copyAt = migration.indexOf('docker cp "k3d-elanous-registry:/var/lib/registry/.');
+    const sourceFingerprintAt = migration.indexOf('src=$(docker run --rm --volumes-from "k3d-elanous-registry:ro"');
+    const copiedFingerprintAt = migration.indexOf('dst=$(tar -cf - -C "$stage" . | python3 -c');
+    const verifyAt = migration.indexOf('[ -n "$src" ] && [ "$src" = "$dst" ]');
+    const deleteAt = migration.indexOf('k3d registry delete elanous-registry');
+    const createAt = migration.indexOf('k3d registry create elanous-registry --delete-enabled --volume');
+    expect(migration).toContain("docker inspect --format '{{.Config.Image}}' k3d-elanous-registry");
+    expect(stopAt).toBeGreaterThan(imageAt);
+    expect(copyAt).toBeGreaterThan(stopAt);
+    expect(sourceFingerprintAt).toBeGreaterThan(copyAt);
+    expect(copiedFingerprintAt).toBeGreaterThan(sourceFingerprintAt);
+    expect(migration).toContain('tarfile,hashlib,json');
+    expect(migration).not.toContain('du -sk');
+    expect(verifyAt).toBeGreaterThan(copiedFingerprintAt);
+    expect(deleteAt).toBeGreaterThan(verifyAt);
+    expect(createAt).toBeGreaterThan(deleteAt);
+  });
+
+  test('비루프백의 기존 삭제 비활성 레지스트리도 데이터 보존 마이그레이션한다', () => {
+    const r = runNodeSetup({
+      os: 'Linux', check: false, defaultRc: 0,
+      rules: [
+        ['docker port k3d-elanous-registry', 0, '0.0.0.0:5050'],
+        ['docker inspect --format', 0, '[]'],
+        ['docker cp k3d-elanous-registry:/var/lib/registry/.', 0],
+        ['docker run --rm --volumes-from', 0],
+        ['tar -cf -', 0],
+        ['k3d registry delete elanous-registry', 0],
+        ['k3d registry create elanous-registry --delete-enabled --volume', 0],
+      ],
+    });
+    expect(r.stdout).toContain('삭제 지원으로 데이터 보존 마이그레이션했다');
+    const migration = r.invocations.find((c) => c.includes('registry-data-migration')) ?? '';
+    expect(migration).toContain('docker cp "k3d-elanous-registry:/var/lib/registry/.');
+    expect(migration).toContain('docker run --rm --volumes-from "k3d-elanous-registry:ro"');
+    expect(migration).toContain('tarfile,hashlib,json');
+    expect(migration).not.toContain('du -sk');
+    expect(migration).toContain('[ -n "$src" ] && [ "$src" = "$dst" ]');
   });
 
   test('Linux: Docker Desktop shim 이면 사유를 내고 멈춘다(docker-ce 를 깔지 않는다)', () => {

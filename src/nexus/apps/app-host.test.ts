@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { constants as fsConstants, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import { constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { platform, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,8 @@ import { TabRegistry } from '../state/tab-registry.js';
 import { NexusEventBus } from '../api/event-bus.js';
 import { startNexusHttpServer } from '../api/http-server.js';
 import { loadNexusAppHost } from './app-host.js';
+import { createMemberStore } from '../members/member-store.js';
+import { FakeAppDbBackupStore } from '../../ux-sim/fake-app-db-backup-world.js';
 
 const manifest = `apiVersion: elanous.app/v0
 slug: voice-note
@@ -195,6 +197,81 @@ test('NEXUS-APP-HOST-FS-HARDEN mounts an immutable snapshot on an isolated app o
     server.stop();
     first.appHost.close();
     second?.appHost.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('public-read RPC remains anonymous with an unrelated cookie', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-app-host-public-read-cookie-'));
+  const appDir = join(root, 'public-note');
+  mkdirSync(join(appDir, 'out'), { recursive: true });
+  writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0
+slug: public-note
+title: Public note
+frontend:
+  kind: static-export
+  out: out
+tables:
+  notes:
+    columns:
+      id: { type: text, primary: true }
+roles:
+  public: { via: public-read }
+rpc:
+  list:
+    sql: SELECT id FROM notes ORDER BY id
+    params: {}
+    allow: [public]
+`);
+  writeFileSync(join(appDir, 'out', 'index.html'), '<main>public</main>');
+  const loaded = loadNexusAppHost(root, undefined, appAuthOptions(root));
+  try {
+    expect(loaded.issues).toEqual([]);
+    const response = await loaded.appHost.handle(new Request('http://public-note.app.localhost/__rpc/list', {
+      method: 'POST', headers: { host: 'public-note.app.localhost', origin: 'http://public-note.app.localhost',
+        cookie: 'unrelated=1', 'content-type': 'application/json' }, body: JSON.stringify({ params: {} }),
+    }));
+    expect(response?.status).toBe(200);
+    expect(await response!.json()).toEqual({ rows: [] });
+  } finally {
+    loaded.appHost.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('app host can mount a newly published app without restarting and wires its database', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-app-host-dynamic-mount-'));
+  const appsDir = join(root, 'apps');
+  mkdirSync(appsDir, { recursive: true });
+  const { appHost, issues } = loadNexusAppHost(appsDir, undefined, appAuthOptions(root));
+  try {
+    expect(issues).toEqual([]);
+    expect(appHost.slugs).toEqual([]);
+    const appDir = join(appsDir, 'new-app');
+    mkdirSync(join(appDir, 'out'), { recursive: true });
+    writeFileSync(join(appDir, 'app.yaml'), manifest.replace('voice-note', 'new-app'));
+    writeFileSync(join(appDir, 'out', 'index.html'), '<main>new app</main>');
+    appHost.mountDirectory('new-app');
+    expect(appHost.slugs).toEqual(['new-app']);
+    expect(appHost.getManifest('new-app')?.slug).toBe('new-app');
+    const response = await appHost.handle(new Request('http://new-app.app.localhost/', {
+      headers: { host: 'new-app.app.localhost' },
+    }));
+    expect(response?.status).toBe(401);
+    const invitation = appHost.issueInvitation('new-app', 'test-owner', undefined, 'viewer');
+    const accepted = await appHost.handle(new Request(`http://new-app.app.localhost/__auth/accept?token=${encodeURIComponent(invitation.token)}`, {
+      headers: { host: 'new-app.app.localhost' },
+    }));
+    const cookie = accepted?.headers.get('set-cookie')?.split(';', 1)[0];
+    expect(cookie).toContain('__Host-app-session=');
+    const rpc = await appHost.handle(new Request('http://new-app.app.localhost/__rpc/list', {
+      method: 'POST', headers: { host: 'new-app.app.localhost', origin: 'http://new-app.app.localhost', cookie: cookie!, 'content-type': 'application/json' }, body: '{}',
+    }));
+    expect(rpc?.status).toBe(200);
+    expect(await rpc?.json()).toEqual({ rows: [] });
+    expect(() => appHost.mountDirectory('new-app')).toThrow('app is already mounted');
+  } finally {
+    appHost.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -433,5 +510,41 @@ test('NEXUS-APP-HOST-FS-HARDEN rejects a nested directory swap to an external ex
     expect(result.issues[0]?.reason).toMatch(/changed|escapes/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('NEXUS-APP-HOST exposes backup health and isolated restore to trusted server callers', () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-app-host-backup-'));
+  writeApp(root, '<main>backup</main>');
+  const store = new FakeAppDbBackupStore();
+  const loaded = loadNexusAppHost(root, undefined, {
+    ...appAuthOptions(root),
+    databaseBackup: { store, key: new Uint8Array(32).fill(17), schedule: false },
+  });
+  const target = join(root, 'restore', 'voice-note.db');
+  try {
+    expect(loaded.appHost.databaseBackupStatus('voice-note')?.state).toBe('healthy');
+    expect(loaded.appHost.restoreDatabaseBackup('voice-note', target).targetEnvironment).toBe('isolated-restore');
+    expect(existsSync(target)).toBe(true);
+  } finally { loaded.appHost.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('verified owner resolves identity and entitlement only from the app session and member database', () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-verified-owner-'));
+  const members = createMemberStore({ path: ':memory:' });
+  writeApp(root, '<main>owner</main>');
+  const member = members.register({ sub: 'verified-sub', email: 'verified@example.test', emailVerified: true, name: 'Verified' }, {
+    consents: { privacy: 'rev-1', terms: 'rev-1' },
+  });
+  const loaded = loadNexusAppHost(root, undefined, appAuthOptions(root));
+  const owner = loaded.appHost.issueOwnerSession('voice-note', member.id);
+  try {
+    expect(loaded.appHost.resolveVerifiedOwner('voice-note', owner.sessionToken, members, 'public-owner')).toEqual({
+      memberId: member.id, userSlug: 'public-owner', plan: 'free', entitlements: {},
+    });
+    expect(loaded.appHost.resolveVerifiedOwner('other-app', owner.sessionToken, members, 'public-owner')).toBeNull();
+    expect(loaded.appHost.resolveVerifiedOwner('voice-note', owner.sessionToken, members, '')).toBeNull();
+  } finally {
+    members.close(); loaded.appHost.close(); rmSync(root, { recursive: true, force: true });
   }
 });

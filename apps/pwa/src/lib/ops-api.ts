@@ -1,4 +1,5 @@
 import type { DaemonClient } from './daemon-client';
+import { fromReleaseGateProgress, type ReleaseGateProgressEvent } from './inside-events';
 
 export type TrainRejectReason = 'typecheck' | 'ratchet' | 'introduced' | 'setup-unmeasured' | 'authorization' | 'lock-owner' | 'other';
 export interface TrainThroughputTotals {
@@ -15,11 +16,12 @@ export interface TrainThroughput {
 export type OpsResult<T> = { kind: 'ready'; data: T } | { kind: 'forbidden' } | { kind: 'error'; status: number };
 // startedAt/endedAt 은 GRAPH-NODE-TIMES(0.2.19 TC) 가 원장에 넣는다 — 그 전엔 없다(화면은 «시각 미기록»).
 export interface ReleaseNode { nodeId: string; ok: boolean | null; summary: string; startedAt?: string | null; endedAt?: string | null }
-// GATE-LIVE-OBS — 데몬이 «지금 gate 노드인 런»에만 싣는 조각 표(발행 원장 shards.json · src/release-loop/gate-shards.ts 가 계약).
+// GATE-LIVE-OBS — 데몬이 gate 실행 시각과 맞는 발행 원장 shards.json을 싣는다(src/release-loop/gate-shards.ts 가 계약).
 export type GateShardState = 'pending' | 'running' | 'done' | 'retry' | 'timeout' | 'failed';
 export interface GateShard {
   id: string; state: GateShardState; startedAt?: string; endedAt?: string;
   installSec?: number; rc?: number; waitReason?: string; plannedMin?: number;
+  reuseDecision?: 'reuse' | 'rerun'; reuseReason?: string;
 }
 export interface GateShards {
   version: string; updatedAt: string; shards: GateShard[];
@@ -34,7 +36,9 @@ export interface ReleaseRun {
   version: string | null;
   path: string[];
   nodes: ReleaseNode[];
+  graph?: { nodes: Array<{ nodeId: string; kind: string; needs: string[] }> };
   gateShards?: GateShards;
+  gateProgress?: ReleaseGateProgressEvent[];
 }
 // 모르는 상태값(예: 앞으로 생길 blocked)은 버리지 않고 그대로 싣는다 — 칸 하나 때문에 화면 전체가 오류가 되지 않게.
 export type ChecklistStatus = 'green' | 'yellow' | 'red' | 'done' | (string & {});
@@ -113,7 +117,9 @@ function gateShards(value: unknown): value is GateShards {
   const summary = value.summary;
   return value.shards.every((shard: unknown) => record(shard) && string(shard.id) && SHARD_STATES.has(shard.state as string)
       && finiteOrMissing(shard.plannedMin) && finiteOrMissing(shard.installSec) && finiteOrMissing(shard.rc)
-      && (shard.waitReason === undefined || string(shard.waitReason)))
+      && (shard.waitReason === undefined || string(shard.waitReason))
+      && (shard.reuseDecision === undefined || shard.reuseDecision === 'reuse' || shard.reuseDecision === 'rerun')
+      && (shard.reuseReason === undefined || string(shard.reuseReason)))
     && Number.isInteger(summary.total) && record(summary.counts) && [...SHARD_STATES].every((key) => Number.isInteger((summary.counts as Record<string, unknown>)[key]))
     && Array.isArray(summary.waitReasons) && summary.waitReasons.every((row: unknown) => record(row) && string(row.reason) && Number.isInteger(row.count))
     && (summary.etaMin === null || typeof summary.etaMin === 'number') && (summary.staleMin === null || typeof summary.staleMin === 'number')
@@ -124,8 +130,15 @@ function run(value: unknown): value is ReleaseRun {
     && (value.version === null || string(value.version))
     && Array.isArray(value.path) && value.path.every(string)
     && Array.isArray(value.nodes) && value.nodes.every(node))) return false;
+  if (value.graph !== undefined && !(record(value.graph) && Array.isArray(value.graph.nodes) && value.graph.nodes.every((entry: unknown) =>
+    record(entry) && string(entry.nodeId) && string(entry.kind) && Array.isArray(entry.needs) && entry.needs.every(string)))) delete value.graph;
   // 조각 표가 깨졌으면 그 표만 버린다 — 런 목록 전체를 오류로 만들지 않는다.
   if (value.gateShards !== undefined && !gateShards(value.gateShards)) delete value.gateShards;
+  if (value.gateProgress !== undefined) {
+    const parsed = Array.isArray(value.gateProgress) ? value.gateProgress.map(fromReleaseGateProgress) : [];
+    if (parsed.every((event): event is ReleaseGateProgressEvent => event !== null && event.runId === value.runId)) value.gateProgress = parsed;
+    else delete value.gateProgress;
+  }
   return true;
 }
 function item(value: unknown): value is OpsChecklistItem {

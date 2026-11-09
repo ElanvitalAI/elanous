@@ -1,0 +1,8 @@
+{
+  "path": "tests/scenarios/repl-rotation-chain.yaml",
+  "disposition": "excluded",
+  "entryCommand": "eln repl --new --json --scenario tests/scenarios/repl-rotation-chain.yaml",
+  "logsRecorded": "runner-dependent",
+  "logsDetail": "REPL logs are separate; some scenarios invoke live models.",
+  "excludeReason": "REPL/provider workflow, not reusable mock device; separate runner or live model dependency."
+}

@@ -26,7 +26,8 @@ import {
 import { DEFAULT_CLOSE_GLYPH } from './ui/chrome/control-glyphs.js';
 import { computePopupBounds, type PopupPlacement } from './ui/chrome/picker-popup-placement.js';
 import type { ToastStack } from './ui/widgets/toast-stack.js';
-import { modelDisplayForRotationEntry, type RotationEntry } from './user-config.js';
+import { modelDisplayForRotationEntry } from './user-config.js';
+import type { RotationEntry } from './user-config/types.js';
 import {
   ansiForPair,
   DEFAULT_WIDGET_TOKENS,

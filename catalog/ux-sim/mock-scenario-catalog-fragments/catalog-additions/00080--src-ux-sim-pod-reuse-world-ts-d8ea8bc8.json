@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/pod-reuse-world.ts",
+  "reason": "POD-REUSE-SIM-METHOD landed integrated world; register its runtime module in the source inventory."
+}

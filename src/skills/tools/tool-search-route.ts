@@ -45,7 +45,7 @@ export function routeToolSearch(
       query,
       ...(typeof args.max_results === 'number' ? { max_results: args.max_results } : {}),
     },
-    { specs: surfaceSpecs },
+    { specs: surfaceSpecs, surface: meta.surface },
   );
   debug.log('capability.resolve', 'tool-search', {
     surface: meta.surface,

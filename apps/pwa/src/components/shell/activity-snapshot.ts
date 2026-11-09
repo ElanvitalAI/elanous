@@ -24,8 +24,8 @@ export type ShellActivitySnapshot =
   | { kind: 'error'; message: string }
   | { kind: 'active'; run: ShellActivityRun; extraLiveCount: number };
 
-export function observatoryHref(subjectId: string): string {
-  return `/observatory#${encodeURIComponent(subjectId)}`;
+export function liveRunHref(runId: string): string {
+  return `/live-run?run=${encodeURIComponent(runId)}`;
 }
 
 function progressRank(progress: SubjectProgress | undefined): number {
@@ -44,7 +44,7 @@ function toRun(
     origin: subject.origin,
     progressLine: progress?.kind === 'progress' ? progress.line : null,
     progressStatus: progress?.kind === 'progress' ? progress.status : null,
-    href: observatoryHref(subject.id),
+    href: liveRunHref(subject.runId || subject.id),
   };
 }
 

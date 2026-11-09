@@ -68,7 +68,6 @@ function baseConfig(): UserConfig {
       allowDashboardTerminalInject: false,
       allowDashboardApiCall: false,
       allowDashboardRunShell: false,
-      allowDashboardState: true,
     },
     chat: {
       conciseness: { enabled: true, finalMessageMaxLines: 10, preambleMaxWords: 12, flatBullets: true },

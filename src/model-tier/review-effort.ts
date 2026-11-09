@@ -1,4 +1,4 @@
-import type { RoleLlmResolution } from '../user-config.js';
+import type { RoleLlmResolution } from '../user-config/types.js';
 import { lookupLlmTierSpec, type LlmTierProvider } from './llm-tier-map.js';
 
 /**

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TASK-AGENT-PARENT-HOST-DEVICE-TS",
+  "path": "src/ux-sim/task-agent-parent-host-device.ts",
+  "boundary": "Injects host inventory, preflight gaps and launch responses at resolveParentHosts/preflightParentHost/launchRemoteParent; no SSH connection is opened.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

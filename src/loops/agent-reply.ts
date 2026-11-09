@@ -8,7 +8,8 @@ import type { LLMProvider } from '../llm.js';
 import type { Message, MsgStore } from '../msg/msg-store.js';
 import { canonicalSeatId } from '../msg/msg-store.js';
 import { ensureCliSession, runTurn } from '../session/chat.js';
-import { getUserConfig, type RoleLlmSpec } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { RoleLlmSpec } from '../user-config/types.js';
 import { Database } from 'bun:sqlite';
 
 export type AgentReplyAddress = 'COORDINATOR' | 'GUARDIAN';

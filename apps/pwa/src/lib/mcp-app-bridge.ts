@@ -1,3 +1,4 @@
+import { isRecord } from '../../../../src/primitives/guards';
 import { debugLog } from './debug';
 
 type JsonRpcId = string | number;
@@ -93,10 +94,6 @@ const pendingKey = (frameId: string, generation: number, id: JsonRpcId) =>
 
 function response(id: JsonRpcId, code: number, message: string): Record<string, unknown> {
   return { jsonrpc: '2.0', id, error: { code, message } };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function isId(value: unknown): value is JsonRpcId {

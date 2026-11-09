@@ -30,8 +30,8 @@ function commit(repo: string, message: string): string {
   run(repo, 'git', 'commit', '-qm', message);
   return run(repo, 'git', 'rev-parse', 'HEAD');
 }
-function addReceipt(repo: string, path: string, baseCommit: string, headCommit: string, radiusFiles: string[]) {
-  const identity = { headCommit, baseCommit, bunVersion: '1.4.2', lockfileHash: 'lock-hash', radiusFiles,
+function addReceipt(repo: string, path: string, baseCommit: string, headCommit: string, radiusFiles: string[], bunVersion = '1.4.2') {
+  const identity = { headCommit, baseCommit, bunVersion, lockfileHash: 'lock-hash', radiusFiles,
     checks: ['test-interference:with-neighbours'], envFingerprint: 'e'.repeat(64) };
   const receipt: GateReceipt = { ...identity, schema: 1, key: computeReceiptKey(identity, 'passed'), verdict: 'passed', savedAt: '2026-10-29T00:00:00.000Z' };
   saveGateReceipt(path, receipt);
@@ -75,6 +75,20 @@ describe('release gate train receipt carry', () => {
     addReceipt(repo, uncoveredPath, base, head, ['src/other/b.test.ts']);
     expect(planGateTrainReceiptCarry({ repo, commit: head, receiptPath: uncoveredPath, bunVersion: '1.4.2', lockfileHash: 'lock-hash',
       envFingerprint: 'e'.repeat(64) })).toMatchObject({ carriedFiles: [], reasons: ['receipt radius does not cover base-to-head changes'] });
+  });
+
+  test('counts repeated carry rejection reasons and reports the fresh measurement count', () => {
+    const { repo } = fixture();
+    const base = commit(repo, 'base');
+    writeFileSync(join(repo, 'src/a.test.ts'), 'test("a", () => {});\n');
+    const head = commit(repo, 'measured');
+    const receiptPath = join(repo, '.git/receipts.json');
+    addReceipt(repo, receiptPath, base, head, ['src/a.test.ts'], '1.4.0');
+    addReceipt(repo, receiptPath, base, head, ['src/a.test.ts'], '1.4.1');
+    const plan = planGateTrainReceiptCarry({ repo, commit: head, receiptPath, bunVersion: '1.4.2',
+      lockfileHash: 'lock-hash', envFingerprint: 'e'.repeat(64) });
+    expect(plan).toMatchObject({ carriedFiles: [], totalFiles: 2, files: ['src/a.test.ts', 'src/other/b.test.ts'],
+      reasonCounts: { 'bun/lockfile/environment differs': 2 }, planReasons: ['no safe receipt coverage'] });
   });
 
   test('re-runs a carried test when a merge-skew source change reaches it', () => {

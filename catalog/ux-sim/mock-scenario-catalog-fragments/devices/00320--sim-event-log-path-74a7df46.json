@@ -1,0 +1,52 @@
+{
+  "id": "sim-event-log-path",
+  "name": "Graph runtime event-stream log path",
+  "implementation": [
+    "src/ux-sim/graph-runtime-overlay-event-path.ts",
+    "src/ux-sim/graph-runtime-overlay-event-path-worker.ts",
+    "src/ux-sim/scenario.ts",
+    "scenarios/ux-sim/graph-runtime-overlay-event-stream.yaml",
+    "scenarios/ux-sim/demo1104-research-arg-graph.yaml",
+    "graphs/overlays/examples/demo1104-research-arg-runtime.yaml",
+    "src/nexus/api/harness-traversal.ts",
+    "apps/pwa/src/lib/run-graph-flow.ts",
+    "apps/pwa/src/components/live-run/LiveRunGraph.tsx",
+    "apps/pwa/src/components/workflows/RunGraphShowcase.tsx"
+  ],
+  "tests": [
+    "src/ux-sim/scenario.test.ts",
+    "src/ux-sim/arg-ui-diff-device.test.ts",
+    "src/self-implement/graph-overlay-condition.test.ts",
+    "apps/pwa/src/components/workflows/RunGraphShowcase.test.tsx"
+  ],
+  "target": "production runtime overlay structural events plus injected mock-outcome graph.path events in the isolated run ledger and PWA runtime graph view",
+  "inputs": [
+    "registered runtime overlay",
+    "generated runId",
+    "isolated test state root",
+    "injected mock review outcome"
+  ],
+  "observations": [
+    "production node-added and edge-rerouted events",
+    "graph.path edge-taken review→FX→merge events from the same runId",
+    "injected mock outcome marker distinguishes the fixture from selector output",
+    "PWA graph diff and event order"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/arg-ui-diff-device.test.ts apps/pwa/src/components/workflows/RunGraphShowcase.test.tsx -t ARG-UI-DIFF",
+    "bun bin/elanous.mjs --test sim run scenarios/ux-sim/graph-runtime-overlay-event-stream.yaml",
+    "bun bin/elanous.mjs --test sim run scenarios/ux-sim/demo1104-research-arg-graph.yaml"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": [
+    "self-implement/graph-overlay-decision",
+    "ux.sim.scenario/completed"
+  ],
+  "recentUse": {
+    "observedAt": "2026-11-03T08:58:16Z",
+    "runId": "ce4bdc5d-492e-4e91-8a37-75b4e5ece776",
+    "event": "self-implement/graph-overlay-decision",
+    "scenarioId": "demo1104-research-arg-graph",
+    "command": "bun bin/elanous.mjs --test sim run scenarios/ux-sim/demo1104-research-arg-graph.yaml"
+  }
+}

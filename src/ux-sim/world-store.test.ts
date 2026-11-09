@@ -2,8 +2,10 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { loadMockScenarioCatalog } from './mock-scenario-catalog.js';
+import { loadDeviceCatalogSnapshotsFromRoot } from './device-catalog-snapshot-fragments.js';
 import { assertSimWorldOwnership, createSimWorld, destroySimWorld, listSimWorlds } from './world-store.js';
 
 const roots: string[] = [];
@@ -27,7 +29,7 @@ afterEach(() => {
 describe('sim world lifecycle', () => {
   test('current device snapshot includes every source module in the catalog', () => {
     const catalog = loadMockScenarioCatalog();
-    const snapshots = JSON.parse(readFileSync(new URL('../sim-world-device-catalogs.json', import.meta.url), 'utf8')) as Record<string, string[]>;
+    const snapshots = loadDeviceCatalogSnapshotsFromRoot(fileURLToPath(new URL('../..', import.meta.url)));
     expect([...snapshots[String(catalog.deviceCatalogVersion)]!].sort()).toEqual(catalog.sourceModules.map(({ id }) => id).sort());
   });
   test('refuses to access sim storage without an explicit isolated test universe', () => {
@@ -156,11 +158,15 @@ describe('sim world lifecycle', () => {
   test('keeps a v2 device snapshot world listable and destroyable after the catalog advances to v3', () => {
     const root = worldsDir();
     const world = createSimWorld('prior-v2-catalog-world', { worldsDir: root });
-    const versionedCatalogs = JSON.parse(readFileSync(new URL('../sim-world-device-catalogs.json', import.meta.url), 'utf8')) as Record<string, string[]>;
+    const versionedCatalogs = loadDeviceCatalogSnapshotsFromRoot(fileURLToPath(new URL('../..', import.meta.url)));
     const priorDeviceIds = versionedCatalogs['2']!;
     const priorDeviceIdSet = new Set(priorDeviceIds);
     for (const id of world.deviceModuleIds) {
       if (!priorDeviceIdSet.has(id)) rmSync(join(world.devicesDir, `${id}.json`));
+    }
+    for (const id of priorDeviceIds) {
+      const path = join(world.devicesDir, `${id}.json`);
+      if (!existsSync(path)) writeFileSync(path, `${JSON.stringify({ id, path: 'src/ux-sim/historical-module.ts' })}\n`, { mode: 0o600 });
     }
     const manifestPath = join(world.rootDir, 'world.json');
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;

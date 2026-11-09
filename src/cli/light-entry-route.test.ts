@@ -14,6 +14,14 @@ import { selectLightCliRoute } from './light-entry-route.js';
 const { ELANOUS_CONFIG_DIR: _ignoredGateConfigDir, ...entrypointEnv } = process.env;
 
 describe('light CLI entry routing', () => {
+  test('routes shell suggestions through the lightweight entry for the supported contract', () => {
+    expect(selectLightCliRoute(['q', 'find', 'recent', 'files'])).toBe('q');
+    expect(selectLightCliRoute(['q', '--raw', '--', 'find', 'recent', 'files'])).toBe('q');
+    expect(selectLightCliRoute(['q', 'find', 'recent', 'files', '--raw'])).toBe('q');
+    expect(selectLightCliRoute(['shell-init', 'zsh'])).toBe('q');
+    expect(selectLightCliRoute(['q', 'find', '-mtime', '1'])).toBeUndefined();
+  });
+
   test('routes only the requested query paths', () => {
     expect(selectLightCliRoute(['msg', 'list', '--to', 'MK'])).toBe('msg');
     expect(selectLightCliRoute(['msg', 'ack', '17', '--to', 'MK'])).toBe('msg');

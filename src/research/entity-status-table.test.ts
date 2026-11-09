@@ -188,21 +188,26 @@ test('hands structured table data to the renderer through an injected seam', () 
 
 test('logs row and hold counts with the caller runId', () => {
   const runId = `run-entity-status-${crypto.randomUUID()}`;
-  const before = debug.events().length;
-  buildResearchEntityStatusTable({
-    title: 'HBM4 vendor status',
-    runId,
-    statusClaims: [
-      statusClaim('Supported vendor', 'HBM4', 'sampling', '2026-10-31', 'https://vendor.example/status'),
-      { id: 'held', entity: 'Held vendor', component: 'HBM4', milestone: 'shipment', reportedAt: '2026-10-31',
-        evidenceExcerpt: 'partial', evidenceAssessment: 'supports-claim', evidence: evidence({ outcome: 'partial', source: 'invalid-url', content: 'partial' }) },
-    ],
-    supplyChainClaims: [],
-  });
-
-  const event = debug.events().slice(before).find((item) => item.category === 'research.entity-status-table'
-    && item.event === 'built' && (item.data as { runId?: string } | undefined)?.runId === runId);
-  expect(event?.data).toMatchObject({ rowCount: 2, supportedRows: 1, heldRows: 1, sourceReferenceCount: 2 });
+  let eventData: unknown;
+  const unregister = debug.registerSink({ name: 'entity-status-table-test', emit: (item) => {
+    if (item.category === 'research.entity-status-table' && item.event === 'built'
+      && (item.data as { runId?: string } | undefined)?.runId === runId) eventData = item.data;
+  } });
+  try {
+    buildResearchEntityStatusTable({
+      title: 'HBM4 vendor status',
+      runId,
+      statusClaims: [
+        statusClaim('Supported vendor', 'HBM4', 'sampling', '2026-10-31', 'https://vendor.example/status'),
+        { id: 'held', entity: 'Held vendor', component: 'HBM4', milestone: 'shipment', reportedAt: '2026-10-31',
+          evidenceExcerpt: 'partial', evidenceAssessment: 'supports-claim', evidence: evidence({ outcome: 'partial', source: 'invalid-url', content: 'partial' }) },
+      ],
+      supplyChainClaims: [],
+    });
+  } finally {
+    unregister();
+  }
+  expect(eventData).toMatchObject({ rowCount: 2, supportedRows: 1, heldRows: 1, sourceReferenceCount: 2 });
 });
 
 test('holds empty or unrelated excerpts and preserves each partial capture with a row reference', () => {

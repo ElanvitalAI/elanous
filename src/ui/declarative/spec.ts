@@ -1,3 +1,4 @@
+import { isObject } from '../../primitives/guards.js';
 import { BoxDecoration } from '../attributes/index.js';
 
 export type WidgetChromeVariant = 'none' | 'panel' | 'window' | 'dialog' | 'tooltip';
@@ -99,10 +100,6 @@ function cleanObject<T extends Record<string, unknown>>(value: T): T | undefined
   const entries = Object.entries(value).filter(([, entry]) => entry !== undefined);
   if (entries.length === 0) return undefined;
   return Object.fromEntries(entries) as T;
-}
-
-function isObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
 export const widgetStyleStateSchema: Record<string, unknown> = {

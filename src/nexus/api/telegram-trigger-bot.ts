@@ -26,7 +26,7 @@ import {
   type TgTriggerEvent,
 } from '../../telegram.js';
 import type { runTurn } from '../../session/chat.js';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 import { registerMissionHitlCallback } from '../../autopilot/mission-hitl-callback.js';
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { debug } from '../../debug/log.js';

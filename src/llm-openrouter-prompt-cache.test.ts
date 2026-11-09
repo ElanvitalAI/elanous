@@ -1,9 +1,10 @@
 import type { LLMToolSpec } from './llm/tool-spec.js';
 // OR-ANTHROPIC-CACHE (2026-10-10) — OpenRouter 뒤 anthropic/* · moonshotai/* 에만 cache_control 중단점을 싣는다.
-import { expect, spyOn, test } from 'bun:test';
+import { expect, test } from 'bun:test';
 import { getProviderForConfig, type LLMMessage } from './llm.js';
 import { applyOpenRouterCacheControl, openRouterPromptCacheFamily } from './prompt-cache/openrouter.js';
-import type { UserConfig } from './user-config.js';
+import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+import type { UserConfig } from './user-config/types.js';
 
 const tools: LLMToolSpec[] = [{ name: 'Read', description: 'read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } }];
 const loop: LLMMessage[] = [
@@ -17,17 +18,15 @@ const loop: LLMMessage[] = [
 
 async function capture(provider: string, model: string, opts: Record<string, unknown> = {}) {
   const bodies: string[] = [];
-  const mock = spyOn(globalThis, 'fetch').mockImplementation((async (_url, init) => {
-    bodies.push(String(init?.body));
-    return new Response('data: [DONE]\n\n', { status: 200 });
-  }) as typeof fetch);
-  try {
+  await withFakeFetchDevice([
+    { url: '/api/v1/chat/completions', method: 'POST', response: (request) => { bodies.push(request.body ?? ''); return new Response('data: [DONE]\n\n', { status: 200 }); } },
+    { url: '/v1/chat/completions', method: 'POST', response: (request) => { bodies.push(request.body ?? ''); return new Response('data: [DONE]\n\n', { status: 200 }); } },
+  ], async (device) => {
     const config = { llm: { provider, model, apiKey: 'test-key', ...(provider === 'local' ? { baseUrl: 'http://localhost:1234/v1' } : {}) } } as UserConfig;
     for await (const _ of getProviderForConfig(config).streamChat!(loop, { tools, ...opts })) { /* consume */ }
-    return { raw: bodies[0]!, body: JSON.parse(bodies[0]!) as Record<string, any> };
-  } finally {
-    mock.mockRestore();
-  }
+    expect(device.calls()).toHaveLength(1);
+  });
+  return { raw: bodies[0]!, body: JSON.parse(bodies[0]!) as Record<string, any> };
 }
 
 function countMarkers(raw: string): number {

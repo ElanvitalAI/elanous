@@ -22,7 +22,7 @@ import type {
   EntityExtractInput,
   EntityExtractOutput,
 } from './patcher-extractors/entity-extractor.js';
-import type { BackgroundReasoningLlmConfig } from '../user-config.js';
+import type { BackgroundReasoningLlmConfig } from '../user-config/types.js';
 
 const DEFAULT_ENTITY_MODEL = 'lm-studio/qwen-7b';
 const DEFAULT_EMBEDDING_MODEL = 'text-embedding-3-small';

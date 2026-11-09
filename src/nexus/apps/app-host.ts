@@ -15,9 +15,31 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { parseAppManifest, type AppManifest } from './app-contract.js';
 import { createAppAuth, type AppAuthOptions, type IssuedAppInvitation } from './app-auth.js';
 import { createAppDatabase, type AppDatabase } from './app-db.js';
+import type { AppDbBackupOptions, AppDbBackupStatus } from './app-db-backup.js';
 import { emitNexusFunnelEvent, type NexusFunnelRuntime } from './funnel-observe.js';
+import type { MemberStore } from '../members/member-store.js';
+import { parsePublicAppHost, resolvePublicAppUserId } from '../../relay/relay-server.js';
+
+export interface VerifiedAppOwner {
+  readonly memberId: string;
+  readonly userSlug: string;
+  readonly plan: string;
+  readonly entitlements: Readonly<Record<string, unknown>>;
+}
+
+/** Shared server accessor for PWA/TUI callers; authentication stays inside the booted host. */
+export function resolveVerifiedOwner(
+  appHost: NexusAppHost,
+  appSlug: string,
+  sessionCredential: string,
+  members: Pick<MemberStore, 'memberPlanForMember'>,
+  configuredPublicUserId?: string,
+): VerifiedAppOwner | null {
+  return appHost.resolveVerifiedOwner(appSlug, sessionCredential, members, configuredPublicUserId);
+}
 
 const APP_HOST_SUFFIX = '.app.localhost';
+const PUBLIC_APP_DOMAIN = 'elanous.app';
 const MIME_BY_EXT: Readonly<Record<string, string>> = {
   '.css': 'text/css; charset=utf-8', '.gif': 'image/gif', '.html': 'text/html; charset=utf-8',
   '.ico': 'image/x-icon', '.jpeg': 'image/jpeg', '.jpg': 'image/jpeg', '.js': 'text/javascript; charset=utf-8',
@@ -36,13 +58,27 @@ export interface NexusAppHost {
   handle(req: Request): Response | undefined | Promise<Response | undefined>;
   /** Trusted server-side invitation issuance. Public app-host requests cannot call this operation. */
   issueInvitation(appSlug: string, invitedBy: string, ttlMs?: number, role?: string): IssuedAppInvitation;
+  /** Trusted server-side Google-member owner session issuance; never exposed as a public app-host route. */
+  issueOwnerSession(appSlug: string, memberId: string): { sessionToken: string; expiresAt: string };
+  /** Validates a host-bound owner cookie/Bearer, then joins the member plan from the private member DB. */
+  resolveVerifiedOwner(appSlug: string, sessionCredential: string, members: Pick<MemberStore, 'memberPlanForMember'>, configuredPublicUserId?: string): VerifiedAppOwner | null;
   readonly slugs: readonly string[];
   /** Parsed, validated manifest snapshot for app-scoped route registration. */
   getManifest(appSlug: string): AppManifest | undefined;
+  /** Trusted server-side backup health and isolated restore controls; app requests cannot call these. */
+  databaseBackupStatus(appSlug: string): AppDbBackupStatus | null;
+  restoreDatabaseBackup(appSlug: string, targetPath: string): ReturnType<NonNullable<AppDatabase['restoreBackup']>>;
+  /** Mounts one already-built app directory into the current host after validating its immutable snapshot. */
+  mountDirectory(appSlug: string): void;
+  /** Removes one dynamically mounted app after a failed publication attempt. */
+  unmountDirectory(appSlug: string): void;
   close(): void;
 }
 
-export type NexusAppHostAuthOptions = Pick<AppAuthOptions, 'dir' | 'key' | 'now' | 'invitationTtlMs' | 'sessionTtlMs' | 'funnel'> & { readonly databaseDirectory?: string };
+export type NexusAppHostAuthOptions = Pick<AppAuthOptions, 'dir' | 'key' | 'now' | 'invitationTtlMs' | 'sessionTtlMs' | 'funnel'> & {
+  readonly databaseDirectory?: string;
+  readonly databaseBackup?: Omit<AppDbBackupOptions, 'appSlug' | 'databasePath' | 'database'>;
+};
 
 interface MountedApp {
   readonly slug: string;
@@ -297,10 +333,26 @@ function createNexusAppHost(
   authBySlug: ReadonlyMap<string, ReturnType<typeof createAppAuth>>,
   appDb?: AppDatabase,
   funnel?: NexusFunnelRuntime,
+  mountDirectory?: (appSlug: string) => void,
+  unmountDirectory?: (appSlug: string) => void,
+  publicUserSlug?: string,
 ): NexusAppHost {
   return {
-    slugs: [...mounts.keys()],
+    get slugs() { return [...mounts.keys()]; },
     getManifest(appSlug) { return mounts.get(appSlug)?.manifest; },
+    databaseBackupStatus(appSlug) { return appDb?.backupStatus?.(appSlug) ?? null; },
+    restoreDatabaseBackup(appSlug, targetPath) {
+      if (!appDb?.restoreBackup) throw new Error('app database backup is not configured');
+      return appDb.restoreBackup(appSlug, targetPath);
+    },
+    mountDirectory(appSlug) {
+      if (!mountDirectory) throw new Error('dynamic app mounting is unavailable');
+      mountDirectory(appSlug);
+    },
+    unmountDirectory(appSlug) {
+      if (!unmountDirectory) throw new Error('dynamic app unmounting is unavailable');
+      unmountDirectory(appSlug);
+    },
     close() { appDb?.close(); },
     issueInvitation(appSlug, invitedBy, ttlMs, role) {
       const auth = authBySlug.get(appSlug);
@@ -321,17 +373,48 @@ function createNexusAppHost(
       }
       return auth.issueInvitation({ appSlug, invitedBy, role: effectiveRole, ...(ttlMs !== undefined ? { ttlMs } : {}) });
     },
+    issueOwnerSession(appSlug, memberId) {
+      const auth = authBySlug.get(appSlug);
+      const mounted = mounts.get(appSlug);
+      if (!mounted || !auth) throw new Error('app is not mounted or app authentication is unavailable');
+      const roles = mounted.manifest.roles as Record<string, unknown> | undefined;
+      const ownerRole = roles?.owner;
+      const via = typeof ownerRole === 'object' && ownerRole !== null && !Array.isArray(ownerRole)
+        ? (ownerRole as Record<string, unknown>).via : undefined;
+      if (via !== 'nexus-session') throw new Error('owner role is not available through a member session');
+      return auth.issueTrustedSession({ appSlug, memberId, role: 'owner' });
+    },
+    resolveVerifiedOwner(appSlug, sessionCredential, members, configuredPublicUserId) {
+      const auth = authBySlug.get(appSlug);
+      const mounted = mounts.get(appSlug);
+      if (!auth || !mounted || !sessionCredential) return null;
+      const session = auth.getSessionRecord(sessionCredential);
+      if (!session || session.appSlug !== appSlug || session.role !== 'owner' || session.source !== 'google-member') return null;
+      const plan = members.memberPlanForMember(session.invitedBy);
+      const userSlug = resolvePublicAppUserId(undefined, configuredPublicUserId);
+      if (!plan || !userSlug) return null;
+      return { memberId: session.invitedBy, userSlug, plan: plan.plan, entitlements: plan.entitlements };
+    },
     handle(req) {
       const hostname = requestHostname(req);
-      if (!hostname?.endsWith(APP_HOST_SUFFIX)) return undefined;
-      const slug = hostname.slice(0, -APP_HOST_SUFFIX.length);
+      if (!hostname) return undefined;
+      const localHost = hostname.endsWith(APP_HOST_SUFFIX);
+      const publicHost = parsePublicAppHost(hostname, PUBLIC_APP_DOMAIN);
+      if (!localHost && !hostname.endsWith(`.${PUBLIC_APP_DOMAIN}`)) return undefined;
+      if (!localHost && (!publicHost || !publicUserSlug || publicHost.user !== publicUserSlug)) return notFound();
+      const slug = localHost ? hostname.slice(0, -APP_HOST_SUFFIX.length) : publicHost!.app;
       const mounted = mounts.get(slug);
       if (!mounted) return notFound();
       const auth = authBySlug.get(slug);
-      if (!auth) return new Response('App authentication unavailable', { status: 503 });
+      const roles = mounted.manifest.roles as Record<string, unknown> | undefined;
+      const publicRole = roles?.public;
+      const publicRead = typeof publicRole === 'object' && publicRole !== null && !Array.isArray(publicRole)
+        && (publicRole as Record<string, unknown>).via === 'public-read';
+      if (!auth && !publicRead) return new Response('App authentication unavailable', { status: 503 });
       const url = new URL(req.url);
       if (url.pathname === '/__auth/accept') {
         if (req.method !== 'GET') return new Response('Method Not Allowed', { status: 405, headers: { allow: 'GET' } });
+        if (!auth) return new Response('App authentication unavailable', { status: 503 });
         const token = url.searchParams.get('token') ?? '';
         const accepted = auth.acceptInvitation({ appSlug: slug, token });
         if (accepted.status !== 200 || !accepted.cookie) return new Response('Unauthorized', { status: 401 });
@@ -343,11 +426,19 @@ function createNexusAppHost(
       if (rpcMatch) {
         return (async () => {
         if (req.method !== 'POST') return new Response(JSON.stringify({ error: 'method-not-allowed' }), { status: 405, headers: { allow: 'POST', 'content-type': 'application/json' } });
-        if (!sameRequestOrigin(req, hostname)) return new Response(JSON.stringify({ error: 'origin-not-allowed' }), { status: 403, headers: { 'content-type': 'application/json' } });
+        const authorization = req.headers.get('authorization') ?? '';
+        const bearerToken = /^Bearer (aps_[A-Za-z0-9_-]{16,4096})$/.exec(authorization)?.[1] ?? null;
+        const hasCookie = Boolean(req.headers.get('cookie'));
+        if (authorization && (!bearerToken || hasCookie)) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+        const nativeBearer = Boolean(bearerToken && !hasCookie && !req.headers.has('origin'));
+        if (!sameRequestOrigin(req, hostname) && !nativeBearer) return new Response(JSON.stringify({ error: 'origin-not-allowed' }), { status: 403, headers: { 'content-type': 'application/json' } });
         if (!/^application\/json(?:\s*;|\s*$)/i.test(req.headers.get('content-type') ?? '')) return new Response(JSON.stringify({ error: 'json-required' }), { status: 415, headers: { 'content-type': 'application/json' } });
-        const sessionCookie = req.headers.get('cookie') ?? '';
-        let session = auth.getSessionRecord(sessionCookie);
-        if (!session || session.appSlug !== slug) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+        const sessionCredential = bearerToken ?? req.headers.get('cookie') ?? '';
+        let session = auth?.getSessionRecord(sessionCredential);
+        let role = session?.appSlug === slug ? session.role : undefined;
+        if (session && bearerToken && session.source !== 'google-member') return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+        if (!role && publicRead && !authorization) role = 'public';
+        if (!role) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
         if (!appDb) return new Response(JSON.stringify({ error: 'app-db-not-wired' }), { status: 503, headers: { 'content-type': 'application/json' } });
         const contentLength = req.headers.get('content-length');
         if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > 64 * 1024) return new Response(JSON.stringify({ error: 'request-too-large' }), { status: 413, headers: { 'content-type': 'application/json' } });
@@ -362,11 +453,13 @@ function createNexusAppHost(
         }
         try {
           // The request body may have taken long enough for the session to expire or be revoked.
-          session = auth.getSessionRecord(sessionCookie);
-          if (!session || session.appSlug !== slug) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
-          const roles = mounted.manifest.roles as Record<string, unknown> | undefined;
-          if (roles && !Object.hasOwn(roles, session.role)) return new Response(JSON.stringify({ error: 'forbidden' }), { status: 403, headers: { 'content-type': 'application/json' } });
-          const rows = appDb.rpc(slug, rpcMatch[1]!, (rpcInput.params ?? {}) as Record<string, unknown>, session.role);
+          session = auth?.getSessionRecord(sessionCredential);
+          role = session?.appSlug === slug ? session.role : undefined;
+          if (session && bearerToken && session.source !== 'google-member') return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+          if (!role && publicRead && !authorization) role = 'public';
+          if (!role) return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'cache-control': 'no-store', 'content-type': 'application/json' } });
+          if (roles && !Object.hasOwn(roles, role)) return new Response(JSON.stringify({ error: 'forbidden' }), { status: 403, headers: { 'content-type': 'application/json' } });
+          const rows = appDb.rpc(slug, rpcMatch[1]!, (rpcInput.params ?? {}) as Record<string, unknown>, role);
           return new Response(JSON.stringify({ rows }), { status: 200, headers: { 'cache-control': 'no-store', 'content-type': 'application/json; charset=utf-8' } });
         } catch (error) {
           const message = error instanceof Error ? error.message : '';
@@ -375,7 +468,8 @@ function createNexusAppHost(
         }
         })();
       }
-      if (auth.verifySession({ appSlug: slug, token: req.headers.get('cookie') ?? '' }).status !== 200) {
+      const isPublicReadRequest = publicRead && (req.method === 'GET' || req.method === 'HEAD');
+      if (!isPublicReadRequest && (!auth || auth.verifySession({ appSlug: slug, token: req.headers.get('cookie') ?? '' }).status !== 200)) {
         return new Response('Unauthorized', { status: 401, headers: { 'cache-control': 'no-store' } });
       }
       if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -390,7 +484,7 @@ function createNexusAppHost(
         'content-type': MIME_BY_EXT[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
         'cache-control': 'no-store',
         'x-nexus-app-host': hostname,
-        'x-nexus-app-origin': `http://${requestAuthority(req, hostname)}`,
+        'x-nexus-app-origin': `${localHost ? 'http' : 'https'}://${requestAuthority(req, hostname)}`,
       });
       const response = new Response(req.method === 'HEAD' ? null : new Uint8Array(body), { status: 200, headers });
       if (req.method === 'GET' && url.pathname === '/' && funnel) {
@@ -413,55 +507,93 @@ export function loadNexusAppHost(
   appsDir: string,
   simulation?: NexusAppHostFsSimulation,
   authOptions?: NexusAppHostAuthOptions,
+  publicUserSlug?: string,
 ): { appHost: NexusAppHost; issues: readonly NexusAppHostIssue[] } {
   const mounts = new Map<string, MountedApp>();
   const authBySlug = new Map<string, ReturnType<typeof createAppAuth>>();
+  const databases = new Map<string, AppDatabase>();
   const issues: NexusAppHostIssue[] = [];
-  if (!existsSync(appsDir)) return { appHost: createNexusAppHost(mounts, authBySlug, undefined, authOptions?.funnel), issues };
-
-  const appsRoot = realpathSync(appsDir);
-  const rootIdentity = stableDirectory(appsRoot, appsRoot);
-  const entries = readdirSync(appsRoot, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
-  for (const entry of entries) {
-    if (entry.isSymbolicLink() || !entry.isDirectory()) continue;
-    const appDir = join(appsRoot, entry.name);
-    if (!existsSync(join(appDir, 'app.yaml'))) continue;
+  const configuredAppsRoot = resolve(appsDir);
+  const appsRoot = () => realpathSync(configuredAppsRoot);
+  const mountDirectory = (appSlug: string, initializeDatabase = true) => {
+    const root = appsRoot();
+    const mounted = mountApp(root, appSlug, simulation);
+    if (mounted.slug !== appSlug) throw new Error('app directory slug does not match its manifest');
+    if (mounts.has(appSlug)) throw new Error('app is already mounted');
+    let auth: ReturnType<typeof createAppAuth> | undefined;
+    let database: AppDatabase | undefined;
     try {
-      const mounted = mountApp(appsRoot, entry.name, simulation);
-      if (mounts.has(mounted.slug)) throw new Error('duplicate app slug');
-      mounts.set(mounted.slug, mounted);
       if (authOptions) {
-        authBySlug.set(mounted.slug, createAppAuth({ ...authOptions, dir: join(authOptions.dir ?? join(appsRoot, '..', 'app-session-tokens'), mounted.slug) }));
+        auth = createAppAuth({ ...authOptions, dir: join(authOptions.dir ?? join(root, '..', 'app-session-tokens'), appSlug) });
+        const hasDbContract = Object.hasOwn(mounted.manifest, 'tables') || Object.hasOwn(mounted.manifest, 'rpc');
+        if (initializeDatabase && hasDbContract) database = createAppDatabase([mounted.manifest], {
+          ...(authOptions.databaseDirectory ? { directory: authOptions.databaseDirectory } : {}),
+          ...(authOptions.databaseBackup ? { backup: authOptions.databaseBackup } : {}),
+        });
       }
+      mounts.set(appSlug, mounted);
+      if (auth) authBySlug.set(appSlug, auth);
+      if (database) databases.set(appSlug, database);
     } catch (error) {
-      issues.push({ appDir: basename(appDir), reason: error instanceof Error ? error.message : String(error) });
+      database?.close();
+      mounts.delete(appSlug);
+      authBySlug.delete(appSlug);
+      databases.delete(appSlug);
+      throw error;
     }
+  };
+  const unmountDirectory = (appSlug: string) => {
+    databases.get(appSlug)?.close();
+    databases.delete(appSlug);
+    authBySlug.delete(appSlug);
+    mounts.delete(appSlug);
+  };
+  if (existsSync(configuredAppsRoot)) {
+    const root = appsRoot();
+    const rootIdentity = stableDirectory(root, root);
+    const entries = readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (entry.isSymbolicLink() || !entry.isDirectory()) continue;
+      const appDir = join(root, entry.name);
+      if (!existsSync(join(appDir, 'app.yaml'))) continue;
+      try { mountDirectory(entry.name, false); }
+      catch (error) { issues.push({ appDir: basename(appDir), reason: error instanceof Error ? error.message : String(error) }); }
+    }
+    stableDirectory(root, root, rootIdentity);
   }
-  stableDirectory(appsRoot, appsRoot, rootIdentity);
-  let appDb: AppDatabase | undefined;
-  if (authOptions && mounts.size > 0) {
-    const databases = new Map<string, AppDatabase>();
+  if (authOptions) {
     for (const [slug, mounted] of mounts) {
       const hasDbContract = Object.hasOwn(mounted.manifest, 'tables') || Object.hasOwn(mounted.manifest, 'rpc');
       if (!hasDbContract) continue;
       try {
-        databases.set(slug, createAppDatabase([mounted.manifest], authOptions.databaseDirectory ? { directory: authOptions.databaseDirectory } : {}));
+        databases.set(slug, createAppDatabase([mounted.manifest], {
+          ...(authOptions.databaseDirectory ? { directory: authOptions.databaseDirectory } : {}),
+          ...(authOptions.databaseBackup ? { backup: authOptions.databaseBackup } : {}),
+        }));
       } catch (error) {
         issues.push({ appDir: slug, reason: error instanceof Error ? error.message : String(error) });
         mounts.delete(slug);
         authBySlug.delete(slug);
       }
     }
-    if (databases.size > 0) {
-      appDb = {
-        rpc(slug, name, params, role) {
-          const database = databases.get(slug);
-          if (!database) throw new Error(`app not found: ${slug}`);
-          return database.rpc(slug, name, params, role);
-        },
-        close() { for (const database of databases.values()) database.close(); databases.clear(); },
-      };
-    }
   }
-  return { appHost: createNexusAppHost(mounts, authBySlug, appDb, authOptions?.funnel), issues };
+  let appDb: AppDatabase | undefined;
+  if (authOptions) {
+    appDb = {
+      rpc(slug, name, params, role) {
+        const database = databases.get(slug);
+        if (!database) throw new Error(`app not found: ${slug}`);
+        return database.rpc(slug, name, params, role);
+      },
+      backupStatus(slug) { return databases.get(slug)?.backupStatus?.(slug) ?? null; },
+      createBackupSnapshot(slug) { return databases.get(slug)?.createBackupSnapshot?.(slug) ?? false; },
+      restoreBackup(slug, targetPath) {
+        const database = databases.get(slug);
+        if (!database?.restoreBackup) throw new Error('app database backup is not configured');
+        return database.restoreBackup(slug, targetPath);
+      },
+      close() { for (const database of databases.values()) database.close(); databases.clear(); },
+    };
+  }
+  return { appHost: createNexusAppHost(mounts, authBySlug, appDb, authOptions?.funnel, mountDirectory, unmountDirectory, publicUserSlug), issues };
 }

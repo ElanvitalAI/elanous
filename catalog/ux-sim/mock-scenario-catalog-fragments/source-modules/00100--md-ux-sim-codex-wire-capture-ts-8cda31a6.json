@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-CODEX-WIRE-CAPTURE-TS",
+  "path": "src/ux-sim/codex-wire-capture.ts",
+  "boundary": "codex wire capture: Fetch-boundary mock for Codex Responses wire-contract tests.",
+  "deviceIds": [
+    "codex-wire-capture"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

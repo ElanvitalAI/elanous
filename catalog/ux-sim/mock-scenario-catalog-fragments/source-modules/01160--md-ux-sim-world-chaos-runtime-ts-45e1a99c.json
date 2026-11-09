@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-WORLD-CHAOS-RUNTIME-TS",
+  "path": "src/ux-sim/world-chaos-runtime.ts",
+  "boundary": "Runs declared monkey faults and world injections on one shared fake-time timeline; measures production readiness recovery and persisted injected ledger rows.",
+  "deviceIds": [
+    "world-runtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

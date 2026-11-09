@@ -8,9 +8,18 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { defaultEmbed, type EmbedFn } from '../src/domains/knowledge.js';
 import { createCensusSearchAdapter, type CensusCase } from './test-census/similar-search.js';
+import type { NumericCandidateProvenance } from './test-census.js';
 
-type CensusRow = { file: string; name: string; suitePath?: string[]; contract?: string; owner?: string };
+type CensusRow = { file: string; name: string; suitePath?: string[]; contract?: string; owner?: string; numericCandidateProvenance?: NumericCandidateProvenance[] | null };
 type CensusDocument = { rows?: CensusRow[] };
+
+export const TEST_CENSUS_AUDIT_QUESTIONS = {
+  expectedValueJustification: [
+    'Which numeric literal is the assertion expecting, and is it a contract value rather than an incidental number in the test body?',
+    'Which git blame commit introduced the literal, and what reason does that commit record?',
+    'Does the recorded reason cite a design budget, external limit, or defect case that still applies? If evidence is absent, mark the value unsubstantiated.',
+  ],
+} as const;
 
 function censusIdentity(row: CensusRow): string {
   return `${row.file} > ${[...(row.suitePath ?? []), row.name].join(' > ')}`;
@@ -33,6 +42,7 @@ export function caseRowsFromSelection(census: CensusDocument, identities: string
     targetSummary: row.contract ?? row.name,
     module: dirname(row.file).replaceAll('\\', '/'),
     owner: row.owner,
+    ...(Object.hasOwn(row, 'numericCandidateProvenance') ? { numericCandidateProvenance: row.numericCandidateProvenance } : {}),
   }));
 }
 
@@ -90,6 +100,7 @@ export async function buildSimilarSearchReport(
   embed: EmbedFn,
   source: { census: string; selection: string },
 ) {
+  const byId = new Map(rows.map((row) => [row.id ?? `${row.file}#${row.name}`, row]));
   const candidateLimit = 3;
   const adapter = await createCensusSearchAdapter(rows, embed);
   try {
@@ -104,8 +115,10 @@ export async function buildSimilarSearchReport(
       casesIndexed: rows.length,
       candidateLimit,
       interpretation: 'Rankings are retrieval observations, not adjudicated same-contract labels. KGS ontology candidates are the union of explicit contract-edge neighbors and shared-module-edge neighbors.',
+      auditQuestions: TEST_CENSUS_AUDIT_QUESTIONS,
       cases: comparisons.map((comparison) => ({
         caseId: comparison.queryId,
+        numericCandidateProvenance: byId.get(comparison.queryId)?.numericCandidateProvenance ?? null,
         top3: {
           bm25: comparison.bm25.slice(0, candidateLimit),
           vector: comparison.vector.slice(0, candidateLimit),

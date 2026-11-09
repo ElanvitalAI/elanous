@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/graph-resume-any-entry.test.ts",
+  "reason": "GRAPH-RESUME-ANY-ENTRY-SIM: asserts the five production-runner resume scenarios and their invariants."
+}

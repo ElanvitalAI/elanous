@@ -51,4 +51,13 @@ describe('SIM-CHAIN-LAND production queue chain', () => {
     expect(result.disposition).toBeNull();
     expect(result.ghCalls.length).toBeGreaterThan(0);
   }, 30_000);
+
+  test('drainQueue repeats the real queue tick and returns ordered receipts for every PR', async () => {
+    const result = await simulateChainLand({ prNumbers: [91, 92, 93], gateOutcomes: ['pass', 'pass', 'pass'], drainQueue: true });
+    expect(result.enqueued).toEqual([91, 92, 93]);
+    expect(result.pending).toEqual([]);
+    expect(result.verdicts.map(({ number, verdict }) => ({ number, verdict }))).toEqual([
+      { number: 91, verdict: 'pass' }, { number: 92, verdict: 'pass' }, { number: 93, verdict: 'pass' },
+    ]);
+  }, 30_000);
 });

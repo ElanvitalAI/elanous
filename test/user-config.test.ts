@@ -4,6 +4,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { CHAT_DEFAULTS } from '../src/user-config/chat';
 import {
   buildUserConfig, getUserConfig, reloadUserConfig, resetUserConfig,
   saveUserConfig, markOnboardingComplete, skillSetDir, currentOnboardingVersion,
@@ -144,14 +145,15 @@ describe('user-config defaults', () => {
     expect(configured.acp.toolApproval.timeoutMs).toBe(1500);
     saveUserConfig(configured, cfgPath);
     expect(JSON.parse(require('node:fs').readFileSync(cfgPath, 'utf-8')).acp).toEqual({
-      hopCap: {}, binaryPaths: { codex: '/opt/bin/codex-acp' }, toolApproval: { timeoutMs: 1500 },
+      // 출처: #35995 retained ACP approval timeout fixture; only retired hopCap is removed.
+      binaryPaths: { codex: '/opt/bin/codex-acp' }, toolApproval: { timeoutMs: 1500 },
     });
     write({ acp: { binaryPaths: { codex: '/opt/bin/codex-acp' } } });
     const fromEnv = buildUserConfig(cfgPath);
     expect(fromEnv.acp.toolApproval.timeoutMs).toBe(2500);
     saveUserConfig(fromEnv, cfgPath);
     expect(JSON.parse(require('node:fs').readFileSync(cfgPath, 'utf-8')).acp).toEqual({
-      hopCap: {}, binaryPaths: { codex: '/opt/bin/codex-acp' },
+      binaryPaths: { codex: '/opt/bin/codex-acp' },
     });
     setEnv({ ELANOUS_ACP_TOOL_APPROVAL_TIMEOUT_MS: undefined });
     expect(buildUserConfig(cfgPath).acp.toolApproval.timeoutMs).toBe(60_000);
@@ -549,7 +551,7 @@ describe('user-config lsp section (Phase L4)', () => {
     });
   });
 
-  test('chat.rendering parses streaming while ignoring the retired compactBoundary switch', () => {
+  test('chat.rendering ignores retired streaming and compactBoundary preferences', () => {
     write({
       chat: {
         rendering: {
@@ -564,33 +566,10 @@ describe('user-config lsp section (Phase L4)', () => {
         },
       },
     });
-    expect(buildUserConfig(cfgPath).chat.rendering).toEqual({
-      streaming: {
-        mode: 'line',
-        catchUpThresholdLines: 1,
-        catchUpAgeMs: 10_000,
-      },
-      wrap: {
-        urlAware: false,
-      },
-      tool: {
-        displayMode: 'inline-to-block',
-        blockMaxLines: 8,
-      },
-      hud: {
-        gaugeWarnRatio: 0.7,
-        gaugeDangerRatio: 0.85,
-      },
-      diff: {
-        colorTier: 'auto',
-        headerStyle: 'legacy',
-        turnBrowserHistory: 8,
-        turnBrowserMode: 'all',
-      },
-    });
+    expect(buildUserConfig(cfgPath).chat.rendering).toEqual(CHAT_DEFAULTS.rendering);
   });
 
-  test('chat.rendering.wrap parses booleans with safe defaults', () => {
+  test('chat.rendering.wrap ignores retired urlAware and preserveOsc8 preferences', () => {
     write({
       chat: {
         rendering: {
@@ -601,12 +580,10 @@ describe('user-config lsp section (Phase L4)', () => {
         },
       },
     });
-    expect(buildUserConfig(cfgPath).chat.rendering.wrap).toEqual({
-      urlAware: true,
-    });
+    expect(buildUserConfig(cfgPath).chat.rendering.wrap).toEqual(CHAT_DEFAULTS.rendering.wrap);
   });
 
-  test('chat.rendering.tool parses mode and clamps block lines', () => {
+  test('chat.rendering.tool ignores retired display preferences', () => {
     write({
       chat: {
         rendering: {
@@ -617,13 +594,10 @@ describe('user-config lsp section (Phase L4)', () => {
         },
       },
     });
-    expect(buildUserConfig(cfgPath).chat.rendering.tool).toEqual({
-      displayMode: 'inline-to-block',
-      blockMaxLines: 1,
-    });
+    expect(buildUserConfig(cfgPath).chat.rendering.tool).toEqual(CHAT_DEFAULTS.rendering.tool);
   });
 
-  test('chat.rendering.hud parses flags and threshold clamps', () => {
+  test('chat.rendering.hud ignores retired gauge preferences', () => {
     write({
       chat: {
         rendering: {
@@ -634,13 +608,10 @@ describe('user-config lsp section (Phase L4)', () => {
         },
       },
     });
-    expect(buildUserConfig(cfgPath).chat.rendering.hud).toEqual({
-      gaugeWarnRatio: 0,
-      gaugeDangerRatio: 1,
-    });
+    expect(buildUserConfig(cfgPath).chat.rendering.hud).toEqual(CHAT_DEFAULTS.rendering.hud);
   });
 
-  test('chat.rendering.diff parses tier and booleans', () => {
+  test('chat.rendering.diff ignores retired diff preferences', () => {
     write({
       chat: {
         rendering: {
@@ -658,12 +629,7 @@ describe('user-config lsp section (Phase L4)', () => {
         },
       },
     });
-    expect(buildUserConfig(cfgPath).chat.rendering.diff).toEqual({
-      colorTier: 'ansi16',
-      headerStyle: 'edited',
-      turnBrowserHistory: 20,
-      turnBrowserMode: 'files',
-    });
+    expect(buildUserConfig(cfgPath).chat.rendering.diff).toEqual(CHAT_DEFAULTS.rendering.diff);
   });
 });
 
@@ -946,6 +912,9 @@ describe('user-config extended schema', () => {
   });
 
   test('skills.activeSet accepts known names; unknown → opencode', () => {
+    write({ skills: {} });
+    expect(buildUserConfig(cfgPath).skills.activeSet).toBe('claudecode');
+
     write({ skills: { activeSet: 'claudecode' } });
     expect(buildUserConfig(cfgPath).skills.activeSet).toBe('claudecode');
 
@@ -1092,30 +1061,7 @@ describe('user-config extended schema', () => {
       overridePath: '/tmp/custom.md',
       taskVariant: 'default',
     });
-    expect(reloaded.chat.rendering).toEqual({
-      streaming: {
-        mode: 'line',
-        catchUpThresholdLines: 25,
-        catchUpAgeMs: 150,
-      },
-      wrap: {
-        urlAware: true,
-      },
-      tool: {
-        displayMode: 'inline-to-block',
-        blockMaxLines: 12,
-      },
-      diff: {
-        colorTier: '256',
-        headerStyle: 'legacy',
-        turnBrowserHistory: 8,
-        turnBrowserMode: 'all',
-      },
-      hud: {
-        gaugeWarnRatio: 0.4,
-        gaugeDangerRatio: 0.6,
-      },
-    });
+    expect(reloaded.chat.rendering).toEqual(CHAT_DEFAULTS.rendering);
   });
 
   test('debug.level stays on historical default when omitted on disk', () => {
@@ -1161,7 +1107,7 @@ describe('user-config extended schema', () => {
 });
 
 describe('dashboard view config', () => {
-  test('loads dashboard.views raw object for view-config parser', () => {
+  test('ignores retired dashboard.views preferences', () => {
     write({
       dashboard: {
         views: {
@@ -1177,10 +1123,10 @@ describe('dashboard view config', () => {
       },
     });
     const cfg = buildUserConfig(cfgPath);
-    expect(cfg.dashboard.views?.order).toEqual(['compact']);
+    expect(cfg.dashboard.views).toBeUndefined();
   });
 
-  test('saveUserConfig persists dashboard.views and reset can omit it', () => {
+  test('saveUserConfig drops retired dashboard.views preferences', () => {
     let cfg = buildUserConfig(cfgPath);
     // FU8 PR #6 (2026-05-12) — `DashboardConfig.promptBank` is now a
     // required field. Preserve the existing fixture by spreading
@@ -1197,7 +1143,8 @@ describe('dashboard view config', () => {
       },
     };
     saveUserConfig(cfg, cfgPath);
-    expect(buildUserConfig(cfgPath).dashboard.views?.order).toEqual(['compact']);
+    expect(buildUserConfig(cfgPath).dashboard.views).toBeUndefined();
+    expect(JSON.parse(require('node:fs').readFileSync(cfgPath, 'utf-8')).dashboard?.views).toBeUndefined();
     saveUserConfig(
       { ...cfg, dashboard: { ...cfg.dashboard, views: undefined } },
       cfgPath,
@@ -1205,7 +1152,7 @@ describe('dashboard view config', () => {
     expect(buildUserConfig(cfgPath).dashboard.views).toBeUndefined();
   });
 
-  test('loads and persists dashboard.theme raw object for theme-token parser', () => {
+  test('ignores and drops retired dashboard.theme preferences', () => {
     write({
       dashboard: {
         theme: {
@@ -1216,11 +1163,11 @@ describe('dashboard view config', () => {
       },
     });
     const cfg = buildUserConfig(cfgPath);
-    expect(cfg.dashboard.theme?.name).toBe('night-test');
-    expect((cfg.dashboard.theme?.colors as any)?.accent).toBe('#123456');
-    saveUserConfig(cfg, cfgPath);
+    expect(cfg.dashboard.theme).toBeUndefined();
+    saveUserConfig({ ...cfg, dashboard: { ...cfg.dashboard, theme: { name: 'night-test', colors: { accent: '#123456' } } } }, cfgPath);
     const reloaded = buildUserConfig(cfgPath);
-    expect((reloaded.dashboard.theme?.pane as any)?.dividerActive).toBe('#abcdef');
+    expect(reloaded.dashboard.theme).toBeUndefined();
+    expect(JSON.parse(require('node:fs').readFileSync(cfgPath, 'utf-8')).dashboard?.theme).toBeUndefined();
   });
 
   test('loads and persists dashboard.promptBank live injection flags', () => {

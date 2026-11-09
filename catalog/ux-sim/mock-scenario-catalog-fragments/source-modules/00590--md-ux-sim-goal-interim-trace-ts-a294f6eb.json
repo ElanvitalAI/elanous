@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GOAL-INTERIM-TRACE-TS",
+  "path": "src/ux-sim/goal-interim-trace.ts",
+  "boundary": "Defines one fixed user/tool trace consumed by classic and next goal-interim renderers so both are checked against identical events.",
+  "deviceIds": [
+    "product-devices"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

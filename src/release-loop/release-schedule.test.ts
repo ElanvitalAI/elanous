@@ -6,7 +6,9 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { formatSchedule, getSchedule, listSchedules, setSchedule, dueReleaseCutEvents, emitDueReleaseCutEvents } from './release-schedule.js';
+import { addItem } from './checklist.js';
 import { runGraph } from '../graph-runner/runner.js';
+import { writeReleaseGraphFixture } from '../../test/helpers/release-graph-fixture.js';
 import { runUnattendedRelease } from '../../scripts/release-loop/unattended-release.js';
 import { graphScheduleEntries } from '../workflow-runtime/triggers/registry.js';
 import { parse as yaml } from 'yaml';
@@ -54,6 +56,20 @@ test('시각은 오프셋 포함 ISO 만 · 잘못된 날짜나 비어 있는 �
   expect(getSchedule('0.2.10')).toBeNull();
 });
 
+test('setSchedule rejects a landing-day change that overloads scheduled CEO work', () => {
+  setup();
+  const day = '2026-10-03';
+  const day2 = '2026-10-04';
+  const landing = (date: string) => `${date}T06:30:00+09:00`;
+  setSchedule('0.2.10', { cutAt: landing(day), landBy: landing(day) }, 'OP');
+  setSchedule('0.2.11', { cutAt: landing(day2), landBy: landing(day2) }, 'OP');
+  addItem('0.2.10', { id: 'first', title: 'first', owner: 'TC', ceoMinutes: 20 });
+  addItem('0.2.11', { id: 'second', title: 'second', owner: 'UX', ceoMinutes: 20 });
+
+  expect(() => setSchedule('0.2.11', { landBy: landing(day) }, 'OP')).toThrow('대표 손 과부하');
+  expect(getSchedule('0.2.11')?.landBy).toBe('2026-10-03T21:30:00.000Z');
+});
+
 test('옛 피처 DB 는 기존 칸·이벤트 보존한 채 판 표만 추가한다', () => {
   setup();
   mkdirSync(join(dir, 'release'));
@@ -76,13 +92,14 @@ test('옛 피처 DB 는 기존 칸·이벤트 보존한 채 판 표만 추가한
 
 test('컷 일정 사건이 구독한 그래프를 손 명령 없이 한 번 시작한다', async () => {
   setup();
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
   mkdirSync(join(dir, 'release', '0.2.9'), { recursive: true });
   writeFileSync(join(dir, 'release', '0.2.9', 'release.json'), JSON.stringify({ version: '0.2.9', publishedAt: '2026-10-01T00:00:00Z' }));
   const cutAt = '2026-10-03T08:00+09:00';
   setSchedule('0.2.10', { cutAt }, 'OP');
   const graphFile = join(dir, 'release-event.yaml');
   writeFileSync(join(dir, 'recipes.yaml'), '{}\n');
-  writeFileSync(graphFile, `graph_id: release-loop
+  writeReleaseGraphFixture(graphFile, `graph_id: release-loop
 loop:
   trigger:
     events: [manual, release.cut.due]
@@ -99,7 +116,7 @@ edges: []
   const emit = async (event: { type: string; id: string; version: string }) => {
     const fired = await runUnattendedRelease({ version: event.version,
       triggerEvent: event as { id: string; type: 'release.cut.due'; version: string; cutAt: string; at: string } }, {
-      ledgerRoot: dir, config: { gatePodPool: 'test-pool' },
+      ledgerRoot: dir, assertCliCurrent: () => {}, config: { gatePodPool: 'test-pool' },
       checklist: () => ({ ok: true, red: [], undecided: [], blocked: [] }),
       graph: (_path, options) => runGraph(graphFile, options),
     });
@@ -108,6 +125,9 @@ edges: []
   };
   const first = await emitDueReleaseCutEvents(now, emit, dir);
   expect(first).toMatchObject([{ type: 'release.cut.due', version: '0.2.10' }]);
+  expect(log).toHaveBeenCalledWith('release.schedule', 'cut-event-emitted', expect.objectContaining({ version: '0.2.10', eta: null }));
+  expect(log).not.toHaveBeenCalledWith('release.schedule', 'countdown-started', expect.anything());
+  log.mockRestore();
   expect(started).toHaveLength(1);
   expect(await emitDueReleaseCutEvents(now, emit, dir)).toEqual([]);
   expect(readdirSync(join(dir, 'graph-runs', 'release-loop')).filter(name => name.endsWith('.json'))).toHaveLength(1);

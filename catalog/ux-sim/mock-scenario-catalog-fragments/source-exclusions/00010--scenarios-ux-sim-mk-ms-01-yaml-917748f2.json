@@ -1,0 +1,4 @@
+{
+  "path": "scenarios/ux-sim/MK-MS-01.yaml",
+  "reason": "Separately registered by open PR #34039 (MK-MS-01 E4 sequence); keep it outside this 33-candidate registration to avoid duplicate catalog ownership."
+}

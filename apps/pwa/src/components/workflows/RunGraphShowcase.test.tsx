@@ -230,7 +230,7 @@ describe('RunGraphShowcase — 390px·태블릿·발표 폭', () => {
     expect(nodes.some((node) => node.id === 'codex-hand')).toBe(true);
   });
 
-  test('ARG-UI-DIFF: production runtime ledger diff/sequence and an unvisited route reach the PWA view', { timeout: 30_000 }, async () => {
+  test('ARG-UI-DIFF: production runtime ledger diff/sequence and an unvisited route reach the PWA view', async () => {
     const stateRoot = mkdtempSync(join(tmpdir(), 'ux-sim-arg-ui-pwa-'));
     setTestStateRoot(stateRoot);
     try {
@@ -281,7 +281,7 @@ describe('RunGraphShowcase — 390px·태블릿·발표 폭', () => {
       setTestStateRoot(null);
       rmSync(stateRoot, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test('태블릿 폭(820px) — 실제 진행 노드와 현재 간선을 넓은 배치로 유지한다', async () => {
     (g.window as { innerWidth: number }).innerWidth = 820;

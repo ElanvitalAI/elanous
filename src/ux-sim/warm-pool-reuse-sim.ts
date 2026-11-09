@@ -85,6 +85,8 @@ function buildProtocolReply(command: WarmWorkerCommand) {
     leaseId: command.leaseId, generation: command.generation, workerId: command.workerId,
     key: command.key, envProfile: command.envProfile, startedAt: Date.now(), finishedAt: Date.now(),
     files: [{ file, rc: 0, failureIds: [], errorIds: [], junitComplete: true }],
+    resetReceipt: { baseImageDigest: command.baseImageDigest ?? command.key.imageDigest,
+      resetMethod: "git-reset-clean-status-v1", postRunDiff: [] },
   } };
 }
 
@@ -95,7 +97,7 @@ function createProtocolBoundary(specification: WarmPodSpec, kubectl: ReturnType<
     if (args.includes(WARM_POD_RUNTIME_PROBE)) {
       const expected = specification.runtimeContract!;
       const observed = { bunVersion: runtimeContractMismatch ? '0.0.0' : expected.bunVersion,
-        os: expected.os, architecture: expected.architecture,
+        os: expected.os, architecture: expected.architecture, baseImageDigest: expected.baseImageDigest,
         tools: Object.fromEntries(expected.requiredTools.map(tool => [tool, true])) };
       return { status: 0, stdout: JSON.stringify(observed), stderr: '' };
     }

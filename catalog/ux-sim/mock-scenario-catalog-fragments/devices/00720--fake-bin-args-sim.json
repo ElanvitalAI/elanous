@@ -1,0 +1,29 @@
+{
+  "id": "fake-bin-args-sim",
+  "name": "Fake executable argv and receipt simulation",
+  "implementation": [
+    "src/ux-sim/fake-bin-args-sim.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-bin-args-sim.test.ts"
+  ],
+  "target": "Test-only fake executable simulation of argv results and isolated run-bound evidence without real tool or shell executions.",
+  "inputs": [
+    "run, mission, and task identity",
+    "fake executable responses",
+    "isolated evidence-root paths"
+  ],
+  "observations": [
+    "three argv outcomes retain exact responses and emit a run-bound receipt",
+    "corrupt receipts and symlink escapes are rejected",
+    "real tool executions and shell executions remain zero"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-bin-args-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [
+    "sim.fake-bin-args.completed"
+  ],
+  "recentUse": null
+}

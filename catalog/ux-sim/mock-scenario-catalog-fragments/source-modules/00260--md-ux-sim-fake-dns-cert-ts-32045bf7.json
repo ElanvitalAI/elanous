@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-DNS-CERT-TS",
+  "path": "src/ux-sim/fake-dns-cert.ts",
+  "boundary": "Isolated wildcard DNS zone and DNS-01 certificate issuance, failure, and renewal contracts (simulation boundary).",
+  "deviceIds": [
+    "fake-dns-cert"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

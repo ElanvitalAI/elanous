@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-RELEASE-SAME-VERSION-RUN-ADOPTION-SIM-TS",
+  "path": "src/ux-sim/release-same-version-run-adoption-sim.ts",
+  "boundary": "Calls the production unattended release coordinator and real graph runner with a temporary release graph, local bare Git remote, and simulated node commands; proves gate failure, same-run gate resume, input compatibility repair, and no second ledger row without contacting production services.",
+  "deviceIds": [
+    "release-same-version-run-adoption-sim"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

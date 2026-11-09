@@ -7,6 +7,10 @@ import { MAX_MUX_FRAME_BYTES, MuxDecoder, MuxEncoder, MuxStreamState } from './m
 
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 const MAX_CLIENTS_PER_SERVER = 8;
+// Public HTTP requests are short-lived and must admit a 50-person audience burst.
+// Keep the independent private WebSocket client limit at eight.
+// Source: OP #92435 approves a bounded 64-slot public cap for KAIST-APP-SERVE-LOAD-50.
+const MAX_PUBLIC_REQUESTS_PER_SERVER = 64;
 const BYTES_PER_SECOND = 1024 * 1024;
 const BURST_BYTES = 2 * BYTES_PER_SECOND;
 const PING_INTERVAL_MS = 30_000;
@@ -25,7 +29,7 @@ export interface RelayServerOptions {
   /** Ed25519 signing public keys (base64url raw 32 bytes), pinned by X25519-derived serverId. */
   trustedHostKeys?: ReadonlyMap<string, string>;
   /** Opt in to the invited-app reverse proxy for exactly this public domain. */
-  publicDomain?: 'elanous.app';
+  publicDomain?: 'elanous.app' | 'elanous.ai';
   /** One pinned Nexus host receives requests for its configured user id only. */
   publicServerId?: string;
   /** User label bound to the pinned public Nexus host; multi-user dispatch belongs to ops relay. */
@@ -48,6 +52,18 @@ export function parsePublicAppHost(value: string, domain = 'elanous.app'): { app
   if (!valid(app, 24) || !valid(user, 20) || user.length < 3 || /-pr\d+$/.test(app)) return undefined;
   if (['www', 'docs', 'api', 'admin', 'relay', 'mail'].includes(app)) return undefined;
   return { app, user };
+}
+
+/** Public app URLs and the relay must use one configured user label. */
+export function resolvePublicAppUserId(explicit?: string, environmentValue = process.env.ELANOUS_PUBLIC_APP_USER_ID): string | undefined {
+  const shared = environmentValue?.trim();
+  if (shared && explicit && shared !== explicit) throw new Error('--public-user-id must match ELANOUS_PUBLIC_APP_USER_ID');
+  const userId = shared || explicit;
+  if (userId !== undefined && (userId.length < 3 || userId.length > 20 || userId.includes('--')
+    || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(userId))) {
+    throw new Error('ELANOUS_PUBLIC_APP_USER_ID must be a valid public app user label');
+  }
+  return userId;
 }
 
 function responseFromPublicEnvelope(value: PublicResponse | undefined, publicHost: string, internalHost: string): Response {
@@ -205,7 +221,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       if (room) fail(room, 'public-host-offline');
       return new Response('Host unavailable', { status: 503 });
     }
-    if (room.publicSlots >= MAX_CLIENTS_PER_SERVER) return new Response('Public request capacity reached', { status: 429 });
+    if (room.publicSlots >= MAX_PUBLIC_REQUESTS_PER_SERVER) return new Response('Public request capacity reached', { status: 429 });
     room.publicSlots += 1;
     let slotHeld = true;
     const releaseSlot = () => { if (slotHeld) { slotHeld = false; room.publicSlots = Math.max(0, room.publicSlots - 1); } };

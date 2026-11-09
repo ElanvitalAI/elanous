@@ -1,0 +1,38 @@
+{
+  "id": "seat-mail-wake",
+  "name": "Seat-address message wake delivery",
+  "checklistCells": [
+    "SEAT-WAKE-ALL-ADDRESSES"
+  ],
+  "implementation": [
+    "src/cli/msg-cli.ts",
+    "src/loops/msg-address.ts",
+    "src/loops/msg-wake.ts",
+    "src/pty-shell/herdr-prompt.ts",
+    "src/ux-sim/fake-herdr.ts"
+  ],
+  "tests": [
+    "src/cli/msg-cli.test.ts",
+    "src/loops/msg-wake.test.ts",
+    "src/pty-shell/herdr-prompt.test.ts"
+  ],
+  "target": "Production message wake resolution and delivery against isolated Codex, Claude and remote pane fixtures",
+  "inputs": [
+    "seat registry",
+    "pane runtime kind",
+    "10 addressed messages"
+  ],
+  "observations": [
+    "registered address and herdr.pane file",
+    "resolved wake route",
+    "all 10 messages acknowledged per runtime kind"
+  ],
+  "entryCommands": [
+    "bun test src/loops/msg-wake.test.ts -t 'all registered addresses wake Codex, Claude, and remote panes for ten messages'",
+    "bun test src/cli/msg-cli.test.ts -t 'address register creates a private herdr pane file and explicit wake opt-in'",
+    "bun test src/pty-shell/herdr-prompt.test.ts -t 'wake composer guard'"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

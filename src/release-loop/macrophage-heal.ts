@@ -1,4 +1,36 @@
 /** Release-loop macrophage: evidence-driven cleanup planning. Live mode emits decisions; mutations stay simulation-only. */
+import { pickAutohealActionForState, type AutohealLadder } from '../self-implement/stop-autoheal.js';
+
+export interface MacrophageFailurePromotion {
+  mode: 'live' | 'shadow';
+  action: 'attempt-repair' | 'retain';
+  crossVerdict: 'agree' | 'disagree' | 'out-of-scope';
+  reason: string;
+  rollbackReason: string;
+  overlayId?: string;
+}
+
+/** Promote one signature only when the macrophage policy and shared graph prescription independently agree. */
+export function resolveMacrophageFailurePromotion(
+  signature: MacrophageEvidence['failureSignature'],
+  options: { loadLadder?: () => AutohealLadder; requestedMode?: unknown; policyAction?: MacrophageAction } = {},
+): MacrophageFailurePromotion {
+  if (signature !== 'type-error') return { mode: 'shadow', action: 'retain', crossVerdict: 'out-of-scope',
+    reason: 'signature-out-of-scope', rollbackReason: 'signature-out-of-scope' };
+  const policyAction = options.policyAction;
+  if (policyAction !== 'attempt-repair') return { mode: 'shadow', action: 'retain',
+    crossVerdict: 'disagree', reason: 'independent-cross-verdict-disagreed', rollbackReason: 'policy-action-mismatch-or-unavailable' };
+  const graphPick = pickAutohealActionForState('gate-failed', { stop_class: 'gate-failed', failure_signature: signature }, options.loadLadder);
+  if (graphPick.source !== 'graph' || graphPick.action !== policyAction) return { mode: 'shadow', action: policyAction,
+    crossVerdict: 'disagree', reason: 'independent-cross-verdict-disagreed',
+    rollbackReason: graphPick.fallbackReason ?? 'overlay-unavailable-or-action-mismatch',
+    ...(graphPick.overlayId ? { overlayId: graphPick.overlayId } : {}) };
+  if (options.requestedMode !== 'live') return { mode: 'shadow', action: policyAction, crossVerdict: 'agree',
+    reason: 'live-mode-not-explicit', rollbackReason: options.requestedMode === 'simulation' ? 'simulation-only' : 'unknown-mode-setting',
+    overlayId: graphPick.overlayId };
+  return { mode: 'live', action: policyAction, crossVerdict: 'agree', reason: 'type-error-policy-and-overlay-agree',
+    rollbackReason: 'none', overlayId: graphPick.overlayId };
+}
 
 export type MacrophageScrapKind =
   | 'parked-pr'
@@ -69,11 +101,19 @@ export interface MacrophageEvent {
   applied: boolean;
   sourceNodeId?: string;
   failureSignature?: MacrophageEvidence['failureSignature'];
+  promotionMode?: 'live' | 'shadow';
+  promotionReason?: string;
+  rollbackReason?: string;
+  promotionOverlayId?: string;
 }
 
 export interface MacrophageHealInput {
   phase: 'idle' | 'active';
   mode?: 'live' | 'simulation';
+  /** Promotion requires a caller-supplied explicit mode; omission remains shadow. */
+  promotionMode?: unknown;
+  /** Injectable only for cross-verdict simulations; production uses the shared STOP-AUTOHEAL ladder. */
+  promotionLadder?: () => AutohealLadder;
   now: Date;
   /** Explicit setting: the number of consecutive release failures that creates a repair cell. */
   consecutiveFailureLimit: number;
@@ -176,11 +216,20 @@ export function runMacrophageHeal(input: MacrophageHealInput): MacrophageHealRes
   if (input.phase === 'active') return { status: 'deferred', events: [], remaining: input.inventory.map((scrap) => scrap.id) };
   const events = input.inventory.map((scrap) => {
     const decision = decide(scrap, input);
+    const promotion = scrap.kind === 'release-node-failure'
+      ? resolveMacrophageFailurePromotion(scrap.evidence.failureSignature, {
+        loadLadder: input.promotionLadder,
+        requestedMode: mode === 'simulation' ? 'simulation' : input.promotionMode,
+        policyAction: decision.action,
+      })
+      : undefined;
     const applied = mode === 'simulation' && mutatingActions.has(decision.action);
     const result = mode === 'simulation'
       ? applied ? `simulated ${decision.action}` : `simulated recommendation ${decision.action}`
       : `planned ${decision.action}; no cleanup applied`;
     return { id: scrap.id, kind: scrap.kind, evidence: decision.evidence, result, action: decision.action, applied,
+      ...(promotion ? { promotionMode: promotion.mode, promotionReason: promotion.reason, rollbackReason: promotion.rollbackReason,
+        ...(promotion.overlayId ? { promotionOverlayId: promotion.overlayId } : {}) } : {}),
       ...(scrap.kind === 'release-node-failure' ? { sourceNodeId: scrap.evidence.nodeId, failureSignature: scrap.evidence.failureSignature ?? 'unknown' } : {}) };
   });
   const removed = new Set(events.filter((event) => event.applied).map((event) => event.id));

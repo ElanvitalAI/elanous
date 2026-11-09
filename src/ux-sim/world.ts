@@ -48,6 +48,7 @@ import { runWarmSiReuseSimulation } from './warm-si-reuse-sim.js';
 import { podSelfImplementSpawn, type SiWarmChildAttempt } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from '../task-orchestrator/surfaces/pod-si-warm-protocol.js';
 import type { ChildPodReuseOperations } from '../task-orchestrator/surfaces/pod-child-reuse.js';
+import type { AppSimulationResult } from '../nexus/apps/app-simulation.js';
 
 /** Catalog world-event IDs map to the concrete simulation input handled by this runner. */
 const WORLD_EVENT_TO_SCENARIO_INPUT: Readonly<Record<string, string>> = {
@@ -116,6 +117,8 @@ export interface WorldScenarioResult {
   fidelity?: Array<{ deviceId: string; verdict: 'green' | 'yellow' | 'unmeasured'; failedRecordingIds: string[] }>;
   billing?: { provider: 'fake-higgsfield'; spendCents: number; externalNetworkAttempts: number };
   publicShare?: { status: number; version: string; body: string };
+  /** App-scoped projection consumed by the operator AppSimLiveView. */
+  appSimulation?: AppSimulationResult;
 }
 
 function worldWatchObservations(world: SimWorld, runId: string): Array<{ event: string; verdict: string }> {
@@ -1058,6 +1061,47 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
       });
       return { pass: recovery.evaluation?.pass ?? true, observations, devices: [...assembled.devices.keys()], ...(scheduled ? { recovery } : {}) };
     }
+    if (steps.length === 1 && stepKeys[0] === 'observe,staticBuildRequired' && steps[0]?.observe === 'kaist-lecture-scrap') {
+      if (steps[0]?.staticBuildRequired !== true) throw new Error('lecture-scrap simulation requires a built static export');
+      const appHost = assembled.appHost;
+      const app = world.spec.apps?.find((candidate) => candidate.slug === 'lecture-scrap');
+      if (!appHost || !app) throw new Error('kaist lecture-scrap simulation requires the declared app and fake host');
+      appHost.deploy('lecture-scrap', app.versions[0]!);
+      const screens = [
+        { step: 'screen-list', path: '/', artifact: 'index.html', text: '스크랩 목록' },
+        { step: 'screen-note-create', path: '/notes/new', artifact: 'notes/new.html', text: '노트 작성' },
+        { step: 'screen-search', path: '/search', artifact: 'search.html', text: '검색' },
+      ] as const;
+      const observations = screens.map((screen) => {
+        const response = appHost.fetch('lecture-scrap.app.sim.invalid', screen.path);
+        const artifact = app.versions[0]!.files[screen.artifact];
+        if (typeof artifact !== 'string' || response.status !== 200 || response.body !== artifact || !response.body.includes(screen.text)) {
+          throw new Error(`lecture-scrap fake host screen failed: ${screen.path} status=${response.status}`);
+        }
+        const artifactSha256 = createHash('sha256').update(artifact).digest('hex');
+        const responseSha256 = response.headers['x-content-sha256'];
+        if (responseSha256 !== artifactSha256) throw new Error(`lecture-scrap fake host response differs from build artifact: ${screen.path}`);
+        const assets = [...new Set([...response.body.matchAll(/(?:src|href)=["'](\/_next\/[^"'?#]+)(?:[?#][^"']*)?["']/g)].map(match => match[1]!))];
+        if (assets.length === 0) throw new Error(`lecture-scrap static build has no Next assets: ${screen.path}`);
+        for (const path of assets) {
+          const asset = appHost.fetch('lecture-scrap.app.sim.invalid', path);
+          if (asset.status !== 200) throw new Error(`lecture-scrap fake host asset failed: ${path} status=${asset.status}`);
+        }
+        return { event: screen.step, verdict: `${screen.path} · ${response.status} · assets ${assets.length}`, assetCount: assets.length, artifactSha256: responseSha256 };
+      });
+      const runId = `kaist-lecture-scrap-${world.spec.seed}-${randomUUID()}`;
+      const receiptId = `${runId}:receipt`;
+      const baseTimeMs = Date.parse(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z');
+      const appSimulation: NonNullable<WorldScenarioResult['appSimulation']> = {
+        runId,
+        events: screens.map((screen, index) => ({ kind: 'app.sim.step', appId: 'lecture-scrap', runId,
+          ts: baseTimeMs + index * 1_000, data: { step: screen.step, path: screen.path, status: 200, assetCount: observations[index]?.assetCount ?? 0,
+            artifactSha256: observations[index]?.artifactSha256 ?? '',
+            message: `${screen.text} fake host 응답 확인`, receiptId } })),
+        receipts: [{ id: receiptId, appId: 'lecture-scrap', runId, outcome: 'passed', summary: 'KAIST 강의 노트·스크랩 3개 화면 시뮬 통과' }],
+      };
+      return { pass: true, observations, devices: [...assembled.devices.keys()], appSimulation };
+    }
     if (steps.length === 1 && stepKeys[0] === 'observe' && steps[0]?.observe === 'app-demo-1114') {
       const demo = object(scenario.demo, 'scenario.demo');
       if (typeof demo.transcript !== 'string' || !demo.transcript.trim() || typeof demo.recording !== 'string' || !demo.recording.trim()) {
@@ -1216,7 +1260,40 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
             externalNetworkAttempts: world.networkEvents.length };
           const pass = higgsfield.ledger.submissions === 1 && higgsfield.ledger.polls === 3 && billing.spendCents === 0
             && billing.externalNetworkAttempts === 0 && observations.length === 7;
-          return { pass, observations, devices: [...assembled.devices.keys()], billing,
+          const runId = `app-demo-1114-${world.spec.seed}-${randomUUID()}`;
+          const receiptIds = new Map(['voice-notes', 'shop-studio'].map((appId) => [appId, `${runId}:${appId}:receipt`]));
+          const appIdsByStep: Readonly<Record<string, string>> = {
+            'demo-build-and-deploy': 'voice-notes',
+            'product-photo-upload': 'shop-studio',
+            'higgsfield-job': 'shop-studio',
+            'recording-and-transcription': 'voice-notes',
+            'summary-todos-and-tts': 'voice-notes',
+            'one-line-change-and-redeploy': 'voice-notes',
+            'public-share-link': 'shop-studio',
+          };
+          const appStepMessages: Readonly<Record<string, string>> = {
+            'demo-build-and-deploy': '앱 빌드와 배포 확인',
+            'product-photo-upload': '상품 사진 저장 확인',
+            'higgsfield-job': '광고 생성 작업 완료',
+            'recording-and-transcription': '녹음과 받아쓰기 확인',
+            'summary-todos-and-tts': '요약·할 일·음성 생성 확인',
+            'one-line-change-and-redeploy': '수정본 재배포 확인',
+            'public-share-link': '공유 링크 확인',
+          };
+          const baseTimeMs = Date.parse(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z');
+          if (!Number.isFinite(baseTimeMs)) throw new Error('world clock start must be a valid timestamp');
+          const appSimulation: NonNullable<WorldScenarioResult['appSimulation']> = {
+            runId,
+            events: observations.map((observation, index) => {
+              const appId = appIdsByStep[observation.event];
+              if (!appId) throw new Error(`app demo observation has no app owner: ${observation.event}`);
+              return { kind: 'app.sim.step', appId, runId, ts: baseTimeMs + index * 1_000,
+                data: { step: observation.event, message: appStepMessages[observation.event]!, receiptId: receiptIds.get(appId)! } };
+            }),
+            receipts: [...receiptIds].map(([appId, id]) => ({ id, appId, outcome: pass ? 'passed' as const : 'failed' as const,
+              runId, summary: `SIM-CHAIN-APP ${appId} · ${pass ? '완료' : '확인 필요'}` })),
+          };
+          return { pass, observations, devices: [...assembled.devices.keys()], billing, appSimulation,
             publicShare: { status: shared.status, version: sharedVersion, body: sharedBody } };
         } finally { productionAppHost.appHost.close(); }
       } finally { storage.close(); }

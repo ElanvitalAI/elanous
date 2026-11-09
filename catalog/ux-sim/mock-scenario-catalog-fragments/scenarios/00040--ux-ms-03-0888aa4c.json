@@ -1,0 +1,19 @@
+{
+  "id": "UX-MS-03",
+  "name": "Review cap and no-verdict boundary",
+  "kind": "review-cap-no-verdict",
+  "device": "product-devices",
+  "implementation": [
+    "src/ux-sim/task-agent-rejudge-on-head-device.ts"
+  ],
+  "tests": [
+    "src/ux-sim/task-agent-rejudge-on-head-device.test.ts"
+  ],
+  "trigger": "Stored review count reaches the cap or a review result is absent.",
+  "observe": [
+    "review request count",
+    "verdict classification",
+    "decision reason"
+  ],
+  "expected": "the cap blocks another request and missing verdict stays unmeasured"
+}

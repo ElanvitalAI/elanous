@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 import type { GraphNodeSpec } from '../self-implement/graph-yaml.js';
 
 /** Opaque Bloom 4/5 output. The hook owns the decision boundary, not analysis policy. */
@@ -190,8 +191,4 @@ function isResearchEdgeProposal(value: unknown): value is ResearchEdgeProposal {
     && typeof value.node.kind === 'string' && typeof value.node.recipe === 'string'
     && typeof value.reason === 'string' && value.reason.trim().length > 0
     && (value.returnTo === undefined || typeof value.returnTo === 'string');
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

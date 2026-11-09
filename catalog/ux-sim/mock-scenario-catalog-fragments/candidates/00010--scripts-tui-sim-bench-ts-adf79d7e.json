@@ -1,0 +1,8 @@
+{
+  "path": "scripts/tui-sim-bench.ts",
+  "disposition": "excluded",
+  "entryCommand": "not-applicable: benchmark requires an explicitly selected goal and provider",
+  "logsRecorded": "no",
+  "logsDetail": "Benchmark is not run by catalog discovery.",
+  "excludeReason": "Measurement/benchmark tool, not a mock device."
+}

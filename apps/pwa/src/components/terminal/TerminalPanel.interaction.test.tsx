@@ -11,7 +11,9 @@
 
 import { createRequire } from 'node:module';
 
-import { afterAll, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
+import { act, create } from 'react-test-renderer';
+import { cloneElement, createElement, isValidElement, lazy, Suspense, type ComponentProps, type ReactElement, type ReactNode } from 'react';
 import { createReactHookHarness } from '@/lib/testing/react-hook-harness';
 import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 import type { DaemonTerminalRenameResult, DaemonTerminalSummary } from '@/lib/daemon-client';
@@ -22,6 +24,7 @@ const require = createRequire(import.meta.url);
 // through React's own dispatcher slot for the duration of a render pass, so this
 // file leaves nothing behind for the sibling suites sharing the process.
 const harness = createReactHookHarness(require('react'));
+const stableVoiceController = { active: false, phase: 'idle', toggle: async () => {} };
 
 // ⛔ The child components are NOT stubbed, deliberately. The harness calls only the
 // top-level component function — it does no reconciliation — so `<XtermView …>` is
@@ -49,7 +52,7 @@ let onVoiceTranscript: ((text: string) => void) | undefined;
 mock.module('@/voice/use-voice-controller', () => ({
   useVoiceController: ({ onTranscript }: { onTranscript: (text: string) => void }) => {
     onVoiceTranscript = onTranscript;
-    return { active: false, phase: 'idle', toggle: async () => {} };
+    return stableVoiceController;
   },
 }));
 
@@ -96,9 +99,29 @@ const client = {
     return renameResult;
   },
 };
-const daemon = { client, config: { baseUrl: '', token: '' }, sessionId: 'session-test' };
+const defaultDaemon = { client, config: { baseUrl: '', token: '' }, sessionId: 'session-test' };
+let daemon = defaultDaemon;
 // Keep the real exports (DaemonContext …): TerminalPanel's own tree imports them.
 mock.module('@/components/providers/DaemonProvider', () => ({ ...actualDaemonProvider, useDaemon: () => daemon }));
+
+let TerminalPanelComponent: typeof import('./TerminalPanel').TerminalPanel;
+let ModifierBarComponent: typeof import('./ModifierBar').ModifierBar;
+let registerTerminalInputFn: typeof import('./terminal-input-registry').registerTerminalInput;
+let TerminalChatDockModule: typeof import('./TerminalChatDock').TerminalChatDock;
+let PtyLiveViewLazyComponent: typeof import('./PtyLiveView.lazy').PtyLiveViewLazy;
+beforeAll(async () => {
+  // Warm subject modules after mock.module setup so test bodies stay deterministic
+  // in a cold remote runner without importing through process-global mocks early.
+  const [panel, modifier, input, dock, liveView] = await Promise.all([
+    import('./TerminalPanel'), import('./ModifierBar'), import('./terminal-input-registry'),
+    import('./TerminalChatDock'), import('./PtyLiveView.lazy'),
+  ]);
+  TerminalPanelComponent = panel.TerminalPanel;
+  ModifierBarComponent = modifier.ModifierBar;
+  registerTerminalInputFn = input.registerTerminalInput;
+  TerminalChatDockModule = dock.TerminalChatDock;
+  PtyLiveViewLazyComponent = liveView.PtyLiveViewLazy;
+});
 
 // TerminalPanel reads window in effects, and the harness runs effects.
 // ⛔ Restored in afterAll: `globalThis` outlives this file, and a leftover fake
@@ -106,17 +129,27 @@ mock.module('@/components/providers/DaemonProvider', () => ({ ...actualDaemonPro
 // ⚠️ `mock.restore()` does not revert module mocks in this Bun build (measured) —
 // the module mocks are put back by restoreModuleMocksAfterAll above instead.
 const storage = new Map<string, string>();
+const windowListeners = new Map<string, Set<(...args: unknown[]) => void>>();
 const priorWindow = (globalThis as { window?: unknown }).window;
 (globalThis as { window?: unknown }).window = {
-  addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => true,
+  addEventListener: (type: string, listener: (...args: unknown[]) => void) => {
+    const listeners = windowListeners.get(type) ?? new Set();
+    listeners.add(listener);
+    windowListeners.set(type, listeners);
+  },
+  removeEventListener: (type: string, listener: (...args: unknown[]) => void) => { windowListeners.get(type)?.delete(listener); },
+  dispatchEvent: () => true,
+  innerWidth: 1280,
+  location: { search: '' },
   prompt: () => promptResult,
   localStorage: {
     getItem: (key: string) => storage.get(key) ?? null,
     setItem: (key: string, value: string) => { storage.set(key, value); },
+    removeItem: (key: string) => { storage.delete(key); },
   },
 };
-afterAll(() => {
-  harness.unmount();
+afterAll(async () => {
+  await act(async () => { harness.unmount(); });
   if (priorWindow === undefined) delete (globalThis as { window?: unknown }).window;
   else (globalThis as { window?: unknown }).window = priorWindow;
 });
@@ -133,27 +166,22 @@ function click(element: { props: Record<string, unknown> }): void {
 /** Render → open the PTY list → click the only row. Returns the row element so a
  *  test can assert what it displayed. */
 async function renderPanel(props: Record<string, unknown> = {}): Promise<void> {
-  const { TerminalPanel } = await import('./TerminalPanel');
   calls.length = 0;
   listOptions.length = 0;
   renameCalls.length = 0;
   toastMessages.length = 0;
   debugEvents.length = 0;
-  harness.unmount();
-  harness.render(() => TerminalPanel(props as never));
+  await act(async () => { harness.unmount(); });
+  harness.render(() => TerminalPanelComponent(props as never));
   await harness.settle();
 }
 
 async function selectTheOnlyRow(): Promise<string> {
-  // ⛔ Imported inside the test, not at module scope. `mock.module` replacements
-  // for the sibling components stay confined that way; hoisting this import made
-  // TuiMirrorView.test.tsx render this file's stub instead of its own subject.
-  const { TerminalPanel } = await import('./TerminalPanel');
   calls.length = 0;
   // Without this the next render resumes the previous test's state — the list
   // effect would not re-fetch, and a stale row would be clicked instead.
-  harness.unmount();
-  harness.render(TerminalPanel as never);
+  await act(async () => { harness.unmount(); });
+  harness.render(TerminalPanelComponent as never);
   await harness.settle();
   click(button('PTY 목록'));
   await harness.settle();
@@ -172,7 +200,7 @@ describe('TerminalPanel · modifier bar placement', () => {
     try {
       listed = [LOCAL];
       await renderPanel();
-      const { ModifierBar } = await import('./ModifierBar');
+      const ModifierBar = ModifierBarComponent;
       const tabs = harness.find((element) => typeof element.props.onActiveChange === 'function');
       harness.act(() => (tabs.props.onActiveChange as (id: string) => void)('sticky-shell-a'));
       await harness.settle();
@@ -181,7 +209,7 @@ describe('TerminalPanel · modifier bar placement', () => {
       await harness.settle();
       const selectedId = harness.find((element) => element.type === ModifierBar).props.terminalId as string;
       expect(selectedId).toBe('sticky-shell-b');
-      harness.unmount();
+      await act(async () => { harness.unmount(); });
       harness.render(() => ModifierBar({ terminalId: selectedId }));
       click(harness.find((element) => element.props['data-testid'] === 'modbar-ctrl'));
       expect(takeStickyModifiers('sticky-shell-a')).toBeNull();
@@ -189,7 +217,7 @@ describe('TerminalPanel · modifier bar placement', () => {
       expect(harness.find((element) => element.props['data-testid'] === 'modbar-ctrl').props['aria-pressed']).toBe(false);
     } finally {
       coarsePointer = false;
-      harness.unmount();
+      await act(async () => { harness.unmount(); });
       if (priorDocument) Object.defineProperty(globalThis, 'document', priorDocument);
       else delete (globalThis as { document?: unknown }).document;
     }
@@ -198,7 +226,7 @@ describe('TerminalPanel · modifier bar placement', () => {
 
 describe('TerminalPanel · voice controls input', () => {
   test('sends trimmed dictation plus a space through the selected terminal\'s registered input sender', async () => {
-    const { registerTerminalInput } = await import('./terminal-input-registry');
+    const registerTerminalInput = registerTerminalInputFn;
     listed = [LOCAL];
     storage.clear();
     await renderPanel();
@@ -237,6 +265,257 @@ describe('TerminalPanel · voice controls input', () => {
     expect(toastMessages).toEqual([{ level: 'error', message: '터미널 입력 전송 실패 — 터미널 연결을 확인하고 다시 말해 주세요.' }]);
     expect(acpConnections).toBe(0);
   });
+
+  test('queues every dock transcript in order until the lazy dock handle is ready', async () => {
+    listed = [LOCAL];
+    storage.clear();
+    await renderPanel();
+    let tabs = harness.find((element) => typeof element.props.onActiveChange === 'function');
+    harness.act(() => (tabs.props.onActiveChange as (id: string) => void)(LOCAL.id));
+    await harness.settle();
+    const dock = harness.find((element) => typeof element.props.onVoiceTranscriptSubmitReady === 'function');
+    harness.act(() => ((dock.props.voice as { onToggle: () => void }).onToggle)());
+    onVoiceTranscript!(' first ');
+    onVoiceTranscript!(' second ');
+
+    const submitted: string[] = [];
+    const ready = dock.props.onVoiceTranscriptSubmitReady as (
+      terminalId: string,
+      handle: { submitVoiceTranscript: (text: string) => void } | null,
+    ) => void;
+    harness.act(() => ready(LOCAL.id, { submitVoiceTranscript: (text) => submitted.push(text) }));
+    expect(submitted).toEqual(['first', 'second']);
+  });
+
+  test('real TerminalPanel output and lazy Dock share one tree across readiness, FIFO, and A-to-B switch', async () => {
+    listed = [LOCAL];
+    storage.clear();
+    storage.set('elanous.webterm.tabs', JSON.stringify(['terminal-A', 'terminal-B']));
+    storage.set('elanous.webterm.activeId', 'terminal-A');
+    storage.set('elanous.webterm.panelsMinimized', '1');
+    windowListeners.get('keydown')?.clear();
+    const sent: Array<{ method: string; params: { sessionId: string; terminalId: string; line: string } }> = [];
+    let releaseFirst: (() => void) | undefined;
+    let releaseSecond: (() => void) | undefined;
+    const acp = {
+      state: 'OPEN',
+      on: () => () => {}, onState: () => () => {}, close: () => {},
+      send: async (method: string, rawParams: unknown) => {
+        const params = rawParams as { sessionId: string; terminalId: string; line: string };
+        if (method === 'terminal/repl/exec') {
+          sent.push({ method, params });
+          if (params.line === ':agent first') await new Promise<void>((resolve) => { releaseFirst = resolve; });
+          if (params.line === ':agent stale second from A') await new Promise<void>((resolve) => { releaseSecond = resolve; });
+        }
+        return { terminals: [], output: '', agent: { markdown: '', modelLabel: 'test', stopReason: 'end_turn' } };
+      },
+    };
+    const realPanelClient = {
+      ...client,
+      connectAcp: () => acp,
+      listTerminals: async () => ({ terminals: [], scope: undefined }),
+      fetchJson: async () => ({ messages: [] }),
+    };
+    let releaseLazyDock!: () => void;
+    const lazyDockGate = new Promise<void>((resolve) => { releaseLazyDock = resolve; });
+    let resolveLazyDockLoaded!: () => void;
+    const lazyDockLoaded = new Promise<void>((resolve) => { resolveLazyDockLoaded = resolve; });
+    let resolveDockHandleReady!: () => void;
+    const dockHandleReady = new Promise<void>((resolve) => { resolveDockHandleReady = resolve; });
+    const LazyDock = lazy(async () => {
+      await lazyDockGate;
+      const module = { TerminalChatDock: TerminalChatDockModule };
+      resolveLazyDockLoaded();
+      return { default: module.TerminalChatDock };
+    });
+    const rewritePanel = (node: ReactNode): ReactNode => {
+      if (Array.isArray(node)) return node.map((child, index) => {
+        const rewritten = rewritePanel(child);
+        return isValidElement(rewritten) && rewritten.key === null
+          ? cloneElement(rewritten as ReactElement, { key: `panel-test-${index}` })
+          : rewritten;
+      });
+      if (!isValidElement(node)) return node;
+      const props = node.props as Record<string, unknown>;
+      if (typeof props.onVoiceTranscriptSubmitReady === 'function') {
+        const onReady = props.onVoiceTranscriptSubmitReady as (terminalId: string, handle: unknown) => void;
+        const dockProps = props as unknown as ComponentProps<typeof LazyDock>;
+        return createElement(Suspense, { fallback: null }, createElement(LazyDock, {
+          ...dockProps,
+          onVoiceTranscriptSubmitReady: (terminalId: string, handle: unknown) => {
+            onReady(terminalId, handle);
+            if (handle) resolveDockHandleReady();
+          },
+        }));
+      }
+      if (typeof node.type === 'function' && node.type.name === 'TerminalPaneLayout') return null;
+      if (typeof props.onActiveChange === 'function' && typeof props.onTabsChange === 'function') {
+        return createElement('div', null,
+          createElement('button', {
+            'data-testid': 'panel-toggle-minimize',
+            onClick: props.onToggleMinimize as () => void,
+          }, 'toggle minimized'),
+          createElement('button', {
+            'data-testid': 'panel-switch-a',
+            onClick: () => (props.onActiveChange as (id: string) => void)('terminal-A'),
+          }, 'A'),
+          createElement('button', {
+            'data-testid': 'panel-switch-b',
+            onClick: () => (props.onActiveChange as (id: string) => void)('terminal-B'),
+          }, 'B'),
+        );
+      }
+      if (typeof props.terminalId === 'string' && typeof props.sessionId === 'string') return null;
+      const children = rewritePanel(props.children as ReactNode);
+      return cloneElement(node as ReactElement, props, children);
+    };
+    function PanelWithLazyDock(): ReactNode {
+      return rewritePanel(TerminalPanelComponent());
+    }
+    const realDaemon = { ...defaultDaemon, client: realPanelClient, config: { baseUrl: 'http://localhost', token: '', provider: '' }, sessionId: 'session-real-tree' };
+    // This test imports the real voice hook through the real lazy Dock. Give its
+    // `instanceof HTMLElement` guard a DOM constructor even when this file runs
+    // alone (the process preload does not install a DOM).
+    class TestElement {}
+    class TestHTMLElement extends TestElement {}
+    const domConstructors = { Element: TestElement, HTMLElement: TestHTMLElement };
+    const priorHTMLElement = Object.getOwnPropertyDescriptor(globalThis, 'HTMLElement');
+    const priorElement = Object.getOwnPropertyDescriptor(globalThis, 'Element');
+    const priorWindowHTMLElement = Object.getOwnPropertyDescriptor(window, 'HTMLElement');
+    const priorWindowElement = Object.getOwnPropertyDescriptor(window, 'Element');
+    Object.defineProperty(globalThis, 'HTMLElement', { configurable: true, value: domConstructors.HTMLElement });
+    Object.defineProperty(globalThis, 'Element', { configurable: true, value: domConstructors.Element });
+    Object.defineProperty(window, 'HTMLElement', { configurable: true, value: domConstructors.HTMLElement });
+    Object.defineProperty(window, 'Element', { configurable: true, value: domConstructors.Element });
+    const priorDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: { addEventListener() {}, removeEventListener() {} } });
+    daemon = realDaemon as never;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    let tree: ReturnType<typeof create> | undefined;
+    try {
+      await act(async () => {
+        tree = create(<PanelWithLazyDock />);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(tree!.root.findAll((element) => typeof element.props.onVoiceTranscriptSubmitReady === 'function')).toHaveLength(0);
+      const keydown = windowListeners.get('keydown')?.values().next().value;
+      expect(keydown).toBeFunction();
+      await act(async () => {
+        keydown!({ metaKey: true, ctrlKey: false, shiftKey: true, key: 'm', preventDefault: () => {} });
+      });
+      expect(debugEvents).toContain('webterm.voice.shortcut.toggle');
+      onVoiceTranscript!(' first ');
+      onVoiceTranscript!(' stale second from A ');
+
+      const minimize = tree!.root.findByProps({ 'data-testid': 'panel-toggle-minimize' });
+      await act(async () => {
+        minimize.props.onClick();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      const dock = () => tree!.root.find((element) => typeof element.props.onVoiceTranscriptSubmitReady === 'function');
+      expect(tree!.root.findAll((element) => typeof element.props.onVoiceTranscriptSubmitReady === 'function')).toHaveLength(0);
+      await act(async () => {
+        releaseLazyDock();
+        await lazyDockLoaded;
+      });
+      await act(async () => { await dockHandleReady; });
+      expect(sent).toEqual([
+        { method: 'terminal/repl/exec', params: { sessionId: 'session-real-tree', terminalId: 'terminal-A', line: ':agent first' } },
+      ]);
+      await act(async () => {
+        releaseFirst!();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(sent).toEqual([
+        { method: 'terminal/repl/exec', params: { sessionId: 'session-real-tree', terminalId: 'terminal-A', line: ':agent first' } },
+        { method: 'terminal/repl/exec', params: { sessionId: 'session-real-tree', terminalId: 'terminal-A', line: ':agent stale second from A' } },
+      ]);
+      await act(async () => { onVoiceTranscript!(' queued third from A '); });
+      expect(releaseSecond).toBeFunction();
+
+      await act(async () => {
+        tree!.root.findByProps({ 'data-testid': 'panel-switch-b' }).props.onClick();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      await act(async () => {
+        releaseSecond!();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(dock().props.terminalId).toBe('terminal-B');
+      expect(sent).toEqual([
+        { method: 'terminal/repl/exec', params: { sessionId: 'session-real-tree', terminalId: 'terminal-A', line: ':agent first' } },
+        { method: 'terminal/repl/exec', params: { sessionId: 'session-real-tree', terminalId: 'terminal-A', line: ':agent stale second from A' } },
+      ]);
+      await act(async () => {
+        onVoiceTranscript!(' valid for B ');
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(sent.at(-1)).toEqual({
+        method: 'terminal/repl/exec', params: { sessionId: 'session-real-tree', terminalId: 'terminal-B', line: ':agent valid for B' },
+      });
+    } finally {
+      if (tree) await act(async () => { tree!.unmount(); });
+      daemon = defaultDaemon;
+      if (priorDocument) Object.defineProperty(globalThis, 'document', priorDocument);
+      else delete (globalThis as { document?: unknown }).document;
+      if (priorHTMLElement) Object.defineProperty(globalThis, 'HTMLElement', priorHTMLElement);
+      else delete (globalThis as { HTMLElement?: unknown }).HTMLElement;
+      if (priorElement) Object.defineProperty(globalThis, 'Element', priorElement);
+      else delete (globalThis as { Element?: unknown }).Element;
+      if (priorWindowHTMLElement) Object.defineProperty(window, 'HTMLElement', priorWindowHTMLElement);
+      else delete (window as { HTMLElement?: unknown }).HTMLElement;
+      if (priorWindowElement) Object.defineProperty(window, 'Element', priorWindowElement);
+      else delete (window as { Element?: unknown }).Element;
+    }
+  });
+
+  test('drops a terminal transcript queued before its dock detaches', async () => {
+    listed = [LOCAL];
+    storage.clear();
+    await renderPanel();
+    let tabs = harness.find((element) => typeof element.props.onActiveChange === 'function');
+    harness.act(() => (tabs.props.onActiveChange as (id: string) => void)(LOCAL.id));
+    await harness.settle();
+    const dock = harness.find((element) => typeof element.props.onVoiceTranscriptSubmitReady === 'function');
+    harness.act(() => ((dock.props.voice as { onToggle: () => void }).onToggle)());
+    onVoiceTranscript!('discard after detach');
+
+    const ready = dock.props.onVoiceTranscriptSubmitReady as (
+      terminalId: string,
+      handle: { submitVoiceTranscript: (text: string) => void } | null,
+    ) => void;
+    const submitted: string[] = [];
+    harness.act(() => ready(LOCAL.id, null));
+    harness.act(() => ready(LOCAL.id, { submitVoiceTranscript: (text) => submitted.push(text) }));
+    expect(submitted).toEqual([]);
+  });
+
+  test('does not attach an old terminal dock handle to the newly selected terminal', async () => {
+    const other = { ...LOCAL, id: 'tui:101' };
+    listed = [LOCAL, other];
+    storage.clear();
+    await renderPanel();
+    let tabs = harness.find((element) => typeof element.props.onActiveChange === 'function');
+    harness.act(() => (tabs.props.onActiveChange as (id: string) => void)(LOCAL.id));
+    await harness.settle();
+    const dock = harness.find((element) => typeof element.props.onVoiceTranscriptSubmitReady === 'function');
+    harness.act(() => ((dock.props.voice as { onToggle: () => void }).onToggle)());
+    onVoiceTranscript!('old terminal');
+
+    tabs = harness.find((element) => typeof element.props.onActiveChange === 'function');
+    harness.act(() => (tabs.props.onActiveChange as (id: string) => void)(other.id));
+    await harness.settle();
+    const newDock = harness.find((element) => typeof element.props.onVoiceTranscriptSubmitReady === 'function');
+    const ready = newDock.props.onVoiceTranscriptSubmitReady as (
+      terminalId: string,
+      handle: { submitVoiceTranscript: (text: string) => void } | null,
+    ) => void;
+    const submitted: string[] = [];
+    harness.act(() => ready(LOCAL.id, { submitVoiceTranscript: (text) => submitted.push(`stale:${text}`) }));
+    onVoiceTranscript!('new terminal');
+    harness.act(() => ready(other.id, { submitVoiceTranscript: (text) => submitted.push(text) }));
+    expect(submitted).toEqual(['new terminal']);
+  });
 });
 
 describe('TerminalPanel · live PTY selection without a shell tab', () => {
@@ -251,7 +530,7 @@ describe('TerminalPanel · live PTY selection without a shell tab', () => {
     const tabPropsBefore = harness.find((element) => typeof element.props.onTabsChange === 'function').props;
     click(harness.find((element) => element.props.className === 'w-full text-left'));
     await harness.settle();
-    const { PtyLiveViewLazy: PtyLiveView } = await import('./PtyLiveView.lazy');
+    const PtyLiveView = PtyLiveViewLazyComponent;
     const live = harness.findAll((element) => element.type === PtyLiveView);
     expect(live).toHaveLength(1);
     expect(live[0]!.props.terminal).toEqual(FOREIGN);
@@ -273,7 +552,7 @@ describe('TerminalPanel · URL PTY selection', () => {
     await renderPanel({ initialPtyId: FOREIGN.id, onPtySelection: (terminal: DaemonTerminalSummary) => selected.push(terminal.id) });
 
     expect(listOptions).toContainEqual({ all: true, includeTest: true });
-    const { PtyLiveViewLazy: PtyLiveView } = await import('./PtyLiveView.lazy');
+    const PtyLiveView = PtyLiveViewLazyComponent;
     expect(harness.find((element) => element.type === PtyLiveView).props.terminal).toEqual(FOREIGN);
     expect(calls).toEqual([{ endpoint: 'scrollback', id: FOREIGN.id, options: { sourceRoot: '/roots/prod/pty/manifest.db' } }]);
     expect(selected).toEqual([]);
@@ -330,7 +609,7 @@ describe('TerminalPanel · URL PTY selection', () => {
     click(harness.find((element) => element.props.className === 'w-full text-left'));
     await harness.settle();
     expect(selected).toEqual([FOREIGN]);
-    const { PtyLiveViewLazy: PtyLiveView } = await import('./PtyLiveView.lazy');
+    const PtyLiveView = PtyLiveViewLazyComponent;
     expect(harness.findAll((element) => element.type === PtyLiveView)).toHaveLength(1);
   });
 });
@@ -348,7 +627,7 @@ describe('TerminalPanel · PTY-list and shell tabs', () => {
     expect(harness.textOf(rows[0]!)).toContain(LOCAL.id);
     click(rows[0]!);
     await harness.settle();
-    const { PtyLiveViewLazy: PtyLiveView } = await import('./PtyLiveView.lazy');
+    const PtyLiveView = PtyLiveViewLazyComponent;
     expect(harness.find((element) => element.type === PtyLiveView).props.terminal).toEqual(newest);
     expect(selected).toEqual([newest]);
     expect(harness.find((element) => typeof element.props.onTabsChange === 'function').props.activeId).toBe(tabsBefore);
@@ -472,9 +751,8 @@ describe('TerminalPanel · a selected row reaches the daemon carrying its own so
     // the row up by id and could fetch the other universe's screen.
     listed = [FOREIGN, { ...FOREIGN, sourceRoot: { name: 'test', dbPath: '/roots/test/pty/manifest.db' } } as DaemonTerminalSummary];
     calls.length = 0;
-    harness.unmount();
-    const { TerminalPanel: Panel } = await import('./TerminalPanel');
-    harness.render(Panel as never);
+    await act(async () => { harness.unmount(); });
+    harness.render(TerminalPanelComponent as never);
     await harness.settle();
     click(button('PTY 목록'));
     await harness.settle();

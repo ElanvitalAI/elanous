@@ -390,9 +390,9 @@ function urlForLanHttp(port: number): string[] {
   // hint; the caller can run `ipconfig getifaddr en0` if they need the
   // actual LAN IP.
   return [
-    `http://localhost:${port}/app/showroom/`,
-    `http://<Mac LAN IP>:${port}/app/showroom/`,
-    `http://<Tailscale IP · 100.x>:${port}/app/showroom/`,
+    `http://localhost:${port}/app/`,
+    `http://<Mac LAN IP>:${port}/app/`,
+    `http://<Tailscale IP · 100.x>:${port}/app/`,
   ];
 }
 

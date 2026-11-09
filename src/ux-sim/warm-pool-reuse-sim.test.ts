@@ -1,14 +1,264 @@
 import { expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { debug } from '../debug/log.js';
 import { LogStore, StoreSink } from '../mss/logging/log-store.js';
 import { getTestStateRoot } from '../nexus/paths.js';
-import { assembleWarmPoolProviderConfig } from '../../scripts/warm-pool-provider-config.js';
+import { assembleWarmPoolProviderConfig, fetchMachinePoolDeclarationsFromNexus } from '../../scripts/warm-pool-provider-config.js';
+import { issueMemberToken, MEMBER_TOKEN_TTL_MS, revokeMemberToken } from '../control-plane/member-tokens.js';
+import type { MachinePoolDeclaration } from '../resource-ledger/machine-pool-inventory.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
+import { createNexusState } from '../nexus/state/state.js';
+import { TabRegistry } from '../nexus/state/tab-registry.js';
+import { NexusEventBus } from '../nexus/api/event-bus.js';
+import { routeRequest, type NexusHttpServerOpts } from '../nexus/api/http-server.js';
+import { createDevProxyRuntimeRef } from '../nexus/api/admin-dev-proxy.js';
 import { createFakePrimaryControl, runWarmPoolReuseSimulation, simulateWarmPoolMachineLossRecovery, type WarmPoolReuseFault } from './warm-pool-reuse-sim.js';
 import { simulateWarmPoolTtlRotation } from './warm-pool-reuse-sim.js';
+import { withSimClock } from './fake-clock.js';
+
+test('warm provider reaches the Nexus machine-pool route and fails closed on the control endpoint 404', async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), 'warm-pool-resource-ledger-route-'));
+  setElanousConfigDir(configRoot);
+  const token = issueMemberToken('node-b');
+  const state = createNexusState({ nexusVersion: 'sim', phase: 'test' });
+  const eventBus = new NexusEventBus();
+  state.bus = eventBus;
+  const opts = { state, registry: new TabRegistry(state), eventBus } as NexusHttpServerOpts;
+  const server = { requestIP: () => ({ address: '127.0.0.1' }) } as never;
+  const devProxy = createDevProxyRuntimeRef();
+  const tailnetValidation = { readTailnetAddresses: () => ['100.64.0.10'] };
+  const simulatedFetch: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const request = new Request(input, init);
+    if (new URL(request.url).hostname === 'warm-control.test') return new Response('Not Found', { status: 404 });
+    return await routeRequest(request, opts, server, null, devProxy) ?? new Response('Not Found', { status: 404 });
+  }, { preconnect: fetch.preconnect, resourceLedgerUrlValidationForTest: tailnetValidation });
+  try {
+    const pools = await fetchMachinePoolDeclarationsFromNexus('http://100.64.0.10:8413/v1/resource-ledger/pools', token, simulatedFetch);
+    expect(pools).toEqual([]);
+    await expect(fetchMachinePoolDeclarationsFromNexus('https://warm-control.test/v1/resource-ledger/pools', token, simulatedFetch))
+      .rejects.toThrow('Nexus resource-ledger request failed: HTTP 404');
+    await expect(fetchMachinePoolDeclarationsFromNexus('http://100.64.0.10:8413/v1/resource-ledger/pools', 'invalid-token', simulatedFetch))
+      .rejects.toThrow('Nexus resource-ledger request failed: HTTP 401');
+    revokeMemberToken('node-b');
+    await expect(fetchMachinePoolDeclarationsFromNexus('http://100.64.0.10:8413/v1/resource-ledger/pools', token, simulatedFetch))
+      .rejects.toThrow('Nexus resource-ledger request failed: HTTP 401');
+  } finally {
+    resetElanousConfigDir();
+    rmSync(configRoot, { recursive: true, force: true });
+  }
+});
+
+test('RESOURCE-LEDGER-PUBLIC-AUTH sim: machine tokens expire at exp; legacy tokens warn and remain accepted', async () => {
+  await withSimClock(Date.parse('2026-11-09T00:00:00.000Z'), async clock => {
+    const configRoot = mkdtempSync(join(tmpdir(), 'warm-pool-machine-token-ttl-'));
+    setElanousConfigDir(configRoot);
+    mkdirSync(join(configRoot, 'logs'), { recursive: true });
+    const logStore = new LogStore(join(configRoot, 'logs', 'logs.db'), { instance: 'test:machine-token-ttl' });
+    const logSink = new StoreSink(logStore, 'ux-sim:machine-token-ttl', { installExitHandlers: false });
+    const unregisterLogSink = debug.registerSink(logSink);
+    const machine = 'host-a';
+    const token = issueMemberToken(machine);
+    const tokenStore = join(configRoot, 'control', 'member-tokens.json');
+    const saved = JSON.parse(readFileSync(tokenStore, 'utf8')) as Record<string, { sha256: string; issuedAt: string; expiresAt: string }>;
+    const expiresAt = Date.parse(saved[machine]!.expiresAt);
+    const state = createNexusState({ nexusVersion: 'sim', phase: 'test' });
+    const eventBus = new NexusEventBus();
+    state.bus = eventBus;
+    const opts = { state, registry: new TabRegistry(state), eventBus } as NexusHttpServerOpts;
+    const server = { requestIP: () => ({ address: '127.0.0.1' }) } as never;
+    const url = 'http://127.0.0.1:8413/v1/resource-ledger/pools';
+    const tailnetValidation = { readTailnetAddresses: () => [] };
+    const simulatedFetch: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      await routeRequest(new Request(input, init), opts, server, null, createDevProxyRuntimeRef())
+        ?? new Response('Not Found', { status: 404 }),
+    { preconnect: fetch.preconnect, resourceLedgerUrlValidationForTest: tailnetValidation });
+    try {
+      expect(expiresAt - Date.parse(saved[machine]!.issuedAt)).toBe(MEMBER_TOKEN_TTL_MS);
+      clock.setTime(expiresAt - 1);
+      expect((await simulatedFetch(url, { headers: { authorization: `Bearer ${token}` } })).status).toBe(200);
+
+      clock.setTime(expiresAt);
+      const expired = await simulatedFetch(url, { headers: { authorization: `Bearer ${token}` } });
+      expect(expired.status).toBe(401);
+      expect(await expired.json()).toEqual({ error: 'unauthorized' });
+      await expect(fetchMachinePoolDeclarationsFromNexus(url, token, simulatedFetch))
+        .rejects.toThrow('Nexus resource-ledger request failed: HTTP 401');
+
+      const legacy = JSON.parse(readFileSync(tokenStore, 'utf8')) as Record<string, Record<string, unknown>>;
+      delete legacy[machine]!.expiresAt;
+      writeFileSync(tokenStore, JSON.stringify(legacy));
+      expect((await simulatedFetch(url, { headers: { authorization: `Bearer ${token}` } })).status).toBe(200);
+      logSink.flush();
+      const warnings = logStore.queryAll({ exactCategories: ['resource-ledger.auth'] });
+      expect(warnings.some(row => row.event === 'legacy-machine-token-without-exp'
+        && JSON.parse(row.data ?? '{}').machine === machine)).toBe(true);
+    } finally {
+      unregisterLogSink();
+      logSink.flush();
+      logSink.close();
+      logStore.close();
+      resetElanousConfigDir();
+      rmSync(configRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+test('five local and tailnet hosts build providers from only their own shared-ledger pool', async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), 'warm-pool-five-host-ledger-'));
+  setElanousConfigDir(configRoot);
+  const hosts = ['node-c', 'minim5', 'mshq', 'aws1', 'aws2'] as const;
+  const digest = `sha256:${'b'.repeat(64)}`;
+  const tokens = Object.fromEntries(hosts.map(host => [host, issueMemberToken(host)]));
+  const pools: MachinePoolDeclaration[] = hosts.map((host): MachinePoolDeclaration => ({ purpose: 'gate', fanoutGroupId: `gate-${host}`,
+    members: [{ host, count: 1, digest, role: 'both' }],
+    fanoutGroup: { shard: { kind: 'gate', input: 'gate-shard', result: 'gate-receipt', fingerprint: 'gate-v1' } },
+    fingerprint: { runtime: 'bun-v1', environment: 'linux', skillPacks: [] },
+    cleanup: { procedure: 'clean-v1', verify: 'verify-v1' } }));
+  mkdirSync(join(configRoot, 'resource-ledger'), { recursive: true });
+  writeFileSync(join(configRoot, 'resource-ledger', 'events.jsonl'), pools.map((pool, index) =>
+    JSON.stringify({ event: 'pool-declared', at: `2026-11-08T00:00:0${index}.000Z`, pool })).join('\n') + '\n');
+  const state = createNexusState({ nexusVersion: 'sim', phase: 'test' });
+  const eventBus = new NexusEventBus();
+  state.bus = eventBus;
+  const opts = { state, registry: new TabRegistry(state), eventBus } as NexusHttpServerOpts;
+  const server = { requestIP: () => ({ address: '127.0.0.1' }) } as never;
+  const tailnetValidation = { readTailnetAddresses: () => ['100.64.0.10'] };
+  const simulatedFetch: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+    await routeRequest(new Request(input, init), opts, server, null, createDevProxyRuntimeRef())
+      ?? new Response('Not Found', { status: 404 }), { preconnect: fetch.preconnect, resourceLedgerUrlValidationForTest: tailnetValidation });
+  const imageConfig = { pod: { warmPoolProfile: 'gate', warmPool: { namespace: 'test', imageRepository: 'registry.example/elanous',
+    imageDigest: digest, baseImageDigest: `sha256:${'f'.repeat(64)}`, lockHash: 'b'.repeat(64), architecture: 'arm64',
+    hostProbeUrl: 'http://host.orb.internal:10001/health', prodProbeUrl: 'http://core.elanous-prod:10002/',
+    sourceUrl: 'https://github.com/ElanvitalAI/elanous.git', templates: [] } },
+  harness: { imageCommit: 'c'.repeat(40), podPool: 'gate-test-context' } };
+  try {
+    for (const host of hosts) {
+      const token = tokens[host]!;
+      const url = host === 'aws1' || host === 'aws2'
+        ? 'http://100.64.0.10:8413/v1/resource-ledger/pools'
+        : 'http://127.0.0.1:8413/v1/resource-ledger/pools';
+      const declarations = await fetchMachinePoolDeclarationsFromNexus(url, token, simulatedFetch);
+      expect(declarations).toEqual([pools[hosts.indexOf(host)]]);
+      const config = { ...imageConfig, pod: { ...imageConfig.pod, warmPool: {
+        ...imageConfig.pod.warmPool, templates: [{ host, tier: 'standard', nodeName: `${host}-node` }],
+      } }, harness: { ...imageConfig.harness, podPool: `${host}-context` } };
+      const provider = assembleWarmPoolProviderConfig({ config, controlUrl: 'https://control.test:8413',
+        memberToken: 'd'.repeat(64), machineTokens: { [host]: token }, machinePools: declarations });
+      expect(provider.poolTemplates).toHaveLength(1);
+      expect(provider.poolTemplates[0]).toMatchObject({ host, slotCount: 1, spec: {
+        kubectlContext: `${host}-context`, image: `registry.example/elanous@${digest}`,
+      } });
+      expect(provider.machineTokens).toEqual({ [host]: token });
+      expect(provider.machinePools).toEqual([pools[hosts.indexOf(host)]]);
+    }
+  } finally {
+    resetElanousConfigDir();
+    rmSync(configRoot, { recursive: true, force: true });
+  }
+});
+
+test('warm provider keeps known pool declarations when the ledger has an unknown event and reports that observation', async () => {
+  const configRoot = mkdtempSync(join(tmpdir(), 'warm-pool-unknown-ledger-event-'));
+  setElanousConfigDir(configRoot);
+  const token = issueMemberToken('node-b');
+  const longUnknownType = 'future pool observation α '.repeat(4);
+  const controlUnknownType = 'future\nledger-event';
+  mkdirSync(join(configRoot, 'logs'), { recursive: true });
+  const logStore = new LogStore(join(configRoot, 'logs', 'logs.db'), { instance: 'test:unknown-resource-ledger-event' });
+  const logSink = new StoreSink(logStore, 'ux-sim:unknown-resource-ledger-event', { installExitHandlers: false });
+  const unregisterLogSink = debug.registerSink(logSink);
+  const pool = { purpose: 'gate', fanoutGroupId: 'gate-sim-v1',
+    members: [{ host: 'node-b', count: 1, digest: `sha256:${'b'.repeat(64)}`, role: 'both' }],
+    fanoutGroup: { shard: { kind: 'gate', input: 'gate-shard', result: 'gate-receipt', fingerprint: 'gate-v1' } },
+    fingerprint: { runtime: 'bun-v1', environment: 'linux', skillPacks: [] },
+    cleanup: { procedure: 'clean-v1', verify: 'verify-v1' } };
+  mkdirSync(join(configRoot, 'resource-ledger'), { recursive: true });
+  writeFileSync(join(configRoot, 'resource-ledger', 'events.jsonl'), [
+    JSON.stringify({ event: 'pool-declared', at: '2026-11-08T00:00:00.000Z', pool }),
+    JSON.stringify({ event: 'future-pool-observation-v2', at: '2026-11-08T00:00:01.000Z', data: { opaque: true } }),
+    JSON.stringify({ event: 'future-pool-observation-v2', at: '2026-11-08T00:00:02.000Z', data: { opaque: true } }),
+    JSON.stringify({ event: 'future-pool-observation-v3', at: '2026-11-08T00:00:03.000Z', data: { opaque: true } }),
+    JSON.stringify({ event: longUnknownType, at: '2026-11-08T00:00:04.000Z', data: { opaque: true } }),
+    JSON.stringify({ event: 'future/type', at: '2026-11-08T00:00:05.000Z' }),
+    JSON.stringify({ event: 'future?type', at: '2026-11-08T00:00:06.000Z' }),
+    JSON.stringify({ event: controlUnknownType, at: '2026-11-08T00:00:07.000Z' }),
+  ].join('\n') + '\n');
+  const state = createNexusState({ nexusVersion: 'sim', phase: 'test' });
+  const eventBus = new NexusEventBus();
+  state.bus = eventBus;
+  const opts = { state, registry: new TabRegistry(state), eventBus } as NexusHttpServerOpts;
+  const server = { requestIP: () => ({ address: '127.0.0.1' }) } as never;
+  try {
+    const response = await routeRequest(new Request('https://nexus.test/v1/resource-ledger/pools', {
+      headers: { authorization: `Bearer ${token}` },
+    }), opts, server, null, createDevProxyRuntimeRef());
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({ pools: [pool], observations: [
+      { kind: 'unknown-ledger-event-skipped', eventType: 'future-pool-observation-v2', count: 2 },
+      { kind: 'unknown-ledger-event-skipped', eventType: 'future-pool-observation-v3', count: 1 },
+      { kind: 'unknown-ledger-event-skipped', eventType: longUnknownType, count: 1 },
+      { kind: 'unknown-ledger-event-skipped', eventType: 'future/type', count: 1 },
+      { kind: 'unknown-ledger-event-skipped', eventType: 'future?type', count: 1 },
+      { kind: 'unknown-ledger-event-skipped', eventType: controlUnknownType, count: 1 },
+    ] });
+    logSink.flush();
+    const warning = logStore.query({ categories: ['resource-ledger'], limit: 10 })
+      .find(row => row.event === 'unknown-events-skipped');
+    expect(warning).toBeDefined();
+    expect(JSON.parse(warning?.data ?? '{}')).toEqual({ total: 7, eventTypes: [
+      { eventTypeJson: JSON.stringify('future-pool-observation-v2'), count: 2 },
+      { eventTypeJson: JSON.stringify('future-pool-observation-v3'), count: 1 },
+      { eventTypeJson: JSON.stringify(longUnknownType), count: 1 },
+      { eventTypeJson: JSON.stringify('future/type'), count: 1 },
+      { eventTypeJson: JSON.stringify('future?type'), count: 1 },
+      { eventTypeJson: JSON.stringify(controlUnknownType), count: 1 },
+    ] });
+    writeFileSync(join(configRoot, 'resource-ledger', 'events.jsonl'), [
+      JSON.stringify({ event: 'pool-declared', at: '2026-11-08T00:00:00.000Z', pool }),
+      '{"event":',
+    ].join('\n') + '\n');
+    const malformed = await routeRequest(new Request('https://nexus.test/v1/resource-ledger/pools', {
+      headers: { authorization: `Bearer ${token}` },
+    }), opts, server, null, createDevProxyRuntimeRef());
+    expect(malformed?.status).toBe(503);
+    expect(await malformed?.json()).toEqual({ error: 'resource-ledger-unavailable' });
+    const invalidRows = [
+      { event: 42 },
+      { event: '' },
+      { event: 'lease-created' },
+      { event: 'lease-heartbeat', at: '2026-11-08T00:00:00.000Z' },
+      { event: 'lease-ended', at: '2026-11-08T00:00:00.000Z', id: 'lease-1' },
+      { event: 'lease-reaped', at: '2026-11-08T00:00:00.000Z', id: 'lease-1' },
+      { event: 'pool-declared', at: '2026-11-08T00:00:00.000Z' },
+      { event: 'pool-pod-receipt', at: '2026-11-08T00:00:00.000Z' },
+      { event: 'guardian-host-lease', at: '2026-11-08T00:00:00.000Z', record: {} },
+      { event: 'guardian-host-lease-conflict', at: '2026-11-08T00:00:00.000Z', requestId: '', existingLeaseId: '', attemptedRequest: {} },
+      { event: 'guardian-host-lease-admitted', at: '2026-11-08T00:00:00.000Z', leaseId: '', host: '', runId: '', consumer: '' },
+      { event: 'guardian-host-lease-admission-denied', at: '2026-11-08T00:00:00.000Z', leaseId: '', host: '', runId: '', consumer: '', reason: '', alternatives: 'bad' },
+    ];
+    for (const invalidRow of invalidRows) {
+      writeFileSync(join(configRoot, 'resource-ledger', 'events.jsonl'), [
+        JSON.stringify({ event: 'pool-declared', at: '2026-11-08T00:00:00.000Z', pool }),
+        JSON.stringify(invalidRow),
+      ].join('\n') + '\n');
+      const invalid = await routeRequest(new Request('https://nexus.test/v1/resource-ledger/pools', {
+        headers: { authorization: `Bearer ${token}` },
+      }), opts, server, null, createDevProxyRuntimeRef());
+      expect(invalid?.status).toBe(503);
+      expect(await invalid?.json()).toEqual({ error: 'resource-ledger-unavailable' });
+    }
+  } finally {
+    logSink.flush();
+    unregisterLogSink();
+    logSink.close();
+    logStore.close();
+    resetElanousConfigDir();
+    rmSync(configRoot, { recursive: true, force: true });
+  }
+});
 
 test('fake primary preserves member and machine lease scope contract', async () => {
   const primary = await createFakePrimaryControl();
@@ -194,7 +444,7 @@ test('GATE-WARM-POOL-SHARDS-SIM: three sequential shards reuse one pinned Pod wi
 test('WARM-POOL-REUSE-SIM: disappearing mesh member reclaims its lease and reassigns same digest', async () => {
   const result = await simulateWarmPoolMachineLossRecovery();
   expect(result).toMatchObject({ reason: 'machine-disappeared', lostHost: 'pool-host-a', lostLeaseCount: 1,
-    reassignedHost: 'pool-host-b', providerSelection: { selected: true, transport: 'observed', reason: 'complete', workerId: expect.stringMatching(/^warm-pool-host-b-[a-f0-9]+-standard-1$/) }, providerTemplate: { host: 'pool-host-b', slotCount: 1, imageDigest: expect.stringMatching(/^sha256:/) }, digest: expect.stringMatching(/^sha256:/), leaseReaped: true, ledgerReason: 'machine-disappeared', podReceipt: { lastJob: 'crawl-shard-1', cleanupResult: { state: 'unknown' } } });
+    reassignedHost: 'pool-host-b', providerSelection: { selected: true, transport: 'observed', reason: 'complete', workerId: expect.stringMatching(/^warm-pool-host-b-[a-f0-9]+-gate-standard-1$/) }, providerTemplate: { host: 'pool-host-b', slotCount: 1, imageDigest: expect.stringMatching(/^sha256:/) }, digest: expect.stringMatching(/^sha256:/), leaseReaped: true, ledgerReason: 'machine-disappeared', podReceipt: { lastJob: 'crawl-shard-1', cleanupResult: { state: 'unknown' } } });
   expect(result.events).toContainEqual(expect.objectContaining({ type: 'vm-disappeared', id: 'pool-host-a', lostLeases: 1 }));
   expect(result.events).toContainEqual(expect.objectContaining({ type: 'lease-opened', id: 'pool-host-b' }));
 });

@@ -1,0 +1,8 @@
+{
+  "path": "scripts/voice-pwa-sim.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun run scripts/voice-pwa-sim.ts",
+  "logsRecorded": "no",
+  "logsDetail": "No ScenarioV0 logs.db contract.",
+  "excludeReason": "PWA voice dogfood script, not an isolated reusable device."
+}

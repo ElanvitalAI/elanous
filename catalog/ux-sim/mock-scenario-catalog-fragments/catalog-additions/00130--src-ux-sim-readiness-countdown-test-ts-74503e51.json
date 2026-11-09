@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/readiness-countdown.test.ts",
+  "reason": "COORD-READINESS-COUNTDOWN deterministic late-readiness, hold, notification and reservation assertions."
+}

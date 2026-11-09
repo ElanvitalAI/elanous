@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,6 +6,22 @@ import { join } from 'node:path';
 import { atomicallyRepairFiles, glmTranslator, notesRepairLlmConfig, repairKoreanMarkdown, runNotesRepair } from './notes-repair.js';
 import { _resetKeyCacheForTests } from '../../src/config.js';
 import { getUserConfig, setUserConfigOverlay } from '../../src/user-config.js';
+import { withFakeFetchDevice } from '../../src/ux-sim/fake-fetch.js';
+
+const ENV_KEYS = ['OPENROUTER_API_KEY', 'ELANOUS_KEY_CACHE_DIR'] as const;
+const envBeforeEach: Record<(typeof ENV_KEYS)[number], string | undefined> = {
+  OPENROUTER_API_KEY: undefined, ELANOUS_KEY_CACHE_DIR: undefined,
+};
+beforeEach(() => {
+  for (const key of ENV_KEYS) envBeforeEach[key] = process.env[key];
+});
+afterEach(() => {
+  for (const key of ENV_KEYS) {
+    const value = envBeforeEach[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
 
 function ownedDocsFixture() {
   const root = mkdtempSync(join(tmpdir(), 'release-notes-owned-'));
@@ -53,17 +69,17 @@ describe('release notes Korean repair', () => {
     const foreignKey = 'foreign-provider-secret-sentinel';
     const foreignBaseUrl = 'https://foreign-provider.invalid/v1';
     const sent: Array<{ authorization: string | null; url: string; headers: string; body: string }> = [];
-    process.env.OPENROUTER_API_KEY = envKey;
-    process.env.ELANOUS_KEY_CACHE_DIR = cacheDir;
-    _resetKeyCacheForTests();
-    setUserConfigOverlay((current) => ({ ...current, llm: { ...current.llm, provider: 'anthropic', apiKey: foreignKey, baseUrl: foreignBaseUrl } }));
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input, init) => {
-      const url = String(input);
-      const headers = new Headers(init?.headers);
-      sent.push({ authorization: headers.get('authorization'), url, headers: JSON.stringify([...headers.entries()]), body: String(init?.body ?? '') });
-      return new Response('unauthorized', { status: 401 });
-    }) as typeof fetch);
     try {
+      await withFakeFetchDevice(['/api/v1/chat/completions', '/v1/chat/completions'].map((url) => ({ url, method: 'POST' as const, response: (request) => {
+      sent.push({ authorization: request.headers.authorization ?? null, url: request.url,
+        headers: JSON.stringify(Object.entries(request.headers)), body: request.body ?? '' });
+      return new Response('unauthorized', { status: 401 });
+    } })), async (fetchDevice) => {
+      try {
+      process.env.OPENROUTER_API_KEY = envKey;
+      process.env.ELANOUS_KEY_CACHE_DIR = cacheDir;
+      _resetKeyCacheForTests();
+      setUserConfigOverlay((current) => ({ ...current, llm: { ...current.llm, provider: 'anthropic', apiKey: foreignKey, baseUrl: foreignBaseUrl } }));
       const selected = notesRepairLlmConfig({ ...config, llm: { ...config.llm, provider: 'anthropic', apiKey: foreignKey, baseUrl: foreignBaseUrl } }, 'openrouter/z-ai/glm-5.3');
       expect('apiKey' in selected.llm).toBe(false);
       expect('baseUrl' in selected.llm).toBe(false);
@@ -76,6 +92,7 @@ describe('release notes Korean repair', () => {
       expect(foreignRequests).not.toContain(foreignKey);
       expect(foreignRequests).not.toContain(foreignBaseUrl);
 
+      const observedCallsBeforeConfigured = fetchDevice.calls().length;
       const configuredKey = 'openrouter-config-secret-sentinel';
       const configuredBaseUrl = 'https://openrouter-config.invalid/v1';
       sent.length = 0;
@@ -89,14 +106,17 @@ describe('release notes Korean repair', () => {
       expect(sent.every((request) => request.authorization === `Bearer ${configuredKey}`)).toBe(true);
       expect(sent.every((request) => request.url.startsWith(`${configuredBaseUrl}/chat/completions`))).toBe(true);
       expect(JSON.stringify(sent)).not.toContain(envKey);
+      expect(fetchDevice.calls()).toHaveLength(observedCallsBeforeConfigured + sent.length);
     } finally {
-      fetchSpy.mockRestore();
       setUserConfigOverlay(null);
       _resetKeyCacheForTests();
       if (originalRouterKey === undefined) delete process.env.OPENROUTER_API_KEY;
       else process.env.OPENROUTER_API_KEY = originalRouterKey;
       if (originalCacheDir === undefined) delete process.env.ELANOUS_KEY_CACHE_DIR;
       else process.env.ELANOUS_KEY_CACHE_DIR = originalCacheDir;
+      }
+    });
+    } finally {
       rmSync(cacheDir, { recursive: true, force: true });
     }
   });

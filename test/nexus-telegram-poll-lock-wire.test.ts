@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import { wireNexusTelegramQaPollers, type NexusTelegramQaPollerWireDeps, type NexusTelegramQaPollerWireHandle } from '../src/nexus/index.js';
 import type { NexusTelegramTriggerBotOpts } from '../src/nexus/api/telegram-trigger-bot.js';
 import type { TelegramBot } from '../src/telegram.js';
-import type { UserConfig } from '../src/user-config.js';
+import type { UserConfig } from '../src/user-config/types.js';
 
 const A = '111:a';
 const B = '222:b';

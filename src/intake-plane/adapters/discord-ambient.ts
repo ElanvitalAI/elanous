@@ -1,5 +1,5 @@
 import { maybeHandleAmbientTextIntake } from '../ambient.js';
-import type { IntakeAmbientCaptureMode } from '../../user-config.js';
+import type { IntakeAmbientCaptureMode } from '../../user-config/types.js';
 
 export interface DiscordAmbientMessageContext {
   text: string;

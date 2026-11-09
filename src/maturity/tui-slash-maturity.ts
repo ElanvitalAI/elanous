@@ -2,13 +2,11 @@
 // Kept out of feature-maturity.ts: the PWA bundles that file, and this one
 // needs the TUI command list.
 import { SLASH_COMMANDS } from '../chat/index.js';
-import { getUserConfig } from '../user-config.js';
 import { FEATURE_MATURITY, type Maturity, type Role } from './feature-maturity.js';
 
-export function readTuiSlashAudience(raw: unknown = getUserConfig().raw?.tui): { role: Role; showBeta: boolean } {
-  const tui = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
-  const role = tui.role === 'general' || tui.role === 'contributor' || tui.role === 'owner' ? tui.role : 'owner';
-  return { role, showBeta: tui.showBeta === true };
+export function readTuiSlashAudience(_raw?: unknown): { role: Role; showBeta: boolean } {
+  // TUI audience is fixed to the local owner; legacy tui.role/showBeta are ignored.
+  return { role: 'owner', showBeta: false };
 }
 
 export function slashMaturity(name: string): Maturity | undefined {

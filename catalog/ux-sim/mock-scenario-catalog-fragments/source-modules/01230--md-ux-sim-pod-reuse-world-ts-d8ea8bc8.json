@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-POD-REUSE-WORLD-TS",
+  "path": "src/ux-sim/pod-reuse-world.ts",
+  "boundary": "Runs the integrated production Pod reuse scenario with real Job manifest and lease logic, isolated fake Kubernetes boundaries, production read-only hostPath checks, and source mount byte measurements compared with a non-hardlinked clone.",
+  "deviceIds": [
+    "warm-si-reuse-sim",
+    "pod-reuse-residue-fault"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

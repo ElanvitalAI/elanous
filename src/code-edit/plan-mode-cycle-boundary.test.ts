@@ -4,11 +4,11 @@ import ts from 'typescript';
 import { expect, test } from 'bun:test';
 
 test('code-edit and plan-mode boundary modules are not in one runtime SCC', () => {
-  const graph = runtimeSccBoundaryGraph();
   const members = [
     'src/code-edit/apply.ts', 'src/code-edit/index.ts', 'src/code-edit/tools.ts',
     'src/plan-mode/index.ts', 'src/plan-mode/tool-enter.ts', 'src/plan-mode/tool-exit.ts',
   ];
+  const graph = runtimeSccBoundaryGraph(members);
   for (const member of members) expect(RUNTIME_SCC_BOUNDARY_ROOTS.has(member), `${member} is a graph root`).toBe(true);
   for (const member of members) expect(graph.tracked.has(member), member).toBe(true);
   const reachableFrom = (start: string): Set<string> => {

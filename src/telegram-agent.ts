@@ -6,7 +6,7 @@
 // (PLAN-multi-surface-pty-shell M4a, 2026-07-12). This module keeps the
 // telegram-flavored entry point + the historical import path alive.
 
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import type { runTurn } from './session/chat.js';
 import { makeElanousAgentRunTurn } from './agent/monad-agent-turn.js';
 

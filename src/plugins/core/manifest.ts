@@ -168,6 +168,16 @@ export interface PluginAIToolContribution {
   parameters?: Record<string, unknown>;
   schema?: string;
   handler?: string;
+  route?: PluginAIToolRoute;
+}
+
+export interface PluginAIToolRoute {
+  triggers: string[];
+  examples: string[];
+  sideEffects: 'read-only' | 'mutating' | 'external' | 'irreversible';
+  risk: 'low' | 'medium' | 'high';
+  cost: 'cheap' | 'spawns-run' | 'spends-llm' | 'spends-cloud';
+  requiresConfirm: boolean;
 }
 
 export interface PluginWidgetContribution {
@@ -1055,9 +1065,50 @@ function parseAiTools(value: unknown): PluginAIToolContribution[] {
       description: stringOr(raw.description, ''),
       ...(parameters ? { parameters } : {}),
       ...(schema ? { schema } : {}),
-      ...(typeof raw.handler === 'string' ? { handler: normalizeMain(raw.handler) } : {}),
+      ...(typeof raw.handler === 'string' ? { handler: normalizeAIToolHandler(raw.handler) } : {}),
+      ...(raw.route !== undefined ? { route: parseAIToolRoute(raw.route, `contributes.aiTools[${idx}].route`) } : {}),
     };
   });
+}
+
+function normalizeAIToolHandler(value: string): string {
+  // Native references stay symbolic until the shared plugin/native dispatcher resolves them.
+  if (/^native:[a-z0-9][a-z0-9_-]*$/i.test(value)) return value;
+  return normalizeMain(value);
+}
+
+function parseAIToolRoute(value: unknown, label: string): PluginAIToolRoute {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`);
+  const raw = value as Record<string, unknown>;
+  const strings = (key: 'triggers' | 'examples'): string[] => {
+    const entries = raw[key];
+    if (!Array.isArray(entries) || entries.length === 0 || entries.some((entry) => typeof entry !== 'string' || !entry.trim())) {
+      throw new Error(`${label}.${key} must be a non-empty array of strings`);
+    }
+    return entries.map((entry) => (entry as string).trim());
+  };
+  const sideEffects = raw.sideEffects;
+  const risk = raw.risk;
+  const cost = raw.cost;
+  if (!['read-only', 'mutating', 'external', 'irreversible'].includes(String(sideEffects))) {
+    throw new Error(`${label}.sideEffects must be read-only | mutating | external | irreversible`);
+  }
+  if (!['low', 'medium', 'high'].includes(String(risk))) throw new Error(`${label}.risk must be low | medium | high`);
+  if (!['cheap', 'spawns-run', 'spends-llm', 'spends-cloud'].includes(String(cost))) {
+    throw new Error(`${label}.cost must be cheap | spawns-run | spends-llm | spends-cloud`);
+  }
+  if (typeof raw.requiresConfirm !== 'boolean') throw new Error(`${label}.requiresConfirm must be a boolean`);
+  if ((risk === 'high' || sideEffects === 'irreversible') && raw.requiresConfirm !== true) {
+    throw new Error(`${label}.requiresConfirm must be true for high-risk or irreversible tools`);
+  }
+  return {
+    triggers: strings('triggers'),
+    examples: strings('examples'),
+    sideEffects: sideEffects as PluginAIToolRoute['sideEffects'],
+    risk: risk as PluginAIToolRoute['risk'],
+    cost: cost as PluginAIToolRoute['cost'],
+    requiresConfirm: raw.requiresConfirm,
+  };
 }
 
 function parsePrompts(value: unknown): PluginPromptContribution[] {

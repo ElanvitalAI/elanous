@@ -1,0 +1,30 @@
+{
+  "id": "grid-ledger",
+  "name": "In-memory grid and lease ledger",
+  "implementation": [
+    "src/ux-sim/grid-ledger.ts",
+    "src/nexus/api/grid.ts"
+  ],
+  "tests": [
+    "src/ux-sim/grid-ledger.test.ts"
+  ],
+  "target": "deterministic grid.v1/lease.v1 create-update-end lifecycle, capacity enforcement, who queries, heartbeat expiry, and read-only resource comparison",
+  "inputs": [
+    "grid hosts and lane caps",
+    "lease fingerprint and mission",
+    "injected clock",
+    "fake kubectl resource reading or unavailable result"
+  ],
+  "observations": [
+    "created/renewed/ended lease",
+    "capacity refusal reason",
+    "who(host|cell|pr) lease fingerprint and state",
+    "measured occupancy difference or explicit unmeasured status"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/grid-ledger.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

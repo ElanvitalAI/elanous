@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GRAPH-RUNTIME-OVERLAY-EVENT-PATH-TS",
+  "path": "src/ux-sim/graph-runtime-overlay-event-path.ts",
+  "boundary": "graph runtime overlay event path: Run the real graph runtime in an isolated process, then relay its production observer event.",
+  "deviceIds": [
+    "sim-event-log-path"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

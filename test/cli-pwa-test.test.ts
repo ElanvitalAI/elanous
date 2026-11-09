@@ -72,7 +72,7 @@ const baseSeams: Partial<PwaTestOpts> = {
     shareUnmount: { status: 'skipped', reason: 'pwa-port-unknown' },
   }),
   tailscaleMountFn: async () => ({
-    ok: true, url: 'https://mbp.tailnet.ts.net:31415/app/showroom/',
+    ok: true, url: 'https://mbp.tailnet.ts.net:31415/app/',
   }),
   tailscaleUnmountFn: async () => ({
     ok: true,
@@ -554,7 +554,7 @@ describe('runPwaTest — Tailscale Serve --https opt-in', () => {
     });
     expect(r.exitCode).toBe(0);
     expect(r.tailscaleMounted).toBe(true);
-    expect(r.url).toBe('https://mbp.tailnet.ts.net:31415/app/showroom/');
+    expect(r.url).toBe('https://mbp.tailnet.ts.net:31415/app/');
     expect(out.logs.some((l) => l.includes('iPad / external (HTTPS'))).toBe(true);
   });
 
@@ -712,7 +712,7 @@ describe('runPwaTest --status', () => {
         nexusPort: 31420,
         devPort: 3211,
         https: true,
-        url: 'https://mbp.tailnet.ts.net:31420/app/showroom/',
+        url: 'https://mbp.tailnet.ts.net:31420/app/',
         startedAt: '2026-05-09T22:00:00Z',
       }),
     );
@@ -728,7 +728,7 @@ describe('runPwaTest --status', () => {
     expect(out.logs).toContain('  nexus     :31420');
     expect(out.logs).toContain('  next-dev  :3211');
     expect(out.logs).toContain('  started   2026-05-09T22:00:00Z');
-    expect(out.logs).toContain('  url       https://mbp.tailnet.ts.net:31420/app/showroom/');
+    expect(out.logs).toContain('  url       https://mbp.tailnet.ts.net:31420/app/');
     expect(out.logs).toContain(`  alive     yes (pid ${process.pid})`);
     expect(out.logs.some(line => line.startsWith('  fix       '))).toBe(false);
     expect(readFileSync(joinPath(stateDir, 'test-state.json'), 'utf8')).toBe(before);

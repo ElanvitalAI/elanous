@@ -38,6 +38,8 @@ export interface GateTrainReceiptPlan {
   carriedFiles: string[];
   totalFiles: number;
   reasons: string[];
+  reasonCounts: Record<string, number>;
+  planReasons: string[];
   receipts: string[];
 }
 
@@ -57,63 +59,67 @@ export function planGateTrainReceiptCarry(input: {
   const currentTree = gitClosureTree(input.repo, input.commit);
   const carried = new Set<string>();
   const accepted: GateReceipt[] = [];
-  const reasons = new Set<string>();
+  const reasonCounts = new Map<string, number>();
+  const recordReason = (reason: string) => reasonCounts.set(reason, (reasonCounts.get(reason) ?? 0) + 1);
   const changedByBase = new Map<string, string[]>();
 
   for (const receipt of receipts) {
-    if (receipt.verdict !== 'passed' || gateReceiptSelfKey(receipt) !== receipt.key) { reasons.add('invalid-or-non-passing receipt'); continue; }
+    if (receipt.verdict !== 'passed' || gateReceiptSelfKey(receipt) !== receipt.key) { recordReason('invalid-or-non-passing receipt'); continue; }
     if (!receipt.checks.some((check) => check === 'test-interference:with-neighbours' || check === 'test-interference:changed-only')) {
-      reasons.add('receipt lacks passing test-interference check'); continue;
+      recordReason('receipt lacks passing test-interference check'); continue;
     }
     if (receipt.bunVersion !== input.bunVersion || receipt.lockfileHash !== input.lockfileHash
-      || receipt.envFingerprint !== input.envFingerprint) { reasons.add('bun/lockfile/environment differs'); continue; }
-    if (!ancestor(input.repo, receipt.baseCommit, input.commit)) { reasons.add('receipt base is not an ancestor of cut'); continue; }
+      || receipt.envFingerprint !== input.envFingerprint) { recordReason('bun/lockfile/environment differs'); continue; }
+    if (!ancestor(input.repo, receipt.baseCommit, input.commit)) { recordReason('receipt base is not an ancestor of cut'); continue; }
     if (receipt.radiusFiles.some((file) => !currentTree.files.includes(file)
       || blob(input.repo, receipt.headCommit, file) !== blob(input.repo, input.commit, file))) {
-      reasons.add('receipt radius changed or missing at cut'); continue;
+      recordReason('receipt radius changed or missing at cut'); continue;
     }
     let measuredChanges: string[];
     try { measuredChanges = changedFilesBetween(input.repo, receipt.baseCommit, receipt.headCommit); }
-    catch { reasons.add('receipt base-to-head diff unavailable'); continue; }
+    catch { recordReason('receipt base-to-head diff unavailable'); continue; }
     if (measuredChanges.some((file) => !receipt.radiusFiles.includes(file))) {
-      reasons.add('receipt radius does not cover base-to-head changes'); continue;
+      recordReason('receipt radius does not cover base-to-head changes'); continue;
     }
     const candidates = candidateTests(currentTree, receipt);
-    if (!candidates?.length) { reasons.add('receipt test radius is empty or opaque'); continue; }
+    if (!candidates?.length) { recordReason('receipt test radius is empty or opaque'); continue; }
 
     let changed: string[];
     try {
       changed = changedByBase.get(receipt.baseCommit) ?? changedFilesBetween(input.repo, receipt.baseCommit, input.commit);
       changedByBase.set(receipt.baseCommit, changed);
-    } catch { reasons.add('cut diff from receipt base unavailable'); continue; }
+    } catch { recordReason('cut diff from receipt base unavailable'); continue; }
     const outside = changed.filter((file) => !receipt.radiusFiles.includes(file) && !INERT.test(file));
     const nonCodeOutside = outside.find((file) => !/\.(?:[cm]?[jt]sx?)$/.test(file));
     if (nonCodeOutside) {
-      reasons.add(`non-code release input changed outside receipt radius: ${nonCodeOutside}`); continue;
+      recordReason(`non-code release input changed outside receipt radius: ${nonCodeOutside}`); continue;
     }
     let safeCandidates = candidates;
     if (outside.length) {
       const affected = testsReachingChanged(currentTree, outside, candidates);
-      if (!affected.ok) { reasons.add('cut import closure opaque'); continue; }
+      if (!affected.ok) { recordReason('cut import closure opaque'); continue; }
       const affectedSet = new Set(affected.tests);
       safeCandidates = candidates.filter((test) => !affectedSet.has(test));
-      if (!safeCandidates.length) { reasons.add('merge-skew changes reach every receipt test'); continue; }
+      if (!safeCandidates.length) { recordReason('merge-skew changes reach every receipt test'); continue; }
     }
     for (const test of safeCandidates) carried.add(test);
     accepted.push(receipt);
   }
 
-  const noCarry = (reason: string): GateTrainReceiptPlan => ({ priorCommit: accepted[0]?.baseCommit ?? input.commit,
-    files: [...tests], carriedFiles: [], totalFiles: tests.length,
-    reasons: [...new Set([...reasons, ...(reason === 'no safe receipt coverage' && reasons.size ? [] : [reason])])].sort(),
-    receipts: accepted.map((receipt) => receipt.key).sort() });
+  const noCarry = (reason: string): GateTrainReceiptPlan => ({
+    priorCommit: accepted[0]?.baseCommit ?? input.commit, files: [...tests], carriedFiles: [], totalFiles: tests.length,
+    reasons: [...new Set([...reasonCounts.keys(), ...(reason === 'no safe receipt coverage' && reasonCounts.size ? [] : [reason])])].sort(),
+    reasonCounts: Object.fromEntries([...reasonCounts.entries()].sort(([a], [b]) => a.localeCompare(b))),
+    planReasons: [reason], receipts: accepted.map((receipt) => receipt.key).sort(),
+  });
   if (!carried.size || !accepted.length) return noCarry(receipts.length ? 'no safe receipt coverage' : 'gate receipt registry empty');
   const selected = tests.filter((file) => !carried.has(file));
   // The caller falls back to a full sweep rather than skipping all test Pods.
   if (!selected.length) return noCarry('all tests carried; keep at least one measured sweep');
   const latest = [...accepted].sort((a, b) => b.savedAt.localeCompare(a.savedAt))[0]!;
   return { priorCommit: latest.baseCommit, files: selected, carriedFiles: [...carried].sort(), totalFiles: tests.length,
-    reasons: [...reasons].sort(), receipts: accepted.map((receipt) => receipt.key).sort() };
+    reasons: [...reasonCounts.keys()].sort(), reasonCounts: Object.fromEntries([...reasonCounts.entries()].sort(([a], [b]) => a.localeCompare(b))),
+    planReasons: [], receipts: accepted.map((receipt) => receipt.key).sort() };
 }
 
 export function gateReceiptRegistryPath(repo: string): string | null {

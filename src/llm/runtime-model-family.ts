@@ -1,4 +1,4 @@
-import type { LLMProviderName } from '../user-config.js';
+import type { LLMProviderName } from '../user-config/types.js';
 
 /** Lightweight model-id family — prefix/substring only. No catalog, no
  *  `src/llm/model-defaults.ts` (that module imports this file). */

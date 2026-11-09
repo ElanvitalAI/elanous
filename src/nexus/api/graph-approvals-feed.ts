@@ -5,7 +5,7 @@
 import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, normalize, sep } from 'node:path';
 import { fieldEventDir, isFieldSlug } from '../../field/field-media.js';
-import type { GraphRunState } from '../../graph-runner/runner.js';
+import type { GraphRunState } from '../../graph-runner/runner-types.js';
 
 export interface FeedSlide { image: string; caption: string; include: boolean; [key: string]: unknown }
 export interface FeedDraft {

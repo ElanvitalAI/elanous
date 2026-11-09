@@ -4,7 +4,7 @@ import { existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } 
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { changedFilesBetween, planPartialRegate, testFileOfId } from './gate-partial';
-import { gitClosureTree, testsReachingChanged, testsReachingChangedCliLazyRequireShadow } from './gate-closure';
+import { gitClosureTree, testsReachingChanged, testsReachingChangedCliLazyRequireCandidate } from './gate-closure';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 
 const SHA = /^[0-9a-f]{40}$/i;
@@ -71,7 +71,7 @@ export function versionOnlyBumps(repo: string, from: string, to: string, version
 
 export function planGateRadiusShadow(input: { repo: string; ledgerRoot: string; version: string;
   baselineVersion: string; forCommit: string; instanceRoot?: string; expectedBaselineCommit?: string;
-  compareCliShadow?: typeof testsReachingChangedCliLazyRequireShadow }): GateRadiusShadowPlan {
+  compareCliShadow?: typeof testsReachingChangedCliLazyRequireCandidate }): GateRadiusShadowPlan {
   const { repo, ledgerRoot, version, baselineVersion, forCommit } = input;
   const full = (reason: string, priorCommit: string | null = null, totalTests: number | null = null): GateRadiusShadowPlan =>
     ({ schema: 1, version, priorCommit, forCommit, proposed: 'full', files: [], totalTests, reason });
@@ -110,7 +110,7 @@ export function planGateRadiusShadow(input: { repo: string; ledgerRoot: string; 
       closure: (code) => testsReachingChanged(tree, code, tests) });
     if (!result.ok) return full(result.reason, priorCommit, tests.length);
     // Shadow only: calculate both closure radii. `files` and the live selector keep using the current radius.
-    const lazy = (input.compareCliShadow ?? testsReachingChangedCliLazyRequireShadow)(tree, effective, tests);
+    const lazy = (input.compareCliShadow ?? testsReachingChangedCliLazyRequireCandidate)(tree, effective, tests);
     const priorFailureFiles = [...new Set([...failures.failures, ...(failures.errors ?? [])].map(testFileOfId))];
     const proposedFiles = lazy.proposed.ok ? [...new Set([...lazy.proposed.tests, ...priorFailureFiles])].sort() : [];
     const lazyRequireShadow = { currentFiles: result.plan.files, proposedFiles, cliSpawnTests: lazy.cliSpawnTests.length,

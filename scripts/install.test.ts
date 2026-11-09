@@ -3,17 +3,33 @@ import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, symlinkSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test as bunTest } from 'bun:test';
 import { isUnprivilegedGitRepairOnlyFailure } from './install-doctor-result';
+import { INSTALL_DETERMINISTIC_SMOKE_TESTS, shouldRunInstallTest } from './lib/install-test-tier.js';
 import { runReleaseInstaller, type Runner } from '../src/cli/release-cli.js';
+import { createFakeBins } from '../src/ux-sim/fake-bin.js';
+import { simCli } from '../src/ux-sim/in-process-cli.js';
+import { packageFixture as createPackageFixture, packageVersionFromSource } from './lib/install-test-package.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
+const registeredInstallTestNames = new Set<string>();
+
+const test = (name: string, fn: () => void | Promise<void>, timeout?: number): void => {
+  registeredInstallTestNames.add(name);
+  const tier = process.env.ELANOUS_INSTALL_TEST_TIER === 'deterministic' ? 'deterministic' : 'nightly';
+  if (shouldRunInstallTest(name, tier)) bunTest(name, fn, timeout);
+  else bunTest.skip(name, fn, timeout);
+};
 
 const repoRoot = resolve(import.meta.dir, '..');
 const installer = resolve(import.meta.dir, 'install.sh');
 const packageJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as { version: string; bin: Record<string, string> };
 const fixtures: string[] = [];
+
+function packageFixture(destination: string, version = packageJson.version): string {
+  return createPackageFixture(destination, version);
+}
 
 afterEach(() => { for (const fixture of fixtures.splice(0)) rmSync(fixture, { recursive: true, force: true }); }, 120_000);
 
@@ -33,6 +49,83 @@ function setup(dir = fixture()) {
 }
 
 const hostBunCache = process.env.BUN_INSTALL_CACHE_DIR ?? join(process.env.BUN_INSTALL ?? join(homedir(), '.bun'), 'install', 'cache');
+
+function checkoutVersionName(path: string): string {
+  const env = { ...process.env, PATH: path };
+  const head = spawnSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8', env }).stdout.trim();
+  if (!/^[0-9a-f]{40}$/.test(head)) return packageJson.version;
+  const dirty = spawnSync('git', ['-C', repoRoot, 'status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8', env }).stdout.trim();
+  return `${packageJson.version}-${head.slice(0, 12)}${dirty ? '-dirty' : ''}`;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function fakeBunBin(dir: string, archive: string, installDir: string, options: { relativeExecPath?: boolean } = {}) {
+  const binDir = join(dir, 'fake-bun-bin');
+  mkdirSync(binDir, { recursive: true });
+  const calls = join(dir, 'fake-bun-calls');
+  const envCalls = join(dir, 'fake-bun-env-calls');
+  writeFileSync(calls, '');
+  writeFileSync(envCalls, '');
+  const realBun = process.execPath;
+  const fakeBins = createFakeBins({
+    bunAddContract: {
+      whenArgsStartWith: ['add', '--no-save', '--ignore-scripts'],
+      otherwise: realBun,
+    },
+  });
+  fixtures.push(resolve(fakeBins.dir, '..'));
+  const bin = join(binDir, 'bun');
+  writeFileSync(bin, [
+    '#!/bin/sh',
+    `{ printf '%s\\0' "$PWD" "$@"; printf '\\036'; } >> '${calls}'`,
+    `{ printf '%s\\0' "${'${TMPDIR:-}'}"; } >> '${envCalls}'`,
+    'case "$1 $2" in',
+    '  "pm pack")',
+    '    [ "$3" = "--destination" ] && [ -d "$4" ] || exit 64',
+    '    package_archive="${ELANOUS_INSTALL_TEST_PACKAGE_TGZ:-}"',
+    `    [ -n "$package_archive" ] || package_archive=${shellQuote(archive)}`,
+    '    command -p cp "$package_archive" "$4/package.tgz"',
+    '    exit $? ;;',
+    '  "add --no-save")',
+    '    [ "$3" = "--ignore-scripts" ] || exit 64',
+    '    case "$4" in --offline) [ "$#" -eq 5 ] || exit 64; package="$5" ;; *) [ "$#" -eq 4 ] || exit 64; package="$4" ;; esac',
+    '    [ "$PWD" = "$ELANOUS_INSTALL_TEST_EXPECTED_CWD" ] || exit 65',
+    '    case "$PWD" in "$ELANOUS_INSTALL_PREFIX"/versions/*) ;; *) exit 65 ;; esac',
+    '    [ -f "$package" ] || exit 66',
+    `    ${shellQuote(fakeBins.bin('bunAddContract'))} "$@" || exit $?`,
+    '    command -p rm -rf "$PWD/node_modules/elanous"',
+    '    command -p mkdir -p "$PWD/node_modules" || exit 67',
+    '    command -p tar -xzf "$package" -C "$PWD/node_modules" || exit 67',
+    '    [ -f "$PWD/node_modules/package/package.json" ] || exit 68',
+    '    command -p mv "$PWD/node_modules/package" "$PWD/node_modules/elanous" || exit 69',
+    '    exit 0 ;;',
+    'esac',
+    ...(options.relativeExecPath ? [
+      'if [ "$1" = "-e" ] && [ "$2" = "process.stdout.write(process.execPath)" ]; then printf relative-bun; exit 0; fi',
+    ] : []),
+    `exec '${realBun}' "$@"`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { bin: binDir, calls, envCalls, fakeBins, cleanup: fakeBins.cleanup };
+}
+
+function parsedFakeBunCalls(file: string): string[][] {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, 'utf8').split('\x1e').slice(0, -1).map((line) => line.split('\0').slice(0, -1));
+}
+
+function realBunFromPath(path: string): string | undefined {
+  for (const dir of path.split(':').filter(Boolean)) {
+    const candidate = join(dir, 'bun');
+    if (!existsSync(candidate)) continue;
+    // 출처: .rules/30-harness/testing-gates.md — Accept the Bun executable only when its resolved path is this runtime.
+    try { if (realpathSync(candidate) === process.execPath) return process.execPath; } catch { /* stale PATH entry */ }
+  }
+  return undefined;
+}
 
 /** The host PATH minus any directory that already holds an `eln` — the installer (rightly) refuses to create its own
  *  `eln` when another one is on PATH, so a developer machine with elanous installed would otherwise fail these tests. */
@@ -84,19 +177,64 @@ function isolatedDoctorBin(env: ReturnType<typeof setup>): string {
   return bin;
 }
 
-function run(args: string[], env: ReturnType<typeof setup> = setup(), path = hostPathWithoutEln(), cwd = repoRoot, extra: Record<string, string> = {}) {
+function run(args: string[], env: ReturnType<typeof setup> = setup(), path = hostPathWithoutEln(), cwd = repoRoot, extra: Record<string, string> = {}, shellCommand?: string) {
   // Existing installer behavior tests consent to the install explicitly; refusal is covered separately.
   const refusingConsent = extra.ELANOUS_INSTALL_ANSWER?.toLowerCase() === 'n';
   const effectiveArgs = args.includes('--help') || refusingConsent ? args : ['--yes', ...args];
   const doctorBin = isolatedDoctorBin(env);
-  const result = spawnSync('/bin/bash', [installer, ...effectiveArgs], {
+  const testRealInstaller = extra.ELANOUS_INSTALL_TEST_REAL === '1';
+  const testCustomBun = extra.ELANOUS_INSTALL_TEST_CUSTOM_BUN === '1';
+  const runtimeExtra = { ...extra };
+  delete runtimeExtra.ELANOUS_INSTALL_TEST_REAL;
+  delete runtimeExtra.ELANOUS_INSTALL_TEST_CUSTOM_BUN;
+  const source = args.includes('--source') ? args[args.indexOf('--source') + 1] : undefined;
+  const version = packageVersionFromSource(source, packageJson.version);
+  const fakeMode = shellCommand === undefined && !testRealInstaller && !refusingConsent && !args.includes('--help')
+    && (testCustomBun || realBunFromPath(path) !== undefined);
+  let versionDir: string | undefined;
+  let installPrefix: string | undefined;
+  let installDir: string | undefined;
+  let packageArchive: string | undefined;
+  let bunShim: ReturnType<typeof fakeBunBin> | undefined;
+  if (fakeMode) {
+    versionDir = source ? version : checkoutVersionName(path);
+    const prefixArg = args.indexOf('--prefix');
+    installPrefix = prefixArg >= 0 ? resolve(cwd, args[prefixArg + 1] ?? env.prefix) : env.prefix;
+    installDir = join(installPrefix, 'versions', versionDir);
+    packageArchive = runtimeExtra.ELANOUS_INSTALL_TEST_PACKAGE_TGZ ?? packageFixture(fixture(), version);
+    runtimeExtra.ELANOUS_INSTALL_TEST_EXPECTED_CWD = installDir;
+    if (!testCustomBun) {
+      bunShim = fakeBunBin(env.dir, packageArchive, installDir);
+      path = `${bunShim.bin}:${path}`;
+    } else {
+      runtimeExtra.ELANOUS_INSTALL_TEST_PACKAGE_TGZ = packageArchive;
+    }
+  }
+  const result = spawnSync('/bin/bash', shellCommand === undefined ? [installer, ...effectiveArgs] : ['-c', shellCommand], {
     cwd,
     encoding: 'utf8',
     // BUN_INSTALL points at the isolated home: install.sh prepends `${BUN_INSTALL}/bin`, and the host's (~/.bun) may hold an eln.
     // The package cache stays the host's — the offline install path depends on it.
-    env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), BUN_INSTALL: join(env.home, '.bun'), BUN_INSTALL_CACHE_DIR: hostBunCache, ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, PATH: path, ELANOUS_INSTALL_LANG: 'en', ...extra, NODE_ENV: 'test', ELANOUS_TEST_BIN_PATH_CANDIDATES: doctorBin },
+    env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), BUN_INSTALL: join(env.home, '.bun'), BUN_INSTALL_CACHE_DIR: hostBunCache, ELANOUS_INSTALL_PREFIX: installPrefix ?? env.prefix, ELANOUS_SHELL_STARTUP: env.startup, PATH: path, ELANOUS_INSTALL_LANG: 'en', ...runtimeExtra, NODE_ENV: 'test', ELANOUS_TEST_BIN_PATH_CANDIDATES: doctorBin },
   });
-  return { ...env, result };
+  const fakeBunCalls = bunShim ? parsedFakeBunCalls(bunShim.calls) : [];
+  const fakeBunEnvCalls = bunShim && existsSync(bunShim.envCalls)
+    ? readFileSync(bunShim.envCalls, 'utf8').split('\0').filter(Boolean)
+    : [];
+  const fakeBinCalls = bunShim?.fakeBins.calls() ?? [];
+  if (bunShim && result.status === 0 && !args.includes('--help')) {
+    const addCall = fakeBunCalls.find((call) => call[1] === 'add');
+    const contractCall = fakeBinCalls.find((call) => call.name === 'bunAddContract');
+    expect(addCall).toBeDefined();
+    expect(addCall?.[0]).toBe(installDir!);
+    expect(addCall?.slice(1, 4)).toEqual(['add', '--no-save', '--ignore-scripts']);
+    expect(contractCall?.argv).toEqual(addCall?.slice(1));
+    expect(existsSync(join(installDir!, 'node_modules', 'elanous', 'package.json'))).toBe(true);
+    expect(readlinkSync(join(installPrefix!, 'current'))).toBe(`versions/${versionDir}`);
+    expect(readFileSync(join(installPrefix!, 'bin', 'elanous'), 'utf8')).toContain(join(installPrefix!, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs'));
+  }
+  bunShim?.cleanup();
+  return { ...env, result, fakeBunCalls, fakeBunEnvCalls, fakeBinCalls };
 }
 
 function requiredFromCatalog(tier: string): string[] {
@@ -127,19 +265,102 @@ function stubGit(dir: string, name: string, sha: string, porcelain = ''): string
 }
 
 // 이 체크아웃을 깔 때 설치기가 지을 폴더 이름(버전 ⊕ 커밋 12자 ⊕ 필요하면 -dirty).
-function checkoutVersionName(): string {
-  const head = spawnSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
-  const dirty = spawnSync('git', ['-C', repoRoot, 'status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8' }).stdout.trim();
-  return `${packageJson.version}-${head.slice(0, 12)}${dirty ? '-dirty' : ''}`;
+function pack(destination: string): string {
+  return packageFixture(destination);
 }
 
-function pack(destination: string): string {
+function packReal(destination: string): string {
   const packed = spawnSync('bun', ['pm', 'pack', '--destination', destination], { cwd: repoRoot, encoding: 'utf8' });
   expect(packed.status).toBe(0);
   return join(destination, readdirSync(destination).find(file => file.endsWith('.tgz'))!);
 }
 
 describe('scripts/install.sh', () => {
+  test('fake bun add refuses a wrong working directory before recording or installing the package', () => {
+    const env = setup();
+    const versionDir = packageJson.version;
+    const installDir = join(env.prefix, 'versions', versionDir);
+    const archive = packageFixture(fixture(), versionDir);
+    const bunShim = fakeBunBin(env.dir, archive, installDir);
+    const wrongCwd = fixture();
+    const command = [join(bunShim.bin, 'bun'), 'add', '--no-save', '--ignore-scripts', '--offline', archive].map(shellQuote).join(' ');
+    const result = run([], env, process.env.PATH ?? '', wrongCwd,
+      { ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_INSTALL_TEST_EXPECTED_CWD: installDir }, command).result;
+    expect(result.status).toBe(65);
+    expect(bunShim.fakeBins.calls()).toEqual([]);
+    expect(existsSync(join(installDir, 'node_modules', 'elanous', 'package.json'))).toBe(false);
+    bunShim.cleanup();
+  });
+
+  test('fake bun add installs the exact tarball operand', () => {
+    const env = setup();
+    const installDir = join(env.prefix, 'versions', 'selected');
+    const selected = packageFixture(fixture(), '1.2.3-selected');
+    const decoy = packageFixture(fixture(), '9.8.7-decoy');
+    mkdirSync(installDir, { recursive: true });
+    const bunShim = fakeBunBin(env.dir, decoy, installDir);
+    const command = [join(bunShim.bin, 'bun'), 'add', '--no-save', '--ignore-scripts', '--offline', selected].map(shellQuote).join(' ');
+    const result = run([], env, process.env.PATH ?? '', installDir,
+      { ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_INSTALL_TEST_EXPECTED_CWD: installDir }, command).result;
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(join(installDir, 'node_modules', 'elanous', 'package.json'), 'utf8')).version)
+      .toBe('1.2.3-selected');
+    expect(bunShim.fakeBins.calls().find(call => call.name === 'bunAddContract')?.argv)
+      .toEqual(['add', '--no-save', '--ignore-scripts', '--offline', selected]);
+    bunShim.cleanup();
+  });
+
+  test('documented one-line installer validates the download and keeps curl failures non-zero', () => {
+    const docs = readFileSync(join(repoRoot, 'release/public/docs/install.md'), 'utf8');
+    const commandBlock = docs.match(/## One line\s+```bash\n([\s\S]*?)\n```/);
+    expect(commandBlock, 'one-line install command is documented').not.toBeNull();
+    const command = commandBlock?.[1];
+    expect(command).toContain('curl -fsSL');
+    expect(command).toContain('test -s "$tmp"');
+    expect(command).toContain('bash -n "$tmp"');
+    expect(command).toContain('bash "$tmp" --yes');
+
+    const env = setup();
+    const fakeBin = join(env.dir, 'fake-bin');
+    const bashCalls = join(env.dir, 'bash-calls.log');
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(join(fakeBin, 'curl'), `#!/bin/sh
+out=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-o' ]; then out="$2"; shift 2; else shift; fi
+done
+if [ "$CURL_MODE" = 'fail' ]; then exit 22; fi
+if [ "$CURL_MODE" = 'invalid' ]; then printf '%s\\n' 'if then' > "$out"; exit 0; fi
+if [ "$CURL_MODE" = 'installer-fail' ]; then printf '%s\\n' '#!/bin/bash' 'exit 7' > "$out"; else printf '%s\\n' '#!/bin/bash' 'exit 0' > "$out"; fi
+`, { mode: 0o755 });
+    writeFileSync(join(fakeBin, 'bash'), `#!/bin/sh
+if [ "$1" = '-n' ]; then exec /bin/bash "$@"; fi
+printf '%s\\n' "$*" >> "$BASH_CALL_LOG"
+exec /bin/bash "$@"
+`, { mode: 0o755 });
+
+    const path = [fakeBin, hostPathWithoutEln()].join(':');
+    const runCommand = (mode: string) => run([], env, path, repoRoot, { CURL_MODE: mode, BASH_CALL_LOG: bashCalls }, command!).result;
+    const failedDownload = runCommand('fail');
+    expect(failedDownload.status).toBe(22);
+    expect(existsSync(bashCalls)).toBe(false);
+
+    const invalidScript = runCommand('invalid');
+    expect(invalidScript.status).toBe(2);
+    expect(existsSync(bashCalls)).toBe(false);
+
+    const successfulDownload = runCommand('success');
+    expect(successfulDownload.status).toBe(0);
+    const calls = readFileSync(bashCalls, 'utf8').trim().split('\n');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatch(/^\/.* --yes$/);
+
+    rmSync(bashCalls);
+    const installerFailure = runCommand('installer-fail');
+    expect(installerFailure.status).toBe(7);
+    expect(readFileSync(bashCalls, 'utf8')).toMatch(/--yes\n$/);
+  });
+
   test('only an otherwise-healthy report with explicit sudo denial for git install is non-blocking', () => {
     const healthyGitDenied = { report: { ok: true }, gitInstall: { ran: true, ok: false, permissionDenied: true } };
     expect(isUnprivilegedGitRepairOnlyFailure(healthyGitDenied)).toBe(true);
@@ -152,7 +373,7 @@ describe('scripts/install.sh', () => {
   });
 
   test('release installer uses the first-run bootstrap command', () => {
-    const packed = pack(fixture());
+    const packed = packReal(fixture());
     const listing = spawnSync('tar', ['-tzf', packed], { encoding: 'utf8' });
     expect(listing.status, listing.stderr).toBe(0);
     expect(readFileSync(installer, 'utf8')).toContain('"$PREFIX/bin/elanous" bootstrap');
@@ -170,7 +391,7 @@ describe('scripts/install.sh', () => {
 
   test('installs a working elanous and records nonempty metadata without leaving its isolated home', () => {
     const env = setup();
-    const { prefix, result } = run(['--no-modify-path'], env);
+    const { prefix, result } = run(['--no-modify-path'], env, undefined, undefined, { ELANOUS_INSTALL_TEST_REAL: '1' });
     expect(result.status, result.stderr).toBe(0);
     const elanous = join(prefix, 'bin', 'elanous');
     expect(existsSync(elanous)).toBe(true);
@@ -213,7 +434,7 @@ describe('scripts/install.sh', () => {
     const foreign = join(pathDir, 'eln');
     writeFileSync(foreign, '#!/bin/sh\necho other\n');
     chmodSync(foreign, 0o755);
-    const installed = run(['--no-modify-path'], env, `${pathDir}:${process.env.PATH ?? ''}`);
+    const installed = run(['--no-modify-path'], env, `${pathDir}:${process.env.PATH ?? ''}`, repoRoot, { ELANOUS_INSTALL_TEST_REAL: '1' });
     expect(installed.result.status, installed.result.stderr).toBe(0);
     expect(installed.result.stdout.match(/⚠ eln:/g)).toHaveLength(1);
     expect(installed.result.stdout).toContain('Setup: prerequisite repairs completed.');
@@ -228,6 +449,78 @@ describe('scripts/install.sh', () => {
     expect(result.status, result.stderr).toBe(0);
     expect(readFileSync(join(home, '.bashrc'), 'utf8')).toContain('# >>> elanous installer PATH >>>');
     expect(readFileSync(join(home, '.profile'), 'utf8')).toContain('# >>> elanous installer PATH >>>');
+  }, 120_000);
+
+  test('bashrc PATH block runs before the default non-interactive early return and installed CLI uses simCli', async () => {
+    const env = setup();
+    writeFileSync(env.startup, '# user settings\ncase $- in\n  *i*) ;;\n  *) return;;\nesac\nexport KEEP=1\n');
+    const installed = run([], env, process.env.PATH ?? '', repoRoot, { ELANOUS_SHELL_STARTUP: '', SHELL: '/bin/bash' });
+    expect(installed.result.status, installed.result.stderr).toBe(0);
+    const bashrc = readFileSync(env.startup, 'utf8');
+    expect(bashrc.indexOf('# >>> elanous installer PATH >>>')).toBeLessThan(bashrc.indexOf('case $- in'));
+    const remote = await simCli(['help'], {
+      mode: 'spawn',
+      entrypoint: join(env.prefix, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs'),
+      allowPaths: [['help']],
+      cwd: repoRoot,
+      stateRoot: join(env.dir, 'cli-state'),
+      configRoot: join(env.home, '.elanous'),
+      injectTestFlag: false,
+      env: { HOME: env.home, PATH: '/usr/bin:/bin', XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache') },
+    });
+    expect(remote.exitCode, remote.stderr).toBe(0);
+  }, 120_000);
+
+  test('failed PATH block validation leaves the existing startup file and permissions intact', () => {
+    const env = setup();
+    const original = '# user settings\n# >>> elanous installer PATH >>>\nexport KEEP=1\n';
+    writeFileSync(env.startup, original, { mode: 0o640 });
+    chmodSync(env.startup, 0o640);
+    const installed = run([], env, hostPathWithoutEln(), repoRoot, { ELANOUS_SHELL_STARTUP: '', SHELL: '/bin/bash' });
+    expect(installed.result.status).not.toBe(0);
+    expect(installed.result.stderr).toContain('PATH block');
+    expect(readFileSync(env.startup, 'utf8')).toBe(original);
+    expect(statSync(env.startup).mode & 0o777).toBe(0o640);
+  }, 120_000);
+
+  test('refuses a symlinked shell startup file without replacing its link or target', () => {
+    const env = setup();
+    const target = join(env.dir, 'dotfiles-bashrc');
+    const original = '# managed by dotfiles\nexport KEEP=1\n';
+    rmSync(env.startup);
+    writeFileSync(target, original, { mode: 0o640 });
+    chmodSync(target, 0o640);
+    symlinkSync(target, env.startup);
+
+    const installed = run([], env, hostPathWithoutEln(), repoRoot, { ELANOUS_SHELL_STARTUP: '', SHELL: '/bin/bash' });
+    expect(installed.result.status).not.toBe(0);
+    expect(installed.result.stderr).toContain('refusing to update PATH in symlinked shell startup file');
+    expect(readlinkSync(env.startup)).toBe(target);
+    expect(readFileSync(target, 'utf8')).toBe(original);
+    expect(statSync(target).mode & 0o777).toBe(0o640);
+  }, 120_000);
+
+  test('split TMPDIR is moved beside the Bun cache before installer temp files are created', () => {
+    const env = setup();
+    const fakeBin = join(env.dir, 'fake-stat-bin');
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(join(fakeBin, 'stat'), `#!/bin/sh
+if [ "$1" = '-c' ] && [ "$2" = '%d' ]; then
+  case "$3" in
+    "$TMPDIR") printf '101\\n'; exit 0 ;;
+    */install/cache|*/install/cache/elanous-tmp) printf '202\\n'; exit 0 ;;
+  esac
+fi
+exec /usr/bin/stat "$@"
+`, { mode: 0o755 });
+    const cache = hostBunCache;
+    const tempAlongsideCache = join(cache, 'elanous-tmp');
+    const path = `${fakeBin}:${hostPathWithoutEln()}`;
+    const installed = run(['--no-modify-path'], env, path, repoRoot, { TMPDIR: env.dir });
+    expect(installed.result.status, installed.result.stderr).toBe(0);
+    expect(installed.result.stderr).toContain('Adjusted installer temp directory to match the Bun cache filesystem.');
+    expect(existsSync(tempAlongsideCache)).toBe(true);
+    expect(installed.fakeBunEnvCalls).toContain(tempAlongsideCache);
   }, 120_000);
 
   test('a non-interactive SSH bash command finds the installed binary after repeat install without changing other startup files', () => {
@@ -254,7 +547,8 @@ describe('scripts/install.sh', () => {
 
     const bashrc = readFileSync(join(env.home, '.bashrc'), 'utf8');
     const profile = readFileSync(join(env.home, '.profile'), 'utf8');
-    expect(bashrc).toStartWith('export KEEP=1\nexport KEEP_BASH=2\n');
+    expect(bashrc.indexOf('# >>> elanous installer PATH >>>')).toBeLessThan(bashrc.indexOf('export KEEP=1'));
+    expect(bashrc).toContain('export KEEP=1\nexport KEEP_BASH=2\n');
     expect(profile).toStartWith('export KEEP_PROFILE=1\nexport PROFILE_MARKER=2\n');
     expect(readFileSync(bashProfile, 'utf8')).toBe('export KEEP_BASH_PROFILE=1\n');
     expect(bashrc.match(/^# >>> elanous installer PATH >>>$/gm)).toHaveLength(1);
@@ -311,18 +605,29 @@ describe('scripts/install.sh', () => {
     const git = join(path, 'git');
     writeFileSync(git, '#!/bin/sh\nexit 0\n');
     chmodSync(git, 0o755);
-    const bun = join(path, 'bun');
-    writeFileSync(bun, '#!/bin/sh\nprintf relative-bun\n');
-    chmodSync(bun, 0o755);
-    const { result } = run(['--no-modify-path', '--no-bootstrap-bun'], env, `${path}:/usr/bin:/bin`);
+    const pathWithGit = `${path}:/usr/bin:/bin`;
+    const versionDir = checkoutVersionName(pathWithGit);
+    const archive = packageFixture(fixture());
+    const bunShim = fakeBunBin(env.dir, archive, join(env.prefix, 'versions', versionDir), { relativeExecPath: true });
+    const { result } = run(['--no-modify-path', '--no-bootstrap-bun'], env, `${bunShim.bin}:${pathWithGit}`, repoRoot, {
+      ELANOUS_INSTALL_TEST_CUSTOM_BUN: '1', ELANOUS_INSTALL_TEST_PACKAGE_TGZ: archive, BUN_INSTALL: join(env.home, '.bun'),
+    });
     // 폴백(`command -v bun`)이 절대 경로를 준다 ⇒ «절대 경로 없음»으로 거부하지 않는다(옛 동작 · BUN_INSTALL 재사용 시험과 같은 축).
     expect(result.stderr).not.toContain('bun executable absolute path is unavailable');
+    expect(result.status).toBe(0);
+    const addCall = parsedFakeBunCalls(bunShim.calls).find((call) => call[1] === 'add');
+    expect(addCall?.[0]).toBe(join(env.prefix, 'versions', versionDir));
+    expect(bunShim.fakeBins.calls().find((call) => call.name === 'bunAddContract')?.argv).toEqual(addCall?.slice(1));
+    const current = readlinkSync(join(env.prefix, 'current'));
+    expect(current.startsWith('versions/')).toBe(true);
+    expect(existsSync(join(env.prefix, current, 'node_modules', 'elanous', 'package.json'))).toBe(true);
     const wrapper = join(env.prefix, 'bin', 'elanous');
     if (existsSync(wrapper)) {
       const text = readFileSync(wrapper, 'utf8');
-      expect(text).toContain(bun);
+      expect(text).toContain(join(bunShim.bin, 'bun'));
       expect(text).not.toContain('relative-bun');
     }
+    bunShim.cleanup();
   });
 
   test('the installed wrapper reports one line when its pinned bun is missing', () => {
@@ -343,8 +648,8 @@ describe('scripts/install.sh', () => {
 
   test('preserves the first installation startup file across a real reinstallation', () => {
     const env = setup();
-    const first = run([], env);
-    const second = run([], env);
+    const first = run([], env, undefined, undefined, { ELANOUS_INSTALL_TEST_REAL: '1' });
+    const second = run([], env, undefined, undefined, { ELANOUS_INSTALL_TEST_REAL: '1' });
     expect(first.result.status, `${first.result.stderr}\n${first.result.stdout}`).toBe(0);
     expect(second.result.status).toBe(0);
     const startup = readFileSync(env.startup, 'utf8');
@@ -447,28 +752,43 @@ describe('scripts/install.sh', () => {
     }
   });
 
-  test('npm-pack installer succeeds without Git or native build tools, then non-interactive setup works', () => {
-    const packed = pack(fixture());
+  test('npm-pack installer succeeds without Git or native build tools, then non-interactive setup works', async () => {
+    // Use the package that ships to users so `setup` exercises the installed CLI entry point,
+    // not the fake CLI used by the installer-only fixture tests.
+    const packed = packReal(fixture());
     const env = setup();
     const missingTools = ['git', 'python', 'python3', 'make', 'g++', 'gcc', 'cc'];
     const path = pathWithoutCommands(missingTools);
     expectCommandsMissing(missingTools, path);
-    const installed = run(['--source', packed, '--no-modify-path', '--no-setup'], env, path, repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0' });
+    const installed = run(['--source', packed, '--no-modify-path', '--no-setup'], env, path, repoRoot,
+      { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_TEST_REAL: '1' });
     expect(installed.result.status, installed.result.stderr).toBe(0);
     expect(installed.result.stdout).toContain('Installed elanous');
     expect(installed.result.stderr).not.toContain('required command missing: git');
     expect(installed.result.stderr).toContain('The Bun TUI needs no system Node.js, Python, or compiler.');
     // The npm-pack install must not run optional native build scripts or require Git/compiler tools for the core TUI.
 
-    const setupReport = spawnSync(join(env.prefix, 'bin', 'elanous'), ['setup', '--non-interactive'], {
-      encoding: 'utf8', env: { ...process.env, HOME: env.home, PATH: path, ELANOUS_CONFIG_DIR: join(env.home, '.elanous'), ELANOUS_STATE_DIR: join(env.home, '.elanous') },
+    const setupReport = await simCli(['setup', '--non-interactive'], {
+      mode: 'spawn',
+      entrypoint: join(env.prefix, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs'),
+      allowPaths: [['setup']],
+      cwd: repoRoot,
+      stateRoot: join(env.dir, 'setup-state'),
+      configRoot: join(env.home, '.elanous'),
+      injectTestFlag: false,
+      env: { HOME: env.home, PATH: path, NODE_ENV: 'test' },
     });
-    expect(setupReport.status, setupReport.stderr).toBe(0);
+    expect(setupReport.exitCode, setupReport.stderr).toBe(0);
     expect(setupReport.stdout).toContain('Setup: external command check');
+    expect(setupReport.stdout).toContain('Setup: LLM credential steps');
+    expect(setupReport.stdout).toContain('Non-interactive: no questions were asked and no configuration was written.');
+    expect(setupReport.stdout).toContain('External commands:');
+    expect(setupReport.stdout).toContain('build-toolchain: manual');
+    expect(existsSync(join(env.home, '.elanous', 'config.json'))).toBe(false);
   }, 180_000);
 
   test('Bun global install of an npm-pack tarball starts the core setup', () => {
-    const packed = pack(fixture());
+    const packed = packReal(fixture());
     const env = setup();
     const bunInstall = join(env.home, '.bun');
     const missingTools = ['git', 'python', 'python3', 'make', 'g++', 'gcc', 'cc'];
@@ -916,7 +1236,7 @@ describe('scripts/install.sh', () => {
     const first = run(['--no-modify-path'], env);
     expect(first.result.status, first.result.stderr).toBe(0);
     const prefix = realpathSync(env.prefix);
-    const firstDir = checkoutVersionName();
+    const firstDir = checkoutVersionName(hostPathWithoutEln());
     expect(readlinkSync(join(prefix, 'current'))).toBe(`versions/${firstDir}`);
     const elanous = join(prefix, 'bin', 'elanous');
     expect(lstatSync(elanous).isFile()).toBe(true);
@@ -1003,11 +1323,15 @@ describe('scripts/install.sh', () => {
     const copied = join(lonely, 'install.sh');
     copyFileSync(installer, copied);
     const env = setup();
+    const archive = packageFixture(fixture());
+    const installDir = join(env.prefix, 'versions', packageJson.version);
+    const bunShim = fakeBunBin(env.dir, archive, installDir);
     const doctorBin = isolatedDoctorBin(env);
     const result = spawnSync('/bin/bash', [copied, '--yes', '--no-modify-path'], {
       cwd: lonely, encoding: 'utf8',
-      env: { ...process.env, HOME: env.home, ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: `file://${release}`, ELANOUS_VERSION: '', ...extra, NODE_ENV: 'test', ELANOUS_TEST_BIN_PATH_CANDIDATES: doctorBin },
+      env: { ...process.env, HOME: env.home, PATH: `${bunShim.bin}:${process.env.PATH ?? ''}`, ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_INSTALL_TEST_EXPECTED_CWD: installDir, ELANOUS_SHELL_STARTUP: env.startup, ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: `file://${release}`, ELANOUS_VERSION: '', ...extra, NODE_ENV: 'test', ELANOUS_TEST_BIN_PATH_CANDIDATES: doctorBin },
     });
+    bunShim.cleanup();
     return { ...env, result };
   }
 
@@ -1202,16 +1526,41 @@ describe('INST2 — finish in the same window', () => {
     const realBun = spawnSync('/bin/bash', ['-c', 'command -v bun'], { encoding: 'utf8' }).stdout.trim();
     const shim = join(env.dir, 'shim');
     mkdirSync(shim);
+    const archive = packageFixture(fixture());
     // offline add fails (cache miss) · registry add prints the noise and then really installs.
     const calls = join(env.dir, 'bun-add-calls');
-    writeFileSync(join(shim, 'bun'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\ncase "$*" in\n  *"add --no-save --ignore-scripts --offline"*) exit 1 ;;\n  *"add --no-save --ignore-scripts "*) echo "Blocked 3 postinstalls. Run \\\`bun pm untrusted\\\` for details."; exec '${realBun}' "$@" --offline ;;\nesac\nexec '${realBun}' "$@"\n`, { mode: 0o755 });
-    const { result } = run(['--no-modify-path', '--no-setup'], env, `${shim}:${process.env.PATH ?? ''}`, repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0' });
+    writeFileSync(join(shim, 'bun'), [
+      '#!/bin/sh',
+      `printf '%s\\n' "$PWD|$*" >> '${calls}'`,
+      'case "$1 $2" in',
+      '  "pm pack") command -p cp "$ELANOUS_INSTALL_TEST_PACKAGE_TGZ" "$4/package.tgz"; exit $? ;;',
+      '  "add --no-save")',
+      '    [ "$3" = "--ignore-scripts" ] || exit 64',
+      '    [ "$4" = "--offline" ] && exit 1',
+      '    package="$4"',
+      '    case "$PWD" in "$ELANOUS_INSTALL_PREFIX"/versions/*) ;; *) exit 65 ;; esac',
+      '    [ -f "$package" ] || exit 66',
+      '    mkdir -p "$PWD/node_modules" || exit 67',
+      '    command -p rm -rf "$PWD/node_modules/package" "$PWD/node_modules/elanous"',
+      '    command -p tar -xzf "$package" -C "$PWD/node_modules" || exit $?',
+      '    [ -f "$PWD/node_modules/package/package.json" ] || exit 68',
+      '    command -p mv "$PWD/node_modules/package" "$PWD/node_modules/elanous" || exit $?',
+      '    echo "Blocked 3 postinstalls. Run `bun pm untrusted` for details."',
+      '    exit 0 ;;',
+      'esac',
+      `exec '${realBun}' "$@"`,
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const { result } = run(['--no-modify-path', '--no-setup'], env, `${shim}:${process.env.PATH ?? ''}`, repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_TEST_CUSTOM_BUN: '1' });
     expect(result.status, result.stderr).toBe(0);
     expect(`${result.stdout}${result.stderr}`).toContain('fetching them from the npm registry');
     expect(`${result.stdout}${result.stderr}`).not.toContain('Blocked 3 postinstalls');
     const addCalls = readFileSync(calls, 'utf8');
     expect(addCalls).toContain('add --no-save --ignore-scripts --offline');
     expect(addCalls).toContain('add --no-save --ignore-scripts ');
+    expect(addCalls).toContain(`${join(env.prefix, 'versions', checkoutVersionName(hostPathWithoutEln()))}|add --no-save --ignore-scripts `);
+    expect(existsSync(join(env.prefix, 'versions', checkoutVersionName(hostPathWithoutEln()), 'node_modules', 'elanous', 'package.json'))).toBe(true);
+    expect(readlinkSync(join(env.prefix, 'current'))).toBe(`versions/${checkoutVersionName(hostPathWithoutEln())}`);
   }, 180_000);
 });
 
@@ -1258,4 +1607,8 @@ describe('INST1 — one language · no silent downgrade · ask before updating',
     expect(ko.result.stdout).not.toContain('Next:');
     expect(ko.result.stdout).not.toMatch(/쓰십시오|않았다 —/);
   }, 180_000);
+});
+
+bunTest('deterministic install smoke tests remain registered', () => {
+  expect(INSTALL_DETERMINISTIC_SMOKE_TESTS.filter((name) => !registeredInstallTestNames.has(name))).toEqual([]);
 });

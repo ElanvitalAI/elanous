@@ -21,10 +21,12 @@
 //    공개는 되돌릴 수 없다(그 판은 영구히 공개 라이선스).
 // ⛔ 공개본은 «원본 매니페스트»(`release/public-export.yaml`)대로만 만든다 — 매매 실행 코드는 그 매니페스트가 이미 뺀다(🅢 #20529).
 import { spawn, spawnSync } from 'node:child_process';
+import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Option, type Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { codeRevision } from '../version/code-revision.js';
@@ -53,18 +55,21 @@ import type { PrereleaseKind } from '../../scripts/release-loop/release-version.
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 import { runReleaseIfReady } from './release-run-if-ready.js';
 import { ReleaseRunClaimConflict, findActiveReleaseRun, readActiveForceReleaseRun, isPidAlive, readReleaseRunLock, withDirectReleaseRunLock, withForceReleaseRunMarker } from './release-single-flight.js';
-import { assertReleaseCliFresh, formatCountdown, formatPreflight, releasePreflight, runReleaseCountdown } from '../../scripts/release-loop/preflight.js';
+import { assertReleaseCliFresh, formatCountdown, formatPreflight, releasePreflight, releaseRunLaunchRefusal, runReleaseCountdown } from '../../scripts/release-loop/preflight.js';
 import { defaultReleaseGraphRunsRoot, formatPublishProposal, measurePublishWindow, proposePublishAt, publishWindowWarning } from '../../scripts/release-loop/publish-window.js';
 import { autoStartScheduledRelease, type AutoStartDeferral } from '../release-loop/auto-start.js';
 import { runRehearsalTick, type RehearsalDeps } from '../release-loop/rehearsal.js';
 import { landingFreezeMessage, LandingFrozenError, readLandingFreeze } from '../release-loop/landing-freeze.js';
-import { gateShardLedgerPath, latestGateShardLedger, readGateShardLedger } from '../release-loop/gate-shard-ledger.js';
+import { appendGateShardLifecycleState, gateShardLedgerPath, latestGateShardLedger, latestGateShardLedgerAttempts, readGateShardLedger } from '../release-loop/gate-shard-ledger.js';
+import { gateShardsPath, mergeGateShardBoardChanges, readGateShards, updateGateShards } from '../release-loop/gate-shards.js';
 import { formatLightRc, runLightRc, type LightRcDeps } from '../release-loop/light-rc.js';
 import { applyWatchList, formatGateHistory, gateHistory, ghMergedPrs } from '../../scripts/release-loop/gate-history.js';
 import { registerRfcCommands } from './rfc-cli.js';
 import { checklistCodenames, checklistVersion, isReleaseVersion, readChecklistContext, registerChecklistReadCommands, type ChecklistEvidenceReader } from './release-checklist-read-cli.js';
 import { syncLinearProgress } from '../decisions/linear-progress-sync.js';
 import { registerReleaseRunStatusCommand } from './release-run-status-cli.js';
+
+export const GATE_SHARD_JSON_PAGE_MAX_BYTES = 60_000;
 
 /** Pin release-run freshness in tests so child CLIs do not observe a moving origin/main ref. */
 export function releaseCliFreshnessCutRevision(explicitCut: string | undefined, env: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -659,12 +664,63 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
   registerReleaseRunStatusCommand(release);
   release.command('gate-shards').description('실행 중에도 읽는 게이트 조각 원장(시도·귀속·증거)')
     .requiredOption('--version <v>', '조회할 판').option('--all', '과거 전이와 재시도까지 조회').option('--json', '결과 JSON')
-    .action((o: { version: string; all?: boolean; json?: boolean }) => {
+    .option('--offset <N>', 'JSON 결과에서 건너뛸 조각 수', '0').option('--limit <N>', 'JSON 한 페이지의 조각 수', '20')
+    .action(async (o: { version: string; all?: boolean; json?: boolean; offset: string; limit: string }) => {
+      const boardPath = gateShardsPath(o.version, releaseRunDeps.ledgerRoot ?? releaseLedgerRoot());
+      const board = readGateShards(boardPath);
+      if (board?.shards.some((shard) => shard.state === 'stop-requested')) {
+        try {
+          const [{ reconcileStaleGateShardBoard }, { defaultKubectl }] = await Promise.all([
+            import('../../scripts/release-loop/gate-runtime.js'),
+            import('../task-orchestrator/surfaces/self-implement-pod.js'),
+          ]);
+          const result = reconcileStaleGateShardBoard({ version: o.version, board: board.shards, kubectl: defaultKubectl });
+          const changed = result.board.some((shard, index) => shard !== board.shards[index]);
+          if (changed) {
+            const ledgerPath = gateShardLedgerPath(o.version, releaseRunDeps.ledgerRoot ?? releaseLedgerRoot());
+            const attemptIds = new Map(board.shards.flatMap((shard) => shard.attemptId ? [[shard.id, shard.attemptId] as const] : []));
+            for (const state of ['done', 'failed', 'timeout'] as const) {
+              const finalized = result.finalized.filter((item) => item.state === state);
+              if (!finalized.length) continue;
+              for (const item of finalized) {
+                const ledgerErrors = appendGateShardLifecycleState(ledgerPath, [item.shard], state, item.endedAt, item.endedAt, attemptIds);
+                for (const error of ledgerErrors) debug.log('release-loop.gate', 'shard-stop-ledger-write-failed', {
+                  runId: board.runId ?? null, version: o.version, shard: item.shard, error,
+                }, { level: 'error' });
+              }
+            }
+            const latest = readGateShardLedger(ledgerPath);
+            const terminalRows = latest ? latestGateShardLedgerAttempts(latest.rows, attemptIds) : new Map();
+            const ledgerConfirmed = new Set(result.finalized.filter((item) => terminalRows.get(item.shard)?.state === item.state).map((item) => item.shard));
+            const confirmedBoard = result.board.map((shard) => result.finalized.some((item) => item.shard === shard.id)
+              && !ledgerConfirmed.has(shard.id) ? board.shards.find((prior) => prior.id === shard.id) ?? shard : shard);
+            if (ledgerConfirmed.size) updateGateShards(boardPath,
+              (current) => mergeGateShardBoardChanges(current, board.shards, confirmedBoard, new Date(), true));
+          } else debug.log('release-loop.gate', 'shard-stop-unmeasured', { runId: board.runId ?? null, version: o.version,
+            pending: board.shards.filter((shard) => shard.state === 'stop-requested').map((shard) => shard.id) }, { level: 'warn' });
+        } catch (error) {
+          debug.log('release-loop.gate', 'shard-stop-reconcile-failed', { runId: board.runId ?? null, version: o.version,
+            error: String(error) }, { level: 'warn' });
+        }
+      }
       const path = gateShardLedgerPath(o.version, releaseRunDeps.ledgerRoot ?? releaseLedgerRoot());
       const ledger = readGateShardLedger(path);
       if (!ledger) throw new CliUserError(`게이트 조각 원장 없음: ${o.version}`, '게이트가 시작되면 다시 조회하세요.');
       const rows = o.all ? ledger.rows : latestGateShardLedger(ledger.rows);
-      if (o.json) console.log(JSON.stringify({ version: o.version, path, malformed: ledger.malformed, rows }));
+      if (o.json) {
+        const offset = Number(o.offset), limit = Number(o.limit);
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+          throw new CliUserError('--offset must be non-negative and --limit must be between 1 and 100.');
+        const maxJsonPageBytes = GATE_SHARD_JSON_PAGE_MAX_BYTES;
+        const base = { version: o.version, path, malformed: ledger.malformed, totalRows: rows.length, offset, limit };
+        let page = rows.slice(offset, offset + limit);
+        const serialize = (items: typeof page) => JSON.stringify({ ...base,
+          returned: items.length, nextOffset: offset + items.length < rows.length ? offset + items.length : null, rows: items });
+        while (page.length > 1 && Buffer.byteLength(serialize(page)) + 1 > maxJsonPageBytes) page = page.slice(0, -1);
+        if (page.length === 1 && Buffer.byteLength(serialize(page)) + 1 > maxJsonPageBytes)
+          throw new CliUserError(`게이트 조각 행 ${offset}이 JSON 페이지 상한 ${maxJsonPageBytes}바이트를 초과합니다.`, '원장 행을 줄이거나 별도 조회 경로를 사용하세요.');
+        await writeStdoutJson(`${serialize(page)}\n`);
+      }
       else {
         console.log(`${o.version} 조각 ${rows.length} · 읽지 못한 행 ${ledger.malformed} · ${path}`);
         for (const row of rows) console.log(`${row.phase}/${row.shardId} ${row.state} ${row.host ?? '?'} rc=${row.rc ?? '?'} ${row.ran ?? '?'}시험 · 실패 ${row.failureIds?.length ?? '?'} · 귀속 ${row.attribution} · ${row.files.length}파일${row.stopReason ? ` · ${row.stopReason}` : ''}`);
@@ -1027,11 +1083,11 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 갱신`);
     });
   withContext(checklist.command('claim <id>').description('칸의 단일 주인을 잡는다'))
-    .requiredOption('--by <owner>', '잡을 자리 또는 하위 자리').option('--force', '기존 주인에서 강제로 바꾼다')
-    .action((id: string, opts: { by: string; force?: boolean }, cmd: Command) => {
+    .requiredOption('--by <owner>', '잡을 자리 또는 하위 자리').option('--force', 'OP 승인으로 기존 주인을 바꾼다').option('--reason <reason>', 'OP 강제 재배정 사유')
+    .action((id: string, opts: { by: string; force?: boolean; reason?: string }, cmd: Command) => {
       const { version, json } = context(cmd);
       if (!mayWrite(cmd)) return;
-      const data = claimItem(version, id, opts.by, { force: opts.force });
+      const data = claimItem(version, id, opts.by, { force: opts.force, reason: opts.reason, actor: process.env.ELANOUS_TRACK || 'cli' });
       if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 주인 ${opts.by}`);
     });
   withContext(checklist.command('rm <id>').description('칸 삭제')).action((id: string, _opts: unknown, cmd: Command) => {
@@ -1184,7 +1240,15 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .action(async (o: { version: string; base?: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => cutReleaseBranch({ ...o, log }), () => true);
     });
-  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
+  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; readinessCountdown?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
+      const launchRefusal = releaseRunLaunchRefusal({ sourcePath: fileURLToPath(import.meta.url) });
+      if (launchRefusal) {
+        debug.log('release.run', 'seat-launch-refused', { seat: process.env.ELANOUS_TRACK ?? null, cwd: process.cwd(), reason: launchRefusal });
+        if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, reason: 'seat-launch-refused', error: launchRefusal })}\n`);
+        else console.error(`⛔ ${launchRefusal}`);
+        process.exitCode = 1;
+        return false;
+      }
       // Only the rc rehearsal channel is operated for now (alpha/beta stay valid version shapes, not run options).
       if (o.prerelease !== undefined && o.prerelease !== 'rc') {
         const message = `--prerelease supports rc only: ${o.prerelease}`;
@@ -1219,10 +1283,10 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         }
       }
       const ledgerRoot = releaseRunDeps.ledgerRoot ?? releaseLedgerRoot();
-      if (!o.dryRun && !o.forceNew) {
+      if (!o.dryRun) {
         const active = findActiveReleaseRun(o.version, ledgerRoot) ?? readActiveForceReleaseRun(o.version, ledgerRoot);
         if (active) {
-          const error = `release run already running: ${o.version} runId=${active.runId} pid=${active.pid} startedAt=${active.startedAt} (--force-new to bypass)`;
+          const error = `release run already running: ${o.version} runId=${active.runId} pid=${active.pid} startedAt=${active.startedAt}`;
           debug.log('release.run', 'already-running', { version: o.version, ...active });
           if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, reason: 'already-running', error, ...active })}\n`);
           else console.error(`⛔ ${error}`);
@@ -1262,14 +1326,15 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           const outcome = await runReleaseIfReady(o.version, {
             ledgerRoot: releaseRunDeps.ledgerRoot,
             forceNew: o.forceNew,
-            readiness: (version, options) => releaseReadiness(version, { ledgerRoot: releaseRunDeps.ledgerRoot, checklist: releaseRunDeps.checklist, ...options }),
+            readiness: (version, options) => releaseReadiness(version, { ledgerRoot: releaseRunDeps.ledgerRoot, checklist: releaseRunDeps.checklist,
+              allowBeforeCut: o.readinessCountdown, ...options }),
             run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps),
           });
           if (outcome.skipped) {
             if (outcome.reason === 'already-running') {
               const active = findActiveReleaseRun(o.version, ledgerRoot) ?? readActiveForceReleaseRun(o.version, ledgerRoot);
               const lock = readReleaseRunLock(o.version, ledgerRoot);
-              const error = `release run already running: ${o.version} runId=${active?.runId ?? 'pending'} pid=${active?.pid ?? lock?.pid ?? 'unknown'} startedAt=${active?.startedAt ?? lock?.startedAt ?? 'unknown'} (--force-new to bypass)`;
+              const error = `release run already running: ${o.version} runId=${active?.runId ?? 'pending'} pid=${active?.pid ?? lock?.pid ?? 'unknown'} startedAt=${active?.startedAt ?? lock?.startedAt ?? 'unknown'}`;
               if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, reason: 'already-running', error, ...(active ?? {}) })}\n`);
               else console.error(`⛔ ${error}`);
               process.exitCode = 1;
@@ -1312,7 +1377,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
           if (!(error instanceof ReleaseRunClaimConflict)) throw error;
           const active = findActiveReleaseRun(o.version, ledgerRoot) ?? readActiveForceReleaseRun(o.version, ledgerRoot);
           const lock = readReleaseRunLock(o.version, ledgerRoot);
-          throw new Error(`release run already running: ${o.version} runId=${active?.runId ?? 'pending'} pid=${active?.pid ?? lock?.pid ?? 'unknown'} startedAt=${active?.startedAt ?? lock?.startedAt ?? 'unknown'} (--force-new to bypass)`);
+          throw new Error(`release run already running: ${o.version} runId=${active?.runId ?? 'pending'} pid=${active?.pid ?? lock?.pid ?? 'unknown'} startedAt=${active?.startedAt ?? lock?.startedAt ?? 'unknown'}`);
         }
         log(`${result.dryRun ? '· 드라이런' : '▶ 릴리스 루프'} ${result.input.version} · 입력 ${JSON.stringify(result.input)}`);
         return result;
@@ -1343,13 +1408,14 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .action(async (o: { version: string; publishAt?: string; countdown?: boolean; allowSideEffects?: boolean; json?: boolean }) => {
       try {
         if (o.countdown) {
-          const countdown = await runReleaseCountdown(o.version, { publishAt: o.publishAt, releaseRunDeps, allowSideEffects: o.allowSideEffects });
+          const countdown = await runReleaseCountdown(o.version, { publishAt: o.publishAt, releaseRunDeps, allowSideEffects: o.allowSideEffects,
+            sourcePath: fileURLToPath(import.meta.url) });
           if (o.json) await writeStdoutJson(`${JSON.stringify(countdown)}\n`);
           else for (const line of formatCountdown(countdown)) console.log(line);
           if (countdown.verdict === 'block') process.exitCode = 1;
           return;
         }
-        const result = await releasePreflight(o.version, { publishAt: o.publishAt, releaseRunDeps });
+        const result = await releasePreflight(o.version, { publishAt: o.publishAt, releaseRunDeps, sourcePath: fileURLToPath(import.meta.url) });
         if (o.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
         else for (const line of formatPreflight(result)) console.log(line);
         if (result.blockers > 0) process.exitCode = 1;
@@ -1618,8 +1684,8 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       });
     });
   release.command('auto-start')
-    .description('판 일정의 컷 창에서 릴리스 시작을 미리 본다 · --apply 로 release run --if-ready 실행')
-    .option('--window-minutes <n>', '컷 뒤 선택 창(분)', '15')
+    .description('컷 전 준비태세를 미리 점검하고 GO 때 릴리스 시작 · --apply 로 release run --if-ready 실행')
+    .option('--window-minutes <n>', '컷 전 준비태세 점검 창(분)', '15')
     .option('--apply', '선택한 판을 release run --if-ready 로 시작')
     .option('--json', '결과 한 줄 JSON(stdout)')
     .action(async (o: { windowMinutes: string; apply?: boolean; json?: boolean }) => {
@@ -1635,9 +1701,9 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         };
         const result = await autoStartScheduledRelease({
           windowMinutes: Number(o.windowMinutes), apply: o.apply, ledgerRoot: scheduleLedgerRoot(), activeRun,
-          readiness: (version, ledgerRoot, now) => releaseReadiness(version, { ledgerRoot, now: () => now, checklist: releaseRunDeps.checklist }),
+          readiness: (version, ledgerRoot, now) => releaseReadiness(version, { ledgerRoot, now: () => now, checklist: releaseRunDeps.checklist, allowBeforeCut: true }),
           launch: async (version, launchOptions) => {
-            const ran = await runAction({ version, ifReady: true, publishAt: launchOptions?.publishAt, json: false }, log);
+            const ran = await runAction({ version, ifReady: true, readinessCountdown: true, publishAt: launchOptions?.publishAt, json: false }, log);
             if (ran && typeof ran === 'object' && ran.deferred) return ran;
             // A run that appeared between readiness and launch is the same refusal, with its identity.
             if (ran === false && activeRun(version, scheduleLedgerRoot())) return { deferred: true, reason: 'already-running' };

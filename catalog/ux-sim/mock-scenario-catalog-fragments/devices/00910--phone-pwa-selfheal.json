@@ -1,0 +1,35 @@
+{
+  "id": "phone-pwa-selfheal",
+  "name": "Phone PWA clipped-button self-heal rehearsal",
+  "checklistCells": ["DEMO-1114-PHONE-PWA-SELFHEAL"],
+  "implementation": [
+    "src/ux-sim/phone-pwa-selfheal.ts",
+    "scripts/replay-phone-pwa-selfheal-trace.ts",
+    "scenarios/ux-sim/fixtures/phone-pwa-selfheal-broken.html",
+    "scenarios/ux-sim/phone-pwa-selfheal-trace.json"
+  ],
+  "tests": [
+    "src/ux-sim/phone-pwa-selfheal.test.ts"
+  ],
+  "target": "Rehearse a Fold-sized PWA CTA clipping diagnosis, responsive CSS repair, and re-observation without a browser, adb device, or external network",
+  "inputs": [
+    "intentionally broken PWA fixture with min-width: 476px",
+    "fake Fold CSS viewport width 360px",
+    "auto-repair enabled or blocked"
+  ],
+  "observations": [
+    "before-repair CTA right edge is 460px, outside the 360px viewport",
+    "responsive repair removes the minimum width and wraps the action row",
+    "after-repair CTA right edge is 344px and the verdict is visible",
+    "the graph trace orders phone-observe, viewport-judge, responsive-repair, and phone-reobserve",
+    "without the repair node the scenario remains blocked and does not report green",
+    "the fallback trace labels itself simulator-only and makes no live-device claim"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/phone-pwa-selfheal.test.ts",
+    "bun scripts/replay-phone-pwa-selfheal-trace.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

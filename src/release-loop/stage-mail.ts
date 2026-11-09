@@ -61,7 +61,7 @@ export function startReleaseStageStallWatch(input: Omit<ReleaseStageMailInput, '
   schedule?: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout>;
   cancel?: (timer: ReturnType<typeof setTimeout>) => void;
 }): () => void {
-  const schedule = deps.schedule ?? setTimeout;
+  const schedule: (callback: () => void, delayMs: number) => ReturnType<typeof setTimeout> = deps.schedule ?? setTimeout;
   const cancel = deps.cancel ?? clearTimeout;
   let stopped = false;
   const log = deps.log ?? ((event: string, data: Record<string, unknown>) => debug.log('release-loop.stage-mail', event, data, { level: 'warn' }));

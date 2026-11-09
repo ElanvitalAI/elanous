@@ -2,11 +2,11 @@ import { RUNTIME_SCC_BOUNDARY_ROOTS, runtimeSccBoundaryGraph } from './helpers/r
 import { expect, test } from 'bun:test';
 
 test('session ID components do not share a non-trivial runtime SCC in the current worktree', () => {
-  const graph = runtimeSccBoundaryGraph();
   const members = [
     'apps/pwa/src/components/chat/SessionIdChip.tsx',
     'apps/pwa/src/components/chat/SessionPill.tsx',
   ];
+  const graph = runtimeSccBoundaryGraph(members);
   for (const member of members) expect(RUNTIME_SCC_BOUNDARY_ROOTS.has(member), `${member} is a graph root`).toBe(true);
   for (const member of members) expect(graph.tracked.has(member), member).toBe(true);
 

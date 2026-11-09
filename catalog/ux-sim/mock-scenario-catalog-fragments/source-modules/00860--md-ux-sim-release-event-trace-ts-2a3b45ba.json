@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-RELEASE-EVENT-TRACE-TS",
+  "path": "src/ux-sim/release-event-trace.ts",
+  "boundary": "Checks declared production release events as an ordered subsequence against explicit phase expectations, rejecting missing, reordered, or misattributed events and handling explicitly concurrent groups.",
+  "deviceIds": [
+    "release-graph-rig"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,23 @@
+{
+  "id": "temp-git-repo",
+  "name": "Temporary Git repository fixture",
+  "implementation": [
+    "src/ux-sim/temp-git-repo.ts"
+  ],
+  "tests": [
+    "src/ux-sim/temp-git-repo.test.ts"
+  ],
+  "target": "Throwaway Git repositories with real commits for simulation tests that need history",
+  "inputs": [
+    "commits and branches to create"
+  ],
+  "observations": [
+    "repository path with the requested history"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/temp-git-repo.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -1,8 +1,16 @@
-import { expect, test } from 'bun:test';
+import { afterAll, expect, test as bunTest } from 'bun:test';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyIntake } from '../src/ad-pipeline/intake.js';
+import { simCli } from '../src/ux-sim/in-process-cli.js';
+import {
+  CLI_CHILD_ONCE_ADOPTION_FILES,
+  evaluateCliChildAdoption,
+  type CliChildEvent,
+  withCliChildRun,
+} from '../src/ux-sim/in-process-cli-539-file-adoption-sim.js';
 import type { PageFacts } from '../src/product-grounding/checklist.js';
 import { AD_GATES, GROUNDING_COLLECTOR_MISSING, PRODUCTION_STEPS, parseGroundingFacts, createAdPipelineDeps, createAdPipelinePlan, runAdPipeline, type AdPipelinePlan, type GroundingOutcome } from '../src/ad-pipeline/run.js';
 
@@ -15,6 +23,31 @@ const SAMPLE_FACTS: PageFacts = {
   specRows: { '기능성 여부': '해당없음' },
   images: [{ src: 'https://example.com/a.png', w: 1200, h: 1600 }],
 };
+
+async function runAdCli(args: readonly string[], mode: 'in-process' | 'spawn' = 'in-process') {
+  const result = await simCli(['ad', ...args], { allowPaths: [['ad']], mode });
+  return { code: result.exitCode, out: result.stdout, text: `${result.stdout}\n${result.stderr}` };
+}
+
+const cliChildAdoptionRun = {
+  runId: `ad-intake-${randomUUID()}`,
+  sourceFile: CLI_CHILD_ONCE_ADOPTION_FILES[0],
+  events: [] as CliChildEvent[],
+};
+function test(name: string, action: () => void | Promise<void>, timeout?: number): void {
+  bunTest(name, async () => {
+    await withCliChildRun(cliChildAdoptionRun, async () => { await action(); });
+  }, timeout);
+}
+
+afterAll(() => {
+  expect(evaluateCliChildAdoption([{
+    sourceFile: cliChildAdoptionRun.sourceFile,
+    runId: cliChildAdoptionRun.runId,
+  }], cliChildAdoptionRun.events)).toEqual({
+    ok: true, targetFiles: 1, realChildren: 1, findings: [],
+  });
+});
 
 test('classifies URL, text brief, and real image inputs', () => {
   expect(classifyIntake({ values: ['https://www.coupang.com/vp/products/0'] })).toEqual({
@@ -233,26 +266,20 @@ test('거부 «문면» 셋도 서로 다르다 — code 만 다르고 message �
   expect(new Set([missing.message, ambiguous.message, unreadable.message]).size).toBe(3);
 });
 
-test('실물 CLI — --image 는 «읽을 수 있는 파일»만 실사로 받는다', async () => {
+test('in-process CLI — --image 는 «읽을 수 있는 파일»만 실사로 받는다', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ad-intake-'));
   const real = join(dir, 'packshot.png');
   writeFileSync(real, 'x');
-  const run = async (...args: string[]) => {
-    const proc = Bun.spawn(['bun', 'bin/elanous.mjs', 'ad', '--plan', ...args], {
-      cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe',
-    });
-    return { code: await proc.exited, out: await new Response(proc.stdout).text() };
-  };
   try {
-  const ok = await run('--image', real);
-  expect(ok.code).toBe(0);
-  expect(JSON.parse(ok.out)).toMatchObject({ intake: { kind: 'image' }, provenance: 'real' });
+    const ok = await runAdCli(['--plan', '--image', real]);
+    expect(ok.code).toBe(0);
+    expect(JSON.parse(ok.out)).toMatchObject({ intake: { kind: 'image' }, provenance: 'real' });
 
-  const missing = await run('--image', join(dir, 'nope.png'));
-  expect(missing.code).toBe(1);
+    const missing = await runAdCli(['--plan', '--image', join(dir, 'nope.png')]);
+    expect(missing.code).toBe(1);
 
-  const directory = await run('--image', dir);   // ⛔ 디렉토리는 «읽을 수 있어도» 실사가 아니다
-  expect(directory.code).toBe(1);
+    const directory = await runAdCli(['--plan', '--image', dir]);   // ⛔ 디렉토리는 «읽을 수 있어도» 실사가 아니다
+    expect(directory.code).toBe(1);
   } finally {
     rmSync(dir, { recursive: true, force: true });   // ⛔ 실패해도 남기지 않는다
   }
@@ -279,62 +306,73 @@ test('이미지와 «본문 입력»이 같이 오면 거부한다 — 판매 UR
 });
 
 test('실물 CLI — 필수 실물 관측 둘을 «회귀로» 못 박는다', async () => {
-  const cwd = join(import.meta.dir, '..');
-  const spawn = async (args: string[]) => {
-    const proc = Bun.spawn(['bun', 'bin/elanous.mjs', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
-    return { code: await proc.exited, out: await new Response(proc.stdout).text() };
-  };
-  const help = await spawn(['ad', '--help']);
+  const help = await runAdCli(['--help']);
   expect(help.code).toBe(0);
   expect(help.out).toContain('--plan');
 
-  const plan = await spawn(['ad', '--plan', 'https://www.coupang.com/vp/products/0']);
+  const plan = await runAdCli(['--plan', 'https://www.coupang.com/vp/products/0'], 'spawn');
   expect(plan.code).toBe(0);
   const parsed = JSON.parse(plan.out);
   expect(parsed).toMatchObject({ intake: { kind: 'url' }, provenance: 'real' });
   for (const gate of AD_GATES) expect(parsed.stages).toContain(gate);
 
-  const withBrief = await spawn(['ad', '--plan', 'https://www.coupang.com/vp/products/0', '--brief', '겨울 건조함을 겨냥한 숏폼']);
+  const withBrief = await runAdCli(['--plan', 'https://www.coupang.com/vp/products/0', '--brief', '겨울 건조함을 겨냥한 숏폼']);
   expect(withBrief.code).toBe(0);
   expect(JSON.parse(withBrief.out)).toMatchObject({
     intake: { kind: 'url', brief: '겨울 건조함을 겨냥한 숏폼' },
     provenance: 'real',
   });
+  expect(evaluateCliChildAdoption([{
+    sourceFile: cliChildAdoptionRun.sourceFile,
+    runId: cliChildAdoptionRun.runId,
+  }], cliChildAdoptionRun.events)).toEqual({
+    ok: true, targetFiles: 1, realChildren: 1, findings: [],
+  });
+}, 60_000);
+
+
+test('adoption rejects a second unannotated real child in an isolated run', async () => {
+  const faultRun = {
+    runId: 'ad-intake-fault-' + randomUUID(),
+    sourceFile: cliChildAdoptionRun.sourceFile,
+    events: [] as CliChildEvent[],
+  };
+  await withCliChildRun(faultRun, async () => {
+    expect((await runAdCli(['--help'], 'spawn')).code).toBe(0);
+    expect((await runAdCli(['--help'], 'spawn')).code).toBe(0);
+  });
+  const verdict = evaluateCliChildAdoption([{
+    sourceFile: faultRun.sourceFile,
+    runId: faultRun.runId,
+  }], faultRun.events);
+  expect(verdict.ok).toBe(false);
+  expect(verdict.realChildren).toBe(2);
+  expect(verdict.findings).toContain(faultRun.sourceFile + ' run=' + faultRun.runId + ': expected 1 child start, got 2');
 }, 60_000);
 
 // ── 4라운드: GOODHART 방어 ─────────────────────────────────────────
 // 🩸 앞 라운드 시험은 `classifyIntake` 에 «이미 갈라진» values/imagePaths 를 주어
-//    Commander 파싱 결함을 «가렸다». 그래서 여기서는 «실제 argv» 로 프로세스를 띄운다.
+//    Commander 파싱 결함을 «가렸다». 여기서는 전체 argv 를 Commander 에 전달한다.
 //    ⛔ `--image <path...>` 는 가변이라 뒤따르는 URL 을 삼킨다 — 그 경로가 이 시험의 표적이다.
 
-test('실물 argv — `--image` 가 삼킨 URL 도 «혼합 입력»으로 가른다 (양쪽 순서)', async () => {
+test('in-process Commander argv — `--image` 가 삼킨 URL 도 «혼합 입력»으로 가른다 (양쪽 순서)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ad-argv-'));
   const img = join(dir, 'pack.png');
   writeFileSync(img, 'x');
-  const cwd = join(import.meta.dir, '..');
-  const spawn = async (args: string[]) => {
-    const proc = Bun.spawn(['bun', 'bin/elanous.mjs', 'ad', '--plan', ...args], {
-      cwd, stdout: 'pipe', stderr: 'pipe',
-    });
-    const [code, out, err] = await Promise.all([
-      proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text(),
-    ]);
-    return { code, text: `${out}\n${err}` };
-  };
   try {
     // ⛔ 이 순서가 앞 라운드에 «깨져 있었다» — URL 이 image 목록으로 삼켜져
     //    「경로를 못 읽는다」는 «틀린 이유»가 나왔다.
-    const swallowed = await spawn(['--image', img, 'https://shop.example/p']);
+    const swallowed = await runAdCli(['--plan', '--image', img, 'https://shop.example/p']);
     expect(swallowed.code).toBe(1);
     expect(swallowed.text).toContain('--brief');
     expect(swallowed.text).not.toContain('unreadable');
 
-    const before = await spawn(['https://shop.example/p', '--image', img]);
+    const before = await runAdCli(['--plan', 'https://shop.example/p', '--image', img]);
     expect(before.code).toBe(1);
     expect(before.text).toContain('--brief');
 
     // ⭐ 「금지」에 붙인 «길»이 실제로 통한다
-    const viaBrief = await spawn(['--image', img, '--brief', '여름 캠페인']);
+    const viaBrief = await runAdCli(['--plan', '--image', img, '--brief', '여름 캠페인']);
     expect(viaBrief.code).toBe(0);
     expect(JSON.parse(viaBrief.text.split('\n\n')[0] || viaBrief.text.trim()))
       .toMatchObject({ intake: { kind: 'image', brief: '여름 캠페인' }, provenance: 'real' });
@@ -368,19 +406,16 @@ test('URL 접지를 못 쟀으면 게이트를 «묻지도» 않는다 — 사�
 // 🩸 삼킨 URL 을 되돌리려고 만든 자가 «너무 느슨해» 진짜 이미지 경로를 URL 로 오인했다.
 //    경로에 점이 든 디렉토리(`/tmp/shop.example/pack.png`)면 거부됐다.
 
-test('실물 argv — 점(.)이 든 «진짜» 이미지 경로를 URL 로 오인하지 않는다', async () => {
+test('in-process Commander argv — 점(.)이 든 «진짜» 이미지 경로를 URL 로 오인하지 않는다', async () => {
   const root = mkdtempSync(join(tmpdir(), 'ad-dot-'));
   const dotted = join(root, 'shop.example');
   mkdirSync(dotted, { recursive: true });
   const img = join(dotted, 'pack.png');
   writeFileSync(img, 'x');
   try {
-    const proc = Bun.spawn(['bun', 'bin/elanous.mjs', 'ad', '--plan', '--image', img], {
-      cwd: join(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe',
-    });
-    const [code, out] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
-    expect(code).toBe(0);
-    expect(JSON.parse(out)).toMatchObject({ intake: { kind: 'image', paths: [img] }, provenance: 'real' });
+    const result = await runAdCli(['--plan', '--image', img]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.out)).toMatchObject({ intake: { kind: 'image', paths: [img] }, provenance: 'real' });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -399,26 +434,20 @@ test('오류 «우선순위»가 의도다 — 혼합 입력이 「경로를 못
 
 // ── 7라운드: «가변 옵션»이라는 뿌리를 뽑고, 사람 칸에 «길»을 냈다 ──────
 
-test('실물 argv — `--image` 는 뒤따르는 텍스트·URL 을 «삼키지 않는다»', async () => {
+test('in-process Commander argv — `--image` 는 뒤따르는 텍스트·URL 을 «삼키지 않는다»', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ad-swallow-'));
   const img = join(dir, 'pack.png');
   writeFileSync(img, 'x');
-  const cwd = join(import.meta.dir, '..');
-  const spawn = async (args: string[]) => {
-    const proc = Bun.spawn(['bun', 'bin/elanous.mjs', 'ad', '--plan', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
-    const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    return { code, text: `${out}\n${err}` };
-  };
   try {
     for (const trailing of ['summer campaign', 'https://shop.example/p']) {
-      const r = await spawn(['--image', img, trailing]);
+      const r = await runAdCli(['--plan', '--image', img, trailing]);
       expect(r.code).toBe(1);
       expect(r.text).toContain('--brief');
       // ⛔ «가짜» 경로 오류가 나오면 실패한다 — 사람이 경로를 고치러 간다.
       expect(r.text).not.toContain('unreadable');
     }
     // ⭐ 반복 가능한 단일 값이라 이미지 여럿도 받는다
-    const two = await spawn(['--image', img, '--image', img]);
+    const two = await runAdCli(['--plan', '--image', img, '--image', img]);
     expect(two.code).toBe(0);
     expect(JSON.parse(two.text.trim()).intake.paths).toHaveLength(2);
   } finally {
@@ -474,28 +503,22 @@ test('접지 사실은 «같은 주소»의 것이어야 한다 — 다른 상�
   }
 });
 
-test('실물 argv — 망가진/다른 주소의 facts 는 «명확한 입력 오류»다 (비정상 종료가 아니다)', async () => {
+test('in-process Commander argv — 망가진/다른 주소의 facts 는 «명확한 입력 오류»다 (비정상 종료가 아니다)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ad-badfacts-'));
-  const cwd = join(import.meta.dir, '..');
   const write = (name: string, body: string) => { const p = join(dir, name); writeFileSync(p, body); return p; };
-  const spawn = async (args: string[]) => {
-    const proc = Bun.spawn(['bun', 'bin/elanous.mjs', 'ad', ...args], { cwd, stdin: new TextEncoder().encode(''), stdout: 'pipe', stderr: 'pipe' });
-    const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    return { code, text: `${out}\n${err}` };
-  };
   try {
-    const malformed = await spawn([SAMPLE_FACTS.url, '--facts', write('bad.json', '{not json')]);
+    const malformed = await runAdCli([SAMPLE_FACTS.url, '--facts', write('bad.json', '{not json')]);
     expect(malformed.code).toBe(1);
     expect(malformed.text).toContain('접지 사실 JSON');
     expect(malformed.text).not.toContain('SyntaxError:');   // ⛔ 스택 트레이스면 실패다
 
-    const wrongUrl = await spawn([SAMPLE_FACTS.url, '--facts',
+    const wrongUrl = await runAdCli([SAMPLE_FACTS.url, '--facts',
       write('other.json', JSON.stringify({ ...SAMPLE_FACTS, url: 'https://other.example/z' }))]);
     expect(wrongUrl.code).toBe(1);
     expect(wrongUrl.text).toContain('다른 주소');
     expect(wrongUrl.text).not.toContain('Approve BRIEF_OK');   // ⛔ 게이트를 열면 안 된다
 
-    const shapeless = await spawn([SAMPLE_FACTS.url, '--facts',
+    const shapeless = await runAdCli([SAMPLE_FACTS.url, '--facts',
       write('shape.json', JSON.stringify({ url: SAMPLE_FACTS.url }))]);
     expect(shapeless.code).toBe(1);
     expect(shapeless.text).not.toContain('Approve BRIEF_OK');
@@ -522,30 +545,24 @@ test('접지 사실 검증은 «원소»까지 본다 — 「배열이다」는 
   expect(parseGroundingFacts(SAMPLE_FACTS, SAMPLE_FACTS.url).ok).toBe(true);
 });
 
-test('실물 argv — `--plan` 도 facts 검증을 «건너뛰지 않는다»', async () => {
+test('in-process Commander argv — `--plan` 도 facts 검증을 «건너뛰지 않는다»', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ad-planfacts-'));
-  const cwd = join(import.meta.dir, '..');
   const write = (name: string, body: string) => { const p = join(dir, name); writeFileSync(p, body); return p; };
-  const spawn = async (args: string[]) => {
-    const proc = Bun.spawn(['bun', 'bin/elanous.mjs', 'ad', ...args], { cwd, stdin: new TextEncoder().encode(''), stdout: 'pipe', stderr: 'pipe' });
-    const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    return { code, text: `${out}\n${err}` };
-  };
   const good = write('good.json', JSON.stringify(SAMPLE_FACTS));
   try {
     // ⛔ 텍스트 갈래에 --facts 는 뜻이 없다 — 계획 모드에서도 거절한다
-    const wrongBranch = await spawn(['--plan', '신제품 컨셉 영상', '--facts', good]);
+    const wrongBranch = await runAdCli(['--plan', '신제품 컨셉 영상', '--facts', good]);
     expect(wrongBranch.code).toBe(1);
     expect(wrongBranch.text).toContain('--facts');
 
     // ⛔ 다른 주소의 facts 도 계획 모드에서 «미리» 걸린다
-    const wrongUrl = await spawn(['--plan', SAMPLE_FACTS.url, '--facts',
+    const wrongUrl = await runAdCli(['--plan', SAMPLE_FACTS.url, '--facts',
       write('other.json', JSON.stringify({ ...SAMPLE_FACTS, url: 'https://other.example/z' }))]);
     expect(wrongUrl.code).toBe(1);
     expect(wrongUrl.text).toContain('다른 주소');
 
     // ✅ 맞는 facts 면 계획이 나온다
-    const ok = await spawn(['--plan', SAMPLE_FACTS.url, '--facts', good]);
+    const ok = await runAdCli(['--plan', SAMPLE_FACTS.url, '--facts', good]);
     expect(ok.code).toBe(0);
     expect(JSON.parse(ok.text.trim())).toMatchObject({ intake: { kind: 'url' }, provenance: 'real' });
   } finally {
@@ -568,24 +585,19 @@ test('계획이 «실행 전제»를 말한다 — 「이대로 돌겠구나」�
   expect(createAdPipelinePlan({ kind: 'image', paths: ['/a.png'] }).prerequisites).toHaveLength(0);
 });
 
-test('실물 argv — `--plan` 산출이 실행 전제를 «보여 준다»', async () => {
+test('in-process Commander argv — `--plan` 산출이 실행 전제를 «보여 준다»', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ad-prereq-'));
   const factsPath = join(dir, 'facts.json');
   writeFileSync(factsPath, JSON.stringify(SAMPLE_FACTS));
-  const cwd = join(import.meta.dir, '..');
-  const spawn = async (args: string[]) => {
-    const proc = Bun.spawn(['bun', 'bin/elanous.mjs', 'ad', '--plan', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
-    const [code, out] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
-    return { code, json: JSON.parse(out.trim()) };
-  };
   try {
-    const bare = await spawn([SAMPLE_FACTS.url]);
+    const bare = await runAdCli(['--plan', SAMPLE_FACTS.url]);
     expect(bare.code).toBe(0);
-    expect(bare.json.prerequisites.join(' ')).toContain('--facts');
-    expect(bare.json.unwiredProduction).toContain('render');
+    const bareJson = JSON.parse(bare.out);
+    expect(bareJson.prerequisites.join(' ')).toContain('--facts');
+    expect(bareJson.unwiredProduction).toContain('render');
 
-    const withFacts = await spawn([SAMPLE_FACTS.url, '--facts', factsPath]);
-    expect(withFacts.json.prerequisites).toHaveLength(0);
+    const withFacts = await runAdCli(['--plan', SAMPLE_FACTS.url, '--facts', factsPath]);
+    expect(JSON.parse(withFacts.out).prerequisites).toHaveLength(0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

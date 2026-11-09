@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/release-same-version-run-adoption-sim.ts",
+  "reason": "RELEASE-RUN-RECOGNIZE-EXISTING-CUT: simulator drives the real graph runner through gate failure and same-run resume using only a temporary Git remote and fake node commands."
+}

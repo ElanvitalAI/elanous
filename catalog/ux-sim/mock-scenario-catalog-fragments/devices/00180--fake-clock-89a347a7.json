@@ -1,0 +1,26 @@
+{
+  "id": "fake-clock",
+  "name": "Fake clock",
+  "implementation": [
+    "src/ux-sim/fake-clock.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-clock.test.ts"
+  ],
+  "target": "process-local time and timer boundary",
+  "inputs": [
+    "clock advance",
+    "scheduled callback"
+  ],
+  "observations": [
+    "elapsed time",
+    "fired timers",
+    "timer callbacks run and one Promise continuation turn is flushed without wall-clock waiting"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-clock.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

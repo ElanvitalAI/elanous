@@ -1,0 +1,10 @@
+apiVersion: elanous.dev/release-graph-edges/v1
+edges:
+  outcome: { terminal: true }
+  heal: { from: failure, to: repair }
+  retry: { attemptsPolicy: exportRetryLimit }
+  detour: { from: blocked, to: declared-recovery }
+  rejoin: { after: repair, at: affected-node }
+  append-recheck: { policy: gate.plan.promoteToFull }
+  accept: { requiresMeasuredRegressionVerdict: true }
+  escalate: { requiresHitlNode: true }

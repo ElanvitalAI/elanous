@@ -1,0 +1,11 @@
+{
+  "id": "MD-UX-SIM-GRID-LEDGER-TS",
+  "path": "src/ux-sim/grid-ledger.ts",
+  "boundary": "Defines grid host/lane capacity and lease state transitions, then reports admission, occupancy and lease-loss decisions for simulated work.",
+  "deviceIds": [
+    "grid-chaos-driver",
+    "grid-ledger"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-APP-TRAFFIC-TS",
+  "path": "src/ux-sim/fake-app-traffic.ts",
+  "boundary": "Per-app request and response byte accounting with warning, throttle, block, window reset, and immediate admin stream termination (simulation boundary).",
+  "deviceIds": [
+    "fake-app-traffic"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

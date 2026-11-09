@@ -24,6 +24,7 @@ const renderDock = (height?: number): string => renderToStaticMarkup(
 test('mounted dock sends a contextual agent turn via terminal/repl/exec', async () => {
   const sent: Array<{ method: string; params: unknown }> = [];
   const tabIntents: Array<'next' | 'prev' | number> = [];
+  const exposed: Array<{ submitVoiceTranscript: (text: string) => void } | null> = [];
   const acp = {
     on: () => () => {}, close: () => {},
     send: async (method: string, params: unknown) => {
@@ -38,7 +39,12 @@ test('mounted dock sends a contextual agent turn via terminal/repl/exec', async 
     await act(async () => {
       tree = create(
         <DaemonContext.Provider value={{ ...daemon, client: client as never, sessionId: 'session-1' }}>
-          <TerminalChatDock terminalId="terminal-1" open onTabIntent={(intent) => tabIntents.push(intent)} />
+          <TerminalChatDock
+            terminalId="terminal-1"
+            open
+            onTabIntent={(intent) => tabIntents.push(intent)}
+            onVoiceTranscriptSubmitReady={(_terminalId, handle) => exposed.push(handle)}
+          />
         </DaemonContext.Provider>,
       );
     });
@@ -59,6 +65,12 @@ test('mounted dock sends a contextual agent turn via terminal/repl/exec', async 
     await act(async () => { input.findByType('textarea').props.onChange({ target: { value: ':tab next' } }); });
     await act(async () => { input.findAllByType('button').at(-1)!.props.onClick(); });
     expect(tabIntents).toEqual(['next']);
+    expect(exposed.at(-1)?.submitVoiceTranscript).toBeFunction();
+    await act(async () => { exposed.at(-1)!.submitVoiceTranscript(' voice command '); });
+    expect(sent).toContainEqual({
+      method: 'terminal/repl/exec',
+      params: { sessionId: 'session-1', terminalId: 'terminal-1', line: ':agent voice command' },
+    });
     const attachment = {
       id: 'file-1', filename: 'notes.txt', mediaType: 'text/plain',
       size: 5, downloadUrl: '/v1/attachments/file-1', path: '/tmp/notes.txt',
@@ -77,7 +89,54 @@ test('mounted dock sends a contextual agent turn via terminal/repl/exec', async 
     if (tree) {
       const mounted = tree;
       await act(async () => { mounted.unmount(); });
+      expect(exposed.at(-1)).toBeNull();
     }
+  }
+});
+
+test('voice transcripts submitted during an ACP turn are sent FIFO after it completes', async () => {
+  const sent: string[] = [];
+  let releaseFirst: (() => void) | undefined;
+  const exposed: Array<{ submitVoiceTranscript: (text: string) => void } | null> = [];
+  const acp = {
+    on: () => () => {}, close: () => {},
+    send: async (_method: string, params: unknown) => {
+      const line = (params as { line?: string }).line ?? '';
+      sent.push(line);
+      if (line === ':agent first') await new Promise<void>((resolve) => { releaseFirst = resolve; });
+      return { agent: { markdown: line, modelLabel: 'test', stopReason: 'end_turn' } };
+    },
+  };
+  const client = { connectAcp: () => acp, fetchJson: async () => ({ messages: [] }) };
+  let tree: ReturnType<typeof create> | undefined;
+  try {
+    await act(async () => {
+      tree = create(
+        <DaemonContext.Provider value={{ ...daemon, client: client as never, sessionId: 'session-queue' }}>
+          <TerminalChatDock
+            terminalId="terminal-queue"
+            open
+            onVoiceTranscriptSubmitReady={(_terminalId, handle) => exposed.push(handle)}
+          />
+        </DaemonContext.Provider>,
+      );
+    });
+    const handle = exposed.at(-1);
+    expect(handle?.submitVoiceTranscript).toBeFunction();
+    await act(async () => {
+      handle!.submitVoiceTranscript('first');
+      handle!.submitVoiceTranscript('second');
+      await Promise.resolve();
+    });
+    expect(sent).toEqual([':agent first']);
+
+    await act(async () => {
+      releaseFirst!();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(sent).toEqual([':agent first', ':agent second']);
+  } finally {
+    if (tree) await act(async () => { tree!.unmount(); });
   }
 });
 

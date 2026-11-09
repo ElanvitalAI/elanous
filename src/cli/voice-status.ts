@@ -24,7 +24,8 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 
-import { getUserConfig, type UserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import {
   MODEL_TIER_LABELS,
   projectSttAllTiers,

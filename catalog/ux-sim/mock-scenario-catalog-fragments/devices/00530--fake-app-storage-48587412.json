@@ -1,0 +1,36 @@
+{
+  "id": "fake-app-storage",
+  "name": "Fake app-scoped object storage contract matrix",
+  "checklistCells": [
+    "SIM-APPSTORAGE"
+  ],
+  "implementation": [
+    "src/ux-sim/fake-app-storage.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-app-storage.test.ts"
+  ],
+  "target": "App-scoped upload, quota, media-type, signed URL, anonymous rate-limit, and provider-error decisions against the real local ObjectStore boundary",
+  "inputs": [
+    "app slug and relative object key",
+    "bytes and content type",
+    "app quota and anonymous upload rate",
+    "signed PUT URL, expiry, and method",
+    "fake S3 RunFn error response"
+  ],
+  "observations": [
+    "all stored keys stay under apps/<slug>/",
+    "path escape and invalid media type rejection",
+    "quota rejection leaves prior bytes unchanged",
+    "valid signed upload and expiry, signature, or method rejection",
+    "per-app anonymous upload limit",
+    "provider 403 rejection and retryable 5xx status",
+    "byte-and-status-only ledger with no request body"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-app-storage.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

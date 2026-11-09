@@ -11,7 +11,7 @@
 //    (미-nested)에서 off 이므로 delegate/자율tool 이 노출됨을 전제.
 
 import { describe, test, expect, spyOn } from 'bun:test';
-import type { UserConfig } from '../../user-config.js';
+import type { UserConfig } from '../../user-config/types.js';
 import { debug } from '../../debug/log.js';
 import { buildFinanceTools } from '../../domains/finance-tools.js';
 import { toolSurface } from './index.js';
@@ -34,7 +34,7 @@ const CHAT_CORE = [
   'schedule_manage', 'session_manage', 'memory_recall', 'fact_check', 'self_recall', 'context_now',
   'autopilot_missions', 'ops_status', 'se_build', 'logs_query', 'mission_decide', 'coo_admin',
   // SYNC1 ① #23007 — owner-only read tools; names are listed, dispatch refuses without a server-verified owner (like release_change).
-  'release_status', 'release_change', 'ops_seats', 'decisions_pending', 'proact_meter', 'elanous_skills_list', 'skill_exec',
+  'release_status', 'release_change', 'ops_seats', 'decisions_pending', 'proact_meter', 'elanous_skills_list', 'skill_exec', 'app_deploy',
 ];
 const CHAT_PTY_EXTRA = ['ElanousHold', 'PtyControl'];
 // webterm 이 chat 위에 항상 더하는 것(pty 무관) — 자율tool 3종(nest-cap off 전제) + 웹터미널/카메라.
@@ -112,9 +112,9 @@ describe('daemon toolSurface — Phase 3 골든룰(이름배열 diff=0·서피�
     expect(on).toContain('finance_quote');
     // shared-app-tools contract: core, then the complete finance pack, then skill discovery/execution.
     expect(on).toEqual([
-      ...CHAT_CORE.slice(0, -2),
+      ...CHAT_CORE.slice(0, -3),
       ...buildFinanceTools().specs.map((spec) => spec.name),
-      'elanous_skills_list', 'skill_exec',
+      'elanous_skills_list', 'skill_exec', 'app_deploy',
       ...off.slice(CHAT_CORE.length),
     ]);
   });

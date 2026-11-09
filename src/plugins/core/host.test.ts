@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { PluginHost, USER_DIR, type HostHooks } from './host.js';
 import { installPlugin, removePlugin } from '../install/plugin-install.js';
+import { toLLMToolSpec } from '../../llm/tool-spec.js';
 
 const tempDirs: string[] = [];
 
@@ -61,6 +62,30 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
     expect(header).toMatch(/package-management directory/);
     expect(header).toContain('<name>/plugin.ts');
     expect(header).toMatch(/currently finds no Claude-managed/);
+  });
+
+  test('manifest route metadata survives PluginHost activation and provider-spec conversion', async () => {
+    const userDir = createDir('elanous-host-route-metadata-');
+    const pluginDir = join(userDir, 'route-fixture');
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(join(pluginDir, 'plugin.json'), JSON.stringify({
+      id: 'route-fixture', name: 'route-fixture', version: '1.0.0', main: './plugin.ts',
+      contributes: { aiTools: [{
+        name: 'RoutedLookup', description: 'lookup status', parameters: { type: 'object' },
+        route: { triggers: ['status'], examples: ['show status'], sideEffects: 'read-only', risk: 'low', cost: 'cheap', requiresConfirm: false },
+      }] },
+    }));
+    writeFileSync(join(pluginDir, 'plugin.ts'), `export default {
+      name: 'route-fixture', version: '1.0.0', description: '', initialState: () => ({}), panes: {},
+      llmTools: [{ name: 'RoutedLookup', description: 'lookup status', parameters: { type: 'object' }, handler: async () => ({ ok: true }) }],
+    };`);
+    const host = new PluginHost(hooks, null, { userDir });
+    await host.discover();
+    await host.activate('route-fixture');
+    const hosted = host.activePluginLLMTools().find((tool) => tool.name === 'RoutedLookup');
+    expect(hosted).toMatchObject({ pluginId: 'route-fixture', route: { sideEffects: 'read-only', requiresConfirm: false } });
+    expect(toLLMToolSpec(hosted!)).toMatchObject({ pluginId: 'route-fixture', route: { triggers: ['status'] } });
+    await host.deactivate();
   });
 
   test('discover() finds repository built-ins including botlab', async () => {

@@ -22,7 +22,7 @@ test('N30 old-graph measured waiver refuses before dispatch and preserves the fa
       dispatchedNodes: [],
       injectedEvidence: { oldGraphMissingKnownIssues: true, stateStayedFailedWithoutWaiver: true },
     });
-    expect(result.cases[0]?.refusal).toContain('waived node must reach known-issues before publication');
+    expect(result.cases[0]?.refusal).toContain('measured gate regressions cannot be waived');
   } finally {
     setTestStateRoot(previous ?? null);
     rmSync(root, { recursive: true, force: true });

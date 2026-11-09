@@ -15,6 +15,8 @@ import type { GateAutohealDecision } from './gate-autoheal.js';
 import type { ExecutedTuiCheck } from './tui-node-checks.js';
 
 export type SweepFailures = { failures: string[]; errors: string[] };
+export type RetryPassCause = 'isolation' | 'timeout' | 'load';
+export type RetryPassEvidence = { id: string; cause: RetryPassCause };
 
 /** Structural shape for failure-only Kubernetes reads; keep the type boundary independent of the Pod implementation. */
 export type GateKubectl = (args: readonly string[], input?: string, timeoutMs?: number) => { status: number | null; stdout: string; stderr: string };
@@ -88,9 +90,13 @@ export interface GateResult {
   partialFailures?: SweepFailures;
   /** GATE-PARTIAL — this verdict re-ran only these files and carried the prior gate's results for the rest. */
   partial?: { priorCommit: string; files: number };
-  trainReceiptReuse?: { carried: number; total: number; receipts: number; reasons: string[] };
+  trainReceiptReuse?: { source?: 'train-receipts' | 'formal-receipts' | 'file-cas' | 'existing-partial' | 'full-sweep'; carried: number | null; total: number | null;
+    remeasure?: number | null; receipts: number; receiptKeys?: string[]; selectedFiles?: number | null;
+    reasons: string[]; reasonCounts?: Record<string, number>; planReasons?: string[] };
   /** A failure that passed an evidence-checked isolated re-run: warning (flaky under load), not an introduced regression. */
   loadFlaky?: string[];
+  /** Evidence-backed cause for a retry pass; absent for older shard receipts. */
+  retryPass?: RetryPassEvidence[];
   /** File-level unhandled errors that reproduced or could not be measured in isolation. They keep the gate red. */
   unmeasuredErrors?: Array<{ file: string; reason: 'reproduced' | 'timeout' | 'unreadable'; ids: string[] }>;
   /** Shard-only unhandled errors whose file-level replay completed cleanly. */
@@ -104,10 +110,11 @@ export interface GateResult {
 export interface GateCommandResult { rc: number; output: string; passedIds?: string[]; stalledEnv?: Array<{ file: string; reason: 'no-output' }>; timedOut?: boolean;
   /** Same-Pod per-file retry passed with complete log/JUnit evidence; these original ids are excluded from introduced. */
   loadFlaky?: string[];
+  retryPass?: RetryPassEvidence[];
   /** Files already given their one same-Pod retry; prevent the later timeout-only path from retrying them again. */
   loadFlakyAttemptedFiles?: string[];
   /** Identity and complete selected inventory of this Pod sweep; only the producer may issue it. */
-  podSweep?: { id: string; invocationId?: string; shards: number; files: string[];
+  podSweep?: { id: string; invocationId?: string; shards: number; files: string[]; imageDigests?: Array<string | null>;
     disposition?: { reused: number; rerun: number; unmeasured: number } };
   /** Complete, source-bound one-file Job result for shadow comparison; absent means unmeasured. */
   warmReference?: WarmWorkerFileResult | null;
@@ -125,6 +132,8 @@ export interface GateSweepProgress {
   groups: readonly GateProgressGroup[];
 }
 export interface GateRunner {
+  /** Bind a CLI-derived release run identity before the first plan or shard row is written. */
+  setRunId?(runId: string | null): void;
   command(cmd: string, args: string[], cwd: string, limitMs?: number): Promise<GateCommandResult>;
   localCommand(cmd: string, args: string[], cwd: string, limitMs?: number): Promise<GateCommandResult>;
   /** Run one isolated test on the same Pod image and pinned commit as the sweep. */
@@ -142,6 +151,7 @@ export interface GateRunner {
   /** GATE-FLOW-SIM — the clock this runner measures with (the injected fake clock in a scenario); absent = `Date.now`. */
   now?(): number;
   progressScheduler?: GateProgressScheduler;
+  heartbeatScheduler?: GateProgressScheduler;
   startBisectSidecar?(inputPath: string, gateOutcome: GateResult['outcome']): void | Promise<void>;
 }
 export interface GateOptions {
@@ -157,6 +167,8 @@ export interface GateOptions {
   imagePinPrepareOnly?: boolean;
   /** The graph run that launched this gate; direct hard rehearsal instead pins source bytes explicitly. */
   graphRunId?: string;
+  /** Direct hard-rehearsal identity; scopes evidence without changing graph-run semantics. */
+  runId?: string;
   /** Only a direct hard rehearsal may pin graph bytes from its measured Git commit. */
   rehearsalBaseline?: boolean;
   forceFreeze?: boolean;
@@ -185,6 +197,8 @@ export interface GateOptions {
     imagePin?: 'cut-commit';
     /** One immutable container image identity for this gate graph run and all its resumes. */
     pinnedImageDigest?: string;
+    /** Tag identity for the source-free runtime image; source checkout still uses GateOptions.commit. */
+    imageTagCommit?: string;
     /** Current image execution identity; an unmeasured base digest keeps warm reuse closed. */
     executionIdentity?: import('./gate-radius-live.js').GatePodExecutionIdentity | null;
     /** Base dependency layer digest from the pinned image; null closes warm reuse. */

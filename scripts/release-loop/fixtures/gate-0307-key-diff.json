@@ -1,0 +1,3293 @@
+{
+  "source": "0.3.7 gate run 113eab2c · recorded failure identities and opaque-reason classifications; not recoverable closure snapshots",
+  "baseline": "3cb140ec2cef82bbe024e54d0b0ad4f939d77485",
+  "cut": "a3501ac55aaf5455e63ab7429d075c1a9fc5fa16",
+  "historyBase": "8171bc1e93e2877cb842b880137c55b5f2a0be9b",
+  "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "identities": [
+    {
+      "failureId": "apps/pwa/src/lib/chat-runtime.meta.test.ts > PWA slash-command boundary > keeps the local TUI-name snapshot in sync with names and aliases, without a runtime server import",
+      "base": {
+        "file": "apps/pwa/src/lib/chat-runtime.meta.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "apps/pwa/src/lib/chat-runtime.meta.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "scripts/hooks/claude-code-utterance.test.ts > HAND-HOOKS-NEXUS-STATUS: SessionStart·UserPromptSubmit·Stop·StopFailure·PreToolUse 훅은 progress 만 보낸다",
+      "base": {
+        "file": "scripts/hooks/claude-code-utterance.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "scripts/hooks/claude-code-utterance.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "scripts/hooks/claude-code-utterance.test.ts > UserPromptSubmit reaches the human Claude Code utterance query",
+      "base": {
+        "file": "scripts/hooks/claude-code-utterance.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "scripts/hooks/claude-code-utterance.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "scripts/lib/tui-streaming-e2e.test.ts > first real TUI turn streams split local SSE text and attributes submit/turn to one registered session",
+      "base": {
+        "file": "scripts/lib/tui-streaming-e2e.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "scripts/lib/tui-streaming-e2e.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "scripts/release-loop/export-check-node.test.ts > real export-check CLI sends graph commit/version through a fake SSH remote boundary",
+      "base": {
+        "file": "scripts/release-loop/export-check-node.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "unreadable"
+      },
+      "cut": {
+        "file": "scripts/release-loop/export-check-node.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "scripts/release-loop/gate-cut-preflight-sim.test.ts > production d4df149e gate sweep routes the non-TypeScript diff through full-radius invalidation",
+      "base": {
+        "file": "scripts/release-loop/gate-cut-preflight-sim.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "test file absent from historical tree"
+      },
+      "cut": {
+        "file": "scripts/release-loop/gate-cut-preflight-sim.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "non-literal import/require"
+      }
+    },
+    {
+      "failureId": "scripts/release-loop/pwa-remote.test.ts > PWA node entrypoint passes default, valid override, and invalid-value fallback to fake child CLI",
+      "base": {
+        "file": "scripts/release-loop/pwa-remote.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "scripts/release-loop/pwa-remote.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "scripts/release-loop/release-post-publish-fanout-sim.test.ts > SIM-RELEASE-CHAIN: post-publish fan-out runs the graph CLIs concurrently, preserves both results at join, then enters verify",
+      "base": {
+        "file": "scripts/release-loop/release-post-publish-fanout-sim.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "scripts/release-loop/release-post-publish-fanout-sim.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "scripts/release-loop/release-sim-chain-remaining-cli.test.ts > test-universe release CLI exercises export, incomplete shard, stopped gate, publish and npm boundaries",
+      "base": {
+        "file": "scripts/release-loop/release-sim-chain-remaining-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "test file absent from historical tree"
+      },
+      "cut": {
+        "file": "scripts/release-loop/release-sim-chain-remaining-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "scripts/release-loop/version-node.test.ts > RELEASE-APPEND-BASE-AUTO: cut-branch --append with a cut commit --base corrects to its first parent with a notice",
+      "base": {
+        "file": "scripts/release-loop/version-node.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "scripts/release-loop/version-node.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (ls-files)"
+      }
+    },
+    {
+      "failureId": "scripts/release-loop/version-node.test.ts > RELEASE-APPEND-BASE-AUTO: cut-branch --append with base omitted resolves the main cut from the ledger record",
+      "base": {
+        "file": "scripts/release-loop/version-node.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "scripts/release-loop/version-node.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (ls-files)"
+      }
+    },
+    {
+      "failureId": "src/autopilot/gh-rest-fallback.test.ts > GraphQL REST fallback > manager lookup → new PR → squash merge keeps the original outcome contracts and pins head sha",
+      "base": {
+        "file": "src/autopilot/gh-rest-fallback.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/autopilot/gh-rest-fallback.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/autopilot/pr-manager-provenance.integration.test.ts > H1 other card in same cell: production guard blocks before push and exposes its result",
+      "base": {
+        "file": "src/autopilot/pr-manager-provenance.integration.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/autopilot/pr-manager-provenance.integration.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/autopilot/pr-manager-provenance.integration.test.ts > H2 same card in same cell: production reuse advances old PR branch",
+      "base": {
+        "file": "src/autopilot/pr-manager-provenance.integration.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/autopilot/pr-manager-provenance.integration.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/autopilot/pr-manager-provenance.integration.test.ts > ledger-bound markerless old PR is reused and an unbound old PR is refused",
+      "base": {
+        "file": "src/autopilot/pr-manager-provenance.integration.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/autopilot/pr-manager-provenance.integration.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/control-cli.test.ts > empty control port environment falls back to the default (not ephemeral)",
+      "base": {
+        "file": "src/cli/control-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/control-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/doctor-fix.test.ts > doctor --fix > registered doctor command preserves ordinary output; fix dry-run and yes JSON use the engine",
+      "base": {
+        "file": "src/cli/doctor-fix.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (readdir)"
+      },
+      "cut": {
+        "file": "src/cli/doctor-fix.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (readdir)"
+      }
+    },
+    {
+      "failureId": "src/cli/pr-land-pod-shadow-job.test.ts > PRLAND-SHADOW-HOST-TIMEOUT: landing resumes after real runner deletes Job and releases lease",
+      "base": {
+        "file": "src/cli/pr-land-pod-shadow-job.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/pr-land-pod-shadow-job.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-auto-start.test.ts > auto-start --apply defers when freeze turns on after selection without marking the run failed",
+      "base": {
+        "file": "src/cli/release-auto-start.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "src/cli/release-auto-start.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "src/cli/release-auto-start.test.ts > auto-start --apply defers when freeze turns on after the entry check (LandingFrozenError at the run boundary)",
+      "base": {
+        "file": "src/cli/release-auto-start.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "src/cli/release-auto-start.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "src/cli/release-auto-start.test.ts > auto-start --apply defers when readiness changes after cut selection",
+      "base": {
+        "file": "src/cli/release-auto-start.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "src/cli/release-auto-start.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "src/cli/release-auto-start.test.ts > auto-start --apply delegates the selected version to the guarded release run; --json prints one result line",
+      "base": {
+        "file": "src/cli/release-auto-start.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "src/cli/release-auto-start.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "src/cli/release-auto-start.test.ts > auto-start --apply is not blocked by a live graph run of another version",
+      "base": {
+        "file": "src/cli/release-auto-start.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "src/cli/release-auto-start.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > RELEASE-REHEARSAL-RC CLI: --prerelease rc numbers the run, never reads checklist readiness (even with --if-ready), and rejects other kinds",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release publish — 되돌릴 수 없으니 기본은 «보기만» > release tag CLI: --yes 없는 소급 판은 한 줄 계획 · exit 0 · 태그 미생성",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > --cut-commit reaches graph input in both normal and --if-ready runs, while the default stays unchanged",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > --dry-run --json prints the complete ledger/config input on stdout without invoking the checklist or graph",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > --dry-run human output includes every graph input field without running the graph",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > --if-ready defers (not fails) when the freeze is switched on after its entry check, at the run boundary",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > --if-ready graph error keeps exit 1 and removes the lock",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > --if-ready honors publishedAt and holds a lock while the real graph runs",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > --if-ready skips a blocked checklist with exit 0 and one JSON line; plain run remains exit 1",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > --if-ready skips a scheduled pre-cut release without creating a lock or running the graph",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > --publish-at reaches the publish graph input on direct and --if-ready runs; omission preserves the input",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > a direct release run while frozen fails in a real CLI process (exit 1 · JSON failure); --if-ready defers",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > a freeze met by the gate node inside the release graph is reported as frozen; an unrelated failure keeps its reason",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > a live graph runner ledger blocks a second CLI process with its actual run identity",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > a real graph run: the gate node refuses a freeze switched on after the run started, records it, and release run reports frozen",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > a second direct or scheduled run refuses a live release-loop ledger record before graph launch",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > direct --force-new rechecks checklist after its start marker before graph launch",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > freeze skips --if-ready before readiness and --force-freeze executes it",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > run executes the runner, reports graph status, and keeps blocked releases fail-closed in JSON",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/release-cli.test.ts > release run CLI > schedule CLI and --if-ready use the injected run ledger even when the default ledger differs",
+      "base": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/release-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/cli/self-utterances-cli.test.ts > self utterance CLI records explicit human and defaults unmarked Claude Code speech to agent",
+      "base": {
+        "file": "src/cli/self-utterances-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/cli/self-utterances-cli.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/context-bus/context-day.test.ts > CLI JSON reads an isolated fake bus without altering its store",
+      "base": {
+        "file": "src/context-bus/context-day.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/context-bus/context-day.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/context-bus/context-day.test.ts > CLI timeline JSON filters one source and rejects unknown seats with exit 2",
+      "base": {
+        "file": "src/context-bus/context-day.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/context-bus/context-day.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/grid/ssh-broker.test.ts > default ssh transport runs real OpenSSH against an instrumented sshd for 60 channels",
+      "base": {
+        "file": "src/grid/ssh-broker.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/grid/ssh-broker.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/grid/ssh-broker.test.ts > generated ControlPath cannot be bypassed by an ssh -S option",
+      "base": {
+        "file": "src/grid/ssh-broker.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/grid/ssh-broker.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/grid/ssh-broker.test.ts > ssh broker snapshots options before building its transport",
+      "base": {
+        "file": "src/grid/ssh-broker.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/grid/ssh-broker.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/nexus/apps/app-host.test.ts > NEXUS-APP-DB-RPC-WIRE rechecks session expiry after a slow RPC body",
+      "base": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/nexus/apps/app-host.test.ts > NEXUS-APP-HOST-FS-HARDEN detects a version changed and restored mid-mount",
+      "base": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/nexus/apps/app-host.test.ts > NEXUS-APP-HOST-FS-HARDEN keeps same-event-loop mounts complete and rejects traversal paths",
+      "base": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/nexus/apps/app-host.test.ts > NEXUS-APP-HOST-FS-HARDEN mounts an immutable snapshot on an isolated app origin",
+      "base": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/nexus/apps/app-host.test.ts > NEXUS-APP-HOST-FS-HARDEN rejects a FIFO swapped in at the open boundary without blocking",
+      "base": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/nexus/apps/app-host.test.ts > NEXUS-APP-HOST-FS-HARDEN rejects a mixed snapshot when a later file changes the earlier file version",
+      "base": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/nexus/apps/app-host.test.ts > NEXUS-APP-HOST-FS-HARDEN rejects a nested directory swap to an external export",
+      "base": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/nexus/apps/app-host.test.ts > NEXUS-APP-HOST-FS-HARDEN rejects symlink swaps, nested links, and hardlinks",
+      "base": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/nexus/apps/app-host.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/nexus/index.test.ts > Nexus startup bearer token > live Nexus dispatches manifest STT through the app route registry and closed secret boundary",
+      "base": {
+        "file": "src/nexus/index.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "src/nexus/index.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "src/nexus/index.test.ts > Nexus startup bearer token > live Nexus dispatches manifest TTS through fake ElevenLabs and closed secret boundary",
+      "base": {
+        "file": "src/nexus/index.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "src/nexus/index.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "src/nexus/index.test.ts > Nexus startup bearer token > live runNexus boot wires four funnel events using installation identity and hashed identifiers",
+      "base": {
+        "file": "src/nexus/index.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "src/nexus/index.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "src/task-orchestrator/surfaces/pod-command-job.test.ts > pod command job manifest > host source mutation after node snapshot cannot change the gate-visible tree",
+      "base": {
+        "file": "src/task-orchestrator/surfaces/pod-command-job.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/task-orchestrator/surfaces/pod-command-job.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/task-orchestrator/surfaces/pod-source-receive.test.ts > podSourceScript > bundle script clones the verified bundle and refuses a one-character sha256 change",
+      "base": {
+        "file": "src/task-orchestrator/surfaces/pod-source-receive.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (readdirSync)"
+      },
+      "cut": {
+        "file": "src/task-orchestrator/surfaces/pod-source-receive.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (readdirSync)"
+      }
+    },
+    {
+      "failureId": "src/task-orchestrator/surfaces/pod-source-receive.test.ts > podSourceScript > commit source fetches and proves the supplied gate base is an ancestor of the cut",
+      "base": {
+        "file": "src/task-orchestrator/surfaces/pod-source-receive.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (readdirSync)"
+      },
+      "cut": {
+        "file": "src/task-orchestrator/surfaces/pod-source-receive.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (readdirSync)"
+      }
+    },
+    {
+      "failureId": "src/task-orchestrator/surfaces/self-implement-pod-host-mirror.test.ts > Pod host mirror Job wiring > bundle delivery keeps cp/ready after Job creation and full child logs report source-via image or clone",
+      "base": {
+        "file": "src/task-orchestrator/surfaces/self-implement-pod-host-mirror.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/task-orchestrator/surfaces/self-implement-pod-host-mirror.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/task-orchestrator/surfaces/self-implement-pod-host-mirror.test.ts > Pod host mirror raw-SHA fetch (real git, production upload-pack settings) > an exact-SHA fetch from a push-seeded bare host mirror checks out the parent-resolved SHA with no refs and no branch route",
+      "base": {
+        "file": "src/task-orchestrator/surfaces/self-implement-pod-host-mirror.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/task-orchestrator/surfaces/self-implement-pod-host-mirror.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/task-orchestrator/surfaces/self-implement-pod-host-mirror.test.ts > si-task Job result marker and mirror seed > ⑦ SI-SEED-DEFAULT: a default source resolves the branch tip once and seeds that sha before the Job; a miss skips with its reason and the Job still applies",
+      "base": {
+        "file": "src/task-orchestrator/surfaces/self-implement-pod-host-mirror.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      },
+      "cut": {
+        "file": "src/task-orchestrator/surfaces/self-implement-pod-host-mirror.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "spawns a command with an opaque repo input"
+      }
+    },
+    {
+      "failureId": "src/task-orchestrator/surfaces/self-implement-pod.test.ts > pod grounding token > a failed host push retries at the next poll with a fresh verified token; a human-token Job remains byte-identical",
+      "base": {
+        "file": "src/task-orchestrator/surfaces/self-implement-pod.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (ls-files)"
+      },
+      "cut": {
+        "file": "src/task-orchestrator/surfaces/self-implement-pod.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (ls-files)"
+      }
+    },
+    {
+      "failureId": "src/tui/size-contract.test.ts > next TUI entry stays within the audited runtime-static ceiling (goal: 100 files / 25k lines)",
+      "base": {
+        "file": "src/tui/size-contract.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (readdirSync)"
+      },
+      "cut": {
+        "file": "src/tui/size-contract.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (readdirSync)"
+      }
+    },
+    {
+      "failureId": "src/ux-sim/app-contract-secret-entropy.test.ts > APP-CONTRACT-SECRET-ENTROPY measures secret recall and false positives through the production parser",
+      "base": {
+        "file": "src/ux-sim/app-contract-secret-entropy.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "src/ux-sim/app-contract-secret-entropy.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "src/ux-sim/mock-scenario-catalog.test.ts > catalog schema, scenario/device links, evidence contract, and all ux-sim runtime modules are indexed",
+      "base": {
+        "file": "src/ux-sim/mock-scenario-catalog.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (readdirSync)"
+      },
+      "cut": {
+        "file": "src/ux-sim/mock-scenario-catalog.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (readdirSync)"
+      }
+    },
+    {
+      "failureId": "src/ux-sim/warm-pool-reuse-evidence-sim.test.ts > POD-REUSE-SWITCH-LIVE-SIM: verified leases persist measured evidence and enable the TA switch",
+      "base": {
+        "file": "src/ux-sim/warm-pool-reuse-evidence-sim.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      },
+      "cut": {
+        "file": "src/ux-sim/warm-pool-reuse-evidence-sim.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "reads a file through an opaque path"
+      }
+    },
+    {
+      "failureId": "test/layer-foundation.test.ts > foundation import boundary > static imports and single-root tsc stay inside the foundation boundary",
+      "base": {
+        "file": "test/layer-foundation.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "non-literal import/require"
+      },
+      "cut": {
+        "file": "test/layer-foundation.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "non-literal import/require"
+      }
+    },
+    {
+      "failureId": "test/spawn-sync-max-buffer.test.ts > harness · Pod · gate spawnSync readers specify maxBuffer (ratchet · allowlist only shrinks)",
+      "base": {
+        "file": "test/spawn-sync-max-buffer.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (ls-files)"
+      },
+      "cut": {
+        "file": "test/spawn-sync-max-buffer.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "scans (ls-files)"
+      }
+    },
+    {
+      "failureId": "test/ui-foundation-r9-u5b-target-boundary-source-truth.test.ts > ui foundation · R9.U-5(b) target boundary source truth > dashboard uses the shared target mount helper instead of an ad-hoc target-kind switch",
+      "base": {
+        "file": "test/ui-foundation-r9-u5b-target-boundary-source-truth.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "names directory src/dashboard"
+      },
+      "cut": {
+        "file": "test/ui-foundation-r9-u5b-target-boundary-source-truth.test.ts",
+        "imageDigest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "closure": {},
+        "opaqueReason": "names directory src/dashboard"
+      }
+    }
+  ],
+  "commits": [
+    {
+      "commit": "bdf9943ef72d4fd15648bcfc0c49b5dbddda063c",
+      "changedFiles": [
+        "scripts/release-loop/gate-flow-sim.test.ts",
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts"
+      ],
+      "prNumber": 35528
+    },
+    {
+      "commit": "09eaba45e067a9db4b5f877927dcdf262865d1c7",
+      "changedFiles": [
+        "scenarios/ux-sim/n30-old-graph-measured-waiver.yaml",
+        "scripts/release-loop/resume.test.ts",
+        "src/ux-sim/n30-old-graph-measured-waiver.test.ts",
+        "src/ux-sim/release-sim-rig.ts"
+      ],
+      "prNumber": 35575
+    },
+    {
+      "commit": "715e59dc9b3cedc319bcc75c5e82e0dbcaae6f80",
+      "changedFiles": [
+        "scripts/release-loop/gate-repair-node.ts",
+        "scripts/release-loop/rla-rehearsal-incident-sim-b.test.ts"
+      ],
+      "prNumber": 35578
+    },
+    {
+      "commit": "38dd0676e51831adcb3f5ae35dbf5b11f2c6fe08",
+      "changedFiles": [
+        "src/autopilot/gh-rest-fallback.test.ts",
+        "src/autopilot/gh-rest-fallback.ts"
+      ],
+      "prNumber": 35573
+    },
+    {
+      "commit": "87ed9d7b93b6a992a882f5b37eedde0a0af27068",
+      "changedFiles": [
+        "scripts/gate-tier-t0-contract.test.ts",
+        "seat-state/OP/patches/TRAIN-GATE-TIER-T0-1107.patch",
+        "seat-state/OP/tools/gate-tier-lanes.py",
+        "seat-state/OP/tools/test-gate-tier-lanes.py"
+      ],
+      "prNumber": 35577
+    },
+    {
+      "commit": "690a0be9226a68eaef8c13324e229c0f1f402757",
+      "changedFiles": [
+        "scripts/release-loop/gate-node.ts"
+      ],
+      "prNumber": 35582
+    },
+    {
+      "commit": "27000a4e752670ca30230400cbfeff9147f6c800",
+      "changedFiles": [
+        "scripts/isolation-hardcode-baseline.txt",
+        "src/debug/log.ts",
+        "src/mss/identity-store.ts",
+        "src/mss/log-enrich.ts",
+        "src/mss/trace-context.ts",
+        "src/mss/ulid.ts",
+        "src/mss/uri/builder.ts",
+        "src/platform/host-id.test.ts",
+        "src/platform/host-id.ts",
+        "src/storage/s3.ts",
+        "src/user-intent/logger.ts",
+        "test/mss/category-infer.test.ts",
+        "test/mss/identity.test.ts",
+        "test/mss/log-enrich.test.ts",
+        "test/mss/logging/debug-integration.test.ts"
+      ],
+      "prNumber": 35566
+    },
+    {
+      "commit": "e3beb524c13c0e37aaba7079d125bb8dc37e9819",
+      "changedFiles": [
+        ".rules/00-core/delivery-and-docs.md",
+        "docs/DECISION-product-positioning-2026-10-08.md",
+        "docs/_index.md",
+        "docs/conductor/CONDUCTOR.md",
+        "docs/conductor/RFC-app-dev-marketplace.md",
+        "docs/conductor/machine-setup.md"
+      ],
+      "prNumber": 35550
+    },
+    {
+      "commit": "0d4f256a5d0c62852c0d71485208f7b6ce5dae5e",
+      "changedFiles": [
+        "scenarios/ux-sim/gate-receipt-carry-any-run.yaml",
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-reuse-identity.test.ts",
+        "scripts/release-loop/gate-reuse-identity.ts",
+        "scripts/release-loop/gate-shard-dispatch.test.ts",
+        "scripts/release-loop/gate-shard-dispatch.ts",
+        "src/release-loop/gate-shard-ledger.ts"
+      ],
+      "prNumber": 35540
+    },
+    {
+      "commit": "88c342699ff335a3a9689689cd1c66ef89db86bb",
+      "changedFiles": [
+        "src/ux-sim/fake-app-db-world.test.ts",
+        "src/ux-sim/fake-app-db-world.ts"
+      ],
+      "prNumber": 35586
+    },
+    {
+      "commit": "14937098a0f70d8c514f33f52694cac6d1c0387b",
+      "changedFiles": [
+        "scripts/release-loop/export-check-node.test.ts",
+        "scripts/release-loop/export-check-node.ts",
+        "scripts/release-loop/export-check-remote.test.ts",
+        "scripts/release-loop/export-check-remote.ts",
+        "scripts/release-loop/unattended-release.ts"
+      ],
+      "prNumber": 35588
+    },
+    {
+      "commit": "805b7454298b277f6c75233af9112b525d3e9ea0",
+      "changedFiles": [
+        "src/mss/logging/log-federation.ts",
+        "src/mss/logging/log-store.ts"
+      ],
+      "prNumber": 35567
+    },
+    {
+      "commit": "a02ca2c794d49265e18a173260989a0530f56682",
+      "changedFiles": [
+        "src/autopilot/lineage/timeline.ts",
+        "src/autopilot/mission-history.ts",
+        "src/autopilot/mission-incident-context.ts",
+        "src/autopilot/mission-trace.ts",
+        "src/briefing/brief-items.ts",
+        "src/cli/logs-cli.ts",
+        "src/cli/logs-timeline.ts",
+        "src/debug/log.ts",
+        "src/domains/cron-match.test.ts",
+        "src/domains/cron-match.ts",
+        "src/domains/finance-tools.ts",
+        "src/domains/guardian-tick.ts",
+        "src/domains/market-quote.ts",
+        "src/domains/morning-synthesis.ts",
+        "src/domains/schedule-health-report.ts",
+        "src/domains/schedule-runner.ts",
+        "src/domains/schedule-state.ts",
+        "src/domains/watch-default-scheduler.ts",
+        "src/hq/fence.ts",
+        "src/input-core/audit-tail.ts",
+        "src/intake-plane/requirement-funnel.ts",
+        "src/loops/checker.ts",
+        "src/loops/registry.ts",
+        "src/session/session-context.ts",
+        "src/time/calendar.ts",
+        "src/time/clock.ts",
+        "src/time/format-core.ts",
+        "src/time/format.ts",
+        "src/time/time-zone.ts",
+        "src/user-config.ts",
+        "src/workflow-runtime/triggers/scheduler.ts"
+      ],
+      "prNumber": 35569
+    },
+    {
+      "commit": "6568f4cccea81a3dccd99064216cdbdc75eeb44f",
+      "changedFiles": [
+        "src/ad-pipeline/fixtures/marketing-studio-video.schema.json",
+        "src/ad-pipeline/fixtures/seedance-2-0.schema.json",
+        "src/ad-pipeline/higgsfield-backend.ts",
+        "src/ad-pipeline/product-video-command.test.ts",
+        "src/ad-pipeline/product-video-command.ts",
+        "src/ad-pipeline/shoot-plan.ts",
+        "src/nexus/apps/app-actions.test.ts",
+        "src/nexus/apps/app-actions.ts",
+        "src/nexus/apps/app-jobs.test.ts",
+        "src/nexus/apps/app-jobs.ts",
+        "src/nexus/index.test.ts",
+        "src/nexus/index.ts"
+      ],
+      "prNumber": 35594
+    },
+    {
+      "commit": "468b47eb1602cff3634115ee07b718b639ad7b76",
+      "changedFiles": [
+        "docs/conductor/CONDUCTOR.md",
+        "docs/conductor/RFC-release-loop-autonomy-and-coordinator.md"
+      ],
+      "prNumber": 35519
+    },
+    {
+      "commit": "2933bc3427d428af4fd11343ce77c9e9a4e3ebdf",
+      "changedFiles": [
+        "scripts/sim-impact.test.ts",
+        "scripts/sim-impact.ts"
+      ],
+      "prNumber": 35590
+    },
+    {
+      "commit": "d6a7b59f549904616010dac3d663188fc3d383a1",
+      "changedFiles": [
+        "src/guardian/host-lease.test.ts",
+        "src/guardian/host-lease.ts"
+      ],
+      "prNumber": 35589
+    },
+    {
+      "commit": "6487b929388e3939108a186f61a22c967624ea7d",
+      "changedFiles": [
+        "scenarios/ux-sim/rla-arg-adaptive-heal.yaml",
+        "scripts/release-loop/adaptive-gate-heal-adapter.test.ts",
+        "scripts/release-loop/adaptive-gate-heal-adapter.ts",
+        "scripts/release-loop/adaptive-gate-heal.sim.test.ts",
+        "scripts/release-loop/adaptive-gate-heal.ts",
+        "scripts/release-loop/gate-image-repair-node.ts",
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-triage-node.ts",
+        "src/graph-runner/runner.ts"
+      ],
+      "prNumber": 35591
+    },
+    {
+      "commit": "8a6eb3f86726725bc17d57445d575991f3c8ad82",
+      "changedFiles": [
+        ".rules/00-core/delivery-and-docs.md",
+        "docs/_index.md",
+        "docs/conductor/CONDUCTOR.md",
+        "docs/conductor/RFC-user-home-and-web-surfaces.md"
+      ],
+      "prNumber": 35593
+    },
+    {
+      "commit": "ac7d1d9b9def0d7502231ce90742e5782d3cb48c",
+      "changedFiles": [
+        "src/acp/core-turn-bridge-autoheal-reset.test.ts",
+        "src/acp/core-turn-bridge-route-provider.test.ts",
+        "src/acp/core-turn-bridge-seat-turn-cap.test.ts",
+        "src/acp/core-turn-bridge-turn-end.test.ts",
+        "src/acp/core-turn-bridge.test.ts",
+        "src/acp/reasoning-thought-buffer.test.ts",
+        "src/autopilot/elanous-builtin-runner-integration.test.ts",
+        "src/boot/daemon-prompt-turn.test.ts",
+        "src/boot/daemon-runtime-first-turn-anchor.test.ts",
+        "src/boot/daemon-runtime-tui-route.test.ts",
+        "src/boot/project-runtime.test.ts",
+        "src/nexus/api/meta-api.test.ts",
+        "src/session/chat.test.ts",
+        "src/skills/tools/persistent-grounding.test.ts",
+        "src/ux-sim/turn-states.test.ts",
+        "test/acp-core-turn-bridge-request-size.test.ts",
+        "test/acp-core-turn-bridge.test.ts",
+        "test/acp-multi-llm-bridge.test.ts",
+        "test/daemon-prompt-turn-tool-result.test.ts",
+        "test/daemon-prompt-turn.test.ts",
+        "test/daemon-runtime-input-source.test.ts",
+        "test/nexus-meta-api-pwa-tts-bridge.test.ts",
+        "test/nexus-prompt-stream-sse.test.ts",
+        "test/persistent-grounding-runtime.test.ts",
+        "test/repl-agent-abort.test.ts",
+        "test/session-input-arbiter-wiring.test.ts",
+        "test/speech-style-daemon.test.ts"
+      ],
+      "prNumber": 35570
+    },
+    {
+      "commit": "1a31b5f297a69b3af8ba7415128a96a36c80ce0e",
+      "changedFiles": [
+        "docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md",
+        "scripts/ux-sim.ts",
+        "src/sim-world-device-catalogs.json",
+        "src/ux-sim/mock-scenario-catalog.json",
+        "src/ux-sim/mock-scenario-catalog.test.ts",
+        "src/ux-sim/readiness-countdown.test.ts",
+        "src/ux-sim/readiness-countdown.ts"
+      ],
+      "prNumber": 35557
+    },
+    {
+      "commit": "39604f131a70623ca9b8464ce6392783f307bc76",
+      "changedFiles": [
+        "scripts/release-loop/gate-flow-sim.test.ts",
+        "scripts/release-loop/gate-node.ts"
+      ],
+      "prNumber": 35595
+    },
+    {
+      "commit": "f447286c8f67ee242d56020a185174efcea05f0a",
+      "changedFiles": [
+        "src/autopilot/pr-manager.test.ts",
+        "src/autopilot/pr-manager.ts",
+        "src/cli/pr-cli.ts",
+        "test/cli/pr-cli.test.ts"
+      ],
+      "prNumber": 35568
+    },
+    {
+      "commit": "a6e9684796c98c299258cb485bee32b7a4c701e2",
+      "changedFiles": [
+        "scripts/release-loop/gate-node.ts"
+      ],
+      "prNumber": 35602
+    },
+    {
+      "commit": "56895246a0cda6791ae5d9f10c6639b5915917bf",
+      "changedFiles": [
+        "docs/INDEX-loop-agents-and-harness-rfcs.md",
+        "docs/conductor/CONDUCTOR.md",
+        "docs/conductor/RFC-guardian-resource-ledger.md"
+      ],
+      "prNumber": 35522
+    },
+    {
+      "commit": "5c53008ac105fcf4b0e41b95c31d92a8038e045a",
+      "changedFiles": [
+        "scripts/windows-startup-smoke.test.ts",
+        "src/cli/machine-wsl-setup.test.ts",
+        "src/cli/machine-wsl-setup.ts",
+        "src/intake-plane/wish-benchmark-ledger.ts"
+      ],
+      "prNumber": 35599
+    },
+    {
+      "commit": "bb761b80fdab513a3a532816825534afc4f20b29",
+      "changedFiles": [
+        "src/ux-sim/turn-states.test.ts"
+      ],
+      "prNumber": 35603
+    },
+    {
+      "commit": "b2c36eb91183d588e6ca5852498fb8eccdba6094",
+      "changedFiles": [
+        "docs/TECH-harness-map-2026-10-06.md",
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "src/release-loop/gate-shard-ledger.test.ts",
+        "src/release-loop/gate-shard-ledger.ts"
+      ],
+      "prNumber": 35574
+    },
+    {
+      "commit": "aaa54bc546d813a5f6f061c4dcf0427e7f066274",
+      "changedFiles": [
+        "docs/manual/MANUAL-user-config.md",
+        "src/nexus/api/http-server.test.ts",
+        "src/nexus/api/http-server.ts",
+        "src/relay/channel.ts",
+        "src/relay/host-connector.test.ts",
+        "src/relay/host-connector.ts",
+        "src/relay/mux.test.ts",
+        "src/relay/mux.ts",
+        "src/relay/relay-server.ts",
+        "src/user-config.test.ts",
+        "src/user-config.ts"
+      ],
+      "prNumber": 35579
+    },
+    {
+      "commit": "7a8e21cbe7bf65ba9734cc6ba16837a79f10c4c8",
+      "changedFiles": [
+        "scripts/ratchets/test-interference-patterns.allowlist.txt"
+      ],
+      "prNumber": 35606
+    },
+    {
+      "commit": "9c83c405e6c7fdc16299575eed53de39534e7e42",
+      "changedFiles": [
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-shard-dispatch.test.ts",
+        "scripts/release-loop/gate-shard-dispatch.ts",
+        "scripts/release-loop/gate-shard-receipts.test.ts",
+        "scripts/release-loop/gate-shard-receipts.ts",
+        "scripts/release-loop/resume-release.test.ts",
+        "scripts/release-loop/resume-release.ts",
+        "src/runtime-identity.test.ts",
+        "src/runtime-identity.ts"
+      ],
+      "prNumber": 35587
+    },
+    {
+      "commit": "fab4a47ed90fb69ec68e9b5eee1817483031e395",
+      "changedFiles": [
+        "scripts/release-loop/gate-node.ts",
+        "src/graph-runner/runner.ts"
+      ],
+      "prNumber": 35609
+    },
+    {
+      "commit": "e18da73984a6d2739828765f876224bfa5f3a7bf",
+      "changedFiles": [
+        "src/nexus/apps/funnel-observe.test.ts",
+        "src/nexus/apps/funnel-observe.ts"
+      ],
+      "prNumber": 35598
+    },
+    {
+      "commit": "8934fdab2370b8e5db15369d128b6c6b6733c25f",
+      "changedFiles": [
+        "scripts/ci-typecheck-changed.test.ts",
+        "scripts/ci-typecheck-changed.ts"
+      ],
+      "prNumber": 35612
+    },
+    {
+      "commit": "4b7a392384cd8764c6588f9bd5efbc0c89ae9752",
+      "changedFiles": [
+        "graphs/release/release-loop.yaml",
+        "scripts/release-loop/release-loop-graph.test.ts"
+      ],
+      "prNumber": 35600
+    },
+    {
+      "commit": "aed054047d70ebcaca4c9ef8401ddb0e220df2bd",
+      "changedFiles": [
+        "src/cli/pr-cli.ts",
+        "src/cli/pr-land-drift-radar.test.ts",
+        "src/cli/pr-land-drift-radar.ts",
+        "src/cli/pr-land-drift-repair.ts",
+        "test/cli/pr-cli.test.ts"
+      ],
+      "prNumber": 35411
+    },
+    {
+      "commit": "39b2aa027f57496fc61a4eb800a48f9b4d299abf",
+      "changedFiles": [
+        "docs/generated/cli-anatomy.md",
+        "release/next.md",
+        "src/cli/secret-cli.ts",
+        "src/nexus/config/secrets.ts",
+        "src/nexus/config/secrets/app-secret-ledger.test.ts",
+        "src/nexus/config/secrets/cred-slot-schema.ts",
+        "src/nexus/config/secrets/cred-slots.ts",
+        "src/nexus/config/secrets/file-backend.ts",
+        "src/nexus/config/secrets/index.ts",
+        "src/nexus/config/secrets/registry.ts",
+        "src/nexus/index.test.ts"
+      ],
+      "prNumber": 35583
+    },
+    {
+      "commit": "713e6cc76d54b742200d1bea17d930862f75789b",
+      "changedFiles": [
+        "src/nexus/api/http-server.test.ts",
+        "src/relay/relay-cli.ts",
+        "src/relay/relay-server.test.ts",
+        "src/relay/relay-server.ts"
+      ],
+      "prNumber": 35610
+    },
+    {
+      "commit": "f7a303e1274740607b014e31035628dc687ad9ed",
+      "changedFiles": [
+        "scripts/release-loop/gate-flow-sim.test.ts",
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-shard-dispatch.test.ts",
+        "scripts/release-loop/gate-shard-dispatch.ts",
+        "src/graph-runner/runner.test.ts",
+        "src/graph-runner/runner.ts"
+      ],
+      "prNumber": 35605
+    },
+    {
+      "commit": "9275e4a501cb54c189b85d43c977b93ac39800ae",
+      "changedFiles": [
+        "src/nexus/apps/app-actions.ts",
+        "src/nexus/apps/app-auth.ts",
+        "src/nexus/apps/app-host.ts",
+        "src/nexus/apps/app-storage.ts",
+        "src/nexus/apps/funnel-observe.test.ts",
+        "src/nexus/apps/funnel-observe.ts",
+        "src/nexus/apps/funnel-wiring.test.ts",
+        "src/nexus/index.test.ts",
+        "src/nexus/index.ts"
+      ],
+      "prNumber": 35607
+    },
+    {
+      "commit": "e319e0335a01a5173dc1ca792204048bdca9aa57",
+      "changedFiles": [
+        "scripts/windows-startup-smoke.test.ts",
+        "src/cli/machine-wsl-setup.test.ts",
+        "src/cli/machine-wsl-setup.ts",
+        "src/intake-plane/wish-benchmark-ledger.ts"
+      ],
+      "prNumber": 35604
+    },
+    {
+      "commit": "6873f98369073b5cadf517a33d75270996cb58a6",
+      "changedFiles": [
+        "docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md",
+        "scenarios/ux-sim/warm-pool-reuse-world.yaml",
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/warm-pool-provider-config.test.ts",
+        "scripts/warm-pool-provider-config.ts",
+        "src/sim-world-device-catalogs.json",
+        "src/task-orchestrator/surfaces/pod-si-warm-host.ts",
+        "src/task-orchestrator/surfaces/pod-si-warm-provider.test.ts",
+        "src/task-orchestrator/surfaces/pod-si-warm-provider.ts",
+        "src/task-orchestrator/surfaces/pod-si-warm-runner.ts",
+        "src/task-orchestrator/surfaces/pod-warm-provenance.ts",
+        "src/task-orchestrator/surfaces/pod-warm-worker-pod.ts",
+        "src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts",
+        "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts",
+        "src/ux-sim/fake-kubectl.test.ts",
+        "src/ux-sim/fake-kubectl.ts",
+        "src/ux-sim/mock-scenario-catalog.json",
+        "src/ux-sim/pod-reuse-match-by-kind-sim.test.ts",
+        "src/ux-sim/pod-reuse-match-by-kind-sim.ts",
+        "src/ux-sim/warm-pool-reuse-sim.test.ts",
+        "src/ux-sim/warm-pool-reuse-sim.ts",
+        "src/ux-sim/warm-si-reuse-sim.test.ts",
+        "src/ux-sim/warm-si-reuse-sim.ts"
+      ],
+      "prNumber": 35542
+    },
+    {
+      "commit": "43d0535e95242605d80192b7cedd63a092e0910a",
+      "changedFiles": [
+        "src/cli/pr-land-drift-radar.test.ts",
+        "src/cli/pr-land-drift-radar.ts"
+      ],
+      "prNumber": 35614
+    },
+    {
+      "commit": "9d49426deca8e4bd4caa4305291e86eb50783cbd",
+      "changedFiles": [
+        "src/chat/index.ts",
+        "src/dashboard/auto-tts/auto-tts-controller.ts",
+        "src/dashboard/auto-tts/auto-tts-host-boot.ts",
+        "src/dashboard/auto-tts/pfc-voice-runtime.ts",
+        "src/dashboard/index.ts",
+        "src/dashboard/input/chat-main-acp-dispatch.test.ts",
+        "src/dashboard/input/chat-main-acp-dispatch.ts",
+        "src/dashboard/input/chat-main-interaction-opts.ts",
+        "src/dashboard/input/chat-main-plain-turn-runtime.ts",
+        "src/dashboard/input/chat-main-submit-control.ts",
+        "src/dashboard/input/chat-main-visibility.ts",
+        "src/dashboard/input/control-signal-consumers.ts",
+        "src/dashboard/input/dashboard-plain-turn-settle-sink.ts",
+        "src/dashboard/input/dashboard-plain-turn-stream.ts",
+        "src/dashboard/input/dashboard-priority-key-route.test.ts",
+        "src/dashboard/input/dashboard-priority-key-route.ts",
+        "src/dashboard/input/dictation-surface-allowlist.ts",
+        "src/dashboard/input/mouse-wiring.ts",
+        "src/dashboard/input/space-longpress-detector.ts",
+        "src/dashboard/input/voice-dictation.ts",
+        "src/dashboard/slash-runtime/dashboard-handlers.ts",
+        "src/dashboard/voice-chat/voice-chat-host-boot.ts",
+        "src/dashboard/voice-chat/voice-chat-mode-controller.ts",
+        "src/dashboard/voice-chat/voice-chat-pipeline.ts",
+        "src/dashboard/voice-host-boot.ts",
+        "src/dashboard/voice-input-host.ts",
+        "src/dashboard/voice-runtime.ts",
+        "src/input/turn-output-bundle.ts",
+        "src/keybindings.ts",
+        "src/llm-stream-disconnect-retry.test.ts",
+        "src/maturity/feature-maturity.ts",
+        "src/self-health/signatures.test.ts",
+        "src/status/bar.ts",
+        "src/tui.ts",
+        "src/ux-sim/classic-tui-seat-scenarios.test.ts",
+        "src/voice/channel-adapters/discord-voice-channel-harness.ts",
+        "src/voice/tts/sentence-segmenter.ts",
+        "test/dashboard-auto-tts-controller.test.ts",
+        "test/dashboard-auto-tts-host-boot.test.ts",
+        "test/dashboard-auto-tts-segmenter.test.ts",
+        "test/dashboard-chat-main-acp-dispatch.test.ts",
+        "test/dashboard-chat-main-plain-turn-runtime.test.ts",
+        "test/dashboard-chat-main-submit-control.test.ts",
+        "test/dashboard-chat-main-visibility.test.ts",
+        "test/dashboard-control-signal-consumers.test.ts",
+        "test/dashboard-dictation-surface-allowlist.test.ts",
+        "test/dashboard-plain-turn-settle-sink.test.ts",
+        "test/dashboard-plain-turn-stream.test.ts",
+        "test/dashboard-priority-key-route.test.ts",
+        "test/dashboard-slash-registry.test.ts",
+        "test/dashboard-voice-chat-controller.test.ts",
+        "test/dashboard-voice-chat-host-boot.test.ts",
+        "test/dashboard-voice-chat-pipeline.test.ts",
+        "test/dashboard-voice-chat-realtime-toggle.test.ts",
+        "test/dashboard-voice-dictation.test.ts",
+        "test/dashboard-voice-host-boot.test.ts",
+        "test/dashboard-voice-runtime.test.ts",
+        "test/dashboard/auto-tts/pfc-voice-runtime.test.ts",
+        "test/space-longpress-detector.test.ts",
+        "test/turn-output-bundle.test.ts",
+        "test/voice-chat-realtime-modal-a.test.ts",
+        "test/voice-cost-tracker.test.ts",
+        "test/voice-wiring.test.ts"
+      ],
+      "prNumber": 35259
+    },
+    {
+      "commit": "a276b2443590324a5b7772e8c001e7f25fcfd163",
+      "changedFiles": [
+        "src/nexus/apps/app-source-snapshot.ts",
+        "src/ux-sim/fake-app-source-concurrent-writer.ts",
+        "src/ux-sim/fake-app-source-world.test.ts",
+        "src/ux-sim/fake-app-source-world.ts"
+      ],
+      "prNumber": 35497
+    },
+    {
+      "commit": "765817740ae0c471117e3c95c47b6de5b1783755",
+      "changedFiles": [
+        "scripts/release-loop/export-check-node.test.ts",
+        "scripts/release-loop/export-check-node.ts",
+        "scripts/release-loop/export-check-remote.test.ts",
+        "scripts/release-loop/export-check-remote.ts",
+        "scripts/release-loop/unattended-release.ts"
+      ],
+      "prNumber": 35611
+    },
+    {
+      "commit": "3b8d3b5af799df8c9f41deeea86135ae23b4269a",
+      "changedFiles": [
+        "scenarios/ux-sim/release-sim-rig.yaml",
+        "scripts/release-loop/resume.test.ts",
+        "src/ux-sim/release-sim-rig.test.ts",
+        "src/ux-sim/release-sim-rig.ts"
+      ],
+      "prNumber": 35615
+    },
+    {
+      "commit": "6be36c7a4d2a8bef9feb326584001da728583c5d",
+      "changedFiles": [
+        "docs/marketing/decks/SOURCES-pitch-2026-10.md"
+      ],
+      "prNumber": 35627
+    },
+    {
+      "commit": "95a882b273ea75521c6d081a5074d219e45411c4",
+      "changedFiles": [
+        "scripts/release-loop/gate-repair-node.ts",
+        "src/setup/llm-env-detect.test.ts",
+        "src/tui-client/next-loop-command.test.ts",
+        "src/tui/size-contract.test.ts"
+      ],
+      "prNumber": 35628
+    },
+    {
+      "commit": "36dc3371caffb26b1311ebdb79d75c791cb0e95d",
+      "changedFiles": [
+        "src/relay/relay-server.test.ts",
+        "src/relay/relay-server.ts"
+      ],
+      "prNumber": 35618
+    },
+    {
+      "commit": "c751f087ebff1ba858540df18138cbd8fc770ca4",
+      "changedFiles": [
+        "src/dashboard/index.ts",
+        "src/dashboard/scenario-runtime-boot.ts",
+        "src/dashboard/scenario-tools-boot.ts",
+        "test/dashboard-scenario-runtime-boot.test.ts",
+        "test/dashboard-scenario-tui-cut.test.ts",
+        "test/scenarios/p5c-a-dashboard-wire.integration.test.ts"
+      ],
+      "prNumber": 35619
+    },
+    {
+      "commit": "69cb1425289a1e34385fe146375411be44e1994e",
+      "changedFiles": [
+        "docs/generated/cli-anatomy.md",
+        "src/cli/app-cli.test.ts",
+        "src/cli/app-cli.ts"
+      ],
+      "prNumber": 35608
+    },
+    {
+      "commit": "b699c66c23532a7d498bfa2efaf2e1d24b724728",
+      "changedFiles": [
+        "scenarios/ux-sim/gate-receipt-carry-any-run.yaml",
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-shard-receipts.ts"
+      ],
+      "prNumber": 35626
+    },
+    {
+      "commit": "e3462bf4da36bbd385f82723e60abe162445f3c2",
+      "changedFiles": [
+        "src/task-orchestrator/surfaces/pod-si-warm-provider.test.ts"
+      ],
+      "prNumber": 35630
+    },
+    {
+      "commit": "aba14369da63fb5a12c65260d0b985a836df179f",
+      "changedFiles": [
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "src/task-orchestrator/surfaces/pod-command-job.test.ts",
+        "src/task-orchestrator/surfaces/pod-command-job.ts",
+        "src/task-orchestrator/surfaces/pod-gate-deps.test.ts",
+        "src/task-orchestrator/surfaces/pod-gate-deps.ts",
+        "src/task-orchestrator/surfaces/pod-gate-volume-ref.test.ts",
+        "src/task-orchestrator/surfaces/pod-gate-volume-ref.ts",
+        "src/task-orchestrator/surfaces/pod-install-slots.ts",
+        "src/task-orchestrator/surfaces/pod-source-receive.test.ts",
+        "src/task-orchestrator/surfaces/pod-source-receive.ts"
+      ],
+      "prNumber": 35551
+    },
+    {
+      "commit": "9f8eb0f9455c0f62fa9ec6319837d648083cd16e",
+      "changedFiles": [
+        "docs/conductor/CONDUCTOR.md",
+        "docs/conductor/user-ops-space.md"
+      ],
+      "prNumber": 35631
+    },
+    {
+      "commit": "c6ce86e085a8c0adf2e454f65c3eead7a85f7d4c",
+      "changedFiles": [
+        "scripts/release-loop/gate-node-sim.test.ts",
+        "scripts/release-loop/gate-node-sim.ts",
+        "scripts/release-loop/resume-release.test.ts",
+        "src/cli/sim-cli.test.ts",
+        "src/ux-sim/gate-roster-second-pool.test.ts",
+        "src/ux-sim/gate-roster-second-pool.ts",
+        "src/ux-sim/gate-shard-host-reroute.test.ts",
+        "src/ux-sim/gate-shard-host-reroute.ts",
+        "src/ux-sim/release-incident-events.test.ts",
+        "src/ux-sim/release-sim-rig.test.ts",
+        "src/ux-sim/release-sim-rig.ts"
+      ],
+      "prNumber": 35635
+    },
+    {
+      "commit": "af5e4d7655246b22fb378f1dd0762ef4c4324fc8",
+      "changedFiles": [
+        "apps/pwa/src/lib/chat-runtime.ts",
+        "scripts/release-loop/gate-pod-stall.test.ts"
+      ],
+      "prNumber": 35649
+    },
+    {
+      "commit": "4033fb171d554823200dfe18dbb4cd19024f3728",
+      "changedFiles": [
+        "src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts",
+        "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts"
+      ],
+      "prNumber": 35633
+    },
+    {
+      "commit": "4796114f75d2ac7054a6830e0ad4662d4ebd91b6",
+      "changedFiles": [
+        "src/pr-tool/census.test.ts",
+        "src/pr-tool/census.ts"
+      ],
+      "prNumber": 35639
+    },
+    {
+      "commit": "633645e53332b42b7a79a3cbe152063445176118",
+      "changedFiles": [
+        "scripts/release-loop/export-check-node.ts",
+        "scripts/release-loop/pwa-build-typecheck.test.ts",
+        "scripts/release-loop/pwa-build-typecheck.ts"
+      ],
+      "prNumber": 35617
+    },
+    {
+      "commit": "3ba992285a2d6f2b3f729beb1ffa9ebd611f6a6f",
+      "changedFiles": [
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-shard-artifacts.ts",
+        "scripts/release-loop/gate-shard-load-flaky.test.ts",
+        "scripts/release-loop/gate-test-summary.ts"
+      ],
+      "prNumber": 35640
+    },
+    {
+      "commit": "d589ae7a561cc281204c403aadb59ef6e3b70cab",
+      "changedFiles": [
+        "src/self-implement/pod-warm-pool-profile.test.ts",
+        "src/self-implement/pod-warm-pool-profile.ts"
+      ],
+      "prNumber": 35655
+    },
+    {
+      "commit": "23279dc82dafc7ce6c2e2dfb69da4348f3d997a3",
+      "changedFiles": [
+        "scripts/release-loop/resume.test.ts",
+        "scripts/release-loop/resume.ts",
+        "src/ux-sim/release-sim-rig.ts"
+      ],
+      "prNumber": 35663
+    },
+    {
+      "commit": "19a9a6d63cee6c7e737ba9ac2b7672403f8f64f7",
+      "changedFiles": [
+        "src/ux-sim/pod-reuse-world.test.ts",
+        "src/ux-sim/pod-reuse-world.ts"
+      ],
+      "prNumber": 35648
+    },
+    {
+      "commit": "7a8e9aa1bbf96264055b6b08eb701586737f23ee",
+      "changedFiles": [
+        "docs/conductor/secrets.md",
+        "src/auth/setup-link-tokens.fixture.ts",
+        "src/auth/setup-link-tokens.test.ts",
+        "src/auth/setup-link-tokens.ts",
+        "src/nexus/api/http-server.ts",
+        "src/nexus/api/public-routes.ts",
+        "src/nexus/api/setup-claim.test.ts",
+        "src/nexus/api/setup-credentials.fixture.ts",
+        "src/nexus/api/setup-credentials.test.ts",
+        "src/nexus/api/setup-credentials.ts",
+        "src/nexus/config/secrets/file-backend.ts",
+        "src/nexus/config/secrets/registry.ts",
+        "src/nexus/config/types.ts",
+        "src/nexus/setup-status.ts"
+      ],
+      "prNumber": 35620
+    },
+    {
+      "commit": "c4571a4f489cb4d248bba160092935facabff195",
+      "changedFiles": [
+        "src/tui/entry-new-session.test.ts",
+        "src/tui/entry.ts",
+        "src/tui/size-contract.test.ts",
+        "src/tui/slash/new-session.ts"
+      ],
+      "prNumber": 35654
+    },
+    {
+      "commit": "e0ecc756e5671c65831157003751988a69607d76",
+      "changedFiles": [
+        "docs/conductor/app-yaml-contract.md",
+        "docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md",
+        "src/nexus/apps/drive-contract.ts",
+        "src/sim-world-device-catalogs.json",
+        "src/ux-sim/fake-app-drive-world.test.ts",
+        "src/ux-sim/fake-app-drive-world.ts",
+        "src/ux-sim/mock-scenario-catalog.json",
+        "src/ux-sim/mock-scenario-catalog.test.ts"
+      ],
+      "prNumber": 35645
+    },
+    {
+      "commit": "3297a2a149ae1cf7f4ed74094784756a30adf936",
+      "changedFiles": [
+        "scripts/release-loop/gate-closure.ts",
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-partial.test.ts"
+      ],
+      "prNumber": 35623
+    },
+    {
+      "commit": "68c4fa3413c955bba4788966f8b799f8ff54e255",
+      "changedFiles": [
+        "scripts/sim-impact.test.ts",
+        "scripts/sim-impact.ts",
+        "src/loops/orchestrator/overlap.test.ts",
+        "src/loops/orchestrator/overlap.ts",
+        "src/loops/orchestrator/sim-impact-audit.test.ts",
+        "src/loops/orchestrator/sim-impact-audit.ts",
+        "src/loops/orchestrator/tick.test.ts",
+        "src/loops/orchestrator/tick.ts",
+        "src/self-dev/sim-impact-wording.ts"
+      ],
+      "prNumber": 35601
+    },
+    {
+      "commit": "34bfbc74526658bd792739307ede2cd1fdfdfbe1",
+      "changedFiles": [
+        "graphs/release/recipes.yaml",
+        "graphs/release/release-loop.yaml",
+        "scenarios/ux-sim/rla-postland-recovery-hitl.yaml",
+        "scripts/release-loop/gate-repair-node.ts",
+        "scripts/release-loop/node-verdict.ts",
+        "scripts/release-loop/repair-pr-landed.test.ts",
+        "scripts/release-loop/repair-pr-landed.ts",
+        "scripts/release-loop/rla-postland-recovery-hitl.sim.test.ts",
+        "src/graph-runner/runner.test.ts",
+        "src/graph-runner/runner.ts"
+      ],
+      "prNumber": 35616
+    },
+    {
+      "commit": "389b8e32593644b2fa811cc2306c680bf6f1e61a",
+      "changedFiles": [
+        "scripts/release-loop/gate-env-baseline.test.ts",
+        "scripts/release-loop/gate-nightly-audits.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-pod-stall-failfast.test.ts",
+        "scripts/release-loop/gate-shard-shell.ts",
+        "scripts/release-loop/gate-warm-pod-live.test.ts",
+        "scripts/release-loop/version-node.test.ts",
+        "scripts/test-diet/lib.test.ts",
+        "scripts/test-diet/node.ts",
+        "src/task-orchestrator/surfaces/pod-gate-deps.test.ts"
+      ],
+      "prNumber": 35629
+    },
+    {
+      "commit": "7208e55e4ed163957a51c8e0700c25d002fecf1c",
+      "changedFiles": [
+        "src/tui-render-cache.ts",
+        "src/tui-terminal-contract.ts",
+        "src/tui.test.ts",
+        "src/tui.ts"
+      ],
+      "prNumber": 35672
+    },
+    {
+      "commit": "76ecd1db223f54d410366012f3d8489cb40b6aee",
+      "changedFiles": [
+        "src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts",
+        "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts"
+      ],
+      "prNumber": 35668
+    },
+    {
+      "commit": "508594b7cfdb5d19cb586e57fc429fc0c4783c3c",
+      "changedFiles": [
+        "src/ad-pipeline/production-contract.ts",
+        "src/ad-pipeline/production.ts",
+        "src/ad-pipeline/run.ts",
+        "test/ad-production.test.ts"
+      ],
+      "prNumber": 35664
+    },
+    {
+      "commit": "6fea85fc2cb23564730eab0d17c72518711c9816",
+      "changedFiles": [
+        "scenarios/ux-sim/fixtures/release-cut-0306-shards.json",
+        "scenarios/ux-sim/release-cut-preflight-regressions.yaml",
+        "scripts/release-loop/gate-cut-preflight-sim.test.ts"
+      ],
+      "prNumber": 35624
+    },
+    {
+      "commit": "1f8e63760a639e50ff850170f966503f73f5d40e",
+      "changedFiles": [
+        "src/ux-sim/fake-relay-world.test.ts",
+        "src/ux-sim/fake-relay-world.ts"
+      ],
+      "prNumber": 35320
+    },
+    {
+      "commit": "eb062fdbc9a8df81e447e9810d4fcc110001d904",
+      "changedFiles": [
+        ".rules/20-repo/daemon-endpoint.md",
+        "src/cli/nexus-show.ts",
+        "src/cli/pwa-show-contract.ts",
+        "src/cli/pwa-show-cycle.test.ts",
+        "src/cli/pwa-show.ts",
+        "src/nexus/daemon-endpoint.ts",
+        "src/nexus/pwa-resolution.ts"
+      ],
+      "prNumber": 35647
+    },
+    {
+      "commit": "85ba6c0d2e1debb2540dd6043a2ad87f3805dfd0",
+      "changedFiles": [
+        "scripts/release-loop/resume-unmeasured-gate.test.ts",
+        "scripts/release-loop/resume.ts"
+      ],
+      "prNumber": 35680
+    },
+    {
+      "commit": "3f454b2dc7f336bbf092fdadc0407943fff27485",
+      "changedFiles": [
+        ".rules/00-core/delivery-and-docs.md",
+        "docs/_index.md",
+        "docs/conductor/CONDUCTOR.md",
+        "docs/conductor/google-drive-read-interface-draft.md",
+        "docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md",
+        "scenarios/ux-sim/google-drive-files-list-readonly.yaml",
+        "src/sim-world-device-catalogs.json",
+        "src/ux-sim/fake-google-drive-world.test.ts",
+        "src/ux-sim/fake-google-drive-world.ts",
+        "src/ux-sim/mock-scenario-catalog.json",
+        "src/ux-sim/mock-scenario-catalog.test.ts"
+      ],
+      "prNumber": 35622
+    },
+    {
+      "commit": "6ada26edbe286758b710dd6541c1ed0fb7d417e0",
+      "changedFiles": [
+        "src/llm-bedrock-provider.test.ts",
+        "src/llm-openrouter-routing.test.ts",
+        "src/ux-sim/fake-fetch.test.ts",
+        "src/ux-sim/fake-fetch.ts"
+      ],
+      "prNumber": 35681
+    },
+    {
+      "commit": "3a2ceb8fc40fd3cccb7b7b7cb1236c1ac361ec96",
+      "changedFiles": [
+        "scripts/release-loop/resume-release.test.ts",
+        "scripts/release-loop/resume-release.ts",
+        "scripts/release-loop/unattended-release.test.ts",
+        "scripts/release-loop/unattended-release.ts",
+        "src/release-loop/macrophage-heal-node.test.ts",
+        "src/release-loop/macrophage-heal-node.ts"
+      ],
+      "prNumber": 35676
+    },
+    {
+      "commit": "5e7b9447be51393a2817c111c8195406211a1025",
+      "changedFiles": [
+        "scripts/release-loop/adaptive-gate-heal-adapter.test.ts",
+        "scripts/release-loop/adaptive-gate-heal-adapter.ts",
+        "scripts/release-loop/adaptive-gate-heal.sim.test.ts",
+        "scripts/release-loop/adaptive-gate-heal.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-triage-node.test.ts",
+        "scripts/release-loop/gate-triage-node.ts",
+        "scripts/release-loop/gate-triage-types.ts",
+        "scripts/release-loop/gate-type-boundary.test.ts",
+        "scripts/release-loop/gate-types.ts",
+        "scripts/release-loop/release-heal-macrophage-bus.sim.test.ts",
+        "src/release-loop/light-rc.ts"
+      ],
+      "prNumber": 35646
+    },
+    {
+      "commit": "af430cb3119cb5a43d5961e6cdd9a1189dee934c",
+      "changedFiles": [
+        "apps/pwa/src/app/apps/page.test.tsx",
+        "apps/pwa/src/app/apps/page.tsx",
+        "apps/pwa/src/components/apps/AppSimLiveView.test.tsx",
+        "apps/pwa/src/components/apps/AppSimLiveView.tsx"
+      ],
+      "prNumber": 35677
+    },
+    {
+      "commit": "e538dbef3dbd2bb25d0bad5a762bcc89d80cd88c",
+      "changedFiles": [
+        "docs/evidence/20261107/TSC-SCC-SWEEP-3-run-ledger.md",
+        "src/self-dev/run-record-mirror.ts",
+        "src/self-dev/run-store-checkpoint.ts",
+        "src/self-dev/run-store-contract.ts",
+        "src/self-dev/run-store.ts",
+        "src/self-implement/run-ledger-archive.ts",
+        "src/self-implement/run-ledger-compact.ts",
+        "src/self-implement/run-ledger-paths.ts",
+        "src/self-implement/run-ledger.ts"
+      ],
+      "prNumber": 35678
+    },
+    {
+      "commit": "c02e8336817387a0df105085c3bc841057c3205f",
+      "changedFiles": [
+        "scripts/release-loop/version-node.test.ts"
+      ],
+      "prNumber": 35667
+    },
+    {
+      "commit": "1dbfb8cbe575ae3d851bcd55ba92f56442e054f6",
+      "changedFiles": [
+        "src/ui/declarative/builder.ts",
+        "src/ui/declarative/encode-specs.ts",
+        "src/ui/declarative/encode.ts"
+      ],
+      "prNumber": 35695
+    },
+    {
+      "commit": "4ec9433ea193d0cbf79885b44a0cc8b28de0fa17",
+      "changedFiles": [
+        "scripts/release-loop/gate-partial.test.ts",
+        "scripts/release-loop/gate-types.ts"
+      ],
+      "prNumber": 35675
+    },
+    {
+      "commit": "c989d05c038d504b3f531f5afc8b659af96b72b1",
+      "changedFiles": [
+        "docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md",
+        "src/release-loop/macrophage-incident-recovery.ts",
+        "src/ux-sim/release-macrophage-incident-coverage.test.ts",
+        "src/ux-sim/release-sim-rig.ts"
+      ],
+      "prNumber": 35665
+    },
+    {
+      "commit": "8f9410e920f2892925c955562b122738a446d448",
+      "changedFiles": [
+        "src/self-implement/headless-elanous-driver.test.ts",
+        "src/self-implement/headless-elanous-driver.ts"
+      ],
+      "prNumber": 35697
+    },
+    {
+      "commit": "df75edd7b5f960852b594b262ef2318cb73fa3dd",
+      "changedFiles": [
+        "src/ui/widgets/context-menu.ts",
+        "src/ui/widgets/dialog.ts",
+        "src/ui/widgets/file-dialog.ts",
+        "src/ui/widgets/permission-prompt.ts",
+        "src/ui/widgets/request-user-input-overlay.ts",
+        "src/ui/widgets/slash-menu.ts",
+        "src/ui/widgets/tooltip.ts"
+      ],
+      "prNumber": 35700
+    },
+    {
+      "commit": "55ac6fe9db1a56d35c812d484233e4c89d8bc196",
+      "changedFiles": [
+        "src/release-loop/gate-timeout-owner-cell.test.ts",
+        "src/release-loop/gate-timeout-owner-cell.ts"
+      ],
+      "prNumber": 35684
+    },
+    {
+      "commit": "aab5f95574c3c6935efa18a056976f09844311dc",
+      "changedFiles": [
+        "src/ux-sim/fake-fetch.test.ts",
+        "src/ux-sim/fake-fetch.ts",
+        "test/audio-stt.test.ts",
+        "test/codex-image-generation.test.ts",
+        "test/codex-request-rejected-shape.test.ts",
+        "test/codex-stream-error-observability.test.ts",
+        "test/llm-codex-headers.test.ts",
+        "test/llm-codex-sse-phase.test.ts",
+        "test/llm-opengateway-provider.test.ts",
+        "test/llm-openrouter-provider.test.ts",
+        "test/open-weight-tool-discipline-openrouter-wire.test.ts",
+        "test/session-runtime-retry-api.test.ts",
+        "test/tool-runtime-api-call.test.ts",
+        "test/web-search.test.ts"
+      ],
+      "prNumber": 35688
+    },
+    {
+      "commit": "356cc3068639f0bb2ead0149d4654eb86ab1a1d2",
+      "changedFiles": [
+        "scenarios/ux-sim/app-demo-1114.yaml",
+        "src/ux-sim/app-demo-1114.test.ts",
+        "src/ux-sim/fake-app-host.test.ts",
+        "src/ux-sim/fake-app-host.ts",
+        "src/ux-sim/fake-higgsfield.test.ts",
+        "src/ux-sim/fake-higgsfield.ts",
+        "src/ux-sim/world.ts"
+      ],
+      "prNumber": 35666
+    },
+    {
+      "commit": "f5b8a6df1d5423d712c9362a50686ff5dd51aa26",
+      "changedFiles": [
+        "src/harness/pod-memory-policy.test.ts",
+        "src/harness/pod-memory-policy.ts",
+        "src/task-orchestrator/surfaces/self-implement-pod-child-llm.test.ts",
+        "src/task-orchestrator/surfaces/self-implement-pod.test.ts",
+        "src/task-orchestrator/surfaces/self-implement-pod.ts"
+      ],
+      "prNumber": 35289
+    },
+    {
+      "commit": "091c4757cdff5077da95d9e3b9ec8aa992d2b8ba",
+      "changedFiles": [
+        "apps/pwa/src/lib/auth-required.test.ts",
+        "apps/pwa/src/lib/camera-intake.test.ts",
+        "apps/pwa/src/lib/control-signals-api.test.ts",
+        "apps/pwa/src/lib/dock-history-hydrate.test.ts",
+        "apps/pwa/src/lib/elevenlabs-voices.test.ts",
+        "apps/pwa/src/lib/merge-approvals-api.test.ts",
+        "apps/pwa/src/lib/model-tier-sync.test.ts",
+        "apps/pwa/src/lib/pushcut-runtime.test.ts",
+        "apps/pwa/src/lib/sessions-store-api.test.ts",
+        "apps/pwa/src/lib/sse-connection-budget.test.ts",
+        "apps/pwa/src/lib/term1-poll-relief.test.ts",
+        "apps/pwa/src/lib/use-live-camera.test.ts"
+      ],
+      "prNumber": 35696
+    },
+    {
+      "commit": "afc5586dabc92445fd062ff02e2443df17a51754",
+      "changedFiles": [
+        "src/loops/checker-contract.ts",
+        "src/loops/checker-registry-cycle.test.ts",
+        "src/loops/checker.ts",
+        "src/loops/fixtures/checker-registry-cycle/checker.js",
+        "src/loops/fixtures/checker-registry-cycle/helper.js",
+        "src/loops/fixtures/checker-registry-cycle/registry.js",
+        "src/loops/fixtures/checker-registry-cycle/schedule-checker.js",
+        "src/loops/fixtures/checker-registry-cycle/schedule-due.js",
+        "src/loops/registry-contract.ts",
+        "src/loops/registry.ts",
+        "src/loops/schedule-due.ts"
+      ],
+      "prNumber": 35651
+    },
+    {
+      "commit": "7eaac502c44b985bc6b111d35851f5c1f4277147",
+      "changedFiles": [
+        "scripts/release-loop/preflight.test.ts",
+        "scripts/release-loop/preflight.ts"
+      ],
+      "prNumber": 35637
+    },
+    {
+      "commit": "916dd3ca5dd368732422c7a6bde4d931047da186",
+      "changedFiles": [
+        "src/cli/sim-cli.ts",
+        "src/cli/sim-lazy-registration.test.ts"
+      ],
+      "prNumber": 35692
+    },
+    {
+      "commit": "57928fbcdb6f35e926cddc605ac6dffb6aa80f3e",
+      "changedFiles": [
+        "scripts/release-loop/gate-receipt-carry-any-run.test.ts",
+        "scripts/release-loop/gate-shard-receipt-carry.ts",
+        "scripts/release-loop/gate-shard-receipts.ts"
+      ],
+      "prNumber": 35693
+    },
+    {
+      "commit": "7a2e967c9909990d3741afab90ffb700379c748e",
+      "changedFiles": [
+        "docs/TECH-harness-map-2026-10-06.md",
+        "docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md",
+        "scenarios/ux-sim/macrophage-attribution-integration-1107.yaml",
+        "scripts/release-loop/gate-repair-node.ts",
+        "scripts/release-loop/rla-rehearsal-incident-sim-b.test.ts",
+        "src/release-loop/macrophage-incident-recovery.ts",
+        "src/release-loop/release-failure-attribution.test.ts",
+        "src/release-loop/release-failure-attribution.ts",
+        "src/ux-sim/release-macrophage-attribution-integration.test.ts",
+        "src/ux-sim/release-macrophage-incident-coverage.test.ts",
+        "src/ux-sim/release-sim-rig.ts"
+      ],
+      "prNumber": 35679
+    },
+    {
+      "commit": "1d8b5566fd9fb6a82477443cd071b93d454f53fb",
+      "changedFiles": [
+        "src/nexus/apps/app-jobs.test.ts",
+        "src/nexus/apps/app-jobs.ts",
+        "src/nexus/apps/higgsfield-backend.test.ts",
+        "src/nexus/apps/higgsfield-backend.ts",
+        "src/nexus/index.test.ts",
+        "src/nexus/index.ts"
+      ],
+      "prNumber": 35685
+    },
+    {
+      "commit": "35433329116b4d1054b84935af905a2755a8fa3a",
+      "changedFiles": [
+        "scripts/release-loop/release-branch.test.ts",
+        "scripts/release-loop/resume-release.test.ts",
+        "scripts/release-loop/resume-release.ts"
+      ],
+      "prNumber": 35644
+    },
+    {
+      "commit": "c8be0dfca57134a583897c4e5b52e75646de95ab",
+      "changedFiles": [
+        "src/ux-sim/release-incident-events.test.ts"
+      ],
+      "prNumber": 35703
+    },
+    {
+      "commit": "ada657381de300cdd451b066fa2a1a3ef861f199",
+      "changedFiles": [
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-receipt-hash.test.ts",
+        "scripts/release-loop/gate-receipt-hash.ts"
+      ],
+      "prNumber": 35642
+    },
+    {
+      "commit": "cf0d3d53e0016ce44194eca47184c917ab5164b7",
+      "changedFiles": [
+        "src/ux-sim/fake-dns-cert.test.ts",
+        "src/ux-sim/fake-dns-cert.ts",
+        "src/ux-sim/multi-tenant-relay-world.test.ts",
+        "src/ux-sim/multi-tenant-relay-world.ts"
+      ],
+      "prNumber": 35638
+    },
+    {
+      "commit": "9b3475ef2bdf39e6e5201a6f5a441ec57f3bfd64",
+      "changedFiles": [
+        "src/intake-plane/core.ts",
+        "src/intake-plane/event-state.ts",
+        "src/intake-plane/items.ts",
+        "src/intake-plane/route.ts"
+      ],
+      "prNumber": 35702
+    },
+    {
+      "commit": "5af85fd5ad75bbf316f1c38dc1c0a3e94af0b2a2",
+      "changedFiles": [
+        "src/nexus/api/channel-ask-op.test.ts"
+      ],
+      "prNumber": 35690
+    },
+    {
+      "commit": "40c13cfedf9eb306c5eb20fe78e911818a92446d",
+      "changedFiles": [
+        "release/public/docs/releases/0.3.6.md",
+        "website/pages.json"
+      ],
+      "prNumber": 35732
+    },
+    {
+      "commit": "8df36e1d7b9e71cc5c90b97c8d047db390fd6b18",
+      "changedFiles": [
+        "src/code-edit/apply.ts",
+        "src/code-edit/plan-mode-cycle-boundary.test.ts",
+        "src/plan-mode/tool-enter.ts",
+        "src/plan-mode/tool-exit.ts"
+      ],
+      "prNumber": 35724
+    },
+    {
+      "commit": "63b6352fd45faf8e03a43bfc50ff102c5f45323e",
+      "changedFiles": [
+        "test/handoff-integration.test.ts",
+        "test/llm-hosts-config.test.ts",
+        "test/llm-models.test.ts",
+        "test/local-llm-compat.test.ts",
+        "test/local-llm-entry-point.test.ts",
+        "test/nexus-status-line.test.ts",
+        "test/oauth/codex-account-rotation.test.ts",
+        "test/registry-discovery.test.ts",
+        "test/showroom-role-judge.test.ts",
+        "test/workflow-runtime-http.test.ts"
+      ],
+      "prNumber": 35713
+    },
+    {
+      "commit": "3bb7d05eca45803ea73cdc0468d4bb951e285b60",
+      "changedFiles": [
+        "scripts/release-loop/rla-event-response-scorecard-report.test.ts",
+        "scripts/release-loop/rla-event-response-scorecard-report.ts",
+        "src/domains/morning-detail.ts",
+        "src/domains/morning-report.ts"
+      ],
+      "prNumber": 35721
+    },
+    {
+      "commit": "27ba3889204f1c367832fbe42a25d694c9b6afde",
+      "changedFiles": [
+        "src/roles/machine-name.ts",
+        "src/roles/machine-profile-boundary.test.ts",
+        "src/roles/machine-profile-contract.ts",
+        "src/roles/machine-profile.ts"
+      ],
+      "prNumber": 35719
+    },
+    {
+      "commit": "6695f9ee7c3af84b46e25a07d5a9282eb1184a12",
+      "changedFiles": [
+        "scripts/release-loop/pwa-host-heal.sim.test.ts",
+        "scripts/release-loop/pwa-remote.ts",
+        "scripts/release-loop/pwa-scenarios-node.ts",
+        "src/release-loop/knowhow/pwa-host-heal.ts"
+      ],
+      "prNumber": 35715
+    },
+    {
+      "commit": "19d5a16e03f1c84489757962f3981c79068c6910",
+      "changedFiles": [
+        ".rules/00-core/delivery-and-docs.md",
+        "docs/_index.md",
+        "docs/conductor/DEMO-APP-1114-RUNBOOK.md"
+      ],
+      "prNumber": 35694
+    },
+    {
+      "commit": "257d8810f0029d19a52643172c3c9700b5e790ad",
+      "changedFiles": [
+        "src/domains/macro-store.ts",
+        "src/domains/regime-db-path.ts",
+        "src/domains/regime-store-cycle-boundary.test.ts",
+        "src/domains/regime-store.ts"
+      ],
+      "prNumber": 35726
+    },
+    {
+      "commit": "6a296a07bad42109e0619d4c0eea9f781438b91e",
+      "changedFiles": [
+        "src/self-implement/goal-author.test.ts"
+      ],
+      "prNumber": 35730
+    },
+    {
+      "commit": "a121614b75ec98560c39ea6a6a30acce27555df4",
+      "changedFiles": [
+        "graphs/release/macrophage-subscriber.yaml",
+        "src/release-loop/macrophage-heal-node.test.ts",
+        "src/release-loop/macrophage-heal-node.ts",
+        "src/release-loop/macrophage-heal.ts"
+      ],
+      "prNumber": 35686
+    },
+    {
+      "commit": "7c58c5a05e31ba731eb1907bf208e74c988e082a",
+      "changedFiles": [
+        "src/mouse-action-recipes.ts",
+        "src/ui/context-menu-presenter.ts",
+        "src/ui/submenu-popup-menu-boundary.test.ts",
+        "src/ui/submenu-popup-menu-contract.ts"
+      ],
+      "prNumber": 35714
+    },
+    {
+      "commit": "d79aa833bdd349df3e8ed8456b5de11bb549d533",
+      "changedFiles": [
+        "src/self-implement/brain-fast.test.ts",
+        "src/self-implement/headless-elanous-driver.ts"
+      ],
+      "prNumber": 35673
+    },
+    {
+      "commit": "ac211e0aa2869b17d74e9ebbe803907bcbb32a31",
+      "changedFiles": [
+        "scripts/release-loop/gate-node.ts",
+        "src/release-loop/gate-shard-ledger.test.ts",
+        "src/release-loop/gate-shard-ledger.ts",
+        "src/ux-sim/release-sim-rig.test.ts"
+      ],
+      "prNumber": 35689
+    },
+    {
+      "commit": "b125c0c3273ad33bb15c2ff0c50356061d0048c2",
+      "changedFiles": [
+        "src/cli/pr-cli.test.ts",
+        "src/cli/pr-cli.ts"
+      ],
+      "prNumber": 35735
+    },
+    {
+      "commit": "4c67df3baff18e467d2ee2a58a63bc9a0e3980e0",
+      "changedFiles": [
+        "src/cli/provider-cli.test.ts",
+        "src/control-plane/light-member.test.ts",
+        "src/control-plane/member.test.ts",
+        "src/control-plane/primary.test.ts",
+        "src/error-report/report.test.ts",
+        "src/llm-codex-prompt-cache-prefix.test.ts",
+        "src/llm-secretstore-runtime.test.ts",
+        "src/llm.test.ts",
+        "src/oauth/overload-failover.test.ts",
+        "src/skills/tools/persistent-grounding.test.ts",
+        "src/web-search/x-intent.test.ts"
+      ],
+      "prNumber": 35736
+    },
+    {
+      "commit": "d7f7f913e17695c05107e3e375ebcdb155f8faf3",
+      "changedFiles": [
+        "integrations/acp-registry/elanous/agent.json",
+        "package.json",
+        "server.json"
+      ],
+      "prNumber": 35737
+    },
+    {
+      "commit": "45be2115a75d51de79412d23c0af5ddf27ca10d8",
+      "changedFiles": [
+        "src/hq/seats.test.ts",
+        "src/hq/seats.ts"
+      ],
+      "prNumber": 35729
+    },
+    {
+      "commit": "f53148622d295ec78b722a80317c3867722b0f98",
+      "changedFiles": [
+        "src/surface/llm-tools-boundary.test.ts",
+        "src/surface/llm-tools.ts"
+      ],
+      "prNumber": 35731
+    },
+    {
+      "commit": "c20f2c63a60fed6a7a55ac0cff9afe8ec4d06555",
+      "changedFiles": [
+        "src/dashboard/slash-runtime/dashboard-handlers.test.ts",
+        "src/llm-provider-any-one.test.ts",
+        "src/llm-stream-disconnect-retry.test.ts",
+        "src/llm/zai-coding-plan.test.ts",
+        "src/research/axis-fanout.test.ts",
+        "src/self-dev/dev-pipeline.test.ts",
+        "src/session/chat-request-size.test.ts",
+        "src/steward/directive-audit.test.ts",
+        "src/ux-sim/fake-fetch.test.ts",
+        "src/ux-sim/fake-fetch.ts",
+        "src/web-search/grok-subscription-default.test.ts"
+      ],
+      "prNumber": 35712
+    },
+    {
+      "commit": "f093ff8c64cf966a080b3a2c439406ce4af1fdc4",
+      "changedFiles": [
+        "apps/pwa/src/components/chat/SessionIdChip.tsx",
+        "apps/pwa/src/components/chat/SessionPill.tsx",
+        "apps/pwa/src/components/chat/session-id-utils.ts",
+        "test/session-id-component-cycle.test.ts"
+      ],
+      "prNumber": 35733
+    },
+    {
+      "commit": "6abe747d68cdead0cb6c73eb954a09879a1fd89a",
+      "changedFiles": [
+        "scripts/release-loop/gate-node-sim.test.ts",
+        "scripts/release-loop/gate-node-sim.ts",
+        "scripts/release-loop/gate-shard-receipts.test.ts",
+        "scripts/release-loop/gate-shard-receipts.ts",
+        "src/release-loop/gate-shard-ledger.ts"
+      ],
+      "prNumber": 35720
+    },
+    {
+      "commit": "8facb0bc60e415b26dd30bf3cb89d6038351bfeb",
+      "changedFiles": [
+        "src/agent-mission/doc-guided-install.test.ts",
+        "src/agent-mission/mission-out.test.ts",
+        "src/channel-bot-token.test.ts",
+        "src/cli/llm-detect-cli.test.ts",
+        "src/cli/logs-cli.test.ts",
+        "src/cli/start-cli.test.ts",
+        "src/harness/browser-act-tabs.test.ts",
+        "src/intake-plane/seat-doc-route.test.ts",
+        "src/nexus/api/pod-credential-api.test.ts",
+        "src/nexus/apps/app-actions.test.ts",
+        "src/ux-sim/fake-fetch.test.ts",
+        "src/ux-sim/fake-fetch.ts"
+      ],
+      "prNumber": 35718
+    },
+    {
+      "commit": "b9eed7486414c3ab2b3cbfda558c721cb397e2bf",
+      "changedFiles": [
+        "src/nexus/api/events.ts",
+        "src/nexus/apps/app-realtime.test.ts",
+        "src/nexus/apps/app-realtime.ts"
+      ],
+      "prNumber": 35699
+    },
+    {
+      "commit": "e85bfc46792710125fcfe3ea791413a88270d8fe",
+      "changedFiles": [
+        "src/briefing/brief-items-import-boundary.test.ts",
+        "src/briefing/brief-items.ts",
+        "src/briefing/claim-key.ts",
+        "src/intake-plane/requirement-funnel.ts"
+      ],
+      "prNumber": 35711
+    },
+    {
+      "commit": "167ccc4c2aba8d3eea411aaeb6fcae56f95f0005",
+      "changedFiles": [
+        "scripts/release-loop/gate-bisect-owner-mail.test.ts",
+        "scripts/release-loop/gate-bisect-owner-mail.ts",
+        "scripts/release-loop/gate-bisect-sidecar.ts",
+        "scripts/release-loop/gate-bisect.test.ts"
+      ],
+      "prNumber": 35705
+    },
+    {
+      "commit": "0c85749adf14e716ddb5f27373a955221b7b0116",
+      "changedFiles": [
+        "scripts/release-loop/rla-event-response-scorecard-report.test.ts",
+        "src/domains/morning-detail.ts"
+      ],
+      "prNumber": 35749
+    },
+    {
+      "commit": "721f9d0aacb1d802847243c8c95dc5494a265a39",
+      "changedFiles": [
+        "src/nexus/api/http-server.test.ts",
+        "src/nexus/api/http-server.ts",
+        "src/nexus/apps/console-address.test.ts",
+        "src/nexus/apps/console-address.ts",
+        "src/nexus/index.ts"
+      ],
+      "prNumber": 35674
+    },
+    {
+      "commit": "ade8aa4f7d683d223d9816edaedf35688057e124",
+      "changedFiles": [
+        "src/self-implement/pod-warm-pool-profile.test.ts",
+        "src/self-implement/pod-warm-pool-profile.ts"
+      ],
+      "prNumber": 35708
+    },
+    {
+      "commit": "a4a91b6f7fa4ea6a66ce07e0fc49c9fc9beebf76",
+      "changedFiles": [
+        "apps/pwa/src/app/apps/page.test.tsx",
+        "apps/pwa/src/app/apps/page.tsx",
+        "apps/pwa/src/app/design-check/page.test.tsx",
+        "apps/pwa/src/app/design-check/page.tsx",
+        "apps/pwa/src/components/design/DirectionCards.test.tsx",
+        "apps/pwa/src/components/design/DirectionCards.tsx"
+      ],
+      "prNumber": 35682
+    },
+    {
+      "commit": "997f073fc5aa1b54a9e83695a88c111e4d336f88",
+      "changedFiles": [
+        "scripts/release-loop/rolling-main-gate.test.ts",
+        "scripts/release-loop/rolling-main-gate.ts"
+      ],
+      "prNumber": 35722
+    },
+    {
+      "commit": "95e6a81f9b2f2d055f144fc5f1995a4461fe5050",
+      "changedFiles": [
+        "src/relay/app-kill-switch.test.ts",
+        "src/relay/app-kill-switch.ts",
+        "src/relay/relay-cli.test.ts",
+        "src/relay/relay-cli.ts",
+        "src/ux-sim/app-kill-switch-world.test.ts",
+        "src/ux-sim/app-kill-switch-world.ts"
+      ],
+      "prNumber": 35634
+    },
+    {
+      "commit": "bf04c33c32c7233b8af292724624c9de500afb73",
+      "changedFiles": [
+        "scripts/release-loop/gate-baseline-manifest.test.ts",
+        "scripts/release-loop/gate-baseline-manifest.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/mac-smoke-node.ts"
+      ],
+      "prNumber": 35662
+    },
+    {
+      "commit": "616bd410c99f4e0b91c402001b3b001d3536141b",
+      "changedFiles": [
+        "scripts/warm-pool-provider-config.test.ts",
+        "scripts/warm-pool-provider-config.ts",
+        "src/runtime-identity.test.ts",
+        "src/runtime-identity.ts",
+        "src/task-orchestrator/surfaces/pod-warm-provenance.ts",
+        "src/task-orchestrator/surfaces/pod-warm-worker-provider.test.ts",
+        "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts",
+        "src/ux-sim/mock-scenario-catalog.json",
+        "src/ux-sim/pod-reuse-match-by-kind-sim.test.ts",
+        "src/ux-sim/pod-reuse-match-by-kind-sim.ts"
+      ],
+      "prNumber": 35691
+    },
+    {
+      "commit": "6a4152c2f7051b872d69f6be8ae59c91567358b5",
+      "changedFiles": [
+        "scripts/release-loop/preflight.test.ts",
+        "scripts/release-loop/preflight.ts",
+        "scripts/release-loop/unattended-release.ts",
+        "scripts/release-loop/version-node.test.ts",
+        "scripts/release-loop/version-node.ts",
+        "src/cli/release-cli.test.ts",
+        "src/cli/release-cli.ts"
+      ],
+      "prNumber": 35671
+    },
+    {
+      "commit": "6f7edab03a3d26e138f9290fb7ed041297bc2f3c",
+      "changedFiles": [
+        "scripts/release-loop/gate-baseline-receipt.test.ts",
+        "scripts/release-loop/gate-baseline-receipt.ts",
+        "scripts/release-loop/gate-radius-live.test.ts",
+        "scripts/release-loop/gate-radius-live.ts"
+      ],
+      "prNumber": 35746
+    },
+    {
+      "commit": "ba5fee44b38ad6c2f7ad43893571fabc69acfc06",
+      "changedFiles": [
+        "src/ux-sim/rla-sim-vocab-node-edge.test.ts",
+        "src/ux-sim/scenarios/rla-sim-vocab-node-edge.yaml"
+      ],
+      "prNumber": 35745
+    },
+    {
+      "commit": "7c86d815532e3634d95664941adbadb11509a810",
+      "changedFiles": [
+        "scripts/release-loop/export-check-node.test.ts",
+        "scripts/release-loop/export-check-node.ts"
+      ],
+      "prNumber": 35754
+    },
+    {
+      "commit": "01753d4c0fd9cde7a3b532986ee79c947b98bce9",
+      "changedFiles": [
+        "scripts/release-loop/pwa-host-heal.sim.test.ts",
+        "scripts/release-loop/pwa-remote.ts"
+      ],
+      "prNumber": 35750
+    },
+    {
+      "commit": "4847de5308f3f0002cbb41ec3de65497b38c449e",
+      "changedFiles": [
+        "scripts/release-loop/gate-repair-node.ts",
+        "scripts/release-loop/rla-postland-recovery-hitl.sim.test.ts",
+        "scripts/release-loop/rla-rehearsal-incident-sim-b.test.ts",
+        "src/release-loop/release-failure-attribution.test.ts",
+        "src/release-loop/release-failure-attribution.ts",
+        "src/ux-sim/release-sim-rig.ts"
+      ],
+      "prNumber": 35669
+    },
+    {
+      "commit": "1bcbdcf9542558c24105181e0394e3d06a5d2eb6",
+      "changedFiles": [
+        "scripts/release-loop/resume-release.test.ts",
+        "scripts/release-loop/resume-release.ts"
+      ],
+      "prNumber": 35744
+    },
+    {
+      "commit": "5b1ed140165f530160cf596b5c9e8037d179ee7c",
+      "changedFiles": [
+        "src/pty-shell/pty-control-ipc.test.ts",
+        "src/pty-shell/pty-control-ipc.ts"
+      ],
+      "prNumber": 35752
+    },
+    {
+      "commit": "1c35e2aa5ee6d8166d04745e0b69c24d700af68e",
+      "changedFiles": [
+        "scripts/smoke-higgsfield-app-cli-session.ts",
+        "src/nexus/apps/app-actions.test.ts",
+        "src/nexus/apps/app-actions.ts",
+        "src/nexus/apps/app-credential-capability.ts",
+        "src/nexus/apps/app-jobs.ts",
+        "src/nexus/apps/higgsfield-backend.test.ts",
+        "src/nexus/apps/higgsfield-backend.ts",
+        "src/nexus/apps/higgsfield-cli-session.ts",
+        "src/nexus/index.ts",
+        "templates/next-app-voice-note/app.yaml"
+      ],
+      "prNumber": 35738
+    },
+    {
+      "commit": "cb8d861e668cb42041e1c5064fe78e798cd4aff9",
+      "changedFiles": [
+        "scenarios/ux-sim/release-sim-chain-remaining.yaml",
+        "scripts/release-loop/release-sim-chain-remaining-cli.test.ts"
+      ],
+      "prNumber": 35756
+    },
+    {
+      "commit": "7276f4e3477e39bc59a5a01b1bd45f550bd900c0",
+      "changedFiles": [
+        "docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md",
+        "scripts/ux-sim.ts",
+        "src/chat/index.ts",
+        "src/dashboard/index.ts",
+        "src/dashboard/input/mouse-conversation-popup-runtime.ts",
+        "src/dashboard/input/mouse-modal-hit-runtime.ts",
+        "src/dashboard/input/mouse-modal-surface-runtime.ts",
+        "src/dashboard/input/mouse-mode-switch-runtime.ts",
+        "src/dashboard/input/mouse-pane-hit-runtime.ts",
+        "src/dashboard/input/mouse-picker-runtime.ts",
+        "src/dashboard/input/mouse-shell-rollup-runtime.ts",
+        "src/dashboard/input/mouse-wiring-loader.test.ts",
+        "src/dashboard/input/mouse-wiring-loader.ts",
+        "src/dashboard/input/mouse-wiring-types.ts",
+        "src/dashboard/input/mouse-wiring.ts",
+        "src/dashboard/preview-widget-runtime.ts",
+        "src/dashboard/slash-runtime/dashboard-handlers.ts",
+        "src/dashboard/special-keys-removal.test.ts",
+        "src/maturity/feature-maturity.ts",
+        "src/ux-sim/classic-tui-seat-scenarios.test.ts",
+        "src/ux-sim/classic-tui-seat-scenarios.ts",
+        "src/ux-sim/fake-llm.ts",
+        "src/ux-sim/mock-scenario-catalog.json",
+        "src/vi-editor.ts",
+        "test/dashboard-preview-widget-runtime.test.ts",
+        "test/dashboard-slash-registry.test.ts",
+        "test/session-start-default-new.test.ts",
+        "test/vi-editor.test.ts"
+      ],
+      "prNumber": 35275
+    },
+    {
+      "commit": "b6b54538bb264a08d286344e318e39e7cc3d9ff9",
+      "changedFiles": [
+        "scripts/release-loop/macrophage-parent-sink.sim.test.ts"
+      ],
+      "prNumber": 35742
+    },
+    {
+      "commit": "dba78d39905b1fb842864037f1c4650a7c93bbfd",
+      "changedFiles": [
+        "scripts/release-loop/gate-baseline-isolated.test.ts",
+        "scripts/release-loop/gate-baseline-isolated.ts"
+      ],
+      "prNumber": 35757
+    },
+    {
+      "commit": "ce5b3374891797921a8bc3a60c025eb362f46e67",
+      "changedFiles": [
+        "scripts/release-loop/release-graph-fanout-mock.test.ts"
+      ],
+      "prNumber": 35761
+    },
+    {
+      "commit": "ea8a7fd1d269e7d025fe28d897053f3a3cd02af6",
+      "changedFiles": [
+        "src/agent-substrate/pr-reviewer.test.ts",
+        "src/agent-substrate/pr-reviewer.ts",
+        "src/agent-substrate/self-review-cli.test.ts",
+        "src/agent-substrate/self-review-cli.ts",
+        "src/cli/review-carry.test.ts",
+        "src/cli/review-carry.ts"
+      ],
+      "prNumber": 35740
+    },
+    {
+      "commit": "7168562f24bc4d55830af81f13a73390ff9615b2",
+      "changedFiles": [
+        "scripts/release-loop/gate-baseline-receipt.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-radius-live.test.ts",
+        "scripts/release-loop/gate-radius-live.ts",
+        "scripts/release-loop/gate-types.ts",
+        "src/release-loop/light-rc.test.ts",
+        "src/release-loop/light-rc.ts"
+      ],
+      "prNumber": 35748
+    },
+    {
+      "commit": "6f0503422354c4aaf00c29c06b3afea48f70aaef",
+      "changedFiles": [
+        "src/self-implement/gate-receipt-registry.test.ts",
+        "src/self-implement/gate-receipt-registry.ts"
+      ],
+      "prNumber": 35743
+    },
+    {
+      "commit": "d4f3d1ec5122e6d7ec4aaa600191e64630d48793",
+      "changedFiles": [
+        "scripts/release-loop/freeze-off-parity.test.ts",
+        "scripts/release-loop/node-verdict.test.ts",
+        "scripts/release-loop/node-verdict.ts",
+        "scripts/release-loop/publish-node.test.ts",
+        "scripts/release-loop/publish-node.ts",
+        "scripts/release-loop/release-loop-graph.test.ts"
+      ],
+      "prNumber": 35728
+    },
+    {
+      "commit": "721c9ea6bcca6e95c668e1cabb6a35f63140a59e",
+      "changedFiles": [
+        "src/ux-sim/release-sim-rig-teardown-scope.test.ts",
+        "src/ux-sim/release-sim-rig.ts"
+      ],
+      "prNumber": 35759
+    },
+    {
+      "commit": "40d4fd4a8fb92193a04ffce4421aa8635cea0e64",
+      "changedFiles": [
+        "src/release-loop/macrophage-heal-node.test.ts"
+      ],
+      "prNumber": 35764
+    },
+    {
+      "commit": "b751d76fa7d7dfb26742d558f1dbe3d3d06f22e2",
+      "changedFiles": [
+        "scripts/release-loop/gate-triage-node.ts",
+        "scripts/release-loop/resume-release.ts",
+        "scripts/release-loop/resume.test.ts",
+        "src/agent-substrate/self-review-cli.test.ts",
+        "src/agent-substrate/self-review-cli.ts",
+        "src/release-loop/waiver-events.ts",
+        "src/ux-sim/waiver-event-transition.test.ts"
+      ],
+      "prNumber": 35376
+    },
+    {
+      "commit": "8c0a8e2eda260dfdbfcde4eb600ed3ec47e4420e",
+      "changedFiles": [
+        "docs/TECH-harness-map-2026-10-06.md",
+        "scripts/release-loop/gate-repair-node.ts",
+        "scripts/release-loop/rla-rehearsal-incident-sim-b.test.ts"
+      ],
+      "prNumber": 35656
+    },
+    {
+      "commit": "d78bc131d1197f654979bccf24727f2487678b13",
+      "changedFiles": [
+        "src/loops/orchestrator/sim-impact-audit.test.ts",
+        "src/loops/orchestrator/sim-impact-audit.ts"
+      ],
+      "prNumber": 35650
+    },
+    {
+      "commit": "5d7de49f111c83d6e46c3dfcaca9724aaf52dcd0",
+      "changedFiles": [
+        "graphs/release/macrophage-subscriber.yaml",
+        "src/release-loop/macrophage-heal-node.ts",
+        "src/release-loop/macrophage-heal.ts",
+        "src/self-implement/merge-train.test.ts",
+        "src/self-implement/merge-train.ts"
+      ],
+      "prNumber": 35766
+    },
+    {
+      "commit": "3511b5d0374ac45f0bb45b1e60bbf2c3ccbb7b22",
+      "changedFiles": [
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-radius-live.ts",
+        "src/release-loop/mock-clock-window.test.ts",
+        "src/release-loop/rehearsal.test.ts",
+        "src/release-loop/rehearsal.ts"
+      ],
+      "prNumber": 35739
+    },
+    {
+      "commit": "393cf99d515bd4d1daa2c1bea3c6c29c3623bf7d",
+      "changedFiles": [
+        "src/loops/orchestrator/overlap.test.ts",
+        "src/loops/orchestrator/overlap.ts",
+        "src/loops/orchestrator/sim-impact-audit.test.ts",
+        "src/loops/orchestrator/sim-impact-audit.ts"
+      ],
+      "prNumber": 35659
+    },
+    {
+      "commit": "e233d6a04790dd039b81ca39cdad91dbae4275f1",
+      "changedFiles": [
+        "graphs/release/recipes.yaml",
+        "scripts/release-loop/hand-response-node.test.ts",
+        "scripts/release-loop/hand-response-node.ts"
+      ],
+      "prNumber": 35771
+    },
+    {
+      "commit": "659bd0c6fce871f1312b84d4111bf7ebce174024",
+      "changedFiles": [
+        "scripts/release-loop/traffic-event-hook-sim.test.ts",
+        "scripts/release-loop/traffic-event-hook-sim.ts",
+        "scripts/release-loop/traffic-event-hook.ts"
+      ],
+      "prNumber": 35760
+    },
+    {
+      "commit": "ad3748ea5f49f3783d1508ebe63b39592ed4c45f",
+      "changedFiles": [
+        "src/cli/pr-land-drift-autorepair.integration.test.ts"
+      ],
+      "prNumber": 35767
+    },
+    {
+      "commit": "2e293d00f234d4ce0384e47e795a528ec32bbe38",
+      "changedFiles": [
+        "scripts/release-loop/gate-node.test.ts"
+      ],
+      "prNumber": 35778
+    },
+    {
+      "commit": "5402b10ff7ba7ec5394df86c66ff7e4dcb2f504b",
+      "changedFiles": [
+        "src/ux-sim/readiness-countdown.test.ts",
+        "src/ux-sim/readiness-countdown.ts"
+      ],
+      "prNumber": 35775
+    },
+    {
+      "commit": "32d2fe1da50195f798998d9b18481bd12f029759",
+      "changedFiles": [
+        "scripts/release-loop/rolling-main-gate.ts",
+        "src/guardian/host-lease-policy.ts",
+        "src/guardian/host-lease.test.ts",
+        "src/guardian/host-lease.ts",
+        "src/release-loop/gate-host-reservation.test.ts",
+        "src/release-loop/gate-host-reservation.ts",
+        "src/resource-ledger/guardian-host-lease-heartbeat-worker.ts",
+        "src/resource-ledger/resource-ledger.test.ts",
+        "src/resource-ledger/resource-ledger.ts"
+      ],
+      "prNumber": 35774
+    },
+    {
+      "commit": "3a2ab0626d64e6f191318917e81ecd8b4e64d19d",
+      "changedFiles": [
+        "scripts/release-loop/gate-triage-node.test.ts",
+        "scripts/release-loop/gate-triage-node.ts",
+        "scripts/release-loop/gate-triage-types.ts"
+      ],
+      "prNumber": 35765
+    },
+    {
+      "commit": "dfe51219daf639c424602d811db41edc1cb2ea5a",
+      "changedFiles": [
+        "src/context-bus/context-now-surfaces.ts",
+        "src/context-bus/context-now.test.ts",
+        "src/context-bus/context-now.ts",
+        "src/context-bus/release-status-sim.test.ts",
+        "src/dashboard/slash-runtime/dashboard-handlers.ts",
+        "src/domains/release-tool.ts",
+        "src/ops/overview-cache.ts",
+        "src/telegram-away-command.test.ts",
+        "src/telegram-away-command.ts",
+        "src/telegram-commands.ts"
+      ],
+      "prNumber": 35368
+    },
+    {
+      "commit": "dc7f829bffc35b8abd743bd5f4160a3703ea64fa",
+      "changedFiles": [
+        "scripts/release-loop/gate-node-sim.test.ts",
+        "scripts/release-loop/gate-node-sim.ts",
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-shard-dispatch.test.ts",
+        "scripts/release-loop/gate-shard-dispatch.ts",
+        "scripts/release-loop/gate-shard-receipts.ts",
+        "scripts/release-loop/gate-types.ts"
+      ],
+      "prNumber": 35706
+    },
+    {
+      "commit": "401858b0fbc9ad61567bfafe02624059de5b0e5c",
+      "changedFiles": [
+        "scripts/release-loop/traffic-event-hook-sim.test.ts",
+        "scripts/release-loop/traffic-event-hook-sim.ts",
+        "scripts/release-loop/traffic-event-hook.ts"
+      ],
+      "prNumber": 35780
+    },
+    {
+      "commit": "0f5241e00719e9fb2e4b78d63c0ee4085d1b9a06",
+      "changedFiles": [
+        "graphs/release/macrophage-subscriber.yaml",
+        "src/cli/pr-cli.ts",
+        "src/release-loop/macrophage-heal-node.ts",
+        "src/release-loop/macrophage-heal.ts",
+        "src/self-implement/l8-merge-queue.test.ts",
+        "src/self-implement/l8-merge-queue.ts"
+      ],
+      "prNumber": 35779
+    },
+    {
+      "commit": "9d2b1739dcdaeebb7d8558f84ef4736baf31da86",
+      "changedFiles": [
+        "docs/generated/cli-anatomy.md",
+        "scripts/release-loop/cut-branch.test.ts",
+        "scripts/release-loop/cut-branch.ts",
+        "src/cli/release-cli.ts"
+      ],
+      "prNumber": 35773
+    },
+    {
+      "commit": "9cddd3b0759949e4e5692cdb047d136459494f26",
+      "changedFiles": [
+        "docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md",
+        "src/git-fs/git-cli.test.ts",
+        "src/git-fs/git-cli.ts",
+        "src/sim-world-device-catalogs.json",
+        "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+        "src/ux-sim/mock-scenario-catalog.json",
+        "src/ux-sim/mock-scenario-catalog.test.ts"
+      ],
+      "prNumber": 35763
+    },
+    {
+      "commit": "0e25e9650da30bffc6a90b7efd2bd9c51217ab1c",
+      "changedFiles": [
+        "scripts/release-loop/gate-image-runtime-identity.ts",
+        "src/ux-sim/gate-image-preflight-runtime-identity-sim.test.ts",
+        "src/ux-sim/gate-image-preflight-runtime-identity-sim.ts"
+      ],
+      "prNumber": 35783
+    },
+    {
+      "commit": "7432ac017c5044848af80c7ecf064b2c7e4f897f",
+      "changedFiles": [
+        "scripts/release-loop/resume-release.ts",
+        "scripts/release-loop/resume.test.ts"
+      ],
+      "prNumber": 35785
+    },
+    {
+      "commit": "4066b36891de068ce959fd17acf53e0dfe6120c8",
+      "changedFiles": [
+        "graphs/release/recipes.yaml",
+        "graphs/release/release-loop.yaml",
+        "scenarios/ux-sim/release-sim-rig.yaml",
+        "scripts/release-loop/auto-approve-node.test.ts",
+        "scripts/release-loop/auto-approve-node.ts",
+        "scripts/release-loop/checklist-gate-node.test.ts",
+        "scripts/release-loop/checklist-gate-node.ts",
+        "scripts/release-loop/publish-node.test.ts",
+        "scripts/release-loop/release-loop-graph.test.ts",
+        "scripts/release-loop/resume.test.ts",
+        "scripts/release-loop/unattended-release.ts",
+        "src/graph-runner/runner.ts",
+        "src/ux-sim/mock-scenario-catalog.json",
+        "src/ux-sim/release-sim-rig.test.ts",
+        "src/ux-sim/release-sim-rig.ts"
+      ],
+      "prNumber": 35734
+    },
+    {
+      "commit": "fe7813639499ff0b4017276dc5803eafa3bd24bc",
+      "changedFiles": [
+        "scripts/release-loop/version-node.test.ts"
+      ],
+      "prNumber": 35790
+    },
+    {
+      "commit": "dcc8db39dddea6e4a7f34061c1d95459fce4180e",
+      "changedFiles": [
+        "scripts/release-loop/gate-image-pin-handshake.ts",
+        "src/ux-sim/gate-image-pin-handshake-sim.test.ts",
+        "src/ux-sim/gate-image-pin-handshake-sim.ts"
+      ],
+      "prNumber": 35787
+    },
+    {
+      "commit": "5dfb6f86e7713a11f08fe6b8ac2cc04b6c46b1bf",
+      "changedFiles": [
+        "scripts/release-loop/gate-flow-sim.test.ts",
+        "scripts/release-loop/gate-node.test.ts",
+        "scripts/release-loop/gate-node.ts",
+        "scripts/release-loop/gate-pod-stall.test.ts",
+        "scripts/release-loop/gate-types.ts"
+      ],
+      "prNumber": 35758
+    },
+    {
+      "commit": "49bf815f15cb38d9ae61692d1d0419bebd4a06a1",
+      "changedFiles": [
+        "docs/conductor/app-yaml-contract.md",
+        "src/nexus/apps/app-contract.test.ts",
+        "src/nexus/apps/app-contract.ts",
+        "src/nexus/apps/app-openapi.test.ts",
+        "src/nexus/apps/funnel-wiring.test.ts",
+        "templates/next-app-translator/app.yaml",
+        "templates/next-app-voice-note/app.yaml"
+      ],
+      "prNumber": 35786
+    },
+    {
+      "commit": "227554f3662776ad66190d394ef4328b0dae9cfb",
+      "changedFiles": [
+        "integrations/acp-registry/elanous/agent.json",
+        "package.json",
+        "server.json"
+      ]
+    },
+    {
+      "commit": "dcb1883d1921a09e7d257e5fb5d3fe3006e1c3b7",
+      "changedFiles": [
+        "scripts/release-loop/export-check-remote.test.ts",
+        "scripts/release-loop/export-check-remote.ts"
+      ],
+      "prNumber": 35794
+    },
+    {
+      "commit": "439d40d78bdf526ea7e91885483584b1afed230d",
+      "changedFiles": [
+        "apps/pwa/src/lib/chat-runtime.meta.test.ts",
+        "apps/pwa/src/lib/live-public.test.ts",
+        "apps/pwa/src/lib/share-capture.test.ts",
+        "src/agent-mission/driver.test.ts",
+        "src/dashboard/mission-cli-consumer.test.ts",
+        "test/status-bar.test.ts"
+      ],
+      "prNumber": 35801
+    },
+    {
+      "commit": "a3501ac55aaf5455e63ab7429d075c1a9fc5fa16",
+      "changedFiles": [
+        "scripts/release-loop/pwa-host-heal.sim.test.ts"
+      ],
+      "prNumber": 35807
+    }
+  ],
+  "keyEvidence": "Opaque rows preserve recorded failureId and opaqueReason only. Empty closure objects and sha256:ffff… are sentinels, not measured CAS key data."
+}

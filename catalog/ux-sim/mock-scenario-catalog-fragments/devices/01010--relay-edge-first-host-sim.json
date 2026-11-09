@@ -1,0 +1,33 @@
+{
+  "id": "relay-edge-first-host-sim",
+  "name": "First relay edge host admission and app-domain handshake",
+  "checklistCells": [
+    "RELAY-EDGE-CONNECT-FIRST-HOST"
+  ],
+  "implementation": [
+    "src/relay/relay-server.ts",
+    "src/relay/host-connector.ts"
+  ],
+  "tests": [
+    "src/ux-sim/relay-edge-first-host-sim.test.ts"
+  ],
+  "target": "Loopback-only relay host pinning, public app routing, and the fake TLS-edge request path without live host or DNS changes",
+  "inputs": [
+    "operator-pinned server ID and host signing public key",
+    "simulated public app host and HTTPS origin",
+    "local host connector with an app request handler"
+  ],
+  "observations": [
+    "trusted host authenticates and receives the app-localhost request",
+    "app response origin, host, and redirect are rewritten to the public HTTPS host",
+    "wrong host signing key is rejected before app dispatch",
+    "unknown user and invalid app hosts are rejected without calling an online host handler",
+    "unpinned public server ID and offline host fail closed"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/relay-edge-first-host-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

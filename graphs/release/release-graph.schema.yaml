@@ -1,0 +1,7 @@
+apiVersion: elanous.dev/release-graph-schema/v1
+graphId: release-loop
+requiredGraphFields: [graph_id, version, entry_node, terminal_nodes, nodes, edges]
+nodeKinds: [git, gate, judge, agent, hitl, subgraph]
+edgeTriggers: [outcome]
+terminalStates: [done, failed]
+recipePrefixes: [cmd, approval]

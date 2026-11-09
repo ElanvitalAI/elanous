@@ -37,11 +37,17 @@ test('unrelated gate failures bypass the same-run stalled receipt planner', () =
   expect(inspected).toBe(false);
 });
 
-test('fail-closed when same-run completed receipt evidence is rejected', () => {
+test('rejected same-run receipts force a full same-commit sweep with zero carried shards', () => {
+  const files = ['src/a.test.ts', 'src/b.test.ts'];
+  let wrote: unknown;
   const result = prepareSameRunGateRecheck(context({ outcome: 'error', commit, error: 'shard result batch write failed' }), {
+    repo: '/repo', ledgerRoot: '/ledger', testsAtCommit: () => files,
     pinnedImageDigest: () => `sha256:${'c'.repeat(64)}`, lockfileHash: () => '9'.repeat(64),
     inspect: (() => ({ ok: false, reason: 'completed shard receipt belongs to another graph run: pod-0' })) as typeof import('./gate-stalled-evidence.js').stalledGateEvidence,
+    write: ((root, plan) => { wrote = { root, plan }; return '/ledger/release/0.3.8/gate-partial.json'; }) as typeof import('./gate-partial.js').writeRecheckPlan,
   });
-  expect(result).toMatchObject({ outcome: 'error', verdict: 'fail' });
-  expect(result.summary).toContain('another graph run');
+  expect(result).toMatchObject({ outcome: 'ok', verdict: 'pass', fullSweepFallback: true, reusedShardCount: 0,
+    remeasureFiles: files, summary: expect.stringContaining('another graph run') });
+  expect(wrote).toMatchObject({ root: '/ledger', plan: { kind: 'recheck', priorCommit: commit, forCommit: commit,
+    files, stalledFiles: files, priorFailures: [], priorErrors: [], preservedShardCount: 0 } });
 });

@@ -22,7 +22,8 @@ import {
   type McpServerBootResult,
   type RegisterMcpClientsOpts,
 } from '../nexus/boot/register-mcp-clients.js';
-import { getUserConfig, type AsideConfig, type McpServerSpec, type UserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config.js';
+import type { AsideConfig, McpServerSpec, UserConfig } from '../user-config/types.js';
 import { registerToolRuntime } from './registry.js';
 
 export type McpProxyBootstrapStatus = 'idle' | 'pending' | 'ready' | 'skipped' | 'failed';

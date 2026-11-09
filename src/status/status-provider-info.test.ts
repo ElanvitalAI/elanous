@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { createStatusProviderInfoReader, statusModelActual } from './status-provider-info.js';
 
 function harness() {

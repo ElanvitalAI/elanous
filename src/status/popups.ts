@@ -14,7 +14,7 @@
 // take minimal dependencies (list + onPick callback + bounds
 // resolver) so they're unit-testable and reusable.
 
-import type { RotationEntry } from '../user-config.js';
+import type { RotationEntry } from '../user-config/types.js';
 import type { ThemeTokens } from '../theme/tokens.js';
 import type { ViewSurfaceHandle } from '../ui/modal-adapter.js';
 import {

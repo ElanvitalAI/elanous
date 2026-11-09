@@ -1,0 +1,25 @@
+{
+  "id": "ta-land-count-dispatcher-sim",
+  "name": "TA live land-count dispatch simulation",
+  "implementation": [
+    "src/ux-sim/ta-land-count-dispatcher-sim.ts"
+  ],
+  "tests": [
+    "src/ux-sim/ta-land-count-dispatcher-sim.test.ts"
+  ],
+  "target": "Test-only decision boundary for admitting task dispatch from an injected eln tasks land-count receipt.",
+  "inputs": [
+    "target capacity",
+    "CLI argv, exit code, stdout, and stderr receipt"
+  ],
+  "observations": [
+    "live parents count while completed orphans do not",
+    "missing, unreadable, malformed, or inconsistent evidence fails closed"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/ta-land-count-dispatcher-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

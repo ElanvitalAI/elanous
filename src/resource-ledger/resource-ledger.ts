@@ -5,6 +5,7 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard.js';
 import { acquireLockSync } from '../storage/file-lock.js';
 import { evaluateHostLeasePolicy, HOST_LEASE_ALTERNATIVE_HOSTS } from '../guardian/host-lease-policy.js';
+import { debug } from '../debug/log.js';
 
 export const RESOURCE_LANES = ['gate', 'train', 'ta', 'hand', 'warm', 'bench', 'unknown'] as const;
 export type ResourceLane = typeof RESOURCE_LANES[number];
@@ -119,53 +120,153 @@ const LEDGER_FILE = 'resource-ledger/events.jsonl';
 const validHost = (host: string) => /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/.test(host);
 const validFp = (fp: string) => /^fp_[A-Za-z0-9_-]{6,128}$/.test(fp);
 const positive = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value > 0;
+const validTimestamp = (value: unknown) => typeof value === 'string' && Number.isFinite(Date.parse(value));
+const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+function validResources(value: unknown): boolean {
+  return isRecord(value) && Object.entries(value).every(([key, amount]) =>
+    ['cpu', 'memoryBytes', 'shards', 'pods'].includes(key) && typeof amount === 'number' && Number.isFinite(amount) && amount >= 0);
+}
+function validGuardianRequest(value: unknown): value is GuardianHostLeaseRequest {
+  if (!isRecord(value)) return false;
+  return ['requestId', 'runId', 'requestedBy', 'consumer', 'purpose', 'host', 'priority'].every(key => validGuardianText(value[key]))
+    && validHost(value.host as string) && validTimestamp(value.expiresAt)
+    && (value.releaseVersion === undefined || validGuardianText(value.releaseVersion));
+}
 
 export function resourceLedgerPath(stateDir = elanousStateRoot()): string {
   return join(stateDir, LEDGER_FILE);
 }
+
+export interface UnknownResourceLedgerEventObservation { eventType: string; count: number }
 
 export function readResourceLedger(path = resourceLedgerPath()): ResourceLedgerEvent[] {
   if (!existsSync(path)) return [];
   return parseResourceLedgerEvents(readFileSync(path, 'utf8'));
 }
 
+/** Resource-ledger view for callers that need explicit forward-compatibility observations. */
+export function readResourceLedgerWithObservations(path = resourceLedgerPath()): {
+  events: ResourceLedgerEvent[];
+  unknownEvents: UnknownResourceLedgerEventObservation[];
+} {
+  if (!existsSync(path)) return { events: [], unknownEvents: [] };
+  const parsed = parseResourceLedgerEventsWithObservations(readFileSync(path, 'utf8'));
+  logUnknownResourceLedgerEvents(parsed.unknownEvents);
+  return parsed;
+}
+
+const KNOWN_RESOURCE_LEDGER_EVENT_TYPES = new Set([
+  'lease-created', 'lease-heartbeat', 'lease-ended', 'lease-reaped', 'pool-declared', 'pool-pod-receipt',
+  'guardian-host-lease', 'guardian-host-lease-conflict', 'guardian-host-lease-admitted', 'guardian-host-lease-admission-denied',
+]);
+
 export function parseResourceLedgerEvents(text: string): ResourceLedgerEvent[] {
-  return text.split(/\r?\n/).filter(Boolean).map((line, index) => {
+  const parsed = parseResourceLedgerEventsWithObservations(text);
+  logUnknownResourceLedgerEvents(parsed.unknownEvents);
+  return parsed.events;
+}
+
+function parseResourceLedgerEventsWithObservations(text: string): {
+  events: ResourceLedgerEvent[];
+  unknownEvents: UnknownResourceLedgerEventObservation[];
+} {
+  const events: ResourceLedgerEvent[] = [];
+  const unknownCounts = new Map<string, number>();
+  for (const [index, line] of text.split(/\r?\n/).filter(Boolean).entries()) {
     let value: unknown;
     try { value = JSON.parse(line); } catch { throw new Error(`resource ledger malformed at line ${index + 1}`); }
-    if (!value || typeof value !== 'object' || !['lease-created', 'lease-heartbeat', 'lease-ended', 'lease-reaped', 'pool-declared', 'pool-pod-receipt', 'guardian-host-lease', 'guardian-host-lease-conflict', 'guardian-host-lease-admitted', 'guardian-host-lease-admission-denied'].includes(String((value as { event?: unknown }).event))) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new Error(`resource ledger invalid event at line ${index + 1}`);
     }
-    if ((value as { event?: unknown }).event === 'guardian-host-lease') {
+    const eventType = (value as { event?: unknown }).event;
+    if (typeof eventType !== 'string' || eventType.length === 0)
+      throw new Error(`resource ledger invalid event at line ${index + 1}`);
+    if (!KNOWN_RESOURCE_LEDGER_EVENT_TYPES.has(eventType)) {
+      unknownCounts.set(eventType, (unknownCounts.get(eventType) ?? 0) + 1);
+      continue;
+    }
+    const row = value as Record<string, unknown>;
+    if (!validTimestamp(row.at)) throw new Error(`resource ledger invalid event at line ${index + 1}`);
+    if (eventType === 'lease-created') {
+      const lease = row.lease;
+      if (!isRecord(lease) || !validGuardianText(lease.id) || !validFp(String(lease.fp ?? ''))
+        || !validHost(String(lease.host ?? '')) || !RESOURCE_LANES.includes(lease.lane as ResourceLane)
+        || !validResources(lease.resources) || !isRecord(lease.mission) || !positive(lease.ttlMs)
+        || !validTimestamp(lease.heartbeatAt) || !validTimestamp(lease.startedAt)
+        || (lease.mission.pr !== undefined && (!Number.isSafeInteger(lease.mission.pr) || Number(lease.mission.pr) < 1)))
+        throw new Error(`resource ledger invalid lease creation at line ${index + 1}`);
+    }
+    if (eventType === 'lease-heartbeat') {
+      if (!validGuardianText(row.id) || !validTimestamp(row.heartbeatAt)
+        || (row.resources !== undefined && !validResources(row.resources)))
+        throw new Error(`resource ledger invalid lease heartbeat at line ${index + 1}`);
+    }
+    if (eventType === 'lease-ended') {
+      if (!validGuardianText(row.id) || !validGuardianText(row.reason) || !validGuardianText(row.stoppedBy))
+        throw new Error(`resource ledger invalid lease end at line ${index + 1}`);
+    }
+    if (eventType === 'lease-reaped') {
+      if (!validGuardianText(row.id) || !validTimestamp(row.expectedHeartbeatAt) || !validTimestamp(row.expectedExpiresAt)
+        || !validTimestamp(row.observedAt) || !['expired-and-absent', 'machine-disappeared'].includes(String(row.reason)))
+        throw new Error(`resource ledger invalid lease reap at line ${index + 1}`);
+    }
+    if (eventType === 'pool-declared') {
+      try { parseMachinePoolDeclarations({ pools: [row.pool] }); }
+      catch { throw new Error(`resource ledger invalid pool declaration at line ${index + 1}`); }
+    }
+    if (eventType === 'pool-pod-receipt') {
+      const receipt = row.receipt;
+      if (!isRecord(receipt) || !validGuardianText(receipt.host) || !validGuardianText(receipt.podUid)
+        || typeof receipt.digest !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(receipt.digest)
+        || !validGuardianText(receipt.runtime) || !validGuardianText(receipt.environment)
+        || !validGuardianText(receipt.lastJob) || !Array.isArray(receipt.skillPacks)
+        || !receipt.skillPacks.every(pack => isRecord(pack) && validGuardianText(pack.name) && validGuardianText(pack.version))
+        || !isRecord(receipt.cleanupResult) || !['clean', 'unclean', 'unknown'].includes(String(receipt.cleanupResult.state))
+        || !validGuardianText(receipt.cleanupResult.procedure) || !validGuardianText(receipt.cleanupResult.reason)
+        || !validTimestamp(receipt.cleanupResult.verifiedAt))
+        throw new Error(`resource ledger invalid Pod receipt at line ${index + 1}`);
+    }
+    if (eventType === 'guardian-host-lease') {
       const row = value as { at?: unknown; record?: Partial<GuardianHostLeaseRecord> };
       const request = row.record?.request;
       if (!validGuardianText(row.at) || !row.record || !validGuardianText(row.record.leaseId)
         || !['active', 'released', 'expired', 'denied'].includes(String(row.record.state))
-        || !request || !['requestId', 'runId', 'requestedBy', 'consumer', 'purpose', 'host', 'priority', 'expiresAt']
-          .every(key => validGuardianText((request as unknown as Record<string, unknown>)[key])))
+        || !validGuardianRequest(request)
+        || !validGuardianText(row.record.at)
+        || (row.record.reason !== undefined && !validGuardianText(row.record.reason))
+        || (row.record.alternatives !== undefined && (!Array.isArray(row.record.alternatives) || !row.record.alternatives.every(validGuardianText))))
         throw new Error(`resource ledger invalid Guardian host lease at line ${index + 1}`);
     }
-    if ((value as { event?: unknown }).event === 'guardian-host-lease-conflict') {
+    if (eventType === 'guardian-host-lease-conflict') {
       const row = value as Partial<GuardianHostLeaseConflictEvent>;
       if (!validGuardianText(row.at) || !validGuardianText(row.requestId) || !validGuardianText(row.existingLeaseId)
-        || !row.attemptedRequest || !validGuardianText(row.attemptedRequest.host))
+        || !validGuardianRequest(row.attemptedRequest))
         throw new Error(`resource ledger invalid Guardian host lease conflict at line ${index + 1}`);
     }
-    if ((value as { event?: unknown }).event === 'guardian-host-lease-admitted') {
+    if (eventType === 'guardian-host-lease-admitted') {
       const row = value as Partial<GuardianHostLeaseAdmittedEvent>;
       if (!validGuardianText(row.at) || !validGuardianText(row.leaseId) || !validGuardianText(row.host)
         || !validGuardianText(row.runId) || !validGuardianText(row.consumer))
         throw new Error(`resource ledger invalid Guardian host lease admission at line ${index + 1}`);
     }
-    if ((value as { event?: unknown }).event === 'guardian-host-lease-admission-denied') {
+    if (eventType === 'guardian-host-lease-admission-denied') {
       const row = value as Partial<GuardianHostLeaseAdmissionDeniedEvent>;
       if (!validGuardianText(row.at) || !validGuardianText(row.leaseId) || !validGuardianText(row.host)
         || !validGuardianText(row.runId) || !validGuardianText(row.consumer) || !validGuardianText(row.reason)
         || !Array.isArray(row.alternatives) || !row.alternatives.every(validGuardianText))
         throw new Error(`resource ledger invalid Guardian host lease admission denial at line ${index + 1}`);
     }
-    return value as ResourceLedgerEvent;
-  });
+    events.push(value as ResourceLedgerEvent);
+  }
+  return { events, unknownEvents: [...unknownCounts].map(([eventType, count]) => ({ eventType, count })) };
+}
+
+function logUnknownResourceLedgerEvents(unknownEvents: readonly UnknownResourceLedgerEventObservation[]): void {
+  if (unknownEvents.length === 0) return;
+  debug.log('resource-ledger', 'unknown-events-skipped', {
+    total: unknownEvents.reduce((sum, observation) => sum + observation.count, 0),
+    eventTypes: unknownEvents.map(({ eventType, count }) => ({ eventTypeJson: JSON.stringify(eventType), count })),
+  }, { level: 'warn' });
 }
 
 /** Latest durable Guardian decision per host lease request. */
@@ -301,6 +402,11 @@ export function activeResourcePools(events: readonly ResourceLedgerEvent[]): Mac
   return [...pools.values()];
 }
 
+/** Machine-scoped read view shared by the Nexus route and simulator. */
+export function resourcePoolsForMachine(events: readonly ResourceLedgerEvent[], machine: string): MachinePoolDeclaration[] {
+  return activeResourcePools(events).filter(pool => pool.members.some(member => member.host === machine));
+}
+
 /** Most recent per-Pod image/runtime/environment/job/cleanup identity from the Nexus resource ledger. */
 export function latestWarmPoolPodReceipts(events: readonly ResourceLedgerEvent[]): WarmPoolPodReceipt[] {
   const receipts = new Map<string, WarmPoolPodReceipt>();
@@ -322,10 +428,21 @@ export function recordWarmPoolPodReceipt(receipt: WarmPoolPodReceipt, now = new 
 }
 
 /** Append a validated pool declaration to the shared resource ledger (Nexus owns this file). */
-export function declareResourcePool(pool: MachinePoolDeclaration, now = new Date(), path?: string): void {
+export function declareResourcePool(pool: MachinePoolDeclaration, now = new Date(), path?: string): boolean {
   const validated = parseMachinePoolDeclarations({ pools: [pool] })[0]!;
   const target = path ?? resourceLedgerPath();
-  withLedgerLock(target, () => appendEvent({ event: 'pool-declared', at: now.toISOString(), pool: validated }, target));
+  let created = false;
+  withLedgerLock(target, () => {
+    const current = activeResourcePools(readResourceLedger(target)).find(row => row.purpose === validated.purpose
+      && row.fanoutGroupId === validated.fanoutGroupId);
+    if (current) {
+      if (JSON.stringify(current) !== JSON.stringify(validated)) throw new Error('conflicting resource pool declaration');
+      return;
+    }
+    appendEvent({ event: 'pool-declared', at: now.toISOString(), pool: validated }, target);
+    created = true;
+  });
+  return created;
 }
 
 /** Reassign active pool declarations when an HQ host is promoted; append-only history stays auditable. */

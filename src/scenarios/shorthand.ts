@@ -1,3 +1,4 @@
+import { isObject } from '../primitives/guards.js';
 // ── Presentation P5a · YAML decoration shorthand expansion ──
 //
 // Flutter-style `BoxDecoration` YAML would be noisy without shortcuts —
@@ -22,10 +23,6 @@
 // The expander walks the tree and rewrites every `style.decoration`
 // encountered. It's pure (no side effects) and returns a new object
 // graph — the caller's input stays intact.
-
-function isObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === 'object' && !Array.isArray(v);
-}
 
 function expandBorder(raw: Record<string, unknown>): Record<string, unknown> {
   if ('all' in raw) {

@@ -16,7 +16,8 @@ import { streamLLM, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 import { llmUsageCostFields } from '../budget/llm-cost.js';
-import { getUserConfig, resolveRoleLlm, type UserConfig } from '../user-config.js';
+import { getUserConfig, resolveRoleLlm } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 
 function logLlmUsage(model: string, usage: LLMUsage): void {
   try {

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GIT-PUSH-TIMEOUT-PARTIAL-OUTCOME-REMOTE-VERIFY-TS",
+  "path": "src/ux-sim/git-push-timeout-partial-outcome-remote-verify.ts",
+  "boundary": "Wraps the real git executable so push updates an isolated local remote, then returns a simulated transport timeout; source-ref move, move-away-and-back, and symbolic-transition injections verify conservative refusal. Confirmation requires an unchanged loose ref file identity/content and reflog plus a URL stable under rewriting.",
+  "deviceIds": [
+    "git-push-timeout-partial-outcome-remote-verify"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

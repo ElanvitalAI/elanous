@@ -4,7 +4,7 @@ import { handleDiscordSeatWork } from './discord-seat-work.js';
 import { DiscordBot } from '../discord.js';
 import { MsgStore } from '../msg/msg-store.js';
 import { answerSeatAsk, deliverSeatAnswers, type AskOrigin } from '../seat-dispatch/seat-ask.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import type { PersonaProfile } from '../persona/types.js';
 import type { PersonaSource } from '../persona/mention-parser.js';
 

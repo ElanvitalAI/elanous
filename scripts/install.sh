@@ -70,6 +70,30 @@ case "${ELANOUS_INSTALL_LANG:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}" in
 esac
 t() { if [ "$INSTALL_LANG" = ko ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
 
+# Bun's install cache may live on the home filesystem while the default /tmp is
+# a separate tmpfs (common in WSL and containers). Keep installer temp files on
+# the cache filesystem so Bun does not silently skip optional packages with EXDEV.
+align_tmpdir_with_bun_cache() {
+  [ "$(uname -s 2>/dev/null)" = Linux ] || return 0
+  local cache_dir="${BUN_INSTALL_CACHE_DIR:-${BUN_INSTALL:-$HOME/.bun}/install/cache}"
+  local current_tmp="${TMPDIR:-/tmp}"
+  [ -d "$current_tmp" ] || return 0
+  mkdir -p "$cache_dir" 2>/dev/null || return 0
+  local tmp_device cache_device cache_parent safe_tmp safe_device
+  tmp_device="$(stat -c '%d' "$current_tmp" 2>/dev/null)" || return 0
+  cache_device="$(stat -c '%d' "$cache_dir" 2>/dev/null)" || return 0
+  [ -n "$tmp_device" ] && [ -n "$cache_device" ] || return 0
+  [ "$tmp_device" != "$cache_device" ] || return 0
+  safe_tmp="$cache_dir/elanous-tmp"
+  mkdir -p "$safe_tmp" 2>/dev/null || return 0
+  safe_device="$(stat -c '%d' "$safe_tmp" 2>/dev/null)" || return 0
+  [ "$safe_device" = "$cache_device" ] || return 0
+  TMPDIR="$safe_tmp"
+  export TMPDIR
+  echo 'Adjusted installer temp directory to match the Bun cache filesystem.' >&2
+}
+align_tmpdir_with_bun_cache
+
 # Interactive = a person is at a terminal. `curl … | bash` gives us the script on stdin, so look at
 # stdout and /dev/tty, not stdin (rustup does the same). CI never counts as interactive.
 # ELANOUS_INSTALL_INTERACTIVE=0|1 overrides the probe (tests, wrappers).
@@ -354,6 +378,51 @@ if [ "$MODIFY_PATH" -eq 1 ]; then
   fi
 fi
 
+write_path_block() {
+  local file="$1" before_content="$2" path_file line file_mode in_block=0
+  if [ -L "$file" ]; then
+    echo "⛔ refusing to update PATH in symlinked shell startup file: $file" >&2
+    return 1
+  fi
+  path_file="$(mktemp "${file}.elanous-path.XXXXXX")" || return 1
+  {
+    if [ "$before_content" = 1 ]; then
+      printf '%s\n%s\n%s\n' "$MARKER_START" "$PATH_LINE" "$MARKER_END"
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [ "$line" = "$MARKER_START" ]; then in_block=1; continue; fi
+      if [ "$in_block" -eq 1 ]; then
+        if [ "$line" = "$MARKER_END" ]; then in_block=0; fi
+        continue
+      fi
+      printf '%s\n' "$line"
+    done < "$file"
+    if [ "$before_content" != 1 ]; then
+      printf '\n%s\n%s\n%s\n' "$MARKER_START" "$PATH_LINE" "$MARKER_END"
+    fi
+  } > "$path_file"
+  if [ "$in_block" -eq 1 ]; then
+    rm -f "$path_file" || true
+    echo "⛔ incomplete elanous PATH block in $file" >&2
+    return 1
+  fi
+  if ! file_mode="$(stat -c '%a' "$file" 2>/dev/null)" && ! file_mode="$(stat -f '%Lp' "$file" 2>/dev/null)"; then
+    rm -f "$path_file" || true
+    echo "⛔ could not preserve permissions while updating PATH in $file" >&2
+    return 1
+  fi
+  if ! chmod "$file_mode" "$path_file"; then
+    rm -f "$path_file" || true
+    echo "⛔ could not preserve permissions while updating PATH in $file" >&2
+    return 1
+  fi
+  if ! mv -f "$path_file" "$file"; then
+    rm -f "$path_file" || true
+    echo "⛔ could not atomically update PATH in $file" >&2
+    return 1
+  fi
+}
+
 # A standalone installer fetches a verified release; explicit sources and checkouts keep their existing paths.
 IS_CHECKOUT=0
 if [ -f "$SCRIPT_DIR/install.sh" ] && [ -f "$REPO_ROOT/package.json" ] && grep -q '"name": *"elanous"' "$REPO_ROOT/package.json" 2>/dev/null; then
@@ -523,11 +592,16 @@ if [ "$(uname -s)" = "Darwin" ]; then
   fi
 fi
 
-if [ "$MODIFY_PATH" -eq 1 ] && ! grep -Fqx "$MARKER_START" "$STARTUP"; then
-  printf '\n%s\n%s\n%s\n' "$MARKER_START" "$PATH_LINE" "$MARKER_END" >> "$STARTUP"
-fi
-if [ "$MODIFY_PATH" -eq 1 ] && [ -n "${LOGIN_STARTUP:-}" ] && ! grep -Fqx "$MARKER_START" "$LOGIN_STARTUP"; then
-  printf '\n%s\n%s\n%s\n' "$MARKER_START" "$PATH_LINE" "$MARKER_END" >> "$LOGIN_STARTUP"
+if [ "$MODIFY_PATH" -eq 1 ]; then
+  if [ -z "${ELANOUS_SHELL_STARTUP:-}" ] && [ "$STARTUP" = "$HOME/.bashrc" ]; then
+    # Debian's default ~/.bashrc returns before reaching appended lines for SSH commands.
+    write_path_block "$STARTUP" 1 || exit 1
+  else
+    write_path_block "$STARTUP" 0 || exit 1
+  fi
+  if [ -n "${LOGIN_STARTUP:-}" ]; then
+    write_path_block "$LOGIN_STARTUP" 0 || exit 1
+  fi
 fi
 
 echo "$(t "Installed elanous $VERSION at $PREFIX/bin/elanous" "elanous $VERSION 을(를) 설치했습니다: $PREFIX/bin/elanous")"

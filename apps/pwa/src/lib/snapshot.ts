@@ -1,16 +1,13 @@
 /**
- * BACKLOG #3 — surface snapshot helper (chat input · scroll position ·
+ * Surface snapshot helper (chat input · scroll position ·
  * xterm scrollback).
  *
- * Workspace 의 LRU freeze (cap 8 desktop / 5 mobile) 가 비활성 탭의
- * React subtree 를 unmount 하면 컴포넌트 state 가 통째 reset 된다.
- * 본 helper 가 surface 별로 localStorage 에 가벼운 snapshot 을 두어
- * 재 mount 시 사용자 가시 컨텍스트 (입력 중 텍스트 · 스크롤 위치 ·
- * 터미널 스크롤백) 를 복원한다.
+ * The helper stores small localStorage snapshots so remounts can restore
+ * user-visible context (draft text, scroll position, terminal scrollback).
  *
  * Key 형식: `elanous.pwa.snapshot.<surface>.<id>` — `surface` 는
- * `chatInput` | `chatScroll` | `xtermScrollback`, `id` 는 tabId 또는
- * terminalId. tabId 미지정 시 'singleton'.
+ * `chatInput` | `chatScroll` | `xtermScrollback`; terminal surfaces may
+ * provide an id, while chat uses the 'singleton' key.
  *
  * Persistence policy:
  * - per-entry cap 256 KB (xterm serialize buffer 최대 케이스 cover).
@@ -25,7 +22,7 @@ const MAX_ENTRY_BYTES = 256 * 1024;
 
 export type SnapshotSurface = 'chatInput' | 'chatScroll' | 'xtermScrollback';
 
-export function snapshotKey(surface: SnapshotSurface, id: string | undefined): string {
+export function snapshotKey(surface: SnapshotSurface, id?: string): string {
   return `${KEY_PREFIX}${surface}.${id && id.length > 0 ? id : 'singleton'}`;
 }
 

@@ -75,7 +75,7 @@ describe('resume --waive gate: only an unmeasured gate', () => {
     expect(releaseResumeWaiver(unmeasured, { from: 'gate', waive: 'gate', reason: REASON })?.unmeasured)
       .toBe('no-verdict: gate process ended with exit null and no result line — SIGTERM');
     const measured = gateThenTriaged({ exit: 1, output: gateOutput({ outcome: 'fail', introduced: ['src/a.test.ts > breaks'] }) });
-    expect(() => releaseResumeWaiver(measured, { from: 'gate', waive: 'gate', reason: REASON })).toThrow('only an unmeasured gate');
+    expect(() => releaseResumeWaiver(measured, { from: 'gate', waive: 'gate', reason: REASON })).toThrow('measured gate regressions cannot be waived');
     // An arbitrary or unexecuted node between gate and failed is not the triage shadow.
     unmeasured.path[3] = 'mac-smoke';
     expect(gateUnmeasuredDetail(unmeasured, 2)).toBeUndefined();
@@ -87,7 +87,7 @@ describe('resume --waive gate: only an unmeasured gate', () => {
   test('a measured gate failure (outcome fail · introduced > 0) is refused', () => {
     const measured = gateThenFailed({ exit: 1, output: gateOutput({ outcome: 'fail', verdict: 'fail', introduced: ['src/a.test.ts > breaks'] }) });
     expect(() => releaseResumeWaiver(measured, { from: 'gate', waive: 'gate', reason: REASON }))
-      .toThrow('only an unmeasured gate — stopped, killed or sweep incomplete — may be waived');
+      .toThrow('measured gate regressions cannot be waived');
     // A bare exit-1 failure with no result line is a measured failure too (only a signal death is «killed»).
     expect(() => releaseResumeWaiver(gateThenFailed({ exit: 1 }), { from: 'gate', waive: 'gate', reason: REASON }))
       .toThrow('cannot waive a safety, side-effect or approval node');
@@ -97,12 +97,17 @@ describe('resume --waive gate: only an unmeasured gate', () => {
     for (const result of [
       { outcome: 'error', error: 'baseline persistence: EACCES' },
       { outcome: 'error', error: 'cleanup: rm failed' },
-      { outcome: 'error', error: 'pod sweep incomplete: stalled shards 1', introduced: ['src/a.test.ts > breaks'] },
-      { outcome: 'error', error: 'failure-attribution-incomplete', introduced: ['src/a.test.ts > breaks'] },
       { outcome: 'error', error: 'pod sweep incomplete: stalled shards 1', introduced: 'none' },
     ]) {
       expect(() => releaseResumeWaiver(gateThenFailed({ exit: 2, output: gateOutput(result) }), { from: 'gate', waive: 'gate', reason: REASON }))
         .toThrow('cannot waive a safety');
+    }
+    for (const result of [
+      { outcome: 'error', error: 'pod sweep incomplete: stalled shards 1', introduced: ['src/a.test.ts > breaks'] },
+      { outcome: 'error', error: 'failure-attribution-incomplete', introduced: ['src/a.test.ts > breaks'] },
+    ]) {
+      expect(() => releaseResumeWaiver(gateThenFailed({ exit: 2, output: gateOutput(result) }), { from: 'gate', waive: 'gate', reason: REASON }))
+        .toThrow('measured gate regressions cannot be waived');
     }
   });
 

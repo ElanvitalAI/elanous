@@ -3,7 +3,8 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { skillSourceId, type SkillSource } from '../user-config.js';
+import { skillSourceId } from '../user-config.js';
+import type { SkillSource } from '../user-config/types.js';
 
 export type ConnectAgent = 'claude' | 'codex';
 export const CONNECT_AGENTS: readonly ConnectAgent[] = ['claude', 'codex'];

@@ -18,6 +18,7 @@ test('SIM-APPHOST serves an explicitly deployed immutable version, rolls back by
   host.deploy('demo', 'v1');
   const v1 = host.fetch('demo.app.sim.invalid', '/index.html');
   expect(v1.status).toBe(200);
+  expect(host.fetch('demo.app.sim.invalid', '/')).toMatchObject({ status: 200, body: '<h1>v1</h1>' });
   expect(v1.headers['x-app-host']).toBe('demo.app.sim.invalid');
   expect(v1.headers['x-app-host']).not.toBe('localhost');
   expect(v1.headers['x-app-origin']).toBe('https://demo.app.sim.invalid');
@@ -46,6 +47,13 @@ test('SIM-APPHOST publishes generated immutable artifacts and serves their captu
     .toThrow('app artifact version already exists or is invalid');
   host.rollback('demo');
   expect(host.fetch('demo.app.sim.invalid', '/index.html').headers['x-app-version']).toBe('v1');
+});
+
+test('SIM-APPHOST resolves extensionless routes to their static-export index.html file', () => {
+  const host = createFakeAppHost([{ slug: 'lecture-scrap', current: 'v1', versions: [
+    { id: 'v1', files: { 'search/index.html': '<main>검색</main>' } },
+  ] }]);
+  expect(host.fetch('lecture-scrap.app.sim.invalid', '/search')).toMatchObject({ status: 200, body: '<main>검색</main>' });
 });
 
 test('SIM-APPHOST serves non-HTML assets with path-appropriate content types', () => {

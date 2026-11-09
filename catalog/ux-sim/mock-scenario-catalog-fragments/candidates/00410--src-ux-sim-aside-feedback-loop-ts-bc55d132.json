@@ -1,0 +1,8 @@
+{
+  "path": "src/ux-sim/aside-feedback-loop.ts",
+  "disposition": "already-indexed",
+  "entryCommand": "bun test src/ux-sim/aside-feedback-loop.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "No runtime logs; real secretary runtime and topic subscription functions run with injected external edges.",
+  "deviceId": "aside-feedback-loop"
+}

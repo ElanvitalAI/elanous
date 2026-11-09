@@ -1,0 +1,25 @@
+{
+  "id": "SIM-CHAIN-LAND",
+  "name": "Enqueue through multi-host train disposition",
+  "kind": "chain-land",
+  "device": "fake-land-queue",
+  "implementation": [
+    "src/ux-sim/chain-land.ts",
+    "src/ux-sim/fake-gh.ts",
+    "src/ux-sim/fake-bin.ts",
+    "src/self-implement/l8-merge-queue.ts",
+    "src/self-implement/merge-train.ts"
+  ],
+  "tests": [
+    "src/ux-sim/chain-land.test.ts"
+  ],
+  "trigger": "Enqueue multiple PRs, inject integrated remote-gate outcomes, or place a real stale lock directory in the temporary Git common dir.",
+  "observe": [
+    "production runL8ShadowQueue result and ledger",
+    "actual git merge-tree/commit-tree calls",
+    "GitHub CLI requests through fake-gh and fake-bin",
+    "per-host gate outcome and attribution",
+    "stale lock leaves pending entries unchanged"
+  ],
+  "expected": "the production queue performs enqueue, integration, gate attribution and verdict disposition; stale lock refuses before integration; no simulated copy of queue/train/disposition logic is used"
+}

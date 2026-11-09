@@ -1,0 +1,11 @@
+{
+  "path": "src/release-loop/macrophage-heal.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/release-loop/macrophage-heal.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "Planner decisions and simulation-only cleanup are asserted by the macrophage release scenario tests.",
+  "deviceId": "release-graph-rig",
+  "scenarioIds": [
+    "RELEASE-MACROPHAGE-HEAL"
+  ]
+}

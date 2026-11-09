@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/fake-app-drive-world.test.ts",
+  "reason": "APP-WEB-DRIVE-TENANT: A/B isolation, scope, page-token, refresh, logout and revoke simulation coverage."
+}

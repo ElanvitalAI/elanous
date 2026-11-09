@@ -1,6 +1,7 @@
 /** In-Pod warm worker. This module does not create a Pod or select a gate result. */
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { gateLockfileHash } from '../../self-implement/gate-receipt-registry.js';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, parse, relative, resolve, sep } from 'node:path';
 import { warmReferenceFromJobArtifacts } from '../../../scripts/release-loop/gate-warm-artifacts.js';
@@ -160,7 +161,7 @@ export function warmWorkerSourceMatches(repoDir: string, cutSha: string, lockHas
       && head.status === 0 && head.stdout.trim() === cutSha
       && dirty.status === 0 && dirty.stdout.trim() === ''
       && tracked.status === 0 && tracked.stdout.split('\0').filter(Boolean).every(entry => entry.startsWith('H '))
-      && createHash('sha256').update(readFileSync(join(repoDir, 'bun.lock'))).digest('hex') === lockHash;
+      && gateLockfileHash(repoDir) === lockHash;
   } catch { return false; }
 }
 
@@ -181,6 +182,8 @@ export class WarmWorkerRuntime {
     scratchDir: string;
     artifactsRoot: string;
     workerId: string;
+    /** Image-baked runtime identity, independent of the worker Pod's lease command. */
+    baseImageDigest: string;
     runFile: WarmWorkerFileRunner;
     runGit?: (args: readonly string[]) => WarmWorkerGitResult;
     removeScratch?: (path: string) => void;
@@ -212,6 +215,7 @@ export class WarmWorkerRuntime {
       || !Number.isFinite(command.deadlineAt)
       || command.envProfile !== 'gate-v1' || (command.baselineSha !== undefined && !sha(command.baselineSha))
       || !keyValid(command.key)
+      || (command.baseImageDigest !== undefined && !/^sha256:[a-f0-9]{64}$/.test(command.baseImageDigest))
       || !Array.isArray(command.files) || command.files.length === 0
       || command.files.some(file => !testPath(file)) || new Set(command.files).size !== command.files.length) {
       return { reply: null, quarantineWorker: false, reason: 'invalid-command' };
@@ -219,6 +223,11 @@ export class WarmWorkerRuntime {
     if (command.deadlineAt <= now()) {
       this.quarantined = true;
       return { reply: null, quarantineWorker: true, reason: 'execution-error' };
+    }
+    if (!/^sha256:[a-f0-9]{64}$/.test(this.options.baseImageDigest)
+      || command.baseImageDigest !== this.options.baseImageDigest) {
+      this.quarantined = true;
+      return { reply: null, quarantineWorker: true, reason: 'quarantined' };
     }
     const repo = realpathSync(this.options.repoDir);
     const sourceMatches = warmWorkerSourceMatches(repo, command.cutSha, command.key.lockHash);
@@ -386,6 +395,11 @@ export class WarmWorkerRuntime {
         reason,
         remainingPaths: remainingPaths.slice(0, 5),
       }, { level: 'warn' }); } catch { /* observation cannot revive an unsafe worker */ }
+      try { debug.log('pod.reuse', 'reset-receipt', { runId: command.runId, attemptId: command.attemptId,
+        workerId: command.workerId, leaseId: command.leaseId, generation: command.generation,
+        baseImageDigest: this.options.baseImageDigest,
+        resetMethod: 'git-reset-clean-status-v1', postRunDiff: remainingPaths, reusable: false, reason,
+      }, { level: 'warn' }); } catch { /* observation cannot revive an unsafe worker */ }
       return { reply: null, quarantineWorker: true, reason: 'cleanup-failed', artifactsDir };
     };
     if (!rootMatches()) return discard('checkout-root-mismatch');
@@ -437,6 +451,8 @@ export class WarmWorkerRuntime {
       ...(command.baselineSha ? { baselineSha: command.baselineSha } : {}), leaseId: command.leaseId,
       generation: command.generation, workerId: command.workerId, key: command.key,
       envProfile: command.envProfile, startedAt, finishedAt, files,
+      resetReceipt: { baseImageDigest: this.options.baseImageDigest,
+        resetMethod: 'git-reset-clean-status-v1', postRunDiff: cleanup.remainingPaths },
     };
     writeFileSync(join(artifactsDir, 'reply.json'), JSON.stringify(reply), { mode: 0o600 });
     if (now() >= command.deadlineAt) {
@@ -444,6 +460,10 @@ export class WarmWorkerRuntime {
       this.quarantined = true;
       return { reply: null, quarantineWorker: true, reason: 'execution-error', artifactsDir };
     }
+    try { debug.log('pod.reuse', 'reset-receipt', { runId: command.runId, attemptId: command.attemptId,
+      workerId: command.workerId, leaseId: command.leaseId, generation: command.generation,
+      ...reply.resetReceipt, reusable: true,
+    }); } catch { /* the on-disk reply remains authoritative */ }
     return { reply, quarantineWorker: false, reason: 'complete', artifactsDir };
   }
 

@@ -1,4 +1,4 @@
-import type { LLMToolSpec } from '../llm/tool-spec.js';
+import { toLLMToolSpec, type LLMToolSpec } from '../llm/tool-spec.js';
 import { buildGitSnapshot } from '../git-fs/index.js';
 import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { debug } from '../debug/log.js';
@@ -1844,7 +1844,18 @@ function buildEssentialSessionRuntimeToolSpecs(opts: {
     .map(name => optionalByName.get(name))
     .filter((tool): tool is LLMToolSpec => !!tool)
     .filter(tool => isToolAvailable(tool.name, opts.toolAvailability));
-  return [...nativeSpecs, ...hostSpecs, ...runtimeSpecs, ...runtimeExtras, ...explicitIntegrationSpecs, ...mcpProxySpecs, ...optionalSpecs];
+  // Manifest route tools must reach the deferred-schema router even though they
+  // are not members of the fixed always-on host-tool families. The router then
+  // activates only the matching low-risk route for this turn.
+  const knownNames = new Set([
+    ...nativeSpecs, ...hostSpecs, ...runtimeSpecs, ...runtimeExtras,
+    ...explicitIntegrationSpecs, ...mcpProxySpecs, ...optionalSpecs,
+  ].map(spec => spec.name));
+  const routedHostSpecs = opts.hostTools
+    .filter(tool => !!tool.pluginId && !!tool.route)
+    .filter(tool => !knownNames.has(tool.name) && isToolAvailable(tool.name, opts.toolAvailability))
+    .map(toSpec);
+  return [...nativeSpecs, ...hostSpecs, ...runtimeSpecs, ...runtimeExtras, ...explicitIntegrationSpecs, ...mcpProxySpecs, ...optionalSpecs, ...routedHostSpecs];
 }
 
 /** Build the full TUI-visible catalog for Agent children. The parent model's
@@ -2249,11 +2260,7 @@ export async function dispatchSessionRuntimeTool(
 }
 
 function toSpec(tool: LLMToolDef): LLMToolSpec {
-  return {
-    name: tool.name,
-    description: tool.description,
-    parameters: tool.parameters,
-  };
+  return toLLMToolSpec(tool);
 }
 
 function hasAny(text: string, needles: readonly string[]): boolean {

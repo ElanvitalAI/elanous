@@ -1,3 +1,4 @@
+import { isObject } from '../primitives/guards.js';
 /**
  * ENTRANCE-DISPATCH-SHADOW: pure, read-only decision contract for comparing the
  * graph entrance with the current dispatcher. This module never launches work.
@@ -72,10 +73,6 @@ export interface EntranceShadowRecord {
 
 function validStamp(value: string): boolean {
   return value.trim().length > 0 && Number.isFinite(Date.parse(value));
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function validInput(name: string, input: unknown): boolean {

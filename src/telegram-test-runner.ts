@@ -23,7 +23,8 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { rmSync, mkdirSync, existsSync } from 'node:fs';
-import { getUserConfig, reloadUserConfig, userConfigPath, type UserConfig } from './user-config.js';
+import { getUserConfig, reloadUserConfig, userConfigPath } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 import { setElanousConfigDir } from './elanous-config-dir.js';
 import { syncTestConfig, isTestConfigStale } from './cli/config-test-sync.js';
 import { makeTelegramAgentRunTurn } from './telegram-agent.js';

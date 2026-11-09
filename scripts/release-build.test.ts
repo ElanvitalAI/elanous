@@ -19,8 +19,9 @@ function fixture(version = '0.0.1'): { root: string; out: string } {
   const out = join(base, 'assets');
   mkdirSync(join(root, 'scripts'), { recursive: true });
   writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'elanous', version, files: ['scripts/'] }));
+  writeFileSync(join(root, '.bun-version'), '1.4.2\n');
   writeFileSync(join(root, 'scripts/install.sh'), '#!/bin/sh\necho shell\n');
-  writeFileSync(join(root, 'scripts/install.ps1'), 'Write-Output powershell\n');
+  writeFileSync(join(root, 'scripts/install.ps1'), 'Write-Output __ELANOUS_BUN_VERSION__\n');
   writeFileSync(join(root, 'scripts/uninstall.sh'), '#!/bin/sh\necho remove\n');
   expect(spawnSync('git', ['init', '-q'], { cwd: root }).status).toBe(0);
   expect(spawnSync('git', ['add', '-A'], { cwd: root }).status).toBe(0);
@@ -37,7 +38,7 @@ test('packs only the supplied tree, copies installers, writes sorted SHA256SUMS 
   expect(result.tag).toBeUndefined();
   expect(readdirSync(out).sort()).toEqual(['SHA256SUMS', 'elanous.tgz', 'install.ps1', 'install.sh', 'uninstall.sh']);
   expect(readFileSync(join(out, 'install.sh'), 'utf8')).toBe('#!/bin/sh\necho shell\n');
-  expect(readFileSync(join(out, 'install.ps1'), 'utf8')).toBe('Write-Output powershell\n');
+  expect(readFileSync(join(out, 'install.ps1'), 'utf8')).toBe('Write-Output 1.4.2\n');
   expect(readFileSync(join(out, 'uninstall.sh'), 'utf8')).toBe('#!/bin/sh\necho remove\n');
   const names = ['install.ps1', 'install.sh', 'elanous.tgz', 'uninstall.sh'];
   expect(result.files.map((f) => f.name)).toEqual(names);

@@ -7,6 +7,7 @@
 
 import { createHash, randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../util/spawn-sync-output.js';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import { getUserConfig } from '../../user-config.js';
@@ -856,6 +857,8 @@ export interface RunPodCommandOptions {
   deadlineSeconds?: number;
   namespace?: string;
   image?: string;
+  /** Inject the launching-tree HEAD probe; the default probe rejects overflow and nonzero exits before image selection. */
+  readGitHead?: () => string | null;
   repoUrl?: string;
   runId?: string;
   /** Exact dependency-layer digest read from the pinned gate image label; null disables runtime-compatible reuse. */
@@ -951,6 +954,20 @@ function exitCodeFromPod(kubectl: Kubectl, namespace: string, job: string, state
 export function podCommandTargetCommit(o: { remote: boolean; gitHead: () => string | null; localImageCommit: () => string | null }): string | null {
   if (o.remote) return o.gitHead() ?? o.localImageCommit();
   return o.localImageCommit();
+}
+
+export function readPodCommandGitHead(
+  run: (args: readonly string[]) => { status: number | null; stdout?: string | null; stderr?: string | null; error?: Error } =
+    (args) => spawnSync('git', [...args], { encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER }),
+): string {
+  const result = run(['rev-parse', 'HEAD']);
+  if (result.error || result.status !== 0) {
+    const detail = result.error?.message ?? `rc=${result.status ?? 'unknown'}`;
+    throw new Error(`pod command: git HEAD lookup failed (${detail})`);
+  }
+  const head = result.stdout?.trim();
+  if (!head) throw new Error('pod command: git HEAD lookup returned empty output');
+  return head;
 }
 
 /** Only opt-in callers can stop waiting on a pre-Job async operation. Late rejections stay observed. */
@@ -1150,10 +1167,10 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     //   🐞 2026-09-27(🅞 실측): 로컬 `elanous-harness:local` 이 옛 판(30f95cf1)이라 레지스트리의 옛 태그를 골라 새 스킬이 없는 이미지로 돌았다.
     const imageCommit = options.imageCommit !== undefined
       ? options.imageCommit
-      : options.kubectl ? null
+      : options.kubectl && !options.readGitHead ? null
         : podCommandTargetCommit({
           remote: Boolean(member?.sshHost),
-          gitHead: () => spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout?.trim() || null,
+          gitHead: options.readGitHead ?? readPodCommandGitHead,
           localImageCommit: () => podImageFreshness({ image }).imageCommit,
         });
     if (pool && member) {

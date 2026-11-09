@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-LLM-TS",
+  "path": "src/ux-sim/fake-llm.ts",
+  "boundary": "fake llm: Deterministic, network-free LLM for gate tests without provider credentials. The opt-in is deliberately explicit; production never selects this provider.",
+  "deviceIds": [
+    "fake-llm"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

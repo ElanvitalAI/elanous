@@ -1,3 +1,4 @@
+import { isRecord } from '../../primitives/guards.js';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DATA_DIR } from '../../config.js';
@@ -66,7 +67,7 @@ export class PluginTrustStore {
       const parsed = JSON.parse(readFileSync(this.path, 'utf-8')) as Partial<PluginTrustFile>;
       return {
         version: 1,
-        records: Array.isArray(parsed.records) ? parsed.records.filter(isRecord) : [],
+        records: Array.isArray(parsed.records) ? parsed.records.filter(isPluginTrustRecord) : [],
       };
     } catch {
       return { version: 1, records: [] };
@@ -85,8 +86,8 @@ export function defaultPluginTrustPath(): string {
   return join(DATA_DIR, 'plugin-trust.json');
 }
 
-function isRecord(value: unknown): value is PluginTrustRecord {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+function isPluginTrustRecord(value: unknown): value is PluginTrustRecord {
+  if (!isRecord(value)) return false;
   const raw = value as Record<string, unknown>;
   return typeof raw.pluginId === 'string'
     && (raw.scope === 'user' || raw.scope === 'workspace')

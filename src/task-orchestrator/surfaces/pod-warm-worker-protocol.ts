@@ -28,6 +28,8 @@ export interface WarmWorkerCommand {
   image?: string;
   requestedAt?: string;
   key: WarmWorkerKey;
+  /** Immutable base image identified by the provider's runtime contract. */
+  baseImageDigest?: string;
   deadlineAt: number;
   files: readonly string[];
   /** Named, versioned environment profile; credentials travel through the existing Secret path. */
@@ -58,6 +60,8 @@ export interface WarmWorkerReply {
   startedAt: number;
   finishedAt: number;
   files: readonly WarmWorkerFileResult[];
+  /** Verified after this lease's last file and before the worker can be returned to the pool. */
+  resetReceipt?: { baseImageDigest: string; resetMethod: 'git-reset-clean-status-v1'; postRunDiff: readonly string[] };
 }
 
 export type WarmShadowReason = 'match' | 'no-sample' | 'reply-unmeasured' | 'reference-unmeasured' | 'invalid-reply' | 'identity' | 'missing-artifact' | 'file-set' | 'result';
@@ -93,6 +97,12 @@ export function parseWarmWorkerReply(raw: unknown): WarmWorkerReply | null {
         || !Array.isArray(item.failureIds) || !item.failureIds.every(named)
         || !Array.isArray(item.errorIds) || !item.errorIds.every(named);
     }) || (reply.baselineSha !== undefined && !named(reply.baselineSha))) return null;
+  if (reply.resetReceipt !== undefined) {
+    const reset = record(reply.resetReceipt);
+    if (!reset || !/^sha256:[a-f0-9]{64}$/.test(String(reset.baseImageDigest))
+      || reset.resetMethod !== 'git-reset-clean-status-v1' || !Array.isArray(reset.postRunDiff)
+      || !reset.postRunDiff.every((path: unknown) => typeof path === 'string')) return null;
+  }
   return raw as WarmWorkerReply;
 }
 

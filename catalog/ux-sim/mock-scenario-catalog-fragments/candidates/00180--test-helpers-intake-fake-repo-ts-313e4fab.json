@@ -1,0 +1,8 @@
+{
+  "path": "test/helpers/intake-fake-repo.ts",
+  "disposition": "excluded",
+  "entryCommand": "bun test test/intake-plane-check-common-name.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "The consumer test asserts temporary-repository behavior.",
+  "excludeReason": "Test helper, not a simulation device."
+}

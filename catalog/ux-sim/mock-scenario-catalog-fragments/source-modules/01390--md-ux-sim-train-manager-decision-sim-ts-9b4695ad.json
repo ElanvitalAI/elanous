@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TRAIN-MANAGER-DECISION-SIM-TS",
+  "path": "src/ux-sim/train-manager-decision-sim.ts",
+  "boundary": "Thin adapter that calls production planTrainDecisions against a fake snapshot; it does not execute train-manager operations.",
+  "deviceIds": [
+    "fake-land-queue"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

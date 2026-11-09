@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'bun:test';
 import { debug } from '../../debug/log.js';
-import { checkPodPool, genericConfigPodPool, imageShipLockPath, measureMemberOccupancy, parsePodPool, podWorkLabels, PodPoolScheduler, POD_POOL_DEFAULT_CAPACITY, preferredMembers, type PodPlacement, resolvePodPoolSpec, snapshotWarmPoolMembers, runBuildScript, syncPoolImage as syncPoolImageRaw, syncPoolImages as syncPoolImagesRaw, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
+import { checkPodPool, genericConfigPodPool, imageShipLockPath, measureMemberOccupancy, parsePodPool, podImageBuildScript, podWorkLabels, PodPoolScheduler, POD_POOL_DEFAULT_CAPACITY, preferredMembers, type PodPlacement, resolvePodPoolSpec, snapshotWarmPoolMembers, runBuildScript, syncPoolImage as syncPoolImageRaw, syncPoolImages as syncPoolImagesRaw, type MemberOccupancy, type RemoteRun } from './pod-pool.js';
 import { podPlacementKind, podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 import { HostPoolLease } from '../../pod-lease/host-lease.js';
 import { loadRunLedger } from '../../self-implement/run-ledger.js';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -20,6 +20,19 @@ const syncPoolImages: typeof syncPoolImagesRaw = (members, image, commit, deps =
   syncPoolImagesRaw(members, image, commit, { ...deps, lock: deps.lock ?? imageTestLock() });
 
 describe('pod pool — priority ⊕ per-node capacity', () => {
+  test('podImageBuildScript ignores partial git output after a failed top-level probe', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-build-root-partial-'));
+    const partialRoot = join(root, 'partial-output');
+    const partialScript = join(partialRoot, 'docker', 'harness', 'build.sh');
+    mkdirSync(join(partialRoot, 'docker', 'harness'), { recursive: true });
+    writeFileSync(partialScript, '#!/bin/sh\nexit 0\n');
+    const error = Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' });
+    try {
+      const script = podImageBuildScript(root, () => ({ status: null, stdout: `${partialRoot}\n`, error }));
+      expect(script).not.toBe(partialScript);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('remote build stderr keeps the first error and bounded tail in debug.log', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'pool-build-stderr-'));
     const script = join(dir, 'build.sh');

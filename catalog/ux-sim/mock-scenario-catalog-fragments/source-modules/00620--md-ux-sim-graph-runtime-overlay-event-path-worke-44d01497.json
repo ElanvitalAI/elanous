@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GRAPH-RUNTIME-OVERLAY-EVENT-PATH-WORKER-TS",
+  "path": "src/ux-sim/graph-runtime-overlay-event-path-worker.ts",
+  "boundary": "Isolated child runs the real self-implement graph overlay, persists observer events to the selected test log DB and can inject a dropped-event fault.",
+  "deviceIds": [
+    "sim-event-log-path"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

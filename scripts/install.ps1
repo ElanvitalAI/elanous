@@ -72,7 +72,41 @@ function Invoke-Quiet([scriptblock] $Block) {
 }
 
 # A junction is removed with rmdir so the target folder's contents are never touched.
+function Invoke-DownloadWithRetry([string] $Uri, [string] $Destination) {
+  $delaySeconds = 1
+  if ($env:ELANOUS_INSTALL_RETRY_DELAY_SECONDS -match '^\d+$') { $delaySeconds = [Math]::Min(10, [int]$env:ELANOUS_INSTALL_RETRY_DELAY_SECONDS) }
+  for ($attempt = 1; $attempt -le 3; $attempt++) {
+    try {
+      Invoke-WebRequest -UseBasicParsing -Uri $Uri -OutFile $Destination
+      if (Test-Path -LiteralPath $Destination -PathType Leaf) { return $true }
+      throw 'download returned without creating a file'
+    } catch {
+      Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+      if ($attempt -lt 3) { Start-Sleep -Seconds ($delaySeconds * $attempt) }
+    }
+  }
+  return $false
+}
+
+function Test-Sha512Integrity([string] $Path, [string] $Integrity) {
+  if ($Integrity -notmatch '^sha512-[A-Za-z0-9+/]+={0,2}$') { return $false }
+  $sha512 = [Security.Cryptography.SHA512]::Create()
+  $stream = [IO.File]::OpenRead($Path)
+  try { $actual = 'sha512-' + [Convert]::ToBase64String($sha512.ComputeHash($stream)) }
+  finally { $stream.Dispose(); $sha512.Dispose() }
+  return $actual -ceq $Integrity
+}
+
 function Set-Junction([string] $Link, [string] $Target) {
+  if ($env:OS -ne 'Windows_NT') {
+    if (Test-Path -LiteralPath $Link) {
+      $item = Get-Item -LiteralPath $Link -Force
+      if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Fail "$Link exists and is not a symbolic link - refusing to replace it" 1 }
+      Remove-Item -LiteralPath $Link -Force
+    }
+    New-Item -ItemType SymbolicLink -Path $Link -Target $Target | Out-Null
+    return
+  }
   if (Test-Path -LiteralPath $Link) {
     $item = Get-Item -LiteralPath $Link -Force
     if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Fail "$Link exists and is not a junction - refusing to replace it" 1 }
@@ -132,31 +166,104 @@ $installerPath = if ($scriptDir) { Join-Path $scriptDir 'install.sh' } else { $n
 $requiredCommands = Get-RequiredCommands $installerPath
 $missingGit = -not (Get-Command git -ErrorAction SilentlyContinue)
 $bootstrappedBun = $false
-$bunBin = Join-Path $HOME '.bun\bin'
-if (-not (Get-Command bun -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath (Join-Path $bunBin 'bun.exe') -PathType Leaf)) {
-  $env:PATH = $bunBin + [IO.Path]::PathSeparator + $env:PATH
+$bunUserBin = Join-Path (Join-Path $HOME '.bun') 'bin'
+if (-not (Get-Command bun -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath (Join-Path $bunUserBin 'bun.exe') -PathType Leaf)) {
+  $env:PATH = $bunUserBin + [IO.Path]::PathSeparator + $env:PATH
 }
 # Preserve checkout required-command enforcement, including git, before changing any installation files.
 foreach ($command in $requiredCommands) {
   if ($command -eq 'bun') { continue }
   if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { Fail "required command missing: $command" 127 }
 }
-if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
-  $bunCommand = 'irm https://bun.sh/install.ps1 | iex'
-  if ($NoBootstrapBun) { Fail "$(Say 'bun is missing; run:' 'bun \uc774 \uc5c6\uc2b5\ub2c8\ub2e4. \uba3c\uc800 \uc2e4\ud589\ud558\uc138\uc694:') $bunCommand" 127 }
-  # Bun's official install.ps1 resets the session PATH to the user PATH only (System32 and tar vanish) - keep ours.
-  $pathBeforeBun = $env:PATH
+$isCheckout = $false
+if ($installerPath -and (Test-Path -LiteralPath $installerPath) -and $repoRoot -and (Test-Path -LiteralPath (Join-Path $repoRoot 'package.json'))) {
+  $isCheckout = (Read-Text (Join-Path $repoRoot 'package.json')) -match '"name":\s*"elanous"'
+}
+if ($isCheckout -and $missingGit) { Fail 'required command missing: git' 127 }
+$bunVersion = '__ELANOUS_BUN_VERSION__'
+if ($isCheckout -and (Test-Path -LiteralPath (Join-Path $repoRoot '.bun-version'))) {
+  $bunVersion = (Read-Text (Join-Path $repoRoot '.bun-version')).Trim()
+} elseif ($bunVersion -eq ('__ELANOUS_' + 'BUN_VERSION__') -and (Get-Command bun -ErrorAction SilentlyContinue)) {
+  # An unbuilt standalone script has no release-embedded pin; use the already-installed Bun rather than reject -Source.
+  $availableBunVersion = Invoke-Quiet { & bun --version }
+  if ($availableBunVersion.ok -and $availableBunVersion.out.Trim() -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+    $bunVersion = $availableBunVersion.out.Trim()
+  }
+}
+if ($bunVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+  Fail 'pinned Bun version is missing or invalid' 1
+}
+$pinnedBunAvailable = $false
+if (Get-Command bun -ErrorAction SilentlyContinue) {
   try {
-    $bootstrapScript = if ($env:ELANOUS_INSTALL_BUN_SCRIPT) {
-      Read-Text $env:ELANOUS_INSTALL_BUN_SCRIPT
-    } else {
-      (Invoke-WebRequest -UseBasicParsing -Uri 'https://bun.sh/install.ps1').Content
+    $installedBunVersion = (& bun --version 2>$null | Select-Object -Last 1).Trim()
+    $pinnedBunAvailable = ($LASTEXITCODE -eq 0 -and $installedBunVersion -eq $bunVersion)
+  } catch { $pinnedBunAvailable = $false }
+}
+if (-not $pinnedBunAvailable) {
+  if ($NoBootstrapBun) { Fail "$(Say 'install pinned Bun version:' '\uc9c0\uc815\ub41c Bun \ubc84\uc804\uc744 \uc124\uce58\ud558\uc138\uc694:') $bunVersion" 127 }
+  # Keep the installer-pinned runtime isolated; never replace a user's shared ~/.bun/bin/bun.exe.
+  $runtimeDataHome = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path (Join-Path $HOME 'AppData') 'Local' }
+  $bunBin = Join-Path (Join-Path (Join-Path $runtimeDataHome 'Elanous') 'runtime') 'bun'
+  $bunBin = Join-Path $bunBin $bunVersion
+  $pathBeforeBun = $env:PATH
+  $bunTemp = Join-Path ([IO.Path]::GetTempPath()) ("elanous-bun-" + [guid]::NewGuid().ToString('N'))
+  try {
+    New-Item -ItemType Directory -Force -Path $bunTemp | Out-Null
+    $githubArchive = Join-Path $bunTemp 'bun-windows-x64.zip'
+    $githubUrl = "https://github.com/oven-sh/bun/releases/download/bun-v${bunVersion}/bun-windows-x64.zip"
+    $githubChecksumUrl = "https://github.com/oven-sh/bun/releases/download/bun-v${bunVersion}/SHASUMS256.txt"
+    $githubChecksumFile = Join-Path $bunTemp 'SHASUMS256.txt'
+    $bunExecutable = $null
+    if ((Invoke-DownloadWithRetry $githubUrl $githubArchive) -and (Invoke-DownloadWithRetry $githubChecksumUrl $githubChecksumFile)) {
+      try {
+        $checksumLine = [regex]::Match((Read-Text $githubChecksumFile), '(?m)^([0-9a-fA-F]{64})[ \t]+(?:\*)?bun-windows-x64\.zip\s*$')
+        if ($checksumLine.Success) {
+          $expected = $checksumLine.Groups[1].Value
+          $actual = (Get-FileHash -LiteralPath $githubArchive -Algorithm SHA256).Hash
+          if ($expected -ieq $actual) {
+            $githubExtract = Join-Path $bunTemp 'github'
+            Expand-Archive -LiteralPath $githubArchive -DestinationPath $githubExtract -Force
+            $bunExecutable = Get-ChildItem -LiteralPath $githubExtract -Filter 'bun.exe' -File -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          }
+        }
+      } catch { $bunExecutable = $null }
     }
-    if (-not $bootstrapScript) { throw 'empty installer response' }
-    & ([scriptblock]::Create([string]$bootstrapScript))
-    if (-not $?) { throw 'installer returned failure' }
-    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "installer exited with code $LASTEXITCODE" }
+    if ($bunExecutable) {
+      $githubBunVersion = Invoke-Quiet { & $bunExecutable --version }
+      if (-not $githubBunVersion.ok -or $githubBunVersion.out.Trim() -ne $bunVersion) { $bunExecutable = $null }
+    }
+    if (-not $bunExecutable) {
+      $npmMetadataUrl = "https://registry.npmjs.org/@oven%2fbun-windows-x64/$bunVersion"
+      $npmMetadataFile = Join-Path $bunTemp 'bun-npm-metadata.json'
+      if (-not (Invoke-DownloadWithRetry $npmMetadataUrl $npmMetadataFile)) { Fail "bun $bunVersion metadata download failed from npm registry" 1 }
+      try { $npmMetadata = Read-Text $npmMetadataFile | ConvertFrom-Json } catch { Fail "bun $bunVersion npm metadata is invalid" 1 }
+      $npmUrl = [string]$npmMetadata.dist.tarball
+      $npmIntegrity = [string]$npmMetadata.dist.integrity
+      $trustedNpmUrl = '^https://registry\.npmjs\.org/@oven/bun-windows-x64/-/bun-windows-x64-' + [regex]::Escape($bunVersion) + '\.tgz$'
+      if ($npmUrl -notmatch $trustedNpmUrl -or -not $npmIntegrity) { Fail "bun $bunVersion npm metadata has no trusted tarball URL or SHA512 integrity" 1 }
+      $npmArchive = Join-Path $bunTemp 'bun-npm.tgz'
+      if (-not (Invoke-DownloadWithRetry $npmUrl $npmArchive)) { Fail "bun $bunVersion npm tarball download failed" 1 }
+      if (-not (Test-Sha512Integrity $npmArchive $npmIntegrity)) { Fail "bun $bunVersion npm tarball SHA512 integrity mismatch" 1 }
+      $npmExtract = Join-Path $bunTemp 'npm'
+      New-Item -ItemType Directory -Force -Path $npmExtract | Out-Null
+      $tarCommand = if ($env:OS -eq 'Windows_NT') { 'tar.exe' } else { 'tar' }
+      & $tarCommand -xzf $npmArchive -C $npmExtract 'package/bin/bun.exe'
+      if ($LASTEXITCODE -ne 0) { Fail "bun $bunVersion npm package extraction failed" 1 }
+      $bunExecutable = Join-Path $npmExtract 'package/bin/bun.exe'
+      if (-not (Test-Path -LiteralPath $bunExecutable -PathType Leaf)) { Fail "bun $bunVersion npm package has no bun.exe" 1 }
+    }
+    $downloadedBunVersion = (& $bunExecutable --version 2>$null | Select-Object -Last 1).Trim()
+    if ($LASTEXITCODE -ne 0 -or $downloadedBunVersion -ne $bunVersion) { Fail "downloaded bun version mismatch: expected $bunVersion actual $downloadedBunVersion" 1 }
+    New-Item -ItemType Directory -Force -Path $bunBin | Out-Null
+    Copy-Item -LiteralPath $bunExecutable -Destination (Join-Path $bunBin 'bun.exe') -Force
+    # Keep the test universe executable on Unix PowerShell; Windows resolves bun.exe as bun.
+    if ($env:OS -ne 'Windows_NT') {
+      Copy-Item -LiteralPath (Join-Path $bunBin 'bun.exe') -Destination (Join-Path $bunBin 'bun') -Force
+      & chmod +x (Join-Path $bunBin 'bun')
+    }
   } catch { Fail "$(Say 'bun bootstrap failed:' 'bun \uc124\uce58 \uc2e4\ud328:') $($_.Exception.Message)" 1 }
+  finally { Remove-Item -LiteralPath $bunTemp -Recurse -Force -ErrorAction SilentlyContinue }
   $env:PATH = $bunBin + [IO.Path]::PathSeparator + $pathBeforeBun
   if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
     Fail (Say 'bun bootstrap failed: bun not found after installation' 'bun \uc124\uce58 \uc2e4\ud328: \uc124\uce58 \ub4a4\uc5d0\ub3c4 bun \uc744 \ucc3e\uc744 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4') 1
@@ -166,10 +273,6 @@ if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
 $bunPath = (Get-Command bun).Source
 
 # A standalone installer fetches a verified release; explicit sources and checkouts keep their existing paths.
-$isCheckout = $false
-if ($installerPath -and (Test-Path -LiteralPath $installerPath) -and $repoRoot -and (Test-Path -LiteralPath (Join-Path $repoRoot 'package.json'))) {
-  $isCheckout = (Read-Text (Join-Path $repoRoot 'package.json')) -match '"name":\s*"elanous"'
-}
 $releaseDirectory = $null
 if (-not $Source -and -not $isCheckout) {
   $releaseBase = if ($env:ELANOUS_RELEASE_BASE) { $env:ELANOUS_RELEASE_BASE } else { 'https://github.com/ElanvitalAI/elanous/releases' }
@@ -204,20 +307,51 @@ try {
     $packageUrl = $releaseDirectory + 'elanous.tgz'
     $checksumUrl = $releaseDirectory + 'SHA256SUMS'
     $checksumFile = Join-Path $tempDirectory 'SHA256SUMS'
+    $releaseVerified = $false
     try {
-      if ($packageUrl -match '^file://') { Copy-Item -LiteralPath ([uri]$packageUrl).LocalPath -Destination $installTarball }
-      else { Invoke-WebRequest -UseBasicParsing -Uri $packageUrl -OutFile $installTarball }
-    } catch { Fail "download failed: $packageUrl" 1 }
-    try {
-      if ($checksumUrl -match '^file://') { Copy-Item -LiteralPath ([uri]$checksumUrl).LocalPath -Destination $checksumFile }
-      else { Invoke-WebRequest -UseBasicParsing -Uri $checksumUrl -OutFile $checksumFile }
-    } catch { Fail "download failed: $checksumUrl" 1 }
-    $checksumLine = [regex]::Match((Read-Text $checksumFile), '(?m)^([0-9a-fA-F]{64})[ \t]+elanous\.tgz\s*$')
-    if (-not $checksumLine.Success) { Fail "checksum missing for elanous.tgz: $checksumUrl" 1 }
-    $expected = $checksumLine.Groups[1].Value
-    $actual = (Get-FileHash -LiteralPath $installTarball -Algorithm SHA256).Hash
-    if ($expected -ine $actual) { Fail "checksum mismatch for $packageUrl`: expected $expected actual $actual" 1 }
-    $metadataSource = $packageUrl
+      if ($packageUrl -match '^file://') { Copy-Item -LiteralPath ([uri]$packageUrl).LocalPath -Destination $installTarball; $packageDownloaded = $true }
+      else { $packageDownloaded = Invoke-DownloadWithRetry $packageUrl $installTarball }
+      if ($packageDownloaded) {
+        if ($checksumUrl -match '^file://') { Copy-Item -LiteralPath ([uri]$checksumUrl).LocalPath -Destination $checksumFile; $checksumDownloaded = $true }
+        else { $checksumDownloaded = Invoke-DownloadWithRetry $checksumUrl $checksumFile }
+      } else { $checksumDownloaded = $false }
+      if ($packageDownloaded -and $checksumDownloaded) {
+        $checksumLine = [regex]::Match((Read-Text $checksumFile), '(?m)^([0-9a-fA-F]{64})[ \t]+elanous\.tgz\s*$')
+        if ($checksumLine.Success) {
+          $expected = $checksumLine.Groups[1].Value
+          $actual = (Get-FileHash -LiteralPath $installTarball -Algorithm SHA256).Hash
+          if ($expected -ieq $actual) {
+            $packageManifestResult = Invoke-Quiet { tar -xzOf $installTarball package/package.json }
+            if ($packageManifestResult.ok) {
+              try {
+                $packageManifest = $packageManifestResult.out | ConvertFrom-Json
+                $manifestVersion = [string]$packageManifest.version
+                $releaseVerified = ($packageManifest.name -eq 'elanous' -and $manifestVersion -and $manifestVersion -notmatch '[\\/]|\.\.')
+              } catch { $releaseVerified = $false }
+            }
+          }
+        }
+      }
+    } catch { $releaseVerified = $false }
+    if ($releaseVerified) {
+      $metadataSource = $packageUrl
+    } else {
+      if ($env:ELANOUS_RELEASE_BASE) { Fail "custom ELANOUS_RELEASE_BASE download or checksum verification failed: $packageUrl" 1 }
+      Remove-Item -LiteralPath $installTarball,$checksumFile -Force -ErrorAction SilentlyContinue
+      $registryVersion = if ($env:ELANOUS_VERSION) { '/' + $env:ELANOUS_VERSION.TrimStart('v') } else { '/latest' }
+      $registryMetadataUrl = 'https://registry.npmjs.org/elanous' + $registryVersion
+      $registryMetadataFile = Join-Path $tempDirectory 'elanous-npm-metadata.json'
+      if (-not (Invoke-DownloadWithRetry $registryMetadataUrl $registryMetadataFile)) { Fail 'elanous release download failed from GitHub and npm registry' 1 }
+      try { $registryMetadata = Read-Text $registryMetadataFile | ConvertFrom-Json } catch { Fail 'invalid elanous npm registry metadata' 1 }
+      $registryPackageUrl = [string]$registryMetadata.dist.tarball
+      $registryIntegrity = [string]$registryMetadata.dist.integrity
+      if ($registryPackageUrl -notmatch '^https://registry\.npmjs\.org/elanous/' -or -not $registryIntegrity) {
+        Fail 'elanous npm registry metadata is missing a trusted tarball URL or integrity' 1
+      }
+      if (-not (Invoke-DownloadWithRetry $registryPackageUrl $installTarball)) { Fail 'elanous npm registry tarball download failed' 1 }
+      if (-not (Test-Sha512Integrity $installTarball $registryIntegrity)) { Fail 'elanous npm registry tarball SHA512 integrity mismatch' 1 }
+      $metadataSource = $registryPackageUrl
+    }
   } elseif ($Source -match '^https?://') {
     try { Invoke-WebRequest -UseBasicParsing -Uri $Source -OutFile $installTarball } catch { Fail "download failed: $Source" 1 }
     $metadataSource = $Source
@@ -324,7 +458,7 @@ try {
   if (-not $NoModifyPath) { Write-Output (Say '  Open a new PowerShell window to use elanous on PATH.' '  elanous \uc744 PATH \uc5d0\uc11c \uc4f0\ub824\uba74 \uc0c8 PowerShell \ucc3d\uc744 \uc5ec\uc138\uc694.') }
   else { Write-Output "$(Say '  Run:' '  \uc2e4\ud589:') $shimPath" }
   if ($missing -ne 'none') {
-    Write-Output "  winget install --id Git.Git -e  # $(Say 'the harness uses git' '\ud558\ub2c8\uc2a4\uac00 git \uc744 \uc0ac\uc6a9\ud569\ub2c8\ub2e4')"
+    Write-Output '  Install Git for Windows from https://git-scm.com/download/win, then reopen PowerShell and run: git --version'
   }
 } finally {
   Remove-Item -LiteralPath $tempDirectory -Recurse -Force -ErrorAction SilentlyContinue

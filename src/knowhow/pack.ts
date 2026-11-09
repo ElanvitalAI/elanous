@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 /** Shared, deterministic retrieval contract for TUI and task-agent knowhow. */
 
 export const KNOWHOW_PACK_DEFAULT_K = 8;
@@ -75,10 +76,6 @@ function timestamp(value: string): number | null {
 
 function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function validTarget(value: unknown): value is KnowhowTarget {

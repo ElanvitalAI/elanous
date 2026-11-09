@@ -1,0 +1,42 @@
+{
+  "id": "edge-creator",
+  "name": "Pairwise graph-edge plan for eight incidents plus E5 same-run resume simulation",
+  "checklistCells": [
+    "SIM-EDGE-CREATOR"
+  ],
+  "implementation": [
+    "src/ux-sim/edge-creator.ts",
+    "src/graph-runner/runner.ts",
+    "src/ux-sim/edge-creator-nightly.ts"
+  ],
+  "tests": [
+    "src/ux-sim/edge-creator.test.ts",
+    "src/ux-sim/edge-creator-nightly.test.ts"
+  ],
+  "target": "Generate bounded pairwise cases from four graph-edge axes and pin all eight recorded incidents; run E5 through the production graph runner with dynamic repair append, interruption, and same-runId resume",
+  "inputs": [
+    "isolated graph-run root",
+    "E1-E8 incident seeds with outcome, interruption, graph mutation, and environment axes",
+    "deterministic pairwise case plan with each incident tuple retained",
+    "E5 dynamic repair append event",
+    "interruption after durable append and after a fake external effect"
+  ],
+  "observations": [
+    "96/96 pair values covered across the four axes",
+    "all eight incident seeds represented in the plan",
+    "baseline and resumed terminal identity",
+    "dynamic append persistence and count",
+    "completed source receipt preservation",
+    "all process attempts within bounded time and declared run execution limit",
+    "repeated repair call with one idempotent external effect"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/edge-creator.test.ts",
+    "bun test src/ux-sim/edge-creator-nightly.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [
+    "sim.edge-creator.append"
+  ],
+  "recentUse": null
+}

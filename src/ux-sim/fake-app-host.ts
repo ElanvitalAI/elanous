@@ -102,8 +102,13 @@ export function createFakeAppHost(apps: readonly FakeAppDeclaration[]): FakeAppH
       const versions = declared.get(slug);
       const versionId = current.get(slug);
       const version = versionId ? versions?.get(versionId) : undefined;
-      const filePath = normalizeSimWorldAppPath(path);
-      const body = version && filePath && Object.hasOwn(version.files, filePath) ? version.files[filePath] : undefined;
+      const filePath = path === '/' ? '/' : normalizeSimWorldAppPath(path);
+      const staticCandidates = filePath === '/' ? ['/index.html']
+        : filePath?.endsWith('.html') ? [filePath]
+          : filePath ? [`${filePath}.html`, `${filePath}/index.html`] : [];
+      const resolvedFilePath = filePath && version?.files[filePath] !== undefined ? filePath
+        : staticCandidates.find(candidate => version?.files[candidate] !== undefined);
+      const body = resolvedFilePath ? version?.files[resolvedFilePath] : undefined;
       if (!version || body === undefined) {
         return { status: 404, body: 'Not Found', headers: { 'content-type': 'text/plain; charset=utf-8', 'x-app-host': host } as Record<string, string> };
       }
@@ -112,7 +117,7 @@ export function createFakeAppHost(apps: readonly FakeAppDeclaration[]): FakeAppH
         status: 200,
         body,
         headers: {
-          'content-type': contentTypeFor(filePath ?? path),
+          'content-type': contentTypeFor(resolvedFilePath ?? path),
           'x-app-host': `${slug}.app.sim.invalid`,
           'x-app-origin': `https://${slug}.app.sim.invalid`,
           'x-app-version': version.id,

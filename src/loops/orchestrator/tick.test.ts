@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, spyOn, test } from 'bun:test';
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync, readdirSync, symlinkSync } from 'node:fs';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { addItem, setItem, listChecklist } from '../../release-loop/checklist.js';
 import { splitCard } from '../../flow-loop/split.js';
@@ -12,7 +12,7 @@ import { dirname, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { CardStore } from '../../task-cards/card-store.js';
 import { buildUserConfig, resetUserConfig } from '../../user-config.js';
-import { isLaunchEligible, nextOrchestratorWindowAt, readCompletionHeartbeat, reconciliation, reportLine, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
+import { isLaunchEligible, nextOrchestratorWindowAt, readCompletionHeartbeat, reconciliation, reportLine, runOrchestratorCli, runOrchestratorNode, type Node, type PlacementInput, type TickDeps } from './tick.js';
 import { AnomalyCluster } from './anomaly-cluster.js';
 import { openMsgStore } from '../../msg/msg-store.js';
 import { checkLoopNeighbors, SEAT_NEIGHBORS } from '../neighbor-runtime.js';
@@ -1957,28 +1957,32 @@ describe('COORD-ENTRANCE-FOLD · 셸 디스패처 은퇴 결정 카드', () => {
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   }, 30000);
 
-  test('main 배선 격리: 그림자 틱이 reject 해도 본 노드 실행을 계속한다(관측은 본 루프를 봉쇄할 수 없다)', async () => {
-    const fs = await import('node:fs');
-    const os = await import('node:os');
-    const path = await import('node:path');
-    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'coord-shadow-cwd-'));
-    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'coord-shadow-state-'));
+  test('CLI 배선 격리: 그림자 틱이 reject 해도 본 노드 실행을 계속한다(관측은 본 루프를 봉쇄할 수 없다)', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'coord-shadow-cwd-'));
+    const stateRoot = mkdtempSync(join(tmpdir(), 'coord-shadow-state-'));
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    const previousGraphContext = process.env.ELANOUS_GRAPH_CONTEXT;
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       // 원장 경로를 디렉터리로 점유해 그림자 틱이 reject 하게 한다 — 판독 가드와 무관하게 배선 격리 자체를 잰다.
-      fs.mkdirSync(path.join(cwd, 'seat-state', 'OP', 'coordinator-shadow-dispatch.jsonl'), { recursive: true });
-      const env: Record<string, string | undefined> = { ...process.env, ELANOUS_STATE_DIR: stateRoot };
-      delete env.ELANOUS_GRAPH_CONTEXT;
-      const child = Bun.spawn([process.execPath, path.join(import.meta.dir, 'tick.ts'), 'intake', '--window', '08'], {
-        cwd, env, stdout: 'ignore', stderr: 'ignore',
-      });
-      expect(await child.exited).toBe(0);
-      const files = fs.readdirSync(path.join(stateRoot, 'loop', 'orchestrator')).filter(name => name.endsWith('-08.json'));
+      mkdirSync(join(cwd, 'seat-state', 'OP', 'coordinator-shadow-dispatch.jsonl'), { recursive: true });
+      process.env.ELANOUS_STATE_DIR = stateRoot;
+      delete process.env.ELANOUS_GRAPH_CONTEXT;
+      expect(await runOrchestratorCli(['intake', '--window', '08'], process.env, { cwd })).toBe(0);
+      expect(log).toHaveBeenCalledWith('loop.orchestrator', 'coordinator-shadow-tick-failed',
+        expect.objectContaining({ node: 'intake' }), { level: 'warn' });
+      const files = readdirSync(join(stateRoot, 'loop', 'orchestrator')).filter(name => name.endsWith('-08.json'));
       expect(files.length).toBe(1);
-      const state = JSON.parse(fs.readFileSync(path.join(stateRoot, 'loop', 'orchestrator', files[0]!), 'utf8'));
+      const state = JSON.parse(readFileSync(join(stateRoot, 'loop', 'orchestrator', files[0]!), 'utf8'));
       expect(state.nodes.intake).toBe('ok');
     } finally {
-      fs.rmSync(cwd, { recursive: true, force: true });
-      fs.rmSync(stateRoot, { recursive: true, force: true });
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      if (previousGraphContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+      else process.env.ELANOUS_GRAPH_CONTEXT = previousGraphContext;
+      log.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(stateRoot, { recursive: true, force: true });
     }
-  }, 60_000);
+  });
 });

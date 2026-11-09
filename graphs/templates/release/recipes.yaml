@@ -1,0 +1,20 @@
+cut:
+  command: 'bun ./release-step.ts cut'
+  timeout_ms: 1800000
+gate:
+  command: 'bun ./release-step.ts gate'
+  timeout_ms: 3600000
+triage:
+  command: 'bun ./release-step.ts triage'
+  timeout_ms: 600000
+publish-command:
+  command: 'bun ./release-step.ts publish'
+  timeout_ms: 3600000
+npm-publish:
+  command: 'bun ./release-step.ts npm-publish'
+  timeout_ms: 3600000
+verify:
+  command: 'bun ./release-step.ts verify'
+  timeout_ms: 1800000
+publish:
+  approval: 'Publish this version? Publishing may be irreversible.'

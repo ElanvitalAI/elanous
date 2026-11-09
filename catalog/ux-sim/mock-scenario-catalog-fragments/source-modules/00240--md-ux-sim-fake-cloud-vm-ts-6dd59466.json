@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-CLOUD-VM-TS",
+  "path": "src/ux-sim/fake-cloud-vm.ts",
+  "boundary": "Models image-based VM create/resume/stop, lease draining, powered-on cost and capacity-tier choice using deterministic state transitions; it never calls a cloud provider.",
+  "deviceIds": [
+    "fake-cloud-vm"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

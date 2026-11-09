@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TEMP-GIT-REMOTE-TS",
+  "path": "src/ux-sim/temp-git-remote.ts",
+  "boundary": "Creates a disposable local Git remote for child-process tests and returns the pinned environment needed to access that fixture.",
+  "deviceIds": [
+    "temp-git-remote"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,7 +1,7 @@
 import { getProviderForConfig, type LLMProvider } from '../llm.js';
 import { providerEnvKey, resolveProviderCredential } from '../llm/provider-credentials.js';
 import { probeProvider } from '../llm/provider-probe.js';
-import type { UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config/types.js';
 import { getSecretAsync, setSecretAsync } from '../nexus/config/secrets/index.js';
 
 export const KEY_SETUP_SERVICES = [

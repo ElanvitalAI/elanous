@@ -1,13 +1,15 @@
 import { expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { releaseReadiness, type ReleaseReadinessDeps } from './release-readiness.js';
+import { gateImageReadinessSignalPath, readGateImageReadinessSignal, releaseReadiness, waitForGateImageT60,
+  type ReleaseReadinessDeps } from './release-readiness.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { setSchedule } from '../../src/release-loop/release-schedule.js';
 import { addItem, listChecklist } from '../../src/release-loop/checklist.js';
 import { debug } from '../../src/debug/log.js';
 import { spyOn } from 'bun:test';
+import { parse as yaml } from 'yaml';
 
 const version = '0.2.6';
 const clear = { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] };
@@ -68,7 +70,15 @@ test('주입 시계가 컷 전이면 before-cut · 정확히 컷 시각이면 �
     setSchedule(version, { cutAt: '2026-10-03T08:00+09:00', landBy: '2026-10-03T06:30+09:00' }, 'OP');
     const early = { ...deps, now: () => new Date('2026-10-02T22:59:00Z'), checklist: () => { throw new Error('gate reached before cut'); } };
     expect(releaseReadiness(version, early)).toEqual({ ready: false, reason: 'before-cut', details: 'before-cut (10-03(토) 08:00 KST)' });
-    expect(log).toHaveBeenCalledWith('release.schedule', 'before-cut', { version, cutAt: '2026-10-02T23:00:00.000Z', landBy: '2026-10-02T21:30:00.000Z' });
+    expect(log).toHaveBeenCalledWith('release.schedule', 'countdown-held', expect.objectContaining({
+      version, cutAt: '2026-10-02T23:00:00.000Z', landBy: '2026-10-02T21:30:00.000Z', eta: '2026-10-02T23:00:00.000Z',
+      holdReason: 'cut-time-constraint',
+    }));
+    expect(releaseReadiness(version, { ...deps, allowBeforeCut: true, now: () => new Date('2026-10-02T22:59:00Z') }))
+      .toEqual({ ready: true, reason: 'ready', details: clear });
+    expect(log).toHaveBeenCalledWith('release.schedule', 'countdown-planned', expect.objectContaining({
+      version, expectedEta: '2026-10-02T23:00:00.000Z', phase: 'pre-cut',
+    }));
     expect(releaseReadiness(version, { ...deps, now: () => new Date('2026-10-02T23:00:00Z') })).toEqual({ ready: true, reason: 'ready', details: clear });
     expect(releaseReadiness(version, { ...deps, now: () => new Date('2026-10-02T23:00:00Z'), checklist: () => blocked })).toEqual({ ready: false, reason: 'checklist-blocked', details: blocked });
   } finally { log.mockRestore(); resetElanousConfigDir(); }
@@ -105,3 +115,119 @@ test('GATE-ENTRY-ALIGN: before the landing deadline an undecided non-P0 yellow s
     expect(releaseReadiness(version, { ledgerRoot: deps.ledgerRoot, now: () => new Date('2026-10-02T22:00:00Z') })).toMatchObject({ ready: false, reason: 'checklist-blocked', details: { undecided: ['WAIT'] } });
   } finally { resetElanousConfigDir(); }
 }));
+
+test('image T-60 readiness signal is run- and cut-bound; absent or mismatched evidence stays unknown', () => fixture((dir, deps) => {
+  const path = gateImageReadinessSignalPath(deps.ledgerRoot!, version);
+  expect(path).toBe(join(dir, 'image-readiness.json'));
+  expect(readGateImageReadinessSignal(path, { runId: 'run-1', cutCommit: 'a'.repeat(40) }))
+    .toEqual({ status: 'unknown', reason: 'signal-missing' });
+  writeFileSync(path, JSON.stringify({ schemaVersion: 1, status: 'ready', runId: 'run-1', cutCommit: 'a'.repeat(40),
+    imageDigest: `sha256:${'b'.repeat(64)}`, eligiblePools: ['gate-pool-a'], checkedAt: '2026-11-07T03:00:00.000Z' }));
+  expect(readGateImageReadinessSignal(path, { runId: 'run-1', cutCommit: 'a'.repeat(40) }).status).toBe('ready');
+  expect(readGateImageReadinessSignal(path, { runId: 'run-2', cutCommit: 'a'.repeat(40) }))
+    .toEqual({ status: 'unknown', reason: 'run-mismatch' });
+  expect(readGateImageReadinessSignal(path, { runId: 'run-1', cutCommit: 'c'.repeat(40) }))
+    .toEqual({ status: 'unknown', reason: 'commit-mismatch' });
+}));
+
+test('T-minus image hold reads the real signal contract, waits through cutAt, then releases', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-image-t60-'));
+  const countdownVersion = '0.3.7';
+  const runId = 'run-countdown';
+  const cutCommit = 'a'.repeat(40);
+  const signalPath = gateImageReadinessSignalPath(root, countdownVersion);
+  const cutAt = '2026-11-07T03:05:00.000Z';
+  let currentCutAt = cutAt;
+  let instant = new Date('2026-11-07T03:00:00.000Z');
+  let sleeps = 0;
+  let unknownEta: unknown = 'not-observed';
+  const eventStates: Array<{ phase: string; eta: string | null; holdReason: string | null }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((_category, event) => {
+    if (event === 'countdown-cut-time-changed') {
+      const state = JSON.parse(readFileSync(join(root, 'release', countdownVersion, 'readiness-countdown.json'), 'utf8')) as typeof eventStates[number];
+      eventStates.push({ phase: state.phase, eta: state.eta, holdReason: state.holdReason });
+    }
+  });
+  const writeSignal = (signalRunId: string) => writeFileSync(signalPath, JSON.stringify({ schemaVersion: 1, status: 'ready',
+    runId: signalRunId, cutCommit, imageDigest: `sha256:${'b'.repeat(64)}`, eligiblePools: ['gate-pool-a'], checkedAt: instant.toISOString() }));
+  try {
+    setSchedule(countdownVersion, { cutAt }, 'OP', root);
+    const result = await waitForGateImageT60({ runId, input: { version: countdownVersion }, outputs: { 'version-release': { commit: cutCommit } } }, {
+      ledgerRoot: root, now: () => instant,
+      sleep: async () => {
+        sleeps++;
+        if (sleeps === 1) unknownEta = JSON.parse(readFileSync(join(root, 'release', countdownVersion, 'readiness-countdown.json'), 'utf8')).eta;
+        if (sleeps === 1) { writeSignal('other-run'); currentCutAt = '2026-11-07T03:06:00.000Z'; setSchedule(countdownVersion, { cutAt: currentCutAt }, 'OP', root); }
+        if (sleeps === 2) { writeSignal(runId); instant = new Date('2026-11-07T03:04:00.000Z'); }
+        if (sleeps === 3) { currentCutAt = '2026-11-07T03:07:00.000Z'; setSchedule(countdownVersion, { cutAt: currentCutAt }, 'OP', root); }
+        if (sleeps === 4) { currentCutAt = '2026-11-07T03:03:00.000Z'; setSchedule(countdownVersion, { cutAt: currentCutAt }, 'OP', root); }
+      },
+      pollMilliseconds: 1000,
+    });
+    expect(result).toMatchObject({ version: countdownVersion, runId, cutCommit, eta: instant.toISOString(), signalPath });
+    expect(sleeps).toBe(4);
+    expect(unknownEta).toBeNull();
+    expect(log).toHaveBeenCalledWith('release.schedule', 'countdown-hold', expect.objectContaining({
+      version: countdownVersion, eta: null, reason: 'image-t60:signal-missing',
+    }));
+    expect(log.mock.calls.filter((call) => call[0] === 'release.schedule' && call[1] === 'countdown-cut-time-changed')).toHaveLength(3);
+    expect(log).toHaveBeenCalledWith('release.schedule', 'countdown-cut-time-changed', {
+      version: countdownVersion, runId, fromCutAt: cutAt, cutAt: '2026-11-07T03:06:00.000Z',
+      observedAt: '2026-11-07T03:00:00.000Z', eta: null, phase: 'hold', holdReason: 'image-t60:run-mismatch',
+    });
+    expect(log).toHaveBeenCalledWith('release.schedule', 'countdown-cut-time-changed', {
+      version: countdownVersion, runId, fromCutAt: '2026-11-07T03:07:00.000Z', cutAt: currentCutAt,
+      observedAt: '2026-11-07T03:04:00.000Z', eta: instant.toISOString(), phase: 'ready', holdReason: null,
+    });
+    expect(eventStates).toEqual([
+      { phase: 'hold', eta: null, holdReason: 'image-t60:run-mismatch' },
+      { phase: 'countdown', eta: '2026-11-07T03:07:00.000Z', holdReason: 'cut-time-constraint' },
+      { phase: 'ready', eta: '2026-11-07T03:04:00.000Z', holdReason: null },
+    ]);
+    expect(log).toHaveBeenCalledWith('release.schedule', 'countdown-cut-time-changed', {
+      version: countdownVersion, runId, fromCutAt: '2026-11-07T03:06:00.000Z', cutAt: '2026-11-07T03:07:00.000Z',
+      observedAt: '2026-11-07T03:04:00.000Z', eta: '2026-11-07T03:07:00.000Z', phase: 'countdown', holdReason: 'cut-time-constraint',
+    });
+    expect(JSON.parse(readFileSync(join(root, 'release', countdownVersion, 'readiness-countdown.json'), 'utf8')))
+      .toMatchObject({ phase: 'ready', eta: result.eta, holdReason: null, runId, cutCommit });
+  } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  expect(existsSync(root)).toBe(false);
+});
+
+test('0.3.6 skips the image signal but holds graph progress until cutAt', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-image-036-'));
+  let instant = new Date('2026-11-07T03:04:00.000Z');
+  let sleeps = 0;
+  let cutAt = '2026-11-07T03:05:00.000Z';
+  try {
+    setSchedule('0.3.6', { cutAt }, 'OP', root);
+    const result = await waitForGateImageT60({ runId: 'run-036', input: { version: '0.3.6' },
+      outputs: { 'version-release': { commit: 'a'.repeat(40) } } }, {
+      ledgerRoot: root, readSignal: () => { throw new Error('0.3.6 must not read the new signal'); },
+      now: () => instant,
+      sleep: async () => {
+        sleeps++;
+        if (sleeps === 1) { instant = new Date(cutAt); cutAt = '2026-11-07T03:06:00.000Z'; setSchedule('0.3.6', { cutAt }, 'OP', root); }
+        else instant = new Date(cutAt);
+      },
+      pollMilliseconds: 1000,
+    });
+    expect(result).toEqual({ version: '0.3.6', runId: 'run-036', cutCommit: 'a'.repeat(40), eta: cutAt, signalPath: '' });
+    expect(sleeps).toBe(2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the production release graph routes every version through the cut-time readiness node', () => {
+  const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as {
+    nodes: Array<{ node_id: string; recipe?: string }>;
+    edges: Array<{ from: string; map?: Record<string, string> }>;
+  };
+  const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
+  expect(graph.edges.find((edge) => edge.from === 'version-release')?.map).toEqual({
+    ok: 'readiness-countdown', fail: 'failed', error: 'failed',
+  });
+  expect(graph.edges.find((edge) => edge.from === 'readiness-countdown')?.map?.ok).toBe('traffic-cut-start');
+  expect(recipes['readiness-countdown']?.command).toBe('bun scripts/release-loop/release-readiness.ts --image-t60-hold');
+  expect(recipes['readiness-countdown']?.timeout_ms).toBe(0);
+  expect(graph.nodes.find((node) => node.node_id === 'readiness-countdown')?.recipe).toBe('cmd:readiness-countdown');
+});

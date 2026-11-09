@@ -8,6 +8,7 @@ import { appendRunLedgerEntry, runLedgerDir } from '../../src/self-implement/run
 import { refuseProductionLedgerWriteInTest } from '../../src/harness/ledger-write-guard.js';
 import { recordFailureEvent } from '../../src/self-implement/heal-intake.js';
 import { roleResult } from './run-role.js';
+import { runTestCli } from '../../test/helpers/cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -15,17 +16,15 @@ setDefaultTimeout(60_000);
 const ROOT = join(import.meta.dir, '../..');
 const HEAL = join(ROOT, 'graphs/heal/heal-loop.yaml');
 
-function graphRun(input: unknown): { status: number; json: { status?: string; path?: string[]; nodes?: Array<{ nodeId: string; output?: string }> } } {
+async function graphRun(input: unknown): Promise<{ status: number; json: { status?: string; path?: string[]; nodes?: Array<{ nodeId: string; output?: string }> } }> {
   const root = mkdtempSync(join(tmpdir(), 'heal-run-'));
-  const child = spawnSync('bun', ['bin/elanous.mjs', '--test', 'graph', 'run', HEAL, '--input', JSON.stringify(input), '--json'], {
-    cwd: ROOT,
-    encoding: 'utf8',
-    env: { ...process.env, ELANOUS_INSTANCE_ROOT: root },
-    timeout: 120_000,
-  });
-  rmSync(root, { recursive: true, force: true });
-  const line = (child.stdout ?? '').split('\n').map((row) => row.trim()).filter((row) => row.startsWith('{')).at(-1) ?? '';
-  return { status: child.status ?? 1, json: line ? JSON.parse(line) as { status?: string; path?: string[]; nodes?: Array<{ nodeId: string; output?: string }> } : {} };
+  try {
+    const result = await runTestCli(['graph', 'run', HEAL, '--input', JSON.stringify(input), '--json'], {
+      cwd: ROOT, stateRoot: root, allowPaths: [['graph', 'run']], env: { ELANOUS_INSTANCE_ROOT: root },
+    });
+    const line = result.stdout.split('\n').map((row) => row.trim()).filter((row) => row.startsWith('{')).at(-1) ?? '';
+    return { status: result.exitCode, json: line ? JSON.parse(line) as { status?: string; path?: string[]; nodes?: Array<{ nodeId: string; output?: string }> } : {} };
+  } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
 function outputOf(json: { nodes?: Array<{ nodeId: string; output?: string }> }, nodeId: string): Record<string, unknown> | undefined {
@@ -35,8 +34,8 @@ function outputOf(json: { nodes?: Array<{ nodeId: string; output?: string }> }, 
   return line?.startsWith('{') ? JSON.parse(line) as Record<string, unknown> : undefined;
 }
 
-test('⑴ 문서만 미검증이면 acknowledge · done · next=review', () => {
-  const { json } = graphRun({ failure: { failedTests: 0, unverified: ['docs/a.md'] } });
+test('⑴ 문서만 미검증이면 acknowledge · done · next=review', async () => {
+  const { json } = await graphRun({ failure: { failedTests: 0, unverified: ['docs/a.md'] } });
   expect(json.path).toContain('acknowledge');
   expect(json.status).toBe('done');
   expect(outputOf(json, 'acknowledge')?.next).toBe('review');
@@ -65,21 +64,21 @@ test('revise-goal cannot claim success without collected materialized paths or a
   expect(result).toMatchObject({ outcome: 'fail', needsHuman: true, reason: 'insufficient-materialized-evidence' });
 });
 
-test('⑵ importer 미실행은 heal-harness 를 거쳐 triage 로 돌아온다', () => {
-  const { json } = graphRun({ failure: { failedTests: 0, importerUnrunTests: 1, unverified: ['src/a.ts'] } });
+test('⑵ importer 미실행은 heal-harness 를 거쳐 triage 로 돌아온다', async () => {
+  const { json } = await graphRun({ failure: { failedTests: 0, importerUnrunTests: 1, unverified: ['src/a.ts'] } });
   expect(json.path).toContain('heal-harness');
   expect(json.path?.filter((id) => id === 'triage').length).toBeGreaterThan(1);
   expect(outputOf(json, 'heal-harness')).toMatchObject({ outcome: 'fail', reason: 'not-wired' });
 }, 120_000);
 
-test('⑶ 할당량 주장 ⊕ 계정 0 은 verify-evidence corrected · 계정 없음', () => {
-  const { json } = graphRun({ failure: { failedTests: 0, environmentClaim: '할당량 소진', environmentEvidence: { accountCount: 0 } } });
+test('⑶ 할당량 주장 ⊕ 계정 0 은 verify-evidence corrected · 계정 없음', async () => {
+  const { json } = await graphRun({ failure: { failedTests: 0, environmentClaim: '할당량 소진', environmentEvidence: { accountCount: 0 } } });
   expect(json.path).toContain('verify-evidence');
   expect(outputOf(json, 'verify-evidence')).toMatchObject({ outcome: 'corrected', 'corrected-kind': 'no-account' });
 }, 120_000);
 
-test('⑷ 할당량 주장 ⊕ exit 127 은 verify-evidence corrected · 바이너리 없음', () => {
-  const { json } = graphRun({ failure: { failedTests: 0, environmentClaim: '할당량 소진', environmentEvidence: { exitCode: 127, stderr: 'node: not found' } } });
+test('⑷ 할당량 주장 ⊕ exit 127 은 verify-evidence corrected · 바이너리 없음', async () => {
+  const { json } = await graphRun({ failure: { failedTests: 0, environmentClaim: '할당량 소진', environmentEvidence: { exitCode: 127, stderr: 'node: not found' } } });
   expect(json.path).toContain('verify-evidence');
   expect(outputOf(json, 'verify-evidence')).toMatchObject({ outcome: 'corrected', 'corrected-kind': 'binary-missing' });
 }, 120_000);

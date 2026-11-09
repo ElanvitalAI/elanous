@@ -9,6 +9,8 @@ export interface MachineApplyFromCaptureDeps extends MachineSetupApplyDeps {
   readonly wsl?: MachineWslSetupDeps;
 }
 
+const WSL_CODEX_CREDENTIAL_GUIDANCE = 'Before WSL setup, sign in once with codex login --device-auth on Windows. Windows owns Codex credentials; WSL setup does not create or refresh them. Windows-to-WSL access-only mirror delivery is a follow-up.';
+
 export function currentMachineSetupPlatform(env: NodeJS.ProcessEnv = process.env, runtimePlatform = process.platform): string {
   if (env.WSL_DISTRO_NAME || env.WSL_INTEROP) return 'wsl';
   if (runtimePlatform === 'darwin') return 'macos';
@@ -51,12 +53,15 @@ export function registerMachineApplyFromCaptureCommand(command: Command, deps: M
     .option('--profile <profile>', 'default, developer, or headquarters', 'default')
     .option('--platform <platform>', 'target platform; inferred from the current host when omitted')
     .option('--distribution <name>', 'WSL distribution to create', 'Ubuntu')
+    .option('--resume-trigger <trigger>', 'Windows resume trigger: onstart (default) or onlogon fallback', 'onstart')
     .option('--wsl-user <name>', 'Linux account to create in the WSL distribution', 'elanous')
-    .option('--resume', 'resume WSL setup after reboot; normally started by RunOnce')
+    .option('--resume', 'resume WSL setup after reboot; normally started by the scheduled task')
+    .option('--allow-cloud-vm', 'explicitly continue WSL2 setup on a detected cloud VM despite reboot risk')
     .option('--yes', 'explicitly approve running package-manager commands')
     .option('--json', 'structured stdout; command stdout is suppressed while interactive prompts remain on the terminal')
-    .action((options: { from: string; profile: string; platform?: string; distribution: string; wslUser: string; resume?: boolean; yes?: boolean; json?: boolean }) => {
+    .action((options: { from: string; profile: string; platform?: string; distribution: string; resumeTrigger: 'onstart' | 'onlogon'; wslUser: string; resume?: boolean; allowCloudVm?: boolean; yes?: boolean; json?: boolean }) => {
       try {
+        if (!['onstart', 'onlogon'].includes(options.resumeTrigger)) throw new Error('--resume-trigger must be onstart or onlogon');
         const capture = readMachineCaptureForPlan(options.from);
         const platform = options.platform ?? (deps.platform ?? currentMachineSetupPlatform)();
         const wslHost = platform === 'wsl' && (deps.wsl?.platform ?? process.platform) === 'win32';
@@ -64,7 +69,7 @@ export function registerMachineApplyFromCaptureCommand(command: Command, deps: M
         if (!options.yes && !options.json) {
           const plan = buildMachineSetupPlan({ profile: options.profile, platform, sourceCapture: capture,
             ...(platform === 'wsl' ? { distribution: options.distribution } : {}) });
-          out.log(`${formatMachineSetupPlan(plan)}\n\nNo commands executed. Add --yes to apply.`);
+          out.log(`${wslHost ? `${WSL_CODEX_CREDENTIAL_GUIDANCE}\n\n` : ''}${formatMachineSetupPlan(plan)}\n\nNo commands executed. Add --yes to apply.`);
           return;
         }
         if (platform === 'wsl' && (deps.wsl?.platform ?? process.platform) === 'win32') {
@@ -72,12 +77,14 @@ export function registerMachineApplyFromCaptureCommand(command: Command, deps: M
             const plan = buildMachineSetupPlan({ profile: options.profile, platform: 'wsl', sourceCapture: capture,
               distribution: options.distribution });
             out.log(JSON.stringify({ kind: 'machine-wsl-setup-plan', profile: options.profile,
-              distribution: options.distribution, user: options.wslUser, requiresYes: true, plan }, null, 2));
+              distribution: options.distribution, user: options.wslUser, requiresYes: true,
+              credentialGuidance: WSL_CODEX_CREDENTIAL_GUIDANCE, plan }, null, 2));
             return;
           }
+          if (!options.json) out.log(WSL_CODEX_CREDENTIAL_GUIDANCE);
           const bootstrap = applyMachineWslBootstrap({ capture: capturePath, profile: options.profile,
-            distribution: options.distribution, user: options.wslUser, resume: options.resume === true,
-            ...(deps.wsl ? { deps: deps.wsl } : {}) });
+            distribution: options.distribution, user: options.wslUser, resume: options.resume === true, resumeTrigger: options.resumeTrigger,
+            deps: { ...deps.wsl, allowCloudVm: options.allowCloudVm === true } });
           const profileResult = bootstrap.status === 'complete'
             ? applyMachineWslProfile({ plan: buildMachineSetupPlan({ profile: options.profile, platform: 'wsl', sourceCapture: capture,
               distribution: options.distribution }),
@@ -87,8 +94,8 @@ export function registerMachineApplyFromCaptureCommand(command: Command, deps: M
             attempted: bootstrap.attempted + profileResult.attempted, profileResult,
             failures: profileResult.failures.map(item => ({ operation: item.operation, reason: `${item.target}: ${item.reason}` })) }
             : bootstrap;
-          if (options.json) out.log(JSON.stringify(result, null, 2));
-          else if (result.status === 'resume-pending') out.log(`machine apply · ${result.detail} · reboot and sign in to continue`);
+          if (options.json) out.log(JSON.stringify({ ...result, credentialGuidance: WSL_CODEX_CREDENTIAL_GUIDANCE }, null, 2));
+          else if (result.status === 'resume-pending') out.log(`machine apply · ${result.detail}`);
           else {
             out.log(`machine apply · WSL ${result.status} · ${result.distribution}/${result.user} · attempted ${result.attempted} · failures ${result.failures.length}`);
             if (result.failures.length) out.log(result.failures.map(item => `${item.operation}: ${item.reason}`).join('\n'));

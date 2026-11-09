@@ -4,7 +4,7 @@ import { findSessionByTelegramChat, updateSessionMeta } from './session/index.js
 import { telegramDecisionOwner } from './decisions/telegram-decision-cards.js';
 import type { TelegramBot } from './telegram.js';
 import type { TgSlashCommand } from './telegram-commands.js';
-import type { UserConfig } from './user-config.js';
+import type { UserConfig } from './user-config/types.js';
 
 export interface TelegramProjectCommandDeps {
   list: () => Project[];

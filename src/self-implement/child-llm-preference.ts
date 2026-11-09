@@ -1,13 +1,7 @@
 // 사용자 자식 모델 선호와 예산 부족 행동을 한 함수로 해석한다.
 // 계정 회전은 여기 없다 — 계정이 여럿일 때 기존 회전이 선택된 프로바이더 안에서 한다.
 
-import type {
-  BudgetGateMaxUsedPercent,
-  BudgetGateOnShortfall,
-  ChildLlmChainEntry,
-  ChildLlmPreferenceMode,
-  UserConfig,
-} from '../user-config.js';
+import type { BudgetGateMaxUsedPercent, BudgetGateOnShortfall, ChildLlmChainEntry, ChildLlmPreferenceMode, UserConfig } from '../user-config/types.js';
 import { DEFAULT_BUDGET_GATE } from '../user-config.js';
 import { debug } from '../debug/log.js';
 import { fallbackChainForProvider, normalizeFallbackChain } from '../oauth/fallback-chain.js';

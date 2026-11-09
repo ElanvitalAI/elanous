@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAULT-NEXUS-STALL-TS",
+  "path": "src/ux-sim/fault-nexus-stall.ts",
+  "boundary": "Production Nexus grid consumer with synchronous kubectl delay and unreachable faults (simulation boundary).",
+  "deviceIds": [
+    "fault-nexus-stall"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

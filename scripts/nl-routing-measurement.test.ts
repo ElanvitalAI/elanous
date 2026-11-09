@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { commandResult, createElanousLiveTurnRunner, endsLiveRun, measureLiveTurn, provePtyDrivesSession, verifyPtySession, waitForOpenTurnClose, type LiveTurnRunner } from './lib/nl-routing-live.js';
 import { resolveTruncatedTurnWaitMs, runLiveCorpus } from './lib/nl-routing-corpus-run.js';
 import { truncatedTurnsSummary } from './lib/nl-routing-live-summary.js';
-import { main as runCorpusMain, resolveCorpusRunSafety, NL_ROUTING_UNSAFE_RUN_ENV } from './measure-nl-routing-corpus.js';
+import { main as runCorpusMain, resolveCorpusRunSafety, NL_ROUTING_UNSAFE_RUN_ENV, corpusRoutingStrategyFromEnv, corpusMeasurementRouteTools, filterCorpusMeasurementToolNames, parseCorpusText } from './measure-nl-routing-corpus.js';
 import { EVAL_PROMPT_TOOL_SURFACES, type EvalPromptResult } from '../src/eval-prompt-cli.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -39,7 +39,7 @@ async function runCorpusRunner(env: Record<string, string>): Promise<{ exitCode:
   }
 }
 
-async function runEmptyCorpus(env: Record<string, string>, surfaceTools: readonly string[] = ['Read']): Promise<{ logs: string[]; output: Record<string, unknown>; cwds: Array<string | undefined> }> {
+async function runEmptyCorpus(env: Record<string, string>, surfaceTools: readonly string[] = ['Read']): Promise<{ logs: string[]; output: Record<string, unknown>; cwds: Array<string | undefined>; strategies: Array<string | undefined>; routeNames: Array<string[]>; measurementOnlyNames: Array<string[]>; denies: Array<string[]> }> {
   const originalArgv = process.argv;
   const originalEnv = { ...process.env };
   const originalLog = console.log;
@@ -47,25 +47,34 @@ async function runEmptyCorpus(env: Record<string, string>, surfaceTools: readonl
   const out = resolve(outDir, 'corpus.json');
   const logs: string[] = [];
   const cwds: Array<string | undefined> = [];
+  const strategies: Array<string | undefined> = [];
+  const routeNames: Array<string[]> = [];
+  const measurementOnlyNames: Array<string[]> = [];
+  const denies: Array<string[]> = [];
   try {
     process.argv = process.argv.slice(0, 2);
     for (const key of Object.keys(process.env)) delete process.env[key];
-    Object.assign(process.env, originalEnv, env, { CORPUS_OUT: out, CORPUS_IDS: 'test-1', CORPUS_REPEATS: '1', CORPUS_BUDGETS: '1', CORPUS_CONCURRENCY: '1' });
+    Object.assign(process.env, originalEnv, { CORPUS_CWD: outDir }, env, { CORPUS_OUT: out, CORPUS_IDS: 'test-1', CORPUS_REPEATS: '1', CORPUS_BUDGETS: '1', CORPUS_CONCURRENCY: '1' });
+    if (!Object.hasOwn(env, 'CORPUS_STRATEGY')) delete process.env.CORPUS_STRATEGY;
     console.log = ((line: string) => logs.push(line)) as typeof console.log;
     await runCorpusMain(
-      () => ({ description: 'test', surface: 'cli', tiers: { test: 'test' }, items: [{ id: 'test-1', tier: 'test', prompt: 'test', accept: [] }] }),
+      () => ({ description: 'test', surface: 'cli', tiers: { test: 'test' }, items: [{ id: 'test-1', tier: 'test', prompt: 'test', accept: [], reject: ['ReleaseGraphStart'] }] }),
       async (options): Promise<EvalPromptResult> => {
         cwds.push(options.cwd);
+        strategies.push(options.routingStrategy);
+        routeNames.push(options.measurementRouteTools?.map((tool) => tool.name) ?? []);
+        measurementOnlyNames.push([...(options.measurementOnlyToolNames ?? [])]);
+        denies.push([...(options.toolDeny ?? [])]);
         return {
-          text: '', modelFamily: 'test', modelId: 'test', turnCount: 0, toolCallCount: 0,
+          text: '', modelFamily: 'test', modelId: 'test', turnCount: 1, toolCallCount: 0,
           toolBreakdown: {}, toolSurface: 'cli', surfaceToolNames: [], surfaceToolCount: 0,
-          durationMs: 0, logPath: null, eventCounts: {}, assertions: [],
+          durationMs: 0, inputTokens: 12, outputTokens: 8, firstTokenMs: 250, logPath: null, eventCounts: {}, assertions: [],
         };
       },
       resolveCorpusRunSafetyFromProcessEnv,
       () => surfaceTools,
     );
-    return { logs, output: JSON.parse(readFileSync(out, 'utf8')) as Record<string, unknown>, cwds };
+    return { logs, output: JSON.parse(readFileSync(out, 'utf8')) as Record<string, unknown>, cwds, strategies, routeNames, measurementOnlyNames, denies };
   } finally {
     console.log = originalLog;
     process.argv = originalArgv;
@@ -76,6 +85,50 @@ async function runEmptyCorpus(env: Record<string, string>, surfaceTools: readonl
 }
 
 describe('NL routing corpus runner safety gate', () => {
+  test('parses JSONL metadata and item rows without changing the legacy JSON corpus contract', () => {
+    const corpus = parseCorpusText([
+      JSON.stringify({ type: 'meta', description: 'fixture', surface: 'chat', tiers: { route: 'route tier' } }),
+      JSON.stringify({ id: 'route-1', tier: 'route', prompt: '상태를 확인해 줘', accept: ['ObserveOpsStatus'] }),
+    ].join('\n'));
+    expect(corpus).toMatchObject({ description: 'fixture', surface: 'chat', items: [{ id: 'route-1' }] });
+    expect(parseCorpusText(JSON.stringify({ description: 'legacy', surface: 'cli', tiers: {}, items: [] }))).toMatchObject({ description: 'legacy', items: [] });
+  });
+
+  test('defaults to native-all and passes explicit index strategy through measurement and raw output', async () => {
+    expect(corpusRoutingStrategyFromEnv({})).toBe('native-all');
+    expect(corpusRoutingStrategyFromEnv({ CORPUS_STRATEGY: 'index' })).toBe('index');
+    expect(() => corpusRoutingStrategyFromEnv({ CORPUS_STRATEGY: 'other' })).toThrow('valid values: native-all, index');
+
+    const baseline = await runEmptyCorpus({});
+    expect(baseline.strategies).toEqual(['native-all']);
+    expect(baseline.logs.some((line) => line.includes('strategy native-all'))).toBe(true);
+    expect(baseline.output.routingStrategy).toBe('native-all');
+
+    const indexed = await runEmptyCorpus({ CORPUS_STRATEGY: 'index' });
+    expect(indexed.strategies).toEqual(['index']);
+    expect(indexed.logs.some((line) => line.includes('strategy index'))).toBe(true);
+    expect(indexed.output.routingStrategy).toBe('index');
+    expect(indexed.routeNames[0]).toEqual(['ReleaseStatus', 'ReleaseGraphStart', 'ObserveLogs', 'ObserveOpsStatus']);
+    expect(indexed.output.routeToolNames).toEqual(indexed.routeNames[0]);
+    expect(indexed.measurementOnlyNames[0]).toEqual(['Read', 'ReleaseStatus', 'ReleaseGraphStart', 'ObserveLogs', 'ObserveOpsStatus']);
+    expect(indexed.denies[0]).toEqual(expect.arrayContaining(['Bash', 'Edit', 'Write', 'SelfImplement']));
+    expect(indexed.output.deniedToolNames).toEqual(indexed.denies[0]);
+    expect((indexed.output.records as Array<Record<string, unknown>>)[0]).toMatchObject({ inputTokens: 12, outputTokens: 8, firstTokenMs: 250, tokensPerTurn: 20 });
+    expect((indexed.output.metrics as Record<string, unknown>).meanFirstTokenMs).toBe(250);
+  });
+
+  test('the measured route surface comes from current built-in plugin manifests', () => {
+    expect(corpusMeasurementRouteTools().map((tool) => tool.name)).toEqual(['ReleaseStatus', 'ReleaseGraphStart', 'ObserveLogs', 'ObserveOpsStatus']);
+  });
+
+  test('tool deny filters route expectations before measurement and preserves allowed surface tools', () => {
+    expect(filterCorpusMeasurementToolNames(
+      ['Read', 'ObserveLogs'],
+      ['ReleaseStatus', 'ObserveLogs'],
+      ['ObserveLogs'],
+    )).toEqual(['Read', 'ReleaseStatus']);
+  });
+
   test('fail-closed before corpus loading when observe-only is disabled', async () => {
     const safetyError = () => resolveCorpusRunSafety({}, { enabled: false, source: 'default' }, ['SelfImplement', 'Bash', 'Edit', 'Write']);
     expect(safetyError).toThrow('exposed mutating tools can modify this worktree');
@@ -104,22 +157,15 @@ describe('NL routing corpus runner safety gate', () => {
     }
   });
 
-  test('the runner entrypoint stops after final surface resolution with non-zero exit and safety guidance', async () => {
+  test('invalid CORPUS_STRATEGY fails closed before any model call', async () => {
     const cwd = mkdtempSync(resolve(tmpdir(), 'nl-routing-cwd-'));
     const corpusPath = resolve(cwd, 'corpus.json');
-    writeFileSync(corpusPath, JSON.stringify({ description: 'test', surface: 'cli', tiers: {}, items: [] }));
+    writeFileSync(corpusPath, JSON.stringify({ description: 'test', surface: 'chat', tiers: { test: 'test' }, items: [{ id: 'test-1', tier: 'test', prompt: '상태 확인', accept: ['ObserveOpsStatus'] }] }));
     try {
-      const result = await runCorpusRunner({ CORPUS_CWD: cwd, CORPUS_PATH: corpusPath });
+      const result = await runCorpusRunner({ CORPUS_CWD: cwd, CORPUS_PATH: corpusPath, CORPUS_STRATEGY: 'unknown' });
       expect(result.exitCode).not.toBe(0);
-      expect(result.stdout).toBe('');
-      expect(result.stderr).toContain('exposed mutating tools can modify this worktree');
-      // The child's HOME is empty, so no provider resolves and the runner measures the last-resort model (gpt-5.5 →
-      // codex family). That family edits through apply_patch, so Bash is the one host-mutating tool it exposes. The old
-      // «Bash, Edit, Write» held only on a machine whose real HOME carried a gpt-family login (gpt-6-sol).
-      expect(result.stderr).toContain('Unprotected host mutating tools exposed: Bash.');
-      expect(result.stderr).toContain('Exposed mutating tools: Bash.');
-      expect(result.stderr).toContain('Known mutating tool surface: SelfImplement, Bash, Edit, Write.');
-      expect(result.stderr).toContain(NL_ROUTING_UNSAFE_RUN_ENV);
+      expect(result.stderr).toContain('Invalid CORPUS_STRATEGY "unknown"; valid values: native-all, index.');
+      expect(result.stderr).not.toContain('runEvalPrompt');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -360,7 +406,7 @@ describe('NL routing corpus runner safety gate', () => {
       expect(logs).toContain('[corpus] 측정 불가 1문항 — 서피스 chat에 기대 툴이 없어 실행·라우팅 실패·티어 분모에서 제외: unavailable');
       expect(logs).toContain('  실패 분류 — ①미발사 1 · ②툴 오선택 0 · ③거부툴 선택 0 (측정 가능 실행 1)\n');
       expect(output.surface).toBe('chat');
-      expect(output.surfaceToolNames).toEqual(['Read']);
+      expect(output.surfaceToolNames).toEqual(['Read', 'ReleaseStatus', 'ReleaseGraphStart', 'ObserveLogs', 'ObserveOpsStatus']);
       expect(output.unmeasurableIds).toEqual(['unavailable']);
     } finally {
       process.argv = originalArgv;
@@ -389,14 +435,14 @@ describe('NL routing corpus runner safety gate', () => {
       await runCorpusMain(
         () => ({
           description: 'test', surface: 'chat', tiers: { test: 'test' },
-          items: [{ id: 'available-but-error', tier: 'test', prompt: 'test', accept: ['SelfImplement'] }],
+          items: [{ id: 'available-but-error', tier: 'test', prompt: 'test', accept: ['Read'] }],
         }),
         async (): Promise<EvalPromptResult> => {
           calls += 1;
           throw new Error('runner unavailable');
         },
         resolveCorpusRunSafetyFromProcessEnv,
-        () => ['SelfImplement'],
+        () => ['Read'],
       );
       const output = JSON.parse(readFileSync(out, 'utf8')) as Record<string, unknown>;
       expect(calls).toBe(1);

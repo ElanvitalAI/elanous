@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { acceptDaemonChannel, generateDaemonKeyPair, MAX_FRAME_BYTES, serverIdFromPublicKey } from './channel.js';
 import { MuxDecoder, MuxEncoder, MuxStreamState } from './mux.js';
-import { challengeMessage, loadTrustedHostKeys, parsePublicAppHost, startRelayServer } from './relay-server.js';
+import { challengeMessage, loadTrustedHostKeys, parsePublicAppHost, resolvePublicAppUserId, startRelayServer } from './relay-server.js';
 import { validateRelayPublicOptions } from './relay-cli.js';
 
 type Relay = ReturnType<typeof startRelayServer>;
@@ -79,6 +79,13 @@ afterEach(() => {
 });
 
 describe('Bun encrypted-frame relay', () => {
+  test('public Nexus URLs and relay binding share one validated user identity', () => {
+    expect(resolvePublicAppUserId(undefined, 'kaist-demo')).toBe('kaist-demo');
+    expect(resolvePublicAppUserId('kaist-demo', 'kaist-demo')).toBe('kaist-demo');
+    expect(() => resolvePublicAppUserId('other-user', 'kaist-demo')).toThrow('--public-user-id must match ELANOUS_PUBLIC_APP_USER_ID');
+    expect(() => resolvePublicAppUserId(undefined, 'ka--ist')).toThrow('valid public app user label');
+  });
+
   test('public app hosts follow the one-label elanous.app and D2 name contract', () => {
     expect(parsePublicAppHost('notes--alice.elanous.app')).toEqual({ app: 'notes', user: 'alice' });
     expect(parsePublicAppHost('voice-note--user-7.elanous.app:443')).toEqual({ app: 'voice-note', user: 'user-7' });
@@ -94,8 +101,9 @@ describe('Bun encrypted-frame relay', () => {
     expect(() => validateRelayPublicOptions({ publicDomain: 'elanous.app', publicServerId: 'a'.repeat(64) }))
       .toThrow('--public-domain, --public-server-id, and --public-user-id must be supplied together');
     expect(() => validateRelayPublicOptions({ publicDomain: 'other.test', publicServerId: 'a'.repeat(64), publicUserId: 'alice' }))
-      .toThrow('public domain must be elanous.app');
+      .toThrow('public domain must be elanous.app or elanous.ai');
     expect(() => validateRelayPublicOptions({ publicDomain: 'elanous.app', publicServerId: 'a'.repeat(64), publicUserId: 'alice' })).not.toThrow();
+    expect(() => validateRelayPublicOptions({ publicDomain: 'elanous.ai', publicServerId: 'a'.repeat(64), publicUserId: 'alice' })).not.toThrow();
   });
 
   test('public mode requires an explicit pinned host and keeps its listener behind the TLS edge', async () => {
@@ -261,7 +269,7 @@ describe('Bun encrypted-frame relay', () => {
     const file = join(dir, 'trusted.json');
     writeFileSync(file, JSON.stringify({ [key.id]: key.publicKey }));
     const child = spawn(process.execPath, [resolve(import.meta.dir, '../../bin/elanous.mjs'), '--test', 'relay', 'serve', '--port', '0', '--trusted-host-keys', file], {
-      cwd: resolve(import.meta.dir, '../..'), env: { ...process.env, NODE_ENV: 'test', ELANOUS_CONFIG_DIR: dir, ELANOUS_STATE_DIR: dir }, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd: resolve(import.meta.dir, '../..'), env: { ...process.env, NODE_ENV: 'test', ELANOUS_CONFIG_DIR: dir, ELANOUS_STATE_DIR: dir, ELANOUS_PUBLIC_APP_USER_ID: 'kaist-demo' }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     try {
       const address = await new Promise<number>((resolvePort, reject) => {

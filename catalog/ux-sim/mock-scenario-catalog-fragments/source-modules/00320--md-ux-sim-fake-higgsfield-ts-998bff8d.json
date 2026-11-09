@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-HIGGSFIELD-TS",
+  "path": "src/ux-sim/fake-higgsfield.ts",
+  "boundary": "Higgsfield generation calls answered by a local fake so media pipelines run without the real service (simulation boundary).",
+  "deviceIds": [
+    "fake-higgsfield"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

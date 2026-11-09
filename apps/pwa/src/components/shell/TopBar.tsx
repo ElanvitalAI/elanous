@@ -30,7 +30,6 @@ import { cn } from '@/lib/utils';
 // 2026-05-07 — Workspace tab strip 을 TopBar 안 inline 으로 mount.
 // useWorkspaceOptional 은 provider 미mount 환경 (예: pre-AppShell 테스트)
 // 에서 null 반환 → 안전한 graceful no-op.
-import { TopBarWorkspaceStrip } from './TopBarWorkspaceStrip';
 import { TopBarActivityIndicator } from './TopBarActivityIndicator';
 import { ShareCaptureButton } from './ShareCaptureButton';
 import type { ShellActivitySnapshot } from './activity-snapshot';
@@ -131,7 +130,6 @@ export function TopBar({ onToggleSidebar, sidebarOpen, activity, onCompactView, 
           안 inline 으로 mount. provider 가 AppShell 위에 있어 모든 route
           에서 동일 state. 빈 워크스페이스 (탭 0개) 일 때는 자체 hidden
           → 첫 진입 사용자가 메뉴 + 아이콘만 보게 정리. */}
-      {sheetMode ? <div className="w-full"><TopBarWorkspaceStrip /></div> : <TopBarWorkspaceStrip />}
       {activity && <TopBarActivityIndicator snapshot={activity} />}
 
       <div className={sheetMode ? 'flex flex-wrap items-center gap-2' : 'ml-auto flex items-center gap-1'}>

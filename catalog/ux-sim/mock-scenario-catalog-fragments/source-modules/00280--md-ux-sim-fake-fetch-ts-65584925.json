@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-FETCH-TS",
+  "path": "src/ux-sim/fake-fetch.ts",
+  "boundary": "Installs an exact method and URL/path fetch response table, records request metadata and response status, rejects unmatched requests without network fallback, and restores the original global fetch.",
+  "deviceIds": [
+    "fake-fetch"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

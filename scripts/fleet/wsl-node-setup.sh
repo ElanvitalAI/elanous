@@ -242,7 +242,7 @@ PS
     [[ -d ~/mirror/elanous-agent.git ]] || git init -q --bare -b main ~/mirror/elanous-agent.git
     mkdir -p ~/.docker-fleet
     [[ -f ~/.docker-fleet/config.json ]] || printf '{"currentContext":""}\n' > ~/.docker-fleet/config.json
-    docker inspect k3d-elanous-registry >/dev/null 2>&1 || k3d registry create elanous-registry --port 127.0.0.1:5050
+    docker inspect k3d-elanous-registry >/dev/null 2>&1 || k3d registry create elanous-registry --delete-enabled --port 127.0.0.1:5050
     if ! k3d cluster list elanous-pool | grep -q elanous-pool; then
       fqdn=$(tailscale status --self --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')
       tail_ip=$(tailscale ip -4)
