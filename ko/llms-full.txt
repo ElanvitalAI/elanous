@@ -5193,6 +5193,20 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 ---
 
+# 0.3.8
+
+Source: https://docs.elanous.ai/releases/0-3-8/
+
+## Behavior changes
+
+- Release runs provide clearer progress, recovery, and evidence handling.
+- Graph and plugin workflows gain broader simulation coverage and more reliable execution paths.
+- The PWA app experience and installation flows receive reliability and usability improvements.
+
+Installers and release assets are available from the [v0.3.8 release](https://github.com/ElanvitalAI/elanous/releases/tag/v0.3.8).
+
+---
+
 # 0.3.7
 
 Source: https://docs.elanous.ai/releases/0-3-7/
