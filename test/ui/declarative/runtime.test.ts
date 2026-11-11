@@ -10,14 +10,6 @@ import {
 
 describe('declarative runtime support', () => {
   test('reports view and widget capabilities independently', () => {
-    const tooltip = resolveDeclarativeRuntimeSupport({ type: 'tooltip' });
-    expect(tooltip).toMatchObject({
-      type: 'tooltip',
-      supportsView: true,
-      supportsWidget: false,
-      preferred: 'view',
-    });
-
     const markdown = resolveDeclarativeRuntimeSupport(
       { type: 'markdown' },
       { host: { hasType: (type) => type === 'markdown' } },

@@ -139,25 +139,19 @@ const fakeScan = (paths: string[], calls?: Array<Record<string, unknown>>) =>
   }) as unknown as NonNullable<InputPickersDeps['scanFinder']>;
 
 describe('createInputPickers — openFinderPicker', () => {
-  test('accept: disposes modal + all three preview bindings, navigates to the file, focuses browser', async () => {
+  test('accept: disposes modal, navigates to the file, focuses browser', async () => {
     const target = join(root, 'sub', 'target.txt');
     const h = makeHarness(root, { scanFinder: fakeScan([target]) });
     await h.pickers.openFinderPicker();
 
     expect(h.modals).toHaveLength(1);
     expect(h.modal).not.toBeNull();
-    expect(h.bindings.map((b) => b.key).sort()).toEqual(['C-/', 'C-]', 'C-_']);
+    expect(h.bindings).toHaveLength(0);
     expect(h.events).toContain('scan:done:1:fd');
-    // Bindings are scoped to THIS picker via the live state accessor.
-    const slash = h.bindings.find((b) => b.key === 'C-/')!;
-    expect(slash.when?.()).toBe(true);
-
     h.modal!.accept();
 
     expect(h.modals[0]!.disposed).toBe(true);
-    expect(h.bindings.every((b) => b.disposed)).toBe(true);
     expect(h.modal).toBeNull();
-    expect(slash.when?.()).toBe(false);
     expect(h.workingDir.cwd).toBe(join(root, 'sub'));
     expect(h.workingDir.entries[h.workingDir.cursor]?.name).toBe('target.txt');
     expect(h.focusCalls).toEqual([['browser', 'agent-roster-search-pick']]);
@@ -165,26 +159,15 @@ describe('createInputPickers — openFinderPicker', () => {
     expect(h.events).toContain('preview:refresh');
   });
 
-  test('cancel: disposes modal + bindings without navigating', async () => {
+  test('cancel: disposes modal without navigating', async () => {
     const h = makeHarness(root, { scanFinder: fakeScan([join(root, 'sub', 'target.txt')]) });
     const before = h.workingDir.cwd;
     await h.pickers.openFinderPicker();
     h.modal!.cancel();
     expect(h.modals[0]!.disposed).toBe(true);
-    expect(h.bindings.every((b) => b.disposed)).toBe(true);
     expect(h.modal).toBeNull();
     expect(h.workingDir.cwd).toBe(before);
     expect(h.focusCalls).toEqual([]);
-  });
-
-  test('Ctrl+/ cycles preview mode through the chatLines/chatScrollOffset accessors', async () => {
-    const h = makeHarness(root, { scanFinder: fakeScan([join(root, 'sub', 'target.txt')]) });
-    await h.pickers.openFinderPicker();
-    const slash = h.bindings.find((b) => b.key === 'C-/')!;
-    slash.handler();
-    expect(h.chatLines.at(-1)).toContain('finder preview: HOVER');
-    expect(h.chatScrollOffset).toBe(-1);
-    h.modal!.cancel();
   });
 
   test('empty scan: reports empty and opens no modal', async () => {

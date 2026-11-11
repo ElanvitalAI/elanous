@@ -63,18 +63,19 @@ export async function readMaskedServiceEnvPaste(): Promise<string> {
   });
 }
 
-export type ParsedServiceKeyEnv = ReadonlyMap<string, string>;
+export type ParsedServiceKeyEnv = ReadonlyMap<string, string> & { readonly skippedNames?: readonly string[] };
 
 /** Parse dotenv assignments without expansion and never include values in errors. */
 export function parseServiceKeyEnv(text: string): ParsedServiceKeyEnv {
   const values = new Map<string, string>();
+  const skippedNames = new Set<string>();
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
     const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
     if (!match) throw new Error('invalid env assignment');
     const name = match[1]!;
-    if (!SERVICE_KEY_ENV_NAMES.has(name)) throw new Error(`unsupported env name: ${name}`);
+    if (!SERVICE_KEY_ENV_NAMES.has(name)) { skippedNames.add(name); continue; }
     if (values.has(name)) throw new Error(`duplicate env name: ${name}`);
     let value = match[2]!.trim();
     if (value.startsWith('"') || value.startsWith("'")) {
@@ -87,7 +88,8 @@ export function parseServiceKeyEnv(text: string): ParsedServiceKeyEnv {
     if (!value || value.includes('\0')) throw new Error(`empty or invalid value for ${name}`);
     values.set(name, value);
   }
-  return values;
+  Object.defineProperty(values, 'skippedNames', { value: [...skippedNames].sort(), enumerable: false });
+  return values as ParsedServiceKeyEnv;
 }
 
 export interface ServiceKeyStatus {

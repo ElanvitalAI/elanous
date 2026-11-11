@@ -21,6 +21,7 @@ const GOLDEN = {"gate": {"outcome": "regression", "commit": "ccccccccccccccccccc
 
 function expectedCurrentWithPolicy() {
   const expected = structuredClone(GOLDEN);
+  Object.assign(expected.gate, { trainReceiptReuse: { source: 'full-sweep', carried: 0, total: null, remeasure: null, selectedFiles: null, receipts: 0, receiptKeys: [], reasons: [], reasonCounts: {}, planReasons: ['no-reuse-plan-selected'] } });
   Object.assign(expected.unattended.input, { gateExecutor: 'pod', gateImagePin: 'cut-commit' });
   Object.assign(expected.graphInput, { gateExecutor: 'pod', gateImagePin: 'cut-commit' });
   Object.assign(expected.publish, { publishProcess: { status: 0,

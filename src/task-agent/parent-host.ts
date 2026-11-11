@@ -20,6 +20,7 @@ import { resolveFreshGrokCredential } from '../grok/credential.js';
 import { memoryQuantityBytes } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 import { shellQuote } from './task-hand.js';
+import type { ProviderAccessMirror } from '../oauth/provider-access-mirror.js';
 
 /** `taskAgent.parentHost` 설정 칸. */
 export interface ParentHostConfig {
@@ -651,12 +652,24 @@ export function installRemoteCodexAccess(target: ParentHostConfig, mirror: { ela
     'const write=(file,value)=>{const temp=file+"."+process.pid+".tmp";try{fs.writeFileSync(temp,JSON.stringify(value),{mode:0o600});fs.chmodSync(temp,0o600);fs.renameSync(temp,file)}catch(error){try{fs.unlinkSync(temp)}catch{};throw error}};',
     'const elanousFile=path.join(process.argv[1],"auth.json"),configDir=path.dirname(elanousFile);fs.mkdirSync(configDir,{recursive:true,mode:0o700});',
     'const elanous=read(elanousFile);if(typeof elanous.version!=="number")elanous.version=payload.elanousVersion;elanous.providers={...(elanous.providers||{})};const defaultHome=path.join(os.homedir(),".codex"),managedAccounts=path.join(configDir,"codex-accounts");for(const key of Object.keys(elanous.providers)){if(key.startsWith("openai-codex:"))delete elanous.providers[key]}fs.rmSync(managedAccounts,{recursive:true,force:true});fs.rmSync(path.join(configDir,"remote-codex-mirror.json"),{force:true});',
-    'const accountHome=payload.account==="default"?defaultHome:path.join(configDir,"codex-accounts",payload.account),tokens={...(payload.provider.tokens||{}),refreshToken:"",refresh_token:""};const upsert=(key,codexHome)=>{const current=elanous.providers[key]||{};elanous.providers[key]={...current,...payload.provider,codexHome,chatGPT:{...(current.chatGPT||{}),...(payload.provider.chatGPT||{})},tokens}};upsert("openai-codex",defaultHome);if(payload.storeKey!=="openai-codex")upsert(payload.storeKey,accountHome);write(elanousFile,elanous);',
+    'const accountHome=payload.account==="default"?defaultHome:path.join(configDir,"codex-accounts",payload.account),tokens={...(payload.provider.tokens||{}),refreshToken:"",refresh_token:""};const upsert=(key,codexHome)=>{const current=elanous.providers[key]||{};elanous.providers[key]={...current,...payload.provider,source:"mirror",codexHome,chatGPT:{...(current.chatGPT||{}),...(payload.provider.chatGPT||{})},tokens}};upsert("openai-codex",defaultHome);if(payload.storeKey!=="openai-codex")upsert(payload.storeKey,accountHome);write(elanousFile,elanous);',
     'const incoming=payload.codexAuth;const installCodex=(home)=>{const file=path.join(home,"auth.json");fs.mkdirSync(home,{recursive:true,mode:0o700});const current=read(file),merged={...current,...incoming};merged.auth_mode=incoming.auth_mode;if(Object.prototype.hasOwnProperty.call(incoming,"last_refresh"))merged.last_refresh=incoming.last_refresh;else delete merged.last_refresh;merged.tokens={...(incoming.tokens||{}),refresh_token:"",refreshToken:""};write(file,merged)};installCodex(defaultHome);if(accountHome!==defaultHome)installCodex(accountHome);',
   ].join('');
   const result = ssh(target.host, `umask 077; mkdir -p ${configDir} "$HOME/.codex" && bun -e ${shellQuote(code)} ${configDir}`, 20_000, payload);
   if (result.status !== 0) throw new Error(`remote Codex access mirror failed (ssh rc=${result.status ?? 'unknown'})`);
 }
+
+/** Shared by both mirror pushes. Keep the previous release's `.guard` inode as the kernel flock;
+ * an older file-owner guard is drained before that inode is adopted, then never unlinked. */
+const REMOTE_MIRROR_LOCK_ACQUIRE = [
+  'const crypto=require("node:crypto"),{dlopen,FFIType}=require("bun:ffi"),owner=JSON.stringify({pid:process.pid,startedAt:Date.now()-Math.floor(process.uptime()*1000),nonce:crypto.randomUUID()}),lock=path.join(dir,"remote-codex-mirror.lock"),guard=lock+".guard",deadline=Date.now()+15000,sleep=new Int32Array(new SharedArrayBuffer(4));',
+  'const lockText=(p)=>{try{return fs.readFileSync(p,"utf8")}catch(e){if(e.code==="ENOENT")return null;throw e}};',
+  'const ownerPid=(raw)=>{let pid=NaN;try{pid=Number(JSON.parse(raw).pid)}catch{pid=Number(raw)}return Number.isSafeInteger(pid)&&pid>0?pid:null};const ownerAlive=(raw)=>{const pid=ownerPid(raw);if(pid===null)return false;try{process.kill(pid,0)}catch(e){return e.code!=="ESRCH"}try{const startedAt=JSON.parse(raw).startedAt;if(Number.isFinite(startedAt)){const actual=Date.parse(require("node:child_process").execFileSync("ps",["-o","lstart=","-p",String(pid)],{encoding:"utf8",timeout:1000,stdio:["ignore","pipe","ignore"]}).trim());if(Number.isFinite(actual)&&Math.abs(actual-startedAt)>5000)return false}}catch{}return true};',
+  'const reclaim=(file,before,seen)=>{const moved=file+".reap-"+crypto.randomUUID();fs.renameSync(file,moved);const after=fs.statSync(moved),actual=lockText(moved);if(after.ino!==before.ino||actual!==seen){try{fs.linkSync(moved,file);fs.rmSync(moved,{force:true})}catch{}throw new Error("remote mirror lock owner changed during reaping")}fs.rmSync(moved,{force:true})};',
+  'fs.mkdirSync(dir,{recursive:true,mode:0o700});const libc=dlopen(process.platform==="darwin"?"/usr/lib/libSystem.B.dylib":"libc.so.6",{flock:{args:[FFIType.i32,FFIType.i32],returns:FFIType.i32}});const guardLock=()=>{while(true){let fd;try{fd=fs.openSync(guard,fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_RDWR,0o600);fs.writeSync(fd,"flock-v2")}catch(e){if(e.code!=="EEXIST")throw e;fd=fs.openSync(guard,"a+")}const drop=()=>{libc.symbols.flock(fd,8);fs.closeSync(fd)};while(libc.symbols.flock(fd,6)!==0){if(Date.now()>=deadline){fs.closeSync(fd);throw new Error("remote mirror guard timeout")}Atomics.wait(sleep,0,0,25)}let before;try{before=fs.statSync(guard)}catch(e){drop();if(e.code==="ENOENT")continue;throw e}if(fs.fstatSync(fd).ino!==before.ino){drop();continue}const seen=lockText(guard);if(seen===null){drop();continue}if(seen!==""&&seen!=="flock-v2"){if(!ownerAlive(seen)&&(ownerPid(seen)!==null||Date.now()-before.mtimeMs>60000))reclaim(guard,before,seen);drop();if(Date.now()>=deadline)throw new Error("remote mirror legacy guard timeout");Atomics.wait(sleep,0,0,25);continue}if(seen===""&&Date.now()-before.mtimeMs<1000){drop();Atomics.wait(sleep,0,0,25);continue}if(seen==="")fs.writeSync(fd,"flock-v2");return drop}};',
+  'let acquired=false;while(!acquired){const releaseGuard=guardLock();try{try{fs.writeFileSync(lock,owner,{flag:"wx",mode:0o600});acquired=true}catch(e){if(e.code!=="EEXIST")throw e;const before=fs.statSync(lock),seen=lockText(lock);if(Date.now()-before.mtimeMs>60000&&seen!==null&&!ownerAlive(seen))reclaim(lock,before,seen)}}finally{releaseGuard()}if(!acquired){if(Date.now()>=deadline)throw new Error("remote mirror lock timeout");Atomics.wait(sleep,0,0,25)}}try{',
+];
+const REMOTE_MIRROR_LOCK_RELEASE = '}finally{const releaseGuard=guardLock();try{if(lockText(lock)===owner)fs.rmSync(lock,{force:true})}finally{releaseGuard();libc.close()}}';
 
 /** Replace the remote Codex account set with one HQ-owned, refresh-free snapshot. */
 export function installRemoteCodexAccessBatch(target: ParentHostConfig, mirrors: readonly { elanousAuth: string; codexAuth: string; account: string }[], ssh: SshRunner = defaultSshRunner): void {
@@ -686,12 +699,12 @@ export function installRemoteCodexAccessBatch(target: ParentHostConfig, mirrors:
     'const write=(p,v)=>{fs.mkdirSync(path.dirname(p),{recursive:true,mode:0o700});const tmp=p+"."+process.pid+".tmp";try{fs.writeFileSync(tmp,JSON.stringify(v),{mode:0o600});fs.chmodSync(tmp,0o600);fs.renameSync(tmp,p)}catch(e){try{fs.unlinkSync(tmp)}catch{};throw e}};',
     // A remote parent can launch concurrently with another parent. Serialize the
     // entire auth-store + named-home transition, including stale-home pruning.
-    'const lock=path.join(dir,"remote-codex-mirror.lock"),deadline=Date.now()+15000,sleep=new Int32Array(new SharedArrayBuffer(4));fs.mkdirSync(dir,{recursive:true,mode:0o700});while(true){try{fs.writeFileSync(lock,String(process.pid),{flag:"wx",mode:0o600});break}catch(e){if(e.code!=="EEXIST")throw e;try{if(Date.now()-fs.statSync(lock).mtimeMs>60000)fs.rmSync(lock,{force:true})}catch{}if(Date.now()>=deadline)throw new Error("remote Codex mirror lock timeout");Atomics.wait(sleep,0,0,25)}}try{',
+    ...REMOTE_MIRROR_LOCK_ACQUIRE,
     'const store=read(file);store.version=typeof store.version==="number"?store.version:items[0].version;store.providers={...(store.providers||{})};for(const key of Object.keys(store.providers)){if(key==="openai-codex"||key.startsWith("openai-codex:"))delete store.providers[key]}',
-    'for(const item of items){const home=item.account==="default"?defaultHome:path.join(managed,item.account),key=item.account==="default"?"openai-codex":"openai-codex:"+item.account;const current=read(path.join(home,"auth.json")),auth={...current,...item.codexAuth,auth_mode:"chatgpt",tokens:{...(item.codexAuth.tokens||{}),refresh_token:"",refreshToken:""}};write(path.join(home,"auth.json"),auth);store.providers[key]={...item.provider,codexHome:home,tokens:{...(item.provider.tokens||{}),refreshToken:"",refresh_token:""}}}',
+    'for(const item of items){const home=item.account==="default"?defaultHome:path.join(managed,item.account),key=item.account==="default"?"openai-codex":"openai-codex:"+item.account;const current=read(path.join(home,"auth.json")),auth={...current,...item.codexAuth,auth_mode:"chatgpt",tokens:{...(item.codexAuth.tokens||{}),refresh_token:"",refreshToken:""}};write(path.join(home,"auth.json"),auth);store.providers[key]={...item.provider,source:"mirror",codexHome:home,tokens:{...(item.provider.tokens||{}),refreshToken:"",refresh_token:""}}}',
     'if(!store.providers["openai-codex"]){const first=items[0],home=path.join(managed,first.account);write(path.join(defaultHome,"auth.json"),{...first.codexAuth,auth_mode:"chatgpt",tokens:{...(first.codexAuth.tokens||{}),refresh_token:"",refreshToken:""}});store.providers["openai-codex"]={...store.providers["openai-codex:"+first.account],codexHome:defaultHome}}',
     'write(file,store);const keep=new Set(items.filter(x=>x.account!=="default").map(x=>x.account));try{for(const name of fs.readdirSync(managed)){if(!keep.has(name))fs.rmSync(path.join(managed,name),{recursive:true,force:true})}}catch(e){if(e.code!=="ENOENT")throw e}fs.rmSync(path.join(dir,"remote-codex-mirror.json"),{force:true});',
-    '}finally{fs.rmSync(lock,{force:true})}',
+    REMOTE_MIRROR_LOCK_RELEASE,
   ].join('');
   const result = ssh(target.host, `umask 077; mkdir -p ${configDir} "$HOME/.codex" && bun -e ${shellQuote(code)} ${configDir}`, 20_000, JSON.stringify(accounts));
   if (result.status !== 0) throw new Error(`remote Codex access mirror batch failed (ssh rc=${result.status ?? 'unknown'})`);
@@ -705,6 +718,26 @@ export function installRemoteCodexCliMirror(
   ssh: SshRunner = defaultSshRunner,
 ): void {
   installRemoteCodexAccessBatch({ ...target, configDir: REMOTE_CODEX_CLI_MIRROR_DIR }, mirrors, ssh);
+}
+
+/** Install Grok and Claude subscription access beside the Codex snapshot. The remote never receives refresh credentials. */
+export function installRemoteProviderAccessMirrors(target: ParentHostConfig, mirrors: readonly ProviderAccessMirror[], ssh: SshRunner = defaultSshRunner): void {
+  if (!mirrors.length) return;
+  const now = Date.now();
+  if (mirrors.some((m) => !['grok', 'claude'].includes(m.provider) || !m.access || !Number.isFinite(m.expiresAt) || m.expiresAt <= now + 120_000))
+    throw new Error('provider access mirror contains an unusable credential');
+  const dir = remotePath(REMOTE_CODEX_CLI_MIRROR_DIR);
+  const code = [
+    'const fs=require("node:fs"),path=require("node:path"),os=require("node:os");',
+    'const items=JSON.parse(fs.readFileSync(0,"utf8")),dir=process.argv[1],file=path.join(dir,"auth.json");',
+    'const read=(p)=>{try{return JSON.parse(fs.readFileSync(p,"utf8"))}catch{return {}}};',
+    'const write=(p,v)=>{fs.mkdirSync(path.dirname(p),{recursive:true,mode:0o700});const t=p+"."+process.pid+".tmp";fs.writeFileSync(t,JSON.stringify(v),{mode:0o600});fs.chmodSync(t,0o600);fs.renameSync(t,p)};',
+    ...REMOTE_MIRROR_LOCK_ACQUIRE,
+    'const store=read(file);if(typeof store.version!=="number")store.version=1;store.providers={...(store.providers||{})};for(const m of items){if(m.expiresAt<=Date.now()+120000)continue;const tokens={accessToken:m.access,refreshToken:"",refresh_token:"",expiresAt:m.expiresAt};if(m.provider==="grok"){store.providers.grok={source:"mirror",authMode:"subscription",tokens,lastRefresh:new Date().toISOString()};write(path.join(os.homedir(),".grok","auth.json"),{"https://auth.x.ai::hq-mirror":{key:m.access,expires_at:new Date(m.expiresAt).toISOString(),refresh_token:"",user_id:m.userId||undefined}})}else if(m.provider==="claude"){store.providers.anthropic={source:"mirror",authMode:"claudeai",tokens,lastRefresh:new Date().toISOString()};write(path.join(os.homedir(),".claude",".credentials.json"),{claudeAiOauth:{accessToken:m.access,refreshToken:"",expiresAt:m.expiresAt,scopes:m.scopes||[]}})}}write(file,store);',
+    REMOTE_MIRROR_LOCK_RELEASE,
+  ].join('');
+  const result = ssh(target.host, `umask 077; mkdir -p ${dir} && bun -e ${shellQuote(code)} ${dir}`, 20_000, JSON.stringify(mirrors));
+  if (result.status !== 0) throw new Error(`remote provider access mirror failed (ssh rc=${result.status ?? 'unknown'})`);
 }
 
 // ── 관측: 원격 런 원장 거울 ─────────────────────────────────────────────────────────────

@@ -1296,24 +1296,33 @@ export function runGate(io: Partial<GateIo> = {}): void {
 //   ⭐ 그래서 막는 자리는 «여기»뿐이다 — 인-프로세스 호출자(`pr-cli.ts`·`seams.ts`)는
 //      argv 를 안 넘기고, 만약 여기서 `process.argv` 를 «읽으면» 형제 게이트가 경고한 그 사고가 난다
 //      (`elanous pr land` 의 인자를 자기 인자로 읽는다 — `src/cli/pr-cli.ts` 의 `args: []` 주석).
-/** Physical MBP/HQ seat shells need a guard even when the caller explicitly selected --local. */
+/** HQ host shells need protection; MacStudio is HQ only in the shared HQ workspace, not arbitrary checkouts. */
 export function isHeadquartersTypecheckShell(host: string, cwd: string): boolean {
-  const name = host.toLowerCase();
-  if (/macstudio|macmini|host-e|node-b|node-c/.test(name)) return false;
-  return /macbook|(?:^|[-.])mbp(?:[-.]|$)/.test(name) || /(?:^|\/)elanous-hq\/(?:seats|work)\//.test(cwd);
+  const name = host.toLowerCase().replace(/\.$/, '');
+  let checkoutPath = cwd;
+  try { checkoutPath = realpathSync(cwd); } catch { /* Keep the supplied path when it is not a local checkout. */ }
+  const inHqWorkspace = /(?:^|\/)elanous-hq\/(?:seats|work)\//.test(checkoutPath);
+  // Cloud runners can execute PR gates from temporary checkouts under elanous-hq/work too. Their FQDNs end
+  // in `.internal`; treating the checkout path as the machine identity made them recursively dispatch TSC
+  // back to another host, which then tried to push from a read-only runner checkout.
+  if (/(?:^|\.)internal$/i.test(name)) return false;
+  if (/macmini|host-e|node-c|(?:^|[-.])node-b(?:[-.]|$)/.test(name)) return false;
+  if (/macstudio/.test(name)) return inHqWorkspace;
+  return /macbook|(?:^|[-.])mbp(?:[-.]|$)/.test(name) || inHqWorkspace;
 }
 
-/** HQ/seat shells default to node-b; a gate Pod, remote worker, or CI measures its own checkout locally. */
+/** HQ/seat shells route through a remote worker; gate Pods, remote workers, and CI measure their checkout locally. */
 export function forbidFullTypecheckOnLocal(env: NodeJS.ProcessEnv, host: string, cwd: string): boolean {
-  if (env.CI || env.KUBERNETES_SERVICE_HOST || env.ELANOUS_GATE_REMOTE_CHILD === '1') return false;
+  if (env.KUBERNETES_SERVICE_HOST || env.ELANOUS_GATE_REMOTE_CHILD === '1') return false;
   return isHeadquartersTypecheckShell(host, cwd);
 }
 
 export const defaultTypecheckRemote = forbidFullTypecheckOnLocal;
 
 export function typecheckDispatchFlags(flags: GateRemoteFlags, env: NodeJS.ProcessEnv, host: string, cwd: string): GateRemoteFlags {
-  return defaultTypecheckRemote(env, host, cwd) && flags.remote === undefined && !flags.local
-    ? { ...flags, remote: env.ELANOUS_TYPECHECK_REMOTE?.trim() || 'node-b' } : flags;
+  if (!defaultTypecheckRemote(env, host, cwd)) return flags;
+  if (flags.local) return { ...flags, error: 'HQ heavy typecheck cannot run with --local; omit it to route to ELANOUS_TYPECHECK_REMOTE (default node-b).' };
+  return flags.remote === undefined ? { ...flags, remote: env.ELANOUS_TYPECHECK_REMOTE?.trim() || 'node-b' } : flags;
 }
 
 // ── WSL-GATE-ENV (0.2.36) — base 환경 해석 · 원격 push 실패 «원인» 보고 ─────────────────────────
@@ -1456,6 +1465,11 @@ if (import.meta.main) void (async () => {
   const repo = sh('git rev-parse --show-toplevel').trim();
   const onMbp = forbidFullTypecheckOnLocal(process.env, hostname(), repo);
   const dispatchFlags = typecheckDispatchFlags(flags, process.env, hostname(), repo);
+  if (dispatchFlags.error) {
+    console.error(`[tsc-gate] ⛔ ${dispatchFlags.error}`);
+    console.error('[tsc-gate] FAIL — HQ heavy check was not started locally.');
+    process.exit(2);
+  }
   const baseEnv = remoteBaseEnv(process.env);
   // 원격만 재는 자리에서 base ref 를 «이 트리에서» 못 풀면, 두 호스트가 «다른 base» 로 잰 판정을
   //   «같은 답»처럼 찍게 된다 — 그래서 띄우지 않고 멈춘다(원인과 처방을 남긴다). --local 은 그대로 간다.

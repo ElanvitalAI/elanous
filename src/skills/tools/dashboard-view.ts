@@ -1,18 +1,7 @@
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // HT1/HT2 — Native tools: DashboardViewSwitch + DashboardWidgetInvoke.
 //
-// Lets the LLM (in control / skill modes) flip dashboard
-// views by id/shortcut/label and fan-out synthetic key events at
-// widget instances. Both tools are the minimum hook surface needed
-// to drive V7 (Widget Playground) from outside the interactive key
-// loop — useful for automated UI smoke tests and for MCP clients
-// that want to manipulate the dashboard from a remote process.
-//
-// Non-destructive: neither tool can kill widgets or create panes —
-// just change which view is active and deliver keystrokes that the
-// target widget's onKey already understands.
-
-
+// Allows dashboard view changes and widget key dispatch from skill tools.
 
 export interface DashboardViewInfo {
   id: string;
@@ -67,7 +56,7 @@ export function buildDashboardViewSwitchTool(): LLMToolSpec {
     name: 'DashboardViewSwitch',
     description:
       'Switch the dashboard to a different view by id, label, or shortcut. '
-      + 'Example needles: "1", "Normal", "playground", "7", "agents". '
+      + 'Example needles: "1", "Normal", "agents". '
       + 'Use DashboardWidgetList after switching to see which widgets '
       + 'the new view renders.',
     parameters: {
@@ -75,7 +64,7 @@ export function buildDashboardViewSwitchTool(): LLMToolSpec {
       properties: {
         view: {
           type: 'string',
-          description: 'View id, label, or numeric shortcut (e.g. "7" or "playground").',
+          description: 'View id, label, or numeric shortcut (e.g. "4" or "agents").',
         },
       },
       required: ['view'],
@@ -108,8 +97,7 @@ export function buildDashboardWidgetInvokeTool(): LLMToolSpec {
       'Fire a synthetic key event at a widget instance. The widget\'s '
       + 'onKey handler receives a KeyEvent { name, ctrl?, shift?, alt? } '
       + 'just as if the user had pressed the key. Useful for exercising '
-      + 'V7 (Widget Playground) from automation or MCP clients. Returns '
-      + 'ok=true + handled flag from the widget\'s EventResult. Also '
+      + 'automated widget checks. Returns ok=true + handled flag from the widget\'s EventResult. Also '
       + 'returns a post-invoke state snapshot for inspection.',
     parameters: {
       type: 'object',

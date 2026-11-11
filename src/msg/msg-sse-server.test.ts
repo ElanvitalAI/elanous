@@ -1,11 +1,15 @@
-import { afterEach, expect, setDefaultTimeout, test } from 'bun:test';
+import { afterEach, expect, setDefaultTimeout, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MsgStore } from './msg-store.js';
-import { startMsgSseServer } from './msg-sse-server.js';
+import { startMsgSseServer, startResidentMsgSseServer } from './msg-sse-server.js';
+import { clearPostOffice, discoverPostOfficeUrl, readPostOffice, writePostOffice } from './msg-post-office.js';
+import { subscribeMsgStream } from './msg-sse-client.js';
+import { debug } from '../debug/log.js';
+import { ResourceLedger } from '../control-plane/ledger.js';
 
 const dirs: string[] = [];
 setDefaultTimeout(15_000);
@@ -35,6 +39,92 @@ async function nextEvent(reader: ReadableStreamDefaultReader<Uint8Array>): Promi
   throw new Error('SSE event timeout');
 }
 
+test('resident server owns a temporary ledger, advertises discovery, serves a watch, and cleans up', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-sse-resident-'));
+  dirs.push(dir);
+  const service = await startResidentMsgSseServer({ stateRoot: dir, token: 'fake-token', port: 0, pollMs: 10 });
+  expect(service).not.toBeNull();
+  try {
+    const discovered = await discoverPostOfficeUrl(dir);
+    expect(discovered).toBe(`http://127.0.0.1:${service!.port}`);
+    let delivered!: () => void;
+    const received = new Promise<void>((resolve) => { delivered = resolve; });
+    const log = spyOn(debug, 'log');
+    const watcher = subscribeMsgStream({ address: 'TC', url: discovered!, token: () => 'fake-token',
+      cursorPath: join(dir, 'cursor.json'), openStore: () => { throw new Error('polling must stay unused'); },
+      onMessage: (message) => { if (message.body === 'resident message') delivered(); },
+    });
+    const writer = new MsgStore(join(dir, 'msg', 'messages.db'));
+    try {
+      writer.post({ from: 'OP', to: 'TC', body: 'resident message' });
+      // Source: the SSE server sends a keepalive every second; this bound gives the simulated watch three intervals.
+      await Promise.race([received, Bun.sleep(3_000).then(() => { throw new Error('resident SSE watch timed out'); })]);
+      expect(log.mock.calls.filter((call) => call[0] === 'msg.sse-client' && call[1] === 'fallback-poll')).toHaveLength(0);
+    } finally { await watcher.stop(); log.mockRestore(); writer.close(); }
+  } finally { service?.stop(); }
+  expect(readPostOffice(dir)).toBeNull();
+  expect(await discoverPostOfficeUrl(dir)).toBeNull();
+});
+
+test('a second Nexus resident cannot replace a live post-office owner', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-sse-owner-'));
+  dirs.push(dir);
+  const first = await startResidentMsgSseServer({ stateRoot: dir, token: 'fake-token', port: 0 });
+  try {
+    expect(await startResidentMsgSseServer({ stateRoot: dir, token: 'fake-token', port: 0 })).toBeNull();
+    expect(readPostOffice(dir)?.port).toBe(first?.port);
+  } finally { first?.stop(); }
+  expect(readPostOffice(dir)).toBeNull();
+});
+
+test('resident skips a live standalone service; after its shutdown a fresh Nexus boot takes ownership', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-sse-handoff-'));
+  dirs.push(dir);
+  const path = join(dir, 'msg', 'messages.db');
+  const writer = new MsgStore(path);
+  const standaloneStore = new MsgStore(path, { readOnly: true });
+  const standalone = startMsgSseServer({ store: standaloneStore, token: 'fake-token', port: 0 });
+  // Source: #36378 the short timer runs the production standalone heartbeat during the handoff simulation.
+  writePostOffice(dir, { port: standalone.port, refreshMs: 5 });
+  const firstHeartbeat = new ResourceLedger(dir).list({ kind: 'instance', name: 'msg-sse' })[0]!.observedAt;
+  // Source: #36378 four five-millisecond timer intervals give the isolated heartbeat time to run.
+  await Bun.sleep(20);
+  // Source: #36378 a later timestamp proves the production standalone refresh timer actually fired.
+  expect(new ResourceLedger(dir).list({ kind: 'instance', name: 'msg-sse' })[0]!.observedAt).toBeGreaterThan(firstHeartbeat);
+  const skipLog = spyOn(debug, 'log');
+  const resident = await startResidentMsgSseServer({ stateRoot: dir, token: 'fake-token', port: 0 });
+  try {
+    expect(resident).toBeNull();
+    expect(skipLog.mock.calls.some((call) => call[0] === 'msg.sse' && call[1] === 'resident-skipped-live-owner')).toBe(true);
+    expect(readPostOffice(dir)?.port).toBe(standalone.port);
+    standalone.stop();
+    standaloneStore.close();
+    expect(clearPostOffice(dir, process.pid, standalone.port)).toBe(true);
+    const next = await startResidentMsgSseServer({ stateRoot: dir, token: 'fake-token', port: 0 });
+    try { expect(readPostOffice(dir)?.port).toBe(next?.port); }
+    finally { next?.stop(); }
+  } finally { skipLog.mockRestore(); writer.close(); }
+  expect(readPostOffice(dir)).toBeNull();
+});
+
+test('skipped resident leaves the standalone registration intact', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'msg-sse-wait-stop-'));
+  dirs.push(dir);
+  const path = join(dir, 'msg', 'messages.db');
+  const writer = new MsgStore(path);
+  const standaloneStore = new MsgStore(path, { readOnly: true });
+  const standalone = startMsgSseServer({ store: standaloneStore, token: 'fake-token', port: 0 });
+  writePostOffice(dir, { port: standalone.port });
+  const resident = await startResidentMsgSseServer({ stateRoot: dir, token: 'fake-token', port: 0 });
+  expect(resident).toBeNull();
+  expect(readPostOffice(dir)?.port).toBe(standalone.port);
+  standalone.stop();
+  standaloneStore.close();
+  expect(clearPostOffice(dir, process.pid, standalone.port)).toBe(true);
+  writer.close();
+  expect(readPostOffice(dir)).toBeNull();
+});
+
 test('authenticated stream receives a post within one second; missing and wrong tokens get 401', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'msg-sse-'));
   dirs.push(dir);
@@ -44,6 +134,9 @@ test('authenticated stream receives a post within one second; missing and wrong 
   const service = startMsgSseServer({ store: readOnly, token: 'same-nexus-token', port: 0, pollMs: 100 });
   const url = `http://127.0.0.1:${service.port}/stream?to=TC&since=0`;
   try {
+    const health = await fetch(`http://127.0.0.1:${service.port}/health`);
+    expect(health.status).toBe(204);
+    expect(health.headers.get('x-elanous-service')).toBe('msg-sse');
     expect((await fetch(url)).status).toBe(401);
     expect((await fetch(url, { headers: { Authorization: 'Bearer wrong' } })).status).toBe(401);
     const response = await fetch(url, { headers: { Authorization: 'Bearer same-nexus-token' } });
@@ -190,10 +283,21 @@ test('msg serve CLI opens the isolated ledger read-only and enforces the Nexus t
     writer.post({ from: 'OP', to: 'TC', body: 'CLI served' });
     expect(await nextEvent(reader)).toEqual({ id: 1, body: 'CLI served' });
     await reader.cancel();
+    const standalone = readPostOffice(dir);
+    expect(standalone?.pid).toBe(child.pid);
+    expect(await startResidentMsgSseServer({ stateRoot: dir, token: 'same-nexus-token', port: 0 })).toBeNull();
+    expect(readPostOffice(dir)).toEqual(standalone);
   } finally {
     child.kill('SIGTERM');
+    if (child.exitCode === null && child.signalCode === null)
+      await new Promise<void>((resolve) => child.once('exit', () => resolve()));
     writer.close();
   }
+  const resident = await startResidentMsgSseServer({ stateRoot: dir, token: 'same-nexus-token', port: 0 });
+  expect(resident).not.toBeNull();
+  try { expect(readPostOffice(dir)?.port).toBe(resident?.port); }
+  finally { resident?.stop(); }
+  expect(readPostOffice(dir)).toBeNull();
 });
 
 test('a paused HTTP reader keeps the server stream queue bounded, then receives every durable ID', async () => {

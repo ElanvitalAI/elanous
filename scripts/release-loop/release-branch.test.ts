@@ -466,6 +466,13 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     const first = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'),
       { input: { version: '0.2.18', previousVersion: '0.2.17', gatePodPool: 'pool', branchCut: true }, deps: { root: state, runBash } });
     expect(first.status).toBe('failed');
+    const expectPersistedExecutionCount = () => {
+      const persisted = JSON.parse(readFileSync(first.statePath, 'utf8')) as { executed: number; nodes: Array<{ executed?: boolean }> };
+      expect(persisted.executed).toBe(persisted.nodes.filter((record) => record.executed).length);
+    };
+    // The resumed runner validates this persisted aggregate against executed node records, including fan-out joins.
+    expect(first.executed).toBe(first.nodes.filter((record) => record.executed).length);
+    expectPersistedExecutionCount();
     expect(first.path.slice(0, 8)).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff',
       'pre-gate-join', 'gate', 'emergency-switch', 'gate-triage']);
     const cut = git(f.origin, 'rev-parse', 'release/0.2.18');
@@ -482,11 +489,15 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     mkdirSync(join(commandRoot, 'node_modules'), { recursive: true });
     mkdirSync(join(commandRoot, 'apps', 'pwa', 'node_modules'), { recursive: true });
     failNode = 'export-check';
+    const legacySaved = JSON.parse(readFileSync(first.statePath, 'utf8')) as { executed: number };
+    legacySaved.executed--;
+    writeFileSync(first.statePath, JSON.stringify(legacySaved));
     await expect(resumeReleaseRun({ runId: first.runId, from: 'gate-triage', commandRoot }, resumeDeps))
       .rejects.toThrow('resume at gate or earlier');
     seen.length = 0;
     const gateRepair = await resumeReleaseRun({ runId: first.runId, from: 'gate', commandRoot }, resumeDeps);
     expect(gateRepair.state.status).toBe('failed');
+    expectPersistedExecutionCount();
     expect(seen[0]?.nodeId).toBe('gate');
     expect(seen.findIndex((item) => item.nodeId === 'gate')).toBeLessThan(seen.findIndex((item) => item.nodeId === 'export-check'));
     expect(seen.filter((item) => item.nodeId === 'gate')).toHaveLength(1);
@@ -494,14 +505,17 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     seen.length = 0;
     const exportRepair = await resumeReleaseRun({ runId: first.runId, from: 'traffic-gate-passed', commandRoot }, resumeDeps);
     expect(exportRepair.state.status).toBe('failed');
+    expectPersistedExecutionCount();
     expect(seen.filter((item) => item.nodeId === 'export-check')).toHaveLength(1);
     failNode = 'prepare';
     const prepareRepair = await resumeReleaseRun({ runId: first.runId, from: 'traffic-gate-passed', commandRoot }, resumeDeps);
     expect(prepareRepair.state.status).toBe('failed');
+    expectPersistedExecutionCount();
     expect(seen.filter((item) => item.nodeId === 'prepare')).toHaveLength(1);
     failNode = 'known-issues';
     const knownIssuesRepair = await resumeReleaseRun({ runId: first.runId, from: 'prepare', commandRoot }, resumeDeps);
     expect(knownIssuesRepair.state.status).toBe('failed');
+    expectPersistedExecutionCount();
     expect(seen.filter((item) => item.nodeId === 'known-issues')).toHaveLength(1);
     failNode = '';
     const finalStart = seen.length;
@@ -509,6 +523,7 @@ test('RELEASE-BRANCH: the real release graph, failed at gate and resumed after -
     // The first post-append resume refreshes the saved tip. Later node-failure resumes must see it unchanged.
     expect(resumed.tip).toMatchObject({ changed: false, from: tip, to: tip });
     expect(resumed.state.status).toBe('done');
+    expectPersistedExecutionCount();
     expect(seen.slice(finalStart).map((item) => item.nodeId).slice(0, 2)).toEqual(['known-issues', 'notes-check']);
     const finalNodes = seen.slice(finalStart).map((item) => item.nodeId);
     const verifyAt = finalNodes.indexOf('verify');

@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/graph-compose-trigger-sim.test.ts",
+  "reason": "GRAPH-COMPOSE C2: a focused simulation device exercises target input refusal, separate run modes, and parent-child run-ledger lineage."
+}

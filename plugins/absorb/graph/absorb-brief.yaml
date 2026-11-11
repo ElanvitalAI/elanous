@@ -1,0 +1,63 @@
+apiVersion: elanous.dev/graph/v2
+graph: { id: absorb-brief, version: 1.0.0, layer: flow, purpose: "회원 스크랩 → 오늘의 브리핑 → 앱 제안" }
+loop:                                      # 루프 등록 = 그래프 머리 한 곳 (레지스트리가 읽는 자리)
+  root: 조율자
+  parent: intake-daily
+  stage: shadow
+  trigger: { events: [scrap.shared, brief.requested], cron: "0 7 * * *" }   # 하루 경계 KST
+  scope: { owner: member, entitlement: absorb }
+  ext: { absorb.budget: { runs_per_day: 2, llm_calls: 3 } }
+entry: collect
+nodes:
+  - { id: collect, type: store, requires: store.read@1, with: { op: list, collection: scraps, where: "status == new", owner: "$context.memberId", ownerScoped: true } }
+  - id: extract
+    type: extract                          # 종류 7(web·x·youtube·voice·video·photo·text)은 공급자 표가 고른다
+    requires: extract.item@1
+    map: { over: "$collect.result.items", as: scrap, max_parallel: 7, partial: accept-with-gaps }
+    post: [ "result.text != ''" ]          # 불변식: 비면 실패(출력 계약)
+  - id: card
+    type: make
+    call: verb-make@^1
+    skill: absorb/card
+    uses: [llm-judge, store]
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+    # Source: y-path upper bound: collect(1) + extract fork/7 branches/join(9) + 3 verb calls + save-brief(1) + suggestion save fork/3 branches/join(5) + notify/done(2) = 21 nodes; absorb-v2-runGraph-sim.ts.
+    budget: { inner_steps: 21 }
+  - id: brief
+    type: decide
+    call: verb-decide@^1
+    skill: absorb/brief
+    uses: [llm-judge, store]
+    packs: [member-apps@1]
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+    # Source: y-path upper bound: collect(1) + extract fork/7 branches/join(9) + 3 verb calls + save-brief(1) + suggestion save fork/3 branches/join(5) + notify/done(2) = 21 nodes; absorb-v2-runGraph-sim.ts.
+    budget: { inner_steps: 21 }
+  - id: suggest
+    type: decide
+    call: verb-decide@^1
+    skill: absorb/suggest
+    uses: [store]
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+    # Source: y-path upper bound: collect(1) + extract fork/7 branches/join(9) + 3 verb calls + save-brief(1) + suggestion save fork/3 branches/join(5) + notify/done(2) = 21 nodes; absorb-v2-runGraph-sim.ts.
+    budget: { inner_steps: 21 }
+    post: [ "result.items[*].evidenceScrapIds.length >= 1" ]
+  - { id: save-brief, type: store, requires: store.write@1, with: { op: upsert, collection: briefings, owner: "$context.memberId", key: "$context.kstDay", value: "$brief.evidence.briefing", ownerScoped: true } }
+  - id: save-suggestions
+    type: store
+    requires: store.write@1
+    # Source: absorb/suggest returns at most three proposals; lowerStaticMaps expands one write per item.
+    map: { over: "$suggest.result.items", as: suggestion, max_parallel: 3 }
+    with: { op: upsert, collection: suggestions, owner: "$context.memberId", key: "$suggestion.id", value: "$suggestion", ownerScoped: true }
+  - { id: notify,  type: notify, requires: notify.channel@1, with: { channels: [android, tui, telegram], dedup: "briefing:$brief.evidence.briefing.id" } }
+edges:
+  - { from: collect, to: extract }
+  - { from: extract, on: outcome, map: { ok: card, fail: failed } }      # fan-out join 출구 = ok·fail
+  - { from: card,    on: outcome, map: { done: brief, rework: card, needs-human: failed, failed: failed } }
+  - { from: brief,   on: outcome, map: { done: suggest, rework: brief, needs-human: failed, failed: failed } }
+  - { from: suggest, on: outcome, map: { done: save-brief, rework: suggest, needs-human: failed, failed: failed } }
+  - { from: save-brief, to: save-suggestions }
+  - { from: save-suggestions, to: notify }
+  - { from: notify,  to: done }
+terminal: [done, failed]                 # 종단 노드는 선언만으로 생김(낮춤이 IR 노드로 만든다)
+observe: { categories: [graph.run, graph.unit, intake.pack, absorb.brief] }
+sims: [sims/absorb-demo-world.yaml]        # 검증 ③ — 가짜 추출기·LLM·텔레그램·시계·앱 호스트

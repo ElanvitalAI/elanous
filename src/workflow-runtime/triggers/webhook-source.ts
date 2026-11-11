@@ -47,6 +47,8 @@ export interface WebhookSource extends TriggerSource {
   /** Detected route collisions ((method, path) registered more than
    *  once). Populated after `start()`. Empty array if none. */
   collisions(): Array<{ method: string; path: string }>;
+  /** Exact graph route with its own auth and no collision; safe to pass the NEXUS bearer gate. */
+  isSelfVerifiedGraphRoute(method: string, path: string): boolean;
   subscriptions(): TriggerSubscription[];
 }
 
@@ -146,6 +148,16 @@ export function createWebhookSource(sourceOpts: WebhookSourceOpts = {}): Webhook
       return await router(req);
     },
     collisions: () => [...collisionList],
+    isSelfVerifiedGraphRoute(method, path) {
+      if (router === null) return false;
+      const matches = [...bindings, ...graphBindings].filter(binding =>
+        binding.webhookEntry.trigger.method === method && binding.webhookEntry.trigger.path === path);
+      if (matches.length !== 1 || !graphBindings.includes(matches[0] as GraphBinding)) return false;
+      const auth = matches[0]!.webhookEntry.trigger.auth;
+      return auth?.type === 'hmac' ||
+        (auth?.type === 'bearer' && auth.token.trim().length > 0) ||
+        (auth?.type === 'basic' && auth.username.trim().length > 0 && auth.password.trim().length > 0);
+    },
     subscriptions: () => [...bindings, ...graphBindings].map(b => ({
       kind: 'webhook' as const,
       workflowName: b.webhookEntry.workflowName,

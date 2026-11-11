@@ -17,7 +17,7 @@
 
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { routeOutbound } from '../outbound/router.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { openSurfaceEventsDb, recordEvent } from '../../domains/surface-events.js';
 import { debug } from '../../debug/log.js';
 import { resolveReportTarget } from '../../telegram-report.js';

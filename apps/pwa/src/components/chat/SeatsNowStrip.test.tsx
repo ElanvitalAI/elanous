@@ -4,6 +4,7 @@ import { DaemonContext } from '@/components/providers/DaemonProvider';
 import { SeatsNowStrip } from './SeatsNowStrip';
 import { ChatLayout } from './ChatLayout';
 import { ChatCurrentProject } from './ChatCurrentProject';
+import { ChatApprovalsChip } from './ChatApprovalsChip';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
@@ -115,7 +116,7 @@ test('failure and empty result leave no DOM; polling skips hidden and cleans up 
   expect(tree!.toJSON()).toBeNull();
 });
 
-test('compact and wide layout place exactly one strip immediately after the header', async () => {
+test('compact and wide layout fold exactly one strip immediately after the header', async () => {
   const probe = setup();
   await probe.mount(true);
   const layout = tree!.root.findByType(ChatLayout).findByType('div');
@@ -123,14 +124,18 @@ test('compact and wide layout place exactly one strip immediately after the head
   const header = children.findIndex((child) => child.props['data-elanous-chat-compact-header'] === '');
   expect(header).toBeGreaterThanOrEqual(0);
   expect(children[header]!.findAllByType(ChatCurrentProject)).toHaveLength(1);
-  expect(children[header + 1]!.type).toBe(SeatsNowStrip);
-  expect(children.filter((child) => child.type === SeatsNowStrip)).toHaveLength(1);
+  expect(children[header + 1]!.type).toBe('details');
+  expect(children[header + 1]!.findAllByType(SeatsNowStrip)).toHaveLength(1);
+  expect(children[header + 2]!.findAllByType(ChatApprovalsChip)).toHaveLength(1);
+  expect(children.flatMap((child) => child.findAllByType(SeatsNowStrip))).toHaveLength(1);
   await act(async () => { tree!.unmount(); });
   tree = undefined;
   Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1200 });
   await probe.mount(true);
   const wide = tree!.root.findByType(ChatLayout).findByType('div').children.filter((child): child is ReactTestRenderer['root'] => typeof child !== 'string');
   expect(wide[0]!.findAllByType(ChatCurrentProject)).toHaveLength(1);
-  expect(wide[1]!.type).toBe(SeatsNowStrip);
-  expect(wide.filter((child) => child.type === SeatsNowStrip)).toHaveLength(1);
+  expect(wide[1]!.type).toBe('details');
+  expect(wide[1]!.findAllByType(SeatsNowStrip)).toHaveLength(1);
+  expect(wide[2]!.findAllByType(ChatApprovalsChip)).toHaveLength(1);
+  expect(wide.flatMap((child) => child.findAllByType(SeatsNowStrip))).toHaveLength(1);
 });

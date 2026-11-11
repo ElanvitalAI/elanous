@@ -1,0 +1,14 @@
+{
+  "id": "SIM-MAPREDUCE",
+  "name": "Multihost map-reduce contract scenarios",
+  "checklistCells": ["MAPREDUCE-CORE"],
+  "implementation": ["src/ux-sim/mapreduce-multihost-sim.ts", "src/task-agent/map-reduce.ts", "scripts/release-loop/gate-shard-dispatch.ts"],
+  "tests": ["src/ux-sim/mapreduce-multihost-sim.test.ts"],
+  "target": "Run the existing task fanout and gate shard planner/reducers against one shared receipt contract",
+  "inputs": ["seeded piece inventory", "fake host list", "retry outcomes", "per-piece cost estimates", "cost ceiling"],
+  "observations": ["same canonical receipt from task and gate modules", "bounded retry and explicit partial result", "budget-exceeded pieces do not launch", "same seed reproduces host assignment and receipt"],
+  "entryCommands": ["bun test src/ux-sim/mapreduce-multihost-sim.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

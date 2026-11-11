@@ -4,6 +4,9 @@ plan:
 recover-plan:
   command: 'bun scripts/graph-units/recover-plan.ts'
   timeout_ms: 30000
+pod-reuse-prep-pending:
+  command: >-
+    bun -e 'console.log(JSON.stringify({outcome:"legacy", verdict:"legacy", reason:"prep-body-pending", receiptPath:""}))'
 harvest-review:
   command: 'bun scripts/graph-harvest-unit.ts'
   dry_run_command: 'bun scripts/graph-harvest-unit.ts --dry-run'

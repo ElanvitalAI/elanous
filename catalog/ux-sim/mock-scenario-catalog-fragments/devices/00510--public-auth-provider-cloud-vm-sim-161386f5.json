@@ -1,0 +1,43 @@
+{
+  "id": "public-auth-provider-cloud-vm-sim",
+  "name": "Tailnet-free public Nexus resource-ledger auth for a cloud VM",
+  "implementation": [
+    "src/ux-sim/public-auth-provider-cloud-vm-sim.ts",
+    "src/ux-sim/fake-cloud-vm.ts",
+    "scripts/warm-pool-provider-config.ts",
+    "src/nexus/api/http-server.ts",
+    "src/nexus/api/resource-ledger.ts",
+    "src/control-plane/member-tokens.ts"
+  ],
+  "tests": [
+    "src/ux-sim/public-auth-provider-cloud-vm-sim.test.ts"
+  ],
+  "target": "Exercise the production warm-pool provider reader against the Nexus public resource-ledger route from a simulated cloud VM without tailnet membership or public network access.",
+  "inputs": [
+    "one cloud host with an expiring machine token",
+    "two machine-scoped pool declarations",
+    "expired and revoked host tokens",
+    "public HTTPS and public HTTP requests"
+  ],
+  "observations": [
+    "HTTPS bearer request returns only the caller host's pool declaration",
+    "other host reads only its own declaration",
+    "expired and revoked credentials return 401",
+    "public HTTP route returns 403 and provider URL validation rejects before fetch",
+    "request observations contain host, path, protocol and status without credential values"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/public-auth-provider-cloud-vm-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null,
+  "checklistCells": [
+    "RESOURCE-LEDGER-PUBLIC-AUTH"
+  ],
+  "defaultProfile": {
+    "credentials": "fake-only",
+    "network": "in-process HTTPS transport",
+    "storage": "temporary"
+  }
+}

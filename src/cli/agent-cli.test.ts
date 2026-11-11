@@ -1,9 +1,10 @@
 import { setDefaultTimeout, describe, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { KgsSqliteStore } from '../knowledge/kgs/sqlite-store.js';
 import { createPack } from '../knowledge/kgs/pack.js';
-import { buildCliAgentTools, runChatTurnCli } from './agent-cli.js';
+import { buildCliAgentTools, dispatchGuardedCliTool, isPotentiallyDestructiveShellCommand, runChatTurnCli, setCliConfirmBashCommandForTesting, setCliRunTurnForTesting } from './agent-cli.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleOnboardingRefusal, OnboardingRefusedError } from '../onboarding.js';
@@ -11,6 +12,18 @@ import { UNATTENDED_SETUP_COMMAND, unattendedSetupHint } from '../onboarding/ent
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
+
+// Source: .rules/30-harness/testing-gates.md §R-TST36; deterministic dispatch fixtures use one accepted prompt and a short confirmation delay.
+const dispatchFixture = {
+  longPathRepeat: 140,
+  readOffset: 123,
+  zeroTokens: 0,
+  confirmationCount: 2,
+  acceptedPrompt: 1,
+  // Source: .rules/30-harness/testing-gates.md §R-TST36; dispatch confirmation mutex allows only one active prompt.
+  maxConcurrentConfirmations: 1,
+  confirmDelayMs: 25,
+} as const;
 
 const root = new URL('../../', import.meta.url).pathname;
 const fixture = new URL('./__fixtures__/agent-help-before/', import.meta.url);
@@ -42,6 +55,7 @@ test('CLI tool turn passes SIGINT cancellation to a running skill_exec result', 
   `;
   try {
     const result = spawnSync(process.execPath, ['-e', script], {
+      // Source: .rules/30-harness/testing-gates.md §R-TST36; bound the cancellation subprocess under gate-pod load.
       cwd: root, encoding: 'utf8', timeout: 30_000,
       env: { ...process.env, HOME: home, ELANOUS_STATE_DIR: join(home, 'state') },
     });
@@ -114,6 +128,7 @@ describe('agent CLI onboarding refusal', () => {
       const result = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${stateDir}`, 'agent', 'hi'], {
         cwd: root,
         env: { ...env, HOME: home, XDG_CONFIG_HOME: configDir, ELANOUS_STATE_DIR: stateDir, ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        // Source: .rules/30-harness/testing-gates.md §R-TST36; cap the real CLI subprocess duration.
         input: '', encoding: 'utf8', timeout: 30_000,
       });
       expect(result.error).toBeUndefined();
@@ -151,6 +166,7 @@ describe('agent CLI onboarding refusal', () => {
       const result = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${stateDir}`, 'chat', 'hi'], {
         cwd: root,
         env: { ...env, HOME: home, XDG_CONFIG_HOME: configDir, ELANOUS_STATE_DIR: stateDir, ELANOUS_SUPPRESS_XDG_WARNING: '1', PATH: bin },
+        // Source: .rules/30-harness/testing-gates.md §R-TST36; cap the real CLI subprocess duration.
         input: '', encoding: 'utf8', timeout: 30_000,
       });
       expect(result.error).toBeUndefined();
@@ -246,6 +262,7 @@ describe('agent CLI chat-turn errors', () => {
           ...withoutCredentials, HOME: home,
           ELANOUS_STATE_DIR: configDir, ELANOUS_SESSION_ROOT: join(home, 'sessions'),
         },
+        // Source: .rules/30-harness/testing-gates.md §R-TST36; cap the provider-free CLI subprocess duration.
         encoding: 'utf8', timeout: 30_000,
       });
       expect(result.error).toBeUndefined();
@@ -297,6 +314,7 @@ describe('CLI conversation-start project suggestion', () => {
     try {
       for (const json of [false, true]) {
         const result = spawnSync(process.execPath, ['-e', script], {
+          // Source: .rules/30-harness/testing-gates.md §R-TST36; bound both JSON-mode subprocess probes.
           cwd: folder, encoding: 'utf8', timeout: 30_000,
           env: { ...process.env, HOME: home, ELANOUS_CONFIG_DIR: configDir,
             ELANOUS_STATE_DIR: join(home, 'state'), TEST_JSON: json ? '1' : '0' },
@@ -422,6 +440,7 @@ test('CLI goal-loop includes RFC-first discipline before the tool/model turn for
       env: { ...process.env, HOME: home, ELANOUS_CONFIG_DIR: stateDir,
         ELANOUS_STATE_DIR: stateDir, NODE_ENV: 'test', ELANOUS_TEST_FAKE_LLM: '0',
         TEST_STATE_DIR: stateDir, TEST_CAPTURE_PATH: capturePath },
+      // Source: .rules/30-harness/testing-gates.md §R-TST36; bound the production CLI process probe.
       encoding: 'utf8', timeout: 30_000,
     });
     expect(result.error).toBeUndefined();
@@ -438,4 +457,239 @@ test('CLI goal-loop includes RFC-first discipline before the tool/model turn for
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+describe('terminal do destructive-command gate', () => {
+  test('requires confirmation for unknown programs, shell composition, and mutation commands', () => {
+    for (const command of [
+      'kill 123', 'rm -rf ./cache', 'cp new.json config.json', 'echo data > config.json',
+      'git reset --hard', 'git checkout .', 'python -c "import shutil; shutil.rmtree(\'data\')"',
+      'find . -exec rm -rf {} +', 'find . -fprint0 output.txt', 'ps aux | grep node', 'ls\nrm -rf data', 'sort -oFILE input',
+      'find . \'-delete\'', 'rg --pre rm needle file', 'rg --pre=rm needle file',
+      "rg '--pre' rm needle file", "rg --p''re rm needle file", 'git diff --ext-diff', 'git diff --textconv',
+      'git diff', 'git show --ext-diff HEAD', 'git log -p --ext-diff -1',
+      'sort --compress-program=/tmp/evil -S1 input', 'sort --compress-program /tmp/evil -S1 input',
+      'sort --compress-prog=/tmp/evil -S1 input', 'sort --compress-p /tmp/evil -S1 input',
+      'sort', 'find . -exec rm -rf {} +', 'xargs rm', 'ls -R .', 'ps aux --forest', 'cat config.json',
+    ]) {
+      expect(isPotentiallyDestructiveShellCommand(command)).toBe(true);
+    }
+  });
+
+  test('allows read-only inspection commands without a confirmation prompt', () => {
+    for (const command of [
+      'pwd', 'pwd -P', 'ls -lah src', 'ps aux', 'ps -ef', 'df -h', 'du -sh src', 'uname -a', 'which bun',
+      'git status --short --branch', 'git branch --show-current', 'git rev-parse --show-toplevel',
+    ]) {
+      expect(isPotentiallyDestructiveShellCommand(command)).toBe(false);
+    }
+  });
+
+  test('the shared do dispatcher blocks indirect writes on decline and dispatches after approval', async () => {
+    const destructiveCommands = [
+      "python3 -c \"import shutil; shutil.rmtree('data')\"", 'git checkout .', 'ls\nrm -rf data',
+      'sort -oFILE input', 'find . -fprint0 output.txt',
+    ];
+    let dispatchCount = 0;
+    let confirmationCount = 0;
+    for (const command of destructiveCommands) {
+      const result = await dispatchGuardedCliTool({
+        name: 'Bash', args: { command }, allowedToolNames: ['Bash'],
+        confirmBashCommand: async () => { confirmationCount += 1; return false; },
+        dispatch: async () => { dispatchCount += 1; return 'ran'; },
+      });
+      expect(result).toEqual({ error: 'Execution declined by the user; do not retry or rephrase this destructive command.' });
+    }
+    expect(confirmationCount).toBe(destructiveCommands.length);
+    expect(dispatchCount).toBe(0);
+
+    const approved = await dispatchGuardedCliTool({
+      name: 'Bash', args: { command: 'touch marker' }, allowedToolNames: ['Bash'],
+      confirmBashCommand: async () => true,
+      dispatch: async () => { dispatchCount += 1; return 'approved'; },
+    });
+    expect(approved).toBe('approved');
+    expect(dispatchCount).toBe(1);
+  });
+
+  test('a declined command aborts the turn before a rewritten command can dispatch', async () => {
+    const controller = new AbortController();
+    let dispatchCount = 0;
+    const declined = await dispatchGuardedCliTool({
+      name: 'Bash', args: { command: 'rm -rf data' }, allowedToolNames: ['Bash'],
+      signal: controller.signal, abortTurn: () => controller.abort(),
+      confirmBashCommand: async () => false,
+      dispatch: async () => { dispatchCount += 1; return 'ran'; },
+    });
+    const rewritten = await dispatchGuardedCliTool({
+      name: 'Bash', args: { command: 'python3 -c "import shutil; shutil.rmtree(\'data\')"' },
+      allowedToolNames: ['Bash'], signal: controller.signal,
+      confirmBashCommand: async () => true,
+      dispatch: async () => { dispatchCount += 1; return 'ran'; },
+    });
+    expect(declined).toEqual({ error: 'Execution declined by the user; do not retry or rephrase this destructive command.' });
+    expect(rewritten).toEqual({ error: 'Execution stopped after a declined command; no further tools will be dispatched.' });
+    expect(dispatchCount).toBe(0);
+  });
+
+  test('a concurrent approval cannot dispatch after another command is declined', async () => {
+    const controller = new AbortController();
+    let approveWaitingCall!: (accepted: boolean) => void;
+    const waitingApproval = new Promise<boolean>(resolve => { approveWaitingCall = resolve; });
+    let dispatchCount = 0;
+    const waiting = dispatchGuardedCliTool({
+      name: 'Bash', args: { command: 'rm first.txt' }, allowedToolNames: ['Bash'],
+      signal: controller.signal, abortTurn: () => controller.abort(),
+      confirmBashCommand: async () => waitingApproval,
+      dispatch: async () => { dispatchCount += 1; return 'ran'; },
+    });
+    const declined = await dispatchGuardedCliTool({
+      name: 'Bash', args: { command: 'rm second.txt' }, allowedToolNames: ['Bash'],
+      signal: controller.signal, abortTurn: () => controller.abort(),
+      confirmBashCommand: async () => false,
+      dispatch: async () => { dispatchCount += 1; return 'ran'; },
+    });
+    approveWaitingCall(true);
+    const lateApproval = await waiting;
+    expect(declined).toEqual({ error: 'Execution declined by the user; do not retry or rephrase this destructive command.' });
+    expect(lateApproval).toEqual({ error: 'Execution stopped after a declined command; no further tools will be dispatched.' });
+    expect(dispatchCount).toBe(0);
+  });
+
+  test('agent CLI production dispatch confirms each obfuscated mutation through simCli', async () => {
+    const dispatchHome = mkdtempSync(join(tmpdir(), 'elanous-do-dispatch-'));
+    const marker = join(dispatchHome, 'must-not-exist');
+    const tracked = join(dispatchHome, 'tracked.txt');
+    writeFileSync(join(dispatchHome, 'config.json'), JSON.stringify({
+      onboarding: { completed: true },
+      llm: { provider: 'auto', model: '', memoryJudge: { enabled: false } },
+    }));
+    // Source: src/cli/agent-cli.ts truncateArgsForLog caps argument previews at 120 characters.
+    const longReadPath = `read-${'x'.repeat(dispatchFixture.longPathRepeat)}.md`;
+    writeFileSync(tracked, 'baseline\n');
+    writeFileSync(join(dispatchHome, longReadPath), 'long read target\n');
+    writeFileSync(tracked, 'modified\n');
+    const commands = [
+      `rg --p''re rm needle '${tracked}'`,
+      `rg '--pre' rm needle '${tracked}'`,
+      `rg --pre rm needle '${tracked}'`,
+      `find . '-delete'`,
+      `touch '${marker}'`,
+      `python3 -c "from pathlib import Path; Path('${marker}').touch()"`,
+      'printf safe\nprintf still-safe',
+      `sort -o'${marker}' /dev/null`,
+      `git diff --ext-diff --no-index /dev/null '${tracked}'`,
+      'git show --ext-diff HEAD',
+      'git log -p --ext-diff -1',
+      'sort --compress-program=./compress-program -S1 /dev/null',
+      'sort --compress-prog=./compress-program -S1 /dev/null',
+      'git checkout .',
+    ];
+    const confirmations: string[] = [];
+    const results: unknown[] = [];
+    let readResult: unknown;
+    let readArgs: { file_path: string; offset: number } | undefined;
+    try {
+      setCliConfirmBashCommandForTesting(async requested => { confirmations.push(requested); return false; });
+      for (const [index, command] of commands.entries()) {
+        setCliRunTurnForTesting(async ({ dispatchTool, onToolCall, onDelta, sessionId }) => {
+          if (!dispatchTool) throw new Error('production tool dispatcher was not provided');
+          onToolCall?.({ id: `textless-plan-${index}`, name: 'Bash', args: { command } });
+          const dispatchResult = await dispatchTool('Bash', { command });
+          results.push(dispatchResult);
+          const reply = JSON.stringify(dispatchResult);
+          onDelta?.(reply);
+          return { text: reply, provider: 'test', model: 'test',
+            meta: { id: sessionId }, usedTokens: dispatchFixture.zeroTokens, droppedMessages: dispatchFixture.zeroTokens, memoryIds: [] };
+        });
+        const result = await simCli(['agent', '--json', 'inspect safely'], {
+          cwd: dispatchHome, configRoot: dispatchHome, allowPaths: [['agent']], env: {
+            HOME: dispatchHome, NODE_ENV: 'test', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'diff.external',
+            GIT_CONFIG_VALUE_0: `touch ${marker}`,
+          },
+        });
+        expect(result.exitCode, result.stderr).toBe(0);
+      }
+      setCliRunTurnForTesting(async ({ dispatchTool, onToolCall, onDelta, sessionId }) => {
+        if (!dispatchTool) throw new Error('production tool dispatcher was not provided');
+        const args = { file_path: longReadPath, offset: dispatchFixture.readOffset };
+        readArgs = args;
+        onToolCall?.({ id: 'textless-read-plan', name: 'Read', args });
+        readResult = await dispatchTool('Read', args);
+        onDelta?.('Read plan displayed.');
+        return { text: 'Read plan displayed.', provider: 'test', model: 'test',
+          meta: { id: sessionId }, usedTokens: dispatchFixture.zeroTokens, droppedMessages: dispatchFixture.zeroTokens, memoryIds: [] };
+      });
+      const result = await simCli(['agent', '--json', 'inspect safely'], {
+        cwd: dispatchHome, configRoot: dispatchHome, allowPaths: [['agent']], env: {
+          HOME: dispatchHome, NODE_ENV: 'test', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'diff.external',
+          GIT_CONFIG_VALUE_0: `touch ${marker}`,
+        },
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(confirmations).toEqual(commands);
+      expect(results).toHaveLength(commands.length);
+      expect(results.every(item => (item as { error?: string }).error?.includes('Execution declined by the user'))).toBe(true);
+      expect(readResult).toBeDefined();
+      expect(readArgs).toEqual({ file_path: longReadPath, offset: dispatchFixture.readOffset });
+      expect(existsSync(marker)).toBe(false);
+      expect(readFileSync(tracked, 'utf8')).toBe('modified\n');
+    } finally {
+      setCliRunTurnForTesting(undefined);
+      setCliConfirmBashCommandForTesting(undefined);
+      rmSync(dispatchHome, { recursive: true, force: true });
+    }
+  });
+
+  test('agent CLI serializes concurrent destructive confirmations through simCli', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'elanous-do-confirm-queue-'));
+    const first = join(home, 'first-marker');
+    const second = join(home, 'second-marker');
+    writeFileSync(join(home, 'config.json'), JSON.stringify({
+      onboarding: { completed: true },
+      llm: { provider: 'auto', model: '', memoryJudge: { enabled: false } },
+    }));
+    let active = 0;
+    let maxActive = dispatchFixture.zeroTokens;
+    let promptCount = 0;
+    const dispatchResults: unknown[] = [];
+    const commands = [`touch '${first}'`, `touch '${second}'`];
+    try {
+      setCliConfirmBashCommandForTesting(async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        const prompt = ++promptCount;
+        await new Promise(resolve => setTimeout(resolve, dispatchFixture.confirmDelayMs));
+        active -= 1;
+        return prompt === dispatchFixture.acceptedPrompt;
+      });
+      setCliRunTurnForTesting(async ({ dispatchTool, onToolCall, onDelta, sessionId }) => {
+        if (!dispatchTool) throw new Error('production tool dispatcher was not provided');
+        const dispatched = await Promise.all(commands.map((command, index) => {
+          onToolCall?.({ id: `concurrent-${index}`, name: 'Bash', args: { command } });
+          return dispatchTool('Bash', { command });
+        }));
+        dispatchResults.push(...dispatched);
+        const reply = JSON.stringify(dispatched);
+        onDelta?.(reply);
+        return { text: reply, provider: 'test', model: 'test',
+          meta: { id: sessionId }, usedTokens: dispatchFixture.zeroTokens,
+          droppedMessages: dispatchFixture.zeroTokens, memoryIds: [] };
+      });
+      const result = await simCli(['agent', '--json', 'inspect safely'], {
+        cwd: home, configRoot: home, allowPaths: [['agent']], env: { HOME: home, NODE_ENV: 'test' },
+      });
+      expect(result.exitCode, result.stderr).toBe(0);
+      expect(maxActive).toBe(dispatchFixture.maxConcurrentConfirmations);
+      expect(promptCount).toBe(dispatchFixture.confirmationCount);
+      expect(dispatchResults).toHaveLength(dispatchFixture.confirmationCount);
+      expect(existsSync(first)).toBe(true);
+      expect(existsSync(second)).toBe(false);
+      expect((dispatchResults[1] as { error?: string }).error).toContain('Execution declined by the user');
+    } finally {
+      setCliRunTurnForTesting(undefined);
+      setCliConfirmBashCommandForTesting(undefined);
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });

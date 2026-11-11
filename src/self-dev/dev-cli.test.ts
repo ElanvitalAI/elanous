@@ -23,12 +23,92 @@ import { defaultSeams } from '../self-implement/seams.js';
 import type { AcpRunResult } from './dev-pipeline.js';
 import type { AgentMissionResult } from '../agent-mission/driver.js';
 import type { SelfDevJobResult } from './orchestrate.js';
-import { buildUserConfig, parseChildLlmPreference, resetUserConfig, setUserConfigOverlay, type UserConfig } from '../user-config.js';
+import { buildUserConfig, getUserConfig, parseChildLlmPreference, resetUserConfig, setUserConfigOverlay, type UserConfig } from '../user-config.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { readHarnessScreen } from '../harness/harness-screen.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DEFAULT_TUI_TEST_READY_TIMEOUT_MS } from '../self-implement/elanous-tui-spawn.js';
 import { simCli } from '../ux-sim/in-process-cli.js';
+
+it('supervisor repair child receives the immutable Pod launch config snapshot (fake Pod)', async () => {
+  const initialConfig = buildUserConfig();
+  const launchConfigSnapshot: UserConfig = {
+    ...initialConfig,
+    tools: { ...initialConfig.tools, selfImplement: {
+      ...initialConfig.tools.selfImplement,
+      supervisor: { reasonRepair: true },
+    } },
+    harness: { ...initialConfig.harness, podPool: 'fake-pool:2', imageCommit: 'fake-image-sha' },
+  };
+  setUserConfigOverlay(() => launchConfigSnapshot);
+  const failed = { ok: false, stage: 'error', node: 'complete', outcome: 'failed' } as unknown as SelfImplementResult;
+  const repaired = { ok: true, stage: 'merged', node: 'merge', outcome: 'completed', merged: true } as unknown as SelfImplementResult;
+  const received: Array<{ feature: string; snapshot?: UserConfig }> = [];
+  try {
+    await devCli.executeDevSelfRun('# Dev CLI failure\n\n## TRACED PATHS\n- src/self-dev/dev-cli.ts — verified target', async () => {
+      setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
+        selfImplement: { ...config.tools.selfImplement, supervisor: { reasonRepair: false } },
+      } }));
+      return failed;
+    }, {
+      rounds: 2,
+      launchConfigSnapshot,
+      printDecision: () => {},
+      executePiece: async (feature, options) => {
+        received.push({ feature, snapshot: options?.launchConfigSnapshot });
+        expect(getUserConfig()).toBe(launchConfigSnapshot);
+        return repaired;
+      },
+      taskAgentShadow: false,
+      taskAgentRejudge: false,
+      sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+    });
+  } finally {
+    setUserConfigOverlay(null);
+  }
+  expect(received.length).toBe(1);
+  expect(received[0]?.snapshot).toBe(launchConfigSnapshot);
+  expect(received[0]?.snapshot?.harness?.podPool).toBe('fake-pool:2');
+  expect(received[0]?.snapshot?.harness?.imageCommit).toBe('fake-image-sha');
+});
+
+it('legacy supervisor callers snapshot config before the initial run', async () => {
+  const initialConfig = buildUserConfig();
+  const launchConfigSnapshot: UserConfig = {
+    ...initialConfig,
+    tools: { ...initialConfig.tools, selfImplement: {
+      ...initialConfig.tools.selfImplement,
+      supervisor: { reasonRepair: true },
+    } },
+  };
+  setUserConfigOverlay(() => launchConfigSnapshot);
+  const failed = { ok: false, stage: 'error', node: 'complete', outcome: 'failed' } as unknown as SelfImplementResult;
+  const repaired = { ok: true, stage: 'merged', node: 'merge', outcome: 'completed', merged: true } as unknown as SelfImplementResult;
+  let called = false;
+  try {
+    await devCli.executeDevSelfRun('# Dev CLI failure\n\n## TRACED PATHS\n- src/self-dev/dev-cli.ts — verified target', async () => {
+      setUserConfigOverlay((config) => ({ ...config, tools: { ...config.tools,
+        selfImplement: { ...config.tools.selfImplement, supervisor: { reasonRepair: false } },
+      } }));
+      return failed;
+    }, {
+      rounds: 2,
+      printDecision: () => {},
+      executePiece: async (_feature, options) => {
+        called = true;
+        expect(options?.launchConfigSnapshot).toBe(launchConfigSnapshot);
+        expect(getUserConfig()).toBe(launchConfigSnapshot);
+        return repaired;
+      },
+      taskAgentShadow: false,
+      taskAgentRejudge: false,
+      sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+    });
+  } finally {
+    setUserConfigOverlay(null);
+  }
+  expect(called).toBe(true);
+});
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);

@@ -8,7 +8,7 @@
 // 절대 상한 hardCeiling. cap 도달 시 split 은 차단되고 조율자가 reshape(merge)/HITL 로 처리(Device 3).
 // gradeArcConformance(아크당 4~5페이즈)와 정합 — 5/arc 는 "아크당 완주가능 페이즈"의 상한.
 
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export interface PhaseBudgetConfig {
   /** 아크당 허용 페이즈 수(기본 5·gradeArcConformance 상한과 정합). */

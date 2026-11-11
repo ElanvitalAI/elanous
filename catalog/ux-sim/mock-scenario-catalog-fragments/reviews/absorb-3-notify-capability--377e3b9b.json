@@ -1,0 +1,4 @@
+{
+  "deviceKey": "absorb-3-notify-capability",
+  "review": "> 📅 **2026-11-09 재검토 (ABSORB-3 · NOTIFY-CAPABILITY)** — 시뮬 장치 매뉴얼의 fake Telegram outbound 계약에 actions·refId·dedupKey 호환 항목이 반영됐다. 시험 근거와 원격 게이트 기준은 그대로 적용한다."
+}

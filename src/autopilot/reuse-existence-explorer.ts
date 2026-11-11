@@ -15,7 +15,7 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { rgListFiles, rgFilesWithMatches } from '../tool-runtime/ripgrep-core.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { HealKind } from './mission-phase-diagnosis.js';
 
 export type ExistenceStatus = 'exists' | 'similar' | 'absent';

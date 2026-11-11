@@ -237,24 +237,54 @@ export function compareDeviceRecording(value: unknown, now = new Date()): Device
   return result;
 }
 
-export function deviceFidelityStatus(deviceId: string): { verdict: 'green' | 'yellow' | 'unmeasured'; failedRecordingIds: string[] } {
+/** E4.5 compares a redacted LLM response cassette with an explicit real-mode response. */
+export function compareLlmCassetteRecording(recordingId: string, cassetteEvents: unknown[], realEvents: unknown[], now = new Date(), legacyRequestKey?: string): DeviceFidelityComparison {
+  if (!/^[a-f0-9]{64}$/.test(recordingId)) throw new Error('LLM cassette recording id is invalid');
+  if (legacyRequestKey !== undefined && !/^[a-f0-9]{64}$/.test(legacyRequestKey)) throw new Error('LLM cassette legacy request key is invalid');
+  const expected = JSON.stringify(cassetteEvents);
+  const actual = JSON.stringify(realEvents);
+  const result: DeviceFidelityComparison = {
+    recordingId, deviceId: 'fake-llm', passed: expected === actual,
+    comparisons: [{ index: 0, passed: expected === actual, expectedSha256: sha(expected), actualSha256: sha(actual) }],
+    comparedAt: now.toISOString(),
+  };
+  const recordingSha256 = sha(expected);
+  withStateDatabase((db) => {
+    const persist = (id: string) => {
+    db.query(`INSERT INTO recordings(recording_id, device_id, passed, recording_sha256, payload) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(recording_id) DO UPDATE SET device_id = excluded.device_id,
+        passed = MIN(recordings.passed, excluded.passed), recording_sha256 = excluded.recording_sha256,
+        payload = CASE WHEN recordings.passed = 0 THEN recordings.payload ELSE excluded.payload END`)
+      .run(id, 'fake-llm', result.passed ? 1 : 0, recordingSha256, JSON.stringify({ ...result, recordingId: id }));
+    };
+    persist(recordingId);
+    if (legacyRequestKey && legacyRequestKey !== recordingId) persist(legacyRequestKey);
+  });
+  return result;
+}
+
+export function deviceFidelityStatus(deviceId: string, recordingIds?: readonly string[]): { verdict: 'green' | 'yellow' | 'unmeasured'; failedRecordingIds: string[] } {
   const canonicalDeviceId = deviceId === 'fake-gh' ? 'fake-github' : deviceId;
   return withStateDatabase((db) => {
-    const comparisons = db.query('SELECT recording_id, passed FROM recordings WHERE device_id = ? ORDER BY recording_id')
-      .all(canonicalDeviceId) as Array<{ recording_id: string; passed: number }>;
+    const selected = recordingIds?.length ? recordingIds : undefined;
+    const comparisons = (selected
+      ? db.query(`SELECT recording_id, passed FROM recordings WHERE device_id = ? AND recording_id IN (${selected.map(() => '?').join(',')}) ORDER BY recording_id`).all(canonicalDeviceId, ...selected)
+      : db.query('SELECT recording_id, passed FROM recordings WHERE device_id = ? ORDER BY recording_id').all(canonicalDeviceId)) as Array<{ recording_id: string; passed: number }>;
     const failedRecordingIds = comparisons.filter((row) => row.passed === 0).map((row) => row.recording_id);
     if (failedRecordingIds.length) return { verdict: 'yellow', failedRecordingIds };
     return { verdict: comparisons.length ? 'green' as const : 'unmeasured' as const, failedRecordingIds: [] };
   });
 }
 
-export function applyDeviceFidelity<T extends { pass: boolean; devices: string[] }>(result: T): T & {
+export function applyDeviceFidelity<T extends { pass: boolean; devices: string[]; recordingIds?: string[] }>(result: T): T & {
   verdict: 'green' | 'yellow' | 'red';
   fidelity: Array<{ deviceId: string; verdict: 'green' | 'yellow' | 'unmeasured'; failedRecordingIds: string[] }>;
 } {
   const fidelity = result.devices.map((deviceId) => ({
     deviceId,
-    ...deviceFidelityStatus(deviceId),
+    ...(deviceId === 'fake-llm'
+      ? result.recordingIds?.length ? deviceFidelityStatus(deviceId, result.recordingIds) : { verdict: 'unmeasured' as const, failedRecordingIds: [] }
+      : deviceFidelityStatus(deviceId)),
   }));
   const hasMismatch = fidelity.some((row) => row.verdict === 'yellow');
   return { ...result, pass: result.pass && !hasMismatch, verdict: hasMismatch ? 'yellow' : result.pass ? 'green' : 'red', fidelity };

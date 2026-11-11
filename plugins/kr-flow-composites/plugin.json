@@ -1,0 +1,16 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "kr-flow-composites",
+  "version": "0.1.0",
+  "description": "Read-only Korean sector, battery, and ETF market-data composition graphs.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graphs/sector-flow.yaml", "./graphs/battery-signal.yaml", "./graphs/etf-price.yaml"],
+      "capabilities": ["proc:bun"],
+      "connectors": [],
+      "pricing": { "model": "free" },
+      "trust": "official",
+      "category": "Finance"
+    }
+  }
+}

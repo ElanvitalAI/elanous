@@ -5,7 +5,7 @@ import { buildUserConfig, resolveSkillSources } from '../user-config.js';
 import type { UserConfig as MainUserConfig } from '../user-config/types.js';
 import { decideProviderForConfig } from '../llm.js';
 import { resolveGrokCredential } from '../grok/credential.js';
-import { loadTokens } from '../oauth/store.js';
+import { authStorePath, loadTokens } from '../oauth/store.js';
 import {
   readUserConfig as readNexusUserConfig,
   readSwitchValue,
@@ -16,6 +16,7 @@ import { resolveSystemdEnvironment } from './install/systemd.js';
 import { resolvePwaStaticDir } from './static-dir-resolve.js';
 import { SKILLS_STEP_COMMAND, unattendedSetupHint } from '../onboarding/entry-hints.js';
 import { CREDENTIAL_SLOT_DEFINITIONS, parseCredentialSlotId, type CredentialSlotId } from './config/secrets/cred-slots.js';
+import { assessCredentialHealth, assessOAuthCredentialHealth, type CredentialHealthObserver, type CredentialHealthStatus } from './config/secrets/cred-health.js';
 
 export type SetupItemId = 'llm' | 'pwa-build' | 'channel-bot' | 'skill-dirs' | 'os-install';
 
@@ -40,6 +41,12 @@ export interface CredentialSetupOption {
   field: string;
   setupUrl: string;
   registerable: boolean;
+  /** Owner web form route; only slots supported by the verified registration handler expose it. */
+  registrationPath: string | null;
+  /** No persisted verification receipt exists yet; never infer a check from presence. */
+  lastCheckedAt: null;
+  /** Present only when expiry and permission metadata were explicitly observed. */
+  healthStatus?: CredentialHealthStatus;
 }
 
 /** Safe metadata for the web credential surface; unsupported verifiers stay fail-closed. */
@@ -47,15 +54,46 @@ export function credentialSetupOptions(): CredentialSetupOption[] {
   return CREDENTIAL_SLOT_DEFINITIONS.flatMap((definition) => definition.fields.map((field) => {
     const id = `cred:${definition.service}.${field}` as CredentialSlotId;
     const parsed = parseCredentialSlotId(id);
+    const registerable = parsed !== undefined && (definition.service === 'openai' || definition.service === 'elevenlabs' || definition.service === 'openrouter');
     return {
       id,
       service: definition.service,
       label: definition.label,
       field,
       setupUrl: definition.setupUrl,
-      registerable: parsed !== undefined && (definition.service === 'openai' || definition.service === 'elevenlabs'),
+      registerable,
+      registrationPath: registerable ? '/credentials/register' : null,
+      lastCheckedAt: null,
     };
   }));
+}
+
+/** Attach health only from an explicit metadata observer; the secret store provides presence alone. */
+export function credentialSetupOptionsWithHealth(health: CredentialHealthObserver): CredentialSetupOption[] {
+  return credentialSetupOptions().map((option) => ({ ...option,
+    healthStatus: assessCredentialHealth(health.inspect(option.id), health.permissionFor(option.id),
+      health.now(), health.warningWindowMs),
+  }));
+}
+
+export interface OAuthCredentialHealthOption { provider: string; healthStatus: CredentialHealthStatus }
+
+/** The OAuth store has expiry and scope metadata; its token values are never returned. */
+export function oauthCredentialHealthOptions(options: { storePath?: string; now?: number } = {}): OAuthCredentialHealthOption[] {
+  const path = options.storePath ?? authStorePath();
+  const now = options.now ?? Date.now();
+  // Source: codex-owner-mirror.ts treats an access token within 120,000 ms of expiry as expiring.
+  const warningWindowMs = 120_000;
+  const providers: ReadonlyArray<{ provider: string; requiredScopes: readonly string[] | null }> = [
+    { provider: 'openai-codex', requiredScopes: ['openid', 'profile', 'email', 'offline_access'] },
+    { provider: 'anthropic', requiredScopes: null },
+  ];
+  return providers.map(({ provider, requiredScopes }) => {
+    const tokens = loadTokens(provider, path)?.tokens;
+    const observation = tokens?.accessToken ? { present: true as const, expiresAt: tokens.expiresAt,
+      ...(typeof tokens.scope === 'string' ? { scope: tokens.scope } : {}) } : { present: false as const };
+    return { provider, healthStatus: assessOAuthCredentialHealth(observation, requiredScopes, now, warningWindowMs) };
+  });
 }
 
 export type SetupBootMode = 'normal' | 'setup' | 'refuse';

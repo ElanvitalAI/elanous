@@ -1,3 +1,4 @@
+import { NEXT_TUI_TITLE } from './core/render.js';
 // TUI-HERDR-NAMED-AGENT — next TUI 가 herdr 밖에서 넣은 한 턴을 받는다(L3 · 실 PTY · fake LLM · fake herdr).
 // `eln herdr prompt` 는 herdr `pane run` 으로 넣는다 — pane 이 bracketed-paste 를 켰으면 바이트는
 // `ESC[200~문장ESC[201~` ⊕ CR(격리 herdr 세션 실측 10-22). 그래서 이 시험은 그 바이트를 그대로 쓴다.
@@ -72,6 +73,7 @@ describe('next TUI × herdr prompt (L3)', () => {
         ELANOUS_STATE_DIR: iso,
         ELANOUS_STATE_DIR_SOURCE: 'test',
         ELANOUS_SESSION_ROOT: sessionsRoot,
+        ELANOUS_NEXT_TUI_COMPACT_HEIGHT: '20',
         ELANOUS_TEST_FAKE_LLM: '1',
         ELANOUS_TEST_FAKE_LLM_RESPONSE: reply,
         HERDR_ENV: '1',
@@ -94,7 +96,7 @@ describe('next TUI × herdr prompt (L3)', () => {
       .filter((c) => c.argv[0] === 'pane' && c.argv[1] === 'report-agent')
       .map((c) => c.argv[c.argv.indexOf('--state') + 1] ?? '?');
     try {
-      await waitFor('boot', (s) => s.includes('elanous next ·') && s.includes('Ctrl+Q 종료'));
+      await waitFor('boot', (s) => s.split('\n').includes(NEXT_TUI_TITLE) && s.includes('Ctrl+Q 종료'));
       const deadline = Date.now() + 10_000;
       while (!states().includes('idle') && Date.now() < deadline) await sleep(100);
       expect(states()[0]).toBe('idle');

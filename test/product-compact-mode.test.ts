@@ -53,7 +53,6 @@ describe('pruneSurfaceCatalogForCompactMode', () => {
     { id: 'pane:obsidian' },
     { id: 'pane:skill-browser' },
     { id: 'companion:clipboard' },
-    { id: 'vw:browser-preview' },
     { id: 'vw:sim' },
     { id: 'vw-companion:detail' },
   ];
@@ -69,7 +68,6 @@ describe('pruneSurfaceCatalogForCompactMode', () => {
       { id: 'reopen:preview' },
       { id: 'pane:obsidian' },
       { id: 'companion:clipboard' },
-      { id: 'vw:browser-preview' },
       { id: 'vw:sim' },
     ]);
   });
@@ -80,11 +78,9 @@ describe('orderSurfaceCatalogForCompactMode', () => {
     { id: 'reopen:preview', group: 'Current View' },
     { id: 'pane:preview', group: 'Panes' },
     { id: 'pane:browser', group: 'Panes' },
-    { id: 'pane:browser-preview', group: 'Panes' },
     { id: 'companion:detail', group: 'Companions' },
     { id: 'companion:clipboard', group: 'Companions' },
     { id: 'vw:preview', group: 'Virtual Windows' },
-    { id: 'vw:browser-preview', group: 'Virtual Windows' },
     { id: 'vw:sim', group: 'Virtual Windows' },
   ];
 
@@ -93,11 +89,9 @@ describe('orderSurfaceCatalogForCompactMode', () => {
       'reopen:preview',
       'pane:preview',
       'pane:browser',
-      'pane:browser-preview',
       'companion:detail',
       'companion:clipboard',
       'vw:preview',
-      'vw:browser-preview',
       'vw:sim',
     ]);
   });
@@ -105,12 +99,10 @@ describe('orderSurfaceCatalogForCompactMode', () => {
   test('promotes core popup and companion actions in compact', () => {
     expect(orderSurfaceCatalogForCompactMode(catalog, 'compact').map((item) => item.id)).toEqual([
       'reopen:preview',
-      'pane:browser-preview',
       'pane:browser',
       'pane:preview',
       'companion:clipboard',
       'companion:detail',
-      'vw:browser-preview',
       'vw:sim',
       'vw:preview',
     ]);

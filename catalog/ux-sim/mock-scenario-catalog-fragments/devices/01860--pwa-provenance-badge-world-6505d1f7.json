@@ -1,0 +1,31 @@
+{
+  "id": "pwa-provenance-badge-world",
+  "name": "PWA provenance badge projection",
+  "audience": "internal",
+  "checklistCells": ["PROVENANCE-TAG-CORE"],
+  "implementation": [
+    "apps/pwa/src/lib/provenance-badge.ts",
+    "src/ux-sim/pwa-provenance-badge-world.ts"
+  ],
+  "tests": [
+    "apps/pwa/src/lib/provenance-badge.test.ts",
+    "src/ux-sim/pwa-provenance-badge-world.test.ts"
+  ],
+  "target": "Projects the RFC-hybrid-sim-real §3 provenance source into the PWA's four requested visible badges; the badge helper is a pure projection and the UX simulator calls that production helper without a screen, network, or real-world side effect.",
+  "inputs": [
+    "real, sim, replay, injected, shadow and synthetic-probe provenance event envelopes",
+    "missing and unrecognized source values"
+  ],
+  "observations": [
+    "sim, replay, injected and shadow map to their requested badges",
+    "real and synthetic-probe remain distinct and are not labeled as one of the four badges",
+    "missing or unrecognized provenance is displayed as unknown rather than real",
+    "event identity and provenance envelope fields remain unchanged"
+  ],
+  "entryCommands": [
+    "bun test apps/pwa/src/lib/provenance-badge.test.ts src/ux-sim/pwa-provenance-badge-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

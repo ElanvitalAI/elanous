@@ -1,0 +1,42 @@
+apiVersion: elanous.dev/graph/v2
+graph: { id: absorb-build, version: 1.0.0, layer: flow, purpose: "명시 확인을 받은 앱 제안을 격리본으로 빌드·시뮬레이션·발행" }
+entry: lookup-suggestion
+policy: { hitl: [approve-publish] }
+nodes:
+  - id: lookup-suggestion
+    type: store
+    requires: store.read@1
+    with:
+      op: get
+      collection: suggestions
+      id: "$input.suggestionId"
+      owner: "$context.memberId"
+      ownerScoped: true
+  - id: build
+    type: make
+    call: verb-make@^1
+    skill: absorb/build
+    uses: [llm-judge]
+    with: { ask: "$lookup-suggestion.evidence.suggestion.ask" }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+    budget: { inner_steps: 2 }
+  - id: simulate
+    type: app-publish
+    requires: app-publish.action@1
+    with: { action: simulate, isolated: true, requireOwner: "$context.memberId", suggestion: "$lookup-suggestion.evidence.suggestion", artifact: "$build.evidence.artifact" }
+  - id: approve-publish
+    type: hitl
+    hitl: { options: [{ key: y, exit: approved }, { key: N, exit: rejected, default: true }] }
+  - id: publish
+    type: app-publish
+    requires: app-publish.action@1
+    with: { action: publish, isolated: true, owner: "$context.memberId", requireOwner: "$context.memberId", requirePassingReceipt: true, receipt: "$simulate.evidence.receipt", artifact: "$build.evidence.artifact" }
+edges:
+  - { from: lookup-suggestion, on: outcome, map: { done: build, failed: failed } }
+  - { from: build, on: outcome, map: { done: simulate, rework: build, needs-human: failed, failed: failed } }
+  - { from: simulate, on: outcome, map: { done: approve-publish, failed: failed } }
+  - { from: approve-publish, on: outcome, map: { approved: publish, rejected: failed } }
+  - { from: publish, on: outcome, map: { done: done, failed: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, graph.unit, app-publish] }
+sims: [sims/absorb-demo-world.yaml]

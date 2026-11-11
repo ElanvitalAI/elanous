@@ -14,6 +14,17 @@ function run(cwd: string, ...args: string[]) { const r = spawnSync(args[0]!, arg
 function git(cwd: string, ...args: string[]) { const r = run(cwd, 'git', ...args); if (r.status !== 0) throw new Error(r.stderr || r.stdout); return r.stdout.trim(); }
 const fragmentsRoot = 'catalog/ux-sim/mock-scenario-catalog-fragments';
 const manualPath = 'docs/manual/MANUAL-ux-simulation-devices-2026-08-23.md';
+test('version history merge combines independently added device membership', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ux-sim-history-driver-'));
+  dirs.push(dir);
+  const [base, ours, theirs] = ['base.json', 'ours.json', 'theirs.json'].map((name) => join(dir, name));
+  writeFileSync(base!, JSON.stringify({ '28': ['MD-BASE'] }));
+  writeFileSync(ours!, JSON.stringify({ '28': ['MD-BASE', 'MD-A'] }));
+  writeFileSync(theirs!, JSON.stringify({ '28': ['MD-BASE', 'MD-B'] }));
+  const result = run(dir, 'node', resolve(process.cwd(), 'scripts/ux-sim-merge-driver.mjs'), 'catalog', base!, ours!, theirs!);
+  expect(result.status).toBe(0);
+  expect(JSON.parse(readFileSync(ours!, 'utf8'))).toEqual({ '28': ['MD-BASE', 'MD-A', 'MD-B'] });
+});
 function fixture() {
  const repo=mkdtempSync(join(tmpdir(),'ux-sim-merge-driver-'));dirs.push(repo);git(repo,'init','-q','-b','main');git(repo,'config','user.name','test');git(repo,'config','user.email','test@localhost');
  mkdirSync(join(repo,'scripts'),{recursive:true});mkdirSync(join(repo,'src/ux-sim'),{recursive:true});mkdirSync(join(repo,'docs/manual'),{recursive:true});mkdirSync(join(repo,'catalog/sim-world-device-catalog-fragments/devices'),{recursive:true});

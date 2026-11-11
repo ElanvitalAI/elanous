@@ -138,8 +138,35 @@ export async function runLlmDetect(
 }
 
 export function registerLlmDetectCommand(program: Command): void {
-  program.command('llm').description('LLM 공급자')
-    .command('detect').description('이 기계에 이미 있는 구독·키를 찾아 순위대로 보여 준다 (--probe 한 턴 검증 · --apply 는 llm.provider 가 auto 일 때만 쓴다)')
+  const llmCommand = program.command('llm [text...]')
+    .description('Ask a model without Elanous context, tools, or a session; use `detect` to inspect providers')
+    .option('--json', 'Emit one JSON line with provider, model, and reply')
+    .action(async (parts: string[] = [], options: { json?: boolean }) => {
+      const text = parts.join(' ');
+      if (!text.trim()) {
+        console.error("error: missing required argument 'text'");
+        process.exitCode = 1;
+        return;
+      }
+      try {
+        const { llmQuery } = await import('./llm-cli.js');
+        const llm = await import('../llm.js');
+        const { getUserConfig } = await import('../user-config.js');
+        const { trimToBudget } = await import('../tokens.js');
+        const result = await llmQuery({ text, deps: {
+          getUserConfig, decideProviderForConfig: llm.decideProviderForConfig, getProviderForConfig: llm.getProviderForConfig,
+          streamLLM: llm.streamLLM, trimToBudget,
+        } });
+        if (options.json) process.stdout.write(JSON.stringify({ sessionId: null, ...result, logPath: null, budget: null }) + '\n');
+        else process.stdout.write(result.reply.endsWith('\n') ? result.reply : `${result.reply}\n`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (options.json) process.stdout.write(JSON.stringify({ error: message }) + '\n');
+        else console.error(`llm failed: ${message}`);
+        process.exitCode = 1;
+      }
+    });
+  llmCommand.command('detect').description('이 기계에 이미 있는 구독·키를 찾아 순위대로 보여 준다 (--probe 한 턴 검증 · --apply 는 llm.provider 가 auto 일 때만 쓴다)')
     .option('--probe', '위에서부터 한 턴(«OK») 검증해 첫 통과를 고른다')
     .option('--apply', '검증을 통과한 공급자를 llm.provider 로 저장 (--probe 필요 · 이미 명시돼 있으면 안 바꾼다)')
     .option('--json', 'JSON 출력')

@@ -543,6 +543,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
         if (text !== undefined) {
           const parsed = parseServiceKeyEnv(text);
           const result = await importServiceKeys(parsed, { print: (line) => out.log(line) }, keyOptions);
+          if (parsed.skippedNames?.length) out.log(`지원하지 않는 env 이름 건너뜀: ${parsed.skippedNames.join(', ')} · 값 출력 0`);
           setExitCode(result.rejected.length ? 1 : 0);
           return;
         }

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { syncMergedPrChecklist, type MergedPrChecklistDeps } from './merged-pr-checklist.js';
+import { proposeStaleMergedChecklistGreens, syncMergedPrChecklist, type MergedPrChecklistDeps, type StaleMergedChecklistPr } from './merged-pr-checklist.js';
 import { boundMergedTaskCells, candidateMergedTaskCells, closeMergedTaskCard } from '../task-agent/postland-card.js';
 import { judgeLandedCell } from './landed-to-green.js';
 import { addItem, listChecklist, type ChecklistItem } from './checklist.js';
@@ -31,6 +31,77 @@ function fixture(items: ChecklistItem[], title = 'unrelated', body = '칸: X', g
 }
 
 describe('confirmed main merge checklist sync', () => {
+  test('stale sweep proposes six yellow cells including target-path repair, without writing green', () => {
+    const cells = [
+      item('TOOL-ROUTING-DEFAULT-FLIP'),
+      item('GRAPH-HITL-BINDING-SEAM'),
+      item('PLUGIN-MULTI-ACTIVE'),
+      item('WIN-INSTALL-SYSTEM-PROFILE'),
+      item('GATE-CLOSURE-LAZY-REQUIRE'),
+      item('HARNESS-BOUNDARY-REJECT-LOOP-GUARD'),
+    ];
+    cells[0]!.title = '대상 경로: src/tool-router/index.ts';
+    cells[1]!.title = '대상 경로: src/graph-runner/runner.ts';
+    cells[2]!.title = '대상 경로: src/tool-router/index.ts';
+    cells[3]!.title = '대상 경로: scripts/install.ps1 · scripts/install.ps1.test.ts';
+    cells[4]!.title = '대상 경로: scripts/release-loop/gate-closure.ts';
+    cells[5]!.title = '대상 경로: src/harness/run-supervisor.ts';
+    const pr = (number: number, title: string, body: string, file: string, mergedAt: string): StaleMergedChecklistPr => ({
+      number, state: 'MERGED', baseRefName: 'main', title, body, mergedAt, files: [{ path: file }],
+    });
+    const prs = [
+      pr(36591, 'feat(tool-router): indexed routing', '칸: TOOL-ROUTING-DEFAULT-FLIP', 'src/tool-router/index.ts', '2026-11-10T09:10:44Z'),
+      pr(36491, 'graph HITL binding seam', '칸: GRAPH-HITL-BINDING-SEAM', 'src/graph-runner/runner.ts', '2026-11-10T09:11:58Z'),
+      pr(36571, 'activate compatible plugins concurrently', 'PluginHost activates compatible plugins concurrently', 'src/tool-router/index.ts', '2026-11-10T14:04:11Z'),
+      pr(36432, 'fix installer profile fallback', 'Install profile fallback', 'scripts/install.ps1', '2026-11-09T23:52:57Z'),
+      pr(36611, 'fix installer SYSTEM data home', 'ProgramData fallback', 'scripts/install.ps1', '2026-11-10T14:26:13Z'),
+      pr(35723, 'GATE-CLOSURE-LAZY-REQUIRE', 'GATE-CLOSURE-LAZY-REQUIRE', 'scripts/release-loop/gate-closure.ts', '2026-11-07T23:10:05Z'),
+      { number: 36594, state: 'MERGED', baseRefName: 'main', title: 'stop repeated boundary rejection loops',
+        body: 'HARNESS-BOUNDARY-REJECT-LOOP-GUARD: live supervisor is src/self-dev/run-supervisor.ts', mergedAt: '2026-11-10T10:13:51Z',
+        files: [{ path: 'src/self-dev/run-supervisor.ts' }] },
+      pr(99999, 'wrong base', '칸: GRAPH-HITL-BINDING-SEAM', 'src/graph-runner/runner.ts', '2026-11-10T15:00:00Z'),
+    ].map((entry, index) => index === 7 ? { ...entry, baseRefName: 'release' } : entry);
+
+    const proposals = proposeStaleMergedChecklistGreens(cells, prs);
+    expect(proposals.map(({ id }) => id)).toEqual(cells.map(({ id }) => id));
+    expect(proposals.map(({ id, prs: rows }) => [id, rows.map(({ number }) => number).sort()])).toEqual([
+      ['TOOL-ROUTING-DEFAULT-FLIP', [36571, 36591]],
+      ['GRAPH-HITL-BINDING-SEAM', [36491]],
+      ['PLUGIN-MULTI-ACTIVE', [36571, 36591]],
+      ['WIN-INSTALL-SYSTEM-PROFILE', [36432, 36611]],
+      ['GATE-CLOSURE-LAZY-REQUIRE', [35723]],
+      ['HARNESS-BOUNDARY-REJECT-LOOP-GUARD', [36594]],
+    ]);
+    const pathOnly = proposals.find(({ id }) => id === 'PLUGIN-MULTI-ACTIVE')!.prs[0]!;
+    expect(pathOnly).toMatchObject({ cellIdMentioned: false, ambiguousWith: ['TOOL-ROUTING-DEFAULT-FLIP'], matchedPaths: ['src/tool-router/index.ts'], evidenceRef: '#36571' });
+    expect(proposals.find(({ id }) => id === 'HARNESS-BOUNDARY-REJECT-LOOP-GUARD')).toMatchObject({
+      proposalKind: 'target-path-repair', targetPaths: ['src/harness/run-supervisor.ts'],
+      prs: [{ number: 36594, matchKind: 'cell-id-path-mismatch', matchedPaths: [], changedPaths: ['src/self-dev/run-supervisor.ts'], cellIdMentioned: true }],
+    });
+    expect(cells.every(({ status }) => status === 'yellow')).toBe(true);
+    expect(proposals.every(({ status, currentStatus }) => status === 'proposed' && currentStatus === 'yellow')).toBe(true);
+  });
+
+  test('keeps a target-path repair proposal beside a separate path match for the same cell', () => {
+    const cell = item('CELL-A');
+    cell.title = '대상 경로: src/expected.ts';
+    const proposals = proposeStaleMergedChecklistGreens([cell], [
+      { number: 1, state: 'MERGED', baseRefName: 'main', title: 'matching', body: 'CELL-A', mergedAt: '2026-11-10T00:00:00Z', files: [{ path: 'src/expected.ts' }] },
+      { number: 2, state: 'MERGED', baseRefName: 'main', title: 'CELL-A path drift', body: '', mergedAt: '2026-11-11T00:00:00Z', files: [{ path: 'src/actual.ts' }] },
+    ]);
+    expect(proposals.map(({ proposalKind }) => proposalKind)).toEqual(['green', 'target-path-repair']);
+    expect(proposals.map(({ prs: rows }) => rows[0]?.number)).toEqual([1, 2]);
+    expect(cell.status).toBe('yellow');
+  });
+
+  test('target-path intersection remains primary evidence when the PR names another cell', () => {
+    const cell = item('CELL-A');
+    cell.title = '대상 경로: src/target.ts';
+    const proposals = proposeStaleMergedChecklistGreens([cell], [{ number: 3, state: 'MERGED', baseRefName: 'main',
+      title: 'CELL-B', body: '', mergedAt: '2026-11-11T00:00:00Z', files: [{ path: 'src/target.ts' }] }]);
+    expect(proposals).toMatchObject([{ id: 'CELL-A', proposalKind: 'green', prs: [{ cellIdMentioned: false, matchedPaths: ['src/target.ts'] }] }]);
+  });
+
   test('unreadable TA binding prevents the legacy green judge path', () => {
     const f = fixture([item('X')], 'unrelated', '칸: X');
     try {

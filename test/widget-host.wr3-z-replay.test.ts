@@ -224,54 +224,6 @@ describe('fader widget WR-3 opt-in', () => {
   });
 });
 
-// ── Playground built-in opt-in (Bundle 7W · WR-3) ───────
-
-describe('playground widget WR-3 opt-in', () => {
-  test('replayState clamps cursor to visible entry + emits telemetry', async () => {
-    const { default: playgroundWidget } = await import('../src/playground/widget.js');
-    const emitted: Array<{ kind: string; data?: Record<string, unknown> }> = [];
-    const seen: Array<{ category: string }> = [];
-    const off = debug.registerSink({
-      name: 'widget-replay-playground-success',
-      emit: (record) => seen.push({ category: record.category }),
-    });
-    try {
-      const host = new WidgetHost({
-        log: () => {},
-        requestRender: () => {},
-        telemetry: { emit: (ev) => emitted.push({ kind: ev.kind, data: ev.data }) },
-      });
-      host.register(playgroundWidget);
-      const inst = host.spawn({ type: 'playground' });
-      host.replayState(inst.id, {
-        cursor: 0,
-        previewSize: 'large' as const,
-        size: 'large' as const,
-        groupOpen: { ux: true, widget: true, modal: true },
-        browserScroll: 0,
-        slots: [],
-        focused: false,
-        mode: 'edit' as const,
-        scenarioPalette: [],
-        scenarioPaletteCursor: 0,
-        themeOptions: [],
-        themeCursor: 0,
-        presetOptions: [],
-        presetCursor: 0,
-        showcaseOptions: [],
-        showcaseCursor: 0,
-      } as never);
-      const replayEvents = emitted.filter((e) => e.kind === 'playground.replay');
-      expect(replayEvents.length).toBe(1);
-      expect(replayEvents[0]!.data).toMatchObject({ mode: 'edit', previewSize: 'large' });
-      expect(host.get(inst.id)!.state).toMatchObject({ mode: 'edit', previewSize: 'large' });
-      expect(seen.filter((record) => record.category === 'widget.replay-state.override.error')).toHaveLength(0);
-    } finally {
-      off();
-    }
-  });
-});
-
 // ── Scratch built-in opt-in ─────────────────────────────
 
 describe('scratch widget WR-3 opt-in', () => {

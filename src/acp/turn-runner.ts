@@ -56,7 +56,7 @@ import {
   type RelayToolUpdate,
 } from '../channel/agent-event-relay.js';
 import { spillFileName } from '../channel/file-sink.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 // ── Surface-scoped HITL for delegated ACP turns ───────────────────
 //

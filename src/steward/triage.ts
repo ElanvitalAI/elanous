@@ -4,7 +4,7 @@ import { launchModeOf, rescueAllows } from './rescue.js';
 import { join } from 'node:path';
 import { fetchLinearIssues } from '../connectors/linear.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { loopEvent } from '../loops/observe.js';

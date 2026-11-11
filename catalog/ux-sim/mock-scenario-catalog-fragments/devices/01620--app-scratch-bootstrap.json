@@ -1,0 +1,13 @@
+{
+  "id": "app-scratch-bootstrap",
+  "name": "Empty-folder app bootstrap planner simulation",
+  "implementation": ["src/ux-sim/app-scratch-bootstrap.ts", "src/self-dev/app-scratch-bootstrap.ts"],
+  "tests": ["src/ux-sim/app-scratch-bootstrap.test.ts"],
+  "target": "Exercises the app bootstrap planner against synthetic requests and folder states; never initializes Git or writes project files.",
+  "inputs": ["synthetic app requests", "empty, populated, and existing Git folder states", "natural-language dispatch state"],
+  "observations": ["only an explicitly selected empty non-Git folder is eligible for preparation", "existing files, repositories, and unrelated requests are preserved"],
+  "entryCommands": ["bun test src/ux-sim/app-scratch-bootstrap.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

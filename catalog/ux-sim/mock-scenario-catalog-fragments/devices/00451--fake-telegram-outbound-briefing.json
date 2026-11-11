@@ -1,0 +1,13 @@
+{
+  "id": "fake-telegram-outbound",
+  "name": "Fake generic notification text and actions",
+  "implementation": ["src/ux-sim/fake-telegram-outbound.ts"],
+  "tests": ["src/ux-sim/fake-telegram-outbound.test.ts"],
+  "target": "Surface-neutral notify.channel@1 text, actions, refId, and dedupKey boundary with no network access; legacy briefingId/buttons remain optional",
+  "inputs": ["text", "optional message kind/actions/refId/dedupKey", "optional legacy briefing ID/buttons", "injected success or failure"],
+  "observations": ["send call count", "delivered generic receipts", "failure does not create a receipt", "generic and legacy fields are preserved independently"],
+  "entryCommands": ["bun test src/ux-sim/fake-telegram-outbound.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -18,7 +18,9 @@ import type { NexusEvent } from '../state/state.js';
 import type { NexusEventBus } from './event-bus.js';
 import { SSE_HEARTBEAT_MS } from './sse-heartbeat.js';
 
-export function handleSseEvents(bus: NexusEventBus, url: URL): Response {
+export function handleSseEvents(bus: NexusEventBus, url: URL, memberScope?: string | { readonly operatorBriefings: true }): Response {
+  const memberId = typeof memberScope === 'string' ? memberScope : undefined;
+  const operatorBriefings = typeof memberScope === 'object' && memberScope !== null && memberScope.operatorBriefings === true;
   const raw = url.searchParams.get('topics') ?? '';
   const prefixes = raw.split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -44,6 +46,11 @@ export function handleSseEvents(bus: NexusEventBus, url: URL): Response {
         // App rows contain tenant data. They are available only from the
         // bearer-gated app-scoped endpoint, never from this public stream.
         if (ev.kind.startsWith('app.row.')) return;
+        // Board and briefing payloads are member-owned. A client-side filter
+        // is not an authorization boundary, so require the owner scope that
+        // routeRequest resolved through /v1/members/owner.
+        if (ev.kind.startsWith('board.card') && (!memberId || ev.memberId !== memberId)) return;
+        if (ev.kind.startsWith('briefing.ready') && !(memberId && ev.memberId === memberId) && !operatorBriefings) return;
         send(`event: ${ev.kind}\n`);
         send(`data: ${JSON.stringify(ev)}\n\n`);
       };

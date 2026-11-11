@@ -1,0 +1,4 @@
+{
+  "deviceKey": "win-1-outbound-guard-sim",
+  "review": "# 📅 2026-11-10 재검토 (WIN-1 · OUTBOUND-GUARD-SIM) — 하이브리드 RFC I2의 source=real 출구 조건과 가짜 클라우드 이미지 비용 사건을 장치·매뉴얼에 추가했다. 외부 sink는 주입된 가짜 함수만 사용하고 나머지 provenance는 sim.leak-blocked로 차단한다."
+}

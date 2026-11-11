@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { MOUSE_RESIDUE_WINDOW_MS, MouseResidueGuard, applyComposerKey, composerViewport, emptyComposer, wheelDirection } from './composer.js';
+import { MOUSE_RESIDUE_WINDOW_MS, MouseResidueGuard, applyComposerKey, composerViewport, emptyComposer, replaceSlashPickerQuery, wheelDirection } from './composer.js';
 import { createInlineEditorState } from '../../input-core/inline-editor.js';
 import { KeyStreamParser, ansi, type Key } from '../../tui.js';
 
@@ -114,6 +114,49 @@ test('long input and backspace keep the current edit position visible at 20 colu
   const after = composerViewport(applyComposerKey(full, { name: 'backspace', ctrl: false, shift: false }).state, 20);
   expect(after.line).not.toContain('y');
   expect(after.line).toContain('x');
+});
+
+test('Shift+Enter, Alt+Enter and Ctrl+J add lines; the viewport grows and shrinks around the cursor', () => {
+  const parser = new KeyStreamParser();
+  const keys = [
+    parser.push('\x1b[13;2u')[0]!, // Kitty Shift+Enter
+    parser.push('\x1b[27;2;13~')[0]!, // xterm modifyOtherKeys Shift+Enter
+    parser.push('\x1b\r')[0]!, // legacy Alt+Enter
+    parser.push('\n')[0]!, // xterm Ctrl+J
+  ];
+  let state = createInlineEditorState('a');
+  for (const key of keys) {
+    const result = applyComposerKey(state, key);
+    expect(result.action).toBe('edit');
+    state = applyComposerKey(result.state, { name: 'b', ctrl: false, shift: false }).state;
+  }
+  expect(state.text).toBe('a\nb\nb\nb\nb');
+  const grown = composerViewport(state, { columns: 20, maxRows: 3 }); // Source: #36752 small-screen composer height cap.
+  expect(grown.lines).toHaveLength(3);
+  expect(grown.lines.at(-1)).toContain('b');
+  expect(grown.cursorRow).toBe(2);
+  const shrunk = composerViewport(createInlineEditorState('a'), { columns: 20, maxRows: 3 }); // Source: #36752 small-screen composer height cap.
+  expect(shrunk.lines).toEqual(['❯ a']);
+  expect(applyComposerKey(state, { name: 'enter', ctrl: false, shift: false }).submitted).toBe(state.text);
+});
+
+test('cursor follows an automatic wrap before the next grapheme and after a full final row', () => {
+  const boundary = composerViewport({ text: 'abcX', cursor: 3 }, { columns: 5, maxRows: 2 }); // Source: #36682
+  expect(boundary.lines).toEqual(['❯ abc', '  X']);
+  expect(boundary.cursorRow).toBe(1); // Source: #36682
+  expect(boundary.cursorCol).toBe(3); // Source: #36682
+  const atEnd = composerViewport({ text: 'abc', cursor: 3 }, { columns: 5, maxRows: 2 }); // Source: #36682
+  expect(atEnd.lines).toEqual(['❯ abc', '  ']);
+  expect(atEnd.cursorRow).toBe(1); // Source: #36682
+  expect(atEnd.cursorCol).toBe(3); // Source: #36682
+  const beforeNewline = composerViewport({ text: 'ab\nX', cursor: 2 }, { columns: 5, maxRows: 2 }); // Source: #36682
+  expect(beforeNewline.cursorRow).toBe(0); // Source: #36682
+});
+
+test('slash picker selection replaces only the query before the cursor and preserves trailing draft text', () => {
+  expect(replaceSlashPickerQuery({ text: '/com arg tail', cursor: 4 }, '/compact')).toEqual({
+    text: '/compact arg tail', cursor: 8,
+  });
 });
 
 test('a bracketed paste inserts its body, not the key name «paste» (TUI-HERDR-NAMED-AGENT)', () => {

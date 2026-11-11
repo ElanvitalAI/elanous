@@ -1,0 +1,6 @@
+world: novice-versioning
+seed: 1109
+github:
+  repo: novice/versioning-app
+  openPRs: 0
+events: []

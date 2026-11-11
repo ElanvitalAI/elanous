@@ -58,8 +58,11 @@ export function blockWriteToolSearchHydration(result: ToolSearchRunResult): Tool
 export const toolSearchRuntime: ToolRuntime<ToolSearchArgs, ToolSearchRunResult> = {
   id: 'tool_search',
   spec: buildToolSearchTool(),
-  async run(req: ToolSearchArgs, _ctx: ToolRuntimeContext): Promise<ToolSearchRunResult> {
-    const result = dispatchToolSearch(req);
+  async run(req: ToolSearchArgs, ctx: ToolRuntimeContext): Promise<ToolSearchRunResult> {
+    const result = dispatchToolSearch(req, {
+      ...(ctx.surfaceSpecs ? { specs: ctx.surfaceSpecs } : {}),
+      surface: ctx.surface,
+    });
     const hydrated = result[HYDRATED_TOOLS_KEY];
     return {
       output: result.content,

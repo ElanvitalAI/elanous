@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChecklistItem } from './checklist.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { RubricAxis } from './rubric-types.js';
 export type { RubricAxis } from './rubric-types.js';
 

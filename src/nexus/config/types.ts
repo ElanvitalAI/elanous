@@ -96,6 +96,8 @@ export interface GlobalConfig {
   nexus?: {
     autoRestartOnConfigChange?: boolean;
     template?: string;
+    /** Maximum age in milliseconds for an app simulation receipt accepted for live promotion. */
+    appPromoteReceiptTtlMs?: number;
     // N-1 cleanup PR g.3 — first-boot welcome card dismiss flag.
     // Set to true the first time the user dismisses the chat-tab
     // welcome card. Subsequent boots skip the card.

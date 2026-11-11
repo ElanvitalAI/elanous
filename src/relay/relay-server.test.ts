@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { acceptDaemonChannel, generateDaemonKeyPair, MAX_FRAME_BYTES, serverIdFromPublicKey } from './channel.js';
 import { MuxDecoder, MuxEncoder, MuxStreamState } from './mux.js';
-import { challengeMessage, loadTrustedHostKeys, parsePublicAppHost, resolvePublicAppUserId, startRelayServer } from './relay-server.js';
+import { challengeMessage, loadRelayCustomDomainRoutes, loadTrustedHostKeys, parsePublicAppHost, resolvePublicAppUserId, startRelayServer } from './relay-server.js';
 import { validateRelayPublicOptions } from './relay-cli.js';
 
 type Relay = ReturnType<typeof startRelayServer>;
@@ -17,6 +17,12 @@ const inbox = new WeakMap<WebSocket, Message[]>();
 const waiters = new WeakMap<WebSocket, (value: Message) => void>();
 const closeEvents = new WeakMap<WebSocket, CloseEvent>();
 const closeWaiters = new WeakMap<WebSocket, (value: CloseEvent) => void>();
+// Source: RFC 9110 §15.5.5 defines 404 as Not Found for an unregistered custom host.
+const CUSTOM_HOST_NOT_FOUND_STATUS = 404;
+// Source: RFC 9110 §15.3.1 defines the successful HTTP response used by this relay fixture.
+const CUSTOM_HOST_OK_STATUS = 200;
+// Source: MuxStreamState fixtures begin with stream id one in this test module.
+const CUSTOM_HOST_FIRST_STREAM_ID = 1;
 const signing = () => {
   const pair = generateKeyPairSync('ed25519');
   const publicKey = pair.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
@@ -132,12 +138,112 @@ describe('Bun encrypted-frame relay', () => {
     expect(correctUserOffline.status).toBe(503);
   });
 
+  test('custom relay hosts require verified ownership, pinned user, and a ready certificate', () => {
+    const key = signing();
+    expect(() => startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]), publicDomain: 'elanous.app',
+      publicServerId: key.id, publicUserId: 'alice', customDomainRoutes: new Map([['notes.example.test',
+        { app: 'notes', user: 'alice', ownershipVerified: false, certificateReady: true }]]) }))
+      .toThrow('invalid or unverified custom domain route');
+    expect(() => startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]), publicDomain: 'elanous.app',
+      publicServerId: key.id, publicUserId: 'alice', customDomainRoutes: new Map([['notes.example.test',
+        { app: 'notes', user: 'bob', ownershipVerified: true, certificateReady: true }]]) }))
+      .toThrow('invalid or unverified custom domain route');
+    expect(() => startRelayServer({ trustedHostKeys: new Map([[key.id, key.publicKey]]), publicDomain: 'elanous.app',
+      publicServerId: key.id, publicUserId: 'alice', customDomainRoutes: new Map([['notes--alice.elanous.app',
+        { app: 'other', user: 'alice', ownershipVerified: true, certificateReady: true }]]) }))
+      .toThrow('invalid or unverified custom domain route');
+  });
+
+  test('custom domain config loader admits only verified routes from an owner-only file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'relay-custom-domain-'));
+    const file = join(dir, 'routes.json');
+    try {
+      // Source: relay config files follow the owner-only mode contract used by loadRelayPublicListing.
+      writeFileSync(file, JSON.stringify({ domains: [{ hostname: 'notes.example.test', app: 'notes', user: 'alice', ownershipVerified: true, certificateReady: true }] }), { mode: 0o600 });
+      expect(loadRelayCustomDomainRoutes(file).get('notes.example.test'))
+        .toEqual({ app: 'notes', user: 'alice', ownershipVerified: true, certificateReady: true });
+      writeFileSync(file, JSON.stringify({ domains: [{ hostname: 'notes.example.test', app: 'notes', user: 'alice', ownershipVerified: false, certificateReady: true }] }), { mode: 0o600 });
+      expect(() => loadRelayCustomDomainRoutes(file)).toThrow('custom domain route is not verified');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('routes a verified custom host to its pinned app host and fails closed on other hostnames', async () => {
+    const signingKey = generateKeyPairSync('ed25519');
+    const signingPublicKey = signingKey.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
+    // Source: deterministic test-only X25519 seed already used by public relay forwarding coverage.
+    const daemonKeys = await generateDaemonKeyPair(new Uint8Array(32).fill(21));
+    const serverId = serverIdFromPublicKey(daemonKeys.publicKey);
+    const server = startRelayServer({ trustedHostKeys: new Map([[serverId, signingPublicKey]]), publicDomain: 'elanous.app',
+      publicServerId: serverId, publicUserId: 'alice', customDomainRoutes: new Map([['notes.example.test',
+        { app: 'notes', user: 'alice', ownershipVerified: true, certificateReady: true }]]) });
+    servers.push(server);
+    // Source: RFC 9110 §15.5.5; custom host absent from the verified route projection is not found.
+    const unknown = await fetch(`http://127.0.0.1:${server.port}/hello`, { headers: { host: 'unknown.example.test' } });
+    expect(unknown.status).toBe(CUSTOM_HOST_NOT_FOUND_STATUS);
+    const hostSocket = await connected(`ws://127.0.0.1:${server.port}/host?serverId=${serverId}`);
+    const challenge = JSON.parse(await next(hostSocket) as string) as { nonce: string };
+    hostSocket.send(JSON.stringify({ type: 'auth', publicKey: signingPublicKey,
+      signature: sign(null, challengeMessage(serverId, challenge.nonce), signingKey.privateKey).toString('base64url') }));
+    expect(JSON.parse(await next(hostSocket) as string)).toEqual({ type: 'authenticated', capabilities: ['public-http-v1'] });
+    hostSocket.send(JSON.stringify({ type: 'host-public-key', publicKey: Buffer.from(daemonKeys.publicKey).toString('base64url') }));
+    expect(JSON.parse(await next(hostSocket) as string)).toEqual({ type: 'host-public-key-accepted' });
+
+    const responsePromise = fetch(`http://127.0.0.1:${server.port}/hello`, {
+      headers: { host: 'notes.example.test', origin: 'https://notes.example.test' },
+    });
+    const taggedPhoneKey = await next(hostSocket) as Uint8Array;
+    const clientId = new DataView(taggedPhoneKey.buffer, taggedPhoneKey.byteOffset, 4).getUint32(0, false);
+    const channel = await acceptDaemonChannel(daemonKeys, taggedPhoneKey.subarray(4));
+    if (!channel.ok) throw new Error(channel.reason);
+    const streams = new MuxStreamState();
+    const decoder = new MuxDecoder(streams);
+    const encoder = new MuxEncoder(streams);
+    const requestOpen = await next(hostSocket) as Uint8Array;
+    const opened = channel.value.open(requestOpen.subarray(4));
+    if (!opened.ok) throw new Error(opened.reason);
+    const openFrame = decoder.decode(opened.value);
+    if (!openFrame.ok || openFrame.value.kind !== 'open') throw new Error('expected public HTTP open frame');
+    expect(openFrame.value.headers.host).toBe('notes.app.localhost');
+    expect(openFrame.value.headers['x-forwarded-host']).toBeUndefined();
+    expect(openFrame.value.headers.origin).toBe('http://notes.app.localhost');
+    const requestEnd = await next(hostSocket);
+    if (!(requestEnd instanceof Uint8Array)) throw new Error('expected encrypted request end frame');
+    const ended = channel.value.open(requestEnd.subarray(4));
+    if (!ended.ok) throw new Error(ended.reason);
+    expect(decoder.decode(ended.value)).toEqual({ ok: true, value: { streamId: CUSTOM_HOST_FIRST_STREAM_ID, kind: 'end' } });
+
+    const envelope = new TextEncoder().encode(JSON.stringify({ status: CUSTOM_HOST_OK_STATUS, headers: {
+      'x-nexus-app-origin': 'http://notes.app.localhost', 'x-nexus-app-host': 'notes.app.localhost',
+      'access-control-allow-origin': 'http://notes.app.localhost', 'location': 'http://notes.app.localhost/result',
+    }, body: Buffer.from('custom host ok').toString('base64') }));
+    const responseData = encoder.encode({ streamId: CUSTOM_HOST_FIRST_STREAM_ID, kind: 'data', data: envelope });
+    if (!responseData.ok) throw new Error(responseData.reason);
+    const encryptedData = channel.value.seal(responseData.value);
+    if (!encryptedData.ok) throw new Error(encryptedData.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedData.value));
+    const responseClose = encoder.encode({ streamId: CUSTOM_HOST_FIRST_STREAM_ID, kind: 'close', reason: '' });
+    if (!responseClose.ok) throw new Error(responseClose.reason);
+    const encryptedClose = channel.value.seal(responseClose.value);
+    if (!encryptedClose.ok) throw new Error(encryptedClose.reason);
+    hostSocket.send(toIdBytes(clientId, encryptedClose.value));
+    const response = await responsePromise;
+    expect(response.status).toBe(CUSTOM_HOST_OK_STATUS);
+    expect(response.headers.get('x-nexus-app-origin')).toBe('https://notes.example.test');
+    expect(response.headers.get('x-nexus-app-host')).toBe('notes.example.test');
+    expect(response.headers.get('access-control-allow-origin')).toBe('https://notes.example.test');
+    expect(response.headers.get('location')).toBe('https://notes.example.test/result');
+    expect(await response.text()).toBe('custom host ok');
+    expect(JSON.parse(await next(hostSocket) as string)).toMatchObject({ type: 'client-disconnected', clientId });
+  });
+
   test('public mode forwards a valid invited-app host request through the authenticated host channel', async () => {
     const signingKey = generateKeyPairSync('ed25519');
     const signingPublicKey = signingKey.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
     const daemonKeys = await generateDaemonKeyPair(new Uint8Array(32).fill(21));
     const serverId = serverIdFromPublicKey(daemonKeys.publicKey);
-    const server = startRelayServer({ trustedHostKeys: new Map([[serverId, signingPublicKey]]), publicDomain: 'elanous.app', publicServerId: serverId, publicUserId: 'alice' });
+    const server = startRelayServer({ trustedHostKeys: new Map([[serverId, signingPublicKey]]), publicDomain: 'elanous.app', publicServerId: serverId, publicUserId: 'alice',
+      appKillSwitch: { isDown: (userId, appId) => userId === 'alice' && appId === 'blocked',
+        applyIncident: () => { throw new Error('unexpected report'); } } });
     servers.push(server);
     const hostSocket = await connected(`ws://127.0.0.1:${server.port}/host?serverId=${serverId}`);
     const challenge = JSON.parse(await next(hostSocket) as string) as { nonce: string };
@@ -146,9 +252,12 @@ describe('Bun encrypted-frame relay', () => {
     expect(JSON.parse(await next(hostSocket) as string)).toEqual({ type: 'authenticated', capabilities: ['public-http-v1'] });
     hostSocket.send(JSON.stringify({ type: 'host-public-key', publicKey: Buffer.from(daemonKeys.publicKey).toString('base64url') }));
     expect(JSON.parse(await next(hostSocket) as string)).toEqual({ type: 'host-public-key-accepted' });
+    const blocked = await fetch(`http://127.0.0.1:${server.port}/hello`, { headers: { host: 'blocked--alice.elanous.app' } });
+    expect(blocked.status).toBe(403);
+    expect(server.stats(serverId).publicRequests).toBe(0);
     const responsePromise = fetch(`http://127.0.0.1:${server.port}/hello`, {
       headers: { host: 'notes--alice.elanous.app', origin: 'https://notes--alice.elanous.app:444',
-        connection: 'x-private-hop, keep-alive', 'x-private-hop': 'must-not-forward' },
+        connection: 'x-private-hop, keep-alive', 'x-private-hop': 'must-not-forward', authorization: 'Bearer emt_test' },
     });
     const taggedPhoneKey = await next(hostSocket) as Uint8Array;
     const clientId = new DataView(taggedPhoneKey.buffer, taggedPhoneKey.byteOffset, 4).getUint32(0, false);
@@ -167,6 +276,7 @@ describe('Bun encrypted-frame relay', () => {
     expect(openFrame.value.headers.origin).toBe('https://notes--alice.elanous.app:444');
     expect(openFrame.value.headers.connection).toBeUndefined();
     expect(openFrame.value.headers['x-private-hop']).toBeUndefined();
+    expect(openFrame.value.headers.authorization).toBe('Bearer emt_test');
     const requestEnd = await next(hostSocket);
     if (!(requestEnd instanceof Uint8Array)) throw new Error(`expected encrypted request end frame, received control: ${requestEnd}`);
     const ended = channel.value.open(requestEnd.subarray(4));

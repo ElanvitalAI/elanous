@@ -81,7 +81,7 @@ export interface DisplayControlDeps {
    *  the right-click dispatcher uses; tests use an in-memory stub. */
   contextMenuRegistry?: ContextMenuRegistry;
   /** S1.D — tooltip resolver. The dashboard wires this to
-   *  `mouseWiring.getTooltipFor(target)` so an LLM can ask
+   *  a surface resolver so an LLM can ask
    *  "what does the pill say?" without having to first hover. */
   tooltipResolver?: (target: HitTarget) => string | null;
 }
@@ -729,7 +729,7 @@ export function openContextMenuRuntime(): ToolRuntime<Args, Out> {
 //
 // Look up the tooltip text the dashboard would render on stable-hover
 // for a given hit target. Uses the injected resolver (wired to
-// `mouseWiring.getTooltipFor` at runtime). Returns null when no
+// a surface resolver at runtime). Returns null when no
 // resolver provides a tooltip for the target — distinct from
 // `ok:false` which signals a contract problem (missing dep / bad args).
 

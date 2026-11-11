@@ -1724,11 +1724,6 @@ describe('selfImplementRuntime — harness progress wiring', () => {
     expect(deliveries[0]!.callbackFailed as number).toBeGreaterThan(0);
   });
 
-  test('이 골이 더한 onProgress 배선을 지우면 위 검사가 그 결손을 잡는다', () => {
-    const source = readFileSync(new URL('./self-implement-runtime.ts', import.meta.url), 'utf8');
-    expect(source).toContain('onProgress: resolveHarnessProgressSink(ctx)');
-    expect(source).toMatch(/seamsFactory\(\{[\s\S]*onProgress: resolveHarnessProgressSink\(ctx\),/);
-  });
 });
 
 describe('selfImplementRuntime — opt-in non-blocking return', () => {
@@ -1905,15 +1900,6 @@ describe('selfImplementRuntime — opt-in non-blocking return', () => {
     }
   });
 
-  test('이 골이 더한 비블로킹 분기를 지우면 위 검사가 그 결손을 잡는다', () => {
-    const source = readFileSync(new URL('./self-implement-runtime.ts', import.meta.url), 'utf8');
-    expect(source).toContain("debug.log('self-implement', 'runtime.invocation-mode'");
-    expect(source).toContain('if (nonBlocking)');
-    expect(source).toContain("invocationMode: 'non-blocking'");
-    expect(source).toContain('const drive = async (runId?: string)');
-    expect(source).toContain('void drive(runId)');
-    expect(source).toMatch(/non_blocking:\s*\{\s*type:\s*'boolean'/);
-  });
 
   function installFakeHarnessSeams(): void {
     _setAutoOpenPrConfigReaderForTesting(() => false);

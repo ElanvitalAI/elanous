@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { expect, test } from 'bun:test';
@@ -30,10 +30,13 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim s
     'AUTHOR-PRECHECK-REJECTED-UNPROVABLE', 'SAFE-PUBLIC-COPY-PUBLISH-REDACTION', 'SW-FREEZE', 'SIM-HQ-MOVE', 'SIM-CHAIN-LAND',
     'UX-MS-13', 'APP-CONTRACT-SECRET-ENTROPY', 'APP-SOURCE-SNAPSHOT', 'APP-WEB-DRIVE-TENANT', 'GIT-PUSH-TIMEOUT-PARTIAL-OUTCOME-REMOTE-VERIFY',
     'GOOGLE-DRIVE-LIST-READONLY', 'UX-MS-POD-PHASE-PREWARM', 'RLA-LAUNCH-COUNTDOWN-1107', 'UX-MS-POD-PHASE-PREWARM-HIT',
-    'TASK-TEMP-CLEANUP', 'SIM-RELEASE-SAME-VERSION-RUN-ADOPTION',
+    'TASK-TEMP-CLEANUP', 'SIM-RELEASE-SAME-VERSION-RUN-ADOPTION', 'SIMKIT-RECEIPT-BADGE',
     'GRAPH-RESUME-ANY-ENTRY-SIM',
     'FLUTTER-DEPLOY-JOURNEY',
     'SEAT-MAIL-WAKE-ALL-ADDRESSES',
+    // Source: catalog/ux-sim/mock-scenario-catalog-fragments/scenarios/01030-01032 graph lifecycle scenarios.
+    'GRAPH-RUN-LIFECYCLE-PAUSE-OWNER-DEATH', 'GRAPH-RUN-LIFECYCLE-CANCEL-OWNER-DEATH', 'GRAPH-RUN-LIFECYCLE-FORK-OWNER-DEATH',
+    'FAKE-AGENT-HOOK-HOST-DELIVERY-ACK',
   ]);
   expect(catalog.runEvidence.scope).toContain('ScenarioV0 YAML runs only');
   expect(catalog.worldEvents.map((event) => event.id)).toEqual(['EV-0042', 'EV-0107', 'hq-move',
@@ -50,7 +53,8 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim s
   expect(catalog.candidateAudit.sourceRows).toBe(36);
   expect(catalog.candidateAudit.existingPaths).toBe(35);
   expect(catalog.candidateAudit.excludedPaths).toBe(catalog.candidateAudit.candidates.filter((candidate) => candidate.disposition === 'excluded').length);
-  expect(catalog.candidateAudit.candidates).toHaveLength(62);
+  // Source: catalog/ux-sim/mock-scenario-catalog-fragments/candidates/ after lifecycle-world registration.
+  expect(catalog.candidateAudit.candidates).toHaveLength(66);
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/safe-public-copy-publish.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/seminar-rehearsal.test.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'scripts/release-loop/gate-bisect.ts' }));
@@ -61,7 +65,7 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim s
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/release-same-version-run-adoption-sim.test.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/graph-resume-any-entry.ts' }));
   expect(catalog.candidateAudit.catalogAdditions).toContainEqual(expect.objectContaining({ path: 'src/ux-sim/graph-resume-any-entry.test.ts' }));
-  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(62);
+  expect(catalog.candidateAudit.candidates.filter((candidate) => existsSync(join(REPO, candidate.path)))).toHaveLength(66);
   expect(catalog.candidateAudit.sourceExclusions).toHaveLength(1);
   expect(catalog.candidateAudit.sourceExclusions[0]).toMatchObject({ path: 'scenarios/ux-sim/MK-MS-01.yaml' });
   expect(catalog.candidateAudit.sourceExclusions[0]?.reason).toContain('#34039');
@@ -113,6 +117,21 @@ test('catalog schema, scenario/device links, evidence contract, and all ux-sim s
   expect(boundaryFor('src/ux-sim/fault-pool-cap.ts')).toContain('omitted :N default capacity');
   expect(boundaryFor('src/ux-sim/fake-browser-page.ts')).toContain('CDP page navigation');
   expect(boundaryFor('src/ux-sim/fake-cloud-vm.ts')).toContain('never calls a cloud provider');
+  expect(catalog.devices.find((device) => device.id === 'fake-cloud-billing-world')).toMatchObject({
+    checklistCells: ['REHEARSAL-IMAGE-BAKE', 'GUARDIAN-TRAIN-WORKER-LIFECYCLE', 'RLA-CLOUD-ELASTIC'],
+    implementation: ['src/ux-sim/fake-cloud-billing-world.ts', 'src/ux-sim/fake-cloud-vm.ts', 'src/ux-sim/fake-clock.ts'],
+    tests: ['src/ux-sim/fake-cloud-billing-world.test.ts'],
+  });
+  expect(catalog.devices.find((device) => device.id === 'fake-cloud-billing-world')?.entryCommands).toEqual([
+    'bun test src/ux-sim/fake-cloud-billing-world.test.ts -t REHEARSAL-IMAGE-BAKE',
+    'bun test src/ux-sim/fake-cloud-billing-world.test.ts -t GUARDIAN-TRAIN-WORKER-LIFECYCLE',
+    'bun test src/ux-sim/fake-cloud-billing-world.test.ts -t RLA-CLOUD-ELASTIC',
+    'bun test src/ux-sim/fake-cloud-billing-world.test.ts',
+  ]);
+  expect(sourceModules.get('src/ux-sim/fake-cloud-billing-world.ts')).toMatchObject({
+    id: 'MD-UX-SIM-FAKE-CLOUD-BILLING-WORLD-TS',
+    deviceIds: ['fake-cloud-billing-world'],
+  });
   expect(boundaryFor('src/ux-sim/fake-fleet.ts')).toContain('per-context Kubernetes fixtures');
   expect(boundaryFor('src/ux-sim/fault-glm-no-credential.ts')).toContain('credential absent');
   expect(boundaryFor('src/ux-sim/in-process-cli.ts')).toContain('registered Commander action');
@@ -247,7 +266,8 @@ test('read-only device registry prints entry, logs, event, recent-use, and omiss
   expect(output).toContain('entry=bun test src/ux-sim/fake-gh.test.ts');
   expect(output).toContain('events=(none recorded)');
   expect(output).toContain('recent=(not recorded)');
-  expect(output).toContain('omission check: required=4 missing=0');
+  // Source: catalog/ux-sim/mock-scenario-catalog-fragments/omission-required-paths/ now registers six paths.
+  expect(output).toContain('omission check: required=6 missing=0');
   expect(output).toContain('MD-UX-SIM-FAKE-CLOCK-TS\tsrc/ux-sim/fake-clock.ts');
   expect(output).toContain('devices=fake-clock');
   expect(output).toContain('certificate=no');
@@ -389,10 +409,15 @@ test('MS-01, MS-04, and MS-07 ask registered devices for independent and disting
   const credential = simGlmNoCredential({ zaiKey: false, openrouterKey: false });
   expect(credential.result).toBe('refused');
   expect(credential.error).toBeTruthy();
-  const temporaryProviderFailure = await simPodCodex503(podCodex503Scenario({ fault: 'overload-503' }));
+  const temporaryProviderFailure = await simPodCodex503(podCodex503Scenario({ fault: 'overload-503', zaiCredentialAvailable: true }));
   const credentialRejected = await simPodCodex503(podCodex503Scenario({ fault: 'auth-401' }));
-  expect(temporaryProviderFailure.result).toBe('zai-fallback');
+  // Source: 내부 문서 `MANUAL-ux-simulation-devices-2026-08-23`; src/oauth/fallback-chain.ts DEFAULT_FALLBACK_CHAIN excludes ZAI.
+  expect(temporaryProviderFailure.result).toBe('no-fallback');
+  // Source: 내부 문서 `MANUAL-ux-simulation-devices-2026-08-23`; ensure injected Codex HTTP path ran.
+  expect(temporaryProviderFailure.scriptedResponses).toBeGreaterThan(0);
+  expect(temporaryProviderFailure.forbiddenZaiAttempts).toBe(0);
   expect(credentialRejected.result).toBe('no-fallback');
+  expect(credentialRejected.error).toMatch(/401/);
 
   const pool = simPoolCap({ spec: 'pool-node-b@node-b', running: { 'pool-node-b': 2 } });
   expect(pool.recommendation).toMatchObject({ recommended: 0, limitedBy: 'pool-cap' });
@@ -410,7 +435,7 @@ test('MS-01, MS-04, and MS-07 ask registered devices for independent and disting
 
 test('list and show render registered scenarios and unknown ids fail closed', () => {
   expect(renderMockScenarioList(catalog).join('\n')).toContain('UX-MS-01\treport-deficit');
-  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 62/63');
+  expect(renderMockScenarioList(catalog).join('\n')).toContain('후보 감사 66/67');
   expect(renderMockScenarioDetails(catalog, 'UX-MS-11').join('\n')).toContain('request-shape 400');
   expect(() => renderMockScenarioDetails(catalog, 'UX-MS-99')).toThrow('unknown mock scenario id');
 });
@@ -422,7 +447,7 @@ test('ux-sim list/show/devices CLI exposes the catalog without launching a simul
   expect(list.stdout).toContain('UX-MS-07');
   expect(list.stdout).toContain('UX-MS-11');
   expect(list.stdout).toContain('UX-MS-12');
-  expect(list.stdout).toContain('후보 감사 62/63');
+  expect(list.stdout).toContain('후보 감사 66/67');
 
   const show = spawnSync('bun', ['scripts/ux-sim.ts', 'show', 'UX-MS-11'], { cwd: REPO, encoding: 'utf8' });
   expect(show.status).toBe(0);
@@ -432,7 +457,7 @@ test('ux-sim list/show/devices CLI exposes the catalog without launching a simul
   expect(devices.status).toBe(0);
   expect(devices.stdout).toContain('Mock device registry · read-only');
   expect(devices.stdout).toContain('recent=(not recorded)');
-  expect(devices.stdout).toContain('omission check: required=4 missing=0');
+  expect(devices.stdout).toContain('omission check: required=6 missing=0');
 
   const unknown = spawnSync('bun', ['scripts/ux-sim.ts', 'show', 'UX-MS-99'], { cwd: REPO, encoding: 'utf8' });
   expect(unknown.status).toBe(2);
@@ -440,13 +465,19 @@ test('ux-sim list/show/devices CLI exposes the catalog without launching a simul
 }, 15000);
 
 test('eln sim devices --json exposes the full catalog through the CLI entry point', () => {
-  const result = spawnSync('bun', ['bin/elanous.mjs', '--test', 'sim', 'devices', '--json'], {
-    cwd: REPO,
-    encoding: 'utf8',
-    timeout: 30000,
-  });
-  expect(result.status, result.stderr).toBe(0);
-  const payload = JSON.parse(result.stdout) as typeof catalog;
+  // Bun truncates captured spawnSync stdout near 256 KiB even with maxBuffer raised; capture to a real file.
+  const root = mkdtempSync(join(tmpdir(), 'sim-devices-json-'));
+  const output = join(root, 'devices.json');
+  const fd = openSync(output, 'w');
+  let payload: typeof catalog;
+  try {
+    const result = spawnSync('bun', ['bin/elanous.mjs', '--test', 'sim', 'devices', '--json'], {
+      // Source: 내부 문서 `MANUAL-ux-simulation-devices-2026-08-23`; bounded CLI catalog fixture.
+      cwd: REPO, encoding: 'utf8', timeout: 30000, stdio: ['ignore', fd, 'pipe'],
+    });
+    expect(result.status, result.stderr).toBe(0);
+    payload = JSON.parse(readFileSync(output, 'utf8')) as typeof catalog;
+  } finally { closeSync(fd); rmSync(root, { recursive: true, force: true }); }
   expect(payload).toEqual(catalog);
   expect(payload.devices.map((device) => device.id)).toEqual(catalog.devices.map((device) => device.id));
   expect(payload.scenarios).toEqual(catalog.scenarios);

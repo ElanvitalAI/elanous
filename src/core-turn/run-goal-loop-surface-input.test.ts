@@ -53,19 +53,6 @@ describe('runGoalLoop — 표면 판정 입력(userText)', () => {
     for (const value of seen) expect(value).toBe(HUMAN); // ⛔ 어느 라운드도 기계 문장으로 안 바뀐다
   });
 
-  // ⛔ 배선 회귀 가드 — 이 시험은 goal-loop seam 만 보므로, 「채팅 경로가 운반자를 싣는가」는
-  //   그 파일의 «소스»로 못 박는다(feedback_source_level_grep_test_value).
-  //   실측 근거: #8118 착지 뒤 그 한 줄이 없어서 실행 경로의 표면 판정이 «항상 빈 값»이었다.
-  test('[chat-wires-carrier] 채팅 경로가 coreCtx 에 사람 문장을 «싣는다»', async () => {
-    const { readFileSync } = await import('node:fs');
-    const { join } = await import('node:path');
-    const src = readFileSync(join(import.meta.dir, '..', 'session', 'chat.ts'), 'utf8');
-    const ctxStart = src.indexOf('const coreCtx: CoreTurnContext = {');
-    expect(ctxStart).toBeGreaterThan(-1);
-    const ctxBlock = src.slice(ctxStart, ctxStart + 800);
-    expect(ctxBlock).toContain('userText: opts.userText');
-  });
-
   test('[carrier-wins] 운반자가 이미 있으면 그 값이 이긴다', async () => {
     const seen: (string | undefined)[] = [];
     await runGoalLoop(

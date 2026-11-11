@@ -332,17 +332,21 @@ describe('measureGoalGroundingCorpus', () => {
   test('SIGTERM exit hook immediately removes the worker group before its 2s orphan poll', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'corpus-parent-term-'));
     const pidPath = join(directory, 'worker.pid');
-    const child = startCli({ CORPUS_WORKER_ENTRY: FAKE_WORKER, FAKE_WORKER_MODE: 'hang', FAKE_WORKER_PID_PATH: pidPath, CORPUS_CALL_TIMEOUT_MS: '120000', CORPUS_WORKER_ORPHAN_CHECK_MS: '2000' });
+    const grandchildPidPath = join(directory, 'grandchild.pid');
+    const child = startCli({ CORPUS_WORKER_ENTRY: FAKE_WORKER, FAKE_WORKER_MODE: 'hang-grandchild', FAKE_WORKER_PID_PATH: pidPath, FAKE_GRANDCHILD_PID_PATH: grandchildPidPath, CORPUS_CALL_TIMEOUT_MS: '120000', CORPUS_WORKER_ORPHAN_CHECK_MS: '2000' });
     let workerPid: number | undefined;
+    let grandchildPid: number | undefined;
     try {
       workerPid = await waitForPid(pidPath);
+      grandchildPid = await waitForPid(grandchildPidPath);
       child.kill('SIGTERM');
       await waitForClose(child);
       expect(child.exitCode).toBe(143);
       expect(child.signalCode).toBeNull();
       await expectDead(workerPid, 500);
+      await expectDead(grandchildPid, 500);
     } finally {
-      await cleanupProcess(child, [workerPid]);
+      await cleanupProcess(child, [workerPid, grandchildPid]);
       rmSync(directory, { recursive: true, force: true });
     }
   }, 15_000);

@@ -2,8 +2,31 @@
 import { describe, test, expect } from 'bun:test';
 import { simEscGate, simAgentRegistry } from './interaction.js';
 import { TURN_ABORT_TURN_ONLY } from '../turn-abort-scope.js';
+import { LONG_SHELL_ESC_CONFIRMATION_MS } from '../esc-abort-gate.js';
 
 describe('simEscGate — ESC 게이트를 «자식 N개» 상태로 즉시 세운다', () => {
+  test('short Bash stops immediately, while long Bash/RunShell uses the inline default-N confirmation', async () => {
+    const short = simEscGate({ shellTool: 'Bash', shellElapsedMs: LONG_SHELL_ESC_CONFIRMATION_MS - (LONG_SHELL_ESC_CONFIRMATION_MS / LONG_SHELL_ESC_CONFIRMATION_MS) });
+    short.esc();
+    expect(short.abortCtrl.signal.aborted).toBe(true);
+    expect(short.inlineLines).toHaveLength(0);
+
+    const keep = simEscGate({ shellTool: 'RunShell', shellElapsedMs: LONG_SHELL_ESC_CONFIRMATION_MS });
+    keep.esc();
+    expect(keep.inlineLines.join('\n')).toContain('y/n · 기본 n');
+    expect(keep.inlineLines.join('\n')).toContain('Stop the long-running shell command?');
+    expect(keep.inlineInput('n')).toBe(true);
+    await keep.settle();
+    expect(keep.abortCtrl.signal.aborted).toBe(false);
+
+    const stop = simEscGate({ shellTool: 'Bash', shellElapsedMs: LONG_SHELL_ESC_CONFIRMATION_MS, inlineAbortScope: 'turn-only' });
+    stop.esc();
+    expect(stop.inlineInput('y')).toBe(true);
+    await stop.settle();
+    expect(stop.abortCtrl.signal.aborted).toBe(true);
+    expect(stop.abortReason()).toBe(TURN_ABORT_TURN_ONLY);
+  });
+
   test('자식 0 → ESC 가 즉시 중단한다(모달 없음)', () => {
     const s = simEscGate({ runningChildren: 0 });
     s.esc();
@@ -68,6 +91,26 @@ describe('simEscGate — ESC 게이트를 «자식 N개» 상태로 즉시 세�
     stop.key('y');
     await stop.settle();
     expect(stop.handoffCalls).toBe(1);      // 중단하면 넘긴다
+    expect(stop.abortCtrl.signal.aborted).toBe(true);
+  });
+
+  test('등록된 AgentRegistry 자식은 입력창 y/N 확인을 열고 N은 계속, y는 중단한다', async () => {
+    const keepRegistry = simAgentRegistry({ foreground: 1 });
+    const keep = simEscGate({ agentRegistry: keepRegistry, inlineConfirmation: true });
+    keep.esc();
+    expect(keep.inlineLines.join('\n')).toContain('y/n · 기본 n');
+    expect(keep.inlineInput('n')).toBe(true);
+    await keep.settle();
+    expect(keep.abortCtrl.signal.aborted).toBe(false);
+
+    const stopRegistry = simAgentRegistry({ foreground: 1 });
+    const stop = simEscGate({ agentRegistry: stopRegistry, inlineConfirmation: true });
+    stop.esc();
+    expect(stop.inlineKey('up')).toBe(true);
+    expect(stop.inlineLines.join('\n')).toContain('▸ y. Stop');
+    expect(stop.inlineInput('y')).toBe(true);
+    await stop.settle();
+    await stop.settle();
     expect(stop.abortCtrl.signal.aborted).toBe(true);
   });
 });

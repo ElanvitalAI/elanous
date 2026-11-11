@@ -17,8 +17,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 
 import { DaemonClient, consumeObserverSse } from './daemon-client';
+import { ChatMessageView } from '../components/chat/ChatMessage';
 import {
   runChatTurnObserver,
   type ChatBlock,
@@ -230,6 +233,106 @@ describe('runChatTurnObserver — placeholder lifecycle', () => {
     dispose();
     expect(final?.text).toBe('최종 답');
     expect(final?.incomplete).toBeUndefined();
+  });
+
+  it('keeps pre-tool progress folded in a completed foreign chat turn', async () => {
+    globalThis.fetch = mockObserverResponse([
+      `event: turn-begin\ndata: {"sessionId":"sess-minimal"}\n\n`,
+      `event: text-delta\ndata: {"delta":"검색 중… ","full":"검색 중… "}\n\n`,
+      `event: tool-call\ndata: {"id":"t1","name":"Search"}\n\n`,
+      `event: tool-result\ndata: {"id":"t1","name":"Search","ok":true}\n\n`,
+      `event: text-delta\ndata: {"delta":"결론입니다.","full":"검색 중… 결론입니다."}\n\n`,
+      `event: turn-end\ndata: {"sessionId":"sess-minimal","text":"검색 중… 결론입니다.","stopReason":"end_turn"}\n\n`,
+    ]);
+    let final: ChatMessage | undefined;
+    const dispose = runChatTurnObserver(makeClient(), 'sess-minimal', {
+      onPlaceholder: () => 'p-minimal', onPartialBlocks: () => {},
+      onFinalize: (_id, message) => { final = message; },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    dispose();
+    expect(final?.text.slice(final.finalTextStart)).toBe('결론입니다.');
+    expect(final?.text.slice(0, final.finalTextStart)).toBe('검색 중… ');
+    const html = renderToStaticMarkup(createElement(ChatMessageView, { message: final!, minimal: true }));
+    expect(html.split('<details')[0]).toContain('결론입니다.');
+    expect(html.split('<details')[0]).not.toContain('검색 중');
+    expect(html).toContain('검색 중');
+  });
+
+  it('shows authoritative final prose when the server replaces pre-tool text', async () => {
+    globalThis.fetch = mockObserverResponse([
+      `event: turn-begin\ndata: {"sessionId":"sess-rewrite"}\n\n`,
+      `event: text-delta\ndata: {"delta":"검색 중…","full":"검색 중…"}\n\n`,
+      `event: tool-call\ndata: {"id":"t1","name":"Search"}\n\n`,
+      `event: turn-end\ndata: {"sessionId":"sess-rewrite","text":"새 결론입니다.","stopReason":"end_turn"}\n\n`,
+    ]);
+    let final: ChatMessage | undefined;
+    const dispose = runChatTurnObserver(makeClient(), 'sess-rewrite', {
+      onPlaceholder: () => 'p-rewrite', onPartialBlocks: () => {},
+      onFinalize: (_id, message) => { final = message; },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    dispose();
+    expect(final?.finalTextStart).toBe(0);
+    expect(final?.text).toBe('새 결론입니다.');
+  });
+
+  it('does not cut a rewritten final answer that starts with the progress word', async () => {
+    globalThis.fetch = mockObserverResponse([
+      `event: turn-begin\ndata: {"sessionId":"sess-same-prefix"}\n\n`,
+      `event: text-delta\ndata: {"delta":"검색","full":"검색"}\n\n`,
+      `event: tool-call\ndata: {"id":"t1","name":"Search"}\n\n`,
+      `event: turn-end\ndata: {"sessionId":"sess-same-prefix","text":"검색 결과는 다음과 같습니다.","stopReason":"end_turn"}\n\n`,
+    ]);
+    let final: ChatMessage | undefined;
+    const dispose = runChatTurnObserver(makeClient(), 'sess-same-prefix', {
+      onPlaceholder: () => 'p-same-prefix', onPartialBlocks: () => {},
+      onFinalize: (_id, message) => { final = message; },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    dispose();
+    expect(final?.finalTextStart).toBe(0);
+    const html = renderToStaticMarkup(createElement(ChatMessageView, { message: final!, minimal: true }));
+    expect(html.split('<details')[0]).toContain('검색 결과는 다음과 같습니다.');
+  });
+
+  it('keeps pre-tool progress folded when turn-end appends an unstreamed answer tail', async () => {
+    globalThis.fetch = mockObserverResponse([
+      `event: turn-begin\ndata: {"sessionId":"sess-tail"}\n\n`,
+      `event: text-delta\ndata: {"delta":"검색 중 ","full":"검색 중 "}\n\n`,
+      `event: tool-call\ndata: {"id":"t1","name":"Search"}\n\n`,
+      `event: text-delta\ndata: {"delta":"결과","full":"검색 중 결과"}\n\n`,
+      `event: turn-end\ndata: {"sessionId":"sess-tail","text":"검색 중 결과입니다.","stopReason":"end_turn"}\n\n`,
+    ]);
+    let final: ChatMessage | undefined;
+    const dispose = runChatTurnObserver(makeClient(), 'sess-tail', {
+      onPlaceholder: () => 'p-tail', onPartialBlocks: () => {},
+      onFinalize: (_id, message) => { final = message; },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    dispose();
+    expect(final?.text.slice(final.finalTextStart)).toBe('결과입니다.');
+    const html = renderToStaticMarkup(createElement(ChatMessageView, { message: final!, minimal: true }));
+    expect(html.split('<details')[0]).not.toContain('검색 중');
+    expect(html.split('<details')[0]).toContain('결과입니다.');
+  });
+
+  it('keeps progress folded after an orphan tool result with a continued SSE answer', async () => {
+    globalThis.fetch = mockObserverResponse([
+      `event: turn-begin\ndata: {"sessionId":"sess-orphan-minimal"}\n\n`,
+      `event: text-delta\ndata: {"delta":"확인 중… ","full":"확인 중… "}\n\n`,
+      `event: tool-result\ndata: {"id":"orphan","name":"Read","ok":true}\n\n`,
+      `event: text-delta\ndata: {"delta":"결과입니다.","full":"확인 중… 결과입니다."}\n\n`,
+      `event: turn-end\ndata: {"sessionId":"sess-orphan-minimal","text":"확인 중… 결과입니다.","stopReason":"end_turn"}\n\n`,
+    ]);
+    let final: ChatMessage | undefined;
+    const dispose = runChatTurnObserver(makeClient(), 'sess-orphan-minimal', {
+      onPlaceholder: () => 'p-orphan-minimal', onPartialBlocks: () => {},
+      onFinalize: (_id, message) => { final = message; },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    dispose();
+    expect(final?.text.slice(final.finalTextStart)).toBe('결과입니다.');
   });
 
   it('keeps abnormal turn-end prose folded', async () => {

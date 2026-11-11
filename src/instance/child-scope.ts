@@ -1,5 +1,5 @@
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { SelfImplementChildInstanceMode } from '../user-config/types.js';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';

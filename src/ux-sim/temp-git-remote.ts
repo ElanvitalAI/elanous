@@ -7,6 +7,8 @@ import { join } from 'node:path';
 
 export interface TempGitRemote {
   readonly root: string;
+  /** Fake GitHub repository identity; null fixtures cannot accept token pushes. */
+  readonly repository: string | null;
   readonly remote: string;
   readonly seed: string;
   readonly checkout: string;
@@ -14,11 +16,19 @@ export interface TempGitRemote {
   readonly gitEnv: Omit<NodeJS.ProcessEnv, 'NODE_ENV'>;
   git(cwd: string, args: readonly string[]): string;
   advanceMain(count: number): void;
+  /** Push the checkout's HEAD to the disposable origin/main, returning the real Git refs. */
+  pushCheckoutMain(): { before: string; after: string };
   removeOrigin(): void;
   cleanup(): void;
 }
 
-export function createTempGitRemote(): TempGitRemote {
+/** Parse keys only: pushInsteadOf values may contain newlines. */
+function hasGitPushUrlRewrite(configKeys: string): boolean {
+  return configKeys.split('\0')
+    .some((key) => /^url\.[\s\S]*\.(?:pushinsteadof|insteadof)$/i.test(key));
+}
+
+export function createTempGitRemote(options: { repository?: string } = {}): TempGitRemote {
   const root = mkdtempSync(join(tmpdir(), 'ux-sim-git-remote-'));
   const remote = join(root, 'remote.git');
   const seed = join(root, 'seed');
@@ -61,7 +71,7 @@ export function createTempGitRemote(): TempGitRemote {
     git(seed, ['push', '-u', 'origin', 'main']);
     git(root, ['clone', remote, checkout]);
     return {
-      root, remote, seed, checkout, gitEnv, git, cleanup,
+      root, repository: options.repository ?? null, remote, seed, checkout, gitEnv, git, cleanup,
       advanceMain(count: number): void {
         if (!Number.isSafeInteger(count) || count < 0) throw new Error('advanceMain count must be a nonnegative integer');
         for (let index = 0; index < count; index += 1) {
@@ -72,6 +82,19 @@ export function createTempGitRemote(): TempGitRemote {
         }
         if (count > 0) git(seed, ['push', 'origin', 'main']);
         git(checkout, ['fetch', 'origin']);
+      },
+      pushCheckoutMain(): { before: string; after: string } {
+        if (git(checkout, ['remote', 'get-url', 'origin']) !== remote)
+          throw new Error('temporary Git origin changed');
+        // Git can rewrite even an explicit destination through local url.*
+        // insteadOf/pushInsteadOf rules. Fail closed before touching either ref.
+        if (hasGitPushUrlRewrite(git(checkout, ['config', '--null', '--name-only', '--list', '--includes'])))
+          throw new Error('Git push URL rewrite configured');
+        const before = git(remote, ['rev-parse', 'refs/heads/main']);
+        const after = git(checkout, ['rev-parse', 'HEAD']);
+        // An explicit local path bypasses any origin.pushurl set by the host or test.
+        git(checkout, ['push', remote, 'HEAD:refs/heads/main']);
+        return { before, after };
       },
       removeOrigin(): void { git(checkout, ['remote', 'remove', 'origin']); },
     };

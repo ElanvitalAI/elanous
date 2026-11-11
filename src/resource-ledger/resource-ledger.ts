@@ -60,12 +60,22 @@ export interface GuardianHostLeaseRecord {
   alternatives?: string[];
 }
 
+/** Human-authored, durable policy for the train worker supervisor. */
+export interface TrainWorkerPolicy {
+  minWorkers: number;
+  maxWorkers: number;
+  scaleDownCpuPercent: number;
+  scaleUpCpuPercent: number;
+  gateReserveWorkers: number;
+}
+
 export type GuardianHostLeaseEvent = { event: 'guardian-host-lease'; at: string; record: GuardianHostLeaseRecord };
 export type GuardianHostLeaseConflictEvent = { event: 'guardian-host-lease-conflict'; at: string; requestId: string; existingLeaseId: string; attemptedRequest: GuardianHostLeaseRequest };
 export type GuardianHostLeaseAdmittedEvent = { event: 'guardian-host-lease-admitted'; at: string; leaseId: string; host: string; runId: string; consumer: string };
 export type GuardianHostLeaseAdmissionDeniedEvent = { event: 'guardian-host-lease-admission-denied'; at: string; leaseId: string; host: string; runId: string; consumer: string; reason: 'lease-not-found' | 'lease-expired' | 'lease-not-active' | 'lease-owner-mismatch'; alternatives: string[] };
 
 export type ResourceLedgerEvent =
+  | { event: 'llm-proxy-call'; at: string; host: string; seat: string; purpose: string; pr?: number; model: string; inputTokens: number | null; outputTokens: number | null; costUsd: number | null; costBasis: 'subscription' | 'reported' | 'estimate' | 'unknown'; status: 'ok' | 'error' }
   | { event: 'lease-created'; at: string; lease: ResourceLease }
   | { event: 'lease-heartbeat'; at: string; id: string; heartbeatAt: string; resources?: ResourceLease['resources'] }
   | { event: 'lease-ended'; at: string; id: string; reason: string; stoppedBy: string }
@@ -75,7 +85,8 @@ export type ResourceLedgerEvent =
   | GuardianHostLeaseEvent
   | GuardianHostLeaseConflictEvent
   | GuardianHostLeaseAdmittedEvent
-  | GuardianHostLeaseAdmissionDeniedEvent;
+  | GuardianHostLeaseAdmissionDeniedEvent
+  | { event: 'train-worker-policy'; at: string; policy: TrainWorkerPolicy };
 
 export interface ResourceMeasurement {
   host: string;
@@ -144,6 +155,17 @@ export function readResourceLedger(path = resourceLedgerPath()): ResourceLedgerE
   return parseResourceLedgerEvents(readFileSync(path, 'utf8'));
 }
 
+export function latestTrainWorkerPolicy(events: readonly ResourceLedgerEvent[]): TrainWorkerPolicy | undefined {
+  return [...events].reverse().find((event): event is Extract<ResourceLedgerEvent, { event: 'train-worker-policy' }> =>
+    event.event === 'train-worker-policy')?.policy;
+}
+
+export function recordTrainWorkerPolicy(policy: TrainWorkerPolicy, now = new Date(), path = resourceLedgerPath()): void {
+  const event: ResourceLedgerEvent = { event: 'train-worker-policy', at: now.toISOString(), policy };
+  parseResourceLedgerEvents(`${JSON.stringify(event)}\n`);
+  withLedgerLock(path, () => appendEvent(event, path));
+}
+
 /** Resource-ledger view for callers that need explicit forward-compatibility observations. */
 export function readResourceLedgerWithObservations(path = resourceLedgerPath()): {
   events: ResourceLedgerEvent[];
@@ -156,8 +178,10 @@ export function readResourceLedgerWithObservations(path = resourceLedgerPath()):
 }
 
 const KNOWN_RESOURCE_LEDGER_EVENT_TYPES = new Set([
+  'llm-proxy-call',
   'lease-created', 'lease-heartbeat', 'lease-ended', 'lease-reaped', 'pool-declared', 'pool-pod-receipt',
   'guardian-host-lease', 'guardian-host-lease-conflict', 'guardian-host-lease-admitted', 'guardian-host-lease-admission-denied',
+  'train-worker-policy',
 ]);
 
 export function parseResourceLedgerEvents(text: string): ResourceLedgerEvent[] {
@@ -195,6 +219,15 @@ function parseResourceLedgerEventsWithObservations(text: string): {
         || !validTimestamp(lease.heartbeatAt) || !validTimestamp(lease.startedAt)
         || (lease.mission.pr !== undefined && (!Number.isSafeInteger(lease.mission.pr) || Number(lease.mission.pr) < 1)))
         throw new Error(`resource ledger invalid lease creation at line ${index + 1}`);
+    }
+    if (eventType === 'llm-proxy-call') {
+      const nullableCount = (value: unknown) => value === null || (Number.isSafeInteger(value) && Number(value) >= 0);
+      if (!validHost(String(row.host ?? '')) || !validGuardianText(row.seat) || !validGuardianText(row.purpose)
+        || typeof row.model !== 'string' || !nullableCount(row.inputTokens) || !nullableCount(row.outputTokens)
+        || !(row.costUsd === null || (typeof row.costUsd === 'number' && Number.isFinite(row.costUsd) && row.costUsd >= 0))
+        || !['ok', 'error'].includes(String(row.status)) || !['subscription', 'reported', 'estimate', 'unknown'].includes(String(row.costBasis))
+        || (row.pr !== undefined && (!Number.isSafeInteger(row.pr) || Number(row.pr) < 1)))
+        throw new Error(`resource ledger invalid LLM proxy call at line ${index + 1}`);
     }
     if (eventType === 'lease-heartbeat') {
       if (!validGuardianText(row.id) || !validTimestamp(row.heartbeatAt)
@@ -255,6 +288,17 @@ function parseResourceLedgerEventsWithObservations(text: string): {
         || !validGuardianText(row.runId) || !validGuardianText(row.consumer) || !validGuardianText(row.reason)
         || !Array.isArray(row.alternatives) || !row.alternatives.every(validGuardianText))
         throw new Error(`resource ledger invalid Guardian host lease admission denial at line ${index + 1}`);
+    }
+    if (eventType === 'train-worker-policy') {
+      const policy = row.policy;
+      // Source: worker counts are nonnegative integers and CPU utilization is a percentage on the 0–100 scale.
+      if (!isRecord(policy) || !Number.isSafeInteger(policy.minWorkers) || Number(policy.minWorkers) < 0
+        || !Number.isSafeInteger(policy.maxWorkers) || Number(policy.maxWorkers) < Number(policy.minWorkers)
+        || !Number.isFinite(policy.scaleDownCpuPercent) || Number(policy.scaleDownCpuPercent) < 0 || Number(policy.scaleDownCpuPercent) > 100
+        || !Number.isFinite(policy.scaleUpCpuPercent) || Number(policy.scaleUpCpuPercent) < 0 || Number(policy.scaleUpCpuPercent) > 100
+        || Number(policy.scaleUpCpuPercent) >= Number(policy.scaleDownCpuPercent)
+        || !Number.isSafeInteger(policy.gateReserveWorkers) || Number(policy.gateReserveWorkers) < 0)
+        throw new Error(`resource ledger invalid train worker policy at line ${index + 1}`);
     }
     events.push(value as ResourceLedgerEvent);
   }
@@ -473,6 +517,11 @@ function withLedgerLock(path: string, action: () => void): void {
 
 function appendEvent(event: ResourceLedgerEvent, path: string): void {
   appendFileSync(path, `${JSON.stringify(event)}\n`, { encoding: 'utf8', flag: 'a' });
+}
+
+/** Persist one admitted proxy invocation before the response is returned. */
+export function recordLlmProxyCall(event: Extract<ResourceLedgerEvent, { event: 'llm-proxy-call' }>, path = resourceLedgerPath()): void {
+  withLedgerLock(path, () => appendEvent(event, path));
 }
 
 export function beginResourceLease(input: Omit<ResourceLease, 'id' | 'startedAt' | 'heartbeatAt' | 'endedAt' | 'endReason' | 'stoppedBy'> & { now?: Date }, path?: string): ResourceLease {

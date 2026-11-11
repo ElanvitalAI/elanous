@@ -79,6 +79,7 @@ const PACKAGE_CHOICES: readonly PackageChoice[] = [
   { name: 'go', manager: 'brew', purpose: 'Go development runtime', profile: 'developer' },
   { name: 'gradle', manager: 'brew', purpose: 'JVM project build tool', profile: 'developer' },
   { name: 'cocoapods', manager: 'brew', purpose: 'dependency manager for legacy iOS projects', profile: 'developer' },
+  { name: 'cargo', manager: 'apt-get', purpose: 'Rust package manager required by the Linux tree-sitter-cli installer', profile: 'developer', platforms: ['linux', 'wsl'] },
   { name: 'tree-sitter-cli', manager: 'brew', purpose: 'parser generation and inspection for developer tooling', profile: 'developer' },
   { name: 'python@3.14', manager: 'brew', purpose: 'explicit Python runtime for scripts and test tooling', profile: 'developer' },
   { name: 'docker-ce', manager: 'apt-get', purpose: 'official Docker Engine for k3d in WSL; skipped when a working Docker Desktop integration is already available', profile: 'developer', platforms: ['wsl'] },

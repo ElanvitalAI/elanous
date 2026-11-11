@@ -307,6 +307,10 @@ export function classifyTelegramText(
   return { kind: 'command', command: m[1]!, body: m[2] ?? '' };
 }
 
+function isValidTelegramMessageId(messageId: number | undefined): messageId is number {
+  return typeof messageId === 'number' && Number.isSafeInteger(messageId) && messageId > 0;
+}
+
 export class TelegramBot {
   private readonly token: string;
   readonly botId: string;
@@ -608,6 +612,7 @@ export class TelegramBot {
      *  plain-text retry on parse errors. Default false keeps
      *  existing callers (refusal messages, error banners) untouched. */
     markdown?: boolean;
+    replyMarkup?: { inline_keyboard: readonly (readonly { text: string; callback_data: string }[])[] };
   } = {}): Promise<{ messageId: number } | void> {
     if (!text) return;
 
@@ -620,25 +625,31 @@ export class TelegramBot {
       // fallback (withTelegramHtmlParseFallback in its send.ts).
       const mdChunks = splitMarkdownForTelegram(text, this.maxChars);
       let lastId: number | undefined;
-      for (const chunk of mdChunks) {
+      let hasUnconfirmedSend = false;
+      for (const [index, chunk] of mdChunks.entries()) {
         const html = markdownToTelegramHtml(chunk);
+        const replyMarkup = index === mdChunks.length - 1 ? opts.replyMarkup : undefined;
         try {
           const r = await this.sendOne(chatId, html, {
             replyTo: opts.replyTo,
             threadId: opts.threadId,
             parseMode: 'HTML',
+            replyMarkup,
           });
-          if (r?.messageId !== undefined) lastId = r.messageId;
+          if (!isValidTelegramMessageId(r?.messageId)) hasUnconfirmedSend = true;
+          else lastId = r.messageId;
         } catch (err: unknown) {
           if (!isTelegramParseEntityError(err)) throw err;
           const r = await this.sendOne(chatId, chunk, {
             replyTo: opts.replyTo,
             threadId: opts.threadId,
+            replyMarkup,
           });
-          if (r?.messageId !== undefined) lastId = r.messageId;
+          if (!isValidTelegramMessageId(r?.messageId)) hasUnconfirmedSend = true;
+          else lastId = r.messageId;
         }
       }
-      return lastId !== undefined ? { messageId: lastId } : undefined;
+      return !hasUnconfirmedSend && lastId !== undefined ? { messageId: lastId } : undefined;
     }
 
     // Chunk defensively — LLM answers frequently exceed 4096 when code
@@ -646,11 +657,18 @@ export class TelegramBot {
     // message_id so callers can edit-in-place if they want.
     const chunks = splitForTelegram(text, this.maxChars);
     let lastId: number | undefined;
-    for (const chunk of chunks) {
-      const r = await this.sendOne(chatId, chunk, opts);
-      if (r?.messageId !== undefined) lastId = r.messageId;
+    let hasUnconfirmedSend = false;
+    for (const [index, chunk] of chunks.entries()) {
+      const r = await this.sendOne(chatId, chunk, {
+        replyTo: opts.replyTo,
+        parseMode: opts.parseMode,
+        threadId: opts.threadId,
+        replyMarkup: index === chunks.length - 1 ? opts.replyMarkup : undefined,
+      });
+      if (!isValidTelegramMessageId(r?.messageId)) hasUnconfirmedSend = true;
+      else lastId = r.messageId;
     }
-    return lastId !== undefined ? { messageId: lastId } : undefined;
+    return !hasUnconfirmedSend && lastId !== undefined ? { messageId: lastId } : undefined;
   }
 
   /** Replace the contents of an existing message. Useful for
@@ -815,11 +833,13 @@ export class TelegramBot {
     replyTo?: number;
     parseMode?: 'MarkdownV2' | 'HTML';
     threadId?: number;
+    replyMarkup?: { inline_keyboard: readonly (readonly { text: string; callback_data: string }[])[] };
   }): Promise<{ messageId: number } | undefined> {
     const body: Record<string, unknown> = { chat_id: chatId, text };
     if (opts.replyTo) body.reply_to_message_id = opts.replyTo;
     if (opts.parseMode) body.parse_mode = opts.parseMode;
     if (opts.threadId != null) body.message_thread_id = opts.threadId;
+    if (opts.replyMarkup) body.reply_markup = opts.replyMarkup;
     const result = await this.throttledCall<{ message_id?: number }>(chatId, 'sendMessage', body);
     if (result && typeof result.message_id === 'number') {
       return { messageId: result.message_id };
@@ -2578,7 +2598,7 @@ function sleep(ms: number): Promise<void> {
 
 import { createSession, findSessionByTelegramChat, findTelegramSession } from './session/index.js';
 import { makeChunkProducer } from './session/streaming/chunk-producer.js';
-import { getUserConfig } from './user-config.js';
+import { getUserConfig } from './user-config/reader.js';
 import { runTurn } from './session/chat.js';
 import { submitIntent } from './intent-gate/gate.js';
 import type { UserConfig } from './user-config/types.js';

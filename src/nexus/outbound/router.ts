@@ -340,7 +340,7 @@ export function resolveChannels(
 async function deliverTelegram(_ch: OutboundChannelConfig, msg: OutboundMsg, cfg: UserConfig, deps: RouterDeps): Promise<ChannelResult> {
   const fmt = formatForChannel('telegram', msg);
   const send = deps.telegramSend ?? sendTelegramReport;
-  const ok = await send(cfg, fmt.text, { markdown: fmt.markdown ?? msg.markdown, fetchImpl: deps.fetchImpl, kind: msg.kind });
+  const ok = await send(cfg, fmt.text, { markdown: fmt.markdown ?? msg.markdown, fetchImpl: deps.fetchImpl, kind: msg.kind, buttons: msg.buttons });
   return ok ? { type: 'telegram', ok: true } : { type: 'telegram', ok: false, error: 'not-configured' };
 }
 
@@ -389,7 +389,7 @@ export const outboundAdapters: ReadonlyMap<string, ChannelAdapter> = new Map<str
   ['telegram', { type: 'telegram', capabilities: {
     send: true, receive: true, thread: false, topic: false, persona: false,
     channelLifecycle: false, permissions: false, commands: false, attachments: false,
-    buttons: false, choices: false, deliveryConfirmation: false, rateLimit: false,
+    buttons: true, choices: false, deliveryConfirmation: false, rateLimit: false,
   }, send: deliverTelegram, receive: (payload): ChannelEnvelope | null => {
     if (!payload || typeof payload !== 'object') return null;
     const tap = payload as Record<string, unknown>;
@@ -430,7 +430,10 @@ export async function routeOutbound(cfg: UserConfig, msg: OutboundMsg, deps: Rou
   const outMsg: OutboundMsg = spill.spilled ? { ...msg, text: spill.text, markdown: false } : msg;
 
   const messageId = createHash('sha1').update(`${msg.kind}\n${msg.text}\n${(deps.now ?? (() => new Date().toISOString()))()}`).digest('hex').slice(0, 16);
-  const dedupKey = deliveryDedupKey(msg.kind, msg.text);
+  const actionFingerprint = msg.buttons?.length || msg.choices?.length
+    ? createHash('sha256').update(JSON.stringify({ buttons: msg.buttons ?? [], choices: msg.choices ?? [] })).digest('hex')
+    : undefined;
+  const dedupKey = msg.dedupKey?.trim() || `${deliveryDedupKey(msg.kind, msg.text)}${actionFingerprint ? `:actions:${actionFingerprint}` : ''}`;
 
   // 배송 원장(fail-soft) — 없어도 발송은 진행.
   const ownLedger = !deps.deliveryDb;

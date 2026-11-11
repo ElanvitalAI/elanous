@@ -35,7 +35,7 @@ import {
 import type { ShellHandle, ShellResult as RunnerResult } from '../../shell-runner/types.js';
 import { debug, redactSecretText, redactSecrets } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { SCHEDULE_WAKEUP_TOOL_NAME } from './schedule-wakeup.js';
 import {
   globalTaskNotificationQueue,

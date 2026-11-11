@@ -1,0 +1,26 @@
+{
+  "id": "light-rc-long-run-device",
+  "name": "Light RC long-running gate simulation",
+  "implementation": [
+    "src/ux-sim/light-rc-long-run-device.ts"
+  ],
+  "tests": [
+    "src/ux-sim/light-rc-long-run-device.test.ts"
+  ],
+  "target": "The real light-release-candidate flow while its formal host gate remains pending",
+  "inputs": [
+    "release version",
+    "pinned base and head commit",
+    "a deferred formal host gate result"
+  ],
+  "observations": [
+    "the light RC stays pending until its host gate resolves",
+    "a long-running unmeasured gate cannot produce a green result"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/light-rc-long-run-device.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

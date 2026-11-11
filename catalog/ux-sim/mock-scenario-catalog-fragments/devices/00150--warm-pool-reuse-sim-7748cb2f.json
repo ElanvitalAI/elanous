@@ -6,11 +6,14 @@
     "src/ux-sim/warm-pool-reuse-switch-sim.ts",
     "src/ux-sim/fake-kubectl.ts",
     "src/task-orchestrator/surfaces/pod-warm-worker-provider.ts",
-    "scripts/warm-pool-provider-config.ts"
+    "scripts/warm-pool-provider-config.ts",
+    "scripts/release-loop/gate-runtime.ts",
+    "src/self-implement/gate-receipt-registry.ts"
   ],
   "tests": [
     "src/ux-sim/warm-pool-reuse-sim.test.ts",
-    "scripts/warm-pool-provider-config.test.ts"
+    "scripts/warm-pool-provider-config.test.ts",
+    "src/ux-sim/pod-warm-lockhash-sim.test.ts"
   ],
   "target": "Production warm-provider reconcile, gate selection and host-scoped resource-ledger reads against fake Kubernetes and a scope-aware fake primary lease API",
   "inputs": [
@@ -18,16 +21,18 @@
     "gate profile",
     "five host-scoped resource-ledger pool declarations",
     "404, invalid or expired machine credential",
-    "image/profile/token-scope fault"
+    "image/profile/token-scope fault",
+    "pinned cut bun.lock with semantic hash distinct from raw SHA"
   ],
   "observations": [
     "pod.warm/request-selection selected=true",
     "one pod.reuse/warm-worker-selected",
     "runId-correlated prepare-refused reason",
-    "pod.warm.provider-config/resource-ledger-read-failed with status and reason; no credentials"
+    "pod.warm.provider-config/resource-ledger-read-failed with status and reason; no credentials",
+    "one normalized lock identity through gate selection, worker runtime and precut canary"
   ],
   "entryCommands": [
-    "bun test scripts/warm-pool-provider-config.test.ts src/ux-sim/warm-pool-reuse-sim.test.ts"
+    "bun test scripts/warm-pool-provider-config.test.ts src/ux-sim/warm-pool-reuse-sim.test.ts src/ux-sim/pod-warm-lockhash-sim.test.ts"
   ],
   "logsRecorded": "yes",
   "eventNames": [

@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, openSync, closeSync, writeSync, realpathSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
-import { homedir, loadavg } from 'node:os';
+import { homedir, hostname, loadavg } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
@@ -12,7 +12,7 @@ import {
   type ConfirmOpts,
   type ConfirmResult,
 } from '../hitl/confirm.js';
-import { runGate as runChangedTypecheckGate } from '../../scripts/ci-typecheck-changed.js';
+import { forbidFullTypecheckOnLocal, isHeadquartersTypecheckShell, runGate as runChangedTypecheckGate, typecheckDispatchFlags } from '../../scripts/ci-typecheck-changed.js';
 import { runIsolationHardcodeGate } from '../../scripts/ci-isolation-hardcode-gate.js';
 import { androidFilesIn, runAndroidUnitTestGate } from '../../scripts/ci-android-unit-tests.js';
 import { iosFilesIn, runIosUnitTestGate } from '../../scripts/ci-ios-unit-tests.js';
@@ -70,7 +70,7 @@ import { classifyTypecheckDrift, executeDriftPlan, planDriftRepair, resolveDrift
 import { needsConductorMapRefresh, openConductorMapRefreshPr } from './pr-land-conductor-map.js';
 import { runTypeDriftRadarAfterLanding } from './pr-land-drift-radar.js';
 import { loadGateReceipts } from '../self-implement/gate-receipt-registry.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { spawnElanousSync as defaultSpawnElanousSync } from '../instance/spawn-elanous.js';
@@ -79,6 +79,7 @@ import { bindPrLandRefusalToRecover, PR_LAND_CARD_ID_ENV } from './pr-land-recov
 import type { HeavyRemoteInput, HeavyRemoteResult } from './pr-land-heavy-remote.js';
 import { runPrLandRemoteGit, type PrLandRemoteGitInput, type PrLandRemoteGitResult } from './pr-land-remote-git.js';
 import { readPrBaseNameWithRetry } from './pr-land-base-read.js';
+import { comparePinnedLandingHead, readContractShadowLanding } from './pr-land-contract-shadow.js';
 import { integrateTrain } from '../self-implement/merge-train.js';
 import type { LandingPodShadowInput, LandingPodShadowVerdict } from './pr-land-pod-shadow-job.js';
 import type { TaskCard } from '../task-agent/task-hand.js';
@@ -86,6 +87,8 @@ import { INFLIGHT_REGISTRY_FILE, removeInflightForPr } from '../pr-tool/inflight
 import type { L8ShadowQueueDeps } from '../self-implement/l8-merge-queue.js';
 import { createMacrophageRuntime } from '../release-loop/macrophage-heal-node.js';
 import { censusOpenPrs, guardNewPr, parseDiffHunks, readOpenPrs, sharedCensusDiffCache, type Seat } from '../pr-tool/census.js';
+import { guardHotspotStart, hotspotApprovalCommentId, type HotspotApproval, type HotspotApprovalSource } from './open-guard.js';
+import { recordHotspotStartForecast, type HotspotStartForecastRow } from './hotspot-start-forecast.js';
 
 export { branchLineageSlug, findSiblingPrs };
 
@@ -279,6 +282,8 @@ export interface PrLandDeps {
   /** 병합 재시도 사이 대기(시험 주입용 · 기본 실제 대기). */
   sleep?: (ms: number) => Promise<void>;
   run?: CmdRunner;
+  /** Isolated ledger sink for planned-file open-guard tests. */
+  appendHotspotStartForecast?: (row: HotspotStartForecastRow) => void;
   resolveBase?: (run: CmdRunner, cwd: string, explicit?: string) => string | undefined;
   currentBranch?: (cwd: string) => string | undefined;
   readFile?: (path: string) => string;
@@ -311,6 +316,8 @@ export interface PrLandDeps {
   runExportLeakCheck?: (changedFiles: readonly string[], cwd: string) => ExportLeakCheck;
   /** Test seam — local 1-minute and 5-minute load around a heavy remote gate. Default `os.loadavg`. */
   loadavg?: () => readonly [number, number, number];
+  /** Test seam — host identity for HQ-local-heavy-gate placement coverage. */
+  hostName?: () => string;
   /** Test seam — included files must not import a module the public export excludes. */
   runExportImportCheck?: (changedFiles: readonly string[], cwd: string) => ExportImportCheck | Promise<ExportImportCheck>;
   /** 공개 문서의 `elanous …` 호출 ↔ 실제 `--help` 대조(경고 전용) — 바뀐 공개 문서 경로를 받아 어긋남 목록을 돌려준다. */
@@ -441,14 +448,61 @@ export async function decideOverlapLanding(input: {
 
 const liveOut = { log: (message: string) => console.log(message), error: (message: string) => console.error(message) };
 
-function runPrLandTypecheckGate(out: { log: (message: string) => void; error: (message: string) => void }, cwd: string): boolean {
+export function shouldRefusePrLandLocalHeavySteps(env: NodeJS.ProcessEnv, host: string, cwd: string, heavyRemote: boolean): boolean {
+  return !heavyRemote && forbidFullTypecheckOnLocal(env, host, cwd) && isHeadquartersTypecheckShell(host, cwd);
+}
+
+type PrLandRemoteTypecheckResult = { status: number | null; stdout: string; stderr: string };
+export type PrLandRemoteTypecheckRunner = (
+  command: string,
+  args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; encoding: 'utf8'; maxBuffer: number },
+) => PrLandRemoteTypecheckResult;
+
+function canonicalCheckoutPath(cwd: string): string {
+  const absolute = resolve(cwd);
+  try { return realpathSync(absolute); } catch { return absolute; }
+}
+
+export function runPrLandTypecheckGate(
+  out: { log: (message: string) => void; error: (message: string) => void },
+  cwd: string,
+  options: { env?: NodeJS.ProcessEnv; host?: string; runRemote?: PrLandRemoteTypecheckRunner } = {},
+): boolean {
+  const targetCwd = canonicalCheckoutPath(cwd);
+  const env = options.env ?? process.env;
+  const host = options.host ?? hostname();
+  const dispatch = typecheckDispatchFlags({ local: false, rest: [] }, env, host, targetCwd);
+  if (dispatch.error) {
+    out.error(`[typecheck] ${dispatch.error}`);
+    return false;
+  }
+  if (dispatch.remote !== undefined) {
+    const remoteHost = dispatch.remote === true ? undefined : dispatch.remote;
+    const script = resolve(targetCwd, 'scripts/ci-typecheck-changed.ts');
+    const args = [script, '--remote', ...(remoteHost ? [remoteHost] : [])];
+    const runRemote = options.runRemote ?? ((command, argv, runOptions) => {
+      const result = spawnSync(command, argv, runOptions);
+      return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+    });
+    const result = runRemote(process.execPath, args, {
+      cwd: targetCwd, env: { ...env }, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
+    });
+    for (const line of result.stdout.split(/\r?\n/u).filter(Boolean)) out.log(line);
+    for (const line of result.stderr.split(/\r?\n/u).filter(Boolean)) out.error(line);
+    if (result.status === 0) return true;
+    if (result.status === null) out.error('[typecheck] ci-typecheck-changed 원격 디스패치가 종료 코드를 남기지 않았다.');
+    return false;
+  }
+
   let failed = false;
   const exit = ((code: number): never => {
     failed = code !== 0;
     throw new Error(`ci-typecheck-changed exited ${code}`);
   });
   try {
-    runChangedTypecheckGate({ log: out.log, warn: out.error, error: out.error, exit, cwd: resolve(cwd), allowMissingCheckoutDependencies: true });
+    runChangedTypecheckGate({ log: out.log, warn: out.error, error: out.error, exit, cwd: targetCwd,
+      forbidFullLocal: forbidFullTypecheckOnLocal(env, host, targetCwd), allowMissingCheckoutDependencies: true });
   } catch (error) {
     if (!failed) throw error;
   }
@@ -2337,7 +2391,10 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     log: (message: string) => { typecheckOutput.push(message); out.log(message); },
     error: (message: string) => { typecheckOutput.push(message); out.error(message); },
   };
-  const typecheckOk = opts.heavyRemote || (deps.runTypecheckGate ? deps.runTypecheckGate(typecheckOut) : runPrLandTypecheckGate(typecheckOut, cwd));
+  const hostName = deps.hostName?.() ?? hostname();
+  const typecheckOk = opts.heavyRemote || (deps.runTypecheckGate
+    ? deps.runTypecheckGate(typecheckOut)
+    : runPrLandTypecheckGate(typecheckOut, cwd, { host: hostName }));
   record('typecheck', typecheckOk);
   if (!typecheckOk) {
     try {
@@ -2384,6 +2441,11 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   out.log(opts.heavyRemote
     ? '✓ typecheck: node-b exact-head heavy gate PASS — changed files have no new type errors.'
     : '✓ typecheck: scripts/ci-typecheck-changed.ts PASS — changed files have no new type errors.');
+
+  if (shouldRefusePrLandLocalHeavySteps(process.env, hostName, cwd, opts.heavyRemote === true)) {
+    out.error(`✗ HQ-HEAVY-LOCAL-GUARD: pr land stopped before local test-suite/PWA heavy gates on HQ. Use pinned --heavy-remote; typecheck remote defaults to ${process.env.ELANOUS_TYPECHECK_REMOTE?.trim() || 'node-b'}.`);
+    return 1;
+  }
 
   const isolation = gateVerdict('isolation-gate', deps.runIsolationGate ?? ((o) => runPrLandIsolationGate(o, cwd)), out);
   // ⭐ 관측에 «잰 것»과 «못 잰 것»을 다른 값으로 남긴다 — 둘이 같은 모양이면 그 자는 거짓을 낸다.
@@ -2860,7 +2922,8 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     return 1;
   }
   if (opts.forceFreeze) debug.log('release-loop.freeze', 'force-merge', { pr: prNumber, reason: opts.forceFreeze.trim() });
-  record('merge', true, { result: merged.kind, ...(merged.remoteBranchDeletion ? { remoteBranchDeletion: merged.remoteBranchDeletion.detail } : {}) });
+  record('merge', true, { pr: prNumber, head: opts.expectedHead ?? headCommit, result: merged.kind,
+    ...(merged.remoteBranchDeletion ? { remoteBranchDeletion: merged.remoteBranchDeletion.detail } : {}) });
   if (Number.isSafeInteger(prNumber) && prNumber > 0 && needsConductorMapRefresh(changedPaths)) {
     try {
       const refreshPr = await (deps.onMergedConductorCellFragments ?? openConductorMapRefreshPr)(prNumber, cwd);
@@ -2872,20 +2935,38 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
       out.error(`⚠ conductor-map: #${prNumber} 착지는 확인됐으나 생성 전용 후속 PR 생성 실패 · ${String(error).slice(0, 180)}`);
     }
   }
-  if (!branch.startsWith('release-docs/')) {
+  {
     try {
       const landed = run('gh', ['pr', 'view', String(prNumber), '--json', 'title,headRefOid,baseRefName,mergedAt,mergeCommit'], { cwd });
       const value = landed.ok ? JSON.parse(landed.out) as Record<string, unknown> : undefined;
       const mergeCommit = value?.mergeCommit && typeof value.mergeCommit === 'object'
         ? (value.mergeCommit as Record<string, unknown>).oid : undefined;
+      if (typeof value?.headRefOid === 'string' && typeof mergeCommit === 'string' && typeof value.mergedAt === 'string') {
+        const pinnedHead = opts.expectedHead ?? headCommit;
+        const landingReceipt = { pr: prNumber, head: value.headRefOid,
+          pinnedHead: pinnedHead ?? null, mergeSha: mergeCommit, mergedAt: value.mergedAt,
+          headMatchesExpected: comparePinnedLandingHead(value.headRefOid, pinnedHead) };
+        debug.log('pr.land', 'land-receipt', landingReceipt);
+        const comparison = landingReceipt.headMatchesExpected === true
+          ? readContractShadowLanding({ head: value.headRefOid, base: verifiedHeavyBase ?? overlapCheckedBase })
+          : { comparison: 'unmeasured' as const, reason: landingReceipt.headMatchesExpected === false
+            ? 'landed head differs from pinned head' : 'pinned head unavailable' };
+        debug.log('gate.contract-select.shadow', 'landing', { ...landingReceipt,
+          gateBase: verifiedHeavyBase ?? overlapCheckedBase ?? null, ...comparison });
+      } else {
+        debug.log('gate.contract-select.shadow', 'landing', { pr: prNumber, head: opts.expectedHead ?? headCommit ?? null,
+          mergeSha: null, comparison: 'unmeasured', reason: 'post-merge GitHub receipt unavailable' });
+      }
       const repairRunId = typeof value?.title === 'string' ? /^RLA-GATE-REPAIR ([^ ]+) /.exec(value.title)?.[1] : undefined;
-      if (repairRunId && typeof value?.headRefOid === 'string' && typeof value.baseRefName === 'string' &&
+      if (!branch.startsWith('release-docs/') && repairRunId && typeof value?.headRefOid === 'string' && typeof value.baseRefName === 'string' &&
         typeof mergeCommit === 'string' && typeof value.mergedAt === 'string') {
         const { publishRepairPrLanded } = await import('../../scripts/release-loop/repair-pr-landed.js');
         publishRepairPrLanded({ schema: 1, prNumber, repairRunId, head: value.headRefOid, mergeSha: mergeCommit,
           base: value.baseRefName, mergedAt: value.mergedAt });
       }
     } catch (error) {
+      try { debug.log('gate.contract-select.shadow', 'landing', { pr: prNumber, head: opts.expectedHead ?? headCommit ?? null,
+        mergeSha: null, comparison: 'unmeasured', reason: 'post-merge GitHub receipt read failed' }); } catch { /* observation cannot undo landing */ }
       try { debug.log('pr.land', 'graph-pr-land-event-unavailable', { pr: prNumber, error: String(error).slice(0, 240) }, { level: 'warn' }); }
       catch { /* event publication cannot undo a confirmed merge */ }
     }
@@ -3056,25 +3137,68 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
       if (result.status === 'unknown') prToolExit(1);
     });
   pr.command('open-guard')
-    .description('새 PR 전에 같은 파일 OPEN PR·골 문서만·자리별 상한 검사')
+    .description('착수·새 PR 전에 같은 파일 OPEN PR·골 문서만·자리별 상한 검사')
     .option('--cwd <path>', '작업 트리 경로')
     .option('--base <ref>', '비교 base ref', 'origin/main')
     .option('--seat <seat>', 'PR 소유 자리(OP|TC|MK|UX)')
     .option('--cell <id>', '릴리스 칸 id (같은 칸 OPEN PR 검사)')
+    .option('--planned-file <path>', '착수 예정 파일 (반복 가능)', (path: string, files: string[]) => [...files, path], [] as string[])
+    .option('--op-approval-file <path>', '핫스팟 OP 승인 JSON (현재 열린 PR head에 묶음)')
     .option('--seat-cap <number>', '자리별 열린 PR 경고 상한', '30')
-    .action((opts: { cwd?: string; base: string; seat?: string; cell?: string; seatCap: string }) => {
+    .action((opts: { cwd?: string; base: string; seat?: string; cell?: string; seatCap: string; plannedFile: string[]; opApprovalFile?: string }) => {
       const cwd = opts.cwd ?? process.cwd();
       const diff = prToolRun('git', ['-C', cwd, 'diff', '--name-only', '-z', `${opts.base}...HEAD`]);
-      const files = diff.ok ? diff.out.split('\0').filter(Boolean) : null;
+      const actualFiles = diff.ok ? diff.out.split('\0').filter(Boolean) : null;
+      const plannedFiles = opts.plannedFile.length ? opts.plannedFile : null;
       const patch = prToolRun('git', ['-C', cwd, 'diff', '--unified=0', `${opts.base}...HEAD`]);
       // PR-CENSUS-PARALLEL: the real runner fans `gh pr diff` out (cap 6); an injected runner stays one by one.
-      const inventory = readOpenPrs(prToolRun, { cwd, ...(files ? { candidateFiles: files } : {}),
+      const inventory = readOpenPrs(prToolRun, { cwd, ...(patch.ok && actualFiles ? { candidateFiles: actualFiles } : {}),
         ...(deps.run ? {} : { runParallel: defaultCensusParallelRunner, diffCache: sharedCensusDiffCache }) });
-      const result = guardNewPr({ files: patch.ok ? files : null, seat: opts.seat as Seat | undefined, seatCap: Number(opts.seatCap), cellId: opts.cell, hunks: patch.ok ? parseDiffHunks(patch.out) : undefined }, inventory);
+      // A clean tree with --planned-file is a work-start check, not a new-PR candidate.
+      // If there are actual branch changes, keep the existing guard bound to those actual files.
+      const result = plannedFiles && actualFiles?.length === 0 ? undefined : guardNewPr({
+        files: patch.ok ? actualFiles : null, seat: opts.seat as Seat | undefined, seatCap: Number(opts.seatCap), cellId: opts.cell,
+        hunks: patch.ok ? parseDiffHunks(patch.out) : undefined,
+      }, inventory);
+      let approval: HotspotApproval | null = null;
+      let approvalSource: HotspotApprovalSource | null = null;
+      if (opts.opApprovalFile) {
+        try {
+          const candidate = JSON.parse(readFileSync(opts.opApprovalFile, 'utf8')) as HotspotApproval;
+          const commentId = hotspotApprovalCommentId(candidate.commentUrl);
+          if (commentId !== null) {
+            const fetched = prToolRun('gh', ['api', `repos/ElanvitalAI/elanous/issues/comments/${commentId}`]);
+            if (fetched.ok) {
+              const comment = JSON.parse(fetched.out) as { id?: unknown; user?: { login?: unknown }; body?: unknown };
+              if (typeof comment.id === 'number' && typeof comment.user?.login === 'string' && typeof comment.body === 'string') {
+                approval = candidate;
+                approvalSource = { commentId: comment.id, author: comment.user.login, body: comment.body };
+              }
+            }
+          }
+        }
+        catch { /* an unreadable approval cannot authorize a hotspot */ }
+      }
+      const hotspot = plannedFiles ? guardHotspotStart(plannedFiles, inventory, approval, approvalSource) : undefined;
+      let forecastError: string | undefined;
+      if (hotspot) {
+        const resolved = prToolRun('git', ['-C', cwd, 'rev-parse', '--verify', opts.base]);
+        // Source: conflict-forecast.v1 base is an exact SHA (RFC-train-manager-loop-agent.md §3c).
+        if (!resolved.ok || !/^[a-f0-9]{40}$/i.test(resolved.out.trim())) forecastError = 'forecast-base-unavailable';
+        else {
+          try {
+            recordHotspotStartForecast({ base: resolved.out.trim(), owner: opts.seat ?? null, verdict: hotspot,
+              ...(deps.appendHotspotStartForecast ? { append: deps.appendHotspotStartForecast } : {}) });
+          } catch (error) { forecastError = `forecast-write-failed: ${String(error)}`; }
+        }
+      }
       // Inspection never spends the three-creation unmeasured allowance.
       // Only pr-manager records an actual new-PR attempt in that ledger.
-      prToolOut.log(JSON.stringify(result));
-      if (result.status !== 'allow') prToolExit(1);
+      const status = forecastError || result?.status === 'unknown' || hotspot?.status === 'unknown' ? 'unknown'
+        : result?.status === 'refuse' || hotspot?.status === 'refuse' ? 'refuse' : 'allow';
+      prToolOut.log(JSON.stringify({ ...(result ?? { reasons: [], warnings: [] }), status, ...(hotspot ? { hotspot } : {}),
+        ...(forecastError ? { forecastError } : {}) }));
+      if (status !== 'allow') prToolExit(1);
     });
   const queue = pr.command('queue').description('Shadow merge queue (never lands PRs)');
   const queueAction = async (action: () => Promise<unknown>) => {

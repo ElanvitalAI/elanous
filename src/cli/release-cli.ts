@@ -5,7 +5,7 @@
 //   elanous release tag --version <x.y.z> --source <commit> [--yes]
 //   elanous release verify  [--version <x.y.z>]
 //   elanous release notes   --from <ref> [--to <ref>]
-//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--dry-run] [--json] [--if-ready] [--force-new]
+//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--dry-run] [--json] [--if-ready] [--force-new] [--adopt-failed-run <runId>]
 //   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--gate-pod-pool <pool>] [--json]
 //   elanous release auto-start [--window-minutes <n>] [--apply] [--json]
 //   elanous release recover --run <runId> --pick <sha...> [--from export-check] [--command-root <path>] [--repo-root <path>] [--no-partial] [--json]
@@ -33,7 +33,7 @@ import { codeRevision } from '../version/code-revision.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
 import { evidencePlan, fetchMergedChecklistPrs, landedButYellow, type MergedPrRunner } from '../release-loop/landed-but-yellow.js';
@@ -72,9 +72,10 @@ import { registerReleaseRunStatusCommand } from './release-run-status-cli.js';
 export const GATE_SHARD_JSON_PAGE_MAX_BYTES = 60_000;
 
 /** Pin release-run freshness in tests so child CLIs do not observe a moving origin/main ref. */
-export function releaseCliFreshnessCutRevision(explicitCut: string | undefined, env: NodeJS.ProcessEnv = process.env): string | undefined {
+export function releaseCliFreshnessCutRevision(explicitCut: string | undefined, adoptFailedRun = false, cliRevision?: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   const explicit = explicitCut?.trim();
   if (explicit) return explicit;
+  if (adoptFailedRun) return cliRevision;
   if (env.NODE_ENV !== 'test') return undefined;
   const testBase = env.ELANOUS_TEST_RELEASE_CLI_FRESHNESS_BASE?.trim();
   return testBase || undefined;
@@ -1240,7 +1241,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .action(async (o: { version: string; base?: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => cutReleaseBranch({ ...o, log }), () => true);
     });
-  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; readinessCountdown?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
+  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; readinessCountdown?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; adoptFailedRun?: string; gateExecutor?: string; gateHost?: string; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
       const launchRefusal = releaseRunLaunchRefusal({ sourcePath: fileURLToPath(import.meta.url) });
       if (launchRefusal) {
         debug.log('release.run', 'seat-launch-refused', { seat: process.env.ELANOUS_TRACK ?? null, cwd: process.cwd(), reason: launchRefusal });
@@ -1257,6 +1258,13 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         process.exitCode = 1;
         return false;
       }
+      if (o.adoptFailedRun && (o.ifReady || o.cutCommit || o.mainCut || o.prerelease)) {
+        const message = '--adopt-failed-run requires a direct stable release-branch run';
+        if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, error: message })}\n`);
+        else console.error(`⛔ ${message}`);
+        process.exitCode = 1;
+        return false;
+      }
       // A malformed --publish-at is refused before readiness, so --if-ready cannot defer it as a success.
       const publishAtInvalid = o.publishAt === undefined ? null : publishAtError(o.publishAt);
       if (publishAtInvalid) {
@@ -1268,7 +1276,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       let branchCutBaseCommit: string | undefined;
       if (!o.dryRun) {
         const cliCommit = codeRevision();
-        const freshnessCut = releaseCliFreshnessCutRevision(o.cutCommit);
+        const freshnessCut = releaseCliFreshnessCutRevision(o.cutCommit, !!o.adoptFailedRun, cliCommit);
         try {
           const freshness = assertReleaseCliFresh(process.cwd(), cliCommit, freshnessCut);
           if (o.cutCommit === undefined && !o.mainCut) branchCutBaseCommit = freshness.cutCommit;
@@ -1328,7 +1336,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
             forceNew: o.forceNew,
             readiness: (version, options) => releaseReadiness(version, { ledgerRoot: releaseRunDeps.ledgerRoot, checklist: releaseRunDeps.checklist,
               allowBeforeCut: o.readinessCountdown, ...options }),
-            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps),
+            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost, adoptFailedRunId: o.adoptFailedRun }, releaseRunDeps),
           });
           if (outcome.skipped) {
             if (outcome.reason === 'already-running') {
@@ -1365,7 +1373,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         }
       }
       await jsonAction(o.json, async (log) => {
-        const run = () => runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps);
+        const run = () => runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost, adoptFailedRunId: o.adoptFailedRun }, releaseRunDeps);
         const forceRun = () => {
           const atStart = releaseReadiness(o.version, { ledgerRoot, checklist: releaseRunDeps.checklist, isPidAlive: () => false });
           if (!atStart.ready) throw new Error(`release run --force-new not ready after claim: ${atStart.reason}`);
@@ -1394,10 +1402,11 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--publish-at <iso>', '승인·선행 노드 통과 뒤 지정 시각까지 발행 대기(오프셋 포함 ISO 시각)')
     .option('--force-freeze', '동결 중 게이트·발행 강행(관측 기록) — 가지 컷은 동결이 필요 없다 · 동결은 비상 스위치로 남는다')
     .option('--force-new', '같은 판의 살아 있는 릴리스 런을 확인한 뒤에도 새 런을 명시적으로 시작')
+    .option('--adopt-failed-run <runId>', 'OP 승인: 원장·판·컷 후손을 확인해 실패한 런의 release/<v> 가지를 인수')
     .option('--gate-executor <pod|host>', 'gate 노드 실행기(기본 pod) — host 는 Pod 대신 SSH 호스트의 깨끗한 클론에서 같은 판정(면제 아님)')
     .option('--gate-host <ssh-host>', '--gate-executor host 의 SSH 호스트(기본 release.loop.gateRemote)')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }) => { await runAction(o); });
+    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; adoptFailedRun?: string; gateExecutor?: string; gateHost?: string; json?: boolean }) => { await runAction(o); });
   release.command('preflight')
     .description('컷 전 사전 점검(기본 읽기 전용) — --countdown 은 단계 판정 모델만 표시하고 컷을 실행하지 않는다. --allow-side-effects 를 명시해야 실패 우편·원장을 기록한다.')
     .requiredOption('--version <v>', '점검할 판(x.y.z)')

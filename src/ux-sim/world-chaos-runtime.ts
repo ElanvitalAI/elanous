@@ -7,7 +7,7 @@ import { loadRunLedger, runLedgerDir, type RunLedgerEntry } from '../self-implem
 import { createFakePsDevice, type FakePsDevice } from './fake-ps.js';
 import type { SimChaosFault, SimHostChaosFault, SimMonkeyFault, SimRecoveryExpectation, SimWorldProcess } from './world-schema.js';
 
-export type WorldChaosKind = 'monkey' | 'gorilla';
+export type WorldChaosKind = 'monkey' | 'gorilla' | 'disaster';
 
 export interface WorldChaosScenario {
   readonly kind: WorldChaosKind;
@@ -106,7 +106,7 @@ export interface WorldChaosAction {
   readonly atMs: number;
   readonly target: string;
   readonly recordTimeline?: boolean;
-  run(now: () => Date): void | Promise<void>;
+  run(now: () => Date): void | readonly WorldChaosAction[] | Promise<void | readonly WorldChaosAction[]>;
 }
 
 export interface WorldChaosClock {
@@ -124,7 +124,7 @@ export interface PendingChaosRecovery {
 }
 
 export interface WorldHostChaosController {
-  start(fault: SimHostChaosFault, atMs: number): PendingChaosRecovery;
+  start(fault: SimHostChaosFault, atMs: number): PendingChaosRecovery | Promise<PendingChaosRecovery>;
 }
 
 /** Run all fault and injection declarations on one stable fake-time axis. */
@@ -144,17 +144,44 @@ export async function runWorldChaosSchedule(
   const timeline: WorldChaosTimelineEntry[] = [];
   const injections: WorldChaosInjectionReceipt[] = [];
   type QueueEntry = { atMs: number; order: number; fault?: SimChaosFault; event?: WorldChaosScheduledEvent; action?: WorldChaosAction; recovery?: PendingChaosRecovery; restore?: () => void; restoreTarget?: string };
-  const queue: QueueEntry[] = [
-    ...faults.map((fault, order) => ({ atMs: durationMs(fault.at), order, fault })),
-    ...scheduledEvents.map((event, order) => ({ atMs: event.atMs, order, event })),
-    ...scheduledActions.map((action, order) => ({ atMs: action.atMs, order, action })),
-  ];
+  const queue: QueueEntry[] = [];
+  const priority = (item: QueueEntry) => item.restore || item.recovery ? 0 : item.fault ? 1 : 2;
+  const compare = (a: QueueEntry, b: QueueEntry) => a.atMs - b.atMs || priority(a) - priority(b) || a.order - b.order;
+  const pushQueue = (entry: QueueEntry) => {
+    let index = queue.length;
+    queue.push(entry);
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (compare(queue[parent]!, queue[index]!) <= 0) break;
+      [queue[parent], queue[index]] = [queue[index]!, queue[parent]!];
+      index = parent;
+    }
+  };
+  const popQueue = () => {
+    const first = queue[0];
+    const last = queue.pop();
+    if (!first || !last || queue.length === 0) return first;
+    queue[0] = last;
+    let index = 0;
+    while (true) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      let smallest = index;
+      if (left < queue.length && compare(queue[left]!, queue[smallest]!) < 0) smallest = left;
+      if (right < queue.length && compare(queue[right]!, queue[smallest]!) < 0) smallest = right;
+      if (smallest === index) break;
+      [queue[index], queue[smallest]] = [queue[smallest]!, queue[index]!];
+      index = smallest;
+    }
+    return first;
+  };
+  for (const [order, fault] of faults.entries()) pushQueue({ atMs: durationMs(fault.at), order, fault });
+  for (const [order, event] of scheduledEvents.entries()) pushQueue({ atMs: event.atMs, order: faults.length + order, event });
+  for (const [order, action] of scheduledActions.entries()) pushQueue({ atMs: action.atMs, order: faults.length + scheduledEvents.length + order, action });
   let nextOrder = queue.length;
   while (queue.length) {
     // Close fault lifecycles (including restorations) before injections scheduled for the same instant.
-    const priority = (item: QueueEntry) => item.restore || item.recovery ? 0 : item.fault ? 1 : 2;
-    queue.sort((a, b) => a.atMs - b.atMs || priority(a) - priority(b) || a.order - b.order);
-    const item = queue.shift()!;
+    const item = popQueue()!;
     if (clock) clock.setTime(Math.max(clock.now(), baseTimeMs + item.atMs));
     if (item.restore) {
       item.restore();
@@ -168,7 +195,10 @@ export async function runWorldChaosSchedule(
       continue;
     }
     if (item.action) {
-      await item.action.run(() => new Date(clock?.now() ?? baseTimeMs + item.atMs));
+      const followUps = await item.action.run(() => new Date(clock?.now() ?? baseTimeMs + item.atMs));
+      if (Array.isArray(followUps)) {
+        for (const action of followUps) pushQueue({ atMs: action.atMs, order: nextOrder++, action });
+      }
       if (item.action.recordTimeline !== false) {
         timeline.push({ atMs: clock ? clock.now() - baseTimeMs : item.atMs, kind: 'world-event', target: item.action.target });
       }
@@ -178,20 +208,20 @@ export async function runWorldChaosSchedule(
       observations.push(await item.recovery.complete());
       timeline.push({ atMs: clock ? clock.now() - baseTimeMs : item.atMs, kind: 'fault-recovery', target: item.recovery.target });
       if (item.recovery.restore && item.recovery.restoreAtMs !== undefined) {
-        queue.push({ atMs: item.recovery.restoreAtMs, order: nextOrder++, restore: item.recovery.restore, restoreTarget: item.recovery.target });
+        pushQueue({ atMs: item.recovery.restoreAtMs, order: nextOrder++, restore: item.recovery.restore, restoreTarget: item.recovery.target });
       }
       continue;
     }
     const fault = item.fault!;
-    const target = 'monkey' in fault ? fault.monkey.kill : fault.gorilla.host;
+    const target = 'monkey' in fault ? fault.monkey.kill : 'gorilla' in fault ? fault.gorilla.host : fault.disaster.host;
     timeline.push({ atMs: item.atMs, kind: 'fault-start', target });
     if ('monkey' in fault) {
       const recovery = startWorldChaosFault(fault, processTable, clock, baseTimeMs);
-      queue.push({ atMs: recovery.atMs, order: nextOrder++, recovery });
+      pushQueue({ atMs: recovery.atMs, order: nextOrder++, recovery });
     } else {
-      if (!hostChaos) throw new Error('world.chaos gorilla needs assembled host devices');
-      const recovery = hostChaos.start(fault, item.atMs);
-      queue.push({ atMs: recovery.atMs, order: nextOrder++, recovery });
+      if (!hostChaos) throw new Error(`world.chaos ${'gorilla' in fault ? 'gorilla' : 'disaster'} needs assembled host devices`);
+      const recovery = await hostChaos.start(fault, item.atMs);
+      pushQueue({ atMs: recovery.atMs, order: nextOrder++, recovery });
     }
   }
   if (!expected) return { observations, timeline, injections };
@@ -206,7 +236,13 @@ export async function runWorldChaosSchedule(
   const injectedLostLedgerRows = ledgerMeasurement
     ? expectedRowIds.length - retainedRowIds.length + Math.max(0, persistedRowIds.length - expectedRowIds.length)
     : null;
-  const lostLedgerRows = injectedLostLedgerRows;
+  const disasterMeasurements = observations.filter((row) => row.kind === 'disaster').map((row) => row.metrics.lostLedgerRows);
+  const disasterLostLedgerRows: number | null = disasterMeasurements.length === 0 ? 0
+    : disasterMeasurements.every((value): value is number => value !== null)
+      ? disasterMeasurements.reduce((sum, value) => sum + value, 0) : null;
+  const lostLedgerRows = injectedLostLedgerRows === null
+    ? (disasterMeasurements.length ? disasterLostLedgerRows : null)
+    : disasterLostLedgerRows === null ? null : injectedLostLedgerRows + disasterLostLedgerRows;
   const recoveryMs = observations.length > 0 && observations.every((row) => row.recoveryMs !== null)
     ? Math.max(...observations.map((row) => row.recoveryMs!)) : null;
   const aggregate: WorldChaosObservation = {

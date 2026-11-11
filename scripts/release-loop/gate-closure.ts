@@ -862,7 +862,7 @@ export function testsReachingChanged(tree: ClosureTree, changed: readonly string
   return testsReachingChangedFromGraph(tree, changed, tests, buildClosureGraph(tree, options));
 }
 
-function testsReachingChangedFromGraph(tree: ClosureTree, changed: readonly string[], tests: readonly string[], graph: ClosureGraph): ClosureVerdict {
+export function testsReachingChangedFromGraph(tree: ClosureTree, changed: readonly string[], tests: readonly string[], graph: ClosureGraph): ClosureVerdict {
   const { forward, staticImports, opaque, tracked } = graph;
   const reverse = new Map<string, string[]>();
   for (const [from, edges] of forward) for (const to of edges) {

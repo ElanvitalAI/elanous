@@ -1,8 +1,7 @@
 import { expect, test } from 'bun:test';
-import { existsSync } from 'node:fs';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { simCli } from './in-process-cli.js';
 
 
@@ -150,6 +149,35 @@ test('explicit spawn mode confirms the where contract at the real entry boundary
     rmSync(root, { recursive: true, force: true });
   }
 }, 25_000);
+
+test('TMP-DIR-LEAK: detached task child cleanup follows the simCli real entry boundary', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ux-sim-task-launch-'));
+  const scratch = mkdtempSync(join(root, 'tasks-cli-launch-'));
+  const stderrPath = join(scratch, 'detached-child.stderr');
+  const started = join(root, 'detached-child.started');
+  const finished = join(root, 'detached-child.finished');
+  const wrapper = resolve(import.meta.dir, 'fixtures/task-launch-entry.mjs');
+  const supervisor = resolve(import.meta.dir, '../cli/task-launch-supervisor.ts');
+  const realEntry = resolve(import.meta.dir, '../../bin/elanous.mjs');
+  writeFileSync(stderrPath, '');
+  try {
+    const run = await simCli(['where', '--json'], {
+      mode: 'spawn', entrypoint: wrapper, allowPaths: [['where']],
+      stateRoot: join(root, 'state'), timeoutMs: 20_000,
+      env: { ELANOUS_TASK_LAUNCH_FIXTURE: [scratch, supervisor, started, finished, realEntry].join('\n') },
+    });
+    expect(run.exitCode).toBe(0);
+    expect(JSON.parse(run.stdout)).toMatchObject({ kind: 'test', root: join(root, 'state') });
+    for (let attempt = 0; attempt < 40 && !existsSync(started); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(existsSync(started)).toBe(true);
+    expect(existsSync(scratch)).toBe(true);
+    for (let attempt = 0; attempt < 80 && (existsSync(scratch) || !existsSync(finished)); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(existsSync(finished)).toBe(true);
+    expect(existsSync(scratch)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
 
 test('spawn timeout force-kills a child that ignores SIGTERM after the grace period', async () => {
   const root = mkdtempSync(join(tmpdir(), 'ux-sim-ignore-term-'));

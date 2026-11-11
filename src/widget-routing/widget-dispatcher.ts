@@ -3,8 +3,7 @@
 // Phase 1 helper that encapsulates "walk widget.behaviors in order,
 // first handlesKey→true claims the key, widget's own onKey runs only
 // for keys no behavior consumed". This is the canonical way a pane
-// handler delegates to a widget — dashboard.ts's playground closure
-// calls `dispatchKeyToWidget(widgetHost, 'wd-playground', key)` and
+// handler delegates to a widget via dispatchKeyToWidget and
 // Phase 3's widget migrations will use the same helper.
 //
 // Lives in src/widget-routing/ alongside the PaneKeyRouter so the

@@ -1,4 +1,5 @@
 import { decideTrainVerdict, type TrainVerdictInput } from '../../../scripts/release-loop/train-verdict.js';
+import { orderHotspotPrsByRadius } from './hotspot-radius-ordering.js';
 
 export type TrainGateState = 'passed' | 'unmeasured' | 'conflict' | 'failed' | 'evidence';
 
@@ -8,6 +9,12 @@ export interface TrainQueueEntry {
   state: 'open' | 'closed' | 'merged';
   gate: TrainGateState;
   expressRank?: number;
+  mustRank?: number;
+  /** A singleton candidate, including a PR that still needs its solo gate. */
+  solo?: boolean;
+  files?: readonly string[];
+  radius?: number;
+  priority?: 'S1' | 'normal';
 }
 
 export interface TrainRefusal {
@@ -45,7 +52,7 @@ export interface TrainDecisionInput {
 }
 
 export interface TrainAssignment {
-  stage: 'express' | 'group';
+  stage: 'express' | 'preflight' | 'group';
   host: string;
   slot: number;
   prs: string[];
@@ -73,6 +80,9 @@ function validate(input: TrainDecisionInput): void {
     if (row.expressRank !== undefined && (!Number.isInteger(row.expressRank) || row.expressRank < 0)) {
       throw new Error(`invalid express rank for PR ${row.pr}`);
     }
+    if (row.mustRank !== undefined && (!Number.isInteger(row.mustRank) || row.mustRank < 0)) {
+      throw new Error(`invalid MUST rank for PR ${row.pr}`);
+    }
   }
   const slotKeys = new Set<string>();
   for (const slot of input.slots) {
@@ -96,12 +106,40 @@ function validate(input: TrainDecisionInput): void {
   }
 }
 
+/** One canonical candidate order for all dispatch lanes. */
+export function orderTrainQueueEntries(queue: readonly TrainQueueEntry[]): TrainQueueEntry[] {
+  const measured = queue.filter(row => row.files !== undefined || row.radius !== undefined || row.priority !== undefined);
+  if (measured.length > 0 && queue.some(row => row.files === undefined || row.radius === undefined)) {
+    throw new Error('train decision hotspot radius is only partially measured');
+  }
+  // Source: train-manager.py dispatch order and RFC-train-manager-loop-agent.md §5.
+  // Keep policy lanes ahead of radius; each lane uses the same hotspot ordering.
+  const queueRank = new Map(queue.map((row, index) => [row.pr, index]));
+  const rankedQueue = [...queue].sort((a, b) => {
+    const aTier = a.expressRank !== undefined ? 0 : a.mustRank !== undefined ? 1 : a.solo ? 2 : 3;
+    const bTier = b.expressRank !== undefined ? 0 : b.mustRank !== undefined ? 1 : b.solo ? 2 : 3;
+    return aTier - bTier
+      || (aTier === 0 ? a.expressRank! - b.expressRank! : 0)
+      || (aTier === 1 ? a.mustRank! - b.mustRank! : 0)
+      || queueRank.get(a.pr)! - queueRank.get(b.pr)!;
+  });
+  if (measured.length === 0) return rankedQueue;
+  const lane = (row: TrainQueueEntry) => row.expressRank !== undefined ? 0 : row.mustRank !== undefined ? 1 : row.solo ? 2 : 3;
+  const ordered: TrainQueueEntry[] = [];
+  for (const tier of [0, 1, 2, 3]) {
+    ordered.push(...orderHotspotPrsByRadius(rankedQueue.filter(row => lane(row) === tier)
+      .map(row => ({ ...row, files: row.files!, radius: row.radius! }))));
+  }
+  return ordered;
+}
+
 /**
  * Pure decision core for the train loop. Inputs are one tick's immutable snapshots;
  * filesystem, GitHub, worker health, and queue writes stay at their adapters.
  */
 export function planTrainDecisions(input: TrainDecisionInput): TrainDecisionResult {
   validate(input);
+  const orderedQueue = orderTrainQueueEntries(input.queue);
   const gatePassed = (row: TrainQueueEntry): boolean => {
     if (row.gate === 'passed') return true;
     if (row.gate !== 'evidence') return false;
@@ -149,17 +187,16 @@ export function planTrainDecisions(input: TrainDecisionInput): TrainDecisionResu
     if (row.state !== 'open') skipped.push({ pr: row.pr, reason: 'not-open' });
     else if (active.has(row.pr)) skipped.push({ pr: row.pr, reason: 'active' });
     else if (!parked.has(row.pr) && row.gate === 'conflict') waiting.push({ pr: row.pr, reason: 'main-merge-conflict' });
-    else if (!parked.has(row.pr) && !gatePassed(row) && !(row.gate === 'unmeasured' && row.expressRank !== undefined)) {
+    else if (!parked.has(row.pr) && !gatePassed(row) && !(row.gate === 'unmeasured' && (row.expressRank !== undefined || row.solo))) {
       waiting.push({ pr: row.pr, reason: 'gate-not-ready' });
     }
   }
 
   let freeSlots = [...input.slots];
   const assignments: TrainAssignment[] = [];
-  const expressRows = input.queue
+  const expressRows = orderedQueue
     .filter((row) => row.state === 'open' && !active.has(row.pr) && !parked.has(row.pr)
-      && row.expressRank !== undefined && (gatePassed(row) || row.gate === 'unmeasured'))
-    .sort((a, b) => (a.expressRank! - b.expressRank!) || input.queue.indexOf(a) - input.queue.indexOf(b));
+      && row.expressRank !== undefined && (gatePassed(row) || row.gate === 'unmeasured'));
   for (const row of expressRows) {
     const slotIndex = freeSlots.findIndex((slot) => slot.expressOnly);
     const selectedIndex = slotIndex >= 0 ? slotIndex : freeSlots.findIndex((slot) => !slot.expressOnly);
@@ -168,24 +205,30 @@ export function planTrainDecisions(input: TrainDecisionInput): TrainDecisionResu
       continue;
     }
     const [slot] = freeSlots.splice(selectedIndex, 1);
-    assignments.push({ stage: 'express', host: slot!.host, slot: slot!.slot, prs: [row.pr] });
+    assignments.push({ stage: row.solo && row.gate === 'unmeasured' ? 'preflight' : 'express',
+      host: slot!.host, slot: slot!.slot, prs: [row.pr] });
     assigned.add(row.pr);
   }
 
   for (const slot of freeSlots.filter((candidate) => !candidate.expressOnly)) {
-    const group = input.queue.filter((row) => row.state === 'open' && !active.has(row.pr) && !parked.has(row.pr)
-      && !assigned.has(row.pr) && row.expressRank === undefined && gatePassed(row)).slice(0, input.groupLimit);
-    if (group.length === 0) break;
-    assignments.push({ stage: 'group', host: slot.host, slot: slot.slot, prs: group.map((row) => row.pr) });
+    const candidates = orderedQueue.filter((row) => row.state === 'open' && !active.has(row.pr) && !parked.has(row.pr)
+      && !assigned.has(row.pr) && row.expressRank === undefined
+      && (gatePassed(row) || (row.solo && row.gate === 'unmeasured')));
+    if (candidates.length === 0) break;
+    const first = candidates[0]!;
+    const nextSolo = candidates.findIndex(row => row.solo);
+    const group = first.solo ? [first] : candidates.slice(0, nextSolo < 0 ? undefined : nextSolo).slice(0, input.groupLimit);
+    const stage = first.solo && first.gate === 'unmeasured' ? 'preflight' : 'group';
+    assignments.push({ stage, host: slot.host, slot: slot.slot, prs: group.map((row) => row.pr) });
     for (const row of group) assigned.add(row.pr);
   }
 
   // Keep every eligible PR visible when the available slots are exhausted.
   // Group limits apply per worker slot, so overflow can be picked up by a later
   // slot; only the final unassigned rows are waiting for capacity.
-  for (const row of input.queue) {
+  for (const row of orderedQueue) {
     if (row.state !== 'open' || active.has(row.pr) || parked.has(row.pr) || assigned.has(row.pr)) continue;
-    if (!gatePassed(row) || row.expressRank !== undefined) continue;
+    if ((!gatePassed(row) && !(row.solo && row.gate === 'unmeasured')) || row.expressRank !== undefined) continue;
     waiting.push({ pr: row.pr, reason: 'no-free-slot' });
   }
 

@@ -10,6 +10,7 @@
 // abort 여부와 무관하게 실행된다 — 그 순서 자체도 아래에서 단언).
 
 import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +18,18 @@ import { bootAcpServer } from '../src/boot/acp-server.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
+
+// The production import once hit a dual-role-manager re-export before its namespace initialized.
+// A fresh process keeps this guard independent of this file's prior module cache.
+test('production ACP server imports without a namespace initialization cycle', () => {
+  const repoDir = join(import.meta.dir, '..');
+  const child = spawnSync('bun', ['-e', "await import('./src/boot/acp-server.ts')"], {
+    // 출처: #36174 import-cycle regression guard; the child must finish and return its diagnostic.
+    cwd: repoDir, encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+  });
+  expect(child.status).toBe(0);
+  expect(child.stderr).not.toContain('before initialization');
+});
 
 let tmp: string;
 let sockPath: string;

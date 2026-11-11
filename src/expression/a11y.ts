@@ -28,7 +28,7 @@ export type NotificationLevel = 'info' | 'warning' | 'error';
 
 /** Map a free-form notification kind (elanous's `NotificationKind`
  *  union: status / osc / exit / block / error / hitl / agent-done /
- *  escalation) to a 3-bucket severity. The mapping is intentionally
+ *  escalation / briefing) to a 3-bucket severity. The mapping is intentionally
  *  conservative — `escalation` and `error` shout, `hitl` warns,
  *  everything else is muted info — and lives in expression so any
  *  surface that emits SR utterances (bell-modal, control-plane health,

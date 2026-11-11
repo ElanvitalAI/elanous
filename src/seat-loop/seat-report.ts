@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { SeatLoopConfig } from '../user-config/types.js';
 import { collectDraftMetrics, collectOverlapMetrics, countSalvagedToday, type DraftMetrics, type OverlapMetrics } from '../self-dev/draft-sweep.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';

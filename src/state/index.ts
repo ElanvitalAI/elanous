@@ -51,6 +51,5 @@ export {
 
 export {
   bridgeContextKeysToStore,
-  bridgeWidgetHostToStore,
   bridgePluginHostToStore,
 } from './bridges/index.js';

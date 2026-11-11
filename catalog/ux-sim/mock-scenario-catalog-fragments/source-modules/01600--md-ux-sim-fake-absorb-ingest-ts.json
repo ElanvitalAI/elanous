@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-FAKE-ABSORB-INGEST-TS",
+  "path": "src/ux-sim/fake-absorb-ingest.ts",
+  "boundary": "Provides deterministic seven-kind scrap fixtures, owner-scoped inbox reads, extractor failure injection and no-BYOK summary-card fallback for the ABSORB ingest flow.",
+  "deviceIds": ["fake-absorb-ingest"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

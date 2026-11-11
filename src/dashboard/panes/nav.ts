@@ -4,7 +4,7 @@
 // top of the dashboard, and produces the click-column bounds so
 // the raw mouse dispatch can route a click to a focus change.
 //
-// The full TitleBar drag-to-swap UX (MX9 widget) needs layout-
+// The former drag-to-swap widget needed layout-
 // render cooperation (pane order mutation) and is deferred to a
 // later phase. This module delivers the minimal "click pane name
 // to focus" so mouse-only users can still steer the dashboard.

@@ -145,12 +145,12 @@ describe('readiness countdown contract probe · RLA-LAUNCH-COUNTDOWN-PHASES', ()
     expect(withCurrentMeasurement.eta).toBe(t + 9 * 60_000);
   });
 
-  test('simulates T−11h through T0 with two explicit holds and blocks premature gate completion', () => {
+  test('simulates T−24h through T0 and T+ publish, verify, cleanup failures with fake-clock recovery', () => {
     const scenario = readinessCountdownPhasesScenario();
     const rows = simulateReadinessCountdown(scenario);
     const t0 = Date.parse('2026-11-07T00:00:00+09:00');
     const at = (hoursBefore: number) => t0 - hoursBefore * 60 * 60_000;
-    const phase = (name: 'T-11h' | 'T-7h' | 'T-2h' | 'T-30m' | 'T0') => rows.find((row) => row.launchPhase === name)!;
+    const phase = (name: 'T-24h' | 'T-11h' | 'T-7h' | 'T-2h' | 'T-30m' | 'T0' | 'T+' | 'publish' | 'verify' | 'cleanup') => rows.find((row) => row.launchPhase === name)!;
     const firstHold = rows.find((row) => row.holdReason?.startsWith('HOLD-1'))!;
     const cutoffAttempts = scenario.events.flatMap((event, index) => event.type === 'milestone-complete' && event.gate === 'cutoff' ? [index] : []);
     const heldCutoffAttempt = rows[cutoffAttempts[0]! + 1]!;
@@ -159,11 +159,16 @@ describe('readiness countdown contract probe · RLA-LAUNCH-COUNTDOWN-PHASES', ()
     const gateAttempt = scenario.events.findIndex((event) => event.type === 'milestone-complete' && event.gate === 'gate');
     const heldGateAttempt = rows[gateAttempt + 1]!;
 
+    expect(phase('T-24h').at).toBe(at(24));
     expect(phase('T-11h').at).toBe(at(11));
     expect(phase('T-7h').at).toBe(at(7));
     expect(phase('T-2h').at).toBe(at(2));
     expect(phase('T-30m').at).toBe(t0 - 30 * 60_000);
     expect(phase('T0').at).toBe(t0);
+    expect(phase('T+').at).toBe(t0 + 5 * 60_000);
+    expect(phase('publish').at).toBe(t0 + 5 * 60_000);
+    expect(phase('verify').at).toBe(t0 + 15 * 60_000);
+    expect(phase('cleanup').at).toBe(t0 + 25 * 60_000);
     expect(firstHold.holdCount).toBe(1);
     expect(firstHold.completed).not.toContain('cutoff');
     expect(heldCutoffAttempt.at).toBe(at(10));
@@ -181,10 +186,28 @@ describe('readiness countdown contract probe · RLA-LAUNCH-COUNTDOWN-PHASES', ()
     expect(heldGateAttempt.phase).toBe('hold');
     expect(heldGateAttempt.readyGate).toBe('gate');
     expect(heldGateAttempt.completed).not.toContain('gate');
-    expect(rows.at(-1)?.launchPhase).toBe('T0');
-    expect(rows.at(-1)?.holdCount).toBe(2);
+    const publishFailure = rows.find((row) => row.holdReason?.startsWith('publish failed'))!;
+    const verifyFailure = rows.find((row) => row.holdReason?.startsWith('verify failed'))!;
+    const cleanupFailure = rows.find((row) => row.holdReason?.startsWith('cleanup failed'))!;
+    const publishAttempt = rows.filter((row) => row.at === t0 + 5 * 60_000).at(-1)!;
+    const verifyAttempt = rows.filter((row) => row.at === t0 + 15 * 60_000).at(-1)!;
+    const cleanupAttempt = rows.filter((row) => row.at === t0 + 25 * 60_000).at(-1)!;
+    expect(publishFailure.readyGate).toBe('publish');
+    expect(publishAttempt.holdReason).toBe(publishFailure.holdReason);
+    expect(publishAttempt.completed).not.toContain('publish');
+    expect(verifyFailure.readyGate).toBe('announcement');
+    expect(verifyAttempt.holdReason).toBe(verifyFailure.holdReason);
+    expect(verifyAttempt.completed).not.toContain('announcement');
+    expect(cleanupFailure.readyGate).toBe('cleanup');
+    expect(cleanupAttempt.holdReason).toBe(cleanupFailure.holdReason);
+    expect(cleanupAttempt.completed).not.toContain('cleanup');
+    expect(rows.filter((row) => row.at === t0 + 10 * 60_000).at(-1)?.completed).toContain('publish');
+    expect(rows.filter((row) => row.at === t0 + 20 * 60_000).at(-1)?.completed).toContain('announcement');
+    expect(rows.filter((row) => row.at === t0 + 30 * 60_000).at(-1)?.completed).toContain('cleanup');
+    expect(rows.at(-1)?.launchPhase).toBe('cleanup');
+    expect(rows.at(-1)?.holdCount).toBe(5);
     expect(rows.at(-1)?.phase).toBe('ready');
-    expect(rows.at(-1)?.completed).toEqual(['cutoff', 'gate', 'publish', 'announcement']);
+    expect(rows.at(-1)?.completed).toEqual(['cutoff', 'gate', 'publish', 'announcement', 'cleanup']);
   });
 
   test('duplicate hold is idempotent; a hold after explicit release starts a new hold count', () => {
@@ -223,6 +246,7 @@ describe('readiness countdown contract probe · RLA-LAUNCH-COUNTDOWN-PHASES', ()
     expect(cutoffReady.hostReservedUntil).toBe(Date.parse('2026-11-06T22:55:00.000Z'));
     expect(cutoffReady.notifications).toEqual([]);
     const gateReady = rows.find((row) => row.at === Date.parse('2026-11-06T22:10:00.000Z') && row.readyGate === 'gate' && row.eta === Date.parse('2026-11-06T22:33:00.000Z'))!;
+    expect(rows[0]?.launchPhase).toBe('T-11h');
     expect(gateReady.hostReservedUntil).toBe(Date.parse('2026-11-06T23:03:00.000Z'));
     expect(gateReady.notifications).toEqual([{ type: 'eta-changed', eta: gateReady.eta }]);
     expect(finishedGate.readyGate).toBe('publish');

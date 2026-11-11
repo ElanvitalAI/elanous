@@ -166,6 +166,20 @@ describe('sendTelegramReport', () => {
     expect(ok).toBe(false);
   });
 
+  test('preserves callback data within Telegram byte limit and fails closed above it', async () => {
+    const calls: any[] = [];
+    const fetchMock = (async (_url: string, init: any) => {
+      calls.push(JSON.parse(init.body));
+      return { json: async () => ({ ok: true, result: { message_id: 1 } }) };
+    }) as unknown as typeof fetch;
+    const cfg = cfgWith({ botToken: 'MAIN:tok', homeChannel: 9 });
+    const valid = '한'.repeat(16) + 'a'.repeat(16); // exactly 64 UTF-8 bytes
+    expect(await sendTelegramReport(cfg, 'with button', { fetchImpl: fetchMock, buttons: [{ label: 'OK', value: valid }] })).toBe(true);
+    expect(calls[0]!.reply_markup.inline_keyboard[0][0].callback_data).toBe(valid);
+    expect(await sendTelegramReport(cfg, 'too long', { fetchImpl: fetchMock, buttons: [{ label: 'OK', value: '한'.repeat(22) }] })).toBe(false);
+    expect(calls).toHaveLength(1);
+  });
+
   // Fix 2 — cross-surface memory: the alert is mirrored into the REPORT
   // channel's bot-scoped session so a follow-up in that chat can recall it
   // (was surface_events-only, session_id NULL → wrong/no answer).

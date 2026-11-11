@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { extractBrowserActStep } from './browser-act-step.js';
+import { browserActionRowsToTrajectory } from './browser-trajectory.js';
+import { readTrajectory } from './browser-act-trajectory.js';
 
 const row = (data: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
   category: 'harness.browser-action', event: 'executed', ts: '2026-08-28T00:00:00.000Z',
@@ -9,14 +9,16 @@ const row = (data: Record<string, unknown>, extra: Record<string, unknown> = {})
 });
 
 describe('browser act step extraction', () => {
-  test('is the single parser both trajectory modules use', () => {
-    // 🪞 이 저장소에 같은 변환이 «둘» 있었다 — 뒤엣것을 내가 짓고 앞엣것을 «나중에» 알았다(2026-08-28).
-    for (const f of ['browser-trajectory.ts', 'browser-act-trajectory.ts']) {
-      const source = readFileSync(join(import.meta.dir, f), 'utf8');
-      expect(source).toContain('extractBrowserActStep');
-      // ⛔ 그리고 «자기 파서»로 되돌아가지 않았는지 — data 를 직접 JSON.parse 하는 자리가 없어야 한다
-      expect(source).not.toContain('JSON.parse(row.data');
-    }
+  test('both trajectory consumers interpret one encoded action and keep their own discard policy', () => {
+    // Source: browser-act-step.ts BrowserActStep.coordinates; browser-trajectory.ts discards null coordinates.
+    const action = row({ runId: 'run-a', url: 'https://example.test', target: '#save', coordinates: { x: 7, y: 9 } });
+    const failed = row({ runId: 'run-a', url: 'https://example.test', target: '#cancel', ok: false, coordinates: null });
+    const replay = browserActionRowsToTrajectory([action, failed], 'run-a');
+    const history = readTrajectory([action, failed].map((entry) => JSON.stringify(entry)).join('\n'));
+    expect(replay.trajectory).toEqual([{ target: '#save', coordinates: { x: 7, y: 9 } }]);
+    expect(replay.discarded.invalidRow).toBe(1); // Source: browser-trajectory.ts counts present-but-null coordinates as invalidRow.
+    expect(history.steps.map((step) => ({ target: step.target, coordinates: step.coordinates, ok: step.ok })))
+      .toEqual([{ target: '#save', coordinates: { x: 7, y: 9 }, ok: true }, { target: '#cancel', coordinates: null, ok: false }]);
   });
 
   test('parses the doubly-encoded data field — the row carries data as a string', () => {

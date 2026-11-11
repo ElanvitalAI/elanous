@@ -9,7 +9,7 @@ import type { LLMToolSpec } from '../../../llm/tool-spec.js';
 
 import { fileURLToPath } from 'node:url';
 import { debug } from '../../../debug/log.js';
-import { getUserConfig } from '../../../user-config.js';
+import { getUserConfig } from '../../../user-config/reader.js';
 
 import type { LLMToolDef } from '../../../plugins/core/types.js';
 import { getSessionCwd } from '../../../session/working-dir.js';

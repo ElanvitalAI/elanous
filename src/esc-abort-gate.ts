@@ -38,6 +38,20 @@ import { SELF_IMPLEMENT_TOOL_NAMES } from './boot/daemon-tools/self-implement-na
 
 export const DASHBOARD_CLARIFICATION_REQUEST = Symbol.for('elanous.dashboard.clarification-request');
 
+// Source: OP #96145 sets the confirmation boundary for a long Bash/RunShell execution to about five seconds.
+export const LONG_SHELL_ESC_CONFIRMATION_MS = 5_000;
+
+export function monotonicNowMs(): number {
+  // Source: Node process.hrtime.bigint() shares the host monotonic clock across the REPL and TUI processes.
+  return Number(process.hrtime.bigint() / 1_000_000n);
+}
+
+export function requiresLongShellEscConfirmation(toolName: string, elapsedMs: number): boolean {
+  return (toolName === 'Bash' || toolName === 'RunShell')
+    && Number.isFinite(elapsedMs)
+    && elapsedMs >= LONG_SHELL_ESC_CONFIRMATION_MS;
+}
+
 export interface EscAbortGateDeps {
   abortCtrl: AbortController;
   /** Return the count of running sub-agents. Called at each Escape
@@ -61,6 +75,8 @@ export interface EscAbortGateDeps {
   forceStopWithoutModal?: () => boolean;
   /** Non-modal replacement for the approval surface in unattended TUI mode. Timeout/cancel resolves false. */
   confirmStopInline?: () => Promise<boolean>;
+  /** Optional stop scope after inline confirmation; defaults to aborting the turn and its children. */
+  onInlineConfirmed?: (running: number) => 'turn-only' | 'kill-children' | void;
   /** Called before abortTurnOnly so the UI can paint a visible pending state immediately. */
   onAbortPending?: (event: { running: number; repeat: number; targets: readonly string[] }) => void;
   /** Called when another Escape arrives after the first abort request. */
@@ -301,7 +317,9 @@ export function createEscAbortGate(deps: EscAbortGateDeps): EscAbortGate {
         void deps.confirmStopInline().then((confirmed) => {
           if (confirmed && !disposed && !deps.abortCtrl.signal.aborted) {
             debug.log('esc.abort', 'unattended-inline-confirmed', { running });
-            abortAndKillChildren(deps.abortCtrl);
+            const scope = deps.onInlineConfirmed?.(running);
+            if (scope === 'turn-only') abortPendingTurn(running);
+            else abortAndKillChildren(deps.abortCtrl);
           } else {
             debug.log('esc.abort', 'unattended-inline-cancelled', { running, reason: 'declined-or-timeout' });
             resetAbortRequestState();

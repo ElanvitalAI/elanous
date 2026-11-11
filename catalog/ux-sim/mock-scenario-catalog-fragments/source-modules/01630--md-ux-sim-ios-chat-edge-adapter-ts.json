@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-IOS-CHAT-EDGE-ADAPTER-TS",
+  "path": "src/ux-sim/ios-chat-edge-adapter.ts",
+  "boundary": "Maps the seven declared iOS chat edge cases into generic edge-creator seeds while preserving incident identity and planner axes.",
+  "deviceIds": ["edge-creator"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

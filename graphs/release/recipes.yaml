@@ -14,6 +14,9 @@ cutoff:
 checklist-gate:
   command: 'bun scripts/release-loop/checklist-gate-node.ts'
   timeout_ms: 600000
+regression-suite:
+  command: 'bun scripts/release-loop/regression-suite-node.ts'
+  timeout_ms: 600000
 tsc:
   command: 'bun run scripts/ci-typecheck-changed.ts'
   timeout_ms: 3600000
@@ -24,6 +27,9 @@ gate:
   command: 'bun scripts/release-loop/gate-node.ts --json'
   # 4h — the Pod gate took 2h02m on 09-30 (G1f ②) and the 0.2.5 loop was cut at exactly 2h with no verdict; K9 (≤15 min) is the real fix.
   timeout_ms: 14400000
+gate-cutover-switch:
+  command: 'bun scripts/release-loop/gate-cutover-switch-node.ts'
+  timeout_ms: 30000
 emergency-switch:
   command: 'bun scripts/release-loop/emergency-publish-switch-sim.ts'
   timeout_ms: 30000
@@ -89,6 +95,9 @@ gate-heal-decision:
 gate-same-run-recheck:
   command: 'bun scripts/release-loop/gate-same-run-recheck-node.ts'
   timeout_ms: 600000
+gate-append-recheck-plan:
+  command: 'bun scripts/release-loop/gate-append-recheck-plan-node.ts'
+  timeout_ms: 30000
 publish-command:
   command: 'bun scripts/release-loop/publish-node.ts'
   # 30m scheduled wait + 30m publish subprocess + 30m bounded asset polling.
@@ -106,6 +115,9 @@ verify:
 traffic-verify-complete:
   command: 'bun scripts/release-loop/traffic-node.ts traffic-verify-complete'
   timeout_ms: 30000
+pwa-formal-update:
+  command: 'bun scripts/release-loop/pwa-formal-update-node.ts'
+  timeout_ms: 1800000
 vault-note:
   command: 'bun scripts/release-loop/vault-note-node.ts'
   timeout_ms: 60000

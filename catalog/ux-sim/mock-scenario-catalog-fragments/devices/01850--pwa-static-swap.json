@@ -1,0 +1,32 @@
+{
+  "id": "pwa-static-swap-world",
+  "name": "pwa-static-swap-world · PWA static generation atomic swap simulation",
+  "audience": "internal",
+  "checklistCells": ["RLA-PWA-FORMAL-UPDATE", "RELEASE-WIN-SMOKE"],
+  "implementation": [
+    "src/ux-sim/pwa-static-swap.ts",
+    "scripts/release-loop/pwa-formal-update.ts",
+    "apps/pwa/scripts/publish-static-generation.ts"
+  ],
+  "tests": [
+    "src/ux-sim/pwa-static-swap.test.ts",
+    "scripts/release-loop/pwa-formal-update-sim.test.ts"
+  ],
+  "target": "The production Nexus PWA post-publish path and atomic static generation publisher, with only external CLI, HTTP and pointer-swap failure boundaries injected.",
+  "inputs": [
+    "previous and candidate static generations",
+    "injected pointer rename failure",
+    "Nexus restart and served-client observation boundaries"
+  ],
+  "observations": [
+    "failed atomic swap keeps the previous generation and its HTML served",
+    "Nexus restart and client observation are skipped when swap fails",
+    "successful path verifies served build SHA and service-worker digest after restart"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/pwa-static-swap.test.ts scripts/release-loop/pwa-formal-update-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

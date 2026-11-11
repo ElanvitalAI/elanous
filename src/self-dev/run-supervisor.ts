@@ -1,6 +1,7 @@
 // ── 런 슈퍼바이저 — 「끝까지 돌린다」를 «판정»으로 만든다 ───────────────────────
 
 import { hasDelivered, resumeKey, triageRun, type FailureClassification } from './orchestrate.js';
+import { createHash } from 'node:crypto';
 import type { DeployVerifyFinding } from '../harness/browser-verify.js';
 import type { SelfDevJobResult, SupervisorStopReason, SupervisorNext, ReviewRework } from './run-types.js';
 import { authorRepairGoal } from '../harness/helper-repair.js';
@@ -8,7 +9,9 @@ export type { SupervisorStopReason } from './run-types.js';
 export { SUPERVISOR_STOP_REASONS } from './run-types.js';
 import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
 import { readRunChart, recordRunChartDecision } from '../self-implement/run-chart.js';
-import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
+import { appendRunLedgerEntry, loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
+import { existsSync } from 'node:fs';
+import { LogStore, logsDbPath, type LogStoreRow } from '../mss/logging/log-store.js';
 import { debug } from '../debug/log.js';
 import { checkCitedReviewPathsAtHead, citedReviewPaths } from '../agent-substrate/review-finding-key.js';
 import { sweepFrozenMerges } from '../self-implement/frozen-merges.js';
@@ -1356,6 +1359,92 @@ export interface SuperviseRunOptions {
   }>;
 }
 
+interface BoundaryRejectLoopEvidence {
+  readonly runId: string;
+  readonly repeatedTool: string;
+  readonly repeatedToolCalls: number;
+  readonly rejectionSignature: string;
+  readonly repeatedRejections: number;
+}
+
+// Source: SOLAR run-16104df2 repeated the same main-tree rejection across rework2; two identical events are the minimum recurrence.
+const BOUNDARY_REJECT_REPEAT_MINIMUM = 2;
+// Source: opaque ledger fingerprints must stay short and contain no rejected command text.
+const BOUNDARY_REJECT_SIGNATURE_HEX_LENGTH = 16;
+
+function parsedLogData(row: LogStoreRow): Record<string, unknown> | null {
+  if (typeof row.data !== 'string') return null;
+  try {
+    const parsed: unknown = JSON.parse(row.data);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown> : null;
+  } catch { return null; }
+}
+
+/** Requires both a repeated identical boundary rejection and repeated use of its tool in that run. */
+export function detectBoundaryRejectLoop(rows: readonly LogStoreRow[]): BoundaryRejectLoopEvidence | null {
+  const pendingDispatches = new Map<string, number[]>();
+  const consumedDispatchIds = new Set<number>();
+  const rejectCounts = new Map<string, { runId: string; tool: string; matchedDispatchIds: number[] }>();
+  for (const row of [...rows].sort((left, right) => left.id - right.id)) {
+    const data = parsedLogData(row);
+    if (!data || typeof data.runId !== 'string' || !row.session_id) continue;
+    if (row.category === 'cli.agent' && row.event === 'tool-dispatch' && typeof data.tool === 'string') {
+      if (typeof data.commandHash !== 'string' || data.tool !== 'Bash') continue;
+      const key = [data.runId, row.session_id, data.tool, data.commandHash].join('\0');
+      const pending = pendingDispatches.get(key) ?? [];
+      pending.push(row.id);
+      pendingDispatches.set(key, pending);
+      continue;
+    }
+    if (row.category !== 'harness.boundary' || row.event !== 'main-tree-reject') continue;
+    if (typeof data.reasonKind !== 'string' || typeof data.commandFirstToken !== 'string'
+      || typeof data.commandAction !== 'string' || typeof data.commandHash !== 'string') continue;
+    const dispatchKey = [data.runId, row.session_id, 'Bash', data.commandHash].join('\0');
+    const pending = pendingDispatches.get(dispatchKey);
+    const dispatchId = pending?.[0];
+    if (dispatchId === undefined || dispatchId >= row.id || consumedDispatchIds.has(dispatchId)) continue;
+    // One dispatch row can justify only one rejection; repeats require separate actual calls.
+    pending!.shift();
+    consumedDispatchIds.add(dispatchId);
+    const signature = [data.runId, row.session_id, 'Bash', data.reasonKind, data.commandFirstToken, data.commandAction, data.commandHash].join('\0');
+    const current = rejectCounts.get(signature) ?? { runId: data.runId, tool: 'Bash', matchedDispatchIds: [] };
+    current.matchedDispatchIds.push(dispatchId);
+    rejectCounts.set(signature, current);
+  }
+  for (const [signature, rejection] of rejectCounts) {
+    if (rejection.matchedDispatchIds.length < BOUNDARY_REJECT_REPEAT_MINIMUM) continue;
+    return {
+      runId: rejection.runId,
+      repeatedTool: rejection.tool,
+      repeatedToolCalls: rejection.matchedDispatchIds.length,
+      rejectionSignature: createBoundaryRejectSignature(signature),
+      repeatedRejections: rejection.matchedDispatchIds.length,
+    };
+  }
+  return null;
+}
+
+function createBoundaryRejectSignature(signature: string): string {
+  // Store a stable opaque fingerprint; rejected command text stays out of the run ledger.
+  return createHash('sha256').update(signature).digest('hex').slice(0, BOUNDARY_REJECT_SIGNATURE_HEX_LENGTH);
+}
+
+function readBoundaryRejectEvidence(runIds: readonly string[]): LogStoreRow[] {
+  if (runIds.length === 0 || !existsSync(logsDbPath())) return [];
+  let store: LogStore | undefined;
+  try {
+    store = LogStore.openReadOnly(logsDbPath());
+    return store.queryByDataKeys({ exactCategories: ['harness.boundary', 'cli.agent'], runIds });
+  } catch (error) {
+    try { debug.log('self-dev.supervisor', 'boundary-evidence-read-failed', { error: String(error) }); } catch { /* fail-soft */ }
+    return [];
+  }
+  finally {
+    try { store?.close(); } catch (error) { try { debug.log('self-dev.supervisor', 'boundary-evidence-close-failed', { error: String(error) }); } catch { /* fail-soft */ } }
+  }
+}
+
 /** Adapt REVIEW-ROUND-REAUTHOR's decision into an observation without duplicating its classification logic. */
 export function supervisorReauthorRequestObservations(
   decision: SupervisorDecision,
@@ -1500,6 +1589,47 @@ export async function superviseRun(opts: SuperviseRunOptions): Promise<Superviso
         ...(allUnreviewedAreNoDiff ? { reviewReason: 'no-diff' } : {}),
       } : {}),
     });
+    const boundaryRunIds = [...new Set(results.flatMap((result) =>
+      [result.childRunId, result.runId].filter((id): id is string => typeof id === 'string' && id.trim().length > 0)))];
+    const boundaryEvidence = detectBoundaryRejectLoop(readBoundaryRejectEvidence(boundaryRunIds));
+    if (boundaryEvidence && decision.action !== 'stop') {
+      decision = {
+        ...decision,
+        action: 'stop',
+        stopReason: 'boundary-reject-loop',
+        why: `같은 main-tree 경계 거부가 ${boundaryEvidence.repeatedRejections}회 반복되고 ${boundaryEvidence.repeatedTool} 도구 호출 ${boundaryEvidence.repeatedToolCalls}회가 관측되어 재실행을 중단함 (signature ${boundaryEvidence.rejectionSignature})`,
+      };
+      try {
+        opts.observe?.('supervisor.boundary-reject-loop', {
+          runId: chartRunId,
+          childRunId: boundaryEvidence.runId,
+          repeatedTool: boundaryEvidence.repeatedTool,
+          repeatedToolCalls: boundaryEvidence.repeatedToolCalls,
+          repeatedRejections: boundaryEvidence.repeatedRejections,
+          rejectionSignature: boundaryEvidence.rejectionSignature,
+          action: 'stop',
+        });
+      } catch { /* observation must not interrupt supervision */ }
+      if (chartRunId) {
+        try {
+          appendRunLedgerEntry({
+            timestamp: new Date().toISOString(),
+            runId: chartRunId,
+            event: 'supervisor.boundary-reject-loop',
+            data: {
+              reason: 'same-boundary-rejection-and-tool-call-repeated',
+              childRunId: boundaryEvidence.runId,
+              repeatedTool: boundaryEvidence.repeatedTool,
+              repeatedToolCalls: boundaryEvidence.repeatedToolCalls,
+              repeatedRejections: boundaryEvidence.repeatedRejections,
+              rejectionSignature: boundaryEvidence.rejectionSignature,
+            },
+          }, chartDir);
+        } catch (error) {
+          try { debug.log('self-dev.supervisor', 'boundary-loop-ledger-write-failed', { runId: chartRunId, error: String(error) }); } catch { /* fail-soft */ }
+        }
+      }
+    }
     if (decision.reauthor) {
       try {
         opts.observe?.('review.reauthor', {

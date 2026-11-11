@@ -20,7 +20,7 @@ import { readFreshAvailabilityState, quotaSignalDir, readQuotaSignal, readQuotaS
 import { creditPaceStatus } from '../budget/codex-credit-pace.js';
 import { noteCodexBillingDecision, type CodexCreditSpendReason } from './codex-billing-route.js';
 import { loadLlmPolicy } from '../policy/llm-policy.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import {
   decideCodexRotation, observeRotation, applyRotation, readCodexAccountRotationConfig, rotatedChildEnv, creditCandidatesByBalance, CODEX_CREDIT_RESERVE_DEFAULT,
   codexAccountThresholdPercent,
@@ -36,6 +36,7 @@ import {
 import type { ClaudePtyMaturity } from './claude-pty-maturity.js';
 import type { UsageOutcomesDeps } from '../budget/usage-outcomes.js';
 import { resolveGrokCredential } from '../grok/credential.js';
+import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
 import { getOpenRouterApiKey } from '../config.js';
 import { zaiCodingPlanAvailable } from '../llm/zai-coding-plan.js';
 import { lookupOpenRouterModelSpec } from '../model-tier/llm-tier-map.js';
@@ -181,7 +182,7 @@ export function activeCodexAccountView(
   //   ⛔ 그리고 여기에 「주입 가능한 resolver」를 두지 «않는다» — 아무도 안 쓰는 확장은
   //     계약만 넓히고 두 자가 갈릴 자리를 새로 만든다(리뷰 must-fix).
   const account = resolveCodexAccountForRun(env, storePath ? { storePath } : {});
-  const stored = loadTokens(account.storeKey, storePath ?? authStorePath());
+  const stored = loadTokens(account.storeKey, storePath ?? codexAccountReadStorePath(authStorePath()));
   const eff = effectiveCodexHome(account, stored, env);
   return {
     name: account.name,
@@ -340,7 +341,7 @@ function rotationCreditsGrant(candidates: readonly RotationCandidate[]): Rotatio
 }
 
 function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessEnv = process.env): RotationCandidate[] {
-  return listCodexAccountsInStore(path)
+  return listCodexAccountsInStore(path, now)
     .map((row) => {
       const stored = loadTokens(row.storeKey, path);
       // ⛔ 홈을 모르는 «이름» 계정은 후보가 «아니다» — 모르는 곳으로 넘기지 않는다.
@@ -580,7 +581,7 @@ export function notifyCodexResetCreditConsumed(
   remainingCount: number | undefined,
   deps: { readonly storePath?: string; readonly now?: number } = {},
 ): void {
-  const path = deps.storePath ?? authStorePath();
+  const path = deps.storePath ?? codexAccountReadStorePath(authStorePath());
   notifyCodexAccountEventWithUsage('reset-credit-consumed', path, deps.now ?? Date.now(),
     (usageSnapshot) => ({
       account: account.name,
@@ -681,7 +682,7 @@ export function inspectCodexRotation(
   /** SUBSCRIPTION-EXHAUST-REROUTE — 크레딧 예비분에 닿아 `no-candidate` 가 됐을 때만 있다. */
   readonly creditReserveHit?: { readonly balance: number; readonly reserve: number };
 } {
-  const path = deps.storePath ?? authStorePath();
+  const path = deps.storePath ?? codexAccountReadStorePath(authStorePath());
   const now = deps.now ?? Date.now();
   // ⛔ 여기도 «같은 심»을 쓴다 — 한 자리만 고치면 표면과 런타임이 «다른 계정»을 말한다
   //   (2026-08-11 72차: 실제로 그랬다 — 런타임은 고쳤는데 status 가 계속 default 를 말했다).
@@ -735,7 +736,7 @@ export function resolveCodexAccountForRun(
 ): CodexAccountResolution {
   // ⛔ 「이름만 주고 홈을 안 준」 경우를 정본 기록으로 메운다 — 안 그러면 조용히 default 로 떨어지고
   //   관측은 `explicit` 이라 말한다(2026-08-11 72차 실측).
-  const storePathForHome = deps.storePath ?? authStorePath();
+  const storePathForHome = deps.storePath ?? codexAccountReadStorePath(authStorePath());
   const current = resolveCodexAccount(env, { storedHome: (key) => loadTokens(key, storePathForHome)?.codexHome });
   const explicit = Boolean(env.ELANOUS_CODEX_ACCOUNT?.trim());
   // ⛔⭐ 사람이 «명시»했으면 고정보다 «먼저» 이긴다(결정 ③) — 고정을 읽지도 쓰지도 않는다.
@@ -776,10 +777,15 @@ export function resolveCodexAccountForRun(
       //   🔑 전환은 «소진당 한 번»으로 갇히고, 그 뒤 다시 핀이 박힌다.
       const pinnedHome = pinned.home;
       const exhausted = pinnedHome !== undefined && pinnedAccountExhausted(pinnedHome, pinned.resolution.name);
-      if (!exhausted) { noteCodexBillingDecision(pinned.creditReason); return pinned.resolution; }
+      let mirrorExpired = false;
+      if (loadTokens(pinned.resolution.storeKey, path)?.source === 'mirror') {
+        try { readCodexOwnerAccessMirror(pinned.resolution.storeKey, { path }); }
+        catch { mirrorExpired = true; }
+      }
+      if (!exhausted && !mirrorExpired) { noteCodexBillingDecision(pinned.creditReason); return pinned.resolution; }
       pinnedByRun.delete(runKey);
       debug.log('oauth.codex-account', 'pin-released',
-        { account: pinned.resolution.name, why: 'threshold-reached' }, { level: 'warn' });
+        { account: pinned.resolution.name, why: mirrorExpired ? 'mirror-expiring' : 'threshold-reached' }, { level: 'warn' });
     }
   }
   const now = Date.now();
@@ -860,7 +866,7 @@ export function resolveCodexAccountForRun(
 /** 리셋권 자동 소비 결과 — 소비했거나, 왜 안 했는지(관측 `reset-consume-skipped` 와 같은 이유). */
 export type CodexResetAutoConsumeOutcome =
   | { readonly consumed: true; readonly account: string; readonly expiresAt: string | null; readonly todayCount: number; readonly redecision?: string }
-  | { readonly consumed: false; readonly reason: 'disabled' | 'daily-cap-reached' | 'test-runtime-guard' | 'in-flight' | 'lock-held' | 'no-available-credit' | 'consume-failed' | 'error'; readonly detail?: string };
+  | { readonly consumed: false; readonly reason: 'disabled' | 'daily-cap-reached' | 'test-runtime-guard' | 'mirror-read-only' | 'in-flight' | 'lock-held' | 'no-available-credit' | 'consume-failed' | 'error'; readonly detail?: string };
 
 export interface CodexResetAutoConsumeDeps {
   readonly storePath?: string;
@@ -902,6 +908,8 @@ export async function autoConsumeCodexResetCredit(deps: CodexResetAutoConsumeDep
     debug.log('codex.rotation', 'reset-consume-skipped', { reason, ...extra });
     return { consumed: false, reason, ...(typeof extra.detail === 'string' ? { detail: extra.detail } : {}) };
   };
+  const readPath = deps.storePath ?? codexAccountReadStorePath(authStorePath());
+  if (readPath === codexOwnerMirrorAuthPath() || listProviders(readPath).some((key) => isCodexStoreKey(key) && loadTokens(key, readPath)?.source === 'mirror')) return skip('mirror-read-only');
   const cap = resetAutoConsumePerDayFromConfig();
   if (cap <= 0) return skip('disabled', { cap });
   const now = deps.now ?? Date.now();
@@ -927,7 +935,7 @@ export async function autoConsumeCodexResetCredit(deps: CodexResetAutoConsumeDep
     // 다른 프로세스가 방금 썼을 수 있다 — 잠근 «뒤»에 다시 센다.
     const locked = readAutoConsumeCount(counterPath, day);
     if (locked >= cap) return skip('daily-cap-reached', { cap, todayCount: locked });
-    const path = deps.storePath ?? authStorePath();
+    const path = deps.storePath ?? codexAccountReadStorePath(authStorePath());
     let earliest: { name: string; home: string; expiresAt: string | null; expiresMs: number } | undefined;
     for (const candidate of buildRotationCandidates(path, now, deps.env ?? process.env)) {
       if (!candidate.home) continue;
@@ -988,7 +996,7 @@ export function rotatedCodexChildEnv(
 ): Record<string, string> {
   try {
     const account = resolveCodexAccountForRun(env, deps);
-    const home = effectiveCodexHome(account, loadTokens(account.storeKey, deps.storePath ?? authStorePath()), env).home;
+    const home = effectiveCodexHome(account, loadTokens(account.storeKey, deps.storePath ?? codexAccountReadStorePath(authStorePath())), env).home;
     return rotatedChildEnv(account.source, home);
   } catch (error) {
     debug.log('oauth.codex-account', 'child-env-failed', {
@@ -998,7 +1006,7 @@ export function rotatedCodexChildEnv(
   }
 }
 
-export interface StoredCodexAccount { name: string; storeKey: string; authMode?: string }
+export interface StoredCodexAccount { name: string; storeKey: string; authMode?: string; source?: 'mirror' }
 
 /**
  * 정본 스토어가 «아는» codex 계정 전부.
@@ -1010,15 +1018,19 @@ export interface StoredCodexAccount { name: string; storeKey: string; authMode?:
  * ⛔ 접미가 «부적격»인 키(`openai-codex:` · 구분자 섞인 이름)는 계정으로 «안» 센다(5R should-fix) —
  *   import 가 만들 수 없는 형태이므로, 손으로 편집된 스토어를 계정처럼 보여 주지 않는다.
  */
-export function listCodexAccountsInStore(storePath?: string): StoredCodexAccount[] {
-  const path = storePath ?? authStorePath();
+export function listCodexAccountsInStore(storePath?: string, now = Date.now()): StoredCodexAccount[] {
+  const path = storePath ?? codexAccountReadStorePath(authStorePath());
   return listProviders(path)
     .filter((key) => isCodexStoreKey(key)
       && (key === 'openai-codex' || isValidAccountName(accountNameFromStoreKey(key))))
     .map((key) => {
       const s = loadTokens(key, path);
+      if (s && (s.source === 'mirror' || path === codexOwnerMirrorAuthPath())) {
+        try { readCodexOwnerAccessMirror(key, { path, now }); }
+        catch { return null; }
+      }
       return s
-        ? { name: accountNameFromStoreKey(key), storeKey: key, ...(s.authMode ? { authMode: s.authMode } : {}) }
+        ? { name: accountNameFromStoreKey(key), storeKey: key, ...(s.authMode ? { authMode: s.authMode } : {}), ...(s.source ? { source: s.source } : {}) }
         : null;
     })
     .filter((r): r is StoredCodexAccount => r !== null);

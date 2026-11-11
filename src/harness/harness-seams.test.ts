@@ -1,6 +1,6 @@
 // 하니스 실 seam 팩토리(H1) — fake SelfImplementSeams 로 배선·fail-closed deploy·하니스 통합 검증.
 import { test, expect, describe, spyOn } from 'bun:test';
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import * as prReviewer from '../agent-substrate/pr-reviewer.js';
@@ -69,9 +69,6 @@ describe('buildHarnessSeams — 실 인프라 배선(fake)', () => {
       }
       expect(seamPayloads).toContainEqual(expect.objectContaining({ steps: 2 }));
       expect(seamPayloads).toContainEqual(expect.objectContaining({ oversized: expect.any(Number), tooSmall: expect.any(Number) }));
-      expect(readFileSync(new URL('./harness-seams.ts', import.meta.url), 'utf8')).toContain(
-        "debug.log('harness.seams', event, { runId, ...data })",
-      );
     } finally {
       log.mockRestore();
       if (previousRunId === undefined) delete process.env.ELANOUS_RUN_ID; else process.env.ELANOUS_RUN_ID = previousRunId;

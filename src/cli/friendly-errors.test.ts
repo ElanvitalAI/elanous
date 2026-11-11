@@ -40,7 +40,7 @@ describe('classifyFriendlyError', () => {
     expect(classifyFriendlyError(new Error('connect ECONNREFUSED 127.0.0.1:1'))).toBe('network');
     expect(classifyFriendlyError(new Error('usage_limit_reached'))).toBe('quota');
     expect(classifyFriendlyError(new Error('Too many requests'))).toBe('quota');
-    expect(classifyFriendlyError(new Error('ask --bare: input exceeds the 8000-token context budget'))).toBe('context-too-long');
+    expect(classifyFriendlyError(new Error('llm: input exceeds the 8000-token context budget'))).toBe('context-too-long');
     expect(classifyFriendlyError(new Error('prompt is too long'))).toBe('context-too-long');
     expect(classifyFriendlyError(new SyntaxError('JSON Parse error: Unexpected token'))).toBe('config-broken');
     expect(classifyFriendlyError(new Error('elanous_task_submit: the elanous daemon is not running in this universe'))).toBe('daemon-down');

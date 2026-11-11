@@ -20,6 +20,51 @@ const syncPoolImages: typeof syncPoolImagesRaw = (members, image, commit, deps =
   syncPoolImagesRaw(members, image, commit, { ...deps, lock: deps.lock ?? imageTestLock() });
 
 describe('pod pool — priority ⊕ per-node capacity', () => {
+  test('an aborted waiter is removed from cloud-starvation demand while occupancy is pending', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-pool-cloud-waiter-'));
+    try {
+      let delayed: Promise<Record<string, MemberOccupancy>> | undefined;
+      let releaseReading: ((value: Record<string, MemberOccupancy>) => void) | undefined;
+      const pressures: number[] = [];
+      const pool = new PodPoolScheduler([{ context: 'full', capacity: 1, k3dCluster: 'full' }], { // Source: 내부 문서 `pod-federation-mapreduce` §2 — one full fixture member ensures a no-slot signal.
+        hostLease: new HostPoolLease('cloud-waiter', { dir }),
+        occupancy: () => delayed ?? { full: { occupied: 1 } },
+      });
+      pool.setCloudStarvationHandler(({ queueDepth }) => { pressures.push(queueDepth); });
+      expect(await pool.tryAcquire(undefined, undefined, { waiterId: 'cancel-me' })).toBeNull();
+      delayed = new Promise(resolve => { releaseReading = resolve; });
+      const controller = new AbortController();
+      const cancelled = pool.tryAcquire(undefined, undefined, { waiterId: 'cancel-me', signal: controller.signal });
+      controller.abort(new Error('waiter cancelled'));
+      releaseReading!({ full: { occupied: 1 } });
+      await expect(cancelled).rejects.toThrow('waiter cancelled');
+      await pool.reconcileCloudCapacity('cancelled waiter cleanup');
+      expect(pressures.at(-1)).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a stale abort listener cannot remove a replacement waiter with the same id', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-pool-replaced-waiter-'));
+    try {
+      const pressures: number[] = [];
+      const pool = new PodPoolScheduler([{ context: 'full', capacity: 1, k3dCluster: 'full' }], { // Source: 내부 문서 `pod-federation-mapreduce` §2 — one occupied slot blocks this fixture member.
+        hostLease: new HostPoolLease('replaced-cloud-waiter', { dir }),
+        occupancy: () => ({ full: { occupied: 1 } }),
+      });
+      pool.setCloudStarvationHandler(({ queueDepth }) => { pressures.push(queueDepth); });
+      const oldSignal = new AbortController();
+      const currentSignal = new AbortController();
+      expect(await pool.tryAcquire(undefined, undefined, { waiterId: 'same-waiter', signal: oldSignal.signal })).toBeNull();
+      expect(await pool.tryAcquire(undefined, undefined, { waiterId: 'same-waiter', signal: currentSignal.signal })).toBeNull();
+      oldSignal.abort();
+      await pool.reconcileCloudCapacity('stale abort must not remove the replacement waiter');
+      expect(pressures.at(-1)).toBe(1);
+      currentSignal.abort();
+      await pool.reconcileCloudCapacity('current abort removes the waiter');
+      expect(pressures.at(-1)).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('podImageBuildScript ignores partial git output after a failed top-level probe', () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-build-root-partial-'));
     const partialRoot = join(root, 'partial-output');

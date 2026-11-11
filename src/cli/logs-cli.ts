@@ -40,7 +40,7 @@ import '../user-config.js'; // Register the saved timezone for standalone logs C
 import { HARNESS_SPACE_KINDS } from '../harness/harness-space.js';
 import { LOG_RETENTION_DEFAULTS, LogCursorNotFoundError, STORE_SAFETY_MAX } from '../mss/logging/log-store.js';
 import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
-import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { tokenizeGrepPhrase } from '../domains/logs-tool.js';
 import { LOG_AXIS_CATEGORIES, knownLogAxes, resolveLogAxis } from '../mss/logging/log-axis.js';
@@ -225,6 +225,9 @@ export function resolveLogTargets(
   //   기본에 들이는 것이라 노이즈가 크고 아직 실증이 없다. **실측된 결함만** 최소로 덮는다 —
   //   운영에서 자식(worktree test)을 보는 쪽은 여전히 `--all --include-test` 소관이다.
   const self: LogTarget = deps.self ?? { name: resolveLogInstanceName(), dbPath: logsDbPath() };
+  // An explicit config-dir names one universe. If its DB cannot be opened,
+  // reporting success from the implicit prod fallback hides that failure.
+  if (getElanousConfigDirOverride()) return { targets: [self] };
   const prod = deps.prod ?? prodTarget();
   return { targets: self.dbPath === prod.dbPath ? [self] : [self, prod] };
 }

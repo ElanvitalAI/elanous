@@ -38,7 +38,7 @@ import type { ModalSurface } from '../src/display/modal-stack.js';
 
 /** Synthesize a recipe-style modal surface — onKey/onMouse mutate
  *  internal state, paint() output reflects that state. Mirrors the
- *  shape of `createDockMenuTreeRecipe` and other PopupAuthority-
+ *  shape of the dock launcher and other PopupAuthority-
  *  mounted recipes (mouse-action-recipes.ts:778). */
 function makeRecipeSurface(opts: {
   id: string;

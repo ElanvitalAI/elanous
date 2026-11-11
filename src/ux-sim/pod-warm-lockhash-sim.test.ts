@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gateLockfileHash } from '../self-implement/gate-receipt-registry.js';
+import { gateLockfileHash, gateLockfileHashBytes } from '../self-implement/gate-receipt-registry.js';
 import { warmWorkerSourceMatches } from '../task-orchestrator/surfaces/pod-warm-worker-runtime.js';
 import { allocatePodPhaseCandidates, podPhaseGateIdentityMatches } from '../task-orchestrator/surfaces/pod-warm-switch.js';
 import { scoreWarmPodCandidates } from '../task-orchestrator/surfaces/pod-warm-provenance.js';
@@ -33,8 +33,10 @@ function seedRepo() {
 test('POD-WARM-NORMALIZE · one bun.lock identity satisfies reconcile, gate selection, worker init, and precut canary', async () => {
   const { root, cutSha } = seedRepo();
   const lockHash = gateLockfileHash(root);
-  const rawHash = createHash('sha256').update(readFileSync(join(root, 'bun.lock'))).digest('hex');
+  const lockBytes = readFileSync(join(root, 'bun.lock'));
+  const rawHash = createHash('sha256').update(lockBytes).digest('hex');
   expect(lockHash).not.toBe(rawHash);
+  expect(gateLockfileHashBytes(lockBytes)).toBe(lockHash);
 
   const key = { context: 'sim-host', imageDigest: `sha256:${'a'.repeat(64)}`, lockHash, architecture: 'amd64' };
   const phaseConfig = { gateIdentity: { cutSha, lockHash } };

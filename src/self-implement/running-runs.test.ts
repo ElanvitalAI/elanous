@@ -925,16 +925,7 @@ test('noCache bypasses the process-lifetime ledger cache without evicting it', (
   }
 });
 
-test('ledger cache invalidates by mtime and size checks only — no file watcher in the query path', async () => {
-  const { readFileSync } = await import('node:fs');
-  for (const file of ['running-runs.ts', 'run-ledger.ts']) {
-    const source = readFileSync(join(import.meta.dir, file), 'utf8');
-    expect(source).not.toMatch(/\bwatch(File)?\s*\(/);
-    expect(source).not.toMatch(/from 'node:fs\/promises'[^;]*\bwatch\b|\bFSWatcher\b/);
-  }
-});
-
-test('a process that queried running runs exits promptly without being held open by the cache', () => {
+test('ledger cache hits on a repeated query and leaves no watcher holding the process open', () => {
   const root = mkdtempSync(join(tmpdir(), 'running-runs-exit-'));
   const directory = join(root, 'run-ledger');
   mkdirSync(directory);

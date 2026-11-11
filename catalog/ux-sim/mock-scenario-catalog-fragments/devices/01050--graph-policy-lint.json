@@ -1,0 +1,30 @@
+{
+  "id": "graph-policy-lint",
+  "name": "Graph manifest policy validation before publishing",
+  "checklistCells": ["GRAPH-POLICY-LINT"],
+  "implementation": [
+    "scripts/check-graph-declaration.ts",
+    "src/graph-runner/graph-cli.ts"
+  ],
+  "tests": [
+    "src/ux-sim/graph-policy-lint-sim.test.ts",
+    "src/graph-runner/graph-cli.test.ts"
+  ],
+  "target": "Reject unsafe graph declarations before they can be published or run.",
+  "inputs": [
+    "graph manifest with a safe policy",
+    "graph manifest with an undeclared capability or unsafe extension",
+    "graph CLI validation request"
+  ],
+  "observations": [
+    "safe declarations pass validation",
+    "unsafe declarations fail with a stable policy diagnostic",
+    "the CLI refuses to publish or execute rejected declarations"
+  ],
+  "eventNames": [],
+  "entryCommands": [
+    "bun test src/ux-sim/graph-policy-lint-sim.test.ts src/graph-runner/graph-cli.test.ts"
+  ],
+  "logsRecorded": "no",
+  "recentUse": null
+}

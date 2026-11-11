@@ -18,7 +18,7 @@ export interface SeatPtyStep {
   /** Raw bytes written to the PTY (already a key: '\x1b', '\x11' …). */
   keys?: string;
   /** Typed text; with `enter` (default true) a separate '\r' follows after a short gap, like a person. */
-  text?: string;
+  text?: string | (() => string);
   enter?: boolean;
   /** Raw chunks written in order with `gapMs` between them (for «type while busy»). */
   chunks?: string[];
@@ -45,6 +45,9 @@ export interface SeatPtySequenceSpec {
   quitKeys?: string;
   exitTimeoutMs?: number;
   artifactPath?: string;
+  /** Observe actual PTY bytes and Enter time for latency/paint receipts. */
+  onOutput?: (chunk: string, atMs: number) => void;
+  onStepInput?: (label: string, atMs: number) => void;
 }
 
 export interface SeatPtySequenceFrame {
@@ -149,6 +152,7 @@ export async function mockSeatPtySequence(spec: SeatPtySequenceSpec): Promise<Se
     }
     pty = spawn(executable, args, { name: 'xterm-256color', cols, rows, cwd: root, env: childEnv });
     const data = pty.onData((chunk) => {
+      spec.onOutput?.(chunk, performance.now());
       pending = pending.then(() => new Promise<void>((r) => terminal.write(chunk, r)));
     });
     const exit = pty.onExit(({ exitCode: code, signal: s }) => { exitCode = code; signal = s ?? null; });
@@ -171,9 +175,10 @@ export async function mockSeatPtySequence(spec: SeatPtySequenceSpec): Promise<Se
         let input = '';
         if (step.keys) { pty.write(step.keys); input += step.keys; }
         if (step.text !== undefined) {
-          pty.write(step.text);
-          input += step.text;
-          if (step.enter !== false) { await sleep(150); pty.write('\r'); input += '\r'; }
+          const typed = typeof step.text === 'function' ? step.text() : step.text;
+          pty.write(typed);
+          input += typed;
+          if (step.enter !== false) { await sleep(150); spec.onStepInput?.(step.label, performance.now()); pty.write('\r'); input += '\r'; }
         }
         for (const [i, chunk] of (step.chunks ?? []).entries()) {
           if (i > 0 && step.gapMs) await sleep(step.gapMs);

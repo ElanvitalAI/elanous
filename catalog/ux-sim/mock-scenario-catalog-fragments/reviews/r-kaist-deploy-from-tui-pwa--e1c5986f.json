@@ -1,0 +1,4 @@
+{
+  "deviceKey": "r-kaist-deploy-from-tui-pwa",
+  "review": "> 📅 **2026-11-09 재검토 (R-KAIST · DEPLOY-FROM-TUI-PWA)** — fake-app-host의 TUI/PWA 배포 훅과 소유자·PASS 영수증 검증을 기존 장치에 확장했다. 진입 시험은 `bun test src/agent/app-deploy-plugin.test.ts src/ux-sim/fake-app-host.test.ts src/nexus/apps/app-publish.test.ts`이며 기존 시뮬 근거 기준을 적용한다."
+}

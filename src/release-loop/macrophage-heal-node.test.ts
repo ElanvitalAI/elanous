@@ -1,10 +1,11 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGraph } from '../graph-runner/runner.js';
 import { createGraphEventBus } from '../graph-runner/graph-events.js';
 import { debug } from '../debug/log.js';
+import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { createMacrophageRuntime } from './macrophage-heal-node.js';
 
 test('release phase node-end reaches the macrophage subscriber and records the actual bus trace', async () => {
@@ -99,7 +100,7 @@ test('simulation routes a real failed release node-end into one shadow decision 
     if (record.category === 'release-loop.macrophage' && record.event === 'decision') macrophageLogs.push(record);
   } });
   let unknownNoticeAttempts = 0;
-  const runtime = createMacrophageRuntime({ runId, graphId, mode: 'simulation',
+  const runtime = createMacrophageRuntime({ runId, graphId, root, mode: 'simulation',
     reportUnknownFailure: (notice) => {
       unknownNoticeAttempts++;
       if (unknownNoticeAttempts === 1) throw new Error('mail store temporarily unavailable');
@@ -197,7 +198,7 @@ test('unknown owner notice failure stays in the runner outbox and succeeds on sa
   const bus = createGraphEventBus();
   let attempts = 0;
   const deliveredNotices: Array<{ runId: string; nodeId: string; detail: string }> = [];
-  const runtime = createMacrophageRuntime({ runId, graphId, eventBus: bus, mode: 'simulation',
+  const runtime = createMacrophageRuntime({ runId, graphId, root, eventBus: bus, mode: 'simulation',
     reportUnknownFailure: (notice) => {
       attempts++;
       if (attempts === 1) throw new Error('temporary notice sink outage');
@@ -225,7 +226,8 @@ test('unknown owner notice failure stays in the runner outbox and succeeds on sa
 });
 
 test('a failed phase join matching both subscriptions produces only one inventory decision', async () => {
-  const runtime = createMacrophageRuntime({ runId: 'failed-phase-dedupe', mode: 'simulation', inventory: () => [
+  const root = mkdtempSync(join(tmpdir(), 'macrophage-failed-phase-dedupe-'));
+  const runtime = createMacrophageRuntime({ runId: 'failed-phase-dedupe', root, mode: 'simulation', inventory: () => [
     { id: 'phase-scrap', kind: 'orphan-worktree', owner: 'seat-owner', evidence: { ownerRunStatus: 'running', ownershipVerified: true } },
   ] });
   try {
@@ -233,12 +235,13 @@ test('a failed phase join matching both subscriptions produces only one inventor
       eventId: 'failed-phase-event', source: { kind: 'node', nodeId: 'pre-gate-join' }, data: { ok: false, reason: 'join failed' } });
     expect(runtime.decisions).toHaveLength(1);
     expect(runtime.decisions[0]?.data).toMatchObject({ sourceEventId: 'failed-phase-event', id: 'phase-scrap' });
-  } finally { runtime.dispose(); }
+  } finally { runtime.dispose(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('phase event dedupe is recorded only after inventory and decision processing succeeds', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'macrophage-phase-retry-'));
   let inventoryAttempts = 0;
-  const runtime = createMacrophageRuntime({ runId: 'phase-retry', mode: 'simulation', inventory: () => {
+  const runtime = createMacrophageRuntime({ runId: 'phase-retry', root, mode: 'simulation', inventory: () => {
     inventoryAttempts++;
     if (inventoryAttempts === 1) throw new Error('inventory temporarily unavailable');
     return [{ id: 'phase-scrap', kind: 'orphan-worktree', owner: 'seat-owner',
@@ -252,7 +255,7 @@ test('phase event dedupe is recorded only after inventory and decision processin
     expect(inventoryAttempts).toBe(2);
     expect(runtime.decisions).toHaveLength(1);
     expect(runtime.decisions[0]?.data).toMatchObject({ sourceEventId: 'phase-retry-event', id: 'phase-scrap' });
-  } finally { runtime.dispose(); }
+  } finally { runtime.dispose(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test('concurrent duplicate phase delivery does not repeat an in-flight cleanup decision', async () => {
@@ -262,7 +265,8 @@ test('concurrent duplicate phase delivery does not repeat an in-flight cleanup d
   const started = new Promise<void>((resolve) => { cleanupStarted = resolve; });
   let cleanupAttempts = 0;
   const runId = 'phase-concurrent-dedupe';
-  const runtime = createMacrophageRuntime({ runId, mode: 'live', inventory: () => [
+  const root = mkdtempSync(join(tmpdir(), 'macrophage-phase-concurrent-'));
+  const runtime = createMacrophageRuntime({ runId, root, mode: 'live', inventory: () => [
     { id: 'merged-worktree', kind: 'orphan-worktree', owner: 'seat-owner',
       evidence: { ownerRunStatus: 'done', ownershipVerified: true, mergedMainline: true, worktreePath: '/fake/worktree' } },
   ], liveCleanup: async () => {
@@ -285,6 +289,7 @@ test('concurrent duplicate phase delivery does not repeat an in-flight cleanup d
   } finally {
     releaseCleanup();
     runtime.dispose();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -329,12 +334,40 @@ test('receipt retry reuses its prepared decision and does not repeat cleanup', a
   } finally { runtime.dispose(); rmSync(root, { recursive: true, force: true }); }
 });
 
+test('run-chart write failure leaves the macrophage decision retryable until its evidence cell is durable', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'macrophage-chart-retry-'));
+  const runId = 'macrophage-chart-retry';
+  writeFileSync(join(root, 'run-ledger'), 'block ledger directory creation');
+  const event = { graphId: 'release-loop', runId, type: 'node-end', eventId: 'chart-retry-event',
+    source: { kind: 'node' as const, nodeId: 'pre-gate-join' }, data: { ok: true } };
+  const runtime = createMacrophageRuntime({ runId, root, mode: 'simulation', inventory: () => [
+    { id: 'retry-evidence', kind: 'stale-generated-artifact',
+      evidence: { sourceFingerprint: 'current', generatedFingerprint: 'stale' } },
+  ] });
+  try {
+    await expect(runtime.eventBus.publish(event)).rejects.toThrow('delivery failed');
+    expect(runtime.decisions).toHaveLength(1);
+    const receiptPath = join(root, 'graph-runs', 'release-loop', `${runId}.json.contexts`, 'macrophage.jsonl');
+    expect(existsSync(receiptPath)).toBe(false);
+    rmSync(join(root, 'run-ledger'));
+    mkdirSync(join(root, 'run-ledger'));
+    await runtime.eventBus.publish(event);
+    expect(runtime.decisions).toHaveLength(1);
+    expect((loadRunLedger(runId, runLedgerDir(root)) ?? []).filter((entry) => entry.event === 'run-chart-cell'))
+      .toHaveLength(1);
+    expect(readFileSync(receiptPath, 'utf8').trim().split('\n')).toHaveLength(1);
+  } finally {
+    runtime.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('simulation observes a dynamically appended gate-repair failure from the real release graph runner', async () => {
   const root = mkdtempSync(join(tmpdir(), 'macrophage-dynamic-repair-sim-'));
   const runId = 'macrophage-dynamic-repair-sim';
   const graphId = 'release-loop';
   const bus = createGraphEventBus();
-  const runtime = createMacrophageRuntime({ runId, graphId, eventBus: bus, mode: 'simulation' });
+  const runtime = createMacrophageRuntime({ runId, graphId, root, eventBus: bus, mode: 'simulation' });
   let gateVisits = 0;
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   try {

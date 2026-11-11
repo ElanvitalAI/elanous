@@ -53,15 +53,8 @@ afterEach(() => {
 });
 
 describe('PluginHost user-dir contract vs Claude package management', () => {
-  test('USER_DIR stays at ~/.claude/plugins and the header names that same path', () => {
+  test('USER_DIR resolves to the Claude user plugin directory', () => {
     expect(USER_DIR).toBe(join(homedir(), '.claude', 'plugins'));
-    const src = readFileSync(join(import.meta.dir, 'host.ts'), 'utf8');
-    const header = src.split('\n').slice(0, 20).join('\n');
-    expect(header).toContain('~/.claude/plugins');
-    expect(header).toContain('src/plugins/adapters/claude-package.ts');
-    expect(header).toMatch(/package-management directory/);
-    expect(header).toContain('<name>/plugin.ts');
-    expect(header).toMatch(/currently finds no Claude-managed/);
   });
 
   test('manifest route metadata survives PluginHost activation and provider-spec conversion', async () => {
@@ -85,6 +78,33 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
     const hosted = host.activePluginLLMTools().find((tool) => tool.name === 'RoutedLookup');
     expect(hosted).toMatchObject({ pluginId: 'route-fixture', route: { sideEffects: 'read-only', requiresConfirm: false } });
     expect(toLLMToolSpec(hosted!)).toMatchObject({ pluginId: 'route-fixture', route: { triggers: ['status'] } });
+    await host.deactivate();
+  });
+
+  test('graph route dispatch rejects a runtime handler without a declared graph asset', async () => {
+    const userDir = createDir('elanous-host-graph-route-');
+    const pluginDir = join(userDir, 'graph-route-fixture');
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(join(pluginDir, 'plugin.json'), JSON.stringify({
+      id: 'graph-route-fixture', name: 'graph-route-fixture', version: '1.0.0', main: './plugin.ts',
+      contributes: { aiTools: [{ name: 'RunGraph', description: 'run graph', handler: 'graph:undeclared',
+        route: { triggers: ['run graph'], examples: ['run declared graph'], sideEffects: 'external', risk: 'low', cost: 'cheap', requiresConfirm: false } }] },
+    }));
+    writeFileSync(join(pluginDir, 'plugin.ts'), `export default {
+      name: 'graph-route-fixture', version: '1.0.0', description: '', initialState: () => ({}), panes: {},
+      llmTools: [{ name: 'RunGraph', description: 'run graph', parameters: { type: 'object' }, handler: async () => 'executed' }],
+    };`);
+    const host = new PluginHost(hooks, null, { userDir });
+    await host.discover();
+    await host.activate('graph-route-fixture');
+    const result = await host.dispatchTool('RunGraph', {});
+    expect(result).toMatchObject({ ok: false });
+    expect(result).not.toMatchObject({ ok: true, result: 'executed' });
+    host.registerHostTool({
+      name: 'RunGraph', description: 'host tool', parameters: { type: 'object' },
+      handler: async () => 'host-executed',
+    });
+    expect(await host.dispatchTool('RunGraph', {})).toEqual({ ok: true, result: 'host-executed' });
     await host.deactivate();
   });
 

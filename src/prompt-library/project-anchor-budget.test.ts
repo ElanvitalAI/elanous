@@ -1,6 +1,9 @@
-import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, it, spyOn } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { debug } from '../debug/log.js';
-import { loadProjectAnchorWithMeta, PROJECT_ANCHOR_MAX_CHARS, resetUniversalPreambleCache, setGlobalAnchorPathForTest } from './universal-preamble.js';
+import { loadProjectAnchor, loadProjectAnchorWithMeta, PROJECT_ANCHOR_MAX_CHARS, resetUniversalPreambleCache, setGlobalAnchorPathForTest } from './universal-preamble.js';
 
 const REPO_ROOT = new URL('../..', import.meta.url).pathname.replace(/\/$/, '');
 
@@ -44,14 +47,28 @@ describe('프로젝트 앵커 예산 — 이 저장소가 상한 «안»에 있�
 
   // ⛔⭐⭐ 관측이 `if (debug.enabled)` 뒤에 있으면 ***운영에서 꺼진다***(핫패스 게이트).
   //   절단은 드물고 결과가 크니 ***항상*** 남겨야 한다. 그 계약을 기계가 문다.
-  it('절단 관측이 «조건부»가 아니다 — debug 가 꺼져 있어도 남는다', () => {
-    const source = require('node:fs').readFileSync(new URL('./universal-preamble.ts', import.meta.url), 'utf8') as string;
-    const helper = source.slice(source.indexOf('function observeProjectAnchorLoss'));
-    const body = helper.slice(0, helper.indexOf('\n}\n') + 3);
-    expect(body).toContain("debug.log('chat.project-anchor', 'budget-loss'");
-    expect(body).not.toContain('debug.enabled');
-    // 그리고 그 자를 «부르는» 자리가 debug.enabled 블록 «밖»이어야 한다.
-    expect(source).toContain('observeProjectAnchorLoss(cwd, result);\n      if (debug.enabled) {');
+  it('절단 관측이 debug 비활성 상태에서도 나온다', () => {
+    const root = mkdtempSync(join(tmpdir(), 'c8-anchor-loss-'));
+    const events: Array<{ category: string; event: string }> = [];
+    const ownEnabled = Object.getOwnPropertyDescriptor(debug, 'enabled');
+    Object.defineProperty(debug, 'enabled', { configurable: true, get: () => false });
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string) => {
+      events.push({ category, event });
+    }) as typeof debug.log);
+    try {
+      mkdirSync(join(root, '.git'));
+      // Source: universal-preamble.ts PROJECT_ANCHOR_MAX_CHARS is the production shared cap; this fixture crosses it.
+      writeFileSync(join(root, 'AGENTS.md'), 'x'.repeat(PROJECT_ANCHOR_MAX_CHARS + 1));
+      resetUniversalPreambleCache();
+      expect(loadProjectAnchor(root).files.some((file) => file.truncated)).toBe(true);
+      expect(events).toContainEqual({ category: 'chat.project-anchor', event: 'budget-loss' });
+    } finally {
+      log.mockRestore();
+      if (ownEnabled) Object.defineProperty(debug, 'enabled', ownEnabled);
+      else Reflect.deleteProperty(debug, 'enabled');
+      resetUniversalPreambleCache();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('관측 이름이 실제로 등록된 카테고리다', () => {

@@ -16,7 +16,7 @@ import { LogStore, logsDbPath, type LogQuery, type LogStoreRow } from '../mss/lo
 import { LOGS_SINCE_OPTION, parseSince } from './logs-cli.js';
 import { formatCodexCreditPlan, type CodexCreditPlan } from '../budget/codex-credit-plan.js';
 import { codexCreditPlanFromDisk } from './codex-credit-plan-view.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { defaultSshRunner, type SshRunner } from '../task-agent/parent-host.js';
 import { shellQuote } from '../task-agent/task-hand.js';
 

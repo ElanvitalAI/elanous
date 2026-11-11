@@ -2,6 +2,9 @@ import { transcribeAudioFile } from '../api/audio-stt.js';
 import { SERVICE_KEY_CATALOG } from '../../setup/service-key-catalog.js';
 import { emitNexusFunnelEvent, type NexusFunnelRuntime } from './funnel-observe.js';
 import type { AppCredentialCapability } from './app-credential-capability.js';
+import { CrawlContractExhaustedError, extractScrapViaGraph } from '../../crawl-capabilities/graph-extract.js';
+import type { CrawlProvider } from '../../crawl-capabilities/contracts.js';
+import type { ExtractedScrap } from '../../crawl-capabilities/scrap-extract.js';
 
 export type AppActionCredential = string | AppCredentialCapability;
 export interface AppActionResolvedCredentials {
@@ -15,8 +18,9 @@ export interface AppActionSecretBoundary {
   resolve(input: { appSlug: string; reference: string }): Promise<AppActionCredential | undefined>;
 }
 export interface AppActionDeclaration {
-  readonly builtin: 'stt' | 'summarize' | 'tts' | 'generate';
+  readonly builtin: 'stt' | 'summarize' | 'tts' | 'generate' | 'extract' | 'translate';
   readonly uses: readonly string[];
+  readonly allow?: readonly string[];
   readonly async?: boolean;
   readonly spend?: string;
 }
@@ -28,10 +32,12 @@ export interface AppActionDeps {
   readonly generate?: (input: { appSlug: string; actionName?: string; prompt: string; image: Uint8Array; mimeType: string; credentials: AppActionResolvedCredentials }) => Promise<{ jobId: string; eventsUrl: string }>;
   readonly transcribe?: (input: { audio: Buffer; apiKey: string; mimeType: string; filename: string; language?: string }) => Promise<{ text: string; language?: string; durationMs?: number }>;
   readonly summarize?: (input: { text: string; apiKey: string }) => Promise<string>;
+  readonly translate?: (input: { text: string; sourceLanguage: string; targetLanguage: string; apiKey: string }) => Promise<string>;
   readonly synthesize?: (input: { text: string; voiceId: string; modelId: string; apiKey: string }) => Promise<{ audio: Uint8Array; mimeType: string }>;
+  readonly crawlProviders?: readonly CrawlProvider[];
 }
-export interface AppActionInput { readonly audio?: Uint8Array | string; readonly image?: string; readonly mimeType?: string; readonly filename?: string; readonly text?: string; readonly language?: string; readonly voiceId?: string; readonly modelId?: string; readonly confirmSpend?: boolean }
-export type AppActionResult = { readonly text: string; readonly language?: string; readonly durationMs?: number } | { readonly audioBase64: string; readonly mimeType: string } | { readonly jobId: string; readonly status: 'queued'; readonly eventsUrl: string };
+export interface AppActionInput { readonly audio?: Uint8Array | string; readonly image?: string; readonly mimeType?: string; readonly filename?: string; readonly text?: string; readonly url?: string; readonly language?: string; readonly sourceLanguage?: string; readonly targetLanguage?: string; readonly voiceId?: string; readonly modelId?: string; readonly confirmSpend?: boolean }
+export type AppActionResult = { readonly text: string; readonly language?: string; readonly durationMs?: number } | { readonly audioBase64: string; readonly mimeType: string } | { readonly jobId: string; readonly status: 'queued'; readonly eventsUrl: string } | ExtractedScrap;
 
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 const MAX_TEXT_CHARS = 100_000;
@@ -43,7 +49,8 @@ const APP_ATTACHABLE_SERVICE_IDS = new Set(SERVICE_KEY_CATALOG.filter(item => it
 const CREDENTIAL_SERVICE_IDS: Readonly<Record<string, string>> = { openai: 'openai-api' };
 
 export class AppActionError extends Error {
-  constructor(readonly code: 'invalid-app' | 'invalid-declaration' | 'credential-unavailable' | 'invalid-input' | 'provider-failed') {
+  constructor(readonly code: 'invalid-app' | 'invalid-declaration' | 'credential-unavailable' | 'invalid-input' | 'provider-failed',
+    readonly details?: Readonly<Record<string, unknown>>) {
     super(code);
     this.name = 'AppActionError';
   }
@@ -79,6 +86,32 @@ async function defaultSummarize(input: { text: string; apiKey: string }): Promis
   if (typeof first !== 'object' || first === null || !('message' in first) || typeof first.message !== 'object' || first.message === null
     || !('content' in first.message) || typeof first.message.content !== 'string' || !first.message.content.trim()) {
     throw new Error('summary provider returned no text');
+  }
+  return first.message.content.trim();
+}
+
+async function defaultTranslate(input: { text: string; sourceLanguage: string; targetLanguage: string; apiKey: string }): Promise<string> {
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST', headers: { authorization: `Bearer ${input.apiKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: `Translate the user's text from ${input.sourceLanguage} to ${input.targetLanguage}. Return only the translation and preserve meaning, tone, and formatting.` },
+        { role: 'user', content: input.text },
+      ],
+      temperature: 0,
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) throw new Error('translation provider rejected request');
+  const payload: unknown = await response.json();
+  if (typeof payload !== 'object' || payload === null || !('choices' in payload) || !Array.isArray(payload.choices)) {
+    throw new Error('translation provider returned invalid response');
+  }
+  const first = payload.choices[0];
+  if (typeof first !== 'object' || first === null || !('message' in first) || typeof first.message !== 'object' || first.message === null
+    || !('content' in first.message) || typeof first.message.content !== 'string' || !first.message.content.trim()) {
+    throw new Error('translation provider returned no text');
   }
   return first.message.content.trim();
 }
@@ -131,10 +164,11 @@ export function createAppActions(deps: AppActionDeps) {
     async run(input: { appSlug: string; declaration: AppActionDeclaration; payload: AppActionInput; actionName?: string }): Promise<AppActionResult> {
       const { appSlug, declaration, payload } = input;
       if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(appSlug) || appSlug.includes('--')) throw new AppActionError('invalid-app');
-      const expectedCredentials = declaration?.builtin === 'tts' ? ['cred:elevenlabs.api_key']
+      const expectedCredentials = declaration?.builtin === 'extract' ? []
+        : declaration?.builtin === 'tts' ? ['cred:elevenlabs.api_key']
         : declaration?.builtin === 'generate' ? ['cred:higgsfield.key_id', 'cred:higgsfield.secret']
           : ['cred:openai.api_key'];
-      const declarationValid = !!declaration && ['stt', 'summarize', 'tts', 'generate'].includes(declaration.builtin)
+      const declarationValid = !!declaration && ['stt', 'summarize', 'tts', 'generate', 'extract', 'translate'].includes(declaration.builtin)
         && Array.isArray(declaration.uses) && declaration.uses.length === expectedCredentials.length
         && declaration.uses.every((value, index) => {
           const service = value.slice('cred:'.length).split('.', 1)[0]!;
@@ -143,6 +177,22 @@ export function createAppActions(deps: AppActionDeps) {
         });
       if (!declaration || !declarationValid || (declaration.builtin === 'generate' && (declaration.async !== true || declaration.spend !== 'owner-confirm'))) {
         throw new AppActionError('invalid-declaration');
+      }
+      if (declaration.builtin === 'extract') {
+        if (typeof payload.url !== 'string' || payload.url.length > 2048) throw new AppActionError('invalid-input');
+        try {
+          const url = new URL(payload.url);
+          if (!['http:', 'https:'].includes(url.protocol)) throw new AppActionError('invalid-input');
+          const extracted = await extractScrapViaGraph({ url: url.href }, { providers: deps.crawlProviders });
+          recordFirstSuccess(appSlug);
+          return extracted;
+        } catch (error) {
+          if (error instanceof AppActionError) throw error;
+          if (error instanceof CrawlContractExhaustedError) throw new AppActionError('provider-failed', {
+            contractId: error.contractId, attempts: error.attempts,
+          });
+          throw new AppActionError(error instanceof TypeError ? 'invalid-input' : 'provider-failed');
+        }
       }
       if (declaration.builtin === 'generate') {
         if (payload.confirmSpend !== true) throw new AppActionError('invalid-input');
@@ -162,6 +212,29 @@ export function createAppActions(deps: AppActionDeps) {
           const queued = await deps.generate({ appSlug, actionName: input.actionName, prompt: payload.text.trim(), image: image.bytes,
           mimeType: image.mimeType, credentials: { appSlug, keyId, secret } });
           return { jobId: queued.jobId, status: 'queued', eventsUrl: queued.eventsUrl };
+        } catch (error) {
+          if (error instanceof AppActionError) throw error;
+          throw new AppActionError('provider-failed');
+        }
+      }
+      if (declaration.builtin === 'translate') {
+        const text = payload.text;
+        const sourceLanguage = payload.sourceLanguage;
+        const targetLanguage = payload.targetLanguage;
+        if (typeof text !== 'string' || !text.trim() || text.length > MAX_TEXT_CHARS
+          || typeof sourceLanguage !== 'string' || !sourceLanguage.trim() || sourceLanguage.length > 64
+          || typeof targetLanguage !== 'string' || !targetLanguage.trim() || targetLanguage.length > 64) {
+          throw new AppActionError('invalid-input');
+        }
+        let apiKey: AppActionCredential | undefined;
+        try { apiKey = await deps.secrets.resolve({ appSlug, reference: declaration.uses[0]! }); }
+        catch { throw new AppActionError('credential-unavailable'); }
+        if (typeof apiKey !== 'string' || !apiKey.trim()) throw new AppActionError('credential-unavailable');
+        try {
+          const translated = await (deps.translate ?? defaultTranslate)({ text: text.trim(), sourceLanguage: sourceLanguage.trim(), targetLanguage: targetLanguage.trim(), apiKey });
+          if (typeof translated !== 'string' || !translated.trim()) throw new Error('translation returned empty text');
+          recordFirstSuccess(appSlug);
+          return { text: translated.trim() };
         } catch (error) {
           if (error instanceof AppActionError) throw error;
           throw new AppActionError('provider-failed');
@@ -283,6 +356,6 @@ export async function handleAppActionRequest(request: Request, runtime: AppActio
   } catch (error) {
     const code = error instanceof AppActionError ? error.code : 'provider-failed';
     const status = code === 'credential-unavailable' ? 503 : code === 'provider-failed' ? 502 : 400;
-    return Response.json({ error: code }, { status });
+    return Response.json({ error: code, ...(error instanceof AppActionError && error.details ? error.details : {}) }, { status });
   }
 }

@@ -65,7 +65,9 @@ mock.module(${JSON.stringify(join(repo, 'src/loops/orchestrator/resync-shadow.ts
     const rejudgePreload = join(root, 'rejudge-preload.ts');
     writeFileSync(rejudgePreload, `import { mock } from 'bun:test';
 import { EventEmitter } from 'node:events';
-mock.module(${JSON.stringify(join(repo, 'src/instance/spawn-elanous.ts'))}, () => ({ spawnElanous: () => {
+mock.module(${JSON.stringify(join(repo, 'src/instance/spawn-elanous.ts'))}, () => ({
+spawnElanousSync: () => { throw new Error('unexpected synchronous elanous spawn in rejudge tick'); },
+spawnElanous: () => {
   const child = new EventEmitter();
   child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = () => {};
   queueMicrotask(() => { child.stdout.emit('data', '[]\\n'); child.emit('close', 0); });

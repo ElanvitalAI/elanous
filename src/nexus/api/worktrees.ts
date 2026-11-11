@@ -29,7 +29,7 @@
 // per existing same-origin enforcement layer).
 
 import { isAbsolute } from 'node:path';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { type GitRunner } from '../../git-fs/retry.js';
 import { runGitCommand } from '../../git-fs/runner.js';
 import { jsonResponse } from './json-response.js';

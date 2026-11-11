@@ -1,0 +1,38 @@
+{
+  "id": "multi-actor-world",
+  "name": "Multi-actor app collaboration and landing contention",
+  "implementation": [
+    "src/ux-sim/multi-actor-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/multi-actor-world.test.ts",
+    "src/ux-sim/world.test.ts"
+  ],
+  "target": "Concurrent user and agent invitations, role-gated actions, optimistic shared edits, administrator app blocking, and competing seat submissions",
+  "inputs": [
+    "actor identity and invited role",
+    "manifest action allow list",
+    "shared document revision",
+    "administrator block and reactivation",
+    "seat submissions with changed paths"
+  ],
+  "observations": [
+    "actor-specific invitation, action, edit, and landing ledger entries",
+    "role allow-list accepts editor and agent while denying viewer",
+    "one concurrent edit commits and the stale revision conflicts",
+    "administrator block affects the app and authorized reactivation clears it",
+    "merge-train planner defers the competing seat on overlapping paths"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/multi-actor-world.test.ts src/ux-sim/world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null,
+  "audience": "user",
+  "defaultProfile": {
+    "credentials": "fake-only",
+    "network": "loopback-only",
+    "storage": "temporary"
+  }
+}

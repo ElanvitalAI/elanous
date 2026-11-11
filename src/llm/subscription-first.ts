@@ -89,8 +89,9 @@ function isTokenExpiring(state: unknown): boolean {
 function defaultLoadTokens(provider: string): unknown | null {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { loadTokens } = require('../oauth/store.js') as typeof import('../oauth/store.js');
-    return loadTokens(provider);
+    const { loadTokens, authStorePath } = require('../oauth/store.js') as typeof import('../oauth/store.js');
+    const { codexAccountReadStorePath } = require('../oauth/codex-owner-mirror.js') as typeof import('../oauth/codex-owner-mirror.js');
+    return loadTokens(provider, codexAccountReadStorePath(authStorePath()));
   } catch { return null; }
 }
 

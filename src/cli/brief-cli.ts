@@ -2,7 +2,7 @@ import type { Command } from 'commander';
 import { BRIEF_DOMAINS, BRIEF_PRIORITIES, BRIEF_REACTIONS, BRIEF_SLOTS, BriefItemsInputError, BriefItemsLedger, type BriefDomain, type BriefPriority, type BriefReaction, type BriefSendSlot } from '../briefing/brief-items.js';
 import { kindRouteTarget } from '../domains/telegram-kind-route.js';
 import { sendTelegramButtonsTo, type TgButton } from '../autopilot/mission-notify.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export function briefFeedbackButtons(ids: readonly number[]): TgButton[][] {
   return ids.map(id => [

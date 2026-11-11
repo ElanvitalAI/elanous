@@ -1,0 +1,18 @@
+graph_id: kr-sector-flow-composite
+version: 1
+entry_node: semi-quote
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: semi-quote, kind: capability, recipe: none, requires: market.quote@1, input: { market: KR, symbol: '005930' }, max_visits: 1 }
+  - { node_id: semi-flow, kind: capability, recipe: none, requires: market.kr-flow@1, input: { market: KR, symbol: '005930' }, max_visits: 1 }
+  - { node_id: battery-quote, kind: capability, recipe: none, requires: market.quote@1, input: { market: KR, symbol: '373220' }, max_visits: 1 }
+  - { node_id: battery-flow, kind: capability, recipe: none, requires: market.kr-flow@1, input: { market: KR, symbol: '373220' }, max_visits: 1 }
+  - { node_id: sector-compose, kind: agent, recipe: 'cmd:sector-compose', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: semi-quote, on: outcome, map: { ok: semi-flow, failed: failed } }
+  - { from: semi-flow, on: outcome, map: { ok: battery-quote, failed: failed } }
+  - { from: battery-quote, on: outcome, map: { ok: battery-flow, failed: failed } }
+  - { from: battery-flow, on: outcome, map: { ok: sector-compose, failed: failed } }
+  - { from: sector-compose, on: outcome, map: { ok: done, fail: failed, failed: failed } }

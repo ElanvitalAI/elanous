@@ -1,0 +1,28 @@
+{
+  "id": "census-oracle-axis-world",
+  "name": "Census oracle axis world",
+  "implementation": [
+    "src/ux-sim/census-oracle-axis-world.ts",
+    "scripts/test-census.ts"
+  ],
+  "tests": [
+    "scripts/test-census.test.ts"
+  ],
+  "target": "case-level JUnit census oracle coverage across X1-X4 and I1-I7",
+  "inputs": [
+    "isolated JUnit report and test source",
+    "explicit @oracle-axis declaration",
+    "asserted, unasserted, failed-only, skipped, unmatched and missing-source cases"
+  ],
+  "observations": [
+    "JSON oracleAxes includes only declared, asserted, passed and uniquely matched axes",
+    "TSV and Markdown expose the same column",
+    "unsupported axis/invariant pair is rejected"
+  ],
+  "entryCommands": [
+    "bun test scripts/test-census.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

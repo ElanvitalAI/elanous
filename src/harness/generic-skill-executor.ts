@@ -16,7 +16,6 @@
 // 관측(제1원칙): harness.skill-compose — discover-start/discovered/planned-chain/step-start/step-progress/step-done/published.
 // 안전: BLOCK 규율(Agent 배치·고비용) · 체인 상한 MAX_STEPS. 부작용 스킬 capability tier 는 로드맵.
 
-import { tierModel } from '../llm/model-defaults.js';
 import { lstatSync, mkdirSync, rmSync } from 'node:fs';
 import { normalize, resolve } from 'node:path';
 import type { DomainExecute, DomainExecuteCtx, DomainExecuteResult } from './skill-executor.js';
@@ -267,8 +266,7 @@ export function defaultGenericSkill(): ComposedSkillDeps {
       return picks.map((n) => ({ name: n, description: (byName.get(n)?.description ?? '').slice(0, 400) }));
     },
     planChain: async (objective, candidates) => {
-      const { streamLLM } = await import('../llm.js');
-      const model = process.env.ELANOUS_SKILL_PLAN_MODEL || process.env.ELANOUS_PR_REVIEW_MODEL || tierModel('better');
+      const { streamRoleLlm } = await import('../llm/role-stream.js');
       const menu = candidates.map((c) => `- ${c.name}: ${c.description}`).join('\n');
       const prompt = [
         '너는 elanous 하니스의 스킬 조합 플래너다. 주어진 objective 를 완수하기 위해 아래 후보 스킬(executor) 중',
@@ -283,7 +281,7 @@ export function defaultGenericSkill(): ComposedSkillDeps {
         '',
         'JSON 배열만 출력: [{"skill":"<후보 이름>","task":"<이 스킬이 할 구체 하위과제 한 문장>"}, ...]',
       ].join('\n');
-      const raw = await streamLLM([{ role: 'user', content: prompt }], () => {}, { model, reasoningEffort: 'high' });
+      const raw = await streamRoleLlm('planning', [{ role: 'user', content: prompt }], () => {}, { reasoningEffort: 'high' });
       return parseSkillChainPlan(raw, candidates);
     },
     runSkill: async (skill, task, priorContext, cwd, onProgress) => {

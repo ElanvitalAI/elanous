@@ -15,7 +15,8 @@ import {
   currentBackend,
   currentBackendId,
 } from './registry.js';
-import { deleteLegacyAppSecretValueSync, importSecretsFileRaw } from './file-backend.js';
+import { deleteAppSecretValue, deleteLegacyAppSecretValueSync, importSecretsFileRaw, setAppSecretValue } from './file-backend.js';
+import { appSecretId } from './app-secret-ledger.js';
 import { assertSharedSecretId } from './types.js';
 import { hasAppSecretEventForId } from './app-secret-ledger.js';
 import { assertCredentialSlotId } from './cred-slots.js';
@@ -32,6 +33,43 @@ export {
   resetBackendRegistry,
 } from './registry.js';
 export * from './cred-slots.js';
+
+export interface GithubMirrorCredential { readonly repository: string; readonly token: string }
+
+export function canonicalGithubRepository(repository: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(repository)
+    || repository.split('/').some((part) => part === '.' || part === '..')) {
+    throw new Error('ELANOUS_GITHUB_MIRROR_REPOSITORY_INVALID');
+  }
+  return repository.toLowerCase();
+}
+
+/** App-owned, ledger-backed token binding; the repository is checked again at push time. */
+export async function registerGithubMirrorCredentialAsync(appSlug: string, credential: GithubMirrorCredential): Promise<void> {
+  const id = appSecretId(appSlug, 'GITHUB_MIRROR_TOKEN');
+  const repository = canonicalGithubRepository(credential.repository);
+  if (!credential.token.trim() || /[\r\n\0]/.test(credential.token)) throw new Error('ELANOUS_GITHUB_MIRROR_TOKEN_INVALID');
+  if (currentBackendId() !== 'file') throw new Error('ELANOUS_GITHUB_MIRROR_BACKEND_UNSUPPORTED');
+  await setAppSecretValue(id, JSON.stringify({ version: 1, repository, token: credential.token }));
+}
+
+export async function readGithubMirrorCredentialAsync(appSlug: string): Promise<GithubMirrorCredential | undefined> {
+  if (currentBackendId() !== 'file') throw new Error('ELANOUS_GITHUB_MIRROR_BACKEND_UNSUPPORTED');
+  const raw = await getSecretAsync(appSecretId(appSlug, 'GITHUB_MIRROR_TOKEN'));
+  if (raw === undefined) return undefined;
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    if (value.version !== 1 || typeof value.repository !== 'string' || typeof value.token !== 'string'
+      || canonicalGithubRepository(value.repository) !== value.repository || !value.token.trim()
+      || /[\r\n\0]/.test(value.token)) throw new Error('invalid');
+    return { repository: value.repository, token: value.token };
+  } catch { throw new Error('ELANOUS_GITHUB_MIRROR_CREDENTIAL_CORRUPT'); }
+}
+
+export async function revokeGithubMirrorCredentialAsync(appSlug: string): Promise<boolean> {
+  if (currentBackendId() !== 'file') throw new Error('ELANOUS_GITHUB_MIRROR_BACKEND_UNSUPPORTED');
+  return deleteAppSecretValue(appSecretId(appSlug, 'GITHUB_MIRROR_TOKEN'));
+}
 export {
   readSecretsFileRaw as readSecrets,
   writeSecretsFileRaw as writeSecrets,

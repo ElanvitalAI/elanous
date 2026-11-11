@@ -327,6 +327,35 @@ test('provider CLI merges distinct machine-scoped declarations from all five hos
   }
 });
 
+test('provider refuses a public ledger response that is not scoped to the requesting host', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'resource-ledger-public-auth-host-scope-'));
+  const configPath = join(dir, 'config.json');
+  const memberTokenPath = join(dir, 'member.token');
+  const machineTokenPath = join(dir, 'aws1.token');
+  const outputPath = join(dir, 'provider.json');
+  writeFileSync(configPath, JSON.stringify({ ...config, pod: { ...config.pod, warmPool: {
+    ...config.pod.warmPool, templates: [{ host: 'aws1', tier: 'standard', nodeName: 'aws1-node' }],
+  } } }));
+  writeFileSync(memberTokenPath, `${'d'.repeat(64)}\n`, { mode: 0o600 });
+  writeFileSync(machineTokenPath, `${'e'.repeat(64)}\n`, { mode: 0o600 });
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async () => Response.json({ pools: [declaration] })) as typeof fetch;
+    await expect(runWarmPoolProviderConfig([
+      '--config', configPath,
+      '--control-url', 'https://control.example:8413',
+      '--member-token-file', memberTokenPath,
+      '--machine-token', `aws1=${machineTokenPath}`,
+      '--resource-ledger-url', 'https://nexus.example:8413/v1/resource-ledger/pools',
+      '--output', outputPath,
+    ])).rejects.toThrow('Nexus resource-ledger response invalid');
+    expect(existsSync(outputPath)).toBe(false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('public-auth ledger fetch fails closed on missing, rejected, or expired machine credentials', async () => {
   const url = 'https://nexus.example:8413/v1/resource-ledger/pools';
   const authorized = 'a'.repeat(64);
@@ -407,6 +436,7 @@ test('resource-ledger read failures fail closed and emit observations without cr
       .filter(row => row.event === 'resource-ledger-read-failed');
     expect(rows).toHaveLength(4);
     const observations = rows.map(row => JSON.parse(row.data ?? '{}'))
+      .map(({ status, reason }) => ({ status, reason }))
       .sort((left, right) => left.status - right.status);
     expect(observations).toEqual([
       { status: 401, reason: 'unauthorized' },
@@ -457,7 +487,7 @@ test('provider CLI logs the requested host and writes no config when its ledger 
     logSink.flush();
     const warning = logStore.query({ categories: ['pod.warm.provider-config'], limit: 10 })
       .find(row => row.event === 'resource-ledger-read-failed');
-    expect(JSON.parse(warning?.data ?? '{}')).toEqual({ host: 'aws1', status: 401, reason: 'unauthorized' });
+    expect(JSON.parse(warning?.data ?? '{}')).toMatchObject({ host: 'aws1', status: 401, reason: 'unauthorized' });
     expect(warning?.data).not.toContain(memberToken);
     expect(warning?.data).not.toContain(machineToken);
   } finally {
@@ -500,4 +530,96 @@ test('provider CLI refuses template-only config without an authoritative Nexus U
     '--control-url', 'https://control.example:8413', '--member-token-file', '/tmp/member.token',
     '--machine-token', 'gcp1=/tmp/gcp1.token']))
     .rejects.toThrow('--resource-ledger-url is required');
+});
+
+test('provider CLI uses a separate ledger credential and preserves host machine credentials', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'warm-pool-ledger-credential-split-'));
+  const configPath = join(dir, 'config.json');
+  const memberTokenPath = join(dir, 'member.token');
+  const gcp1LedgerTokenPath = join(dir, 'gcp1-ledger.token');
+  const aws1LedgerTokenPath = join(dir, 'aws1-ledger.token');
+  const gcp1TokenPath = join(dir, 'gcp1.token');
+  const aws1TokenPath = join(dir, 'aws1.token');
+  const outputPath = join(dir, 'provider.json');
+  const memberToken = 'd'.repeat(64);
+  const gcp1LedgerToken = 'f'.repeat(64);
+  const aws1LedgerToken = 'c'.repeat(64);
+  const gcp1MachineToken = 'e'.repeat(64);
+  const aws1MachineToken = 'a'.repeat(64);
+  const aws1Declaration = { ...declaration, fanoutGroupId: 'gate-aws1',
+    members: [{ host: 'aws1', count: 3, digest, role: 'both' as const }] };
+  writeFileSync(configPath, JSON.stringify({ ...config, pod: { ...config.pod, warmPool: {
+    ...config.pod.warmPool, templates: [
+      { host: 'gcp1', tier: 'standard', nodeName: 'gcp1-node' },
+      { host: 'aws1', tier: 'standard', nodeName: 'aws1-node' },
+    ],
+  } } }));
+  writeFileSync(memberTokenPath, `${memberToken}\n`, { mode: 0o600 });
+  writeFileSync(gcp1LedgerTokenPath, `${gcp1LedgerToken}\n`, { mode: 0o600 });
+  writeFileSync(aws1LedgerTokenPath, `${aws1LedgerToken}\n`, { mode: 0o600 });
+  writeFileSync(gcp1TokenPath, `${gcp1MachineToken}\n`, { mode: 0o600 });
+  writeFileSync(aws1TokenPath, `${aws1MachineToken}\n`, { mode: 0o600 });
+  let requests = 0;
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(request) {
+    requests++;
+    const authorization = request.headers.get('authorization');
+    if (authorization === `Bearer ${gcp1LedgerToken}`) return Response.json({ pools: [declaration] });
+    if (authorization === `Bearer ${aws1LedgerToken}`) return Response.json({ pools: [aws1Declaration] });
+    return Response.json({ error: 'unauthorized' }, { status: 401 });
+  } });
+  try {
+    await runWarmPoolProviderConfig([
+      '--config', configPath,
+      '--control-url', 'https://control.example:8413',
+      '--member-token-file', memberTokenPath,
+      '--ledger-token-file', `gcp1=${gcp1LedgerTokenPath}`,
+      '--ledger-token-file', `aws1=${aws1LedgerTokenPath}`,
+      '--machine-token', `gcp1=${gcp1TokenPath}`,
+      '--machine-token', `aws1=${aws1TokenPath}`,
+      '--resource-ledger-url', `http://127.0.0.1:${server.port}/v1/resource-ledger/pools`,
+      '--output', outputPath,
+    ]);
+    expect(requests).toBe(2);
+    const written = JSON.parse(readFileSync(outputPath, 'utf8')) as {
+      memberToken: string; machineTokens: Record<string, string>; poolTemplates: Array<{ host: string }>;
+    };
+    expect(written.memberToken).toBe(memberToken);
+    expect(written.machineTokens).toEqual({ gcp1: gcp1MachineToken, aws1: aws1MachineToken });
+    expect(written.poolTemplates.map(row => row.host).sort()).toEqual(['aws1', 'gcp1']);
+  } finally {
+    server.stop(true);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('provider refuses a separate ledger credential response scoped to another host', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'warm-pool-ledger-credential-scope-'));
+  const configPath = join(dir, 'config.json');
+  const memberTokenPath = join(dir, 'member.token');
+  const ledgerTokenPath = join(dir, 'aws1-ledger.token');
+  const machineTokenPath = join(dir, 'aws1.token');
+  const outputPath = join(dir, 'provider.json');
+  writeFileSync(configPath, JSON.stringify({ ...config, pod: { ...config.pod, warmPool: {
+    ...config.pod.warmPool, templates: [{ host: 'aws1', tier: 'standard', nodeName: 'aws1-node' }],
+  } } }));
+  writeFileSync(memberTokenPath, `${'d'.repeat(64)}\n`, { mode: 0o600 });
+  writeFileSync(ledgerTokenPath, `${'c'.repeat(64)}\n`, { mode: 0o600 });
+  writeFileSync(machineTokenPath, `${'a'.repeat(64)}\n`, { mode: 0o600 });
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async () => Response.json({ pools: [declaration] })) as typeof fetch;
+    await expect(runWarmPoolProviderConfig([
+      '--config', configPath,
+      '--control-url', 'https://control.example:8413',
+      '--member-token-file', memberTokenPath,
+      '--ledger-token-file', `aws1=${ledgerTokenPath}`,
+      '--machine-token', `aws1=${machineTokenPath}`,
+      '--resource-ledger-url', 'https://nexus.example:8413/v1/resource-ledger/pools',
+      '--output', outputPath,
+    ])).rejects.toThrow('Nexus resource-ledger response invalid');
+    expect(existsSync(outputPath)).toBe(false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

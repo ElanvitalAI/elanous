@@ -125,6 +125,7 @@ describe('doctor diagnostics bundle', () => {
     try {
       const output: string[] = [];
       const codes: number[] = [];
+      let bundleLoads = 0;
       const program = new Command();
       const deps = {
         repositoryRoot: process.cwd(), env: {}, cacheDir: join(root, 'cache'),
@@ -132,20 +133,25 @@ describe('doctor diagnostics bundle', () => {
         readiness: { provider: 'auto' as const }, commandExists: () => false,
         // The machine's real local LLM servers must not make two doctor runs differ.
         localLlmInventory: async () => ({ nodes: [], models: [], at: 0, cached: false, warnings: [] }),
+        loadDoctorBundle: async () => { bundleLoads += 1; return await import('./doctor-bundle.js'); },
         out: { log: (text: string) => output.push(text) }, setExitCode: (code: number) => codes.push(code),
       };
       registerDoctorCommand(program, deps);
       await program.parseAsync(['doctor', '--json'], { from: 'user' });
+      expect(bundleLoads).toBe(0);
       const original = JSON.parse(output.at(-1)!);
       await program.parseAsync(['doctor', '--bundle', '--out', root, '--json'], { from: 'user' });
+      expect(bundleLoads).toBe(1);
       const bundled = JSON.parse(output.at(-1)!);
       expect(Object.keys(bundled)).toEqual(['path', 'files', 'bytes']);
       expect(bundled.files).toContain('doctor.json');
       expect(JSON.parse(unpack(bundled.path, root)['doctor.json']!)).toEqual(original);
       await program.parseAsync(['doctor', '--bundle', '--out', join(root, 'human')], { from: 'user' });
+      expect(bundleLoads).toBe(2);
       expect(output.at(-1)).toContain('Contents:\n  summary.json\n  doctor.json');
       expect(output.at(-1)).toContain(join(root, 'human', 'elanous-diagnostics-'));
       await program.parseAsync(['doctor', '--json'], { from: 'user' });
+      expect(bundleLoads).toBe(2);
       expect(JSON.parse(output.at(-1)!)).toEqual(original);
       expect(codes).toEqual([1, 1]); // Missing required commands retain the ordinary doctor exit code; bundle does not add one.
     } finally { rmSync(root, { recursive: true, force: true }); }

@@ -1,7 +1,5 @@
 import { describe, expect, test } from 'bun:test';
 import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { pageTargetIds, planTabReclaim } from './browser-act-tabs.js';
 import { performBrowserAction } from './browser-act.js';
 import type { CdpClient } from '../browser-cdp/client.js';
@@ -30,7 +28,6 @@ function fakeClient(): CdpClient {
   return client as unknown as CdpClient;
 }
 
-const actSource = readFileSync(join(import.meta.dir, 'browser-act.ts'), 'utf8');
 const list = (entries: Array<{ id: string; type: string }>) => JSON.stringify(entries);
 
 describe('opened-tab reclaim', () => {
@@ -108,7 +105,7 @@ describe('opened-tab reclaim', () => {
       // ⛔ 클릭이 «연» 것만 닫는다 — 원래 있던 탭은 안 건드린다
       expect(device.calls().map((call) => new URL(call.url).pathname)).toEqual(['/json/list', '/json/list', '/json/close/opened']);
       expect(device.calls().at(-1)?.status).toBe(200);
-      expect(events[0]).toMatchObject({ tabsPlanned: 1, tabsReclaimed: 1 });
+      expect(events[0]).toMatchObject({ tabsPlanned: 1, tabsReclaimed: 1, tabsDetail: expect.any(String) });
     });
   });
 
@@ -130,10 +127,4 @@ describe('opened-tab reclaim', () => {
     });
   });
 
-  test('the observation separates "how many opened" from "how many closed"', () => {
-    // ⛔ 뭉치면 «닫지 못한» 누수가 조용해진다.
-    expect(actSource).toContain('tabsPlanned');
-    expect(actSource).toContain('tabsReclaimed');
-    expect(actSource).toContain('tabsDetail');
-  });
 });

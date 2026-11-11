@@ -37,7 +37,7 @@ import {
   type AgentContext,
 } from './agent-context-bundle.js';
 import { inspectActiveProvider } from '../provider-summary.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { debug } from '../debug/log.js';
 
 export interface AgentTurnInput {

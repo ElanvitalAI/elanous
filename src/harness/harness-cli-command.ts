@@ -47,7 +47,7 @@ import { PR_LABELS } from '../github/pr-labels.js';
 import { ghAutomationEnv } from '../autopilot/pr-manager.js';
 import { decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { SiblingResyncAdapters, SiblingResyncResult, SiblingRunTarget } from '../self-implement/sibling-resync.js';
 import type { RunTtlAdapters, RunTtlResult } from '../self-implement/run-ttl.js';
 import type { ControlMemoPayload } from './control-inbox.js';

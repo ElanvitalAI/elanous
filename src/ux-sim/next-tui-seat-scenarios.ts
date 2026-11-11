@@ -3,7 +3,7 @@
 // `bin/elanous.mjs`); this file only types keys, seeds the store through the real session API,
 // and reads the universe back through the same binary's `logs` CLI.
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { appendMessage, createSession, getActiveSessionId, loadSession, setActiveSessionId } from '../session/index.js';
 import { mockSeatPtySequence, type SeatPtySequenceEvidence, type SeatPtyStep } from './mock-seat-pty-sequence.js';
@@ -11,12 +11,15 @@ import { GOAL_INTERIM_NOT_DONE_REPLY, GOAL_INTERIM_TOOL_CALL } from './goal-inte
 export { GOAL_INTERIM_NOT_DONE_REPLY, GOAL_INTERIM_TOOL_CALL } from './goal-interim-trace.js';
 import { pasteFoldToken } from '../chat/paste-fold.js';
 import { DEFAULT_GOAL_CONTINUE_CAP } from '../dashboard/input/goal-continue.js';
+import { LONG_SHELL_ESC_CONFIRMATION_MS } from '../esc-abort-gate.js';
 import {
-  TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
+  TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_SCRIPT_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
 } from './fake-llm.js';
 
-export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-clear-session', 'next-compact', 'next-resume', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-subagent-e4', 'next-seat-turn-cap'] as const;
+export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-clear-session', 'next-compact', 'next-resume', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-esc-confirm-long-shell', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-context-area-clear', 'next-dock-long-stream', 'next-subagent-e4', 'next-seat-turn-cap', 'next-core-harden'] as const;
 export type NextTuiScenario = (typeof NEXT_TUI_SCENARIOS)[number];
+// TODO(R-TICKET): read ELANOUS_NEXT_TUI_COMPACT_HEIGHT once its setting lands.
+const NEXT_TUI_DOCK_PIN_MIN_ROWS = 24;
 
 export interface NextTuiScenarioSpec {
   scenario: NextTuiScenario;
@@ -114,6 +117,43 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
   };
   const done = (n: number, also?: string) => (s: string) => count(s, reply) === n && s.includes('응답 완료') && (!also || s.includes(also));
 
+  if (spec.scenario === 'next-core-harden') {
+    const cases = [
+      { name: 'large-paste', scenario: 'next-paste' },
+      { name: 'queue-and-escape', scenario: 'next-queue' },
+      { name: 'long-tool-output', scenario: 'next-tool-fold' },
+      { name: 'multiple-subagents-one', scenario: 'next-subagent-e4' },
+      { name: 'multiple-subagents-two', scenario: 'next-subagent-e4' },
+    ] as const;
+    const results: Array<{ name: string; result: NextTuiScenarioResult }> = [];
+    for (const c of cases) {
+      const childRoot = join(root, c.name);
+      const result = await runNextTuiScenario({ ...spec, scenario: c.scenario, root: childRoot });
+      results.push({ name: c.name, result });
+    }
+    const checks = {
+      largePasteSurvivesSubmission: results[0]?.result.checks.submittedWhole === true,
+      queueBacklogPreservesOrder: results[1]?.result.checks.userTurnsInOrder === true,
+      escapeDuringTurnRestoresQueuedPrompt: results[1]?.result.checks.escRestoresQueue === true,
+      longToolOutputRendersAndRefolds: results[2]?.result.checks.realToolResultStored === true
+        && results[2]?.result.checks.collapsedAfterTurn === true && results[2]?.result.checks.expandedOnEnter === true
+        && results[2]?.result.checks.foldedAgainOnEnter === true,
+      multipleSubagentsInheritTools: results.slice(3).length === 2 && results.slice(3).every(({ result }) =>
+        result.checks.childDispatchObservedInIsolatedLedger === true && result.checks.childInheritedTools === true),
+      allScenariosExitCleanly: results.length === cases.length && results.every(({ result }) => result.run.exitCode === 0),
+    };
+    const last = results.at(-1)!.result;
+    const lines = results.flatMap(({ result }) => result.logs.lines);
+    return {
+      scenario: spec.scenario,
+      universe: root,
+      run: last.run,
+      store: { scenarios: results.map(({ name, result }) => ({ name, checks: result.checks, store: result.store })) },
+      logs: { command: `composite N03 PTY run: ${cases.map((c) => c.scenario).join(' → ')}`, rc: results.every(({ result }) => result.logs.rc === 0) ? 0 : 1, lines, eventCount: lines.length, limit: results.reduce((sum, { result }) => sum + result.logs.limit, 0) },
+      checks,
+    };
+  }
+
   if (seatTurnCapScenario) {
     const run = await mockSeatPtySequence({
       ...base,
@@ -154,6 +194,13 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
 
   if (spec.scenario === 'next-subagent-e4') {
     const capture = join(root, 'fake-llm.jsonl');
+    const debugDir = join(root, '.elanous', 'debug');
+    const debugFileOffsets = new Map<string, number>();
+    if (existsSync(debugDir)) {
+      for (const name of readdirSync(debugDir).filter((entry) => (entry.startsWith('debug-') || entry.startsWith('chat-')) && entry.endsWith('.log'))) {
+        debugFileOffsets.set(name, statSync(join(debugDir, name)).size);
+      }
+    }
     const run = await mockSeatPtySequence({
       ...base,
       env: {
@@ -182,9 +229,13 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     const childPrompt = JSON.stringify(childRequest?.messages ?? []);
     // The child Agent writes to the isolated debug trail; its events are not
     // guaranteed to have a StoreSink in this standalone PTY process.
-    const debugDir = join(root, '.elanous', 'debug');
     const debugLines = readdirSync(debugDir).filter((name) => (name.startsWith('debug-') || name.startsWith('chat-')) && name.endsWith('.log'))
-      .flatMap((name) => readFileSync(join(debugDir, name), 'utf8').split('\n').filter(Boolean))
+      .flatMap((name) => {
+        const contents = readFileSync(join(debugDir, name));
+        const previousSize = debugFileOffsets.get(name) ?? 0;
+        const offset = previousSize > 0 && contents.length >= previousSize ? previousSize : 0;
+        return contents.subarray(offset).toString('utf8').split('\n').filter(Boolean);
+      })
       .filter((line) => {
         try {
           const event = JSON.parse(line) as { category?: string };
@@ -223,44 +274,223 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     return { scenario: spec.scenario, universe: root, run, store: { capture, capturedRequests: captured.length }, logs, checks };
   }
 
-  if (spec.scenario === 'next-at-picker') {
+  if (spec.scenario === 'next-dock-long-stream') {
+    const streamedReply = Array.from({ length: 36 }, (_, index) => `dock-stream-line-${String(index + 1).padStart(2, '0')} ${'x'.repeat(96)}`).join('\n');
     const fixture = join(root, 'picked.txt');
-    const capture = join(root, 'fake-llm.jsonl');
-    writeFileSync(fixture, 'attachment body from the isolated @ picker fixture');
+    writeFileSync(fixture, 'long stream dock picker fixture');
     const run = await mockSeatPtySequence({
       ...base,
-      env: { ...base.env, ELANOUS_TEST_FAKE_LLM_CAPTURE: capture },
+      rows: 24,
+      env: { ...base.env, [TEST_FAKE_LLM_SCRIPT_ENV]: `stall:${streamedReply}` },
       steps: [
-        { label: 'at candidates', text: 'Read @picked', enter: false, until: (s) => s.includes('▸ picked.txt') },
-        { label: 'selected attachment', keys: '\r', until: (s) => s.includes('[attached 1: picked.txt]') },
-        { label: 'sent with attachment', keys: '\r', until: done(1, 'Read [attached 1: picked.txt]') },
+        { label: 'long output remains streaming', text: 'stream a long answer', until: (s) => s.includes('dock-stream-line-36') && s.includes('응답 중 · Esc 취소') },
+        { label: 'long output cancelled', keys: '\x1b', until: (s) => s.includes('응답 취소됨 · Enter 전송') },
+        { label: 'picker open after long output', text: 'Read @picked', enter: false, until: (s) => s.includes('▸ picked.txt') && s.includes('@ 파일 첨부') },
+        { label: 'picker closed after long output', keys: '\x1b', until: (s) => s.includes('Read @picked') && !s.includes('@ 파일 첨부') },
       ],
     });
-    const logs = readLogs(spec, 'tui.next,llm.route-decision');
-    const events = parseEvents(logs);
-    const id = withStore(root, () => getActiveSessionId() ?? '');
-    const stored = withStore(root, () => id ? loadSession(id)?.messages ?? [] : []);
-    const user = [...stored].reverse().find((message) => message.role === 'user');
-    const content = JSON.stringify(user?.content ?? null);
-    const captured = readFileSync(capture, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as {
-      messages: Array<{ role: string; content: unknown }>;
-    });
-    const capturedUser = captured.flatMap((request) => request.messages).filter((message) => message.role === 'user').at(-1);
-    const modelContent = JSON.stringify(capturedUser?.content ?? null);
-    const selected = events.filter((event) => event.category === 'tui.next' && event.event === 'at-picker-selected');
-    const loaded = events.filter((event) => event.category === 'tui.next' && event.event === 'at-picker-module-loaded');
-    const checks = {
-      bootFramePrecedesPicker: run.frames[0]?.label === 'boot'
-        && !run.frames[0]?.screen.includes('파일 첨부 후보'),
-      pickerListsFixture: run.frames.find((frame) => frame.label === 'at candidates')?.screen.includes('▸ picked.txt') === true,
-      selectedPathRecorded: selected.length === 1 && (parseData<{ path: string }>(selected[0]?.data).path ?? '').endsWith('/picked.txt'),
-      moduleLoadedOnlyOnTypedAt: loaded.length === 1 && parseData<{ onDemand: boolean }>(loaded[0]?.data).onDemand === true,
-      submittedBodyKeepsSelection: content.includes('[attached 1: picked.txt]'),
-      submittedAttachmentContent: modelContent.includes('attachment body from the isolated @ picker fixture'),
-      onlyFakeProvider: onlyFake(events),
-      exitedClean: run.exitCode === 0,
+    const frame = (label: string) => run.frames.find((item) => item.label === label)?.screen ?? '';
+    const composerPinned = (label: string) => {
+      if (run.rows < NEXT_TUI_DOCK_PIN_MIN_ROWS) return true;
+      const lines = frame(label).split('\n');
+      return lines.length === run.rows && lines.at(-1)?.trimStart().startsWith('❯') === true;
     };
-    return { scenario: spec.scenario, universe: root, run, store: { sessionId: id, userContent: content, modelContent }, logs, checks };
+    return {
+      scenario: spec.scenario, universe: root, run, store: {}, logs: readLogs(spec, 'tui.next,llm.route-decision'), checks: {
+        longOutputVisibleWhileBusy: frame('long output remains streaming').includes('dock-stream-line-36')
+          && frame('long output remains streaming').includes('응답 중 · Esc 취소'),
+        composerPinnedDuringLongOutput: composerPinned('long output remains streaming'),
+        composerPinnedAfterCancel: composerPinned('long output cancelled'),
+        composerPinnedWhilePickerOpen: composerPinned('picker open after long output'),
+        composerPinnedAfterPickerClose: composerPinned('picker closed after long output'),
+        pickerClosedAndDraftRestored: frame('picker closed after long output').includes('❯ Read @picked')
+          && !frame('picker closed after long output').includes('@ 파일 첨부'),
+        exitedClean: run.exitCode === 0,
+      },
+    };
+  }
+
+  if (spec.scenario === 'next-at-picker') {
+    const results: Array<{ rows: number; root: string; capture: string; run: SeatPtySequenceEvidence; logs: NextTuiScenarioResult['logs']; store: Record<string, unknown>; checks: Record<string, boolean> }> = [];
+    for (const rows of [24, 40]) {
+      const caseRoot = join(root, `rows-${rows}`);
+      mkdirSync(caseRoot, { recursive: true });
+      writeFileSync(join(caseRoot, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+      const fixture = join(caseRoot, 'picked.txt');
+      const capture = join(caseRoot, 'fake-llm.jsonl');
+      writeFileSync(fixture, 'attachment body from the isolated @ picker fixture');
+      const caseSpec = { ...spec, root: caseRoot };
+      const artifactDir = process.env.ELANOUS_TUI_INLINE_PICKER_EVIDENCE_DIR;
+      if (artifactDir) mkdirSync(artifactDir, { recursive: true });
+      const artifactPath = artifactDir ? join(artifactDir, `next-inline-picker-${rows}.json`) : undefined;
+      const run = await mockSeatPtySequence({
+        ...base, root: caseRoot, rows,
+        env: {
+          ...base.env,
+          ELANOUS_SESSION_ROOT: join(caseRoot, 'sessions'), ELANOUS_CONFIG_DIR: caseRoot, ELANOUS_STATE_DIR: caseRoot,
+          ELANOUS_TEST_FAKE_LLM_CAPTURE: capture,
+          [TEST_FAKE_LLM_SCRIPT_ENV]: 'ok,stall:inline confirmation test hold',
+        },
+        ...(artifactPath ? { artifactPath } : {}),
+        steps: [
+          { label: 'at candidates', text: 'Read @picked', enter: false, until: (s) => s.includes('▸ picked.txt') && s.includes('@ 파일 첨부') },
+          { label: 'selected attachment', keys: '\r', until: (s) => s.includes('[attached 1: picked.txt]') && !s.includes('@ 파일 첨부') },
+          { label: 'sent selected attachment draft unchanged', keys: '\r', until: done(1, 'Read [attached 1: picked.txt]') },
+          { label: 'slash candidates', keys: '\x15', text: '/he', enter: false, until: (s) => s.includes('/ 명령') && s.includes('/help') },
+          { label: 'slash dismissed with draft restored', keys: '\x1b', until: (s) => s.includes('/he') && !s.includes('/ 명령') },
+          { label: 'slash candidates reopened', text: 'lp', enter: false, until: (s) => s.includes('/ 명령') && s.includes('/help') },
+          { label: 'slash command selected and run', keys: '\r', until: (s) => s.includes('/resume — 이전 대화 이어가기') && !s.includes('/ 명령') },
+          // The compact route is above the 24-row viewport after /help appends the full
+          // command list. Page up to make that output visible before asserting it.
+          { label: 'slash command output remains scrollable', keys: '\x1b[5~', until: (s) => s.includes('/compact — 대화 정리') && !s.includes('/ 명령') },
+          { label: 'ordinary turn pending', text: 'inline-confirm', until: (s) => s.includes('inline confirmation test hold') && s.includes('응답 중 · Esc 취소') },
+          { label: 'ordinary Esc cancels immediately', keys: '\x1b', until: (s) => s.includes('응답 취소됨 · Enter 전송') },
+        ],
+      });
+      const logs = readLogs(caseSpec, 'tui.next,llm.route-decision');
+      const events = parseEvents(logs);
+      const id = withStore(caseRoot, () => getActiveSessionId() ?? '');
+      const stored = withStore(caseRoot, () => id ? loadSession(id)?.messages ?? [] : []);
+      const user = [...stored].reverse().find((message) => message.role === 'user' && JSON.stringify(message.content).includes('[attached 1: picked.txt]'));
+      const content = JSON.stringify(user?.content ?? null);
+      const captured = readFileSync(capture, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { messages: Array<{ role: string; content: unknown }> });
+      const capturedUser = captured.flatMap((request) => request.messages).find((message) => message.role === 'user' && JSON.stringify(message.content).includes('[attached 1: picked.txt]'));
+      const modelContent = JSON.stringify(capturedUser?.content ?? null);
+      const selected = events.filter((event) => event.category === 'tui.next' && event.event === 'at-picker-selected');
+      const loaded = events.filter((event) => event.category === 'tui.next' && event.event === 'at-picker-module-loaded');
+      const selectedFrame = run.frames.find((frame) => frame.label === 'selected attachment')?.screen ?? '';
+      results.push({ rows, root: caseRoot, capture, run, logs, store: { sessionId: id, userContent: content, modelContent }, checks: {
+        bootFramePrecedesPicker: run.frames[0]?.label === 'boot' && !run.frames[0]?.screen.includes('파일 첨부'),
+        pickerLivesImmediatelyAboveComposer: (() => {
+          const frame = run.frames.find((item) => item.label === 'at candidates')?.screen ?? '';
+          const lines = frame.split('\n');
+          const candidate = lines.findIndex((line) => line.includes('▸ picked.txt'));
+          return candidate >= 0 && candidate < lines.length - 2 && lines[candidate + 1]?.includes('Enter 추가') === true
+            && lines[candidate + 2]?.includes('❯') === true && !frame.slice(0, candidate).includes('▸ picked.txt');
+        })(),
+        selectionClosesPanelAndRestoresComposer: selectedFrame.includes('[attached 1: picked.txt]') && !selectedFrame.includes('@ 파일 첨부'),
+        slashCandidatesInInputArea: run.frames.find((frame) => frame.label === 'slash candidates')?.screen.includes('/ 명령') === true,
+        slashPickerLivesImmediatelyAboveComposer: (() => {
+          const lines = (run.frames.find((frame) => frame.label === 'slash candidates')?.screen ?? '').split('\n');
+          const firstCandidate = lines.findIndex((line) => line.includes('▸ /help — 명령과 키 안내'));
+          const hint = lines.findIndex((line) => line.includes('Enter 실행 · Esc 닫기'));
+          const composer = lines.findIndex((line) => line.trimStart().startsWith('❯ /he'));
+          return firstCandidate > 0 && lines[firstCandidate - 1]?.includes('/ 명령') === true
+            && hint > firstCandidate && composer === hint + 1 && composer === lines.length - 1
+            && composer - (firstCandidate - 1) <= 6;
+        })(),
+        slashEscRestoresDraft: (() => { const frame = run.frames.find((item) => item.label === 'slash dismissed with draft restored')?.screen ?? ''; return frame.includes('/he') && !frame.includes('/ 명령'); })(),
+        slashSelectionRunsCommand: (() => {
+          const selected = run.frames.find((item) => item.label === 'slash command selected and run')?.screen ?? '';
+          const output = run.frames.find((item) => item.label === 'slash command output remains scrollable')?.screen ?? '';
+          return selected.includes('/resume — 이전 대화 이어가기') && !selected.includes('/ 명령')
+            && output.includes('/compact — 대화 정리') && !output.includes('/ 명령');
+        })(),
+        ordinaryTurnEscCancelsImmediately: (() => {
+          const frame = run.frames.find((item) => item.label === 'ordinary Esc cancels immediately')?.screen ?? '';
+          return frame.includes('응답 취소됨 · Enter 전송') && !frame.includes('응답 중단 확인');
+        })(),
+        selectedPathRecorded: selected.length === 1 && (parseData<{ path: string }>(selected[0]?.data).path ?? '').endsWith('/picked.txt'),
+        moduleLoadedOnlyOnTypedAt: loaded.length === 1 && parseData<{ onDemand: boolean }>(loaded[0]?.data).onDemand === true,
+        submittedBodyKeepsSelection: content.includes('[attached 1: picked.txt]'),
+        submittedAttachmentContent: modelContent.includes('attachment body from the isolated @ picker fixture'),
+        onlyFakeProvider: onlyFake(events),
+        exitedClean: run.exitCode === 0,
+      } });
+    }
+    const allLines = results.flatMap((result) => result.logs.lines);
+    const logs: NextTuiScenarioResult['logs'] = {
+      command: results.map((result) => result.logs.command).join(' ⊕ '),
+      rc: results.every((result) => result.logs.rc === 0) ? 0 : 1,
+      lines: allLines, eventCount: allLines.length, limit: results.reduce((sum, result) => sum + result.logs.limit, 0),
+    };
+    return {
+      scenario: spec.scenario, universe: root,
+      run: { ...results[0]!.run, frames: results.flatMap((result) => result.run.frames.map((frame) => ({ ...frame, label: `${result.rows}: ${frame.label}` }))), exitCode: results.every((result) => result.run.exitCode === 0) ? 0 : 1 },
+      store: { sizes: results.map(({ rows, store, capture }) => ({ rows, ...store, capture })) }, logs,
+      checks: Object.fromEntries(results.flatMap((result) => Object.entries(result.checks).map(([name, passed]) => [`${name}:${result.rows}`, passed]))),
+    };
+  }
+
+  if (spec.scenario === 'next-context-area-clear') {
+    const fixtureA = join(root, 'a.txt');
+    const fixtureB = join(root, 'b.txt');
+    const fixtureC = join(root, 'c.txt');
+    writeFileSync(fixtureA, 'attachment area first fixture');
+    writeFileSync(fixtureB, 'attachment area second fixture');
+    writeFileSync(fixtureC, 'attachment area third fixture');
+    const withoutLayout = (value: string): string => value
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+      .replace(/[\s\u0000-\u001f]/gu, '');
+    const containsPath = (value: string, path: string): boolean => withoutLayout(value).includes(withoutLayout(path));
+    const run = await mockSeatPtySequence({
+      ...base,
+      cols: 44,
+      rows: 12,
+      steps: [
+        { label: 'first attachment picker opened', text: 'Read @a', enter: false, until: (s) => s.includes('▸ a.txt') && s.includes('@ 파일 첨부') },
+        { label: 'first attachment selected', keys: '\r', until: (s) => s.includes('[attached 1: a.txt]') && !s.includes('@ 파일 첨부') },
+        { label: 'second attachment picker opened', text: '@b', enter: false, until: (s) => s.includes('▸ b.txt') && s.includes('@ 파일 첨부') },
+        { label: 'second attachment selected', keys: '\r', until: (s) => s.includes('[attached 2: b.txt]') && !s.includes('@ 파일 첨부') },
+        { label: 'attachments sent', keys: '\r', until: (s) => count(s, reply) === 1 && s.includes('응답 완료') },
+        { label: 'attachment page one', text: '/context', enter: true, until: (s) => s.includes('첨부 2건 · 1/2쪽') && containsPath(s, fixtureA.slice(0, 40)) },
+        { label: 'attachment page two', text: '/context page 2', enter: true, until: (s) => s.includes('2/2쪽') && containsPath(s, fixtureB.slice(0, 40)) },
+        { label: 'attachment path page two down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
+        { label: 'attachment path page three down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 3/') && s.includes('❯') },
+        { label: 'attachment path page up keeps input', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
+        { label: 'attachment first path page', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 1/') && s.includes('❯') },
+        { label: 'page up at first attachment page enters log navigation', keys: '\x1b[5~', until: (s) => s.includes('로그 탐색') },
+        { label: 'escape returns to composer after log navigation', keys: '\x1b', until: (s) => s.includes('❯') },
+        { label: 'attachment page down after log navigation', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
+        { label: 'long activity keeps attachment area pinned', text: '/help', enter: true, until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
+        { label: 'third attachment picker opened', text: '@c', enter: false, until: (s) => s.includes('▸ c.txt') && s.includes('@ 파일 첨부') },
+        { label: 'third attachment selected refreshes area', keys: '\r', until: (s) => s.includes('첨부 3건 · 2/3쪽') && s.includes('❯') },
+        { label: 'third attachment sent', keys: '\r', until: (s) => s.includes('응답 완료') },
+        { label: 'attachment page three shows new item', text: '/context page 3', enter: true, until: (s) => s.includes('첨부 3건 · 3/3쪽') && containsPath(s, fixtureC.slice(0, 40)) },
+        { label: 'new attachment path page two down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/3') && s.includes('❯') },
+        { label: 'new attachment path page three down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 3/3') && s.includes('❯') },
+        { label: 'second attachment dropped', text: '/context drop 2', enter: true, until: (s) => s.includes('첨부 #2 삭제') && containsPath(s, fixtureA.slice(0, 40)) },
+        { label: 'attachment area cleared', text: '/context clear', enter: true, until: (s) => s.includes('첨부 2건 삭제') },
+        { label: 'empty attachment area', text: '/context', enter: true, until: (s) => s.includes('/context: (없음)') },
+      ],
+    });
+    const screen = (label: string) => run.frames.find((frame) => frame.label === label)?.screen ?? '';
+    const screenWithoutLayout = (label: string): string => withoutLayout(screen(label));
+    const attachmentViewportText = (label: string): string => {
+      const lines = screen(label).split('\n');
+      const title = lines.findIndex((line) => line.includes('첨부 ') && line.includes('쪽'));
+      if (title < 0) return '';
+      const status = lines.findIndex((line) => line.includes('PgUp/PgDn'));
+      const prompt = lines.findIndex((line) => line.trimStart().startsWith('❯'));
+      const end = status > title ? status : prompt > title ? prompt - 1 : lines.length;
+      return withoutLayout(lines.slice(title + 1, end).join(''));
+    };
+    const longPathAcrossPages = [
+      'attachment page two', 'attachment path page two down', 'attachment path page three down',
+    ].map(attachmentViewportText).join('');
+    const newAttachmentPathAcrossPages = [
+      'attachment page three shows new item', 'new attachment path page two down', 'new attachment path page three down',
+    ].map(attachmentViewportText).join('');
+    return {
+      scenario: spec.scenario, universe: root, run, store: { fixtureA, fixtureB, fixtureC }, logs: readLogs(spec, 'tui.next'), checks: {
+        firstPageShowsFixture: containsPath(screen('attachment page one'), fixtureA.slice(0, 40)),
+        secondPageShowsFixture: longPathAcrossPages.includes(withoutLayout(fixtureB)),
+        longPathIsNavigable: longPathAcrossPages.includes(withoutLayout(fixtureB)),
+        inputRemainsVisibleDuringPathNavigation: ['attachment path page two down', 'attachment path page three down', 'attachment path page up keeps input']
+          .every((label) => screen(label).includes('❯')),
+        pageUpAtFirstAttachmentPageEntersLogNavigation: screen('page up at first attachment page enters log navigation').includes('로그 탐색'),
+        logNavigationReturnsToComposer: screen('escape returns to composer after log navigation').includes('❯'),
+        areaStaysVisibleAfterLongActivity: screen('long activity keeps attachment area pinned').includes('첨부 2건 · 2/2쪽'),
+        longPathStaysVisibleAfterLongActivity: attachmentViewportText('long activity keeps attachment area pinned').length > 0,
+        attachmentAddedAfterOpenRefreshesCount: screenWithoutLayout('third attachment selected refreshes area').includes('첨부3건·2/3쪽'),
+        attachmentAddedAfterOpenIsReachable: newAttachmentPathAcrossPages.includes(withoutLayout(fixtureC)),
+        dropRemovesOnlySecondPath: !attachmentViewportText('second attachment dropped').includes('[attached2:b.txt]')
+          && attachmentViewportText('second attachment dropped').includes('[attached1:a.txt]'),
+        clearRemovesLastPath: !attachmentViewportText('attachment area cleared').includes('[attached1:a.txt]'),
+        emptyListClearsPreviousArea: !attachmentViewportText('empty attachment area').includes('[attached1:a.txt]'),
+        exitedClean: run.exitCode === 0,
+      },
+    };
   }
 
   if (spec.scenario === 'next-new-session' || spec.scenario === 'next-clear-session') {
@@ -305,6 +535,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
   if (spec.scenario === 'next-resume') return runNextResumeScenario(spec, root, base, reply, done);
 
   if (spec.scenario === 'next-tool-fold') return runNextToolFoldScenario(spec, root, base, reply, done);
+  if (spec.scenario === 'next-esc-confirm-long-shell') return runNextEscConfirmLongShellScenario(spec, root, base, reply, done);
   if (spec.scenario === 'next-tool-fold-read') return runNextToolFoldReadScenario(spec, root, base, done);
   if (spec.scenario === 'next-queue') return runNextQueueScenario(spec, root, base, reply, done);
   if (spec.scenario === 'next-proactive-continue') return runNextProactiveContinueScenario(spec, root, base);
@@ -420,15 +651,22 @@ function activeUserTexts(root: string): { id: string; user: string[] } {
   return { id, user: id ? userTexts(root, id) : [] };
 }
 
-/** TUI-NEXT-QUEUE-AND-WAKE ① — two sentences ⊕ a draft typed while one slow turn runs; then Esc over a queued one. */
+/** TUI-NEXT-QUEUE-AND-WAKE ① — two sentences ⊕ a draft typed while one slow turn runs; confirm Esc before restoring queued input. */
 async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, reply: string, done: Done): Promise<NextTuiScenarioResult> {
   const slow = '천천히';
   const steps: SeatPtyStep[] = [
     // One slow turn; while it runs: two submissions and an unsent draft.
     { label: 'busy with two queued', chunks: [`첫 질문 ${slow}`, '\r', '둘째 질문', '\r', '셋째 질문', '\r', '쓰던 초안'], gapMs: 300, until: (s) => s.includes('대기 2') && s.includes('쓰던 초안') },
     { label: 'after settle', until: (s) => done(3)(s) && s.includes('셋째 질문') && s.includes('쓰던 초안') && !s.includes('대기'), timeoutMs: 60_000 },
-    // The draft becomes a slow turn; one more is queued behind it; Esc cancels the turn → the queued one returns to the prompt.
-    { label: 'esc restores queue', chunks: [` ${slow}`, '\r', '다섯째', '\r', '\x1b'], gapMs: 400, until: (s) => s.includes('대기 1건을 입력칸으로') && s.includes('다섯째'), timeoutMs: 60_000 },
+    // The draft becomes a slow turn; one more is queued behind it. Esc asks for confirmation;
+    // only the explicit y cancels the turn and restores that queued input to the composer.
+    { label: 'slow draft turn started', text: ` ${slow}`, until: (s) => s.includes('응답 중 · Esc 취소'), timeoutMs: 10_000 },
+    { label: 'fifth turn queued', text: '다섯째', until: (s) => s.includes('대기 1'), timeoutMs: 10_000 },
+    { label: 'unsent draft stays behind queue', text: '미전송 초안', enter: false, until: (s) => s.includes('대기 1') && s.includes('미전송 초안'), timeoutMs: 10_000 },
+    { label: 'esc opens queue stop confirmation', keys: '\x1b', until: (s) => s.includes('응답 중단 확인') && s.includes('n. 계속'), timeoutMs: 10_000 },
+    { label: 'n keeps the queued turn and draft pending', keys: 'n', until: (s) => s.includes('응답 중 · Esc 취소') && s.includes('대기 1') && s.includes('미전송 초안'), timeoutMs: 10_000 },
+    { label: 'second esc opens confirmation', keys: '\x1b', until: (s) => s.includes('응답 중단 확인') && s.includes('n. 계속'), timeoutMs: 10_000 },
+    { label: 'y cancels and restores queue', keys: 'y', until: (s) => s.includes('대기 1건을 입력칸으로') && s.includes('다섯째') && !s.includes('응답 중단 확인'), timeoutMs: 30_000 },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -445,7 +683,11 @@ async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, bas
     userTurnsInOrder: JSON.stringify(store.user.slice(0, 3)) === JSON.stringify([`첫 질문 ${slow}`, '둘째 질문', '셋째 질문']),
     threeReplies: count(frame('after settle'), reply) === 3,
     draftKept: promptLine(frame('after settle')).includes('쓰던 초안'),
-    escRestoresQueue: promptLine(frame('esc restores queue')).includes('다섯째') && !store.user.includes('다섯째'),
+    escConfirmationKeepsQueuePending: frame('esc opens queue stop confirmation').includes('응답 중단 확인')
+      && frame('n keeps the queued turn and draft pending').includes('대기 1')
+      && frame('n keeps the queued turn and draft pending').includes('응답 중 · Esc 취소')
+      && promptLine(frame('n keeps the queued turn and draft pending')).includes('미전송 초안'),
+    escRestoresQueue: promptLine(frame('y cancels and restores queue')).includes('다섯째↵미전송 초안') && !store.user.includes('다섯째'),
     onlyFakeProvider: onlyFake(events),
     exitedClean: run.exitCode === 0,
   };
@@ -566,13 +808,11 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
   return { scenario: spec.scenario, universe: root, run, store: { ...store, reply }, logs, checks };
 }
 
-/** TUI-NEXT-FOLD — one real turn: the fake model calls the registered Bash tool, which prints 30 lines
- *  (`seq`), so the stored tool result comes from the real tool path (not a seed). Then PageUp (log focus)
- *  → Enter (expand) → Enter (fold again). */
-export const NEXT_TOOL_FOLD_COMMAND = 'seq -f fold-line-%02g 0 29';
+/** TUI-NEXT-FOLD-DEFAULT — real Bash tool call; both progressive MessageBlock and saved tool row are selectable. */
+export const NEXT_TOOL_FOLD_COMMAND = "seq -f fold-line-%02g 0 29; printf 'fold-stderr-marker\\n' >&2; exit 7";
 async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, reply: string, done: Done): Promise<NextTuiScenarioResult> {
   const ask = '도구 출력 접기 시험';
-  const summaryRe = /▸ 도구 Bash · (\d+)줄 \(접힘\)/;
+  const summaryRe = /▸ 도구 · Bash 결과 \(접힘\)/;
   // Whole stored session, read at the moment each screen is reached: before the toggles and after both.
   const snapshot = (): string => withStore(root, () => {
     const sid = getActiveSessionId() ?? '';
@@ -586,11 +826,15 @@ async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, 
       until: (s) => { const ok = done(1)(s) && summaryRe.test(s); if (ok && !beforeToggle) beforeToggle = snapshot(); return ok; },
     },
     { label: 'log focus (PageUp)', keys: '\x1b[5~', until: '로그 탐색' },
-    { label: 'expanded (Enter)', keys: '\r', until: (s) => s.includes('fold-line-29') && !summaryRe.test(s), timeoutMs: 15_000 },
+    { label: 'L1 summary (Enter)', keys: '\r', until: (s) => s.includes('도구 · Bash 결과') && !summaryRe.test(s), timeoutMs: 15_000 },
+    { label: 'L2 steps (Enter)', keys: '\r', until: (s) => s.includes('호출 인자 전달') && s.includes('도구 · Bash 결과'), timeoutMs: 15_000 },
+    { label: 'L3 raw reference (Enter)', keys: '\r', until: (s) => s.includes('fold-line-29') && s.includes('입력'), timeoutMs: 15_000 },
     {
-      label: 'folded again (Enter)', keys: '\r', timeoutMs: 15_000,
-      until: (s) => { const ok = summaryRe.test(s) && !s.includes('fold-line-29'); if (ok && !afterToggles) afterToggles = snapshot(); return ok; },
+      label: 'MessageBlock folds again (Enter)', keys: '\r', timeoutMs: 15_000,
+      until: (s) => { const ok = summaryRe.test(s) && !s.split('\n').some((line) => line.trim() === '입력'); if (ok && !afterToggles) afterToggles = snapshot(); return ok; },
     },
+    { label: 'saved tool row is selectable (Enter)', keys: '\r', until: (s) => s.includes('fold-line-29') && s.includes('fold-stderr-marker')
+      && !s.split('\n').some((line) => line.trim() === '입력'), timeoutMs: 15_000 },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -612,15 +856,21 @@ async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, 
   })();
   const screen = (label: string) => run.frames.find((f) => f.label === label)?.screen ?? '';
   const folded0 = screen('after tool turn (folded)');
-  const expanded = screen('expanded (Enter)');
-  const folded1 = screen('folded again (Enter)');
+  const folded1 = screen('MessageBlock folds again (Enter)');
+  const expanded = screen('L3 raw reference (Enter)');
   const checks = {
     // The 30 lines come from the Bash tool actually running in the turn loop.
     realToolResultStored: tool?.toolName === 'Bash' && stdoutLines.length === 30
       && stdoutLines.every((l, i) => l === `fold-line-${String(i).padStart(2, '0')}`),
     collapsedAfterTurn: summaryRe.test(folded0) && !folded0.includes('fold-line-12'),
-    expandedOnEnter: expanded.includes('fold-line-29') && !summaryRe.test(expanded),
-    foldedAgainOnEnter: summaryRe.test(folded1) && !folded1.includes('fold-line-29'),
+    summaryAtL1: screen('L1 summary (Enter)').includes('도구 · Bash 결과'),
+    stepsAtL2: screen('L2 steps (Enter)').includes('호출 인자 전달'),
+    expandedOnL3: expanded.includes('fold-line-29') && expanded.includes('fold-stderr-marker')
+      && /종료 상태\s+7/.test(expanded) && !summaryRe.test(expanded),
+    savedToolFoldIsSelectable: screen('saved tool row is selectable (Enter)').includes('fold-line-29')
+      && screen('saved tool row is selectable (Enter)').includes('fold-stderr-marker')
+      && !screen('saved tool row is selectable (Enter)').split('\n').some((line) => line.trim() === '입력'),
+    foldedAgainOnEnter: summaryRe.test(folded1) && !folded1.split('\n').some((line) => line.trim() === '입력'),
     // Fold state is screen-only: the whole stored session read right after the first folded screen
     // equals the one read right after the second Enter (and it holds the real tool result).
     sessionUnchanged: beforeToggle !== '' && beforeToggle === afterToggles && beforeToggle.includes('fold-line-29'),
@@ -628,6 +878,68 @@ async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, 
     exitedClean: run.exitCode === 0,
   };
   return { scenario: spec.scenario, universe: root, run, store: { sessionId: id, messages: stored.length, toolName: tool?.toolName ?? null, stdoutLines: stdoutLines.length, foldedAs: summaryRe.exec(folded0)?.[0] ?? null, sessionBytesBeforeToggle: beforeToggle.length, sessionBytesAfterToggles: afterToggles.length }, logs, checks };
+}
+
+// Source: OP #96145 sets the long-shell confirmation boundary at about five seconds; the PTY waits beyond it.
+const LONG_SHELL_PTY_GAP_MS = LONG_SHELL_ESC_CONFIRMATION_MS + 1_000;
+// Source: OP #96145 sets the confirmation boundary at about five seconds; keep the fake Bash alive through the Esc prompt.
+const LONG_SHELL_PTY_SLEEP_SECONDS = LONG_SHELL_ESC_CONFIRMATION_MS / 1_000 + 3;
+
+async function runNextEscConfirmLongShellScenario(
+  spec: NextTuiScenarioSpec,
+  root: string,
+  base: ScenarioBase,
+  reply: string,
+  done: Done,
+): Promise<NextTuiScenarioResult> {
+  const ask = '긴 Bash 중단 확인 시험';
+  const shellPidPath = join(root, 'cancelled-shell.pid');
+  const shellPidHasExited = (): boolean => {
+    if (!existsSync(shellPidPath)) return false;
+    const pid = Number(readFileSync(shellPidPath, 'utf8'));
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try { process.kill(pid, 0); return false; }
+    catch { return true; }
+  };
+  const run = await mockSeatPtySequence({
+    ...base,
+    env: {
+      ...base.env,
+      [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({
+        when: ask, name: 'Bash', args: { command: `printf '%s' "$$" > '${shellPidPath}'; exec sleep ${LONG_SHELL_PTY_SLEEP_SECONDS}` },
+      }),
+    },
+    steps: [
+      { label: 'long Bash running', text: ask, until: (screen) => screen.includes('Bash 실행 중') },
+      {
+        label: 'long Bash Esc asks y/N', chunks: ['', '\u001b'], gapMs: LONG_SHELL_PTY_GAP_MS,
+        until: (screen) => screen.includes('긴 셸 명령 중단 확인') && screen.includes('y/n 입력 · 기본 N'),
+      },
+      { label: 'N keeps Bash running', keys: 'n', until: (screen) => screen.includes('긴 셸 명령 계속 실행') },
+      { label: 'N command completes', until: (screen) => done(1)(screen) && screen.includes('응답 완료') },
+      { label: 'second long Bash running', text: ask, until: (screen) => screen.includes('Bash 실행 중') },
+      {
+        label: 'second long Bash Esc asks y/N', chunks: ['', '\u001b'], gapMs: LONG_SHELL_PTY_GAP_MS,
+        until: (screen) => screen.includes('긴 셸 명령 중단 확인') && screen.includes('y/n 입력 · 기본 N'),
+      },
+      { label: 'y stops Bash turn', keys: 'y', until: (screen) => screen.includes('응답 취소됨') && shellPidHasExited() },
+    ],
+  });
+  const cancelledShellPid = Number(readFileSync(shellPidPath, 'utf8'));
+  const logs = readLogs(spec, 'tui.next,llm.route-decision');
+  const events = parseEvents(logs);
+  const frame = (label: string) => run.frames.find((entry) => entry.label === label)?.screen ?? '';
+  const checks = {
+    longShellShownWhileRunning: frame('long Bash running').includes('Bash 실행 중'),
+    longEscShowsDefaultNInlinePanel: frame('long Bash Esc asks y/N').includes('y/n 입력 · 기본 N'),
+    noKeepsTheSameShellRunning: frame('N keeps Bash running').includes('긴 셸 명령 계속 실행'),
+    declinedShellCompletesNormally: done(1)(frame('N command completes')) && frame('N command completes').includes('응답 완료'),
+    yesStopsTheSecondTurn: frame('y stops Bash turn').includes('응답 취소됨'),
+    cancelledShellProcessExitedAtYConfirmation: Number.isInteger(cancelledShellPid) && cancelledShellPid > 0 && shellPidHasExited(),
+    onlyFakeProvider: onlyFake(events),
+    exitedClean: run.exitCode === 0,
+  };
+  return { scenario: spec.scenario, universe: root, run, store: { ask, checks }, logs, checks };
 }
 
 /** Lines of the file the Read scenario reads (the 10-22 incident shape: «     1\tfold-line-1 …», 20 lines). */
@@ -642,15 +954,10 @@ export const NEXT_TOOL_FOLD_READ_LINES = 20;
 async function runNextToolFoldReadScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, done: Done): Promise<NextTuiScenarioResult> {
   const ask = '읽기 출력 접기 시험';
   const summaryRe = /▸ 도구 Read · 20줄 \(접힘\)/;
-  const headerRe = /도구: Read · 20줄 · \d+B/;
   const file = join(root, 'fold-read.txt');
   writeFileSync(file, Array.from({ length: NEXT_TOOL_FOLD_READ_LINES }, (_, i) => `fold-line-${i + 1}`).join('\n') + '\n');
   const steps: SeatPtyStep[] = [
     { label: 'after Read turn (folded)', text: ask, timeoutMs: 60_000, until: (s) => done(1)(s) && summaryRe.test(s) },
-    { label: 'log focus (PageUp)', keys: '\x1b[5~', until: '로그 탐색' },
-    { label: 'expanded (Enter)', keys: '\r', until: (s) => s.includes('fold-line-20') && !summaryRe.test(s), timeoutMs: 15_000 },
-    // 24 rows cut the block's top — scroll up to its header line.
-    { label: 'expanded top (↑)', keys: '\x1b[A'.repeat(6), until: (s) => headerRe.test(s), timeoutMs: 15_000 },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -666,18 +973,13 @@ async function runNextToolFoldReadScenario(spec: NextTuiScenarioSpec, root: stri
   const envelope = (() => { try { return JSON.parse(result) as { output?: unknown; linesRead?: unknown }; } catch { return null; } })();
   const screen = (label: string) => run.frames.find((f) => f.label === label)?.screen ?? '';
   const folded = screen('after Read turn (folded)');
-  const expanded = screen('expanded (Enter)');
-  const top = screen('expanded top (↑)');
-  // Every file line that is on screen sits on its own row as «<n> fold-line-<n>» (both expanded frames together cover all 20).
-  const fileRows = new Set([...`${expanded}\n${top}`.matchAll(/^ +(\d+) fold-line-(\d+) *$/gm)].filter((m) => m[1] === m[2]).map((m) => Number(m[1])));
   const checks = {
     // The stored result is the real Read envelope (one JSON line) — the shape the incident showed raw.
     realReadEnvelopeStored: tool?.toolName === 'Read' && envelope?.linesRead === NEXT_TOOL_FOLD_READ_LINES
       && typeof envelope.output === 'string' && envelope.output.includes('\tfold-line-1\n'),
     collapsedAfterTurn: summaryRe.test(folded) && !folded.includes('fold-line-12'),
-    // Expanded = the file's lines on their own rows with the status on the header, no raw envelope.
-    expandedAsFileLines: headerRe.test(top) && fileRows.size === NEXT_TOOL_FOLD_READ_LINES,
-    noRawEnvelope: ![folded, expanded, top].some((s) => s.includes('{"output"') || s.includes('\\n') || s.includes('"linesRead"')),
+    // Read expansion is tracked in NEXT-TUI-FOLD-READ-EXPAND (P1); this PR only guards the folded default.
+    noRawEnvelope: !folded.includes('{"output"') && !folded.includes('\\n') && !folded.includes('"linesRead"'),
     onlyFakeProvider: onlyFake(events),
     exitedClean: run.exitCode === 0,
   };

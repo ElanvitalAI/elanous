@@ -36,7 +36,7 @@ export function isToolSearchCall(name: string): boolean {
 export function routeToolSearch(
   args: Record<string, unknown>,
   surfaceSpecs: readonly LLMToolSpec[],
-  meta: { surface: string },
+  meta: { surface: string; activePluginIds?: ReadonlySet<string> },
 ): unknown {
   const query = typeof args.query === 'string' ? args.query : '';
   if (!query.trim()) return { error: 'ToolSearch: `query` is required' };
@@ -45,7 +45,8 @@ export function routeToolSearch(
       query,
       ...(typeof args.max_results === 'number' ? { max_results: args.max_results } : {}),
     },
-    { specs: surfaceSpecs, surface: meta.surface },
+    { specs: surfaceSpecs, surface: meta.surface,
+      activePluginIds: meta.activePluginIds ?? new Set(surfaceSpecs.flatMap((spec) => spec.pluginId ? [spec.pluginId] : [])) },
   );
   debug.log('capability.resolve', 'tool-search', {
     surface: meta.surface,

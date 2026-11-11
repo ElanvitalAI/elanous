@@ -303,6 +303,9 @@ export interface SerializedMessage {
   content: string;
   ts: string;
   toolName?: string;
+  toolCallId?: string;
+  /** Run-scoped tool trace identity used by surfaces to resolve MessageBlock rawRef. */
+  surfaceRunId?: string;
   toolArgs?: unknown;
   toolResult?: unknown;
   tokenEstimate?: number;

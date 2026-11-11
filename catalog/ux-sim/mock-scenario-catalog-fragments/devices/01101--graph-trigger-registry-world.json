@@ -1,0 +1,13 @@
+{
+  "id": "graph-trigger-registry-world",
+  "name": "Graph trigger registry delivery world",
+  "implementation": ["src/ux-sim/graph-trigger-hook-device.ts", "src/ux-sim/fake-clock.ts"],
+  "tests": ["src/ux-sim/graph-trigger-registry-world.test.ts"],
+  "target": "Deliver cron ticks, webhook resends, API retries and duplicate/out-of-order events to an injected registry adapter before the real graph runner; the world never supplies the dedupe decision.",
+  "inputs": ["graph YAML", "scripted triggerId/eventId/dedupeKey/at/payload", "registry adapter"],
+  "observations": ["delivery and decision order", "runner start calls and runIds", "graph node events", "duplicate rejection reason"],
+  "entryCommands": ["bun test src/ux-sim/graph-trigger-registry-world.test.ts"],
+  "logsRecorded": "conditional",
+  "eventNames": ["node-arrival", "node-start", "node-end", "node-leave"],
+  "recentUse": null
+}

@@ -1,6 +1,16 @@
 make-doc-input:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../../scripts/graph-units/verbs-envelope.ts" make-doc-input'
   timeout_ms: 10000
+make:
+  prompt: |
+    Use the requested skill and the provided ask, context, and prior data to make the requested result.
+    Return only one JSON object with outcome set to done, rework, needs-human, or failed, plus result and evidence fields.
+    Input: $ARGUMENTS
+decide:
+  prompt: |
+    Use the requested skill and the provided ask, context, and prior data to make the requested decision or summary.
+    Return only one JSON object with outcome set to done, rework, needs-human, or failed, plus result and evidence fields.
+    Input: $ARGUMENTS
 research:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../../scripts/graph-units/verbs/research.ts"'
   timeout_ms: 300000

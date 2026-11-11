@@ -1,0 +1,13 @@
+{
+  "id": "tool-router-world",
+  "name": "Tool router search-only plugin and low-risk native schema replay",
+  "implementation": ["src/ux-sim/tool-router-world.ts", "src/tool-router/index.ts", "src/plugins/core/host.ts", "src/ux-sim/absorb-v2-runGraph-sim.ts", "src/dashboard/plugin-route-adapter.ts", "src/session-runtime/index.ts", "src/session-runtime/tier-flip.ts", "src/native-tool-catalog.ts", "src/core-turn/run-core-turn.ts", "src/skills/tools/tool-search.ts", "src/skills/tools/tool-search-route.ts", "src/skills/tools/tool-search-spec.ts", "src/eval-prompt-cli.ts"],
+  "tests": ["src/ux-sim/tool-router-world.test.ts", "src/ux-sim/plugin-release-observe-route-world.test.ts", "src/plugins/core/host.test.ts"],
+  "target": "Replay route-declaring first-party plugin manifests through indexed discovery, ToolSearch selection, disabled filtering, native-all, deferred-off, and failed-index fallback; additionally ensure the low-risk dashboard, terminal modal read, and Linear schemas stay out of the direct provider tool list and remain selectable through ToolSearch.",
+  "inputs": ["all first-party plugin manifests with route metadata", "enabled plugin IDs", "injected index failure", "four fixed English prompts for GetDashboardState, TerminalModalList, TerminalModalObserve, and elanous_linear_issue"],
+  "observations": ["route mode and match", "manifest-to-ontology coverage", "app deploy confirmation block", "multi-active matches, zero plugin-route warm preloads, ToolSearch route/select matches and active-scoped fallback", "no plugin-route schema in provider tools under default, native-all, or deferred-off modes", "graph handler allowlist and confirmation dispatch", "runtime default and native-all active schemas", "four-of-four direct schema availability versus four-of-four ToolSearch schema hydration", "TerminalModalKill remains directly available", "index load count", "enabled fallback scope"],
+  "entryCommands": ["bun test src/ux-sim/tool-router-world.test.ts", "bun test src/ux-sim/plugin-release-observe-route-world.test.ts", "bun test src/plugins/core/host.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

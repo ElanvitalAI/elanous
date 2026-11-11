@@ -14,8 +14,10 @@
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 
 import { parseGraphTemplateYaml } from '../src/self-implement/graph-yaml.js';
+import { lowerGraphV2 } from '../src/graph-v2/lower.js';
 import { parseArgv } from './lib/argv.js';
 import { parseGraphOverlayYaml } from '../src/self-implement/graph-overlay-yaml.js';
 
@@ -51,6 +53,16 @@ const expectFail = new Set(
 
 const files = PARSED.positional;
 
+function isGraphV2(source: string): boolean {
+  try {
+    const parsed: unknown = parseYaml(source);
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      && (parsed as Record<string, unknown>).apiVersion === 'elanous.dev/graph/v2';
+  } catch {
+    return false;
+  }
+}
+
 if (files.length === 0) {
   console.error('사용: bun scripts/check-graph-declaration.ts [--index] <file.yaml> [...]');
   process.exit(2);
@@ -63,7 +75,11 @@ for (const f of files) {
   try { src = readFileSync(f, 'utf8'); }
   catch (e) { console.log(`\n=== ${f} ===\n  ⛔ 못 읽었다 — ${(e as Error).message}`); bad++; continue; }
 
-  const r = parseGraphTemplateYaml(src, basename(f));
+  // Keep graph.yaml v2's publish-time safety verdict on the same lowering path as MVP-B.
+  // The YAML parse above only selects the format; all v2 policy checks live in lowerGraphV2.
+  const r = isGraphV2(src)
+    ? lowerGraphV2(src, { label: basename(f) })
+    : parseGraphTemplateYaml(src, basename(f));
   const errors = r.errors ?? [];
   const warnings = r.warnings ?? [];
   const base = basename(f);
@@ -135,7 +151,9 @@ if (overlayDir !== null) {
   const names = new Map<string, string[]>(); // graph_id → 노드 이름(선언 순서)
   for (const f of files) {
     let src: string; try { src = readFileSync(f, 'utf8'); } catch { continue; }
-    const r = parseGraphTemplateYaml(src, basename(f));
+    const r = isGraphV2(src)
+      ? lowerGraphV2(src, { label: basename(f) })
+      : parseGraphTemplateYaml(src, basename(f));
     if (r.template) names.set(r.template.graphId, r.template.nodes.map((n) => n.nodeId));
   }
   const ovs = readdirSync(overlayDir).filter((f) => f.endsWith('.yaml'));

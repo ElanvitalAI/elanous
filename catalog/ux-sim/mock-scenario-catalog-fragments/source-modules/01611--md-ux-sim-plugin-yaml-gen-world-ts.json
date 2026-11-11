@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-PLUGIN-YAML-GEN-WORLD-TS",
+  "path": "src/ux-sim/plugin-yaml-gen-world.ts",
+  "boundary": "Simulates declarative plugin manifest generation and installation.",
+  "deviceIds": ["plugin-yaml-gen"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
@@ -7,6 +7,7 @@ import { ProjectStore } from '../../project/project-store.js';
 import { createSession } from '../../session/index.js';
 
 import { DaemonSessionHistory } from '../../boot/daemon-runtime.js';
+import * as daemonPromptTurn from '../../boot/daemon-prompt-turn.js';
 import { surfaceUxFromDispatchCtx } from '../../agent/surface-ux/build.js';
 import * as coreTurnModule from '../../core-turn/run-core-turn.js';
 import * as providerSummary from '../../provider-summary.js';
@@ -130,6 +131,43 @@ test('project conversation selects tool cwd and attaches AGENTS.md to system con
     if (oldSession === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = oldSession;
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('prompt dispatch carries only the server verified owner receipt selected for lecture-scrap', async () => {
+  const received: DaemonToolDispatchCtx[] = [];
+  const resolverAppSlugs: Array<string | undefined> = [];
+  let dispatch: ((name: string, args: Record<string, unknown>, ctx?: { callId: string }) => Promise<unknown>) | undefined;
+  spyOn(coreTurnModule, 'runCoreTurn').mockImplementation(async (ctx) => {
+    dispatch = ctx.dispatchTool;
+    return { stopReason: 'end_turn', finalText: 'OK' };
+  });
+  const response = await handlePromptPost(new Request('http://test/v1/prompt', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ userText: '강의 앱 배포해 줘' }),
+  }), {
+    noAuth: true,
+    history: new DaemonSessionHistory(),
+    toolCwd: process.cwd(),
+    toolSurface: {
+      kind: 'chat', specs: [],
+      async dispatch(_name, _args, ctx) { received.push(ctx); return { ok: true }; },
+    },
+    resolveVerifiedOwner: (_request, appSlug) => {
+      resolverAppSlugs.push(appSlug);
+      if (appSlug !== 'lecture-scrap') return undefined;
+      return { id: 'member-1', appSlug, memberId: 'member-1', userSlug: 'alice', plan: 'free', entitlements: {} };
+    },
+  });
+
+  expect(response.status).toBe(200);
+  await dispatch!('app_deploy', {});
+  expect(resolverAppSlugs).toEqual([undefined, 'lecture-scrap']);
+  expect(received).toHaveLength(1);
+  expect(received[0]).toMatchObject({
+    verifiedOwner: { id: 'member-1' },
+    appDeploymentSession: 'nexus-owner',
+    appDeploymentOwner: { appSlug: 'lecture-scrap', memberId: 'member-1', userSlug: 'alice', plan: 'free', entitlements: {} },
+  });
 });
 
 test('both prompt endpoints reject JSON null with the existing bad-request response', async () => {
@@ -332,10 +370,22 @@ describe('POST /v1/prompt/stream feedback event-bus delivery', () => {
 });
 
 describe('daemon prompt surface wiring', () => {
-  test('passes a resolved surface at every runDaemonPromptTurn call site', () => {
-    const source = readFileSync(new URL('./meta-api.ts', import.meta.url), 'utf8');
-    expect(source.match(/runDaemonPromptTurn\(/g)).toHaveLength(2);
-    expect(source.match(/surface: surfaceResolution\.surface/g)).toHaveLength(2);
+  test('both prompt endpoints pass their resolved input surface to the turn', async () => {
+    const surfaces: string[] = [];
+    spyOn(daemonPromptTurn, 'runDaemonPromptTurn').mockImplementation(async (opts) => {
+      surfaces.push(opts.surface ?? 'missing');
+      return { sessionId: 'c8-surface', text: 'ok', stopReason: 'end_turn' };
+    });
+    const request = (path: string, kind: 'pwa' | 'terminal') => new Request(`http://test${path}`, { method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: `c8-surface-${kind}`, userText: 'hello', source: { kind } }),
+    });
+    const opts = { noAuth: true, history: new DaemonSessionHistory(), eventBus: new NexusEventBus() };
+    for (const kind of ['pwa', 'terminal'] as const) {
+      expect((await handlePromptPost(request('/v1/prompt', kind), opts)).status).toBe(200);
+      expect((await handlePromptStreamPost(request('/v1/prompt/stream', kind), opts)).status).toBe(200);
+    }
+    expect(surfaces).toEqual(['pwa', 'pwa', 'tui', 'tui']);
   });
 });
 

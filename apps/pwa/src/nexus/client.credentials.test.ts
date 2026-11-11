@@ -28,3 +28,20 @@ test('plugin credential client preserves HTTP error status for callers', async (
     }
   }
 });
+
+test('OpenRouter import flow sends only the selected candidate id and receives masked metadata', async () => {
+  const calls: Array<{ url: string; method: string; body?: string; authorization?: string }> = [];
+  const client = createNexusClient({ baseUrl: 'https://example.test', token: 'owner', fetchImpl: (async (url, init) => {
+    calls.push({ url: String(url), method: init?.method ?? '', body: init?.body as string | undefined,
+      authorization: new Headers(init?.headers).get('authorization') ?? undefined });
+    return init?.method === 'POST'
+      ? Response.json({ saved: true, verification: 'verified', lastFour: '2345' })
+      : Response.json({ candidates: [{ id: 'opaque-candidate', name: 'OPENROUTER_API_KEY', source: 'process environment', lastFour: '2345' }] });
+  }) as typeof fetch });
+  expect((await client.listOpenRouterImportCandidates()).candidates[0]?.lastFour).toBe('2345');
+  expect(await client.importOpenRouterCandidate('opaque-candidate')).toEqual({ saved: true, verification: 'verified', lastFour: '2345' });
+  expect(calls).toEqual([
+    { url: 'https://example.test/v1/credentials/openrouter/import', method: 'GET', authorization: 'Bearer owner' },
+    { url: 'https://example.test/v1/credentials/openrouter/import', method: 'POST', body: '{"id":"opaque-candidate"}', authorization: 'Bearer owner' },
+  ]);
+});

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-TRAIN-MANAGER-WORLD-TS",
+  "path": "src/ux-sim/train-manager-world.ts",
+  "boundary": "Hermetic train manager world: fixed clock, fake GitHub and merge-tree snapshots, temporary JSONL/mail observations, production train-decision/merge-train logic, plus pinned operational-script and landing-shell replays.",
+  "deviceIds": [
+    "train-manager-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

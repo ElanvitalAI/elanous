@@ -3,7 +3,7 @@
 // HITL(buildHitlButtonRows·buildClarifyMessages) 100% 그대로(회귀 0). 켜면 UXIntent 경로로 전환.
 // 순수·fail-soft(config 오류 시 OFF).
 
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 interface UxAgentConfig { enabled?: unknown; surface?: { telegram?: unknown } }
 

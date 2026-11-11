@@ -1,8 +1,12 @@
 import type { GraphEdgeSpec, GraphTemplateSpec } from './graph-yaml.js';
+import { readFileSync } from 'node:fs';
+import { shapeGraphUnit } from '../graph-runner/unit-shape.js';
 
 export interface StaticGraphUnit {
   readonly path: string;
   readonly template: GraphTemplateSpec;
+  readonly source?: string;
+  readonly definition?: 'standalone' | 'component';
 }
 
 export type StaticUnitResolver = (call: string, callerPath: string) => StaticGraphUnit;
@@ -24,7 +28,10 @@ export function flattenGraphUnits(
 
   for (const callNode of graph.nodes) {
     if (callNode.kind !== 'subgraph' || !callNode.call) continue;
-    const unit = resolve(callNode.call, graphPath);
+    const resolved = resolve(callNode.call, graphPath);
+    const unit = callNode.shape && resolved.definition !== 'component'
+      ? { ...resolved, template: shapeGraphUnit(resolved.source ?? readFileSync(resolved.path, 'utf8'), resolved.template, callNode.shape, resolved.path).template }
+      : resolved;
     const unitHeader = unit.template.unit;
     const selectedEntry = callNode.callEntry ?? unit.template.entryNode;
     if (!unitHeader || !(unitHeader.entries ?? [unit.template.entryNode]).includes(selectedEntry)) {

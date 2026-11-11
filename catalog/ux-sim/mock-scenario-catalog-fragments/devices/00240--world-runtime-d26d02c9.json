@@ -5,6 +5,7 @@
     "bun test src/ux-sim/world.test.ts src/ux-sim/world-chaos-runtime.test.ts src/ux-sim/world-host-chaos.test.ts src/ux-sim/world-snapshot.test.ts src/ux-sim/event-monkey.test.ts",
     "bun test src/ux-sim/world.test.ts src/ux-sim/world-chaos-runtime.test.ts src/ux-sim/event-monkey.test.ts",
     "bun test src/ux-sim/world-host-chaos.test.ts",
+    "bun test src/ux-sim/world-regression-suite.test.ts",
     "bun test src/ux-sim/warm-si-reuse-sim.test.ts",
     "bun test src/ux-sim/fake-app-host.test.ts",
     "bun test src/ux-sim/gate-roster-second-pool.test.ts"
@@ -32,6 +33,7 @@
     "src/ux-sim/fake-app-host.ts",
     "src/ux-sim/gate-roster-second-pool.ts",
     "src/ux-sim/world-watch.ts",
+    "src/ux-sim/world-regression-suite.ts",
     "src/ux-sim/multi-tenant-relay-world.ts",
     "src/ux-sim/plugin-release-observe-route-world.ts",
     "src/ux-sim/pwa-retained-routes-world.ts"
@@ -70,6 +72,7 @@
     "src/ux-sim/world-chaos-runtime.test.ts",
     "src/ux-sim/event-monkey.test.ts",
     "src/ux-sim/world-host-chaos.test.ts",
+    "src/ux-sim/world-regression-suite.test.ts",
     "src/ux-sim/warm-si-reuse-sim.test.ts",
     "src/ux-sim/fake-app-host.test.ts",
     "src/ux-sim/gate-roster-second-pool.test.ts",

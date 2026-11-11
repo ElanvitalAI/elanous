@@ -27,6 +27,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { androidToolchainMissing } from './lib/android-toolchain.js';
+import { redactSecretText } from '../src/debug/secret-redaction.js';
 
 const ROOT = join(import.meta.dir, '..');
 
@@ -344,6 +345,43 @@ function defaultReadResults(androidDir: string) {
   return out;
 }
 
+/**
+ * JUnit XML is the source of the testcase count, but Gradle can fail before it
+ * writes any XML (including when a test task fails before report generation).
+ * Keep the gate fail-closed at zero cases while retaining the small, useful
+ * part of Gradle's failure report instead of reducing it to an unexplained 0.
+ */
+function gradleFailureSummary(output: string): string[] {
+  const lines = output.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '').split(/\r?\n/);
+  const useful: string[] = [];
+  const safeLine = (line: string) => redactSecretText(line.trim()).slice(0, 500);
+  let failureDetailsRemaining = 0;
+  for (const line of lines) {
+    if (/^\s*\* What went wrong:\s*$/.test(line)) {
+      failureDetailsRemaining = 8;
+      useful.push(line.trim());
+      continue;
+    }
+    if (failureDetailsRemaining > 0) {
+      if (/^\s*\* (?:Try|Exception is):/.test(line)) failureDetailsRemaining = 0;
+      else if (line.trim()) {
+        useful.push(safeLine(line));
+        failureDetailsRemaining -= 1;
+      }
+    }
+    if (/^\s*(?:>\s*)?(?:FAILURE: Build failed with an exception\.|\* Try:|Task :[^\n]* FAILED|Execution failed for task |There were failing tests\.|See the report at:)/.test(line)) {
+      useful.push(safeLine(line));
+    }
+  }
+  const unique = [...new Set(useful.filter(Boolean))];
+  if (unique.length <= 12) return unique;
+  return [
+    ...unique.slice(0, 5),
+    `… ${unique.length - 11} Gradle failure diagnostics omitted …`,
+    ...unique.slice(-6),
+  ];
+}
+
 const SKIP_WALK_DIRS = new Set(['build', '.gradle', 'node_modules']);
 
 /** 게이트가 순수 필터에 넘길 파일 목록 — 빌드 산출은 건너뛴다. */
@@ -420,8 +458,14 @@ export function runAndroidUnitTestGate(io: AndroidGateIo = {}): number {
   if (tally.ran === 0) {
     // 🔑 이 분기가 이 게이트의 «존재 이유»다.
     error('[android-gate] ⛔ FAIL — 돈 시험이 «0개»다. ⛔ 0 은 통과가 아니다.');
-    error('   대개 원인은 «컴파일 실패»다 — 아래 컴파일러 줄을 읽어라:');
-    for (const line of run.output.split('\n').filter((l) => l.startsWith('e: '))) error(`   ${line}`);
+    error('   JUnit testcase 가 없어서 시험 수를 확인할 수 없다 — 아래 Gradle 진단을 읽어라:');
+    for (const line of gradleFailureSummary(run.output)) error(`   ${line}`);
+    const outputWithoutAnsi = run.output.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '');
+    const compileErrors = outputWithoutAnsi.split('\n').filter((line) => line.startsWith('e: '));
+    if (compileErrors.length > 0) {
+      error(`   컴파일 오류 ${compileErrors.length}줄 (앞 10줄):`);
+      for (const line of compileErrors.slice(0, 10)) error(`   ${redactSecretText(line).slice(0, 500)}`);
+    }
     return 1;
   }
 

@@ -15,11 +15,10 @@ describe('dashboard view config', () => {
   // Scheduler shortcut contract predates it (4e37e59043, 2026-04-17).
   test('ships native views as config-backed definitions', () => {
     const registry = buildDashboardViewRegistry();
-    expect(registry.views.map(v => v.id)).toEqual(['1', '2', '3', 'agents', 'debug', 'playground']);
+    expect(registry.views.map(v => v.id)).toEqual(['1', '2', '3', 'agents', 'debug']);
     expect(registry.views.find(v => v.id === 'debug')?.shortcut).toBe('5');
     expect(registry.views.find(v => v.id === 'agents')?.shortcut).toBe('4');
     expect(registry.views.find(v => v.id === '4')).toBeUndefined();
-    expect(registry.views.find(v => v.id === 'playground')?.shortcut).toBe('7');
     expect(registry.views[0]!.rows[0]!.panes.map(p => p.pane)).toEqual(['browser', 'preview', 'sessions-sidebar']);
     expect(registry.views.find(v => v.id === 'agents')?.rows[0]?.panes.map(p => p.pane))
       .toEqual(['agent-roster', 'agent-detail', 'preview']);
@@ -29,24 +28,11 @@ describe('dashboard view config', () => {
       .toEqual(['debug-stack', 'debug-prompts', 'log']);
   });
 
-  test('VP1 — playground view routes Ctrl+7 to playground pane', () => {
-    const registry = buildDashboardViewRegistry();
-    const v7 = findDashboardView(registry, '7');
-    expect(v7?.id).toBe('playground');
-    expect(v7?.label).toBe('Widget Playground');
-    expect(v7?.primary).toBe('playground');
-    expect(v7?.baseView).toBe(1);
-    // /view playground also works as label lookup
-    expect(findDashboardView(registry, 'playground')?.id).toBe('playground');
-    expect(findDashboardView(registry, 'widget playground')?.id).toBe('playground');
-  });
-
-  test('resolves reordered native shortcuts for Agents, Debug, and Playground', () => {
+  test('resolves reordered native shortcuts for Agents and Debug', () => {
     const registry = buildDashboardViewRegistry();
 
     expect(findDashboardView(registry, '4')?.id).toBe('agents');
     expect(findDashboardView(registry, '5')?.id).toBe('debug');
-    expect(findDashboardView(registry, '7')?.id).toBe('playground');
     expect(findDashboardView(registry, '6')).toBeNull();
   });
 
@@ -59,7 +45,7 @@ describe('dashboard view config', () => {
       ],
     });
     // Explicitly conflicts with every default axis: order, enabled state, and ratio.
-    expect(registry.views.map(v => v.id)).toEqual(['3', '1', 'agents', 'debug', 'playground']);
+    expect(registry.views.map(v => v.id)).toEqual(['3', '1', 'agents', 'debug']);
     expect(registry.views.find(v => v.id === '2')).toBeUndefined();
     const normal = registry.allViews.find(v => v.id === '1')!;
     expect(normal.rows).toEqual([{ ratio: 1, panes: [{ pane: 'browser', ratio: 2 }, { pane: 'preview', ratio: 1 }] }]);
@@ -67,9 +53,6 @@ describe('dashboard view config', () => {
   });
 
   test('adds custom view modes with shortcuts', () => {
-    // Shortcut 8 — shortcut 7 is now reserved for the Widget
-    // Playground (VP1). findDashboardView returns the first match in
-    // `views` order, so built-ins still win when ids collide.
     const registry = buildDashboardViewRegistry({
       views: [{
         id: 'focus-preview',
@@ -101,8 +84,6 @@ describe('dashboard view config', () => {
   });
 
   test('merges contributed plugin views before user overrides', () => {
-    // Shortcut 8 — shortcut 7 is now reserved for the built-in
-    // Widget Playground; contributed plugins should avoid colliding.
     const registry = buildDashboardViewRegistry({
       views: [{ id: 'plugin:demo.monitor', label: 'User Monitor', rows: [{ panes: ['log'] }] }],
     }, {
@@ -136,13 +117,10 @@ describe('dashboard view config', () => {
   });
 
   test('cycles through enabled registry order', () => {
-    // VP1 — disable playground so this cycle test stays isolated to
-    // the working-dir views it was originally written for.
     const registry = buildDashboardViewRegistry({
       order: ['3', '1'],
       views: [
         { id: '2', enabled: false },
-        { id: 'playground', enabled: false },
       ],
     });
     expect(registry.views.map(v => v.id)).toEqual(['3', '1', 'agents', 'debug']);

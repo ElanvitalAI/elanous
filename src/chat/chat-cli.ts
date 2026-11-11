@@ -12,6 +12,7 @@
 
 import { buildChatDevSpec, runDevPipeline } from '../self-dev/dev-pipeline.js';
 import type { DevChatOpts } from '../self-dev/dev-pipeline.js';
+import { solarScene5InputFromFile } from './solar-scene5-context.js';
 
 /** chat CLI 옵션(commander) — `--new`/`--tools`/`--goal-loop` 는 boolean, `--session` 은 id/prefix. */
 export interface ChatCliOpts {
@@ -24,6 +25,7 @@ export interface ChatCliOpts {
   json?: boolean;
   tools?: boolean;
   goalLoop?: boolean;
+  solarScene5Receipt?: string;
 }
 
 export interface ChatCliDeps {
@@ -55,7 +57,8 @@ export function toDevChatOpts(opts: ChatCliOpts): DevChatOpts {
  * runChatTurn(cfg-바인딩 runChatTurnCli)을 구동한다. 결과·exit-code 없음(chat 턴은 자체 I/O). 무손실 등가.
  */
 export async function runChatCliCommand(text: string, opts: ChatCliOpts, deps: ChatCliDeps): Promise<void> {
-  const spec = buildChatDevSpec(text, toDevChatOpts(opts));
+  const prompt = opts.solarScene5Receipt ? solarScene5InputFromFile(opts.solarScene5Receipt) : text;
+  const spec = buildChatDevSpec(prompt, toDevChatOpts(opts));
   const run = deps.runDevPipeline ?? runDevPipeline;
   await run(spec, {
     runChatTurn: deps.runChatTurn,

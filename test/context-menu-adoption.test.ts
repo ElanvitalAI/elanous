@@ -117,40 +117,23 @@ describe('createDefaultMenuPresenter', () => {
     expect(result).toEqual({ value: null, reason: 'outside-click' });
   });
 
-  test('command submenu opens recursively and resolves with submenu selection', async () => {
+  test('classic presenter omits submenu-only entries', async () => {
     const { pushed, presenter } = mkDeps();
     const menu: Menu = {
       title: 'Root',
-      items: [
-        {
-          kind: 'command',
-          id: 'debug.mode',
-          label: 'Debug mode change',
-          submenu: {
-            title: 'Debug mode',
-            items: [
-              { kind: 'command', id: 'debug.mode.on', label: 'On' },
-              { kind: 'command', id: 'debug.mode.diag', label: 'Diag' },
-            ],
-          },
+      items: [{
+        kind: 'command',
+        id: 'debug.mode',
+        label: 'Debug mode change',
+        submenu: {
+          title: 'Debug mode',
+          items: [{ kind: 'command', id: 'debug.mode.on', label: 'On' }],
         },
-      ],
+      }],
     };
 
-    const resultP = presenter(menu, { x: 5, y: 5 }, {});
-    expect(pushed).toHaveLength(1);
-    const root = pushed[0]!;
-    root.paint();
-    expect(root.onKey?.({ name: 'enter' } as never)).toBe('consumed');
-
-    expect(pushed).toHaveLength(1);
-    const submenu = pushed[0]!;
-    expect(submenu.id).toBe(root.id);
-    submenu.paint();
-    expect(submenu.onKey?.({ name: 'enter' } as never)).toBe('consumed');
-
-    const result = await resultP;
-    expect(result).toEqual({ value: 'debug.mode.on', reason: 'selected' });
+    const result = await presenter(menu, { x: 5, y: 5 }, {});
+    expect(result).toEqual({ value: null, reason: 'outside-click' });
     expect(pushed).toHaveLength(0);
   });
 });

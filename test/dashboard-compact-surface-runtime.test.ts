@@ -9,14 +9,12 @@ describe('createCompactSurfaceRuntime', () => {
       getCompactMode: () => 'compact-tight',
       openDashboardPane: () => true,
       focusPane: () => {},
-      openBrowserPreviewModal: () => {},
       openDashboardPaneModal: () => {},
       openCompanionPopup: () => {},
     });
 
     expect(runtime.buildTargets().map((item) => item.id)).toEqual([
       'reopen:browser',
-      'pane:browser-preview',
       'pane:browser',
       'pane:preview',
       'pane:obsidian',
@@ -37,7 +35,6 @@ describe('createCompactSurfaceRuntime', () => {
         return true;
       },
       focusPane: (pane) => calls.push(`focus:${pane}`),
-      openBrowserPreviewModal: () => calls.push('pane:browser-preview'),
       openDashboardPaneModal: (pane) => calls.push(`pane:${pane}`),
       openCompanionPopup: (key) => calls.push(`companion:${key}`),
       onWarning: (message) => calls.push(`warn:${message}`),

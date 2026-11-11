@@ -1,3 +1,4 @@
+import { isRecord } from '../primitives/guards.js';
 import { createFakeExecutableDevice, type FakeExecutableRun, type FakeBinCall } from './fake-bin.js';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
@@ -37,10 +38,6 @@ const EXPECTED_RESPONSES: FakeExecutableRun[] = [
   { name: 'tool', argv: ['version'], stdout: 'default response\n', stderr: '', exitCode: 0, signal: null },
 ];
 const EXPECTED_CALLS: FakeBinCall[] = EXPECTED_RESPONSES.map(({ name, argv }) => ({ name, argv }));
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;

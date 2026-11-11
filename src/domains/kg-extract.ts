@@ -12,7 +12,7 @@ import { Database } from 'bun:sqlite';
 import { existsSync } from 'node:fs';
 import { addEdge, type EdgeRelation } from './kg-store.js';
 import { linkEntities } from './kg-recall.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 import { windowCompare } from '../time/db-window.js';
 

@@ -35,7 +35,7 @@ import { spawnSync } from 'node:child_process';
 import { basename, isAbsolute, resolve } from 'node:path';
 
 import { getSessionCwd } from '../../session/working-dir.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { debug } from '../../debug/log.js';
 import { rgListFiles } from '../../tool-runtime/ripgrep-core.js';
 import { noteBroadSearch, noteNarrowingAction } from './search-loop-guard.js';

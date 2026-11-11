@@ -1,9 +1,15 @@
 import type { Command } from 'commander';
-import { readFileSync } from 'node:fs';
-import { getTestStateRoot } from '../nexus/paths.js';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, resolve } from 'node:path';
+import { getTestStateRoot, nexusRootDir, setTestStateRoot } from '../nexus/paths.js';
+import { stateDirSourceForChild } from '../agent/identity-env.js';
+import { parseAppManifest } from '../nexus/apps/app-contract.js';
+import { validateAppSimulation } from '../nexus/apps/app-simulate.js';
 import { runScenarioFile } from '../ux-sim/scenario.js';
-import { loadMockScenarioCatalog, renderMockScenarioDevices } from '../ux-sim/mock-scenario-catalog.js';
-import { createWorld, destroyWorldById, loadWorld, runWorldScenario } from '../ux-sim/world.js';
+import { buildMockScenarioUserPackage, loadMockScenarioCatalog, renderMockScenarioDevices } from '../ux-sim/mock-scenario-catalog.js';
+import { createWorld, createWorldRegressionTargetRunner, destroyWorldById, loadWorld, runWorldScenario } from '../ux-sim/world.js';
 import { createSimWorld, destroySimWorld, listSimWorlds } from '../ux-sim/world-store.js';
 import { restoreSimWorld, snapshotSimWorld } from '../ux-sim/world-snapshot.js';
 import { parseSimWorld } from '../ux-sim/world-schema.js';
@@ -11,9 +17,135 @@ import { listMockDeviceRequests, renderMockDeviceRequests, requestMockDevice } f
 import { compareDeviceRecording, deviceFidelityStatus } from '../ux-sim/device-fidelity.js';
 import { readSimCoverage } from '../ux-sim/sim-coverage.js';
 import { readSimWorldWatchEvents, renderSimWorldWatchEvent } from '../ux-sim/world-watch.js';
+import { assertNetworkZeroSandboxAvailable } from '../ux-sim/network-sandbox.js';
+import { registerSimSuggestCommand } from './sim-suggest-cli.js';
 
-export function registerSimCommands(program: Command): void {
+type UserSimulationProfile = { credentials: string; network: string; storage: string };
+type SimAppCliCommand = (args: string[], allowedStatus?: readonly number[]) => Promise<{ status: number; stdout: string; stderr?: string }>;
+type SimAppRuntime = {
+  assertNetworkIsolation?: typeof assertNetworkZeroSandboxAvailable;
+  executeCli?: SimAppCliCommand;
+};
+/** Create an isolated child environment from runtime essentials, excluding host credentials and connection strings. */
+export function createUserSimulationEnvironment(
+  profiles: readonly UserSimulationProfile[],
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const testStateRoot = getTestStateRoot();
+  if (!testStateRoot) throw new Error('sim app requires --test isolated mode');
+  if (profiles.some((profile) => profile.credentials !== 'fake-only'
+    || profile.network !== 'loopback-only' || profile.storage !== 'temporary')) {
+    throw new Error('user simulation device does not provide the mandatory safe default profile');
+  }
+  const allowedEnv = new Set(['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'TMP', 'TEMP', 'NODE_ENV',
+    'ELANOUS_STATE_DIR', 'ELANOUS_CONFIG_DIR', 'LANG', 'LC_ALL', 'TZ']);
+  return { ...Object.fromEntries(Object.entries(sourceEnv).filter(([key]) => allowedEnv.has(key))), NODE_ENV: sourceEnv.NODE_ENV ?? 'test', ELANOUS_STATE_DIR: testStateRoot, ELANOUS_STATE_DIR_SOURCE: stateDirSourceForChild(testStateRoot, sourceEnv) };
+}
+
+export function registerSimCommands(program: Command, simAppRuntime: SimAppRuntime = {}): void {
   const sim = program.command('sim').description('격리 시나리오를 실행하고 화면·로그 기대값을 대조한다');
+  sim.command('app <app>')
+    .description('app.yaml 선언을 기존 가짜 장치 세계에서 실행하고 결과·영수증을 남긴다')
+    .option('--scenario <name>', '실행할 선언 시나리오 이름')
+    .option('--list', '선언된 시나리오 목록만 출력')
+    .option('--json', '구조화 결과 출력')
+    .action(async (app: string, options: { scenario?: string; list?: boolean; json?: boolean }) => {
+      try {
+        const stateRoot = getTestStateRoot();
+        if (!stateRoot) throw new Error('sim app requires --test isolated mode');
+        const appDir = isAbsolute(app) || app.includes('/') || app.includes('\\')
+          ? resolve(app) : join(nexusRootDir(), 'apps', app);
+        const appYaml = readFileSync(join(appDir, 'app.yaml'), 'utf8');
+        const parsed = parseAppManifest(appYaml);
+        if (!parsed.ok) throw new Error(`invalid app.yaml: ${parsed.errors.map((issue) => `${issue.path}: ${issue.reason}`).join('; ')}`);
+        const manifest = parsed.manifest;
+        const simulationIssues = validateAppSimulation(manifest.simulate, {
+          actions: Object.keys((manifest.actions as Record<string, unknown> | undefined) ?? {}),
+          rpc: Object.keys((manifest.rpc as Record<string, unknown> | undefined) ?? {}),
+          roles: Object.keys((manifest.roles as Record<string, unknown> | undefined) ?? {}),
+          tables: Object.keys((manifest.tables as Record<string, unknown> | undefined) ?? {}),
+        });
+        if (simulationIssues.length) throw new Error(`invalid simulate declaration: ${simulationIssues.map((issue) => `${issue.path}: ${issue.reason}`).join('; ')}`);
+        const scenarios = (manifest.simulate as { scenarios?: Array<{ name: string }> } | undefined)?.scenarios ?? [];
+        const connectorDeclarations = (manifest.simulate as { connectors?: Record<string, { fake: string; profile?: string }> } | undefined)?.connectors ?? {};
+        const packageDevices = buildMockScenarioUserPackage(loadMockScenarioCatalog());
+        const packageDeviceByAlias: Record<string, string> = {
+          'generate-job': 'fake-higgsfield', stt: 'SIM-FAKE-PROVIDERS-AV', tts: 'SIM-FAKE-PROVIDERS-AV',
+          'object-store': 'fake-app-storage', payment: 'fake-payment', 'share-link': 'fake-app-auth',
+        };
+        const deviceProfiles = Object.fromEntries(Object.entries(connectorDeclarations).map(([connector, declaration]) => {
+          const deviceId = packageDeviceByAlias[declaration.fake];
+          const packagedDevice = packageDevices.find((device) => device.id === deviceId);
+          if (!packagedDevice) throw new Error(`connector ${connector} has no packaged user simulation device: ${declaration.fake}`);
+          return [connector, { device: packagedDevice.id, selectedProfile: declaration.profile ?? 'ok', defaultProfile: packagedDevice.defaultProfile }];
+        }));
+        if (options.list) {
+          if (options.json) console.log(JSON.stringify({ app: manifest.slug, scenarios, deviceProfiles }));
+          else for (const scenario of scenarios) console.log(scenario.name);
+          return;
+        }
+        if (options.scenario && !scenarios.some((scenario) => scenario.name === options.scenario)) {
+          throw new Error(`unknown scenario: ${options.scenario}`);
+        }
+        const { runDeclaredAppSimulation } = await import('../nexus/apps/app-simulation-runner.js');
+        const simulationEnv = createUserSimulationEnvironment(Object.values(deviceProfiles).map((row) => row.defaultProfile));
+        (simAppRuntime.assertNetworkIsolation ?? assertNetworkZeroSandboxAvailable)(simulationEnv);
+        const result = await runDeclaredAppSimulation({ manifest, appDirectory: appDir, ...(options.scenario ? { scenarioName: options.scenario } : {}) },
+          { environment: simulationEnv, ...(simAppRuntime.executeCli ? { executeCli: simAppRuntime.executeCli } : {}) });
+        const appFingerprint = createHash('sha256').update(appYaml).digest('hex');
+        const receiptDir = join(resolve(stateRoot), 'sim', 'receipts', manifest.slug);
+        mkdirSync(receiptDir, { recursive: true, mode: 0o700 });
+        const runId = result.scenarios.map((scenario) => scenario.result.runId).join('_');
+        const receiptPath = join(receiptDir, `${runId.replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
+        const receipt = { app: manifest.slug, appFingerprint, runId, passed: result.passed,
+          scenarios: result.scenarios.map((scenario) => ({ scenario: scenario.name, status: scenario.passed ? 'passed' as const : 'failed' as const, failedExpectations: scenario.failedExpectations })),
+          devices: Object.values(deviceProfiles).map((row) => row.device), deviceProfiles,
+          results: result.scenarios.map((scenario) => ({ scenario: scenario.name, events: scenario.result.events,
+            evidence: scenario.evidence, receipts: scenario.result.receipts, externalNetworkEvents: scenario.externalNetworkEvents })),
+          createdAt: new Date().toISOString() };
+        writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+        if (!result.passed) process.exitCode = 1;
+        if (options.json) console.log(JSON.stringify({ ...receipt, receiptPath }, null, 2));
+        else {
+          console.log(`시나리오 | 결과`);
+          for (const row of receipt.scenarios) console.log(`${row.scenario} | ${row.status}`);
+          console.log(`영수증 | ${receiptPath}`);
+        }
+      } catch (error) {
+        console.error(`sim app: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 2;
+      }
+    });
+  registerSimSuggestCommand(sim);
+  sim.command('suite <folder>')
+    .description('시나리오 묶음의 정규화 영수증을 기준과 대조한다')
+    .option('--target <target>', 'sim 또는 real', 'sim')
+    .option('--update-baseline', '결정론 확인 후 기준 영수증 갱신')
+    .action(async (folder: string, opts: { target: string; updateBaseline?: boolean }) => {
+      const priorRoot = getTestStateRoot();
+      const ownedRoot = priorRoot ? null : mkdtempSync(join(tmpdir(), 'elanous-sim-suite-'));
+      try {
+        if (ownedRoot) setTestStateRoot(ownedRoot);
+        if (opts.target !== 'sim' && opts.target !== 'real') throw new Error('suite target must be sim or real');
+        const { runWorldRegressionSuite } = await import('../ux-sim/world-regression-suite.js');
+        const targetRunner = createWorldRegressionTargetRunner();
+        const run = opts.target === 'sim' || (opts.target === 'real' && process.env.ELANOUS_SIM_REAL_TARGET_ADAPTER)
+          ? targetRunner.run : undefined;
+        const result = await runWorldRegressionSuite({ folder, target: opts.target, updateBaseline: opts.updateBaseline,
+          ...(run ? { run } : {}) });
+        if (result.differences.length === 0) console.log(`suite ${result.scenarios} scenario(s): no differences`);
+        else for (const difference of result.differences) console.log(JSON.stringify(difference));
+        if (!result.pass) process.exitCode = 1;
+      } catch (error) {
+        console.error(`sim suite: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 2;
+      } finally {
+        if (ownedRoot) {
+          setTestStateRoot(null);
+          rmSync(ownedRoot, { recursive: true, force: true });
+        }
+      }
+    });
   sim.command('run <scenario-file>')
     .description('등록된 UX simulation 시나리오를 test 우주에서 실행한다')
     .action(async (scenarioFile: string) => {
@@ -73,8 +205,15 @@ export function registerSimCommands(program: Command): void {
   const devices = sim.command('devices')
     .description('정본 목장치 카탈로그를 읽기 전용으로 조회한다')
     .option('--missing', 'test 우주에 기록된 미해결 mock 장치 요청 조회')
+    .option('--user-package', '내부 장치 중 사용자 앱 커넥터용 패키지만 조회')
     .option('--json', '카탈로그 JSON 출력')
-    .action((opts: { json?: boolean; missing?: boolean }) => {
+    .action(async (opts: { json?: boolean; missing?: boolean; userPackage?: boolean }) => {
+      if (opts.userPackage && opts.missing) {
+        console.error('sim devices: --user-package cannot be combined with --missing');
+        // Source: #36308 defines invalid sim-device option combinations as a CLI usage error.
+        process.exitCode = 2;
+        return;
+      }
       if (opts.missing) {
         try {
           const rows = listMockDeviceRequests();
@@ -86,7 +225,17 @@ export function registerSimCommands(program: Command): void {
         return;
       }
       const catalog = loadMockScenarioCatalog();
-      console.log(opts.json ? JSON.stringify(catalog, null, 2) : renderMockScenarioDevices(catalog).join('\n'));
+      if (opts.userPackage) {
+        const devices = buildMockScenarioUserPackage(catalog);
+        console.log(opts.json ? JSON.stringify({ devices }, null, 2) : devices.map((device) => `${device.id}\t${device.name}\t${device.scenarios.length} scenarios · ${device.decisionCases.length} decision cases · declared defaults: ${device.defaultProfile.credentials}/${device.defaultProfile.network}/${device.defaultProfile.storage}`).join('\n'));
+        return;
+      }
+      if (opts.json) {
+        // Large catalog snapshots can exceed a single pipe write; wait for the full payload.
+        await new Promise<void>((resolve, reject) => {
+          process.stdout.write(`${JSON.stringify(catalog, null, 2)}\n`, (error) => error ? reject(error) : resolve());
+        });
+      } else console.log(renderMockScenarioDevices(catalog).join('\n'));
     });
   devices.command('request <cellId>')
     .description('test 우주에 필요한 mock 장치와 미충족 경계를 기록한다')

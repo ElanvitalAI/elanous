@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-FAKE-AGENT-HOOK-HOST-TS",
+  "path": "src/ux-sim/fake-agent-hook-host.ts",
+  "boundary": "Hosts Claude/Codex hook event payloads and an in-memory seat-scoped MCP inbox, reusing production msg-hook formatting and deduplication without process or network access.",
+  "deviceIds": ["fake-agent-hook-host"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

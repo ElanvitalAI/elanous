@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-FAKE-NEXUS-BOARD-SERVER-TS",
+  "path": "src/ux-sim/fake-nexus-board-server.ts",
+  "boundary": "Serves synthetic board-card JSON and SSE events in memory for board client tests without binding a network socket.",
+  "deviceIds": ["mini-board-card"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

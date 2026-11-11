@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { withoutExternalEffects } from '../../test/forbid-external-effects.js';
 import type { ResourceView } from '../control-plane/ledger.js';
 import { rankMachines } from './load-balance.js';
 
@@ -92,8 +92,13 @@ test('낡은 부하 관측이나 유효하지 않은 cpuCount도 부하 없음�
   expect(result.candidates.slice(1).every((candidate) => candidate.score === null)).toBe(true);
 });
 
-test('순수 판정은 파일·네트워크·프로세스를 직접 부르지 않는다', () => {
-  const source = readFileSync(new URL('./load-balance.ts', import.meta.url), 'utf8');
-  expect(source).not.toMatch(/from ['"]node:/);
-  expect(source).not.toMatch(/\b(readFileSync|writeFileSync|Bun\.file|Bun\.spawn|fetch|child_process|process\.)\b/);
+test('ranking is repeatable and leaves machine observations untouched', () => {
+  // Source: load-balance.ts ranks loadAvg[0]/cpuCount; these fixture values put idle before busy.
+  const machines = [machine('busy', { load: { loadAvg: [2], cpuCount: 2 } }),
+    machine('idle', { load: { loadAvg: [1], cpuCount: 2 } })];
+  const before = structuredClone(machines);
+  const first = withoutExternalEffects(() => rankMachines({ machines, required: [], nowMs: NOW }));
+  expect(rankMachines({ machines, required: [], nowMs: NOW })).toEqual(first);
+  expect(first.candidates.map((candidate) => candidate.machine)).toEqual(['idle', 'busy']);
+  expect(machines).toEqual(before);
 });

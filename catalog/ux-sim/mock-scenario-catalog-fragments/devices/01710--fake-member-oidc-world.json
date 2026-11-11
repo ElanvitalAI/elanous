@@ -1,0 +1,47 @@
+{
+  "id": "fake-member-oidc-world",
+  "name": "Fake member OIDC, signup and public ledger authorization world",
+  "checklistCells": [
+    "RESOURCE-LEDGER-PUBLIC-AUTH",
+    "KAIST-SIGNUP-APP-SLOT"
+  ],
+  "implementation": [
+    "src/ux-sim/fake-member-oidc-world.ts",
+    "src/ux-sim/fake-google-oauth.ts",
+    "src/nexus/members/members-api.ts",
+    "src/nexus/members/member-store.ts",
+    "src/nexus/apps/app-lifecycle-ledger.ts",
+    "src/nexus/api/http-server.ts",
+    "scripts/warm-pool-provider-config.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-member-oidc-world.test.ts"
+  ],
+  "target": "Drive real member signup, browser OAuth callback, native PKCE app-slot exchange, owner and board Nexus HTTP routes, member-key handlers, and the public machine-scoped resource-ledger route using a fake Google OIDC edge and fake HTTPS VM transport",
+  "inputs": [
+    "deterministic fake Google identities, authorization URL, callback state and S256 PKCE",
+    "KAIST event-code and concurrent signup requests",
+    "member plan catalog rows and app-slot lifecycle state",
+    "host-bound machine tokens, public HTTPS ledger URL and pool declarations"
+  ],
+  "observations": [
+    "concurrent callbacks retain separate member sessions, event-code attribution and isolated app slots",
+    "Nexus HTTP browser start, callback, native one-time code exchange and owner route preserve state and reject callback/code replay",
+    "the allowlisted elanous://auth/callback returns only an app-slot code and state; app-scoped bearer is issued only after PKCE exchange",
+    "a member cannot create a second app slot and its #36200 member key can be revoked",
+    "public HTTPS provider reads only its host pool; missing, wrong-host, expired or revoked tokens fail closed",
+    "public HTTP is rejected before the bearer is sent and successful declarations assemble a provider"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-member-oidc-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null,
+  "audience": "internal",
+  "defaultProfile": {
+    "credentials": "fake-only",
+    "network": "loopback-only",
+    "storage": "temporary"
+  }
+}

@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,7 +17,8 @@ function fixture(graphId = 'release-loop', nodeId = 'approve-publish') {
   const statePath = join(root, 'graph-runs', graphId, `${runId}.json`);
   mkdirSync(join(root, 'graph-runs', graphId), { recursive: true });
   const state: GraphRunState = { graphId, runId, statePath, status: 'awaiting-approval', path: [nodeId], nodes: [],
-    executed: 0, dryRun: false, pending: { nodeId, since: new Date().toISOString(), message: 'v0.2.10 공개 발행 — 되돌릴 수 없다. 승인하시겠습니까?' } };
+    executed: 0, dryRun: false, pending: { nodeId, since: new Date().toISOString(), message: 'v0.2.10 공개 발행 — 되돌릴 수 없다. 승인하시겠습니까?',
+      inputSha256: createHash('sha256').update('undefined').digest('hex') } };
   writeFileSync(statePath, JSON.stringify(state));
   const ledger = new DecisionLedger({ stateDir: root, resolveVersion: () => ({ released: '0.2.9', dev: '0.2.10', codename: null }) });
   const deps = { root, ledger };

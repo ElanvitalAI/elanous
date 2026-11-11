@@ -13,7 +13,7 @@
 // an allow flag is ignored and the launch stays refused.
 
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export const ELANOUS_NESTED_DEPTH_ENV = 'ELANOUS_NESTED_DEPTH';
 

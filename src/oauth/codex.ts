@@ -506,6 +506,7 @@ export async function loadFreshCodexAuthState(
   //   호출자마다 읽으면 「설정 읽기는 한 자리」라는 배선을 호출자가 스스로 깬다.
   const account = resolveCodexAccountForRun();
   const stored = loadTokens(account.storeKey);
+  if (stored?.source === 'mirror') return readCodexOwnerAccessMirror(account.storeKey, { path: authStorePath() });
   // ⛔⭐⭐⭐ 읽기(reconcile) 방향도 «그 계정의 홈»으로만 본다(2R must-fix).
   //   종전엔 기본 미러 경로를 봐서, 이름 계정이 «계정 A 의 미러»를 읽어 정본을 오염시킬 수 있었다.
   //   ⇒ 쓰기만 고치고 읽기를 안 고치면 같은 사고가 «반대 방향»으로 난다.

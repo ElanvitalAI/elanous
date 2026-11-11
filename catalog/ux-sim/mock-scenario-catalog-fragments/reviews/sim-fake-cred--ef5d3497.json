@@ -1,0 +1,4 @@
+{
+  "deviceKey": "sim-fake-cred",
+  "review": "> 📅 **2026-11-09 재검토 (SIM-FAKE-CRED)** — 시뮬 장치 매뉴얼에 정본 슬롯 이름을 쓰는 가짜 자격 장치와 `bun test src/ux-sim/fake-cred.test.ts` 진입을 추가했다. 없음·만료·권한 부족·회전 직후를 고정 응답으로 검증하며 이 규칙의 시험 근거 기준을 적용한다."
+}

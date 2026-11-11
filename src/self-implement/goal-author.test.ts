@@ -8037,7 +8037,8 @@ ${report}`);
 
   test('uses the default mission slug generator for a Korean goal filename', async () => {
     const cwd = existingGoalDocumentsRoot('goal-author-');
-    const stream = mock(async (_messages: unknown, onUpdate: (_delta: string, full: string) => void) => {
+    const stream = mock(async (role: string, _messages: unknown, onUpdate: (_delta: string, full: string) => void) => {
+      expect(role).toBe('planning');
       onUpdate('', 'readable-korean-goal-filename');
     });
     setMissionSlugStreamForTest(stream as never);

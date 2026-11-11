@@ -1,0 +1,13 @@
+{
+  "id": "graph-placement-lease-world",
+  "name": "Graph placement and Guardian lease admission world",
+  "implementation": ["src/ux-sim/graph-placement-lease-world.ts", "src/ux-sim/fake-fleet.ts", "src/ux-sim/graph-trigger-hook-device.ts", "src/resource-ledger/resource-ledger.ts"],
+  "tests": ["src/ux-sim/graph-placement-lease-world.test.ts"],
+  "target": "Observe graph node entry against local/pod/remote/user-cloud placement, profile cap, host availability and real isolated Guardian lease identity while keeping missing generation admission visible.",
+  "inputs": ["graph YAML", "placement/host/runId/consumer", "lease expiry and identity", "profile CPU cap and pod generation", "fake host availability"],
+  "observations": ["Guardian admission ledger rows", "node entry attempts and runIds", "graph node events", "unmeasured generation/profile gaps"],
+  "entryCommands": ["bun test src/ux-sim/graph-placement-lease-world.test.ts"],
+  "logsRecorded": "conditional",
+  "eventNames": ["node-arrival", "node-start", "node-end", "node-leave"],
+  "recentUse": null
+}

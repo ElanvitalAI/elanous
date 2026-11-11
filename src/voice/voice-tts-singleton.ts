@@ -12,7 +12,7 @@
 
 import { accessSync, constants, existsSync, statSync } from 'node:fs';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import {
   createTTSProvider,
   resolveTTSProviderIdFromEnv,

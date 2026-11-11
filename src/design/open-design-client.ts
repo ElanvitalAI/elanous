@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 
 export const OPEN_DESIGN_TIMEOUT_MS = 30_000;

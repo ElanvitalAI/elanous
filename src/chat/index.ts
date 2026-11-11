@@ -2,6 +2,8 @@
 // Integrates into the dashboard log pane as an inline chat
 
 import { getGrokApiKey, GROK_MODEL, GROK_API_URL } from '../config.js';
+import { filterSlashCommands } from '../input-core/slash-filter.js';
+export { filterSlashCommands };
 import { C, ansi, KeyStreamParser, readKey, traceKey, traceKeyListener, termSize, pad, visibleWidth, stripAnsi, truncate, render, hLine, closeTui, resetRenderCache, invalidateRenderCacheFromRow, injectKey, takeInjectedKeys, cancelPendingReadKey } from '../tui.js';
 import { paintCursorMove, paintCursorVisibility, type CursorState } from '../display/cursor-state.js';
 import { firstVisibleInputLineIdx, inputLineWindow } from '../display/prompt-frame.js';
@@ -9,6 +11,7 @@ import { createChatPickerFamilySource, createChatPickerFamilySources } from './p
 import type { ChatPickerKind } from './pickers/kinds.js';
 import { createPickerState, type BufferAction, type PickerBufferView } from './pickers/state.js';
 import { createChatPickerModalRuntime } from './pickers/modal-runtime.js';
+import { formatInlinePanel } from '../tui/input/inline-panel.js';
 import type { ModalSurface } from '../display/modal-stack.js';
 import type { PromptRowOwner } from '../display/prompt-row-owner.js';
 // Type-only import: avoids the runtime circular dep that streamGrok
@@ -21,6 +24,7 @@ import type { ContentBlock } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { createPasteFold } from './paste-fold.js';
 import { hasClipboardImage, readClipboardText } from '../clipboard/index.js';
+import { readClipboardPaste } from '../clipboard/paste.js';
 import { matchTextInputGlobalAction } from './global-actions.js';
 import { CTRL_C_ARM_MS, resolveCtrlCInInput } from './ctrl-c-in-input.js';
 import { isTextInputQuitChord } from './input-quit-chord.js';
@@ -517,8 +521,8 @@ export const SLASH_COMMANDS: SlashCommand[] = ([
   { name: 'chat',  aliases: [],            description: 'Toggle LLM-only layout (hide 3-pane grid)' },
   { name: 'dashboard', aliases: ['dash'],  description: 'Return to 3-pane dashboard layout' },
   { name: 'telegram',  aliases: ['tg'],    description: 'Telegram bot — status / pair / send / pause / stop / attach / detach / sessions', subcommands: ['status', 'pair', 'setup', 'send', 'pause', 'stop', 'attach', 'detach', 'sessions'] },
-  { name: 'tablet',    aliases: [],        description: 'Tablet mode — collapse layout to log + input', subcommands: ['on', 'off', 'toggle', 'auto', 'status', 'browser-preview', 'bp'] },
-  { name: 'surface',   aliases: [], description: 'Surface control — open a pane/catalog launcher (/surface catalog · browser · preview · log · scratch · obsidian · skill) OR set a preferred LLM surface (/surface coding-agent · research-agent · control-agent · ops-agent · … · clear · status)', subcommands: ['catalog', 'browser', 'preview', 'browser-preview', 'log', 'scratch', 'obsidian', 'skill', 'skill-file', 'agents', 'coding-agent', 'coding-chat', 'research-agent', 'research-chat', 'control-agent', 'ops-ui-agent', 'ops-fleet-agent', 'ops-agent', 'clear', 'status'] },
+  { name: 'tablet',    aliases: [],        description: 'Tablet mode — collapse layout to log + input', subcommands: ['on', 'off', 'toggle', 'auto', 'status'] },
+  { name: 'surface',   aliases: [], description: 'Surface control — open a pane (/surface browser · preview · log · scratch · obsidian · skill) OR set a preferred LLM surface (/surface coding-agent · research-agent · control-agent · ops-agent · … · clear · status)', subcommands: ['browser', 'preview', 'log', 'scratch', 'obsidian', 'skill', 'skill-file', 'agents', 'coding-agent', 'coding-chat', 'research-agent', 'research-chat', 'control-agent', 'ops-ui-agent', 'ops-fleet-agent', 'ops-agent', 'clear', 'status'] },
   { name: 'term',  aliases: ['terminal'], description: 'Interactive terminal modal — new / list / attach / detach / switch / kill / snapshot / resume', subcommands: ['new', 'list', 'attach', 'detach', 'switch', 'kill', 'snapshot', 'resume'] },
   { name: 'side', aliases: [], description: '사이드탭 — 목록 · 셸/Codex/Claude 탭 · attach · 미션 결과 파일', subcommands: ['list', 'new', 'attach', 'open', 'mission'] },
   { name: 'claude', aliases: [], description: 'Spawn claude-code CLI in a terminal modal' },
@@ -548,40 +552,6 @@ export const SLASH_COMMANDS: SlashCommand[] = ([
 export function displayedSlashCommandNames(commands: readonly SlashCommand[] = SLASH_COMMANDS): string[] {
   return commands.filter((command) => !command.hidden)
     .flatMap((command) => [command.name, ...(command.aliases ?? [])]);
-}
-
-/** Score and rank slash commands against the user's typed text (sans leading `/`).
- *
- *  Exported as a pure function so tests can exercise the ranking without
- *  spinning up the full textInput TTY loop. Ranking rules:
- *    prefix-on-name         100
- *    prefix-on-alias         80
- *    substring-on-name       50
- *    word-start in desc      10  (regex \b<text>)
- *  Sort by score desc, then name asc. Hidden commands are omitted from discovery,
- *  while the dispatch registry continues to accept direct input. */
-export function filterSlashCommands(text: string, commands: SlashCommand[]): SlashCommand[] {
-  const discoverable = commands.filter((command) => !command.hidden);
-  const q = text.toLowerCase();
-  if (!q) return discoverable;
-  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const descRe = new RegExp(`\\b${escaped}`, 'i');
-  const scored: { cmd: SlashCommand; score: number }[] = [];
-  for (const cmd of discoverable) {
-    const name = cmd.name.toLowerCase();
-    const aliases = (cmd.aliases ?? []).map(a => a.toLowerCase());
-    let score = 0;
-    if (name.startsWith(q)) score = 100;
-    else if (aliases.some(a => a.startsWith(q))) score = 80;
-    else if (name.includes(q)) score = 50;
-    else if (descRe.test(cmd.description)) score = 10;
-    if (score > 0) scored.push({ cmd, score });
-  }
-  scored.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    return a.cmd.name.localeCompare(b.cmd.name);
-  });
-  return scored.map(s => s.cmd);
 }
 
 /** Candidate suggestion for argument autocomplete. */
@@ -886,6 +856,11 @@ export async function textInput(opts: {
    *  render via writeOverlay) instead of writing rows directly to
    *  stdout. When omitted, falls back to legacy direct-paint mode. */
   modalSink?: ModalSink;
+  /** Draw picker candidates as plain text in the host composer panel. */
+  inlinePickers?: boolean;
+  onInputPanelChange?: (lines: readonly string[]) => void;
+  /** Return true to consume submitted text as an active inline decision answer. */
+  onInputSubmit?: (text: string) => boolean | { restoreText: string };
   /** Optional ownership gate for picker modal sync. When false, the
    *  main chat surface stays visually present but must not keep
    *  re-syncing slash/arg/@/skill picker overlays while another
@@ -1131,6 +1106,11 @@ export async function textInput(opts: {
       await picker.refresh(bufView());
       return false;
     }
+    if (key.name === 'escape' && picker.dismiss(bufView())) {
+      clearPicker();
+      drawAll();
+      return true;
+    }
     return await pickerModalRuntime.dispatchKey({ key, source: 'input-loop', label: 'main' });
   };
   const cancelReverseHistorySearch = (state = reverseSearch): void => {
@@ -1174,6 +1154,7 @@ export async function textInput(opts: {
   /** Retire any mounted picker modal. Modal runtime owns the clear contract. */
   const clearPicker = () => {
     pickerModalRuntime.clearAll();
+    if (opts.inlinePickers) publishInlinePanel([]);
   };
 
   // Track how many rows drawInput painted last time so we can clear
@@ -1344,8 +1325,32 @@ export async function textInput(opts: {
     if (isSlashMode()) return 'slash';
     return null;
   };
+  let lastInlinePanelKey = '';
+  let inlinePanelNeedsFrame = false;
+  const publishInlinePanel = (lines: readonly string[]): void => {
+    const key = lines.join('\n');
+    if (key === lastInlinePanelKey) return;
+    lastInlinePanelKey = key;
+    inlinePanelNeedsFrame = true;
+    opts.onInputPanelChange?.(lines);
+  };
 
   const syncActivePickerModal = (): void => {
+    if (opts.inlinePickers) {
+      pickerModalRuntime.clearAll();
+      if (opts.shouldSyncPickers?.() === false) {
+        publishInlinePanel([]);
+        return;
+      }
+      const snapshot = picker.panelSnapshot(bufView());
+      publishInlinePanel(snapshot ? formatInlinePanel({
+        title: snapshot.kind === 'slash' ? '/ 명령' : snapshot.kind === 'at' ? '@ 첨부' : snapshot.kind === 'skill' ? '스킬' : '인자',
+        rows: snapshot.rows,
+        selected: snapshot.selected,
+        hint: snapshot.kind === 'at' ? 'Tab 탐색 · Enter 첨부' : 'Enter 선택 · Esc 닫기',
+      }) : []);
+      return;
+    }
     if (opts.shouldSyncPickers?.() === false) {
       if (debug.enabled) {
         debug.log('chat.picker.sync', 'chat-main.skipped', {
@@ -1458,7 +1463,11 @@ export async function textInput(opts: {
       else if (opts.cursorSink) writeTerminal(paintCursorVisibility(false));
     },
     modalSink: opts.modalSink,
-    shouldRequestModalRender: () => isAtMode() || isSkillMode() || isArgMode() || isSlashMode(),
+    shouldRequestModalRender: () => {
+      const request = isAtMode() || isSkillMode() || isArgMode() || isSlashMode() || inlinePanelNeedsFrame;
+      inlinePanelNeedsFrame = false;
+      return request;
+    },
   });
   const drawAllInner = renderActions.repaintHost;
   const drawAll = renderActions.repaintUserMutation;
@@ -1852,22 +1861,24 @@ export async function textInput(opts: {
     if (key.ctrl && (key.name === 'v' || key.name === 'V' || key.name === 'ㅍ')) {
       // TUI-PASTE-ECHO — 이미지가 있으면 첨부(기존), 없으면 클립보드 «글»을 붙여넣기와 같은 규칙으로 넣는다
       //   (짧으면 그대로 · 길면 «[붙여넣음 #k · N줄 · M자]»). 예전엔 글이면 «No image» 만 남고 아무것도 안 들어갔다.
-      let hasImage = false;
-      try { hasImage = opts.onPasteImage ? await (opts.clipboardHasImage ?? hasClipboardImage)() : false; } catch { hasImage = false; }
-      if (opts.onPasteImage && hasImage) {
-        let token: string | null = null;
-        try { token = await opts.onPasteImage(); }
-        catch { /* swallow — leave buffer unchanged */ }
-        if (token) {
-          applyBufferState(insertTextAtCursor(bufferState(), token));
-          onUserBufferEdit();
-        }
+      const pasted = await readClipboardPaste({
+        ...(opts.onPasteImage ? {
+          hasImage: opts.clipboardHasImage ?? hasClipboardImage,
+          attachImage: opts.onPasteImage,
+        } : {}),
+        readText: opts.clipboardText ?? readClipboardText,
+      });
+      if (pasted.kind === 'image') {
+        applyBufferState(insertTextAtCursor(bufferState(), pasted.value));
+        onUserBufferEdit();
+        debug.log('tui.paste', 'image-attached', { surface: 'classic' });
         drawAll();
         continue;
       }
-      let clip: string | null = null;
-      try { clip = await (opts.clipboardText ?? readClipboardText)(); } catch { clip = null; }
-      debug.log('tui.paste', 'clipboard-read', { surface: 'classic', chars: clip?.length ?? 0, image: hasImage });
+      const clip = pasted.kind === 'text' ? pasted.text : null;
+      debug.log('tui.paste', 'clipboard-read', {
+        surface: 'classic', chars: clip?.length ?? 0, image: pasted.imageDetected,
+      });
       if (clip) {
         applyBufferState(insertMultilineTextAtCursor(bufferState(), pasteFold.fold(clip)));
         onUserBufferEdit();
@@ -1896,6 +1907,24 @@ export async function textInput(opts: {
       }
     }
     else if (controlAction.kind === 'submit') {
+      const inlineSubmit = opts.onInputSubmit?.(lines.join('\n'));
+      if (inlineSubmit) {
+        if (typeof inlineSubmit === 'object') {
+          lines = inlineSubmit.restoreText.split('\n');
+          lineIdx = lines.length - 1;
+          colIdx = lines[lineIdx]!.length;
+        } else {
+          lines = [''];
+          lineIdx = 0;
+          colIdx = 0;
+        }
+        historyIdx = -1;
+        savedCurrentInput = '';
+        onUserBufferEdit();
+        await picker.refresh(bufView());
+        drawAll();
+        continue;
+      }
       return submitBufferResult(lines.join('\n'));
     }
     else if (controlAction.kind === 'cancel') {

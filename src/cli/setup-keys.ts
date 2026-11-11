@@ -3,10 +3,12 @@ import { serviceKeyStatus, storeServiceKeys, verifyServiceKey, type ParsedServic
 import { detectProviders } from '../llm/provider-detect.js';
 import { loginWithCodex } from '../oauth/codex.js';
 import type { FirstRunProviderSetupResult } from '../onboarding/first-run.js';
-import { MODEL_ROLES, resolveRoleLlm } from '../user-config.js';
+import { MODEL_ROLES, resolveRoleLlm, userConfigPath } from '../user-config.js';
 import type { LLMProviderName, UserConfig } from '../user-config/types.js';
 import { parseMenuAnswer } from '../onboarding/menu-answer.js';
 import { isHeadlessEnv } from '../acp/codex-auth.js';
+import { listCredentialSlotsAsync, selectBackendFromConfig, setCredentialSlotBatchAsync } from '../nexus/config/secrets/index.js';
+import { scanCredentialImports, type CredentialImportScan } from '../setup/cred-import-scan.js';
 
 export interface SetupKeysIO {
   ask(prompt: string): Promise<string>;
@@ -27,6 +29,9 @@ export interface SetupKeysOptions {
   config: UserConfig;
   env?: NodeJS.ProcessEnv;
   cacheDir?: string;
+  homeDir?: string;
+  cwd?: string;
+  configPath?: string;
   includeOptional?: boolean;
   /** Override GUI-less shell detection in first-run tests/embedders. */
   isHeadless?: () => boolean;
@@ -34,6 +39,10 @@ export interface SetupKeysOptions {
   loginWithCodex?: typeof loginWithCodex;
   /** Verification seam for deterministic setup simulations; the production default remains verifyServiceKey. */
   verifier?: SetupKeyVerifier;
+  /** Storage seams for the metadata-only existing credential import proposal. */
+  initializeCredentialBackend?: () => void;
+  listCredentialSlots?: typeof listCredentialSlotsAsync;
+  saveCredentialSlotBatch?: typeof setCredentialSlotBatchAsync;
 }
 
 export interface FirstRunProviderSetupOptions extends SetupKeysOptions {
@@ -123,12 +132,89 @@ export async function importServiceKeys(values: ParsedServiceKeyEnv, io: Pick<Se
       io.print(`${item.label}: 검증 ${verification.reason}${verification.httpStatus ? ` (HTTP ${verification.httpStatus})` : ''} · 저장 안 함`);
     }
   }
-  const saved = accepted.size ? storeServiceKeys(accepted, { env, cacheDir: options.cacheDir }) : { stored: [] };
-  if (saved.stored.length) io.print(`저장 완료: ${saved.stored.join(', ')} · 값 출력 0`);
-  return { stored: saved.stored, rejected: rejected.sort(), unverified: unverified.sort() };
+  const cached = new Map<string, string>();
+  const stored: string[] = [];
+  for (const [name, value] of accepted) {
+    const item = SERVICE_KEY_CATALOG.find(candidate => candidate.kind === 'api-key' && candidate.envNames.includes(name));
+    if (item?.id === 'openrouter' && item.storeIds?.[0]) {
+      try {
+        await (options.saveCredentialSlotBatch ?? setCredentialSlotBatchAsync)({ [item.storeIds[0]]: value });
+        env[name] = value;
+        stored.push(name);
+      } catch { rejected.push(name); }
+    } else cached.set(name, value);
+  }
+  if (cached.size) stored.push(...storeServiceKeys(cached, { env, cacheDir: options.cacheDir }).stored);
+  if (stored.length) io.print(`저장 완료: ${stored.sort().join(', ')} · 값 출력 0`);
+  return { stored: stored.sort(), rejected: rejected.sort(), unverified: unverified.sort() };
+}
+
+function parseImportSelection(answer: string, count: number): number[] | undefined {
+  const tokens = answer.split(',').map(token => token.trim()).filter(Boolean);
+  if (!tokens.length || tokens.some(token => !/^\d+$/.test(token))) return undefined;
+  const indices = tokens.map(Number);
+  if (indices.some(index => !Number.isInteger(index) || index < 0 || index >= count)) return undefined;
+  if (new Set(indices).size !== indices.length) return undefined;
+  return indices;
+}
+
+/** Offer source metadata, then pass only explicit user selections to the canonical credential-slot writer. */
+export async function importExistingCredentialSources(io: Pick<SetupKeysIO, 'ask' | 'print'>, options: SetupKeysOptions): Promise<string[]> {
+  let scan: CredentialImportScan;
+  try {
+    (options.initializeCredentialBackend ?? selectBackendFromConfig)();
+    const inventory = await (options.listCredentialSlots ?? listCredentialSlotsAsync)();
+    scan = scanCredentialImports({
+      homeDir: options.homeDir,
+      cwd: options.cwd,
+      configPath: options.configPath ?? userConfigPath(),
+      existingSlots: inventory.filter(slot => slot.present).map(slot => slot.id),
+    });
+  } catch {
+    io.print('기존 자격 가져오기: 슬롯 상태를 확인할 수 없어 건너뜁니다 · 값 출력 0');
+    return [];
+  }
+  if (scan.proposals.length === 0) {
+    io.print('기존 자격 가져오기: 가져올 후보 없음 · 값 출력 0');
+    return [];
+  }
+  io.print('기존 자격 가져오기 제안 (값은 표시하지 않음):');
+  scan.proposals.forEach((proposal, index) => {
+    const review = proposal.reason ? ` · 가져오지 않음: ${proposal.reason}` : '';
+    io.print(`${index} ${proposal.name} · ${proposal.sourcePath} → ${proposal.slot}${review}`);
+  });
+  const answer = (await io.ask('eln secret에 가져올 번호 (쉼표로 여러 개, Enter=건너뜀): ')).trim();
+  if (!answer) return [];
+  const indices = parseImportSelection(answer, scan.proposals.length);
+  if (!indices) {
+    io.print('기존 자격 가져오기: 선택이 올바르지 않아 저장하지 않았습니다 · 값 출력 0');
+    return [];
+  }
+  const selected = indices.map(index => scan.proposals[index]!).filter(Boolean);
+  const unresolved = selected.find(proposal => proposal.reason);
+  if (unresolved) {
+    io.print(`선택한 후보는 안전하게 해석되지 않아 저장하지 않았습니다 · ${unresolved.reason} · 값 출력 0`);
+    return [];
+  }
+  let values: Record<string, string>;
+  try { values = scan.readSelected(selected.map(proposal => proposal.id)); }
+  catch {
+    io.print('기존 자격 가져오기: 같은 슬롯 후보는 하나만 선택해야 합니다 · 저장 안 함 · 값 출력 0');
+    return [];
+  }
+  try {
+    await (options.saveCredentialSlotBatch ?? setCredentialSlotBatchAsync)(values);
+    const slots = Object.keys(values).sort();
+    io.print(`eln secret 가져오기 완료: ${slots.join(', ')} · 값 출력 0`);
+    return slots;
+  } catch {
+    io.print('기존 자격 가져오기: 저장하지 못했습니다 · 값 출력 0');
+    return [];
+  }
 }
 
 export async function runSetupKeys(io: SetupKeysIO, options: SetupKeysOptions): Promise<{ stored: string[]; skipped: string[] }> {
+  await importExistingCredentialSources(io, options);
   const providers = await detectProviders({ env: options.env });
   for (const line of renderProviderProposal(options.config, providers)) io.print(line);
   const { listCodexAccountsInStore } = await import('../oauth/codex-account-store.js');

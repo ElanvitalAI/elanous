@@ -10,7 +10,7 @@ import { cronMatches } from '../domains/cron-match.js';
 import { resolveTimeZone } from '../time/time-zone.js';
 import { inventoryCrontab, listSchedules, openSchedulesDb, type ScheduleRow } from '../domains/schedule-registry.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 import { runGraph, type GraphRunState } from '../graph-runner/runner.js';
 import { FENCE_ROLES } from '../hq/hq.js';
@@ -21,8 +21,29 @@ export type { LoopEntry, LoopRoot, LoopRun, LoopStage } from './registry-contrac
 import { readUnreadCount } from '../msg/msg-store.js';
 import { loopMessageRoute, SEAT_MESSAGE_ROUTES, type LoopReplyBody, type MessageWake } from './msg-address.js';
 import { resolveWake, type WakeDeps, type WakeResolution } from './msg-wake.js';
+import { registerGraphTriggerDispatchBinding, type GraphTriggerDispatchBindingInput,
+  type RegisteredGraphTriggerDispatchBinding } from './graph-trigger-dispatch-lease.js';
+export { claimGraphTriggerDispatchLease, renewGraphTriggerDispatchLease, releaseGraphTriggerDispatchLease } from './graph-trigger-dispatch-lease.js';
+export type { GraphTriggerDispatchLease, GraphTriggerDispatchLeaseClaim, GraphTriggerDispatchLeaseInput } from './graph-trigger-dispatch-lease.js';
 
 const LOOP_STAGES: readonly LoopStage[] = ['proposed', 'shadow', 'live', 'retiring', 'retired'];
+
+export interface GraphTriggerRunRegistration extends GraphTriggerDispatchBindingInput {}
+
+export interface RegisteredGraphTriggerRun extends RegisteredGraphTriggerDispatchBinding {}
+
+/** The loop registry exposes the same durable binding used by dispatch leases. */
+export function registerGraphTriggerRun(input: GraphTriggerRunRegistration, options: {
+  registryRoot?: string;
+  stateRoot?: string;
+  createRunId?: () => string;
+} = {}): RegisteredGraphTriggerRun {
+  return registerGraphTriggerDispatchBinding(input, {
+    ...(options.registryRoot ? { registryRoot: options.registryRoot } : {}),
+    ...(options.stateRoot ? { stateRoot: options.stateRoot } : {}),
+    ...(options.createRunId ? { createRunId: options.createRunId } : {}),
+  });
+}
 
 export interface LoopRegistryOptions {
   root?: string;

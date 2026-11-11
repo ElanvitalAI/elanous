@@ -14,7 +14,7 @@
 
 import type { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { openSurfaceEventsDb, surfaceEventsDbPath, recordEvent, queryEvents } from './surface-events.js';
 
 export type SentimentKind = 'correction' | 'frustration' | 'abandonment' | 'satisfaction';

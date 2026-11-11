@@ -56,44 +56,5 @@ describe('createFinderModal', () => {
     expect(picked?.relPath).toBe('src/components/Button.tsx');
   });
 
-  test('onHover fires with FinderItem on initial mount + selection change', () => {
-    const hovered: Array<FinderItem | null> = [];
-    const modal = createFinderModal({
-      items: ITEMS,
-      bounds: bounds(),
-      width: 72,
-      onAccept: () => {},
-      onHover: (item) => { hovered.push(item); },
-    });
-    // Initial mount primes the hook with the first item.
-    expect(hovered).toHaveLength(1);
-    expect(hovered[0]?.relPath).toBe('button/docs/readme.md');
-    modal.down();
-    expect(hovered.at(-1)?.relPath).toBe('src/components/Button.tsx');
-    modal.up();
-    expect(hovered.at(-1)?.relPath).toBe('button/docs/readme.md');
-  });
 
-  test('onHover fires null when filter empties the list', () => {
-    const hovered: Array<FinderItem | null> = [];
-    const modal = createFinderModal({
-      items: ITEMS,
-      bounds: bounds(),
-      width: 72,
-      onAccept: () => {},
-      onHover: (item) => { hovered.push(item); },
-    });
-    for (const ch of 'zzz') modal.type(ch);
-    expect(hovered.at(-1)).toBeNull();
-  });
-
-  test('onHover unset is still a valid spec', () => {
-    const modal = createFinderModal({
-      items: ITEMS,
-      bounds: bounds(),
-      width: 72,
-      onAccept: () => {},
-    });
-    expect(() => modal.down()).not.toThrow();
-  });
 });

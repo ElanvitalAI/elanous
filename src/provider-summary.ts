@@ -12,7 +12,7 @@
 
 import { resolveGrokCredential } from './grok/credential.js';
 import { decideProviderForConfig, type ProviderDecision } from './llm.js';
-import { getUserConfig } from './user-config.js';
+import { getUserConfig } from './user-config/reader.js';
 import type { UserConfig } from './user-config/types.js';
 import { loadTokens, isExpiringSoon } from './oauth/store.js';
 import { CODEX_REFRESH_BUFFER_MS } from './oauth/codex.js';

@@ -1,5 +1,5 @@
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { ExternalTaskSource, TaskApproval } from './types.js';
 
 export interface ExternalAutoRunRule {

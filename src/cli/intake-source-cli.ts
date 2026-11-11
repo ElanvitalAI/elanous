@@ -5,7 +5,7 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { addSource, canonicalSeat, dueSources, expiredSource, isManagedStarterTopicRssSource, listSources, removeSource, runDue, sourceIsDue, syncBriefingTopicSource, syncStarterTopicRssSources, type RunDueDeps, type SourceKind } from '../intake-plane/intake-sources.js';
 import { projectTopicBriefing, subscribeTopicSearch, type SubscribeTopicSearchInput } from '../intake-plane/actions.js';
 import { runIntakeIssueBriefing } from '../intake-plane/actions.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export function registerIntakeSourceCommands(intake: Command, root: () => string = effectiveInstanceRoot,
   deps: { subscribeTopicSearch?: (input: SubscribeTopicSearchInput, options?: { stateDir?: string; runDeps?: RunDueDeps }) => ReturnType<typeof subscribeTopicSearch>;

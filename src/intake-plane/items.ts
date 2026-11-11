@@ -16,9 +16,33 @@ export type IntakeKind = 'video' | 'repo' | 'post' | 'article' | 'note' | 'rss';
 export type IntakePrivacy = 'public' | 'user-private';
 export const INTAKE_STATUSES = ['new', 'queued', 'absorbed', 'checked', 'routed', 'discarded', 'deferred'] as const;
 export type IntakeStatus = typeof INTAKE_STATUSES[number];
+export type AbsorbScrapKind = 'text' | 'web' | 'x' | 'youtube' | 'voice' | 'video' | 'photo';
+export interface AbsorbScrapTimelineEntry {
+  t: number;
+  kind: 'voice' | 'photo' | 'video';
+  mediaRef: string;
+  mime: string;
+}
+export interface AbsorbScrapPayload {
+  schema: 'absorb/v0';
+  memberId: string;
+  kind: AbsorbScrapKind;
+  source: 'android-share' | 'android-record' | 'flutter-share' | 'flutter-record' | 'tui' | 'pwa' | 'telegram';
+  raw: { text?: string; url?: string; mediaRef?: string; mime?: string; timeline?: AbsorbScrapTimelineEntry[] };
+  status: 'new' | 'extracting' | 'absorbed' | 'failed';
+  card?: { title: string; points: [string, string?, string?]; tags: string[]; originUrl?: string };
+  failure?: { stage: 'extract' | 'card'; reason: string };
+  createdAt: string;
+  absorbedAt?: string;
+}
 
 export interface IntakeItem {
   id: string;
+  /** Member namespace for absorb/v0 records; legacy intake entries omit it. */
+  memberId?: string;
+  absorb?: AbsorbScrapPayload;
+  /** Hashed, member-scoped idempotency keys; never included in the public absorb payload. */
+  absorbIdempotency?: Record<string, string>;
   source: IntakeSource | RegisteredIntakeSourceKind;
   /** 같은 항목이 다른 입력원에서도 왔으면 여기 모인다 — «두 입력원에서 동시에 뜬 것»이 신호다. */
   sources: (IntakeSource | RegisteredIntakeSourceKind)[];
@@ -46,6 +70,8 @@ export interface IntakeItem {
 
 /** 수집기가 내는 한 줄 — 모양 맞추기 전. */
 export interface RawIntakeItem {
+  memberId?: string;
+  absorb?: AbsorbScrapPayload;
   seat?: string;
   briefingTopic?: string;
   publisher?: string;
@@ -70,13 +96,13 @@ function normalizedSeat(seat: unknown): string | undefined {
 }
 
 export function intakeItemId(source: IntakeSource | RegisteredIntakeSourceKind,
-  raw: Pick<RawIntakeItem, 'url' | 'text' | 'linearIssueId'> & { seat?: string }): string {
+  raw: Pick<RawIntakeItem, 'url' | 'text' | 'linearIssueId' | 'memberId'> & { seat?: string }): string {
   const seat = normalizedSeat(raw.seat);
   const url = raw.url ? canonicalUrl(raw.url) : undefined;
   const itemKey = url ?? `${source}:${(raw.text ?? '').trim().slice(0, 200)}`;
   const basis = raw.linearIssueId ? JSON.stringify(['linear-issue', raw.linearIssueId.toLowerCase(), itemKey]) : itemKey;
   // Unassigned items retain their original IDs; assigned items have an independent lifecycle per seat.
-  return createHash('sha256').update(seat ? JSON.stringify([seat, basis]) : basis).digest('hex').slice(0, 16);
+  return createHash('sha256').update(raw.memberId ? JSON.stringify([raw.memberId, basis]) : seat ? JSON.stringify([seat, basis]) : basis).digest('hex').slice(0, 16);
 }
 
 function kindFor(source: IntakeSource | RegisteredIntakeSourceKind, url: string | undefined): IntakeKind {
@@ -105,7 +131,9 @@ export function shapeIntakeItem(source: IntakeSource | RegisteredIntakeSourceKin
   const signals: Record<string, number> = {};
   for (const [k, v] of Object.entries(raw.signals ?? {})) if (Number.isFinite(v)) signals[`${source}.${k}`] = v;
   return {
-    id: intakeItemId(source, { url, text, seat, linearIssueId: raw.linearIssueId }),
+    id: intakeItemId(source, { url, text, seat, linearIssueId: raw.linearIssueId, memberId: raw.memberId }),
+    ...(raw.memberId ? { memberId: raw.memberId } : {}),
+    ...(raw.absorb ? { absorb: raw.absorb } : {}),
     source,
     sources: [source],
     ...(seat ? { seat } : {}),
@@ -173,6 +201,8 @@ export function ingestIntakeItems(instanceRoot: string, source: IntakeSource | R
     if (!prev) { writes.set(shaped.id, shaped); result.added++; continue; }
     const merged: IntakeItem = {
       ...prev,
+      memberId: shaped.memberId ?? prev.memberId,
+      absorb: shaped.absorb ?? prev.absorb,
       sources: [...new Set([...prev.sources, source])],
       lastSeenAt: now,
       signals: { ...prev.signals, ...shaped.signals },
@@ -194,6 +224,62 @@ export function ingestIntakeItems(instanceRoot: string, source: IntakeSource | R
   appendItems(instanceRoot, [...writes.values()]);
   log('ingested', { source, ...result });
   return result;
+}
+
+/** Store absorb/v0 scraps in the existing IntakeItem JSONL ledger. */
+export function ingestAbsorbScrap(instanceRoot: string, payload: AbsorbScrapPayload, idempotencyKey: string, now = payload.createdAt): { item: IntakeItem; replayed: boolean } {
+  const source: IntakeSource = 'pwa';
+  const identity = payload.raw.url ?? payload.raw.text ?? payload.raw.mediaRef ?? `${payload.kind}:${now}`;
+  const raw: RawIntakeItem = {
+    memberId: payload.memberId,
+    url: payload.raw.url,
+    text: payload.raw.text ?? payload.raw.mediaRef ?? identity,
+    title: payload.card?.title,
+    kind: payload.kind === 'text' || payload.kind === 'photo' ? 'note' : payload.kind === 'web' ? 'article' : payload.kind === 'x' ? 'post' : 'video',
+    absorb: payload,
+  };
+  // Absorb entries keep the complete input identity: URL-only or text-prefix IDs
+  // can collapse different kinds or long bodies into one member's ledger item.
+  const id = createHash('sha256').update(JSON.stringify([
+    'absorb/v0', payload.memberId, payload.kind, payload.source, payload.raw,
+  ])).digest('hex').slice(0, 16);
+  const { items } = loadIntakeLedger(instanceRoot);
+  const keyHash = createHash('sha256').update(`${payload.memberId}\0${idempotencyKey}`).digest('hex');
+  const fingerprint = createHash('sha256').update(JSON.stringify({ kind: payload.kind, source: payload.source, raw: payload.raw })).digest('hex');
+  for (const existing of items.values()) {
+    const prior = existing.absorbIdempotency?.[keyHash];
+    if (prior !== undefined) {
+      if (prior !== fingerprint) throw new Error('idempotency-conflict');
+      return { item: existing, replayed: true };
+    }
+  }
+  const prev = items.get(id);
+  if (prev?.absorb) {
+    const updated = { ...prev, absorbIdempotency: { ...prev.absorbIdempotency, [keyHash]: fingerprint } };
+    appendItems(instanceRoot, [updated]);
+    return { item: updated, replayed: false };
+  }
+  const shaped = shapeIntakeItem(source, raw, now);
+  if (!shaped) throw new Error('scrap requires text, url, or mediaRef');
+  shaped.id = id;
+  shaped.absorbIdempotency = { [keyHash]: fingerprint };
+  appendItems(instanceRoot, [shaped]);
+  debug.log('absorb.ingest', 'scrap-received', { id, memberId: payload.memberId, kind: payload.kind, source: payload.source });
+  return { item: shaped, replayed: false };
+}
+
+export function listAbsorbScraps(instanceRoot: string, memberId: string): IntakeItem[] {
+  return [...loadIntakeLedger(instanceRoot).items.values()]
+    .filter((item) => item.memberId === memberId && item.absorb?.schema === 'absorb/v0')
+    .sort((a, b) => b.absorb!.createdAt.localeCompare(a.absorb!.createdAt));
+}
+
+export function updateAbsorbScrap(instanceRoot: string, id: string, patch: Partial<Pick<AbsorbScrapPayload, 'status' | 'card' | 'failure' | 'absorbedAt'>>): boolean {
+  const { items } = loadIntakeLedger(instanceRoot);
+  const item = items.get(id);
+  if (!item?.absorb) return false;
+  appendItems(instanceRoot, [{ ...item, absorb: { ...item.absorb, ...patch } }]);
+  return true;
 }
 
 /** 상태·산출 갱신 — 흡수 뒤 `absorbed` · 노트 경로 등. 없는 id 면 false. */

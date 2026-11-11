@@ -1,10 +1,11 @@
 /* ── Search engines ── */
+import type { ContractRequest } from './registry.js';
 
 export type SearchEngine =
   // 웹 검색 (일반·뉴스) — tavily 1순위
   | 'tavily' | 'tavily-news'
   // 크롤/스크랩/추출 — firecrawl REST
-  | 'firecrawl' | 'fc-news' | 'fc-agent' | 'fc-map' | 'fc-crawl'
+  | 'firecrawl' | 'fc-news' | 'fc-agent' | 'fc-map' | 'fc-crawl' | 'fc-scrape'
   // 개발자 인덱스 (README·문서·이슈·PR 아티팩트 — 코딩 질문 1차 출처)
   | 'fc-dev'
   // 커뮤니티 — grok (X/레딧 유일 커버)
@@ -12,7 +13,7 @@ export type SearchEngine =
   // X 트윗 벌크 (정량·필터)
   | 'apify'
   // 무료 티어 (키 불필요 — 유료 공백/--free 시 발동)
-  | 'ddg'
+  | 'ddg' | 'ddg-social' | 'jina-reader' | 'local-readability'
   // web_capture (스크린샷 아티팩트)
   | 'capture'
   | 'all';
@@ -56,6 +57,8 @@ export interface CrawlResult {
 
 export interface CrawlDecision {
   engines: SearchEngine[];
+  /** Auto routes select a capability contract; --engine keeps explicit engine IDs. */
+  requires?: ContractRequest[];
   query: string;
   reason: string;
   mode: RunMode;

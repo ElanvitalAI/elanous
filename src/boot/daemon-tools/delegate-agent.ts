@@ -13,7 +13,7 @@ import { mkdirSync } from 'node:fs';
 
 import type { DaemonToolDispatchCtx } from './types.js';
 import { globalDualRoleManager } from '../../acp/dual-role-manager.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { extractUpdateText } from '../../skills/tools/acp-session.js';
 import { recordAutonomousActionSafe } from '../../domains/autonomy-log.js';
 import { debug } from '../../debug/log.js';

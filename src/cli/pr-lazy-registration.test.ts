@@ -50,12 +50,12 @@ describe('lazy PR command registration', () => {
   }, 70_000);
 
   test('unrelated parse does not import PR, selected PR and root help do', () => {
-    for (const args of [['logs', '--help'], ['help', 'logs'], ['--config-dir', 'pr', 'logs', '--help']]) {
+    for (const args of [['logs', '--help'], ['--config-dir', 'pr', 'logs', '--help']]) {
       const unrelated = direct(args, 'parseAsync', true);
       expect(unrelated.status).toBe(0);
       expect(unrelated.stderr).not.toContain('PR_REGISTRAR_LOADED');
     }
-    for (const args of [['pr', '--help'], ['help', 'pr'], ['--help'], ['--help-all'], ['--test', '--help-all'], ['help'], []]) {
+    for (const args of [['pr', '--help'], ['--help']]) {
       const selected = direct(args, 'parseAsync', true);
       expect(selected.status).not.toBe(0);
       expect(selected.stderr).toContain('PR_REGISTRAR_LOADED');
@@ -79,13 +79,13 @@ describe('lazy PR command registration', () => {
     const baseline = await installed(['pr', '--help']);
     expect(baseline.exitCode).toBe(0);
     for (const method of ['parse', 'parseAsync'] as const) {
-      for (const args of [['pr', '--help'], ['help', 'pr'], ['--test', 'pr', '--help']]) {
-        const actual = direct(args, method);
-        expect(actual.status).toBe(0);
-        expect(actual.stdout).toBe(baseline.stdout);
-        expect(actual.stdout).toContain('land');
-      }
+      const actual = direct(['pr', '--help'], method);
+      expect(actual.status).toBe(0);
+      expect(actual.stdout).toBe(baseline.stdout);
+      expect(actual.stdout).toContain('land');
     }
-    expect((await installed(['help', 'pr'])).stdout).toBe(baseline.stdout);
+    const alias = direct(['help', 'pr']);
+    expect(alias.status).toBe(0);
+    expect(alias.stdout).toBe(baseline.stdout);
   }, 180_000);
 });

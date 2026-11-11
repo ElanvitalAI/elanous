@@ -16,6 +16,19 @@ function importsOf(file: string): ts.ImportDeclaration[] {
 }
 
 describe('gate type-only boundary', () => {
+  test('known issues and gate helpers import contracts without loading runner types from facades', () => {
+    const known = importsOf('scripts/release-loop/known-issues-node.ts');
+    expect(known.some((entry) => ts.isStringLiteral(entry.moduleSpecifier)
+      && entry.moduleSpecifier.text.endsWith('/runner.js'))).toBe(false);
+    expect(known.some((entry) => ts.isStringLiteral(entry.moduleSpecifier)
+      && entry.moduleSpecifier.text.endsWith('/runner-primitives.js'))).toBe(true);
+    expect(known.some((entry) => ts.isStringLiteral(entry.moduleSpecifier)
+      && entry.moduleSpecifier.text.endsWith('/runner-types.js') && entry.importClause?.isTypeOnly)).toBe(true);
+    const gateHelper = importsOf('scripts/release-loop/gate-autoheal-sim-evidence.ts');
+    expect(gateHelper.some((entry) => ts.isStringLiteral(entry.moduleSpecifier)
+      && entry.moduleSpecifier.text.endsWith('/gate-types.js') && entry.importClause?.isTypeOnly)).toBe(true);
+  });
+
   test('gate contracts do not statically import the runtime gate node', () => {
     for (const importer of importers) {
       const imports = importsOf(importer);

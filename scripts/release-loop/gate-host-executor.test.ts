@@ -116,7 +116,7 @@ test('release run input: the policy-selected Pod needs a pool and rejects host o
     expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} })).toThrow('release.loop.gatePodPool is required by release ops policy');
     expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} }, undefined, { executor: 'pod' })).toThrow('release.loop.gatePodPool is required by release ops policy');
     // The release policy selects the measured Pod method and pins its image to the resolved cut.
-    expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool' } })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit' });
+    expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool' } })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit' });
     expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: {} }, undefined, { executor: 'host', host: 'node-b' }))
       .toThrow('gate executor host conflicts with release policy pod');
     expect(() => buildReleaseRunInput('0.11.0', { ledgerRoot: root, config: { gatePodPool: 'pool', gateRemote: 'old' } }, undefined, { executor: 'host', host: 'node-b' }))

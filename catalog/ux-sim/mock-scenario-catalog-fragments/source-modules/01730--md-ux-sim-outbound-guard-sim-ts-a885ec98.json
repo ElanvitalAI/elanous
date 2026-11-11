@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-OUTBOUND-GUARD-SIM-TS",
+  "path": "src/ux-sim/outbound-guard-sim.ts",
+  "boundary": "Applies the hybrid RFC I2 source=real gate to an injected fake outbound sink; non-real or incomplete provenance records sim.leak-blocked and executes no sink.",
+  "deviceIds": ["outbound-guard-sim"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -4,6 +4,7 @@ import { readResourceLedger, reapResourceLeaseIfCurrent, type ResourceFinding } 
 import { reconcileLeaseCleanup } from './lease-automation.js';
 import { gateHostReservationRoot, inspectReleaseGateHost } from '../release-loop/gate-host-reservation.js';
 import { existsSync } from 'node:fs';
+import { readHostReadiness } from './host-readiness.js';
 import { logsDbPath, LogStore, type LogStoreRow } from '../mss/logging/log-store.js';
 
 type GateTrainFingerprint = { fp: string; entrance: 'self-gate' | 'train'; host?: string; reservedHost?: string };
@@ -70,6 +71,7 @@ export interface ResourceReconcileTickDeps {
   fingerprints?: () => readonly GateTrainFingerprint[];
   releaseReservation?: () => ReturnType<typeof inspectReleaseGateHost>;
   log?: (event: string, data: Record<string, unknown>) => void;
+  hostReadiness?: typeof readHostReadiness;
 }
 
 type GuardianFinding = ResourceFinding | { kind: 'release-reservation'; host: 'node-b'; id: string; detail: string; action: 'report-only' };
@@ -137,7 +139,8 @@ export async function resourceReconcileTick(overrides: ResourceReconcileTickDeps
   };
   try { (overrides.log ?? ((name, data) => debug.log('loop.guardian', name, data)))('resource-reconcile', event); }
   catch { /* reconciliation is observation and must not stop the guardian */ }
-  const result = { ...snapshot, findings, cleanup, releaseReservation };
+  const hostReadiness = (overrides.hostReadiness ?? readHostReadiness)();
+  const result = { ...snapshot, findings, cleanup, releaseReservation, hostReadiness };
   latestResourceSnapshot = { ...result, stale: false };
   latestResourceFailure = null;
   return result;

@@ -1,0 +1,13 @@
+{
+  "id": "fake-mobile-toolchain",
+  "name": "Fake mobile toolchain and failure cards",
+  "implementation": ["src/ux-sim/fake-mobile-toolchain.ts", "src/ux-sim/fake-bin.ts"],
+  "tests": ["src/ux-sim/fake-mobile-toolchain.test.ts"],
+  "target": "Replay mobile install, device, store and push failures through fixed tool responses.",
+  "inputs": ["failure reason", "virtual clock", "fake CLI arguments"],
+  "observations": ["recovery card", "ordered events", "fake Flutter, Dart, Android and Apple command output"],
+  "entryCommands": ["bun test src/ux-sim/fake-mobile-toolchain.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

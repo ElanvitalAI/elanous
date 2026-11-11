@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
-import { registerSimCommands } from './sim-cli.js';
+import { createUserSimulationEnvironment, registerSimCommands } from './sim-cli.js';
 import { listMockDeviceRequests } from '../ux-sim/mock-device-requests.js';
-import { createWorld } from '../ux-sim/world.js';
+import { createWorld, destroyWorldById, executeWorldScenario, loadWorld } from '../ux-sim/world.js';
 import { appendSimWorldWatchEvents } from '../ux-sim/world-watch.js';
 
 const roots: string[] = [];
@@ -14,6 +14,8 @@ const originalLog = console.log;
 const originalError = console.error;
 const originalExitCode = process.exitCode;
 let priorTestRoot: string | undefined;
+const credentialEnvKeys = ['OPENAI_API_KEY', 'SSH_PRIVATE_KEY', 'DATABASE_URL', 'REDIS_URL'] as const;
+const initialCredentialEnv = Object.fromEntries(credentialEnvKeys.map((key) => [key, process.env[key]]));
 
 afterEach(() => {
   console.log = originalLog;
@@ -21,9 +23,233 @@ afterEach(() => {
   process.exitCode = originalExitCode ?? 0;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   setTestStateRoot(priorTestRoot ?? null);
+  for (const key of credentialEnvKeys) {
+    const value = initialCredentialEnv[key];
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
 });
 
 describe('sim world CLI', () => {
+  test('user default profiles create a credential-free runner environment', () => {
+    priorTestRoot = getTestStateRoot();
+    const root = mkdtempSync(join(tmpdir(), 'sim-app-profile-'));
+    roots.push(root);
+    setTestStateRoot(root);
+    const result = createUserSimulationEnvironment([
+      { credentials: 'fake-only', network: 'loopback-only', storage: 'temporary' },
+    ], { PATH: process.env.PATH, DATABASE_URL: 'postgres://SIM-DB-BOUNDARY-SENTINEL',
+      REDIS_URL: 'redis://SIM-REDIS-BOUNDARY-SENTINEL', OPENAI_API_KEY: 'SIM-BOUNDARY-SENTINEL',
+      SSH_PRIVATE_KEY: 'SIM-SSH-BOUNDARY-SENTINEL' });
+    expect(result).toMatchObject({ PATH: process.env.PATH, ELANOUS_STATE_DIR: root });
+    expect(['derived', 'explicit']).toContain(result.ELANOUS_STATE_DIR_SOURCE!);
+    expect(result.NODE_ENV).toBe('test');
+    expect(result).not.toHaveProperty('OPENAI_API_KEY');
+    expect(result).not.toHaveProperty('SSH_PRIVATE_KEY');
+    expect(result).not.toHaveProperty('DATABASE_URL');
+    expect(result).not.toHaveProperty('REDIS_URL');
+  });
+
+  test('sim app lists declarations from app.yaml inside the isolated universe', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sim-app-cli-'));
+    roots.push(root);
+    priorTestRoot = getTestStateRoot();
+    setTestStateRoot(root);
+    const appDir = join(root, 'demo-app');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(appDir);
+    writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0
+slug: demo-app
+title: Demo app
+frontend: { kind: static-export }
+simulate:
+  connectors:
+    summarize: { fake: stt, profile: ok }
+  scenarios:
+    - name: happy path
+      steps: [{ action: summarize }]
+      expect: [{ event: completed }]
+actions:
+  summarize: { builtin: summarize, input: { text: text }, output: { text: text } }
+`);
+    const output: string[] = [];
+    const errors: string[] = [];
+    console.log = (...parts: unknown[]) => { output.push(parts.map(String).join(' ')); };
+    console.error = (...parts: unknown[]) => { errors.push(parts.map(String).join(' ')); };
+    process.exitCode = 0;
+    const program = new Command();
+    registerSimCommands(program);
+
+    await program.parseAsync(['node', 'test', 'sim', 'app', appDir, '--list', '--json']);
+    expect(errors).toEqual([]);
+    expect(JSON.parse(output.pop()!)).toMatchObject({ app: 'demo-app', scenarios: [{ name: 'happy path' }],
+      deviceProfiles: { summarize: { device: 'SIM-FAKE-PROVIDERS-AV', selectedProfile: 'ok',
+        defaultProfile: { credentials: 'fake-only', network: 'loopback-only', storage: 'temporary' } } } });
+    expect(errors).toEqual([]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test('sim app runs the real declared runner behind a mocked OS sandbox boundary', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sim-app-cli-run-'));
+    roots.push(root);
+    priorTestRoot = getTestStateRoot();
+    setTestStateRoot(root);
+    const appDir = join(root, 'demo-app');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(appDir);
+    writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0
+slug: demo-app
+title: Demo app
+frontend: { kind: static-export }
+tables:
+  notes:
+    columns:
+      id: { type: text, primary: true }
+      title: { type: text }
+roles: { owner: { via: nexus-session } }
+rpc:
+  addNote:
+    sql: INSERT INTO notes (id, title) VALUES (:id, :title)
+    params: { id: { type: text }, title: { type: text } }
+    allow: [owner]
+simulate:
+  connectors:
+    summarize: { fake: stt, profile: ok }
+  scenarios:
+    - name: happy-path
+      steps: [{ rpc: addNote, as: owner, params: { id: note-1, title: hi } }]
+      expect: [{ event: rpc.addNote.completed }, { table: notes, rows: ${['notes'].length} }]
+actions:
+  summarize: { builtin: summarize, input: { text: text }, output: { text: text } }
+`);
+    const output: string[] = [];
+    const errors: string[] = [];
+    const priorEnv = { DATABASE_URL: process.env.DATABASE_URL, REDIS_URL: process.env.REDIS_URL,
+      SSH_PRIVATE_KEY: process.env.SSH_PRIVATE_KEY, OPENAI_API_KEY: process.env.OPENAI_API_KEY };
+    process.env.DATABASE_URL = 'postgres://SIM-DB-BOUNDARY-SENTINEL';
+    process.env.REDIS_URL = 'redis://SIM-REDIS-BOUNDARY-SENTINEL';
+    process.env.SSH_PRIVATE_KEY = 'SIM-SSH-BOUNDARY-SENTINEL';
+    process.env.OPENAI_API_KEY = 'SIM-API-BOUNDARY-SENTINEL';
+    console.log = (...parts: unknown[]) => { output.push(parts.map(String).join(' ')); };
+    console.error = (...parts: unknown[]) => { errors.push(parts.map(String).join(' ')); };
+    process.exitCode = 0;
+    let refusedRunnerCalls = 0;
+    const refusedProgram = new Command();
+    registerSimCommands(refusedProgram, {
+      assertNetworkIsolation() { throw new Error('test sandbox unavailable'); },
+      async executeCli() { refusedRunnerCalls++; return { status: 0, stdout: '' }; },
+    });
+    await refusedProgram.parseAsync(['node', 'test', 'sim', 'app', appDir, '--scenario', 'happy-path', '--json']);
+    expect(process.exitCode).toBe(2);
+    expect(errors).toEqual(['sim app: test sandbox unavailable']);
+    expect(refusedRunnerCalls).toBe(0);
+    errors.length = 0;
+    process.exitCode = 0;
+    const program = new Command();
+    const priorSandboxFlag = process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+    registerSimCommands(program, {
+      assertNetworkIsolation(environment) {
+        if (!environment) throw new Error('isolated simulation environment was not provided');
+        expect(environment.DATABASE_URL).toBeUndefined();
+        expect(environment.REDIS_URL).toBeUndefined();
+        expect(environment.SSH_PRIVATE_KEY).toBeUndefined();
+        expect(environment.OPENAI_API_KEY).toBeUndefined();
+      },
+      async executeCli(args) {
+        if (args[2] === 'create-yaml') {
+          const world = await createWorld(args[3]!);
+          return { status: 0, stdout: JSON.stringify({ id: world.id }) };
+        }
+        if (args[2] === 'run') {
+          const oldFlag = process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+          process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = '1';
+          try {
+            const result = await executeWorldScenario(loadWorld(args[3]!), args[4]!);
+            return { status: result.pass ? 0 : 1, stdout: JSON.stringify(result) };
+          } finally {
+            if (oldFlag === undefined) delete process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+            else process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = oldFlag;
+          }
+        }
+        if (args[2] === 'destroy') {
+          await destroyWorldById(args[3]!);
+          return { status: 0, stdout: '' };
+        }
+        throw new Error(`unexpected simulated app CLI command: ${args.join(' ')}`);
+      },
+    });
+
+    try {
+      await program.parseAsync(['node', 'test', 'sim', 'app', appDir, '--scenario', 'happy-path', '--json']);
+    } finally {
+      if (priorSandboxFlag === undefined) delete process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED;
+      else process.env.ELANOUS_SIM_WORLD_OS_SANDBOXED = priorSandboxFlag;
+    }
+    expect(errors).toEqual([]);
+    expect(process.exitCode).toBe(0);
+    const printed = JSON.parse(output.pop()!) as { receiptPath: string; passed: boolean;
+      scenarios: Array<{ scenario: string; status: string; failedExpectations: string[] }>;
+      results: Array<{ events: Array<{ data: { step: string } }>; evidence: { events: string[]; tableRows: Record<string, number> };
+        receipts: Array<{ outcome: string }> }> };
+    expect(printed).toMatchObject({ passed: true, scenarios: [{ scenario: 'happy-path', status: 'passed', failedExpectations: [] }],
+      results: [{ events: [{ data: { step: 'rpc.addNote.completed' } }], evidence: { events: ['rpc.addNote.completed'], tableRows: { notes: ['notes'].length } },
+        receipts: [{ outcome: 'passed' }] }] });
+    expect(JSON.parse(readFileSync(printed.receiptPath, 'utf8'))).toMatchObject({ app: 'demo-app', passed: true,
+      results: [{ events: [{ data: { step: 'rpc.addNote.completed' } }], evidence: { events: ['rpc.addNote.completed'], tableRows: { notes: ['notes'].length } },
+        receipts: [{ outcome: 'passed' }] }] });
+    expect(process.env.DATABASE_URL).toBe('postgres://SIM-DB-BOUNDARY-SENTINEL');
+    expect(process.env.REDIS_URL).toBe('redis://SIM-REDIS-BOUNDARY-SENTINEL');
+    expect(process.env.SSH_PRIVATE_KEY).toBe('SIM-SSH-BOUNDARY-SENTINEL');
+    expect(process.env.OPENAI_API_KEY).toBe('SIM-API-BOUNDARY-SENTINEL');
+    if (priorEnv.DATABASE_URL === undefined) delete process.env.DATABASE_URL; else process.env.DATABASE_URL = priorEnv.DATABASE_URL;
+    if (priorEnv.REDIS_URL === undefined) delete process.env.REDIS_URL; else process.env.REDIS_URL = priorEnv.REDIS_URL;
+    if (priorEnv.SSH_PRIVATE_KEY === undefined) delete process.env.SSH_PRIVATE_KEY; else process.env.SSH_PRIVATE_KEY = priorEnv.SSH_PRIVATE_KEY;
+    if (priorEnv.OPENAI_API_KEY === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = priorEnv.OPENAI_API_KEY;
+  });
+
+  test('sim suite creates its own isolated root and reports an unconnected real target as unmeasured', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sim-suite-real-'));
+    roots.push(root);
+    priorTestRoot = getTestStateRoot();
+    setTestStateRoot(null);
+    const suite = join(root, 'suite');
+    mkdirSync(join(suite, 'incident'), { recursive: true });
+    writeFileSync(join(suite, 'suite.json'), JSON.stringify({ durationTolerancePercent: 10 })); // Source: suite fixture makes duration policy explicit.
+    writeFileSync(join(suite, 'incident', 'world.yaml'), 'world: incident\n');
+    writeFileSync(join(suite, 'incident', 'scenario.yaml'), 'world: incident\nsteps: []\n');
+    const output: string[] = [];
+    console.log = (...parts: unknown[]) => { output.push(parts.map(String).join(' ')); };
+    process.exitCode = 0;
+    const program = new Command();
+    registerSimCommands(program);
+    await program.parseAsync(['node', 'test', 'sim', 'suite', suite, '--target', 'real']);
+    expect(output).toHaveLength(1);
+    expect(JSON.parse(output[0]!)).toMatchObject({ scenario: 'incident', field: 'target', actual: 'unmeasured: target runner unavailable' });
+    expect(process.exitCode).toBe(1);
+    expect(getTestStateRoot()).toBeUndefined();
+  });
+
+  test('real suite stays unmeasured when no isolated worker is available', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sim-suite-target-'));
+    roots.push(root);
+    priorTestRoot = getTestStateRoot();
+    setTestStateRoot(root);
+    const suite = join(root, 'suite');
+    const caseDir = join(suite, 'incident');
+    mkdirSync(caseDir, { recursive: true });
+    writeFileSync(join(suite, 'suite.json'), JSON.stringify({ durationTolerancePercent: 10 })); // Source: regression suite fixture sets its tolerance.
+    // Source: minimal parseable world fixture uses the schema's required seed.
+    writeFileSync(join(caseDir, 'world.yaml'), 'world: incident\nseed: 1\ndevices: [fake-clock]\nevents: []\n');
+    writeFileSync(join(caseDir, 'scenario.yaml'), 'world: incident\nsteps: []\n');
+    const output: string[] = [];
+    console.log = (...parts: unknown[]) => { output.push(parts.map(String).join(' ')); };
+    process.exitCode = 0;
+    const program = new Command();
+    registerSimCommands(program);
+    await program.parseAsync(['node', 'test', 'sim', 'suite', suite, '--target', 'real', '--update-baseline']);
+    expect(output).toEqual([JSON.stringify({ scenario: 'incident', field: 'target', baseline: 'real', actual: 'unmeasured: target runner unavailable' })]);
+    expect(process.exitCode).toBe(1);
+  });
+
   test('sim watch streams world observation rows from the isolated test world', async () => {
     const root = mkdtempSync(join(tmpdir(), 'sim-world-watch-'));
     roots.push(root);
@@ -127,7 +353,7 @@ describe('sim world CLI', () => {
     expect(absentIdentityGate).not.toHaveProperty('autoheal');
     expect(errors).toEqual([]);
     expect(process.exitCode).toBe(0);
-  });
+  }, 15_000);
 
   test('records and lists mock device requests only inside the isolated test universe', async () => {
     const root = mkdtempSync(join(tmpdir(), 'sim-device-request-cli-'));

@@ -2,7 +2,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { basename, join, resolve } from 'node:path/posix';
+import { basename, join, relative, resolve } from 'node:path/posix';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
 import { withGateTestEnv } from '../../scripts/lib/gate-test-env.js';
 import { runIsolationHardcodeGate } from '../../scripts/ci-isolation-hardcode-gate.js';
@@ -29,11 +29,15 @@ import {
   overlapWithCurrentChanges,
 } from '../cli/pr-granularity.js';
 import { listWorktrees } from '../git-fs/worktree.js';
-import { runShardedGateTests, runShardedGateTestsAsync, writeShardFailureEvidence, remoteShardArgv, type ShardRunProgress, type ShardRunResult } from '../self-dev/shard-run.js';
+import { runShardedGateTests, runShardedGateTestsAsync, writeShardFailureEvidence, remoteShardArgv, type ShardRunLifecycleEvent, type ShardRunProgress, type ShardRunResult } from '../self-dev/shard-run.js';
 import { planGateRemoteShards, shardPlanOrchestrationId, type GateRemoteShard } from '../self-dev/shard-plan.js';
 import { parseGateScenario, readGateScenarioFile } from './gate-scenario.js';
 import { isGateSpawnLaneFile } from '../self-dev/spawn-lane-files.js';
 import { defaultGateEnvKey, defaultRevResolver, resolveArtifactDir, writeGateArtifacts, type GateArtifactCounts, type GateArtifactsUnavailable, type RevResolver } from './gate-artifacts.js';
+import { releaseLedgerRoot } from '../instance/resolve.js';
+import { gateEnvFingerprint } from './gate-receipt-registry.js';
+import { appendGateShardLedgerForGate, appendGateShardLedgerBatch, gateShardLedgerPath, gateShardLedgerBatchComplete, readGateShardLedger, type GateShardLedgerRow } from '../release-loop/gate-shard-ledger.js';
+import { parseXml } from '../self-dev/shard-aggregate.js';
 
 export interface SelfGateCliOptions {
   base?: string;
@@ -59,6 +63,8 @@ export interface SelfGateCliOptions {
   artifactDir?: string;
   /** Marker captured by the process entry point; keeps receipts stable if the environment changes during dispatch. */
   trainGate?: boolean;
+  /** Release version when this self-gate belongs to a release graph without a context file. */
+  version?: string;
 }
 
 const SELF_GATE_SEAT_TRACKS = new Set(['OP', 'OPC', 'OPT', 'TC', 'UX', 'MK']);
@@ -142,7 +148,7 @@ export interface DirtyWorktreeClassification {
   unrelated: DirtyWorktreePath[];
 }
 
-interface SelfGateCliDeps {
+export interface SelfGateCliDeps {
   changedFiles?: (cwd: string, options: SelfGateCliOptions) => ChangedFileSelection;
   exists?: (path: string) => boolean;
   isRegularFile?: (cwd: string, path: string) => boolean;
@@ -191,11 +197,244 @@ interface GateArtifactCapture {
   unmeasuredReason?: string;
   unshardedRc?: number | null;
   artifactsUnavailable?: GateArtifactsUnavailable;
+  /** True only after the required train self-gate batch has been read back and verified from the HQ ledger. */
+  hqLedgerVerified?: boolean;
   /** `unrun importer tests: N` 의 N — 색인 조회 실패면 null(그 이유가 importerLookupFailed). */
   unrunImporters?: number | null;
   importerLookupFailed?: string;
   timeoutRechecks?: readonly TimeoutRecheckRecord[];
   interferenceRechecks?: readonly InterferenceRecheckRecord[];
+}
+
+interface SelfGateLedgerContext {
+  path: string;
+  required: boolean;
+  version: string;
+  commit: string;
+  runId: string;
+  invocationId: string;
+  envFingerprint: string;
+  host: string | null;
+  entrypoint: 'self-gate' | 'train';
+}
+
+function selfGateLedgerGraphContext(): { runId?: string; version?: string; commit?: string } {
+  const raw = process.env.ELANOUS_GRAPH_CONTEXT?.trim();
+  if (!raw) return {};
+  try {
+    const text = existsSync(raw) ? readFileSync(raw, 'utf8') : raw;
+    const value = JSON.parse(text) as { runId?: unknown; input?: { version?: unknown; commit?: unknown } };
+    return {
+      ...(typeof value.runId === 'string' && value.runId ? { runId: value.runId } : {}),
+      ...(typeof value.input?.version === 'string' && value.input.version ? { version: value.input.version } : {}),
+      ...(typeof value.input?.commit === 'string' && value.input.commit ? { commit: value.input.commit } : {}),
+    };
+  } catch { return {}; }
+}
+
+function requiresRemoteTrainLedger(options: SelfGateCliOptions): boolean {
+  return (options.trainGate ?? process.env.ELANOUS_TRAIN_GATE === '1') && process.env.ELANOUS_GATE_REMOTE_CHILD === '1';
+}
+
+function selfGateLedgerContext(cwd: string, options: SelfGateCliOptions, deps: SelfGateCliDeps): SelfGateLedgerContext | undefined {
+  const train = options.trainGate ?? process.env.ELANOUS_TRAIN_GATE === '1';
+  const graph = selfGateLedgerGraphContext();
+  const remote = process.env.ELANOUS_GATE_REMOTE_CHILD === '1';
+  const required = remote && train;
+  const version = options.version?.trim() || graph.version || process.env.ELANOUS_RELEASE_VERSION?.trim() || '';
+  if (!/^\d+\.\d+\.\d+(?:[-.][A-Za-z0-9.-]+)?$/.test(version)) {
+    if (required) throw new Error('remote self-gate refused: HQ shard ledger release version is unavailable');
+    return undefined;
+  }
+  const commit = graph.commit ?? (deps.resolveRev ?? defaultRevResolver(cwd))('HEAD') ?? undefined;
+  if (!commit) {
+    if (required) throw new Error('remote self-gate refused: HQ shard ledger commit identity is unavailable');
+    return undefined;
+  }
+  const runId = graph.runId || process.env.ELANOUS_RUN_ID?.trim() || (required ? '' : randomUUID());
+  if (!runId && required) throw new Error('remote self-gate refused: HQ shard ledger release run id is unavailable');
+  const envFingerprint = gateEnvFingerprint(process.env);
+  const context = {
+    path: gateShardLedgerPath(version, releaseLedgerRoot()), required, version, commit, runId,
+    invocationId: `${train ? 'train' : 'self-gate'}-${randomUUID()}`, envFingerprint,
+    host: process.env.ELANOUS_GATE_REMOTE_HOST?.trim() || null, entrypoint: train ? 'train' as const : 'self-gate' as const,
+  };
+  return context;
+}
+
+function selfGateJUnitEvidence(xml: string | undefined, files: readonly string[], cwd: string): {
+  ran: number; pass: number | null; fail: number | null; errors: number | null; skipped: number | null;
+  failureIds: string[] | null; errorIds: string[] | null; attribution: 'complete' | 'unmeasured';
+} {
+  const unavailable = { ran: 0, pass: null, fail: null, errors: null, skipped: null,
+    failureIds: null, errorIds: null, attribution: 'unmeasured' as const };
+  if (!xml || !files.length) return unavailable;
+  const root = parseXml(xml);
+  if (!root || (root.name !== 'testsuites' && root.name !== 'testsuite')) return unavailable;
+  const expected = new Set(files);
+  const observed = new Set<string>();
+  const failureIds: string[] = [];
+  const errorIds: string[] = [];
+  let ran = 0; let skipped = 0; let valid = true;
+  const normalized = (file: string | undefined, inherited?: string): string | undefined => {
+    const path = file || inherited;
+    if (!path) return undefined;
+    const relativePath = path.startsWith('/') ? relative(resolve(cwd), resolve(path)) : path;
+    return relativePath.split('\\').join('/');
+  };
+  const walk = (node: NonNullable<ReturnType<typeof parseXml>>, suiteFile?: string): void => {
+    const parentFile = node.name === 'testsuite' ? normalized(node.attrs.file, suiteFile) : suiteFile;
+    if (node.name === 'testcase') {
+      const file = normalized(node.attrs.file, parentFile);
+      const name = node.attrs.name;
+      if (!file || !expected.has(file) || !name) { valid = false; return; }
+      observed.add(file); ran++;
+      if (node.children.some((child) => child.name === 'skipped')) { skipped++; return; }
+      const failure = node.children.find((child) => child.name === 'failure');
+      const error = node.children.find((child) => child.name === 'error');
+      if (failure) failureIds.push(`${file} > ${name}`);
+      if (error) errorIds.push(`${file} > ${name}`);
+      return;
+    }
+    for (const child of node.children) walk(child, parentFile);
+  };
+  walk(root);
+  if (!valid || !ran || [...expected].some((file) => !observed.has(file))) return unavailable;
+  return { ran, pass: ran - failureIds.length - errorIds.length - skipped, fail: failureIds.length,
+    errors: errorIds.length, skipped, failureIds, errorIds, attribution: 'complete' };
+}
+
+function selfGateLedgerWriter(cwd: string, options: SelfGateCliOptions, deps: SelfGateCliDeps, onVerified?: () => void) {
+  const context = selfGateLedgerContext(cwd, options, deps);
+  if (!context) return undefined;
+  const latest = new Map<string, GateShardLedgerRow>();
+  const started = new Map<string, string>();
+  const attemptIds = new Map<string, string>();
+  let lifecycleOrdinal = 0;
+  const planned = new Map<string, { files: readonly string[]; ordinal: number; attemptId: string; count: number }>();
+  const runningAttempts = new Map<string, Map<number, { ordinal: number; attemptId: string | null; count: number }>>();
+  const completedAttempts = new Map<string, Map<number, {
+    attempt: import('../self-dev/shard-aggregate.js').GateShardAttempt; state: 'retry' | 'done' | 'failed';
+    at: string; ordinal: number; attemptId: string | null; count: number;
+  }>>();
+  const persist = (row: GateShardLedgerRow) => {
+    const error = appendGateShardLedgerForGate(context.path, row, context.required);
+    if (error) debug.log('self-gate', 'hq-shard-ledger-write-failed', { shardId: row.shardId, error, failClosed: false });
+    latest.set(row.shardId, row);
+  };
+  const rowFor = (shard: { id: string; files: readonly string[] }, state: GateShardLedgerRow['state'], at: string,
+    attempt?: import('../self-dev/shard-aggregate.js').GateShardAttempt): GateShardLedgerRow => {
+    const evidence = selfGateJUnitEvidence(attempt?.currentJUnit, shard.files, cwd);
+    return {
+      v: 1, runId: context.runId, invocationId: context.invocationId, entrypoint: context.entrypoint,
+      version: context.version, phase: 'cut', shardId: shard.id, files: [...shard.files], host: context.host,
+      executor: 'host', imageDigest: null, measuredImageDigest: null, currentImageDigest: null,
+      commit: context.commit, envFingerprint: context.envFingerprint, startedAt: started.get(shard.id) ?? null,
+      endedAt: attempt ? at : null, observedAt: at, state, rc: attempt?.currentExitCode ?? null,
+      pass: evidence.pass, fail: evidence.fail, errors: evidence.errors, skipped: evidence.skipped,
+      ran: evidence.ran, failureIds: evidence.failureIds, errorIds: evidence.errorIds, attribution: evidence.attribution,
+      logPath: null, junitPath: null,
+      stopReason: attempt?.currentUnmeasuredReason ?? attempt?.currentDiagnostic ?? null,
+      attemptId: attemptIds.get(shard.id) ?? null,
+    };
+  };
+  const observe = (event: ShardRunLifecycleEvent): void => {
+    const ordinal = ++lifecycleOrdinal;
+    const shardId = event.shard.id;
+    if (event.type === 'planned') {
+      const attemptId = randomUUID();
+      attemptIds.set(shardId, attemptId);
+      const prior = planned.get(shardId);
+      planned.set(shardId, { files: [...event.shard.files], ordinal, attemptId, count: (prior?.count ?? 0) + 1 });
+    }
+    if (event.type === 'running') {
+      if (attemptIds.has(shardId) && event.attempt > 1) attemptIds.set(shardId, randomUUID());
+      started.set(shardId, event.at);
+      const runs = runningAttempts.get(shardId) ?? new Map<number, { ordinal: number; attemptId: string | null; count: number }>();
+      const prior = runs.get(event.attempt);
+      runs.set(event.attempt, { ordinal, attemptId: attemptIds.get(shardId) ?? null, count: (prior?.count ?? 0) + 1 });
+      runningAttempts.set(shardId, runs);
+    }
+    if (event.type === 'attempt') {
+      const evidence = selfGateJUnitEvidence(event.attempt.currentJUnit, event.shard.files, cwd);
+      const state = event.state === 'retry' ? 'retry'
+        : event.state === 'failed' || evidence.attribution !== 'complete' || (evidence.fail ?? 0) > 0
+          || (evidence.errors ?? 0) > 0 || event.attempt.currentExitCode !== 0 || !!event.attempt.currentSignal ? 'failed' : 'done';
+      const attempts = completedAttempts.get(shardId) ?? new Map<number, {
+        attempt: import('../self-dev/shard-aggregate.js').GateShardAttempt; state: 'retry' | 'done' | 'failed';
+        at: string; ordinal: number; attemptId: string | null; count: number;
+      }>();
+      const prior = attempts.get(event.attempt.attempt);
+      attempts.set(event.attempt.attempt, { attempt: event.attempt, state, at: event.at, ordinal,
+        attemptId: attemptIds.get(shardId) ?? null, count: (prior?.count ?? 0) + 1 });
+      completedAttempts.set(shardId, attempts);
+    }
+    const row = event.type === 'planned' ? rowFor(event.shard, 'pending', event.at)
+      : event.type === 'running' ? rowFor(event.shard, 'running', event.at)
+        : rowFor(event.shard, completedAttempts.get(shardId)!.get(event.attempt.attempt)!.state, event.at, event.attempt);
+    persist(row);
+  };
+  const finish = (sharded: ShardRunResult): void => {
+    const observedAt = new Date().toISOString();
+    const rows = sharded.shards.map((shard) => {
+      const plan = planned.get(shard.id);
+      const runs = runningAttempts.get(shard.id) ?? new Map();
+      const observations = completedAttempts.get(shard.id) ?? new Map();
+      const returned = sharded.attempts.filter((candidate) => candidate.shardId === shard.id);
+      const attemptNumbers = [...new Set(returned.map((attempt) => attempt.attempt))].sort((a, b) => a - b);
+      let lifecycleComplete = !!plan && plan.count === 1 && plan.files.length === shard.files.length
+        && plan.files.every((file, index) => file === shard.files[index])
+        && returned.length > 0 && attemptNumbers.length === returned.length
+        && runs.size === attemptNumbers.length && observations.size === attemptNumbers.length;
+      if (lifecycleComplete) {
+        for (let index = 0; index < attemptNumbers.length; index++) {
+          const attemptNumber = attemptNumbers[index]!;
+          const attempt = returned.find((candidate) => candidate.attempt === attemptNumber);
+          const running = runs.get(attemptNumber);
+          const observed = observations.get(attemptNumber);
+          const previous = index > 0 ? observations.get(attemptNumbers[index - 1]!) : undefined;
+          if (attemptNumber !== index + 1 || !attempt || !running || !observed
+            || running.count !== 1 || observed.count !== 1 || !plan || running.ordinal <= plan.ordinal
+            || observed.ordinal <= running.ordinal || !running.attemptId || running.attemptId !== observed.attemptId
+            || (index === 0 && running.attemptId !== plan.attemptId)
+            || attempt.shardId !== shard.id || JSON.stringify(attempt) !== JSON.stringify(observed.attempt)
+            || (index < attemptNumbers.length - 1 && observed.state !== 'retry')
+            || (index === attemptNumbers.length - 1 && observed.state === 'retry')
+            || (index > 0 && (!previous || previous.state !== 'retry' || previous.ordinal >= running.ordinal
+              || previous.attemptId === running.attemptId))) {
+            lifecycleComplete = false;
+            break;
+          }
+        }
+      }
+      if (context.required && !lifecycleComplete) {
+        throw new Error(`remote self-gate refused: HQ shard lifecycle is incomplete (${shard.id})`);
+      }
+      const finalNumber = attemptNumbers.at(-1);
+      const observed = finalNumber === undefined ? undefined : observations.get(finalNumber);
+      const attempt = observed?.attempt ?? returned.at(-1);
+      const last = latest.get(shard.id);
+      const state = observed?.state !== 'done' || !attempt ? 'failed' : 'done';
+      const complete = rowFor(shard, state, observed?.at ?? observedAt, attempt);
+      return { ...complete, ...(last?.startedAt ? { startedAt: last.startedAt } : {}), observedAt,
+        attemptId: last?.attemptId ?? attemptIds.get(shard.id) ?? randomUUID() };
+    });
+    if (!rows.length) {
+      if (context.required) throw new Error('remote self-gate refused: HQ shard ledger has no planned shard rows');
+      return;
+    }
+    const batchId = randomUUID();
+    const error = appendGateShardLedgerBatch(context.path, rows, context.required, batchId);
+    if (error) debug.log('self-gate', 'hq-shard-ledger-batch-write-failed', { error, failClosed: false });
+    if (context.required) {
+      const persisted = readGateShardLedger(context.path);
+      if (!persisted || persisted.trailingPartial || persisted.malformed > 0 || !gateShardLedgerBatchComplete(persisted.rows, {
+        batchId, version: context.version, commit: context.commit, phase: 'cut', observedAt, shardIds: rows.map((row) => row.shardId),
+      })) throw new Error('remote self-gate refused: HQ shard ledger completed batch is not queryable');
+      onVerified?.();
+    }
+  };
+  return { observe, finish, required: context.required };
 }
 
 /** SIDE-VERIFY ③ — summary 정수 칸: 게이트가 이미 낸 `result.baseline` ⊕ `unrunImporterTotal` 을 «옮기기만» 한다.
@@ -852,6 +1091,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   const capture: GateArtifactCapture = {};
   const trainGate = options.trainGate ?? process.env.ELANOUS_TRAIN_GATE === '1';
   const result = runSelfGateCliCore(cwd, options, deps, capture, false) as SelfGateCliResult;
+  if (requiresRemoteTrainLedger(options) && !capture.hqLedgerVerified) throw new Error('remote train self-gate refused: HQ shard ledger was not verified');
   persistGateReceipt(cwd, capture, deps);
   if (options.artifactDir !== undefined) emitGateArtifacts(cwd, options.artifactDir, result, capture, deps, trainGate);
   return result;
@@ -862,6 +1102,7 @@ export async function runSelfGateCliAsync(cwd: string, options: SelfGateCliOptio
   const capture: GateArtifactCapture = {};
   const trainGate = options.trainGate ?? process.env.ELANOUS_TRAIN_GATE === '1';
   const result = await runSelfGateCliCore(cwd, options, deps, capture, true);
+  if (requiresRemoteTrainLedger(options) && !capture.hqLedgerVerified) throw new Error('remote train self-gate refused: HQ shard ledger was not verified');
   persistGateReceipt(cwd, capture, deps);
   if (options.artifactDir !== undefined) emitGateArtifacts(cwd, options.artifactDir, result, capture, deps, trainGate);
   return result;
@@ -1176,6 +1417,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
   if (options.shardConcurrency !== undefined && (!Number.isSafeInteger(options.shardConcurrency) || options.shardConcurrency < 1 || options.shardConcurrency > 4)) throw new Error('invalid shard concurrency (expected 1–4)');
   if (options.fixedShardDistribution && options.shards === undefined) throw new Error('--fixed-shard-distribution requires --shards <n>');
   const prepared = prepareGateTestSelection(cwd, options, deps);
+  const ledgerWriter = selfGateLedgerWriter(cwd, options, deps, () => { capture.hqLedgerVerified = true; });
   const { selection, lookupFailed, routeIndex, scope } = prepared;
   const expose = publicExposureFiles(selection.files).length > 0
     ? runExposeGate(cwd, selection.files, getUserConfig().harness?.exposeGate === 'strict' ? 'strict' : 'warn', deps.runCommand)
@@ -1258,6 +1500,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
   const iosPassed = runAdditionalGate('ios-gate', deps.runIosGate ?? runIosUnitTestGate, selection.files, cwd, lines);
   const pwaPassed = runAdditionalGate('pwa-gate', deps.runPwaGate ?? runPwaBuildGate, selection.files, cwd, lines);
   if (receiptDecision?.mode === 'inherit' && testFiles.length === 0 && fullTestFiles.length > 0) {
+    if (ledgerWriter?.required) throw new Error('remote train self-gate refused: inherited receipt skipped the measured shard run');
     capture.testReceiptMeasured = true;
     capture.failedTestFiles = [];
     capture.verdict = 'passed';
@@ -1277,6 +1520,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
   }
 
   if (skipTestStep) {
+    if (ledgerWriter?.required) throw new Error('remote train self-gate refused: no test shard was selected');
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     capture.testReceiptMeasured = false;
     capture.failedTestFiles = [];
@@ -1287,16 +1531,18 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
 
   // The default direct Bun path has one process and one 300s limit. Route real child/PTY tests through
   // the separated shard runner even when the caller did not request --shards.
-  if (options.shards !== undefined || testFiles.some(isGateSpawnLaneFile)) {
+  if (options.shards !== undefined || ledgerWriter?.required || testFiles.some(isGateSpawnLaneFile)) {
     const spawnFileCount = testFiles.filter(isGateSpawnLaneFile).length;
     const shardCount = options.shards ?? (Math.min(3, spawnFileCount) + Number(testFiles.length > spawnFileCount));
     const onShardComplete = shardProgressObserver(cwd, options, deps);
     const mode = { ...(options.fixedShardDistribution ? { fixedDistribution: true } : {}), onShardComplete,
+      ...(ledgerWriter ? { onShardLifecycle: ledgerWriter.observe } : {}),
       ...(options.shardConcurrency !== undefined ? { concurrency: options.shardConcurrency } : {}) };
     const runResult = asyncShards
       ? (deps.runShardsAsync ?? runShardedGateTestsAsync)(cwd, testFiles, selection.baseRef, shardCount, undefined, undefined, undefined, mode)
       : (deps.runShards ?? runShardedGateTests)(cwd, testFiles, selection.baseRef, shardCount, undefined, undefined, undefined, mode);
     const finishShardedGate = (sharded: ShardRunResult): SelfGateCliResult => {
+      ledgerWriter?.finish(sharded);
       capture.sharded = sharded;
       capture.verdict = sharded.aggregate.status;
       lines.push(`shards: ${sharded.shards.length} (${sharded.shards.map((shard) => `${shard.id}=${shard.files.join(',')}`).join('; ')})${sharded.expandedFrom !== undefined ? ` · RSS 예산상 ${sharded.expandedFrom}→${sharded.shards.length} 자동 확장` : ''}${sharded.measurementFailures ? ` · 측정 실패 ${sharded.measurementFailures}` : ''}${options.fixedShardDistribution ? ' · 고정 분배(사전 측정 없음)' : ''}${sharded.distribution === 'fixed-cap-fallback' ? ` · 호스트 상한 자동 고정 분배(${sharded.fallbackReason})` : ''}${sharded.concurrency !== undefined ? ` · 동시성 ${sharded.concurrency} (${sharded.concurrencyReason ?? 'reason unavailable'})` : ''}${sharded.measurementMs !== undefined ? ` · RSS 사전 측정 ${(sharded.measurementMs / 1000).toFixed(1)}s · 묶음 ${((sharded.bundleMs ?? 0) / 1000).toFixed(1)}s · currentΣ ${((sharded.currentProcessMs ?? 0) / 1000).toFixed(1)}s · baselineΣ ${((sharded.baselineProcessMs ?? 0) / 1000).toFixed(1)}s` : ''}`);
@@ -1382,6 +1628,7 @@ function runSelfGateCliCore(cwd: string, options: SelfGateCliOptions, deps: Self
     return runResult instanceof Promise ? runResult.then(finishShardedGate) : finishShardedGate(runResult);
   }
 
+  if (ledgerWriter?.required) throw new Error('remote train self-gate refused: execution bypassed the HQ shard ledger');
   const test = (deps.runTests ?? ((dir, files) => (deps.runCommand ?? defaultRunCommand)('bun', ['test', ...files], dir)))(cwd, testFiles);
   const worktreeLog = formatProcessOutput(test);
   Object.assign(capture, { unshardedRc: test.status, artifactsUnavailable: 'unsharded' } satisfies GateArtifactCapture);

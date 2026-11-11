@@ -2,7 +2,7 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, re
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { debug } from '../../debug/log.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import type { UserConfig } from '../../user-config/types.js';
 import { roleForKind } from '../../domains/telegram-kind-route.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';

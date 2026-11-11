@@ -17,7 +17,7 @@ import { isRescueAllowedAction } from '../steward/rescue.js';
 import { DecisionLedger, type DecisionEntry, type DecisionOption, type Recommendation } from '../decisions/decision-ledger.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { loopEvent } from '../loops/observe.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { PersonaLoopConfig, SeatLoopConfig, UserConfig } from '../user-config/types.js';
 import { checkSeatBudget, type RunningSeatPod } from '../org/seat-budget.js';
 import { DEFAULT_STALL_PARENTS, findStalls } from '../org/stall-escalation.js';

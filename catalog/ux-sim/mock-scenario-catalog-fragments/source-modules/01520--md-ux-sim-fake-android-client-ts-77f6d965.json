@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-FAKE-ANDROID-CLIENT-TS",
+  "path": "src/ux-sim/fake-android-client.ts",
+  "boundary": "Replays Android briefing, board, and approval interactions with member-scoped fakes. The Android NoteViewModel/MemberAppClient unit scenario captures its actual voice-plus-photo POST request, and a companion integration test passes that exact request through the real in-process scraps API without external HTTP or device calls.",
+  "deviceIds": ["fake-android-client"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

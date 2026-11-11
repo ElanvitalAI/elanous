@@ -26,7 +26,7 @@ describe('chat input history priority', () => {
       historyLength: 3,
       historyIdx: 1,
       keyName: 'down',
-      currentLine: '/tablet browser-preview',
+      currentLine: '/tablet status',
     })).toBe(true);
   });
 
@@ -37,7 +37,7 @@ describe('chat input history priority', () => {
       historyLength: 3,
       historyIdx: -1,
       keyName: 'up',
-      currentLine: '/tablet browser-preview',
+      currentLine: '/tablet status',
     })).toBe(false);
   });
 
@@ -59,7 +59,7 @@ describe('chat input history priority', () => {
       historyLength: 3,
       historyIdx: 0,
       keyName: 'up',
-      currentLine: '/tablet browser-preview',
+      currentLine: '/tablet status',
     })).toBe(true);
     expect(shouldPreferHistoryArrowNavigation({
       preferHistoryArrowKeys: false,
@@ -67,7 +67,7 @@ describe('chat input history priority', () => {
       historyLength: 3,
       historyIdx: 1,
       keyName: 'down',
-      currentLine: '/tablet browser-preview',
+      currentLine: '/tablet status',
     })).toBe(true);
   });
 

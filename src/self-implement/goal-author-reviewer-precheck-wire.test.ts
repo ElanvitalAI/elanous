@@ -4,8 +4,9 @@ import {
   parseGoalAuthorReviewerPrecheck,
   resolveGoalAuthorReviewerPrecheckEnabled,
   runGoalAuthorReviewerPrecheck,
+  GOAL_AUTHOR_REVIEWER_RESPONSE_FORMAT,
 } from './goal-author.js';
-import { getUserConfig, reloadUserConfig, resetUserConfig } from '../user-config.js';
+import { getUserConfig, reloadUserConfig, resetUserConfig, resolveRoleLlm } from '../user-config.js';
 import type { LLMMessage } from '../llm.js';
 import { writeAuthoredGoal } from './goal-author.js';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -129,7 +130,7 @@ describe('AUTHOR-REVIEWER-PRECHECK-WIRE', () => {
     }
   });
 
-  test('opt-in makes one pinned Terra-medium request and preserves all result arrays', async () => {
+  test('opt-in makes one review-role request and preserves all result arrays', async () => {
     let calls = 0;
     let sent: LLMMessage[] = [];
     let options: Parameters<typeof import('../llm.js').streamLLM>[2] | undefined;
@@ -142,8 +143,9 @@ describe('AUTHOR-REVIEWER-PRECHECK-WIRE', () => {
     };
     const result = await runGoalAuthorReviewerPrecheck(goalDocument(), { stream });
     expect(calls).toBe(1);
-    expect(options).toMatchObject({ model: 'gpt-6.1-terra', reasoningEffort: 'medium', usageRole: 'review', usagePhase: 'author-reviewer-precheck' });
-    expect(options?.provider?.name).toBe('openai-codex');
+    expect(options).toMatchObject({ model: resolveRoleLlm('review').model, reasoningEffort: 'medium', usageRole: 'review', usagePhase: 'author-reviewer-precheck' });
+    expect(options?.responseFormat).toEqual(GOAL_AUTHOR_REVIEWER_RESPONSE_FORMAT);
+    expect(options?.provider?.name).toBeTruthy();
     expect(String(sent[0]?.content)).toContain('Reviewable goal');
     const applied = await executeGoalAuthorReviewerPrecheck(true, goalDocument(), 'run-apply', async () => result);
     expect(applied).toMatchObject({ status: 'completed', result: { appliedFixes: ['The result has a measurable criterion and an observable source.'], unappliedItems: [] } });
@@ -384,6 +386,6 @@ describe('AUTHOR-REVIEWER-PRECHECK-WIRE', () => {
     expect(result.status).toBe('completed');
     expect(result.result?.suggestions).toEqual(['tighten boundary']);
     expect(result.result?.remainingNeedsHuman).toEqual(['confirm rollout owner']);
-    expect(events[0]?.data).toMatchObject({ model: 'gpt-6.1-terra', appliedFixCount: 1, appliedFixes: ['The result has a measurable criterion and an observable source.'], fixEvidence: [criterionEdit()], fixesResult: ['The result has a measurable criterion and an observable source.'] });
+    expect(events[0]?.data).toMatchObject({ authorRunId: 'run-4', appliedFixCount: 1, appliedFixes: ['The result has a measurable criterion and an observable source.'], fixEvidence: [criterionEdit()], fixesResult: ['The result has a measurable criterion and an observable source.'] });
   });
 });

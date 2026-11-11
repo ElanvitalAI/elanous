@@ -41,14 +41,12 @@ export function effectiveChatOnlyModeForViewport(
 const COMPACT_TIGHT_SURFACE_CATALOG_IDS = new Set<string>([
   'pane:browser',
   'pane:preview',
-  'pane:browser-preview',
   'pane:obsidian',
   'companion:clipboard',
   'companion:memo',
   'companion:detail',
   'vw:browser',
   'vw:preview',
-  'vw:browser-preview',
   'vw:sim',
 ]);
 
@@ -76,26 +74,22 @@ const SURFACE_GROUP_PRIORITY: Record<ProductCompactMode, Record<string, number>>
 const SURFACE_ITEM_PRIORITY: Record<ProductCompactMode, Record<string, number>> = {
   wide: {},
   compact: {
-    'pane:browser-preview': 0,
     'pane:browser': 1,
     'pane:preview': 2,
     'companion:clipboard': 0,
     'companion:memo': 1,
     'companion:detail': 2,
-    'vw:browser-preview': 0,
     'vw:sim': 1,
     'vw:browser': 2,
     'vw:preview': 3,
   },
   'compact-tight': {
-    'pane:browser-preview': 0,
     'pane:browser': 1,
     'pane:preview': 2,
     'pane:obsidian': 3,
     'companion:clipboard': 0,
     'companion:memo': 1,
     'companion:detail': 2,
-    'vw:browser-preview': 0,
     'vw:sim': 1,
     'vw:browser': 2,
     'vw:preview': 3,

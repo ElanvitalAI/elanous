@@ -4,11 +4,51 @@ import { createAppActions, AppActionError, handleAppActionRequest } from './app-
 import { createFakeStt } from '../../ux-sim/fake-stt.js';
 import { handleAudioStt } from '../api/audio-stt.js';
 import { fakeElevenLabsAudioBytes, startFakeElevenLabs } from '../../ux-sim/fake-elevenlabs.js';
+import type { CrawlProvider } from '../../crawl-capabilities/contracts.js';
 
 const sttDeclaration = { builtin: 'stt' as const, uses: ['cred:openai.api_key'] };
 const summaryDeclaration = { builtin: 'summarize' as const, uses: ['cred:openai.api_key'] };
 const ttsDeclaration = { builtin: 'tts' as const, uses: ['cred:elevenlabs.api_key'] };
 const generateDeclaration = { builtin: 'generate' as const, async: true, spend: 'owner-confirm', uses: ['cred:higgsfield.key_id', 'cred:higgsfield.secret'] };
+const extractDeclaration = { builtin: 'extract' as const, uses: [] };
+const translateDeclaration = { builtin: 'translate' as const, uses: ['cred:openai.api_key'] };
+
+test('KAIST extract action routes web, X and YouTube URLs through the crawl contract', async () => {
+  const called: string[] = [];
+  const fixture: CrawlProvider = {
+    id: 'fixture', provides: ['extract.structured@1'], tier: 'free', latency: 1, keyEnv: [], available: () => true,
+    run: async url => {
+      called.push(url);
+      return { engine: 'fixture', query: url, items: [{ engine: 'fixture', query: url, url, text: 'fixed article body', metadata: { title: 'Fixed title' } }], totalItems: 1 };
+    },
+  };
+  const actions = createAppActions({
+    secrets: { async resolve() { throw new Error('extract must not request a credential'); } },
+    crawlProviders: [fixture],
+  });
+  for (const url of ['https://example.test/article', 'https://x.com/lecture/status/1', 'https://www.youtube.com/watch?v=fixture']) {
+    const response = await handleAppActionRequest(new Request('http://localhost/v1/apps/lecture-scrap/actions/extract', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }),
+    }), { authorize: async () => true, getDeclaration: () => extractDeclaration, run: input => actions.run(input) });
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toMatchObject({ ok: true, url, title: 'Fixed title', provider: 'fixture' });
+  }
+  expect(called).toHaveLength(3);
+  await expect(actions.run({ appSlug: 'lecture-scrap', declaration: extractDeclaration, payload: { url: 'file:///etc/passwd' } }))
+    .rejects.toMatchObject({ code: 'invalid-input' });
+});
+
+test('KAIST extract action exposes exhausted contract and safe provider attempts', async () => {
+  const empty: CrawlProvider = { id: 'empty', provides: ['extract.structured@1'], tier: 'free', latency: 1, keyEnv: [], available: () => true,
+    run: async () => null };
+  const actions = createAppActions({ secrets: { async resolve() { throw new Error('unexpected credential'); } }, crawlProviders: [empty] });
+  const response = await handleAppActionRequest(new Request('http://localhost/v1/apps/lecture-scrap/actions/extract', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: 'https://example.test/article' }),
+  }), { authorize: () => true, getDeclaration: () => extractDeclaration, run: input => actions.run(input) });
+  expect(response?.status).toBe(502);
+  expect(await response?.json()).toMatchObject({ error: 'provider-failed', contractId: 'extract.structured@1',
+    attempts: [{ provider: 'empty-extract-structured-1', reason: 'empty' }] });
+});
 
 test('app TTS resolves only the app-attachable ElevenLabs credential and returns fake audio bytes', async () => {
   const fake = await startFakeElevenLabs({ apiKey: 'sim-elevenlabs-key' });
@@ -77,6 +117,23 @@ test('app STT action resolves a manifest credential through the boundary and use
   expect(result).toMatchObject({ text: '\uC548\uB155\uD558\uC138\uC694', language: 'ko' });
   expect(resolved).toEqual([{ appSlug: 'voice-note', reference: 'cred:openai.api_key' }]);
   expect(JSON.stringify(result)).not.toContain('sim-only-secret');
+});
+
+test('app translate action uses the credential boundary and passes source and target languages', async () => {
+  const resolved: Array<{ appSlug: string; reference: string }> = [];
+  const calls: Array<{ text: string; sourceLanguage: string; targetLanguage: string; apiKey: string }> = [];
+  const actions = createAppActions({
+    secrets: { async resolve(input) { resolved.push(input); return 'sim-only-secret'; } },
+    translate: async input => { calls.push(input); return 'Hello there'; },
+  });
+  const result = await actions.run({ appSlug: 'translator', declaration: translateDeclaration,
+    payload: { text: '안녕하세요', sourceLanguage: '한국어', targetLanguage: 'English' } });
+  expect(result).toEqual({ text: 'Hello there' });
+  expect(calls).toEqual([{ text: '안녕하세요', sourceLanguage: '한국어', targetLanguage: 'English', apiKey: 'sim-only-secret' }]);
+  expect(resolved).toEqual([{ appSlug: 'translator', reference: 'cred:openai.api_key' }]);
+  expect(JSON.stringify(result)).not.toContain('sim-only-secret');
+  await expect(actions.run({ appSlug: 'translator', declaration: translateDeclaration,
+    payload: { text: 'hello', sourceLanguage: 'English' } })).rejects.toMatchObject({ code: 'invalid-input' });
 });
 
 test('summarize action uses injected provider and never returns credential material', async () => {

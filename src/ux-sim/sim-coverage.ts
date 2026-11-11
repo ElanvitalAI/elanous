@@ -4,6 +4,7 @@ import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { getTestStateRoot } from '../nexus/paths.js';
 import { loadMockScenarioCatalog, type MockScenarioCatalog } from './mock-scenario-catalog.js';
 import { requestMockDevice } from './mock-device-requests.js';
+import { deviceFidelityStatus } from './device-fidelity.js';
 
 const COVERAGE_FORMAT = 1;
 const EVENT_ALIASES: Record<string, string> = { 'dead-pid-lock': 'EV-0042', 'host-reboot': 'EV-0107' };
@@ -16,6 +17,8 @@ export interface SimCoverageReceipt {
   scenarioId: string;
   completedAt: string;
   pass: boolean;
+  verdict?: 'green' | 'yellow' | 'red';
+  recordingIds?: string[];
   codePathCoveragePercent: number;
   codePaths: string[];
   eventKinds: string[];
@@ -126,8 +129,10 @@ function makeReceipt(input: {
   world: CoverageWorld;
   deviceIds: string[];
   pass: boolean;
+  verdict?: 'green' | 'yellow' | 'red';
   scenarioFile: string;
   observations: Array<{ event: string; verdict: string }>;
+  recordingIds?: string[];
   now: Date;
   repoRoot: string;
   catalog: MockScenarioCatalog;
@@ -149,6 +154,8 @@ function makeReceipt(input: {
     scenarioId,
     completedAt: input.now.toISOString(),
     pass: input.pass,
+    ...(input.verdict ? { verdict: input.verdict } : {}),
+    ...(input.recordingIds?.length ? { recordingIds: [...new Set(input.recordingIds)].sort() } : {}),
     codePaths: [...paths].sort(),
     eventKinds,
     eventIds,
@@ -165,7 +172,9 @@ function validateReceipt(value: unknown, path: string): SimCoverageReceipt {
     || !Array.isArray(row.codePaths)
     || row.codePaths.some((entry) => typeof entry !== 'string') || !Array.isArray(row.eventKinds)
     || row.eventKinds.some((entry) => typeof entry !== 'string') || !Array.isArray(row.eventIds)
-    || row.eventIds.some((entry) => typeof entry !== 'string') || !Array.isArray(row.devices)) {
+    || row.eventIds.some((entry) => typeof entry !== 'string') || !Array.isArray(row.devices)
+    || (row.recordingIds !== undefined && (!Array.isArray(row.recordingIds) || row.recordingIds.some((id) => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id))))
+    || (row.verdict !== undefined && !['green', 'yellow', 'red'].includes(String(row.verdict)))) {
     throw new Error('sim coverage receipt is invalid: ' + path);
   }
   const devices = row.devices.map((entry) => {
@@ -180,6 +189,8 @@ function validateReceipt(value: unknown, path: string): SimCoverageReceipt {
     format: COVERAGE_FORMAT, runId: row.runId, worldId: row.worldId, scenarioId: row.scenarioId,
     completedAt: row.completedAt, codePathCoveragePercent: row.codePathCoveragePercent,
     pass: row.pass,
+    ...(row.verdict ? { verdict: row.verdict as SimCoverageReceipt['verdict'] } : {}),
+    ...(Array.isArray(row.recordingIds) ? { recordingIds: row.recordingIds as string[] } : {}),
     codePaths: row.codePaths as string[], eventKinds: row.eventKinds as string[],
     eventIds: row.eventIds as string[], devices,
   };
@@ -217,6 +228,11 @@ function persistReceipt(directory: string, receipt: SimCoverageReceipt): void {
 function percent(covered: number, total: number): number { return total === 0 ? 100 : Math.round((covered / total) * 10000) / 100; }
 
 function makeReport(receipts: SimCoverageReceipt[], catalog: MockScenarioCatalog): SimCoverageReport {
+  receipts = receipts.map((receipt) => {
+    if (!receipt.pass || !receipt.recordingIds?.length) return receipt;
+    const comparison = deviceFidelityStatus('fake-llm', receipt.recordingIds);
+    return comparison.verdict === 'yellow' ? { ...receipt, pass: false, verdict: 'yellow' } : receipt;
+  });
   const allPaths = new Map<string, Set<string>>();
   for (const module of catalog.sourceModules) {
     const path = module.path;
@@ -268,8 +284,10 @@ export function recordSimWorldCoverage(input: {
   world: CoverageWorld;
   deviceIds: string[];
   pass: boolean;
+  verdict?: 'green' | 'yellow' | 'red';
   scenarioFile: string;
   observations: Array<{ event: string; verdict: string }>;
+  recordingIds?: string[];
   now?: () => Date;
   repoRoot?: string;
   catalog?: MockScenarioCatalog;

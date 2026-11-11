@@ -169,10 +169,21 @@ describe('runNexus status health wiring', () => {
         proxyRequests++;
         return new Response(null, { status: 403 });
       } });
-      const server = Bun.serve({ hostname: host, port: 0, fetch: () => {
+      const serve = (bindHost: string) => Bun.serve({ hostname: bindHost, port: 0, fetch: () => {
         localRequests++;
         return new Response(null, { status: 204 });
       } });
+      // Some macOS hosts do not assign 127.0.0.2. A wildcard listener owns
+      // the selected port on every local address, preventing another .2
+      // listener from turning the unreachable probe into a false success.
+      let expectedUnreachable = false;
+      let server: ReturnType<typeof serve>;
+      try { server = serve(host); }
+      catch (error) {
+        if (host !== '127.0.0.2') throw error;
+        expectedUnreachable = true;
+        server = serve('0.0.0.0');
+      }
       try {
         setProxyEnv(`http://127.0.0.1:${proxy.port}`);
         writeLiveLock();
@@ -180,9 +191,10 @@ describe('runNexus status health wiring', () => {
         const fetchSpy = spyOn(globalThis, 'fetch');
         await runNexus({ status: true });
         expect(fetchSpy).not.toHaveBeenCalled();
-        expect(localRequests).toBe(1);
+        expect(localRequests).toBe(expectedUnreachable ? 0 : 1);
         expect(proxyRequests).toBe(0);
-        expect(output).toContain('  status    alive (pid=' + process.pid + ' host=' + hostname() + ' since=2026-08-13T00:00:00.000Z)');
+        const status = expectedUnreachable ? 'http health unknown' : 'alive';
+        expect(output).toContain('  status    ' + status + ' (pid=' + process.pid + ' host=' + hostname() + ' since=2026-08-13T00:00:00.000Z)');
       } finally {
         server.stop(true);
         proxy.stop(true);

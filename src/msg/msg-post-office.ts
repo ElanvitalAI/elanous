@@ -11,9 +11,22 @@
 // ⛔ 시험 우주에서는 실제 프로세스를 띄우지 않는다 — `ELANOUS_MSG_SSE_LIVE=1` 로만 연다(격리 실물 시험용).
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
 
+import { ResourceLedger } from '../control-plane/ledger.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
+import { withFileLockSync } from '../storage/file-lock.js';
+
+const RESOURCE_ID = 'instance:msg-sse';
+const STANDALONE_OWNER = 'msg-sse';
+const RESIDENT_OWNER = 'msg-sse-resident';
+// Source: the resident post office refreshes its control resource entry every minute; five minutes tolerates short stalls.
+const RESOURCE_TTL_MS = 5 * 60_000;
+const RESOURCE_REFRESH_MS = 60_000;
+const refreshTimers = new Map<string, ReturnType<typeof setInterval>>();
+const standaloneRefreshTimers = new Map<string, { pid: number; port: number; timer: ReturnType<typeof setInterval> }>();
 
 export interface PostOfficeInfo {
   /** Loopback port the SSE service answers on. */
@@ -34,8 +47,21 @@ export function postOfficeFile(stateRoot: string): string {
   return join(stateRoot, 'msg', 'sse.json');
 }
 
+function controlPostOffice(stateRoot: string, includeExpired = false): { info: PostOfficeInfo; resident: boolean; owner: string } | null {
+  const record = new ResourceLedger(stateRoot).list({ kind: 'instance', name: 'msg-sse' })
+    .find((row) => row.id === RESOURCE_ID && [STANDALONE_OWNER, RESIDENT_OWNER].includes(row.owner) && (includeExpired || !row.expired));
+  if (!record) return null;
+  const { port, pid, resident } = record.attrs;
+  if (typeof port !== 'number' || !Number.isSafeInteger(port) || port < 1 || port > 65535
+    || typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid < 1
+    || record.endpoint !== `http://127.0.0.1:${port}`) return null;
+  return { info: { port, pid, url: record.endpoint }, resident: record.owner === RESIDENT_OWNER || resident === true, owner: record.owner };
+}
+
 /** The recorded service, or null when nothing registered one — 파일이 없으면 «모름»이지 «서비스 없음»의 측정이 아니다. */
 export function readPostOffice(stateRoot: string): PostOfficeInfo | null {
+  try { const control = controlPostOffice(stateRoot); if (control) return control.info; }
+  catch { /* A missing or unreadable control ledger leaves the legacy discovery line available. */ }
   let raw: unknown;
   try { raw = JSON.parse(readFileSync(postOfficeFile(stateRoot), 'utf8')); }
   catch { return null; }
@@ -46,34 +72,142 @@ export function readPostOffice(stateRoot: string): PostOfficeInfo | null {
   return { port, pid, url: `http://127.0.0.1:${port}` };
 }
 
+/** A live registered owner prevents Nexus from starting a competing resident listener. */
+export function livePostOffice(stateRoot: string): PostOfficeInfo | null {
+  const info = readPostOffice(stateRoot);
+  return info && pidAlive(info.pid) ? info : null;
+}
+
 /** Called by `msg serve --sse` right after the service binds its port. */
-export function writePostOffice(stateRoot: string, info: { port: number; pid?: number }): PostOfficeInfo {
+export function writePostOffice(stateRoot: string, info: { port: number; pid?: number; refreshMs?: number }): PostOfficeInfo {
   const path = postOfficeFile(stateRoot);
   mkdirSync(dirname(path), { recursive: true });
   const value: PostOfficeInfo = { port: info.port, pid: info.pid ?? process.pid, url: `http://127.0.0.1:${info.port}` };
-  writeFileSync(path, `${JSON.stringify(value)}\n`);
-  return value;
+  const owner = STANDALONE_OWNER;
+  const publish = () => new ResourceLedger(stateRoot).register({
+    id: RESOURCE_ID, kind: 'instance', machine: hostname(), name: 'msg-sse', owner,
+    endpoint: value.url, attrs: { port: value.port, pid: value.pid, resident: false }, observedAt: Date.now(), ttlMs: RESOURCE_TTL_MS,
+  }, owner);
+  const registered = withFileLockSync(join(stateRoot, 'msg', 'sse-registration.lock'), () => {
+    let current: ReturnType<typeof controlPostOffice>;
+    try { current = controlPostOffice(stateRoot); }
+    catch { current = null; }
+    if (current && (current.info.pid !== value.pid || current.info.port !== value.port) && pidAlive(current.info.pid)) {
+      return current.info;
+    }
+    try {
+      const ledger = new ResourceLedger(stateRoot);
+      const previous = ledger.list({ kind: 'instance', name: 'msg-sse' }).find((row) => row.id === RESOURCE_ID);
+      if (previous && ![STANDALONE_OWNER, RESIDENT_OWNER].includes(previous.owner))
+        throw new Error('post office resource owned by another service');
+      if (previous && previous.owner !== owner) ledger.delete(RESOURCE_ID, previous.owner);
+      publish();
+    }
+    catch {
+      // A resident may have taken the ledger lock after our first read.
+      try { const winner = controlPostOffice(stateRoot); if (winner?.resident) return winner.info; }
+      catch { /* Standalone service keeps the legacy discovery line when the ledger is unavailable. */ }
+    }
+    writeFileSync(path, `${JSON.stringify(value)}\n`);
+    return value;
+  }, { breakDeadHolder: true });
+  if (registered.port !== value.port || registered.pid !== value.pid) return registered;
+  if (value.pid === process.pid) {
+    const old = standaloneRefreshTimers.get(stateRoot);
+    if (old) clearInterval(old.timer);
+    const timer = setInterval(() => {
+      try {
+        const current = controlPostOffice(stateRoot, true);
+        if (current?.owner !== STANDALONE_OWNER || current.info.pid !== value.pid || current.info.port !== value.port) {
+          clearInterval(timer);
+          standaloneRefreshTimers.delete(stateRoot);
+          return;
+        }
+        new ResourceLedger(stateRoot).heartbeat(RESOURCE_ID, STANDALONE_OWNER);
+      } catch { /* A transient ledger failure retries on the next tick. */ }
+    }, info.refreshMs ?? RESOURCE_REFRESH_MS);
+    timer.unref();
+    standaloneRefreshTimers.set(stateRoot, { pid: value.pid, port: value.port, timer });
+  }
+  return registered;
+}
+
+/** Publish a Nexus resident under the ledger's own lock, fencing older writer heartbeats during handoff. */
+export async function writeResidentPostOffice(stateRoot: string, info: { port: number; pid?: number }): Promise<PostOfficeInfo> {
+  const value: PostOfficeInfo = { port: info.port, pid: info.pid ?? process.pid, url: `http://127.0.0.1:${info.port}` };
+  const ledger = new ResourceLedger(stateRoot);
+  const registered = await ledger.withSerializedMutation(() => {
+    const control = controlPostOffice(stateRoot);
+    const current = control?.info ?? readPostOffice(stateRoot);
+    if (current && (current.pid !== value.pid || current.port !== value.port) && pidAlive(current.pid)) {
+      return current;
+    }
+    const previous = ledger.list({ kind: 'instance', name: 'msg-sse' }).find((row) => row.id === RESOURCE_ID);
+    if (previous && ![STANDALONE_OWNER, RESIDENT_OWNER].includes(previous.owner))
+      throw new Error('post office resource owned by another service');
+    if (previous && previous.owner !== RESIDENT_OWNER) ledger.delete(RESOURCE_ID, previous.owner);
+    ledger.register({ id: RESOURCE_ID, kind: 'instance', machine: hostname(), name: 'msg-sse', owner: RESIDENT_OWNER,
+      endpoint: value.url, attrs: { port: value.port, pid: value.pid, resident: true }, observedAt: Date.now(), ttlMs: RESOURCE_TTL_MS,
+    }, RESIDENT_OWNER);
+    mkdirSync(dirname(postOfficeFile(stateRoot)), { recursive: true });
+    writeFileSync(postOfficeFile(stateRoot), `${JSON.stringify(value)}\n`);
+    return value;
+  });
+  if (registered.port === value.port && registered.pid === value.pid) {
+    const oldTimer = refreshTimers.get(stateRoot);
+    if (oldTimer) clearInterval(oldTimer);
+    const timer = setInterval(() => {
+      try { ledger.heartbeat(RESOURCE_ID, RESIDENT_OWNER); }
+      catch { /* A later heartbeat retries while discovery still has its TTL. */ }
+    }, RESOURCE_REFRESH_MS);
+    timer.unref();
+    refreshTimers.set(stateRoot, timer);
+  }
+  return registered;
 }
 
 /** Called when the service stops — only the writer's own line is removed, never a newer one. */
-export function clearPostOffice(stateRoot: string, pid: number = process.pid): boolean {
-  const current = readPostOffice(stateRoot);
-  if (current !== null && current.pid !== pid) return false;
-  try { rmSync(postOfficeFile(stateRoot), { force: true }); return true; }
-  catch { return false; }
+export function clearPostOffice(stateRoot: string, pid: number = process.pid, port?: number): boolean {
+  mkdirSync(join(stateRoot, 'msg'), { recursive: true });
+  return withFileLockSync(join(stateRoot, 'msg', 'sse-registration.lock'), () => {
+    const current = readPostOffice(stateRoot);
+    if (current !== null && (current.pid !== pid || (port !== undefined && current.port !== port))) return false;
+    const timer = refreshTimers.get(stateRoot);
+    if (timer) { clearInterval(timer); refreshTimers.delete(stateRoot); }
+    const standaloneTimer = standaloneRefreshTimers.get(stateRoot);
+    if (standaloneTimer?.pid === pid && (port === undefined || standaloneTimer.port === port)) {
+      clearInterval(standaloneTimer.timer);
+      standaloneRefreshTimers.delete(stateRoot);
+    }
+    try {
+      const owned = controlPostOffice(stateRoot, true);
+      if (owned && owned.info.pid === pid && (port === undefined || owned.info.port === port))
+        new ResourceLedger(stateRoot).delete(RESOURCE_ID, owned.owner);
+    }
+    catch { /* The resource entry may already have expired or been removed. */ }
+    try { rmSync(postOfficeFile(stateRoot), { force: true }); return true; }
+    catch { return false; }
+  }, { breakDeadHolder: true });
 }
 
 function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-/** Any HTTP answer (401 included) means the service is listening; silence means it is gone. */
+/** Only the resident SSE service's health signature counts; another listener on the port is not discovery. */
 async function probePostOffice(url: string): Promise<boolean> {
   try {
-    const response = await fetch(`${url}/stream`, { signal: AbortSignal.timeout(500) });
+    const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(500) });
     try { await response.body?.cancel(); } catch { /* body already closed */ }
-    return true;
+    return response.status === 204 && response.headers.get('x-elanous-service') === 'msg-sse';
   } catch { return false; }
+}
+
+/** Read-only discovery seam for `msg watch`; the CLI may pass this URL to its existing SSE branch. */
+export async function discoverPostOfficeUrl(stateRoot: string = elanousStateRoot()): Promise<string | null> {
+  const info = readPostOffice(stateRoot);
+  if (!info || !pidAlive(info.pid) || !await probePostOffice(info.url)) return null;
+  return info.url;
 }
 
 function liveUniverse(): boolean {

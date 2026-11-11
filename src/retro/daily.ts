@@ -18,7 +18,7 @@ import { dirname, join, resolve } from 'node:path';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 import { spawnElanousSync } from '../instance/spawn-elanous.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { debug } from '../debug/log.js';
 
 export const RETRO_DAILY_GRAPH_ID = 'retro-daily';

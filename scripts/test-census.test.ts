@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { caseFor, numericCandidateEvidence, sourcePathFor } from './test-census';
+import { caseFor, numericCandidateEvidence, renderTestCensus, sourcePathFor } from './test-census';
+import { createCensusOracleAxisWorld } from '../src/ux-sim/census-oracle-axis-world';
 
 function git(cwd: string, ...args: string[]): string {
   const env = { ...process.env, GIT_AUTHOR_NAME: 'Census simulation', GIT_AUTHOR_EMAIL: 'census@example.invalid', GIT_COMMITTER_NAME: 'Census simulation', GIT_COMMITTER_EMAIL: 'census@example.invalid' };
@@ -14,6 +15,83 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 describe('test census source attribution', () => {
+  it('reports only declared, asserted oracle axes for uniquely matched JUnit cases in every format', () => {
+    const world = createCensusOracleAxisWorld();
+    try {
+      world.writeSource([
+        '// @oracle-axis X2:I1 X3:I4',
+        "test('resume preserves terminal and graph state', () => { expect(true).toBe(true); });",
+        '// @oracle-axis X4:I5',
+        "test('declaration without a verdict', () => { const observed = true; });",
+        '// @oracle-axis X4:I5',
+        "test('ordinary method is not a verdict', () => { new Date().toISOString(); });",
+        '// @oracle-axis X4:I5',
+        "test('expect object method is not a verdict', () => { expect.toString(); });",
+        '// @oracle-axis X4:I5',
+        "test('uncalled helper is not a verdict', () => { const helper = () => expect(true).toBe(true); });",
+        '// @oracle-axis X4:I5',
+        "test('assert object method is not a verdict', () => { assert.toString(); });",
+        '// @oracle-axis X4:I5',
+        "test('uncalled object method is not a verdict', () => { const helper = { check() { expect(true).toBe(true); } }; });",
+        '// @oracle-axis X4:I5',
+        "test('invoked callback is a verdict', () => { [true].forEach(value => expect(value).toBe(true)); });",
+        '// @oracle-axis X4:I5',
+        "test('empty callback is not a verdict', () => { [].forEach(value => expect(value).toBe(true)); });",
+        '// @oracle-axis X4:I5',
+        "test('immediate function is a verdict', () => { (() => expect(true).toBe(true))(); });",
+        '// @oracle-axis X4:I5',
+        "test('failed before verdict', () => { expect(true).toBe(true); });",
+        '// @oracle-axis X4:I5',
+        '// unrelated comment',
+        "test('stale annotation is not coverage', () => { expect(true).toBe(true); });",
+        '// @oracle-axis X4:I5',
+        '',
+        "test('separated annotation is not coverage', () => { expect(true).toBe(true); });",
+        '// @oracle-axis X4:I5',
+        "test('custom matcher is a verdict', () => { expect(true).toPass(); });",
+        '// @oracle-axis X2:I1',
+        "test.skip('declared but skipped', () => { expect(true).toBe(true); });",
+        "test('unclassified assertion', () => { expect(true).toBe(true); });",
+      ].join('\n'));
+      const args = [world.gateDir, '--source-root', world.root];
+      const json = JSON.parse(renderTestCensus([...args, '--format', 'json'])) as { rows: Array<{ name: string; oracleAxes: string[] | null }> };
+      const byName = new Map(json.rows.map((row) => [row.name, row.oracleAxes]));
+      expect(byName.get('resume preserves terminal and graph state')).toEqual(['X2:I1', 'X3:I4']);
+      expect(byName.get('declaration without a verdict')).toEqual([]);
+      expect(byName.get('ordinary method is not a verdict')).toEqual([]);
+      expect(byName.get('expect object method is not a verdict')).toEqual([]);
+      expect(byName.get('uncalled helper is not a verdict')).toEqual([]);
+      expect(byName.get('assert object method is not a verdict')).toEqual([]);
+      expect(byName.get('uncalled object method is not a verdict')).toEqual([]);
+      expect(byName.get('invoked callback is a verdict')).toEqual(['X4:I5']);
+      expect(byName.get('empty callback is not a verdict')).toEqual([]);
+      expect(byName.get('immediate function is a verdict')).toEqual(['X4:I5']);
+      expect(byName.get('failed before verdict')).toBeNull();
+      expect(byName.get('stale annotation is not coverage')).toEqual([]);
+      expect(byName.get('separated annotation is not coverage')).toEqual([]);
+      expect(byName.get('custom matcher is a verdict')).toEqual(['X4:I5']);
+      expect(byName.get('declared but skipped')).toBeNull();
+      expect(byName.get('unclassified assertion')).toEqual([]);
+      expect(byName.get('unmatched name')).toBeNull();
+      expect(byName.get('missing source')).toBeNull();
+      const tsv = renderTestCensus([...args, '--format', 'tsv']);
+      expect(tsv.split('\n')[1]).toContain('oracleAxes');
+      expect(tsv).toContain('X2:I1,X3:I4');
+      const markdown = renderTestCensus([...args, '--format', 'markdown']);
+      expect(markdown).toContain('판정 오라클 축');
+      expect(markdown).toContain('X2:I1, X3:I4');
+      expect(markdown).toContain('미확인');
+    } finally { world.dispose(); }
+  });
+
+  it('rejects a declared axis and invariant pair absent from the RFC mapping', () => {
+    const world = createCensusOracleAxisWorld();
+    try {
+      world.writeSource("// @oracle-axis X4:I2\ntest('resume preserves terminal and graph state', () => { expect(true).toBe(true); });\n");
+      expect(() => renderTestCensus([world.gateDir, '--source-root', world.root, '--format', 'json'])).toThrow('invalid oracle axis X4:I2');
+    } finally { world.dispose(); }
+  });
+
   it('simulates expected-value provenance from the literal through blame to the commit rationale', () => {
     const repo = mkdtempSync(join(tmpdir(), 'test-census-numeric-provenance-'));
     try {
@@ -29,6 +107,28 @@ describe('test census source attribution', () => {
         { literal: '5', line: 3, blameCommit: commit, reason: 'Cap retries at the remote quota\n\nReason: the provider rejects a fifth attempt in one window.' },
       ]);
     } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('attributes through a symlink alias but leaves a missing source unknown', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'test-census-source-real-'));
+    const alias = `${repo}-alias`;
+    try {
+      git(repo, 'init', '-q', '-b', 'main');
+      writeFileSync(join(repo, 'quota.test.ts'), 'expect(retries).toBe(4);\n');
+      git(repo, 'add', 'quota.test.ts');
+      git(repo, 'commit', '-q', '-m', 'Cap retries at four');
+      const commit = git(repo, 'rev-parse', 'HEAD').trim();
+      symlinkSync(repo, alias, 'dir');
+      expect(numericCandidateEvidence(join(alias, 'quota.test.ts'), [{ literal: '4', line: 1 }], realpathSync(repo))).toEqual([
+        { literal: '4', line: 1, blameCommit: commit, reason: 'Cap retries at four' },
+      ]);
+      expect(numericCandidateEvidence(join(alias, 'missing.test.ts'), [{ literal: '4', line: 1 }], repo)).toEqual([
+        { literal: '4', line: 1, blameCommit: null, reason: null },
+      ]);
+    } finally {
+      rmSync(alias, { force: true });
       rmSync(repo, { recursive: true, force: true });
     }
   });

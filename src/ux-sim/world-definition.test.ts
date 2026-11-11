@@ -45,9 +45,9 @@ events:
   expect(node.metadata.labels).toMatchObject({ 'kubernetes.io/arch': 'amd64', 'elanous.dev/pools': 'gate' });
   const github = devices.get('fake-gh') as { prs: unknown[] };
   expect(github.prs).toHaveLength(2);
-  const llm = devices.get('fake-llm') as { config: unknown; response(): string };
+  const llm = devices.get('fake-llm') as { config: unknown; response(): Promise<string> };
   expect(llm.config).toEqual(spec.providers);
-  expect(llm.response()).toContain('test-fake-llm');
+  expect(await llm.response()).toContain('test-fake-llm');
   const clock = devices.get('fake-clock') as { start: string; speed: number; withClock: typeof withSimClock };
   expect(clock).toMatchObject({ start: '2026-11-01T18:00:00+09:00', speed: 600 });
   expect(await clock.withClock(new Date(clock.start), (simClock) => simClock.now())).toBe(Date.parse(clock.start));

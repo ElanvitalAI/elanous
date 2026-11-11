@@ -6,6 +6,8 @@ import { resolve } from 'node:path';
 export interface MockScenarioDevice {
   id: string;
   name: string;
+  audience: 'user' | 'internal';
+  defaultProfile?: MockScenarioSafeDefaultProfile;
   /** Checklist requests this device explicitly covers. */
   checklistCells?: string[];
   implementation: string[];
@@ -18,6 +20,29 @@ export interface MockScenarioDevice {
   eventNames: string[];
   recentUse: { observedAt: string; runId: string; event: string; scenarioId: string; command: string } | null;
 }
+
+/** Declarative package defaults only; an execution runtime must enforce these policies separately. */
+export interface MockScenarioSafeDefaultProfile {
+  credentials: 'fake-only';
+  network: 'loopback-only';
+  storage: 'temporary';
+}
+
+export interface MockScenarioUserPackageDevice {
+  id: string;
+  name: string;
+  implementation: string[];
+  eventNames: string[];
+  defaultProfile: MockScenarioSafeDefaultProfile;
+  decisionCases: string[];
+  scenarios: Array<Pick<MockScenarioEntry, 'id' | 'name' | 'kind' | 'trigger' | 'observe' | 'expected'>>;
+}
+
+const SAFE_USER_DEFAULT_PROFILE: MockScenarioSafeDefaultProfile = Object.freeze({
+  credentials: 'fake-only',
+  network: 'loopback-only',
+  storage: 'temporary',
+});
 
 /** File-level inventory backing the grouped, runnable device records above. */
 export interface MockScenarioSourceModule {
@@ -143,6 +168,10 @@ export function parseMockScenarioCatalog(value: unknown): MockScenarioCatalog {
     return {
       id: requireString(row.id, `devices[${index}].id`),
       name: requireString(row.name, `devices[${index}].name`),
+      audience: parseDeviceAudience(row.audience, `devices[${index}].audience`),
+      ...(row.audience === 'user'
+        ? { defaultProfile: parseSafeDefaultProfile(row.defaultProfile, `devices[${index}].defaultProfile`) }
+        : {}),
       ...(checklistCells ? { checklistCells } : {}),
       implementation: requireStringArray(row.implementation, `devices[${index}].implementation`),
       tests: requireStringArray(row.tests, `devices[${index}].tests`),
@@ -396,6 +425,30 @@ export function loadMockScenarioCatalog(): MockScenarioCatalog {
   return loadMockScenarioCatalogFromRoot(fileURLToPath(new URL('../..', import.meta.url)));
 }
 
+/** User package projection reuses catalog-backed implementations and scenario contracts. */
+export function buildMockScenarioUserPackage(catalog: MockScenarioCatalog): MockScenarioUserPackageDevice[] {
+  const userDevices = catalog.devices.filter((device) => device.audience === 'user');
+  return userDevices.map((device) => {
+    if (!device.defaultProfile) throw new Error(`user device ${device.id} has no safe default profile`);
+    const defaultProfile = parseSafeDefaultProfile(device.defaultProfile, `devices.${device.id}.defaultProfile`);
+    return {
+      id: device.id,
+      name: device.name,
+      implementation: [...device.implementation],
+      eventNames: [...device.eventNames],
+      defaultProfile: {
+        credentials: defaultProfile.credentials,
+        network: defaultProfile.network,
+        storage: defaultProfile.storage,
+      },
+      decisionCases: [...device.observations],
+      scenarios: catalog.scenarios.filter((scenario) => scenario.device === device.id).map(({ id, name, kind, trigger, observe, expected }) => ({
+        id, name, kind, trigger, observe: [...observe], expected,
+      })),
+    };
+  });
+}
+
 export function renderMockScenarioList(catalog: MockScenarioCatalog): string[] {
   const reviewedRows = catalog.candidateAudit.sourceRows + catalog.candidateAudit.catalogAdditions.length;
   const reviewedPaths = catalog.candidateAudit.existingPaths + catalog.candidateAudit.catalogAdditions.length;
@@ -468,6 +521,23 @@ function parseLogsRecorded(value: unknown, path: string): MockScenarioDevice['lo
   const result = requireString(value, path);
   if (!['yes', 'no', 'conditional', 'runner-dependent'].includes(result)) throw new Error(`${path} is unknown: ${result}`);
   return result as MockScenarioDevice['logsRecorded'];
+}
+
+function parseDeviceAudience(value: unknown, path: string): MockScenarioDevice['audience'] {
+  if (value === undefined) return 'internal';
+  if (value !== 'user' && value !== 'internal') throw new Error(`${path} must be user or internal`);
+  return value;
+}
+
+function parseSafeDefaultProfile(value: unknown, path: string): MockScenarioSafeDefaultProfile {
+  if (!isRecord(value)
+    || value.credentials !== 'fake-only'
+    || value.network !== 'loopback-only'
+    || value.storage !== 'temporary'
+    || Object.keys(value).some((key) => !['credentials', 'network', 'storage'].includes(key))) {
+    throw new Error(`${path} must be the secret-free fake-only, loopback-only, temporary profile`);
+  }
+  return { ...SAFE_USER_DEFAULT_PROFILE };
 }
 
 function parseRecentUse(value: unknown, path: string): MockScenarioDevice['recentUse'] {

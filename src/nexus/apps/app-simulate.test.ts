@@ -65,6 +65,15 @@ describe('SIMKIT-APP-YAML-SIMULATE', () => {
     ]));
   });
 
+  test('accepts app action input and rejects malformed input maps', () => {
+    const simulation = { scenarios: [{ name: 'summary', steps: [{ action: 'summarize', as: 'viewer', input: { text: 'hello' } }],
+      expect: [{ event: 'action.summarize.completed' }] }] };
+    const validation = { actions: ['summarize'], roles: ['owner', 'viewer'] };
+    expect(validateAppSimulation(simulation, validation)).toEqual([]);
+    expect(validateAppSimulation({ scenarios: [{ ...simulation.scenarios[0]!, steps: [{ action: 'summarize', input: [] }] }] },
+      validation).map(issue => issue.path)).toContain('/simulate/scenarios/0/steps/0/input');
+  });
+
   test('rejects credentials, URLs, and account fields without echoing supplied values', () => {
     const secret = 'sk-private-should-not-appear';
     const result = validateAppSimulation({ connectors: { payment: { fake: 'payment', apiKey: secret } }, note: 'https://example.invalid' });

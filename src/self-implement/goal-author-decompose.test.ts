@@ -7,7 +7,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetLiveDetailCacheForTesting, writeLiveDetail } from '../live/detail-switch.js';
-import { setUserConfigOverlay } from '../user-config.js';
+import { resolveRoleLlm, setUserConfigOverlay } from '../user-config.js';
 import { parseAskTargetPathHintsResult } from '../self-dev/launch-preflight-text.js';
 import { composeSliceHandText } from '../task-agent/tier-split.js';
 
@@ -930,9 +930,9 @@ describe('AUTHOR-DECOMPOSE-KNOB planning LLM selection', () => {
       expect(streamLlmCalls.length).toBe(2);
       const [decomposeCall, criticCall] = streamLlmCalls;
       expect(decomposeCall?.messages).toEqual([{ role: 'user', content: 'DECOMPOSE PROMPT MARKER' }]);
-      expect(decomposeCall?.opts).toStrictEqual({ model: 'planning-knob-model', reasoningEffort: 'medium' });
+      expect(decomposeCall?.opts).toMatchObject({ model: 'planning-knob-model', reasoningEffort: 'medium', usageRole: 'planning', usagePhase: 'goal-author-decompose' });
       expect(criticCall?.messages).toEqual([{ role: 'user', content: 'CRITIC PROMPT MARKER' }]);
-      expect(criticCall?.opts).toStrictEqual({ model: 'planning-knob-model', reasoningEffort: 'medium' });
+      expect(criticCall?.opts).toMatchObject({ model: 'planning-knob-model', reasoningEffort: 'medium', usageRole: 'planning', usagePhase: 'goal-author-decompose' });
     } finally {
       captureStreamLlm = false;
       decomposeCallablePrompt = undefined;
@@ -966,7 +966,7 @@ describe('AUTHOR-DECOMPOSE-KNOB planning LLM selection', () => {
       expect(steps).toEqual(originalSteps);
       expect(streamLlmCalls.length).toBe(2);
       for (const call of streamLlmCalls) {
-        expect(call.opts).toStrictEqual({ reasoningEffort: 'high' });
+        expect(call.opts).toMatchObject({ model: resolveRoleLlm('planning').model, reasoningEffort: 'high', usageRole: 'planning' });
       }
     } finally {
       captureStreamLlm = false;
@@ -996,7 +996,7 @@ describe('AUTHOR-DECOMPOSE-KNOB planning LLM selection', () => {
       await createGoalAuthorDecomposeSteps(undefined, { adversarialReview: true })('implement a robust goal author seam');
       expect(streamLlmCalls.length).toBe(2);
       for (const call of streamLlmCalls) {
-        expect(call.opts).toStrictEqual({ model: 'env-knob-model', reasoningEffort: 'low' });
+        expect(call.opts).toMatchObject({ model: 'env-knob-model', reasoningEffort: 'low', usageRole: 'planning' });
       }
     } finally {
       captureStreamLlm = false;

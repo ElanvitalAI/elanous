@@ -39,6 +39,8 @@ export interface AppSiteDeploymentRuntime {
   readonly build: (input: { appSlug: string; source: AppSiteDeploymentSource }) => Promise<AppSiteDeploymentBuild>;
   readonly publish: (input: { appSlug: string; userSlug: string; publicUrl: string; build: AppSiteDeploymentBuild; owner: AppSiteDeploymentOwner }) => Promise<void>;
   readonly verify: (input: { publicUrl: string; verifyText: string }) => Promise<{ status: number; body: string }>;
+  /** Optional shared lock that serializes source publication with receipt-gated promotion. */
+  readonly withSourceLock?: <T>(appSlug: string, run: (assertHeld: () => void) => T | Promise<T>) => Promise<T>;
 }
 
 export type AppSiteDeploymentOperations = Pick<AppSiteDeploymentRuntime,
@@ -289,24 +291,31 @@ export function createAppSiteDeployRoute(runtime?: AppSiteDeploymentRuntime) {
     if (!/^application\/json(?:\s*;|\s*$)/i.test(request.headers.get('content-type') ?? '')) return jsonError('json-required', 415);
     const templateId = await readTemplateId(request);
     if (!templateId) return jsonError('invalid-deploy-request', 400);
-    let publicUrl: string | undefined;
-    let source: AppSiteDeploymentSource | undefined;
-    try {
-      publicUrl = publicAppAddress({ appSlug, userSlug });
-      source = await runtime.createFromTemplate({ appSlug, templateId, userSlug, owner });
-      const build = await runtime.build({ appSlug, source });
-      if (!build.verifyText.trim()) throw new Error('build verification text is required');
-      await runtime.publish({ appSlug, userSlug, publicUrl, build, owner });
-      const verified = await runtime.verify({ publicUrl, verifyText: build.verifyText });
-      if (verified.status !== 200 || !verified.body.includes(build.verifyText)) throw new Error('published app verification failed');
-      const rawOutput: AppSiteDeployRawOutput = { kind: 'site-deploy', status: 'success', publicUrl };
-      return Response.json({ rawOutput }, { status: 200, headers: { 'cache-control': 'no-store' } });
-    } catch {
-      if (source) {
-        try { await runtime.discard?.(source); } catch { /* preserve the deployment failure response */ }
+    const deploy = async (assertLockHeld: () => void = () => undefined): Promise<Response> => {
+      let publicUrl: string | undefined;
+      let source: AppSiteDeploymentSource | undefined;
+      try {
+        publicUrl = publicAppAddress({ appSlug, userSlug });
+        source = await runtime.createFromTemplate({ appSlug, templateId, userSlug, owner });
+        const build = await runtime.build({ appSlug, source });
+        if (!build.verifyText.trim()) throw new Error('build verification text is required');
+        // The source lock's live-holder policy keeps it owned across this awaited publish call.
+        assertLockHeld();
+        await runtime.publish({ appSlug, userSlug, publicUrl, build, owner });
+        assertLockHeld();
+        const verified = await runtime.verify({ publicUrl, verifyText: build.verifyText });
+        if (verified.status !== 200 || !verified.body.includes(build.verifyText)) throw new Error('published app verification failed');
+        const rawOutput: AppSiteDeployRawOutput = { kind: 'site-deploy', status: 'success', publicUrl };
+        return Response.json({ rawOutput }, { status: 200, headers: { 'cache-control': 'no-store' } });
+      } catch {
+        if (source) {
+          try { await runtime.discard?.(source); } catch { /* preserve the deployment failure response */ }
+        }
+        const rawOutput: AppSiteDeployRawOutput = { kind: 'site-deploy', status: 'failed' };
+        return Response.json({ rawOutput }, { status: 502, headers: { 'cache-control': 'no-store' } });
       }
-      const rawOutput: AppSiteDeployRawOutput = { kind: 'site-deploy', status: 'failed' };
-      return Response.json({ rawOutput }, { status: 502, headers: { 'cache-control': 'no-store' } });
-    }
+    };
+    try { return runtime.withSourceLock ? await runtime.withSourceLock(appSlug, assertHeld => deploy(assertHeld)) : await deploy(); }
+    catch { return jsonError('app-source-lock-unavailable', 503); }
   };
 }

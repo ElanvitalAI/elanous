@@ -360,43 +360,7 @@ test('reads a populated context-bus journal without mutating its bytes', async (
   }
 });
 
-test('real isolated CLI drops harness-child lifecycle counts without writing', () => {
-  const root = resolve(import.meta.dir, '../..');
-  const state = mkdtempSync(join(root, 'context-condense-cli-')); dirs.push(state);
-  const journal = join(state, 'surface_events.db');
-  const db = new Database(journal, { create: true });
-  db.run(`CREATE TABLE events (id TEXT, ts TEXT, text TEXT, summary TEXT, kind TEXT, refs TEXT, surface TEXT, direction TEXT)`);
-  const at = new Date(Date.now() - 60_000).toISOString();
-  db.run(`INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, ['started', at, 'start', 'start',
-    'started', JSON.stringify({ seat: 'harness-child', source: 'elanous://harness/run-123/pty-456' }),
-    'context:external', 'outbound']);
-  db.run(`INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, ['finished', new Date(Date.parse(at) + 10_000).toISOString(),
-    'done', 'Harness child finished: success', 'finished',
-    JSON.stringify({ seat: 'harness-child', source: 'elanous://harness/run-123/pty-456' }), 'context:external', 'outbound']);
-  db.run(`INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, ['missing-seat', at, 'report', 'report', '보고',
-    JSON.stringify({ url: 'https://example.test/missing-seat' }), 'coord:channel', 'outbound']);
-  db.close();
-  const before = readFileSync(journal);
-  const output = spawnSync(process.execPath,
-    ['bin/elanous.mjs', `--test=${state}`, 'context', 'condense', '--since', '24h', '--dry-run', '--json'],
-    { cwd: root, encoding: 'utf8', timeout: 90_000,
-      env: { ...process.env, ELANOUS_STATE_DIR: state, NODE_ENV: 'test' } });
-  expect(output.status).toBe(0);
-  const json = JSON.parse(output.stdout.split('\n')[0]!);
-  expect(json).toMatchObject({ conflicts: 0, skipped: { 'no-seat': 1 }, folded: 0, droppedHarnessChild: 2 });
-  expect(json.cards).toEqual([]);
-  expect(json.funnel.read).toEqual({ total: 3, bySeat: { 'harness-child': 2, '(unknown)': 1 },
-    bySurface: { 'context:external': 2, 'coord:channel': 1 } });
-  expect(json.funnel.sources.droppedHarnessChild).toEqual({ total: 2, bySeat: { 'harness-child': 2 } });
-  expect(output.stdout.trim().split('\n')).toHaveLength(1);
-  expect(json).toHaveProperty('since');
-  expect(json).toHaveProperty('until');
-  expect(json).not.toHaveProperty('applied');
-  expect(readdirSync(state)).toEqual(['surface_events.db']);
-  expect(readFileSync(journal)).toEqual(before);
-}, 120_000);
-
-test('real isolated CLI previews an empty window without mutating an existing journal or creating candidate files', () => {
+test('real isolated CLI drops harness-child and previews an empty candidate window without writes', () => {
   const root = resolve(import.meta.dir, '../..');
   const state = mkdtempSync(join(root, 'context-condense-cli-')); dirs.push(state);
   const journal = join(state, 'surface_events.db');
@@ -404,6 +368,14 @@ test('real isolated CLI previews an empty window without mutating an existing jo
   db.run(`CREATE TABLE events (id TEXT, ts TEXT, text TEXT, summary TEXT, kind TEXT, refs TEXT, surface TEXT, direction TEXT)`);
   db.run(`INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, ['journal-1', '2020-01-01T00:00:00.000Z', 'fixture',
     'fixture', '보고', JSON.stringify({ seat: 'TC', url: 'https://example.test/journal' }), 'coord:channel', 'outbound']);
+  const at = new Date(Date.now() - 60_000).toISOString();
+  for (const [id, kind] of [['started', 'started'], ['finished', 'finished']] as const) {
+    db.run(`INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [id, at, kind, kind, kind,
+      JSON.stringify({ seat: 'harness-child', source: 'elanous://harness/run-123/pty-456' }),
+      'context:external', 'outbound']);
+  }
+  db.run(`INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, ['missing-seat', at, 'report', 'report', '보고',
+    JSON.stringify({ url: 'https://example.test/missing-seat' }), 'coord:channel', 'outbound']);
   db.close();
   const before = readFileSync(journal);
   const args = ['bin/elanous.mjs', `--test=${state}`, 'context', 'condense', '--since', '24h', '--dry-run'];
@@ -411,9 +383,11 @@ test('real isolated CLI previews an empty window without mutating an existing jo
     env: { ...process.env, ELANOUS_STATE_DIR: state, NODE_ENV: 'test' } });
   expect(output.status).toBe(0);
   const [json, ...markdown] = output.stdout.split('\n');
-  expect(JSON.parse(json!)).toMatchObject({ cards: [], conflicts: 0, skipped: {}, folded: 0 });
+  expect(JSON.parse(json!)).toMatchObject({ cards: [], conflicts: 0, skipped: { 'no-seat': 1 }, folded: 0,
+    droppedHarnessChild: 2, funnel: { read: { total: 3, bySeat: { 'harness-child': 2, '(unknown)': 1 } },
+      sources: { droppedHarnessChild: { total: 2, bySeat: { 'harness-child': 2 } } } } });
   expect(markdown.join('\n')).toContain('# Long-term context memory candidates');
-  expect(markdown.join('\n')).toContain('Funnel: read 0 (OP 0 · TC 0 · MK 0 · UX 0) → sources 0');
+  expect(markdown.join('\n')).toContain('Funnel: read 3');
   expect(readdirSync(state)).toEqual(['surface_events.db']);
   expect(readFileSync(journal)).toEqual(before);
   const bad = spawnSync(process.execPath, [...args, '--apply'], { cwd: root, encoding: 'utf8', timeout: 90_000,
@@ -422,12 +396,13 @@ test('real isolated CLI previews an empty window without mutating an existing jo
   expect(bad.stderr).toContain('--apply and --dry-run cannot be combined');
   expect(readdirSync(state)).not.toContain('context-memory');
   expect(readFileSync(journal)).toEqual(before);
-  const applied = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${state}`, 'context', 'condense', '--since', '24h', '--apply'],
+  const applied = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${state}`, 'context', 'condense', '--since', '24h', '--apply', '--json'],
     { cwd: root, encoding: 'utf8', timeout: 90_000,
       env: { ...process.env, ELANOUS_STATE_DIR: state, NODE_ENV: 'test' } });
   expect(applied.status).toBe(0);
   expect(JSON.parse(applied.stdout.split('\n')[0]!)).toMatchObject({ cards: [], conflicts: 0,
     applied: { written: 0, retired: 0, decisions: [] } });
+  expect(applied.stdout.trim().split('\n')).toHaveLength(1);
   expect(readdirSync(state)).toEqual(['surface_events.db']);
   expect(readFileSync(journal)).toEqual(before);
 }, 300_000);

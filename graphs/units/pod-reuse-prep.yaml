@@ -1,0 +1,17 @@
+graph_id: pod-reuse-prep
+version: 1
+unit:
+  inputs: [cutSha, candidatePath]
+  outputs: [verdict, reason, receiptPath]
+  exits: [reuse, legacy, skip, failed, error]
+entry_node: pending
+terminal_nodes: [legacy, reuse, skip, failed, error]
+nodes:
+  - { node_id: pending, kind: agent, recipe: 'cmd:pod-reuse-prep-pending', max_visits: 1 }
+  - { node_id: legacy, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: reuse, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: skip, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: error, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: pending, on: outcome, map: { legacy: legacy } }

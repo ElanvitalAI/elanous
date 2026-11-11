@@ -2,8 +2,8 @@
 name: omni-crawl
 description: >
   통합 «문서» 검색/크롤링 스킬 (2026-09-02 재편 — 여론 축은 social-pulse 로 분리).
-  일반 웹/뉴스 검색은 Tavily 1순위(공식 결정 2026-09-10 기본 ON · DuckDuckGo 는 **폴백 전용**으로 강등),
-  크롤/스크랩/추출은 Firecrawl REST v2(풀본문·maxAge 캐시), 개발 아티팩트(README·문서·이슈·PR)는
+  일반 웹/뉴스 검색은 계약 선택으로 DuckDuckGo 무료를 먼저 시도하고 빈 결과면 Tavily/Firecrawl BYOK로 진행한다.
+  URL 스크랩은 Jina/로컬 readability 무료 후 Firecrawl REST v2로 진행한다. 개발 아티팩트(README·문서·이슈·PR)는
   Firecrawl Developer Index(`--engine fc-dev` — 매칭 패시지를 직접 반환해 스크랩 콜 절감).
   --mode deep 딥리서치 (다각도 검색 + 풀스크랩 + 커뮤니티 합성 · 기술 주제면 fc-dev 자동 가세 —
   검증·인용 보고서가 필요하면 이게 아니라 deep-research 하니스).
@@ -28,37 +28,28 @@ requires: []
 
 **키워드 하나** → 역할기반 멀티 엔진 라우팅 → 통합 마크다운/JSON → (선택) omni-digest 요약.
 
-## 역할 분담 (2026-07-06 재편 — 구독 최적화)
+## 계약 선택 (2026-11-09)
 
-| 역할 | 1순위 (유료·기본) | 폴백 | 근거 (실측) |
-|------|-------|------|-------------|
-| **일반 웹 검색** | **tavily** | firecrawl → 🆓 ddg | 공식 결정 2026-09-10 기본 ON. ⚙️ `OMNI_CRAWL_TAVILY=0` 이면 ddg 1순위로 역전 |
-| **뉴스** | tavily-news + fc-news(qdr 필터) | 🆓 ddg | ⚙️ 스위치 OFF 면 fc-news 단독 |
-| **크롤/스크랩/PDF/추출** | firecrawl REST v2 | **jina 무료** | 풀본문·maxAge 캐시(기본 2일·500% 가속) |
-| **개발 아티팩트(문서·이슈·PR)** | **fc-dev** (Developer Index) | ddg | 패시지 직반환 — 블로그보다 «정의한» 원문이 강한 답 |
-| **X/레딧/커뮤니티 여론** | grok (유일 커버) | apify | $0.03/콜 — 엔진은 여기 있고 **표면은 `social-pulse`** |
-| **X 트윗 벌크(정량)** | apify | — | 좋아요/날짜 필터 |
-| **스크린샷(시각 소스)** | **capture (로컬 Chrome·무료)** | Dia CDP 9222 | JS 렌더 페이지 아티팩트 |
-| **딥 리서치** | `--mode deep` 합성 파이프라인 | — | 기본 **tavily ~6cr + firecrawl ~5cr + grok $0.05** · 스위치 OFF 면 tavily 대신 무료 ddg ·**Sources 인용 강제** |
+자동 라우팅은 공급자 이름 대신 `search.web@1`, `search.news@1`, `scrape.url@1`, `crawl.site@1`, `social.posts@1` 등의 요구 계약을 만든다. `src/registry.ts` 공급자 선언의 `provides`·`tier`·`latency`·`keyEnv`·`conditions`로 후보를 고른다. 무료 공급자 성공 시 BYOK는 호출하지 않는다. 무료 결과가 비거나 실패하면 적격 BYOK를 순서대로 한 번씩 시도한다. `keyEnv` 목록은 OR이며 값은 출력하지 않는다.
 
-### 💸 비용 원칙 (2026-07-10 무료 티어 추가)
+| 요구 능력 | 무료 첫 경로 | 후속 BYOK |
+|---|---|---|
+| 웹·뉴스 검색 | DuckDuckGo | Tavily, Firecrawl, Grok 웹(해당 계약) |
+| URL 본문 스크랩 | Jina Reader, 로컬 readability | Firecrawl 스크랩 |
+| 소셜 게시물 | DDG의 X/Reddit 공개 검색 | Grok, Apify(조건 일치 시) |
+| 사이트 크롤·맵·에이전트 추출·개발 인덱스 | 해당 무료 공급자가 없으면 명시적 소진 | 기존 Firecrawl 어댑터 |
+| 스크린샷 | 로컬 capture | — |
 
-> **품질 동일 시 무료, 아니면 유료 우선.** 유료(firecrawl/grok/apify)가 **1순위·기본**.
-> ⚙️ **tavily 가 1순위** — 공식 결정 2026-09-10: 2026-08-06 엔 고정비 때문에 ddg 를 1순위로 뒀는데,
-> **DDG HTML 이 차단되면 웹 검색 축이 통째로 0건**이 되고 폴백조차 안 걸리는 구멍이 있었다(실측).
-> 무료는 «돈 떨어졌을 때의 안전망»이지 1순위가 아니다 — 기본 ON, `OMNI_CRAWL_TAVILY=0` 으로 역전 가능.
-> ⛔ ***「콜당 싸다」와 「늘 켜 둔다」는 다른 축이다.*** `--engine tavily` 명시 호출은 스위치와 무관하게 돈다.
-> 무료(ddg 검색·jina 스크랩·capture)는 **① 유료 키 없음 ② 유료 0건 공백 ③ `--free` 명시
-> ④ deep 스크랩 실패분 보충** 일 때만 자동 강등. "돈 떨어지면 죽는" 구조를 메우는 안전망.
-> deer-flow(무료 DDG+Jina 기본, 유료 선택) 아키텍처에서 이식 — omni-crawl은 유료 우선으로 반전.
+`--engine <id>`는 기존 엔진 ID를 직접 호출하는 호환 경로다. `--free`는 요구 능력에서 무료 공급자만 허용한다. `--json`과 `--print`의 출력 마커는 유지된다. `OMNI_CRAWL_TAVILY`는 자동 순위를 제어하지 않으며 명시 `--engine tavily`도 그대로 동작한다.
+기간을 지정한 뉴스는 DDG를 제외하고 기간 필터를 지원하는 공급자만 선택한다. `research.deep@1`과 `extract.structured@1`의 상위 계약은 #36151 레지스트리가 맡고, 이 스킬의 deep 합성은 단계별 검색·스크랩 계약을 소비한다.
 
 ## 무료로 쓰는 길 (키 없이)
 
-이 스킬 폴더에서 `bun scripts/main.ts "<검색어>" --free --print`로 DDG 검색을 사용합니다. URL 본문은 키 없는 Jina Reader 또는 로컬 HTML 추출을 사용할 수 있습니다. `--free`는 유료 엔진을 피하려는 명시적 선택이며, 검색 서비스 접속이 막히면 결과가 없을 수 있습니다.
+`bun scripts/main.ts "<검색어>" --print`는 무료 검색부터 시작한다. `--free`는 BYOK 폴백도 금지한다. URL 본문은 Jina Reader와 로컬 readability를 순서대로 시도한다.
 
 ## 내 키로 쓰는 길
 
-유료 검색·스크랩은 자신의 `TAVILY_KEY`(Tavily)와 `FIRECRAWL_API_KEY`(Firecrawl)를 실행 환경에 설정합니다. 선택 엔진은 `XAI_API_KEY`(Grok), `APIFY_TOKEN`(Apify)를 사용합니다. 설정할 때 값이나 자격 파일은 이 스킬 문서·사본에 넣지 않습니다.
+`TAVILY_KEY`/`TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, `XAI_API_KEY`, `APIFY_TOKEN` 중 해당 키가 있으면 무료 경로 공백 뒤 적격 공급자로 호출된다. 값이나 자격 파일은 스킬 문서에 넣지 않는다.
 
 ## 엔진
 
@@ -72,24 +63,13 @@ requires: []
 | **fc-agent** | 웹 | FIRE-1 에이전트 (⚠ CLI 전용·대화형) |
 | **grok-x / grok-reddit / grok-community / grok-web** | X/레딧/웹 | Grok 검색 (grok-4-1-fast-reasoning) |
 | **apify** | X | 트윗 벌크 수집 |
-| **ddg** 🆓 | 웹 | DuckDuckGo HTML 검색 (키 불필요) — **폴백 전용**. `--health` 에서 실패해도 ⚠️ 경고일 뿐 전체 판정을 깨지 않는다 |
-| **jina** 🆓 | URL | Jina Reader 마크다운 스크랩 (키리스·scrapeFree 내부) |
+| **ddg** 🆓 | 웹 | DuckDuckGo HTML 검색 (키 불필요) — 무료 자동 첫 경로. `--health` 에서 실패해도 ⚠️ 경고일 뿐 전체 판정을 깨지 않는다 |
+| **jina-reader / local-readability** 🆓 | URL | Jina Reader·로컬 HTML 본문 추출 계약 어댑터 |
 | **capture** 🆓 | 페이지 | 스크린샷 아티팩트 (로컬 headless Chrome → Dia CDP 폴백) |
 
-## 딥리서치 (`--mode deep` 또는 "딥리서치/심층 분석" 인텐트)
+## 딥리서치 (`--mode deep`)
 
-자체 합성 파이프라인 (Tavily Research 엔드포인트 미사용 — 콜당 15~250cr 폭탄 회피):
-
-```
-1) 다각도 검색 ×3 (Tavily 사용 가능 시 Tavily, 키 없음/비활성 시 Firecrawl) 병렬
-   런타임 0건/실패면 다음 유료 엔진, 두 검색축이 모두 비었을 때만 DDG 무료 최후 폴백
-2) URL dedup → 상위 5개 Firecrawl 풀스크랩 (캐시 2h)
-3) grok-community 1콜 (X+레딧 여론 각도)                 ~$0.05
-4) 기술 주제면 fc-dev 1콜 자동 가세 (looksTechnical 게이트)  ~2cr
-→ 통합 마크다운 (풀본문이 스니펫보다 dedup 우선 생존)
-```
-
-각 각도 검색과 URL 스크랩은 엔진·단계별 경과 시간을 로그에 남긴다. Tavily 키가 없는 정상 경로는 Firecrawl 검색으로 세 각도를 채우며, DDG는 Tavily와 Firecrawl이 모두 없거나 0건일 때만 최후 폴백으로 호출한다.
+기존 합성 파이프라인을 유지하되 세 각도 검색은 `search.web@1`, 상위 URL 본문은 `scrape.url@1`, 커뮤니티 각도는 `social.posts@1`, 기술 주제의 개발 아티팩트는 `search.developer@1`로 선택한다. 공급자는 각 계약의 무료→BYOK 순서가 정한다. 결과를 합쳐 URL을 중복 제거하고 Sources 섹션을 출력한다.
 
 ## 실행
 
@@ -102,7 +82,7 @@ bun scripts/main.ts "<검색어>" [OPTIONS]
 ### 예시
 
 ```bash
-# 기본 (tavily · OMNI_CRAWL_TAVILY=0 이면 ddg 무료)
+# 기본 (search.web@1 · 무료 우선)
 bun scripts/main.ts "Samsung HBM4 경쟁력" --print
 
 # 뉴스 (오늘자)
@@ -149,13 +129,13 @@ bun scripts/main.ts "https://news.samsung.com" --engine fc-crawl --print
 
 - **프로바이더 레지스트리** (`src/registry.ts`, 2026-07-10): 엔진 디스패치를 switch 하드코딩에서
   디스크립터 등록으로 전환 (deer-flow `use: module:function` 플러그인 패턴 이식). 신규 프로바이더
-  추가 = `registerEngine({ id, capability, tier, available, run })` 1개 등록 (main.ts 수정 불필요).
-  각 디스크립터의 `tier: paid|free` 가 자동 폴백 근거.
+  추가 = `registerEngine({ id, capability, provides, tier, keyEnv, conditions, available, run })` 등록.
+  계약별 무료→BYOK 선택과 빈 결과 폴백은 레지스트리 공용 함수가 맡는다.
 - **SSRF 가드** (`src/url-safety.ts`, 2026-07-10): 무료 로컬 페치/스크린샷 전 URL 검증 —
   localhost·RFC1918·클라우드 메타데이터(169.254.169.254)·난독화 IP(10진/16진/8진) 차단
   (deer-flow `url_safety.py` 포팅). fc-crawl/fc-map/capture/scrapeFree 에 적용. `--allow-private` opt-out.
 - **무료 티어** (`src/free.ts`, 2026-07-10): DDG HTML 검색 + Jina Reader(keyless) 마크다운 +
-  로컬 readability 폴백 (dep-free = 순수 fetch+regex). 유료 공백/키없음/`--free`/deep 실패분에만 발동.
+  로컬 readability 폴백 (dep-free = 순수 fetch+regex). 자동 계약 선택의 첫 경로다.
 - **web_capture** (`src/capture.ts`, 2026-07-10): headless Chrome `--screenshot` 셸아웃 →
   Dia CDP(9222) 폴백. PNG 아티팩트는 로컬 캡처 디렉토리에 저장.
 - **REST 직결** (2026-07-06): firecrawl CLI shell-out 제거 — 크론/데몬 최소 PATH 즉사,
@@ -173,9 +153,7 @@ bun scripts/main.ts "https://news.samsung.com" --engine fc-crawl --print
   코드·엔진·폴백·dedup 은 이 한 벌을 공유한다. grok 은 100줄, apify 는 66줄로 전체의 7%라
   떼어낼 덩어리가 아니었고, `--mode deep` 이 ddg+firecrawl+grok 을 한 파이프라인에서 합성하므로
   프로세스 경계를 넣으면 위 «REST 직결» 항목이 기록한 고장을 재현한다. `--engine grok-*` 호출 계약은 불변.
-- **폴백 체인**: tavily ↔ firecrawl → (최후) 🆓 ddg · scrape 실패 → waitFor 재시도 → 🆓 jina.
-  공식 결정 2026-09-10: `wantedWeb` 에 ddg 를 포함시켜 **ddg 1순위였을 때 0건이면 유료로 «승격» 보충**되게 했다
-  (종전엔 ddg 가 축 계산에서 빠져 보충이 아예 안 걸렸다).
+- **폴백 체인**: 계약 적격 공급자를 무료→BYOK→paid, 선언 latency, ID 순으로 정렬하고 빈 결과·실패 때 다음 공급자를 한 번씩 호출한다.
 - **URL dedup**: 엔진 간 중복 제거. deep 모드는 풀본문 우선 생존.
 - **비용 가시성**: 결과에 `비용: firecrawl ~5cr` 표시. `--health`가 잔량 보고.
 - **API 스펙 보관**: `specs/` — Firecrawl v2·Tavily 전 엔드포인트 (2026-07-06 다운로드).
@@ -203,14 +181,13 @@ bun scripts/monitor.ts delete <monitorId>
 
 운영 중(2026-07-06~): 삼성전자 뉴스룸·SK하이닉스 뉴스룸 (각 1h·~1,440cr/월).
 
-## 스크랩 우선순위 (fallback 체인)
+## 스크랩 우선순위 (계약 선택)
 
 ```
-firecrawl scrape(REST·캐시) → waitFor 재시도(SPA)
-  → 🆓 jina Reader(keyless) → 🆓 직접 HTML+로컬 readability → Dia CDP (로그인 필요 시)
+🆓 Jina Reader → 🆓 직접 HTML+로컬 readability → Firecrawl scrape(REST·캐시, BYOK)
 ```
 
-웹 검색 축: `🆓 ddg → firecrawl` (⚙️ 스위치 ON 이면 `tavily → firecrawl → 🆓 ddg` 로 복귀).
+웹 검색 축: `🆓 ddg → Tavily → Firecrawl → Grok 웹`(각 키가 있고 앞 공급자가 비었을 때만 진행).
 SSRF 가드는 무료 로컬 페치·capture 에 항상 적용(`--allow-private` 로만 해제).
 
 ## omni-digest 연계
@@ -234,7 +211,7 @@ omni-digest --content "<크롤결과>" --format rich-cards --print
 | 변수 | 용도 | 필수 |
 |------|------|------|
 | `TAVILY_KEY` | Tavily 검색/추출 | tavily 사용 시 |
-| `OMNI_CRAWL_TAVILY` | ⚙️ tavily 상시사용 스위치 (기본 ON · `0` 이면 OFF, ddg 우선) | 선택 |
+| `OMNI_CRAWL_TAVILY` | 옛 자동 순위 스위치; 계약 선택에는 영향 없음 | 선택 |
 | `FIRECRAWL_API_KEY` | Firecrawl REST | firecrawl 사용 시 |
 | `XAI_API_KEY` | Grok 검색 | Grok 사용 시 |
 | `APIFY_TOKEN` | Apify tweet-scraper | Apify 사용 시 |

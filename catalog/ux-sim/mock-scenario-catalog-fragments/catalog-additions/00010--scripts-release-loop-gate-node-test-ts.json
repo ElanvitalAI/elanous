@@ -1,0 +1,4 @@
+{
+  "path": "scripts/release-loop/gate-node.test.ts",
+  "reason": "GATE-NODE-WIRING-BUNDLE adds a focused release-graph simulation proof outside the original OP inventory rows."
+}

@@ -1,5 +1,9 @@
 import { expect, test } from 'bun:test';
+import { act, create } from 'react-test-renderer';
 import { renderToStaticMarkup } from 'react-dom/server';
+import ReleasePage from '@/app/ops/release/page';
+import { DaemonContext } from '@/components/providers/DaemonProvider';
+import { OperatorReleaseRoute } from './OperatorReleaseRoute';
 import { ReleaseRunsContent, mergeReleaseGateProgress } from './ReleaseRunsView';
 import { fromReleaseGateProgress, type ReleaseGateProgressEvent } from '@/lib/inside-events';
 import type { ReleaseRun } from '@/lib/ops-api';
@@ -33,10 +37,51 @@ function renderRun(events: ReleaseGateProgressEvent[], shards: NonNullable<Relea
     ],
     gateShards: { ...shardFile, summary: summarizeShards(shardFile, Date.parse(updatedAt)) },
   };
+
   return renderToStaticMarkup(<ReleaseRunsContent result={{ kind: 'ready', data: [run] }} version="0.3.6"
     selectedRun={run} openedNodeId={null} log={null} gateProgress={events}
     onVersion={() => {}} onRun={() => {}} onNode={() => {}} />);
 }
+
+test('pwa-release-graph-live-run-sim: non-operators receive no /ops/release page content', () => {
+  expect(renderToStaticMarkup(<OperatorReleaseRoute operator={false} />)).toBe('');
+});
+
+test('pwa-release-graph-live-run-sim: /ops/release checks /v1/me and mounts the view only for an operator', async () => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  const client = { fetchResponse: async (path: string) => { calls.push(path); return new Response(JSON.stringify([])); } };
+  const daemon = { config: { baseUrl: '', token: '', provider: '' }, setConfig: () => {}, client: client as never, sessionId: 'test', setSessionId: () => {} };
+  let tree: ReturnType<typeof create> | undefined;
+  try {
+    for (const operator of [false, true]) {
+      calls.length = 0;
+      Object.defineProperty(globalThis, 'window', { configurable: true, value: {
+        location: { protocol: 'https:', host: 'pwa.test' }, addEventListener: () => {}, removeEventListener: () => {},
+      } });
+      globalThis.fetch = (async (input: RequestInfo | URL) => {
+        expect(input).toBe('https://pwa.test/v1/me');
+        return { ok: true, json: async () => ({ operator }) } as Response;
+      }) as typeof fetch;
+      await act(async () => {
+        tree = create(<DaemonContext.Provider value={daemon}><ReleasePage /></DaemonContext.Provider>);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(calls).toEqual(operator ? ['/v1/ops/release/runs'] : []);
+      expect(operator ? tree!.root.findAllByType('main').length : tree!.toJSON()).toEqual(operator ? 1 : null);
+      await act(async () => { tree!.unmount(); });
+      tree = undefined;
+    }
+  } finally {
+    if (tree) await act(async () => { tree!.unmount(); });
+    globalThis.fetch = originalFetch;
+    if (originalWindow) Object.defineProperty(globalThis, 'window', originalWindow);
+    else Reflect.deleteProperty(globalThis, 'window');
+  }
+});
 
 test('pwa-release-graph-live-run-sim: one c073464a cut run joins ledger and live events and renders all 81 radius invalidations', () => {
   const saved = Array.from({ length: 81 }, (_, index) => progress({

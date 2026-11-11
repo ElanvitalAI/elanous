@@ -585,7 +585,6 @@
 1	plan-doc-link	src/cli/logs-cli.ts
 1	plan-doc-link	src/cli/nexus-ios-bind.ts
 1	plan-doc-link	src/conductor/types.ts
-1	plan-doc-link	src/dashboard/browser-help-runtime.ts
 2	plan-doc-link	src/dashboard/index.ts
 1	plan-doc-link	src/dashboard/windowing/visibility-chord.ts
 1	plan-doc-link	src/discord/components-builder.ts

@@ -5,19 +5,24 @@ import { getUserConfig, reloadUserConfig, saveUserConfig } from '../user-config.
 import type { McpServerSpec } from '../user-config/types.js';
 import {
   discoverMcpOAuth,
-  exchangeAuthorizationCode,
+  completeAppOAuthConnection,
   ensureClientRegistration,
   loadStoredRegistration,
   loopbackRedirectPort,
   prepareMcpOAuthAuthorization,
   authorizeMcpDevice,
+  assistMcpOAuthLogin,
+  McpOAuthError,
   type McpOAuthFetch,
+  type McpDeviceAuthorization,
   type AuthorizationServerMetadata,
   type ProtectedResourceMetadata,
 } from '../mcp/mcp-oauth.js';
 import { parseWwwAuthenticate } from '../mcp/client.js';
 import { debug } from '../debug/log.js';
 import { browserUnavailableReason } from '../oauth/browser-availability.js';
+import { authStorePath, loadTokens, oauthConnectionStatus } from '../oauth/store.js';
+import { assessOAuthCredentialHealth } from '../nexus/config/secrets/cred-health.js';
 
 const CALLBACK_PATH = '/oauth/callback';
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -28,6 +33,7 @@ type Callback = { code: string; state: string };
 
 export interface McpLoginResult {
   exitCode: number;
+  connection?: { issuer: string; connected: boolean; expiresAt: number | null; lastRefresh: string | null };
 }
 
 export interface McpLoginOpts {
@@ -97,30 +103,46 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
     const loginWithDevice = async (): Promise<McpLoginResult> => {
       if (server?.listening) await closeServer(server);
       const stored = loadStoredRegistration(discovered.metadata.issuer, oauthOpts);
-      const deviceRegistration = await ensureClientRegistration(discovered.metadata, { ...oauthOpts, deviceCode: true });
-      const authorizeDevice = (registration: typeof deviceRegistration) => authorizeMcpDevice(discovered.metadata, registration, {
+      const deviceOptions = {
         scope: challenge.scope,
         resource: discovered.resource.resource,
         ...oauthOpts,
         ...(opts.deviceSleep ? { sleep: opts.deviceSleep } : {}),
         ...(opts.deviceNow ? { now: opts.deviceNow } : {}),
-        onDeviceCode: ({ userCode, verificationUri, verificationUriComplete }) => {
+        onDeviceCode: ({ userCode, verificationUri, verificationUriComplete }: McpDeviceAuthorization) => {
           out.log(`Authorize '${opts.serverId}' at ${verificationUriComplete ?? verificationUri}`);
           out.log(`Device code: ${userCode}`);
         },
-      });
+      };
+      const saved = loadTokens(discovered.metadata.issuer, opts.storePath ?? authStorePath());
+      const healthStatus = assessOAuthCredentialHealth(saved
+        ? { present: true, expiresAt: saved.tokens.expiresAt, scope: saved.tokens.scope }
+        : { present: false }, [], opts.deviceNow?.() ?? Date.now(), 0);
+      const assisted = healthStatus === 'missing' || healthStatus === 'expired';
+      const deviceRegistration = assisted ? undefined
+        : await ensureClientRegistration(discovered.metadata, { ...oauthOpts, deviceCode: true });
+      const authorizeDevice = (registration: typeof deviceRegistration, forceReregister = false) =>
+        assisted
+          ? assistMcpOAuthLogin({ ...deviceOptions, resourceMetadataUrl: challenge.resourceMetadata!,
+            resourceUrl: spec.url, discovered, healthStatus, method: 'device',
+            ...(forceReregister ? { forceReregister: true } : {}) })
+          : authorizeMcpDevice(discovered.metadata, registration!, deviceOptions);
       try {
         await authorizeDevice(deviceRegistration);
       } catch (error) {
         // A reused client the server does not accept for the device grant (e.g. an old browser client stored
         // without its loopback URI) gets one fresh device registration; anything else fails as before.
-        const reused = stored?.clientId === deviceRegistration.clientId;
+        const reused = !!stored && (assisted || stored.clientId === deviceRegistration?.clientId);
         if (!reused || !discovered.metadata.registrationEndpoint || !/\((?:unauthorized_client|invalid_client)\)/.test(String(error))) throw error;
-        await authorizeDevice(await ensureClientRegistration(discovered.metadata, { ...oauthOpts, deviceCode: true, forceReregister: true }));
+        await authorizeDevice(assisted ? undefined
+          : await ensureClientRegistration(discovered.metadata, { ...oauthOpts, deviceCode: true, forceReregister: true }), assisted);
       }
       out.log(`✓ credentials saved for '${opts.serverId}' (${discovered.metadata.issuer})`);
       persistLoginDiscovery(opts, discovered.metadata, out);
-      return { exitCode: 0 };
+      return { exitCode: 0, connection: {
+        issuer: discovered.metadata.issuer,
+        ...oauthConnectionStatus(discovered.metadata.issuer, opts.storePath ?? authStorePath()),
+      } };
     };
     if ((why || !discovered.metadata.authorizationEndpoint) && discovered.metadata.deviceAuthorizationEndpoint) {
       if (why) out.log(why);
@@ -188,18 +210,22 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
       out.log(`Browser approval did not complete for '${opts.serverId}'; trying device code.`);
       return await loginWithDevice();
     }
-    await exchangeAuthorizationCode(authorization.metadata, authorization.request, callback, oauthOpts);
+    const receipt = await completeAppOAuthConnection(authorization.metadata, authorization.request, callback, oauthOpts);
+    if (!receipt.connected) throw new Error('OAuth connection was not stored');
     out.log(`✓ credentials saved for '${opts.serverId}' (${authorization.metadata.issuer})`);
     persistLoginDiscovery(opts, authorization.metadata, out);
-    return { exitCode: 0 };
+    return { exitCode: 0, connection: receipt };
   } catch (error) {
     const stage = loginFailureStage(error);
+    const reason = error instanceof McpOAuthError ? error.message
+      : error instanceof Error && error.message === 'authorization callback state does not match the authorization request'
+        ? error.message : 'authorization did not complete';
     debug.log('mcp.login', 'failed', {
       serverId: opts.serverId,
       stage,
-      reason: error instanceof Error ? error.message : String(error),
+      reason,
     });
-    out.error(`✗ MCP login failed: ${error instanceof Error ? error.message : String(error)}`);
+    out.error(`✗ MCP login failed: ${reason}`);
     return { exitCode: 1 };
   } finally {
     if (server?.listening) await closeServer(server);
@@ -356,7 +382,7 @@ async function listenForCallback(
     const oauthError = url.searchParams.get('error');
     if (oauthError) {
       completed = true;
-      const error = new Error(`authorization callback returned ${oauthError}${url.searchParams.get('error_description') ? `: ${url.searchParams.get('error_description')}` : ''}`);
+      const error = new Error('authorization callback was denied');
       res.writeHead(400); res.end('Login failed; return to the terminal.');
       settleCallback(error);
       return;

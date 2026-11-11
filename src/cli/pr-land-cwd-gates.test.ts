@@ -1,14 +1,52 @@
 // `pr land --cwd <tree>` measures typecheck and mock-module restore against that tree, not process.cwd().
 import { expect, setDefaultTimeout, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveTscScript, runGate } from '../../scripts/ci-typecheck-changed.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
-import { runPrLand } from './pr-cli.js';
+import { runPrLand, runPrLandTypecheckGate, shouldRefusePrLandLocalHeavySteps } from './pr-cli.js';
 
 setDefaultTimeout(60_000);
+
+test('pr land refuses local test-suite and PWA gates on HQ unless the heavy gate already ran remotely', () => {
+  const seat = '/Users/user/elanous-hq/seats/OP';
+  expect(shouldRefusePrLandLocalHeavySteps({}, 'MacBookProM5', seat, false)).toBe(true);
+  expect(shouldRefusePrLandLocalHeavySteps({}, 'MacStudioB1', seat, false)).toBe(true);
+  expect(shouldRefusePrLandLocalHeavySteps({}, 'MacBookProM5', seat, true)).toBe(false);
+  expect(shouldRefusePrLandLocalHeavySteps({ CI: '1' }, 'MacBookProM5', seat, false)).toBe(true);
+  expect(shouldRefusePrLandLocalHeavySteps({}, 'node-b', '/tmp/worktree', false)).toBe(false);
+});
+
+test('pr land routes its in-process typecheck from an HQ symlink to the canonical checkout', () => {
+  const root = mkdtempSync(join(tmpdir(), 'prland-typecheck-alias-'));
+  const hqCheckout = join(root, 'elanous-hq', 'seats', 'OP', 'repo');
+  const alias = join(root, 'checkout-alias');
+  mkdirSync(hqCheckout, { recursive: true });
+  symlinkSync(hqCheckout, alias, 'dir');
+  const calls: Array<{ command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv }> = [];
+  const lines: string[] = [];
+  try {
+    const passed = runPrLandTypecheckGate({ log: (line) => lines.push(line), error: (line) => lines.push(line) }, alias, {
+      env: { ELANOUS_TYPECHECK_REMOTE: 'gcp2' },
+      host: 'MacStudioB1',
+      runRemote: (command, args, options) => {
+        calls.push({ command, args, cwd: options.cwd, env: options.env });
+        return { status: 0, stdout: '[tsc-gate] PASS\n', stderr: '' };
+      },
+    });
+    expect(passed).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      command: process.execPath,
+      args: [join(realpathSync(hqCheckout), 'scripts/ci-typecheck-changed.ts'), '--remote', 'gcp2'],
+      cwd: realpathSync(hqCheckout),
+      env: { ELANOUS_TYPECHECK_REMOTE: 'gcp2' },
+    });
+    expect(lines).toEqual(['[tsc-gate] PASS']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 function git(cwd: string, args: string[]): void {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -16,8 +54,8 @@ function git(cwd: string, args: string[]): void {
 }
 
 /** A repo whose only change since the root commit is a markdown file — zero .ts. */
-function docsOnlyTree(): { dir: string; base: string; head: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'prland-cwd-'));
+function docsOnlyTree(parent = tmpdir()): { dir: string; base: string; head: string } {
+  const dir = mkdtempSync(join(parent, 'prland-cwd-'));
   // Injected compiler results still require target declarations unless the
   // production runner measures a completely dependency-free checkout.
   mkdirSync(join(dir, 'node_modules', 'bun-types'), { recursive: true });
@@ -54,7 +92,41 @@ function capture(run: (log: (message: string) => void, error: (message: string) 
   return { lines, code };
 }
 
-test('tsc gate on --cwd docs-only tree reports base≠head, zero changed .ts, and PASS', () => {
+test('runPrLand refuses HQ local heavy gates before invoking the test suite or PWA gate', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'prland-hq-heavy-'));
+  const seat = join(root, 'elanous-hq', 'seats', 'OP');
+  mkdirSync(seat, { recursive: true });
+  const { dir } = docsOnlyTree(seat);
+  const alias = join(root, 'checkout-alias');
+  symlinkSync(dir, alias, 'dir');
+  const lines: string[] = [];
+  let typecheckCalls = 0;
+  let testSuiteCalls = 0;
+  let pwaCalls = 0;
+  try {
+    const code = await runPrLand({ cwd: alias }, {
+      hostName: () => 'MacStudioB1',
+      currentBranch: () => 'feature',
+      resolveBase: () => 'origin/main',
+      run: (command, args) => {
+        if (command === 'git' && args[0] === 'remote') return { ok: true, out: args[1] === 'get-url' ? 'https://github.com/example/repo.git' : 'origin' };
+        return { ok: true, out: '' };
+      },
+      listUnfinishedRuns: () => [],
+      queryRunningRuns: () => { throw new Error('observation unavailable'); },
+      runTypecheckGate: () => { typecheckCalls++; return true; },
+      runTestInterferenceGate: async () => { testSuiteCalls++; return 0; },
+      runPwaGate: () => { pwaCalls++; return true; },
+      out: { log: (line) => lines.push(line), error: (line) => lines.push(line) },
+    });
+    expect(code).toBe(1);
+    expect(typecheckCalls).toBe(1);
+    expect(lines.join('\\n')).toContain('HQ-HEAVY-LOCAL-GUARD');
+    expect(testSuiteCalls).toBe(0);
+    expect(pwaCalls).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+test('tsc gate reads both docs-only and TypeScript changes from --cwd', () => {
   const { dir, base, head } = docsOnlyTree();
   expect(base).not.toBe(head);
   const { lines, code } = capture((log, error, exit) => {
@@ -67,23 +139,19 @@ test('tsc gate on --cwd docs-only tree reports base≠head, zero changed .ts, an
   expect(summary).toContain('변경 .ts 0개');
   expect(lines.some((line) => line.startsWith('[tsc-gate] PASS'))).toBe(true);
   expect(code).toBe(0);
-});
-
-test('tsc gate reads a changed TypeScript file from --cwd even when launched from another tree', () => {
-  const { dir } = docsOnlyTree();
   mkdirSync(join(dir, 'src'), { recursive: true });
   writeFileSync(join(dir, 'src/model.ts'), 'export const targetOnly = 1;\n');
   git(dir, ['add', 'src/model.ts']);
   git(dir, ['commit', '-q', '-m', 'target TypeScript']);
   let tscRuns = 0;
-  const { lines, code } = capture((log, error, exit) => runGate({
+  const changed = capture((log, error, exit) => runGate({
     cwd: dir, log, warn: error, error, exit,
     runTscCmd: () => { tscRuns++; return { ran: true, out: '' }; },
   }));
-  expect(code).toBe(0);
+  expect(changed.code).toBe(0);
   expect(tscRuns).toBeGreaterThan(0);
-  expect(lines.join('\n')).toContain('변경 .ts 1개 관측');
-  expect(lines.some((line) => line.startsWith('[tsc-gate] PASS'))).toBe(true);
+  expect(changed.lines.join('\n')).toContain('변경 .ts 1개 관측');
+  expect(changed.lines.some((line) => line.startsWith('[tsc-gate] PASS'))).toBe(true);
 });
 
 test('a dependency-free --cwd tree runs the installed compiler and judges only its changed diagnostic', () => {
@@ -198,43 +266,6 @@ test('pr land --cwd runs installed tsc for a PWA change in a dependency-free tar
   }
 });
 
-test('pr land --cwd reaches its production type gate in another Git worktree before any PR mutation', async () => {
-  const { dir } = docsOnlyTree();
-  const target = mkdtempSync(join(tmpdir(), 'prland-target-worktree-'));
-  const lines: string[] = [];
-  let mutations = 0;
-  try {
-    git(dir, ['worktree', 'add', '--detach', target, 'HEAD']);
-    rmSync(join(target, 'node_modules'), { recursive: true, force: true });
-    writeFileSync(join(target, 'tsconfig.gate.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true, types: [], skipLibCheck: true }, include: ['src/**/*.ts'] }));
-    mkdirSync(join(target, 'src'), { recursive: true });
-    writeFileSync(join(target, 'src/model.test.ts'), 'const targetOnly: number = "wrong";\n');
-    git(target, ['add', 'tsconfig.gate.json', 'src/model.test.ts']);
-    git(target, ['commit', '-q', '-m', 'broken target TypeScript']);
-    mkdirSync(join(dir, 'src'), { recursive: true });
-    writeFileSync(join(dir, 'src/launcher.test.ts'), 'const launcherOnly: number = "wrong";\n');
-    const code = await runPrLand({ cwd: target }, {
-      currentBranch: () => 'feature', resolveBase: () => 'origin/main',
-      run: (command, args) => {
-        if (command === 'git' && args[0] === 'remote') return { ok: true, out: args[1] === 'get-url' ? 'https://github.com/example/repo.git' : 'origin' };
-        return { ok: true, out: '' };
-      },
-      listUnfinishedRuns: () => [], queryRunningRuns: () => { throw new Error('observation unavailable'); },
-      out: { log: (line) => lines.push(line), error: (line) => lines.push(line) },
-      manager: { upsertPr: () => { mutations++; throw new Error('must not create PR'); } } as never,
-    });
-    expect(code).toBe(1);
-    expect(lines.join('\n')).toContain('src/model.test.ts(1,7): error TS2322');
-    expect(lines.join('\n')).not.toContain('launcher.test.ts');
-    expect(lines.join('\n')).toContain('변경 .ts 1개 관측');
-    expect(lines.join('\n')).toContain('✗ typecheck: scripts/ci-typecheck-changed.ts blocked pr land.');
-    expect(mutations).toBe(0);
-  } finally {
-    git(dir, ['worktree', 'remove', '--force', target]);
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 test('CLI pr land --cwd reports only the target diagnostic before any PR mutation', () => {
   const { dir } = docsOnlyTree();
   const target = mkdtempSync(join(tmpdir(), 'prland-cli-target-'));
@@ -316,7 +347,7 @@ test('tsc gate fails explicitly when no target or installed compiler exists', ()
   expect(lines.at(-1)).toContain('FAIL');
 });
 
-test('a compiler path disappearing before Bun execution fails with the install instruction', () => {
+test('a missing compiler candidate or vanished compiler reports the install instruction', () => {
   const { dir } = docsOnlyTree();
   try {
     mkdirSync(join(dir, 'src'), { recursive: true });
@@ -333,26 +364,16 @@ test('a compiler path disappearing before Bun execution fails with the install i
     expect(lines.join('\n')).toContain('bun install --frozen-lockfile');
     expect(lines.join('\n')).not.toContain('[tsc-gate] PASS');
     expect(lines.at(-1)).toContain('못 쟀다');
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('a dependency-free --cwd tree without any compiler candidate fails with the install instruction', () => {
-  const { dir } = docsOnlyTree();
-  try {
     rmSync(join(dir, 'node_modules'), { recursive: true, force: true });
-    mkdirSync(join(dir, 'src'), { recursive: true });
-    writeFileSync(join(dir, 'src/model.test.ts'), 'export const targetOnly = 1;\n');
-    git(dir, ['add', 'src/model.test.ts']);
-    git(dir, ['commit', '-q', '-m', 'target TypeScript']);
-    const { lines, code } = capture((log, error, exit) => runGate({
+    const absent = capture((log, error, exit) => runGate({
       cwd: dir, log, warn: error, error, exit,
       allowMissingCheckoutDependencies: true,
       resolveTscScript: (cwd) => resolveTscScript(cwd, join(dir, 'absent-cli/scripts')),
     }));
-    expect(code).toBe(1);
-    expect(lines.join('\n')).toContain('TypeScript 실행 파일 없음');
-    expect(lines.join('\n')).toContain('bun install --frozen-lockfile');
-    expect(lines.at(-1)).toContain('FAIL');
+    expect(absent.code).toBe(1);
+    expect(absent.lines.join('\n')).toContain('TypeScript 실행 파일 없음');
+    expect(absent.lines.join('\n')).toContain('bun install --frozen-lockfile');
+    expect(absent.lines.at(-1)).toContain('FAIL');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

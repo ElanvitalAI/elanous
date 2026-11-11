@@ -7,7 +7,7 @@
 //
 // ⛔ **실측이 만든 모듈이다**(2026-08-02): 스위치가 ⑴에만 있어서, 관측 전용으로 재려던 코퍼스 측정이
 //    ⑵로 흘러 **진짜 self-implement 런을 두 번 띄웠다**(worktree 두 개 생성 · 사람이 수동 정지).
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export const OBSERVE_ONLY_FLAG_ENV = 'ELANOUS_SELF_IMPLEMENT_OBSERVE_ONLY';
 

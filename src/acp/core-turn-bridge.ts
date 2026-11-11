@@ -48,7 +48,7 @@ import { runGoalLoop } from '../core-turn/run-goal-loop.js';
 import type { CoreTurnDispatchTool } from '../core-turn/types.js';
 import { stripGoalRepeatReadbackPreface } from '../core-turn/run-goal-loop.js';
 import { parseSeatTurnCapConfig, resolveSeatTurnCap } from '../core-turn/seat-turn-cap.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { getModelFamily } from '../models/prompts.js';
 import { resolveModelContextWindow } from '../models/context-window.js';
 import type { AcpServerOptions, AcpTurnContext } from './server.js';

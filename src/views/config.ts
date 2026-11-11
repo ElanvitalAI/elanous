@@ -74,7 +74,6 @@ export const VALID_VIEW_PANES = new Set<PaneFocus>([
   'skill-browser', 'skill-file',
   'agent-roster', 'agent-detail', 'agent-log',
   'debug-events', 'debug-detail', 'debug-stack', 'debug-prompts',
-  'playground',
   'sessions-sidebar',
 ]);
 
@@ -157,29 +156,6 @@ export const DEFAULT_DASHBOARD_VIEWS: DashboardViewDef[] = [
     rows: [
       { ratio: 3, panes: [{ pane: 'debug-events', ratio: 2 }, { pane: 'debug-detail', ratio: 3 }, { pane: 'preview', ratio: 2 }] },
       { ratio: 2, panes: [{ pane: 'debug-stack', ratio: 2 }, { pane: 'debug-prompts', ratio: 2 }, { pane: 'log', ratio: 2 }] },
-    ],
-  },
-  {
-    // VP1 — Widget Playground. Pane surface is a single `playground`
-    // slot that the dashboard renders as a 4×4 grid of widget
-    // instances. VP2 fills in the 15 sample widgets; VP4 adds an
-    // inspect pane on the side; VP3 binds Ctrl+7 to this view.
-    // baseView: 1 (Normal) — reuses the working-dir input bar /
-    // focus lifecycle, nothing else borrowed.
-    id: 'playground',
-    label: 'Widget Playground',
-    enabled: true,
-    order: 70,
-    shortcut: '7',
-    baseView: 1,
-    primary: 'playground',
-    omitOrder: ['log', 'playground'],
-    // VP6 — playground pane now owns browser|preview split internally;
-    // bottom row is the global log pane only (scratch dropped for V7
-    // so the log has the full width — easier to trace interaction).
-    rows: [
-      { ratio: 4, panes: [{ pane: 'playground', ratio: 1 }] },
-      { ratio: 1, panes: [{ pane: 'log', ratio: 1 }] },
     ],
   },
 ];

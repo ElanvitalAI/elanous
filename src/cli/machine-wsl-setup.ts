@@ -1,5 +1,8 @@
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, win32 as pathWin32 } from 'node:path';
 import { applyMachineSetupPlan, type MachineSetupApplyResult } from './machine-setup-apply.js';
 import { buildMachineSetupPlan, type MachineSetupPlan } from './machine-setup-plan.js';
 
@@ -18,7 +21,7 @@ export interface MachineWslSetupResult {
   readonly resumeTrigger?: MachineWslResumeTrigger;
   readonly detail: string;
   readonly attempted: number;
-  readonly failures: readonly { readonly operation: string; readonly reason: string }[];
+  readonly failures: readonly { readonly operation: string; readonly reason: string; readonly target?: string }[];
   readonly profileResult?: MachineSetupApplyResult;
 }
 
@@ -32,6 +35,10 @@ export interface MachineWslSetupDeps {
   readonly executable?: string;
   readonly entry?: string;
   readonly scheduleResume?: (commandLine: string) => MachineWslCommandResult;
+  readonly resumeTaskDefinitionPath?: string;
+  readonly resumeTaskWrapperPath?: string;
+  readonly writeResumeTaskDefinition?: (path: string, xml: string) => void;
+  readonly writeResumeTaskWrapper?: (path: string, script: string) => void;
   readonly allowCloudVm?: boolean;
 }
 
@@ -73,10 +80,24 @@ export function buildMachineWslResumeCommand(input: {
   readonly user: string;
   readonly resumeTrigger?: MachineWslResumeTrigger;
 }): string {
-  return [input.executable, currentMachineWslEntry(input.entry), 'machine', 'apply', '--from', input.capture, '--profile', input.profile,
-    '--platform', 'wsl', '--distribution', input.distribution, '--wsl-user', input.user,
-    '--resume-trigger', input.resumeTrigger ?? 'onstart', '--resume', '--yes']
+  return [input.executable, ...buildMachineWslResumeArguments(input)]
     .map(quoteWindowsArgument).join(' ');
+}
+
+function buildMachineWslResumeArguments(input: {
+  readonly entry: string;
+  readonly capture: string;
+  readonly profile: string;
+  readonly distribution: string;
+  readonly user: string;
+  readonly resumeTrigger?: MachineWslResumeTrigger;
+  readonly resumeTaskWrapperPath?: string;
+}): string[] {
+  const args = [currentMachineWslEntry(input.entry), 'machine', 'apply', '--from', input.capture, '--profile', input.profile,
+    '--platform', 'wsl', '--distribution', input.distribution, '--wsl-user', input.user,
+    '--resume-trigger', input.resumeTrigger ?? 'onstart', '--resume', '--yes'];
+  if (input.resumeTaskWrapperPath) args.push('--resume-task-wrapper', input.resumeTaskWrapperPath);
+  return args;
 }
 
 /** Resume through install.ps1's stable current junction so an update before reboot is picked up. */
@@ -84,16 +105,182 @@ export function currentMachineWslEntry(entry: string): string {
   return entry.replace(/\\versions\\[^\\]+(?=\\node_modules\\elanous\\bin\\elanous\.mjs$)/i, '\\current');
 }
 
-export function buildMachineWslStartupTaskArgs(input: { readonly commandLine: string; readonly windowsUser: string; readonly trigger?: MachineWslResumeTrigger }): string[] {
+function xmlEscape(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+// Source: Microsoft Task Scheduler XML schema version 1.2 supports BootTrigger and S4U principals.
+const MACHINE_WSL_TASK_XML_VERSION = '1.2';
+
+export function buildMachineWslStartupTaskXml(input: {
+  readonly executable: string;
+  readonly arguments: string;
+  readonly windowsUser: string;
+  readonly trigger?: MachineWslResumeTrigger;
+}): string {
   const windowsUser = input.windowsUser.trim();
   const trigger = input.trigger ?? 'onstart';
   if (!windowsUser || /[\r\n\0]/.test(windowsUser)) throw new Error('Windows account name is required for startup resume');
-  if (!input.commandLine || /[\r\n\0]/.test(input.commandLine)) throw new Error('startup resume command is invalid');
-  const args = ['/Create', '/TN', RESUME_TASK_NAME, '/SC', trigger.toUpperCase(), '/RU', windowsUser];
-  if (trigger === 'onstart') args.push('/NP');
-  else args.push('/IT');
-  args.push('/RL', 'HIGHEST', '/TR', input.commandLine, '/F');
-  return args;
+  if (!input.executable || /[\r\n\0]/.test(input.executable)) throw new Error('startup resume executable is invalid');
+  if (/\0/.test(input.arguments)) throw new Error('startup resume arguments are invalid');
+  const triggerXml = trigger === 'onstart'
+    ? '<BootTrigger><Enabled>true</Enabled></BootTrigger>'
+    : `<LogonTrigger><Enabled>true</Enabled><UserId>${xmlEscape(windowsUser)}</UserId></LogonTrigger>`;
+  const logonType = trigger === 'onstart' ? 'S4U' : 'InteractiveToken';
+  return [
+    `<?xml version="1.0" encoding="UTF-16"?>`,
+    `<Task version="${MACHINE_WSL_TASK_XML_VERSION}" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">`,
+    `<Triggers>${triggerXml}</Triggers>`,
+    `<Principals><Principal id="Author"><UserId>${xmlEscape(windowsUser)}</UserId><LogonType>${logonType}</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>`,
+    '<Settings><Enabled>true</Enabled><StartWhenAvailable>true</StartWhenAvailable></Settings>',
+    `<Actions Context="Author"><Exec><Command>${xmlEscape(input.executable)}</Command><Arguments>${xmlEscape(input.arguments)}</Arguments></Exec></Actions>`,
+    '</Task>',
+  ].join('');
+}
+
+export function buildMachineWslStartupTaskArgs(input: { readonly taskXmlPath: string; readonly windowsUser: string }): string[] {
+  const windowsUser = input.windowsUser.trim();
+  if (!windowsUser || /[\r\n\0]/.test(windowsUser)) throw new Error('Windows account name is required for startup resume');
+  if (!input.taskXmlPath || /[\r\n\0]/.test(input.taskXmlPath)) throw new Error('startup resume task XML path is invalid');
+  return ['/Create', '/TN', RESUME_TASK_NAME, '/XML', input.taskXmlPath, '/F'];
+}
+
+export function machineWslResumeTaskDefinitionPath(env: NodeJS.ProcessEnv, override?: string): string | undefined {
+  if (override) return override;
+  const localAppData = env.LOCALAPPDATA ?? (env.USERPROFILE ? pathWin32.join(env.USERPROFILE, 'AppData', 'Local') : undefined);
+  if (!localAppData) return undefined;
+  return pathWin32.join(localAppData, 'Elanous', 'machine-setup-resume.xml');
+}
+
+function machineWslResumeTaskWrapperPath(taskDefinitionPath: string): string {
+  return taskDefinitionPath.replace(/\.xml$/i, `-${randomUUID()}.ps1`);
+}
+
+function machineWslResumeTaskAction(taskDefinitionPath: string, env: NodeJS.ProcessEnv): { readonly executable: string; readonly arguments: string; readonly wrapperPath: string } {
+  const wrapperPath = machineWslResumeTaskWrapperPath(taskDefinitionPath);
+  const executable = pathWin32.join(env.WINDIR ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const arguments_ = ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', wrapperPath]
+    .map(quoteWindowsArgument).join(' ');
+  return { executable, arguments: arguments_, wrapperPath };
+}
+
+function buildMachineWslResumeTaskWrapper(input: {
+  readonly executable: string;
+  readonly entry: string;
+  readonly capture: string;
+  readonly profile: string;
+  readonly distribution: string;
+  readonly user: string;
+  readonly resumeTrigger?: MachineWslResumeTrigger;
+}, wrapperPath: string): string {
+  const payload = Buffer.from(JSON.stringify({ executable: input.executable,
+    arguments: buildMachineWslResumeArguments({ ...input, resumeTaskWrapperPath: wrapperPath }) }), 'utf8').toString('base64');
+  return [
+    '$ErrorActionPreference = "Stop"',
+    `$resume = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json`,
+    '$resumeArgs = @($resume.arguments)',
+    '& $resume.executable @resumeArgs',
+    '$resumeExit = $LASTEXITCODE',
+    'if ($resumeExit -eq 0 -and (Test-Path -LiteralPath $MyInvocation.MyCommand.Path)) { Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force }',
+    'exit $resumeExit',
+    '',
+  ].join('\r\n');
+}
+
+function writeResumeTaskDefinition(filePath: string, xml: string, writer = (target: string, contents: string) => {
+  mkdirSync(dirname(filePath), { recursive: true });
+  // Source: A blank Hyper-V Windows 11 guest rejects UTF-8 schtasks /XML input; UTF-16LE with BOM registers successfully.
+  writeFileSync(filePath, Buffer.from(`\uFEFF${contents}`, 'utf16le'));
+}): void {
+  writer(filePath, xml);
+}
+
+function writeResumeTaskWrapper(filePath: string, script: string, writer = (target: string, contents: string) => {
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(target, contents, 'utf8');
+}): void {
+  writer(filePath, script);
+}
+
+function registerMachineWslResumeTask(input: {
+  readonly executable: string;
+  readonly entry: string;
+  readonly capture: string;
+  readonly profile: string;
+  readonly distribution: string;
+  readonly user: string;
+  readonly resumeTrigger?: MachineWslResumeTrigger;
+}, deps: MachineWslSetupDeps, windowsUser: string,
+invoke: (name: string, args: readonly string[], captureOutput?: boolean) => MachineWslCommandResult,
+markAttempt: () => void): {
+  readonly result: MachineWslCommandResult;
+  readonly taskDefinitionPath?: string;
+  readonly wrapperPath?: string;
+} {
+  const commandLine = buildMachineWslResumeCommand(input);
+  if (deps.scheduleResume) {
+    markAttempt();
+    return { result: deps.scheduleResume(commandLine) };
+  }
+  const env = deps.env ?? process.env;
+  const taskDefinitionPath = machineWslResumeTaskDefinitionPath(env, deps.resumeTaskDefinitionPath);
+  if (!taskDefinitionPath) return { result: { status: null, errorCode: 'LOCALAPPDATA_REQUIRED' } };
+  const action = machineWslResumeTaskAction(taskDefinitionPath, env);
+  const taskXml = buildMachineWslStartupTaskXml({ executable: action.executable, arguments: action.arguments,
+    windowsUser, trigger: input.resumeTrigger });
+  const wrapper = buildMachineWslResumeTaskWrapper(input, action.wrapperPath);
+  try {
+    writeResumeTaskWrapper(action.wrapperPath, wrapper, deps.writeResumeTaskWrapper);
+    writeResumeTaskDefinition(taskDefinitionPath, taskXml, deps.writeResumeTaskDefinition);
+  } catch (error) {
+    const errorCode = (error as NodeJS.ErrnoException).code;
+    const cleanupError = removeResumeTaskArtifacts(taskDefinitionPath, action.wrapperPath);
+    return { result: { status: null, errorCode: errorCode ?? 'RESUME_TASK_FILES_WRITE_FAILED',
+      ...(cleanupError ? { stderr: `resume task file cleanup failed (${cleanupError})` } : {}) }, taskDefinitionPath,
+      wrapperPath: action.wrapperPath };
+  }
+  return { result: invoke('schtasks.exe', buildMachineWslStartupTaskArgs({ taskXmlPath: taskDefinitionPath,
+    windowsUser })), taskDefinitionPath, wrapperPath: action.wrapperPath };
+}
+
+function removeResumeTaskArtifacts(taskDefinitionPath: string | undefined, wrapperPath?: string): string | undefined {
+  if (!taskDefinitionPath) return undefined;
+  // A user can resume setup manually while the registered task still exists. In that path
+  // the CLI has no wrapper argument, so recover the exact wrapper from the task XML before deleting it.
+  const registeredWrapperPath = wrapperPath ?? readResumeTaskWrapperPath(taskDefinitionPath);
+  wrapperPath = registeredWrapperPath;
+  if (wrapperPath) {
+    const taskStem = pathWin32.basename(taskDefinitionPath).replace(/\.xml$/i, '');
+    const wrapperName = pathWin32.basename(wrapperPath);
+    const sameDirectory = pathWin32.normalize(pathWin32.dirname(taskDefinitionPath)).toLowerCase()
+      === pathWin32.normalize(pathWin32.dirname(wrapperPath)).toLowerCase();
+    if (!sameDirectory || !wrapperName.startsWith(`${taskStem}-`) || !/^[0-9a-f-]+\.ps1$/i.test(wrapperName.slice(taskStem.length + 1))) {
+      return 'INVALID_RESUME_TASK_WRAPPER_PATH';
+    }
+  }
+  for (const path of [taskDefinitionPath, ...(wrapperPath ? [wrapperPath] : [])]) {
+    try {
+      rmSync(path, { force: true });
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code ?? 'RESUME_TASK_FILE_REMOVE_FAILED';
+    }
+  }
+  return undefined;
+}
+
+function readResumeTaskWrapperPath(taskDefinitionPath: string): string | undefined {
+  let xml: string;
+  try {
+    xml = readFileSync(taskDefinitionPath, 'utf16le').replace(/^\uFEFF/, '');
+  } catch {
+    return undefined;
+  }
+  const encodedArguments = /<Arguments>([\s\S]*?)<\/Arguments>/i.exec(xml)?.[1];
+  if (!encodedArguments) return undefined;
+  const arguments_ = encodedArguments.replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  const match = /(?:^|\s)-File\s+(?:"([^"]+)"|([^\s]+))/i.exec(arguments_);
+  return match?.[1] ?? match?.[2];
 }
 
 function validDistribution(value: string): boolean {
@@ -148,6 +335,17 @@ function fail(distribution: string, user: string, operation: string, result: Mac
       : `exit ${result.status ?? 'unknown'}${diagnostic ? `: ${diagnostic}` : ''}`);
   return { kind: 'machine-wsl-setup-result', status: 'failed', distribution, user, detail: operation,
     attempted, failures: [{ operation, reason }] };
+}
+
+function failResumeRegistration(distribution: string, user: string, result: MachineWslCommandResult, attempted: number,
+  taskDefinitionPath?: string, wrapperPath?: string): MachineWslSetupResult {
+  const registrationFailure = fail(distribution, user, 'register-resume', result, attempted);
+  const cleanupError = removeResumeTaskArtifacts(taskDefinitionPath, wrapperPath);
+  if (!cleanupError) return registrationFailure;
+  return { ...registrationFailure, failures: [...registrationFailure.failures, {
+    operation: 'remove-resume-task-definition', target: taskDefinitionPath ?? 'LocalAppData task XML',
+    reason: `file cleanup failed (${cleanupError})`,
+  }] };
 }
 
 export function buildWslDockerPrerequisiteScript(): string {
@@ -267,12 +465,12 @@ export function applyMachineWslBootstrap(input: {
     const windowsUser = (deps.env ?? process.env).USERNAME?.trim();
     if (!deps.scheduleResume && !windowsUser) return fail(distribution, user, 'register-resume', { status: null,
       errorCode: 'WINDOWS_USER_REQUIRED' }, attempted, 'cannot register an unattended startup task without the current Windows account name');
-    const resumeCommand = buildMachineWslResumeCommand({ executable, entry, capture: input.capture,
-      profile: input.profile, distribution, user, resumeTrigger: input.resumeTrigger });
-    const scheduled = deps.scheduleResume
-      ? (attempted += 1, deps.scheduleResume(resumeCommand))
-      : invoke('schtasks.exe', buildMachineWslStartupTaskArgs({ commandLine: resumeCommand, windowsUser: windowsUser!, trigger: input.resumeTrigger }));
-    if (scheduled.status !== 0) return fail(distribution, user, 'register-resume', scheduled, attempted);
+    const registration = registerMachineWslResumeTask({ executable, entry, capture: input.capture,
+      profile: input.profile, distribution, user, resumeTrigger: input.resumeTrigger }, deps, windowsUser ?? '', invoke, () => { attempted += 1; });
+    if (registration.result.status !== 0) {
+      return failResumeRegistration(distribution, user, registration.result, attempted,
+        registration.taskDefinitionPath, registration.wrapperPath);
+    }
     const installed = invoke('wsl.exe', ['--install', '--distribution', distribution, '--no-launch'], true);
     if (installed.status !== 0) return fail(distribution, user, 'wsl-install', installed, attempted);
     const resumeTrigger = input.resumeTrigger ?? 'onstart';
@@ -293,12 +491,12 @@ export function applyMachineWslBootstrap(input: {
     const windowsUser = (deps.env ?? process.env).USERNAME?.trim();
     if (!deps.scheduleResume && !windowsUser) return fail(distribution, user, 'register-resume', { status: null,
       errorCode: 'WINDOWS_USER_REQUIRED' }, attempted, 'cannot register an unattended startup task without the current Windows account name');
-    const resumeCommand = buildMachineWslResumeCommand({ executable, entry, capture: input.capture,
-      profile: input.profile, distribution, user, resumeTrigger });
-    const scheduled = deps.scheduleResume
-      ? (attempted += 1, deps.scheduleResume(resumeCommand))
-      : invoke('schtasks.exe', buildMachineWslStartupTaskArgs({ commandLine: resumeCommand, windowsUser: windowsUser!, trigger: resumeTrigger }));
-    if (scheduled.status !== 0) return fail(distribution, user, 'register-resume', scheduled, attempted);
+    const registration = registerMachineWslResumeTask({ executable, entry, capture: input.capture,
+      profile: input.profile, distribution, user, resumeTrigger }, deps, windowsUser ?? '', invoke, () => { attempted += 1; });
+    if (registration.result.status !== 0) {
+      return failResumeRegistration(distribution, user, registration.result, attempted,
+        registration.taskDefinitionPath, registration.wrapperPath);
+    }
     const installed = invoke('wsl.exe', ['--install', '--distribution', distribution, '--no-launch'], true);
     if (installed.status !== 0) return fail(distribution, user, 'wsl-install', installed, attempted);
     return { kind: 'machine-wsl-setup-result', status: 'resume-pending', distribution, user, resumeTrigger,
@@ -335,6 +533,8 @@ export function applyMachineWslProfile(input: {
   readonly distribution: string;
   readonly user: string;
   readonly run?: MachineWslSetupDeps['run'];
+  readonly resumeTaskDefinitionPath?: string;
+  readonly resumeTaskWrapperPath?: string;
 }): MachineSetupApplyResult {
   const command = input.run ?? run;
   const runGuest = (name: string, args: readonly string[]) => command('wsl.exe', [
@@ -365,9 +565,30 @@ export function applyMachineWslProfile(input: {
     : undefined;
   if (dockerProbe?.status === 0) dockerEngineReady = true;
   else if (dockerProbe?.status === 45) {
-    failures.push({ operation: 'wsl-docker-engine-probe', target: 'docker',
-      reason: 'an existing Docker command is present but its engine is unreachable; leaving the existing Docker Desktop integration untouched. Start it or repair its WSL integration, then retry.' });
-    return { ...validation, applied: false, attempted: 1, succeeded, failures };
+    const context = runGuest('/bin/bash', ['-lc', `if [ -z "\${DOCKER_HOST:-}" ] && [ "$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null)" = 'unix:///var/run/docker.sock' ]; then printf '%s' docker-context-local-socket; fi`]);
+    const serviceSocket = context.status === 0 && context.stdout?.trim() === 'docker-context-local-socket'
+      ? runRoot('/bin/bash', ['-lc', `pid=$(/usr/bin/systemctl show docker --property MainPID --value); if /usr/bin/systemctl is-active --quiet docker && /usr/bin/getent group docker >/dev/null 2>&1 && /usr/bin/ss -xlpn 2>/dev/null | /usr/bin/grep -F '/run/docker.sock' | /usr/bin/grep -F "pid=$pid," >/dev/null && ! /usr/bin/id -nG "$1" | /usr/bin/tr ' ' '\n' | /usr/bin/grep -Fxq docker; then printf '%s' linux-docker-group-missing; fi`, 'bash', input.user])
+      : undefined;
+    if (serviceSocket?.status === 0 && serviceSocket.stdout?.trim() === 'linux-docker-group-missing') {
+      attempted += 1;
+      const repaired = runRoot('/usr/sbin/usermod', ['--append', '--groups', 'docker', input.user]);
+      if (repaired.status !== 0) return fail('wsl-docker-group-repair', input.user, repaired);
+      succeeded += 1;
+      const restarted = command('wsl.exe', ['--terminate', input.distribution]);
+      if (restarted.status !== 0) return fail('wsl-docker-group-restart', input.distribution, restarted);
+      // Source: existing WSL Docker probe exit contract immediately above; success means reachable and 45 means unreachable.
+      const refreshedProbe = runGuest('/bin/bash', ['-lc', 'if docker info >/dev/null 2>&1; then exit 0; else exit 45; fi']);
+      if (refreshedProbe.status === 0) dockerEngineReady = true;
+      else {
+        failures.push({ operation: 'wsl-docker-engine-probe', target: 'docker',
+          reason: 'Docker remains unreachable after repairing the Linux docker-group membership; inspect the WSL Docker service and retry.' });
+        return { ...validation, applied: false, attempted: attempted + 1, succeeded, failures };
+      }
+    } else {
+      failures.push({ operation: 'wsl-docker-engine-probe', target: 'docker',
+        reason: 'an existing Docker command is present but its engine is unreachable; leaving the existing Docker Desktop integration untouched. Start it or repair its WSL integration, then retry.' });
+      return { ...validation, applied: false, attempted: 1, succeeded, failures };
+    }
   } else if (dockerProbe && dockerProbe.status !== 44) {
     attempted += 1;
     return fail('wsl-docker-engine-probe', 'docker', dockerProbe);
@@ -470,12 +691,19 @@ export function applyMachineWslProfile(input: {
     if (query.status === 0) {
       attempted += 1;
       const removed = command('schtasks.exe', ['/Delete', '/TN', RESUME_TASK_NAME, '/F'], true);
-      if (removed.status === 0) succeeded += 1;
+      if (removed.status === 0) {
+        succeeded += 1;
+        const cleanupError = removeResumeTaskArtifacts(input.resumeTaskDefinitionPath, input.resumeTaskWrapperPath);
+        if (cleanupError) failures.push({ operation: 'remove-resume-task-definition', target: 'LocalAppData task XML', reason: `file cleanup failed (${cleanupError})` });
+      }
       else failures.push({ operation: 'remove-startup-resume', target: RESUME_TASK_NAME,
         reason: removed.status === null && removed.errorCode ? `command unavailable (${removed.errorCode})` : `exit ${removed.status ?? 'unknown'}` });
     } else if (!/cannot find|cannot locate|not found/i.test(`${query.stdout ?? ''} ${query.stderr ?? ''}`)) {
       failures.push({ operation: 'query-startup-resume', target: RESUME_TASK_NAME,
         reason: query.status === null && query.errorCode ? `command unavailable (${query.errorCode})` : `exit ${query.status ?? 'unknown'}` });
+    } else {
+      const cleanupError = removeResumeTaskArtifacts(input.resumeTaskDefinitionPath, input.resumeTaskWrapperPath);
+      if (cleanupError) failures.push({ operation: 'remove-resume-task-definition', target: 'LocalAppData task XML', reason: `file cleanup failed (${cleanupError})` });
     }
   }
   return { ...profileResult, applied: failures.length === 0, attempted, succeeded, failures };

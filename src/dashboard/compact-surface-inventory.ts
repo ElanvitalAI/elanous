@@ -41,7 +41,6 @@ export function buildDashboardSurfaceCatalogTargets(args: {
       ...closedPaneTargets,
       { id: 'pane:browser', label: 'Browser popup', description: 'Open Browser as a popup', group: 'Panes' },
       { id: 'pane:preview', label: 'Preview popup', description: 'Open Preview as a popup', group: 'Panes' },
-      { id: 'pane:browser-preview', label: 'Browser + Preview popup', description: 'Open the combined browser/preview modal', group: 'Panes' },
       { id: 'pane:scratch', label: 'Scratch popup', description: 'Open Scratch as a popup canvas', group: 'Panes' },
       { id: 'pane:obsidian', label: 'Obsidian popup', description: 'Open Obsidian as a popup', group: 'Panes' },
       { id: 'pane:skill-browser', label: 'Skill browser popup', description: 'Open the skill browser popup', group: 'Panes' },

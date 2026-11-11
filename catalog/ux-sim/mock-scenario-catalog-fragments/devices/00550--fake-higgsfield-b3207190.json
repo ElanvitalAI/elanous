@@ -19,5 +19,11 @@
   ],
   "logsRecorded": "no",
   "eventNames": [],
-  "recentUse": null
+  "recentUse": null,
+  "audience": "user",
+  "defaultProfile": {
+    "credentials": "fake-only",
+    "network": "loopback-only",
+    "storage": "temporary"
+  }
 }

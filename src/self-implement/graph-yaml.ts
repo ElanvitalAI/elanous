@@ -15,10 +15,30 @@ import { parseOverlayCondition } from './graph-overlay-condition.js';
  *    🩸 §4.6 이 지목한 병: `mission-capabilities/registry.ts` 가 그 방식이라 `--root` 격리가 불가능하다. */
 export type GraphNodeKind = typeof HARNESS_CORE_KINDS[number];
 
+/** Opaque, namespaced extension payload. Runners hash and persist it but never interpret it. */
+export type GraphExtensionMap = Readonly<Record<string, unknown>>;
+
+export interface GraphV2Declaration {
+  readonly apiVersion: 'elanous.dev/graph/v2';
+  readonly sourceVersion: string;
+  readonly layer: 'flow' | 'unit';
+  readonly purpose: string;
+  readonly cap?: string;
+  readonly allow?: Readonly<Record<string, unknown>>;
+  readonly packs?: readonly string[];
+  readonly observe?: Readonly<Record<string, unknown>>;
+  readonly sims?: readonly string[];
+  readonly policy?: Readonly<Record<string, unknown>>;
+  readonly loop?: { readonly stopWhen?: readonly string[]; readonly budget?: Readonly<Record<string, unknown>> };
+}
+
 export interface GraphNodeContract {
   readonly inputs: readonly string[];
   readonly tools: string;
   readonly outputs: readonly string[];
+  /** Portable JSON Schema subset checked at the child call boundary. */
+  readonly inputSchema?: Readonly<Record<string, unknown>>;
+  readonly outputSchema?: Readonly<Record<string, unknown>>;
 }
 
 export interface GraphNodeSubscription {
@@ -27,13 +47,31 @@ export interface GraphNodeSubscription {
   readonly action: 'wake' | 'invalidate' | 'reroute';
 }
 
+export interface GraphHitlOption { readonly key: string; readonly exit: string; readonly default?: boolean }
+
+export interface GraphUnitShape {
+  readonly skip?: readonly string[];
+  readonly recipe?: Readonly<Record<string, string>>;
+  readonly fanoutMax?: number;
+}
+
+export interface GraphUnitShapePoints {
+  readonly skip?: readonly string[];
+  readonly recipe?: readonly string[];
+  readonly fanoutMax?: { readonly min: number; readonly max: number };
+}
+
 export interface GraphNodeSpec {
   readonly nodeId: string;
   readonly kind: GraphNodeKind | (string & {});
   readonly recipe: string;
   readonly maxVisits: number;
+  /** Source-declared structural cap marker, preserved without runner interpretation. */
+  readonly cap?: string;
   /** Direct prerequisite node IDs; independent nodes with one source and a common dependent are compiled to a fan-out barrier. */
   readonly needs?: readonly string[];
+  /** Contract id required by a generic capability node. */
+  readonly requires?: `${string}.${string}@${number}`;
   /** Named shared resources; nodes with a common lock are never dispatched together. */
   readonly resourceLocks?: readonly string[];
   /** L0 journey-stage declaration (optional for other graph templates). */
@@ -44,6 +82,8 @@ export interface GraphNodeSpec {
   /** ⭐ 「아크마다 한 번」처럼 «한 노드가 여럿 돈다」를 값으로. 없으면 한 번이다. */
   readonly fanOut?: string;
   readonly contract?: GraphNodeContract;
+  /** Declarative human choice keys mapped to graph outcome exits. */
+  readonly hitl?: { readonly options: readonly GraphHitlOption[] };
   /** Optional node-scoped payload, used by persisted run-local graph additions. */
   readonly input?: unknown;
   /** Structured event kinds this node is allowed to publish. */
@@ -51,6 +91,8 @@ export interface GraphNodeSpec {
   /** Structured event subscriptions dispatched by the graph runner. */
   readonly subscribes?: readonly GraphNodeSubscription[];
   readonly call?: string;
+  /** Bounded changes requested for this unit call. */
+  readonly shape?: GraphUnitShape;
   /** Entry selected by this call when a unit exposes more than one entry. */
   readonly callEntry?: string;
   readonly budget?: { readonly innerSteps: number };
@@ -58,6 +100,10 @@ export interface GraphNodeSpec {
   readonly allowance?: { readonly innerSteps: number };
   /** L1: skip this optional node when a measured state condition holds. */
   readonly skipWhen?: string;
+  /** Opaque extension values and provider-facing context; both are recorded with the graph snapshot. */
+  readonly ext?: GraphExtensionMap;
+  readonly postconditions?: readonly string[];
+  readonly context?: { readonly ext: Readonly<Record<string, GraphExtensionMap>> };
 }
 
 export interface GraphEdgeSpec {
@@ -77,11 +123,27 @@ export interface GraphEdgeSpec {
   readonly observed?: number;
   /** L1: a measured state condition takes precedence over the default edge. */
   readonly when?: string;
+  readonly ext?: GraphExtensionMap;
+}
+
+export interface GraphSupervisorSpec {
+  readonly ref: `loop:${string}@${number}`;
+  readonly role: 'primary' | 'observer' | 'healer';
+  readonly scope: 'run' | 'template';
+  readonly authority: readonly ('reroute' | 'add-node' | 'repair' | 'hitl' | 'cleanup')[];
+  readonly requires: readonly string[];
 }
 
 export interface GraphTemplateSpec {
-  readonly loop?: { readonly title?: string; readonly description?: string; readonly trigger?: { readonly cron?: string; readonly events?: readonly string[] } };
+  readonly loop?: { readonly title?: string; readonly description?: string; readonly root?: string; readonly parent?: string; readonly stage?: string;
+    readonly trigger?: { readonly cron?: string; readonly events?: readonly string[] }; readonly stopWhen?: string; readonly scope?: Readonly<Record<string, unknown>>;
+    readonly authority?: Readonly<Record<string, unknown>>; readonly budget?: Readonly<Record<string, unknown>>; readonly ext?: GraphExtensionMap };
   readonly graphId: string;
+  /** Named loop agents allowed to supervise this graph; execution binds their cards separately. */
+  readonly supervisors?: readonly GraphSupervisorSpec[];
+  /** Preserved v2 source declaration; execution remains through this file's legacy IR fields. */
+  readonly ext?: GraphExtensionMap;
+  readonly v2?: GraphV2Declaration;
   readonly version: number;
   /** Maximum number of ready fan-out nodes; omitted means legacy unbounded fan-out. */
   readonly maxParallelNodes?: number;
@@ -95,7 +157,8 @@ export interface GraphTemplateSpec {
   readonly allowance?: { readonly innerSteps: number };
   /** ⭐ 런 계약(선택) — 이 그래프가 «기본으로» 요구하는 실행 칸 등. 발사 인자가 덮는다(graph-run-contract.ts). */
   readonly runContract?: GraphRunContractSpec;
-  readonly unit?: { readonly inputs: readonly string[]; readonly outputs: readonly string[]; readonly exits: readonly string[]; readonly entries?: readonly string[] };
+  readonly unit?: { readonly inputs: readonly string[]; readonly outputs: readonly string[]; readonly exits: readonly string[];
+    readonly entries?: readonly string[]; readonly shapePoints?: GraphUnitShapePoints };
   /** Non-executable landing policy declaration. The train executor consumes this in a later slice. */
   readonly policy?: LandUnitTrainPolicySpec;
   readonly nodes: readonly GraphNodeSpec[];
@@ -150,6 +213,20 @@ function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
+function validUnitValueSchema(value: unknown, depth = 0): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || depth > 8) return false;
+  const schema = value as Record<string, unknown>;
+  if (Object.keys(schema).some(key => !['type', 'required', 'properties', 'items', 'enum'].includes(key)) ||
+      typeof schema.type !== 'string' || !['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'].includes(schema.type)) return false;
+  if (schema.required !== undefined && (schema.type !== 'object' || !Array.isArray(schema.required) ||
+      !schema.required.every(key => typeof key === 'string' && key.length > 0))) return false;
+  if (schema.properties !== undefined && (schema.type !== 'object' || !schema.properties ||
+      typeof schema.properties !== 'object' || Array.isArray(schema.properties) ||
+      !Object.values(schema.properties).every(child => validUnitValueSchema(child, depth + 1)))) return false;
+  if (schema.items !== undefined && (schema.type !== 'array' || !validUnitValueSchema(schema.items, depth + 1))) return false;
+  return schema.enum === undefined || (Array.isArray(schema.enum) && schema.enum.length > 0);
+}
+
 /** ⛔ 던지지 않는다. 못 읽은 것은 `errors` 로, 읽었지만 의심스러운 것은 `warnings` 로 낸다. */
 export function parseGraphTemplateYaml(source: string, label = '<inline>'): GraphParseResult {
   const errors: GraphParseIssue[] = [];
@@ -167,6 +244,52 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
 
   const graphId = typeof doc.graph_id === 'string' ? doc.graph_id : undefined;
   if (graphId === undefined) errors.push({ path: `${label}/graph_id`, message: 'graph_id 가 없거나 문자열이 아니다' });
+  const supervisors: GraphSupervisorSpec[] = [];
+  if (doc.supervisors !== undefined) {
+    if (!Array.isArray(doc.supervisors) || doc.supervisors.length === 0) {
+      errors.push({ path: `${label}/supervisors`, message: 'supervisors 는 비어 있지 않은 목록이어야 한다' });
+    } else {
+      const refs = new Set<string>();
+      let primaryCount = 0;
+      for (const [index, value] of doc.supervisors.entries()) {
+        const at = `${label}/supervisors/${index}`;
+        if (!isRecord(value) || Object.keys(value).some(key => !['ref', 'role', 'scope', 'authority', 'requires'].includes(key))) {
+          errors.push({ path: at, message: '감독자는 ref·role·scope·authority·requires 만 가진 맵이어야 한다' });
+          continue;
+        }
+        if (typeof value.ref !== 'string' || !/^loop:[a-z][a-z0-9-]*@[1-9]\d*$/.test(value.ref))
+          errors.push({ path: `${at}/ref`, message: 'ref 는 loop:<id>@<positive version> 이어야 한다' });
+        if (value.role !== 'primary' && value.role !== 'observer' && value.role !== 'healer')
+          errors.push({ path: `${at}/role`, message: 'role 은 primary|observer|healer 이어야 한다' });
+        if (value.scope !== undefined && value.scope !== 'run' && value.scope !== 'template')
+          errors.push({ path: `${at}/scope`, message: 'scope 는 run|template 이어야 한다' });
+        const authorities = ['reroute', 'add-node', 'repair', 'hitl', 'cleanup'];
+        if (!Array.isArray(value.authority) || value.authority.length === 0 ||
+            value.authority.some(item => typeof item !== 'string' || !authorities.includes(item)) ||
+            new Set(value.authority).size !== value.authority.length)
+          errors.push({ path: `${at}/authority`, message: 'authority 는 중복 없는 허용 동사 목록이어야 한다' });
+        if (value.requires !== undefined && (!Array.isArray(value.requires) ||
+            value.requires.some(item => typeof item !== 'string' || !/^[a-z][a-z0-9.-]*\/[a-z][a-z0-9-]*$/.test(item)) ||
+            new Set(value.requires).size !== value.requires.length))
+          errors.push({ path: `${at}/requires`, message: 'requires 는 중복 없는 이름공간 확장 목록이어야 한다' });
+        if (typeof value.ref === 'string') {
+          if (refs.has(value.ref)) errors.push({ path: `${at}/ref`, message: '감독자 ref 는 중복될 수 없다' });
+          refs.add(value.ref);
+        }
+        if (value.role === 'primary') primaryCount++;
+        if (typeof value.ref === 'string' && /^loop:[a-z][a-z0-9-]*@[1-9]\d*$/.test(value.ref) &&
+            (value.role === 'primary' || value.role === 'observer' || value.role === 'healer') &&
+            (value.scope === undefined || value.scope === 'run' || value.scope === 'template') &&
+            Array.isArray(value.authority) && value.authority.length > 0 &&
+            value.authority.every(item => authorities.includes(item)) &&
+            (value.requires === undefined || Array.isArray(value.requires)))
+          supervisors.push({ ref: value.ref as GraphSupervisorSpec['ref'], role: value.role,
+            scope: (value.scope ?? 'run') as GraphSupervisorSpec['scope'],
+            authority: value.authority as GraphSupervisorSpec['authority'], requires: (value.requires ?? []) as string[] });
+      }
+      if (primaryCount !== 1) errors.push({ path: `${label}/supervisors`, message: '감독자 목록에는 primary 가 정확히 하나여야 한다' });
+    }
+  }
   const policy = graphId === 'land' ? parseLandUnitTrainPolicy(doc.policy, `${label}/policy`, errors) : undefined;
   if (graphId === 'land' && doc.policy === undefined) errors.push({ path: `${label}/policy`, message: 'land 유닛에는 착지 열차 policy 가 필요하다' });
   const version = typeof doc.version === 'number' && Number.isInteger(doc.version) ? doc.version : undefined;
@@ -214,6 +337,8 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     }
     const recipe = n.recipe;
     if (typeof recipe !== 'string') { errors.push({ path: `${at}/recipe`, message: 'recipe 가 없다 — 이 노드가 «무엇으로» 도는지 모른다' }); continue; }
+    if (n.requires !== undefined && (typeof n.requires !== 'string' || !/^[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*@[1-9]\d*$/.test(n.requires)))
+      errors.push({ path: `${at}/requires`, message: 'requires 는 <namespace>.<contract>@<positive version> 이어야 한다' });
     const maxVisits = n.max_visits;
     if (typeof maxVisits !== 'number' || !Number.isInteger(maxVisits) || maxVisits < 1) {
       errors.push({ path: `${at}/max_visits`, message: 'max_visits 는 1 이상의 정수여야 한다' });
@@ -252,6 +377,8 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
           inputs: asArray(contractRaw.inputs).filter((v): v is string => typeof v === 'string'),
           tools: typeof contractRaw.tools === 'string' ? contractRaw.tools : '',
           outputs: asArray(contractRaw.outputs).filter((v): v is string => typeof v === 'string'),
+          ...(validUnitValueSchema(contractRaw.input_schema) ? { inputSchema: contractRaw.input_schema } : {}),
+          ...(validUnitValueSchema(contractRaw.output_schema) ? { outputSchema: contractRaw.output_schema } : {}),
         }
       : undefined;
     let emits: string[] | undefined;
@@ -300,10 +427,79 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
         }
       }
     }
+    let hitl: GraphNodeSpec['hitl'];
+    if (n.hitl !== undefined) {
+      const declaration = n.hitl && typeof n.hitl === 'object' && !Array.isArray(n.hitl) ? n.hitl as Record<string, unknown> : undefined;
+      if (!declaration || Object.keys(declaration).some(key => key !== 'options') || !Array.isArray(declaration.options) || declaration.options.length === 0) {
+        errors.push({ path: `${at}/hitl`, message: 'hitl 은 options 를 가진 맵이어야 한다' });
+      } else {
+        const options: GraphHitlOption[] = [];
+        const keys = new Set<string>();
+        let defaults = 0;
+        for (const [optionIndex, rawOption] of declaration.options.entries()) {
+          const optionPath = `${at}/hitl/options/${optionIndex}`;
+          const option = rawOption && typeof rawOption === 'object' && !Array.isArray(rawOption) ? rawOption as Record<string, unknown> : undefined;
+          if (!option || Object.keys(option).some(key => !['key', 'exit', 'default'].includes(key)) ||
+              typeof option.key !== 'string' || !option.key.trim() || typeof option.exit !== 'string' || !option.exit.trim() ||
+              (option.default !== undefined && typeof option.default !== 'boolean')) {
+            errors.push({ path: optionPath, message: 'HITL 선택지는 key·exit 문자열과 선택적 boolean default 만 허용한다' });
+            continue;
+          }
+          if (keys.has(option.key)) errors.push({ path: `${optionPath}/key`, message: 'HITL key 는 중복될 수 없다' });
+          keys.add(option.key);
+          if (option.default === true) defaults++;
+          options.push({ key: option.key, exit: option.exit, ...(option.default === true ? { default: true } : {}) });
+        }
+        if (defaults > 1) errors.push({ path: `${at}/hitl/options`, message: 'HITL 기본 선택지는 하나만 허용한다' });
+        if (options.length === declaration.options.length) hitl = { options };
+      }
+      if (kind !== 'hitl') errors.push({ path: `${at}/hitl`, message: 'hitl 선언은 kind: hitl 에서만 허용된다' });
+    }
     // A subgraph node becomes a unit call only when it names `call:`; without it the node keeps the
     // pre-unit meaning (catalog role / recipe node), so existing declarations stay valid.
+    let call: string | undefined;
+    let shape: GraphUnitShape | undefined;
+    if (kind === 'subgraph' && n.call !== undefined) {
+      if (typeof n.call === 'string') call = n.call;
+      else if (n.call && typeof n.call === 'object' && !Array.isArray(n.call)) {
+        const declaration = n.call as Record<string, unknown>;
+        if (Object.keys(declaration).some(key => !['unit', 'shape'].includes(key)))
+          errors.push({ path: `${at}/call`, message: 'call 맵은 unit·shape 만 허용한다' });
+        if (typeof declaration.unit === 'string') call = declaration.unit;
+        else errors.push({ path: `${at}/call/unit`, message: 'unit 은 id@정수판 또는 id@^주판이어야 한다' });
+        if (declaration.shape !== undefined) {
+          const rawShape = declaration.shape && typeof declaration.shape === 'object' && !Array.isArray(declaration.shape)
+            ? declaration.shape as Record<string, unknown> : undefined;
+          if (!rawShape || Object.keys(rawShape).some(key => !['skip', 'recipe', 'fanout_max'].includes(key))) {
+            errors.push({ path: `${at}/call/shape`, message: 'shape 는 skip·recipe·fanout_max 만 허용하는 맵이어야 한다' });
+          } else {
+            const parsedShape: { skip?: string[]; recipe?: Record<string, string>; fanoutMax?: number } = {};
+            if (rawShape.skip !== undefined) {
+              if (!Array.isArray(rawShape.skip) || !rawShape.skip.every(value => typeof value === 'string' && value.trim()) ||
+                  new Set(rawShape.skip).size !== rawShape.skip.length)
+                errors.push({ path: `${at}/call/shape/skip`, message: 'skip 은 중복 없는 노드 id 목록이어야 한다' });
+              else parsedShape.skip = rawShape.skip as string[];
+            }
+            if (rawShape.recipe !== undefined) {
+              const replacements = rawShape.recipe && typeof rawShape.recipe === 'object' && !Array.isArray(rawShape.recipe)
+                ? rawShape.recipe as Record<string, unknown> : undefined;
+              if (!replacements || Object.entries(replacements).some(([node, value]) => !node.trim() || typeof value !== 'string' || !value.trim()))
+                errors.push({ path: `${at}/call/shape/recipe`, message: 'recipe 는 노드 id 에 비어 있지 않은 recipe 를 대응하는 맵이어야 한다' });
+              else parsedShape.recipe = Object.fromEntries(Object.entries(replacements) as [string, string][]);
+            }
+            if (rawShape.fanout_max !== undefined) {
+              if (!Number.isSafeInteger(rawShape.fanout_max) || (rawShape.fanout_max as number) < 1)
+                errors.push({ path: `${at}/call/shape/fanout_max`, message: 'fanout_max 는 1 이상의 안전한 정수여야 한다' });
+              else parsedShape.fanoutMax = rawShape.fanout_max as number;
+            }
+            if (Object.keys(rawShape).length === 0) errors.push({ path: `${at}/call/shape`, message: 'shape 요청이 비었다' });
+            if (Object.keys(parsedShape).length > 0) shape = parsedShape;
+          }
+        }
+      } else errors.push({ path: `${at}/call`, message: 'call 은 unit id 문자열 또는 { unit, shape } 맵이어야 한다' });
+    }
     if (kind === 'subgraph' && (n.call !== undefined || n.budget !== undefined || n.allowance !== undefined || n.call_entry !== undefined)) {
-      if (typeof n.call !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*@(?:\^?[1-9]\d*)$/.test(n.call))
+      if (!call || !/^[A-Za-z0-9][A-Za-z0-9._-]*@(?:\^?[1-9]\d*)$/.test(call))
         errors.push({ path: `${at}/call`, message: 'call 은 id@정수판 또는 id@^주판이어야 한다' });
       const budget = n.budget as Record<string, unknown> | undefined;
       if (!budget || typeof budget !== 'object' || Array.isArray(budget) ||
@@ -319,6 +515,11 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       if (!contractRaw || !Array.isArray(contractRaw.inputs) || !contractRaw.inputs.every(v => typeof v === 'string') ||
           !Array.isArray(contractRaw.outputs) || !contractRaw.outputs.every(v => typeof v === 'string'))
         errors.push({ path: `${at}/contract`, message: 'subgraph 에는 inputs·outputs 계약이 필요하다' });
+      for (const field of ['input_schema', 'output_schema'] as const) {
+        if (contractRaw?.[field] !== undefined && (!validUnitValueSchema(contractRaw[field]) ||
+          (contractRaw[field] as Record<string, unknown>).type !== 'object'))
+          errors.push({ path: `${at}/contract/${field}`, message: 'unit 값 계약은 object JSON Schema subset 이어야 한다' });
+      }
       if (recipe !== 'none') errors.push({ path: `${at}/recipe`, message: 'subgraph 는 recipe 를 실행하지 않는다' });
       if (n.call_entry !== undefined && (typeof n.call_entry !== 'string' || !n.call_entry.trim()))
         errors.push({ path: `${at}/call_entry`, message: 'call_entry 는 비어 있지 않은 노드 id 여야 한다' });
@@ -331,6 +532,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
 
     nodes.push({
       nodeId, kind, recipe, maxVisits,
+      ...(typeof n.requires === 'string' ? { requires: n.requires as `${string}.${string}@${number}` } : {}),
       ...(needs === undefined ? {} : { needs }),
       ...(resourceLocks === undefined ? {} : { resourceLocks }),
       ...(typeof n.journey_stage === 'string' ? { journeyStage: n.journey_stage } : {}),
@@ -339,10 +541,12 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       ...(Array.isArray(n.terminal_stages) ? { terminalStages: n.terminal_stages.filter((v): v is string => typeof v === 'string') } : {}),
       ...(typeof n.fan_out === 'string' ? { fanOut: n.fan_out } : {}),
       ...(contract ? { contract } : {}),
+      ...(hitl ? { hitl } : {}),
       ...(Object.hasOwn(n, 'input') ? { input: n.input } : {}),
       ...(emits === undefined ? {} : { emits }),
       ...(subscribes === undefined ? {} : { subscribes }),
-      ...(kind === 'subgraph' && typeof n.call === 'string' ? { call: n.call } : {}),
+      ...(kind === 'subgraph' && call ? { call } : {}),
+      ...(kind === 'subgraph' && shape ? { shape } : {}),
       ...(kind === 'subgraph' && typeof n.call_entry === 'string' ? { callEntry: n.call_entry } : {}),
       ...(kind === 'subgraph' && n.budget && typeof n.budget === 'object' && !Array.isArray(n.budget) &&
         typeof (n.budget as Record<string, unknown>).inner_steps === 'number'
@@ -530,7 +734,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
   if (doc.unit !== undefined) {
     const rawUnit = doc.unit as Record<string, unknown>;
     if (!rawUnit || typeof rawUnit !== 'object' || Array.isArray(rawUnit) ||
-        Object.keys(rawUnit).some(key => !['inputs', 'outputs', 'exits', 'entries'].includes(key)) ||
+        Object.keys(rawUnit).some(key => !['inputs', 'outputs', 'exits', 'entries', 'shape_points'].includes(key)) ||
         !['inputs', 'outputs', 'exits'].every(key => Array.isArray(rawUnit[key]) &&
           (rawUnit[key] as unknown[]).every(v => typeof v === 'string' && v.length > 0) &&
           new Set(rawUnit[key] as string[]).size === (rawUnit[key] as string[]).length) ||
@@ -540,8 +744,57 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
         (rawUnit.entries !== undefined && (!Array.isArray(rawUnit.entries) || !(rawUnit.entries as unknown[]).every(v => typeof v === 'string' && v.length > 0 && known.has(v)) ||
           new Set(rawUnit.entries as string[]).size !== (rawUnit.entries as string[]).length || !(rawUnit.entries as string[]).includes(entryNode!)))) {
       errors.push({ path: `${label}/unit`, message: 'unit 의 inputs·outputs·exits 및 terminal_nodes 가 일치해야 한다' });
-    } else unit = { inputs: rawUnit.inputs as string[], outputs: rawUnit.outputs as string[], exits: rawUnit.exits as string[],
-      ...(rawUnit.entries === undefined ? {} : { entries: rawUnit.entries as string[] }) };
+    } else {
+      let shapePoints: GraphUnitShapePoints | undefined;
+      if (rawUnit.shape_points !== undefined) {
+        const rawPoints = rawUnit.shape_points && typeof rawUnit.shape_points === 'object' && !Array.isArray(rawUnit.shape_points)
+          ? rawUnit.shape_points as Record<string, unknown> : undefined;
+        if (!rawPoints || Object.keys(rawPoints).some(key => !['skip', 'recipe', 'fanout_max'].includes(key))) {
+          errors.push({ path: `${label}/unit/shape_points`, message: 'shape_points 는 skip·recipe·fanout_max 만 허용하는 맵이어야 한다' });
+        } else {
+          const points: { skip?: string[]; recipe?: string[]; fanoutMax?: { min: number; max: number } } = {};
+          for (const key of ['skip', 'recipe'] as const) {
+            const rawIds = rawPoints[key];
+            if (rawIds === undefined) continue;
+            if (!Array.isArray(rawIds) || rawIds.length === 0 || !rawIds.every(value => typeof value === 'string' && value.trim()) ||
+                new Set(rawIds).size !== rawIds.length) {
+              errors.push({ path: `${label}/unit/shape_points/${key}`, message: `${key} 는 중복 없는 비어 있지 않은 노드 id 목록이어야 한다` });
+              continue;
+            }
+            const ids = rawIds as string[];
+            points[key] = ids;
+            for (const id of ids) {
+              const node = nodes.find(candidate => candidate.nodeId === id);
+              if (!node) errors.push({ path: `${label}/unit/shape_points/${key}`, message: `'${id}' 는 선언된 노드가 아니다` });
+              else if (key === 'skip') {
+                const incoming = edges.filter(edge => edge.to === id || Object.values(edge.map ?? {}).includes(id));
+                const outgoing = edges.filter(edge => edge.from === id);
+                if (id === entryNode || (rawUnit.entries as string[] | undefined)?.includes(id) || terminalNodes.includes(id) || node.kind === 'gate' || node.kind === 'hitl' || node.kind === 'subgraph' ||
+                    incoming.length !== 1 || incoming.some(edge => edge.branches || edge.fallback || edge.when) ||
+                    outgoing.length !== 1 || typeof outgoing[0]?.to !== 'string' || outgoing[0]?.branches || outgoing[0]?.fallback || outgoing[0]?.when)
+                  errors.push({ path: `${label}/unit/shape_points/skip`, message: `'${id}' 는 entry·terminal·필수 노드이거나 단일 우회 경로가 없다` });
+              } else if (terminalNodes.includes(id) || node.kind === 'gate' || node.kind === 'hitl' || node.kind === 'subgraph') {
+                errors.push({ path: `${label}/unit/shape_points/recipe`, message: `'${id}' 는 실행 recipe 를 교체할 수 없는 노드다` });
+              }
+            }
+          }
+          if (rawPoints.fanout_max !== undefined) {
+            const range = rawPoints.fanout_max && typeof rawPoints.fanout_max === 'object' && !Array.isArray(rawPoints.fanout_max)
+              ? rawPoints.fanout_max as Record<string, unknown> : undefined;
+            if (!range || Object.keys(range).some(key => !['min', 'max'].includes(key)) ||
+                !Number.isSafeInteger(range.min) || !Number.isSafeInteger(range.max) ||
+                (range.min as number) < 1 || (range.max as number) < (range.min as number)) {
+              errors.push({ path: `${label}/unit/shape_points/fanout_max`, message: 'fanout_max 은 1 이상의 정수 min·max 범위여야 한다' });
+            } else points.fanoutMax = { min: range.min as number, max: range.max as number };
+          }
+          if (Object.keys(rawPoints).length === 0) errors.push({ path: `${label}/unit/shape_points`, message: '허용 성형 지점이 비었다' });
+          if (Object.keys(points).length > 0) shapePoints = points;
+        }
+      }
+      unit = { inputs: rawUnit.inputs as string[], outputs: rawUnit.outputs as string[], exits: rawUnit.exits as string[],
+        ...(rawUnit.entries === undefined ? {} : { entries: rawUnit.entries as string[] }),
+        ...(shapePoints ? { shapePoints } : {}) };
+    }
   }
   const runContract = parseGraphRunContract(doc.run_contract);
   if (runContract.error) errors.push({ path: `${label}/run_contract`, message: runContract.error });
@@ -570,6 +823,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
   return {
     template: {
       graphId: graphId!, version: version!, ...(maxParallelNodes === undefined ? {} : { maxParallelNodes }), entryNode: entryNode!, terminalNodes, nodes, edges,
+      ...(doc.supervisors === undefined ? {} : { supervisors }),
       ...(unit ? { unit } : {}),
       ...(policy ? { policy } : {}),
       ...(Array.isArray(journeyStages) ? { journeyStages: journeyStages as string[] } : {}),

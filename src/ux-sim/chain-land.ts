@@ -126,6 +126,7 @@ export async function simulateChainLand(input: ChainLandInput): Promise<ChainLan
     };
     const deps: L8ShadowQueueDeps = {
       command,
+      rulesPreflight: async () => ({ outcome: 'pass', detail: 'simulation rules preflight passed' }),
       lock: { waitMs: 0 },
       observeEnqueue: () => {},
       observe: () => {},

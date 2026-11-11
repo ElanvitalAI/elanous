@@ -27,9 +27,9 @@ beforeAll(() => {
   put('apps/pwa/src/app/page.tsx', "import '@/lib/pwa'; export default function Page() { return null; }\n");
   put('apps/pwa/src/lib/pwa.ts', 'export const pwa = true;\n');
   put('apps/desktop/src/main.ts', 'export const desktop = true;\n');
-  put('plugins/hello/manifest.json', JSON.stringify({ entry: 'plugin.ts' }));
-  put('plugins/hello/plugin.ts', "import './child.ts';\n");
-  put('plugins/hello/child.ts', 'export const plugin = true;\n');
+  put('plugins/sample/manifest.json', JSON.stringify({ entry: 'plugin.ts' }));
+  put('plugins/sample/plugin.ts', "import './child.ts';\n");
+  put('plugins/sample/child.ts', 'export const plugin = true;\n');
   put('plugins/bot/plugin.json', JSON.stringify({ main: './plugin.ts' }));
   put('plugins/bot/plugin.ts', 'export const bot = true;\n');
   put('plugins/missing/manifest.json', JSON.stringify({ entry: 'missing.ts' }));
@@ -44,12 +44,12 @@ describe('conservative multi-entrypoint report', () => {
   it('follows CLI lazy import, independent script, app alias, and both manifest formats', () => {
     const files = trackedModules(root);
     const report = analyzeReachability(root, files, inventoryRoots(root, files));
-    for (const file of ['src/a2a/server.ts', 'src/independent.ts', 'apps/pwa/src/lib/pwa.ts', 'apps/desktop/src/main.ts', 'plugins/hello/child.ts', 'plugins/bot/plugin.ts', 'src/boot/acp-server.ts']) {
+    for (const file of ['src/a2a/server.ts', 'src/independent.ts', 'apps/pwa/src/lib/pwa.ts', 'apps/desktop/src/main.ts', 'plugins/sample/child.ts', 'plugins/bot/plugin.ts', 'src/boot/acp-server.ts']) {
       expect(report.unionReachable).toContain(file);
       expect(report.unknownKeep).not.toContain(file);
     }
     expect(report.groups.find(g => g.name === 'scripts')?.roots).toContain('scripts/independent.ts');
-    expect(report.groups.find(g => g.name === 'plugins')?.roots).toEqual(['plugins/bot/plugin.ts', 'plugins/hello/plugin.ts', 'plugins/missing/missing.ts']);
+    expect(report.groups.find(g => g.name === 'plugins')?.roots).toEqual(['plugins/bot/plugin.ts', 'plugins/missing/missing.ts', 'plugins/sample/plugin.ts']);
     expect(report.unresolved).toContainEqual({ importer: '(root:plugins)', specifier: 'plugins/missing/missing.ts', kind: 'unresolved' });
     expect(report.unknownKeep).toContain('plugins/missing/missing.ts');
     expect(report.deletions).toBe(0);

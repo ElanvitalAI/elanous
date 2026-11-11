@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, readlinkSync, renameSync, writeFileSync } from
 import { basename, dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { logsDbPath, LogStore, type LogStoreRow, type LogQuery } from '../mss/logging/log-store.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { harnessQueuePath } from './harness-queue.js';
 import { leaseKubectl, measurePoolLease, recommendConcurrency, type PodLeaseMember } from '../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool, resolvePodPoolSpec, type PodPoolMember, type PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';

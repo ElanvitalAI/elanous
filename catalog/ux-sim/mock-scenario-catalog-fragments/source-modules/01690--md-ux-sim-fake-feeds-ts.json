@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-FAKE-FEEDS-TS",
+  "path": "src/ux-sim/fake-feeds.ts",
+  "boundary": "Feeds fixed posts and source failures through registered crawl capability providers, recording interest-to-feedback receipts and credential-slot presence without real network access.",
+  "deviceIds": ["fake-feeds"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

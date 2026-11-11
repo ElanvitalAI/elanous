@@ -28,7 +28,6 @@ import {
   slashMenuWidget,
   textAreaWidget,
   toastStackWidget,
-  tooltipWidget,
   widget,
   windowWidget,
 } from '../../../src/ui/declarative/index.js';
@@ -92,13 +91,11 @@ describe('WidgetBuilder', () => {
     const windowSpec = windowWidget('log', 'Telemetry').build();
     const dialogSpec = dialogWidget('dialog', 'Approve').build();
     const panelSpec = panelWidget('list', 'Queue').build();
-    const tooltipSpec = tooltipWidget('tooltip', 'Hint').build();
     const intakeSpec = intakeReviewWidget('Review intake').build();
 
     expect(windowSpec.chrome).toMatchObject({ variant: 'window', title: 'Telemetry', showBorder: true });
     expect(dialogSpec.chrome).toMatchObject({ variant: 'dialog', title: 'Approve', showBorder: true });
     expect(panelSpec.chrome).toMatchObject({ variant: 'panel', title: 'Queue', showBorder: true });
-    expect(tooltipSpec.chrome).toMatchObject({ variant: 'tooltip', title: 'Hint', showBorder: true });
     expect(intakeSpec.chrome).toMatchObject({ variant: 'dialog', title: 'Review intake', showBorder: true });
   });
 
@@ -110,10 +107,6 @@ describe('WidgetBuilder', () => {
     const dialogSpec = dialogWidget('dialog', 'Approve patch?')
       .setBody('Replace 14 lines in dashboard runtime')
       .setButtons(dialogButtons)
-      .build();
-    const tooltipSpec = tooltipWidget('tooltip', 'Hint')
-      .setText('Move across the status pills to preview actions.')
-      .setTtl(10000)
       .build();
     const listSpec = listWidget('Queue')
       .setItems(['crawl docs', 'switch model'])
@@ -187,10 +180,6 @@ describe('WidgetBuilder', () => {
         { label: 'Approve', shortcut: 'a', value: 'Approve' },
         { label: 'Deny', value: 'deny' },
       ],
-    });
-    expect(tooltipSpec.config).toMatchObject({
-      text: 'Move across the status pills to preview actions.',
-      ttlMs: 10000,
     });
     expect(listSpec.type).toBe('list');
     expect(listSpec.chrome).toMatchObject({ variant: 'panel', title: 'Queue' });

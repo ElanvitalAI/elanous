@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
-import { browserLaunchCommand, loginWithCodexBrowser } from './codex-browser-login.js';
+import { assistCodexBrowserLogin, browserLaunchCommand, loginWithCodexBrowser } from './codex-browser-login.js';
 import { CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL } from './codex.js';
-import { loadTokens } from './store.js';
+import { loadTokens, saveTokens } from './store.js';
 
 let root: string;
 let previousXdg: string | undefined;
@@ -27,6 +27,48 @@ afterEach(() => {
 });
 
 const jwt = (claims: object) => `header.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.sig`;
+
+test('missing Codex credential starts browser login and returns metadata without tokens', async () => {
+  let opened!: (url: string) => void;
+  const browser = new Promise<string>((resolve) => { opened = resolve; });
+  const run = assistCodexBrowserLogin('missing', { preferredPort: 0,
+    openBrowser: (url) => { opened(url); return true; },
+    fetchImpl: (async () => new Response(JSON.stringify({ access_token: 'private-access', refresh_token: 'private-refresh',
+      expires_in: 3600, scope: 'openid profile email offline_access' }), { status: 200 })) as unknown as typeof fetch,
+  });
+  const authorize = new URL(await browser);
+  const redirect = authorize.searchParams.get('redirect_uri')!;
+  expect((await fetch(`${redirect}?code=code&state=${authorize.searchParams.get('state')}`)).status).toBe(200);
+  const receipt = await run;
+  expect(receipt).toMatchObject({ kind: 'completed', provider: 'openai-codex', method: 'browser', connected: true });
+  expect(JSON.stringify(receipt)).not.toMatch(/private-access|private-refresh|code=/);
+  expect(loadTokens('openai-codex')?.tokens.accessToken).toBe('private-access');
+  expect(await assistCodexBrowserLogin('valid', { openBrowser: () => { throw new Error('must not open'); } }))
+    .toEqual({ kind: 'skipped', healthStatus: 'valid' });
+  expect(await assistCodexBrowserLogin('unmeasured', { openBrowser: () => { throw new Error('must not open'); } }))
+    .toEqual({ kind: 'skipped', healthStatus: 'unmeasured' });
+  await expect(assistCodexBrowserLogin('expired', { preferredPort: 0, openBrowser: () => false }))
+    .rejects.toThrow('browser-unavailable');
+});
+
+test('expired Codex credential completes browser login and replaces the stored token', async () => {
+  saveTokens('openai-codex', { accessToken: 'old-expired-access', refreshToken: 'old-expired-refresh',
+    expiresAt: Date.now() - 1 }, { authMode: 'chatgpt' });
+  let opened!: (url: string) => void;
+  const browser = new Promise<string>((resolve) => { opened = resolve; });
+  const run = assistCodexBrowserLogin('expired', { preferredPort: 0,
+    openBrowser: (url) => { opened(url); return true; },
+    fetchImpl: (async () => new Response(JSON.stringify({ access_token: 'replacement-access',
+      refresh_token: 'replacement-refresh', expires_in: 3600 }), { status: 200 })) as unknown as typeof fetch,
+  });
+  const authorize = new URL(await browser);
+  const redirect = authorize.searchParams.get('redirect_uri')!;
+  expect((await fetch(`${redirect}?code=code&state=${authorize.searchParams.get('state')}`)).status).toBe(200);
+  const receipt = await run;
+  expect(receipt).toMatchObject({ kind: 'completed', connected: true });
+  expect(JSON.stringify(receipt)).not.toMatch(/replacement-access|replacement-refresh|old-expired/);
+  expect(loadTokens('openai-codex')?.tokens.accessToken).toBe('replacement-access');
+});
 
 test('Windows browser launcher hands the complete OAuth URL to the URL handler without cmd parsing', () => {
   const url = 'https://auth.openai.com/oauth/authorize?client_id=abc&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&state=long%25value';

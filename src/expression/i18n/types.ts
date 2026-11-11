@@ -93,7 +93,7 @@ export interface Messages {
   ariaMarkdown: string;
   /** Notification severity labels — used by `describeNotificationEvent`
    *  when the host asks for a localized severity word. Mapping from
-   *  `NotificationKind` (8 values) to one of these 3 macro-categories
+   *  `NotificationKind` (9 values) to one of these 3 macro-categories
    *  lives in `expression/a11y.ts` (`notificationLevelLabel`). */
   notificationLevelInfo: string;
   notificationLevelWarning: string;

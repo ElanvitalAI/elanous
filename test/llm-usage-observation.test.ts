@@ -47,6 +47,42 @@ async function usageRows(model: string): Promise<Array<Record<string, unknown>>>
 }
 
 describe('agent-turn usage observation', () => {
+  it('passes a model-aware long-answer budget to provider calls', async () => {
+    const seen: number[] = [];
+    const probe: LLMProvider = {
+      name: 'openai', defaultModel: 'gpt-6.1-terra', available: () => true,
+      async *streamChat(_messages, opts) {
+        seen.push(opts?.maxTokens ?? 0);
+        yield { type: 'text', delta: 'done' };
+      },
+      async *chat() { yield 'done'; },
+    };
+    await streamLLM([{ role: 'user', content: 'design' }], () => {}, { provider: probe, usageRole: 'implement' });
+    await streamLLM([{ role: 'user', content: 'classify' }], () => {}, { provider: probe, usageRole: 'classify' });
+    expect(seen).toEqual([12_000, 2_048]);
+  });
+
+  it('keeps provider stopReason in llm.usage and the no-tools usage callback consumed by CLI/SSE', async () => {
+    const rows: Array<Record<string, unknown>> = [];
+    const requests: Array<Record<string, unknown>> = [];
+    const surfaced: Array<Record<string, unknown>> = [];
+    const logSpy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'llm.usage' && event === 'llm-usage') rows.push((data ?? {}) as Record<string, unknown>);
+      if (category === 'llm.request' && event === 'completed') requests.push((data ?? {}) as Record<string, unknown>);
+    });
+    try {
+      expect(await streamLLMWithTools([{ role: 'user', content: 'long answer' }], {
+        onText: () => {}, dispatchTool: async () => ({}), onUsage: usage => surfaced.push({ ...usage }),
+      }, { provider: provider('gpt-6-sol', [
+        { type: 'text', delta: 'complete' },
+        { type: 'usage', usage: { outputTokens: 12, stopReason: 'stop' } },
+      ]) })).toBe('complete');
+    } finally { logSpy.mockRestore(); }
+    expect(surfaced).toMatchObject([{ outputTokens: 12, stopReason: 'stop' }]);
+    expect(rows).toMatchObject([{ outputTokens: 12, stopReason: 'stop' }]);
+    expect(requests).toMatchObject([{ stopReason: 'stop' }]);
+  });
+
   it('preserves the default site and omits role for legacy provider-name and omitted arguments', () => {
     const rows: Array<Record<string, unknown>> = [];
     const logSpy = spyOn(debug, 'log').mockImplementation((category, event, data) => {

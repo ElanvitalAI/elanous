@@ -1,0 +1,8 @@
+world: pwa-formal-update
+steps:
+  - observe: pwa-formal-update
+expect:
+  verdict: fail
+  activeHtml: '<main>previous</main>'
+  restart: not-called
+  observe: not-called

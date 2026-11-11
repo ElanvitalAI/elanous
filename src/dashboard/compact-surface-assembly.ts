@@ -34,7 +34,6 @@ export interface CreateDashboardCompactSurfaceAssemblyDeps {
   getCompactMode: () => ProductCompactMode;
   openDashboardPane: (pane: PaneFocus) => boolean;
   focusPane: (pane: PaneFocus) => void;
-  openBrowserPreviewModal: () => void;
   openDashboardPaneModal: (pane: PaneFocus) => void;
   openCompanionPopup: (key: DashboardCompanionSurfaceKey) => void;
   onWarning: (message: string) => void;
@@ -65,7 +64,6 @@ export function createDashboardCompactSurfaceAssembly(
     getCompactMode: deps.getCompactMode,
     openDashboardPane: deps.openDashboardPane,
     focusPane: deps.focusPane,
-    openBrowserPreviewModal: deps.openBrowserPreviewModal,
     openDashboardPaneModal: deps.openDashboardPaneModal,
     openCompanionPopup: deps.openCompanionPopup,
     onWarning: deps.onWarning,

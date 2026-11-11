@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { debug } from '../../src/debug/log.js';
 import { runWithReleasePwaTraffic } from './gate-traffic-mode.js';
 
-export type NodeOutcome = 'ok' | 'fail' | 'error' | 'partial' | 'unknown' | 'recovery-required' | 'switch' | 'stay-normal';
+export type NodeOutcome = 'ok' | 'fail' | 'error' | 'partial' | 'unknown' | 'recovery-required' | 'switch' | 'stay-normal' | 'legacy' | 'audit';
 export type NodeVerdict = 'pass' | 'flaky' | 'fail';
 export interface GraphContext {
   graphId?: string;
@@ -17,7 +17,7 @@ export interface GraphContext {
   nodeInput?: Record<string, unknown>;
   outputs: Record<string, Record<string, unknown>>;
   /** Ordered executions let re-entered nodes select the verdict from the latest gate visit. */
-  nodeHistory?: Array<{ nodeId: string; executionId?: string; output?: unknown }>;
+  nodeHistory?: Array<{ nodeId: string; executionId?: string; startedAt?: string; endedAt?: string; output?: unknown }>;
 }
 
 export function latestGateOutput(context: GraphContext): Record<string, unknown> | undefined {

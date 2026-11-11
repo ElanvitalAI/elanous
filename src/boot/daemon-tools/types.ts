@@ -68,6 +68,8 @@ export interface DaemonToolDispatchCtx {
   verifiedOwner?: { id: string };
   /** Server-authenticated Nexus app session class for public app deployment. */
   appDeploymentSession?: 'nexus-owner' | 'member' | 'anonymous';
+  /** App-scoped member receipt resolved by Nexus; tool arguments cannot set this. */
+  appDeploymentOwner?: { appSlug: string; memberId: string; userSlug: string; plan: string; entitlements: Readonly<Record<string, unknown>> };
   /** Ingestion entry class. Omit for conservative external-verbatim fallback. */
   entry?: IngestionEntry;
   /** M5 PR 2 (PLAN-rich-dev-feedback-multi-surface · 2026-05-13) —

@@ -25,7 +25,7 @@ import { findNativeTool } from '../native-tool-catalog.js';
 import { debug } from '../debug/log.js';
 import { userIntentLogger } from '../user-intent/index.js';
 import { buildCliAgentTools } from '../cli/agent-cli.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { TokenScope } from '../auth/scope.js';
 import { filterToolsForScope, isToolAllowedForScope } from '../nexus/api/mcp-public-allowlist.js';
 import { normalizeRunId } from '../harness/harness-space.js';

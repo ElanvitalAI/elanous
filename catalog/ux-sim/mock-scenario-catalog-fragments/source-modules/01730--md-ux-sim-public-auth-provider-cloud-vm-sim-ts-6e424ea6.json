@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-PUBLIC-AUTH-PROVIDER-CLOUD-VM-SIM-TS",
+  "path": "src/ux-sim/public-auth-provider-cloud-vm-sim.ts",
+  "boundary": "Runs the production warm-pool provider fetcher against the production Nexus resource-ledger handler as an isolated tailnet-free cloud VM; records only non-secret request metadata.",
+  "deviceIds": ["public-auth-provider-cloud-vm-sim"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

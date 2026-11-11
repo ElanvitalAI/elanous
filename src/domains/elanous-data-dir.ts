@@ -22,7 +22,6 @@
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { debug } from '../debug/log.js';
 import { tmpdir } from 'node:os';
 
 /** 데이터 루트 (중립 이름).
@@ -60,11 +59,16 @@ function testFallbackDir(): string {
   try { mkdirSync(testFallbackRoot, { recursive: true }); }
   catch { /* 생성 실패해도 아래 관측은 남긴다 */ }
   try {
-    debug.log('conatus.data-dir', 'test-root-redirect', {
+    const diagnostic = (globalThis as typeof globalThis & {
+      __elanous_mss_diagnostic_logger__?: { log: (category: string, event: string, data: Record<string, unknown>) => void };
+    }).__elanous_mss_diagnostic_logger__;
+    const observation = {
       pid: process.pid,
       root: testFallbackRoot,
       why: 'NODE_ENV=test without CONATUS_DATA_DIR/ELANOUS_STATE_DIR',
-    });
+    };
+    if (diagnostic?.log) diagnostic.log('conatus.data-dir', 'test-root-redirect', observation);
+    else process.emitWarning(JSON.stringify(observation), { code: 'CONATUS_TEST_ROOT_REDIRECT' });
   } catch { /* 관측 실패가 격리를 막지 않는다 */ }
   return testFallbackRoot;
 }

@@ -11,7 +11,7 @@
 //   3) 하드코딩 기본값
 // config 우선이라 `elanous config` 로 코드 변경 0·인스턴스별(테스트 config 만 상향) 조정 가능.
 
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 /** SE(코딩) 페이즈 예산 계단 — maxTurns(턴 상한·attempt 수). fallback 기본값일 뿐(config-first).
  *  ★ 2026-07-23 대표 재설계 "멀티 엘리베이션 불요·첫 실패 시 조율자 triage" — 운영은 **config

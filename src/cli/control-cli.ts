@@ -18,7 +18,7 @@ import type { ResourceView } from '../control-plane/ledger.js';
 import { issueMemberToken, issueMemberTokenToFile, revokeMemberToken, listMemberTokens } from '../control-plane/member-tokens.js';
 import { collectControlStatus, readControlHqLease } from '../control/control-status.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { registerResourceLedgerCommands } from './resource-ledger-cli.js';
 import { registerTrainThroughputCommands } from './train-throughput.js';
 
@@ -252,6 +252,7 @@ export async function runControlServe(options: { port?: string; host?: string; a
     }),
   }) : undefined;
   const leaseView = bucket !== undefined ? createLeaseHolderView({
+    ttlMs: 0, // Every write must observe the current storage lease, including non-worker mutations.
     machine, read: () => observeLease('gcs', () => (options.read ?? readRoleLeaseAsync)(bucket)),
   }) : remoteLeaseView ? { get: async () => {
     const snapshot = await remoteLeaseView.get({ fresh: true });
@@ -259,6 +260,7 @@ export async function runControlServe(options: { port?: string; host?: string; a
     // while that HQ is serving; comparing the HQ machine name to this worker would deny every host.
     return { ...snapshot, iAmHolder: snapshot.known };
   } } : options.followHqLease ? createLeaseHolderView({
+    ttlMs: 0, // HQ lease expiry or handoff must fence the next write, not the next cache interval.
     machine: hqHostName ?? '', read: () => observeLease('hq', () => {
       const { record, expired } = (options.readHq ?? readControlHqLease)();
       return hqHostName && record && expired === false

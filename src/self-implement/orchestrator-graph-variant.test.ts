@@ -35,7 +35,9 @@ test('orchestrator executes two validated run-local variants and writes distinct
     });
     expect(result.runId).toBe(id);
     expect(result.ok).toBe(true);
-    expect(entries.map(entry => entry.event)).toContain('graph-authority-resolved');
+    expect(entries.find(entry => entry.event === 'graph-authority-resolved')?.data).toMatchObject({
+      graphAuthoritative: true, graphAuthoritativeSource: 'default', activeGraphId: 'self-implement',
+    });
     expect(entries.find(entry => entry.event === 'graph-variant-applied')?.data).toMatchObject({ graphId: 'self-implement', graphFile: `${runLedgerPath(id)}.graph.yaml` });
     const { graphVersionHash } = await import('./graph-yaml.js');
     const savedVariant = parseYaml(readFileSync(`${runLedgerPath(id)}.graph.yaml`, 'utf8'));

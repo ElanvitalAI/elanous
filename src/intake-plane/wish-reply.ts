@@ -3,7 +3,7 @@ import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { appendMessage, adoptSession } from '../session/index.js';
 import { CardStore } from '../task-cards/card-store.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { WishReplyTarget } from './wish-card.js';
 
 export interface WishReplySinks {

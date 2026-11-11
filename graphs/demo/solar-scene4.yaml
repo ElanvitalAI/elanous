@@ -1,0 +1,24 @@
+# Source: graphs/demo/inside-seed.yaml plan/build/review/publish demo flow; Solar adds one prompt decision before publish.
+graph_id: solar-scene4
+version: 1
+loop:
+  title: Solar scene four demo
+  description: Plan, build, review once for rework, ask Solar for a summary and publish decision, then publish.
+  trigger:
+    events: [manual]
+entry_node: plan
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: plan, kind: agent, recipe: 'cmd:plan', max_visits: 1 }
+  - { node_id: build, kind: agent, recipe: 'cmd:solar-build', max_visits: 2 }
+  - { node_id: review, kind: judge, recipe: 'cmd:solar-review', max_visits: 2 }
+  - { node_id: solar-summary, kind: prompt, recipe: 'prompt:solar-summary', max_visits: 1, contract: { inputs: [request, review], tools: none, outputs: [outcome, summary, reason] } }
+  - { node_id: publish, kind: agent, recipe: 'cmd:publish', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: plan, on: outcome, map: { ok: build } }
+  - { from: build, on: outcome, map: { ok: review } }
+  - { from: review, on: outcome, map: { rework: build, ok: solar-summary } }
+  - { from: solar-summary, on: outcome, map: { ok: publish, fail: failed, error: failed } }
+  - { from: publish, on: outcome, map: { ok: done } }

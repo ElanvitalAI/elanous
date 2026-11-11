@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "policy": "deny-unlisted-and-unresolved",
+  "pricingStatus": "undecided",
+  "tiers": ["free", "paid"],
+  "features": [
+    {
+      "key": "gcp.single_cloud_expand",
+      "description": "One GCP expansion architecture and its approved workload lifecycle",
+      "grant": { "free": true, "paid": true }
+    },
+    {
+      "key": "gcp.basic_security_grade_design",
+      "description": "Data classification and baseline security configuration by grade",
+      "grant": { "free": true, "paid": true }
+    },
+    {
+      "key": "architecture.multi_cloud",
+      "description": "Architecture design across cloud providers",
+      "grant": { "free": false, "paid": true }
+    },
+    {
+      "key": "security.external_certification_mapping",
+      "description": "Customer-scoped control and evidence mapping for externally requested formal security certifications",
+      "grant": { "free": false, "paid": true }
+    }
+  ]
+}

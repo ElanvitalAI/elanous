@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadFreshCodexAuthState } from './codex.js';
+import { _setCodexAccountOutboundSenderForTesting, autoConsumeCodexResetCredit, listCodexAccountsInStore, resolveCodexAccountForRun } from './codex-account-store.js';
 import { debug } from '../debug/log.js';
 import '../llm.js';
 import { collectCodexMirrorCredentials, CODEX_OWNER_MIRROR_RELATIVE_PATH, CODEX_OWNER_MIRROR_REQUIRED, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
@@ -42,6 +43,7 @@ const writeMirror = (path: string, accessToken: string, expiresAt: number, refre
 }));
 
 afterEach(() => {
+  _setCodexAccountOutboundSenderForTesting(null);
   for (const [key, value] of Object.entries({ XDG_CONFIG_HOME: oldEnv.xdg, ELANOUS_STATE_DIR: oldEnv.state,
     ELANOUS_STATE_DIR_SOURCE: oldEnv.source, ELANOUS_CODEX_ACCOUNT: oldEnv.account, ELANOUS_RUN_ID: oldEnv.runId })) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -58,6 +60,33 @@ afterEach(() => {
 });
 
 describe("remote direct Codex uses the owner's access-only mirror", () => {
+  test('mirror accounts are first-class rotation candidates and an expiring one is excluded', async () => {
+    _setCodexAccountOutboundSenderForTesting(() => true);
+    const { path } = fixture();
+    const now = Date.now();
+    const fresh = now + 4 * 60 * 60_000;
+    const near = now + 60_000;
+    const providers = Object.fromEntries(([['openai-codex', near], ['openai-codex:team', fresh], ['openai-codex:third', fresh]] as const).map(([key, exp]) => [key, {
+      source: 'mirror', authMode: 'chatgpt', codexHome: join(path, key),
+      tokens: { accessToken: jwt(Math.floor(Number(exp) / 1000)), refreshToken: '', refresh_token: '', expiresAt: exp },
+    }]));
+    writeFileSync(path, JSON.stringify({ version: 1, providers }));
+    expect(listCodexAccountsInStore(path, now).map((a) => a.name)).toEqual(['team', 'third']);
+    expect(listCodexAccountsInStore().map((a) => a.name)).toEqual(['team', 'third']);
+    expect(['team', 'third']).toContain(resolveCodexAccountForRun(process.env, { storePath: path }).name);
+    process.env.ELANOUS_CODEX_ACCOUNT = 'team';
+    expect(resolveCodexAccountForRun(process.env, { storePath: path }).name).toBe('team');
+    delete process.env.ELANOUS_CODEX_ACCOUNT;
+    process.env.ELANOUS_RUN_ID = 'run-mirror-expiry-fixture';
+    expect(resolveCodexAccountForRun().name).toBe('team');
+    providers['openai-codex:team'].tokens.expiresAt = near;
+    writeFileSync(path, JSON.stringify({ version: 1, providers }));
+    expect(resolveCodexAccountForRun().name).toBe('third');
+    let calls = 0;
+    const result = await autoConsumeCodexResetCredit({ storePath: path, list: async () => { calls++; throw new Error('remote list forbidden'); }, consume: async () => { calls++; throw new Error('remote consume forbidden'); } });
+    expect(result).toEqual({ consumed: false, reason: 'mirror-read-only' });
+    expect(calls).toBe(0);
+  });
   test('default owner mirror path follows the resolved state root', () => {
     const { path } = fixture();
     expect(codexOwnerMirrorAuthPath()).toBe(path);
@@ -215,6 +244,17 @@ describe("remote direct Codex uses the owner's access-only mirror", () => {
 
 describe('collectCodexMirrorCredentials (REMOTE-MIRROR-SKIP-UNUSABLE 11-05)', () => {
   class Expiring extends Error { constructor(readonly account: string, readonly hoursLeft: number) { super(`openai-codex:${account} expiring`); } }
+
+  test('provider-only push keeps the exact Codex skip reasons', () => {
+    const result = collectCodexMirrorCredentials(['default', 'team'], (name) => {
+      if (name === 'default') throw new Expiring(name, 0.4);
+      throw new Error('unavailable');
+    }, { allowEmpty: true });
+    expect(result).toEqual({ mirrors: [], skipped: [
+      { account: 'default', reason: 'access-expiring' },
+      { account: 'team', reason: 'credential-unavailable' },
+    ] });
+  });
 
   test('an expiring default does not drop the fresh team and third mirrors', () => {
     const logs: unknown[][] = [];

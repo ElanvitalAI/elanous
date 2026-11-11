@@ -13,7 +13,7 @@ import { setPlanToolPlanModeGuard } from '../code-edit/plan-tool.js';
 import { getPlanModeState, setPlanModeState, generatePlanSessionId } from './session.js';
 import { initPlanArtifact } from './persistence.js';
 import { INACTIVE_PLAN_MODE_STATE } from './types.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { enterWorktreeRuntime } from '../tool-runtime/git-worktree-runtimes.js';
 import { debug } from '../debug/log.js';
 

@@ -1,0 +1,23 @@
+{
+  "id": "next-tui-plugin-wizard",
+  "name": "Next TUI plugin wizard fake Nexus boundary",
+  "implementation": [
+    "src/tui/core/registry.ts",
+    "src/ux-sim/fake-nexus-plugin-wizard.ts",
+    "src/ux-sim/next-tui-plugin-wizard-world.ts",
+    "src/tui/branches/plugin-wizard.ts"
+  ],
+  "tests": ["src/tui/branches/plugin-wizard.test.ts", "src/ux-sim/next-tui-plugin-wizard-world.test.ts"],
+  "entryCommands": ["bun test src/tui/branches/plugin-wizard.test.ts src/ux-sim/next-tui-plugin-wizard-world.test.ts"],
+  "target": "Route a natural-language plugin request through the production Nexus API client, show its YAML proposal, and prove the graph save endpoint is called only after explicit approval.",
+  "inputs": [
+    "next-TUI natural-language phrase matching the plugin route",
+    "fake Nexus POST /v1/graphs/wizard proposal with YAML and summary",
+    "ambiguous confirmation followed by explicit yes or no",
+    "classic-TUI fixed support notice"
+  ],
+  "observations": ["natural-language route match", "wizard prompt request", "proposal summary and YAML identity", "zero saves before confirmation", "saved graph identity after confirmation", "classic notice text"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

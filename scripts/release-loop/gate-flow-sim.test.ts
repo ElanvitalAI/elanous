@@ -18,6 +18,7 @@ import { savePassingGateFileReceipts } from './gate-runtime';
 import { withSimClock } from '../../src/ux-sim/fake-clock';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { runGraph } from '../../src/graph-runner/runner.js';
+import { correlateGateLog } from '../../src/mss/logging/gate-correlation.js';
 import { debug } from '../../src/debug/log.js';
 import type { PodCommandResult, RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 
@@ -353,16 +354,14 @@ test('GATE-FLOW-SIM: an absent seam keeps the real tools — the production defa
   expect(runner.recheckPodBatch).toBeFunction();
 });
 
-test('RELEASE-SIM-REAL-GATE-ENTRY: graph launches the real gate CLI and records its graph-path guard decision', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'release-sim-real-gate-entry-'));
+test('RELEASE-SIM-ALS-SUCCESS: successful in-process gate execution keeps its graph correlation scope', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-sim-als-success-'));
   dirs.push(root);
   const repo = join(root, 'repo');
   mkdirSync(repo, { recursive: true });
-  const instanceRoot = join(root, 'instance');
-  mkdirSync(instanceRoot, { recursive: true });
-  const graph = join(root, 'real-gate-entry.yaml');
-  writeFileSync(join(root, 'recipes.yaml'), 'gate:\n  command: "gate-node"\n');
-  writeFileSync(graph, `graph_id: release-sim-real-gate-entry
+  const graph = join(root, 'als-success.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), 'gate:\n  command: "bun scripts/release-loop/gate-node.ts --json"\n');
+  writeFileSync(graph, `graph_id: release-loop
 version: 1
 entry_node: gate
 terminal_nodes: [done, failed]
@@ -378,7 +377,66 @@ edges:
 
   const previousCwd = process.cwd();
   process.chdir(repo);
+  const observations: Array<Record<string, unknown>> = [];
+  const gateEnvironment: Array<{ runId?: string; batchId?: string; invocation?: string }> = [];
   let run: Awaited<ReturnType<typeof runGraph>>;
+  try {
+    run = await runGraph(graph, {
+      runId: RUN_ID,
+      pinChildUniverse: true,
+      input: { commit: 'a'.repeat(40), version: '0.3.9-rc.1', previousVersion: '0.3.8',
+        gateExecutor: 'pod', gatePodPool: 'pool-sim:1', gatePodShards: 1, gateImagePin: 'cut-commit' },
+      deps: {
+        root: join(root, 'instance'),
+        runBash: async (_body, options) => {
+          gateEnvironment.push({ runId: options.env?.ELANOUS_GRAPH_RUN_ID,
+            batchId: options.env?.ELANOUS_BATCH_ID, invocation: options.env?.ELANOUS_GATE_INVOCATION });
+          observations.push(correlateGateLog('release-loop.gate', 'runner-als-probe', { decision: 'allow' }) as Record<string, unknown>);
+          return { exitCode: 0, stdout: '{"outcome":"ok"}', stderr: '' };
+        },
+      },
+    });
+  } finally { process.chdir(previousCwd); }
+
+  expect(run!.status).toBe('done');
+  expect(run!.path).toEqual(['gate', 'done']);
+  expect(gateEnvironment).toHaveLength(1);
+  expect(observations).toHaveLength(1);
+  expect(observations[0]).toMatchObject({ runId: RUN_ID, invocation: gateEnvironment[0]?.invocation,
+    batch: gateEnvironment[0]?.batchId, decision: 'allow' });
+});
+
+test('RELEASE-SIM-REAL-GATE-ENTRY: graph launches the real gate CLI and records its graph-path guard decision', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-sim-real-gate-entry-'));
+  dirs.push(root);
+  const repo = join(root, 'repo');
+  mkdirSync(repo, { recursive: true });
+  const instanceRoot = join(root, 'instance');
+  mkdirSync(instanceRoot, { recursive: true });
+  const graph = join(root, 'real-gate-entry.yaml');
+  writeFileSync(join(root, 'recipes.yaml'), 'gate:\n  command: "bun scripts/release-loop/gate-node.ts --json"\n');
+  writeFileSync(graph, `graph_id: release-loop
+version: 1
+entry_node: gate
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: gate, kind: agent, recipe: 'cmd:gate', max_visits: 1 }
+  - { node_id: residual-run, kind: agent, recipe: 'cmd:gate', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - from: gate
+    on: outcome
+    map: { ok: done, fail: residual-run }
+  - from: residual-run
+    on: outcome
+    map: { ok: done, fail: failed }
+`);
+
+  const previousCwd = process.cwd();
+  process.chdir(repo);
+  let run: Awaited<ReturnType<typeof runGraph>>;
+  const gateEnvironment: Array<{ runId?: string; batchId?: string; invocation?: string }> = [];
   try {
     run = await runGraph(graph, {
       runId: RUN_ID,
@@ -388,6 +446,8 @@ edges:
       deps: {
         root: instanceRoot,
         runBash: async (_body, options) => {
+          gateEnvironment.push({ runId: options.env?.ELANOUS_GRAPH_RUN_ID,
+            batchId: options.env?.ELANOUS_BATCH_ID, invocation: options.env?.ELANOUS_GATE_INVOCATION });
           const bun = Bun.which('bun');
           if (!bun) throw new Error('Bun executable unavailable for real gate CLI simulation');
           const child = spawnSync(bun, [join(REPOSITORY_ROOT, 'scripts/release-loop/gate-node.ts'), '--json'], {
@@ -401,14 +461,34 @@ edges:
   } finally { process.chdir(previousCwd); }
 
   expect(run!.status).toBe('failed');
-  expect(run!.path).toEqual(['gate', 'failed']);
+  expect(run!.path).toEqual(['gate', 'residual-run', 'failed']);
+  const gateNode = run!.nodes.find((node) => node.nodeId === 'gate')!;
+  const residualNode = run!.nodes.find((node) => node.nodeId === 'residual-run')!;
+  expect(gateEnvironment).toHaveLength(2);
+  expect(gateEnvironment[0]).toMatchObject({ runId: RUN_ID, batchId: gateNode.executionId });
+  expect(gateEnvironment[1]).toMatchObject({ runId: RUN_ID, batchId: residualNode.executionId });
+  expect(typeof gateEnvironment[0]?.invocation).toBe('string');
+  expect(typeof gateEnvironment[1]?.invocation).toBe('string');
+  expect(gateEnvironment[0]?.invocation).not.toBe(gateEnvironment[1]?.invocation);
   const debugDir = join(repo, '.elanous/debug');
   const events = readdirSync(debugDir).filter((name) => /^debug-.*\.log$/.test(name))
     .flatMap((name) => readFileSync(join(debugDir, name), 'utf8').trim().split('\n'))
-    .filter(Boolean).map((line) => JSON.parse(line) as { category?: string; event?: string; data?: { path?: string; decision?: string } });
-  expect(events.some((event) => event.category === 'release-loop.gate' && event.event === 'entry-guard-evaluated'
-    && event.data?.path === 'graph' && event.data.decision === 'allow')).toBe(true);
-  const gateNode = run!.nodes.find((node) => node.nodeId === 'gate')!;
+    .filter(Boolean).map((line) => JSON.parse(line) as { category?: string; event?: string; data?: {
+      runId?: string; invocation?: string; batch?: string; shard?: string | number | null; attempt?: string | number | null;
+      phase?: string; host?: string | null; podJob?: string | null; file?: string | null; evidenceLevel?: string;
+      path?: string; decision?: string;
+    } });
+  const invocationByBatch = new Map(gateEnvironment.map(({ batchId, invocation }) => [batchId, invocation]));
+  const entryGuards = events.filter((event) => event.category === 'release-loop.gate' && event.event === 'entry-guard-evaluated');
+  expect(entryGuards).toHaveLength(2);
+  expect(entryGuards.every((event) => event.data?.runId === RUN_ID
+    && event.data.invocation === invocationByBatch.get(event.data.batch)
+    && event.data.path === 'graph' && event.data.decision === 'allow')).toBe(true);
+  const graphGateEvents = events.filter((event) => event.category === 'release-loop.gate');
+  expect(graphGateEvents.length).toBeGreaterThan(0);
+  expect(graphGateEvents.every((event) => event.data?.runId === RUN_ID
+    && typeof event.data.invocation === 'string' && event.data.invocation.length > 0
+    && event.data.invocation === invocationByBatch.get(event.data.batch))).toBe(true);
   expect(String(gateNode.output)).toContain('host-not-in-pod-pool');
 });
 

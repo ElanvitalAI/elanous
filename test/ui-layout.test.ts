@@ -1,8 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { TextView, BoxView, Consumed, Ignored, type EventResult, type View } from '../src/ui/view.js';
-import { withBorder, withShadow } from '../src/ui/decor.js';
+import { TextView, BoxView, Consumed, Ignored, type View } from '../src/ui/view.js';
 import { LinearLayout } from '../src/ui/layout/linear.ts';
-import { ScrollView } from '../src/ui/layout/scroll.ts';
 import { Printer } from '../src/ui/printer.js';
 import { stripAnsi } from '../src/tui.js';
 
@@ -16,29 +14,7 @@ function mkFocusable(label: string, consumed: string[] = []): View {
   };
 }
 
-describe('LC5 decor', () => {
-  test('withBorder draws bordered box around inner', () => {
-    const v = withBorder(new TextView('hi'), { title: 'T' });
-    const p = Printer.create({ width: 6, height: 3 });
-    v.draw(p);
-    const lines = p.lines().map(stripAnsi);
-    expect(lines[0]).toBe('┌ T ─┐');
-    expect(lines[1]).toBe('│hi  │');
-  });
-
-  test('withShadow leaves right+bottom 1-cell shadow', () => {
-    const v = withShadow(new TextView('AB'));
-    const p = Printer.create({ width: 4, height: 3 });
-    v.draw(p);
-    const lines = p.lines().map(stripAnsi);
-    // Top-left 3×2 region contains inner content; right col y=1..2
-    // and bottom row x=1..3 are shadow cells '▒'.
-    expect(lines[0].startsWith('AB')).toBe(true);
-    expect(lines[0][3]).toBe(' ');                  // top-right corner NOT shadow
-    expect(lines[1][3]).toBe('▒');
-    expect(lines[2][1]).toBe('▒');
-  });
-
+describe('LC5 BoxView', () => {
   test('BoxView renders focused right-side title glyph without clobbering title', () => {
     const v = new BoxView(new TextView('hi'), {
       border: true,
@@ -134,65 +110,5 @@ describe('LC5 LinearLayout', () => {
     l.onEvent({ name: 'down' });
     // Focused child consumed, layout should NOT move focus.
     expect(l.focusedChild()).toBe(a);
-  });
-});
-
-describe('LC5 ScrollView', () => {
-  test('renders visible slice of tall content', () => {
-    const long = new TextView(Array.from({ length: 10 }, (_, i) => `row${i}`).join('\n'));
-    const sv = new ScrollView(long, { scrollbar: false });
-    const p = Printer.create({ width: 8, height: 3 });
-    sv.layout({ width: 8, height: 3 });
-    sv.draw(p);
-    const lines = p.lines().map(stripAnsi);
-    expect(lines[0]).toBe('row0    ');
-    expect(lines[1]).toBe('row1    ');
-    expect(lines[2]).toBe('row2    ');
-  });
-
-  test('scroll down shifts the visible slice', () => {
-    const long = new TextView(Array.from({ length: 10 }, (_, i) => `row${i}`).join('\n'));
-    const sv = new ScrollView(long, { scrollbar: false });
-    sv.layout({ width: 8, height: 3 });
-    // First draw populates lastContentH etc.
-    const p = Printer.create({ width: 8, height: 3 });
-    sv.draw(p);
-    // Down key scrolls by 1.
-    sv.onEvent({ name: 'down' });
-    const p2 = Printer.create({ width: 8, height: 3 });
-    sv.draw(p2);
-    expect(stripAnsi(p2.lines()[0]!)).toBe('row1    ');
-  });
-
-  test('end key jumps to bottom; home jumps to top', () => {
-    const long = new TextView(Array.from({ length: 20 }, (_, i) => `r${i}`).join('\n'));
-    const sv = new ScrollView(long, { scrollbar: false });
-    const p = Printer.create({ width: 5, height: 3 });
-    sv.draw(p);
-    sv.onEvent({ name: 'end' });
-    const pEnd = Printer.create({ width: 5, height: 3 });
-    sv.draw(pEnd);
-    const lines = pEnd.lines().map(stripAnsi);
-    expect(lines[2]).toContain('r19');
-
-    sv.onEvent({ name: 'home' });
-    const pHome = Printer.create({ width: 5, height: 3 });
-    sv.draw(pHome);
-    expect(stripAnsi(pHome.lines()[0]!)).toContain('r0');
-  });
-
-  test('scrollbar track + thumb on right edge', () => {
-    const long = new TextView(Array.from({ length: 20 }, () => 'x').join('\n'));
-    const sv = new ScrollView(long, { scrollbar: true });
-    const p = Printer.create({ width: 4, height: 4 });
-    sv.draw(p);
-    const lines = p.lines().map(stripAnsi);
-    // Right column is the scrollbar (│ or █ ).
-    for (const line of lines) {
-      expect(line[3] === '│' || line[3] === '█').toBe(true);
-    }
-    // At least one thumb cell '█' somewhere in track.
-    const col = lines.map(l => l[3]).join('');
-    expect(col).toContain('█');
   });
 });

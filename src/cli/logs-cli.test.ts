@@ -2146,6 +2146,29 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
     }
   });
 
+  it('명시 --config-dir 로그 DB open 실패는 운영 DB 행으로 가리지 않는다', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'elanous-logs-explicit-open-fail-'));
+    const isolated = join(home, 'isolated');
+    const prodDb = join(home, '.elanous', 'logs', 'logs.db');
+    const isolatedDb = join(isolated, 'logs', 'logs.db');
+    const previous = getElanousConfigDirOverride();
+    try {
+      const prod = new LogStore(prodDb, { instance: 'prod' });
+      prod.insertBatch([{ rec: { ts: '2026-11-11T00:00:00.000Z', category: 'scope', event: 'prod-must-not-appear' }, surface: 'nexus' }]);
+      prod.close();
+      mkdirSync(isolatedDb, { recursive: true }); // exists, but SQLite cannot open a directory as a database
+      setElanousConfigDir(isolated);
+      const result = await runLogs(['--json'], home);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('open 실패');
+      expect(result.stderr).toContain(isolatedDb);
+      expect(result.stdout).not.toContain('prod-must-not-appear');
+    } finally {
+      if (previous === undefined) resetElanousConfigDir(); else setElanousConfigDir(previous);
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('연합 조회에서 한 인스턴스 읽기가 실패하면 사람·JSON 산출에 이름을 싣고 커서와 같은 종료값 2를 낸다', async () => {
     const home = mkdtempSync(join(tmpdir(), 'elanous-logs-unreadable-'));
     const prodDbPath = join(home, '.elanous', 'logs', 'logs.db');

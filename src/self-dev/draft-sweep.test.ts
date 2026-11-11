@@ -912,7 +912,7 @@ describe('automatic draft claim lifecycle', () => {
 describe('overlap metrics', () => {
   // Shaped like the real 2026-10-07 rows: Pod-forwarded, payload as a JSON string, axis summaries not lists.
   const payload = (runId: string | null, warnings: Array<{ kind: string; name: string }>, extra: Record<string, unknown> = {}) => ({
-    inputSource: 'say', goalFile: '/home/ubuntu/repo/docs/goals/GOAL-src-a-ts-ed9934a2-2026-09-29.md', paths: ['src/a.ts'],
+    inputSource: 'say', goalFile: '/home/user/repo/docs/goals/GOAL-src-a-ts-ed9934a2-2026-09-29.md', paths: ['src/a.ts'],
     invokerBehindDefaultBranch: false, blockers: [], warnings, plannedBranchStatus: 'resolved',
     siblingPrCount: warnings.filter((w) => w.kind === 'sibling-pr').length,
     openPrs: { state: 'checked', count: 41 }, liveRuns: { state: 'checked', count: 0 }, unreadableRuns: 0, liveRunWindowMs: 1_800_000,

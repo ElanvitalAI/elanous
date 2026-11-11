@@ -289,6 +289,7 @@ function verifiedScenarios(
     && scenarioIds.has(entry.scenarioId)
     && typeof entry.scenarioId === 'string'
     && typeof entry.runId === 'string'
+    && entry.runId.trim().length > 0
     && entry.events.some((event) => event.event === 'graph.path'
       && typeof event.guardId === 'string'
       && guards.some((guard) => guard.id === event.guardId

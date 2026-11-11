@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { runMacrophageHeal, type MacrophageScrap } from '../release-loop/macrophage-heal.js';
 import { planMacrophageIncident, simulateMacrophageRecovery } from '../release-loop/macrophage-incident-recovery.js';
+import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { runReleaseMacrophageIncidentSim } from './release-sim-rig.js';
 
 const incidents = [
@@ -76,6 +77,23 @@ test('release-sim-rig: ten 0.3.6 macrophage incidents traverse detection, attrib
       && sourceEvent?.type === 'node-end' && sourceEvent.data?.ok === false
       && sourceEvent.source.kind === 'node' && sourceEvent.source.nodeId === 'gate';
   })).toBe(true);
+  const macrophageChartRows = (loadRunLedger(runId, runLedgerDir(root)) ?? [])
+    .filter((entry) => entry.event === 'run-chart-cell' && entry.data.device === 'macrophage');
+  expect(macrophageChartRows).toHaveLength(result.runtimeDecisions.length);
+  for (const decision of result.runtimeDecisions) {
+    const evidence = typeof decision.data?.evidence === 'string'
+      ? decision.data.evidence : JSON.stringify(decision.data?.evidence ?? {});
+    expect(macrophageChartRows).toContainEqual(expect.objectContaining({
+      runId,
+      event: 'run-chart-cell',
+      data: expect.objectContaining({
+        device: 'macrophage',
+        stopKey: decision.eventId,
+        observed: expect.stringContaining(evidence.slice(0, 240)),
+        verdict: decision.data?.action,
+      }),
+    }));
+  }
   expect(result.graphState.path.filter((node) => node === 'gate')).toHaveLength(2);
   expect(result.cases.map(({ signal, plan }) => [signal.id, plan.label, plan.step])).toEqual([
     ['a-export-check-failures', 'hitl', 'R4-hitl'],

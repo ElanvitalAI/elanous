@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { isRuntimeLlmModelCompatibleWithProvider } from '../user-config.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
@@ -103,11 +104,17 @@ function walk(dir: string, out: string[] = []): string[] {
 }
 
 describe('user-config cycle boundary', () => {
-  it('user-config does not import model-defaults (cycle-safe classifier lives there)', () => {
-    const src = readFileSync('src/user-config.ts', 'utf-8');
-    expect(/from ['"][^'"]*llm\/model-defaults/.test(src)).toBe(false);
-    expect(/from ['"][^'"]*registry\/normalize/.test(src)).toBe(false);
-    expect(/from ['"][^'"]*models\/prompts/.test(src)).toBe(false);
+  it('fresh process imports user config before model defaults and resolves the provider ladder', () => {
+    const probe = [
+      "const config = await import('./src/user-config.ts');",
+      "const models = await import('./src/llm/model-defaults.ts');",
+      "if (!config.isRuntimeLlmModelCompatibleWithProvider('openai-codex', models.tierModel('best', 'openai-codex'))) throw new Error('provider ladder unavailable');",
+    ].join('\n');
+    const child = spawnSync(process.execPath, ['-e', probe], {
+      cwd: join(import.meta.dir, '../..'), encoding: 'utf8', timeout: 15_000, // Source: #36174 fresh-process import-cycle guard.
+    });
+    expect(child.status).toBe(0);
+    expect(child.stderr).not.toContain('before initialization');
   });
 
   it('active-provider defaults still follow the explicit provider ladder', () => {

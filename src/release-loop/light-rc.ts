@@ -16,6 +16,7 @@ import type { GateOptions, GateResult, GateRunner } from '../../scripts/release-
 import { executeTuiNodeCheck, type ExecutedTuiCheck } from '../../scripts/release-loop/tui-node-checks.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { gateBaselineReceipt, gateGraphPins } from '../../scripts/release-loop/gate-baseline-receipt.js';
+import { gateImageReadinessSignalPath, readGateImageReadinessSignal } from '../../scripts/release-loop/release-readiness.js';
 
 export const LIGHT_RC_ALWAYS_FILE = 'release/light-rc-always.txt';
 export const LIGHT_RC_DEFAULT_SHARDS = 4;
@@ -23,6 +24,15 @@ export const LIGHT_RC_NO_PREVIOUS_CUT = '직전 판 컷을 못 찾았다 — --b
 /** RELEASE-DAILY-LIGHT-RC ① — what light-rc measures by default: main as it is on origin, not the tree it started in
  *  (10-12: the seat tree measured changed=2, a main worktree 52). */
 export const LIGHT_RC_DEFAULT_HEAD = 'origin/main';
+/** The cut-minus-seven-hour rehearsal is intentionally pinned to the warmed cloud host. */
+export const LIGHT_RC_REHEARSAL_CLOUD_HOST = 'aws1';
+
+// Source: scripts/release-loop/release-readiness.ts makes the image signal mandatory from release 0.3.7.
+function gateImageReadinessRequired(version: string): boolean {
+  const [major, minor, patch] = baseVersion(version).split('.').map(Number);
+  // Source: `release-readiness.ts` introduced the mandatory signal at release 0.3.7; 0.3.6 remains compatible.
+  return major !== 0 || minor > 3 || (minor === 3 && patch >= 7);
+}
 
 export interface LightRcOptions {
   base?: string;
@@ -47,6 +57,8 @@ export interface LightRcOptions {
   log?: (line: string) => void;
   /** Rehearsal-only TUI screen check; other light-rc callers keep their current defaults. */
   rehearsalTui?: boolean;
+  /** Pin the scheduled rc-7h rehearsal to its dedicated cloud host; never fall back to another gate host. */
+  rehearsalCloudHost?: boolean;
 }
 
 /** Keep only a complete, identity-bound cut proof from the disposable host-gate instance. */
@@ -143,6 +155,9 @@ export interface LightRcResult {
   measuredCommit: string;
   /** HEAD of the tree light-rc was started from; differs from measuredCommit when it ran from a seat/work tree. */
   worktreeHead: string | null;
+  /** Exact changed-file and test selection returned by self-gate; absent remote evidence is an empty list and fails closed. */
+  changedFiles?: string[];
+  testFiles?: string[];
   /** RELEASE-DAILY-LIGHT-RC ② — tests added because they import a changed source; null = not reported. */
   importerTests: number | null;
   /** New failures vs. the base; null = the gate produced no measurement (never read as green). */
@@ -155,6 +170,8 @@ export interface LightRcResult {
   shards: number;
   /** Host the gate ran on; null = this machine. */
   remote: string | null;
+  /** Scheduled cloud rehearsal only: the clean, identity-bound gate receipt was durably copied to the release ledger. */
+  hostReceiptPersisted?: boolean;
   gateExitCode: number;
   ok: boolean;
   /** LIGHT-RC-MEASURE ③ — why the gate produced no measurement (e.g. `shard-2`); null = it measured. Carried in the
@@ -280,6 +297,9 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
   if (!Number.isSafeInteger(shards) || shards < 1) throw new Error(`invalid --shards count: ${opts.shards}`);
   if (opts.shardConcurrency !== undefined && (!Number.isSafeInteger(opts.shardConcurrency) || opts.shardConcurrency < 1 || opts.shardConcurrency > 4)) throw new Error(`invalid --shard-concurrency: ${opts.shardConcurrency}`);
   if (opts.remote !== undefined && !isValidGateHost(opts.remote)) throw new Error(`invalid --remote host: ${opts.remote}`);
+  if (opts.rehearsalCloudHost && opts.remote !== undefined && opts.remote !== LIGHT_RC_REHEARSAL_CLOUD_HOST)
+    throw new Error(`release light-rc: cloud rehearsal is pinned to ${LIGHT_RC_REHEARSAL_CLOUD_HOST}; refusing ${opts.remote}`);
+  const rehearsalRemote = opts.rehearsalCloudHost ? LIGHT_RC_REHEARSAL_CLOUD_HOST : opts.remote;
   const log = opts.log ?? ((line: string) => process.stderr.write(`${line}\n`));
   const cwd = repoRoot(deps);
   const { measuredCommit, worktreeHead } = resolveMeasuredCommit(cwd, opts.head, deps, log);
@@ -293,27 +313,43 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
 
   // A named remote rehearsal must measure with the release graph's host gate recipe. The public light-rc result shape
   // stays the same; only its execution path changes. Host gate shard assignment is currently the graph's four groups.
-  if (opts.remote !== undefined && !opts.legacySelfGate) {
+  if (rehearsalRemote !== undefined && !opts.legacySelfGate) {
     if (shards !== LIGHT_RC_DEFAULT_SHARDS) return {
-      version, base, measuredCommit, worktreeHead, importerTests: null, introduced: null, preexisting: null,
-      unclassified: null, alwaysInclude: alwaysInclude.length, alwaysIncludeMissing: [], shards, remote: opts.remote,
+      version, base, measuredCommit, worktreeHead, changedFiles: [], testFiles: [], importerTests: null, introduced: null, preexisting: null,
+      unclassified: null, alwaysInclude: alwaysInclude.length, alwaysIncludeMissing: [], shards, remote: rehearsalRemote,
       gateExitCode: 2, ok: false, unmeasured: 'host-gate-shard-contract-mismatch',
     };
+    const graphRunId = opts.graphRunId ?? activeReleaseGraphRunId();
+    const gatePodPool = rehearsalRemote ? deps.gatePodPool ?? configuredGatePodPool() : undefined;
+    if (opts.rehearsalCloudHost && gateImageReadinessRequired(version)) {
+      const unmeasured = (reason: string): LightRcResult => ({
+        version, base, measuredCommit, worktreeHead, importerTests: null, introduced: null, preexisting: null,
+        unclassified: null, alwaysInclude: alwaysInclude.length, alwaysIncludeMissing: [], shards, remote: rehearsalRemote,
+        // Source: `runLightRc` uses gate exit code 2 when a host gate cannot produce a measurement.
+        gateExitCode: 2, ok: false, unmeasured: reason,
+      });
+      if (!graphRunId) return unmeasured('image-readiness-run-id-missing');
+      if (!gatePodPool) return unmeasured('image-readiness-pool-unconfigured');
+      const readiness = readGateImageReadinessSignal(
+        gateImageReadinessSignalPath(opts.ledgerRoot ?? releaseLedgerRoot(), baseVersion(version)),
+        { runId: graphRunId, cutCommit: measuredCommit },
+      );
+      if (readiness.status !== 'ready') return unmeasured(`image-readiness-${readiness.reason}`);
+      if (!readiness.signal.eligiblePools.includes(gatePodPool)) return unmeasured('image-readiness-pool-ineligible');
+    }
     const resolvedBase = (deps.git ?? defaultGit)(['rev-parse', '--verify', '--quiet', `${base}^{commit}`], cwd);
     const base40 = resolvedBase.stdout.trim();
     if (resolvedBase.rc !== 0 || !SHA_RE.test(base40)) throw new Error(`release light-rc: --base does not resolve to a commit (${base})`);
     const scratch = mkdtempSync(join(tmpdir(), 'elanous-light-rc-host-gate-'));
     try {
-      const graphRunId = opts.graphRunId ?? activeReleaseGraphRunId();
       const ledgerRoot = opts.ledgerRoot ?? releaseLedgerRoot();
       copyReleaseGraphRun(ledgerRoot, scratch, graphRunId);
-      const gatePodPool = opts.remote ? deps.gatePodPool ?? configuredGatePodPool() : undefined;
       const previous = (() => { try { return (deps.previousVersion ?? latestPublishedPreviousVersion)(baseVersion(version), opts.ledgerRoot); } catch { return undefined; } })();
       const options: GateOptions = {
         commit: measuredCommit, version, baselineCommit: base40, ...(previous ? { baselineVersion: previous } : {}),
         ...(graphRunId ? { graphRunId } : {}),
         ...(gatePodPool ? { pod: { pool: gatePodPool, shards } } : {}),
-        executor: 'host', remote: opts.remote, full: true, rehearsalTui: opts.rehearsalTui,
+        executor: 'host', remote: rehearsalRemote, full: true, rehearsalTui: opts.rehearsalTui,
         // Keep the gate's disposable instance state isolated, but persist its receipt in the release ledger so the
         // cut gate can inherit same-head/changed-radius evidence after this rehearsal returns.
         repo: cwd, instanceRoot: scratch, ledgerRoot: scratch, shardLedgerRoot: ledgerRoot, scratchOnly: true,
@@ -321,7 +357,8 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
       const gate = deps.runFormalHostGate
         ? await deps.runFormalHostGate(options, deps.formalHostGateRunner)
         : await import('../../scripts/release-loop/gate-api-leaf.js').then(({ judgeGate }) => judgeGate(options, deps.formalHostGateRunner));
-      if (persistHostReceiptArtifacts(scratch, ledgerRoot, version, graphRunId)) {
+      const hostReceiptPersisted = persistHostReceiptArtifacts(scratch, ledgerRoot, version, graphRunId);
+      if (hostReceiptPersisted) {
         debug.log('release.light-rc', 'receipt-preserved', { version, commit: measuredCommit, graphRunId: graphRunId ?? null });
       }
       const unclassifiedCount = (gate.stalledShards?.length ?? 0) + (gate.unmeasuredErrors?.length ?? 0)
@@ -329,11 +366,12 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
       const alwaysIncludeMissing = alwaysInclude.filter((path) => !existsSync(join(cwd, path)));
       const rehearsalTui = opts.rehearsalTui ? gate.rehearsalTui ?? { outcome: 'unmeasured' as const, detail: 'release host gate runner did not return remote TUI evidence' } : undefined;
       return {
-        version, base: base40, measuredCommit, worktreeHead, importerTests: null,
+        version, base: base40, measuredCommit, worktreeHead, changedFiles: [], testFiles: [], importerTests: null,
         introduced: gate.outcome === 'error' ? null : gate.introduced.length,
         preexisting: gate.outcome === 'error' ? null : gate.preexisting,
         unclassified: gate.outcome === 'error' ? null : unclassifiedCount,
-        alwaysInclude: alwaysInclude.length, alwaysIncludeMissing, shards, remote: opts.remote,
+        alwaysInclude: alwaysInclude.length, alwaysIncludeMissing, shards, remote: rehearsalRemote,
+        ...(opts.rehearsalCloudHost ? { hostReceiptPersisted } : {}),
         gateExitCode: rehearsalTui && rehearsalTui.outcome !== 'ok' ? 2 : gate.outcome === 'ok' ? 0 : gate.outcome === 'regression' ? 1 : 2,
         ok: gate.outcome === 'ok' && unclassifiedCount === 0 && (!rehearsalTui || rehearsalTui.outcome === 'ok'),
         unmeasured: gate.outcome === 'error' ? gate.error ?? 'host-gate-unmeasured' : null,
@@ -368,7 +406,7 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
     tool: 'self-gate', repo: cwd, installPwa: true, refs: [base], json: true, commit: measuredCommit,
     // The host re-runs this command with --local (and ELANOUS_GATE_REMOTE_CHILD=1), so it never recurses.
     remoteArgv: (sha) => ['bun', 'bin/elanous.mjs', 'release', 'light-rc', '--version', version, '--base', sha(base), '--head', measuredCommit, '--shards', String(shards), ...(opts.shardConcurrency !== undefined ? ['--shard-concurrency', String(opts.shardConcurrency)] : []), ...(opts.fixedShardDistribution ? ['--fixed-shard-distribution'] : []), '--local', '--json', ...(opts.rehearsalTui ? ['--rehearsal-tui'] : [])],
-    flags: { remote: opts.local ? undefined : opts.remote ?? true, local: !!opts.local },
+    flags: { remote: opts.local ? undefined : rehearsalRemote ?? true, local: !!opts.local },
     runLocal,
   }, {
     ...deps.dispatchDeps,
@@ -381,7 +419,7 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
   let result: LightRcResult;
   if (local) {
     result = {
-      version, base, measuredCommit, worktreeHead,
+      version, base, measuredCommit, worktreeHead, changedFiles: [...local.changedFiles], testFiles: [...local.testFiles],
       importerTests: local.importerTestsAdded ? local.importerTestsAdded.length : null,
       introduced: local.baseline?.introduced ?? null,
       preexisting: local.baseline?.preexisting ?? null,
@@ -397,13 +435,15 @@ export async function runLightRc(version: string, opts: LightRcOptions = {}, dep
     const host = (remote as { host?: unknown }).host;
     result = {
       version, base, measuredCommit, worktreeHead,
+      changedFiles: Array.isArray(remote.changedFiles) ? remote.changedFiles.map(String) : [],
+      testFiles: Array.isArray(remote.testFiles) ? remote.testFiles.map(String) : [],
       importerTests: typeof remote.importerTests === 'number' ? remote.importerTests : null,
       introduced: typeof remote.introduced === 'number' ? remote.introduced : null,
       preexisting: typeof remote.preexisting === 'number' ? remote.preexisting : null,
       unclassified: typeof remote.unclassified === 'number' ? remote.unclassified : null,
       alwaysInclude: alwaysInclude.length,
       alwaysIncludeMissing: Array.isArray(remote.alwaysIncludeMissing) ? remote.alwaysIncludeMissing.map(String) : [],
-      shards, remote: typeof host === 'string' && host ? host : opts.remote ?? LIGHT_RC_UNKNOWN_HOST,
+      shards, remote: typeof host === 'string' && host ? host : rehearsalRemote ?? LIGHT_RC_UNKNOWN_HOST,
       gateExitCode: typeof remote.gateExitCode === 'number' ? remote.gateExitCode : rc, ok: false,
       unmeasured: typeof remote.unmeasured === 'string' && remote.unmeasured
         ? remote.unmeasured

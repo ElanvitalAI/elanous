@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-TOOL-ROUTER-WORLD-TS",
+  "path": "src/ux-sim/tool-router-world.ts",
+  "boundary": "Replays first-party route manifests with enabled-plugin and failed-index boundaries without invoking handlers.",
+  "deviceIds": ["tool-router-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

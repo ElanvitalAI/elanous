@@ -31,8 +31,8 @@ describe('11-04 setup service catalog', () => {
       expect(item.usedBy.length).toBeGreaterThan(0);
       expect(item.verification.length).toBeGreaterThan(0);
     }
-    const metadataWithoutAllowedHiggsfieldSlot = JSON.stringify(SERVICE_KEY_CATALOG).replace(/higgsfield\.secret/g, '');
-    expect(metadataWithoutAllowedHiggsfieldSlot).not.toMatch(/secret|token-value|api-key-value/i);
+    const displayMetadata = SERVICE_KEY_CATALOG.map(({ envNames: _envNames, storeIds: _storeIds, ...item }) => item);
+    expect(JSON.stringify(displayMetadata)).not.toMatch(/secret|token-value|api-key-value/i);
     expect(SERVICE_KEY_CATALOG.find(item => item.id === 'elevenlabs')?.appAttachable).toBe(true);
     const higgsfield = SERVICE_KEY_CATALOG.find(item => item.id === 'higgsfield');
     expect(higgsfield?.kind).toBe('api-key');

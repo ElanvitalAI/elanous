@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runPodCommand, type RunPodCommandOptions, type PodCommandResult } from '../task-orchestrator/surfaces/pod-command-job.js';
 import { redactSecretText } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { RootPlanSummary } from './pr-land-heavy-remote.js';
 import type { WarmReuseEvidence, WarmReuseEvidenceByConsumer, WarmReuseSwitchConfig } from '../task-orchestrator/surfaces/pod-warm-switch.js';
 import { requestWarmPodReplay, finalizeWarmPodReplay, quarantineWarmPodReplay } from '../task-orchestrator/surfaces/pod-warm-worker-provider.js';

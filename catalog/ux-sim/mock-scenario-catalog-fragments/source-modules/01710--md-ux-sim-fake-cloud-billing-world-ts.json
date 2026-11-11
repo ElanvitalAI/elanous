@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-FAKE-CLOUD-BILLING-WORLD-TS",
+  "path": "src/ux-sim/fake-cloud-billing-world.ts",
+  "boundary": "Composes fake-cloud-vm with deterministic image bake, registry readiness, role admission, monthly billing and release worker lifecycle without contacting a cloud provider or image registry.",
+  "deviceIds": ["fake-cloud-billing-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

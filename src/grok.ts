@@ -13,7 +13,7 @@
 
 import type { GrokAnalysis, DiffResult, EnvDelta } from './types.js';
 import * as ui from './ui.js';
-import { getUserConfig } from './user-config.js';
+import { getUserConfig } from './user-config/reader.js';
 import { getProviderForConfig, anyProviderAvailable, logAgentTurnUsage, type LLMMessage } from './llm.js';
 import type { LLMUsage } from './prompt-cache/types.js';
 

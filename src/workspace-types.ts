@@ -38,7 +38,6 @@ export type PaneFocus =
   | 'debug-events' | 'debug-detail' | 'debug-stack' | 'debug-prompts'
   | 'scheduler-board' | 'scheduler-inspector' | 'scheduler-paused'
   | 'scheduler-active' | 'scheduler-ready' | 'scheduler-draft'
-  | 'playground'
   | 'sessions-sidebar'
   | `plugin:${string}`;
 

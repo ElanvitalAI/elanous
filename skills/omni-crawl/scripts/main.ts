@@ -7,33 +7,16 @@ import { parseArgs } from 'node:util';
 import { initEnv } from '../src/env.js';
 import { decideCrawl } from '../src/router.js';
 import { searchGrok } from '../src/grok-search.js';
-import { searchFirecrawl, searchDeveloperFirecrawl, scrapeFirecrawl, creditUsageFirecrawl, firecrawlAvailable } from '../src/firecrawl.js';
-import { searchTavily, extractTavily, usageTavily, tavilyAvailable } from '../src/tavily.js';
-import { searchDdg, scrapeFree } from '../src/free.js';
+import { searchFirecrawl, searchDeveloperFirecrawl, creditUsageFirecrawl } from '../src/firecrawl.js';
+import { searchTavily, usageTavily } from '../src/tavily.js';
+import { searchDdg } from '../src/free.js';
 import { chromeAvailable } from '../src/capture.js';
-import { runRegisteredEngine, type EngineCtx } from '../src/registry.js';
+import { runRegisteredEngine, runCapability, type ContractRequest, type EngineCtx } from '../src/registry.js';
 import { renderMarkdown, saveMarkdown, renderSourcesSection } from '../src/render.js';
 import type { CrawlResult, CrawlItem, SearchEngine } from '../src/types.js';
 import { writeStdoutJson } from '../src/stdout-json.js';
 
 initEnv();
-
-/** ⛔⭐ tavily 를 **상시 경로**에 쓸 것인가 (공식 결정 2026-09-10 · **기본 ON**).
- *
- *  이력: 2026-08-06 엔 비용(deep 1회당 advanced ×3 ≈ 6cr 고정비) 때문에 기본 OFF 로 두고
- *  무료 ddg 를 1순위로 삼았다. 그러나 **DDG HTML 차단 시 웹 검색 축이 통째로 0건**이 되고,
- *  `applyWebFallback` 의 `wantedWeb` 이 ddg 를 세지 않아 **보충조차 걸리지 않는** 구멍이 있었다
- *  (2026-09-10 실측: 연속 3회 0건 · `--health` 에서 ddg-free FAIL 확인).
- *
- *  → 무료는 «돈 떨어졌을 때의 안전망»이지 1순위가 아니다. `types.ts` 의 "tavily 1순위" 주석과
- *    `applyWebFallback` 의 "유료가 1순위·기본" 원칙으로 되돌린다.
- *    **ddg 는 폴백 / `--free` / `--engine ddg` 전용**이 된다.
- *
- *  끄기(= 옛 동작으로 역전, ddg 1순위): `.env` 또는 셸에 `OMNI_CRAWL_TAVILY=0`.
- */
-export function tavilyEnabled(): boolean {
-  return (process.env.OMNI_CRAWL_TAVILY ?? '').trim() !== '0';
-}
 
 const { values: flags, positionals } = parseArgs({
   allowPositionals: true,
@@ -78,7 +61,8 @@ async function main(query: string) {
   console.log('━'.repeat(60));
   console.log(`쿼리:   ${query}`);
   console.log(`모드:   ${decision.mode}`);
-  if (decision.mode !== 'deep' || decision.engines.length) console.log(`엔진:   ${decision.engines.join(', ') || '(deep 오케스트레이션)'}`);
+  if (decision.mode !== 'deep' || decision.engines.length)
+    console.log(`능력:   ${decision.engines.join(', ') || decision.requires?.map(r => r.contract).join(', ') || '(deep 오케스트레이션)'}`);
   console.log(`이유:   ${decision.reason}`);
   if (decision.digestAfter) console.log(`연계:   → omni-digest (${decision.digestFormat})`);
   console.log('');
@@ -89,15 +73,19 @@ async function main(query: string) {
   if (decision.mode === 'deep' && !decision.engines.length) {
     results = await runDeep(query);
   } else {
-    // Run engines in parallel (allSettled 격리)
-    const tasks = decision.engines.map(engine => runEngine(engine, query));
+    // Explicit --engine keeps the legacy ID path; automatic routes select contracts.
+    const tasks = decision.engines.length
+      ? decision.engines.map(engine => runEngine(engine, query))
+      : (decision.requires ?? []).map(async requirement => {
+        const selected = await runCapability(requirement, query, engineCtx());
+        console.log(`  [${requirement.contract}] ${selected.provider}${selected.attempts.length ? ` · 앞선 시도 ${selected.attempts.map(a => `${a.provider}:${a.reason}`).join(', ')}` : ''}`);
+        return selected.result;
+      });
     const settled = await Promise.allSettled(tasks);
     for (const s of settled) {
       if (s.status === 'fulfilled' && s.value) results.push(s.value);
       else if (s.status === 'rejected') console.log(`  ⚠ 엔진 실패: ${s.reason?.message || s.reason}`);
     }
-    // ── 폴백 체인: 웹 검색 축이 완전 공백이면 반대 엔진으로 1회 보충 ──
-    results = await applyWebFallback(decision.engines, results, query);
   }
 
   // ── URL dedup (엔진 간 중복 제거 — 반복 파이프라인 노이즈 감소) ──
@@ -151,202 +139,49 @@ async function main(query: string) {
   console.log('━'.repeat(60));
 }
 
-// ── Deep research 파이프라인 (자체 합성 — Tavily Research 엔드포인트 미사용·비용 예측성) ──
-//
-// 1) 다각도 웹 검색 ×3 (Tavily 사용 가능 시 Tavily, 아니면 Firecrawl) 병렬
-// 2) URL dedup → 상위 K=5 를 firecrawl 풀스크랩 (maxAge 2h 캐시)
-// 3) grok-community 1콜 (X+레딧 여론 각도)
-// 카버당 비용: tavily ~6cr + firecrawl ~5cr + grok ~$0.03 — 예측 가능.
-/** deep 모드에서 개발자 인덱스를 낄지 판정. 금융/일반 주제에 2cr 를 태우지 않기 위한 게이트. */
+// ── Deep research composes contracted abilities; no supplier ID is selected here. ──
 function looksTechnical(q: string): boolean {
   return /\b(api|sdk|cli|library|framework|npm|pip|cargo|docker|kubernetes|rust|python|typescript|javascript|golang|react|next\.js|postgres|redis|error|exception|traceback|deprecat|regression|breaking\s*change)\b|라이브러리|프레임워크|에러|예외|버그|이슈|마이그레이션|구현체/i.test(q);
 }
 
+async function safeCapability(request: ContractRequest, query: string, ctx = engineCtx()) {
+  try {
+    const selected = await runCapability(request, query, ctx);
+    console.log(`  [${request.contract}] ${selected.provider} · ${selected.result.totalItems}건${selected.attempts.length ? ` · 앞선 시도 ${selected.attempts.map(a => `${a.provider}:${a.reason}`).join(', ')}` : ''}`);
+    return selected;
+  } catch {
+    console.log(`  [${request.contract}] 적격 공급자 소진`);
+    return null;
+  }
+}
+
 async function runDeep(query: string): Promise<CrawlResult[]> {
-  console.log('  [deep] 다각도 검색 → 풀스크랩 → 커뮤니티 합성');
+  const freeOnly = flags.free;
   const angles = [
     { q: query, label: 'core' },
     { q: `${query} 분석 전망 outlook analysis`, label: 'outlook' },
     { q: `${query} 리스크 문제점 비판 risk criticism`, label: 'risk' },
   ];
-
-  const results: CrawlResult[] = [];
-
-  // 1) 다각도 검색 + grok-community 동시 발사
-  // 키 부재·비활성뿐 아니라 Tavily/Firecrawl 런타임 공백도 다음 엔진으로 넘긴다.
-  // Tavily 부재 시 Firecrawl이 우선이며 DDG는 두 유료 검색축이 모두 비었을 때만 최후 폴백.
-  const angleEngines = deepAngleSearchOrder(tavilyEnabled() && tavilyAvailable(), firecrawlAvailable());
-  const searchTasks: Array<Promise<CrawlResult | null>> = [
-    ...angles.map(a => searchDeepAngle(a, angleEngines)),
-    searchGrok({ query, mode: 'community' })
-      .catch(e => { console.log(`  [deep] grok-community 실패: ${e.message?.slice(0, 80)}`); return null; }),
-    // 기술 주제면 개발자 인덱스 1콜 추가(실측 ~2cr) — 패시지가 곧 인용이라 풀스크랩 콜을 아낀다.
-    ...(looksTechnical(query) ? [
-      searchDeveloperFirecrawl(query, { k: 10, passages: 2 })
-        .catch(e => { console.log(`  [deep] fc-dev 실패: ${e.message?.slice(0, 80)}`); return null; }),
-    ] : []),
+  const searchRequest: ContractRequest = { contract: 'search.web@1', freeOnly };
+  const sideRequests: ContractRequest[] = [
+    { contract: 'social.posts@1', conditions: { socialSite: 'community' }, freeOnly },
+    ...(looksTechnical(query) ? [{ contract: 'search.developer@1' as const, freeOnly }] : []),
   ];
-  const settled = await Promise.all(searchTasks);
-  for (const r of settled) if (r) results.push(r as CrawlResult);
-
-  // 2) 검색 히트에서 상위 URL 추출 → firecrawl 풀스크랩 (병렬·캐시 2h)
-  const seen = new Set<string>();
-  const topUrls: string[] = [];
-  for (const r of results) {
-    if (!r.engine.startsWith('tavily') && !r.engine.startsWith('firecrawl') && !r.engine.startsWith('ddg')) continue;
-    for (const it of r.items) {
-      if (!it.url || seen.has(it.url)) continue;
-      seen.add(it.url);
-      topUrls.push(it.url);
-      if (topUrls.length >= 5) break;
-    }
-    if (topUrls.length >= 5) break;
-  }
-  if (topUrls.length) {
-    console.log(`  [deep] 상위 ${topUrls.length}개 URL 풀스크랩 (firecrawl·캐시 2h)`);
-    const scraped = await Promise.all(topUrls.map(async u => {
-      const startedAt = Date.now();
-      try {
-        const result = await scrapeFirecrawl(u, { maxAge: 2 * 3600_000 });
-        if (!result) {
-          console.log(`  [deep:firecrawl:scrape] ${u} · 실패 · ${Date.now() - startedAt}ms · 본문 없음`);
-          return null;
-        }
-        console.log(`  [deep:firecrawl:scrape] ${u} · ${Date.now() - startedAt}ms · ${result.content.length}자`);
-        return result;
-      } catch (e: any) {
-        console.log(`  [deep:firecrawl:scrape] ${u} · 실패 · ${Date.now() - startedAt}ms · ${e.message?.slice(0, 80)}`);
-        return null;
-      }
-    }));
-    const items: CrawlItem[] = [];
-    for (let i = 0; i < scraped.length; i++) {
-      const s = scraped[i];
-      if (!s) continue;
-      items.push({
-        engine: 'fc-deep', query, url: topUrls[i],
-        text: s.content.slice(0, 6000),
-        metadata: { title: s.title, fullLength: s.content.length },
-      });
-    }
-    // 스크랩 실패분: tavily extract(기본 OFF) → jina 무료 스크랩
-    let missed = topUrls.filter((_, i) => !scraped[i]);
-    const extractedUrls = new Set<string>();
-    if (missed.length && tavilyEnabled() && tavilyAvailable()) {
-      try {
-        const ext = await extractTavily(missed);
-        for (const e of ext) { items.push({ engine: 'fc-deep', query, url: e.url, text: e.content.slice(0, 6000), metadata: { via: 'tavily-extract' } }); extractedUrls.add(e.url); }
-      } catch { /* fail-soft */ }
-    }
-    missed = missed.filter(u => !extractedUrls.has(u));
-    if (missed.length) {
-      console.log(`  [deep] 잔여 ${missed.length}개 → jina 무료 스크랩`);
-      const freeScraped = await Promise.all(missed.map(u => scrapeFree(u, { allowPrivate: flags['allow-private'] }).catch(() => null)));
-      for (let i = 0; i < freeScraped.length; i++) {
-        const s = freeScraped[i];
-        if (s) items.push({ engine: 'fc-deep', query, url: missed[i], text: s.content.slice(0, 6000), metadata: { via: s.method, title: s.title } });
-      }
-    }
-    if (items.length) {
-      console.log(`  [deep:firecrawl:fullscrape] ${items.length}/${topUrls.length}건 본문 확보`);
-      results.push({ engine: 'deep-fullscrape', query, items, totalItems: items.length, costNote: `firecrawl ~${scraped.filter(Boolean).length}cr + 무료` });
-    } else {
-      console.log(`  [deep:firecrawl:fullscrape] 0/${topUrls.length}건 본문 확보`);
-    }
-  }
-
-  return results;
-}
-
-type DeepAngleEngine = 'tavily' | 'firecrawl' | 'ddg';
-
-function deepAngleSearchOrder(tavilyReady: boolean, firecrawlReady: boolean): DeepAngleEngine[] {
-  return [
-    ...(tavilyReady ? ['tavily' as const] : []),
-    ...(firecrawlReady ? ['firecrawl' as const] : []),
-    'ddg',
-  ];
-}
-
-function firecrawlTbsFromTimeRange(timeRange?: string): string | undefined {
-  if (!timeRange) return undefined;
-  return ({ day: 'qdr:d', week: 'qdr:w', month: 'qdr:m', year: 'qdr:y' } as Record<string, string>)[timeRange];
-}
-
-async function searchDeepAngle(
-  angle: { q: string; label: string },
-  engines: DeepAngleEngine[],
-): Promise<CrawlResult | null> {
-  for (const engine of engines) {
-    const startedAt = Date.now();
-    try {
-      const result = engine === 'tavily'
-        ? await searchTavily(angle.q, { depth: 'advanced', maxResults: 5, chunksPerSource: 3, timeRange: flags['time-range'] })
-        : engine === 'firecrawl'
-          ? await searchFirecrawl(angle.q, { limit: 5, tbs: firecrawlTbsFromTimeRange(flags['time-range']) })
-          : await searchDdg(angle.q, { maxResults: 5 });
-      const elapsedMs = Date.now() - startedAt;
-      console.log(`  [deep:${engine}:${angle.label}] ${result.totalItems}건 · ${elapsedMs}ms`);
-      if (result.totalItems > 0) return { ...result, engine: `${engine}:${angle.label}` };
-    } catch (e: any) {
-      console.log(`  [deep:${engine}:${angle.label}] 실패 · ${Date.now() - startedAt}ms · ${e.message?.slice(0, 80)}`);
-    }
-  }
-  return null;
-}
-
-// ── 폴백 체인: tavily ↔ firecrawl → (최후) ddg 무료 (웹 검색 축 공백 방지) ──
-//
-// 원칙: 유료(tavily/firecrawl)가 1순위·기본. 유료가 공백/미가용일 때만 무료(ddg)로 강등.
-// "품질 동일 시 무료, 아니면 유료 우선" — 무료는 돈 떨어졌을 때의 안전망.
-async function applyWebFallback(engines: SearchEngine[], results: CrawlResult[], query: string): Promise<CrawlResult[]> {
-  // ⛔ ddg 도 «웹 검색 축»으로 센다(공식 결정 2026-09-10). 종전엔 ddg 가 빠져 있어서
-  //    ddg 1순위로 돌던 시절 DDG 가 0건이면 **보충이 아예 안 걸렸다** — 그 구멍을 막는다.
-  const wantedWeb = engines.some(e => e === 'tavily' || e === 'tavily-news' || e === 'firecrawl' || e === 'fc-news' || e === 'ddg');
-  if (!wantedWeb) return results;
-  const triedDdg = engines.includes('ddg');
-  const gotWeb = () => results.some(r => /^(tavily|firecrawl|ddg)/.test(r.engine) && r.totalItems > 0);
-  if (gotWeb()) return results;
-
-  // 1순위 실패 → 반대 유료 엔진 1회
-  const triedTavily = engines.includes('tavily') || engines.includes('tavily-news');
-  try {
-    if (triedDdg) {
-      // ddg 1순위(OMNI_CRAWL_TAVILY=0)가 공백 → 유료로 «승격» 보충
-      if (tavilyAvailable()) {
-        console.log('  [fallback] ddg 공백 → tavily 검색 승격');
-        const fb = await searchTavily(query, { depth: 'basic', maxResults: 5 });
-        if (fb.totalItems > 0) results.push(fb);
-      }
-      if (!gotWeb() && firecrawlAvailable()) {
-        console.log('  [fallback] ddg 공백 → firecrawl 검색 승격');
-        const fb = await searchFirecrawl(query, { limit: 5 });
-        if (fb.totalItems > 0) results.push(fb);
-      }
-    } else if (triedTavily && firecrawlAvailable()) {
-      console.log('  [fallback] tavily 공백 → firecrawl 검색 보충');
-      const fb = await searchFirecrawl(query, { limit: 5 });
-      if (fb.totalItems > 0) results.push(fb);
-    } else if (!triedTavily && tavilyAvailable()) {
-      console.log('  [fallback] firecrawl 공백 → tavily 검색 보충');
-      const fb = await searchTavily(query, { depth: 'basic', maxResults: 5 });
-      if (fb.totalItems > 0) results.push(fb);
-    }
-  } catch (e: any) {
-    console.log(`  [fallback] 보충 실패: ${e.message?.slice(0, 80)}`);
-  }
-
-  // 유료 양쪽 다 공백/미가용 → 무료 ddg 최후 보충 (죽지 않게).
-  // 단 이미 ddg 로 돌아서 0건이었다면 같은 엔진을 재시도하지 않는다(차단 상태면 무의미).
-  if (!gotWeb() && !triedDdg) {
-    try {
-      console.log('  [fallback] 유료 웹 검색 공백 → ddg 무료 티어 강등');
-      const fb = await searchDdg(query, { maxResults: 5 });
-      if (fb.totalItems > 0) results.push(fb);
-    } catch (e: any) {
-      console.log(`  [fallback] ddg 보충 실패: ${e.message?.slice(0, 80)}`);
-    }
-  }
+  const selected = await Promise.all([
+    ...angles.map(angle => safeCapability(searchRequest, angle.q, { ...engineCtx(), depth: 'advanced' })),
+    ...sideRequests.map(request => safeCapability(request, query)),
+  ]);
+  const web = selected.slice(0, angles.length);
+  const results: CrawlResult[] = selected.flatMap((item, index) => item
+    ? [{ ...item.result, engine: index < angles.length ? `${item.provider}:${angles[index]!.label}` : item.provider }]
+    : []);
+  const topUrls = [...new Set(web.flatMap(item => item?.result.items.map(hit => hit.url).filter((url): url is string => Boolean(url)) ?? []))].slice(0, 5);
+  const scraped = await Promise.all(topUrls.map(url => safeCapability({ contract: 'scrape.url@1', freeOnly }, url, { ...engineCtx(), depth: 'advanced' })));
+  const items: CrawlItem[] = scraped.flatMap((selected, index) => selected
+    ? selected.result.items.map(item => ({ ...item, engine: 'deep-fullscrape', query, url: item.url ?? topUrls[index],
+      metadata: { ...item.metadata, via: selected.provider } }))
+    : []);
+  if (items.length) results.push({ engine: 'deep-fullscrape', query, items, totalItems: items.length });
   return results;
 }
 
@@ -480,45 +315,42 @@ function runSelfTest() {
   console.log('=== omni-crawl self-test ===\n');
   let passed = 0, failed = 0;
 
-  // ⛔ 기대값은 **tavily 스위치를 따라간다**(공식 결정 2026-08-06 기본 OFF). 스위치를 뒤집고도
-  //    자기테스트를 안 고쳐 3건이 상시 FAIL 로 남아 있었다 — 신호가 죽어 있던 자리다.
-  const WEB = (process.env.OMNI_CRAWL_TAVILY ?? '').trim() !== '0' ? 'tavily' : 'ddg';
-  const NEWS = WEB === 'tavily' ? ['tavily-news', 'fc-news'] : ['fc-news'];
-
-  const cases: Array<{ text: string; expectEngines: string[]; expectDigest: boolean; expectMode?: string; free?: boolean }> = [
-    { text: 'AI 트렌드', expectEngines: [WEB], expectDigest: false },
-    { text: 'X에서 AI 검색', expectEngines: ['grok-x'], expectDigest: false },
-    { text: '레딧 반응', expectEngines: ['grok-reddit'], expectDigest: false },
-    { text: '트윗 검색', expectEngines: ['apify'], expectDigest: false },
-    { text: '삼성전자 뉴스', expectEngines: NEWS, expectDigest: false },
-    { text: '웹 크롤 요약', expectEngines: ['firecrawl'], expectDigest: true },
-    { text: '커뮤니티 반응 정리', expectEngines: ['grok-community'], expectDigest: true },
-    { text: '전체 검색', expectEngines: [WEB, 'apify', 'grok-x', 'firecrawl'], expectDigest: false },
-    { text: 'pydantic 라이브러리 사용법', expectEngines: ['fc-dev'], expectDigest: false },
-    { text: 'tokio 이슈 확인', expectEngines: ['fc-dev'], expectDigest: false },
-    { text: 'axum 에러 메시지 정리', expectEngines: ['fc-dev'], expectDigest: true },
-    { text: '데이터 추출', expectEngines: ['fc-agent'], expectDigest: false },
-    { text: '사이트맵 파악', expectEngines: ['fc-map'], expectDigest: false },
-    { text: '딥리서치 해줘', expectEngines: [], expectDigest: false, expectMode: 'deep' },
-    { text: '이 페이지 스크린샷', expectEngines: ['capture'], expectDigest: false },
-    { text: 'AI 트렌드', expectEngines: ['ddg'], expectDigest: false, free: true },
-    { text: '삼성전자 스크린샷', expectEngines: ['capture'], expectDigest: false, free: true },
+  const cases: Array<{ text: string; query?: string; requires: string[]; digest: boolean; mode?: string; free?: boolean; forceEngines?: string; engines?: string[] }> = [
+    { text: 'AI 트렌드', requires: ['search.web@1'], digest: false },
+    { text: 'https://example.com/article', query: 'https://example.com/article', requires: ['scrape.url@1'], digest: false },
+    { text: 'https://github.com/example/repo', query: 'https://github.com/example/repo', requires: ['scrape.url@1'], digest: false },
+    { text: '사이트맵 파악', query: 'https://example.com', requires: ['map.site@1'], digest: false },
+    { text: '사이트 전체 크롤', query: 'https://example.com', requires: ['crawl.site@1'], digest: false },
+    { text: '데이터 추출', query: 'https://example.com', requires: ['extract.agent@1'], digest: false },
+    { text: 'X에서 AI 검색', requires: ['social.posts@1:x'], digest: false },
+    { text: '레딧 반응', requires: ['social.posts@1:reddit'], digest: false },
+    { text: '트윗 검색', requires: ['social.posts@1:x'], digest: false },
+    { text: '삼성전자 뉴스', requires: ['search.news@1'], digest: false },
+    { text: '웹 크롤 요약', requires: ['scrape.url@1'], digest: true },
+    { text: '커뮤니티 반응 정리', requires: ['social.posts@1:community'], digest: true },
+    { text: '전체 검색', requires: ['search.web@1', 'social.posts@1:x', 'social.posts@1:reddit'], digest: false },
+    { text: 'pydantic 라이브러리 사용법', requires: ['search.developer@1'], digest: false },
+    { text: 'tokio 이슈 확인', requires: ['search.developer@1'], digest: false },
+    { text: 'axum 에러 메시지 정리', requires: ['search.developer@1'], digest: true },
+    { text: '데이터 추출', requires: ['extract.agent@1'], digest: false },
+    { text: '사이트맵 파악', requires: ['map.site@1'], digest: false },
+    { text: '딥리서치 해줘', requires: [], digest: false, mode: 'deep' },
+    { text: '이 페이지 스크린샷', requires: ['capture.url@1'], digest: false },
+    { text: 'AI 트렌드', requires: ['search.web@1'], digest: false, free: true },
+    { text: '레딧 반응', requires: ['social.posts@1:reddit'], digest: false, free: true },
+    { text: '삼성전자 스크린샷', requires: ['capture.url@1'], digest: false, free: true },
+    { text: 'AI 트렌드', requires: [], digest: false, forceEngines: 'tavily,firecrawl', engines: ['tavily', 'firecrawl'] },
   ];
-
   for (const tc of cases) {
-    const r = decideCrawl({ intentText: tc.text, query: 'test', forceFree: tc.free });
-    const engOk = JSON.stringify([...r.engines].sort()) === JSON.stringify([...tc.expectEngines].sort());
-    const digOk = r.digestAfter === tc.expectDigest;
-    const modeOk = !tc.expectMode || r.mode === tc.expectMode;
-    if (engOk && digOk && modeOk) {
-      console.log(`  PASS: "${tc.text}" → [${r.engines}] mode=${r.mode} digest=${r.digestAfter}`);
-      passed++;
-    } else {
-      console.log(`  FAIL: "${tc.text}"`);
-      console.log(`    expect: [${tc.expectEngines}] mode=${tc.expectMode ?? 'auto'} digest=${tc.expectDigest}`);
-      console.log(`    got:    [${r.engines}] mode=${r.mode} digest=${r.digestAfter}`);
-      failed++;
-    }
+    const r = decideCrawl({ intentText: tc.text, query: tc.query ?? 'test', forceFree: tc.free, forceEngines: tc.forceEngines });
+    const got = r.requires?.map(req => req.contract + (req.conditions?.socialSite ? `:${req.conditions.socialSite}` : '')) ?? [];
+    const ok = JSON.stringify(got) === JSON.stringify(tc.requires)
+      && JSON.stringify(r.engines) === JSON.stringify(tc.engines ?? [])
+      && r.digestAfter === tc.digest
+      && (!tc.mode || r.mode === tc.mode)
+      && (!tc.free || r.requires?.every(req => req.freeOnly));
+    if (ok) { console.log(`  PASS: "${tc.text}" → [${got.join(', ') || r.engines.join(', ')}]`); passed++; }
+    else { console.log(`  FAIL: "${tc.text}" expected ${tc.requires} got ${got} engines=${r.engines}`); failed++; }
   }
 
   // deep 모드의 fc-dev 게이트 — 금융/일반 주제에 2cr 를 태우지 않는지 고정한다.
@@ -535,43 +367,21 @@ function runSelfTest() {
     else { console.log(`  FAIL: looksTechnical("${q}") expect ${expect}, got ${got}`); failed++; }
   }
 
-  const angleEngineCases: Array<[string, boolean, boolean, string]> = [
-    ['Tavily and Firecrawl ready', true, true, 'tavily,firecrawl,ddg'],
-    ['Tavily unavailable', false, true, 'firecrawl,ddg'],
-    ['Tavily disabled', false, true, 'firecrawl,ddg'],
-    ['both paid search engines unavailable', false, false, 'ddg'],
-  ];
-  for (const [label, tavilyReady, firecrawlReady, expected] of angleEngineCases) {
-    const got = deepAngleSearchOrder(tavilyReady, firecrawlReady).join(',');
-    if (got === expected) { console.log(`  PASS: deep angle fallback ${label} → ${got}`); passed++; }
-    else { console.log(`  FAIL: deep angle fallback ${label} expect ${expected}, got ${got}`); failed++; }
-  }
-  const tbsCases: Array<[string, string | undefined]> = [
-    ['day', 'qdr:d'], ['week', 'qdr:w'], ['month', 'qdr:m'], ['year', 'qdr:y'], ['unset', undefined],
-  ];
-  for (const [timeRange, expected] of tbsCases) {
-    const got = firecrawlTbsFromTimeRange(timeRange === 'unset' ? undefined : timeRange);
-    if (got === expected) { console.log(`  PASS: Firecrawl time range ${timeRange} → ${got ?? 'unset'}`); passed++; }
-    else { console.log(`  FAIL: Firecrawl time range ${timeRange} expect ${expected}, got ${got}`); failed++; }
-  }
-
   console.log(`\n결과: ${passed} passed, ${failed} failed`);
   if (failed > 0) process.exit(1);
 }
 
 function printHelp() {
   console.log(`
-omni-crawl — 통합 검색/크롤링 (tavily + firecrawl REST + grok + apify 역할분담)
+omni-crawl — 계약 기반 검색/크롤링 (기존 공급자 어댑터)
 
 사용법: bun scripts/main.ts "<검색어>" [OPTIONS]
        bun scripts/main.ts --health          # 전 엔진 라이브 진단
 
-역할:  일반 웹=tavily · 뉴스=tavily-news+fc-news · 크롤/스크랩=firecrawl(REST)
-       커뮤니티/X/레딧=grok · 트윗 벌크=apify · 딥리서치=--mode deep
-       무료 폴백=ddg 검색·jina 스크랩(키 불필요) · 스크린샷=capture(로컬 Chrome)
+역할:  자동 라우팅은 search.web/news · scrape.url · social.posts 등 계약 선택
+       딥리서치=--mode deep · 스크린샷=capture(로컬 Chrome)
 
-비용:  유료(tavily/firecrawl/grok/apify)가 1순위·기본. 유료 공백/키없음/--free 시
-       무료(ddg/jina)로 자동 강등 — "품질 동일 시 무료, 아니면 유료 우선".
+비용:  무료(ddg/jina/로컬)가 우선. 빈 결과나 실패 뒤에만 BYOK 공급자를 시도.
 
 옵션:
   --message, -m <text>   의도 힌트 (역할 자동 라우팅)
@@ -579,7 +389,7 @@ omni-crawl — 통합 검색/크롤링 (tavily + firecrawl REST + grok + apify �
                          fc-crawl, fc-agent, fc-map, grok-x/web/reddit/community, apify,
                          ddg(무료 검색), capture(스크린샷)
   --free                 무료 티어 강제 (ddg 검색 / jina 스크랩 / capture)
-  --mode <auto|deep>     deep = 다각도 tavily + firecrawl 풀스크랩 + grok 합성 + Sources 인용
+  --mode <auto|deep>     deep = 다각도 계약 검색 + 계약 스크랩/소셜 합성 + Sources 인용
   --depth <basic|advanced>  tavily 검색 깊이 (advanced=2cr·근거 청크)
   --limit <n>            검색 결과 수 (기본 5)
   --time-range <r>       day|week|month|year (최신성 필터)
@@ -593,7 +403,7 @@ omni-crawl — 통합 검색/크롤링 (tavily + firecrawl REST + grok + apify �
   --self-test            라우팅 회귀 테스트
 
 예시:
-  bun scripts/main.ts "Samsung HBM4 경쟁력" --print                # tavily 기본
+  bun scripts/main.ts "Samsung HBM4 경쟁력" --print                # search.web@1 무료 우선
   bun scripts/main.ts "삼성전자 뉴스" --time-range day --print      # 뉴스 (오늘)
   bun scripts/main.ts "SK하이닉스 전망" --mode deep --print          # 딥리서치+인용
   bun scripts/main.ts "AI 트렌드" --free --print                    # 무료 티어(ddg)

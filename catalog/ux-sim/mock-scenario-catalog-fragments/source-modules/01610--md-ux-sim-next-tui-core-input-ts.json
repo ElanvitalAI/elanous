@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-NEXT-TUI-CORE-INPUT-TS",
+  "path": "src/ux-sim/next-tui-core-input.ts",
+  "boundary": "Drives the production next-TUI input controller through deterministic editing, prompt-history and paste-fold transitions.",
+  "deviceIds": ["tui-interaction"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

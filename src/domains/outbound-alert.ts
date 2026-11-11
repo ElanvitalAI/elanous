@@ -13,7 +13,7 @@ import { conatusEnv } from './conatus-env.js';
 import { spillLongContent } from '../storage/content-spill.js';
 import { openSurfaceEventsDb, recordEvent } from './surface-events.js';
 import { latestUserIntentTs } from '../user-intent/index.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { explainReportRoute, isOperationalKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './telegram-kind-route.js';

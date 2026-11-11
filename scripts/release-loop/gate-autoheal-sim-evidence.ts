@@ -10,7 +10,8 @@ import { debug } from '../../src/debug/log.js';
 import { setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { prodInstanceRoot } from '../../src/instance/resolve.js';
-import { runGateNode, type GateResult } from './gate-node.js';
+import { runGateNode } from './gate-node.js';
+import type { GateResult } from './gate-types.js';
 import { GATE_NODE_SIM_SCENARIOS, judgeInjectedGateEvent } from './gate-node-sim.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');

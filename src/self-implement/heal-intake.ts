@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
 import { passJourneyNode } from '../self-dev/graph-journey-nodes.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js';
 import { appendRunLedgerEntry, runLedgerDir } from './run-ledger.js';
 

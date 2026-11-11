@@ -1,0 +1,4 @@
+{
+  "deviceKey": "opt-absorb-brief-graph-contract",
+  "review": "> 📅 **2026-11-10 재검토 (OPT · ABSORB-BRIEF-GRAPH-CONTRACT)** — 시뮬 장치 매뉴얼에 absorb Graph v2 runGraph 계약·매핑 저장 필드 검증이 추가됐다. 생산 runGraph 경계에 fake capability 를 주입한 시뮬 증거에 이 규칙의 기존 검증 기준을 적용하며 규칙 본문은 영향 없음."
+}

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { resolve, sep } from 'node:path';
 import { debug } from '../debug/log.js';
 import { resolveCurrentInstance } from '../instance/current.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export class VaultWriteBlockedError extends Error {
   readonly code = 'vault-write-blocked-test-universe';

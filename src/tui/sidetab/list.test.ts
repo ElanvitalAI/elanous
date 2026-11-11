@@ -1,3 +1,4 @@
+import { NEXT_TUI_TITLE } from '../core/render.js';
 import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -179,6 +180,7 @@ describe('next TUI sidetab', () => {
       XDG_CACHE_HOME: join(root, '.cache'), ELANOUS_STATE_DIR: root, ELANOUS_STATE_DIR_SOURCE: 'explicit',
       ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_SKIP_LOGIN_ENV: '1',
       ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
+      ELANOUS_NEXT_TUI_COMPACT_HEIGHT: '20',
     };
     const readScreen = () => Array.from({ length: 24 }, (_, row) => terminal.buffer.active.getLine(terminal.buffer.active.viewportY + row)?.translateToString(true) ?? '').join('\n');
     let app: MinimalPty | undefined;
@@ -221,7 +223,7 @@ describe('next TUI sidetab', () => {
         outputPending = outputPending.then(() => new Promise<void>((resolve) => terminal.write(chunk, resolve)));
       });
       appExit = app.onExit(({ exitCode: code }) => { exitCode = code; });
-      await waitForScreen((screen) => screen.includes('elanous next ·') && screen.includes('Ctrl+Q 종료') && screen.includes('❯'), 'next TUI ready');
+      await waitForScreen((screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') && screen.includes('❯'), 'next TUI ready');
 
       const now = Date.now();
       for (const [id, label] of [['pty:82001', 'shell-child-a']] as const) {
@@ -321,9 +323,9 @@ describe('next TUI sidetab', () => {
         root,
         rows: 24,
         cols: 80,
-        env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' },
+        env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1', ELANOUS_NEXT_TUI_COMPACT_HEIGHT: '20' },
         ready: { label: 'chat-before-toggle', timeoutMs: 30_000, until: (screen) => {
-          const ready = screen.includes('elanous next ·') && screen.includes('Ctrl+Q 종료');
+          const ready = screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료');
           return ready;
         } },
         steps: [
@@ -372,8 +374,8 @@ describe('next TUI sidetab', () => {
         root,
         rows: 24,
         cols: 80,
-        env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1' },
-        ready: { label: 'chat-ready', timeoutMs: 30_000, until: (screen) => screen.includes('elanous next ·') },
+        env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1', ELANOUS_NEXT_TUI_COMPACT_HEIGHT: '20' },
+        ready: { label: 'chat-ready', timeoutMs: 30_000, until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) }, // Source: #36661
         steps: [
           { label: 'open-sidetab', keys: '\x1c', timeoutMs: 15_000, until: (screen) => screen.includes('↑↓ 전환') && screen.includes('+ new') },
           { label: 'shortcut-letters-remain-prompt-text', keys: 'nx', timeoutMs: 15_000, until: (screen) => screen.includes('❯ nx') },

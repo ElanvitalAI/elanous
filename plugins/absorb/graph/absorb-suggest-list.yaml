@@ -1,0 +1,16 @@
+apiVersion: elanous.dev/graph/v2
+graph: { id: absorb-suggest-list, version: 1.0.0, layer: flow, purpose: "검증된 회원의 기존 앱 제안 읽기" }
+entry: list
+nodes:
+  - id: list
+    type: store
+    requires: store.read@1
+    with:
+      op: list
+      collection: suggestions
+      where: "owner == $context.memberId"
+      ownerScoped: true
+edges:
+  - { from: list, on: outcome, map: { done: done, failed: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, absorb.suggestion] }

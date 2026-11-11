@@ -22,7 +22,7 @@ import {
   type McpServerBootResult,
   type RegisterMcpClientsOpts,
 } from '../nexus/boot/register-mcp-clients.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { AsideConfig, McpServerSpec, UserConfig } from '../user-config/types.js';
 import { registerToolRuntime } from './registry.js';
 

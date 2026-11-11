@@ -45,8 +45,9 @@ test('inside-seed declares only inert demo commands and a bounded review loop', 
     ['review', 'outcome', { rework: 'build', ok: 'publish' }],
     ['publish', 'outcome', { ok: 'done' }],
   ]);
-  expect(Object.keys(recipes)).toEqual(['plan', 'build', 'review', 'publish']);
-  expect(graph.nodes.filter(({ recipe }) => recipe).map(({ recipe }) => recipe)).toEqual(Object.keys(recipes).map((key) => `cmd:${key}`));
+  const commandRecipes = ['plan', 'build', 'review', 'publish'];
+  expect(commandRecipes.every(key => typeof recipes[key]?.command === 'string')).toBe(true);
+  expect(graph.nodes.filter(({ recipe }) => recipe).map(({ recipe }) => recipe)).toEqual(commandRecipes.map((key) => `cmd:${key}`));
   expect(recipes.plan?.command).toStartWith('sleep ');
   expect(recipes.build?.command).toStartWith('sleep ');
   expect(recipes.publish?.command).toStartWith('sleep ');

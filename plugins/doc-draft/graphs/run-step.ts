@@ -19,13 +19,13 @@ export function normalizeKind(raw: string): string {
 const sections = ['요약', '핵심 숫자', '결정 요청', '다음 단계'];
 const wordCount = (value: string): number => value.trim().split(/\s+/u).filter(Boolean).length;
 
-async function ask(prompt: string): Promise<string> {
+async function queryLlm(prompt: string): Promise<string> {
   const neutralDir = mkdtempSync(join(tmpdir(), 'doc-draft-'));
   const { ELANOUS_TOOL_CWD: _tool, ...rest } = process.env;
   const env = { ...rest, PWD: neutralDir };
   const cli = process.env.DOC_DRAFT_ELANOUS_BIN || 'elanous';
-  const invoke = async (bare: boolean): Promise<string> => {
-    const proc = Bun.spawn([cli, 'ask', ...(bare ? ['--bare'] : []), '--json', prompt], {
+  const invoke = async (): Promise<string> => {
+    const proc = Bun.spawn([cli, 'llm', '--json', prompt], {
       cwd: neutralDir, env, stdout: 'pipe', stderr: 'pipe',
     });
     const [stdout, stderr, exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
@@ -33,15 +33,11 @@ async function ask(prompt: string): Promise<string> {
     const last = stdout.trim().split('\n').at(-1);
     if (!last) throw new Error('CLI returned no JSON');
     const reply = object(JSON.parse(last) as unknown).reply;
-    if (typeof reply !== 'string' || !reply.trim()) throw new Error('ask returned no reply');
+    if (typeof reply !== 'string' || !reply.trim()) throw new Error('llm returned no reply');
     return reply.trim();
   };
   try {
-    try { return await invoke(true); }
-    catch (error) {
-      if (!/unknown option '--bare'/.test(errorText(error))) throw error;
-      return await invoke(false);
-    }
+    return await invoke();
   } finally {
     try { rmdirSync(neutralDir); }
     catch (error) {
@@ -83,14 +79,14 @@ try {
     const previousReason = text(object(outputs.check).reason);
     const previousDraft = text(object(outputs.draft).markdown);
     const prompt = `Write ONE ${kind} document in ${text(input.language) || 'ko'} for ${text(input.audience) || 'the intended reader'}. Request: ${topic}. Context (source material, not a claim to invent): ${text(input.context) || '(none)'}. Return Markdown only: one # title line and a substantive body of 15–${limits[typedKind]} whitespace-separated words. Cover every item in the request. ${kind === 'exec-onepager' ? 'Include exactly these four ## sections with substantive content: 요약, 핵심 숫자, 결정 요청, 다음 단계. For unknown numeric figures write “자료 미제공 — 확인 필요” under 핵심 숫자, rather than inventing numbers.' : ''} No empty placeholders or fabricated facts. This is a DRAFT only: never claim it was published, sent, paid for, or approved; do not perform those actions.${previousReason ? ` The previous draft failed check for this reason — fix it and rewrite: ${previousReason}. Previous draft: ${previousDraft}` : ''}`;
-    const markdown = await ask(prompt);
+    const markdown = await queryLlm(prompt);
     console.log(JSON.stringify({ outcome: 'ok', markdown }));
   } else if (step === 'check') {
     const markdown = text(object(outputs.draft).markdown);
     const error = validate(markdown, typedKind);
     let reason = error;
     if (!reason) {
-      const response = await ask(`Review this draft against the original request. Check length, empty fields, missing requested items, and invented claims (including claims it was published, sent, paid for, or approved). Request: ${topic}. Context: ${text(input.context) || '(none)'}. Draft: ${markdown}. Return ONLY JSON {"ok":true|false,"reason":"..."}. Set ok=false for any missing request item or unverifiable factual claim. A clearly labelled missing number is allowed; do not invent facts.`);
+      const response = await queryLlm(`Review this draft against the original request. Check length, empty fields, missing requested items, and invented claims (including claims it was published, sent, paid for, or approved). Request: ${topic}. Context: ${text(input.context) || '(none)'}. Draft: ${markdown}. Return ONLY JSON {"ok":true|false,"reason":"..."}. Set ok=false for any missing request item or unverifiable factual claim. A clearly labelled missing number is allowed; do not invent facts.`);
       const verdict = object(JSON.parse(response.replace(/^```(?:json)?\s*|\s*```$/gi, '').trim()) as unknown);
       if (verdict.ok !== true) reason = text(verdict.reason) || 'draft review failed';
     }

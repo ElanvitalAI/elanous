@@ -1,0 +1,13 @@
+{
+  "id": "world-regression-suite",
+  "name": "World scenario receipt regression suite",
+  "implementation": ["src/ux-sim/world-regression-suite.ts", "src/ux-sim/real-target-sandbox.ts"],
+  "tests": ["src/ux-sim/world-regression-suite.test.ts", "src/ux-sim/real-target-sandbox.test.ts"],
+  "target": "Catch changed world scenario steps, outcomes, invariants, event order, and simulated duration against target-specific baselines.",
+  "inputs": ["world.yaml", "scenario.yaml", "target-specific baseline receipt", "duration tolerance"],
+  "observations": ["normalized scenario receipt", "per-field differences", "unmeasured real target when no isolated worker is available", "hostile adapter blocked by OS sandbox"],
+  "entryCommands": ["bun test src/ux-sim/world-regression-suite.test.ts", "bun test src/ux-sim/real-target-sandbox.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

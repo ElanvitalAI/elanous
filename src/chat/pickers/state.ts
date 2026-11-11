@@ -206,7 +206,9 @@ export interface PickerState {
   argItems(): ArgSuggestion[];
   atItems(): AtCandidate[];
   skillItems(): SkillCandidate[];
+  panelSnapshot(buf: PickerBufferView): { kind: Exclude<PickerMode, null>; rows: Array<{ label: string; description?: string }>; selected: number } | null;
   selectedIdx(): number;
+  dismiss(buf: PickerBufferView): boolean;
 
   /** Test-only: structured view of internal state. */
   _snapshot(): {
@@ -228,6 +230,7 @@ export function createPickerState(deps: PickerDeps): PickerState {
   let pickerNavigated = false;
   let atPickerNavigated = false;
   let lastAtKey = '__off__';
+  let dismissedContextKey = '';
   let argCache: { key: string; items: ArgSuggestion[] } = { key: '', items: [] };
   let atCache: { key: string; items: AtCandidate[] } = { key: '__uninitialized__', items: [] };
   let skillCache: { key: string; items: SkillCandidate[] } = { key: '__uninitialized__', items: [] };
@@ -352,10 +355,11 @@ export function createPickerState(deps: PickerDeps): PickerState {
   };
 
   const mode = (buf: PickerBufferView): PickerMode => {
-    if (parseAtContext(buf) !== null) return 'at';
-    if (parseSkillContext(buf) !== null) return 'skill';
-    if (isSlashMode(buf)) return 'slash';
-    if (parseArgContext(buf, deps.commands) !== null) return 'arg';
+    const kind: PickerMode = parseAtContext(buf) !== null ? 'at'
+      : parseSkillContext(buf) !== null ? 'skill'
+      : isSlashMode(buf) ? 'slash'
+      : parseArgContext(buf, deps.commands) !== null ? 'arg' : null;
+    if (!kind || dismissedContextKey !== `${kind}:${buf.lineIdx}:${buf.lines[buf.lineIdx] ?? ''}:${buf.colIdx}`) return kind;
     return null;
   };
 
@@ -731,6 +735,10 @@ export function createPickerState(deps: PickerDeps): PickerState {
   };
 
   const dispatch = async (key: Key, buf: PickerBufferView): Promise<DispatchResult> => {
+    if (key.name === 'escape' && mode(buf)) {
+      dismissedContextKey = `${mode(buf)}:${buf.lineIdx}:${buf.lines[buf.lineIdx] ?? ''}:${buf.colIdx}`;
+      return { consumed: true, action: null };
+    }
     const m = mode(buf);
     if (m === 'at') return dispatchAt(key, buf);
     if (m === 'skill') return dispatchSkill(key, buf);
@@ -740,6 +748,7 @@ export function createPickerState(deps: PickerDeps): PickerState {
   };
 
   const onBufferEdit = (): void => {
+    dismissedContextKey = '';
     cmdPickerIdx = 0;
     pickerNavigated = false;
     // at-picker nav flag is gated on lastAtKey → atCache.key drift,
@@ -767,7 +776,25 @@ export function createPickerState(deps: PickerDeps): PickerState {
     argItems: () => currentArgItems,
     atItems: () => currentAtItems,
     skillItems: () => currentSkillItems,
+    panelSnapshot: (buf) => {
+      const kind = mode(buf);
+      if (!kind) return null;
+      const rows = kind === 'slash'
+        ? filteredSlash(buf).map((item) => ({ label: `/${item.name}${item.aliases?.length ? ` (${item.aliases.join(', ')})` : ''}`, description: item.description }))
+        : kind === 'arg'
+          ? currentArgItems.map((item) => ({ label: item.value, ...(item.description ? { description: item.description } : {}) }))
+          : kind === 'at'
+            ? currentAtItems.map((item) => ({ label: item.label, ...(item.hint ? { description: item.hint } : {}) }))
+            : currentSkillItems.map((item) => ({ label: `$${item.name}`, ...(item.description ? { description: item.description } : {}) }));
+      return rows.length ? { kind, rows, selected: cmdPickerIdx } : null;
+    },
     selectedIdx: () => cmdPickerIdx,
+    dismiss: (buf) => {
+      const active = mode(buf);
+      if (!active) return false;
+      dismissedContextKey = `${active}:${buf.lineIdx}:${buf.lines[buf.lineIdx] ?? ''}:${buf.colIdx}`;
+      return true;
+    },
     _snapshot: () => ({
       cmdPickerIdx,
       pickerNavigated,

@@ -1,10 +1,11 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import * as gatePartial from './gate-partial';
+import { gateGitSync, gateGitSyncPerlFallback } from './gate-git';
 import { changedFilesBetween, mergePartialFailures, partialPlanPath, planPartialRegate, readPartialPlan, readPartialPlanResult, writePartialPlan, testFileOfId } from './gate-partial';
 import { buildClosureGraph, bunfigPreload, gitClosureTree, testsReachingChanged, testsReachingChangedCliLazyRequireShadow, testsReachingChangedCliLazyRequireCandidate, testsReachingChangedForGateReuse, TRACEABLE_RELEASE_JSON, type ClosureTree } from './gate-closure';
 
@@ -41,6 +42,60 @@ test('GATE-PARTIAL: any non-test source change, the same commit, or an unsafe id
   expect(planPartialRegate({ ...base, forCommit: P, changedFiles: ['src/x.test.ts'] })).toMatchObject({ ok: false, reason: expect.stringContaining('no new commit') });
   expect(planPartialRegate({ ...base, priorFailures: ['../../etc > x'], changedFiles: ['src/x.test.ts'] })).toMatchObject({ ok: false });
   expect(planPartialRegate({ ...base, changedFiles: ['package.json'] })).toMatchObject({ ok: false });
+});
+
+test('GATE-NODE-LAZY-FETCH-HANG: absent receipt head is rejected before diff or path lookup in a partial clone', () => {
+  const promisorRoot = mkdtempSync(join(tmpdir(), 'gate-partial-promisor-'));
+  const gitDir = join(promisorRoot, '.git');
+  mkdirSync(gitDir, { recursive: true });
+  writeFileSync(join(gitDir, 'config'), '[core]\n\trepositoryformatversion = 0\n\tbare = false\n[extensions]\n\tpartialClone = origin\n[remote "origin"]\n\turl = https://lazy-fetch.invalid/repo\n\tpromisor = true\n');
+  const fakeGitDir = join(promisorRoot, 'fake-git-bin');
+  mkdirSync(fakeGitDir);
+  const calls = join(promisorRoot, 'git-calls.log');
+  const fakeGit = join(fakeGitDir, 'git');
+  const sleeperPid = join(promisorRoot, 'sleeper.pid');
+  writeFileSync(fakeGit, `#!/bin/sh\nprintf '%s|%s\\n' "$GIT_NO_LAZY_FETCH" "$*" >> '${calls}'\nif [ "$GATE_TEST_SLEEP" = 1 ]; then sleep 3 & echo $! > '${sleeperPid}'; wait; fi\nif [ "$GATE_TEST_ORPHAN" = 1 ]; then sleep 3 & echo $! > '${sleeperPid}'; exit 0; fi\nexit 1\n`);
+  chmodSync(fakeGit, 0o755);
+  const previousPath = process.env.PATH;
+  try {
+    process.env.PATH = `${fakeGitDir}:${previousPath ?? ''}`;
+    expect(() => changedFilesBetween(promisorRoot, 'f'.repeat(40), 'a'.repeat(40))).toThrow('git diff commit missing from local object store');
+    const callsMade = readFileSync(calls, 'utf8').trim().split('\n');
+    expect(callsMade).toEqual(['1|cat-file --batch-check=%(objectname) %(objecttype)']);
+    process.env.GATE_TEST_SLEEP = '1';
+    const startedAt = Date.now();
+    const timedOut = gateGitSync(['version'], promisorRoot, { encoding: 'utf8' }, 100);
+    const elapsedMs = Date.now() - startedAt;
+    // Source: R-TST36; gate-git.ts applies the 100ms timeout plus kill grace and scheduler headroom.
+    expect(elapsedMs).toBeLessThan(process.platform === 'linux' ? 2_000 : 4_000);
+    expect(timedOut.status === 124 || (timedOut.error && 'code' in timedOut.error && timedOut.error.code === 'ETIMEDOUT')).toBe(true);
+    if (timedOut.status === 124) {
+      const sleeper = Number(readFileSync(sleeperPid, 'utf8').trim());
+      expect(() => process.kill(sleeper, 0)).toThrow();
+    }
+    const fallbackStart = Date.now();
+    const fallback = gateGitSyncPerlFallback(['version'], promisorRoot, { encoding: 'utf8' }, 100);
+    // Source: R-TST36; gate-git.ts applies the 100ms fallback alarm plus process-group cleanup headroom.
+    expect(Date.now() - fallbackStart).toBeLessThan(2_000);
+    expect(fallback.status).toBe(124);
+    const fallbackSleeper = Number(readFileSync(sleeperPid, 'utf8').trim());
+    expect(() => process.kill(fallbackSleeper, 0)).toThrow();
+    delete process.env.GATE_TEST_SLEEP;
+    process.env.GATE_TEST_ORPHAN = '1';
+    const orphanStart = Date.now();
+    const fastExitWithOrphan = gateGitSyncPerlFallback(['version'], promisorRoot, { encoding: 'utf8' }, 1_000);
+    expect(fastExitWithOrphan.status).toBe(0);
+    // Source: R-TST36; gate-git.ts returns after the direct child exits and kills its orphaned process group.
+    expect(Date.now() - orphanStart).toBeLessThan(1_000);
+    const orphan = Number(readFileSync(sleeperPid, 'utf8').trim());
+    expect(() => process.kill(orphan, 0)).toThrow();
+  } finally {
+    delete process.env.GATE_TEST_ORPHAN;
+    delete process.env.GATE_TEST_SLEEP;
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(promisorRoot, { recursive: true, force: true });
+  }
 });
 
 test('GATE-PARTIAL: a plan is read only for its commit; a malformed plan is an error', () => {
@@ -230,7 +285,8 @@ test('GATE-CLOSURE-LAZY-REQUIRE shadow simulation: only CLI-path tests retain fu
   });
   const tests = TESTS(tree);
   const shadow = testsReachingChangedCliLazyRequireCandidate(tree, ['src/sim-cli.ts'], tests);
-  expect(shadow.current).toMatchObject({ ok: true, tests: ['test/cli-helper-spawn.test.ts', 'test/cli-spawn.test.ts', 'test/cli-split-helpers.test.ts', 'test/module-import.test.ts'], reached: 2, opaque: 2 });
+  expect(shadow.current).toMatchObject({ ok: true, tests: ['test/cli-helper-spawn.test.ts', 'test/cli-spawn.test.ts', 'test/cli-split-helpers.test.ts', 'test/module-import.test.ts'], reached: 1, opaque: 3 });
+  expect(shadow.current.ok && shadow.current.opaqueFiles).toContain('src/index.ts: spawns a command with an opaque repo input');
   expect(shadow.proposed).toMatchObject({ ok: true, tests: ['test/cli-helper-spawn.test.ts', 'test/cli-spawn.test.ts',
     'test/cli-split-helpers.test.ts'] });
   expect(shadow.cliSpawnTests).toEqual(['test/cli-spawn.test.ts']);

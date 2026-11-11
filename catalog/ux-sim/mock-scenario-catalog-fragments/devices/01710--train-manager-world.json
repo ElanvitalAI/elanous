@@ -1,0 +1,46 @@
+{
+  "id": "train-manager-world",
+  "name": "Train manager and landing queue world",
+  "checklistCells": [
+    "TRAIN-LOOP-AGENT",
+    "TRAIN-BASE-MAIN-ONLY",
+    "CONFLICT-FORECAST-LEDGER"
+  ],
+  "implementation": [
+    "src/ux-sim/train-manager-world.ts",
+    "src/ux-sim/hotspot-file-lease-world.ts",
+    "src/loops/train/decisions.ts",
+    "src/self-implement/merge-train.ts",
+    "scripts/ux-sim/fixtures/op-snapshot-1109/train-manager.py",
+    "scripts/ux-sim/fixtures/op-snapshot-1109/train-batch-live.py",
+    "land-enqueue.sh"
+  ],
+  "tests": [
+    "src/ux-sim/train-manager-world.test.ts",
+    "src/ux-sim/hotspot-file-lease-world.test.ts",
+    "scripts/ux-sim/test-train-edge-operational-replay.py",
+    "scripts/land-enqueue.test.sh"
+  ],
+  "target": "Use the production train decision, PR conflict forecast, and merge-train paths with fake GitHub, fake merge-tree, a fixed clock, and an isolated conflict JSONL ledger. Replay pinned HQ train-manager functions and land-enqueue.sh with GH_STUB in temporary state; no live GitHub calls, remote ref writes, or production seat files.",
+  "inputs": [
+    "open, closed, and base-ref PR snapshots",
+    "fixed train queue, gates, and worker slots",
+    "pairwise fake merge-tree conflicts and changed paths"
+  ],
+  "observations": [
+    "only open main-based PRs reach train assignment",
+    "conflict rows append as deterministic JSONL and retain PR owner attribution",
+    "production train decisions and landing integration produce the expected assignments and receipts",
+    "all test writes remain under temporary HOME/repository paths"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/train-manager-world.test.ts",
+    "bun test src/ux-sim/hotspot-file-lease-world.test.ts",
+    "bun test src/ux-sim/train-manager-world.test.ts -t TRAIN-LOOP-AGENT",
+    "bun test src/ux-sim/train-manager-world.test.ts -t TRAIN-BASE-MAIN-ONLY",
+    "bun test src/ux-sim/train-manager-world.test.ts -t CONFLICT-FORECAST-LEDGER"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

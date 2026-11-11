@@ -2,8 +2,9 @@ import { afterEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ResourceLedger } from '../control-plane/ledger.js';
 
-import { clearPostOffice, ensurePostOffice, postOfficeFile, readPostOffice, writePostOffice } from './msg-post-office.js';
+import { clearPostOffice, ensurePostOffice, postOfficeFile, readPostOffice, writePostOffice, writeResidentPostOffice } from './msg-post-office.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -26,6 +27,18 @@ test('write, read and clear keep the discovery line under <root>/msg/sse.json', 
   expect(readPostOffice(dir)).toEqual(written);
   expect(clearPostOffice(dir, 4242)).toBe(true);
   expect(readPostOffice(dir)).toBeNull();
+});
+
+test('the control resource ledger discovers a registered post office after the legacy file is removed', () => {
+  const dir = root();
+  const written = writePostOffice(dir, { port: 47823, pid: 4243 });
+  const records = new ResourceLedger(dir).list({ kind: 'instance', name: 'msg-sse' });
+  expect(records).toHaveLength(1);
+  expect(records[0]?.endpoint).toBe(written.url);
+  rmSync(postOfficeFile(dir));
+  expect(readPostOffice(dir)).toEqual(written);
+  expect(clearPostOffice(dir, 4243)).toBe(true);
+  expect(new ResourceLedger(dir).list({ kind: 'instance', name: 'msg-sse' })).toHaveLength(0);
 });
 
 test('a malformed or half-written discovery line reads as absent instead of a guessed port', () => {
@@ -73,4 +86,58 @@ test('a restart is ordered at the registered port and the discovery line survive
   expect(ensured).toEqual({ state: 'restarted', port: written.port });
   // 발견 줄은 남는다 — 다시 띄운 서비스가 자기 줄을 다시 적기 전까지 독자는 같은 포트를 본다.
   expect(readPostOffice(dir)).toEqual(written);
+});
+
+test('an unrelated HTTP listener on the registered port is not mistaken for the SSE post office', async () => {
+  const dir = root();
+  const unrelated = Bun.serve({ port: 0, hostname: '127.0.0.1', fetch: () => new Response(null, { status: 204 }) });
+  try {
+    writePostOffice(dir, { port: unrelated.port, pid: process.pid });
+    const launched: number[] = [];
+    expect(await ensurePostOffice({ stateRoot: dir, launch: ({ port }) => { launched.push(port); } }))
+      .toEqual({ state: 'restarted', port: unrelated.port });
+    expect(launched).toEqual([unrelated.port]);
+  } finally { unrelated.stop(true); }
+});
+
+test('a resident owner is not overwritten or cleared by a concurrent standalone server', async () => {
+  const dir = root();
+  const standalone = writePostOffice(dir, { port: 47824, pid: 4242 });
+  let oldTimerAttempts = 0;
+  let oldTimerRejected = 0;
+  let oldTimerAccepted = 0;
+  // Source: #36378 isolated timer simulation uses a 5ms tick and 30ms window to exercise older writes.
+  const oldTimer = setInterval(() => {
+    oldTimerAttempts++;
+    try { new ResourceLedger(dir).register({ id: 'instance:msg-sse', kind: 'instance', machine: 'old', name: 'msg-sse',
+      owner: 'msg-sse', endpoint: standalone.url, attrs: { port: standalone.port, pid: 4242 }, observedAt: Date.now(), ttlMs: Number.MAX_SAFE_INTEGER,
+    }, 'msg-sse'); oldTimerAccepted++; } catch { oldTimerRejected++; }
+  }, 5);
+  // Source: #36378 the old timer first writes successfully, then keeps running across the atomic resident takeover.
+  await Bun.sleep(15);
+  // Source: #36378 the timer must have refreshed the standalone record before resident takeover.
+  expect(oldTimerAccepted).toBeGreaterThan(0);
+  const resident = (await writeResidentPostOffice(dir, { port: 47825, pid: process.pid }))!;
+  expect(readPostOffice(dir)).toEqual(resident);
+  expect(writePostOffice(dir, { port: standalone.port, pid: 4242 })).toEqual(resident);
+  try { await Bun.sleep(30); } finally { clearInterval(oldTimer); }
+  // Source: #36378 at least one timer tick proves the older writer was actually fenced.
+  expect(oldTimerAttempts).toBeGreaterThan(0);
+  // Source: #36378 the timer must attempt at least one write after resident takeover and be fenced.
+  expect(oldTimerRejected).toBeGreaterThan(0);
+  expect(oldTimerAccepted + oldTimerRejected).toBe(oldTimerAttempts);
+  expect(readPostOffice(dir)).toEqual(resident);
+  expect(await writeResidentPostOffice(dir, { port: 47826, pid: process.pid })).toEqual(resident);
+  expect(clearPostOffice(dir, 4242, standalone.port)).toBe(false);
+  expect(readPostOffice(dir)).toEqual(resident);
+  expect(clearPostOffice(dir, process.pid, resident.port)).toBe(true);
+  expect(readPostOffice(dir)).toBeNull();
+});
+
+test('standalone registration keeps sse.json discovery when the control ledger cannot be read', () => {
+  const dir = root();
+  mkdirSync(join(dir, 'control'), { recursive: true });
+  writeFileSync(join(dir, 'control', 'ledger.json'), 'broken ledger');
+  const info = writePostOffice(dir, { port: 47827, pid: 4242 });
+  expect(readPostOffice(dir)).toEqual(info);
 });

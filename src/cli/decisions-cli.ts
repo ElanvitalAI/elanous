@@ -7,7 +7,7 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { dirname, join } from 'node:path';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { projectDecisionsToLinear } from '../decisions/decision-linear-projection.js';
 import { DecisionLedger, importDecisionMarkdown, validateDecisionRaise, type DecisionCategory, type DecisionLedgerOptions, type DecisionOption, type DecisionTrack, type DecisionEntry, type RaiseInput, type Seat, type SeatDecisionRecord } from '../decisions/decision-ledger.js';
 import { formatProactMeter, readProactMeter } from '../decisions/proact-meter.js';

@@ -203,6 +203,13 @@ function openPrivateDatabase(databasePath: string, stateRoot: string): { db: Dat
   }
 }
 
+function closeGuardDescriptor(descriptor: number): void {
+  try { closeSync(descriptor); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EBADF') throw error;
+  }
+}
+
 /** Durable per-user app stop state and audit. Relay request enforcement is wired by the follow-up relay-server slice. */
 export function createAppKillSwitch(databasePath = defaultDatabasePath(), options: AppKillSwitchOptions = {}) {
   if (databasePath === ':memory:') throw new Error('app kill switch requires a private database path');
@@ -298,6 +305,6 @@ export function createAppKillSwitch(databasePath = defaultDatabasePath(), option
         .map((event) => ({ ...event }));
     },
 
-    close(): void { db.close(); closeSync(opened.descriptor); closeSync(opened.parentDescriptor); },
+    close(): void { db.close(); closeGuardDescriptor(opened.descriptor); closeGuardDescriptor(opened.parentDescriptor); },
   };
 }

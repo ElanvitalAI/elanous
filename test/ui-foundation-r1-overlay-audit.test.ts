@@ -26,16 +26,4 @@ describe('R1 overlay audit', () => {
     expect(banner).toContain('Retained for test coverage + backwards compatibility');
   });
 
-  test('overlay family source comments point at the shared policy file', () => {
-    const hoverPresenter = read('src/ui/hover-presenter.ts');
-    const menuHost = read('src/ui/context-menu-host.ts');
-    // 2026-07-07 · dashboard decomposition: src/status-bar-popups.ts
-    // moved to src/status/popups.ts (same content, new home).
-    const statusPopups = read('src/status/popups.ts');
-    const dragWire = read('src/drag-session-dashboard-wire.ts');
-
-    for (const text of [hoverPresenter, menuHost, statusPopups, dragWire]) {
-      expect(text).toContain('transient-overlay-policy.ts');
-    }
-  });
 });

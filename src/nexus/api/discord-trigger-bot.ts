@@ -30,7 +30,7 @@ import {
 } from '../../discord.js';
 import type { DiscordEvent } from '../../workflow-runtime/triggers/discord-source.js';
 import { debug } from '../../debug/log.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { registerSurfaceSink, registerStreamingSink } from '../../session/session-fanout.js';
 import { parseDiscordEndpoint, isOwnInstanceEndpoint } from '../../session/session-endpoint-key.js';
 import { createDiscordStreamSink } from '../../session/streaming/discord-stream-sink.js';

@@ -120,7 +120,7 @@ test('SIM-MOBILE-OWNER-SESSION resolves Google subject to its app slot and issue
       `https://api.example.test/v1/members/oauth/google/callback?code=${callback.code}&state=${callback.state}`,
       { headers: { cookie: stateCookie } },
     ));
-    expect(completed?.status).toBe(303);
+    expect(completed?.status).toBe(200);
     const profile = await membersApi.handle(new Request('https://api.example.test/v1/members', {
       headers: { cookie: completed!.headers.get('set-cookie')!.split(';', 1)[0]! },
     }));
@@ -306,8 +306,8 @@ test('SIM-APP-GOOGLE-OAUTH-APP-DB-E2E follows Google callback into isolated app 
       null,
       createDevProxyRuntimeRef(),
     );
-    expect(completed?.status).toBe(303);
-    expect(completed?.headers.get('location')).toBe('https://app.example.test/signup/complete');
+    expect(completed?.status).toBe(200);
+    expect(await completed!.text()).toContain('emk_');
     const memberCookie = completed!.headers.get('set-cookie')!.split(';', 1)[0]!;
     expect(memberCookie).toContain('__Host-elanous_member_session=');
 

@@ -114,16 +114,25 @@ export function listMemberTokens(root: string = effectiveInstanceRoot()): Array<
   return Object.entries(readStore(root)).map(([machine, { issuedAt }]) => ({ machine, issuedAt }));
 }
 
-export function machineForToken(token: string, root: string = effectiveInstanceRoot()): string | undefined {
+function machineForTokenChecked(token: string, root: string, requireExpiry: boolean): string | undefined {
   const digest = createHash('sha256').update(token).digest();
   const now = Date.now();
   let match: string | undefined;
   for (const [machine, { sha256, expiresAt }] of Object.entries(readStore(root))) {
     if (!timingSafeEqual(digest, Buffer.from(sha256, 'hex'))) continue;
-    if (expiresAt === undefined) {
+    if (expiresAt === undefined && !requireExpiry) {
       debug.log('resource-ledger.auth', 'legacy-machine-token-without-exp', { machine });
       match = machine;
-    } else if (Date.parse(expiresAt) > now) match = machine;
+    } else if (expiresAt !== undefined && Date.parse(expiresAt) > now) match = machine;
   }
   return match;
+}
+
+export function machineForToken(token: string, root: string = effectiveInstanceRoot()): string | undefined {
+  return machineForTokenChecked(token, root, false);
+}
+
+/** Strict admission for credential-bearing proxy calls; legacy non-expiring entries are refused. */
+export function machineForExpiringToken(token: string, root: string = effectiveInstanceRoot()): string | undefined {
+  return machineForTokenChecked(token, root, true);
 }

@@ -1,7 +1,7 @@
 import type { Command } from 'commander';
 import type { Database } from 'bun:sqlite';
 import type { GuardianPlan } from '../domains/guardian-tick.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { writeStdoutJson } from './stdout-json.js';
 
 // Domain modules (schedules.db · schedule-runner → node-cron) load lazily inside the actions,

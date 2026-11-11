@@ -20,6 +20,21 @@
 import { debugLog } from './debug';
 
 const SHARE_CACHE_PREFIX = 'elanous-pwa-share-target-';
+const SHARE_PROGRESS_PREFIX = 'elanous.pwa.share-progress.';
+
+function progressPath(id: string): string { return `/__share/${id}/progress/`; }
+function progressStoragePrefix(id: string): string { return `${SHARE_PROGRESS_PREFIX}${id}.`; }
+
+async function cacheProgressKeys(cache: Cache, id: string): Promise<Array<{ request: Request; key: string }>> {
+  const prefix = progressPath(id);
+  const requests = await cache.keys();
+  return requests.flatMap((request) => {
+    const path = new URL(request.url).pathname;
+    if (!path.startsWith(prefix)) return [];
+    try { return [{ request, key: decodeURIComponent(path.slice(prefix.length)) }]; }
+    catch { return []; }
+  });
+}
 
 interface ShareManifestFile {
   index: number;
@@ -46,10 +61,21 @@ export interface SharedPayload {
   files: File[];
   /** Cache keys aligned by index with `files` for partial acknowledgement. */
   fileKeys: string[];
+  missingFiles?: string[];
   /** Combined text the existing Level 1 flow already feeds into
    *  `/chat` as a prefill — we keep that contract so behaviour
    *  stays identical when no files are attached. */
   combinedText: string;
+}
+
+export class ShareLockUnavailableError extends Error {}
+
+/** Serializes all reads, writes, and completion for one share across tabs. */
+export async function withSharedPayloadLock<T>(id: string, task: () => Promise<T>): Promise<T> {
+  if (typeof navigator === 'undefined' || !navigator.locks?.request) {
+    throw new ShareLockUnavailableError('공유 저장 동시성 제어를 사용할 수 없습니다.');
+  }
+  return navigator.locks.request(`elanous.pwa.share.${id}`, task);
 }
 
 async function findShareCache(): Promise<Cache | null> {
@@ -96,10 +122,12 @@ export async function takeSharedPayload(id: string, options: { drain?: boolean }
   const manifest = (await manifestRes.json()) as ShareManifest;
   const files: File[] = [];
   const fileKeys: string[] = [];
+  const missingFiles: string[] = [];
   for (const meta of manifest.files) {
     const fileRes = await cache.match(meta.cacheUrl);
     if (!fileRes) {
       debugLog('pwa.share.l2.file-missing', { id, cacheUrl: meta.cacheUrl });
+      missingFiles.push(meta.filename);
       continue;
     }
     const blob = await fileRes.blob();
@@ -123,6 +151,7 @@ export async function takeSharedPayload(id: string, options: { drain?: boolean }
     url: manifest.url,
     files,
     fileKeys,
+    missingFiles,
     combinedText: buildCombinedText(manifest),
   };
 }
@@ -142,10 +171,41 @@ export async function acknowledgeSharedPayloadFiles(id: string, fileKeys: readon
   const remaining = manifest.files.filter((meta) => !acknowledged.has(meta.cacheUrl));
   if (remaining.length === 0) {
     await cache.delete(manifestUrl);
+    // Keep the completed keys as a tombstone. Another tab may already
+    // have read this payload before we deleted its manifest.
   } else if (acknowledged.size > 0) {
     await cache.put(manifestUrl, new Response(JSON.stringify({ ...manifest, files: remaining }), {
       headers: { 'content-type': 'application/json' },
     }));
+  }
+}
+
+/** Progress lives with the share cache so a new share window can resume. */
+export async function readSharedPayloadProgress(id: string): Promise<string[]> {
+  const cache = await findShareCache();
+  const cached = cache ? (await cacheProgressKeys(cache, id)).map((entry) => entry.key) : [];
+  const fallback: string[] = [];
+  if (typeof localStorage !== 'undefined') {
+    const prefix = progressStoragePrefix(id);
+    for (let index = 0; index < localStorage.length; index++) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(prefix)) {
+        try { fallback.push(decodeURIComponent(key.slice(prefix.length))); }
+        catch { /* Ignore malformed storage keys. */ }
+      }
+    }
+  }
+  return [...new Set([...cached, ...fallback])];
+}
+
+export async function markSharedPayloadProgress(id: string, key: string): Promise<void> {
+  const cache = await findShareCache();
+  if (!cache) throw new Error('공유 저장 기록을 찾지 못했습니다.');
+  try {
+    await cache.put(`${progressPath(id)}${encodeURIComponent(key)}`, new Response('1'));
+  } catch (error) {
+    if (typeof localStorage === 'undefined') throw error;
+    localStorage.setItem(`${progressStoragePrefix(id)}${encodeURIComponent(key)}`, '1');
   }
 }
 

@@ -10,11 +10,12 @@ import { dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { acquireLockAsync } from '../../src/storage/file-lock.js';
-import { lastJsonObject, runGraph, verifyReleaseCommandRoot, verifyReleaseRecipeSnapshot, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { forkGraphRun, lastJsonObject, listGraphRuns, manageGraphRun, runGraph, verifyReleaseCommandRoot, verifyReleaseRecipeSnapshot, type GraphRunState } from '../../src/graph-runner/runner.js';
 import type { GraphEvent, GraphEventBus } from '../../src/graph-runner/graph-events.js';
 import type { MacrophageScrap } from '../../src/release-loop/macrophage-heal.js';
 import { withOpSeatFlock } from '../../src/steward/resync-tick.js';
-import { readGateShards } from '../../src/release-loop/gate-shards.js';
+import { gateShardsPath, markGateShardsStopRequested, readGateShards } from '../../src/release-loop/gate-shards.js';
+import { appendGateShardLifecycleState, gateShardLedgerPath } from '../../src/release-loop/gate-shard-ledger.js';
 import { releaseRunUniverse } from './release-universe.js';
 import { isReleaseVersion } from './release-version.js';
 import { changedFilesBetween, clearPartialPlan, collectExecutedPodShardImages, gateAppendReceiptCostsFromLedger, planPartialRegate, planSameCommitRecheck, planStalledShardRecheck, testFileOfId, writePartialPlan, writeRecheckPlan } from './gate-partial.js';
@@ -238,12 +239,63 @@ export function refreshReleaseBranchTip(runId: string, deps: ResumeReleaseDeps =
   return refreshReleaseBranchTipInternal(runId, deps, from, waiverCommit, false);
 }
 
+/** Pause a release graph instance without deleting its durable receipts. */
+export function pauseReleaseRun(runId: string, deps: ResumeReleaseDeps = {}): GraphRunState {
+  const root = deps.root ?? effectiveInstanceRoot();
+  const matches = listGraphRuns(root).runs.filter((state) => state.graphId === 'release-loop' && state.runId === runId);
+  if (matches.length !== 1) throw new Error(matches.length ? `ambiguous release run: ${runId}` : `no release run: ${runId}`);
+  const paused = manageGraphRun('release-loop', runId, 'pause', root);
+  stopReleaseGateShards(paused, root);
+  return paused;
+}
+
+/** Cancel is terminal; only pause/failed runs can later resume or fork. */
+export function cancelReleaseRun(runId: string, deps: ResumeReleaseDeps = {}): GraphRunState {
+  const root = deps.root ?? effectiveInstanceRoot();
+  const matches = listGraphRuns(root).runs.filter((state) => state.graphId === 'release-loop' && state.runId === runId);
+  if (matches.length !== 1) throw new Error(matches.length ? `ambiguous release run: ${runId}` : `no release run: ${runId}`);
+  const cancelled = manageGraphRun('release-loop', runId, 'cancel', root);
+  stopReleaseGateShards(cancelled, root);
+  return cancelled;
+}
+
+function stopReleaseGateShards(state: GraphRunState, root: string): void {
+  const version = state.input && typeof state.input === 'object' && !Array.isArray(state.input)
+    ? (state.input as Record<string, unknown>).version : undefined;
+  if (typeof version !== 'string') return;
+  const requested = markGateShardsStopRequested(gateShardsPath(version, root), state.runId);
+  if (!requested) return;
+  const ids = requested.shards.filter((shard) => shard.state === 'stop-requested').map((shard) => shard.id);
+  const attemptIds = new Map(requested.shards.flatMap((shard) => shard.attemptId ? [[shard.id, shard.attemptId] as const] : []));
+  const ledgerErrors = appendGateShardLifecycleState(gateShardLedgerPath(version, root), ids, 'stop-requested', new Date().toISOString(), null, attemptIds);
+  debug.log('graph.runs', 'shard-stop-requested', { graphId: state.graphId, runId: state.runId, version,
+    shards: ids.length, terminalConfirmed: false, ledgerErrors });
+}
+
+/** Fork a release instance at a descendant cut commit; the source ledger remains byte-for-byte intact. */
+export function forkReleaseRun(runId: string, forkRunId: string, targetCommit: string,
+  deps: ResumeReleaseDeps = {}): GraphRunState {
+  const root = deps.root ?? effectiveInstanceRoot();
+  const matches = listGraphRuns(root).runs.filter((state) => state.graphId === 'release-loop' && state.runId === runId);
+  if (matches.length !== 1) throw new Error(matches.length ? `ambiguous release run: ${runId}` : `no release run: ${runId}`);
+  const source = matches[0]!;
+  const recordedCommit = lastJsonObject(source.nodes.find((node) => node.nodeId === 'version-release')?.output)?.commit;
+  if (typeof recordedCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(recordedCommit)) {
+    throw new Error(`release run ${runId} has no full version-release commit to fork`);
+  }
+  return forkGraphRun('release-loop', runId, forkRunId, targetCommit, {
+    root, isAncestor: deps.isAncestor ?? ancestorRunner(deps.repo ?? process.cwd()),
+  });
+}
+
 function refreshReleaseBranchTipInternal(runId: string, deps: ResumeReleaseDeps, from: string | undefined, waiverCommit: string | undefined, dryRun: boolean, expectedTip?: string, allowBudgetExceeded = false): TipRefresh {
   const root = deps.root ?? effectiveInstanceRoot();
   const statePath = join(root, 'graph-runs', 'release-loop', `${safeRunId(runId)}.json`);
   const state = JSON.parse(readFileSync(statePath, 'utf8')) as GraphRunState;
   if (state.graphId !== 'release-loop' || state.runId !== runId) throw new Error(`run identity mismatch: ${statePath}`);
-  if (state.status !== 'failed' && !(allowBudgetExceeded && state.status === 'budget-exceeded')) throw new Error(`release run ${runId} is ${state.status} — only a failed run is resumed`);
+  if (state.status !== 'failed' && state.status !== 'paused' && !(allowBudgetExceeded && state.status === 'budget-exceeded')) {
+    throw new Error(`release run ${runId} is ${state.status} — only a failed or paused run is resumed`);
+  }
   const branchFork = from === undefined || state.path.includes(from) ? undefined : releaseFanOutForkIndex(state, from);
   // Repeated nodes restart at their latest visit (matches the runner), never across an earlier approval.
   const restartAt = from === undefined ? -1 : state.path.lastIndexOf(from) >= 0 ? state.path.lastIndexOf(from) : branchFork ?? -1;
@@ -1186,6 +1238,7 @@ async function recoverReleaseRunLocked(opts: RecoverReleaseOptions, deps: Recove
       outcome: gateImagePrebuild.outcome, ...(gateImagePrebuild.outcome === 'failed' ? { reason: gateImagePrebuild.reason } : {}),
       ...(gateImagePrebuild.outcome === 'built' || gateImagePrebuild.outcome === 'reused'
         ? { digest: gateImagePrebuild.digest, eligiblePools: gateImagePrebuild.eligiblePools } : {}) });
+    if (gateImagePrebuild.outcome === 'failed') return stop('resume', new Error(`cut gate image prebuild failed: ${gateImagePrebuild.reason}`));
   }
 
   // 3/3 resume from the earliest saved cut consumer — the read-only preflight first (its plan is the record), then the graph run.

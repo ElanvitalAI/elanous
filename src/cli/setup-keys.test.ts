@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadTokens } from '../oauth/store.js';
@@ -9,11 +9,120 @@ import { buildUserConfig } from '../user-config.js';
 import {
   FIRST_RUN_PROVIDER_SETUP_MENU_HEADING,
   FIRST_RUN_PROVIDER_SETUP_MENU_MAX_MISSES,
+  importExistingCredentialSources,
+  importServiceKeys,
   runFirstRunProviderSetup,
   type SetupKeysIO,
 } from './setup-keys.js';
 import { startFakeOpenAiCompatibleApi } from '../ux-sim/service-key-setup.js';
 import { withSimClock } from '../ux-sim/fake-clock.js';
+
+test('setup proposes fake-home credentials without values and stores only the selected catalog slot', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'setup-keys-import-'));
+  const home = join(root, 'home');
+  const project = join(root, 'project');
+  const secret = 'fake-home-secret-must-never-render';
+  const envPath = join(project, '.env');
+  const configPath = join(home, '.elanous', 'config.json');
+  mkdirSync(project, { recursive: true });
+  mkdirSync(join(home, '.elanous'), { recursive: true });
+  writeFileSync(envPath, `EODHD_API_KEY=${secret}\nELEVENLABS_API_KEY=unselected-secret\n`);
+  writeFileSync(configPath, JSON.stringify({ llm: { provider: 'openai', apiKey: 'unselected-config-secret' } }));
+  const output: string[] = [];
+  const writes: Array<Record<string, string>> = [];
+  let initialized = false;
+  try {
+    const imported = await importExistingCredentialSources({
+      ask: async () => '0',
+      print: line => output.push(line),
+    }, {
+      config: buildUserConfig(configPath),
+      homeDir: home,
+      cwd: project,
+      configPath,
+      initializeCredentialBackend: () => { initialized = true; },
+      listCredentialSlots: async () => [],
+      saveCredentialSlotBatch: async values => { writes.push({ ...values }); },
+    });
+    expect(initialized).toBe(true);
+    expect(imported).toEqual(['cred:eodhd.api_key']);
+    expect(writes).toEqual([{ 'cred:eodhd.api_key': secret }]);
+    expect(output.join('\n')).toContain(`EODHD_API_KEY · ${envPath} → cred:eodhd.api_key`);
+    expect(output.join('\n')).not.toContain(secret);
+    expect(output.join('\n')).not.toContain('unselected-secret');
+    expect(output.join('\n')).not.toContain('unselected-config-secret');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('setup import Enter skips all fake-home proposals without writing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'setup-keys-import-skip-'));
+  const home = join(root, 'home');
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, '.env'), 'EODHD_API_KEY=skip-me-secret\n');
+  const writes: Array<Record<string, string>> = [];
+  try {
+    const imported = await importExistingCredentialSources({ ask: async () => '', print: () => {} }, {
+      config: buildUserConfig(join(home, 'config.json')),
+      homeDir: home,
+      cwd: join(root, 'project'),
+      configPath: join(home, 'config.json'),
+      initializeCredentialBackend: () => {},
+      listCredentialSlots: async () => [],
+      saveCredentialSlotBatch: async values => { writes.push({ ...values }); },
+    });
+    expect(imported).toEqual([]);
+    expect(writes).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('OpenRouter hidden paste imports to its Nexus secret slot, not the legacy key cache', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'setup-openrouter-secret-'));
+  const secret = 'sk-or-v1-hidden-fixture';
+  const writes: Array<Record<string, string>> = [];
+  const env: NodeJS.ProcessEnv = {};
+  const output: string[] = [];
+  try {
+    const result = await importServiceKeys(new Map([['OPENROUTER_API_KEY', secret]]), { print: line => output.push(line) }, {
+      config: buildUserConfig(), env, cacheDir: join(root, 'cache'),
+      verifier: async () => ({ success: true, verification: 'verified' }),
+      saveCredentialSlotBatch: async values => { writes.push({ ...values }); },
+    });
+    expect(result.stored).toEqual(['OPENROUTER_API_KEY']);
+    expect(writes).toEqual([{ 'cred:openrouter.api_key': secret }]);
+    expect(env.OPENROUTER_API_KEY).toBe(secret);
+    expect(output.join('\n')).not.toContain(secret);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('setup import rejects repeating the same proposal index', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'setup-keys-import-duplicate-'));
+  const home = join(root, 'home');
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, '.env'), 'EODHD_API_KEY=duplicate-selection-secret\n');
+  const output: string[] = [];
+  const writes: Array<Record<string, string>> = [];
+  try {
+    const imported = await importExistingCredentialSources({ ask: async () => '0,0', print: line => output.push(line) }, {
+      config: buildUserConfig(join(home, 'config.json')),
+      homeDir: home,
+      cwd: join(root, 'project'),
+      configPath: join(home, 'config.json'),
+      initializeCredentialBackend: () => {},
+      listCredentialSlots: async () => [],
+      saveCredentialSlotBatch: async values => { writes.push({ ...values }); },
+    });
+    expect(imported).toEqual([]);
+    expect(writes).toEqual([]);
+    expect(output.join('\n')).toContain('선택이 올바르지 않아 저장하지 않았습니다');
+    expect(output.join('\n')).not.toContain('duplicate-selection-secret');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('first-run no-provider flow reaches ready through the production Codex OAuth fetch seam', async () => {
   const root = mkdtempSync(join(tmpdir(), 'setup-keys-oauth-'));

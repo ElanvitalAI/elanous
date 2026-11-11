@@ -1,0 +1,27 @@
+{
+  "id": "fake-market-feed",
+  "name": "Deterministic synthetic multi-asset market feed",
+  "implementation": [
+    "src/ux-sim/fake-market-feed.ts"
+  ],
+  "tests": [
+    "src/ux-sim/fake-market-feed.test.ts"
+  ],
+  "target": "Synthetic quote and news inputs for fixed asset class by region by sector map cells; no live data boundary",
+  "inputs": [
+    "fixed asset class, region, and sector catalogs",
+    "stable map cell coordinates"
+  ],
+  "observations": [
+    "stable coordinate cell IDs",
+    "one delayed-simulated quote and one synthetic news item per cell",
+    "fixed snapshot identity and source URI",
+    "unknown coordinates rejected without network access"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-market-feed.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

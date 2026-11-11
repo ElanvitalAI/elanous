@@ -1,0 +1,32 @@
+{
+  "id": "graph-trigger-hook-device",
+  "name": "Graph trigger and hook simulation device",
+  "implementation": [
+    "src/ux-sim/graph-trigger-hook-device.ts"
+  ],
+  "tests": [
+    "src/ux-sim/graph-trigger-hook-device.test.ts"
+  ],
+  "target": "Run the production graph runner with a controllable clock, fake schedule/webhook/API/event/manual ingress and an ordered event subscriber; input rejection and word-edge hook assertions are added with the graph contract implementation.",
+  "inputs": [
+    "graph YAML and recipe fixture",
+    "trigger kind and input payload",
+    "clock instant and command result"
+  ],
+  "observations": [
+    "persisted graph run state and input",
+    "trigger call order and clock instant",
+    "ordered graph event envelopes"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/graph-trigger-hook-device.test.ts"
+  ],
+  "logsRecorded": "conditional",
+  "eventNames": [
+    "node-arrival",
+    "node-start",
+    "node-end",
+    "node-leave"
+  ],
+  "recentUse": null
+}

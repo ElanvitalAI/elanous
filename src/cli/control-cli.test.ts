@@ -448,7 +448,7 @@ test('control serve stops writes when the GCS lease object expires at the storag
             key: { context: 'mbp', imageDigest: 'sha256:image', lockHash: 'lock', architecture: 'arm64' }, ttlMs: 30_000 }),
         });
         expect(warm.status).toBe(409);
-        clock.tick(10_050);
+        // A non-worker write must be fenced immediately, within the old 10 s cache window.
         expect((await register()).status).toBe(409);
         expect(commands.slice(before)).toEqual(Array.from({ length: 2 }, () => ['storage', 'objects', 'describe',
           'gs://example-bucket/lease/control-primary.json', '--format=value(generation)']));
@@ -751,14 +751,11 @@ test('control serve follows the lease only when opted in', async () => {
       expect(denied.headers.get('x-primary-generation')).toBe('7');
       expect(await denied.json()).toEqual({ error: 'not-primary', holder: 'fixture-node', generation: 7 });
       expect(readCount).toBeGreaterThan(0);
-      await withSimClock(Date.now(), async clock => {
-        holder = 'mbp';
-        clock.tick(10_050);
-        const accepted = await register(followed.port);
-        expect(accepted.status).toBe(200);
-        expect(accepted.headers.get('x-primary-generation')).toBe('8');
-        expect((await accepted.json() as { name: string }).name).toBe('demo');
-      });
+      holder = 'mbp';
+      const accepted = await register(followed.port);
+      expect(accepted.status).toBe(200);
+      expect(accepted.headers.get('x-primary-generation')).toBe('8');
+      expect((await accepted.json() as { name: string }).name).toBe('demo');
     } finally { await followed.stop(); }
     const legacy = await launchInProcess(false);
     try {
@@ -767,7 +764,7 @@ test('control serve follows the lease only when opted in', async () => {
       expect(allowed.status).toBe(200);
       expect(allowed.headers.get('x-primary-generation')).toBeNull();
       expect((await allowed.json() as { name: string }).name).toBe('demo');
-      expect(readCount).toBe(2);
+      expect(readCount).toBe(3);
     } finally { await legacy.stop(); }
   } finally {
     log.mockRestore();
@@ -813,6 +810,23 @@ test('control serve HQ lease holder=this host permits warm worker registration',
       expect(response.status).toBe(200);
       expect(response.headers.get('x-primary-generation')).toBe('4');
     });
+});
+
+test('control serve fences a non-worker write on the first request after HQ lease loss', async () => {
+  let holder = 'mbp';
+  const readHq = () => ({ record: { holder, generation: 4, acquiredAt: 1, renewedAt: 2, ttlSeconds: 60 },
+    ageSeconds: 0, expired: false });
+  await withHqControl(readHq, async (port, dir) => {
+    const register = () => fetch(`http://127.0.0.1:${port}/v1/resources/register`, {
+      method: 'POST', headers: { authorization: `Bearer ${ensureControlTokens(dir).member}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'hq-handoff', kind: 'instance', machine: 'mbp', name: 'hq-handoff', attrs: {}, ttlMs: 30_000 }),
+    });
+    expect((await register()).status).toBe(200);
+    holder = 'node-b';
+    const denied = await register();
+    expect(denied.status).toBe(409);
+    expect(await denied.json()).toEqual({ error: 'not-primary', holder: 'node-b', generation: 4 });
+  });
 });
 
 test('control serve HQ lease unreadable rejects warm worker registration', async () => {

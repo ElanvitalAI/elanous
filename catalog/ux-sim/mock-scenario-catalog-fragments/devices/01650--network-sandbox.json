@@ -1,0 +1,13 @@
+{
+  "id": "network-sandbox",
+  "name": "Simulation app network isolation probe",
+  "implementation": ["src/ux-sim/network-sandbox.ts", "src/ux-sim/world.ts"],
+  "tests": ["src/ux-sim/novice-versioning-world.test.ts"],
+  "target": "Refuse app simulation when the host cannot provide an isolated network namespace.",
+  "inputs": ["host platform", "sandbox executable availability", "fixed scenario"],
+  "observations": ["sandboxed world result", "zero external network events"],
+  "entryCommands": ["bun test src/ux-sim/novice-versioning-world.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -49,19 +49,6 @@ describe('executeImmediateDashboardSlash', () => {
     expect(opened).toEqual(['obsidian']);
   });
 
-  test('opens browser-preview surface immediately', () => {
-    const events: string[] = [];
-    const result = executeImmediateDashboardSlash(
-      { name: 'surface', args: ['browser-preview'] },
-      {
-        getStatusLines: () => ['unused'],
-        openBrowserPreviewModal: () => { events.push('bp'); },
-      },
-    );
-    expect(result?.ok).toBe(true);
-    expect(events).toEqual(['bp']);
-  });
-
   test('opens browser surface in vw immediately', () => {
     const events: string[] = [];
     const result = executeImmediateDashboardSlash(
@@ -76,22 +63,6 @@ describe('executeImmediateDashboardSlash', () => {
     );
     expect(result?.ok).toBe(true);
     expect(events).toEqual(['browser']);
-  });
-
-  test('opens the surface catalog immediately', () => {
-    const events: string[] = [];
-    const result = executeImmediateDashboardSlash(
-      { name: 'surface', args: ['catalog'] },
-      {
-        getStatusLines: () => ['unused'],
-        openSurfaceCatalog: () => {
-          events.push('catalog');
-          return true;
-        },
-      },
-    );
-    expect(result?.ok).toBe(true);
-    expect(events).toEqual(['catalog']);
   });
 
   test('opens clipboard companion immediately', () => {

@@ -30,7 +30,7 @@ import { buildManualReviewIntent, intentFromPr, prIntentSectionCoverage, reviewI
 import { buildReviewScopeContractContext } from '../cli/review-carry.js';
 import { NO_VERDICT_LINE_REASON, budgetReviewerContext, isNoneSentinelFinding, reviewDiffBudgetObservation, splitDiffByFile, type ReviewImage, type ReviewInput, type ReviewerContextItem, type ReviewResult } from './pr-reviewer.js';
 import type { ReferencedFileReader } from '../self-implement/goal-file-reader.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { LLMProviderName, ReviewerMixSpec, RoleLlmSpec, SubscriptionReviewerSpec } from '../user-config/types.js';
 import { loadLlmPolicy } from '../policy/llm-policy.js';
 import { listRunLedgers, lookupPrGoalAcceptance, lookupRunLedger, type PrGoalAcceptanceLookup, type RunLedgerEntry, type RunLedgerLookup } from '../self-implement/run-ledger.js';
@@ -2428,9 +2428,11 @@ async function runSelfReviewCliCommandPinned(
     }
     const loopLock = readReviewLoopBreakerLock(pr);
     // A cap refusal writes a loop-breaker lock before an OP can authorize the
-    // retry. Let the normal cap preflight/one-use claim govern that specific
-    // lock; other loop-breaker reasons remain an unconditional stop.
-    const opAuthorizedCapRetry = loopLock?.reason === 'review-cap-exceeded'
+    // retry. A same-head stale-reopen lock can likewise predate the one-use
+    // cap grant; let the normal cap preflight/claim govern that single attempt.
+    const sameHeadLoopLock = loopLock?.reason === 'two-consecutive-stale-reopen-rounds'
+      && (!COMMIT_OID.test(diffRead.headCommit) || loopLock.head === diffRead.headCommit);
+    const opAuthorizedCapRetry = (loopLock?.reason === 'review-cap-exceeded' || sameHeadLoopLock)
       && previousRoundCount >= 5 && opAllowsReviewOverCap(pr) && Boolean(reason);
     // REVIEW-CAP-MAINMERGE-EXEMPT: a cap refusal lock on a merge-only successor head is
     // bypassed without the OP allowance loop — the head itself is exempt from the cap.
@@ -2445,8 +2447,6 @@ async function runSelfReviewCliCommandPinned(
     mainMergeCapExempt ||= mainMergeCapExemptRetry;
     // Stale-reopen locks belong to the exact head that produced them. Other
     // waiver-needed reasons retain their existing global stop/OP-cap semantics.
-    const sameHeadLoopLock = loopLock?.reason === 'two-consecutive-stale-reopen-rounds'
-      && (!COMMIT_OID.test(diffRead.headCommit) || loopLock.head === diffRead.headCommit);
     if (loopLock && (loopLock.reason !== 'two-consecutive-stale-reopen-rounds' || sameHeadLoopLock)
       && !opAuthorizedCapRetry && !mainMergeCapExemptRetry) {
       const message = loopLock.reason === 'review-loop-lock-corrupt'
@@ -3085,7 +3085,11 @@ async function runSelfReviewCliCommandPinned(
       .map((finding) => [reviewFindingKey(finding).key, finding])).values()];
       let loopState: 'clear' | 'stale-reopen' | 'waiver-needed' = loopAssessment.state;
       let loopReason: string | undefined;
-      if (nextStreak >= 2) {
+      // An OP-authorized cap review must produce its real verdict even if the
+      // stale-reopen streak remains over threshold. The one-use claim prevents
+      // another same-head attempt; preserve the loop state for observability.
+      const capReviewClaimed = Boolean(claimedCapPath) || opts.reviewerMixCapClaimed === true;
+      if (nextStreak >= 2 && !capReviewClaimed) {
         loopReason = 'two-consecutive-stale-reopen-rounds';
         writeReviewLoopBreakerLock(pr, diffRead.headCommit, loopReason);
         review = { ...review, reviewed: false, verdict: 'fail', failureReason: 'waiver-needed' };

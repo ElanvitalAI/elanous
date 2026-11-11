@@ -154,6 +154,9 @@ export interface LLMToolDef {
   /** Optional route metadata copied from plugin.json and used only for lazy schema selection. */
   pluginId?: string;
   route?: LLMToolRouteMetadata;
+  /** Symbolic manifest route handler; inert metadata for ToolSearch allowlisting. */
+  handlerRef?: string;
+  allowedGraphIds?: readonly string[];
   handler(args: Record<string, unknown>, ctx: PluginContext): Promise<unknown>;
 }
 

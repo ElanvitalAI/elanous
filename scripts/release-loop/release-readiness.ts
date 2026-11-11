@@ -36,15 +36,22 @@ export interface GateImageReadinessSignal {
 
 export type GateImageReadiness =
   | { status: 'ready'; signal: GateImageReadinessSignal }
-  | { status: 'unknown'; reason: 'signal-missing' | 'signal-invalid' | 'run-mismatch' | 'commit-mismatch' };
+  | { status: 'unknown'; reason: 'signal-missing' | 'signal-invalid' | 'run-mismatch' | 'commit-mismatch' | 'prebuild-pending' | 'prebuild-unconfirmed' };
 
 export function gateImageReadinessSignalPath(root: string, version: string): string {
   if (!/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(version)) throw new Error(`release version must be x.y.z: ${version}`);
   return join(root, 'release', version, 'image-readiness.json');
 }
 
+export function gateImageReadinessPendingPath(root: string, version: string): string {
+  return join(dirname(gateImageReadinessSignalPath(root, version)), 'image-readiness.pending');
+}
+
 /** Fail closed until the image producer publishes a run- and cut-bound readiness signal. */
-export function readGateImageReadinessSignal(path: string, expected: { runId: string; cutCommit: string }): GateImageReadiness {
+export function readGateImageReadinessSignal(path: string, expected: { runId: string; cutCommit: string },
+  options: { ignorePending?: boolean } = {}): GateImageReadiness {
+  if (!options.ignorePending && existsSync(join(dirname(path), 'image-readiness.pending')))
+    return { status: 'unknown', reason: 'prebuild-pending' };
   if (!existsSync(path)) return { status: 'unknown', reason: 'signal-missing' };
   let value: unknown;
   try { value = JSON.parse(readFileSync(path, 'utf8')); }
@@ -125,6 +132,16 @@ export async function waitForGateImageT60(context: ReadinessGraphContext, deps: 
   const signalPath = gateImageReadinessSignalPath(root, version);
   const statePath = join(root, 'release', version, 'readiness-countdown.json');
   const readSignal = deps.readSignal ?? readGateImageReadinessSignal;
+  const prebuild = versionOutput && typeof versionOutput === 'object' && !Array.isArray(versionOutput)
+    ? (versionOutput as { gateImagePrebuild?: unknown }).gateImagePrebuild : undefined;
+  const attestation = prebuild && typeof prebuild === 'object' && !Array.isArray(prebuild)
+    ? prebuild as { outcome?: unknown; runId?: unknown; cutCommit?: unknown; digest?: unknown; eligiblePools?: unknown } : null;
+  const prebuildSucceeded = (attestation?.outcome === 'built' || attestation?.outcome === 'reused')
+    && attestation.runId === runId && typeof attestation.cutCommit === 'string'
+    && attestation.cutCommit.toLowerCase() === cutCommit.toLowerCase()
+    && typeof attestation.digest === 'string' && /^sha256:[0-9a-f]{64}$/i.test(attestation.digest)
+    && Array.isArray(attestation.eligiblePools) && attestation.eligiblePools.length > 0
+    && attestation.eligiblePools.every((pool) => typeof pool === 'string' && pool.trim());
   let lastReason = '';
   let lastCutAt: string | undefined;
   while (true) {
@@ -133,7 +150,11 @@ export async function waitForGateImageT60(context: ReadinessGraphContext, deps: 
     const instant = now();
     const observedAt = instant.toISOString();
     const fromCutAt = lastCutAt !== undefined && lastCutAt !== currentSchedule.cutAt ? lastCutAt : undefined;
-    const image = readSignal(signalPath, { runId, cutCommit });
+    const observed = readSignal(signalPath, { runId, cutCommit });
+    const image: GateImageReadiness = observed.status === 'unknown' ? observed
+      : prebuildSucceeded && String(attestation!.digest).toLowerCase() === observed.signal.imageDigest.toLowerCase()
+        && [...attestation!.eligiblePools as string[]].sort().join('\n') === [...observed.signal.eligiblePools].sort().join('\n')
+        ? observed : { status: 'unknown', reason: 'prebuild-unconfirmed' };
     const cutReached = instant.getTime() >= Date.parse(currentSchedule.cutAt);
     const ready = image.status === 'ready' && cutReached;
     const holdReason = image.status === 'ready' ? (cutReached ? null : 'cut-time-constraint') : `image-t60:${image.reason}`;

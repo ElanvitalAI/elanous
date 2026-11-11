@@ -5,7 +5,6 @@ export type DashboardCompanionSurfaceKey = 'clipboard' | 'memo' | 'detail';
 export interface DispatchDashboardSurfaceCatalogActionDeps {
   openDashboardPane: (pane: PaneFocus) => boolean;
   focusPane: (pane: PaneFocus) => void;
-  openBrowserPreviewModal: () => void;
   openDashboardPaneModal: (pane: PaneFocus) => void;
   openCompanionPopup: (key: DashboardCompanionSurfaceKey) => void;
   onWarning?: (message: string) => void;
@@ -22,10 +21,6 @@ export function dispatchDashboardSurfaceCatalogAction(
     } else {
       deps.onWarning?.(`could not reopen pane: ${surfaceId.slice('reopen:'.length)}`);
     }
-    return;
-  }
-  if (surfaceId === 'pane:browser-preview') {
-    deps.openBrowserPreviewModal();
     return;
   }
   if (surfaceId.startsWith('pane:')) {

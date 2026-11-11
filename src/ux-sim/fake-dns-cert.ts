@@ -40,6 +40,11 @@ export interface FakeDnsCertDevice {
   readonly zone: FakeDnsZone;
   readonly counters: { readonly wildcardRecordWrites: number; readonly acmeTxtWrites: number };
   registerApp(hostname: string): void;
+  /** Test-only BYOC path: models DNS ownership and certificate readiness without writing real DNS. */
+  connectCustomDomain(input: { hostname: string; appHost: string; cnameTarget: string; ownerTxt: { name: string; value: string }; expectedOwnerProof: string; cloudflareTokenAvailable?: boolean }):
+    { readonly status: 'verified' | 'rejected'; readonly reason?: 'invalid-host' | 'cname-mismatch' | 'owner-proof-mismatch'; readonly hostname: string; readonly appHost?: string; readonly certificateReady: boolean; readonly dnsSetup: 'manual' | 'cloudflare-simulated' };
+  issueCustomCertificate(hostname: string): Promise<{ readonly status: 'issued' | 'failed'; readonly reason?: 'domain-unverified' | 'domain-changed' | 'propagation-timeout' | 'issuance-limit' | 'caa-rejected'; readonly hostname: string }>;
+  customDomain(hostname: string): { readonly appHost: string; readonly certificateReady: boolean } | undefined;
   apps(): string[];
   matchesWildcard(hostname: string): boolean;
   issueCertificate(): Promise<FakeDnsCertResult>;
@@ -84,6 +89,7 @@ export function createFakeDnsCert(options: FakeDnsCertOptions = {}): FakeDnsCert
   if (issuanceLimit !== undefined) requireNonnegative(issuanceLimit, 'issuanceLimit');
   requireNonnegative(certificateLifetimeMs, 'certificateLifetimeMs');
   const registeredApps = new Set<string>();
+  const customDomains = new Map<string, { appHost: string; certificateReady: boolean }>();
   const events: FakeDnsCertEvent[] = [];
   let acmeTxtWrites = 0;
   let issuanceAttempts = 0;
@@ -139,6 +145,51 @@ export function createFakeDnsCert(options: FakeDnsCertOptions = {}): FakeDnsCert
     registerApp(hostname) {
       if (!matchesWildcard(hostname)) throw new Error(`fake-dns-cert: hostname is outside *.elanous.app: ${hostname}`);
       if (!registeredApps.has(hostname)) { registeredApps.add(hostname); events.push({ type: 'app-registered', at: now(), detail: hostname }); }
+    },
+    connectCustomDomain(input) {
+      const hostname = input.hostname.trim().toLowerCase().replace(/\.$/, '');
+      const validHost = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(hostname) && !hostname.includes('..') && !hostname.includes('elanous.app');
+      const appHost = input.appHost.trim().toLowerCase().replace(/\.$/, '');
+      const appIsRegistered = registeredApps.has(appHost) && matchesWildcard(appHost);
+      const reject = (reason: 'invalid-host' | 'cname-mismatch' | 'owner-proof-mismatch') => {
+        customDomains.delete(hostname);
+        events.push({ type: 'issuance-failed', at: now(), detail: `custom-domain:${reason}:${hostname}` });
+        return { status: 'rejected' as const, reason, hostname, certificateReady: false, dnsSetup: input.cloudflareTokenAvailable ? 'cloudflare-simulated' as const : 'manual' as const };
+      };
+      if (!validHost) return reject('invalid-host');
+      if (!appIsRegistered || input.cnameTarget.trim().toLowerCase().replace(/\.$/, '') !== appHost) return reject('cname-mismatch');
+      if (input.ownerTxt.name.trim().toLowerCase().replace(/\.$/, '') !== `_elanous-owner.${hostname}`
+        || !input.ownerTxt.value || input.ownerTxt.value !== input.expectedOwnerProof) return reject('owner-proof-mismatch');
+      customDomains.set(hostname, { appHost, certificateReady: false });
+      events.push({ type: 'app-registered', at: now(), detail: `custom-domain:${hostname}->${appHost}` });
+      return { status: 'verified' as const, hostname, appHost, certificateReady: false,
+        dnsSetup: input.cloudflareTokenAvailable ? 'cloudflare-simulated' as const : 'manual' as const };
+    },
+    async issueCustomCertificate(rawHostname) {
+      const hostname = rawHostname.trim().toLowerCase().replace(/\.$/, '');
+      const domain = customDomains.get(hostname);
+      if (!domain) return { status: 'failed', reason: 'domain-unverified', hostname };
+      const fail = (reason: 'domain-changed' | 'propagation-timeout' | 'issuance-limit' | 'caa-rejected') => {
+        events.push({ type: 'issuance-failed', at: now(), detail: `custom-domain:${reason}:${hostname}` });
+        return { status: 'failed' as const, reason, hostname };
+      };
+      if (!caaAllowed) return fail('caa-rejected');
+      if (issuanceLimit !== undefined && issuanceAttempts >= issuanceLimit) return fail('issuance-limit');
+      issuanceAttempts += 1;
+      acmeTxtWrites += 1;
+      const startedAt = now();
+      events.push({ type: 'acme-txt-written', at: startedAt, detail: `_acme-challenge.${hostname}` });
+      const waitMs = propagationTimeoutMs === undefined ? propagationDelayMs : Math.min(propagationDelayMs, propagationTimeoutMs);
+      await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+      if (propagationTimeoutMs !== undefined && propagationDelayMs > propagationTimeoutMs) return fail('propagation-timeout');
+      if (customDomains.get(hostname) !== domain) return fail('domain-changed');
+      domain.certificateReady = true;
+      events.push({ type: 'certificate-issued', at: now(), detail: hostname });
+      return { status: 'issued', hostname };
+    },
+    customDomain(hostname) {
+      const found = customDomains.get(hostname.trim().toLowerCase().replace(/\.$/, ''));
+      return found && { ...found };
     },
     apps() { return [...registeredApps].sort(); },
     matchesWildcard,

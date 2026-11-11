@@ -1,0 +1,30 @@
+# KAIST key-feature simulation. Host handlers are supplied by the .sim.test fixture;
+# the crawl nodes use the production contract registry and fixed-response providers.
+# Both crawl contracts accept a URL and fetch independently; absorb joins their
+# outputs. The runner does not bind a prior node's page body into extract input.
+graph_id: kaist-key-feature
+version: 1
+loop:
+  title: KAIST 공유에서 브리핑까지
+  description: 공유 URL을 스크랩으로 보관하고 계약 기반 추출을 흡수한 뒤 출처가 있는 브리핑으로 만든다.
+  inputs: [memberId, sourceKind, url]
+  trigger:
+    events: [manual]
+entry_node: share
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: share, kind: agent, recipe: 'handler:share', max_visits: 1 }
+  - { node_id: scrap, kind: agent, recipe: 'handler:scrap', max_visits: 1 }
+  - { node_id: crawl-scrape, kind: capability, recipe: none, requires: scrape.url@1, max_visits: 1 }
+  - { node_id: extract, kind: capability, recipe: none, requires: extract.structured@1, max_visits: 1 }
+  - { node_id: absorb, kind: agent, recipe: 'handler:absorb', max_visits: 1 }
+  - { node_id: brief, kind: agent, recipe: 'handler:brief', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: share, on: outcome, map: { ok: scrap, fail: failed, error: failed } }
+  - { from: scrap, on: outcome, map: { ok: crawl-scrape, fail: failed, error: failed } }
+  - { from: crawl-scrape, on: outcome, map: { done: extract, failed: failed } }
+  - { from: extract, on: outcome, map: { done: absorb, failed: failed } }
+  - { from: absorb, on: outcome, map: { ok: brief, fail: failed, error: failed } }
+  - { from: brief, on: outcome, map: { ok: done, fail: failed, error: failed } }

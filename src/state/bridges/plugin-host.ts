@@ -12,12 +12,12 @@
 //     in a subsequent PR · P1.7a).
 //
 // Implementation = **Option A (method wrap)**: PluginHost exposes
-// public `activate(name)` / `deactivate()` methods but no lifecycle
-// subscribe API. We monkey-patch the instance (own-property shadows)
-// so internal `this.deactivate()` calls inside `activate()` pass
-// through our hooks. On dispose we `delete` the own-properties so the
-// prototype methods take over — plugin-host is left exactly as we
-// found it.
+// public `activate(name)`, `deactivate()`, and `deactivateAll()` methods
+// but no lifecycle subscribe API. We monkey-patch those instance methods
+// (own-property shadows) and synchronize the full active set after each
+// operation settles, including internal legacy transitions in activate().
+// On dispose we `delete` the own-properties so the prototype methods take
+// over — plugin-host is left exactly as we found it.
 //
 // Loop prevention is unnecessary here: activate/deactivate are
 // discrete, caller-driven events. Plugins mutating their own slice
@@ -26,8 +26,8 @@
 //
 // Debug junctions (CLAUDE.md 규율):
 //   - state.bridge.plugin-host.attach     · initial sync
-//   - state.bridge.plugin-host.activate   · slice installed after activate
-//   - state.bridge.plugin-host.deactivate · slice removed after deactivate
+//   - state.bridge.plugin-host.activate   · active slices synchronized
+//   - state.bridge.plugin-host.deactivate · active slices synchronized
 //   - state.bridge.plugin-host.dispose    · wrappers detached
 
 import { debug } from '../../debug/log.js';
@@ -41,10 +41,9 @@ import type { ElanousState, Store } from '../types.js';
  *  Semantics:
  *    - On attach, the currently active plugin's slice is installed into
  *      the store (host is authoritative).
- *    - `host.activate(name)` → `installPluginSlice(store, name, state)`
- *      after the original method resolves.
- *    - `host.deactivate()` → `uninstallPluginSlice(store, name)` after
- *      the original method resolves.
+ *    - After activate, deactivate, or deactivateAll settles, install
+ *      newly active slices and uninstall removed slices from the host's
+ *      actual active set. Existing active store slices remain untouched.
  *    - On dispose, the monkey-patches are removed. The currently
  *      installed slice is NOT uninstalled (the active plugin is still
  *      running; its slice remains authoritative until the caller
@@ -63,44 +62,74 @@ export function bridgePluginHostToStore(
   // preserved when we re-invoke them inside the wrappers.
   const origActivate = pluginHost.activate.bind(pluginHost);
   const origDeactivate = pluginHost.deactivate.bind(pluginHost);
+  const origDeactivateAll = pluginHost.deactivateAll.bind(pluginHost);
+  // Structural test hosts can provide the original single-active API.
+  const livePlugins = () => typeof pluginHost.activePlugins === 'function'
+    ? pluginHost.activePlugins()
+    : pluginHost.active() ? [pluginHost.active()!] : [];
+  const syncedPluginNames = new Set<string>();
+  const syncFromHost = () => {
+    const active = livePlugins();
+    const activeNames = new Set(active.map(plugin => plugin.name));
+    for (const name of syncedPluginNames) {
+      if (!activeNames.has(name)) uninstallPluginSlice(store, name);
+    }
+    for (const plugin of active) {
+      if (!syncedPluginNames.has(plugin.name)) installPluginSlice(store, plugin.name, plugin.state);
+    }
+    syncedPluginNames.clear();
+    for (const name of activeNames) syncedPluginNames.add(name);
+  };
 
   // ── Initial sync (host → store, one-shot) ──────────────────────
   {
-    const active = pluginHost.active();
-    if (active) {
+    for (const active of livePlugins()) {
       installPluginSlice(store, active.name, active.state);
+      syncedPluginNames.add(active.name);
     }
     if (debug.enabled) {
       debug.log('state.bridge.plugin-host.attach', 'init-sync', {
-        active: active?.name ?? null,
+        active: pluginHost.active()?.name ?? null,
       });
     }
   }
 
   // ── Wrap activate · install slice after successful activation ──
   const wrappedActivate = async function (name: string): Promise<void> {
-    await origActivate(name);
-    const active = pluginHost.active();
-    if (active) {
-      installPluginSlice(store, active.name, active.state);
+    try {
+      await origActivate(name);
+    } finally {
+      syncFromHost();
       if (debug.enabled) {
-        debug.log('state.bridge.plugin-host.activate', 'slice-installed', {
-          name: active.name,
+        debug.log('state.bridge.plugin-host.activate', 'slices-synced', {
+          active: livePlugins().map(active => active.name),
         });
       }
     }
   };
 
   // ── Wrap deactivate · remove slice after successful deactivation ──
-  const wrappedDeactivate = async function (): Promise<void> {
-    const prev = pluginHost.active();
-    const prevName = prev?.name ?? null;
-    await origDeactivate();
-    if (prevName) {
-      uninstallPluginSlice(store, prevName);
+  const wrappedDeactivate = async function (name?: string): Promise<void> {
+    try {
+      await origDeactivate(name);
+    } finally {
+      syncFromHost();
       if (debug.enabled) {
-        debug.log('state.bridge.plugin-host.deactivate', 'slice-removed', {
-          name: prevName,
+        debug.log('state.bridge.plugin-host.deactivate', 'slices-synced', {
+          active: livePlugins().map(active => active.name),
+        });
+      }
+    }
+  };
+
+  const wrappedDeactivateAll = async function (): Promise<void> {
+    try {
+      await origDeactivateAll();
+    } finally {
+      syncFromHost();
+      if (debug.enabled) {
+        debug.log('state.bridge.plugin-host.deactivate', 'all-slices-synced', {
+          active: livePlugins().map(active => active.name),
         });
       }
     }
@@ -112,6 +141,7 @@ export function bridgePluginHostToStore(
   // before the new activation runs.
   (pluginHost as unknown as { activate: typeof wrappedActivate }).activate = wrappedActivate;
   (pluginHost as unknown as { deactivate: typeof wrappedDeactivate }).deactivate = wrappedDeactivate;
+  (pluginHost as unknown as { deactivateAll: typeof wrappedDeactivateAll }).deactivateAll = wrappedDeactivateAll;
 
   let disposed = false;
   return () => {
@@ -122,6 +152,7 @@ export function bridgePluginHostToStore(
     // responsibility to uninstall if desired).
     delete (pluginHost as unknown as { activate?: unknown }).activate;
     delete (pluginHost as unknown as { deactivate?: unknown }).deactivate;
+    delete (pluginHost as unknown as { deactivateAll?: unknown }).deactivateAll;
     if (debug.enabled) {
       debug.log('state.bridge.plugin-host.dispose', 'detached', {});
     }

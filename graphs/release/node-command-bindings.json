@@ -1,0 +1,18 @@
+{
+  "hitl:*": { "recipe": "hitl:*" },
+  "gate-cutover-switch": {
+    "recipe": "cmd:gate-cutover-switch",
+    "command": "bun scripts/release-loop/gate-cutover-switch-node.ts"
+  },
+  "regression-suite": {
+    "recipe": "cmd:regression-suite",
+    "command": "bun scripts/release-loop/regression-suite-node.ts"
+  },
+  "pwa-formal-update": {
+    "recipe": "cmd:pwa-formal-update",
+    "command": "bun scripts/release-loop/pwa-formal-update-node.ts"
+  },
+  "pod-reuse-prep": {
+    "recipe": "none"
+  }
+}

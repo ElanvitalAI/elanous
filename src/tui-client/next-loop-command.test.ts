@@ -1,6 +1,4 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { createNextLoopCommand } from './next-loop-command.js';
 import type { InternalTurnGate } from '../dashboard/input/internal-turn.js';
 
@@ -42,12 +40,6 @@ describe('Next TUI /loop command', () => {
     tick?.();
     expect(calls).toHaveLength(2);
     command.dispose();
-  });
-
-  test('entry tears the timer down on new session, resume, and TUI exit', () => {
-    const source = readFileSync(resolve(import.meta.dir, '../tui/entry.ts'), 'utf8');
-    expect(source.match(/loopCommand(?: as [^)]+\))?\?\.run\('stop'\)/g)).toHaveLength(2);
-    expect(source).toMatch(/loopCommand(?: as [^)]+\))?\?\.dispose\(\);/);
   });
 
   test('rejects malformed interval or missing prompt without arming a timer', () => {

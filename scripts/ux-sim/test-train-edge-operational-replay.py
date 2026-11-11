@@ -257,7 +257,6 @@ with tempfile.TemporaryDirectory(prefix='train-edge-operational-replay-') as raw
     if positive_cap_result != {'slots': 1, 'humanInterventions': 0}:
         raise SystemExit(f'production positive-cap control mismatch: {positive_cap_result!r}')
 
-
     # Run the pinned production run_live callsite with all remote effects replaced.
     from types import SimpleNamespace
     live_home = root / 'live-home'

@@ -17,7 +17,7 @@ import { parsePositiveInt } from '../self-dev/dev-cli.js';
 import type { SelfImplementResult, SelfImplementSeams } from './orchestrator.js';
 import type { DocumentReferenceStatus } from './self-implement-runtime.js';
 import { resolveObserveOnlyDecision } from './observe-only.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { resolveAutoReview } from './context-capsule.js';
 import { readDecomposeProposals } from '../self-dev/decompose-proposal.js';
 import { tracedPathReferences } from './goal-author.js';

@@ -26,7 +26,7 @@ import type { MouseEvent } from './mouse-events.js';
  *  and drop-zone rendering path know what the user is trying to do:
  *
  *    - `'reorder'`     — shuffle items within a single container
- *                        (DraggableList sessions sidebar, etc.)
+ *                        (reorderable list rows, etc.)
  *    - `'move'`        — relocate something between peers
  *                        (pane title bars, VW title-swap)
  *    - `'resize'`      — adjust a dimension via a handle
@@ -40,7 +40,7 @@ import type { MouseEvent } from './mouse-events.js';
  *  resize = axis-specific cursor, select-range = highlight band).
  *  Legacy views that omit the mode get `undefined`; callers should
  *  treat that the same as `'reorder'` (the pre-Phase-4 default for
- *  the two existing consumers, DraggableList + TitleBar). */
+ *  existing drag-origin views). */
 export type DragMode = 'reorder' | 'move' | 'resize' | 'select-range';
 
 /** IDX-F5c — refinement returned by `View.describeHit`. Modal-adapter

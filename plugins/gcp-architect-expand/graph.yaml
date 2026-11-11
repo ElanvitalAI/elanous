@@ -1,0 +1,22 @@
+# Declaration only. Bundled executable recipes fail closed; no GCP connector exists.
+# Real provisioning requires a separate reviewed local adapter and HITL gate.
+graph_id: gcp-architect-expand
+version: 1
+entry_node: detect
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: detect, kind: agent, recipe: 'cmd:detect', max_visits: 1 }
+  - { node_id: propose, kind: agent, recipe: 'cmd:propose', max_visits: 1 }
+  - { node_id: approve, kind: hitl, recipe: 'approval:spend', max_visits: 1 }
+  - { node_id: provision, kind: agent, recipe: 'cmd:provision', max_visits: 1 }
+  - { node_id: schedule, kind: agent, recipe: 'cmd:schedule', max_visits: 1 }
+  - { node_id: idle-stop, kind: agent, recipe: 'cmd:idle-stop', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: detect, on: outcome, map: { ok: propose, shortage: propose, none: done, unknown: failed, fail: failed } }
+  - { from: propose, on: outcome, map: { ok: approve, proposed: approve, fail: failed } }
+  - { from: approve, on: outcome, map: { ok: provision, fail: failed } }
+  - { from: provision, on: outcome, map: { ok: schedule, fail: failed } }
+  - { from: schedule, on: outcome, map: { ok: idle-stop, fail: idle-stop } }
+  - { from: idle-stop, on: outcome, map: { ok: done, stopped: done, fail: failed } }

@@ -500,6 +500,14 @@ export async function* runAgent(
   runPromise.then(
     (text) => {
       flushStep();
+      if (task.controller.signal.aborted) {
+        task.state = 'aborted';
+        task.finishedAt = Date.now();
+        queue.push({ type: 'status', stage: 'aborted' });
+        queue.close();
+        try { opts.onTerminal?.(task); } catch { /* registry isolates */ }
+        return;
+      }
       task.result = text;
       task.state = 'done';
       task.finishedAt = Date.now();

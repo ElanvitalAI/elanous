@@ -21,6 +21,8 @@ interface FakeState { count: number; label?: string }
 
 class FakeHost {
   private activeEntry: { name: string; state: FakeState } | null = null;
+  activationBarrier: Promise<void> | null = null;
+  failNextActivation: string | null = null;
 
   // Seeds used by activate() to simulate different plugin state shapes.
   seeds = new Map<string, () => FakeState>();
@@ -32,15 +34,29 @@ class FakeHost {
     return this.activeEntry as unknown as ActivePlugin;
   }
 
+  activePlugins(): ActivePlugin[] {
+    return this.active() ? [this.active()!] : [];
+  }
+
   async activate(name: string): Promise<void> {
+    if (this.activationBarrier) await this.activationBarrier;
+    if (this.failNextActivation === name) {
+      this.failNextActivation = null;
+      throw new Error(`activation failed: ${name}`);
+    }
     if (this.activeEntry?.name === name) return; // idempotent (matches real plugin-host)
     if (this.activeEntry) await this.deactivate();
     const seed = this.seeds.get(name) ?? (() => ({ count: 0 }));
     this.activeEntry = { name, state: seed() };
   }
 
-  async deactivate(): Promise<void> {
+  async deactivate(_name?: string): Promise<void> {
+    if (this.activationBarrier) await this.activationBarrier;
     this.activeEntry = null;
+  }
+
+  async deactivateAll(): Promise<void> {
+    await this.deactivate();
   }
 
   // Helper used by tests to mutate active state without going through
@@ -130,6 +146,21 @@ describe('bridgePluginHostToStore · activate → slice install', () => {
 
     dispose();
   });
+
+  test('failed peer activation preserves a directly updated active slice', async () => {
+    const host = new FakeHost();
+    host.seeds.set('alpha', () => ({ count: 1 }));
+    const store = mkStore();
+    const dispose = bridgePluginHostToStore(store, asHost(host));
+
+    await host.activate('alpha');
+    store.setState(state => ({ plugins: { ...state.plugins, alpha: { count: 42 } } }));
+    host.failNextActivation = 'beta';
+    await expect(host.activate('beta')).rejects.toThrow('activation failed: beta');
+
+    expect(store.getState().plugins.alpha).toEqual({ count: 42 });
+    dispose();
+  });
 });
 
 describe('bridgePluginHostToStore · deactivate → slice removal', () => {
@@ -155,6 +186,39 @@ describe('bridgePluginHostToStore · deactivate → slice removal', () => {
 
     await host.deactivate();
     expect(Object.keys(store.getState().plugins)).toHaveLength(0);
+    dispose();
+  });
+
+  test('deactivateAll removes every previously synchronized slice', async () => {
+    const host = new FakeHost();
+    host.seeds.set('alpha', () => ({ count: 2 }));
+    const store = mkStore();
+    const dispose = bridgePluginHostToStore(store, asHost(host));
+
+    await host.activate('alpha');
+    expect('alpha' in store.getState().plugins).toBe(true);
+    await host.deactivateAll();
+    expect('alpha' in store.getState().plugins).toBe(false);
+
+    dispose();
+  });
+
+  test('a queued deactivate syncs after the pending activation finishes', async () => {
+    const host = new FakeHost();
+    host.seeds.set('alpha', () => ({ count: 2 }));
+    let release!: () => void;
+    host.activationBarrier = new Promise<void>(resolve => { release = resolve; });
+    const store = mkStore();
+    const dispose = bridgePluginHostToStore(store, asHost(host));
+
+    const activating = host.activate('alpha');
+    await Promise.resolve();
+    const deactivating = host.deactivate('alpha');
+    release();
+    await Promise.all([activating, deactivating]);
+
+    expect(host.activePlugins()).toEqual([]);
+    expect('alpha' in store.getState().plugins).toBe(false);
     dispose();
   });
 });

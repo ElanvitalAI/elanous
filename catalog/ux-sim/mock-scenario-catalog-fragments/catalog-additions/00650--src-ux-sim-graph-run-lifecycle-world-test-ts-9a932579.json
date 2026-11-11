@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/graph-run-lifecycle-world.test.ts",
+  "reason": "Focused contract test for the graph lifecycle simulator."
+}

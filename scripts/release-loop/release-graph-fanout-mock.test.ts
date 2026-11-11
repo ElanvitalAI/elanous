@@ -101,8 +101,10 @@ test('RELEASE-GRAPH-FANOUT event injection: release YAML joins docs-land and ver
   const runBash = async (_command: string, options: { env?: NodeJS.ProcessEnv }) => {
     const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
     if (!contextPath) throw new Error('mock runner did not receive graph context');
-    const context = JSON.parse(await Bun.file(contextPath).text()) as { nodeId: string };
+    const context = JSON.parse(await Bun.file(contextPath).text()) as { graphId: string; nodeId: string };
     calls.set(context.nodeId, (calls.get(context.nodeId) ?? 0) + 1);
+    if (context.graphId === 'pod-reuse-prep') return { stdout: JSON.stringify({ outcome: 'legacy', verdict: 'legacy',
+      reason: 'prep-body-pending', receiptPath: '' }), stderr: '', exitCode: 0 };
     if (context.nodeId === 'docs-land' || context.nodeId === 'version-dev-bump') {
       activeBranches++;
       maxActiveBranches = Math.max(maxActiveBranches, activeBranches);
@@ -114,10 +116,11 @@ test('RELEASE-GRAPH-FANOUT event injection: release YAML joins docs-land and ver
       return { stdout: JSON.stringify({ outcome: ok ? 'ok' : 'fail', artifact: `${context.nodeId}-${calls.get(context.nodeId)}` }), stderr: '', exitCode: ok ? 0 : 1 };
     }
     const extra = context.nodeId === 'version-release' ? { version: '0.2.44', commit: 'a'.repeat(40), branch: 'release/0.2.44' } : {};
-    return { stdout: JSON.stringify({ outcome: 'ok', ...extra }), stderr: '', exitCode: 0 };
+    const outcome = context.nodeId === 'gate-cutover-switch' ? 'legacy' : 'ok';
+    return { stdout: JSON.stringify({ outcome, ...extra }), stderr: '', exitCode: 0 };
   };
   try {
-    const first = await runGraph(graph, { input: { version: '0.2.44', branchCut: true }, deps: { root, runBash,
+    const first = await runGraph(graph, { input: { version: '0.2.44', branchCut: true, cutSha: 'a'.repeat(40), candidatePath: 'fixture:candidate' }, deps: { root, runBash,
       log: (event, data) => {
         if (event === 'node-start' || event === 'node-end') {
           lifecycle.push({ event, graphId: String(data.graphId), runId: String(data.runId), nodeId: String(data.nodeId) });

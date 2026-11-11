@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { gateFileReceiptKey, type GateFileReceiptIdentity } from './gate-file-receipts.js';
 import { readGateFileReceiptHistory } from './gate-shard-receipts.js';
 
@@ -41,7 +42,7 @@ export function lookupMainSameKeyReceipts(root: string, cut: FileCasKey, mainTip
   return readGateFileReceiptHistory(root, key).flatMap((receipt) => {
     if (receipt.lane !== 'train' || !SHA.test(receipt.sourceHead40)) return [];
     const ancestor = spawnSync('git', ['merge-base', '--is-ancestor', receipt.sourceHead40, mainTip],
-      { cwd: repo, encoding: 'utf8', timeout: 15_000 });
+      { cwd: repo, encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     return ancestor.status === 0 && !ancestor.error ? [{ key: cut, status: receipt.outcome === 'pass' ? 'pass' as const
       : 'fail' as const, verified: true }] : [];
   });

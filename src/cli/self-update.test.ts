@@ -52,6 +52,7 @@ describe('runReleaseUpdate — release installer', () => {
     const deps: ReleaseUpdateDeps = {
       packageRoot,
       fetchInstaller: async (url) => { urls.push(url); return 'echo verified installer'; },
+      wait: async () => {},
       run: (command, args, cwd, input, env) => {
         calls.push({ command, args, cwd, input, env });
         if (command === 'bash') writeFileSync(join(prefix, 'install.json'), JSON.stringify({ version: installedVersion }));
@@ -176,6 +177,63 @@ describe('runReleaseUpdate — release installer', () => {
       expect(f.calls).toEqual([{ command: 'bash', args: ['-s', '--', '--yes', '--no-modify-path', '--prefix', f.prefix], cwd: f.prefix, input: 'echo verified installer', env: { ELANOUS_VERSION: '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: 'https://github.com/ElanvitalAI/elanous/releases' } }]);
       expect(result).toMatchObject({ exitCode: 0, installedVersion: '0.2.0', restarted: false });
     } finally { f.cleanup(); }
+  });
+
+  test('retries a transient latest installer fetch failure before installing', async () => {
+    const f = setup();
+    const urls: string[] = [];
+    const waits: number[] = [];
+    let installerFetches = 0;
+    try {
+      const result = await runReleaseUpdate({}, {
+        ...f.deps,
+        fetchInstaller: async (url) => {
+          urls.push(url);
+          if (installerFetches++ === 0) throw new Error('HTTP 503');
+          return 'echo verified installer';
+        },
+        wait: async (milliseconds) => { waits.push(milliseconds); },
+      });
+      expect(result).toMatchObject({ exitCode: 0, installedVersion: '0.2.0' });
+      expect(urls).toEqual([
+        'https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh',
+        'https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh',
+      ]);
+      expect(waits).toEqual([1_000]);
+      expect(f.calls).toHaveLength(1);
+    } finally { f.cleanup(); }
+  });
+
+  test('latest installer retries are bounded and pinned-version downloads remain single-shot', async () => {
+    const latest = setup();
+    const latestWaits: number[] = [];
+    let latestCalls = 0;
+    try {
+      const result = await runReleaseUpdate({}, {
+        ...latest.deps,
+        fetchInstaller: async () => { latestCalls++; throw new Error('HTTP 503'); },
+        wait: async (milliseconds) => { latestWaits.push(milliseconds); },
+      });
+      expect(result.exitCode).toBe(1);
+      expect(latestCalls).toBe(3);
+      expect(latestWaits).toEqual([1_000, 2_000]);
+      expect(latest.calls).toHaveLength(0);
+    } finally { latest.cleanup(); }
+
+    const pinned = setup();
+    let pinnedCalls = 0;
+    const pinnedWaits: number[] = [];
+    try {
+      const result = await runReleaseUpdate({ version: '0.2.0-rc.1' }, {
+        ...pinned.deps,
+        fetchInstaller: async () => { pinnedCalls++; throw new Error('HTTP 503'); },
+        wait: async (milliseconds) => { pinnedWaits.push(milliseconds); },
+      });
+      expect(result.exitCode).toBe(1);
+      expect(pinnedCalls).toBe(1);
+      expect(pinnedWaits).toEqual([]);
+      expect(pinned.calls).toHaveLength(0);
+    } finally { pinned.cleanup(); }
   });
 
   test('version-specific release and explicit restart use selected tag and service', async () => {
@@ -538,9 +596,10 @@ describe('self-update routing by install source (2026-09-25 🅣)', () => {
         packageRoot: inst.packageRoot,
         out: { log: (line) => lines.push(line), error: () => {} },
         fetchInstaller: async (url) => { urls.push(url); throw new Error('injected download stop'); },
+        wait: async () => {},
       };
       const tail = await runUpdateForInstallation({ json: true }, { cliRoot: inst.packageRoot, release: deps });
-      expect(urls).toEqual([`${tailBase}/latest/download/install.sh`]);
+      expect(urls).toEqual(Array(3).fill(`${tailBase}/latest/download/install.sh`));
       expect(tail).toMatchObject({ exitCode: 1, releaseBase: tailBase, releaseBaseSource: 'install-source' });
       expect(JSON.parse(lines.at(-1)!)).toEqual(tail);
       writeFileSync(join(inst.prefix, 'install.json'), JSON.stringify({ source: `${tailBase}/download/v0.2.3-abcdef123456/elanous.tgz` }));
@@ -557,10 +616,10 @@ describe('self-update routing by install source (2026-09-25 🅣)', () => {
       expect(refused).toMatchObject({ exitCode: 2, releaseBase: publicBase, releaseBaseSource: 'env' });
       expect(refused.reason).toContain('내부 설치본');
       expect(JSON.parse(lines.at(-1)!)).toEqual(refused);
-      expect(urls).toHaveLength(3);
+      expect(urls).toHaveLength(7);
       const option = await runReleaseUpdate({ json: true }, { ...deps, releaseBase: publicBase });
       expect(option).toMatchObject({ exitCode: 2, releaseBase: publicBase, releaseBaseSource: 'option' });
-      expect(urls).toHaveLength(3);
+      expect(urls).toHaveLength(7);
     } finally {
       if (old === undefined) delete process.env.ELANOUS_RELEASE_BASE;
       else process.env.ELANOUS_RELEASE_BASE = old;
@@ -575,8 +634,9 @@ describe('self-update routing by install source (2026-09-25 🅣)', () => {
       await runReleaseUpdate({}, {
         packageRoot: inst.packageRoot, releaseBase: 'file:///tmp/rel/', out: { log: () => {}, error: () => {} },
         fetchInstaller: async (url) => { urls.push(url); throw new Error('stop here'); },
+        wait: async () => {},
       });
-      expect(urls).toEqual(['file:///tmp/rel/latest/download/install.sh']);
+      expect(urls).toEqual(Array(3).fill('file:///tmp/rel/latest/download/install.sh'));
     } finally { rmSync(inst.prefix, { recursive: true, force: true }); }
   });
 });

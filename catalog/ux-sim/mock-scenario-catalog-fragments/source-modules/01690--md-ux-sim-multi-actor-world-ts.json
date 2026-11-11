@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-MULTI-ACTOR-WORLD-TS",
+  "path": "src/ux-sim/multi-actor-world.ts",
+  "boundary": "Exercises invitation role issuance, manifest action authorization, shared-edit conflicts, app blocking, and train planning with fake credentials, temporary storage, and loopback relay only.",
+  "deviceIds": ["multi-actor-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

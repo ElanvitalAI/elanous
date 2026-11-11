@@ -32,6 +32,8 @@ export interface ApprovalModalSpec {
   detail?: string | string[];
   yesLabel?: string;
   noLabel?: string;
+  /** Put the rejecting choice first so Enter/initial focus cannot approve. */
+  defaultNo?: boolean;
   theme?: ThemeTokens;
 }
 
@@ -82,6 +84,9 @@ export function createApprovalModal(spec: ApprovalModalSpec): ApprovalModalHandl
   // sourced. Imperative handle.handleKey + approvalModalRouter are
   // preserved for existing direct-call sites + tests.
   mounted.surface.onKey = handleKey;
+  mounted.surface.onMouse = (ev) => mounted.handleMouse(ev) === 'consumed'
+    ? { type: 'refresh' }
+    : { type: 'none' };
 
   const dispose = (answer?: boolean): void => {
     resolve(answer ?? false);
@@ -109,10 +114,15 @@ class ApprovalDialog implements View {
     const dialog = new Dialog<boolean>({
       title: spec.title,
       body,
-      buttons: [
-        { label: spec.yesLabel ?? 'Yes (y)', value: true,  shortcut: 'y', style: 'primary' },
-        { label: spec.noLabel  ?? 'No (n/Esc)', value: false, shortcut: 'n', style: 'default' },
-      ],
+      buttons: spec.defaultNo
+        ? [
+            { label: spec.noLabel ?? 'No (n/Esc)', value: false, shortcut: 'n', style: 'default' },
+            { label: spec.yesLabel ?? 'Yes (y)', value: true, shortcut: 'y', style: 'primary' },
+          ]
+        : [
+            { label: spec.yesLabel ?? 'Yes (y)', value: true, shortcut: 'y', style: 'primary' },
+            { label: spec.noLabel ?? 'No (n/Esc)', value: false, shortcut: 'n', style: 'default' },
+          ],
       onSubmit: v => resolve(v),
       onCancel: () => resolve(false),
       theme: spec.theme,

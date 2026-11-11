@@ -1,0 +1,27 @@
+{
+  "id": "graph-run-lifecycle-world",
+  "name": "Graph run lifecycle world",
+  "audience": "internal",
+  "checklistCells": ["GRAPH-INSTANCE-PAUSE-CANCEL-FORK"],
+  "implementation": [
+    "src/ux-sim/graph-run-lifecycle-world.ts",
+    "src/graph-runner/runner.ts",
+    "scripts/release-loop/resume-release.ts"
+  ],
+  "tests": ["src/ux-sim/graph-run-lifecycle-world.test.ts"],
+  "target": "Exercise pause, cancel, and descendant-commit fork through the production graph run ledger after an active node owner disappears.",
+  "inputs": [
+    "two-node persisted graph",
+    "blocked active node with simulated lost owner",
+    "pause, cancel, or descendant commit fork operation"
+  ],
+  "observations": [
+    "pause preserves completed receipts and resumes the interrupted node once",
+    "cancel remains terminal and refuses resume",
+    "fork creates an independent run with source lineage and target commit while retaining the source ledger"
+  ],
+  "entryCommands": ["bun test src/ux-sim/graph-run-lifecycle-world.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

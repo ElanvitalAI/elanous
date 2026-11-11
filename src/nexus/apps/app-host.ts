@@ -1,20 +1,29 @@
+import { randomUUID } from 'node:crypto';
 import {
   closeSync,
   constants as fsConstants,
   existsSync,
   fstatSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
+  renameSync,
   realpathSync,
   statSync,
+  unlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import iconv from 'iconv-lite';
 import { parseAppManifest, type AppManifest } from './app-contract.js';
 import { createAppAuth, type AppAuthOptions, type IssuedAppInvitation } from './app-auth.js';
+import { detectDeclaredHtmlCharset, MADE_WITH_BADGE_ENTITLEMENT } from './made-with-badge.js';
+import { applyConceptProofBadge, type SimReceipt } from '../../ux-sim/sim-receipt.js';
 import { createAppDatabase, type AppDatabase } from './app-db.js';
+import type { NexusEventBus } from '../api/event-bus.js';
 import type { AppDbBackupOptions, AppDbBackupStatus } from './app-db-backup.js';
 import { emitNexusFunnelEvent, type NexusFunnelRuntime } from './funnel-observe.js';
 import type { MemberStore } from '../members/member-store.js';
@@ -38,8 +47,19 @@ export function resolveVerifiedOwner(
   return appHost.resolveVerifiedOwner(appSlug, sessionCredential, members, configuredPublicUserId);
 }
 
+/** Resolves a member owner from an app session without trusting a caller supplied app slug. */
+export function resolveVerifiedMemberOwner(
+  appHost: NexusAppHost,
+  sessionCredential: string,
+  members: Pick<MemberStore, 'memberPlanForMember'>,
+  configuredPublicUserId?: string,
+): VerifiedAppOwner | null {
+  return appHost.resolveVerifiedMemberOwner(sessionCredential, members, configuredPublicUserId);
+}
+
 const APP_HOST_SUFFIX = '.app.localhost';
 const PUBLIC_APP_DOMAIN = 'elanous.app';
+const APP_HOST_STATE_DIR = '.elanous-app-host-state';
 const MIME_BY_EXT: Readonly<Record<string, string>> = {
   '.css': 'text/css; charset=utf-8', '.gif': 'image/gif', '.html': 'text/html; charset=utf-8',
   '.ico': 'image/x-icon', '.jpeg': 'image/jpeg', '.jpg': 'image/jpeg', '.js': 'text/javascript; charset=utf-8',
@@ -62,6 +82,8 @@ export interface NexusAppHost {
   issueOwnerSession(appSlug: string, memberId: string): { sessionToken: string; expiresAt: string };
   /** Validates a host-bound owner cookie/Bearer, then joins the member plan from the private member DB. */
   resolveVerifiedOwner(appSlug: string, sessionCredential: string, members: Pick<MemberStore, 'memberPlanForMember'>, configuredPublicUserId?: string): VerifiedAppOwner | null;
+  /** Validates an owner app session by its server-verified token claim, without an appSlug input. */
+  resolveVerifiedMemberOwner(sessionCredential: string, members: Pick<MemberStore, 'memberPlanForMember'>, configuredPublicUserId?: string): VerifiedAppOwner | null;
   readonly slugs: readonly string[];
   /** Parsed, validated manifest snapshot for app-scoped route registration. */
   getManifest(appSlug: string): AppManifest | undefined;
@@ -69,14 +91,17 @@ export interface NexusAppHost {
   databaseBackupStatus(appSlug: string): AppDbBackupStatus | null;
   restoreDatabaseBackup(appSlug: string, targetPath: string): ReturnType<NonNullable<AppDatabase['restoreBackup']>>;
   /** Mounts one already-built app directory into the current host after validating its immutable snapshot. */
-  mountDirectory(appSlug: string): void;
+  mountDirectory(appSlug: string, entitlements?: Readonly<Record<string, unknown>>): void;
   /** Removes one dynamically mounted app after a failed publication attempt. */
   unmountDirectory(appSlug: string): void;
+  /** Connects the durable simulation proof used for the served attribution badge. */
+  setConceptProofResolver(resolver: (appSlug: string) => SimReceipt | undefined): void;
   close(): void;
 }
 
 export type NexusAppHostAuthOptions = Pick<AppAuthOptions, 'dir' | 'key' | 'now' | 'invitationTtlMs' | 'sessionTtlMs' | 'funnel'> & {
   readonly databaseDirectory?: string;
+  readonly eventBus?: Pick<NexusEventBus, 'publishAppRowChange'>;
   readonly databaseBackup?: Omit<AppDbBackupOptions, 'appSlug' | 'databasePath' | 'database'>;
 };
 
@@ -84,6 +109,7 @@ interface MountedApp {
   readonly slug: string;
   readonly manifest: AppManifest;
   readonly files: ReadonlyMap<string, Buffer>;
+  readonly entitlements?: Readonly<Record<string, unknown>>;
 }
 
 interface FileIdentity {
@@ -333,10 +359,13 @@ function createNexusAppHost(
   authBySlug: ReadonlyMap<string, ReturnType<typeof createAppAuth>>,
   appDb?: AppDatabase,
   funnel?: NexusFunnelRuntime,
-  mountDirectory?: (appSlug: string) => void,
+  mountDirectory?: (appSlug: string, entitlements?: Readonly<Record<string, unknown>>) => void,
   unmountDirectory?: (appSlug: string) => void,
   publicUserSlug?: string,
 ): NexusAppHost {
+  let conceptProofResolver: ((appSlug: string) => SimReceipt | undefined) | undefined;
+  const decorateHtml = (appSlug: string, html: string, mounted: MountedApp): string =>
+    applyConceptProofBadge(html, conceptProofResolver?.(appSlug), mounted.entitlements);
   return {
     get slugs() { return [...mounts.keys()]; },
     getManifest(appSlug) { return mounts.get(appSlug)?.manifest; },
@@ -345,14 +374,15 @@ function createNexusAppHost(
       if (!appDb?.restoreBackup) throw new Error('app database backup is not configured');
       return appDb.restoreBackup(appSlug, targetPath);
     },
-    mountDirectory(appSlug) {
+    mountDirectory(appSlug, entitlements) {
       if (!mountDirectory) throw new Error('dynamic app mounting is unavailable');
-      mountDirectory(appSlug);
+      mountDirectory(appSlug, entitlements ?? {});
     },
     unmountDirectory(appSlug) {
       if (!unmountDirectory) throw new Error('dynamic app unmounting is unavailable');
       unmountDirectory(appSlug);
     },
+    setConceptProofResolver(resolver) { conceptProofResolver = resolver; },
     close() { appDb?.close(); },
     issueInvitation(appSlug, invitedBy, ttlMs, role) {
       const auth = authBySlug.get(appSlug);
@@ -394,6 +424,20 @@ function createNexusAppHost(
       const userSlug = resolvePublicAppUserId(undefined, configuredPublicUserId);
       if (!plan || !userSlug) return null;
       return { memberId: session.invitedBy, userSlug, plan: plan.plan, entitlements: plan.entitlements };
+    },
+    resolveVerifiedMemberOwner(sessionCredential, members, configuredPublicUserId) {
+      if (!sessionCredential) return null;
+      for (const [appSlug, auth] of authBySlug) {
+        const mounted = mounts.get(appSlug);
+        if (!mounted) continue;
+        const session = auth.getSessionRecord(sessionCredential);
+        if (!session || session.appSlug !== appSlug || session.role !== 'owner' || session.source !== 'google-member') continue;
+        const plan = members.memberPlanForMember(session.invitedBy);
+        const userSlug = resolvePublicAppUserId(undefined, configuredPublicUserId);
+        if (!plan || !userSlug) return null;
+        return { memberId: session.invitedBy, userSlug, plan: plan.plan, entitlements: plan.entitlements };
+      }
+      return null;
     },
     handle(req) {
       const hostname = requestHostname(req);
@@ -486,7 +530,72 @@ function createNexusAppHost(
         'x-nexus-app-host': hostname,
         'x-nexus-app-origin': `${localHost ? 'http' : 'https'}://${requestAuthority(req, hostname)}`,
       });
-      const response = new Response(req.method === 'HEAD' ? null : new Uint8Array(body), { status: 200, headers });
+      let responseBody = body;
+      if (['.html', '.htm'].includes(extname(filePath).toLowerCase())) {
+        const asciiView = body.toString('latin1');
+        // Source: BOM inspection needs only the first four bytes, the longest supported marker prefix.
+        const bytePrefix = body.subarray(0, 4).toString('hex');
+        const utf32Bom = bytePrefix.startsWith('0000feff') || bytePrefix.startsWith('fffe0000');
+        const utf8Bom = bytePrefix.startsWith('efbbbf');
+        const utf16leBom = bytePrefix.startsWith('fffe');
+        const utf16beBom = bytePrefix.startsWith('feff');
+        const utf16leSignature = /^[0-9a-f]{2}00[0-9a-f]{2}00/i.test(bytePrefix);
+        const utf16beSignature = /^00[0-9a-f]{2}00[0-9a-f]{2}/i.test(bytePrefix);
+        const bomCharset = utf32Bom ? undefined : utf8Bom ? 'utf-8'
+          : utf16leBom ? 'utf-16le'
+            : utf16beBom ? 'utf-16be'
+              : utf16leSignature ? 'utf-16le'
+                : utf16beSignature ? 'utf-16be'
+              : undefined;
+        const bomHex = utf8Bom ? 'efbbbf' : utf16leBom ? 'fffe' : utf16beBom ? 'feff' : undefined;
+        const bomBytes = bomHex ? Buffer.from(bomHex, 'hex') : undefined;
+        const declaredCharset = detectDeclaredHtmlCharset(asciiView);
+        const charset = bomCharset ?? declaredCharset;
+        const bigEndian = charset?.toLowerCase().replaceAll('_', '-') === 'utf-16be'
+          || charset?.toLowerCase() === 'utf16be';
+        const decodeCharset = bigEndian ? 'utf-16le' : charset;
+        if (utf32Bom) {
+          responseBody = body;
+        } else if (charset && decodeCharset && iconv.encodingExists(decodeCharset)) {
+          headers.set('content-type', `text/html; charset=${charset}`);
+          // Source: encoded BOM length is determined from its bytes, so decoding starts after the marker.
+          const bodyWithoutBom = bomBytes ? body.subarray(bomBytes.length) : body;
+          try {
+            const decodedBytes = bigEndian ? Buffer.from(bodyWithoutBom).swap16() : bodyWithoutBom;
+            const utf8Charset = ['utf-8', 'utf8'].includes(charset.toLowerCase());
+            if (utf8Charset) {
+              try {
+                const html = new TextDecoder('utf-8', { fatal: true }).decode(decodedBytes);
+                const transformed = Buffer.from(decorateHtml(slug, html, mounted));
+                responseBody = bomBytes ? Buffer.concat([bomBytes, transformed]) : transformed;
+              } catch {
+                // Source: a byte-preserving fallback still applies entitlement handling to malformed UTF-8 HTML.
+                responseBody = Buffer.from(decorateHtml(slug, asciiView, mounted), 'latin1');
+              }
+            } else {
+              const html = iconv.decode(decodedBytes, decodeCharset);
+              const encoded = iconv.encode(decorateHtml(slug, html, mounted), decodeCharset);
+              const orderedBytes = bigEndian ? Buffer.from(encoded).swap16() : encoded;
+              responseBody = bomBytes ? Buffer.concat([bomBytes, orderedBytes]) : orderedBytes;
+            }
+          } catch {
+            responseBody = body;
+          }
+        } else if (charset) {
+          headers.set('content-type', `text/html; charset=${charset}`);
+          responseBody = Buffer.from(decorateHtml(slug, asciiView, mounted), 'latin1');
+        } else {
+          try {
+            const html = new TextDecoder('utf-8', { fatal: true }).decode(body);
+            responseBody = Buffer.from(decorateHtml(slug, html, mounted));
+          } catch {
+            // Source: latin1 maps each input byte to one code point, preserving bytes through fallback encode.
+            headers.set('content-type', 'text/html; charset=windows-1252');
+            responseBody = Buffer.from(decorateHtml(slug, asciiView, mounted), 'latin1');
+          }
+        }
+      }
+      const response = new Response(req.method === 'HEAD' ? null : new Uint8Array(responseBody), { status: 200, headers });
       if (req.method === 'GET' && url.pathname === '/' && funnel) {
         emitNexusFunnelEvent(funnel, {
           type: 'app-open', accountHash: funnel.accountHash, appHash: funnel.appHash(slug),
@@ -515,9 +624,27 @@ export function loadNexusAppHost(
   const issues: NexusAppHostIssue[] = [];
   const configuredAppsRoot = resolve(appsDir);
   const appsRoot = () => realpathSync(configuredAppsRoot);
-  const mountDirectory = (appSlug: string, initializeDatabase = true) => {
+  const mountDirectory = (appSlug: string, entitlements?: Readonly<Record<string, unknown>>, initializeDatabase = true) => {
     const root = appsRoot();
-    const mounted = mountApp(root, appSlug, simulation);
+    const mountedBase = mountApp(root, appSlug, simulation);
+    const stateDirectory = join(root, APP_HOST_STATE_DIR);
+    let mountedEntitlements = entitlements;
+    if (mountedEntitlements === undefined) {
+      try {
+        const state: unknown = JSON.parse(readFileSync(join(stateDirectory, `${appSlug}.json`), 'utf8'));
+        if (!state || typeof state !== 'object' || Array.isArray(state)
+          || typeof (state as { badgeDisabled?: unknown }).badgeDisabled !== 'boolean') {
+          throw new Error('app host entitlement state is invalid');
+        }
+        if ((state as { badgeDisabled: boolean }).badgeDisabled) {
+          // Source: 내부 문서 `nexus-revenue-and-market` §2⑤ — restore managed badge removal after restart.
+          mountedEntitlements = { [MADE_WITH_BADGE_ENTITLEMENT]: 0 };
+        }
+      } catch (error) {
+        if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
+      }
+    }
+    const mounted: MountedApp = mountedEntitlements ? { ...mountedBase, entitlements: mountedEntitlements } : mountedBase;
     if (mounted.slug !== appSlug) throw new Error('app directory slug does not match its manifest');
     if (mounts.has(appSlug)) throw new Error('app is already mounted');
     let auth: ReturnType<typeof createAppAuth> | undefined;
@@ -530,6 +657,19 @@ export function loadNexusAppHost(
           ...(authOptions.databaseDirectory ? { directory: authOptions.databaseDirectory } : {}),
           ...(authOptions.databaseBackup ? { backup: authOptions.databaseBackup } : {}),
         });
+      }
+      if (entitlements !== undefined) {
+        mkdirSync(stateDirectory, { recursive: true });
+        // Source: 내부 문서 `nexus-revenue-and-market` §2③⑤ — persist only the derived attribution toggle.
+        const badgeDisabled = entitlements[MADE_WITH_BADGE_ENTITLEMENT] === 0;
+        const statePath = join(stateDirectory, `${appSlug}.json`);
+        const pendingStatePath = `${statePath}.tmp-${randomUUID()}`;
+        writeFileSync(pendingStatePath, JSON.stringify({ badgeDisabled }));
+        try { renameSync(pendingStatePath, statePath); }
+        catch (error) {
+          try { unlinkSync(pendingStatePath); } catch { /* the incomplete file is already absent */ }
+          throw error;
+        }
       }
       mounts.set(appSlug, mounted);
       if (auth) authBySlug.set(appSlug, auth);
@@ -556,7 +696,7 @@ export function loadNexusAppHost(
       if (entry.isSymbolicLink() || !entry.isDirectory()) continue;
       const appDir = join(root, entry.name);
       if (!existsSync(join(appDir, 'app.yaml'))) continue;
-      try { mountDirectory(entry.name, false); }
+      try { mountDirectory(entry.name, undefined, false); }
       catch (error) { issues.push({ appDir: basename(appDir), reason: error instanceof Error ? error.message : String(error) }); }
     }
     stableDirectory(root, root, rootIdentity);
@@ -568,6 +708,7 @@ export function loadNexusAppHost(
       try {
         databases.set(slug, createAppDatabase([mounted.manifest], {
           ...(authOptions.databaseDirectory ? { directory: authOptions.databaseDirectory } : {}),
+          ...(authOptions.eventBus ? { eventBus: authOptions.eventBus } : {}),
           ...(authOptions.databaseBackup ? { backup: authOptions.databaseBackup } : {}),
         }));
       } catch (error) {

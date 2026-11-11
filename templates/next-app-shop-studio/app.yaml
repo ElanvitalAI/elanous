@@ -1,0 +1,90 @@
+apiVersion: elanous.app/v0
+slug: shop-studio
+title: 공방 쇼핑몰
+template: next-app-shop-studio
+
+frontend:
+  kind: static-export
+  out: out/
+
+design:
+  description: 공방 상품을 등록하고 상품 사진으로 광고 영상을 만든다
+  screens:
+    - { path: /, title: 상품 목록 }
+
+tables:
+  products:
+    columns:
+      id: { type: text, primary: true }
+      title: { type: text }
+      description: { type: text }
+      price_label: { type: text }
+      # listProducts returns the stored apps/shop-studio/... key; makeAd.image takes the prefix-relative key.
+      image_key: { type: object-ref }
+      created_at: { type: timestamp, default: now }
+    realtime: true
+
+roles:
+  owner: { via: nexus-session }
+  public: { via: public-read }
+
+rpc:
+  listProducts:
+    sql: SELECT id, title, description, price_label, image_key, created_at FROM products ORDER BY created_at DESC LIMIT :limit
+    params:
+      limit: { type: int, max: 200, default: 50 }
+    allow: [owner, public]
+  addProduct:
+    sql: INSERT INTO products (id, title, description, price_label, image_key) VALUES (:id, :title, :description, :price_label, :image_key)
+    params:
+      id: { type: text }
+      title: { type: text }
+      description: { type: text }
+      price_label: { type: text }
+      image_key: { type: object-ref }
+    allow: [owner]
+
+actions:
+  makeAd:
+    builtin: generate
+    async: true
+    input: { image: object-ref, text: text }
+    uses: [cred:higgsfield.key_id, cred:higgsfield.secret]
+    spend: owner-confirm
+
+storage:
+  prefix: apps/shop-studio/
+  quotaBytes: 104857600
+  upload:
+    allow: [owner]
+    types: [image/jpeg, image/png, image/webp]
+    maxBytes: 10485760
+
+credentials:
+  - cred:higgsfield.key_id
+  - cred:higgsfield.secret
+
+simulate:
+  seed: 1114
+  clock: { start: 2100-11-14T00:00:00Z, speed: 60 }
+  connectors:
+    makeAd: { fake: generate-job, profile: ok }
+    storage: { fake: object-store, profile: ok }
+  scenarios:
+    - name: 상품 등록과 공개 목록
+      steps:
+        - rpc: addProduct
+          as: owner
+          params:
+            id: demo-mug
+            title: 손으로 빚은 찻잔
+            description: 유약을 입혀 구운 도자기 찻잔
+            price_label: 28000원
+            image_key: apps/shop-studio/products/demo-mug.png
+        - rpc: listProducts
+          as: public
+          params: { limit: 50 }
+      expect:
+        - { event: rpc.addProduct.completed }
+        - { event: rpc.listProducts.completed }
+        - { table: products, rows: 1 }

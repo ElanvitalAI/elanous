@@ -16,7 +16,8 @@
     "scripts/release-loop/release-graph-fanout-mock.test.ts",
     "scripts/release-loop/gate-node-sim.test.ts",
     "scripts/release-loop/gate-bisect.test.ts",
-    "scripts/release-loop/gate-flow-sim.test.ts"
+    "scripts/release-loop/gate-flow-sim.test.ts",
+    "scripts/release-loop/gate-node.test.ts"
   ],
   "trigger": "Inject release node outcomes including concurrent warning and required branches.",
   "observe": [
@@ -24,7 +25,8 @@
     "fan-out join branch outcomes",
     "start-time overlap",
     "unexpected edge list",
-    "terminal status"
+    "terminal status",
+    "shard disposition and invocationId, timeout owner-cell persistence, macrophage decision event order"
   ],
   "expected": "warning failures remain visible but pass the join; required failures route to failed"
 }

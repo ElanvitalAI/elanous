@@ -12,7 +12,10 @@ import { buildNexusWsBridgeAuth, daemonThinStage1, DAEMON_THIN_STAY_ALLOWLIST, r
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { ProjectStore } from '../project/project-store.js';
 import { createSession } from '../session/index.js';
+import { createMemberStore } from './members/member-store.js';
+import { listAbsorbScraps } from '../intake-plane/items.js';
 import { handleCreateTab } from './api/tabs-mutations.js';
+import { startNexusHttpServer } from './api/http-server.js';
 import { createRegistryBackend } from './webterm/pty.js';
 import { createFakeStt } from '../ux-sim/fake-stt.js';
 import { fakeElevenLabsAudioBytes, startFakeElevenLabs } from '../ux-sim/fake-elevenlabs.js';
@@ -73,6 +76,94 @@ test('NEXUS boot starts a webterm tab in the associated conversation project fol
     resetElanousConfigDir();
     setTestStateRoot(null);
     if (previous === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('APP-MADE-WITH-BADGE deploy wiring forwards verified owner entitlements to the app host', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-app-deploy-badge-entitlement-'));
+  const previousPublicUserId = process.env.ELANOUS_PUBLIC_APP_USER_ID;
+  const previousGoogleRedirect = process.env.GOOGLE_OAUTH_REDIRECT_URI;
+  let nexus: Awaited<ReturnType<typeof runNexus>> | undefined;
+  let ownerServer: ReturnType<typeof Bun.serve> | undefined;
+  let httpOpts: import('./api/http-server.js').NexusHttpServerOpts | undefined;
+  try {
+    setElanousConfigDir(root);
+    setTestStateRoot(root);
+    process.env.ELANOUS_PUBLIC_APP_USER_ID = 'public-owner';
+    delete process.env.GOOGLE_OAUTH_REDIRECT_URI;
+    const owner = {
+      memberId: 'member-badge', userSlug: 'public-owner', plan: 'managed',
+      // Source: 내부 문서 `nexus-revenue-and-market` §2⑤ — managed plans remove free attribution.
+      entitlements: { 'nexus.app.attribution': 0 },
+    };
+    // Source: Bun.serve uses port 0 to bind an ephemeral local test endpoint.
+    ownerServer = Bun.serve({ port: 0, fetch: () => Response.json(owner) });
+    const appRoot = join(root, 'nexus', 'apps', 'lecture-scrap');
+    const outputRoot = join(appRoot, 'out');
+    nexus = await runNexus({
+      detachForTesting: true, skipHttpServer: false, skipRuntimeApi: true,
+      skipSupervisor: true, mcpEnabled: false, skipEnvMigration: true,
+      skipRestoreFromPending: true, registerDaemonTab: false, registerSettingsTab: false,
+      skipPushcutChannel: true, skipPwaChannel: true, skipTelegramChannel: true,
+      skipDiscordChannel: true, skipTerminalChannel: true, skipIntentPrediction: true,
+      cleanGhostTailscaleServeFn: async () => {},
+      appSiteDeploymentOperations: {
+        createFromTemplate: async ({ appSlug }) => {
+          mkdirSync(outputRoot, { recursive: true });
+          writeFileSync(join(appRoot, 'app.yaml'), `apiVersion: elanous.app/v0
+slug: ${appSlug}
+title: Public lecture notes
+frontend:
+  kind: static-export
+  out: out
+roles:
+  public: { via: public-read }
+`);
+          writeFileSync(join(outputRoot, 'index.html'), '<html><body><main>managed app</main></body></html>');
+          return { appRoot, appSlug };
+        },
+        build: async () => ({ appRoot: outputRoot, verifyText: 'managed-deploy-proof' }),
+        publish: async () => {},
+        // Source: app-site-deploy treats HTTP 200 with its marker as a successful publish verification.
+        verify: async ({ verifyText }) => ({ status: 200, body: verifyText }),
+      },
+      startNexusHttpServerFn: ((opts: import('./api/http-server.js').NexusHttpServerOpts) => {
+        httpOpts = opts;
+        return { port: ownerServer!.port, hostname: '127.0.0.1', url: ownerServer!.url, stop: () => {} };
+      }) as typeof import('./api/http-server.js').startNexusHttpServer,
+    });
+    if (!nexus || !httpOpts) throw new Error('Nexus deploy routes were not wired');
+    const deployRequest = () => new Request('http://nexus.invalid/v1/apps/lecture-scrap/deploy', {
+      method: 'POST', headers: {
+        authorization: 'Bearer aps_abcdefghijklmnopqrstuvwxyz123456', 'content-type': 'application/json',
+      }, body: JSON.stringify({ templateId: 'next-app-lecture-scrap' }),
+    });
+    let deployResponse: Response | undefined;
+    for (const route of httpOpts.appRoutes) {
+      deployResponse = await route(deployRequest()) ?? undefined;
+      if (deployResponse) break;
+    }
+    // Source: app-site-deploy returns HTTP 200 after the owner deployment verifies successfully.
+    expect(deployResponse?.status).toBe(200);
+    const hosted = await httpOpts.appHost.handle(new Request('http://lecture-scrap.app.localhost/', {
+      headers: { host: 'lecture-scrap.app.localhost' },
+    }));
+    // Source: the Nexus app host returns HTTP 200 for a mounted public-read HTML response.
+    expect(hosted?.status).toBe(200);
+    const html = await hosted!.text();
+    expect(html).toContain('<main>managed app</main>');
+    expect(html).not.toContain('made-with-badge');
+    expect(html).not.toContain('made with elanous');
+  } finally {
+    await nexus?.release();
+    ownerServer?.stop();
+    resetElanousConfigDir();
+    setTestStateRoot(null);
+    if (previousPublicUserId === undefined) delete process.env.ELANOUS_PUBLIC_APP_USER_ID;
+    else process.env.ELANOUS_PUBLIC_APP_USER_ID = previousPublicUserId;
+    if (previousGoogleRedirect === undefined) delete process.env.GOOGLE_OAUTH_REDIRECT_URI;
+    else process.env.GOOGLE_OAUTH_REDIRECT_URI = previousGoogleRedirect;
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -182,6 +273,63 @@ describe('Nexus startup bearer token', () => {
       expect(captured.wsBridge?.wsAuthVerifier?.verify({ kind: 'auth', token } as Parameters<NonNullable<NonNullable<typeof captured.wsBridge>['wsAuthVerifier']>['verify']>[0])).toEqual({ ok: true });
       expect(nexus.runtime.httpAuth).toBe('on');
     } finally { nexus.release(); }
+  });
+
+  test('runNexus routes the shared runtime event bus into authenticated app database writers', async () => {
+    const appDir = join(isolated, 'nexus', 'apps', 'runtime-notes');
+    mkdirSync(join(appDir, 'out'), { recursive: true });
+    writeFileSync(join(appDir, 'app.yaml'), `apiVersion: elanous.app/v0
+slug: runtime-notes
+title: Runtime notes
+frontend: { kind: static-export, out: out }
+roles:
+  owner: { via: share-link }
+tables:
+  notes:
+    columns:
+      id: { type: text, primary: true }
+      title: { type: text }
+rpc:
+  list:
+    sql: SELECT id, title FROM notes ORDER BY id
+    params: {}
+    allow: [owner]
+  add:
+    sql: INSERT INTO notes (id, title) VALUES (:id, :title)
+    params: { id: { type: text }, title: { type: text } }
+    allow: [owner]
+`);
+    writeFileSync(join(appDir, 'out', 'index.html'), '<main>runtime notes</main>');
+    const { nexus, captured } = await boot();
+    const appHost = captured.appHost;
+    if (!appHost) throw new Error('app host did not mount');
+    const seen: string[] = [];
+    const unsubscribe = nexus.eventBus.subscribe(event => seen.push(event.kind), ['app.row.']);
+    try {
+      expect(captured.eventBus).toBe(nexus.eventBus);
+      const invitation = appHost.issueInvitation('runtime-notes', 'sim-owner', undefined, 'owner');
+      const accepted = (await appHost.handle(new Request(
+        `http://nexus.invalid/__auth/accept?token=${encodeURIComponent(invitation.token)}`,
+        { headers: { host: 'runtime-notes.app.localhost' } },
+      )))!;
+      expect(accepted.status).toBe(303);
+      const cookie = accepted.headers.get('set-cookie')!.split(';', 1)[0]!;
+      const base = { host: 'runtime-notes.app.localhost', origin: 'http://runtime-notes.app.localhost', cookie, 'content-type': 'application/json' };
+      const list = await appHost.handle(new Request('http://nexus.invalid/__rpc/list', {
+        method: 'POST', headers: base, body: JSON.stringify({ params: {} }),
+      }));
+      expect(list?.status).toBe(200);
+      expect(seen).toEqual([]);
+      const insert = await appHost.handle(new Request('http://nexus.invalid/__rpc/add', {
+        method: 'POST', headers: base, body: JSON.stringify({ params: { id: '1', title: 'runtime write' } }),
+      }));
+      expect(insert?.status).toBe(200);
+      expect(seen).toEqual(['app.row.insert']);
+    } finally {
+      unsubscribe();
+      appHost.close();
+      nexus.release();
+    }
   });
 
   test('live Nexus dispatches manifest STT through the app route registry and closed secret boundary', async () => {
@@ -1105,6 +1253,78 @@ describe('runNexus · MCP handshake timeout wiring', () => {
       });
     } finally {
       await nexus.release();
+    }
+  }, 15_000);
+});
+
+describe('runNexus · scraps API wiring', () => {
+  let stateRoot: string;
+
+  beforeEach(() => {
+    stateRoot = mkdtempSync(join(tmpdir(), 'elanous-nexus-scraps-wire-'));
+    setTestStateRoot(stateRoot);
+  });
+
+  afterEach(() => {
+    setTestStateRoot(null);
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  test('passes test-universe storage through the real Nexus HTTP startup and scraps route', async () => {
+    let httpOpts: import('./api/http-server.js').NexusHttpServerOpts | undefined;
+    const previousRedirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI;
+    process.env.GOOGLE_OAUTH_REDIRECT_URI = 'https://example.test/v1/members/oauth/google/callback';
+    const memberDb = createMemberStore({ path: join(stateRoot, 'nexus', 'members', 'members.sqlite') });
+    const member = memberDb.register({ sub: 'nexus-scraps-startup-test', email: 'scraps-startup@example.test', emailVerified: true, name: 'Scraps Startup Test' }, {
+      consents: { privacy: 'v1', terms: 'v1' },
+    });
+    const session = memberDb.createSession(member.id);
+    memberDb.close();
+    const nexus = await runNexus({
+      detachForTesting: true,
+      skipHttpServer: false,
+      skipSupervisor: true,
+      skipRuntimeApi: true,
+      skipPushcutChannel: true,
+      skipPwaChannel: true,
+      skipTelegramChannel: true,
+      skipTerminalChannel: true,
+      skipDiscordChannel: true,
+      skipIntentPrediction: true,
+      skipEnvMigration: true,
+      skipRestoreFromPending: true,
+      registerDaemonTab: false,
+      registerSettingsTab: false,
+      startNexusHttpServerFn: ((opts: import('./api/http-server.js').NexusHttpServerOpts) => {
+        httpOpts = opts;
+        return startNexusHttpServer(opts);
+      }) as typeof import('./api/http-server.js').startNexusHttpServer,
+      httpStartPort: 48_000 + Math.floor(Math.random() * 2_000),
+    });
+    if (!nexus) throw new Error('runNexus returned undefined');
+
+    try {
+      expect(httpOpts?.scraps).toEqual({
+        instanceRoot: join(stateRoot, 'nexus'),
+        extractors: {},
+      });
+      if (!nexus.httpServer) throw new Error('Nexus HTTP server did not start');
+      const response = await fetch(`${nexus.httpServer.url}/v1/scraps`, {
+        method: 'POST',
+        headers: { cookie: `__Host-elanous_member_session=${encodeURIComponent(session.token)}`, 'content-type': 'application/json', 'idempotency-key': 'nexus-startup-scraps-001' },
+        body: JSON.stringify({ kind: 'text', source: 'tui', raw: { text: 'real startup test note' } }),
+      });
+      expect(response.status).toBe(201);
+      expect(await response.json()).toMatchObject({ memberId: member.id, status: 'absorbed' });
+      expect(listAbsorbScraps(join(stateRoot, 'nexus'), member.id)).toHaveLength(1);
+      const invalid = await fetch(`${nexus.httpServer.url}/v1/scraps`, {
+        headers: { cookie: '__Host-elanous_member_session=invalid-session' },
+      });
+      expect(invalid.status).toBe(401);
+    } finally {
+      await nexus.release();
+      if (previousRedirectUri === undefined) delete process.env.GOOGLE_OAUTH_REDIRECT_URI;
+      else process.env.GOOGLE_OAUTH_REDIRECT_URI = previousRedirectUri;
     }
   }, 15_000);
 });

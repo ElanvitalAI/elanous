@@ -105,7 +105,11 @@ export interface MemoryEntry {
 // ── Paths ────────────────────────────────────────────────────────────
 
 export function memoryRoot(): string {
-  const base = getAppliedGlobalTestRoot() ?? (process.env.XDG_DATA_HOME && process.env.XDG_DATA_HOME.trim()
+  // --test-state-dir is inherited by child TUI/daemon processes through
+  // ELANOUS_STATE_DIR; the in-process flag marker is not inherited.
+  const base = getAppliedGlobalTestRoot() ?? (process.env.ELANOUS_STATE_DIR && process.env.ELANOUS_STATE_DIR.trim()
+    ? process.env.ELANOUS_STATE_DIR
+    : process.env.XDG_DATA_HOME && process.env.XDG_DATA_HOME.trim()
     ? process.env.XDG_DATA_HOME
     : join(homedir(), '.local', 'share'));
   return join(base, 'elanous', 'memory');

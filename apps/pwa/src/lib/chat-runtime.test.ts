@@ -810,14 +810,32 @@ describe('runAcpForeignTurnObserver — CV-1 cross-surface mirror', () => {
       onPartialBlocks: (_id, blocks) => { latest = blocks; },
       onFinalize: (id) => { finalized.push(id); },
     });
-    emit(chunkUpdate('sess-signal', { sessionUpdate: 'elanous_turn_begin' }));
+    emit(chunkUpdate('sess-signal', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' }, _meta: { elanousTurn: { phase: 'begin' } } }));
     emit(chunkUpdate('sess-signal', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '초안' } }));
     await new Promise((r) => setTimeout(r, 50));
     expect(finalized).toEqual([]);
     emit(chunkUpdate('sess-signal', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' 최종' } }));
-    emit(chunkUpdate('sess-signal', { sessionUpdate: 'elanous_turn_end', text: '초안 최종', stopReason: 'end_turn' }));
+    emit(chunkUpdate('sess-signal', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' }, _meta: { elanousTurn: { phase: 'end', text: '초안 최종', stopReason: 'end_turn' } } }));
     expect(finalized).toEqual(['ph-signal']);
     expect(latest).toEqual([{ kind: 'text', text: '초안 최종' }]);
+    dispose();
+  });
+  it('accepts legacy raw boundaries and finalizes a failed metadata turn', () => {
+    const { acp, emit } = makeMockAcp();
+    const finalized: Array<{ id: string; stopReason: string }> = [];
+    const dispose = runAcpForeignTurnObserver(acp, 'sess-boundary-compat', {
+      onPlaceholder: () => `ph-${finalized.length}`,
+      onPartialBlocks: () => {},
+      onFinalize: (id, info) => { finalized.push({ id, stopReason: info.stopReason }); },
+    });
+    emit(chunkUpdate('sess-boundary-compat', { sessionUpdate: 'elanous_turn_begin' }));
+    emit(chunkUpdate('sess-boundary-compat', { sessionUpdate: 'elanous_turn_end', text: 'legacy', stopReason: 'end_turn' }));
+    emit(chunkUpdate('sess-boundary-compat', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' }, _meta: { elanousTurn: { phase: 'begin' } } }));
+    emit(chunkUpdate('sess-boundary-compat', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' }, _meta: { elanousTurn: { phase: 'end', stopReason: 'error' } } }));
+    expect(finalized).toEqual([
+      { id: 'ph-0', stopReason: 'end_turn' },
+      { id: 'ph-1', stopReason: 'error' },
+    ]);
     dispose();
   });
   it('uses server text on cancelled turns and resets an invalid final prose boundary', () => {

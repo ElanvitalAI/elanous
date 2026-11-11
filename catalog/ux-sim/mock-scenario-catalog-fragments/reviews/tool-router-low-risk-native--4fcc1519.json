@@ -1,0 +1,4 @@
+{
+  "deviceKey": "tool-router-low-risk-native",
+  "review": "> 📅 **2026-11-10 재검토 (TOOL-ROUTER · LOW-RISK NATIVE)** — tool-router-world의 같은 네 프롬프트에서 GetDashboardState·TerminalModalList·TerminalModalObserve·elanous_linear_issue가 native 기준 직접 노출되고 index 기준 직접 목록에서 빠진 뒤 ToolSearch select로 같은 schema를 되찾는지 확인한다. 정확도는 시뮬 선택 성공률이며 실제 LLM 토큰 측정값으로 해석하지 않는다."
+}

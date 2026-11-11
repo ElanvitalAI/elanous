@@ -1,0 +1,14 @@
+id: member-apps
+version: 1
+kind: app-slot-contract
+description: Read member-owned app slots and their declared screen/RPC inventory as graph input.
+source: { capability: store, collection: member-app-slots, ownerScoped: true }
+fields:
+  - { name: appId, type: string, required: true }
+  - { name: templateSlug, type: string, required: true }
+  - { name: screens, type: string[], required: true }
+  - { name: rpc, type: string[], required: true }
+constraints:
+  - app slots are resolved from the server-verified owner scope
+  - request or graph input cannot override memberId
+  - empty inventory yields no suggestions

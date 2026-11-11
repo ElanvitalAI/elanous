@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "instance": { "source": "harness", "runId": "harness-demo-1", "title": "Implement card", "observedAt": "2026-11-10T07:00:00.000Z", "state": "waiting" },
+  "nodes": [
+    { "id": "read", "label": "Read context", "model": "terra", "role": "implementer", "state": "done" },
+    { "id": "build", "label": "Build", "model": "terra", "role": "implementer", "state": "done" },
+    { "id": "review", "label": "Review", "role": "reviewer", "state": "waiting" }
+  ],
+  "edges": [
+    { "id": "read-build", "from": "read", "to": "build", "kind": "flow", "state": "taken" },
+    { "id": "build-review", "from": "build", "to": "review", "kind": "flow", "state": "taken" }
+  ],
+  "progress": { "completed": 2, "total": null, "activeNodeIds": ["review"] },
+  "logs": [
+    { "seq": 1, "nodeId": "read", "level": "info", "text": "맥락 읽음" },
+    { "seq": 2, "nodeId": "build", "level": "info", "text": "변경 작성" },
+    { "seq": 3, "nodeId": "review", "level": "warn", "text": "검토 대기" }
+  ],
+  "statusLine": "harness-demo-1 · 검토 대기",
+  "readState": "ok"
+}

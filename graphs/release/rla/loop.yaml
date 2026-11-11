@@ -1,0 +1,30 @@
+apiVersion: elanous.dev/loop/v1
+id: 'loop:rla@1'
+card:
+  title: Release Loop Agent
+  supervises: [release-loop]
+  role: primary
+  extensions: [elanous.dev/arg]
+triggers:
+  events: [gate.verdict, release.incident, run.failed]
+authority: [reroute, add-node, repair, hitl]
+policy:
+  scope: run
+  proposal: validate-before-apply
+  verificationFailure: rollback
+  approval: { resultType: input_required, requestState: required }
+  openProposal:
+    vocabularyNamespace: release.gate.failure
+    lowRiskKinds: [vocabulary]
+    highRiskKinds: [node, edge, condition, external-action]
+    candidateStore: instance
+    injectCandidateMemory: false
+    autoPromote: false
+    templatePromotion: [declaration, verification, mrtr-approval]
+knowledgePacks: [../release-edge-vocabulary.yaml, ../macrophage-subscriber.yaml]
+templateMemory: { graph: ../release-loop.yaml, ledger: graph-supervisors/actions.jsonl }
+prompt:
+  role: release-supervisor
+  instruction: Observe the failed gate; propose a bounded retry edge, validate it, verify the result, and roll back on failure.
+  llm: { role: supervisor-planner, optional: true }
+graph: ./supervisor.yaml

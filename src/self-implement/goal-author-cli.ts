@@ -2,7 +2,7 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { writeGoalDocumentAtomic } from './goal-document-write.js';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { parseAskProseTitle } from '../self-dev/launch-preflight.js';
 import { createGoalAuthorDecomposeSteps, readRecentStepCountsFailOpen, type RecentStepCountReader } from './goal-author-decompose.js';
 import { defaultGoalAuthorSelfResolve, parseGoalDocumentClarifications, seedGoalAuthorFromAnsweredClarification, seedGoalAuthorFromClarification, selfAnswerGoalDocumentClarifications } from './goal-author-clarification.js';

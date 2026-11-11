@@ -1,0 +1,27 @@
+{
+  "id": "hotspot-file-lease-world",
+  "name": "Hotspot file lease and planned-start forecast world",
+  "audience": "internal",
+  "checklistCells": ["HOTSPOT-FILE-LEASE"],
+  "implementation": [
+    "src/ux-sim/hotspot-file-lease-world.ts",
+    "src/cli/hotspot-start-forecast.ts",
+    "src/ux-sim/train-manager-world.ts"
+  ],
+  "tests": ["src/ux-sim/hotspot-file-lease-world.test.ts"],
+  "target": "Record planned hotspot overlap evidence through the production start-forecast writer and train-manager simulation, including unknown inventory and clean-start behavior.",
+  "inputs": [
+    "planned-start verdict",
+    "open PRs with file overlap evidence",
+    "unknown inventory or clean-start verdict"
+  ],
+  "observations": [
+    "one open-guard row is recorded per observed overlapping PR head",
+    "unknown inventory produces an unmeasured forecast row",
+    "clean start produces no forecast rows"
+  ],
+  "entryCommands": ["bun test src/ux-sim/hotspot-file-lease-world.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

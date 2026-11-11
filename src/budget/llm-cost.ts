@@ -9,7 +9,7 @@ import { findClaudeModel } from '../anthropic/models.js';
 import { findCodexModel } from '../codex/models.js';
 import { findGeminiModel } from '../gemini/models.js';
 import { findGrokModel } from '../grok/models.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import { getCatalog } from '../registry/loader.js';
 import { byokCostFor, type ByokActualCost, type ByokPartialCost } from '../llm/openrouter-byok-cost.js';

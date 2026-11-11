@@ -2617,7 +2617,10 @@ function wireAcpConnection(
               // receives partial chunks live. Cross-surface mirror is automatic via
               // `broadcast()` (line 568-593) — no per-peer routing logic needed.
               const sessionId = p.sessionId;
-              await broadcast(sessionId, { sessionUpdate: 'elanous_turn_begin' });
+              await broadcast(sessionId, {
+                sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' },
+                _meta: { elanousTurn: { phase: 'begin' } },
+              });
               const emitTextChunk = (delta: string): void => {
                 queueBroadcast({
                   sessionUpdate: 'agent_message_chunk',
@@ -2708,9 +2711,8 @@ function wireAcpConnection(
               });
               await pendingBroadcasts;
               await broadcast(sessionId, {
-                sessionUpdate: 'elanous_turn_end',
-                text: agentResult.markdown,
-                stopReason: agentResult.stopReason,
+                sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' },
+                _meta: { elanousTurn: { phase: 'end', text: agentResult.markdown, stopReason: agentResult.stopReason } },
               });
               // FU-2 webterm wire — flush partial sentence buffer once
               // the `:agent` turn settles (mirrors chat REST `turn-end`
@@ -2724,7 +2726,10 @@ function wireAcpConnection(
             } catch (e) {
               try {
                 await pendingBroadcasts;
-                await broadcast(p.sessionId, { sessionUpdate: 'elanous_turn_end', stopReason: 'error' });
+                await broadcast(p.sessionId, {
+                  sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' },
+                  _meta: { elanousTurn: { phase: 'end', stopReason: 'error' } },
+                });
               } catch { /* original turn error remains authoritative */ }
               result = {
                 ...result,

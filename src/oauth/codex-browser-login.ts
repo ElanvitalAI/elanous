@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL } from './codex.js';
 import { expiresAtFromSeconds, saveTokens, type ProviderAuthState } from './store.js';
+import type { CredentialHealthStatus } from '../nexus/config/secrets/cred-health.js';
 
 const AUTHORIZE_URL = 'https://auth.openai.com/oauth/authorize';
 const DEFAULT_PORT = 1455;
@@ -170,4 +171,19 @@ export async function loginWithCodexBrowser(opts: CodexBrowserLoginOpts = {}): P
     if (listening) server.close();
     server.off('error', onServerError);
   }
+}
+
+export type CodexBrowserLoginAssistResult =
+  | { kind: 'skipped'; healthStatus: CredentialHealthStatus }
+  | { kind: 'completed'; provider: 'openai-codex'; method: 'browser'; connected: true; expiresAt: number | null };
+
+/** Bridge an absent or expired credential to the established browser flow without returning tokens. */
+export async function assistCodexBrowserLogin(
+  healthStatus: CredentialHealthStatus,
+  opts: CodexBrowserLoginOpts = {},
+): Promise<CodexBrowserLoginAssistResult> {
+  if (healthStatus !== 'missing' && healthStatus !== 'expired') return { kind: 'skipped', healthStatus };
+  const state = await loginWithCodexBrowser(opts);
+  return { kind: 'completed', provider: 'openai-codex', method: 'browser', connected: true,
+    expiresAt: state.tokens.expiresAt };
 }

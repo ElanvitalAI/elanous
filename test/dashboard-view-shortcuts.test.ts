@@ -7,9 +7,7 @@ describe('matchDashboardViewShortcut', () => {
     expect(matchDashboardViewShortcut({ name: '4', ctrl: true, shift: false })).toBe('4');
   });
 
-  test('treats Ctrl+/ as a plain-terminal fallback for View 7', () => {
-    expect(matchDashboardViewShortcut({ name: '/', ctrl: true, shift: false })).toBe('7');
-  });
+
 
   test('ignores plain slash and shifted or alt variants', () => {
     expect(matchDashboardViewShortcut({ name: '/', ctrl: false, shift: false })).toBeNull();

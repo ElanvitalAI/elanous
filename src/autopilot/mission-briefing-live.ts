@@ -13,7 +13,7 @@ import { missionResources } from './mission-resources.js';
 import { prUrlFromNotes } from './mission-multiphase-executor.js';
 import { latestMissionRouteDecision } from './mission-route-decision.js';
 import { resolveRouteDecision } from '../llm/route-decision.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 /** 페이즈가 실집행/구현(deliverable 산출) 페이즈인가 — 조사·확인 마커면 read-only(산출물 기대 안 함). */
 function phaseIsImpl(notes: readonly string[]): boolean {

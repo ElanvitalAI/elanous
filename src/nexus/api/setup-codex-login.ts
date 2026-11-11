@@ -1,5 +1,7 @@
 import { debug } from '../../debug/log.js';
-import { loginWithCodexBrowser } from '../../oauth/codex-browser-login.js';
+import { assistCodexBrowserLogin } from '../../oauth/codex-browser-login.js';
+import { oauthCredentialHealthOptions } from '../setup-status.js';
+import type { CredentialHealthStatus } from '../config/secrets/cred-health.js';
 import {
   CODEX_DEVICE_LOGIN_URL,
   exchangeDeviceAuthCode,
@@ -14,6 +16,7 @@ type CodexLoginStatus =
   | { state: 'idle' }
   | { state: 'pending'; mode: Mode; authorizeUrl?: string; userCode?: string; verificationUrl?: string }
   | { state: 'ok'; mode: Mode }
+  | { state: 'skipped'; mode: Mode; healthStatus: CredentialHealthStatus }
   | { state: 'error'; mode: Mode; error: string };
 
 const TIMEOUT_MS = 5 * 60_000;
@@ -85,7 +88,11 @@ export function saveCodexProvider(): void {
 }
 
 const defaultDeps: LoginDeps = {
-  browser: (openBrowser) => loginWithCodexBrowser({ openBrowser, timeoutMs: TIMEOUT_MS }),
+  browser: async (openBrowser) => {
+    const status = oauthCredentialHealthOptions().find((row) => row.provider === 'openai-codex')?.healthStatus ?? 'missing';
+    const assisted = await assistCodexBrowserLogin(status, { openBrowser, timeoutMs: TIMEOUT_MS });
+    return assisted;
+  },
   device: deviceLogin,
   saveProvider: saveCodexProvider,
   observe: (event, mode) => { debug.log('setup.codex-login', event, { mode }); },
@@ -132,7 +139,12 @@ export function createCodexLoginHandlers(deps: LoginDeps = defaultDeps) {
     void (async () => {
       try {
         if (mode === 'browser') {
-          await deps.browser((url) => { ready({ authorizeUrl: url }); return true; });
+          const result = await deps.browser((url) => { ready({ authorizeUrl: url }); return true; });
+          if (result && typeof result === 'object' && 'kind' in result && result.kind === 'skipped' &&
+              'healthStatus' in result && typeof result.healthStatus === 'string') {
+            if (generation === attempt) status = { state: 'skipped', mode, healthStatus: result.healthStatus as CredentialHealthStatus };
+            return;
+          }
         } else {
           await deps.device((userCode, verificationUrl) => ready({ userCode, verificationUrl }));
         }

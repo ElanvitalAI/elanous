@@ -3,7 +3,7 @@ import { startHookReceiver } from '../hooks/receiver.js';
 import { HookQueue } from '../hooks/queue.js';
 import { closeIngressAndExposure, hookExposurePlan, hookExposureStatus, startPublicHookIngress, turnHookExposureOff, turnHookExposureOn, type HookExposureDeps } from '../hooks/expose.js';
 import { getSecretAsync, setSecretAsync } from '../nexus/config/secrets/index.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export function asanaEnabled(raw: unknown = getUserConfig().raw): boolean {
   const tox = (raw as { tox?: { external?: { asana?: { enabled?: unknown } } } } | undefined)?.tox;

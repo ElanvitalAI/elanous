@@ -4,9 +4,14 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { createDevProxyRuntimeRef } from '../../src/nexus/api/admin-dev-proxy.js';
+import { routeRequest, type NexusHttpServerOpts } from '../../src/nexus/api/http-server.js';
+import { NexusEventBus } from '../../src/nexus/api/event-bus.js';
 import { createGoogleSignin } from '../../src/nexus/members/google-signin.js';
 import { createMemberStore } from '../../src/nexus/members/member-store.js';
 import { createMembersApi } from '../../src/nexus/members/members-api.js';
+import { TabRegistry } from '../../src/nexus/state/tab-registry.js';
+import { createNexusState } from '../../src/nexus/state/state.js';
 import { createFakeGoogleOAuthWorld, FAKE_GOOGLE_ISSUER } from '../../src/ux-sim/fake-google-oauth.js';
 
 const count = Number(process.argv.find(arg => arg.startsWith('--count='))?.split('=')[1] ?? 300);
@@ -40,6 +45,21 @@ const google = createGoogleSignin({
   userinfoEndpoint: `${FAKE_GOOGLE_ISSUER}/userinfo`,
 });
 const api = createMembersApi({ store, google, successRedirectUri: 'https://app.example.test/signup/complete', now });
+const state = createNexusState({ nexusVersion: 'sim', phase: 'test' });
+const eventBus = new NexusEventBus();
+state.bus = eventBus;
+const routeOpts = { state, registry: new TabRegistry(state), eventBus, membersApi: api,
+  metaApi: { bearerToken: 'fake-member-burst-meta-token', noAuth: false } } as NexusHttpServerOpts;
+const routeIps = new WeakMap<Request, string>();
+const fakeServer = { requestIP: (request: Request) => {
+  const address = routeIps.get(request);
+  return address ? { address } : null;
+} } as never;
+const devProxyRef = createDevProxyRuntimeRef();
+async function throughNexus(request: Request, networkKey: string): Promise<Response> {
+  routeIps.set(request, networkKey);
+  return await routeRequest(request, routeOpts, fakeServer, null, devProxyRef) ?? new Response('Not Found', { status: 404 });
+}
 
 type Result = { start: number; callback?: number; profile?: number; startMs: number; googleMs?: number; callbackMs?: number; totalMs: number; error?: string };
 const elapsed = (from: number) => Math.round((performance.now() - from) * 100) / 100;
@@ -52,10 +72,10 @@ async function signup(index: number): Promise<Result> {
   const startedAt = performance.now();
   const networkKey = index < sharedCount ? '203.0.113.42' : `198.51.${Math.floor(index / 254)}.${index % 254 + 1}`;
   try {
-    const start = (await api.handle(new Request('https://api.example.test/v1/members', {
+    const start = await throughNexus(new Request('https://api.example.test/v1/members', {
       method: 'POST', headers: { origin: 'https://app.example.test', 'content-type': 'application/json' },
       body: JSON.stringify({ consents: { privacy: 'privacy-v1', terms: 'terms-v1' }, eventCode: 'KAIST-2026' }),
-    }), networkKey))!;
+    }), networkKey);
     const startMs = elapsed(startedAt);
     if (start.status !== 201) return { start: start.status, startMs, totalMs: elapsed(startedAt) };
     const { authorizationUrl } = await start.json() as { authorizationUrl: string };
@@ -65,15 +85,15 @@ async function signup(index: number): Promise<Result> {
     const googleMs = elapsed(googleAt);
     const callbackAt = performance.now();
     const stateCookie = start.headers.get('set-cookie')!.split(';', 1)[0]!;
-    const callback = (await api.handle(new Request(`${redirectUri}?code=${code}&state=${state}`, {
+    const callback = await throughNexus(new Request(`${redirectUri}?code=${code}&state=${state}`, {
       headers: { cookie: stateCookie },
-    })))!;
+    }), networkKey);
     const callbackMs = elapsed(callbackAt);
-    if (callback.status !== 303) return { start: start.status, callback: callback.status, startMs, googleMs, callbackMs, totalMs: elapsed(startedAt) };
+    if (callback.status !== 200) return { start: start.status, callback: callback.status, startMs, googleMs, callbackMs, totalMs: elapsed(startedAt) };
     const sessionCookie = callback.headers.get('set-cookie')!.split(';', 1)[0]!;
-    const profile = (await api.handle(new Request('https://api.example.test/v1/members', {
+    const profile = await throughNexus(new Request('https://api.example.test/v1/members', {
       headers: { cookie: sessionCookie },
-    })))!;
+    }), networkKey);
     const profileBody = profile.status === 200 ? await profile.json() as { member?: { email?: string } } : null;
     const error = profileBody?.member?.email === `burst-${index}@example.test`
       ? undefined : `attendee ${index} received a mismatched member profile`;
@@ -95,10 +115,10 @@ try {
     eventUses: rowCount('member_event_uses'),
   };
   db.close();
-  const successful = results.filter(result => result.start === 201 && result.callback === 303
+  const successful = results.filter(result => result.start === 201 && result.callback === 200
     && result.profile === 200 && !result.error).length;
   const summary = {
-    universe: 'local isolated SQLite + fake Google', count, sharedCount,
+    universe: 'Nexus routeRequest + isolated SQLite + fake Google', count, sharedCount,
     successful, successRate: successful / count, wallMs: elapsed(wallAt),
     p95Ms: {
       start: percentile(results.map(result => result.startMs), 0.95),

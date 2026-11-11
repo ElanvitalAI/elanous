@@ -8,6 +8,7 @@
 import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { gateGitSync, gateCommitObjectsExist } from './gate-git.js';
 import { dirname, join } from 'node:path';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
 import { CODE_FILE, TRACEABLE_RELEASE_JSON, type ClosureVerdict } from './gate-closure';
@@ -432,10 +433,13 @@ export function mergePartialFailures(plan: PartialPlan, measured: { failures: st
 /** Files changed between two commits — both sides of a rename (`--no-renames`), so moving a source file into a test or
  *  Markdown name still shows the source path that disappeared. */
 export function changedFilesBetween(repo: string, from: string, to: string): string[] {
+  const commits = [...new Set([from.toLowerCase(), to.toLowerCase()])];
+  if (gateCommitObjectsExist(repo, commits).size !== commits.length) {
+    throw new Error('git diff commit missing from local object store');
+  }
   // git-spawn-allow: read-only diff of two release commits.
-  const result = spawnSync('git', ['diff', '--name-only', '--no-renames', `${from}..${to}`], {
-    cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER,
-  });
+  const result = gateGitSync(['diff', '--name-only', '--no-renames', `${from}..${to}`], repo,
+    { encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
   if (result.status !== 0 || result.error) throw new Error(`git diff failed: ${(result.stderr || result.error || 'no output').toString().trim()}`);
   return result.stdout.split(/\r?\n/).filter(Boolean);
 }

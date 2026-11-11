@@ -12,13 +12,21 @@ export const FEATURE_MATURITY = {
     '/setup': { pwa: 'stable' },
     '/setup/done': { pwa: 'stable' },
     '/chat': { pwa: 'stable' },
+    '/board': { pwa: 'stable' },
+    '/share/received': { pwa: 'stable' },
     '/term': { pwa: 'stable' },
     '/live-run': { pwa: 'beta' },
+    '/live-run/adaptive': { pwa: 'beta' },
     '/settings': { pwa: 'beta' },
+    '/credentials': { pwa: 'system' },
+    '/credentials/register': { pwa: 'system' },
+    '/credentials/register/claim': { pwa: 'system' },
     '/editor': { pwa: 'stable' },
     '/vault': { pwa: 'beta' },
     '/apps': { pwa: 'beta' },
+    '/apps/report': { pwa: 'stable' },
     '/design-check': { pwa: 'tool' },
+    '/ops/release': { pwa: 'ops' },
   },
   // Canonical CLI command names only; aliases inherit their command's grade.
   cliRoot: {
@@ -41,10 +49,10 @@ export const FEATURE_MATURITY = {
     schedule: 'beta', guardian: 'beta', intake: 'beta', logs: 'stable', retro: 'beta', ad: 'beta', docs: 'beta', secret: 'beta',
     decisions: 'beta', directives: 'beta', claims: 'beta', lesson: 'beta', fleet: 'beta', ops: 'stable', outputs: 'beta', publish: 'beta', cred: 'beta',
     env: 'beta', 'agent-mission': 'beta', mission: 'beta', dev: 'beta', keys: 'beta', finance: 'beta',
-    config: 'stable', tasks: 'stable', brief: 'beta', notify: 'beta', away: 'beta', labels: 'beta', msg: 'beta', ask: 'stable', q: 'beta', 'shell-init': 'beta',
+    config: 'stable', tasks: 'stable', brief: 'beta', notify: 'beta', away: 'beta', labels: 'beta', msg: 'beta', ask: 'stable', do: 'beta', q: 'beta', 'shell-init': 'beta',
     onboarding: 'beta', login: 'stable', session: 'beta', chat: 'stable', repl: 'stable',
     agent: 'stable', registry: 'beta', tier: 'stable', local: 'beta', scheduler: 'beta',
-    attach: 'beta', wf: 'beta', nexus: 'stable', phone: 'beta', token: 'beta',
+    attach: 'beta', wf: 'beta', nexus: 'stable', phone: 'beta', token: 'beta', member: 'beta',
     acp: 'beta', voice: 'beta', sim: 'beta', tui: 'system',
     'run-detached': 'system', dogfood: 'system', run: 'system',
   },
@@ -153,4 +161,3 @@ export function visibleOn(route: string, surface: Surface, role: Role): boolean 
   if (route === '/settings') return true;
   return maturity === 'stable' || (role === 'contributor' && (maturity === 'beta' || maturity === 'tool'));
 }
-

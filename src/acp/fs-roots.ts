@@ -20,7 +20,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { fallbackObsidianVault } from '../obsidian/default-vault.js';
 
 export type FsRootKind = 'cwd' | 'obsidian';

@@ -1,10 +1,11 @@
 import { expect, test } from 'bun:test';
+import { Buffer } from 'node:buffer';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
-import { applyMachineWslBootstrap, applyMachineWslProfile, buildMachineWslResumeCommand, buildMachineWslStartupTaskArgs, buildWslDockerPrerequisiteScript, buildWslDockerRepositoryScript, setWslConfiguration } from './machine-wsl-setup.js';
+import { applyMachineWslBootstrap, applyMachineWslProfile, buildMachineWslResumeCommand, buildMachineWslStartupTaskArgs, buildMachineWslStartupTaskXml, buildWslDockerPrerequisiteScript, buildWslDockerRepositoryScript, currentMachineWslEntry, setWslConfiguration } from './machine-wsl-setup.js';
 import { buildMachineSetupPlan } from './machine-setup-plan.js';
 import { registerMachineApplyFromCaptureCommand } from './machine-apply-from-capture.js';
 
@@ -18,51 +19,258 @@ const hostProbe = (manufacturer = 'Contoso', product = 'Workstation') => (comman
 test('WSL bootstrap registers a startup resume before requesting distro installation', () => {
   const calls: string[][] = [];
   const events: string[] = [];
-  let scheduled = '';
-  const result = applyMachineWslBootstrap({ capture: 'C:\\Users\\User\\capture.json', profile: 'developer',
-    distribution: 'Ubuntu-24.04', user: 'user', resume: false,
-    deps: {
-      platform: 'win32', executable: 'C:\\Program Files\\Elanous\\bun.exe', entry: 'C:\\Program Files\\Elanous\\elanous.mjs',
-      env: { USERNAME: 'user' },
+  const taskDirectory = mkdtempSync(join(tmpdir(), 'machine-wsl-resume-create-'));
+  const taskPath = join(taskDirectory, 'resume.xml');
+  let taskWrapperPath = '';
+  try {
+    let scheduled = '';
+    const result = applyMachineWslBootstrap({ capture: 'C:\\Users\\User\\capture.json', profile: 'developer',
+      distribution: 'Ubuntu-24.04', user: 'user', resume: false,
+      deps: {
+        platform: 'win32', executable: 'C:\\Program Files\\Elanous\\bun.exe', entry: 'C:\\Program Files\\Elanous\\elanous.mjs',
+        env: { USERNAME: 'user', LOCALAPPDATA: 'C:\\Users\\user\\AppData\\Local' },
+        resumeTaskDefinitionPath: taskPath,
+        writeResumeTaskWrapper: (path, script) => { taskWrapperPath = path; writeFileSync(path, script, 'utf8'); },
+        run: (command, args) => {
+          calls.push([command, ...args]);
+          const probed = hostProbe()(command, args);
+          if (probed) { events.push('probe'); return probed; }
+          if (command === 'schtasks.exe') { scheduled = args.join(' '); events.push('schedule'); return { status: 0 }; }
+          events.push('install'); return { status: 0 };
+        },
+      } });
+    expect(result).toMatchObject({ status: 'resume-pending', distribution: 'Ubuntu-24.04', user: 'user' });
+    // Source: Three host probes, one schtasks registration, and one WSL install are attempted in this bootstrap path.
+    expect(result.attempted).toBe(5);
+    expect(scheduled).toContain('/XML');
+    expect(scheduled).not.toContain('/TR');
+    const taskXmlBytes = readFileSync(taskPath);
+    expect(taskXmlBytes.toString('hex')).toMatch(/^fffe/);
+    const taskXml = taskXmlBytes.toString('utf16le').replace(/^\uFEFF/, '');
+    const taskWrapper = readFileSync(taskWrapperPath, 'utf8');
+    expect(taskWrapper).toContain('Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force');
+    expect(taskXml).toContain('encoding="UTF-16"');
+    expect(taskXml).toContain('<Command>C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Command>');
+    expect(taskXml).toContain('<BootTrigger><Enabled>true</Enabled></BootTrigger>');
+    expect(taskXml).toContain(`<Arguments>-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ${taskWrapperPath}</Arguments>`);
+    const encodedResume = /FromBase64String\('([^']+)'\)/.exec(taskWrapper)?.[1];
+    expect(encodedResume).toBeDefined();
+    expect(JSON.parse(Buffer.from(encodedResume!, 'base64').toString('utf8'))).toEqual({
+      executable: 'C:\\Program Files\\Elanous\\bun.exe',
+      arguments: ['C:\\Program Files\\Elanous\\elanous.mjs', 'machine', 'apply', '--from',
+        'C:\\Users\\User\\capture.json', '--profile', 'developer', '--platform', 'wsl', '--distribution',
+        'Ubuntu-24.04', '--wsl-user', 'user', '--resume-trigger', 'onstart', '--resume', '--yes',
+        '--resume-task-wrapper', taskWrapperPath],
+    });
+    expect(taskXml).toContain('<LogonType>S4U</LogonType>');
+    expect(existsSync(taskPath)).toBe(true);
+    expect(calls.find(call => call[0] === 'schtasks.exe')).toEqual([
+      'schtasks.exe', '/Create', '/TN', 'ElanousMachineSetupResume', '/XML', taskPath, '/F',
+    ]);
+    expect(result.detail).toContain('Reboot resumes setup automatically; sign in to Codex once on Windows. WSL does not create or refresh Codex credentials.');
+    expect(events).toEqual(['probe', 'probe', 'probe', 'schedule', 'install']);
+    expect(calls.map(call => call[0])).toEqual(['systeminfo.exe', 'reg.exe', 'reg.exe', 'schtasks.exe', 'wsl.exe']);
+    expect(calls.at(-1)).toEqual(['wsl.exe', '--install', '--distribution', 'Ubuntu-24.04', '--no-launch']);
+  } finally {
+    rmSync(taskDirectory, { recursive: true, force: true });
+  }
+});
+
+test('WSL resume task keeps the Task Scheduler action short for a SYSTEM profile install path', () => {
+  const systemProfileRoot = 'C:\\Windows\\system32\\config\\systemprofile\\AppData\\Local\\Elanous';
+  const taskPath = `${systemProfileRoot}\\machine-setup-resume.xml`;
+  const executable = `${systemProfileRoot}\\runtime\\node.exe`;
+  const entry = `${systemProfileRoot}\\versions\\0.3.8\\node_modules\\elanous\\bin\\elanous.mjs`;
+  const capture = 'C:\\Windows\\Temp\\win1-machine-capture.json';
+  const legacyResumeCommand = buildMachineWslResumeCommand({ executable, entry, capture, profile: 'developer',
+    distribution: 'Ubuntu', user: 'elanous' });
+  // Source: Azure win-blank Run Command log 2026-11-10 records schtasks rejecting /TR values over 261 characters.
+  const taskSchedulerRunTextLimit = 261;
+  expect(legacyResumeCommand.length).toBeGreaterThan(taskSchedulerRunTextLimit);
+
+  const calls: string[][] = [];
+  let taskXml = '';
+  let taskWrapper = '';
+  let taskWrapperPath = '';
+  const result = applyMachineWslBootstrap({ capture, profile: 'developer', distribution: 'Ubuntu', user: 'elanous', resume: false,
+    deps: { platform: 'win32', executable, entry, env: { USERNAME: 'SYSTEM', WINDIR: 'C:\\Windows' },
+      resumeTaskDefinitionPath: taskPath,
+      writeResumeTaskWrapper: (path, script) => { taskWrapperPath = path; taskWrapper = script; },
+      writeResumeTaskDefinition: (_path, xml) => { taskXml = xml; },
       run: (command, args) => {
         calls.push([command, ...args]);
-        const probed = hostProbe()(command, args);
-        if (probed) { events.push('probe'); return probed; }
-        if (command === 'schtasks.exe') { scheduled = args.join(' '); events.push('schedule'); return { status: 0 }; }
-        events.push('install'); return { status: 0 };
-      },
-    } });
-  expect(result).toMatchObject({ status: 'resume-pending', distribution: 'Ubuntu-24.04', user: 'user' });
-  expect(result.attempted).toBe(5);
-  expect(scheduled).toContain('--resume');
-  expect(scheduled).toContain('--resume-trigger onstart');
-  expect(scheduled).toContain('/SC ONSTART');
-  expect(scheduled).toContain('/NP');
-  expect(result.detail).toContain('Reboot resumes setup automatically; sign in to Codex once on Windows. WSL does not create or refresh Codex credentials.');
-  expect(scheduled).toContain('capture.json');
-  expect(events).toEqual(['probe', 'probe', 'probe', 'schedule', 'install']);
-  expect(calls.map(call => call[0])).toEqual(['systeminfo.exe', 'reg.exe', 'reg.exe', 'schtasks.exe', 'wsl.exe']);
-  expect(calls.at(-1)).toEqual(['wsl.exe', '--install', '--distribution', 'Ubuntu-24.04', '--no-launch']);
+        return hostProbe()(command, args) ?? { status: 0 };
+      } } });
+
+  expect(result).toMatchObject({ status: 'resume-pending', distribution: 'Ubuntu', user: 'elanous' });
+  const taskArguments = /<Arguments>(.*?)<\/Arguments>/.exec(taskXml)?.[1]?.replaceAll('&quot;', '"');
+  expect(taskXml).toContain('<Command>C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Command>');
+  expect(taskArguments).toContain(`-File ${taskWrapperPath}`);
+  expect(taskArguments?.length).toBeLessThan(taskSchedulerRunTextLimit);
+  expect(taskArguments).not.toContain('--from');
+  const encodedResume = /FromBase64String\('([^']+)'\)/.exec(taskWrapper)?.[1];
+  expect(JSON.parse(Buffer.from(encodedResume!, 'base64').toString('utf8'))).toEqual({
+    executable,
+    arguments: [currentMachineWslEntry(entry), 'machine', 'apply', '--from', capture, '--profile', 'developer', '--platform', 'wsl',
+      '--distribution', 'Ubuntu', '--wsl-user', 'elanous', '--resume-trigger', 'onstart', '--resume', '--yes',
+      '--resume-task-wrapper', taskWrapperPath],
+  });
+  expect(calls.find(call => call[0] === 'schtasks.exe')).toContain('/XML');
+  expect(calls.find(call => call[0] === 'schtasks.exe')).not.toContain('/TR');
 });
 
 test('startup resume task supports ONSTART S4U and ONLOGON interactive fallback without storing a password', () => {
   const command = buildMachineWslResumeCommand({ executable: 'C:\\Program Files\\Elanous\\bun.exe',
     entry: 'C:\\Program Files\\Elanous\\current\\node_modules\\elanous\\bin\\elanous.mjs',
     capture: 'C:\\Users\\User\\capture.json', profile: 'developer', distribution: 'Ubuntu-24.04', user: 'user' });
-  expect(buildMachineWslStartupTaskArgs({ commandLine: command, windowsUser: 'user' })).toEqual([
-    '/Create', '/TN', 'ElanousMachineSetupResume', '/SC', 'ONSTART', '/RU', 'user', '/NP', '/RL', 'HIGHEST', '/TR', command, '/F',
+  expect(command).toContain('current\\node_modules\\elanous\\bin\\elanous.mjs');
+  expect(buildMachineWslStartupTaskArgs({ taskXmlPath: 'C:\\Users\\User\\resume.xml', windowsUser: 'user' })).toEqual([
+    '/Create', '/TN', 'ElanousMachineSetupResume', '/XML', 'C:\\Users\\User\\resume.xml', '/F',
   ]);
-  expect(buildMachineWslStartupTaskArgs({ commandLine: command, windowsUser: 'user', trigger: 'onlogon' })).toEqual([
-    '/Create', '/TN', 'ElanousMachineSetupResume', '/SC', 'ONLOGON', '/RU', 'user', '/IT', '/RL', 'HIGHEST', '/TR', command, '/F',
-  ]);
+});
+
+test('startup task XML keeps its action separate from schtasks arguments and never embeds credentials', () => {
+  const resumeArguments = '"C:\\Program Files\\Elanous\\current\\elanous.mjs" machine apply --from "C:\\Users\\User\\capture.json" --profile developer --platform wsl --distribution Ubuntu-24.04 --wsl-user user --resume-trigger onlogon --resume --yes';
+  const xml = buildMachineWslStartupTaskXml({ executable: 'C:\\Program Files\\Elanous\\bun.exe',
+    arguments: resumeArguments,
+    windowsUser: 'ACME&tester', trigger: 'onlogon' });
+  expect(xml).toContain('<LogonTrigger><Enabled>true</Enabled><UserId>ACME&amp;tester</UserId></LogonTrigger>');
+  expect(xml).toContain('<LogonType>InteractiveToken</LogonType>');
+  expect(xml).toContain('<Command>C:\\Program Files\\Elanous\\bun.exe</Command>');
+  expect(xml).toContain(`<Arguments>${resumeArguments.replace(/&/g, '&amp;').replace(/"/g, '&quot;')}</Arguments>`);
+  expect(xml).not.toContain('<Password>');
+  expect(buildMachineWslStartupTaskArgs({ taskXmlPath: 'C:\\Users\\tester\\AppData\\Local\\Elanous\\resume.xml', windowsUser: 'tester' }))
+    .toEqual(['/Create', '/TN', 'ElanousMachineSetupResume', '/XML', 'C:\\Users\\tester\\AppData\\Local\\Elanous\\resume.xml', '/F']);
+});
+
+test('startup task XML write failure is returned as a structured register-resume failure', () => {
+  const taskDirectory = mkdtempSync(join(tmpdir(), 'machine-wsl-write-failure-'));
+  const taskPath = join(taskDirectory, 'resume.xml');
+  const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'developer', distribution: 'Ubuntu',
+    user: 'elanous', resume: false, deps: { platform: 'win32', env: { USERNAME: 'user' },
+      resumeTaskDefinitionPath: taskPath,
+      writeResumeTaskDefinition: path => { writeFileSync(path, '<partial'); throw Object.assign(new Error('denied'), { code: 'EACCES' }); },
+      run: (command, args) => hostProbe()(command, args) ?? { status: 0 } } });
+  expect(result).toMatchObject({ status: 'failed', detail: 'register-resume' });
+  expect(result.failures[0]?.reason).toBe('command unavailable (EACCES)');
+  expect(existsSync(taskPath)).toBe(false);
+  rmSync(taskDirectory, { recursive: true, force: true });
+});
+
+test('failed resume-task replacement preserves the wrapper used by an already registered task', () => {
+  // Source: The simulation stores the initial registration before the failed replacement attempt.
+  const initialRegistrationIndex = 0;
+  // Source: The simulation stores the failed replacement after the initial registration.
+  const failedReplacementIndex = 1;
+  const taskDirectory = mkdtempSync(join(tmpdir(), 'machine-wsl-preserve-resume-'));
+  const taskPath = join(taskDirectory, 'resume.xml');
+  const wrapperPaths: string[] = [];
+  const successfulCommand = hostProbe()('systeminfo.exe', [])!;
+  let failRegistration = false;
+  const deps = {
+    platform: 'win32',
+    executable: 'C:\\Elanous\\node.exe',
+    entry: 'C:\\Elanous\\elanous.mjs',
+    env: { USERNAME: 'tester', WINDIR: 'C:\\Windows' },
+    resumeTaskDefinitionPath: taskPath,
+    writeResumeTaskWrapper: (path: string, script: string) => { wrapperPaths.push(path); writeFileSync(path, script, 'utf8'); },
+    run: (command: string, args: readonly string[]) => {
+      const probe = hostProbe()(command, args);
+      if (probe) return probe;
+      if (command === 'schtasks.exe' && failRegistration) return { status: null, errorCode: 'ACCESS_DENIED' };
+      return successfulCommand;
+    },
+  };
+  try {
+    const first = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'developer', distribution: 'Ubuntu',
+      user: 'elanous', resume: false, deps });
+    expect(first).toMatchObject({ status: 'resume-pending' });
+    const priorWrapper = wrapperPaths[initialRegistrationIndex]!;
+    const priorContents = readFileSync(priorWrapper, 'utf8');
+
+    failRegistration = true;
+    const second = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'developer', distribution: 'Ubuntu',
+      user: 'elanous', resume: false, deps });
+
+    expect(second).toMatchObject({ status: 'failed', detail: 'register-resume' });
+    expect(wrapperPaths[failedReplacementIndex]).not.toBe(priorWrapper);
+    expect(existsSync(priorWrapper)).toBe(true);
+    expect(readFileSync(priorWrapper, 'utf8')).toBe(priorContents);
+    expect(existsSync(wrapperPaths[failedReplacementIndex]!)).toBe(false);
+  } finally {
+    rmSync(taskDirectory, { recursive: true, force: true });
+  }
 });
 
 test('ONLOGON resume reports that signing in after reboot resumes setup', () => {
   const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'default', distribution: 'Ubuntu',
     user: 'elanous', resume: false, resumeTrigger: 'onlogon', deps: { platform: 'win32', env: { USERNAME: 'user' },
+      scheduleResume: () => ({ status: 0 }),
       run: (command, args) => hostProbe()(command, args) ?? { status: 0 } } });
   expect(result).toMatchObject({ status: 'resume-pending', resumeTrigger: 'onlogon' });
   expect(result.detail).toContain('After reboot, Windows sign-in resumes setup automatically; complete Codex identity login on Windows.');
+});
+
+test('missing distro resume writes ONLOGON XML through the default registration path', () => {
+  const taskDirectory = mkdtempSync(join(tmpdir(), 'machine-wsl-logon-resume-'));
+  const taskPath = join(taskDirectory, 'resume.xml');
+  try {
+    const calls: string[][] = [];
+    const result = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'developer', distribution: 'Ubuntu',
+      user: 'elanous', resume: true, deps: { platform: 'win32', env: { USERNAME: 'tester', LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local' },
+        executable: 'C:\\Elanous\\bun.exe', entry: 'C:\\Elanous\\elanous.mjs',
+        resumeTaskDefinitionPath: taskPath,
+        run: (command, args) => {
+          calls.push([command, ...args]);
+          if (command === 'wsl.exe' && args[0] === '--list') return { status: 0, stdout: 'NAME STATE VERSION\n' };
+          return { status: 0 };
+        } } });
+    expect(result).toMatchObject({ status: 'resume-pending', resumeTrigger: 'onlogon' });
+    const taskXmlBytes = readFileSync(taskPath);
+    expect(taskXmlBytes.toString('hex')).toMatch(/^fffe/);
+    const taskXml = taskXmlBytes.toString('utf16le').replace(/^\uFEFF/, '');
+    const taskWrapperPath = /-File ([^<]+\.ps1)<\/Arguments>/.exec(taskXml)?.[1];
+    expect(taskWrapperPath).toBeDefined();
+    expect(readFileSync(taskWrapperPath!, 'utf8')).toContain('ConvertFrom-Json');
+    expect(taskXml).toContain('encoding="UTF-16"');
+    expect(taskXml).toContain('<LogonTrigger><Enabled>true</Enabled><UserId>tester</UserId></LogonTrigger>');
+    expect(taskXml).toContain('<LogonType>InteractiveToken</LogonType>');
+    expect(taskXml).toContain('<Command>C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Command>');
+    expect(taskXml).toContain(`<Arguments>-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ${taskWrapperPath}</Arguments>`);
+    expect(calls.find(call => call[0] === 'schtasks.exe')).toEqual([
+      'schtasks.exe', '/Create', '/TN', 'ElanousMachineSetupResume', '/XML', taskPath, '/F',
+    ]);
+  } finally {
+    rmSync(taskDirectory, { recursive: true, force: true });
+  }
+});
+
+test('registration failure reports task XML cleanup failure for both bootstrap entry paths', () => {
+  const taskDirectory = mkdtempSync(join(tmpdir(), 'machine-wsl-cleanup-failure-'));
+  try {
+    const taskPath = join(taskDirectory, 'resume.xml');
+    mkdirSync(taskPath);
+    // Source: Task Scheduler returns Win32 ERROR_ACCESS_DENIED for a denied registration.
+    // Source: Win32 ERROR_ACCESS_DENIED is error code 5.
+    const accessDeniedStatus = 5;
+    const run = (command: string, args: readonly string[]) => hostProbe()(command, args)
+      ?? (command === 'wsl.exe' && args[0] === '--list' ? { status: 0, stdout: 'NAME STATE VERSION\n' }
+        : command === 'schtasks.exe' ? { status: accessDeniedStatus } : { status: 0 });
+    const baseDeps = { platform: 'win32' as const, env: { USERNAME: 'tester' }, entry: 'C:\\Elanous\\elanous.mjs',
+      resumeTaskDefinitionPath: taskPath, writeResumeTaskDefinition: () => {}, run };
+    const initial = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'developer', distribution: 'Ubuntu',
+      user: 'elanous', resume: false, deps: { ...baseDeps, allowCloudVm: true } });
+    const resumed = applyMachineWslBootstrap({ capture: 'capture.json', profile: 'developer', distribution: 'Ubuntu',
+      user: 'elanous', resume: true, deps: baseDeps });
+    for (const result of [initial, resumed]) {
+      expect(result).toMatchObject({ status: 'failed', detail: 'register-resume' });
+      const cleanupFailure = result.failures.find(failure => failure.operation === 'remove-resume-task-definition');
+      expect(cleanupFailure?.target).toBe(taskPath);
+      expect(cleanupFailure?.reason).toMatch(/^file cleanup failed \(.*EISDIR\)$/);
+    }
+  } finally {
+    rmSync(taskDirectory, { recursive: true, force: true });
+  }
 });
 
 test('MACHINE-WSL-ZERO-TOUCH simulation resumes through fake schtasks and WSL without a guest password', () => {
@@ -92,19 +300,24 @@ test('MACHINE-WSL-ZERO-TOUCH simulation resumes through fake schtasks and WSL wi
     if (args.includes('--user') && args[args.indexOf('--user') + 1] === 'elanous' && line.includes('install.sh')) { events.push('elanous-installed'); return { status: 0 }; }
     return { status: 0 };
   };
-  const scheduleResume = (commandLine: string) => run('schtasks.exe', buildMachineWslStartupTaskArgs({ commandLine, windowsUser: 'user' }));
+  const scheduleResume = (_commandLine: string) => run('schtasks.exe', buildMachineWslStartupTaskArgs({ taskXmlPath: 'C:\\Users\\User\\resume.xml', windowsUser: 'user' }));
   const first = applyMachineWslBootstrap({ capture: 'C:\\Users\\User\\capture.json', profile: 'developer', distribution: 'Ubuntu',
     user: 'elanous', resume: false, deps: { platform: 'win32', env: { USERNAME: 'user' }, executable: 'C:\\Elanous\\bun.exe',
       entry: 'C:\\Elanous\\current\\node_modules\\elanous\\bin\\elanous.mjs', run, scheduleResume } });
   events.push('reboot-consented');
   const resumed = applyMachineWslBootstrap({ capture: 'C:\\Users\\User\\capture.json', profile: 'developer', distribution: 'Ubuntu',
     user: 'elanous', resume: true, deps: { platform: 'win32', env: { USERNAME: 'user' }, run } });
+  const taskDirectory = mkdtempSync(join(tmpdir(), 'machine-wsl-resume-remove-'));
+  const taskPath = join(taskDirectory, 'resume.xml');
+  writeFileSync(taskPath, '<Task/>');
   const profile = applyMachineWslProfile({ plan: buildMachineSetupPlan({ profile: 'developer', platform: 'wsl' }),
-    distribution: 'Ubuntu', user: 'elanous', run });
+    distribution: 'Ubuntu', user: 'elanous', run, resumeTaskDefinitionPath: taskPath });
 
   expect(first.status).toBe('resume-pending');
   expect(resumed.status).toBe('complete');
   expect(profile.failures).toEqual([]);
+  expect(existsSync(taskPath)).toBe(false);
+  rmSync(taskDirectory, { recursive: true, force: true });
   expect(taskRegistered).toBe(false);
   expect(calls.some(call => call.command === 'reg.exe' && call.args.some(arg => arg.includes('RunOnce')))).toBe(false);
   expect(calls.some(call => call.command === 'wsl.exe' && call.args.some(arg => arg.includes('/usr/bin/passwd')))).toBe(false);
@@ -410,6 +623,32 @@ test('WSL profile apply runs apt commands inside the selected distro and aggrega
   expect(result.manual).not.toContain('wsl-eln-version-check');
 });
 
+test('successful WSL resume removes the task XML and its exact wrapper path', () => {
+  const taskDirectory = mkdtempSync(join(tmpdir(), 'machine-wsl-resume-cleanup-'));
+  const taskDefinitionPath = join(taskDirectory, 'machine-setup-resume.xml');
+  const resumeTaskWrapperPath = join(taskDirectory, 'machine-setup-resume-abcdef.ps1');
+  writeFileSync(taskDefinitionPath, 'task xml');
+  writeFileSync(resumeTaskWrapperPath, 'resume wrapper');
+  const successfulCommand = hostProbe()('systeminfo.exe', [])!;
+  try {
+    const result = applyMachineWslProfile({
+      plan: buildMachineSetupPlan({ profile: 'default', platform: 'wsl' }),
+      distribution: 'Ubuntu',
+      user: 'elanous',
+      resumeTaskDefinitionPath: taskDefinitionPath,
+      resumeTaskWrapperPath,
+      run: (command, args) => command === 'schtasks.exe' && args[0] === '/Query'
+        ? { status: null, errorCode: 'TASK_NOT_FOUND', stdout: 'task not found' }
+        : successfulCommand,
+    });
+    expect(result.applied).toBe(true);
+    expect(existsSync(taskDefinitionPath)).toBe(false);
+    expect(existsSync(resumeTaskWrapperPath)).toBe(false);
+  } finally {
+    rmSync(taskDirectory, { recursive: true, force: true });
+  }
+});
+
 test('Docker CE scripts execute in a blank fake guest and fetch its key only after curl is installed', () => {
   const root = mkdtempSync(join(tmpdir(), 'machine-wsl-curl-bootstrap-'));
   const bin = join(root, 'bin');
@@ -513,6 +752,8 @@ test('WSL developer engine simulation installs Docker CE and k3d through fake WS
 });
 
 test('WSL developer engine simulation reuses a healthy Docker Desktop integration without replacing it', () => {
+  // Source: #36297 src/cli/machine-wsl-setup.ts treats command status zero as success.
+  const success = 0;
   const calls: { command: string; args: readonly string[] }[] = [];
   const result = applyMachineWslProfile({ plan: buildMachineSetupPlan({ profile: 'developer', platform: 'wsl' }),
     distribution: 'Ubuntu', user: 'elanous', run: (command, args) => {
@@ -544,6 +785,86 @@ test('WSL developer engine simulation preserves an unreachable existing Docker s
   expect(result).toMatchObject({ applied: false, failures: [{ operation: 'wsl-docker-engine-probe' }] });
   expect(calls.some(call => call.args.join(' ').includes('download.docker.com/linux/'))).toBe(false);
   expect(calls.some(call => call.args.join(' ').includes('apt-get install'))).toBe(false);
+});
+
+test('WSL developer engine simulation repairs missing docker-group access for an active Linux Docker service', () => {
+  // Source: #36297 src/cli/machine-wsl-setup.ts treats command status zero as success.
+  const success = 0;
+  // Source: #36297 src/cli/machine-wsl-setup.ts uses status 45 for an existing but unreachable Docker engine.
+  const unreachable = 45;
+  // Source: #36297 src/cli/machine-wsl-setup.ts treats schtasks query status 1 as an absent optional task.
+  const taskMissing = 1;
+  const calls: { command: string; args: readonly string[] }[] = [];
+  let membershipRepaired = false;
+  let wslRestarted = false;
+  let reProbeObserved = false;
+  const result = applyMachineWslProfile({ plan: buildMachineSetupPlan({ profile: 'developer', platform: 'wsl' }),
+    distribution: 'Ubuntu', user: 'elanous', run: (command, args) => {
+      calls.push({ command, args });
+      const joined = args.join(' ');
+      if (joined.includes('docker info')) {
+        if (membershipRepaired && wslRestarted) reProbeObserved = true;
+        return { status: membershipRepaired && wslRestarted ? success : unreachable };
+      }
+      if (joined.includes('docker-context-local-socket')) return { status: success, stdout: 'docker-context-local-socket' };
+      if (joined.includes('linux-docker-group-missing')) return { status: success, stdout: 'linux-docker-group-missing' };
+      if (joined.includes('/usr/sbin/usermod')) { membershipRepaired = true; return { status: success }; }
+      if (command === 'wsl.exe' && args[0] === '--terminate') { wslRestarted = true; return { status: success }; }
+      if (command === 'schtasks.exe' && args[0] === '/Query') return { status: taskMissing, stdout: 'ERROR: cannot find task' };
+      return { status: success };
+    } });
+
+  expect(result).toMatchObject({ applied: true, failures: [] });
+  const indexOf = (text: string) => calls.findIndex(call => call.args.join(' ').includes(text));
+  // Source: #36297 Array.findIndex uses -1 for missing and nonnegative positions for found entries.
+  expect(indexOf('linux-docker-group-missing')).toBeGreaterThanOrEqual(0);
+  expect(indexOf('/usr/sbin/usermod --append --groups docker elanous')).toBeLessThan(indexOf('--terminate Ubuntu'));
+  expect(reProbeObserved).toBe(true);
+});
+
+test('WSL developer engine simulation preserves a remote Docker context when a local service also exists', () => {
+  // Source: #36297 src/cli/machine-wsl-setup.ts treats command status zero as success.
+  const success = 0;
+  // Source: #36297 src/cli/machine-wsl-setup.ts uses status 45 for an existing but unreachable Docker engine.
+  const unreachable = 45;
+  const calls: { command: string; args: readonly string[] }[] = [];
+  const result = applyMachineWslProfile({ plan: buildMachineSetupPlan({ profile: 'developer', platform: 'wsl' }),
+    distribution: 'Ubuntu', user: 'elanous', run: (command, args) => {
+      calls.push({ command, args });
+      const joined = args.join(' ');
+      if (joined.includes('docker info')) return { status: unreachable };
+      if (joined.includes('docker-context-local-socket')) return { status: success, stdout: '' };
+      if (command === 'schtasks.exe' && args[0] === '/Query') return { status: success, stdout: '' };
+      return { status: success };
+    } });
+
+  expect(result).toMatchObject({ applied: false, failures: [{ operation: 'wsl-docker-engine-probe' }] });
+  expect(calls.some(call => call.args.join(' ').includes('/usr/sbin/usermod --append --groups docker'))).toBe(false);
+  expect(calls.some(call => call.args.join(' ').includes('--terminate Ubuntu'))).toBe(false);
+});
+
+test('WSL developer engine simulation stops when Docker stays unreachable after a group repair', () => {
+  // Source: #36297 src/cli/machine-wsl-setup.ts treats command status zero as success.
+  const success = 0;
+  // Source: #36297 src/cli/machine-wsl-setup.ts uses status 45 for an existing but unreachable Docker engine.
+  const unreachable = 45;
+  // Source: #36297 src/cli/machine-wsl-setup.ts treats schtasks query status 1 as an absent optional task.
+  const taskMissing = 1;
+  const calls: { command: string; args: readonly string[] }[] = [];
+  const result = applyMachineWslProfile({ plan: buildMachineSetupPlan({ profile: 'developer', platform: 'wsl' }),
+    distribution: 'Ubuntu', user: 'elanous', run: (command, args) => {
+      calls.push({ command, args });
+      const joined = args.join(' ');
+      if (joined.includes('docker info')) return { status: unreachable };
+      if (joined.includes('docker-context-local-socket')) return { status: success, stdout: 'docker-context-local-socket' };
+      if (joined.includes('linux-docker-group-missing')) return { status: success, stdout: 'linux-docker-group-missing' };
+      if (command === 'schtasks.exe' && args[0] === '/Query') return { status: taskMissing, stdout: 'ERROR: cannot find task' };
+      return { status: success };
+    } });
+
+  expect(result).toMatchObject({ applied: false, failures: [{ operation: 'wsl-docker-engine-probe' }] });
+  expect(calls.some(call => call.args.join(' ').includes('--terminate Ubuntu'))).toBe(true);
+  expect(calls.some(call => call.args.join(' ').includes('raw.githubusercontent.com/k3d-io/k3d/main/install.sh'))).toBe(false);
 });
 
 test('WSL profile apply stops when the release download fails even if a prior guest eln remains available', () => {
@@ -651,7 +972,9 @@ test('WSL eln verification checks the login-shell file identity and version unde
 test('machine apply shows the selected distro before approval and prints manual steps after resume', async () => {
   const root = mkdtempSync(join(tmpdir(), 'machine-wsl-cli-'));
   const capture = join(root, 'capture.json');
-  writeFileSync(capture, JSON.stringify({ kind: 'machine-capture', schemaVersion: 1, platform: 'darwin', packages: {
+  writeFileSync(capture, JSON.stringify({ kind: 'machine-capture',
+    // Source: src/cli/machine-capture.ts declares the current capture schemaVersion as a literal.
+    schemaVersion: 1, platform: 'darwin', packages: {
     tapsStatus: 'captured', taps: [], formulaeStatus: 'captured', formulae: [], casksStatus: 'captured', casks: [],
   } }));
   const output: string[] = [];
@@ -709,6 +1032,48 @@ test('machine apply shows the selected distro before approval and prints manual 
     expect(output.join('\n')).toContain('tailscale-login');
     expect(output.join('\n')).toContain('wsl-terminal-fonts');
     expect(calls.some(args => args.join(' ').includes('apt-get'))).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('manual machine resume discovers and removes the scheduled wrapper from task XML', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'machine-wsl-wrapper-resume-cli-'));
+  const capture = join(root, 'capture.json');
+  const taskDefinitionPath = join(root, 'machine-setup-resume.xml');
+  const resumeTaskWrapperPath = join(root, 'machine-setup-resume-abcdef.ps1');
+  writeFileSync(capture, JSON.stringify({ kind: 'machine-capture', schemaVersion: 1, platform: 'darwin', packages: {
+    tapsStatus: 'captured', taps: [], formulaeStatus: 'captured', formulae: [], casksStatus: 'captured', casks: [],
+  } }));
+  const taskXml = buildMachineWslStartupTaskXml({ executable: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+    arguments: `-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${resumeTaskWrapperPath}"`,
+    windowsUser: 'user', trigger: 'onstart' });
+  writeFileSync(taskDefinitionPath, Buffer.from(`\uFEFF${taskXml}`, 'utf16le'));
+  writeFileSync(resumeTaskWrapperPath, 'resume wrapper');
+  const output: string[] = [];
+  const successfulCommand = hostProbe()('systeminfo.exe', [])!;
+  const program = new Command();
+  registerMachineApplyFromCaptureCommand(program.command('apply'), {
+    platform: () => 'wsl',
+    wsl: {
+      platform: 'win32',
+      resumeTaskDefinitionPath: taskDefinitionPath,
+      run: (command, args) => {
+        if (command === 'wsl.exe' && args[0] === '--list') return { ...successfulCommand, stdout: 'NAME STATE VERSION\n* Ubuntu Stopped 2\n' };
+        if (args.includes('/usr/bin/id')) return { ...successfulCommand, stdout: '1000\n' };
+        if (args.includes('/bin/sh') && args.join(' ').includes('/etc/wsl.conf')) return { ...successfulCommand, stdout: '__ELANOUS_WSL_CONF_MISSING__' };
+        if (args.includes('/usr/bin/systemctl')) return { ...successfulCommand, stdout: 'running\n' };
+        if (command === 'schtasks.exe' && args[0] === '/Query') return { status: null, stdout: 'ERROR: cannot find task' };
+        return successfulCommand;
+      },
+    },
+    out: { log: value => output.push(value) },
+  });
+  try {
+    await program.parseAsync(['node', 'eln', 'apply', '--from', capture, '--platform', 'wsl', '--resume', '--yes']);
+    expect(output.join('\n')).toContain('machine apply · WSL complete');
+    expect(existsSync(taskDefinitionPath)).toBe(false);
+    expect(existsSync(resumeTaskWrapperPath)).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -27,7 +27,7 @@ import { McpServerError,
   type McpConnectionFailureReason,
 } from '../mcp/client.js';
 import { loadStoredAccessToken } from '../mcp/mcp-oauth.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { McpServerSpec } from '../user-config/types.js';
 
 export interface McpDiagnoseOpts {

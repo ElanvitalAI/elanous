@@ -1,4 +1,5 @@
 import type { Command } from 'commander';
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { getUserConfig, reloadUserConfig } from '../user-config.js';
 import { handleOnboardingRefusal, needsOnboarding, runOnboarding } from '../onboarding.js';
@@ -16,6 +17,12 @@ import { inspectActiveProvider, oneLineProvider } from '../provider-summary.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { debug } from '../debug/log.js';
 import * as ui from '../ui.js';
+import { isPotentiallyDestructiveShellCommand } from './shell-confirmation-policy.js';
+
+export { isPotentiallyDestructiveShellCommand } from './shell-confirmation-policy.js';
+
+// Source: harness-write-boundary.ts commandRejectTelemetry records the same command's first 16 SHA-256 hex characters.
+const CLI_BOUNDARY_COMMAND_HASH_LENGTH = 16;
 
 export function emitDetachedProgress(
   env: FeedbackEnvelope,
@@ -58,10 +65,16 @@ type CliAgentDispatch = typeof import('../skills/tools/agent.js').dispatchAgent;
 let cliAgentDispatchForTesting: CliAgentDispatch | undefined;
 
 let cliRunTurnForTesting: typeof runTurn | undefined;
+let cliConfirmBashCommandForTesting: ((command: string) => Promise<boolean>) | undefined;
 
 /** Test seam for exercising the real Commander and pipeline path without an LLM call. */
 export function setCliRunTurnForTesting(runTurnForTesting: typeof runTurn | undefined): void {
   cliRunTurnForTesting = runTurnForTesting;
+}
+
+/** Test seam for the production CLI confirmation boundary. */
+export function setCliConfirmBashCommandForTesting(confirm: ((command: string) => Promise<boolean>) | undefined): void {
+  cliConfirmBashCommandForTesting = confirm;
 }
 
 export function setCliAgentDispatchForTesting(dispatch: CliAgentDispatch | undefined): void {
@@ -144,6 +157,7 @@ export function registerAgentCommands(program: Command): void {
       forceNew: opts.new === true,
       json: opts.json === true,
       surface: 'agent',
+      confirmBashCommand: cliConfirmBashCommandForTesting,
       // commander stores --no-tools as `tools: false`, plain absence as undefined → default true here.
       enableTools: opts.tools !== false,
     });
@@ -455,6 +469,16 @@ export async function runChatTurnCli(opts: {
    *  chat path stays text-only and matches telegram/discord etc.
    *  for backward compatibility. `elanous agent` flips this on. */
   enableTools?: boolean;
+  /** Optional tool allowlist for purpose-built CLI surfaces. */
+  allowedToolNames?: readonly string[];
+  /** Called before a surface-specific Bash dispatch; false blocks execution. */
+  confirmBashCommand?: (command: string) => Promise<boolean>;
+  /** Print the model's plan text before showing/executing its first tool call. */
+  showToolPlan?: boolean;
+  /** Additional surface-specific instruction appended to the system prompt. */
+  extraSystemPrompt?: string;
+  /** Log category for guarded terminal-agent tool calls. */
+  toolLogCategory?: string;
   /** ⭐ substrate 통합 — goal-loop 아밍. true 면 tool-loop 을 runGoalLoop 으로 감싸
    *  목표 완료(GOAL-COMPLETE 증거게이트)까지 across-turn 반복. config
    *  llm.goalLoop.enabled 로도 아밍(ACP bridge 와 동일 SSOT). enableTools 필요. */
@@ -533,13 +557,38 @@ export async function runChatTurnCli(opts: {
   const toolAbort = new AbortController();
   const abortToolsOnSigint = (): void => toolAbort.abort();
   if (opts.enableTools) {
+    let confirmationDispatchTail: Promise<void> = Promise.resolve();
+    const serializeConfirmedDispatch = async <T>(dispatch: () => Promise<T>): Promise<T> => {
+      const previous = confirmationDispatchTail;
+      let release!: () => void;
+      confirmationDispatchTail = new Promise<void>(resolve => { release = resolve; });
+      await previous;
+      try { return await dispatch(); }
+      finally { release(); }
+    };
     const built = buildCliAgentTools(opts.cfg, harnessSpace ? {
       sessionId: session.id,
       emitFeedback: emitHarnessFeedbackProgress,
     } : undefined);   // ★ cfg 전달 → financeEnabled 시 finance 팩 노출(서피스 게이팅 정리)
     tools = built;
-    dispatchTool = (name, args) => built.dispatch(name, args, { signal: toolAbort.signal });
-    enabledToolNames = built.specs.map(s => s.name);
+    enabledToolNames = opts.allowedToolNames
+      ? built.specs.filter(spec => opts.allowedToolNames!.includes(spec.name)).map(spec => spec.name)
+      : built.specs.map(s => s.name);
+    if (opts.allowedToolNames) tools = { ...built, specs: built.specs.filter(spec => opts.allowedToolNames!.includes(spec.name)) };
+    dispatchTool = async (name, args) => {
+      const guardedDispatch = () => dispatchGuardedCliTool({
+        name, args, allowedToolNames: opts.allowedToolNames, confirmBashCommand: opts.confirmBashCommand,
+        signal: toolAbort.signal, abortTurn: () => toolAbort.abort(),
+        toolLogCategory: opts.toolLogCategory,
+        dispatch: () => built.dispatch(name, args, { signal: toolAbort.signal }),
+      });
+      const command = args.command;
+      if (name === 'Bash' && opts.confirmBashCommand && typeof command === 'string'
+        && isPotentiallyDestructiveShellCommand(command)) {
+        return serializeConfirmedDispatch(guardedDispatch);
+      }
+      return guardedDispatch();
+    };
     process.on('SIGINT', abortToolsOnSigint);
   }
   // Wire the universal preamble (project anchor + project tree +
@@ -571,6 +620,7 @@ export async function runChatTurnCli(opts: {
   } catch { /* universal-preamble unavailable — proceed without it */ }
   agentSystemPrompt = applyHarnessPolicy(agentSystemPrompt, process.env[HARNESS_POLICY_ENV]);
   agentSystemPrompt = applyDocumentReferences(agentSystemPrompt, process.env[DOCUMENT_REFERENCES_ENV]);
+  if (opts.extraSystemPrompt) agentSystemPrompt = `${agentSystemPrompt ?? ''}\n\n${opts.extraSystemPrompt}`;
   // Archon-port T1.2 (2026-05-08) — apply user-config `chat.toolDeny`
   // to the CLI agent's tool roster. Prior to T1.2 this code path
   // ignored toolDeny entirely (only `eval-prompt-cli.ts` honored it),
@@ -600,6 +650,7 @@ export async function runChatTurnCli(opts: {
       userConfig: opts.cfg,
       sessionId: session.id,
       userText: opts.userText,
+      ...(opts.enableTools ? { signal: toolAbort.signal } : {}),
       ...(opts.surface === 'ask' ? { utteranceSurface: 'ask' as const } : {}),
       systemPrompt: agentSystemPrompt,
       onDelta: (d) => {
@@ -613,8 +664,19 @@ export async function runChatTurnCli(opts: {
       onToolCall: (call) => {
         // The next delta belongs to the next assistant message.
         sawToolCall = true;
+        const planOutput = opts.json ? process.stderr : process.stdout;
+        if (opts.showToolPlan) {
+          const plan = segmentChunks.join('').trim();
+          const request = opts.userText.replace(/\s+/g, ' ').trim();
+          const fallbackPlan = call.name === 'Bash' && typeof call.args.command === 'string'
+            ? `Plan for "${request}": run ${call.args.command}`
+            : `Plan for "${request}": call ${call.name} with ${JSON.stringify(call.args)}`;
+          planOutput.write(`${plan || fallbackPlan}\n`);
+        }
         closeSegment();
-        if (!opts.json) {
+        if (opts.showToolPlan && call.name === 'Bash' && typeof call.args.command === 'string') {
+          planOutput.write(`\n$ ${call.args.command}\n`);
+        } else if (!opts.json) {
           process.stdout.write(`\n  ⏺ ${call.name}(${truncateArgsForLog(call.args)})\n`);
         }
       },
@@ -674,6 +736,47 @@ export async function runChatTurnCli(opts: {
   ui.info(`[session ${session.id.slice(0, 8)}  ${result.provider}${result.model ? '/' + result.model : ''}  ${sessionBudget(session.id)}]`);
 }
 
+/** Shared guarded dispatch boundary used by `runChatTurnCli` and terminal-do simulations. */
+export async function dispatchGuardedCliTool(opts: {
+  name: string;
+  args: Record<string, unknown>;
+  allowedToolNames?: readonly string[];
+  confirmBashCommand?: (command: string) => Promise<boolean>;
+  signal?: AbortSignal;
+  abortTurn?: () => void;
+  toolLogCategory?: string;
+  dispatch: () => Promise<unknown>;
+}): Promise<unknown> {
+  if (opts.signal?.aborted) {
+    return { error: 'Execution stopped after a declined command; no further tools will be dispatched.' };
+  }
+  if (opts.allowedToolNames && !opts.allowedToolNames.includes(opts.name)) {
+    return { error: `Tool ${opts.name} is not available on this CLI surface.` };
+  }
+  if (opts.name === 'Bash' && opts.confirmBashCommand && typeof opts.args.command === 'string'
+    && isPotentiallyDestructiveShellCommand(opts.args.command)) {
+    const accepted = await opts.confirmBashCommand(opts.args.command);
+    // A parallel call may have been waiting for confirmation when another
+    // call was declined. Re-check after the await before any dispatch.
+    if (opts.signal?.aborted) {
+      return { error: 'Execution stopped after a declined command; no further tools will be dispatched.' };
+    }
+    debug.log(opts.toolLogCategory ?? 'cli.agent', accepted ? 'command-approved' : 'command-denied', { tool: opts.name });
+    if (!accepted) {
+      opts.abortTurn?.();
+      return { error: 'Execution declined by the user; do not retry or rephrase this destructive command.' };
+    }
+  }
+  const commandHash = opts.name === 'Bash' && typeof opts.args.command === 'string'
+    ? createHash('sha256').update(opts.args.command).digest('hex').slice(0, CLI_BOUNDARY_COMMAND_HASH_LENGTH)
+    : undefined;
+  debug.log(opts.toolLogCategory ?? 'cli.agent', 'tool-dispatch', {
+    tool: opts.name,
+    ...(commandHash ? { commandHash } : {}),
+  });
+  return opts.dispatch();
+}
+
 /** Build the CLI agent's minimal tool catalog + dispatcher. Returns
  *  the spec list to pass into runTurn's `tools` field plus a single
  *  dispatch function. Native tools are sourced from
@@ -689,6 +792,7 @@ export function buildCliAgentTools(
     emitFeedback: (env: import('../feedback/envelope.js').FeedbackEnvelope) => void;
   },
   trustedWorkingDirectory?: string,
+  pluginRuntimeOptions?: import('./child-plugin-runtime.js').ChildPluginRuntimeOptions,
 ): {
   specs: import('../llm/tool-spec.js').LLMToolSpec[];
   dispatch: (name: string, args: Record<string, unknown>, context?: { signal?: AbortSignal }) => Promise<unknown>;
@@ -780,10 +884,19 @@ export function buildCliAgentTools(
       planCtx,
     ));
   }
+  const childBridge = pluginRuntimeOptions === undefined ? undefined
+    : (require('./child-plugin-runtime.js') as typeof import('./child-plugin-runtime.js'))
+      .createChildPluginRuntimeContract(pluginRuntimeOptions);
+  if (childBridge) {
+    const childCatalog = sr.buildSubagentSessionRuntimeToolSpecs({
+      hostTools: childBridge.hostTools, runtimeTools: childBridge.runtimeTools, optionalTools: specs,
+    });
+    specs.splice(0, specs.length, ...childCatalog);
+  }
   // Native dispatch — route through dispatchSessionRuntimeTool so we
   // pick up all the dashboard guards (broad-search-block, scoped-
-  // analysis, dedup planner). Scheduler/plugin/runtime stubs return
-  // not-available since the CLI doesn't wire those subsystems.
+  // analysis, dedup planner). Plugin and runtime tools use the same
+  // host/route and registry contract as the classic TUI.
   const dispatchSessionRuntimeTool = sr.dispatchSessionRuntimeTool;
   const createPlanner = sr.createSearchPlannerState;
   const plannerState = createPlanner({ maxAutoNarrowCandidates: 2 });
@@ -802,13 +915,16 @@ export function buildCliAgentTools(
         modelFamily: undefined,
         agentHostTools: specs,
         agentDispatchTool: dispatch,
-        buildChildToolCatalog: (childCwd: string) => buildCliAgentTools(cfg, undefined, childCwd),
+        buildChildToolCatalog: (childCwd: string) => buildCliAgentTools(cfg, undefined, childCwd, pluginRuntimeOptions),
         searchPlannerState: plannerState,
         turnIndex: undefined,
         ptyDashboardOn: false,
-        getToolRuntime: () => undefined,
-        dispatchToolRuntime: async (n) => ({ error: `runtime tool unavailable in CLI: ${n}` }),
-        dispatchPluginTool: async (n) => ({ ok: false as const, error: `plugin tool unavailable in CLI: ${n}` }),
+        getToolRuntime: childBridge?.getToolRuntime ?? (() => undefined),
+        dispatchToolRuntime: childBridge
+          ? (n, input) => childBridge.dispatchToolRuntime(n, input, context?.signal)
+          : async (n) => ({ error: `runtime tool unavailable in CLI: ${n}` }),
+        dispatchPluginTool: childBridge?.dispatchPluginTool
+          ?? (async (n) => ({ ok: false as const, error: `plugin tool unavailable in CLI: ${n}` })),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -834,4 +950,3 @@ function truncateResultForLog(result: unknown): string {
   preview = preview.replace(/\s+/g, ' ').trim();
   return preview.length > 200 ? preview.slice(0, 200) + '…' : preview;
 }
-

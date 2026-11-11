@@ -19,7 +19,7 @@ import { isTransientGitError } from './retry.js';
 import { runGitCommand } from './runner.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { GATE_DEPS_DIR, GATE_DEPS_TREES, projectDepsManifest } from '../task-orchestrator/surfaces/pod-gate-deps.js';
 
 const GIT_TIMEOUT_MS = 30_000;

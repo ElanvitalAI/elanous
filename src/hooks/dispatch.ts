@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { runSeatLoopOnce } from '../seat-loop/seat-loop.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { openMsgStore } from '../msg/msg-store.js';
 import type { EventsConfig } from '../user-config/types.js';
 import type { QueuedHook } from './queue.js';

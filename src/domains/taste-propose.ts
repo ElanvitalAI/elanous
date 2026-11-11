@@ -12,7 +12,7 @@
 
 import type { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { openSurfaceEventsDb, surfaceEventsDbPath, recordEvent, queryEvents } from './surface-events.js';
 import { openKnowledgeDb, knowledgeDbPath, loadKindVectors } from './knowledge.js';
 import { cosine } from './taste-model.js';

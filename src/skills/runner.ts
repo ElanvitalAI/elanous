@@ -240,7 +240,7 @@ import {
 } from '../log-entry.js';
 import { getModelPromptAddon, getModelFamily } from '../models/prompts.js';
 import { buildUniversalPreamble } from '../prompt-library/universal-preamble.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { resolveChatSystemPrompt } from '../prompt-library/registry.js';
 import {
   buildPromptInjection,

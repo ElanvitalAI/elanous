@@ -3,7 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
-import { listChecklist, setItem } from './checklist.js';
+import { listChecklist, parseTargetPathHintLine, setItem, type ChecklistItem } from './checklist.js';
 import { judgeLandedCell } from './landed-to-green.js';
 import { evidencePlan, landedButYellow, type MergedChecklistPr } from './landed-but-yellow.js';
 import { assignedVersions, evidenceAdd } from './feature-store.js';
@@ -22,6 +22,156 @@ export interface MergedPrChecklistDeps {
   feedbackStatePath?: string;
   feedbackFollowUp?: NonNullable<Parameters<typeof recordMergedTaskImplFindings>[2]>['followUp'];
   log?: typeof debug.log;
+}
+
+export interface StaleMergedChecklistGreenProposal {
+  id: string;
+  status: 'proposed';
+  proposalKind: 'green' | 'target-path-repair';
+  currentStatus: 'yellow';
+  targetPaths: string[];
+  prs: Array<{
+    number: number;
+    title: string;
+    mergedAt: string;
+    matchedPaths: string[];
+    changedPaths: string[];
+    matchKind: 'target-path' | 'cell-id-path-mismatch';
+    cellIdMentioned: boolean;
+    ambiguousWith: string[];
+    evidenceRef: string;
+  }>;
+}
+
+export interface StaleMergedChecklistPr {
+  number: number;
+  state: string;
+  baseRefName: string;
+  title: string;
+  body: string | null;
+  mergedAt: string;
+  files?: Array<{ path: string }>;
+  changedFiles?: number;
+  author?: { login: string };
+}
+
+export interface OpenChecklistPathMatch {
+  id: string;
+  currentStatus: 'yellow';
+  targetPaths: string[];
+  prs: Array<{ number: number; title: string; author: string; baseRefName: string; matchedPaths: string[]; changedPaths: string[] }>;
+}
+
+export interface StaleMergedChecklistScan {
+  proposals: StaleMergedChecklistGreenProposal[];
+  openPathMatches: OpenChecklistPathMatch[];
+  scannedMergedMainPrs: number;
+  scannedOpenPrs: number;
+  complete: boolean;
+  incompletePrNumbers: number[];
+}
+
+// Source: GitHub CLI PR list pagination returns at most 1,000 results; report a capped scan as incomplete.
+const MERGED_PR_SCAN_LIMIT = 1_000;
+// Source: up to 1,000 PR bodies and file lists can exceed execFileSync's 1 MiB default; reserve 128 MiB for the JSON response.
+const MERGED_PR_SCAN_MAX_BUFFER = 128 * 1024 * 1024;
+
+/** Read-only stale-cell sweep. A match creates a review proposal; it never writes checklist evidence or status. */
+export function proposeStaleMergedChecklistGreens(
+  items: readonly ChecklistItem[],
+  prs: readonly StaleMergedChecklistPr[],
+): StaleMergedChecklistGreenProposal[] {
+  const yellow = items.filter((item) => item.status === 'yellow');
+  const targets = new Map(yellow.map((item) => [item.id, parseTargetPathHintLine(item.title).fragments
+    .map((path) => path.trim().replace(/^`|`$/g, '')).filter(Boolean)]));
+  const mentioned = (text: string, id: string): boolean => {
+    const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?<![A-Za-z0-9_-])${escaped}(?![A-Za-z0-9_-])`).test(text);
+  };
+  const proposals: StaleMergedChecklistGreenProposal[] = [];
+  for (const item of yellow) {
+    const targetPaths = targets.get(item.id) ?? [];
+    if (!targetPaths.length) continue;
+    const matches = prs.flatMap((pr) => {
+      if (pr.state !== 'MERGED' || pr.baseRefName !== 'main' || !Array.isArray(pr.files)
+        || (pr.changedFiles !== undefined && pr.changedFiles > pr.files.length)) return [];
+      const changedPaths = [...new Set(pr.files.map((file) => file.path))];
+      const matchedPaths = changedPaths.filter((path) => targetPaths.includes(path));
+      const text = `${pr.title}\n${pr.body ?? ''}`;
+      const mentionedIds = yellow.filter((candidate) => mentioned(text, candidate.id)).map((candidate) => candidate.id);
+      const cellIdMentioned = mentionedIds.includes(item.id);
+      const matchKind = matchedPaths.length ? 'target-path' as const : 'cell-id-path-mismatch' as const;
+      // A target-path hit is primary evidence even when the PR names another cell; an ID-only
+      // mismatch is surfaced separately as a wording repair, never as a green suggestion.
+      if (!matchedPaths.length && !cellIdMentioned) return [];
+      const ambiguousWith = yellow.filter((candidate) => candidate.id !== item.id
+        && (targets.get(candidate.id) ?? []).some((path) => matchedPaths.includes(path)))
+        .map((candidate) => candidate.id);
+      return [{ number: pr.number, title: pr.title, mergedAt: pr.mergedAt, matchedPaths,
+        changedPaths, matchKind, cellIdMentioned, ambiguousWith, evidenceRef: `#${pr.number}` }];
+    }).sort((a, b) => b.mergedAt.localeCompare(a.mergedAt) || b.number - a.number);
+    const pathMatches = matches.filter((match) => match.matchKind === 'target-path');
+    const pathMismatches = matches.filter((match) => match.matchKind === 'cell-id-path-mismatch');
+    for (const [proposalKind, rows] of [['green', pathMatches], ['target-path-repair', pathMismatches]] as const) {
+      if (rows.length) proposals.push({ id: item.id, status: 'proposed', proposalKind,
+        currentStatus: 'yellow', targetPaths, prs: rows });
+    }
+  }
+  return proposals;
+}
+
+/** Open PR path hits identify active work and never imply checklist completion. */
+export function findOpenChecklistPathMatches(
+  items: readonly ChecklistItem[],
+  prs: readonly StaleMergedChecklistPr[],
+): OpenChecklistPathMatch[] {
+  const yellow = items.filter((item) => item.status === 'yellow');
+  const targets = new Map(yellow.map((item) => [item.id, parseTargetPathHintLine(item.title).fragments
+    .map((path) => path.trim().replace(/^`|`$/g, '')).filter(Boolean)]));
+  return yellow.flatMap((item) => {
+    const targetPaths = targets.get(item.id) ?? [];
+    if (!targetPaths.length) return [];
+    const matches = prs.flatMap((pr) => {
+      if (pr.state !== 'OPEN' || !Array.isArray(pr.files)
+        || (pr.changedFiles !== undefined && pr.changedFiles > pr.files.length)) return [];
+      const changedPaths = [...new Set(pr.files.map((file) => file.path))];
+      const matchedPaths = changedPaths.filter((path) => targetPaths.includes(path));
+      if (!matchedPaths.length) return [];
+      return [{ number: pr.number, title: pr.title, author: pr.author?.login ?? 'unknown', baseRefName: pr.baseRefName,
+        matchedPaths, changedPaths }];
+    }).sort((a, b) => a.number - b.number);
+    return matches.length ? [{ id: item.id, currentStatus: 'yellow' as const, targetPaths, prs: matches }] : [];
+  });
+}
+
+/** Fetch merged-main PR changed files and return review proposals without writing checklist data. */
+export type MergedMainPrReader = (cwd: string, args: readonly string[]) => StaleMergedChecklistPr[];
+
+function readMergedMainPrs(cwd: string, args: readonly string[]): StaleMergedChecklistPr[] {
+  const raw = execFileSync('gh', [...args], { cwd, encoding: 'utf8', timeout: 60_000, maxBuffer: MERGED_PR_SCAN_MAX_BUFFER });
+  return JSON.parse(raw) as StaleMergedChecklistPr[];
+}
+
+export function collectStaleMergedChecklistProposals(
+  version: string,
+  cwd: string,
+  readPrs: MergedMainPrReader = readMergedMainPrs,
+): StaleMergedChecklistScan {
+  try {
+    const mergedPrs = readPrs(cwd, ['pr', 'list', '--state', 'merged', '--base', 'main', '--limit', String(MERGED_PR_SCAN_LIMIT),
+      '--json', 'number,state,baseRefName,title,body,mergedAt,files,changedFiles']);
+    const openPrs = readPrs(cwd, ['pr', 'list', '--state', 'open', '--limit', String(MERGED_PR_SCAN_LIMIT),
+      '--json', 'number,state,baseRefName,title,body,mergedAt,files,changedFiles,author']);
+    const incompletePrNumbers = [...mergedPrs, ...openPrs].filter((pr) => pr.changedFiles !== undefined && Array.isArray(pr.files)
+      && pr.files.length < pr.changedFiles).map(({ number }) => number);
+    const items = listChecklist(version).items;
+    return { proposals: proposeStaleMergedChecklistGreens(items, mergedPrs), openPathMatches: findOpenChecklistPathMatches(items, openPrs),
+      scannedMergedMainPrs: mergedPrs.length, scannedOpenPrs: openPrs.length,
+      complete: mergedPrs.length < MERGED_PR_SCAN_LIMIT && openPrs.length < MERGED_PR_SCAN_LIMIT && incompletePrNumbers.length === 0,
+      incompletePrNumbers: [...new Set(incompletePrNumbers)] };
+  } catch (error) {
+    throw new Error(`merged-main PR 경로를 조회하지 못했다: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
 }
 
 function readMergedPr(number: number, cwd: string): NonNullable<MergedPrChecklistDeps['readPr']> extends (number: number, cwd: string) => infer T ? T : never {

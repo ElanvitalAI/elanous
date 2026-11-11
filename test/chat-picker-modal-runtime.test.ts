@@ -18,6 +18,8 @@ function createFakePicker(dispatchResult: DispatchResult): PickerState {
     atItems: () => [],
     skillItems: () => [],
     selectedIdx: () => 0,
+    panelSnapshot: () => null,
+    dismiss: () => false,
     _snapshot: () => ({
       cmdPickerIdx: 0,
       pickerNavigated: false,

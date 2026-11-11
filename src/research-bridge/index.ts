@@ -25,3 +25,8 @@ export {
   formatResearchPrefill,
   formatResearchSummary,
 } from './format.js';
+
+export {
+  CRAWL_CONTRACTS, CRAWL_PROVIDERS, matchingCrawlProviders, executeCrawlCapability,
+  type CrawlContract, type CrawlContext, type CrawlProvider,
+} from './crawl.js';

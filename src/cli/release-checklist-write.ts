@@ -3,7 +3,7 @@ import type { Command } from 'commander';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { hqCliWriteAllowed } from '../hq/hq.js';
 import { fileLeaseStore } from '../hq/lease.js';
 import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';

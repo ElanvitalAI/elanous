@@ -175,12 +175,6 @@ describe('2026-09-26 설정 졸업 — 선언은 항상 실행 권위', () => {
       });
   });
 
-  test('기존 실행 모듈 orchestrator.ts는 payload factory를 그대로 호출한다', () => {
-    const orchestratorSource = readFileSync(join(import.meta.dir, 'orchestrator.ts'), 'utf8');
-
-    expect(orchestratorSource).toContain("observe('graph-authority-resolved', graphAuthorityFields(graphAuthority, graphTemplate));");
-  });
-
   test('대응 스펙이 없으면 던지지 않고 null로 남겨 빈 선언 손실과 구별한다', () => {
     const authority = resolveGraphAuthority({});
     const missingSpecTemplate: GraphTemplate = {

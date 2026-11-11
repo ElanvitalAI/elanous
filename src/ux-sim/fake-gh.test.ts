@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { createFakeGh, type FakeGhPr } from './fake-gh.js';
+import { createTempGitRemote } from './temp-git-remote.js';
 import { githubDraftSweepAdapters } from '../harness/harness-cli-command.js';
 import { runDraftSweep } from '../self-dev/draft-sweep.js';
 import { registerTasksCommands } from '../cli/tasks-cli.js';
@@ -39,6 +40,80 @@ test('fake gh pr view --json returns pinned queue fields for the production shad
   gh.api(['pr', 'merge', '123']);
   const mergedView = JSON.parse(gh.api(['pr', 'view', '123', '--json', 'state,mergeCommit'])) as { state: string; mergeCommit: { oid: string } };
   expect(mergedView).toEqual({ state: 'MERGED', mergeCommit: { oid: gh.prs[0]!.mergeSha! } });
+});
+
+test('SIM-FAKE-GITHUB: a scoped token pushes to the real local remote and emits one push webhook', () => {
+  const remote = createTempGitRemote({ repository: 'example/repo' });
+  try {
+    const gh = fakeGh({ prs: [], repository: 'example/repo', tokens: [
+      { id: 'write-token', repository: 'example/repo', permission: 'contents:write', expiresAt: '2026-10-25T00:00:00Z' },
+    ] });
+    const before = remote.git(remote.remote, ['rev-parse', 'refs/heads/main']);
+    writeFileSync(join(remote.checkout, 'README.md'), 'mirrored change\n');
+    remote.git(remote.checkout, ['add', 'README.md']);
+    remote.git(remote.checkout, ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'mirror input']);
+    const head = remote.git(remote.checkout, ['rev-parse', 'HEAD']);
+    expect(gh.pushWithToken('write-token', remote)).toEqual({ ok: true, before, after: head });
+    expect(remote.git(remote.remote, ['rev-parse', 'refs/heads/main'])).toBe(head);
+    expect(gh.webhooks).toEqual([{ id: 'push-1', repository: 'example/repo', ref: 'refs/heads/main', before, after: head,
+      deliveredAt: NOW.toISOString() }]);
+    expect(gh.pushWithToken('write-token', remote)).toEqual({ ok: true, before: head, after: head });
+    expect(gh.webhooks).toHaveLength(1);
+  } finally { remote.cleanup(); }
+});
+
+test('SIM-FAKE-GITHUB: a non-fast-forward push fails without a webhook', () => {
+  const remote = createTempGitRemote({ repository: 'example/repo' });
+  try {
+    const gh = fakeGh({ prs: [], repository: 'example/repo', tokens: [
+      { id: 'write-token', repository: 'example/repo', permission: 'contents:write' },
+    ] });
+    writeFileSync(join(remote.checkout, 'README.md'), 'local change\n');
+    remote.git(remote.checkout, ['add', 'README.md']);
+    remote.git(remote.checkout, ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'local']);
+    remote.advanceMain(1);
+    const before = remote.git(remote.remote, ['rev-parse', 'refs/heads/main']);
+    expect(gh.pushWithToken('write-token', remote)).toEqual({ ok: false, reason: 'push-failed' });
+    expect(remote.git(remote.remote, ['rev-parse', 'refs/heads/main'])).toBe(before);
+    expect(gh.webhooks).toEqual([]);
+  } finally { remote.cleanup(); }
+});
+
+test('SIM-FAKE-GITHUB: expired and read-only tokens cannot change the remote or emit webhooks', () => {
+  const remote = createTempGitRemote({ repository: 'example/repo' });
+  try {
+    const gh = fakeGh({ prs: [], repository: 'example/repo', tokens: [
+      { id: 'expired', repository: 'example/repo', permission: 'contents:write', expiresAt: '2026-10-23T00:00:00Z' },
+      { id: 'read-only', repository: 'example/repo', permission: 'contents:read', expiresAt: '2026-10-25T00:00:00Z' },
+      { id: 'other-repo', repository: 'example/other', permission: 'contents:write', expiresAt: '2026-10-25T00:00:00Z' },
+    ] });
+    const before = remote.git(remote.remote, ['rev-parse', 'refs/heads/main']);
+    writeFileSync(join(remote.checkout, 'README.md'), 'not yet pushed\n');
+    remote.git(remote.checkout, ['add', 'README.md']);
+    remote.git(remote.checkout, ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'blocked input']);
+    expect(gh.pushWithToken('expired', remote)).toEqual({ ok: false, reason: 'token-expired' });
+    expect(gh.pushWithToken('read-only', remote)).toEqual({ ok: false, reason: 'permission-denied' });
+    expect(gh.pushWithToken('other-repo', remote)).toEqual({ ok: false, reason: 'repository-denied' });
+    expect(gh.pushWithToken('missing', remote)).toEqual({ ok: false, reason: 'token-unknown' });
+    expect(remote.git(remote.remote, ['rev-parse', 'refs/heads/main'])).toBe(before);
+    expect(gh.webhooks).toEqual([]);
+  } finally { remote.cleanup(); }
+});
+
+test('SIM-FAKE-GITHUB: repository A token cannot push a repository B fixture', () => {
+  const remote = createTempGitRemote({ repository: 'example/other' });
+  try {
+    const gh = fakeGh({ prs: [], repository: 'example/repo', tokens: [
+      { id: 'write-token', repository: 'example/repo', permission: 'contents:write' },
+    ] });
+    const before = remote.git(remote.remote, ['rev-parse', 'refs/heads/main']);
+    writeFileSync(join(remote.checkout, 'README.md'), 'wrong repository\n');
+    remote.git(remote.checkout, ['add', 'README.md']);
+    remote.git(remote.checkout, ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-m', 'wrong repo']);
+    expect(gh.pushWithToken('write-token', remote)).toEqual({ ok: false, reason: 'repository-denied' });
+    expect(remote.git(remote.remote, ['rev-parse', 'refs/heads/main'])).toBe(before);
+    expect(gh.webhooks).toEqual([]);
+  } finally { remote.cleanup(); }
 });
 
 async function greenSweep(gh: ReturnType<typeof createFakeGh>, mergeSha = SHA) {

@@ -1,14 +1,157 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gateImagePinPath, pinnedGateImageSync, readGateImagePin, replaceGateImagePin, resolveGateImagePin, supersedeGateImagePin,
-  gateImageLayerRuntimeKey, prebuildGateImagePinAtCut, writeGateImagePin } from './gate-image-pin.js';
+  gateImageLayerRuntimeKey, prebuildGateImagePinAtCut, runCutGateImagePrebuild, writeGateImagePin } from './gate-image-pin.js';
 import { podCommandJobManifest } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
+import { gateImageReadinessPendingPath, gateImageReadinessSignalPath,
+  readGateImageReadinessSignal, waitForGateImageT60 } from './release-readiness.js';
+import { setSchedule } from '../../src/release-loop/release-schedule.js';
 
 const digestA = `sha256:${'a'.repeat(64)}`;
 const digestB = `sha256:${'b'.repeat(64)}`;
 const digestC = `sha256:${'c'.repeat(64)}`;
+const attestedCut = (commit: string, runId: string) => ({ commit,
+  gateImagePrebuild: { outcome: 'built', runId, cutCommit: commit, digest: digestA, eligiblePools: ['pool-a'] } });
+
+it('image prebuild result sim publishes built and reused readiness that releases T-60', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'image-readiness-producer-'));
+  const input = { root, repo: root, runId: 'cut-run', version: '0.3.9', commit: 'd'.repeat(40), pool: 'pool-a' };
+  const path = gateImageReadinessSignalPath(root, input.version);
+  const now = new Date('2026-11-09T03:05:00.000Z');
+  try {
+    setSchedule(input.version, { cutAt: '2026-11-09T03:00:00.000Z' }, 'OP', root);
+    for (const outcome of ['built', 'reused'] as const) {
+      const result = runCutGateImagePrebuild(input, { now: () => now,
+        runPrebuild: () => ({ status: 0, stdout: JSON.stringify({ outcome, digest: digestA, eligiblePools: ['pool-a'] }) }) });
+      expect(result).toEqual({ outcome, runId: input.runId, cutCommit: input.commit, digest: digestA, eligiblePools: ['pool-a'] });
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ schemaVersion: 1, status: 'ready', runId: input.runId,
+        cutCommit: input.commit, imageDigest: digestA, eligiblePools: ['pool-a'], checkedAt: now.toISOString() });
+      expect(await waitForGateImageT60({ runId: input.runId, input: { version: input.version },
+        outputs: { 'version-release': attestedCut(input.commit, input.runId) } }, { ledgerRoot: root, now: () => now,
+        sleep: async () => { throw new Error('unexpected image hold'); } })).toMatchObject({ signalPath: path, runId: input.runId });
+    }
+    expect(readdirSync(join(root, 'release', input.version)).filter((name) => name.includes('pending'))).toEqual([]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('failed image prebuild sim leaves T-60 held without a readiness signal', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'image-readiness-failed-'));
+  const input = { root, repo: root, runId: 'cut-run', version: '0.3.9', commit: 'd'.repeat(40), pool: 'pool-a' };
+  const path = gateImageReadinessSignalPath(root, input.version);
+  const now = new Date('2026-11-09T03:05:00.000Z');
+  try {
+    setSchedule(input.version, { cutAt: '2026-11-09T03:00:00.000Z' }, 'OP', root);
+    expect(runCutGateImagePrebuild(input, { runPrebuild: () => ({ status: 1, stdout: JSON.stringify({ outcome: 'failed', reason: 'build failed' }) }) }))
+      .toEqual({ outcome: 'failed', reason: 'build failed' });
+    expect(existsSync(path)).toBe(false);
+    await expect(waitForGateImageT60({ runId: input.runId, input: { version: input.version },
+      outputs: { 'version-release': attestedCut(input.commit, input.runId) } }, { ledgerRoot: root, now: () => now,
+      sleep: async () => { throw new Error('image hold observed'); } })).rejects.toThrow('image hold observed');
+    expect(JSON.parse(readFileSync(join(root, 'release', input.version, 'readiness-countdown.json'), 'utf8')))
+      .toMatchObject({ phase: 'hold', holdReason: 'image-t60:prebuild-pending' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('failed retry removes a prior ready signal for the same run and cut', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'image-readiness-retry-'));
+  const input = { root, repo: root, runId: 'cut-run', version: '0.3.9', commit: 'd'.repeat(40), pool: 'pool-a' };
+  const path = gateImageReadinessSignalPath(root, input.version);
+  const now = new Date('2026-11-09T03:05:00.000Z');
+  try {
+    setSchedule(input.version, { cutAt: '2026-11-09T03:00:00.000Z' }, 'OP', root);
+    expect(runCutGateImagePrebuild(input, { now: () => now,
+      runPrebuild: () => ({ status: 0, stdout: JSON.stringify({ outcome: 'built', digest: digestA, eligiblePools: ['pool-a'] }) }) }).outcome).toBe('built');
+    expect(existsSync(path)).toBe(true);
+    expect(runCutGateImagePrebuild(input, { runPrebuild: () => ({ status: 1, stdout: JSON.stringify({ outcome: 'failed', reason: 'retry failed' }) }) }))
+      .toEqual({ outcome: 'failed', reason: 'retry failed' });
+    expect(existsSync(path)).toBe(false);
+    await expect(waitForGateImageT60({ runId: input.runId, input: { version: input.version },
+      outputs: { 'version-release': attestedCut(input.commit, input.runId) } }, { ledgerRoot: root, now: () => now,
+      sleep: async () => { throw new Error('image hold observed'); } })).rejects.toThrow('image hold observed');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const failure of ['delete', 'write', 'pending'] as const) {
+  it(`independent T-60 rejects an old signal after ${failure} failure`, async () => {
+    const root = mkdtempSync(join(tmpdir(), `image-readiness-${failure}-`));
+    const old = { root, repo: root, runId: failure === 'write' ? 'current-run' : 'old-run',
+      version: '0.3.9', commit: failure === 'delete' ? 'd'.repeat(40) : 'a'.repeat(40), pool: 'pool-a' };
+    const current = { ...old, runId: 'current-run', commit: 'd'.repeat(40) };
+    const path = gateImageReadinessSignalPath(root, old.version);
+    const now = new Date('2026-11-09T03:05:00.000Z');
+    const child = { status: 0, stdout: JSON.stringify({ outcome: 'built', digest: digestA, eligiblePools: ['pool-a'] }) };
+    try {
+      setSchedule(old.version, { cutAt: '2026-11-09T03:00:00.000Z' }, 'OP', root);
+      expect(runCutGateImagePrebuild(old, { runPrebuild: () => child }).outcome).toBe('built');
+      const injected = failure === 'delete' ? { invalidateReady: () => { throw new Error('delete denied'); } }
+        : failure === 'pending' ? { markLocalPending: () => { throw new Error('pending denied'); } }
+          : { writeReady: () => { throw new Error('write denied'); } };
+      expect(runCutGateImagePrebuild(current, { ...injected, runPrebuild: () => child }).outcome).toBe('failed');
+      // Remove an optional marker to prove the reader's run/cut identity check is sufficient.
+      rmSync(gateImageReadinessPendingPath(root, old.version), { force: true });
+      expect(readGateImageReadinessSignal(path, { runId: old.runId, cutCommit: old.commit }).status).toBe('ready');
+      await expect(waitForGateImageT60({ runId: current.runId, input: { version: current.version },
+        outputs: { 'version-release': { commit: current.commit,
+          gateImagePrebuild: attestedCut(old.commit, old.runId).gateImagePrebuild } } }, { ledgerRoot: root, now: () => now,
+        sleep: async () => { throw new Error('identity hold observed'); } })).rejects.toThrow('identity hold observed');
+      expect(JSON.parse(readFileSync(join(root, 'release', current.version, 'readiness-countdown.json'), 'utf8')))
+        .toMatchObject({ phase: 'hold', eta: null });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+it('invalid successful child result cannot publish readiness', () => {
+  const root = mkdtempSync(join(tmpdir(), 'image-readiness-invalid-'));
+  const input = { root, repo: root, runId: 'cut-run', version: '0.3.9', commit: 'd'.repeat(40), pool: 'pool-a' };
+  const path = gateImageReadinessSignalPath(root, input.version);
+  try {
+    for (const result of [{ outcome: 'built', digest: 'latest', eligiblePools: ['pool-a'] },
+      { outcome: 'reused', digest: digestA, eligiblePools: [] }]) {
+      expect(runCutGateImagePrebuild(input, { runPrebuild: () => ({ status: 0, stdout: JSON.stringify(result) }) }).outcome).toBe('failed');
+      expect(existsSync(path)).toBe(false);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it('a retry with a read-only release directory cannot release the countdown', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'image-readiness-unlink-'));
+  const input = { root, repo: root, runId: 'cut-run', version: '0.3.9', commit: 'd'.repeat(40), pool: 'pool-a' };
+  const path = gateImageReadinessSignalPath(root, input.version);
+  const dir = join(root, 'release', input.version);
+  try {
+    expect(runCutGateImagePrebuild(input, { runPrebuild: () => ({ status: 0,
+      stdout: JSON.stringify({ outcome: 'built', digest: digestA, eligiblePools: ['pool-a'] }) }) }).outcome).toBe('built');
+    setSchedule(input.version, { cutAt: '2026-11-09T03:00:00.000Z' }, 'OP', root);
+    chmodSync(dir, 0o500);
+    expect(runCutGateImagePrebuild(input, { runPrebuild: () => ({ status: 1,
+      stdout: JSON.stringify({ outcome: 'failed', reason: 'retry failed' }) }) }).outcome).toBe('failed');
+    await expect(waitForGateImageT60({ runId: input.runId, input: { version: input.version },
+      outputs: { 'version-release': { commit: input.commit } } }, { ledgerRoot: root,
+      now: () => new Date('2026-11-09T03:05:00.000Z') })).rejects.toThrow();
+    chmodSync(dir, 0o700);
+    expect(readGateImageReadinessSignal(path, { runId: input.runId, cutCommit: input.commit }, { ignorePending: true }).status).toBe('ready');
+    await expect(waitForGateImageT60({ runId: input.runId, input: { version: input.version },
+      outputs: { 'version-release': { commit: input.commit } } }, { ledgerRoot: root,
+      now: () => new Date('2026-11-09T03:05:00.000Z'),
+      sleep: async () => { throw new Error('unconfirmed hold observed'); } })).rejects.toThrow('unconfirmed hold observed');
+    expect(JSON.parse(readFileSync(join(dir, 'readiness-countdown.json'), 'utf8')))
+      .toMatchObject({ phase: 'hold', holdReason: 'image-t60:prebuild-unconfirmed' });
+  } finally { chmodSync(dir, 0o700); rmSync(root, { recursive: true, force: true }); }
+});
+
+it('readiness rename failure returns failed and removes the pending file', () => {
+  const root = mkdtempSync(join(tmpdir(), 'image-readiness-rename-'));
+  const input = { root, repo: root, runId: 'cut-run', version: '0.3.9', commit: 'd'.repeat(40), pool: 'pool-a' };
+  const path = gateImageReadinessSignalPath(root, input.version);
+  try {
+    mkdirSync(path, { recursive: true });
+    expect(runCutGateImagePrebuild(input, { runPrebuild: () => ({ status: 0,
+      stdout: JSON.stringify({ outcome: 'built', digest: digestA, eligiblePools: ['pool-a'] }) }) }).outcome).toBe('failed');
+    expect(readdirSync(join(root, 'release', input.version)).sort()).toEqual(['image-readiness.json', 'image-readiness.pending']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 it('keys the reusable source-free layer only by measured runtime identity', () => {
   const identity = { baseImageDigest: digestA, lockHash: 'b'.repeat(64), architecture: 'x86_64', bunVersion: '1.4.2',

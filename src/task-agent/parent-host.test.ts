@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { defaultTaskLauncher as launchDefaultTask, runRemoteTaskParent, type DetachedSpawn } from '../cli/tasks-cli.js';
 import { debug } from '../debug/log.js';
 import { LogStore, StoreSink } from '../mss/logging/log-store.js';
-import { hostCredentials } from '../task-orchestrator/surfaces/self-implement-pod.js';
+import { hostCredentials, podImageFreshness } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { _resetGrokRefreshCooldownForTesting, resolveGrokCredential } from '../grok/credential.js';
 import {
   judgeParentHostCredentials, PARENT_CHILD_CREDENTIAL_MIN_REMAINING_MS, judgeParentHostFacts, releaseCore, launchRemoteParent, mirrorRemoteRunLedgers, RemoteParentNotLaunchedError, parseEtime, parseHarnessParents, preflightParentHost, preflightScript, remoteLaunchScript, shouldInstallRemoteCodexAccess,
@@ -648,6 +648,39 @@ describe('발사 전 점검', () => {
     expect(releaseCore('0.2.23-dev.0')).toBe('0.2.23');
     expect(releaseCore('weird')).toBe('weird');
   });
+  test('실제 Pod 이미지 pin 검사와 부모 계약은 서로 다른 판 번호를 기준으로 한다', () => {
+    const imageCommit = '0123456789abcdef0123456789abcdef01234567';
+    const probes: string[] = [];
+    const image = podImageFreshness({ image: 'registry.example/harness:pinned', run: (command, args) => {
+      probes.push([command, ...args].join(' '));
+      return { status: 0, stdout: `${imageCommit}\n` };
+    } });
+    expect(probes).toEqual([
+      'git rev-parse HEAD',
+      'docker image inspect registry.example/harness:pinned --format {{index .Config.Labels "elanous.commit"}}',
+    ]);
+    expect(image).toMatchObject({ imageCommit, headCommit: imageCommit, fresh: true });
+    const facts = {
+      version: '0.2.18',
+      ledgerSchema: 'run-ledger-line/v1',
+      parentProtocol: 'parent-host-facts/v1',
+      config: '1', podPool: '1', repo: '1', kubectl: '1',
+    };
+    expect(judgeParentHostFacts(facts, { localVersion: '0.2.23-dev.0', launchHoldActive: false })).toEqual([]);
+    expect(judgeParentHostFacts({ ...facts, parentProtocol: 'parent-host-facts/v0' },
+      { localVersion: '0.2.23-dev.0', launchHoldActive: false })).toEqual([
+      'compatibility-contract-mismatch: parent-HQ-protocol remote parent-host-facts/v0 ≠ HQ parent-host-facts/v1',
+    ]);
+  });
+  test('계약을 보고하지 않는 레거시 원격은 기준판은 통과하고 다른 기준판은 차단한다', () => {
+    const legacy = { config: '1', podPool: '1', repo: '1', kubectl: '1' };
+    expect(judgeParentHostFacts({ ...legacy, version: '0.2.20' },
+      { localVersion: '0.2.20-dev.0', launchHoldActive: false })).toEqual([]);
+    expect(judgeParentHostFacts({ ...legacy, version: '0.2.19' },
+      { localVersion: '0.2.20-dev.0', launchHoldActive: false })).toEqual([
+      'version-mismatch: remote 0.2.19 ≠ HQ 0.2.20-dev.0',
+    ]);
+  });
   test('ssh 실패 = unreachable', () => {
     const result = preflightParentHost({ target: TARGET, localVersion: 'x', launchHoldActive: false, ssh: stubSsh([{ match: /./, status: 255, stderr: 'ssh: connect timed out' }]) });
     expect(result.ok).toBe(false);
@@ -1090,7 +1123,7 @@ describe('원격 스크립트 — 실제 셸', () => {
     const { home } = fakeHome('true');
     const mirror = (account: string) => ({
       account,
-      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: `access-${account}`, refreshToken: '', refresh_token: '' } } } }),
+      elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { authMode: 'chatgpt', tokens: { accessToken: `access-${account}`, refreshToken: '', refresh_token: '', expiresAt: Date.now() + 4 * 60 * 60_000 } } } }),
       codexAuth: JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: `access-${account}`, refresh_token: '', refreshToken: '' } }),
     });
     try {
@@ -1127,6 +1160,7 @@ describe('원격 스크립트 — 실제 셸', () => {
       });
       expect(parentEntry.status).toBe(0);
       expect(parentEntry.stdout).toContain('third');
+      expect(parentEntry.stdout).toContain('source=mirror');
     } finally { rmSync(home, { recursive: true, force: true }); }
   });
 

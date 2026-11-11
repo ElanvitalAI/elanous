@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-FAKE-TELEGRAM-OUTBOUND-TS",
+  "path": "src/ux-sim/fake-telegram-outbound.ts",
+  "boundary": "Generic notify text/actions/refId/dedupKey outbound boundary, entirely in memory; optional legacy briefingId/buttons remain compatible.",
+  "deviceIds": ["fake-telegram-outbound"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

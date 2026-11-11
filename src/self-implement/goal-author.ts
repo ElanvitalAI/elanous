@@ -22,8 +22,8 @@ function observeGoalAuthor(
   debug.log(category, event, data);
   debug.log(category === 'goal-author' ? 'harness.author' : 'harness.author.clarify', event, data);
 }
-import { getUserConfig } from '../user-config.js';
-import { getProviderForConfig, streamLLM, type LLMMessage } from '../llm.js';
+import { getUserConfig } from '../user-config/reader.js';
+import type { LLMMessage, LLMOpts } from '../llm.js';
 
 export type GoalAuthorGrade = 'full' | 'lite';
 export type GoalAuthorGradeSource = 'flag' | 'env' | 'config' | 'default';
@@ -158,6 +158,32 @@ export interface GoalAuthorReviewerPrecheckResult {
   readonly unappliedItems: readonly string[];
 }
 
+/** OpenRouter's strict JSON Schema keeps Solar's `fixes` and evidence arrays parseable. */
+export const GOAL_AUTHOR_REVIEWER_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'goal_author_reviewer_precheck',
+    strict: true,
+    schema: {
+      type: 'object', additionalProperties: false,
+      properties: {
+        suggestions: { type: 'array', items: { type: 'string' } },
+        fixes: { type: 'array', items: { type: 'string' } },
+        fixEvidence: { type: 'array', items: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            fix: { type: 'string' }, originalText: { type: 'string' }, revisedText: { type: 'string' },
+          },
+          required: ['fix', 'originalText', 'revisedText'],
+        } },
+        remainingNeedsHuman: { type: 'array', items: { type: 'string' } },
+        revisedDocument: { type: 'string' },
+      },
+      required: ['suggestions', 'fixes', 'fixEvidence', 'remainingNeedsHuman', 'revisedDocument'],
+    },
+  },
+} as const;
+
 export interface GoalAuthorReviewerPrecheckContext {
   readonly conversationId: string;
   readonly round: number;
@@ -175,7 +201,6 @@ export interface GoalAuthorReviewerDialogResult {
   readonly result?: GoalAuthorReviewerPrecheckResult;
 }
 
-const GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL = 'gpt-6.1-terra';
 
 export function parseGoalAuthorReviewerPrecheck(raw: string): GoalAuthorReviewerPrecheckResult {
   const text = raw.trim().replace(/^```(?:json)?\s*/iu, '').replace(/\s*```$/u, '');
@@ -261,14 +286,9 @@ export function resolveGoalAuthorReviewerPrecheckEnabled(config = getUserConfig(
 
 export async function runGoalAuthorReviewerPrecheck(
   document: string,
-  deps: { config?: ReturnType<typeof getUserConfig>; stream?: typeof streamLLM; reviewContext?: GoalAuthorReviewerPrecheckContext; mockScenarioCatalog?: string } = {},
+  deps: { config?: ReturnType<typeof getUserConfig>; stream?: (messages: LLMMessage[], onChunk: (delta: string, all: string) => void, opts?: LLMOpts) => Promise<string>; reviewContext?: GoalAuthorReviewerPrecheckContext; mockScenarioCatalog?: string } = {},
 ): Promise<GoalAuthorReviewerPrecheckResult> {
   const config = deps.config ?? getUserConfig();
-  const pinnedConfig = {
-    ...config,
-    llm: { ...config.llm, provider: 'openai-codex' as const, model: GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL },
-  };
-  const provider = getProviderForConfig(pinnedConfig, GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL);
   const prompt = [
     'Review this completed goal document before it is written. Return only JSON with string-array fields suggestions, fixes, remainingNeedsHuman, a fixEvidence array of { fix, originalText, revisedText }, and a revisedDocument string.',
     'Challenge each completion-boundary constraint instead of treating it as inherently necessary. 제약을 의심하라: 저작 문면의 세계와 구현의 세계에서 같은 제약인가? 카탈로그에 있는 목장치나 사건 주입으로 같은 동작을 관찰할 수 있는가? 실물 점검만 요구하는 경계라면 의도를 보존하는 목장치·주입 사건을 제안하라. Do not require a real-world inspection by default. Preserve a live check when the ask explicitly requires an external-system outcome.',
@@ -281,18 +301,18 @@ export async function runGoalAuthorReviewerPrecheck(
     document,
   ].join('\n\n');
   const messages: LLMMessage[] = [{ role: 'user', content: prompt }];
-  let actualProvider = provider.name;
-  let actualModel = GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL;
-  const raw = await (deps.stream ?? streamLLM)(messages, () => undefined, {
-    provider,
-    model: GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL,
+  let actualProvider = '';
+  let actualModel = '';
+  const { streamRoleLlm } = await import('../llm/role-stream.js');
+  const raw = await streamRoleLlm('review', messages, () => undefined, {
+    config,
+    responseFormat: GOAL_AUTHOR_REVIEWER_RESPONSE_FORMAT,
     reasoningEffort: 'medium',
     maxTokens: 3000,
-    usageRole: 'review',
     usagePhase: 'author-reviewer-precheck',
     usageSite: 'author-reviewer-precheck',
     onResolvedProvider: (resolvedProvider, resolvedModel) => { actualProvider = resolvedProvider; actualModel = resolvedModel; },
-  });
+  }, deps.stream ? { streamLLM: deps.stream } : {});
   debug.log('author.reviewer-precheck', 'response', { provider: actualProvider, model: actualModel, responseChars: raw.length });
   const result = parseGoalAuthorReviewerPrecheck(raw);
   const values = inspectGoalDoneBoundary(document).values;
@@ -367,8 +387,6 @@ export async function executeGoalAuthorReviewerPrecheck(
     const status = valid ? 'completed' : 'rejected-soft';
     observe(valid ? 'completed' : 'revision-rejected', {
       authorRunId,
-      provider: 'openai-codex',
-      model: GOAL_AUTHOR_REVIEWER_PRECHECK_MODEL,
       status,
       proposedSuggestionCount: result.suggestions.length,
       proposedFixCount: result.fixes.length,

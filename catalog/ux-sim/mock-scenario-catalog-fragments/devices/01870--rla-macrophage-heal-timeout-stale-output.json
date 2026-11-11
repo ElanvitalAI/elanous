@@ -1,0 +1,28 @@
+{
+  "id": "rla-macrophage-heal-timeout-stale-output",
+  "name": "RLA macrophage timeout and stale output simulation",
+  "checklistCells": ["RLA-MACROPHAGE-HEAL"],
+  "implementation": [
+    "src/ux-sim/rla-macrophage-heal-timeout-stale-output-sim.ts",
+    "src/release-loop/macrophage-heal.ts"
+  ],
+  "tests": ["src/ux-sim/rla-macrophage-heal-timeout-stale-output-sim.test.ts"],
+  "target": "Exercise the real macrophage planner against an isolated release incident inventory, covering exhausted timeout budget, stale generated output, and fail-closed controls.",
+  "inputs": [
+    "timeoutBurned=true evidence from the injected gate-timeout boundary",
+    "source and generated fingerprints that differ",
+    "matching fingerprints and unmeasured timeout controls"
+  ],
+  "observations": [
+    "timeout case recommends and simulates quarantine-test",
+    "stale generated output recommends and simulates regenerate",
+    "matching or unmeasured evidence remains retained",
+    "remaining inventory contains only the retained controls"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/rla-macrophage-heal-timeout-stale-output-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -26,8 +26,8 @@ test('warm provider reaches the Nexus machine-pool route and fails closed on the
   const state = createNexusState({ nexusVersion: 'sim', phase: 'test' });
   const eventBus = new NexusEventBus();
   state.bus = eventBus;
-  const opts = { state, registry: new TabRegistry(state), eventBus } as NexusHttpServerOpts;
-  const server = { requestIP: () => ({ address: '127.0.0.1' }) } as never;
+  const opts = { state, registry: new TabRegistry(state), eventBus, allowInsecureResourceLedgerLoopbackForTests: true } as NexusHttpServerOpts;
+  const server = { requestIP: (request: Request) => ({ address: new URL(request.url).hostname === '100.64.0.10' ? '100.64.0.20' : '127.0.0.1' }) } as never;
   const devProxy = createDevProxyRuntimeRef();
   const tailnetValidation = { readTailnetAddresses: () => ['100.64.0.10'] };
   const simulatedFetch: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
@@ -51,7 +51,7 @@ test('warm provider reaches the Nexus machine-pool route and fails closed on the
   }
 });
 
-test('RESOURCE-LEDGER-PUBLIC-AUTH sim: machine tokens expire at exp; legacy tokens warn and remain accepted', async () => {
+test('RESOURCE-LEDGER-PUBLIC-AUTH sim: public HTTPS reads are host-scoped and fail closed on HTTP, expiry, legacy, and revocation', async () => {
   await withSimClock(Date.parse('2026-11-09T00:00:00.000Z'), async clock => {
     const configRoot = mkdtempSync(join(tmpdir(), 'warm-pool-machine-token-ttl-'));
     setElanousConfigDir(configRoot);
@@ -60,7 +60,9 @@ test('RESOURCE-LEDGER-PUBLIC-AUTH sim: machine tokens expire at exp; legacy toke
     const logSink = new StoreSink(logStore, 'ux-sim:machine-token-ttl', { installExitHandlers: false });
     const unregisterLogSink = debug.registerSink(logSink);
     const machine = 'host-a';
+    const otherMachine = 'host-b';
     const token = issueMemberToken(machine);
+    const otherToken = issueMemberToken(otherMachine);
     const tokenStore = join(configRoot, 'control', 'member-tokens.json');
     const saved = JSON.parse(readFileSync(tokenStore, 'utf8')) as Record<string, { sha256: string; issuedAt: string; expiresAt: string }>;
     const expiresAt = Date.parse(saved[machine]!.expiresAt);
@@ -68,8 +70,19 @@ test('RESOURCE-LEDGER-PUBLIC-AUTH sim: machine tokens expire at exp; legacy toke
     const eventBus = new NexusEventBus();
     state.bus = eventBus;
     const opts = { state, registry: new TabRegistry(state), eventBus } as NexusHttpServerOpts;
-    const server = { requestIP: () => ({ address: '127.0.0.1' }) } as never;
-    const url = 'http://127.0.0.1:8413/v1/resource-ledger/pools';
+    const server = { requestIP: () => ({ address: '198.51.100.42' }) } as never;
+    const url = 'https://nexus.example:8413/v1/resource-ledger/pools';
+    const pool = (host: string): MachinePoolDeclaration => ({ purpose: 'gate', fanoutGroupId: `gate-${host}`,
+      members: [{ host, count: 1, digest: `sha256:${'b'.repeat(64)}`, role: 'both' }],
+      fanoutGroup: { shard: { kind: 'gate', input: 'gate-shard', result: 'gate-receipt', fingerprint: 'gate-v1' } },
+      fingerprint: { runtime: 'bun-v1', environment: 'linux', skillPacks: [] },
+      cleanup: { procedure: 'clean-v1', verify: 'verify-v1' } });
+    const machinePool = pool(machine);
+    const otherMachinePool = pool(otherMachine);
+    const pools = [machinePool, otherMachinePool];
+    mkdirSync(join(configRoot, 'resource-ledger'), { recursive: true });
+    writeFileSync(join(configRoot, 'resource-ledger', 'events.jsonl'), pools.map((value, index) =>
+      JSON.stringify({ event: 'pool-declared', at: `2026-11-08T00:00:0${index}.000Z`, pool: value })).join('\n') + '\n');
     const tailnetValidation = { readTailnetAddresses: () => [] };
     const simulatedFetch: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
       await routeRequest(new Request(input, init), opts, server, null, createDevProxyRuntimeRef())
@@ -78,7 +91,24 @@ test('RESOURCE-LEDGER-PUBLIC-AUTH sim: machine tokens expire at exp; legacy toke
     try {
       expect(expiresAt - Date.parse(saved[machine]!.issuedAt)).toBe(MEMBER_TOKEN_TTL_MS);
       clock.setTime(expiresAt - 1);
-      expect((await simulatedFetch(url, { headers: { authorization: `Bearer ${token}` } })).status).toBe(200);
+      const ownPools = await fetchMachinePoolDeclarationsFromNexus(url, token, simulatedFetch);
+      expect(ownPools).toEqual([machinePool]);
+      expect(await fetchMachinePoolDeclarationsFromNexus(url, otherToken, simulatedFetch)).toEqual([otherMachinePool]);
+
+      const cleartext = await simulatedFetch(url.replace('https:', 'http:'), { headers: { authorization: `Bearer ${token}` } });
+      expect(cleartext.status).toBe(403);
+      expect(await cleartext.json()).toEqual({ error: 'secure-transport-required' });
+
+      const loopbackProxy = { requestIP: () => ({ address: '127.0.0.1' }) } as never;
+      const forwardedPlaintext = await routeRequest(new Request('http://127.0.0.1:8413/v1/resource-ledger/pools', {
+        headers: { host: 'public.example', authorization: `Bearer ${token}` },
+      }), opts, loopbackProxy, null, createDevProxyRuntimeRef());
+      expect(forwardedPlaintext?.status).toBe(403);
+      expect(await forwardedPlaintext?.json()).toEqual({ error: 'secure-transport-required' });
+      const localOnly = await routeRequest(new Request('http://127.0.0.1:8413/v1/resource-ledger/pools', {
+        headers: { host: '127.0.0.1:8413', authorization: `Bearer ${token}` },
+      }), { ...opts, allowInsecureResourceLedgerLoopbackForTests: true }, loopbackProxy, null, createDevProxyRuntimeRef());
+      expect(localOnly?.status).toBe(200);
 
       clock.setTime(expiresAt);
       const expired = await simulatedFetch(url, { headers: { authorization: `Bearer ${token}` } });
@@ -90,11 +120,17 @@ test('RESOURCE-LEDGER-PUBLIC-AUTH sim: machine tokens expire at exp; legacy toke
       const legacy = JSON.parse(readFileSync(tokenStore, 'utf8')) as Record<string, Record<string, unknown>>;
       delete legacy[machine]!.expiresAt;
       writeFileSync(tokenStore, JSON.stringify(legacy));
-      expect((await simulatedFetch(url, { headers: { authorization: `Bearer ${token}` } })).status).toBe(200);
+      expect((await simulatedFetch(url, { headers: { authorization: `Bearer ${token}` } })).status).toBe(401);
+      const replacement = issueMemberToken(machine);
+      revokeMemberToken(machine);
+      expect((await simulatedFetch(url, { headers: { authorization: `Bearer ${replacement}` } })).status).toBe(401);
       logSink.flush();
-      const warnings = logStore.queryAll({ exactCategories: ['resource-ledger.auth'] });
-      expect(warnings.some(row => row.event === 'legacy-machine-token-without-exp'
-        && JSON.parse(row.data ?? '{}').machine === machine)).toBe(true);
+      const authLogs = logStore.queryAll({ exactCategories: ['resource-ledger.auth'] });
+      const refused = authLogs.filter(row => row.event === 'request-refused').map(row => JSON.parse(row.data ?? '{}'));
+      expect(refused.some(row => row.reason === 'secure-transport-required')).toBe(true);
+      expect(refused.map(row => row.reason)).toContain('unauthorized');
+      expect(authLogs.map(row => row.data ?? '').join('\n')).not.toContain(token);
+      expect(authLogs.map(row => row.data ?? '').join('\n')).not.toContain(otherToken);
     } finally {
       unregisterLogSink();
       logSink.flush();
@@ -123,8 +159,8 @@ test('five local and tailnet hosts build providers from only their own shared-le
   const state = createNexusState({ nexusVersion: 'sim', phase: 'test' });
   const eventBus = new NexusEventBus();
   state.bus = eventBus;
-  const opts = { state, registry: new TabRegistry(state), eventBus } as NexusHttpServerOpts;
-  const server = { requestIP: () => ({ address: '127.0.0.1' }) } as never;
+  const opts = { state, registry: new TabRegistry(state), eventBus, allowInsecureResourceLedgerLoopbackForTests: true } as NexusHttpServerOpts;
+  const server = { requestIP: (request: Request) => ({ address: new URL(request.url).hostname === '100.64.0.10' ? '100.64.0.20' : '127.0.0.1' }) } as never;
   const tailnetValidation = { readTailnetAddresses: () => ['100.64.0.10'] };
   const simulatedFetch: typeof fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
     await routeRequest(new Request(input, init), opts, server, null, createDevProxyRuntimeRef())
@@ -208,7 +244,7 @@ test('warm provider keeps known pool declarations when the ledger has an unknown
     const warning = logStore.query({ categories: ['resource-ledger'], limit: 10 })
       .find(row => row.event === 'unknown-events-skipped');
     expect(warning).toBeDefined();
-    expect(JSON.parse(warning?.data ?? '{}')).toEqual({ total: 7, eventTypes: [
+    expect(JSON.parse(warning?.data ?? '{}')).toMatchObject({ total: 7, eventTypes: [
       { eventTypeJson: JSON.stringify('future-pool-observation-v2'), count: 2 },
       { eventTypeJson: JSON.stringify('future-pool-observation-v3'), count: 1 },
       { eventTypeJson: JSON.stringify(longUnknownType), count: 1 },

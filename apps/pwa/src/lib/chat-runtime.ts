@@ -1120,6 +1120,7 @@ export function runChatTurnObserver(
   let placeholderId: string | null = null;
   const blocks: ChatBlock[] = [];
   let textIdx = -1;
+  let finalTextStart = 0;
   let imageCount = 0;
   let toolCount = 0;
   let mcpAppCount = 0;
@@ -1130,6 +1131,7 @@ export function runChatTurnObserver(
     placeholderId = null;
     blocks.length = 0;
     textIdx = -1;
+    finalTextStart = 0;
     imageCount = 0;
     toolCount = 0;
     mcpAppCount = 0;
@@ -1194,6 +1196,7 @@ export function runChatTurnObserver(
     },
     onToolCall: ({ id, name, args }) => {
       if (dropCurrentTurn || placeholderId === null) return;
+      finalTextStart = textIdx === -1 ? 0 : (blocks[textIdx] as Extract<ChatBlock, { kind: 'text' }>).text.length;
       toolCount += 1;
       blocks.push({ kind: 'tool_use', id, name, status: 'running', startedAt: Date.now(), args });
       handlers.onPartialBlocks(placeholderId, snapshot());
@@ -1206,6 +1209,7 @@ export function runChatTurnObserver(
       const status: 'done' | 'error' = ok ? 'done' : 'error';
       const sources = name === 'context_now' ? contextSources(rawOutput, Date.now()) : null;
       if (idx === -1) {
+        finalTextStart = textIdx === -1 ? 0 : (blocks[textIdx] as Extract<ChatBlock, { kind: 'text' }>).text.length;
         toolCount += 1;
         blocks.push({
           kind: 'tool_use',
@@ -1268,6 +1272,10 @@ export function runChatTurnObserver(
         resetTurn();
         return;
       }
+      const streamedText = textIdx === -1 ? '' : (blocks[textIdx] as Extract<ChatBlock, { kind: 'text' }>).text;
+      // A rewritten server answer may coincidentally begin with a progress word.
+      // Require observed post-tool prose, then allow an unstreamed tail at turn-end.
+      const finalStart = streamedText.length > finalTextStart && res.text?.startsWith(streamedText) ? finalTextStart : 0;
       if (textIdx !== -1 && res.text) {
         blocks[textIdx] = { kind: 'text', text: res.text };
       }
@@ -1290,6 +1298,7 @@ export function runChatTurnObserver(
         id: `m-obs-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         role: 'assistant',
         text: res.text ?? '',
+        finalTextStart: finalStart,
         ...(isIncompleteChatStopReason(res.stopReason) ? { incomplete: true } : {}),
         timestamp: Date.now(),
         meta: {
@@ -1713,6 +1722,7 @@ interface AcpSessionUpdateContent {
 
 interface AcpSessionUpdate {
   sessionUpdate?: string;
+  _meta?: { elanousTurn?: { phase?: string; text?: string; stopReason?: string } };
   content?: AcpSessionUpdateContent;
   toolCallId?: string;
   rawInput?: Record<string, unknown>;
@@ -1811,21 +1821,24 @@ export function runAcpForeignTurnObserver(
     const update = params.update;
     if (!update) return;
 
-    if (update.sessionUpdate === 'elanous_turn_begin') {
+    const turnBoundary = update._meta?.elanousTurn;
+    if (turnBoundary?.phase === 'begin' || update.sessionUpdate === 'elanous_turn_begin') {
       // The server now owns this boundary. Do not infer completion from silence.
       if (placeholderId !== null) finishIncomplete();
       explicitTurn = true;
       ensurePlaceholder();
       return;
     }
-    if (update.sessionUpdate === 'elanous_turn_end') {
+    if (turnBoundary?.phase === 'end' || update.sessionUpdate === 'elanous_turn_end') {
       if (!explicitTurn) return;
       const ph = placeholderId;
       let finalStart = finalTextStart;
-      const finalTextIsAuthoritative = typeof update.text === 'string'
-        && (update.text.length > 0 || !isIncompleteChatStopReason(update.stopReason));
-      if (ph && finalTextIsAuthoritative && typeof update.text === 'string') {
-        const authoritativeText = update.text;
+      const finalText = turnBoundary?.text ?? update.text;
+      const stopReason = turnBoundary?.stopReason ?? update.stopReason;
+      const finalTextIsAuthoritative = typeof finalText === 'string'
+        && (finalText.length > 0 || !isIncompleteChatStopReason(stopReason));
+      if (ph && finalTextIsAuthoritative && typeof finalText === 'string') {
+        const authoritativeText = finalText;
         const streamedText = textIdx === -1 ? '' : (blocks[textIdx] as Extract<ChatBlock, { kind: 'text' }>).text;
         // Keep the pre-tool boundary only when that exact prose is still the
         // beginning of the server's final body. The post-tool prose may change.
@@ -1837,13 +1850,13 @@ export function runAcpForeignTurnObserver(
           blocks[textIdx] = { kind: 'text', text: authoritativeText };
         }
         handlers.onPartialBlocks(ph, snapshot());
-      } else if (update.text === '') {
+      } else if (finalText === '') {
         // A cancelled/failed runner may have streamed a useful partial answer.
         finalStart = 0;
       }
       if (ph) debugLog('webterm.chat.acp.foreign-turn.end', { id: ph, images: imageCount, tools: toolCount });
       reset();
-      if (ph) handlers.onFinalize?.(ph, { stopReason: update.stopReason ?? 'error', finalTextStart: finalStart });
+      if (ph) handlers.onFinalize?.(ph, { stopReason: stopReason ?? 'error', finalTextStart: finalStart });
       return;
     }
 

@@ -24,6 +24,24 @@ export const SEAT_MESSAGE_ROUTES: Readonly<Record<string, { msgAddress: string; 
 export type LoopReplyBody = 'none' | 'rules' | 'agent';
 export type MessageWake = 'sse' | 'pty-inject' | 'herdr' | 'cron' | 'none';
 
+export type PaneMessageAddress =
+  | { kind: 'pane'; paneId: string }
+  | { kind: 'session'; sessionId: string }
+  | { kind: 'seat-pane'; seat: string; pane: string };
+
+/** Parse concrete Herdr destinations without treating their IDs as seat names. */
+export function parsePaneMessageAddress(address: string): PaneMessageAddress | null {
+  const raw = address.trim();
+  const session = /^session:([A-Za-z0-9_.-]{1,128})$/i.exec(raw);
+  if (session) return { kind: 'session', sessionId: session[1]! };
+  const pane = /^pane:([A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+)$/i.exec(raw)
+    ?? /^([A-Za-z0-9_.-]+:p[0-9]+)$/i.exec(raw);
+  if (pane) return { kind: 'pane', paneId: pane[1]! };
+  const seatPane = /^([A-Za-z][A-Za-z0-9_-]{0,63})\/([A-Za-z0-9_.-]+)$/.exec(raw);
+  if (seatPane) return { kind: 'seat-pane', seat: seatPane[1]!.toUpperCase(), pane: seatPane[2]! };
+  return null;
+}
+
 export function loopMessageRoute(id: string): { msgAddress: string | null; replyBody: LoopReplyBody; wake: MessageWake } {
   return Object.hasOwn(LOOP_MESSAGE_ROUTES, id)
     ? LOOP_MESSAGE_ROUTES[id as keyof typeof LOOP_MESSAGE_ROUTES]

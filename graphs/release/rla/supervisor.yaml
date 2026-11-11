@@ -1,0 +1,23 @@
+graph_id: rla-supervisor
+version: 1
+entry_node: observe
+terminal_nodes: [done, failed, needs-human]
+nodes:
+  - { node_id: observe, kind: agent, recipe: 'cmd:observe', max_visits: 1 }
+  - { node_id: reason, kind: prompt, recipe: 'prompt:reason', max_visits: 1, contract: { inputs: [observation, context, knowledgePacks, templateMemory], tools: none, outputs: [apiVersion, verb, rationale, changes, rollbackWhen] } }
+  - { node_id: propose, kind: agent, recipe: 'cmd:propose', max_visits: 1 }
+  - { node_id: validate, kind: judge, recipe: 'cmd:validate', max_visits: 1 }
+  - { node_id: apply, kind: agent, recipe: 'cmd:apply', max_visits: 1 }
+  - { node_id: verify, kind: gate, recipe: 'cmd:verify', max_visits: 1 }
+  - { node_id: rollback, kind: agent, recipe: 'cmd:rollback', max_visits: 1 }
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: observe, on: outcome, map: { ok: propose, novel: reason, rollback_required: rollback, fail: failed, error: failed } }
+  - { from: reason, on: outcome, map: { ok: propose, fail: failed, error: failed } }
+  - { from: propose, on: outcome, map: { ok: validate, rollback_required: rollback, fail: failed, error: failed } }
+  - { from: validate, on: outcome, map: { ok: apply, reuse: done, input_required: needs-human, rollback_required: rollback, fail: failed, error: failed } }
+  - { from: apply, on: outcome, map: { ok: verify, input_required: needs-human, rollback_required: rollback, fail: failed, error: failed } }
+  - { from: verify, on: outcome, map: { ok: done, rollback_required: rollback, fail: rollback, error: rollback } }
+  - { from: rollback, on: outcome, map: { ok: failed, fail: failed, error: failed } }

@@ -89,14 +89,48 @@ export function fanOutGraphSource(source: string, graph: GraphTemplateSpec, bran
   const failed = graph.unit ? terminals.find((terminal) => terminal === 'failed')
     : terminals.find((terminal) => topLevelTerminalStatus(graph.graphId, terminal) === 'failed');
   if (!done || !failed) throw new Error(`fan-out requires declared success and failure terminals: ${graph.graphId}`);
-  document.entry_node = branchNode;
-  if (Array.isArray(document.nodes)) {
-    document.nodes = document.nodes.map((entry) => {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
-      const { needs: _needs, ...node } = entry as Record<string, unknown>;
-      return node;
-    });
+  if (document.apiVersion === 'elanous.dev/graph/v2') {
+    const idMatch = /^(.*)__map_(\d+)$/.exec(branchNode);
+    const originalId = idMatch?.[1];
+    const sourceNodes = Array.isArray(document.nodes) ? document.nodes.filter((entry): entry is Record<string, unknown> =>
+      !!entry && typeof entry === 'object' && !Array.isArray(entry)) : [];
+    const sourceMapNode = originalId ? sourceNodes.find((entry) => entry.id === originalId && entry.map && typeof entry.map === 'object') : undefined;
+    const loweredBranch = graph.nodes.find((node) => node.nodeId === branchNode);
+    const loweredInput = loweredBranch?.input && typeof loweredBranch.input === 'object' && !Array.isArray(loweredBranch.input)
+      ? loweredBranch.input as Record<string, unknown> : undefined;
+    const mapItem = loweredInput?.__graphV2MapItem;
+    if (!sourceMapNode || !mapItem) throw new Error(`cannot reconstruct lowered static map branch: ${branchNode}`);
+    const { map: _map, ...branchSource } = sourceMapNode;
+    const priorWith = branchSource.with && typeof branchSource.with === 'object' && !Array.isArray(branchSource.with)
+      ? branchSource.with as Record<string, unknown> : {};
+    // The selected branch binds its item from branchParentOutputs; unrelated parent nodes would be
+    // revalidated without their edges in this child graph (and unit exit maps would falsely fail).
+    document.nodes = [{ ...branchSource, id: branchNode, with: { ...priorWith, __graphV2MapItem: mapItem } }];
+    document.entry = branchNode;
+  } else {
+    document.entry_node = branchNode;
+    if (Array.isArray(document.nodes)) {
+      document.nodes = document.nodes.map((entry) => {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+        const { needs: _needs, ...node } = entry as Record<string, unknown>;
+        return node;
+      });
+    }
   }
-  document.edges = [{ from: branchNode, on: 'outcome', map: { ok: done, fail: failed, error: failed } }];
+  const childNodeIds = new Set((Array.isArray(document.nodes) ? document.nodes : []).flatMap((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const node = entry as Record<string, unknown>;
+    const id = typeof node.id === 'string' ? node.id : node.node_id;
+    return typeof id === 'string' ? [id] : [];
+  }));
+  const unitNodeIds = new Set(graph.nodes.filter((node) => node.kind === 'subgraph' && childNodeIds.has(node.nodeId))
+    .map((node) => node.nodeId));
+  const unitEdges = Array.isArray(document.edges) ? document.edges.filter((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    const from = (entry as Record<string, unknown>).from;
+    return typeof from === 'string' && unitNodeIds.has(from);
+  }) : [];
+  // Keep unrelated unit exit contracts intact while the fan-out child executes just its selected branch.
+  document.edges = [...unitEdges, { from: branchNode, on: 'outcome', map: { ok: done, fail: failed, error: failed } }];
   return stringifyYaml(document);
 }

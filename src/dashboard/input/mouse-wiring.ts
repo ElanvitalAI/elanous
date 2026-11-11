@@ -1,6 +1,4 @@
 import { createMouseStatusLine } from './mouse-status-line.js';
-import { DEFAULT_PILL_TOOLTIPS, pillHoverTarget } from './mouse-pill-hover.js';
-export { pillHoverTarget } from './mouse-pill-hover.js';
 export { fitStatusSegments, statusSegmentKind, truncateToVisibleWidth, clampPillsToWidth } from './mouse-status-line.js';
 import type { DashboardInputHitTarget, DashboardModalHitTarget, DashboardMousePreflightInputClassifier, DashboardMousePreflightModalClassifier, DashboardMousePreflightPaneClassifier, DashboardMouseWiring, DashboardMouseWiringDeps, DashboardPaneHitTarget, DashboardStatusInput, DockItemBound } from './mouse-wiring-types.js';
 export type { DashboardInputHitTarget, DashboardModalHitTarget, DashboardMousePreflightInputClassifier, DashboardMousePreflightModalClassifier, DashboardMousePreflightPaneClassifier, DashboardMouseWiring, DashboardMouseWiringDeps, DashboardPaneHitTarget, DashboardStatusInput, DockItemBound } from './mouse-wiring-types.js';
@@ -59,15 +57,6 @@ import type { PillBound, PillName } from '../../status/pills.js';
 import { pillAtColumn } from '../../status/pills.js';
 import { classifyStatusBarHit, hitTargetLabel } from '../../display/hit-target.js';
 import { rectContains } from '../../display/rect.js';
-import {
-  createHoverTracker,
-  wireHoverToContextKeys,
-  type HoverTarget,
-  type HoverTracker,
-} from '../../ui/hover-tracker.js';
-import { createHoverPresenter, type HoverPresenter } from '../../ui/hover-presenter.js';
-import { resolveTooltipChromeSpec } from '../../ui/chrome/tooltip-chrome.js';
-import type { ContextKeyService } from '../../input-core/context-keys.js';
 import type { ThemeTokens } from '../../theme/tokens.js';
 import type { WorkspaceHost } from '../../display/workspace-host.js';
 import type { ConversationPopupHost } from '../../conv-dash/popup-host.js';
@@ -76,17 +65,12 @@ import { modelDisplayForRotationEntry } from '../../user-config.js';
 import type { RotationEntry } from '../../user-config/types.js';
 import {
   createWdPickerRecipe,
-  createShellRollupPopupRecipe,
   createModeSwitcherRecipe,
   createDockLauncherRecipe,
-  createDockMenuTreeRecipe,
   createViewPickerRecipe,
   createWorkspaceDesktopShellRecipe,
   createWorkspaceRestoreRecipe,
   createConversationPopupShellRecipe,
-  type PaneWindowPreset,
-  type SurfaceCatalogPreset,
-  type ShellRollupEntry,
   type ViewPreset,
 } from '../../mouse-action-recipes.js';
 import {
@@ -324,85 +308,12 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
     popoverRegistrar,
   });
 
-  // IDX-5 Phase 1 — hover tracker + tooltip presenter. Both are
-  // optional: when neither `ctx` nor `hoverTracker` is supplied the
-  // wiring behaves exactly as pre-IDX-5 (no extra state, no timers,
-  // no subscriptions). When a tracker is present we bridge to
-  // ContextKeys (if ctx given) and auto-show a Tooltip surface on
-  // stable-hover targets with tooltipText.
-  const hoverHintsEnabled = deps.suppressHoverHints !== true;
   const currentPopupWorkspaceId = (): string => {
     const top = deps.getTopModalSurface?.() ?? null;
     return top && isWorkspaceInteractionSurface(top)
       ? top.id
       : 'dashboard-main';
   };
-  const hoverTracker: HoverTracker | null =
-    hoverHintsEnabled
-      ? (deps.hoverTracker ?? (deps.ctx ? createHoverTracker() : null))
-      : null;
-  const tooltipFor: (name: PillName) => string | null =
-    hoverHintsEnabled
-      ? (deps.pillTooltipText ?? ((n) => DEFAULT_PILL_TOOLTIPS[n] ?? null))
-      : (() => null);
-  let disposeHoverCtxBridge: (() => void) | null = null;
-  let hoverPresenter: HoverPresenter | null = null;
-  if (hoverTracker && deps.ctx) {
-    try {
-      disposeHoverCtxBridge = wireHoverToContextKeys(hoverTracker, deps.ctx);
-    } catch {
-      // Bridge failure must never break boot — ctx updates can be
-      // debugged out-of-band.
-    }
-  }
-  if (hoverTracker) {
-    try {
-      hoverPresenter = createHoverPresenter(hoverTracker, {
-        termSize: deps.termSize,
-        pushSurface: deps.pushModalSurface,
-        redraw: deps.redraw,
-        getTheme: deps.getTheme,
-        getChromeSpec: () => resolveTooltipChromeSpec({ title: 'Hint' }),
-        enabled: deps.hoverPopupsEnabled,
-      });
-    } catch {
-      /* presenter failure is non-fatal; hover keys still update */
-    }
-  }
-  // IDX-F5d Phase 2 — bridge pane-body hover events to widget.onHover
-  // via the host-provided dispatcher. Subscribe only when BOTH the
-  // tracker and the dispatcher are present; subscription is released
-  // in `dispose()`.
-  let disposeHoverWidgetBridge: (() => void) | null = null;
-  if (hoverTracker && deps.dispatchHoverToWidget) {
-    try {
-      const dispatch = deps.dispatchHoverToWidget;
-      disposeHoverWidgetBridge = hoverTracker.subscribe((ev) => {
-        const t = ev.target;
-        if (t.kind !== 'pane-body' || !t.paneId || !t.hit) return;
-        if (ev.kind === 'hover-over') {
-          dispatch(t.paneId, { kind: ev.kind, hit: t.hit, row: ev.y, col: ev.x });
-        } else {
-          dispatch(t.paneId, { kind: ev.kind, hit: t.hit });
-        }
-      });
-    } catch {
-      /* bridge failure non-fatal — pane-body widgets just won't see hover */
-    }
-  }
-  let disposePaneHoverBridge: (() => void) | null = null;
-  if (hoverTracker && deps.onPaneHoverEvent) {
-    try {
-      const onPaneHoverEvent = deps.onPaneHoverEvent;
-      disposePaneHoverBridge = hoverTracker.subscribe((ev) => {
-        if (ev.target.kind !== 'pane-body' || !ev.target.paneId) return;
-        onPaneHoverEvent(ev);
-      });
-    } catch {
-      /* bridge failure non-fatal — pane hover HUD remains absent */
-    }
-  }
-
   const statusLine = createMouseStatusLine({
     termSize: deps.termSize,
     conversationPopupHost: deps.conversationPopupHost,
@@ -436,14 +347,16 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
     const divider = chalk.hex(theme?.colors.muted ?? '#6c7086')('│');
     const appendDivider = () => appendDockDivider(parts, col, termCols, divider);
 
-    appendDockSegment(
-      parts,
-      dockItems,
-      col,
-      termCols,
-      chalk.hex(theme?.colors.info ?? '#89b4fa').bold('≡ Menu'),
-      { kind: 'menu' },
-    );
+    if (deps.onToggleChatOnly || deps.onExitProgram) {
+      appendDockSegment(
+        parts,
+        dockItems,
+        col,
+        termCols,
+        chalk.hex(theme?.colors.info ?? '#89b4fa').bold('≡ Menu'),
+        { kind: 'menu' },
+      );
+    }
 
     const mover = deps.getVirtualWindowMover?.();
     if (mover && windows.length > 0) {
@@ -575,56 +488,20 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
   const openDockLauncherPopup = (
     placement: import('../../status/popups.js').PopupPlacement,
   ): boolean => {
-    const panes = deps.getDockMenuWindowTargets?.() ?? [];
-    const surfaces = deps.getDockMenuSurfaceTargets?.() ?? [];
-    const canOpenWindow = panes.length > 0 && !!deps.onOpenDockWindow;
-    const canOpenSurface = surfaces.length > 0 && !!deps.onOpenDockSurface;
-    // Empty catalogs still consume the dock-row click: the parent
-    // launcher (`recipe:dock-launcher`) paints Chat only / Exit even
-    // when no window/surface targets are published. The tree recipe
-    // is reserved for hosts that actually have a submenu catalog.
-    if (!canOpenWindow && !canOpenSurface) {
-      const handle = createDockLauncherRecipe({
-        placement,
-        onPick: async (action) => {
-          if (action === 'chat-only') await deps.onToggleChatOnly?.();
-          if (action === 'exit-program') await deps.onExitProgram?.();
-          closePopup();
-        },
-        onCancel: () => closePopup(),
-        theme: deps.getTheme?.() ?? undefined,
-        shadow: undefined,
-      });
-      popupAuthority.mount(handle, 'dockLauncher', currentPopupWorkspaceId());
-      return true;
-    }
-    const handle = createDockMenuTreeRecipe({
+    const items: Array<{ value: 'chat-only' | 'exit-program'; label: string }> = [];
+    if (deps.onToggleChatOnly) items.push({ value: 'chat-only', label: 'Chat only' });
+    if (deps.onExitProgram) items.push({ value: 'exit-program', label: 'Exit program' });
+    if (items.length === 0) return false;
+    const handle = createDockLauncherRecipe({
       placement,
-      windowPanes: panes,
-      surfaces,
-      onOpenWindow: async (paneId) => {
-        await deps.onOpenDockWindow?.(paneId);
-        deps.redraw();
-        closePopup();
-      },
-      onOpenSurface: async (surfaceId) => {
-        await deps.onOpenDockSurface?.(surfaceId);
-        deps.redraw();
-        closePopup();
-      },
-      onToggleChatOnly: async () => {
-        await deps.onToggleChatOnly?.();
-        closePopup();
-      },
-      onExitProgram: async () => {
-        await deps.onExitProgram?.();
+      items,
+      onPick: async (action) => {
+        if (action === 'chat-only') await deps.onToggleChatOnly?.();
+        if (action === 'exit-program') await deps.onExitProgram?.();
         closePopup();
       },
       onCancel: () => closePopup(),
       theme: deps.getTheme?.() ?? undefined,
-      // Bottom-anchored dock popup should not project a shadow into the
-      // fixed dock row; keep the menu slab itself but skip the extra
-      // shadow band here.
       shadow: undefined,
     });
     popupAuthority.mount(handle, 'dockLauncher', currentPopupWorkspaceId());
@@ -862,28 +739,6 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
         shadow: pillPopupShadow(),
         onMinimize: () => minimizePopup('recipe:mode', 'Switch mode'),
       });
-    } else if (pill.name === 'shellRollup') {
-      // SRF-4 — anchored popup listing live shell-runner handles.
-      const entries = deps.getShellRollupEntries?.() ?? [];
-      if (entries.length === 0) {
-        toastStack.push({ text: 'No shell handles — RunShell(mode:"vw") spawns one', kind: 'info' });
-        deps.redraw();
-        return;
-      }
-      handle = createShellRollupPopupRecipe({
-        entries,
-        placement,
-        onPick: (id) => {
-          try { deps.onShellRollupPick?.(id); } catch { /* isolate */ }
-          closePopup();
-          deps.redraw();
-        },
-        onCancel: () => closePopup(),
-        toasts: toastStack,
-        theme: deps.getTheme?.() ?? undefined,
-        shadow: pillPopupShadow(),
-        onMinimize: () => minimizePopup('recipe:shell-rollup', 'Shells'),
-      });
     } else if (pill.name === 'workingDir') {
       const paths = deps.getRecentWds();
       if (paths.length === 0) {
@@ -1066,52 +921,6 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
       width: Math.max(minWidth, nextRight - left + 1),
       height: Math.max(minHeight, nextBottom - top + 1),
     };
-  };
-
-  const feedHover = (ev: DisplayMouseEvent): void => {
-    if (!hoverTracker) return;
-    // Feed on every event we can observe. Motion is the primary
-    // signal; click / release / drag also give us coordinates so
-    // stable-hover can fire even in 1002 mode (no pure motion).
-    // `scroll-up/down` rarely move the pointer, but updating anyway
-    // is safe — equality-based change detection inside the tracker
-    // makes repeat calls cheap.
-    //
-    // Priority:
-    //   1. Pill hover (pre-existing — has tooltip copy)
-    //   2. Pane-body hit with optional widget refinement (F5d Phase 2)
-    //   3. null — pointer is off every known region (clear current)
-    const pill = pillHoverTarget(pills, statusRow, ev.row, ev.col, tooltipFor);
-    if (pill) {
-      hoverTracker.update({ x: ev.col, y: ev.row }, pill);
-      return;
-    }
-    // IDX-F5d Phase 2 — pane-body hover feed. Builds the HoverTarget
-    // from the already-classified `ev.hitTarget` (must have been set
-    // by the classification block that ran before us — see handleMouse
-    // below). Only pane-body flows through here today; pane-title /
-    // pane-nav-tab can follow the same pattern if a future consumer
-    // needs them (tooltip on tab, focus-preview on title, …).
-    const h = ev.hitTarget;
-    if (h && h.kind === 'pane-body') {
-      const itemTag = h.hit?.kind === 'list-row' ? `:${h.hit.itemIndex}`
-        : h.hit?.kind === 'table-cell' ? `:${h.hit.row}-${h.hit.col}`
-        : h.hit?.kind === 'text-char' ? `:${h.hit.line}-${h.hit.col}`
-        : h.hit?.kind === 'conversation-message' ? `:${h.hit.messageId}`
-        : '';
-      hoverTracker.update(
-        { x: ev.col, y: ev.row },
-        {
-          id: `pane-body:${h.paneId}${itemTag}`,
-          kind: 'pane-body',
-          paneId: h.paneId,
-          hit: h.hit,
-        },
-      );
-      return;
-    }
-    // Pointer is off every tracked region — emit leave + clear.
-    hoverTracker.update(null, null);
   };
 
   const preflightHitTarget = (ev: DisplayMouseEvent): HitTarget | undefined => {
@@ -1358,15 +1167,7 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
     // know the top modal surface. Mutation of `ev` is OK — event is
     // single-use and owned by us within handleMouse.
     //
-    // IDX-F5d Phase 2 (2026-04-22) — classification moved AHEAD of
-    // `feedHover` so pane-body hover events carry the widget
-    // refinement (hit.itemIndex for lists, etc.) the tracker needs
-    // to fire enter/leave on row change.
     preflightHitTarget(ev);
-    // IDX-5 / F5d Phase 2 — feed the hover tracker AFTER hitTarget
-    // classification so pane-body targets (with describeHit refinement)
-    // can flow through. No-op when hover wiring is disabled.
-    feedHover(ev);
     // DS-2b (2026-04-21) — drag session chokepoint. When an active
     // drag is underway, the adapter consumes drag/release events
     // and short-circuits the legacy mouse chain. Non-progressing
@@ -1702,19 +1503,7 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
   };
 
   const dispose = (): void => {
-    try { hoverPresenter?.dispose(); } catch { /* isolate */ }
-    hoverPresenter = null;
-    try { disposeHoverCtxBridge?.(); } catch { /* isolate */ }
-    disposeHoverCtxBridge = null;
-    try { disposeHoverWidgetBridge?.(); } catch { /* isolate */ }
-    disposeHoverWidgetBridge = null;
-    try { disposePaneHoverBridge?.(); } catch { /* isolate */ }
-    disposePaneHoverBridge = null;
     clearModalResizeHover();
-    // hoverTracker.dispose clears its own subscribers + timer. If
-    // the tracker was passed in by the caller we still dispose it —
-    // the caller constructed it for this wiring's lifetime.
-    try { hoverTracker?.dispose(); } catch { /* isolate */ }
     closePopup();
   };
 
@@ -1725,13 +1514,6 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
     setDockRow,
     handleMouse,
     preflightHitTarget,
-    getTooltipFor(target: HitTarget): string | null {
-      // S1.D — pill tooltip lookup is the only resolver wired today.
-      // Future kinds (modal-button label, vw-pane-title, etc.) plug
-      // in here without changing the runtime contract.
-      if (target.kind === 'pill') return tooltipFor(target.name) ?? null;
-      return null;
-    },
     routeKey,
     renderToasts,
     hasActivePopup: () => popupAuthority.hasActivePopup(),
@@ -1747,7 +1529,6 @@ export function createDashboardMouseWiring(deps: DashboardMouseWiringDeps): Dash
       modalMoveSession,
       modalResizeSession,
       dockMoverSession,
-      hoverActiveTooltipId: hoverPresenter ? hoverPresenter._activeSurfaceId() : null,
     }),
   };
 }

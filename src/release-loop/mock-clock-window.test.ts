@@ -26,6 +26,7 @@ function replay() {
   const clock = { at: new Date(cut - 24 * 60 * 60_000) };
   const deps: RehearsalDeps = {
     now: () => clock.at, schedules: () => [schedule], hardIntervalHours: 12,
+    cloudVmAdapter: { start: async () => {}, stop: async () => {}, status: async () => ({ host: 'aws1', state: 'running' }) },
     shardPlan: () => ({ shards: 4, testFiles: 12, gatePlanShards: 4, resources: { cpus: 16, freeBytes: 12e9, totalBytes: 24e9 }, unmeasured: null }),
     git: (args) => ({ rc: 0, stdout: args[0] === 'rev-parse' ? `${SHA}\n` : '' }),
     leakCheck: () => ({ status: 0 }),
@@ -71,9 +72,9 @@ test('N07: production rc-7h actually runs before a later hard-5h supersedes it',
   const h = replay();
   h.clock.at = new Date(cut - 7 * 60 * 60_000);
   await h.tick();
-  expect(h.readStamp('rc-7h')).toMatchObject({ outcome: 'ok', sha: SHA, result: { measuredCommit: SHA, worktreeHead: SHA, remote: 'node-b', gateExitCode: 0 } });
+  expect(h.readStamp('rc-7h')).toMatchObject({ outcome: 'ok', sha: SHA, result: { measuredCommit: SHA, worktreeHead: SHA, remote: 'aws1', gateExitCode: 0 } });
   await h.tick();
-  expect(h.rcCalls).toMatchObject([{ version: schedule.version, selection: { remote: 'node-b', shards: 4 } }]);
+  expect(h.rcCalls).toMatchObject([{ version: schedule.version, selection: { remote: 'aws1', rehearsalCloudHost: true, shards: 4 } }]);
   expect(h.gateCalls).toHaveLength(0);
   h.clock.at = new Date(cut - 5 * 60 * 60_000);
   await h.tick();

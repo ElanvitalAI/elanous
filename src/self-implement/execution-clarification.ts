@@ -10,7 +10,7 @@ import {
   type ClarificationCandidate,
   type ClarificationContext,
 } from '../hitl/clarification-policy.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { appendRunLedgerEntry, type RunLedgerWriter } from './run-ledger.js';
 
 export interface ExecutionClarificationContext {

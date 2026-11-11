@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import ts from 'typescript';
-import { splitKeys, KeyStreamParser, sliceAnsiByColumns } from './tui.js';
+import { ansi, splitKeys, KeyStreamParser, sliceAnsiByColumns } from './tui.js';
 
 function runtimeImports(filePath: string): string[] {
   const source = ts.createSourceFile(filePath, readFileSync(filePath, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -555,6 +555,7 @@ describe('tui exit handlers are start-gated', () => {
     expect(counts.once.sigint).toBe(counts.before.sigint + 1);
     expect(counts.once.sigterm).toBe(counts.before.sigterm + 1);
     expect(counts.twice).toEqual(counts.once);
+    for (const sequence of [ansi.kittyKbOn, ansi.modKeysOn, ansi.kittyKbOff, ansi.modKeysOff]) expect(stdout).toContain(sequence);
     expect(stdout).toContain('EXIT-NOTICE');
     expect(code).toBe(130);
   }, 10_000);
@@ -564,6 +565,7 @@ describe('tui exit handlers are start-gated', () => {
       isTTY: Boolean(process.stdin.isTTY),
     })`), { signal: 'SIGTERM' });
     expect(stdout).toContain('TUI-COUNTS:{"isTTY":true}');
+    for (const sequence of [ansi.kittyKbOn, ansi.modKeysOn, ansi.kittyKbOff, ansi.modKeysOff]) expect(stdout).toContain(sequence);
     expect(stdout).toContain('EXIT-NOTICE');
     expect(code).toBe(143);
   }, 10_000);

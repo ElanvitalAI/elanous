@@ -105,7 +105,7 @@ export function formatAutoMergeSuccessMessage(input: {
 
 import { GoalRunStore, insertGoalRunRecord, type GoalPriorRuns } from './goal-run-store.js';
 import { writeGoalRunRecordFragment } from './goal-execution-records.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { appendRunLedgerEntries, appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, pathSignatureOf, queryRunChain, runLedgerDir, type RunChainShardSibling, type RunLedgerBatchWriter, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
 import { buildRunStopTerminalEvidence, classifyMergeHoldStop, classifyTerminalHarnessFailure, forgetRunStop, isRunStopClass, readRunStopRecord, recordRunStop, runStopRecorded } from './run-stop.js';
 import { autohealFromStop, parseAutohealMode, pickAutohealAction, type AutohealActions, type AutohealResult } from './stop-autoheal.js';

@@ -125,7 +125,18 @@ test('developer profile chooses curated runtimes and exposes unverified Linux in
   const plan = buildMachineSetupPlan({ profile: 'developer', platform: 'linux' });
   expect(plan.packages.find(item => item.name === 'golang-go')).toMatchObject({ manager: 'apt-get', presence: 'would-install' });
   expect(plan.packages.find(item => item.name === 'gradle')).toMatchObject({ manager: 'apt-get', presence: 'would-install' });
+  expect(plan.packages.find(item => item.name === 'cargo')).toMatchObject({ manager: 'apt-get', presence: 'would-install' });
   expect(plan.packages.find(item => item.name === 'tree-sitter-cli')).toMatchObject({ manager: 'cargo', presence: 'would-install' });
+  for (const platform of ['linux', 'wsl'] as const) {
+    const platformPlan = buildMachineSetupPlan({ profile: 'developer', platform });
+    const cargoInstall = platformPlan.operations.find(item => item.manager === 'apt-get' && item.packages?.includes('cargo'));
+    const treeSitterInstall = platformPlan.operations.find(item => item.manager === 'cargo' && item.packages?.includes('tree-sitter-cli'));
+
+    expect(platformPlan.packages.find(item => item.name === 'cargo')).toMatchObject({ manager: 'apt-get' });
+    expect(cargoInstall).toBeDefined();
+    expect(treeSitterInstall).toBeDefined();
+    expect(platformPlan.operations.indexOf(cargoInstall!)).toBeLessThan(platformPlan.operations.indexOf(treeSitterInstall!));
+  }
   expect(plan.operations.some(item => item.manager === 'manual' && item.packages?.includes('deno'))).toBe(true);
   expect(plan.operations.some(item => item.manager === 'manual' && item.packages?.includes('cocoapods'))).toBe(true);
 });

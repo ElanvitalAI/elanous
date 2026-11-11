@@ -1,0 +1,14 @@
+{
+  "id": "fake-android-client",
+  "name": "Fake Android member, briefing, board, and voice-note API client",
+  "checklistCells": ["ANDROID-BRIEF-TAB", "ANDROID-VOICE-PHOTO-NOTE"],
+  "implementation": ["src/ux-sim/fake-android-client.ts"],
+  "tests": ["src/ux-sim/fake-android-client.test.ts", "src/ux-sim/android-note-real-client.test.ts", "apps/android/app/src/test/kotlin/com/elanvitalai/elanous/android/ui/note/NoteAttachmentViewModelTest.kt"],
+  "target": "Run the actual Android NoteViewModel and MemberAppClient voice-plus-mid-recording-photo flow through fake STT, summary, storage, and HTTP boundaries, capture its real POST body, and replay that exact request through the real in-process member-scoped scraps API without external services",
+  "inputs": ["owner-a and owner-b bearer sessions", "briefing day query", "briefing and board IDs", "approval request", "recorded audio plus a photo captured mid-recording"],
+  "observations": ["briefing and board reads are restricted to the authenticated member", "SSE events are member-scoped", "approval is idempotency guarded and rejects a foreign member card", "actual Android NoteViewModel invokes fake STT and summary with the recording and selected photo, then MemberAppClient uploads and submits the ordered timeline", "the captured Android POST method, path, authorization, idempotency key, and body are passed unchanged into the real scraps API, which stores owner-scoped audio/photo refs and hides the note from a second member", "no external network attempts are made"],
+  "entryCommands": ["bun test src/ux-sim/fake-android-client.test.ts", "scripts/run-android-voice-photo-note-sim.sh (requires a prepared Android SDK/JDK host)"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

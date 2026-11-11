@@ -378,6 +378,7 @@ const SESSION_TOOL_FAMILY_RULES: SessionToolFamilyRule[] = [
       'autopilot_missions',
       'self_recall',
       'memory_recall',
+      'memory_save',
       'session_manage',
       'schedule_manage',
       'fact_check',

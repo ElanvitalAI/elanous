@@ -4,7 +4,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { debug } from '../../debug/log.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 
 /** Set by the op.elanous.ai proxy (Caddy) after Google sign-in, server side; the proxy strips any incoming copy. */

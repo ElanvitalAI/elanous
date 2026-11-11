@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { mountViewAsModalSurface, type ContextMenuRequest } from '../src/ui/modal-adapter.js';
 import { buildContextMenuPopup } from '../src/ui/context-menu-host.js';
-import { createSlashLauncherPopup } from '../src/ui/slash-launcher.js';
 import { Consumed, Ignored } from '../src/ui/view.js';
 import type { View, EventResult, Size, FocusSource, ContextMenuActionItem } from '../src/ui/view.js';
 import type { Printer } from '../src/ui/printer.js';
@@ -189,61 +188,5 @@ describe('MX6 buildContextMenuPopup', () => {
     const h = buildContextMenuPopup(req, () => {}, () => cancels++, OPTS);
     h.handleKey({ name: 'escape' } as never);
     expect(cancels).toBe(1);
-  });
-});
-
-describe('MX6 slash launcher popup', () => {
-  test('renders title and commands', () => {
-    let fired = '';
-    const h = createSlashLauncherPopup({
-      commands: [
-        { name: '/provider', description: 'Switch LLM',  onRun: () => { fired = 'prov'; } },
-        { name: '/wd',       description: 'Change cwd',  onRun: () => { fired = 'wd'; } },
-        { name: '/undo',     description: 'Undo turn',   onRun: () => { fired = 'undo'; } },
-      ],
-      termCols: 80,
-      termRows: 24,
-    });
-    const out = h.surface.paint();
-    expect(out).toContain('/provider');
-    expect(out).toContain('/wd');
-    expect(out).toContain('/undo');
-    expect(out.length).toBeGreaterThan(0);
-    void fired;
-    h.dispose();
-  });
-
-  test('double-click on a command row fires its onRun', () => {
-    let fired: string | null = null;
-    const h = createSlashLauncherPopup({
-      commands: [
-        { name: '/provider', description: 'X',  onRun: () => { fired = 'provider'; } },
-        { name: '/wd',       description: 'Y',  onRun: () => { fired = 'wd'; } },
-      ],
-      anchorRow: 20,
-      anchorCol: 2,
-      termCols: 80,
-      termRows: 24,
-    });
-    h.surface.paint();
-    const bounds = h.surface.bounds;
-    for (let r = bounds.row + 1; r < bounds.row + bounds.height - 1 && !fired; r++) {
-      h.handleMouse(mouse('click', r, bounds.col + 2));
-      h.handleMouse(mouse('double-click', r, bounds.col + 2));
-    }
-    expect(fired).not.toBeNull();
-    h.dispose();
-  });
-
-  test('anchor near right edge: popup clipped to terminal', () => {
-    const h = createSlashLauncherPopup({
-      commands: [{ name: '/a', description: '', onRun: () => {} }],
-      anchorRow: 20,
-      anchorCol: 78,
-      termCols: 80,
-      termRows: 24,
-    });
-    expect(h.surface.bounds.col + h.surface.bounds.width - 1).toBeLessThanOrEqual(80);
-    h.dispose();
   });
 });

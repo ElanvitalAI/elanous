@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { useState } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
@@ -8,6 +8,7 @@ import { ChatLayout } from './ChatLayout';
 import { ChatConversationList } from './ChatConversationList';
 import { ChatCurrentProject } from './ChatCurrentProject';
 import { _resetSessionsServiceSingletonForTest } from '@/lib/sessions-service';
+import { userIntentLogger } from '@/lib/user-intent-logger';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 let tree: ReactTestRenderer | undefined;
@@ -55,6 +56,25 @@ async function mount(show: boolean, entries: Array<{ id: string; title: string; 
   return { root: tree!.root, getSelected: () => selected, calls, getProject: () => projectId };
 }
 
+test('standalone chat mount emits route intent while embedded chat does not', async () => {
+  const emit = spyOn(userIntentLogger, 'emit').mockResolvedValue({ ok: true });
+  try {
+    await mount(true);
+    expect(emit).toHaveBeenCalledWith({
+      surface: 'pwa',
+      intent: { layer: 'navigation', kind: 'pwa.navigation.chat_opened', target: { kind: 'route', id: '/chat' } },
+      surface_state: { route: '/chat' },
+    });
+    await act(async () => tree!.unmount());
+    tree = undefined;
+    emit.mockClear();
+    await mount(false);
+    expect(emit).not.toHaveBeenCalled();
+  } finally {
+    emit.mockRestore();
+  }
+});
+
 test('/chat keeps desktop column and moves the mobile drawer button into the status menu without replacing chat', async () => {
   const { root } = await mount(true, [], 390);
   const desktop = root.findAllByType('aside')[0]!;
@@ -63,7 +83,8 @@ test('/chat keeps desktop column and moves the mobile drawer button into the sta
   expect(root.findAllByType(ChatLayout)).toHaveLength(1);
   const chat = root.findByType(ChatLayout);
   const status = root.findByProps({ 'data-elanous-mobile-chat-status': '' });
-  expect(status.props.className).toContain('h-10 min-h-10');
+  expect(status.props.className).toContain('min-h-10');
+  expect(status.findAllByType('details')).toHaveLength(1);
   expect(status.findAllByProps({ 'aria-label': '채팅 메뉴' })).toHaveLength(1);
   expect(root.findByType(ChatLayout).props.mobileSimple).toBe(true);
   expect(root.findAllByProps({ 'data-elanous-chat-compact-header': '' })).toHaveLength(0);

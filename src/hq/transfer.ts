@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { defaultSshRunner, localShellRunner, parseLease, sshLeaseStore, type LeaseStore, type SshRunner } from './lease.js';
 import { promoteHq, type PromoteResult } from './promote.js';
 

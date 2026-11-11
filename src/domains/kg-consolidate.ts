@@ -17,7 +17,7 @@ import { buildOntology, detectAnomalies, enqueueAnomalyDigs, type AnomalyCandida
 import { correlateCrossMarketBatch } from './kg-crossmarket.js';
 import { extractAndStore, type ChatFn } from './kg-extract.js';
 import { loadKrPrices, loadUsPrices } from './kg-correlation.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { conatusPath } from './conatus-data-dir.js';
 
 export const BREAKING_DB_PATH = conatusPath('breaking_signals.db');

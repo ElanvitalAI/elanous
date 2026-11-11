@@ -3,10 +3,15 @@
  * Build a case-level inventory from Bun JUnit gate reports and the matching
  * test source. JUnit is authoritative for which cases actually ran; source
  * analysis adds static structure and a short contract cue.
+ * An immediately preceding `// @oracle-axis X2:I1 X3:I4` declares the RFC axis/invariant
+ * pairs backed by an assertion call in a uniquely matched case with a passing attempt. This is static
+ * source evidence, not proof that a particular branch reached the assertion at runtime.
+ * Failed-only, skipped, unmatched or missing source stays unknown;
+ * a matched case without a supported declaration and assertion stays unclassified.
  *
  *   bun scripts/test-census.ts [gate-logs/cut] [--source-root repo] [--format tsv|markdown|json] [--out path]
  */
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, realpathSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import ts from 'typescript';
 import { XMLParser } from 'fast-xml-parser';
@@ -32,6 +37,7 @@ type CaseSource = {
   body: ts.Node | undefined;
   line: number;
   assertions: string[];
+  oracleAxes?: string[];
 };
 
 type SourceFacts = {
@@ -60,6 +66,7 @@ type CensusRow = JunitCase & {
   numericCandidateProvenance: NumericCandidateProvenance[] | null;
   contract: string;
   sourceLine: number | null;
+  oracleAxes: string[] | null;
 };
 
 function repositoryFile(file: string): string {
@@ -192,6 +199,70 @@ function assertionKinds(body: ts.Node | undefined): string[] {
   return [...kinds].sort();
 }
 
+// Source: 내부 문서 `RFC-sim-edge-creator` §3b–3c maps X1–X4 to I1–I7.
+const ORACLE_AXIS_PAIRS = new Set(['X1:I1', 'X1:I3', 'X2:I1', 'X2:I2', 'X2:I7', 'X3:I1', 'X3:I3', 'X3:I4', 'X4:I5', 'X4:I6']);
+class InvalidOracleAxisError extends Error {}
+
+function hasOracleAssertion(body: ts.Node | undefined): boolean {
+  if (!body) return false;
+  let found = false;
+  const objectMethods = new Set(['toString', 'toLocaleString', 'toJSON', 'toISOString', 'toUTCString', 'toFixed', 'toLowerCase', 'toUpperCase', 'toPrecision', 'toExponential']);
+  const assertMethods = new Set(['ok', 'equal', 'notEqual', 'strictEqual', 'notStrictEqual', 'deepEqual', 'notDeepEqual', 'deepStrictEqual', 'notDeepStrictEqual', 'throws', 'doesNotThrow', 'rejects', 'doesNotReject', 'match', 'doesNotMatch', 'ifError', 'fail']);
+  const isExpectReceiver = (expression: ts.Expression): boolean => {
+    let current = expression;
+    while (ts.isPropertyAccessExpression(current) && ['not', 'resolves', 'rejects'].includes(current.name.text)) current = current.expression;
+    return ts.isCallExpression(current) && ts.isIdentifier(current.expression) && current.expression.text === 'expect';
+  };
+  const visit = (node: ts.Node): void => {
+    if (node !== body && (ts.isClassDeclaration(node) || ts.isClassExpression(node))) return;
+    if (node !== body && ts.isFunctionLike(node)) {
+      let invocation: ts.Node = node;
+      while (ts.isParenthesizedExpression(invocation.parent)) invocation = invocation.parent;
+      const parent = invocation.parent;
+      const guaranteedArrayCallback = ts.isCallExpression(parent) && parent.arguments.includes(node as ts.Expression)
+        && ts.isPropertyAccessExpression(parent.expression)
+        && ['forEach', 'map', 'flatMap', 'filter'].includes(parent.expression.name.text)
+        && ts.isArrayLiteralExpression(parent.expression.expression)
+        && parent.expression.expression.elements.some((element) => !ts.isSpreadElement(element) && !ts.isOmittedExpression(element));
+      const invoked = ts.isCallExpression(parent) && (parent.expression === invocation
+        || guaranteedArrayCallback);
+      if (!invoked) return;
+    }
+    if (ts.isCallExpression(node)) {
+      const expression = node.expression;
+      const expectMatcher = ts.isPropertyAccessExpression(expression)
+        && /^to[A-Z]/.test(expression.name.text)
+        && !objectMethods.has(expression.name.text)
+        && isExpectReceiver(expression.expression);
+      const assertCall = ts.isIdentifier(expression) && expression.text === 'assert'
+        || ts.isPropertyAccessExpression(expression) && ts.isIdentifier(expression.expression) && expression.expression.text === 'assert' && assertMethods.has(expression.name.text);
+      if (expectMatcher || assertCall) found = true;
+    }
+    if (!found) ts.forEachChild(node, visit);
+  };
+  visit(body);
+  return found;
+}
+
+function declaredOracleAxes(node: ts.CallExpression, source: ts.SourceFile, body: ts.Node | undefined): string[] {
+  const statement = ts.isExpressionStatement(node.parent) ? node.parent : node;
+  const comments = ts.getLeadingCommentRanges(source.text, statement.getFullStart()) ?? [];
+  const comment = comments.at(-1);
+  if (!comment || comment.kind !== ts.SyntaxKind.SingleLineCommentTrivia) return [];
+  const gap = source.text.slice(comment.end, statement.getStart(source));
+  if (!/^[ \t]*\r?\n[ \t]*$/.test(gap)) return [];
+  const axes = new Set<string>();
+  const text = source.text.slice(comment.pos, comment.end);
+  const declaration = /^\/\/\s*@oracle-axis\s+(.+)$/.exec(text);
+  if (declaration) {
+    for (const pair of declaration[1]!.split(/[\s,]+/).filter(Boolean)) {
+      if (!ORACLE_AXIS_PAIRS.has(pair)) throw new InvalidOracleAxisError(`invalid oracle axis ${pair} at ${source.fileName}`);
+      axes.add(pair);
+    }
+  }
+  return hasOracleAssertion(body) ? [...axes].sort() : [];
+}
+
 function parseSource(path: string): SourceFacts {
   const source = readFileSync(path, 'utf8');
   const kind = path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
@@ -226,7 +297,8 @@ function parseSource(path: string): SourceFacts {
       if (root === 'test' || root === 'it') {
         const callback = node.arguments.find((arg, index) => index > 0 && (ts.isArrowFunction(arg) || ts.isFunctionExpression(arg)));
         const body = callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)) ? callback.body : undefined;
-        cases.push({ title: title?.title ?? '<dynamic-title>', templateFragments: title?.fragments ?? [], suite: [...suites], body, line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1, assertions: assertionKinds(body) });
+        const assertions = assertionKinds(body);
+        cases.push({ title: title?.title ?? '<dynamic-title>', templateFragments: title?.fragments ?? [], suite: [...suites], body, line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1, assertions, oracleAxes: declaredOracleAxes(node, sf, body) });
       }
     }
     ts.forEachChild(node, visit);
@@ -314,7 +386,8 @@ export function numericCandidateEvidence(
   sourceRoot: string,
 ): NumericCandidateProvenance[] {
   if (!candidates.length) return [];
-  const rootKey = resolve(sourceRoot);
+  const rootPath = resolve(sourceRoot);
+  const rootKey = existsSync(rootPath) ? realpathSync(rootPath) : rootPath;
   if (!repositoryRootCache.has(rootKey)) {
     try { repositoryRootCache.set(rootKey, spawnSyncText('git', ['rev-parse', '--show-toplevel'], { cwd: rootKey, encoding: 'utf8' }).trim()); }
     catch { repositoryRootCache.set(rootKey, null); }
@@ -329,7 +402,9 @@ export function numericCandidateEvidence(
     } catch { shallowRepositoryCache.set(repositoryRoot, true); }
   }
   const shallowRepository = shallowRepositoryCache.get(repositoryRoot) ?? true;
-  const pathFromRepository = relative(repositoryRoot, resolve(sourcePath)).replaceAll('\\', '/');
+  const sourceAbsolute = resolve(sourcePath);
+  const canonicalSource = existsSync(sourceAbsolute) ? realpathSync(sourceAbsolute) : sourceAbsolute;
+  const pathFromRepository = relative(repositoryRoot, canonicalSource).replaceAll('\\', '/');
   if (!pathFromRepository || pathFromRepository === '..' || pathFromRepository.startsWith('../') || isAbsolute(pathFromRepository)) {
     return candidates.map((candidate) => ({ ...candidate, blameCommit: null, reason: null }));
   }
@@ -398,22 +473,22 @@ function markdown(rows: CensusRow[], reportCount: number, gateDir: string, sourc
   const lines = [
     `# Test census — gate 0.3.5 cut`,
     '',
-    `Source: \`${gateDir}\` · code: \`${sourceRoot}\` · JUnit reports ${reportCount} · shards ${JSON.stringify(shardStates ?? 'unknown')} · unique executed cases ${rows.length}. Import counts and call signals are static file-level indicators; loops and numeric candidates are scoped to uniquely matched case bodies. Numeric literals greater than one are candidates, not confirmed expected values. Blame commit and its full message are provenance only; human review decides whether the rationale still justifies the assertion.`,
+    `Source: \`${gateDir}\` · code: \`${sourceRoot}\` · JUnit reports ${reportCount} · shards ${JSON.stringify(shardStates ?? 'unknown')} · unique cases ${rows.length}. Oracle axes are explicit source declarations with assertion calls in matched cases with a passing attempt; branch-level assertion reach is not measured. Import counts and call signals are static file-level indicators; loops and numeric candidates are scoped to uniquely matched case bodies. Numeric literals greater than one are candidates, not confirmed expected values. Blame commit and its full message are provenance only; human review decides whether the rationale still justifies the assertion.`,
     '',
-    '| 파일 | suite 경로 | classname | 케이스 | 게이트 소요(s, 첫 실행) | 시도별 소요·결과 | import 수(정적/동적) | spawn/sleep/네트워크(정적 신호) | 반복 루프 | 기대값 리터럴 후보(>1) | git blame 커밋 | 사유(커밋 메시지) | 계약 요약 | 소스 상태 | 케이스 연결 |',
-    '|---|---|---|---|---:|---|---:|---|---:|---|---|---|---|---|---|',
+    '| 파일 | suite 경로 | classname | 케이스 | 게이트 소요(s, 첫 실행) | 시도별 소요·결과 | import 수(정적/동적) | spawn/sleep/네트워크(정적 신호) | 반복 루프 | 기대값 리터럴 후보(>1) | git blame 커밋 | 사유(커밋 메시지) | 판정 오라클 축 | 계약 요약 | 소스 상태 | 케이스 연결 |',
+    '|---|---|---|---|---:|---|---:|---|---:|---|---|---|---|---|---|---|',
   ];
   for (const row of rows) {
     const signalNames = ['spawn', 'sleep', 'network'].filter((key) => row[key as 'spawn' | 'sleep' | 'network']);
     const staticSignals = row.sourceStatus === 'missing' ? '미확인' : signalNames.join(', ') || '없음';
-    lines.push(`| ${esc(row.file)} | ${esc(row.suitePath.join(' > '))} | ${esc(row.classname)} | ${esc(row.name)} | ${row.seconds?.toFixed(4) ?? '미측정'} | ${attempts(row)} | ${row.imports ?? '미확인'}/${row.dynamicImports ?? '미확인'} | ${staticSignals} | ${row.loops ?? '미확인'} | ${numeric(row)} | ${provenanceCell(row, 'blameCommit')} | ${provenanceCell(row, 'reason')} | ${esc(row.contract)} | ${row.sourceStatus} | ${row.caseMatch} |`);
+    lines.push(`| ${esc(row.file)} | ${esc(row.suitePath.join(' > '))} | ${esc(row.classname)} | ${esc(row.name)} | ${row.seconds?.toFixed(4) ?? '미측정'} | ${attempts(row)} | ${row.imports ?? '미확인'}/${row.dynamicImports ?? '미확인'} | ${staticSignals} | ${row.loops ?? '미확인'} | ${numeric(row)} | ${provenanceCell(row, 'blameCommit')} | ${provenanceCell(row, 'reason')} | ${row.oracleAxes === null ? '미확인' : row.oracleAxes.join(', ') || '미분류'} | ${esc(row.contract)} | ${row.sourceStatus} | ${row.caseMatch} |`);
   }
   return `${lines.join('\n')}\n`;
 }
 
 function tsv(rows: CensusRow[], reportCount: number, gateDir: string, sourceRoot: string, shardStates?: Record<string, number>): string {
   const escape = (value: unknown): string => String(value ?? '').replaceAll('\\', '\\\\').replaceAll('\t', '\\t').replaceAll('\r', '').replaceAll('\n', '\\n');
-  const columns: Array<keyof CensusRow> = ['file', 'suitePath', 'classname', 'name', 'line', 'seconds', 'result', 'attempts', 'sourceStatus', 'caseMatch', 'imports', 'dynamicImports', 'spawn', 'sleep', 'network', 'loops', 'numericCandidates', 'numericCandidateProvenance', 'contract', 'sourceLine'];
+  const columns: Array<keyof CensusRow> = ['file', 'suitePath', 'classname', 'name', 'line', 'seconds', 'result', 'attempts', 'sourceStatus', 'caseMatch', 'imports', 'dynamicImports', 'spawn', 'sleep', 'network', 'loops', 'numericCandidates', 'numericCandidateProvenance', 'oracleAxes', 'contract', 'sourceLine'];
   const cellValue = (row: CensusRow, column: keyof CensusRow): unknown => {
     if (column === 'attempts') return JSON.stringify(row.attempts);
     if (column === 'suitePath') return row.suitePath.join(' > ');
@@ -421,17 +496,17 @@ function tsv(rows: CensusRow[], reportCount: number, gateDir: string, sourceRoot
     if (column === 'numericCandidates' && (row.caseMatch === 'unmatched' || row.sourceStatus === 'missing')) return 'unknown';
     if (column === 'numericCandidateProvenance' && (row.caseMatch === 'unmatched' || row.sourceStatus === 'missing')) return 'unknown';
     if (column === 'numericCandidateProvenance') return JSON.stringify(row.numericCandidateProvenance);
+    if (column === 'oracleAxes') return row.oracleAxes === null ? 'unknown' : row.oracleAxes.join(',') || 'unclassified';
     return Array.isArray(row[column]) ? (row[column] as string[]).join(',') : row[column];
   };
   return [
-    `# gateDir=${gateDir} sourceRoot=${sourceRoot} reports=${reportCount} cases=${rows.length} shards=${JSON.stringify(shardStates ?? 'unknown')}; imports/call-signals are static file-level indicators; loops/numeric-candidates are from uniquely matched case bodies; numericCandidateProvenance is candidate literal + blame SHA + full commit message (unknown differs from none); seconds=first report, result=last parsed attempt, attempts=all report/document timings and outcomes`,
+    `# gateDir=${gateDir} sourceRoot=${sourceRoot} reports=${reportCount} cases=${rows.length} shards=${JSON.stringify(shardStates ?? 'unknown')}; oracleAxes=declared source pair + assertion call in matched case with passing attempt (branch reach unmeasured); imports/call-signals are static file-level indicators; loops/numeric-candidates are from uniquely matched case bodies; numericCandidateProvenance is candidate literal + blame SHA + full commit message (unknown differs from none); seconds=first report, result=last parsed attempt, attempts=all report/document timings and outcomes`,
     columns.join('\t'),
     ...rows.map((row) => columns.map((column) => escape(cellValue(row, column))).join('\t')),
   ].join('\n') + '\n';
 }
 
-function main(): void {
-  const args = process.argv.slice(2);
+export function renderTestCensus(args: string[]): string {
   const root = process.cwd();
   const positional = args[0] && !args[0]!.startsWith('--') ? args[0] : undefined;
   const gateDir = resolve(positional ?? join(process.env.HOME ?? '', '.elanous/release/0.3.5/gate-logs/cut'));
@@ -461,7 +536,7 @@ function main(): void {
     const sourcePath = sourcePathFor(row.file, sourceRoot);
     let facts = sourcePath ? sourceCache.get(sourcePath) : null;
     if (sourcePath && facts === undefined) {
-      try { facts = parseSource(sourcePath); } catch { facts = null; }
+      try { facts = parseSource(sourcePath); } catch (error) { if (error instanceof InvalidOracleAxisError) throw error; facts = null; }
       sourceCache.set(sourcePath, facts);
     }
     const matched = facts ? caseFor(row, facts.cases) : undefined;
@@ -482,13 +557,14 @@ function main(): void {
       numericCandidateProvenance: sourcePath && matched ? numericCandidateEvidence(sourcePath, metrics.candidateLocations, sourceRoot) : matched ? [] : null,
       contract,
       sourceLine: matched?.line ?? null,
+      oracleAxes: matched && row.attempts.some((attempt) => attempt.result === 'passed') ? matched.oracleAxes ?? [] : null,
     };
   });
   const output = format === 'json'
     ? `${JSON.stringify({ gateDir, sourceRoot, reports: reportPaths.length, shardStates, complete: !!shardStates && Object.entries(shardStates).every(([state, count]) => state === 'done' || count === 0), cases: rows.length, rows }, null, 2)}\n`
     : format === 'tsv' ? tsv(rows, reportPaths.length, gateDir, sourceRoot, shardStates) : markdown(rows, reportPaths.length, gateDir, sourceRoot, shardStates);
   if (out) writeFileSync(out, output);
-  else process.stdout.write(output);
+  return out ? '' : output;
 }
 
-if (import.meta.main) main();
+if (import.meta.main) process.stdout.write(renderTestCensus(process.argv.slice(2)));

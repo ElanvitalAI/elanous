@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 
 const REPOSITORY_NAME = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;

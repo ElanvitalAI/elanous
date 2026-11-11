@@ -1,10 +1,11 @@
 import { hostname } from 'node:os';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
+import { CODEX_CREDENTIAL_OWNER_HOST, CODEX_CREDENTIAL_SLOT, normalizeCredentialHost, readCredentialOwner, recordCredentialMirror, type CredentialOwnerRecord } from '../nexus/config/secrets/cred-owner.js';
 import { loadTokens, type ProviderAuthState } from './store.js';
 
 export const CODEX_OWNER_MIRROR_RELATIVE_PATH = join('remote-parent-credentials', 'cli-mirror', 'auth.json');
@@ -33,15 +34,47 @@ function rootFingerprint(root: string): string {
   return createHash('sha256').update(root).digest('hex').slice(0, 16);
 }
 
-function normalizedHost(value: string): string {
-  return value.trim().replace(/\.local$/i, '').toLowerCase();
-}
-
 /** The HQ-configured machine identity is the stable short name used by the lease. */
 export function isCodexTokenOwnerHost(config = getUserConfig(), machine = hostname()): boolean {
-  const owner = normalizedHost(config.llm.codexTokenOwnerHost || 'mbp');
-  const local = normalizedHost(config.hq?.hostName || machine);
-  return local === owner;
+  try {
+    const owner = normalizeCredentialHost(config.llm.codexTokenOwnerHost || CODEX_CREDENTIAL_OWNER_HOST);
+    const local = normalizeCredentialHost(config.hq?.hostName || machine);
+    return owner === CODEX_CREDENTIAL_OWNER_HOST && local === owner;
+  } catch { return false; }
+}
+
+/** Run the existing install on an owner host, then record only slot and host metadata. */
+export function deliverCodexMirrorAndRecord(
+  targetHost: string,
+  deliver: () => void,
+  options: { readonly config?: ReturnType<typeof getUserConfig>; readonly machine?: string; readonly ledgerPath?: string } = {},
+): CredentialOwnerRecord {
+  if (!isCodexTokenOwnerHost(options.config ?? getUserConfig(), options.machine ?? hostname()))
+    throw new Error('Codex owner host must be mbp');
+  const mirrorHost = normalizeCredentialHost(targetHost);
+  if (mirrorHost === CODEX_CREDENTIAL_OWNER_HOST) throw new Error('credential owner cannot be a mirror');
+  const previous = readCredentialOwner(CODEX_CREDENTIAL_SLOT, options.ledgerPath);
+  if (previous && previous.ownerHost !== CODEX_CREDENTIAL_OWNER_HOST) throw new Error('Codex owner host must be mbp');
+  try { deliver(); }
+  catch (error) {
+    const candidate = error as { code?: unknown; rc?: unknown } | null;
+    const safeCode = ['ETIMEDOUT', 'ECONNREFUSED', 'EHOSTUNREACH', 'SSH_FAILED'].includes(String(candidate?.code))
+      ? String(candidate?.code) : undefined;
+    const safeRc = Number.isInteger(candidate?.rc) && Number(candidate?.rc) >= 0 && Number(candidate?.rc) <= 255
+      ? Number(candidate?.rc) : undefined; // Source: SSH process exit status is an unsigned byte; never include raw error text.
+    throw new Error(`CODEX_MIRROR_DELIVERY_FAILED (reason=${safeCode ?? 'unknown'}${safeRc === undefined ? '' : `; rc=${safeRc}`})`);
+  }
+  return recordCredentialMirror({ slot: CODEX_CREDENTIAL_SLOT, ownerHost: CODEX_CREDENTIAL_OWNER_HOST, mirrorHost }, options.ledgerPath);
+}
+
+/** Account discovery and rotation must read the same remote snapshot as execution. */
+export function codexAccountReadStorePath(ownerStorePath: string): string {
+  if (process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1') return codexOwnerMirrorAuthPath();
+  if (!isCodexTokenOwnerHost()) {
+    const mirror = codexOwnerMirrorAuthPath();
+    if (existsSync(mirror)) return mirror;
+  }
+  return ownerStorePath;
 }
 
 /** Read only a fresh, access-only HQ snapshot. This helper never performs OAuth refresh. */
@@ -92,6 +125,7 @@ export interface CodexMirrorSkippedAccount { account: string; reason: 'access-ex
 export function collectCodexMirrorCredentials<T extends object>(
   accounts: readonly string[],
   read: (account: string) => T,
+  opts: { allowEmpty?: boolean } = {},
 ): { mirrors: Array<T & { account: string }>; skipped: CodexMirrorSkippedAccount[] } {
   const mirrors: Array<T & { account: string }> = [];
   const skipped: CodexMirrorSkippedAccount[] = [];
@@ -104,7 +138,7 @@ export function collectCodexMirrorCredentials<T extends object>(
       try { debug.log('llm.codex', 'owner-mirror-push-skipped', { account, reason }, { level: 'warn' }); } catch { /* fail-soft */ }
     }
   }
-  if (mirrors.length === 0) {
+  if (mirrors.length === 0 && !opts.allowEmpty) {
     throw new Error(`쓸 수 있는 주인 Codex 계정이 없다 (${skipped.map((s) => `${s.account}=${s.reason}`).join(', ')})`);
   }
   return { mirrors, skipped };

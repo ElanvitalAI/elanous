@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { runGitCommand } from '../../git-fs/runner.js';
 import { countTestDeclarations } from '../../self-implement/test-declarations.js';
 import { NEXT_MD_PATH, resolveNextMdConflict } from '../../release-loop/next-md-merge.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { debug } from '../../debug/log.js';
 import { HARNESS_RUN_ID_ENV } from '../../harness/harness-space.js';
 import { listInflight, type InflightEntry } from '../../pr-tool/inflight-registry.js';

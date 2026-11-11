@@ -7,7 +7,7 @@ import { parse as parseYaml } from 'yaml';
 import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, realpathSync } from 'node:fs';
 import { homedir, hostname, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, createGateRootLimiter, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, mismatchedGateRosterImagePools, parseOptions, readIsolatedRun, readShardArtifacts, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, releaseGatePoolStartBlock, runGateNode, runWarmPrecutCanary, warmCommandMatchesRequest, warmEvidenceFromVerdicts, withWarmGateHooks, resolveWarmProviderConfig, warmProviderTarget, type WarmGateControlDependencies, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, gateAdmissionWaitSeconds, gateReceiptReuseKey, planGateRiskLaneShards, reconcileStaleGateShardBoard, parseGateInstallSlotWaitMs, gatePreparationTimings, gateVolumeRefOutput, type GateAdmission, type GateOptions, type GateRunner, sameHeadPreexistingFailureIds, writeGateVerdictRecord } from './gate-node';
+import { createGateRunner, createGateRootLimiter, gateShardShell, previousShardDescent, previousShardResult, GATE_ISOLATED_TIMEOUT_MS, GATE_TIMEOUT_RECHECK_MS, GATE_HOST_RECHECK_FILE_LIMIT, loadFlakyCensusPath, limitedLocalCommand, graphGateResult, judgeGate, mismatchedGateRosterImagePools, parseOptions, readIsolatedRun, readShardArtifacts, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, stripPodRepoRoot, shardFailureIds, admitGateShard, poolGateAdmission, reportSelectionTimed, reservedGateHosts, releaseGatePoolStartBlock, runGateNode, runWarmPrecutCanary, warmCommandMatchesRequest, warmEvidenceFromVerdicts, withWarmGateHooks, resolveWarmProviderConfig, warmProviderTarget, type WarmGateControlDependencies, GATE_ADMISSION_WAIT_SECONDS_DEFAULT, gateAdmissionWaitSeconds, gateReceiptReuseKey, planGateRiskLaneShards, reconcileStaleGateShardBoard, parseGateInstallSlotWaitMs, gatePreparationTimings, gateVolumeRefOutput, type GateAdmission, type GateOptions, type GateRunner, sameHeadPreexistingFailureIds, writeGateVerdictRecord } from './gate-node';
 import { cleanRetryVerdict, failedJunitFiles } from './gate-shard-load-flaky';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { buildUserConfig, getUserConfig, resetUserConfig } from '../../src/user-config.js';
@@ -35,14 +35,44 @@ import { warmReferenceFromJobArtifacts, writeWarmJobManifest } from './gate-warm
 import { readWarmReuseEvidence } from '../../src/task-orchestrator/surfaces/warm-reuse-evidence.js';
 import { inspectReleaseGateHost } from '../../src/release-loop/gate-host-reservation.js';
 import { runGraph } from '../../src/graph-runner/runner.js';
+import type { GraphEvent, GraphEventBus } from '../../src/graph-runner/graph-events.js';
+import { runUnattendedRelease } from './unattended-release.js';
 import { isGateSpawnLaneFile, planGateSpawnSeparatedShards } from './spawn-lane';
 import { gateImagePinPath, writeGateImagePin } from './gate-image-pin.js';
 import { computeReceiptKey, gateEnvFingerprint as registryEnvFingerprint, gateLockfileHash, saveGateReceipt, type GateReceipt } from '../../src/self-implement/gate-receipt-registry.js';
 import { gateLockfileHashAtCommit, gateTestedFileHashesAtCommit } from './gate-reuse-identity.js';
-import { summarizeSelectedGateReceiptPlan } from './gate-runtime.js';
+import { gateReceiptChangedFileImpact, summarizeSelectedGateReceiptPlan } from './gate-runtime.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
+
+test('GATE-NODE-LAZY-FETCH-HANG: an absent receipt head forces a full rerun without a commit-path lookup', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'gate-missing-receipt-head-'));
+  scratch.push(repo);
+  const git = (...args: string[]) => {
+    const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout.trim();
+  };
+  git('init', '-q'); git('config', 'user.email', 'gate@test'); git('config', 'user.name', 'Gate test');
+  writeFileSync(join(repo, 'tracked.txt'), 'current head\n');
+  git('add', 'tracked.txt'); git('commit', '-qm', 'current cut');
+  const current = git('rev-parse', 'HEAD');
+  const tests = ['scripts/release-loop/gate-node.test.ts'];
+  expect(gateReceiptChangedFileImpact(repo, 'f'.repeat(40), current, tests)).toMatchObject({
+    files: tests, fullRerun: expect.stringContaining('changed-file-diff-unreadable'),
+  });
+});
+
+test('GATE-NODE-LAZY-FETCH-HANG: startup is visible before option parsing and heartbeat continues', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-startup-heartbeat-'));
+  scratch.push(root);
+  const progressFile = join(root, 'progress.jsonl');
+  expect(await runGateNode(['--help'], { ELANOUS_GATE_PROGRESS_FILE: progressFile })).toBe(0);
+  const events = readFileSync(progressFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { event?: string; phase?: string });
+  expect(events.some((event) => event.event === 'gate-startup' && event.phase === 'startup')).toBe(true);
+  expect(events.some((event) => event.event === 'phase-heartbeat')).toBe(true);
+});
 
 test('GATE-NODE-STALE-RUNNING: watchdog reads the current result JSON and batches terminal Job reads per host', () => {
   const dir = mkdtempSync(join(tmpdir(), 'gate-stale-watchdog-'));
@@ -197,7 +227,7 @@ test('verdict completeness requires schema-v2 valid receipt bound to the same co
 });
 const A = 'src/a.test.ts > A', B = 'src/b.test.ts > B', C = 'src/c.test.ts > C', D = 'src/d.test.ts > D';
 const scratch: string[] = [];
-const homeRepoFixture = ['', 'home', 'ubuntu', 'repo'].join('/');
+const homeRepoFixture = ['', 'home', 'user', 'repo'].join('/');
 test('gate host reservation names the actual executor rather than every remote host', () => {
   expect(reservedGateHosts({ remote: 'node-b' })).toEqual(['node-b']);
   expect(reservedGateHosts({ remote: 'agent@node-b' })).toEqual(['node-b']);
@@ -5869,6 +5899,17 @@ test('0.2.18: a Pod clone-root prefix (cwd changed by a test) is stripped back t
   expect(stripPodRepoRoot('../home/other/repo/src/x.test.ts:')).toBe('../home/other/repo/src/x.test.ts:');
 });
 
+test('0.3.9: arbitrary Pod account names normalize in console and junit paths', () => {
+  const buildRepo = ['', 'home', 'build$', 'repo'].join('/');
+  for (const root of [buildRepo, `../../${buildRepo.slice(1)}`]) {
+    const path = `${root}/src/a.test.ts`;
+    const clean = `${path}:\n(fail) fails\n1 fail\nRan 1 test across 1 file.\n`;
+    const junit = `<testsuites tests="1"><testsuite name="${path}" file="${path}" tests="1"><testcase name="fails"><failure/></testcase></testsuite></testsuites>`;
+    expect(stripPodRepoRoot(clean)).toContain('src/a.test.ts:');
+    expect(shardFailureIds(clean, junit, 1, 0)).toEqual({ failures: ['src/a.test.ts > fails'], errors: [] });
+  }
+});
+
 // GATE-INTRO-RECHECK (0.2.19) — a new failure that is only bun's «timed out» shape gets one isolated re-run with a 60 s
 // per-test limit before it is called introduced (0.2.18 first gate: two 5 s limits missed at 6.04/6.06 s → an 84-minute re-gate).
 const timedOutOutput = (id: string, ms = 6040) => {
@@ -5973,6 +6014,108 @@ test('GATE-NODE-WIRING-BUNDLE sim: three distinct baseline-unmeasurable cuts cre
       expect(db.query('SELECT cell_id FROM completed_owner_cells').all()).toHaveLength(1);
     } finally { db.close(); }
   } finally { spy.mockRestore(); }
+});
+
+test('GATE-NODE-WIRING-BUNDLE sim: one release cut flow records shard disposition, owner cell, and macrophage decision in order', async () => {
+  const { root, instanceRoot, runner } = timeoutRecheckFake(() => ({ rc: 124, output: '', timedOut: true }));
+  const command = runner.command;
+  runner.command = async (cmd, args, cwd, limitMs) => cmd === 'bun' && args.includes('--timeout') && cwd.endsWith('/baseline')
+    ? { rc: 1, output: timedOutOutput(B, 60_010) }
+    : command(cmd, args, cwd, limitMs);
+  let invocation = 0;
+  const sweep = runner.sweep.bind(runner);
+  runner.sweep = async (tree, logDir, pod, only, onProgress) => {
+    const result = await sweep(tree, logDir, pod, only, onProgress);
+    if (!tree.endsWith('/cut')) return result;
+    invocation += 1;
+    return { ...result, podSweep: { id: `sim-sweep-${invocation}`, invocationId: `sim-invocation-${invocation}`,
+      shards: 2, files: [...(only ?? ['src/a.test.ts', 'src/b.test.ts'])],
+      disposition: { reused: 0, rerun: 2, unmeasured: 0 } } };
+  };
+  setElanousConfigDir(instanceRoot);
+  mkdirSync(join(root, 'release', '1.0.0'), { recursive: true });
+  writeFileSync(join(root, 'release', '1.0.0', 'release.json'), JSON.stringify({ version: '1.0.0', sourceCommit: '0'.repeat(40), publishedAt: 'simulated' }));
+  const policyPath = join(root, 'release-ops-policy.yaml');
+  writeFileSync(policyPath, 'schemaVersion: 1\ngate:\n  default: { executor: host, poolSource: config.release.loop.gatePodPool, imagePin: cut-commit }\n  rehearsalDecisions: []\nknownInterferences: []\n');
+  const trace: Array<{ source: string; event: string; data?: unknown }> = [];
+  const spy = spyOn(debug, 'log').mockImplementation((category: string, event: string, data?: unknown) => {
+    if (category === 'release-loop.gate' && ['shard-ledger-summary', 'timeout-owner-cell-observed'].includes(event))
+      trace.push({ source: category, event, data });
+  });
+  let runId = '';
+  const recorded: GraphEvent[] = [];
+  try {
+    const parent = await runUnattendedRelease({ version: '1.0.1', gateExecutor: 'host', gateHost: 'simhost' }, {
+      ledgerRoot: root, config: { gateRemote: 'simhost' }, policyPath, assertCliCurrent: () => {},
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [] }),
+      registerLogSink: async () => true, refreshScorecard: () => {},
+      graph: async (releaseGraph, parentOptions) => {
+        runId = parentOptions.runId!;
+        const eventBus = (parentOptions as typeof parentOptions & { eventBus: GraphEventBus }).eventBus;
+        eventBus.subscribe((event) => {
+          if ((event.type === 'node-end' && event.source.nodeId === 'gate') || event.type === 'release.macrophage.decision') {
+            recorded.push(event);
+            trace.push({ source: event.type === 'node-end' ? 'graph-runner' : 'release-loop.macrophage', event: event.type, data: event.data });
+          }
+        });
+        for (const commit of ['1'.repeat(40), '2'.repeat(40), '3'.repeat(40)]) {
+          const result = await judgeGate({ ...options(instanceRoot), version: '1.0.1', commit }, runner);
+          expect(result).toMatchObject({ outcome: 'ok', introduced: [] });
+        }
+        const failingGate = fake([B], []);
+        const failingGateCommand = failingGate.runner.command.bind(failingGate.runner);
+        failingGate.runner.command = async (cmd, args, cwd, limitMs) => cmd === 'mktemp'
+          ? { rc: 0, output: '/tmp/release-gate-simulated\n' }
+          : failingGateCommand(cmd, args, cwd, limitMs);
+        return runGraph(releaseGraph, { ...parentOptions, eventBus, input: { ...parentOptions.input, commit: 'a'.repeat(40) },
+          deps: { ...parentOptions.deps, root, runBash: async (command, runOptions) => {
+            if (command !== 'bun scripts/release-loop/gate-node.ts --json')
+              return { stdout: JSON.stringify({ outcome: 'ok' }), stderr: '', exitCode: 0 };
+            let stdout = '';
+            const capture = spyOn(console, 'log').mockImplementation((line) => { stdout = String(line); });
+            try {
+              // A child inherits the graph-pinned state root; mirror that process-local resolution in this in-process simulation.
+              setElanousConfigDir(root);
+              const exitCode = await runGateNode(['--json'], runOptions.env!, failingGate.runner);
+              expect(JSON.parse(stdout)).toMatchObject({ outcome: 'fail', introduced: [B] });
+              return { stdout, stderr: '', exitCode };
+            } finally { capture.mockRestore(); }
+          } },
+        });
+      },
+    });
+    expect(parent.state?.status).toBe('failed');
+    const shardRows = trace.filter((row) => row.event === 'shard-ledger-summary');
+    expect(shardRows).toHaveLength(3);
+    expect(shardRows.map(({ data }) => data)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ invocationId: 'sim-invocation-1', disposition: { reused: 0, rerun: 2, unmeasured: 0 } }),
+      expect.objectContaining({ invocationId: 'sim-invocation-2', disposition: { reused: 0, rerun: 2, unmeasured: 0 } }),
+      expect.objectContaining({ invocationId: 'sim-invocation-3', disposition: { reused: 0, rerun: 2, unmeasured: 0 } }),
+    ]));
+    expect(trace.filter((row) => row.event === 'timeout-owner-cell-observed').map(({ data }) => data))
+      .toEqual([expect.objectContaining({ testId: B, streak: 1 }), expect.objectContaining({ testId: B, streak: 2 }), expect.objectContaining({ testId: B, streak: 3 })]);
+    const ownerDbPath = join(instanceRoot, 'release/gate-timeout-owner-cells.sqlite');
+    expect(existsSync(ownerDbPath)).toBe(true);
+    const ownerDb = new Database(ownerDbPath, { readonly: true });
+    try {
+      expect(ownerDb.query('SELECT streak FROM timeout_observations WHERE test_id = ? ORDER BY rowid').all(B))
+        .toEqual([{ streak: 1 }, { streak: 2 }, { streak: 3 }]);
+      expect(ownerDb.query('SELECT cell_id FROM completed_owner_cells WHERE test_id = ?').all(B)).toHaveLength(1);
+    } finally { ownerDb.close(); }
+    const gateEnd = recorded.find((event) => event.type === 'node-end' && event.source.nodeId === 'gate');
+    const decision = recorded.find((event) => event.type === 'release.macrophage.decision'
+      && (event.data as { phaseNodeId?: string }).phaseNodeId === 'gate');
+    expect(gateEnd).toMatchObject({ type: 'node-end', runId, source: { kind: 'node', nodeId: 'gate' }, data: { ok: false } });
+    expect(decision).toMatchObject({ type: 'release.macrophage.decision', runId,
+      data: { action: 'notify-owner', applied: false, status: 'planned', phaseNodeId: 'gate',
+        failureSignature: 'unknown', promotionMode: 'shadow' } });
+    const gateEndIndex = trace.findIndex((row) => row.event === 'node-end');
+    const decisionIndex = trace.findIndex((row) => row.event === 'release.macrophage.decision'
+      && (row.data as { phaseNodeId?: string }).phaseNodeId === 'gate');
+    expect(decisionIndex).toBeGreaterThan(gateEndIndex);
+  } finally {
+    spy.mockRestore();
+  }
 });
 
 test('GATE-TIMEOUT-NOT-BLOCK: only the matching baseline skip waives the timeout identity', async () => {

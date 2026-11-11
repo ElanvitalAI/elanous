@@ -1,0 +1,18 @@
+apiVersion: elanous.dev/graph/v2
+graph: { id: absorb-ingest, version: 1.0.0, layer: flow, purpose: "검증된 회원 소유 스크랩을 저장" }
+entry: save
+nodes:
+  - id: save
+    type: store
+    requires: store.write@1
+    with:
+      op: create
+      collection: scraps
+      owner: "$context.memberId"
+      value: "$input"
+      status: new
+      ownerScoped: true
+edges:
+  - { from: save, on: outcome, map: { done: done, failed: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, absorb.scrap] }

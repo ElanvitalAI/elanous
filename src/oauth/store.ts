@@ -27,14 +27,16 @@
 
 import {
   existsSync, readFileSync, writeFileSync, mkdirSync, renameSync,
-  chmodSync, lstatSync, readlinkSync,
+  chmodSync, lstatSync, readlinkSync, openSync, closeSync, fchmodSync, unlinkSync,
 } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join, dirname, parse, resolve, sep } from 'node:path';
 import { extractChatGPTClaims, decodeJWTPayload, type ChatGPTClaims } from './jwt.js';
 import { debug } from '../debug/log.js';
 import { isCodexStoreKey } from './codex-account.js';
 import { migrateLegacyXdgFile } from '../storage/legacy-elanous-dir-migrate.js';
+import { withFileLockSync } from '../storage/file-lock.js';
 
 export interface OAuthTokens {
   accessToken: string;
@@ -57,6 +59,8 @@ export type CodexMirrorResult = 'written' | 'not-created-missing-cli-fields' | '
 
 export interface ProviderAuthState {
   tokens: OAuthTokens;
+  /** Access-only snapshot owned and refreshed on another host. Never refresh locally. */
+  source?: 'mirror';
   /** ISO timestamp of the most recent refresh. Hermes uses this for
    *  UX and telemetry; we mirror it for Codex dual-write. */
   lastRefresh: string;
@@ -134,10 +138,23 @@ function readStore(path: string = authStorePath()): AuthStore {
 
 function writeStore(store: AuthStore, path: string = authStorePath()): void {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = path + '.tmp';
-  writeFileSync(tmp, JSON.stringify(store, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, path);
-  try { chmodSync(path, 0o600); } catch { /* best-effort */ }
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(tmp, 'wx', 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    writeFileSync(fd, JSON.stringify(store, null, 2) + '\n', 'utf-8');
+    closeSync(fd);
+    renameSync(tmp, path);
+  } catch (error) {
+    try { closeSync(fd); } catch { /* already closed */ }
+    try { unlinkSync(tmp); } catch { /* already renamed */ }
+    throw error;
+  }
+}
+
+function withStoreLock<T>(path: string, fn: () => T): T {
+  mkdirSync(dirname(path), { recursive: true });
+  return withFileLockSync(`${path}.lock`, fn, { breakDeadHolder: true });
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -145,6 +162,76 @@ function writeStore(store: AuthStore, path: string = authStorePath()): void {
 export function loadTokens(provider: string, path: string = authStorePath()): ProviderAuthState | null {
   const store = readStore(path);
   return store.providers[provider] ?? null;
+}
+
+/** Metadata-only read for app connection surfaces. Never returns a token or client secret. */
+export interface OAuthConnectionStatus {
+  connected: boolean;
+  expiresAt: number | null;
+  lastRefresh: string | null;
+}
+
+export class OAuthRegistrationChangedError extends Error {
+  constructor() {
+    super('OAuth registration changed');
+    this.name = 'OAuthRegistrationChangedError';
+  }
+}
+
+export function oauthConnectionStatus(provider: string, path: string = authStorePath()): OAuthConnectionStatus {
+  const state = loadTokens(provider, path);
+  return {
+    connected: Boolean(state?.tokens.accessToken),
+    expiresAt: state?.tokens.expiresAt ?? null,
+    lastRefresh: state?.lastRefresh ?? null,
+  };
+}
+
+/** Safe compare token for an OAuth request that waits for human approval. */
+export interface OAuthRegistrationSnapshot {
+  clientId: string | null;
+  stateDigest: string | null;
+}
+
+export function oauthSnapshotFromState(state: ProviderAuthState | null): OAuthRegistrationSnapshot {
+  return {
+    clientId: state?.accountUuid ?? null,
+    stateDigest: state ? createHash('sha256').update(JSON.stringify(state)).digest('hex') : null,
+  };
+}
+
+export function oauthRegistrationSnapshot(provider: string, path: string = authStorePath()): OAuthRegistrationSnapshot {
+  return oauthSnapshotFromState(loadTokens(provider, path));
+}
+
+/** Replace a client's registration and tokens in one private write, refusing a stale client. */
+export function replaceClientTokensIfCurrent(
+  provider: string,
+  expectedClientId: string | null,
+  tokens: OAuthTokens,
+  registration: { clientId: string; clientSecret?: string; redirectUri?: string; authMode: string },
+  path: string = authStorePath(),
+  expectedStateDigest?: string | null,
+): void {
+  if (isCodexStoreKey(provider)) throw new Error('OAuth client replacement is unavailable for Codex accounts');
+  withStoreLock(path, () => {
+    const store = readStore(path);
+    const previous = store.providers[provider];
+    if ((previous?.accountUuid ?? null) !== expectedClientId ||
+        (previous && previous.authMode !== registration.authMode) ||
+        (expectedStateDigest !== undefined && oauthSnapshotFromState(previous ?? null).stateDigest !== expectedStateDigest)) {
+      throw new OAuthRegistrationChangedError();
+    }
+    store.providers[provider] = {
+      tokens,
+      lastRefresh: new Date().toISOString(),
+      authMode: registration.authMode,
+      accountUuid: registration.clientId,
+      ...(registration.clientSecret ? { organizationUuid: registration.clientSecret } : {}),
+      ...(registration.redirectUri ? { redirectUri: registration.redirectUri } : {}),
+    };
+    writeStore(store, path);
+  });
 }
 
 /** Decode a JWT's `exp` claim into epoch-ms (or null when absent/bad). */
@@ -264,6 +351,7 @@ export function saveTokens(
   opts: WriteTokensOpts = {},
   path: string = authStorePath(),
 ): ProviderAuthState {
+  const state = withStoreLock(path, () => {
   const store = readStore(path);
   const existing = store.providers[provider];
   // ChatGPT claims live on the JWT access token the OpenAI OAuth
@@ -291,6 +379,8 @@ export function saveTokens(
   };
   store.providers[provider] = state;
   writeStore(store, path);
+  return state;
+  });
 
   // ⛔⭐⭐⭐ 미러 대상은 «저장하는 그 기록»이 정한다 — 주변 env/config 를 «안 읽는다».
   //   1R must-fix: 종전엔 현재 환경의 계정 해석으로 골라서, `openai-codex:team` 을 저장하는데
@@ -313,11 +403,13 @@ export function saveTokens(
 }
 
 export function deleteTokens(provider: string, path: string = authStorePath()): boolean {
-  const store = readStore(path);
-  if (!(provider in store.providers)) return false;
-  delete store.providers[provider];
-  writeStore(store, path);
-  return true;
+  return withStoreLock(path, () => {
+    const store = readStore(path);
+    if (!(provider in store.providers)) return false;
+    delete store.providers[provider];
+    writeStore(store, path);
+    return true;
+  });
 }
 
 export function listProviders(path: string = authStorePath()): string[] {

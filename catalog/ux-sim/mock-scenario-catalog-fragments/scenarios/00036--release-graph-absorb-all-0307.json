@@ -18,7 +18,9 @@
     "A1-A15 retain incident order, rationale, and one runId",
     "every recipe and domain-pack binding is declared by the real release graph manifest",
     "gate remains independent of export-check",
-    "the graph run reaches approve-publish and no other HITL node"
+    "the graph run reaches approve-publish and no other HITL node",
+    "a newly observed event produces a declarative edge diff which the real graph runner simulates",
+    "changing only gate.plan.promoteToFull changes the simulated append/full route"
   ],
-  "expected": "The release graph simulator accounts for all 15 interventions with RLA evidence and pauses at the declared publication approval boundary."
+  "expected": "The release graph simulator accounts for all 15 interventions with RLA evidence and pauses at the declared publication approval boundary; a new-event edge diff passes simulation and changes route from policy values alone."
 }

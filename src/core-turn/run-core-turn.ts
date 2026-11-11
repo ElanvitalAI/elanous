@@ -576,7 +576,9 @@ export async function runCoreTurn(
   const { messages, tools: tieredTools, stats } = applyDeferredTools(
     ctx.messages,
     ctx.tools,
-    { enabled: deferredEnabled, ...(recentUserText ? { userText: recentUserText } : {}) },
+    { enabled: deferredEnabled,
+      activePluginIds: new Set(ctx.tools.flatMap((tool) => tool.pluginId ? [tool.pluginId] : [])),
+      ...(recentUserText ? { userText: recentUserText } : {}) },
   );
   // Preserve the pre-routing contract: a named skill only skips the research
   // prepass when skill_exec is actually active after the normal tier split.

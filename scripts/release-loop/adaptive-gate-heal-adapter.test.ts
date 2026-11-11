@@ -1,11 +1,12 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { createGraphEventBus, type GraphEventBus } from '../../src/graph-runner/graph-events.js';
 import { runGraph, type GraphRunOptions } from '../../src/graph-runner/runner.js';
+import { argCandidateDirectory } from '../../src/graph-runner/arg-open-proposal.js';
 import type { GateResult } from './gate-types.js';
 import { parseOptions } from './gate-node.js';
 import { registerAdaptiveGateHealAdapter, RELEASE_GATE_FAILED_EVENT, type AdaptiveGateHealAppendNodeRequest } from './adaptive-gate-heal-adapter.js';
@@ -346,14 +347,21 @@ test('RLA-ALL-LIVE sim: receipt audit rejects host attribution gaps and residual
 
 test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the same run then waits at HITL', async () => {
   const root = mkdtempSync(join('/tmp', 'rla-all-live-pod-retry-'));
+  const previousLive = process.env.ELANOUS_RLA_ARG_LIVE;
+  process.env.ELANOUS_RLA_ARG_LIVE = '1';
   const commit = 'e'.repeat(40);
   const gateExecutors: unknown[] = [];
   let gateVisits = 0;
+  let proposalCalls = 0;
   let liveTriage: Record<string, unknown> | undefined;
   try {
     const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
     const cwd = join(import.meta.dir, '../..');
     const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (body, opts) => {
+      const rawContext = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { graphId?: string };
+      if (rawContext.graphId === 'pod-reuse-prep')
+        return { exitCode: 0, stdout: JSON.stringify({ outcome: 'legacy', verdict: 'legacy',
+          reason: 'prep-body-pending', receiptPath: '' }), stderr: '' };
       if (body.includes('gate-node.ts --json')) {
         gateVisits++;
         const context = readGraphContext(opts.env!);
@@ -376,7 +384,25 @@ test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the sam
     };
     const state = await runGraph(graphPath, { runId: 'rla-all-live-pod-retry', input: {
       version: '0.3.7', previousVersion: '0.3.6', gateExecutor: 'host', gatePodPool: 'pool-aws2@aws2:1',
-    }, deps: { root, runBash } });
+      cutSha: commit, candidatePath: 'fixture:legacy',
+      graphCutover: 'audit', graphCutoverEvidenceId: 'RLA-ARG-LIVE-sim',
+    }, deps: { root, runBash, callLLM: async prompt => {
+      expect(prompt).toContain('attemptsPolicy');
+      expect(prompt).not.toContain('release.gate.failure.attribution-gap');
+      proposalCalls++;
+      if (proposalCalls > 1) return JSON.stringify({ // Source: RLA-ARG-FULL-VERBS high-risk MRTR simulation.
+        apiVersion: 'elanous.dev/arg-proposal/v1', verb: 'propose-new-gate-node',
+        rationale: 'Pod failure needs a new diagnostic node',
+        changes: [{ kind: 'node', node: { node_id: 'diagnostic-gate', kind: 'gate', recipe: 'none' } }],
+        rollbackWhen: ['verification fails'],
+      });
+      return JSON.stringify({
+      apiVersion: 'elanous.dev/arg-proposal/v1', verb: 'register-attribution-gap',
+      rationale: 'Previously unseen host attribution gap',
+      changes: [{ kind: 'vocabulary', term: 'release.gate.failure.attribution-gap' }],
+      rollbackWhen: ['verification fails'],
+      });
+    } } });
     expect(gateVisits).toBe(2);
     expect(gateExecutors).toEqual(['host', 'pod']);
     expect(liveTriage?.prescription).toMatchObject({ action: 'decision-required' });
@@ -384,7 +410,25 @@ test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the sam
     expect(state.path).not.toContain('emergency-switch');
     expect(state.path).toContain('gate-heal-decision');
     expect(state.pending?.nodeId).toBe('gate-heal-decision');
-  } finally { rmSync(root, { recursive: true, force: true }); }
+    expect(state.adaptiveGraphEdges).toEqual([expect.objectContaining({ from: 'gate-triage', to: 'gate', triggerEvent: 'release.gate.failed' })]);
+    expect(state.adaptiveGraphVocabulary).toContain('release.gate.failure.attribution-gap');
+    expect(state.graphRevision).toBe(3); // Source: RLA-SUPERVISOR-ARG-GRAPH edge and vocabulary apply contracts.
+    expect(proposalCalls).toBe(2); // Source: RLA-ARG-FULL-VERBS one proposal per unmeasured gate event.
+    expect(state.argInputRequests?.[0]?.resultType).toBe('input_required');
+    expect(state.argInputRequests?.[0]?.requestState.proposal).toContain('diagnostic-gate');
+    const vocabulary = parseYaml(readFileSync(join(`${state.statePath}.graph`, 'release-edge-vocabulary.yaml'), 'utf8'));
+    expect(vocabulary.failureTypes['release.gate.failure.attribution-gap']).toMatchObject({
+      source: 'rla-open-proposal', graphRevision: 3, // Source: RLA-SUPERVISOR-ARG-GRAPH edge and vocabulary apply contracts.
+    });
+    expect(readFileSync(join(root, 'graph-supervisors/actions.jsonl'), 'utf8')).toContain('"verb":"verify"');
+    const candidateDirectory = argCandidateDirectory(root, state.runId);
+    expect(JSON.parse(readFileSync(join(candidateDirectory, readdirSync(candidateDirectory)[0]!), 'utf8')).status).toBe('candidate');
+    expect(existsSync(join(root, 'graph-supervisors/template-memory.json'))).toBe(false);
+  } finally {
+    if (previousLive === undefined) delete process.env.ELANOUS_RLA_ARG_LIVE;
+    else process.env.ELANOUS_RLA_ARG_LIVE = previousLive;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 

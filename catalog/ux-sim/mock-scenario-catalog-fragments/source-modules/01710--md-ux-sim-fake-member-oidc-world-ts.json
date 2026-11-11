@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-FAKE-MEMBER-OIDC-WORLD-TS",
+  "path": "src/ux-sim/fake-member-oidc-world.ts",
+  "boundary": "Composes production member signup and app-slot handlers through a loopback Nexus HTTP server with an in-memory fake Google OIDC boundary; verifies browser callback state, native PKCE exchange and app-host owner routes without external network calls.",
+  "deviceIds": [
+    "fake-member-oidc-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

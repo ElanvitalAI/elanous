@@ -17,6 +17,9 @@ export interface NexusEvent {
   kind:
     | 'nexus.boot'
     | 'nexus.shutdown'
+    | 'app.row.insert'
+    | 'app.row.update'
+    | 'app.row.delete'
     | 'tab.created'
     | 'tab.up'
     | 'tab.down'
@@ -93,6 +96,9 @@ export interface NexusEvent {
     // SSE 로 **내용을 담은** 메시지레벨 갱신을 받는다(content-less `session.updated` 와 달리
     // role/text 포함). 스트리밍(ACP peer broadcast)은 C5 별도. `detail` = { sessionId, role, text }.
     | 'session.output'
+    // Member-scoped mini-board invalidation. The SSE bridge filters this
+    // event by the verified owner memberId before emitting it.
+    | 'board.card'
     // Hand mission addressed line. Durable rows live in agent-missions; this event
     // is only the existing /v1/events SSE notification edge.
     | 'mission.line'
@@ -125,6 +131,7 @@ export interface NexusEvent {
     // SSE 구독자는 `?topics=graph.compose` 로 받는다.
     | 'graph.compose';
   tabId?: string;
+  memberId?: string;
   detail?: Record<string, unknown>;
 }
 

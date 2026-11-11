@@ -1,0 +1,28 @@
+{
+  "id": "absorb-graph-v2-runGraph",
+  "name": "Absorb plugin graph through the production graph runner with fake capabilities",
+  "checklistCells": ["ABSORB-BUNDLE"],
+  "implementation": [
+    "src/ux-sim/absorb-v2-runGraph-sim.ts",
+    "src/ux-sim/fake-app-host.ts",
+    "src/ux-sim/fake-clock.ts",
+    "plugins/absorb/sims/absorb-demo-world.yaml"
+  ],
+  "tests": ["src/ux-sim/absorb-v2-runGraph-sim.test.ts"],
+  "target": "Executes the absorb plugin graphs with runGraph and fake capabilities; verifies the default-N route gate and records the current upstream blocker on the explicit-y full flow.",
+  "inputs": [
+    "confirmation y or N",
+    "member-owned seven-kind scrap fixture",
+    "fake simulation receipt pass or fail"
+  ],
+  "observations": [
+    "default N returns confirmation-required before graph handler dispatch; LLM and app-host calls remain zero",
+    "runGraph store flows persist new owner-scoped scraps and filter foreign-owner records from collection and suggestion listing",
+    "a runGraph capability flow rejects failed, missing, mismatched-artifact, and foreign-owner receipts before app-host calls",
+    "the full explicit-y bundle graph currently stops at the upstream core verb exit contract"
+  ],
+  "entryCommands": ["bun src/ux-sim/absorb-v2-runGraph-sim.ts N", "bun src/ux-sim/absorb-v2-runGraph-sim.ts y"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

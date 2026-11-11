@@ -9,7 +9,7 @@ import { writeStdoutJson } from '../cli/stdout-json.js';
 import { debug } from '../debug/log.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { HqConfig, HqFenceRole } from '../user-config/types.js';
 import { fenceOutcomeDir, recordFenceOutcome } from './fence-outcomes.js';
 import { promoteHq, proposeHqPromotion, writeOpSeatRequest } from './promote.js';

@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { normalizeSimWorldAppPath } from './world-schema.js';
+import type { AppDeployPublishHook } from '../agent/app-deploy-plugin.js';
+import { publicAppAddress } from '../nexus/apps/console-address.js';
 
 export interface FakeAppVersion {
   readonly id: string;
@@ -23,6 +25,29 @@ export interface FakeAppHost {
   deployArtifact(slug: string, version: FakeAppVersion): void;
   rollback(slug: string): void;
   fetch(host: string, path: string): FakeAppResponse;
+}
+
+/** Publishes only a passing receipt into the existing in-memory app host. */
+export function createFakeAppDeployPublishHook(input: {
+  readonly host: FakeAppHost;
+  readonly ownerUserId: string;
+  readonly receiptId: string;
+  readonly version: FakeAppVersion;
+}): AppDeployPublishHook {
+  const appSlug = 'lecture-scrap';
+  const publicUrl = `${publicAppAddress({ appSlug, userSlug: input.ownerUserId })}/`;
+  return {
+    async publish(request) {
+      if (request.appId !== appSlug || request.ownerUserId !== input.ownerUserId
+        || request.simulationReceipt !== input.receiptId) throw new Error('fake app publish receipt or owner mismatch');
+      input.host.deployArtifact(appSlug, input.version);
+      return { publicUrl };
+    },
+    async verifyPublicUrl(value) {
+      const response = input.host.fetch(`${appSlug}.app.sim.invalid`, '/');
+      return value === publicUrl && response.status === 200 && response.headers['x-app-version'] === input.version.id;
+    },
+  };
 }
 
 const APP_CONTENT_TYPES: Readonly<Record<string, string>> = {

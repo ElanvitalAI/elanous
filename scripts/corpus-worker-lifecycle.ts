@@ -1,4 +1,5 @@
 import { debug } from '../src/debug/log.js';
+import { killCorpusProcessGroup } from './corpus-process-group.js';
 
 const CATEGORY = 'goal-grounding.corpus';
 const DEFAULT_ORPHAN_CHECK_MS = 100;
@@ -23,13 +24,7 @@ function isLiveProcess(pid: number): boolean {
  * only rather than risking its test runner's process group. */
 function terminateOwnGroup(reason: 'orphan-detected' | 'lifetime-expired', data: Record<string, unknown>): void {
   debug.log(CATEGORY, reason, data);
-  try {
-    process.kill(-process.pid, 'SIGKILL');
-  } catch (error: unknown) {
-    if (!(error instanceof Error) || !('code' in error) || error.code !== 'ESRCH') throw error;
-    try { process.kill(process.pid, 'SIGKILL'); }
-    catch (fallback: unknown) { if (!(fallback instanceof Error) || !('code' in fallback) || fallback.code !== 'ESRCH') throw fallback; }
-  }
+  killCorpusProcessGroup(process.pid);
   process.exit(1);
 }
 

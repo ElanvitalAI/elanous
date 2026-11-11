@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from './instance/resolve.js';
-import { getUserConfig } from './user-config.js';
+import { getUserConfig } from './user-config/reader.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
 import { forwardTelegramDispatch } from './telegram-dispatch-forward.js';
 import { mergeCapturedPath, warmCapturedEnv } from './shell-env-bootstrap.js';

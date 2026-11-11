@@ -6,8 +6,10 @@ import { debug } from '../debug/log.js';
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { checklistEvidenceChain, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, summarizeChecklist, type ChecklistEvidenceStage } from '../release-loop/checklist.js';
+import { collectStaleMergedChecklistProposals, type StaleMergedChecklistScan } from '../release-loop/merged-pr-checklist.js';
 import { userConfigPath } from '../user-config.js';
 import { CliUserError } from './cli-user-error.js';
+import { readRemoteChecklist, requestChecklistClaim } from './release-checklist-remote.js';
 import { writeStdoutJson } from './stdout-json.js';
 
 const SEMVER = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
@@ -35,7 +37,7 @@ export function readChecklistContext(cmd: Command): { version: string; codenames
 
 export async function checklistOutput(v: string, codenames: Record<string, string>, mode: 'list' | 'status', json?: boolean, owner?: string): Promise<void> {
   if (owner !== undefined) parseOwner(owner);
-  const snapshot = listChecklist(v);
+  const snapshot = await readRemoteChecklist(v) ?? listChecklist(v);
   const data = owner === undefined ? snapshot : { ...snapshot, items: snapshot.items.filter((item) => ownerMatches(item.owner, owner)) };
   const summary = summarizeChecklist(data);
   const parity = data.items.flatMap((item) => {
@@ -192,16 +194,51 @@ export function collectChecklistEvidenceStages(item: ReturnType<typeof listCheck
 }
 
 /** Register the same read commands on the full and lightweight release roots. */
-export function registerChecklistReadCommands(checklist: Command, evidenceReader: ChecklistEvidenceReader = defaultChecklistEvidenceReader): void {
+export type StaleChecklistSweep = (version: string, cwd: string) => StaleMergedChecklistScan;
+
+export function registerChecklistReadCommands(
+  checklist: Command,
+  evidenceReader: ChecklistEvidenceReader = defaultChecklistEvidenceReader,
+  staleSweep: StaleChecklistSweep = collectStaleMergedChecklistProposals,
+): void {
   const withContext = (cmd: Command) => cmd.option('--version <v>', '판 또는 별칭').option('--json', '결과 JSON').option('--hq-override', '본부 임대 거부를 관측하며 수동 우회');
   withContext(checklist.command('list').description('모든 칸')).option('--owner <owner>', '자리 또는 하위 자리로 거르기').action(async (opts: { owner?: string }, cmd: Command) => {
     const { version, codenames, json } = readChecklistContext(cmd);
     await checklistOutput(version, codenames, 'list', json, opts.owner);
   });
-  withContext(checklist.command('status').description('상태 요약')).option('--owner <owner>', '자리 또는 하위 자리로 거르기').action(async (opts: { owner?: string }, cmd: Command) => {
+  withContext(checklist.command('status').description('상태 요약 (원격: ELANOUS_NEXUS_URL + 0600 ELANOUS_NEXUS_TOKEN_FILE)')).option('--owner <owner>', '자리 또는 하위 자리로 거르기').action(async (opts: { owner?: string }, cmd: Command) => {
     const { version, codenames, json } = readChecklistContext(cmd);
     await checklistOutput(version, codenames, 'status', json, opts.owner);
   });
+  withContext(checklist.command('stale-sweep').description('병합·열린 PR 경로로 노란 칸 상태를 읽기 전용 대조'))
+    .action(async (_opts: unknown, cmd: Command) => {
+      const { version, json } = readChecklistContext(cmd);
+      const scan = staleSweep(version, process.cwd());
+      if (json) { await writeStdoutJson(`${JSON.stringify({ version, ...scan })}\n`); return; }
+      const incomplete = scan.incompletePrNumbers.length ? ` · 파일 목록 절단 PR: ${scan.incompletePrNumbers.map((number) => `#${number}`).join(', ')}` : '';
+      console.log(`${version} · 병합 PR ${scan.scannedMergedMainPrs}건 · 열린 PR ${scan.scannedOpenPrs}건 조사${scan.complete ? '' : ` · ⚠ 불완전 조사${incomplete}`}`);
+      if (!scan.proposals.length && !scan.openPathMatches.length) { console.log('제안·열린 PR 경로 일치 없음'); return; }
+      for (const proposal of scan.proposals) {
+        console.log(`${proposal.id} · ${proposal.proposalKind} · 제안 상태: proposed(사람 검토 필요) · 현재 ${proposal.currentStatus} · 대상 경로: ${proposal.targetPaths.join(', ')}`);
+        for (const pr of proposal.prs) {
+          const idEvidence = pr.cellIdMentioned ? '셀 ID 언급' : '경로 일치만 · 셀 ID 미언급';
+          const sharedPath = pr.ambiguousWith.length ? ` · 공유 대상: ${pr.ambiguousWith.join(', ')}` : '';
+          console.log(`  #${pr.number} · ${idEvidence}${sharedPath} · 일치 경로: ${pr.matchedPaths.join(', ') || '없음'} · 변경 경로: ${pr.changedPaths.join(', ')}`);
+        }
+      }
+      for (const row of scan.openPathMatches) {
+        const refs = row.prs.map((pr) => `#${pr.number}@${pr.author} (${pr.baseRefName}) [${pr.matchedPaths.join(', ')}]`).join('; ');
+        console.log(`${row.id} · 현재 yellow · 열린 PR 경로 일치(중복 작업 확인): ${refs}`);
+      }
+    });
+  withContext(checklist.command('claim-request <id>').description('비어 있는 노란 칸을 OP 에게 우편으로 선점 요청'))
+    .requiredOption('--by <seat>', '요청 자리')
+    .action(async (id: string, opts: { by: string }, cmd: Command) => {
+      const { version } = readChecklistContext(cmd);
+      const snapshot = await readRemoteChecklist(version) ?? listChecklist(version);
+      requestChecklistClaim(snapshot, id, opts.by);
+      console.log(`OP 에 ${version} ${id} 선점 요청을 보냈다 (원장 소유권은 OP 확인 뒤 변경)`);
+    });
   withContext(checklist.command('evidence [id]').description('칸의 단계별 실물 근거 사슬 조회·PR 참조 추가'))
     .action(async (id: string | undefined, _opts: unknown, cmd: Command) => {
       const { version, json } = readChecklistContext(cmd);

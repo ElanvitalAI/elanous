@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-APP-UPGRADE-PATH-WORLD-TS",
+  "path": "src/ux-sim/app-upgrade-path-world.ts",
+  "boundary": "Simulates app upgrade paths with isolated source changes, verification, publication, and rollback.",
+  "deviceIds": ["app-upgrade-path"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -17,34 +17,57 @@ export function emptyComposer(): InlineEditorState {
   return createInlineEditorState();
 }
 
-/** Keep the edit cursor and the newest text visible in one terminal row. */
-export function composerViewport(state: InlineEditorState, columns: number): { line: string; cursorCol: number } {
-  const text = safeLogText(state.text).replace(/\n/g, '↵');
-  const before = safeLogText(state.text.slice(0, state.cursor)).replace(/\n/g, '↵');
-  const graphemes = Array.from(segmenter.segment(text), ({ segment }) => segment);
-  const cursorAt = Math.min(graphemes.length, Array.from(segmenter.segment(before)).length);
-  // Reserve one cell for the visible cursor after the prompt and text.
-  const available = Math.max(1, columns - 3);
-  let start = cursorAt;
-  let beforeWidth = 0;
-  while (start > 0) {
-    const cells = Bun.stringWidth(graphemes[start - 1]!);
-    if (beforeWidth + cells > available) break;
-    beforeWidth += cells;
-    start--;
-  }
+/** Replace a slash-picker query before the cursor while retaining the draft suffix. */
+export function replaceSlashPickerQuery(state: InlineEditorState, command: string): InlineEditorState {
+  const cursor = Math.max(0, Math.min(state.cursor, state.text.length));
+  return { text: command + state.text.slice(cursor), cursor: command.length };
+}
+
+/** Wrap the draft, grow with it, and scroll inside the bounded composer when needed. */
+export function composerViewport(state: InlineEditorState, viewport: number | { columns: number; maxRows: number }): {
+  line: string; lines: string[]; cursorRow: number; cursorCol: number;
+} {
+  const width = Math.max(1, typeof viewport === 'number' ? viewport : viewport.columns);
+  const available = Math.max(1, width - 2);
+  const rows = ['❯ '];
   let used = 0;
-  let end = start;
-  while (end < graphemes.length) {
-    const cells = Bun.stringWidth(graphemes[end]!);
-    if (used + cells > available) break;
-    used += cells;
-    end++;
+  let cursorRow = 0;
+  let cursorCol = 3;
+  let cursorMarked = false;
+  const cursor = Math.max(0, Math.min(state.cursor, state.text.length));
+  const markCursor = () => { cursorRow = rows.length - 1; cursorCol = Math.min(width, used + 3); cursorMarked = true; };
+  for (const { segment, index } of segmenter.segment(state.text)) {
+    const newline = segment === '\n';
+    const visible = newline ? '' : safeLogText(segment);
+    const cells = newline ? 0 : Bun.stringWidth(visible);
+    // The next grapheme owns the new row when it would overflow this one.
+    if (!newline && used > 0 && used + cells > available) {
+      rows.push('  ');
+      used = 0;
+    }
+    if (!cursorMarked && index >= cursor) markCursor();
+    if (newline) {
+      rows.push('  ');
+      used = 0;
+      continue;
+    }
+    if (cells <= available) {
+      rows[rows.length - 1] += visible;
+      used += cells;
+    }
   }
-  return {
-    line: `❯ ${graphemes.slice(start, end).join('')}`,
-    cursorCol: Math.min(columns, 3 + beforeWidth),
-  };
+  if (!cursorMarked) {
+    // A full final row leaves the insertion point at the next row's start.
+    if (cursor === state.text.length && used >= available) {
+      rows.push('  ');
+      used = 0;
+    }
+    markCursor();
+  }
+  const height = Math.max(1, typeof viewport === 'number' ? 1 : viewport.maxRows);
+  const start = Math.max(0, Math.min(cursorRow - height + 1, rows.length - height));
+  const lines = rows.slice(start, start + height);
+  return { line: lines.at(-1) ?? '❯ ', lines, cursorRow: cursorRow - start, cursorCol };
 }
 
 export type WheelDirection = 'up' | 'down';
@@ -134,11 +157,13 @@ export function applyComposerKey(state: InlineEditorState, key: Key): ComposerRe
     return { state, action: 'quit' };
   }
   if ((name === 'enter' || name === 'return') && !key.shift) {
+    if (key.alt || key.ctrl) return { state: inlineEditorInsert(state, '\n'), action: 'edit' };
     const submitted = state.text.trim();
     return submitted
       ? { state: emptyComposer(), action: 'submit', submitted }
       : { state, action: 'none' };
   }
+  if (key.ctrl && name === 'j') return { state: inlineEditorInsert(state, '\n'), action: 'edit' };
   // One bracketed-paste envelope (terminal paste · herdr `pane run`) is one key whose body rides on `paste`.
   // Without this the shared text rule inserted the key NAME («paste») instead of the pasted text.
   if (name === 'paste') {

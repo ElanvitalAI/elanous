@@ -9,6 +9,7 @@ import { routeMaturity } from '@/lib/route-maturity';
 import { useShowBeta } from '@/lib/show-beta';
 import { NAV_GROUPS, NAV_SHOW_HIDDEN_KEY, NAV_SHOW_LABS_KEY, SIDEBAR_NAV_ITEMS, visibleNavGroups, type NavGroupId } from './sidebar-nav-items';
 import { NAV_PREFS_EVENT, readFlag } from './nav-visibility-prefs';
+import { userIntentLogger } from '@/lib/user-intent-logger';
 
 export function MobileBottomTabs() {
   const pathname = usePathname();
@@ -62,6 +63,13 @@ export function MobileBottomTabs() {
   // 운영자에게 «더보기» 시트는 운영 칸이 맨 위다 — 맨 아래면 폰 폭에서 접혀 «릴리스»를 못 찾는다(10-07 피드백).
   const extra = groups.filter((group) => !group.bottomTab);
   const path = (pathname ?? '/').replace(/\/+$/, '') || '/';
+  const recordNavigation = (href: string) => {
+    void userIntentLogger.emit({
+      surface: 'pwa',
+      intent: { layer: 'navigation', kind: 'pwa.navigation.bottom_tab_open', target: { kind: 'route', id: href } },
+      surface_state: { route: path },
+    });
+  };
   const isActive = (item: typeof items[number]) => path === item.href || (item.href !== '/' && path.startsWith(`${item.href}/`))
     || (item.activeAlso ?? []).some((href) => path === href || path.startsWith(`${href}/`));
   const activeGroup = groups.find((group) => group.items.some(isActive));
@@ -79,7 +87,7 @@ export function MobileBottomTabs() {
             const selected = activeGroup?.id === group.id;
             const className = `flex min-w-0 flex-1 flex-col items-center justify-center gap-0.5 text-xs ${selected ? 'font-semibold text-primary' : 'text-muted-foreground'}`;
             return group.items.length === 1 ? (
-              <Link key={group.id} href={group.items[0]!.href as never} aria-label={group.label} aria-current={selected ? 'page' : undefined} className={className}>
+              <Link key={group.id} href={group.items[0]!.href as never} aria-label={group.label} aria-current={selected ? 'page' : undefined} className={className} onClick={() => recordNavigation(group.items[0]!.href)}>
                 <Icon aria-hidden className="h-5 w-5" /><span>{group.label}</span>
                 {role === 'general' && showBeta && group.items[0]!.href !== '/settings' && routeMaturity(group.items[0]!.href) === 'beta' && <span className="text-[10px] text-primary">실험</span>}
               </Link>
@@ -108,7 +116,7 @@ export function MobileBottomTabs() {
                 {group.items.map((item) => {
                   const Icon = item.icon;
                   const experimental = role === 'general' && showBeta && item.href !== '/settings' && routeMaturity(item.href) === 'beta';
-                  return <Link key={item.href} href={item.href as never} aria-current={isActive(item) ? 'page' : undefined} onClick={() => setOpen(null)} className="flex items-center gap-3 rounded-md px-3 py-3 text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                  return <Link key={item.href} href={item.href as never} aria-current={isActive(item) ? 'page' : undefined} onClick={() => { recordNavigation(item.href); setOpen(null); }} className="flex items-center gap-3 rounded-md px-3 py-3 text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
                     <Icon aria-hidden className="h-4 w-4" />{item.label}
                     {experimental && <span className="rounded border border-primary/40 px-1 text-[10px] text-primary">실험</span>}
                   </Link>;

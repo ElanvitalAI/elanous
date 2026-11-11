@@ -1,0 +1,11 @@
+observe: { command: 'arg:observe' }
+reason:
+  prompt: |
+    Inspect the observation, release graph context, knowledge packs and template memory.
+    Return one JSON object matching elanous.dev/arg-proposal/v1 with verb, rationale, changes and rollbackWhen.
+    Input: $ARGUMENTS
+propose: { command: 'arg:propose' }
+validate: { command: 'arg:validate' }
+apply: { command: 'arg:apply' }
+verify: { command: 'arg:verify' }
+rollback: { command: 'arg:rollback' }

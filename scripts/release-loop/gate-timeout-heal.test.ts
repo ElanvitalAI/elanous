@@ -2,7 +2,7 @@
 // finished, says «timeout», and only the rest runs again; per-shard deadlines follow the plan; installs share node slots.
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -19,6 +19,16 @@ import { debug } from '../../src/debug/log.js';
 const CUT = 'a'.repeat(40);
 const dirs: string[] = [];
 const temp = (prefix: string) => { const dir = mkdtempSync(join(tmpdir(), prefix)); dirs.push(dir); return dir; };
+
+/** The real isolated shell clones this fixture, so provide its setup script and tracked PWA directory. */
+function prepareIsolationSource(repo: string) {
+  mkdirSync(join(repo, 'node_modules'), { recursive: true });
+  mkdirSync(join(repo, 'apps/pwa/node_modules'), { recursive: true });
+  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  mkdirSync(join(repo, 'scripts/release-loop'), { recursive: true });
+  writeFileSync(join(repo, 'apps/pwa/.fixture'), 'fixture\n');
+  copyFileSync(join(import.meta.dir, 'remote-worktree-setup.sh'), join(repo, 'scripts/release-loop/remote-worktree-setup.sh'));
+}
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 const junitFor = (files: readonly string[], failing: ReadonlySet<string> = new Set()) => `<?xml version="1.0"?>\n<testsuites>\n${files.map((file) =>
@@ -46,7 +56,8 @@ test('② parts follow the plan and the file cap, in order', () => {
   const parts = shardParts(files, () => 1);
   expect(parts.map((part) => part.length)).toEqual([POD_SHARD_FILE_CAP, POD_SHARD_FILE_CAP, 6]);
   expect(parts.flat()).toEqual(files);
-  expect(shardParts(['a', 'b', 'c', 'd'], (file) => file === 'b' ? 200 : 10).map((part) => part.length)).toEqual([2, 2]);
+  // The current duration-aware planner isolates the 200s outlier before balancing the remaining files.
+  expect(shardParts(['a', 'b', 'c', 'd'], (file) => file === 'b' ? 200 : 10).map((part) => part.length)).toEqual([1, 1, 2]);
 });
 
 test('batch test wall counts overlapping test intervals once and leaves setup gaps as overhead', () => {
@@ -200,13 +211,13 @@ test('isolation batch runs four files in one shell with separate HOME and comple
   const root = temp('gate-batch-');
   const home = join(root, 'home');
   const repo = join(root, 'work', 'repo');
-  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  prepareIsolationSource(repo);
   mkdirSync(home);
   fakeTools(join(root, 'bin'));
   mkdirSync(join(repo, 'src'));
   writeFileSync(join(repo, 'src/fixture.txt'), 'source');
   expect(spawnSync('git', ['-C', repo, 'init', '-q']).status).toBe(0);
-  expect(spawnSync('git', ['-C', repo, 'add', 'src/fixture.txt']).status).toBe(0);
+  expect(spawnSync('git', ['-C', repo, 'add', '.']).status).toBe(0);
   expect(spawnSync('git', ['-C', repo, '-c', 'user.name=TC', '-c', 'user.email=tc@example.invalid', 'commit', '-qm', 'fixture']).status).toBe(0);
   const parts = ['a', 'b', 'c', 'd'].map((name) => [`src/${name}.test.ts`]);
   const shell = gateShardShell({ parts, cdpPatterns: [], softSeconds: 15, cachePrefix: '', installSlots: 0, parallelParts: 4 })
@@ -252,13 +263,13 @@ test('final recheck shell executes four file parts, reports each rc, and runs at
   const home = join(root, 'home');
   const repo = join(root, 'work', 'repo');
   const trace = join(root, 'parallel.trace');
-  mkdirSync(join(repo, 'apps/pwa'), { recursive: true });
+  prepareIsolationSource(repo);
   mkdirSync(home);
   fakeTools(join(root, 'bin'));
   mkdirSync(join(repo, 'src'));
   writeFileSync(join(repo, 'src/fixture.txt'), 'source');
   expect(spawnSync('git', ['-C', repo, 'init', '-q']).status).toBe(0);
-  expect(spawnSync('git', ['-C', repo, 'add', 'src/fixture.txt']).status).toBe(0);
+  expect(spawnSync('git', ['-C', repo, 'add', '.']).status).toBe(0);
   expect(spawnSync('git', ['-C', repo, '-c', 'user.name=TC', '-c', 'user.email=tc@example.invalid', 'commit', '-qm', 'fixture']).status).toBe(0);
   const files = ['a', 'b', 'c', 'd'].map((name) => `src/${name}.test.ts`);
   const shell = gateShardShell({ parts: files.map((file) => [file]), cdpPatterns: [], softSeconds: 20,
@@ -323,6 +334,7 @@ function sweepRunner(files: string[], pod: (o: RunPodCommandOptions, parts: stri
   const root = temp('gate-sweep-');
   const repo = join(root, 'repo');
   mkdirSync(repo);
+  prepareIsolationSource(repo);
   mkdirSync(join(repo, 'release'));
   writeFileSync(join(repo, 'release/gate-batch-safe.json'), JSON.stringify({ env: 'linux-pod', tests: safeFiles.map((file) => ({ file, evidence: 'synthetic test fixture' })) }));
   const command: GateRunner['command'] = async (cmd, args) => {
@@ -385,7 +397,7 @@ test('sweep generated batch Job shell overlaps safe file tests in the real shell
   writeFileSync(join(repo, 'src/fixture.txt'), 'source');
   fakeTools(join(root, 'bin'));
   expect(spawnSync('git', ['-C', repo, 'init', '-q']).status).toBe(0);
-  expect(spawnSync('git', ['-C', repo, 'add', 'src/fixture.txt']).status).toBe(0);
+  expect(spawnSync('git', ['-C', repo, 'add', '.']).status).toBe(0);
   expect(spawnSync('git', ['-C', repo, '-c', 'user.name=TC', '-c', 'user.email=tc@example.invalid', 'commit', '-qm', 'fixture']).status).toBe(0);
   const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1, stallSeconds: 0 });
   expect(result.rc).toBe(0);
@@ -432,8 +444,9 @@ test('reproduction through the sweep: a cut shard is reason=timeout, keeps its f
   expect(meta).toMatchObject({ reason: 'timeout', rc: null, finishedFiles: POD_SHARD_FILE_CAP, deadlineSeconds: 1200 });
   const board = readGateShards(shardsPath);
   expect(board).toMatchObject({ version: '9.9.9', shards: [
-    { id: 'pod-0', state: 'done', rc: 0 },
-    { id: 'pod-0-n', state: 'done', installSec: 2.5, rc: 0 },
+    // A runtime-lockfile change invalidates the prior shard receipt; assert its rerun reason, not old install timing.
+    { id: 'pod-0', state: 'done', rc: 0, reuseDecision: 'rerun', reuseReason: 'runtime-lockfile-unmeasured' },
+    { id: 'pod-0-n', state: 'done' },
   ] });
   expect(typeof board!.shards[0]!.endedAt).toBe('string');
 });

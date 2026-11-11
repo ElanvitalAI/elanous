@@ -8,10 +8,11 @@
 //   그 순간을 잡으려고 폴링 스크립트를 짓고도 «두 번» 놓쳤고, 판당 3~5분이 들었다.
 //   ⇒ 여기서는 자식 수를 «숫자로» 주면 끝난다.
 
-import { createEscAbortGate, type EscAbortGate } from '../esc-abort-gate.js';
+import { createEscAbortGate, requiresLongShellEscConfirmation, type EscAbortGate } from '../esc-abort-gate.js';
 import type { ModalSurface } from '../display/modal-stack.js';
 import { AgentRegistry } from '../agent/registry.js';
 import type { AgentDefinition } from '../agent/types.js';
+import { InlineChoiceBroker } from '../tui/inline-choice.js';
 
 export interface EscGateSim {
   gate: EscAbortGate;
@@ -24,6 +25,12 @@ export interface EscGateSim {
   handoffCalls: number;
   /** 키 하나를 게이트에 넣는다(모달이 떠 있을 때만 소비된다). */
   key(name: string): boolean;
+  /** Submit an answer to the input-based confirmation, when enabled. */
+  inlineInput(input: string): boolean;
+  /** Select an inline confirmation option, when enabled. */
+  inlineKey(key: string): boolean;
+  /** Rendered inline prompt lines, when enabled. */
+  inlineLines: string[];
   /** ESC 를 넣는다. */
   esc(): void;
   /** 취소 신호의 «뜻» — turn-only 인지 kill-children 인지. */
@@ -46,10 +53,21 @@ export interface EscGateSim {
  */
 export function simEscGate(opts: {
   runningChildren?: number;
+  agentRegistry?: AgentRegistry;
+  inlineConfirmation?: boolean;
+  shellTool?: 'Bash' | 'RunShell';
+  shellElapsedMs?: number;
+  inlineAbortScope?: 'turn-only' | 'kill-children';
   viewport?: { cols: number; rows: number };
 } = {}): EscGateSim {
+  const longShell = requiresLongShellEscConfirmation(opts.shellTool ?? '', opts.shellElapsedMs ?? 0);
   const abortCtrl = new AbortController();
   const mounted: ModalSurface[] = [];
+  const inlineLines: string[] = [];
+  const inlineChoices = new InlineChoiceBroker({
+    appendLines: (lines) => inlineLines.push(...lines),
+    renderPanel: (lines) => inlineLines.splice(0, inlineLines.length, ...lines),
+  });
   const sim = {
     abortCtrl,
     mounted,
@@ -57,14 +75,30 @@ export function simEscGate(opts: {
   } as EscGateSim & { gate: EscAbortGate };
   sim.gate = createEscAbortGate({
     abortCtrl,
-    getRunningCount: () => opts.runningChildren ?? 0,
+    getRunningCount: () => (opts.agentRegistry?.list('running').length ?? opts.runningChildren ?? 0) + (longShell ? 1 : 0),
     mountModal: (surface) => { mounted.push(surface); return () => { mounted.pop(); }; },
     getViewport: () => opts.viewport ?? { cols: 100, rows: 30 },
     requestRedraw: () => { /* 시뮬레이터는 그리지 않는다 */ },
     handoffSurvivingChildren: () => { sim.handoffCalls += 1; },
+    shouldAbortImmediately: () => opts.shellTool !== undefined && !longShell,
+    forceStopWithoutModal: () => opts.inlineConfirmation === true || longShell,
+    ...(opts.inlineAbortScope ? { onInlineConfirmed: () => opts.inlineAbortScope } : {}),
+    ...(opts.inlineConfirmation || longShell ? {
+      confirmStopInline: async () => {
+        const result = await inlineChoices.ask({
+          id: 'sim-esc-confirm', question: longShell ? 'Stop the long-running shell command?' : 'Stop running child work?',
+          options: [{ value: 'stop', label: 'Stop' }, { value: 'continue', label: 'Continue' }],
+          yesNo: true, includeOther: false,
+        });
+        return !('cancelled' in result) && result.selected[0] === 'stop';
+      },
+    } : {}),
   });
   sim.isOpen = () => sim.gate.isGateOpen();
   sim.key = (name: string) => sim.gate.handleKey({ name } as never);
+  sim.inlineInput = (input: string) => inlineChoices.handleInput(input);
+  sim.inlineKey = (key: string) => inlineChoices.handleKey(key);
+  sim.inlineLines = inlineLines;
   sim.esc = () => sim.gate.handleEscape();
   sim.abortReason = () => abortCtrl.signal.reason;
   sim.settle = () => new Promise<void>((resolve) => { setImmediate(resolve); });

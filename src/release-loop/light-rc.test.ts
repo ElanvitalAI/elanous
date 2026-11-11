@@ -12,8 +12,9 @@ import { registerReleaseCommands } from '../cli/release-cli.js';
 import { createGateRunner, judgeGate } from '../../scripts/release-loop/gate-node.js';
 import { PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
 import { gateBaselineReceipt, gateEnvFingerprint } from '../../scripts/release-loop/gate-baseline-receipt.js';
+import { gateImageReadinessSignalPath } from '../../scripts/release-loop/release-readiness.js';
 import { gateShardLedgerPath, readGateShardLedger } from './gate-shard-ledger.js';
-import { LIGHT_RC_ALWAYS_FILE, LIGHT_RC_UNKNOWN_HOST, formatLightRc, parseAlwaysIncludeList, resolveMeasuredCommit, runLightRc, type LightRcDeps } from './light-rc.js';
+import { LIGHT_RC_ALWAYS_FILE, LIGHT_RC_DEFAULT_SHARDS, LIGHT_RC_UNKNOWN_HOST, formatLightRc, parseAlwaysIncludeList, resolveMeasuredCommit, runLightRc, type LightRcDeps } from './light-rc.js';
 
 const REPO = resolve(import.meta.dir, '../..');
 const dirs: string[] = [];
@@ -111,6 +112,12 @@ function gateResult(over: Partial<SelfGateCliResult> = {}): SelfGateCliResult {
 }
 
 const MAIN_SHA = 'c'.repeat(40);
+// Source: GateImageReadinessSignal.schemaVersion in scripts/release-loop/release-readiness.ts.
+const IMAGE_READINESS_SCHEMA_VERSION = 1;
+// Source: readGateImageReadinessSignal validates a sha256 digest with 64 hexadecimal characters.
+const IMAGE_DIGEST_HEX_LENGTH = 64;
+// Source: runLightRc uses exit code 2 when a host gate is unmeasured.
+const UNMEASURED_GATE_EXIT_CODE = 2;
 /** Fake git: rev-parse (HEAD and origin/main alike) answers MAIN_SHA — the tree is at the measured commit. */
 const fakeGit = (args: string[]) => ({ rc: 0, stdout: args[0] === 'rev-parse' ? `${MAIN_SHA}\n` : 'abc123\n' });
 
@@ -128,7 +135,126 @@ function localDeps(over: Partial<LightRcDeps> = {}, gate: SelfGateCliResult = ga
   return { calls, dispatched, deps };
 }
 
+function imageReadinessRoot(input: { runId?: string; cutCommit?: string; imageDigest?: string; eligiblePools?: string[] } = {}): string {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-light-rc-image-readiness-'));
+  dirs.push(root);
+  const path = gateImageReadinessSignalPath(root, '0.3.9');
+  mkdirSync(join(root, 'release', '0.3.9'), { recursive: true });
+  writeFileSync(path, `${JSON.stringify({ schemaVersion: IMAGE_READINESS_SCHEMA_VERSION, status: 'ready', runId: input.runId ?? 'run-light-rc',
+    cutCommit: input.cutCommit ?? MAIN_SHA, imageDigest: input.imageDigest ?? `sha256:${'a'.repeat(IMAGE_DIGEST_HEX_LENGTH)}`,
+    eligiblePools: input.eligiblePools ?? ['pool-a'], checkedAt: '2026-11-10T00:00:00.000Z' })}\n`);
+  return root;
+}
+
 describe('runLightRc (LIGHT-RC ⑶)', () => {
+  test('0.3.9 cloud rehearsal fails closed for missing, stale, or ineligible image readiness and preserves the host recipe', async () => {
+    let gateCalls = 0;
+    const setup = localDeps({ gatePodPool: 'pool-a', runFormalHostGate: async (options) => {
+      gateCalls++;
+      expect(options).toMatchObject({ executor: 'host', remote: 'aws1', pod: { pool: 'pool-a' } });
+      return { outcome: 'ok', commit: MAIN_SHA, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
+    } });
+
+    const missingRoot = mkdtempSync(join(tmpdir(), 'elanous-light-rc-image-missing-'));
+    dirs.push(missingRoot);
+    const missing = await runLightRc('0.3.9', {
+      base: MAIN_SHA, head: MAIN_SHA, rehearsalCloudHost: true, graphRunId: 'run-light-rc',
+      ledgerRoot: missingRoot, log: () => {},
+    }, setup.deps);
+    expect(missing).toMatchObject({ ok: false, gateExitCode: UNMEASURED_GATE_EXIT_CODE, unmeasured: 'image-readiness-signal-missing' });
+
+    const staleRoot = imageReadinessRoot({ cutCommit: 'd'.repeat(MAIN_SHA.length) });
+    const stale = await runLightRc('0.3.9', {
+      base: MAIN_SHA, head: MAIN_SHA, rehearsalCloudHost: true, graphRunId: 'run-light-rc', ledgerRoot: staleRoot, log: () => {},
+    }, setup.deps);
+    expect(stale).toMatchObject({ ok: false, gateExitCode: UNMEASURED_GATE_EXIT_CODE, unmeasured: 'image-readiness-commit-mismatch' });
+
+    const wrongPoolRoot = imageReadinessRoot({ eligiblePools: ['pool-b'] });
+    const wrongPool = await runLightRc('0.3.9', {
+      base: MAIN_SHA, head: MAIN_SHA, rehearsalCloudHost: true, graphRunId: 'run-light-rc', ledgerRoot: wrongPoolRoot, log: () => {},
+    }, setup.deps);
+    expect(wrongPool).toMatchObject({ ok: false, gateExitCode: UNMEASURED_GATE_EXIT_CODE, unmeasured: 'image-readiness-pool-ineligible' });
+
+    const prereleaseMissing = await runLightRc('0.3.9-rc.1', {
+      base: MAIN_SHA, head: MAIN_SHA, rehearsalCloudHost: true, graphRunId: 'run-light-rc', ledgerRoot: missingRoot, log: () => {},
+    }, setup.deps);
+    expect(prereleaseMissing).toMatchObject({ ok: false, gateExitCode: UNMEASURED_GATE_EXIT_CODE, unmeasured: 'image-readiness-signal-missing' });
+    expect(gateCalls).toBe(0);
+
+    const wrongRunRoot = imageReadinessRoot({ runId: 'run-other' });
+    const wrongRun = await runLightRc('0.3.9', {
+      base: MAIN_SHA, head: MAIN_SHA, rehearsalCloudHost: true, graphRunId: 'run-light-rc', ledgerRoot: wrongRunRoot, log: () => {},
+    }, setup.deps);
+    expect(wrongRun).toMatchObject({ ok: false, gateExitCode: UNMEASURED_GATE_EXIT_CODE, unmeasured: 'image-readiness-run-mismatch' });
+
+    const invalidDigestRoot = imageReadinessRoot({ imageDigest: 'sha256:invalid' });
+    const invalidDigest = await runLightRc('0.3.9', {
+      base: MAIN_SHA, head: MAIN_SHA, rehearsalCloudHost: true, graphRunId: 'run-light-rc', ledgerRoot: invalidDigestRoot, log: () => {},
+    }, setup.deps);
+    expect(invalidDigest).toMatchObject({ ok: false, gateExitCode: UNMEASURED_GATE_EXIT_CODE, unmeasured: 'image-readiness-signal-invalid' });
+
+    const readyRoot = imageReadinessRoot();
+    const ready = await runLightRc('0.3.9', {
+      base: MAIN_SHA, head: MAIN_SHA, rehearsalCloudHost: true, graphRunId: 'run-light-rc', ledgerRoot: readyRoot, log: () => {},
+    }, setup.deps);
+    expect(ready).toMatchObject({ remote: 'aws1', gateExitCode: 0, ok: true, unmeasured: null });
+
+    const prerelease = await runLightRc('0.3.9-rc.1', {
+      base: MAIN_SHA, head: MAIN_SHA, rehearsalCloudHost: true, graphRunId: 'run-light-rc', ledgerRoot: readyRoot, log: () => {},
+    }, setup.deps);
+    expect(prerelease).toMatchObject({ remote: 'aws1', gateExitCode: 0, ok: true, unmeasured: null });
+    expect(gateCalls).toBe(2);
+  });
+
+  test('scheduled cloud rehearsal pins the host gate to aws1 and refuses explicit failover', async () => {
+    const calls: string[] = [];
+    const setup = localDeps({ runFormalHostGate: async (options) => {
+      calls.push(options.remote ?? '');
+      return { outcome: 'ok', commit: MAIN_SHA, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
+    } });
+    const result = await runLightRc('0.2.19', { base: MAIN_SHA, head: MAIN_SHA, rehearsalCloudHost: true, log: () => {} }, setup.deps);
+    expect(calls).toEqual(['aws1']);
+    expect(result).toMatchObject({ remote: 'aws1', gateExitCode: 0 });
+    await expect(runLightRc('0.2.19', { remote: 'minim5', rehearsalCloudHost: true, log: () => {} }, setup.deps))
+      .rejects.toThrow('cloud rehearsal is pinned to aws1; refusing minim5');
+    expect(calls).toHaveLength(1);
+  });
+
+  test('scheduled cloud rehearsal refuses a shard count outside the aws1 host-gate contract', async () => {
+    let gateCalls = 0;
+    const setup = localDeps({ runFormalHostGate: async () => {
+      gateCalls++;
+      return { outcome: 'ok', commit: MAIN_SHA, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
+    } });
+
+    const result = await runLightRc('0.2.19', {
+      base: MAIN_SHA, head: MAIN_SHA, remote: 'aws1', rehearsalCloudHost: true, shards: 3, log: () => {},
+    }, setup.deps);
+
+    expect(gateCalls).toBe(0);
+    expect(result).toMatchObject({ remote: 'aws1', shards: 3, gateExitCode: UNMEASURED_GATE_EXIT_CODE, ok: false,
+      unmeasured: 'host-gate-shard-contract-mismatch' });
+  });
+
+  test('scheduled cloud rehearsal accepts the default four-shard host-gate contract', async () => {
+    let gateCalls = 0;
+    const setup = localDeps({ runFormalHostGate: async () => {
+      gateCalls++;
+      return { outcome: 'ok', commit: MAIN_SHA, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
+    } });
+
+    const result = await runLightRc('0.2.19', {
+      base: MAIN_SHA, head: MAIN_SHA, remote: 'aws1', rehearsalCloudHost: true, shards: LIGHT_RC_DEFAULT_SHARDS, log: () => {},
+    }, setup.deps);
+
+    expect(gateCalls).toBe(1);
+    expect(result).toMatchObject({ remote: 'aws1', shards: LIGHT_RC_DEFAULT_SHARDS, gateExitCode: 0, ok: true, unmeasured: null });
+  });
+
   test('explicit --remote runs the release gate host recipe and keeps the public light-rc result shape', async () => {
     const calls: Array<Record<string, unknown>> = [];
     const setup = localDeps({ runFormalHostGate: async (options) => {

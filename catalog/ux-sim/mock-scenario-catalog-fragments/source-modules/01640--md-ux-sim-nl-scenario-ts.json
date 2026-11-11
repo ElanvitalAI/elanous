@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-NL-SCENARIO-TS",
+  "path": "src/ux-sim/nl-scenario.ts",
+  "boundary": "Proposes a scenario from events declared by attached app simulation connectors; model output is constrained to those events and invalid choices fail closed.",
+  "deviceIds": ["nl-scenario-proposal"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

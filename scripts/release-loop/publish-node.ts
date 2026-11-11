@@ -8,6 +8,7 @@ import { debug } from '../../src/debug/log.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { prereleaseKind } from './release-version.js';
+import { hasPassingEmergencyPublishGate } from './emergency-publish-authorization.js';
 import { publishAtError } from './publish-at.js';
 import { validatedTuiRegress } from './tui-node-checks.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandRunner, type GraphContext } from './node-verdict.js';
@@ -114,12 +115,13 @@ export function runPublish(run: CommandRunner = runCommand, prodFreezeRoot?: str
     return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: neither auto-approve nor approve-publish approved' };
   }
   const gate = context.outputs.gate;
+  const emergencyGate = hasPassingEmergencyPublishGate(context);
   const ownerWaivedGate = gate?.verdict === 'owner-waived'
     && (gate.outcome === 'ok' || gate.outcome === 'pass(owner-waived)')
     && typeof gate.approvedBy === 'string' && gate.approvedBy.trim().length > 0
     && typeof gate.reason === 'string' && gate.reason.trim().length > 0;
-  if (gate?.outcome !== 'ok' && !ownerWaivedGate)
-    return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: gate outcome is not ok or explicitly owner-waived' };
+  if (gate?.outcome !== 'ok' && !ownerWaivedGate && !emergencyGate)
+    return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: gate outcome is not ok, explicitly owner-waived, or replaced by a same-run emergency gate' };
   for (const node of ['pwa', 'upgrade', 'tui', 'prepare', 'docs']) {
     if (context.outputs[node]?.outcome !== 'ok') return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `publish blocked: ${node} outcome is not ok` };
   }

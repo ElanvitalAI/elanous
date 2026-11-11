@@ -31,14 +31,20 @@ import { OPS_BOARD_PATH, handleOpsBoard, type OpsBoardDeps } from './ops-board-r
 import { CARD_FOLLOWUP_PATH, createCardFollowupJobs, type CardFollowupJobs } from './card-followup-route.js';
 import { SKILL_EXEC_PATH, createSkillExecJobs, type SkillExecJobs } from './skill-exec-route.js';
 import { compareTokenConstTime } from '../../acp/transport/auth.js';
+import type { TrustedTlsEdge } from './tls-edge.js';
 import { ensureAuthToken } from '../../auth/acp-token.js';
+import { listChecklist, type Checklist } from '../../release-loop/checklist.js';
 import { pushEvent, type NexusState } from '../state/state.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
-import { machineForToken } from '../../control-plane/member-tokens.js';
+import { machineForToken, machineForExpiringToken } from '../../control-plane/member-tokens.js';
+import { handleHqLlmProxy, HQ_LLM_PROXY_PATH, type HqLlmProxyDeps } from './hq-llm-proxy.js';
+import { recordLlmProxyCall } from '../../resource-ledger/resource-ledger.js';
+import { codexOAuthAvailable, getProviderForConfigAsync } from '../../llm.js';
+import { getSecretAsync } from '../config/secrets/index.js';
 import { handleResourceLedgerPoolDeclarationPost, handleResourceLedgerPoolsApi } from './resource-ledger.js';
 import { handleMissionLineRequest, MissionLineHttpError } from '../../agent-mission/mission-line.js';
-import { resolveVerifiedOwner, type NexusAppHost } from '../apps/app-host.js';
+import { resolveVerifiedMemberOwner as resolveVerifiedAppMemberOwner, resolveVerifiedOwner, type NexusAppHost } from '../apps/app-host.js';
 import type { AppLifecycleSnapshot } from '../apps/app-lifecycle-ledger.js';
 import type { AppSimulationSnapshot } from '../apps/app-simulation.js';
 import { consoleAddress, publicAppAddress, simulationPreviewAddress } from '../apps/console-address.js';
@@ -176,15 +182,19 @@ import { handleFabricPlans, type FabricPlansRouteOpts } from './fabric-plans.js'
 import { dispatchPersonaRoute } from './personas.js';
 import { handleMe, operatorSignal } from './operator.js';
 import { handleGraphRunRoute } from '../../graph-runner/graph-run-api.js';
+import { handlePluginGraphApiRun } from '../../graph-runner/plugin-graph-entry.js';
+import { isSelfVerifiedGraphWebhookRequest } from './graph-route-allowlist.js';
 import { handleOpsApi } from './ops-api.js';
 import { handleProjectAutopsy } from './project-autopsy.js';
 import { handleRoleJudge } from './role-judge.js';
 import { handleAudioStt } from './audio-stt.js';
+import { handleScraps, type ScrapsRouteOptions } from './scraps.js';
 import { handleLlmModels } from './llm-models.js';
 import { handleLlmHostsConfig } from './llm-hosts-config.js';
 import { handleLlmRotationGet, handleLlmRotationNext } from './llm-rotation.js';
 import { handleSetupClaim } from './setup-claim.js';
 import { handleCredentialRegistrationClaim, handleCredentialRegistrationLinkCreate, handleCredentialRegistrationLinkRevoke, handleCredentialRegistrationSubmit, handleCredentialSlotsGet } from './setup-credentials.js';
+import { handleOpenRouterImportCandidates, handleOpenRouterImportConfirm, handleOpenRouterOAuthCallback, handleOpenRouterOAuthStart } from './openrouter-oauth.js';
 import { handleSetupCodexLoginGet, handleSetupCodexLoginPost } from './setup-codex-login.js';
 import {
   handleLlmProvidersList,
@@ -355,6 +365,7 @@ import {
   handleTaskDetail,
 } from './tasks-scheduler.js';
 import { handleTaskCardsGet, handleTaskCardsWishPost, handleTaskCardsClosePost } from './task-cards-api.js';
+import { boardCardNexusEvent, handleBoardRoute, resolveVerifiedMemberOwner, type BoardApiDeps } from './board-api.js';
 import { handleTaskCreatePost, handleTaskApprovePost } from './tasks-create.js';
 import { matchIngestAuthorization } from './ingest-token.js';
 import {
@@ -383,6 +394,8 @@ import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { handlePluginsIndexGet, handlePluginsGet, handlePluginsMarketRefresh, handlePluginsInstall, handlePluginsRemove, handlePluginWizardList, handlePluginWizardSave } from './plugins-market.js';
 import { handlePluginsCredentialsGet, handlePluginsCredentialsPut } from './plugins-credentials-api.js';
 import { createConfiguredMembersApi, type MembersApi } from '../members/members-api.js';
+import type { GraphCapabilityRegistry } from '../../graph-runner/capabilities.js';
+import type { MemberEventStore } from './member-event-store.js';
 import {
   handleWorkflowsList,
 } from './workflows.js';
@@ -441,27 +454,36 @@ import { createAppHostScopedResolver } from './app-host-scoped-resolver.js';
 
 /** Process-wide DRAFT-METRIC cache (one background collection per TTL, shared by every page load). */
 let sharedDraftMetrics: DraftMetricsSource | undefined;
-const defaultMembersApi = createAppHostScopedResolver((appHost?: object) => {
-  try {
-    const nexusAppHost = appHost as NexusAppHost | undefined;
-    return createConfiguredMembersApi(nexusAppHost
-      ? {
-        issueOwnerSession: (appId, memberId) => nexusAppHost.issueOwnerSession(appId, memberId),
-        resolveVerifiedOwner: (appSlug, credential, members) => resolveVerifiedOwner(nexusAppHost, appSlug, credential, members),
-        publicAppUrl: slot => {
-          try {
-            const userSlug = resolvePublicAppUserId();
-            if (!userSlug || !nexusAppHost.slugs.includes(slot.appSlug)) return null;
-            return `${publicAppAddress({ appSlug: slot.appSlug, userSlug })}/`;
-          }
-          catch { return null; }
-        },
-      }
-      : {});
-  } catch {
-    return null;
+const NO_CAPABILITY_REGISTRY = {};
+const defaultMembersApiResolvers = new WeakMap<object, (appHost?: object) => MembersApi | null>();
+function defaultMembersApi(appHost?: object, capabilityProviders?: GraphCapabilityRegistry): MembersApi | null {
+  const key = capabilityProviders ?? NO_CAPABILITY_REGISTRY;
+  let resolver = defaultMembersApiResolvers.get(key);
+  if (!resolver) {
+    resolver = createAppHostScopedResolver((candidate?: object) => {
+      try {
+        const nexusAppHost = candidate as NexusAppHost | undefined;
+        return createConfiguredMembersApi({
+          ...(nexusAppHost ? {
+            issueOwnerSession: (appId, memberId) => nexusAppHost.issueOwnerSession(appId, memberId),
+            resolveVerifiedOwner: (appSlug, credential, members) => resolveVerifiedOwner(nexusAppHost, appSlug, credential, members),
+            resolveVerifiedMemberOwner: (credential, members) => resolveVerifiedAppMemberOwner(nexusAppHost, credential, members),
+            publicAppUrl: slot => {
+              try {
+                const userSlug = resolvePublicAppUserId();
+                if (!userSlug || !nexusAppHost.slugs.includes(slot.appSlug)) return null;
+                return `${publicAppAddress({ appSlug: slot.appSlug, userSlug })}/`;
+              } catch { return null; }
+            },
+          } : {}),
+          ...(capabilityProviders ? { capabilityProviders } : {}),
+        });
+      } catch { return null; }
+    });
+    defaultMembersApiResolvers.set(key, resolver);
   }
-});
+  return resolver(appHost);
+}
 
 export const NEXUS_HTTP_PORT_RANGE = 16;     // try 31415..31430
 /** Short timeout for the pre-bind localhost occupancy probe. */
@@ -515,6 +537,12 @@ export function probeNexusHttpPort(
 export type NexusWsBridgeInit = Omit<WsBridgeOpts, 'hostname' | 'port'>;
 
 export interface NexusHttpServerOpts {
+  /** Test seam for HQ's read-only release ledger; production reads this Nexus instance's checklist. */
+  checklistReader?: (version: string) => Checklist;
+  /** Grant metadata supplied by the host; without it credential health remains unmeasured. */
+  credentialHealthObserver?: import('../config/secrets/cred-health.js').CredentialHealthObserver;
+  /** ABSORB-INGEST owner-scoped scraps API; production wiring supplies the NM-1 session resolver and existing extractors. */
+  scraps?: Omit<ScrapsRouteOptions, 'resolveOwner'>;
   /** Optional fabric-plan ledger and decomposition seam; production uses the instance root and existing fabric decomposer. */
   fabricPlans?: FabricPlansRouteOpts;
   /** GRAPH-WIZARD 시험 주입(LLM·템플릿 뿌리). 운영은 비워 둔다. */
@@ -546,6 +574,8 @@ export interface NexusHttpServerOpts {
   eventBus: NexusEventBus;
   /** Test seam for the read-only usage collector; production uses the cached handler. */
   usageHandler?: () => Promise<Response>;
+  /** Isolated route tests only: permit loopback HTTP with a loopback Host. Never set in production. */
+  allowInsecureResourceLedgerLoopbackForTests?: boolean;
   /** Test seam for the context-now ledgers; production reads the live ledgers. */
   contextNowDeps?: ContextNowDeps;
   /** Supervisor handle — required for the write API (PR ι). When omitted
@@ -573,6 +603,16 @@ export interface NexusHttpServerOpts {
   metaApi?: MetaApiOpts;
   /** Public member signup API is self-authenticated by OAuth state and member session. */
   membersApi?: MembersApi;
+  /** Explicit TLS terminator proof for loopback HTTP forwarded by a trusted local edge. */
+  trustedTlsEdge?: TrustedTlsEdge;
+  /** Server-side fake upstream and ledger sink for route-level proxy simulations. */
+  llmProxySimulation?: Pick<HqLlmProxyDeps, 'run' | 'record'>;
+  /** Main capability registry shared by member routes and graph-runner consumers. */
+  capabilityProviders?: GraphCapabilityRegistry;
+  /** Nexus state-directory event journal shared by `store.events@1` and member board routes. */
+  boardEventStore?: MemberEventStore;
+  /** Plugin-owned handler for an explicitly approved member card. */
+  boardApprovalDispatch?: BoardApiDeps['dispatchApproved'];
   /** Resolves the asynchronously booted configured MCP clients on each resource request. */
   getMcpClients?: () => McpClientsHandle | undefined;
   /** 대표 2026-09-10 — `POST /v1/nexus/admin/mcp-reload` 의 실행부.
@@ -731,6 +771,7 @@ export interface NexusHttpServerOpts {
       headers: Record<string, string | undefined>;
       body: string;
     }) => Promise<{ status: number; body: string; headers?: Record<string, string> } | null>;
+    isSelfVerifiedGraphWebhookRoute?: (method: string, path: string) => boolean;
     /** Surface-unification v2 — chat trigger dispatch. POST under
      *  `/v1/workflows/chat<path>` reaches the daemon's chat router,
      *  which matches by `chatTrigger.path` and runs the workflow.
@@ -868,6 +909,11 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
     );
   }
 
+  const stopBoardEventSubscription = opts.boardEventStore?.subscribe?.(event => {
+    const nexusEvent = boardCardNexusEvent(event);
+    if (nexusEvent) pushEvent(opts.state, nexusEvent);
+  });
+
   const url = `http://${hostname}:${resolvedPort}`;
   const stopInsideRelay = startInsideEventRelay();
   let serverStopped = false;
@@ -943,6 +989,7 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
       relayConnection?.close();
       relayConnection = undefined;
       stopInsideRelay();
+      stopBoardEventSubscription?.();
       try { server!.stop(true); } catch { /* idempotent */ }
       loopEdgesDataSource.close();
       opts.appHost?.close();
@@ -1089,6 +1136,35 @@ const TASK_AGENT_BOARD_PATH = '/api/task-agent/board';
 let skillExecJobs: SkillExecJobs | undefined;
 function defaultSkillExecJobs(): SkillExecJobs {
   return skillExecJobs ??= createSkillExecJobs();
+}
+
+function secureMemberTransport(req: Request, opts: NexusHttpServerOpts, server: BunServerLike): boolean {
+  if (new URL(req.url).protocol === 'https:') return true;
+  const edge = opts.trustedTlsEdge;
+  if (!edge || new URL(req.url).protocol !== 'http:') return false;
+  const peer = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
+  if (peer !== '127.0.0.1' && peer !== '::1' && peer !== '::ffff:127.0.0.1') return false;
+  const offered = req.headers.get('x-elanous-tls-edge-secret');
+  return req.headers.get('x-forwarded-proto') === 'https'
+    && req.headers.get('x-forwarded-host') === new URL(edge.origin).host
+    && !!offered && compareTokenConstTime(offered, edge.secret);
+}
+
+function isResourceLedgerTransportSecure(req: Request, opts: NexusHttpServerOpts, server: BunServerLike): boolean {
+  if (secureMemberTransport(req, opts, server)) return true;
+  if (new URL(req.url).protocol !== 'http:') return false;
+  const peer = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
+  if (!peer) return false;
+  const url = new URL(req.url);
+  const host = req.headers.get('host') ?? url.host;
+  const loopbackPeer = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1' || /^127\./.test(peer);
+  const loopbackHost = (value: string): boolean => /^(?:localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?$/i.test(value);
+  if (opts.allowInsecureResourceLedgerLoopbackForTests && loopbackPeer && loopbackHost(url.host) && loopbackHost(host)) return true;
+  const tailPeer = /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(peer) || /^fd7a:115c:a1e0:/i.test(peer);
+  const tailHost = /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(host)
+    || /^\[fd7a:115c:a1e0:[0-9a-f:]+\](?::\d+)?$/i.test(host)
+    || /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net(?::\d+)?$/i.test(host);
+  return tailPeer && tailHost;
 }
 
 export async function routeRequest(
@@ -1238,6 +1314,16 @@ export async function routeRequest(
     }
     return pitch.handlePitchApi(req, opts.metaApi);
   }
+  const pluginGraphRun = /^\/v1\/graph-plugins\/([^/]+)\/run$/.exec(pathname);
+  if (pluginGraphRun) {
+    if (method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    const signal = operatorSignal(req, opts.metaApi);
+    const credential = bearerCredential(req, opts.metaApi);
+    if (!signal.operator || (signal.operatorSource !== 'op-proxy' && credential !== 'bearer-match' && credential !== 'temp-token'))
+      return jsonResponse({ error: 'forbidden' }, 403);
+    return handlePluginGraphApiRun(req, pluginGraphRun[1]!);
+  }
   // CGE-RUN — 편집기 «실행»은 운영자 전용이다: 사용자 그래프가 셸 노드를 부를 수 있으므로 같은 출처 무토큰 통과는 받지 않는다
   // (운영자 프록시 헤더 · owner bearer 일치 · owner 가 발급한 짧은 임시 토큰만 — 명시 토큰은 언제나 필요).
   if (/^\/v1\/graphs\/[^/]+\/(?:run|runs\/[^/]+)$/.test(pathname)) {
@@ -1257,10 +1343,17 @@ export async function routeRequest(
   // Machine credentials can read only declarations that include their host; owner bearer can publish declarations.
   if (pathname === '/v1/resource-ledger/pools') {
     if (method === 'GET') {
+      if (!isResourceLedgerTransportSecure(req, opts, server)) {
+        debug.log('resource-ledger.auth', 'request-refused', { reason: 'secure-transport-required' }, { level: 'warn' });
+        return jsonResponse({ error: 'secure-transport-required' }, 403);
+      }
       const offered = req.headers.get('authorization');
       const presented = offered?.startsWith('Bearer ') ? offered.slice(7).trim() : '';
-      const machine = presented ? machineForToken(presented, effectiveInstanceRoot()) : undefined;
-      if (!machine) return jsonResponse({ error: 'unauthorized' }, 401);
+      const machine = presented ? machineForExpiringToken(presented, effectiveInstanceRoot()) : undefined;
+      if (!machine) {
+        debug.log('resource-ledger.auth', 'request-refused', { reason: 'unauthorized' }, { level: 'warn' });
+        return jsonResponse({ error: 'unauthorized' }, 401);
+      }
       return handleResourceLedgerPoolsApi(machine);
     }
     if (method === 'POST') {
@@ -1268,6 +1361,70 @@ export async function routeRequest(
       return handleResourceLedgerPoolDeclarationPost(req);
     }
     return jsonResponse({ error: 'method-not-allowed' }, 405);
+  }
+
+  if (pathname === HQ_LLM_PROXY_PATH) {
+    const bearer = /^Bearer\s+(\S+)$/i.exec(req.headers.get('authorization') ?? '')?.[1];
+    // A short-lived member bearer still carries paid capability and request content.
+    // Never accept it over remote plaintext, even inside the tailnet.
+    if (bearer?.startsWith('emt_') && !secureMemberTransport(req, opts, server))
+      return jsonResponse({ error: 'secure-transport-required' }, 403);
+    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    const peer = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
+    const memberToken = membersApi?.memberForScope?.(req, 'llm.proxy', peer);
+    const host = req.headers.get('host') ?? new URL(req.url).host;
+    const tailPeer = !!peer && (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(peer) || /^fd7a:115c:a1e0:/i.test(peer));
+    const tailHost = /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(host)
+      || /^\[fd7a:115c:a1e0:[0-9a-f:]+\](?::\d+)?$/i.test(host) || /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net(?::\d+)?$/i.test(host);
+    return handleHqLlmProxy(req, {
+      tailnet: () => tailPeer && tailHost,
+      authorize: request => !!memberToken || (!!opts.metaApi && opts.metaApi.noAuth !== true
+        && checkAuth(request, opts.metaApi) && bearerCredential(request, opts.metaApi) === 'bearer-match'),
+      machine: request => {
+        if (memberToken) return peer;
+        const token = request.headers.get('x-elanous-machine-token');
+        return token ? machineForExpiringToken(token, effectiveInstanceRoot()) : undefined;
+      },
+      record: opts.llmProxySimulation?.record ?? recordLlmProxyCall,
+      run: opts.llmProxySimulation?.run ?? (async (messages, llmOpts) => {
+        const configured = getUserConfig();
+        const billing = codexOAuthAvailable() ? 'subscription' as const : 'api' as const;
+        const model = llmOpts.model ?? 'gpt-6.1-terra';
+        if (!/^(?:gpt-|codex-)[A-Za-z0-9._-]+$/.test(model)) throw new Error('unsupported proxy model');
+        const provider = await getProviderForConfigAsync({ ...configured, llm: { ...configured.llm, provider: 'openai-codex', model, apiKey: undefined, baseUrl: undefined } }, model,
+          async id => id === 'OPENAI_API_KEY' ? await getSecretAsync('cred:openai.api_key') ?? await getSecretAsync(id) : getSecretAsync(id));
+        let usage: import('../../prompt-cache/types.js').LLMUsage = {};
+        async function* events() {
+          for await (const event of provider.streamChat!(messages, { ...llmOpts, signal: llmOpts.signal,
+            onUsage: value => { Object.assign(usage, value); } })) {
+            if (event.type === 'usage') Object.assign(usage, event.usage);
+            yield event;
+          }
+        }
+        return { events: events(), usage, billing };
+      }),
+    });
+  }
+
+  if (pathname === '/v1/tokens/introspect') {
+    if (method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
+    if (!secureMemberTransport(req, opts, server)) return jsonResponse({ error: 'secure-transport-required' }, 403);
+    const audience = new URL(req.url).searchParams.get('audience');
+    if (!audience || !/^[a-f0-9]{64}$/.test(audience)) return jsonResponse({ error: 'invalid-request' }, 400);
+    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost);
+    const member = membersApi?.memberForScope?.(req, 'relay.connect', audience);
+    return member
+      ? new Response(JSON.stringify({ memberId: member.memberId }), { status: 200,
+        headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } })
+      : jsonResponse({ error: 'unauthorized' }, 401);
+  }
+  if (pathname === '/v1/tokens') {
+    // The member key is long-lived. A loopback peer can also be a remote TLS edge,
+    // so peer address alone cannot prove the client-to-edge leg was encrypted.
+    if (!secureMemberTransport(req, opts, server))
+      return jsonResponse({ error: 'secure-transport-required' }, 403);
+    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    return membersApi?.handleToken ? membersApi.handleToken(req) : jsonResponse({ error: 'members-not-configured' }, 503);
   }
 
   // Default-deny for every `/v1/` path that is not on PUBLIC_ROUTES.
@@ -1290,10 +1447,16 @@ export async function routeRequest(
       || pathname.startsWith('/v1/hitl/callback/')
     ))
   );
+  const graphWebhookSelfVerified = isSelfVerifiedGraphWebhookRequest(method, pathname, opts.workflowDaemon);
   if (
     method !== 'OPTIONS'
     && pathname.startsWith('/v1/')
     && !isPublicRoute(method, pathname, { setupMode: false })
+    && !graphWebhookSelfVerified
+    && !(pathname === '/v1/events' && (() => {
+      const topics = (url.searchParams.get('topics') ?? '').split(',').map(topic => topic.trim()).filter(Boolean);
+      return topics.length > 0 && topics.every(topic => topic === 'board.card' || topic === 'briefing.ready');
+    })())
   ) {
     const fallbackToken = runtimeLessMetaRoute ? ensureAuthToken().token : undefined;
     const offered = req.headers.get('authorization');
@@ -1314,12 +1477,35 @@ export async function routeRequest(
       debug.log('nexus.auth', 'ingest-token', { name, pathname });
     }
   }
-  if (pathname.startsWith('/v1/members')) {
-    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost);
+  if (pathname.startsWith('/v1/members') || pathname.startsWith('/v1/member/keys') || pathname.startsWith('/v1/member/tokens')) {
+    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
     if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
     const networkKey = (server as BunServerLike & { requestIP?: (request: Request) => { address: string } | null }).requestIP?.(req)?.address;
     const response = await membersApi.handle(req, networkKey ?? 'unknown');
     if (response) return response;
+  }
+  if (pathname === '/v1/scraps') {
+    if (!opts.scraps) return jsonResponse({ error: 'scraps-not-wired' }, 503);
+    const membersApi = opts.membersApi ?? defaultMembersApi(opts.appHost, opts.capabilityProviders);
+    if (!membersApi) return jsonResponse({ error: 'members-not-configured' }, 503);
+    return handleScraps(req, {
+      ...opts.scraps,
+      resolveOwner: async (scrapRequest) => {
+        const ownerUrl = new URL('/v1/members/owner', scrapRequest.url);
+        const headers = new Headers();
+        for (const name of ['cookie', 'origin', 'authorization']) {
+          const value = scrapRequest.headers.get(name);
+          if (value) headers.set(name, value);
+        }
+        const ownerRequest = new Request(ownerUrl, { method: 'GET', headers });
+        const ownerResponse = await membersApi.handle(ownerRequest, 'unknown');
+        if (!ownerResponse?.ok) return null;
+        let owner: unknown;
+        try { owner = await ownerResponse.json(); } catch { return null; }
+        if (!owner || typeof owner !== 'object' || typeof (owner as { memberId?: unknown }).memberId !== 'string') return null;
+        return { memberId: (owner as { memberId: string }).memberId };
+      },
+    });
   }
   // OAuth 동적 클라이언트 등록(RFC 7591) — Elanous 는 OAuth 를 쓰지 않는다. 405 대신 «이렇게 등록하라»를 돌려준다.
   if (method === 'POST' && pathname === '/register') {
@@ -1871,6 +2057,22 @@ export async function routeRequest(
     return (opts.usageHandler ?? handleUsageGet)();
   }
 
+  if (pathname === '/v1/release/checklist') {
+    if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)
+      || !['bearer-match', 'temp-token'].includes(bearerCredential(req, opts.metaApi) ?? ''))
+      return jsonResponse({ error: 'unauthorized' }, 401);
+    const version = url.searchParams.get('version') ?? '';
+    if (!/^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(version))
+      return jsonResponse({ error: 'invalid-version' }, 400);
+    try {
+      const response = jsonResponse((opts.checklistReader ?? listChecklist)(version));
+      response.headers.set('cache-control', 'no-store');
+      return response;
+    }
+    catch { return jsonResponse({ error: 'checklist-unavailable' }, 503); }
+  }
+
   // SK2 (PWA) list — GET must be routed before the non-GET block below; the original route sat inside it,
   // so the PWA banner's GET always fell through to «not-found» (found by the DEMO-RUNa rehearsal · 10-03).
   if (method === 'GET' && pathname === '/v1/skills/problems') {
@@ -1888,6 +2090,15 @@ export async function routeRequest(
   // Templates POST handled here too (PR κ).
   // Config / secrets PUT/POST/DELETE here too (PR μ).
   if (method !== 'GET') {
+    if (pathname === '/v1/board' || pathname.startsWith('/v1/board/')) {
+      const response = await handleBoardRoute(req, pathname, {
+        store: opts.boardEventStore,
+        dispatchApproved: opts.boardApprovalDispatch,
+        resolveOwner: request => resolveVerifiedMemberOwner(request, opts.membersApi ?? defaultMembersApi(opts.appHost), opts.appHost?.slugs),
+        publish: event => { pushEvent(opts.state, event); },
+      });
+      if (response) return response;
+    }
     if (method === 'POST' && pathname === SKILL_EXEC_PATH) {
       if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       return (opts.skillExec ?? defaultSkillExecJobs()).post(req);
@@ -2186,6 +2397,16 @@ export async function routeRequest(
       return handleCredentialRegistrationLinkRevoke(req, {
         authorizeOwner: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) && !setupBearerScopeDenied(request, opts.metaApi),
       });
+    }
+    if (pathname === '/v1/credentials/openrouter/oauth/start' && (method === 'POST' || method === 'OPTIONS')) {
+      if (method === 'OPTIONS') return corsPreflight('POST, OPTIONS');
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi) || setupBearerScopeDenied(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleOpenRouterOAuthStart(req);
+    }
+    if (pathname === '/v1/credentials/openrouter/import' && (method === 'POST' || method === 'OPTIONS')) {
+      if (method === 'OPTIONS') return corsPreflight('GET, POST, OPTIONS');
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi) || setupBearerScopeDenied(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleOpenRouterImportConfirm(req);
     }
     // PWA `/setup` wizard Phase 1 (2026-05-19) — LLM provider 첫 셋업.
     // POST 는 mutation 블록 안에서 등록 (memory `feedback_post_route_must_be_in_method_block`).
@@ -3074,7 +3295,15 @@ export async function routeRequest(
   if (pathname === '/v1/credentials/slots' && method === 'GET') {
     return handleCredentialSlotsGet(req, {
       authorizeOwner: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) && !setupBearerScopeDenied(request, opts.metaApi),
+      ...(opts.credentialHealthObserver ? { healthObserver: opts.credentialHealthObserver } : {}),
     });
+  }
+  if (pathname === '/v1/credentials/openrouter/oauth/callback' && method === 'GET') {
+    return handleOpenRouterOAuthCallback(req);
+  }
+  if (pathname === '/v1/credentials/openrouter/import' && method === 'GET') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi) || setupBearerScopeDenied(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleOpenRouterImportCandidates(req);
   }
   if (pathname === '/v1/setup/llm-providers') {
     return handleLlmProvidersList(req);
@@ -3366,7 +3595,32 @@ export async function routeRequest(
     };
     return handleConnectInfoGet(ctx);
   }
-  if (pathname === '/v1/events') return handleSseEvents(opts.eventBus, url);
+  if (pathname === '/v1/board' || pathname.startsWith('/v1/board/')) {
+    const response = await handleBoardRoute(req, pathname, {
+      store: opts.boardEventStore,
+      dispatchApproved: opts.boardApprovalDispatch,
+      resolveOwner: request => resolveVerifiedMemberOwner(request, opts.membersApi ?? defaultMembersApi(opts.appHost), opts.appHost?.slugs),
+      publish: event => { pushEvent(opts.state, event); },
+    });
+    if (response) return response;
+  }
+  if (pathname === '/v1/events') {
+    const topics = (url.searchParams.get('topics') ?? '').split(',').map(topic => topic.trim()).filter(Boolean);
+    const hasBoardTopic = topics.includes('board.card');
+    const hasBriefingTopic = topics.includes('briefing.ready');
+    const memberOnlyTopics = topics.length > 0 && topics.every(topic => topic === 'board.card' || topic === 'briefing.ready');
+    const operatorAuthorized = !!opts.metaApi && !!bearerCredential(req, opts.metaApi);
+    if (hasBoardTopic && !memberOnlyTopics && !operatorAuthorized) {
+      return jsonResponse({ error: 'member_topic_must_be_isolated' }, 400);
+    }
+    if (hasBriefingTopic && !memberOnlyTopics && !operatorAuthorized) return jsonResponse({ error: 'unauthorized' }, 401);
+    const needsMemberScope = memberOnlyTopics;
+    const owner = needsMemberScope
+      ? await resolveVerifiedMemberOwner(req, opts.membersApi ?? defaultMembersApi(opts.appHost), opts.appHost?.slugs)
+      : null;
+    if (needsMemberScope && !owner && (!operatorAuthorized || (hasBoardTopic && !hasBriefingTopic))) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleSseEvents(opts.eventBus, url, owner?.memberId ?? (operatorAuthorized ? { operatorBriefings: true } : undefined));
+  }
   // Phase 0.5 (2026-05-08) — intent-prediction REST + SSE.
   // /v1/intent-prediction/:sessionId{,/sse,/feedback}
   if (pathname.startsWith('/v1/intent-prediction/') && opts.intentPrediction) {

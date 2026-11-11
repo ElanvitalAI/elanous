@@ -1,6 +1,4 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { CoreTurnContext, CoreTurnResult } from './types.js';
 import { runGoalLoop } from './run-goal-loop.js';
@@ -118,18 +116,8 @@ describe('runGoalLoop — goal.loop run attribution', () => {
     expect(withoutRunId.every((observation) => !Object.hasOwn(observation, 'runId'))).toBe(true);
   });
 
-  test('all sessionId-bearing goal.loop payloads reuse one conditional run attribution', async () => {
-    const source = readFileSync(join(import.meta.dir, 'run-goal-loop.ts'), 'utf8');
-
-    const sessionIdPayloads = source.match(/sessionId: ctx\.sessionId/g) ?? [];
-    const compliantSessionPayloads = source.match(/sessionId: ctx\.sessionId, \.\.\.runAttribution/g) ?? [];
-    expect(sessionIdPayloads.length - compliantSessionPayloads.length).toBe(0);
-    expect(compliantSessionPayloads.length).toBeGreaterThan(0);
-    expect((source.match(/const harnessRunId = getHarnessRunId\(\);/g) ?? []).length).toBe(1);
-    expect(source).toContain("const runAttribution = harnessRunId ? { runId: harnessRunId } : {};");
-  });
-
   test('complete observation distinguishes matched, fail-open mismatch, and skipped test evidence without changing acceptance flow', async () => {
+    process.env[RUN_ID_ENV] = 'run-attribution-20260814';
     const matched = await runCompletionScenario(true);
     expect(matched.result).toMatchObject({ goalComplete: true, stopReason: 'goal_complete', iterations: 1 });
     expect(matched.turns).toBe(1);
@@ -148,5 +136,14 @@ describe('runGoalLoop — goal.loop run attribution', () => {
     expect(completeObservation(failOpen.observations).data).toMatchObject({ via: 'update_goal', evidenceCheck: 'mismatch-failopen' });
     expect(failOpen.observations.filter(({ event }) => event === 'complete-rejected-evidence-mismatch')).toHaveLength(1);
     expect(failOpen.observations.filter(({ event }) => event === 'complete-evidence-mismatch-failopen')).toHaveLength(1);
+
+    for (const scenario of [matched, skipped, failOpen]) {
+      const sessionEvents = scenario.observations.filter(({ data }) => data.sessionId === 'goal-loop-run-attribution');
+      expect(sessionEvents).not.toHaveLength(0);
+      expect(sessionEvents.every(({ data }) => data.runId === 'run-attribution-20260814')).toBe(true);
+      expect(sessionEvents.some(({ event }) => event === 'start')).toBe(true);
+      expect(sessionEvents.some(({ event }) => event === 'complete')).toBe(true);
+    }
+    expect(failOpen.observations.filter(({ event }) => event.includes('mismatch')).every(({ data }) => data.runId === 'run-attribution-20260814')).toBe(true);
   });
 });

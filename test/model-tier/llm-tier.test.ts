@@ -53,9 +53,10 @@ describe('M2-1 · LLM_TIER_MAP_BY_PROVIDER · invariants', () => {
     for (const provider of providers) {
       // 📏 10-22: #29770 opengateway 첫 조각은 «실측 모델 하나 · reasoning off» 를 모든 칸에 둔다(llm-tier-map.ts 주석) — 그 계약은 아래 전용 시험이 문다.
       if (provider === 'opengateway') continue;
-      const level = provider === 'local' ? undefined : provider === 'openai-codex' ? 'medium' : 'high';
+      const level = provider === 'local' ? undefined : provider === 'openai-codex' || provider === 'hq-proxy' ? 'medium' : 'high';
       expect(LLM_TIER_MAP_BY_PROVIDER[provider].loaded.reasoningLevel).toBe(level);
     }
+    expect(LLM_TIER_MAP_BY_PROVIDER['hq-proxy']).toBe(LLM_TIER_MAP_BY_PROVIDER['openai-codex']);
   });
 
   test('budget and best resolve to distinct complete specs on every provider', () => {

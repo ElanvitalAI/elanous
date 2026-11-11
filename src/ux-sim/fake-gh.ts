@@ -1,5 +1,6 @@
 import type { MergedPrRunner, MergedPrRunResult } from '../release-loop/landed-but-yellow.js';
 import { createHash } from 'node:crypto';
+import type { TempGitRemote } from './temp-git-remote.js';
 
 /** GitHub data at the CLI boundary; sweep decisions remain in the production callers. */
 export interface FakeGhPr {
@@ -26,6 +27,26 @@ export interface FakeGhFault {
   times: number;
 }
 
+export interface FakeGhToken {
+  /** Fixture identifier, never passed to Git or included in a webhook. */
+  id: string;
+  repository: string;
+  permission: 'contents:read' | 'contents:write';
+  expiresAt?: string;
+}
+
+export interface FakeGhPushWebhook {
+  id: string;
+  repository: string;
+  ref: 'refs/heads/main';
+  before: string;
+  after: string;
+  deliveredAt: string;
+}
+
+export type FakeGhPushResult = { ok: true; before: string; after: string }
+  | { ok: false; reason: 'token-unknown' | 'token-expired' | 'permission-denied' | 'repository-denied' | 'push-failed' };
+
 export interface FakeGh {
   /** Same synchronous gh execution boundary as githubDraftSweepAdapters. */
   api(args: string[]): string;
@@ -35,14 +56,32 @@ export interface FakeGh {
   runAsync: MergedPrRunner;
   readonly calls: string[][];
   readonly prs: FakeGhPr[];
+  /** Delivered only after a successful push; blocked pushes leave this empty. */
+  readonly webhooks: readonly FakeGhPushWebhook[];
+  pushWithToken(tokenId: string, remote: TempGitRemote): FakeGhPushResult;
 }
 
-export function createFakeGh(input: { prs: FakeGhPr[]; faults?: FakeGhFault[]; repository?: string; now?: () => Date }): FakeGh {
+export function createFakeGh(input: { prs: FakeGhPr[]; faults?: FakeGhFault[]; repository?: string; now?: () => Date; tokens?: readonly FakeGhToken[] }): FakeGh {
   const prs = input.prs.map((pr) => ({ ...pr, labels: [...(pr.labels ?? [])], files: [...(pr.files ?? [])], comments: [...(pr.comments ?? [])] }));
   const faults = (input.faults ?? []).map((fault) => ({ ...fault, remaining: fault.times }));
   const calls: string[][] = [];
+  const webhooks: FakeGhPushWebhook[] = [];
+  const tokens = (input.tokens ?? []).map(token => ({ ...token }));
   const repo = input.repository ?? 'example/repo';
   const now = input.now ?? (() => new Date());
+  const pushWithToken = (tokenId: string, remote: TempGitRemote): FakeGhPushResult => {
+    const token = tokens.find(candidate => candidate.id === tokenId);
+    if (!token) return { ok: false, reason: 'token-unknown' };
+    if (token.expiresAt && !(Date.parse(token.expiresAt) > now().getTime())) return { ok: false, reason: 'token-expired' };
+    if (token.repository !== repo || remote.repository !== repo) return { ok: false, reason: 'repository-denied' };
+    if (token.permission !== 'contents:write') return { ok: false, reason: 'permission-denied' };
+    try {
+      const { before, after } = remote.pushCheckoutMain();
+      if (before !== after) webhooks.push({ id: `push-${webhooks.length + 1}`, repository: repo, ref: 'refs/heads/main', before, after,
+        deliveredAt: now().toISOString() });
+      return { ok: true, before, after };
+    } catch { return { ok: false, reason: 'push-failed' }; }
+  };
   const find = (number: number) => {
     const pr = prs.find((entry) => entry.number === number);
     if (!pr) throw new Error(`fake-gh: unknown PR #${number}`);
@@ -214,5 +253,5 @@ export function createFakeGh(input: { prs: FakeGhPr[]; faults?: FakeGhFault[]; r
       return { status: 1, stdout: '', stderr: failure.stderr ?? failure.message ?? String(error) };
     }
   };
-  return { api, run, runAsync: async (command, args, cwd) => run(command, args, cwd), calls, prs };
+  return { api, run, runAsync: async (command, args, cwd) => run(command, args, cwd), calls, prs, webhooks, pushWithToken };
 }

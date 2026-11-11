@@ -10,3 +10,16 @@ review:
 publish:
   command: 'sleep 0.01; printf ''{"outcome":"ok"}\n'''
   timeout_ms: 30000
+solar-summary:
+  prompt: |
+    You are Solar for the scene-four demo. Summarize the request and decide whether the reviewed work can be published.
+    Return only one JSON object with outcome "ok" or "fail", a short summary, and a reason.
+    Build result: $build.output
+    Review evidence: $review.output
+    Request: $ARGUMENTS
+solar-build:
+  command: 'printf ''{"outcome":"ok","artifact":"scene-four build draft","evidence":"build node completed the demo draft"}\n'''
+  timeout_ms: 30000
+solar-review:
+  command: 'if [ -f "${ELANOUS_GRAPH_CONTEXT%/*}/solar-review-seen" ]; then printf ''{"outcome":"ok","findings":"draft meets the demo acceptance check","evidence":"second review of scene-four build draft passed"}\n''; else : > "${ELANOUS_GRAPH_CONTEXT%/*}/solar-review-seen"; printf ''{"outcome":"rework","findings":"draft requires one revision","evidence":"first review requested a rework"}\n''; fi'
+  timeout_ms: 30000

@@ -1,0 +1,10 @@
+graph_id: lecture-scrap-extract
+version: 1
+entry_node: extract
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: extract, kind: capability, recipe: none, requires: extract.structured@1, max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: extract, on: outcome, map: { done: done, failed: failed } }

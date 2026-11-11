@@ -6,16 +6,17 @@
  *
  *  🔑 ⛔ **그러면 적재 경로가 «둘»이 된다** — 한쪽만 redaction 을 타거나 한쪽만 logs.db 에
  *  안 들어가면, ***폴백으로 온 관측이 조용히 다르게 취급된다.***
- *  ⇒ 그래서 REST 핸들러가 «그 공용 함수»를 쓰는지 자로 문다.
- *
- *  ## ⚠️ 이 자가 답하지 «않는» 것
- *  ACP 서버가 실제로 그 메서드를 라우팅하는지 — 그건 `src/acp/server.ts` 축이고
- *  라이브(`elanous logs --event debug-logs.ingest`)로 본다. */
+ *  ⇒ 실제 REST 요청과 in-process ACP 메서드를 같은 임시 상태 뿌리에서 실행해
+ *  유효/무효 레코드 집계와 폴백 라우팅을 확인한다. */
 
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
+import { ClientSideConnection, ndJsonStream } from '@agentclientprotocol/sdk';
+import { createInProcessAcpBridge } from '../../tui-client/acp-transport-local.js';
+import { runAcpServer } from '../../acp/server.js';
+import type { AcpConnectionHandler, AcpTransportServer } from '../../acp/transport/index.js';
 
 // ⛔⭐⭐ **시험이 사람의 상태 디렉토리를 «오염시키지» 않게 뿌리를 옮긴다** —
 //   무인 리뷰 must-fix(PR #11391): *"실제 `ingestDebugLogRecords()` 를 기본 저장소로 호출하여
@@ -52,13 +53,6 @@ describe('debug 로그 적재 — HTTP 와 ACP 가 «같은 길»', () => {
     expect(out.rejected).toBe(1);
   });
 
-  it('⛔ REST 핸들러가 «그 공용 함수»를 쓴다 — 두 길이 갈리면 폴백 관측만 다르게 취급된다', () => {
-    const src = readFileSync(resolve(import.meta.dir, 'debug-logs.ts'), 'utf8');
-    // 주석으로 통과하지 않게 «호출 모양»을 본다.
-    const body = src.slice(src.indexOf('export async function handleDebugLogsBatch'));
-    expect(body).toContain('ingestDebugLogRecords(obj.records)');
-  });
-
   it('⭐ REST 는 여전히 같은 응답 모양을 낸다 — 리팩터가 계약을 안 바꿨다', async () => {
     const req = new Request('http://x/v1/debug-logs/batch', {
       method: 'POST',
@@ -74,9 +68,45 @@ describe('debug 로그 적재 — HTTP 와 ACP 가 «같은 길»', () => {
     expect(Array.isArray(json.files)).toBe(true);
   });
 
-  it('⛔ ACP 확장 메서드가 «배선돼 있고» 같은 함수를 쓴다', () => {
-    const acp = readFileSync(resolve(import.meta.dir, '../../acp/server.ts'), 'utf8');
-    expect(acp).toContain("method === 'elanous/debug-logs/ingest'");
-    expect(acp).toContain('ingestDebugLogRecords(p.records)');
+  it('ACP extension ingests valid records and rejects invalid records through the live server', async () => {
+    const record = { ts: new Date().toISOString(), category: 'probe.acp.shared', event: 'same-record',
+      source: { platform: 'pwa' }, data: { token: 'fixture-secret' } };
+    const records = [record, { nope: true }];
+    const rest = await handleDebugLogsBatch(new Request('http://x/v1/debug-logs/batch', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ records }),
+    }));
+    expect(rest.status).toBe(200);
+    const restResult = await rest.json() as { accepted: number; rejected: number; files: string[] };
+    expect(restResult).toMatchObject({ accepted: 1, rejected: 1 });
+    const file = restResult.files[0]!;
+    expect(file.startsWith(TEST_ROOT)).toBe(true);
+    const before = readFileSync(file, 'utf8').trimEnd().split('\n');
+    expect(JSON.parse(before.at(-1)!)).toEqual(record);
+    const bridge = createInProcessAcpBridge();
+    const abort = new AbortController();
+    const server = runAcpServer({
+      shutdownSignal: abort.signal,
+      transportFactory: async (onConnection: AcpConnectionHandler): Promise<AcpTransportServer> => {
+        void onConnection({ readable: bridge.a.readable, writable: bridge.a.writable,
+          peerId: 'debug-ingest-test', close: async () => { try { await bridge.a.writable.close(); } catch {} } });
+        return { kind: 'in-process', address: 'test://debug-ingest',
+          close: async () => { try { await bridge.a.writable.close(); } catch {} } };
+      },
+    });
+    const client = new ClientSideConnection(() => ({
+      async sessionUpdate() {},
+      async requestPermission() { return { outcome: { outcome: 'cancelled' as const } }; },
+    }), ndJsonStream(bridge.b.writable, bridge.b.readable));
+    try {
+      await client.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const result = await client.extMethod('elanous/debug-logs/ingest', { records });
+      expect(result).toMatchObject({ ok: true, accepted: 1, rejected: 1 });
+      const after = readFileSync(file, 'utf8').trimEnd().split('\n');
+      expect(after).toHaveLength(before.length + 1);
+      expect(JSON.parse(after.at(-1)!)).toEqual(record);
+    } finally {
+      abort.abort();
+      await server;
+    }
   });
 });

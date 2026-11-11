@@ -12,6 +12,8 @@ export interface OutboundMsg {
   text: string;
   markdown: boolean;
   kind: string;
+  /** Stable producer identity for delivery-ledger deduplication (e.g. briefing:<id>). */
+  dedupKey?: string;
   /** Optional routing role; absent preserves per-kind fan-out. */
   role?: string;
   /** Optional transport metadata. A router must not send these fields to a connector that does not declare support. */

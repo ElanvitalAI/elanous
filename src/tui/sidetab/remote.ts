@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { debug } from '../../debug/log.js';
 import { parsePodPool } from '../../task-orchestrator/surfaces/pod-pool.js';
 import type { SidetabRow } from '../../sidetab-core/model.js';

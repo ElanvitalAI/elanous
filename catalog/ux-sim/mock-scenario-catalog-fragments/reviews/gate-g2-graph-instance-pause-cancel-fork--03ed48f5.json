@@ -1,0 +1,4 @@
+{
+  "deviceKey": "gate-g2-graph-instance-pause-cancel-fork",
+  "review": "# 📅 2026-11-10 재검토 (GATE-G2 · GRAPH-INSTANCE-PAUSE-CANCEL-FORK) — production graph runner의 pause·cancel·fork와 node-owner 상실 후 재개 시뮬 장치를 등록한다. 테스트는 aws1 원격에서 실행하고, 격리 원장·완료 prefix·취소 terminal·fork lineage를 확인한다."
+}

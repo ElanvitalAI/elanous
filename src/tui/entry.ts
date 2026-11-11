@@ -1,14 +1,23 @@
 import { initTui, closeTui, injectKey, readKey, type Key } from '../tui.js';
-import { fitLogLine, isToolFoldToggleKey, logViewLines, safeLogText, safeStatusText, streamReplyLines, toggleVisibleToolFold, toolFoldBlockStarts, wheelScroll } from './chat/log-view.js';
+import { createNextTuiHistoryCache, fitLogLine, foldTargetAtScreenRow, isNextTuiContextCountStatus, isToolFoldToggleKey, logViewLines, NEXT_TUI_TITLE, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, nextVisibleFoldTarget, renderNextTuiLogFrame, safeLogText, safeStatusText, streamReplyLines, toggleVisibleToolFold, toolFoldBlockStarts, wheelScroll, wrapLogLines } from './core/render.js';
+import type { MessageBlock } from '../conv-substrate/message-block.js';
+import { nextMessageBlockDetailLevel } from './chat/message-block-view.js';
+import { createMessageBlockSessionStore, upsertMessageBlock } from './core/message-block-session.js';
+import { formatMessageBlockRawTrace, resolveMessageBlockRawTrace } from './core/message-block-raw-ref.js';
 import { BackgroundJobStatus } from './chat/background-job-status.js';
-import { MOUSE_RESIDUE_WINDOW_MS, MouseResidueGuard, applyComposerKey, composerViewport, emptyComposer, wheelDirection } from './input/composer.js';
-import { createInlineEditorState, type InlineEditorState } from '../input-core/inline-editor.js';
-import { nextTuiTitle, requestNewTuiSession } from './slash/new-session.js';
+import { MOUSE_RESIDUE_WINDOW_MS, MouseResidueGuard, composerViewport, replaceSlashPickerQuery, wheelDirection } from './input/composer.js';
+import { inlineEditorInsert, type InlineEditorState } from '../input-core/inline-editor.js';
+import { createContextRegistry } from '../context.js';
+import { hasClipboardImage, readClipboardText } from '../clipboard/index.js';
+import { registerClipboardImageAttachment } from '../clipboard/image-attachment.js';
+import { readClipboardPaste } from '../clipboard/paste.js';
+import { requestNewTuiSession } from './slash/new-session.js';
 import { COMPACT_BUSY_STATUS, COMPACT_NO_SESSION_STATUS } from './slash/compact-command.js';
 import { RESUME_BUSY_STATUS, parseResumeCommand } from './slash/resume-command.js';
 import { reportTuiProgress, reportTuiTurn } from '../pty-shell/tui-run-state.js';
-import { createPasteFold } from '../chat/paste-fold.js';
-import { createTurnTypeaheadState, dequeueTurnTypeaheadHandoff, drainTurnTypeaheadOnce, restoreTurnTypeaheadSubmission } from '../chat/turn-typeahead.js';
+import { createNextTuiQueue, nextTuiQueueSuffix } from './core/queue.js';
+import { agentDisplayLines, applyAgentEvent, reconcileAgentOutputStatuses, type AgentDisplay } from './core/agents.js';
+import { decideNextTuiAutoContinue, startNextTuiTurn } from './core/turn.js';
 import { debug } from '../debug/log.js';
 import { setCliStderrSink } from '../git-fs/cli-stderr.js';
 import { createInputLagProbe } from './input-lag-probe.js';
@@ -17,6 +26,17 @@ import { countInterimDisplay, internalTurnOriginOfText, planInterimDisplay } fro
 import type { NextLoopCommand } from '../tui-client/next-loop-command.js';
 import { handleSignalsSlash, type SignalsSlashContext } from './slash/signals.js';
 import { updatePtyManifestSession } from '../pty-shell/pty-manifest.js';
+import { createNextTuiCoreInput } from './core/input.js';
+import { formatInlinePanel } from './input/inline-panel.js';
+import { startMissionWatch as startMissionWatchLoop } from './mission-watch.js';
+import { nextSlashCandidates } from './input/slash-complete.js';
+import { nextFirstScreenLines } from './branches/first-screen.js';
+import type { NextTuiHarnessRunner } from './branches/harness.js';
+import { monotonicNowMs, requiresLongShellEscConfirmation } from '../esc-abort-gate.js';
+import { applyShellApprovalKey, NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS } from '../tui-client/next-shell-approval.js';
+import { SYNCHRONIZED_OUTPUT_BEGIN, SYNCHRONIZED_OUTPUT_END, openSynchronizedOutputRegion, synchronizedOutputDisabledByEnv } from '../display/synchronized-output-region.js';
+import { remoteFrameRows, ScreenPaintCache } from './core/screen-paint-cache.js';
+import type { SerializedMessage } from '../session/index.js';
 
 let nextTuiRouteRegistry: typeof import('./core/registry.js') | undefined;
 async function loadNextTuiRouteRegistry(): Promise<typeof import('./core/registry.js')> {
@@ -24,9 +44,53 @@ async function loadNextTuiRouteRegistry(): Promise<typeof import('./core/registr
   return nextTuiRouteRegistry;
 }
 
-/** Status-line count of what waits for the running turn — empty when nothing waits. */
-export function nextTuiQueueSuffix(count: number): string {
-  return count > 0 ? ` · 대기 ${count}` : '';
+export { nextTuiQueueSuffix } from './core/queue.js';
+
+export interface NextTuiActiveShellCall { readonly name: 'Bash' | 'RunShell'; readonly startedAtMonotonicMs: number }
+
+export function nextTuiShellEscDecision(
+  activeCalls: ReadonlyMap<string, NextTuiActiveShellCall>,
+  nowMs: number,
+): 'abort' | 'confirm' | null {
+  if (activeCalls.size === 0) return null;
+  return [...activeCalls.values()].some(({ name, startedAtMonotonicMs }) =>
+    requiresLongShellEscConfirmation(name, nowMs - startedAtMonotonicMs)) ? 'confirm' : 'abort';
+}
+
+const shellApprovalSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+function shellApprovalCommandLines(command: string, columns: number): string[] {
+  const width = Math.max(1, columns - 2);
+  const lines: string[] = [];
+  for (const sourceLine of safeLogText(command).split(/\r?\n/)) {
+    let line = '';
+    let used = 0;
+    for (const { segment } of shellApprovalSegmenter.segment(sourceLine)) {
+      const cells = Bun.stringWidth(segment);
+      if (used > 0 && used + cells > width) {
+        lines.push(`  ${line}`);
+        line = '';
+        used = 0;
+      }
+      if (cells > width) continue;
+      line += segment;
+      used += cells;
+    }
+    lines.push(`  ${line}`);
+  }
+  return lines.length ? lines : ['  '];
+}
+
+export function shellApprovalCommandViewport(
+  command: string,
+  terminalColumns: number,
+  sidetabWidth: number,
+  rows: number,
+  scroll: number,
+): { readonly lines: readonly string[]; readonly pageSize: number; readonly scroll: number } {
+  const chatColumns = Math.max(1, terminalColumns - (sidetabWidth > 0 ? sidetabWidth + 1 : 0));
+  const lines = shellApprovalCommandLines(command, chatColumns);
+  const pageSize = Math.max(1, Math.min(8, rows - 6));
+  return { lines, pageSize, scroll: Math.min(Math.max(0, scroll), Math.max(0, lines.length - pageSize)) };
 }
 
 type NextTuiTermSession = {
@@ -41,10 +105,15 @@ type NextTuiTermSession = {
 export interface NextTuiOptions {
   readonly resumeSessionId?: string;
   readonly sidetabMode?: 'off' | 'collapsed' | 'open';
+  readonly compactHeight?: number;
+  /** Test seam for the approval panel deadline; production uses the REPL timeout. */
+  readonly shellApprovalTimeoutMs?: number;
   /** Read-only terminal session source; injectable so the Next slash stays testable without PTYs. */
   readonly termSessions?: {
     list(): readonly NextTuiTermSession[] | Promise<readonly NextTuiTermSession[]>;
   };
+  /** Test seam for the registry-loaded harness branch; production reuses the local CLI adapter. */
+  readonly harnessRunner?: NextTuiHarnessRunner;
 }
 
 const sidetabOpenBySession = new Map<string, boolean>();
@@ -61,26 +130,7 @@ interface AtPickerQuery {
   readonly end: number;
 }
 
-export function atPickerHeaderLines(
-  candidates: readonly AtPickerCandidate[],
-  selected: number,
-  availableRows: number,
-  fit: (text: string) => string,
-): string[] {
-  if (availableRows <= 0) return [];
-  const safeSelected = Math.max(0, Math.min(selected, candidates.length - 1));
-  if (availableRows === 1) {
-    const candidate = candidates[safeSelected];
-    return [fit(candidate ? `@ ${safeSelected + 1}/${candidates.length} · ${candidate.label}` : '@ 파일 후보 없음')];
-  }
-  const limit = Math.max(1, Math.min(6, availableRows - 1));
-  const start = Math.max(0, Math.min(safeSelected - limit + 1, candidates.length - limit));
-  const visible = candidates.slice(start, start + limit);
-  return [
-    fit(visible.length ? '@ 파일 첨부 · ↑↓ 선택 · Enter 추가 · Esc 닫기' : '@ 파일 후보 없음'),
-    ...visible.map((candidate, offset) => fit((start + offset === safeSelected ? '▸' : ' ') + ' ' + candidate.label)),
-  ];
-}
+interface SlashPickerCandidate { readonly value: string; readonly description: string }
 
 /** Local chat entry: history and input are TUI-owned; turn execution stays shared. */
 export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
@@ -110,12 +160,16 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // turn-start segments recorder wired over the shared turn delegation.
   const { readSeatMailSnapshot, seatMailLine } = await import('./seat-mail-boot.js');
   const mailLine = seatMailLine(readSeatMailSnapshot(process.cwd()));
-  let editor = emptyComposer();
+  const input = createNextTuiCoreInput();
   let status = 'Enter 전송 · Esc 취소 · Ctrl+Q 종료';
+  let welcomePending = true;
+  const compactHeight = nextTuiCompactHeight(process.env.ELANOUS_NEXT_TUI_COMPACT_HEIGHT, options.compactHeight);
+  const missionWatchCancellation: { cancel?: () => void } = {};
   let busy = false;
   let turnAbort: AbortController | null = null;
   let turnDone: Promise<void> | null = null;
   let scroll = 0;
+  const prepareHistory = createNextTuiHistoryCache();
   let maxScroll = 0;
   let focus: 'input' | 'log' = 'input';
   let sidetabEnabled = options.sidetabMode !== 'off';
@@ -150,33 +204,98 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // Wakes readKey when a character held by the residue guard would otherwise wait for the next key.
   const residueWake: Key = { name: '', ctrl: false, shift: false, raw: '' };
   let residueTimer: ReturnType<typeof setTimeout> | null = null;
-  let historyIndex = 0;
-  let draft = '';
   let activity: string[] = [];
+  let agents: AgentDisplay[] = [];
   /** Rows of the last `/resume` list — `/resume <n>` picks from what the user saw. */
   let lastResumeRows: import('../session/index.js').SessionMeta[] | null = null;
   let atPicker: { query: AtPickerQuery; candidates: AtPickerCandidate[]; selected: number } | null = null;
+  let slashPicker: { query: string; candidates: SlashPickerCandidate[]; selected: number } | null = null;
+  let slashPickerVisible = false;
+  let stopConfirmationSelection: 0 | 1 | null = null;
+  let stopConfirmationKind: 'turn' | 'long-shell' | null = null;
+  const shellApprovalPrompt: { current: { readonly callId: string; readonly command: string; scroll: number; timer: ReturnType<typeof setTimeout> | null; readonly resolve: (approved: boolean) => void } | null } = { current: null };
+  let lastResolvedShellApprovalCallId: string | null = null;
+  const activeShellCalls = new Map<string, NextTuiActiveShellCall>();
+  const activeToolCalls = new Map<string, string>();
+  const shellActivitySnapshotRequest: { current: (() => boolean) | null } = { current: null };
+  const pushNowRequest: { current: ((requestId: string) => boolean) | null } = { current: null };
+  const pushNowCommit: { current: ((requestId: string) => boolean) | null } = { current: null };
+  let shellEscSnapshotPending = false;
+  let pushNowSnapshotPending = false;
+  let pushNowRequestId: string | null = null;
+  let pushNowPhase: 'checking' | 'committing' | null = null;
+  const pushNowCommitting = (): boolean => pushNowPhase === 'committing';
+  let pushNowRequestSerial = 0;
   let atPickerApi: typeof import('./input/at-picker.js') | null = null;
   let dismissedAtQuery = '';
+  let slashNavigated = false;
+  let dismissedSlashDraft = '';
   const atAttachmentTokens = new Map<string, string>();
+  let contextAttachmentArea: string[] = [];
+  let contextAttachmentAreaVisible = false;
+  let contextAttachmentPage = 0;
+  let contextAttachmentScroll = 0;
+  let contextAttachmentScrollStep = 1;
+  let contextAttachmentScrollMax = 0;
+  let contextAttachmentScrollPage = 1;
+  let contextAttachmentScrollPages = 1;
   let atAttachmentOrdinal = 0;
+  const clipboardAttachments = createContextRegistry();
+  const refreshVisibleContextAttachmentArea = async (): Promise<void> => {
+    if (!contextAttachmentAreaVisible) return;
+    const branch = await import('./branches/context.js');
+    const projection = branch.projectNextTuiContextArea(atAttachmentTokens, contextAttachmentPage, 1);
+    contextAttachmentPage = projection.page;
+    contextAttachmentArea = projection.lines;
+    contextAttachmentScroll = 0;
+  };
   // Tool-output fold state, keyed by message index; long tool output renders
   // collapsed and Enter/Tab/F in the log toggles the foldable block on screen nearest the
   // bottom of the last rendered scroll window.
   const expandedToolBlocks = new Set<number>();
-  let logWindow = { start: 0, rows: 0, columns: 80 };
+  const messageBlockSessions = createMessageBlockSessionStore();
+  let messageBlocks: MessageBlock[] = [];
+  let messageBlockLevels = new Map<string, 0 | 1 | 2 | 3>();
+  let messageBlockRawTexts = new Map<string, string>();
+  let messageBlockAfterMessageIndexes = new Map<string, number>();
+  const saveMessageBlockSession = (): void => {
+    if (!id) return;
+    messageBlockSessions.save(id, { blocks: [...messageBlocks], levels: new Map(messageBlockLevels),
+      rawTexts: new Map(messageBlockRawTexts), afterMessageIndexes: new Map(messageBlockAfterMessageIndexes) });
+  };
+  const restoreMessageBlockSession = (sessionId: string): void => {
+    const saved = messageBlockSessions.restore(sessionId);
+    messageBlocks = saved.blocks;
+    messageBlockLevels = saved.levels;
+    messageBlockRawTexts = saved.rawTexts;
+    messageBlockAfterMessageIndexes = saved.afterMessageIndexes;
+  };
+  let logWindow: { start: number; rows: number; columns: number; bodyTop: number; leadingBlankRows: number; foldTargets: readonly ({ kind: 'message'; id: string; start: number; end: number } | { kind: 'tool'; index: number; start: number; end: number })[] } = { start: 0, rows: 0, columns: 80, bodyTop: 1, leadingBlankRows: 0, foldTargets: [] };
+  let lastFoldTargetKey: string | null = null;
   let streamingReply = '';
-  let streamRenderAt = 0;
-  let streamRenderTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingEcho: SerializedMessage | null = null;
+  let pendingEchoStart = 0;
+  const screenPaintCache = new ScreenPaintCache();
+  const paintScreen = (lines: string[], cursorRow: number, cursorCol: number, columns: number, rows: number): void => {
+    const region = openSynchronizedOutputRegion();
+    const synchronized = region.outermost && !synchronizedOutputDisabledByEnv();
+    const diff = screenPaintCache.diff(lines, columns, rows);
+    let output = `${synchronized ? SYNCHRONIZED_OUTPUT_BEGIN : ''}\x1b[?25l`;
+    if (diff.clear) output += '\x1b[H\x1b[2J';
+    for (const { row, text } of diff.changedRows) output += `\x1b[${row + 1};1H\x1b[2K\x1b[0m${text}`;
+    output += `\x1b[${cursorRow};${cursorCol}H\x1b[?25h${synchronized ? SYNCHRONIZED_OUTPUT_END : ''}`;
+    try {
+      process.stdout.write(output);
+    } finally {
+      region.close();
+    }
+  };
   const backgroundJobs = new BackgroundJobStatus(id);
   const backgroundSubscription: { stop?: () => void } = {};
-  const selfHealthSubscription: { stop?: () => void } = {};
   let observedSessionId: string | null = null;
-  let selfHealthLine: string | null = null;
   // TUI-NEXT-QUEUE-AND-WAKE — what is submitted while busy waits here (the classic FIFO state) and
   // leaves one item per settle; Esc returns it all to the prompt (classic «interrupted» drain).
-  let queue = createTurnTypeaheadState();
-  let interrupted = false;
+  const queue = createNextTuiQueue();
   /** The prompt text a queued submission displaced; it comes back once that submission is sent. */
   let restoreDraft: string | null = null;
   /** ⏰/↻ lines from the wakeup scheduler and the internal-turn door (newest last, at most three). */
@@ -186,6 +305,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const internalWake: Key = { name: '', ctrl: false, shift: false, raw: '' };
   let wakeup: NextTuiWakeup | null = null;
   let loopCommand: NextLoopCommand | null = null;
+  let decideBranchRoute: ((input: string) => string) | undefined;
+  let pluginWizardFlow: ReturnType<typeof import('./branches/plugin-wizard.js').createPluginWizardFlow> | null = null;
   const runLoopCommand = async (raw: string): Promise<string[]> => {
     if (!loopCommand) {
       if (!wakeup?.gate) {
@@ -199,11 +320,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     }
     return loopCommand.run(raw);
   };
-  const pasteFold = createPasteFold();
   // TURN-END-BEFORE-GOAL — 답이 약속만 하고 끝나면 깨움 문으로 한 턴 더(classic 과 같은 모듈 · 동적 로드).
   let goalContinue: ReturnType<(typeof dashboardRuntime)['createGoalContinue']> | null = null;
   /** 이번 턴이 실패·취소로 끝났나 — 그런 턴은 이어가지 않는다. */
-  let turnFailed = false;
   /** 마지막으로 관측에 남긴 접힌 중간 답 수(next · 바뀔 때만 'folded' 한 줄). */
   let interimFoldedShown = 0;
   const pushNotice = (line: string): void => {
@@ -212,18 +331,16 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const observeSession = (
     sessionId: string,
     onBackground: typeof import('../tui-client/local-chat-turn.js').onLocalChatBackgroundStatus,
-    onSelfHealth: typeof import('../tui-client/local-chat-turn.js').onLocalChatSelfHealthStatus,
   ): void => {
     if (observedSessionId === sessionId) return;
     backgroundSubscription.stop?.();
-    selfHealthSubscription.stop?.();
     backgroundSubscription.stop = onBackground(sessionId, (frame) => {
       if (frame === null) backgroundJobs.clear();
       else backgroundJobs.accept(frame);
-      render();
-    });
-    selfHealthSubscription.stop = onSelfHealth(sessionId, (snapshot) => {
-      selfHealthLine = snapshot?.line ?? null;
+      if (id === sessionId && !busy) {
+        session = loadSession(sessionId);
+        messages = session?.messages ?? messages;
+      }
       render();
     });
     observedSessionId = sessionId;
@@ -231,6 +348,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   // MISSION-FABRIC-REMOVAL(대표 11-05) — /mission 은 지웠다. 미션 패브릭(autopilot 미션 스토어)은 시뮬레이션 장치로 새로 짓는다.
   const slashHandlers = new Map<string, (args: string[], context: SignalsSlashContext) => Promise<void>>();
   slashHandlers.set('signals', handleSignalsSlash);
+  slashHandlers.set('status', async (_args, context) => (await import('./branches/status.js')).runNextTuiStatusBranchRoute('/status', { addLines: (...lines) => context.chatLines.push(...lines), sessionId: id ?? undefined }));
   const dispatchSlash = async (name: string, args: string[], context: SignalsSlashContext): Promise<boolean> => {
     const handler = slashHandlers.get(name);
     if (!handler) return false;
@@ -262,17 +380,19 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   }));
 
   const render = (): void => {
+    slashPickerVisible = false;
     if (sidetabRemoteFrame !== null) {
       const columns = process.stdout.columns || 80;
       const rows = process.stdout.rows || 24;
       const footer = fitLogLine(` ${status} `, Math.max(1, columns));
-      process.stdout.write(`\x1b[H\x1b[2J${sidetabRemoteFrame}\x1b[${rows};1H\x1b[7m${footer}\x1b[0m`);
+      const body = remoteFrameRows(sidetabRemoteFrame, columns, rows - 1);
+      paintScreen([...Array(Math.max(0, rows - 1 - body.length)).fill(''), ...body, `\x1b[7m${footer}\x1b[0m`], rows, 1, columns, rows);
       return;
     }
     const columns = process.stdout.columns || 0;
     const rows = process.stdout.rows || 0;
     if (columns < 20 || rows < 6) {
-      process.stdout.write(`\x1b[H\x1b[2J${fitLogLine('터미널이 너무 작습니다 · q 종료', Math.max(1, columns))}`);
+      paintScreen([fitLogLine('터미널이 너무 작습니다 · q 종료', Math.max(1, columns))], 1, 1, columns, rows);
       return;
     }
     if (sidetabOpen && columns < 34) {
@@ -287,42 +407,111 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const sidetabWidth = sidetabOpen ? sidetabApi!.sidetabWidthForTerminal(columns) : 0;
     const chatColumns = columns - sidetabWidth - (sidetabOpen ? 1 : 0);
     const backgroundLine = backgroundJobs.line();
-    const showSelfHealth = selfHealthLine !== null && rows >= 7;
-    const title = fitLogLine(`elanous next · ${safeLogText(nextTuiTitle(session?.meta)).split('\n')[0]}`, chatColumns);
-    const turnStatus = (!busy && focus === 'log'
+    const title = fitLogLine(NEXT_TUI_TITLE, chatColumns);
+    const header = [title, mailLine ? fitLogLine(mailLine, chatColumns) : '─'.repeat(Math.max(0, chatColumns))];
+    const rawTurnStatus = (!busy && focus === 'log'
       ? `로그 탐색 · ↑↓ 스크롤${toolFoldBlockStarts(messages, chatColumns).length > 0 ? ' · Enter 접기/펼치기' : ''} · Esc 입력`
-      : status) + nextTuiQueueSuffix(queue.queuedSubmissions.length);
-    const footer = backgroundLine
-      ? [fitLogLine(backgroundLine, chatColumns), fitLogLine(turnStatus, chatColumns)]
-      : [fitLogLine(turnStatus, chatColumns)];
-    const prompt = composerViewport(editor, chatColumns);
-    const header = [title, mailLine ? fitLogLine(mailLine, chatColumns) : '─'.repeat(Math.min(chatColumns, 80))];
-    if (showSelfHealth) header.push(fitLogLine(selfHealthLine!, chatColumns));
-    if (atPicker) {
-      // Reserve the prompt, footer, and picker heading before assigning candidate rows.
-      const pickerRows = rows - header.length - footer.length - 1;
-      if (pickerRows > 0) {
-        header.push(...atPickerHeaderLines(atPicker.candidates, atPicker.selected, pickerRows, (line) => fitLogLine(line, chatColumns)));
-      }
-    }
-    const history = [
-      ...logViewLines(messages, chatColumns, expandedToolBlocks),
-      ...notices.map((line) => fitLogLine(line, chatColumns)),
-      ...activity.map((line) => fitLogLine(line, chatColumns)),
+      : status);
+    const turnStatusBase = (isNextTuiContextCountStatus(rawTurnStatus) ? '' : nextTuiStatusAfterWelcome(rawTurnStatus)) + nextTuiQueueSuffix(queue.count);
+    const activeShellApproval = shellApprovalPrompt.current;
+    const approvalViewport = activeShellApproval
+      ? shellApprovalCommandViewport(activeShellApproval.command, columns, sidetabOpen ? sidetabWidth : 0, rows, activeShellApproval.scroll)
+      : null;
+    const approvalCommandLines = approvalViewport?.lines ?? [];
+    const approvalPageSize = approvalViewport?.pageSize ?? 1;
+    const approvalScroll = approvalViewport?.scroll ?? 0;
+    const attachmentLines = contextAttachmentArea.flatMap((line) => wrapLogLines(safeStatusText(line), chatColumns));
+    const attachmentContent = attachmentLines.slice(1);
+    const statusRowCount = backgroundLine ? 2 : 1;
+    const attachmentRowLimit = Math.max(1, Math.min(6, rows - header.length - statusRowCount - 1));
+    const attachmentBodyRows = Math.max(1, attachmentRowLimit - 1);
+    contextAttachmentScrollStep = attachmentBodyRows;
+    contextAttachmentScrollPages = Math.max(1, Math.ceil(attachmentContent.length / attachmentBodyRows));
+    contextAttachmentScrollMax = (contextAttachmentScrollPages - 1) * attachmentBodyRows;
+    contextAttachmentScroll = Math.max(0, Math.min(contextAttachmentScroll, contextAttachmentScrollMax));
+    contextAttachmentScrollPage = Math.floor(contextAttachmentScroll / attachmentBodyRows) + 1;
+    const attachmentOverflow = contextAttachmentScrollMax > 0;
+    const attachmentHint = attachmentOverflow && focus === 'input' && !atPicker && !slashPicker && !activeShellApproval
+      ? `첨부 경로 ${contextAttachmentScrollPage}/${contextAttachmentScrollPages} · PgUp/PgDn`
+      : null;
+    const turnStatus = [attachmentHint, turnStatusBase].filter(Boolean).join(' · ');
+    const compactActionStatus = nextTuiCompactActionStatus(turnStatus);
+    const attachmentFooter = attachmentLines.length
+      ? [attachmentLines[0]!, ...attachmentContent.slice(contextAttachmentScroll, contextAttachmentScroll + attachmentBodyRows)]
+      : [];
+    const withAttachmentFooter = (lines: string[]): string[] => [...attachmentFooter, ...lines];
+    const statusFooter = rows <= compactHeight
+      ? (welcomePending ? [fitLogLine('Enter 전송 · Esc 취소 · Ctrl+Q 종료', chatColumns)]
+        : compactActionStatus ? [fitLogLine(compactActionStatus, chatColumns)] : [])
+      : [
+          ...(backgroundLine ? [fitLogLine(backgroundLine, chatColumns)] : []),
+          ...(welcomePending ? [fitLogLine('Enter 전송 · Esc 취소 · Ctrl+Q 종료', chatColumns)] : []),
+          ...(turnStatus ? [fitLogLine(turnStatus, chatColumns)] : []),
+        ];
+    const panelSpec = atPicker
+      ? {
+          title: '@ 파일 첨부',
+          rows: atPicker.candidates.map((candidate) => ({ label: candidate.label })),
+          selected: atPicker.selected,
+          hint: 'Enter 추가 · Esc 닫기',
+        }
+      : slashPicker
+        ? {
+            title: '/ 명령',
+            rows: slashPicker.candidates.map((candidate) => ({ label: candidate.value, description: candidate.description })),
+            selected: slashPicker.selected,
+            hint: '↑↓ 선택 · Tab 완성 · Enter 실행 · Esc 닫기',
+          }
+        : stopConfirmationSelection !== null
+          ? {
+              title: stopConfirmationKind === 'long-shell' ? '긴 셸 명령 중단 확인' : '응답 중단 확인',
+              rows: [{ label: 'y. 중단' }, { label: 'n. 계속' }],
+              selected: stopConfirmationSelection,
+              hint: 'y/n 입력 · 기본 N · Enter=계속 · Esc 닫기',
+            }
+          : null;
+    slashPickerVisible = Boolean(slashPicker && !atPicker && !activeShellApproval);
+    const footer = withAttachmentFooter(activeShellApproval
+      ? [
+          fitLogLine('Bash 실행 승인 · 전체 명령', chatColumns),
+          ...approvalCommandLines.slice(approvalScroll, approvalScroll + approvalPageSize).map((line) => fitLogLine(line, chatColumns)),
+          fitLogLine(`명령 ${approvalScroll + 1}-${Math.min(approvalCommandLines.length, approvalScroll + approvalPageSize)} / ${approvalCommandLines.length} · ↑↓ 내용 보기`, chatColumns),
+          fitLogLine('y 실행 · n 거부 · Enter 기본 N · Esc 거부', chatColumns),
+        ]
+      : panelSpec
+      ? formatInlinePanel(panelSpec).map((line) => fitLogLine(line, chatColumns))
+      : statusFooter);
+    // Keep title, status and at least one log row visible on ordinary small terminals.
+    const promptMaxRows = Math.max(1, Math.min(6, rows - header.length - footer.length - 1)); // Source: #36682
+    const prompt = composerViewport(input.editor, { columns: chatColumns, maxRows: promptMaxRows });
+    // Keep submitted user text visible until the session transcript catches up.
+    const visibleMessages = pendingEcho && !messages.slice(pendingEchoStart).some((message) =>
+      message.role === 'user' && message.content === pendingEcho!.content)
+      ? [...messages, pendingEcho] : messages;
+    const displayActivity = [
+      ...agentDisplayLines(reconcileAgentOutputStatuses(agents, messages)),
+      ...activity,
+      ...(backgroundJobs.taskLines?.() ?? []).map(safeStatusText),
     ];
-    // Header rows can grow when mail, health, or picker state appears. Preserve
-    // the prompt first, then trim excess header rows before calculating history.
-    const visibleFooter = footer.slice(0, Math.max(0, Math.min(footer.length, rows - 1)));
-    const headerBudget = Math.max(0, rows - visibleFooter.length - 1);
-    const visibleHeader = header.slice(0, headerBudget);
-    const bodyRows = Math.max(0, rows - visibleHeader.length - visibleFooter.length - 1);
-    maxScroll = Math.max(0, history.length - bodyRows);
-    scroll = Math.min(scroll, maxScroll);
-    const start = Math.max(0, history.length - bodyRows - scroll);
-    const body = history.slice(start, start + bodyRows);
-    logWindow = { start, rows: bodyRows, columns: chatColumns };
-    const lines = [...visibleHeader, ...body, ...visibleFooter, prompt.line];
-    const promptRow = lines.length;
+    // Source: renderNextTuiLogFrame reserves one prompt row after header and footer.
+    const firstScreen = nextFirstScreenLines({
+      width: chatColumns,
+      availableRows: Math.max(0, rows - header.length - footer.length - prompt.lines.length),
+      hasMessages: visibleMessages.length > 0,
+      hasActivity: displayActivity.length > 0,
+      hasNotices: notices.length > 0,
+      hasDraft: input.editor.text.length > 0,
+      busy,
+    });
+    const frameInput = { messages: visibleMessages, messageBlocks: messageBlocks.map((block) => ({
+      block, level: messageBlockLevels.get(block.id) ?? 0, rawText: messageBlockRawTexts.get(block.id),
+      afterMessageIndex: messageBlockAfterMessageIndexes.get(block.id),
+    })), columns: chatColumns, rows,
+      header, footer, promptLine: prompt.line, promptLines: prompt.lines, notices, activity: [...firstScreen, ...displayActivity], scroll,
+      expandedToolIndexes: expandedToolBlocks };
+    const frame = renderNextTuiLogFrame(frameInput, prepareHistory(frameInput));
+    ({ scroll, maxScroll, logWindow } = frame);
+    const { lines, promptRow } = frame;
     const sidetabLines = sidetabOpen
       ? sidetabApi!.formatSidetabLines(sidetabRows, sidetabSelected, sidetabWidth, Math.max(1, rows - 1), sidetabMode)
       : [];
@@ -331,8 +520,42 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       const line = lines[index] ?? '';
       return sidetabOpen ? `${sidetabLines[index] ?? ' '.repeat(sidetabWidth)}│${line}` : line;
     });
-    process.stdout.write(`\x1b[H\x1b[2J${screenLines.join('\n')}\x1b[${promptRow};${prompt.cursorCol + (sidetabOpen ? sidetabWidth + 1 : 0)}H\x1b[?25h`);
-    if (sidetabAttachments?.hasModal() && !paintingCoordinatorFrame) sidetabAttachments.refresh();
+    paintScreen(screenLines, promptRow + prompt.cursorRow, prompt.cursorCol + (sidetabOpen ? sidetabWidth + 1 : 0), columns, rows);
+    if (sidetabAttachments?.hasModal() && !paintingCoordinatorFrame) {
+      sidetabAttachments.refresh();
+      screenPaintCache.invalidate(rows);
+    }
+  };
+
+  const startMissionWatch = (
+    kind: 'ready' | 'run',
+    missionId: string,
+    poll: () => Promise<{ message: string; outcome: 'pending' | 'complete' | 'error' }>,
+    onReady?: (isActive: () => boolean) => Promise<void>,
+  ): void => {
+    missionWatchCancellation.cancel?.();
+    status = kind === 'ready' ? `미션 준비 관찰 중 · ${missionId}` : `미션 실행 관찰 중 · ${missionId}`;
+    render();
+    const watcher = startMissionWatchLoop({
+      poll,
+      onUpdate: (message) => {
+        activity.push(`  ${message}`);
+        if (activity.length > 30) activity.splice(0, activity.length - 30);
+        render();
+      },
+      onError: (message) => {
+        activity.push(`  미션 관찰 실패: ${message}`);
+        status = `미션 관찰 오류 · ${missionId}`;
+        render();
+      },
+      onComplete: async (isActive) => {
+        if (kind === 'ready') await onReady?.(isActive);
+        if (!isActive()) return;
+        status = kind === 'ready' ? `미션 준비 완료 · ${missionId}` : `미션 종결 · ${missionId}`;
+        render();
+      },
+    });
+    missionWatchCancellation.cancel = watcher.cancel;
   };
 
   const ensureSidetabAttachments = async (): Promise<void> => {
@@ -357,13 +580,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       ...(installer.detectAgentCli ? { detectAgentCli: installer.detectAgentCli } : {}),
       drawRemoteFrame: (frame) => {
         sidetabRemoteFrame = frame || null;
-        if (sidetabRemoteFrame !== null) {
-          const columns = process.stdout.columns || 80;
-          const rows = process.stdout.rows || 24;
-          const footer = fitLogLine(` ${status} `, Math.max(1, columns));
-          process.stdout.write(`\x1b[H\x1b[2J${sidetabRemoteFrame}\x1b[${rows};1H\x1b[7m${footer}\x1b[0m`);
-        }
-        else render();
+        render();
       },
     });
   };
@@ -471,19 +688,23 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       status = '세션을 읽을 수 없습니다 · 목록을 다시 열어 주세요';
       return;
     }
+    saveMessageBlockSession();
     id = targetId;
+    restoreMessageBlockSession(targetId);
+    lastFoldTargetKey = null;
     session = target;
     messages = target.messages;
     setActiveSessionId(targetId);
     updatePtyManifestSession(`tui:${process.pid}`, targetId);
     backgroundJobs.setSessionId(targetId);
-    selfHealthLine = null;
     const statusSources = await import('../tui-client/local-chat-turn.js');
-    observeSession(targetId, statusSources.onLocalChatBackgroundStatus, statusSources.onLocalChatSelfHealthStatus);
+    observeSession(targetId, statusSources.onLocalChatBackgroundStatus);
     goalContinue?.noteHumanTurn();
     lastResumeRows = null;
     expandedToolBlocks.clear();
     activity = [];
+    agents = [];
+    activeShellCalls.clear();
     streamingReply = '';
     scroll = 0;
     maxScroll = 0;
@@ -528,7 +749,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let restoreTuiStderrOwner: (() => void) | null = null;
 
   const refreshAtPicker = async (): Promise<void> => {
-    const query = editor.text.slice(0, editor.cursor).match(/(?:^|\s)@([\p{L}\p{N}_./~\\-]*)$/u);
+    const query = input.editor.text.slice(0, input.editor.cursor).match(/(?:^|\s)@([\p{L}\p{N}_./~\\-]*)$/u);
     if (!query) {
       atPicker = null;
       dismissedAtQuery = '';
@@ -536,7 +757,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       return;
     }
     const prefix = query[1] ?? '';
-    const start = editor.cursor - prefix.length - 1;
+    const start = input.editor.cursor - prefix.length - 1;
     const key = start + ':' + prefix;
     if (dismissedAtQuery === key) { atPicker = null; return; }
     if (!atPickerApi) {
@@ -544,50 +765,120 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       debug.log('tui.next', 'at-picker-module-loaded', { onDemand: true });
     }
     const candidates = await atPickerApi.listAtFiles(prefix, process.cwd());
-    atPicker = { query: { prefix, start, end: editor.cursor }, candidates, selected: 0 };
+    atPicker = { query: { prefix, start, end: input.editor.cursor }, candidates, selected: 0 };
     status = candidates.length ? '@ 파일 첨부 후보 · ↑↓ 선택 · Enter 추가' : '@ 파일 후보 없음 · 계속 입력';
+  };
+
+  const refreshSlashPicker = async (): Promise<void> => {
+    const draft = input.editor.text;
+    if (draft !== dismissedSlashDraft) dismissedSlashDraft = '';
+    if (input.editor.cursor !== draft.length || !/^\/[\w-]*$/.test(draft) || draft === dismissedSlashDraft) {
+      slashPicker = null;
+      if (status.startsWith('슬래시 명령')) status = 'Enter 전송 · Esc 취소 · Ctrl+Q 종료';
+      return;
+    }
+    const registry = await loadNextTuiRouteRegistry();
+    const candidates = nextSlashCandidates(draft, registry.NEXT_TUI_ROUTE_REGISTRY,
+      registry.NEXT_TUI_INPUT_CONTEXT, registry.resolveNextTuiRoute)
+      .map(({ text, description }) => ({ value: text, description }));
+    slashPicker = candidates.length ? { query: draft.slice(1), candidates, selected: 0 } : null;
+    slashNavigated = false;
+    if (candidates.length) status = '슬래시 명령 · ↑↓ 선택 · Tab 완성 · Esc 닫기';
   };
 
   /** Every busy path ends here: the door learns the turn is over, then the queue moves or returns to the prompt. */
   const settle = (): void => {
     wakeup?.gate.noteTurnSettled();
-    const count = queue.queuedSubmissions.length;
-    if (interrupted) {
-      interrupted = false;
-      if (count === 0) return;
-      const drained = drainTurnTypeaheadOnce(queue, editor.text || null, { interrupted: true });
-      queue = drained.state;
-      editor = createInlineEditorState(drained.nextInitial ?? '');
-      status = `응답 취소됨 · 대기 ${count}건을 입력칸으로 · Enter 전송`;
-      debug.log('tui.next', 'queue-restored', { count });
-      return;
-    }
-    if (count > 0) injectKey(queueWake);
+    const result = queue.settle(input.editor.text);
+    if (result.kind === 'restore') {
+      input.setText(result.text);
+      input.clearHistory();
+      status = `응답 취소됨 · 대기 ${result.count}건을 입력칸으로 · Enter 전송`;
+      debug.log('tui.next', 'queue-restored', { count: result.count });
+    } else if (result.kind === 'wake') injectKey(queueWake);
   };
 
   /** Sends the head of the queue through the ordinary idle submit path (slash commands included). */
   const dispatchQueued = (): void => {
-    const { handoff, state } = dequeueTurnTypeaheadHandoff(queue);
+    const handoff = queue.dequeue();
     if (handoff.kind !== 'submit') return;
-    queue = state;
     // 대기열에서 나가는 것도 사람이 쳐 둔 턴이다 — 골 이어가기의 연속·지문을 비운다(r3 must-fix).
     goalContinue?.noteHumanTurn();
-    restoreDraft = editor.text;
-    editor = createInlineEditorState(handoff.text);
+    restoreDraft = input.editor.text;
+    input.setText(handoff.text);
     focus = 'input';
-    historyIndex = 0;
-    debug.log('tui.next', 'queue-dispatched', { length: handoff.text.length, remaining: queue.queuedSubmissions.length });
+    input.clearHistory();
+    debug.log('tui.next', 'queue-dispatched', { length: handoff.text.length, remaining: handoff.remaining });
     replay.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  };
+
+  /** Apply the execution-side snapshot captured when Esc was pressed. */
+  const applyShellEscDecision = (): void => {
+    shellEscSnapshotPending = false;
+    const shellDecision = nextTuiShellEscDecision(activeShellCalls, monotonicNowMs());
+    if (shellDecision !== 'confirm') {
+      turnAbort?.abort();
+      queue.markInterrupted();
+      status = '응답 취소 중';
+    } else {
+      stopConfirmationSelection = 1;
+      stopConfirmationKind = shellDecision === 'confirm' ? 'long-shell' : 'turn';
+      status = shellDecision === 'confirm' ? '긴 셸 명령 중단 확인 · 기본 N' : '응답 중단 확인 · 기본 N';
+    }
+    render();
+  };
+
+  const applyPushNowDecision = (requestId: string, outcome: 'ready' | 'interrupted' | 'deferred', activeTools: string[]): void => {
+    if (requestId !== pushNowRequestId) return;
+    if (outcome === 'ready') {
+      if (!busy || queue.count === 0 || pushNowPhase !== 'checking') {
+        pushNowSnapshotPending = false;
+        pushNowRequestId = null;
+        pushNowPhase = null;
+        return;
+      }
+      pushNowPhase = 'committing';
+      if (pushNowCommit.current?.(requestId) !== true) {
+        pushNowSnapshotPending = false;
+        pushNowRequestId = null;
+        pushNowPhase = null;
+        status = '도구 상태 확인 불가 · 대기 입력 유지';
+      }
+      render();
+      return;
+    }
+    pushNowSnapshotPending = false;
+    pushNowRequestId = null;
+    // The child has committed an interrupt, but the turn can still emit events until it settles.
+    if (outcome !== 'interrupted') pushNowPhase = null;
+    if (!busy || queue.count === 0) return;
+    if (outcome === 'deferred') {
+      status = `⏳ 실행 중인 도구 ${safeStatusText([...new Set(activeTools)].join(', '))} 뒤에 대기 입력 전송`;
+      debug.log('tui.next', 'queue-push-now', { count: queue.count, action: 'deferred', tools: activeTools, requestId });
+    } else {
+      turnAbort?.abort();
+      status = '⚡ 지금 밀어 넣기 · 대기 입력 전송 중';
+      debug.log('tui.next', 'queue-push-now', { count: queue.count, action: 'interrupt', requestId });
+    }
+    render();
   };
 
   /** One chat turn on the shared REPL child — a person's submit, or an internal turn the door opened (banner). */
   const startChatTurn = (turnText: string, banner?: string): void => {
     activity = [];
+    agents = [];
+    activeShellCalls.clear();
+    activeToolCalls.clear();
+    stopConfirmationSelection = null;
+    stopConfirmationKind = null;
+    pushNowSnapshotPending = false;
+    pushNowRequestId = null;
+    pushNowPhase = null;
     streamingReply = '';
-    streamRenderAt = 0;
     const attachments = [...atAttachmentTokens].filter(([token]) => turnText.includes(token)).map(([, path]) => path);
     if (!id) {
       id = createSession({ source: 'tui' }).id;
+      restoreMessageBlockSession(id);
       setActiveSessionId(id);
       session = loadSession(id);
       backgroundJobs.setSessionId(id);
@@ -605,91 +896,114 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     if (banner && !internalTurnOriginOfText(turnText)) pushNotice(banner);
     status = banner ? `${safeStatusText(banner)} · 응답 중 · Esc 취소` : '응답 중 · Esc 취소';
     dashboardRuntime.beginTurnStartSegments(turnSessionId);
-    // «압축 N→M 메시지» stays on the status line through the reply when this turn compacted first.
-    let compactNote = '';
-    turnFailed = false;
     // 이번 턴이 만든 답만 골 이어가기 판정에 쓴다 — 시작 때 세션 길이를 잡아 둔다.
     const messagesAtTurnStart = messages.length;
-    // 이번 턴에 자동 압축이 있었나 — 있으면 길이 기준이 깨지므로 «마지막 사람 글 뒤» 로 판정한다.
-    let turnCompacted = false;
-    let turnGoalComplete = false;
-    let turnGoalStopReason: string | undefined;
-    const abort = new AbortController();
-    turnAbort = abort;
-    turnDone = import('../tui-client/local-chat-turn.js')
-      .then(({ runLocalChatTurn, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus }) => {
-        observeSession(turnSessionId, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus);
-        let firstResponseSeen = false;
-        return runLocalChatTurn(turnSessionId, turnText, abort.signal, undefined, undefined, (delta, replace = false) => {
-          // 스트림 텍스트 = 진전 신호 — 마지막 진전 시각을 올린다(녹음기 없으면 아무 일도 안 한다).
-          reportTuiProgress();
-          // 첫 응답 경계: 첫 스트림 델타에서 턴 시작 트레이스를 닫는다(endedBy=stream-open).
-          if (!firstResponseSeen) {
-            firstResponseSeen = true;
-            dashboardRuntime.endTurnStartSegments(turnSessionId, 'stream-open');
-          }
-          // The first model token is visible while the turn runs. Once the core
-          // replaces that provisional answer, let the persisted final message
-          // become canonical instead of showing the same answer in both layers.
-          if (replace) {
-            streamingReply = '';
-            activity = [];
-            if (streamRenderTimer !== null) clearTimeout(streamRenderTimer);
-            streamRenderTimer = null;
-            streamRenderAt = performance.now();
+    const turn = startNextTuiTurn({ sessionId: turnSessionId, text: turnText }, {
+      run: async ({ sessionId, text, signal }, onDelta, onCompact, onNotice, onAgent, onStatus, onMessageBlock) => {
+        const { runLocalChatTurn, onLocalChatBackgroundStatus, requestLocalChatShellActivitySnapshot, requestLocalChatPushNow, commitLocalChatPushNow } = await import('../tui-client/local-chat-turn.js');
+        shellActivitySnapshotRequest.current = () => requestLocalChatShellActivitySnapshot(sessionId);
+        pushNowRequest.current = (requestId) => requestLocalChatPushNow(sessionId, requestId);
+        pushNowCommit.current = (requestId) => commitLocalChatPushNow(sessionId, requestId);
+        observeSession(sessionId, onLocalChatBackgroundStatus);
+        return runLocalChatTurn(sessionId, text, signal, undefined, undefined, onDelta,
+          { onCompact: (outcome) => onCompact(outcome.status ?? ''), onMessageBlock }, attachments, onStatus, onAgent,
+          (event) => {
+            if (event.phase === 'snapshot') {
+              activeShellCalls.clear();
+              for (const call of event.calls) activeShellCalls.set(call.id, { name: call.name, startedAtMonotonicMs: call.startedAtMonotonicMs });
+              if (shellEscSnapshotPending) applyShellEscDecision();
+              else render();
+              return;
+            }
+            if (event.phase === 'start') {
+              activeShellCalls.set(event.id, { name: event.name, startedAtMonotonicMs: event.startedAtMonotonicMs });
+              status = `${event.name} 실행 중 · Esc 취소`;
+            } else {
+              activeShellCalls.delete(event.id);
+              status = '응답 중 · Esc 취소';
+            }
             render();
-            return;
-          } else {
-            streamingReply = (streamingReply + delta).slice(-32_768);
-            activity = streamReplyLines(streamingReply, process.stdout.columns || 80);
-          }
-          const now = performance.now();
-          if (streamRenderAt === 0 || now - streamRenderAt >= 33) {
-            streamRenderAt = now;
-            render();
-          } else if (streamRenderTimer === null) {
-            streamRenderTimer = setTimeout(() => {
-              streamRenderTimer = null;
-              streamRenderAt = performance.now();
+          }, (event) => {
+            if (event.phase === 'snapshot') {
+              activeToolCalls.clear();
+              for (const call of event.calls) activeToolCalls.set(call.id, call.name);
+            } else if (event.phase === 'start') activeToolCalls.set(event.id, event.name);
+            else activeToolCalls.delete(event.id);
+            // The execution-side set decides interruption; this mirror shows live non-shell work.
+            const nonShellTools = [...new Set([...activeToolCalls.values()].filter((name) => name !== 'Bash' && name !== 'RunShell'))];
+            if (nonShellTools.length > 0) {
+              status = `실행 중인 도구 ${safeStatusText(nonShellTools.join(', '))} · Esc 취소`;
               render();
-            }, 33 - (now - streamRenderAt));
-          }
-        }, {
-          onCompact: (outcome) => {
-            compactNote = outcome.status ? `${outcome.status} · ` : '';
-            turnCompacted = true;
-            status = `${compactNote}응답 중 · Esc 취소`;
-            session = loadSession(turnSessionId);
-            messages = session?.messages ?? [];
-            expandedToolBlocks.clear();
-            render();
-          },
-        }, attachments, (line) => {
-          pushNotice(line);
-          render();
-        }).then((result) => {
-          turnGoalComplete = result?.goalComplete === true;
-          turnGoalStopReason = result?.goalStopReason;
-        });
-      })
-      .then(() => {
-        status = turnGoalStopReason === 'max_turns'
-          ? 'Turn cap reached — continue with your next input'
-          : `${compactNote}응답 완료 · Enter 전송 · Ctrl+Q 종료`;
-      })
-      .catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        turnFailed = true;
-        status = compactNote + (message === '응답을 취소했습니다'
-          ? '응답 취소됨 · Enter 전송'
-          : `응답 실패: ${safeStatusText(message)}`);
-      })
-      .finally(async () => {
-        if (streamRenderTimer !== null) clearTimeout(streamRenderTimer);
-        streamRenderTimer = null;
+            } else if (event.phase === 'finish' && event.name !== 'Bash' && event.name !== 'RunShell') {
+              status = '응답 중 · Esc 취소';
+              render();
+            }
+          }, (event) => applyPushNowDecision(event.requestId, event.outcome, event.activeTools));
+      },
+      onProgress: reportTuiProgress,
+      onStreamOpen: () => dashboardRuntime.endTurnStartSegments(turnSessionId, 'stream-open'),
+      onPreview: (preview) => {
+        streamingReply = preview;
+        activity = preview ? streamReplyLines(preview, process.stdout.columns || 80) : [];
+        render();
+      },
+      onCompact: (compactStatus) => {
+        status = `${compactStatus ? `${compactStatus} · ` : ''}응답 중 · Esc 취소`;
         session = loadSession(turnSessionId);
         messages = session?.messages ?? [];
-        activity = [];
+        expandedToolBlocks.clear();
+        render();
+      },
+      onNotice: (line) => { pushNotice(line); render(); },
+      onStatus: (line) => {
+        if (isNextTuiContextCountStatus(line)) return;
+        status = safeStatusText(line);
+        render();
+      },
+      onAgent: (event) => {
+        agents = applyAgentEvent(agents, event);
+        reportTuiProgress();
+        render();
+      },
+      onMessageBlock: (block) => {
+        const state = messageBlockSessions.restore(turnSessionId);
+        upsertMessageBlock(state, block, Math.max(0, messagesAtTurnStart));
+        messageBlockSessions.save(turnSessionId, state);
+        if (id === turnSessionId) {
+          session = loadSession(turnSessionId);
+          messages = session?.messages ?? messages;
+          messageBlocks = state.blocks;
+          messageBlockLevels = state.levels;
+          messageBlockRawTexts = state.rawTexts;
+          messageBlockAfterMessageIndexes = state.afterMessageIndexes;
+        }
+        reportTuiProgress();
+        if (id === turnSessionId) render();
+      },
+      onSettled: async (outcome) => {
+        pendingEcho = null;
+        stopConfirmationSelection = null;
+        stopConfirmationKind = null;
+        activeShellCalls.clear();
+        activeToolCalls.clear();
+        shellActivitySnapshotRequest.current = null;
+        pushNowCommit.current = null;
+        pushNowRequest.current = null;
+        shellEscSnapshotPending = false;
+        pushNowSnapshotPending = false;
+        pushNowRequestId = null;
+        pushNowPhase = null;
+        const compactNote = outcome.compactNote ? `${outcome.compactNote} · ` : '';
+        status = outcome.kind === 'cancelled' ? `${compactNote}응답 취소됨 · Enter 전송`
+          : outcome.kind === 'failed' ? `${compactNote}응답 실패 · ↑ 이전 입력 후 Enter 재시도`
+            : outcome.goalStopReason === 'max_turns' ? 'Turn cap reached — continue with your next input'
+              : `${compactNote}응답 완료 · Enter 전송 · Ctrl+Q 종료`;
+        session = loadSession(turnSessionId);
+        messages = session?.messages ?? [];
+        activity = outcome.kind === 'failed'
+          ? [`✘ 응답 실패: ${safeStatusText(outcome.error ?? 'unknown error')}`,
+            '다음 행동: ↑ 이전 입력 · Enter 재시도 · 반복되면 /new']
+          : [];
         streamingReply = '';
         busy = false;
         turnAbort = null;
@@ -703,19 +1017,15 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             debug.log('tui.goal-interim', 'folded', { surface: 'next', ...shown });
           }
         } catch { /* fail-soft: 관측은 턴 정리를 막지 않는다 */ }
-        // Goal completion is terminal even when the person has already drafted the next input.
-        // A real submitted turn calls noteHumanTurn and clears this terminal state.
-        if (goalContinue && turnGoalComplete) goalContinue.noteGoalCompleted();
-        // 사람이 쌓아 둔 다음 입력이 먼저다 — 대기열이 비었을 때만 골 이어가기를 잰다.
-        if (goalContinue && queue.queuedSubmissions.length === 0 && editor.text.length === 0) {
+        const auto = decideNextTuiAutoContinue(outcome, queue.count, input.editor.text);
+        if (goalContinue && auto === 'complete') goalContinue.noteGoalCompleted();
+        if (goalContinue && auto === 'check') {
           try {
-            if (!turnGoalComplete) {
-              goalContinue.noteTurnEnded({ lines: dashboardRuntime.replyLinesOfThisTurn(messages, turnCompacted ? 'after-last-user' : messagesAtTurnStart), failed: turnFailed || interrupted });
-              goalContinue.check();
-            }
+            goalContinue.noteTurnEnded({ lines: dashboardRuntime.replyLinesOfThisTurn(messages, outcome.compacted ? 'after-last-user' : messagesAtTurnStart), failed: outcome.kind === 'failed' });
+            goalContinue.check();
           } catch { /* fail-soft: 골 이어가기는 턴 정리를 막지 않는다 */ }
-        } else if (goalContinue && (queue.queuedSubmissions.length > 0 || editor.text.length > 0)) {
-          debug.log('tui.proactive', 'yield-user-input', { queued: queue.queuedSubmissions.length, bufferedChars: editor.text.length });
+        } else if (goalContinue && auto === 'yield') {
+          debug.log('tui.proactive', 'yield-user-input', { queued: queue.count, bufferedChars: input.editor.text.length });
         }
         const switchAfterTurn = pendingSidetabSwitch;
         pendingSidetabSwitch = null;
@@ -730,7 +1040,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             reportTuiTurn('idle');
           }
         }
-      });
+      },
+    });
+    turnAbort = turn.controller;
+    turnDone = turn.done.then(() => {});
   };
 
   if (sidetabOpen) {
@@ -744,6 +1057,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       render();
     }, 1_000);
   }
+  // Load the route table before accepting Enter so the first echo has no import wait.
+  await loadNextTuiRouteRegistry();
   initTui();
   const { installTuiStderrOwner } = await import('../surface/tui-stderr-owner.js');
   restoreTuiStderrOwner = installTuiStderrOwner((line) => {
@@ -771,17 +1086,49 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   try {
     {
       const { createNextTuiWakeup, setNextTuiWakeupTool } = await import('../tui-client/next-wakeup.js');
-      const { setNextSidetabHandler, setNextSidetabIpcEnabled } = await import('../tui-client/local-chat-turn.js');
+      const { setNextSidetabHandler, setNextSidetabIpcEnabled, setNextTuiShellApprovalHandler, setNextTuiShellApprovalCancelHandler } = await import('../tui-client/local-chat-turn.js');
       const { createNextSidetabHostHandler } = await import('./sidetab/nl-tool.js');
       setNextSidetabIpcEnabled(true);
       wakeup = createNextTuiWakeup({
         isTurnRunning: () => busy,
-        getBufferText: () => editor.text,
-        getQueuedCount: () => queue.queuedSubmissions.length,
+        getBufferText: () => input.editor.text,
+        getQueuedCount: () => queue.count,
         requestYield: () => injectKey(internalWake),
         notify: (line) => { pushNotice(line); render(); },
       });
       setNextTuiWakeupTool(wakeup.tool);
+      setNextTuiShellApprovalHandler((command, callId) => new Promise<boolean>((resolve) => {
+        if (shellApprovalPrompt.current) { resolve(false); return; }
+        const pending = { callId, command, scroll: 0, timer: null as ReturnType<typeof setTimeout> | null, resolve };
+        shellApprovalPrompt.current = pending;
+        pending.timer = setTimeout(() => {
+          if (shellApprovalPrompt.current !== pending) return;
+          shellApprovalPrompt.current = null;
+          status = 'Bash 승인 시간 초과 · 거부됨';
+          resolve(false);
+          render();
+        }, Math.max(1, Math.min(options.shellApprovalTimeoutMs ?? NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS - 1_000,
+          NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS - 1_000)));
+        status = 'Bash 실행 승인 필요 · 기본 N';
+        render();
+      }));
+      setNextTuiShellApprovalCancelHandler((callId, reason) => {
+        const active = shellApprovalPrompt.current;
+        const message = reason === 'timeout' ? 'Bash 승인 시간 초과 · 거부됨' : 'Bash 승인 취소됨 · 거부됨';
+        if (active?.callId === callId) {
+          shellApprovalPrompt.current = null;
+          if (active.timer) clearTimeout(active.timer);
+          lastResolvedShellApprovalCallId = callId;
+          status = message;
+          active.resolve(false);
+          render();
+        } else if (lastResolvedShellApprovalCallId === callId) {
+          // The child may time out while the host is processing a delayed reply.
+          // Keep the final visible state fail-closed for this exact request.
+          status = message;
+          render();
+        }
+      });
       setNextSidetabHandler(createNextSidetabHostHandler({
         rows: async () => { if (!sidetabApi) sidetabApi = await import('./sidetab/list.js'); refreshSidetabRows(); return sidetabRows; },
         selected: () => sidetabSelected,
@@ -869,18 +1216,42 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       const replayed = replay.shift();
       const rawKey = replayed ?? await readKey();
       // TUI-PASTE-ECHO — 긴 붙여넣기는 입력창에 자리표시 한 덩어리로(제출 때 원문으로 되돌린다).
-      let key: Key = rawKey.name === 'paste' && typeof rawKey.paste === 'string' ? { ...rawKey, paste: pasteFold.fold(rawKey.paste) } : rawKey;
-      // Ctrl+V — 클립보드 글을 같은 붙여넣기 규칙으로(예전엔 next 가 Ctrl 글자를 버려 아무 일도 없었다).
+      let key: Key = input.foldKey(rawKey);
+      // Ctrl+V shares classic's image-first, text-fallback contract; bracketed file/path paste remains unchanged.
       if (key.ctrl && (key.name === 'v' || key.name === 'V' || key.name === 'ㅍ') && focus === 'input') {
-        const { readClipboardText } = await import('../clipboard/index.js');
-        const clip = await readClipboardText().catch(() => null);
-        debug.log('tui.paste', 'clipboard-read', { surface: 'next', chars: clip?.length ?? 0 });
-        if (!clip) {
-          status = '클립보드에 붙여넣을 글이 없습니다 · Enter 전송';
+        const pasted = await readClipboardPaste({
+          hasImage: hasClipboardImage,
+          attachImage: async () => {
+            const registered = await registerClipboardImageAttachment(clipboardAttachments);
+            if (!registered) return null;
+            const { attachment, isNew } = registered;
+            atAttachmentTokens.set(attachment.token, attachment.sourcePath);
+            await refreshVisibleContextAttachmentArea();
+            debug.log('tui.paste', 'image-attached', {
+              surface: 'next', filename: attachment.filename, reused: !isNew,
+            });
+            return `${attachment.token} `;
+          },
+          readText: readClipboardText,
+        });
+        if (pasted.kind === 'image') {
+          input.setEditor(inlineEditorInsert(input.editor, pasted.value));
+          input.clearHistory();
           render();
           continue;
         }
-        key = { name: 'paste', ctrl: false, shift: false, raw: '', paste: pasteFold.fold(clip) };
+        const clip = pasted.kind === 'text' ? pasted.text : null;
+        debug.log('tui.paste', 'clipboard-read', {
+          surface: 'next', chars: clip?.length ?? 0, image: pasted.imageDetected,
+        });
+        if (!clip) {
+          status = pasted.imageDetected
+            ? '클립보드 이미지를 첨부하지 못했습니다 · 다시 시도'
+            : '클립보드에 붙여넣을 글이 없습니다 · Enter 전송';
+          render();
+          continue;
+        }
+        key = { name: 'paste', ctrl: false, shift: false, raw: '', paste: input.foldPaste(clip) };
       }
       if (key === queueWake) {
         if (!busy) dispatchQueued();
@@ -889,7 +1260,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       }
       if (key === internalWake) {
         // The door opened while idle; a person who got here first (a turn, a typed prompt) withdraws it.
-        if (busy || editor.text.length > 0) wakeup?.gate.port.declined?.(busy ? 'turn-running' : 'buffer');
+        if (busy || input.editor.text.length > 0) wakeup?.gate.port.declined?.(busy ? 'turn-running' : 'buffer');
         else {
           const request = wakeup?.gate.takePending();
           if (request) startChatTurn(request.input, wakeup!.banner(request));
@@ -917,7 +1288,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         if (step.kind === 'mouse') {
           // The ESC that led this report already ran as Escape; undo its prompt effect.
           // An aborted turn cannot be undone, so its "cancelling" status stays truthful.
-          if (escapeSnapshot && !escapeSnapshot.busy) ({ editor, status, focus } = escapeSnapshot);
+          if (escapeSnapshot && !escapeSnapshot.busy) {
+            input.setEditor(escapeSnapshot.editor);
+            status = escapeSnapshot.status;
+            focus = escapeSnapshot.focus;
+          }
           escapeSnapshot = null;
           if (step.wheel) scroll = wheelScroll(scroll, step.wheel, maxScroll);
           render();
@@ -925,12 +1300,13 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }
         if (key === residueWake) continue;
         if (key.name === 'escape' && key.raw === '\x1b') {
-          escapeSnapshot = { editor, status, focus, busy };
+          escapeSnapshot = { editor: input.editor, status, focus, busy };
           mouseResidue.arm(Date.now());
         } else {
           escapeSnapshot = null;
         }
       }
+      if (welcomePending) welcomePending = false;
       if (sidetabChordPending) {
         sidetabChordPending = false;
         if (sidetabChordTimer !== null) clearTimeout(sidetabChordTimer);
@@ -1005,6 +1381,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         continue;
       }
       if (key.name === 'mouse' && key.mouse?.type === 'click') {
+        let panelClick = false;
         if (sidetabOpen && sidetabMode === 'list' && !sidetabAttachments?.hasRemoteView() && !sidetabAttachments?.hasModal()) {
           const panelWidth = sidetabApi!.sidetabWidthForTerminal(process.stdout.columns || 0);
           if (key.mouse.col <= panelWidth) {
@@ -1017,12 +1394,72 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             if (index !== null) {
               await selectSidetabIndex(index);
             }
+            panelClick = true;
+          }
+        }
+        if (!panelClick && !sidetabAttachments?.hasModal() && !sidetabAttachments?.hasRemoteView()) {
+          const target = foldTargetAtScreenRow(logWindow.foldTargets, logWindow, key.mouse.row);
+          if (target) {
+            focus = 'log';
+            lastFoldTargetKey = target.kind === 'message' ? `message:${target.id}` : `tool:${target.index}`;
+            if (target.kind === 'message') {
+              const block = messageBlocks.find((candidate) => candidate.id === target.id);
+              if (block) messageBlockLevels.set(block.id, (messageBlockLevels.get(block.id) ?? 0) === 0 ? 1 : 0);
+            } else if (expandedToolBlocks.has(target.index)) expandedToolBlocks.delete(target.index);
+            else expandedToolBlocks.add(target.index);
+            saveMessageBlockSession();
           }
         }
         render();
         continue;
       }
       if (sidetabAttachments?.handleKey(key)) {
+        render();
+        continue;
+      }
+      const activeShellApproval = shellApprovalPrompt.current;
+      if (activeShellApproval) {
+        const decision = applyShellApprovalKey(key.name, key);
+        if (decision.kind === 'pending') {
+          if (key.name === 'up' || key.name === 'down') {
+            const terminalColumns = Math.max(1, process.stdout.columns || 1);
+            const sidetabWidth = sidetabOpen && sidetabApi ? sidetabApi.sidetabWidthForTerminal(terminalColumns) : 0;
+            const viewport = shellApprovalCommandViewport(activeShellApproval.command, terminalColumns, sidetabWidth,
+              process.stdout.rows || 6, activeShellApproval.scroll);
+            activeShellApproval.scroll = Math.max(0, Math.min(
+              Math.max(0, viewport.lines.length - viewport.pageSize), viewport.scroll + (key.name === 'down' ? 1 : -1),
+            ));
+          }
+        } else {
+          shellApprovalPrompt.current = null;
+          const pending = activeShellApproval;
+          if (pending.timer) clearTimeout(pending.timer);
+          lastResolvedShellApprovalCallId = pending.callId;
+          status = decision.approved ? 'Bash 명령 승인됨' : 'Bash 명령 거부됨';
+          pending.resolve(decision.approved);
+        }
+        render();
+        continue;
+      }
+      if (stopConfirmationSelection !== null) {
+        if (key.name === 'escape') {
+          const confirmationKind = stopConfirmationKind;
+          stopConfirmationSelection = null;
+          stopConfirmationKind = null;
+          status = confirmationKind === 'long-shell' ? '긴 셸 명령 계속 실행 · Esc 취소' : '응답 중 · Esc 취소';
+        } else if (key.name === 'up' || key.name === 'down') {
+          stopConfirmationSelection = stopConfirmationSelection === 0 ? 1 : 0;
+        } else if (key.name === 'y' || key.name === 'n' || key.name === 'enter' || key.name === 'return') {
+          const stop = key.name === 'y' || ((key.name === 'enter' || key.name === 'return') && stopConfirmationSelection === 0);
+          const confirmationKind = stopConfirmationKind;
+          stopConfirmationSelection = null;
+          stopConfirmationKind = null;
+          if (stop) {
+            turnAbort?.abort();
+            queue.markInterrupted();
+            status = '응답 취소 중';
+          } else status = confirmationKind === 'long-shell' ? '긴 셸 명령 계속 실행 · Esc 취소' : '응답 중 · Esc 취소';
+        }
         render();
         continue;
       }
@@ -1047,7 +1484,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
         continue;
       }
-      if (sidetabOpen && sidetabMode === 'new') {
+      if (sidetabOpen && (sidetabMode as 'list' | 'new') === 'new') {
         if (key.name === 'escape') {
           sidetabMode = 'list';
         } else {
@@ -1076,7 +1513,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         render();
         continue;
       }
-      if (sidetabOpen && editor.text.length === 0 && key.name === 'enter') {
+      if (sidetabOpen && input.editor.text.length === 0 && key.name === 'enter') {
         const selected = sidetabRows[sidetabSelected];
         if (selected) {
           if (toggleWorkspaceRow(selected)) {
@@ -1092,8 +1529,20 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         continue;
       }
       if (busy && (key.name === 'escape' || (key.ctrl && key.name === 'c'))) {
+        if (key.name === 'escape') {
+          if (shellEscSnapshotPending) continue;
+          shellEscSnapshotPending = true;
+          if (shellActivitySnapshotRequest.current?.()) {
+            status = '셸 실행 상태 확인 중 · Esc';
+            render();
+            continue;
+          }
+          shellEscSnapshotPending = false;
+          applyShellEscDecision();
+          continue;
+        }
         turnAbort?.abort();
-        interrupted = true;
+        queue.markInterrupted();
         status = '응답 취소 중';
         render();
         continue;
@@ -1103,17 +1552,53 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         await turnDone;
         break;
       }
+      if (!busy && focus === 'input' && !atPicker && !slashPicker && !shellApprovalPrompt.current
+        && contextAttachmentScrollMax > 0
+        && ((key.name === 'pageup' && contextAttachmentScroll > 0)
+          || (key.name === 'pagedown' && contextAttachmentScroll < contextAttachmentScrollMax))) {
+        const delta = key.name === 'pageup' ? -contextAttachmentScrollStep : contextAttachmentScrollStep;
+        contextAttachmentScroll = Math.max(0, Math.min(contextAttachmentScrollMax, contextAttachmentScroll + delta));
+        render();
+        continue;
+      }
       if (key.name === 'pageup' || key.name === 'pagedown') {
         focus = 'log';
         scroll = Math.max(0, scroll + (key.name === 'pageup' ? 10 : -10));
         render();
         continue;
       }
-      // TUI-NEXT-FOLD — Enter/Tab (or F) in the log expands/folds the long tool block visible in the
-      // current scroll window (nearest the bottom). With none on screen the key keeps its ordinary meaning.
-      if (focus === 'log' && isToolFoldToggleKey(key.name) && toggleVisibleToolFold(expandedToolBlocks, messages, logWindow.columns, logWindow)) {
-        render();
-        continue;
+      // TUI-NEXT-FOLD — Enter/Space fold MessageBlocks; Tab/F still step through detail levels.
+      if (focus === 'log' && (isToolFoldToggleKey(key.name) || key.name === 'space')) {
+        const visibleTargets = logWindow.foldTargets.filter((candidate) => candidate.end >= logWindow.start
+          && candidate.start < logWindow.start + logWindow.rows);
+        const targetKey = (candidate: typeof visibleTargets[number]): string => candidate.kind === 'message' ? `message:${candidate.id}` : `tool:${candidate.index}`;
+        const target = nextVisibleFoldTarget(visibleTargets, messageBlocks, messageBlockLevels, lastFoldTargetKey);
+        if (target?.kind === 'message') {
+          lastFoldTargetKey = targetKey(target);
+          const block = messageBlocks.find((candidate) => candidate.id === target.id);
+          if (block) {
+            const current = messageBlockLevels.get(block.id) ?? 0;
+            messageBlockLevels.set(block.id, nextMessageBlockDetailLevel(block, current));
+          }
+          const expanded = block && messageBlockLevels.get(block.id) === 3 && block.detail?.rawRef ? block : undefined;
+          if (expanded?.detail?.rawRef && !messageBlockRawTexts.has(expanded.id)) {
+            const trace = resolveMessageBlockRawTrace(loadSession(id!)?.messages ?? [], expanded);
+            if (trace) {
+              messageBlockRawTexts.set(expanded.id, formatMessageBlockRawTrace(trace));
+              saveMessageBlockSession();
+            }
+          }
+          saveMessageBlockSession();
+          render();
+          continue;
+        }
+        if (target?.kind === 'tool') {
+          lastFoldTargetKey = targetKey(target);
+          if (expandedToolBlocks.has(target.index)) expandedToolBlocks.delete(target.index);
+          else expandedToolBlocks.add(target.index);
+          render();
+          continue;
+        }
       }
       if (focus === 'log' && (key.name === 'up' || key.name === 'down')) {
         scroll = Math.max(0, scroll + (key.name === 'up' ? 1 : -1));
@@ -1139,11 +1624,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
-        if ((key.name === 'enter' || key.name === 'return') && !key.shift && activeAtPicker.candidates[activeAtPicker.selected]) {
+        if ((key.name === 'enter' || key.name === 'return') && !key.shift && !key.alt && !key.ctrl && activeAtPicker.candidates[activeAtPicker.selected]) {
           const candidate = activeAtPicker.candidates[activeAtPicker.selected]!;
-          const picked = atPickerApi!.acceptAtFile(editor.text, activeAtPicker.query, candidate, ++atAttachmentOrdinal);
-          editor = { text: picked.text, cursor: picked.cursor };
+          const picked = atPickerApi!.acceptAtFile(input.editor.text, activeAtPicker.query, candidate, ++atAttachmentOrdinal);
+          input.setEditor({ text: picked.text, cursor: picked.cursor });
           atAttachmentTokens.set(picked.token, candidate.absPath);
+          await refreshVisibleContextAttachmentArea();
           atPicker = null;
           dismissedAtQuery = '';
           status = '파일 첨부 추가됨 · Enter 전송';
@@ -1152,9 +1638,76 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           continue;
         }
       }
+      const activeSlashPicker = slashPicker as { query: string; candidates: SlashPickerCandidate[]; selected: number } | null;
+      let selectedSlashCommand: string | null = null;
+      if (!busy && focus === 'input' && activeSlashPicker && slashPickerVisible) {
+        if (key.name === 'escape') {
+          dismissedSlashDraft = input.editor.text;
+          slashPicker = null;
+          slashNavigated = false;
+          render();
+          continue;
+        }
+        if ((key.name === 'up' || key.name === 'down') && activeSlashPicker.candidates.length > 0) {
+          activeSlashPicker.selected = (activeSlashPicker.selected + (key.name === 'up' ? -1 : 1) + activeSlashPicker.candidates.length) % activeSlashPicker.candidates.length;
+          slashNavigated = true;
+          render();
+          continue;
+        }
+        if (key.name === 'tab' && !key.shift && activeSlashPicker.candidates[activeSlashPicker.selected]) {
+          input.setText(`${activeSlashPicker.candidates[activeSlashPicker.selected]!.value} `);
+          slashPicker = null;
+          slashNavigated = false;
+          status = '명령 완성 · Enter 전송';
+          render();
+          continue;
+        }
+        if ((key.name === 'enter' || key.name === 'return') && !key.shift && !key.alt && !key.ctrl && slashNavigated && activeSlashPicker.candidates[activeSlashPicker.selected]) {
+          selectedSlashCommand = activeSlashPicker.candidates[activeSlashPicker.selected]!.value;
+          slashPicker = null;
+          slashNavigated = false;
+        }
+      }
       if (busy) {
-        const pending = applyComposerKey(editor, key);
-        editor = pending.state;
+        if (key.name === 'up' && key.ctrl && !key.alt && !key.shift && !key.meta) {
+          if (pushNowCommitting()) {
+            status = '지금 제출 중 · 응답 전환 뒤 입력 가능';
+            render();
+            continue;
+          }
+          // A pending probe has no authority to abort after this recall.
+          pushNowSnapshotPending = false;
+          pushNowRequestId = null;
+          pushNowPhase = null;
+          const recalled = queue.recall(input.editor.text);
+          if (recalled) {
+            input.setText(recalled.text);
+            input.clearHistory();
+            status = `대기 ${recalled.count}건을 입력칸으로 · 응답 중`;
+            debug.log('tui.next', 'queue-recalled', { count: recalled.count });
+          }
+          render();
+          continue;
+        }
+        if ((key.name === 'enter' || key.name === 'return') && !key.shift && !key.ctrl && !key.alt
+          && input.editor.text.trim().length === 0 && queue.count > 0) {
+          if (pushNowCommitting()) {
+            status = '지금 제출 중 · 응답 전환 뒤 입력 가능';
+            render();
+            continue;
+          }
+          // The child decides and aborts in one event-loop tick, before another tool can start.
+          if (!pushNowSnapshotPending) {
+            const requestId = `push-${++pushNowRequestSerial}`;
+            pushNowSnapshotPending = pushNowRequest.current?.(requestId) === true;
+            pushNowRequestId = pushNowSnapshotPending ? requestId : null;
+            pushNowPhase = pushNowSnapshotPending ? 'checking' : null;
+            status = pushNowSnapshotPending ? '도구 실행 상태 확인 중 · 대기 입력 유지' : '도구 상태 확인 불가 · 대기 입력 유지';
+          }
+          render();
+          continue;
+        }
+        const pending = input.applyKey(key, queue.pendingTexts);
         if (pending.action === 'submit' && pending.submitted) {
           const routeRegistry = await loadNextTuiRouteRegistry();
           const pendingRoute = routeRegistry.resolveNextTuiRoute(pending.submitted, routeRegistry.NEXT_TUI_INPUT_CONTEXT);
@@ -1183,64 +1736,108 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           }
           // Queued, not put back: it leaves on its own after this turn settles (herdr `pane run` and msg-wake
           // pastes arrive here too, so an outside prompt during a turn is kept, not lost).
-          queue = restoreTurnTypeaheadSubmission(queue, pending.submitted);
+          queue.enqueue(pending.submitted);
           status = '응답 중 · 완료 뒤 순서대로 전송 · Esc 취소';
-          debug.log('tui.next', 'queue-enqueued', { length: pending.submitted.length, count: queue.queuedSubmissions.length });
+          debug.log('tui.next', 'queue-enqueued', { length: pending.submitted.length, count: queue.count });
         }
         render();
         continue;
       }
       if (key.name === 'up' || key.name === 'down') {
         const prompts = messages.filter((message) => message.role === 'user').map((message) => message.content);
-        if (prompts.length === 0 || (key.name === 'down' && historyIndex === 0)) {
-          render();
-          continue;
-        }
-        if (key.name === 'up' && historyIndex === 0) draft = editor.text;
-        historyIndex = Math.max(0, Math.min(prompts.length, historyIndex + (key.name === 'up' ? 1 : -1)));
-        editor = createInlineEditorState(historyIndex === 0 ? draft : prompts[prompts.length - historyIndex]!);
+        input.browseHistory(key.name, prompts);
+        slashPicker = null;
         render();
         continue;
       }
       focus = 'input';
-      const result = applyComposerKey(editor, key);
-      editor = result.state;
-      if (result.action === 'edit') await refreshAtPicker();
-      else if (result.action === 'submit' || result.action === 'cancel' || result.action === 'quit') atPicker = null;
+      if (selectedSlashCommand !== null) input.setEditor(replaceSlashPickerQuery(input.editor, selectedSlashCommand));
+      const result = input.applyKey(key, queue.pendingTexts);
+      input.noteAction(result.action);
+      if (result.action === 'edit') {
+        await refreshAtPicker();
+        await refreshSlashPicker();
+      } else if (result.action === 'submit' || result.action === 'cancel' || result.action === 'quit') {
+        atPicker = null;
+        slashPicker = null;
+        slashNavigated = false;
+      }
       if (restoreDraft !== null) {
         // A queued submission just left through this Enter; what the person was typing comes back.
-        if (result.action === 'submit') editor = createInlineEditorState(restoreDraft);
+        if (result.action === 'submit') input.setText(restoreDraft);
         restoreDraft = null;
       }
-      if (result.action === 'edit' || result.action === 'cancel' || result.action === 'submit') historyIndex = 0;
       if (result.action === 'quit') break;
       if (result.action === 'cancel') {
         status = '입력 취소됨 · Enter 전송 · Ctrl+Q 종료';
-        pasteFold.retainOnly([editor.text, ...queue.queuedSubmissions.map(String)]);
+        input.retainLivePasteTokens([input.editor.text, ...queue.pendingTexts]);
       }
       if (result.action === 'submit' && result.submitted) {
-        const submittedFull = pasteFold.expand(result.submitted);
+        const submittedFull = input.expandSubmission(result.submitted, [input.editor.text, ...queue.pendingTexts]);
         // 지운 붙여넣기의 원문은 놓는다 — 입력칸·대기열에 남은 토큰만 쥔다(r3 must-fix).
-        pasteFold.retainOnly([editor.text, ...queue.queuedSubmissions.map(String)]);
+        input.retainLivePasteTokens([input.editor.text, ...queue.pendingTexts]);
         const submitted = submittedFull.trim();
+        if (submitted === '/tasks') {
+          const lines = backgroundJobs.taskLines();
+          activity = lines.length > 0 ? [`작업 ${lines.length}건 · /tasks stop <id 앞자리> 로 취소`] : ['배경 Agent 작업 없음'];
+          status = '작업 목록 · Enter 전송';
+          render();
+          continue;
+        }
+        if (submitted.startsWith('/tasks stop ')) {
+          const prefix = submitted.slice('/tasks stop '.length).trim();
+          const taskId = prefix.length >= 4 ? backgroundJobs.resolveTask(prefix) : null;
+          if (!taskId || !id) status = '작업 ID를 고유한 4자 이상 앞자리로 입력하세요';
+          else {
+            const { requestLocalChatTaskStop } = await import('../tui-client/local-chat-turn.js');
+            status = requestLocalChatTaskStop(id, taskId) ? `작업 ${backgroundJobs.displayTaskId(taskId)} 중단 요청` : '작업 중단 요청 실패';
+          }
+          render();
+          continue;
+        }
         const routeRegistry = await loadNextTuiRouteRegistry();
         const route = routeRegistry.resolveNextTuiRoute(submitted, routeRegistry.NEXT_TUI_INPUT_CONTEXT);
+        // Existing registry commands remain usable during a wizard confirmation.
+        // Ordinary text (including the wizard phrase itself) is still the wizard's answer.
+        if (pluginWizardFlow && (!route || route.id === 'plugin.wizard')) {
+          const turn = await pluginWizardFlow.answer(submitted);
+          if (turn.kind === 'confirmation-required') {
+            activity.push('저장 여부를 “네” 또는 “아니오”로 답해 주세요.');
+          } else {
+            if (turn.kind === 'saved') {
+              pluginWizardFlow = null;
+              activity.push(`플러그인 저장 완료: ${turn.id}`);
+            } else if (turn.kind === 'declined') {
+              pluginWizardFlow = null;
+              activity.push('플러그인 초안을 저장하지 않았습니다.');
+            } else if (turn.kind === 'error') activity.push(turn.message);
+          }
+          status = 'Enter 전송';
+          render();
+          continue;
+        }
+        if (!route && !submitted.startsWith('/')) {
+          pendingEcho = { role: 'user', content: submittedFull, ts: new Date().toISOString() };
+          pendingEchoStart = messages.length;
+          render();
+        }
         if (route?.action === 'quit') break;
         if (route?.id === 'session.new') {
+          pluginWizardFlow = null;
           const next = await requestNewTuiSession({ busy, from: id });
           if (next.kind === 'started') {
             (loopCommand as NextLoopCommand | null)?.run('stop');
             const previous = id;
             backgroundSubscription.stop?.();
             backgroundSubscription.stop = undefined;
-            selfHealthSubscription.stop?.();
-            selfHealthSubscription.stop = undefined;
-            selfHealthLine = null;
             if (previous) {
               const { closeLocalChatSession } = await import('../tui-client/local-chat-turn.js');
               await closeLocalChatSession(previous);
             }
+            saveMessageBlockSession();
             id = next.id;
+            restoreMessageBlockSession(id);
+            lastFoldTargetKey = null;
             lastResumeRows = null;
             session = loadSession(id);
             messages = [];
@@ -1251,7 +1848,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             streamingReply = '';
             scroll = 0;
             focus = 'input';
-            draft = '';
+            input.clearHistory();
           }
           status = next.status;
           render();
@@ -1304,14 +1901,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             const previous = id;
             backgroundSubscription.stop?.();
             backgroundSubscription.stop = undefined;
-            selfHealthSubscription.stop?.();
-            selfHealthSubscription.stop = undefined;
-            selfHealthLine = null;
             if (previous) {
               const { closeLocalChatSession } = await import('../tui-client/local-chat-turn.js');
               await closeLocalChatSession(previous);
             }
+            saveMessageBlockSession();
             id = next.id;
+            restoreMessageBlockSession(id);
+            lastFoldTargetKey = null;
             lastResumeRows = null;
             session = loadSession(id);
             messages = session?.messages ?? [];
@@ -1322,8 +1919,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             streamingReply = '';
             scroll = 0;
             focus = 'input';
-            draft = '';
-            historyIndex = 0;
+            input.clearHistory();
           }
           status = safeStatusText(next.status);
           render();
@@ -1335,8 +1931,26 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
-        if (route?.id === 'provider') {
-          const command = submitted.slice('/provider'.length).trim();
+        if (route?.id === 'model') {
+          const { applyNextTuiModelTier, parseNextTuiModelCommand } = await import('./slash/model.js');
+          const parsed = parseNextTuiModelCommand(submitted);
+          if (parsed.kind === 'tier') {
+            if (!id) {
+              status = '현재 대화를 찾을 수 없어 모델 설정을 적용하지 못했습니다';
+            } else {
+              applyNextTuiModelTier(id, parsed.tier, parsed.choice);
+              status = `모델: ${parsed.label} · 다음 턴부터 적용`;
+            }
+            render();
+            continue;
+          }
+          if (parsed.kind === 'invalid') {
+            activity.push(parsed.message);
+            status = 'Enter 전송';
+            render();
+            continue;
+          }
+          const command = parsed.providerCommand;
           activity = ['provider 목록 조회 중'];
           busy = true;
           status = 'provider 조회 중 · Esc 취소';
@@ -1364,26 +1978,37 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
-        if (route?.id === 'harness') {
-          const rest = submitted.slice('/harness'.length).trim();
-          const command = rest === 'runs' ? 'runs' : rest.startsWith('ask ') ? 'ask' : null;
-          const goal = command === 'ask' ? rest.slice(4).trim() : '';
-          if (!command || (command === 'ask' && (!goal || goal === '--dry-run'))) {
-            activity.push('사용법: /harness ask <목표> · /harness runs');
+        if (route?.branchHost === 'plugin-wizard' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('./branches/plugin-wizard.js');
+          pluginWizardFlow = branch.createPluginWizardFlow();
+          const turn = await pluginWizardFlow.start(submitted);
+          if (turn.kind === 'proposal') activity.push(...branch.formatPluginWizardProposal(turn.proposal).map(safeStatusText));
+          else if (turn.kind === 'error') {
+            pluginWizardFlow = null;
+            activity.push(safeStatusText(turn.message));
+          }
+          status = '플러그인 초안 확인 · Enter 전송';
+          render();
+          continue;
+        }
+        if (route?.branchHost === 'harness' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('./branches/harness.js');
+          const request = branch.parseNextTuiHarnessCommand(submitted);
+          if (!request) {
+            activity.push(branch.NEXT_TUI_HARNESS_USAGE);
             render();
             continue;
           }
-          activity = [safeStatusText(`하니스 ${command === 'ask' ? '시작' : '진행 조회'}: ${goal || 'runs'}`)];
+          activity = [safeStatusText(branch.nextTuiHarnessStartLine(request))];
           busy = true;
           status = '하니스 진행 중 · Esc 취소';
           const abort = new AbortController();
           turnAbort = abort;
-          turnDone = import('../tui-client/local-harness-command.js')
-            .then(({ runLocalHarnessCommand }) => runLocalHarnessCommand(command, goal, abort.signal, (line) => {
+          turnDone = branch.runNextTuiHarnessBranchRoute(request, abort.signal, (line) => {
               activity.push(safeStatusText(line));
               activity = activity.slice(-80);
               render();
-            }))
+            }, options.harnessRunner)
             .then(() => { status = '하니스 명령 완료 · Enter 전송'; })
             .catch((error: unknown) => {
               const message = error instanceof Error ? error.message : String(error);
@@ -1400,75 +2025,103 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
-        if (route?.action === 'help') {
-          activity.push(...(await loadNextTuiRouteRegistry()).NEXT_TUI_HELP_LINES);
+        if (route?.branchHost === 'memory' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('./branches/memory.js');
+          activity = branch.runNextTuiMemoryBranchRoute(submitted).split('\n').map(safeStatusText);
           status = 'Enter 전송';
           render();
           continue;
         }
-        if (route?.id === 'sidetab') {
-          const args = submitted.slice(1).trim().split(/\s+/);
-          const action = args[1]?.toLowerCase();
-          if (action === 'help') {
-            activity.push('/side [open|close|off|on|all|workspaces|new|kill|help] · /sidetab 별칭', 'Ctrl+\\ 후 s=사이드탭 · p=부모 · 1–9=선택 · Esc=입력 · 목록 클릭=전환');
-            status = 'Enter 전송';
-          } else if (action === 'off') {
-            const restoreOpen = sidetabOpen;
-            if (sidetabOpen) await toggleSidetab();
-            sidetabEnabled = false;
-            if (restoreOpen) {
-              sidetabOpenBySession.set(id!, true);
-              updateSessionMeta(id!, (meta) => { meta.uiState = { ...meta.uiState, sidetabOpen: true }; });
-            }
-            status = '사이드탭 off · /side on 으로 이 세션에서 켜기';
-          } else if (action === 'on') {
-            sidetabEnabled = true;
-            if (sidetabOpenBySession.get(id!) === true && !sidetabOpen) await toggleSidetab();
-            status = sidetabOpen ? '사이드탭 on · 열림' : '사이드탭 on · /side open 으로 열기';
-          } else if (action === 'open') {
-            sidetabEnabled = true;
-            if (!sidetabOpen) await toggleSidetab();
-          } else if (action === 'close') {
-            if (sidetabOpen) await toggleSidetab();
-          } else if (action === 'all') {
-            expandedWorkspaceIds.clear();
-            const nextViewMode: 'current' | 'all' = sidetabViewMode === 'all' ? 'current' : 'all';
-            sidetabViewMode = nextViewMode;
-            sidetabEnabled = true;
-            if (!sidetabOpen) await toggleSidetab();
-            else refreshSidetabRows();
-            status = nextViewMode === 'all' ? '사이드탭 전체 목록' : '사이드탭 현재 세션 목록';
-          } else if (action === 'workspaces') {
-            expandedWorkspaceIds.clear();
-            sidetabViewMode = sidetabViewMode === 'workspaces' ? 'current' : 'workspaces';
-            sidetabEnabled = true;
-            if (!sidetabOpen) await toggleSidetab();
-            else refreshSidetabRows();
-            status = sidetabViewMode === 'workspaces' ? '사이드탭 미션·하니스 워크스페이스' : '사이드탭 현재 세션 목록';
-          } else if (action === 'kill') {
-            if (!sidetabApi) sidetabApi = await import('./sidetab/list.js');
-            refreshSidetabRows();
-            const selected = sidetabRows[sidetabSelected];
-            if (selected) {
-              await ensureSidetabAttachments();
-              sidetabAttachments?.kill(selected);
-              refreshSidetabRows();
-            } else {
-              status = '종료할 PTY가 없습니다';
-            }
-          } else if (action === 'new') {
-            sidetabEnabled = true;
-            if (!sidetabOpen) await toggleSidetab();
-            if (sidetabOpen) sidetabMode = 'new';
-          } else {
-            await toggleSidetab();
-          }
+        if (route?.branchHost === 'decide' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('./branches/decide.js');
+          decideBranchRoute ??= branch.createNextTuiDecideBranchRoute();
+          activity = decideBranchRoute(submitted).split('\n').map(safeStatusText);
+          status = 'Enter 전송';
           render();
           continue;
         }
-        if (route?.id === 'terminal') {
-          const { dispatchNextTermSlash } = await import('./slash/term-next.js');
-          const args = submitted.slice('/'.length).trim().split(/\s+/).slice(1);
+        if (route?.action === 'help') {
+          const helpLines = (await loadNextTuiRouteRegistry()).buildNextTuiHelpLines();
+          activity.push(...helpLines);
+          // A 24-row terminal cannot show every command and the Keys section at once.
+          // Start at this help block's first line; PgDn reaches the remaining commands and keys.
+          scroll = Math.max(0, helpLines.length - logWindow.rows);
+          status = scroll > 0 ? 'PgDn 나머지 명령·키 보기 · Esc 입력' : 'Enter 전송';
+          render();
+          continue;
+        }
+        if (route?.branchHost === 'now' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('./branches/now.js');
+          await branch.runNextTuiNowBranchRoute(submitted, {
+            chatLines: activity,
+            setChatScrollOffset: (value) => { scroll = Math.max(0, Math.min(value, maxScroll)); },
+          });
+          status = 'Enter 전송';
+          render();
+          continue;
+        }
+        if (route?.branchHost === 'context' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('./branches/context.js');
+          branch.runNextTuiContextBranchRoute(submitted, {
+            chatLines: activity,
+            attachments: atAttachmentTokens,
+            attachmentPage: contextAttachmentPage,
+            attachmentPageSize: 1,
+            setAttachmentPage: (value) => { contextAttachmentPage = value; },
+            setAttachmentArea: (lines) => {
+              contextAttachmentAreaVisible = true;
+              contextAttachmentArea = [...lines];
+              contextAttachmentScroll = 0;
+            },
+            setChatScrollOffset: (value) => { scroll = Math.max(0, Math.min(value, maxScroll)); },
+          });
+          status = 'Enter 전송';
+          render();
+          continue;
+        }
+        if (route?.branchHost === 'app' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('./branches/app/index.js');
+          await branch.runNextTuiAppBranchRoute(submitted, {
+            chatLines: activity,
+            cwd: process.cwd(),
+            setChatScrollOffset: (value) => { scroll = Math.max(0, Math.min(value, maxScroll)); },
+          });
+          status = 'Enter 전송';
+          render();
+          continue;
+        }
+        if (route?.branchHost === 'sidetab' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('./branches/sidetab/route.js');
+          await branch.runNextTuiBranchRoute(submitted, {
+            state: () => ({ open: sidetabOpen, viewMode: sidetabViewMode, rememberedOpen: sidetabOpenBySession.get(id!) === true }),
+            setEnabled: (enabled) => { sidetabEnabled = enabled; },
+            rememberOpen: () => {
+              sidetabOpenBySession.set(id!, true);
+              updateSessionMeta(id!, (meta) => { meta.uiState = { ...meta.uiState, sidetabOpen: true }; });
+            },
+            setViewMode: (mode) => { sidetabViewMode = mode; },
+            setNewMode: () => { sidetabMode = 'new'; },
+            clearExpandedWorkspaces: () => expandedWorkspaceIds.clear(),
+            toggle: toggleSidetab,
+            refreshRows: refreshSidetabRows,
+            killSelected: async () => {
+              if (!sidetabApi) sidetabApi = await import('./sidetab/list.js');
+              refreshSidetabRows();
+              const selected = sidetabRows[sidetabSelected];
+              if (!selected) return false;
+              await ensureSidetabAttachments();
+              sidetabAttachments?.kill(selected);
+              refreshSidetabRows();
+              return true;
+            },
+            addHelp: (...lines) => { activity.push(...lines); },
+            setStatus: (message) => { status = message; },
+          });
+          render();
+          continue;
+        }
+        if (route?.branchHost === 'terminal' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('./branches/term/route.js');
           const sessions = options.termSessions ?? {
             list: async () => {
               const { listPty } = await import('../pty-shell/registry.js');
@@ -1482,7 +2135,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
               }));
             },
           };
-          await dispatchNextTermSlash(args, {
+          await branch.runNextTuiTermBranchRoute(submitted, {
             chatLines: activity,
             setChatScrollOffset: (value) => { scroll = Math.max(0, Math.min(value, maxScroll)); },
             sessions,
@@ -1491,7 +2144,29 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
           render();
           continue;
         }
-        if (route?.id === 'signals') {
+        if (route?.branchHost === 'mission' && route.branchModule) {
+          const branch = await import(route.branchModule) as typeof import('./slash/mission.js');
+          await branch.runNextTuiMissionBranchRoute(submitted, {
+            chatLines: activity,
+            setChatScrollOffset: (value) => { scroll = Math.max(0, Math.min(value, maxScroll)); },
+            muted: (text) => text,
+            accent: (text) => text,
+            text: (text) => text,
+            error: (text) => text,
+            success: (text) => text,
+            warning: (text) => text,
+            info: (text) => text,
+            subtext: (text) => text,
+            missionTui: {
+              startReadyWatch: (missionId, poll, onReady) => startMissionWatch('ready', missionId, poll, onReady),
+              startRunWatch: (missionId, poll) => startMissionWatch('run', missionId, poll),
+            },
+          });
+          status = status || 'Enter 전송';
+          render();
+          continue;
+        }
+        if (route?.action === 'command' && slashHandlers.has(submitted.slice(1).trim().split(/\s+/)[0] ?? '')) {
           slashContext.chatLines = activity;
           const [command = '', ...args] = submitted.slice('/'.length).trim().split(/\s+/);
           const dispatched = await dispatchSlash(command, args, slashContext);
@@ -1509,6 +2184,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       render();
     }
   } finally {
+    missionWatchCancellation.cancel?.();
+    delete missionWatchCancellation.cancel;
     if (simWatchTimer !== null) clearInterval(simWatchTimer);
     if (sidetabRefreshTimer !== null) clearInterval(sidetabRefreshTimer);
     if (sidetabChordTimer !== null) clearTimeout(sidetabChordTimer);
@@ -1525,13 +2202,18 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       setNextTuiWakeupTool(null);
     }
     const { setNextSidetabHandler, setNextSidetabIpcEnabled } = await import('../tui-client/local-chat-turn.js');
+    const pendingShellApproval = shellApprovalPrompt.current;
+    shellApprovalPrompt.current = null;
+    if (pendingShellApproval?.timer) clearTimeout(pendingShellApproval.timer);
+    pendingShellApproval?.resolve(false);
+    const { setNextTuiShellApprovalHandler, setNextTuiShellApprovalCancelHandler } = await import('../tui-client/local-chat-turn.js');
+    setNextTuiShellApprovalHandler(null);
+    setNextTuiShellApprovalCancelHandler(null);
     setNextSidetabHandler(null);
     setNextSidetabIpcEnabled(false);
     turnAbort?.abort();
     await turnDone;
     backgroundSubscription.stop?.();
-    selfHealthSubscription.stop?.();
-    selfHealthLine = null;
     if (id) {
       const { closeLocalChatSession } = await import('../tui-client/local-chat-turn.js');
       await closeLocalChatSession(id);

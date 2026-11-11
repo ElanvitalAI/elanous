@@ -636,6 +636,8 @@ describe('ARG-UNIT-CALL — subgraph unit call parsing', () => {
     const node = '{ node_id: a, kind: agent, recipe: test, max_visits: 1 }';
     expect(parseGraphTemplateYaml(doc(node, 'unit: { inputs: [i], outputs: [o], exits: [done] }\n')).template?.unit).toEqual({ inputs: ['i'], outputs: ['o'], exits: ['done'] });
     expect(parseGraphTemplateYaml(doc(node, 'unit: { inputs: [i], outputs: [o], exits: [other] }\n')).errors.some(e => e.path === '<inline>/unit')).toBe(true);
+    expect(parseGraphTemplateYaml(doc(node, 'unit: { inputs: [i], outputs: [o], exits: [done, other] }\n')).errors.some(e => e.path === '<inline>/unit')).toBe(true);
+    expect(parseGraphTemplateYaml(doc(node, 'unit: { inputs: [i], outputs: [o], exits: [done, done] }\n')).errors.some(e => e.path === '<inline>/unit')).toBe(true);
   });
   test('multi-entry headers declare every selectable entry and calls name a nonempty selector', () => {
     const source = `graph_id: multi\nversion: 1\nunit: { inputs: [], outputs: [], exits: [done], entries: [a, b] }\nentry_node: a\nterminal_nodes: [done]\nnodes:\n  - { node_id: a, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: b, kind: gate, recipe: none, max_visits: 1 }\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: a, to: done }\n  - { from: b, to: done }\n`;

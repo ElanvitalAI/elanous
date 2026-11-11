@@ -1,4 +1,4 @@
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 import type { SeatEntry } from '../seat-loop/seat-loop.js';
 

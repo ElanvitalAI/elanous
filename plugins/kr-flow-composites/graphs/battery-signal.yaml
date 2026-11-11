@@ -1,0 +1,22 @@
+graph_id: kr-battery-signal-composite
+version: 1
+entry_node: lg-quote
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: lg-quote, kind: capability, recipe: none, requires: market.quote@1, input: { market: KR, symbol: '373220' }, max_visits: 1 }
+  - { node_id: lg-flow, kind: capability, recipe: none, requires: market.kr-flow@1, input: { market: KR, symbol: '373220' }, max_visits: 1 }
+  - { node_id: sdi-quote, kind: capability, recipe: none, requires: market.quote@1, input: { market: KR, symbol: '006400' }, max_visits: 1 }
+  - { node_id: sdi-flow, kind: capability, recipe: none, requires: market.kr-flow@1, input: { market: KR, symbol: '006400' }, max_visits: 1 }
+  - { node_id: eco-quote, kind: capability, recipe: none, requires: market.quote@1, input: { market: KR, symbol: '086520' }, max_visits: 1 }
+  - { node_id: eco-flow, kind: capability, recipe: none, requires: market.kr-flow@1, input: { market: KR, symbol: '086520' }, max_visits: 1 }
+  - { node_id: battery-compose, kind: agent, recipe: 'cmd:battery-compose', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: lg-quote, on: outcome, map: { ok: lg-flow, failed: failed } }
+  - { from: lg-flow, on: outcome, map: { ok: sdi-quote, failed: failed } }
+  - { from: sdi-quote, on: outcome, map: { ok: sdi-flow, failed: failed } }
+  - { from: sdi-flow, on: outcome, map: { ok: eco-quote, failed: failed } }
+  - { from: eco-quote, on: outcome, map: { ok: eco-flow, failed: failed } }
+  - { from: eco-flow, on: outcome, map: { ok: battery-compose, failed: failed } }
+  - { from: battery-compose, on: outcome, map: { ok: done, fail: failed, failed: failed } }

@@ -2326,7 +2326,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
                 lane: 'ta', workload: { memoryLimit, kind }, skip: unfitContexts, onEmpty: (reason) => {
                 stageReason['pool-slot'] = reason;
                 firstSlotReasonCode ??= slotReasonCode(reason);
-              }, mode: { kind, ...(minihLocation ? { minihLocation } : {}), onPlacement: (placement) => { lastPlacement = placement; } } } });
+              }, mode: { kind, waiterId: attempt.observationKey, ...(minihLocation ? { minihLocation } : {}), onPlacement: (placement) => { lastPlacement = placement; } } } });
             if (acquired) {
               recordSlotObservation(attempt, 'admitted', firstSlotReasonCode ?? 'admitted');
               debug.log('self-implement.pod', 'pool-slot', { spaceId: input.spaceId, context: acquired.context, inflight: options.pool.snapshot(), ...(lastPlacement ? { placement: lastPlacement } : {}) });

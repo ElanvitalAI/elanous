@@ -1,7 +1,0 @@
-{
-  "name": "hello",
-  "version": "0.1.0",
-  "entry": "plugin.ts",
-  "description": "Scaffold plugin — copy this folder to bootstrap a new plugin.",
-  "author": "monad-agent"
-}

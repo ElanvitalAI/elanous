@@ -331,7 +331,7 @@ export function readReworkSalvageEvidence(cwd: string): { clean: boolean; aheadC
 export const ELANOUS_ENTRY_SCRIPT = fileURLToPath(new URL('../../bin/elanous.mjs', import.meta.url));
 
 export function launchDevGoalFileDetached(
-  input: { goalFile: string; base?: string; target?: string; correlation?: string; env?: Readonly<Record<string, string>> },
+  input: { goalFile: string; base?: string; target?: string; correlation?: string; noAutoMerge?: boolean; env?: Readonly<Record<string, string>> },
   spawnChild: typeof spawn = spawn,
 ): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -342,6 +342,7 @@ export function launchDevGoalFileDetached(
       ELANOUS_ENTRY_SCRIPT, 'dev', '--file', input.goalFile,
       ...(input.base ? ['--base', input.base] : []),
       ...(input.target ? ['--target', input.target] : []),
+      ...(input.noAutoMerge ? ['--no-auto-merge'] : []),
       ...(input.correlation !== undefined ? ['--correlation', input.correlation] : []),
     ], {
       cwd: process.cwd(),

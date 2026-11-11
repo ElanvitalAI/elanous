@@ -5,7 +5,7 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { readPendingQuestionAnswer, readPendingQuestions, writePendingQuestionAnswer } from '../ask-user-question/pending-questions.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { createVersionResolver, type VersionOptions, type Versions } from '../directives/version-at.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { registeredSeats, resolveSeat } from '../seat-address/seat-address.js';
 import { isSeatId } from '../seat-dispatch/seat-questions.js';
 import { openMsgStore } from '../msg/msg-store.js';

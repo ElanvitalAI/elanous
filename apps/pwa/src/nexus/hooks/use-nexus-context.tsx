@@ -17,7 +17,7 @@ import type { NexusClient } from '../client';
 const NexusClientContext = createContext<NexusClient | null>(null);
 
 export interface NexusProviderProps {
-  client: NexusClient;
+  client: NexusClient | null;
   /** Optional QueryClient override (tests + parallel apps share). */
   queryClient?: QueryClient;
   /** Default staleTime for nexus queries (ms). Default 2000 — SSE

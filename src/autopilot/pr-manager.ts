@@ -23,7 +23,7 @@ import { isTransientExecutionFailure } from '../self-dev/execution-transient.js'
 import { withGhRestFallback } from './gh-rest-fallback.js';
 import { cardIdFromBody, cellIdFromBody, guardNewPr, hasCardMarker, parseDiffHunks, readOpenPrs, recordGuardUnmeasured, sharedCensusDiffCache, sliceMarkerFromBody, spawnParallelCommands, type GuardVerdict, type HunkOverlapMode, type PrToolParallelCommand, type Seat } from '../pr-tool/census.js';
 import { labelsForAxis, PR_LABEL_NAMES } from '../github/pr-labels.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { runSuffixKey } from '../self-implement/salvage-branches.js';
 import { forecastPrPushConflicts, recordUnmeasuredPrPushConflict } from '../cli/pr-land-overlap-evidence.js';
 

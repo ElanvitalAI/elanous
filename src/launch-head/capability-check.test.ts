@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { withoutExternalEffects } from '../../test/forbid-external-effects.js';
 import {
   PATH_CAPABILITY_RULES,
   POD_CAPABILITIES,
@@ -123,10 +123,9 @@ test('규칙 표는 코드 상수 한 곳이고 원문 대응을 그대로 둔�
   expect(Array.isArray(POD_CAPABILITIES)).toBe(true);
 });
 
-test('capability-check.ts 는 파일·네트워크·프로세스를 직접 부르지 않는다', () => {
-  const source = readFileSync(new URL('./capability-check.ts', import.meta.url), 'utf8');
-  expect(source).not.toMatch(/from ['"]node:/);
-  expect(source).not.toMatch(/\b(readFileSync|writeFileSync|Bun\.file|Bun\.spawn|fetch|child_process)\b/);
+test('capability decision stays pure and depends on the goal, not unrelated prose', () => {
+  expect(withoutExternalEffects(() => checkCapability({ goalText: `${IOS_GOAL}\n설명: 재현 가능한 판정` })))
+    .toEqual(checkCapability({ goalText: IOS_GOAL }));
 });
 
 test('반환 형태는 outcome · required · reasons 다', () => {

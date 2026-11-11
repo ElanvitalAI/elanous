@@ -44,7 +44,6 @@ export const SHORTCUT_TABLE: Record<PaneFocus, string> = {
   'debug-detail': 'D',
   'debug-stack': 'S',
   'debug-prompts': 'P',
-  playground: 'y',
   'sessions-sidebar': 's',
 };
 

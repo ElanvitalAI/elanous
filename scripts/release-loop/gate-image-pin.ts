@@ -4,6 +4,8 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, 
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
+import { gateImageReadinessPendingPath, gateImageReadinessSignalPath,
+  readGateImageReadinessSignal, type GateImageReadinessSignal } from './release-readiness.js';
 
 /** A gate run may execute only against one immutable image identity and its exact source tag. */
 export interface GateImagePin { runId: string; digest: string; image: string; commit: string }
@@ -249,27 +251,84 @@ export function gateImagePinPath(root: string, version: string, runId: string): 
 }
 
 export interface CutGateImagePrebuildInput { root: string; repo: string; runId: string; version: string; commit: string; pool: string }
-export type CutGateImagePrebuildOutcome = GateImagePrebuildResult | { outcome: 'skipped' | 'failed'; reason: string };
+type ChildGateImagePrebuildOutcome = GateImagePrebuildResult | { outcome: 'skipped' | 'failed'; reason: string };
+export type CutGateImagePrebuildOutcome = (GateImagePrebuildResult & { runId: string; cutCommit: string })
+  | { outcome: 'skipped' | 'failed'; reason: string };
+interface CutGateImagePrebuildDeps {
+  runPrebuild?: () => { stdout?: string | null; stderr?: string | null; status: number | null; error?: Error };
+  now?: () => Date;
+  invalidateReady?: (input: CutGateImagePrebuildInput) => void;
+  markLocalPending?: () => void;
+  writeReady?: (input: CutGateImagePrebuildInput, result: GateImagePrebuildResult, now: Date) => void;
+}
+
+function writePendingMarker(path: string, input: CutGateImagePrebuildInput): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.pending-${randomUUID()}`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify({ runId: input.runId, cutCommit: input.commit.toLowerCase() })}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, path);
+  } finally { rmSync(temporary, { force: true }); }
+}
+
+function markGateImagePrebuildPending(input: CutGateImagePrebuildInput, deps: CutGateImagePrebuildDeps): void {
+  deps.markLocalPending?.();
+  writePendingMarker(gateImageReadinessPendingPath(input.root, input.version), input);
+}
+
+function writeGateImageReadiness(input: CutGateImagePrebuildInput, result: GateImagePrebuildResult, now: Date): void {
+  const digest = normalizeGateImageDigest(result.digest);
+  if (!digest || !Array.isArray(result.eligiblePools) || result.eligiblePools.length === 0
+    || result.eligiblePools.some((pool) => typeof pool !== 'string' || !pool.trim())) {
+    throw new Error('cut gate image prebuild returned invalid readiness identity');
+  }
+  const path = gateImageReadinessSignalPath(input.root, input.version);
+  const signal: GateImageReadinessSignal = { schemaVersion: 1, status: 'ready', runId: input.runId,
+    cutCommit: input.commit.toLowerCase(), imageDigest: digest, eligiblePools: result.eligiblePools, checkedAt: now.toISOString() };
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.pending-${randomUUID()}`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(signal)}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, path);
+  } finally { rmSync(temporary, { force: true }); }
+}
+
+/** Best-effort cleanup of an earlier verdict for this run and cut. */
+function invalidateGateImageReadiness(input: CutGateImagePrebuildInput): void {
+  const path = gateImageReadinessSignalPath(input.root, input.version);
+  if (readGateImageReadinessSignal(path, { runId: input.runId, cutCommit: input.commit }, { ignorePending: true }).status !== 'ready') return;
+  rmSync(path, { force: true });
+}
 
 /** Sync entry point used immediately after cut-branch; the child performs the asynchronous pool build. */
-export function runCutGateImagePrebuild(input: CutGateImagePrebuildInput): CutGateImagePrebuildOutcome {
+export function runCutGateImagePrebuild(input: CutGateImagePrebuildInput, deps: CutGateImagePrebuildDeps = {}): CutGateImagePrebuildOutcome {
   if (!input.pool || !input.runId || !/^[0-9a-f]{40}$/i.test(input.commit)) return { outcome: 'skipped', reason: 'gate pool, run id, or cut commit absent' };
+  try { markGateImagePrebuildPending(input, deps); (deps.invalidateReady ?? invalidateGateImageReadiness)(input); }
+  catch (error) { return { outcome: 'failed', reason: `image readiness invalidation failed: ${error instanceof Error ? error.message : String(error)}` }; }
   const script = join(import.meta.dir, 'gate-image-pin.ts');
-  const run = spawnSync('bun', [script, '--prebuild', '--root', input.root, '--repo', input.repo, '--run-id', input.runId,
+  const run = deps.runPrebuild?.() ?? spawnSync('bun', [script, '--prebuild', '--root', input.root, '--repo', input.repo, '--run-id', input.runId,
     '--version', input.version, '--commit', input.commit, '--pool', input.pool], {
     cwd: input.repo, encoding: 'utf8', timeout: 20 * 60_000, maxBuffer: 4 * 1024 * 1024,
   });
   const line = (run.stdout ?? '').trim().split('\n').at(-1);
   if (!line) return { outcome: 'failed', reason: `${run.stderr || run.error || `prebuild child exited ${run.status}`}`.trim().slice(-1000) };
   try {
-    const result = JSON.parse(line) as CutGateImagePrebuildOutcome;
+    const result = JSON.parse(line) as ChildGateImagePrebuildOutcome;
     if (run.status !== 0 || run.error) return result.outcome === 'failed' ? result
       : { outcome: 'failed', reason: `${run.stderr || run.error || `prebuild child exited ${run.status}`}`.trim().slice(-1000) };
-    return result;
+    if (result.outcome === 'built' || result.outcome === 'reused') {
+      try {
+        (deps.writeReady ?? writeGateImageReadiness)(input, result, (deps.now ?? (() => new Date()))());
+        rmSync(gateImageReadinessPendingPath(input.root, input.version), { force: true });
+      }
+      catch (error) { return { outcome: 'failed', reason: `image readiness signal write failed: ${error instanceof Error ? error.message : String(error)}` }; }
+    }
+    return result.outcome === 'built' || result.outcome === 'reused'
+      ? { ...result, runId: input.runId, cutCommit: input.commit.toLowerCase() } : 'reason' in result ? result : { outcome: 'failed', reason: 'invalid child outcome' };
   } catch { return { outcome: 'failed', reason: `prebuild child returned invalid JSON: ${line.slice(0, 300)}` }; }
 }
 
-async function prebuildFromArgs(args: string[]): Promise<CutGateImagePrebuildOutcome> {
+async function prebuildFromArgs(args: string[]): Promise<ChildGateImagePrebuildOutcome> {
   const values = new Map<string, string>();
   for (let i = 0; i < args.length; i++) {
     const key = args[i]!;

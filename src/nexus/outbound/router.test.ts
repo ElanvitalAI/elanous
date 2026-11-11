@@ -171,7 +171,7 @@ test('built-in connectors declare receive only for existing bot paths, never for
     expect(Object.values(adapter.capabilities).every(value => typeof value === 'boolean')).toBe(true);
     expect(adapter.capabilities.send).toBe(true);
     expect(adapter.capabilities.receive).toBe(adapter.type !== 'pushcut');
-    expect(adapter.capabilities.buttons).toBe(false);
+    expect(adapter.capabilities.buttons).toBe(adapter.type === 'telegram');
     expect(typeof adapter.receive).toBe(adapter.type === 'pushcut' ? 'undefined' : 'function');
   }
   await expect(receiveChannelEvent('pushcut', {})).resolves.toBeNull();
@@ -334,7 +334,6 @@ test('explicit empty metadata still requires connector capabilities', async () =
   const { calls, deliveryDb, routerDeps } = deps();
   const cases: Array<Partial<OutboundMsg>> = [
     { attachments: [] },
-    { buttons: [] },
     { choices: [] },
     { threadId: '' },
   ];
@@ -348,6 +347,35 @@ test('explicit empty metadata still requires connector capabilities', async () =
       ]);
     }
     expect(calls).toEqual([]);
+  } finally { deliveryDb.close(); }
+});
+
+test('Telegram accepts inline buttons while other connectors fail closed', async () => {
+  const { calls, deliveryDb, routerDeps } = deps();
+  try {
+    const result = await routeOutbound(cfg(config), { ...msg, buttons: [{ label: 'Open', value: 'brief:open' }] }, routerDeps);
+    expect(result.delivered).toBe(true);
+    expect(result.channels).toEqual([
+      { type: 'telegram', ok: true },
+      { type: 'discord', ok: false, error: 'unsupported-capability' },
+    ]);
+    expect(calls).toEqual(['telegram']);
+  } finally { deliveryDb.close(); }
+});
+
+test('same text with different Telegram action targets is not deduplicated', async () => {
+  const { calls, deliveryDb, routerDeps } = deps();
+  try {
+    const outbound = { channels: [{ type: 'telegram' }], routes: { alert: ['telegram'] } };
+    const resultOne = await routeOutbound(cfg(outbound), {
+      ...msg, buttons: [{ label: 'Open', value: 'suggest_accept:brief-1' }],
+    }, { ...routerDeps, dedup: true });
+    const resultTwo = await routeOutbound(cfg(outbound), {
+      ...msg, buttons: [{ label: 'Open', value: 'suggest_accept:brief-2' }],
+    }, { ...routerDeps, dedup: true });
+    expect(resultOne.suppressed).not.toBe(true);
+    expect(resultTwo.suppressed).not.toBe(true);
+    expect(calls).toEqual(['telegram', 'telegram']);
   } finally { deliveryDb.close(); }
 });
 

@@ -139,7 +139,7 @@ describe('resume --waive gate: only an unmeasured gate', () => {
   });
 
   test('other nodes keep their rules: mac-smoke measured failure still waivable, --from alone still not a waiver', () => {
-    const mac = run(['mac-smoke', 'failed'], [{ nodeId: 'mac-smoke', ok: false, executed: true, exit: 1 }, { nodeId: 'failed' }]);
+    const mac = run(['mac-smoke', 'traffic-failed-restore', 'failed'], [{ nodeId: 'mac-smoke', ok: false, executed: true, exit: 1 }, { nodeId: 'traffic-failed-restore', ok: true, executed: true, exit: 0 }, { nodeId: 'failed' }]);
     const waived = releaseResumeWaiver(mac, { from: 'mac-smoke', waive: 'mac-smoke', reason: REASON });
     expect(waived).toEqual({ nodeId: 'mac-smoke', reason: REASON, acceptedRegressions: [{ id: 'waive:mac-smoke', note: REASON }] });
     expect(() => releaseResumeWaiver(stoppedGate(), { from: 'gate', waive: 'prepare', reason: REASON })).toThrow('--from must name the waived node');

@@ -1,10 +1,7 @@
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { WORKTREE_BRANCH_PREFIX } from '../src/harness/worktree-branch-prefix.js';
+import { WORKTREE_BRANCH_PREFIX, plannedSelfImplBranch } from '../src/harness/worktree-branch-prefix.js';
 
-test('documents successful-merge self-cleanup without changing the shared prefix', () => {
-  const source = readFileSync(new URL('../src/harness/worktree-branch-prefix.ts', import.meta.url), 'utf8');
-
-  expect(source).toContain('A successfully merged run cleans up its own worktree.');
+test('planned self-implement branch uses the shared disposable prefix', () => {
   expect(WORKTREE_BRANCH_PREFIX).toBe('self-impl/');
+  expect(plannedSelfImplBranch('fixture goal').startsWith(WORKTREE_BRANCH_PREFIX)).toBe(true);
 });

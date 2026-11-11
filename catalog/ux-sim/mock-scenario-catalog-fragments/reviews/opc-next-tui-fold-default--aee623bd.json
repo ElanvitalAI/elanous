@@ -1,0 +1,4 @@
+{
+  "deviceKey": "opc-next-tui-fold-default",
+  "review": "> 📅 **2026-11-10 재검토 (OPC · NEXT-TUI-FOLD-DEFAULT)** — 기존 next-tool-fold PTY가 MessageBlock 단계 순환·stderr/종료 메타데이터·L3 줄바꿈과 화면 내 접힘 공정성을 확인한다. 원격 시험 규칙 본문 영향 없음."
+}

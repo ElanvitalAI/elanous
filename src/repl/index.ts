@@ -19,6 +19,7 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 // REPL that pipes through ssh / tmux / VS Code terminal alike.
 
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
+import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve as resolvePath, isAbsolute, basename } from 'node:path';
 import * as ui from '../ui.js';
@@ -36,7 +37,7 @@ import {
   setActiveSessionId,
   getActiveSessionId,
 } from '../session/index.js';
-import { reloadUserConfig, saveUserConfig, jumpToRotationEntry } from '../user-config.js';
+import { getUserConfig, reloadUserConfig, saveUserConfig, jumpToRotationEntry } from '../user-config.js';
 import type { UserConfig } from '../user-config/types.js';
 import { setAmbientSessionId, debug } from '../debug/log.js';
 import { buildInstalledSkillCatalogMessage, type InstalledSkillSummary } from '../dashboard/skill-catalog-preamble.js';
@@ -51,26 +52,66 @@ import type { PendingTaskNotification } from '../agent/task-notification.js';
 import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js';
 import { buildSeatBootSystemMessages, type SeatBootDeps } from '../dashboard/seat-boot-preamble.js';
 import { installNextTuiSelfHealthTracker } from '../tui/chat/self-health-status.js';
+import { bashApprovalFinding } from '../tool-runtime/bash-approval.js';
+import { createReplShellApprover, dispatchNextTuiBash, type ShellApprovalIpcProcess } from '../tui-client/next-shell-approval.js';
+import { isToolSearchCall, routeToolSearch } from '../skills/tools/tool-search-route.js';
+import { agentResultStatus, type AgentDisplayEvent } from '../tui/core/agents.js';
+import { createNextTuiMessageBlockEmitter } from './next-tui-message-blocks.js';
+import { monotonicNowMs } from '../esc-abort-gate.js';
+import { createPushNowRouter, createShellSnapshotRouter } from './shell-snapshot-router.js';
+import { nextTuiPushNowDecision } from '../tui/core/queue.js';
+import { setSessionTierOverride } from '../model-tier/session-override.js';
 
 /** Private side channel for the next TUI. Ordinary REPL JSONL stdout is unchanged. */
 const NEXT_TUI_BG_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
+type ReplShellActivity =
+  | { phase: 'start'; id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number }
+  | { phase: 'finish'; id: string; name: 'Bash' | 'RunShell' }
+  | { phase: 'snapshot'; calls: Array<{ id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number }> };
+type ReplToolActivity =
+  | { phase: 'start' | 'finish'; id: string; name: string }
+  | { phase: 'snapshot'; calls: Array<{ id: string; name: string }> };
+
+const shellSnapshotRouter = createShellSnapshotRouter();
+const pushNowRouter = createPushNowRouter();
+if (typeof process.send === 'function') process.on('message', (message: unknown) => {
+  if (!shellSnapshotRouter.receive(message)) pushNowRouter.receive(message);
+});
 
 export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: () => number) {
   if (process.env.ELANOUS_NEXT_TUI_BG_STATUS !== '1') return null;
   const { globalAgentRegistry } = require('../agent/registry.js') as typeof import('../agent/registry.js');
   const { globalTaskNotificationQueue } = require('../agent/task-notification.js') as typeof import('../agent/task-notification.js');
   const unregisteredPromises = new Set<string>();
+  const backgroundTaskIds = new Set<string>();
   let last = '';
   const emit = () => {
     const tasks = globalAgentRegistry.list();
     for (const task of tasks) unregisteredPromises.delete(task.id);
+    for (const task of tasks) if (task.background) backgroundTaskIds.add(task.id);
     const running = tasks.filter((task) => task.background && (task.state === 'pending' || task.state === 'running')).length;
-    const frame = JSON.stringify({ sessionId, promised: unregisteredPromises.size > 0, running, pending: globalTaskNotificationQueue.size + bufferedCount() });
+    const roster = tasks.filter((task) => backgroundTaskIds.has(task.id)).sort((left, right) => {
+      const leftDone = left.state === 'done' || left.state === 'error' || left.state === 'aborted';
+      const rightDone = right.state === 'done' || right.state === 'error' || right.state === 'aborted';
+      return Number(leftDone) - Number(rightDone) || (leftDone && rightDone ? (left.finishedAt ?? 0) - (right.finishedAt ?? 0) : 0);
+    }).map((task) => ({
+      id: task.id, label: task.label ?? task.definition.name, state: task.state,
+    }));
+    const frame = JSON.stringify({ sessionId, promised: unregisteredPromises.size > 0, running, pending: globalTaskNotificationQueue.size + bufferedCount(), tasks: roster });
     if (frame === last) return;
     last = frame;
     process.stderr.write(`${NEXT_TUI_BG_PREFIX}${frame}\n`);
   };
   const done = globalAgentRegistry.onTaskDone(emit);
+  const onTaskStop = (message: unknown): void => {
+    if (!message || typeof message !== 'object') return;
+    const request = message as { type?: unknown; sessionId?: unknown; taskId?: unknown };
+    if (request.type !== 'elanous.next-tui.task-stop' || request.sessionId !== sessionId || typeof request.taskId !== 'string') return;
+    const task = globalAgentRegistry.list().find((item) => item.id === request.taskId && backgroundTaskIds.has(item.id));
+    if (task) globalAgentRegistry.abort(task.id);
+    emit();
+  };
+  process.on('message', onTaskStop);
   const timer = setInterval(emit, 250);
   timer.unref();
   emit();
@@ -85,7 +126,7 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
       emit();
     },
     emit,
-    dispose() { clearInterval(timer); done.dispose(); },
+    dispose() { clearInterval(timer); done.dispose(); process.off('message', onTaskStop); },
   };
 }
 
@@ -137,6 +178,8 @@ export interface ReplOpts {
 export interface ScenarioTurn {
   id?: string;
   prompt: string;
+  /** Session tier carried from the Next TUI host to its persistent REPL child. */
+  modelTier?: 'budget' | 'balanced' | 'best';
   /** Switch provider before this turn. Resolves through
    *  `rotationEntryLabel` (e.g. "opus" / "codex" / "gemini"). */
   rotate?: string;
@@ -167,7 +210,10 @@ interface PendingAttachment {
 /** Build the REPL's tool catalog + dispatcher. Mirrors
  *  `buildCliAgentTools` in src/index.ts but lives here so the REPL
  *  module is self-contained when consumed in tests. */
-function buildReplTools(): {
+export function buildReplTools(options: {
+  readonly shellApprovalProcess?: ShellApprovalIpcProcess;
+  readonly dispatchBash?: (args: Record<string, unknown>, options: { cwd: string }) => Promise<unknown>;
+} = {}): {
   specs: LLMToolSpec[];
   dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
 } {
@@ -182,18 +228,48 @@ function buildReplTools(): {
   })) {
     specs.push(spec);
   }
+  const core = (require('../domains/core-tools.js') as typeof import('../domains/core-tools.js')).buildCoreTools();
+  for (const memoryTool of core.specs.filter(spec => spec.name === 'memory_recall' || spec.name === 'memory_save')) {
+    if (specs.some(spec => spec.name === memoryTool.name)) continue;
+    specs.push(memoryTool);
+    dispatchByName.set(memoryTool.name, args => core.dispatch(memoryTool.name, args));
+  }
   // The ops ledger is a runtime family, so the native-only catalog above
   // cannot advertise it. Keep the REPL surface limited to seat mail.
   const ledger = require('../skills/tools/ops-ledger.js') as typeof import('../skills/tools/ops-ledger.js');
   const ask = require('../skills/tools/msg-ask.js') as typeof import('../skills/tools/msg-ask.js');
   specs.push(ledger.buildMsgListTool(), ledger.buildMsgPostTool(), ask.buildMsgAskTool(), ledger.buildMsgAckTool());
   const bashMod = require('../skills/tools/index.js') as typeof import('../skills/tools/index.js');
+  const dispatchBash = options.dispatchBash ?? bashMod.dispatchBash;
   specs.push(bashMod.buildBashTool());
-  dispatchByName.set('Bash', async (args) => bashMod.dispatchBash(args, { cwd: process.cwd() }));
+  const shellApprover = createReplShellApprover(options.shellApprovalProcess ?? process as unknown as ShellApprovalIpcProcess);
+  dispatchByName.set('Bash', async (args) => {
+    const command = typeof args.command === 'string' ? args.command : '';
+    const approvalFinding = bashApprovalFinding(command, getUserConfig().shell.bashApproval);
+    if (approvalFinding) {
+      return dispatchNextTuiBash({
+        command,
+        enabled: true,
+        requiresApproval: true,
+        approve: shellApprover,
+        dispatch: () => dispatchBash(args, { cwd: process.cwd() }),
+      });
+    }
+    return dispatchBash(args, { cwd: process.cwd() });
+  });
   const appDeploy = require('../agent/app-deploy-plugin.js') as typeof import('../agent/app-deploy-plugin.js');
   const appDeploySpec = appDeploy.appDeployPluginSpec();
   specs.push(appDeploySpec);
   dispatchByName.set(appDeploySpec.name, (args) => appDeploy.runAppDeploy(args));
+  const pluginBridge = (require('../cli/child-plugin-runtime.js') as typeof import('../cli/child-plugin-runtime.js'))
+    .createChildPluginRuntimeContract();
+  const exposedNames = new Set(specs.map((spec) => spec.name));
+  for (const tool of pluginBridge.hostTools) {
+    if (!tool.route || exposedNames.has(tool.name)) continue;
+    specs.push({ name: tool.name, description: tool.description, parameters: tool.parameters,
+      pluginId: tool.pluginId, route: tool.route });
+    exposedNames.add(tool.name);
+  }
   // TUI-NEXT-QUEUE-AND-WAKE: the next TUI parent opens an IPC hop only for its own REPL children;
   // the classic ScheduleWakeup spec is advertised and each call is answered by the parent's scheduler.
   const wakeMod = require('../tui-client/next-wakeup.js') as typeof import('../tui-client/next-wakeup.js');
@@ -206,6 +282,7 @@ function buildReplTools(): {
   const planner = sr.createSearchPlannerState({ maxAutoNarrowCandidates: 2 });
   const dispatch = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
     try {
+      if (isToolSearchCall(name)) return routeToolSearch(args, specs, { surface: 'tui-next' });
       const direct = dispatchByName.get(name);
       if (direct) return await direct(args);
       if (isReplMessageTool(name)) return await dispatchReplMessageTool(name, args);
@@ -222,11 +299,11 @@ function buildReplTools(): {
         agentDispatchTool: dispatch,
         buildChildToolCatalog: (childCwd: string) => {
           const cli = require('../cli/agent-cli.js') as typeof import('../cli/agent-cli.js');
-          return cli.buildCliAgentTools(undefined, undefined, childCwd);
+          return cli.buildCliAgentTools(undefined, undefined, childCwd, {});
         },
         getToolRuntime: () => undefined,
         dispatchToolRuntime: async (n) => ({ error: `runtime unavailable in REPL: ${n}` }),
-        dispatchPluginTool: async (n) => ({ ok: false as const, error: `plugin unavailable in REPL: ${n}` }),
+        dispatchPluginTool: pluginBridge.dispatchPluginTool,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -375,8 +452,22 @@ async function runOneTurn(
   onJsonDelta?: (delta: string) => void,
   onJsonStatus?: (line: string) => void,
   onJsonReplace?: (fullText: string) => void,
+  onJsonAgent?: (event: AgentDisplayEvent) => void,
+  onJsonMessageBlock?: (block: import('../conv-substrate/message-block.js').MessageBlock) => void,
+  onJsonShellActivity?: (event: ReplShellActivity) => void,
+  signal?: AbortSignal,
+  shellSnapshotTurnId?: string,
+  onJsonToolActivity?: (event: ReplToolActivity) => void,
+  onPushNowRequest?: (requestId: string, phase: 'probe' | 'commit', activeTools: string[]) => void,
 ): Promise<{ reply: string; provider: string; model: string | null; durationMs: number; logPath: string | null; goalComplete?: boolean; goalStopReason?: string }> {
   const startedAt = Date.now();
+  let memorySaveFailed = false;
+  (require('../tui/persistent-user-memory.js') as typeof import('../tui/persistent-user-memory.js'))
+    .rememberExplicitTuiUserFact(userText, undefined, () => { memorySaveFailed = true; });
+  if (memorySaveFailed) {
+    return { reply: '기억을 저장하지 못했습니다. 저장소 상태를 확인한 뒤 다시 요청해 주세요.',
+      provider: cfg.llm.provider, model: cfg.llm.model ?? null, durationMs: Date.now() - startedAt, logPath: null };
+  }
   const replyChunks: string[] = [];
   const userImages = pendingAttachments.length > 0 ? pendingAttachments.map(a => a.block) : [];
   if (!jsonOutput) {
@@ -402,10 +493,29 @@ async function runOneTurn(
   // block for this call, leaving the human prompt and system prompt intact.
   if (nextTuiNotifications) userImages.unshift({ type: 'text', text: nextTuiNotifications });
   const tuiIntent = classifyTuiChatIntent(userText, { seat: process.env.COORD_ID?.trim() !== undefined });
-  const result = await runTurn({
+  const surfaceRunId = onJsonMessageBlock ? randomUUID() : undefined;
+  const messageBlocks = onJsonMessageBlock ? createNextTuiMessageBlockEmitter({
+    sessionId, runId: surfaceRunId!, emit: onJsonMessageBlock,
+  }) : undefined;
+  const activeShellCalls = new Map<string, { id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number }>();
+  const activeToolCalls = new Map<string, { id: string; name: string }>();
+  const onShellSnapshotSignal = (): void => {
+    onJsonShellActivity?.({ phase: 'snapshot', calls: [...activeShellCalls.values()] });
+    onJsonToolActivity?.({ phase: 'snapshot', calls: [...activeToolCalls.values()] });
+  };
+  const stopShellSnapshotListener = (onJsonShellActivity || onJsonToolActivity) && shellSnapshotTurnId
+    ? shellSnapshotRouter.listen(shellSnapshotTurnId, onShellSnapshotSignal)
+    : undefined;
+  const stopPushNowListener = onPushNowRequest && shellSnapshotTurnId
+    ? pushNowRouter.listen(shellSnapshotTurnId, ({ requestId, phase }) => onPushNowRequest(requestId, phase, [...activeToolCalls.values()].map((call) => call.name)))
+    : undefined;
+  let result: Awaited<ReturnType<typeof runTurn>>;
+  try {
+    result = await runTurn({
     userConfig: cfg,
     sessionId,
     userText,
+    ...(surfaceRunId ? { surfaceRunId } : {}),
     utteranceSurface: 'tui',
     ...(tuiIntent.goalLoop ? { goalLoop: true } : {}),
     systemPrompt,
@@ -429,10 +539,28 @@ async function runOneTurn(
         process.stdout.write(`\n\n  [근거 반영된 답변]\n  ${fullText}\n`);
       }
     },
-    onStatusLine: (line) => { onJsonStatus?.(line); },
+    onStatusLine: (line) => { onJsonStatus?.(line); messageBlocks?.status(line); },
+    onGoalInterim: (text, iteration) => messageBlocks?.progress(text, [`목표 단계 ${iteration || 1} 완료`]),
+    onReasoning: (event) => { if (event.kind === 'summary_delta') messageBlocks?.thought(event.delta, true); },
     tools: replToolSpecs,
     dispatchTool: tools?.dispatch,
+    ...(signal ? { signal } : {}),
     onToolCall: (call) => {
+      messageBlocks?.toolCall(call);
+      if (jsonOutput && onJsonToolActivity) {
+        const activeCall = { id: call.id, name: call.name };
+        activeToolCalls.set(call.id, activeCall);
+        onJsonToolActivity({ phase: 'start', ...activeCall });
+      }
+      if (call.name === 'Agent') onJsonAgent?.({ phase: 'start', id: call.id,
+        ...(typeof call.args.description === 'string' ? { description: call.args.description } : {}) });
+      if (jsonOutput && onJsonShellActivity && (call.name === 'Bash' || call.name === 'RunShell')) {
+        const activeCall: { id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number } = {
+          id: call.id, name: call.name as 'Bash' | 'RunShell', startedAtMonotonicMs: monotonicNowMs(),
+        };
+        activeShellCalls.set(call.id, activeCall);
+        onJsonShellActivity({ phase: 'start', ...activeCall });
+      }
       if (!jsonOutput) {
         const args = JSON.stringify(call.args);
         const argsPreview = args.length > 100 ? args.slice(0, 100) + '…' : args;
@@ -440,6 +568,16 @@ async function runOneTurn(
       }
     },
     onToolResult: (call) => {
+      messageBlocks?.toolResult(call);
+      if (jsonOutput && onJsonToolActivity) {
+        activeToolCalls.delete(call.id);
+        onJsonToolActivity({ phase: 'finish', id: call.id, name: call.name });
+      }
+      if (call.name === 'Agent') onJsonAgent?.({ phase: 'finish', id: call.id, status: agentResultStatus(call.result) });
+      if (jsonOutput && onJsonShellActivity && (call.name === 'Bash' || call.name === 'RunShell')) {
+        activeShellCalls.delete(call.id);
+        onJsonShellActivity({ phase: 'finish', id: call.id, name: call.name });
+      }
       if (!jsonOutput) {
         let preview: string;
         if (typeof call.result === 'string') preview = call.result;
@@ -453,7 +591,11 @@ async function runOneTurn(
         process.stdout.write(`     ↳ ${preview}\n  `);
       }
     },
-  });
+    });
+  } finally {
+    stopShellSnapshotListener?.();
+    stopPushNowListener?.();
+  }
   // A failed turn keeps the buffered notifications for the next JSONL prompt.
   nextTuiDelivery?.pending.splice(0);
   const reply = jsonOutput ? replyChunks.join('') : '';
@@ -811,6 +953,11 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
         }
         cfg = nextCfg;
       }
+      if (process.env.ELANOUS_NEXT_TUI_STREAM === '1'
+        && (turn.modelTier === 'budget' || turn.modelTier === 'balanced' || turn.modelTier === 'best')) {
+        setSessionTierOverride(sessionIdRef.current, { llm: turn.modelTier, rationale: 'next TUI /model' });
+        debug.log('tui.next', 'model-tier-applied', { sessionId: sessionIdRef.current, tier: turn.modelTier });
+      }
       const turnAttachments: PendingAttachment[] = [];
       for (const ap of turn.attachments ?? []) {
         const att = loadAttachment(ap, process.cwd());
@@ -823,6 +970,12 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
       }
       const turnSystemPrompt = selfHealth ? `${systemPrompt}\n\n${selfHealth.line}` : systemPrompt;
       let result: Awaited<ReturnType<typeof runOneTurn>>;
+      const turnAbort = new AbortController();
+      const pushNowReady = new Set<string>();
+      let terminateAfterTurn = false;
+      const onTerminate = (): void => { terminateAfterTurn = true; turnAbort.abort(); };
+      const streamTurn = process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string';
+      if (streamTurn) process.once('SIGTERM', onTerminate);
       try {
         result = await runOneTurn(
           cfg,
@@ -842,12 +995,60 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
           process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
             ? (text) => { process.stdout.write(`${JSON.stringify({ event: 'replace', turnId: turn.id, text })}\n`); }
             : undefined,
+          process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
+            ? (event) => { process.stdout.write(`${JSON.stringify({ event: 'agent', turnId: turn.id, ...event })}\n`); }
+            : undefined,
+          process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string'
+            ? (block) => { process.stdout.write(`${JSON.stringify({ event: 'message-block', turnId: turn.id, block })}\n`); }
+            : undefined,
+          streamTurn
+            ? (activity) => { process.stdout.write(`${JSON.stringify({ event: 'shell-activity', turnId: turn.id, ...activity })}\n`); }
+            : undefined,
+          streamTurn ? turnAbort.signal : undefined,
+          streamTurn ? turn.id : undefined,
+          streamTurn
+            ? (activity) => { process.stdout.write(`${JSON.stringify({ event: 'tool-activity', turnId: turn.id, ...activity })}\n`); }
+            : undefined,
+          streamTurn
+            ? (requestId, phase, activeTools) => {
+              let outcome: 'ready' | 'interrupted' | 'deferred';
+              if (phase === 'probe') {
+                outcome = nextTuiPushNowDecision(activeTools) === 'interrupt' ? 'ready' : 'deferred';
+                if (outcome === 'ready') pushNowReady.add(requestId);
+              } else {
+                outcome = pushNowReady.delete(requestId) && nextTuiPushNowDecision(activeTools) === 'interrupt' ? 'interrupted' : 'deferred';
+              }
+              process.stdout.write(`${JSON.stringify({ event: 'push-now-result', turnId: turn.id, requestId, outcome, activeTools })}\n`);
+              if (outcome === 'interrupted') turnAbort.abort();
+            }
+            : undefined,
         );
       } catch (error) {
+        if (streamTurn) process.off('SIGTERM', onTerminate);
+        if (terminateAfterTurn) {
+          backgroundBridge?.dispose();
+          selfHealthTracker?.dispose();
+          process.stdin.destroy();
+          process.exit(0);
+        }
         if (!backgroundBridge) throw error;
         backgroundBridge.emit();
+        if (process.env.ELANOUS_NEXT_TUI_STREAM === '1' && typeof turn.id === 'string') {
+          process.stdout.write(`${JSON.stringify({ event: 'message-block', turnId: turn.id, block: {
+            id: `${sessionIdRef.current}:${turn.id}:error`, ts: Date.now(), source: 'system',
+            body: { kind: 'error', text: error instanceof Error ? error.message : String(error) },
+            detail: { level: 1, summary: error instanceof Error ? error.message : String(error) },
+          } })}\n`);
+        }
         console.log(JSON.stringify({ sessionId: sessionIdRef.current, error: error instanceof Error ? error.message : String(error) }));
         continue;
+      }
+      if (streamTurn) process.off('SIGTERM', onTerminate);
+      if (terminateAfterTurn) {
+        backgroundBridge?.dispose();
+        selfHealthTracker?.dispose();
+        process.stdin.destroy();
+        process.exit(0);
       }
       backgroundBridge?.emit();
       const failures = applyAsserts(result.reply, turn.asserts, undefined, turn.id ?? 't?');

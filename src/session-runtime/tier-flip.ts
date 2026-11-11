@@ -35,18 +35,15 @@ import {
 } from '../native-tool-catalog.js';
 import { collectSignals } from '../tool-hints/signals.js';
 import type { ToolIntentScope } from '../tool-hints/types.js';
-import { debug } from '../debug/log.js';
-import { buildToolRouteIndex, routeToolIntentWithFallback, toolRouteIdentity } from '../tool-router/index.js';
+import { defaultToolRoutingStrategy, type ToolRoutingStrategy } from '../tool-router/index.js';
 // Spec-only import (pure literal, zero deps) — the dispatch half of
 // ToolSearch lives in skills/tools/tool-search.ts and drags the tool
 // runtime registry with it, which has no business in this prompt seam.
 import { buildToolSearchTool, TOOL_SEARCH_NAME } from '../skills/tools/tool-search-spec.js';
 
 /** P3 웜 intent-preload (RFC §4) — userText 가 도메인/스코프 시그널을 담고
- *  있으면, 그 스코프의 deferred 툴을 **당턴 active 로 선주입**(un-defer)해
- *  ToolSearch 왕복을 없앤다. 매칭은 Arc H 와 동일한 `collectSignals` 재사용
- *  (single source of intent truth). 매칭 안 되는 스코프의 deferred 툴은
- *  그대로 deferred → ToolSearch 콜드 폴백(P4). */
+ *  있으면 native deferred 툴을 **당턴 active 로 선주입**(un-defer)한다.
+ *  Manifest plugin routes는 이 경로를 우회하고 ToolSearch에서만 활성화한다. */
 function warmPreloadScopesFromText(userText: string): ReadonlySet<ToolIntentScope> {
   const sig = collectSignals({ recentUserText: userText });
   const scopes = new Set<ToolIntentScope>();
@@ -165,7 +162,7 @@ export function splitDeferredToolSpecs(
   specs: readonly LLMToolSpec[],
   /** Override the default catalog — primarily for tests. */
   catalog: readonly NativeToolCatalogEntry[] = nativeToolCatalog,
-  /** P3 웜-preload — 이 스코프에 속한 deferred 툴은 active 로 승격(un-defer).
+  /** P3 웜-preload — 이 스코프에 속한 native deferred 툴은 active 로 승격(un-defer).
    *  omit / 빈 Set = 웜-preload 없음(전부 deferred → P4 콜드 폴백). */
   warmPreloadScopes: ReadonlySet<ToolIntentScope> = new Set(),
 ): TierSplitResult {
@@ -176,49 +173,28 @@ function splitDeferredToolSpecsInternal(
   specs: readonly LLMToolSpec[],
   catalog: readonly NativeToolCatalogEntry[],
   warmPreloadScopes: ReadonlySet<ToolIntentScope>,
-  routePreloadedNames: ReadonlySet<string> = new Set(),
 ): TierSplitResult {
   const index = buildNameIndex(catalog);
   const active: LLMToolSpec[] = [];
   const deferred: DeferredToolEntry[] = [];
   const warmPreloaded: string[] = [];
   const seen = new Set<string>();
-  const selectedRouteByName = new Map<string, string>();
-  for (const spec of specs) {
-    if (spec.pluginId && spec.route) {
-      const identity = toolRouteIdentity(spec.pluginId, spec.name);
-      if (routePreloadedNames.has(identity)) selectedRouteByName.set(spec.name, identity);
-    }
-  }
   for (const spec of specs) {
     const entry = index.get(spec.name.toLowerCase());
     const manifestRoute = !!spec.pluginId && !!spec.route;
-    const specRouteIdentity = manifestRoute ? toolRouteIdentity(spec.pluginId!, spec.name) : undefined;
-    const routePreloaded = specRouteIdentity !== undefined && routePreloadedNames.has(specRouteIdentity);
-    const selectedRoute = selectedRouteByName.get(spec.name);
-    if (selectedRoute && specRouteIdentity !== selectedRoute) continue;
-    const canWarmRoute = routePreloaded && spec.route?.risk === 'low'
-      && spec.route.sideEffects === 'read-only' && !spec.route.requiresConfirm;
-    if (manifestRoute && !canWarmRoute) {
+    if (manifestRoute) {
       // Manifest route identity is an explicit surface-local route allowlist.
-      // Keep it deferred even if a same-name native catalog entry is hidden;
-      // route: hydration resolves the exact plugin identity from surfaceSpecs.
+      // Keep every route schema out of the provider list; route: and select:
+      // hydration resolve the exact plugin identity from surfaceSpecs.
       const name = entry?.displayName ?? spec.name;
       if (!seen.has(name)) deferred.push({ name, summary: entry?.promptSummary ?? synthesiseFallbackSummary(spec) });
       seen.add(name);
       continue;
     }
     if (entry && isDeferred(entry)) {
-      if (routePreloaded) {
-        for (let i = deferred.length - 1; i >= 0; i--) if (deferred[i]?.name === entry.displayName) deferred.splice(i, 1);
-        active.push(spec);
-        if (!seen.has(entry.displayName)) warmPreloaded.push(entry.displayName);
-        seen.add(entry.displayName);
-        continue;
-      }
       // P3 — turn intent 가 이 툴의 스코프를 활성화했으면 defer 하지 않고
       // active 로 선주입(왕복 0). 매칭 안 되면 deferred 유지(P4 폴백).
-      if (entry.intentScope && warmPreloadScopes.has(entry.intentScope)) {
+      if (entry.warmPreload !== false && entry.intentScope && warmPreloadScopes.has(entry.intentScope)) {
         active.push(spec);
         if (!seen.has(entry.displayName)) warmPreloaded.push(entry.displayName);
         seen.add(entry.displayName);
@@ -231,12 +207,6 @@ function splitDeferredToolSpecsInternal(
         summary: entry.promptSummary,
       });
     } else if (!entry && isDynamicallyDeferred(spec)) {
-      if (routePreloaded) {
-        active.push(spec);
-        if (!seen.has(spec.name)) warmPreloaded.push(spec.name);
-        seen.add(spec.name);
-        continue;
-      }
       if (seen.has(spec.name)) continue;
       seen.add(spec.name);
       deferred.push({
@@ -244,12 +214,6 @@ function splitDeferredToolSpecsInternal(
         summary: synthesiseFallbackSummary(spec),
       });
     } else if (!entry && isImplicitlyDeferredByName(spec.name)) {
-      if (routePreloaded) {
-        active.push(spec);
-        if (!seen.has(spec.name)) warmPreloaded.push(spec.name);
-        seen.add(spec.name);
-        continue;
-      }
       // No catalog entry but the byname fallback says this is
       // specialised + rarely used. Render with a synthesised
       // promptSummary derived from the spec itself — the LLM still
@@ -436,10 +400,14 @@ export interface ApplyDeferredToolsResult {
  *  baseline measurement). */
 export interface ApplyDeferredToolsOpts {
   enabled?: boolean;
+  /** Index discovery is the default; native-all explicitly restores the full native schema surface. */
+  routingStrategy?: ToolRoutingStrategy;
+  /** When provided, route preloading considers only these currently active plugins. */
+  activePluginIds?: ReadonlySet<string>;
   catalog?: readonly NativeToolCatalogEntry[];
   /** P3 웜 intent-preload (RFC §4) — 이번 턴 userText. 도메인/스코프 시그널이
-   *  있으면 그 스코프의 deferred 툴을 active 로 선주입해 ToolSearch 왕복을
-   *  없앤다. omit 시 웜-preload 없음(모든 deferred 툴은 P4 콜드 폴백). */
+   *  있으면 native deferred 툴을 active 로 선주입해 ToolSearch 왕복을 없앤다.
+   *  Manifest plugin routes는 이 preloading에서 제외한다. */
   userText?: string;
 }
 
@@ -448,9 +416,13 @@ export function applyDeferredTools(
   tools: readonly LLMToolSpec[],
   opts: ApplyDeferredToolsOpts = {},
 ): ApplyDeferredToolsResult {
-  const enabled = opts.enabled ?? true;
+  const enabled = opts.enabled ?? defaultToolRoutingStrategy(opts.routingStrategy) === 'index';
   const catalog = opts.catalog ?? nativeToolCatalog;
-  if (tools.length === 0) {
+  // The caller's tool pool is the turn's active surface; an explicit set may narrow it.
+  const activePluginIds = opts.activePluginIds ?? new Set(tools.flatMap((tool) => tool.pluginId ? [tool.pluginId] : []));
+  const availableTools = tools.filter((tool) => !tool.pluginId || activePluginIds.has(tool.pluginId));
+  const routeSpecs = availableTools.filter((tool) => !!tool.pluginId && !!tool.route);
+  if (availableTools.length === 0) {
     return {
       messages: messages.slice(),
       tools: [],
@@ -467,50 +439,42 @@ export function applyDeferredTools(
     };
   }
   if (!enabled) {
+    const routeNames = new Set<string>();
+    const deferred = routeSpecs.flatMap((tool) => {
+      const entry = catalog.find((candidate) => candidate.displayName.toLowerCase() === tool.name.toLowerCase() ||
+        candidate.id.toLowerCase() === tool.name.toLowerCase() || candidate.aliases.some((alias) => alias.toLowerCase() === tool.name.toLowerCase()));
+      const name = entry?.displayName ?? tool.name;
+      if (routeNames.has(name)) return [];
+      routeNames.add(name);
+      return [{ name, summary: entry?.promptSummary ?? synthesiseFallbackSummary(tool) }];
+    });
+    const active = availableTools.filter((tool) => !(tool.pluginId && tool.route));
+    let toolSearchInjected = false;
+    if (deferred.length > 0 && !active.some((tool) => tool.name === TOOL_SEARCH_NAME)) {
+      active.push(buildToolSearchTool());
+      toolSearchInjected = true;
+    }
+    const rewritten = deferred.length > 0 ? injectDeferredAnnounce(messages, buildDeferredToolsPromptBlock(deferred)) : messages.slice();
     return {
-      messages: messages.slice(),
-      tools: tools.slice(),
+      messages: rewritten,
+      tools: active,
       stats: {
-        activeCount: tools.length,
-        deferredCount: 0,
+        activeCount: active.length,
+        deferredCount: deferred.length,
         warmPreloaded: 0,
         unhydratableCount: 0,
-        deferredNames: [],
+        deferredNames: deferred.map(({ name }) => name),
         unhydratableNames: [],
-        injected: false,
-        toolSearchInjected: false,
+        injected: deferred.length > 0,
+        toolSearchInjected,
       },
     };
   }
-  // P3 — turn intent 로 웜-preload 스코프 계산(userText 있을 때만).
+  // P3 — native deferred specs에만 적용할 intent preload scope.
   const warmScopes = opts.userText
     ? warmPreloadScopesFromText(opts.userText)
     : new Set<ToolIntentScope>();
-  const routedNames = new Set<string>();
-  if (opts.userText) {
-    const routeSpecs = tools.filter((tool) => tool.pluginId && tool.route);
-    if (routeSpecs.length > 0) {
-      const enabledPluginIds = new Set(routeSpecs.map((tool) => tool.pluginId!));
-      const decision = routeToolIntentWithFallback(opts.userText, () => buildToolRouteIndex(routeSpecs.map((tool) => ({
-        pluginId: tool.pluginId!,
-        tools: [{ name: tool.name, description: tool.description, route: tool.route! }],
-      }))), { enabledPluginIds, limit: 1 });
-      for (const match of decision.matches.slice(0, 1)) {
-        // Warm-load only the top reversible, low-risk schema. Higher impact
-        // routes remain discoverable through ToolSearch and retain confirmation gates.
-        if (match.route.risk === 'low' && match.route.sideEffects === 'read-only' && !match.route.requiresConfirm) {
-          routedNames.add(toolRouteIdentity(match.pluginId, match.name));
-        }
-      }
-      debug.log('tool.route', 'route-decision', {
-        source: 'turn-preload', queryLength: opts.userText.length, mode: decision.mode,
-        miss: decision.miss, matches: decision.matches.map(({ pluginId, name, score, route }) => ({
-          pluginId, name, score, risk: route.risk, sideEffects: route.sideEffects, preloaded: routedNames.has(toolRouteIdentity(pluginId, name)),
-        })),
-      });
-    }
-  }
-  const { active, deferred, warmPreloaded, unhydratable, toolSearchInjected } = splitDeferredToolSpecsInternal(tools, catalog, warmScopes, routedNames);
+  const { active, deferred, warmPreloaded, unhydratable, toolSearchInjected } = splitDeferredToolSpecsInternal(availableTools, catalog, warmScopes);
   if (deferred.length === 0) {
     return {
       messages: messages.slice(),

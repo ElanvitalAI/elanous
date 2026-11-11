@@ -96,8 +96,9 @@ export function analyzeImportGraphScc(
   selectionStatus: ImportGraphSelectionStatus,
   options: ClosureOptions = {},
   changedFiles: readonly string[] = [],
+  preparedGraph?: ClosureGraph,
 ): ImportGraphSccReport {
-  const graph = buildClosureGraph(tree, options);
+  const graph = preparedGraph ?? buildClosureGraph(tree, options);
   const changedFileImpactsReport = changedFileImpacts(graph, tree.preload, changedFiles);
   const tests = [...new Set(selectedTests)].sort();
   const missingTests = tests.filter((test) => !graph.staticImports.has(test));

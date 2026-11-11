@@ -8,6 +8,8 @@ When advancing `deviceCatalogVersion`, first set membership for the new version 
 
 The independent-writer simulation merges real catalog source-module fragments and device membership fragments, then runs the normal loader and history refresh command. It verifies that both additions appear in the new current snapshot while the shared history file stays untouched by the PR changes.
 
+The merge train uses the `uxsim-history` driver when two branches have refreshed the aggregate history. It combines version keys and membership additions, then regenerates and validates the result against the per-device fragments. Add membership in the device fragments first; the train writes the aggregate history.
+
 ```sh
 bun scripts/generate-sim-world-device-catalogs.ts
 bun test scripts/generate-sim-world-device-catalogs.test.ts

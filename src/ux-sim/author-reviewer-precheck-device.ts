@@ -1,6 +1,6 @@
 import type { LLMMessage, streamLLM as StreamLLM } from '../llm.js';
 import { executeGoalAuthorReviewerPrecheck, runGoalAuthorReviewerPrecheck } from '../self-implement/goal-author.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { debug } from '../debug/log.js';
 
 export type AuthorReviewerPrecheckVariant = 'applied' | 'rejected-unprovable';

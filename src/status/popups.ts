@@ -1,8 +1,7 @@
 // MX5 — Status-bar pill popup factories.
 //
 // R1.3 policy lock: status-bar transient popups are popup-tier modal
-// surfaces, not overlay-host sprites. See
-// `src/display/transient-overlay-policy.ts`.
+// surfaces, not overlay-host sprites.
 //
 // When the user clicks on the model pill or sessionCwd pill in the
 // status bar, this module produces a SelectView-backed modal

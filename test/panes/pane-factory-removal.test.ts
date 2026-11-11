@@ -7,14 +7,14 @@ const removed = [
   'src/acp/resident-shell.ts',
   'src/dashboard/sim-shell.ts',
   'src/iul/resident-vw.ts',
+  'src/iul/sidebar-shell.ts',
   'src/sim/resident-vw.ts',
+  'src/preview-pane/mount.ts',
+  'src/browser-pane/mount.ts',
 ];
 const remaining = [
   'src/panes/factory.ts',
   'src/panes/index.ts',
-  'src/browser-pane/mount.ts',
-  'src/preview-pane/mount.ts',
-  'src/iul/sidebar-shell.ts',
   'src/acp/channel-browser-shell.ts',
 ];
 
@@ -33,7 +33,7 @@ describe('retired virtual-window pane factories', () => {
     for (const path of remaining) {
       expect(source(path)).not.toMatch(/from ['"][^'"]*virtual-windows\//);
     }
-    for (const dir of ['src/panes', 'src/browser-pane', 'src/preview-pane', 'src/iul', 'src/acp', 'src/sim']) {
+    for (const dir of ['src/panes', 'src/browser-pane', 'src/preview-pane', 'src/acp', 'src/sim']) {
       for (const entry of readdirSync(resolve(import.meta.dir, '../..', dir), { withFileTypes: true })) {
         if (entry.isFile() && entry.name.endsWith('.ts')) {
           expect(source(`${dir}/${entry.name}`)).not.toContain('virtual-windows');
@@ -43,9 +43,6 @@ describe('retired virtual-window pane factories', () => {
     expect(source('src/panes/factory.ts')).not.toContain('resolveFromContent');
     expect(source('src/panes/index.ts')).not.toContain('content-adapter');
     for (const [path, factory] of [
-      ['src/browser-pane/mount.ts', 'createBrowserPaneContent'],
-      ['src/preview-pane/mount.ts', 'createPreviewPaneContent'],
-      ['src/iul/sidebar-shell.ts', 'createIulSidebarShellPaneContent'],
       ['src/acp/channel-browser-shell.ts', 'createAcpChannelBrowserPaneContent'],
     ]) {
       expect(source(path)).not.toContain(factory);
@@ -53,9 +50,6 @@ describe('retired virtual-window pane factories', () => {
   });
 
   test('modal and sidebar view exports remain present', () => {
-    expect(source('src/browser-pane/mount.ts')).toContain('export function openBrowserPaneModal(');
-    expect(source('src/preview-pane/mount.ts')).toContain('export function openPreviewPaneModal(');
-    expect(source('src/iul/sidebar-shell.ts')).toContain('export function createIulSidebarShellView(');
     expect(source('src/acp/channel-browser-shell.ts')).toContain('export function createAcpChannelBrowserView(');
   });
 });

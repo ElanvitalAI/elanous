@@ -1,0 +1,60 @@
+apiVersion: elanous.app/v0
+slug: lecture-scrap
+title: 강의 노트 · 스크랩
+template: next-app-lecture-scrap
+
+frontend:
+  kind: static-export
+  out: out/
+
+design:
+  description: 강의 자료를 모으고 노트를 적어 한 번에 찾는다
+  screens:
+    - { path: /, title: 스크랩 목록 }
+    - { path: /notes/new, title: 노트 작성 }
+    - { path: /search, title: 검색 }
+
+tables:
+  scraps:
+    columns:
+      id: { type: text, primary: true }
+      title: { type: text }
+      url: { type: text }
+      excerpt: { type: text }
+      created_at: { type: timestamp, default: now }
+    realtime: true
+  lecture_notes:
+    columns:
+      id: { type: text, primary: true }
+      title: { type: text }
+      body: { type: text }
+      created_at: { type: timestamp, default: now }
+    realtime: true
+
+roles:
+  owner: { via: nexus-session }
+  public: { via: public-read }
+
+rpc:
+  listScraps:
+    sql: SELECT id, title, url, excerpt, created_at FROM scraps ORDER BY created_at DESC LIMIT :limit
+    params:
+      limit: { type: int, max: 200, default: 50 }
+    allow: [owner, public]
+  addLectureNote:
+    sql: INSERT INTO lecture_notes (id, title, body, created_at) VALUES (:id, :title, :body, :created_at)
+    params:
+      id: { type: text }
+      title: { type: text }
+      body: { type: text }
+      created_at: { type: timestamp }
+    allow: [owner]
+  searchLibrary:
+    sql: SELECT id, title, excerpt FROM scraps WHERE title LIKE :query OR excerpt LIKE :query UNION ALL SELECT id, title, body AS excerpt FROM lecture_notes WHERE title LIKE :query OR body LIKE :query LIMIT :limit
+    params:
+      query: { type: text }
+      limit: { type: int, max: 200, default: 50 }
+    allow: [owner, public]
+
+storage:
+  prefix: apps/lecture-scrap/

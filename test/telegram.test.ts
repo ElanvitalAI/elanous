@@ -68,6 +68,7 @@ function baseConfig(): UserConfig {
       allowDashboardTerminalInject: false,
       allowDashboardApiCall: false,
       allowDashboardRunShell: false,
+      bashApproval: 'dangerous',
     },
     chat: {
       conciseness: { enabled: true, finalMessageMaxLines: 10, preambleMaxWords: 12, flatBullets: true },
@@ -133,6 +134,8 @@ const FAST_TG_OPTS = {
   perChatGapMs: 0,
   streamEditGapMs: 0,
 } as const;
+
+const TINY_TELEGRAM_CHUNK_LIMIT = '0123456789'.length;
 
 let root: string;
 beforeEach(() => {
@@ -342,18 +345,62 @@ describe('TelegramBot', () => {
     expect(calls[0].body.text).toBe('hello');
   });
 
-  test('sendMessage chunks long text', async () => {
+  test('sendMessage includes reply markup for plain-text messages', async () => {
     const { fetchImpl, calls } = makeStubFetch(() => ({}));
+    const bot = new TelegramBot({ token: 't', allowedUsers: [], onMessage: async () => undefined, fetchImpl, ...FAST_TG_OPTS });
+    const replyMarkup = { inline_keyboard: [[{ text: '브리핑 보기', callback_data: 'briefing:brief-7' }]] };
+    await bot.sendMessage(42, '오늘의 브리핑', { markdown: false, replyMarkup });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.body.reply_markup).toEqual(replyMarkup);
+  });
+
+  test('sendMessage chunks long text', async () => {
+    const { fetchImpl, calls } = makeStubFetch(() => ({ message_id: 1 }));
     const bot = new TelegramBot({
       token: 't', allowedUsers: [],
       onMessage: async () => undefined,
       fetchImpl,
-      maxMessageChars: 10,
+      maxMessageChars: TINY_TELEGRAM_CHUNK_LIMIT,
       ...FAST_TG_OPTS,
     });
     await bot.sendMessage(42, 'x'.repeat(35));
-    expect(calls.length).toBeGreaterThan(1);
+    expect(calls).toHaveLength(splitForTelegram('x'.repeat(35), TINY_TELEGRAM_CHUNK_LIMIT).length);
     expect(calls.every(c => c.url.includes('/sendMessage'))).toBe(true);
+  });
+
+  test('sendMessage attaches action buttons only to the final chunk', async () => {
+    const { fetchImpl, calls } = makeStubFetch(() => ({ message_id: 1 }));
+    const bot = new TelegramBot({
+      token: 't', allowedUsers: [], onMessage: async () => undefined, fetchImpl,
+      maxMessageChars: TINY_TELEGRAM_CHUNK_LIMIT, ...FAST_TG_OPTS,
+    });
+    const replyMarkup = { inline_keyboard: [[{ text: 'OK', callback_data: 'suggest_accept:brief-1' }]] };
+    await bot.sendMessage(42, 'x'.repeat(35), { markdown: false, replyMarkup });
+    expect(calls).toHaveLength(splitForTelegram('x'.repeat(35), TINY_TELEGRAM_CHUNK_LIMIT).length);
+    expect(calls.slice(0, -1).every((call) => call.body.reply_markup === undefined)).toBe(true);
+    expect(calls.at(-1)?.body.reply_markup).toEqual(replyMarkup);
+  });
+
+  test('sendMessage fails closed when the final action chunk has no message id', async () => {
+    let sends = 0;
+    const { fetchImpl } = makeStubFetch(() => ({ message_id: ++sends === 1 ? 1 : undefined }));
+    const bot = new TelegramBot({
+      token: 't', allowedUsers: [], onMessage: async () => undefined, fetchImpl,
+      maxMessageChars: TINY_TELEGRAM_CHUNK_LIMIT, ...FAST_TG_OPTS,
+    });
+    const replyMarkup = { inline_keyboard: [[{ text: 'OK', callback_data: 'suggest_accept:brief-1' }]] };
+    await expect(bot.sendMessage(42, 'x'.repeat(25), { markdown: false, replyMarkup })).resolves.toBeUndefined();
+  });
+
+  test.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 3])('sendMessage fails closed on invalid chunk message id %p', async (invalidId) => {
+    let sends = 0;
+    const { fetchImpl } = makeStubFetch(() => ({ message_id: ++sends === 1 ? invalidId : 2 }));
+    const bot = new TelegramBot({
+      token: 't', allowedUsers: [], onMessage: async () => undefined, fetchImpl,
+      maxMessageChars: TINY_TELEGRAM_CHUNK_LIMIT, ...FAST_TG_OPTS,
+    });
+    await expect(bot.sendMessage(42, 'x'.repeat(25), { markdown: false })).resolves.toBeUndefined();
+    expect(sends).toBe(splitForTelegram('x'.repeat(25), TINY_TELEGRAM_CHUNK_LIMIT).length);
   });
 
   test('reaction emoji start and success stay on without a config switch', async () => {

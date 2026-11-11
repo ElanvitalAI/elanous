@@ -15,7 +15,10 @@ import { loadDeviceCatalogSnapshotsFromRoot } from './device-catalog-snapshot-fr
  */
 const WORLD_FORMAT = 1;
 const WORLD_ID = /^[a-z0-9](?:[a-z0-9-]{0,62})$/;
-const DEVICE_CATALOGS_BY_VERSION = loadDeviceCatalogSnapshotsFromRoot(fileURLToPath(new URL('../..', import.meta.url)));
+let deviceCatalogsByVersionCache: Record<string, string[]> | undefined;
+function deviceCatalogsByVersion(): Record<string, string[]> {
+  return deviceCatalogsByVersionCache ??= loadDeviceCatalogSnapshotsFromRoot(fileURLToPath(new URL('../..', import.meta.url)));
+}
 
 export interface SimWorld {
   readonly id: string;
@@ -179,7 +182,7 @@ function validateDeviceModules(
     throw new Error(`sim world device catalog version is invalid: ${rootDir}`);
   }
   const catalogVersion = String(manifest.deviceCatalogVersion);
-  const catalogIdsForVersion = DEVICE_CATALOGS_BY_VERSION[catalogVersion];
+  const catalogIdsForVersion = deviceCatalogsByVersion()[catalogVersion];
   if (!catalogIdsForVersion) throw new Error(`sim world device catalog version is unsupported: ${rootDir}`);
   if (!Array.isArray(ids) || ids.length === 0 || ids.some((id) => typeof id !== 'string' || !/^MD-[A-Z0-9-]+$/.test(id))
     || new Set(ids).size !== ids.length) {

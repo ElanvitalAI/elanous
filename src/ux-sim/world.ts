@@ -1,4 +1,4 @@
-import { chmodSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants as fsConstants, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
@@ -8,16 +8,20 @@ import dgram from 'node:dgram';
 import dns from 'node:dns';
 import dnsPromises from 'node:dns/promises';
 import childProcess from 'node:child_process';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { delimiter, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { parseSimChaos, parseSimWorld as parseSimWorldSchema, parseSimWorldExpectation, parseSimWorldInjections, parseSimWorldProcesses, type SimChaosFault, type SimRecoveryExpectation, type SimWorldApp, type SimWorldInjection, type SimWorldProcess } from './world-schema.js';
 import { createFakeGh } from './fake-gh.js';
+import { createFakeCred } from './fake-cred.js';
+import { testFakeLlmProvider } from './fake-llm.js';
+import { createFakeFeeds } from './fake-feeds.js';
 import { createFakeKubectl } from './fake-kubectl.js';
 import { createFakeSsh } from './fake-ssh.js';
 import { createFakeFleetDevice } from './fake-fleet.js';
 import { createFakeCloudVm } from './fake-cloud-vm.js';
 import { createFakePsDevice, type FakePsDevice } from './fake-ps.js';
-import { testFakeLlmEnabled, testFakeLlmResponse } from './fake-llm.js';
+import { createSimWorldLlm, parseSimWorldLlmConfig, testFakeLlmEnabled, type SimLlmRouter, type SimWorldLlmConfig } from './fake-llm.js';
+import { getProvider, type LLMMessage } from '../llm.js';
 import { withSimClock, type SimClock } from './fake-clock.js';
 import { loadMockScenarioCatalog } from './mock-scenario-catalog.js';
 import { getTestStateRoot } from '../nexus/paths.js';
@@ -26,15 +30,21 @@ import { loadRunLedger, runLedgerDir, type RunLedgerEntry } from '../self-implem
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
 import type { HqMoveFault } from './hq-move-sim.js';
 import { isTrustedPromotionPythonBody } from '../hq/promote.js';
+import { createAppDatabase } from '../nexus/apps/app-db.js';
+import { Database } from 'bun:sqlite';
+import type { AppManifest } from '../nexus/apps/app-contract.js';
+import { runNoviceVersioningScenario, type NoviceTaskEvidence, type NoviceVersioningFault } from '../../scenarios/ux-sim/novice-versioning-scenario.js';
 
 // Capture before runInWorld's process sandbox is installed; tests can execute worlds concurrently.
 const spawnSyncForPromotion = childProcess.spawnSync;
 import { createFakeAppHost } from './fake-app-host.js';
+import { createFakeAppFailures } from './fake-app-failures.js';
 import { createFakeStt } from './fake-stt.js';
 import { fakeElevenLabsAudioBytes } from './fake-elevenlabs.js';
 import { createFakeHiggsfieldRunner } from './fake-higgsfield.js';
 import { createFakeAppStorage } from './fake-app-storage.js';
-import { createAppActions } from '../nexus/apps/app-actions.js';
+import { createRelayTrafficMeter, type RelayTrafficCapConfig } from '../relay/relay-server.js';
+import { createAppActions, handleAppActionRequest } from '../nexus/apps/app-actions.js';
 import { loadNexusAppHost } from '../nexus/apps/app-host.js';
 import { runWorldChaosSchedule, type WorldChaosAction, type WorldChaosRun, type WorldChaosScheduledEvent } from './world-chaos-runtime.js';
 import { createWorldHostChaosController } from './world-host-chaos.js';
@@ -49,6 +59,7 @@ import { podSelfImplementSpawn, type SiWarmChildAttempt } from '../task-orchestr
 import { siWarmSha256, type SiWarmCommand, type SiWarmReply, type SiWarmReturnedBytes } from '../task-orchestrator/surfaces/pod-si-warm-protocol.js';
 import type { ChildPodReuseOperations } from '../task-orchestrator/surfaces/pod-child-reuse.js';
 import type { AppSimulationResult } from '../nexus/apps/app-simulation.js';
+import { runMultiActorSimulation } from './multi-actor-world.js';
 
 /** Catalog world-event IDs map to the concrete simulation input handled by this runner. */
 const WORLD_EVENT_TO_SCENARIO_INPUT: Readonly<Record<string, string>> = {
@@ -75,6 +86,7 @@ export interface SimWorldSpec {
   clock?: { start: string; speed: number };
   hosts?: Array<{ name: string; arch: 'arm64' | 'amd64'; cpu: number; pools: string[]; egress: boolean }>;
   providers?: Record<string, Record<string, unknown>>;
+  llm?: SimWorldLlmConfig;
   github?: { repo: string; openPRs: number };
   seats?: string[];
   apps?: SimWorldApp[];
@@ -93,7 +105,7 @@ export interface SimWorld {
   readonly networkEvents: SimNetworkEvent[];
 }
 
-export interface AssembledWorld { devices: Map<string, unknown>; appHost?: ReturnType<typeof createFakeAppHost> }
+export interface AssembledWorld { devices: Map<string, unknown>; appHost?: ReturnType<typeof createFakeAppHost>; llm?: SimLlmRouter }
 export interface WorldExecutionRuntime {
   runPromotionPython(source: string, home: string, env: Record<string, string>): { status: number | null; stdout: string; stderr: string };
 }
@@ -107,11 +119,15 @@ export interface WorldScenarioResult {
   pass: boolean;
   observations: Array<{
     event: string; verdict: string; gateOutcome?: string; gateError?: string | null;
+    invariant?: 'pass' | 'fail' | 'unmeasured'; durationMs?: number | null;
     placements?: readonly { context: string; files: readonly string[]; available: boolean }[];
     reassignments?: readonly { from: string; to: string; files: readonly string[] }[];
     completedFiles?: readonly string[];
   }>;
   devices: string[];
+  /** Redacted cassette request hashes used by this world, for scoped E4.5 downgrades. */
+  recordingIds?: string[];
+  load?: SimLoadResult;
   recovery?: WorldChaosRun;
   verdict?: 'green' | 'yellow' | 'red';
   fidelity?: Array<{ deviceId: string; verdict: 'green' | 'yellow' | 'unmeasured'; failedRecordingIds: string[] }>;
@@ -119,16 +135,485 @@ export interface WorldScenarioResult {
   publicShare?: { status: number; version: string; body: string };
   /** App-scoped projection consumed by the operator AppSimLiveView. */
   appSimulation?: AppSimulationResult;
+  appSimulationEvidence?: { events: string[]; tableRows: Record<string, number>; screenText: string; screenStatus?: 'unmeasured' };
+  noviceVersioning?: { tasks: NoviceTaskEvidence[]; elapsedBasis: 'screen-and-action estimate' };
+  externalNetworkEvents?: SimNetworkEvent[];
 }
 
-function worldWatchObservations(world: SimWorld, runId: string): Array<{ event: string; verdict: string }> {
-  const rows: Array<{ event: string; verdict: string }> = [];
+/** Structural contract shared with runWorldRegressionSuite (R-MKT #36347). */
+export type SuiteTarget = 'sim' | 'real';
+export interface SuiteCase {
+  readonly id: string;
+  readonly worldFile: string;
+  readonly scenarioFile: string;
+  readonly baselineFile: string;
+}
+export interface SuiteReceipt {
+  readonly pass: boolean;
+  readonly steps: readonly { readonly id: string; readonly outcome: string; readonly invariant: string; readonly durationMs: number | null }[];
+  readonly eventKinds: readonly string[];
+}
+/** Build the R-MKT injection callback. `real` stays unmeasured until an OS-isolated worker
+ * exists; an in-process adapter cannot enforce cancellation or write boundaries. */
+export function createWorldRegressionTargetRunner(): {
+  run(item: SuiteCase, target: SuiteTarget): Promise<SuiteReceipt>;
+} {
+  return { run: async (item, target) => {
+    if (target !== 'sim' && target !== 'real') throw new Error(`unsupported suite target: ${String(target)}`);
+    if (target === 'sim') {
+      if (!getTestStateRoot()) throw new Error('sim target requires an explicit --test universe');
+      const world = await createWorld(item.worldFile);
+      try {
+        const result = await runWorldScenario(world, item.scenarioFile);
+        const observations = result.observations;
+        return {
+          pass: result.pass,
+          steps: observations.map((row) => ({ id: row.event, outcome: row.gateOutcome ?? row.verdict,
+            invariant: row.invariant ?? (row.gateOutcome === 'ok' ? 'pass' : row.gateOutcome === 'fail' ? 'fail' : 'unmeasured'),
+            durationMs: row.durationMs ?? null })),
+          eventKinds: [...observations.map((row) => row.event), ...(result.recovery?.timeline.map((event) => event.kind) ?? [])],
+        };
+      } finally { await destroyWorld(world); }
+    }
+    return (await import('./real-target-sandbox.js')).runRealTargetSandbox(item);
+  } };
+}
+
+function worldWatchObservations(world: SimWorld, runId: string): WorldScenarioResult['observations'] {
+  const rows: WorldScenarioResult['observations'] = [];
   const push = rows.push.bind(rows);
   rows.push = (...events) => {
     appendSimWorldWatchEvents(world, runId, events);
     return push(...events);
   };
   return rows;
+}
+
+export interface SimLoadStage { readonly target: number; readonly perMs?: number; readonly forMs: number }
+export interface SimLoadTrafficCap {
+  readonly caps: RelayTrafficCapConfig;
+  readonly memberId: string;
+  readonly connectionId: string;
+  readonly bytesPerRequest: number;
+}
+export interface SimLoadConfig {
+  readonly model: 'open' | 'closed';
+  readonly stages: readonly SimLoadStage[];
+  readonly maxInFlight: number;
+  readonly thinkTimeMs: number;
+  readonly serviceTimeMs: number;
+  readonly trafficCap?: SimLoadTrafficCap;
+}
+export type SimLoadMetric = 'step.duration.p50' | 'step.duration.p95' | 'errors.rate' | 'arrivals.delivered_ratio' | 'iterations.completed' | 'vus.active';
+export interface SimLoadThreshold { readonly metric: SimLoadMetric; readonly operator: 'lt' | 'lte' | 'gt' | 'gte'; readonly value: number }
+export interface SimLoadResult {
+  readonly model: 'open' | 'closed';
+  readonly planned: number;
+  readonly started: number;
+  readonly completed: number;
+  readonly dropped: number;
+  readonly errors: number;
+  readonly errorsRate: number | null;
+  readonly deliveredRatio: number | null;
+  readonly activePeak: number;
+  readonly latencyMs: { readonly p50: number | null; readonly p95: number | null };
+  readonly metrics: Readonly<Record<SimLoadMetric, number | null>>;
+  readonly thresholds: readonly { readonly metric: SimLoadMetric; readonly operator: SimLoadThreshold['operator']; readonly value: number; readonly actual: number | null; readonly passed: boolean }[];
+  readonly pass: boolean;
+}
+
+const MAX_SIM_LOAD_ITERATIONS = 100_000;
+
+function loadDurationMs(value: unknown, path: string): number {
+  if (typeof value !== 'string') throw new Error(`${path} must be a duration such as 1s or 5m`);
+  const match = /^\+?(0|[1-9]\d*)(ms|s|m|h)$/.exec(value);
+  if (!match) throw new Error(`${path} must be a duration such as 1s or 5m`);
+  const amount = Number(match[1]);
+  const duration = amount * ({ ms: 1, s: 1_000, m: 60_000, h: 3_600_000 } as const)[match[2] as 'ms' | 's' | 'm' | 'h'];
+  if (!Number.isSafeInteger(duration) || duration <= 0) throw new Error(`${path} must be a positive safe duration`);
+  return duration;
+}
+
+export function parseSimLoadConfig(value: unknown, thresholdValue?: unknown): { config: SimLoadConfig; thresholds: SimLoadThreshold[] } {
+  const row = object(value, 'scenario.load');
+  const allowed = ['model', 'stages', 'maxInFlight', 'thinkTime', 'serviceTime', 'trafficCap'];
+  const unknown = Object.keys(row).find((key) => !allowed.includes(key));
+  if (unknown) throw new Error(`scenario.load.${unknown} is not a supported field`);
+  const model = row.model ?? 'open';
+  if (model !== 'open' && model !== 'closed') throw new Error('scenario.load.model must be open or closed');
+  if (!Array.isArray(row.stages) || row.stages.length === 0) throw new Error('scenario.load.stages must be a non-empty list');
+  const stages = row.stages.map((candidate, index): SimLoadStage => {
+    const path = `scenario.load.stages[${index}]`;
+    const stage = object(candidate, path);
+    const stageUnknown = Object.keys(stage).find((key) => !['target', 'per', 'for'].includes(key));
+    if (stageUnknown) throw new Error(`${path}.${stageUnknown} is not a supported field`);
+    const minimumTarget = 0;
+    if (!Number.isSafeInteger(stage.target) || Number(stage.target) < minimumTarget) {
+      throw new Error(`${path}.target must be an integer >= ${minimumTarget}`);
+    }
+    const forMs = loadDurationMs(stage.for, `${path}.for`);
+    const perMs = stage.per === undefined ? undefined : loadDurationMs(stage.per, `${path}.per`);
+    if (model === 'open' && perMs === undefined) throw new Error(`${path}.per is required for the open model`);
+    if (model === 'closed' && perMs !== undefined) throw new Error(`${path}.per is only valid for the open model`);
+    return { target: Number(stage.target), forMs, ...(perMs === undefined ? {} : { perMs }) };
+  });
+  if (row.maxInFlight !== undefined
+    && (!Number.isSafeInteger(row.maxInFlight) || Number(row.maxInFlight) < 1)) {
+    throw new Error('scenario.load.maxInFlight must be a positive integer');
+  }
+  if (model === 'closed' && row.maxInFlight !== undefined) throw new Error('scenario.load.maxInFlight is only valid for the open model');
+  const maxInFlight = model === 'open' ? Number(row.maxInFlight ?? 200) : Number(row.maxInFlight ?? 200);
+  if (maxInFlight > MAX_SIM_LOAD_ITERATIONS) throw new Error(`scenario.load.maxInFlight cannot exceed ${MAX_SIM_LOAD_ITERATIONS}`);
+  const thinkTimeMs = row.thinkTime === undefined ? 0 : loadDurationMs(row.thinkTime, 'scenario.load.thinkTime');
+  const serviceTimeMs = row.serviceTime === undefined ? 1 : loadDurationMs(row.serviceTime, 'scenario.load.serviceTime');
+  let trafficCap: SimLoadTrafficCap | undefined;
+  if (row.trafficCap !== undefined) {
+    const cap = object(row.trafficCap, 'scenario.load.trafficCap');
+    if (Object.keys(cap).some((key) => !['caps', 'memberId', 'connectionId', 'bytesPerRequest'].includes(key))) {
+      throw new Error('scenario.load.trafficCap has an unsupported field');
+    }
+    const caps = object(cap.caps, 'scenario.load.trafficCap.caps');
+    const free = object(caps.free, 'scenario.load.trafficCap.caps.free');
+    if (Object.keys(caps).some((key) => key !== 'free')
+      || Object.keys(free).some((key) => !['memberBytesPerMinute', 'connectionBytesPerMinute'].includes(key))) {
+      throw new Error('scenario.load.trafficCap.caps has an unsupported field');
+    }
+    if (typeof cap.memberId !== 'string' || !cap.memberId || typeof cap.connectionId !== 'string' || !cap.connectionId
+      || !Number.isSafeInteger(cap.bytesPerRequest) || Number(cap.bytesPerRequest) < 0) {
+      throw new Error('scenario.load.trafficCap requires memberId, connectionId, and nonnegative bytesPerRequest');
+    }
+    trafficCap = { caps: { free: { memberBytesPerMinute: Number(free.memberBytesPerMinute), connectionBytesPerMinute: Number(free.connectionBytesPerMinute) } },
+      memberId: cap.memberId, connectionId: cap.connectionId, bytesPerRequest: Number(cap.bytesPerRequest) };
+  }
+  const thresholds: SimLoadThreshold[] = [];
+  if (thresholdValue === undefined) throw new Error('scenario.load requires scenario.thresholds');
+  if (thresholdValue !== undefined) {
+    if (!Array.isArray(thresholdValue)) throw new Error('scenario.thresholds must be a list');
+    const allowedMetrics: readonly SimLoadMetric[] = ['step.duration.p50', 'step.duration.p95', 'errors.rate', 'arrivals.delivered_ratio', 'iterations.completed', 'vus.active'];
+    for (const [index, candidate] of thresholdValue.entries()) {
+      const threshold = object(candidate, `scenario.thresholds[${index}]`);
+      const keys = Object.keys(threshold).filter((key) => ['lt', 'lte', 'gt', 'gte'].includes(key));
+      if (Object.keys(threshold).some((key) => !['metric', ...keys].includes(key)) || keys.length !== 1) {
+        throw new Error(`scenario.thresholds[${index}] must contain metric and exactly one comparison`);
+      }
+      if (typeof threshold.metric !== 'string' || !allowedMetrics.includes(threshold.metric as SimLoadMetric)) {
+        throw new Error(`scenario.thresholds[${index}].metric is unsupported`);
+      }
+      const metric = threshold.metric as SimLoadMetric;
+      if (model === 'open' && (metric === 'iterations.completed' || metric === 'vus.active')) {
+        throw new Error(`scenario.thresholds[${index}].metric ${metric} requires the closed model`);
+      }
+      if (model === 'closed' && metric === 'arrivals.delivered_ratio') {
+        throw new Error(`scenario.thresholds[${index}].metric arrivals.delivered_ratio requires the open model`);
+      }
+      const operator = keys[0] as SimLoadThreshold['operator'];
+      const rawValue = threshold[operator];
+      const isLatencyMetric = metric === 'step.duration.p50' || metric === 'step.duration.p95';
+      const value = isLatencyMetric && typeof rawValue === 'string'
+        ? loadDurationMs(rawValue, `scenario.thresholds[${index}].${operator}`)
+        : rawValue;
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        throw new Error(`scenario.thresholds[${index}].${operator} must be a nonnegative number${isLatencyMetric ? ' or duration' : ''}`);
+      }
+      thresholds.push({ metric, operator, value });
+    }
+  }
+  if (thresholds.length === 0) throw new Error('scenario.load requires at least one scenario.thresholds entry');
+  let estimated = 0;
+  if (model === 'closed') {
+    // Actual response durations are only known during execution. Bound the initial VU set here;
+    // the runtime guard below limits repeated iterations without rejecting slow valid workloads.
+    for (const stage of stages) estimated = Math.max(estimated, stage.target);
+  } else {
+    let previousRate = 0;
+    let cumulativeExpected = 0;
+    let scheduledSoFar = 0;
+    for (const stage of stages) {
+      const rate = stage.target / stage.perMs!;
+      cumulativeExpected += ((previousRate + rate) * stage.forMs) / 2;
+      const cumulativeScheduled = Math.floor(cumulativeExpected);
+      estimated += cumulativeScheduled - scheduledSoFar;
+      scheduledSoFar = cumulativeScheduled;
+      previousRate = rate;
+    }
+  }
+  if (!Number.isSafeInteger(estimated) || estimated > MAX_SIM_LOAD_ITERATIONS) {
+    throw new Error(`scenario.load plan exceeds ${MAX_SIM_LOAD_ITERATIONS} iterations`);
+  }
+  return { config: { model, stages, maxInFlight, thinkTimeMs, serviceTimeMs, ...(trafficCap ? { trafficCap } : {}) }, thresholds };
+}
+
+function percentile(samples: readonly number[], fraction: number): number | null {
+  if (!samples.length) return null;
+  const sorted = [...samples].sort((a, b) => a - b);
+  return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)]!;
+}
+
+function thresholdPass(actual: number, operator: SimLoadThreshold['operator'], value: number): boolean {
+  switch (operator) {
+    case 'lt': return actual < value;
+    case 'lte': return actual <= value;
+    case 'gt': return actual > value;
+    case 'gte': return actual >= value;
+  }
+}
+
+interface PreparedSimLoad {
+  readonly planned: number;
+  readonly actions: readonly WorldChaosAction[];
+  result(): SimLoadResult;
+}
+
+interface SimLoadQueueEntry { readonly action: WorldChaosAction; readonly order: number }
+
+function pushSimLoadQueue(heap: SimLoadQueueEntry[], entry: SimLoadQueueEntry): void {
+  let index = heap.length;
+  heap.push(entry);
+  while (index > 0) {
+    const parent = Math.floor((index - 1) / 2);
+    const current = heap[index]!;
+    const before = heap[parent]!;
+    if (before.action.atMs < current.action.atMs || (before.action.atMs === current.action.atMs && before.order <= current.order)) break;
+    heap[index] = before;
+    heap[parent] = current;
+    index = parent;
+  }
+}
+
+function popSimLoadQueue(heap: SimLoadQueueEntry[]): SimLoadQueueEntry | undefined {
+  const first = heap[0];
+  const last = heap.pop();
+  if (!first || !last || heap.length === 0) return first;
+  heap[0] = last;
+  let index = 0;
+  while (true) {
+    const left = index * 2 + 1;
+    const right = left + 1;
+    let smallest = index;
+    for (const child of [left, right]) {
+      if (child >= heap.length) continue;
+      const a = heap[child]!;
+      const b = heap[smallest]!;
+      if (a.action.atMs < b.action.atMs || (a.action.atMs === b.action.atMs && a.order < b.order)) smallest = child;
+    }
+    if (smallest === index) break;
+    [heap[index], heap[smallest]] = [heap[smallest]!, heap[index]!];
+    index = smallest;
+  }
+  return first;
+}
+
+function pushNumberHeap(heap: number[], value: number): void {
+  let index = heap.length;
+  heap.push(value);
+  while (index > 0) {
+    const parent = Math.floor((index - 1) / 2);
+    if (heap[parent]! <= heap[index]!) break;
+    [heap[parent], heap[index]] = [heap[index]!, heap[parent]!];
+    index = parent;
+  }
+}
+
+function popNumberHeap(heap: number[]): number | undefined {
+  const first = heap[0];
+  const last = heap.pop();
+  if (first === undefined || last === undefined || heap.length === 0) return first;
+  heap[0] = last;
+  let index = 0;
+  while (true) {
+    const left = index * 2 + 1;
+    const right = left + 1;
+    let smallest = index;
+    if (left < heap.length && heap[left]! < heap[smallest]!) smallest = left;
+    if (right < heap.length && heap[right]! < heap[smallest]!) smallest = right;
+    if (smallest === index) break;
+    [heap[index], heap[smallest]] = [heap[smallest]!, heap[index]!];
+    index = smallest;
+  }
+  return first;
+}
+
+function prepareSimLoad(
+  config: SimLoadConfig,
+  thresholds: readonly SimLoadThreshold[],
+  seed: number,
+  runIteration: (plannedAtMs: number, virtualUser?: number) => Promise<{ readonly status: number; readonly durationMs: number }> | { readonly status: number; readonly durationMs: number },
+): PreparedSimLoad {
+  const latencies: number[] = [];
+  let started = 0;
+  let completed = 0;
+  let dropped = 0;
+  let errors = 0;
+  let activePeak = 0;
+  let offsetMs = 0;
+  const plannedArrivals: Array<{ atMs: number; index: number }> = [];
+  const openRateSegments: Array<{ startMs: number; durationMs: number; initialRate: number; finalRate: number; cumulativeStart: number; cumulativeEnd: number }> = [];
+  const closedInitialActions: WorldChaosAction[] = [];
+  const closedStages: Array<{ readonly start: number; readonly end: number; readonly target: number }> = [];
+  let randomState = seed >>> 0;
+  const random = () => { randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0; return randomState / 0x1_0000_0000; };
+
+  if (config.model === 'open') {
+    let previousRate = 0;
+    let cumulativeExpected = 0;
+    let priorOffsetMs = 0;
+    for (const stage of config.stages) {
+      const duration = stage.forMs;
+      const finalRate = stage.target / stage.perMs!;
+      const initialRate = previousRate;
+      const stageExpected = ((initialRate + finalRate) * duration) / 2;
+      const cumulativeEnd = cumulativeExpected + stageExpected;
+      openRateSegments.push({ startMs: priorOffsetMs, durationMs: duration, initialRate, finalRate, cumulativeStart: cumulativeExpected, cumulativeEnd });
+      cumulativeExpected = cumulativeEnd;
+      previousRate = finalRate;
+      priorOffsetMs += duration;
+      offsetMs += duration;
+    }
+    const plannedCount = Math.floor(cumulativeExpected);
+    let segmentIndex = 0;
+    for (let index = 0; index < plannedCount; index += 1) {
+      const targetCount = index + random();
+      while (segmentIndex < openRateSegments.length - 1 && targetCount > openRateSegments[segmentIndex]!.cumulativeEnd) segmentIndex += 1;
+      const segment = openRateSegments[segmentIndex]!;
+      const segmentTarget = Math.max(0, targetCount - segment.cumulativeStart);
+      const slope = (segment.finalRate - segment.initialRate) / segment.durationMs;
+      const discriminant = Math.max(0, segment.initialRate * segment.initialRate + 2 * slope * segmentTarget);
+      const denominator = segment.initialRate + Math.sqrt(discriminant);
+      const atMs = segmentTarget === 0 ? 0 : (2 * segmentTarget) / denominator;
+      if (plannedArrivals.length >= MAX_SIM_LOAD_ITERATIONS) throw new Error(`scenario.load plan exceeds ${MAX_SIM_LOAD_ITERATIONS} iterations`);
+      plannedArrivals.push({ atMs: segment.startMs + Math.min(segment.durationMs, Math.max(0, atMs)), index: plannedArrivals.length });
+    }
+  } else {
+    for (const stage of config.stages) {
+      const start = offsetMs;
+      const end = start + stage.forMs;
+      closedStages.push({ start, end, target: stage.target });
+      activePeak = Math.max(activePeak, stage.target);
+      offsetMs = end;
+    }
+    let treeSize = 1;
+    while (treeSize < closedStages.length) treeSize *= 2;
+    const stageMax = new Array<number>(treeSize * 2).fill(0);
+    for (let index = 0; index < closedStages.length; index += 1) stageMax[treeSize + index] = closedStages[index]!.target;
+    for (let index = treeSize - 1; index > 0; index -= 1) stageMax[index] = Math.max(stageMax[index * 2]!, stageMax[index * 2 + 1]!);
+    const findNextEligibleStage = (vu: number, from: number): number | undefined => {
+      const find = (node: number, left: number, right: number): number | undefined => {
+        if (right <= from || stageMax[node]! <= vu) return undefined;
+        if (right - left === 1) return left < closedStages.length ? left : undefined;
+        const middle = Math.floor((left + right) / 2);
+        return find(node * 2, left, middle) ?? find(node * 2 + 1, middle, right);
+      };
+      return find(1, 0, treeSize);
+    };
+    const nextInterval = (vu: number, atMs: number, fromStage: number): { readonly stageIndex: number; readonly atMs: number; readonly end: number } | undefined => {
+      let low = fromStage;
+      let high = closedStages.length;
+      while (low < high) {
+        const middle = Math.floor((low + high) / 2);
+        if (closedStages[middle]!.end <= atMs) low = middle + 1;
+        else high = middle;
+      }
+      const stageIndex = findNextEligibleStage(vu, low);
+      if (stageIndex === undefined) return undefined;
+      const stage = closedStages[stageIndex]!;
+      const scheduledAt = Math.max(atMs, stage.start);
+      return scheduledAt < stage.end ? { stageIndex, atMs: scheduledAt, end: stage.end } : nextInterval(vu, atMs, stageIndex + 1);
+    };
+    const makeAction = (vu: number, stageIndex: number, atMs: number, end: number): WorldChaosAction => ({
+      atMs, target: `load-vu:${vu + 1}`, recordTimeline: false,
+      run: async () => {
+        if (atMs >= end) return;
+        if (planned >= MAX_SIM_LOAD_ITERATIONS) throw new Error(`scenario.load plan exceeds ${MAX_SIM_LOAD_ITERATIONS} iterations`);
+        planned += 1;
+        started += 1;
+        const result = await runIteration(atMs, vu);
+        const durationMs = Number.isFinite(result.durationMs) && result.durationMs >= 0 ? result.durationMs : 0;
+        const completionAt = atMs + Math.max(1, durationMs);
+        return [{ atMs: completionAt, target: `load-complete-vu:${vu + 1}`, recordTimeline: false, run: () => {
+          latencies.push(durationMs);
+          completed += 1;
+          if (result.status >= 400) errors += 1;
+          const nextAt = completionAt + config.thinkTimeMs;
+          const next = nextInterval(vu, nextAt, stageIndex);
+          return next ? [makeAction(vu, next.stageIndex, next.atMs, next.end)] : undefined;
+        } }];
+      },
+    });
+    for (let vu = 0; vu < activePeak; vu += 1) {
+      const first = nextInterval(vu, 0, 0);
+      if (first) closedInitialActions.push(makeAction(vu, first.stageIndex, first.atMs, first.end));
+    }
+  }
+  plannedArrivals.sort((a, b) => a.atMs - b.atMs || a.index - b.index);
+  if (plannedArrivals.length > MAX_SIM_LOAD_ITERATIONS) throw new Error(`scenario.load plan exceeds ${MAX_SIM_LOAD_ITERATIONS} iterations`);
+  let planned = config.model === 'open' ? plannedArrivals.length : 0;
+  const activeEnds: number[] = [];
+  const openActions: WorldChaosAction[] = plannedArrivals.map(({ atMs, index }) => ({
+    atMs,
+    target: `load-arrival:${index + 1}`,
+    recordTimeline: false,
+    run: async () => {
+      if (config.model === 'open') {
+        while (activeEnds[0] !== undefined && activeEnds[0]! <= atMs) popNumberHeap(activeEnds);
+        if (activeEnds.length >= config.maxInFlight) { dropped += 1; return; }
+        activePeak = Math.max(activePeak, activeEnds.length + 1);
+      }
+      const result = await runIteration(atMs);
+      const durationMs = Number.isFinite(result.durationMs) && result.durationMs >= 0 ? result.durationMs : 0;
+      started += 1;
+      if (config.model === 'open') pushNumberHeap(activeEnds, atMs + Math.max(1, durationMs));
+      const completionAt = atMs + Math.max(1, durationMs);
+      return [{ atMs: completionAt, target: `load-complete:${index + 1}`, recordTimeline: false, run: () => {
+        latencies.push(durationMs);
+        completed += 1;
+        if (result.status >= 400) errors += 1;
+      } }];
+    },
+  }));
+  const actions: WorldChaosAction[] = config.model === 'open' ? openActions : closedInitialActions;
+  return {
+    planned, actions,
+    result() {
+      const errorsRate = started === 0 ? null : errors / started;
+      const deliveredRatio = config.model === 'open' ? (planned === 0 ? null : started / planned) : null;
+      const metrics: Record<SimLoadMetric, number | null> = {
+        'step.duration.p50': percentile(latencies, 0.5),
+        'step.duration.p95': percentile(latencies, 0.95),
+        'errors.rate': errorsRate,
+        'arrivals.delivered_ratio': deliveredRatio,
+        'iterations.completed': config.model === 'closed' ? completed : null,
+        'vus.active': config.model === 'closed' ? activePeak : null,
+      };
+      const thresholdResults = thresholds.map((threshold) => {
+        const actual = metrics[threshold.metric];
+        return { ...threshold, actual, passed: actual !== null && thresholdPass(actual, threshold.operator, threshold.value) };
+      });
+      return {
+        model: config.model, planned, started, completed, dropped, errors, errorsRate, deliveredRatio, activePeak,
+        latencyMs: { p50: percentile(latencies, 0.5), p95: percentile(latencies, 0.95) }, metrics,
+        thresholds: thresholdResults, pass: thresholdResults.every((threshold) => threshold.passed),
+      };
+    },
+  };
+}
+
+/** Drive one scenario step against the deterministic open or closed arrival plan. */
+export async function runSimLoad(
+  config: SimLoadConfig,
+  thresholds: readonly SimLoadThreshold[],
+  seed: number,
+  runIteration: (plannedAtMs: number, virtualUser?: number) => Promise<{ readonly status: number; readonly durationMs: number }> | { readonly status: number; readonly durationMs: number },
+): Promise<SimLoadResult> {
+  const run = prepareSimLoad(config, thresholds, seed, runIteration);
+  const queue: SimLoadQueueEntry[] = [];
+  let nextOrder = 0;
+  for (const action of run.actions) pushSimLoadQueue(queue, { action, order: nextOrder++ });
+  while (queue.length) {
+    const action = popSimLoadQueue(queue)!.action;
+    const followUps = await action.run(() => new Date(action.atMs));
+    if (Array.isArray(followUps)) for (const followUp of followUps) pushSimLoadQueue(queue, { action: followUp, order: nextOrder++ });
+  }
+  return run.result();
 }
 
 const WORLD_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -216,6 +701,7 @@ export function parseSimWorld(source: string): SimWorldSpec {
     const rows = object(value.providers, 'world.providers');
     providers = Object.fromEntries(Object.entries(rows).map(([name, config]) => [name, object(config, `world.providers.${name}`)]));
   }
+  const llm = value.llm === undefined ? undefined : parseSimWorldLlmConfig(value.llm);
   let github: SimWorldSpec['github'];
   if (value.github !== undefined) {
     const row = object(value.github, 'world.github');
@@ -239,6 +725,7 @@ export function parseSimWorld(source: string): SimWorldSpec {
     ...(hosts?.length ? ['fake-kubectl'] : []),
     ...((Array.isArray(value.processes) && value.processes.length > 0) || (Array.isArray(value.chaos) && value.chaos.length > 0) ? ['fake-ps'] : []),
     ...(providers && Object.keys(providers).length ? ['fake-llm'] : []),
+    ...(llm ? ['fake-llm'] : []),
     ...(github ? ['fake-gh'] : []),
     ...(clock ? ['fake-clock'] : []),
     ...(apps?.length ? ['fake-clock'] : []),
@@ -255,7 +742,7 @@ export function parseSimWorld(source: string): SimWorldSpec {
   const injections = parseSimWorldInjections(value.injections);
   const expect = parseSimWorldExpectation(value.expect);
   if (expect && !chaos?.length) throw new Error('world.expect.recovers requires world.chaos');
-  if (expect && !injections?.some((injection) => injection.ledger?.length)) {
+  if (expect && !injections?.some((injection) => injection.ledger?.length) && !chaos?.some((fault) => 'disaster' in fault)) {
     throw new Error('world.expect.recovers requires injected ledger rows to measure losses');
   }
   const spec: SimWorldSpec = { world: id, seed: Number(seed), devices, events: events as SimWorldSpec['events'],
@@ -264,6 +751,7 @@ export function parseSimWorld(source: string): SimWorldSpec {
   if (clock) spec.clock = clock;
   if (hosts) spec.hosts = hosts;
   if (providers) spec.providers = providers;
+  if (llm) spec.llm = llm;
   if (github) spec.github = github;
   if (seats) spec.seats = seats;
   if (apps) spec.apps = [...apps];
@@ -349,14 +837,30 @@ function worldInjectionEvents(world: SimWorld, runId: string, injectedRows: RunL
 }
 
 /** Resolve aliases against the checked-in device catalog and construct existing in-process fakes. */
-export function assembleWorld(world: Pick<SimWorld, 'spec'>, clock?: SimClock): AssembledWorld {
-  const catalog = loadMockScenarioCatalog();
+type SimWorldLlmRuntimeOptions = { sharedCredentialProvider?: import('../llm.js').LLMProvider; fakeProvider?: import('../llm.js').LLMProvider; now?: () => number };
+
+export function assembleWorld(world: Pick<SimWorld, 'spec'> & Partial<Pick<SimWorld, 'root'>> & { llmRuntime?: SimWorldLlmRuntimeOptions }, clock?: SimClock): AssembledWorld {
+  const catalog = world.spec.devices.some((name) => name !== 'fake-llm') ? loadMockScenarioCatalog() : undefined;
   const devices = new Map<string, unknown>();
   const appHost = world.spec.apps?.length ? createFakeAppHost(world.spec.apps) : undefined;
+  const llmConfig = world.spec.llm ?? (world.spec.devices.includes('fake-llm') ? { mode: 'fake' as const } : undefined);
+  const needsSharedProvider = llmConfig?.mode === 'real' || llmConfig?.mode === 'auto'
+    || Object.values(llmConfig?.nodeModes ?? {}).some((mode) => mode === 'real' || mode === 'auto');
+  let sharedCredentialProvider = world.llmRuntime?.sharedCredentialProvider;
+  if (!sharedCredentialProvider && needsSharedProvider) {
+    try { sharedCredentialProvider = getProvider(); }
+    catch { /* Fail closed on a call when the shared credential slot is unavailable. */ }
+  }
+  const llm = llmConfig ? createSimWorldLlm(llmConfig, {
+    ...(sharedCredentialProvider ? { sharedCredentialProvider } : {}),
+    ...(world.llmRuntime?.fakeProvider ? { fakeProvider: world.llmRuntime.fakeProvider } : {}),
+    ...(world.llmRuntime?.now ? { now: world.llmRuntime.now } : {}),
+    ...(world.root ? { recordingFile: join(world.root, 'llm-cassette.json') } : {}),
+  }) : undefined;
   for (const requestedName of world.spec.devices) {
     const id = requestedName === 'fake-gh' ? 'fake-github' : requestedName === 'mail' ? 'sim-mailbox' : requestedName;
-    const row = catalog.devices.find((candidate) => candidate.id === id);
-    if (!row) throw new Error(`unknown mock device: ${requestedName}`);
+    const row = catalog?.devices.find((candidate) => candidate.id === id);
+    if (!row && id !== 'fake-llm') throw new Error(`unknown mock device: ${requestedName}`);
     if (devices.has(requestedName)) throw new Error(`duplicate mock device: ${requestedName}`);
     switch (id) {
       case 'fake-kubectl':
@@ -385,8 +889,21 @@ export function assembleWorld(world: Pick<SimWorld, 'spec'>, clock?: SimClock): 
           devices.set(requestedName, createFakeGh({ prs, repository: world.spec.github?.repo ?? `${world.spec.world}/fixture` }));
         }
         break;
+      case 'fake-cred':
+        devices.set(requestedName, createFakeCred({ now: clock?.now ?? Date.now }));
+        break;
+      case 'fake-feeds':
+        devices.set(requestedName, createFakeFeeds({ now: clock?.now ?? Date.now }));
+        break;
       case 'fake-llm':
-        devices.set(requestedName, { enabled: testFakeLlmEnabled, response: testFakeLlmResponse, config: world.spec.providers ?? {} });
+        devices.set(requestedName, { enabled: testFakeLlmEnabled, config: world.spec.providers ?? {}, router: llm,
+          forNode: llm?.forNode,
+          async response(nodeId = 'default', messages: LLMMessage[] = []) {
+            if (!llm) throw new Error('fake-llm device has no configured router');
+            const response: string[] = [];
+            for await (const chunk of llm.forNode(nodeId).chat(messages)) response.push(chunk);
+            return response.join('');
+          } });
         break;
       case 'fake-ssh':
         {
@@ -413,11 +930,17 @@ export function assembleWorld(world: Pick<SimWorld, 'spec'>, clock?: SimClock): 
       case 'world-runtime':
         devices.set(requestedName, { inject: injectAnyEvent });
         break;
+      case 'fake-app-failures':
+        devices.set(requestedName, createFakeAppFailures(world.spec.apps ?? []));
+        break;
       case 'pod-reuse-residue-fault':
         devices.set(requestedName, { create: createPodReuseResidueFaultFixture });
         break;
       case 'warm-pool-reuse-sim':
         devices.set(requestedName, { run: runWarmSiReuseSimulation });
+        break;
+      case 'multi-actor-world':
+        devices.set(requestedName, { run: runMultiActorSimulation });
         break;
       case 'sim-mailbox':
         devices.set(requestedName, createSimMailbox());
@@ -426,7 +949,17 @@ export function assembleWorld(world: Pick<SimWorld, 'spec'>, clock?: SimClock): 
         throw new Error(`mock device has no world adapter: ${requestedName}`);
     }
   }
-  return { devices, ...(appHost ? { appHost } : {}) };
+  return { devices, ...(appHost ? { appHost } : {}), ...(llm ? { llm } : {}) };
+}
+
+/** The world scenario runner's node entrypoint; every simulated LLM call crosses this router. */
+export async function runSimWorldLlmNode(world: AssembledWorld, nodeId: string, messages: LLMMessage[]): Promise<string> {
+  const router = world.llm;
+  if (!router) throw new Error('world LLM node call requires the fake-llm device');
+  const provider = router.forNode(nodeId);
+  const output: string[] = [];
+  for await (const event of provider.streamChat!(messages)) if (event.type === 'text') output.push(event.delta);
+  return output.join('');
 }
 
 export interface WarmPoolReuseWorldEvidence {
@@ -789,6 +1322,8 @@ export async function runWarmPoolReuseWorldScenario(world: SimWorld): Promise<Wa
 /** Defense-in-depth API guards inside the sandboxed scenario executor. */
 export async function runInWorld<T>(world: SimWorld, run: (runtime: WorldExecutionRuntime) => Promise<T>): Promise<T> {
   if (activeNetworkWorld) throw new Error('sim worlds run serially while the network guard is installed');
+  const priorSimUniverse = process.env.ELANOUS_SIM_UNIVERSE;
+  process.env.ELANOUS_SIM_UNIVERSE = '1';
   const originalFetch = globalThis.fetch;
   const originalHttpRequest = http.request;
   const originalHttpGet = http.get;
@@ -963,6 +1498,8 @@ export async function runInWorld<T>(world: SimWorld, run: (runtime: WorldExecuti
     dnsPromises.resolve = originalDnsPromiseResolve;
     if (bunRuntime && originalBunSpawn) bunRuntime.spawn = originalBunSpawn;
     if (bunRuntime && originalBunSpawnSync) bunRuntime.spawnSync = originalBunSpawnSync;
+    if (priorSimUniverse === undefined) delete process.env.ELANOUS_SIM_UNIVERSE;
+    else process.env.ELANOUS_SIM_UNIVERSE = priorSimUniverse;
     activeNetworkWorld = undefined;
   }
 }
@@ -980,10 +1517,184 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
   world = ownedWorld;
   return runInWorld(world, async (runtime) => {
     const assembled = assembleWorld(world);
+    const noviceVersioningFile = resolve(import.meta.dir, '../../scenarios/ux-sim/novice-versioning-scenario.ts');
+    if (resolve(scenarioFile) === noviceVersioningFile) {
+      if (world.id !== 'novice-versioning' || !world.spec.devices.includes('fake-gh')
+        || !assembled.devices.has('fake-gh')) {
+        throw new Error('novice versioning scenario requires its declared novice-versioning world and fake GitHub device');
+      }
+      const injectedFault = process.env.ELANOUS_UX_SIM_NOVICE_FAULT;
+      if (injectedFault && process.env.NODE_ENV !== 'test') throw new Error('novice versioning fault injection is test-only');
+      if (injectedFault && ![ 'apply-routes-to-discard', 'apply-reports-wrong-version', 'applied-screen-has-forbidden-word' ].includes(injectedFault)) throw new Error(`unsupported novice versioning test fault: ${injectedFault}`);
+      const tasks = runNoviceVersioningScenario(injectedFault as NoviceVersioningFault | undefined);
+      const pass = tasks.length === 3 && tasks.every((task) => task.pass);
+      return { pass, devices: [...assembled.devices.keys()],
+        observations: tasks.map((task) => ({ event: `novice-${task.task}`,
+          verdict: `${task.clicks} clicks · ${task.elapsedSeconds}s · stuck=${task.stuckScreens.length}` })),
+        noviceVersioning: { tasks, elapsedBasis: 'screen-and-action estimate' },
+        externalNetworkEvents: [...world.networkEvents] };
+    }
     const scenario = object(parseYaml(readFileSync(resolve(scenarioFile), 'utf8')), 'scenario');
     if (scenario.world !== world.id || !Array.isArray(scenario.steps)) throw new Error('scenario must target its declared world and list steps');
     const steps = scenario.steps.map((step) => object(step, 'scenario step'));
+    const load = scenario.load === undefined ? undefined : parseSimLoadConfig(scenario.load, scenario.thresholds);
+    if (!load && scenario.thresholds !== undefined) throw new Error('scenario.thresholds requires scenario.load');
+    if (load && !(steps.length === 1 && steps[0]?.observe === 'app-host')) {
+      throw new Error('scenario.load currently requires the single observe: app-host scenario step');
+    }
     const stepKeys = steps.map((step) => Object.keys(step).sort().join(','));
+    if (steps.length === 1 && stepKeys[0] === 'llm') {
+      const call = object(steps[0]?.llm, 'scenario step llm');
+      if (Object.keys(call).sort().join(',') !== 'messages,node' || typeof call.node !== 'string' || !call.node.trim()
+        || !Array.isArray(call.messages) || call.messages.some((message) => !message || typeof message !== 'object' || Array.isArray(message))) {
+        throw new Error('scenario llm step requires only a node id and messages list');
+      }
+      const expected = object(scenario.expect, 'scenario.expect');
+      if (Object.keys(expected).join(',') !== 'responseContains' || typeof expected.responseContains !== 'string') {
+        throw new Error('scenario llm expectation requires responseContains');
+      }
+      const llmDevice = assembled.devices.get('fake-llm') as { response?: (nodeId: string, messages: LLMMessage[]) => Promise<string> } | undefined;
+      if (!llmDevice?.response) throw new Error('scenario llm step requires the fake-llm response boundary');
+      const response = await llmDevice.response(call.node, call.messages as LLMMessage[]);
+      return { pass: response.includes(expected.responseContains), devices: [...assembled.devices.keys()], recordingIds: [...(assembled.llm?.recordingIds ?? [])], observations: [
+        { event: `llm-node-${call.node}`, verdict: `response-sha256:${createHash('sha256').update(response).digest('hex')}` },
+      ] };
+    }
+    if (scenario.appSimulation !== undefined) {
+      const declaration = object(scenario.appSimulation, 'scenario.appSimulation');
+      const manifest = object(declaration.manifest, 'scenario.appSimulation.manifest');
+      const appSlug = typeof manifest.slug === 'string' ? manifest.slug : '';
+      const appScenario = object(declaration.scenario, 'scenario.appSimulation.scenario');
+      if (!appSlug || typeof appScenario.name !== 'string' || !Array.isArray(appScenario.steps)) {
+        throw new Error('scenario.appSimulation requires an app slug and declared scenario steps');
+      }
+      const tables = object(manifest.tables ?? {}, 'app.tables');
+      const rpcDeclarations = object(manifest.rpc ?? {}, 'app.rpc');
+      const actionDeclarations = object(manifest.actions ?? {}, 'app.actions');
+      const roles = object(manifest.roles ?? {}, 'app.roles');
+      const tableRows: Record<string, number> = Object.fromEntries(Object.keys(tables).map((table) => [table, [].length]));
+      const evidenceEvents: string[] = [];
+      const resultEvents: NonNullable<AppSimulationResult['events']>[number][] = [];
+      const runId = `app-${randomUUID()}`;
+      const receiptId = `receipt-${randomUUID()}`;
+      const databaseDirectory = join(world.root, 'app-simulation-db', runId);
+      const appDatabase = createAppDatabase([manifest as unknown as AppManifest], { directory: databaseDirectory });
+      const actions = createAppActions({ secrets: { async resolve() { return 'simulated-app-credential'; } },
+        async summarize({ text }) { return text; },
+        // Test-world app actions use the same isolated fake LLM as graph simulations.
+        async translate({ text }) {
+          let translated = '';
+          for await (const chunk of testFakeLlmProvider.chat([{ role: 'user', content: text }])) translated += chunk;
+          return translated;
+        } });
+      let activeRole = 'owner';
+      const actionRuntime = {
+        authorize(_request: Request, slug: string) {
+          const actionName = new URL(_request.url).pathname.split('/').at(-1);
+          if (slug !== appSlug || !Object.hasOwn(roles, activeRole) || !actionName
+            || !Object.hasOwn(actionDeclarations, actionName)) return false;
+          const action = object(actionDeclarations[actionName], `app.actions.${actionName}`);
+          const allowedRoles = action.allow === undefined ? ['owner'] : action.allow;
+          return Array.isArray(allowedRoles) && allowedRoles.includes(activeRole);
+        },
+        getDeclaration(slug: string, name: string) {
+          return slug === appSlug && Object.hasOwn(actionDeclarations, name)
+            ? actionDeclarations[name] as Parameters<typeof actions.run>[0]['declaration'] : undefined;
+        },
+        run(input: Parameters<typeof actions.run>[0]) { return actions.run(input); },
+      };
+      let runtimePassed = true;
+      let failureSummary: string | undefined;
+      let lastActionOutput: Record<string, unknown> | undefined;
+      try {
+        for (const [stepIndex, rawStep] of appScenario.steps.entries()) {
+          const step = object(rawStep, `scenario.appSimulation.scenario.steps[${stepIndex}]`);
+          try {
+            let eventName: string;
+            if (typeof step.rpc === 'string') {
+              if (!Object.hasOwn(rpcDeclarations, step.rpc)) throw new Error(`rpc not found: ${step.rpc}`);
+              const role = typeof step.as === 'string' ? step.as : 'owner';
+              const rawParams = object(step.params ?? {}, `scenario step ${stepIndex} params`);
+              const params = Object.fromEntries(Object.entries(rawParams).map(([key, value]) => {
+                if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.hasOwn(value, '$actionOutput')) return [key, value];
+                const reference = object(value, `scenario step ${stepIndex} param ${key}`);
+                if (Object.keys(reference).length !== 1 || typeof reference.$actionOutput !== 'string'
+                  || !lastActionOutput || !Object.hasOwn(lastActionOutput, reference.$actionOutput)) {
+                  throw new Error(`unavailable action output for rpc param: ${key}`);
+                }
+                return [key, lastActionOutput[reference.$actionOutput]];
+              }));
+              appDatabase.rpc(appSlug, step.rpc, params, role);
+              eventName = `rpc.${step.rpc}.completed`;
+            } else if (typeof step.action === 'string') {
+              activeRole = typeof step.as === 'string' ? step.as : 'owner';
+              const response = await handleAppActionRequest(new Request(`http://app-simulation.invalid/v1/apps/${appSlug}/actions/${step.action}`, {
+                method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(object(step.input ?? {}, `scenario step ${stepIndex} input`)),
+              }), actionRuntime);
+              if (!response?.ok) {
+                const body = await response?.json().catch(() => undefined) as { error?: unknown } | undefined;
+                throw new Error(`app action failed: ${typeof body?.error === 'string' ? body.error : response?.status ?? 'no response'}`);
+              }
+              lastActionOutput = object(await response.json(), `scenario action ${step.action} output`);
+              eventName = `action.${step.action}.completed`;
+            } else if (typeof step.inject === 'string') {
+              throw new Error(`no simulation device adapter is registered for injected event: ${step.inject}`);
+            } else throw new Error('scenario.appSimulation step must declare rpc, action, or inject');
+
+            evidenceEvents.push(eventName);
+            resultEvents.push({ kind: 'app.sim.step', appId: appSlug, runId, ts: Date.now(),
+              data: { step: eventName, message: `scenario ${appScenario.name} step completed`, receiptId } });
+          } catch (error) {
+            runtimePassed = false;
+            failureSummary = error instanceof Error ? error.message : 'scenario step failed';
+            resultEvents.push({ kind: 'app.sim.step', appId: appSlug, runId, ts: Date.now(),
+              data: { step: 'scenario-step-failed', message: failureSummary, receiptId } });
+            break;
+          }
+        }
+        for (const table of Object.keys(tables)) {
+          try {
+            const rows = new Database(join(databaseDirectory, `${appSlug}.db`), { readonly: true });
+            try {
+              const count = rows.query(`SELECT COUNT(*) AS count FROM "${table.replaceAll('"', '""')}"`).get() as { count?: unknown } | null;
+              if (count && typeof count.count === 'number' && Number.isSafeInteger(count.count)) tableRows[table] = count.count;
+              else { runtimePassed = false; failureSummary ??= `unable to observe table: ${table}`; }
+            } finally { rows.close(); }
+          } catch (error) {
+            runtimePassed = false;
+            failureSummary ??= error instanceof Error ? error.message : `unable to observe table: ${table}`;
+          }
+        }
+      } finally { appDatabase.close(); }
+      const networkClean = world.networkEvents.length === [].length;
+      if (!networkClean) { runtimePassed = false; failureSummary ??= 'blocked external network attempt'; }
+      // The fake host's HTML response is not a rendered screen. The caller measures it in Chrome.
+      const appSimulation: AppSimulationResult = { runId, events: resultEvents,
+        receipts: [{ id: receiptId, appId: appSlug, runId, outcome: runtimePassed ? 'passed' : 'failed',
+          ...(failureSummary ? { summary: failureSummary.slice(0, 240) } : { summary: `scenario ${appScenario.name} executed` }) }] };
+      return { pass: runtimePassed && networkClean, observations: [{ event: `app-scenario-${appScenario.name}`,
+        verdict: runtimePassed && networkClean ? 'executed' : `failed: ${failureSummary ?? 'runtime failure'}` }],
+        devices: [...assembled.devices.keys()], appSimulation,
+        appSimulationEvidence: { events: evidenceEvents, tableRows, screenText: '', screenStatus: 'unmeasured' }, externalNetworkEvents: [...world.networkEvents] };
+    }
+    if (steps.length === 1 && stepKeys[0] === 'observe' && steps[0]?.observe === 'pwa-formal-update') {
+      if (!assembled.devices.has('fake-clock')) throw new Error('pwa-formal-update requires fake-clock isolation');
+      const expected = object(scenario.expect, 'scenario.expect');
+      if (Object.keys(expected).sort().join(',') !== 'activeHtml,observe,restart,verdict'
+        || expected.verdict !== 'fail' || expected.activeHtml !== '<main>previous</main>'
+        || expected.restart !== 'not-called' || expected.observe !== 'not-called') {
+        throw new Error('pwa-formal-update expectation must require failed swap and preserved previous generation');
+      }
+      const { simulatePwaFormalUpdateSwapFailure } = await import('../../scripts/release-loop/pwa-formal-update.js');
+      const evidence = await simulatePwaFormalUpdateSwapFailure();
+      const pass = evidence.activeHtml === expected.activeHtml && evidence.verdict === expected.verdict
+        && evidence.restartCalled === false && evidence.observed === false;
+      return { pass, devices: [...assembled.devices.keys()], observations: [
+        { event: 'pwa-formal-update-swap-failed', verdict: evidence.verdict, activeGeneration: evidence.activeGeneration,
+          activeHtml: evidence.activeHtml, restart: evidence.restartCalled ? 'called' : 'not-called',
+          clientObservation: evidence.observed ? 'called' : 'not-called' },
+      ] };
+    }
     if (steps.length === 2 && stepKeys[0] === 'inject' && stepKeys[1] === 'observe'
       && object(steps[0]!.inject, 'scenario inject').id === 'gate-roster-second-pool') {
       if (steps[1]?.observe !== 'gate-roster-second-pool') throw new Error('gate roster scenario must observe gate-roster-second-pool');
@@ -1049,17 +1760,47 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
       const hasLedgerInjections = world.spec.injections?.some((injection) => injection.ledger?.length) ?? false;
       const processTable = assembled.devices.get('fake-ps') as FakePsDevice | undefined;
       const appActions = worldAppActions(world.spec, assembled, observations);
-      const scheduled = (world.spec.chaos?.length ?? 0) > 0 || scheduledInjections.length > 0 || appActions.length > 0;
-      const recovery = await clockDevice.withClock(new Date(baseTimeMs), (clock) => {
-        const hostChaos = world.spec.chaos?.some((fault) => 'gorilla' in fault)
+      const scheduled = (world.spec.chaos?.length ?? 0) > 0 || scheduledInjections.length > 0 || appActions.length > 0 || load !== undefined;
+      const execution = await clockDevice.withClock(new Date(baseTimeMs), async (clock): Promise<{ recovery: WorldChaosRun; loadResult?: SimLoadResult }> => {
+        const hostChaos = world.spec.chaos?.some((fault) => 'gorilla' in fault || 'disaster' in fault)
           ? createWorldHostChaosController({ world: world.spec.world, hosts: world.spec.hosts ?? [], devices: assembled.devices,
-            baseTimeMs, clock, processTable: processTable! })
+            stateRoot: world.root, baseTimeMs, clock, processTable: processTable! })
           : undefined;
-        return runWorldChaosSchedule(world.spec.chaos ?? [], world.spec.processes ?? [], world.spec.expect?.recovers,
+        const app = load ? world.spec.apps?.[0] : undefined;
+        const appHost = load ? assembled.appHost : undefined;
+        if (load && (!app || !appHost)) throw new Error('load scenario requires a declared app and fake app-host');
+        // Use the stable app root so version-specific file ordering does not pin load traffic to a stale path.
+        const page = '/';
+        const loadAppVersions = new Set<string>();
+        const loadTrafficStatuses: number[] = [];
+        const trafficMeter = load?.config.trafficCap ? createRelayTrafficMeter(load.config.trafficCap.caps, () => clock.now()) : undefined;
+        const loadRun = load ? prepareSimLoad(load.config, load.thresholds, world.spec.seed, (plannedAtMs) => {
+          clock.setTime(Math.max(clock.now(), baseTimeMs + plannedAtMs));
+          const response = appHost!.fetch(`${app!.slug}.app.sim.invalid`, page);
+          const version = response.headers['x-app-version'];
+          if (version) loadAppVersions.add(version);
+          const cap = load.config.trafficCap;
+          const traffic = cap ? trafficMeter!.charge(cap.memberId, cap.connectionId, cap.bytesPerRequest) : 'allowed';
+          const status = traffic === 'allowed' ? response.status : 429;
+          if (cap) loadTrafficStatuses.push(status);
+          return { status, durationMs: load.config.serviceTimeMs };
+        }) : undefined;
+        const scenarioActions = loadRun ? [...appActions, ...loadRun.actions] : appActions;
+        const recovery = await runWorldChaosSchedule(world.spec.chaos ?? [], world.spec.processes ?? [], world.spec.expect?.recovers,
           hasLedgerInjections ? { runId, stateRoot: world.root, expectedRows: injectedRows } : undefined,
-          scheduledInjections, clock, baseTimeMs, hostChaos, processTable, appActions);
+          scheduledInjections, clock, baseTimeMs, hostChaos, processTable, scenarioActions);
+        if (!load || !loadRun) return { recovery };
+        const finalTime = load.config.stages.reduce((sum, stage) => sum + stage.forMs, 0);
+        clock.setTime(Math.max(clock.now(), baseTimeMs + finalTime));
+        const result = loadRun.result();
+        observations.push({ event: 'sim-load', verdict: `${result.model} planned=${result.planned} started=${result.started} dropped=${result.dropped} p95=${result.latencyMs.p95 ?? 'unmeasured'}ms errors=${result.errorsRate ?? 'unmeasured'} clockAtEndMs=${clock.now() - baseTimeMs}` });
+        if (loadAppVersions.size) observations.push({ event: 'sim-load-app-versions', verdict: [...loadAppVersions].sort().join(',') });
+        if (loadTrafficStatuses.length) observations.push({ event: 'sim-load-traffic-cap', verdict: loadTrafficStatuses.join(',') });
+        return { recovery, loadResult: result };
       });
-      return { pass: recovery.evaluation?.pass ?? true, observations, devices: [...assembled.devices.keys()], ...(scheduled ? { recovery } : {}) };
+      return { pass: (execution.recovery.evaluation?.pass ?? true) && (execution.loadResult?.pass ?? true), observations,
+        devices: [...assembled.devices.keys()], ...(execution.loadResult ? { load: execution.loadResult } : {}),
+        ...(scheduled ? { recovery: execution.recovery } : {}) };
     }
     if (steps.length === 1 && stepKeys[0] === 'observe,staticBuildRequired' && steps[0]?.observe === 'kaist-lecture-scrap') {
       if (steps[0]?.staticBuildRequired !== true) throw new Error('lecture-scrap simulation requires a built static export');
@@ -1068,14 +1809,15 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
       if (!appHost || !app) throw new Error('kaist lecture-scrap simulation requires the declared app and fake host');
       appHost.deploy('lecture-scrap', app.versions[0]!);
       const screens = [
-        { step: 'screen-list', path: '/', artifact: 'index.html', text: '스크랩 목록' },
-        { step: 'screen-note-create', path: '/notes/new', artifact: 'notes/new.html', text: '노트 작성' },
-        { step: 'screen-search', path: '/search', artifact: 'search.html', text: '검색' },
+        { step: 'screen-list', path: '/', artifact: 'index.html', text: ['날짜별 기록', '2026-11-14', '2026-11-13', '강의 자료 폴더'] },
+        { step: 'screen-note-create', path: '/notes/new', artifact: 'notes/new.html', text: ['노트 작성', '2026-11-14', '수업일', '논리 분류'] },
+        { step: 'screen-search', path: '/search', artifact: 'search.html', text: ['검색'] },
       ] as const;
       const observations = screens.map((screen) => {
         const response = appHost.fetch('lecture-scrap.app.sim.invalid', screen.path);
         const artifact = app.versions[0]!.files[screen.artifact];
-        if (typeof artifact !== 'string' || response.status !== 200 || response.body !== artifact || !response.body.includes(screen.text)) {
+        if (typeof artifact !== 'string' || response.status !== 200 || response.body !== artifact
+          || screen.text.some(text => !response.body.includes(text))) {
           throw new Error(`lecture-scrap fake host screen failed: ${screen.path} status=${response.status}`);
         }
         const artifactSha256 = createHash('sha256').update(artifact).digest('hex');
@@ -1087,7 +1829,7 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
           const asset = appHost.fetch('lecture-scrap.app.sim.invalid', path);
           if (asset.status !== 200) throw new Error(`lecture-scrap fake host asset failed: ${path} status=${asset.status}`);
         }
-        return { event: screen.step, verdict: `${screen.path} · ${response.status} · assets ${assets.length}`, assetCount: assets.length, artifactSha256: responseSha256 };
+        return { event: screen.step, verdict: `${screen.path} · ${response.status} · ${screen.text.join(' · ')} · assets ${assets.length}`, assetCount: assets.length, artifactSha256: responseSha256 };
       });
       const runId = `kaist-lecture-scrap-${world.spec.seed}-${randomUUID()}`;
       const receiptId = `${runId}:receipt`;
@@ -1097,7 +1839,7 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
         events: screens.map((screen, index) => ({ kind: 'app.sim.step', appId: 'lecture-scrap', runId,
           ts: baseTimeMs + index * 1_000, data: { step: screen.step, path: screen.path, status: 200, assetCount: observations[index]?.assetCount ?? 0,
             artifactSha256: observations[index]?.artifactSha256 ?? '',
-            message: `${screen.text} fake host 응답 확인`, receiptId } })),
+            message: `${screen.text.join(' · ')} fake host 응답 확인`, receiptId } })),
         receipts: [{ id: receiptId, appId: 'lecture-scrap', runId, outcome: 'passed', summary: 'KAIST 강의 노트·스크랩 3개 화면 시뮬 통과' }],
       };
       return { pass: true, observations, devices: [...assembled.devices.keys()], appSimulation };
@@ -1373,8 +2115,9 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
       const baseTimeMs = Date.parse(world.spec.clock?.start ?? '2100-01-01T00:00:00.000Z');
       clock.setTime(baseTimeMs);
       const processTable = assembled.devices.get('fake-ps') as FakePsDevice | undefined;
-      const hostChaos = world.spec.chaos?.some((fault) => 'gorilla' in fault)
-        ? createWorldHostChaosController({ world: world.spec.world, hosts: world.spec.hosts ?? [], devices: assembled.devices, baseTimeMs, clock, processTable: processTable! })
+      const hostChaos = world.spec.chaos?.some((fault) => 'gorilla' in fault || 'disaster' in fault)
+        ? createWorldHostChaosController({ world: world.spec.world, hosts: world.spec.hosts ?? [], devices: assembled.devices,
+          stateRoot: world.root, baseTimeMs, clock, processTable: processTable! })
         : undefined;
       let pass = true;
       const actions = worldAppActions(world.spec, assembled, observations);
@@ -1401,6 +2144,7 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
       if (recovery) observations.push(...recovery.observations.map((row) => ({
         event: `chaos-${row.kind}`,
         verdict: `${row.faultVerdict} → ${row.recoveryVerdict} (${row.recoveryMs === null ? 'unrecovered' : `${row.recoveryMs}ms`})`,
+        invariant: row.recoveredAtMs === null ? 'fail' as const : 'pass' as const, durationMs: row.recoveryMs,
       })));
       return { pass, observations, devices: [...assembled.devices.keys()], ...(includeRecovery ? { recovery } : {}) };
     });
@@ -1408,15 +2152,53 @@ export async function executeWorldScenario(world: SimWorld, scenarioFile: string
 }
 
 /** Every supported invocation crosses the OS network sandbox before scenario code runs. */
+function executableOnPath(name: string): string | null {
+  for (const directory of (process.env.PATH ?? '').split(delimiter).filter(Boolean)) {
+    const candidate = join(directory, name);
+    try { accessSync(candidate, fsConstants.X_OK); return candidate; } catch { /* Try the next PATH entry. */ }
+  }
+  return null;
+}
+
+function linuxNetworkSandbox(testRoot: string, cwd: string): { command: string; args: string[] } {
+  const probeOptions = { cwd, encoding: 'utf8' as const, env: process.env, timeout: 10_000 };
+  const unshare = executableOnPath('unshare');
+  if (unshare) {
+    const probe = childProcess.spawnSync(unshare, ['-rn', process.execPath, '-e', 'process.exit(0)'], probeOptions);
+    if (!probe.error && probe.status === 0) return { command: unshare, args: ['-rn', process.execPath] };
+  }
+
+  const bwrap = executableOnPath('bwrap');
+  if (bwrap) {
+    const rootView = ['--unshare-net', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc'];
+    const probe = childProcess.spawnSync(bwrap, [...rootView, '--chdir', cwd, process.execPath, '-e', 'process.exit(0)'], probeOptions);
+    if (!probe.error && probe.status === 0) {
+      return { command: bwrap, args: [...rootView, '--bind', testRoot, testRoot, '--chdir', cwd, process.execPath] };
+    }
+  }
+
+  throw new Error('network-zero simulation requires a usable Linux unshare -rn or bwrap --unshare-net; refusing to execute without OS network isolation');
+}
+
 function invokeSandboxedWorldRunner(world: SimWorld, scenarioFile: string, networkProbe = false): string {
   const testRoot = getTestStateRoot();
   if (!testRoot) throw new Error('sim worlds require an explicit --test universe');
-  if (process.platform !== 'darwin') throw new Error('network-zero simulation requires macOS sandbox-exec');
+  const cwd = process.cwd();
   const runner = resolve(import.meta.dir, '../../scripts/sim-world-runner.ts');
-  const child = childProcess.spawnSync('/usr/bin/sandbox-exec', [
-    '-p', '(version 1)(allow default)(deny network*)', process.execPath, runner,
-  ], {
-    cwd: process.cwd(), encoding: 'utf8',
+  let command: string;
+  let args: string[];
+  if (process.platform === 'darwin') {
+    command = '/usr/bin/sandbox-exec';
+    args = ['-p', '(version 1)(allow default)(deny network*)', process.execPath, runner];
+  } else if (process.platform === 'linux') {
+    const sandbox = linuxNetworkSandbox(testRoot, cwd);
+    command = sandbox.command;
+    args = [...sandbox.args, runner];
+  } else {
+    throw new Error(`network-zero simulation has no supported OS sandbox for ${process.platform}; refusing to execute without network isolation`);
+  }
+  const child = childProcess.spawnSync(command, args, {
+    cwd, encoding: 'utf8',
     env: { ...process.env, ELANOUS_SIM_WORLD_STATE_ROOT: testRoot, ELANOUS_SIM_WORLD_ID: world.id,
       ELANOUS_SIM_WORLD_SCENARIO: resolve(scenarioFile), ELANOUS_SIM_WORLD_OS_SANDBOXED: '1',
       ELANOUS_SIM_WORLD_NETWORK_PROBE: networkProbe ? '1' : '0' },
@@ -1432,7 +2214,8 @@ export async function runWorldScenario(world: SimWorld, scenarioFile: string): P
   try { result = JSON.parse(output) as WorldScenarioResult; }
   catch { throw new Error(`sim world runner returned invalid JSON: ${output}`); }
   const completed = applyDeviceFidelity(result) as WorldScenarioResult;
-  recordSimWorldCoverage({ world, deviceIds: result.devices, pass: completed.pass, scenarioFile, observations: completed.observations });
+  recordSimWorldCoverage({ world, deviceIds: result.devices, pass: completed.pass, verdict: completed.verdict, recordingIds: result.recordingIds,
+    scenarioFile, observations: completed.observations });
   return completed;
 }
 

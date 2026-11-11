@@ -1,6 +1,7 @@
-import { createPublicKey, randomBytes, verify } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { createPublicKey, randomBytes, randomUUID, verify } from 'node:crypto';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
 import type { ServerWebSocket } from 'bun';
+import { debug } from '../debug/log.js';
 import { challengeMessage, createPhoneChannel, MAX_FRAME_BYTES, serverIdFromPublicKey } from './channel.js';
 export { challengeMessage } from './channel.js';
 import { MAX_MUX_FRAME_BYTES, MuxDecoder, MuxEncoder, MuxStreamState } from './mux.js';
@@ -11,16 +12,136 @@ const MAX_CLIENTS_PER_SERVER = 8;
 // Keep the independent private WebSocket client limit at eight.
 // Source: OP #92435 approves a bounded 64-slot public cap for KAIST-APP-SERVE-LOAD-50.
 const MAX_PUBLIC_REQUESTS_PER_SERVER = 64;
+// Source: #36294 relay member gate; the cap covers the existing public burst,
+// eight private clients and one host without unbounded Nexus introspection.
+const MAX_MEMBER_CHECKS = MAX_PUBLIC_REQUESTS_PER_SERVER + MAX_CLIENTS_PER_SERVER + 1;
 const BYTES_PER_SECOND = 1024 * 1024;
 const BURST_BYTES = 2 * BYTES_PER_SECOND;
 const PING_INTERVAL_MS = 30_000;
 const DEAD_PEER_MS = 90_000;
 const AUTH_TIMEOUT_MS = 10_000;
 
-type SocketData = { role: 'host' | 'client'; serverId: string; clientId?: number; challenge?: string; authenticated: boolean; lastSeen: number; tokens: number; refillAt: number; authTimer?: ReturnType<typeof setTimeout> };
+export interface RelayTrafficCapConfig {
+  readonly free: { readonly memberBytesPerMinute: number; readonly connectionBytesPerMinute: number };
+}
+
+export interface RelayCustomDomainRoute {
+  readonly app: string;
+  readonly user: string;
+  /** Set only after TXT ownership proof and CNAME target have been observed. */
+  readonly ownershipVerified: boolean;
+  /** The TLS edge must have an active certificate before requests are routed. */
+  readonly certificateReady: boolean;
+}
+
+/** Owner-controlled opt-in file for the single pinned public user. */
+export function loadRelayPublicListing(path: string): ReadonlySet<string> {
+  if (typeof constants.O_NOFOLLOW !== 'number' || typeof constants.O_NONBLOCK !== 'number') {
+    throw new Error('relay public listing safe open is unavailable');
+  }
+  // Source: POSIX nonblocking open prevents a swapped FIFO from hanging relay startup before fstat.
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  let raw: string;
+  try {
+    const stat = fstatSync(fd);
+    // Source: loadRelayTrafficCap owner-only file policy; POSIX mode 0600 keeps app selection private until published.
+    if (!stat.isFile() || (stat.mode & 0o077) !== 0
+      || (process.getuid && stat.uid !== process.getuid())) throw new Error('relay public listing config must be owner-only regular file');
+    raw = readFileSync(fd, 'utf8');
+  } finally { closeSync(fd); }
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).join() !== 'apps'
+    || !Array.isArray((parsed as { apps?: unknown }).apps)
+    || !(parsed as { apps: unknown[] }).apps.every(app => typeof app === 'string')) {
+    throw new Error('invalid relay public listing config');
+  }
+  const apps = (parsed as { apps: string[] }).apps;
+  if (new Set(apps).size !== apps.length) throw new Error('duplicate public listing app id');
+  return new Set(apps);
+}
+
+/** Owner-only projection of domains whose DNS ownership and TLS certificate are already verified. */
+export function loadRelayCustomDomainRoutes(path: string): ReadonlyMap<string, RelayCustomDomainRoute> {
+  if (typeof constants.O_NOFOLLOW !== 'number' || typeof constants.O_NONBLOCK !== 'number') {
+    throw new Error('relay custom domain safe open is unavailable');
+  }
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  let raw: string;
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) {
+      throw new Error('relay custom domain config must be owner-only regular file');
+    }
+    raw = readFileSync(fd, 'utf8');
+  } finally { closeSync(fd); }
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).join() !== 'domains'
+    || !Array.isArray((parsed as { domains?: unknown }).domains)) throw new Error('invalid relay custom domain config');
+  const routes = new Map<string, RelayCustomDomainRoute>();
+  for (const entry of (parsed as { domains: unknown[] }).domains) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)
+      || Object.keys(entry).sort().join() !== 'app,certificateReady,hostname,ownershipVerified,user') {
+      throw new Error('invalid relay custom domain route entry');
+    }
+    const route = entry as RelayCustomDomainRoute & { hostname: string };
+    if (typeof route.hostname !== 'string' || typeof route.app !== 'string' || typeof route.user !== 'string'
+      || route.ownershipVerified !== true || route.certificateReady !== true) throw new Error('custom domain route is not verified');
+    const hostname = route.hostname.trim().toLowerCase().replace(/\.$/, '');
+    if (!hostname || routes.has(hostname)) throw new Error('duplicate or invalid custom domain route');
+    routes.set(hostname, { app: route.app, user: route.user, ownershipVerified: true, certificateReady: true });
+  }
+  return routes;
+}
+
+export function loadRelayTrafficCap(path: string): RelayTrafficCapConfig {
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0
+    || (process.getuid && stat.uid !== process.getuid())) throw new Error('relay traffic cap config must be owner-only regular file');
+  const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).join() !== 'free') {
+    throw new Error('invalid relay traffic cap config');
+  }
+  const free = (parsed as { free?: unknown }).free;
+  if (!free || typeof free !== 'object' || Array.isArray(free)
+    || Object.keys(free).sort().join() !== 'connectionBytesPerMinute,memberBytesPerMinute') {
+    throw new Error('invalid relay traffic cap config');
+  }
+  const config = { free: free as RelayTrafficCapConfig['free'] };
+  createRelayTrafficMeter(config);
+  return config;
+}
+
+/** Fixed UTC minute windows; limit values come from operator config, never a public response. */
+export function createRelayTrafficMeter(config: RelayTrafficCapConfig, now: () => number = Date.now) {
+  const { memberBytesPerMinute, connectionBytesPerMinute } = config.free;
+  if (![memberBytesPerMinute, connectionBytesPerMinute].every(value => Number.isSafeInteger(value) && value > 0)) {
+    throw new Error('invalid relay traffic cap config');
+  }
+  let minute = -1;
+  const members = new Map<string, number>();
+  const connections = new Map<string, number>();
+  return {
+    charge(memberId: string | null | undefined, connectionId: string, bytes: number): 'allowed' | 'limited' | 'member-required' {
+      if (!memberId) return 'member-required';
+      if (!connectionId || !Number.isSafeInteger(bytes) || bytes < 0) throw new Error('invalid relay traffic measurement');
+      const currentMinute = Math.floor(now() / 60_000);
+      if (currentMinute !== minute) { minute = currentMinute; members.clear(); connections.clear(); }
+      const memberTotal = members.get(memberId) ?? 0;
+      const connectionTotal = connections.get(connectionId) ?? 0;
+      if (memberTotal + bytes > memberBytesPerMinute || connectionTotal + bytes > connectionBytesPerMinute) return 'limited';
+      members.set(memberId, memberTotal + bytes);
+      connections.set(connectionId, connectionTotal + bytes);
+      return 'allowed';
+    },
+    forgetConnection(connectionId: string): void { connections.delete(connectionId); },
+  };
+}
+
+type SocketData = { role: 'host' | 'client'; serverId: string; clientId?: number; challenge?: string; authenticated: boolean; lastSeen: number; tokens: number; refillAt: number; memberId?: string; connectionId: string; authTimer?: ReturnType<typeof setTimeout> };
 type Socket = ServerWebSocket<SocketData>;
 type PublicResponse = { status: number; headers: Record<string, string>; body: string };
-type PublicRequest = { channel: import('./channel.js').EncryptedChannel; decoder: MuxDecoder; resolve: (response: Response) => void; timer: ReturnType<typeof setTimeout>; publicHost: string; internalHost: string; releaseSlot: () => void; response?: PublicResponse };
+type PublicRequest = { channel: import('./channel.js').EncryptedChannel; decoder: MuxDecoder; resolve: (response: Response) => void; timer: ReturnType<typeof setTimeout>; publicHost: string; internalHost: string; memberId?: string; connectionId: string; releaseSlot: () => void; response?: PublicResponse };
+type AppKillSwitch = Pick<ReturnType<typeof import('./app-kill-switch.js').createAppKillSwitch>, 'applyIncident' | 'isDown' | 'close'>;
 type Room = { host?: Socket; hostPublicKey?: Uint8Array; clients: Map<number, Socket>; publicRequests: Map<number, PublicRequest>; publicSlots: number; nextId: number; bytes: number; failures: Record<string, number> };
 
 export interface RelayServerOptions {
@@ -28,12 +149,28 @@ export interface RelayServerOptions {
   hostname?: string;
   /** Ed25519 signing public keys (base64url raw 32 bytes), pinned by X25519-derived serverId. */
   trustedHostKeys?: ReadonlyMap<string, string>;
+  /** Rollout switch. Existing relay behavior remains active until enabled. */
+  memberRequired?: boolean;
+  /** Server IDs are pinned to the owning Nexus member, independent of caller claims. */
+  hostOwnerMemberIds?: ReadonlyMap<string, string>;
+  /** Introspects relay.connect on every connection, so expiry and revocation take effect. */
+  validateMemberToken?: (token: string, serverId: string) => Promise<{ memberId: string } | null>;
+  /** Operator-provided private free-tier limits. The server never returns these values. */
+  trafficCap?: RelayTrafficCapConfig;
+  /** @internal Deterministic clock for traffic-window simulations. */
+  trafficNowForTesting?: () => number;
+  /** Durable app stop ledger used by the public report route and request gate. */
+  appKillSwitch?: Pick<AppKillSwitch, 'applyIncident' | 'isDown'> & Partial<Pick<AppKillSwitch, 'close'>>;
+  /** Apps whose owner explicitly opted in to public search; the default is empty. */
+  publicListedApps?: ReadonlySet<string>;
   /** Opt in to the invited-app reverse proxy for exactly this public domain. */
   publicDomain?: 'elanous.app' | 'elanous.ai';
   /** One pinned Nexus host receives requests for its configured user id only. */
   publicServerId?: string;
   /** User label bound to the pinned public Nexus host; multi-user dispatch belongs to ops relay. */
   publicUserId?: string;
+  /** Verified custom hostnames from the domain/certificate control plane; absent entries fail closed. */
+  customDomainRoutes?: ReadonlyMap<string, RelayCustomDomainRoute>;
   /** @internal Short timeout for focused relay lifecycle tests. */
   publicRequestTimeoutMsForTesting?: number;
 }
@@ -142,6 +279,12 @@ export function startRelayServer(options: RelayServerOptions = {}) {
   for (const [id, key] of trustedHostKeys) {
     if (!/^[a-f0-9]{64}$/.test(id) || !decodeKey(key)) throw new Error('invalid relay trusted host key entry');
   }
+  if (options.memberRequired && (!options.validateMemberToken || !options.hostOwnerMemberIds
+    || [...trustedHostKeys.keys()].some(id => !options.hostOwnerMemberIds?.get(id)))) {
+    throw new Error('relay member gate requires a token verifier and owner for every trusted host');
+  }
+  if (options.trafficCap && !options.memberRequired) throw new Error('relay traffic cap requires member authentication');
+  const trafficMeter = options.trafficCap ? createRelayTrafficMeter(options.trafficCap, options.trafficNowForTesting) : null;
   if (options.publicDomain !== undefined) {
     if (!options.publicServerId || !trustedHostKeys.has(options.publicServerId)
       || !options.publicUserId || options.publicUserId.length < 3 || options.publicUserId.length > 20
@@ -154,17 +297,70 @@ export function startRelayServer(options: RelayServerOptions = {}) {
   } else if (options.publicServerId !== undefined || options.publicUserId !== undefined) {
     throw new Error('publicServerId and publicUserId require publicDomain');
   }
+  const publicListedApps = new Set(options.publicListedApps ?? []);
+  if (publicListedApps.size && !options.publicDomain) throw new Error('public app listing requires public relay mode');
+  for (const app of publicListedApps) {
+    if (parsePublicAppHost(`${app}--${options.publicUserId}.${options.publicDomain}`, options.publicDomain)?.app !== app) {
+      throw new Error('invalid public listing app id');
+    }
+  }
+  const customDomainRoutes = new Map<string, RelayCustomDomainRoute>();
+  for (const [rawHostname, route] of options.customDomainRoutes ?? []) {
+    const hostname = rawHostname.trim().toLowerCase().replace(/\.$/, '');
+    if (!hostname || hostname.includes(':') || hostname.includes('/') || hostname.includes('..')
+      || !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(hostname)
+      || (!!options.publicDomain && !!parsePublicAppHost(hostname, options.publicDomain))
+      || !options.publicDomain || route.user !== options.publicUserId
+      || !route.ownershipVerified || !route.certificateReady
+      || parsePublicAppHost(`${route.app}--${route.user}.${options.publicDomain}`, options.publicDomain)?.app !== route.app) {
+      throw new Error('invalid or unverified custom domain route');
+    }
+    if (customDomainRoutes.has(hostname)) throw new Error('duplicate custom domain route');
+    customDomainRoutes.set(hostname, { ...route });
+  }
   const rooms = new Map<string, Room>();
   const sockets = new Set<Socket>();
+  let activeMemberChecks = 0;
   const roomFor = (id: string): Room => {
     let room = rooms.get(id);
     if (!room) { room = { clients: new Map(), publicRequests: new Map(), publicSlots: 0, nextId: 1, bytes: 0, failures: {} }; rooms.set(id, room); }
     return room;
   };
   const fail = (room: Room, reason: string) => { room.failures[reason] = (room.failures[reason] ?? 0) + 1; };
+  type MemberCredential = { token: string; source: 'protocol' | 'authorization' };
+  const memberCredentials = (req: Request): MemberCredential[] => {
+    const credentials: MemberCredential[] = [];
+    const bearer = /^Bearer\s+(emt_[A-Za-z0-9_-]+)$/i.exec(req.headers.get('authorization') ?? '')?.[1];
+    if (bearer) credentials.push({ token: bearer, source: 'authorization' });
+    const protocol = req.headers.get('sec-websocket-protocol')?.split(',').map(value => value.trim())
+      .find(value => /^emt_[A-Za-z0-9_-]+$/.test(value));
+    if (protocol) credentials.push({ token: protocol, source: 'protocol' });
+    return credentials;
+  };
+  type MemberGate = { status: 'allowed'; consumed: MemberCredential[] } | { status: 'denied' | 'busy'; consumed: [] };
+  const memberAuthorized = async (req: Request, serverId: string): Promise<MemberGate> => {
+    if (!options.memberRequired) return { status: 'allowed', consumed: [] };
+    const credentials = memberCredentials(req);
+    if (!credentials.length) return { status: 'denied', consumed: [] };
+    if (activeMemberChecks >= MAX_MEMBER_CHECKS) return { status: 'busy', consumed: [] };
+    activeMemberChecks += 1;
+    const consumed: MemberCredential[] = [];
+    try {
+      const ownerId = options.hostOwnerMemberIds!.get(serverId);
+      if (!ownerId) return { status: 'denied', consumed: [] };
+      for (const credential of credentials) {
+        let member: { memberId: string } | null = null;
+        try { member = await options.validateMemberToken!(credential.token, serverId); } catch { /* fail closed */ }
+        if (member?.memberId === ownerId) consumed.push(credential);
+      }
+    }
+    finally { activeMemberChecks -= 1; }
+    return consumed.length ? { status: 'allowed', consumed } : { status: 'denied', consumed: [] };
+  };
   const sendControl = (ws: Socket, value: object) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(value)); };
   const drop = (ws: Socket) => {
     const data = ws.data;
+    trafficMeter?.forgetConnection(data.connectionId);
     if (data.authTimer) clearTimeout(data.authTimer);
     sockets.delete(ws);
     const room = rooms.get(data.serverId);
@@ -206,7 +402,10 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     const serverId = options.publicServerId!;
     const room = rooms.get(serverId);
     const hostHeader = req.headers.get('host') ?? '';
-    const publicApp = parsePublicAppHost(hostHeader, options.publicDomain);
+    const normalizedHost = hostHeader.trim().toLowerCase().replace(/:\d+$/, '').replace(/\.$/, '');
+    const customRoute = customDomainRoutes.get(normalizedHost);
+    const publicApp = parsePublicAppHost(hostHeader, options.publicDomain)
+      ?? (customRoute ? { app: customRoute.app, user: customRoute.user } : undefined);
     if (!publicApp) {
       if (room) fail(room, 'public-invalid-host');
       return new Response('Not found', { status: 404 });
@@ -215,6 +414,71 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       if (room) fail(room, 'public-user-mismatch');
       return new Response('Not found', { status: 404 });
     }
+    if (new URL(req.url).pathname === '/.well-known/elanous/apps') {
+      if (req.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+      // Source: 내부 문서 `nexus-backend-in-a-box` APP-PUBLIC-LISTING; owner opt-in defaults off.
+      const apps = [...publicListedApps].filter(app => !options.appKillSwitch?.isDown(publicApp.user, app))
+        .sort().map(app => `https://${app}--${publicApp.user}.${options.publicDomain}`);
+      return new Response(JSON.stringify({ apps }), { status: 200, headers: {
+        'content-type': 'application/json', 'cache-control': 'no-store', 'x-robots-tag': 'noindex',
+      } });
+    }
+    const reportPath = new URL(req.url).pathname === '/.well-known/elanous/report';
+    if (reportPath) {
+      const origin = req.headers.get('origin');
+      if (origin !== 'https://elanous.app' && origin !== 'https://elanous.ai') return new Response('Forbidden', { status: 403 });
+      const reportHeaders = { 'access-control-allow-origin': origin, 'access-control-allow-methods': 'POST, OPTIONS',
+        'access-control-allow-headers': 'content-type', vary: 'Origin', 'cache-control': 'no-store' };
+      if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: reportHeaders });
+      if (req.method !== 'POST') return new Response('Method not allowed', { status: 405, headers: reportHeaders });
+      if (!options.appKillSwitch) return new Response('Unavailable', { status: 503, headers: reportHeaders });
+      // Source: 내부 문서 `nexus-backend-in-a-box` APP-ABUSE-REPORT; bounded category-only ingress.
+      const maxReportBytes = 1_024;
+      if (Number(req.headers.get('content-length') ?? 0) > maxReportBytes || !req.body) {
+        return new Response('Invalid report', { status: 400, headers: reportHeaders });
+      }
+      let raw = '';
+      let bytes = 0;
+      const decoder = new TextDecoder();
+      const reader = req.body.getReader();
+      try {
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          bytes += part.value.byteLength;
+          if (bytes > maxReportBytes) { await reader.cancel(); return new Response('Invalid report', { status: 400, headers: reportHeaders }); }
+          raw += decoder.decode(part.value, { stream: true });
+        }
+        raw += decoder.decode();
+      } catch { return new Response('Invalid report', { status: 400, headers: reportHeaders }); }
+      finally { reader.releaseLock(); }
+      let payload: unknown;
+      try { payload = JSON.parse(raw); } catch { return new Response('Invalid report', { status: 400, headers: reportHeaders }); }
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+        || Object.keys(payload).join() !== 'category'
+        || !['abuse', 'phishing', 'spam'].includes((payload as { category?: unknown }).category as string)) {
+        return new Response('Invalid report', { status: 400, headers: reportHeaders });
+      }
+      try {
+        options.appKillSwitch.applyIncident({ userId: publicApp.user, appId: publicApp.app, incident: 'abuse-report',
+          reason: (payload as { category: string }).category, requestedBy: 'public-report' });
+        for (const [id, pending] of room?.publicRequests ?? []) {
+          const target = parsePublicAppHost(pending.publicHost, options.publicDomain);
+          if (target?.app !== publicApp.app || target.user !== publicApp.user) continue;
+          clearTimeout(pending.timer); room?.publicRequests.delete(id); pending.releaseSlot();
+          pending.resolve(new Response('App unavailable', { status: 403 }));
+          if (room?.host) sendControl(room.host, { type: 'client-disconnected', clientId: id });
+        }
+      } catch { return new Response('Unavailable', { status: 503, headers: reportHeaders }); }
+      return new Response(JSON.stringify({ received: true }), { status: 202,
+        headers: { ...reportHeaders, 'content-type': 'application/json' } });
+    }
+    const memberGate = await memberAuthorized(req, serverId);
+    if (memberGate.status !== 'allowed') {
+      debug.log('relay.auth', 'member-denied', { serverId, route: 'public' });
+      return new Response(memberGate.status === 'busy' ? 'busy' : 'unauthorized', { status: memberGate.status === 'busy' ? 429 : 401 });
+    }
+    if (options.appKillSwitch?.isDown(publicApp.user, publicApp.app)) return new Response('App unavailable', { status: 403 });
     const publicHost = hostHeader.trim().toLowerCase().replace(/:\d+$/, '').replace(/\.$/, '');
     const internalHost = `${publicApp.app}.app.localhost`;
     if (!room?.host || !room.hostPublicKey) {
@@ -223,8 +487,10 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     }
     if (room.publicSlots >= MAX_PUBLIC_REQUESTS_PER_SERVER) return new Response('Public request capacity reached', { status: 429 });
     room.publicSlots += 1;
+    const connectionId = randomUUID();
+    const memberId = options.memberRequired ? options.hostOwnerMemberIds!.get(serverId) : undefined;
     let slotHeld = true;
-    const releaseSlot = () => { if (slotHeld) { slotHeld = false; room.publicSlots = Math.max(0, room.publicSlots - 1); } };
+    const releaseSlot = () => { if (slotHeld) { slotHeld = false; room.publicSlots = Math.max(0, room.publicSlots - 1); trafficMeter?.forgetConnection(connectionId); } };
     try {
     if (req.signal.aborted) { releaseSlot(); return new Response('Request cancelled', { status: 499 }); }
     const body = new Uint8Array(await req.arrayBuffer());
@@ -251,6 +517,8 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       }, options.publicRequestTimeoutMsForTesting ?? 30_000),
       publicHost,
       internalHost,
+      memberId,
+      connectionId,
       releaseSlot,
     };
     room.publicRequests.set(clientId, pending);
@@ -267,8 +535,13 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       releaseSlot();
       return new Response('Request cancelled', { status: 499 });
     }
+    let trafficLimited = false;
     const send = (bytes: Uint8Array): boolean => {
       if (!room.host || room.host.readyState !== WebSocket.OPEN) return false;
+      if (trafficMeter && trafficMeter.charge(memberId, connectionId, bytes.byteLength) !== 'allowed') {
+        trafficLimited = true;
+        return false;
+      }
       room.bytes += bytes.byteLength;
       room.host.send(encodeClientId(clientId, bytes));
       return true;
@@ -276,8 +549,17 @@ export function startRelayServer(options: RelayServerOptions = {}) {
     const forwardedHeaders = new Headers(req.headers);
     const connectionTokens = (forwardedHeaders.get('connection') ?? '').split(',').map(token => token.trim().toLowerCase())
       .filter(token => /^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(token));
-    for (const name of ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', ...connectionTokens]) {
+    for (const name of ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+      'te', 'trailer', 'transfer-encoding', 'upgrade', ...connectionTokens]) {
       forwardedHeaders.delete(name);
+    }
+    if (memberGate.consumed.some(credential => credential.source === 'authorization')) forwardedHeaders.delete('authorization');
+    const relayProtocols = new Set(memberGate.consumed.filter(credential => credential.source === 'protocol').map(credential => credential.token));
+    if (relayProtocols.size) {
+      const appProtocols = (forwardedHeaders.get('sec-websocket-protocol') ?? '').split(',').map(value => value.trim())
+        .filter(value => value && !relayProtocols.has(value));
+      if (appProtocols.length) forwardedHeaders.set('sec-websocket-protocol', appProtocols.join(', '));
+      else forwardedHeaders.delete('sec-websocket-protocol');
     }
     forwardedHeaders.set('host', internalHost);
     const requestOrigin = forwardedHeaders.get('origin');
@@ -292,7 +574,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       headers: Object.fromEntries(forwardedHeaders.entries()) });
     if (!opened.ok || !send(phone.phonePublicKey)) {
       clearTimeout(pending.timer); room.publicRequests.delete(clientId); releaseSlot();
-      return new Response('Bad gateway', { status: 502 });
+      return new Response(trafficLimited ? 'Traffic limited' : 'Bad gateway', { status: trafficLimited ? 429 : 502 });
     }
     const sendFrame = (frame: Parameters<typeof encoder.encode>[0]): boolean => {
       const encoded = encoder.encode(frame);
@@ -306,7 +588,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       || !sendFrame({ streamId: 1, kind: 'end' })) {
       clearTimeout(pending.timer); room.publicRequests.delete(clientId); releaseSlot();
       sendControl(room.host, { type: 'client-disconnected', clientId });
-      return new Response('Bad gateway', { status: 502 });
+      return new Response(trafficLimited ? 'Traffic limited' : 'Bad gateway', { status: trafficLimited ? 429 : 502 });
     }
     return response;
     } catch {
@@ -317,7 +599,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
   const server = Bun.serve<SocketData>({
     hostname: options.hostname ?? '127.0.0.1', port: options.port ?? 0,
     maxRequestBodySize: MAX_MUX_FRAME_BYTES,
-    fetch(req, server) {
+    async fetch(req, server) {
       const url = new URL(req.url);
       const isWebSocket = req.headers.get('upgrade')?.toLowerCase() === 'websocket';
       if (options.publicDomain && !isWebSocket) return publicFetch(req);
@@ -327,10 +609,16 @@ export function startRelayServer(options: RelayServerOptions = {}) {
       const serverId = url.searchParams.get('serverId');
       if (!serverId || !/^[a-f0-9]{64}$/.test(serverId)) return new Response('invalid serverId', { status: 400 });
       if (!trustedHostKeys.has(serverId)) return new Response('unknown serverId', { status: 403 });
+      const memberGate = await memberAuthorized(req, serverId);
+      if (memberGate.status !== 'allowed') {
+        debug.log('relay.auth', 'member-denied', { serverId, route: url.pathname });
+        return new Response(memberGate.status === 'busy' ? 'busy' : 'unauthorized', { status: memberGate.status === 'busy' ? 429 : 401 });
+      }
       if (!isWebSocket) return new Response('upgrade required', { status: 426 });
       const role = url.pathname === '/host' ? 'host' : 'client';
       const now = Date.now();
-      if (!server.upgrade(req, { data: { role, serverId, authenticated: false, lastSeen: now, tokens: BURST_BYTES, refillAt: now } })) {
+      if (!server.upgrade(req, { data: { role, serverId, authenticated: false, lastSeen: now, tokens: BURST_BYTES, refillAt: now,
+        memberId: options.memberRequired ? options.hostOwnerMemberIds!.get(serverId) : undefined, connectionId: randomUUID() } })) {
         return new Response('upgrade required', { status: 426 });
       }
       return undefined;
@@ -413,19 +701,32 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         if (!capacity(ws, bytes.length)) { fail(room, 'rate-limit'); ws.close(1008, 'rate limit exceeded'); return; }
         if (data.role === 'client') {
           if (!room.host || data.clientId === undefined) { ws.close(1012, 'host offline'); return; }
+          if (trafficMeter && trafficMeter.charge(data.memberId, data.connectionId, bytes.length) !== 'allowed') {
+            fail(room, 'traffic-cap'); ws.close(1008, 'traffic limited'); return;
+          }
           room.bytes += bytes.length;
           room.host.send(encodeClientId(data.clientId, bytes));
         } else {
           if (room.host !== ws) { ws.close(1008, 'host replaced'); return; }
           const clientId = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, false);
           const client = room.clients.get(clientId);
+          const pending = room.publicRequests.get(clientId);
+          if (!client && !pending) { fail(room, 'unknown-client'); return; }
+          if (trafficMeter && trafficMeter.charge(client ? client.data.memberId : pending?.memberId,
+            client ? client.data.connectionId : pending?.connectionId ?? '', bytes.length - 4) !== 'allowed') {
+            fail(room, 'traffic-cap');
+            if (pending) {
+              clearTimeout(pending.timer); room.publicRequests.delete(clientId); pending.releaseSlot();
+              pending.resolve(new Response('Traffic limited', { status: 429 }));
+            } else client?.close(1008, 'traffic limited');
+            return;
+          }
           room.bytes += bytes.length - 4;
           if (client) {
             client.send(bytes.subarray(4));
             return;
           }
-          const pending = room.publicRequests.get(clientId);
-          if (!pending) { fail(room, 'unknown-client'); return; }
+          if (!pending) return;
           const opened = pending.channel.open(bytes.subarray(4));
           if (!opened.ok) {
             clearTimeout(pending.timer); room.publicRequests.delete(clientId); pending.releaseSlot();
@@ -483,6 +784,7 @@ export function startRelayServer(options: RelayServerOptions = {}) {
         room.publicRequests.clear();
       }
       server.stop(true);
+      options.appKillSwitch?.close?.();
     },
   };
 }

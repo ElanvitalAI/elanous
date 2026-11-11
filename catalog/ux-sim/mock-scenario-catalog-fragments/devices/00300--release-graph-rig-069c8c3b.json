@@ -44,7 +44,9 @@
     "src/release-loop/macrophage-safe-cleanup.test.ts",
     "scripts/release-loop/release-graph-fanout-mock.test.ts",
     "scripts/release-loop/gate-flow-sim.test.ts",
+    "src/ux-sim/gate-no-wallclock.test.ts",
     "scripts/release-loop/gate-node-sim.test.ts",
+    "scripts/release-loop/gate-node.test.ts",
     "scripts/release-loop/gate-bisect.test.ts",
     "scripts/release-loop/adaptive-gate-heal.sim.test.ts",
     "src/ux-sim/release-event-trace.test.ts",
@@ -90,10 +92,13 @@
     "cloud lifecycle events and same-run release resume",
     "ARG repair proposals connect from the prior node, execute only after R0-R4 policy approval, and otherwise route to HITL or no-op",
     "publication-day replay keeps one runId and reaches only approve-publish as HITL",
-    "receipt-audit → residual-run → gate-triage → applied repair append → gate → receipt-audit → done under one runId"
+    "receipt-audit → residual-run → gate-triage → applied repair append → gate → receipt-audit → done under one runId",
+    "gate startup timestamp and failed verdict duration follow the injected clock",
+    "one release cut flow records shard disposition and invocationId, owner-cell persistence, then macrophage decision on the shared graph bus"
   ],
   "entryCommands": [
     "bun test scripts/release-loop/release-graph-fanout-mock.test.ts",
+    "bun test src/ux-sim/gate-no-wallclock.test.ts",
     "bun test src/ux-sim/release-sim-rig.test.ts",
     "bun test scripts/release-loop/adaptive-gate-heal.sim.test.ts",
     "bun test scripts/release-loop/rla-rehearsal-incident-sim-b.test.ts",
@@ -103,7 +108,8 @@
     "bun test src/ux-sim/graph-resume-any-entry.test.ts",
     "bun test src/ux-sim/release-day-0307-replay.test.ts",
     "bun bin/elanous.mjs --test sim run scenarios/ux-sim/macro-chain-e2e.yaml",
-    "bun test src/ux-sim/gate-image-layered-delta-sim.test.ts src/ux-sim/gate-steady-state-proof-sim.test.ts"
+    "bun test src/ux-sim/gate-image-layered-delta-sim.test.ts src/ux-sim/gate-steady-state-proof-sim.test.ts",
+    "bun test scripts/release-loop/gate-node.test.ts -t 'GATE-NODE-WIRING-BUNDLE sim'"
   ],
   "logsRecorded": "conditional",
   "eventNames": [
@@ -117,6 +123,9 @@
     "heal.hitl.decided",
     "heal.noop.decided",
     "release.gate.failed",
+    "shard-ledger-summary",
+    "timeout-owner-cell-observed",
+    "release.macrophage.decision",
     "graph.policy-denied",
     "graph.policy-noop"
   ],

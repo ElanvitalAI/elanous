@@ -6,6 +6,8 @@ import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { LiveRunAutoFollowPanel } from '@/components/live-run/LiveRunAutoFollowPanel';
 import { LiveRunPanel } from '@/components/live-run/LiveRunPanel';
+import { GraphInstanceSimulationScreen } from '@/components/live-run/GraphInstanceSimulationScreen';
+import { GraphInstanceLiveScreen } from '@/components/live-run/GraphInstanceLiveScreen';
 import { ReleaseRunsView } from '@/components/ops/ReleaseRunsView';
 import { claimSetupLink, readSetupLinkToken } from '@/lib/setup-link';
 import { loadDaemonConfig, saveDaemonConfig } from '@/lib/daemon-config';
@@ -64,13 +66,25 @@ function LiveRunRoute() {
   }, []);
   if (linkState === 'checking') return <p role="status" className="p-4 text-sm">기기 연결을 확인하는 중…</p>;
   if (linkState === 'failed') return <p role="alert" className="p-4 text-sm">연결 링크가 만료됐거나 이미 사용됐습니다. 새 링크를 요청해 주세요.</p>;
+  if (params.get('view') === 'instance-sim') return <GraphInstanceSimulationScreen />;
+  if (params.get('view') === 'instance') {
+    const source = params.get('source');
+    const runId = params.get('run')?.trim();
+    const graphId = params.get('graph')?.trim();
+    if (source === 'resource' && !operator) return <p className="p-4">운영자만 볼 수 있습니다</p>;
+    if (!['harness', 'graph', 'release', 'resource'].includes(source ?? '')
+      || (source !== 'resource' && !runId) || ((source === 'graph' || source === 'release') && !graphId))
+      return <p role="alert" className="p-4">인스턴스 출처와 런 식별자를 확인해 주세요.</p>;
+    return <GraphInstanceLiveScreen instanceKey={source === 'resource' ? { source: 'resource' }
+      : { source: source as 'harness' | 'graph' | 'release', ...(runId ? { runId } : {}), ...(graphId ? { graphId } : {}) }} />;
+  }
   if (params.get('view') === 'release') return operator ? <ReleaseRunsView /> : <p className="p-4">운영자만 볼 수 있습니다</p>;
   const runId = params.get('run')?.trim() || null;
-  if (!runId) return <>{operator && <div className="flex justify-end px-4 pt-2"><Link href="/live-run?view=release" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">릴리스 그래프</Link></div>}<LiveRunAutoFollowPanel /></>;
+  if (!runId) return <><div className="flex justify-end gap-2 px-4 pt-2">{operator && <Link href="/live-run/?view=instance&source=resource" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">자원 현황</Link>}<Link href="/live-run/?view=instance-sim" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">인스턴스 재생</Link><Link href="/live-run/adaptive/" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">적응형 그래프 재생</Link>{operator && <Link href="/live-run?view=release" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">릴리스 그래프</Link>}</div><LiveRunAutoFollowPanel /></>;
   const stageMode = params.get('stage') === '1';
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {operator && !stageMode && <div className="flex justify-end px-4 pt-2"><Link href="/live-run?view=release" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">릴리스 그래프</Link></div>}
+      {!stageMode && <div className="flex justify-end gap-2 px-4 pt-2"><Link href="/live-run/adaptive/" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">적응형 그래프 재생</Link>{operator && <Link href="/live-run?view=release" className="rounded border border-border px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">릴리스 그래프</Link>}</div>}
       {!stageMode && <div className="flex shrink-0 justify-end px-4 pt-2"><button type="button" aria-label="최신 런 자동 따라가기" onClick={() => router.replace('/live-run/')} className="rounded border border-border bg-surface px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated">
         최신 런 자동 따라가기
       </button></div>}

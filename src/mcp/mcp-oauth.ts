@@ -9,22 +9,29 @@
 // 인가 서버가 RFC 8628 을 광고할 때는 장치 코드로 자격을 얻는다.
 // 경계: 새 CLI 하위 명령은 더하지 않는다.
 
-import { chmodSync, closeSync, fchmodSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { generatePkcePair } from '../oauth/pkce.js';
 import {
   authStorePath,
   expiresAtFromSeconds,
   isExpiringSoon,
   loadTokens,
+  oauthConnectionStatus,
+  oauthRegistrationSnapshot,
+  oauthSnapshotFromState,
+  OAuthRegistrationChangedError,
+  replaceClientTokensIfCurrent,
   saveTokens,
   type OAuthTokens,
+  type OAuthConnectionStatus,
+  type OAuthRegistrationSnapshot,
   type ProviderAuthState,
   type WriteTokensOpts,
 } from '../oauth/store.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { debug } from '../debug/log.js';
+import type { CredentialHealthStatus } from '../nexus/config/secrets/cred-health.js';
+import { assessOAuthCredentialHealth } from '../nexus/config/secrets/cred-health.js';
 
 const REFRESH_BUFFER_MS = 120_000;
 const AUTH_MODE = 'mcp-oauth';
@@ -97,6 +104,8 @@ export interface AuthorizationRequest {
   redirectUri: string;
   issuer: string;
   clientId: string;
+  /** Digest only; binds the later token commit to the store seen before browser approval. */
+  expectedStore?: OAuthRegistrationSnapshot;
   /** Set when the client registration is pending (see ClientRegistration.pending); in memory only. */
   pendingRegistration?: { clientSecret?: string };
   scope?: string;
@@ -192,7 +201,7 @@ function loadIssuerState(
     },
     path,
   );
-  debug.log('mcp.oauth', 'legacy-credential-adopted', { issuer, from: legacy, to: path });
+  debug.log('mcp.oauth', 'legacy-credential-adopted', { source: 'legacy', destination: 'shared' });
   return loadTokens(issuer, path);
 }
 
@@ -241,13 +250,15 @@ async function getJson(
       method: 'GET',
       headers: { accept: 'application/json' },
     });
-  } catch (err) {
+  } catch {
     throw new McpOAuthError(
       'discovery',
-      `${what} request failed: ${err instanceof Error ? err.message : String(err)}`,
+      `${what} request failed`,
     );
   }
-  const text = await res.text();
+  let text: string;
+  try { text = await res.text(); }
+  catch { throw new McpOAuthError('discovery', `${what} response could not be read`); }
   if (res.status < 200 || res.status >= 300) {
     throw new McpOAuthError('discovery', `${what} returned HTTP ${res.status}`);
   }
@@ -352,7 +363,7 @@ export async function discoverProtectedResource(
     if (!resourceCoversEndpoint(resource, opts.resourceUrl)) {
       throw new McpOAuthError(
         'identity-mismatch',
-        `protected resource metadata describes ${resource}, which does not cover the MCP endpoint ${opts.resourceUrl}`,
+        'protected resource metadata does not cover the MCP endpoint',
       );
     }
   }
@@ -391,7 +402,7 @@ export async function discoverAuthorizationServer(
   if (!sameOAuthIdentifier(issuer, authorizationServer)) {
     throw new McpOAuthError(
       'identity-mismatch',
-      `authorization server metadata issuer (${issuer}) does not match the identifier it was fetched from (${authorizationServer})`,
+      'authorization server metadata issuer does not match the requested identifier',
     );
   }
   const registrationEndpoint = stringField(body, 'registration_endpoint');
@@ -430,11 +441,7 @@ function registrationFromState(state: ProviderAuthState | null): ClientRegistrat
 }
 
 function saveMcpTokens(issuer: string, tokens: OAuthTokens, opts: WriteTokensOpts, path: string): void {
-  // The shared store creates path.tmp with default permissions and chmods only
-  // after rename. Restrict the temporary file before this MCP credential write.
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(`${path}.tmp`, '', { mode: 0o600, flag: 'w' });
-  chmodSync(`${path}.tmp`, 0o600);
+  // oauth/store.ts owns the only private, atomic write path.
   saveTokens(issuer, tokens, opts, path);
 }
 
@@ -442,25 +449,23 @@ function persistRegistration(
   issuer: string,
   registration: ClientRegistration,
   path: string,
-  tokens?: OAuthTokens,
+  expected: ProviderAuthState | null,
 ): void {
-  const existing = loadTokens(issuer, path);
-  saveMcpTokens(
-    issuer,
-    tokens ?? existing?.tokens ?? { accessToken: '', refreshToken: '', expiresAt: null },
-    {
-      authMode: AUTH_MODE,
-      accountUuid: registration.clientId,
-      ...(registration.clientSecret
-        ? { organizationUuid: registration.clientSecret }
-        : existing?.organizationUuid
-          ? { organizationUuid: existing.organizationUuid }
-          : {}),
-      ...(registration.redirectUri ? { redirectUri: registration.redirectUri } : {}),
-      mirrorCodex: false,
-    },
-    path,
-  );
+  try {
+    replaceClientTokensIfCurrent(issuer, expected?.accountUuid ?? null,
+      expected?.tokens ?? { accessToken: '', refreshToken: '', expiresAt: null }, {
+        clientId: registration.clientId,
+        authMode: AUTH_MODE,
+        ...(registration.clientSecret ? { clientSecret: registration.clientSecret }
+          : expected?.accountUuid === registration.clientId && expected.organizationUuid
+            ? { clientSecret: expected.organizationUuid } : {}),
+        ...(registration.redirectUri ? { redirectUri: registration.redirectUri } : {}),
+      }, path, oauthSnapshotFromState(expected).stateDigest);
+  } catch (error) {
+    throw new McpOAuthError('registration', error instanceof OAuthRegistrationChangedError
+      ? 'stored client registration changed during registration'
+      : 'credential store write failed');
+  }
 }
 
 /** 루프백 redirect_uri 의 TCP 포트. 없거나 기본 포트(생략)면 null. */
@@ -507,6 +512,7 @@ export async function ensureClientRegistration(
       'no stored client registration and authorization server has no registration_endpoint',
     );
   }
+  const expected = loadTokens(metadata.issuer, path);
   const redirectUri = opts.redirectUri ?? DEFAULT_REDIRECT_URI;
   let res: Awaited<ReturnType<McpOAuthFetch>>;
   try {
@@ -525,13 +531,15 @@ export async function ensureClientRegistration(
         application_type: 'native',
       }),
     });
-  } catch (err) {
+  } catch {
     throw new McpOAuthError(
       'registration',
-      `dynamic registration request failed: ${err instanceof Error ? err.message : String(err)}`,
+      'dynamic registration request failed',
     );
   }
-  const text = await res.text();
+  let text: string;
+  try { text = await res.text(); }
+  catch { throw new McpOAuthError('registration', 'dynamic registration response could not be read'); }
   if (res.status < 200 || res.status >= 300) {
     throw new McpOAuthError('registration', `dynamic registration returned HTTP ${res.status}`);
   }
@@ -551,9 +559,10 @@ export async function ensureClientRegistration(
   if (opts.deviceCode) return registration;
   // A browser registration over another client's live tokens (e.g. after a device login) waits for its own
   // tokens: storing it now would orphan the stored refresh token if this approval is cancelled or fails.
-  const existing = loadTokens(metadata.issuer, path);
-  if (existing?.tokens.refreshToken && existing.accountUuid && existing.accountUuid !== clientId) return { ...registration, pending: true };
-  persistRegistration(metadata.issuer, registration, path);
+  if ((expected?.tokens.accessToken || expected?.tokens.refreshToken) && expected.accountUuid && expected.accountUuid !== clientId) {
+    return { ...registration, pending: true };
+  }
+  persistRegistration(metadata.issuer, registration, path, expected);
   return registration;
 }
 
@@ -570,6 +579,7 @@ export function buildAuthorizationRequest(
     scope?: string;
     resource?: string;
     redirectUri?: string;
+    expectedStore?: OAuthRegistrationSnapshot;
   } = {},
 ): AuthorizationRequest {
   if (!supportsS256(metadata)) {
@@ -598,6 +608,7 @@ export function buildAuthorizationRequest(
     redirectUri,
     issuer: metadata.issuer,
     clientId: registration.clientId,
+    ...(opts.expectedStore ? { expectedStore: opts.expectedStore } : {}),
     ...(registration.pending ? { pendingRegistration: registration.clientSecret ? { clientSecret: registration.clientSecret } : {} } : {}),
     ...(scope ? { scope } : {}),
     ...(opts.resource ? { resource: opts.resource } : {}),
@@ -626,22 +637,6 @@ function formBody(fields: Record<string, string | undefined>): string {
   return params.toString();
 }
 
-function oauthErrorPayload(text: string): string | undefined {
-  try {
-    const parsed = JSON.parse(text) as { error?: unknown; error_description?: unknown };
-    if (typeof parsed?.error === 'string' && parsed.error.trim()) {
-      const description =
-        typeof parsed.error_description === 'string' && parsed.error_description.trim()
-          ? `: ${parsed.error_description.trim()}`
-          : '';
-      return `${parsed.error.trim()}${description}`;
-    }
-  } catch {
-    /* not JSON */
-  }
-  return undefined;
-}
-
 async function postToken(
   tokenEndpoint: string,
   fields: Record<string, string | undefined>,
@@ -658,21 +653,17 @@ async function postToken(
       },
       body: formBody(fields),
     });
-  } catch (err) {
+  } catch {
     throw new McpOAuthError(
       code,
-      `token endpoint request failed: ${err instanceof Error ? err.message : String(err)}`,
+      'token endpoint request failed',
     );
   }
-  const text = await res.text();
+  let text: string;
+  try { text = await res.text(); }
+  catch { throw new McpOAuthError(code, 'token response could not be read'); }
   if (res.status < 200 || res.status >= 300) {
-    const payload = oauthErrorPayload(text);
-    throw new McpOAuthError(
-      code,
-      payload
-        ? `token endpoint returned HTTP ${res.status} (${payload})`
-        : `token endpoint returned HTTP ${res.status}`,
-    );
+    throw new McpOAuthError(code, `token endpoint returned HTTP ${res.status}`);
   }
   const body = parseJsonObject(text, 'token response', code);
   const accessToken = stringField(body, 'access_token');
@@ -696,60 +687,26 @@ function persistTokens(
   tokens: OAuthTokens,
   registration: ClientRegistration | null,
   path: string,
+  expected: ProviderAuthState | null,
+  expectedSnapshot: OAuthRegistrationSnapshot = oauthSnapshotFromState(expected),
 ): void {
-  const existing = loadTokens(issuer, path);
-  const clientId = registration?.clientId ?? existing?.accountUuid;
-  const switchingClient = registration !== null && existing !== null && registration.clientId !== existing.accountUuid;
-  const clientSecret = registration?.clientSecret ?? (switchingClient ? undefined : existing?.organizationUuid);
-  if (switchingClient) {
-    // Build the complete replacement in memory. A failed temporary write or rename
-    // must leave the old client's registration AND refresh token together on disk.
-    const store = JSON.parse(readFileSync(path, 'utf8')) as { providers: Record<string, ProviderAuthState> };
-    const previous = store.providers[issuer];
-    if (!previous || previous.accountUuid !== existing?.accountUuid) {
-      throw new McpOAuthError('token', 'stored client registration changed during token exchange');
-    }
-    const replacement: ProviderAuthState = {
-      ...previous,
-      tokens,
-      lastRefresh: new Date().toISOString(),
+  const clientId = registration?.clientId ?? expected?.accountUuid;
+  if (!clientId) throw new McpOAuthError('token', 'client registration is missing');
+  const switchingClient = expected !== null && clientId !== expected.accountUuid;
+  const clientSecret = registration?.clientSecret ?? (switchingClient ? undefined : expected?.organizationUuid);
+  const redirectUri = registration?.redirectUri ?? (switchingClient ? undefined : expected?.redirectUri);
+  try {
+    replaceClientTokensIfCurrent(issuer, expectedSnapshot.clientId, tokens, {
+      clientId,
       authMode: AUTH_MODE,
-      accountUuid: registration.clientId,
-    };
-    delete replacement.redirectUri;
-    delete replacement.organizationUuid;
-    if (clientSecret) replacement.organizationUuid = clientSecret;
-    if (registration.redirectUri) replacement.redirectUri = registration.redirectUri;
-    store.providers[issuer] = replacement;
-    // A stale path.tmp may be 0644. Never write new tokens into it, even briefly.
-    // The unique sibling is created exclusively and private before any token bytes are written.
-    const tmp = `${path}.${randomUUID()}.tmp`;
-    const fd = openSync(tmp, 'wx', 0o600);
-    try {
-      fchmodSync(fd, 0o600);
-      writeFileSync(fd, `${JSON.stringify(store, null, 2)}\n`, 'utf8');
-      closeSync(fd);
-      renameSync(tmp, path);
-    } catch (error) {
-      try { closeSync(fd); } catch { /* already closed */ }
-      try { unlinkSync(tmp); } catch { /* already renamed */ }
-      throw error;
-    }
-    return;
+      ...(clientSecret ? { clientSecret } : {}),
+      ...(redirectUri ? { redirectUri } : {}),
+    }, path, expectedSnapshot.stateDigest);
+  } catch (error) {
+    throw new McpOAuthError('token', error instanceof OAuthRegistrationChangedError
+      ? 'stored client registration changed during token exchange'
+      : 'credential store write failed');
   }
-  saveMcpTokens(
-    issuer,
-    tokens,
-    {
-      authMode: AUTH_MODE,
-      ...(clientId ? { accountUuid: clientId } : {}),
-      ...(clientSecret ? { organizationUuid: clientSecret } : {}),
-      // A loopback URI belongs to the client that registered it — never carry it onto a different (device) client.
-      ...(existing?.redirectUri && (!registration || registration.clientId === existing.accountUuid) ? { redirectUri: existing.redirectUri } : {}),
-      mirrorCodex: false,
-    },
-    path,
-  );
 }
 
 export interface McpDeviceAuthorization {
@@ -772,6 +729,7 @@ export async function authorizeMcpDevice(
 ): Promise<OAuthTokens> {
   const endpoint = metadata.deviceAuthorizationEndpoint;
   if (!endpoint) throw new McpOAuthError('device', 'authorization server does not advertise device_authorization_endpoint');
+  const expected = loadTokens(metadata.issuer, storePath(opts));
   const fetchFn = fetchImpl(opts);
   const post = async (url: string, fields: Record<string, string | undefined>) => {
     let response: Awaited<ReturnType<McpOAuthFetch>>;
@@ -781,10 +739,12 @@ export async function authorizeMcpDevice(
         headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' },
         body: formBody(fields),
       });
-    } catch (error) {
-      throw new McpOAuthError('device', `device authorization request failed: ${error instanceof Error ? error.message : String(error)}`);
+    } catch {
+      throw new McpOAuthError('device', 'device authorization request failed');
     }
-    const text = await response.text();
+    let text: string;
+    try { text = await response.text(); }
+    catch { throw new McpOAuthError('device', 'device authorization response could not be read'); }
     return { status: response.status, body: parseJsonObject(text, 'device authorization response', 'device') };
   };
   const started = await post(endpoint, {
@@ -797,8 +757,9 @@ export async function authorizeMcpDevice(
   const userCode = stringField(started.body, 'user_code');
   const verificationUri = stringField(started.body, 'verification_uri');
   if (started.status < 200 || started.status >= 300 || !deviceCode || !userCode || !verificationUri) {
-    const error = stringField(started.body, 'error');
-    throw new McpOAuthError('device', `device authorization returned HTTP ${started.status}${error ? ` (${error})` : ''} or missing required fields`);
+    const code = stringField(started.body, 'error');
+    const safeCode = code === 'unauthorized_client' || code === 'invalid_client' ? ` (${code})` : '';
+    throw new McpOAuthError('device', `device authorization returned HTTP ${started.status}${safeCode} or missing required fields`);
   }
   requireHttpUrl(verificationUri, 'verification_uri');
   const verificationUriComplete = stringField(started.body, 'verification_uri_complete');
@@ -835,12 +796,12 @@ export async function authorizeMcpDevice(
         tokenType: stringField(polled.body, 'token_type') ?? 'Bearer',
         ...(stringField(polled.body, 'scope') ? { scope: stringField(polled.body, 'scope') } : {}),
       };
-      persistTokens(metadata.issuer, tokens, registration, storePath(opts));
+      persistTokens(metadata.issuer, tokens, registration, storePath(opts), expected);
       return tokens;
     }
     const error = stringField(polled.body, 'error');
     if (error === 'slow_down') interval += 5000;
-    else if (error !== 'authorization_pending') throw new McpOAuthError('device', `device token request returned HTTP ${polled.status} (${error ?? 'unknown'})`);
+    else if (error !== 'authorization_pending') throw new McpOAuthError('device', `device token request returned HTTP ${polled.status} (${error === 'access_denied' || error === 'expired_token' ? error : 'unknown'})`);
   }
   throw new McpOAuthError('device', 'device authorization expired before approval');
 }
@@ -853,6 +814,7 @@ export async function exchangeAuthorizationCode(
 ): Promise<OAuthTokens> {
   const code = verifyAuthorizationCallback(request, callback);
   const path = storePath(opts);
+  const expected = loadTokens(metadata.issuer, path);
   const pending = request.pendingRegistration;
   const registration: ClientRegistration | null = pending
     ? { clientId: request.clientId, ...(pending.clientSecret ? { clientSecret: pending.clientSecret } : {}), redirectUri: request.redirectUri }
@@ -872,12 +834,14 @@ export async function exchangeAuthorizationCode(
     'token',
   );
   // A pending registration is committed together with the tokens it just earned.
-  if (pending) persistRegistration(metadata.issuer, registration!, path, tokens);
+  if (pending) persistTokens(metadata.issuer, tokens, registration!, path, expected, request.expectedStore);
   else persistTokens(
     metadata.issuer,
     tokens,
     registration ?? { clientId: request.clientId },
     path,
+    expected,
+    request.expectedStore,
   );
   return tokens;
 }
@@ -933,7 +897,7 @@ async function refreshStoredAccessTokenUncoalesced(
     scope: tokens.scope ?? existing.tokens.scope,
     tokenType: tokens.tokenType ?? existing.tokens.tokenType ?? 'Bearer',
   };
-  persistTokens(metadata.issuer, retained, registration, path);
+  persistTokens(metadata.issuer, retained, registration, path, existing);
   return retained;
 }
 
@@ -971,14 +935,20 @@ export async function prepareMcpOAuthAuthorization(
   opts: PrepareMcpOAuthAuthorizationOpts,
 ): Promise<McpOAuthAuthorization> {
   const { resource, metadata } = opts.discovered ?? await discoverMcpOAuth(opts.resourceMetadataUrl, opts);
+  const beforeRegistration = oauthRegistrationSnapshot(metadata.issuer, storePath(opts));
   const registration = await ensureClientRegistration(metadata, {
     ...opts,
     ...(opts.forceReregister ? { forceReregister: true } : {}),
   });
+  const expectedStore = registration.pending ? beforeRegistration : oauthRegistrationSnapshot(metadata.issuer, storePath(opts));
+  if (!registration.pending && expectedStore.clientId !== registration.clientId) {
+    throw new McpOAuthError('registration', 'stored client registration changed during authorization preparation');
+  }
   const request = buildAuthorizationRequest(metadata, registration, {
     scope: opts.scope,
     resource: resource.resource,
     redirectUri: opts.redirectUri,
+    expectedStore,
   });
   return { metadata, request };
 }
@@ -988,13 +958,56 @@ export async function acquireAccessToken(
 ): Promise<{ accessToken: string; issuer: string }> {
   const authorization = await prepareMcpOAuthAuthorization(opts);
   const callback = await opts.authorize(authorization.request);
-  const tokens = await exchangeAuthorizationCode(
-    authorization.metadata,
-    authorization.request,
-    callback,
-    opts,
-  );
+  const tokens = await exchangeAuthorizationCode(authorization.metadata, authorization.request, callback, opts);
   return { accessToken: tokens.accessToken, issuer: authorization.metadata.issuer };
+}
+
+/** Complete a previously prepared app authorization and expose only stored connection metadata. */
+export async function completeAppOAuthConnection(
+  metadata: AuthorizationServerMetadata,
+  request: AuthorizationRequest,
+  callback: AuthorizationCallback,
+  opts: McpOAuthRuntimeOpts = {},
+): Promise<{ issuer: string } & OAuthConnectionStatus> {
+  await exchangeAuthorizationCode(metadata, request, callback, opts);
+  return { issuer: metadata.issuer, ...oauthConnectionStatus(metadata.issuer, storePath(opts)) };
+}
+
+export interface McpOAuthLoginAssistOpts extends PrepareMcpOAuthAuthorizationOpts {
+  healthStatus: CredentialHealthStatus;
+  method: 'browser' | 'device';
+  /** The caller opens the URL and returns the callback; state and verifier stay in the request. */
+  onBrowser?: AuthorizeHandler;
+  /** The caller displays the user code and verification URL; the device code stays private. */
+  onDeviceCode?: (code: McpDeviceAuthorization) => Promise<void> | void;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+export type McpOAuthLoginAssistResult =
+  | { kind: 'skipped'; healthStatus: CredentialHealthStatus }
+  | { kind: 'completed'; method: 'browser' | 'device'; issuer: string; connected: boolean; expiresAt: number | null };
+
+/** Connect only missing or expired credentials through the existing OAuth flows. Never returns token bytes. */
+export async function assistMcpOAuthLogin(opts: McpOAuthLoginAssistOpts): Promise<McpOAuthLoginAssistResult> {
+  if (opts.healthStatus !== 'missing' && opts.healthStatus !== 'expired')
+    return { kind: 'skipped', healthStatus: opts.healthStatus };
+  if (opts.method === 'browser') {
+    if (!opts.onBrowser) throw new McpOAuthError('discovery', 'browser login callback unavailable');
+    const authorization = await prepareMcpOAuthAuthorization(opts);
+    const callback = await opts.onBrowser(authorization.request);
+    const receipt = await completeAppOAuthConnection(authorization.metadata, authorization.request, callback, opts);
+    return { kind: 'completed', method: 'browser', issuer: receipt.issuer, connected: receipt.connected,
+      expiresAt: receipt.expiresAt };
+  }
+  if (!opts.onDeviceCode) throw new McpOAuthError('device', 'device code display callback unavailable');
+  const { resource, metadata } = opts.discovered ?? await discoverMcpOAuth(opts.resourceMetadataUrl, opts);
+  const registration = await ensureClientRegistration(metadata, { ...opts, deviceCode: true });
+  await authorizeMcpDevice(metadata, registration, { ...opts, resource: resource.resource,
+    onDeviceCode: opts.onDeviceCode });
+  const receipt = oauthConnectionStatus(metadata.issuer, storePath(opts));
+  return { kind: 'completed', method: 'device', issuer: metadata.issuer, connected: receipt.connected,
+    expiresAt: receipt.expiresAt };
 }
 
 export interface RecoverAccessTokenOpts extends McpOAuthRuntimeOpts {
@@ -1033,24 +1046,34 @@ export async function recoverAccessToken(
 
   if (opts.hadBearer) {
     if (!tokenEndpoint) return null;
-    const refreshed = await refreshStoredAccessToken(
-      { issuer, tokenEndpoint },
-      opts,
-    );
-    return { accessToken: refreshed.accessToken, issuer, tokenEndpoint };
+    try {
+      const refreshed = await refreshStoredAccessToken({ issuer, tokenEndpoint }, opts);
+      return { accessToken: refreshed.accessToken, issuer, tokenEndpoint };
+    } catch (error) {
+      // A rejected refresh of an expired credential needs a new authorization.
+      // Without a caller-owned browser callback, keep the existing refresh error.
+      const prior = loadIssuerState(issuer, opts);
+      if (!(error instanceof McpOAuthError) || error.code !== 'refresh' || !opts.authorize || !metadata || !resource ||
+          !opts.resourceMetadataUrl || !prior || prior.tokens.expiresAt === null || prior.tokens.expiresAt > Date.now()) throw error;
+      const assisted = await assistMcpOAuthLogin({ ...opts, resourceMetadataUrl: opts.resourceMetadataUrl,
+        discovered: { resource, metadata }, healthStatus: 'expired', method: 'browser', onBrowser: opts.authorize });
+      const accessToken = assisted.kind === 'completed' && assisted.connected
+        ? loadStoredAccessToken(issuer, opts) : null;
+      return accessToken ? { accessToken, issuer, tokenEndpoint } : null;
+    }
   }
 
   const existing = await getValidAccessToken(issuer, { ...opts, tokenEndpoint });
   if (existing) return { accessToken: existing, issuer, tokenEndpoint };
 
-  if (!opts.authorize || !metadata) return null;
-  const registration = await ensureClientRegistration(metadata, opts);
-  const request = buildAuthorizationRequest(metadata, registration, {
-    scope: opts.scope,
-    resource: resource?.resource,
-    redirectUri: opts.redirectUri,
-  });
-  const callback = await opts.authorize(request);
-  const tokens = await exchangeAuthorizationCode(metadata, request, callback, opts);
-  return { accessToken: tokens.accessToken, issuer, tokenEndpoint };
+  if (!opts.authorize || !metadata || !resource || !opts.resourceMetadataUrl) return null;
+  const prior = loadIssuerState(metadata.issuer, opts);
+  const healthStatus = assessOAuthCredentialHealth(prior?.tokens.accessToken?.trim()
+    ? { present: true, expiresAt: prior.tokens.expiresAt, scope: prior.tokens.scope }
+    : { present: false }, [], Date.now(), 0);
+  const assisted = await assistMcpOAuthLogin({ ...opts, resourceMetadataUrl: opts.resourceMetadataUrl,
+    discovered: { resource, metadata }, healthStatus, method: 'browser', onBrowser: opts.authorize });
+  if (assisted.kind !== 'completed') return null;
+  const token = await getValidAccessToken(metadata.issuer, { ...opts, tokenEndpoint });
+  return token ? { accessToken: token, issuer, tokenEndpoint } : null;
 }

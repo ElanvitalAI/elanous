@@ -1,6 +1,6 @@
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 import { classifyShortQuestion } from '../chat/short-question.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { runCoreTurn } from '../core-turn/run-core-turn.js';
 import type { LLMMessage } from '../llm.js';
 import { maybeImageBearingResult } from '../llm.js';
@@ -110,6 +110,9 @@ export async function runDaemonPromptTurn(opts: {
   surfaceHitlChannels?: ConfirmChannel[];
   /** Server-authenticated human owner for this request; absent for delegated or unverified callers. */
   verifiedOwner?: { id: string };
+  /** Verified app-bound member owner proof for Nexus deployment tools. */
+  appDeploymentOwner?: { appSlug: string; memberId: string; userSlug: string; plan: string; entitlements: Readonly<Record<string, unknown>> };
+  appDeploymentSession?: 'nexus-owner' | 'member' | 'anonymous';
   /** Optional structured-question channels for the triggering chat surface. */
   surfaceQuestionChannels?: QuestionChannel[];
   /** CWD for fs-bound tool dispatch (Read / Grep). Defaults to
@@ -233,6 +236,8 @@ export async function runDaemonPromptTurn(opts: {
               ? { requestOrigin: 'external-agent' as const } : {}),
             ...(request.userText ? { userText: request.userText } : {}),
             ...(opts.verifiedOwner ? { verifiedOwner: opts.verifiedOwner } : {}),
+            ...(opts.appDeploymentOwner ? { appDeploymentOwner: opts.appDeploymentOwner } : {}),
+            ...(opts.appDeploymentSession ? { appDeploymentSession: opts.appDeploymentSession } : {}),
             ...(opts.surface !== undefined || sourceResolution.surface !== 'unknown' ? { surface } : {}),
             ...(opts.surfaceHitlChannels ? { surfaceHitlChannels: opts.surfaceHitlChannels } : {}),
             ...(opts.surfaceQuestionChannels ? { surfaceQuestionChannels: opts.surfaceQuestionChannels } : {}),

@@ -36,12 +36,12 @@ describe('relay app kill-switch CLI', () => {
     await program.parseAsync(['relay', 'app-kill-switch', 'status', '--user-id', 'tenant-a', '--app-id', 'shop'], { from: 'user' });
 
     expect(output[0]).toContain('state recorded: down · user=tenant-a · app=shop · incident=cost-spike');
-    expect(output[0]).toContain('relay-server enforcement hook pending');
+    expect(output[0]).not.toContain('enforcement hook pending');
     expect(output[1]).toContain('recorded state: down · user=tenant-a · app=shop');
     expect(output[2]).toContain('"reason":"cost guard tripped"');
     expect(output[2]).toContain('"requestedBy":"cost-guard"');
     expect(output[3]).toContain('state reactivated · user=tenant-a · app=shop');
-    expect(output[3]).toContain('relay-server enforcement hook pending');
+    expect(output[3]).not.toContain('enforcement hook pending');
     expect(output[4]).toContain(`"actorId":"uid-${process.getuid?.()}"`);
     expect(output[5]).toContain('recorded state: up · user=tenant-a · app=shop');
     expect(errors).toEqual([]);

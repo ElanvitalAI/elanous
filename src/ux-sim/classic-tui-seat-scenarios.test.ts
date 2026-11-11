@@ -14,10 +14,10 @@ const REPO_CLI = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
 // Each scenario boots this tree's classic TUI (bare `elanous`) on a real PTY with the network-free
 // fake LLM (`ELANOUS_TEST_FAKE_LLM_AS_PROVIDER=1`) and reads the universe back through the same CLI's
 // `logs`. One TUI at a time (sequential tests) — the seat host carries one isolated TUI per run.
-async function run(scenario: ClassicTuiScenario) {
+async function run(scenario: ClassicTuiScenario, rows = 30) {
   const dir = mkdtempSync(join(tmpdir(), `n03-${scenario}-`));
   try {
-    return await runClassicTuiScenario({ scenario, root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
+    return await runClassicTuiScenario({ scenario, root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI, rows });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -78,8 +78,15 @@ describe('classic TUI scenarios on N03 (this tree · fake LLM)', () => {
     expect(screen).toContain(finalReply);
   });
   test('scenario list is the CLI contract', () => {
-    expect([...CLASSIC_TUI_SCENARIOS]).toEqual(['classic-first-screen-noise', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-priority-keys', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop']);
+    expect([...CLASSIC_TUI_SCENARIOS]).toEqual(['classic-first-screen-noise', 'classic-inline-picker', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-priority-keys', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop']);
   });
+
+  test('classic-inline-picker: @ and / panels stay above the composer and Esc restores the draft at 24 and 40 rows', async () => {
+    for (const rows of [24, 40]) {
+      const result = await run('classic-inline-picker', rows);
+      expect(Object.values(result.checks).every(Boolean)).toBe(true);
+    }
+  }, 180_000);
 
   test('classic-first-screen-noise: first-run internals stay out of the screen and Enter skips without Doctor', async () => {
     const r = await run('classic-first-screen-noise');

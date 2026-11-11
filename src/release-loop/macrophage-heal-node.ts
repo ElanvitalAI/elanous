@@ -8,6 +8,8 @@ import { debug } from '../debug/log.js';
 import { openMsgStore } from '../msg/msg-store.js';
 import { runMacrophageHeal, type MacrophageEvidence, type MacrophageScrap } from './macrophage-heal.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { runLedgerDir, appendRunLedgerEntryChecked } from '../self-implement/run-ledger.js';
+import { readRunChart, recordRunChartDecision } from '../self-implement/run-chart.js';
 
 const SUBSCRIBER_GRAPH = join(import.meta.dir, '../../graphs/release/macrophage-subscriber.yaml');
 const SUBSCRIBER_NODE_ID = 'macrophage-heal';
@@ -140,6 +142,29 @@ function decisionEventId(runId: string, key: string): string {
   return `${runId}:macrophage:${key}`;
 }
 
+function recordMacrophageRunChart(root: string, event: GraphEvent): void {
+  const dir = runLedgerDir(root);
+  const timestamp = event.emittedAt;
+  const initialized = appendRunLedgerEntryChecked(event.runId, (entries) => entries === null
+    ? { append: true, entry: { runId: event.runId, timestamp, event: 'release-macrophage-chart-init',
+      data: { graphId: event.graphId, source: 'release.macrophage.decision' } } }
+    : { append: false, result: 'already-initialized' as const }, dir);
+  if (initialized.refusal) {
+    throw new Error(`macrophage run-chart initialization refused: run=${event.runId} event=${event.eventId}`);
+  }
+  const prior = readRunChart(event.runId, 'macrophage', dir);
+  const data = event.data ?? {};
+  const evidence = typeof data.evidence === 'string' ? data.evidence : JSON.stringify(data.evidence ?? {});
+  const result = recordRunChartDecision({ runId: event.runId, dir, device: 'macrophage', stopKey: event.eventId,
+    observed: `${String(data.id ?? 'unknown decision')}: ${evidence}`,
+    verdict: String(data.action ?? 'unmeasured'), action: String(data.action ?? 'unmeasured'),
+    handoff: data.action === 'route-to-supervisor' ? 'outer-supervisor' : 'none',
+    why: String(data.result ?? data.failureSignature ?? data.status ?? 'macrophage decision recorded'),
+    readStopKeys: prior.map((cell) => cell.stopKey) });
+  if (result !== 'recorded' && result !== 'already-recorded')
+    throw new Error(`macrophage run-chart decision was not persisted: run=${event.runId} event=${event.eventId} result=${result}`);
+}
+
 /** Attach the declarative macrophage subscriber to an active release graph's real event bus. */
 export function createMacrophageRuntime(options: MacrophageRuntimeOptions): MacrophageRuntime {
   const root = options.root ?? effectiveInstanceRoot();
@@ -246,6 +271,7 @@ export function createMacrophageRuntime(options: MacrophageRuntimeOptions): Macr
         appendMacrophageState(paths.state, { schema: 'elanous.release.macrophage-state.v1', kind: 'decision-prepared', key, event: eventInput });
       }
       if (published) {
+        recordMacrophageRunChart(root, published);
         (options.writeReceipt ?? appendMacrophageReceipt)(root, published);
         receiptedDecisionKeys.add(key);
         appendMacrophageState(paths.state, { schema: 'elanous.release.macrophage-state.v1', kind: 'decision-receipted', key });
@@ -255,6 +281,7 @@ export function createMacrophageRuntime(options: MacrophageRuntimeOptions): Macr
       debug.log('release-loop.macrophage', 'decision', { graphId: dispatch.event.graphId, runId: dispatch.event.runId, ...data });
       const decisionEvent = await bus.publish(eventInput);
       publishedInRuntime.set(key, decisionEvent);
+      recordMacrophageRunChart(root, decisionEvent);
       (options.writeReceipt ?? appendMacrophageReceipt)(root, decisionEvent);
       receiptedDecisionKeys.add(key);
       appendMacrophageState(paths.state, { schema: 'elanous.release.macrophage-state.v1', kind: 'decision-receipted', key });

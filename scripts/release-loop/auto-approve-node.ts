@@ -5,6 +5,7 @@ import { debug } from '../../src/debug/log.js';
 import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
 import { listChecklist } from '../../src/release-loop/checklist.js';
+import { hasPassingEmergencyPublishGate } from './emergency-publish-authorization.js';
 import { emitNodeResult, readGraphContext, type GraphContext } from './node-verdict.js';
 import { regressWarning, validatedTuiRegress } from './tui-node-checks.js';
 
@@ -51,6 +52,7 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
   const root = deps.instanceRoot ?? effectiveInstanceRoot();
   const repo = deps.repo ?? resolve(import.meta.dir, '../..');
   const gate = context.outputs.gate;
+  const emergencyGate = hasPassingEmergencyPublishGate(context);
   const ownerWaivedGate = gate?.verdict === 'owner-waived'
     && (gate.outcome === 'ok' || gate.outcome === 'pass(owner-waived)')
     && typeof gate.approvedBy === 'string' && gate.approvedBy.trim().length > 0
@@ -84,9 +86,9 @@ export function runAutoApprove(context: GraphContext = readGraphContext(), deps:
   context.outputs['checklist-gate'] = { ...context.outputs['checklist-gate'], publishBlockingYellow };
   const holdReasons = publishApprovalHoldReasons(context);
   const metrics: ApprovalMetric[] = [
-    { name: BLOCKING_METRIC_NAMES[0], value: JSON.stringify({ outcome: gate?.outcome ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null, ownerWaived: ownerWaivedGate }),
+    { name: BLOCKING_METRIC_NAMES[0], value: JSON.stringify({ outcome: gate?.outcome ?? null, introduced: gate?.introduced ?? null, error: gate?.error ?? null, ownerWaived: ownerWaivedGate, emergencyGate }),
       verdict: !gate || gate.outcome === undefined ? 'unmeasured'
-        : ownerWaivedGate ? 'pass' : !Array.isArray(gate.introduced) ? 'unmeasured'
+        : ownerWaivedGate || emergencyGate ? 'pass' : !Array.isArray(gate.introduced) ? 'unmeasured'
           : gate.outcome === 'ok' && gate.introduced.length === 0 && gateErrorAbsent ? 'pass' : 'fail' },
     { name: BLOCKING_METRIC_NAMES[1], value: `running=${bunVersion}; pinned=${pinned ?? 'missing'}`,
       verdict: !pinned ? 'unmeasured' : bunVersion === pinned ? 'pass' : 'fail' },

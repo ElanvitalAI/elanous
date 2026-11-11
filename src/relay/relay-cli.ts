@@ -54,15 +54,45 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
     .option('--public-domain <domain>', 'Enable the single-host public app proxy for elanous.app or elanous.ai (TLS must terminate at the local edge proxy)')
     .option('--public-server-id <id>', 'Pinned Nexus host serverId that receives its configured public user app hosts')
     .option('--public-user-id <id>', 'User label bound to this single Nexus host; multi-user dispatch belongs to the ops relay')
-    .action(async (opts: { trustedHostKeys: string; port: string; publicDomain?: string; publicServerId?: string; publicUserId?: string }) => {
+    .option('--member-required', 'Require a current relay.connect member token for every WebSocket connection (default false)')
+    .option('--member-nexus-url <url>', 'HTTPS Nexus origin for relay token introspection')
+    .option('--host-owner-members <file>', 'JSON serverId-to-memberId pins for member-required mode')
+    .option('--traffic-cap-config <file>', 'Owner-only JSON with free member and connection byte limits per minute')
+    .option('--public-listing-config <file>', 'Owner-only JSON opt-in list of searchable public app IDs (default empty)')
+    .option('--custom-domain-config <file>', 'Owner-only JSON routes for custom hosts with verified DNS ownership and TLS certificates')
+    .action(async (opts: { trustedHostKeys: string; port: string; publicDomain?: string; publicServerId?: string; publicUserId?: string;
+      memberRequired?: boolean; memberNexusUrl?: string; hostOwnerMembers?: string; trafficCapConfig?: string; publicListingConfig?: string; customDomainConfig?: string }) => {
       const port = Number(opts.port);
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('invalid relay port');
       const { loadTrustedHostKeys, resolvePublicAppUserId, startRelayServer } = await import('./relay-server.js');
       const publicUserId = opts.publicDomain ? resolvePublicAppUserId(opts.publicUserId) : opts.publicUserId;
       const resolvedOpts = { ...opts, ...(publicUserId ? { publicUserId } : {}) };
       validateRelayPublicOptions(resolvedOpts);
-      const relay = startRelayServer({ port, hostname: '127.0.0.1', trustedHostKeys: loadTrustedHostKeys(opts.trustedHostKeys),
-        ...(opts.publicDomain ? { publicDomain: opts.publicDomain as 'elanous.app' | 'elanous.ai', publicServerId: opts.publicServerId!, publicUserId: publicUserId! } : {}) });
+      if (opts.memberRequired && (!opts.memberNexusUrl || !opts.hostOwnerMembers)) {
+        throw new Error('--member-required requires --member-nexus-url and --host-owner-members');
+      }
+      if (!opts.memberRequired && opts.trafficCapConfig) throw new Error('--traffic-cap-config requires --member-required');
+      if (opts.publicListingConfig && !opts.publicDomain) throw new Error('--public-listing-config requires --public-domain');
+      const memberOptions = opts.memberRequired ? await (async () => {
+        const { createNexusRelayMemberVerifier, loadRelayHostOwners } = await import('./relay-member-verifier.js');
+        const { loadRelayTrafficCap } = await import('./relay-server.js');
+        return { memberRequired: true, hostOwnerMemberIds: loadRelayHostOwners(opts.hostOwnerMembers!),
+          validateMemberToken: createNexusRelayMemberVerifier(opts.memberNexusUrl!),
+          ...(opts.trafficCapConfig ? { trafficCap: loadRelayTrafficCap(opts.trafficCapConfig) } : {}) };
+      })() : {};
+      const { loadRelayPublicListing, loadRelayCustomDomainRoutes } = await import('./relay-server.js');
+      const publicListedApps = opts.publicListingConfig ? loadRelayPublicListing(opts.publicListingConfig) : undefined;
+      const customDomainRoutes = opts.customDomainConfig ? loadRelayCustomDomainRoutes(opts.customDomainConfig) : undefined;
+      const { createAppKillSwitch } = await import('./app-kill-switch.js');
+      const appKillSwitch = opts.publicDomain ? createAppKillSwitch(options.appKillSwitchDatabasePath
+        ?? join(getElanousConfigDir(), 'relay', 'app-kill-switch.sqlite')) : undefined;
+      let relay: ReturnType<typeof startRelayServer>;
+      try {
+        relay = startRelayServer({ port, hostname: '127.0.0.1', trustedHostKeys: loadTrustedHostKeys(opts.trustedHostKeys),
+          ...(opts.publicDomain ? { publicDomain: opts.publicDomain as 'elanous.app' | 'elanous.ai', publicServerId: opts.publicServerId!, publicUserId: publicUserId! } : {}),
+          ...(appKillSwitch ? { appKillSwitch } : {}), ...(publicListedApps ? { publicListedApps } : {}),
+          ...(customDomainRoutes ? { customDomainRoutes } : {}), ...memberOptions });
+      } catch (error) { appKillSwitch?.close(); throw error; }
       console.log(`relay listening on 127.0.0.1:${relay.port}${opts.publicDomain ? ' (public TLS edge required)' : ''}`);
       process.once('SIGINT', () => { relay.stop(); });
       process.once('SIGTERM', () => { relay.stop(); });
@@ -79,7 +109,7 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
     .action(async (input: { userId: string; appId: string; incident: 'abuse-report' | 'cost-spike'; reason: string; requestedBy: string }) => {
       await withAppKillSwitch(options, (control) => {
         const event = control.applyIncident(input);
-        (options.write ?? ((text: string) => process.stdout.write(text)))(`app kill switch state recorded: down · user=${event.userId} · app=${event.appId} · incident=${event.incident}\nrelay-server enforcement hook pending\n`);
+        (options.write ?? ((text: string) => process.stdout.write(text)))(`app kill switch state recorded: down · user=${event.userId} · app=${event.appId} · incident=${event.incident}\n`);
       });
     });
   killSwitch.command('up')
@@ -90,7 +120,7 @@ export function registerRelayCommand(program: Command, options: RelayCommandOpti
       await withAppKillSwitch(options, (control, operatorId) => {
         const changed = control.reactivate({ userId: input.userId, appId: input.appId,
           actor: { kind: 'operator', id: operatorId } });
-        (options.write ?? ((text: string) => process.stdout.write(text)))(`app kill switch state ${changed ? 'reactivated' : 'already up'} · user=${input.userId} · app=${input.appId} · relay-server enforcement hook pending\n`);
+        (options.write ?? ((text: string) => process.stdout.write(text)))(`app kill switch state ${changed ? 'reactivated' : 'already up'} · user=${input.userId} · app=${input.appId}\n`);
       });
     });
   killSwitch.command('status')

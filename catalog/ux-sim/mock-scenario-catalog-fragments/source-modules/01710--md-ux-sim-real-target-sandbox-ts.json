@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-REAL-TARGET-SANDBOX-TS",
+  "path": "src/ux-sim/real-target-sandbox.ts",
+  "boundary": "Runs a declared real-target adapter inside an OS sandbox with parent-owned time and stop controls, read-only test inputs, declared write mounts, and a fail-closed unavailable receipt.",
+  "deviceIds": ["world-regression-suite"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

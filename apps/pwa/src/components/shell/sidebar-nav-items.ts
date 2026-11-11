@@ -92,6 +92,12 @@ export interface NonMenuSidebarRoute {
 }
 
 export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
+  { href: '/credentials/register', category: 'settings-subpage', reason: '자격 금고 슬롯별 등록 화면.' },
+  { href: '/credentials/register/claim', category: 'settings-subpage', reason: '일회용 소유자 등록 링크를 처리하는 화면.' },
+  { href: '/apps/report', category: 'workflow-subflow', reason: '앱 화면에서 여는 공개 앱 신고 화면.' },
+  { href: '/ops/release', category: 'operator-direct-link', reason: '운영자 릴리스 그래프 직접 진입점.' },
+  { href: '/live-run/adaptive', category: 'beta-direct-link', reason: '런 장면에서 여는 적응형 그래프 시뮬레이션 재생 화면.' },
+  { href: '/share/received', category: 'system-share-target', reason: 'OS 공유 수신 후 회원 스크랩 저장 화면.' },
   { href: '/setup', category: 'provider-onboarding', reason: 'LLM provider 온보딩 진입점.' },
   { href: '/setup/done', category: 'provider-onboarding-complete', reason: 'LLM provider 온보딩 완료 화면.' },
   { href: '/', category: 'root-welcome', reason: '첫 방문자를 위한 루트 welcome 화면.' },
@@ -101,10 +107,12 @@ export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
 export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { group: 'talk', href: '/chat', label: '채팅', hint: '채팅 (스트리밍 · multimodal · mic)', icon: MessageSquare },
   { group: 'work', href: '/live-run', label: '런 장면', hint: '하니스 런 하나가 도는 장면 — 노드·간선 (라이브 · 리플레이)', icon: GitBranch },
+  { group: 'work', href: '/board', label: '내 보드', hint: '회원 본인 앱의 진행 상태와 브리핑', icon: LayoutGrid },
   { group: 'make', href: '/term', label: '터미널', hint: '터미널 + agent dock', icon: TerminalSquare },
   { group: 'make', href: '/editor', label: '그래프', hint: '그래프 작성·편집 — 작업 노드 · 실행 단계 노드', icon: GitBranch },
   { group: 'make', href: '/apps', label: '앱', hint: '앱 스튜디오 — 시뮬레이션과 운영 상태', icon: LayoutGrid },
   { group: 'make', href: '/design-check', label: '디자인 방향', hint: '앱 디자인 방향 고르기', icon: Palette },
   { group: 'files', href: '/vault', label: 'Obsidian 노트', hint: 'Vault — Obsidian 노트 (브라우저·에디터·검색·그래프)', icon: BookOpen },
   { group: 'settings', href: '/settings', label: '설정', hint: '환경 + provider + theme', icon: Settings },
+  { group: 'settings', href: '/credentials', label: '자격', hint: '넥서스 금고의 자격 슬롯 상태', icon: Settings },
 ] as const;

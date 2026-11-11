@@ -1,0 +1,13 @@
+{
+  "id": "pod-federation-sim",
+  "name": "Deterministic Pod federation placement",
+  "implementation": ["src/ux-sim/pod-federation-sim.ts", "src/ux-sim/fake-fleet.ts", "src/ux-sim/fake-cloud-vm.ts"],
+  "tests": ["src/ux-sim/pod-federation-sim.test.ts"],
+  "target": "Exercise production pool placement and cloud recovery using fixed host and Pod responses.",
+  "inputs": ["work IDs", "host availability", "completion attempt"],
+  "observations": ["selected host and context", "rebound attempts", "accepted and stale piece outcomes"],
+  "entryCommands": ["bun test src/ux-sim/pod-federation-sim.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

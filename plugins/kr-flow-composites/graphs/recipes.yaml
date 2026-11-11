@@ -1,0 +1,9 @@
+sector-compose:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../../scripts/kr-flow-composites.ts" sector-flow'
+  timeout_ms: 30000
+battery-compose:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../../scripts/kr-flow-composites.ts" battery-signal'
+  timeout_ms: 30000
+etf-compose:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../../scripts/kr-flow-composites.ts" etf-price'
+  timeout_ms: 30000

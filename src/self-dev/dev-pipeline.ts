@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { benchArmBranchForBase } from '../bench/bench.js';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import type { DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
 import { getNestDepth } from '../agent/nest-depth.js';
 import { appendRunLedgerEntry } from '../self-implement/run-ledger.js';
@@ -55,6 +55,7 @@ import type { DefaultSeamsOptions } from '../self-implement/seams.js';
 import { harnessTargetOptions, resolveHarnessTarget, revalidateHarnessTarget, type HarnessTargetResolution } from '../self-implement/harness-target-options.js';
 import { provisionRepository, type RepoProvisionResult } from '../self-implement/repo-provision.js';
 import { decideNonGitInit } from '../self-implement/non-git-consent.js';
+import { planAppScratchBootstrap } from './app-scratch-bootstrap.js';
 import { createInterface } from 'node:readline/promises';
 import type { ChildLlmSelection } from '../agent/run-context.js';
 import type { SurfaceUx } from '../agent/surface-ux/types.js';
@@ -2165,7 +2166,30 @@ async function runDevPipelineDispatch(
   preflightGoalFileEvidence(plan.input, inputText, spec.allowNoEvidence === true);
   preflightSupersededGoalFile(plan.input, inputText, spec.allowSupersededGoal === true);
   preflightGoalFileLint(plan.input, inputText, plan.dispatch, deps.cwd ?? process.cwd(), spec.allowGoalLintErrors === true, deps);
-  const text = applyManualGoalEvidenceRequirement(plan.input, inputText);
+  let text = applyManualGoalEvidenceRequirement(plan.input, inputText);
+  let autoInitAppScratch = false;
+  if ('text' in plan.input && spec.self?.naturalLanguageDispatch === true) {
+    const cwd = deps.cwd ?? process.cwd();
+    const bootstrapTarget = plan.target ?? resolveHarnessTarget(cwd);
+    const targetPath = bootstrapTarget.canonicalTarget ?? bootstrapTarget.target;
+    let entries: string[] = [];
+    if (bootstrapTarget.status === 'non-git-dir') {
+      try { entries = readdirSync(targetPath); }
+      catch { entries = ['<unreadable>']; }
+    }
+    const bootstrap = planAppScratchBootstrap({
+      request: extractVerbatimOriginalAsk(inputText)?.ask ?? inputText,
+      naturalLanguageDispatch: true,
+      targetStatus: bootstrapTarget.status,
+      entries,
+    });
+    autoInitAppScratch = bootstrap.autoInitGit;
+    if (bootstrap.inferredTargetPaths.length > 0) {
+      text = `대상 경로: ${bootstrap.inferredTargetPaths.join(' · ')}\n${text}`;
+      emitHumanProgress(`[app-scratch] inferred targets: ${bootstrap.inferredTargetPaths.join(' · ')}`, spec.humanReadableOutput !== false, deps.progress);
+    }
+    if (autoInitAppScratch) emitHumanProgress(`[app-scratch] empty folder detected; preparing a local git repository`, spec.humanReadableOutput !== false, deps.progress);
+  }
   const goalId = 'file' in plan.input ? parseGoalId(text) : null;
   seen.goalId = goalId;
   const lineageNotice = resolveGoalFileBase(plan, goalId, deps.runGh);
@@ -2264,7 +2288,7 @@ async function runDevPipelineDispatch(
     const decision = await decideNonGitInit({
       target,
       interactive: deps.nonGitInteractive ?? (process.stdin.isTTY === true),
-      assumeYes: spec.assumeYes === true,
+      assumeYes: spec.assumeYes === true || autoInitAppScratch,
       ask,
     });
     if (decision !== 'init') {

@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
-import { lastJsonObject, type GraphRunState } from '../../src/graph-runner/runner.js';
+import { lastJsonObject } from '../../src/graph-runner/runner-primitives.js';
+import type { GraphRunState } from '../../src/graph-runner/runner-types.js';
 import { join } from 'node:path';
 import { emitNodeResult, readGraphContext, runCommand, type CommandRunner, type GraphContext } from './node-verdict.js';
 

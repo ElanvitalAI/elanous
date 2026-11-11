@@ -29,9 +29,12 @@ describe('service key setup storage boundary', () => {
     expect(JSON.stringify({ stored: ['OPENROUTER_API_KEY', 'XAI_API_KEY'] })).not.toContain(secret);
   });
 
-  test('rejects unknown, duplicate, malformed, and empty entries without echoing their values', () => {
+  test('skips unknown names while parsing known entries and rejects duplicate, malformed, and empty known entries', () => {
     const sentinel = 'sentinel-never-echo-this';
-    expect(() => parseServiceKeyEnv(`UNLISTED_TOKEN=${sentinel}`)).toThrow('unsupported env name: UNLISTED_TOKEN');
+    const mixed = parseServiceKeyEnv(`UNLISTED_TOKEN=${sentinel}\nFDS_API_KEY=known-fake-key`);
+    expect([...mixed]).toEqual([['FDS_API_KEY', 'known-fake-key']]);
+    expect(mixed.skippedNames).toEqual(['UNLISTED_TOKEN']);
+    expect(JSON.stringify(mixed.skippedNames)).not.toContain(sentinel);
     expect(() => parseServiceKeyEnv(`XAI_API_KEY=${sentinel}\nXAI_API_KEY=another-secret`)).toThrow('duplicate env name: XAI_API_KEY');
     expect(() => parseServiceKeyEnv(`XAI_API_KEY="${sentinel}`)).toThrow('invalid quoted value for XAI_API_KEY');
     expect(() => parseServiceKeyEnv('XAI_API_KEY=')).toThrow('empty or invalid value for XAI_API_KEY');

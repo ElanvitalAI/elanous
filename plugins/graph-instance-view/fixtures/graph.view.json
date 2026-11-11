@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "instance": { "source": "graph", "runId": "graph-demo-1", "graphId": "research-flow", "title": "Research flow", "observedAt": "2026-11-10T07:00:00.000Z", "state": "running" },
+  "nodes": [
+    { "id": "plan", "label": "Plan", "model": "opus", "role": "planner", "state": "done" },
+    { "id": "search-a", "label": "Search A", "model": "sonnet", "role": "researcher", "state": "done" },
+    { "id": "search-b", "label": "Search B", "model": "sonnet", "role": "researcher", "state": "running", "progress": { "done": 1, "total": 3 } },
+    { "id": "join", "label": "Synthesize", "role": "editor", "state": "queued" }
+  ],
+  "edges": [
+    { "id": "plan-a", "from": "plan", "to": "search-a", "kind": "branch", "state": "taken" },
+    { "id": "plan-b", "from": "plan", "to": "search-b", "kind": "branch", "state": "taken" },
+    { "id": "a-join", "from": "search-a", "to": "join", "kind": "join", "state": "planned" },
+    { "id": "b-join", "from": "search-b", "to": "join", "kind": "join", "state": "planned" }
+  ],
+  "progress": { "completed": 2, "total": 4, "activeNodeIds": ["search-b"] },
+  "logs": [
+    { "seq": 1, "nodeId": "plan", "level": "info", "text": "계획 완료" },
+    { "seq": 2, "nodeId": "search-a", "level": "info", "text": "A 완료" },
+    { "seq": 3, "nodeId": "search-b", "level": "info", "text": "B 진행 중" }
+  ],
+  "statusLine": "graph-demo-1 · 진행 중",
+  "readState": "ok"
+}

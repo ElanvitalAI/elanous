@@ -54,7 +54,7 @@ test('DEBUG-GATE-INSIDE-LOG: lazy payload evaluation waits for logger gates', ()
 test('webterm :agent broadcasts ordered turn boundaries after its stream', async () => {
   const bridge = createInProcessAcpBridge();
   const abort = new AbortController();
-  const updates: Array<{ sessionUpdate: string; content?: { text?: string }; text?: string; stopReason?: string }> = [];
+  const updates: Array<{ sessionUpdate: string; content?: { text?: string }; _meta?: { elanousTurn?: { phase: string; text?: string; stopReason?: string } } }> = [];
   const server = runAcpServer({
     shutdownSignal: abort.signal,
     transportFactory: async (onConnection: AcpConnectionHandler): Promise<AcpTransportServer> => {
@@ -81,10 +81,11 @@ test('webterm :agent broadcasts ordered turn boundaries after its stream', async
     const { sessionId } = await client.newSession({ cwd: process.cwd(), mcpServers: [] });
     await client.extMethod('terminal/repl/exec', { sessionId, terminalId: 'term-test', line: ':agent hi' });
     expect(updates.map((update) => update.sessionUpdate)).toEqual([
-      'elanous_turn_begin', 'agent_message_chunk', 'tool_call', 'tool_call_update',
-      'agent_message_chunk', 'elanous_turn_end',
+      'agent_message_chunk', 'agent_message_chunk', 'tool_call', 'tool_call_update',
+      'agent_message_chunk', 'agent_message_chunk',
     ]);
-    expect(updates.at(-1)).toMatchObject({ text: '초안 최종', stopReason: 'end_turn' });
+    expect(updates[0]?._meta?.elanousTurn).toEqual({ phase: 'begin' });
+    expect(updates.at(-1)?._meta?.elanousTurn).toEqual({ phase: 'end', text: '초안 최종', stopReason: 'end_turn' });
   } finally {
     abort.abort();
     await server;

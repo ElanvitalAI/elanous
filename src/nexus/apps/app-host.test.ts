@@ -3,14 +3,17 @@ import { constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync,
 import { execFileSync } from 'node:child_process';
 import { platform, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import iconv from 'iconv-lite';
 import { createFakeAppHost } from '../../ux-sim/fake-app-host.js';
 import { createNexusState } from '../state/state.js';
 import { TabRegistry } from '../state/tab-registry.js';
 import { NexusEventBus } from '../api/event-bus.js';
 import { startNexusHttpServer } from '../api/http-server.js';
 import { loadNexusAppHost } from './app-host.js';
+import { MADE_WITH_BADGE_ENTITLEMENT } from './made-with-badge.js';
 import { createMemberStore } from '../members/member-store.js';
 import { FakeAppDbBackupStore } from '../../ux-sim/fake-app-db-backup-world.js';
+import type { SimReceipt } from '../../ux-sim/sim-receipt.js';
 
 const manifest = `apiVersion: elanous.app/v0
 slug: voice-note
@@ -338,6 +341,226 @@ test('NEXUS-APP-DB-RPC-WIRE rechecks session expiry after a slow RPC body', asyn
   }
 });
 
+test('app host applies the made-with attribution only with a passing concept proof', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-app-host-made-with-badge-'));
+  const outDir = writeApp(root, '<html><body><footer data-elanous-made-with-badge="true"><footer data-elanous-made-with-badge="true">old</footer></footer><main>hello</main><plaintext>plain tail </body></plaintext></html>');
+  writeFileSync(join(outDir, 'template.html'), '<html><body><main>template</main><template><template><div></body></div></template></template><plaintext>template tail</plaintext></html>');
+  writeFileSync(join(outDir, 'textarea.html'), '<html><body><main>start</main><textarea>unterminated </body>');
+  writeFileSync(join(outDir, 'comparison.html'), '<html><body><p>1 < 2 <textarea><footer data-elanous-made-with-badge="true">user example</footer></textarea></p></body></html>');
+  writeFileSync(join(outDir, 'legacy.html'), Buffer.from('<html><head><meta charset="x-app-legacy"></head><body>caf\u00e9</body></html>', 'latin1'));
+  writeFileSync(join(outDir, 'comment-charset.html'), '<html><head><!-- <meta charset="windows-1252"> --><script>const example = "<meta charset=windows-1252>";</script></head><body>😃</body></html>');
+  writeFileSync(join(outDir, 'attribute-charset.html'), '<html><head><meta name=example value="charset=windows-1252"></head><body>😃</body></html>');
+  writeFileSync(join(outDir, 'utf8-bom.html'), Buffer.concat([Buffer.from('efbbbf', 'hex'), Buffer.from('<html><head><meta charset="windows-1252"></head><body>😃</body></html>')]));
+  writeFileSync(join(outDir, 'utf16.html'), iconv.encode('\uFEFF<html><body><main>utf16 app</main><footer data-elanous-made-with-badge="true">old</footer></body></html>', 'utf-16le'));
+  writeFileSync(join(outDir, 'utf16-no-bom.html'), iconv.encode('<html><head><meta charset="utf-16le"></head><body>utf16 no bom</body></html>', 'utf-16le'));
+  writeFileSync(join(outDir, 'utf16-leading-space.html'), iconv.encode(' \n<html><head><meta charset="utf-16le"></head><body>utf16 leading space</body></html>', 'utf-16le'));
+  writeFileSync(join(outDir, 'utf16be.html'), iconv.encode('\uFEFF<html><body>utf16be app</body></html>', 'utf-16le').swap16());
+  writeFileSync(join(outDir, 'utf16be-leading-space.html'), iconv.encode(' \n<html><head><meta charset="utf-16be"></head><body>utf16be leading space</body></html>', 'utf-16le').swap16());
+  writeFileSync(join(outDir, 'utf16-prefix.html'), iconv.encode('hello<html><head><meta charset="utf-16le"></head><body>utf16 prefix</body></html>', 'utf-16le'));
+  writeFileSync(join(outDir, 'utf16be-prefix.html'), iconv.encode('hello<html><head><meta charset="utf-16be"></head><body>utf16be prefix</body></html>', 'utf-16le').swap16());
+  writeFileSync(join(outDir, 'invalid-utf8.html'), Buffer.concat([
+    Buffer.from('<html><body><main>invalid '), Buffer.from('\u00ff', 'latin1'),
+    Buffer.from('</main><footer data-elanous-made-with-badge="true">old</footer></body></html>'),
+  ]));
+  writeFileSync(join(outDir, 'invalid-declared-utf8.html'), Buffer.concat([
+    Buffer.from('<html><head><meta charset="utf-8"></head><body><main>invalid '), Buffer.from('\u00ff', 'latin1'),
+    Buffer.from('</main><footer data-elanous-made-with-badge="true">old</footer></body></html>'),
+  ]));
+  try {
+    const loaded = loadNexusAppHost(root, undefined, appAuthOptions(root));
+    const proof = { schema: 'elanous.sim-receipt.v1', appSimulationReceiptId: 'receipt-proof', appSimulationRunId: 'run-proof',
+      appId: 'voice-note', appFingerprint: 'a'.repeat(64), deviceCatalogVersion: 1,
+      requiredScenarios: [{ id: 'happy-path', outcome: 'passed' as const }], sandboxEstablished: true,
+      externalNetworkAttempts: 0, blockedNetworkAttempts: 0, unmeasuredCount: 0,
+      eventLedgerPath: 'app-simulation.sqlite#run-proof', createdAt: '2026-11-10T08:00:00.000Z',
+      verdict: 'passed' as const, reasons: [], receiptFingerprint: 'b'.repeat(64) } satisfies SimReceipt;
+    loaded.appHost.setConceptProofResolver(() => proof);
+    const invitation = loaded.appHost.issueInvitation('voice-note', 'test');
+    const accepted = (await loaded.appHost.handle(new Request(
+      `http://voice-note.app.localhost/__auth/accept?token=${encodeURIComponent(invitation.token)}`,
+      { headers: { host: 'voice-note.app.localhost' } },
+    )))!;
+    const cookie = accepted.headers.get('set-cookie')!.split(';', 1)[0]!;
+    const fetchPage = async (path: string): Promise<Response> => (await loaded.appHost.handle(new Request(`http://voice-note.app.localhost${path}`, {
+      headers: { host: 'voice-note.app.localhost', cookie },
+    })))!;
+
+    const response = await fetchPage('/');
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain('<main>hello</main>');
+    expect(body).toContain('<plaintext>plain tail </body></plaintext></html>');
+    expect(body.indexOf('class="elanous-made-with-badge"')).toBeLessThan(body.indexOf('<plaintext>'));
+    expect(body.match(/<footer[^>]*class="elanous-made-with-badge"/g)).toHaveLength(1);
+
+    const templateBody = await (await fetchPage('/template.html')).text();
+    expect(templateBody.indexOf('class="elanous-made-with-badge"')).toBeGreaterThan(templateBody.lastIndexOf('</template>'));
+    expect(templateBody.indexOf('class="elanous-made-with-badge"')).toBeLessThan(templateBody.indexOf('<plaintext>'));
+    expect(templateBody).toContain('<template><template><div></body></div></template></template>');
+
+    const textareaBody = await (await fetchPage('/textarea.html')).text();
+    expect(textareaBody.indexOf('class="elanous-made-with-badge"')).toBeLessThan(textareaBody.indexOf('<textarea>'));
+    expect(textareaBody).toContain('<textarea>unterminated </body>');
+
+    const comparisonBody = await (await fetchPage('/comparison.html')).text();
+    expect(comparisonBody).toContain('<p>1 < 2 <textarea><footer data-elanous-made-with-badge="true">user example</footer></textarea></p>');
+    expect(comparisonBody.match(/<footer[^>]*class="elanous-made-with-badge"/g)).toHaveLength(1);
+
+    const legacyResponse = await fetchPage('/legacy.html');
+    expect(legacyResponse.headers.get('content-type')).toContain('charset=x-app-legacy');
+    const legacyHtml = Buffer.from(await legacyResponse.arrayBuffer()).toString('latin1');
+    expect(legacyHtml).toMatch(/<body>caf\u00e9</);
+    expect(legacyHtml).toContain('made with elanous');
+
+    const commentCharsetResponse = await fetchPage('/comment-charset.html');
+    expect(commentCharsetResponse.headers.get('content-type')).toContain('charset=utf-8');
+    expect(await commentCharsetResponse.text()).toContain('<body>😃<footer');
+
+    const attributeCharset = await (await fetchPage('/attribute-charset.html')).text();
+    expect(attributeCharset).toContain('<body>😃<footer');
+    const utf8BomResponse = await fetchPage('/utf8-bom.html');
+    expect(utf8BomResponse.headers.get('content-type')).toContain('charset=utf-8');
+    const utf8BomBytes = Buffer.from(await utf8BomResponse.arrayBuffer());
+    expect(utf8BomBytes.toString('hex').startsWith('efbbbf')).toBe(true);
+    expect(new TextDecoder('utf-8').decode(utf8BomBytes)).toContain('<body>😃<footer');
+
+    const utf16Response = await fetchPage('/utf16.html');
+    expect(utf16Response.headers.get('content-type')).toContain('charset=utf-16le');
+    const utf16Bytes = Buffer.from(await utf16Response.arrayBuffer());
+    expect(utf16Bytes.toString('hex').startsWith('fffe')).toBe(true);
+    const utf16Html = new TextDecoder('utf-16le').decode(utf16Bytes);
+    expect(utf16Html).toContain('<main>utf16 app</main>');
+    expect(utf16Html.match(/<footer[^>]*class="elanous-made-with-badge"/g)).toHaveLength(1);
+    const utf16NoBomResponse = await fetchPage('/utf16-no-bom.html');
+    expect(utf16NoBomResponse.headers.get('content-type')).toContain('charset=utf-16le');
+    expect(new TextDecoder('utf-16le').decode(await utf16NoBomResponse.arrayBuffer())).toContain('utf16 no bom');
+    const utf16beResponse = await fetchPage('/utf16be.html');
+    expect(utf16beResponse.headers.get('content-type')).toContain('charset=utf-16be');
+    const utf16beBytes = Buffer.from(await utf16beResponse.arrayBuffer());
+    expect(utf16beBytes.toString('hex').startsWith('feff')).toBe(true);
+    expect(new TextDecoder('utf-16be').decode(utf16beBytes)).toContain('utf16be app');
+    const utf16LeadingSpace = await fetchPage('/utf16-leading-space.html');
+    expect(utf16LeadingSpace.headers.get('content-type')).toContain('charset=utf-16le');
+    expect(new TextDecoder('utf-16le').decode(await utf16LeadingSpace.arrayBuffer())).toContain('utf16 leading space');
+    const utf16beLeadingSpace = await fetchPage('/utf16be-leading-space.html');
+    expect(utf16beLeadingSpace.headers.get('content-type')).toContain('charset=utf-16be');
+    expect(new TextDecoder('utf-16be').decode(await utf16beLeadingSpace.arrayBuffer())).toContain('utf16be leading space');
+    const utf16Prefix = await fetchPage('/utf16-prefix.html');
+    expect(utf16Prefix.headers.get('content-type')).toContain('charset=utf-16le');
+    expect(new TextDecoder('utf-16le').decode(await utf16Prefix.arrayBuffer())).toContain('utf16 prefix');
+    const utf16bePrefix = await fetchPage('/utf16be-prefix.html');
+    expect(utf16bePrefix.headers.get('content-type')).toContain('charset=utf-16be');
+    expect(new TextDecoder('utf-16be').decode(await utf16bePrefix.arrayBuffer())).toContain('utf16be prefix');
+
+    const invalidUtf8Response = await fetchPage('/invalid-utf8.html');
+    expect(invalidUtf8Response.headers.get('content-type')).toContain('charset=windows-1252');
+    const invalidUtf8Html = Buffer.from(await invalidUtf8Response.arrayBuffer()).toString('latin1');
+    expect(invalidUtf8Html).toContain('<main>invalid \u00ff</main>');
+    expect(invalidUtf8Html.match(/<footer[^>]*class="elanous-made-with-badge"/g)).toHaveLength(1);
+    const invalidDeclaredUtf8Response = await fetchPage('/invalid-declared-utf8.html');
+    expect(invalidDeclaredUtf8Response.headers.get('content-type')).toContain('charset=utf-8');
+    const invalidDeclaredUtf8Html = Buffer.from(await invalidDeclaredUtf8Response.arrayBuffer()).toString('latin1');
+    expect(invalidDeclaredUtf8Html).toContain('<main>invalid \u00ff</main>');
+    expect(invalidDeclaredUtf8Html.match(/<footer[^>]*class="elanous-made-with-badge"/g)).toHaveLength(1);
+
+    loaded.appHost.unmountDirectory('voice-note');
+    // Source: 내부 문서 `nexus-revenue-and-market` §2⑤ — managed plan entitlement removes attribution.
+    loaded.appHost.mountDirectory('voice-note', { [MADE_WITH_BADGE_ENTITLEMENT]: 0 });
+    const managedInvitation = loaded.appHost.issueInvitation('voice-note', 'test');
+    const managedAccepted = (await loaded.appHost.handle(new Request(
+      `http://voice-note.app.localhost/__auth/accept?token=${encodeURIComponent(managedInvitation.token)}`,
+      { headers: { host: 'voice-note.app.localhost' } },
+    )))!;
+    const managedCookie = managedAccepted.headers.get('set-cookie')!.split(';', 1)[0]!;
+    const managedBody = await (await loaded.appHost.handle(new Request('http://voice-note.app.localhost/', {
+      headers: { host: 'voice-note.app.localhost', cookie: managedCookie },
+    })))!.text();
+    expect(managedBody).toContain('<main>hello</main>');
+    expect(managedBody).not.toContain('made-with-badge');
+    expect(managedBody).not.toContain('made with elanous');
+    const managedUtf16 = (await loaded.appHost.handle(new Request('http://voice-note.app.localhost/utf16.html', {
+      headers: { host: 'voice-note.app.localhost', cookie: managedCookie },
+    })))!;
+    const managedUtf16Html = new TextDecoder('utf-16le').decode(await managedUtf16!.arrayBuffer());
+    expect(managedUtf16Html).toContain('<main>utf16 app</main>');
+    expect(managedUtf16Html).not.toContain('made-with-badge');
+    expect(managedUtf16Html).not.toContain('old');
+    const managedInvalidUtf8 = await loaded.appHost.handle(new Request('http://voice-note.app.localhost/invalid-utf8.html', {
+      headers: { host: 'voice-note.app.localhost', cookie: managedCookie },
+    }));
+    const managedInvalidUtf8Html = Buffer.from(await managedInvalidUtf8!.arrayBuffer()).toString('latin1');
+    expect(managedInvalidUtf8Html).toContain('<main>invalid \u00ff</main>');
+    expect(managedInvalidUtf8Html).not.toContain('made-with-badge');
+    expect(managedInvalidUtf8Html).not.toContain('old');
+    const managedDeclaredInvalidUtf8 = await loaded.appHost.handle(new Request('http://voice-note.app.localhost/invalid-declared-utf8.html', {
+      headers: { host: 'voice-note.app.localhost', cookie: managedCookie },
+    }));
+    const managedDeclaredInvalidHtml = Buffer.from(await managedDeclaredInvalidUtf8!.arrayBuffer()).toString('latin1');
+    expect(managedDeclaredInvalidHtml).toContain('<main>invalid \u00ff</main>');
+    expect(managedDeclaredInvalidHtml).not.toContain('made-with-badge');
+    expect(managedDeclaredInvalidHtml).not.toContain('old');
+    const managedUnknownCharset = await loaded.appHost.handle(new Request('http://voice-note.app.localhost/legacy.html', {
+      headers: { host: 'voice-note.app.localhost', cookie: managedCookie },
+    }));
+    const managedUnknownCharsetHtml = Buffer.from(await managedUnknownCharset!.arrayBuffer()).toString('latin1');
+    expect(managedUnknownCharsetHtml).toContain('<body>caf\u00e9</body>');
+    expect(managedUnknownCharsetHtml).not.toContain('made-with-badge');
+    loaded.appHost.close();
+
+    writeFileSync(join(root, '.elanous-app-host-state', 'voice-note.json.tmp-interrupted'), '{"badgeDisabled":');
+    const restarted = loadNexusAppHost(root, undefined, appAuthOptions(root));
+    const restartedInvitation = restarted.appHost.issueInvitation('voice-note', 'test');
+    const restartedAccepted = (await restarted.appHost.handle(new Request(
+      `http://voice-note.app.localhost/__auth/accept?token=${encodeURIComponent(restartedInvitation.token)}`,
+      { headers: { host: 'voice-note.app.localhost' } },
+    )))!;
+    const restartedCookie = restartedAccepted.headers.get('set-cookie')!.split(';', 1)[0]!;
+    const restartedBody = await (await restarted.appHost.handle(new Request('http://voice-note.app.localhost/', {
+      headers: { host: 'voice-note.app.localhost', cookie: restartedCookie },
+    })))!.text();
+    expect(restartedBody).toContain('<main>hello</main>');
+    expect(restartedBody).not.toContain('made-with-badge');
+    expect(restartedBody).not.toContain('made with elanous');
+    restarted.appHost.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('app host serves the made-with badge bound to the persisted passing simulation proof', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-app-host-sim-receipt-'));
+  writeApp(root, '<html><body><textarea><footer data-elanous-made-with-badge="true">user example</footer></textarea><main>proof-backed app</main></body></html>');
+  const loaded = loadNexusAppHost(root, undefined, appAuthOptions(root));
+  try {
+    const proof = {
+      schema: 'elanous.sim-receipt.v1', appSimulationReceiptId: 'receipt-1', appSimulationRunId: 'run-1',
+      appId: 'voice-note', appFingerprint: 'a'.repeat(64), deviceCatalogVersion: 1,
+      requiredScenarios: [{ id: 'happy-path', outcome: 'passed' }], sandboxEstablished: true,
+      externalNetworkAttempts: 0, blockedNetworkAttempts: 0, unmeasuredCount: 0,
+      eventLedgerPath: 'app-simulation.sqlite#run-1', createdAt: '2026-11-10T08:00:00.000Z',
+      verdict: 'passed', reasons: [], receiptFingerprint: 'b'.repeat(64),
+    } as SimReceipt;
+    loaded.appHost.setConceptProofResolver(() => proof);
+    const invitation = loaded.appHost.issueInvitation('voice-note', 'test');
+    const accepted = (await loaded.appHost.handle(new Request(
+      `http://voice-note.app.localhost/__auth/accept?token=${encodeURIComponent(invitation.token)}`,
+      { headers: { host: 'voice-note.app.localhost' } },
+    )))!;
+    const cookie = accepted.headers.get('set-cookie')!.split(';', 1)[0]!;
+    const response = await appRequest(loaded.appHost, '/', 'GET', cookie);
+    const html = await response.text();
+    expect(html).toContain('data-elanous-made-with-badge="true"');
+    expect(html).toContain(`data-sim-receipt-fingerprint="${proof.receiptFingerprint}"`);
+    expect(html).toContain('<textarea><footer data-elanous-made-with-badge="true">user example</footer></textarea>');
+    expect(html.match(/data-sim-receipt-fingerprint=/g)).toHaveLength(1);
+
+    loaded.appHost.setConceptProofResolver(() => undefined);
+    const withoutProof = await (await appRequest(loaded.appHost, '/', 'GET', cookie)).text();
+    expect(withoutProof).not.toContain('data-sim-receipt-fingerprint=');
+    expect(withoutProof).not.toContain('made with elanous');
+  } finally { loaded.appHost.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
 test('NEXUS-APP-HOST-FS-HARDEN rejects symlink swaps, nested links, and hardlinks', () => {
   const root = mkdtempSync(join(tmpdir(), 'nexus-app-host-race-'));
   const outDir = writeApp(root, '<main>safe</main>');
@@ -539,11 +762,14 @@ test('verified owner resolves identity and entitlement only from the app session
   const loaded = loadNexusAppHost(root, undefined, appAuthOptions(root));
   const owner = loaded.appHost.issueOwnerSession('voice-note', member.id);
   try {
+    // Source: src/nexus/members/member-store.test.ts — the current free-plan catalog includes relay.connect.
     expect(loaded.appHost.resolveVerifiedOwner('voice-note', owner.sessionToken, members, 'public-owner')).toEqual({
-      memberId: member.id, userSlug: 'public-owner', plan: 'free', entitlements: {},
+      memberId: member.id, userSlug: 'public-owner', plan: 'free', entitlements: { 'relay.connect': true },
     });
     expect(loaded.appHost.resolveVerifiedOwner('other-app', owner.sessionToken, members, 'public-owner')).toBeNull();
     expect(loaded.appHost.resolveVerifiedOwner('voice-note', owner.sessionToken, members, '')).toBeNull();
+    expect(loaded.appHost.resolveVerifiedMemberOwner(owner.sessionToken, members, 'public-owner')?.memberId).toBe(member.id);
+    expect(loaded.appHost.resolveVerifiedMemberOwner('aps_invalid', members, 'public-owner')).toBeNull();
   } finally {
     members.close(); loaded.appHost.close(); rmSync(root, { recursive: true, force: true });
   }

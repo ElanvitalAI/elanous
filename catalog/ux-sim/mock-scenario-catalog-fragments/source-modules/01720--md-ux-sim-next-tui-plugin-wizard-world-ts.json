@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-NEXT-TUI-PLUGIN-WIZARD-WORLD-TS",
+  "path": "src/ux-sim/next-tui-plugin-wizard-world.ts",
+  "boundary": "Replays a Next TUI plugin-wizard proposal and explicit save confirmation against a fake Nexus API; no network or provider calls.",
+  "deviceIds": ["next-tui-plugin-wizard"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

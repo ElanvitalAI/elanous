@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-PWA-PROVENANCE-BADGE-WORLD-TS",
+  "path": "src/ux-sim/pwa-provenance-badge-world.ts",
+  "boundary": "Projects PWA provenance-bearing event rows through the production badge helper without a screen, network, or real-world side effect.",
+  "deviceIds": ["pwa-provenance-badge-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

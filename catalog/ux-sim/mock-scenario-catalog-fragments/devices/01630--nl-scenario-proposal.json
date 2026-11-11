@@ -1,0 +1,13 @@
+{
+  "id": "nl-scenario-proposal",
+  "name": "Fail-closed natural-language app-scenario proposal",
+  "implementation": ["src/ux-sim/nl-scenario.ts"],
+  "tests": ["src/ux-sim/nl-scenario.test.ts"],
+  "target": "Propose only declared app simulation events from a natural-language request and fail closed on invalid or unavailable model choices",
+  "inputs": ["app simulation declaration with attached fake connectors", "natural-language request", "LLM choice seam output"],
+  "observations": ["only declared connector events are offered", "unknown model output yields no proposal", "model errors fail closed"],
+  "entryCommands": ["bun test src/ux-sim/nl-scenario.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

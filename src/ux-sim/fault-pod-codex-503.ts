@@ -1,16 +1,15 @@
-// 결함 주입 심 «Pod 자식 공급자 폴백» ── codex 응답 503(server_is_overloaded) 이 생산 폴백 사다리(FALLBACK_STEPS)를
-// 타고 승인된 zai(glm) 로 이어가고, 503 이 아닌 오류는 폴백 없이 끝나는지를 프로세스 안(S1)에서 재현한다.
+// 결함 주입 심 «Pod 자식 공급자 폴백» ── codex 503/401 이 현재 기본 체인에서 어떻게 끝나는지 프로세스 안(S1)에서 재현한다.
 //
 // 🚨 왜 이것이 있나 (POD-CHILD-PROVIDER-FALLBACK · 2026-10-21)
 // 폴백 코드 #29340(e9553897) 은 main 에 착지했지만 E4 증거(10-19 격리 node-b Pod · fake HTTP 503 → GLM)는
 // scratch 장치라 새 초록 규칙의 장치 조건 ①(main 착지 · 자기 시험)을 못 채웠다. 이 심이 그 완료 경계를
-// 상주 시험으로 만든다 — 503 이면(한 번) zai 로 이어감 · 503 아닌 오류 → 폴백 안 함, 두 경우를 가른다.
+// 상주 시험으로 만든다 — GLM 금지 뒤 기본 체인(codex-rotate → grok)은 두 오류 모두 no-fallback 이다.
 //
 // ⛔ 흉내 내지 않는다 — 진짜 `streamLLMWithTools`(Pod 자식이 도는 도구 경로) ⊕ 진짜 재시도 정책
-// (`fetchApiWithRetry` 의 503 streak → `OverloadFailoverError` 전환) ⊕ 진짜 `FALLBACK_STEPS` 사다리를 그대로
-// 부른다. 폴백 대상도 진짜다 — 생산 `PROVIDERS.glm`(zaiCodingPlanAvailable → makeZaiCodingPlanProvider →
-// OpenAI 호환 HTTP)을 바꾸지 않고, Pod 자식이 받는 zai 자격 env(ZAI_POD_SECRET_KEY) 하나만 가짜 값으로 둔다.
-// 주입은 HTTP 경계 하나뿐: codex 쪽은 스크립트된 503/401 · zai 코딩 엔드포인트는 정상 SSE(kubectl·네트워크·Pod 없음).
+// (`fetchApiWithRetry` 의 503 streak → `OverloadFailoverError` 전환) ⊕ 정책 기본 체인을 그대로 부른다.
+// bun test의 fake 기본값은 이 격리된 HTTP 주입 경로만 명시 real 모드로 우회한다.
+// 주입은 HTTP 경계 하나뿐: codex 쪽은 스크립트된 503/401 · 금지된 zai 엔드포인트는 실패 트랩(kubectl·네트워크·Pod 없음).
+// Source: `src/oauth/fallback-chain.ts` DEFAULT_FALLBACK_CHAIN; 대표 2026-11-01 GLM fallback prohibition.
 // 심이 주는 Pod 사실 하나: codex 자식 Pod 엔 grok 자격이 없다(호스트 grok auth.json 이 섞이지 않게).
 // 관측 = 결과 provider · llm.retry 관측 · llm.router 이벤트 · 영수증(명령 ⊕ injectionId ⊕ 결과) · 층 L1.
 
@@ -22,12 +21,9 @@ import { _resetKeyCacheForTests } from '../config.js';
 import { debug } from '../debug/log.js';
 import { PROVIDERS, streamLLMWithTools } from '../llm.js';
 import { ZAI_CODING_PLAN_URL } from '../llm/zai-coding-plan.js';
-import { FALLBACK_STEPS, type FallbackStep } from '../oauth/fallback-chain.js';
-import { ZAI_POD_SECRET_KEY } from '../task-orchestrator/surfaces/pod-zai-child.js';
+import { DEFAULT_FALLBACK_CHAIN, type FallbackStep } from '../oauth/fallback-chain.js';
 import { setUserConfigOverlay } from '../user-config.js';
-
-/** zai 코딩 엔드포인트(HTTP 경계)가 돌려주는 답 — 폴백이 실제로 zai 응답을 흘렸는지 대조한다. */
-export const POD_CODEX_503_ZAI_ANSWER = '[pod-codex-503] zai OK';
+import { testFakeLlmProvider } from './fake-llm.js';
 
 /** 이 심의 사다리 층 — event-monkey(L0)가 원장·logs.db 에 줄을 싣는 데 대해, 이 심은 진짜 LLM 폴백 경로를 프로세스 안에서 돈다. */
 export const POD_CODEX_503_LEVEL = 'L1' as const;
@@ -49,12 +45,18 @@ export const POD_CODEX_503_FAULT_RESPONSES: Readonly<Record<PodCodex503Fault, { 
 export interface PodCodex503Scenario {
   /** 주입할 결함(기본 'overload-503' — 칸의 결함). */
   readonly fault: PodCodex503Fault;
+  /** 금지된 GLM 공급자가 실수로 후보에 들어오면 잡도록 넣는 테스트 전용 ZAI 키. */
+  readonly zaiCredentialAvailable?: boolean;
+  /** 결과·영수증 귀속 검증용 성공 Grok 반례. */
+  readonly grokFallbackResponds?: boolean;
+  /** 이벤트 없는 직접 성공의 provider 귀속 검증용 Codex SSE 응답. */
+  readonly codexResponds?: boolean;
   /** 주입 식별자 — 영수증에 실린다(기본 `inj-<uuid>`). */
   readonly injectionId?: string;
 }
 
 export function podCodex503Scenario(overrides: Partial<PodCodex503Scenario> = {}): Required<PodCodex503Scenario> {
-  return { fault: 'overload-503', injectionId: `inj-${randomUUID()}`, ...overrides };
+  return { fault: 'overload-503', zaiCredentialAvailable: false, grokFallbackResponds: false, codexResponds: false, injectionId: `inj-${randomUUID()}`, ...overrides };
 }
 
 /** 관측 행 — debug.log 를 가로챈 원본(category ⊕ event ⊕ data). */
@@ -69,29 +71,30 @@ export interface PodCodex503Observation {
   readonly injectionId: string;
   readonly fault: PodCodex503Fault;
   readonly faultStatus: number;
-  /** 생산 폴백 사다리 — `FALLBACK_STEPS` 정본 칸들(Pod 자식이 받는 체인과 같은 어휘). */
+  /** 정책 폴백 사다리 — `DEFAULT_FALLBACK_CHAIN`이며 GLM/ZAI는 포함하지 않는다. */
   readonly chain: readonly FallbackStep[];
-  /** 완료 경계 판정 — 503 → 'zai-fallback' · 503 아닌 오류 → 'no-fallback'. */
-  readonly result: 'zai-fallback' | 'no-fallback';
+  /** 관측 결과는 실행 응답·fallback 이벤트에서 산출한다. */
+  readonly result: 'no-fallback' | 'fallback-response' | 'fallback-failed' | 'unexpected-response' | 'prohibited-zai-attempt';
   readonly resultProvider: string | null;
   readonly answer: string | null;
   readonly error: string | null;
-  readonly glmCalls: number;
+  /** 금지된 경로를 호출하려 한 횟수(반드시 0). */
+  readonly forbiddenZaiAttempts: number;
   readonly scriptedResponses: number;
   /** llm.retry 관측 — 재시도·전환 판정 원본(retry · switch-provider · abort). */
   readonly retryRows: readonly PodCodex503ObservedRow[];
   /** llm.router 이벤트 — overload-failover · 후보 스캔. */
   readonly events: readonly PodCodex503ObservedRow[];
-  /** zai.coding-plan 관측 — 생산 glm(zai 코딩 플랜) 공급자가 실제로 요청을 냈다는 원본. */
+  /** zai.coding-plan 관측 — 금지된 경로가 요청되지 않았는지 확인한다. */
   readonly zaiRows: readonly PodCodex503ObservedRow[];
 }
 
 /** 완료 경계 증거 명령 — 칸 문면이 지정한 이 장치의 재는 명령. */
 export const POD_CODEX_503_EVIDENCE_COMMAND = 'bun test src/ux-sim/fault-pod-codex-503.test.ts';
 
-/** 영수증 = 명령 ⊕ injectionId ⊕ 결과. */
-export function podCodex503Receipt(observation: Pick<PodCodex503Observation, 'injectionId' | 'result'>): string {
-  return `영수증: ${POD_CODEX_503_EVIDENCE_COMMAND} ⊕ ${observation.injectionId} ⊕ ${observation.result}`;
+/** 영수증 = 명령 ⊕ injectionId ⊕ 결과 ⊕ 실제 공급자·답(없으면 -). */
+export function podCodex503Receipt(observation: Pick<PodCodex503Observation, 'injectionId' | 'result' | 'resultProvider' | 'answer'>): string {
+  return `영수증: ${POD_CODEX_503_EVIDENCE_COMMAND} ⊕ ${observation.injectionId} ⊕ ${observation.result} ⊕ provider=${observation.resultProvider ?? '-'} ⊕ answer=${observation.answer ?? '-'}`;
 }
 
 /** 한 화면 — 층 · injectionId · 결과 · 사다리 · 관측 · 영수증. */
@@ -101,8 +104,8 @@ export function renderPodCodex503(observation: PodCodex503Observation): string[]
     : `  결과 provider: ${observation.resultProvider ?? '-'} · 오류: ${observation.error ?? '-'}`;
   return [
     `pod-codex-503 · 층 ${observation.level} · 주입 ${observation.injectionId} · 결함 ${observation.fault} · 결과 ${observation.result}`,
-    `  사다리(FALLBACK_STEPS): ${observation.chain.join(' → ')}`,
-    `  주입 응답 ${observation.faultStatus} × ${observation.scriptedResponses}회 · glm 호출 ${observation.glmCalls}회`,
+    `  사다리(DEFAULT_FALLBACK_CHAIN): ${observation.chain.join(' → ')}`,
+    `  주입 응답 ${observation.faultStatus} × ${observation.scriptedResponses}회 · 금지된 zai 호출 ${observation.forbiddenZaiAttempts}회`,
     outcome,
     ...observation.retryRows.map((row) => `  llm.retry ${row.event} ${JSON.stringify(row.data)}`),
     ...observation.events.map((row) => `  llm.router ${row.event} ${JSON.stringify(row.data)}`),
@@ -116,14 +119,14 @@ export async function simPodCodex503(scenario: PodCodex503Scenario = podCodex503
   const injectionId = scenario.injectionId ?? `inj-${randomUUID()}`;
   const fault: PodCodex503Fault = scenario.fault;
   const scripted = POD_CODEX_503_FAULT_RESPONSES[fault];
-  const chain: readonly FallbackStep[] = [...FALLBACK_STEPS];
+  const chain: readonly FallbackStep[] = [...DEFAULT_FALLBACK_CHAIN];
   const savedEnv = { ...process.env };
   const savedGrok = PROVIDERS.grok;
   const savedFetch = globalThis.fetch;
   const savedLog = debug.log;
   const home = mkdtempSync(join(tmpdir(), 'fault-pod-codex-503-'));
   const rows: PodCodex503ObservedRow[] = [];
-  let glmCalls = 0;
+  let forbiddenZaiAttempts = 0;
   let scriptedResponses = 0;
   try {
     process.env.HOME = home;
@@ -131,30 +134,36 @@ export async function simPodCodex503(scenario: PodCodex503Scenario = podCodex503
     process.env.CODEX_HOME = join(home, '.codex');
     // zai 한도 원장·quota 신호(quotaSignalDir)가 운영 ~/.elanous/budget 이 아니라 임시 뿌리로 간다.
     process.env.ELANOUS_STATE_DIR = join(home, 'state');
+    // Fake LLM은 기본 test universe 안전장치다. 이 sim은 가짜 HTTP 경계에서만 production retry를 검증한다.
+    process.env.ELANOUS_LLM_MODE = 'real';
     for (const key of ISOLATED_LLM_ENV_KEYS) delete process.env[key];
+    if (scenario.zaiCredentialAvailable) process.env.ZAI_API_KEY = 'fake-zai-test-only';
     // 키 캐시 파일(os.homedir() 기준 · HOME 을 안 따른다)을 끄고 이미 기억된 값도 비운다 —
     // 그래야 호스트의 진짜 키가 이 심에 섞이지 않는다.
     process.env.ELANOUS_KEEP_ENV_KEYS = '1';
     _resetKeyCacheForTests();
-    // Pod 자식의 zai 자격 = Job 이 Secret 에서 내려 주는 env 하나(zaiPodEnv · ZAI_POD_SECRET_KEY) — 그 꼴 그대로 둔다.
-    // 생산 `PROVIDERS.glm`(zaiCodingPlanAvailable → makeZaiCodingPlanProvider → OpenAI 호환 HTTP)은 바꾸지 않는다.
-    process.env[ZAI_POD_SECRET_KEY] = 'fake-zai-test-only';
     // codex 자식 Pod 에는 grok 자격이 실리지 않는다(podJobManifest 는 grok 자식에만 grokCredential 을 깐다).
     // grok 자격은 os.homedir() 의 auth.json 이라 HOME 격리로는 못 지운다 — 그 Pod 사실 하나만 심이 준다.
     PROVIDERS.grok = { ...savedGrok!, available: () => false };
+    if (scenario.grokFallbackResponds) {
+      PROVIDERS.grok = { ...testFakeLlmProvider, name: 'grok', available: () => true };
+    }
     setUserConfigOverlay((config) => ({
       ...config,
-      llm: { ...config.llm, provider: 'openai-codex', apiKey: 'fake-codex-test-only', fallbackChain: [...FALLBACK_STEPS] },
+      llm: { ...config.llm, provider: 'openai-codex', apiKey: 'fake-codex-test-only', fallbackChain: [...chain] },
     }));
-    // 주입 = HTTP 경계 하나. codex(그 밖 전부)는 스크립트된 결함, zai 코딩 엔드포인트는 정상 SSE 한 줄.
+    // 주입 = HTTP 경계 하나. Codex는 스크립트된 결함, 금지된 ZAI 요청은 카운트하고 실패시킨다.
     globalThis.fetch = Object.assign(
       async (input: string | URL | Request): Promise<Response> => {
         const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
         if (url === ZAI_CODING_PLAN_URL) {
-          glmCalls += 1;
-          const sse = `data: ${JSON.stringify({ choices: [{ delta: { content: POD_CODEX_503_ZAI_ANSWER } }] })}\n\n`
-            + 'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\ndata: [DONE]\n\n';
-          return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+          forbiddenZaiAttempts += 1;
+          return new Response('zai fallback prohibited by the simulation policy', { status: 403 });
+        }
+        if (scenario.codexResponds) {
+          return new Response('data: {"choices":[{"delta":{"content":"fake-codex-answer"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+            status: 200, headers: { 'content-type': 'text/event-stream' },
+          });
         }
         scriptedResponses += 1;
         return new Response(scripted.body, { status: scripted.status });
@@ -178,19 +187,30 @@ export async function simPodCodex503(scenario: PodCodex503Scenario = podCodex503
     const retryRows = rows.filter((row) => row.category === 'llm.retry');
     const events = rows.filter((row) => row.category === 'llm.router');
     const zaiRows = rows.filter((row) => row.category === 'zai.coding-plan');
-    const failover = events.find((row) => row.event === 'overload-failover' && (row.data as { fallbackProvider?: unknown }).fallbackProvider === 'glm');
-    const fellBack = failover !== undefined && answer === POD_CODEX_503_ZAI_ANSWER && glmCalls === 1;
+    const successfulFailover = [...events].reverse().find((row) => row.event === 'overload-failover'
+      && typeof (row.data as { fallbackProvider?: unknown }).fallbackProvider === 'string');
+    const initialProvider = events.find((row) => row.event === 'streamLLMWithTools'
+      && typeof (row.data as { provider?: unknown }).provider === 'string');
+    const resultProvider = successfulFailover
+      ? (successfulFailover.data as { fallbackProvider: string }).fallbackProvider
+      : answer !== null && initialProvider
+        ? (initialProvider.data as { provider: string }).provider
+        : null;
+    const result: PodCodex503Observation['result'] = forbiddenZaiAttempts > 0
+      ? 'prohibited-zai-attempt'
+      : successfulFailover ? answer !== null ? 'fallback-response' : 'fallback-failed'
+      : answer !== null ? 'unexpected-response' : 'no-fallback';
     return {
       level: POD_CODEX_503_LEVEL,
       injectionId,
       fault,
       faultStatus: scripted.status,
       chain,
-      result: fellBack ? 'zai-fallback' : 'no-fallback',
-      resultProvider: fellBack ? 'glm' : null,
-      answer: fellBack ? answer : null,
-      error: fellBack ? null : error,
-      glmCalls,
+      result,
+      resultProvider,
+      answer,
+      error,
+      forbiddenZaiAttempts,
       scriptedResponses,
       retryRows,
       events,

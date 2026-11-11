@@ -38,7 +38,6 @@ import { checkPythonEnv } from './python-cli.js';
 import { describeModes, formatModeLine, type DoctorMode } from './doctor-modes.js';
 import { formatDoctorLocalLlm, probeDoctorLocalLlm, type DoctorLocalLlm } from './doctor-local-llm.js';
 import type { LlmInventory } from '../llm/local-manager/types.js';
-import { buildDoctorBundle } from './doctor-bundle.js';
 import { uploadDoctorBundle } from './doctor-bundle-upload.js';
 import { checkNodeModules, formatNodeModulesCheck, nodeModulesTrees } from './doctor-node-modules.js';
 import {
@@ -218,6 +217,8 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
   adviceInteractive?: boolean;
   /** Local-manager inventory seam; default calls getInventory(). */
   localLlmInventory?: () => Promise<LlmInventory>;
+  /** Bundle loader seam; the default import is deferred until `--bundle` runs. */
+  loadDoctorBundle?: () => Promise<typeof import('./doctor-bundle.js')>;
   /** Inject the upload transport and consent for isolated CLI tests. */
   uploadFetch?: typeof globalThis.fetch;
   confirmBundleUpload?: (message: string) => Promise<boolean>;
@@ -1653,6 +1654,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
           // Same report as `doctor --json`, local LLM section included, so support sees what the user saw.
           const doctorReport = runDoctor(deps);
           if (doctorReport.ok) doctorReport.localLlm = await probeDoctorLocalLlm(deps.localLlmInventory);
+          const { buildDoctorBundle } = await (deps.loadDoctorBundle ?? (() => import('./doctor-bundle.js')))();
           const result = buildDoctorBundle({ outDir: opts.out ?? process.cwd(), doctorOptions: deps, doctorReport });
           if (opts.upload) {
             let uploadUrl: string | undefined;

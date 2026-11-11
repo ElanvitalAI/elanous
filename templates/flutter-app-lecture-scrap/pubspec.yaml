@@ -1,0 +1,14 @@
+name: lecture_scrap
+description: 강의 노트 · 스크랩 Flutter 앱
+publish_to: none
+version: 0.1.0+1
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  elanous_nexus:
+    path: ../../sdk/dart/elanous_nexus
+  flutter_secure_storage: ^9.2.4
+flutter:
+  uses-material-design: true

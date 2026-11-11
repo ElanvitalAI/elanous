@@ -1,6 +1,7 @@
 // `/new` (`/clear` and `/session new` aliases) — leave the old session without quitting next TUI.
 // The old session is never deleted; only the active marker moves.
 import { debug } from '../../debug/log.js';
+import { NEXT_TUI_NEW_SESSION_SLASHES } from '../core/registry.js';
 
 export const NEW_SESSION_BUSY_STATUS = '응답 중에는 /new 를 받지 않습니다 · 완료(또는 Esc 취소) 뒤 다시';
 
@@ -9,7 +10,7 @@ const UNTITLED = '(new session)';
 
 export function isNewSessionCommand(text: string): boolean {
   const normalized = text.trim().split(/\s+/).join(' ');
-  return normalized === '/new' || normalized === '/clear' || normalized === '/session new';
+  return (NEXT_TUI_NEW_SESSION_SLASHES as readonly string[]).includes(normalized);
 }
 
 export function nextTuiTitle(meta: { readonly title?: string } | null | undefined): string {

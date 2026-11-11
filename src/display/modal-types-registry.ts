@@ -76,17 +76,13 @@ export type AppModalTypeName =
   | 'model-picker'
   | 'wd-picker'
   | 'context-menu'
-  | 'slash-launcher'
   | 'hover-tooltip'
   // DragSession primitive (ROADMAP §5.2 #16 · PLAN-drag-session-primitive.md)
   // consumers — pre-registered so DS-3 / DS-4 caller migrations can
   // push via typed API the day they land, without a registry edit.
   | 'copy-move-picker'         // DS-4b ambiguous drop disambiguation modal
   | 'drop-target-popover'      // DS-3 drop-zone highlight ephemeral popover
-  // Wave P4b-1 — widget-host instance opened as a modal-stack popup
-  // via `openWidgetModalPopup`. `/plan-board` mounts the live plan
-  // board widget; `/bg` mounts the unified background-tasks widget.
-  | 'plan-board-popup'
+  // Widget-host instance opened as a modal-stack popup for /bg.
   | 'background-tasks-popup';
 
 /** Declaration of an app-level modal type. `name` is the stable key
@@ -108,12 +104,11 @@ export const APP_MODAL_TYPES: readonly AppModalTypeDecl[] = [
   { name: 'vw-rename',                 tier: 'dialog' },
   { name: 'plan-exit-modal',           tier: 'dialog' },
 
-  // Picker tier (slash / arg / at / search / slash-launcher / drag disambiguation)
+  // Picker tier (slash / arg / at / search / drag disambiguation)
   { name: 'slash-picker',              tier: 'picker' },
   { name: 'arg-picker',                tier: 'picker' },
   { name: 'at-picker',                 tier: 'picker' },
   { name: 'search-modal',              tier: 'picker' },
-  { name: 'slash-launcher',            tier: 'picker' },
   { name: 'copy-move-picker',          tier: 'picker' },  // DragSession DS-4b
 
   // Popup tier (attachment / status-bar / multi-pane / drop-zone highlight)

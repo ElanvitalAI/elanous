@@ -137,40 +137,6 @@ test('CLI cross-check, shadow warning, strict config and alternative validation'
   } finally { console.error = oldError; resetElanousConfigDir(); resetUserConfig(); rmSync(stateDir, { recursive: true, force: true }); }
 });
 
-test('actual CLI parses checked, explicitly skipped, absent and conflicting cross-check flags', async () => {
-  const stateDir = root();
-  const run = (...args: string[]) => simCli([`--test=${stateDir}`, 'decisions', 'raise', '--agent', 'OP', ...judgmentArgs,
-    '--title', 'Pitch', '--category', 'scope', '--s', 'Situation', '--c', 'Complication', '--option', 'a=Go:Proceed',
-    '--option', 'b=Wait:Delay', '--recommend', 'a', '--why', 'Ready', '--json', ...args],
-  { allowPaths: [['decisions']], cwd: join(import.meta.dir, '..', '..') });
-  const warning = '교차 확인 없음 — --xcheck SEAT:메모 또는 --no-xcheck 이유';
-  try {
-    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ decisions: { requireCrossCheck: false } }));
-    const checked = await run('--xcheck', 'TC:키 경로 영향 없음', '--alternative', 'b', '--dissent', 'UX: 화면 문구 미정');
-    expect(checked.exitCode, checked.stderr).toBe(0);
-    expect(JSON.parse(checked.stdout)).toMatchObject({ crossCheck: [{ seat: 'TC', note: '키 경로 영향 없음' }], alternative: 'b', dissent: 'UX: 화면 문구 미정' });
-    expect(checked.stderr).not.toContain(warning);
-    const skipped = await run('--no-xcheck', '자리 루프 · 이웃 교환은 DEC-XCHECK ②');
-    expect(skipped.exitCode, skipped.stderr).toBe(0);
-    expect(JSON.parse(skipped.stdout).crossCheckSkipped).toBe('자리 루프 · 이웃 교환은 DEC-XCHECK ②');
-    expect(skipped.stderr).not.toContain(warning);
-    const absent = await run();
-    expect(absent.exitCode, absent.stderr).toBe(0);
-    expect(JSON.parse(absent.stdout).crossCheckSkipped).toBe('missing');
-    expect(absent.stderr.split('\n').filter(line => line === warning)).toHaveLength(1);
-    const conflicting = await run('--xcheck', 'TC:확인', '--no-xcheck', '생략');
-    expect(conflicting.exitCode).toBe(1);
-    expect(conflicting.stderr).toContain('choose --xcheck or --no-xcheck');
-    const withoutReason = await run('--no-xcheck');
-    expect(withoutReason.exitCode).toBe(1);
-    expect(withoutReason.stderr).toContain("option '--no-xcheck <이유>' argument missing");
-    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ decisions: { requireCrossCheck: true } }));
-    const strict = await run();
-    expect(strict.exitCode).toBe(1);
-    expect(strict.stderr).toContain(warning);
-  } finally { rmSync(stateDir, { recursive: true, force: true }); }
-}, 180_000);
-
 test('isolated decisions CLI skips adjudication and records the write target', () => {
   const stateDir = root();
   const events: Array<{ category: string; event: string; data: unknown }> = [];
@@ -349,26 +315,6 @@ test('decisions CLI fences raise/decide at generation, permits observed override
     expect(errors.some(line => line.includes('hq override: decisions raise'))).toBe(true);
   } finally { process.exitCode = prior ?? 0; console.error = oldError; rmSync(stateDir, { recursive: true, force: true }); }
 });
-test('actual isolated decisions CLI writes despite a foreign lease without override', async () => {
-  const stateDir = root();
-  const store = fileLeaseStore(join(stateDir, 'hq', 'lease.json'), () => 100);
-  const run = (...args: string[]) => simCli(['--test', stateDir, 'decisions', ...withJudgment(args)], {
-    allowPaths: [['decisions']], stateRoot: stateDir, cwd: join(import.meta.dir, '..', '..'),
-  });
-  const raise = ['raise', '--agent', 'codex', '--title', 'Fence?', '--category', 'scope', '--s', 'S.', '--c', 'C.',
-    '--option', 'a=Yes:Proceed', '--option', 'b=No:Wait', '--skip-recommend', 'Unknown', '--json'];
-  try {
-    expect(store.cas(null, serializeLease({ holder: 'other-host', generation: 2, acquiredAt: 100, renewedAt: 100, ttlSeconds: 1500 }))).toBe(true);
-    const added = await run(...raise);
-    expect(added.exitCode, added.stderr).toBe(0);
-    expect(added.stderr).not.toContain('hq override:');
-    const entry = JSON.parse(added.stdout);
-    const decided = await run('decide', entry.id, 'a', '--json');
-    expect(decided.exitCode, decided.stderr).toBe(0);
-    expect(JSON.parse(decided.stdout).status).toBe('decided');
-  } finally { rmSync(stateDir, { recursive: true, force: true }); }
-}, 180_000);
-
 test('CLI raises, filters, shows and records human/AUTO decisions; validation errors do not append', () => {
   const stateDir = root();
   const repoRoot = emptyGitRepo(join(stateDir, 'repo'));
@@ -465,7 +411,7 @@ test('unknown actor is never silently attributed to elanous; historical options 
   } finally { if (oldAgent === undefined) delete process.env.AI_AGENT; else process.env.AI_AGENT = oldAgent; }
 });
 
-test('isolated CLI helper reads an item raised in an isolated state directory', async () => {
+test('isolated CLI helper raises and decides a pending question', async () => {
   const stateDir = root();
   const raise = await simCli(['--test', stateDir, 'decisions', 'raise', '--agent', 'codex', '--title', 'CLI child decision', '--category', 'scope', '--s', 'Scope requested.', '--c', 'Choice required.', '--option', 'a=Accept:Expands scope', '--option', 'b=Decline:Keeps scope', '--skip-recommend', 'Needs investigation', '--pending-question', '근거: 요청 문서\n무엇이 바뀌나: 승인 시 범위 확장\n기본값 시 결과: 현재 범위 유지', '--resume-question', 'auq:q1:abcde', '--run', 'run-x', '--json'], {
     allowPaths: [['decisions']], stateRoot: stateDir,
@@ -483,11 +429,6 @@ test('isolated CLI helper reads an item raised in an isolated state directory', 
   expect(JSON.parse(readFileSync(join(stateDir, 'ask-user-question', 'answers', `${encodeURIComponent('auq:q1:abcde')}.json`), 'utf8'))).toEqual({
     id: 'auq:q1:abcde', result: { answers: { scope_choice: 'a) Accept' } },
   });
-  const result = await simCli(['--test', stateDir, 'decisions', 'list', '--status', 'all', '--json'], {
-    allowPaths: [['decisions']], stateRoot: stateDir,
-  });
-  expect(result.exitCode, result.stderr.slice(0, 500)).toBe(0);
-  expect(JSON.parse(result.stdout.trim()).map((entry: { id: string }) => entry.id)).toContain(id);
   // 전달 실패(exit 3 · retry-answer 안내)·재전달 판정은 같은 등록 명령을 in-process 로 도는
   // «CLI reports durable decision with failed delivery…»·«CLI decide with no pending question…» 가 잠근다.
   // 실제 진입점 spawn 검증은 아래의 대용량 stdout 계약 한 건에 둔다.

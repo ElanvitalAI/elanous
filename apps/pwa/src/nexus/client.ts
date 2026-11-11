@@ -24,6 +24,17 @@ import type {
 
 const TASK_CARDS_PATH = '/v1/task-cards';
 
+export interface CredentialSlotWire {
+  id: string;
+  label: string;
+  present: boolean;
+  lastCheckedAt: string | null;
+  registerable?: boolean;
+  registrationPath?: string | null;
+  healthStatus?: 'missing' | 'valid' | 'expiring' | 'expired' | 'insufficient-permission' | 'unmeasured';
+  healthLabel?: string;
+}
+
 export class NexusApiError extends Error {
   constructor(
     public readonly status: number,
@@ -123,6 +134,15 @@ export interface NexusClient {
   readonly baseUrl: string;
   // ---- read ----
   getHealth(): Promise<NexusHealth>;
+  getCredentialSlots(): Promise<{ credentials: CredentialSlotWire[] }>;
+  startOpenRouterOAuth(): Promise<{ authorizationUrl: string }>;
+  listOpenRouterImportCandidates(): Promise<{ candidates: Array<{ id: string; name: string; source: string; lastFour: string }> }>;
+  importOpenRouterCandidate(id: string): Promise<{ saved: true; verification: 'verified'; lastFour: string }>;
+  createCredentialRegistrationLink(slot: string): Promise<{ slot: string; url: string; expiresAt: number }>;
+  revokeCredentialRegistrationLink(token: string): Promise<{ revoked: true }>;
+  claimCredentialRegistrationLink(token: string): Promise<{ slot: string; label: string; setupUrl: string; bearer: string; expiresAt: number }>;
+  submitCredentialRegistration(slot: string, bearer: string, value: string): Promise<{ saved: true; slot: string; verification: 'verified' }>;
+  registerCredentialSlot(slot: string, value: string): Promise<{ saved: true; slot: string; verification: 'verified' }>;
   getNexus(): Promise<NexusSnapshot>;
   getTabs(opts?: { kind?: NexusTabKind }): Promise<{ tabs: NexusTabState[] }>;
   getTab(id: string): Promise<{ tab: NexusTabState; recentEvents: NexusEvent[] }>;
@@ -289,6 +309,8 @@ export interface NexusClient {
   getHarnessRunsSince(sinceMs: number, options?: { includeLanded?: boolean }): Promise<HarnessRunsSinceResponse>;
   /** HARNESS-RUN-LIVE-GRAPH — 런 하나의 노드 순서·결과·시각 ⊕ 여정 띠. */
   getHarnessRunTraversal(runId: string): Promise<HarnessRunTraversal>;
+  /** R-SURFACE JSON v1: read-only plugin projection for graph, harness, release, or resources. */
+  getGraphInstanceView(query: { source: 'harness' | 'graph' | 'release' | 'resource'; runId?: string; graphId?: string }): Promise<unknown>;
   /** Live 탭 — 로그 조회(최신순). `store` 는 다른 인스턴스 읽기 전용. */
   getLogs(query: LogsQuery): Promise<LogsResponse>;
   /** Live 탭 — 로그 저장소가 있는 인스턴스 목록. */
@@ -1215,11 +1237,23 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
   const defaultTimeoutMs = opts.timeoutMs ?? 8000;
   const optsToken = opts.token;
 
+  function validateRegistrationLink(link: { slot: string; url: string; expiresAt: number }, slot: string): string {
+    try {
+      const currentUrl = typeof window === 'undefined' ? undefined : window.location.href;
+      const baseOrigin = new URL(baseUrl, currentUrl).origin;
+      const target = new URL(link.url, currentUrl ?? baseUrl);
+      const token = target.origin === baseOrigin && target.pathname === '/app/credentials/register/claim/'
+        ? new URLSearchParams(target.hash.slice(1)).get('t') : null;
+      if (link.slot !== slot || !Number.isFinite(link.expiresAt) || !token) throw new Error('invalid link');
+      return token;
+    } catch { throw new Error('자격 등록 링크를 확인할 수 없습니다.'); }
+  }
+
   async function request<T>(
     method: string,
     path: string,
     body?: unknown,
-    opts?: { signal?: AbortSignal; timeoutMs?: number },
+    opts?: { signal?: AbortSignal; timeoutMs?: number; tokenOverride?: string },
   ): Promise<T> {
     const url = `${baseUrl}${path}`;
     const timeoutMs = opts?.timeoutMs ?? defaultTimeoutMs;
@@ -1251,10 +1285,10 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
         const res = await fetchImpl(url, {
           method,
           ...(ctrl ? { signal: ctrl.signal } : {}),
-          ...((body !== undefined || optsToken) ? {
+          ...((body !== undefined || opts?.tokenOverride || optsToken) ? {
             headers: {
               ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
-              ...(optsToken ? { authorization: `Bearer ${optsToken}` } : {}),
+              ...((opts?.tokenOverride ?? optsToken) ? { authorization: `Bearer ${opts?.tokenOverride ?? optsToken}` } : {}),
             },
           } : {}),
           ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -1337,6 +1371,54 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     baseUrl,
     // ---- read ----
     getHealth: () => request<NexusHealth>('GET', '/v1/health'),
+    getCredentialSlots: () => request('GET', '/v1/credentials/slots'),
+    startOpenRouterOAuth: async () => {
+      const result = await request<{ authorizationUrl: string }>('POST', '/v1/credentials/openrouter/oauth/start', {});
+      const authorizationUrl = new URL(result.authorizationUrl);
+      if (authorizationUrl.origin !== 'https://openrouter.ai' || authorizationUrl.pathname !== '/auth') throw new Error('OpenRouter 연결 주소가 올바르지 않습니다.');
+      return { authorizationUrl: authorizationUrl.toString() };
+    },
+    listOpenRouterImportCandidates: () => request<{ candidates: Array<{ id: string; name: string; source: string; lastFour: string }> }>('GET', '/v1/credentials/openrouter/import'),
+    importOpenRouterCandidate: async (id) => {
+      if (!id) throw new Error('OpenRouter 키 후보를 확인할 수 없습니다.');
+      const result = await request<{ saved: true; verification: 'verified'; lastFour: string }>('POST', '/v1/credentials/openrouter/import', { id });
+      if (result.saved !== true || result.verification !== 'verified') throw new Error('OpenRouter 키 저장 결과를 확인할 수 없습니다.');
+      return result;
+    },
+    createCredentialRegistrationLink: async (slot) => {
+      const link = await request<{ slot: string; url: string; expiresAt: number }>('POST', '/v1/credentials/registration-links', { slot });
+      validateRegistrationLink(link, slot);
+      return link;
+    },
+    revokeCredentialRegistrationLink: async (token) => {
+      if (!token) throw new Error('자격 등록 링크를 확인할 수 없습니다.');
+      const result = await request<{ revoked: true }>('POST', '/v1/credentials/registration-links/revoke', { t: token });
+      if (result.revoked !== true) throw new Error('자격 등록 링크 폐기 결과를 확인할 수 없습니다.');
+      return { revoked: true };
+    },
+    claimCredentialRegistrationLink: async (token) => {
+      if (!token) throw new Error('자격 등록 링크를 확인할 수 없습니다.');
+      const claimed = await request<{ slot: string; label: string; setupUrl: string; bearer: string; expiresAt: number }>(
+        'POST', '/v1/setup/credential-claim', { t: token }, { tokenOverride: '' });
+      if (!claimed.slot || !claimed.bearer || !Number.isFinite(claimed.expiresAt)) throw new Error('자격 등록 권한을 확인할 수 없습니다.');
+      return claimed;
+    },
+    submitCredentialRegistration: async (slot, bearer, value) => {
+      const saved = await request<{ saved: true; slot: string; verification: 'verified' }>(
+        'POST', '/v1/setup/credential-register', { slot, value }, { tokenOverride: bearer });
+      if (saved.saved !== true || saved.slot !== slot || saved.verification !== 'verified') throw new Error('자격 저장 결과를 확인할 수 없습니다.');
+      return { saved: true, slot, verification: 'verified' };
+    },
+    registerCredentialSlot: async (slot, value) => {
+      const link = await request<{ slot: string; url: string; expiresAt: number }>('POST', '/v1/credentials/registration-links', { slot });
+      const token = validateRegistrationLink(link, slot);
+      const claimed = await request<{ slot: string; bearer: string }>('POST', '/v1/setup/credential-claim', { t: token }, { tokenOverride: '' });
+      if (claimed.slot !== slot || !claimed.bearer) throw new Error('자격 등록 권한을 확인할 수 없습니다.');
+      const saved = await request<{ saved: true; slot: string; verification: 'verified' }>('POST', '/v1/setup/credential-register',
+        { slot, value }, { tokenOverride: claimed.bearer });
+      if (saved.saved !== true || saved.slot !== slot || saved.verification !== 'verified') throw new Error('자격 저장 결과를 확인할 수 없습니다.');
+      return { saved: true, slot, verification: 'verified' };
+    },
     getNexus:  () => request<NexusSnapshot>('GET', '/v1/nexus'),
     getTabs: (qopts) => {
       const q = qopts?.kind ? `?kind=${encodeURIComponent(qopts.kind)}` : '';
@@ -1488,6 +1570,12 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     getHarnessRuns: () => request('GET', '/v1/harness/runs'),
     getHarnessRunsSince: (sinceMs, options) => request('GET', `/v1/harness/runs?finishedSince=${Math.max(0, Math.floor(sinceMs))}${options?.includeLanded === false ? '&includeLanded=0' : ''}`),
     getHarnessRunTraversal: (runId) => request('GET', `/v1/harness/run-traversal?runId=${encodeURIComponent(runId)}`),
+    getGraphInstanceView: (query) => {
+      const params = new URLSearchParams({ source: query.source });
+      if (query.source !== 'resource' && query.runId) params.set('runId', query.runId);
+      if (query.source !== 'resource' && query.graphId) params.set('graphId', query.graphId);
+      return request('GET', `/v1/graph-instance-view?${params}`);
+    },
     getLogs: (query) => {
       const q = new URLSearchParams();
       for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== '') q.set(k, String(v));

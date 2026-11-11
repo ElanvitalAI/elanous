@@ -9,11 +9,20 @@ import { observeModelInputTokens } from '../harness/model-input-observation.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { DecisionLedger } from '../decisions/decision-ledger.js';
 import { latestGraphRun, listGraphRuns, runGraph, type GraphRunOptions, type GraphRunState } from './runner.js';
+import { createDefaultMarketDataRegistry } from './capability-providers/market-data/registry.js';
+import { claimGraphTriggerDispatchLease, GRAPH_TRIGGER_DISPATCH_LEASE_MS, GRAPH_TRIGGER_DISPATCH_RENEWAL_DIVISOR,
+  getGraphTriggerDispatchBinding, releaseGraphTriggerDispatchLease, renewGraphTriggerDispatchLease,
+  isGraphTriggerDispatchLeaseOwnerActive, withGraphTriggerDispatchLeaseFence } from '../loops/graph-trigger-dispatch-lease.js';
 
 export interface GraphTickOptions {
   startIfIdle?: boolean;
   /** Resume this exact persisted run instead of whichever run happens to be latest. */
   resumeRunId?: string;
+  /** Stable upstream trigger identity; absent values give this tick a unique dispatch key. */
+  triggerId?: string;
+  dedupeKey?: string;
+  /** Explicit registry location for isolated tests or multi-root dispatch deployments. */
+  registryRoot?: string;
   input?: unknown;
   mineDir?: string;
   deps?: GraphRunOptions['deps'] & { notify?: () => void | Promise<void>; isAlive?: (pid: number) => boolean };
@@ -77,6 +86,7 @@ export async function graphTick(path: string, options: GraphTickOptions = {}): P
   let nodeRefusal: GraphTickResult | null = null;
   const runDeps: GraphRunOptions['deps'] = {
     ...options.deps,
+    capabilityProviders: options.deps?.capabilityProviders ?? createDefaultMarketDataRegistry(),
     beforeNode: () => {
       options.deps?.beforeNode?.();
       nodeRefusal = peerRefusal([...new Set([...initial.ids, ...inspect().ids])]);
@@ -84,25 +94,50 @@ export async function graphTick(path: string, options: GraphTickOptions = {}): P
     },
   };
   const root = options.deps?.root ?? effectiveInstanceRoot();
-  const lock = join(root, 'graph-runs', graphId, '.tick.lock');
-  mkdirSync(join(root, 'graph-runs', graphId), { recursive: true });
-  const releaseRecovery = await acquireRecoveryGuard(`${lock}.recovery.guard`, graphId);
   const tickId = `graph-${randomUUID()}`;
+  const triggerId = options.triggerId ?? `graph:${graphId}`;
+  const dedupeKey = options.dedupeKey ?? options.resumeRunId ?? tickId;
+  const registryRoot = options.registryRoot ?? effectiveInstanceRoot();
+  const priorBinding = getGraphTriggerDispatchBinding({ triggerId, dedupeKey, graphId }, { registryRoot });
+  const boundRoot = priorBinding?.stateRoot ?? root;
+  if (options.deps?.root && priorBinding && resolve(root) !== resolve(priorBinding.stateRoot))
+    throw new Error(`graph trigger dispatch binding conflict: ${triggerId}/${dedupeKey}`);
+  const observedLatest = priorBinding
+    ? listGraphRuns(boundRoot).runs.find(run => run.graphId === graphId && run.runId === priorBinding.runId) ?? null
+    : options.resumeRunId
+      ? listGraphRuns(boundRoot).runs.find(run => run.graphId === graphId && run.runId === options.resumeRunId) ?? null
+      : latestGraphRun(graphId, boundRoot);
+  if (options.resumeRunId && !observedLatest) throw new Error(`graph run not found: ${graphId}/${options.resumeRunId}`);
+  const suggestedRunId = priorBinding?.runId ?? (observedLatest && (observedLatest.status === 'running' || observedLatest.status === 'awaiting-approval')
+    ? observedLatest.runId : tickId);
+  const leaseClaim = claimGraphTriggerDispatchLease({ triggerId, dedupeKey, graphId, runId: suggestedRunId },
+    { registryRoot, stateRoot: boundRoot });
+  if (!leaseClaim.claimed) return { action: 'waiting', runId: leaseClaim.lease.runId };
+  const executionRoot = leaseClaim.lease.stateRoot;
+  const lock = join(executionRoot, 'graph-runs', graphId, '.tick.lock');
+  mkdirSync(join(executionRoot, 'graph-runs', graphId), { recursive: true });
   let acquired = false;
+  let releaseRecovery: (() => void) | undefined;
   try {
-    acquireTickLock(lock, graphId, options.deps?.isAlive ?? processAlive);
+    releaseRecovery = await acquireRecoveryGuard(`${lock}.recovery.guard`, graphId);
+    acquireTickLock(lock, graphId, options.deps?.isAlive ?? processAlive,
+      leaseClaim.reclaimedOwner, leaseClaim.lease.owner, registryRoot);
     acquired = true;
+    releaseRecovery();
+    releaseRecovery = undefined;
     await options.deps?.notify?.();
     const current = inspect();
     const refusedAfterNotify = peerRefusal([...new Set([...initial.ids, ...current.ids])]);
     if (refusedAfterNotify) return refusedAfterNotify;
     // The run identity and executed bytes must agree with the ledger and the gate.
     if (current.graphId !== graphId) throw new Error(`graph id changed during tick: ${graphId} -> ${current.graphId}`);
-    const latest = options.resumeRunId
-      ? listGraphRuns(root).runs.find(run => run.graphId === graphId && run.runId === options.resumeRunId) ?? null
-      : latestGraphRun(graphId, root);
+    const latest = leaseClaim.lease.runId === tickId && !priorBinding
+      ? latestGraphRun(graphId, executionRoot)
+      : listGraphRuns(executionRoot).runs.find(run => run.graphId === graphId && run.runId === leaseClaim.lease.runId) ?? null;
     if (options.resumeRunId && !latest) throw new Error(`graph run not found: ${graphId}/${options.resumeRunId}`);
-    if (options.resumeRunId && (latest?.status !== 'awaiting-approval' || !latest.pending?.decision)) {
+    const legacyApprovalNeedsReissue = latest?.status === 'awaiting-approval' && !!latest.pending &&
+      !latest.pending.inputSha256 && !latest.growthPark;
+    if (options.resumeRunId && (latest?.status !== 'awaiting-approval' || (!latest.pending?.decision && !legacyApprovalNeedsReissue))) {
       throw new Error(`graph run is not awaiting a recorded decision: ${graphId}/${options.resumeRunId}`);
     }
     const growthCard = latest?.growthPark
@@ -112,14 +147,39 @@ export async function graphTick(path: string, options: GraphTickOptions = {}): P
     const growthDecided = growthCard?.status === 'decided' && growthCard.decidedBy?.kind === 'human' &&
       (growthCard.choice === 'a' || growthCard.choice === 'b');
     let result: GraphTickResult;
-    if (latest?.status === 'awaiting-approval' && !latest.pending?.decision && !growthDecided) {
+    if (latest?.status === 'awaiting-approval' && !latest.pending?.decision && !growthDecided && !legacyApprovalNeedsReissue) {
       result = { action: 'waiting', runId: latest.runId, status: latest.status };
-    } else if (latest?.status === 'running' || (latest?.status === 'awaiting-approval' && (latest.pending?.decision || growthDecided))) {
-      const state = await runGraph(path, { resumeRunId: latest.runId, graphSource: current.source, deps: { ...runDeps, root } });
-      result = { action: 'resumed', runId: state.runId, status: state.status };
-    } else if (options.startIfIdle) {
-      const state = await runGraph(path, { input: options.input, graphSource: current.source, deps: { ...runDeps, root } });
-      result = { action: 'started', runId: state.runId, status: state.status };
+    } else if (latest?.status === 'running' || (latest?.status === 'awaiting-approval' && (latest.pending?.decision || growthDecided || legacyApprovalNeedsReissue)) || options.startIfIdle) {
+      const resuming = latest?.status === 'running' || (latest?.status === 'awaiting-approval' && (latest.pending?.decision || growthDecided || legacyApprovalNeedsReissue));
+      const runId = resuming ? latest!.runId : leaseClaim.lease.runId;
+      if (priorBinding && latest && !resuming && latest.status !== 'running' && latest.status !== 'awaiting-approval') {
+        result = { action: 'idle', runId, status: latest.status };
+      } else {
+        let leaseOwned = true;
+        const renew = () => {
+          try { leaseOwned = leaseOwned && renewGraphTriggerDispatchLease(leaseClaim.lease); }
+          catch { leaseOwned = false; }
+        };
+        const leaseTimer = setInterval(renew, Math.floor(GRAPH_TRIGGER_DISPATCH_LEASE_MS / GRAPH_TRIGGER_DISPATCH_RENEWAL_DIVISOR));
+        leaseTimer.unref?.();
+        const beforePersist = (state: GraphRunState) => {
+          runDeps.beforePersist?.(state);
+          if (!leaseOwned || !renewGraphTriggerDispatchLease(leaseClaim.lease)) {
+            leaseOwned = false;
+            throw new Error(`graph trigger dispatch lease lost: ${leaseClaim.lease.triggerId}/${leaseClaim.lease.dedupeKey}`);
+          }
+        };
+        const withPersistFence = (state: GraphRunState, persist: () => void) =>
+          withGraphTriggerDispatchLeaseFence(leaseClaim.lease, persist);
+        try {
+          const state = await runGraph(path, resuming
+            ? { resumeRunId: runId, graphSource: current.source, deps: { ...runDeps, root: executionRoot, beforePersist, withPersistFence } }
+            : { runId, input: options.input, graphSource: current.source, deps: { ...runDeps, root: executionRoot, beforePersist, withPersistFence } });
+          result = { action: resuming ? 'resumed' : 'started', runId: state.runId, status: state.status };
+        } finally {
+          clearInterval(leaseTimer);
+        }
+      }
     } else {
       result = { action: 'idle' };
     }
@@ -133,15 +193,27 @@ export async function graphTick(path: string, options: GraphTickOptions = {}): P
     try {
       if (acquired) {
         observeModelInputTokens({ scope: 'loop-tick', nodeKind: 'graph-tick', graphId, tickId });
-        unlinkSync(join(lock, 'owner'));
-        rmdirSync(lock);
+        const ours = `${process.pid}\n${leaseClaim.lease.owner}`;
+        try {
+          releaseRecovery = await acquireRecoveryGuard(`${lock}.recovery.guard`, graphId);
+          if (readFileSync(join(lock, 'owner'), 'utf8') === ours) {
+            unlinkSync(join(lock, 'owner'));
+            rmdirSync(lock);
+          }
+        } finally {
+          releaseRecovery?.();
+          releaseRecovery = undefined;
+        }
       }
-    } finally { releaseRecovery(); }
+    } finally {
+      releaseRecovery?.();
+      releaseGraphTriggerDispatchLease(leaseClaim.lease);
+    }
   }
 }
 
-// The stable inode is never unlinked: the kernel drops a dead claimant's
-// exclusive flock even if it was killed during recovery.
+// Keep only lock-directory inspection/recovery serialized; the lease fences
+// active persistence and lets an expired delivery replace a still-live pid.
 async function acquireRecoveryGuard(path: string, graphId: string): Promise<() => void> {
   const library = process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : process.platform === 'linux' ? 'libc.so.6' : null;
   if (!library) throw new Error('graph tick recovery requires flock');
@@ -161,8 +233,9 @@ function processAlive(pid: number): boolean {
   catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
 }
 
-/** A crashed tick must not wedge the hourly schedule: the lock names its owner pid, and a dead owner's lock is taken over once. */
-function acquireTickLock(lock: string, graphId: string, isAlive: (pid: number) => boolean): void {
+/** A crashed or lease-expired tick must not wedge the schedule; lock owner records pid and lease token. */
+function acquireTickLock(lock: string, graphId: string, isAlive: (pid: number) => boolean, reclaimedOwner?: string, leaseOwner?: string,
+  registryRoot?: string): void {
   for (let attempt = 0; attempt < 2; attempt++) {
     try { mkdirSync(lock); }
     catch (error) {
@@ -170,15 +243,18 @@ function acquireTickLock(lock: string, graphId: string, isAlive: (pid: number) =
       let ownerText: string | undefined;
       try { ownerText = readFileSync(join(lock, 'owner'), 'utf8').trim(); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-      const owner = ownerText ? Number(ownerText) : Number.NaN;
+      const [pidText, lockLeaseOwner] = ownerText?.split('\n') ?? [];
+      const owner = pidText ? Number(pidText) : Number.NaN;
       // The stable flock spans the whole tick. An absent or empty owner is
       // safe to reclaim after a crash, including before or during owner creation.
-      const deadOwner = Number.isInteger(owner) && owner > 0 && !isAlive(owner);
-      if (attempt === 0 && (deadOwner || Number.isNaN(owner))) {
+      const liveLease = !!lockLeaseOwner && !!registryRoot && isGraphTriggerDispatchLeaseOwnerActive(registryRoot, lockLeaseOwner);
+      const deadOwner = Number.isInteger(owner) && owner > 0 && !isAlive(owner) && !liveLease;
+      const expiredLeaseOwner = !!reclaimedOwner && lockLeaseOwner === reclaimedOwner;
+      if (attempt === 0 && (deadOwner || Number.isNaN(owner) || expiredLeaseOwner)) {
         let currentOwnerText: string | undefined;
         try { currentOwnerText = readFileSync(join(lock, 'owner'), 'utf8').trim(); }
         catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-        if (currentOwnerText !== ownerText || (ownerText !== undefined && ownerText !== '' && !deadOwner)) {
+        if (currentOwnerText !== ownerText || (ownerText !== undefined && ownerText !== '' && !deadOwner && !expiredLeaseOwner)) {
           throw new Error(`graph tick lock owner changed: ${graphId}`);
         }
         if (currentOwnerText !== undefined) unlinkSync(join(lock, 'owner'));
@@ -188,7 +264,7 @@ function acquireTickLock(lock: string, graphId: string, isAlive: (pid: number) =
       }
       throw new Error(`graph tick already running: ${graphId}${Number.isInteger(owner) && owner > 0 ? ` (pid ${owner})` : ''}`);
     }
-    try { writeFileSync(join(lock, 'owner'), String(process.pid), { flag: 'wx' }); }
+    try { writeFileSync(join(lock, 'owner'), `${process.pid}\n${leaseOwner ?? ''}`, { flag: 'wx' }); }
     catch (error) {
       try { rmdirSync(lock); } catch { /* another owner may have claimed the empty directory */ }
       throw error;

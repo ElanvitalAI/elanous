@@ -1,0 +1,35 @@
+{
+  "id": "app-upgrade-path",
+  "name": "Existing app feature upgrade with source isolation and rollback",
+  "checklistCells": [
+    "APP-UPGRADE-PATH"
+  ],
+  "implementation": [
+    "src/agent/app-deploy-plugin.ts",
+    "src/nexus/apps/app-lifecycle-ledger.ts",
+    "src/ux-sim/app-upgrade-path-world.ts",
+    "src/ux-sim/fake-app-host.ts",
+    "src/ux-sim/fake-app-source-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/app-upgrade-path-world.test.ts",
+    "src/nexus/apps/app-lifecycle-ledger.test.ts"
+  ],
+  "target": "Runs the one-input runAppDeployUpgrade transaction against existing fake app-host and source-world devices; it rejects aliased or nested live-source workspaces, publishes v2 only after isolated changes and passing simulation, and records rollback success or failure after public verification.",
+  "inputs": [
+    "existing app ID, source target, requested change, owner user ID",
+    "source snapshot and isolated restored copy",
+    "simulation and public verification outcomes"
+  ],
+  "observations": [
+    "source tree remains unchanged while the isolated copy is modified",
+    "successful v2 publication preserves the existing public URL",
+    "failed public verification restores v1; failed rollback is returned to the caller and recorded for operator recovery"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/app-upgrade-path-world.test.ts src/nexus/apps/app-lifecycle-ledger.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -1,0 +1,9 @@
+{
+  "path": "src/ux-sim/graph-run-lifecycle-world.test.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/graph-run-lifecycle-world.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "The test asserts simulator scenarios and production run state.",
+  "deviceId": "graph-run-lifecycle-world",
+  "scenarioIds": ["GRAPH-RUN-LIFECYCLE-PAUSE-OWNER-DEATH", "GRAPH-RUN-LIFECYCLE-CANCEL-OWNER-DEATH", "GRAPH-RUN-LIFECYCLE-FORK-OWNER-DEATH"]
+}

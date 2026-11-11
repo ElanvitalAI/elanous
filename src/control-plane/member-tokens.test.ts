@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { issueMemberToken, listMemberTokens, machineForToken, revokeMemberToken } from './member-tokens.js';
+import { issueMemberToken, listMemberTokens, machineForExpiringToken, machineForToken, revokeMemberToken } from './member-tokens.js';
 
 const roots: string[] = [];
 function root() { const dir = mkdtempSync(join(tmpdir(), 'control-member-')); roots.push(dir); return dir; }
@@ -40,4 +40,20 @@ test('machine identifiers must be safe storage keys', () => {
     expect(() => revokeMemberToken(machine, dir)).toThrow('invalid control machine');
   }
   expect(listMemberTokens(dir)).toEqual([]);
+});
+
+test('LLM proxy requires an expiring machine token and rejects expiration or revocation', () => {
+  const dir = root();
+  const token = issueMemberToken('pod-a', dir);
+  const path = join(dir, 'control', 'member-tokens.json');
+  expect(machineForExpiringToken(token, dir)).toBe('pod-a');
+  const store = JSON.parse(readFileSync(path, 'utf8')) as Record<string, { expiresAt?: string }>;
+  store['pod-a']!.expiresAt = new Date(Date.now() - 1000).toISOString();
+  writeFileSync(path, JSON.stringify(store));
+  expect(machineForExpiringToken(token, dir)).toBeUndefined();
+  delete store['pod-a']!.expiresAt;
+  writeFileSync(path, JSON.stringify(store));
+  expect(machineForExpiringToken(token, dir)).toBeUndefined();
+  revokeMemberToken('pod-a', dir);
+  expect(machineForExpiringToken(token, dir)).toBeUndefined();
 });

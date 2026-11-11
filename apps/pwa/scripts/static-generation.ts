@@ -85,6 +85,11 @@ export async function runStaticBuild(appDir = resolve(import.meta.dir, '..')): P
     cpSync(appDir, stagedApp, { recursive: true, filter: (source) => !source.includes('/node_modules') && !source.includes('/.next') && !source.endsWith('/out') && !source.includes('/.pwa-generations') });
     cpSync(join(repoRoot, 'src'), join(stagedRepo, 'src'), { recursive: true });
     cpSync(join(repoRoot, 'scripts'), join(stagedRepo, 'scripts'), { recursive: true });
+    cpSync(join(repoRoot, 'skills', 'omni-crawl'), join(stagedRepo, 'skills', 'omni-crawl'), { recursive: true });
+    // Source modules imported by Next can resolve scenario fixtures during type checking.
+    symlinkSync(join(repoRoot, 'scenarios'), join(stagedRepo, 'scenarios'), 'dir');
+    mkdirSync(join(stagedRepo, 'plugins'), { recursive: true });
+    symlinkSync(join(repoRoot, 'plugins', 'graph-instance-view'), join(stagedRepo, 'plugins', 'graph-instance-view'), 'dir');
     symlinkSync(join(repoRoot, 'node_modules'), join(stagedRepo, 'node_modules'), 'dir');
     const appNodeModules = join(appDir, 'node_modules');
     if (existsSync(appNodeModules)) symlinkSync(appNodeModules, join(stagedApp, 'node_modules'), 'dir');

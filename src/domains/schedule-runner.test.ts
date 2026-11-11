@@ -1,8 +1,11 @@
 import { test, expect, describe } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { openSchedulesDb, inventoryCrontab, listSchedules, setRunVia, markRun } from './schedule-registry.js';
 import { startScheduleRunner } from './schedule-runner.js';
+import { dispatchScheduleManage } from './schedule-manage-tool.js';
+import { TaskStore } from '../task-orchestrator/store.js';
 
 // 합성 crontab — 2잡
 const CRON = [
@@ -177,18 +180,49 @@ describe('catch-up 자기회복 + 실행결과 추적(P1)', () => {
   });
 });
 
-// wire 가드 — 데몬 부트/셧다운에 러너 배선 + schedule_manage adopt/release
-describe('배선 가드', () => {
-  test('nexus가 startScheduleRunner를 부트+셧다운 배선', () => {
-    const src = readFileSync(join(import.meta.dir, '..', 'nexus', 'index.ts'), 'utf-8');
-    expect(src).toContain('startScheduleRunner(');
-    expect(src).toContain('scheduleRunner.stop()');
-  });
-  test('schedule_manage 액션(공유 모듈) — U4d: adopt=migrate 별칭·schedule-runner 은퇴', () => {
-    const src = readFileSync(join(import.meta.dir, 'schedule-manage-tool.ts'), 'utf-8');
-    expect(src).toContain("if (action === 'adopt') action = 'migrate'"); // adopt→migrate 리다이렉트
-    expect(src).toContain("action === 'migrate'");
-    expect(src).toContain("action === 'release'");
-    expect(src).not.toContain("setRunVia(sdb, target.id, 'elanous')"); // run_via='elanous' 생성 폐지
+describe('schedule_manage adopt compatibility', () => {
+  test('adopt migrates a crontab job to a fabric trigger instead of arming the retired runner', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'c8d-schedule-adopt-'));
+    const crontab = join(root, 'crontab.txt');
+    const bin = join(root, 'crontab');
+    writeFileSync(crontab, '0 7 * * * bun scripts/foo-report.ts\n');
+    writeFileSync(bin, `#!/bin/sh\nif [ "$1" = "-l" ]; then cat "${crontab}"; else cat > "${crontab}"; fi\n`);
+    chmodSync(bin, 0o755);
+    const previous = { state: process.env.ELANOUS_STATE_DIR, config: process.env.ELANOUS_CONFIG_DIR, path: process.env.PATH };
+    process.env.ELANOUS_STATE_DIR = root;
+    process.env.ELANOUS_CONFIG_DIR = root;
+    process.env.PATH = `${root}:${previous.path ?? ''}`;
+    try {
+      const result = await dispatchScheduleManage({ action: 'adopt', id: 'foo-report' }) as { migrated?: string; taskId?: string; error?: string };
+      expect(result.error).toBeUndefined();
+      expect(result.migrated).toBe('foo-report');
+      expect(result.taskId).toBeTruthy();
+      let schedulerJobId: string | undefined;
+      const store = new TaskStore();
+      try {
+        const task = store.getTask(result.taskId!);
+        expect(task).toMatchObject({
+          surface: { kind: 'terminal-pane', spec: { command: 'bun scripts/foo-report.ts' } },
+          scheduleText: '0 7 * * *',
+        });
+        schedulerJobId = task?.schedulerJobId;
+      } finally { store.close(); }
+      expect(readFileSync(crontab, 'utf8').trim()).toBe('');
+      const db = openSchedulesDb();
+      try {
+        const row = listSchedules(db).find((candidate) => candidate.name === 'foo-report');
+        expect(row?.run_via).toBe('trigger');
+        expect(schedulerJobId).toBe(row?.id);
+        const retiredRunner = startScheduleRunner({ db, schedule: fakeSchedule, crontabText: () => '' });
+        try { expect(retiredRunner.active()).toEqual([]); }
+        finally { retiredRunner.stop(); }
+      }
+      finally { db.close(); }
+    } finally {
+      if (previous.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous.state;
+      if (previous.config === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previous.config;
+      if (previous.path === undefined) delete process.env.PATH; else process.env.PATH = previous.path;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

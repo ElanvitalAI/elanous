@@ -148,6 +148,71 @@ describe('resolveProviderCredential — 우선순위 rotation → env → (미�
     expect(fromEnv).toMatchObject({ apiKey: 'env-key', source: 'env' });
   });
 
+  test('OpenRouter BYOK written through the Nexus credential slot feeds the provider secret lookup', async () => {
+    const ids: string[] = [];
+    const resolved = await resolveProviderCredentialAsync({ provider: 'openrouter', baseProvider: 'openrouter', env: {} }, async id => {
+      ids.push(id); return 'openrouter-test-secret';
+    });
+    expect(ids).toEqual(['cred:openrouter.api_key']);
+    expect(resolved).toMatchObject({ apiKey: 'openrouter-test-secret', source: 'secret-store' });
+  });
+
+  test('OpenRouter canonical slot overrides stale env and rotation values after OAuth/import updates', async () => {
+    const ids: string[] = [];
+    const resolved = await resolveProviderCredentialAsync({
+      provider: 'openrouter', baseProvider: 'openrouter',
+      rotation: [{ provider: 'openrouter', apiKey: 'old-rotation-key' }],
+      env: { OPENROUTER_API_KEY: 'old-env-key' },
+    }, async id => { ids.push(id); return 'new-slot-key'; });
+    expect(ids).toEqual(['cred:openrouter.api_key']);
+    expect(resolved).toMatchObject({ apiKey: 'new-slot-key', source: 'secret-store' });
+  });
+
+  test('OpenRouter custom proxy keeps its endpoint paired with its configured rotation key', async () => {
+    const ids: string[] = [];
+    const resolved = await resolveProviderCredentialAsync({
+      provider: 'openrouter', baseProvider: 'openrouter',
+      rotation: [{ provider: 'openrouter', baseUrl: 'https://proxy.example.test/v1', apiKey: 'proxy-bound-key' }],
+      env: { OPENROUTER_API_KEY: 'generic-env-key' },
+    }, async id => { ids.push(id); return 'new-canonical-slot-key'; });
+    expect(ids).toEqual(['cred:openrouter.api_key']);
+    expect(resolved).toMatchObject({ apiKey: 'proxy-bound-key', source: 'rotation', baseUrl: 'https://proxy.example.test/v1' });
+    expect(resolved.apiKey).not.toBe('new-canonical-slot-key');
+  });
+
+  test('OpenRouter custom proxy fails closed when no key is bound to that endpoint', async () => {
+    const ids: string[] = [];
+    const resolved = await resolveProviderCredentialAsync({
+      provider: 'openrouter', baseProvider: 'openrouter',
+      rotation: [{ provider: 'openrouter', baseUrl: 'https://proxy.example.test/v1' }],
+      env: { OPENROUTER_API_KEY: 'generic-env-key' },
+    }, async id => { ids.push(id); return 'new-canonical-slot-key'; });
+    expect(ids).toEqual(['cred:openrouter.api_key']);
+    expect(resolved).toMatchObject({ source: 'none', baseUrl: 'https://proxy.example.test/v1' });
+    expect(resolved.apiKey).toBeUndefined();
+  });
+
+  test('OpenRouter official endpoint can use the canonical slot with an explicit baseUrl', async () => {
+    const ids: string[] = [];
+    const resolved = await resolveProviderCredentialAsync({
+      provider: 'openrouter', baseProvider: 'openrouter',
+      rotation: [{ provider: 'openrouter', baseUrl: 'https://openrouter.ai/api/v1/', apiKey: 'old-rotation-key' }],
+      env: { OPENROUTER_API_KEY: 'old-env-key' },
+    }, async id => { ids.push(id); return 'canonical-key'; });
+    expect(ids).toEqual(['cred:openrouter.api_key']);
+    expect(resolved).toMatchObject({ apiKey: 'canonical-key', source: 'secret-store', baseUrl: 'https://openrouter.ai/api/v1/' });
+  });
+
+  test('OpenRouter reads the legacy secret ID when the canonical slot is absent', async () => {
+    const ids: string[] = [];
+    const resolved = await resolveProviderCredentialAsync({ provider: 'openrouter', env: {} }, async id => {
+      ids.push(id);
+      return id === 'OPENROUTER_API_KEY' ? 'legacy-secret-store-key' : undefined;
+    });
+    expect(ids).toEqual(['cred:openrouter.api_key', 'OPENROUTER_API_KEY']);
+    expect(resolved).toMatchObject({ apiKey: 'legacy-secret-store-key', source: 'secret-store' });
+  });
+
   test('⭐ 401 재현 가드 — provider 가 바뀌면 base 키를 절대 상속하지 않는다', () => {
     // 2026-07-26 실측 그대로: base=openai-codex(키 보유) → escalate 로 provider 만 anthropic 이 됨.
     // 종전 코드는 여기서 openai 키를 그대로 실어 anthropic 에 붙였다 → 401.

@@ -244,7 +244,7 @@ describe('research axis fanout', () => {
     expect(result.axes[0]!.error).toContain('firecrawl: timeout');
   });
 
-  it('일반 다축 검색은 Grok을 생략하고 Firecrawl만 호출한다', async () => {
+  it('일반 다축 검색은 Grok을 생략하고 무료 DDG를 먼저 호출한다', async () => {
     const calls: string[] = [];
     const provider = (id: string): WebSearchProvider => ({
       id, displayName: id, available: () => true,
@@ -255,9 +255,9 @@ describe('research axis fanout', () => {
     });
     const search = createResearchAxisSearcher([provider('grok'), provider('firecrawl'), provider('ddg-free')]);
     const results = await Promise.all([search('first axis'), search('second axis')]);
-    expect(calls.map(call => call.split(':')[0]).sort()).toEqual(['firecrawl', 'firecrawl']);
+    expect(calls.map(call => call.split(':')[0]).sort()).toEqual(['ddg-free', 'ddg-free']);
     expect(results.flatMap(result => Array.isArray(result) ? result : result.hits).map(hit => hit.engine).sort())
-      .toEqual(['firecrawl', 'firecrawl']);
+      .toEqual(['ddg-free', 'ddg-free']);
   });
 
   it('최신·여론 질문도 Grok 없이 Exa/Firecrawl만 호출한다', async () => {
@@ -310,7 +310,7 @@ describe('research axis fanout', () => {
     expect(result.axes.flatMap(axis => axis.evidence).some(item => item.content.includes('research tool budget reached'))).toBe(true);
   });
 
-  it('일반 금리 축은 Exa 성공 뒤 다른 공급자를 호출하지 않는다', async () => {
+  it('일반 금리 축은 무료 DDG 성공 뒤 다른 공급자를 호출하지 않는다', async () => {
     _resetWebSearchProvidersForTests(false);
     const calls: string[] = [];
     for (const id of ['grok', 'grok-api', 'exa', 'firecrawl', 'tavily', 'ddg']) {
@@ -324,14 +324,14 @@ describe('research axis fanout', () => {
     }
     try {
       const result = await fanOutAxisEvidence([axes[0]!]);
-      expect(calls).toEqual(['exa']);
-      expect(result.axes[0]!.evidence.map(item => item.sourceKind)).toEqual(['web-search:exa']);
+      expect(calls).toEqual(['ddg']);
+      expect(result.axes[0]!.evidence.map(item => item.sourceKind)).toEqual(['web-search:ddg']);
     } finally {
       _resetWebSearchProvidersForTests();
     }
   });
 
-  it('Exa 성공 시 웹 폴백은 즉시 멈춰 뒤 공급자를 호출하지 않는다', async () => {
+  it('무료 DDG 공백 뒤 Exa 성공 시 웹 폴백은 멈춘다', async () => {
     const calls: string[] = [];
     const provider = (id: string, search: WebSearchProvider['search']): WebSearchProvider => ({
       id, displayName: id, available: () => true, search,
@@ -353,7 +353,7 @@ describe('research axis fanout', () => {
 
     const result = await search('latest public opinion topic');
 
-    expect(calls).toEqual(['exa']);
+    expect(calls).toEqual(['ddg-free', 'exa']);
     expect(Array.isArray(result) ? result : result.hits).toMatchObject([
       { url: 'https://exa.example', engine: 'exa' },
     ]);
@@ -417,7 +417,7 @@ describe('research axis fanout', () => {
     }
   });
 
-  it('유료 provider가 없으면 DDG를 최후 폴백으로 쓰고 화면·로그에 출처를 남긴다', async () => {
+  it('무료 DDG만 있으면 이를 쓰고 화면·로그에 출처를 남긴다', async () => {
     const calls: string[] = [];
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     const ddg: WebSearchProvider = {
@@ -447,7 +447,7 @@ describe('research axis fanout', () => {
     }
   });
 
-  it('Exa 실패 뒤 Firecrawl만 폴백하며 Grok과 DDG는 호출하지 않는다', async () => {
+  it('무료 DDG·Exa 실패 뒤 Firecrawl만 폴백하며 Grok은 호출하지 않는다', async () => {
     const calls: string[] = [];
     const provider = (id: string, search: WebSearchProvider['search']): WebSearchProvider => ({
       id, displayName: id, available: () => true, search,
@@ -467,7 +467,7 @@ describe('research axis fanout', () => {
 
     const result = await search('latest public opinion topic');
 
-    expect(calls).toEqual(['exa', 'firecrawl']);
+    expect(calls).toEqual(['ddg-free', 'exa', 'firecrawl']);
     expect(Array.isArray(result) ? [] : result.hits).toEqual([]);
   });
 

@@ -53,6 +53,10 @@ function fixture(over: Partial<WakeDeps> = {}, opts: { wrap?: (run: HerdrCliRunn
   const deps: WakeDeps = {
     stateRoot, seatStateRoot: join(stateRoot, 'seats'), live: true, now: () => now,
     listPtys: configuredPtys,
+    listHerdrPanes: over.listHerdrPanes ?? (() => [
+      { paneId, sessionId: 'session-opt', title: 'workspace | OPT', cwd: '/tmp/seats/OPT', host: 'local', status: 'idle' },
+      { paneId: 'wJ:p9', sessionId: 'session-other', title: 'workspace | OTHER', cwd: '/tmp/seats/OTHER', host: 'local', status: 'idle' },
+    ]),
     readPane: configuredReadPane,
     // Focused tests opt every seat in; the human-pane guard has its own tests below.
     hasOptIn: configuredOptIn,
@@ -93,13 +97,90 @@ test('resolves loop rows from the table, seats by exact pty name, then herdr pan
   expect(resolveWake('UX', withRef.deps)).toMatchObject({ wake: 'none', source: 'seat-registry', reason: 'registry-wake-disabled' });
   // An address outside the table is never resolved on the host, even with a same-named pty.
   const stray = fixture({ listPtys: () => [{ id: 'tui:9', nickname: 'wakeprobe', alive: true, turnState: 'idle' }] });
-  expect(resolveWake('WAKEPROBE', stray.deps)).toEqual({ wake: 'none', source: 'unresolved', reason: 'undeclared-address' });
+  expect(resolveWake('WAKEPROBE', stray.deps)).toEqual({ wake: 'none', source: 'unresolved', reason: 'undeclared-address:candidates=2' });
+});
+
+test('routes pane/session and seat-pane addresses from a fake herdr pane census and reports ambiguous seats', () => {
+  const f = fixture({
+    listHerdrPanes: () => [
+      { paneId: 'wT:p4', sessionId: 'sess-4', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'idle' },
+      { paneId: 'wT:p5', sessionId: 'sess-5', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'idle' },
+    ],
+  });
+  expect(resolveWake('pane:wT:p4', f.deps)).toMatchObject({ wake: 'herdr', target: 'wT:p4', source: 'herdr.pane' });
+  expect(resolveWake('session:sess-5', f.deps)).toMatchObject({ wake: 'herdr', target: 'wT:p5', source: 'herdr.pane' });
+  expect(resolveWake('TC/p4', { ...f.deps, listHerdrPanes: () => [{ paneId: 'wT:p4', title: 'work | TC', cwd: '/hq/seats/TC', status: 'idle' }] })).toMatchObject({ wake: 'herdr', target: 'wT:p4' });
+  expect(resolveWake('ABSORB-3', f.deps)).toMatchObject({ wake: 'none', reason: 'ambiguous-seat:candidates=2' });
+});
+
+test('registry herdr targets require one live matching census pane', () => {
+  const readRegistry: WakeDeps['readRegistry'] = () => ({ status: 'ready', registry: { version: 1, seats: [
+    { address: 'OPC', host: 'local', target: 'wT:p4', wake: 'herdr', replyBody: 'agent', optIn: true },
+  ] } });
+  const deps = fixture({ readRegistry }).deps;
+  expect(resolveWake('OPC', { ...deps, listHerdrPanes: () => [{ paneId: 'wT:p4', status: 'idle' }] }))
+    .toMatchObject({ wake: 'herdr', target: 'wT:p4', source: 'seat-registry' });
+  expect(resolveWake('OPC', { ...deps, listHerdrPanes: () => [{ paneId: 'wT:p4', status: 'dead' }] }))
+    .toMatchObject({ wake: 'none', source: 'unresolved', reason: 'dead-pane-address:candidates=1' });
+  expect(resolveWake('OPC', { ...deps, listHerdrPanes: () => [
+    { paneId: 'wT:p4', status: 'idle' }, { paneId: 'wT:p4', status: 'idle' },
+  ] })).toMatchObject({ wake: 'none', reason: 'ambiguous-pane:candidates=2' });
+});
+
+test('pane title and cwd disagreement stays ambiguous instead of routing either seat', () => {
+  const f = fixture({ readRegistry: () => ({ status: 'absent' }), listHerdrPanes: () => [
+    { paneId: 'wT:p4', sessionId: 'sess-4', title: 'work | OTHER', cwd: '/hq/seats/TC', status: 'idle' },
+  ] });
+  expect(resolveWake('TC', f.deps)).toMatchObject({ wake: 'none', reason: 'ambiguous-seat:candidates=1' });
+  expect(resolveWake('OTHER/p4', f.deps)).toMatchObject({ wake: 'none', reason: 'ambiguous-pane:candidates=1' });
+});
+
+test('missing pane address fields preserve unknown instead of confirming dead addresses', () => {
+  const sessionMissing = fixture({ listHerdrPanes: () => [
+    { paneId: 'wT:p4', title: 'work | TC', cwd: '/hq/seats/TC', status: 'idle' },
+  ] });
+  expect(resolveWake('session:sess-4', sessionMissing.deps))
+    .toMatchObject({ wake: 'none', source: 'unresolved', reason: 'session-address-fields-unknown:candidates=1' });
+  const seatMissing = fixture({ readRegistry: () => ({ status: 'absent' }), listHerdrPanes: () => [
+    { paneId: 'wT:p4', title: 'work | TC', status: 'idle' },
+  ] });
+  expect(resolveWake('TC', seatMissing.deps))
+    .toMatchObject({ wake: 'none', source: 'unresolved', reason: 'seat-address-fields-unknown:candidates=1' });
+});
+
+test('pane census command failures and malformed rows stay unknown; direct panes require one live match', () => {
+  const failed = fixture({ listHerdrPanes: undefined, runHerdrPaneList: () => ({ status: null, stdout: '', error: new Error('timeout') }) });
+  expect(resolveWake('pane:wT:p4', failed.deps)).toMatchObject({ wake: 'none', source: 'unresolved', reason: 'pane-census-unavailable:candidates=unknown' });
+  const malformed = fixture({ listHerdrPanes: undefined, runHerdrPaneList: () => ({ status: 0, stdout: '{"result":{"panes":[{"pane_id":4}]}}' }) });
+  expect(resolveWake('session:sess-4', malformed.deps)).toMatchObject({ wake: 'none', reason: 'pane-census-unavailable:candidates=unknown' });
+  const malformedField = fixture({ listHerdrPanes: undefined, runHerdrPaneList: () => ({ status: 0, stdout: '{"result":{"panes":[{"pane_id":"wT:p4","session_id":4,"agent_status":"idle"}]}}' }) });
+  expect(resolveWake('pane:wT:p4', malformedField.deps)).toMatchObject({ wake: 'none', reason: 'pane-census-unavailable:candidates=unknown' });
+  const duplicated = fixture({ listHerdrPanes: () => [
+    { paneId: 'wT:p4', status: 'idle' }, { paneId: 'wT:p4', status: 'idle' },
+  ] });
+  expect(resolveWake('pane:wT:p4', duplicated.deps)).toMatchObject({ wake: 'none', reason: 'ambiguous-pane:candidates=2' });
+  const dead = fixture({ listHerdrPanes: () => [{ paneId: 'wT:p4', status: 'dead' }] });
+  expect(resolveWake('pane:wT:p4', dead.deps)).toMatchObject({ wake: 'none', reason: 'dead-pane-address:candidates=1' });
+  const statusUnknown = fixture({ listHerdrPanes: () => [{ paneId: 'wT:p4' }] });
+  expect(resolveWake('pane:wT:p4', statusUnknown.deps)).toMatchObject({ wake: 'none', reason: 'pane-status-unknown:candidates=1' });
+  const agentStatusWins = fixture({ listHerdrPanes: undefined, runHerdrPaneList: () => ({ status: 0, stdout: '{"result":{"panes":[{"pane_id":"wT:p4","status":"running","agent_status":"idle"}]}}' }) });
+  expect(resolveWake('pane:wT:p4', agentStatusWins.deps)).toMatchObject({ wake: 'herdr', target: 'wT:p4' });
+  const titleAndCwd = fixture({ listHerdrPanes: () => [{ paneId: 'wT:p4', title: 'work | OTHER', cwd: '/hq/seats/TC', status: 'idle' }] });
+  expect(resolveWake('TC/p4', titleAndCwd.deps)).toMatchObject({ wake: 'none', reason: 'ambiguous-pane:candidates=1' });
+  expect(resolveWake('pane:wT:p99', titleAndCwd.deps)).toMatchObject({ wake: 'none', reason: 'dead-pane-address:candidates=0' });
+  expect(resolveWake('session:missing', titleAndCwd.deps)).toMatchObject({ wake: 'none', reason: 'session-address-fields-unknown:candidates=1' });
+  const mixedSeat = fixture({ listHerdrPanes: () => [
+    { paneId: 'wT:p4', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'idle' },
+    { paneId: 'wT:p5', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'dead' },
+  ] });
+  expect(resolveWake('ABSORB-3', mixedSeat.deps)).toMatchObject({ wake: 'none', reason: 'ambiguous-seat:candidates=2' });
 });
 
 test('explicit herdr registration is not shadowed by a same-named PTY', () => {
   const f = fixture({
     readPane: path => path.endsWith(join('OPT', 'herdr.pane')) ? 'wJ:p42' : null,
     listPtys: () => [{ id: 'tui:1', nickname: 'opt', alive: true, turnState: 'idle' }],
+    listHerdrPanes: () => [{ paneId: 'wJ:p42', sessionId: 'session-opt', title: 'workspace | OPT', cwd: '/tmp/seats/OPT', host: 'local', status: 'idle' }],
   });
   expect(resolveWake('OPT', f.deps)).toEqual({ wake: 'herdr', target: 'wJ:p42', source: 'seat-registry', host: 'local', optIn: true });
 });
@@ -112,13 +193,17 @@ test('unknown migration host cannot be used as an active registration', () => {
 test('replacing a registered pane revokes old wake consent unless fresh --wake is explicit', () => {
   const seats = mkdtempSync(join(tmpdir(), 'msg-wake-replace-'));
   dirs.push(seats);
-  const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined, listPtys: () => [], readRegistry: undefined });
+  let currentPane = 'wJ:p1';
+  const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined, listPtys: () => [], readRegistry: undefined,
+    listHerdrPanes: () => [{ paneId: currentPane, title: 'workspace | MK', cwd: '/tmp/seats/MK', status: 'idle' }] });
   expect(registerSeatPaneAddress({ address: 'MK', paneId: 'wJ:p1', host: 'local', enableWake: true }, f.deps).wakeEnabled).toBe(true);
   const replaced = registerSeatPaneAddress({ address: 'MK', paneId: 'wJ:p2', host: 'local', replace: true }, f.deps);
   expect(replaced.wakeEnabled).toBe(false);
+  currentPane = 'wJ:p2';
   expect(resolveWake('MK', f.deps)).toMatchObject({ wake: 'herdr', target: 'wJ:p2', optIn: false });
   const reconsented = registerSeatPaneAddress({ address: 'MK', paneId: 'wJ:p3', host: 'local', replace: true, enableWake: true }, f.deps);
   expect(reconsented.wakeEnabled).toBe(true);
+  currentPane = 'wJ:p3';
   expect(resolveWake('MK', f.deps)).toMatchObject({ wake: 'herdr', target: 'wJ:p3', optIn: true });
 });
 
@@ -257,7 +342,7 @@ test('herdr wake logs loops.msg-wake herdr-prompt; a herdr error is failed and g
     expect(lines[0]).toMatchObject({ seat: 'MK', msgId: 1, target: 'wJ:p1', result: 'injected', accepted: true, reason: 'submitted', status: 'idle', agent: 'elanous' });
     expect(typeof lines[0]!.ms).toBe('number');
     const gone = fixture({ readPane: path => path.endsWith(join('MK', 'herdr.pane')) ? 'wZ:p404' : null });
-    expect(await wakeRecipient('MK', 2, { from: 'OP' }, gone.deps)).toMatchObject({ result: 'busy', reason: 'agent_status=unknown' });
+    expect(await wakeRecipient('MK', 2, { from: 'OP' }, gone.deps)).toMatchObject({ result: 'no-wake', reason: 'dead-pane-address:candidates=0' });
     expect(gone.herdr).toEqual([]);
     // 아무것도 안 들어갔으니 창을 돌려준다 — pane 을 고치면 다음 글이 바로 깨운다.
     const fixed = fixture({ stateRoot: gone.deps.stateRoot });
@@ -520,6 +605,9 @@ test('the default (no wake-inject anywhere) calls no pty text or herdr input at 
   let herdrCalls = 0;
   const f = fixture({ seatStateRoot: seats, readPane: undefined, hasOptIn: undefined,
     listPtys: () => [{ id: 'tui:1', nickname: 'opt', alive: true, turnState: 'idle' }],
+    listHerdrPanes: () => ['OP', 'TC', 'MK', 'UX', 'OPC', 'OPT'].map(seat => ({
+      paneId: `w:${seat}`, sessionId: `session-${seat}`, title: `work | ${seat}`, cwd: `/hq/seats/${seat}`, status: 'idle',
+    })),
     ptyInjector: async () => async () => { ptyCalls++; },
     herdrRun: async () => { herdrCalls++; return { code: 0, stdout: '', stderr: '' }; } });
   for (const [index, seat] of ['OP', 'TC', 'MK', 'UX', 'OPC', 'OPT'].entries()) {

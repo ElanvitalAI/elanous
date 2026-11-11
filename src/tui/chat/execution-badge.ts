@@ -13,7 +13,7 @@
 // re-export shim for backward compat until callers migrate.
 
 import { currentRouteDecision, routeFallbackLabel } from '../../llm/route-decision.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { effectiveReasoningLevel, modelSupportsReasoning } from '../../llm.js';
 import { executionBadge } from '../../telegram-exec-footer.js';
 

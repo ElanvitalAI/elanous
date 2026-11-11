@@ -178,6 +178,8 @@ interface ResolveCredentialInput {
   env?: NodeJS.ProcessEnv;
   /** 이미 조회한 SecretStore 값. 값은 런타임 메모리에서만 전달한다. */
   secretStoreApiKey?: string | undefined;
+  /** OpenRouter canonical slot 은 이전 env/config 값보다 우선한다. */
+  preferSecretStore?: boolean;
 }
 
 /**
@@ -189,6 +191,8 @@ interface ResolveCredentialInput {
  *   ③ 기존 SecretStore (`providerEnvKey` 와 같은 ID)
  *   ④ provider 가 **안 바뀐** 경우에 한해 base `llm.apiKey` 상속
  *   ⑤ 없음 — 호출자가 판단(구독/OAuth provider 는 이게 정상일 수 있다)
+ * OpenRouter 의 canonical slot (`cred:openrouter.api_key`) 만은 새로 연결한 키가 실제로 쓰이도록 ①·②보다 먼저다.
+ * 구 슬롯 ID `OPENROUTER_API_KEY` 는 canonical slot 이 없을 때만 이 기존 순서로 호환 조회한다.
  *
  * ⚠️ ③ 이 마지막인 것이 이 수리의 핵심이다. 종전엔 ③ 이 **무조건 첫 번째**였고, 그래서 provider 가
  * 바뀌어도 옛 provider 의 키가 따라갔다(= 401 의 근본). provider 가 바뀌었으면 base 키는 **틀린 키**다.
@@ -210,14 +214,32 @@ export function resolveProviderCredential(input: ResolveCredentialInput): Resolv
   const { provider, rotation, baseApiKey, baseProvider } = input;
   const env = input.env ?? process.env;
 
-  // 목표 provider 의 엔드포인트 — 키와 **같은 규율**로 rotation 에서만 가져온다(10R).
+  // 목표 provider 의 엔드포인트 — 키와 **같은 엔트리**에서 함께 가져온다.
   //   전환이면 옛 baseUrl 은 틀린 주소이므로, rotation 에 명시가 없으면 undefined(provider 기본).
   // ⛔⭐ local 은 «런 단위 env»(`LOCAL_LLM_URL`)가 config rotation 을 이긴다 — `ELANOUS_LLM_PROVIDER` 가 config 를 이기는 것과 같은 규칙(BACKLOG B13).
   //   🩸 2026-09-25: 부모에 `LOCAL_LLM_URL=<원격 프록시>` 를 줬는데 rotation 의 `local → localhost:1234` 가 이겨 자식이 «호스트»
   //     LM Studio 로 갔다. Pod(config 없음)에선 안 드러났다.
   const envEndpoint = provider === 'local' ? env.LOCAL_LLM_URL?.trim() : undefined;
-  const endpoint = envEndpoint || rotation?.find((r) => r.provider === provider && typeof r.baseUrl === 'string' && r.baseUrl.trim().length > 0)?.baseUrl?.trim();
+  const endpointEntry = rotation?.find((r) => r.provider === provider && typeof r.baseUrl === 'string' && r.baseUrl.trim().length > 0);
+  const endpoint = envEndpoint || endpointEntry?.baseUrl?.trim();
   const withUrl = endpoint ? { baseUrl: endpoint } : {};
+
+  // A custom OpenRouter endpoint and its key are one credential pair. Never send
+  // the newly linked canonical key, env key, or a different rotation key there.
+  const normalizedEndpoint = endpointEntry?.baseUrl?.trim().replace(/\/+$/, '');
+  const customOpenRouterEndpoint = provider === 'openrouter' && endpointEntry
+    && normalizedEndpoint !== 'https://openrouter.ai/api/v1';
+  if (customOpenRouterEndpoint && endpointEntry) {
+    const endpointKey = endpointEntry.apiKey?.trim();
+    return endpointKey
+      ? { apiKey: endpointKey, source: 'rotation', ...withUrl }
+      : { source: 'none', ...withUrl };
+  }
+
+  const stored = input.secretStoreApiKey?.trim();
+  if (input.preferSecretStore && stored) {
+    return { apiKey: stored, source: 'secret-store', ...(providerEnvKey(provider) ? { envKey: providerEnvKey(provider) } : {}), ...withUrl };
+  }
 
   // ① rotation(config) — 같은 provider 의 명시 키.
   const hit = rotation?.find((r) => r.provider === provider && typeof r.apiKey === 'string' && r.apiKey.trim().length > 0);
@@ -235,7 +257,6 @@ export function resolveProviderCredential(input: ResolveCredentialInput): Resolv
 
   // ③ SecretStore — setup service-keys uses providerEnvKey(provider) as its secret ID.
   // The value is never copied to config or observability fields.
-  const stored = input.secretStoreApiKey?.trim();
   if (stored) return { apiKey: stored, source: 'secret-store', ...(envKey ? { envKey } : {}), ...withUrl };
 
   // ④ 상속 — **provider 가 확실히 그대로일 때만.** 바뀌었으면 base 키는 다른 provider 것이라 틀렸다.
@@ -282,6 +303,26 @@ export async function resolveProviderCredentialAsync(
   input: ResolveCredentialInput,
   getSecret?: (id: string) => Promise<string | undefined>,
 ): Promise<ResolvedCredential> {
+  if (input.provider === 'openrouter') {
+    const env = input.env ?? process.env;
+    if (getSecret || canReadHostSecretStore(env)) {
+      const read = async (id: string): Promise<string | undefined> => {
+        try {
+          if (getSecret) return await getSecret(id);
+          const { getSecretAsync } = await import('../nexus/config/secrets/index.js');
+          return await getSecretAsync(id);
+        } catch { return undefined; }
+      };
+      const canonical = await read('cred:openrouter.api_key');
+      if (canonical?.trim()) {
+        return resolveProviderCredential({ ...input, secretStoreApiKey: canonical, preferSecretStore: true });
+      }
+      // Compatibility for keys written before OpenRouter received its named slot.
+      const legacy = await read('OPENROUTER_API_KEY');
+      return resolveProviderCredential({ ...input, secretStoreApiKey: legacy });
+    }
+    return resolveProviderCredential(input);
+  }
   const withoutStore = resolveProviderCredential(input);
   if (withoutStore.source === 'rotation' || withoutStore.source === 'env') return withoutStore;
   const secretId = providerEnvKey(input.provider);

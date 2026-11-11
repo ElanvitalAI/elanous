@@ -19,7 +19,7 @@
 
 import type { Database } from 'bun:sqlite';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { budgetModel } from '../llm/model-defaults.js';
 import {
   openSurfaceEventsDb,

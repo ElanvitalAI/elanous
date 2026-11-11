@@ -16,6 +16,9 @@ export interface LLMToolSpec {
   /** Present only for manifest-declared plugin routes. */
   pluginId?: string;
   route?: LLMToolRouteMetadata;
+  /** Inert graph route metadata used to scope lazy route discovery to manifest declarations. */
+  handlerRef?: string;
+  allowedGraphIds?: readonly string[];
 }
 
 
@@ -28,11 +31,15 @@ export function toLLMToolSpec(tool: {
   parameters: Record<string, unknown>;
   pluginId?: string;
   route?: LLMToolRouteMetadata;
+  handlerRef?: string;
+  allowedGraphIds?: readonly string[];
 }): LLMToolSpec {
   return {
     name: tool.name,
     description: tool.description,
     parameters: tool.parameters,
     ...(tool.pluginId && tool.route ? { pluginId: tool.pluginId, route: tool.route } : {}),
+    ...(tool.handlerRef ? { handlerRef: tool.handlerRef } : {}),
+    ...(tool.allowedGraphIds ? { allowedGraphIds: tool.allowedGraphIds } : {}),
   };
 }

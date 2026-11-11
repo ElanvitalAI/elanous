@@ -1,5 +1,7 @@
 import { claimCredentialRegistrationLinkToken, commitCredentialRegistrationBearer, consumeCredentialRegistrationBearer, issueCredentialRegistrationLinkToken, revokeCredentialRegistrationLinkToken } from '../../auth/setup-link-tokens.js';
-import { credentialSetupOptions } from '../setup-status.js';
+import { credentialSetupOptions, credentialSetupOptionsWithHealth, oauthCredentialHealthOptions } from '../setup-status.js';
+import { credentialHealthLabel, type CredentialHealthStatus } from '../config/secrets/cred-health.js';
+import type { CredentialHealthObserver } from '../config/secrets/cred-health.js';
 import { listCredentialSlotsAsync } from '../config/secrets/cred-slots.js';
 import { hasCredentialSlotWriteReceipt, writeCredentialSlotBatchValue } from '../config/secrets/registry.js';
 import { verifyServiceKey, type ServiceKeyVerification } from '../../setup/service-keys.js';
@@ -11,6 +13,9 @@ export interface SetupCredentialDeps {
   verify?: (service: string, value: string) => Promise<{ result: ServiceKeyVerification; httpStatus?: number }>;
   saveCredential?: (slot: string, value: string, receipt: { id: string; valueHash: string }) => void;
   authorizeOwner?: (req: Request) => boolean;
+  /** Optional metadata-only observer; presence from the secret store alone never asserts validity. */
+  healthObserver?: CredentialHealthObserver;
+  oauthStorePath?: string;
 }
 
 function reconcileCredentialSubmission(receiptId: string, valueHash: string): 'committed' | 'not-committed' | 'unknown' {
@@ -56,10 +61,16 @@ async function readJson(req: Request): Promise<Record<string, unknown> | null> {
 /** Owner-authenticated metadata for the credential page. Values are never fetched. */
 export async function handleCredentialSlotsGet(req: Request, deps: SetupCredentialDeps = {}): Promise<Response> {
   if (deps.authorizeOwner && !deps.authorizeOwner(req)) return jsonResponse({ error: 'unauthorized' }, 401);
-  const options = credentialSetupOptions();
+  const options = deps.healthObserver ? credentialSetupOptionsWithHealth(deps.healthObserver) : credentialSetupOptions();
   const slots = await listCredentialSlotsAsync();
   const status = new Map(slots.map((row) => [row.id, row.present]));
-  return jsonResponse({ credentials: options.map((row) => ({ ...row, present: status.get(row.id) ?? false })) });
+  const oauth = oauthCredentialHealthOptions({ ...(deps.oauthStorePath ? { storePath: deps.oauthStorePath } : {}),
+    ...(deps.now ? { now: deps.now() } : {}) });
+  return jsonResponse({ credentials: options.map((row) => {
+    const present = status.get(row.id) ?? false;
+    const healthStatus: CredentialHealthStatus = !present ? 'missing' : row.healthStatus ?? 'unmeasured';
+    return { ...row, present, healthStatus, healthLabel: credentialHealthLabel(healthStatus) };
+  }), oauth: oauth.map((row) => ({ ...row, healthLabel: credentialHealthLabel(row.healthStatus) })) });
 }
 
 /** Mint a one-slot, ten-minute link. The token appears only in this response and URL fragment. */

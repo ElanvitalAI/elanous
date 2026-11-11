@@ -1,13 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { CLICK_KIND_EXPRESSION, decideReversibility } from './browser-act-reversibility.js';
 import { performBrowserAction } from './browser-act.js';
 import type { CdpClient } from '../browser-cdp/client.js';
 
 
 /** ⛔ 흉내가 아니라 «진짜 performBrowserAction» 을 부른다 — CDP 만 대역이다. */
-function fakeClient(options: { clicks: Array<{ x: number; y: number }>; kind: string }): CdpClient {
+function fakeClient(options: { clicks: Array<{ x: number; y: number }>; kind: string; evaluations?: string[] }): CdpClient {
   let listener: ((event: { method: string; params: Record<string, unknown> }) => void) | undefined;
   return {
     pid: -1,
@@ -16,7 +14,7 @@ function fakeClient(options: { clicks: Array<{ x: number; y: number }>; kind: st
       listener?.({ method: 'Page.lifecycleEvent', params: { name: 'load', frameId: 'frame', loaderId: 'loader' } });
       return { frameId: 'frame', loaderId: 'loader' };
     },
-    async evaluate() { return { x: 5, y: 6, kind: options.kind }; },
+    async evaluate(expression: string) { options.evaluations?.push(expression); return { x: 5, y: 6, kind: options.kind }; },
     async screenshot() { return Buffer.from('png'); },
     async click(coordinates: { x: number; y: number }) { options.clicks.push(coordinates); },
     async close() { /* no-op */ },
@@ -54,7 +52,6 @@ function silentClient(options: { clicks: Array<{ x: number; y: number }> }): Cdp
   } as unknown as CdpClient;
 }
 
-const actSource = readFileSync(join(import.meta.dir, 'browser-act.ts'), 'utf8');
 
 describe('click reversibility', () => {
   test('an unattended path may follow a link but may not submit', () => {
@@ -144,13 +141,19 @@ describe('click reversibility', () => {
     expect(clicks).toHaveLength(1);
   });
 
-  test('adds no extra CDP round trip — the kind rides along with the coordinates', () => {
-    // ⛔ 물으러 가면 그 물음도 매답릴 수 있다(이 축의 원래 병).
-    expect(actSource).toContain('CLICK_KIND_EXPRESSION');
-    // ⛔ 모양을 «통째로» 박지 않는다 — 그렇게 박아 둔 첫 판이 소스가 자라자 조용히 늙어
-    //    ***`main` 에서 깨진 채로 남아 있었다***(2026-08-29 발견: 실제 소스는 `{ x, y, kind, href, text }`).
-    //    ⇒ 🔑 이 시험이 «묻는 것»은 「모양이 무엇인가」가 아니라 ***「kind 가 좌표와 «같이» 오나」***다.
-    expect(actSource).toMatch(/return \{ x, y, kind[,}]/);
+  test('click classification and coordinates share one CDP evaluation before the URL readback', async () => {
+    const clicks: Array<{ x: number; y: number }> = [];
+    const evaluations: string[] = [];
+    const result = await performBrowserAction(
+      { url: 'https://example.test', target: '#buy', armed: true },
+      { connect: async () => fakeClient({ clicks, kind: 'submit', evaluations }), captureTimeoutMs: 200, // Source: #13406 browser-act capture fixture.
+        reclaimOpenedTabs: false, reversibilityPolicy: 'any', observe: () => {} },
+    );
+    expect(result.ok).toBe(true);
+    expect(evaluations).toHaveLength(2); // Source: #13406 one click probe plus the URL readback; no separate kind probe.
+    expect(evaluations.filter((expression) => expression.includes(CLICK_KIND_EXPRESSION))).toHaveLength(1);
+    expect(evaluations.at(-1)).toBe('location.href');
+    expect(clicks).toEqual([{ x: 5, y: 6 }]);
   });
 
   test('a click that starts no navigation does not pay the full load budget', async () => {
@@ -214,9 +217,4 @@ describe('click reversibility', () => {
     expect(events[0]?.postClickLoadWait).toBe('event');
   }, 20_000);
 
-  test('the unattended default is the strict one', () => {
-    // ⛔ 기본이 느슨하면 「깜빡 잊으면 열린다」가 된다.
-    expect(actSource).toContain("policy: ReversibilityPolicy = 'navigation-only'");
-    expect(actSource).toContain("deps.reversibilityPolicy ?? 'navigation-only'");
-  });
 });

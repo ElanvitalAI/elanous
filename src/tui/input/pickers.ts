@@ -4,7 +4,7 @@
  *
  *   - openAgentRosterSearch — `/` over the agent roster
  *   - openTransferPicker    — browser → ssh / iphone transfer target
- *   - openFinderPicker      — Ctrl+T file finder (+ Ctrl+/ · Ctrl+_ · Ctrl+] preview bindings)
+ *   - openFinderPicker      — Ctrl+T file finder
  *   - openDirectoryPicker   — Alt+C directory finder
  *   - openSshPicker         — Ctrl+K SSH host picker
  *
@@ -29,7 +29,6 @@ import { scanFinder as defaultScanFinder, relativizeResults } from '../../finder
 import { scanRemoteFinder as defaultScanRemoteFinder, relativizeRemoteResults } from '../../finder/finder-scan-remote.js';
 import { createFinderModal, type FinderItem } from '../../finder/finder-modal.js';
 import { getSessionCwd } from '../../session/working-dir.js';
-import { showPreviewModal } from '../../dashboard/modals/preview.js';
 import { createSshPickerModal } from '../../ssh/ssh-picker-modal.js';
 import { touchSshHost, type SshHost } from '../../ssh/ssh-hosts.js';
 import { refreshRemoteWorkingDir, enterRemoteDirectory } from '../../ssh/remote-browser.js';
@@ -41,10 +40,20 @@ import {
 } from '../../working-dir/index.js';
 import type { PaneFocus } from '../../workspace-types.js';
 import type { ThemeTokens } from '../../theme/tokens.js';
-import type { DashboardFinderFeedbackRuntime } from '../../dashboard/finder-feedback-runtime.js';
-import type { createDashboardTransferFeedbackRuntime } from '../../dashboard/transfer-feedback-runtime.js';
+export interface PickerTransferFeedback {
+  onNoFilesToTransfer(): void;
+  onTransferDisabled(reason?: string | null): void;
+  onNoTransferTargets(): void;
+}
 
-type TransferFeedbackRuntime = ReturnType<typeof createDashboardTransferFeedbackRuntime>;
+export interface PickerFinderFeedback {
+  onFinderScanStarted(target: string): void;
+  onFinderScanCompleted(options: { count: number; backend: string; truncated: boolean; durationMs: number }): void;
+  onFinderScanEmpty(): void;
+  onSshConnectStarted(options: { name: string; host: string }): void;
+  onSshConnectSucceeded(name: string): void;
+  onSshConnectFailed(name: string, message: string): void;
+}
 
 /** Dashboard-owned mutable state. Implemented by the dashboard as live
  *  get/set accessors so a write here is the dashboard's write. */
@@ -64,19 +73,8 @@ export interface InputPickersDeps {
   agentSurfaceStore: AgentSurfaceStore;
   workingDir: WorkingDirState;
   dockedPreview: Parameters<typeof refreshRemoteWorkingDir>[2];
-  transferFeedbackRuntime: Pick<
-    TransferFeedbackRuntime,
-    'onNoFilesToTransfer' | 'onTransferDisabled' | 'onNoTransferTargets'
-  >;
-  finderFeedbackRuntime: Pick<
-    DashboardFinderFeedbackRuntime,
-    | 'onFinderScanStarted'
-    | 'onFinderScanCompleted'
-    | 'onFinderScanEmpty'
-    | 'onSshConnectStarted'
-    | 'onSshConnectSucceeded'
-    | 'onSshConnectFailed'
-  >;
+  transferFeedbackRuntime: PickerTransferFeedback;
+  finderFeedbackRuntime: PickerFinderFeedback;
   currentThemeTokens: () => ThemeTokens;
   currentWorkspaceOwnerId: () => string;
   activeBrowserWidgetId: () => string;
@@ -340,163 +338,13 @@ export function createInputPickers(deps: InputPickersDeps): InputPickers {
     const titleRoot = workingDir.remote
       ? `${workingDir.remote.host.name}:${workingDir.remote.cwd}`
       : getSessionCwd().replace(homedir(), '~');
-    // 2026-05-03 — preview modes (yazi/fzf-style, on-demand).
-    //
-    // Default mode is OFF — the picker opens cleanly with NO preview
-    // so it's never annoying on tablet / narrow terminals. The user
-    // toggles preview behaviour with `Ctrl+/` (matches zshrc
-    // `--bind 'ctrl-/:toggle-preview'`):
-    //
-    //   off    →  hover  →  2pane  →  off  (cycle)
-    //
-    //   • off   — no preview, ever. The cursor moves freely.
-    //   • hover — popup appears after the cursor stays still for
-    //             1 second (HOVER_DELAY_MS). Popup auto-dismisses
-    //             after 4s. Centered, the same width as legacy
-    //             behaviour but on-demand.
-    //   • 2pane — browser-preview style: persistent preview popup
-    //             docked to the right of the picker. Updates
-    //             instantly as the cursor moves. Falls back to
-    //             hover if the terminal is too narrow (<140 cols).
-    //
-    // showPreviewModal supports remote-skip by itself (preview
-    // handlers read local fs), so we simply guard with workingDir
-    // .remote before scheduling.
-    type PreviewMode = 'off' | 'hover' | '2pane';
-    const HOVER_DELAY_MS = 1000;
-    const TWO_PANE_MIN_COLS = 140;
-    const TWO_PANE_GROUP = 'finder-2pane-preview';
-
-    let previewMode: PreviewMode = 'off';
-    let lastSelected: FinderItem | null = null;
-    let hoverTimer: ReturnType<typeof setTimeout> | null = null;
-    let lastPreviewHandle: { dispose(): void } | null = null;
-
-    const clearHoverTimer = () => {
-      if (hoverTimer !== null) { clearTimeout(hoverTimer); hoverTimer = null; }
-    };
-    const disposeActivePreview = () => {
-      if (lastPreviewHandle) {
-        try { lastPreviewHandle.dispose(); } catch { /* ignore */ }
-        lastPreviewHandle = null;
-      }
-    };
-
-    /** Compute the docked-preview bounds for 2-pane mode. Picker
-     *  centred at width≈90; preview takes the right gutter. Returns
-     *  null when there isn't enough room (caller falls back to
-     *  hover). */
-    const computeDockedPreviewBounds = (): {
-      row: number; col: number; width: number; height: number;
-    } | null => {
-      const { cols: tc, rows: tr } = termSize();
-      if (tc < TWO_PANE_MIN_COLS) return null;
-      const pickerWidth = Math.min(90, Math.max(50, tc - 6));
-      const pickerCol = Math.max(1, Math.floor((tc - pickerWidth) / 2));
-      const previewCol = pickerCol + pickerWidth + 2;
-      const previewWidth = Math.max(40, tc - previewCol - 2);
-      if (previewWidth < 40) return null;
-      const previewHeight = Math.max(8, Math.min(tr - 6, 28));
-      const previewRow = Math.max(1, Math.floor((tr - previewHeight) / 2));
-      return { row: previewRow, col: previewCol, width: previewWidth, height: previewHeight };
-    };
-
-    const paintPreviewFor = (item: FinderItem) => {
-      if (workingDir.remote) return;   // remote previews unsupported
-      const { rows: tr, cols: tc } = termSize();
-      const docked = previewMode === '2pane' ? computeDockedPreviewBounds() : null;
-      void showPreviewModal(item.absPath, {
-        coordinator: display,
-        termCols: tc,
-        termRows: tr,
-        title: item.relPath,
-        ttlMs: previewMode === '2pane' ? 0 : 4000,
-        bounds: docked ?? undefined,
-        group: previewMode === '2pane' ? TWO_PANE_GROUP : 'image-preview',
-      }).then((r) => {
-        lastPreviewHandle = r?.handle ?? null;
-      }).catch(() => { /* preview failure is non-fatal */ });
-    };
-
-    const scheduleHoverPreview = (item: FinderItem | null) => {
-      lastSelected = item;
-      clearHoverTimer();
-      if (previewMode === 'off') return;
-      if (!item || workingDir.remote) {
-        // Off-screen / remote — kill any straggling popup so the
-        // user doesn't see a preview that no longer matches the
-        // selection.
-        disposeActivePreview();
-        return;
-      }
-      if (previewMode === '2pane') {
-        // Instant update — no debounce. Persistent popup replaces
-        // itself via group dedup.
-        paintPreviewFor(item);
-        return;
-      }
-      // HOVER mode. Selection just changed → the popup currently on
-      // screen (if any) is stale. Drop it immediately so the user
-      // doesn't keep seeing the previous file's preview while their
-      // cursor is on a new file. The next paint waits HOVER_DELAY_MS
-      // of stillness before re-appearing.
-      disposeActivePreview();
-      hoverTimer = setTimeout(() => {
-        hoverTimer = null;
-        paintPreviewFor(item);
-      }, HOVER_DELAY_MS);
-    };
-
-    /** Cycle off → hover → 2pane → off. Surfaces a status line so
-     *  the user knows which mode they're in (Ctrl+/ has no chrome
-     *  feedback otherwise). 2pane on a narrow terminal degrades
-     *  to hover with a warning. */
-    const cyclePreviewMode = (): void => {
-      const next: PreviewMode = previewMode === 'off' ? 'hover'
-                              : previewMode === 'hover' ? '2pane'
-                              : 'off';
-      previewMode = next;
-      clearHoverTimer();
-      // Drop the active popup whenever the mode changes. The new
-      // mode (if any) re-paints below.
-      disposeActivePreview();
-
-      if (next === 'off') {
-        state.chatLines.push(C.muted('  finder preview: OFF (Ctrl+/ to cycle modes)'));
-      } else if (next === 'hover') {
-        state.chatLines.push(C.muted('  finder preview: HOVER (popup after 1 s · Ctrl+/ next)'));
-      } else {
-        // 2pane — refuse if the terminal is too narrow; degrade to
-        // hover so the user gets *some* preview without overlap.
-        const docked = computeDockedPreviewBounds();
-        if (!docked) {
-          previewMode = 'hover';
-          state.chatLines.push(C.warning(`  finder preview: 2-pane needs ≥${TWO_PANE_MIN_COLS} cols — falling back to HOVER`));
-        } else {
-          state.chatLines.push(C.muted('  finder preview: 2-PANE (docked right · Ctrl+/ to disable)'));
-          if (lastSelected) paintPreviewFor(lastSelected);
-        }
-      }
-      state.chatScrollOffset = -1;
-      draw();
-    };
-
-    // Declared up here so `onAccept`/`onCancel` closures below can
-    // reference both; assigned right after the picker mounts.
-    let previewToggleDisposable: { dispose(): void } | null = null;
-    let previewDismissDisposable: { dispose(): void } | null = null;
     const picker = createFinderModal({
       items: finderItems,
       bounds, width, maxVisible: visibleRows,
       truncated,
       title: `Find file in ${titleRoot}`,
       theme: currentThemeTokens(),
-      onHover: scheduleHoverPreview,
       onAccept: (item) => {
-        clearHoverTimer();
-        disposeActivePreview();
-        previewToggleDisposable?.dispose();
-        previewDismissDisposable?.dispose();
         state.agentSearchModal = null;
         handle?.dispose();
         const parentDir = item.absPath.slice(0, item.absPath.lastIndexOf('/')) || '/';
@@ -532,58 +380,8 @@ export function createInputPickers(deps: InputPickersDeps): InputPickers {
         draw();
       },
       onCancel: () => {
-        clearHoverTimer();
-        disposeActivePreview();
-        previewToggleDisposable?.dispose();
-        previewDismissDisposable?.dispose();
         state.agentSearchModal = null;
         handle?.dispose();
-        draw();
-      },
-    });
-    // Ctrl+/ (and Ctrl+_ which some terminals send for the same
-    // physical chord) cycles preview modes. Active for the lifetime
-    // of THIS picker only — disposed in both onAccept and onCancel
-    // above. Q4 (substrate Occam): no per-binding pipe alias, register
-    // each variant separately. (Korean IME aliases unnecessary — Ctrl+/
-    // has no jamo mapping on the 2-set layout.)
-    const togglePreviewMode = (): void => { cyclePreviewMode(); };
-    const previewSlash = display.registerKeyBinding({
-      id: `dashboard:finder-picker-preview-toggle-slash:${Date.now().toString(36)}`,
-      key: 'C-/',
-      scope: 'global',
-      when: () => state.agentSearchModal === picker,
-      handler: togglePreviewMode,
-    });
-    const previewUnder = display.registerKeyBinding({
-      id: `dashboard:finder-picker-preview-toggle-under:${Date.now().toString(36)}`,
-      key: 'C-_',
-      scope: 'global',
-      when: () => state.agentSearchModal === picker,
-      handler: togglePreviewMode,
-    });
-    previewToggleDisposable = {
-      dispose: () => { previewSlash.dispose(); previewUnder.dispose(); },
-    };
-    // Ctrl+] — instantly dismiss the active preview popup WITHOUT
-    // closing the picker or changing the mode. Esc would be more
-    // intuitive but the picker captures Esc internally to cancel
-    // itself. Ctrl+\ is unsafe because it raises SIGQUIT in many
-    // terminal drivers. Ctrl+] (historically "telnet escape" =
-    // "exit this context") is universally safe + semantically right.
-    // Active only while a preview is currently visible — otherwise
-    // the binding silently no-ops (no flicker, no log spam).
-    // Mode stays as set; if user is in HOVER mode, the next
-    // cursor stillness re-triggers the popup. To stop the popup
-    // from re-appearing entirely, cycle Ctrl+/ back to OFF.
-    previewDismissDisposable = display.registerKeyBinding({
-      id: `dashboard:finder-picker-preview-dismiss:${Date.now().toString(36)}`,
-      key: 'C-]',
-      scope: 'global',
-      when: () => state.agentSearchModal === picker && lastPreviewHandle !== null,
-      handler: () => {
-        clearHoverTimer();
-        disposeActivePreview();
         draw();
       },
     });

@@ -13,6 +13,104 @@ export type MapRowKind = 'green-candidate' | 'mock-pr' | 'implementation-remains
   | 'harvest' | 'close-candidate' | 'hold';
 export type MapEvidenceVerdict = 'pass' | 'fail' | 'hold' | 'unmeasured';
 
+/** Shared, execution-neutral contract consumed by task MAPREDUCE-FANOUT and gate shards. */
+export interface MapReducePolicy {
+  seed: string;
+  /** Additional attempts after the first dispatch. */
+  retryMax: number;
+  /** Total ceiling in the caller's documented cost unit. */
+  costLimit: number;
+}
+export interface MapReduceAttemptReceipt {
+  attempt: number;
+  host: string;
+  status: 'complete' | 'failed' | 'unmeasured';
+  cost: number;
+}
+export interface MapReducePieceReceipt {
+  pieceId: string;
+  host: string | null;
+  status: 'complete' | 'failed' | 'unmeasured' | 'budget-exceeded';
+  reservedCost: number;
+  attempts: MapReduceAttemptReceipt[];
+}
+export interface MapReduceReceipt {
+  seed: string;
+  costLimit: number;
+  reservedCost: number;
+  spentCost: number;
+  verdict: 'complete' | 'partial' | 'hold';
+  pieces: MapReducePieceReceipt[];
+}
+
+export function validMapReducePolicy(policy: MapReducePolicy): boolean {
+  return typeof policy.seed === 'string' && policy.seed.trim().length > 0
+    && Number.isSafeInteger(policy.retryMax) && policy.retryMax >= 0 // Source: retry.max counts additional attempts and cannot be negative (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
+    && Number.isFinite(policy.costLimit) && policy.costLimit >= 0; // Source: the reservation ceiling is a non-negative budget (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
+}
+
+export function validMapReducePieceReceipt(policy: MapReducePolicy, piece: MapReducePieceReceipt): boolean {
+  if (!validMapReducePolicy(policy) || !MAP_REDUCE_PIECE_ID.test(piece.pieceId)
+    || !['complete', 'failed', 'unmeasured', 'budget-exceeded'].includes(piece.status)
+    || (piece.host !== null && (typeof piece.host !== 'string' || !piece.host.trim()))
+    || !Number.isFinite(piece.reservedCost) || piece.reservedCost < 0 // Source: reservations cannot be negative (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
+    || !Array.isArray(piece.attempts) || piece.attempts.length > policy.retryMax + 1) return false;
+  const attemptsValid = piece.attempts.every((attempt, index) => Number.isSafeInteger(attempt.attempt)
+    && attempt.attempt === index + 1 // Source: attempt history is one-based (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
+    && typeof attempt.host === 'string' && !!attempt.host.trim()
+    && ['complete', 'failed', 'unmeasured'].includes(attempt.status)
+    && Number.isFinite(attempt.cost) && attempt.cost >= 0); // Source: measured spend cannot be negative (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
+  const priorAttemptsFailed = piece.attempts.slice(0, -1).every((attempt) => attempt.status === 'failed');
+  return attemptsValid
+    && (piece.status !== 'complete' || piece.attempts.at(-1)?.status === 'complete' && priorAttemptsFailed
+      && piece.host === piece.attempts.at(-1)?.host)
+    && (piece.status !== 'failed' || piece.attempts.length === policy.retryMax + 1
+      && piece.attempts.every((attempt) => attempt.status === 'failed')
+      && piece.host === piece.attempts.at(-1)?.host)
+    && (piece.status !== 'unmeasured' || piece.attempts.length === 0
+      || piece.attempts.at(-1)?.status === 'unmeasured' && priorAttemptsFailed
+        && piece.host === piece.attempts.at(-1)?.host)
+    && (piece.status !== 'budget-exceeded' || piece.attempts.length === 0);
+}
+
+/** Stable seeded host selection shared by both existing planners; it does not execute work. */
+export function mapReduceHostForPiece(seed: string, pieceId: string, attempt: number, hosts: readonly string[]): string | null {
+  const eligible = [...new Set(hosts.filter((host) => typeof host === 'string' && host.trim()))].sort();
+  if (!eligible.length || !Number.isSafeInteger(attempt) || attempt < 1) return null; // Source: attempts are one-based (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
+  let hash = 2166136261; // Source: FNV-1a 32-bit offset basis (NUMGUARD)
+  for (const character of `${seed}\0${pieceId}\0${attempt}`) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619) >>> 0; // Source: FNV-1a 32-bit prime (NUMGUARD)
+  return eligible[hash % eligible.length]!;
+}
+
+/** Canonical receipt reducer. Callers translate their production rows into these piece receipts. */
+export function reduceMapReduceReceipt(policy: MapReducePolicy, pieceIds: readonly string[], pieces: readonly MapReducePieceReceipt[]): MapReduceReceipt {
+  if (!validMapReducePolicy(policy) || new Set(pieceIds).size !== pieceIds.length
+    || pieceIds.some((id) => !MAP_REDUCE_PIECE_ID.test(id))) throw new Error('map-reduce contract identity or policy invalid');
+  const expected = new Set(pieceIds);
+  const validPieces = pieces.filter((piece) => expected.has(piece.pieceId));
+  const duplicate = new Set<string>();
+  const seen = new Set<string>();
+  for (const piece of validPieces) {
+    if (seen.has(piece.pieceId)) duplicate.add(piece.pieceId);
+    seen.add(piece.pieceId);
+  }
+  const canonical = pieceIds.map((pieceId) => validPieces.find((piece) => piece.pieceId === pieceId))
+    .filter((piece): piece is MapReducePieceReceipt => !!piece)
+    .map((piece) => ({ ...piece, attempts: [...piece.attempts] }))
+    .sort((a, b) => a.pieceId.localeCompare(b.pieceId));
+  const reservedCost = canonical.reduce((sum, piece) => sum + piece.reservedCost, 0);
+  const spentCost = canonical.reduce((sum, piece) => sum + piece.attempts.reduce((cost, attempt) => cost + attempt.cost, 0), 0);
+  const attemptsValid = canonical.every((piece) => validMapReducePieceReceipt(policy, piece)
+    && piece.attempts.reduce((sum, attempt) => sum + attempt.cost, 0) <= piece.reservedCost);
+  const allPiecesPresent = canonical.length === pieceIds.length && validPieces.length === pieces.length
+    && seen.size === pieceIds.length && duplicate.size === 0;
+  const verdict = pieceIds.length === 0 // Source: empty work has no completion receipt (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
+    || !allPiecesPresent || !attemptsValid || reservedCost > policy.costLimit || spentCost > policy.costLimit
+    || canonical.some((piece) => piece.status === 'unmeasured') ? 'hold'
+    : canonical.every((piece) => piece.status === 'complete') ? 'complete' : 'partial';
+  return { seed: policy.seed, costLimit: policy.costLimit, reservedCost, spentCost, verdict, pieces: canonical };
+}
+
 export interface MapRunStart {
   event: 'start';
   mapRunId: string;
@@ -31,6 +129,7 @@ export interface MapRunStart {
   selectedPool: string | null;
   imageCommit: string | null;
   dryRun: boolean;
+  mapReducePolicy?: MapReducePolicy;
 }
 
 export interface MapRunRow {
@@ -57,6 +156,7 @@ export interface MapRunRow {
   endedAt?: string | null;
   rc?: number | null;
   result?: Record<string, unknown>;
+  mapReducePiece?: MapReducePieceReceipt;
 }
 
 export interface MapRunRead {
@@ -73,9 +173,11 @@ export interface MapRunReduce {
   counts: Record<MapRowKind, number>;
   /** A dry-run has no write authority, even when every item is a candidate. */
   writes: 0;
+  receipt?: MapReduceReceipt;
 }
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/;
+const MAP_REDUCE_PIECE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const SHA = /^[0-9a-f]{40}$/;
 const KINDS = new Set<MapRowKind>(['green-candidate', 'mock-pr', 'implementation-remains', 'harvest', 'close-candidate', 'hold']);
 const RECIPE_KINDS: Record<MapRecipe, ReadonlySet<MapRowKind>> = {
@@ -107,6 +209,7 @@ function validateStart(start: MapRunStart): void {
   if (typeof start.inventoryComplete !== 'boolean' || typeof start.dryRun !== 'boolean') throw new Error('map-run completeness or dry-run missing');
   if (!start.inventoryComplete && start.itemIds.length) throw new Error('map-run partial inventory cannot name items');
   if (!start.requestedPool || !('selectedPool' in start) || !('imageCommit' in start)) throw new Error('map-run pool or image provenance missing');
+  if (start.mapReducePolicy && !validMapReducePolicy(start.mapReducePolicy)) throw new Error('map-run invalid shared map-reduce policy');
 }
 
 function validateRow(row: MapRunRow, start: MapRunStart): void {
@@ -147,6 +250,13 @@ function validateRow(row: MapRunRow, start: MapRunStart): void {
   }
   if (row.result != null && (typeof row.result !== 'object' || Array.isArray(row.result))) {
     throw new Error('map-run invalid result');
+  }
+  if (start.mapReducePolicy && !row.rowsSuppressed && !row.mapReducePiece) {
+    throw new Error('map-run shared piece receipt missing');
+  }
+  if (row.mapReducePiece && (row.mapReducePiece.pieceId !== row.itemId || !start.mapReducePolicy
+    || !validMapReducePieceReceipt(start.mapReducePolicy, row.mapReducePiece))) {
+    throw new Error('map-run invalid shared piece receipt');
   }
 }
 
@@ -216,11 +326,14 @@ export function reduceMapRun(mapRunId: string, root?: string): MapRunReduce {
   const accounted = start.inventoryComplete && rows.length === start.itemIds.length
     && rows.every((row) => !row.rowsSuppressed);
   const complete = accounted && start.itemIds.length > 0 && counts.hold === 0;
+  const receipt = start.mapReducePolicy ? reduceMapReduceReceipt(start.mapReducePolicy, start.itemIds,
+    rows.flatMap((row) => row.mapReducePiece ? [row.mapReducePiece] : [])) : undefined;
   return {
     mapRunId, verdict: complete ? 'complete' : 'hold',
     reason: !start.inventoryComplete ? 'inventory-incomplete' : start.itemIds.length === 0 ? 'empty-inventory'
       : !accounted ? 'results-missing'
       : counts.hold ? 'item-hold' : 'all-items-accounted',
     expected: start.itemIds.length, observed: rows.length, counts, writes: 0,
+    ...(receipt ? { receipt } : {}),
   };
 }

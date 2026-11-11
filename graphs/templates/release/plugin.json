@@ -34,8 +34,7 @@
               "approval:publish"
             ],
             "skills": [],
-            "domainPacks": [],
-            "maxSideEffects": "publish"
+            "domainPacks": []
           },
           "policy": {
             "executor": {

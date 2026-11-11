@@ -1,0 +1,5 @@
+world: pwa-formal-update
+seed: 1109
+devices: [fake-clock]
+clock: { start: '2100-11-09T00:00:00Z', speed: 60 }
+events: []

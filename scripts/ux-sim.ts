@@ -273,7 +273,12 @@ if (argv.includes('--fault')) {
     console.log(renderSqliteBusy(simSqliteBusy()).join('\n'));
     process.exit(0);
   }
-  console.error(`⛔ 모르는 결함이다: ${fault ?? '(없음)'} — 아는 것: cred-expiry · pod-death · pod-child-result · pool-cap · sqlite-busy`);
+  if (fault === 'app-scratch-bootstrap') {
+    const { appScratchBootstrapSweep, renderAppScratchBootstrap } = await import('../src/ux-sim/app-scratch-bootstrap.js');
+    console.log(renderAppScratchBootstrap(appScratchBootstrapSweep()).join('\n'));
+    process.exit(0);
+  }
+  console.error(`⛔ 모르는 결함이다: ${fault ?? '(없음)'} — 아는 것: cred-expiry · pod-death · pod-child-result · pool-cap · sqlite-busy · app-scratch-bootstrap`);
   process.exit(2);
 }
 

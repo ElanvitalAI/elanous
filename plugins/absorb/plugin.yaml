@@ -1,0 +1,102 @@
+apiVersion: elanous.dev/plugin/v2
+id: absorb
+name: Absorb
+version: 0.3.9
+description: Member-owned scrap absorption, daily briefing, and app upgrade suggestion graph.
+handlers:
+  boardApproval: { module: handlers/board-approval.ts, export: createBoardApprovalDispatch, skill: absorb/build }
+trust: builtin
+contributes:
+  aiTools:
+    - name: scrap_add
+      description: Add a member-owned scrap to the absorption graph.
+      handler: graph:absorb-ingest
+      parameters:
+        type: object
+        properties:
+          kind: { type: string, enum: [web, x, youtube, voice, video, photo, text] }
+          text: { type: string }
+          url: { type: string }
+          mediaRef: { type: string }
+        required: [kind]
+        additionalProperties: false
+      route:
+        triggers: ["스크랩 추가", "이 링크 저장해", "이것도 흡수해", "save this scrap"]
+        examples: ["이 웹 문서를 스크랩에 추가해", "save this YouTube video"]
+        sideEffects: external
+        risk: medium
+        cost: cheap
+        requiresConfirm: false
+    - name: brief_today
+      description: Build or read today's member-owned briefing.
+      handler: graph:absorb-brief
+      parameters: { type: object, properties: {}, additionalProperties: false }
+      route:
+        triggers: ["오늘 브리핑", "오늘 스크랩 정리해", "brief me today"]
+        examples: ["오늘의 브리핑 보여줘", "brief me on today's scraps"]
+        sideEffects: external
+        risk: low
+        cost: spends-llm
+        requiresConfirm: false
+    - name: suggest_list
+      description: List evidence-backed app suggestions for the verified member.
+      handler: graph:absorb-suggest-list
+      parameters: { type: object, properties: {}, additionalProperties: false }
+      route:
+        triggers: ["제안 목록", "앱 개선 제안 보여줘", "list my suggestions"]
+        examples: ["스크랩에서 나온 앱 제안 보여줘", "list today's app suggestions"]
+        sideEffects: read-only
+        risk: low
+        cost: cheap
+        requiresConfirm: false
+    - name: suggest_accept
+      description: Accept one evidence-backed app suggestion through its isolated build simulation.
+      handler: graph:absorb-build
+      parameters:
+        type: object
+        properties:
+          suggestionId: { type: string, minLength: 1 }
+        required: [suggestionId]
+        additionalProperties: false
+      route:
+        triggers: ["이 제안 수락", "이 기능 만들어줘", "제안 적용해줘", "accept this suggestion"]
+        examples: ["이 제안을 격리된 앱 복사본에서 진행해줘", "accept this suggestion and simulate it"]
+        sideEffects: external
+        risk: high
+        cost: spends-cloud
+        requiresConfirm: true
+        confirmation:
+          prompt: "이 제안을 격리된 앱 복사본에 적용하고 시뮬레이션을 시작할까요? (y/N)"
+          default: N
+capabilities:
+  - store
+  - extract
+  - stt
+  - ocr
+  - llm-judge
+  - notify
+  - app-publish
+graphs:
+  - graph/absorb-ingest.yaml
+  - graph/absorb-brief.yaml
+  - graph/absorb-suggest-list.yaml
+  - graph/absorb-build.yaml
+skills:
+  - id: absorb/card
+    path: skills/absorb/card/SKILL.md
+    sideEffects: none
+  - id: absorb/brief
+    path: skills/absorb/brief/SKILL.md
+    sideEffects: none
+  - id: absorb/suggest
+    path: skills/absorb/suggest/SKILL.md
+    sideEffects: none
+  - id: absorb/build
+    path: skills/absorb/build/SKILL.md
+    sideEffects: none
+packs:
+  - id: member-apps
+    version: 1
+    path: packs/member-apps/pack.yaml
+sims:
+  - sims/absorb-demo-world.yaml

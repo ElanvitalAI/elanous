@@ -6,6 +6,7 @@ import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeSync } 
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { killCorpusProcessGroup } from './corpus-process-group.js';
 import { installCorpusWorkerLiveness } from './corpus-worker-lifecycle.js';
 
 /** 기본 worker는 이 파일 자신이다. 테스트는 deps.workerEntry seam으로 별도 가짜 worker를 공급한다. */
@@ -91,10 +92,8 @@ export function corpusLiveWorkerCount(): number { return liveWorkers.size; }
 function terminateWorkerGroup(child: ChildProcess, reason: string, log: CorpusLog = (category, event, data) => debug.log(category, event, data)): void {
   if (!child.pid) return;
   log('goal-grounding.corpus', 'worker-cleanup', { pid: child.pid, reason });
-  try { process.kill(-child.pid, 'SIGKILL'); }
-  catch (error: unknown) {
-    if (!(error instanceof Error) || !('code' in error) || error.code !== 'ESRCH') throw error;
-  }
+  const mode = killCorpusProcessGroup(child.pid);
+  if (mode === 'members') log('goal-grounding.corpus', 'worker-group-kill-denied', { pid: child.pid, reason });
 }
 
 function cleanupLiveWorkers(reason: string): void {

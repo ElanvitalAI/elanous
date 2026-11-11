@@ -35,7 +35,7 @@ import { openKgDb, listNodes, getEdges, getNode } from './kg-store.js';
 import { recallCluster, recallHybrid } from './kg-recall.js';
 import { blastRadius } from './kg-infer.js';
 import { screenerPreset, formatScreenerRows, parseScreenerJson } from './screener-presets.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { loadFullPanel, backtest as conatusBacktest, factorResearch as conatusFactorResearch } from './conatus-backtest.js';
 import { runScreens, reportMd as conatusScreenReportMd } from './conatus-screen.js';
 import { computeTrend, render as conatusTrendRender } from './conatus-trend.js';

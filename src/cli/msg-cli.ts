@@ -16,7 +16,7 @@ import { debug } from '../debug/log.js';
 import type { AgentReplyAddress, AgentReplyInput, AgentReplyResult } from '../loops/agent-reply.js';
 import { noReplyBodyNotice, unsupportedLoopAddressNotice } from '../loops/msg-address.js';
 import { messageReplyBodyFor, registerSeatPaneAddress, resolveWake, wakeRecipient, type WakeDeps, type WakeOutcome } from '../loops/msg-wake.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { RoleLlmSpec } from '../user-config/types.js';
 import { postReleaseOpCommand, postReleaseOpQuestion } from '../release-loop/op-channel.js';
 
@@ -77,6 +77,13 @@ type RecipientOptions = CommonOptions & { to?: string; after?: string; limit?: s
 function seat(raw: string | undefined, flag: string): string {
   if (raw === undefined) throw new Error(`${flag} is required`);
   return canonicalSeatId(raw);
+}
+
+function messageRecipient(raw: string | undefined, flag: string): string {
+  if (raw === undefined) throw new Error(`${flag} is required`);
+  const address = canonicalMessageAddress(raw);
+  if (address === 'ALL' || address.startsWith('group:')) throw new Error(`${flag} must name one recipient`);
+  return address;
 }
 
 function integer(raw: string | undefined, flag: string, fallback: number, min: number, max: number): number {
@@ -313,15 +320,22 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
 
   msg.command('post [body]').description('Post a message; use - or omit body to read stdin')
     .option('--from <seat>').option('--to <seat>').option('--kind <kind>').option('--body <text>')
+    .option('--reject-undeclared', 'reject a recipient that has no routable seat or pane instead of storing it with a warning')
     .option('--reply-to <id>', 'point this reply at a question message ID')
     .option('--agent-reply <address>', 'let this address\'s agent body (COORDINATOR · GUARDIAN) answer the saved message once')
     .option('--origin-key <key>', 'deduplicate a channel mirror by coord:<commentId>:<recipient>').option('--json')
-    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; replyTo?: string; originKey?: string; agentReply?: string }) => run(async () => {
+    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; replyTo?: string; originKey?: string; agentReply?: string; rejectUndeclared?: boolean }) => run(async () => {
       const from = seat(opts.from, '--from');
       const unsupported = opts.to === undefined ? null : unsupportedLoopAddressNotice(opts.to);
       if (unsupported) out.error(unsupported);
       if (opts.to === undefined) throw new Error('--to is required');
       const to = canonicalMessageAddress(opts.to);
+      const route = resolveWake(to, deps.wakeDeps);
+      const undeclared = route.reason?.startsWith('undeclared-address');
+      const unroutable = undeclared || route.reason?.startsWith('dead-');
+      if (opts.rejectUndeclared && route.wake === 'none' && unroutable)
+        throw new Error(`undeclared or dead message address: ${to} (${route.reason})`);
+      if (route.wake === 'none' && undeclared) out.error(`${route.reason} · wake=none · ${to}: 수신 패널을 찾지 못했습니다 (거부하려면 --reject-undeclared)`);
       debug.log('msg.post', 'caller-runtime', { runtime: process.env.ELANOUS_AGENT_RUNTIME?.trim() || 'unknown', to });
       // Validate the auto-reply target before saving — a mismatched flag must not leave a stored message behind.
       const agentAddress = agentReplyAddress(opts.agentReply);
@@ -454,7 +468,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   msg.command('ack [id]').description('Acknowledge one message with --id, or acknowledge through --through')
     .option('--to <seat>').option('--id <id>', 'acknowledge exactly one message').option('--through <id>', 'acknowledge all messages through this ID').option('--json')
     .action((positional: string | undefined, opts: CommonOptions & { to?: string; id?: string; through?: string }) => run(() => {
-      const to = seat(opts.to, '--to');
+      const to = messageRecipient(opts.to, '--to');
       if (Number(Boolean(opts.id)) + Number(Boolean(opts.through)) + Number(Boolean(positional)) !== 1) throw new Error('choose exactly one of positional ID, --id, or --through');
       if (opts.id !== undefined) {
         const id = integer(opts.id, '--id', 1, 1, Number.MAX_SAFE_INTEGER);
@@ -470,11 +484,20 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
   msg.command('unread').description('Show recipients with unacknowledged messages')
     .option('--to <seat>').option('--json')
     .action((opts: CommonOptions & { to?: string }) => run(() => {
-      const to = opts.to === undefined ? undefined : seat(opts.to, '--to');
+      const to = opts.to === undefined ? undefined : messageRecipient(opts.to, '--to');
       const rows = withStore(store => {
-        if (to === undefined) return store.unread();
+        const unreadAddressVisible = (address: string) => {
+          const route = resolveWake(address, deps.wakeDeps);
+          if (route.wake !== 'none') return true;
+          if (route.source === 'loop-table' || route.reason === 'topic') return false;
+          return !route.reason?.startsWith('dead-') && !route.reason?.startsWith('undeclared-address');
+        };
+        const liveRows = (items: ReturnType<typeof store.unread>) => items.filter(row => {
+          return unreadAddressVisible(row.recipient);
+        });
+        if (to === undefined) return liveRows(store.unread());
         const count = store.unreadCount(to);
-        return count ? [{ recipient: to, count }] : [];
+        return count && unreadAddressVisible(to) ? [{ recipient: to, count }] : [];
       });
       emit(rows, opts.json, () => {
         if (!rows.length) out.log('No unread messages.');
@@ -490,7 +513,7 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
     .option('--once', 'poll once and exit').option('--json')
     .action((opts: RecipientOptions & { interval?: string; once?: boolean; sinceAck?: boolean; sse?: string }) => run(async () => {
       if (opts.sinceAck && opts.after !== undefined) throw new Error('--since-ack cannot be used with --after');
-      const to = seat(opts.to, '--to');
+      const to = messageRecipient(opts.to, '--to');
       const interval = integer(opts.interval, '--interval', 1000, 1, 60000);
       const after = opts.after === undefined ? undefined : integer(opts.after, '--after', 0, 0, Number.MAX_SAFE_INTEGER);
       const store = open();

@@ -405,6 +405,8 @@ exec /bin/bash "$@"
     expect(shortVersion.stdout).toBe(version.stdout);
     expect(result.stdout).toContain('Setup: prerequisite repairs completed.');
     expect(result.stdout).toContain('Next:');
+    expect(result.stdout).toContain('Run in a terminal:');
+    expect(result.stdout).not.toContain('Starting first-time setup');
     const metadata = JSON.parse(readFileSync(join(prefix, 'install.json'), 'utf8')) as Record<string, string>;
     expect(metadata.version).toBe(packageJson.version);
     expect(metadata.source).toBe(realpathSync(repoRoot));
@@ -1318,7 +1320,7 @@ exec /usr/bin/stat "$@"
     }
   }, 240_000);
 
-  function standalone(release: string, extra: Record<string, string> = {}) {
+  function standalone(release: string, extra: Record<string, string> = {}, curlShim?: string, sleepShim?: string) {
     const lonely = fixture();
     const copied = join(lonely, 'install.sh');
     copyFileSync(installer, copied);
@@ -1326,6 +1328,8 @@ exec /usr/bin/stat "$@"
     const archive = packageFixture(fixture());
     const installDir = join(env.prefix, 'versions', packageJson.version);
     const bunShim = fakeBunBin(env.dir, archive, installDir);
+    if (curlShim) writeFileSync(join(bunShim.bin, 'curl'), curlShim, { mode: 0o755 });
+    if (sleepShim) writeFileSync(join(bunShim.bin, 'sleep'), sleepShim, { mode: 0o755 });
     const doctorBin = isolatedDoctorBin(env);
     const result = spawnSync('/bin/bash', [copied, '--yes', '--no-modify-path'], {
       cwd: lonely, encoding: 'utf8',
@@ -1347,6 +1351,242 @@ exec /usr/bin/stat "$@"
     expect(installed.result.status, installed.result.stderr).toBe(0);
     expect(JSON.parse(readFileSync(join(installed.prefix, 'install.json'), 'utf8')).source).toBe(`file://${release}/latest/download/elanous.tgz`);
     expect(readlinkSync(join(installed.prefix, 'current'))).toBe(`versions/${packageJson.version}`);
+  }, 120_000);
+
+  test('standalone installer retries a transient latest asset download failure before verifying and installing', () => {
+    const release = fixture();
+    const assets = join(release, 'latest', 'download');
+    mkdirSync(assets, { recursive: true });
+    const tarball = join(assets, 'elanous.tgz');
+    copyFileSync(pack(fixture()), tarball);
+    const hash = createHash('sha256').update(readFileSync(tarball)).digest('hex');
+    const sums = join(assets, 'SHA256SUMS');
+    writeFileSync(sums, `${hash}  elanous.tgz\n`);
+
+    const env = setup();
+    const calls = join(env.dir, 'curl-calls.log');
+
+    const curlShim = `#!/bin/sh
+out=''
+headers=''
+url=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -D) headers="$2"; shift 2 ;;
+    -w) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\n' "$url" >> "$ELANOUS_INSTALL_TEST_CURL_CALLS"
+count=$(grep -Fxc "$url" "$ELANOUS_INSTALL_TEST_CURL_CALLS")
+if [ "$count" -eq 1 ]; then exit 22; fi
+case "$url" in
+  */elanous.tgz) cp "$ELANOUS_INSTALL_TEST_TARBALL" "$out" ;;
+  */SHA256SUMS) cp "$ELANOUS_INSTALL_TEST_SUMS" "$out" ;;
+  *) exit 64 ;;
+esac
+if [ -n "$headers" ]; then
+  cat > "$headers" <<'HEADERS'
+HTTP/2 302
+location: https://github.com/ElanvitalAI/elanous/releases/download/v9.9.9/elanous.tgz
+
+HTTP/2 302
+location: https://release-assets.githubusercontent.com/github-production-release-asset/example?token=secret
+
+HTTP/2 200
+
+HEADERS
+fi
+printf '%s' 'https://release-assets.githubusercontent.com/github-production-release-asset/example?token=secret'
+`;
+    const installed = standalone(release, {
+      ELANOUS_INSTALL_TEST_CURL_CALLS: calls,
+      ELANOUS_INSTALL_TEST_TARBALL: tarball,
+      ELANOUS_INSTALL_TEST_SUMS: sums,
+      ELANOUS_RELEASE_BASE: 'https://github.com/ElanvitalAI/elanous/releases',
+    }, curlShim);
+
+    expect(installed.result.status, installed.result.stderr).toBe(0);
+    expect(readFileSync(calls, 'utf8').trim().split('\n')).toEqual([
+      'https://github.com/ElanvitalAI/elanous/releases/latest/download/elanous.tgz',
+      'https://github.com/ElanvitalAI/elanous/releases/latest/download/elanous.tgz',
+      'https://github.com/ElanvitalAI/elanous/releases/download/v9.9.9/SHA256SUMS',
+      'https://github.com/ElanvitalAI/elanous/releases/download/v9.9.9/SHA256SUMS',
+    ]);
+    expect(JSON.parse(readFileSync(join(installed.prefix, 'install.json'), 'utf8')).source)
+      .toBe('https://github.com/ElanvitalAI/elanous/releases/download/v9.9.9/elanous.tgz');
+
+    const unresolvedCalls = join(env.dir, 'unresolved-curl-calls.log');
+    const unresolvedCurlShim = `#!/bin/sh
+out=''
+headers=''
+url=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -D) headers="$2"; shift 2 ;;
+    -w) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\n' "$url" >> "$ELANOUS_INSTALL_TEST_CURL_CALLS"
+cp "$ELANOUS_INSTALL_TEST_TARBALL" "$out"
+cat > "$headers" <<'HEADERS'
+HTTP/2 302
+location: https://release-assets.githubusercontent.com/github-production-release-asset/example?token=secret
+
+HTTP/2 200
+
+HEADERS
+printf '%s' 'https://release-assets.githubusercontent.com/github-production-release-asset/example?token=secret'
+`;
+    const unresolved = standalone(release, {
+      ELANOUS_INSTALL_TEST_CURL_CALLS: unresolvedCalls,
+      ELANOUS_INSTALL_TEST_TARBALL: tarball,
+      ELANOUS_RELEASE_BASE: 'https://github.com/ElanvitalAI/elanous/releases',
+    }, unresolvedCurlShim);
+    expect(unresolved.result.status).toBe(1);
+    expect(unresolved.result.stderr).toContain('did not identify an immutable tag');
+    // Source: a redirect without its release-tag Location must stop after the tarball request.
+    expect(readFileSync(unresolvedCalls, 'utf8').trim().split('\n')).toEqual([
+      'https://github.com/ElanvitalAI/elanous/releases/latest/download/elanous.tgz',
+    ]);
+    expect(existsSync(join(unresolved.prefix, 'current'))).toBe(false);
+  }, 120_000);
+
+  test('latest asset retries stop after three attempts while versioned downloads stay single-shot', () => {
+    const release = fixture();
+    const scratch = fixture();
+    const latestCalls = join(scratch, 'latest-curl-calls.log');
+    const latestSleeps = join(scratch, 'latest-sleep-calls.log');
+    const versionedCalls = join(scratch, 'versioned-curl-calls.log');
+    const checksumCalls = join(scratch, 'checksum-curl-calls.log');
+    const checksumSleeps = join(scratch, 'checksum-sleep-calls.log');
+    const mismatchCalls = join(scratch, 'mismatch-curl-calls.log');
+    const mismatchSleeps = join(scratch, 'mismatch-sleep-calls.log');
+    const assets = join(release, 'latest', 'download');
+    mkdirSync(assets, { recursive: true });
+    const tarball = join(assets, 'elanous.tgz');
+    copyFileSync(pack(fixture()), tarball);
+    const actual = createHash('sha256').update(readFileSync(tarball)).digest('hex');
+    const sums = join(assets, 'SHA256SUMS');
+    writeFileSync(sums, `${actual}  elanous.tgz\n`);
+    const expectedMismatch = `${actual[0] === 'a' ? 'b' : 'a'}${actual.slice(1)}`;
+    const mismatchSums = join(scratch, 'mismatch-SHA256SUMS');
+    writeFileSync(mismatchSums, `${expectedMismatch}  elanous.tgz\n`);
+    const alwaysFailCurl = `#!/bin/sh
+out=''
+url=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-o' ]; then out="$2"; shift 2; else url="$1"; shift; fi
+done
+printf '%s\\n' "$url" >> "$ELANOUS_INSTALL_TEST_CURL_CALLS"
+exit 22
+`;
+    const recordSleep = `#!/bin/sh
+printf '%s\\n' "$1" >> "$ELANOUS_INSTALL_TEST_SLEEP_CALLS"
+`;
+    const checksumFailCurl = `#!/bin/sh
+out=''
+url=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-o' ]; then out="$2"; shift 2; else url="$1"; shift; fi
+done
+printf '%s\\n' "$url" >> "$ELANOUS_INSTALL_TEST_CURL_CALLS"
+case "$url" in
+  */elanous.tgz) cp "$ELANOUS_INSTALL_TEST_TARBALL" "$out" ;;
+  */SHA256SUMS) exit 22 ;;
+  *) exit 64 ;;
+esac
+`;
+    const checksumRetryMismatchCurl = `#!/bin/sh
+out=''
+url=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-o' ]; then out="$2"; shift 2; else url="$1"; shift; fi
+done
+printf '%s\\n' "$url" >> "$ELANOUS_INSTALL_TEST_CURL_CALLS"
+case "$url" in
+  */elanous.tgz) cp "$ELANOUS_INSTALL_TEST_TARBALL" "$out"; printf '%s' "$url" ;;
+  */SHA256SUMS)
+    count=$(grep -Fxc "$url" "$ELANOUS_INSTALL_TEST_CURL_CALLS")
+    if [ "$count" -eq 1 ]; then exit 22; fi
+    cp "$ELANOUS_INSTALL_TEST_SUMS" "$out"; printf '%s' "$url" ;;
+  *) exit 64 ;;
+esac
+`;
+    const latest = standalone(release, {
+      ELANOUS_INSTALL_TEST_CURL_CALLS: latestCalls,
+      ELANOUS_INSTALL_TEST_SLEEP_CALLS: latestSleeps,
+    }, alwaysFailCurl, recordSleep);
+    expect(latest.result.status).toBe(1);
+    expect(latest.result.stderr).toContain(`file://${release}/latest/download/elanous.tgz`);
+    expect(readFileSync(latestCalls, 'utf8').trim().split('\n'))
+      .toEqual(Array(3).fill(`file://${release}/latest/download/elanous.tgz`));
+    expect(readFileSync(latestSleeps, 'utf8').trim().split('\n')).toEqual(['1', '2']);
+    expect(existsSync(join(latest.prefix, 'current'))).toBe(false);
+
+    const versioned = standalone(release, {
+      ELANOUS_VERSION: '9.9.9',
+      ELANOUS_INSTALL_TEST_CURL_CALLS: versionedCalls,
+    }, alwaysFailCurl);
+    expect(versioned.result.status).toBe(1);
+    expect(readFileSync(versionedCalls, 'utf8').trim().split('\n'))
+      .toEqual([`file://${release}/download/v9.9.9/elanous.tgz`]);
+    expect(existsSync(join(versioned.prefix, 'current'))).toBe(false);
+
+    const versionedChecksumCalls = join(scratch, 'versioned-checksum-curl-calls.log');
+    const versionedChecksumFailCurl = `#!/bin/sh
+out=''
+url=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '-o' ]; then out="$2"; shift 2; else url="$1"; shift; fi
+done
+printf '%s\n' "$url" >> "$ELANOUS_INSTALL_TEST_CURL_CALLS"
+case "$url" in
+  */elanous.tgz) cp "$ELANOUS_INSTALL_TEST_TARBALL" "$out" ;;
+  */SHA256SUMS) exit 22 ;;
+  *) exit 64 ;;
+esac
+`;
+    const versionedChecksum = standalone(release, {
+      ELANOUS_VERSION: '9.9.9',
+      ELANOUS_INSTALL_TEST_CURL_CALLS: versionedChecksumCalls,
+      ELANOUS_INSTALL_TEST_TARBALL: tarball,
+    }, versionedChecksumFailCurl);
+    expect(versionedChecksum.result.status).toBe(1);
+    expect(readFileSync(versionedChecksumCalls, 'utf8').trim().split('\n'))
+      .toEqual([`file://${release}/download/v9.9.9/elanous.tgz`, `file://${release}/download/v9.9.9/SHA256SUMS`]);
+    expect(existsSync(join(versionedChecksum.prefix, 'current'))).toBe(false);
+
+    const checksum = standalone(release, {
+      ELANOUS_INSTALL_TEST_CURL_CALLS: checksumCalls,
+      ELANOUS_INSTALL_TEST_SLEEP_CALLS: checksumSleeps,
+      ELANOUS_INSTALL_TEST_TARBALL: tarball,
+    }, checksumFailCurl, recordSleep);
+    expect(checksum.result.status).toBe(1);
+    expect(checksum.result.stderr).toContain(`file://${release}/latest/download/SHA256SUMS`);
+    expect(readFileSync(checksumCalls, 'utf8').trim().split('\n'))
+      .toEqual([`file://${release}/latest/download/elanous.tgz`, ...Array(3).fill(`file://${release}/latest/download/SHA256SUMS`)]);
+    expect(readFileSync(checksumSleeps, 'utf8').trim().split('\n')).toEqual(['1', '2']);
+    expect(existsSync(join(checksum.prefix, 'current'))).toBe(false);
+
+    const mismatch = standalone(release, {
+      ELANOUS_INSTALL_TEST_CURL_CALLS: mismatchCalls,
+      ELANOUS_INSTALL_TEST_SLEEP_CALLS: mismatchSleeps,
+      ELANOUS_INSTALL_TEST_TARBALL: tarball,
+      ELANOUS_INSTALL_TEST_SUMS: mismatchSums,
+    }, checksumRetryMismatchCurl, recordSleep);
+    expect(mismatch.result.status).toBe(1);
+    expect(mismatch.result.stderr).toContain(expectedMismatch);
+    expect(mismatch.result.stderr).toContain(actual);
+    expect(readFileSync(mismatchCalls, 'utf8').trim().split('\n'))
+      .toEqual([`file://${release}/latest/download/elanous.tgz`, `file://${release}/latest/download/SHA256SUMS`, `file://${release}/latest/download/SHA256SUMS`]);
+    expect(readFileSync(mismatchSleeps, 'utf8').trim().split('\n')).toEqual(['1']);
+    expect(existsSync(join(mismatch.prefix, 'current'))).toBe(false);
   }, 120_000);
 
   test('standalone installer rejects a checksum mismatch before creating current and reports both hashes', () => {
@@ -1462,7 +1702,7 @@ describe('INST2 — finish in the same window', () => {
   test('headless fresh install starts web first-run without requiring /dev/tty', () => {
     const env = setup();
     const { exec, record } = fakeSetup(env.dir);
-    const { prefix, result } = run(['--no-modify-path'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '' });
+    const { prefix, result } = run(['--no-modify-path'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_SETUP_EXEC: exec, ELANOUS_INSTALL_TEST_REAL: '1', CI: '' });
     expect(result.status, result.stderr).toBe(0);
     expect(readFileSync(record, 'utf8').trim()).toBe(join(realpathSync(prefix), 'bin', 'elanous'));
     expect(result.stdout).toContain('Setup: prerequisite repairs completed.');
@@ -1515,7 +1755,7 @@ describe('INST2 — finish in the same window', () => {
   test('--no-setup: a fresh headless install does not start setup', () => {
     const env = setup();
     const { exec, record } = fakeSetup(env.dir);
-    const { result } = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '' });
+    const { result } = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_SETUP_EXEC: exec, ELANOUS_INSTALL_TEST_REAL: '1', CI: '' });
     expect(result.status, result.stderr).toBe(0);
     expect(existsSync(record)).toBe(false);
     expect(result.stdout).not.toContain('Starting first-time setup');

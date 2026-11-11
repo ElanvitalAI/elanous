@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-MAPREDUCE-MULTIHOST-SIM-TS",
+  "path": "src/ux-sim/mapreduce-multihost-sim.ts",
+  "boundary": "SIM-MAPREDUCE: deterministic fake attempt outcomes at production task and gate host-launch boundaries; calls production planners and reducers.",
+  "deviceIds": ["SIM-MAPREDUCE"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -28,7 +28,7 @@ function git(args: string[], cwd = temp): string {
   expect(r.status, `${args.join(' ')}: ${r.stderr}`).toBe(0);
   return r.stdout.trim();
 }
-async function inProcess(args: string[], cwd = seed, stateRoot = join(home, 'test-state')) {
+async function inProcess(args: string[], cwd = seed, stateRoot = join(home, 'test-state'), configRoot?: string) {
   const turn = inProcessTurn;
   let release!: () => void;
   inProcessTurn = new Promise<void>((resolve) => { release = resolve; });
@@ -37,7 +37,8 @@ async function inProcess(args: string[], cwd = seed, stateRoot = join(home, 'tes
     const result = await simCli(args, {
       cwd,
       stateRoot,
-      env: { HOME: home },
+      configRoot,
+      env: { HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') },
       allowPaths: [['hq', 'init'], ['hq', 'seat'], ['hq', 'work', 'new'], ['hq', 'work', 'done'], ['hq', 'lease'], ['hq', 'fence'], ['hq', 'fence-wrapper'], ['hq', 'fence-audit']],
     });
     return { status: result.exitCode, stdout: result.stdout, stderr: result.stderr };
@@ -855,17 +856,18 @@ test('init preserves an absolute local origin', async () => {
   expect(git(['--git-dir', join(root, 'repo.git'), 'rev-parse', '--verify', 'refs/remotes/origin/main'])).toBe(git(['rev-parse', 'HEAD'], seed));
 }, 120_000);
 
-test('init refuses a different resolved home without changing the house ledger', () => {
+test('init refuses a different resolved home without changing the house ledger', async () => {
+  // The first integration test exercises the real --config-dir CLI flag and asserts ledger.home.path.
+  // This test isolates the ledger's mismatch behavior with the same simCli config-root seam.
   const root = join(home, 'elanous-hq');
   const firstHome = join(home, 'first-config');
   const secondHome = join(home, 'second-config');
-  const init = (configDir: string) => command('bun', [cli, `--test=${join(home, 'test-state')}`, '--config-dir', configDir, 'hq', 'init', '--root', root], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
-  const first = init(firstHome);
+  const init = (configDir: string) => inProcess(['hq', 'init', '--root', root], seed, join(home, 'test-state'), configDir);
+  const first = await init(firstHome);
   expect(first.status, first.stderr).toBe(0);
   const registered = readFileSync(join(root, 'house.json'), 'utf8');
   expect(JSON.parse(registered).home.path).toBe(firstHome);
-  const second = init(secondHome);
+  const second = await init(secondHome);
   expect(second.status).toBe(1);
   expect(second.stderr).toContain('house.json home mismatch:');
   expect(readFileSync(join(root, 'house.json'), 'utf8')).toBe(registered);
@@ -887,15 +889,14 @@ test('failed initial fetch can be retried after the bare remote becomes availabl
   expect(JSON.parse(readFileSync(join(root, 'house.json'), 'utf8')).home.path).toBe(join(home, 'test-state'));
 }, 120_000);
 
-test('mirror fetch tracks main only and removes stale remote-tracking branch refs', () => {
+test('mirror fetch tracks main only and removes stale remote-tracking branch refs', async () => {
   const root = join(home, 'elanous-hq');
   git(['switch', '-c', 'feature/pr-123'], seed);
   writeFileSync(join(seed, 'feature'), 'branch-only\n');
   git(['add', 'feature'], seed);
   git(['commit', '-m', 'feature branch'], seed);
   git(['push', 'origin', 'feature/pr-123'], seed);
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const repo = join(root, 'repo.git');
   expect(git(['--git-dir', repo, 'config', '--get-all', 'remote.origin.fetch'])).toBe('+refs/heads/main:refs/remotes/origin/main');
@@ -907,8 +908,7 @@ test('mirror fetch tracks main only and removes stale remote-tracking branch ref
   git(['--git-dir', repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
   git(['--git-dir', repo, 'fetch', 'origin']);
   expect(git(['--git-dir', repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin'])).toContain('refs/remotes/origin/feature/pr-123');
-  const repeated = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const repeated = await initInProcess(seed);
   expect(repeated.status, repeated.stderr).toBe(0);
   expect(git(['--git-dir', repo, 'config', '--get-all', 'remote.origin.fetch'])).toBe('+refs/heads/main:refs/remotes/origin/main');
   expect(git(['--git-dir', repo, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin'])).toBe('refs/remotes/origin/main');
@@ -917,8 +917,7 @@ test('mirror fetch tracks main only and removes stale remote-tracking branch ref
 
 test('remote seat lifecycle runs on the selected SSH host and records its host without copying credentials', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const help = await hq('seat', '--help');
   expect(help.status, help.stderr).toBe(0);
@@ -1050,10 +1049,9 @@ test('remote seat script clones, refreshes, and removes a real worktree on the s
   }
 }, 120_000);
 
-test('remote seat preserves SSH failure text and does not register a failed create', () => {
+test('remote seat preserves SSH failure text and does not register a failed create', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const captured = captureRemoteOperations();
   expect(() => hqSeat('OP', { root, host: 'mshq', ssh: () => ({ status: 255, stdout: 'stdout detail', stderr: 'ssh: connect timed out' }) }))
@@ -1064,10 +1062,9 @@ test('remote seat preserves SSH failure text and does not register a failed crea
   expect(typeof (captured.events()[0]?.data as Record<string, unknown>).ms).toBe('number');
 }, 120_000);
 
-test('remote refresh and delete failures each record an unsuccessful boundary and retain registration', () => {
+test('remote refresh and delete failures each record an unsuccessful boundary and retain registration', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const captured = captureRemoteOperations();
   const calls: string[] = [];
@@ -1086,10 +1083,9 @@ test('remote refresh and delete failures each record an unsuccessful boundary an
   expect(captured.events().map(event => (event.data as Record<string, unknown>).ok)).toEqual([true, false, false]);
 }, 120_000);
 
-test('remote seat operation result is unchanged when debug logging throws', () => {
+test('remote seat operation result is unchanged when debug logging throws', async () => {
   const root = join(home, 'elanous-hq');
-  const init = command('bun', [cli, `--test=${join(home, 'test-state')}`, 'hq', 'init'], seed,
-    { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(temp, 'empty-gitconfig') });
+  const init = await initInProcess(seed);
   expect(init.status, init.stderr).toBe(0);
   const logSpy = spyOn(debug, 'log').mockImplementation(() => { throw new Error('log sink failed'); });
   try {
@@ -1257,7 +1253,8 @@ test('HQ lease status command help and local status remain available unchanged',
   const config = join(temp, 'config');
   mkdirSync(config);
   writeFileSync(join(config, 'config.json'), JSON.stringify({ hq: { arbiter: 'local' } }));
-  const status = command('bun', [cli, `--test=${join(home, 'test-state')}`, '--config-dir', config, 'hq', 'lease', 'status', '--json'], temp, { ...process.env, HOME: home });
+  // The real --config-dir process boundary is covered by the first integration test above.
+  const status = await inProcess(['hq', 'lease', 'status', '--json'], temp, join(home, 'test-state'), config);
   expect(status.status, status.stderr).toBe(0);
   expect(JSON.parse(status.stdout.trim().split('\n').at(-1)!)).toEqual({ ok: true, action: 'status', record: null, ageSeconds: null, expired: null });
   for (const name of ['fence', 'fence-wrapper', 'fence-audit']) {

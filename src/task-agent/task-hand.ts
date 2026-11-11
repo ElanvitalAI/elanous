@@ -18,7 +18,7 @@ import type { GraphWizardDeps } from '../graph-wizard/generate.js';
 import type { PluginWizardDeps, PluginWizardInput } from '../graph-wizard/mission-compose.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
 import { resolveDaemonHarnessTarget } from '../intake-plane/harness-target.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { readBudgetInputsLive, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { HARNESS_RUN_ID_ENV, mintRunId, normalizeRunId } from '../harness/harness-space.js';
 import { newLaunchUtteranceId, recordLaunchUtterance } from '../harness/launch-utterance-ledger.js';

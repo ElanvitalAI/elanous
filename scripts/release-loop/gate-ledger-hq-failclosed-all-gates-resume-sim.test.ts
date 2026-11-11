@@ -10,6 +10,10 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-co
 import { appendGateShardLedgerBatch, gateShardLedgerPath, readGateShardLedger, type GateShardLedgerRow } from '../../src/release-loop/gate-shard-ledger.js';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import type { PodCommandResult } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
+import { runRehearsalTick } from '../../src/release-loop/rehearsal.js';
+import type { ReleaseSchedule } from '../../src/release-loop/release-schedule.js';
+import { runSelfGateCliAsync, type SelfGateCliDeps } from '../../src/self-implement/gate-cli.js';
+import type { ShardRunMode } from '../../src/self-dev/shard-run.js';
 
 setDefaultTimeout(60_000);
 const originalCwd = process.cwd();
@@ -29,10 +33,12 @@ function sourceTree(root: string): string {
   const repo = join(root, 'repo');
   mkdirSync(join(repo, 'src'), { recursive: true });
   mkdirSync(join(repo, 'apps', 'pwa'), { recursive: true });
+  mkdirSync(join(repo, 'release'), { recursive: true });
   writeFileSync(join(repo, 'package.json'), '{"name":"gate-ledger-sim","version":"1.0.0"}\n');
   writeFileSync(join(repo, 'bun.lock'), 'lockfileVersion = 1\n');
   writeFileSync(join(repo, 'apps', 'pwa', 'bun.lock'), '{"lockfileVersion":1,"configVersion":1,"workspaces":{"":{"name":"sim-pwa"}},"packages":{}}\n');
   writeFileSync(join(repo, TEST_FILE), "import { test } from 'bun:test';\ntest('ledger sim', () => {});\n");
+  writeFileSync(join(repo, 'release', 'light-rc-always.txt'), `${TEST_FILE}\n`);
   for (const args of [['init', '-q'], ['config', 'user.name', 'Gate ledger sim'], ['config', 'user.email', 'sim@example.invalid'], ['add', '.'], ['commit', '-qm', 'gate ledger simulation']]) {
     const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
     if (result.status !== 0) throw new Error(result.stderr || `git ${args[0]} failed`);
@@ -240,4 +246,216 @@ test('GATE-LEDGER-HQ-SINGLE sim: direct CLI parser accepts hard-rehearsal run sc
   expect(() => parseOptions(['--commit', BASE, '--version', '0.3.8-rc.1', '--baseline-version', '0.3.7', '--run-id', runId,
     '--executor', 'pod', '--pod-pool', 'sim-pool@sim-remote:1', '--pod-shards', '1'], {}))
     .toThrow('--run-id is only valid with --rehearsal-baseline');
+});
+
+test('GATE-LEDGER-HQ-SINGLE sim: light rehearsal run id is queryable in the HQ ledger', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-ledger-light-rehearsal-sim-'));
+  const repo = sourceTree(root);
+  const commit = runCommit(repo);
+  const instanceRoot = join(root, 'hq');
+  mkdirSync(instanceRoot, { recursive: true });
+  const now = new Date('2026-11-10T00:30:00.000Z');
+  const schedule = { version: VERSION, cutAt: '2026-11-10T03:00:00.000Z', publishAt: '2026-11-10T05:00:00.000Z' } as ReleaseSchedule;
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  const previousStateDirSource = process.env.ELANOUS_STATE_DIR_SOURCE;
+  const previousGraphContext = process.env.ELANOUS_GRAPH_CONTEXT;
+  const previousCwd = process.cwd();
+  try {
+    process.env.ELANOUS_STATE_DIR = instanceRoot;
+    process.env.ELANOUS_STATE_DIR_SOURCE = 'explicit';
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ graphId: 'release-loop', runId: 'release-run-sim-1' });
+    setElanousConfigDir(instanceRoot);
+    const podCalls: string[] = [];
+    const result = await runRehearsalTick({ ledgerRoot: instanceRoot, checkout: repo, apply: true, remote: 'node-c' }, {
+      now: () => now,
+      schedules: () => [schedule],
+      git: (args) => ({ rc: 0, stdout: args[0] === 'rev-parse' ? `${commit}\n` : '' }),
+      leakCheck: () => ({ status: 0 }),
+      shardPlan: () => ({ shards: 4, testFiles: 1, gatePlanShards: 4,
+        resources: { cpus: 8, freeBytes: 8e9, totalBytes: 16e9 }, unmeasured: null }),
+      lightRcDeps: {
+        previousVersion: () => '0.3.6',
+        git: (args) => ({ rc: 0, stdout: args[0] === 'rev-parse' || args[0] === 'merge-base' ? `${commit}\n` : '' }),
+        readFile: (path) => path.endsWith('light-rc-always.txt') ? `${TEST_FILE}\n` : undefined,
+        gatePodPool: 'gate-sim@sim-remote:1',
+        runFormalHostGate: async (options) => {
+          expect(options.graphRunId, 'the light-rc graphRunId must equal its durable rehearsal stamp ID').toBe('release-run-sim-1');
+          expect(options.shardLedgerRoot).toBe(instanceRoot);
+          const context = { graphId: 'release-loop', nodeId: 'gate', runId: options.graphRunId, input: { version: options.version,
+            previousVersion: options.baselineVersion, commit: options.commit, gateExecutor: 'pod', gateImagePin: 'cut-commit',
+            gatePodPool: 'gate-sim@sim-remote:1' },
+            outputs: { 'version-release': { commit }, cutoff: { baseline: { sha: commit } },
+              'gate-image-repair-111111111111': { outcome: 'ok', imagePin: 'cut-commit', imagePinRunId: options.graphRunId,
+                commit, imagePinDigest: IMAGE } } };
+        const oldCwd = process.cwd();
+        process.chdir(repo);
+        try {
+          const exitCode = await runGateNode(['--json'], { ELANOUS_GRAPH_CONTEXT: JSON.stringify(context),
+            ELANOUS_STATE_DIR: instanceRoot, ELANOUS_STATE_DIR_SOURCE: 'explicit' }, undefined, undefined, () => IMAGE,
+            undefined, makeGateTools(repo, podCalls));
+          expect(exitCode).toBe(0);
+          return { outcome: 'ok' as const, commit: options.commit, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
+            knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1,
+            rehearsalTui: { outcome: 'ok' as const, detail: 'simulated TUI evidence' } };
+        } finally {
+          process.chdir(oldCwd);
+        }
+      },
+      },
+    });
+    expect(result).toMatchObject({ status: 'due', run: 'rc-150m' });
+    const stamp = JSON.parse(readFileSync(join(instanceRoot, 'release', VERSION, 'rehearsal', 'rc-150m.json'), 'utf8')) as { lightRcRunId?: string };
+    expect(stamp.lightRcRunId).toBe('release-run-sim-1');
+    const ledger = readGateShardLedger(gateShardLedgerPath(VERSION, instanceRoot));
+    const rowsForRun = ledger?.rows.filter((row) => row.runId === stamp.lightRcRunId) ?? [];
+    expect(rowsForRun[0]).toBeDefined();
+    expect(rowsForRun.some((row) => row.state === 'done' && row.fail === 0), 'raw HQ rows are queryable by rehearsal run id').toBe(true);
+  } finally {
+    process.chdir(previousCwd);
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
+    if (previousStateDirSource === undefined) delete process.env.ELANOUS_STATE_DIR_SOURCE;
+    else process.env.ELANOUS_STATE_DIR_SOURCE = previousStateDirSource;
+    if (previousGraphContext === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT;
+    else process.env.ELANOUS_GRAPH_CONTEXT = previousGraphContext;
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('GATE-LEDGER-HQ-SINGLE sim: train-marked self-gate appends its raw shard batch to the same HQ ledger', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-ledger-train-self-gate-sim-'));
+  const repo = sourceTree(root);
+  const commit = runCommit(repo);
+  const instanceRoot = join(root, 'hq');
+  mkdirSync(instanceRoot, { recursive: true });
+  const contextPath = join(root, 'graph-context.json');
+  const runId = 'train-self-gate-sim-run';
+  writeFileSync(contextPath, JSON.stringify({ graphId: 'release-loop', runId, input: { version: VERSION, commit } }));
+  const saved = {
+    stateDir: process.env.ELANOUS_STATE_DIR,
+    stateSource: process.env.ELANOUS_STATE_DIR_SOURCE,
+    graphContext: process.env.ELANOUS_GRAPH_CONTEXT,
+    remoteChild: process.env.ELANOUS_GATE_REMOTE_CHILD,
+    trainGate: process.env.ELANOUS_TRAIN_GATE,
+  };
+  try {
+    process.env.ELANOUS_STATE_DIR = instanceRoot;
+    process.env.ELANOUS_STATE_DIR_SOURCE = 'explicit';
+    process.env.ELANOUS_GRAPH_CONTEXT = contextPath;
+    process.env.ELANOUS_GATE_REMOTE_CHILD = '1';
+    process.env.ELANOUS_TRAIN_GATE = '1';
+    setElanousConfigDir(instanceRoot);
+    let failShard = false;
+    let retryShard = false;
+    let omitLifecycle = false;
+    let omitRetryCompletion = false;
+    let omitRetryRunning = false;
+    let omitReturnedAttempt = false;
+    let skipTestSelection = false;
+    let shardRuns = 0;
+    const junit = (failed: boolean) => `<testsuites tests="1" failures="${Number(failed)}" errors="0"><testsuite file="${TEST_FILE}" tests="1" failures="${Number(failed)}" errors="0"><testcase name="ledger sim" file="${TEST_FILE}">${failed ? '<failure message="assertion failed"/>' : ''}</testcase></testsuite></testsuites>`;
+    const dependencies: SelfGateCliDeps = {
+      changedFiles: () => ({ files: skipTestSelection ? [] : [TEST_FILE], baseRef: commit }),
+      resolveRev: (ref) => ref === 'HEAD' || ref === commit ? commit : null,
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+      runShardsAsync: async (_cwd, files, _baseRef, _count, _run, _baseline, _budget, mode) => {
+        shardRuns++;
+        const shard = { id: 'shard-1', files: [...files], plannedRssMb: 1, plannedSeconds: 1 };
+        const attempt = { shardId: 'shard-1', attempt: 1, currentJUnit: junit(failShard), baselineJUnit: junit(false),
+          currentExitCode: failShard ? 1 : 0, baselineExitCode: 0, currentSignal: null, baselineSignal: null,
+          baselineFiles: [...files], currentRoot: repo, baselineRoot: repo };
+        const retryAttempt = { shardId: 'shard-1', attempt: 1, currentJUnit: undefined, baselineJUnit: junit(false),
+          currentExitCode: null, baselineExitCode: 0, currentSignal: 'SIGKILL', baselineSignal: null,
+          baselineFiles: [...files], currentRoot: repo, baselineRoot: repo };
+        const finalAttempt = { ...attempt, attempt: 2 };
+        const attempts = retryShard ? [retryAttempt, finalAttempt] : [attempt];
+        const observer = (mode as ShardRunMode).onShardLifecycle;
+        if (!omitLifecycle) {
+          observer?.({ type: 'planned', shard, at: new Date().toISOString() });
+          if (retryShard) {
+            observer?.({ type: 'running', shard, attempt: 1, at: new Date().toISOString() });
+            if (!omitRetryCompletion) observer?.({ type: 'attempt', shard, attempt: retryAttempt, state: 'retry', at: new Date().toISOString() });
+            if (!omitRetryRunning) observer?.({ type: 'running', shard, attempt: 2, at: new Date().toISOString() });
+            observer?.({ type: 'attempt', shard, attempt: finalAttempt, state: failShard ? 'failed' : 'done', at: new Date().toISOString() });
+          } else {
+            observer?.({ type: 'running', shard, attempt: 1, at: new Date().toISOString() });
+            observer?.({ type: 'attempt', shard, attempt, state: failShard ? 'failed' : 'done', at: new Date().toISOString() });
+          }
+        }
+        return {
+          aggregate: { status: failShard ? 'failed' : 'passed', retryShardIds: [] }, shards: [shard], attempts: omitReturnedAttempt ? [] : attempts,
+        } as Awaited<ReturnType<NonNullable<SelfGateCliDeps['runShardsAsync']>>>;
+      },
+    };
+    const result = await runSelfGateCliAsync(repo, { base: commit, shards: 1, fixedShardDistribution: true, trainGate: true }, dependencies);
+    expect(result.exitCode).toBe(0);
+    const path = gateShardLedgerPath(VERSION, instanceRoot);
+    const ledger = readGateShardLedger(path);
+    const rows = ledger?.rows.filter((row) => row.runId === runId) ?? [];
+    expect(rows.some((row) => row.state === 'done' && row.shardId === 'shard-1'), 'train self-gate raw row must be queryable by release run id').toBe(true);
+    expect(rows.map((row) => row.state)).toEqual(['pending', 'running', 'done', 'done']);
+    expect(rows.every((row) => row.entrypoint === 'train' && row.invocationId)).toBe(true);
+    expect(rows[0]).toMatchObject({ version: VERSION, commit, phase: 'cut', executor: 'host', files: [TEST_FILE] });
+    expect(ledger?.malformed).toBe(0);
+    expect(ledger?.incompleteBatches).toEqual([]);
+
+    const beforeDefaultShardRun = shardRuns;
+    expect((await runSelfGateCliAsync(repo, { base: commit, trainGate: true }, dependencies)).exitCode).toBe(0);
+    expect(shardRuns).toBe(beforeDefaultShardRun + 1);
+
+    retryShard = true;
+    const retried = await runSelfGateCliAsync(repo, { base: commit, shards: 1, fixedShardDistribution: true, trainGate: true }, dependencies);
+    expect(retried.exitCode).toBe(0);
+    const retryRows = readGateShardLedger(path)!.rows.filter((row) => row.runId === runId).slice(-6);
+    expect(retryRows.map((row) => row.state)).toEqual(['pending', 'running', 'retry', 'running', 'done', 'done']);
+    expect(retryRows[1]!.attemptId).not.toBe(retryRows[3]!.attemptId);
+
+    omitRetryCompletion = true;
+    await expect(runSelfGateCliAsync(repo, { base: commit, shards: 1, fixedShardDistribution: true, trainGate: true }, dependencies))
+      .rejects.toThrow('HQ shard lifecycle is incomplete (shard-1)');
+    omitRetryCompletion = false;
+    omitRetryRunning = true;
+    await expect(runSelfGateCliAsync(repo, { base: commit, shards: 1, fixedShardDistribution: true, trainGate: true }, dependencies))
+      .rejects.toThrow('HQ shard lifecycle is incomplete (shard-1)');
+    omitRetryRunning = false;
+    retryShard = false;
+
+    failShard = true;
+    const failed = await runSelfGateCliAsync(repo, { base: commit, shards: 1, fixedShardDistribution: true, trainGate: true }, dependencies);
+    expect(failed.exitCode).toBe(1);
+    const failedLedger = readGateShardLedger(path)!;
+    expect(failedLedger.rows.filter((row) => row.runId === runId).slice(-4).map((row) => row.state))
+      .toEqual(['pending', 'running', 'failed', 'failed']);
+    expect(failedLedger.incompleteBatches).toEqual([]);
+
+    failShard = false;
+    omitLifecycle = true;
+    await expect(runSelfGateCliAsync(repo, { base: commit, shards: 1, fixedShardDistribution: true, trainGate: true }, dependencies))
+      .rejects.toThrow('HQ shard lifecycle is incomplete (shard-1)');
+
+    omitLifecycle = false;
+    omitReturnedAttempt = true;
+    await expect(runSelfGateCliAsync(repo, { base: commit, shards: 1, fixedShardDistribution: true, trainGate: true }, dependencies))
+      .rejects.toThrow('HQ shard lifecycle is incomplete (shard-1)');
+    omitReturnedAttempt = false;
+
+    skipTestSelection = true;
+    await expect(runSelfGateCliAsync(repo, { base: commit, trainGate: true }, dependencies))
+      .rejects.toThrow('remote train self-gate refused: no test shard was selected');
+    skipTestSelection = false;
+
+    writeFileSync(path, '{unterminated');
+    await expect(runSelfGateCliAsync(repo, { base: commit, shards: 1, fixedShardDistribution: true, trainGate: true }, dependencies))
+      .rejects.toThrow('unterminated JSONL row');
+  } finally {
+    const restore = (key: string, value: string | undefined) => { if (value === undefined) delete process.env[key]; else process.env[key] = value; };
+    restore('ELANOUS_STATE_DIR', saved.stateDir);
+    restore('ELANOUS_STATE_DIR_SOURCE', saved.stateSource);
+    restore('ELANOUS_GRAPH_CONTEXT', saved.graphContext);
+    restore('ELANOUS_GATE_REMOTE_CHILD', saved.remoteChild);
+    restore('ELANOUS_TRAIN_GATE', saved.trainGate);
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

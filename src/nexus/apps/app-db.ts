@@ -6,6 +6,7 @@ import type { AppManifest } from './app-contract.js';
 import { projectAppLifecycleSnapshot, validateAppLifecycleEvent, type AppLifecycleEvent, type AppLifecycleSnapshot } from './app-lifecycle-ledger.js';
 import { appObjectKey } from '../../storage/object-store.js';
 import { getElanousConfigDir } from '../../elanous-config-dir.js';
+import type { NexusEventBus } from '../api/event-bus.js';
 import { nexusRootDir } from '../paths.js';
 import { sqlNowIso } from '../../time/db-window.js';
 import { createAppDbBackupService, type AppDbBackupOptions, type AppDbBackupService, type AppDbBackupStatus } from './app-db-backup.js';
@@ -140,6 +141,390 @@ export function createAppLifecycleStore(databasePath = join(nexusRootDir(), 'app
     },
     close() { if (!closed) { closed = true; db.close(); } },
   };
+}
+
+type AppRowChange = { appSlug: string; table: string; operation: 'insert' | 'update' | 'delete'; rowId: string; row: Record<string, unknown> };
+type RowSnapshot = { physicalId: string; rowId: string; row: Record<string, unknown> };
+type LoggedChange = { sequence: number; app_slug: string; table_name: string; operation: AppRowChange['operation']; row_id: string; previous_row_id: string | null; row_json: string };
+
+const CHANGE_LOG = '_elanous_app_row_changes';
+const CHANGE_ROW_IDS = '_elanous_app_row_ids';
+
+function installChangeTriggers(db: Database, slug: string, manifest: Manifest): void {
+  db.exec(`CREATE TEMP TABLE IF NOT EXISTS ${identifier(CHANGE_LOG)} (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT, app_slug TEXT NOT NULL, table_name TEXT NOT NULL,
+    operation TEXT NOT NULL, row_id TEXT NOT NULL, previous_row_id TEXT, row_json TEXT NOT NULL
+  )`);
+  const needsSyntheticIds = Object.values(manifest.tables ?? {}).some(declaration => {
+    const columns = Object.keys(declaration.columns ?? {});
+    return !['_rowid_', 'rowid', 'oid'].some(candidate => !columns.some(name => name.toLowerCase() === candidate));
+  });
+  if (needsSyntheticIds) {
+    db.exec(`CREATE TEMP TABLE IF NOT EXISTS ${identifier(CHANGE_ROW_IDS)} (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, row_json TEXT NOT NULL
+    )`);
+  }
+  for (const [table, declaration] of Object.entries(manifest.tables ?? {})) {
+    const columns = Object.keys(declaration.columns ?? {});
+    const jsonFrom = (reference: string) => `json_object(${columns.map(name => {
+      const column = `${reference}${identifier(name)}`;
+      // SQLite JSON rejects BLOBs. Represent them losslessly as a tagged hex object.
+      const value = `json(CASE WHEN typeof(${column}) = 'blob' THEN json_object('$blobHex', hex(${column})) ELSE json_quote(${column}) END)`;
+      return `'${name.replaceAll("'", "''")}', ${value}`;
+    }).join(', ')})`;
+    const json = (prefix: 'NEW' | 'OLD') => jsonFrom(`${prefix}.`);
+    const primary = Object.entries(declaration.columns ?? {}).find(([, column]) => column.primary === true)?.[0];
+    const physical = ['_rowid_', 'rowid', 'oid'].find(candidate => !columns.some(name => name.toLowerCase() === candidate));
+    const physicalId = (prefix: 'NEW' | 'OLD') => `CAST(${prefix}.${identifier(physical!)} AS TEXT)`;
+    const tableKey = `${slug}/${table}`;
+    const mappedId = (prefix: 'NEW' | 'OLD', newest = false) => `(SELECT 'rowid:' || sequence FROM ${identifier(CHANGE_ROW_IDS)}
+      WHERE table_name = '${tableKey.replaceAll("'", "''")}' AND row_json = ${json(prefix)} ORDER BY sequence ${newest ? 'DESC' : 'ASC'} LIMIT 1)`;
+    const needsMap = (prefix: 'NEW' | 'OLD') => primary ? `${prefix}.${identifier(primary)} IS NULL` : '1';
+    const keyedId = (prefix: 'NEW' | 'OLD') => {
+      const value = `CAST(${prefix}.${identifier(primary!)} AS TEXT)`;
+      return `CASE WHEN substr(${value}, 1, 6) = 'rowid:' OR substr(${value}, 1, 4) = 'key:'
+        THEN 'key:' || ${value} ELSE ${value} END`;
+    };
+    const rowId = (prefix: 'NEW' | 'OLD') => physical
+      ? primary ? `CASE WHEN ${needsMap(prefix)} THEN 'rowid:' || ${physicalId(prefix)} ELSE ${keyedId(prefix)} END` : physicalId(prefix)
+      : primary ? `CASE WHEN ${needsMap(prefix)} THEN ${mappedId(prefix)} ELSE ${keyedId(prefix)} END` : mappedId(prefix);
+    const insertSyntheticId = (prefix: 'NEW' | 'OLD') => `INSERT INTO ${identifier(CHANGE_ROW_IDS)} (table_name, row_json)
+      SELECT '${tableKey.replaceAll("'", "''")}', ${json(prefix)} WHERE ${needsMap(prefix)};`;
+
+    if (!physical) {
+      const where = primary ? ` WHERE ${identifier(primary)} IS NULL` : '';
+      const existing = db.query(`SELECT ${jsonFrom('')} AS row_json FROM ${identifier(table)}${where}`).all() as Array<{ row_json: string }>;
+      for (const row of existing) db.query(`INSERT INTO ${identifier(CHANGE_ROW_IDS)} (table_name, row_json) VALUES (?, ?)`)
+        .run(tableKey, row.row_json);
+    }
+    for (const operation of ['insert', 'update', 'delete'] as const) {
+      const trigger = identifier(`__elanous_app_${operation}_${table}`);
+      const prefix = operation === 'delete' ? 'OLD' : 'NEW';
+      const updateNewId = operation === 'insert' && !physical
+        ? primary ? `CASE WHEN ${needsMap('NEW')} THEN ${mappedId('NEW', true)} ELSE ${keyedId('NEW')} END` : mappedId('NEW', true)
+        : operation === 'update' && !physical
+          ? primary
+            ? `CASE WHEN ${needsMap('NEW')} THEN CASE WHEN ${needsMap('OLD')} THEN ${mappedId('OLD')} ELSE ${mappedId('NEW', true)} END ELSE ${keyedId('NEW')} END`
+            : mappedId('OLD')
+          : rowId(prefix);
+      const updatePreviousId = operation === 'update' && !physical
+        ? primary ? `CASE WHEN ${needsMap('OLD')} THEN ${mappedId('OLD')} ELSE ${keyedId('OLD')} END` : mappedId('OLD')
+        : operation === 'insert' ? 'NULL' : rowId('OLD');
+      const beforeLog = operation === 'insert' && !physical ? insertSyntheticId('NEW')
+        : operation === 'update' && !physical ? `INSERT INTO ${identifier(CHANGE_ROW_IDS)} (table_name, row_json)
+          SELECT '${tableKey.replaceAll("'", "''")}', ${json('NEW')} WHERE ${needsMap('NEW')} AND NOT (${needsMap('OLD')});`
+        : '';
+      const afterLog = operation === 'update' && !physical
+        ? `UPDATE ${identifier(CHANGE_ROW_IDS)} SET row_json = ${json('NEW')} WHERE sequence =
+            (SELECT sequence FROM ${identifier(CHANGE_ROW_IDS)} WHERE table_name = '${tableKey.replaceAll("'", "''")}' AND row_json = ${json('OLD')} ORDER BY sequence LIMIT 1)
+              AND ${needsMap('OLD')} AND ${needsMap('NEW')};
+          DELETE FROM ${identifier(CHANGE_ROW_IDS)} WHERE sequence =
+            (SELECT sequence FROM ${identifier(CHANGE_ROW_IDS)} WHERE table_name = '${tableKey.replaceAll("'", "''")}' AND row_json = ${json('OLD')} ORDER BY sequence LIMIT 1)
+              AND ${needsMap('OLD')} AND NOT (${needsMap('NEW')});`
+        : operation === 'delete' && !physical
+          ? `DELETE FROM ${identifier(CHANGE_ROW_IDS)} WHERE sequence =
+              (SELECT sequence FROM ${identifier(CHANGE_ROW_IDS)} WHERE table_name = '${tableKey.replaceAll("'", "''")}' AND row_json = ${json('OLD')} ORDER BY sequence LIMIT 1)
+                AND ${needsMap('OLD')};`
+          : '';
+      db.exec(`CREATE TEMP TRIGGER IF NOT EXISTS ${trigger} AFTER ${operation.toUpperCase()} ON ${identifier(table)}
+        BEGIN ${beforeLog}
+          INSERT INTO ${identifier(CHANGE_LOG)} (app_slug, table_name, operation, row_id, previous_row_id, row_json)
+          VALUES ('${slug.replaceAll("'", "''")}', '${table.replaceAll("'", "''")}', '${operation}', ${updateNewId}, ${updatePreviousId}, ${json(prefix)});
+          ${afterLog}
+        END`);
+    }
+  }
+}
+
+function eventValue(value: unknown): unknown {
+  if (!(value instanceof Uint8Array)) return value;
+  return { $blobHex: Array.from(value, byte => byte.toString(16).padStart(2, '0')).join('').toUpperCase() };
+}
+
+function snapshotRows(db: Database, manifest: Manifest): Map<string, RowSnapshot[]> {
+  const snapshot = new Map<string, RowSnapshot[]>();
+  for (const [table, declaration] of Object.entries(manifest.tables ?? {})) {
+    const columns = Object.entries(declaration.columns ?? {});
+    const primary = columns.find(([, column]) => column.primary === true)?.[0];
+    const physical = ['_rowid_', 'rowid', 'oid'].find(candidate => !columns.some(([name]) => name.toLowerCase() === candidate));
+    let alias = '__elanous_snapshot_physical_id';
+    while (columns.some(([name]) => name === alias)) alias += '_';
+    let jsonAlias = '__elanous_snapshot_row_json';
+    while (columns.some(([name]) => name === jsonAlias) || jsonAlias === alias) jsonAlias += '_';
+    const rowJson = `json_object(${columns.map(([name]) => {
+      const column = identifier(name);
+      const value = `json(CASE WHEN typeof(${column}) = 'blob' THEN json_object('$blobHex', hex(${column})) ELSE json_quote(${column}) END)`;
+      return `'${name.replaceAll("'", "''")}', ${value}`;
+    }).join(', ')})`;
+    const physicalProjection = physical ? `${identifier(physical)} AS ${identifier(alias)}, ` : '';
+    const rows = db.query(`SELECT ${physicalProjection}${rowJson} AS ${identifier(jsonAlias)}, * FROM ${identifier(table)}`).all() as Array<Record<string, unknown>>;
+    const syntheticIds = physical ? new Map<string, string[]>() : new Map<string, string[]>();
+    if (!physical) {
+      const tableKey = `${manifest.slug}/${table}`;
+      const mapped = db.query(`SELECT sequence, row_json FROM ${identifier(CHANGE_ROW_IDS)} WHERE table_name = ? ORDER BY sequence`)
+        .all(tableKey) as Array<{ sequence: number; row_json: string }>;
+      for (const entry of mapped) {
+        const ids = syntheticIds.get(entry.row_json) ?? [];
+        ids.push(`rowid:${entry.sequence}`);
+        syntheticIds.set(entry.row_json, ids);
+      }
+    }
+    snapshot.set(table, rows.map(raw => {
+      const row = Object.fromEntries(Object.entries(raw).filter(([name]) => name !== alias && name !== jsonAlias).map(([name, value]) => [name, eventValue(value)]));
+      const physicalId = physical ? String(raw[alias]) : syntheticIds.get(String(raw[jsonAlias]))?.shift() ?? 'unmapped';
+      const value = primary ? raw[primary] : undefined;
+      const textValue = value == null ? undefined : String(value);
+      const rowId = primary
+        ? textValue == null ? physical ? `rowid:${physicalId}` : physicalId
+          : textValue.startsWith('rowid:') || textValue.startsWith('key:') ? `key:${textValue}` : textValue
+        : physicalId;
+      return { physicalId, rowId, row };
+    }));
+  }
+  return snapshot;
+}
+
+function containsReplaceStatement(sql: string): boolean {
+  const tokens: string[] = [];
+  for (let index = 0; index < sql.length;) {
+    const char = sql[index]!;
+    const next = sql[index + 1];
+    if (/\s/.test(char)) { index++; continue; }
+    if (char === '-' && next === '-') {
+      index += 2;
+      while (index < sql.length && sql[index] !== '\n') index++;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      const end = sql.indexOf('*/', index + 2);
+      if (end < 0) return false;
+      index = end + 2;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === '`' || char === '[') {
+      const close = char === '[' ? ']' : char;
+      index++;
+      while (index < sql.length) {
+        if (sql[index] === close) {
+          if (char !== '[' && sql[index + 1] === close) { index += 2; continue; }
+          index++;
+          break;
+        }
+        index++;
+      }
+      continue;
+    }
+    if (/[A-Za-z_]/.test(char)) {
+      const start = index++;
+      while (index < sql.length && /[A-Za-z0-9_$]/.test(sql[index]!)) index++;
+      tokens.push(sql.slice(start, index).toUpperCase());
+      continue;
+    }
+    index++;
+  }
+  return tokens.some((token, index) => ((token === 'INSERT' || token === 'UPDATE') && tokens[index + 1] === 'OR' && tokens[index + 2] === 'REPLACE')
+    || (token === 'REPLACE' && tokens[index + 1] === 'INTO'));
+}
+
+type UniqueIndex = { terms: Array<{ expression: string; collation: string }>; where?: string };
+type SqlSourceToken = { value: string; start: number; end: number; kind: 'word' | 'symbol' | 'string' };
+
+function sqlSourceTokens(sql: string): SqlSourceToken[] | undefined {
+  const tokens: SqlSourceToken[] = [];
+  for (let index = 0; index < sql.length;) {
+    const char = sql[index]!;
+    const next = sql[index + 1];
+    if (/\s/u.test(char)) { index++; continue; }
+    if (char === '-' && next === '-') { index += 2; while (index < sql.length && sql[index] !== '\n') index++; continue; }
+    if (char === '/' && next === '*') { const end = sql.indexOf('*/', index + 2); if (end < 0) return undefined; index = end + 2; continue; }
+    if (char === "'" || char === '"' || char === '`' || char === '[') {
+      const start = index;
+      const close = char === '[' ? ']' : char;
+      index++;
+      let closed = false;
+      while (index < sql.length) {
+        if (sql[index] === close) {
+          if (char !== '[' && sql[index + 1] === close) { index += 2; continue; }
+          index++;
+          closed = true;
+          break;
+        }
+        index++;
+      }
+      if (!closed) return undefined;
+      tokens.push({ value: sql.slice(start + 1, index - 1), start, end: index, kind: char === "'" ? 'string' : 'word' });
+      continue;
+    }
+    if (/[A-Za-z_]/u.test(char)) {
+      const start = index++;
+      while (index < sql.length && /[A-Za-z0-9_$]/u.test(sql[index]!)) index++;
+      tokens.push({ value: sql.slice(start, index), start, end: index, kind: 'word' });
+      continue;
+    }
+    tokens.push({ value: char, start: index, end: index + 1, kind: 'symbol' });
+    index++;
+  }
+  return tokens;
+}
+
+function uniqueIndexDefinition(sql: string): { terms: string[]; where?: string } | undefined {
+  const tokens = sqlSourceTokens(sql);
+  if (!tokens) return undefined;
+  const on = tokens.findIndex(token => token.kind === 'word' && token.value.toUpperCase() === 'ON');
+  if (on < 0) return undefined;
+  const open = tokens.findIndex((token, index) => index > on && token.value === '(');
+  if (open < 0) return undefined;
+  let depth = 0;
+  let close = -1;
+  for (let index = open; index < tokens.length; index++) {
+    if (tokens[index]!.kind === 'symbol' && tokens[index]!.value === '(') depth++;
+    else if (tokens[index]!.kind === 'symbol' && tokens[index]!.value === ')' && --depth === 0) { close = index; break; }
+  }
+  if (close < 0) return undefined;
+  const spans: Array<[number, number]> = [];
+  let termStart = tokens[open]!.end;
+  depth = 0;
+  for (let index = open + 1; index < close; index++) {
+    const token = tokens[index]!;
+    if (token.kind === 'symbol' && token.value === '(') depth++;
+    else if (token.kind === 'symbol' && token.value === ')') depth--;
+    else if (token.kind === 'symbol' && token.value === ',' && depth === 0) { spans.push([termStart, token.start]); termStart = token.end; }
+  }
+  spans.push([termStart, tokens[close]!.start]);
+  const terms = spans.map(([start, end]) => sql.slice(start, end).trim().replace(/\s+(?:ASC|DESC)\s*$/iu, ''));
+  const whereToken = tokens.slice(close + 1).find(token => token.kind === 'word' && token.value.toUpperCase() === 'WHERE');
+  const where = whereToken ? sql.slice(whereToken.end).replace(/;\s*$/u, '').trim() : undefined;
+  return { terms, ...(where ? { where } : {}) };
+}
+
+function uniqueKeys(db: Database, table: string): UniqueIndex[] {
+  const indexes = db.query(`PRAGMA index_list(${identifier(table)})`).all() as Array<{ name: string; unique: number; partial: number }>;
+  const keys: UniqueIndex[] = [];
+  for (const index of indexes.filter(candidate => Number(candidate.unique) === 1)) {
+    const columns = db.query(`PRAGMA index_xinfo(${identifier(index.name)})`).all() as Array<{ key: number; name: string | null; coll: string | null }>;
+    const key = columns.filter(column => Number(column.key) === 1);
+    const stored = db.query("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?").get(index.name) as { sql: string | null } | null;
+    const definition = stored?.sql ? uniqueIndexDefinition(stored.sql) : undefined;
+    if (Number(index.partial) === 1 && !definition?.where) continue;
+    const terms = key.map((column, position) => ({
+      expression: column.name ? identifier(column.name) : definition?.terms[position] ?? '',
+      collation: column.coll ?? 'BINARY',
+    }));
+    if (!terms.length || terms.some(term => !term.expression || !['BINARY', 'NOCASE', 'RTRIM'].includes(term.collation.toUpperCase()))) continue;
+    keys.push({ terms, ...(Number(index.partial) === 1 && definition?.where ? { where: definition.where } : {}) });
+  }
+  return keys;
+}
+
+function sqlRowProjection(row: Record<string, unknown>): { sql: string; values: unknown[] } {
+  const entries = Object.entries(row);
+  const values = entries.map(([, value]) => {
+    if (typeof value === 'object' && value !== null && '$blobHex' in value) {
+      const hex = String((value as { $blobHex: unknown }).$blobHex);
+      return Uint8Array.from(hex.match(/.{2}/gu)?.map(byte => Number.parseInt(byte, 16)) ?? []);
+    }
+    return value;
+  });
+  return { sql: entries.map(([name], index) => `? AS ${identifier(name)}`).join(', '), values };
+}
+
+function uniqueIndexValues(db: Database, row: Record<string, unknown>, index: UniqueIndex): unknown[] | undefined {
+  const projection = sqlRowProjection(row);
+  if (!projection.sql) return undefined;
+  const selected = index.terms.map((term, position) => `(${term.expression}) AS ${identifier(`key_${position}`)}`);
+  if (index.where) selected.push(`CASE WHEN (${index.where}) THEN 1 ELSE 0 END AS ${identifier('__included')}`);
+  let result: Record<string, unknown> | null;
+  try {
+    result = db.query(`SELECT ${selected.join(', ')} FROM (SELECT ${projection.sql}) AS ${identifier('__elanous_index_row')}`)
+      .get(...projection.values as never[]) as Record<string, unknown> | null;
+  } catch {
+    // Legacy indexes may reference columns omitted from the current manifest; skip only that inference.
+    return undefined;
+  }
+  if (!result || (index.where && Number(result.__included) !== 1)) return undefined;
+  return index.terms.map((_, position) => result[`key_${position}`]);
+}
+
+function sqliteValuesEqual(db: Database, left: unknown, right: unknown, collation: string): boolean {
+  if (left == null || right == null) return false;
+  const result = db.query(`SELECT ? = ? COLLATE ${identifier(collation)} AS equal`).get(left as never, right as never) as { equal: number };
+  return Number(result.equal) === 1;
+}
+
+function conflictsOnUniqueKey(db: Database, left: Record<string, unknown>, right: Record<string, unknown>, keys: UniqueIndex[], leftId: string, rightId: string): boolean {
+  return leftId === rightId || keys.some(index => {
+    const leftValues = uniqueIndexValues(db, left, index);
+    const rightValues = uniqueIndexValues(db, right, index);
+    return leftValues !== undefined && rightValues !== undefined && index.terms.every((term, position) =>
+      sqliteValuesEqual(db, leftValues[position], rightValues[position], term.collation));
+  });
+}
+
+function inferReplaceDeletes(
+  db: Database,
+  manifest: Manifest,
+  snapshots: Map<string, RowSnapshot[]>,
+  changes: LoggedChange[],
+): LoggedChange[] {
+  const active = new Map([...snapshots].map(([table, rows]) => [table, rows.map(row => ({ rowId: row.rowId, row: row.row }))]));
+  const keysByTable = new Map([...snapshots.keys()].map(table => [table, uniqueKeys(db, table)]));
+  const ordered: LoggedChange[] = [];
+  for (const change of changes) {
+    const rows = active.get(change.table_name);
+    if (!rows) { ordered.push(change); continue; }
+    if (change.operation === 'delete') {
+      active.set(change.table_name, rows.filter(row => row.rowId !== change.row_id));
+      ordered.push(change);
+      continue;
+    }
+    const nextRow = JSON.parse(change.row_json) as Record<string, unknown>;
+    const previousId = change.previous_row_id ?? change.row_id;
+    const updating = change.operation === 'update' ? rows.find(row => row.rowId === previousId) : undefined;
+    const conflicts = rows.filter(row => row !== updating
+      && conflictsOnUniqueKey(db, row.row, nextRow, keysByTable.get(change.table_name) ?? [], row.rowId, change.row_id));
+    for (const conflict of conflicts) {
+      const syntheticId = /^rowid:(\d+)$/u.exec(conflict.rowId);
+      const declaration = manifest.tables?.[change.table_name];
+      const columns = Object.keys(declaration?.columns ?? {});
+      const hasPhysicalRowId = ['_rowid_', 'rowid', 'oid'].some(candidate => !columns.some(name => name.toLowerCase() === candidate));
+      if (syntheticId && !hasPhysicalRowId) db.query(`DELETE FROM ${identifier(CHANGE_ROW_IDS)} WHERE table_name = ? AND sequence = ?`)
+        .run(`${manifest.slug}/${change.table_name}`, Number(syntheticId[1]));
+      ordered.push({
+        sequence: change.sequence - 0.5, app_slug: change.app_slug, table_name: change.table_name,
+        operation: 'delete', row_id: conflict.rowId, previous_row_id: null, row_json: JSON.stringify(conflict.row),
+      });
+    }
+    const remaining = rows.filter(row => !conflicts.includes(row));
+    if (change.operation === 'update' && updating) {
+      const updated = { rowId: change.row_id, row: nextRow };
+      const position = remaining.indexOf(updating);
+      if (position < 0) remaining.push(updated); else remaining[position] = updated;
+    } else {
+      remaining.push({ rowId: change.row_id, row: nextRow });
+    }
+    active.set(change.table_name, remaining);
+    ordered.push(change);
+  }
+  return ordered;
+}
+
+function hasReplaceTriggers(db: Database): boolean {
+  const triggers = db.query("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND sql IS NOT NULL").all() as Array<{ sql: string }>;
+  return triggers.some(trigger => containsReplaceStatement(trigger.sql));
+}
+
+function hasReplaceConstraints(db: Database): boolean {
+  const tables = db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL").all() as Array<{ sql: string }>;
+  return tables.some(({ sql }) => {
+    const words = sqlSourceTokens(sql)?.filter(token => token.kind === 'word').map(token => token.value.toUpperCase()) ?? [];
+    return words.some((word, index) => word === 'ON' && words[index + 1] === 'CONFLICT' && words[index + 2] === 'REPLACE');
+  });
+}
+
+function isSqliteConstraintError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = (error as Error & { code?: unknown }).code;
+  return (typeof code === 'string' && code.startsWith('SQLITE_CONSTRAINT')) || /constraint failed/iu.test(error.message);
 }
 
 function identifier(value: string): string { return `"${value.replaceAll('"', '""')}"`; }
@@ -440,11 +825,15 @@ function schema(db: Database, manifest: Manifest): void {
 /** Opens durable, app-isolated SQLite files and executes only contract-declared RPCs. */
 export function createAppDatabase(
   manifests: readonly AppManifest[],
-  options: { readonly directory?: string; readonly backup?: Omit<AppDbBackupOptions, 'appSlug' | 'databasePath' | 'database'> } = {},
+  options: {
+    readonly directory?: string;
+    readonly eventBus?: Pick<NexusEventBus, 'publishAppRowChange'>;
+    readonly backup?: Omit<AppDbBackupOptions, 'appSlug' | 'databasePath' | 'database'>;
+  } = {},
 ): AppDatabase {
   const root = options.directory ?? join(getElanousConfigDir(), 'nexus', 'apps');
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  const apps = new Map<string, { db: Database; rpc: Map<string, Rpc> }>();
+  const apps = new Map<string, { db: Database; rpc: Map<string, Rpc>; manifest: Manifest }>();
   const backups = new Map<string, AppDbBackupService>();
   try {
     for (const value of manifests) {
@@ -467,6 +856,7 @@ export function createAppDatabase(
         db.exec('PRAGMA journal_mode = WAL');
         db.exec('PRAGMA foreign_keys = ON');
         schema(db, manifest);
+        installChangeTriggers(db, manifest.slug, manifest);
         databaseInitialized = true;
       };
       try {
@@ -490,7 +880,7 @@ export function createAppDatabase(
         db.close();
         throw error;
       }
-      apps.set(manifest.slug, { db, rpc: new Map(Object.entries(manifest.rpc ?? {})) });
+      apps.set(manifest.slug, { db, rpc: new Map(Object.entries(manifest.rpc ?? {})), manifest });
     }
   } catch (error) {
     for (const backup of backups.values()) backup.close();
@@ -524,9 +914,56 @@ export function createAppDatabase(
       const writeRpc = isWriteSql(declaration.sql);
       if (writeRpc) backup?.assertWritesAllowed();
       const statement = app.db.query(declaration.sql);
-      const rows = statement.all(bound as never) as unknown[];
-      if (writeRpc) backups.get(slug)?.captureWal();
-      return rows;
+      const before = (app.db.query(`SELECT COALESCE(MAX(sequence), 0) AS sequence FROM ${identifier(CHANGE_LOG)}`).get() as { sequence: number }).sequence;
+      // Explicit statements, triggers, and table constraints can all cause implicit REPLACE deletes.
+      const replaceSnapshots = (options.eventBus && (containsReplaceStatement(declaration.sql) || hasReplaceTriggers(app.db) || hasReplaceConstraints(app.db)))
+        ? snapshotRows(app.db, app.manifest)
+        : undefined;
+      const savepoint = identifier('_elanous_app_rpc');
+      app.db.exec(`SAVEPOINT ${savepoint}`);
+      let result: unknown[];
+      let changes: LoggedChange[];
+      try {
+        result = statement.all(bound as never) as unknown[];
+        changes = app.db.query(`SELECT sequence, app_slug, table_name, operation, row_id, previous_row_id, row_json FROM ${identifier(CHANGE_LOG)} WHERE sequence > ? ORDER BY sequence`).all(before) as LoggedChange[];
+        if (replaceSnapshots) changes = inferReplaceDeletes(app.db, app.manifest, replaceSnapshots, changes);
+        if (changes.some(change => change.sequence > before && change.sequence < Number.MAX_SAFE_INTEGER)) {
+          app.db.query(`DELETE FROM ${identifier(CHANGE_LOG)} WHERE sequence > ?`).run(before);
+        }
+        app.db.exec(`RELEASE ${savepoint}`);
+      } catch (error) {
+        let partial = app.db.query(`SELECT sequence, app_slug, table_name, operation, row_id, previous_row_id, row_json FROM ${identifier(CHANGE_LOG)} WHERE sequence > ? ORDER BY sequence`).all(before) as LoggedChange[];
+        if (isSqliteConstraintError(error) && partial.length > 0) {
+          // SQLite's FAIL algorithm preserves earlier row changes from the same statement.
+          // ABORT removes that statement's trigger rows, so this path only keeps real partial writes.
+          if (replaceSnapshots) partial = inferReplaceDeletes(app.db, app.manifest, replaceSnapshots, partial);
+          app.db.query(`DELETE FROM ${identifier(CHANGE_LOG)} WHERE sequence > ?`).run(before);
+          app.db.exec(`RELEASE ${savepoint}`);
+          for (const change of partial) {
+            try {
+              options.eventBus?.publishAppRowChange({
+                appSlug: change.app_slug, table: change.table_name, operation: change.operation,
+                rowId: change.row_id, row: JSON.parse(change.row_json) as Record<string, unknown>,
+              });
+            } catch { /* preserve SQLite's committed partial result if event delivery fails */ }
+          }
+          if (writeRpc) backup?.captureWal();
+          throw error;
+        }
+        try { app.db.exec(`ROLLBACK TO ${savepoint}`); } catch { /* OR ROLLBACK may already have removed the savepoint */ }
+        try { app.db.exec(`RELEASE ${savepoint}`); } catch { /* preserve the original SQLite error */ }
+        throw error;
+      }
+      for (const change of changes) {
+        try {
+          options.eventBus?.publishAppRowChange({
+            appSlug: change.app_slug, table: change.table_name, operation: change.operation,
+            rowId: change.row_id, row: JSON.parse(change.row_json) as Record<string, unknown>,
+          });
+        } catch { /* the RPC is already committed; delivery failures must not report a rollback */ }
+      }
+      if (writeRpc) backup?.captureWal();
+      return result;
     },
     backupStatus(slug) { return backups.get(slug)?.status() ?? null; },
     createBackupSnapshot(slug) { return backups.get(slug)?.createSnapshot() ?? false; },

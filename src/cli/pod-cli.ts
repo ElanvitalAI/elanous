@@ -10,7 +10,7 @@ import { putPodShelfImage, listPodShelfImages, type PodShelfImage } from '../tas
 import { defaultRemoteRun } from '../task-orchestrator/surfaces/pod-pool.js';
 import { debug } from '../debug/log.js';
 import { readPodMemoryAdvice } from './pod-memory-advice.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
 import { parsePodPool, resolvePodPoolSpec, podPoolHostLease, type PoolKubectl } from '../task-orchestrator/surfaces/pod-pool.js';
 import { leaseKubectl, measurePoolLease, probePoolDns, probePoolGitHub, recommendConcurrency, type PoolLeaseMeasure, type PoolDnsProbe, type ExternalGitHubProbe } from '../task-orchestrator/surfaces/pod-lease.js';

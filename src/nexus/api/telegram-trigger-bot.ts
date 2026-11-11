@@ -30,7 +30,7 @@ import type { UserConfig } from '../../user-config/types.js';
 import { registerMissionHitlCallback } from '../../autopilot/mission-hitl-callback.js';
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { debug } from '../../debug/log.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { registerSurfaceSink, registerStreamingSink } from '../../session/session-fanout.js';
 import { parseTelegramEndpoint, isOwnInstanceEndpoint, matchesBot } from '../../session/session-endpoint-key.js';
 import { createTelegramStreamSink } from '../../session/streaming/telegram-stream-sink.js';

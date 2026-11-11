@@ -152,4 +152,16 @@ describe('acquireLockAsync — 탈취를 보유자가 안다 (fail-closed)', () 
     lock.release();
     expect(existsSync(lockPath)).toBe(false);
   });
+
+  test('breakDeadHolder does not evict a live async holder just because its heartbeat is old', async () => {
+    // Source: #36315 short fixture lease and old mtime force stale-age path while owner PID stays alive.
+    const lock = await acquireLockAsync(lockPath, { staleMs: 50, breakDeadHolder: true });
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lockPath, old, old);
+    // Source: #36315 retry bounds make the held-lock timeout deterministic in the fixture.
+    await expect(acquireLockAsync(lockPath, { staleMs: 50, breakDeadHolder: true, maxTries: 3, retryBusyMs: 5 }))
+      .rejects.toThrow(/timed out/);
+    expect(lock.stillHeld()).toBe(true);
+    lock.release();
+  });
 });

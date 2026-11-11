@@ -18,7 +18,7 @@ import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { spawnElanous } from '../instance/spawn-elanous.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { resyncPendingPath, resyncPendingRecoveryPath } from './resync-tick.js';
 
 export const REJUDGE_TICK_EVENT = 'rejudge-tick';

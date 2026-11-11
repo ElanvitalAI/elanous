@@ -62,6 +62,8 @@ export interface ShardRunMode {
   hostResources?: { cores: number; freeMemoryGiB: number; freeTmpGiB: number; load1?: number };
   /** Observation after each bundle's first current+baseline attempt; never controls retries or verdict. */
   onShardComplete?: (progress: ShardRunProgress) => void;
+  /** Durable observers (for example the HQ gate ledger) receive lifecycle transitions before the runner returns. */
+  onShardLifecycle?: (event: ShardRunLifecycleEvent) => void;
   /** Maximum concurrently active shard bundles. The default is three, bounded to one through four. */
   concurrency?: number;
 }
@@ -73,6 +75,11 @@ export interface ShardRunProgress {
   completedFiles: number;
   totalFiles: number;
 }
+
+export type ShardRunLifecycleEvent =
+  | { type: 'planned'; shard: GateTestShard; at: string }
+  | { type: 'running'; shard: GateTestShard; attempt: number; at: string }
+  | { type: 'attempt'; shard: GateTestShard; attempt: GateShardAttempt; state: 'retry' | 'done' | 'failed'; at: string };
 
 function hostResources(): ShardRunMode['hostResources'] | undefined {
   try {
@@ -232,7 +239,7 @@ export function runShardedGateTests(
     try { fixed = planFixedGateTestShards(files, count); }
     catch (error) { return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [], reason: String(error), distribution: 'fixed' }; }
     debug.log('self-dev.shard', 'fixed-distribution', { shards: fixed.length, files: fixed.reduce((sum, shard) => sum + shard.files.length, 0) });
-    return { ...runPlannedShards(cwd, fixed, baseRef, run, baselineWorktree, mode.onShardComplete), distribution: 'fixed' };
+    return { ...runPlannedShards(cwd, fixed, baseRef, run, baselineWorktree, mode), distribution: 'fixed' };
   }
   const rss = new Map<string, number>();
   const seconds = new Map<string, number>();
@@ -269,7 +276,7 @@ export function runShardedGateTests(
       const fixed = planFixedGateTestShards(files, maxCount);
       debug.log('self-dev.shard', 'host-cap-fixed-fallback', { requested: count, cap: maxCount,
         files: new Set(files).size, reason, measurementFailures: measurementFailures ?? 0 });
-      return { ...runPlannedShards(cwd, fixed, baseRef, run, baselineWorktree, mode.onShardComplete), distribution: 'fixed-cap-fallback',
+      return { ...runPlannedShards(cwd, fixed, baseRef, run, baselineWorktree, mode), distribution: 'fixed-cap-fallback',
         fallbackReason: reason, ...(measurementFailures ? { measurementFailures } : {}) };
     } catch (error) {
       return { aggregate: { status: 'unmeasured', retryShardIds: [] }, shards: [], attempts: [],
@@ -302,7 +309,7 @@ export function runShardedGateTests(
     requested: count, planned: shards.length, files: new Set(files).size, budgetGiB,
     measurementFailures: measurementFailures ?? 0,
   });
-  return { ...runPlannedShards(cwd, shards, baseRef, run, baselineWorktree, mode.onShardComplete), ...(plannedCount > count ? { expandedFrom: count } : {}), ...(measurementFailures ? { measurementFailures } : {}) };
+  return { ...runPlannedShards(cwd, shards, baseRef, run, baselineWorktree, mode), ...(plannedCount > count ? { expandedFrom: count } : {}), ...(measurementFailures ? { measurementFailures } : {}) };
 }
 
 /** Shared by the measured and the fixed planner: current + baseline per shard, one retry round, one aggregate. */
@@ -312,7 +319,7 @@ function runPlannedShards(
   baseRef: string,
   run: ShardProcess,
   baselineWorktree: typeof withBaselineWorktree,
-  onShardComplete?: ShardRunMode['onShardComplete'],
+  mode: ShardRunMode,
 ): ShardRunResult {
   const attempts: GateShardAttempt[] = [];
   const failureEvidence: ShardFailureEvidence[] = [];
@@ -327,6 +334,7 @@ function runPlannedShards(
     const treeReadable = (() => { try { return statSync(dir).isDirectory(); } catch { return false; } })();
     const atBase = (shard: GateTestShard) => treeReadable ? shard.files.filter((file) => !absentAtBaseline(join(dir, file))) : [...shard.files];
     let pending = shards;
+    for (const shard of shards) mode.onShardLifecycle?.({ type: 'planned', shard, at: new Date().toISOString() });
     let completedFiles = 0;
     const totalFiles = new Set(shards.flatMap((shard) => shard.files)).size;
     for (let round = 1; round <= 2 && pending.length; round++) {
@@ -340,6 +348,7 @@ function runPlannedShards(
           debug.log('self-dev.shard', 'baseline-files-absent', { shardId: shard.id, round, absent: shard.files.filter((file) => !baselineFiles.includes(file)) });
         }
         const shardStartedAt = performance.now();
+        mode.onShardLifecycle?.({ type: 'running', shard, attempt: round, at: new Date().toISOString() });
         const current = runSafely(cwd, shard.files);
         const base = baselineFiles.length ? runSafely(dir, baselineFiles) : { exitCode: 0 };
         keepFailure(shard.id, 'current', round, shard.files, current);
@@ -356,15 +365,20 @@ function runPlannedShards(
           baselineFiles,
           currentRoot: cwd, baselineRoot: dir,
         });
-        if (round === 1 && onShardComplete) {
+        if (round === 1 && mode.onShardComplete) {
           completedFiles += shard.files.length;
           try {
-            onShardComplete({ shardId: shard.id, completedShards: attempts.length,
+            mode.onShardComplete({ shardId: shard.id, completedShards: attempts.length,
               totalShards: shards.length, completedFiles, totalFiles });
           } catch { /* progress is observation only */ }
         }
       }
       const retry = new Set(aggregateGateTestShards(shards, attempts).retryShardIds);
+      for (const shard of pending) {
+        const attempt = attempts.filter((entry) => entry.shardId === shard.id).at(-1);
+        if (attempt) mode.onShardLifecycle?.({ type: 'attempt', shard, attempt,
+          state: retry.has(shard.id) ? round === 2 ? 'failed' : 'retry' : 'done', at: new Date().toISOString() });
+      }
       pending = shards.filter((shard) => retry.has(shard.id));
     }
     return aggregateGateTestShards(shards, attempts);
@@ -426,9 +440,10 @@ export async function runShardedGateTestsAsync(
   // planning-only aggregate, so this phase never launches a shard or creates a baseline worktree.
   const planningOnlyBaseline = (() => ({ status: 'passed' as const, retryShardIds: [] })) as unknown as typeof withBaselineWorktree;
   const planned = runShardedGateTests(cwd, files, baseRef, count, (_cwd, selected) => samples.get(selected[0]!) ?? { exitCode: null },
-    planningOnlyBaseline, budgetGiB, { ...mode, ...(resources ? { hostResources: resources } : {}) });
+    planningOnlyBaseline, budgetGiB, { ...mode, onShardLifecycle: undefined, ...(resources ? { hostResources: resources } : {}) });
   if (planned.reason) return { ...planned, concurrency, concurrencyReason: selectedConcurrency.reason, measurementMs, bundleMs: 0 };
   const shards = planned.shards;
+  for (const shard of shards) mode.onShardLifecycle?.({ type: 'planned', shard, at: new Date().toISOString() });
   const attempts: GateShardAttempt[] = [];
   const failureEvidence: ShardFailureEvidence[] = [];
   const bundlesStartedAt = performance.now();
@@ -461,6 +476,7 @@ export async function runShardedGateTestsAsync(
           const index = next++;
           if (index >= pending.length) return;
           const shard = pending[index]!;
+          mode.onShardLifecycle?.({ type: 'running', shard, attempt: round, at: new Date().toISOString() });
           const baselineFiles = atBase.get(shard.id)!;
           if (baselineFiles.length < shard.files.length) {
             debug.log('self-dev.shard', 'baseline-files-absent', { shardId: shard.id, round,
@@ -503,6 +519,12 @@ export async function runShardedGateTestsAsync(
       attempts.push(...roundAttempts);
       for (const evidence of roundEvidence) failureEvidence.push(...evidence);
       const retry = new Set(aggregateGateTestShards(shards, attempts).retryShardIds);
+      for (let index = 0; index < pending.length; index++) {
+        const shard = pending[index]!;
+        const attempt = roundAttempts[index];
+        if (attempt) mode.onShardLifecycle?.({ type: 'attempt', shard, attempt,
+          state: retry.has(shard.id) ? round === 2 ? 'failed' : 'retry' : 'done', at: new Date().toISOString() });
+      }
       pending = shards.filter((shard) => retry.has(shard.id));
     }
     return aggregateGateTestShards(shards, attempts);

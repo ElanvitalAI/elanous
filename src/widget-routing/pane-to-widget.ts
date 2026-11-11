@@ -2,9 +2,8 @@
 //
 // Phase 0 stub. Phase 2+ populates this table as widgets are migrated
 // from dashboard-local inline handlers to widget-owned behaviors. A
-// widget id like `wd-playground` maps to pane id `playground`, letting
-// the router delegate `router.dispatch('playground', key)` to
-// `widgetHost.get('wd-playground').onKey(...)` via a generic handler
+// widget ids map to pane ids, letting the router delegate key events
+// to the widget host through a generic handler
 // that the dashboard registers (still in Phase 0 territory — the
 // handler body stays in dashboard.ts).
 //

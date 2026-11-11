@@ -4,15 +4,13 @@ import type { ToastStack } from '../../ui/widgets/toast-stack.js';
 import type { Printer } from '../../ui/printer.js';
 import type { PopoverRegistrar } from '../../surface/adapters/popover-wiring.js';
 import type { PillBound, PillName } from '../../status/pills.js';
-import type { HoverTarget, HoverTracker } from '../../ui/hover-tracker.js';
-import type { ContextKeyService } from '../../input-core/context-keys.js';
 import type { ThemeTokens } from '../../theme/tokens.js';
 import type { WorkspaceHost } from '../../display/workspace-host.js';
 import type { ConversationPopupHost } from '../../conv-dash/popup-host.js';
 import type { ConversationPopupSummary, GitSegmentState, RunningBuildState, ShellRollupSummary, BackgroundJobsSummary, VwSummary } from '../../status/bar.js';
 import type { StatusProviderInfo } from '../../status/status-provider-info.js';
 import type { RotationEntry } from '../../user-config/types.js';
-import type { PaneWindowPreset, SurfaceCatalogPreset, ShellRollupEntry, ViewPreset } from '../../mouse-action-recipes.js';
+import type { ViewPreset } from '../../mouse-action-recipes.js';
 
 export type DockItemBound =
   | { kind: 'menu'; startCol: number; endCol: number }
@@ -124,11 +122,6 @@ export interface DashboardMouseWiringDeps {
   getRecentWds: () => string[];
   /** Switch to a picked wd. Can be async. */
   setSessionWd: (path: string) => void | Promise<void>;
-  /** Dock area launcher targets for "Add Window". */
-  getDockMenuWindowTargets?: () => PaneWindowPreset[];
-  onOpenDockWindow?: (paneId: string) => void | Promise<void>;
-  getDockMenuSurfaceTargets?: () => SurfaceCatalogPreset[];
-  onOpenDockSurface?: (surfaceId: string) => void | Promise<void>;
   onToggleChatOnly?: () => void | Promise<void>;
   onExitProgram?: () => void | Promise<void>;
   /** Dashboard views exposed through the dock area picker. */
@@ -161,13 +154,6 @@ export interface DashboardMouseWiringDeps {
    *  workspace contains docked entries, the wiring opens an anchored
    *  restore popup and delegates the picked `surfaceId` here. */
   onWorkspaceRestore?: (surfaceId: string) => void | Promise<void>;
-  /** SRF-4 — return the live shell-runner handles for the rollup pill
-   *  popup. Empty list is fine (popup still opens with a "no handles"
-   *  toast). Omit to make the pill a no-op visual. */
-  getShellRollupEntries?: () => ShellRollupEntry[];
-  /** SRF-4 — user picked a handle in the rollup popup. Host runs the
-   *  same decideAttach flow as `/shell attach`. */
-  onShellRollupPick?: (handleId: string) => void;
   /** VW-U3 — access the currently-foreground modal surface (typically
    *  a VirtualWindow). When mouse clicks land inside the modal's bounds
    *  we dispatch through surface.onMouse so the VW can focus the
@@ -207,70 +193,14 @@ export interface DashboardMouseWiringDeps {
   /** A1 — current active mode, read fresh when the pill popup opens
    *  (so the user sees the correct selection highlighted). */
   getActiveMode?: () => 'general' | 'sync' | 'control';
-  /** IDX-5 Phase 1 — ContextKeyService singleton. When provided, the
-   *  wiring creates an internal HoverTracker, feeds it on every
-   *  mouse event, and bridges hover-stable → ContextKeys
-   *  (hoverTargetKind / hoverTooltip) + Tooltip auto-show.
-   *  Omit for tests / headless paths that don't need hover. */
-  ctx?: ContextKeyService;
-  /** IDX-5 — injectable HoverTracker. Tests pass a tracker built
-   *  with a fake timer to drive stable-hover deterministically; at
-   *  runtime wiring creates its own via createHoverTracker(). */
-  hoverTracker?: HoverTracker;
-  /** Hover popup gate. The essential dashboard supplies `() => false`;
-   *  omitted gates continue to show tooltips for other hosts. */
-  hoverPopupsEnabled?: () => boolean;
-  /** IDX-5 — override the per-pill tooltip text map. Callers can
-   *  hide a tooltip by returning null. Default map covers the
-   *  current pill names. */
-  pillTooltipText?: (name: PillName) => string | null;
   /** IDX-5 Phase 2 — right-click-on-pill handler. The wiring hands
    *  the pill name + 0-indexed terminal coordinates of the click so
    *  the host can call `registry.showMenu(handleForPill(name), pos)`.
    *  Omit and right-clicks on pills fall through to the default modal
    *  forward branch (pre-Phase-2 behaviour). */
   onPillRightClick?: (name: PillName, pos: { x: number; y: number }) => void;
-  /** IDX-F5d Phase 2 (2026-04-22) — pane-body hover dispatcher. When
-   *  provided, the wiring auto-subscribes to its internal HoverTracker
-   *  and translates pane-body hover-enter / -leave / -over / -stable
-   *  events into `widgetHost.dispatchHover(paneId, widgetEv)` calls.
-   *
-   *  Dashboard wires this to `widgetHost.dispatchHover.bind(widgetHost)`.
-   *  Headless / test harnesses omit it; tracker still fires for tests
-   *  that subscribe directly.
-   *
-   *  Shape: the wiring emits a widget-level `WidgetHoverEvent` (from
-   *  widget-types.ts) — consumer must keep the type import since
-   *  dashboard-mouse-wiring deliberately doesn't import widget-types
-   *  to preserve its layering (mouse wiring is lower than widget
-   *  host). We use a structural type to avoid the import. */
-  dispatchHoverToWidget?: (
-    paneId: string,
-    event:
-      | { kind: 'hover-enter'; hit: unknown }
-      | { kind: 'hover-leave'; hit: unknown }
-      | { kind: 'hover-over'; hit: unknown; row: number; col: number }
-      | { kind: 'hover-stable'; hit: unknown },
-  ) => void;
-  /** P1 Bundle C — dashboard-level pane hover observer. Lets the host
-   *  surface pane-body hover metadata (HUD, status-bar, analytics)
-   *  without reaching into the internal HoverTracker directly. */
-  onPaneHoverEvent?: (
-    event:
-      | { kind: 'hover-enter'; target: HoverTarget }
-      | { kind: 'hover-leave'; target: HoverTarget }
-      | { kind: 'hover-over'; target: HoverTarget; x: number; y: number }
-      | { kind: 'hover-stable'; target: HoverTarget },
-  ) => void;
-  /** IDX-6 round-2 — live theme accessor. When provided, the
-   *  auto-mounted Tooltip surface resolves its muted prefix from the
-   *  current theme. Evaluated lazily per tooltip so /theme switch
-   *  during a session reflows the next tooltip correctly. */
+  /** IDX-6 round-2 — live theme accessor for popup chrome. */
   getTheme?: () => ThemeTokens | null | undefined;
-  /** Disable dashboard hover hint popups/context-key hover copy
-   *  wholesale. Keeps mouse hover passive while preserving click
-   *  routing. */
-  suppressHoverHints?: boolean;
   workspaceHost?: WorkspaceHost;
   conversationPopupHost?: ConversationPopupHost;
   onConversationPopupPick?: (sessionId: string) => void | Promise<void>;
@@ -337,7 +267,7 @@ export interface DashboardMouseWiringDeps {
    *  dispatch). */
   getModalHitTarget?: DashboardMousePreflightModalClassifier;
   /** Bundle A · A2 — SurfaceRegistry popover registrar. Injected so
-   *  pill popups (wd picker · mode switcher · shell rollup · …)
+   *  pill popups (wd picker · mode switcher · …)
    *  register as `{kind:'popover'}` alongside the existing modal-tier
    *  registration, letting LLM `GetUIState({kind:'popover'})` /
    *  `ObserveSurface({kind:'popover'})` tools distinguish transient
@@ -369,13 +299,6 @@ export interface DashboardMouseWiring {
    *  chain. This keeps input-core and drag consumers aligned on the
    *  same `ev.hitTarget` snapshot for a given frame. */
   preflightHitTarget(ev: DisplayMouseEvent): HitTarget | undefined;
-  /** F6 / S1.D — resolve the tooltip text that would appear if the
-   *  pointer hovered over the given hit. Reads the wiring's existing
-   *  `pillTooltipText` resolver for `pill` kinds; returns null for
-   *  every other kind (no provider registered yet). Used by the
-   *  GetHoverTooltip LLM tool runtime so an LLM can ask "what does
-   *  the model pill say?" without needing to first synthesise a hover. */
-  getTooltipFor(target: HitTarget): string | null;
   /** Wire into dispatchDashboardKey — returns 'consumed' when an
    *  active popup processed the key, 'passthrough' otherwise. */
   routeKey(key: KeyEvent): 'consumed' | 'passthrough';
@@ -389,7 +312,7 @@ export interface DashboardMouseWiring {
   /** Access to the ToastStack singleton — dashboard can push manual
    *  toasts (non-pill actions) if desired. */
   toasts(): ToastStack;
-  /** IDX-5 Phase 1 — release hover-tracker timer + tooltip presenter.
+  /** IDX-5 Phase 1 — release the hover-tracker timer.
    *  Idempotent. Dashboard calls this at shutdown so the internal
    *  setTimeout + listener set don't keep the process alive. */
   dispose(): void;
@@ -419,6 +342,5 @@ export interface DashboardMouseWiring {
       anchorCol: number;
       anchorRow: number;
     } | null;
-    hoverActiveTooltipId: string | null;
   };
 }

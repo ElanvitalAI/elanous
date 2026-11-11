@@ -175,7 +175,6 @@ test('queue cell references and PR work exclude candidates even without a second
   expect(result.seats[1]).toMatchObject({ queued: 0, target: 5, short: 5, wouldAuthor: [
     { cellId: 'TC-B', version: '0.2.16' },
   ] });
-  expect(readFileSync(new URL('./author-depth.ts', import.meta.url), 'utf8').includes('addHarnessQueue')).toBe(false);
 });
 
 test('collecting a shadow decision leaves the isolated real queue storage unchanged', async () => {

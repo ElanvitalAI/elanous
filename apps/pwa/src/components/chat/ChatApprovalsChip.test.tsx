@@ -171,13 +171,16 @@ test('switching clients hides old cards immediately and ignores a late old-clien
   expect(decisions).toEqual([]);
 });
 
-test('wide ChatLayout places the approvals chip after SeatsNowStrip without an extra wrapper', async () => {
+test('wide ChatLayout keeps approvals after the folded activity details', async () => {
   const request = async (path: string) => json(path.includes('decisions') ? { decisions: [] } : { items: [] });
   const daemon = { client: { fetchResponse: request, fetchJson: async () => ({ messages: [] }), voiceWsUrl: () => '', connectAcp: () => { throw Error('offline'); } } as never, config: { baseUrl: '', token: '', provider: '' }, sessionId: '', setConfig: () => {}, setSessionId: () => {} };
   Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { innerWidth: 1024, location: { search: '' }, sessionStorage: { getItem: () => null } }) });
   await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatLayout /></DaemonContext.Provider>); });
   const children = tree!.root.findByType(ChatLayout).findByType('div').children.filter((child): child is ReactTestRenderer['root'] => typeof child !== 'string');
-  const strip = children.findIndex(child => child.type === SeatsNowStrip);
-  expect(strip).toBeGreaterThanOrEqual(0);
-  expect(children[strip + 1]!.findAllByType(ChatApprovalsChip)).toHaveLength(1);
+  const details = children.findIndex(child => child.type === 'details');
+  // Source: #36166 ChatLayout renders the folded activity details before the approvals chip.
+  expect(details).toBeGreaterThanOrEqual(0);
+  expect(children[details]!.findAllByType(SeatsNowStrip)).toHaveLength(1);
+  expect(children[details]!.findByType('summary').children.join('')).toBe('자세히');
+  expect(children[details + 1]!.findAllByType(ChatApprovalsChip)).toHaveLength(1);
 });

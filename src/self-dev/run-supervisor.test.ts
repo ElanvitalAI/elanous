@@ -1,14 +1,17 @@
 import { test, expect, describe, spyOn } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readTaskCard, writeTaskCards, type TaskCard } from '../task-agent/task-hand.js';
 import { rejudgeCardOnHead } from '../task-agent/rejudge-on-head.js';
 import * as rejudgeOnHead from '../task-agent/rejudge-on-head.js';
 import { saveSelfDevRun, loadSelfDevRun, selfDevRunsDir } from './run-store.js';
-import { decideNextRun, superviseRun, rejudgeTerminalTaskCard, madeProgress, countLanded, countBaseCompleted, appendRound, noPrStreakKey, needsHumanRepairReason, needsHumanRepairGoal, SUPERVISOR_STOP_REASONS, mineFailurePatterns, bindPatternMineKey, patternMineLivesFromRounds, patternMineSignaturesFromDecision, type SupervisorRound, type SupervisorStopReason, type SupervisorJobResult } from './run-supervisor.js';
+import { decideNextRun, detectBoundaryRejectLoop, superviseRun, rejudgeTerminalTaskCard, madeProgress, countLanded, countBaseCompleted, appendRound, noPrStreakKey, needsHumanRepairReason, needsHumanRepairGoal, SUPERVISOR_STOP_REASONS, mineFailurePatterns, bindPatternMineKey, patternMineLivesFromRounds, patternMineSignaturesFromDecision, type SupervisorRound, type SupervisorStopReason, type SupervisorJobResult } from './run-supervisor.js';
+import { LogStore, logsDbPath, type LogStoreRow } from '../mss/logging/log-store.js';
+import type { LogRecord } from '../mss/logging/record.js';
+import { runLedgerPath } from '../self-implement/run-ledger.js';
 
 const merged = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'merged', merged: true }) as never;
 const worktreeCompleted = (id: string) => ({ taskId: id, feature: id, status: 'done', stage: 'worktree-completed' }) as never;
@@ -43,6 +46,91 @@ const falseFailure = (id: string) => ({
 }) as unknown as SupervisorJobResult;
 
 describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
+  test('HARNESS-BOUNDARY-REJECT-LOOP-GUARD: 같은 거부와 Bash 재호출을 잡아 재실행을 끊고 근거를 원장에 남긴다', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'supervisor-boundary-loop-'));
+    const runId = '6ad7e42b-5e8f-44cc-a5ab-8315b6d6d301';
+    const childRunId = 'run-solar-boundary-simulation';
+    const rows: LogStoreRow[] = [];
+    // Source: simulation recreates repeated tool dispatch and identical boundary rejection seen in SOLAR run-16104df2.
+    const repeatedEvents = 2;
+    const eventOrder: Array<{ type: 'dispatch'; tool: string; commandHash?: string } | { type: 'reject' }> = [
+      { type: 'dispatch', tool: 'Bash', commandHash: 'opaque-command-hash' },
+      { type: 'dispatch', tool: 'Read' },
+      { type: 'reject' },
+      { type: 'dispatch', tool: 'Bash', commandHash: 'opaque-command-hash' },
+      { type: 'dispatch', tool: 'Read' },
+      { type: 'reject' },
+    ];
+    // Source: this in-memory log fixture assigns unique monotonically increasing row ids.
+    let rowId = 0;
+    for (const event of eventOrder) {
+      rowId++;
+      if (event.type === 'dispatch') {
+        rows.push({ id: rowId, ts: '', ts_ms: rowId, level: 'info', instance: 'test', surface: 'cli', category: 'cli.agent', event: 'tool-dispatch', session_id: 'simulation-session', trace_id: null,
+          data: JSON.stringify({ runId: childRunId, tool: event.tool, ...(event.commandHash ? { commandHash: event.commandHash } : {}) }) });
+      } else {
+        rows.push({ id: rowId, ts: '', ts_ms: rowId, level: 'warn', instance: 'test', surface: 'harness', category: 'harness.boundary', event: 'main-tree-reject', session_id: 'simulation-session', trace_id: null,
+          data: JSON.stringify({ runId: childRunId, reasonKind: 'unknown-command', commandFirstToken: 'grep', commandAction: 'grep', commandHash: 'opaque-command-hash' }) });
+      }
+    }
+    expect(detectBoundaryRejectLoop(rows)).toMatchObject({ repeatedTool: 'Bash', repeatedRejections: repeatedEvents });
+    let secondBashDispatch: LogStoreRow | undefined;
+    for (const row of rows) {
+      if (row.category !== 'cli.agent' || row.event !== 'tool-dispatch' || typeof row.data !== 'string') continue;
+      const dispatch = JSON.parse(row.data) as { tool?: string; commandHash?: string };
+      if (dispatch.tool === 'Bash' && dispatch.commandHash) secondBashDispatch = row;
+    }
+    expect(detectBoundaryRejectLoop(rows.filter((row) => row.id !== secondBashDispatch?.id))).toBeNull();
+    let rerunCalls = 0;
+    // Source: the guard must stop before dispatching any repair round.
+    const expectedRerunCalls = 0;
+    const priorStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = stateDir;
+    try {
+      const writer = new LogStore(logsDbPath());
+      try {
+        writer.insertBatch(rows.map((row) => ({
+          rec: { ts: '2026-11-10T00:00:00.000Z', category: row.category, event: row.event,
+            data: row.data ? JSON.parse(row.data) : null, session_id: row.session_id ?? undefined } as LogRecord & { session_id?: string },
+          surface: row.surface,
+        })));
+      } finally { writer.close(); }
+      await superviseRun({
+        initial: [{ ...mysteryWithProposal('solar-child'), runId: childRunId, childRunId } as SupervisorJobResult],
+        runStore: { runId, dir: join(stateDir, 'run-ledger') },
+        promoteDecomposition: () => ({ reason: 'simulation-promotion', pieceCount: repeatedEvents }),
+        rerun: async (previous) => { rerunCalls++; return previous; },
+        sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+        taskAgentShadow: false,
+        taskAgentRejudge: false,
+      });
+      expect(rerunCalls).toBe(expectedRerunCalls);
+      const ledgerPath = runLedgerPath(runId, join(stateDir, 'run-ledger'));
+      const ledgerEntries = readFileSync(ledgerPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+      expect(ledgerEntries).toContainEqual(expect.objectContaining({ event: 'supervisor.boundary-reject-loop', data: expect.objectContaining({
+        reason: 'same-boundary-rejection-and-tool-call-repeated', childRunId,
+        repeatedTool: 'Bash', repeatedToolCalls: repeatedEvents, repeatedRejections: repeatedEvents,
+      }) }));
+
+      const successfulDecisions: Array<{ action: string; stopReason?: SupervisorStopReason }> = [];
+      await superviseRun({
+        initial: [{ taskId: 'already-landed', feature: 'already-landed', status: 'done', stage: 'merged', merged: true,
+          runId: childRunId, childRunId } as unknown as SupervisorJobResult],
+        runStore: { runId: '416e87d4-b206-4c11-93be-45f795f53980', dir: join(stateDir, 'run-ledger') },
+        rerun: async (previous) => previous,
+        sweepPendingMerges: async () => ({ pending: 0, merged: 0 }),
+        taskAgentShadow: false,
+        taskAgentRejudge: false,
+        onDecision: ({ action, stopReason }) => successfulDecisions.push({ action, stopReason }),
+      });
+      expect(successfulDecisions[0]).toEqual({ action: 'stop', stopReason: 'converged' });
+    } finally {
+      if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = priorStateDir;
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   test('REVIEW-ROUND-REAUTHOR: 장기 mock 리뷰는 저작 결함을 범위 축소 + FU 처방으로 분리한다', async () => {
     const results = [
       {

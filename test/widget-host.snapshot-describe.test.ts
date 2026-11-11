@@ -365,19 +365,5 @@ describe('built-in widget WR-2 opt-in (WR-4 · 6 more widgets)', () => {
     expect(desc).toContain('sink 7');
   });
 
-  test('playground widget — mode + cursor + size in hash + describe', async () => {
-    const { default: playgroundWidget } = await import('../src/playground/widget.js');
-    const host = makeHost();
-    host.register(playgroundWidget);
-    const inst = host.spawn({ type: 'playground' });
-    const h0 = host.snapshotHashFor(inst.id);
-    expect(host.describeSurfaceFor(inst.id)!).toContain('browse');
-    expect(host.describeSurfaceFor(inst.id)!).toContain('size medium');
-    const ctx = host.buildContext(inst.id)!;
-    ctx.setState({ mode: 'edit', previewSize: 'large' } as never);
-    expect(host.snapshotHashFor(inst.id)).not.toBe(h0);
-    const desc = host.describeSurfaceFor(inst.id)!;
-    expect(desc).toContain('edit');
-    expect(desc).toContain('size large');
-  });
+
 });

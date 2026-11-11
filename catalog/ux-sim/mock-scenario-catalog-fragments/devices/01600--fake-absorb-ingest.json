@@ -1,0 +1,14 @@
+{
+  "id": "fake-absorb-ingest",
+  "name": "Fake seven-kind ABSORB inbox and extractors",
+  "checklistCells": ["ABSORB-INGEST-CONTRACT", "ABSORB-INGEST-EXTRACT", "ABSORB-INGEST-CARD"],
+  "implementation": ["src/ux-sim/fake-absorb-ingest.ts", "src/intake-plane/absorb-extract.ts"],
+  "tests": ["src/ux-sim/fake-absorb-ingest.test.ts", "src/nexus/api/scraps.test.ts"],
+  "target": "Exercise all seven scrap input kinds, member-scoped inbox reads, extraction failure injection and deterministic no-BYOK summary cards.",
+  "inputs": ["Seven fixed scrap records", "Two member identities", "One injected extractor failure", "BYOK absent"],
+  "observations": ["All seven kinds produce extracted content and cards", "Member A cannot read member B records", "Injected extraction failure is recorded", "No BYOK uses deterministic summary fallback"],
+  "entryCommands": ["bun test src/ux-sim/fake-absorb-ingest.test.ts src/nexus/api/scraps.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

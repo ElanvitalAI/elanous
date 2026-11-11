@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-NEXT-TUI-ROUTE-DEVICE-TS",
+  "path": "src/ux-sim/next-tui-route-device.ts",
+  "boundary": "Routes fixed submissions and projects help through the production Next TUI route registry, including role, maturity and feature gates.",
+  "deviceIds": ["tui-interaction"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

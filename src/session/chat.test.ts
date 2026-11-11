@@ -65,6 +65,7 @@ afterAll(() => {
 
 const { runTurn } = await import('./chat.js');
 const coreTurnModule = await import('../core-turn/run-core-turn.js');
+const goalLoopModule = await import('../core-turn/run-goal-loop.js');
 
 function tool(name: string): LLMToolSpec {
   return {
@@ -76,6 +77,7 @@ function tool(name: string): LLMToolSpec {
 
 function testConfig(provider: LLMProvider, goalLoopEnabled = false) {
   return {
+    chat: {},
     llm: {
       provider: provider.name,
       model: provider.defaultModel,
@@ -96,6 +98,7 @@ async function runToolTurn(
     dispatchTool?: CoreTurnDispatchTool;
     goalLoopConfigEnabled?: boolean;
     sessionId?: string;
+    skipMemoryInjection?: boolean;
   },
 ): Promise<string> {
   const provider: LLMProvider = {
@@ -120,7 +123,7 @@ async function runToolTurn(
     sessionId: session.id,
     userText: extra?.userText ?? 'hello',
     systemPrompt: 'base prompt',
-    skipMemoryInjection: true,
+    skipMemoryInjection: extra?.skipMemoryInjection ?? true,
     tools,
     dispatchTool,
     provider,
@@ -176,6 +179,67 @@ describe('session chat terminal-capable turns', () => {
       output: 'captured',
       _imageFile: '/tmp/nonexistent-chat-test.png',
     });
+  });
+
+  test('routes a fresh stable TUI fact question through budget tier with no tools or memory lookup', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-simple-fast-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    const provider: LLMProvider = {
+      name: 'openai-codex', defaultModel: 'gpt-6.1-terra', available: () => true,
+      async *chat() { yield 'plain'; },
+      async *streamChat(messages, opts = {}) { directCalls.push({ messages, opts }); yield { type: 'text', delta: 'plain' } as const; },
+    };
+    activeProvider = provider;
+    const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+    await runTurn({
+      userConfig: testConfig(provider), sessionId: session.id, userText: '우리나라 가장 높은 빌딩?',
+      systemPrompt: 'base prompt', tools: [tool('ToolSearch')], provider,
+      dispatchTool: async () => { throw new Error('fast route must not dispatch tools'); },
+    });
+
+    expect(streamCalls).toHaveLength(0);
+    expect(directCalls).toHaveLength(1);
+    expect(directCalls[0]?.opts).toMatchObject({ model: 'gpt-6-luna', reasoningEffort: 'low' });
+    expect(directCalls[0]?.opts.tools).toBeUndefined();
+    expect(directCalls[0]?.messages.at(-1)).toMatchObject({ role: 'user', content: '우리나라 가장 높은 빌딩?' });
+  });
+
+  test('keeps action, volatile, and compound questions on the existing tool path', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-fast-route-rejections-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    chatTestSpies[0]?.mockClear();
+    chatTestSpies[1]?.mockClear();
+    for (const userText of [
+      'Can you delete the database?',
+      'Who is the president of South Korea?',
+      'What is 2+2 and 3+3?',
+      'What is my name?',
+      'What is in the repository?',
+      'What is the name of the user?',
+      'What is searchIndex in src/router.ts?',
+      'What is in src/router.ts?',
+      'What is 2+2? What is 3+3?',
+      'What is 2+2. What is 3+3?',
+    ]) {
+      await runToolTurn([tool('ToolSearch')], undefined, { userText, providerName: 'openai-codex', skipMemoryInjection: false });
+    }
+    expect(streamCalls).toHaveLength(10);
+    expect(directCalls).toHaveLength(0);
+    expect(streamCalls.every(call => call.opts.tools?.some(item => item.name === 'ToolSearch'))).toBe(true);
+    const personalQuestion = 'What is the name of the user?';
+    expect(Boolean(
+      chatTestSpies[0]?.mock.calls.some(([prompt]) => prompt === personalQuestion)
+      || chatTestSpies[1]?.mock.calls.some(([prompt]) => prompt === personalQuestion)
+    )).toBe(true);
+  });
+
+  test('keeps fast-route behavior disabled when no concrete provider tier is available', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-fast-route-no-tier-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    await runToolTurn([tool('ToolSearch')], undefined, { userText: '우리나라 가장 높은 빌딩?', providerName: 'auto' });
+    expect(streamCalls).toHaveLength(1);
+    expect(directCalls).toHaveLength(0);
+    expect(streamCalls[0]?.opts.tools?.some(item => item.name === 'ToolSearch')).toBe(true);
   });
 
   test('wires the request-size guard through Codex TUI tool turns', async () => {
@@ -653,6 +717,31 @@ describe('Next TUI research turn routing', () => {
     if (sessionRoot) rmSync(sessionRoot, { recursive: true, force: true });
     delete process.env.ELANOUS_SESSION_ROOT;
     activeProvider = undefined;
+  });
+
+  test('the chat entry passes the human utterance into the armed goal loop', async () => {
+    sessionRoot = mkdtempSync(join(tmpdir(), 'elanous-chat-goal-loop-carrier-'));
+    process.env.ELANOUS_SESSION_ROOT = sessionRoot;
+    const provider: LLMProvider = {
+      name: 'test-provider', defaultModel: 'test-model', available: () => true,
+      async *chat() { yield 'plain'; }, async *streamChat() { yield { type: 'text', delta: 'plain' } as const; },
+    };
+    activeProvider = provider;
+    const session = createSession({ provider: provider.name, model: provider.defaultModel, source: 'tui' });
+    const loop = spyOn(goalLoopModule, 'runGoalLoop').mockImplementation(async () => ({
+      finalText: 'loop reply', goalComplete: false, stopReason: 'max_iterations', iterations: 1,
+    }) as never);
+    try {
+      const result = await runTurn({
+        userConfig: testConfig(provider, false), sessionId: session.id,
+        userText: 'human research request', utteranceSurface: 'tui', systemPrompt: 'TUI prompt',
+        skipMemoryInjection: true, tools: [tool('Read')], dispatchTool: async () => 'read result', provider,
+        goalLoop: true, goalLoopMaxIterations: 1,
+      });
+      expect(loop).toHaveBeenCalledTimes(1);
+      expect(loop.mock.calls[0]?.[0].userText).toBe('human research request');
+      expect(result.text).toBe('loop reply');
+    } finally { loop.mockRestore(); }
   });
 
   test('uses the shared first-reply core turn with the across-turn goal loop disabled', async () => {

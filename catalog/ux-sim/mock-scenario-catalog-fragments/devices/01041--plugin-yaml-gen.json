@@ -1,0 +1,33 @@
+{
+  "id": "plugin-yaml-gen",
+  "name": "Declarative plugin YAML generation and installation",
+  "checklistCells": [
+    "PLUGIN-YAML-GEN"
+  ],
+  "implementation": [
+    "src/plugins/core/plugin-yaml.ts",
+    "scripts/plugins/generate-plugin-json.ts",
+    "src/ux-sim/plugin-yaml-gen-world.ts"
+  ],
+  "tests": [
+    "src/plugins/core/plugin-yaml.test.ts",
+    "src/ux-sim/plugin-yaml-gen-world.test.ts"
+  ],
+  "target": "Generates plugin.json from a code-free plugin.yaml and graph v2 headers, verifies generated and committed content match, then installs and reloads the absorb bundle.",
+  "inputs": [
+    "plugin.yaml metadata and graph asset paths",
+    "graph v2 headers with purpose, allow, policy and observe declarations"
+  ],
+  "observations": [
+    "graph manifests in generated JSON agree with declared graph assets",
+    "stale committed plugin.json is rejected",
+    "installed plugin reloads with its graph IDs and generic capability names"
+  ],
+  "entryCommands": [
+    "bun test src/plugins/core/plugin-yaml.test.ts src/ux-sim/plugin-yaml-gen-world.test.ts",
+    "bun scripts/plugins/generate-plugin-json.ts --check plugins/absorb"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

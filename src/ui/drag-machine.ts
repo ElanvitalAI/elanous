@@ -128,8 +128,7 @@ export class DragMachine {
    *  when no drag is active OR when the origin didn't declare a
    *  mode (legacy consumers). Drop-zone renderers and other
    *  consumers should default undefined to `'reorder'`, which
-   *  matches the pre-Phase-4 behavior of the only two existing
-   *  drag-origin views (DraggableList rows + TitleBar). */
+   *  matches the pre-Phase-4 behavior for drag-origin views. */
   currentMode(): DragMode | undefined {
     return this.state?.mode;
   }

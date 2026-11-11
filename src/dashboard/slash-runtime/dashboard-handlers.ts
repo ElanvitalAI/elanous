@@ -43,7 +43,7 @@
 //                   existing chatLines / chatScrollOffset / config
 //                   helpers. /shell adds a `shellSlash` ctx bundle
 //                   for shellSlashRuntime line formatters +
-//                   openRollupPopup + 2 vw-registry helpers
+//                   2 vw-registry helpers
 //                   (switchTo + resolveVwIdByLabel · used by attach
 //                   routing). getShellRegistry +
 //                   renderHandleStatusChip + decideAttach hoisted
@@ -200,9 +200,7 @@
 //                   tablet (compact-tight) mode. Reads viewport
 //                   compact level / product compact mode + the
 //                   `tabletModeManual` mutable host state; flips it
-//                   via setter; on `browser-preview` opens the modal
-//                   and exits the input loop. Threads `tablet` ctx
-//                   bundle (4 methods).
+//                   via setter. Threads `tablet` ctx bundle.
 //   B-2.j         — /playground — declarative scenario harness for
 //                   widget/dialog/picker/theme stress tests. The
 //                   command handler factory + harness factory have
@@ -827,7 +825,6 @@ export interface DashboardSlashContext {
     };
     setManual(value: boolean | null): void;
     requestRender(): void;
-    openBrowserPreviewModal(): void;
   };
 
   // B-2.e additions — /history viewer.
@@ -1058,7 +1055,7 @@ export interface DashboardSlashContext {
     run(args: readonly string[]): Promise<void>;
   };
 
-  // B-3.c.1 additions — /shell list/kill/attach/rollup. /local has no
+  // B-3.c.1 additions — /shell list/kill/attach. /local has no
   // bundle (all deps are static-imported helpers + existing ctx
   // chatLines / chatScrollOffset / color funcs / config helpers).
   shellSlash: {
@@ -1088,8 +1085,6 @@ export interface DashboardSlashContext {
       genericAttachWarningLine(reason: string): string;
       unknownSubcommandLine(sub: string): string;
     };
-    /** Open the shell-rollup popup (the same surface as the 🐚 pill). */
-    openRollupPopup(): Promise<void>;
     /** Switch the foreground virtual window to the given id. */
     virtualWindowsSwitchTo(windowId: number): void;
     /** Resolve a virtual-window id by spawn-title (used by /shell attach). */
@@ -1177,7 +1172,7 @@ export const DASHBOARD_SLASH_CATALOG_BASELINE = {
     'bg', 'cb', 'ce', 'child', 'clip', 'clipboard',
     'code-edit', 'compact', 'compress', 'cost', 'detail', 'dv',
     'harness-llm', 'intake', 'loop', 'me', 'memo',
-    'note', 'pause', 'plan-board', 'preview', 'pv', 'report',
+    'note', 'pause', 'preview', 'pv', 'report',
     'sh', 'shell', 'signal', 'signals', 'skill-reload',
     'skills-reload', 'spend', 'squeeze',
     'tk', 'tokens',
@@ -1755,21 +1750,6 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     ctx.setChatScrollOffset(-1);
   });
 
-  registry.register('plan-board', (_args, ctx) => {
-    // Wave P4b-1 — open the live plan-board widget as a modal popup.
-    // The widget already mirrors `subscribePlanUpdate` (wired in
-    // P3a) so the modal reflects the current PlanState live.
-    const handle = ctx.widgetModalPopup?.open?.({
-      widgetInstanceId: 'wd-plan-board',
-      modalType: 'plan-board-popup',
-      title: 'Plan board',
-    });
-    if (!handle) {
-      ctx.pushDebugLine(ctx.muted('  /plan-board: popup host not wired.'));
-      ctx.setChatScrollOffset(-1);
-    }
-  });
-
   registry.register('pause', async (_args, ctx) => {
     // Phase 1.1 (PLAN §4.1) — request a mid-turn pause. Sets a process-
     // singleton flag the next streamLLMWithTools dispatch round consumes;
@@ -2267,7 +2247,7 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
         //   ⛔ 그리고 「띄웠다」와 「끝났다」는 다른 값이다 — 이 표면은 «띄운 것»까지만 말한다.
         try {
           const { launchDevGoalFileDetached } = await import('../../self-implement/seams.js');
-          await launchDevGoalFileDetached({ goalFile: result.goalFile });
+          await launchDevGoalFileDetached({ goalFile: result.goalFile, noAutoMerge: true });
           ctx.chatLines.push(ctx.accent('  🚀 런을 띄웠다(백그라운드) — 이 화면을 닫아도 계속 돈다'));
           ctx.chatLines.push(ctx.muted('     관측: elanous logs --category self-implement --since 10m'));
         } catch (spawnError) {
@@ -4116,7 +4096,6 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
     //   /tablet off          → force OFF even on compact-tight
     //   /tablet toggle       → flip ON ↔ OFF (leaving auto if currently auto)
     //   /tablet auto         → clear the manual override, revert to viewport-driven
-    //   /tablet browser-preview|bp → open the Browser+Preview modal directly
     const sub = (args[0] || 'status').toLowerCase();
     const before = ctx.tablet.getState();
     if (sub === 'status' || sub === '' || sub === 'show') {
@@ -4126,7 +4105,7 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
           ? ctx.success(`on  (viewport=${before.level}; compact=${before.compactMode}; auto would be ${before.compactMode === 'compact-tight' ? 'ON' : 'off'})`)
           : ctx.warning(`off  (viewport=${before.level}; compact=${before.compactMode}; auto would be ${before.compactMode === 'compact-tight' ? 'ON' : 'off'})`);
       ctx.pushDebugLine(ctx.undo.bold(`  /tablet: ${stateLine}`));
-      ctx.pushDebugLine(ctx.muted('  subcommands: on | off | toggle | auto | status | browser-preview'));
+      ctx.pushDebugLine(ctx.muted('  subcommands: on | off | toggle | auto | status'));
     } else if (sub === 'on') {
       ctx.tablet.setManual(true);
       ctx.pushDebugLine(ctx.success('  ✓ tablet mode ON (log + input; others via Ctrl+M <pane>)'));
@@ -4144,15 +4123,8 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
       const after = ctx.tablet.getState();
       ctx.pushDebugLine(ctx.success(`  ✓ tablet mode auto (viewport=${after.level}; compact=${after.compactMode} ⇒ ${after.effective ? 'ON' : 'off'})`));
       ctx.tablet.requestRender();
-    } else if (sub === 'browser-preview' || sub === 'bp') {
-      ctx.tablet.openBrowserPreviewModal();
-      ctx.pushDebugLine(ctx.muted('  opened Browser + Preview modal'));
-      ctx.tablet.requestRender();
-      ctx.setExitInputLoop(true);
-      ctx.setChatScrollOffset(-1);
-      return;
     } else {
-      ctx.pushDebugLine(ctx.warning(`  /tablet: unknown subcommand "${sub}" — try on | off | toggle | auto | status | browser-preview`));
+      ctx.pushDebugLine(ctx.warning(`  /tablet: unknown subcommand "${sub}" — try on | off | toggle | auto | status`));
     }
     ctx.setChatScrollOffset(-1);
   });

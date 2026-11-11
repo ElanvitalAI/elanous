@@ -28,7 +28,7 @@ import {
 } from './mission-decompose-baseline.js';
 import { executeApprovedMission } from './mission-executor.js';
 import { deliverMissionPhases, type CourierDeps } from './track-courier.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { DecomposeCallable } from '../task-orchestrator/generator.js';
 import type { ProposedTask } from '../task-orchestrator/generator-schema.js';
 import { spawn } from 'node:child_process';

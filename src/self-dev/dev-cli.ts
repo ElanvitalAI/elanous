@@ -41,7 +41,7 @@ import type { SelfImplementResult } from '../self-implement/orchestrator.js';
 import { buildDeliverableTargets } from './deliverable-target-wiring.js';
 import { observeDeliverables, type DeliverableObservationResult, type DeliverableObservationTarget } from '../harness/deliverable-observation.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig, runWithUserConfigSnapshot } from '../user-config.js';
 import type { UserConfig } from '../user-config/types.js';
 import { resolveChildLlmPreference, type ChildLlmPreferenceInput, type ResolvedChildLlmPreference } from '../self-implement/child-llm-preference.js';
 import { applyLaunchOverloadFailover, codexProviderNamed } from '../oauth/overload-failover-launch.js';
@@ -212,10 +212,14 @@ export interface DevSelfRunSuperviseOptions {
   runId?: string;
   goalType?: string;
   deliverableDocument?: string;
+  /** Host-resolved launch configuration. A repair rerun must reuse this snapshot instead of resolving Pod
+   *  settings again from the repair worktree's cwd/config. The snapshot contains configuration only; credentials
+   *  remain behind the existing credential broker. */
+  launchConfigSnapshot?: UserConfig;
   observeDeliverables?: (targets: readonly DeliverableObservationTarget[]) => Promise<DeliverableObservationResult>;
   onDecision?: (decision: SupervisorDecision) => void;
   readProposals?: typeof readDecomposeProposals;
-  executePiece?: (feature: string, opts?: { base?: string }) => Promise<SelfImplementResult>;
+  executePiece?: (feature: string, opts?: { base?: string; launchConfigSnapshot?: UserConfig }) => Promise<SelfImplementResult>;
   pressParentSignals?: (goalFile: string) => DecisionSignalPressResult | Promise<DecisionSignalPressResult>;
   readSoftStopRequest?: typeof readSoftStopRequest;
   closeDraftPr?: (prUrl: string, comment: string, timeoutMs?: number) => boolean;
@@ -974,6 +978,10 @@ export async function executeDevSelfRun(
   initialResult?: SelfImplementResult,
 ): Promise<DevSelfRunExecution> {
   const enteredAtMs = Date.now();
+  // Direct callers that predate the explicit host handoff still get a single pre-run snapshot.
+  const launchConfigSnapshot = supervise
+    ? (supervise.launchConfigSnapshot ?? getUserConfig())
+    : undefined;
   let result: SelfImplementResult | undefined;
   let supervisorStopReason: SupervisorStopReason | undefined;
   let finalSupervisorDecision: SupervisorDecision | undefined;
@@ -1058,7 +1066,7 @@ export async function executeDevSelfRun(
     executedRounds = 1;
     if (!supervise) return { result };
 
-    const reasonRepairConfigured = getUserConfig().tools.selfImplement.supervisor?.reasonRepair === true;
+    const reasonRepairConfigured = launchConfigSnapshot?.tools.selfImplement.supervisor?.reasonRepair === true;
     const hasPieceExecutor = supervise.executePiece !== undefined;
     const reasonRepairEnabled = reasonRepairConfigured && hasPieceExecutor;
     const reasonRepairSkipReason = !reasonRepairConfigured ? 'disabled'
@@ -1222,7 +1230,12 @@ export async function executeDevSelfRun(
           const repaired: ReturnType<typeof asSupervisorJobResult>[] = [];
           for (const { job, goal } of repairJobs) {
             try { debug.log('self-dev.supervisor', 'oscillation-repair.executed', { surface: 'dev', taskId: job.taskId, chars: goal.length }); } catch { /* fail-open */ }
-            const repairResult = recordResult(await supervise.executePiece(goal));
+            const executeRepair = () => supervise.executePiece!(goal, {
+              ...(launchConfigSnapshot ? { launchConfigSnapshot } : {}),
+            });
+            const repairResult = recordResult(await (launchConfigSnapshot
+              ? runWithUserConfigSnapshot(launchConfigSnapshot, executeRepair)
+              : executeRepair()));
             retainConfirmedMerge(repairResult);
             if (shardResults === undefined) result = repairResult;
             if (honorChildSoftStop('relaunch', repairResult)) {

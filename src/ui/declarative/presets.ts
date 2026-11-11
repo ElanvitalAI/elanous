@@ -10,7 +10,6 @@ import {
   question,
   textAreaWidget,
   toastStackWidget,
-  tooltipWidget,
   type DeclarativeWidgetNode,
 } from './builder.js';
 import { encodeWidgetTree } from './encode.js';
@@ -65,28 +64,6 @@ const PRESETS: readonly WidgetLabPreset[] = [
         .setButtons([
           dialogButton('Approve').setShortcut('a').setStyle('primary'),
           dialogButton('Deny', 'deny').setShortcut('d'),
-        ]),
-    ],
-  },
-  {
-    id: 'hover-overlay',
-    title: 'Hover Overlay',
-    description: 'tooltip + toast showcase preset',
-    build: () => [
-      tooltipWidget('tooltip', 'Declarative hint').withId('hint').withCharacter('Hint')
-        .showCloseButton(false)
-        .setFooter('hover to reveal')
-        .animateEnter({ preset: 'fade', durationMs: 120 })
-        .setText('Move across the status pills to preview actions.')
-        .setTtl(10000),
-      toastStackWidget('Toasts').withId('notices').withCharacter('Overlay')
-        .showCloseButton(false)
-        .setFooter('success / warning / info')
-        .setPlacement('top-right')
-        .setItems([
-          { text: 'Saved widget spec', kind: 'success' },
-          { text: 'Theme switched', kind: 'info' },
-          { text: 'Retrying connection', kind: 'warning' },
         ]),
     ],
   },

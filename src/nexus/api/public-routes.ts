@@ -5,7 +5,8 @@
 // exemption + constant-time bearer). Static `/app/*` and `/` are outside
 // `/v1` and are not gate subjects.
 //
-// Callbacks and webhooks stay off this list:
+// Callbacks and webhooks stay off this static list. The HTTP gate checks
+// active, exact graph webhook routes with their own auth separately:
 //   - `handleHitlCallback` (`src/nexus/api/meta-api.ts`) calls `checkAuth`
 //     itself; it does not verify a callback signature or token of its own.
 //   - `checkAuth` (`src/workflow-runtime/triggers/webhook-router.ts`)
@@ -24,6 +25,22 @@ export interface PublicRoute {
 }
 
 export const PUBLIC_ROUTES: Array<PublicRoute> = [
+  { method: 'POST', match: 'exact', path: '/v1/tokens', selfVerified: true,
+    why: 'member key bearer is checked by the token API before minting a scoped access token' },
+  { method: 'POST', match: 'exact', path: '/v1/tokens/introspect', selfVerified: true,
+    why: 'relay.connect bearer is checked against current expiry, key revocation, plan and audience' },
+  { method: 'GET', match: 'exact', path: '/v1/member/keys', selfVerified: true,
+    why: 'member key listing verifies the revocable member session' },
+  { method: 'POST', match: 'exact', path: '/v1/member/keys', selfVerified: true,
+    why: 'member key creation verifies the revocable member session' },
+  { method: 'DELETE', match: 'prefix', path: '/v1/member/keys/', selfVerified: true,
+    why: 'member key revocation verifies the revocable member session and owner' },
+  { method: 'POST', match: 'prefix', path: '/v1/member/keys/', selfVerified: true,
+    why: 'member key rotation verifies the revocable member session and owner' },
+  { method: 'GET', match: 'exact', path: '/v1/member/tokens', selfVerified: true,
+    why: 'member token listing verifies the revocable member session' },
+  { method: 'DELETE', match: 'prefix', path: '/v1/member/tokens/', selfVerified: true,
+    why: 'member token revocation verifies the revocable member session and owner' },
   {
     method: 'GET',
     match: 'exact',
@@ -47,6 +64,14 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     why: 'member signup starts a server-side state+PKCE Google OAuth flow; consent and code inputs are validated by member API',
   },
   {
+    method: 'GET', match: 'exact', path: '/v1/scraps', selfVerified: true,
+    why: 'scrap reads resolve the member owner from the server-verified session before querying the shared intake ledger',
+  },
+  {
+    method: 'POST', match: 'exact', path: '/v1/scraps', selfVerified: true,
+    why: 'scrap writes ignore request memberId and resolve owner from the server-verified member session',
+  },
+  {
     method: 'GET', match: 'exact', path: '/v1/members', selfVerified: true,
     why: 'member profile uses only the revocable HttpOnly member-session cookie',
   },
@@ -59,12 +84,24 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     why: 'verified owner context is resolved from an app-bound session cookie or bearer by the member API',
   },
   {
+    method: 'GET', match: 'exact', path: '/v1/board', selfVerified: true,
+    why: 'member board data is filtered by the app-bound owner verified by /v1/members/owner',
+  },
+  {
+    method: 'POST', match: 'prefix', path: '/v1/board/', selfVerified: true,
+    why: 'board approval is accepted only from an app-bound owner session and an explicit approval decision',
+  },
+  {
     method: 'POST', match: 'exact', path: '/v1/members/app-slot', selfVerified: true,
     why: 'creating the one event-coded member app slot verifies its own member session',
   },
   {
     method: 'POST', match: 'exact', path: '/v1/members/app-slot/session', selfVerified: true,
     why: 'mobile owner session verifies a Google ID token against the configured native audiences and resolves subject, member, and app slot server-side',
+  },
+  {
+    method: 'POST', match: 'exact', path: '/v1/members/app-slot/exchange', selfVerified: true,
+    why: 'native app-slot session exchange consumes a short-lived state-bound Google callback code once and resolves its member and app slot server-side',
   },
   {
     method: 'DELETE', match: 'exact', path: '/v1/members', selfVerified: true,

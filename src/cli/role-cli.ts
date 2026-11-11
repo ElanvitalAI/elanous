@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { Command } from 'commander';
 import { interpretCasResult, isAbsentSaid, type CasOutcome } from '../roles/lease-cas.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { readMachineProfile, seatRank, validSeatRank } from '../roles/machine-profile.js';
 import {
   ROLE_LEASE_OBJECT_PATH, nextAccept, nextClaim, nextHandoff, nextRevert, parseRoleLease,

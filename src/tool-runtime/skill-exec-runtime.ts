@@ -6,7 +6,7 @@ import * as skillIndex from '../skills/index.js';
 import type { SkillIndexEntry } from '../skills/index.js';
 import { dirname } from 'node:path';
 import { resolveSkillName } from '../skills/name-match.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 import type { ToolRuntime } from './types.js';
 

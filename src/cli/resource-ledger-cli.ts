@@ -6,7 +6,7 @@ import { ensureAuthToken } from '../auth/acp-token.js';
 import { parseMachinePoolDeclarations, type MachinePoolDeclaration } from '../resource-ledger/machine-pool-inventory.js';
 import { assertResourceLedgerUrl } from '../../scripts/resource-ledger-url.js';
 import type { Command } from 'commander';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { parsePodPool, resolvePodPoolSpec } from '../task-orchestrator/surfaces/pod-pool.js';
 import { activeResourceLeases, parseResourceLedgerEvents, readResourceLedger, reconcileResourceLeases, reassignResourcePools, resourceLedgerPath, resourceMatrix,
   RESOURCE_LANES, type ResourceLane, type ResourceMeasurement } from '../resource-ledger/resource-ledger.js';

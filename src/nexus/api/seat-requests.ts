@@ -8,7 +8,7 @@ import { openMsgStore, canonicalSeatId } from '../../msg/msg-store.js';
 import { dispatchCeoTask, type CeoCommandDeps } from '../../seat-dispatch/ceo-commands.js';
 import { appendSeatRequestRows, withSeatRequestLedgerLock } from '../../seat-dispatch/seat-request-ledger.js';
 import { acknowledgeSeatAnswers, askSeat, deliverSeatAnswers, parseSeatAsk, type SeatAskDeps } from '../../seat-dispatch/seat-ask.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { submitIntakeWork } from '../../intake-plane/submit-intake-work.js';
 import { parseSeatAddress, resolveSeat } from '../../seat-address/seat-address.js';

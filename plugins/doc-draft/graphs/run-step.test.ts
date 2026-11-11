@@ -22,8 +22,7 @@ const fakeSource = `#!/usr/bin/env bun
 import { appendFileSync } from 'node:fs';
 const [command, ...args] = process.argv.slice(2);
 if (process.env.DOC_DRAFT_CALL_LOG) appendFileSync(process.env.DOC_DRAFT_CALL_LOG, JSON.stringify({command,args,cwd:process.cwd(),toolCwd:process.env.ELANOUS_TOOL_CWD ?? null})+'\\n');
-if (command !== 'ask') process.exit(2);
-if (process.env.DOC_DRAFT_NO_BARE && args.includes('--bare')) { console.error("unknown option '--bare'"); process.exit(1); }
+if (command !== 'llm') process.exit(2);
 const prompt = args.at(-1) || '';
 if (process.env.DOC_DRAFT_KEEP_NEUTRAL && !prompt.startsWith('Review this draft')) {
   const { mkdirSync, writeFileSync } = await import('node:fs');
@@ -31,7 +30,7 @@ if (process.env.DOC_DRAFT_KEEP_NEUTRAL && !prompt.startsWith('Review this draft'
   mkdirSync(process.cwd() + '/.elanous');
   writeFileSync(process.cwd() + '/.elanous/another-process.txt', 'keep this file');
 }
-if (process.env.DOC_DRAFT_FAIL_ASK) { console.error('ask unavailable'); process.exit(1); }
+if (process.env.DOC_DRAFT_FAIL_ASK) { console.error('llm unavailable'); process.exit(1); }
 if (prompt.startsWith('Review this draft')) {
   const reviews = process.env.DOC_DRAFT_CALL_LOG ? (await Bun.file(process.env.DOC_DRAFT_CALL_LOG).text()).split('\\n').filter(line => line.includes('Review this draft')).length : 1;
   console.log(JSON.stringify({reply:JSON.stringify({ok: !process.env.DOC_DRAFT_REJECT && !(process.env.DOC_DRAFT_REJECT_ONCE && reviews === 1),reason:'requested item missing'})}));
@@ -279,7 +278,7 @@ test('a Markdown link is not an unfilled placeholder (운영 실측 10-02 — [e
   } finally { bare.cleanup(); }
 }, 30000);
 
-test('ask runs from an empty temporary folder, uses bare JSON with legacy fallback, and never invokes publish/send/pay', async () => {
+test('llm runs from an empty temporary folder with JSON and never invokes publish/send/pay', async () => {
   const f = fixture();
   const caller = join(f.root, 'caller');
   await Bun.write(join(caller, 'AGENTS.md'), 'Secret project instructions');
@@ -287,15 +286,14 @@ test('ask runs from an empty temporary folder, uses bare JSON with legacy fallba
   const prior = process.env.DOC_DRAFT_ELANOUS_BIN;
   process.env.DOC_DRAFT_ELANOUS_BIN = f.bin;
   process.env.DOC_DRAFT_CALL_LOG = log;
-  process.env.DOC_DRAFT_NO_BARE = '1';
   const priorCwd = process.cwd();
   try {
     process.chdir(caller);
     const state = await runGraph(graphFile, { input: { kind: 'memo', topic: 'Meeting', outDir: join(f.root, 'drafts') }, deps: { root: f.root } });
     expect(state.status).toBe('done');
     const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { command: string; args: string[]; cwd: string; toolCwd: string | null });
-    expect(calls.map(call => call.args.slice(0, -1))).toEqual([['--bare', '--json'], ['--json'], ['--bare', '--json'], ['--json']]);
-    expect(calls.every(call => call.command === 'ask' && call.cwd.includes('doc-draft-') && call.cwd !== caller && call.toolCwd === null)).toBe(true);
+    expect(calls.map(call => call.args.slice(0, -1))).toEqual([['--json'], ['--json']]);
+    expect(calls.every(call => call.command === 'llm' && call.cwd.includes('doc-draft-') && call.cwd !== caller && call.toolCwd === null)).toBe(true);
     expect(calls.every(call => !existsSync(call.cwd))).toBe(true);
     expect(calls.map(call => call.args.at(-1)).join(' ')).not.toContain('Secret project instructions');
   } finally {
@@ -303,7 +301,6 @@ test('ask runs from an empty temporary folder, uses bare JSON with legacy fallba
     if (prior === undefined) delete process.env.DOC_DRAFT_ELANOUS_BIN;
     else process.env.DOC_DRAFT_ELANOUS_BIN = prior;
     delete process.env.DOC_DRAFT_CALL_LOG;
-    delete process.env.DOC_DRAFT_NO_BARE;
     f.cleanup();
   }
 }, 30000);
@@ -336,7 +333,7 @@ test('ask failure routes draft to failed without writing an output file', async 
   try {
     expect(f.state.status).toBe('failed');
     expect(f.state.path).toEqual(['draft', 'failed']);
-    expect(String(f.state.nodes[0]?.output)).toContain('ask unavailable');
+    expect(String(f.state.nodes[0]?.output)).toContain('llm unavailable');
     expect(existsSync(join(f.root, 'graph-runs', 'doc-draft', f.state.runId, 'draft.md'))).toBe(false);
   } finally { f.cleanup(); }
 });

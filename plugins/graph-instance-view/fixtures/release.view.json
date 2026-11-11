@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "instance": { "source": "release", "runId": "release-demo-1", "graphId": "release-loop", "title": "Release loop", "observedAt": "2026-11-10T07:00:00.000Z", "state": "failed" },
+  "nodes": [
+    { "id": "cut", "label": "Cut", "role": "release", "state": "done" },
+    { "id": "gate", "label": "Gate", "role": "validator", "state": "failed" },
+    { "id": "repair", "label": "Repair", "role": "healer", "state": "queued" },
+    { "id": "publish", "label": "Publish", "role": "release", "state": "queued" }
+  ],
+  "edges": [
+    { "id": "cut-gate", "from": "cut", "to": "gate", "kind": "flow", "state": "taken" },
+    { "id": "gate-repair", "from": "gate", "to": "repair", "kind": "branch", "state": "planned" },
+    { "id": "repair-gate", "from": "repair", "to": "gate", "kind": "flow", "state": "planned" },
+    { "id": "gate-publish", "from": "gate", "to": "publish", "kind": "branch", "state": "planned" }
+  ],
+  "progress": { "completed": 1, "total": 4, "activeNodeIds": [] },
+  "logs": [
+    { "seq": 1, "nodeId": "cut", "level": "info", "text": "컷 완료" },
+    { "seq": 2, "nodeId": "gate", "level": "error", "text": "게이트 실패" }
+  ],
+  "statusLine": "release-demo-1 · 게이트 실패",
+  "readState": "ok"
+}

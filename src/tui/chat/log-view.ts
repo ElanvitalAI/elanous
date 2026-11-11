@@ -2,8 +2,11 @@ import type { SerializedMessage } from '../../session/index.js';
 import { redactSecretText } from '../../debug/log.js';
 import { planInterimDisplay, type InterimDisplay } from './goal-interim.js';
 import { parseToolResultEnvelope, toolResultBodyText, toolResultErrorText } from '../../chat/tool-render/result-text.js';
+import { agentTraceLine } from '../core/agents.js';
+import { renderMarkdown } from '../../render.js';
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
 
 export function safeLogText(text: string): string {
   const plain = text
@@ -13,28 +16,128 @@ export function safeLogText(text: string): string {
   return redactSecretText(plain);
 }
 
-function wrapLine(text: string, columns: number): string[] {
+function wrapText(text: string, columns: number, styled: boolean, resetOnWrap = true): string[] {
   const width = Math.max(1, columns);
   const lines: string[] = [];
   let line = '';
   let used = 0;
-  for (const { segment } of segmenter.segment(text)) {
-    const cells = Bun.stringWidth(segment);
-    if (used > 0 && used + cells > width) {
-      lines.push(line);
-      line = '';
-      used = 0;
+  let lineIndentWidth = 0;
+  let activeSgr: string[] = [];
+  let continuation = false;
+  const nextLine = (nextCells: number): void => {
+    lines.push(line + (styled && (activeSgr.length > 0 || resetOnWrap) ? '\x1b[0m' : ''));
+    lineIndentWidth = Math.min(2, Math.max(0, width - nextCells));
+    line = ' '.repeat(lineIndentWidth) + (styled ? activeSgr.join('') : '');
+    used = lineIndentWidth;
+    continuation = true;
+  };
+  // Segment visible text once. An SGR sequence inside a word changes style,
+  // never the word boundary at which we decide to wrap.
+  let plain = text;
+  const stylesAt = new Map<number, string[]>();
+  if (styled) {
+    plain = '';
+    let from = 0;
+    for (const match of text.matchAll(/\x1b\[[0-?]*[ -/]*m/g)) {
+      plain += text.slice(from, match.index);
+      const styles = stylesAt.get(plain.length) ?? [];
+      styles.push(match[0]);
+      stylesAt.set(plain.length, styles);
+      from = match.index + match[0].length;
     }
-    if (cells > width) continue;
-    line += segment;
-    used += cells;
+    plain += text.slice(from);
   }
+  const emitStyles = (index: number): void => {
+    for (const style of stylesAt.get(index) ?? []) {
+      line += style;
+      const params = style.slice(2, -1).split(';').map((value) => Number(value || 0));
+      if (params.includes(0)) activeSgr = [];
+      if (params.some((value) => value !== 0)) activeSgr.push(style);
+    }
+  };
+  const emit = (start: number, end: number): void => {
+    for (let index = start; index < end; index++) {
+      emitStyles(index);
+      line += plain[index];
+    }
+  };
+  const emitSkippedStyles = (start: number, end: number): void => {
+    for (let index = start; index < end; index++) emitStyles(index);
+  };
+  const fitEmptyLine = (cells: number): void => {
+    if (used !== lineIndentWidth || used + cells <= width || cells > width) return;
+    lineIndentWidth = Math.max(0, width - cells);
+    line = ' '.repeat(lineIndentWidth) + (styled ? activeSgr.join('') : '');
+    used = lineIndentWidth;
+  };
+  const appendWord = (word: string, start: number): void => {
+    const whitespace = /^\s+$/.test(word);
+    if (whitespace && continuation && used === lineIndentWidth) {
+      emitSkippedStyles(start, start + word.length);
+      return;
+    }
+    const cells = Bun.stringWidth(word);
+    const firstGrapheme = segmenter.segment(word)[Symbol.iterator]().next().value?.segment ?? word;
+    const firstCells = Bun.stringWidth(firstGrapheme);
+    if (used + cells > width && used > lineIndentWidth) {
+      nextLine(cells <= width ? cells : firstCells);
+      if (whitespace) {
+        emitSkippedStyles(start, start + word.length);
+        return;
+      }
+    }
+    fitEmptyLine(cells);
+    if (used + cells <= width) {
+      emit(start, start + word.length);
+      used += cells;
+      return;
+    }
+    // A single long word (or an unspaced CJK run) still has to fit the terminal.
+    for (const { segment, index } of segmenter.segment(word)) {
+      const segmentCells = Bun.stringWidth(segment);
+      if (used + segmentCells > width && used > lineIndentWidth) nextLine(segmentCells);
+      fitEmptyLine(segmentCells);
+      if (used + segmentCells > width) continue;
+      emit(start + index, start + index + segment.length);
+      used += segmentCells;
+    }
+  };
+  for (const { segment, index } of wordSegmenter.segment(plain)) appendWord(segment, index);
+  emitStyles(plain.length);
   lines.push(line);
   return lines;
 }
 
+function wrapLine(text: string, columns: number): string[] {
+  return wrapText(text, columns, false);
+}
+
+/** Only trusted classic-renderer SGR escapes pass through after sanitizing raw text. */
+function wrapRenderedLine(text: string, columns: number, resetOnWrap = true): string[] {
+  return wrapText(text, columns, true, resetOnWrap);
+}
+
+function assistantMarkdownLines(text: string, columns: number, label: string, resetOnWrap = true): string[] {
+  const rendered = renderMarkdown(safeLogText(text));
+  return rendered.split('\n').flatMap((part, index) =>
+    wrapRenderedLine(`${index === 0 ? label : '  '}${part}`, columns, resetOnWrap));
+}
+
 export function fitLogLine(text: string, columns: number): string {
-  return wrapLine(safeLogText(text), columns)[0] ?? '';
+  let result = '';
+  let used = 0;
+  for (const { segment } of segmenter.segment(safeLogText(text))) {
+    const cells = Bun.stringWidth(segment);
+    if (used + cells > Math.max(1, columns)) break;
+    result += segment;
+    used += cells;
+  }
+  return result;
+}
+
+/** Preserve every grapheme when a status area needs more than one terminal row. */
+export function wrapLogLines(text: string, columns: number): string[] {
+  return wrapLine(safeLogText(text), columns);
 }
 
 export function safeStatusText(text: string): string {
@@ -156,6 +259,8 @@ function messageLines(
   display: InterimDisplay | undefined,
 ): string[] {
   if (message.role === 'tool') {
+    const agentLine = agentTraceLine(message);
+    if (agentLine) return [fitLogLine(agentLine, columns), ''];
     const running = message.toolResult === undefined;
     const outputLines = running ? 0 : toolOutputLineCount(message, columns);
     if (running || outputLines <= TOOL_FOLD_LINE_LIMIT || expandedToolIndexes?.has(index)) {
@@ -168,10 +273,14 @@ function messageLines(
   if (display?.kind === 'folded') return [...wrapLine(`엘라누스: ${display.line}`, columns), ''];
   const lines: string[] = [];
   const label = message.role === 'user' ? '나: ' : '엘라누스: ';
-  const parts = safeLogText(message.content).split('\n');
-  for (let i = 0; i < parts.length; i++) {
-    const prefix = i === 0 ? label : '  ';
-    lines.push(...wrapLine(prefix + parts[i], columns));
+  if (message.role === 'assistant') {
+    lines.push(...assistantMarkdownLines(message.content, columns, label));
+  } else {
+    const content = safeLogText(message.content);
+    const parts = content.split('\n');
+    for (let i = 0; i < parts.length; i++) {
+      lines.push(...wrapLine(`${i === 0 ? label : '  '}${parts[i]}`, columns));
+    }
   }
   lines.push('');
   return lines;
@@ -185,11 +294,22 @@ export function logViewLines(
   columns: number,
   expandedToolIndexes?: ReadonlySet<number>,
 ): string[] {
+  return logViewLinesWithInsertions(messages, columns, expandedToolIndexes);
+}
+
+/** Render session history with ephemeral surface rows attached after a message index. */
+export function logViewLinesWithInsertions(
+  messages: readonly SerializedMessage[],
+  columns: number,
+  expandedToolIndexes?: ReadonlySet<number>,
+  afterMessageIndex: ReadonlyMap<number, readonly string[]> = new Map(),
+): string[] {
   const plan = planInterimDisplay(messages);
   const lines: string[] = [];
   for (const [index, message] of messages.entries()) {
     if (!isLogRole(message)) continue;
     lines.push(...messageLines(message, index, columns, expandedToolIndexes, plan.get(index)));
+    lines.push(...(afterMessageIndex.get(index) ?? []));
   }
   return lines.length > 0 ? lines : ['대화 기록 없음'];
 }
@@ -199,6 +319,7 @@ export function toolFoldBlockStarts(messages: readonly SerializedMessage[], colu
   const starts: number[] = [];
   for (const [index, message] of messages.entries()) {
     if (message.role !== 'tool' || message.toolResult === undefined) continue;
+    if (agentTraceLine(message)) continue;
     if (toolOutputLineCount(message, columns) > TOOL_FOLD_LINE_LIMIT) starts.push(index);
   }
   return starts;
@@ -261,7 +382,6 @@ export function toggleVisibleToolFold(
 
 /** Ephemeral reply preview until the persisted assistant message replaces it. */
 export function streamReplyLines(text: string, columns: number): string[] {
-  const parts = safeLogText(text).split('\n');
-  const lines = parts.flatMap((part, index) => wrapLine(`${index === 0 ? '엘라누스: ' : '  '}${part}`, columns));
+  const lines = assistantMarkdownLines(text, columns, '엘라누스: ', false);
   return lines.slice(-80);
 }

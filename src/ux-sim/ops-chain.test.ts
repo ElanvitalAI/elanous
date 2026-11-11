@@ -83,7 +83,7 @@ test('SIM-CHAIN-OPS: Pod leak holds dispatch; idle traffic queues work; quota ex
     putPod(pod: Record<string, unknown>): void;
   };
   const gh = devices.get('fake-gh') as { run(command: string, args: readonly string[]): { status: number; stdout: string }; calls: string[][] };
-  const llm = devices.get('fake-llm') as { config: Record<string, Record<string, unknown>>; response(): string };
+  const llm = devices.get('fake-llm') as { config: Record<string, Record<string, unknown>>; response(): Promise<string> };
   const clock = devices.get('fake-clock') as { withClock: typeof withSimClock };
 
   await runInWorld(world, () => clock.withClock(NOW, async () => {
@@ -144,7 +144,7 @@ test('SIM-CHAIN-OPS: Pod leak holds dispatch; idle traffic queues work; quota ex
     // Scenario 3: an exhausted provider is measured as L1; the actual dispatcher can still route rule-based work.
     const quota = llm.config.test?.remainingQuota;
     if (typeof quota !== 'number') throw new Error('SIM-CHAIN-OPS fake-llm quota fixture is required');
-    expect(llm.response()).toContain('test-fake-llm');
+    expect(await llm.response()).toContain('test-fake-llm');
     const degradation = probeDegradation(root, {
       usableLlm: () => ({ usable: Number(quota) > 0, why: 'test provider quota exhausted' }),
       board: () => ({ ok: true }),

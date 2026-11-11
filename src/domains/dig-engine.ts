@@ -22,7 +22,7 @@ import { openKgDb, getNode as kgGetNode } from './kg-store.js';
 import { recallHybrid, type HybridRecall } from './kg-recall.js';
 import { US_PULSE_DB, openPulseDb, detectNotables, loadUniverse } from './us-pulse.js';
 import { existsSync } from 'node:fs';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 import { conatusPath } from './conatus-data-dir.js';
 import { hoursAgo, within } from '../time/db-window.js';

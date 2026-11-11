@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-FAKE-MOBILE-TOOLCHAIN-TS",
+  "path": "src/ux-sim/fake-mobile-toolchain.ts",
+  "boundary": "Provides deterministic mobile install, device, store and push failure cards plus PATH shims for Flutter, Dart, Android and Apple commands without calling real tools.",
+  "deviceIds": ["fake-mobile-toolchain"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

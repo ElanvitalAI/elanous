@@ -37,7 +37,10 @@ nodes:
   - { node_id: notes-recheck, kind: gate, recipe: 'cmd:notes-check', max_visits: 1 }
   - { node_id: auto-approve, kind: gate, recipe: 'cmd:auto-approve', max_visits: 1 }
   - { node_id: approve-publish, kind: hitl, recipe: 'approval:publish', max_visits: 1 }
+  # Keep the opt-in graph's HITL surface aligned with the shared release manifest.
+  - { node_id: approve-continue, kind: hitl, recipe: 'approval:continue-publish', max_visits: 1 }
   - { node_id: gate-repair-recovery, kind: hitl, recipe: 'approval:repair-recovery', max_visits: 1 }
+  - { node_id: gate-heal-decision, kind: hitl, recipe: 'approval:gate-heal-decision', max_visits: 1 }
   - { node_id: publish, kind: git, recipe: 'cmd:publish-command', max_visits: 1, notify: { on: [ok, fail] } }
   - { node_id: npm-publish, kind: git, recipe: 'cmd:npm-publish', max_visits: 1 }
   - { node_id: traffic-npm-published, kind: gate, recipe: 'cmd:traffic-npm-published', max_visits: 1 }

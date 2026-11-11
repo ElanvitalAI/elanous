@@ -6,7 +6,7 @@ import { textOnly } from '../llm/stream-text.js';
 // (2) 결정론 앵커 섹션(정확한 수치/티커) + (3) 상세 링크를 합쳐 에센셜 메시지를 만든다.
 // LLM 실패 시 서사만 빠지고 결정론 섹션은 그대로(fail-soft).
 
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { marketClock } from './finance.js';

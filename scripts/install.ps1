@@ -61,6 +61,35 @@ function Read-Text([string] $Path) {
   return [IO.File]::ReadAllText($Path)
 }
 
+function Resolve-InstallerUserHome {
+  $profileHome = $env:USERPROFILE
+  if (-not $profileHome -and $env:LOCALAPPDATA) {
+    $profileHome = Split-Path -Parent (Split-Path -Parent $env:LOCALAPPDATA)
+  }
+  if (-not $profileHome) { $profileHome = $HOME }
+  return $profileHome
+}
+
+function Resolve-InstallerDataHome {
+  $dataHome = $env:LOCALAPPDATA
+  if (-not $dataHome) {
+    $userHome = Resolve-InstallerUserHome
+    if ($userHome) { $dataHome = Join-Path (Join-Path $userHome 'AppData') 'Local' }
+  }
+  # SYSTEM and other service accounts can have neither USERPROFILE nor LOCALAPPDATA.
+  if (-not $dataHome -and $env:ProgramData) { $dataHome = $env:ProgramData }
+  return $dataHome
+}
+
+function Resolve-InstallerProfilePath {
+  if ($env:ELANOUS_POWERSHELL_PROFILE) { return $env:ELANOUS_POWERSHELL_PROFILE }
+  if ($PROFILE) { return $PROFILE }
+  $profileHome = Resolve-InstallerUserHome
+  if (-not $profileHome) { return $null }
+  $profileDirectory = Join-Path (Join-Path $profileHome 'Documents') 'WindowsPowerShell'
+  return Join-Path $profileDirectory 'Microsoft.PowerShell_profile.ps1'
+}
+
 # Windows PowerShell 5.1 turns a native command's stderr into a terminating NativeCommandError under
 # ErrorActionPreference=Stop - even with 2>$null. A git probe that is allowed to fail must run outside that mode.
 function Invoke-Quiet([scriptblock] $Block) {
@@ -155,8 +184,13 @@ if ($osArchitecture -eq 'ARM64') {
 }
 
 if (-not $Prefix) {
-  $dataHome = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME 'AppData\Local' }
-  $Prefix = if ($env:ELANOUS_INSTALL_PREFIX) { $env:ELANOUS_INSTALL_PREFIX } else { Join-Path $dataHome 'elanous' }
+  if ($env:ELANOUS_INSTALL_PREFIX) {
+    $Prefix = $env:ELANOUS_INSTALL_PREFIX
+  } else {
+    $dataHome = Resolve-InstallerDataHome
+    if (-not $dataHome) { Fail 'could not resolve an installation data directory' 1 }
+    $Prefix = Join-Path $dataHome 'elanous'
+  }
 }
 if (-not $Source -and $env:ELANOUS_INSTALL_SOURCE) { $Source = $env:ELANOUS_INSTALL_SOURCE }
 
@@ -166,8 +200,9 @@ $installerPath = if ($scriptDir) { Join-Path $scriptDir 'install.sh' } else { $n
 $requiredCommands = Get-RequiredCommands $installerPath
 $missingGit = -not (Get-Command git -ErrorAction SilentlyContinue)
 $bootstrappedBun = $false
-$bunUserBin = Join-Path (Join-Path $HOME '.bun') 'bin'
-if (-not (Get-Command bun -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath (Join-Path $bunUserBin 'bun.exe') -PathType Leaf)) {
+$installerUserHome = Resolve-InstallerUserHome
+$bunUserBin = if ($installerUserHome) { Join-Path (Join-Path $installerUserHome '.bun') 'bin' } else { $null }
+if (-not (Get-Command bun -ErrorAction SilentlyContinue) -and $bunUserBin -and (Test-Path -LiteralPath (Join-Path $bunUserBin 'bun.exe') -PathType Leaf)) {
   $env:PATH = $bunUserBin + [IO.Path]::PathSeparator + $env:PATH
 }
 # Preserve checkout required-command enforcement, including git, before changing any installation files.
@@ -203,7 +238,8 @@ if (Get-Command bun -ErrorAction SilentlyContinue) {
 if (-not $pinnedBunAvailable) {
   if ($NoBootstrapBun) { Fail "$(Say 'install pinned Bun version:' '\uc9c0\uc815\ub41c Bun \ubc84\uc804\uc744 \uc124\uce58\ud558\uc138\uc694:') $bunVersion" 127 }
   # Keep the installer-pinned runtime isolated; never replace a user's shared ~/.bun/bin/bun.exe.
-  $runtimeDataHome = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path (Join-Path $HOME 'AppData') 'Local' }
+  $runtimeDataHome = Resolve-InstallerDataHome
+  if (-not $runtimeDataHome) { Fail 'could not resolve a Bun runtime directory' 1 }
   $bunBin = Join-Path (Join-Path (Join-Path $runtimeDataHome 'Elanous') 'runtime') 'bun'
   $bunBin = Join-Path $bunBin $bunVersion
   $pathBeforeBun = $env:PATH
@@ -287,13 +323,15 @@ $Prefix = (Resolve-Path -LiteralPath $Prefix).Path
 $pathLiteral = (Join-Path $Prefix 'bin').Replace("'", "''")
 $pathLine = '$env:PATH = ''' + $pathLiteral + ''' + [IO.Path]::PathSeparator + $env:PATH'
 if (-not $NoModifyPath) {
-  $profilePath = if ($env:ELANOUS_POWERSHELL_PROFILE) { $env:ELANOUS_POWERSHELL_PROFILE } else { $PROFILE }
-  $profileDirectory = Split-Path -Parent $profilePath
-  New-Item -ItemType Directory -Force -Path $profileDirectory | Out-Null
-  if (-not (Test-Path -LiteralPath $profilePath)) { New-Item -ItemType File -Path $profilePath | Out-Null }
-  $profileContent = Read-Text $profilePath
-  if ($profileContent.Contains($markerStart) -and -not $profileContent.Contains($pathLine)) {
-    Fail 'PATH block already points to a different installation prefix' 1
+  $profilePath = Resolve-InstallerProfilePath
+  if ($profilePath) {
+    $profileDirectory = Split-Path -Parent $profilePath
+    New-Item -ItemType Directory -Force -Path $profileDirectory | Out-Null
+    if (-not (Test-Path -LiteralPath $profilePath)) { New-Item -ItemType File -Path $profilePath | Out-Null }
+    $profileContent = Read-Text $profilePath
+    if ($profileContent.Contains($markerStart) -and -not $profileContent.Contains($pathLine)) {
+      Fail 'PATH block already points to a different installation prefix' 1
+    }
   }
 }
 
@@ -417,13 +455,23 @@ try {
   $shimContent = "@echo off`r`nrem elanous-wrapper`r`n`"$bunPath`" `"%~dp0..\current\node_modules\elanous\bin\elanous.mjs`" %*`r`n"
   Set-Content -LiteralPath $shimPath -Value $shimContent -NoNewline -Encoding ascii
   $elnShim = Join-Path $binDirectory 'eln.cmd'
-  $pathEln = Get-Command eln -ErrorAction SilentlyContinue
-  if (($pathEln -and $pathEln.Source -ne $elnShim) -or
-      ((Test-Path -LiteralPath $elnShim) -and ((Get-Item -LiteralPath $elnShim -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
-        (Read-Text $elnShim) -notmatch '(?m)^rem elanous-wrapper\r?$'))) {
-    Write-Output 'WARNING eln: another command already exists; use elanous instead'
-  } else {
-    Set-Content -LiteralPath $elnShim -Value $shimContent -NoNewline -Encoding ascii
+  if ((Test-Path -LiteralPath $elnShim) -and ((Get-Item -LiteralPath $elnShim -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
+      (Read-Text $elnShim) -notmatch '(?m)^rem elanous-wrapper\r?$')) {
+    Fail "eln shim exists and is not installer-owned; refusing to overwrite or claim it: $elnShim" 1
+  }
+  Set-Content -LiteralPath $elnShim -Value $shimContent -NoNewline -Encoding ascii
+
+  $processPathEntries = @(($env:PATH -split [regex]::Escape([string][IO.Path]::PathSeparator)) | Where-Object {
+    $_ -and -not [string]::Equals([string]$_, $binDirectory, [StringComparison]::OrdinalIgnoreCase)
+  })
+  $env:PATH = (@($binDirectory) + $processPathEntries) -join [IO.Path]::PathSeparator
+  $elnOnPath = $true
+  if ($env:OS -eq 'Windows_NT') {
+    $resolvedElnPaths = @(& where.exe eln 2>$null)
+    $resolvedPath = if ($resolvedElnPaths.Count -gt 0) { [string]$resolvedElnPaths[0] } else { '<not found>' }
+    if (-not [string]::Equals([IO.Path]::GetFullPath($resolvedPath), [IO.Path]::GetFullPath($elnShim), [StringComparison]::OrdinalIgnoreCase)) {
+      Fail "installed eln shim is not first on the current PATH: expected $elnShim, resolved $resolvedPath" 1
+    }
   }
 
   $installedPackage = Join-Path $Prefix 'current\node_modules\elanous\package.json'
@@ -437,7 +485,7 @@ try {
   # The build folder keeps its own copy - `elanous --version` reads its own build's metadata after a rollback.
   $metadataJson | Set-Content -LiteralPath (Join-Path $versionDirectory 'install.json') -NoNewline
 
-  if (-not $NoModifyPath -and -not (Read-Text $profilePath).Contains($markerStart)) {
+  if (-not $NoModifyPath -and $profilePath -and -not (Read-Text $profilePath).Contains($markerStart)) {
     Add-Content -LiteralPath $profilePath -Value ("`r`n$markerStart`r`n$pathLine`r`n$markerEnd")
   }
   # The default execution policy (Restricted) skips $PROFILE in a new window - the user PATH is what a fresh shell sees.
@@ -451,6 +499,8 @@ try {
   }
   $installedMessage = Say 'Installed elanous {0} at {1}' 'elanous {0} \uc744(\ub97c) \uc124\uce58\ud588\uc2b5\ub2c8\ub2e4: {1}'
   Write-Output ($installedMessage -f $version, $shimPath)
+  Write-Output ("ELN command: {0}" -f $elnShim)
+  Write-Output ("ELN available on current PATH: {0}" -f $elnOnPath)
   $bootstrapped = if ($bootstrappedBun) { 'bun' } else { 'none' }
   $missing = if ($missingGit -and -not $isCheckout) { 'git(next step)' } else { 'none' }
   Write-Output "$(Say 'Install summary' '\uc124\uce58 \uc694\uc57d'): bootstrapped: $bootstrapped; missing: $missing"

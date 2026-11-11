@@ -6,13 +6,10 @@
 import { describe, test, expect } from 'bun:test';
 import { buildLogPaneViewport, renderLogPane, findBlock, renderBodyLine, physicalLogRowCount, logPaneContentHeight, maxLogPaneScroll } from '../src/panes/log-pane.js';
 import { stripAnsi } from '../src/tui.js';
-import { renderSkillsRows, type SkillRow } from '../src/panes/skills-pane.js';
-import { renderFilesRows } from '../src/panes/files-pane.js';
 import { paneTitle } from '../src/panes/pane-title.js';
 import { fileColor, fileIcon, sizeStr } from '../src/panes/file-icons.js';
 import { colorLine } from '../src/panes/syntax-color.js';
 import { canPreview } from '../src/panes/preview-pane.js';
-import type { FileTreeEntry } from '../src/types.js';
 
 describe('log pane', () => {
   test('multiline log content consumes physical rows without covering the streaming footer', () => {
@@ -284,51 +281,6 @@ describe('log pane', () => {
       const stripped = stripAnsi(out);
       expect(stripped.length).toBeLessThanOrEqual(maxW);
     });
-  });
-});
-
-describe('skills pane', () => {
-  const rows: SkillRow[] = [
-    { name: 'alpha', fileCount: 3, syncedTargets: 2, hasSnapshot: true, lastSynced: new Date('2026-01-01') },
-    { name: 'beta',  fileCount: 1, syncedTargets: 0, hasSnapshot: false },
-  ];
-
-  test('produces exactly listH rows (padded with empty strings)', () => {
-    const out = renderSkillsRows(
-      { rows, cursor: 0, offset: 0, focused: true },
-      30, 5,
-    );
-    expect(out).toHaveLength(5);
-    expect(out[0]).toContain('alpha');
-    expect(out[1]).toContain('beta');
-    expect(out[2]).toBe('');
-  });
-
-  test('is pure', () => {
-    const state = { rows, cursor: 1, offset: 0, focused: false };
-    expect(renderSkillsRows(state, 30, 3)).toEqual(renderSkillsRows(state, 30, 3));
-  });
-});
-
-describe('files pane', () => {
-  const files: FileTreeEntry[] = [
-    { path: 'SKILL.md', size: 1024, mtime: '' },
-    { path: 'src/index.ts', size: 2048, mtime: '' },
-  ];
-
-  test('renders files with icons and sizes', () => {
-    const out = renderFilesRows(
-      { files, cursor: 0, offset: 0, focused: true },
-      40, 3,
-    );
-    expect(out).toHaveLength(3);
-    expect(out[0]).toContain('SKILL.md');
-    expect(out[1]).toContain('index.ts');
-  });
-
-  test('is pure', () => {
-    const state = { files, cursor: 0, offset: 0, focused: false };
-    expect(renderFilesRows(state, 40, 2)).toEqual(renderFilesRows(state, 40, 2));
   });
 });
 

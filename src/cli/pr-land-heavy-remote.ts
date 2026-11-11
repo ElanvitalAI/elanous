@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { gateRemoteHostCap, realGateRemoteRunner, resolveGateRemoteSettings, runOnRemote, type GateRemoteRunner, type RemoteRunOutcome } from '../self-implement/gate-remote.js';
 import { decideWarmReuse, type WarmReuseEvidenceByConsumer, type WarmReuseSwitchConfig } from '../task-orchestrator/surfaces/pod-warm-switch.js';

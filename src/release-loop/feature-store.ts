@@ -6,7 +6,7 @@ import { releaseLedgerRoot } from '../instance/resolve.js';
 import { assertNotTestWritingOps } from '../instance/test-write-guard.js';
 import { CliUserError } from '../cli/cli-user-error.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { hqSeenGenerationPath, readHqLease, readSeenGeneration } from '../hq/hq.js';
 import { devVersion, withoutDispatchSkipLine, type Checklist, type ChecklistHistory, type ChecklistItem } from './checklist.js';
 

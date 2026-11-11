@@ -570,8 +570,13 @@ test('measured gate regressions are never waivable while stopped or incomplete r
 });
 
 test('waiver rejects unrecorded nodes, unsafe side effects, invalid input and duplicate public issue IDs', () => {
-  const state = { path: ['version-release', 'tui', 'failed'], nodes: [{ nodeId: 'version-release', ok: true, executed: true },
-    { nodeId: 'tui', ok: false, executed: true }, { nodeId: 'failed', ok: true, executed: false }], input: { version: VERSION } } as GraphRunState;
+  // Source: the current graph restores traffic after a failed TUI node before reaching the failed terminal.
+  const state = { path: ['version-release', 'tui', 'traffic-failed-restore', 'failed'], nodes: [
+    { nodeId: 'version-release', ok: true, executed: true },
+    { nodeId: 'tui', ok: false, executed: true },
+    { nodeId: 'traffic-failed-restore', ok: true, executed: true },
+    { nodeId: 'failed', ok: true, executed: false },
+  ], input: { version: VERSION } } as GraphRunState;
   expect(releaseResumeWaiver(state, { from: 'tui' })).toBeUndefined();
   expect(releaseResumeWaiver(state, { from: 'tui', acceptedRegressions: [{ id: 'R1', note: 'issue' }] })).toBeUndefined();
   expect(releaseResumeWaiver(state, { from: 'tui', acceptedRegressions: [] })).toBeUndefined();
@@ -612,8 +617,7 @@ test('release resume graph consumes the exact gate-waiver event and routes its n
     if (ctx.nodeId === 'version-release') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', version: VERSION, commit: cutTip, branch: `release/${VERSION}` }) + '\n', stderr: '' };
     // The gate output may not carry a commit; the event remains bound to the saved release cut.
     if (ctx.nodeId === 'gate') return { exitCode: 1, stdout: JSON.stringify({ outcome: 'error', commit: cutTip, introduced: [], introducedIds: [], error: 'pod sweep incomplete: worker interrupted' }) + '\n', stderr: '' };
-    // The first incomplete gate is rejected by receipt auditing; its owner-waived retry gets a complete synthetic audit.
-    if (ctx.nodeId === 'receipt-audit' && receiptAuditRuns++ === 0) return { exitCode: 2, stdout: JSON.stringify({ outcome: 'error', verdict: 'fail', summary: 'gate sweep incomplete' }) + '\n', stderr: '' };
+    if (ctx.nodeId === 'receipt-audit') receiptAuditRuns++;
     return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
   };
   const graph = async (...args: Parameters<typeof runGraph>) => {
@@ -635,6 +639,7 @@ test('release resume graph consumes the exact gate-waiver event and routes its n
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true, previousVersion: '0.2.18' }, deps: { root, runBash } });
     savedRunStatePath = first.statePath;
     expect(first.status).toBe('failed');
+    expect(receiptAuditRuns).toBe(0);
     const before = readFileSync(first.statePath, 'utf8');
     const invoke = async (args: string[]) => {
       process.exitCode = 0; lines.length = 0;
@@ -661,8 +666,11 @@ test('release resume graph consumes the exact gate-waiver event and routes its n
     expect(staleEvents.every((event) => event.uses === 0)).toBe(true);
     expect(staleState.nodes.find((node) => node.nodeId === 'gate')?.output).toContain('different worker stopped');
     writeFileSync(first.statePath, before);
+    // Source: the initial failed gate stops before receipt-audit; the valid waiver retry dispatches it once.
+    expect(receiptAuditRuns).toBe(0);
     const result = await invoke(['--owner-waive', 'gate', '--approved-by', 'OP', '--reason', reason]);
     expect(result).toMatchObject({ ok: true, status: 'done' });
+    expect(receiptAuditRuns).toBe(1);
     const saved = JSON.parse(readFileSync(first.statePath, 'utf8')) as GraphRunState;
     const waiverEvents = readWaiverEvents(join(root, 'review-results', 'waiver-events.jsonl'));
     expect(waiverEvents.find((event) => event.eventId === staleSuperset.eventId)).toMatchObject({ uses: 0 });

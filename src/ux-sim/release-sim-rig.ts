@@ -1038,7 +1038,7 @@ export interface ReleaseSimRigScenario {
   kind: 'release-graph';
   id: string;
   isolation: 'test';
-  input: { version: string; previousVersion: string; releaseGateFanout?: boolean };
+  input: { version: string; previousVersion: string; releaseGateFanout?: boolean; graphCutover?: 'legacy' | 'audit'; graphCutoverEvidenceId?: string };
   cases: ReleaseSimRigCase[];
 }
 
@@ -1240,9 +1240,15 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
   }
   if (typeof root.id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(root.id)) throw new Error('scenario.id must be lowercase letters, digits, and hyphens');
   const input = record(root.input, 'scenario.input');
-  exactKeys(input, ['version', 'previousVersion', 'releaseGateFanout'], 'scenario.input');
+  exactKeys(input, ['version', 'previousVersion', 'releaseGateFanout', 'graphCutover', 'graphCutoverEvidenceId'], 'scenario.input');
   if (input.releaseGateFanout !== undefined && typeof input.releaseGateFanout !== 'boolean') {
     throw new Error('scenario.input.releaseGateFanout must be boolean');
+  }
+  if (input.graphCutover !== undefined && input.graphCutover !== 'legacy' && input.graphCutover !== 'audit') {
+    throw new Error('scenario.input.graphCutover must be legacy or audit');
+  }
+  if (input.graphCutoverEvidenceId !== undefined && typeof input.graphCutoverEvidenceId !== 'string') {
+    throw new Error('scenario.input.graphCutoverEvidenceId must be a string');
   }
   if (typeof input.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(input.version)
     || typeof input.previousVersion !== 'string' || !/^\d+\.\d+\.\d+$/.test(input.previousVersion)) {
@@ -1350,7 +1356,10 @@ export function parseReleaseSimRigScenario(source: string): ReleaseSimRigScenari
       expect: { status: expected.status, mustVisit, mustNotVisit, ...(overlap ? { overlap } : {}), ...(typeof refusalIncludes === 'string' ? { refusalIncludes } : {}), ...(events ? { events } : {}) } };
   });
   return { version: 1, kind: 'release-graph', id: root.id, isolation: 'test',
-    input: { version: input.version, previousVersion: input.previousVersion, ...(input.releaseGateFanout === true ? { releaseGateFanout: true } : {}) }, cases };
+    input: { version: input.version, previousVersion: input.previousVersion,
+      ...(input.releaseGateFanout === true ? { releaseGateFanout: true } : {}),
+      ...(input.graphCutover === undefined ? {} : { graphCutover: input.graphCutover as 'legacy' | 'audit' }),
+      ...(input.graphCutoverEvidenceId === undefined ? {} : { graphCutoverEvidenceId: input.graphCutoverEvidenceId as string }) }, cases };
 }
 
 function parseContext(env: NodeJS.ProcessEnv): { nodeId: string; executionId: string } {
@@ -2491,6 +2500,13 @@ async function runCase(scenario: ReleaseSimRigScenario, item: ReleaseSimRigCase,
     const injection = item.nodeOutcomes?.[nodeId];
     if (nodeId === 'gate-triage') {
       const child = spawnSync('bun', ['scripts/release-loop/gate-triage-node.ts'], {
+        cwd: REPOSITORY_ROOT, env: { ...process.env, ...options.env }, encoding: 'utf8', maxBuffer: 1024 * 1024,
+      });
+      nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };
+      return { exitCode: child.status ?? 2, stdout: child.stdout ?? '', stderr: child.stderr ?? '' };
+    }
+    if (command.trim() === 'bun scripts/release-loop/gate-cutover-switch-node.ts') {
+      const child = spawnSync('bun', ['scripts/release-loop/gate-cutover-switch-node.ts'], {
         cwd: REPOSITORY_ROOT, env: { ...process.env, ...options.env }, encoding: 'utf8', maxBuffer: 1024 * 1024,
       });
       nodeTimings[nodeId] = { startedAtMs, endedAtMs: performance.now() };

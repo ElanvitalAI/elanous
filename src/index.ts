@@ -32,7 +32,8 @@ import { DEV_PIPELINE_SINK_SURFACE } from './self-implement/self-cli-sink-surfac
 import { DEFAULT_TUI_TEST_READY_TIMEOUT_MS } from './self-implement/elanous-tui-spawn.js';
 
 import { applyTestStateDirFlagFromArgv } from './cli/test-state-dir-flag.js';
-import { applyTestFlagFromArgv, observeTestFlagOwnership, uncoveredTestFlagPaths, staleTestFlagPaths } from './cli/test-flag.js';
+import { applyTestFlagFromArgv, extractTestFlag, observeTestFlagOwnership, uncoveredTestFlagPaths, staleTestFlagPaths } from './cli/test-flag.js';
+import { applyLlmModeFlagFromArgv } from './cli/llm-mode-flag.js';
 
 import { recordImagePinFromConfigSet, registerImageCommands } from './cli/image-cli.js';
 
@@ -50,11 +51,13 @@ import { acpServerHelpText } from './boot/acp-server-help.js';
 // flag bg-launch'd children receive to inherit the parent's
 // `setTestStateRoot()` (replaces the removed ELANOUS_NEXUS_DIR env
 // inheritance · 2026-05-13 config-dir-unify).
-applyTestStateDirFlagFromArgv();
+const appliedTestStateDir = applyTestStateDirFlagFromArgv();
 // ★ 전역 `--test` (P2 · 2026-07-26) — 사람/에이전트용 공개 입구. 위 두 내부 플래그와 같은
 //   격리 기계(applyIsolatedRoot)를 부른다. `--test` 를 스스로 선언한 명령은 그 명령이 계속
 //   소유하므로 여기서 손대지 않는다(OWNED_TEST_FLAG_PATHS · ratchet 테스트가 강제).
+const testUniverseRequested = appliedTestStateDir !== undefined || extractTestFlag(process.argv).found;
 applyTestFlagFromArgv();
+applyLlmModeFlagFromArgv(testUniverseRequested);
 // An explicit caller-supplied config directory must take precedence over the
 // test-instance default so scoped storage commands stay inside that directory.
 applyConfigDirFlagFromArgv();
@@ -702,7 +705,7 @@ async function executeHarnessSelfRun(
   input: string,
   supervisor: Pick<HarnessAskSayOptions, 'supervise' | 'supervisorSource'>,
   executeDevSelfRun: RunDevAskExecuteDevSelfRun | undefined,
-  executePipeline: (pieceFeature?: string, relaunch?: boolean, base?: string) => ReturnType<RunDevAskRunDevPipeline>,
+  executePipeline: (pieceFeature?: string, relaunch?: boolean, base?: string, launchConfigSnapshot?: import('./user-config/types.js').UserConfig) => ReturnType<RunDevAskRunDevPipeline>,
   runId: string,
   startDraftTriage: typeof import('./self-dev/dev-cli.js')['startDraftTriage'],
   startDraftTriageOptions?: RunDevAskStartDraftTriageOptions,
@@ -720,6 +723,7 @@ async function executeHarnessSelfRun(
   startDraftTriage(runId, startDraftTriageOptions);
   // 정지 요청의 «신선도» 기준 — 첫 런 «전»에 잰다(첫 런 도중의 정지도 이 호출의 것이다).
   const invocationStartedAtMs = Date.now();
+  const launchConfigSnapshot = getUserConfig();
   const initial = await executeDevPipelineInvocation(executePipeline, { kind: 'initial' });
   if (initial.kind !== 'self') return initial;
   debug.log('harness.supervisor', 'resolved', {
@@ -733,13 +737,12 @@ async function executeHarnessSelfRun(
   }, supervisor.supervise === true
     ? {
         invocationStartedAtMs,
+        launchConfigSnapshot,
         entryPoint: entranceId ?? 'harness',
         observedRunId: runId,
         completion: initial.plan.completion,
         executePiece: async (pieceFeature, opts) => {
-          const rerun = await executeDevPipelineInvocation(executePipeline, {
-            kind: 'fragment-reexecution', pieceFeature, ...(opts?.base === undefined ? {} : { base: opts.base }),
-          });
+          const rerun = await executePipeline(pieceFeature, undefined, opts?.base, opts?.launchConfigSnapshot);
           if (rerun.kind !== 'self') throw new Error(`harness supervisor: piece 재실행이 예상 밖 dispatch(kind=${rerun.kind})를 반환`);
           return rerun.result;
         },
@@ -1164,9 +1167,11 @@ prShell.command('lineage <pr>').description('PR 계보의 관측 사실만 JSON�
   .requiredOption('--json', 'JSON 관측 결과 출력')
   .option('--cwd <path>', '저장소 경로');
 prShell.command('census').description('열린 PR 전체·골 문서만·2일 무커밋 draft·미닫힌 superseded 집계').option('--cwd <path>', '저장소 경로');
-prShell.command('open-guard').description('새 PR 전에 같은 파일 OPEN PR·골 문서만·자리별 상한 검사')
+prShell.command('open-guard').description('착수·새 PR 전에 같은 파일 OPEN PR·골 문서만·자리별 상한 검사')
   .option('--cwd <path>', '작업 트리 경로').option('--base <ref>', '비교 base ref', 'origin/main')
   .option('--seat <seat>', 'PR 소유 자리(OP|TC|MK|UX)').option('--cell <id>', '릴리스 칸 id (같은 칸 OPEN PR 검사)')
+  .option('--planned-file <path>', '착수 예정 파일 (반복 가능)', (path: string, files: string[]) => [...files, path], [] as string[])
+  .option('--op-approval-file <path>', '핫스팟 OP 승인 JSON (현재 열린 PR head에 묶음)')
   .option('--seat-cap <number>', '자리별 열린 PR 경고 상한', '30');
 const prQueueShell = prShell.command('queue').description('Shadow merge queue (never lands PRs)');
 prQueueShell.command('status').description('Show pending PRs and shadow verdicts');
@@ -5459,7 +5464,7 @@ const selfOrchestrateCmd = selfCmd
         };
         // 🧷 IMAGE-ONE-SOURCE: 운영 config `harness.imageCommit` 이 있으면 레지스트리를 가진 멤버는 굽지 않고 기준 이미지(커밋 태그)를 당긴다.
         const imageSourceMod = await import('./task-orchestrator/surfaces/pod-image-source.js');
-        let podImageCfg: { harness?: { imageCommit?: unknown } } | undefined = undefined;
+        let podImageCfg: import('./user-config/types.js').UserConfig | undefined = undefined;
         // ⛔ 설정을 못 읽으면 «기준값 없음»으로 읽지 않는다 — 기준값이 있었을 수 있으니 굽지 않고 멈춘다.
         try { podImageCfg = (await import('./user-config.js')).getUserConfig(); } catch (e) {
           ui.error(`--substrate pod: 운영 config 를 못 읽어 기준 이미지(harness.imageCommit) 여부를 모른다 — 굽지 않고 멈춘다: ${(e as Error).message}`);
@@ -5494,8 +5499,27 @@ const selfOrchestrateCmd = selfCmd
           const byContext = new Map<string, PodPoolMemberT>([...(preparedImage.head?.synced ?? []), ...preparedImage.pinned].map((m) => [m.context, m]));
           const synced = poolMembers.filter((m) => ok.has(m.context)).map((m) => byContext.get(m.context)!);
           if (synced.length === 0) { ui.error('--substrate pod: 이미지를 맞춘 풀 노드가 없다'); process.exit(2); }
-          pool = new poolMod.PodPoolScheduler(synced);
-          poolMembers = synced;
+          const cloudBurstRuntime = await import('./fleet/cloud-burst-runtime.js');
+          const burstConfig = cloudBurstRuntime.cloudBurstRuntimeConfig(podImageCfg!);
+          const burstMember = burstConfig ? cloudBurstRuntime.reservedCloudBurstMember(burstConfig) : undefined;
+          if (burstMember && synced.some((member) => member.context === burstMember.context || member.sshHost === burstMember.sshHost)) {
+            debug.log('fleet.cloud-burst', 'candidate-conflict', { context: burstMember.context, host: burstMember.sshHost }, { level: 'warn' });
+          }
+          const finalMembers = burstMember && !synced.some((member) => member.context === burstMember.context || member.sshHost === burstMember.sshHost)
+            ? [...synced, burstMember] : synced;
+          pool = new poolMod.PodPoolScheduler(finalMembers);
+          poolMembers = finalMembers;
+          let cloudVmCommand: string | undefined;
+          try { cloudVmCommand = (await import('../scripts/release-loop/unattended-release.js')).releaseRehearsalConfig().cloudVmCommand; }
+          catch (error) { debug.log('fleet.cloud-burst', 'vm-command-unavailable', { error: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+          cloudBurstRuntime.installCloudBurstAuto({
+            pool,
+            ...(burstConfig && burstMember && finalMembers.includes(burstMember) ? { config: burstConfig } : {}),
+            ...(cloudVmCommand ? { cloudVmCommand } : {}),
+            ledger: new (await import('./control-plane/ledger.js')).ResourceLedger(),
+            isWarm: async (member, expectedImageDigest) => poolMod.checkPodPool([member], (args) => defaultKubectl(args)).ok
+              && cloudBurstRuntime.cloudPoolImageDigestReady(member.context, expectedImageDigest, (args) => defaultKubectl(args)),
+          });
         }
         const requestedPassEnv = String((opts as { podPassEnv?: string }).podPassEnv ?? '').split(',').map((k) => k.trim()).filter(Boolean);
         const grokKeyNames = ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'];
@@ -7141,22 +7165,28 @@ agentCmd.command('mirror')
         import('./user-config.js'), import('./hq/hq.js'), import('./task-agent/parent-host.js'),
         import('./task-orchestrator/surfaces/self-implement-pod.js'), import('./oauth/store.js'), import('./oauth/codex-account-store.js'),
       ]);
-      const { isCodexTokenOwnerHost, collectCodexMirrorCredentials } = await import('./oauth/codex-owner-mirror.js');
+      const { isCodexTokenOwnerHost, collectCodexMirrorCredentials, deliverCodexMirrorAndRecord } = await import('./oauth/codex-owner-mirror.js');
       if (!isCodexTokenOwnerHost(getUserConfig())) throw new Error('Codex 토큰 주인 호스트에서만 mirror push 를 실행할 수 있다');
       if (!hqFenceDecision('ledger-cli').run) throw new Error('HQ 주인 임대가 없어 Codex mirror push 를 거부한다');
       const target = parentHost.resolveParentHost({ host, cwd: process.cwd() }, { ...process.env, ELANOUS_TA_PARENT_HOST: undefined });
       if (!target) throw new Error('잘못된 원격 호스트 이름');
+      const { collectProviderAccessMirrors } = await import('./oauth/provider-access-mirror.js');
+      const providerMirrors = collectProviderAccessMirrors();
       const accounts = accountsStore.listCodexAccountsInStore();
-      if (!accounts.length) throw new Error('주인 Codex 계정이 없다');
       if (accounts.length > 16) throw new Error('Codex 계정이 16개를 넘어 미러를 안전하게 교체할 수 없다');
-      // REMOTE-MIRROR-SKIP-UNUSABLE (11-05): one expiring account (default) must not drop the fresh ones.
-      const { mirrors, skipped } = collectCodexMirrorCredentials(accounts.map((account) => account.name), (name) => {
-        const credential = pod.hostCredentials(name, auth.authStorePath(), () => '', { requireExplicitChatgptAuthMode: true });
-        return { elanousAuth: credential.elanousAuth, codexAuth: credential.codexAuth };
-      });
-      parentHost.installRemoteCodexCliMirror(target, mirrors);
-      const skippedText = skipped.length ? ` · 건너뜀=${skipped.map((s) => `${s.account}(${s.reason})`).join(',')}` : '';
-      console.log(`Codex 접근 미러 설치 완료 · host=${target.host} · accounts=${mirrors.length}${skippedText} · refresh=미포함`);
+      // One expiring account must not drop other providers or fresh Codex accounts.
+      const codex = (() => {
+        if (!accounts.length) return { mirrors: [] as Array<{ account: string; elanousAuth: string; codexAuth: string }>, skipped: [] as Array<{ account: string; reason: string }> };
+        return collectCodexMirrorCredentials(accounts.map((account) => account.name), (name) => {
+          const credential = pod.hostCredentials(name, auth.authStorePath(), () => '', { requireExplicitChatgptAuthMode: true });
+          return { elanousAuth: credential.elanousAuth, codexAuth: credential.codexAuth };
+        }, { allowEmpty: providerMirrors.length > 0 });
+      })();
+      if (!codex.mirrors.length && !providerMirrors.length) throw new Error('보낼 수 있는 OAuth 접근 토큰이 없다');
+      if (codex.mirrors.length) deliverCodexMirrorAndRecord(target.host, () => parentHost.installRemoteCodexCliMirror(target, codex.mirrors));
+      parentHost.installRemoteProviderAccessMirrors(target, providerMirrors);
+      const skippedText = codex.skipped.length ? ` · 건너뜀=${codex.skipped.map((s) => `${s.account}(${s.reason})`).join(',')}` : '';
+      console.log(`OAuth 접근 미러 설치 완료 · host=${target.host} · codex=${codex.mirrors.length} · providers=${providerMirrors.map((m) => m.provider).join(',') || '없음'}${skippedText} · refresh=미포함`);
     } catch (error) {
       console.error(`codex mirror push 실패: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
@@ -8394,7 +8424,11 @@ const selfDevCmd = program
         import('./harness/harness-space.js'),
       ]);
       let pipelineRuns = 0;
-      const executePipeline = async (pieceFeature?: string, relaunch?: boolean, base?: string) => {
+      const launchConfigSnapshot = getUserConfig();
+      const executePipeline = async (pieceFeature?: string, relaunch?: boolean, base?: string, repairConfig?: import('./user-config/types.js').UserConfig) => {
+        if (repairConfig !== undefined && repairConfig !== launchConfigSnapshot) {
+          throw new DevPipelineError('dev supervisor: repair launch config snapshot differs from the original launch');
+        }
         const runId = pipelineRuns === 0 ? devRunId : mintRunId();
         const runIdSource = pipelineRuns === 0 ? devRunIdSource : 'explicit' as const;
         pipelineRuns += 1;
@@ -8434,6 +8468,7 @@ const selfDevCmd = program
           },
           devOpts.supervise
             ? {
+                launchConfigSnapshot,
                 ...(devOpts.superviseRounds === undefined ? {} : { rounds: devCli.parsePositiveInt(devOpts.superviseRounds, '--supervise-rounds') }),
                 entryPoint: 'dev-cli',
                 observedRunId: devRunId,
@@ -8444,9 +8479,7 @@ const selfDevCmd = program
                   return applyManualGoalEvidenceRequirement(spec.input, resolveDevInputText(spec.input, (path) => readFileSync(path, 'utf8')));
                 })(),
                 executePiece: async (pieceFeature, opts) => {
-                  const rerun = await executeDevPipelineInvocation(executePipeline, {
-                    kind: 'fragment-reexecution', pieceFeature, ...(opts?.base === undefined ? {} : { base: opts.base }),
-                  });
+                  const rerun = await executePipeline(pieceFeature, undefined, opts?.base, opts?.launchConfigSnapshot);
                   if (rerun.kind !== 'self') throw new DevPipelineError(`dev supervisor: piece 재실행이 예상 밖 dispatch(kind=${rerun.kind})를 반환`);
                   return rerun.result;
                 },
@@ -9009,35 +9042,14 @@ if (!INDEX_FAST_ROOT) {
   registerQCommands(program);
 }
 
-// ── ask alias (script-friendly one-shot query) ──
+// ── contextual ask and context-free model question ──
 program
   .command('ask <text...>')
-  .description('Alias for `elanous chat --new`: send one query and print the reply')
+  .description('Ask one question with Elanous context, then print the reply')
   .option('--reuse', 'Reuse the active CLI session instead of creating a new one')
   .option('--session <id>', 'Continue an explicit session (id or unique prefix). Overrides --reuse and active session.')
   .option('--json', 'Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn.')
-  .option('--bare', 'Send only this text to the model: no Elanous preamble, project tree, memory, tools or session')
-  .action(async (parts: string[], opts: { reuse?: boolean; session?: string; json?: boolean; bare?: boolean }) => {
-    if (opts.bare) {
-      try {
-        const { askBare } = await import('./cli/ask-bare.js');
-        const llm = await import('./llm.js');
-        const { getUserConfig } = await import('./user-config.js');
-        const { trimToBudget } = await import('./tokens.js');
-        const result = await askBare({ text: parts.join(' '), deps: {
-          getUserConfig, decideProviderForConfig: llm.decideProviderForConfig, getProviderForConfig: llm.getProviderForConfig,
-          streamLLM: llm.streamLLM, trimToBudget,
-        } });
-        if (opts.json) process.stdout.write(JSON.stringify({ sessionId: null, ...result, logPath: null, budget: null, bare: true }) + '\n');
-        else process.stdout.write(result.reply.endsWith('\n') ? result.reply : `${result.reply}\n`);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (opts.json) process.stdout.write(JSON.stringify({ error: message, bare: true }) + '\n');
-        else console.error(`ask --bare failed: ${message}`);
-        process.exitCode = 1;
-      }
-      return;
-    }
+  .action(async (parts: string[], opts: { reuse?: boolean; session?: string; json?: boolean }) => {
     const cfg = reloadUserConfig();
     await runChatTurnCli({
       cfg,
@@ -9047,6 +9059,48 @@ program
       forceNew: false,
       json: opts.json === true,
       surface: 'ask',
+    });
+  });
+
+program
+  .command('do <text...>')
+  .description('Investigate a task and execute it in this terminal (the execution mode); destructive commands require y/N.')
+  .option('--json', 'Print the final result as JSON; plans and commands remain visible on stderr')
+  .option('--yes', 'Skip destructive-command confirmations for this invocation')
+  .action(async (parts: string[], opts: { json?: boolean; yes?: boolean }) => {
+    const text = parts.join(' ').trim();
+    if (!text) {
+      console.error("error: missing required argument 'text'");
+      process.exitCode = 1;
+      return;
+    }
+    const cfg = reloadUserConfig();
+    const confirmBashCommand = async (command: string): Promise<boolean> => {
+      if (opts.yes) return true;
+      if (!process.stdin.isTTY || !process.stderr.isTTY) {
+        console.error('Destructive command blocked: interactive y/N confirmation is unavailable. Rerun with --yes only if you intend this action.');
+        return false;
+      }
+      const { createInterface } = await import('node:readline/promises');
+      const prompt = createInterface({ input: process.stdin, output: process.stderr });
+      try {
+        const answer = await prompt.question(`실행할 명령: ${command}\n실행할까요? [y/N] `);
+        return /^y(?:es)?$/i.test(answer.trim());
+      } finally {
+        prompt.close();
+      }
+    };
+    await runChatTurnCli({
+      cfg, userText: text, explicitSessionId: undefined,
+      reuseActive: false, forceNew: true, json: opts.json === true,
+      surface: 'agent', enableTools: true, showToolPlan: true, confirmBashCommand, toolLogCategory: 'cli.do',
+      allowedToolNames: ['Read', 'Grep', 'Glob', 'ListDir', 'Bash'],
+      extraSystemPrompt: [
+        'You are `eln do`, a terminal agent. Investigate the requested task using read-only tools first.',
+        'Before every tool call, state a short plan and show the exact command you intend to run.',
+        'Carry out requested non-destructive actions. Before destructive actions, describe the impact and ask for y/N; the CLI enforces this for destructive shell commands.',
+        'Never claim a command succeeded unless its tool result confirms success. Keep the final report concise.',
+      ].join('\n'),
     });
   });
 
@@ -9912,16 +9966,22 @@ program
   .option('--json', 'Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn.')
   .option('--tools', 'Enable the tool-loop path (Read/Grep/Glob/ListDir/Edit/Write + Bash). Default off — chat is text-only by default for backward compatibility. `elanous agent` is a thin wrapper that flips this on.')
   .option('--goal-loop', 'Arm the across-turn goal loop (runGoalLoop): wrap the tool-loop so the model keeps iterating until the goal is complete (GOAL-COMPLETE evidence gate) or maxIterations. Requires --tools. Same engine as ACP/dashboard (재발명 없음). Config `llm.goalLoop.enabled` also arms it.')
+  .option('--solar-scene5-receipt <file>', 'Use the preceding graph run --json receipt as context for the fixed Solar demo scene 5 question')
   .option('--implement', 'Bypass the harness goal-loop guard for the legacy implementation child entrypoint')
-  .action(async (rawParts: string[], opts: { new?: boolean; continue?: boolean; resume?: string | boolean; session?: string; json?: boolean; tools?: boolean; goalLoop?: boolean; implement?: boolean }) => {
+  .action(async (rawParts: string[], opts: { new?: boolean; continue?: boolean; resume?: string | boolean; session?: string; json?: boolean; tools?: boolean; goalLoop?: boolean; solarScene5Receipt?: string; implement?: boolean }) => {
     // TUI-H8-FOLLOW ② — `chat --resume "질문"` 에서 Commander 가 질문 첫 낱말을 세션 id 로 먹지 않게.
     const { splitResumeArgument } = await import('./session/session-start.js');
     const split = splitResumeArgument(opts.resume, rawParts ?? [], 'chat', process.argv.slice(2));
     opts.resume = split.resume;
     const parts = split.parts;
-    if (parts.length === 0) {
+    if (parts.length === 0 && !opts.solarScene5Receipt) {
       console.error("error: missing required argument 'text'");
       process.exit(1);
+    }
+    if (parts.length > 0 && opts.solarScene5Receipt) {
+      console.error('error: --solar-scene5-receipt supplies the fixed scene 5 question; omit chat text');
+      process.exitCode = 1;
+      return;
     }
     if (getHarnessSpace() && opts.tools && opts.goalLoop && !opts.implement) {
       process.stderr.write('Harness chat goal-loop requires `dev --implement`; use that implementation entrypoint instead.\n');
@@ -12093,6 +12153,10 @@ program
 const tokenCmd = program
   .command('token')
   .description('Manage the ACP admin token');
+if (!INDEX_FAST_ROOT || INDEX_FAST_ROOT === 'member' || INDEX_FAST_ROOT === 'token') {
+  (require('./cli/member-key-token-cli.js') as typeof import('./cli/member-key-token-cli.js'))
+    .registerMemberKeyTokenCommands(program, tokenCmd);
+}
 
 // 단기 소유자 토큰 — 검증·시연·다른 기기에 영구 토큰을 건네지 않으려고(해시만 저장 · 기본 15분 · 최대 24시간).
 tokenCmd
@@ -13057,7 +13121,8 @@ async function main(): Promise<void> {
       return;
     }
     const { showNextTui } = await import('./tui/entry.js');
-    await showNextTui({ resumeSessionId, sidetabMode: getUserConfig().tui?.sidetab ?? 'collapsed' });
+    const tuiConfig = getUserConfig().tui;
+    await showNextTui({ resumeSessionId, sidetabMode: tuiConfig?.sidetab ?? 'collapsed', compactHeight: tuiConfig?.next?.compactHeight });
     bootTimer.phase('show-next');
     bootTimer.done();
   } else {

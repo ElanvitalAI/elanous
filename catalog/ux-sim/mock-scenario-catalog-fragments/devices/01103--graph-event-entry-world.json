@@ -1,0 +1,13 @@
+{
+  "id": "graph-event-entry-world",
+  "name": "Graph external event entry and internal bus world",
+  "implementation": ["src/ux-sim/graph-event-entry-world.ts", "src/ux-sim/graph-trigger-hook-device.ts", "src/graph-runner/graph-events.ts"],
+  "tests": ["src/ux-sim/graph-event-entry-world.test.ts"],
+  "target": "Deliver duplicate and out-of-order external events through an injected entry adapter and distinguish them from real run-scoped graph bus publications.",
+  "inputs": ["graph YAML", "external eventId/sequence/dedupeKey", "existing runId for internal publication"],
+  "observations": ["new runner start calls", "entry decisions", "run-scoped internal event envelopes"],
+  "entryCommands": ["bun test src/ux-sim/graph-event-entry-world.test.ts"],
+  "logsRecorded": "conditional",
+  "eventNames": ["node-arrival", "node-start", "node-end", "node-leave", "batch-closed"],
+  "recentUse": null
+}

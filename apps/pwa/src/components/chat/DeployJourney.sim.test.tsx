@@ -65,6 +65,7 @@ test('PWA 배포해줘: fake auth/host에서 N은 발행 0건, y는 공개 URL �
       sessionId: 'pwa-owner-chat',
       verifiedOwner: { id: 'owner-1' },
       appDeploymentSession: 'nexus-owner' as const,
+      appDeploymentOwner: { appSlug, memberId: 'owner-1', userSlug: 'alice', plan: 'free' as const, entitlements: {} },
       confirmChannels: [channel],
     };
     const deps = {

@@ -60,7 +60,7 @@ import { buildAcpContextPreambleForSession } from './telegram-commands.js';
 import { executionFooter } from './telegram-exec-footer.js';
 import { debug } from './debug/log.js';
 import { makeChunkProducer } from './session/streaming/chunk-producer.js';
-import { getUserConfig } from './user-config.js';
+import { getUserConfig } from './user-config/reader.js';
 import { detectCard, runCardFollowup, NotACardError } from './card-followup/core.js';
 import { localOcrText } from './telegram-card-followup.js';
 import type { GraphRun } from './graph-runner/runner-types.js';

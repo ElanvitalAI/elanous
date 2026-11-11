@@ -9,6 +9,9 @@
     "src/ux-sim/render-frame.ts",
     "src/ux-sim/headless-tui.ts",
     "src/ux-sim/input-history.ts",
+    "src/ux-sim/next-tui-core-input.ts",
+    "src/ux-sim/next-tui-route-device.ts",
+    "src/tui/core/input.ts",
     "src/ux-sim/slash-menu-frames.ts",
     "src/ux-sim/mock-seat-pty-frame.ts",
     "src/ux-sim/mock-seat-pty-frame-child.ts",
@@ -24,6 +27,8 @@
     "src/ux-sim/render-frame.test.ts",
     "src/ux-sim/headless-tui.test.ts",
     "src/ux-sim/input-history.test.ts",
+    "src/ux-sim/next-tui-core-input.test.ts",
+    "src/ux-sim/next-tui-route-device.test.ts",
     "src/ux-sim/slash-menu-frames.test.ts",
     "src/ux-sim/mock-seat-pty-frame.test.ts",
     "src/ux-sim/mock-seat-pty-sequence.test.ts",
@@ -48,6 +53,8 @@
     "20-minute cap interrupts a blocking AgentOutput wait while the child remains available"
   ],
   "entryCommands": [
+    "bun test src/ux-sim/next-tui-core-input.test.ts",
+    "bun test src/ux-sim/next-tui-route-device.test.ts",
     "bun test src/ux-sim/interaction.test.ts src/ux-sim/turn-states.test.ts src/ux-sim/render-frame.test.ts src/ux-sim/headless-tui.test.ts src/ux-sim/input-history.test.ts src/ux-sim/slash-menu-frames.test.ts src/ux-sim/mock-seat-pty-frame.test.ts src/ux-sim/mock-seat-pty-sequence.test.ts src/ux-sim/pty-key-modifiers-device.test.ts",
     "bun test src/ux-sim/agent-output-seat-cap.test.ts",
     "bun test src/ux-sim/user-config-tui-diet-sim.test.ts"

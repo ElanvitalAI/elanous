@@ -5,7 +5,7 @@
 #
 # ⭐ 읽는 법
 #   role        그래프 노드가 가리키는 «역할» 이름. 표준 템플릿·성형(launch/runtime)·힐·워크플로우·태스크가 «같은» 이름을 쓴다.
-#   kind        실행 권한 등급. agent·gate·git·judge·observe·hitl·subgraph (§7.2).
+#   kind        그래프 노드 종류. agent·gate·git·judge·observe·hitl·prompt·subgraph·classify·capability (§7.2).
 #   grain       atom(한 번의 호출) · composite(몇 분짜리 루프·여러 호출) · subgraph(그래프 한 판).
 #   outcomes    이 노드가 낼 수 있는 결과 — 간선 `on: outcome` 의 map 키가 된다.
 #   effects     none · worktree-write · git · network · spawn · pause · ui(웹·화면 조작)
@@ -21,7 +21,7 @@ catalog_id: elanous-node-catalog
 version: 1
 
 kinds:
-  existing: [agent, gate, git, judge, observe, hitl, prompt, subgraph, classify]
+  existing: [agent, gate, git, judge, observe, hitl, prompt, subgraph, classify, capability]
   proposed: {}
 
 roles:

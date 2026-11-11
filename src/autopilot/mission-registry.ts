@@ -18,7 +18,6 @@ import { elanousStateRoot } from './state-paths.js';
 import { addMissionEdge } from './mission-edges.js';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { budgetModel } from '../llm/model-defaults.js';
 import { TaskStore } from '../task-orchestrator/store.js';
 import { createMission as createToxMission, type Mission } from '../task-orchestrator/mission.js';
 import { apmSnapshotToMissionInit, apmStatusToMissionStatus, isAutopilotMission } from '../task-orchestrator/mission-autopilot.js';
@@ -161,7 +160,7 @@ function sanitizeLlmSlug(raw: string): string {
     .slice(0, 50).replace(/-+$/g, '');
 }
 
-type MissionSlugStream = typeof import('../llm.js').streamLLM;
+type MissionSlugStream = typeof import('../llm/role-stream.js').streamRoleLlm;
 
 let missionSlugStreamForTest: MissionSlugStream | undefined;
 
@@ -176,9 +175,7 @@ export function setMissionSlugStreamForTest(stream?: MissionSlugStream): void {
 export async function generateMissionSlug(goal: string): Promise<string> {
   const fallback = slugify(extractSlugSource(goal));
   try {
-    const model = budgetModel(); // 활성 provider의 빠른 요약 모델
-    const { streamLLM, resolveDefaultProvider } = await import('../llm.js');
-    const provider = resolveDefaultProvider(model);
+    const stream = missionSlugStreamForTest ?? (await import('../llm/role-stream.js')).streamRoleLlm;
     const prompt =
       'Summarize this mission into an English kebab-case title: lowercase words joined by hyphens, ' +
       'as descriptive as fits within ~50 characters (5-8 words is fine). Capture the core intent; ' +
@@ -187,8 +184,7 @@ export async function generateMissionSlug(goal: string): Promise<string> {
       'Example title: memory-lifecycle-decay-consolidation-archive\n\n' +
       `Goal: ${goal.slice(0, 600)}\nTitle:`;
     let full = '';
-    await (missionSlugStreamForTest ?? streamLLM)([{ role: 'user', content: prompt }], (_d, all) => { full = all; },
-      { model, ...(provider ? { provider } : {}) });
+    await stream('planning', [{ role: 'user', content: prompt }], (_d, all) => { full = all; });
     const slug = sanitizeLlmSlug(full);
     return slug || fallback;
   } catch { return fallback; }

@@ -198,15 +198,12 @@ test('next entry imports no dashboard module and legacy imports do not grow', ()
     return [...source.matchAll(/(?:from\s*|import\s*\()['"]([^'"]*dashboard\/[^'"]+)['"]/g)]
       .map((match) => `${path.slice(root.length + 1)}:${match[1]}`);
   }).sort();
-  // These are pre-existing legacy TUI references. The next entry's closure has none.
-  expect(dashboardImports).toEqual([
-    'input/pickers.ts:../../dashboard/finder-feedback-runtime.js',
-    'input/pickers.ts:../../dashboard/modals/preview.js',
-    'input/pickers.ts:../../dashboard/transfer-feedback-runtime.js',
-    'slash/term.ts:../../dashboard/input/terminal-modal-router.js',
-    'slash/term.ts:../../dashboard/slash-runtime/registry.js',
-    'slash/term.ts:../../dashboard/term-slash-runtime.js',
-  ]);
+  // Source: 내부 문서 `next-tui-production` §4 item 33; picker modules have no dashboard import.
+  expect(dashboardImports).toEqual([]);
+  const classicTerm = readFileSync(join(root, 'slash/term.ts'), 'utf8');
+  // Source: 내부 문서 `next-tui-production` sets the per-module 600-line limit.
+  expect(classicTerm.split('\n').length - 1).toBeLessThanOrEqual(600);
+  expect(classicTerm).not.toMatch(/(?:from\s*|import\s*\()['"][^'"]*dashboard\//);
   for (const path of ['entry.ts', 'input/composer.ts', 'chat/log-view.ts']) {
     expect(readFileSync(join(root, path), 'utf8')).not.toMatch(/(?:from\s*|import\s*\()['"][^'"]*dashboard\//);
   }
@@ -226,7 +223,7 @@ test('next TUI entry stays within the design budget (100 runtime-static files / 
 
 test('new next TUI production modules stay within 600 lines', () => {
   const root = import.meta.dir;
-  const existingOversized = new Set(['entry.ts', 'slash/term.ts', 'sidetab/attach.ts', 'input/pickers.ts']);
+  const existingOversized = new Set(['entry.ts', 'slash/term.ts', 'input/pickers.ts']);
   const oversized: string[] = [];
   for (const path of sourceFiles(root)) {
     if (readFileSync(path, 'utf8').split('\n').length > 600) {

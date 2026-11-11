@@ -61,9 +61,10 @@ export default function AppsPage() {
           <h1 className="mt-2 text-2xl font-semibold tracking-tight">앱 스튜디오</h1>
           <p className="mt-2 text-sm text-muted-foreground">앱별 시뮬레이션 흐름과 실제 운영 상태를 확인합니다.</p>
         </div>
-        <Link href="/design-check" className="rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium hover:bg-muted">
-          디자인 방향 고르기
-        </Link>
+        <div className="flex gap-2">
+          <Link href="/apps/report" className="rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium hover:bg-muted">공개 앱 신고</Link>
+          <Link href="/design-check" className="rounded-lg border border-border bg-card px-4 py-2 text-sm font-medium hover:bg-muted">디자인 방향 고르기</Link>
+        </div>
       </header>
 
       {state === 'loading' && <p role="status" className="text-sm text-muted-foreground">앱을 불러오는 중…</p>}

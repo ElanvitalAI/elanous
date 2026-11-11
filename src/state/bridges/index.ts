@@ -4,7 +4,5 @@
 // P1 state store. Each bridge is additive · caller owns dispose.
 
 export { bridgeContextKeysToStore } from './context-keys.js';
-export { bridgeWidgetHostToStore } from './widget-host.js';
 export { bridgePluginHostToStore } from './plugin-host.js';
 export { bridgeViewModeToContextKeys, publishViewMode } from './view-mode.js';
-export { bridgeWidgetHostFocusToStore } from './widget-host-focus.js';

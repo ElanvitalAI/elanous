@@ -20,7 +20,7 @@
 // production-grade for browser-side realtime feedback).
 
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import {
   createStreamingSTTProvider,
   resolveStreamingSTTProviderIdFromEnv,

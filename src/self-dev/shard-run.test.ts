@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, 
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { aggregateGateTestShards } from './shard-aggregate.js';
-import { maxAutomaticShardCount, resolveShardConcurrency, runBunShard, runBunShardAsync, runBunShardWithSpawn, runShardedGateTests, runShardedGateTestsAsync, SHARD_FAILURE_TAIL_BYTES, selfGateShardTimeoutMs, writeShardFailureEvidence, type ShardProcess } from './shard-run.js';
+import { maxAutomaticShardCount, resolveShardConcurrency, runBunShard, runBunShardAsync, runBunShardWithSpawn, runShardedGateTests, runShardedGateTestsAsync, SHARD_FAILURE_TAIL_BYTES, selfGateShardTimeoutMs, writeShardFailureEvidence, type ShardProcess, type ShardRunLifecycleEvent } from './shard-run.js';
 import { GATE_SPAWN_LANE_FILES, isGateSpawnLaneFile } from './spawn-lane-files.js';
 import { planFixedGateTestShards, type GateTestShard } from './shard-plan.js';
 import { withFakeBins, type FakeBinSpec } from '../ux-sim/fake-bin.js';
@@ -126,17 +126,28 @@ test('async measured concurrency one retains the existing planner and aggregate 
 test('async retry reruns only the incomplete bundle and leaves all attempts in plan order', async () => {
   const files = ['test/a.test.ts', 'test/b.test.ts', 'test/c.test.ts'];
   const calls = new Map<string, number>();
+  const lifecycle: string[] = [];
   const run = async (cwd: string, selected: readonly string[]) => {
     const key = `${cwd}:${selected[0]}`;
     calls.set(key, (calls.get(key) ?? 0) + 1);
     if (cwd === '/head' && selected[0] === files[1] && calls.get(key) === 1) return { exitCode: null, signal: 'SIGKILL' };
     return { exitCode: 0, junit: xml(selected, []) };
   };
-  const result = await runShardedGateTestsAsync('/head', files, 'HEAD', 3, run,
-    (async (_cwd: string, _ref: string, visit: (dir: string) => Promise<unknown>) => visit('/base')) as never, 8, { fixedDistribution: true, concurrency: 3 });
+  const result = await runShardedGateTestsAsync('/head', files, 'HEAD', files.length, run,
+    (async (_cwd: string, _ref: string, visit: (dir: string) => Promise<unknown>) => visit('/base')) as never, 8,
+    { fixedDistribution: true, concurrency: files.length, onShardLifecycle: (event: ShardRunLifecycleEvent) => {
+      lifecycle.push(event.type === 'attempt' ? `${event.type}:${event.shard.id}#${event.attempt.attempt}:${event.state}`
+        : event.type === 'running' ? `${event.type}:${event.shard.id}#${event.attempt}` : `${event.type}:${event.shard.id}`);
+    } });
   expect(result.aggregate.status).toBe('passed');
   expect(result.attempts.map((attempt) => [attempt.shardId, attempt.attempt]))
     .toEqual([['shard-1', 1], ['shard-2', 1], ['shard-3', 1], ['shard-2', 2]]);
+  expect(lifecycle).toEqual([
+    'planned:shard-1', 'planned:shard-2', 'planned:shard-3',
+    'running:shard-1#1', 'running:shard-2#1', 'running:shard-3#1',
+    'attempt:shard-1#1:done', 'attempt:shard-2#1:retry', 'attempt:shard-3#1:done',
+    'running:shard-2#2', 'attempt:shard-2#2:done',
+  ]);
   expect(calls.get(`/head:${files[0]}`)).toBe(1);
   expect(calls.get(`/head:${files[1]}`)).toBe(2);
 });

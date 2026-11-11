@@ -1,0 +1,44 @@
+# Declarative graph-yaml-world fixture. Validate against the runner-v2 sim contract before claiming PASS.
+apiVersion: elanous.dev/graph-sim/v1
+id: absorb-demo-world
+graph: ../graph/absorb-brief.yaml
+effects: fake-only
+clock:
+  timezone: Asia/Seoul
+  start: 2026-11-09T06:59:00+09:00
+providers:
+  store: fake-member-store
+  extract: fake-extractors
+  stt: fake-stt
+  ocr: fake-ocr
+  llm-judge: fake-llm
+  notify: fake-telegram-outbound
+  app-publish: fake-app-host
+fixtures:
+  members:
+    - id: member-demo
+      byok: true
+      apps:
+        - id: lecture-scrap-demo
+          screens: [scraps, lecture-notes]
+          rpc: [scraps.list, notes.create]
+    - id: member-empty
+      byok: false
+      apps: []
+  scraps:
+    - { id: scrap-text, owner: member-demo, kind: text, status: new, text: "시험 텍스트 노트" }
+    - { id: scrap-web, owner: member-demo, kind: web, status: new, url: https://example.test/article }
+    - { id: scrap-x, owner: member-demo, kind: x, status: new, url: https://x.com/example/status/1 }
+    - { id: scrap-youtube, owner: member-demo, kind: youtube, status: new, url: https://youtu.be/example }
+    - { id: scrap-voice, owner: member-demo, kind: voice, status: new, mediaRef: fake://member-demo/voice-1 }
+    - { id: scrap-video, owner: member-demo, kind: video, status: new, mediaRef: fake://member-demo/video-1 }
+    - { id: scrap-photo, owner: member-demo, kind: photo, status: new, mediaRef: fake://member-demo/photo-1 }
+    - { id: private-other-member, owner: member-empty, kind: text, status: new, text: "격리 확인용" }
+  suggestions:
+    - { id: suggestion-member-demo, owner: member-demo, appId: lecture-scrap-demo, evidenceScrapIds: [scrap-text] }
+    - { id: suggestion-other-member, owner: member-empty, appId: private-app, evidenceScrapIds: [private-other-member] }
+assertions:
+  - fixture declares member-owned scraps for [text, web, x, youtube, voice, video, photo] and a different-owner sentinel
+  - suggest_accept default N returns confirmation-required before its graph handler runs
+  - build simulator scenarios cover pass, failed, missing, and artifact-mismatched receipts plus a foreign-owner suggestion
+  - full y flow remains blocked until runGraph preserves capability result data and core verb exits

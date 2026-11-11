@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { listMockDeviceRequests } from './mock-device-requests.js';
+import { compareLlmCassetteRecording } from './device-fidelity.js';
 import { loadMockScenarioCatalog } from './mock-scenario-catalog.js';
 import { readSimCoverage, recordSimWorldCoverage } from './sim-coverage.js';
 
@@ -54,6 +55,27 @@ test('world coverage records private per-run paths, events and device fingerprin
     const catalog = loadMockScenarioCatalog();
     const reducedCatalog = { ...catalog, sourceModules: catalog.sourceModules.filter((module) => module.path !== 'src/ux-sim/fake-clock.ts') };
     expect(readSimCoverage({ catalog: reducedCatalog }).codePathCoverage.percent).toBeLessThanOrEqual(100);
+  } finally {
+    setTestStateRoot(previous ?? null);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an E4.5 mismatch retroactively yellows only green receipts that used its cassette', () => {
+  const previous = getTestStateRoot();
+  const root = mkdtempSync(join(tmpdir(), 'sim-coverage-cassette-'));
+  try {
+    setTestStateRoot(root);
+    const cassetteId = 'c'.repeat(64); // Source: SHA-256 cassette request key shape.
+    recordSimWorldCoverage({
+      world: { id: 'llm-cassette-world', spec: { devices: ['fake-llm'], events: [] } },
+      deviceIds: ['fake-llm'], pass: true, verdict: 'green', recordingIds: [cassetteId], scenarioFile,
+      observations: [{ event: 'llm-response', verdict: 'replayed' }],
+    });
+    compareLlmCassetteRecording(cassetteId, [{ type: 'text', delta: 'saved' }], [{ type: 'text', delta: 'drifted' }]);
+    const report = readSimCoverage();
+    expect(report.receipts).toHaveLength(1);
+    expect(report.receipts[0]).toMatchObject({ pass: false, verdict: 'yellow', recordingIds: [cassetteId] });
   } finally {
     setTestStateRoot(previous ?? null);
     rmSync(root, { recursive: true, force: true });

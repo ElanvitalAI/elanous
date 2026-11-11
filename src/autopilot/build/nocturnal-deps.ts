@@ -16,7 +16,7 @@ import type { NocturnalDeps } from './nocturnal-runner.js';
 import { critiquePhaseWithLLM, renderCritique } from '../mission-critique.js';
 import { recordAutonomousActionSafe } from '../../domains/autonomy-log.js';
 import { makePrManager, type PrManager } from '../pr-manager.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { debug } from '../../debug/log.js';
 import { lookupLlmTierSpec } from '../../model-tier/index.js';
 

@@ -9,7 +9,7 @@ import {
   createMissionNextActionSource, MISSION_ACTION_KINDS, type PhaseActionState,
 } from '../../intent-prediction/next-action-source.js';
 import { createLocalShowroomLaneCallable } from '../../task-orchestrator/surfaces/showroom-lane-callable.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { TaskStore } from '../../task-orchestrator/store.js';
 
 /** refId(phaseId) → 페이즈 액션 상태(TaskStore 역추적·fail-soft null). done/failed 카드 mount 당 1회. */

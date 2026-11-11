@@ -2,7 +2,7 @@ import { expect, spyOn, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { closeLocalChatSession, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus, runLocalChatTurn, setNextSidetabHandler, setNextSidetabIpcEnabled } from './local-chat-turn.js';
+import { closeLocalChatSession, onLocalChatBackgroundStatus, onLocalChatSelfHealthStatus, requestLocalChatShellActivitySnapshot, runLocalChatTurn, setNextSidetabHandler, setNextSidetabIpcEnabled, setNextTuiShellApprovalCancelHandler, setNextTuiShellApprovalHandler } from './local-chat-turn.js';
 import { debug } from '../debug/log.js';
 import { BackgroundJobStatus } from '../tui/chat/background-job-status.js';
 import { appendMessage, createSession, loadSession, setActiveSessionId } from '../session/index.js';
@@ -11,6 +11,8 @@ import { CHAT_DEFAULTS } from '../user-config/chat.js';
 import type { CompactProvider } from '../compact/provider.js';
 import { compactNextTuiSession, isCompactCommand, type NextTuiCompactOutcome } from '../tui/slash/compact.js';
 import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { LONG_SHELL_ESC_CONFIRMATION_MS, monotonicNowMs } from '../esc-abort-gate.js';
+import { clearSessionTierOverride, setSessionTierOverride } from '../model-tier/session-override.js';
 
 test('a cancellation before lazy turn loading never starts a child', async () => {
   const abort = new AbortController();
@@ -27,6 +29,7 @@ test('a prompt reaches JSONL stdin and never appears in child argv', async () =>
     for await (const line of createInterface({ input: process.stdin })) {
       const input = JSON.parse(line);
       if (input.prompt !== 'private prompt text') process.exit(4);
+      if (input.modelTier !== 'budget') process.exit(7);
       if (process.argv.includes(input.prompt)) process.exit(2);
     const configFlag = process.argv.indexOf('--config-dir');
     if (configFlag < 0 || process.argv[configFlag + 1] !== process.env.EXPECTED_CONFIG_DIR) process.exit(3);
@@ -42,6 +45,7 @@ test('a prompt reaches JSONL stdin and never appears in child argv', async () =>
   process.env.EXPECTED_CONFIG_DIR = getElanousConfigDir();
   const priorSidetabIpc = process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC;
   try {
+    setSessionTierOverride('test-session', { llm: 'budget', rationale: 'next TUI /model fast' });
     process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC = '1';
     setNextSidetabHandler(null);
     setNextSidetabIpcEnabled(false);
@@ -52,6 +56,7 @@ test('a prompt reaches JSONL stdin and never appears in child argv', async () =>
       surface: 'tui-local', sessionId: 'test-session', provider: 'grok', model: 'grok-4.7',
     });
   } finally {
+    clearSessionTierOverride('test-session');
     await closeLocalChatSession('test-session');
     setNextSidetabIpcEnabled(false);
     if (priorSidetabIpc === undefined) delete process.env.ELANOUS_NEXT_TUI_SIDETAB_IPC;
@@ -92,6 +97,148 @@ test('the sticky REPL resolves sidetab IPC against the current TUI handler', asy
     setNextSidetabHandler(null);
     setNextSidetabIpcEnabled(false);
     await closeLocalChatSession('sidetab-ipc');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the sticky REPL routes risky Bash approval IPC to the current human prompt handler', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-shell-approval-ipc-'));
+  const cli = join(dir, 'shell-approval-ipc-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    if (process.env.ELANOUS_NEXT_TUI_SHELL_APPROVAL_IPC !== '1') process.exit(12);
+    for await (const line of createInterface({ input: process.stdin })) {
+      const request = JSON.parse(line);
+      const response = new Promise((resolve) => process.once('message', resolve));
+      process.send({ type: 'elanous.shell-approval.call', callId: 'approval-1', command: 'rm -rf /tmp/demo' });
+      const result = await response;
+      console.log(JSON.stringify({ event: 'delta', turnId: request.id, text: JSON.stringify(result) }));
+      console.log(JSON.stringify({ event: 'result', turnId: request.id, reply: 'done', provider: 'test', model: 'ipc' }));
+    }
+  `);
+  const commands: string[] = [];
+  const replies: string[] = [];
+  try {
+    setNextTuiShellApprovalHandler(async (command) => { commands.push(command); return true; });
+    await runLocalChatTurn('shell-approval-ipc', 'test approval', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    expect(commands).toEqual(['rm -rf /tmp/demo']);
+    expect(JSON.parse(replies[0] ?? 'null')).toEqual({
+      type: 'elanous.shell-approval.result', callId: 'approval-1', approved: true,
+    });
+  } finally {
+    setNextTuiShellApprovalHandler(null);
+    await closeLocalChatSession('shell-approval-ipc');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a sticky REPL created before the human handler is installed still denies Bash approval', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-shell-approval-deny-'));
+  const cli = join(dir, 'shell-approval-deny-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    if (process.env.ELANOUS_NEXT_TUI_SHELL_APPROVAL_IPC !== '1') process.exit(12);
+    for await (const line of createInterface({ input: process.stdin })) {
+      const request = JSON.parse(line);
+      const response = new Promise((resolve) => process.once('message', resolve));
+      process.send({ type: 'elanous.shell-approval.call', callId: 'approval-early', command: 'rm -rf /tmp/demo' });
+      const result = await response;
+      console.log(JSON.stringify({ event: 'delta', turnId: request.id, text: JSON.stringify(result) }));
+      console.log(JSON.stringify({ event: 'result', turnId: request.id, reply: 'done', provider: 'test', model: 'ipc' }));
+    }
+  `);
+  const replies: string[] = [];
+  try {
+    setNextTuiShellApprovalHandler(null);
+    await runLocalChatTurn('shell-approval-deny', 'test approval', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    expect(JSON.parse(replies[0] ?? 'null')).toEqual({
+      type: 'elanous.shell-approval.result', callId: 'approval-early', approved: false,
+    });
+  } finally {
+    setNextTuiShellApprovalHandler(null);
+    await closeLocalChatSession('shell-approval-deny');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('child timeout cancels one request id and the next Bash approval remains available', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-shell-approval-cancel-'));
+  const cli = join(dir, 'shell-approval-cancel-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    let turn = 0;
+    for await (const line of createInterface({ input: process.stdin })) {
+      const request = JSON.parse(line);
+      turn += 1;
+      const callId = 'approval-' + turn;
+      const response = new Promise((resolve) => process.once('message', resolve));
+      process.send({ type: 'elanous.shell-approval.call', callId, command: 'rm -rf /tmp/demo-' + turn });
+      if (turn === 1) setTimeout(() => process.send({ type: 'elanous.shell-approval.cancel', callId, reason: 'timeout' }), 20);
+      const result = await response;
+      console.log(JSON.stringify({ event: 'delta', turnId: request.id, text: JSON.stringify(result) }));
+      console.log(JSON.stringify({ event: 'result', turnId: request.id, reply: 'done', provider: 'test', model: 'ipc' }));
+    }
+  `);
+  const cancellations: string[] = [];
+  const replies: string[] = [];
+  let resolveFirst: ((approved: boolean) => void) | null = null;
+  try {
+    setNextTuiShellApprovalHandler((_command, callId) => callId === 'approval-1'
+      ? new Promise<boolean>((resolve) => { resolveFirst = resolve; })
+      : Promise.resolve(callId === 'approval-2'));
+    setNextTuiShellApprovalCancelHandler((callId, reason) => {
+      cancellations.push(`${callId}:${reason}`);
+      if (callId === 'approval-1') resolveFirst?.(false);
+    });
+    await runLocalChatTurn('shell-approval-cancel', 'first', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    await runLocalChatTurn('shell-approval-cancel', 'second', new AbortController().signal, cli, undefined, (delta) => replies.push(delta));
+    expect(cancellations).toEqual(['approval-1:timeout']);
+    expect(JSON.parse(replies[0] ?? 'null')).toMatchObject({ callId: 'approval-1', approved: false });
+    expect(JSON.parse(replies[1] ?? 'null')).toMatchObject({ callId: 'approval-2', approved: true });
+  } finally {
+    setNextTuiShellApprovalHandler(null);
+    setNextTuiShellApprovalCancelHandler(null);
+    await closeLocalChatSession('shell-approval-cancel');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('turn abort cancels the matching pending Bash prompt before closing the child', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-shell-approval-abort-'));
+  const cli = join(dir, 'shell-approval-abort-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    for await (const line of createInterface({ input: process.stdin })) {
+      const request = JSON.parse(line);
+      const callId = 'approval-abort';
+      process.send({ type: 'elanous.shell-approval.call', callId, command: 'rm -rf /tmp/abort' });
+      await new Promise((resolve) => process.once('message', resolve));
+      console.log(JSON.stringify({ event: 'result', turnId: request.id, reply: 'done', provider: 'test', model: 'ipc' }));
+    }
+  `);
+  const abort = new AbortController();
+  const cancellation: string[] = [];
+  let releasePrompt: ((approved: boolean) => void) | null = null;
+  let signalPromptStarted: (() => void) | null = null;
+  const promptStarted = new Promise<void>((resolve) => { signalPromptStarted = resolve; });
+  try {
+    setNextTuiShellApprovalHandler(() => new Promise<boolean>((resolve) => {
+      releasePrompt = resolve;
+      signalPromptStarted?.();
+    }));
+    setNextTuiShellApprovalCancelHandler((callId, reason) => {
+      cancellation.push(`${callId}:${reason}`);
+      releasePrompt?.(false);
+    });
+    const turn = runLocalChatTurn('shell-approval-abort', 'abort this turn', abort.signal, cli);
+    await promptStarted;
+    abort.abort();
+    await expect(turn).rejects.toThrow('응답을 취소했습니다');
+    expect(cancellation).toEqual(['approval-abort:turn-cancelled']);
+  } finally {
+    setNextTuiShellApprovalHandler(null);
+    setNextTuiShellApprovalCancelHandler(null);
+    await closeLocalChatSession('shell-approval-abort');
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -172,6 +319,109 @@ test('delta frames reach only their turn before the final JSONL response', async
   }
 });
 
+test('shell activity frames forward only valid current-turn Bash and RunShell boundaries', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-shell-activity-'));
+  const cli = join(dir, 'shell-activity-cli.ts');
+  // Source: model the start event arriving after the configured confirmation boundary.
+  const delayedStartMonotonicMs = monotonicNowMs() - LONG_SHELL_ESC_CONFIRMATION_MS - (LONG_SHELL_ESC_CONFIRMATION_MS / LONG_SHELL_ESC_CONFIRMATION_MS);
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    let requestSnapshot;
+    const snapshotRequested = new Promise(resolve => { requestSnapshot = resolve; });
+    process.on('message', message => { if (message.type === 'elanous.next-tui.shell-snapshot') requestSnapshot(); });
+    for await (const line of createInterface({ input: process.stdin })) {
+      const input = JSON.parse(line);
+      console.log(JSON.stringify({ event: 'shell-activity', turnId: 'stale-turn', phase: 'start', id: 'stale', name: 'Bash' }));
+      console.log(JSON.stringify({ event: 'shell-activity', turnId: input.id, phase: 'start', id: 'shell-1', name: 'Bash', startedAtMonotonicMs: ${delayedStartMonotonicMs} }));
+      await snapshotRequested;
+      console.log(JSON.stringify({ event: 'shell-activity', turnId: input.id, phase: 'snapshot', calls: [{ id: 'shell-2', name: 'RunShell', startedAtMonotonicMs: ${delayedStartMonotonicMs} }] }));
+      console.log(JSON.stringify({ event: 'shell-activity', turnId: input.id, phase: 'finish', id: 'shell-1', name: 'Bash' }));
+      console.log(JSON.stringify({ event: 'shell-activity', turnId: input.id, phase: 'start', id: 'invalid', name: 'Read' }));
+      console.log(JSON.stringify({ event: 'result', turnId: input.id, reply: 'done' }));
+    }
+  `);
+  const activity: Array<
+    | { phase: 'start'; id: string; name: string; startedAtMonotonicMs: number }
+    | { phase: 'finish'; id: string; name: string }
+    | { phase: 'snapshot'; calls: Array<{ id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number }> }
+  > = [];
+  try {
+    const turn = runLocalChatTurn('shell-activity-session', 'one', new AbortController().signal, cli,
+      undefined, undefined, {}, [], undefined, undefined, (event) => activity.push(event));
+    for (let tries = 0; tries < 100 && !activity.some((event) => event.phase === 'start'); tries++) await Bun.sleep(10);
+    expect(requestLocalChatShellActivitySnapshot('shell-activity-session')).toBe(true);
+    await turn;
+    expect(activity).toEqual([
+      { phase: 'start', id: 'shell-1', name: 'Bash', startedAtMonotonicMs: delayedStartMonotonicMs },
+      { phase: 'snapshot', calls: [{ id: 'shell-2', name: 'RunShell', startedAtMonotonicMs: delayedStartMonotonicMs }] },
+      { phase: 'finish', id: 'shell-1', name: 'Bash' },
+    ]);
+  } finally {
+    await closeLocalChatSession('shell-activity-session');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('tool activity forwards a current-turn non-shell tool and a fresh execution snapshot', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-tool-activity-'));
+  const cli = join(dir, 'tool-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    let turnId;
+    process.on('message', message => {
+      if (message.type !== 'elanous.next-tui.shell-snapshot' || message.turnId !== turnId) return;
+      console.log(JSON.stringify({ event: 'tool-activity', turnId, phase: 'snapshot', calls: [{ id: 'read-1', name: 'Read' }, { id: 'agent-1', name: 'Agent' }] }));
+      console.log(JSON.stringify({ event: 'tool-activity', turnId, phase: 'finish', id: 'read-1', name: 'Read' }));
+      console.log(JSON.stringify({ event: 'result', turnId, reply: 'done' }));
+    });
+    for await (const line of createInterface({ input: process.stdin })) {
+      turnId = JSON.parse(line).id;
+      console.log(JSON.stringify({ event: 'tool-activity', turnId: 'stale-turn', phase: 'start', id: 'stale', name: 'Bash' }));
+      console.log(JSON.stringify({ event: 'tool-activity', turnId, phase: 'start', id: 'read-1', name: 'Read' }));
+    }
+  `);
+  const activity: Array<{ phase: string; id?: string; name?: string; calls?: Array<{ id: string; name: string }> }> = [];
+  try {
+    const turn = runLocalChatTurn('tool-activity-session', 'one', new AbortController().signal, cli,
+      undefined, undefined, {}, [], undefined, undefined, undefined, (event) => activity.push(event));
+    for (let tries = 0; tries < 100 && activity.length === 0; tries++) await Bun.sleep(10);
+    expect(requestLocalChatShellActivitySnapshot('tool-activity-session')).toBe(true);
+    await turn;
+    expect(activity).toEqual([
+      { phase: 'start', id: 'read-1', name: 'Read' },
+      { phase: 'snapshot', calls: [{ id: 'read-1', name: 'Read' }, { id: 'agent-1', name: 'Agent' }] },
+      { phase: 'finish', id: 'read-1', name: 'Read' },
+    ]);
+  } finally {
+    await closeLocalChatSession('tool-activity-session');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('transient status frames reach the status callback without becoming reply text', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-status-frame-'));
+  const cli = join(dir, 'status-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    for await (const line of createInterface({ input: process.stdin })) {
+      const input = JSON.parse(line);
+      console.log(JSON.stringify({ event: 'status', turnId: input.id, text: 'ctx 410,000 chars / 400,000' }));
+      console.log(JSON.stringify({ event: 'result', turnId: input.id, reply: '요약 완료' }));
+    }
+  `);
+  const statuses: string[] = [];
+  const replies: Array<{ text: string; replace?: boolean }> = [];
+  try {
+    await runLocalChatTurn('status-session', 'summarize context', new AbortController().signal, cli,
+      undefined, (text, replace) => replies.push({ text, replace }), {}, [], (line) => statuses.push(line));
+    expect(statuses).toEqual(['ctx 410,000 chars / 400,000']);
+    expect(replies).toEqual([]);
+  } finally {
+    await closeLocalChatSession('status-session');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('self health frames require the active turn and session and clear on child exit', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'next-tui-health-frame-'));
   const cli = join(dir, 'health-cli.ts');
@@ -196,6 +446,33 @@ test('self health frames require the active turn and session and clear on child 
   } finally {
     stop();
     await closeLocalChatSession('health-session');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Agent progress frames reach only the active turn and carry no child output', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-agent-'));
+  const cli = join(dir, 'agent-cli.ts');
+  writeFileSync(cli, `
+    import { createInterface } from 'node:readline';
+    for await (const line of createInterface({ input: process.stdin })) {
+      const input = JSON.parse(line);
+      console.log(JSON.stringify({ event: 'agent', turnId: 'stale', phase: 'start', id: 'x', description: 'ignore' }));
+      console.log(JSON.stringify({ event: 'agent', turnId: input.id, phase: 'start', id: 'a', description: '코드 조사' }));
+      console.log(JSON.stringify({ event: 'agent', turnId: input.id, phase: 'finish', id: 'a', status: 'done' }));
+      console.log(JSON.stringify({ event: 'result', turnId: input.id, reply: 'ok' }));
+    }
+  `);
+  const events: Array<{ phase: string; id: string; description?: string; status?: string }> = [];
+  try {
+    await runLocalChatTurn('agent-session', 'question', new AbortController().signal, cli,
+      undefined, undefined, {}, [], undefined, (event) => events.push(event));
+    expect(events).toEqual([
+      { phase: 'start', id: 'a', description: '코드 조사' },
+      { phase: 'finish', id: 'a', status: 'done' },
+    ]);
+  } finally {
+    await closeLocalChatSession('agent-session');
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -314,6 +591,67 @@ test('a REPL turn error keeps the child alive for the next prompt', async () => 
     await expect(runLocalChatTurn('retry', 'second', new AbortController().signal, cli)).resolves.toEqual({ goalComplete: false });
   } finally {
     await closeLocalChatSession('retry');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an onboarding refusal reaches the Next TUI as its actionable stderr message', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-onboarding-refusal-'));
+  const cli = join(dir, 'onboarding-refusal.ts');
+  const guidance = 'No config yet — run `elanous` once interactively (onboarding) before using repl --json / --stdin-jsonl.';
+  writeFileSync(cli, `process.stderr.write(${JSON.stringify(guidance + '\n')}); process.exit(2);`);
+  try {
+    await expect(runLocalChatTurn('onboarding-refusal', 'first prompt', new AbortController().signal, cli))
+      .rejects.toThrow(guidance);
+  } finally {
+    await closeLocalChatSession('onboarding-refusal');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('onboarding refusal does not wait for a descendant holding the stderr pipe open', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-inherited-stderr-'));
+  const cli = join(dir, 'inherited-stderr.ts');
+  const pidFile = join(dir, 'descendant-pid');
+  const guidance = 'No config yet — run elanous onboarding';
+  writeFileSync(cli, `
+    import { writeFileSync } from 'node:fs';
+    import { spawn } from 'node:child_process';
+    const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+    writeFileSync(${JSON.stringify(pidFile)}, String(descendant.pid));
+    process.stderr.write(${JSON.stringify(guidance + '\n')});
+    process.exit(2);
+  `);
+  try {
+    const outcome = await Promise.race([
+      runLocalChatTurn('inherited-stderr', 'first prompt', new AbortController().signal, cli)
+        .then(() => 'unexpected success', (error: Error) => error.message),
+      Bun.sleep(1500).then(() => 'timed out'), // Source: #36702 — reject before inherited pipe closes.
+    ]);
+    expect(outcome).toBe(guidance);
+    const pid = Number(readFileSync(pidFile, 'utf8'));
+    expect(() => process.kill(pid, 0)).not.toThrow();
+  } finally {
+    if (existsSync(pidFile)) {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8'))); } catch { /* already exited */ }
+    }
+    await closeLocalChatSession('inherited-stderr');
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the real REPL onboarding gate reaches the Next TUI without a JSONL frame', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'next-tui-real-onboarding-'));
+  const cli = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
+  setElanousConfigDir(dir);
+  try {
+    await expect(runLocalChatTurn('real-onboarding-refusal', 'first prompt', new AbortController().signal, cli))
+      .rejects.toThrow('No config yet — run `elanous` once interactively (onboarding)');
+  } finally {
+    await closeLocalChatSession('real-onboarding-refusal');
+    resetElanousConfigDir();
     rmSync(dir, { recursive: true, force: true });
   }
 });

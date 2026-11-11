@@ -1,3 +1,4 @@
+import { isRecord } from '../../primitives/guards.js';
 export interface AppSimulationIssue {
   readonly path: string;
   readonly reason: string;
@@ -20,12 +21,8 @@ export const APP_SIMULATION_DEVICES: AppSimulationDeviceRegistry = {
   'share-link': { profiles: ['ok', 'expired', 'rate-limited'], events: ['expired', 'revoked'] },
 };
 
-type RecordValue = Record<string, unknown>;
 const SECRET_KEY = /(?:secret|credential|token|api.?key|password|account|url)/i;
 
-function isRecord(value: unknown): value is RecordValue {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 function issue(errors: AppSimulationIssue[], path: string, reason: string): void {
   errors.push({ path, reason });
@@ -83,8 +80,11 @@ function validateStep(step: unknown, path: string, roles: ReadonlySet<string>, a
     if (typeof event !== 'string' || !/^[a-z0-9-]+\.[a-z0-9-]+$/.test(event)) issue(errors, `${path}/inject`, '장치.사건 이름이어야 한다');
     if (step.at !== undefined && (typeof step.at !== 'string' || !/^\+\d+(?:ms|s|m|h)$/.test(step.at))) issue(errors, `${path}/at`, '주입 시각은 +<수><ms|s|m|h> 형식이어야 한다');
   }
-  const allowed = kind === 'inject' ? new Set(['inject', 'at']) : new Set([kind, 'as']);
+  const allowed = kind === 'inject' ? new Set(['inject', 'at'])
+    : kind === 'rpc' ? new Set(['rpc', 'as', 'params']) : new Set(['action', 'as', 'input']);
   if (Object.keys(step).some((key) => !allowed.has(key))) issue(errors, path, '단계에 알 수 없는 필드가 있다');
+  if (kind === 'rpc' && step.params !== undefined && !isRecord(step.params)) issue(errors, `${path}/params`, 'RPC params 는 맵이어야 한다');
+  if (kind === 'action' && step.input !== undefined && !isRecord(step.input)) issue(errors, `${path}/input`, 'action input 은 맵이어야 한다');
 }
 
 function validateExpectation(value: unknown, path: string, errors: AppSimulationIssue[]): void {

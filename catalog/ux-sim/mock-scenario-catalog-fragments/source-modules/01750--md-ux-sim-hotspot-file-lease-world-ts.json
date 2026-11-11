@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-HOTSPOT-FILE-LEASE-WORLD-TS",
+  "path": "src/ux-sim/hotspot-file-lease-world.ts",
+  "boundary": "Runs production planned-start forecasting with the train-manager simulator to exercise hotspot overlap, unknown inventory, and clean-start paths; also records conflict-forecast ledger rows beside the hermetic train-manager world result.",
+  "deviceIds": ["hotspot-file-lease-world", "train-manager-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

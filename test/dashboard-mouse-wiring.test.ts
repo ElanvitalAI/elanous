@@ -5,7 +5,6 @@ import type { ActiveProviderInfo } from '../src/provider-summary.js';
 import type { ModalSurface } from '../src/display/modal-stack.js';
 import type { DisplayMouseEvent } from '../src/display/types.js';
 import { Printer } from '../src/ui/printer.js';
-import { createHoverTracker } from '../src/ui/hover-tracker.js';
 import { createConversationPopupHost } from '../src/conv-dash/popup-host.js';
 import { debug } from '../src/debug/log.js';
 
@@ -61,17 +60,15 @@ function mkDeps(overrides: Partial<Parameters<typeof createDashboardMouseWiring>
   const recents: string[] = ['/home/a', '/home/b'];
   const activated: RotationEntry[] = [];
   const switched: string[] = [];
-  const openedDockWindows: string[] = [];
-  const openedDockSurfaces: string[] = [];
-  const exitProgramCalls: number[] = [];
   const appliedViews: string[] = [];
   const switchedVirtualWindows: number[] = [];
   const movedVirtualWindows: Array<'left' | 'right'> = [];
   const switchedToDashboardMain: number[] = [];
   const openedWindowPicker: number[] = [];
+  const exitProgramCalls: number[] = [];
 
   return {
-    pushed, rotation, recents, activated, switched, openedDockWindows, openedDockSurfaces, exitProgramCalls, appliedViews, switchedVirtualWindows, movedVirtualWindows, switchedToDashboardMain, openedWindowPicker,
+    pushed, rotation, recents, activated, switched, appliedViews, switchedVirtualWindows, movedVirtualWindows, switchedToDashboardMain, openedWindowPicker, exitProgramCalls,
     get redraws() { return redraws; },
     wiring: createDashboardMouseWiring({
       termSize: () => ({ rows: 24, cols: 120 }),
@@ -80,18 +77,7 @@ function mkDeps(overrides: Partial<Parameters<typeof createDashboardMouseWiring>
       setActiveModel: e => { activated.push(e); },
       getRecentWds: () => recents,
       setSessionWd: p => { switched.push(p); },
-      getDockMenuWindowTargets: () => [
-        { id: 'browser', label: 'Browser', description: 'Open Browser in a popup window' },
-        { id: 'preview', label: 'Preview', description: 'Open Preview in a popup window' },
-      ],
-      onOpenDockWindow: async (paneId) => { openedDockWindows.push(paneId); },
-      getDockMenuSurfaceTargets: () => [
-        { id: 'pane:browser', label: 'Browser popup', group: 'Panes' },
-        { id: 'companion:clipboard', label: 'Clipboard companion', group: 'Companions' },
-        { id: 'vw:browser', label: 'Browser virtual window', group: 'Virtual Windows' },
-      ],
-      onOpenDockSurface: async (surfaceId) => { openedDockSurfaces.push(surfaceId); },
-      onExitProgram: async () => { exitProgramCalls.push(Date.now()); },
+      onExitProgram: () => { exitProgramCalls.push(Date.now()); },
       getDashboardViews: () => [
         { id: '1', label: 'Normal', description: 'View 1', active: true },
         { id: 'agents', label: 'Agents', description: 'View 4', active: false },
@@ -262,55 +248,18 @@ describe('MX11b dashboard-mouse-wiring — pill click dispatch', () => {
     expect(h.wiring.hasActivePopup()).toBe(true);
   });
 
-  test('SRF-4: shellRollup pill click opens the rollup popup', () => {
-    const picked: string[] = [];
-    const h = mkDeps({
-      getShellRollupEntries: () => [
-        { id: 'aaaa', chip: '▶ run  ', mode: 'vw', status: 'running', label: 'runner' },
-        { id: 'bbbb', chip: '⏸ bg   ', mode: 'bg', status: 'backgrounded' },
-      ],
-      onShellRollupPick: (id) => picked.push(id),
-    });
+  test('shell rollup status remains read-only without a popup', () => {
+    const h = mkDeps();
     h.wiring.buildStatusLine({
       swd: '/x', providerInfo: PROVIDER, gitState: 'main',
-      shellRollup: { running: 1, backgrounded: 1 },
+      shellRollup: { running: 1, backgrounded: 0 },
     });
     h.wiring.setStatusRow(22);
-    const snap = h.wiring._snapshot();
-    const rollupPill = snap.pills.find(p => p.name === 'shellRollup');
-    expect(rollupPill).toBeDefined();
-    const consumed = h.wiring.handleMouse(mouse('click', 22, rollupPill!.startCol + 2));
-    expect(consumed).toBe(true);
-    expect(h.pushed).toHaveLength(1);
-    expect(h.pushed[0]?.id).toBe('recipe:shell-rollup');
-    expect(h.wiring.hasActivePopup()).toBe(true);
-  });
-
-  test('SRF-4: empty rollup → toast + no popup', () => {
-    const h = mkDeps({
-      getShellRollupEntries: () => [],
-    });
-    h.wiring.buildStatusLine({
-      swd: '/x', providerInfo: PROVIDER, gitState: 'main',
-      shellRollup: { running: 0, backgrounded: 0 },
-    });
-    h.wiring.setStatusRow(22);
-    const rollupPill = h.wiring._snapshot().pills.find(p => p.name === 'shellRollup');
-    // rollup segment hides when both counts are 0, so no pill to click —
-    // re-test with non-zero counts (stale snapshot scenario: segment
-    // still visible but getShellRollupEntries returns empty).
-    if (!rollupPill) {
-      h.wiring.buildStatusLine({
-        swd: '/x', providerInfo: PROVIDER, gitState: 'main',
-        shellRollup: { running: 2, backgrounded: 0 },
-      });
-    }
-    const pill = h.wiring._snapshot().pills.find(p => p.name === 'shellRollup')!;
-    const consumed = h.wiring.handleMouse(mouse('click', 22, pill.startCol + 1));
-    expect(consumed).toBe(true);
+    const pill = h.wiring._snapshot().pills.find(p => p.name === 'shellRollup');
+    expect(pill).toBeDefined();
+    h.wiring.handleMouse(mouse('click', 22, pill!.startCol + 1));
     expect(h.pushed).toHaveLength(0);
-    const toasts = h.wiring.toasts().snapshot();
-    expect(toasts.some(t => t.text.includes('No shell handles'))).toBe(true);
+    expect(h.wiring.hasActivePopup()).toBe(false);
   });
 
   test('rotation empty + fallback active model → cycle reuses the active entry', () => {
@@ -356,31 +305,7 @@ describe('MX11b dashboard-mouse-wiring — pill click dispatch', () => {
     expect(h.pushed[0]?.id).toBe('recipe:conversation-popup-shell');
   });
 
-  test('pane hover bridge forwards conversation-message hits with stable row identity', () => {
-    const events: Array<{ kind: string; id: string }> = [];
-    const hoverTracker = createHoverTracker();
-    const h = mkDeps({
-      hoverTracker,
-      onPaneHoverEvent: (ev) => {
-        events.push({ kind: ev.kind, id: ev.target.id });
-      },
-      getPaneHitTarget: () => ({
-        kind: 'pane-body',
-        paneId: 'pane-conv',
-        hit: {
-          kind: 'conversation-message',
-          sessionId: 'sess-1',
-          messageId: 'msg-2',
-          role: 'assistant',
-          rangeStart: 4,
-          rangeEnd: 9,
-        },
-      }),
-    });
-    expect(h.wiring.handleMouse(mouse('motion', 8, 14))).toBe(false);
-    expect(events.some((event) => event.kind === 'hover-enter' && event.id === 'pane-body:pane-conv:msg-2')).toBe(true);
-    hoverTracker.dispose();
-  });
+
 });
 
 describe('MX11b dashboard-mouse-wiring — modal title drag session', () => {
@@ -887,11 +812,6 @@ describe('dock area launcher + selectors', () => {
         { id: 2, label: 'Build', active: false },
         { id: 3, label: 'Logs', active: false },
       ],
-      getDockMenuSurfaceTargets: () => [
-        { id: 'pane:browser', label: 'Browser popup', group: 'Panes' },
-        { id: 'companion:clipboard', label: 'Clipboard companion', group: 'Companions' },
-        { id: 'vw:browser', label: 'Browser virtual window', group: 'Virtual Windows' },
-      ],
     });
     wide.wiring.buildDockLine();
     crowded.wiring.buildDockLine();
@@ -904,19 +824,7 @@ describe('dock area launcher + selectors', () => {
     expect(wideCenter.endCol - wideCenter.startCol).toBe(crowdedCenter.endCol - crowdedCenter.startCol);
   });
 
-  test('clicking dock menu in compact opens dock menu tree and dispatches add-window from the shared submenu', async () => {
-    const h = mkDeps();
-    h.wiring.buildDockLine();
-    h.wiring.setDockRow(23);
-    const menu = h.wiring._snapshot().dockItems.find((item: any) => item.kind === 'menu')!;
-    expect(h.wiring.handleMouse(mouse('click', 23, menu.startCol + 1))).toBe(true);
-    expect(h.pushed.at(-1)?.id).toBe('recipe:dock-menu-tree');
-    expect(h.wiring.routeKey({ name: 'enter' } as never)).toBe('consumed');
-    expect(h.wiring.routeKey({ name: 'enter' } as never)).toBe('consumed');
-    await new Promise(r => setTimeout(r, 0));
-    expect(h.openedDockWindows).toEqual(['browser']);
-    expect(h.wiring.hasActivePopup()).toBe(false);
-  });
+
 
   test('dock mover click still dispatches while a blocking virtual window is foreground', async () => {
     const modalCalls: Array<{ row: number; col: number }> = [];
@@ -987,24 +895,10 @@ describe('dock area launcher + selectors', () => {
     h.wiring.setDockRow(23);
     const menu = h.wiring._snapshot().dockItems.find((item: any) => item.kind === 'menu')!;
     expect(h.wiring.handleMouse(mouse('click', 23, menu.startCol + 1))).toBe(true);
-    expect(h.pushed.at(-1)?.id).toBe('recipe:dock-menu-tree');
+    expect(h.pushed.at(-1)?.id).toBe('recipe:dock-launcher');
   });
 
-  test('clicking dock menu can open the shared surface submenu and dispatch a picked surface', async () => {
-    const h = mkDeps();
-    h.wiring.buildDockLine();
-    h.wiring.setDockRow(23);
-    const menu = h.wiring._snapshot().dockItems.find((item: any) => item.kind === 'menu')!;
-    expect(h.wiring.handleMouse(mouse('click', 23, menu.startCol + 1))).toBe(true);
-    expect(h.pushed.at(-1)?.id).toBe('recipe:dock-menu-tree');
-    expect(h.wiring.routeKey({ name: 'down' } as never)).toBe('consumed');
-    expect(h.wiring.routeKey({ name: 'enter' } as never)).toBe('consumed');
-    expect(h.wiring.routeKey({ name: 'down' } as never)).toBe('consumed');
-    expect(h.wiring.routeKey({ name: 'enter' } as never)).toBe('consumed');
-    await new Promise(r => setTimeout(r, 0));
-    expect(h.openedDockSurfaces).toEqual(['pane:browser']);
-    expect(h.wiring.hasActivePopup()).toBe(false);
-  });
+
 
   test('clicking view area opens a view picker and applies the selected view', async () => {
     const h = mkDeps();
@@ -1057,7 +951,7 @@ describe('dock area launcher + selectors', () => {
     expect(rendered).not.toContain('○ Reset view config');
   });
 
-  test('compact-tight dock menu still exposes the shared tree contract', async () => {
+  test('classic dock launcher only offers its wired exit action and dispatches it', async () => {
     const h = mkDeps({
       termSize: () => ({ rows: 24, cols: 100 }),
     });
@@ -1066,27 +960,23 @@ describe('dock area launcher + selectors', () => {
     const menu = h.wiring._snapshot().dockItems.find((item: any) => item.kind === 'menu')!;
     expect(h.wiring.handleMouse(mouse('click', 23, menu.startCol + 1))).toBe(true);
     const rendered = h.pushed.at(-1)?.paint?.() ?? '';
-    expect(rendered).toContain('Add surface');
-    expect(rendered).toContain('Pop out pane');
-    expect(rendered).toContain('Chat only');
     expect(rendered).toContain('Exit program');
-  });
-
-  test('dock menu can dispatch exit program from the shared parent menu', async () => {
-    const h = mkDeps();
-    h.wiring.buildDockLine();
-    h.wiring.setDockRow(23);
-    const menu = h.wiring._snapshot().dockItems.find((item: any) => item.kind === 'menu')!;
-    expect(h.wiring.handleMouse(mouse('click', 23, menu.startCol + 1))).toBe(true);
-    expect(h.pushed.at(-1)?.id).toBe('recipe:dock-menu-tree');
-    expect(h.wiring.routeKey({ name: 'down' } as never)).toBe('consumed');
-    expect(h.wiring.routeKey({ name: 'down' } as never)).toBe('consumed');
-    expect(h.wiring.routeKey({ name: 'down' } as never)).toBe('consumed');
+    expect(rendered).not.toContain('Add surface');
+    expect(rendered).not.toContain('Pop out pane');
+    expect(rendered).not.toContain('Chat only');
     expect(h.wiring.routeKey({ name: 'enter' } as never)).toBe('consumed');
     await new Promise(r => setTimeout(r, 0));
     expect(h.exitProgramCalls).toHaveLength(1);
     expect(h.wiring.hasActivePopup()).toBe(false);
   });
+
+  test('dock omits the menu when no action is wired', () => {
+    const h = mkDeps({ onExitProgram: undefined });
+    expect(h.wiring.buildDockLine()).not.toContain('≡ Menu');
+    expect(h.wiring._snapshot().dockItems.some((item: any) => item.kind === 'menu')).toBe(false);
+  });
+
+
 
 });
 

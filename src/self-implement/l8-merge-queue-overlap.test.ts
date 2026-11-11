@@ -14,6 +14,7 @@ function fixture(views: Record<number, { files?: { path: string }[] }>) {
   const calls: string[][] = [];
   let locked = false;
   const deps: L8ShadowQueueDeps = {
+    rulesPreflight: async () => ({ outcome: 'pass', detail: 'simulated integrated rules pass' }),
     acquire: async () => {
       expect(locked).toBe(false);
       locked = true;

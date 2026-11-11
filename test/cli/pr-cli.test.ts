@@ -215,6 +215,8 @@ const registerPrCommands = (program: Command, deps: PrLandDeps = {}) => realRegi
 
 const baseDeps = {
   get prodFreezeRoot() { return prodFreezeRoot; },
+  // Exercise legacy local gate paths as a remote worker; HQ placement has its own guard tests.
+  hostName: () => 'node-b',
   currentBranch: () => 'feat/land', resolveBase: () => 'origin/main', run: baseLookupRun, listUnfinishedRuns: () => [] as const,
   queryRunningRuns: () => runningRuns([]), runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true, runModelHardcodeGate: () => true, runDaemonPortGate: () => true,
   runPublicLeakGate: () => 0,
@@ -1409,6 +1411,8 @@ describe('elanous pr land', () => {
         if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && args.includes('headRefOid,state,isDraft')) {
           return { ok: true, out: JSON.stringify({ headRefOid: HEAD, state: 'OPEN', isDraft: false }) };
         }
+        if (cmd === 'gh' && command === 'pr view 51 --json url') return { ok: true, out: JSON.stringify({ url: URL }) };
+        if (cmd === 'gh' && command === 'api repos/example/repo/git/ref/heads/main --jq .object.sha') return { ok: true, out: `${TIP}\n` };
         if (cmd === 'git' && command === 'rev-parse HEAD') return { ok: true, out: `${HEAD}\n` };
         if (cmd === 'git' && command === 'status --porcelain') return { ok: true, out: '' };
         if (cmd === 'git' && command === 'fetch --quiet origin main') return { ok: true, out: '' };
@@ -1606,10 +1610,11 @@ describe('elanous pr land', () => {
         })).toBe(1);
         expect(sink.errors.join('\n')).toContain('ancestor-auto-not-ancestor:');
         expect(commands).toContainEqual({ cmd: 'gh', args: ['pr', 'edit', '51', '--add-label', 'elanous:needs-rebase'] });
-        const fetchIndex = preflightCommands.findIndex((command) => command === 'git fetch --quiet origin main');
+        const baseTipLookupIndex = preflightCommands.findIndex((command) => command === 'gh api repos/example/repo/git/ref/heads/main --jq .object.sha');
         const overlapLookupIndex = preflightCommands.map((command) => command.startsWith('git log ') && command.includes('--name-only')).lastIndexOf(true);
-        expect(fetchIndex).toBeGreaterThanOrEqual(0);
-        expect(overlapLookupIndex).toBeGreaterThan(fetchIndex);
+        // Source: #35917 remote base-tip lookup must run before the overlap file scan.
+        expect(baseTipLookupIndex).toBeGreaterThanOrEqual(0);
+        expect(overlapLookupIndex).toBeGreaterThan(baseTipLookupIndex);
         expect(heavyCalls).toBe(0);
         expect(localTypecheckCalls).toBe(0);
         expect(calls).not.toContain('merge');

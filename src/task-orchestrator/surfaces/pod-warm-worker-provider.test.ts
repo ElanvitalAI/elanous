@@ -3335,9 +3335,10 @@ test('WARM-POOL-PROVIDER-DEPLOY: production CLIs redact tokens, reconcile with f
     const podReads = device.calls.filter(args => args[4] === 'get' && args[5] === 'pods');
     expect(podReads).toHaveLength(3);
     const rawPodQueries = rawPodRequests.map(path => new URLSearchParams(path.slice(path.indexOf('?') + 1)));
-    expect(rawPodQueries).toHaveLength(2);
-    expect(rawPodQueries.filter(query => query.get('fieldSelector')?.startsWith('metadata.name=warm-node-b-standard-'))).toHaveLength(1);
+    expect(rawPodQueries).toHaveLength(3); // Source: #36630
+    expect(rawPodQueries.filter(query => query.get('fieldSelector')?.startsWith('metadata.name=warm-node-b-standard-'))).toHaveLength(2); // Source: #36630
     expect(rawPodQueries.filter(query => query.get('labelSelector') === 'elanous.kind=warm-worker')).toHaveLength(1);
+    expect(rawPodQueries.filter(query => query.get('labelSelector') === 'elanous.kind=warm-worker,elanous.ai/quarantined!=true')).toHaveLength(1); // Source: #36630
     expect(rawPodQueries.every(query => query.get('limit') === '25')).toBe(true);
     expect(device.calls.filter(args => args[4] === 'create')).toHaveLength(1);
     expect(reconciled.stdout).not.toContain(memberValue); expect(reconciled.stderr).not.toContain(machineValue);

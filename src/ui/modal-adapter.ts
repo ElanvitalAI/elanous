@@ -856,7 +856,7 @@ export function mountViewAsModalSurface(spec: ViewSurfaceSpec): ViewSurfaceHandl
     cursor: spec.cursor,
     // Previously callers had to manually patch `handle.surface.onKey =
     // handle.handleKey` after mounting. Several callers forgot
-    // (mouse-action-recipes / slash-launcher / status-bar-popups /
+    // (mouse-action-recipes / status-bar-popups /
     // vw-*-modal / ask-user-question / plan-exit-modal), which left
     // the modal visible but key-inert — coordinator.routeKey would
     // see `!surface.onKey` and fall through, and the user would

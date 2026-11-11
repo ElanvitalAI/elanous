@@ -16,7 +16,6 @@ describe('buildDashboardSurfaceCatalogTargets', () => {
     });
     expect(targets.map((item) => item.id)).toEqual([
       'reopen:preview',
-      'pane:browser-preview',
       'pane:browser',
       'pane:preview',
       'pane:obsidian',

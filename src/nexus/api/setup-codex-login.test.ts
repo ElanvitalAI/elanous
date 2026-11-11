@@ -10,6 +10,7 @@ import { NexusEventBus } from './event-bus.js';
 import { routeRequest, type NexusHttpServerOpts } from './http-server.js';
 import { createCodexLoginHandlers, saveCodexProvider } from './setup-codex-login.js';
 import { getUserConfig, reloadUserConfig, saveUserConfig } from '../../user-config.js';
+import { saveTokens } from '../../oauth/store.js';
 
 let dir: string | undefined;
 afterEach(() => {
@@ -30,6 +31,17 @@ function deferred() {
   const promise = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
   return { promise, resolve, reject };
 }
+
+test('setup browser handler skips a valid Codex credential without launching or saving', async () => {
+  dir = mkdtempSync(join(tmpdir(), 'codex-login-skip-'));
+  setElanousConfigDir(dir);
+  saveTokens('openai-codex', { accessToken: 'private-valid', refreshToken: 'private-refresh',
+    expiresAt: Date.now() + 3_600_000, scope: 'openid profile email offline_access' }, { authMode: 'chatgpt' });
+  const handlers = createCodexLoginHandlers();
+  const result = await handlers.post(request('browser'));
+  expect(await result.json()).toEqual({ state: 'skipped', mode: 'browser', healthStatus: 'valid' });
+  expect(await handlers.get().json()).toEqual({ state: 'skipped', mode: 'browser', healthStatus: 'valid' });
+});
 
 test('browser returns authorize URL without opening a daemon browser; simultaneous requests share pending login and ok saves provider', async () => {
   const done = deferred();

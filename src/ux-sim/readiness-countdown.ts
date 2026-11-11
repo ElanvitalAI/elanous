@@ -3,8 +3,8 @@
  * Inputs are simulated boundary events; this module never reads wall time,
  * GitHub, a host pool, or a release graph.
  */
-export type CountdownGate = 'cutoff' | 'gate' | 'publish' | 'announcement';
-export type LaunchCountdownPhase = 'T-11h' | 'T-7h' | 'T-2h' | 'T-30m' | 'T0';
+export type CountdownGate = 'cutoff' | 'gate' | 'publish' | 'announcement' | 'cleanup';
+export type LaunchCountdownPhase = 'T-24h' | 'T-11h' | 'T-7h' | 'T-2h' | 'T-30m' | 'T0' | 'T+' | 'publish' | 'verify' | 'cleanup';
 
 export interface ReadinessRequirement {
   readonly id: string;
@@ -30,6 +30,10 @@ export interface ReadinessCountdownInput {
   readonly fixedTimeConstraint: number;
   readonly requirements: readonly ReadinessRequirement[];
   readonly events: readonly ReadinessEvent[];
+  /** Initial schedule phase; existing scenarios retain the T-11h default. */
+  readonly initialLaunchPhase?: LaunchCountdownPhase;
+  /** Include the simulated post-release cleanup gate after publish and verification. */
+  readonly includeCleanup?: boolean;
   readonly countdownMilliseconds: number;
   readonly hostReservationLeadMilliseconds: number;
   readonly hostReservationBufferMilliseconds: number;
@@ -60,7 +64,7 @@ export interface ReadinessSnapshot {
   readonly gateDurationEstimateMilliseconds: number;
 }
 
-const GATES: readonly CountdownGate[] = ['cutoff', 'gate', 'publish', 'announcement'];
+const GATES: readonly CountdownGate[] = ['cutoff', 'gate', 'publish', 'announcement', 'cleanup'];
 
 function pendingRequirements(requirements: readonly ReadinessRequirement[], ready: ReadonlyMap<string, number>, gate: CountdownGate): string[] {
   return requirements.filter((requirement) => requirement.gates.includes(gate) && !ready.has(requirement.id)).map(({ id }) => id);
@@ -89,7 +93,7 @@ export function simulateReadinessCountdown(input: ReadinessCountdownInput): Read
   let countdownPausedMilliseconds = 0;
   let previousEta: number | null = null;
   let reservedUntil: number | null = null;
-  let launchPhase: LaunchCountdownPhase = 'T-11h';
+  let launchPhase: LaunchCountdownPhase = input.initialLaunchPhase ?? 'T-11h';
   let holdCount = 0;
   let disposition: ReadinessSnapshot['disposition'] = 'active';
   let materialDelayNotified = false;
@@ -98,7 +102,7 @@ export function simulateReadinessCountdown(input: ReadinessCountdownInput): Read
     ? priorDurations[Math.floor(priorDurations.length / 2)]!
     : (priorDurations[priorDurations.length / 2 - 1]! + priorDurations[priorDurations.length / 2]!) / 2;
 
-  const currentGate = () => GATES.find((candidate) => !completed.has(candidate)) ?? null;
+  const currentGate = () => (input.includeCleanup ? GATES : GATES.slice(0, -1)).find((candidate) => !completed.has(candidate)) ?? null;
   const gateDurationEstimate = (): number => Math.max(priorGateMedian, measuredGateDuration);
   const stageDuration = (gate: CountdownGate): number => Math.max(input.countdownMilliseconds, gate === 'gate' ? gateDurationEstimate() : 0);
   const stageElapsed = (): number => countdownStartedAt === null ? 0 : Math.max(0, now - countdownStartedAt - countdownPausedMilliseconds - (countdownPausedAt === null ? 0 : now - countdownPausedAt));
@@ -256,13 +260,15 @@ export function readinessCountdown1107Scenario(): ReadinessCountdownInput {
   };
 }
 
-/** Simulates the scheduled release phases and two separate no-go holds through T0. */
+/** Simulates the scheduled release phases, then injected publish, verify and cleanup failures after T0. */
 export function readinessCountdownPhasesScenario(): ReadinessCountdownInput {
   const t0 = Date.parse('2026-11-07T00:00:00+09:00');
   const minus = (milliseconds: number) => t0 - milliseconds;
   const hour = 60 * minute;
   return {
     fixedTimeConstraint: minus(11 * hour),
+    initialLaunchPhase: 'T-24h',
+    includeCleanup: true,
     countdownMilliseconds: 0,
     hostReservationLeadMilliseconds: 30 * minute,
     hostReservationBufferMilliseconds: 30 * minute,
@@ -271,8 +277,12 @@ export function readinessCountdownPhasesScenario(): ReadinessCountdownInput {
       { id: 'image-pinned', gates: ['gate'], expectedReadyAt: minus(30 * minute) },
       { id: 'regressions-clear', gates: ['gate'], expectedReadyAt: minus(30 * minute) },
       { id: 'publish-ready', gates: ['publish', 'announcement'], expectedReadyAt: t0 },
+      { id: 'verify-ready', gates: ['announcement'], expectedReadyAt: t0 + 20 * minute },
+      { id: 'cleanup-ready', gates: ['cleanup'], expectedReadyAt: t0 + 30 * minute },
     ],
     events: [
+      { at: minus(24 * hour), type: 'phase-transition', phase: 'T-24h' },
+      { at: minus(11 * hour), type: 'phase-transition', phase: 'T-11h' },
       { at: minus(11 * hour), type: 'hold', reason: 'HOLD-1: cut branch is not landed' },
       { at: minus(10 * hour), type: 'requirement-ready', id: 'cut-branch-landed' },
       { at: minus(10 * hour), type: 'milestone-complete', gate: 'cutoff' },
@@ -291,8 +301,24 @@ export function readinessCountdownPhasesScenario(): ReadinessCountdownInput {
       { at: t0, type: 'phase-transition', phase: 'T0' },
       { at: t0, type: 'milestone-complete', gate: 'gate' },
       { at: t0, type: 'requirement-ready', id: 'publish-ready' },
-      { at: t0, type: 'milestone-complete', gate: 'publish' },
-      { at: t0, type: 'milestone-complete', gate: 'announcement' },
+      { at: t0 + 5 * minute, type: 'phase-transition', phase: 'T+' },
+      { at: t0 + 5 * minute, type: 'phase-transition', phase: 'publish' },
+      { at: t0 + 5 * minute, type: 'hold', reason: 'publish failed: simulated registry unavailable' },
+      { at: t0 + 5 * minute, type: 'milestone-complete', gate: 'publish' },
+      { at: t0 + 10 * minute, type: 'release-hold' },
+      { at: t0 + 10 * minute, type: 'milestone-complete', gate: 'publish' },
+      { at: t0 + 15 * minute, type: 'phase-transition', phase: 'verify' },
+      { at: t0 + 15 * minute, type: 'hold', reason: 'verify failed: simulated published artifact mismatch' },
+      { at: t0 + 15 * minute, type: 'milestone-complete', gate: 'announcement' },
+      { at: t0 + 20 * minute, type: 'release-hold' },
+      { at: t0 + 20 * minute, type: 'requirement-ready', id: 'verify-ready' },
+      { at: t0 + 20 * minute, type: 'milestone-complete', gate: 'announcement' },
+      { at: t0 + 25 * minute, type: 'phase-transition', phase: 'cleanup' },
+      { at: t0 + 25 * minute, type: 'hold', reason: 'cleanup failed: simulated host lease still active' },
+      { at: t0 + 25 * minute, type: 'milestone-complete', gate: 'cleanup' },
+      { at: t0 + 30 * minute, type: 'release-hold' },
+      { at: t0 + 30 * minute, type: 'requirement-ready', id: 'cleanup-ready' },
+      { at: t0 + 30 * minute, type: 'milestone-complete', gate: 'cleanup' },
     ],
   };
 }

@@ -37,10 +37,7 @@ export interface OpenFinderModalOpts {
   onAccept: (item: FinderItem) => void;
   onCancel?: () => void;
   theme?: ThemeTokens;
-  /** Phase E: fires when the user hovers (arrow-keys/types) to a
-   *  different result. Callers wire this to a debounced preview
-   *  render (showPreviewModal / side pane). Null when results empty. */
-  onHover?: (item: FinderItem | null) => void;
+
 }
 
 export function rankFinderItems(items: readonly FinderItem[], query: string): FinderItem[] {
@@ -85,13 +82,6 @@ export function createFinderModal(opts: OpenFinderModalOpts): SearchModalHandle 
     theme: opts.theme,
     browseMode: true,
     footerHint: '',
-    onSelectionChange: opts.onHover
-      ? (item) => {
-          if (!item) { opts.onHover!(null); return; }
-          const target = opts.items.find(i => i.absPath === String(item.payload));
-          opts.onHover!(target ?? null);
-        }
-      : undefined,
   });
 }
 

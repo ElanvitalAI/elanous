@@ -6,8 +6,8 @@ apps:
     versions:
       - id: v1
         files:
-          index.html: '<main><h1>스크랩 목록</h1><article>분산 시스템 특강</article></main>'
-          notes/new.html: '<main><h1>노트 작성</h1><textarea aria-label="강의 노트"></textarea></main>'
+          index.html: '<main><h1>날짜별 기록</h1><article>2026-11-14 · 기록일 (녹음 시작 기준) · 수업일 예시 2026-11-13 · 강의 자료 폴더 (논리 폴더 예시)</article></main>'
+          notes/new.html: '<main><h1>노트 작성</h1><p>기록일 예시 2026-11-14 · 수업일 예시 2026-11-13 · 기록 폴더 예시: 강의 자료 (논리 분류)</p><textarea aria-label="강의 노트"></textarea></main>'
           search.html: '<main><h1>검색</h1><input aria-label="자료 검색"></main>'
 steps:
   - observe: kaist-lecture-scrap

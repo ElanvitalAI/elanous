@@ -1,0 +1,21 @@
+graph_id: market-quote
+version: 1
+entry_node: quote
+terminal_nodes: [done, rework, needs-human, failed]
+unit:
+  inputs: [ask]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+nodes:
+  - node_id: quote
+    kind: capability
+    recipe: none
+    requires: market.ohlcv@1
+    max_visits: 1
+    contract: { inputs: [input, nodeInput, outputs], tools: read-only, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: quote, on: outcome, map: { ok: done, rework: rework, needs-human: needs-human, failed: failed } }

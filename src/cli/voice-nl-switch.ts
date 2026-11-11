@@ -25,7 +25,7 @@ import {
   type NlTierApplyPlan,
   type NlTierDetection,
 } from '../model-tier/index.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 
 export interface RunVoiceNlSwitchOpts {

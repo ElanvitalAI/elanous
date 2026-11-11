@@ -183,9 +183,12 @@ describe('SIM world YAML schema', () => {
       .toThrow('world.injections[0].ledger[0].event');
   });
 
-  test('gorilla faults target one declared host and carry measurable recovery inputs', () => {
+  test('gorilla and disaster faults target declared hosts and carry measurable recovery inputs', () => {
     const gorilla = { ...validWorld, chaos: [{ at: '+5m', gorilla: { host: 'gcp2', egress: false, cpu: 2, for: '+20m' } }] };
     expect(parseSimWorld(source(gorilla)).chaos).toEqual([{ at: '+5m', gorilla: { host: 'gcp2', egress: false, cpu: 2, for: '+20m' } }]);
+    const hqProcess = { id: 'headquarters', host: 'node-b', releaseVersion: '0.3.5', role: 'headquarters', fingerprint: 'fp_hq_headquarters', lane: 'hand', mission: 'hq-handoff' };
+    const disaster = { ...validWorld, processes: [...validWorld.processes, hqProcess], chaos: [{ at: '+10m', disaster: { host: 'node-b', down: true } }], injections: undefined };
+    expect(parseSimWorld(source(disaster)).chaos).toEqual([{ at: '+10m', disaster: { host: 'node-b', down: true } }]);
     expect(() => parseSimWorld(source({ ...validWorld, chaos: [{ at: '+1m', gorilla: { host: 'unknown', egress: false, cpu: 2, for: '+1m' } }] })))
       .toThrow('gorilla.host must name exactly one declared world host');
     expect(() => parseSimWorld(source({ ...validWorld, chaos: [{ at: '+1m', gorilla: { host: 'gcp2', egress: false, cpu: 8, for: '+1m' } }] })))
@@ -194,7 +197,21 @@ describe('SIM world YAML schema', () => {
       { at: '+1m', gorilla: { host: 'node-b', egress: false, cpu: 2, for: '+5m' } },
       { at: '+6m', gorilla: { host: 'node-b', egress: false, cpu: 2, for: '+1m' } },
     ] }))).toThrow('overlaps another host fault for node-b');
-    expect(() => parseSimWorld(source({ ...validWorld, chaos: [{ at: '+1m', disaster: { host: 'node-b', down: true } }] })))
-      .toThrow('exactly one supported fault: monkey, gorilla');
+    expect(() => parseSimWorld(source({ ...validWorld, hosts: [validWorld.hosts[0]], processes: [hqProcess], chaos: [{ at: '+1m', disaster: { host: 'node-b', down: true } }] })))
+      .toThrow('needs a surviving declared host');
+    expect(() => parseSimWorld(source({ ...validWorld, chaos: [{ at: '+1m', disaster: { host: 'gcp2', down: true } }] })))
+      .toThrow('must identify the world\'s exactly one headquarters process');
+    const unmarkedHeadquarters = { ...hqProcess, role: undefined };
+    expect(() => parseSimWorld(source({ ...validWorld, processes: [...validWorld.processes, unmarkedHeadquarters],
+      chaos: [{ at: '+1m', disaster: { host: 'node-b', down: true } }] })))
+      .toThrow('must identify the world\'s exactly one headquarters process');
+    const secondHeadquarters = { ...hqProcess, id: 'second-headquarters', host: 'gcp2', fingerprint: 'fp_hq_second', mission: 'second-handoff' };
+    expect(() => parseSimWorld(source({ ...validWorld, processes: [...validWorld.processes, hqProcess, secondHeadquarters],
+      chaos: [{ at: '+1m', disaster: { host: 'node-b', down: true } }] })))
+      .toThrow('must identify the world\'s exactly one headquarters process');
+    expect(() => parseSimWorld(source({ ...validWorld, processes: [...validWorld.processes, hqProcess], chaos: [
+      { at: '+1m', disaster: { host: 'node-b', down: true } },
+      { at: '+2m', gorilla: { host: 'node-b', egress: false, cpu: 2, for: '+1m' } },
+    ] }))).toThrow('overlaps another host fault for node-b');
   });
 });

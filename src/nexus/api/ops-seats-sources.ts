@@ -3,7 +3,7 @@
 import { DecisionLedger } from '../../decisions/decision-ledger.js';
 import { listCoordEvents, type CoordEvent } from '../../context-bus/coord-events.js';
 import { checklistDevVersion, listChecklist, type ChecklistItem } from '../../release-loop/checklist.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { SEATS, kstDayRange, type ChannelComment, type ChannelSource, type MergedPr, type SeatsSources } from './ops-seats.js';
 
 const GH_TIMEOUT_MS = 20_000;

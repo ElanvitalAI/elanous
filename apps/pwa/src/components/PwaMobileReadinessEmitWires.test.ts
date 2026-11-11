@@ -8,11 +8,11 @@
 //
 // 6 boundary:
 //   #1 IntentPanel onTap        → ShowroomLayout
-//   #2 Card swipe decision      → SessionsDeckPanel
+//   #2 Mobile route selection   → MobileBottomTabs
 //   #3 Voice intake submit      → ShowroomVoiceIntake
 //   #4 Camera intake send       → ShowroomCameraIntake
 //   #5 Push action tap          → public/sw.js (fetch /v1/user-intents/emit)
-//   #6 Reflection route mount   → ReflectionRouteIntentBeacon
+//   #6 Chat route mount         → ChatPanel
 
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -30,10 +30,10 @@ function readSrc(rel: string): string {
 }
 
 const SHOWROOM_LAYOUT_SRC = readSrc('components/showroom/ShowroomLayout.tsx');
-const SESSIONS_DECK_SRC   = readSrc('components/card-swipe/SessionsDeckPanel.tsx');
+const MOBILE_TABS_SRC     = readSrc('components/shell/MobileBottomTabs.tsx');
 const VOICE_INTAKE_SRC    = readSrc('components/showroom/ShowroomVoiceIntake.tsx');
 const CAMERA_INTAKE_SRC   = readSrc('components/showroom/ShowroomCameraIntake.tsx');
-const REFLECTION_BEACON_SRC = readSrc('components/reflection/ReflectionRouteIntentBeacon.tsx');
+const CHAT_PANEL_SRC       = readSrc('components/chat/ChatPanel.tsx');
 const SW_SRC              = readFileSync(join(PWA_PKG, 'public', 'sw.js'), 'utf8');
 
 const USER_INTENT_LOGGER_IMPORT_RE =
@@ -46,10 +46,12 @@ describe('PWA mobile-readiness · userIntentLogger emit wires', () => {
     expect(SHOWROOM_LAYOUT_SRC).toContain("userIntentLogger.emit");
   });
 
-  test('#2 SessionsDeckPanel imports userIntentLogger + emits card_swipe_<decision>', () => {
-    expect(SESSIONS_DECK_SRC).toMatch(USER_INTENT_LOGGER_IMPORT_RE);
-    expect(SESSIONS_DECK_SRC).toMatch(/pwa\.gesture\.card_swipe_\$\{decision\}/);
-    expect(SESSIONS_DECK_SRC).toContain("userIntentLogger.emit");
+  test('#2 MobileBottomTabs emits route selection for direct tabs and sheet links', () => {
+    expect(MOBILE_TABS_SRC).toMatch(USER_INTENT_LOGGER_IMPORT_RE);
+    expect(MOBILE_TABS_SRC).toContain("'pwa.navigation.bottom_tab_open'");
+    expect(MOBILE_TABS_SRC).toContain('userIntentLogger.emit');
+    expect(MOBILE_TABS_SRC).toContain('onClick={() => recordNavigation(group.items[0]!.href)}');
+    expect(MOBILE_TABS_SRC).toContain('recordNavigation(item.href); setOpen(null);');
   });
 
   test('#3 ShowroomVoiceIntake imports userIntentLogger + emits pwa.utterance.voice_send after intake OK', () => {
@@ -74,29 +76,28 @@ describe('PWA mobile-readiness · userIntentLogger emit wires', () => {
     expect(SW_SRC).toContain("layer: 'selection'");
   });
 
-  test('#6 ReflectionRouteIntentBeacon imports userIntentLogger + emits pwa.navigation.reflection_opened on mount', () => {
-    expect(REFLECTION_BEACON_SRC).toMatch(USER_INTENT_LOGGER_IMPORT_RE);
-    expect(REFLECTION_BEACON_SRC).toContain("'pwa.navigation.reflection_opened'");
-    expect(REFLECTION_BEACON_SRC).toContain("userIntentLogger.emit");
-    // Beacon must fire from useEffect so SSR doesn't double-emit.
-    expect(REFLECTION_BEACON_SRC).toMatch(/useEffect\s*\(/);
+  test('#6 ChatPanel emits pwa.navigation.chat_opened on standalone route mount', () => {
+    expect(CHAT_PANEL_SRC).toMatch(USER_INTENT_LOGGER_IMPORT_RE);
+    expect(CHAT_PANEL_SRC).toContain("'pwa.navigation.chat_opened'");
+    expect(CHAT_PANEL_SRC).toContain('if (!props.showConversationList) return;');
+    expect(CHAT_PANEL_SRC).toContain('userIntentLogger.emit');
+    // Mount signal stays in useEffect so SSR does not double-emit.
+    expect(CHAT_PANEL_SRC).toMatch(/useEffect\s*\(/);
   });
 
   test('all 6 emit kinds follow MANUAL §3 <surface>.<layer>.<verb> convention', () => {
     const KINDS = [
       'pwa.selection.intent_button_tap',
-      'pwa.gesture.card_swipe_',
+      'pwa.navigation.bottom_tab_open',
       'pwa.utterance.voice_send',
       'pwa.gesture.camera_attach_session',
       'pwa.gesture.camera_intake_save',
       'pwa.selection.push_action_tap',
-      'pwa.navigation.reflection_opened',
+      'pwa.navigation.chat_opened',
     ];
     const CONVENTION_RE = /^pwa\.(utterance|gesture|selection|navigation|ambient|device_state|system)\.[a-z_]+$/;
     for (const kind of KINDS) {
-      // card_swipe_ is a template prefix — strip the template variable for the regex check.
-      const checked = kind.endsWith('_') ? `${kind}left` : kind;
-      expect(checked).toMatch(CONVENTION_RE);
+      expect(kind).toMatch(CONVENTION_RE);
     }
   });
 });

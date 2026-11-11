@@ -152,7 +152,10 @@ test('T-minus image hold reads the real signal contract, waits through cutAt, th
     runId: signalRunId, cutCommit, imageDigest: `sha256:${'b'.repeat(64)}`, eligiblePools: ['gate-pool-a'], checkedAt: instant.toISOString() }));
   try {
     setSchedule(countdownVersion, { cutAt }, 'OP', root);
-    const result = await waitForGateImageT60({ runId, input: { version: countdownVersion }, outputs: { 'version-release': { commit: cutCommit } } }, {
+    const result = await waitForGateImageT60({ runId, input: { version: countdownVersion }, outputs: { 'version-release': {
+      commit: cutCommit, gateImagePrebuild: { outcome: 'built', runId, cutCommit,
+        digest: `sha256:${'b'.repeat(64)}`, eligiblePools: ['gate-pool-a'] },
+    } } }, {
       ledgerRoot: root, now: () => instant,
       sleep: async () => {
         sleeps++;

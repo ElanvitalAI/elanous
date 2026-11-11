@@ -54,27 +54,27 @@ test('only open decisions are labelled pending; closed decisions do not appear a
 });
 
 test('truncates public text to 30 characters and masks private text before display', () => {
-  const result = contextSources({ ...raw, facts: [{ ...raw.facts[3], title: `/home/ubuntu/private ${'가'.repeat(34)}` }], events: [] }, now);
+  const result = contextSources({ ...raw, facts: [{ ...raw.facts[3], title: `/home/user/private ${'가'.repeat(34)}` }], events: [] }, now);
   expect(result?.[0]?.label).toBe(`CTO 자리 루프 · ${'가'.repeat(30)}`);
-  expect(result?.[0]?.label).not.toContain('/home/ubuntu');
+  expect(result?.[0]?.label).not.toContain('/home/user');
 });
 
 test('private paths and non-elanous URIs never reach the provenance title', () => {
   const result = contextSources({ ...raw,
     facts: [
-      { ...raw.facts[3], source: '/home/ubuntu/private' },
+      { ...raw.facts[3], source: '/home/user/private' },
       { ...raw.facts[2], source: 'https://example.com/private' },
       { ...raw.facts[1], source: 'elanous://decisions/%2Fhome%2Fubuntu%2Fprivate' },
     ],
     events: [{ ...raw.events[0], source: 'elanous://context/event/../../private' }],
   }, now);
   expect(result).toEqual([]);
-  expect(JSON.stringify(result)).not.toContain('/home/ubuntu/private');
+  expect(JSON.stringify(result)).not.toContain('/home/user/private');
 });
 
 test('a safe source remains visible beside an unsafe source', () => {
   const result = contextSources({ ...raw, facts: [
-    { ...raw.facts[3], source: '/home/ubuntu/private' },
+    { ...raw.facts[3], source: '/home/user/private' },
     raw.facts[2],
   ], events: [] }, now);
   expect(result).toEqual([expected[2]]);

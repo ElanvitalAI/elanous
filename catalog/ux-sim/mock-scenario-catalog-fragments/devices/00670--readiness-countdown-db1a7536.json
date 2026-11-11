@@ -7,16 +7,20 @@
   "tests": [
     "src/ux-sim/readiness-countdown.test.ts"
   ],
-  "target": "Readiness gates, hold, ETA notices and host reservation extensions against a fixed-time constraint",
+  "target": "Release countdown from T-24h through T+, including publish, verify and cleanup recovery against a simulated clock",
   "inputs": [
     "fake PR land events",
     "gate duration",
     "host readiness",
     "manual hold",
-    "milestone completion"
+    "milestone completion",
+    "simulated clock advances",
+    "injected publish, verify and cleanup failures"
   ],
   "observations": [
-    "GO/NO-GO at cutoff, gate, publish and announcement",
+    "GO/NO-GO at cutoff, gate, publish, verification and cleanup",
+    "T-24h through T0 and T+ phase transitions",
+    "publish, verify and cleanup failures block completion until explicit recovery",
     "ETA change notifications",
     "T-minus host reservation expiry",
     "11-07 06:00 constraint to 07:xx readiness replay"

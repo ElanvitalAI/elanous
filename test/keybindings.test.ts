@@ -76,20 +76,7 @@ describe('keybinding registry', () => {
     expect(KEYBINDINGS.some(binding => binding.action.includes('Horizontal split') || binding.action.includes('Toggle modal ↔ virtual-window session'))).toBe(false);
   });
 
-  test('VP3 — Ctrl+7 binding wired for Widget Playground view', () => {
-    const ctrl7 = KEYBINDINGS.find(b => b.keys.includes('Ctrl+7'));
-    expect(ctrl7).toBeDefined();
-    expect(ctrl7!.keys).toContain('Ctrl+/ (fallback)');
-    expect(ctrl7!.action).toContain('Widget Playground');
-    expect(ctrl7!.action).toContain('/view 7');
-  });
 
-  test('VP3 — renderKeyHelp surfaces Ctrl+7 alongside other view shortcuts', () => {
-    const out = renderKeyHelp();
-    expect(out).toContain('Ctrl+7');
-    expect(out).toContain('Ctrl+/');
-    expect(out).toMatch(/View 7.*Widget Playground|Widget Playground.*View 7/);
-  });
 });
 
 describe('slash command hygiene', () => {

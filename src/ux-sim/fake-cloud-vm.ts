@@ -22,6 +22,7 @@ export interface FakeCloudVmSpec {
 export interface FakeCloudVmSnapshot {
   readonly id: string;
   readonly imageDigest: string;
+  readonly hourlyCost: number;
   readonly state: FakeCloudVmState;
   readonly readyAt: number;
   readonly activeLeases: number;
@@ -83,6 +84,7 @@ export function createFakeCloudVm() {
     return {
       id: vm.id,
       imageDigest: vm.imageDigest,
+      hourlyCost: vm.hourlyCost,
       state: vm.state,
       readyAt: vm.readyAt,
       activeLeases: vm.activeLeases,

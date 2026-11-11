@@ -5,17 +5,18 @@ import type { ChatConfig } from "./chat.js";
 import type { OrchestratorLoopConfig } from "./orchestrator.js";
 import type { GroundingConfig } from "../grounding/sources.js";
 import type { BudgetUserConfig, ModelTierUserConfig, SmartDefaultsUserConfig } from "../model-tier/types.js";
+import type { TrainWorkerPolicy } from "../resource-ledger/resource-ledger.js";
 
 export interface UserConfig {
   /** Next TUI options. `unattended` makes confirmation/clarification paths non-blocking. */
-  tui?: { sidetab?: 'off' | 'collapsed' | 'open'; unattended?: boolean };
+  tui?: { sidetab?: 'off' | 'collapsed' | 'open'; unattended?: boolean; next?: { compactHeight?: number } };
   projects?: Record<string, ProjectConfig>;
   /** Default personal topic watch; absent = enabled when user sources exist. */
   watch?: { enabled?: boolean };
   starter?: { topics?: string[] };
   /** GUARD-ONE-a: omitted means shadow. `live` is parsed for the later cutover, but `elanous guardian tick`
    *  refuses it until a human-confirmed operational change (GUARD-ONE-a ships shadow only). */
-  guardian?: { mode?: 'shadow' | 'live'; /** Orphan CLI GC on the guardian tick: off = no ps collection, shadow (default) = evidence only, on = evidence then SIGTERM. */ orphanGc?: 'off' | 'shadow' | 'on' };
+  guardian?: { mode?: 'shadow' | 'live'; /** Orphan CLI GC on the guardian tick: off = no ps collection, shadow (default) = evidence only, on = evidence then SIGTERM. */ orphanGc?: 'off' | 'shadow' | 'on'; /** Explicit human-authored resource policy consumed by the Nexus Guardian supervisor. */ trainWorkerPolicy?: TrainWorkerPolicy };
   /** Task-agent live move allow-list (`src/task-agent/live-moves.ts` validates its vocabulary).
    *  Absent = env ELANOUS_TASK_AGENT_LIVE_MOVES, else none (pure shadow). */
   taskAgent?: { liveMoves?: string[]; /** TA-REJUDGE-PERIODIC — steward tick runs `tasks rejudge --all` every N minutes (absent/0 = off). */ rejudgeEveryMinutes?: number; /** 1-minute load average above which that tick is skipped (default 60). */ rejudgeMaxLoad?: number; /** TA-REPAIR-TICK-CAP — new repair launches per `tasks rejudge --all` (default 3, 0 = none). */ repairMaxPerTick?: number; /** Old cards are skipped by periodic rejudge after this many hours (default 72). */ rejudgeMaxAgeHours?: number; /** TA-LAND-AFTER-REVIEW — opt-in external queue adapter, never a direct merge command. */ landQueue?: { command: string; remote: string }; parentHost?: { host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number } | Array<{ host?: string; cwd?: string; elanous?: string; configDir?: string; podPool?: string; approvalCapacity?: number }> };

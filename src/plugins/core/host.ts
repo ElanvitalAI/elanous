@@ -49,6 +49,7 @@ import {
   type PluginSource,
   type PluginViewContribution,
 } from './manifest.js';
+import { graphRouteHandlerAllowed, isGraphRouteHandler } from '../../tool-router/index.js';
 import { buildPromptInjection, getPromptBankStore } from '../../prompt-bank/index.js';
 import { getGlobalElementRegistry, publishElementEvent } from '../../element-registry/index.js';
 import { mintPluginUri } from '../../mss/uri/builder.js';
@@ -56,6 +57,7 @@ import type { PluginUri } from '../../mss/uri/brand.js';
 import { loadPluginNodes } from '../../graph-kinds/plugin-nodes.js';
 import { registerOutboundAdapter } from '../../nexus/outbound/router.js';
 import { getNodeKindRegistration, listNodeKinds, unregisterPluginNodeKind, type NodeKindEntry } from '../../graph-kinds/registry.js';
+import { checkPeerCompat } from './multi-active.js';
 
 /** Clamp a tool handler's return value to something short enough for
  *  the debug log. Preserves the shape for JSON.stringify so small
@@ -248,6 +250,8 @@ export class PluginHost {
   private available = new Map<string, PluginEntry>();
   private discoveredNodeKinds = new Map<string, NodeKindEntry>();
   private activeEntry: ActivePlugin | null = null;
+  private activeEntries = new Map<string, ActivePlugin>();
+  private lifecycleTail: Promise<void> = Promise.resolve();
   private hooks: HostHooks;
   /** Optional widget host. When set, plugin-host calls buildLayout on
    *  activation and auto-disposes widgets on deactivate. */
@@ -273,6 +277,13 @@ export class PluginHost {
    *  disposed on deactivate so the next activation gets a fresh
    *  handle (and session entries for the old pluginId are cleared). */
   private pluginStateApi: Map<string, import('../../plugin-state/api.js').PluginStateApi> = new Map();
+
+  /** Serialize lifecycle transitions so teardown cannot race reactivation of the same plugin. */
+  private serializeLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.lifecycleTail.then(operation, operation);
+    this.lifecycleTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
 
   constructor(hooks: HostHooks, widgetHost: WidgetHost | null = null, opts: PluginHostOptions = {}) {
     this.hooks = hooks;
@@ -309,12 +320,12 @@ export class PluginHost {
    *  globalMissionRegistry. Each registration tracks a disposer on the
    *  active entry so deactivate() tears them down. autostart missions
    *  flip to 'running' inside register() via the registry's own logic. */
-  private registerManifestMissions(entry: PluginEntry): void {
-    if (!this.activeEntry) return;
+  private registerManifestMissions(entry: PluginEntry, active = this.activeEntry): void {
+    if (!active) return;
     const specs = entry.manifest.contributes.missions ?? [];
     if (specs.length === 0) return;
     const { globalMissionRegistry } = require('../../plugin-missions/registry.js');
-    const stateApi = this.buildPersistentStateContext();
+    const stateApi = this.buildPersistentStateContext(active);
     for (const def of specs) {
       try {
         const dispose = globalMissionRegistry.register({
@@ -323,7 +334,7 @@ export class PluginHost {
           def,
           ...(stateApi ? { stateApi } : {}),
         });
-        this.activeEntry.ownedMissionDisposers.push(dispose);
+        active.ownedMissionDisposers.push(dispose);
       } catch (err: any) {
         this.hooks.log(`⚠ plugin "${entry.manifest.id}" mission "${def.id}" failed to register: ${err?.message ?? err}`);
       }
@@ -334,8 +345,8 @@ export class PluginHost {
    *  globalRouteRegistry. Disposers clean up on deactivate. Persists
    *  the compiled snapshot to .elanous/routes.json after each batch so
    *  external tooling (LLM tools, editors) can read it. */
-  private registerManifestRoutes(entry: PluginEntry): void {
-    if (!this.activeEntry) return;
+  private registerManifestRoutes(entry: PluginEntry, active = this.activeEntry): void {
+    if (!active) return;
     const specs = entry.manifest.contributes.routes ?? [];
     if (specs.length === 0) return;
     const { globalRouteRegistry } = require('../../plugin-routes/registry.js');
@@ -343,7 +354,7 @@ export class PluginHost {
     for (const def of specs) {
       try {
         const dispose = globalRouteRegistry.register(entry.manifest.id, def, isBuiltin);
-        this.activeEntry.ownedRouteDisposers.push(dispose);
+        active.ownedRouteDisposers.push(dispose);
       } catch (err: any) {
         this.hooks.log(`⚠ plugin "${entry.manifest.id}" route "${def.id}" failed to register: ${err?.message ?? err}`);
       }
@@ -357,15 +368,15 @@ export class PluginHost {
    *  in-memory definition registry so WorkflowList/WorkflowRun can
    *  reach them. Actual execution flows through globalWorkflowRunner
    *  (its dispatchers must be wired by the host at bootstrap). */
-  private registerManifestWorkflows(entry: PluginEntry): void {
-    if (!this.activeEntry) return;
+  private registerManifestWorkflows(entry: PluginEntry, active = this.activeEntry): void {
+    if (!active) return;
     const specs = entry.manifest.contributes.workflows ?? [];
     if (specs.length === 0) return;
     const { registerWorkflowDefinition } = require('../../plugin-workflows/llm-tools.js');
     for (const def of specs) {
       try {
         const dispose = registerWorkflowDefinition(entry.manifest.id, def);
-        this.activeEntry.ownedWorkflowDisposers.push(dispose);
+        active.ownedWorkflowDisposers.push(dispose);
       } catch (err: any) {
         this.hooks.log(`⚠ plugin "${entry.manifest.id}" workflow "${def.id}" failed to register: ${err?.message ?? err}`);
       }
@@ -374,8 +385,8 @@ export class PluginHost {
 
   /** Register manifest-declared shell hooks for the plugin being activated.
    *  Installed plugins' hooks stay off (no approval path); disposers unregister them on deactivate. */
-  private registerManifestHooks(entry: PluginEntry): void {
-    if (!this.activeEntry) return;
+  private registerManifestHooks(entry: PluginEntry, active = this.activeEntry): void {
+    if (!active) return;
     const declared = entry.manifest.contributes.hooks ?? [];
     const specs = enabledPluginHooks(declared, entry.source);
     if (specs.length === 0) return;
@@ -395,7 +406,7 @@ export class PluginHost {
       });
       try {
         const dispose = globalHookDispatcher.register(handler);
-        this.activeEntry.ownedHookDisposers.push(dispose);
+        active.ownedHookDisposers.push(dispose);
       } catch (err: any) {
         this.hooks.log(`⚠ plugin "${entry.manifest.id}" hook "${spec.id}" failed to register: ${err?.message ?? err}`);
       }
@@ -406,8 +417,7 @@ export class PluginHost {
    *  plugin. Returns undefined when no persistence backend is wired
    *  or no plugin is active — callers feature-detect via optional
    *  chaining on ctx.persistentState. */
-  private buildPersistentStateContext(): import('../../plugin-state/api.js').PluginStateApi | undefined {
-    const active = this.activeEntry;
+  private buildPersistentStateContext(active = this.activeEntry): import('../../plugin-state/api.js').PluginStateApi | undefined {
     if (!active || !this.statePersistence) return undefined;
     const existing = this.pluginStateApi.get(active.name);
     if (existing) return existing;
@@ -683,15 +693,41 @@ export class PluginHost {
     return this.activeEntry;
   }
 
-  isActive(name: string): boolean {
-    return this.activeEntry?.name === name || this.activeEntry?.plugin.name === name;
+  /** All live plugins in activation order. The last entry owns key focus. */
+  activePlugins(): ActivePlugin[] {
+    return [...this.activeEntries.values()];
   }
 
-  async activate(name: string): Promise<void> {
+  isActive(name: string): boolean {
+    return this.activePlugins().some(active => active.name === name || active.plugin.name === name);
+  }
+
+  activate(name: string): Promise<void> {
+    return this.serializeLifecycle(() => this.activateNow(name));
+  }
+
+  private async activateNow(name: string): Promise<void> {
     const entry = this.resolveEntry(name);
     if (!entry) throw new Error(`plugin "${name}" not found — try /plugin list`);
-    if (this.activeEntry?.name === entry.manifest.id) return;
-    if (this.activeEntry) await this.deactivate();
+    if (this.activeEntries.has(entry.manifest.id)) return;
+    const peers = this.activePlugins().map(active => this.available.get(active.name)!.manifest);
+    if (peers.length > 0) {
+      if (!entry.manifest.allowMultiActive || peers.some(peer => !peer.allowMultiActive)) {
+        await this.deactivateAllNow();
+      } else {
+        const decision = checkPeerCompat(entry.manifest, peers);
+        if (!decision.ok) throw new Error(decision.reason);
+        const occupiedSlots = new Map<PaneSlot, string>();
+        for (const active of this.activePlugins()) {
+          for (const slot of active.ownedSlots) occupiedSlots.set(slot, active.name);
+        }
+        const collision = (Object.keys(entry.plugin.panes) as PaneSlot[])
+          .find(slot => occupiedSlots.has(slot));
+        if (collision) {
+          throw new Error(`plugin "${entry.manifest.id}" cannot activate: pane slot "${collision}" is already owned by "${occupiedSlots.get(collision)}"`);
+        }
+      }
+    }
 
     const plugin = entry.plugin;
     const loadedWidgetTypes: string[] = [];
@@ -748,6 +784,12 @@ export class PluginHost {
       for (const type of loadedWidgetTypes) this.widgetHost?.unregisterType(type);
       throw err;
     }
+    const peerToolNames = new Set(this.activePluginLLMTools().map(tool => tool.name));
+    const collidingTool = aiTools.find(tool => peerToolNames.has(tool.name));
+    if (collidingTool) {
+      for (const type of loadedWidgetTypes) this.widgetHost?.unregisterType(type);
+      throw new Error(`plugin tool "${collidingTool.name}" already belongs to an active plugin`);
+    }
 
     let state: unknown;
     try {
@@ -762,7 +804,8 @@ export class PluginHost {
       kind: 'plugin', id: entry.manifest.id,
     });
     publishElementEvent('plugin', entry.manifest.id, 'create');
-    this.activeEntry = {
+    const previousFocus = this.activeEntry;
+    const activating: ActivePlugin = {
       name: entry.manifest.id,
       plugin,
       state,
@@ -788,41 +831,48 @@ export class PluginHost {
       // observable identity for downstream MSS bridges).
       pluginUri: mintPluginUri(),
     };
-    this.activeEntry.ownedCommandDisposables.push(this.commands.registerPluginCommands({
-      pluginId: entry.manifest.id,
-      manifest: entry.manifest,
-      slashCommands: plugin.slashCommands ?? [],
-      context: () => this.buildContext(),
-    }));
-    this.activeEntry.ownedTaskDisposables.push(this.tasks.registerPluginTasks(entry.manifest.contributes.tasks ?? [], {
-      pluginId: entry.manifest.id,
-      pluginDir: entry.path,
-      // WD7 — plugin workspaceDir follows the active project.
-      workspaceDir: getSessionCwd(),
-      execution: this.buildExecutionContext(),
-    }));
-    this.loadManifestDashboardContributions(entry);
-    this.loadManifestPromptContributions(entry);
-    // PX-3: register manifest-declared shell hooks BEFORE onActivate
-    // so the plugin can assume its own hooks are already wired when
-    // it boots.
-    this.registerManifestHooks(entry);
-    // PX-4: missions + workflows register here too so onActivate sees
-    // them in globalMissionRegistry / workflow definition registry.
-    this.registerManifestMissions(entry);
-    this.registerManifestWorkflows(entry);
-    // PX-5: routes register at activate so the keyword detector +
-    // Turn hook see them immediately.
-    this.registerManifestRoutes(entry);
-    // PX-3 P5: StateRestore hook — fires ONCE per plugin activation,
-    // delivering the plugin's persisted state blob. Fire-and-forget;
-    // return value ignored. Zero cost when no handlers registered.
+    this.activeEntry = activating;
+    this.activeEntries.set(activating.name, activating);
     try {
-      await this.dispatchStateRestore(entry.manifest.id);
-    } catch (err: any) {
-      this.hooks.log(`⚠ plugin "${entry.manifest.id}" StateRestore failed: ${err?.message ?? err}`);
+      activating.ownedCommandDisposables.push(this.commands.registerPluginCommands({
+        pluginId: entry.manifest.id,
+        manifest: entry.manifest,
+        slashCommands: plugin.slashCommands ?? [],
+        context: () => this.buildContext(activating),
+      }));
+      activating.ownedTaskDisposables.push(this.tasks.registerPluginTasks(entry.manifest.contributes.tasks ?? [], {
+        pluginId: entry.manifest.id,
+        pluginDir: entry.path,
+        // WD7 — plugin workspaceDir follows the active project.
+        workspaceDir: getSessionCwd(),
+        execution: this.buildExecutionContext(activating),
+      }));
+      this.loadManifestDashboardContributions(entry, activating);
+      this.loadManifestPromptContributions(entry, activating);
+      // PX-3: register manifest-declared shell hooks BEFORE onActivate
+      // so the plugin can assume its own hooks are already wired when
+      // it boots.
+      this.registerManifestHooks(entry, activating);
+      // PX-4: missions + workflows register here too so onActivate sees
+      // them in globalMissionRegistry / workflow definition registry.
+      this.registerManifestMissions(entry, activating);
+      this.registerManifestWorkflows(entry, activating);
+      // PX-5: routes register at activate so the keyword detector +
+      // Turn hook see them immediately.
+      this.registerManifestRoutes(entry, activating);
+      // PX-3 P5: StateRestore hook — fires ONCE per plugin activation,
+      // delivering the plugin's persisted state blob. Fire-and-forget;
+      // return value ignored. Zero cost when no handlers registered.
+      try {
+        await this.dispatchStateRestore(entry.manifest.id);
+      } catch (err: any) {
+        this.hooks.log(`⚠ plugin "${entry.manifest.id}" StateRestore failed: ${err?.message ?? err}`);
+      }
+    } catch (err) {
+      await this.deactivateNow(activating.name);
+      throw err;
     }
-    const ctx = this.buildContext();
+    const ctx = this.buildContext(activating);
     try {
       await plugin.onActivate?.(ctx);
       for (const adapter of plugin.channelAdapters ?? []) {
@@ -830,99 +880,125 @@ export class PluginHost {
           throw new Error(`channel connector ${adapter.type} must be declared in contributes.connectors`);
         }
         // The manifest declaration alone is not an active channel.
-        this.activeEntry.ownedChannelDisposers.push(registerOutboundAdapter(adapter));
+        activating.ownedChannelDisposers.push(registerOutboundAdapter(adapter));
       }
       // Resolve layout after onActivate so the plugin can initialize
       // state first (e.g. fetch remote rows). buildLayout can spawn
       // widgets via the tracked helper — we record ids for dispose.
       if (plugin.buildLayout && this.widgetHost) {
-        const layoutCtx = this.buildLayoutCtx();
+        const layoutCtx = this.buildLayoutCtx(activating);
         const layout = plugin.buildLayout(layoutCtx);
-        if (layout) this.activeEntry.layout = layout;
+        if (layout) activating.layout = layout;
       }
-      this.hooks.hudSet('mode', `mode: ${name}`, 10);
+      this.hooks.hudSet('mode', this.activeEntry ? `mode: ${this.activeEntry.name}` : '', 10);
     } catch (err: any) {
       this.hooks.log(`⚠ plugin "${name}" activation failed: ${err?.message || err}`);
       // Best-effort cleanup — dispose any widgets that made it
       const reg = getGlobalElementRegistry();
       reg.unregister('plugin', entry.manifest.id);
       publishElementEvent('plugin', entry.manifest.id, 'delete');
-      if (this.widgetHost && this.activeEntry) {
-        for (const id of this.activeEntry.ownedWidgets) {
+      if (this.widgetHost) {
+        for (const id of activating.ownedWidgets) {
           this.widgetHost.dispose(id);
           reg.unregister('widget', id);
           publishElementEvent('widget', id, 'delete');
         }
       }
-      if (this.activeEntry) {
-        for (const d of this.activeEntry.ownedDisplayDisposables) d.dispose();
-        for (const d of this.activeEntry.ownedCommandDisposables) d.dispose();
-        for (const d of this.activeEntry.ownedTaskDisposables) d.dispose();
-        for (const d of this.activeEntry.ownedChannelDisposers) d();
-        for (const d of this.activeEntry.ownedHookDisposers) d();
-        for (const d of this.activeEntry.ownedMissionDisposers) d();
-        for (const d of this.activeEntry.ownedRouteDisposers) d();
-        for (const d of this.activeEntry.ownedWorkflowDisposers) d();
-        for (const type of this.activeEntry.ownedWidgetTypes) this.widgetHost?.unregisterType(type);
+      {
+        for (const d of activating.ownedDisplayDisposables) d.dispose();
+        for (const d of activating.ownedCommandDisposables) d.dispose();
+        for (const d of activating.ownedTaskDisposables) d.dispose();
+        for (const d of activating.ownedChannelDisposers) d();
+        for (const d of activating.ownedHookDisposers) d();
+        for (const d of activating.ownedMissionDisposers) d();
+        for (const d of activating.ownedRouteDisposers) d();
+        for (const d of activating.ownedWorkflowDisposers) d();
+        for (const type of activating.ownedWidgetTypes) this.widgetHost?.unregisterType(type);
+        for (const id of activating.promptFragmentIds) getPromptBankStore().delete(id);
       }
-      this.activeEntry = null;
-      this.hooks.hudSet('mode', '', 10);
+      this.clearPluginStateScope(activating.name);
+      this.activeEntries.delete(activating.name);
+      if (this.activeEntry === activating) {
+        this.activeEntry = previousFocus && this.activeEntries.get(previousFocus.name) === previousFocus
+          ? previousFocus : this.activePlugins().at(-1) ?? null;
+      }
+      this.hooks.hudSet('mode', this.activeEntry ? `mode: ${this.activeEntry.name}` : '', 10);
       throw err;
     }
   }
 
-  async deactivate(): Promise<void> {
-    if (!this.activeEntry) return;
-    const ctx = this.buildContext();
+  deactivate(name?: string): Promise<void> {
+    return this.serializeLifecycle(() => this.deactivateNow(name));
+  }
+
+  private async deactivateNow(name?: string): Promise<void> {
+    const target = name ? this.activeEntries.get(name) : this.activeEntry;
+    if (!target) return;
+    const previousFocus = this.activeEntry;
+    this.activeEntry = target;
+    const ctx = this.buildContext(target);
     try {
-      await this.activeEntry.plugin.onDeactivate?.(ctx);
+      await target.plugin.onDeactivate?.(ctx);
     } catch (err: any) {
-      this.hooks.log(`⚠ plugin "${this.activeEntry.name}" onDeactivate failed: ${err?.message || err}`);
+      this.hooks.log(`⚠ plugin "${target.name}" onDeactivate failed: ${err?.message || err}`);
     }
     const reg = getGlobalElementRegistry();
     // Dispose every widget this plugin spawned through PluginLayoutCtx
     if (this.widgetHost) {
-      for (const id of this.activeEntry.ownedWidgets) {
+      for (const id of target.ownedWidgets) {
         this.widgetHost.dispose(id);
         reg.unregister('widget', id);
         publishElementEvent('widget', id, 'delete');
       }
     }
-    for (const d of this.activeEntry.ownedDisplayDisposables) d.dispose();
-    for (const d of this.activeEntry.ownedCommandDisposables) d.dispose();
-    for (const d of this.activeEntry.ownedTaskDisposables) d.dispose();
-    for (const d of this.activeEntry.ownedChannelDisposers) d();
+    for (const d of target.ownedDisplayDisposables) d.dispose();
+    for (const d of target.ownedCommandDisposables) d.dispose();
+    for (const d of target.ownedTaskDisposables) d.dispose();
+    for (const d of target.ownedChannelDisposers) d();
     const promptStore = getPromptBankStore();
-    for (const id of this.activeEntry.promptFragmentIds) promptStore.delete(id);
+    for (const id of target.promptFragmentIds) promptStore.delete(id);
     // PX-3: dispose hook registrations for this plugin.
-    for (const d of this.activeEntry.ownedHookDisposers) {
+    for (const d of target.ownedHookDisposers) {
       try { d(); } catch { /* best-effort */ }
     }
     // PX-4: dispose mission + workflow registrations.
-    for (const d of this.activeEntry.ownedMissionDisposers) {
+    for (const d of target.ownedMissionDisposers) {
       try { d(); } catch { /* best-effort */ }
     }
-    for (const d of this.activeEntry.ownedWorkflowDisposers) {
+    for (const d of target.ownedWorkflowDisposers) {
       try { d(); } catch { /* best-effort */ }
     }
     // PX-5: dispose route registrations + re-persist.
-    for (const d of this.activeEntry.ownedRouteDisposers) {
+    for (const d of target.ownedRouteDisposers) {
       try { d(); } catch { /* best-effort */ }
     }
-    if (this.activeEntry.ownedRouteDisposers.length > 0) {
+    if (target.ownedRouteDisposers.length > 0) {
       try {
         const { globalRouteRegistry } = require('../../plugin-routes/registry.js');
         void globalRouteRegistry.persist();
       } catch { /* best-effort */ }
     }
-    for (const type of this.activeEntry.ownedWidgetTypes) this.widgetHost?.unregisterType(type);
+    for (const type of target.ownedWidgetTypes) this.widgetHost?.unregisterType(type);
     // PX-2 P4: drop session-state entries + cached api handle for
     // this plugin. Persistent state in ~/.elanous/state survives.
-    this.clearPluginStateScope(this.activeEntry.name);
-    reg.unregister('plugin', this.activeEntry.name);
-    publishElementEvent('plugin', this.activeEntry.name, 'delete');
-    this.activeEntry = null;
-    this.hooks.hudSet('mode', '', 10);
+    this.clearPluginStateScope(target.name);
+    reg.unregister('plugin', target.name);
+    publishElementEvent('plugin', target.name, 'delete');
+    this.activeEntries.delete(target.name);
+    if (this.activeEntry === target) {
+      this.activeEntry = previousFocus && this.activeEntries.get(previousFocus.name) === previousFocus
+        ? previousFocus
+        : this.activePlugins().at(-1) ?? null;
+    }
+    this.hooks.hudSet('mode', this.activeEntry ? `mode: ${this.activeEntry.name}` : '', 10);
+  }
+
+  deactivateAll(): Promise<void> {
+    return this.serializeLifecycle(() => this.deactivateAllNow());
+  }
+
+  private async deactivateAllNow(): Promise<void> {
+    for (const active of [...this.activeEntries.values()].reverse()) await this.deactivateNow(active.name);
   }
 
   /** Layout produced by the active plugin's buildLayout, or null when
@@ -932,21 +1008,19 @@ export class PluginHost {
   }
 
   activeDashboardPanes(): ActiveDashboardPaneContribution[] {
-    return [...(this.activeEntry?.dashboardPanes ?? [])];
+    return this.activePlugins().flatMap(active => active.dashboardPanes);
   }
 
   activeDashboardViews(): PluginViewContribution[] {
-    return [...(this.activeEntry?.dashboardViews ?? [])];
+    return this.activePlugins().flatMap(active => active.dashboardViews);
   }
 
   activeThemeContributions(): ActiveThemeContribution[] {
-    return [...(this.activeEntry?.themeContributions ?? [])];
+    return this.activePlugins().flatMap(active => active.themeContributions);
   }
 
   loadThemeTokens(id: string): ThemeTokenInput | null {
-    const active = this.activeEntry;
-    if (!active) return null;
-    const contribution = active.themeContributions.find(theme =>
+    const contribution = this.activeThemeContributions().find(theme =>
       theme.id === id
       || theme.localId === id
       || `${theme.pluginId}.${theme.localId}` === id
@@ -967,8 +1041,8 @@ export class PluginHost {
   /** Reload a specific plugin's module (dev helper). */
   async reload(name: string): Promise<void> {
     const entry = this.resolveEntry(name);
-    const wasActive = this.activeEntry?.name === entry?.manifest.id;
-    if (wasActive) await this.deactivate();
+    const wasActive = entry ? this.activeEntries.has(entry.manifest.id) : false;
+    if (wasActive) await this.deactivate(entry!.manifest.id);
     if (!entry) throw new Error(`plugin "${name}" not found`);
     await this.scanDir(join(entry.path, '..'), entry.source);
     if (wasActive) await this.activate(entry.manifest.id);
@@ -980,8 +1054,9 @@ export class PluginHost {
    *  or 'passthrough' when the dashboard should fall back to its own
    *  browse-mode key logic. */
   async routeKey(ev: KeyEvent, focus: PaneSlot): Promise<'consumed' | 'passthrough'> {
-    const active = this.activeEntry;
+    const active = this.activePlugins().find(plugin => plugin.ownedSlots.has(focus)) ?? this.activeEntry;
     if (!active) return 'passthrough';
+    this.activeEntry = active;
 
     // Busy guard — plugin owns long-running input blocking. Caller still
     // gets 'consumed' so the dashboard main loop swallows the key.
@@ -1015,7 +1090,7 @@ export class PluginHost {
 
     // 3. Plugin-global onKey
     if (active.plugin.onKey) {
-      const action = active.plugin.onKey(ev, active.state as any, this.buildContext());
+      const action = active.plugin.onKey(ev, active.state as any, this.buildContext(active));
       if (action.type !== 'none') {
         await this.applyAction(action);
         return 'consumed';
@@ -1041,17 +1116,14 @@ export class PluginHost {
 
   /** Slash commands contributed by the active plugin. */
   contributedSlashCommands(): SlashCommand[] {
-    const active = this.activeEntry;
-    if (!active) return [];
-    return this.commands.list({ pluginId: active.name }).map(command => commandToSlashMetadata(command, (args) => this.dispatchCommand(command.id, args)));
+    return this.activePlugins().flatMap(active => this.commands.list({ pluginId: active.name })
+      .map(command => commandToSlashMetadata(command, (args) => this.dispatchCommand(command.id, args))));
   }
 
   /** Active plugin command catalog. Includes hidden/internal commands
    *  when requested. Handlers stay private to dispatchCommand. */
   contributedCommands(opts: { includeHidden?: boolean } = {}): RegisteredCommand[] {
-    const active = this.activeEntry;
-    if (!active) return [];
-    return this.commands.list({ pluginId: active.name, includeHidden: opts.includeHidden });
+    return this.activePlugins().flatMap(active => this.commands.list({ pluginId: active.name, includeHidden: opts.includeHidden }));
   }
 
   hostLLMTools(): LLMToolDef[] {
@@ -1059,7 +1131,7 @@ export class PluginHost {
   }
 
   activePluginLLMTools(): LLMToolDef[] {
-    return [...(this.activeEntry?.aiTools ?? [])];
+    return this.activePlugins().flatMap(active => active.aiTools);
   }
 
   /** LLM tool defs contributed by the active plugin + any host-level
@@ -1089,11 +1161,19 @@ export class PluginHost {
       return { ok: false, error: `unknown tool "${name}"` };
     }
     const started = Date.now();
-    debug.log('plugin.tool', name, { args, plugin: this.activeEntry?.name ?? null });
+    const owner = this.activePlugins().find(active => active.aiTools.includes(tool));
+    debug.log('plugin.tool', name, { args, plugin: owner?.name ?? null });
     try {
+      const activePlugin = owner ? this.available.get(owner.name) : undefined;
+      const handlerRef = activePlugin?.manifest.contributes.aiTools?.find((candidate) => candidate.name === name)?.handler;
+      if (activePlugin && handlerRef && isGraphRouteHandler(handlerRef)) {
+        const { loadGraphPluginFromDir } = await import('../../graph-runner/graph-manifest-loader.js');
+        const declaredGraphIds = new Set(Object.keys(loadGraphPluginFromDir(activePlugin.path).graphs));
+        if (!graphRouteHandlerAllowed(handlerRef, declaredGraphIds)) throw new Error(`graph route is not allowlisted: ${name}`);
+      }
       // Host tools can run outside any plugin context — buildContext
       // falls back to a minimal stub when activeEntry is null.
-      const ctx = this.activeEntry ? this.buildContext() : this.buildHostContext();
+      const ctx = owner ? this.buildContext(owner) : this.buildHostContext();
       const result = await tool.handler(args, ctx);
       debug.log('plugin.tool.done', name, {
         durationMs: Date.now() - started,
@@ -1207,16 +1287,16 @@ export class PluginHost {
 
   /** Build a PluginLayoutCtx for buildLayout. Spawns through the tracked
    *  helper so we know which widgets belong to this plugin. */
-  private buildLayoutCtx<S>(): PluginLayoutCtx<S> {
+  private buildLayoutCtx<S>(active = this.activeEntry): PluginLayoutCtx<S> {
     const host = this;
-    const pluginCtx = this.buildContext();
+    const pluginCtx = this.buildContext(active);
     return {
       plugin: pluginCtx,
-      get state() { return (host.activeEntry?.state ?? {}) as S; },
+      get state() { return (active?.state ?? {}) as S; },
       spawnWidget(opts) {
         if (!host.widgetHost) throw new Error('no widget host attached');
         const inst = host.widgetHost.spawn(opts);
-        if (host.activeEntry) host.activeEntry.ownedWidgets.push(inst.id);
+        active?.ownedWidgets.push(inst.id);
         getGlobalElementRegistry().register('widget', inst.id, { kind: 'widget', id: inst.id });
         publishElementEvent('widget', inst.id, 'create');
         return inst;
@@ -1225,11 +1305,11 @@ export class PluginHost {
     };
   }
 
-  private buildContext(): PluginContext {
+  private buildContext(active = this.activeEntry): PluginContext {
     const host = this;
     return {
-      get pluginName() { return host.activeEntry?.name ?? ''; },
-      get state() { return host.activeEntry?.state ?? {}; },
+      get pluginName() { return active?.name ?? ''; },
+      get state() { return active?.state ?? {}; },
       get display() { return host.hooks.display; },
       focus: {
         // F-3b — prefer primitive `focusManager` when wired; fall back
@@ -1260,29 +1340,29 @@ export class PluginHost {
       keymap: {
         register: (binding) => {
           const disposable = host.hooks.display?.registerKey(binding) ?? { dispose: () => {} };
-          host.activeEntry?.ownedDisplayDisposables.push(disposable);
+          active?.ownedDisplayDisposables.push(disposable);
           return disposable;
         },
       },
       events: host.hooks.displayEvents ? {
         subscribe: (type, listener) => {
           const disposable = host.hooks.displayEvents!.subscribe(type, listener);
-          host.activeEntry?.ownedDisplayDisposables.push(disposable);
+          active?.ownedDisplayDisposables.push(disposable);
           return disposable;
         },
       } : undefined,
       theme: host.hooks.theme ? {
         current: () => host.hooks.theme!(),
       } : undefined,
-      execution: host.buildExecutionContext(),
-      capabilities: host.buildCapabilitiesContext(),
-      tasks: host.buildTasksContext(),
-      prompts: host.buildPromptsContext(),
-      modals: host.buildModalsContext(),
+      execution: host.buildExecutionContext(active),
+      capabilities: host.buildCapabilitiesContext(active),
+      tasks: host.buildTasksContext(active),
+      prompts: host.buildPromptsContext(active),
+      modals: host.buildModalsContext(active),
       panes: host.buildPanesContext(),
       setState(patch) {
-        if (!host.activeEntry) return;
-        host.activeEntry.state = { ...(host.activeEntry.state as object), ...patch };
+        if (!active) return;
+        active.state = { ...(active.state as object), ...patch };
         host.hooks.requestRender();
       },
       log: (line) => host.hooks.log(line),
@@ -1291,14 +1371,14 @@ export class PluginHost {
       focusPane: (pane) => host.hooks.focusPane(pane),
       getWidget: (id) => host.widgetHost?.get(id) ?? null,
       setLayout: (layout) => {
-        if (!host.activeEntry) return;
-        host.activeEntry.layout = layout;
+        if (!active) return;
+        active.layout = layout;
         host.hooks.requestRender();
       },
       spawnWidget: (opts) => {
         if (!host.widgetHost) throw new Error('no widget host attached');
         const inst = host.widgetHost.spawn(opts);
-        if (host.activeEntry) host.activeEntry.ownedWidgets.push(inst.id);
+        active?.ownedWidgets.push(inst.id);
         getGlobalElementRegistry().register('widget', inst.id, { kind: 'widget', id: inst.id });
         publishElementEvent('widget', inst.id, 'create');
         return inst;
@@ -1328,7 +1408,7 @@ export class PluginHost {
       // entry caches the api so repeated property reads return the
       // same object reference.
       get persistentState() {
-        return host.buildPersistentStateContext();
+        return host.buildPersistentStateContext(active);
       },
     };
   }
@@ -1347,11 +1427,10 @@ export class PluginHost {
     };
   }
 
-  private buildExecutionContext(): PluginContext['execution'] {
+  private buildExecutionContext(active = this.activeEntry): PluginContext['execution'] {
     if (!this.hooks.execution) return undefined;
     return {
       spawn: (spec) => {
-        const active = this.activeEntry;
         if (!active) throw new Error('no active plugin for execution spawn');
         assertCapability(this.capabilityPolicy.canSpawnProcess(this.capabilityContext(active), spec));
         return this.hooks.execution!.spawn(spec);
@@ -1359,8 +1438,7 @@ export class PluginHost {
     };
   }
 
-  private buildCapabilitiesContext(): PluginContext['capabilities'] {
-    const active = this.activeEntry;
+  private buildCapabilitiesContext(active = this.activeEntry): PluginContext['capabilities'] {
     if (!active) return undefined;
     const host = this;
     return {
@@ -1417,8 +1495,7 @@ export class PluginHost {
     };
   }
 
-  private buildTasksContext(): PluginContext['tasks'] {
-    const active = this.activeEntry;
+  private buildTasksContext(active = this.activeEntry): PluginContext['tasks'] {
     if (!active) return undefined;
     return {
       list: () => this.tasks.list(active.name),
@@ -1426,8 +1503,7 @@ export class PluginHost {
     };
   }
 
-  private buildModalsContext(): PluginContext['modals'] {
-    const active = this.activeEntry;
+  private buildModalsContext(active = this.activeEntry): PluginContext['modals'] {
     if (!active || !this.widgetHost) return undefined;
     return {
       open: (id, opts = {}) => {
@@ -1467,8 +1543,7 @@ export class PluginHost {
     };
   }
 
-  private buildPromptsContext(): PluginContext['prompts'] {
-    const active = this.activeEntry;
+  private buildPromptsContext(active = this.activeEntry): PluginContext['prompts'] {
     if (!active) return undefined;
     const pluginId = active.name;
     const store = getPromptBankStore();
@@ -1544,8 +1619,7 @@ export class PluginHost {
     }
   }
 
-  private loadManifestDashboardContributions(entry: PluginEntry): void {
-    const active = this.activeEntry;
+  private loadManifestDashboardContributions(entry: PluginEntry, active = this.activeEntry): void {
     if (!active) return;
     const paneSpecs = entry.manifest.contributes.panes ?? [];
     if (paneSpecs.length > 0 && !this.widgetHost) {
@@ -1584,8 +1658,7 @@ export class PluginHost {
     }));
   }
 
-  private loadManifestPromptContributions(entry: PluginEntry): void {
-    const active = this.activeEntry;
+  private loadManifestPromptContributions(entry: PluginEntry, active = this.activeEntry): void {
     if (!active) return;
     const prompts = entry.manifest.contributes.prompts ?? [];
     if (prompts.length === 0) return;

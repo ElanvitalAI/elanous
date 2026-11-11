@@ -340,7 +340,8 @@ function readGrokCredential(opts: {
 
   if (opts.skipSubscription !== true) {
     const sub = readSubscriptionToken(grokAuthFilePath(opts.home));
-    if (sub) {
+    if (sub && (sub.scopeName !== 'https://auth.x.ai::hq-mirror'
+      || (sub.expiresAt && Date.parse(sub.expiresAt) > Date.now() + 120_000))) {
       return {
         kind: 'subscription',
         baseUrl: GROK_SUBSCRIPTION_BASE_URL,
@@ -492,6 +493,7 @@ export function refreshGrokSubscriptionToken(
   const path = grokAuthFilePath(opts.home);
   const selected = readSelectedScope(path);
   if (!selected) return 'no-credential';
+  if (selected.scopeName === 'https://auth.x.ai::hq-mirror') return 'no-credential';
   if (opts.requireRefreshToken && !selected.refreshToken) return 'no-credential';
   // A nested refresh for the same auth file observes the outer call's result later.
   if (grokSubscriptionRefreshesInProgress.has(path)) return 'unchanged';

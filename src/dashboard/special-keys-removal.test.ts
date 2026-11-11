@@ -7,22 +7,6 @@ import { routeDashboardPriorityKey } from './input/dashboard-priority-key-route.
 import { dispatchDashboardKey } from './input/key-dispatcher.js';
 import type { DashboardKeyHandler } from './input/key-types.js';
 
-test('classic dashboard no longer embeds the mini vi editor', () => {
-  const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
-  const previewRuntime = readFileSync(new URL('./preview-widget-runtime.ts', import.meta.url), 'utf8');
-  expect(source).not.toContain("from '../vi-editor.js'");
-  expect(source).not.toContain('ELANOUS_USE_MINI_VI');
-  expect(source).not.toContain('handleViEditorKey');
-  expect(previewRuntime).not.toContain('projectVi');
-});
-
-test('classic slash command catalog and dispatcher no longer expose rebind', () => {
-  const catalog = readFileSync(new URL('../chat/index.ts', import.meta.url), 'utf8');
-  const handlers = readFileSync(new URL('./slash-runtime/dashboard-handlers.ts', import.meta.url), 'utf8');
-  expect(catalog).not.toContain("name: 'rebind'");
-  expect(handlers).not.toContain("registry.register('rebind'");
-});
-
 test('classic TUI retains the simulated Escape abort gate and production typeahead transition', () => {
   const interaction = readFileSync(new URL('../ux-sim/interaction.ts', import.meta.url), 'utf8');
   const turnStates = readFileSync(new URL('../ux-sim/turn-states.ts', import.meta.url), 'utf8');

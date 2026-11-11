@@ -21,6 +21,13 @@ const inbox = [
   { id: 14, from: 'TC', to: 'OP', body: '확인 요청' },
 ];
 
+function sortSnapshotKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortSnapshotKeys);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => [key, sortSnapshotKeys(entry)]));
+}
+
 describe('msg turn hook output', () => {
   test('finds the seat from a seat worktree cwd and ignores non-seat directories', () => {
     expect(seatFromCwd('/Users/me/elanous-hq/seats/OP')).toBe('OP');
@@ -46,6 +53,28 @@ describe('msg turn hook output', () => {
     expect(stop).toEqual({ decision: 'block', reason: '새 우편 2통(#11, #14) — 처리 후 ack' });
     expect(buildMsgHookOutput({ event: 'stop', format: 'codex', cwd: '/repo/elanous-hq/seats/UX', sessionId: 's3', messages: inbox, stateDir: dir })).toBeNull();
     expect(buildMsgHookOutput({ event: 'session-start', format: 'codex', cwd: '/repo/elanous-hq/seats/UX', sessionId: 's2', messages: inbox, stateDir: dir })).toBeNull();
+  });
+
+  const outputSnapshot = (format: 'claude' | 'codex') => {
+    const dir = stateDir();
+    const render = (event: 'user-prompt-submit' | 'session-start' | 'stop') => JSON.parse(buildMsgHookOutput({
+      event, format, cwd: '/repo/elanous-hq/seats/OP', sessionId: `${format}-${event}`, messages: inbox, stateDir: dir,
+    })!);
+    return { userPromptSubmit: render('user-prompt-submit'), sessionStart: render('session-start'), stop: render('stop') };
+  };
+  test('Claude hook output snapshot keeps additionalContext nested and Stop blocking', () => {
+    const outputs = outputSnapshot('claude');
+    expect(JSON.stringify(sortSnapshotKeys(outputs))).toMatchInlineSnapshot(`"{"sessionStart":{"hookSpecificOutput":{"additionalContext":"📬 전달 완료: 미읽음 우편 2통 — 정본 eln msg list --to OP · 처리한 글 ID 하나씩 eln msg ack --to OP --id <id>\\n- #11 MK→OP [coord] 첫 줄 나머지 본문\\n- #14 TC→OP [] 확인 요청","hookEventName":"SessionStart"}},"stop":{"decision":"block","reason":"새 우편 2통(#11, #14) — 처리 후 ack"},"userPromptSubmit":{"hookSpecificOutput":{"additionalContext":"📬 전달 완료: 미읽음 우편 2통 — 정본 eln msg list --to OP · 처리한 글 ID 하나씩 eln msg ack --to OP --id <id>\\n- #11 MK→OP [coord] 첫 줄 나머지 본문\\n- #14 TC→OP [] 확인 요청","hookEventName":"UserPromptSubmit"}}}"`);
+    expect(Object.hasOwn(outputs.userPromptSubmit, 'additionalContext')).toBe(false);
+    expect(Object.hasOwn(outputs.sessionStart, 'additionalContext')).toBe(false);
+    expect(Object.hasOwn(outputs.stop, 'additionalContext')).toBe(false);
+  });
+  test('Codex hook output snapshot keeps additionalContext nested and Stop blocking', () => {
+    const outputs = outputSnapshot('codex');
+    expect(JSON.stringify(sortSnapshotKeys(outputs))).toMatchInlineSnapshot(`"{"sessionStart":{"hookSpecificOutput":{"additionalContext":"📬 전달 완료: 미읽음 우편 2통 — 정본 eln msg list --to OP · 처리한 글 ID 하나씩 eln msg ack --to OP --id <id>\\n- #11 MK→OP [coord] 첫 줄 나머지 본문\\n- #14 TC→OP [] 확인 요청","hookEventName":"SessionStart"}},"stop":{"decision":"block","reason":"새 우편 2통(#11, #14) — 처리 후 ack"},"userPromptSubmit":{"hookSpecificOutput":{"additionalContext":"📬 전달 완료: 미읽음 우편 2통 — 정본 eln msg list --to OP · 처리한 글 ID 하나씩 eln msg ack --to OP --id <id>\\n- #11 MK→OP [coord] 첫 줄 나머지 본문\\n- #14 TC→OP [] 확인 요청","hookEventName":"UserPromptSubmit"}}}"`);
+    expect(Object.hasOwn(outputs.userPromptSubmit, 'additionalContext')).toBe(false);
+    expect(Object.hasOwn(outputs.sessionStart, 'additionalContext')).toBe(false);
+    expect(Object.hasOwn(outputs.stop, 'additionalContext')).toBe(false);
   });
 
   test('remembers every bundle and does not merge missing session IDs', () => {

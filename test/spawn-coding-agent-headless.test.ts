@@ -5,7 +5,6 @@
 // and family exposure — no external binary required (whichBinary seam).
 
 import { describe, test, expect, afterEach } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import {
   dispatchSpawnCodingAgentHeadless,
   buildSpawnCodingAgentHeadlessTool,
@@ -22,12 +21,13 @@ const supportedBrands: CodingAgentBrand[] = ['claude-code', 'codex'];
 afterEach(() => resetForTesting());
 
 describe('SpawnCodingAgentHeadless', () => {
-  test('owns CodingAgentBrand without importing the VW tool', () => {
-    const source = readFileSync(new URL('../src/skills/tools/spawn-coding-agent-headless.ts', import.meta.url), 'utf8');
-    expect(source).toMatch(/export type CodingAgentBrand = 'claude-code' \| 'codex';/);
-    expect(source).not.toMatch(/from\s+['"]\.\/spawn-coding-agent-vw(?:\.js)?['"]/);
+  test('both advertised brands use the headless binary boundary', () => {
     const properties = buildSpawnCodingAgentHeadlessTool().parameters.properties as { brand: { enum: string[] } };
     expect(properties.brand.enum).toEqual(supportedBrands);
+    for (const brand of supportedBrands) {
+      expect(() => dispatchSpawnCodingAgentHeadless({ brand }, { whichBinary: () => null })).toThrow(CodingAgentBinaryMissing);
+      expect(listPty()).toHaveLength(0);
+    }
   });
 
   test('rejects an unknown brand', () => {

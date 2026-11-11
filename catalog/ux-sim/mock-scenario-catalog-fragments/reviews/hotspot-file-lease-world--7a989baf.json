@@ -1,0 +1,4 @@
+{
+  "deviceKey": "hotspot-file-lease-world",
+  "review": "> 📅 **2026-11-10 재검토 (R-HOTSPOT · HOTSPOT-FILE-LEASE)** — 누락된 sourceModules 행을 추가하고 현재 장치 멤버십·생성 매뉴얼을 맞췄다. 실패하던 mock-scenario-catalog 시험을 다시 실행해 장치 목록과 생성 출력의 일치를 확인했다. 아래 시험·게이트 판정 규칙은 바뀌지 않았다."
+}

@@ -8,9 +8,9 @@ frontend:
   out: out/
 
 design:
-  description: 강의 자료를 모으고 노트를 적어 한 번에 찾는다
+  description: 날짜별 강의 기록과 논리 폴더 예시를 보고 노트 화면과 전체 검색 화면을 둘러본다 (정적 데모)
   screens:
-    - { path: /, title: 스크랩 목록 }
+    - { path: /, title: 날짜별 기록 }
     - { path: /notes/new, title: 노트 작성 }
     - { path: /search, title: 검색 }
 
@@ -76,6 +76,11 @@ storage:
     maxBytes: 10485760
 
 actions:
+  extract:
+    builtin: extract
+    input: { url: text }
+    output: { url: text, title: text, excerpt: text, content: text, provider: text }
+    uses: []
   transcribe:
     builtin: stt
     input: { audio: object-ref }

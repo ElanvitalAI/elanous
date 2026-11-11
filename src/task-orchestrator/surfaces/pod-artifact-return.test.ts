@@ -80,7 +80,7 @@ describe('pod artifact return', () => {
   test('skips malformed lines without discarding valid rows or consuming their receipts', () => {
     const store = new LogStore(':memory:');
     const ts = new Date().toISOString();
-    const openedStores = '{"_meta":{"type":"log-query-opened-stores","stores":[{"name":"prod","path":"/home/ubuntu/.elanous/logs/logs.db"},{"name":"test:repo","path":"/home/ubuntu/repo/.elanous-test/logs/logs.db"}],"scope":{"registeredStores":1,"unopenedStores":0},"queryStatus":{"registeredStores":true}}}';
+    const openedStores = '{"_meta":{"type":"log-query-opened-stores","stores":[{"name":"prod","path":"/home/user/.elanous/logs/logs.db"},{"name":"test:repo","path":"/home/user/repo/.elanous-test/logs/logs.db"}],"scope":{"registeredStores":1,"unopenedStores":0},"queryStatus":{"registeredStores":true}}}';
     const text = [JSON.stringify({ ts, category: 'harness.decision', event: 'decision', data: { runId: 'child-run' } }), 'not-json', openedStores, ''].join('\n');
     try {
       expect(importPodLogs(Buffer.from(text), 'si-job', store)).toEqual({ imported: 1, skipped: 2 });

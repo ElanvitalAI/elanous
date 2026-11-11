@@ -9,7 +9,8 @@ import { debug } from '../debug/log.js';
 import { checkLoops } from './checker.js';
 import { inventoryCrontab, listSchedules, openSchedulesDb } from '../domains/schedule-registry.js';
 import { parseGraphTemplateYaml } from '../self-implement/graph-yaml.js';
-import { listAllLoops, listLoops, loopRecentRuns, loopStatus, runLoop, setLoopEnabled, type LoopRegistryOptions } from './registry.js';
+import { listAllLoops, listLoops, loopRecentRuns, loopStatus, registerGraphTriggerRun, runLoop, setLoopEnabled,
+  type LoopRegistryOptions } from './registry.js';
 import { LOOP_MESSAGE_ROUTES } from './msg-address.js';
 import { MsgStore } from '../msg/msg-store.js';
 
@@ -35,6 +36,33 @@ function fixture() {
   const opts: LoopRegistryOptions = { root, stateRoot, now: new Date('2026-09-28T06:30:00.000Z'), schedules: rows };
   return { root, stateRoot, cronFile, line, opts };
 }
+
+test('graph trigger registration is idempotent per trigger and dedupe key in the dispatch SSOT', () => {
+  const f = fixture();
+  const identity = { triggerId: 'orders-webhook', dedupeKey: 'delivery-1', graphId: 'orders' };
+  const first = registerGraphTriggerRun(identity, { registryRoot: f.stateRoot, stateRoot: f.stateRoot,
+    createRunId: () => 'orders-run-1' });
+  const retry = registerGraphTriggerRun(identity, { registryRoot: f.stateRoot, stateRoot: f.stateRoot,
+    createRunId: () => 'unused-retry-run' });
+  const retryWithBrokenRunIdFactory = registerGraphTriggerRun(identity, {
+    registryRoot: f.stateRoot, stateRoot: f.stateRoot,
+    createRunId: () => { throw new Error('run ID factory must not run for an existing binding'); },
+  });
+  const nextDelivery = registerGraphTriggerRun({ ...identity, dedupeKey: 'delivery-2' }, {
+    registryRoot: f.stateRoot, stateRoot: f.stateRoot, createRunId: () => 'orders-run-1',
+  });
+
+  expect(first).toEqual({ ...identity, runId: 'orders-run-1', stateRoot: f.stateRoot, created: true });
+  expect(retry).toEqual({ ...identity, runId: 'orders-run-1', stateRoot: f.stateRoot, created: false });
+  expect(retryWithBrokenRunIdFactory).toEqual({ ...identity, runId: 'orders-run-1', stateRoot: f.stateRoot, created: false });
+  expect(nextDelivery).toEqual({ ...identity, dedupeKey: 'delivery-2', runId: 'orders-run-1', stateRoot: f.stateRoot, created: true });
+  expect(() => registerGraphTriggerRun({ ...identity, graphId: 'other-graph' }, {
+    registryRoot: f.stateRoot, stateRoot: f.stateRoot,
+  })).toThrow('graph trigger binding conflict');
+  expect(() => registerGraphTriggerRun(identity, {
+    registryRoot: f.stateRoot, stateRoot: join(f.stateRoot, 'other-state'),
+  })).toThrow('graph trigger binding conflict');
+});
 
 test('loop registry uses the inbox address export and reads unread counts from its own state root', () => {
   const f = fixture();

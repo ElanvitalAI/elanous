@@ -1,8 +1,16 @@
 /** Canonical shared credential slots consumed by Nexus app actions. */
 export const CREDENTIAL_SLOT_DEFINITIONS = [
   { service: 'openai', label: 'OpenAI', fields: ['api_key'], setupUrl: 'https://platform.openai.com/api-keys' },
+  { service: 'openrouter', label: 'OpenRouter', fields: ['api_key'], setupUrl: 'https://openrouter.ai/keys' },
   { service: 'elevenlabs', label: 'ElevenLabs', fields: ['api_key'], setupUrl: 'https://elevenlabs.io/app/settings/api-keys' },
   { service: 'higgsfield', label: 'Higgsfield', fields: ['key_id', 'secret'], setupUrl: 'https://console.higgsfield.ai/' },
+  { service: 'eodhd', label: 'EODHD', fields: ['api_key'], setupUrl: 'https://eodhd.com/register' },
+  { service: 'toss', label: 'Toss Securities', fields: ['client_id', 'client_secret', 'account_seq', 'base_url'], setupUrl: 'https://developers.tossinvest.com/docs' },
+  { service: 'twelvedata', label: 'Twelve Data', fields: ['api_key'], setupUrl: 'https://twelvedata.com/' },
+  { service: 'fds', label: 'Financial Datasets', fields: ['api_key'], setupUrl: 'https://docs.financialdatasets.ai/' },
+  { service: 'krx', label: 'KRX Data Marketplace', fields: ['api_key'], setupUrl: 'https://openapi.krx.co.kr/' },
+  { service: 'kis', label: 'Korea Investment & Securities', fields: ['app_key', 'app_secret', 'account'], setupUrl: 'https://apiportal.koreainvestment.com/' },
+  { service: 'finnhub', label: 'Finnhub', fields: ['api_key'], setupUrl: 'https://finnhub.io/register' },
 ] as const;
 
 export type CredentialSlotId = `cred:${string}.${string}`;

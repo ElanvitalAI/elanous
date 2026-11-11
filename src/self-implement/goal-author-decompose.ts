@@ -548,20 +548,21 @@ export function createGoalAuthorDecomposeSteps(
         '완료 경계 3행(코드·실물·증거 명령) — step 1 의 acceptance 3 으로 묶음(경계 행은 조각이 아니다).',
       );
     }
-    const { streamLLM } = await import('../llm.js');
+    const { streamRoleLlm } = await import('../llm/role-stream.js');
     // ⭐ AUTHOR-DECOMPOSE-KNOB(0.2.24 · G7 #25848) — 쪼개기·적대 비평의 두 streamLLM 호출이 인핸서와
     //   «같은 규칙»으로 planning 노브(roleLlm.planning ⊕ ELANOUS_PROMPT_ENHANCE_MODEL/EFFORT)를 따른다.
     //   미설정이면 종전 그대로 — model 은 아예 전달하지 않는다(streamLLM 기본 모델) ⊕ effort 는 high.
-    const { model, effort } = selectPlanningLlm();
-    const llmOpts: { model?: string; reasoningEffort: 'low' | 'medium' | 'high'; signal?: AbortSignal } = model === undefined
-      ? { reasoningEffort: effort, ...(signal ? { signal } : {}) }
-      : { model, reasoningEffort: effort, ...(signal ? { signal } : {}) };
+    const { model, effort, modelSource } = selectPlanningLlm();
+    const override = model && (modelSource !== 'config-role' || process.env.ELANOUS_PROMPT_ENHANCE_MODEL);
+    const llmOpts = { reasoningEffort: effort, ...(override ? { roleModelOverride: model } : {}),
+      ...(signal ? { signal } : {}), usagePhase: 'goal-author-decompose' } as const;
+    const callPlanning = (prompt: string) => streamRoleLlm('planning', [{ role: 'user', content: prompt }], () => {}, llmOpts);
     let decompositionRationale: string | undefined;
     const decompose = (ask: string) => {
       decompositionRationale = undefined;
       return llmDecomposeSteps(
         ask,
-        (input) => streamLLM([{ role: 'user', content: input.prompt }], () => {}, llmOpts).then((text) => ({ text })),
+        (input) => callPlanning(input.prompt).then((text) => ({ text })),
         { ...(options?.context ? { context: options.context } : {}), maxTasks: GOAL_AUTHOR_SIZE_SAFETY_MAX_SLICES,
           promptProfile: 'goal-author-coarse', ...(signal ? { signal } : {}),
           onRationale: (rationale) => { decompositionRationale = rationale; } },
@@ -582,8 +583,7 @@ export function createGoalAuthorDecomposeSteps(
         }); } catch { /* observation is fail-soft */ }
       }
       const measure = async (slices: string[]) => {
-        const parsed = parseGoalSliceSizes(await streamLLM(
-          [{ role: 'user', content: goalSliceSizePrompt(objective, slices) }], () => {}, llmOpts), slices.length);
+        const parsed = parseGoalSliceSizes(await callPlanning(goalSliceSizePrompt(objective, slices)), slices.length);
         return parsed ? { sizes: parsed, sizeSource: 'planner-estimate' as const }
           : { sizes: deriveGoalSliceSizes(slices), sizeSource: 'derived' as const };
       };
@@ -665,7 +665,7 @@ export function createGoalAuthorDecomposeSteps(
       reviewSkipReason,
     });
     if (!reviewExecuted) return finish(steps, decompositionRationale);
-    const critic = (prompt: string) => streamLLM([{ role: 'user', content: prompt }], () => {}, llmOpts);
+    const critic = callPlanning;
 
     let revisedSteps: string[] | undefined;
     try {

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "marketplace-market-data",
+  "version": "0.1.0",
+  "description": "Marketplace graph unit fixture providing the market.ohlcv@1 contract.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graphs/units/market-quote.yaml", "./graphs/units/market-ohlcv.yaml"],
+      "graphManifests": {
+        "market-quote": {
+          "purpose": "Fetch a market quote through the market.ohlcv@1 capability.",
+          "allow": { "recipes": [], "skills": [], "domainPacks": [], "maxSideEffects": "none" },
+          "hitl": []
+        },
+        "market-ohlcv": {
+          "purpose": "Fetch market OHLCV bars through the market.ohlcv@1 capability.",
+          "allow": { "recipes": [], "skills": [], "domainPacks": [], "maxSideEffects": "none" },
+          "hitl": []
+        }
+      }
+    }
+  }
+}

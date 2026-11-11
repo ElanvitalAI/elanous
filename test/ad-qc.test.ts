@@ -176,11 +176,8 @@ test('calibrated RGB-byte distances use the documented 0–441 scale', () => {
   ).findings).toContainEqual({ name: 'color-distance-between-cuts', verdict: 'ok' });
 });
 
-test('calibrated dialogue LUFS tolerance compares an unbounded non-negative absolute deviation from −14', async () => {
+test('calibrated dialogue LUFS tolerance compares an unbounded non-negative absolute deviation from −14', () => {
   const tolerance: QcThresholds = { ...thresholds, dialogueLufsTolerance: 1 };
-  const qcSource = await Bun.file(new URL('../src/ad-pipeline/qc.ts', import.meta.url)).text();
-
-  expect(qcSource).toContain('non-negative LUFS difference and is not limited to single digits');
   expect(resultFor({ ...measuredWithinPolicy, dialogueLufs: -14.69 }, tolerance).findings)
     .toContainEqual({ name: 'dialogue-loudness', verdict: 'ok' });
   expectFinding(

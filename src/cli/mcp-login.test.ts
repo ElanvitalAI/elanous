@@ -6,7 +6,7 @@ import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { persistDiscoveredIssuer, runMcpLogin } from './mcp-login.js';
-import { loadTokens } from '../oauth/store.js';
+import { loadTokens, saveTokens } from '../oauth/store.js';
 import type { McpOAuthFetch } from '../mcp/mcp-oauth.js';
 import { McpClient } from '../mcp/client.js';
 import { reloadUserConfig, saveUserConfig } from '../user-config.js';
@@ -311,6 +311,9 @@ describe('runMcpLogin browser and device integration', () => {
     const result = await runMcpLogin({ ...f.opts, fetch,
       deviceNow: () => now, deviceSleep: async (ms) => { now += ms; } });
     expect(result.exitCode).toBe(0);
+    expect(result.connection).toMatchObject({ issuer, connected: true });
+    expect(JSON.stringify(result.connection)).not.toContain('access');
+    expect(JSON.stringify(result.connection)).not.toContain('refresh');
     expect(loadTokens(issuer, f.storePath)?.tokens.accessToken).toBe('access');
   });
 
@@ -356,6 +359,9 @@ describe('runMcpLogin browser and device integration', () => {
       },
     });
     expect(result.exitCode).toBe(0);
+    expect(result.connection).toMatchObject({ issuer, connected: true });
+    expect(JSON.stringify(result.connection)).not.toContain('access');
+    expect(JSON.stringify(result.connection)).not.toContain('refresh');
     expect(approved).toBe(true);
     const registered = JSON.parse(f.calls.find((call) => call.url === `${issuer}/register`)?.body ?? '{}') as Record<string, unknown>;
     expect(registered.grant_types).toEqual(['authorization_code', 'refresh_token']);
@@ -399,6 +405,25 @@ describe('runMcpLogin browser and device integration', () => {
 });
 
 describe('runMcpLogin registration reuse and the real aside path', () => {
+  test('expired device credential re-registers only once after the server rejects its stored client', async () => {
+    const f = loginFixture(true);
+    saveTokens(issuer, { accessToken: 'old-access', refreshToken: 'old-refresh', expiresAt: Date.now() - 1 },
+      { authMode: 'mcp-oauth', accountUuid: 'client', mirrorCodex: false }, f.storePath);
+    let registers = 0;
+    const rejecting: McpOAuthFetch = async (url, init) => {
+      if (url === `${issuer}/register`) { registers++; return json({ client_id: 'client-2' }); }
+      if (url === `${issuer}/device` && (init?.body ?? '').includes('client_id=client&'))
+        return json({ error: 'unauthorized_client' }, 400);
+      return f.fetch(url, init);
+    };
+    let now = Date.now();
+    const result = await runMcpLogin({ ...f.opts, fetch: rejecting, deviceNow: () => now,
+      deviceSleep: async (ms) => { now += ms; } });
+    expect(result.exitCode).toBe(0);
+    expect(registers).toBe(1);
+    expect(loadTokens(issuer, f.storePath)?.accountUuid).toBe('client-2');
+  });
+
   test('a second device login reuses the stored device client (its refresh token stays paired)', async () => {
     const f = loginFixture(true);
     let now = 0;
@@ -521,7 +546,7 @@ describe('runMcpLogin registration reuse and the real aside path', () => {
     const modes: number[] = [];
     const originalRename = fs.renameSync;
     const rename = spyOn(fs, 'renameSync').mockImplementation((from, to) => {
-      if (from === `${f.storePath}.tmp`) modes.push(fs.statSync(from).mode & 0o777);
+      if (typeof from === 'string' && from.startsWith(`${f.storePath}.`) && from.endsWith('.tmp')) modes.push(fs.statSync(from).mode & 0o777);
       return originalRename(from, to);
     });
     const umask = process.umask(0o022);
@@ -541,7 +566,7 @@ describe('runMcpLogin registration reuse and the real aside path', () => {
     const modes: number[] = [];
     const originalRename = fs.renameSync;
     const rename = spyOn(fs, 'renameSync').mockImplementation((from, to) => {
-      if (from === `${f.storePath}.tmp`) modes.push(fs.statSync(from).mode & 0o777);
+      if (typeof from === 'string' && from.startsWith(`${f.storePath}.`) && from.endsWith('.tmp')) modes.push(fs.statSync(from).mode & 0o777);
       return originalRename(from, to);
     });
     const umask = process.umask(0o022);

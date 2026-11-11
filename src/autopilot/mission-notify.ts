@@ -5,7 +5,7 @@
 // 토큰을 해석(main/report/test) — 매칭 없으면 main 기본. origin/토큰/chat 없으면 false 반환
 // (caller 가 sendOutbound 폴백). 봇 토큰은 저장 안 하고 config 에서만 읽는다.
 
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { canUseUxAgent } from '../ux/ux-config.js';
 import { notifyMissionHitlViaUx } from './mission-ux-live.js';

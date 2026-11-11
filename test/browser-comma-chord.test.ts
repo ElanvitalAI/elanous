@@ -1,7 +1,7 @@
 // Browser-pane comma-chord runtime tests.
 //
 // Covers the chord state machine end-to-end: arming on `,`, dispatch
-// of `,v` / `,s` / `,?` continuations, Korean IME aliases, timeout
+// of `,v` / `,s` continuations, Korean IME aliases, timeout
 // behaviour, unknown-continuation surfacing.
 
 import { describe, expect, test, beforeEach } from 'bun:test';
@@ -20,7 +20,6 @@ interface SpyState {
   hintCleared: number;
   edits: number;
   summaries: number;
-  helps: number;
   notices: Array<{ level: string; msg: string }>;
 }
 
@@ -29,14 +28,13 @@ function makeRuntime(): {
   spy: SpyState;
 } {
   const spy: SpyState = {
-    hintShown: 0, hintCleared: 0, edits: 0, summaries: 0, helps: 0, notices: [],
+    hintShown: 0, hintCleared: 0, edits: 0, summaries: 0, notices: [],
   };
   const rt = createBrowserChordRuntime({
     showChordHint: () => { spy.hintShown += 1; },
     clearChordHint: () => { spy.hintCleared += 1; },
     onEditFocused: () => { spy.edits += 1; },
     onSummarizeFocused: () => { spy.summaries += 1; },
-    onShowHelp: () => { spy.helps += 1; },
     notice: (level, msg) => { spy.notices.push({ level, msg }); },
   });
   return { rt, spy };
@@ -58,7 +56,7 @@ describe('browser comma chord — arming', () => {
     expect(consumed).toBe(true);
     expect(isChordArmed()).toBe(true);
     expect(spy.hintShown).toBe(1);
-    expect(spy.edits + spy.summaries + spy.helps).toBe(0);
+    expect(spy.edits + spy.summaries).toBe(0);
   });
 
   test('Korean IME ㅁ also arms the leader', async () => {
@@ -98,7 +96,6 @@ describe('browser comma chord — continuations', () => {
     expect(consumed).toBe(true);
     expect(spy.edits).toBe(1);
     expect(spy.summaries).toBe(0);
-    expect(spy.helps).toBe(0);
     // Chord cleared after continuation.
     expect(isChordArmed()).toBe(false);
   });
@@ -110,21 +107,6 @@ describe('browser comma chord — continuations', () => {
     expect(consumed).toBe(true);
     expect(spy.summaries).toBe(1);
     expect(spy.edits).toBe(0);
-  });
-
-  test(',? fires the help overlay', async () => {
-    const { rt, spy } = makeRuntime();
-    await rt.tryHandleKey(k(','));
-    const consumed = await rt.tryHandleKey(k('?'));
-    expect(consumed).toBe(true);
-    expect(spy.helps).toBe(1);
-  });
-
-  test(',/ also fires help (no-shift alias)', async () => {
-    const { rt, spy } = makeRuntime();
-    await rt.tryHandleKey(k(','));
-    await rt.tryHandleKey(k('/'));
-    expect(spy.helps).toBe(1);
   });
 
   test('Korean IME continuations: ㅁ → ㅍ fires editor', async () => {
@@ -158,8 +140,7 @@ describe('browser comma chord — continuations', () => {
     expect(consumed).toBe(true);
     expect(spy.notices).toHaveLength(1);
     expect(spy.notices[0]!.msg).toContain(',q');
-    expect(spy.notices[0]!.msg).toContain(',?');
-    expect(spy.edits + spy.summaries + spy.helps).toBe(0);
+    expect(spy.edits + spy.summaries).toBe(0);
   });
 
   test('chord state cleared even on unknown continuation', async () => {

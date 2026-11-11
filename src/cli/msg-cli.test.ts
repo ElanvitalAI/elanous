@@ -201,33 +201,115 @@ test('post wakes the recipient after the durable save; a reply is passed through
 });
 
 test('post with the real wake warns once for an unresolved seat and stays quiet when no reply body was announced', async () => {
-  const f = fixture('', () => ({ wake: undefined, wakeDeps: { listPtys: () => [], readPane: () => null, live: false } }));
+  const f = fixture('', () => ({ wake: undefined, wakeDeps: { listPtys: () => [], listHerdrPanes: () => [], readPane: () => null, live: false } }));
   await f.run('post', 'hello', '--from', 'OP', '--to', 'UX');
   expect(f.exits).toEqual([]);
-  expect(f.stderr).toEqual(['이 주소는 깨울 길이 없다 — 받는 몸이 스스로 읽을 때까지 쌓인다 (wake=none · 모름: seat-registry-missing)']);
+  expect(f.stderr).toEqual(['이 주소는 깨울 길이 없다 — 받는 몸이 스스로 읽을 때까지 쌓인다 (wake=none · 모름: seat-registry-missing:candidates=0)']);
   await f.run('post', 'hello', '--from', 'OP', '--to', 'GUARDIAN');
   expect(f.stderr.at(-1)).toBe('이 주소는 읽는 몸이 없다 — 지금은 OP');
   expect(f.stderr).toHaveLength(2);
 });
 
 test('route shows reply body and resolved wake for loop and seat addresses', async () => {
-  const f = fixture('', () => ({ wakeDeps: { listPtys: () => [{ id: 'tui:9', nickname: 'opt', alive: true }], readPane: () => null, hasOptIn: () => false } }));
+  const f = fixture('', () => ({ wakeDeps: { listPtys: () => [{ id: 'tui:9', nickname: 'opt', alive: true }], listHerdrPanes: () => [], readPane: () => null, hasOptIn: () => false } }));
   await f.run('route', 'coordinator', '--json');
   await f.run('route', 'opt', '--json');
   await f.run('route', 'ux', '--json');
   expect(f.stdout.map(line => JSON.parse(line))).toEqual([
     { msgAddress: 'COORDINATOR', replyBody: 'rules', wake: 'cron', source: 'loop-table' },
-    { msgAddress: 'OPT', replyBody: null, wake: 'none', source: 'unresolved', reason: 'seat-registry-missing' },
-    { msgAddress: 'UX', replyBody: null, wake: 'none', source: 'unresolved', reason: 'seat-registry-missing' },
+    { msgAddress: 'OPT', replyBody: null, wake: 'none', source: 'unresolved', reason: 'seat-registry-missing:candidates=0' },
+    { msgAddress: 'UX', replyBody: null, wake: 'none', source: 'unresolved', reason: 'seat-registry-missing:candidates=0' },
   ]);
   await f.run('route', 'opt');
-  expect(f.stdout.at(-1)).toBe('OPT\treplyBody=모름\twake=none\t(unresolved: seat-registry-missing)');
+  expect(f.stdout.at(-1)).toBe('OPT\treplyBody=모름\twake=none\t(unresolved: seat-registry-missing:candidates=0)');
+});
+
+test('pane address forms route through the Herdr census; unread drops recipients whose addresses are dead', async () => {
+  const f = fixture('', () => ({ wakeDeps: {
+    listHerdrPanes: () => [{ paneId: 'wT:p4', sessionId: 'sess-4', title: 'editor | TC', cwd: '/hq/seats/TC', host: 'local', status: 'idle' }],
+    readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: [] } }),
+  } }));
+  await f.run('route', 'TC/p4', '--json');
+  expect(JSON.parse(f.stdout[0]!)).toMatchObject({ msgAddress: 'TC/p4', wake: 'herdr', target: 'wT:p4' });
+  await f.run('route', 'session:sess-4', '--json');
+  expect(JSON.parse(f.stdout[1]!)).toMatchObject({ msgAddress: 'session:sess-4', wake: 'herdr', target: 'wT:p4' });
+  await f.run('post', 'direct pane delivery', '--from', 'OP', '--to', 'TC/p4');
+  await f.run('list', '--to', 'TC/p4', '--json');
+  const direct = JSON.parse(f.stdout.at(-1)!)[0];
+  expect(direct).toMatchObject({ to: 'TC/p4', body: 'direct pane delivery' });
+  const directStore = f.store();
+  try { directStore.ack('TC/p4', direct.id); } finally { directStore.close(); }
+  await f.run('post', 'orphan', '--from', 'OP', '--to', 'GONE');
+  await f.run('unread', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([]);
+});
+
+test('unavailable Herdr census stays unknown; unread filters only confirmed dead addresses for aggregate and direct queries', async () => {
+  let herdrResult: { status: number | null; stdout: string; error?: unknown } = { status: null, stdout: '', error: new Error('herdr timed out') };
+  const f = fixture('', () => ({ wakeDeps: {
+    runHerdrPaneList: () => herdrResult,
+    readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: [] } }),
+  } }));
+  await f.run('post', 'preserve unknown', '--from', 'OP', '--to', 'pane:wT:p4', '--reject-undeclared');
+  const store = f.store();
+  try { expect(store.list('pane:wT:p4')).toHaveLength(1); } finally { store.close(); }
+  await f.run('unread', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([{ recipient: 'pane:wT:p4', count: 1 }]);
+  await f.run('unread', '--to', 'pane:wT:p4', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([{ recipient: 'pane:wT:p4', count: 1 }]);
+
+  herdrResult = { status: 0, stdout: 'not JSON' };
+  await f.run('route', 'pane:wT:p4', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ reason: 'pane-census-unavailable:candidates=unknown' });
+  herdrResult = { status: 0, stdout: JSON.stringify({ result: { panes: [
+    { pane_id: 'wT:p4', status: 'idle' }, { pane_id: 'wT:p4', status: 'idle' },
+  ] } }) };
+  await f.run('route', 'pane:wT:p4', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toMatchObject({ reason: 'ambiguous-pane:candidates=2' });
+  await f.run('post', 'ambiguous durable', '--from', 'OP', '--to', 'pane:wT:p4', '--reject-undeclared');
+  expect(f.exits).toEqual([]);
+  const afterAmbiguous = f.store();
+  try { expect(afterAmbiguous.list('pane:wT:p4')).toHaveLength(2); } finally { afterAmbiguous.close(); }
+  await f.run('unread', '--to', 'pane:wT:p4', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([{ recipient: 'pane:wT:p4', count: 2 }]);
+
+  herdrResult = { status: 0, stdout: JSON.stringify({ result: { panes: [{ pane_id: 'wT:p4', status: 'dead' }] } }) };
+  await f.run('unread', '--to', 'pane:wT:p4', '--json');
+  expect(JSON.parse(f.stdout.at(-1)!)).toEqual([]);
+  await f.run('post', 'dead reject', '--from', 'OP', '--to', 'pane:wT:p4', '--reject-undeclared');
+  expect(f.exits.at(-1)).toBe(2);
+
+  const missingRegistry = fixture('', () => ({ wakeDeps: {
+    listHerdrPanes: () => [],
+    readRegistry: () => ({ status: 'absent' }),
+  } }));
+  await missingRegistry.run('post', 'keep unknown registry', '--from', 'OP', '--to', 'UX', '--reject-undeclared');
+  expect(missingRegistry.exits).toEqual([]);
+  const unknownStore = missingRegistry.store();
+  try { expect(unknownStore.list('UX')).toHaveLength(1); } finally { unknownStore.close(); }
+});
+
+test('post --reject-undeclared rejects before writing, while default post warns and remains durable', async () => {
+  const f = fixture('', () => ({ wakeDeps: {
+    listHerdrPanes: () => [],
+    readRegistry: () => ({ status: 'ready', registry: { version: 1, seats: [] } }),
+  } }));
+  await f.run('post', 'no write', '--from', 'OP', '--to', 'UNKNOWN', '--reject-undeclared');
+  expect(f.exits.at(-1)).toBe(2);
+  const before = f.store();
+  try { expect(before.list('UNKNOWN')).toEqual([]); } finally { before.close(); }
+  await f.run('post', 'durable warning', '--from', 'OP', '--to', 'UNKNOWN');
+  expect(f.stderr.some(line => line.includes('undeclared-address'))).toBe(true);
+  const store = f.store();
+  try { expect(store.list('UNKNOWN')).toHaveLength(1); } finally { store.close(); }
 });
 
 test('address register writes one private central registry row with explicit wake opt-in', async () => {
   const seatStateRoot = mkdtempSync(join(tmpdir(), 'msg-seat-address-'));
   dirs.push(seatStateRoot);
-  const f = fixture('', () => ({ wakeDeps: { seatStateRoot, listPtys: () => [] } }));
+  const f = fixture('', () => ({ wakeDeps: { seatStateRoot, listPtys: () => [], listHerdrPanes: () => [
+    { paneId: 'wJ:p10', sessionId: 'session-nt-1', title: 'work | NT-1', cwd: '/hq/seats/NT-1', host: 'mshq', status: 'idle' },
+  ] } }));
   await f.run('address', 'register', 'NT-1', '--herdr-pane', 'wJ:p10', '--host', 'mshq', '--wake', '--json');
   const result = JSON.parse(f.stdout[0]!);
   expect(result).toMatchObject({ address: 'NT-1', paneId: 'wJ:p10', host: 'mshq', changed: true, wakeEnabled: true });

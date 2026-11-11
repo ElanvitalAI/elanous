@@ -10,10 +10,7 @@
 // background-pill-runtime (P2b). Host-scoped, single block, splice
 // in-place, removed on empty.
 //
-// "Asset" companion: `src/widgets/plan-board.ts` is the WidgetDef
-// that future waves wire into a sidebar / pane surface. This runtime
-// is the immediate chat-surface presentation — ephemeral, no widget
-// host required.
+// The chat-surface presentation is ephemeral and uses no widget host.
 
 import { renderPlanBoard } from '../code-edit/plan-renderer.js';
 import {

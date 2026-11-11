@@ -22,15 +22,17 @@ import { debug } from '../debug/log.js';
 import { createRequestSizeGuard, formatRequestSizeStatus, type RequestSizeGuard } from './request-size-guard.js';
 import type { InputSourceKind } from '../input/input-source-kind.js';
 import { getProviderForConfigAsync, streamLLMWithTools, type LLMMessage, type LLMOpts, type LLMProvider, type ContentBlock } from '../llm.js';
-import type { UserConfig } from '../user-config/types.js';
+import type { LLMProviderName, UserConfig } from '../user-config/types.js';
 import {
   estimateMessagesTokens, estimateTokens, trimToBudget, budget, formatBudget,
   DEFAULT_TOKEN_BUDGET,
 } from '../tokens.js';
 import { buildMemoryInjection, buildMemoryInjectionLLM } from '../memory.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { budgetModel } from '../llm/model-defaults.js';
 import { explicitTurnTier } from '../model-tier/turn-tier.js';
+import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
+import { isSimpleQuestionFastRoute } from '../model-tier/simple-question-fast-route.js';
 import { recordTurn } from '../status/metrics.js';
 import {
   buildTerminalCapableTurn,
@@ -43,7 +45,7 @@ import {
 // ACP bridge(core-turn-bridge.ts)·dashboard(runGoalLoopHook)와 동일 엔진 재사용(재발명 제거).
 import { runCoreTurn } from '../core-turn/run-core-turn.js';
 import { runGoalLoop } from '../core-turn/run-goal-loop.js';
-import type { CoreTurnContext, CoreTurnDispatchTool } from '../core-turn/types.js';
+import type { CoreTurnCallbacks, CoreTurnContext, CoreTurnDispatchTool } from '../core-turn/types.js';
 import { resolveSeatTurnCap } from '../core-turn/seat-turn-cap.js';
 import { classifyTuiChatIntent } from '../core-turn/short-question.js';
 import { composeChildContext, type ChildContextProfile } from '../self-implement/child-context-composition.js';
@@ -59,6 +61,8 @@ export interface RunTurnOpts {
   userConfig: UserConfig;
   sessionId: string;
   userText: string;
+  /** Stable per-turn identity shared with surface MessageBlock raw references. */
+  surfaceRunId?: string;
   /** System prompt applied only if the session has none. */
   systemPrompt?: string;
   /** Token budget (rough); defaults to DEFAULT_TOKEN_BUDGET. */
@@ -72,6 +76,9 @@ export interface RunTurnOpts {
   onReplaceText?: (fullText: string) => void;
   /** Optional transient stream recovery status for the originating UI. */
   onStatusLine?: (line: string) => void;
+  /** TUI-only narration callbacks; other surfaces can omit them. */
+  onGoalInterim?: (text: string, iteration: number) => void;
+  onReasoning?: (event: Parameters<NonNullable<CoreTurnCallbacks['onReasoning']>>[0]) => void;
   /** Optional provider override — for tests. */
   provider?: LLMProvider;
   /** Originating utterance surface. Omit only when the caller cannot
@@ -303,6 +310,22 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   if (!loaded) throw new Error(`session not found: ${opts.sessionId}`);
   const { meta } = loaded;
   let messages = loaded.messages;
+  const explicitTier = opts.llmOpts?.model ? undefined : explicitTurnTier(opts.userConfig, opts.sessionId);
+  const priorUserTurns = messages.filter(message => message.role === 'user').length;
+  const simpleQuestionFastRouteCandidate = meta.source === 'tui'
+    && !opts.llmOpts?.model && !opts.llmOpts?.reasoningEffort && !explicitTier
+    && isSimpleQuestionFastRoute({
+      text: opts.userText,
+      priorUserTurns,
+      hasAttachments: (opts.userImages?.length ?? 0) > 0 || (opts.userAttachments?.length ?? 0) > 0,
+    });
+  const fastRouteProvider = simpleQuestionFastRouteCandidate
+    ? opts.provider ?? await getProviderForConfigAsync(opts.userConfig)
+    : undefined;
+  const fastRouteTier = fastRouteProvider && fastRouteProvider.name !== 'auto'
+    ? lookupLlmTierSpec(fastRouteProvider.name as LLMProviderName, 'budget')
+    : undefined;
+  const simpleQuestionFastRoute = fastRouteTier !== undefined;
 
   // Memory injection: build the block once per turn, folded into the
   // system prompt. Never fails loud — if the store isn't set up, we
@@ -327,7 +350,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       effectiveSystemPrompt = effectiveSystemPrompt ? `${effectiveSystemPrompt}\n\n${block}` : block;
     }
   }
-  if (!opts.skipMemoryInjection) {
+  if (!opts.skipMemoryInjection && !simpleQuestionFastRoute) {
     try {
       // LLM-judge recall(2026-07-19 · 기본 ON·대표 지시) — 키워드 대신 luna 의미판정으로 관련
       // 기억 선택(WSD). 끄려면 config llm.memoryJudge.enabled:false. judge 실패 시 내부 키워드
@@ -339,6 +362,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         : buildMemoryInjection(opts.userText, { maxTokens: budget });
       if (inj.block) {
         memoryIds = inj.injectedIds;
+        debug.log('chat.memory-layer', 'injected', { session: opts.sessionId, ids: inj.injectedIds, tokens: inj.tokens });
         effectiveSystemPrompt = effectiveSystemPrompt
           ? `${effectiveSystemPrompt}\n\n${inj.block}`
           : inj.block;
@@ -403,10 +427,14 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   };
   appendMessage(opts.sessionId, userMsg);
 
-  const explicitTier = opts.llmOpts?.model ? undefined : explicitTurnTier(opts.userConfig, opts.sessionId);
+  const provider = fastRouteProvider ?? opts.provider ?? await getProviderForConfigAsync(opts.userConfig, explicitTier?.model ?? opts.llmOpts?.model);
+  const fastTier = simpleQuestionFastRoute ? fastRouteTier : undefined;
   const llmOpts = explicitTier ? {
     ...(opts.llmOpts ?? {}), model: explicitTier.model,
     ...(explicitTier.reasoningEffort && !opts.llmOpts?.reasoningEffort ? { reasoningEffort: explicitTier.reasoningEffort } : {}),
+  } : fastTier ? {
+    // Codex Responses rejects `minimal`; low is its least accepted effort.
+    ...(opts.llmOpts ?? {}), model: fastTier.model, reasoningEffort: 'low' as const,
   } : opts.llmOpts;
   if (explicitTier) {
     debug.log('llm.tier', 'turn-tier-applied', {
@@ -414,7 +442,12 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       reasoningEffort: llmOpts?.reasoningEffort ?? null,
     });
   }
-  const provider = opts.provider ?? await getProviderForConfigAsync(opts.userConfig, llmOpts?.model);
+  if (fastTier) {
+    debug.log('llm.tier', 'simple-question-fast-route', {
+      sessionId: opts.sessionId, model: fastTier.model, reasoningEffort: 'low', tools: 'omitted',
+    }, { level: 'info' });
+    effectiveSystemPrompt = 'Answer this stable factual question directly and briefly in the user’s language. If uncertain, say so; do not invent.';
+  }
 
   // 2) Assemble, trim, call. When images are attached for THIS turn,
   //    swap the string content of the latest user message for
@@ -485,7 +518,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   // Branch — tool-loop path when caller supplies a non-empty tool
   // catalog (CLI agent surface), legacy text-only stream otherwise
   // (telegram, discord, scheduler, etc — all unchanged).
-  if (opts.tools && opts.tools.length > 0) {
+  if (!simpleQuestionFastRoute && opts.tools && opts.tools.length > 0) {
     if (!opts.dispatchTool) {
       throw new Error('runTurn: tools provided without dispatchTool');
     }
@@ -569,7 +602,8 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
         callbacks: {
           onText: (delta) => { opts.onDelta?.(delta); },
           onReplaceText: (fullText) => { opts.onReplaceText?.(fullText); },
-          onGoalInterim: (interimText) => {
+          onGoalInterim: (interimText, iteration) => {
+            opts.onGoalInterim?.(interimText, iteration);
             appendMessage(opts.sessionId, {
               role: 'assistant', content: interimText, ts: new Date().toISOString(),
               tokenEstimate: estimateTokens(interimText), goalInterim: true,
@@ -578,10 +612,12 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
           onToolCall: (call) => { toolCallArgs.set(call.id, call.args); opts.onToolCall?.(call); },
           onToolResult: (call) => {
             try {
-              appendMessage(opts.sessionId, buildToolTraceMessage(call.name, toolCallArgs.get(call.id), call.result));
+              appendMessage(opts.sessionId, { ...buildToolTraceMessage(call.name, toolCallArgs.get(call.id), call.result), toolCallId: call.id,
+                ...(opts.surfaceRunId ? { surfaceRunId: opts.surfaceRunId } : {}) });
             } catch { /* telemetry persistence must not break the turn */ }
             opts.onToolResult?.(call);
           },
+          onReasoning: (event) => { opts.onReasoning?.(event); },
         },
         ...(turnLlmOpts?.model ? { modelOverride: turnLlmOpts.model } : {}),
         ...(turnLlmOpts?.reasoningEffort ? { reasoningEffort: turnLlmOpts.reasoningEffort } : {}),
@@ -617,11 +653,13 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
           opts.onDelta?.(delta);
         },
         onStatus: (line) => { opts.onStatusLine?.(line); },
+        onReasoning: (event) => { opts.onReasoning?.(event); },
         dispatchTool: async (name, args, ctx) => dispatchTool(name, args, ctx),
         onToolCall: (call) => { toolCallArgs.set(call.id, call.args); opts.onToolCall?.(call); },
         onToolResult: (call) => {
           try {
-            appendMessage(opts.sessionId, buildToolTraceMessage(call.name, toolCallArgs.get(call.id), call.result));
+            appendMessage(opts.sessionId, { ...buildToolTraceMessage(call.name, toolCallArgs.get(call.id), call.result), toolCallId: call.id,
+              ...(opts.surfaceRunId ? { surfaceRunId: opts.surfaceRunId } : {}) });
           } catch { /* telemetry persistence must not break the turn */ }
           opts.onToolResult?.(call);
         },

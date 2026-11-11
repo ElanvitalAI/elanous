@@ -1,0 +1,4 @@
+{
+  "deviceKey": "r-logvol-gate-no-wallclock-1",
+  "review": "> 📅 **2026-11-09 재검토 (R-LOGVOL · GATE-NO-WALLCLOCK-1)** — release-graph-rig에 주입 시계의 시작 관측·실패 소요 시간 재생을 등록했다. 기존 시뮬 근거와 벽시계 판정 금지 기준을 적용하며 규칙 본문은 영향 없음."
+}

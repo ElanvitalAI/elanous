@@ -28,23 +28,11 @@ function render(spec: WidgetSpec, size: Size = { width: 40, height: 8 }): string
 
 describe('declarative view runtime', () => {
   test('reports which spec types have runtime factories', () => {
-    expect(canCreateDeclarativeView({ type: 'tooltip' })).toBe(true);
     expect(canCreateDeclarativeView({ type: 'dialog' })).toBe(true);
     expect(canCreateDeclarativeView({ type: 'intake-review' })).toBe(true);
     expect(canCreateDeclarativeView({ type: 'permission-prompt' })).toBe(true);
     expect(canCreateDeclarativeView({ type: 'request-user-input-overlay' })).toBe(true);
     expect(canCreateDeclarativeView({ type: 'unknown-type' })).toBe(false);
-  });
-
-  test('materializes tooltip chrome from declarative spec', () => {
-    const lines = render({
-      type: 'tooltip',
-      chrome: { title: 'Spec hint', showClose: false, variant: 'tooltip' },
-      config: { text: 'hover help', ttlMs: 1000 },
-    }, { width: 24, height: 4 });
-    const joined = lines.join('\n');
-    expect(joined).toContain('Spec hint');
-    expect(joined).toContain('hover help');
   });
 
   test('materializes dialog body and buttons from declarative spec', () => {

@@ -6,6 +6,7 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { ObjectStore } from '../../storage/object-store.js';
+import { acquireLockAsync } from '../../storage/file-lock.js';
 
 const MAX_FILES = 10_000;
 const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
@@ -108,7 +109,8 @@ function isEnvSecretFile(path: string): boolean {
   return /^\.env(?:\.|$)/.test(name) && !/^\.env\.(?:example|sample|template)$/.test(name);
 }
 
-function containsSecret(text: string): boolean {
+/** Shared source-content guard for snapshots and outbound Git history scans. */
+export function containsSecret(text: string): boolean {
   const candidates = [text, text.replace(/(?:%[0-9a-f]{2})+/gi, (value) => {
     try { return decodeURIComponent(value); } catch { return value; }
   })];
@@ -169,6 +171,29 @@ function collectFiles(rootPath: string): Array<{ path: string; data: Uint8Array;
   if (!files.length) throw new AppSourceSnapshotError('invalid-input', 'source directory is empty');
   assertNoSecrets(files);
   return files;
+}
+
+/** Compute the same stable identity used by immutable source snapshots without writing an object. */
+export function fingerprintAppSourceDirectory(sourceRoot: string): string {
+  const files = collectFiles(sourceRoot);
+  return fingerprintOf(files.map(({ path, data, mode }) => ({ path, sha256: sha256(data), size: data.byteLength, mode })));
+}
+
+/** Serialize source changes and promotion decisions across Nexus processes for one app. */
+export async function withAppSourceLock<T>(appSlug: string, sourceRoot: string, run: (assertHeld: () => void) => T | Promise<T>): Promise<T> {
+  if (!validSlug(appSlug)) throw new AppSourceSnapshotError('invalid-input', 'app slug is invalid');
+  const parent = dirname(resolve(sourceRoot));
+  mkdirSync(parent, { recursive: true, mode: 0o700 });
+  // Live holders cannot be evicted by mtime, so this lock spans awaited publish work even if the event loop stalls.
+  // A dead process is still reclaimed immediately from the PID embedded in the lock token.
+  const release = await acquireLockAsync(join(parent, `.${appSlug}.source.lock`), { breakDeadHolder: true });
+  try {
+    const assertHeld = () => {
+      if (!release.stillHeld()) throw new AppSourceSnapshotError('invalid-input', 'app source lock was lost');
+    };
+    assertHeld();
+    return await run(assertHeld);
+  } finally { release.release(); }
 }
 
 function parseManifest(path: string, appSlug: string, deploymentId: string): SnapshotManifest {

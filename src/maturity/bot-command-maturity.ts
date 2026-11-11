@@ -1,4 +1,4 @@
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { FEATURE_MATURITY, type Role } from './feature-maturity.js';
 
 export type BotSurface = 'telegram' | 'discord';

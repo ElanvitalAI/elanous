@@ -1,0 +1,4 @@
+{
+  "deviceKey": "ux-resource-ledger-public-auth",
+  "review": "> 📅 **2026-11-10 재검토 (UX · RESOURCE-LEDGER-PUBLIC-AUTH)** — tailnet 없는 가짜 VM에서 production provider·Nexus HTTPS route를 연결하는 `public-auth-provider-cloud-vm-sim` 장치와 focused test를 등록했다. 자격 증명은 메타데이터에 기록하지 않고 만료·회수·HTTP 거부를 고정 응답으로 검증한다."
+}

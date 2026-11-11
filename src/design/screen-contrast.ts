@@ -8,7 +8,7 @@
 //
 // 🔑 그리고 실측해 보니 ③ 의 «재료»가 전부 있었다(2026-08-25):
 //   `pty snapshot --ansi`  셀 전경 SGR      📏 표본 하나에서 38;2 ***69건***
-//   `queryTerminalBg`      터미널 기본 배경  (OSC 11 · src/panes/terminal-bg-query.ts)
+//   OSC 11 배경 질의 보조는 당시의 실험 재료였으나 제품 호출 없이 제거됐다.
 //   `measureContrast`      WCAG 2.x 비율     (src/theme/contrast.ts)
 //   ⇒ ***없던 것은 그 셋을 «잇는» 자 하나***다. 이 파일이 그것이다.
 //

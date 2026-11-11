@@ -1,10 +1,5 @@
 /**
- * 무료 티어 — 품질 동일 시 무료, 아니면 유료 우선 (사용자 원칙)
- *
- * 유료(tavily/firecrawl)가 1순위·기본. 이 무료 경로는 다음일 때만 발동:
- *   ① 유료 키 미설정          ② 유료 엔진이 0건 반환(공백)
- *   ③ --free 명시             ④ deep 모드 스크랩 실패분 보충
- * 즉 "돈 떨어지면 죽는" 구조를 메우는 최후 안전망 + opt-in.
+ * 무료 티어 — 자동 계약 선택에서 먼저 시도하고, 공백이면 BYOK로 진행한다.
  *
  * 구현 (deer-flow ddg_search/jina_ai 포팅, dep-free = 순수 fetch + regex):
  *   - searchDdg   : DuckDuckGo HTML 엔드포인트 스크레이프 (키 불필요)

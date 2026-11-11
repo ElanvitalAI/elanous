@@ -2,7 +2,6 @@ import { readFileSync, realpathSync } from 'node:fs';
 import { resolve, relative, isAbsolute } from 'node:path';
 import type * as TS from 'typescript';
 import tsApi from './lazy-typescript.js';
-import { tierModel } from '../llm/model-defaults.js';
 import { debug } from '../debug/log.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 
@@ -213,9 +212,8 @@ export async function defaultGoalAuthorSelfResolve(
   try {
     const result = await Promise.race([
       (deps.stream ?? (async (input, signal, reportUsage) => {
-        const { streamLLM } = await import('../llm.js');
-        return streamLLM([{ role: 'user', content: input }], () => {}, {
-          model: process.env.ELANOUS_GOAL_AUTHOR_MODEL || tierModel('better'),
+        const { streamRoleLlm } = await import('../llm/role-stream.js');
+        return streamRoleLlm('planning', [{ role: 'user', content: input }], () => {}, {
           reasoningEffort: 'high',
           signal,
           onUsage: reportUsage,

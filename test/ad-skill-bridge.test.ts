@@ -1,4 +1,6 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
+import * as nodeFs from 'node:fs';
+import * as childProcess from 'node:child_process';
 import { parseSkillOutput } from '../src/ad-pipeline/skill-bridge.js';
 import { validateSceneSpec } from '../src/ad-pipeline/scene-spec.js';
 
@@ -156,14 +158,30 @@ test('mixes exact structure roles with positional fallback independently per sho
   expect(result.scene?.beats.map((beat) => beat.role)).toEqual(['hook', 'buildup', 'buildup', 'climax', 'climax']);
 });
 
-test('keeps prompt markdown and free-form Korean axes verbatim without I/O dependencies', async () => {
-  const result = parseSkillOutput([1, 2, 3].map((index) => shot(index, 5, unusualPrompt)).join('\n'));
-  expect(result.englishPrompt).toBe(`${unusualPrompt}\n\n${unusualPrompt}\n\n${unusualPrompt}`);
-  expect(result.scene?.beats[0]?.promptCore).toBe(unusualPrompt);
-  expect(result.scene?.beats[0]?.emotion).toEqual({ primary: '희망', secondary: '기대감' });
-
-  const source = await Bun.file(new URL('../src/ad-pipeline/skill-bridge.ts', import.meta.url)).text();
-  expect(source).not.toMatch(/node:(?:fs|child_process)|\bfetch\s*\(/);
+test('keeps prompt markdown and free-form Korean axes verbatim without I/O dependencies', () => {
+  const readFile = spyOn(nodeFs, 'readFileSync').mockImplementation(() => { throw new Error('unexpected file read'); });
+  const writeFile = spyOn(nodeFs, 'writeFileSync').mockImplementation(() => { throw new Error('unexpected file write'); });
+  const spawn = spyOn(childProcess, 'spawn').mockImplementation(() => { throw new Error('unexpected child process'); });
+  const spawnSync = spyOn(childProcess, 'spawnSync').mockImplementation(() => { throw new Error('unexpected child process'); });
+  const exec = spyOn(childProcess, 'exec').mockImplementation(() => { throw new Error('unexpected child process'); });
+  const execSync = spyOn(childProcess, 'execSync').mockImplementation(() => { throw new Error('unexpected child process'); });
+  const file = spyOn(Bun, 'file').mockImplementation(() => { throw new Error('unexpected file I/O'); });
+  const fetch = spyOn(globalThis, 'fetch').mockImplementation(() => { throw new Error('unexpected network I/O'); });
+  try {
+    const result = parseSkillOutput([1, 2, 3].map((index) => shot(index, 5, unusualPrompt)).join('\n'));
+    expect(result.englishPrompt).toBe(`${unusualPrompt}\n\n${unusualPrompt}\n\n${unusualPrompt}`);
+    expect(result.scene?.beats[0]?.promptCore).toBe(unusualPrompt);
+    expect(result.scene?.beats[0]?.emotion).toEqual({ primary: '희망', secondary: '기대감' });
+  } finally {
+    readFile.mockRestore();
+    writeFile.mockRestore();
+    spawn.mockRestore();
+    spawnSync.mockRestore();
+    exec.mockRestore();
+    execSync.mockRestore();
+    file.mockRestore();
+    fetch.mockRestore();
+  }
 });
 
 // 🔴 회귀 가드 — 초판은 `/` «만» 받았고, 스킬 템플릿·교재는 `+`·`,`·`·` 를 쓴다.

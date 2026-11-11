@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-POD-FEDERATION-SIM-TS",
+  "path": "src/ux-sim/pod-federation-sim.ts",
+  "boundary": "Runs deterministic multi-host Pod placement, host loss, cloud recovery and stale-attempt rejection through the production pool scheduler and fake fleet.",
+  "deviceIds": ["pod-federation-sim"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

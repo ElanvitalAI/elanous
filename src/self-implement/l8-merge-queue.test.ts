@@ -100,7 +100,7 @@ function deps(remote: string, opts: { failTest?: boolean; failInstall?: boolean;
 function shadowDeps(remote: string, resolveConflict?: (file: string, conflicted: string, target: string, worktree: string) => Promise<string>, onIntegrated?: (cwd: string) => void) {
   const { injected, calls, pushes } = deps(remote);
   const observed: unknown[] = [];
-  const queueDeps = { ...injected, resolveConflict, observe: (verdict: unknown) => { observed.push(verdict); },
+  const queueDeps = { ...injected, resolveConflict, rulesPreflight: async () => ({ outcome: 'pass' as const, detail: 'simulated integrated rules pass' }), observe: (verdict: unknown) => { observed.push(verdict); },
     command: (bin: string, args: readonly string[], cwd: string) => {
       if (bin === 'bun' && args[0] === 'run' && args[1] === 'test:deterministic') {
         calls.push([...args]);
@@ -112,6 +112,30 @@ function shadowDeps(remote: string, resolveConflict?: (file: string, conflicted:
   };
   return { queueDeps, calls, pushes, observed };
 }
+
+test('enqueue simulates a rules-contract violation and refuses before writing the queue ledger', async () => {
+  const { cwd, remote } = fixture();
+  const { queueDeps } = shadowDeps(remote);
+  const diagnostic = 'R-LAND-NUMGUARD test/rules-contract.test.ts:1723 · exception-expiry baseline must be refreshed';
+  let preflightInput: { cwd: string; number: number; head: string } | undefined;
+  queueDeps.rulesPreflight = async (input) => {
+    preflightInput = input;
+    return { outcome: 'fail', detail: diagnostic };
+  };
+
+  await expect(enqueueL8ShadowQueue(cwd, 7, queueDeps)).rejects.toThrow(diagnostic);
+  expect(preflightInput).toMatchObject({ cwd, number: 7, head: expect.stringMatching(/^[0-9a-f]{40}$/) });
+  expect(await statusL8ShadowQueue(cwd, queueDeps)).toEqual({ pending: [], verdicts: [] });
+});
+
+test('enqueue refuses an unmeasured remote rules-contract preflight before queue registration', async () => {
+  const { cwd, remote } = fixture();
+  const { queueDeps } = shadowDeps(remote);
+  queueDeps.rulesPreflight = async () => ({ outcome: 'unmeasured', detail: 'remote host unavailable' });
+
+  await expect(enqueueL8ShadowQueue(cwd, 7, queueDeps)).rejects.toThrow('rules-contract preflight unmeasured');
+  expect(await statusL8ShadowQueue(cwd, queueDeps)).toEqual({ pending: [], verdicts: [] });
+});
 
 test('shadow queue uses context resolution for ordinary conflicts and preserves next.md additions', async () => {
   const { cwd, remote, head } = fixture(true);
@@ -496,6 +520,7 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
   const queueDeps: L8ShadowQueueDeps = {
     acquire: async () => () => {},
     command: execute,
+    rulesPreflight: async () => ({ outcome: 'pass', detail: 'simulated integrated rules pass' }),
     observeEnqueue: () => {},
     trainIntegrate: (repo, baseSha, batch, trainGit) => {
       integratedBatches.push(batch.map((candidate) => ({ ...candidate })));

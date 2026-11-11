@@ -10,7 +10,7 @@
 
 import { join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 /** 13F 기관보유 지식 DB (fact_13f_holdings · dim_security). ★ M0.1(2026-07-07):
  *  R3 벡터 지식(~/.elanous/conatus/knowledge.db·docs 테이블)과 동명 충돌하던

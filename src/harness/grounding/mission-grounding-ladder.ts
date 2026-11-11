@@ -10,7 +10,6 @@
 //
 // 제1원칙: 무엇을 어디까지 팠나 debug.log('mission.grounding'). fail-soft — 티어 오류는 스킵(다음으로).
 
-import { tierModel } from '../../llm/model-defaults.js';
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -241,11 +240,8 @@ export function parseAssess(raw: string, curTierIdx: number): { confidence: Conf
 }
 
 async function defaultAssess(prompt: string): Promise<string> {
-  const { streamLLM } = await import('../../llm.js');
-  return streamLLM([{ role: 'user', content: prompt }], () => {}, {
-    model: process.env.ELANOUS_GROUNDING_ASSESS_MODEL || process.env.ELANOUS_DECOMPOSE_MODEL || tierModel('better'),
-    reasoningEffort: 'low',
-  });
+  const { streamRoleLlm } = await import('../../llm/role-stream.js');
+  return streamRoleLlm('research', [{ role: 'user', content: prompt }], () => {}, { reasoningEffort: 'low' });
 }
 
 /** LLM assess 없을 때(test·미주입) 휴리스틱 — impl 파일 읽었고 호출부 티어까지 갔으면 high. */

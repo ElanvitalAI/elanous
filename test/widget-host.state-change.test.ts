@@ -402,18 +402,7 @@ describe('built-in widget onStateChange opt-in (WR-4 · Bundle 7W)', () => {
     expect(filterEvents[0]!.data).toMatchObject({ filter: 'list.' });
   });
 
-  test('playground widget emits playground.mode.change on mode toggle', async () => {
-    const { default: playgroundWidget } = await import('../src/playground/widget.js');
-    const emitted: Array<{ kind: string; data?: Record<string, unknown> }> = [];
-    const host = makeInstrumentedHost(emitted);
-    host.register(playgroundWidget);
-    const inst = host.spawn({ type: 'playground' });
-    const ctx = host.buildContext(inst.id)!;
-    ctx.setState({ mode: 'edit' } as never);
-    const modeEvents = emitted.filter((e) => e.kind === 'playground.mode.change');
-    expect(modeEvents.length).toBe(1);
-    expect(modeEvents[0]!.data).toMatchObject({ from: 'browse', to: 'edit' });
-  });
+
 });
 
 // ── Event shape ────────────────────────────────────────

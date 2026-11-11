@@ -7,6 +7,7 @@ import { parseAppManifest } from './app-contract.js';
 import { createAppSimulationStore } from './app-simulation-db.js';
 import { createAppSimulationRoute } from './app-simulation-route.js';
 import { runRegisteredAppSimulation } from './app-simulation-runner.js';
+import { createFakeAppHost } from '../../ux-sim/fake-app-host.js';
 
 const validYaml = `apiVersion: elanous.app/v0
 slug: voice-note
@@ -48,6 +49,15 @@ const errorsOf = (result: ParseResult) => result.ok ? [] : result.errors;
 const warningsOf = (result: ParseResult) => result.ok ? result.warnings : [];
 
 describe('NEXUS-APP-CONTRACT', () => {
+  test('KAIST URL extract action declares the executable contract without a credential', () => {
+    const source = readFileSync(join(import.meta.dir, '../../../templates/next-app-lecture-scrap/app.yaml'), 'utf8');
+    const parsed = parseAppManifest(source);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect((parsed.manifest.actions as Record<string, unknown> | undefined)?.['extract']).toMatchObject({
+      builtin: 'extract', input: { url: 'text' },
+      output: { url: 'text', title: 'text', excerpt: 'text', content: 'text', provider: 'text' }, uses: [],
+    });
+  });
   test('KAIST lecture-scrap static build is served at canonical routes by the registered simulation and receipt route', async () => {
     const root = join(import.meta.dir, '../../../templates/next-app-lecture-scrap');
     const generatedRoot = mkdtempSync(join(tmpdir(), 'kaist-lecture-scrap-app-'));
@@ -86,6 +96,26 @@ describe('NEXUS-APP-CONTRACT', () => {
           { step: 'screen-search', path: '/search', status: 200, assetCount: expect.any(Number), artifactSha256: expectedHashes[2] },
         ]);
         expect(snapshot.events.every(event => Number(event.data.assetCount) > 0)).toBe(true);
+        const appHost = createFakeAppHost([{ slug: 'lecture-scrap', versions: [] }]);
+        appHost.deployArtifact('lecture-scrap', { id: `sim-${responseBody.simulation.runId}`, files: builtFiles! });
+        const hostedScreens = ['/','/notes/new','/search'].map(path => ({ path,
+          response: appHost.fetch('lecture-scrap.app.sim.invalid', path) }));
+        expect(hostedScreens.map(({ path, response }) => ({ path, status: response.status }))).toEqual([
+          { path: '/', status: 200 }, { path: '/notes/new', status: 200 }, { path: '/search', status: 200 },
+        ]);
+        expect(hostedScreens[0]?.response.body).toContain('날짜별 기록');
+        expect(hostedScreens[0]?.response.body).toContain('2026-11-14');
+        expect(hostedScreens[0]?.response.body).toContain('2026-11-13');
+        expect(hostedScreens[0]?.response.body).toContain('강의 자료 폴더');
+        expect(hostedScreens[1]?.response.body).toContain('노트 작성');
+        expect(hostedScreens[1]?.response.body).toContain('수업일');
+        expect(hostedScreens[1]?.response.body).toContain('논리 분류');
+        expect(hostedScreens[2]?.response.body).toContain('검색');
+        expect(hostedScreens.map(({ response }) => response.headers['x-app-version'])).toEqual(
+          Array(3).fill(`sim-${responseBody.simulation.runId}`));
+        const hostedHashes = hostedScreens.map(({ response }) => createHash('sha256').update(response.body).digest('hex'));
+        expect(hostedHashes).toEqual(expectedHashes);
+        expect(hostedScreens.map(({ response }) => response.headers['x-app-sha256'])).toEqual(hostedHashes);
       } finally { simulation.close(); }
     } finally {
       rmSync(generatedRoot, { recursive: true, force: true });
@@ -111,6 +141,17 @@ describe('NEXUS-APP-CONTRACT', () => {
     expect(warningsOf(result)).toEqual([]);
     expect(result.ok && result.manifest.slug).toBe('voice-note');
     expect(errorsOf(parseAppManifest(validYaml, ['voice-note'])).map(issue => issue.path)).toContain('/slug');
+  });
+
+  test('action allow lists accept declared roles and reject empty or undeclared roles', () => {
+    const allowed = replaceOnce('builtin: summarize, input: { text: text }, output: { text: text }, uses: [cred:openai.api_key]',
+      'builtin: summarize, input: { text: text }, output: { text: text }, allow: [viewer], uses: [cred:openai.api_key]');
+    expect(parseAppManifest(allowed).ok).toBe(true);
+    for (const allow of ['[]', '[admin]']) {
+      const invalid = replaceOnce('builtin: summarize, input: { text: text }, output: { text: text }, uses: [cred:openai.api_key]',
+        `builtin: summarize, input: { text: text }, output: { text: text }, allow: ${allow}, uses: [cred:openai.api_key]`);
+      expect(errorsOf(parseAppManifest(invalid))).toContainEqual(expect.objectContaining({ path: '/actions/@entry:1/allow' }));
+    }
   });
 
   test('validates app storage quota and upload role/content-type declarations', () => {

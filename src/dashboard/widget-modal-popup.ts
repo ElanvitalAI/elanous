@@ -10,8 +10,8 @@
 // adapter is the bridge between widget-host (asset) and modal-stack
 // (popup tier).
 //
-// Used by `/plan-board` and `/bg` slash commands so the operator can
-// pop up an interactive plan board / unified background-tasks list
+// Used by the `/bg` slash command so the operator can
+// pop up the unified background-tasks list
 // without having to reach into the widget-host's layout slot.
 
 import type { ModalSurface, ModalBounds } from '../display/modal-stack.js';

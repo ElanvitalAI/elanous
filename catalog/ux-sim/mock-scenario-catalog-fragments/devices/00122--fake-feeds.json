@@ -1,0 +1,14 @@
+{
+  "id": "fake-feeds",
+  "name": "Fake absorb-agent feeds",
+  "checklistCells": ["SIM-FAKE-FEEDS"],
+  "implementation": ["src/ux-sim/fake-feeds.ts", "src/ux-sim/world.ts", "src/crawl-capabilities/contracts.ts"],
+  "tests": ["src/ux-sim/fake-feeds.test.ts"],
+  "target": "Replay interest, source recommendation, approval, briefing and human feedback with fixed feed responses and no external network",
+  "inputs": ["interest chips", "injected posts and source statuses", "optional key slot presence", "owner feedback"],
+  "observations": ["five-step receipt", "deduplicated briefing", "free and BYOK collector IDs", "source failure cards", "zero external network calls"],
+  "entryCommands": ["bun test src/ux-sim/fake-feeds.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

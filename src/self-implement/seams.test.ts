@@ -61,6 +61,12 @@ describe('launchDevGoalFileDetached', () => {
     expect(received.map(({ args }) => args)).toEqual([[ELANOUS_ENTRY_SCRIPT, 'dev', '--file', 'g.md', '--base', 'main', '--target', '/tmp/x']]);   // 절대 경로(사용자 프로젝트 cwd 에서도)
   });
 
+  test('classic harness ask can detach with draft PR completion and no automatic merge', async () => {
+    const received: SpawnObservation[] = [];
+    await launchDevGoalFileDetached({ goalFile: 'g.md', noAutoMerge: true }, fakeSpawn(received));
+    expect(received[0]?.args).toEqual([ELANOUS_ENTRY_SCRIPT, 'dev', '--file', 'g.md', '--no-auto-merge']);
+  });
+
   function expectDetachedLaunch(observation: SpawnObservation, args: string[]): void {
     expect(observation.args).toEqual(args);
     expect(observation.options.detached).toBe(true);

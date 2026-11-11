@@ -1,0 +1,18 @@
+{
+  "id": "n8n-explicit-envelope",
+  "name": "Execute Workflow with an explicit envelope",
+  "nodes": [
+    {
+      "id": "execute-market-quote",
+      "name": "Execute market quote",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [240, 180],
+      "parameters": {
+        "workflowId": "market-quote",
+        "contract": { "inputs": ["ask"], "outputs": ["result", "evidence"] }
+      }
+    }
+  ],
+  "connections": {}
+}

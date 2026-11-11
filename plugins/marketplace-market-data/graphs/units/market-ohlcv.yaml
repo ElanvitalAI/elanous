@@ -1,0 +1,23 @@
+graph_id: market-ohlcv
+# Source: graph unit declarations use the current integer version 1 schema.
+version: 1
+entry_node: ohlcv
+terminal_nodes: [done, rework, needs-human, failed]
+unit:
+  inputs: [market, symbol, from, to]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+nodes:
+  - node_id: ohlcv
+    kind: capability
+    recipe: none
+    requires: market.ohlcv@1
+    # Source: one market capability invocation is the unit's bounded work step.
+    max_visits: 1
+    contract: { inputs: [market, symbol, from, to], tools: read-only, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: ohlcv, on: outcome, map: { ok: done, rework: rework, needs-human: needs-human, failed: failed } }

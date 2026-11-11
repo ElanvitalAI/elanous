@@ -80,7 +80,7 @@ test('release and observe manifest routes resolve deterministically with safe mi
 });
 
 
-test('turn preload and ToolSearch route resolve a Korean ask to the English plugin schema', async () => {
+test('plugin route schemas stay deferred and ToolSearch resolves a Korean ask to the English schema', async () => {
   const specs = await createHostedRouteSpecs(['elanous-release', 'elanous-observe']);
   const catalog = specs.map((tool) => ({
     id: tool.name.toLowerCase(), kind: 'other' as const, aliases: [], displayName: tool.name,
@@ -90,7 +90,9 @@ test('turn preload and ToolSearch route resolve a Korean ask to the English plug
   } as NativeToolCatalogEntry));
   const query = '0.3.8 발행 준비 어디까지 됐어?';
   const turn = applyDeferredTools([{ role: 'user', content: query }], specs, { userText: query, catalog });
-  expect(turn.tools.map((tool) => tool.name)).toContain('ReleaseStatus');
+  expect(turn.tools.map((tool) => tool.name)).toContain('ToolSearch');
+  expect(turn.tools.map((tool) => tool.name)).not.toContain('ReleaseStatus');
+  expect(turn.stats.deferredNames).toContain('ReleaseStatus');
   expect(turn.stats.deferredNames).toContain('ObserveLogs');
 
   const highRiskTurn = applyDeferredTools(
@@ -104,7 +106,9 @@ test('turn preload and ToolSearch route resolve a Korean ask to the English plug
   const defaultCatalogSafeTurn = applyDeferredTools(
     [{ role: 'user', content: query }], specs, { userText: query },
   );
-  expect(defaultCatalogSafeTurn.tools.map((tool) => tool.name)).toContain('ReleaseStatus');
+  expect(defaultCatalogSafeTurn.tools.map((tool) => tool.name)).toContain('ToolSearch');
+  expect(defaultCatalogSafeTurn.tools.map((tool) => tool.name)).not.toContain('ReleaseStatus');
+  expect(defaultCatalogSafeTurn.stats.deferredNames).toContain('ReleaseStatus');
   expect(defaultCatalogSafeTurn.tools.map((tool) => tool.name)).not.toContain('ReleaseGraphStart');
 
   const defaultCatalogTurn = applyDeferredTools(
@@ -142,10 +146,7 @@ test('turn preload and ToolSearch route resolve a Korean ask to the English plug
     expect(hydrated[0]).toMatchObject({ name: 'ReleaseStatus', pluginId: 'elanous-release', parameters: { type: 'object' } });
     const routeEvents = debug.events(1000).slice(priorEventCount);
     expect(routeEvents.some((event) => event.category === 'tool.route' && event.event === 'route-decision'
-      && (event.data as { source?: string; matches?: { name: string; pluginId: string }[] })?.source === 'turn-preload'
-      && (event.data as { matches?: { name: string; pluginId: string }[] })?.matches?.[0]?.name === 'ReleaseStatus'
-      && (event.data as { matches?: { name: string; pluginId: string; preloaded?: boolean }[] })?.matches?.[0]?.pluginId === 'elanous-release'
-      && (event.data as { matches?: { name: string; pluginId: string; preloaded?: boolean }[] })?.matches?.[0]?.preloaded === true)).toBe(true);
+      && (event.data as { source?: string })?.source === 'turn-preload')).toBe(false);
     expect(routeEvents.some((event) => event.category === 'tool.route' && event.event === 'route-decision'
       && (event.data as { surface?: string; matches?: { name: string; pluginId: string }[] })?.surface === 'ux-sim'
       && (event.data as { matches?: { name: string; pluginId: string }[] })?.matches?.[0]?.name === 'ReleaseStatus'
@@ -190,7 +191,7 @@ test('RRF keeps duplicate tool names isolated by plugin and gives equal ontology
 });
 
 
-test('turn preload preserves plugin route identity when a deferred native tool shares its name', () => {
+test('plugin routes stay out of provider schemas and remain searchable when native names overlap', () => {
   const routeSpec: LLMToolSpec = {
     name: 'SharedLookup', description: 'release status', parameters: { type: 'object', properties: { source: { const: 'plugin-route' } } },
     pluginId: 'elanous-release', route: {
@@ -211,8 +212,11 @@ test('turn preload preserves plugin route identity when a deferred native tool s
   const result = applyDeferredTools([{ role: 'user', content: '발행 확인' }], [convertedRoute, nativeSpec], {
     userText: '발행 확인', catalog,
   });
-  expect(result.tools).toHaveLength(1);
-  expect(result.tools[0]).toMatchObject({ name: 'SharedLookup', pluginId: 'elanous-release', parameters: { properties: { source: { const: 'plugin-route' } } } });
+  expect(result.tools.filter((tool) => tool.pluginId && tool.route)).toEqual([]);
+  expect(result.stats.warmPreloaded).toBe(0);
+  expect(result.stats.deferredNames).toContain('SharedLookup');
+  expect(dispatchToolSearch({ query: 'route:발행 확인' }, { specs: [convertedRoute], activePluginIds: new Set(['elanous-release']) }).matched)
+    .toContain('SharedLookup');
 
   const dynamicallyDeferredRoute = {
     ...routeSpec, name: 'DynamicLookup', alwaysLoad: false, shouldDefer: true,
@@ -220,6 +224,7 @@ test('turn preload preserves plugin route identity when a deferred native tool s
   const dynamicResult = applyDeferredTools([{ role: 'user', content: '발행 확인' }], [dynamicallyDeferredRoute], {
     userText: '발행 확인', catalog: [],
   });
-  expect(dynamicResult.tools.map((tool) => tool.name)).toContain('DynamicLookup');
-  expect(dynamicResult.stats.warmPreloaded).toBe(1);
+  expect(dynamicResult.tools.map((tool) => tool.name)).not.toContain('DynamicLookup');
+  expect(dynamicResult.stats.deferredNames).toContain('DynamicLookup');
+  expect(dynamicResult.stats.warmPreloaded).toBe(0);
 });

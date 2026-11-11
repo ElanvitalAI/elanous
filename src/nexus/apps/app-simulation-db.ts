@@ -4,12 +4,15 @@ import { dirname, join } from 'node:path';
 import { sqlNowIso } from '../../time/db-window.js';
 import { nexusRootDir } from '../paths.js';
 import { validateAppSimulationResult, type AppSimulationEvent, type AppSimulationReceipt, type AppSimulationSnapshot } from './app-simulation.js';
+import type { SimReceipt } from '../../ux-sim/sim-receipt.js';
 
 interface EventRow { event_json: string }
 interface ReceiptRow { receipt_json: string }
 
 export interface AppSimulationStore {
   record(value: unknown): void;
+  recordWithConceptProof(value: unknown, receiptId: string, createProof: (receipt: AppSimulationReceipt) => SimReceipt): void;
+  recordConceptProof(receiptId: string, proof: SimReceipt): void;
   snapshot(appId: string): AppSimulationSnapshot;
   close(): void;
 }
@@ -38,29 +41,56 @@ export function createAppSimulationStore(databasePath = join(nexusRootDir(), 'ap
   const insertReceipt = db.query('INSERT OR IGNORE INTO app_simulation_receipts(receipt_id, run_id, app_id, receipt_json) VALUES (?, ?, ?, ?)');
   let closed = false;
   const assertOpen = () => { if (closed) throw new Error('app simulation store is closed'); };
+  const record = (value: unknown, proofSpec?: { readonly receiptId: string; readonly createProof: (receipt: AppSimulationReceipt) => SimReceipt }): void => {
+    assertOpen();
+    const result = validateAppSimulationResult(value);
+    if (proofSpec && !result.receipts.some(receipt => receipt.id === proofSpec.receiptId)) throw new Error('concept proof receipt is absent from simulation result');
+    const outcomes = new Set(result.receipts.map(receipt => receipt.outcome));
+    const outcome = outcomes.size === 1 && outcomes.has('passed') ? 'passed' : 'failed';
+    const createdAt = (db.query(`SELECT ${sqlNowIso()} AS created_at`).get() as { created_at: string }).created_at;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      insertRun.run(result.runId, outcome, createdAt);
+      const existing = db.query('SELECT outcome FROM app_simulation_runs WHERE run_id = ?').get(result.runId) as { outcome: string } | null;
+      if (!existing || existing.outcome !== outcome) throw new Error('app simulation run id conflicts with existing result');
+      const eventSequences = new Map<string, number>();
+      for (const event of result.events) {
+        const sequence = (eventSequences.get(event.appId) ?? 0) + 1;
+        eventSequences.set(event.appId, sequence);
+        const stored: AppSimulationEvent = { ...event, id: `${result.runId}:${event.appId}:${sequence}` };
+        insertEvent.run(result.runId, event.appId, sequence, JSON.stringify(stored));
+      }
+      for (const receipt of result.receipts) {
+        const stored: AppSimulationReceipt = { ...receipt, createdAt };
+        const proof = proofSpec?.receiptId === receipt.id ? proofSpec.createProof(stored) : undefined;
+        if (proof && (proof.appSimulationReceiptId !== stored.id || proof.appSimulationRunId !== stored.runId || proof.appId !== stored.appId)) {
+          throw new Error('concept proof does not match its app simulation receipt');
+        }
+        insertReceipt.run(receipt.id, result.runId, receipt.appId, JSON.stringify(proof ? { ...stored, conceptProof: proof } : stored));
+      }
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  };
   return {
-    record(value) {
+    record(value) { record(value); },
+    recordWithConceptProof(value, receiptId, createProof) { record(value, { receiptId, createProof }); },
+    recordConceptProof(receiptId, proof) {
       assertOpen();
-      const result = validateAppSimulationResult(value);
-      const outcomes = new Set(result.receipts.map(receipt => receipt.outcome));
-      const outcome = outcomes.size === 1 && outcomes.has('passed') ? 'passed' : 'failed';
-      const createdAt = sqlNowIso();
+      if (!receiptId.trim() || proof.schema !== 'elanous.sim-receipt.v1'
+        || !/^[a-f0-9]{64}$/.test(proof.receiptFingerprint)
+        || !['passed', 'failed', 'stale', 'unmeasured'].includes(proof.verdict)) {
+        throw new Error('invalid app simulation concept proof');
+      }
       db.exec('BEGIN IMMEDIATE');
       try {
-        insertRun.run(result.runId, outcome, createdAt);
-        const existing = db.query('SELECT outcome FROM app_simulation_runs WHERE run_id = ?').get(result.runId) as { outcome: string } | null;
-        if (!existing || existing.outcome !== outcome) throw new Error('app simulation run id conflicts with existing result');
-        const eventSequences = new Map<string, number>();
-        for (const event of result.events) {
-          const sequence = (eventSequences.get(event.appId) ?? 0) + 1;
-          eventSequences.set(event.appId, sequence);
-          const stored: AppSimulationEvent = { ...event, id: `${result.runId}:${event.appId}:${sequence}` };
-          insertEvent.run(result.runId, event.appId, sequence, JSON.stringify(stored));
+        const row = db.query('SELECT receipt_json FROM app_simulation_receipts WHERE receipt_id = ?').get(receiptId) as ReceiptRow | null;
+        if (!row) throw new Error('app simulation receipt is unavailable');
+        const receipt = JSON.parse(row.receipt_json) as AppSimulationReceipt;
+        if (receipt.id !== proof.appSimulationReceiptId || receipt.appId !== proof.appId || receipt.runId !== proof.appSimulationRunId) {
+          throw new Error('concept proof does not match its app simulation receipt');
         }
-        for (const receipt of result.receipts) {
-          const stored: AppSimulationReceipt = { ...receipt, createdAt };
-          insertReceipt.run(receipt.id, result.runId, receipt.appId, JSON.stringify(stored));
-        }
+        db.query('UPDATE app_simulation_receipts SET receipt_json = ? WHERE receipt_id = ?')
+          .run(JSON.stringify({ ...receipt, conceptProof: proof }), receiptId);
         db.exec('COMMIT');
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     },

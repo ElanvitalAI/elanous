@@ -18,8 +18,8 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 
 
 import { listAcpBackends } from '../../acp/backend-registry.js';
+import { CLIENT_NAMESPACE } from '../../acp/namespaces.js';
 import {
-  CLIENT_NAMESPACE,
   globalDualRoleManager,
   ReentrancyError,
   UnknownSessionError,

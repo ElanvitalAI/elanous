@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { readFileSync } from 'node:fs';
+import { program as entryProgram } from '../index.js';
 import { registerOpsCommands } from './ops-cli.js';
 import { registerPublishCommands } from './publish-cli.js';
 
@@ -40,12 +40,14 @@ describe('G6b extracted command registration', () => {
     }
   });
 
-  test('index delegates registration instead of retaining inline ops/publish blocks', () => {
-    const source = readFileSync(new URL('../index.ts', import.meta.url), 'utf8');
-    expect(source).not.toMatch(/program\.command\(['"](?:ops|publish)['"]\)/);
-    expect((source.match(/^registerOpsCommands\(program\);$/gm) ?? []).length).toBe(1);
-    expect((source.match(/^registerPublishCommands\(program\);$/gm) ?? []).length).toBe(1);
-    expect(source.indexOf('registerOpsCommands(program);')).toBeLessThan(source.indexOf('registerPublishCommands(program);'));
-    expect(source.indexOf('registerPublishCommands(program);')).toBeGreaterThan(source.indexOf('registerOpsCommands(program);'));
+  test('real CLI root exposes one ops and publish tree in registration order', () => {
+    const roots = entryProgram.commands.filter((command) => ['ops', 'publish'].includes(command.name()));
+    expect(roots.map((command) => command.name())).toEqual(['ops', 'publish']);
+    for (const command of roots) {
+      expect([command, ...command.commands].map((entry) => ({
+        name: entry.name(),
+        flags: entry.options.map((option) => option.flags),
+      }))).toEqual(before[command.name() as keyof typeof before]);
+    }
   });
 });

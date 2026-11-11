@@ -11,7 +11,7 @@
 
 import { lookupLlmTierSpec } from '../model-tier/index.js';
 import type { ModelTier } from '../model-tier/types.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { LLMProviderName, ReasoningLevel } from '../user-config/types.js';
 
 /** Provider used for tier defaults. Model-env mismatches are named in

@@ -33,13 +33,13 @@ import { SEAT_MEMORY_RECALL_MAX_CHARS, SEAT_MEMORY_RECALL_PREFIX } from '../dash
 import { AUTOHEAL_MAX_ATTEMPTS } from '../self-health/autoheal.js';
 import { mockSeatPtySequence, type SeatPtySequenceEvidence, type SeatPtyStep } from './mock-seat-pty-sequence.js';
 import {
-  TEST_FAKE_LLM_CAPTURE_ENV, TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_ENV,
-  TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_SCRIPT_ENV, TEST_FAKE_LLM_SCRIPT_SKIP_WHEN_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
+  TEST_FAKE_LLM_CAPTURE_ENV, TEST_FAKE_LLM_ENV,
+  TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_SCRIPT_ENV, TEST_FAKE_LLM_SCRIPT_SKIP_WHEN_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
 } from './fake-llm.js';
 import { pasteFoldToken } from '../chat/paste-fold.js';
 import { bracketedPaste, CLIP_TEXT, GOAL_CONTINUE_PLEDGE_REPLY, GOAL_INTERIM_NOT_DONE_REPLY, GOAL_INTERIM_TOOL_CALL, goalInterimScreenCounts, INTERNAL_TURN_USER_HEADER, clipboardShimPath, PASTE_LONG, PASTE_LONG_TOKEN, PASTE_SHORT, parseData, readLogs } from './next-tui-seat-scenarios.js';
 
-export const CLASSIC_TUI_SCENARIOS = ['classic-first-screen-noise', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-priority-keys', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop'] as const;
+export const CLASSIC_TUI_SCENARIOS = ['classic-first-screen-noise', 'classic-inline-picker', 'classic-400-heal', 'classic-400-exhausted', 'classic-seat-boot', 'classic-typing-lag', 'classic-priority-keys', 'classic-mcp-calltool', 'classic-wakeup', 'classic-goal-continue', 'classic-goal-interim', 'classic-paste', 'classic-orphan-autostop'] as const;
 export type ClassicTuiScenario = (typeof CLASSIC_TUI_SCENARIOS)[number];
 
 export interface ClassicTuiScenarioSpec {
@@ -48,6 +48,7 @@ export interface ClassicTuiScenarioSpec {
   root: string;
   executable: string;
   entry: string;
+  rows?: number;
   expectedBinarySha256?: string;
 }
 
@@ -156,7 +157,7 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
     executable: spec.executable,
     args: [spec.entry, '--config-dir', '{root}', '--test-state-dir', '{root}'],
     root,
-    rows: 30,
+    rows: spec.rows ?? 30,
     cols: 100,
     ...(spec.expectedBinarySha256 ? { expectedBinarySha256: spec.expectedBinarySha256 } : {}),
     ready: spec.scenario === 'classic-first-screen-noise'
@@ -171,6 +172,61 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
     const logs = readLogs({ root, executable: spec.executable, entry: spec.entry }, logCategories);
     return { scenario: spec.scenario, universe: root, run, store, logs, checks: checks(rowsOf(logs)) };
   };
+
+  if (spec.scenario === 'classic-inline-picker') {
+    const fixture = join(root, 'picked.txt');
+    writeFileSync(fixture, 'classic inline picker fixture');
+    const artifactDir = process.env.ELANOUS_TUI_INLINE_PICKER_EVIDENCE_DIR;
+    if (artifactDir) mkdirSync(artifactDir, { recursive: true });
+    const artifactPath = artifactDir ? join(artifactDir, `classic-inline-picker-${spec.rows ?? 30}.json`) : undefined;
+    env[TEST_FAKE_LLM_TOOL_CALL_ENV] = JSON.stringify({
+      when: 'inline-confirm',
+      name: 'Agent',
+      args: { description: 'Esc confirmation fixture', prompt: 'hold child for Esc fixture', max_turns: 1 },
+    });
+    env.ELANOUS_TUI_UNATTENDED = '1';
+    env[TEST_FAKE_LLM_DELAY_MS_ENV] = '15000';
+    env[TEST_FAKE_LLM_DELAY_WHEN_ENV] = 'hold child for Esc fixture';
+    const run = await mockSeatPtySequence({
+      ...base,
+      env,
+      ...(artifactPath ? { artifactPath } : {}),
+      steps: [
+        { label: 'at candidates', text: 'Read @picked', enter: false, until: (screen) => screen.includes('@ 첨부') && screen.includes('picked.txt') },
+        { label: 'selected attachment', keys: '\r', until: (screen) => screen.includes('[Text #1]') && !screen.includes('@ 첨부') },
+        { label: 'slash candidates', keys: '\x15', text: '/he', enter: false, until: (screen) => screen.includes('/ 명령') && screen.includes('/help') },
+        { label: 'slash dismissed', keys: '\x1b', until: (screen) => screen.includes('/he') && !screen.includes('/ 명령') },
+        { label: 'slash draft extended', text: 'x', enter: false, until: (screen) => screen.includes('❯ /hex') },
+        { label: 'slash draft cleared', keys: '\x15', until: (screen) => screen.includes('❯') && !screen.includes('❯ /hex') },
+        { label: 'y/N confirmation opened', text: 'inline-confirm', until: (screen) => screen.includes('⏺ Agent(') },
+        { label: 'y/N choices visible', keys: '\x1b', until: (screen) => screen.includes('도는 작업과 하위 에이전트를 함께 중단할까요?') && screen.includes('y/n · 기본 n') },
+        { label: 'n selected and turn restored', text: 'n', until: (screen) => screen.includes('✔ 완료') && !screen.includes('y/n · 기본 n'), timeoutMs: 30_000 },
+      ],
+    });
+    return finish(run, { fixture, rows: spec.rows ?? 30 }, () => {
+      const screen = (label: string) => run.frames.find((frame) => frame.label === label)?.screen ?? '';
+      const atOpen = screen('at candidates').split('\n');
+      const atRow = atOpen.findIndex((line) => line.includes('▸ picked.txt'));
+      const promptRow = atOpen.findIndex((line) => line.includes('❯ Read @picked'));
+      const selected = screen('selected attachment');
+      const dismissed = screen('slash dismissed');
+      return {
+        atPanelInComposerBand: atRow >= 0 && atRow < promptRow && atOpen[atRow + 1]?.includes('Enter 첨부') === true
+          && atOpen[atRow + 2]?.includes('─') === true,
+        atSelectionClosesAndRestoresInput: selected.includes('[Text #1]') && selected.includes('❯ Read [Text #1]') && !selected.includes('@ 첨부'),
+        slashPanelInComposerBand: screen('slash candidates').includes('/ 명령') && screen('slash candidates').includes('❯ /he'),
+        escapeClosesPickerWithoutLosingDraft: dismissed.includes('❯ /he') && !dismissed.includes('/ 명령'),
+        confirmationOpenedInComposer: screen('y/N choices visible').includes('y/n · 기본 n'),
+        confirmationUsesInputChoices: screen('y/N choices visible').includes('y. 중단')
+          && screen('y/N choices visible').includes('n. 계속')
+          && screen('y/N choices visible').includes('y/n · 기본 n'),
+        nSelectionRestoresTurn: screen('n selected and turn restored').includes('inline-confirm')
+          && screen('n selected and turn restored').includes('✔ 완료')
+          && !screen('n selected and turn restored').includes('y/n · 기본 n'),
+        exitedClean: run.exitCode === 0,
+      };
+    });
+  }
 
   if (spec.scenario === 'classic-first-screen-noise') {
     const run = await mockSeatPtySequence({

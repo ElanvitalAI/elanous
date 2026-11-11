@@ -1,0 +1,34 @@
+{
+  "id": "adaptive-graph-design",
+  "name": "Adaptive graph design simulator",
+  "implementation": [
+    "src/ux-sim/graph-design-sim.ts",
+    "src/ux-sim/graph-diff-apply.ts"
+  ],
+  "tests": [
+    "src/ux-sim/graph-design-sim.test.ts",
+    "src/ux-sim/graph-diff-apply.test.ts"
+  ],
+  "target": "Simulate adaptive graph revisions through the currently supported graph-template parser and runGraph compatibility path; keep scenario flow in YAML",
+  "inputs": [
+    "two initial synthetic expert views",
+    "catalog/ux-sim/fixtures/adaptive-graph-v1.yaml and revision-one graph declaration",
+    "new expert view and add/remove/replace diff",
+    "replayed event id for an idempotency check"
+  ],
+  "observations": [
+    "generated YAML for revision one and revision two",
+    "parser validation before revision publication",
+    "revision-one and revision-two runGraph paths",
+    "invalidated node closure and superseded prior outputs",
+    "duplicate diff is a no-op and revision gaps fail closed",
+    "graph-engine-sim selects the route in the updated declaration",
+    "fixture currently uses the existing graph-template schema; RFC GRAPH-RUNNER-V2 verbs and capabilities await GRAPH-YAML-SCHEMA and graph-yaml-world"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/graph-design-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

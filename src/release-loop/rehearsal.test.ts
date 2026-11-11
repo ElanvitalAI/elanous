@@ -10,7 +10,7 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-di
 import { listLoops } from '../loops/registry.js';
 import { registerReleaseCommands } from '../cli/release-cli.js';
 import { runGraph } from '../graph-runner/runner.js';
-import { LIGHT_RC_DEFAULT_SHARDS, type LightRcResult } from './light-rc.js';
+import { LIGHT_RC_DEFAULT_SHARDS, runLightRc, type LightRcResult } from './light-rc.js';
 import { setSchedule, type ReleaseSchedule } from './release-schedule.js';
 import { spawnHardRehearsalGate, planRehearsal as livePlanRehearsal, rehearsalLeakFailureDetail, runRehearsalLeakCheck, runRehearsalTick, sanitizeRehearsalLeakDetail, type HardGateResult, type RehearsalDeps, type StepId } from './rehearsal.js';
 import { planRehearsalShards, type RehearsalShardPlan } from './rehearsal-shard-plan.js';
@@ -18,6 +18,7 @@ import { writeGateVerdictRecord } from '../../scripts/release-loop/gate-node.js'
 import { HARD_REHEARSAL_POD_SHARDS, hardRehearsalGateVersion, planHardRehearsalRadius } from '../../scripts/release-loop/gate-radius-live.js';
 import { appendGateShardLedger, appendGateShardLedgerBatch, gateShardLedgerPath, readGateShardLedger, type GateShardLedgerRow } from './gate-shard-ledger.js';
 import { gateShardsPath, writeGateShards } from './gate-shards.js';
+import type { CloudVmAdapter } from './cloud-vm-adapter.js';
 
 const cut = '2026-10-10T13:00:00Z';
 const schedule = { version: '0.2.23', cutAt: cut, publishAt: '2026-10-10T15:30:00Z' } as ReleaseSchedule;
@@ -41,11 +42,18 @@ const planRehearsal: typeof livePlanRehearsal = (schedules, now, stamps) => live
 test('hard-mid cannot be disabled by interval zero', () => {
   expect(() => livePlanRehearsal([schedule], at(720), {}, 0)).toThrow('must be an integer from 8 to 72');
 });
-const rc = (overrides: Partial<LightRcResult> = {}): LightRcResult => ({ version: schedule.version, base: 'abc', measuredCommit: 'c'.repeat(40), worktreeHead: 'c'.repeat(40), importerTests: 0, unmeasured: null, introduced: 0, preexisting: 3, unclassified: 0, alwaysInclude: 1, alwaysIncludeMissing: [], shards: 4, remote: 'node-b', gateExitCode: 0, ok: true, ...overrides });
+const rc = (overrides: Partial<LightRcResult> = {}): LightRcResult => ({ version: schedule.version, base: 'abc', measuredCommit: 'c'.repeat(40), worktreeHead: 'c'.repeat(40), importerTests: 0, unmeasured: null, introduced: 0, preexisting: 3, unclassified: 0, alwaysInclude: 1, alwaysIncludeMissing: [], shards: 4, remote: 'aws1', gateExitCode: 0, ok: true, ...overrides });
 function harness(now: Date, result: LightRcResult = rc(), dirty = false) {
-  const calls: string[] = [], hardCalls: string[] = [], notifications: string[] = [], gitCalls: string[] = [];
+  const calls: string[] = [], hardCalls: string[] = [], notifications: string[] = [], gitCalls: string[] = [], cloudCalls: string[] = [];
+  let vmState: 'running' | 'stopped' = 'stopped';
+  const cloudVmAdapter: CloudVmAdapter = {
+    async start(host) { cloudCalls.push(`start:${host}`); vmState = 'running'; },
+    async stop(host) { cloudCalls.push(`stop:${host}`); vmState = 'stopped'; },
+    async status(host) { cloudCalls.push(`status:${host}`); return { host, state: vmState }; },
+  };
   const deps: RehearsalDeps = {
     now: () => now, schedules: () => [schedule], hardIntervalHours: 12,
+    cloudVmAdapter,
     shardPlan: () => ({ shards: 4, testFiles: 30, gatePlanShards: 4, resources: { cpus: 16, freeBytes: 12e9, totalBytes: 24e9 }, unmeasured: null }),
     git: (args) => { gitCalls.push(args.join(' ')); return { rc: 0, stdout: args[0] === 'status' ? dirty ? ' M file.ts\n' : '' : args[0] === 'rev-parse' ? '1234567890abcdef\n' : '' }; },
     leakCheck: () => ({ status: 0 }),
@@ -56,7 +64,7 @@ function harness(now: Date, result: LightRcResult = rc(), dirty = false) {
     },
     notify: (text) => { notifications.push(text); },
   };
-  return { deps, calls, hardCalls, notifications, gitCalls };
+  return { deps, calls, hardCalls, notifications, gitCalls, cloudCalls };
 }
 
 function publicExportLeakCheckout(fileName: string, exclude: string[] = [], include = 'src/**'): string {
@@ -460,7 +468,7 @@ test('default twelve-hour mid-cycle hard gate uses the same pinned Pod path and 
   await runRehearsalTick(opts, first.deps);
   await runRehearsalTick(opts, first.deps);
   expect(first.hardCalls).toEqual([schedule.version]);
-  expect(stamp(root, 'hard-mid')).toMatchObject({ outcome: 'ok', selection: { shards: 12, remote: 'node-b' } });
+  expect(stamp(root, 'hard-mid')).toMatchObject({ outcome: 'ok', selection: { shards: 12, remote: 'aws1' } });
   const second = harness(at(300));
   second.deps.hardIntervalHours = 12;
   await runRehearsalTick(opts, second.deps);
@@ -647,38 +655,48 @@ test('rehearsal tick stamps a failed TUI screen result as an error, not a succes
 
 test('explicit shard count and host reach the RC run and its stamp', async () => {
   const root = newRoot();
-  const h = harness(at(420), rc({ shards: 12, remote: 'node-c' }));
-  const selections: Array<{ shards?: number; remote?: string }> = [];
+  const h = harness(at(420), rc({ shards: 4, remote: 'aws1' }));
+  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection) => {
     selections.push(selection);
     return lightRc(version, checkout, selection);
   };
-  const tick = await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, shards: 12, remote: 'node-c' }, h.deps);
+  const tick = await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, shards: 12, remote: 'aws1' }, h.deps);
   expect(tick.status).toBe('due');
-  expect(selections).toEqual([{ shards: 12, remote: 'node-c' }]);
-  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: 12, remote: 'node-c' }, result: { shards: 12, remote: 'node-c' } });
+  expect(selections).toEqual([{ shards: 4, remote: 'aws1', rehearsalCloudHost: true }]);
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: 4, remote: 'aws1' }, result: { shards: 4, remote: 'aws1' } });
 });
 
-test('RC-reported shard count must match selected count before an explicit run can be green', async () => {
+test('rc-7h normalizes explicit shard counts to the aws1 host-gate contract', async () => {
   const root = newRoot(), h = harness(at(420), rc({ shards: 4, ok: true }));
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, shards: 12 }, h.deps);
-  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'unmeasured', selection: { shards: 12 }, result: { shards: 4 } });
-  expect(stamp(root, 'rc-7h').summary).toContain('selected shards 12 but RC reported 4');
-  expect(h.notifications[0]).toContain('selected shards 12 but RC reported 4');
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: 4 }, result: { shards: 4 } });
+  expect(stamp(root, 'rc-7h').summary).toContain('full-shards fallback (4)');
 });
 
-test('measured gate failure and shard mismatch remain error without hiding the mismatch', async () => {
+test('rc-7h keeps a host-gate shard-contract refusal unmeasured in its stamp', async () => {
+  const root = newRoot();
+  const h = harness(at(420), rc({ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', gateExitCode: 2, ok: false,
+    unmeasured: 'host-gate-shard-contract-mismatch' }));
+
+  await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
+
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'unmeasured', selection: { shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1' },
+    result: { shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', gateExitCode: 2,
+      unmeasured: 'host-gate-shard-contract-mismatch' } });
+});
+
+test('measured rc-7h gate failure remains error after shard normalization', async () => {
   const root = newRoot(), h = harness(at(420), rc({ shards: 4, ok: false, gateExitCode: 1 }));
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, shards: 12 }, h.deps);
-  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'error', selection: { shards: 12 } });
-  expect(stamp(root, 'rc-7h').summary).toContain('selected shards 12 but RC reported 4');
-  expect(h.notifications[0]).toContain('selected shards 12 but RC reported 4');
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'error', selection: { shards: 4 } });
+  expect(stamp(root, 'rc-7h').summary).toContain('full-shards fallback (4)');
 });
 
 test('no-option tick calls the actual planner with selected files, stored board and resources', async () => {
   const root = newRoot(), h = harness(at(420), rc());
-  const selections: Array<{ shards?: number; remote?: string }> = [];
+  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection) => { selections.push(selection); return lightRc(version, checkout, selection); };
   h.deps.shardPlan = planRehearsalShards;
@@ -689,9 +707,9 @@ test('no-option tick calls the actual planner with selected files, stored board 
     board: () => ({ v: 1, version: schedule.version, updatedAt: at(420).toISOString(), shards: Array.from({ length: 5 }, (_, i) => ({ id: String(i), state: 'done' })) }),
   };
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
-  expect(selections).toEqual([{ shards: 3, remote: undefined }]);
-  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'unmeasured', selection: { shards: 3 }, shardPlan: { testFiles: 3, gatePlanShards: 5, resources: { cpus: 2, freeBytes: 8e9, totalBytes: 16e9 } } });
-  expect(stamp(root, 'rc-7h').summary).toContain('importer coverage not reported');
+  expect(selections).toEqual([{ shards: 4, remote: 'aws1', rehearsalCloudHost: true }]);
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: 4 }, shardPlan: { testFiles: 3, gatePlanShards: 5, resources: { cpus: 2, freeBytes: 8e9, totalBytes: 16e9 } } });
+  expect(stamp(root, 'rc-7h').summary).toContain('full-shards fallback (4)');
 });
 
 test('complete selected-file memory and a measured RC can finish a no-option tick as ok', async () => {
@@ -711,8 +729,8 @@ test('complete selected-file memory and a measured RC can finish a no-option tic
 test('remote no-option tick does not use local memory to cap its shard count', async () => {
   for (const freeBytes of [3 * 1024 ** 3, 7 * 1024 ** 3, 227 * 1024 ** 3]) {
     const expected = 5;
-    const root = newRoot(), h = harness(at(420), rc({ shards: expected }));
-    const selections: Array<{ shards?: number; remote?: string }> = [];
+    const root = newRoot(), h = harness(at(420), rc({ shards: LIGHT_RC_DEFAULT_SHARDS }));
+    const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
     const lightRc = h.deps.lightRc!;
     h.deps.lightRc = async (version, checkout, selection) => { selections.push(selection); return lightRc(version, checkout, selection); };
     h.deps.shardPlan = planRehearsalShards;
@@ -723,14 +741,14 @@ test('remote no-option tick does not use local memory to cap its shard count', a
       board: () => ({ v: 1, version: schedule.version, updatedAt: at(420).toISOString(), shards: Array.from({ length: 5 }, (_, i) => ({ id: String(i), state: 'done' })) }),
     };
     await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
-    expect(selections).toEqual([{ shards: expected, remote: undefined }]);
-    expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'unmeasured', selection: { shards: expected }, shardPlan: { testFiles: 30, gatePlanShards: 5, resources: { freeBytes }, capacity: { requiredBytes: (1 + 2 * expected) * 1024 ** 3 } } });
-    expect(stamp(root, 'rc-7h').summary).toContain('selected file memory not measured');
+    expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true }]);
+    expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: LIGHT_RC_DEFAULT_SHARDS }, shardPlan: { testFiles: 30, gatePlanShards: 5, resources: { freeBytes } } });
+    expect(stamp(root, 'rc-7h').summary).toContain('full-shards fallback (4)');
   }
 });
 
 test('remote no-option tick runs RC despite a zero local memory slot and stamps its measured result', async () => {
-  const root = newRoot(), h = harness(at(420), rc({ shards: 1 }));
+  const root = newRoot(), h = harness(at(420), rc({ shards: LIGHT_RC_DEFAULT_SHARDS }));
   h.deps.shardPlan = planRehearsalShards;
   h.deps.shardPlanDeps = {
     resolveBase: () => 'base', readAlways: () => 'test/always.test.ts',
@@ -743,22 +761,22 @@ test('remote no-option tick runs RC despite a zero local memory slot and stamps 
   await runRehearsalTick(opts, h.deps);
   await runRehearsalTick(opts, h.deps);
   expect(h.calls).toEqual([schedule.version]);
-  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: 1 }, shardPlan: { capacity: { memoryShards: 0, peakFileBytes: 6_000_000_000 }, remoteCapacityVerifiedBy: 'node-b', unmeasured: null } });
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: 1, remote: 'aws1' }, shardPlan: { capacity: { memoryShards: 0, peakFileBytes: 6_000_000_000 }, remoteCapacityVerifiedBy: 'aws1', unmeasured: null } });
   expect(h.notifications).toHaveLength(1);
 });
 
 test('no-option tick records real planning evidence and forwards candidate shards; incomplete evidence stays unmeasured', async () => {
   const root = newRoot(), h = harness(at(420), rc());
-  const selections: Array<{ shards?: number; remote?: string }> = [];
+  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection) => { selections.push(selection); return lightRc(version, checkout, selection); };
   h.deps.shardPlan = () => ({ shards: 12, testFiles: 699, gatePlanShards: 12, resources: { cpus: 16, freeBytes: 227e9, totalBytes: 256e9 }, unmeasured: 'sufficiency threshold not measured' });
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
-  expect(selections).toEqual([{ shards: 12, remote: undefined }]);
-  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'unmeasured', selection: { shards: 12 }, shardPlan: { shards: 12, testFiles: 699, gatePlanShards: 12, resources: { cpus: 16, freeBytes: 227e9 } } });
-  expect(stamp(root, 'rc-7h').summary).toContain('sufficiency threshold not measured');
+  expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true }]);
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: LIGHT_RC_DEFAULT_SHARDS }, shardPlan: { shards: 12, testFiles: 699, gatePlanShards: 12, resources: { cpus: 16, freeBytes: 227e9 } } });
+  expect(stamp(root, 'rc-7h').summary).toContain('full-shards fallback (4)');
   expect(stamp(root, 'rc-7h').shardPlan.testFiles).toBe(699);
-  expect(h.notifications[0]).toContain('sufficiency threshold not measured');
+  expect(h.notifications[0]).toContain('full-shards fallback (4)');
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
   expect(selections).toHaveLength(1);
 });
@@ -891,17 +909,64 @@ test('leak-check failure stays recorded even when the gate shard plan is missing
   expect(h.calls).toEqual([]);
 });
 
-test('remote override forwards planned shards but leaves remote capacity unmeasured', async () => {
+test('rc-7h keeps its aws1 host pin when a remote override leaves capacity unmeasured', async () => {
   const root = newRoot(), h = harness(at(420));
-  const selections: Array<{ shards?: number; remote?: string }> = [];
+  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
   h.deps.shardPlan = () => ({ shards: 3, testFiles: 18, gatePlanShards: 3, resources: { cpus: 8, freeBytes: 4e9, totalBytes: 8e9 }, unmeasured: 'remote capacity not measured' });
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection) => { selections.push(selection); return lightRc(version, checkout, selection); };
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, remote: 'node-c' }, h.deps);
-  expect(selections).toEqual([{ shards: 3, remote: 'node-c' }]);
+  expect(selections).toEqual([{ shards: 3, remote: 'aws1', rehearsalCloudHost: true }]);
   expect(stamp(root, 'rc-7h').shardPlan.unmeasured).toContain('remote capacity not measured');
   expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'unmeasured' });
   expect(stamp(root, 'rc-7h').summary).toContain('remote capacity not measured');
+});
+
+test('scheduled aws1 rehearsal starts through CloudVmAdapter and stops only after a persisted clean receipt', async () => {
+  const root = newRoot(), h = harness(at(420), rc({ hostReceiptPersisted: true }));
+  await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
+  expect(h.cloudCalls).toEqual(['start:aws1', 'status:aws1', 'stop:aws1', 'status:aws1']);
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', result: { hostReceiptPersisted: true } });
+});
+
+test('cloud start failure postpones the same rehearsal step and never falls back locally', async () => {
+  const root = newRoot(), h = harness(at(420));
+  h.deps.cloudVmAdapter = {
+    async start() { throw new Error('provider start refused'); },
+    async stop() { throw new Error('stop must not run'); },
+    async status() { throw new Error('status must not run'); },
+  };
+  const result = await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
+  expect(result.status).toBe('due');
+  expect(h.calls).toEqual([]);
+  expect(existsSync(join(root, 'release', schedule.version, 'rehearsal', 'rc-7h.json'))).toBe(false);
+  expect(result.stamps?.[0]).toMatchObject({ outcome: 'unmeasured', summary: expect.stringContaining('postponed without failover') });
+});
+
+test('rc-7h planned shard mismatch normalizes to four before light-rc and records a measured stamp', async () => {
+  const root = newRoot();
+  const h = harness(at(420));
+  let gateCalls = 0;
+  h.deps.shardPlan = () => ({ shards: 3, testFiles: 18, gatePlanShards: 3,
+    resources: { cpus: 8, freeBytes: 4e9, totalBytes: 8e9 }, unmeasured: null });
+  h.deps.lightRc = async (version, _checkout, selection) => runLightRc(version, {
+    base: 'c'.repeat(40), head: 'c'.repeat(40), ...selection, log: () => {},
+  }, {
+    cwd: '/fake/checkout', git: () => ({ rc: 0, stdout: `${'c'.repeat(40)}\n` }),
+    readFile: () => 'test/always.test.ts', previousVersion: () => '0.2.22',
+    runFormalHostGate: async () => {
+      gateCalls++;
+      return { outcome: 'ok', commit: 'c'.repeat(40), introduced: [], preexisting: 0, fixed: 0, knownEnv: 0,
+        knownEnvCleared: [], stalledEnv: [], rcNonzeroNoFailures: [], durationMs: 1 };
+    },
+  });
+
+  await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
+
+  expect(gateCalls).toBe(1);
+  expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', selection: { shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1' },
+    shardPlan: { shards: 3 }, result: { shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', gateExitCode: 0, unmeasured: null } });
+  expect(stamp(root, 'rc-7h').summary).toContain(`full-shards fallback (${LIGHT_RC_DEFAULT_SHARDS})`);
 });
 
 test('requested remote must match the RC host before capacity can be verified', async () => {
@@ -911,14 +976,14 @@ test('requested remote must match the RC host before capacity can be verified', 
     planningGaps: [], unmeasured: 'remote gate host resources unmeasured before RC' });
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, remote: 'node-c' }, h.deps);
   expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'unmeasured', shardPlan: { remoteCapacityPending: true } });
-  expect(stamp(root, 'rc-7h').summary).toContain('requested remote node-c but RC reported node-b');
+  expect(stamp(root, 'rc-7h').summary).toContain('requested remote aws1 but RC reported node-b');
 });
 
 test('failed RC alert preserves a requested-versus-actual remote mismatch', async () => {
   const root = newRoot(), h = harness(at(420), rc({ shards: 4, remote: 'node-b', ok: false, gateExitCode: 1 }));
   await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true, shards: 4, remote: 'node-c' }, h.deps);
   expect(stamp(root, 'rc-7h').outcome).toBe('error');
-  expect(h.notifications[0]).toContain('requested remote node-c but RC reported node-b');
+  expect(h.notifications[0]).toContain('requested remote aws1 but RC reported node-b');
 });
 
 test('runner failure preserves already-stamped planning gap', async () => {
@@ -987,7 +1052,7 @@ test('two identical -7h ticks claim the stage once; outcome and SHA stay in the 
   expect(h.calls).toEqual([schedule.version]);
   expect(h.gitCalls).toEqual(['status --porcelain', 'fetch -q origin main', 'checkout -q --detach origin/main', 'rev-parse HEAD']);
   expect(h.notifications).toHaveLength(1);
-  expect(h.notifications[0]).toContain('새 회귀 0 · 기존 3 · 미분류 0 · node-b');
+  expect(h.notifications[0]).toContain('새 회귀 0 · 기존 3 · 미분류 0 · aws1');
   expect(h.notifications[0]!.split('\n')).toHaveLength(1);
   expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', sha: '1234567890abcdef', result: { introduced: 0 }, startedAt: at(420).toISOString() });
   expect(existsSync(join(root, 'release', schedule.version, 'rehearsal', 'rc-150m.json'))).toBe(false);
@@ -1396,8 +1461,8 @@ test('CLI preview is read-only and JSON remains one line; loop registry names th
 }, 30_000);
 
 test('CLI apply accepts injected clock and checkout, emits one JSON result and claims once', async () => {
-  const root = newRoot(), h = harness(at(420), rc({ shards: 12, remote: 'node-c' }));
-  const selections: Array<{ shards?: number; remote?: string }> = [];
+  const root = newRoot(), h = harness(at(420), rc({ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1' }));
+  const selections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
   const lightRc = h.deps.lightRc!;
   h.deps.lightRc = async (version, checkout, selection) => {
     selections.push(selection);
@@ -1414,7 +1479,7 @@ test('CLI apply accepts injected clock and checkout, emits one JSON result and c
     process.exitCode = 0;
     process.stdout.write = ((chunk: string) => { output.push(String(chunk)); return true; }) as typeof process.stdout.write;
     console.error = () => {};
-    await cli.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--checkout', '/fake/checkout', '--shards', '12', '--remote', 'node-c', '--json'], { from: 'user' });
+    await cli.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--checkout', '/fake/checkout', '--shards', '12', '--remote', 'aws1', '--json'], { from: 'user' });
     await cli.parseAsync(['release', 'rehearsal', 'tick', '--apply', '--checkout', '/fake/checkout', '--json'], { from: 'user' });
     expect(process.exitCode).toBe(0);
   } finally { process.exitCode = exit ?? 0; process.stdout.write = original; console.error = oldError; }
@@ -1422,7 +1487,7 @@ test('CLI apply accepts injected clock and checkout, emits one JSON result and c
   expect(JSON.parse(output[0]!)).toMatchObject({ ok: true, status: 'due', stamps: [{ outcome: 'ok' }] });
   expect(JSON.parse(output[1]!)).toMatchObject({ ok: true, status: 'not-yet' });
   expect(h.calls).toEqual([schedule.version]);
-  expect(selections).toEqual([{ shards: 12, remote: 'node-c' }]);
+  expect(selections).toEqual([{ shards: LIGHT_RC_DEFAULT_SHARDS, remote: 'aws1', rehearsalCloudHost: true }]);
   expect(stamp(root, 'rc-7h').sha).toBe('1234567890abcdef');
 });
 

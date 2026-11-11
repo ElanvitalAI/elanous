@@ -646,6 +646,71 @@ describe('runAndroidUnitTestGate', () => {
     expect(code).toBe(1);
     expect(c.err.join('\n')).toContain('없어서 통과');
   });
+
+  test('가짜 Gradle 출력 장치 — JUnit 산출 전 테스트 태스크 실패를 0건으로 숨기지 않고 원인을 남긴다', () => {
+    const c = capture();
+    const fakeGradleOutput = [
+      '> Task :app:testDebugUnitTest FAILED',
+      'FAILURE: Build failed with an exception.',
+      '* What went wrong:',
+      "Could not resolve all files for configuration ':app:testDebugUnitTestRuntimeClasspath'.",
+      `Could not resolve api_key = "longsecret${'x'.repeat(600)}" for the test runtime classpath.`,
+      "Execution failed for task ':app:testDebugUnitTest'.",
+      '> There were failing tests. See the report at: file:///tmp/android-test-results/index.html',
+    ].join('\n');
+    const code = runAndroidUnitTestGate({
+      args: [], cwd: rootWithGradlew(), log: c.log, error: c.error,
+      // Fake Gradle runner intentionally produces no JUnit file, as when it
+      // aborts before report generation. Keep the real default file collector.
+      runGradle: () => ({ status: 1, output: fakeGradleOutput }),
+    });
+    const diagnostic = c.err.join('\n');
+    expect(code).toBe(1);
+    expect(diagnostic).toContain('JUnit testcase 가 없어서');
+    expect(diagnostic).toContain(':app:testDebugUnitTest FAILED');
+    expect(diagnostic).toContain('Could not resolve all files for configuration');
+    expect(diagnostic).not.toContain('longsecret');
+    expect(diagnostic).toContain('There were failing tests');
+  });
+
+  test('가짜 Gradle 출력 장치 — 여러 실패와 긴 출력에서도 앞·뒤 원인을 제한된 줄로 보존한다', () => {
+    const c = capture();
+    const fakeGradleOutput = [
+      '> Task :app:testDebugUnitTest FAILED',
+      'FAILURE: Build failed with an exception.',
+      '> Task :app:testReleaseUnitTest FAILED',
+      ...Array.from({ length: 20 }, (_, index) => `Execution failed for task ':app:variant${index}'.`),
+      '> There were failing tests. See the report at: file:///tmp/android-test-results/index.html',
+    ].join('\n');
+    const code = runAndroidUnitTestGate({
+      args: [], cwd: rootWithGradlew(), log: c.log, error: c.error,
+      runGradle: () => ({ status: 1, output: fakeGradleOutput }),
+    });
+    const diagnostic = c.err.join('\n');
+    expect(code).toBe(1);
+    expect(diagnostic).toContain(':app:testDebugUnitTest FAILED');
+    expect(diagnostic).toContain(':app:testReleaseUnitTest FAILED');
+    expect(diagnostic).toContain('Gradle failure diagnostics omitted');
+    expect(diagnostic).toContain('There were failing tests');
+    expect(diagnostic.split('\n')).toHaveLength(14);
+  });
+
+  test('JUnit 0 컴파일 오류는 비밀을 가리고 최대 10줄만 출력한다', () => {
+    const c = capture();
+    const fakeGradleOutput = Array.from({ length: 20 }, (_, index) =>
+      `\u001b[31me: Secret.kt:${index + 1}:1 api_key = "supersecretvalue12345"\u001b[0m`,
+    ).join('\n');
+    const code = runAndroidUnitTestGate({
+      args: [], cwd: rootWithGradlew(), log: c.log, error: c.error,
+      runGradle: () => ({ status: 1, output: fakeGradleOutput }),
+    });
+    const diagnostic = c.err.join('\n');
+    expect(code).toBe(1);
+    expect(diagnostic).toContain('컴파일 오류 20줄 (앞 10줄)');
+    expect(diagnostic).toContain('api_key = ***');
+    expect(diagnostic).not.toContain('supersecretvalue12345');
+    expect(diagnostic.match(/Secret\.kt:/g)).toHaveLength(10);
+  });
 });
 
 describe('parseChangedFiles — 형제 게이트와 «같은 관례»', () => {

@@ -1,0 +1,27 @@
+{
+  "id": "graph-v2-lowering",
+  "name": "Graph v2 lowering and extension preservation",
+  "implementation": [
+    "src/graph-v2/lower.ts"
+  ],
+  "tests": [
+    "src/ux-sim/graph-v2-lower-sim.test.ts"
+  ],
+  "target": "Lower graph v2 declarations into the existing runGraph IR while preserving extension data and closing invalid declarations",
+  "inputs": [
+    "graph v2 YAML declaration",
+    "extension fields",
+    "valid and invalid declarations"
+  ],
+  "observations": [
+    "lowered runGraph nodes",
+    "preserved extension fields",
+    "closed rejection of invalid declarations"
+  ],
+  "eventNames": [],
+  "entryCommands": [
+    "bun test src/ux-sim/graph-v2-lower-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "recentUse": null
+}

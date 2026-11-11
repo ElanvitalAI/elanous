@@ -46,6 +46,8 @@ export type DaemonTriggerVariant = 'schedule' | 'webhook' | 'discord' | 'telegra
 export interface WorkflowRuntimeDaemonOpts {
   /** Workflows to subscribe. Typically `discoverWorkflows()`. */
   workflows: WorkflowEntry[];
+  /** Installed graph plugin assets registered with the daemon webhook router. */
+  graphFiles?: readonly string[];
   /** WorkflowDeps to pass to `runWorkflowToCompletion` on each emit. */
   deps: WorkflowDeps;
   /** Inject for tests. Defaults to `runWorkflowToCompletion`. */
@@ -111,6 +113,8 @@ export interface WorkflowRuntimeDaemon {
   /** Dispatch an inbound HTTP request through the webhook router. Used
    *  by `src/nexus/api/http-server.ts` to bridge `/v1/workflows/webhooks/*`. */
   dispatchWebhook(req: WebhookRouterRequest): Promise<WebhookRouterResponse | null>;
+  /** NEXUS may defer to this exact authenticated graph webhook route's own credential check. */
+  isSelfVerifiedGraphWebhookRoute(method: string, path: string): boolean;
   /** Dispatch a normalized Discord event (message · mention · reaction)
    *  through subscribed Discord trigger nodes. Used by the AXON
    *  Discord bridge follow-up that taps `src/discord.ts` MESSAGE_CREATE
@@ -263,6 +267,10 @@ export function createWorkflowRuntimeDaemon(
   return {
     async start() {
       if (started) return;
+      for (const file of opts.graphFiles ?? []) webhookSource.subscribeGraph(file, async request => {
+        const { handlePluginGraphWebhook } = await import('../graph-runner/plugin-graph-entry.js');
+        return handlePluginGraphWebhook(file, request);
+      });
       for (const entry of entries) {
         scheduleSource.subscribe(entry, emit);
         webhookSource.subscribe(entry, emit);
@@ -345,6 +353,9 @@ export function createWorkflowRuntimeDaemon(
     },
     async dispatchWebhook(req) {
       return await webhookSource.dispatch(req);
+    },
+    isSelfVerifiedGraphWebhookRoute(method, path) {
+      return started && webhookSource.isSelfVerifiedGraphRoute(method, path);
     },
     async dispatchDiscord(event) {
       return await discordSource.dispatch(event);

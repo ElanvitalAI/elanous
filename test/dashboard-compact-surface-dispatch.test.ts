@@ -14,7 +14,6 @@ function mkDeps() {
         return pane !== 'log';
       },
       focusPane: (pane: string) => { events.push(`focus:${pane}`); },
-      openBrowserPreviewModal: () => { events.push('browser-preview'); },
       openDashboardPaneModal: (pane: string) => { events.push(`pane:${pane}`); },
       openCompanionPopup: (key: 'clipboard' | 'memo' | 'detail') => { events.push(`companion:${key}`); },
       onWarning: (message: string) => { warnings.push(message); },
@@ -39,8 +38,7 @@ describe('dispatchDashboardSurfaceCatalogAction', () => {
     const h = mkDeps();
     dispatchDashboardSurfaceCatalogAction('pane:obsidian', h.deps);
     dispatchDashboardSurfaceCatalogAction('companion:memo', h.deps);
-    dispatchDashboardSurfaceCatalogAction('pane:browser-preview', h.deps);
-    expect(h.events).toEqual(['pane:obsidian', 'companion:memo', 'browser-preview']);
+    expect(h.events).toEqual(['pane:obsidian', 'companion:memo']);
   });
 
   test('routes virtual window actions and vw companion actions', () => {

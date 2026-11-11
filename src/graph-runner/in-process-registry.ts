@@ -5,10 +5,16 @@ export interface InProcessHandlerContext {
   readonly graphId: string;
   readonly runId: string;
   readonly nodeId: string;
+  /** Contract identifiers lowered from graph-v2 node requires. */
+  readonly requires?: `${string}.${string}@${number}`;
   readonly input: unknown;
+  /** Original run input retained when `input` is narrowed to a capability request. */
+  readonly graphInput?: unknown;
   /** Optional node-scoped payload used by dynamically appended repair steps. */
   readonly nodeInput?: unknown;
   readonly outputs: Readonly<Record<string, unknown>>;
+  /** Providers may stop work when a contract execution deadline is reached. */
+  readonly signal?: AbortSignal;
   /** A code node may publish only the event kinds declared in its YAML `emits` allowlist. */
   readonly emitEvent?: (type: string, data?: Readonly<Record<string, unknown>>) => Promise<GraphEvent>;
 }
@@ -17,6 +23,8 @@ export interface InProcessHandlerResult {
   readonly ok: boolean;
   /** Named edge outcome from the graph's declared map. */
   readonly outcome: string;
+  /** Data passed to downstream `result.*` references; evidence remains audit metadata. */
+  readonly result?: unknown;
   readonly evidence?: Readonly<Record<string, unknown>>;
   readonly error?: string;
 }

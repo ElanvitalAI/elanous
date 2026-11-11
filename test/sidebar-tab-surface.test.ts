@@ -180,14 +180,6 @@ describe('SidebarTabSurface', () => {
     expect(seen).toEqual(['2->1:hist']);
   });
 
-  test('playground catalog includes sidebar tab surface sample', async () => {
-    const { getCatalog, resetCatalogForTest } = await import('../src/playground/catalog.js');
-    resetCatalogForTest();
-    const catalog = getCatalog();
-    const entry = catalog.find((item) => item.id === 'ux.sidebar-tab-surface');
-    expect(entry?.title).toBe('SidebarTabSurface');
-  });
-
   test('uses compact title and footer hints on narrow widths', () => {
     const surface = new SidebarTabSurface({
       title: 'ACP Channels',

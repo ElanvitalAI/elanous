@@ -46,26 +46,6 @@ export interface DashboardGlobalKeyRegistration {
   when?: () => boolean;
 }
 
-export interface RegisterDashboardGlobalKeysDeps {
-  enableSupplementalGlobalKeys: boolean;
-  register: (binding: DashboardGlobalKeyRegistration) => void;
-  openSurfaceCatalog: () => void;
-  surfaceCatalogWhen?: () => boolean;
-}
-
-/** Registers optional dashboard controls. */
-export function registerDashboardGlobalKeys(deps: RegisterDashboardGlobalKeysDeps): void {
-  if (deps.enableSupplementalGlobalKeys) {
-    deps.register({
-      id: 'dashboard:open-surface-catalog',
-      key: 'C-g',
-      scope: 'global',
-      handler: deps.openSurfaceCatalog,
-      when: deps.surfaceCatalogWhen,
-    });
-  }
-}
-
 export type ForkableSessionTurn = {
   role: 'user' | 'assistant' | 'system';
   content: string;
@@ -204,6 +184,7 @@ import { PreviewTerminal } from '../preview/terminal.js';
 import { startThinking, startPinnedThinking, type ThinkingHandle } from '../thinking-line.js';
 import { goalLoopIterationThinking } from './goal-loop-thinking.js';
 import { debug, getAmbientSessionId } from '../debug/log.js';
+import { rememberExplicitTuiUserFact } from '../tui/persistent-user-memory.js';
 import { startEventLoopStallMonitor, thinkingVerbFromFooter } from './event-loop-stall-monitor.js';
 import { createInputLagProbe, noteInputLagPaint, setInputLagProbe } from '../tui/input-lag-probe.js';
 import { getPushcutClient } from '../pushcut/client.js';
@@ -550,22 +531,42 @@ export function activeEscDelegatedPty(
 
 export interface EscAbortToolState {
   activeToolNamesByCallId: Map<string, string>;
+  activeToolStartedAtMsByCallId: Map<string, number>;
 }
 
 export function createEscAbortToolState(): EscAbortToolState {
-  return { activeToolNamesByCallId: new Map() };
+  return { activeToolNamesByCallId: new Map(), activeToolStartedAtMsByCallId: new Map() };
 }
 
-export function trackEscAbortToolCall(toolState: EscAbortToolState, call: Pick<DashboardTurnStreamCall, 'id' | 'name'>): void {
+export function trackEscAbortToolCall(
+  toolState: EscAbortToolState,
+  call: Pick<DashboardTurnStreamCall, 'id' | 'name'>,
+  startedAtMs = performance.now(),
+): void {
   toolState.activeToolNamesByCallId.set(call.id, call.name);
+  toolState.activeToolStartedAtMsByCallId.set(call.id, startedAtMs);
 }
 
 export function settleEscAbortToolCall(toolState: EscAbortToolState, call: Pick<DashboardTurnStreamCall, 'id'>): void {
   toolState.activeToolNamesByCallId.delete(call.id);
+  toolState.activeToolStartedAtMsByCallId.delete(call.id);
 }
 
 export function clearEscAbortToolState(toolState: EscAbortToolState): void {
   toolState.activeToolNamesByCallId.clear();
+  toolState.activeToolStartedAtMsByCallId.clear();
+}
+
+export function hasActiveEscShell(toolState: EscAbortToolState): boolean {
+  return [...toolState.activeToolNamesByCallId.values()].some((toolName) => toolName === 'Bash' || toolName === 'RunShell');
+}
+
+export function hasLongRunningEscShell(toolState: EscAbortToolState, nowMs = performance.now()): boolean {
+  return [...toolState.activeToolNamesByCallId]
+    .some(([callId, toolName]) => {
+      const startedAtMs = toolState.activeToolStartedAtMsByCallId.get(callId);
+      return startedAtMs !== undefined && requiresLongShellEscConfirmation(toolName, nowMs - startedAtMs);
+    });
 }
 
 export function activeEscHarnessSpace(
@@ -754,7 +755,7 @@ export function getEscAbortRunningCount(
     const dashboardToolRunning = [...toolState.activeToolNamesByCallId.values()]
       .filter((toolName) => (SELF_IMPLEMENT_TOOL_NAMES as readonly string[]).includes(toolName))
       .length;
-    return registeredRunning + dashboardToolRunning;
+    return registeredRunning + dashboardToolRunning + (hasLongRunningEscShell(toolState) ? 1 : 0);
   } catch {
     return Math.max(1, registeredRunning);
   }
@@ -806,7 +807,6 @@ import { createMouseModalSurfaceRuntime } from './input/mouse-modal-surface-runt
 import { createMouseModeSwitchRuntime } from './input/mouse-mode-switch-runtime.js';
 import { createMousePaneHitRuntime } from './input/mouse-pane-hit-runtime.js';
 import { createMousePickerRuntime } from './input/mouse-picker-runtime.js';
-import { createMouseShellRollupRuntime } from './input/mouse-shell-rollup-runtime.js';
 import { createDashboardPluginBaseRuntime } from './plugin-base-runtime.js';
 import { createDashboardPluginExecutionRuntime } from './plugin-execution-runtime.js';
 import { createDashboardPluginPaneRuntime } from './plugin-pane-runtime.js';
@@ -875,7 +875,6 @@ import {
 } from './clipboard-message-runtime.js';
 import { createDashboardCopyRuntime } from './copy-runtime.js';
 import { createDashboardMediaRuntime } from './media-runtime.js';
-import { openDashboardMediaPreviewInSurface } from './media-preview-surface-runtime.js';
 import { appendDashboardAssistantSampleOutput } from './assistant-sample-runtime.js';
 import { createDashboardChordFeedbackRuntime } from './chord-feedback-runtime.js';
 import { createDashboardContextMenuFeedbackRuntime } from './context-menu-feedback-runtime.js';
@@ -986,7 +985,6 @@ import type { SurfaceUx } from '../agent/surface-ux/types.js';
 import { getDefaultQuestionChannels, type QuestionChannel } from '../hitl/question.js';
 import { getDefaultCompactProvider, scheduleArchiveRetentionOnce } from '../compact/index.js';
 import { attachDashboardWorkingDirSelection } from './working-dir-selection-attachment.js';
-import { createBrowserHelpRuntime } from './browser-help-runtime.js';
 import { createBrowserChordRuntime } from './browser-chord-runtime.js';
 import { summarizeFileWithLLM } from './browser-llm-summary.js';
 import { resolveDashboardHostChromePolicy } from './host-chrome-policy.js';
@@ -1052,13 +1050,13 @@ import {
   type Attachment,
 } from '../context.js';
 import { loadAllAttachments } from '../extractors.js';
-import { grabClipboardImage, pruneOldPastes, isClipboardSupported, writeClipboard, writeClipboardDetailed } from '../clipboard/index.js';
+import { pruneOldPastes, isClipboardSupported, writeClipboard, writeClipboardDetailed } from '../clipboard/index.js';
+import { registerClipboardImageAttachment } from '../clipboard/image-attachment.js';
 import { startClipboardHistory, type ClipboardHistory } from '../clipboard/history.js';
 import { renderImagePreview } from '../image/preview.js';
 import { isKgpTerminal } from '../kgp/capabilities.js';
 import { renderImageKGP } from '../kgp/pipeline.js';
 import { _internal as previewRouterInternal } from '../preview/router.js';
-import { showPreviewModal } from './modals/preview.js';
 import { terminalModalRouter } from './input/terminal-modal-router.js';
 import {
   syncDashboardViewModeToContextKeys,
@@ -1080,10 +1078,6 @@ import {
   resolveDebugWorkbenchStatus,
   resolveDebugWindowStatus,
 } from './modals/debug-pane-chrome.js';
-import {
-  openBrowserPreviewModalHost,
-  resolveBrowserPreviewModalLiveMode,
-} from './modals/browser-preview-modal-seams.js';
 import { initDashboardTerminalSessions } from './terminal/session.js';
 import {
   initTerminalMatrix,
@@ -1113,6 +1107,7 @@ import {
 import {
   initDashboardApprovers,
   createInjectApprover,
+  createBashApprover,
   createConfigSetApprover,
   createAcpPermissionApprover,
   openGenericApproval,
@@ -1134,7 +1129,6 @@ import { createCompanionSurfaceHostRegistry } from './companion-surface-host-reg
 import { companionSurfaceId } from './companion-surface-address.js';
 import type { DashboardCompanionSurfaceKey } from './compact-surface-dispatch.js';
 import { createDashboardCompactSurfaceAssembly } from './compact-surface-assembly.js';
-import { openCompactSurfaceCatalogPopup } from './compact-surface-popup.js';
 import { approvalModalRouter, type ApprovalModalRouter } from '../approval-modal.js';
 import { routeApprovalModalKey } from './input/approval-key-router.js';
 
@@ -1155,7 +1149,6 @@ import {
   DASHBOARD_MAIN_WORKSPACE_ID,
 } from '../display/workspace-affinity.js';
 import { initDashboardHitl, stopDashboardHitl } from './runtime/hitl.js';
-import { openDashboardShellRollupPopup } from './shell-rollup-popup.js';
 import { spawnCodingAgent, CodingAgentBinaryMissing } from '../terminal/coding-agent.js';
 import type { TerminalSession } from '../terminal/session-registry.js';
 import { createSessionPickerModal } from '../session/picker-modal.js';
@@ -1169,7 +1162,6 @@ import { resolveEscEscRewind } from '../chat/esc-esc-rewind.js';
 import { wirePersistence } from '../terminal/session-persistence.js';
 import { renderMarkdown as renderMarkdownGlow } from '../markdown-preview.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'path';
-import { statSync } from 'fs';
 import {
   FIGURES, toolHeader, toolResult,
   renderMarkdown, successLine, errorLine, warningLine,
@@ -1217,7 +1209,7 @@ import {
   AGENT_ACTIVITY_SEGMENT_KEY,
   PULSE_HALF_PERIOD_MS,
 } from '../agent-activity-hud.js';
-import { DASHBOARD_CLARIFICATION_REQUEST, consumeStreamingTopModalEscape, createEscAbortGate, createEscAbortPendingGate, createHarnessEscHint, routeStreamingEscapeKey } from '../esc-abort-gate.js';
+import { DASHBOARD_CLARIFICATION_REQUEST, consumeStreamingTopModalEscape, createEscAbortGate, createEscAbortPendingGate, createHarnessEscHint, requiresLongShellEscConfirmation, routeStreamingEscapeKey } from '../esc-abort-gate.js';
 import { enqueueSoftStop, readSoftStopRequestStatus } from '../harness/control-inbox.js';
 import { setSelfImplementSoftStopSpaceObserver } from '../self-implement/soft-stop-observer.js';
 import { launchEditor, canLaunchEditor } from '../editor-launcher.js';
@@ -1283,24 +1275,7 @@ import {
   createPlaygroundCommandHandler,
   DEFAULT_SCENARIOS,
   getDefaultScenarioRegistry,
-  parseScenarioYaml,
-  runScenario,
-  serializeScenarioToYaml,
-  type Scenario,
 } from '../playground-scenario/index.js';
-import {
-  buildShowcaseEntries,
-  buildPresetOptionEntries,
-  buildScenarioLoadFeedback,
-  buildScenarioPaletteEntries,
-  buildScenarioRunFeedback,
-  buildScenarioSaveFeedback,
-  buildThemeOptionEntries,
-  resolveEditableScenarioSource,
-  type PlaygroundScenarioPaletteEntry,
-  type PlaygroundPresetOptionEntry,
-  type PlaygroundThemeOptionEntry,
-} from '../playground/lab.js';
 import { computeWorkingFocusSync } from '../display/working-focus-sync.js';
 import { dispatchPaneClick } from '../display/pane-click-dispatch.js';
 import { installResizeListener } from '../display/resize-listener.js';
@@ -1317,7 +1292,9 @@ import { buildDebugCallStack } from '../debug/call-stack.js';
 import { buildAstGrepHostTool } from '../skills/tools/ast-grep.js';
 import { buildLspHostTool } from '../skills/tools/lsp/index.js';
 import { BUILTIN_DIR, PluginHost } from '../plugins/core/host.js';
-import { createDashboardPluginRouteAdapter, type DashboardPluginRouteAdapter, type DashboardPluginRouteBridge } from './plugin-route-adapter.js';
+import { createDashboardPluginRouteAdapter, createDashboardTuiConfirmContext, createDashboardGraphRouteDispatcher, requestDashboardGraphConfirmation, resolveDashboardVerifiedOwner, type DashboardPluginRouteAdapter, type DashboardPluginRouteBridge } from './plugin-route-adapter.js';
+import type { GraphRunOptions } from '../graph-runner/runner.js';
+import { getActiveAcpAskPusher } from '../acp/server.js';
 
 /** Keep wake notifications immediate; display completed results only when a turn drains them. */
 export function subscribeDashboardAgentResults(
@@ -1361,13 +1338,25 @@ export function createDashboardPluginRouteBridge(options: {
   dispatchPlugin(name: string, args: Record<string, unknown>): Promise<
     { ok: true; result: unknown } | { ok: false; error: string }
   >;
+  dispatchAppDeploy?: Parameters<typeof createDashboardPluginRouteAdapter>[0]['dispatchAppDeploy'];
+  dispatchGraph?: Parameters<typeof createDashboardPluginRouteAdapter>[0]['dispatchGraph'];
+  requestConfirmation?: Parameters<typeof createDashboardPluginRouteAdapter>[0]['requestConfirmation'];
+  getTuiDispatchContext?: () => Partial<import('../tool-runtime/types.js').ToolRuntimeContext> | Promise<Partial<import('../tool-runtime/types.js').ToolRuntimeContext>>;
 }): DashboardPluginRouteBridge {
-  const adapter = createDashboardPluginRouteAdapter(options);
+  const adapter = createDashboardPluginRouteAdapter({
+    pluginRoot: options.pluginRoot,
+    dispatchCore: options.dispatchCore,
+    dispatchGraph: options.dispatchGraph,
+    requestConfirmation: options.requestConfirmation,
+    dispatchAppDeploy: options.dispatchAppDeploy,
+    getTuiDispatchContext: options.getTuiDispatchContext,
+  });
   return {
     classicHostTools: adapter.classicHostTools,
     nextHostTools: adapter.nextHostTools,
-    async dispatch(name, args, confirmed) {
-      return await adapter.dispatch(name, args, confirmed) ?? options.dispatchPlugin(name, args);
+    async dispatch(name, args, confirmed, context) {
+      const dispatchContext = { surface: 'tui' as const, ...await options.getTuiDispatchContext?.(), ...context };
+      return await adapter.dispatch(name, args, confirmed, dispatchContext) ?? options.dispatchPlugin(name, args);
     },
   };
 }
@@ -1377,7 +1366,7 @@ export function buildClassicDashboardTuiTurnTools(
   adapter: DashboardPluginRouteAdapter,
   options: Parameters<typeof buildSessionRuntimeToolSpecs>[0],
 ) {
-  return buildSessionRuntimeToolSpecs({ ...options, hostTools: adapter.classicHostTools(options.hostTools) });
+  return prioritizeDashboardTuiToolSearch(buildSessionRuntimeToolSpecs({ ...options, hostTools: adapter.classicHostTools(options.hostTools) }));
 }
 
 /** Tool-catalog assembly invoked by the production ACP-next chat-turn path. */
@@ -1385,9 +1374,10 @@ export function buildNextDashboardTuiTurnTools(
   adapter: DashboardPluginRouteAdapter,
   options: Parameters<typeof buildSessionRuntimeToolSpecs>[0],
 ) {
-  return buildSessionRuntimeToolSpecs({ ...options, hostTools: adapter.nextHostTools(options.hostTools) });
+  return prioritizeDashboardTuiToolSearch(buildSessionRuntimeToolSpecs({ ...options, hostTools: adapter.nextHostTools(options.hostTools) }));
 }
 import { registerDashboardPaneHostTools } from './panes/host-tools.js';
+import { dispatchClassicTuiTool, prioritizeDashboardTuiToolSearch } from './classic-tui-dispatch.js';
 import { type ThemeTokens } from '../theme/tokens.js';
 import { getActiveThemeName, resolveActiveTheme } from './render/theme-resolver.js';
 import { getTheme } from '../themes/index.js';
@@ -1501,8 +1491,6 @@ type Pane = 'input' | 'skills' | 'files' | 'preview' | 'log';
 import { SYNC_MODES, type SyncPane } from '../../plugins/sync/types.js';
 import { WidgetHost } from '../widgets/host.js';
 import { createPaneKeyRouter, dispatchKeyToWidget } from '../widget-routing/index.js';
-import playgroundWidget, { type PlaygroundWidgetState } from '../playground/widget.js';
-import { setWidgetHostForCatalog } from '../playground/catalog.js';
 import sessionsSidebarWidget from '../session/sidebar-widget.js';
 import type { SessionsSidebarState } from '../session/sidebar-widget.js';
 import { listSessionCards } from '../session/card.js';
@@ -1514,7 +1502,8 @@ import { globalDualRoleManager, setAcpHopCapResolver } from '../acp/dual-role-ma
 import { createDashboardExternalInputHost, stopTurnViaEscGate, updateDashboardExternalInputQueueNotice } from './input/external-input-host.js';
 import { registerTuiForceStopHandler } from '../capture/tui-self-report.js';
 import { createInlineAskUserQuestionResolver, resolveUnattendedInlineChoiceTimeoutMs, UNATTENDED_INLINE_CHOICE_TIMEOUT_MS } from '../ask-user-question/index.js';
-import { createInlineChoiceTurnEndCleanup, InlineChoiceBroker } from '../tui/inline-choice.js';
+import { createInlineChoiceTurnEndCleanup, InlineChoiceBroker, splitInlineChoiceComposerInput } from '../tui/inline-choice.js';
+import { fitLogLine } from '../tui/chat/log-view.js';
 import { registerExternalInputHost } from '../input/external-input-queue.js';
 // H3 #6 follow-up #3 — background sessions render as a distinct sidebar
 // kind with live state badge + tap-to-Join. Dashboard pulls BG records
@@ -1635,6 +1624,10 @@ export interface ShowDashboardOptions {
    *  effect in in-process mode (use TUI's `/session load` for that
    *  path). */
   resumeSessionId?: string;
+  /** Existing authenticated Nexus member session; absence leaves owner-scoped graph routes fail-closed. */
+  getNexusMemberSession?: () => { nexusUrl: string; sessionToken?: string } | undefined;
+  /** Test-world capability providers; production callers leave this unset. */
+  graphRunOptions?: GraphRunOptions;
 }
 
 // FileIndex cache keyed by absolute cwd. A single elanous session can
@@ -2546,7 +2539,7 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
     s.length <= max ? s : '\u2026' + s.slice(-(max - 1));
 
   /**
-   * Grab an image off the macOS clipboard, register it in the session
+   * Register an image from the macOS clipboard in the session
    * registry, and render a summary line. Shared between the `/paste` slash
    * command and the Ctrl+Shift+V chord on the input. Returns the token
    * string (e.g. `[Image #3] `) for the caller to splice into its buffer,
@@ -2558,20 +2551,13 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
       return null;
     }
     try {
-      const savedPath = await grabClipboardImage();
-      if (!savedPath) {
+      const registered = await registerClipboardImageAttachment(contextRegistry);
+      if (!registered) {
         pushDebugLine(C.warning('  No image on clipboard.'));
         pushDebugLine(C.muted('  Take a screenshot (Cmd+Shift+4, Ctrl held) to copy to clipboard.'));
         return null;
       }
-      const st = statSync(savedPath);
-      const { attachment: att, isNew } = ctxAddEx(contextRegistry, {
-        kind: 'image',
-        sourcePath: savedPath,
-        filename: basename(savedPath),
-        sizeBytes: st.size,
-        mtime: Math.floor(st.mtimeMs),
-      });
+      const { attachment: att, isNew } = registered;
       if (isNew) {
         pushDebugLine(C.muted(`  \u251c\u2500 `) + C.text(att.token) + ' ' + C.subtext(`${att.filename} (${fmtBytes(att.sizeBytes)})`));
       } else {
@@ -2581,7 +2567,7 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
       // The attachment summary confirms the paste without a scratch preview or modal.
       return `${att.token} `;
     } catch (err: any) {
-      // grabClipboardImage now throws with the osascript diagnostic
+      // The shared clipboard helper throws with the osascript diagnostic
       // ("no-image: tried …" / "write-error: …") — surface it so the
       // user can tell whether the clipboard truly has an image or
       // whether it's a format we couldn't coerce.
@@ -2670,9 +2656,18 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     }
     chatScrollOffset = -1;
   };
+  let inlineChoicePanelLines: readonly string[] = [];
+  let inlinePickerPanelLines: readonly string[] = [];
+  let inlineChoiceDraftPrefix: string | null = null;
   const inlineChoiceBroker = new InlineChoiceBroker({
+    onPromptStart: () => { inlineChoiceDraftPrefix = promptCtl.getBufferText?.() ?? ''; },
+    onPromptEnd: () => { inlineChoiceDraftPrefix = null; },
     appendLines: (lines) => {
       for (const line of lines) pushChatLine(C.info(line));
+      draw();
+    },
+    renderPanel: (lines) => {
+      inlineChoicePanelLines = lines;
       draw();
     },
   });
@@ -3959,8 +3954,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // in-place splice runtime so repeated update_plan calls REPLACE
   // the previous board instead of pushing duplicates that scroll
   // the chat off-screen. Empty plan → block removed (ephemeral).
-  // The companion `src/widgets/plan-board.ts` WidgetDef is the
-  // asset for follow-up sidebar/pane wiring.
   {
     const { createPlanBoardRuntime, wirePlanBoardRuntime } =
       await import('./plan-board-runtime.js');
@@ -4453,24 +4446,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   let browserPaneRegistry!: BrowserPaneRegistry;
   let previewPaneRegistry!: PreviewPaneRegistry;
 
-  // Browser-pane help (`~`) uses the transient modal primitive.
-  const browserHelpRuntime = createBrowserHelpRuntime({
-    termSize,
-    keyLabel: (key, desc) => `  ${C.key(pad(key, 14))} ${C.text(desc)}`,
-    sectionLabel: (title) => C.bold(title),
-    muted: (text) => C.muted(text),
-    showHelpModal: ({ title, lines, termCols, termRows, ttlMs, group }) => {
-      showTransientTerminalModal({
-        title,
-        lines,
-        coordinator: display,
-        termCols,
-        termRows,
-        ttlMs,
-        group,
-      });
-    },
-  });
   // Refresh context runtime deps after the dashboard session registry is ready.
   try {
     const { setContextRuntimeDeps } = await import('../tool-runtime/index.js');
@@ -4486,27 +4461,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     });
   } catch { /* non-fatal */ }
 
-  // TR-P3: capture a pane's currently-rendered output so it can be
-  // popped as a transient modal body. Best-effort — unknown panes
-  // yield a placeholder so the modal still opens.
-  const captureDeferredPane = (pane: PaneFocus): string => {
-    switch (pane) {
-      case 'log':
-        return chatLines.slice(-200).join('\n');
-      case 'scratch':
-        return scratchLines.length > 0 ? scratchLines.join('\n') : '(scratch empty)';
-      case 'preview':
-        return dockedPreview.previewLines.length > 0
-          ? dockedPreview.previewLines.join('\n')
-          : '(preview empty)';
-      case 'obsidian':
-        return obsidianDir.entries.slice(0, 50).map(e => (e.isDir ? '📁 ' : '  ') + e.name).join('\n');
-      case 'browser':
-        return workingDir.entries.slice(0, 50).map(e => (e.isDir ? '📁 ' : '  ') + e.name).join('\n');
-      default:
-        return `[${pane}] — pane modal capture not wired for this kind yet`;
-    }
-  };
   let pluginHost: PluginHost;
   let pluginRouteAdapter: DashboardPluginRouteBridge;
   let lastThemeLoadError = '';
@@ -5735,11 +5689,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     immediateDeps: {
       getStatusLines: getDashboardStatusLines,
       openPaneModal: (pane) => openDashboardPaneModal(pane),
-      openBrowserPreviewModal: () => openBrowserPreviewModal(),
-      openSurfaceCatalog: () => {
-        openSurfaceCatalogPopup();
-        return true;
-      },
       openSurfaceInVw: () => false,
       openCompanionSurface: (surface, target) => {
         if (target === 'vw') return false;
@@ -6026,16 +5975,22 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       requestRedraw: () => draw(),
       getTheme: () => currentThemeTokens(),
       getWaitingTargetNames: () => getEscAbortWaitingToolNames(escAbortToolState),
-      shouldAbortImmediately: () => activeHarnessSpace() !== null || getDelegatedPty() !== null || getDelegatedShell() !== null,
-      forceStopWithoutModal: () => resolveTuiUnattended(getUserConfig()),
+      shouldAbortImmediately: () => !hasLongRunningEscShell(escAbortToolState)
+        && (activeHarnessSpace() !== null || getDelegatedPty() !== null
+          || hasActiveEscShell(escAbortToolState) || getDelegatedShell() !== null),
+      forceStopWithoutModal: () => hasLongRunningEscShell(escAbortToolState)
+        || (!hasActiveEscShell(escAbortToolState) && resolveTuiUnattended(getUserConfig())),
+      onInlineConfirmed: () => hasLongRunningEscShell(escAbortToolState) && getDelegatedShell() !== null ? 'turn-only' : undefined,
       confirmStopInline: async () => {
+        const confirmingLongShell = hasLongRunningEscShell(escAbortToolState);
         const result = await inlineChoiceBroker.ask({
           id: `stop-turn:${Date.now().toString(36)}`,
-          question: '도는 작업과 하위 에이전트를 함께 중단할까요?',
+          question: confirmingLongShell ? '오래 실행 중인 셸 명령을 중단할까요?' : '도는 작업과 하위 에이전트를 함께 중단할까요?',
           options: [
-            { value: 'stop', label: '중단', description: '현재 턴과 자식 작업을 종료합니다.' },
+            { value: 'stop', label: '중단', description: confirmingLongShell ? '현재 Bash/RunShell 명령을 끝냅니다.' : '현재 턴과 자식 작업을 종료합니다.' },
             { value: 'continue', label: '계속', description: '현재 작업을 계속 실행합니다.' },
           ],
+          yesNo: true,
           includeOther: false,
           timeoutMs: UNATTENDED_INLINE_CHOICE_TIMEOUT_MS,
         });
@@ -6328,6 +6283,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               key: k.name, ctrl: !!k.ctrl, alt: !!k.alt, kind: k.kind ?? null,
             });
           } catch { /* fail-soft */ }
+          // A high-risk plugin route can be suspended on its yes/no approval
+          // while this stream remains active. Let y/n answer that gate before
+          // typeahead captures the same character for a later turn.
+          if (inlineChoiceBroker.handleStreamingKey(k)) return 'consumed';
           // ── C-d-3' · 턴 중 타이핑 보존 (essential 전용 · CC/codex 동형) ──
           // printable/backspace/enter 를 typeahead 버퍼가 소유 + 즉시 에코.
           // j/k/f 등 문자키는 streaming 입력으로 보존하고 스크롤은 PgUp/방향키/휠이 담당한다.
@@ -7321,9 +7280,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       case 'debug-detail': return 'wd-debug-detail';
       case 'debug-stack': return 'wd-debug-stack';
       case 'debug-prompts': return 'wd-debug-prompts';
-      // VP1 — Widget Playground surface. Placeholder markdown widget
-      // until VP2 ships the real playground widget implementation.
-      case 'playground': return 'wd-playground';
       case 'sessions-sidebar': return 'wd-sessions-sidebar';
     }
     return null;
@@ -7462,7 +7418,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       'skill-browser', 'skill-file',
       'agent-roster', 'agent-detail', 'agent-log',
       'debug-events', 'debug-detail', 'debug-stack', 'debug-prompts',
-      'playground', 'sessions-sidebar',
+      'sessions-sidebar',
     ];
     for (const p of STATIC_PANES) {
       if (surfaceIdForWorkingFocus(p, workingDir.view) === wid) return p;
@@ -7950,25 +7906,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   widgetHost.spawn({ type: 'markdown', id: 'wd-debug-detail', character: 'Debug Detail', config: { text: '' } });
   widgetHost.spawn({ type: 'markdown', id: 'wd-debug-stack', character: 'Debug Stack', config: { text: '' } });
   widgetHost.spawn({ type: 'markdown', id: 'wd-debug-prompts', character: 'Prompt Bank', config: { text: '' } });
-  // VP2 — Widget Playground.
-  //
-  // The 'playground' WidgetDef is defined inline in src/ so it stays
-  // inside the TS rootDir (the plugin-style widgets/<name>/widget.ts
-  // files are cross-boundary and counted in the TS rootDir baseline).
-  // We register() before spawn() so the playground type is known when
-  // V7 binds `wd-playground` to it.
-  widgetHost.register(playgroundWidget, 'builtin', 'src/playground-widget.ts');
-  // VP6 — hand the widget-host to the playground catalog so the
-  // built-in widget group can enumerate defs without crossing the TS
-  // rootDir with direct `../widgets/*` imports. Safe to call every
-  // boot; subsequent calls just invalidate the cached catalog.
-  setWidgetHostForCatalog(widgetHost);
-  widgetHost.spawn({
-    type: 'playground',
-    id: 'wd-playground',
-    character: 'Widget Playground',
-    config: { initialSize: 'medium' },
-  });
   // ST3 — Sessions sidebar (leadColumn-ready). Register explicitly in
   // addition to discover() so the widget is guaranteed present even
   // before the first disk scan resolves; discover() replaces it with
@@ -7980,14 +7917,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     character: 'Sessions',
     config: { cards: [] },
   });
-  // Wave P3a (presentation) · A4-1 — plan-board widget asset.
-  // Registered (not spawned) so future waves can drop the widget
-  // into a sidebar tab / pane surface without re-defining it. The
-  // immediate user-visible plan board comes from the chatLines
-  // splice runtime (createPlanBoardRuntime, see WF2 site above).
+  // KAIST · operator-only mini board. The TUI renders the shared TaskCard
+  // projection; its host supplies journal events and owns the refresh cadence.
   {
-    const { default: planBoardWidget } = await import('../widgets/plan-board.js');
-    widgetHost.register(planBoardWidget, 'builtin', 'src/widgets/plan-board.ts');
+    const { default: miniBoardWidget } = await import('../widgets/mini-board.js');
+    widgetHost.register(miniBoardWidget, 'builtin', 'src/widgets/mini-board.ts');
   }
   // NT4 — notification bell modal widget. Registered + spawned here
   // so Ctrl+X b (NT5) can toggle without spawn latency. The bellOpen
@@ -8318,330 +8252,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     }));
   };
   dispatchDashboardSubmitText = dispatchSidebarSubmit;
-  let browserContextMenuCursorResolver: (() => number | null) | null = null;
-  let browserPreviewModalCloseRequest: (() => void) | null = null;
-  // VP5 — observed playground reload timestamp. Per-redraw we poll
-  // the wd-playground state; if its `reloadRequestedAt` advances past
-  // this value the dashboard re-discovers widgets + re-registers the
-  // inline playground type (discover() clears the registry so the
-  // inline def needs to be re-added).
-  let lastPlaygroundReloadAt = 0;
-  let playgroundReloadInFlight = false;
-  let lastPlaygroundLabPaletteKey = '';
-  let lastPlaygroundThemeKey = '';
-  let lastPlaygroundPresetKey = '';
-  let lastPlaygroundShowcaseKey = '';
-  let lastPlaygroundRunAt = 0;
-  let lastPlaygroundSaveAt = 0;
-  let lastPlaygroundLoadAt = 0;
-  let lastPlaygroundShowcaseLaunchAt = 0;
-  let playgroundRunInFlight = false;
   const ensureDefaultPlaygroundScenarioRegistry = () => {
     const reg = getDefaultScenarioRegistry();
     if (reg.list().length === 0) reg.registerAll(DEFAULT_SCENARIOS);
     return reg;
-  };
-  const currentPlaygroundPalette = (): PlaygroundScenarioPaletteEntry[] =>
-    buildScenarioPaletteEntries(ensureDefaultPlaygroundScenarioRegistry().list());
-  const currentPlaygroundThemes = (): PlaygroundThemeOptionEntry[] =>
-    buildThemeOptionEntries();
-  const currentPlaygroundPresets = (): PlaygroundPresetOptionEntry[] =>
-    buildPresetOptionEntries();
-  const currentPlaygroundShowcases = () =>
-    buildShowcaseEntries();
-  const replayPlaygroundState = (patch: (state: PlaygroundWidgetState) => PlaygroundWidgetState): boolean => {
-    const inst = widgetHost.get('wd-playground') as { state?: PlaygroundWidgetState } | null;
-    if (!inst?.state) return false;
-    widgetHost.replayState('wd-playground', patch(inst.state));
-    return true;
-  };
-  const maybeTriggerPlaygroundReload = (): void => {
-    const inst = widgetHost.get('wd-playground');
-    if (!inst) return;
-    const ts = (inst.state as { reloadRequestedAt?: number } | null)?.reloadRequestedAt ?? 0;
-    if (ts <= lastPlaygroundReloadAt) return;
-    if (playgroundReloadInFlight) return;
-    lastPlaygroundReloadAt = ts;
-    playgroundReloadInFlight = true;
-    statusFeedbackRuntime.onWidgetHostReloadStarted();
-    void widgetHost.discover()
-      .then(() => widgetHost.register(playgroundWidget, 'builtin', 'src/playground-widget.ts'))
-      .then(() => { setWidgetHostForCatalog(widgetHost); })
-      .then(() => statusFeedbackRuntime.onWidgetHostReloadCompleted())
-      .catch((err) => {
-        const m = err instanceof Error ? err.message : String(err);
-        statusFeedbackRuntime.onWidgetHostReloadFailed(m);
-      })
-      .finally(() => { playgroundReloadInFlight = false; draw(); });
-  };
-  const openPlaygroundScenarioEditor = (scenario: Scenario): boolean => {
-    const view = findDashboardView(viewRegistry, 'playground');
-    if (view) setActiveDashboardView(view);
-    const inst = widgetHost.get('wd-playground') as { state?: PlaygroundWidgetState } | null;
-    if (!inst?.state) return false;
-    const prevState = inst.state;
-    const source = serializeScenarioToYaml(scenario);
-    const palette = currentPlaygroundPalette();
-    const themes = currentPlaygroundThemes();
-    const presets = currentPlaygroundPresets();
-    const showcases = currentPlaygroundShowcases();
-    const prevPresetId = prevState.presetOptions[prevState.presetCursor]?.id;
-    const prevShowcaseId = prevState.showcaseOptions[prevState.showcaseCursor]?.id;
-    const nextState: PlaygroundWidgetState = {
-      ...prevState,
-      mode: 'edit',
-      editSource: source,
-      editCursor: 0,
-      editScrollTop: 0,
-      editResult: parseScenarioYaml(source),
-      editScenarioId: scenario.id,
-      scenarioPalette: palette,
-      scenarioPaletteCursor: Math.max(0, palette.findIndex((entry) => entry.id === scenario.id)),
-      themeOptions: themes,
-      themeCursor: Math.max(0, themes.findIndex((entry) => entry.name === currentThemeTokens().name)),
-      presetOptions: presets,
-      presetCursor: Math.max(0, prevPresetId
-        ? presets.findIndex((entry) => entry.id === prevPresetId)
-        : 0),
-      showcaseOptions: showcases,
-      showcaseCursor: Math.max(0, prevShowcaseId
-        ? showcases.findIndex((entry) => entry.id === prevShowcaseId)
-        : 0),
-      activeShowcasePluginId: pluginHost.active()?.name ?? undefined,
-    };
-    widgetHost.replayState('wd-playground', nextState);
-    draw();
-    return true;
-  };
-  const maybeSyncPlaygroundLabPalette = (): void => {
-    const inst = widgetHost.get('wd-playground') as { state?: PlaygroundWidgetState } | null;
-    if (!inst?.state) return;
-    const palette = currentPlaygroundPalette();
-    const paletteKey = palette.map((entry) => `${entry.id}:${entry.stepCount}`).join('|');
-    if (paletteKey === lastPlaygroundLabPaletteKey && inst.state.scenarioPalette.length === palette.length) return;
-    lastPlaygroundLabPaletteKey = paletteKey;
-    const preferredCursorId = inst.state.scenarioPalette[inst.state.scenarioPaletteCursor]?.id
-      ?? inst.state.editScenarioId
-      ?? palette[0]?.id
-      ?? null;
-    const nextCursor = preferredCursorId
-      ? Math.max(0, palette.findIndex((entry) => entry.id === preferredCursorId))
-      : 0;
-    widgetHost.replayState('wd-playground', {
-      ...inst.state,
-      scenarioPalette: palette,
-      scenarioPaletteCursor: nextCursor,
-    });
-  };
-  const maybeSyncPlaygroundVisualConsole = (): void => {
-    const inst = widgetHost.get('wd-playground') as { state?: PlaygroundWidgetState } | null;
-    if (!inst?.state) return;
-    const themes = currentPlaygroundThemes();
-    const presets = currentPlaygroundPresets();
-    const showcases = currentPlaygroundShowcases();
-    const themeKey = themes.map((entry) => entry.name).join('|');
-    const presetKey = presets.map((entry) => entry.id).join('|');
-    const showcaseKey = showcases.map((entry) => entry.id).join('|');
-    if (
-      themeKey === lastPlaygroundThemeKey &&
-      presetKey === lastPlaygroundPresetKey &&
-      showcaseKey === lastPlaygroundShowcaseKey &&
-      inst.state.themeOptions.length === themes.length &&
-      inst.state.presetOptions.length === presets.length &&
-      inst.state.showcaseOptions.length === showcases.length &&
-      inst.state.activeShowcasePluginId === (pluginHost.active()?.name ?? undefined)
-    ) {
-      return;
-    }
-    lastPlaygroundThemeKey = themeKey;
-    lastPlaygroundPresetKey = presetKey;
-    lastPlaygroundShowcaseKey = showcaseKey;
-    const activeThemeName = currentThemeTokens().name;
-    const preferredThemeName = inst.state.themeOptions[inst.state.themeCursor]?.name ?? activeThemeName;
-    const preferredPresetId = inst.state.presetOptions[inst.state.presetCursor]?.id ?? presets[0]?.id ?? null;
-    const preferredShowcaseId = inst.state.showcaseOptions[inst.state.showcaseCursor]?.id ?? showcases[0]?.id ?? null;
-    widgetHost.replayState('wd-playground', {
-      ...inst.state,
-      themeOptions: themes,
-      themeCursor: Math.max(0, themes.findIndex((entry) => entry.name === preferredThemeName || entry.name === activeThemeName)),
-      presetOptions: presets,
-      presetCursor: preferredPresetId
-        ? Math.max(0, presets.findIndex((entry) => entry.id === preferredPresetId))
-        : 0,
-      showcaseOptions: showcases,
-      showcaseCursor: preferredShowcaseId
-        ? Math.max(0, showcases.findIndex((entry) => entry.id === preferredShowcaseId))
-        : 0,
-      activeShowcasePluginId: pluginHost.active()?.name ?? undefined,
-    });
-  };
-  const maybeApplyPlaygroundThemeSelection = (): void => {
-    const inst = widgetHost.get('wd-playground') as { state?: PlaygroundWidgetState } | null;
-    const state = inst?.state;
-    if (!state || state.mode !== 'edit') return;
-    const desiredTheme = state.themeOptions[state.themeCursor]?.name;
-    if (!desiredTheme || desiredTheme === currentThemeTokens().name) return;
-    const cfg = getUserConfig();
-    cfg.dashboard.theme = { ...(cfg.dashboard.theme as object ?? {}), active: desiredTheme } as never;
-    saveUserConfig(cfg);
-    replayPlaygroundState((prev) => ({
-      ...prev,
-      labFeedback: {
-        level: 'info',
-        title: 'Theme applied',
-        at: Date.now(),
-        lines: [`dashboard theme switched to ${desiredTheme}`],
-      },
-    }));
-    draw();
-  };
-  const maybeHandlePlaygroundLabActions = (): void => {
-    const inst = widgetHost.get('wd-playground') as { state?: PlaygroundWidgetState } | null;
-    const state = inst?.state;
-    if (!state || state.mode !== 'edit') return;
-    const reg = ensureDefaultPlaygroundScenarioRegistry();
-    if ((state.launchShowcaseRequestedAt ?? 0) > lastPlaygroundShowcaseLaunchAt) {
-      lastPlaygroundShowcaseLaunchAt = state.launchShowcaseRequestedAt ?? 0;
-      const showcase = state.showcaseOptions[state.showcaseCursor];
-      if (!showcase) {
-        replayPlaygroundState((prev) => ({
-          ...prev,
-          labFeedback: {
-            level: 'error',
-            title: 'Launch blocked',
-            at: Date.now(),
-            lines: ['no showcase lane is selected'],
-          },
-        }));
-      } else {
-        void pluginHost.activate(showcase.pluginId)
-          .then(() => {
-            replayPlaygroundState((prev) => ({
-              ...prev,
-              activeShowcasePluginId: showcase.pluginId,
-              labFeedback: {
-                level: 'success',
-                title: 'Showcase launched',
-                at: Date.now(),
-                lines: [`${showcase.label} opened via plugin ${showcase.pluginId}`],
-              },
-            }));
-            draw();
-          })
-          .catch((err) => {
-            const message = err instanceof Error ? err.message : String(err);
-            replayPlaygroundState((prev) => ({
-              ...prev,
-              labFeedback: {
-                level: 'error',
-                title: 'Showcase launch failed',
-                at: Date.now(),
-                lines: [message],
-              },
-            }));
-            draw();
-          });
-      }
-    }
-    if ((state.loadRequestedAt ?? 0) > lastPlaygroundLoadAt) {
-      lastPlaygroundLoadAt = state.loadRequestedAt ?? 0;
-      const entry = state.scenarioPalette[state.scenarioPaletteCursor];
-      if (!entry) {
-        replayPlaygroundState((prev) => ({
-          ...prev,
-          labFeedback: {
-            level: 'error',
-            title: 'Load blocked',
-            at: Date.now(),
-            lines: ['no scenario is selected in the palette'],
-          },
-        }));
-      } else {
-        const scenario = reg.get(entry.id);
-        if (!scenario) {
-          replayPlaygroundState((prev) => ({
-            ...prev,
-            labFeedback: {
-              level: 'error',
-              title: 'Load blocked',
-              at: Date.now(),
-              scenarioId: entry.id,
-              lines: [`${entry.id} is no longer registered`],
-            },
-          }));
-        } else if (openPlaygroundScenarioEditor(scenario)) {
-          replayPlaygroundState((prev) => ({
-            ...prev,
-            labFeedback: buildScenarioLoadFeedback(entry),
-          }));
-        }
-      }
-    }
-    if ((state.saveRequestedAt ?? 0) > lastPlaygroundSaveAt) {
-      lastPlaygroundSaveAt = state.saveRequestedAt ?? 0;
-      const parsed = parseScenarioYaml(state.editSource);
-      const resolution = resolveEditableScenarioSource(state.editSource, state.editScenarioId);
-      if (!resolution.ok || !resolution.scenario) {
-        replayPlaygroundState((prev) => ({ ...prev, labFeedback: resolution.feedback }));
-      } else {
-        reg.register(resolution.scenario);
-        replayPlaygroundState((prev) => ({
-          ...prev,
-          editScenarioId: resolution.scenario!.id,
-          scenarioPalette: currentPlaygroundPalette(),
-          labFeedback: buildScenarioSaveFeedback(resolution.scenario!, parsed.warnings.length),
-        }));
-      }
-    }
-    if ((state.runRequestedAt ?? 0) > lastPlaygroundRunAt && !playgroundRunInFlight) {
-      lastPlaygroundRunAt = state.runRequestedAt ?? 0;
-      const resolution = resolveEditableScenarioSource(state.editSource, state.editScenarioId);
-      if (!resolution.ok || !resolution.scenario) {
-        replayPlaygroundState((prev) => ({ ...prev, labFeedback: resolution.feedback }));
-      } else {
-        playgroundRunInFlight = true;
-        replayPlaygroundState((prev) => ({
-          ...prev,
-          labFeedback: {
-            level: 'info',
-            title: 'Run in progress',
-            at: Date.now(),
-            scenarioId: resolution.scenario!.id,
-            lines: [`executing ${resolution.scenario!.id} against the live playground harness`],
-          },
-        }));
-        void (async () => {
-          const harness = createLivePlaygroundHarness({
-            coordinator: display,
-            contextKeys: getDashboardContextKeyService(),
-            termSize: () => termSize(),
-          });
-          try {
-            const result = await runScenario(resolution.scenario!, harness);
-            replayPlaygroundState((prev) => ({
-              ...prev,
-              editScenarioId: resolution.scenario!.id,
-              labFeedback: buildScenarioRunFeedback(result),
-            }));
-          } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            replayPlaygroundState((prev) => ({
-              ...prev,
-              labFeedback: {
-                level: 'error',
-                title: 'Run failed',
-                at: Date.now(),
-                scenarioId: resolution.scenario!.id,
-                lines: [message],
-              },
-            }));
-          } finally {
-            playgroundRunInFlight = false;
-            draw();
-          }
-        })();
-      }
-    }
   };
   let debugEventCursor = 0;
   let debugEventManual = false;
@@ -8667,7 +8281,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       case 'debug-detail': return 'Debug Detail';
       case 'debug-stack': return 'Debug Stack';
       case 'debug-prompts': return 'Prompt Bank';
-      case 'playground': return 'Widget Playground';
       default: return 'Pane';
     }
   };
@@ -9530,6 +9143,19 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     pluginRoot: BUILTIN_DIR,
     dispatchCore,
     dispatchPlugin: (name, args) => pluginHost.dispatchTool(name, args),
+    dispatchGraph: createDashboardGraphRouteDispatcher(opts.graphRunOptions,
+      (prompt) => requestDashboardGraphConfirmation(inlineChoiceBroker, prompt)),
+    requestConfirmation: (prompt) => requestDashboardGraphConfirmation(inlineChoiceBroker, prompt),
+    getTuiDispatchContext: async () => {
+      const nexusSession = opts.getNexusMemberSession?.();
+      const verifiedOwner = nexusSession ? await resolveDashboardVerifiedOwner(nexusSession) : undefined;
+      return createDashboardTuiConfirmContext(
+        acpSessionIdRef.current ?? undefined,
+        getActiveAcpAskPusher(),
+        undefined,
+        verifiedOwner,
+      );
+    },
   });
   // LSP (Phase L3 of 내부 문서 `ROADMAP-lsp-integration`) — structural /
   // symbol-level source queries via typescript-language-server. Pool
@@ -10083,7 +9709,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     workingDirState: workingDir,
     resolveBrowserStateCursor: (browserId) => (
       resolveBrowserStateById(browserId ?? 'wd-browser')?.cursor
-      ?? browserContextMenuCursorResolver?.()
       ?? workingDir.cursor
     ),
     resolveBrowserActionContext: (hit) => resolveBrowserActionContextFromHit({
@@ -10116,10 +9741,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     ),
     onPick: async (_ev, result) => {
       if (result.reason !== 'selected') return;
-      const fromBrowserPreviewModal =
-        _ev.hitTarget?.kind === 'pane-body'
-        && typeof _ev.hitTarget.widgetInstanceId === 'string'
-        && _ev.hitTarget.widgetInstanceId.endsWith('::pane-multi-modal');
       switch (result.value) {
         case 'debug.copy-path': {
           const payload = result.payload as { path?: unknown } | undefined;
@@ -10168,9 +9789,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             dispatchSidebarSubmit(
               encodeBrowserScopedSubmitText('file-attach', payload.browserId, payload.absPath),
             );
-          }
-          if (fromBrowserPreviewModal) {
-            try { browserPreviewModalCloseRequest?.(); } catch { /* ignore */ }
           }
           return;
         }
@@ -10334,7 +9952,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     getCompactMode: () => productCompactModeForViewport(paneViewport()),
     openDashboardPane: (pane) => openDashboardPane(pane),
     focusPane: (pane) => setWorkingFocus(pane, 'surface-catalog-reopen-pane'),
-    openBrowserPreviewModal: () => openBrowserPreviewModal(),
     openDashboardPaneModal: (pane) => openDashboardPaneModal(pane),
     openCompanionPopup: (key) => setCompanionPopupOpen(key as DashboardCompanionSurfaceKey, true),
     onWarning: (message) => {
@@ -10517,14 +10134,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       chatScrollOffset = -1;
     },
   });
-  const mouseShellRollupRuntime = createMouseShellRollupRuntime({
-    resolveVwIdByLabel: () => null,
-    switchToVirtualWindow: () => { throw new Error('Virtual windows are unavailable in the essential dashboard'); },
-    onWarning: (message) => {
-      chatLines.push(C.warning(`  ${message}`));
-      chatScrollOffset = -1;
-    },
-  });
   const mouseConversationPopupRuntime = createMouseConversationPopupRuntime({
     conversationPopupHost,
     ensureConversationWidgetMounted,
@@ -10580,7 +10189,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const { createDashboardMouseWiring } = await loadDashboardMouseWiring();
   const mouseWiring = createDashboardMouseWiring({
     termSize: () => termSize(),
-    hoverPopupsEnabled: () => false,
     getRotation: mousePickerRuntime.getRotation,
     getCurrentModelEntry: mousePickerRuntime.getCurrentModelEntry,
     setActiveModel: mousePickerRuntime.setActiveModel,
@@ -10625,8 +10233,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // SRF-4 — shell rollup pill click → popup listing live handles.
     // Handles are fetched at click time so the popup always reflects
     // the current ShellRegistry state (not a frozen snapshot).
-    getShellRollupEntries: mouseShellRollupRuntime.getShellRollupEntries,
-    onShellRollupPick: mouseShellRollupRuntime.onShellRollupPick,
     // VW-U3 — expose the foreground modal so mouse clicks inside
     // its bounds dispatch through surface.onMouse (VW focus pane).
     getTopModalSurface: mouseModalSurfaceRuntime.getTopModalSurface,
@@ -10640,14 +10246,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     tryRaiseModalAtPoint: (row, col) => display.tryRaiseModalAtPoint(row, col),
     getActiveMode: mouseModeSwitchRuntime.getActiveMode,
     onModeSwitch: mouseModeSwitchRuntime.onModeSwitch,
-    // IDX-5 Phase 1 — hover wiring. Pass the dashboard singleton so
-    // hover-stable updates hoverTargetKind / hoverTooltip, enabling
-    // when-clauses to gate on "is the pointer on a pill?" and the
-    // Tooltip widget to auto-show over status-bar pills.
-    ctx: getDashboardContextKeyService(),
-    // IDX-6 round-2 — live theme for the auto-mounted Tooltip surface.
-    getTheme: () => currentThemeTokens(),
-    suppressHoverHints: true,
     workspaceHost: display.workspaceHostAPI(),
     // IDX-5 Phase 3 B-4 — classify clicks outside the status-bar pill
     // row into broader pane regions so lastClickHitKind can carry
@@ -10688,7 +10286,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       mouseDispatch: (ev) => mouseWiring.handleMouse(ev),
       menuProviderRegistry: ctxMenuProviders,
       contextMenuRegistry: getDashboardContextMenuRegistry(),
-      tooltipResolver: (target) => mouseWiring.getTooltipFor(target),
+      tooltipResolver: () => null, // Classic hover hints retired.
     });
   } catch { /* never break boot */ }
 
@@ -10815,12 +10413,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       pluginFocusedInstanceId: SYNC_WIDGET_IDS[sync.focus] ?? null,
       workingFocusedInstanceId: workingFocusedId,
     });
-    // VP5 — observe playground reload request (per-redraw poll).
-    maybeTriggerPlaygroundReload();
-    maybeSyncPlaygroundLabPalette();
-    maybeSyncPlaygroundVisualConsole();
-    maybeApplyPlaygroundThemeSelection();
-    maybeHandlePlaygroundLabActions();
     // IDX-F3.5c — the per-frame dashboard-projection block used to live
     // here; every workingDir.focus mutation now flows through
     // setWorkingFocus, which issues display.syncExternalFocus at the
@@ -10922,6 +10514,14 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
 
     // Input block.
     let promptCaret: CursorState | null = null;
+    const composerPanelLines = inlineChoicePanelLines.length ? inlineChoicePanelLines : inlinePickerPanelLines;
+    if (composerPanelLines.length > 0) {
+      zones.push({
+        id: 'input-picker-panel',
+        height: composerPanelLines.length,
+        render: (h, c) => composerPanelLines.slice(0, h).map((line) => fitLogLine(line, c)),
+      });
+    }
     zones.push({
       id: 'input-divider-upper',
       height: 1,
@@ -11674,158 +11274,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     openDebugWorkbenchModal(key);
     draw();
   };
-  const openBrowserPreviewModal = (): void => {
-    const { cols: tc, rows: tr } = termSize();
-    const preFocus: PaneFocus = workingDir.focus;
-    const focusPlan = resolveLegacyForegroundModalFocusPlan({
-      workingFocus: workingDir.focus,
-      preferred: preFocus,
-      lastWorkingDirPane: focusTransitionState.getLastWorkingDirPane(),
-      fallbackPane: firstPaneOfView(workingDir.view),
-      reason: 'tablet-modal-open',
-    });
-    const preModalPaneFocus = focusPlan.anchorPane;
-    if (focusPlan.demotionTransition) {
-      setWorkingFocus(
-        focusPlan.demotionTransition.nextFocus,
-        focusPlan.demotionTransition.reason,
-      );
-    }
-    const browserWidgetInstanceId = browserWidgetInstanceIdForView(workingDir.view);
-    const liveMode = resolveBrowserPreviewModalLiveMode(process.env.ELANOUS_PANE_MODAL_LIVE);
-    const openWindowLocalModelPicker = async (
-      action: import('./modals/pane-multi.js').PaneMultiModalChromeAction,
-    ): Promise<(() => void) | null> => {
-      const entries = getUserConfig().llm.rotation ?? [];
-      if (entries.length === 0) {
-        chatLines.push(C.warning('  no model rotation configured'));
-        chatScrollOffset = -1;
-        draw();
-        return null;
-      }
-      const { createModelPickerRecipe } = await import('../mouse-action-recipes.js');
-      const handle = createModelPickerRecipe({
-        entries,
-        placement: {
-          anchorStartCol: action.anchorStartCol - 1,
-          anchorEndCol: action.anchorEndCol - 1,
-          statusRow: action.anchorRow,
-          termCols: tc,
-          termRows: tr,
-        },
-        onSwitch: async (entry) => {
-          try {
-            const label = rotationEntryLabel(entry);
-            const { cfg: nextCfg } = jumpToRotationEntry(getUserConfig(), label);
-            saveUserConfig(nextCfg);
-            reloadUserConfig();
-          } catch (e) {
-            chatLines.push(C.error(`  model switch failed: ${e instanceof Error ? e.message : String(e)}`));
-            chatScrollOffset = -1;
-          }
-          draw();
-        },
-        onCancel: () => {
-          draw();
-        },
-        theme: currentThemeTokens(),
-        shadow: process.env.ELANOUS_MODAL_SHADOW === 'off'
-          ? undefined
-          : { theme: currentThemeTokens() },
-      });
-      handle.surface.onKey = (ev) => handle.handleKey(ev);
-      attachSurfaceToWorkspace(handle.surface, currentWorkspaceOwnerId());
-      const modal = display.pushModal(handle.surface);
-      return () => {
-        try { handle.dispose(); } catch { /* ignore */ }
-        try { modal.dispose(); } catch { /* ignore */ }
-      };
-    };
-    void openBrowserPreviewModalHost({
-      termCols: tc,
-      termRows: tr,
-      preFocus,
-      preModalPaneFocus,
-      tabletMode: effectiveTabletMode(),
-      browserWidgetInstanceId,
-      liveMode,
-      workingDirFocus: workingDir.focus,
-      widgetHost,
-      workingDirRegistry: browserPaneRegistry,
-      previewRegistry: previewPaneRegistry,
-      display,
-      draw,
-      debug,
-      currentThemeTokens,
-      dispatchSubmit: dispatchSidebarSubmit,
-      setWorkingFocus: (nextFocus) => { setWorkingFocus(nextFocus as PaneFocus, 'tablet-modal-close'); },
-      setContextMenuCursorResolver: (resolver) => { browserContextMenuCursorResolver = resolver; },
-      setCloseRequest: (handler) => { browserPreviewModalCloseRequest = handler; },
-      openModelPicker: (action) => openWindowLocalModelPicker(action),
-      captureDeferredPane: (pane) => captureDeferredPane(pane),
-      fmtEntryColored,
-      iconForEntry,
-      onContextMenuMouse: (ev) => ctxMenuWire.onMouse(ev),
-    });
-  };
-  registerDashboardGlobalKeys({
-    enableSupplementalGlobalKeys: getUserConfig().dashboard.enableSupplementalGlobalKeys,
-    register: (binding) => { display.registerKeyBinding(binding); },
-    openSurfaceCatalog: () => openSurfaceCatalogPopup(),
-    surfaceCatalogWhen: () => agentSearchModal === null,
-  });
-
   function currentWorkspaceOwnerId(): string {
     return DASHBOARD_MAIN_WORKSPACE_ID;
-  }
-
-  function openSurfaceCatalogPopup(): void {
-    void openCompactSurfaceCatalogPopup({
-      getTargets: () => compactSurfaceRuntime.buildTargets(),
-      openTarget: (surfaceId) => compactSurfaceRuntime.openTarget(surfaceId),
-      ownerWorkspaceId: DASHBOARD_MAIN_WORKSPACE_ID,
-      termSize,
-      getTheme: () => currentThemeTokens(),
-      pushModalSurface: (surface) => display.pushModal(surface),
-      onEmptyTargets: () => {
-        pushDebugLine(C.muted('  no surface targets available'));
-        chatScrollOffset = -1;
-      },
-      redraw: draw,
-    }).catch(() => {});
-  }
-
-  /** N2 — open the shell-runner rollup popup centered on the viewport.
-   *  Entry point for `/shell rollup` so keyboard users can access the
-   *  same UI mouse users get by clicking
-   *  the 🐚 status-bar pill. Anchored-to-pill placement stays in
-   *  dashboard-mouse-wiring; this path is explicitly center-placed so
-   *  it works with status row unknown. */
-  let shellRollupDispose: (() => void) | null = null;
-  async function openShellRollupPopup(): Promise<void> {
-    const { getShellRegistry } = await import('../shell-runner/registry.js');
-    await openDashboardShellRollupPopup({
-      getShellRegistry,
-      getCurrentDispose: () => shellRollupDispose,
-      setCurrentDispose: (dispose) => {
-        shellRollupDispose = dispose;
-      },
-      resolveVwIdByLabel: () => null,
-      switchVirtualWindow: () => { throw new Error('Virtual windows are unavailable in the essential dashboard'); },
-      ownerWorkspaceId: DASHBOARD_MAIN_WORKSPACE_ID,
-      termSize,
-      getTheme: () => currentThemeTokens(),
-      pushModalSurface: (surface) => display.pushModal(surface),
-      onEmpty: () => {
-      pushDebugLine(C.muted('  (no shell-runner handles — RunShell(mode:"vw") spawns one)'));
-      chatScrollOffset = -1;
-      },
-      onWarning: (message) => {
-        pushDebugLine(C.warning(`  ${message}`));
-        chatScrollOffset = -1;
-      },
-      redraw: draw,
-    });
   }
 
   // Track which task ID the cursor is currently LOCKED onto across
@@ -12311,13 +11761,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // retire (scheduler view 폐기 · 동일 데이터는 workflow row 가 cover).
     inst.state = { ...(inst.state as { rows: unknown[]; cursor: number }), rows };
   };
-  // Wave P4b-2 — ephemeral popup lifecycle. plan-board popup auto-
-  // closes when the plan goes empty; bg-tasks popup auto-closes when
-  // every source count reaches zero. Both subscribers also refresh
-  // the chat surface so the user's view stays consistent.
-  const closePlanBoardPopupIfIdle = (): void => {
-    activeWidgetPopupHandles.get('plan-board-popup')?.dispose();
-  };
+  // The background-tasks popup closes when every source count reaches zero.
   const closeBgTasksPopupIfIdle = (): void => {
     const totalActive = shellRegistryForPill.list({ status: 'running' }).length
       + globalAgentRegistry.list().filter((a) => a.state === 'running').length
@@ -12326,14 +11770,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       activeWidgetPopupHandles.get('background-tasks-popup')?.dispose();
     }
   };
-  // Plan listener — close popup when steps drop to zero.
-  {
-    const { subscribePlanUpdate: subscribePlanForPopup } =
-      await import('../code-edit/plan-tool.js');
-    subscribePlanForPopup((state) => {
-      if (state.steps.length === 0) closePlanBoardPopupIfIdle();
-    });
-  }
   shellRegistryForPill.subscribe(() => {
     backgroundPillRuntime.refresh();
     refreshBackgroundTasksWidget();
@@ -13308,21 +12744,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         lastAssistantRange,
         lastAssistantMode,
       }),
-      openPreviewSurface: async (preview) => {
-        const { rows: tr, cols: tc } = termSize();
-        await openDashboardMediaPreviewInSurface(preview, {
-          showPreviewModal: async (absPath, title) => {
-            await showPreviewModal(absPath, {
-              coordinator: display,
-              termCols: tc,
-              termRows: tr,
-              title,
-              ttlMs: 4000,
-            });
-          },
-        });
-        return true;
-      },
       openTarget: async (url) => {
         spawn('open', [url], {
           detached: true,
@@ -13470,7 +12891,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // (Option B · see 내부 문서 `ROADMAP-widget-arch-refactor` §4 Phase 0).
     // The dispatch call happens at the bottom of the pane-dispatch
     // block; behavior is preserved 1:1 with the old inline branches.
-    // Phase 0b-1: log / playground / debug-events / scheduler-inspector.
+    // Phase 0b-1: log / debug-events / scheduler-inspector.
     // Remaining batches land in later commits of the same PR.
     // ══════════════════════════════════════════════════════════════
     const paneKeyRouter = createPaneKeyRouter();
@@ -13481,34 +12902,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       // TR-P4: arrow pane-nav removed in the log pane; Tab
       // cycles focus, the log pane's j/k/etc are handled below.
       await handleLogPaneKey(key);
-      return 'consumed' as const;
-    });
-
-    paneKeyRouter.register('playground', (key) => {
-      // F-B5b pre-existing fix: prior to the router landing, keys on
-      // `p === 'playground'` fell through the entire working-dir
-      // dispatch block and dropped silently — the widget's `onKey` was
-      // dead code. Delegate here so ↑↓/j/k, 1/2/3, tab, r, e (F-B5b
-      // edit-mode toggle), Esc, etc. actually reach the playground
-      // widget. 'none' result falls through so this fix never
-      // regresses any key that was working before.
-      //
-      // Phase 1 (2026-04-19) — routes through dispatchKeyToWidget so
-      // the widget's `behaviors` chain runs first. Playground declares
-      // no behaviors yet; once Phase 3 adds them, this call site is
-      // unchanged.
-      const action = dispatchKeyToWidget(widgetHost, 'wd-playground', key);
-      if (debug.enabled) {
-        const inst = widgetHost.get('wd-playground') as { state?: { mode?: string } } | undefined;
-        debug.log('playground.onKey', key.name || '(empty)', {
-          result: (action as { type?: string } | null)?.type ?? 'null',
-          ctrl: key.ctrl, shift: key.shift,
-          mode: inst?.state?.mode,
-        });
-      }
-      if (action && typeof action === 'object' && 'type' in action && action.type !== 'none') {
-        draw();
-      }
       return 'consumed' as const;
     });
 
@@ -13807,9 +13200,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // Phase 0b-3a: browser / obsidian — the two filesystem browsers.
 
     // Yazi-style comma-chord runtime — `,v` (vim) · `,s` (LLM summary)
-    // · `,?` (help). Singleton scoped to the browser pane handler.
+    // Singleton scoped to the browser pane handler.
     // The runtime owns the chord state machine; this closure supplies
-    // the actions (file edit / summarize / help).
+    // the actions (file edit / summarize).
     const browserChordRuntime = createBrowserChordRuntime({
       showChordHint: () => {
         const { cols: tc, rows: tr } = termSize();
@@ -13945,7 +13338,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           width: popupWidth,
         });
       },
-      onShowHelp: () => browserHelpRuntime.showHelp(),
       notice: (level, msg) => {
         chatLines.push(level === 'warning' ? C.warning(msg) : C.muted(msg));
         chatScrollOffset = -1;
@@ -13966,12 +13358,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       // IME aliases handled inside browserChordRuntime.
       if (await browserChordRuntime.tryHandleKey(key)) {
         debug.log('browser.comma-chord.consumed', key.name || '(empty)', {});
-        draw();
-        return 'consumed';
-      }
-      // Yazi-style help (`~` toggles overlay). Single key, no modifier.
-      if (!key.ctrl && !key.alt && (key.name === '~' || key.name === '?' && key.shift)) {
-        browserHelpRuntime.showHelp();
         draw();
         return 'consumed';
       }
@@ -14751,6 +14137,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         // Two calls per turn is OK — buildSessionRuntimeToolSpecs is
         // pure assembly over already-loaded specs.
         getPreamble: ({ sessionId, userText }) => {
+          let memorySaveFailed = false;
+          rememberExplicitTuiUserFact(userText, undefined, () => {
+            memorySaveFailed = true;
+            pushChatLine(C.warning('  ⚠ 기억을 저장하지 못했습니다. 저장소 상태를 확인해 주세요.'));
+          });
           const runtime = acpToolRuntime;
           const turnUserConfig = getUserConfig();
           const activeModel = inspectActiveProvider().model;
@@ -14777,6 +14168,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           const classicTools = runtime ? classicSidetabMission.getTools(withSurfaceDefaults) : withSurfaceDefaults;
           const tuiTools = classicTools;
           return [
+            ...(memorySaveFailed ? [{ role: 'system' as const,
+              content: '이번 턴의 명시적 기억 저장은 실패했다. 저장했다고 약속하지 말고 사용자에게 실패를 알려라.' }] : []),
             ...tuiChatPersonaMessages(currentChatPersonaSessionId(), chatPersonaSelection),
             ...buildDashboardTurnPreamble({
               userText,
@@ -14901,11 +14294,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               uc.shell.allowDashboardPty === true && (acpPtyAvailable?.() ?? false),
             getToolRuntime: (toolName) => runtime.getToolRuntime(toolName),
             dispatchToolRuntime: (toolName, input, toolCallId) =>
-              runtime.dispatchToolByName(toolName, input, {
+              dispatchClassicTuiTool(runtime.dispatchToolByName, toolName, input, {
                 surface: 'tui',
                 parentSessionId: ctx?.sessionId,
                 toolCallId,
                 signal: hasParentTurnAbortSignal ? turnSignal : undefined,
+                approver: createBashApprover(),
                 inheritGeneralPurposeToolCatalog: true,
                 // ⭐ Agent-family context. Without these two the sub-agent runs
                 //  text-only (see getTools above). `agentDispatchTool` routes the
@@ -14947,7 +14341,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   acpDispatchToolSelf
                     ? acpDispatchToolSelf(childName, childArgs, ctx)
                     : Promise.resolve({ error: 'parent dispatcher unavailable' }),
-              }),
+              }, acpTurnToolSpecs),
             dispatchPluginTool: async (toolName, input) => pluginRouteAdapter.dispatch(toolName, input),
           });
           if (ctx?.callId && (name === 'Bash' || name === 'RunShell')) {
@@ -15577,9 +14971,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
 
       // ── Working-dir view switch (Ctrl+digit) ──
       // Ctrl+2 goes through parseKey normalization; other digits
-      // require modified-key protocols. Plain xterm / tmux can
-      // collapse Ctrl+7 onto the same bytes as Ctrl+/, so the matcher
-      // absorbs that fallback and still routes to V7.
+      // require modified-key protocols.
       const viewShortcut = matchDashboardViewShortcut(key);
       if (viewShortcut) {
         const def = findDashboardView(viewRegistry, viewShortcut);
@@ -15758,7 +15150,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         // moved to paneKeyRouter — see registrations at the top of the
         // outer function body.
 
-        // `log` and `playground` moved to paneKeyRouter — see
+        // `log` moved to paneKeyRouter — see
         // registrations at the top of the outer function body.
 
         // ── Widget architecture refactor Phase 0 — dispatch tail ──
@@ -15965,6 +15357,18 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             debugLog: debug.enabled ? (event, label, payload) => debug.log(event, label, payload) : undefined,
             textInputOpts: {
               internalTurnYield: internalTurnYieldPort,
+              inlinePickers: true,
+              onInputPanelChange: (lines) => { inlinePickerPanelLines = lines; },
+              onInputSubmit: (text) => {
+                if (inlineChoiceDraftPrefix === null) return inlineChoiceBroker.handleInput(text);
+                const { answer, restoreText } = splitInlineChoiceComposerInput(text, inlineChoiceDraftPrefix);
+                if (answer === null) {
+                  inlineChoiceDraftPrefix = restoreText;
+                  return { restoreText };
+                }
+                const result = inlineChoiceBroker.handleInputResult(answer);
+                return result === 'ignored' ? false : { restoreText };
+              },
               ...(nextInitialPastes.length ? { initialPastes: nextInitialPastes } : {}),
               onScrollKey: (name) => {
                 const { rows } = termSize();
@@ -16007,6 +15411,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   chatMainInputVisibilityState().inputOwnership?.owner === 'chat-main',
                 onPasteImage: attachClipboardImage,
                 routeInputKey: async (key) => {
+                if (inlineChoiceBroker.handleKey(key.name ?? '')) return 'consumed';
                 if (await handleLogPaneCopyAction(key)) return 'consumed';
                 // A-5b.2 · dispatcher-level key hook (routeInputEventAsync
                 // · ViewMode='input'). Runs AFTER onPreKey and BEFORE
@@ -16307,6 +15712,18 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           const cmdText = submitIntent.kind === 'control-turn'
             ? (submitIntent.commandText ?? '')
             : submitIntent.text;
+          if (submitIntent.kind === 'submit-turn' && !internalTurn) {
+            const { NEXT_TUI_INPUT_CONTEXT, resolveNextTuiRoute } = await import('../tui/core/registry.js');
+            const route = resolveNextTuiRoute(submitIntent.text, NEXT_TUI_INPUT_CONTEXT);
+            if (route?.branchHost === 'plugin-wizard') {
+              const { CLASSIC_PLUGIN_WIZARD_NOTICE } = await import('../tui/branches/plugin-wizard.js');
+              echoSubmittedUserText(submitIntent.text);
+              chatLines.push(C.info(`  ${CLASSIC_PLUGIN_WIZARD_NOTICE}`));
+              chatScrollOffset = -1;
+              draw();
+              continue;
+            }
+          }
           if (submitIntent.kind === 'submit-turn' && !internalTurn && parseSeatAsk(submitIntent.text)) {
             try {
               const receipt = await askSeat(submitIntent.text, { channel: 'tui', clientId: tuiSeatAskClientId },
@@ -16794,7 +16211,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 }),
                 setManual: (value) => { tabletModeManual = value; },
                 requestRender: () => { requestDashboardRender(); },
-                openBrowserPreviewModal: () => { openBrowserPreviewModal(); },
               },
               childScreen: {
                 runId: () => getHarnessRunId(process.env),
@@ -16841,11 +16257,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                       },
                     }),
                     write: (l) => lines.push(l),
-                    onEditScenario: async (scenario) => {
-                      if (!openPlaygroundScenarioEditor(scenario)) {
-                        throw new Error('playground widget instance unavailable');
-                      }
-                    },
                   });
                   await handler([...args2]);
                   return lines;
@@ -17000,12 +16411,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               },
               shellSlash: {
                 slashRuntime: shellSlashRuntime,
-                openRollupPopup: () => openShellRollupPopup(),
                 virtualWindowsSwitchTo: () => { throw new Error('Virtual windows are unavailable in the essential dashboard'); },
                 resolveVwIdByLabel: () => null,
               },
               termSlash: {
-                slashRuntime: termSlashRuntime,
+                slashRuntime: termSlashRuntime, modalRouter: terminalModalRouter,
                 openNewTerminal: spawnGlobalTerminalModal,
                 sessionRegistry: sessionRegistry as unknown as DashboardSlashContext['termSlash']['sessionRegistry'],
                 terminalMatrix: terminalMatrix as unknown as DashboardSlashContext['termSlash']['terminalMatrix'],
@@ -17841,6 +17251,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               });
             },
             buildTurnPreamble: (args) => {
+              let memorySaveFailed = false;
+              rememberExplicitTuiUserFact(args.userText, undefined, () => {
+                memorySaveFailed = true;
+                pushChatLine(C.warning('  ⚠ 기억을 저장하지 못했습니다. 저장소 상태를 확인해 주세요.'));
+              });
               // Wave 5 (2026-05-04) — plain-chat path enabledTools
               // propagation. Wave 4 wired the ACP path (line ~15107)
               // by inlining buildSessionRuntimeToolSpecs inside the
@@ -17860,6 +17275,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   })
                 : [];
               return [
+                ...(memorySaveFailed ? [{ role: 'system' as const,
+                  content: '이번 턴의 명시적 기억 저장은 실패했다. 저장했다고 약속하지 말고 사용자에게 실패를 알려라.' }] : []),
                 ...tuiChatPersonaMessages(currentChatPersonaSessionId(), chatPersonaSelection),
                 ...buildDashboardTurnPreamble({
                   userText: args.userText,

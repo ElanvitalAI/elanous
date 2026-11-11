@@ -18,13 +18,13 @@ function makeHooks(): HostHooks & { logs: string[] } {
   };
 }
 
-describe('hello plugin + persistentState', () => {
+describe('fixture plugin + persistentState', () => {
   let root: string;
   let builtinDir: string;
   let userRoot: string;
 
   // Minimal hello-clone written into the temp plugin dir for test
-  // isolation. Mirrors plugins/hello/plugin.ts behaviour.
+  // isolation. Uses an in-memory plugin fixture.
   function writeHello(): void {
     const dir = join(builtinDir, 'hello');
     mkdirSync(dir, { recursive: true });
@@ -70,7 +70,7 @@ describe('hello plugin + persistentState', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test('hello plugin activate → persist → reload restores state', async () => {
+  test('fixture plugin activate → persist → reload restores state', async () => {
     // First session — advance counter manually, deactivate to persist.
     const persistence = new FsPluginStatePersistence({ userRoot, warn: () => {} });
     const host = new PluginHost(makeHooks(), null, { statePersistence: persistence });
@@ -99,7 +99,7 @@ describe('hello plugin + persistentState', () => {
     expect((host2 as any).activeEntry.state).toEqual({ waves: 3 });
   });
 
-  test('hello plugin without persistence backend still works (no-op path)', async () => {
+  test('fixture plugin without persistence backend still works (no-op path)', async () => {
     const host = new PluginHost(makeHooks());  // no statePersistence
     (host as any).scanOverride = { builtin: builtinDir, user: '/nonexistent' };
     await (host as any).scanDir(builtinDir, 'builtin');

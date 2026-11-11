@@ -1,0 +1,4 @@
+{
+  "deviceKey": "ux-rla-pwa-formal-update",
+  "review": "> 📅 **2026-11-10 재검토 (UX · RLA-PWA-FORMAL-UPDATE)** — `pwa-static-swap-world`의 실패 주입은 실제 atomic publisher를 호출하고 이전 PWA generation 보존을 검증한다. 그래프 노드는 node-verdict 계약을 따르며 원격 그래프 시험·정적 빌드 증거를 요구한다."
+}

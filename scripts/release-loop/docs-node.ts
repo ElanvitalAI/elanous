@@ -26,7 +26,7 @@ interface DocsResult {
 }
 
 type TranslationRunner = (line: string) => string;
-type AskSpawn = (command: string, args: string[], options: SpawnSyncOptionsWithStringEncoding) => SpawnSyncReturns<string>;
+type LlmSpawn = (command: string, args: string[], options: SpawnSyncOptionsWithStringEncoding) => SpawnSyncReturns<string>;
 
 const HANGUL = /[\uac00-\ud7a3]/;
 // Allow common English typography without accepting arbitrary non-ASCII letters, digits, or symbols.
@@ -93,15 +93,15 @@ function markdownFenceLine(raw: string, closing = false): { marker: string; quot
 }
 
 /**
- * The CLI that answers the translation boundary. `ELANOUS_RELEASE_ASK_BIN` lets a fake-bin stand in at
+ * The CLI that answers the translation boundary. `ELANOUS_RELEASE_LLM_BIN` lets a fake-bin stand in at
  * this child-process boundary (offline runs, tests) without touching the model or the operator's config.
  */
-function askCliPath(env: NodeJS.ProcessEnv): string {
-  return env.ELANOUS_RELEASE_ASK_BIN?.trim() || join(REPO_ROOT, 'bin/elanous.mjs');
+function llmCliPath(env: NodeJS.ProcessEnv): string {
+  return env.ELANOUS_RELEASE_LLM_BIN?.trim() || join(REPO_ROOT, 'bin/elanous.mjs');
 }
 
 /** Translate one public note sentence without sending private manifest fields to the model. */
-function askBareForEnglish(line: string, askSpawn: AskSpawn = spawnSync, env: NodeJS.ProcessEnv = process.env): string {
+function llmForEnglish(line: string, llmSpawn: LlmSpawn = spawnSync, env: NodeJS.ProcessEnv = process.env): string {
   const prompt = [
     'Translate the following public release-note sentence into concise English.',
     'Return only the translated sentence. Preserve product names, code, Markdown links, and meaning.',
@@ -109,14 +109,14 @@ function askBareForEnglish(line: string, askSpawn: AskSpawn = spawnSync, env: No
     '',
     line,
   ].join('\n');
-  const result = askSpawn(process.execPath, [askCliPath(env), 'ask', '--bare', '--json', prompt], {
+  const result = llmSpawn(process.execPath, [llmCliPath(env), 'llm', '--json', prompt], {
     // Pin the approved translation model for this child only; do not mutate the operator's config.
     cwd: process.cwd(), env: { ...process.env, ELANOUS_LLM_PROVIDER: 'openrouter', ELANOUS_LLM_MODEL: 'z-ai/glm-5.3' },
     encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024,
   });
-  if (result.error || result.status !== 0) throw new Error(`ask --bare failed: ${result.error?.message ?? result.stderr ?? result.stdout}`);
+  if (result.error || result.status !== 0) throw new Error(`llm failed: ${result.error?.message ?? result.stderr ?? result.stdout}`);
   const payload = JSON.parse(result.stdout.trim().split('\n').at(-1) ?? 'null') as { reply?: unknown; error?: unknown };
-  if (typeof payload.reply !== 'string') throw new Error(typeof payload.error === 'string' ? payload.error : 'ask --bare returned no reply');
+  if (typeof payload.reply !== 'string') throw new Error(typeof payload.error === 'string' ? payload.error : 'llm returned no reply');
   return payload.reply;
 }
 
@@ -235,7 +235,7 @@ function graphInput(env: NodeJS.ProcessEnv): Record<string, unknown> {
 /** Apply the cutoff manifest to the public documentation checkout. */
 export function runDocs(
   args: string[], base = process.cwd(), env: NodeJS.ProcessEnv = process.env,
-  deps: { stateRoot?: string; writeTemp?: (path: string, text: string) => void; translateLine?: TranslationRunner; askSpawn?: AskSpawn } = {},
+  deps: { stateRoot?: string; writeTemp?: (path: string, text: string) => void; translateLine?: TranslationRunner; llmSpawn?: LlmSpawn } = {},
 ): DocsResult {
   let version: string | null = null;
   try {
@@ -270,7 +270,7 @@ export function runDocs(
     const count = registry.pages.filter((page) => page.id === id).length;
     if (count > 1) throw new Error(`duplicate pages entry: ${id}`);
     const translationFailures: string[] = [];
-    const translateLine = deps.translateLine ?? ((line) => askBareForEnglish(line, deps.askSpawn, env));
+    const translateLine = deps.translateLine ?? ((line) => llmForEnglish(line, deps.llmSpawn, env));
     const translationCache = new Map<string, string>();
     const publicEntries = new Set(['feat', 'fix', 'security']);
     const notesManifest: ReleaseManifest = {

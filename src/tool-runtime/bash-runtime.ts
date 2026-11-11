@@ -23,7 +23,17 @@
 
 import { buildBashTool, dispatchBash, type BashResult, type BashToolOpts } from '../skills/tools/index.js';
 import { getSessionCwd } from '../session/working-dir.js';
+import { getUserConfig } from '../user-config.js';
+import { requestConfirmation } from '../hitl/confirm.js';
 import type { ToolRuntime, ToolRuntimeContext } from './types.js';
+import { BASH_APPROVAL_MATCHED_TEXT_LIMIT, bashApprovalFinding, type BashApprovalPolicy } from './bash-approval.js';
+
+// Source: POSIX shell status 126 denotes a command that was refused before execution.
+const BASH_APPROVAL_DENIED_EXIT_CODE = 126;
+// Source: approval denials happen before child process creation, so command runtime is zero.
+const BASH_APPROVAL_PRESPAWN_DURATION_MS = 0;
+// Source: a denied command has no captured child output.
+const BASH_APPROVAL_NO_OUTPUT = '';
 
 /** Subset of BashToolOpts that the runtime pins via module state.
  *  cwd is OPTIONAL in deps — when unset, the runtime pulls the
@@ -33,6 +43,7 @@ import type { ToolRuntime, ToolRuntimeContext } from './types.js';
 export type BashRuntimeDeps = Partial<Omit<BashToolOpts, 'signal'>>;
 
 let deps: BashRuntimeDeps | null = null;
+let approvalPolicyOverride: BashApprovalPolicy | undefined;
 
 /** Wire the deps the runtime will pass into dispatchBash on every
  *  call. Pass null to un-set (tests). */
@@ -45,6 +56,11 @@ export function _getBashRuntimeDepsForTesting(): BashRuntimeDeps | null {
   return deps;
 }
 
+/** Test-only policy override; production reads the persisted user setting. */
+export function setBashRuntimeApprovalPolicyForTest(policy: BashApprovalPolicy | undefined): void {
+  approvalPolicyOverride = policy;
+}
+
 export const bashRuntime: ToolRuntime<Record<string, unknown>, BashResult> = {
   id: 'bash',
   spec: buildBashTool(),
@@ -55,6 +71,34 @@ export const bashRuntime: ToolRuntime<Record<string, unknown>, BashResult> = {
     // it unset so browser-pane Ctrl+W retargets Bash immediately.
     const cwd = deps?.cwd ?? getSessionCwd();
     const opts: BashToolOpts = { ...(deps ?? {}), cwd, signal: ctx.signal };
+    const command = typeof req.command === 'string' ? req.command : '';
+    const policy = approvalPolicyOverride ?? getUserConfig().shell.bashApproval;
+    const approvalFinding = ctx.requireApproval
+      ? { severity: 'destructive' as const, reason: 'caller requires confirmation', matched: command.slice(0, BASH_APPROVAL_MATCHED_TEXT_LIMIT) }
+      : (ctx.surface === 'tui' || ctx.surface === 'dashboard')
+        ? bashApprovalFinding(command, policy)
+        : null;
+    if (approvalFinding) {
+      let approved = false;
+      try {
+        approved = ctx.approver
+          ? await ctx.approver({ cmd: command, args: [approvalFinding.reason], cwd })
+          : (await requestConfirmation({
+            header: 'Bash approval required',
+            prompt: command,
+            detail: approvalFinding.reason,
+            yesLabel: 'Run command',
+            noLabel: 'Deny command',
+          })).answer;
+      } catch {
+        approved = false;
+      }
+      if (!approved) {
+        const error = `Bash denied: confirmation declined (${approvalFinding.reason})`;
+        return { stdout: BASH_APPROVAL_NO_OUTPUT, stderr: error, output: error, exitCode: BASH_APPROVAL_DENIED_EXIT_CODE,
+          timedOut: false, aborted: false, durationMs: BASH_APPROVAL_PRESPAWN_DURATION_MS };
+      }
+    }
     // Track H — dashboard surface defaults to sandbox='auto' so
     // LLM-invoked Bash calls get sandbox-exec wrapping on macOS
     // unless the LLM explicitly opts out via `sandbox` on args.

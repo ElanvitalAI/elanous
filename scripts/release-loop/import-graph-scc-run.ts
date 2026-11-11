@@ -1,8 +1,53 @@
 // Bind the shared gate selector to the committed-tree SCC report at one exact HEAD.
 import { spawnSync } from 'node:child_process';
 import { selectGateTestFiles } from '../../src/self-implement/gate-cli.js';
-import { gitClosureTree } from './gate-closure.js';
+import { isTestPath } from '../../src/self-implement/importer-test-index.js';
+import { gitClosureTree, testsReachingChanged } from './gate-closure.js';
 import { analyzeImportGraphScc, type ImportGraphSccReport } from './import-graph-scc.js';
+
+// Source: OP TSC-CUT-GATE-RUNNER-HUB instruction and 0.3.9 evidence: 5,473/6,419; completion is <= half of baseline total.
+const HUB_RADIUS_BASELINE_SELECTED = 5_473;
+const HUB_RADIUS_BASELINE_TOTAL = 6_419;
+const HUB_RADIUS_MAXIMUM_HALF = Math.floor(HUB_RADIUS_BASELINE_TOTAL / 2);
+export const TSC_CUT_GATE_HUB_FILES = ['scripts/release-loop/gate-node.ts', 'src/graph-runner/runner.ts'] as const;
+
+export interface GateHubReachReport {
+  readonly commit: string;
+  readonly changedFiles: readonly string[];
+  readonly totalTestFiles: number;
+  readonly hubReach: { readonly definiteTests: number; readonly opaqueAdditionalTests: number; readonly selectedTests: number };
+  readonly baseline: { readonly selectedTests: number; readonly totalTestFiles: number; readonly halfMaximum: number };
+  readonly withinHalf: boolean;
+  readonly conservativeGate: { readonly mode: 'radius' | 'full-fallback'; readonly selectedTests: number; readonly reason?: string };
+}
+
+/** Diagnostic reverse-import radius for the two TSC hubs; the conservative selector result is reported separately. */
+export function reportGateHubReach(repo: string, commit: string, changedFiles: readonly string[] = TSC_CUT_GATE_HUB_FILES): GateHubReachReport {
+  if (!/^[0-9a-f]{40}$/i.test(commit)) throw new Error('commit must be a full SHA');
+  if (!changedFiles.length || changedFiles.some((file) => !file.trim())) throw new Error('changed hub files are required');
+  const tree = gitClosureTree(repo, commit);
+  const tests = tree.files.filter(isTestPath).sort();
+  const missing = changedFiles.filter((file) => !tree.files.includes(file));
+  if (missing.length) throw new Error(`hub files missing at commit: ${missing.join(',')}`);
+
+  // This matches the historical reverse-reach radius (definite + opaque potential), which excluded preload-wide fallback.
+  const radius = testsReachingChanged({ ...tree, preload: [] }, changedFiles, tests);
+  if (!radius.ok) throw new Error(`hub reach unmeasured: ${radius.reason}`);
+  // Keep the production fail-closed decision visible: opaque preload dependencies can still select the entire gate.
+  const conservative = testsReachingChanged(tree, changedFiles, tests);
+  const halfMaximum = HUB_RADIUS_MAXIMUM_HALF;
+  return {
+    commit,
+    changedFiles: [...changedFiles],
+    totalTestFiles: tests.length,
+    hubReach: { definiteTests: radius.reached, opaqueAdditionalTests: radius.opaque, selectedTests: radius.tests.length },
+    baseline: { selectedTests: HUB_RADIUS_BASELINE_SELECTED, totalTestFiles: HUB_RADIUS_BASELINE_TOTAL, halfMaximum },
+    withinHalf: (conservative.ok ? conservative.tests.length : tests.length) <= halfMaximum,
+    conservativeGate: conservative.ok
+      ? { mode: 'radius', selectedTests: conservative.tests.length }
+      : { mode: 'full-fallback', selectedTests: tests.length, reason: conservative.reason },
+  };
+}
 
 export type ImportGraphGateResult =
   | { readonly ok: false; readonly reason: string }

@@ -2,7 +2,7 @@ import { debug } from '../../debug/log.js';
 import { PR_LABELS } from '../../github/pr-labels.js';
 import { runGhCliWithResultAsync } from '../../git-fs/gh-cli.js';
 import { runGitCommand } from '../../git-fs/runner.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { installMetadataSource } from '../../version/code-revision.js';
 import { getApprovalGate, latestApprovalGate, startApprovalGate, type ApprovalGateInput, type ApprovalGateState } from './merge-approvals-gate.js';
 import { jsonResponse } from './json-response.js';

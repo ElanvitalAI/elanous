@@ -5,7 +5,6 @@ import type { KeyEvent } from '../src/plugins/core/types.js';
 import { RequestUserInputOverlay, type Question, type QuestionAnswer } from '../src/ui/widgets/request-user-input-overlay.js';
 import { SlashMenu } from '../src/ui/widgets/slash-menu.js';
 import { ContextMenu, computePlacement } from '../src/ui/widgets/context-menu.js';
-import { ComboBox } from '../src/ui/widgets/combo-box.js';
 import { Dialog } from '../src/ui/widgets/dialog.js';
 import { PermissionPrompt } from '../src/ui/widgets/permission-prompt.js';
 
@@ -318,86 +317,5 @@ describe('LC9 computePlacement', () => {
     expect(r.y).toBe(0);
     expect(r.width).toBe(40);
     expect(r.height).toBe(20);
-  });
-});
-
-describe('LC9 ComboBox', () => {
-  test('typing filters dropdown', () => {
-    const cb = new ComboBox<string>({
-      options: [
-        { value: 'main',    label: 'main' },
-        { value: 'feature', label: 'feature/ui' },
-        { value: 'mobile',  label: 'mobile' },
-      ],
-      onSubmit: () => {},
-    });
-    cb.takeFocus();
-    cb.onEvent(key('m'));
-    const lines = render(cb, 40, 5);
-    expect(lines.join('\n')).toContain('main');
-    expect(lines.join('\n')).toContain('mobile');
-    expect(lines.join('\n')).not.toContain('feature/ui');
-  });
-
-  test('Enter picks highlighted option', () => {
-    let picked: string | null = null;
-    const cb = new ComboBox<string>({
-      options: [
-        { value: 'main',    label: 'main' },
-        { value: 'feature', label: 'feature' },
-      ],
-      onSubmit: v => { picked = v as string; },
-    });
-    cb.takeFocus();
-    cb.onEvent(key('down'));
-    cb.onEvent(key('enter'));
-    expect(picked).toBe('feature');
-  });
-
-  test('allowFreeform returns typed string when no match', () => {
-    let picked: string | null = null;
-    const cb = new ComboBox<string>({
-      options: [{ value: 'main', label: 'main' }],
-      allowFreeform: true,
-      onSubmit: v => { picked = v as string; },
-    });
-    cb.takeFocus();
-    cb.onEvent(key('z')); cb.onEvent(key('z'));
-    cb.onEvent(key('enter'));
-    expect(picked).toBe('zz');
-  });
-
-  test('Escape calls onCancel', () => {
-    let cancelled = false;
-    const cb = new ComboBox<string>({
-      options: [],
-      onSubmit: () => {},
-      onCancel: () => { cancelled = true; },
-    });
-    cb.takeFocus();
-    cb.onEvent(key('escape'));
-    expect(cancelled).toBe(true);
-  });
-
-  test('chromeSpec wraps combo in declarative chrome', () => {
-    const cb = new ComboBox<string>({
-      title: 'Legacy combo',
-      chromeSpec: {
-        title: 'Spec combo',
-        showClose: false,
-        variant: 'panel',
-      },
-      options: [
-        { value: 'main', label: 'main' },
-        { value: 'feature', label: 'feature' },
-      ],
-      onSubmit: () => {},
-    });
-    cb.takeFocus();
-    const lines = render(cb, 40, 7);
-    const joined = lines.join('\n');
-    expect(joined).toContain('Spec combo');
-    expect(joined).not.toContain('×');
-    expect(joined).toContain('main');
   });
 });

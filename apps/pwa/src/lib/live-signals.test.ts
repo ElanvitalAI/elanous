@@ -69,13 +69,13 @@ describe('foldForRole (LIVE1)', () => {
     expect(isRawErrorText('stack overflow in parser')).toBe(true);
     expect(isRawErrorText('at buildLive (live-signals.ts:10:1)')).toBe(true);
     expect(isRawErrorText('/Users/me/repo/file.ts')).toBe(true);
-    expect(isRawErrorText('/home/ubuntu/repo')).toBe(true);
+    expect(isRawErrorText('/home/user/repo')).toBe(true);
     expect(isRawErrorText('C:\\Users\\me\\file.ts')).toBe(true);
     expect(isRawErrorText('default 95%')).toBe(false);
     expect(isRawErrorText('로컬 부하 9.1')).toBe(false);
   });
   test('non-owner folds raw errors and leaves plain reasons; owner keeps the original', () => {
-    const raw = 'Error: ENOENT: no such file or directory, open /home/ubuntu/x';
+    const raw = 'Error: ENOENT: no such file or directory, open /home/user/x';
     expect(foldForRole(raw, 'general')).toBe('실패 — 자세한 사유는 오너 화면에서');
     expect(foldForRole(raw, 'contributor')).toBe('실패 — 자세한 사유는 오너 화면에서');
     expect(foldForRole(raw, 'owner')).toBe(raw);

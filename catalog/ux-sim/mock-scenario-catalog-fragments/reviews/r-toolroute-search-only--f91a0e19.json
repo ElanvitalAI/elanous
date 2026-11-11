@@ -1,0 +1,4 @@
+{
+  "deviceKey": "r-toolroute-search-only",
+  "review": "> 📅 **2026-11-10 재검토 (R-TOOLROUTE · SEARCH-ONLY)** — tool-router-world가 기본·native-all·deferred-off 모두에서 plugin route schema의 provider 직접 노출과 warm preload를 막고, ToolSearch route/select 발견은 유지하는지 재생한다. 기존 결정 경계와 시뮬 판정 기준은 영향 없음."
+}

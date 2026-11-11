@@ -98,6 +98,7 @@ function createProtocolBoundary(specification: WarmPodSpec, kubectl: ReturnType<
       const expected = specification.runtimeContract!;
       const observed = { bunVersion: runtimeContractMismatch ? '0.0.0' : expected.bunVersion,
         os: expected.os, architecture: expected.architecture, baseImageDigest: expected.baseImageDigest,
+        lockHash: specification.key.lockHash,
         tools: Object.fromEntries(expected.requiredTools.map(tool => [tool, true])) };
       return { status: 0, stdout: JSON.stringify(observed), stderr: '' };
     }
@@ -234,6 +235,7 @@ export async function runWarmPoolReuseSimulation(options: { runId: string; shard
           || (fault === 'image-pin-mismatch' && !options.imagePinDigests);
         const observed = { bunVersion: contractMismatch ? '0.0.0' : expected.bunVersion,
           os: expected.os, architecture: expected.architecture, baseImageDigest: expected.baseImageDigest,
+          lockHash: candidate.spec.key.lockHash,
           tools: Object.fromEntries(expected.requiredTools.map(tool => [tool, true])) };
         return { status: 0, stdout: JSON.stringify(observed), stderr: '' };
       }

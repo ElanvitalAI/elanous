@@ -13,7 +13,7 @@ import { debug } from '../debug/log.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { checklistDevVersion, listChecklist, parseOwner } from '../release-loop/checklist.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export const FOLLOW_UP_DEPTH_LIMIT = 3;
 export const FOLLOW_UP_OP_CARD_REQUIRED = 'OP 카드 필요';

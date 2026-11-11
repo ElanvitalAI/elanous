@@ -43,10 +43,6 @@ export const KEYBINDINGS: KeyBinding[] = [
   { keys: ['Ctrl+4'],              action: 'Switch to Agents view',          context: 'global' },
   { keys: ['Ctrl+5'],              action: 'Switch to Debug view',           context: 'global' },
   { keys: ['Ctrl+6'],              action: 'Switch to Scheduler view',       context: 'global' },
-  // VP3 — Ctrl+7 switches to the Widget Playground view (V7). Requires
-  // kitty-keyboard or xterm modifyOtherKeys (both enabled on startup).
-  // `/view 7` is the portable fallback for plain xterm.
-  { keys: ['Ctrl+7', 'Ctrl+/ (fallback)'], action: 'Switch to View 7 — Widget Playground (or /view 7)', context: 'global' },
   // FU-1/FU-2 — opener + chord shortcuts. 모두 coordinator.registerKeyBinding
   // 경유. Q4 (substrate Occam, 2026-05-03): Korean IME alias 는 중앙
   // KEY_ALIAS_TABLE (input-core/key-alias-table.ts) 가 lookup 시

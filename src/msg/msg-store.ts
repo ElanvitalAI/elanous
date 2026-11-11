@@ -51,6 +51,13 @@ export function canonicalMessageAddress(value: string): string {
     if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(name)) throw new Error('invalid group name');
     return name === 'all' ? 'ALL' : `group:${name}`;
   }
+  const session = /^session:([A-Za-z0-9_.-]{1,128})$/i.exec(address);
+  if (session) return `session:${session[1]}`;
+  const pane = /^pane:([A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+)$/i.exec(address)
+    ?? /^([A-Za-z0-9_.-]+:p[0-9]+)$/i.exec(address);
+  if (pane) return `pane:${pane[1]}`;
+  const seatPane = /^([A-Za-z][A-Za-z0-9_-]{0,63})\/([A-Za-z0-9_.-]+)$/.exec(address);
+  if (seatPane) return `${canonicalSeatId(seatPane[1]! )}/${seatPane[2]}`;
   return canonicalSeatId(address);
 }
 
@@ -64,7 +71,9 @@ function canonicalGroupAddress(value: string): string {
 export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('message must be an object');
   const record = input as Record<string, unknown>;
-  const from = canonicalMessageAddress(record.from as string);
+  const fromAddress = canonicalMessageAddress(record.from as string);
+  if (fromAddress.startsWith('group:') || fromAddress.startsWith('pane:') || fromAddress.startsWith('session:') || fromAddress.includes('/')) throw new Error('sender must be a seat');
+  const from = canonicalSeatId(fromAddress);
   const to = canonicalMessageAddress(record.to as string);
   if (from === 'ALL') throw new Error('ALL cannot send messages');
   if (from.startsWith('group:')) throw new Error('sender must be a seat');
@@ -441,7 +450,7 @@ export class MsgStore {
 
   /** Messages strictly after the supplied cursor, ordered by durable insertion ID. */
   listByRecipient(recipient: string, after: number = 0, limit: number = 100): Message[] {
-    const to = canonicalSeatId(recipient);
+    const to = canonicalMessageAddress(recipient);
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     validCursor(after);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
@@ -475,7 +484,7 @@ export class MsgStore {
   }
 
   messageStatus(recipient: string, messageId: number): 'delivered' | 'acked' | 'done' | null {
-    const to = canonicalSeatId(recipient);
+    const to = canonicalMessageAddress(recipient);
     if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
     const hasAcks = hasMessageAckTable(this.db);
     const hasGroups = hasGroupMembershipTable(this.db);
@@ -545,14 +554,14 @@ export class MsgStore {
   }
 
   getCursor(recipient: string): number {
-    const to = canonicalSeatId(recipient);
+    const to = canonicalMessageAddress(recipient);
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     return (this.db.query('SELECT last_id FROM msg_cursors WHERE recipient = ?').get(to) as { last_id: number } | null)?.last_id ?? 0;
   }
 
   /** Atomically reject future IDs and keep concurrent or stale acknowledgements from rewinding. */
   advanceCursor(recipient: string, cursor: number): number {
-    const to = canonicalSeatId(recipient);
+    const to = canonicalMessageAddress(recipient);
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     validCursor(cursor);
     const result = this.db.query(`INSERT INTO msg_cursors(recipient, last_id)
@@ -567,7 +576,7 @@ export class MsgStore {
 
   /** Acknowledge exactly one delivered message for its recipient without moving past siblings. */
   ackMessage(recipient: string, messageId: number, status: 'acked' | 'done' = 'acked'): boolean {
-    const to = canonicalSeatId(recipient);
+    const to = canonicalMessageAddress(recipient);
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
     if (status !== 'acked' && status !== 'done') throw new Error('status must be acked or done');
@@ -582,7 +591,7 @@ export class MsgStore {
   }
 
   unreadCount(recipient: string): number {
-    const to = canonicalSeatId(recipient);
+    const to = canonicalMessageAddress(recipient);
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     return unreadCountOn(this.db, to);
   }
@@ -624,7 +633,7 @@ export function openMsgStoreReadOnly(path?: string): MsgStore { return new MsgSt
 
 /** Observe one recipient without creating a store or advancing its acknowledgement. */
 export function readUnreadCount(recipient: string, path: string = defaultMsgStorePath()): number | null {
-  const to = canonicalSeatId(recipient);
+  const to = canonicalMessageAddress(recipient);
   if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
   if (!existsSync(path)) return null;
   const db = new Database(path, { readonly: true });
@@ -634,7 +643,7 @@ export function readUnreadCount(recipient: string, path: string = defaultMsgStor
 
 /** Observe one recipient's unread count ⊕ newest unread ID (read-only · no cursor change). null = ledger absent («모름»). */
 export function readUnreadSummary(recipient: string, path: string = defaultMsgStorePath()): { count: number; maxId: number | null } | null {
-  const to = canonicalSeatId(recipient);
+  const to = canonicalMessageAddress(recipient);
   if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
   if (!existsSync(path)) return null;
   const db = new Database(path, { readonly: true });

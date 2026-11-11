@@ -29,7 +29,7 @@ import { decomposeSelfDevGoal, type SelfDevDecomposeOptions, type SelfDevDecompo
 import { decomposeFabricRequest, type FabricDecomposeRequestOptions, type FabricDecomposeRequestResult } from '../self-dev/fabric-decompose-adapter.js';
 import { normalizeTargetPaths, observeDecomposerSelection, selectFabricDecomposer } from '../self-dev/self-orchestrate-runtime.js';
 import { parseAskProseTitle } from '../self-dev/launch-preflight.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { mintRunId } from '../harness/harness-space.js';
 import { recordNonBlockingRunPending, recordNonBlockingRunResult } from './run-ledger.js';
 

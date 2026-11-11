@@ -64,6 +64,85 @@ async function drain(p: ReturnType<typeof llm.getProviderForConfig>, model?: str
 }
 
 describe('OpenRouter provider wire', () => {
+  test('R-TICKET three long replies and Solar goal-author lint continue once with final stop', async () => {
+    const prompts = ['design', 'implementation', 'evidence', 'goal-author lint'];
+    for (const prompt of prompts) {
+      calls = [];
+      installFetch(() => {
+        const first = calls.length === 1;
+        const sse = `data: ${JSON.stringify({ choices: [{ delta: { content: first ? `${prompt}-part-` : 'done' }, finish_reason: first ? 'length' : 'stop' }] })}\n\ndata: [DONE]\n\n`;
+        return new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(sse)); c.close(); } }),
+          { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      });
+      const provider = llm.getProviderForConfig(cfg({ provider: 'openrouter', model: 'openrouter/upstage/solar-pro4', apiKey: 'sk-or-cfg' }));
+      const events = [] as Array<import('../src/llm.js').LLMStreamEvent>;
+      for await (const event of provider.streamChat!([{ role: 'user', content: prompt }])) events.push(event);
+      expect(events.filter(event => event.type === 'text').map(event => (event as { delta: string }).delta).join('')).toBe(`${prompt}-part-done`);
+      expect(events.filter(event => event.type === 'usage').map(event => (event as { usage: { stopReason?: string } }).usage.stopReason)).toEqual(['length', 'stop']);
+      expect(calls).toHaveLength(2);
+      expect('max_tokens' in calls[0]!.body).toBe(false);
+      expect(calls[1]!.body.messages.at(-1)).toMatchObject({ role: 'user' });
+    }
+  });
+
+  test('explicit caller maxTokens stops at length without adding a continuation request', async () => {
+    installFetch(() => {
+      const sse = 'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n';
+      return new Response(sse, { headers: { 'content-type': 'text/event-stream' } });
+    });
+    const provider = llm.getProviderForConfig(cfg({ provider: 'openrouter', model: 'openrouter/upstage/solar-pro4', apiKey: 'sk-or-cfg' }));
+    const oldMode = process.env.ELANOUS_LLM_MODE;
+    process.env.ELANOUS_LLM_MODE = 'real';
+    try {
+      const reasons: string[] = [];
+      const answer = await llm.streamLLM([{ role: 'user', content: 'bounded answer' }], () => {}, {
+        // Source: #36714 — an explicit caller output cap bounds the whole logical request.
+        provider, maxTokens: 4_096, onUsage: usage => { if (usage.stopReason) reasons.push(usage.stopReason); },
+      });
+      expect(answer).toBe('partial');
+      expect(calls).toHaveLength(1);
+      expect(reasons).toEqual(['length']);
+    } finally {
+      if (oldMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+      else process.env.ELANOUS_LLM_MODE = oldMode;
+    }
+  });
+
+  test('length continuation preserves the tool contract for a later tool call', async () => {
+    installFetch(() => {
+      const choice = calls.length === 1
+        ? { delta: { content: 'I need to check. ' }, finish_reason: 'length' }
+        : { delta: { tool_calls: [{ index: 0, id: 'read-1', type: 'function', function: { name: 'Read', arguments: '{"path":"a"}' } }] }, finish_reason: 'tool_calls' };
+      return new Response(`data: ${JSON.stringify({ choices: [choice] })}\n\ndata: [DONE]\n\n`,
+        { headers: { 'content-type': 'text/event-stream' } });
+    });
+    const provider = llm.getProviderForConfig(cfg({ provider: 'openrouter', model: 'openrouter/upstage/solar-pro4', apiKey: 'sk-or-cfg' }));
+    const events: Array<import('../src/llm.js').LLMStreamEvent> = [];
+    for await (const event of provider.streamChat!([{ role: 'user', content: 'inspect' }], {
+      tools: [{ name: 'Read', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } }],
+      toolChoice: 'required',
+    })) events.push(event);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]!.body.tools).toEqual(calls[0]!.body.tools);
+    expect(calls[1]!.body.tool_choice).toEqual(calls[0]!.body.tool_choice);
+    expect(events.some(event => event.type === 'tool_call' && event.name === 'Read')).toBe(true);
+  });
+
+  test('strict JSON Schema reaches Solar wire and requires a capable endpoint', async () => {
+    const p = llm.getProviderForConfig(cfg({
+      provider: 'openrouter', model: 'openrouter/upstage/solar-pro4', apiKey: 'sk-or-cfg',
+      openrouter: { providerPreferences: { require_parameters: false } },
+    }));
+    const responseFormat = { type: 'json_schema' as const, json_schema: {
+      name: 'review', strict: true as const,
+      schema: { type: 'object', properties: { fixes: { type: 'array', items: { type: 'string' } } }, required: ['fixes'], additionalProperties: false },
+    } };
+    for await (const _ of p.streamChat!([{ role: 'user', content: 'review' }], { responseFormat })) { /* consume */ }
+    expect(calls[0]!.body.model).toBe('upstage/solar-pro4');
+    expect(calls[0]!.body.response_format).toEqual(responseFormat);
+    expect(calls[0]!.body.provider.require_parameters).toBe(true);
+  });
+
   test('config provider=openrouter — 접두를 떼고, 설정 키와 X-Title 을 보낸다', async () => {
     const p = llm.getProviderForConfig(cfg({ provider: 'openrouter', model: 'openrouter/moonshotai/kimi-k3', apiKey: 'sk-or-cfg' }));
     expect(p.name).toBe('openrouter');

@@ -1,7 +1,7 @@
-import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { gateGitSync } from './gate-git.js';
 
 const SHA40 = /^[a-f0-9]{40}$/i;
 const SNAPSHOT_FORMAT_VERSION = 2;
@@ -24,7 +24,7 @@ export function createCutSnapshot(repo: string, commit: string, artifactDir?: st
       if (saved?.commit === commit && saved.formatVersion === SNAPSHOT_FORMAT_VERSION) data = saved; } catch { /* missing or stale artifact: rebuild below */ }
   }
   if (!data) {
-    const listed = spawnSync('git', ['ls-tree', '-r', '-z', commit], { cwd: repo, encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
+    const listed = gateGitSync(['ls-tree', '-r', '-z', commit], repo, { encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
     if (listed.status !== 0 || listed.error) throw new Error(`CutSnapshot ls-tree failed: ${(listed.stderr || listed.error || '').toString().trim()}`);
     const rows: Array<{ path: string; oid: string }> = [];
     const files: string[] = [];
@@ -34,7 +34,7 @@ export function createCutSnapshot(repo: string, commit: string, artifactDir?: st
       files.push(match[4]!);
       if (match[2] === 'blob' && SNAPSHOT_FILE.test(match[4]!)) rows.push({ path: match[4]!, oid: match[3]! });
     }
-    const batch = spawnSync('git', ['cat-file', '--batch'], { cwd: repo, input: rows.map((row) => row.oid).join('\n') + '\n', maxBuffer: 2 * 1024 * 1024 * 1024 });
+    const batch = gateGitSync(['cat-file', '--batch'], repo, { input: rows.map((row) => row.oid).join('\n') + '\n', maxBuffer: 2 * 1024 * 1024 * 1024 });
     if (batch.status !== 0 || batch.error || !Buffer.isBuffer(batch.stdout)) throw new Error(`CutSnapshot cat-file failed: ${(batch.stderr || batch.error || '').toString().trim()}`);
     const out = batch.stdout as Buffer;
     const entries: Record<string, CutSnapshotEntry> = {};

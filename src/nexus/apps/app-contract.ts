@@ -41,8 +41,12 @@ const TOP_LEVEL_KEYS = new Set([
 ]);
 // Host-name reservation examples named by 내부 문서 `nexus-backend-in-a-box` §③b.
 const RESERVED_SLUGS = new Set(['www', 'docs', 'api', 'admin', 'relay', 'mail']);
-const BUILTINS = new Set(['stt', 'summarize', 'tts', 'generate', 'translate']);
+const BUILTINS = new Set(['stt', 'summarize', 'tts', 'generate', 'translate', 'extract']);
 const ACTION_IO_CONTRACTS = {
+  extract: {
+    input: { required: { url: 'text' }, optional: {} },
+    output: { required: { url: 'text', title: 'text', excerpt: 'text', content: 'text', provider: 'text' }, optional: {} },
+  },
   stt: {
     input: { required: { audio: 'object-ref' }, optional: { language: 'text' } },
     output: { required: { text: 'text' }, optional: { language: 'text', durationMs: 'number' } },
@@ -261,10 +265,14 @@ function sqlIsSafe(sql: string, params: unknown, declaredTables: Set<string>): b
 
   const knownTables = new Set([...declaredTables].map(name => name.toLowerCase()));
   for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i]!;
+    const token: SqlToken = tokens[i]!;
     if (token.type !== 'word' || !SQL_TABLE_KEYWORDS.has(token.value.toUpperCase())) continue;
     if (token.value.toUpperCase() === 'FROM' && !fromCommaTablesAreDeclared(tokens, i, knownTables)) return false;
-    const table = tokens[i + 1];
+    const tableIndex = token.value.toUpperCase() === 'UPDATE'
+      && tokens[i + 1]?.value.toUpperCase() === 'OR' && tokens[i + 2]?.value.toUpperCase() === 'REPLACE'
+      ? i + 3
+      : i + 1;
+    const table = tokens[tableIndex];
     if (!table) continue;
     if (table.value === '(') {
       // Derived tables must be a query; a parenthesized bare table name is not a declaration bypass.
@@ -274,7 +282,7 @@ function sqlIsSafe(sql: string, params: unknown, declaredTables: Set<string>): b
     }
     if (table.type !== 'word') continue;
     let tableName = table.value;
-    if (tokens[i + 2]?.value === '.') return false; // app tables are local, unqualified names
+    if (tokens[tableIndex + 1]?.value === '.') return false; // app tables are local, unqualified names
     if (!knownTables.has(tableName.toLowerCase())) return false;
   }
   return true;
@@ -362,13 +370,17 @@ function validateManifest(
       const raw = doc.actions[name];
       const path = mapEntryPath('/actions', index);
       if (!isRecord(raw)) { push(errors, path, '동작 선언은 맵이어야 한다'); continue; }
-      if (typeof raw.builtin !== 'string' || !BUILTINS.has(raw.builtin)) push(errors, `${path}/builtin`, '허용된 내장 동작(stt, summarize, tts, generate, translate) 중 하나여야 한다');
+      if (typeof raw.builtin !== 'string' || !BUILTINS.has(raw.builtin)) push(errors, `${path}/builtin`, '허용된 내장 동작(stt, summarize, tts, generate, translate, extract) 중 하나여야 한다');
       else if (Object.hasOwn(ACTION_IO_CONTRACTS, raw.builtin)) {
         const contract = ACTION_IO_CONTRACTS[raw.builtin as keyof typeof ACTION_IO_CONTRACTS];
         validateActionIo(raw, path, 'input', contract.input, errors);
         validateActionIo(raw, path, 'output', contract.output, errors);
       }
       if (raw.uses !== undefined) validateCredentialList(raw.uses, `${path}/uses`, errors, false);
+      if (raw.allow !== undefined && (!Array.isArray(raw.allow) || raw.allow.length === 0
+        || raw.allow.some(role => typeof role !== 'string' || !roles.has(role)))) {
+        push(errors, `${path}/allow`, 'allow 은 선언된 역할만 포함하는 비어 있지 않은 목록이어야 한다');
+      }
       if (raw.async === true && raw.builtin === 'generate' && !nonEmptyString(raw.spend)) push(errors, `${path}/spend`, '비동기 generate 는 spend 선언이 필요하다');
     }
   }

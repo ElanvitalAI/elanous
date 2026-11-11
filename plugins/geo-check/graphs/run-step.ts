@@ -23,8 +23,7 @@ const engines = input.engines === undefined ? ['openai-codex', 'grok'] : strings
 if (!engines.length || engines.length > 3 || engines.length !== new Set(engines).size || (input.engines !== undefined && (!Array.isArray(input.engines) || strings(input.engines).length !== input.engines.length))) throw new Error('engines must contain 1 to 3 distinct names');
 const cli = process.env.GEO_CHECK_ELANOUS_BIN || 'elanous';
 
-// Ask from an empty folder: run inside a brand's own repository, `elanous ask` carries that project's
-// context (AGENTS.md and the like) and the answers «know» the brand — a marketer's folder inflated mentions 0/10 → 9/10.
+// Ask context-free model questions from an empty folder so caller files and Elanous project context do not bias engine answers.
 const neutralDir = mkdtempSync(join(tmpdir(), 'geo-check-'));
 function neutralEnv(engine?: string): Record<string, string | undefined> {
   const { ELANOUS_TOOL_CWD: _tool, ...rest } = process.env;
@@ -43,17 +42,12 @@ async function invoke(args: string[], engine?: string): Promise<unknown> {
   if (!last) throw new Error('CLI returned no JSON');
   return JSON.parse(last) as unknown;
 }
-// An installed elanous older than `ask --bare` rejects the flag; ask the plain way and mark the row so the report can say so.
-async function askEngine(question: string, engine: string): Promise<{ answer: string; bare: boolean }> {
-  try { return { answer: reply(await invoke(['ask', '--bare', '--json', question], engine)), bare: true }; }
-  catch (e) {
-    if (!/unknown option '--bare'/.test(errorLine(e))) throw e;
-    return { answer: reply(await invoke(['ask', '--json', question], engine)), bare: false };
-  }
+async function askEngine(question: string, engine: string): Promise<{ answer: string }> {
+  return { answer: reply(await invoke(['llm', '--json', question], engine)) };
 }
 function reply(raw: unknown): string {
   const result = object(raw);
-  if (typeof result.reply !== 'string') throw new Error('ask returned no reply');
+  if (typeof result.reply !== 'string') throw new Error('llm returned no reply');
   return result.reply;
 }
 function parseArray(raw: string): unknown {
@@ -124,8 +118,8 @@ async function run(step: string): Promise<void> {
     let failures = 0;
     for (const question of questions) for (const engine of engines) {
       try {
-        const { answer, bare } = await askEngine(question, engine);
-        answers.push({ question, engine, answer, ...(bare ? {} : { bare: false }) });
+        const { answer } = await askEngine(question, engine);
+        answers.push({ question, engine, answer });
       }
       catch (e) { failures++; answers.push({ question, engine, error: errorLine(e) }); }
     }

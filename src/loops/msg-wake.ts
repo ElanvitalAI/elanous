@@ -22,7 +22,7 @@
 //    재두드림 «전»에 그 주소 미읽음을 잰다 — 0 이면 두드리지 않고 줄을 지운다(`dropped-read` · H4-FOLLOW ③).
 
 import { Database } from 'bun:sqlite';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -33,7 +33,7 @@ import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js'
 import { canonicalSeatId, readUnreadCount } from '../msg/msg-store.js';
 import { herdrPrompt, type HerdrCliRunner } from '../pty-shell/herdr-prompt.js';
 import { listPtyManifestRows } from '../pty-shell/pty-manifest.js';
-import { messageRouteFor, SEAT_MESSAGE_ROUTES, type MessageWake } from './msg-address.js';
+import { messageRouteFor, parsePaneMessageAddress, SEAT_MESSAGE_ROUTES, type MessageWake } from './msg-address.js';
 import { acquireLockSync } from '../storage/file-lock.js';
 import { readSeatRegistry, seatRegistryEntry, seatRegistryPath, type SeatRegistryEntry } from './seat-registry.js';
 
@@ -75,6 +75,10 @@ export interface WakeDeps {
   live?: boolean;
   timeoutMs?: number;
   listPtys?: () => Array<{ id: string; nickname?: string; alive: boolean; turnState?: 'busy' | 'idle' }>;
+  /** Herdr pane census seam used for explicit pane/session addresses and undeclared-seat recovery. */
+  listHerdrPanes?: () => Array<{ paneId: string; sessionId?: string; title?: string; cwd?: string; host?: string; status?: string }> | null;
+  /** Process boundary seam for testing Herdr's JSON command and failure modes. */
+  runHerdrPaneList?: () => { status: number | null; stdout: string; error?: unknown };
   /** Reads one seat-folder file (`pty.ref` · `herdr.pane`); null when absent. */
   readPane?: (path: string) => string | null;
   /** Does this seat-folder opt-in file exist (`<seat>/wake-inject`)? */
@@ -92,6 +96,86 @@ export interface WakeDeps {
   warn?: (line: string) => void;
   /** Unread count for an address before a deferred re-knock (H4-FOLLOW ③). null = «모름» (never drops). Default: the msg ledger. */
   readUnread?: (address: string) => number | null;
+}
+
+type HerdrPane = { paneId: string; sessionId?: string; title?: string; cwd?: string; host?: string; status?: string };
+
+let paneCensusCachedAt = 0;
+let paneCensusHasValue = false;
+let paneCensusCache: HerdrPane[] | null = null;
+
+function herdrPaneCensus(run?: WakeDeps['runHerdrPaneList']): HerdrPane[] | null {
+  if (!run && paneCensusHasValue && Date.now() - paneCensusCachedAt < 500) return paneCensusCache;
+  const result = (run ?? (() => spawnSync('herdr', ['pane', 'list', '--json'], { encoding: 'utf8', timeout: 1500, windowsHide: true })))();
+  let parsed: HerdrPane[] | null = null;
+  if (result.status !== 0 || result.error) {
+    parsed = null;
+  } else {
+    try {
+      const envelope = JSON.parse(result.stdout) as { result?: { panes?: unknown[] } };
+      if (!Array.isArray(envelope.result?.panes)) throw new Error('invalid herdr pane list envelope');
+      parsed = envelope.result.panes.map(value => {
+        if (!value || typeof value !== 'object') throw new Error('invalid herdr pane row');
+        const row = value as Record<string, unknown>;
+        const paneId = row.pane_id ?? row.paneId;
+        if (typeof paneId !== 'string' || !/^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/.test(paneId)) throw new Error('invalid herdr pane ID');
+        const string = (...keys: string[]) => {
+          const key = keys.find(candidate => Object.hasOwn(row, candidate));
+          if (key === undefined) return undefined;
+          if (typeof row[key] !== 'string') throw new Error(`invalid Herdr pane field: ${key}`);
+          return row[key] as string;
+        };
+        const sessionId = string('session_id', 'sessionId');
+        const title = string('title', 'name');
+        const cwd = string('cwd', 'working_directory');
+        const host = string('host', 'ssh_host');
+        const status = string('agent_status', 'pane_status', 'status');
+        return { paneId, ...(sessionId ? { sessionId } : {}), ...(title ? { title } : {}), ...(cwd ? { cwd } : {}), ...(host ? { host } : {}), ...(status ? { status } : {}) };
+      });
+    } catch { parsed = null; }
+  }
+  if (!run) {
+    paneCensusCache = parsed;
+    paneCensusCachedAt = Date.now();
+    paneCensusHasValue = true;
+  }
+  return parsed;
+}
+
+function paneLiveness(pane: HerdrPane): 'live' | 'dead' | 'unknown' {
+  const status = pane.status?.trim().toLowerCase();
+  if (status && ['idle', 'working', 'blocked'].includes(status)) return 'live';
+  if (status && ['done', 'dead', 'exited', 'closed', 'stopped', 'missing'].includes(status)) return 'dead';
+  return 'unknown';
+}
+
+function paneLivenessReason(pane: HerdrPane, type: 'pane' | 'session'): string {
+  return paneLiveness(pane) === 'dead' ? `dead-${type}-address` : 'pane-status-unknown';
+}
+
+function unresolved(reason: string): WakeResolution {
+  return { wake: 'none', source: 'unresolved', reason };
+}
+
+function seatsFromPane(row: HerdrPane): string[] {
+  const candidates = [
+    /\|\s*([A-Za-z][A-Za-z0-9_-]*)\s*$/.exec(row.title ?? '')?.[1],
+    /(?:^|[/\\])seats[/\\]([A-Za-z][A-Za-z0-9_-]*)(?:[/\\]|$)/i.exec(row.cwd ?? '')?.[1],
+  ].filter((seat): seat is string => seat !== undefined).map(seat => seat.toUpperCase());
+  return [...new Set(candidates)];
+}
+
+function paneSeatIdentity(row: HerdrPane): { seats: string[]; complete: boolean; ambiguous: boolean } {
+  const seats = seatsFromPane(row);
+  return { seats, complete: row.title !== undefined && row.cwd !== undefined, ambiguous: seats.length > 1 };
+}
+
+function paneOptIn(row: HerdrPane, deps: WakeDeps): boolean {
+  const seats = seatsFromPane(row);
+  if (seats.length !== 1) return false;
+  const seat = seats[0]!;
+  const path = join(resolveSeatStateRoot(deps), seat, WAKE_OPT_IN_FILE);
+  return deps.hasOptIn?.(path) ?? existsSync(path);
 }
 
 function isLive(deps: WakeDeps): boolean {
@@ -112,6 +196,19 @@ function registryFor(deps: WakeDeps) {
 function wakeResolutionForSeat(entry: SeatRegistryEntry): WakeResolution {
   return { wake: entry.wake, ...(entry.target ? { target: entry.target } : {}), source: 'seat-registry',
     host: entry.host, optIn: entry.optIn, ...(entry.wake === 'none' ? { reason: 'registry-wake-disabled' } : {}) };
+}
+
+function validateRegisteredHerdrPane(entry: SeatRegistryEntry, census: () => HerdrPane[] | null): WakeResolution {
+  const registered = wakeResolutionForSeat(entry);
+  if (entry.wake !== 'herdr' || !entry.target) return registered;
+  const panes = census();
+  if (panes === null) return unresolved('pane-census-unavailable:candidates=unknown');
+  const matches = panes.filter(row => row.paneId === entry.target);
+  if (matches.length !== 1) return unresolved(`${matches.length > 1 ? 'ambiguous-pane' : 'dead-pane-address'}:candidates=${matches.length}`);
+  const pane = matches[0]!;
+  const liveness = paneLiveness(pane);
+  if (liveness !== 'live') return unresolved(`${paneLivenessReason(pane, 'pane')}:candidates=1`);
+  return { ...registered, host: entry.host || pane.host };
 }
 
 /** Reply-body policy shares the same address registry used for wake routing. */
@@ -151,19 +248,61 @@ export function remoteHerdrRunner(host: string): HerdrCliRunner {
 
 /** How a post to `address` would wake its reader — table first, then a live pty named after the seat, then herdr. */
 export function resolveWake(address: string, deps: WakeDeps = {}): WakeResolution {
-  const name = address.trim().toUpperCase();
+  const raw = address.trim();
+  const name = raw.toUpperCase();
   if (name === 'ALL') return { wake: 'none', source: 'unresolved', reason: 'topic' };
-  const route = messageRouteFor(name);
-  if (route?.wake) return { wake: route.wake, source: 'loop-table' };
-  // Registered seat addresses are resolved from one operational SSOT. Once present, the file is
-  // authoritative: an absent row never falls through to a similarly named pane or seat folder.
+  const loop = messageRouteFor(name);
+  if (loop?.wake) return { wake: loop.wake, source: 'loop-table' };
+  const direct = parsePaneMessageAddress(raw);
+  const census = () => deps.listHerdrPanes ? deps.listHerdrPanes() : herdrPaneCensus(deps.runHerdrPaneList);
+  if (direct?.kind === 'pane') {
+    const panes = census();
+    if (panes === null) return unresolved('pane-census-unavailable:candidates=unknown');
+    const matches = panes.filter(row => row.paneId === direct.paneId);
+    const pane = matches.length === 1 && paneLiveness(matches[0]!) === 'live' ? matches[0] : undefined;
+    return pane ? { wake: 'herdr', target: pane.paneId, source: 'herdr.pane', ...(pane.host ? { host: pane.host } : {}), optIn: paneOptIn(pane, deps) }
+      : unresolved(`${matches.length > 1 ? 'ambiguous-pane' : matches.length === 1 ? paneLivenessReason(matches[0]!, 'pane') : 'dead-pane-address'}:candidates=${matches.length}`);
+  }
+  if (direct?.kind === 'session') {
+    const panes = census();
+    if (panes === null) return unresolved('pane-census-unavailable:candidates=unknown');
+    if (panes.some(row => row.sessionId === undefined)) return unresolved(`session-address-fields-unknown:candidates=${panes.length}`);
+    const matches = panes.filter(row => row.sessionId === direct.sessionId);
+    const pane = matches.length === 1 && paneLiveness(matches[0]!) === 'live' ? matches[0] : undefined;
+    return pane ? { wake: 'herdr', target: pane.paneId, source: 'herdr.pane', ...(pane.host ? { host: pane.host } : {}), optIn: paneOptIn(pane, deps) }
+      : unresolved(matches.length > 1 ? `ambiguous-session:candidates=${matches.length}` : matches.length === 1
+        ? `${paneLivenessReason(matches[0]!, 'session')}:candidates=1` : `dead-session-address:candidates=0`);
+  }
+  if (direct?.kind === 'seat-pane') {
+    const panes = census();
+    if (panes === null) return unresolved('pane-census-unavailable:candidates=unknown');
+    const paneRows = panes.filter(row => row.paneId === direct.pane || row.paneId.endsWith(`:${direct.pane}`));
+    if (paneRows.some(row => paneSeatIdentity(row).ambiguous)) return unresolved(`ambiguous-pane:candidates=${paneRows.length}`);
+    if (paneRows.some(row => !paneSeatIdentity(row).complete)) return unresolved(`pane-address-fields-unknown:candidates=${paneRows.length}`);
+    const matches = paneRows.filter(row => paneSeatIdentity(row).seats.includes(direct.seat));
+    const pane = matches.length === 1 && paneLiveness(matches[0]!) === 'live' ? matches[0] : undefined;
+    return pane ? { wake: 'herdr', target: pane.paneId, source: 'herdr.pane', ...(pane.host ? { host: pane.host } : {}), optIn: paneOptIn(pane, deps) }
+      : unresolved(matches.length > 1 ? `ambiguous-pane:candidates=${matches.length}` : matches.length === 1
+        ? `${paneLivenessReason(matches[0]!, 'pane')}:candidates=1` : `dead-pane-address:candidates=0`);
+  }
+  // Explicit registry entries remain authoritative; an absent declaration can resolve by pane title/cwd.
   const registry = registryFor(deps);
   if (registry.status === 'invalid') return { wake: 'none', source: 'unresolved', reason: `invalid-seat-registry:${registry.reason}` };
   if (registry.status === 'ready') {
     const entry = seatRegistryEntry(registry.registry, name);
-    return entry ? wakeResolutionForSeat(entry) : { wake: 'none', source: 'unresolved', reason: 'undeclared-address' };
+    if (entry) return validateRegisteredHerdrPane(entry, census);
   }
-  return { wake: 'none', source: 'unresolved', reason: 'seat-registry-missing' };
+  const seatName = name.replace(/^SEAT:/, '');
+  const panes = census();
+  if (panes === null) return unresolved('pane-census-unavailable:candidates=unknown');
+  const allMatches = panes.filter(row => seatsFromPane(row).includes(seatName));
+  if (allMatches.some(row => paneSeatIdentity(row).ambiguous)) return unresolved(`ambiguous-seat:candidates=${allMatches.length}`);
+  if (panes.some(row => !paneSeatIdentity(row).complete)) return unresolved(`seat-address-fields-unknown:candidates=${panes.length}`);
+  return allMatches.length === 1 && paneLiveness(allMatches[0]!) === 'live'
+    ? { wake: 'herdr', target: allMatches[0]!.paneId, source: 'herdr.pane', ...(allMatches[0]!.host ? { host: allMatches[0]!.host } : {}), optIn: paneOptIn(allMatches[0]!, deps) }
+    : unresolved(allMatches.length > 1 ? `ambiguous-seat:candidates=${allMatches.length}`
+      : allMatches.length === 1 ? `${paneLivenessReason(allMatches[0]!, 'pane')}:candidates=1`
+        : `${registry.status === 'absent' ? 'seat-registry-missing' : 'undeclared-address'}:candidates=${panes.length}`);
 }
 
 export interface RegisterSeatPaneOptions {

@@ -21,6 +21,7 @@ import {
   saveUserConfig,
 } from './user-config.js';
 import { debug } from './debug/log.js';
+import { DEFAULT_TRAIN_WORKER_POLICY } from './loops/train/worker-lifecycle.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -52,6 +53,14 @@ test('nexus relay config is opt-in and normalizes its connection fields', () => 
   expect(resolveNexusRelayConfig(buildUserConfig(configPath))).toEqual({ enabled: false });
 });
 
+test('Guardian train worker policy comes from config and rejects invalid overrides', () => {
+  writeConfig({ guardian: { trainWorkerPolicy: DEFAULT_TRAIN_WORKER_POLICY } });
+  expect(buildUserConfig(configPath).guardian?.trainWorkerPolicy).toEqual(DEFAULT_TRAIN_WORKER_POLICY);
+  writeConfig({ guardian: { trainWorkerPolicy: { ...DEFAULT_TRAIN_WORKER_POLICY,
+    scaleUpCpuPercent: DEFAULT_TRAIN_WORKER_POLICY.scaleDownCpuPercent } } });
+  expect(buildUserConfig(configPath).guardian?.trainWorkerPolicy).toBeUndefined();
+});
+
 test('outbound quietHours accepts off and KST ranges and survives config save', () => {
   writeConfig({ outbound: { quietHours: 'off', deferredMaxAttempts: 7 } });
   const off = buildUserConfig(configPath);
@@ -74,6 +83,18 @@ test('legacy TUI preferences are ignored and removed on save', () => {
   saveUserConfig(cfg, configPath);
   const saved = JSON.parse(readFileSync(configPath, 'utf8'));
   expect(saved).not.toHaveProperty('tui');
+});
+
+test('next TUI compact height survives config round-trip while retired TUI keys do not', () => {
+  writeConfig({ tui: { sidetab: 'open', next: { compactHeight: 20 } } });
+  const cfg = buildUserConfig(configPath);
+  expect(cfg.tui).toEqual({ sidetab: 'collapsed', next: { compactHeight: 20 } });
+  saveUserConfig(cfg, configPath);
+  expect(JSON.parse(readFileSync(configPath, 'utf8')).tui).toEqual({ next: { compactHeight: 20 } });
+  for (const invalid of [7, 101, 20.5, '20', null]) {
+    writeConfig({ tui: { next: { compactHeight: invalid } } });
+    expect(buildUserConfig(configPath).tui?.next).toBeUndefined();
+  }
 });
 
 test('openai-codex provider default follows the recommended GPT-6.1 Terra model', () => {

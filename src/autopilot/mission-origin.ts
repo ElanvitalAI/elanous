@@ -9,7 +9,7 @@
 
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { elanousStateRoot } from './state-paths.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { join } from 'node:path';
 

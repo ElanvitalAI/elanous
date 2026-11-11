@@ -51,7 +51,7 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 import { nativeToolCatalog, type NativeToolCatalogEntry } from '../../native-tool-catalog.js';
 import { listToolRuntimes } from '../../tool-runtime/registry.js';
 import { DEFAULT_MAX_RESULTS, MAX_RESULTS_HARD_CAP, HYDRATED_TOOLS_KEY } from './tool-search-spec.js';
-import { buildToolRouteIndex, routeToolIntentWithFallback } from '../../tool-router/index.js';
+import { buildToolRouteIndex, routeToolIntentWithFallback, type ToolRouteIndex } from '../../tool-router/index.js';
 import { debug } from '../../debug/log.js';
 
 export { buildToolSearchTool, TOOL_SEARCH_NAME } from './tool-search-spec.js';
@@ -70,6 +70,8 @@ export interface ToolSearchOpts {
    *  hydrate their own deferred tools. Omit for registry-only lookup
    *  (dashboard behaviour, unchanged). */
   specs?: readonly LLMToolSpec[];
+  /** Restrict route discovery to plugins active on this surface. */
+  activePluginIds?: ReadonlySet<string>;
   /** Optional surface label for route-decision observations. */
   surface?: string;
 }
@@ -311,6 +313,36 @@ export function dispatchToolSearchRoute(
   };
 }
 
+/** Build the production route index with each graph handler constrained to its plugin's declared IDs. */
+export function buildToolSearchRouteIndex(routeSpecs: readonly LLMToolSpec[]): {
+  index: ToolRouteIndex;
+  allowedGraphIdsByPlugin: ReadonlyMap<string, ReadonlySet<string>>;
+} {
+  const allowedGraphIdsByPlugin = new Map<string, ReadonlySet<string>>();
+  const allowedGraphIdsByRoute = new Map<string, ReadonlySet<string>>();
+  for (const spec of routeSpecs) {
+    if (spec.pluginId && spec.handlerRef && /^(?:\.\/)?graph:/.test(spec.handlerRef)) {
+      allowedGraphIdsByPlugin.set(spec.pluginId, new Set([
+        ...(allowedGraphIdsByPlugin.get(spec.pluginId) ?? []), ...(spec.allowedGraphIds ?? []),
+      ]));
+      const routeKey = `${spec.pluginId}:${spec.name}`;
+      const declaredForRoute = new Set(spec.allowedGraphIds ?? []);
+      const previousForRoute = allowedGraphIdsByRoute.get(routeKey);
+      allowedGraphIdsByRoute.set(routeKey, previousForRoute
+        ? new Set([...previousForRoute].filter((graphId) => declaredForRoute.has(graphId)))
+        : declaredForRoute);
+    }
+  }
+  const routeSources = routeSpecs.filter((spec) => spec.pluginId && spec.route).map((spec) => ({
+    pluginId: spec.pluginId!,
+    tools: [{ name: spec.name, description: spec.description, handler: spec.handlerRef, route: spec.route! }],
+  }));
+  return {
+    index: buildToolRouteIndex(routeSources, { allowedGraphIdsByRoute }),
+    allowedGraphIdsByPlugin,
+  };
+}
+
 /** Dispatch entrypoint. Pure (no I/O) — looks up tool specs directly
  *  from the runtime registry so tests can exercise it by registering
  *  fake runtimes. */
@@ -318,18 +350,25 @@ export function dispatchToolSearch(
   args: ToolSearchArgs,
   opts: ToolSearchOpts = {},
 ): ToolSearchResult {
+  // A supplied spec pool is the active surface; registry-only lookup has no local active scope.
+  const activePluginIds = opts.activePluginIds ?? (opts.specs
+    ? new Set(opts.specs.flatMap((spec) => spec.pluginId ? [spec.pluginId] : []))
+    : undefined);
+  const surfaceSpecs = activePluginIds
+    ? opts.specs?.filter((spec) => !spec.pluginId || activePluginIds.has(spec.pluginId))
+    : opts.specs;
   const maxResults = Math.min(
     Math.max(1, Math.floor(args.max_results ?? DEFAULT_MAX_RESULTS)),
     MAX_RESULTS_HARD_CAP,
   );
   if (/^route:\s*/i.test(args.query)) {
     const intent = args.query.replace(/^route:\s*/i, '').trim();
-    const routeSpecs = (opts.specs ?? []).filter((spec) => spec.pluginId && spec.route);
+    const routeSpecs = (surfaceSpecs ?? []).filter((spec) => spec.pluginId && spec.route);
     const enabledPluginIds = new Set(routeSpecs.map((spec) => spec.pluginId!));
-    const decision = routeToolIntentWithFallback(intent, () => buildToolRouteIndex(routeSpecs.map((spec) => ({
-      pluginId: spec.pluginId!,
-      tools: [{ name: spec.name, description: spec.description, route: spec.route! }],
-    }))), { enabledPluginIds, limit: args.max_results === undefined ? 1 : maxResults });
+    const { index, allowedGraphIdsByPlugin } = buildToolSearchRouteIndex(routeSpecs);
+    const decision = routeToolIntentWithFallback(intent, () => index,
+      { enabledPluginIds, activePluginIds: opts.activePluginIds, allowedGraphIdsByPlugin,
+      limit: args.max_results === undefined ? 1 : maxResults });
     const routes: { pluginId: string; name: string }[] = [];
     const seenRouteNames = new Set<string>();
     for (const match of decision.matches) {
@@ -347,7 +386,8 @@ export function dispatchToolSearch(
     return result;
   }
   const parsed = parseToolSearchQuery(args.query);
-  const entries = listSearchCandidates(opts.specs);
+  const entries = listSearchCandidates(surfaceSpecs)
+    .filter(({ spec }) => !spec.pluginId || !activePluginIds || activePluginIds.has(spec.pluginId));
 
   if (parsed.kind === 'select') {
     const matched: SearchCandidate[] = [];

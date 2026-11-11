@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { releasePathHold, releasePrFilePaths } from '../self-dev/release-path-guard.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 import type { QueueItem, QueueSeat } from './harness-queue.js';
 import type { RunGh, ScannedStoppedPr, StoppedPrCategory } from './helper-scan.js';

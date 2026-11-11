@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -228,6 +228,7 @@ function advanceLines(result: AdvanceMissionResult): string[] {
  *  (ORCH-LIVE-1008: the orchestrator tick runs `bun …/tick.ts delegate`, so the hand launched `tick.ts --config-dir …
  *  harness say …`, which exited 2 with stdio ignored — the card said `launched` and no run ever started). */
 export const ELANOUS_CLI_ENTRY = resolve(import.meta.dir, '../../bin/elanous.mjs');
+export const TASK_LAUNCH_SUPERVISOR_ENTRY = resolve(import.meta.dir, './task-launch-supervisor.ts');
 
 /** argv for a detached `elanous` child that runs `args` in `configDir`. */
 export function taskLauncherArgv(configDir: string, args: readonly string[]): string[] {
@@ -241,8 +242,10 @@ export interface DefaultTaskLauncherDeps {
   spawn?: DetachedSpawn;
   /** 조기 종료 감시 창(ms) — context(런 id)가 있을 때만 · 0 이면 감시하지 않는다(옛 동작). */
   earlyExitWindowMs?: number;
-  /** 자식 stderr 를 받을 디렉토리(시험 주입). 기본 = `<tmpdir>/elanous-task-launch`. */
+  /** 자식 stderr 를 받을 디렉토리(시험 주입). 기본은 실행별 임시 디렉터리다. */
   stderrDir?: string;
+  /** 실행별 stderr 임시 디렉터리의 부모(시험 주입). */
+  stderrTempRoot?: string;
   /** stop 줄 기록기(시험 주입). 기본 = 런 원장. */
   writeStop?: import('../self-implement/run-ledger.js').RunLedgerWriter;
   /** 이미 stop 이 있나(시험 주입). 기본 = 이 우주 런 원장 ⊕ 이 프로세스 기록. */
@@ -586,7 +589,7 @@ export async function runRemoteTaskParent(args: string[], context: TaskLaunchCon
   return { dispatched: true, exitCode: receipt.exitCode ?? 0, host: receipt.parentHost?.host ?? 'unknown' };
 }
 
-/** Advisory lines may precede the actual fatal error. Keep the full stderr as evidence. */
+/** Advisory lines may precede the fatal error; select its actionable line while the scratch file exists. */
 function actionableStderrLine(path: string): string {
   try {
     const fd = openSync(path, 'r');
@@ -630,48 +633,74 @@ export async function defaultTaskLauncher(args: string[], cwd?: string, context?
   }
   // STOP-RECORD launch-failed: stdio 를 버리면 자식이 exit 2 로 죽어도 흔적이 0 이고 카드는 «launched» 로 남는다
   // (ORCH-LIVE-1008). stderr 만 파일로 받고(파이프는 부모가 먼저 끝나면 자식을 EPIPE 로 죽인다), 짧은 창 안의 종료를 본다.
-  const stderrDir = deps.stderrDir ?? join(tmpdir(), 'elanous-task-launch');
-  mkdirSync(stderrDir, { recursive: true });
+  const ownsStderrDir = deps.stderrDir === undefined;
+  const stderrDir = deps.stderrDir ?? mkdtempSync(join(deps.stderrTempRoot ?? tmpdir(), 'tasks-cli-launch-'));
+  if (!ownsStderrDir) mkdirSync(stderrDir, { recursive: true });
   const stderrPath = join(stderrDir, `${context.runId}.stderr`);
-  // 'w' — 같은 runId 재발사가 지난 시도의 stderr 를 이번 cause 로 읽지 않게(리뷰 must-fix).
-  const fd = openSync(stderrPath, 'w');
+  let fd: number | undefined;
   let exited: Promise<{ code: number | null; signal: string | null }> | undefined;
-  const watched: DetachedSpawn = (command, spawnArgs, options) => {
-    const child = (spawn as unknown as (c: string, a: string[], o: unknown) => ReturnType<DetachedSpawn>)(command, spawnArgs, { ...options, stdio: ['ignore', 'ignore', fd] });
-    const emitter = child as unknown as { once?: (event: 'exit', listener: (code: number | null, signal: string | null) => void) => unknown };
-    exited = new Promise((done) => { emitter.once?.('exit', (code, signal) => done({ code, signal })); });
-    return child;
+  let childExited = false;
+  let deferStderrCleanup = false;
+  let scratchCleaned = false;
+  const cleanupScratch = () => {
+    if (scratchCleaned) return;
+    scratchCleaned = true;
+    if (ownsStderrDir) rmSync(stderrDir, { recursive: true, force: true });
+    else { try { unlinkSync(stderrPath); } catch { /* no stderr file was created */ } }
   };
   try {
-    await spawnDetachedConfirmed(watched, process.execPath, argv, SPAWN_CONFIRM_TIMEOUT_MS, cwd, localContext!.env);
+    // 'w' — 같은 runId 재발사가 지난 시도의 stderr 를 이번 cause 로 읽지 않게(리뷰 must-fix).
+    fd = openSync(stderrPath, 'w');
+    const watched: DetachedSpawn = (command, spawnArgs, options) => {
+      const child = (spawn as unknown as (c: string, a: string[], o: unknown) => ReturnType<DetachedSpawn>)(command, spawnArgs, { ...options, stdio: ['ignore', 'ignore', fd] });
+      const emitter = child as unknown as { once?: (event: 'exit', listener: (code: number | null, signal: string | null) => void) => unknown };
+      exited = new Promise((done) => { emitter.once?.('exit', (code, signal) => {
+        childExited = true;
+        done({ code, signal });
+        if (deferStderrCleanup) cleanupScratch();
+      }); });
+      return child;
+    };
+    try {
+      await spawnDetachedConfirmed(watched, process.execPath,
+        [TASK_LAUNCH_SUPERVISOR_ENTRY, stderrDir, String(process.pid), process.execPath, ...argv], SPAWN_CONFIRM_TIMEOUT_MS, cwd, localContext!.env);
+    } finally {
+      try { closeSync(fd); } catch { /* the child keeps its own copy */ }
+      fd = undefined;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const early = exited
+      ? await Promise.race([exited, new Promise<undefined>((done) => { timer = setTimeout(() => done(undefined), window); })])
+      : undefined;
+    if (timer) clearTimeout(timer);
+    if (early && early.code !== 0) {
+      const first = actionableStderrLine(stderrPath);
+      const cause = `child rc=${early.code ?? early.signal ?? 'unknown'}${first ? `: ${first}` : ''}`;
+      const { boundRunStopCause, recordRunStop, runStopRecorded, RUN_STOP_EVENT } = await import('../self-implement/run-stop.js');
+      const hasStop = deps.hasStop ?? ((id: string) => {
+        if (runStopRecorded(id)) return true;
+        try { return (loadRunLedgerSync(id) ?? []).some((entry) => entry.event === RUN_STOP_EVENT); } catch { return false; }
+      });
+      // 자식이 같은 runId 로 이미 stop 을 썼으면 더하지 않는다(런마다 한 줄 · 리뷰 must-fix).
+      if (hasStop(context.runId)) throw new Error(`발사 직후 자식이 종료했다 — ${boundRunStopCause(cause)}`);
+      const entry = recordRunStop({
+        runId: context.runId, site: 'launch-failed', class: 'launch-failed',
+        cause,
+        evidenceRef: `run-ledger:${context.runId}:stop`,
+        nextMove: 'Fix the launch argv/config from the recorded cause, then re-hand the card',
+      }, ...(deps.writeStop ? [deps.writeStop] : []));
+      // handTask 가 이 예외로 카드를 `launch-failed` 로 적는다(«launched» 로 남지 않게).
+      throw new Error(`발사 직후 자식이 종료했다 — ${String(entry.data.cause)}`);
+    }
+    return { runId: context.runId };
   } finally {
-    try { closeSync(fd); } catch { /* the child keeps its own copy */ }
+    if (fd !== undefined) { try { closeSync(fd); } catch { /* already closed or owned by the child */ } }
+    try { writeFileSync(join(stderrDir, '.launcher-finished'), String(process.pid)); } catch { /* cleaner waits for launcher exit */ }
+    // A still-running child owns a copy of the descriptor. Keep its visible path for the
+    // host GC's open-file guard; the child supervisor removes it after child exit if this process is gone.
+    if (exited && !childExited) deferStderrCleanup = true;
+    else cleanupScratch();
   }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const early = exited
-    ? await Promise.race([exited, new Promise<undefined>((done) => { timer = setTimeout(() => done(undefined), window); })])
-    : undefined;
-  if (timer) clearTimeout(timer);
-  if (early && early.code !== 0) {
-    const first = actionableStderrLine(stderrPath);
-    const cause = `child rc=${early.code ?? early.signal ?? 'unknown'}${first ? `: ${first}` : ''}`;
-    const { boundRunStopCause, recordRunStop, runStopRecorded, RUN_STOP_EVENT } = await import('../self-implement/run-stop.js');
-    const hasStop = deps.hasStop ?? ((id: string) => {
-      if (runStopRecorded(id)) return true;
-      try { return (loadRunLedgerSync(id) ?? []).some((entry) => entry.event === RUN_STOP_EVENT); } catch { return false; }
-    });
-    // 자식이 같은 runId 로 이미 stop 을 썼으면 더하지 않는다(런마다 한 줄 · 리뷰 must-fix).
-    if (hasStop(context.runId)) throw new Error(`발사 직후 자식이 종료했다 — ${boundRunStopCause(cause)}`);
-    const entry = recordRunStop({
-      runId: context.runId, site: 'launch-failed', class: 'launch-failed',
-      cause,
-      evidenceRef: stderrPath,
-      nextMove: 'Fix the launch argv/config from the stderr evidence, then re-hand the card',
-    }, ...(deps.writeStop ? [deps.writeStop] : []));
-    // handTask 가 이 예외로 카드를 `launch-failed` 로 적는다(«launched» 로 남지 않게).
-    throw new Error(`발사 직후 자식이 종료했다 — ${String(entry.data.cause)}`);
-  }
-  return { runId: context.runId };
 }
 
 /** `spawn` 의 필요한 면만(시험 주입). */

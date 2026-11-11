@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/graph-run-lifecycle-world.ts",
+  "reason": "New graph lifecycle simulator for GRAPH-INSTANCE-PAUSE-CANCEL-FORK."
+}

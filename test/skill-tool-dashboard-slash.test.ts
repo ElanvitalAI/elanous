@@ -139,13 +139,13 @@ describe('ALLOWED_SLASHES — «약속한 이름»이 실제로 닿는가', () =
 
   const immediateDeps = {
     getStatusLines: () => ['status'],
-    openSurfaceCatalog: () => true,
+    openPaneModal: () => {},
   };
   // ⛔ 인자 «0개»로만 치면 「인자를 요구하는」 즉시 명령이 「안 닿는다」로 «잘못» 보인다
   //   (📏 2026-08-21: /surf 는 args.length >= 1 일 때만 처리되는데 라이브에선 «작동»한다).
   //   ⇒ 대표 인자 하나를 같이 태운다. 실행이 던지면 그 시도만 «없던 것»으로 본다.
   const reachesImmediate = (name: string): boolean =>
-    [[], ['catalog']].some((args) => {
+    [[], ['browser']].some((args) => {
       try {
         return executeImmediateDashboardSlash({ name, args }, immediateDeps) !== null;
       } catch {

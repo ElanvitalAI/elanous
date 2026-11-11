@@ -9,9 +9,9 @@ import { sendOutbound } from '../domains/outbound-alert.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 import { isValidGateHost } from '../self-implement/gate-remote.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
-import { latestPublishedPreviousVersion, releaseLoopConfig } from '../../scripts/release-loop/unattended-release.js';
+import { latestPublishedPreviousVersion, releaseLoopConfig, releaseRehearsalConfig } from '../../scripts/release-loop/unattended-release.js';
 import { LEAK_MARKERS, loadExportConfig, selectExportFiles } from '../../scripts/public-export.js';
-import { LIGHT_RC_DEFAULT_SHARDS, LIGHT_RC_UNKNOWN_HOST, runLightRc, type LightRcResult } from './light-rc.js';
+import { LIGHT_RC_DEFAULT_SHARDS, LIGHT_RC_UNKNOWN_HOST, runLightRc, type LightRcDeps, type LightRcResult } from './light-rc.js';
 import { planRehearsalShards, type RehearsalShardPlan, type RehearsalShardPlanDeps } from './rehearsal-shard-plan.js';
 import { listSchedules, type ReleaseSchedule } from './release-schedule.js';
 import { SPAWN_SYNC_MAX_BUFFER } from '../util/spawn-sync-output.js';
@@ -20,6 +20,7 @@ import { gateSourcePins } from '../../scripts/release-loop/gate-baseline-receipt
 import { preflightGateExecutionIdentity, type GatePodExecutionIdentity } from '../../scripts/release-loop/gate-radius-live.js';
 import { gateShardLedgerBatchComplete, gateShardLedgerPath, readGateShardLedger } from './gate-shard-ledger.js';
 import { gateShardsPath, readGateShards } from './gate-shards.js';
+import { createCommandCloudVmAdapter, type CloudVmAdapter } from './cloud-vm-adapter.js';
 
 export type StepId = 'hard-mid' | 'rc-7h' | 'hard-5h' | 'rc-150m';
 export type RehearsalOutcome = 'ok' | 'regression' | 'unmeasured' | 'error' | 'no-checkout' | 'checkout-dirty' | 'superseded' | 'interrupted';
@@ -96,6 +97,8 @@ export interface RehearsalStamp {
   recovery?: RehearsalRecovery;
   hardGateRunId?: string;
   hardGateLog?: string;
+  /** Light rehearsal gate rows are queryable at HQ under this per-step execution identity. */
+  lightRcRunId?: string;
   /** B6: an unmeasured hard gate always retains a cause, run id and durable local evidence path. */
   measurementGap?: { cause: string; runId: string; evidence: string };
   shardPlan?: RehearsalShardPlan;
@@ -119,11 +122,15 @@ export interface RehearsalDeps {
   hardIntervalHours?: number;
   now?: () => Date;
   schedules?: (root: string) => ReleaseSchedule[];
-  lightRc?: (version: string, checkout: string, selection: { shards?: number; remote?: string }) => Promise<LightRcResult>;
+  lightRc?: (version: string, checkout: string, selection: { shards?: number; remote?: string; rehearsalCloudHost?: boolean }, runId?: string) => Promise<LightRcResult>;
+  /** Injectable outer host/dispatch boundaries while the rehearsal and light-rc code paths stay real. */
+  lightRcDeps?: Omit<LightRcDeps, 'cwd'>;
   hardGate?: (version: string, checkout: string, sha: string, ledgerRoot: string, runId: string, remote?: string, podPool?: string) => Promise<HardGateResult>;
   hardGateGraphPins?: (checkout: string, commit: string) => { graphSha: string; recipeSha: string } | null;
   hardGateIdentity?: (pool: string, env: NodeJS.ProcessEnv, commit?: string) => GatePodExecutionIdentity | null;
   hardGateSpawn?: typeof spawnHardRehearsalGate;
+  /** Injectable control-plane boundary; production uses release.rehearsal.cloudVmCommand. */
+  cloudVmAdapter?: CloudVmAdapter;
   shardPlan?: typeof planRehearsalShards;
   shardPlanDeps?: RehearsalShardPlanDeps;
   notify?: (text: string) => void | boolean | Promise<void | boolean>;
@@ -137,6 +144,16 @@ export type RehearsalTickResult = RehearsalPlan & { applied?: boolean; stamps?: 
 function stampPath(root: string, version: string, step: StepId): string {
   if (!/^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(version)) throw new Error(`invalid release version: ${version}`);
   return join(root, 'release', version, 'rehearsal', `${step}.json`);
+}
+
+function rehearsalGraphRunId(): string | undefined {
+  const contextPath = process.env.ELANOUS_GRAPH_CONTEXT;
+  if (!contextPath) return undefined;
+  try {
+    const context = JSON.parse(contextPath.trimStart().startsWith('{') ? contextPath : readFileSync(contextPath, 'utf8')) as { graphId?: unknown; runId?: unknown };
+    return typeof context.graphId === 'string' && typeof context.runId === 'string'
+      && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(context.runId) ? context.runId : undefined;
+  } catch { return undefined; }
 }
 
 const defaultGit: NonNullable<RehearsalDeps['git']> = (args, cwd) => {
@@ -575,13 +592,15 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
     }
   }
   if (plan.status !== 'due') return { ...plan, ...(written.length ? { stamps: written, applied: true } : {}), notificationFailures };
-  const claim = (step: StepId): { path: string; stamp: RehearsalStamp } | null => {
+  const claim = (step: StepId, execute = true): { path: string; stamp: RehearsalStamp } | null => {
     const path = stampPath(root, plan.version, step);
     mkdirSync(dirname(path), { recursive: true });
     const stamp: RehearsalStamp = { version: plan.version, cutAt: plan.cutAt, step, outcome: 'running', startedAt: now.toISOString(), ownerPid: process.pid };
     if (step === 'hard-mid' || step === 'hard-5h') {
       stamp.hardGateRunId = `hard-${randomUUID()}`;
       stamp.hardGateLog = join(dirname(path), `${stamp.hardGateRunId}.log`);
+    } else if (execute) {
+      stamp.lightRcRunId = rehearsalGraphRunId() ?? `light-${randomUUID()}`;
     }
     // Crash-safe exclusive create: the complete JSON is written to a private temp file, then hard-linked into
     // place. link(2) fails with EEXIST like wx, but the stamp can never be observed empty or half-written.
@@ -606,7 +625,7 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
     if (!await deliverStamp(path, notify, clock)) notificationFailures++;
   };
   for (const step of plan.supersede) {
-    const claimed = claim(step);
+    const claimed = claim(step, false);
     if (claimed) { claimed.stamp.outcome = 'superseded'; await finish(claimed.path, claimed.stamp); }
   }
   if (plan.run) {
@@ -615,6 +634,30 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
       const { path, stamp } = claimed;
       debug.log('release.rehearsal', 'step-start', { version: plan.version, step: plan.run, outcome: 'running' });
       try {
+        const cloudHostStep = plan.run === 'hard-mid' || plan.run === 'rc-7h';
+        let cloudVm: CloudVmAdapter | undefined;
+        const ensureCloudVmReady = async (): Promise<void> => {
+          if (!cloudHostStep || cloudVm) return;
+          const configured = deps.cloudVmAdapter;
+          const command = configured ? undefined : releaseRehearsalConfig().cloudVmCommand;
+          if (!configured && !command) throw new Error('release.rehearsal.cloudVmCommand is not configured; refusing cloud rehearsal without local fallback');
+          cloudVm = configured ?? createCommandCloudVmAdapter(command!);
+          await cloudVm.start('aws1');
+          const status = await cloudVm.status('aws1');
+          if (status.state !== 'running') throw new Error(`aws1 status is ${status.state}${status.detail ? ` (${status.detail})` : ''}`);
+          debug.log('release.rehearsal', 'cloud-vm-ready', { version: plan.version, step: plan.run, host: 'aws1', state: status.state });
+        };
+        const postponeCloudStep = async (error: unknown): Promise<RehearsalTickResult> => {
+          const reason = oneLine(error instanceof Error ? error.message : String(error));
+          stamp.outcome = 'unmeasured';
+          stamp.summary = `aws1 start/readiness failed; rehearsal postponed without failover: ${reason}`;
+          stamp.endedAt = clock().toISOString();
+          unlinkSync(path);
+          written.push(stamp);
+          debug.log('release.rehearsal', 'cloud-vm-postponed', { version: plan.version, step: plan.run, host: 'aws1', reason });
+          try { await notify(stamp.summary); } catch { notificationFailures++; }
+          return { ...plan, applied: true, stamps: written, notificationFailures };
+        };
         const checkout = opts.checkout?.trim() || process.env.ELANOUS_REHEARSAL_GIT_CWD?.trim();
         if (!checkout) stamp.outcome = 'no-checkout';
         else {
@@ -634,11 +677,15 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
               ...(leakDetail ? { detail: leakDetail } : {}) };
             if (leakStatus !== 0) throw new Error(`public export leak-check failed (rc=${leakStatus ?? 'spawn'})${leakDetail ? ` · ${leakDetail}` : ''}`);
             if (plan.run === 'hard-5h' || plan.run === 'hard-mid') {
-              const targetHost = opts.remote ?? 'node-b';
+              const targetHost = plan.run === 'hard-mid' ? 'aws1' : opts.remote ?? 'node-b';
               stamp.selection = { shards: 12, remote: targetHost };
               const hardGateRunId = stamp.hardGateRunId;
               const hardGateLog = stamp.hardGateLog;
               if (!hardGateRunId || !hardGateLog) throw new Error('hard rehearsal claim has no evidence identity');
+              if (plan.run === 'hard-mid') {
+                try { await ensureCloudVmReady(); }
+                catch (error) { return await postponeCloudStep(error); }
+              }
               const hard = await (deps.hardGate ?? ((version, cwd, sha, ledger, id, host) =>
                 runHardGate(version, cwd, sha, ledger, id, host, deps.hardGateGraphPins, deps.hardGateIdentity, deps.hardGateSpawn, opts.podPool)))
                 (plan.version, checkout, stamp.sha, root, hardGateRunId, targetHost, opts.podPool);
@@ -666,6 +713,8 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
             const shardPlan = opts.shards === undefined ? (deps.shardPlan ?? planRehearsalShards)(plan.version, root, checkout, { ...deps.shardPlanDeps, remoteGate: true }) : undefined;
             if (shardPlan) stamp.shardPlan = shardPlan;
             const fullFallbackReasons = [
+              ...(plan.run === 'rc-7h' && shardPlan && shardPlan.shards !== LIGHT_RC_DEFAULT_SHARDS
+                ? [`planned shard count ${shardPlan.shards} does not match the aws1 host-gate contract`] : []),
               ...(shardPlan?.planningGaps ?? []),
               ...(shardPlan?.rssRevisionPending ? ['selected-file memory revision is not verified'] : []),
               ...(shardPlan?.testFiles === null ? ['selected test inventory unavailable'] : []),
@@ -674,10 +723,11 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
               ...(opts.shards !== undefined && opts.shards !== LIGHT_RC_DEFAULT_SHARDS ? [`requested shard count ${opts.shards} does not match the full host gate`] : []),
               ...(shardPlan && shardPlan.shards !== LIGHT_RC_DEFAULT_SHARDS ? [`planned shard count ${shardPlan.shards} does not match the full host gate`] : []),
             ];
-            const fullFallback = plan.run === 'rc-150m' && fullFallbackReasons.length > 0;
+            const fullFallback = (plan.run === 'rc-150m' || plan.run === 'rc-7h') && fullFallbackReasons.length > 0;
             const selection = {
-              shards: fullFallback ? LIGHT_RC_DEFAULT_SHARDS : opts.shards ?? shardPlan?.shards,
-              remote: opts.remote,
+              shards: plan.run === 'rc-7h' || fullFallback ? LIGHT_RC_DEFAULT_SHARDS : opts.shards ?? shardPlan?.shards,
+              remote: plan.run === 'rc-7h' ? 'aws1' : opts.remote,
+              ...(plan.run === 'rc-7h' ? { rehearsalCloudHost: true } : {}),
               ...(fullFallback ? { fullFallback: { reason: [...new Set(fullFallbackReasons)].join('; '),
                 ...(shardPlan ? { plannedShards: shardPlan.shards } : {}) } } : {}),
             };
@@ -693,13 +743,18 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
               return { ...plan, applied: true, stamps: written, notificationFailures };
             }
             const regressionFiles: string[] = [];
-            const result = await (deps.lightRc ?? ((version, cwd) => runLightRc(version, { ledgerRoot: root, head: stamp.sha, ...selection, rehearsalTui: true, log: (line) => {
+            if (plan.run === 'rc-7h') {
+              try { await ensureCloudVmReady(); }
+              catch (error) { return await postponeCloudStep(error); }
+            }
+            const result = await (deps.lightRc ?? ((version, cwd, selected, runId) => runLightRc(version, { ledgerRoot: root, head: stamp.sha, ...selected,
+              ...(runId ? { graphRunId: runId } : {}), rehearsalTui: true, log: (line) => {
                 for (const entry of line.split(/\r?\n/)) {
                   const file = /^- introduced: (.+?)(?: > |$)/.exec(entry)?.[1];
                   if (file && regressionFiles.length < 3) regressionFiles.push(file);
                 }
                 console.error(line);
-              } }, { cwd })))(plan.version, checkout, selection);
+              } }, { ...deps.lightRcDeps, cwd })))(plan.version, checkout, selection, stamp.lightRcRunId);
             stamp.result = result;
             if (opts.recoveryRun && result.unmeasured !== null) {
               const failedShard = result.unmeasured;
@@ -719,8 +774,8 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
             if (regressionFiles.length) stamp.regressionFiles = regressionFiles;
             const shardMismatch = selection.shards !== undefined && result.shards !== selection.shards
               ? `selected shards ${selection.shards} but RC reported ${result.shards}` : null;
-            const remoteMismatch = opts.remote && result.remote !== opts.remote
-              ? `requested remote ${opts.remote} but RC reported ${result.remote ?? 'local'}` : null;
+            const remoteMismatch = selection.remote && result.remote !== selection.remote
+              ? `requested remote ${selection.remote} but RC reported ${result.remote ?? 'local'}` : null;
             if (shardPlan?.remoteCapacityPending && result.remote && result.remote !== LIGHT_RC_UNKNOWN_HOST
               && !remoteMismatch && result.unmeasured === null
               && result.introduced !== null && result.unclassified === 0 && result.ok
@@ -733,7 +788,7 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
             }
             const remoteCapacityVerified = plan.run === 'rc-150m' && stamp.shardPlan?.remoteCapacityPending === true
               && result.ok && result.gateExitCode === 0 && result.unmeasured === null && result.unclassified === 0
-              && result.remote === opts.remote && !shardMismatch && !remoteMismatch;
+              && result.remote === selection.remote && !shardMismatch && !remoteMismatch;
             const shardPlanningGap = fullFallback ? null : stamp.shardPlan?.unmeasured
               ?.replace(remoteCapacityVerified ? /(?:^|; )remote gate host resources unmeasured before RC(?=; |$)/g : /$^/, '')
               .replace(/^; |; $/g, '') || null;
@@ -744,8 +799,22 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
               : result.introduced === null || result.unclassified === null || result.unmeasured !== null || result.unclassified > 0 ? 'unmeasured'
               : result.unmeasured === null && (!result.ok || result.gateExitCode !== 0) ? 'error'
               : planningGap ? 'unmeasured' : 'ok';
-            stamp.summary = oneLine(`introduced ${result.introduced ?? 'UNKNOWN'} · preexisting ${result.preexisting ?? 'UNKNOWN'} · unclassified ${result.unclassified ?? 'UNKNOWN'} · ${result.remote ?? 'local'} · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}${result.unmeasured !== null ? ` · unmeasured: ${result.unmeasured || 'RC reason empty'}` : ''}${fullFallback ? ` · full-shards fallback (${selection.shards}): ${selection.fullFallback?.reason}` : shardPlanningGap ? ` · unmeasured: ${shardPlanningGap}` : ''}${shardMismatch ? ` · unmeasured: ${shardMismatch}` : ''}${remoteMismatch ? ` · unmeasured: ${remoteMismatch}` : ''}`);
+            stamp.summary = oneLine(`light gate runId ${stamp.lightRcRunId} · introduced ${result.introduced ?? 'UNKNOWN'} · preexisting ${result.preexisting ?? 'UNKNOWN'} · unclassified ${result.unclassified ?? 'UNKNOWN'} · ${result.remote ?? 'local'} · gate rc ${result.gateExitCode}${!result.ok ? ' · RC 실패' : ''}${result.unmeasured !== null ? ` · unmeasured: ${result.unmeasured || 'RC reason empty'}` : ''}${fullFallback ? ` · full-shards fallback (${selection.shards}): ${selection.fullFallback?.reason}` : shardPlanningGap ? ` · unmeasured: ${shardPlanningGap}` : ''}${shardMismatch ? ` · unmeasured: ${shardMismatch}` : ''}${remoteMismatch ? ` · unmeasured: ${remoteMismatch}` : ''}`);
             }
+          }
+        }
+        if (cloudVm && plan.run === 'rc-7h' && stamp.outcome === 'ok' && stamp.result?.hostReceiptPersisted === true) {
+          try {
+            await cloudVm.stop('aws1');
+            const status = await cloudVm.status('aws1');
+            debug.log('release.rehearsal', 'cloud-vm-stopped', { version: plan.version, step: plan.run, host: 'aws1', state: status.state });
+            if (status.state !== 'stopped') throw new Error(`aws1 stop was not confirmed (state=${status.state})`);
+          } catch (error) {
+            const reason = oneLine(error instanceof Error ? error.message : String(error));
+            stamp.summary = oneLine(`${stamp.summary ?? 'rc-7h completed'} · aws1 stop failed (measurement retained): ${reason}`);
+            debug.log('release.rehearsal', 'cloud-vm-stop-warning', { version: plan.version, step: plan.run, host: 'aws1', reason });
+            try { await notify(`aws1 stop failed after completed rehearsal measurement; receipt retained: ${reason}`); }
+            catch { notificationFailures++; }
           }
         }
       } catch (error) {

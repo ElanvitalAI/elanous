@@ -9,7 +9,7 @@ import { runTrafficNode } from './traffic-node.js';
 
 const GRAPH = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
 
-test('release graph records its emergency branch but caller evidence cannot enable publishing', async () => {
+test('release graph ignores caller timestamps and stays on the normal repair path before the same-run block matures', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-emergency-disabled-sim-'));
   const trafficFile = join(root, 'traffic.json');
   const seats = Object.fromEntries(['OP', 'TC', 'MK', 'UX'].map((seat) => [seat, { perCycle: 6 }]));
@@ -74,7 +74,7 @@ test('release graph records its emergency branch but caller evidence cannot enab
     expect(gateRuns).toBe(1);
     expect(events.mock.calls.some(([category, event]) => category === 'release-loop.emergency-publish' && event === 'switch-declined')).toBe(true);
     expect(JSON.parse(switchOutput)).toMatchObject({ action: 'stay-normal', eligible: false, promoted: false,
-      reasons: ['emergency-publish-disabled-by-default'] });
+      reasons: ['normal-release-blocked-too-short'] });
   } finally {
     events.mockRestore();
     console.log = realLog;

@@ -48,6 +48,7 @@ const KIND_COLOR: Record<NotificationKind, (s: string) => string> = {
   hitl:         (s) => C.warning(s),
   'agent-done': (s) => C.info(s),
   escalation:   (s) => C.error(s),
+  briefing:     (s) => C.accent(s),
 };
 
 // IDX-6 Phase 6 migration — kinds that map to a semantic IconTokens
@@ -62,6 +63,7 @@ function kindGlyph(kind: NotificationKind): string {
     case 'hitl':        return icon('warning');
     case 'agent-done':  return icon('success');
     case 'escalation':  return icon('error');   // critical — shares slot with error
+    case 'briefing':    return icon('notification');
     case 'status':      return '●';
     case 'osc':         return '◌';
     case 'exit':        return '◻';

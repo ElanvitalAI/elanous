@@ -33,12 +33,6 @@ export function registerShellSlash(registry: SlashCommandRegistry<DashboardSlash
       if (matches.length === 1) return matches[0]!;
       return matches.length > 1 ? { ambiguous: matches } as const : null;
     };
-    if (sub === 'rollup') {
-      // N2 — same popup as the 🐚 pill click, openable from
-      // keyboard-only sessions (SSH / nested tmux).
-      await ctx.shellSlash.openRollupPopup();
-      return;
-    }
     if (sub === 'list') {
       // N3 — `/shell list all` bypasses the 30s settled TTL so users
       // can audit everything. Default stays live-only.

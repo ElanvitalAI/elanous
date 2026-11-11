@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { debug, redactSecretText } from '../debug/log.js';
 import { TaskStore } from '../task-orchestrator/store.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 import { inferPhaseTrack, loadTrackRegistry, trackPostIds } from './mission-phase-track.js';
 import type { TrackAgentInput, TrackAgentRunner } from './track-agent.js';

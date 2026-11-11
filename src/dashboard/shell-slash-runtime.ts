@@ -49,7 +49,6 @@ export function createDashboardShellSlashRuntime(
       deps.muted('  /shell list [all]         List handles (default hides settled 30s+; "all" shows everything).'),
       deps.muted('  /shell kill <id>          Kill a handle (prefix match on id OK).'),
       deps.muted('  /shell attach <id>        Focus the runner VW hosting a vw/modal-mode handle.'),
-      deps.muted('  /shell rollup             Open the handle popup (same as 🐚 pill click / ^B S).'),
       deps.muted(''),
       deps.muted('  Handles are created by RunShell — see /term for legacy session mgmt.'),
     ],

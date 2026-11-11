@@ -1124,6 +1124,7 @@ edges:
   const first = await firstPromise;
   expect(maxActive).toBe(2);
   expect(first.status).toBe('failed');
+  expect(first.executed).toBe(first.nodes.filter((record) => record.executed).length);
   const fork = first.fanOuts?.['start:ok'];
   expect(fork?.branches.a).toMatchObject({ status: 'failed', output: expect.any(String), artifactSha256: expect.any(String) });
   expect(fork?.branches.b).toMatchObject({ status: 'done', output: expect.any(String), artifactSha256: expect.any(String),
@@ -1139,10 +1140,12 @@ edges:
     .rejects.toThrow("--from cannot resume fan-out branch 'a'; resume from fan-out source 'start' instead");
   const unchanged = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'start', deps });
   expect(unchanged.status).toBe('failed');
+  expect(unchanged.executed).toBe(unchanged.nodes.filter((record) => record.executed).length);
   expect(counts).toEqual(new Map([['branch-a', 2], ['branch-b', 1]]));
   writeFileSync(branchArtifact, 'tampered-artifact');
   const artifactChanged = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'start', deps });
   expect(artifactChanged.status).toBe('failed');
+  expect(artifactChanged.executed).toBe(artifactChanged.nodes.filter((record) => record.executed).length);
   expect(counts).toEqual(new Map([['branch-a', 3], ['branch-b', 2]]));
   const savedState = JSON.parse(readFileSync(first.statePath, 'utf8')) as { input: unknown };
   savedState.input = { releaseInput: 'after' };
@@ -1150,6 +1153,9 @@ edges:
   failA = false;
   const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'start', deps });
   expect(resumed.status).toBe('done');
+  expect(resumed.executed).toBe(resumed.nodes.filter((record) => record.executed).length);
+  const persistedResume = JSON.parse(readFileSync(resumed.statePath, 'utf8')) as { executed: number; nodes: Array<{ executed?: boolean }> };
+  expect(persistedResume.executed).toBe(persistedResume.nodes.filter((record) => record.executed).length);
   expect(counts).toEqual(new Map([['branch-a', 4], ['branch-b', 3]]));
   expect(resumed.fanOuts?.['start:ok']?.branches.b?.completionReceipt?.inputSha256)
     .not.toBe(successfulBranch.completionReceipt?.inputSha256);
@@ -1655,6 +1661,46 @@ test('subgraph prior input receives the previous node result', async () => {
       .toBe('{"outcome":"done","answer":"from-previous-verb"}');
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('unit input bindings can select a declared field from an earlier graph node output', async () => {
+  const fixture = unitFixture();
+  writeFileSync(join(fixture.root, 'recipes.yaml'), `seed:\n  command: >-\n    printf '%s' '{"evidence":{"suggestion":{"ask":"Add a lesson timer"}}}'\n`);
+  writeFileSync(fixture.root + '/units/recipes.yaml', `produce:\n  command: >-\n    bun -e 'const c=JSON.parse(require("fs").readFileSync(process.env.ELANOUS_GRAPH_CONTEXT,"utf8")); console.log(JSON.stringify({answer:c.input.ask}))'\n`);
+  writeFileSync(fixture.graph, readFileSync(fixture.graph, 'utf8')
+    .replace('entry_node: invoke', 'entry_node: seed')
+    .replace('  - node_id: invoke', "  - { node_id: seed, kind: agent, recipe: 'cmd:seed', max_visits: 1 }\n  - node_id: invoke")
+    .replace('contract: { inputs: [request], tools: read-only, outputs: [answer] }',
+      'contract: { inputs: [ask], tools: read-only, outputs: [answer] }\n    input: { ask: "$seed.evidence.suggestion.ask" }')
+    .replace('edges:\n  - { from: invoke', 'edges:\n  - { from: seed, to: invoke }\n  - { from: invoke'));
+  writeFileSync(fixture.unit, readFileSync(fixture.unit, 'utf8').replace('inputs: [request]', 'inputs: [ask]'));
+  try {
+    const result = await runGraph(fixture.graph, { deps: { root: fixture.root } });
+    expect(result.status).toBe('done');
+    expect(result.nodes.find(node => node.nodeId === 'invoke')?.output).toBe('{"outcome":"done","answer":"Add a lesson timer"}');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('declared unit input binding wins over a conflicting caller-supplied value', async () => {
+  const fixture = unitFixture();
+  writeFileSync(join(fixture.root, 'recipes.yaml'), `seed:\n  command: >-\n    printf '%s' '{"evidence":{"suggestion":{"ask":"owner-scoped ask"}}}'\n`);
+  writeFileSync(fixture.root + '/units/recipes.yaml', `produce:\n  command: >-\n    bun -e 'const c=JSON.parse(require("fs").readFileSync(process.env.ELANOUS_GRAPH_CONTEXT,"utf8")); console.log(JSON.stringify({answer:c.input.ask}))'\n`);
+  writeFileSync(fixture.graph, readFileSync(fixture.graph, 'utf8')
+    .replace('entry_node: invoke', 'entry_node: seed')
+    .replace('  - node_id: invoke', "  - { node_id: seed, kind: agent, recipe: 'cmd:seed', max_visits: 1 }\n  - node_id: invoke")
+    .replace('contract: { inputs: [request], tools: read-only, outputs: [answer] }',
+      'contract: { inputs: [ask], tools: read-only, outputs: [answer] }\n    input: { ask: "$seed.evidence.suggestion.ask" }')
+    .replace('edges:\n  - { from: invoke', 'edges:\n  - { from: seed, to: invoke }\n  - { from: invoke'));
+  writeFileSync(fixture.unit, readFileSync(fixture.unit, 'utf8').replace('inputs: [request]', 'inputs: [ask]'));
+  try {
+    const result = await runGraph(fixture.graph, { input: { ask: 'caller-supplied conflicting ask' }, deps: { root: fixture.root } });
+    expect(result.status).toBe('done');
+    expect(result.nodes.find(node => node.nodeId === 'invoke')?.output).toBe('{"outcome":"done","answer":"owner-scoped ask"}');
+  } finally {
+    rmSync(fixture.root, { recursive: true, force: true });
   }
 });
 

@@ -1,0 +1,41 @@
+{
+  "id": "fake-cloud-billing-world",
+  "name": "Fake cloud billing, image bake and worker lifecycle",
+  "implementation": [
+    "src/ux-sim/fake-cloud-billing-world.ts",
+    "src/ux-sim/fake-cloud-vm.ts",
+    "src/ux-sim/fake-clock.ts"
+  ],
+  "tests": ["src/ux-sim/fake-cloud-billing-world.test.ts"],
+  "checklistCells": ["REHEARSAL-IMAGE-BAKE", "GUARDIAN-TRAIN-WORKER-LIFECYCLE", "RLA-CLOUD-ELASTIC"],
+  "target": "Replay cut-pinned golden image baking, cloud registry propagation, role-tagged VM admission, monthly cost reservations, worker scaling and cut-to-verify release gating without provider access.",
+  "inputs": [
+    "cut SHA and role-tag recipe",
+    "baked and required image assets",
+    "registry propagation delay",
+    "host role, image, credentials, substitutions and mirror freshness",
+    "VM warmup, deadline and preemption",
+    "monthly budget, hourly rate and runtime reservation",
+    "training worker demand and release phase"
+  ],
+  "observations": [
+    "image digest pinned to cut SHA and recipe",
+    "registry syncing and ready states",
+    "image download and partial recipe failures",
+    "credential, substitution, mirror, role, cut and deadline refusals",
+    "warmup preemption and fallback host selection",
+    "budget reservations, runtime spend and remaining balance",
+    "train worker scale up, idle scale down, gate slot reclamation and restoration",
+    "cut, gate, publish and verify phase transitions",
+    "zero human intervention and zero external calls"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-cloud-billing-world.test.ts -t REHEARSAL-IMAGE-BAKE",
+    "bun test src/ux-sim/fake-cloud-billing-world.test.ts -t GUARDIAN-TRAIN-WORKER-LIFECYCLE",
+    "bun test src/ux-sim/fake-cloud-billing-world.test.ts -t RLA-CLOUD-ELASTIC",
+    "bun test src/ux-sim/fake-cloud-billing-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

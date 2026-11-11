@@ -202,7 +202,9 @@ export type SupervisorStopReason =
   | 'review-unobserved'
   | 'review-oscillating'
   | 'deliverable-unobserved'
-  | 'deliverable-merged';
+  | 'deliverable-merged'
+  /** 같은 경계 거부와 도구 호출이 반복되어 비용 소모 전에 구현 라운드를 끊었다. */
+  | 'boundary-reject-loop';
 
 /** Lightweight runtime catalogue shared by the supervisor and pure local judge. */
 export const SUPERVISOR_STOP_REASONS = [
@@ -222,6 +224,7 @@ export const SUPERVISOR_STOP_REASONS = [
   'review-oscillating',
   'deliverable-unobserved',
   'deliverable-merged',
+  'boundary-reject-loop',
 ] as const satisfies readonly SupervisorStopReason[];
 
 export type SupervisorNext = 'harvest' | 'scope-decompose' | 'self-review' | 'human-gate' | 'proposal';

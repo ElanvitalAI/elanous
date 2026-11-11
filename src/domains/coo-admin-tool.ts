@@ -1,7 +1,7 @@
 import type { LLMToolSpec } from '../llm/tool-spec.js';
 
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { fetchLinearProjectIssues, type LinearProjectIssue } from '../connectors/linear.js';
 import { formatElanousCard } from './elanous-card.js';

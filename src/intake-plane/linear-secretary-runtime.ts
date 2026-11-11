@@ -5,7 +5,7 @@ import { resolveLinearProjectId, resolveLinearViewerId } from '../connectors/lin
 import { extractJsonBlock } from './decompose.js';
 import { extractKeywords, searchMemories } from '../memory.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { createRepositoryReferencedFileReader } from '../self-implement/goal-file-reader.js';
 
 export interface LinearSecretaryEvidence { source: string; link: string; excerpt: string }

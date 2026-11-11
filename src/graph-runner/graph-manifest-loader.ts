@@ -1,13 +1,14 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { parsePluginManifest, type PluginManifest } from '../plugins/core/manifest.js';
+import { loadPluginManifestFromDir, type PluginManifest } from '../plugins/core/manifest.js';
 import { parseGraphTemplateYaml, type GraphTemplateSpec } from '../self-implement/graph-yaml.js';
+import { lowerGraphV2 } from '../graph-v2/lower.js';
 
 export interface GraphManifestDeclaration {
   graphId: string;
   purpose: string;
-  allow: { recipes: string[]; skills: string[]; domainPacks: string[]; maxSideEffects?: 'none' | 'write' | 'spawn' };
+  allow: { recipes: string[]; skills: string[]; domainPacks: string[]; capabilities?: string[]; maxSideEffects?: 'none' | 'write' | 'spawn' };
   policy?: Record<string, unknown>;
   hitl: string[];
   observe?: { categories: string[] };
@@ -86,7 +87,19 @@ function validateEdgeVocabulary(rawGraph: unknown, graphId: string): void {
 }
 
 /** Use the same check for initial nodes and nodes appended while a run is active. */
-export function assertGraphManifestRecipeAllowed(manifest: GraphManifestDeclaration, recipe: string, recipeIds: ReadonlySet<string> = new Set()): void {
+export function assertGraphManifestRecipeAllowed(manifest: GraphManifestDeclaration, recipe: string,
+  recipeIds: ReadonlySet<string> = new Set(), requires?: string,
+  node?: Pick<GraphTemplateSpec['nodes'][number], 'nodeId' | 'kind'>): void {
+  if (requires && !manifest.allow.capabilities?.includes(requires.split('.')[0]!))
+    throw new Error(`graph.manifest-denied: capability ${requires}`);
+  if (recipe.startsWith('hitl:')) {
+    if (node?.kind === 'hitl' && manifest.hitl.includes(node.nodeId) && /^hitl:[a-z][a-z0-9-]*$/.test(recipe)) return;
+    throw new Error(`graph.manifest-denied: HITL binding needs a declared node: ${recipe}`);
+  }
+  if (recipe.startsWith('cap:')) {
+    if (manifest.allow.capabilities?.includes(recipe.slice(4))) return;
+    throw new Error(`graph.manifest-denied: capability ${recipe.slice(4)}`);
+  }
   if (recipe === 'none' || recipe.startsWith('approval:')) return;
   if (manifest.allow.recipes.includes(recipe)) return;
   if (recipe.startsWith('cmd:') && manifest.allow.recipes.includes(recipe.slice(4))) return;
@@ -141,8 +154,11 @@ export function loadGraphPluginFromDir(pluginDir: string): LoadedGraphPlugin {
   const root = realpathSync(pluginDir);
   const manifestPath = graphFile(root, 'plugin.json');
   const raw = record(JSON.parse(readFileSync(manifestPath, 'utf8')), manifestPath);
-  const plugin = parsePluginManifest(raw, { fallbackId: typeof raw.name === 'string' ? raw.name : undefined });
+  const plugin = loadPluginManifestFromDir(root, {
+    id: typeof raw.name === 'string' ? raw.name : 'graph-plugin',
+  }).manifest;
   const extension = record(record(raw.extensions, 'extensions')['ai.elanous'], 'extensions["ai.elanous"]');
+  const capabilities = stringList(extension.capabilities ?? [], 'extensions["ai.elanous"].capabilities');
   const declarations = record(extension.graphManifests, 'extensions["ai.elanous"].graphManifests');
   const assets = plugin.contributes.graphs ?? [];
   if (assets.length === 0) throw new Error(`graph plugin declares no graphs: ${manifestPath}`);
@@ -151,11 +167,14 @@ export function loadGraphPluginFromDir(pluginDir: string): LoadedGraphPlugin {
     const file = graphFile(root, asset);
     const source = readFileSync(file, 'utf8');
     const rawGraph = parseYaml(source) as unknown;
-    const parsed = parseGraphTemplateYaml(source, file);
-    if (!parsed.template || parsed.errors.length > 0) {
-      throw new Error(`invalid graph ${file}: ${parsed.errors.map(issue => `${issue.path}: ${issue.message}`).join('; ')}`);
+    const v2 = rawGraph && typeof rawGraph === 'object' && !Array.isArray(rawGraph)
+      && (rawGraph as Record<string, unknown>).apiVersion === 'elanous.dev/graph/v2';
+    const executable = v2 ? lowerGraphV2(source, { label: file }) : parseGraphTemplateYaml(source, file);
+    if (!executable.template || executable.errors.length > 0) {
+      throw new Error(`invalid graph ${file}: ${executable.errors.map(issue => `${issue.path}: ${issue.message}`).join('; ')}`);
     }
-    const id = parsed.template.graphId;
+    const template = executable.template;
+    const id = template.graphId;
     if (graphs[id]) throw new Error(`duplicate graph_id '${id}' in ${manifestPath}`);
     const declaration = record(declarations[id], `graphManifests.${id}`);
     if (typeof declaration.purpose !== 'string' || !declaration.purpose.trim()) {
@@ -177,25 +196,25 @@ export function loadGraphPluginFromDir(pluginDir: string): LoadedGraphPlugin {
       ...declaration,
       graphId: id,
       purpose: declaration.purpose,
-      allow: { recipes, skills, domainPacks, ...(maxSideEffects ? { maxSideEffects: maxSideEffects as 'none' | 'write' | 'spawn' } : {}) },
+      allow: { recipes, skills, domainPacks, capabilities, ...(maxSideEffects ? { maxSideEffects: maxSideEffects as 'none' | 'write' | 'spawn' } : {}) },
       policy,
       hitl,
       ...(categories ? { observe: { categories } } : {}),
     };
-    validateEdgeVocabulary(rawGraph, id);
+    if (!v2) validateEdgeVocabulary(rawGraph, id);
     const policyRefs = new Set<string>();
     collectPolicyReferences(rawGraph, policyRefs);
     for (const reference of policyRefs) {
       if (!Object.hasOwn(policy, reference)) throw new Error(`graph ${id} references undeclared policy key: ${reference}`);
     }
-    const hitlNodes = parsed.template.nodes.filter(node => node.kind === 'hitl').map(node => node.nodeId);
+    const hitlNodes = template.nodes.filter(node => node.kind === 'hitl').map(node => node.nodeId);
     if (new Set(hitl).size !== hitl.length ||
       hitlNodes.length !== hitl.length || hitlNodes.some(node => !hitl.includes(node))) {
       throw new Error(`graphManifests.${id}.hitl differs from graph hitl nodes`);
     }
     const recipeIds = recipes.includes('cmd:*@./recipes.yaml') ? graphRecipeIds(root, file) : new Set<string>();
-    for (const node of parsed.template.nodes) assertGraphManifestRecipeAllowed(graphManifest, node.recipe, recipeIds);
-    graphs[id] = { file, template: parsed.template, manifest: graphManifest };
+    for (const node of template.nodes) assertGraphManifestRecipeAllowed(graphManifest, node.recipe, recipeIds, node.requires, node);
+    graphs[id] = { file, template, manifest: graphManifest };
   }
   for (const id of Object.keys(declarations)) {
     if (!graphs[id]) throw new Error(`graphManifests.${id} has no declared graph asset`);

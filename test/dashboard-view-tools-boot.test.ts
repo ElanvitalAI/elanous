@@ -27,16 +27,16 @@ describe('bootDashboardViewTools', () => {
       },
       listViews: () => [
         { id: 'normal', label: 'Normal', shortcut: '1', active: true },
-        { id: 'playground', label: 'Widget Playground', shortcut: '7', active: false },
+        { id: 'agents', label: 'Agents', shortcut: '4', active: false },
       ],
       switchViewByNeedle: (needle) => {
         switchedTo = needle;
-        return needle === '7' ? 'playground' : null;
+        return needle === '4' ? 'agents' : null;
       },
-      getWidget: (id) => id === 'wd-playground'
-        ? { type: 'playground', state: { cursor: 3 } }
+      getWidget: (id) => id === 'wd-agent-roster'
+        ? { type: 'agents', state: { cursor: 3 } }
         : null,
-      getWidgetDef: (id) => id === 'wd-playground'
+      getWidgetDef: (id) => id === 'wd-agent-roster'
         ? {
             onKey: (ev, _state, ctx) => {
               receivedEvent = ev;
@@ -50,18 +50,18 @@ describe('bootDashboardViewTools', () => {
     });
 
     expect(installed?.list()).toHaveLength(2);
-    expect(installed?.switchTo('7')).toBe('playground');
-    expect(switchedTo).toBe('7');
-    expect(widgetOps?.snapshot('wd-playground')).toEqual({
-      type: 'playground',
+    expect(installed?.switchTo('4')).toBe('agents');
+    expect(switchedTo).toBe('4');
+    expect(widgetOps?.snapshot('wd-agent-roster')).toEqual({
+      type: 'agents',
       state: { cursor: 3 },
     });
-    expect(widgetOps?.sendKey('wd-playground', 'enter', { ctrl: true })).toEqual({
+    expect(widgetOps?.sendKey('wd-agent-roster', 'enter', { ctrl: true })).toEqual({
       ok: true,
       handled: true,
     });
     expect(receivedEvent).toEqual({ name: 'enter', ctrl: true, shift: false, alt: false });
-    expect(receivedContext).toEqual({ id: 'wd-playground', kind: 'ctx' });
+    expect(receivedContext).toEqual({ id: 'wd-agent-roster', kind: 'ctx' });
     expect(draws).toBe(1);
   });
 

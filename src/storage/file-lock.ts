@@ -42,8 +42,9 @@ export interface LockOpts {
   retryBusyMs?: number;
   maxTries?: number;
   /**
-   * Sync lock only: also break the lock when the pid on its first line is a dead process
-   * (a holder killed with -9 must not wedge waiters for `staleMs`).
+   * Also break the lock when the pid on its first line is a dead process (a holder killed
+   * with -9 must not wedge waiters for `staleMs`). When enabled for async locks, a live
+   * process is never displaced on age alone; its heartbeat may be delayed by long work.
    */
   breakDeadHolder?: boolean;
   /** Called once, the first time the lock is found held by someone else. */
@@ -185,7 +186,9 @@ export async function acquireLockAsync(lockPath: string, opts: LockOpts = {}): P
       if (code !== 'EEXIST') throw err;
       try {
         const observed = statSync(lockPath);
-        if (Date.now() - observed.mtimeMs > staleMs) {
+        const stale = Date.now() - observed.mtimeMs > staleMs;
+        const dead = opts.breakDeadHolder && holderIsDead(lockPath);
+        if (dead || (stale && !opts.breakDeadHolder)) {
           // ⭐ **원자적 클레임** — `unlink` 가 아니라 `rename` 으로 뺏는다.
           //   ⓐ `rename` 은 원자라 여러 회수자 중 **하나만** 이긴다. 각자 unlink 후 create 하면
           //      둘 다 *"내가 잡았다"* 고 믿는 창이 생긴다.

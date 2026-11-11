@@ -1,5 +1,5 @@
 import { decideProviderForConfig, type ProviderDecision } from '../llm.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 
 export interface UsableLlm {

@@ -4,6 +4,9 @@
 # Inputs gateRemote (SSH host, e.g. node-b) and gateRemoteMirror (bare mirror path, default ~/mirror/elanous-agent.git): run gate sweeps in temporary remote clones without a matching caller checkout; omit gateRemote for local execution.
 # Optional opsHosts: ['local', '<ssh-host>']; omit for no operational upgrades. Optional internalDist publishes the release checkout to the internal feed first; opsRestart: true explicitly allows daemon restarts.
 graph_id: release-loop
+supervisors:
+  - { ref: 'loop:rla@1', role: primary, scope: run, authority: [reroute, add-node, repair, hitl], requires: [elanous.dev/arg] }
+  - { ref: 'loop:macrophage@1', role: healer, scope: run, authority: [cleanup] }
 loop:
   title: 릴리스
   description: 승인된 판을 빌드·검증·게시한다
@@ -23,12 +26,23 @@ nodes:
   - { node_id: traffic-cut-start, kind: gate, recipe: 'cmd:traffic-cut-start', max_visits: 1 }
   - { node_id: cutoff, kind: judge, recipe: 'cmd:cutoff', max_visits: 1 }
   - { node_id: checklist-gate, kind: gate, recipe: 'cmd:checklist-gate', max_visits: 1, needs: [cutoff] }
+  - { node_id: regression-suite, kind: gate, recipe: 'cmd:regression-suite', max_visits: 1, needs: [cutoff] }
   # cmd:docs dispatches by graph node ID: bounded prefetch before gate, TUI join after upgrade, docs write after both.
   # Public export is checked alongside post-gate preparation work and gates the prepare/publish path.
   - { node_id: export-check, kind: gate, recipe: 'cmd:export-check', max_visits: 1, needs: [traffic-gate-passed] }
   - { node_id: prefetch, kind: agent, recipe: 'cmd:docs', max_visits: 1, needs: [cutoff] }
-  - { node_id: pre-gate-join, kind: gate, recipe: none, max_visits: 1, needs: [checklist-gate, prefetch] }
+  - { node_id: pre-gate-join, kind: gate, recipe: none, max_visits: 1, needs: [checklist-gate, regression-suite, prefetch] }
+  # Reuse preparation is advisory: every result rejoins the existing gate, which falls back to its legacy pool.
+  - node_id: pod-reuse-prep
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: pod-reuse-prep@1
+    budget: { inner_steps: 8 }
+    input: { cutSha: '$cutoff.cutoff.sha', candidatePath: '$cutoff.candidatePath?' }
+    contract: { inputs: [cutSha, candidatePath], tools: read-and-run-tests, outputs: [verdict, reason, receiptPath] }
   - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 4, notify: { on: [fail] } }
+  - { node_id: gate-cutover-switch, kind: judge, recipe: 'cmd:gate-cutover-switch', max_visits: 4 }
   # Source: mirror the normal gate's four-visit retry budget so each failed gate attempt evaluates the disabled switch once.
   - { node_id: emergency-switch, kind: judge, recipe: 'cmd:emergency-switch', max_visits: 4 }
   # Source: this fail-closed stub needs one visit; the measured emergency gate is deferred.
@@ -75,6 +89,7 @@ nodes:
   - { node_id: release-post-publish-join, kind: gate, recipe: none, max_visits: 1, needs: [docs-land, version-dev-bump] }
   - { node_id: verify, kind: gate, recipe: 'cmd:verify', max_visits: 1, notify: { on: [ok, fail] } }
   - { node_id: traffic-verify-complete, kind: gate, recipe: 'cmd:traffic-verify-complete', max_visits: 1 }
+  - { node_id: pwa-formal-update, kind: gate, recipe: 'cmd:pwa-formal-update', max_visits: 1, notify: { on: [fail] } }
   - { node_id: vault-note, kind: gate, recipe: 'cmd:vault-note', max_visits: 1 }
   - { node_id: release-story, kind: gate, recipe: 'cmd:release-story', max_visits: 1 }
   - { node_id: ops-upgrade, kind: agent, recipe: 'cmd:ops-upgrade', max_visits: 1 }
@@ -93,12 +108,16 @@ edges:
     # Prefetch is advisory; checklist remains a gate before the release sweep.
     warning_branches: [prefetch]
   # The cutoff fans checklist-gate and prefetch out together; export-check is deliberately not their prerequisite.
-  - { from: pre-gate-join, on: outcome, map: { ok: gate, fail: traffic-failed-restore, error: traffic-failed-restore } }
-  - { from: gate, on: outcome, map: { ok: receipt-audit, fail: emergency-switch, error: gate-triage } }
+  - { from: pre-gate-join, on: outcome, map: { ok: pod-reuse-prep, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  - { from: pod-reuse-prep, on: outcome, map: { reuse: gate, legacy: gate, skip: gate, failed: gate, error: gate } }
+  - { from: gate, on: outcome, map: { ok: gate-cutover-switch, fail: emergency-switch, error: gate-triage } }
+  - { from: gate-cutover-switch, on: outcome, map: { legacy: traffic-gate-passed, audit: receipt-audit, error: traffic-failed-restore } }
   - { from: emergency-switch, on: outcome, map: { switch: emergency-gate, stay-normal: gate-triage, ok: gate-triage, fail: gate-triage, error: gate-triage } }
-  - { from: emergency-gate, on: outcome, map: { ok: receipt-audit, fail: traffic-failed-restore, error: traffic-failed-restore } }
+  # The reduced emergency gate carries its own complete changed-file and mandatory-test measurement; the full normal-sweep
+  # receipt audit is inapplicable to that narrower execution and must not reinterpret the failed normal gate as its verdict.
+  - { from: emergency-gate, on: outcome, map: { ok: traffic-gate-passed, fail: traffic-failed-restore, error: traffic-failed-restore } }
   - { from: receipt-audit, on: outcome, map: { ok: traffic-gate-passed, fail: residual-run, error: traffic-failed-restore } }
-  - { from: residual-run, on: outcome, map: { ok: receipt-audit-recheck, fail: gate-triage, error: gate-triage } }
+  - { from: residual-run, on: outcome, map: { ok: receipt-audit-recheck, fail: emergency-switch, error: gate-triage } }
   - { from: receipt-audit-recheck, on: outcome, map: { ok: traffic-gate-passed, fail: gate-triage, error: traffic-failed-restore } }
   # Export, mac-smoke, and PWA run after the gate in parallel. Export only gates the pre-prepare join; mac-smoke stays warning-only.
   - from: traffic-gate-passed
@@ -131,7 +150,8 @@ edges:
     on: outcome
   - { from: release-post-publish-join, on: outcome, map: { ok: verify, fail: traffic-failed-restore, error: traffic-failed-restore } }
   - { from: verify, on: outcome, map: { ok: traffic-verify-complete, fail: traffic-failed-restore, error: traffic-failed-restore } }
-  - { from: traffic-verify-complete, on: outcome, map: { ok: vault-note, fail: vault-note, error: vault-note } }
+  - { from: traffic-verify-complete, on: outcome, map: { ok: pwa-formal-update, fail: pwa-formal-update, error: pwa-formal-update } }
+  - { from: pwa-formal-update, on: outcome, map: { ok: vault-note, fail: traffic-failed-restore, error: traffic-failed-restore } }
   # Warning-only: vault note and release story failures after publication never block operational upgrades.
   - { from: vault-note, on: outcome, map: { ok: release-story, fail: release-story, error: release-story } }
   - { from: release-story, on: outcome, map: { ok: ops-upgrade, fail: ops-upgrade, error: ops-upgrade } }

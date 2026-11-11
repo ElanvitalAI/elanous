@@ -124,19 +124,27 @@ function writeFailedRun(root: string, runId = 'r', gateOutput = '{"outcome":"ok"
   configureTraffic(root);
   const statePath = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
   mkdirSync(join(root, 'graph-runs', 'release-loop'), { recursive: true });
+  // Source: the live release graph inserts readiness-countdown and traffic-cut-start before cutoff.
+  const outcome = (JSON.parse(gateOutput) as { outcome?: string }).outcome;
+  const path = outcome === 'ok'
+    ? ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'receipt-audit', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'traffic-failed-restore', 'failed']
+    : ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
+  const nodes = path.map((nodeId) => {
+    const terminal = nodeId === 'failed';
+    const failedTui = nodeId === 'tui';
+    const output = nodeId === 'version-release'
+      ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: cutCommit, branch: `release/${VERSION}` })
+      : nodeId === 'cutoff'
+        ? JSON.stringify({ baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: cutCommit } })
+        : nodeId === 'gate' ? gateOutput : failedTui ? '{"outcome":"fail"}' : terminal ? undefined : '{"outcome":"ok"}';
+    return { nodeId, ok: !failedTui && !(nodeId === 'gate' && outcome !== 'ok'),
+      exit: terminal ? null : failedTui || (nodeId === 'gate' && outcome !== 'ok') ? 1 : 0,
+      executed: !terminal, ...(output === undefined ? {} : { output }) };
+  });
   const state = {
     graphId: 'release-loop', runId, status: 'failed',
-    graphPath: join(releaseGraphDir, 'release-loop.yaml'),
-    input: { version: VERSION, branchCut: true },
-    path: ['version-release', 'cutoff', 'gate', 'tui', 'failed'],
-    nodes: [
-      { nodeId: 'version-release', ok: true, exit: 0, executed: true, output: JSON.stringify({ outcome: 'ok', version: VERSION, commit: cutCommit, branch: `release/${VERSION}` }) },
-      { nodeId: 'cutoff', ok: true, exit: 0, executed: true, output: JSON.stringify({ baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: cutCommit } }) },
-      { nodeId: 'gate', ok: true, exit: 0, executed: true, output: gateOutput },
-      { nodeId: 'tui', ok: false, exit: 1, executed: true, output: '{"outcome":"fail"}' },
-      { nodeId: 'failed', ok: true, exit: 0, executed: false },
-    ],
-    executed: 4, dryRun: false, statePath,
+    graphPath: join(releaseGraphDir, 'release-loop.yaml'), input: { version: VERSION, branchCut: true },
+    path, nodes, executed: nodes.filter((node) => node.executed).length, dryRun: false, statePath,
     graphSnapshot: {
       graphSha: createHash('sha256').update(readFileSync(join(releaseGraphDir, 'release-loop.yaml'))).digest('hex'),
       recipesSha: createHash('sha256').update(readFileSync(join(releaseGraphDir, 'recipes.yaml'))).digest('hex'),
@@ -372,7 +380,8 @@ test('host-down from runGateNode is preserved through resume and switches the sa
     state.input.gatePodPool = 'pool-test';
     state.input.gateImagePin = 'cut-commit';
     state.input.previousVersion = '0.2.18';
-    state.path = ['version-release', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
+    // Source: the current release graph inserts readiness-countdown before traffic-cut-start.
+    state.path = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
     state.nodes = state.path.map((nodeId) => ({ nodeId, ok: true, exit: 0, executed: true,
       output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
         : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: 'ok' }) }));
@@ -460,7 +469,8 @@ test('interference partial-resume rechecks only affected files at the same cut',
   runState.input.commit = SHA;
   runState.input.baselineVersion = '0.2.18';
   runState.input.previousVersion = '0.2.18';
-  runState.path = ['version-release', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
+  // Source: the current graph adds readiness-countdown before traffic-cut-start.
+  runState.path = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
   runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
     output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
       : nodeId === 'cutoff' ? JSON.stringify({ baseline: { sha: 'b'.repeat(40) }, cutoff: { sha: SHA } })
@@ -533,7 +543,8 @@ test('load-flaky autoheal without explicit interference evidence falls back inst
   runState.input.commit = SHA;
   runState.input.baselineVersion = '0.2.18';
   runState.input.previousVersion = '0.2.18';
-  runState.path = ['version-release', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
+  // Source: the current graph adds readiness-countdown before traffic-cut-start.
+  runState.path = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate'];
   runState.nodes = runState.path.map((nodeId) => ({ nodeId, ok: nodeId !== 'gate', exit: nodeId === 'gate' ? 2 : 0, executed: true,
     output: nodeId === 'version-release' ? JSON.stringify({ outcome: 'ok', version: VERSION, commit: SHA, branch: `release/${VERSION}` })
       : nodeId === 'gate' ? JSON.stringify(gateOutput) : JSON.stringify({ outcome: 'ok' }) }));
@@ -565,8 +576,11 @@ test('resume preflight matches owned docs and prepared paths by realpath while r
     writeFileSync(join(prepared, 'release.json'), JSON.stringify({ version: VERSION, sourceCommit: SHA }));
     const preparedAlias = join(root, 'prepared-alias'); symlinkSync(prepared, preparedAlias, 'dir');
     const state = JSON.parse(readFileSync(saved.statePath, 'utf8')) as { nodes: Array<Record<string, unknown>> };
+    // Source: prepare is already present in the current saved graph path; update its receipt instead of appending a duplicate.
+    const prepareRecord = state.nodes.find((record) => record.nodeId === 'prepare')!;
+    prepareRecord.ok = true;
+    prepareRecord.output = JSON.stringify({ outcome: 'ok', out: preparedAlias, commit: SHA });
     state.nodes.push(
-      { nodeId: 'prepare', ok: true, output: JSON.stringify({ outcome: 'ok', out: preparedAlias, commit: SHA }) },
       { nodeId: 'docs', ok: true, output: JSON.stringify({ outcome: 'ok', branch, worktree: receiptTree, artifactOwner: { runId: 'r', attempt: 0 } }) },
     );
     writeFileSync(saved.statePath, JSON.stringify(state));
@@ -1581,7 +1595,9 @@ test('a moved command checkout stops a resumed Bash node before its runner is ca
   let commands = 0;
   const runBash = async (body: string) => {
     commands++;
-    if (body.includes('version-node.ts release')) return { exitCode: 0, stderr: '', stdout: JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}`, commit: cut }) };
+    // Source: the current graph runs readiness-countdown and traffic-cut-start before the test's failing cutoff node.
+    if (body.includes('version-node.ts release') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start'))
+      return { exitCode: 0, stderr: '', stdout: JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}`, commit: cut }) };
     return { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}' };
   };
   try {
@@ -1732,7 +1748,7 @@ test('the resumed Bash process reads from the verified command checkout', async 
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
   try {
     const first = await runGraph(graphPath, { input: { version: VERSION, branchCut: true }, deps: { root,
-      runBash: async (body) => body.includes('version-node.ts release')
+      runBash: async (body) => body.includes('version-node.ts release') || body.includes('release-readiness.ts') || body.includes('traffic-node.ts traffic-cut-start')
         ? { exitCode: 0, stderr: '', stdout: JSON.stringify({ outcome: 'ok', version: VERSION, branch: `release/${VERSION}`, commit: cut }) }
         : { exitCode: 1, stderr: '', stdout: '{"outcome":"fail"}' } } });
     expect(first.status).toBe('failed');
@@ -2544,7 +2560,12 @@ test('E11 c159bb8d ledger replay carries completed same-run shards before train 
     saveLedger('lock');
     rmSync(partialPlanPath(root, version), { force: true });
     const changedLockPlan = plan();
-    expect([changedImagePlan.outcome, changedLockPlan.outcome]).toEqual(['error', 'error']);
+    // Source: a receipt image/lock mismatch must fail closed by discarding all 80 reused shards and remeasuring the full set.
+    for (const driftPlan of [changedImagePlan, changedLockPlan]) {
+      expect(driftPlan).toMatchObject({ outcome: 'ok', reusedShardCount: 0, fullSweepFallback: true });
+      expect(driftPlan.remeasureFiles).toHaveLength(files.length);
+      expect([...driftPlan.remeasureFiles].sort()).toEqual([...files].sort());
+    }
     expect(sameIdentitySelection).toEqual([files[17]]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 120_000);

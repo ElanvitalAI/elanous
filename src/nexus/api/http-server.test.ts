@@ -26,6 +26,8 @@ import { startRelayServer } from '../../relay/relay-server.js';
 import { loadNexusAppHost } from '../apps/app-host.js';
 import { createAppLifecycleEvent, projectAppLifecycleSnapshot, type AppLifecycleSnapshot } from '../apps/app-lifecycle-ledger.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
+import { createFakeCred } from '../../ux-sim/fake-cred.js';
+import { writeCredentialSlotBatchValue } from '../config/secrets/registry.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -48,6 +50,80 @@ function serverFixture() {
   state.bus = eventBus;
   return { state, eventBus, registry: new TabRegistry(state) };
 }
+
+test('Nexus credential slots route forwards the observed fake grant health to the owner', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'credential-health-http-'));
+  setElanousConfigDir(dir);
+  useBackend('file');
+  // Source: fixed simulation time and explicit warning window avoid wall-clock-dependent health.
+  const fake = createFakeCred({ now: () => 1_000 });
+  fake.install('cred:eodhd.api_key', { permissions: ['market.read'], expiresAt: 2_000 });
+  fake.install('cred:krx.api_key', { permissions: ['market.read'], expiresAt: 1_000 });
+  const value = 'fixture-private-value';
+  writeCredentialSlotBatchValue({ 'cred:eodhd.api_key': value, 'cred:krx.api_key': value });
+  const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+    metaApi: { bearerToken: 'owner', noAuth: false },
+    credentialHealthObserver: { inspect: fake.inspect, permissionFor: () => 'market.read', now: () => 1_000,
+      warningWindowMs: 100 }, // Source: explicit fixture threshold for the GET response.
+  });
+  try {
+    const response = await fetch(`${server.url}/v1/credentials/slots`, { headers: { authorization: 'Bearer owner' } });
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    const parsed = JSON.parse(body) as { credentials: Array<{ id: string; present: boolean; healthStatus: string }> };
+    expect(parsed.credentials.find((row) => row.id === 'cred:eodhd.api_key')).toMatchObject({ present: true, healthStatus: 'valid' });
+    expect(parsed.credentials.find((row) => row.id === 'cred:krx.api_key')).toMatchObject({ present: true, healthStatus: 'expired' });
+    expect(parsed.credentials.find((row) => row.id === 'cred:fds.api_key')).toMatchObject({ present: false, healthStatus: 'missing' });
+    expect(body).not.toContain(value);
+    expect(body).not.toContain('permissions');
+  } finally { server.stop(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Nexus credential slots route reports stored OAuth metadata and opaque API key uncertainty without an observer', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'credential-health-live-'));
+  const priorXdg = process.env.XDG_CONFIG_HOME;
+  setElanousConfigDir(dir);
+  process.env.XDG_CONFIG_HOME = dir;
+  useBackend('file');
+  const value = 'private-api-key';
+  writeCredentialSlotBatchValue({ 'cred:eodhd.api_key': value });
+  mkdirSync(join(dir, 'elanous'), { recursive: true });
+  // Source: fixed fixture expiry is far beyond the current clock, so status is derived from the stored timestamp.
+  writeFileSync(join(dir, 'elanous', 'auth.json'), JSON.stringify({ version: 1, providers: {
+    'openai-codex': { tokens: { accessToken: 'private-oauth-token', refreshToken: '',
+      expiresAt: Date.now() + 3_600_000, scope: 'openid profile email offline_access' }, lastRefresh: 'fixture' },
+  } }));
+  const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(),
+    metaApi: { bearerToken: 'owner', noAuth: false } });
+  try {
+    const response = await fetch(`${server.url}/v1/credentials/slots`, { headers: { authorization: 'Bearer owner' } });
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    const parsed = JSON.parse(body) as { credentials: Array<{ id: string; healthStatus: string }>;
+      oauth: Array<{ provider: string; healthStatus: string }> };
+    expect(parsed.credentials.find((row) => row.id === 'cred:eodhd.api_key')?.healthStatus).toBe('unmeasured');
+    expect(parsed.oauth.find((row) => row.provider === 'openai-codex')?.healthStatus).toBe('valid');
+    expect(body).not.toContain(value);
+    expect(body).not.toContain('private-oauth-token');
+  } finally {
+    server.stop(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
+    if (priorXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = priorXdg;
+  }
+});
+
+test('HQ LLM proxy is mounted on Nexus and rejects loopback even with a tailnet Host', async () => {
+  const server = startNexusHttpServer({ ...serverFixture(), startPort: uniquePort(), metaApi: { bearerToken: 'owner', noAuth: false } });
+  try {
+    const body = JSON.stringify({ seat: 'R-PROXY', purpose: 'review', messages: [{ role: 'user', content: 'hello' }] });
+    const local = await fetch(`${server.url}/v1/llm/proxy`, { method: 'POST',
+      headers: { authorization: 'Bearer owner', 'content-type': 'application/json' }, body });
+    expect(local.status).toBe(403);
+    const tailHost = await fetch(`${server.url}/v1/llm/proxy`, { method: 'POST',
+      headers: { host: 'hq.example.ts.net', authorization: 'Bearer owner', 'content-type': 'application/json' }, body });
+    expect(tailHost.status).toBe(403);
+  } finally { server.stop(); }
+});
 
 test('channel-bot GET and authenticated POST reach HTTP handlers without leaking the token', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'channel-bot-http-'));

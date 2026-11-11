@@ -5,7 +5,7 @@ import { constants as fsConstants, closeSync, mkdirSync, mkdtempSync, openSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
-import { applyDeviceFidelity, canonicalizeDeviceResponse, compareDeviceRecording, deviceFidelityStatus } from './device-fidelity.js';
+import { applyDeviceFidelity, canonicalizeDeviceResponse, compareDeviceRecording, compareLlmCassetteRecording, deviceFidelityStatus } from './device-fidelity.js';
 
 const previousRoot = getTestStateRoot();
 const roots: string[] = [];
@@ -40,6 +40,19 @@ test('replays recorded real GitHub responses through the fake GitHub device', ()
   expect(result).toMatchObject({ recordingId: 'github-pulls-open', deviceId: 'fake-github', passed: true });
   expect(result.comparisons).toHaveLength(1);
   expect(deviceFidelityStatus('fake-github').verdict).toBe('green');
+});
+
+test('E4.5 LLM mismatch is attached only to worlds that used that cassette', () => {
+  withFidelityRoot();
+  const cassetteId = 'a'.repeat(64); // Source: SHA-256 recording key shape.
+  const legacyRequestKey = 'd'.repeat(64); // Source: legacy cassette request-key shape.
+  expect(compareLlmCassetteRecording(cassetteId, [{ type: 'text', delta: 'saved' }], [{ type: 'text', delta: 'changed' }], undefined, legacyRequestKey).passed).toBe(false);
+  expect(compareLlmCassetteRecording(cassetteId, [{ type: 'text', delta: 'saved' }], [{ type: 'text', delta: 'saved' }]).passed).toBe(true);
+  expect(deviceFidelityStatus('fake-llm', [cassetteId]).verdict).toBe('yellow');
+  expect(deviceFidelityStatus('fake-llm', [legacyRequestKey]).verdict).toBe('yellow');
+  expect(applyDeviceFidelity({ pass: true, devices: ['fake-llm'], recordingIds: [cassetteId] })).toMatchObject({ pass: false, verdict: 'yellow' });
+  expect(applyDeviceFidelity({ pass: true, devices: ['fake-llm'], recordingIds: ['b'.repeat(64)] })).toMatchObject({ pass: true, verdict: 'green' });
+  expect(applyDeviceFidelity({ pass: true, devices: ['fake-llm'] })).toMatchObject({ pass: true, verdict: 'green', fidelity: [{ verdict: 'unmeasured' }] });
 });
 
 test('a real-versus-device mismatch is durable and downgrades only results using that device', () => {

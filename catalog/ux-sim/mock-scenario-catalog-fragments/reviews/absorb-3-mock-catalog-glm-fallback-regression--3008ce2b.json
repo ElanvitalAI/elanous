@@ -1,0 +1,4 @@
+{
+  "deviceKey": "absorb-3-mock-catalog-glm-fallback-regression",
+  "review": "> 📅 **2026-11-10 재검토 (ABSORB-3 · MOCK-CATALOG-GLM-FALLBACK-REGRESSION)** — Pod Codex 503 시뮬 장치와 매뉴얼이 금지된 Z.ai 성공 fallback을 정책 기본 체인(no GLM)으로 갱신했고, 테스트 키 존재 중에도 호출이 0임을 검사한다. 이 규칙의 시뮬 증거와 원격 게이트 기준은 그대로 적용한다."
+}

@@ -1,7 +1,7 @@
 {
   "id": "MD-UX-SIM-FAULT-POD-CODEX-503-TS",
   "path": "src/ux-sim/fault-pod-codex-503.ts",
-  "boundary": "Injects a child-endpoint Codex HTTP 503 and competing Z.ai response to verify production fallback and surfaced result.",
+  "boundary": "Injects Codex HTTP 503/401 into production retry with an optional fake Z.ai credential and verifies the default Codex-rotation/Grok chain never calls the prohibited fallback.",
   "deviceIds": [
     "fault-injection"
   ],

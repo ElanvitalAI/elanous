@@ -6,7 +6,7 @@ import { decideRestartNeeded, type RestartNeededResult } from './nexus-restart-n
 import { debug } from '../debug/log.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { planEdgeRail, type EdgeRailInput, type EdgeRailPlan } from './self-update-canary.js';
 import { loadRunLedger } from '../self-implement/run-ledger.js';
 
@@ -740,6 +740,8 @@ export interface ReleaseUpdateDeps {
   packageRoot?: string;
   exists?: (path: string) => boolean;
   fetchInstaller?: (url: string) => Promise<string>;
+  /** Bounded latest-release retry delay; injectable so retry behavior stays deterministic in tests. */
+  wait?: (milliseconds: number) => Promise<void>;
   run?: (command: string, args: string[], cwd: string, input?: string, env?: NodeJS.ProcessEnv) => { status: number | null; stderr: string };
   os?: NodeJS.Platform;
   uid?: number;
@@ -819,14 +821,28 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
   };
   if (isTailnet(source) && !isTailnet(base)) return fail(2, '내부 설치본을 공개 기준으로 바꾸지 않는다');
   const url = `${base}/${version ? `download/v${version}` : 'latest/download'}/install.sh`;
-  let installer: string;
+  let installer = '';
   try {
-    installer = await (deps.fetchInstaller ?? (async (address) => {
+    const fetchInstaller = deps.fetchInstaller ?? (async (address) => {
       const response = await fetch(address);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       return response.text();
-    }))(url);
-    if (!installer.trim()) throw new Error('empty installer');
+    });
+    const attempts = version ? 1 : 3;
+    let lastError: unknown;
+    let fetchedInstaller = false;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        installer = await fetchInstaller(url);
+        if (!installer.trim()) throw new Error('empty installer');
+        fetchedInstaller = true;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt < attempts) await (deps.wait ?? ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds))))(1_000 * attempt);
+      }
+    }
+    if (!fetchedInstaller) throw lastError ?? new Error('installer download failed');
   } catch (error) {
     return fail(1, `설치기 다운로드 실패 (${url}): ${String(error)}`);
   }

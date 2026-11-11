@@ -30,6 +30,7 @@ import {
   type NexusRuntimeMeta,
 } from './runtime.js';
 import { nexusLockPath, nexusRuntimePath, nexusRootDir } from './paths.js';
+import { createJsonlMemberEventStore, createNexusCapabilityRegistry } from './api/member-event-store.js';
 import { createPwaRegistration, type PwaRegistrationDeps } from './pwa-registration.js';
 import { resolveCurrentInstance } from '../instance/current.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
@@ -118,7 +119,10 @@ import {
 import { discoverWorkflows as discoverWorkflowsForDaemon } from '../workflow-runtime/discovery.js';
 import { buildDefaultWorkflowDeps as buildWorkflowDaemonDeps } from './api/workflows.js';
 import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } from './api/http-server.js';
-import { loadNexusAppHost } from './apps/app-host.js';
+import { trustedTlsEdgeFromEnv } from './api/tls-edge.js';
+import { loadNexusAppHost, resolveVerifiedOwner as resolveVerifiedAppOwner, type NexusAppHost } from './apps/app-host.js';
+import { createMemberStore, type MemberStore } from './members/member-store.js';
+import { createVerifiedAbsorbBriefingsAppRoute } from './api/briefings-api.js';
 import { createAppPublishServerAdapter } from './apps/app-publish.js';
 import {
   createAppSiteDeployRoute,
@@ -133,7 +137,10 @@ export { resolveVerifiedOwner, type VerifiedAppOwner } from './apps/app-host.js'
 import { createAppLifecycleEvent } from './apps/app-lifecycle-ledger.js';
 import { createAppLifecycleStore, type AppLifecycleStore } from './apps/app-db.js';
 import { createAppSimulationStore, type AppSimulationStore } from './apps/app-simulation-db.js';
+import { resolveConceptProofForFingerprint } from './apps/app-simulation.js';
 import { createAppSimulationRoute } from './apps/app-simulation-route.js';
+import { createAppPromoteRoute } from './apps/app-promote.js';
+import { fingerprintAppSourceDirectory, withAppSourceLock } from './apps/app-source-snapshot.js';
 import {
   claimNexusFunnelFirstSuccess,
   tryCreateNexusFunnelRuntime,
@@ -149,6 +156,7 @@ import { createObjectStore, resolveStorageConfig } from '../storage/object-store
 import { APP_DB_BACKUP_HISTORY_KEY_REF, APP_DB_BACKUP_KEY_REF } from './apps/app-db-backup.js';
 import { checkAuth } from './api/meta-api.js';
 import { startControlServer } from '../control-plane/server.js';
+import { startResidentMsgSseServer } from '../msg/msg-sse-server.js';
 import { nexusMemberMachine, startMemberHeartbeat } from '../control-plane/member.js';
 import { resolvePrimary } from '../control-plane/primary.js';
 import { cleanGhostTailscaleServe } from '../cli/tailscale-serve.js';
@@ -255,7 +263,7 @@ import { globalAcpAgentManager } from '../acp/agent-manager.js';
 import { fetchCodexPlugins } from '../acp/codex-plugins.js';
 import { globalAgentCliConversationStore } from './api/agent-cli-conversation-store.js';
 import { globalMissionRouter } from '../llm/mission-router.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { debug } from '../debug/log.js';
@@ -476,6 +484,8 @@ export interface RunNexusOptions {
   /** Bypass the wait loop (tests). When true, runNexus returns the
    *  release callback after writing runtime.json instead of blocking. */
   detachForTesting?: boolean;
+  /** Test-only isolated post-office boot; production starts it with the normal Nexus lifetime. */
+  msgSseForTesting?: { stateRoot: string; token: string; port?: number };
   /** Test-only observation of the live continuation scheduler created by runNexus. */
   onContinuationSchedulerStarted?: (scheduler: import('../dispatch/continuation-scheduler.js').ContinuationScheduler) => void;
   /** Test-only PWA registry dependency seam. Production uses the registry defaults. */
@@ -710,10 +720,15 @@ export interface RunNexusOptions {
   registerMcpClientsFn?: typeof registerMcpClients;
   getMcpUserConfigForTesting?: typeof getUserConfig;
   reloadUserConfigForTesting?: typeof import('../user-config.js').reloadUserConfig;
+  /** Guardian's generic worker-management adapter and human-authored ledger policy. */
+  trainWorkerLifecycle?: {
+    adapter?: import('../loops/train/worker-lifecycle.js').TrainWorkerLifecycleAdapter;
+    policy?: import('../resource-ledger/resource-ledger.js').TrainWorkerPolicy;
+  };
 }
 
 export interface RunNexusHandle {
-  release: () => void;
+  release: () => void | Promise<void>;
   state: ReturnType<typeof createNexusState>;
   registry: TabRegistry;
   runtime: NexusRuntimeMeta;
@@ -958,6 +973,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   // the boot block lives in an inner try/catch. Assigned by the inner
   // boot block; left undefined when the boot path is never reached.
   let patcherSubstrateHandle: PatcherSubstrate | undefined;
+  let stopTrainWorkerLifecycle: (() => Promise<void>) | undefined;
   // W9d-FU Z15.b — Devices fleet cron handle. Same scope rationale as
   // `patcherSubstrateHandle`.
   let devicesSubstrateHandle: DevicesSubstrate | undefined;
@@ -1188,6 +1204,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   const stopTaRepairEventCollector = startTaRepairEventCollector(eventBus);
   const state = createNexusState({ nexusVersion: NEXUS_VERSION, phase: NEXUS_PHASE });
   state.bus = eventBus;
+  const boardEventStore = createJsonlMemberEventStore(joinPath(nexusRootDir(), 'member-events'));
+  const capabilityProviders = createNexusCapabilityRegistry(boardEventStore);
   // BACKLOG #9 — fan workflow approval lifecycle into `/v1/events` SSE
   // so the PWA modal opens on push (~200ms) instead of waiting for
   // the next 1s pendingApprovals poll cycle.
@@ -1366,6 +1384,18 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       debug.log('control.server', 'start-failed-in-nexus', { port: opts.controlPort, reason: (err as Error).message }, { level: 'warn' });
     }
   }
+  let msgSseResident: Awaited<ReturnType<typeof startResidentMsgSseServer>> | undefined;
+  if (!opts.detachForTesting || opts.msgSseForTesting) {
+    try {
+      msgSseResident = await startResidentMsgSseServer({
+        stateRoot: opts.msgSseForTesting?.stateRoot ?? elanousStateRoot(),
+        token: opts.msgSseForTesting?.token ?? ensureAuthToken().token,
+        port: opts.msgSseForTesting?.port ?? 0,
+      });
+    } catch (err) {
+      debug.log('msg.sse', 'start-failed-in-nexus', { reason: (err as Error).message }, { level: 'warn' });
+    }
+  }
   // Surface-unification v2.1 FU-3 (2026-05-11) — workflow-runtime
   // daemon. Owns trigger source lifecycle (schedule/webhook/discord/
   // telegram/chat). Schedule + webhook + chat fire from in-process
@@ -1420,6 +1450,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   // ACP WS bridge, intake/sessions etc. all dispatch in-process.
   const skipRuntime = opts.skipRuntimeApi ?? !!opts.detachForTesting;
   let runtimeHistory: DaemonSessionHistory | undefined;
+  let deploymentOwnerAppHost: NexusAppHost | undefined;
+  let deploymentOwnerMemberStore: MemberStore | undefined;
   let runtimeHitlPending: HitlPendingCallbacks | undefined;
   // Identity of the AskUserQuestion resolver this boot installed (or null
   // when a prior resolver already owned the hook). release() clears only
@@ -2259,6 +2291,20 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
 
       metaApiOpts = {
         voiceRest,
+        resolveVerifiedOwner: (req, appSlug) => {
+          const host = deploymentOwnerAppHost;
+          const members = deploymentOwnerMemberStore;
+          if (!host || !members || appSlug !== 'lecture-scrap') return undefined;
+          const authorization = req.headers.get('authorization') ?? '';
+          const bearer = /^Bearer\s+(.+)$/i.exec(authorization)?.[1]?.trim();
+          const cookie = req.headers.get('cookie') ?? '';
+          for (const credential of [cookie, bearer ?? '']) {
+            if (!credential) continue;
+            const owner = resolveVerifiedAppOwner(host, appSlug, credential, members, resolvePublicAppUserId());
+            if (owner) return { ...owner, id: owner.memberId, appSlug };
+          }
+          return undefined;
+        },
         ...(bearerToken ? { bearerToken } : {}),
         noAuth,
         history: runtimeHistory,
@@ -2351,7 +2397,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         historicalKeys: historicalBackupKeys,
       };
       appHostLoad = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'), undefined, {
-        dir: joinPath(nexusRootDir(), 'app-session-tokens'), key, funnel: appFunnelRuntime, databaseBackup,
+        dir: joinPath(nexusRootDir(), 'app-session-tokens'), key, funnel: appFunnelRuntime, eventBus, databaseBackup,
       }, appPublicUserSlug);
     } catch (error) {
       debug.log('nexus.app-auth', 'signing-key-unavailable', { reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
@@ -2359,6 +2405,11 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       appHostLoad = loadNexusAppHost(joinPath(nexusRootDir(), 'apps'), undefined, undefined, appPublicUserSlug);
     }
     const { appHost, issues: appHostIssues } = appHostLoad;
+    deploymentOwnerAppHost = appHost;
+    if (process.env.GOOGLE_OAUTH_REDIRECT_URI?.trim()) {
+      try { deploymentOwnerMemberStore = createMemberStore(); }
+      catch (error) { debug.log('nexus.app-deploy-owner', 'member-store-unavailable', { reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+    }
     const appPublishAdapter = appPublicUserSlug ? createAppPublishServerAdapter(appHost, {
       getManifest: slug => appHost.getManifest(slug),
       authorizeOwner: request => !!metaApiOpts && checkAuth(request, metaApiOpts),
@@ -2381,6 +2432,13 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       try { appSimulationStore?.close(); } catch { /* best-effort */ }
       appSimulationStore = undefined;
     }
+    appHost.setConceptProofResolver(slug => {
+      try {
+        const currentFingerprint = fingerprintAppSourceDirectory(joinPath(nexusRootDir(), 'apps', slug));
+        const receipts = appSimulationStore?.snapshot(slug).receipts ?? [];
+        return resolveConceptProofForFingerprint(receipts, currentFingerprint);
+      } catch { return undefined; }
+    });
     for (const issue of appHostIssues) {
       debug.log('nexus.app-host', 'app-mount-rejected', issue, { level: 'warn' });
     }
@@ -2697,6 +2755,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         const bridgeTaskStore = new BridgeTaskStore();
         workflowDaemon = createWorkflowRuntimeDaemon({
           workflows: discoveredWorkflows,
+          graphFiles: (await import('../graph-runner/plugin-graph-entry.js')).installedGraphFiles(),
           deps: daemonDeps,
           onEmit: ({ workflowName, result }) => {
             try {
@@ -3291,7 +3350,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         const raw = (actions as Record<string, unknown>)[actionName];
         if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
         const value = raw as Record<string, unknown>;
-        if ((value.builtin !== 'stt' && value.builtin !== 'summarize' && value.builtin !== 'tts' && value.builtin !== 'generate')
+        if ((value.builtin !== 'stt' && value.builtin !== 'summarize' && value.builtin !== 'tts' && value.builtin !== 'generate' && value.builtin !== 'extract')
           || !Array.isArray(value.uses) || !value.uses.every(item => typeof item === 'string')) return undefined;
         return {
           builtin: value.builtin, uses: value.uses as string[],
@@ -3311,18 +3370,23 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     const appSiteDeployRoute = appPublicUserSlug ? createAppSiteDeployRoute({
       ...appSiteDeploymentOperations,
       configuredPublicUserId: appPublicUserSlug,
+      withSourceLock: (slug, run) => withAppSourceLock(slug, joinPath(nexusRootDir(), 'apps', slug), run),
       resolveOwner: (request, appSlug) => httpServer
         ? fetchAppMemberOwner(request, appSlug, httpServer.url)
         : Promise.resolve(null),
       publish: async input => {
         await appSiteDeploymentOperations.publish(input);
-        appHost.mountDirectory(input.appSlug);
+        appHost.mountDirectory(input.appSlug, input.owner.entitlements);
       },
       discard: async source => {
         if (source.appSlug) appHost.unmountDirectory(source.appSlug);
         await appSiteDeploymentOperations.discard?.(source);
       },
     }) : undefined;
+    const absorbBriefingsRoute = createVerifiedAbsorbBriefingsAppRoute({
+      root: elanousStateRoot(),
+      endpointOrigin: () => httpServer?.url ?? null,
+    });
     const appStorageRoute = createAppStorageRoute({
       storage: appStorageService,
       getManifest: appSlug => appHost.getManifest(appSlug),
@@ -3332,8 +3396,22 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       store: appSimulationStore,
       authorize: candidate => !!metaApiOpts && checkAuth(candidate, metaApiOpts),
       hasApp: slug => appHost.slugs.includes(slug),
+      getManifest: slug => appHost.getManifest(slug),
+      appSourceRoot: slug => joinPath(nexusRootDir(), 'apps', slug),
+      fingerprintApp: slug => fingerprintAppSourceDirectory(joinPath(nexusRootDir(), 'apps', slug)),
+      withSourceLock: (slug, run) => withAppSourceLock(slug, joinPath(nexusRootDir(), 'apps', slug), run),
       publish: event => { pushEvent(state, event); },
     }) : undefined;
+    const appPromoteRoute = createAppPromoteRoute({
+      simulations: appSimulationStore,
+      lifecycle: appLifecycleStore,
+      hasApp: slug => appHost.slugs.includes(slug),
+      authorizeOwner: async (candidate, slug) => !!httpServer
+        && !!await fetchAppMemberOwner(candidate, slug, httpServer.url),
+      currentFingerprint: slug => fingerprintAppSourceDirectory(joinPath(nexusRootDir(), 'apps', slug)),
+      withSourceLock: (slug, run) => withAppSourceLock(slug, joinPath(nexusRootDir(), 'apps', slug), run),
+      config: () => getUserConfig()?.global?.nexus ?? {},
+    });
     const appJobRoute = appGenerationRuntime
       ? (request: Request) => handleAppJobRequest(request, {
         jobs: appGenerationRuntime!.jobs,
@@ -3377,10 +3455,24 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       }, 1_500);
       (warm as { unref?: () => void }).unref?.();
     }
+    const trustedTlsEdge = trustedTlsEdgeFromEnv();
+    const { loadDeclaredPluginHandler } = await import('../plugins/core/declared-handler.js');
+    const createBoardApprovalDispatch = await loadDeclaredPluginHandler<
+      (deps: { appsRoot: string; graphOptions: { deps: { capabilityProviders: typeof capabilityProviders } } }) => NonNullable<import('./api/board-api.js').BoardApiDeps['dispatchApproved']>
+    >(joinPath(import.meta.dir, '../../plugins'), 'boardApproval');
+    const boardApprovalDispatch = createBoardApprovalDispatch?.({
+      appsRoot: joinPath(nexusRootDir(), 'apps'),
+      graphOptions: { deps: { capabilityProviders } },
+    }) ?? (async () => { throw new Error('board approval plugin unavailable'); });
     httpServer = startHttpServer({
       state,
       registry,
       eventBus,
+      boardEventStore,
+      boardApprovalDispatch,
+      capabilityProviders,
+      scraps: { instanceRoot: nexusRootDir(), extractors: {} },
+      ...(trustedTlsEdge ? { trustedTlsEdge } : {}),
       setup: { mode: nexusSetup.setupMode, missing: nexusSetup.setupMissing },
       ...(supervisor ? { supervisor } : {}),
       ...(outboundSubstrate ? { outboundTokens: { tokenStore: outboundSubstrate.tokenStore } } : {}),
@@ -3404,7 +3496,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         return appSimulationStore.snapshot(slug);
       },
       ...(appPublicUserSlug ? { appPreviewUserSlug: appPublicUserSlug } : {}),
-      appRoutes: [...(appPublishRoute ? [appPublishRoute] : []), ...(appSiteDeployRoute ? [appSiteDeployRoute] : []), appActionRoute, ...(appSimulationRoute ? [appSimulationRoute] : []), appStorageRoute, ...(appJobRoute ? [appJobRoute] : [])],
+      appRoutes: [...(appPublishRoute ? [appPublishRoute] : []), ...(appSiteDeployRoute ? [appSiteDeployRoute] : []), absorbBriefingsRoute, appActionRoute, ...(appSimulationRoute ? [appSimulationRoute] : []), appPromoteRoute, appStorageRoute, ...(appJobRoute ? [appJobRoute] : [])],
       ...(runtimeIntentPrediction ? { intentPrediction: runtimeIntentPrediction } : {}),
       // next-fluent(태스크 완료 → 다음 액션 1-클릭 칩·2026-07-15) — mission-fabric-aware source +
       // 항상 켜진 라우트(기본 ON). personas 만 선택 사항이며, route 는 503(not-wired) 안 냄.
@@ -3489,6 +3581,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         ? {
             workflowDaemon: {
               dispatchWebhook: (req) => workflowDaemon!.dispatchWebhook(req),
+              isSelfVerifiedGraphWebhookRoute: (method, path) => workflowDaemon!.isSelfVerifiedGraphWebhookRoute(method, path),
               dispatchChat: (req) => workflowDaemon!.dispatchChat(req),
               dispatchTelegram: (event) => workflowDaemon!.dispatchTelegram(event),
               chatConfig: (name) => workflowDaemon!.chatConfig(name),
@@ -3496,6 +3589,11 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
           }
         : {}),
     });
+
+    // Replay persisted graph acceptances with their original run IDs after a daemon restart.
+    void import('./api/board-api.js').then(({ recoverBoardApprovals }) =>
+      recoverBoardApprovals(boardEventStore, boardApprovalDispatch, () => console.error('[nexus] board graph recovery failed'))
+    ).catch(() => console.error('[nexus] board graph recovery unavailable'));
 
     // R5 follow-up (2026-05-09) — wire the session-decision → ACP
     // forward subscriber. Reuses the same NotificationActionLoopback
@@ -3703,9 +3801,27 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   let shareCoordinatorTimer: ReturnType<typeof setInterval> | undefined;
   let shareCoordinatorStopped = false;
   let shareCoordinatorPending: Promise<void> | undefined;
-  const wrappedRelease = (): void => {
+  try {
+    const [{ startGuardianTrainWorkerRuntime, resolveTrainWorkerRuntime }, { RESOURCE_RECONCILE_INTERVAL_MS }, { getUserConfig }] = await Promise.all([
+      import('../loops/train/worker-lifecycle.js'),
+      import('../resource-ledger/guardian-reconcile.js'),
+      import('../user-config.js'),
+    ]);
+    const trainWorkerRuntime = resolveTrainWorkerRuntime(opts.trainWorkerLifecycle?.adapter,
+      opts.trainWorkerLifecycle?.policy ?? getUserConfig().guardian?.trainWorkerPolicy);
+    stopTrainWorkerLifecycle = startGuardianTrainWorkerRuntime({
+      ...trainWorkerRuntime,
+      intervalMs: RESOURCE_RECONCILE_INTERVAL_MS,
+    });
+  } catch (error) {
+    debug.log('nexus.guardian', 'train-worker-lifecycle-unavailable', {
+      reason: error instanceof Error ? error.message : String(error),
+    }, { level: 'warn' });
+  }
+  const wrappedRelease = async (): Promise<void> => {
     shareCoordinatorStopped = true;
     if (shareCoordinatorTimer) { clearInterval(shareCoordinatorTimer); shareCoordinatorTimer = undefined; }
+    try { await stopTrainWorkerLifecycle?.(); } catch { /* shutdown continues if Guardian tick cleanup fails */ }
     pushEvent(state, { kind: 'nexus.shutdown' });
     pwaRegistration.unregister();
     try { unsubscribeWebtermTabLifecycle(); } catch { /* swallow */ }
@@ -3881,9 +3997,13 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       leaseReleasePending = stopLease().catch(error => debug.log('control.port-lease', 'release-failed', { port: leasePortFromLauncher, reason: String(error) }, { level: 'warn' }));
     }
     controlServer?.stop();
+    msgSseResident?.stop();
     httpServer?.stop();
     try { appGenerationRuntime?.jobs.close(); } catch { /* best-effort shutdown */ }
     try { appLifecycleStore?.close(); } catch { /* best-effort shutdown */ }
+    try { deploymentOwnerMemberStore?.close(); } catch { /* best-effort shutdown */ }
+    deploymentOwnerMemberStore = undefined;
+    deploymentOwnerAppHost = undefined;
     try { appSimulationStore?.close(); } catch { /* best-effort shutdown */ }
     appLifecycleStore = undefined;
     if (appStorageService) {
@@ -3936,7 +4056,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     await shareCoordinatorPending;
     try { await unmountAutoMountedShare(); }
     finally {
-      wrappedRelease();
+      await wrappedRelease();
       await leaseReleasePending;
     }
   };

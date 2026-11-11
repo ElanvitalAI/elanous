@@ -1,0 +1,15 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "gcp-architect-expand",
+  "version": "0.1.0",
+  "description": "Local-first capacity and cost proposal graph. Declaration and fake-world simulation only; no Google Cloud calls.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graph.yaml"],
+      "capabilities": ["fs:workdir"],
+      "connectors": [],
+      "pricing": { "model": "free" },
+      "category": "Infrastructure"
+    }
+  }
+}

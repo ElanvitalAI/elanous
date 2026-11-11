@@ -1,0 +1,21 @@
+{
+  "id": "fake-app-failures",
+  "name": "Fake app build, deploy, and runtime failure injections",
+  "audience": "internal",
+  "checklistCells": ["SIM-FAKE-APP-FAILURES"],
+  "implementation": ["src/ux-sim/fake-app-failures.ts"],
+  "tests": ["src/ux-sim/fake-app-failures.test.ts"],
+  "target": "Injects deterministic app-development failures into one simulation world without calling build, deploy, or runtime services.",
+  "inputs": ["declared app ID", "active app version", "fixed failure fixtures"],
+  "observations": [
+    "build failures for missing static output and invalid app contract",
+    "deploy failures for publish-gate rejection, certificate issuance, and relay disconnect",
+    "runtime failures for repeated server errors, slow requests, rejected credentials, and canary hits",
+    "each injected record has a stage, connector, app ID, and app version",
+    "one unrecognized build-hook failure remains classified as unknown"
+  ],
+  "entryCommands": ["bun test src/ux-sim/fake-app-failures.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

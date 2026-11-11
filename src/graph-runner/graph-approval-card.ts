@@ -11,7 +11,7 @@ export interface GraphApprovalCardDeps {
 }
 
 type Pending = NonNullable<GraphRunState['pending']>;
-const REF = /^graph-approval:([A-Za-z0-9][A-Za-z0-9._-]*):([A-Za-z0-9][A-Za-z0-9._-]*):([A-Za-z0-9][A-Za-z0-9._-]*):([1-9]\d*)$/;
+const REF = /^graph-approval:([A-Za-z0-9][A-Za-z0-9._-]*):([A-Za-z0-9][A-Za-z0-9._-]*):([A-Za-z0-9][A-Za-z0-9._-]*):([1-9]\d*)(?::([a-f0-9-]{36}))?$/;
 
 function ledgerFor(deps: GraphApprovalCardDeps, root: string): Pick<DecisionLedger, 'list' | 'raise'> {
   return deps.ledger ?? new DecisionLedger({ stateDir: root });
@@ -32,7 +32,7 @@ export function raiseApprovalCard(state: GraphRunState, pending: Pending, deps: 
     observation('skipped', identity);
     return undefined;
   }
-  const ref = `graph-approval:${state.graphId}:${state.runId}:${nodeId}:${visit}`;
+  const ref = `graph-approval:${state.graphId}:${state.runId}:${nodeId}:${visit}${pending.approvalNonce ? `:${pending.approvalNonce}` : ''}`;
   const ledger = ledgerFor(deps, root);
   const existing = ledger.list({ status: 'all' }).find(entry => entry.refs?.includes(ref));
   if (existing) {
@@ -61,10 +61,10 @@ export function applyDecidedApprovals(deps: GraphApprovalCardDeps = {}): number 
     for (const ref of entry.refs ?? []) {
       const match = REF.exec(ref);
       if (!match) continue;
-      const [, graphId, runId, nodeId, rawVisit] = match;
+      const [, graphId, runId, nodeId, rawVisit, approvalNonce] = match;
       const identity = { graphId: graphId!, runId: runId!, nodeId: nodeId! };
       // One unreadable run must not block every later card (L11 review round 1 should-fix).
-      try { if (applyOne(entry, identity, Number(rawVisit), root)) applied++; }
+      try { if (applyOne(entry, identity, Number(rawVisit), root, approvalNonce)) applied++; }
       catch (error) {
         observation('skipped', identity, entry.id, entry.choice, error instanceof Error ? error.message : String(error));
       }
@@ -73,7 +73,7 @@ export function applyDecidedApprovals(deps: GraphApprovalCardDeps = {}): number 
   return applied;
 }
 
-function applyOne(entry: DecisionEntry, identity: { graphId: string; runId: string; nodeId: string }, visit: number, root: string): boolean {
+function applyOne(entry: DecisionEntry, identity: { graphId: string; runId: string; nodeId: string }, visit: number, root: string, approvalNonce?: string): boolean {
   const { graphId, runId, nodeId } = identity;
   // Graph approvals gate irreversible steps (publish) — only a person's answer approves or rejects, never a delegated auto decision.
   if ((entry.choice !== 'a' && entry.choice !== 'b') || entry.decidedBy?.kind !== 'human' || !Number.isSafeInteger(visit)) {
@@ -90,6 +90,7 @@ function applyOne(entry: DecisionEntry, identity: { graphId: string; runId: stri
   }
   if (state.graphId !== graphId || state.runId !== runId || state.dryRun || state.growthPark || state.status !== 'awaiting-approval' ||
       !state.pending || state.pending.nodeId !== nodeId || state.pending.decision || state.path.at(-1) !== nodeId ||
+      state.pending.approvalNonce !== approvalNonce ||
       state.path.filter(node => node === nodeId).length !== visit ||
       existsSync(`${statePath}.${state.path.length}.decision.json`)) {
     observation('skipped', identity, entry.id, entry.choice);

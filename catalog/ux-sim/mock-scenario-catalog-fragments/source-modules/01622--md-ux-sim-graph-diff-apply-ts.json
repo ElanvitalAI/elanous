@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-GRAPH-DIFF-APPLY-TS",
+  "path": "src/ux-sim/graph-diff-apply.ts",
+  "boundary": "Applies validated graph edits to synthetic templates and reports invalidated downstream nodes without mutating production graph files.",
+  "deviceIds": ["adaptive-graph-design"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

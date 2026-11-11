@@ -8,14 +8,6 @@ export interface SidebarShellPresentation {
   badgeMaxWidth?: number;
 }
 
-const IUL_LAB_SIDEBAR_PRESENTATION = {
-  title: 'IUL UX Lab',
-  compactTitle: 'IUL',
-  pluralLabel: 'labs',
-  singularLabel: 'lab',
-  emptyState: '(no IUL lab lanes)',
-} as const;
-
 const ACP_CHANNEL_SIDEBAR_PRESENTATION = {
   title: 'ACP Channels',
   compactTitle: 'ACP',
@@ -25,15 +17,6 @@ const ACP_CHANNEL_SIDEBAR_PRESENTATION = {
   footerHint: '↑↓ switch channel · Enter detail · Right-click menu · Ctrl+Enter/Double-click action · Tab focus swap',
   compactFooterHint: '↑↓ channel · ↵ detail · rc menu · ^↵/dbl action',
 } as const;
-
-export function resolveIulSidebarShellPresentation(): SidebarShellPresentation {
-  return {
-    title: IUL_LAB_SIDEBAR_PRESENTATION.title,
-    compactTitle: IUL_LAB_SIDEBAR_PRESENTATION.compactTitle,
-    ...resolveSidebarShellVocabulary(IUL_LAB_SIDEBAR_PRESENTATION),
-    badgeMaxWidth: 6,
-  };
-}
 
 export function resolveAcpSidebarShellPresentation(): SidebarShellPresentation {
   return {

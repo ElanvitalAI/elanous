@@ -7,7 +7,7 @@ import { dispatchCeoTask, type CeoCommandDeps } from '../seat-dispatch/ceo-comma
 import { ceoTaskDeps, classifyCeoIntent } from '../seat-dispatch/ceo-intent.js';
 import { askSeat, askSeatAs, parseSeatAsk, type SeatAskDeps } from '../seat-dispatch/seat-ask.js';
 import { parseSeatAddress, resolveSeat } from '../seat-address/seat-address.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { UserConfig } from '../user-config/types.js';
 import { answerAsSeat } from './seat-answer.js';
 import { answerAsPersona, resolvePersonaAddress, seatOfPersona, type PersonaAnswerDeps } from './persona-answer.js';

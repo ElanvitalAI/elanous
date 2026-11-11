@@ -14,7 +14,7 @@ import { openSignalsDb, SIGNALS_DB_PATH, periodStats } from './breaking-signals.
 import { US_PULSE_DB, openPulseDb, loadUniverse, sectorWrap, detectNotables, SECTOR_ETFS, ANCHOR_ETFS } from './us-pulse.js';
 import { KR_SECTOR_ETFS, readLiveSnapshot } from './market-live.js';
 import { openSchedulesDb, inventoryCrontab, inventoryInternalSchedules, listSchedules, scheduleHealth } from './schedule-registry.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { opsSnapshot, opsHealth, opsTimeline, opsMissionDetail } from './ops-status.js';
 import { conatusPath } from './conatus-data-dir.js';
 import { tradeMandatePath } from './trade-mandate.js';

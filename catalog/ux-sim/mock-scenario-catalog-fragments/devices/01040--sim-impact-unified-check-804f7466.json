@@ -1,0 +1,35 @@
+{
+  "id": "sim-impact-unified-check",
+  "name": "Unified goal and PR simulation-impact decision with graph-path evidence",
+  "checklistCells": [
+    "SIM-IMPACT-UNIFIED-CHECK"
+  ],
+  "implementation": [
+    "scripts/sim-impact-check.ts",
+    "scripts/sim-impact.ts",
+    "src/loops/orchestrator/sim-impact-audit.ts"
+  ],
+  "tests": [
+    "src/ux-sim/sim-impact-unified-check-sim.test.ts"
+  ],
+  "target": "Unified simulation-impact check for goal wording and PR diffs, including the resident OP omission report",
+  "inputs": [
+    "goal targets with and without proof-scenario wording",
+    "a PR guard patch and its reverse import closure",
+    "scenario definitions plus graph.path evidence with runId and guard node",
+    "open work items for the 08 and 18 coordinator audit windows"
+  ],
+  "observations": [
+    "ordinary goal gaps warn while entrypoint or guard gaps refuse",
+    "uncovered PR guard gaps return T2 hold and matching graph.path evidence clears the hold",
+    "the audit posts uncovered work to OP at 08 and 18 and skips 12"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/sim-impact-unified-check-sim.test.ts",
+    "bun scripts/sim-impact-check.ts --goal <goal-file> [--json]",
+    "bun scripts/sim-impact-check.ts --pr <number> [--event-evidence <path>] [--json]"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

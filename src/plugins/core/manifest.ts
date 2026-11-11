@@ -14,6 +14,7 @@ import type {
   WorkflowStepOnError,
 } from '../../plugin-workflows/types.js';
 import { WORKFLOW_DEFAULTS } from '../../plugin-workflows/types.js';
+import { readPluginYamlGeneratedManifest } from './plugin-yaml.js';
 
 export type PluginSource = 'builtin' | 'user' | 'workspace' | 'installed';
 
@@ -279,6 +280,14 @@ export function loadPluginManifestFromDir(
   pluginDir: string,
   fallback: { id: string; name?: string; version?: string; description?: string; main?: string; allowClaudeManifest?: boolean },
 ): PluginManifestLoadResult {
+  const generated = readPluginYamlGeneratedManifest(pluginDir);
+  if (generated) {
+    return {
+      manifest: parsePluginManifest(generated, { fallbackId: fallback.id, fallbackMain: fallback.main ?? './plugin.ts' }),
+      path: join(pluginDir, 'plugin.yaml'),
+      inferred: false,
+    };
+  }
   const manifestFiles = fallback.allowClaudeManifest ? [...MANIFEST_FILES, CLAUDE_MANIFEST_FILE] : MANIFEST_FILES;
   for (const rel of manifestFiles) {
     const path = join(pluginDir, rel);

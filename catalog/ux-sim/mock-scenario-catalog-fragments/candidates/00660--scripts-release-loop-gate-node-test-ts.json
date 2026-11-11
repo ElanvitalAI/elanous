@@ -1,0 +1,11 @@
+{
+  "path": "scripts/release-loop/gate-node.test.ts",
+  "disposition": "device",
+  "entryCommand": "bun test scripts/release-loop/gate-node.test.ts -t 'GATE-NODE-WIRING-BUNDLE sim'",
+  "logsRecorded": "no",
+  "logsDetail": "Injected release cut flow asserts shard-ledger disposition and invocation identity, persisted timeout owner-cell observations, and the macrophage decision event on the shared graph bus.",
+  "deviceId": "release-graph-rig",
+  "scenarioIds": [
+    "UX-MS-02"
+  ]
+}

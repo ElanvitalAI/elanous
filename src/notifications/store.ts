@@ -27,7 +27,8 @@ export type NotificationKind =
   | 'error'        // 파싱/런타임 에러
   | 'hitl'         // HITL 콜백 (approval, etc.)
   | 'agent-done'   // PFC-S1 P2: background Agent task finished (done/error/aborted)
-  | 'escalation';  // PFC-S3.1: Andon Cord signal (LOW/MED/HIGH/CRITICAL)
+  | 'escalation'   // PFC-S3.1: Andon Cord signal (LOW/MED/HIGH/CRITICAL)
+  | 'briefing';    // Absorb briefing notification card
 
 export interface NotificationEvent {
   readonly id: string;

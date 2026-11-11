@@ -5,6 +5,7 @@ export type AppLifecycleAction =
   | 'simulated'
   | 'receipt-issued'
   | 'promoted'
+  | 'upgrade'
   | 'paused'
   | 'rolled-back'
   | 'trashed'
@@ -73,7 +74,7 @@ const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const VERSION_ID = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/;
 const REASON_CODES = new Set<string>(APP_LIFECYCLE_REASON_CODES);
 const ACTIONS = new Set<AppLifecycleAction>([
-  'created', 'simulated', 'receipt-issued', 'promoted', 'paused', 'rolled-back', 'trashed', 'restored', 'purged',
+  'created', 'simulated', 'receipt-issued', 'promoted', 'upgrade', 'paused', 'rolled-back', 'trashed', 'restored', 'purged',
 ]);
 
 function validateAppId(appId: unknown): string {
@@ -198,6 +199,7 @@ export function projectAppLifecycleSnapshot(
         latestReceiptId = event.receiptId ?? null;
         break;
       case 'promoted':
+      case 'upgrade':
         if (event.appVersion !== undefined && event.appVersion !== currentVersion) {
           previousVersion = currentVersion;
           currentVersion = event.appVersion;

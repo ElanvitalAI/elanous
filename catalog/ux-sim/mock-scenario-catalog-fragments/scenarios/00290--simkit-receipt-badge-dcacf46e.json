@@ -1,0 +1,26 @@
+{
+  "id": "SIMKIT-RECEIPT-BADGE",
+  "name": "Declared app simulation receipt gates the attribution badge",
+  "kind": "simulation-proof-and-badge-binding",
+  "device": "sim-receipt-proof",
+  "implementation": [
+    "src/ux-sim/sim-receipt.ts",
+    "src/nexus/apps/app-simulation-route.ts",
+    "src/nexus/apps/app-simulation-db.ts",
+    "src/nexus/apps/app-host.ts"
+  ],
+  "tests": [
+    "src/ux-sim/sim-receipt.test.ts",
+    "src/nexus/apps/app-simulation-route.test.ts",
+    "src/nexus/apps/app-simulation-db.test.ts",
+    "src/nexus/apps/app-host.test.ts"
+  ],
+  "trigger": "A deterministic test-world run completes the required app.yaml scenarios and the Nexus app host serves the resulting static app snapshot.",
+  "observe": [
+    "required scenarios are read from app.yaml",
+    "simulation proof receipt is stored atomically with its app receipt and events",
+    "current-source passing proof binds the owned badge fingerprint",
+    "missing, failed, stale, unmeasured, malformed-script and rollback-failure paths withhold or omit proof"
+  ],
+  "expected": "The badge is visible only for a current passing proof; browser parsing never attaches its fingerprint to text, template content or script-inert markup."
+}

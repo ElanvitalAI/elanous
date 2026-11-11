@@ -9,6 +9,7 @@ import { Menu, X } from 'lucide-react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { useCompactMode } from '@/lib/compact-mode';
 import { useShellActivity } from '@/components/shell/use-shell-activity';
+import { userIntentLogger } from '@/lib/user-intent-logger';
 
 export interface ChatPanelProps {
   /** Only the standalone /chat page shows its conversation navigation. */
@@ -18,6 +19,14 @@ export interface ChatPanelProps {
 }
 
 export function ChatPanel(props: ChatPanelProps = {}) {
+  useEffect(() => {
+    if (!props.showConversationList) return;
+    void userIntentLogger.emit({
+      surface: 'pwa',
+      intent: { layer: 'navigation', kind: 'pwa.navigation.chat_opened', target: { kind: 'route', id: '/chat' } },
+      surface_state: { route: '/chat' },
+    });
+  }, [props.showConversationList]);
   const { compact } = useCompactMode();
   const mobileSimple = !!props.mobileSimple && compact;
   const mobileActivity = useShellActivity();

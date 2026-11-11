@@ -35,6 +35,8 @@ export interface ToolRuntimeContext {
    *  to attach approval prompts (e.g. dashboard) or skip them
    *  (e.g. skill, which delegates trust to the skill author). */
   surface: ToolRuntimeSurface;
+  /** Caller-visible tool catalog for surface-scoped discovery runtimes such as ToolSearch. */
+  surfaceSpecs?: readonly LLMToolSpec[];
   /** When true, the runtime should treat the invocation as
    *  untrusted and prompt the user before taking side effects.
    *  Runtime may ignore for read-only ops. */
@@ -102,6 +104,8 @@ export interface ToolRuntimeContext {
   verifiedOwner?: { id: string };
   /** Server-authenticated Nexus app session class; never supplied by tool arguments. */
   appDeploymentSession?: 'nexus-owner' | 'member' | 'anonymous';
+  /** Verified app-scoped member receipt resolved by Nexus at the request boundary. */
+  appDeploymentOwner?: { appSlug: string; memberId: string; userSlug: string; plan: string; entitlements: Readonly<Record<string, unknown>> };
   /** Server-assigned provenance; omitted on existing owner tool paths. */
   requestOrigin?: RequestOrigin;
   /** Confirm through the originating chat's channels, not another user's global channel. */

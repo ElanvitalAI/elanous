@@ -53,7 +53,7 @@ import { setToxRuntimeDeps, resetToxRuntimeDepsForTest } from './runtime-deps.js
 import type { TaskSurfaceKind } from './types.js';
 import type { TaskStore } from './store.js';
 import { startToxLoop } from './tox-loop.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export type AndonSubscribeSeam = (
   fn: (signal: AndonSignalLike, kind: AndonSubscriberKind) => void,

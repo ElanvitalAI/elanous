@@ -1,0 +1,39 @@
+{
+  "id": "fake-agent-hook-host",
+  "name": "Fake agent hook host and MCP inbox",
+  "checklistCells": [
+    "MSGX-PLUGIN-HOOKS",
+    "MSGX-MCP-INBOX"
+  ],
+  "implementation": [
+    "src/msg/msg-hook.ts",
+    "src/msg/msg-store.ts",
+    "src/ux-sim/fake-agent-hook-host.ts"
+  ],
+  "tests": [
+    "src/msg/msg-hook.test.ts",
+    "src/ux-sim/fake-agent-hook-host.test.ts"
+  ],
+  "target": "Claude and Codex hook payload delivery plus the fake MCP inbox/ack call contract against an in-memory, seat-scoped mailbox; production MCP handlers are not exercised.",
+  "inputs": [
+    "UserPromptSubmit and Stop hook events",
+    "Claude and Codex formats",
+    "two unread messages addressed to a synthetic seat",
+    "MCP msg-inbox and msg-ack calls"
+  ],
+  "observations": [
+    "hookSpecificOutput.additionalContext is nested and contains addressed unread messages",
+    "Stop returns decision:block once per session bundle",
+    "same-session Stop repeats are suppressed and a new unread bundle after ack is delivered",
+    "MCP inbox returns unread messages and each ack removes only that seat's message",
+    "cross-seat acknowledgement is rejected",
+    "Production MCP handlers are not exercised; only the fake call contract is validated."
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/fake-agent-hook-host.test.ts",
+    "bun test src/msg/msg-hook.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -97,6 +97,8 @@ export interface SendReportOpts {
   fetchImpl?: typeof fetch;
   /** Purpose of the message — routes to a channel role (see `DEFAULT_KIND_ROLES`). */
   kind?: string;
+  /** Optional inline actions for short briefing cards. */
+  buttons?: readonly { label: string; value: string }[];
 }
 
 /** Send a report to its kind's exact-role channel (or the safe legacy target).
@@ -121,7 +123,12 @@ export async function sendTelegramReport(
     onMessage: async () => undefined,
     ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
   });
-  const sent = await bot.sendMessage(target.chatId, text, { markdown: opts.markdown ?? true });
+  if (opts.buttons?.some(({ value }) => Buffer.byteLength(value, 'utf8') > 64)) {
+    logReport('unrouted', { kind: opts.kind ?? null, role: explainReportRoute(cfg, opts.kind).role, reason: 'callback-data-over-limit' });
+    return false;
+  }
+  const buttons = opts.buttons?.length ? { inline_keyboard: [opts.buttons.map(({ label, value }) => ({ text: label, callback_data: value }))] } : undefined;
+  const sent = await bot.sendMessage(target.chatId, text, { markdown: opts.markdown ?? true, ...(buttons ? { replyMarkup: buttons } : {}) });
   // Delivered only with Telegram's message id back — an empty answer is unconfirmed and returns false (review r4).
   const confirmed = Number.isSafeInteger(sent?.messageId) && (sent?.messageId ?? 0) > 0;
   logReport(confirmed ? 'sent' : 'unconfirmed',

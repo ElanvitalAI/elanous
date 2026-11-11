@@ -19,7 +19,7 @@ import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { prevScheduledFire } from './cron-match.js';
 import { debug } from '../debug/log.js';
 import { listSources } from '../intake-plane/intake-sources.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { deriveScheduleName, ensureScheduleRunsSchema, recordScheduleRun } from './schedule-runs.js';
 

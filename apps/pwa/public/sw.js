@@ -183,9 +183,14 @@ async function handleSharePost(request) {
       }),
     );
 
-    // Hand the shared id to Chat, which drains the manifest, uploads
-    // the files and stages them beside the message composer.
-    return Response.redirect(`/app/chat?shared=${encodeURIComponent(id)}`, 303);
+    // The existing chat attachment path handles PDF, which has no
+    // absorb/v0 scrap kind. Preserve that handoff for PDF shares.
+    if (files.some((file) => file.type === 'application/pdf' || /\.pdf$/i.test(file.name))) {
+      return Response.redirect(`/app/chat?shared=${encodeURIComponent(id)}`, 303);
+    }
+    // A static exported screen reads the cache and saves through the
+    // member-scoped scraps API. Failed items remain cached for retry.
+    return Response.redirect(`/app/share/received/?shared=${encodeURIComponent(id)}`, 303);
   } catch (e) {
     // If anything blows up, surface a minimal HTML page so the user
     // sees a real error instead of a blank tab. The fail-safe is one

@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:elanous:graph-instance-view:1",
+  "title": "GraphInstanceView v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "instance", "nodes", "edges", "progress", "logs", "statusLine", "readState"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "instance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "runId", "title", "observedAt", "state"],
+      "properties": {
+        "source": { "enum": ["harness", "graph", "release", "resource"] },
+        "runId": { "type": "string", "minLength": 1 },
+        "graphId": { "type": "string", "minLength": 1 },
+        "title": { "type": "string" },
+        "observedAt": { "type": "string", "minLength": 1 },
+        "state": { "$ref": "#/$defs/instanceState" }
+      }
+    },
+    "nodes": { "type": "array", "items": { "$ref": "#/$defs/node" } },
+    "edges": { "type": "array", "items": { "$ref": "#/$defs/edge" } },
+    "progress": {
+      "type": "object", "additionalProperties": false,
+      "required": ["completed", "total", "activeNodeIds"],
+      "properties": {
+        "completed": { "type": "integer", "minimum": 0 },
+        "total": { "type": ["integer", "null"], "minimum": 0 },
+        "label": { "type": "string" },
+        "activeNodeIds": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "logs": { "type": "array", "items": { "$ref": "#/$defs/log" } },
+    "statusLine": { "type": "string" },
+    "readState": { "enum": ["ok", "partial", "unavailable"] }
+  },
+  "allOf": [
+    {
+      "if": { "type": "object", "required": ["instance"], "properties": { "instance": { "type": "object", "required": ["source"], "properties": { "source": { "enum": ["graph", "release"] } } } } },
+      "then": { "type": "object", "properties": { "instance": { "type": "object", "required": ["graphId"], "properties": { "graphId": { "type": "string", "minLength": 1 } } } } }
+    },
+    {
+      "if": { "type": "object", "required": ["instance"], "properties": { "instance": { "type": "object", "required": ["source"], "properties": { "source": { "const": "release" } } } } },
+      "then": { "type": "object", "properties": { "instance": { "type": "object", "properties": { "graphId": { "const": "release-loop" } } } } }
+    },
+    {
+      "if": { "type": "object", "required": ["instance"], "properties": { "instance": { "type": "object", "required": ["source"], "properties": { "source": { "const": "resource" } } } } },
+      "then": { "type": "object", "properties": { "nodes": { "type": "array", "items": { "type": "object", "required": ["resource"], "properties": { "state": { "enum": ["on", "off", "stopped", "unknown"] }, "resource": { "$ref": "#/$defs/node/properties/resource" } } } } } },
+      "else": { "type": "object", "properties": { "nodes": { "type": "array", "items": { "type": "object", "properties": { "state": { "enum": ["queued", "running", "waiting", "done", "failed", "unknown"] } } } } } }
+    }
+  ],
+  "$defs": {
+    "instanceState": { "enum": ["running", "waiting", "done", "failed", "unknown"] },
+    "nodeState": { "enum": ["queued", "running", "waiting", "done", "failed", "unknown", "on", "off", "stopped"] },
+    "node": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "label", "state"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "label": { "type": "string" },
+        "model": { "type": "string" },
+        "role": { "type": "string" },
+        "state": { "$ref": "#/$defs/nodeState" },
+        "resource": {
+          "type": "object", "additionalProperties": false,
+          "required": ["hostKind", "tasks"],
+          "properties": {
+            "hostKind": { "enum": ["local", "cloud"] },
+            "cpuCores": { "type": "integer", "minimum": 1 },
+            "loadavg": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "number", "minimum": 0 } },
+            "memory": {
+              "type": "object", "additionalProperties": false,
+              "required": ["usedBytes", "totalBytes"],
+              "properties": {
+                "usedBytes": { "type": "integer", "minimum": 0 },
+                "totalBytes": { "type": "integer", "minimum": 0 }
+              }
+            },
+            "tasks": {
+              "type": "array",
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "label"],
+                "properties": {
+                  "kind": { "enum": ["seat", "pod", "train", "gate", "rehearsal", "review"] },
+                  "label": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "progress": {
+          "type": "object", "additionalProperties": false,
+          "required": ["done", "total"],
+          "properties": {
+            "done": { "type": "integer", "minimum": 0 },
+            "total": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "edge": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "from", "to", "kind", "state"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "from": { "type": "string", "minLength": 1 },
+        "to": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["flow", "branch", "join"] },
+        "state": { "enum": ["planned", "taken", "unknown"] }
+      }
+    },
+    "log": {
+      "type": "object", "additionalProperties": false,
+      "required": ["seq", "level", "text"],
+      "properties": {
+        "seq": { "type": "integer", "minimum": 1 },
+        "at": { "type": "string" },
+        "nodeId": { "type": "string", "minLength": 1 },
+        "level": { "enum": ["info", "warn", "error"] },
+        "text": { "type": "string" }
+      }
+    }
+  }
+}

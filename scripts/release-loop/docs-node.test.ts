@@ -235,7 +235,7 @@ test('RELEASE-NOTES-EN-AUTOFIX rejects non-Latin output and leaves fenced code/c
   expect(readFileSync(notes, 'utf8')).toContain('```text\n> ```\n한국어 인용 표식은 코드 안\n- ```\n한국어 목록 표식은 코드 안\n```\nQuoted follow-up\n> ```text\n>     ```\n> 한국어 인용 코드 줄\n> ```\n> Quoted follow-up\n> ```text\n> 한국어 인용 코드\n> ```\n> - > ```text\n>   > 한국어 목록 인용 코드\n>   > ```\n> - Quoted follow-up\n```text\n    ```\n한국어 들여쓴 코드 줄\n```\nQuoted follow-up\n\t```\nQuoted follow-up\n<!-- 한국어 주석 -->\n- 한국어 이모지 항목\n');
 });
 
-test('RELEASE-NOTES-EN-AUTOFIX pins the approved model at the ask child process boundary', () => {
+test('RELEASE-NOTES-EN-AUTOFIX pins the approved model at the llm child process boundary', () => {
   const { root } = fixture();
   const state = join(root, 'state');
   writeFileSync(join(state, 'release/9.9.9/manifest.json'), JSON.stringify({
@@ -250,7 +250,7 @@ test('RELEASE-NOTES-EN-AUTOFIX pins the approved model at the ask child process 
     process.chdir(root);
     result = runDocs(['--version', '9.9.9', '--base', root, '--json'], root, {}, {
       stateRoot: state,
-      askSpawn: (command, args, options) => {
+      llmSpawn: (command, args, options) => {
         calls.push({ command, args, cwd: options.cwd, env: options.env ?? {} });
         return { pid: 1, output: [], stdout: JSON.stringify({ reply: 'English public line' }), stderr: '', status: 0, signal: null, error: undefined };
       },
@@ -260,7 +260,7 @@ test('RELEASE-NOTES-EN-AUTOFIX pins the approved model at the ask child process 
   }
   expect(result.outcome).toBe('ok');
   expect(calls).toHaveLength(1);
-  expect(calls[0]!.args).toContain('ask');
+  expect(calls[0]!.args).toContain('llm');
   expect(calls[0]!.args[0]).toBe(resolve(import.meta.dir, '../../bin/elanous.mjs'));
   expect(existsSync(calls[0]!.args[0]!)).toBe(true);
   expect(realpathSync(calls[0]!.cwd!)).toBe(realpathSync(root));
@@ -869,10 +869,10 @@ test('RELEASE-NOTES-EN-AUTOFIX: the production graph entry writes English releas
       { sha: 'three', title: 'private title', line: 'English public line', kind: 'feat', docs: 'present', prNumber: 44 },
     ], deferred: [], escalate: [],
   }));
-  const askLog = join(root, 'ask-calls.log');
-  const fakeAskCli = join(root, 'fake-bin/ask-cli.ts');
-  mkdirSync(dirname(fakeAskCli), { recursive: true });
-  writeFileSync(fakeAskCli, [
+  const llmLog = join(root, 'llm-calls.log');
+  const fakeLlmCli = join(root, 'fake-bin/llm-cli.ts');
+  mkdirSync(dirname(fakeLlmCli), { recursive: true });
+  writeFileSync(fakeLlmCli, [
     "import { appendFileSync } from 'node:fs';",
     "const prompt = process.argv.at(-1) ?? '';",
     "const source = prompt.trim().split('\\n').at(-1) ?? '';",
@@ -881,7 +881,7 @@ test('RELEASE-NOTES-EN-AUTOFIX: the production graph entry writes English releas
     "  '한국어 이어지는 항목': 'Translated follow-up item',",
     "  '한국어 늦게 착지한 항목': 'Late-landed item',",
     '};',
-    `appendFileSync(${JSON.stringify(askLog)}, source + '\\n');`,
+    `appendFileSync(${JSON.stringify(llmLog)}, source + '\\n');`,
     "console.log(JSON.stringify({ reply: translations[source] ?? 'UNEXPECTED ' + source }));",
     '',
   ].join('\n'));
@@ -892,7 +892,7 @@ test('RELEASE-NOTES-EN-AUTOFIX: the production graph entry writes English releas
     cwd: root, encoding: 'utf8', timeout: 100_000,
     env: {
       ...process.env, ELANOUS_STATE_DIR: state, ELANOUS_GRAPH_CONTEXT: contextPath,
-      ELANOUS_RELEASE_ASK_BIN: fakeAskCli,
+      ELANOUS_RELEASE_LLM_BIN: fakeLlmCli,
     },
   });
   const readOr = (path: string) => existsSync(path) ? readFileSync(path, 'utf8') : '<absent>';
@@ -904,7 +904,7 @@ test('RELEASE-NOTES-EN-AUTOFIX: the production graph entry writes English releas
   expect(ledger).toMatchObject({ outcome: 'ok', verdict: 'pass', version: '9.9.9', summary: 'docs v9.9.9 · 3 pages' });
   expect(ledger.translationFallbacks).toBeUndefined();
   // Only public Hangul lines reach the model — never the private PR titles or numbers.
-  expect(readOr(askLog)).toBe('한국어 공개 항목\n한국어 이어지는 항목\n');
+  expect(readOr(llmLog)).toBe('한국어 공개 항목\n한국어 이어지는 항목\n');
   const rendered = '# 9.9.9\n\n## Behavior changes\n\n- Translated public item\n- Translated follow-up item\n- English public line\n';
   expect(readOr(notes)).toBe(rendered);
   expect(readOr(notes)).not.toContain('#42');
@@ -916,7 +916,7 @@ test('RELEASE-NOTES-EN-AUTOFIX: the production graph entry writes English releas
   const resumed = runNode();
   expect(resumed.status).toBe(0);
   expect(JSON.parse(resumed.stdout.trim().split('\n').at(-1)!)).toMatchObject({ outcome: 'ok', verdict: 'pass', version: '9.9.9' });
-  expect(readOr(askLog).split('\n').filter(Boolean).at(-1)).toBe('한국어 늦게 착지한 항목');
+  expect(readOr(llmLog).split('\n').filter(Boolean).at(-1)).toBe('한국어 늦게 착지한 항목');
   expect(readOr(notes)).toContain('## Also in this release\n\n- Late-landed item\n');
   expect(readOr(notes)).not.toMatch(/[\uac00-\ud7a3]/);
 }, 120_000);

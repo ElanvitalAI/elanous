@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-GRAPH-RUN-LIFECYCLE-WORLD-TS",
+  "path": "src/ux-sim/graph-run-lifecycle-world.ts",
+  "boundary": "Runs the production graph runner and persisted instance lifecycle against an isolated temporary graph, with a node owner lost mid-execution.",
+  "deviceIds": ["graph-run-lifecycle-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

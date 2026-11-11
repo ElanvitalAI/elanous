@@ -8,3 +8,4 @@ edges:
   append-recheck: { policy: gate.plan.promoteToFull }
   accept: { requiresMeasuredRegressionVerdict: true }
   escalate: { requiresHitlNode: true }
+failureTypes: {}

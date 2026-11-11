@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { MsgStore, canonicalSeatId, defaultMsgStorePath, openMsgStore, readUnreadCount, readUnreadSummary, validateMessageEnvelope } from './msg-store.js';
+import { MsgStore, canonicalMessageAddress, canonicalSeatId, defaultMsgStorePath, openMsgStore, readUnreadCount, readUnreadSummary, validateMessageEnvelope } from './msg-store.js';
 
 const dirs: string[] = [];
 function diskPath(): string {
@@ -15,6 +15,19 @@ function diskPath(): string {
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('message identity and envelope', () => {
+  test('canonicalizes direct pane, session, and seat/pane recipients while keeping sender seat-only', () => {
+    expect(canonicalMessageAddress('wJ:p4')).toBe('pane:wJ:p4');
+    expect(canonicalMessageAddress('session:abc-123')).toBe('session:abc-123');
+    expect(canonicalMessageAddress('tc/p4')).toBe('TC/p4');
+    const store = new MsgStore(':memory:');
+    try {
+      const direct = store.post({ from: 'OP', to: 'wJ:p4', body: 'panel recipient' });
+      expect(store.listByRecipient('pane:wJ:p4')).toEqual([direct]);
+      expect(store.unreadCount('pane:wJ:p4')).toBe(1);
+      expect(() => store.post({ from: 'pane:wJ:p4', to: 'OP', body: 'invalid sender' })).toThrow('sender must be a seat');
+    } finally { store.close(); }
+  });
+
   test('acknowledges one message by ID and excludes expired messages from unread', () => {
     const store = new MsgStore(':memory:');
     try {

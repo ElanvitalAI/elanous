@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "instance": { "source": "resource", "runId": "resource-fleet", "title": "Fixture: resource fleet", "observedAt": "2026-11-10T07:00:00.000Z", "state": "unknown" },
+  "nodes": [
+    { "id": "mbp", "label": "mbp", "state": "on", "resource": { "hostKind": "local", "cpuCores": 8, "loadavg": [1.2, 1.4, 1.1], "memory": { "usedBytes": 8589934592, "totalBytes": 17179869184 }, "tasks": [{ "kind": "seat", "label": "R-SURFACE" }, { "kind": "review", "label": "PR review" }] } },
+    { "id": "node-b", "label": "node-b", "state": "on", "resource": { "hostKind": "local", "cpuCores": 16, "loadavg": [4.1, 3.8, 3.2], "memory": { "usedBytes": 25769803776, "totalBytes": 34359738368 }, "tasks": [{ "kind": "pod", "label": "build Pod" }, { "kind": "gate", "label": "type gate" }] } },
+    { "id": "node-c", "label": "node-c", "state": "on", "resource": { "hostKind": "local", "cpuCores": 8, "loadavg": [0.6, 0.5, 0.4], "memory": { "usedBytes": 4294967296, "totalBytes": 17179869184 }, "tasks": [{ "kind": "train", "label": "landing train" }] } },
+    { "id": "minim5", "label": "minim5", "state": "off", "resource": { "hostKind": "local", "tasks": [] } },
+    { "id": "mshq", "label": "mshq", "state": "on", "resource": { "hostKind": "local", "cpuCores": 12, "loadavg": [1.1, 0.9, 0.8], "memory": { "usedBytes": 12884901888, "totalBytes": 25769803776 }, "tasks": [{ "kind": "seat", "label": "OP" }] } },
+    { "id": "aws1", "label": "aws1", "state": "on", "resource": { "hostKind": "cloud", "cpuCores": 8, "loadavg": [2.5, 2.1, 1.9], "memory": { "usedBytes": 8589934592, "totalBytes": 17179869184 }, "tasks": [{ "kind": "review", "label": "Terra review" }] } },
+    { "id": "aws2", "label": "aws2", "state": "off", "resource": { "hostKind": "cloud", "tasks": [] } },
+    { "id": "gcp1", "label": "gcp1", "state": "on", "resource": { "hostKind": "cloud", "cpuCores": 8, "loadavg": [1.8, 1.5, 1.3], "memory": { "usedBytes": 6442450944, "totalBytes": 17179869184 }, "tasks": [{ "kind": "rehearsal", "label": "release rehearsal" }] } },
+    { "id": "gcp2", "label": "gcp2", "state": "on", "resource": { "hostKind": "cloud", "cpuCores": 8, "loadavg": [0.3, 0.4, 0.4], "memory": { "usedBytes": 4294967296, "totalBytes": 17179869184 }, "tasks": [{ "kind": "pod", "label": "test Pod" }] } },
+    { "id": "azure", "label": "azure", "state": "stopped", "resource": { "hostKind": "cloud", "tasks": [] } }
+  ],
+  "edges": [],
+  "progress": { "label": "가동", "completed": 7, "total": 10, "activeNodeIds": ["mbp", "node-b", "node-c", "mshq", "aws1", "gcp1", "gcp2"] },
+  "logs": [
+    { "seq": 1, "nodeId": "aws1", "level": "info", "text": "aws1 리뷰 자리 가동" },
+    { "seq": 2, "nodeId": "aws2", "level": "warn", "text": "aws2 전원 꺼짐" },
+    { "seq": 3, "nodeId": "azure", "level": "info", "text": "azure 정지 확인" }
+  ],
+  "statusLine": "자원 7/10 가동 · fixture",
+  "readState": "ok"
+}

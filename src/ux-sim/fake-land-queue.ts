@@ -36,8 +36,11 @@ export function fakeLandSlots(load: number, previous: 2 | 3 = 2): 2 | 3 {
 function syntheticGit(conflicting: ReadonlyMap<number, readonly string[]>, prByHead: ReadonlyMap<string, number>): TrainGit {
   let commit = 0;
   const sha = (n: number) => n.toString(16).padStart(40, '0');
+  // Source: simulateFakeLandQueue's 40-character synthetic base passed to integrateTrain below.
+  // The integration fixture passes this base when every candidate conflicts before commit-tree.
+  const treeByCommit = new Map([[sha(1), sha(1)], ['1'.repeat(40), sha(1)]]);
   return (args) => {
-    const command = args.find((arg) => arg === 'merge-tree' || arg === 'commit-tree' || arg === 'ls-tree');
+    const command = args.find((arg) => arg === 'merge-tree' || arg === 'commit-tree' || arg === 'ls-tree' || arg === 'rev-parse');
     if (command === 'merge-tree') {
       const pr = prByHead.get(args.at(-1) ?? '');
       const files = pr === undefined ? [] : conflicting.get(pr) ?? [];
@@ -45,10 +48,20 @@ function syntheticGit(conflicting: ReadonlyMap<number, readonly string[]>, prByH
         ? { status: 1, stdout: `${sha(900 + pr!)}\0${files.join('\0')}\0\0`, stderr: '' }
         : { status: 0, stdout: `${sha(900 + (pr ?? 0))}\0`, stderr: '' };
     }
-    if (command === 'commit-tree') return { status: 0, stdout: sha(++commit), stderr: '' };
+    if (command === 'commit-tree') {
+      const tree = args[args.indexOf('commit-tree') + 1];
+      const commitSha = sha(++commit);
+      if (tree) treeByCommit.set(commitSha, tree);
+      return { status: 0, stdout: commitSha, stderr: '' };
+    }
     // integrateTrain (SIM-CATALOG-GENERATED #35047) lists base and merged trees to guard the UX-sim catalog.
     // The synthetic trees carry no catalog, so both listings are empty and the ordinary integration path runs.
     if (command === 'ls-tree') return { status: 0, stdout: '', stderr: '' };
+    if (command === 'rev-parse') {
+      const target = args.at(-1)?.replace(/\^\{tree\}$/, '');
+      const tree = target ? treeByCommit.get(target) : undefined;
+      return tree ? { status: 0, stdout: tree, stderr: '' } : { status: 1, stdout: '', stderr: 'unknown synthetic commit' };
+    }
     return { status: 2, stdout: '', stderr: `unsupported fake git command: ${args[0]}` };
   };
 }

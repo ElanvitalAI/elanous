@@ -43,7 +43,7 @@ void _pillNameCompat;
  *  `col` is 1-indexed too. `statusRow === null` means the status zone
  *  wasn't composed this frame — every event is a miss. The one-above
  *  tolerance (row === statusRow - 1) matches the existing
- *  `pillHoverTarget` behaviour: terminals occasionally report the
+ *  status-bar hit tolerance: terminals occasionally report the
  *  pixel top-edge of a pill cell as row−1, and we want that to still
  *  classify as a pill hit. */
 export function classifyStatusBarHit(

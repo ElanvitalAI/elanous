@@ -4,11 +4,12 @@
 
 import type { LLMToolSpec } from './llm/tool-spec.js';
 import { textOnly } from './llm/stream-text.js';
+import { resolveRequestMaxTokens } from './llm/output-budget.js';
 import { STREAM_DISCONNECT_MAX_RETRIES, STREAM_IDLE_TIMEOUT_MAX_RETRIES, StreamIdleTimeoutError, streamDisconnectRetryDelayMs, isStreamDisconnectRetryable, sleepUnlessAborted } from './llm/stream-fallback.js';
 import { wellFormedLLMMessages } from './llm-wellformed.js';
 import { truncateOutput } from './output-truncation.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
+import { testFakeLlmDefaultSelected, testFakeLlmEnabled, testFakeLlmProvider } from './ux-sim/fake-llm.js';
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { globalAnchorPath } from './prompt-library/universal-preamble.js';
@@ -33,7 +34,7 @@ import { debug, redactSecrets, redactSecretText } from './debug/log.js';
 import { estimateMessagesTokens } from './tokens.js';
 import { isVerifiedOpenGatewayModel } from './llm/opengateway-models.js';
 import { resolveCodexAccountForRun } from './oauth/codex-account-store.js';
-import { codexOwnerMirrorAuthPath, readCodexOwnerAccessMirror } from './oauth/codex-owner-mirror.js';
+import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, readCodexOwnerAccessMirror } from './oauth/codex-owner-mirror.js';
 import { llmUsageCostFields } from './budget/llm-cost.js';
 import { accumulateByokUsage } from './llm/openrouter-byok-cost.js';
 import { ACTION_PHASE_OPS_TOOLS, isSteeredShellRejection, REPAIR_PHASE_READ_ONLY_OPS_TOOLS } from './llm/tool-loop-steered-rejection.js';
@@ -66,6 +67,7 @@ import { BedrockProvider, isBedrockCompatibleModel, makeBedrockProvider } from '
 import { HarmonyChannelFilter, type HarmonyToolCall } from './llm/wire/harmony.js';
 import { OPEN_WEIGHT_TOOL_DISCIPLINE } from './llm/open-weight-discipline.js';
 import { makeZaiCodingPlanProvider, zaiCodingPlanAvailable } from './llm/zai-coding-plan.js';
+import { makeHqProxyProvider } from './llm/hq-proxy-provider.js';
 import { isOpenRouterDeepSeekWireModel, nonEmptyReasoningDetails, openRouterDeepSeekCatalogEffort, openRouterDeepSeekEffort, openRouterDeepSeekRequestExtras, openRouterNeedsKimiToolSchema } from './llm/openrouter-deepseek.js';
 import { resolveModelAlias } from './intelligence-map/model-alias.js';
 import { BUILTIN_CATALOG, reasoningEffortCeiling as reasoningEffortCeilingOf } from './intelligence-map/model-catalog.js';
@@ -368,6 +370,8 @@ class RequestSizeLimitError extends Error {
 
 export interface LLMOpts {
   model?: string;
+  /** OpenRouter Chat Completions structured output. Other providers keep their existing wire body. */
+  responseFormat?: { type: 'json_schema'; json_schema: { name: string; strict: true; schema: Record<string, unknown> } };
   /** Explicit research surface verdict from the turn router. Relaxes early
    *  exploration guards while retaining a finite tool-loop hard stop. */
   researchTurn?: boolean;
@@ -375,6 +379,8 @@ export interface LLMOpts {
   onResolvedProvider?(provider: string, model: string): void;
   temperature?: number;
   maxTokens?: number;
+  /** Internal: distinguishes a caller cap from a role/model default passed to a provider. */
+  maxTokensExplicit?: boolean;
   signal?: AbortSignal;
   /** Override the text-stream idle watchdog per request (milliseconds). */
   streamIdleTimeoutMs?: number;
@@ -851,7 +857,7 @@ export async function* parseOpenAISSELines(
   /** OR-TOOLARGS-REPAIR (2026-10-10) — `flagInvalidToolArgs` 가 참이면(OpenRouter 경로) 인자 JSON 파싱 실패를
    *  `{}` 로 «조용히» 바꾸지 않고 `argsInvalid` 표지를 단다(도구 루프가 실행을 막는다) ⊕ 관측을 남긴다.
    *  ⛔ 생략·거짓이면 종전과 바이트 동일(다른 공급자 무변경). */
-  parseOpts: { flagInvalidToolArgs?: boolean; emitTrailingReasoningDetails?: boolean } = {},
+  parseOpts: { flagInvalidToolArgs?: boolean; emitTrailingReasoningDetails?: boolean; onStopReason?: (reason: string) => void } = {},
 ): AsyncGenerator<LLMStreamEvent, void, unknown> {
   const flagInvalidToolArgs = parseOpts.flagInvalidToolArgs === true;
   const { parseOpenAIUsage } = await import('./prompt-cache/openai.js');
@@ -936,6 +942,7 @@ export async function* parseOpenAISSELines(
 
     const choice = parsed.choices?.[0];
     if (!choice) continue;
+    if (typeof choice.finish_reason === 'string') parseOpts.onStopReason?.(choice.finish_reason);
 
     const textDelta = choice.delta?.content;
     if (textDelta) {
@@ -1123,6 +1130,7 @@ async function* streamOpenAIEvents(
    *  ⛔ 생략하면 종전과 «바이트 동일** — 기존 호출자 무회귀. */
   extraHeaders?: Record<string, string>,
   remainingFallbacks?: number,
+  allowLengthContinuation = true,
 ): AsyncGenerator<LLMStreamEvent, void, unknown> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(extraHeaders ?? {}) };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
@@ -1138,7 +1146,7 @@ async function* streamOpenAIEvents(
     messages: Array.isArray(body?.messages) ? body.messages.length : undefined,
     tools: observeRequestTools(body?.tools),
     temperature: body?.temperature,
-    maxTokens: body?.max_tokens,
+    maxTokens: body?.max_tokens ?? body?.max_completion_tokens ?? body?.max_output_tokens,
     ...(debug.isVerboseEnabled() ? { body: redactSecrets(body) } : {}),
   });
 
@@ -1160,19 +1168,45 @@ async function* streamOpenAIEvents(
 
   let textChars = 0;
   let toolCalls = 0;
+  let textContent = '';
+  let stopReason: string | undefined;
+  let stopReasonDelivered = false;
   try {
     // OR-TOOLARGS-REPAIR — 깨진 도구 인자 표지는 OpenRouter 엔드포인트에서만 켠다(다른 공급자 무변경).
     const flagInvalidToolArgs = inferOpenAIProviderName(url) === 'openrouter';
     const emitTrailingReasoningDetails = flagInvalidToolArgs && typeof body?.model === 'string' && isOpenRouterDeepSeekWireModel(body.model);
-    for await (const ev of parseOpenAISSELines(sseLineStream(response.body!), flagInvalidToolArgs ? { flagInvalidToolArgs, ...(emitTrailingReasoningDetails ? { emitTrailingReasoningDetails } : {}) } : {})) {
-      if (ev.type === 'text') textChars += ev.delta.length;
+    for await (const ev of parseOpenAISSELines(sseLineStream(response.body!), {
+      ...(flagInvalidToolArgs ? { flagInvalidToolArgs } : {}),
+      ...(emitTrailingReasoningDetails ? { emitTrailingReasoningDetails } : {}),
+      onStopReason: reason => { stopReason = reason; },
+    })) {
+      if (ev.type === 'text') { textChars += ev.delta.length; textContent += ev.delta; }
       else if (ev.type === 'tool_call') toolCalls++;
+      if (ev.type === 'usage' && stopReason) {
+        stopReasonDelivered = true;
+        yield { ...ev, usage: { ...ev.usage, stopReason } };
+        continue;
+      }
       yield ev;
     }
+    if (stopReason && !stopReasonDelivered) yield { type: 'usage', usage: { provider: 'openai', stopReason } };
     debug.log('llm.response.complete', 'stream done', {
       durationMs: Date.now() - startedAt,
-      textChars, toolCalls,
+      textChars, toolCalls, stopReason: stopReason ?? null,
     });
+    debug.log('llm.request', 'completed', {
+      model: body?.model, maxTokens: body?.max_tokens ?? body?.max_completion_tokens ?? body?.max_output_tokens ?? null,
+      stopReason: stopReason ?? null,
+    });
+    if (allowLengthContinuation && stopReason === 'length' && toolCalls === 0 && textContent.length > 0
+      && Array.isArray(body?.messages) && body?.response_format === undefined && !signal?.aborted) {
+      const continuationBody = { ...body, messages: [...body.messages,
+        { role: 'assistant', content: textContent },
+        { role: 'user', content: 'Continue exactly where the answer stopped. Do not repeat earlier text.' },
+      ] };
+      debug.log('llm.request', 'length-continuation', { model: body?.model, textChars });
+      yield* streamOpenAIEvents(url, apiKey, continuationBody, signal, extraHeaders, remainingFallbacks, false);
+    }
   } catch (err: any) {
     if (err.name === 'AbortError') {
       debug.log('llm.response.aborted', 'user/timeout abort', {
@@ -1185,6 +1219,10 @@ async function* streamOpenAIEvents(
     }, { level: 'error' });
     throw err;
   }
+}
+
+function allowAutomaticContinuation(opts: LLMOpts): boolean {
+  return !(opts.maxTokensExplicit ?? opts.maxTokens !== undefined);
 }
 
 /** Read a fetch response body as an async iterable of SSE lines. */
@@ -2214,11 +2252,14 @@ export async function* streamCodexResponsesEvents(
       // cached reads — the metrics module would silently report 0%
       // hit rate for codex regardless. See store=true wave (next+1)
       // for the volume-side counterpart.
-      if (type === 'response.completed') {
+      if (type === 'response.completed' || type === 'response.incomplete') {
         if (typeof parsed.response?.end_turn === 'boolean') {
           yield { type: 'turn_end', endTurn: parsed.response.end_turn };
         }
+        // Responses reports a status, not Chat Completions finish_reason. Preserve that value verbatim.
+        const stopReason = typeof parsed.response?.status === 'string' ? parsed.response.status : undefined;
         const u = parsed.response?.usage;
+        let usageEmitted = false;
         if (u && typeof u === 'object') {
           const cached = u.input_tokens_details?.cached_tokens
             ?? u.prompt_tokens_details?.cached_tokens;
@@ -2229,10 +2270,12 @@ export async function* streamCodexResponsesEvents(
           const reasoning = u.output_tokens_details?.reasoning_tokens;
           const reasoningOutputTokens = typeof reasoning === 'number' ? reasoning : undefined;
           if (inputTokens !== undefined || outputTokens !== undefined || cacheReadInputTokens !== undefined) {
+            usageEmitted = true;
             yield {
               type: 'usage',
               usage: {
                 provider: 'openai',
+                ...(stopReason !== undefined ? { stopReason } : {}),
                 ...(inputTokens !== undefined ? { inputTokens } : {}),
                 ...(outputTokens !== undefined ? { outputTokens } : {}),
                 ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
@@ -2241,6 +2284,7 @@ export async function* streamCodexResponsesEvents(
             };
           }
         }
+        if (!usageEmitted && stopReason !== undefined) yield { type: 'usage', usage: { provider: 'openai', stopReason } };
       }
       // Response errors — record the provider's structured diagnostics before
       // preserving the legacy error text for callers.
@@ -2939,6 +2983,7 @@ export async function* streamGeminiEvents(
   let cachedTokens = 0;
   let thoughtTokens = 0;
   let toolUsePromptTokens = 0;
+  let stopReason: string | undefined;
 
   try {
     for await (const rawChunk of stream) {
@@ -2968,6 +3013,7 @@ export async function* streamGeminiEvents(
         // 'safety-blocked' category. Includes the safety ratings so
         // forensic reviewers can see WHY the block fired.
         const finish = candidate.finishReason;
+        if (typeof finish === 'string') stopReason = finish;
         if (finish === 'SAFETY' || finish === 'BLOCKED' || finish === 'PROHIBITED_CONTENT') {
           const ratings = (candidate.safetyRatings ?? [])
             .map(r => `${r.category}=${r.probability}`)
@@ -3031,7 +3077,7 @@ export async function* streamGeminiEvents(
     }
 
     const geminiUsage = geminiUsageFromMetadata({ promptTokens, outputTokens, cachedTokens, thoughtTokens, toolUsePromptTokens });
-    if (geminiUsage) yield { type: 'usage', usage: geminiUsage };
+    if (geminiUsage || stopReason) yield { type: 'usage', usage: { ...(geminiUsage ?? { provider: 'openai' as const }), ...(stopReason ? { stopReason } : {}) } };
 
     debug.log('llm.response.status', `gemini done`, {
       model: body.model,
@@ -3041,6 +3087,7 @@ export async function* streamGeminiEvents(
       cachedTokens,
       thoughtTokens,
       toolUsePromptTokens,
+      stopReason: stopReason ?? null,
     });
   } catch (err) {
     if ((err as { name?: string }).name === 'AbortError') return;
@@ -3091,6 +3138,7 @@ export async function* parseAnthropicSSELines(
   const { parseAnthropicUsage } = await import('./prompt-cache/anthropic.js');
   const toolBlocks: Map<number, AnthropicToolCallAccum> = new Map();
   let pendingUsage: import('./prompt-cache/types.js').LLMUsage | null = null;
+  let stopReason: string | undefined;
   for await (const line of lines as AsyncIterable<string>) {
     if (!line.startsWith('data: ')) continue;
     const data = line.slice(6).trim();
@@ -3104,10 +3152,15 @@ export async function* parseAnthropicSSELines(
     if (parsed.type === 'message_start' || parsed.type === 'message_delta') {
       const usage = parseAnthropicUsage(parsed);
       if (usage) pendingUsage = { ...(pendingUsage ?? {}), ...usage };
+      if (typeof parsed.delta?.stop_reason === 'string') stopReason = parsed.delta.stop_reason;
       continue;
     }
     if (parsed.type === 'message_stop') {
-      if (pendingUsage) { yield { type: 'usage', usage: pendingUsage }; pendingUsage = null; }
+      if (pendingUsage || stopReason) {
+        yield { type: 'usage', usage: { ...(pendingUsage ?? { provider: 'anthropic' }), ...(stopReason ? { stopReason } : {}) } };
+        pendingUsage = null;
+        stopReason = undefined;
+      }
       continue;
     }
 
@@ -3148,7 +3201,7 @@ export async function* parseAnthropicSSELines(
     }
   }
   // message_stop 없이 끊긴 스트림 — 모은 사용량을 잃지 않는다.
-  if (pendingUsage) yield { type: 'usage', usage: pendingUsage };
+  if (pendingUsage || stopReason) yield { type: 'usage', usage: { ...(pendingUsage ?? { provider: 'anthropic' }), ...(stopReason ? { stopReason } : {}) } };
 }
 
 async function* streamAnthropicEvents(
@@ -3273,7 +3326,7 @@ export const GrokProvider: LLMProvider = {
       //   빠지면 HTTP 426(실측).
       yield* streamOpenAIEvents(
         `${grokCred.baseUrl}/chat/completions`, apiKey, grokBody, opts.signal,
-        grokCred.kind === 'subscription' ? grokCred.headers : undefined,
+        grokCred.kind === 'subscription' ? grokCred.headers : undefined, undefined, allowAutomaticContinuation(opts),
       );
     } catch (err) {
       const subscriptionExpired = grokCred.kind === 'subscription' && isGrokUnauthorized(grokHttpStatus(err));
@@ -3291,7 +3344,7 @@ export const GrokProvider: LLMProvider = {
           // ⛔ 재시도는 «정확히 1회» — 여기서 또 401 이면 아래 강등으로 안 가고 던진다.
           //   (갱신 직후에도 401 이면 갱신이 아니라 «자격 자체»의 문제다.)
           yield* streamOpenAIEvents(
-            `${renewed.baseUrl}/chat/completions`, renewed.token, grokBody, opts.signal, renewed.headers,
+            `${renewed.baseUrl}/chat/completions`, renewed.token, grokBody, opts.signal, renewed.headers, undefined, allowAutomaticContinuation(opts),
           );
           return;
         }
@@ -3310,7 +3363,7 @@ export const GrokProvider: LLMProvider = {
         from: 'subscription', to: downgraded.kind, source: downgraded.source, refreshOutcome: refreshed,
       }, { level: 'warn' });
       yield* streamOpenAIEvents(
-        `${downgraded.baseUrl}/chat/completions`, downgraded.token, grokBody, opts.signal,
+        `${downgraded.baseUrl}/chat/completions`, downgraded.token, grokBody, opts.signal, undefined, undefined, allowAutomaticContinuation(opts),
       );
     }
   },
@@ -3347,7 +3400,7 @@ export const OpenAIProvider: LLMProvider = {
       ...(tools ? { tools } : {}),
       ...(toChatToolChoice(opts.toolChoice) ? { tool_choice: toChatToolChoice(opts.toolChoice) } : {}),
       ...(includeUsage ? { stream_options: { include_usage: true } } : {}),
-    }, opts.signal);
+    }, opts.signal, undefined, undefined, allowAutomaticContinuation(opts));
   },
   async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
 };
@@ -3692,7 +3745,7 @@ function buildLocalProvider(opts: {
           autoNoThink: !!preset.behaviors.auto_prepend_no_think,
         });
       }
-      yield* streamOpenAIEvents(url, apiKey, body, opts.signal);
+      yield* streamOpenAIEvents(url, apiKey, body, opts.signal, undefined, undefined, allowAutomaticContinuation(opts));
     },
     async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
   };
@@ -3907,6 +3960,9 @@ function mapGeminiSafetySettings(
 }
 
 export const PROVIDERS: Record<string, LLMProvider> = {
+  'hq-proxy': { name: 'hq-proxy', get defaultModel() { return CODEX_DEFAULT_MODEL; }, available: () => configuredHqProxyProvider().available(),
+    streamChat: (messages, opts) => configuredHqProxyProvider().streamChat!(messages, opts),
+    chat: (messages, opts) => configuredHqProxyProvider().chat(messages, opts) },
   grok: GrokProvider,
   openai: OpenAIProvider,
   'openai-codex': {
@@ -3948,6 +4004,11 @@ export const PROVIDERS: Record<string, LLMProvider> = {
 function configuredZaiProvider(): LLMProvider {
   const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
   return makeZaiCodingPlanProvider(getUserConfig().llm);
+}
+
+function configuredHqProxyProvider(): LLMProvider {
+  const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
+  return makeHqProxyProvider(getUserConfig().llm);
 }
 
 const AUTOMATIC_PROVIDER_ORDER = ['grok', 'anthropic', 'gemini', 'local'] as const;
@@ -4011,7 +4072,7 @@ function providerDecisionCandidates(): Array<LLMProvider & { name: ProviderDecis
 
 /** Exported (OB1) so onboarding and `setup` judge «is there a usable ChatGPT/Codex login» exactly as the runtime does. */
 export function codexOAuthAvailable(): boolean {
-  if (process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1') {
+  if (process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1' || codexAccountReadStorePath(authStorePath()) !== authStorePath()) {
     try {
       const mirrorPath = codexOwnerMirrorAuthPath();
       const account = resolveCodexAccountForRun(process.env, { storePath: mirrorPath });
@@ -4071,6 +4132,8 @@ export function decideProviderForConfig(
   model?: string,
 ): ProviderDecision {
   const { provider, apiKey, baseUrl } = userConfig.llm;
+  if (provider === 'hq-proxy') return { provider, model: model ?? makeHqProxyProvider(userConfig.llm).defaultModel,
+    auth: baseUrl && apiKey ? 'apikey' : 'none' };
   if (provider === 'auto') {
     if (model) {
       const selected = getProvider(model);
@@ -4147,7 +4210,7 @@ export function decideProviderForConfig(
 }
 
 function isKnownProviderName(provider: string): provider is ConcreteProviderName {
-  return provider === 'grok' || provider === 'openai' || provider === 'openai-codex' || provider === 'anthropic' || provider === 'gemini' || provider === 'local' || provider === 'openrouter' || provider === 'opengateway' || provider === 'bedrock';
+  return provider === 'grok' || provider === 'openai' || provider === 'openai-codex' || provider === 'anthropic' || provider === 'gemini' || provider === 'local' || provider === 'openrouter' || provider === 'opengateway' || provider === 'bedrock' || provider === 'hq-proxy';
 }
 
 function authKindForProvider(provider: string, model: string, apiKey?: string): ProviderDecisionAuth {
@@ -4179,6 +4242,7 @@ function defaultModelForProvider(provider: ConcreteProviderName): string {
     case 'grok': return GROK_MODEL;
     case 'openai': return OPENAI_MODEL;
     case 'openai-codex': return CODEX_DEFAULT_MODEL;
+    case 'hq-proxy': return CODEX_DEFAULT_MODEL;
     case 'anthropic': return ANTHROPIC_MODEL;
     case 'gemini': return GEMINI_MODEL;
     case 'local': return LOCAL_LLM_MODEL;
@@ -4280,6 +4344,7 @@ function remainingFallbackProviderNames(
   attemptedProviders: ReadonlySet<string>,
   opts: LLMOpts & { provider?: LLMProvider },
 ): string[] {
+  if (testFakeLlmDefaultSelected()) return [];
   return explainFallbackCandidates(attemptedProviders, opts).candidates;
 }
 
@@ -4412,6 +4477,7 @@ function activeGlmProviderForModel(model: string): LLMProvider | undefined {
  * available provider (preferring DEFAULT_PROVIDER env var if set).
  */
 export function getProvider(model?: string): LLMProvider {
+  if (testFakeLlmDefaultSelected()) return testFakeLlmProvider;
   if (model) {
     // Wave 8 (2026-05-04) — resolve model alias before prefix lookup.
     // Short aliases like `haiku` / `opus` / `flash` map to canonical
@@ -4621,7 +4687,7 @@ export function isLikelyVisionModel(model: string | undefined): boolean {
 // ⭐ OPENROUTER-OPTIMIZE G9 — `reportedCostUsd`(OpenRouter `usage.cost`)도 싣는다. 빠지면 `stream-llm` 행이
 //   실청구액을 잃고 카탈로그 추정(대개 `cost.kind=unknown`)으로 떨어진다(리뷰·저작 행 실측).
 //   합산은 토큰 칸과 같은 규약이다 — OpenAI 호환 스트림은 `usage` 를 마지막 청크에 «한 번» 싣는다(누적 반복 보고 아님).
-type ObservedUsage = Pick<LLMUsage, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens' | 'reportedCostUsd' | 'byok' | 'upstreamCostUsd'>;
+type ObservedUsage = Pick<LLMUsage, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens' | 'reportedCostUsd' | 'byok' | 'upstreamCostUsd' | 'stopReason'>;
 
 type ProviderTextResult =
   | { ok: true; full: string; usage: ObservedUsage | 'unmeasured' }
@@ -4646,6 +4712,7 @@ function accumulateUsage(usage: ObservedUsage | undefined, received: LLMUsage): 
   for (const field of ['inputTokens', 'outputTokens', 'cacheReadInputTokens', 'cacheCreationInputTokens', 'reportedCostUsd'] as const) {
     if (received[field] !== undefined) total[field] = (total[field] ?? 0) + received[field];
   }
+  if (received.stopReason !== undefined) total.stopReason = received.stopReason;
   return accumulateByokUsage(total, received); // OR-BYOK-COST
 }
 
@@ -4729,6 +4796,39 @@ async function consumeProviderText(
   }
 }
 
+let warnedAboutRealLlmInNonProd = false;
+
+function logLlmProviderSelection(provider: LLMProvider): void {
+  const universe = process.env.ELANOUS_UX_SIM_RUN_ID || process.env.ELANOUS_SIM_UNIVERSE === '1'
+    ? 'sim'
+    : process.env.NODE_ENV === 'test' || process.env.ELANOUS_STATE_DIR
+      ? 'test'
+      : 'prod';
+  const source = provider.name === 'test-fake-llm' ? 'fake'
+    : provider.name.startsWith('sim-llm:') ? provider.name.endsWith(':fake') ? 'fake'
+      : provider.name.endsWith(':replay') ? 'replay' : provider.name.endsWith(':real') ? 'real' : 'auto' : 'real';
+  const reason = process.env.ELANOUS_LLM_MODE
+    ? `explicit --${process.env.ELANOUS_LLM_MODE}-llm override`
+    : source === 'fake' && process.env.NODE_ENV === 'test'
+      ? 'test-execution default'
+      : source === 'fake' ? 'fake provider selected' : 'configured provider selection';
+  const firstRealWarning = source === 'real' && universe !== 'prod' && !warnedAboutRealLlmInNonProd;
+  if (firstRealWarning) warnedAboutRealLlmInNonProd = true;
+  debug.log('llm.provider', 'selected', {
+    universe,
+    source,
+    reason,
+    provider: provider.name,
+    ...(firstRealWarning ? { warning: '실제 공급자 호출' } : {}),
+  }, { level: firstRealWarning ? 'warn' : 'info' });
+}
+
+function requestMaxTokens(provider: LLMProvider, model: string, opts: LLMOpts): number | undefined {
+  // Source: OpenRouter/OpenGateway and Codex omit a default wire cap to leave room for reasoning; explicit caps still pass through.
+  if (['openrouter', 'opengateway', 'openai-codex'].includes(provider.name)) return opts.maxTokens;
+  return resolveRequestMaxTokens(model, opts.usageRole, opts.maxTokens);
+}
+
 export async function streamLLM(
   messages: LLMMessage[],
   onChunk: (delta: string, full: string) => void,
@@ -4740,7 +4840,8 @@ export async function streamLLM(
   } = {},
 ): Promise<string> {
   const started = Date.now();
-  let activeProvider = opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
+  const fakeDefault = testFakeLlmDefaultSelected();
+  let activeProvider = fakeDefault ? testFakeLlmProvider : opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
   const attemptedProviders = new Set<string>([activeProvider.name, ...(opts.skipProviders ?? [])]);
   let blockedProviders: ProviderFallbackAttempt[] = [];
   let modelOverride = opts.model;
@@ -4752,6 +4853,8 @@ export async function streamLLM(
     );
     activeProvider = finalized.provider;
     const activeModel = finalized.model;
+    const maxTokens = requestMaxTokens(activeProvider, activeModel, opts);
+    logLlmProviderSelection(activeProvider);
     if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(opts.tools);
     opts.onResolvedProvider?.(activeProvider.name, activeModel);
     await recordChildFirstLlmStart({
@@ -4759,13 +4862,18 @@ export async function streamLLM(
       ...(activeProvider.name === 'openai-codex' && process.env.ELANOUS_CODEX_ACCOUNT?.trim()
         ? { accountName: process.env.ELANOUS_CODEX_ACCOUNT.trim() } : {}),
     });
+    if (!opts.usageRole) debug.log('llm.role', 'outside-role', {
+      provider: activeProvider.name, model: activeModel, site: opts.usageSite ?? 'stream-llm',
+    }, { level: 'warn' });
     debug.log('llm.router', 'streamLLM', {
       provider: activeProvider.name,
       model: activeModel,
+      usageRole: opts.usageRole ?? null,
+      usageSite: opts.usageSite ?? null,
       messageCount: messages.length,
       messageRoles: summarizeRoles(messages),
       tools: opts.tools?.map(t => t.name),
-      maxTokens: opts.maxTokens,
+      maxTokens,
       temperature: opts.temperature,
     }, { level: 'info' });
     // Keep text-only stream failures on streamLLM's existing provider fallback path.
@@ -4775,6 +4883,8 @@ export async function streamLLM(
       {
         ...opts,
         model: activeModel,
+        maxTokens,
+        maxTokensExplicit: opts.maxTokensExplicit ?? opts.maxTokens !== undefined,
         remainingFallbacks: opts.provider ? 0 : remainingFallbackProviderNames(attemptedProviders, opts).length,
       },
       onChunk,
@@ -4805,7 +4915,7 @@ export async function streamLLM(
       ...(Number.isSafeInteger(err?.status) ? { httpStatus: err.status as number } : Number.isSafeInteger(err?.statusCode) ? { httpStatus: err.statusCode as number } : {}),
       error: err,
     });
-    if (err instanceof OverloadFailoverError && !opts.provider) {
+    if (err instanceof OverloadFailoverError && !opts.provider && !testFakeLlmDefaultSelected()) {
       const switched = activeProvider.name === 'openai-codex'
         ? firstAvailableFallbackProvider(attemptedProviders, opts)
         : providerByName('grok');
@@ -4945,6 +5055,7 @@ function summarizeRoles(messages: LLMMessage[]): Record<string, number> {
  *  Exported so skill-runner and other non-streamLLM callers can share
  *  the same precedence logic. */
 export function resolveDefaultProvider(model?: string): LLMProvider {
+  if (testFakeLlmDefaultSelected()) return testFakeLlmProvider;
   try {
     // Local import to avoid a top-of-file circular dep tangle.
     const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
@@ -4984,6 +5095,7 @@ export function resolveDefaultProvider(model?: string): LLMProvider {
 
 /** Async default resolver for requests that can use keys saved by setup service-keys. */
 export async function resolveDefaultProviderAsync(model?: string): Promise<LLMProvider> {
+  if (testFakeLlmDefaultSelected()) return testFakeLlmProvider;
   try {
     // Preserve the established resolver as the default for every credential
     // source it already handles. Besides avoiding provider-factory churn, this
@@ -8135,9 +8247,13 @@ export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOr
       ...(providerName ? { billingProvider: providerName.replace(/^auto:/, ''), billing } : {}),
       ...(usage.inputTokens !== undefined && { inputTokens: usage.inputTokens }),
       ...(usage.outputTokens !== undefined && { outputTokens: usage.outputTokens }),
+      ...(usage.stopReason !== undefined && { stopReason: usage.stopReason }),
       ...(usage.cacheReadInputTokens !== undefined && { cacheReadInputTokens: usage.cacheReadInputTokens }),
       ...(usage.cacheCreationInputTokens !== undefined && { cacheCreationInputTokens: usage.cacheCreationInputTokens }),
       ...llmUsageCostFields(model, usage, undefined, billing),
+    });
+    if (usage.stopReason !== undefined) debug.log('llm.request', 'completed', {
+      model, provider: providerName ?? usage.provider ?? null, site, stopReason: usage.stopReason,
     });
   } catch { /* usage observation must not change the turn */ }
 }
@@ -8272,10 +8388,11 @@ export async function streamLLMWithTools(
 ): Promise<string> {
   // Fixed providers keep the original synchronous launch path. Load the circuit before
   // selection only when it can change this turn's initial provider.
-  const circuit = !opts.provider && !opts.initialProvider
+  const circuit = !opts.provider && !opts.initialProvider && !testFakeLlmDefaultSelected()
     ? await import('./session-runtime/provider-circuit.js')
     : undefined;
-  const provider = opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
+  const fakeDefault = testFakeLlmDefaultSelected();
+  const provider = fakeDefault ? testFakeLlmProvider : opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
   const initial = finalizeStreamingProviderModel(provider, opts.model ?? provider.defaultModel);
   let activeProvider = initial.provider;
   let activeModel = initial.model;
@@ -8343,7 +8460,10 @@ export async function streamLLMWithTools(
     debug.log('llm.router', 'streamLLMWithTools.fallback', {
       reason: !provider.streamChat ? 'provider-no-streamChat' : 'no-tools',
     }, { level: 'info' });
-    const fallbackText = await streamLLM(messages, handlers.onText, opts);
+    const fallbackText = await streamLLM(messages, handlers.onText, {
+      ...opts,
+      onUsage: usage => { opts.onUsage?.(usage); handlers.onUsage?.(usage); },
+    });
     // Even the no-tools path emits onTurnComplete so callers can treat
     // tool and text-only turns uniformly when persisting chat history.
     handlers.onTurnComplete?.([
@@ -8871,6 +8991,8 @@ export async function streamLLMWithTools(
       const base = {
         ...opts,
         model: activeModel,
+        maxTokens: requestMaxTokens(activeProvider, activeModel, opts),
+        maxTokensExplicit: opts.maxTokensExplicit ?? opts.maxTokens !== undefined,
         tools: completionNeedsFinalTurn && !keepToolsNoCall
           ? []
           : turn === 0 && opts.firstTurnTools ? opts.firstTurnTools : activeTools,
@@ -9006,6 +9128,7 @@ export async function streamLLMWithTools(
           };
           const providerMessages = mapProviderToolNamesInMessages(history, nameMap.toProviderName);
           previousRequestEstimatedTokens = estimateMessagesTokens(providerMessages);
+          logLlmProviderSelection(activeProvider);
           streamIter = restoreProviderToolCallNames(
             activeProvider.streamChat!(providerMessages, providerOpts),
             nameMap.toOriginalName,
@@ -9075,7 +9198,7 @@ export async function streamLLMWithTools(
           rewindDisconnectedStream();
           streamIter = undefined;
         }
-        if (err instanceof OverloadFailoverError && !opts.provider) {
+        if (err instanceof OverloadFailoverError && !opts.provider && !testFakeLlmDefaultSelected()) {
           const switched = activeProvider.name === 'openai-codex'
             ? firstAvailableFallbackProvider(attemptedProviders, opts)
             : providerByName('grok');
@@ -11699,7 +11822,7 @@ export async function streamLLMWithTools(
 // `baseUrl` in config.
 
 import type { LLMConfig as UCLLMConfig, UserConfig } from './user-config/types.js';
-import { loadTokens, readCodexMirrorTokens } from './oauth/store.js';
+import { authStorePath, loadTokens, readCodexMirrorTokens } from './oauth/store.js';
 import { resolveCodexAccount, effectiveCodexHome } from './oauth/codex-account.js';
 import { codexCreditSpendReason } from './oauth/codex-billing-route.js';
 import { join } from 'node:path';
@@ -11878,6 +12001,14 @@ function makeOpenAICompatProvider(
           ...(toolChoice !== undefined ? { tool_choice: toolChoice } : {}),
           ...(wire.extraBody ?? {}),
           ...deepSeekProvider,
+          ...(name === 'openrouter' && opts.responseFormat ? {
+            response_format: opts.responseFormat,
+            provider: {
+              ...((wire.extraBody as { provider?: Record<string, unknown> } | undefined)?.provider ?? {}),
+              ...((deepSeekProvider as { provider?: Record<string, unknown> }).provider ?? {}),
+              require_parameters: true,
+            },
+          } : {}),
           // OpenRouter alone resolves per-call effort against the configured level and catalog default.
           ...(name === 'openrouter'
             ? openRouterReasoningField(activeModel, opts.reasoningEffort, cfg.reasoningLevel)
@@ -11886,6 +12017,8 @@ function makeOpenAICompatProvider(
         },
         opts.signal,
         useSub ? useSub.headers : (sticky ? { ...wire.headers, 'x-session-id': sticky.key } : wire.headers),
+        undefined,
+        allowAutomaticContinuation(opts),
       );
     },
     async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
@@ -12342,7 +12475,7 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
         ...openAiTemperatureField(apiKeyModel, opts.temperature ?? 0.3),
         ...openAiOutputTokenField(apiKeyModel, opts.maxTokens ?? 2048),
         ...(tools ? { tools } : {}),
-      }, opts.signal, undefined, opts.remainingFallbacks);
+      }, opts.signal, undefined, opts.remainingFallbacks, allowAutomaticContinuation(opts));
     },
     async *chat(messages, opts = {}) { yield* textOnly(this.streamChat!(messages, opts)); },
   };
@@ -12499,7 +12632,7 @@ export function isModelCompatible(providerName: string, model: string | undefine
   const implied = inferProviderFromModel(model);
   if (implied === null) return true;  // unknown prefix — let provider handle
   // openai-codex and openai accept each other's model families (gpt-*, codex-*).
-  if ((providerName === 'openai-codex' || providerName === 'openai')
+  if ((providerName === 'openai-codex' || providerName === 'openai' || providerName === 'hq-proxy')
       && (implied === 'openai' || implied === 'openai-codex')) return true;
   // local accepts free-form names, but a model that resolves to a
   // SPECIFIC cloud family (haiku → anthropic, gpt-5 → openai, etc) is
@@ -12521,6 +12654,7 @@ export function isModelCompatible(providerName: string, model: string | undefine
  *  because the codex provider only materializes when the user explicitly
  *  picks it in config. */
 export function anyProviderAvailable(userConfig?: UserConfig): boolean {
+  if (testFakeLlmDefaultSelected()) return true;
   try {
     const cfg = userConfig ?? (() => {
       const { getUserConfig } = require('./user-config.js') as typeof import('./user-config.js');
@@ -12561,7 +12695,9 @@ export function getProviderForConfig(
   userConfig: UserConfig,
   model?: string,
 ): LLMProvider {
+  if (testFakeLlmDefaultSelected()) return testFakeLlmProvider;
   const { provider } = userConfig.llm;
+  if (provider === 'hq-proxy') return makeHqProxyProvider(userConfig.llm);
   // CLAUDE-IMPL-LANE(10-11) — `claude-acp` 는 LLM provider 가 아니라 구독 ACP 구현 실행기 선택이다.
   //   여기서 풀리면 모델 이름(claude-…)이 anthropic(API 키 provider)으로 넘어가 «구독» 런이 API 로 과금된다 → 거부.
   //   구현은 implement seam 의 claude-acp 갈래(src/self-implement/claude-acp-implement.ts)만 쓴다.
@@ -12685,6 +12821,7 @@ export async function getProviderForConfigAsync(
   env: NodeJS.ProcessEnv = process.env,
   onSecretStoreCredential?: () => void,
 ): Promise<LLMProvider> {
+  if (testFakeLlmDefaultSelected()) return testFakeLlmProvider;
   const { resolveProviderCredentialAsync } = await import('./llm/provider-credentials.js');
   const decision = finalizeProviderModelCompatibility(decideProviderForConfig(userConfig, model));
   let target = decision.provider.startsWith('auto:')

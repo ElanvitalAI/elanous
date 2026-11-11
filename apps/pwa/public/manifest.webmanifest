@@ -23,7 +23,7 @@
       "files": [
         {
           "name": "files",
-          "accept": ["image/*", "video/*", "application/pdf", "text/plain", ".txt", ".md"]
+          "accept": ["image/*", "audio/*", "video/*", "application/pdf", "text/plain", ".txt", ".md"]
         }
       ]
     }

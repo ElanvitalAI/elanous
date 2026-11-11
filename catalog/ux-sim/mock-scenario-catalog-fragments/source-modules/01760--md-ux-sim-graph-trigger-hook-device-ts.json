@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-GRAPH-TRIGGER-HOOK-DEVICE-TS",
+  "path": "src/ux-sim/graph-trigger-hook-device.ts",
+  "boundary": "Runs the real graph runner behind a controllable fake clock and ingress, recording adapter decisions and event envelopes without deciding deduplication itself.",
+  "deviceIds": ["graph-trigger-hook-device", "graph-trigger-registry-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

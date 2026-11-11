@@ -1,7 +1,7 @@
 import type { Command } from 'commander';
 import { join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { canonicalSeatId, defaultMsgStorePath, openMsgStore, type Message, type MsgStore } from '../msg/msg-store.js';
+import { canonicalMessageAddress, defaultMsgStorePath, openMsgStore, type Message, type MsgStore } from '../msg/msg-store.js';
 import { readQueryCache } from '../storage/short-lived-read-cache.js';
 
 interface MessageListOptions { to?: string; thread?: string; after?: string; limit?: string; json?: boolean }
@@ -42,7 +42,7 @@ export function registerMsgListCommand(msg: Command, deps: {
       try {
         if (opts.thread !== undefined && opts.to !== undefined) throw new Error('--thread cannot be used with --to');
         const to = opts.thread === undefined
-          ? (opts.to === undefined ? (() => { throw new Error('--to is required'); })() : canonicalSeatId(opts.to))
+          ? (opts.to === undefined ? (() => { throw new Error('--to is required'); })() : canonicalMessageAddress(opts.to))
           : undefined;
         const threadId = opts.thread === undefined ? undefined : integer(opts.thread, '--thread', 0, 1, Number.MAX_SAFE_INTEGER);
         const limit = integer(opts.limit, '--limit', 100, 1, 1000);

@@ -10,7 +10,6 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { budgetModel } from '../llm/model-defaults.js';
 import { getSkillIndex, type SkillIndexEntry } from '../skills/index.js';
 import { searchMemories } from '../memory.js';
 import { debug } from '../debug/log.js';
@@ -164,10 +163,7 @@ export function isImplementationGoal(goal: string): boolean {
 
 export type SearchTermFn = (goal: string) => Promise<string[]>;
 
-type SearchTermsLlmClient = {
-  resolveDefaultProvider: (model?: string) => ReturnType<typeof import('../llm.js').resolveDefaultProvider> | undefined;
-  streamLLM: typeof import('../llm.js').streamLLM;
-};
+type SearchTermsLlmClient = Pick<typeof import('../llm/role-stream.js'), 'streamRoleLlm'>;
 
 /** luna 로 골 → 코드 검색 키워드(영문 식별자·도메인 명사). 실패 시 골에서 영문 토큰 추출. */
 export async function defaultSearchTerms(
@@ -183,9 +179,8 @@ export async function defaultSearchTerms(
     truncatedChars: goal.length - llmGoal.length,
   });
   try {
-    const client = llmClient ?? await import('../llm.js');
-    const model = budgetModel();
-    const provider = client.resolveDefaultProvider(model);
+    const client = llmClient ?? await import('../llm/role-stream.js');
+    let model = '';
     const prompt =
       'Given a software mission goal (Korean or English), output 6-12 code search keywords to find ' +
       'EXISTING related code/docs in this repo: English identifiers, module names, domain nouns ' +
@@ -196,9 +191,8 @@ export async function defaultSearchTerms(
       (mockScenarioCatalog ? `\n\nAvailable mock-device and event-injection catalog (reference only):\n${mockScenarioCatalog}` : '') +
       '\nKeywords:';
     let full = '';
-    await client.streamLLM([{ role: 'user', content: prompt }], (_d, all) => { full = all; }, {
-      model,
-      ...(provider ? { provider } : {}),
+    await client.streamRoleLlm('classify', [{ role: 'user', content: prompt }], (_d, all) => { full = all; }, {
+      onResolvedProvider: (_provider, resolvedModel) => { model = resolvedModel; },
       onUsage: (usage) => logLlmUsage('codebase-gate-injected', model, usage),
     });
     const terms = full.split(/[,\n]/).map((s) => s.trim().toLowerCase().replace(/[^a-z0-9-]/g, '')).filter((t) => t.length >= 3);
@@ -409,9 +403,8 @@ export type SkillPickFn = (goal: string, index: SkillIndexEntry[], limit: number
  *  null(호출측 결정론 fallback), 명시적 NONE → [](관련없음 존중). */
 export async function pickSkillsViaLlm(goal: string, index: SkillIndexEntry[], limit: number): Promise<string[] | null> {
   try {
-    const model = budgetModel();
-    const { streamLLM, resolveDefaultProvider } = await import('../llm.js');
-    const provider = resolveDefaultProvider(model);
+    const { streamRoleLlm } = await import('../llm/role-stream.js');
+    let model = '';
     const catalog = index.map((s) => `- ${s.name}: ${s.description.replace(/\s+/g, ' ').slice(0, 110)}`).join('\n');
     const prompt =
       'Select reusable skills for a software mission. From the SKILL LIST, pick those whose capability is ' +
@@ -420,9 +413,8 @@ export async function pickSkillsViaLlm(goal: string, index: SkillIndexEntry[], l
       'verbatim from the list, comma-separated. If none apply, output exactly NONE.\n\n' +
       `GOAL: ${goal.slice(0, 500)}\n\nSKILL LIST:\n${catalog}\n\nRelevant skill names:`;
     let full = '';
-    await streamLLM([{ role: 'user', content: prompt }], (_d, all) => { full = all; }, {
-      model,
-      ...(provider ? { provider } : {}),
+    await streamRoleLlm('classify', [{ role: 'user', content: prompt }], (_d, all) => { full = all; }, {
+      onResolvedProvider: (_provider, resolvedModel) => { model = resolvedModel; },
       onUsage: (usage) => logLlmUsage('codebase-gate-dynamic', model, usage),
     });
     const valid = new Set(index.map((s) => s.name.toLowerCase()));

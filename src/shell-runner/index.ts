@@ -24,8 +24,6 @@ export type {
   BgRollup,
   BgEntry,
 } from './background-surface.js';
-export { createModalSurface } from './modal-surface.js';
-export type { ModalSurface, ModalSurfaceOpts, ModalSnapshot } from './modal-surface.js';
 export { createVwSurface } from './vw-surface.js';
 export type { VwSurface, VwSurfaceOpts, VwSnapshot } from './vw-surface.js';
 export {

@@ -1,5 +1,5 @@
 import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { writePeerEdit } from '../nexus/api/graph-peer-edit.js';
@@ -7,8 +7,10 @@ import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { Command } from 'commander';
 import { registerGraphCommands } from './graph-cli.js';
 import { runGraph } from './runner.js';
+import { emptyGraphCapabilityRegistry, registerGraphCapabilityContract, registerGraphCapabilityProviderDeclaration } from './capabilities.js';
 import { writeReleaseGraphFixture } from '../../test/helpers/release-graph-fixture.js';
 import { simCli } from '../ux-sim/in-process-cli.js';
+import { lowerGraphV2 } from '../graph-v2/lower.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -19,10 +21,50 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 
 async function spawnGraphAt(stateRoot: string, cwd: string, ...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   const result = await simCli(['graph', ...args], {
-    allowPaths: [['graph', 'adapt-report'], ['graph', 'promote', 'evaluate'], ['graph', 'tick'], ['graph', 'runs', 'list'], ['graph', 'approve'], ['graph', 'notify'], ['graph', 'run'], ['graph', 'status'], ['graph', 'runs', 'status']], stateRoot, cwd,
+    allowPaths: [['graph', 'policy-check'], ['graph', 'import-n8n'], ['graph', 'adapt-report'], ['graph', 'promote', 'evaluate'], ['graph', 'tick'], ['graph', 'runs', 'list'], ['graph', 'approve'], ['graph', 'notify'], ['graph', 'run'], ['graph', 'status'], ['graph', 'runs', 'status']], stateRoot, cwd,
   });
   return { code: result.exitCode, stdout: result.stdout, stderr: result.stderr };
 }
+
+test('graph policy-check accepts one valid manifest and rejects five invalid policy graphs', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-policy-check-'));
+  dirs.push(dir);
+  const makePlugin = (name: string, graphSource: string, allow: unknown, hitl: unknown = []) => {
+    const pluginDir = join(dir, name);
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(join(pluginDir, 'graph.yaml'), graphSource);
+    writeFileSync(join(pluginDir, 'plugin.json'), JSON.stringify({
+      name,
+      version: '1.0.0',
+      description: 'isolated graph policy fixture',
+      extensions: { 'ai.elanous': {
+        graphs: ['./graph.yaml'],
+        graphManifests: { fixture: { purpose: 'exercise static policy checks', allow, hitl } },
+      } },
+    }));
+    return pluginDir;
+  };
+  const graph = (kind = 'gate', recipe = 'none') => `graph_id: fixture\nversion: 1\nentry_node: start\nterminal_nodes: [done]\nnodes:\n  - { node_id: start, kind: ${kind}, recipe: '${recipe}', max_visits: 1${kind === 'hitl' ? ", hitl: { options: [{ key: approve, exit: ok }] }" : ''} }\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges:\n  - { from: start, on: outcome, map: { ok: done } }\n`;
+  const allowed = { recipes: [], skills: ['skill:fixture'], domainPacks: ['pack:fixture'] };
+  const valid = makePlugin('valid', graph(), allowed);
+  const accepted = await spawnGraphAt(join(dir, 'state'), dir, 'policy-check', valid, '--json');
+  expect(accepted.code).toBe(0);
+  expect(JSON.parse(accepted.stdout)).toMatchObject({ ok: true, plugin: 'valid', graphs: ['fixture'] });
+
+  const invalid = [
+    { plugin: makePlugin('recipe-denied', graph('gate', 'cmd:outside-policy'), allowed), error: 'graph.manifest-denied: recipe' },
+    { plugin: makePlugin('skills-malformed', graph(), { ...allowed, skills: 'skill:fixture' }), error: 'allow.skills must be a string array' },
+    { plugin: makePlugin('packs-malformed', graph(), { ...allowed, domainPacks: ['pack:fixture', 'pack:fixture'] }), error: 'allow.domainPacks must not contain duplicates' },
+    { plugin: makePlugin('kind-unknown', graph('not-a-node-kind'), allowed), error: 'not-a-node-kind' },
+    { plugin: makePlugin('hitl-mismatch', graph('hitl'), allowed, ['missing-hitl-node']), error: 'hitl differs from graph hitl nodes' },
+  ];
+  for (const fixture of invalid) {
+    const rejected = await spawnGraphAt(join(dir, 'state'), dir, 'policy-check', fixture.plugin);
+    expect(rejected.code, fixture.plugin).not.toBe(0);
+    expect(rejected.stderr).toContain('graph policy-check:');
+    expect(rejected.stderr).toContain(fixture.error);
+  }
+});
 
 async function spawnGraph(stateRoot: string, ...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return await spawnGraphAt(stateRoot, root, ...args);
@@ -34,6 +76,71 @@ async function runGraphInProcess(stateRoot: string, ...args: string[]): Promise<
   });
   return { code: result.exitCode, stdout: result.stdout, stderr: result.stderr };
 }
+
+test('graph import-n8n CLI maps an installed marketplace unit and writes lowered authoring YAML', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-import-n8n-cli-'));
+  dirs.push(dir);
+  const fixture = join(root, 'plugins/marketplace-market-data/sims/n8n/execute-workflow-default.json');
+  const graphRoot = join(dir, 'graphs');
+  const unitRoot = join(graphRoot, 'units');
+  mkdirSync(unitRoot, { recursive: true });
+  for (const file of ['market-quote.yaml', 'recipes.yaml'])
+    writeFileSync(join(unitRoot, file), readFileSync(join(root, 'plugins/marketplace-market-data/graphs/units', file), 'utf8'));
+  writeFileSync(join(graphRoot, 'recipes.yaml'), '{}\n');
+  const output = join(graphRoot, 'imported.yaml');
+  const missingOutput = await spawnGraph(join(dir, 'state'), 'import-n8n', fixture,
+    '--unit', 'market-quote=market-quote@^1', '--unit-root', unitRoot);
+  expect(missingOutput.code).not.toBe(0);
+  expect(missingOutput.stderr).toContain("required option '--output <path>'");
+  const recipeOutput = await spawnGraph(join(dir, 'state'), 'import-n8n', fixture,
+    '--unit', 'market-quote=market-quote@^1', '--unit-root', unitRoot, '--output', join(graphRoot, 'recipes.yaml'));
+  expect(recipeOutput.code).not.toBe(0);
+  expect(recipeOutput.stderr).toContain('cannot replace the graph recipe file');
+  expect(readFileSync(join(graphRoot, 'recipes.yaml'), 'utf8')).toBe('{}\n');
+  const inputOutput = join(graphRoot, 'source-workflow.json');
+  writeFileSync(inputOutput, readFileSync(fixture, 'utf8'));
+  const overwriteInput = await spawnGraph(join(dir, 'state'), 'import-n8n', inputOutput,
+    '--unit', 'market-quote=market-quote@^1', '--unit-root', unitRoot, '--output', inputOutput);
+  expect(overwriteInput.code).not.toBe(0);
+  expect(readFileSync(inputOutput, 'utf8')).toContain('Execute Workflow with the default envelope');
+  const existingOutput = join(graphRoot, 'existing.yaml');
+  writeFileSync(existingOutput, 'keep\n');
+  const overwrite = await spawnGraph(join(dir, 'state'), 'import-n8n', fixture,
+    '--unit', 'market-quote=market-quote@^1', '--unit-root', unitRoot, '--output', existingOutput);
+  expect(overwrite.code).not.toBe(0);
+  expect(readFileSync(existingOutput, 'utf8')).toBe('keep\n');
+  const danglingOutput = join(graphRoot, 'dangling.yaml');
+  const danglingTarget = join(graphRoot, 'not-created.yaml');
+  symlinkSync(danglingTarget, danglingOutput);
+  const overwriteDangling = await spawnGraph(join(dir, 'state'), 'import-n8n', fixture,
+    '--unit', 'market-quote=market-quote@^1', '--unit-root', unitRoot, '--output', danglingOutput);
+  expect(overwriteDangling.code).not.toBe(0);
+  expect(lstatSync(danglingOutput).isSymbolicLink()).toBe(true);
+  expect(existsSync(danglingTarget)).toBe(false);
+  const result = await spawnGraph(join(dir, 'state'), 'import-n8n', fixture,
+    '--unit', 'market-quote=market-quote@^1', '--unit-root', unitRoot, '--output', output);
+  const invalidOutput = await spawnGraph(join(dir, 'state'), 'import-n8n', fixture,
+    '--unit', 'market-quote=market-quote@^1', '--unit-root', unitRoot, '--output', join(dir, 'detached.yaml'));
+  expect(invalidOutput.code).not.toBe(0);
+  expect(invalidOutput.stderr).toContain('--output must be beside');
+  expect(result.code).toBe(0);
+  const source = readFileSync(output, 'utf8');
+  const lowered = lowerGraphV2(source, { label: output });
+  expect(lowered.errors).toEqual([]);
+  expect(lowered.template?.nodes[0]).toMatchObject({ nodeId: 'execute-market-quote', call: 'market-quote@^1',
+    contract: { inputs: ['ask'], outputs: ['result', 'evidence'] } });
+  const contract = { id: 'market.ohlcv@1' as const, input: { type: 'object' },
+    output: { type: 'object', required: ['quote'], properties: { quote: { type: 'string' } } } };
+  const providers = registerGraphCapabilityProviderDeclaration(
+    registerGraphCapabilityContract(emptyGraphCapabilityRegistry(), contract),
+    { id: 'fixture-market', provides: ['market.ohlcv@1'], tier: 'free',
+      invoke: () => ({ ok: true, outcome: 'ok', result: { quote: '42.00' }, evidence: { source: 'cli-sim' } }) },
+  );
+  const state = await runGraph(output, { input: { ask: { symbol: 'SIM' } }, quiet: true,
+    deps: { root: join(dir, 'graph-state'), capabilityProviders: providers } });
+  expect(state.status).toBe('done');
+  expect(state.unitCalls?.at(-1)).toMatchObject({ unit: 'market-quote', exit: 'done' });
+});
 
 test('graph adapt-report measures same-goal A/A/B ledger paths, adaptations, landings and exclusions', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'graph-adapt-report-'));

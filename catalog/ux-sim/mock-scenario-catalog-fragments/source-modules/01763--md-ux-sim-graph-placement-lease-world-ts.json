@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-GRAPH-PLACEMENT-LEASE-WORLD-TS",
+  "path": "src/ux-sim/graph-placement-lease-world.ts",
+  "boundary": "Combines an isolated production Guardian lease ledger, fake fleet host availability and real graph node entry under an injected placement adapter; it does not implement the future generation/profile admission policy.",
+  "deviceIds": ["graph-placement-lease-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -38,7 +38,7 @@ import { planPrLandRecovery, type PrLandRecoveryPlan } from '../cli/pr-land-reco
 import { lastJsonObject, runGraph } from '../graph-runner/runner.js';
 import { debug } from '../debug/log.js';
 import { prodInstanceRoot } from '../instance/resolve.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { loadRunLedger, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import type { DetachedSpawn } from '../cli/tasks-cli.js';
 import { remoteLedgerMirrorDir } from './parent-host.js';

@@ -1,7 +1,7 @@
 import { test, expect, describe } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { missionKind, cancelMission, sweepFiniteMissions, isReviewDue, workflowNameOf, FINITE_MODELS, CONTINUOUS_MODELS, buildMissionExecutionContext, pauseMission, resumeMission, isMissionPaused, mergeMissionPhases } from './mission-lifecycle.js';
 import { openAutopilotMissionsDb, createMission, getMission } from './mission-registry.js';
+import { dispatchAutopilotMissions } from './mission-tool.js';
 
 describe('buildMissionExecutionContext — 골 정정 시 "왜 축소하는지" 실행 컨텍스트(대표 2026-07-12)', () => {
   test('실패 페이즈+비평 사유 → 컨텍스트 / 실패 없으면 빈 문자열', async () => {
@@ -98,8 +98,10 @@ describe('cancelMission — 파생 없는 미션 종료', () => {
     const db = openAutopilotMissionsDb();
     const m = createMission(db, { goal: 'cancel 테스트', source: 'manual', triage: { executionModel: 'scheduler' } });
     db.close();
-    const r = await cancelMission(m.id);
+    const r = await dispatchAutopilotMissions({ action: 'cancel', id: m.id }) as { ok?: boolean; missionId?: string; status?: string; releasedCrons?: number; releasedWorkflows?: number };
     expect(r.ok).toBe(true);
+    expect(r.missionId).toBe(m.id);
+    expect(r.status).toBe('done');
     expect(r.releasedCrons).toBe(0);
     expect(r.releasedWorkflows).toBe(0);
     // 취소는 done 마킹이 아니라 행 완전 제거(purge) — 유령 dedup 오탐 방지(2026-07-11).
@@ -141,10 +143,9 @@ describe('sweepFiniteMissions — 유한 자동종료', () => {
 });
 
 describe('배선 가드 — cancel 액션', () => {
-  test('autopilot_missions 에 cancel', () => {
-    const src = readFileSync(new URL('./mission-tool.ts', import.meta.url), 'utf-8');
-    expect(src).toContain("action === 'cancel'");
-    expect(src).toContain('cancelMission(');
+  test('autopilot_missions cancel delegates a missing mission to the lifecycle decision', async () => {
+    const result = await dispatchAutopilotMissions({ action: 'cancel', id: 'apm_c8_missing' }) as { error?: string };
+    expect(result.error).toContain('미션 없음');
   });
 });
 

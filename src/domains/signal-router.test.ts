@@ -1,8 +1,6 @@
 // 신호 라우터 단위테스트 — 순수(주입 send·무네트워크). A3.
 import { test, expect, describe, spyOn } from 'bun:test';
 import { SignalPool, type Signal } from './signal-pool.js';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import type { CdpClient } from '../browser-cdp/client.js';
 import { debug } from '../debug/log.js';
 import {
@@ -352,15 +350,6 @@ describe('digest infographic SVG', () => {
     expect(Buffer.isBuffer(png)).toBe(true);
   });
 
-  test('산출 경로는 renderSvgToPngIsolated 를 부르지 않는다', () => {
-    const src = readFileSync(join(import.meta.dir, 'signal-router.ts'), 'utf8');
-    expect(src).not.toMatch(/import\s+[^;]*renderSvgToPngIsolated/);
-    expect(src).not.toMatch(/renderSvgToPngIsolated\s*\(/);
-    expect(src).not.toContain('svg-png-isolated');
-    expect(src).toContain('client.screenshot');
-    expect(src).toContain("from '@antv/infographic/ssr'");
-    expect(src).toContain('renderToString');
-  });
 });
 
 describe('runDigest infographic photo delivery', () => {
@@ -444,9 +433,6 @@ describe('runDigest infographic photo delivery', () => {
       expect(photos[0]!.png.equals(Buffer.from('wired-png'))).toBe(true);
       expect(photos[0]!.caption).toBe(d.preview);
       expect(d.sent).toBe(true);
-      const src = readFileSync(join(import.meta.dir, 'signal-router.ts'), 'utf8');
-      expect(src).toMatch(/const svg = await renderDigestSvg\(pending, deps\.renderSvg\)/);
-      expect(src).not.toMatch(/const syntax = digestInfographicSyntax\(pending\)/);
     } finally { p.close(); }
   });
 

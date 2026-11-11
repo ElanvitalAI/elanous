@@ -1,6 +1,6 @@
-import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import type { CutSnapshot } from './gate-cut-snapshot.js';
+import { gateGitSync } from './gate-git.js';
 
 const SHA40 = /^[a-f0-9]{40}$/i;
 const TEST_FILE = /^(?:[\w.-]+\/)*[\w.-]+\.test\.(?:tsx?|jsx?|mts|cts)$/;
@@ -14,8 +14,8 @@ export interface GateReceiptHashBatchResult {
 export type GateReceiptHashBatchRunner = (repo: string, input: Buffer) => GateReceiptHashBatchResult;
 
 function readGitBlobs(repo: string, input: Buffer): GateReceiptHashBatchResult {
-  const result = spawnSync('git', ['cat-file', '--batch=%(objectname) %(objecttype) %(objectsize) %(rest)'],
-    { cwd: repo, input, maxBuffer: CAT_FILE_MAX_BUFFER });
+  const result = gateGitSync(['cat-file', '--batch=%(objectname) %(objecttype) %(objectsize) %(rest)'], repo,
+    { input, maxBuffer: CAT_FILE_MAX_BUFFER });
   return { status: result.status, stdout: Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.alloc(0),
     ...(result.error ? { error: result.error } : {}) };
 }

@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-NETWORK-SANDBOX-TS",
+  "path": "src/ux-sim/network-sandbox.ts",
+  "boundary": "Probes host support for an isolated network namespace before a simulation app world can run, failing closed when neither Linux sandbox command is usable.",
+  "deviceIds": ["network-sandbox"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

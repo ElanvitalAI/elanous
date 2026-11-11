@@ -1,0 +1,14 @@
+{
+  "id": "fake-cred",
+  "name": "Fake credential slots",
+  "checklistCells": ["SIM-FAKE-CRED"],
+  "implementation": ["src/ux-sim/fake-cred.ts", "src/ux-sim/world.ts"],
+  "tests": ["src/ux-sim/fake-cred.test.ts"],
+  "target": "Canonical shared credential slots with absence, expiry, permission denial, and immediate rotation",
+  "inputs": ["canonical slot ID", "permission set", "expiry time", "rotation"],
+  "observations": ["metadata-only slot snapshot", "authorization verdict", "generation invalidation"],
+  "entryCommands": ["bun test src/ux-sim/fake-cred.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

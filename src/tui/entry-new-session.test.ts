@@ -1,3 +1,4 @@
+import { NEXT_TUI_TITLE } from './core/render.js';
 // TUI-NEXT-NEW-SESSION — `/new` (alias `/session new`) opens a fresh session from inside next TUI.
 // The decision runs through the same seam entry.ts calls; the store is the real session store
 // pointed at a temp root, so «옛 세션 기록은 그대로» is read back from disk, not assumed.
@@ -10,6 +11,7 @@ import { appendMessage, createSession, getActiveSessionId, listSessions, loadSes
 import { ptyAvailable, startPty } from '../pty-shell/registry.js';
 import { spawnRealCli } from '../testing/real-cli-spawn.js';
 import { NEW_SESSION_BUSY_STATUS, isNewSessionCommand, nextTuiTitle, requestNewTuiSession } from './slash/new-session.js';
+import { NEXT_TUI_INPUT_CONTEXT, buildNextTuiHelpLines, resolveNextTuiRoute } from './core/registry.js';
 
 let dir = '';
 const saved: Record<string, string | undefined> = {};
@@ -41,6 +43,9 @@ describe('/new command shape', () => {
   test('accepts /new, /clear and /session new only', () => {
     for (const text of ['/new', ' /new ', '/clear', ' /clear ', '/session new', '/session   new']) expect(isNewSessionCommand(text)).toBe(true);
     for (const text of ['/newx', '/new 제목', '/clear title', '/session', '/sessions new', 'new', '/quit']) expect(isNewSessionCommand(text)).toBe(false);
+    expect(resolveNextTuiRoute('/new', NEXT_TUI_INPUT_CONTEXT)?.id).toBe('session.new');
+    expect(resolveNextTuiRoute('/clear', NEXT_TUI_INPUT_CONTEXT)?.id).toBe('session.new');
+    expect(buildNextTuiHelpLines().join('\n')).toContain('/new · /clear · /session new');
   });
 
   test('a fresh session shows «새 대화» rather than the store placeholder', () => {
@@ -111,6 +116,7 @@ function credentialFreeEnv(): Record<string, string> {
     if (/(_API_KEY|_TOKEN|_AUTH|_BASE_URL)$/i.test(key) || /^(ANTHROPIC|OPENAI|OPENROUTER|XAI|GROK|GEMINI|GOOGLE|CODEX|CLAUDE|AWS|BEDROCK|ELANOUS_CODEX)/i.test(key)) continue;
     env[key] = value;
   }
+  env.ELANOUS_NEXT_TUI_COMPACT_HEIGHT = '20';
   return env;
 }
 
@@ -168,7 +174,7 @@ describe('next TUI /new in a real PTY (L3)', () => {
       pty.write('\r');
     };
     try {
-      await waitFor('boot', (s) => s.includes('elanous next ·') && s.includes('Ctrl+Q 종료'));
+      await waitFor('boot', (s) => s.split('\n').includes(NEXT_TUI_TITLE) && s.includes('Ctrl+Q 종료'));
       await send('첫 메시지');
       await waitFor('after message 1', (s) => count(s, reply) === 1 && s.includes('응답 완료'));
       await send('둘째 메시지');
@@ -177,7 +183,7 @@ describe('next TUI /new in a real PTY (L3)', () => {
       const oldId = getActiveSessionId() ?? '';
       await send('/new');
       const after = await waitFor('after /new', (s) => s.includes(`새 대화 · 이전 = ${oldId.slice(0, 8)}`));
-      expect(after).toContain('elanous next · 새 대화');
+      expect(after).toContain(NEXT_TUI_TITLE);
       expect(after).not.toContain('첫 메시지');
       expect(after).not.toContain(reply);
       await send('셋째 메시지');
@@ -242,7 +248,7 @@ describe('bare next TUI launch after CLI automation (L3)', () => {
       let screen = '';
       while (Date.now() < deadline) {
         screen = await pty.renderScreen();
-        if (screen.includes('elanous next ·') && screen.includes('Ctrl+Q 종료')) break;
+        if (screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료')) break;
         await sleep(200);
       }
       screens.push(`===== automation seed =====\n${seed.stdout}\n===== bare next boot =====\n${screen}`);
@@ -250,7 +256,7 @@ describe('bare next TUI launch after CLI automation (L3)', () => {
         mkdirSync(process.env.ELANOUS_BARE_LAUNCH_LIVE_OUT, { recursive: true });
         writeFileSync(join(process.env.ELANOUS_BARE_LAUNCH_LIVE_OUT, 'before-after.txt'), screens.join('\n\n'));
       }
-      expect(screen).toContain('elanous next · 새 대화');
+      expect(screen).toContain(NEXT_TUI_TITLE);
       expect(screen).not.toContain(marker);
       expect(screen).not.toContain('[fake-llm] automation seed complete');
       const humanSessionId = getActiveSessionId();
@@ -274,11 +280,11 @@ describe('bare next TUI launch after CLI automation (L3)', () => {
       let continued = '';
       while (Date.now() < continueDeadline) {
         continued = await pty.renderScreen();
-        if (continued.includes('elanous next ·') && continued.includes('Ctrl+Q 종료')) break;
+        if (continued.split('\n').includes(NEXT_TUI_TITLE) && continued.includes('Ctrl+Q 종료')) break;
         await sleep(200);
       }
       screens.push(`===== --continue after automation seed =====\n${continued}`);
-      expect(continued).toContain('elanous next · 새 대화');
+      expect(continued).toContain(NEXT_TUI_TITLE);
       expect(continued).not.toContain(marker);
       expect(getActiveSessionId()).toBe(humanSessionId);
       if (process.env.ELANOUS_BARE_LAUNCH_LIVE_OUT) {

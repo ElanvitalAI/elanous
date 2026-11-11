@@ -6,6 +6,7 @@ import { takeHydratedTools } from '../skills/tools/tool-search-spec.js';
 import { buildSharedAppTools } from './shared-app-tools.js';
 import { appDeployPluginSpec, runAppDeploy } from './app-deploy-plugin.js';
 import type { AppSimulationResult } from '../nexus/apps/app-simulation.js';
+import { createFakeAppDeployPublishHook, createFakeAppHost } from '../ux-sim/fake-app-host.js';
 
 const args = { appId: 'lecture-scrap', requestText: '강의 노트·스크랩 앱 만들어 배포해 줘' };
 const passed: AppSimulationResult = {
@@ -60,6 +61,20 @@ test('a member session cannot promote a verified principal into the Nexus deploy
   expect(publishes).toBe(0);
 });
 
+test('a verified owner for another app cannot publish lecture-scrap', async () => {
+  let publishes = 0;
+  const result = await runAppDeploy(args, {
+    surface: 'tui', verifiedOwner: { id: 'member-1' }, appDeploymentSession: 'nexus-owner',
+    appDeploymentOwner: { appSlug: 'other-app', memberId: 'member-1', userSlug: 'alice', plan: 'free', entitlements: {} },
+    confirmChannels: [{ name: 'test', request: async () => true, cancel: () => undefined }],
+  }, {
+    simulate: async () => passed,
+    hook: { publish: async () => { publishes++; return { publicUrl: 'https://lecture-scrap--alice.elanous.app/' }; }, verifyPublicUrl: async () => true },
+  });
+  expect(result.status).toBe('rejected');
+  expect(publishes).toBe(0);
+});
+
 test('ACP y/N asks once after PASS, defaults to N, and publishes only after y', async () => {
   for (const answer of ['N', 'y']) {
     let publishes = 0;
@@ -69,7 +84,8 @@ test('ACP y/N asks once after PASS, defaults to N, and publishes only after y', 
       return { answers: { confirm: answer } };
     });
     const result = await runAppDeploy(args, {
-      surface: 'tui', verifiedOwner: { id: 'alice' }, appDeploymentSession: 'nexus-owner', sessionId: 'owner-session', confirmChannels: [channel],
+      surface: 'tui', verifiedOwner: { id: 'member-1' }, appDeploymentSession: 'nexus-owner', sessionId: 'owner-session',
+      appDeploymentOwner: { appSlug: 'lecture-scrap', memberId: 'member-1', userSlug: 'alice', plan: 'free', entitlements: {} }, confirmChannels: [channel],
     }, {
       simulate: async () => passed,
       hook: {
@@ -84,4 +100,34 @@ test('ACP y/N asks once after PASS, defaults to N, and publishes only after y', 
     expect(publishes).toBe(answer === 'y' ? 1 : 0);
     expect(result.publicUrl).toBe(answer === 'y' ? 'https://lecture-scrap--alice.elanous.app/' : undefined);
   }
+});
+
+test('TUI and PWA publish through the fake app host only for the verified owner and PASS receipt', async () => {
+  for (const surface of ['tui', 'pwa'] as const) {
+    const host = createFakeAppHost([{ slug: 'lecture-scrap', versions: [
+      { id: 'old', files: { 'index.html': '<main>old</main>' } },
+    ], current: 'old' }]);
+    const hook = createFakeAppDeployPublishHook({ host, ownerUserId: 'alice', receiptId: 'receipt-1',
+      version: { id: 'new', files: { 'index.html': '<main>deployed</main>' } } });
+    const context = { surface, verifiedOwner: { id: 'member-1' }, appDeploymentSession: 'nexus-owner' as const,
+      appDeploymentOwner: { appSlug: 'lecture-scrap', memberId: 'member-1', userSlug: 'alice', plan: 'free', entitlements: {} },
+      confirmChannels: [{ name: 'fake-confirm', request: async () => true, cancel: () => undefined }] };
+    const result = await runAppDeploy(args, context, { simulate: async () => passed, hook });
+    expect(result).toMatchObject({ status: 'published', simulationReceipt: 'receipt-1',
+      publicUrl: 'https://lecture-scrap--alice.elanous.app/' });
+    expect(host.fetch('lecture-scrap.app.sim.invalid', '/')).toMatchObject({ status: 200, body: '<main>deployed</main>' });
+  }
+});
+
+test('a publish hook cannot report another owner origin as this owner deployment', async () => {
+  const result = await runAppDeploy(args, {
+    surface: 'pwa', verifiedOwner: { id: 'member-1' }, appDeploymentSession: 'nexus-owner',
+    appDeploymentOwner: { appSlug: 'lecture-scrap', memberId: 'member-1', userSlug: 'alice', plan: 'free', entitlements: {} },
+    confirmChannels: [{ name: 'fake-confirm', request: async () => true, cancel: () => undefined }],
+  }, { simulate: async () => passed, hook: {
+    publish: async () => ({ publicUrl: 'https://lecture-scrap--bob.elanous.app/' }),
+    verifyPublicUrl: async () => true,
+  } });
+  expect(result).toMatchObject({ status: 'failed', error: 'public app URL is invalid' });
+  expect(result.publicUrl).toBeUndefined();
 });

@@ -1,5 +1,9 @@
 import { describe, it, expect, spyOn } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { runChatCliCommand, toDevChatOpts, type ChatCliDeps } from './chat-cli.js';
+import { SOLAR_SCENE5_QUESTION, parseSolarScene4Receipt } from './solar-scene5-context.js';
 import type { runDevPipeline, DevPipelineSpec, DevPipelineDeps, DevChatOpts, ResolvedDevPlan } from '../self-dev/dev-pipeline.js';
 
 describe('toDevChatOpts — CLI 옵션 → DevChatOpts 매핑(무손실)', () => {
@@ -95,5 +99,65 @@ describe('runChatCliCommand — interactive 재라우팅 글루', () => {
     await runChatCliCommand('실제 텍스트', { session: 'sX', goalLoop: true }, deps);
     expect(gotText).toBe('실제 텍스트');
     expect(gotChat).toEqual({ session: 'sX', forceNew: false, continueActive: false, json: false, enableTools: false, goalLoop: true });
+  });
+});
+
+describe('Solar demo scene 5 prior-scene receipt', () => {
+  it('sends the preceding graph receipt through the real chat dispatch and removes the no-context reply', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'solar-scene5-'));
+    const file = join(root, 'scene4.json');
+    writeFileSync(file, JSON.stringify({
+      graphId: 'demo-graph', runId: 'run-42', status: 'done', path: ['prepare', 'finish'],
+      nodes: [
+        { nodeId: 'prepare', ok: true, executed: true, output: { secret: 'DO_NOT_SEND' } },
+        { nodeId: 'finish', ok: true, executed: false },
+      ],
+    }));
+    const replies: string[] = [];
+    const runChatTurn = async (text: string): Promise<void> => {
+      replies.push(text.includes('graphId: demo-graph') && text.includes('runId: run-42')
+        ? '확인: 그래프 run-42 완료. 미확인: Solar 모델 호출.'
+        : '맥락 없음');
+      if (text.includes('graphId: demo-graph')) {
+        expect(text).toContain(SOLAR_SCENE5_QUESTION);
+        expect(text).toContain('finish: 실행 안 됨');
+        expect(text).toContain('장면 1~3의 결과');
+        expect(text).not.toContain('DO_NOT_SEND');
+      }
+    };
+    try {
+      await runChatCliCommand(SOLAR_SCENE5_QUESTION, {}, { runChatTurn });
+      await runChatCliCommand('', { solarScene5Receipt: file }, { runChatTurn });
+      expect(replies).toEqual(['맥락 없음', '확인: 그래프 run-42 완료. 미확인: Solar 모델 호출.']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('dispatches a valid graph receipt even when excluded raw node output is large', async () => {
+    expect(() => parseSolarScene4Receipt({ status: 'done', path: [], nodes: [] })).toThrow('graphId');
+    const root = mkdtempSync(join(tmpdir(), 'solar-scene5-'));
+    const file = join(root, 'large.json');
+    try {
+      // Source: Terra review of #36745 — raw node output can exceed the former 1 MiB file cap.
+      const largeOutput = 'RAW_NODE_OUTPUT_MUST_STAY_OUT_OF_PROMPT'.repeat(40000);
+      writeFileSync(file, JSON.stringify({
+        graphId: 'large-graph', runId: 'large-run', status: 'done', path: ['run'],
+        nodes: [{ nodeId: 'run', ok: true, executed: true, output: largeOutput }],
+      }));
+      let dispatched = false;
+      await runChatCliCommand('', { solarScene5Receipt: file }, {
+        runChatTurn: async text => {
+          dispatched = true;
+          expect(text).toContain('graphId: large-graph');
+          expect(text).toContain('run: 실행 성공');
+          expect(text).not.toContain('RAW_NODE_OUTPUT_MUST_STAY_OUT_OF_PROMPT');
+          expect(text.length).toBeLessThan(largeOutput.length);
+        },
+      });
+      expect(dispatched).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

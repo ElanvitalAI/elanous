@@ -1,25 +1,8 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dlopen, FFIType } from 'bun:ffi';
+import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
-import { logDiagnostic } from '../../mss/logging/diagnostic-sink.js';
-
-/** `flock` lives in a different library per platform — `libc.so.6` alone made issue/match die on macOS (#21048 was gated only in a Linux Pod). */
-const LIBC_CANDIDATES: Readonly<Partial<Record<NodeJS.Platform, readonly string[]>>> = {
-  darwin: ['/usr/lib/libSystem.B.dylib'],
-  linux: ['libc.so.6'],
-};
-
-function openFlock(): { flock: (fd: number, op: number) => number; close: () => void } | null {
-  for (const name of LIBC_CANDIDATES[process.platform] ?? []) {
-    try {
-      const lib = dlopen(name, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } });
-      return { flock: (fd, op) => lib.symbols.flock(fd, op) as number, close: () => lib.close() };
-    } catch { /* try the next candidate */ }
-  }
-  return null;
-}
+import { withPrivateFileLock } from './private-file-lock.js';
 
 interface StoredIngestToken {
   name: string;
@@ -71,33 +54,7 @@ function readTokens(root: string): StoredIngestToken[] {
 
 function withTokenStoreLock<T>(root: string, update: () => T): T {
   const directory = join(root, 'nexus');
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const lock = join(directory, '.ingest-tokens.lock');
-  const fd = openSync(lock, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
-  const libc = openFlock();
-  if (!libc) logDiagnostic('nexus.ingest-token', 'lock-unavailable', { platform: process.platform });
-  let locked = false;
-  try {
-    const stat = fstatSync(fd);
-    if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error('ingest token store lock must be a private regular file');
-    if (libc) {
-      const deadline = Date.now() + 10_000;
-      const pause = new Int32Array(new SharedArrayBuffer(4));
-      for (;;) {
-        if (libc.flock(fd, 2 | 4) === 0) {
-          locked = true;
-          break;
-        }
-        if (Date.now() >= deadline) throw new Error('timed out waiting for ingest token store lock');
-        Atomics.wait(pause, 0, 0, 10);
-      }
-    }
-    return update();
-  } finally {
-    if (locked) libc?.flock(fd, 8);
-    closeSync(fd);
-    libc?.close();
-  }
+  return withPrivateFileLock(join(directory, '.ingest-tokens.lock'), update, 'nexus.ingest-token');
 }
 
 function writeTokens(root: string, tokens: StoredIngestToken[]): void {

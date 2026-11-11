@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadGraphManifestForFile, loadGraphPluginFromDir } from './graph-manifest-loader.js';
 import { runGraph } from './runner.js';
+import { compilePluginYaml } from '../plugins/core/plugin-yaml.js';
 
 const graph = (id: string) => `graph_id: ${id}\nversion: 1\nentry_node: done\nterminal_nodes: [done]\nnodes:\n  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\nedges: []\n`;
 async function fixture(run: (dir: string, write: (body: Record<string, unknown>) => void) => void | Promise<void>): Promise<void> {
@@ -115,7 +116,59 @@ test('production release manifest loads under the generic declaration checks', (
   const loaded = loadGraphPluginFromDir(join(root, 'graphs', 'release'));
   expect(Object.keys(loaded.graphs)).toEqual(['release-loop']);
   expect(loaded.graphs['release-loop']?.manifest.observe?.categories).toContain('release-loop.*');
+  const general = loadGraphPluginFromDir(join(root, 'graphs', 'templates', 'release'));
+  expect(Object.keys(general.graphs)).toEqual(['release-template']);
 });
+
+test('compiled plugin.yaml owns an executable graph.yaml v2 and rejects a stale generated manifest', async () => fixture(async (dir) => {
+  const source = `apiVersion: elanous.dev/graph/v2\n` +
+    `graph: { id: graph-plugin-format, version: 1.0.0, layer: flow, purpose: Run a declared graph }\n` +
+    `entry: work\nnodes:\n  - { id: work, type: gate }\nedges:\n  - { from: work, to: done }\nterminal: [done]\n`;
+  writeFileSync(join(dir, 'graph.yaml'), source);
+  writeFileSync(join(dir, 'plugin.yaml'), `apiVersion: elanous.dev/plugin/v2\nid: graph-plugin-format\n` +
+    `name: Graph Plugin Format\nversion: 1.0.0\ngraphs: [./graph.yaml]\n`);
+  writeFileSync(join(dir, 'plugin.json'), compilePluginYaml(dir));
+  const loaded = loadGraphPluginFromDir(dir);
+  expect(loaded.graphs['graph-plugin-format']?.template.graphId).toBe('graph-plugin-format');
+  const state = await runGraph(join(dir, 'graph.yaml'), { dryRun: true, quiet: true, deps: { root: join(dir, 'state') } });
+  expect(state.status).toBe('done');
+  await expect(runGraph(join(dir, 'graph.yaml'), { graphSource: source.replace('id: graph-plugin-format', 'id: injected-flow'),
+    deps: { root: join(dir, 'state') } })).rejects.toThrow('graph.manifest-denied');
+  writeFileSync(join(dir, 'plugin.json'), compilePluginYaml(dir).replace('"version": "1.0.0"', '"version": "1.0.1"'));
+  expect(() => loadGraphPluginFromDir(dir)).toThrow('plugin.json is stale');
+}));
+
+test('v2 capability nodes require the plugin manifest to declare their capability', () => fixture(async (dir) => {
+  const source = `apiVersion: elanous.dev/graph/v2\n` +
+    `graph: { id: capability-flow, version: 1.0.0, layer: flow, purpose: Read declared data }\n` +
+    `entry: read\nnodes:\n  - { id: read, type: store, requires: store.read@1 }\n` +
+    `edges:\n  - { from: read, to: done }\nterminal: [done]\n`;
+  writeFileSync(join(dir, 'graph.yaml'), source);
+  const plugin = (capabilities: string) => `apiVersion: elanous.dev/plugin/v2\nid: capability-flow\n` +
+    `name: Capability Flow\nversion: 1.0.0\ngraphs: [./graph.yaml]\ncapabilities: ${capabilities}\n`;
+  writeFileSync(join(dir, 'plugin.yaml'), plugin('[store]'));
+  writeFileSync(join(dir, 'plugin.json'), compilePluginYaml(dir));
+  expect(loadGraphPluginFromDir(dir).graphs['capability-flow']?.manifest.allow.capabilities).toEqual(['store']);
+  const state = await runGraph(join(dir, 'graph.yaml'), { dryRun: true, quiet: true, deps: { root: join(dir, 'state') } });
+  expect(state.status).toBe('done');
+  writeFileSync(join(dir, 'plugin.yaml'), plugin('[]'));
+  writeFileSync(join(dir, 'plugin.json'), compilePluginYaml(dir));
+  expect(() => loadGraphPluginFromDir(dir)).toThrow('graph.manifest-denied: capability store.read@1');
+  await expect(runGraph(join(dir, 'graph.yaml'), { dryRun: true, quiet: true, deps: { root: join(dir, 'state') } }))
+    .rejects.toThrow('graph.manifest-denied: capability store.read@1');
+}));
+
+test('cap recipes cannot use the ordinary recipe allowlist to bypass capability admission', () => fixture((dir, write) => {
+  writeFileSync(join(dir, 'flow.yaml'), `graph_id: cap-allowlist-bypass\nversion: 1\nentry_node: use\n` +
+    `terminal_nodes: [done]\nnodes:\n  - { node_id: use, kind: capability, recipe: 'cap:store', max_visits: 1 }\n` +
+    `  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }\n` +
+    `edges:\n  - { from: use, on: outcome, map: { ok: done, fail: done, error: done } }\n`);
+  const declaration = { purpose: 'Reject undeclared capability', allow: { recipes: ['cap:store'] }, hitl: [] };
+  write({ graphs: ['./flow.yaml'], capabilities: [], graphManifests: { 'cap-allowlist-bypass': declaration } });
+  expect(() => loadGraphPluginFromDir(dir)).toThrow('graph.manifest-denied: capability store');
+  write({ graphs: ['./flow.yaml'], capabilities: ['store'], graphManifests: { 'cap-allowlist-bypass': declaration } });
+  expect(loadGraphPluginFromDir(dir).graphs['cap-allowlist-bypass']?.manifest.allow.capabilities).toEqual(['store']);
+}));
 
 test('manifest discovery climbs nested plugin paths and keeps null declarations in transition mode', () => fixture(async (dir) => {
   const nested = join(dir, 'graphs', 'units', 'verbs');

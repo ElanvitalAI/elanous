@@ -33,6 +33,72 @@ describe('createApprovalModal', () => {
     expect(await m.promise).toBe(false);
   });
 
+  test('defaultNo makes Enter reject while y remains an explicit approval', async () => {
+    const m = createApprovalModal({
+      id: 'test-approval-default-no',
+      bounds: { row: 5, col: 5, width: 40, height: 8 },
+      title: '배포',
+      prompt: '공개 배포할까요?',
+      yesLabel: 'y',
+      noLabel: 'N',
+      defaultNo: true,
+    });
+    m.handleKey({ name: 'enter' } as never);
+    expect(await m.promise).toBe(false);
+
+    const explicitYes = createApprovalModal({
+      id: 'test-approval-default-no-yes',
+      bounds: { row: 5, col: 5, width: 40, height: 8 },
+      title: '배포',
+      prompt: '공개 배포할까요?',
+      yesLabel: 'y',
+      noLabel: 'N',
+      defaultNo: true,
+    });
+    explicitYes.handleKey({ name: 'y' } as never);
+    expect(await explicitYes.promise).toBe(true);
+  });
+
+  test('defaultNo allows an explicit human selection of y followed by Enter', async () => {
+    const m = createApprovalModal({
+      id: 'test-approval-default-no-selected-yes',
+      bounds: { row: 5, col: 5, width: 40, height: 8 },
+      title: '배포',
+      prompt: '공개 배포할까요?',
+      yesLabel: 'y',
+      noLabel: 'N',
+      defaultNo: true,
+    });
+    m.handleKey({ name: 'right' } as never);
+    m.handleKey({ name: 'enter' } as never);
+    expect(await m.promise).toBe(true);
+  });
+
+  test('defaultNo allows an explicit human click on the y choice', async () => {
+    const m = createApprovalModal({
+      id: 'test-approval-default-no-click-yes',
+      bounds: { row: 5, col: 5, width: 40, height: 8 },
+      title: '배포',
+      prompt: '공개 배포할까요?',
+      yesLabel: 'y',
+      noLabel: 'N',
+      defaultNo: true,
+    });
+    const paint = m.surface.paint();
+    let clickTarget: { row: number; col: number } | undefined;
+    for (const match of paint.matchAll(/\x1b\[(\d+);(\d+)H\x1b\[0m([\s\S]*?)(?=\x1b\[\d+;\d+H|$)/g)) {
+      const text = match[3]!.replace(/\x1b\[[0-9;]*m/g, '');
+      const buttonOffset = text.indexOf('[ y ]');
+      if (buttonOffset >= 0) {
+        clickTarget = { row: Number(match[1]), col: Number(match[2]) + buttonOffset + 2 };
+        break;
+      }
+    }
+    expect(clickTarget).toBeDefined();
+    expect(m.surface.onMouse?.({ type: 'click', ...clickTarget! } as never)).toEqual({ type: 'refresh' });
+    expect(await m.promise).toBe(true);
+  });
+
   test('escape resolves false', async () => {
     const m = mk();
     m.handleKey({ name: 'escape' } as never);

@@ -1,4 +1,4 @@
-// Browser-pane comma-chord runtime — yazi-style `,v` / `,s` / `,?`.
+// Browser-pane comma-chord runtime — yazi-style `,v` / `,s`.
 //
 // Sits between the dashboard's pane key dispatcher and the existing
 // chord-state machine (`src/input-core/chord-state.ts`). Returns
@@ -32,8 +32,6 @@ const COMMA_KEYS = new Set([',', 'ㅁ']);
 const V_KEYS = new Set(['v', 'ㅍ']);
 /** s continuation aliases — 's' on US, 'ㄴ' under Korean IME. */
 const S_KEYS = new Set(['s', 'ㄴ']);
-/** Help continuation — '?' is shift+'/', '/' bare also accepted. */
-const HELP_KEYS = new Set(['?', '/']);
 
 export interface BrowserChordRuntimeDeps {
   /** Show the chord-armed hint toast — replaces the prior hint toast
@@ -45,8 +43,6 @@ export interface BrowserChordRuntimeDeps {
   onEditFocused(): Promise<void> | void;
   /** Run the `,s` action — LLM summary popup. */
   onSummarizeFocused(): Promise<void> | void;
-  /** Run the `,?` action — show the help overlay. */
-  onShowHelp(): void;
   /** Surface a short notice to the chat / log. */
   notice(level: 'muted' | 'warning', msg: string): void;
 }
@@ -66,7 +62,6 @@ export const BROWSER_CHORD_INTERNAL = {
   COMMA_KEYS,
   V_KEYS,
   S_KEYS,
-  HELP_KEYS,
 } as const;
 
 export function createBrowserChordRuntime(
@@ -114,14 +109,9 @@ export function createBrowserChordRuntime(
           await deps.onSummarizeFocused();
           return true;
         }
-        if (HELP_KEYS.has(tail)) {
-          deps.onShowHelp();
-          return true;
-        }
         // Unrecognized continuation — surface a hint and swallow
-        // (yazi's Which dismisses silently on unknown keys; we
-        // explain so the user discovers `,?`).
-        deps.notice('muted', `  ,${tail}: unknown chord — ,? for help`);
+        // (yazi's Which dismisses silently on unknown keys).
+        deps.notice('muted', `  ,${tail}: unknown chord`);
         return true;
       }
 

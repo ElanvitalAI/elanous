@@ -8,7 +8,7 @@ import { normalizeRunId } from './harness-space.js';
 import { loadFederatedRunLedger, loadRunLedger } from '../self-implement/run-ledger.js';
 import { prodInstanceRoot } from '../instance/resolve.js';
 import { remoteLedgerMirrorDirs } from '../task-agent/parent-host.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { resolveRepositoryName } from './repository-name.js';
 import {
   classifySalvageRetention,

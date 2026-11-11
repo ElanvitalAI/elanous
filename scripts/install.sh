@@ -428,6 +428,39 @@ IS_CHECKOUT=0
 if [ -f "$SCRIPT_DIR/install.sh" ] && [ -f "$REPO_ROOT/package.json" ] && grep -q '"name": *"elanous"' "$REPO_ROOT/package.json" 2>/dev/null; then
   IS_CHECKOUT=1
 fi
+
+# GitHub's `latest/download` pointer can become visible before every release asset has propagated.
+# Retry the two release assets a bounded number of times; checksum and archive validation remain fail-closed.
+LAST_DOWNLOAD_URL=''
+download_latest_asset() {
+  url="$1"
+  output="$2"
+  headers="${3:-}"
+  attempt=1
+  delay=1
+  while [ "$attempt" -le 3 ]; do
+    if [ -n "$headers" ]; then
+      if effective_url=$(curl -fsSL -D "$headers" -w '%{url_effective}' -o "$output" "$url"); then
+        LAST_DOWNLOAD_URL="$effective_url"
+        return 0
+      else
+        status=$?
+      fi
+    elif effective_url=$(curl -fsSL -w '%{url_effective}' -o "$output" "$url"); then
+      LAST_DOWNLOAD_URL="$effective_url"
+      return 0
+    else
+      status=$?
+    fi
+    if [ "$attempt" -eq 3 ]; then return "$status"; fi
+    echo "⚠ latest release asset download failed (attempt $attempt/3); retrying in ${delay}s: $url" >&2
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+  return 1
+}
+
 if [ -z "$SOURCE" ] && [ "$IS_CHECKOUT" -eq 0 ]; then
   RELEASE_BASE="${ELANOUS_RELEASE_BASE:-https://github.com/ElanvitalAI/elanous/releases}"
   if [ -n "${ELANOUS_VERSION:-}" ]; then
@@ -439,8 +472,29 @@ if [ -z "$SOURCE" ] && [ "$IS_CHECKOUT" -eq 0 ]; then
   CHECKSUM_URL="${RELEASE_DIR}SHA256SUMS"
   command -v curl >/dev/null 2>&1 || { echo "⛔ download failed: $PACKAGE_URL (curl missing)" >&2; exit 1; }
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/elanous-install.XXXXXX")" || { echo "⛔ mktemp failed" >&2; exit 1; }
-  curl -fsSL -o "$TMP/package.tgz" "$PACKAGE_URL" || { echo "⛔ download failed: $PACKAGE_URL" >&2; exit 1; }
-  curl -fsSL -o "$TMP/SHA256SUMS" "$CHECKSUM_URL" || { echo "⛔ download failed: $CHECKSUM_URL" >&2; exit 1; }
+  if [ -z "${ELANOUS_VERSION:-}" ]; then
+    case "$RELEASE_BASE" in
+      http://*|https://*)
+        download_latest_asset "$PACKAGE_URL" "$TMP/package.tgz" "$TMP/package.headers" || { echo "⛔ download failed: $PACKAGE_URL" >&2; exit 1; }
+        RELEASE_TAG="$(awk 'tolower($1) == "location:" { $1=""; sub(/^[[:space:]]*/, ""); sub(/\r$/, ""); print }' "$TMP/package.headers" | sed -nE 's#^https?://[^[:space:]]*/releases/download/([^/?]+)/elanous\.tgz([?][^[:space:]]*)?$#\1#p' | tail -n 1)"
+        [ -n "$RELEASE_TAG" ] || { echo "⛔ latest release redirect did not identify an immutable tag; refusing checksum fallback: $PACKAGE_URL" >&2; exit 1; }
+        PACKAGE_URL="${RELEASE_BASE%/}/download/$RELEASE_TAG/elanous.tgz"
+        CHECKSUM_URL="${RELEASE_BASE%/}/download/$RELEASE_TAG/SHA256SUMS"
+        ;;
+      *)
+        # Local file release fixtures have no HTTP redirect chain or tag Location header.
+        download_latest_asset "$PACKAGE_URL" "$TMP/package.tgz" || { echo "⛔ download failed: $PACKAGE_URL" >&2; exit 1; }
+        case "$LAST_DOWNLOAD_URL" in
+          file://*|http://*|https://*) PACKAGE_URL="$LAST_DOWNLOAD_URL" ;;
+        esac
+        CHECKSUM_URL="${PACKAGE_URL%elanous.tgz}SHA256SUMS"
+        ;;
+    esac
+    download_latest_asset "$CHECKSUM_URL" "$TMP/SHA256SUMS" || { echo "⛔ download failed: $CHECKSUM_URL" >&2; exit 1; }
+  else
+    curl -fsSL -o "$TMP/package.tgz" "$PACKAGE_URL" || { echo "⛔ download failed: $PACKAGE_URL" >&2; exit 1; }
+    curl -fsSL -o "$TMP/SHA256SUMS" "$CHECKSUM_URL" || { echo "⛔ download failed: $CHECKSUM_URL" >&2; exit 1; }
+  fi
   EXPECTED="$(awk '$2 == "elanous.tgz" && $1 ~ /^[[:xdigit:]]+$/ && length($1) == 64 { print $1; exit }' "$TMP/SHA256SUMS")"
   [ -n "$EXPECTED" ] || { echo "⛔ checksum missing for elanous.tgz: $CHECKSUM_URL" >&2; exit 1; }
   if command -v sha256sum >/dev/null 2>&1; then
@@ -609,8 +663,9 @@ echo "$(t "Installed elanous $VERSION at $PREFIX/bin/elanous" "elanous $VERSION 
 
 START_SETUP=$INTERACTIVE
 [ "$RUN_SETUP" -eq 1 ] || START_SETUP=0
-# A fresh installation starts first-run even from a headless SSH session; `--no-setup` remains the opt-out.
-if [ -z "$INSTALLED_VERSION" ] && [ "$RUN_SETUP" -eq 1 ]; then START_SETUP=1; fi
+# A fresh headless install must return to its caller. A bare CLI launch requires
+# stdin TTY; only an explicit setup executor can take over that headless flow.
+if [ -z "$INSTALLED_VERSION" ] && [ "$RUN_SETUP" -eq 1 ] && { [ "$INTERACTIVE" -eq 1 ] || [ -n "${ELANOUS_INSTALL_SETUP_EXEC:-}" ]; }; then START_SETUP=1; fi
 
 # Bootstrap selects only non-sudo tools and PATH; sudo items are printed as a short plan.
 if ELANOUS_INSTALL_PREFIX="$PREFIX" PATH="$PREFIX/bin:$PATH" "$PREFIX/bin/elanous" bootstrap >"$TMP/bootstrap.out" 2>"$TMP/bootstrap.err"; then
@@ -638,7 +693,7 @@ case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
   *) if [ "$MODIFY_PATH" -eq 1 ]; then echo "  $(t "open a new shell (or: source $STARTUP)" "새 셸을 여세요(또는: source $STARTUP)")"; else echo "  $(t "add $PREFIX/bin to PATH" "$PREFIX/bin 을 PATH 에 넣으세요")"; fi ;;
 esac
-if [ "$START_SETUP" -eq 0 ]; then echo "  $(t "Run: $PREFIX/bin/elanous   # first-time setup (in a new shell: elanous)" "실행: $PREFIX/bin/elanous   # 첫 설정(새 셸에서는: elanous)")"; fi
+if [ "$START_SETUP" -eq 0 ]; then echo "  $(t "Run in a terminal: $PREFIX/bin/elanous   # first-time setup" "터미널에서 실행: $PREFIX/bin/elanous   # 첫 설정")"; fi
 if PATH="$PREFIX/bin:$PATH" command -v gh >/dev/null 2>&1; then
   if ! PATH="$PREFIX/bin:$PATH" gh auth status >/dev/null 2>&1; then echo "  gh auth login"; fi
 else

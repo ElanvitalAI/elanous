@@ -1,0 +1,26 @@
+{
+  "id": "outbound-guard-sim",
+  "name": "Provenance-gated outbound side-effect simulation",
+  "implementation": [
+    "src/ux-sim/outbound-guard-sim.ts",
+    "src/ux-sim/fake-cloud-billing-world.ts"
+  ],
+  "tests": ["src/ux-sim/outbound-guard-sim.test.ts"],
+  "checklistCells": ["OUTBOUND-GUARD-SIM"],
+  "target": "Prove that only source=real provenance reaches an injected outbound sink, using a simulated cloud image-bake charge as the first outward-action case.",
+  "inputs": [
+    "provenance universe, source, device and scenario",
+    "fake-cloud-billing-world image-bake charge"
+  ],
+  "observations": [
+    "source=sim charge is blocked before the fake outbound sink",
+    "sim.leak-blocked carries action and provenance context",
+    "replay, injected, shadow, synthetic-probe, missing and incomplete provenance fail closed",
+    "source=real reaches only the injected fake sink",
+    "no real cloud, provider, process or network call"
+  ],
+  "entryCommands": ["bun test src/ux-sim/outbound-guard-sim.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -25,8 +25,7 @@ const [kind, ...args] = process.argv.slice(2);
 if (process.env.GEO_CHECK_CALL_LOG) appendFileSync(process.env.GEO_CHECK_CALL_LOG, JSON.stringify({kind,args,provider:process.env.ELANOUS_LLM_PROVIDER ?? null})+'\\n');
 const question = args.at(-1) || '';
 if (kind === 'research') { if (process.env.GEO_CHECK_NO_WEB) { console.log(JSON.stringify({query:question+' site https://elanous.ai/',output:'omni_search — 0 hits',metadata:{}})); process.exit(0); } console.log(JSON.stringify({query:question,output:'- [Guide](https://www.elanous.ai/guide)\\n  snippet',metadata:{}})); process.exit(0); }
-if (kind !== 'ask') process.exit(2);
-if (process.env.GEO_CHECK_NO_BARE && args.includes('--bare')) { console.error("error: unknown option '--bare'"); process.exit(1); }
+if (kind !== 'llm' && kind !== 'ask') process.exit(2);
 if (process.env.GEO_CHECK_ECHO_CWD) { console.log(JSON.stringify({reply:'cwd='+process.cwd()+' tool='+(process.env.ELANOUS_TOOL_CWD ?? 'none')})); process.exit(0); }
 if (question.includes('Generate exactly 5')) { console.log(JSON.stringify({reply:JSON.stringify(['What is an AI assistant?', 'Which assistant is best?', 'How can I automate?', 'What tools compare?', 'How much does it cost?'])})); process.exit(0); }
 if (question.includes('Using ONLY this score table') && process.env.GEO_CHECK_SUGGEST_REPLIES) { const list = JSON.parse(process.env.GEO_CHECK_SUGGEST_REPLIES); const f = process.env.GEO_CHECK_SUGGEST_COUNTER; let n = 0; try { n = Number(readFileSync(f, 'utf8')) || 0; } catch {} writeFileSync(f, String(n + 1)); console.log(JSON.stringify({reply: JSON.stringify(list[Math.min(n, list.length - 1)])})); process.exit(0); }
@@ -62,7 +61,7 @@ test('six graph nodes connect only through their step recipes', () => {
   }
 });
 
-test('fake CLI receives bare JSON only for answers; questions and suggest retain their ask arguments', async () => {
+test('fake CLI receives context-free llm JSON for answers; questions and suggestions retain contextual ask', async () => {
   const f = fixture();
   try {
     const callLog = join(f.root, 'calls.jsonl');
@@ -78,10 +77,10 @@ test('fake CLI receives bare JSON only for answers; questions and suggest retain
 
     const calls = readFileSync(callLog, 'utf8').trim().split('\n').map(row => JSON.parse(row) as { kind: string; args: string[]; provider: string | null });
     expect(calls).toHaveLength(4);
-    expect(calls[0]).toMatchObject({ kind: 'ask', provider: null });
+  expect(calls[0]).toMatchObject({ kind: 'ask', provider: null });
     expect(calls[0]!.args).toEqual(['--json', 'Generate exactly 5 potential customer questions about the category of Elanous. Respond ONLY with a JSON array of 5 question strings. Do not include the brand name in any question.']);
-    expect(calls[1]).toEqual({ kind: 'ask', args: ['--bare', '--json', 'Which assistant is best?'], provider: 'openai-codex' });
-    expect(calls[2]).toEqual({ kind: 'ask', args: ['--bare', '--json', 'Which assistant is best?'], provider: 'grok' });
+  expect(calls[1]).toEqual({ kind: 'llm', args: ['--json', 'Which assistant is best?'], provider: 'openai-codex' });
+  expect(calls[2]).toEqual({ kind: 'llm', args: ['--json', 'Which assistant is best?'], provider: 'grok' });
     expect(calls[3]).toMatchObject({ kind: 'ask', provider: null });
     expect(calls[3]!.args).toEqual(['--json', 'Using ONLY this score table, return a JSON array of 3 to 5 improvement suggestions. Each item: {"suggestion": "<FAQ question, FAQPage/Organization structured data, comparison document, etc.>", "evidence": <id of one cell below>}. Evidence cells (pick by id): [{"id":0,"question":"Which assistant is best?","engine":"grok","error":"credential unavailable","mention":false,"citation":false}]. Score table: [{"question":"Which assistant is best?","engine":"grok","error":"credential unavailable","mention":false,"citation":false}]']);
     expect(readFileSync(join(dir, 'run-step.ts'), 'utf8')).not.toMatch(/(?:from\s*|import\s*\()['"][^'"]*src\//);
@@ -249,19 +248,19 @@ test('answers are asked from an empty folder, not the folder the graph runs in',
   } finally { f.cleanup(); }
 });
 
-test('an installed elanous without ask --bare falls back to plain ask and marks the row', async () => {
+test('context-free answers use the llm command once without fallback to contextual ask', async () => {
   const f = fixture();
   try {
     const callLog = join(f.root, 'calls.jsonl');
-    const answers = await step('answers', { brand: 'Elanous', engines: ['openai-codex'] }, { questions: { questions: ['What assistant should I use?'] } }, f.bin, f.root, callLog, { GEO_CHECK_NO_BARE: '1' });
+    const answers = await step('answers', { brand: 'Elanous', engines: ['openai-codex'] }, { questions: { questions: ['What assistant should I use?'] } }, f.bin, f.root, callLog);
     expect(answers).toMatchObject({ calls: 1, errors: 0, outcome: 'ok' });
-    expect(answers.answers[0]).toMatchObject({ engine: 'openai-codex', answer: 'Visit https://elanous.ai/guide for details.', bare: false });
+    expect(answers.answers[0]).toMatchObject({ engine: 'openai-codex', answer: 'Visit https://elanous.ai/guide for details.' });
     const calls = readFileSync(callLog, 'utf8').trim().split('\n').map(row => JSON.parse(row) as { args: string[] });
-    expect(calls.map(c => c.args)).toEqual([['--bare', '--json', 'What assistant should I use?'], ['--json', 'What assistant should I use?']]);
+    expect(calls.map(c => c.args)).toEqual([['--json', 'What assistant should I use?']]);
   } finally { f.cleanup(); }
 });
 
-test('other ask failures are not retried without --bare', async () => {
+test('llm failures are not retried through contextual ask', async () => {
   const f = fixture();
   try {
     const callLog = join(f.root, 'calls.jsonl');

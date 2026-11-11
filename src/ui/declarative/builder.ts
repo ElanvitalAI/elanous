@@ -358,16 +358,6 @@ export class DialogWidgetBuilder extends WidgetBuilder {
   }
 }
 
-export class TooltipWidgetBuilder extends WidgetBuilder {
-  setText(text: string): this {
-    return this.patchConfig({ text });
-  }
-
-  setTtl(ttlMs: number): this {
-    return this.patchConfig({ ttlMs });
-  }
-}
-
 export class ListWidgetBuilder extends WidgetBuilder {
   setItems(items: readonly string[]): this {
     return this.patchConfig({ items: [...items] });
@@ -708,10 +698,6 @@ export function toastStackWidget(title?: string): ToastStackWidgetBuilder {
 
 export function textAreaWidget(title?: string): TextAreaWidgetBuilder {
   return new TextAreaWidgetBuilder('text-area').withChromeRole('panel', title);
-}
-
-export function tooltipWidget(type: string, title?: string): TooltipWidgetBuilder {
-  return new TooltipWidgetBuilder(type).withChromeRole('tooltip', title);
 }
 
 export function listWidget(title?: string): ListWidgetBuilder {

@@ -56,6 +56,65 @@ describe('pwa build gate (GATE-PWA)', () => {
     expect(r.out).toContain('측정 불가');
   });
 
+  test('a Next worker exit keeps the earlier TypeScript diagnostic in the gate output', () => {
+    // Source: the batch-node-b-22244441 transcript lost this diagnostic behind the final 15 lines.
+    const trailing = Array.from({ length: 20 }, (_, index) => `worker tail ${index}`).join('\n');
+    const output = [
+      'Failed to compile.',
+      '../../src/crawl-capabilities/contracts.ts:2:34',
+      "Type error: Cannot find module '../../skills/omni-crawl/src/types.js' or its corresponding type declarations.",
+      trailing,
+      'Next.js build worker exited with code: 1 and signal: null',
+    ].join('\n');
+    const r = run(['apps/pwa/src/app/page.tsx'], graphOf([]), { status: 1, output });
+    expect(r.rc).toBe(1);
+    expect(r.out).toContain('src/crawl-capabilities/contracts.ts:2:34');
+    expect(r.out).toContain("Type error: Cannot find module '../../skills/omni-crawl/src/types.js'");
+    expect(r.out).toContain('Next.js build worker exited with code: 1 and signal: null');
+    expect(r.out.indexOf('Type error:')).toBeLessThan(r.out.indexOf('Next.js build worker exited'));
+  });
+
+  test('standard TypeScript diagnostic beyond the tail keeps its file and error code', () => {
+    // Source: TypeScript's regular file(line,column): error TSxxxx output can precede a long Next worker tail.
+    const trailing = Array.from({ length: 20 }, (_, index) => `worker tail ${index}`).join('\n');
+    const output = `src/foo.ts(2,34): error TS2307: Cannot find module './missing.js'\n${trailing}`;
+    const r = run(['apps/pwa/src/app/page.tsx'], graphOf([]), { status: 1, output });
+    expect(r.out).toContain("src/foo.ts(2,34): error TS2307: Cannot find module './missing.js'");
+  });
+
+  test('ANSI tail is normalized and duplicate diagnostics use whole lines', () => {
+    const diagnostic = 'Type error: Cannot find module ./missing.js';
+    // Source: the gate keeps the final 15 lines; the diagnostic must sit before that window.
+    const filler = Array.from({ length: 20 }, (_, index) => `worker tail ${index}`).join('\n');
+    const output = [
+      diagnostic,
+      filler,
+      `context includes ${diagnostic} but is a different line`,
+      '\u001b[31mNext.js build worker exited with code: 1\u001b[0m',
+    ].join('\n');
+    const r = run(['apps/pwa/src/app/page.tsx'], graphOf([]), { status: 1, output });
+    expect(r.out.split('\n').filter((line) => line === diagnostic)).toHaveLength(1);
+    expect(r.out).not.toContain('\u001b[');
+    expect(r.out).toContain('Next.js build worker exited with code: 1');
+  });
+
+  test('Webpack module failure keeps its preceding source path beyond the tail', () => {
+    // Source: Next/Webpack prints a file path without line number before Module not found.
+    const filler = Array.from({ length: 20 }, (_, index) => `worker tail ${index}`).join('\n');
+    const output = `./src/foo.tsx\nModule not found: Can't resolve './missing'\n${filler}`;
+    const r = run(['apps/pwa/src/app/page.tsx'], graphOf([]), { status: 1, output });
+    expect(r.out).toContain("./src/foo.tsx\nModule not found: Can't resolve './missing'");
+  });
+
+  test('a repeated indented diagnostic appears once in the reported tail', () => {
+    const diagnostic = 'Type error: Cannot find module ./missing.js';
+    // Source: a diagnostic before the final 15 lines can repeat there with leading spaces.
+    const filler = Array.from({ length: 20 }, (_, index) => `worker tail ${index}`).join('\n');
+    const output = `${diagnostic}\n${filler}\n  ${diagnostic}`;
+    const r = run(['apps/pwa/src/app/page.tsx'], graphOf([]), { status: 1, output });
+    expect(r.out.split('\n').filter((line) => line.trim() === diagnostic)).toHaveLength(1);
+  });
+
   test('non-TS files under src/ (css, js beside a .d.ts) build conservatively', () => {
     expect(pwaReach(['src/shared/styles.css'], graphOf([])).reaches).toBe(true);
     expect(pwaReach(['src/lib/bridge.js'], graphOf(['src/lib/bridge.d.ts'])).reaches).toBe(true);

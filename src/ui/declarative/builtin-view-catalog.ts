@@ -1,6 +1,5 @@
 import type { WidgetChromeSpec } from './spec.js';
 import type { View } from '../view.js';
-import { Tooltip } from '../widgets/tooltip.js';
 import { Dialog } from '../widgets/dialog.js';
 import { SlashMenu, type SlashCommand } from '../widgets/slash-menu.js';
 import { ContextMenu } from '../widgets/context-menu.js';
@@ -139,27 +138,6 @@ function configOf(spec: WidgetSpec): Record<string, unknown> {
 }
 
 export const builtinDeclarativeViewDefinitions: readonly BuiltinDeclarativeViewDefinition[] = [
-  {
-    type: 'tooltip',
-    description: 'tooltip overlay view',
-    configSchema: {
-      type: 'object',
-      properties: {
-        text: stringValueSchema,
-        ttlMs: { type: 'integer', minimum: 0 },
-      },
-      required: ['text'],
-      additionalProperties: false,
-    },
-    createView: (spec) => {
-      const cfg = configOf(spec);
-      return new Tooltip({
-        text: asString(cfg.text, 'tooltip.config.text'),
-        ...(cfg.ttlMs !== undefined ? { ttlMs: asNumber(cfg.ttlMs, 'tooltip.config.ttlMs') } : {}),
-        ...(chromeOf(spec) ? { chromeSpec: chromeOf(spec) } : {}),
-      });
-    },
-  },
   {
     type: 'dialog',
     description: 'dialog view wrapper',

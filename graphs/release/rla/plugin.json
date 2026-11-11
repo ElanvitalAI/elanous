@@ -1,0 +1,19 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "rla-supervisor",
+  "version": "0.3.10",
+  "description": "Declared ARG supervisor graph for the release loop.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./supervisor.yaml"],
+      "graphManifests": {
+        "rla-supervisor": {
+          "purpose": "Observe, propose, validate, apply, verify, and roll back release graph repairs.",
+          "allow": { "recipes": ["cmd:*@./recipes.yaml", "prompt:reason"], "maxSideEffects": "write" },
+          "hitl": [],
+          "terminal": { "done": "success", "failed": "failure", "needs-human": "input_required" }
+        }
+      }
+    }
+  }
+}

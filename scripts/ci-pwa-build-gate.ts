@@ -31,6 +31,19 @@ export type PwaGateIo = {
   runBuild?: (root: string) => BuildResult;
 };
 
+function buildDiagnostics(lines: readonly string[]): string[] {
+  const found: string[] = [];
+  for (const [index, line] of lines.entries()) {
+    const labeled = /^\s*(?:Type error:|Module not found:|error TS\d{4,5}:)/u.test(line);
+    const located = /^\s*.+\.(?:tsx?|jsx?)(?:\(\d+(?:,\d+)?\)|:\d+(?::\d+)?)(?:\s*[-:]\s*|\s+)(?:error\s+)?TS\d{4,5}:/u.test(line);
+    if (!labeled && !located) continue;
+    const location = lines[index - 1]?.trim();
+    if (labeled && location && /\.(?:tsx?|jsx?)(?::\d+(?::\d+)?)?$/u.test(location)) found.push(location);
+    found.push(line.trim());
+  }
+  return [...new Set(found)];
+}
+
 function defaultBuild(root: string): BuildResult {
   const pwa = join(root, 'apps/pwa');
   let deps = checkPwaBuildDeps(pwa);
@@ -151,9 +164,16 @@ export function runPwaBuildGate(io: PwaGateIo = {}): number {
     log(`[pwa-gate] PASS — PWA 빌드 성공(${seconds}s).`);
     return 0;
   }
-  const tail = result.output.trim().split('\n').slice(-15).join('\n');
+  const plain = result.output.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, '');
+  const lines = plain.trim().split(/\r?\n/u);
+  const tailLines = lines.slice(-15);
+  const tail = tailLines.join('\n');
   if (result.status === null) error(`[pwa-gate] 측정 불가 — 빌드를 못 돌렸다: ${result.error?.message ?? tail.split('\n').pop() ?? 'unknown'}`);
-  else error(`[pwa-gate] FAIL — PWA 빌드 실패(rc=${result.status} · ${seconds}s):\n${tail}`);
+  else {
+    const tailSet = new Set(tailLines.map((line) => line.trim()));
+    const diagnostics = buildDiagnostics(lines).filter((line) => !tailSet.has(line));
+    error(`[pwa-gate] FAIL — PWA 빌드 실패(rc=${result.status} · ${seconds}s):\n${diagnostics.length ? `${diagnostics.join('\n')}\n` : ''}${tail}`);
+  }
   return 1;
 }
 

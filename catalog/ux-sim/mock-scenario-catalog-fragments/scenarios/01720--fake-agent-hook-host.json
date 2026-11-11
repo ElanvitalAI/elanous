@@ -1,0 +1,11 @@
+{
+  "id": "FAKE-AGENT-HOOK-HOST-DELIVERY-ACK",
+  "name": "Agent hooks inject unread messages and MCP ack settles them",
+  "kind": "fake-agent-hook-host",
+  "device": "fake-agent-hook-host",
+  "implementation": ["src/msg/msg-hook.ts", "src/ux-sim/fake-agent-hook-host.ts"],
+  "tests": ["src/msg/msg-hook.test.ts", "src/ux-sim/fake-agent-hook-host.test.ts"],
+  "trigger": "Send two unread messages to a synthetic seat, invoke Claude UserPromptSubmit and Codex Stop hooks, then read and ack them through fake MCP inbox calls.",
+  "observe": ["Claude output nests additionalContext under hookSpecificOutput and includes only addressed mail", "repeated delivery of the same session bundle is suppressed and Stop blocks once", "MCP inbox observes both messages, per-ID ack removes one, and cross-seat ack is refused"],
+  "expected": "hook delivery and MCP inbox acknowledgement agree on the same seat-scoped unread set with no external process or network calls"
+}

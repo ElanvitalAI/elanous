@@ -31,6 +31,7 @@ function fixture(outcome: 'pass' | 'conflict' | 'fail', selectedFiles = 1, nextM
   let resolvedNextMd: string | undefined;
   const deps: L8ShadowQueueDeps = {
     acquire: async () => () => {},
+    rulesPreflight: async () => ({ outcome: 'pass', detail: 'fixture integrated rules pass' }),
     observe: (verdict) => { observed.push(verdict); },
     command: (bin, args, cwd) => {
       calls.push(`${bin} ${args.join(' ')}`);
@@ -156,6 +157,7 @@ test('real git conflict lists next.md with a trailing newline and shadow CLI res
   const outputs: string[] = [];
   const deps: L8ShadowQueueDeps = {
     acquire: async () => () => {},
+    rulesPreflight: async () => ({ outcome: 'pass', detail: 'fixture integrated rules pass' }),
     observe: () => {},
     command: (bin, args, cwd) => {
       calls.push(`${bin} ${args.join(' ')}`);

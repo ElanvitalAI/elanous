@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { cachedCutSnapshot } from './gate-cut-snapshot.js';
-import { spawnSync } from 'node:child_process';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
+import { gateGitSync } from './gate-git.js';
 
 const SHA40 = /^[a-f0-9]{40}$/i;
 const TEST_FILE = /^(?:[\w.-]+\/)*[\w.-]+\.test\.(?:tsx?|jsx?|mts|cts)$/;
@@ -14,7 +14,7 @@ export function gateTestedFileHashesAtCommit(repo: string, commit: string, files
   for (const file of [...files].sort()) {
     const hash = snapshot?.entries.get(file)?.sha256;
     if (snapshot && (!hash || !/^[a-f0-9]{64}$/i.test(hash))) return null;
-    const result = snapshot ? null : spawnSync('git', ['show', commit + ':' + file], { cwd: repo, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+    const result = snapshot ? null : gateGitSync(['show', commit + ':' + file], repo, { maxBuffer: SPAWN_SYNC_MAX_BUFFER });
     if (result && (result.status !== 0 || result.error || !Buffer.isBuffer(result.stdout))) return null;
     hashes[file] = snapshot ? hash! : createHash('sha256').update(result!.stdout).digest('hex');
   }
@@ -32,7 +32,7 @@ export function gateLockfileHashAtCommit(repo: string, commit: string): string |
     if (snapshot && !entry) return null;
     if (snapshot) contents.push(Buffer.from(entry!.content, 'base64'));
     else {
-      const result = spawnSync('git', ['show', commit + ':' + file], { cwd: repo, maxBuffer: SPAWN_SYNC_MAX_BUFFER });
+      const result = gateGitSync(['show', commit + ':' + file], repo, { maxBuffer: SPAWN_SYNC_MAX_BUFFER });
       if (result.status !== 0 || result.error || !Buffer.isBuffer(result.stdout)) return null;
       contents.push(result.stdout);
     }

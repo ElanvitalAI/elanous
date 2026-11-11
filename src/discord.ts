@@ -22,7 +22,7 @@
 
 import { markdownToTelegramHtml as _unusedMarkdownFn } from './telegram-format.js'; // eslint-disable-line @typescript-eslint/no-unused-vars
 import { debug } from './debug/log.js';
-import { getUserConfig } from './user-config.js';
+import { getUserConfig } from './user-config/reader.js';
 import { deliverSeatAnswers } from './seat-dispatch/seat-ask.js';
 import { handleDiscordSeatWork, type DiscordSeatWorkDeps } from './intake-plane/discord-seat-work.js';
 import { parseSeatAddress } from './seat-address/seat-address.js';

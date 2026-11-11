@@ -71,6 +71,7 @@ interface OpenApprovalSpec {
   detail?: string | string[];
   yesLabel?: string;
   noLabel?: string;
+  defaultNo?: boolean;
 }
 
 async function openApproval(spec: OpenApprovalSpec): Promise<boolean> {
@@ -97,6 +98,7 @@ async function openApproval(spec: OpenApprovalSpec): Promise<boolean> {
     detail: spec.detail,
     yesLabel: spec.yesLabel,
     noLabel: spec.noLabel,
+    defaultNo: spec.defaultNo,
     theme: state.getTheme?.() ?? undefined,
   });
   const modalHandle = state.coordinator.pushModal(modal.surface);
@@ -182,6 +184,18 @@ export function createShellApprover(): (req: ShellApprovalRequest) => Promise<Sh
     });
     return ok ? 'allow-session' : 'deny-once';
   };
+}
+
+/** Bash tool approval uses the same modal surface while retaining a binary runtime decision. */
+export function createBashApprover(): (req: { cmd: string; args?: string[]; cwd?: string }) => Promise<boolean> {
+  return async (req) => openApproval({
+    title: 'Approve risky Bash command?',
+    prompt: req.cmd,
+    detail: [req.args?.[0], req.cwd ? `cwd: ${req.cwd}` : ''].filter(Boolean).join('\n'),
+    yesLabel: 'Run command (y)',
+    noLabel: 'Deny (n)',
+    defaultNo: true,
+  });
 }
 
 export function createCodeEditApprover(): (req: CodeEditApprovalRequest) => Promise<boolean> {

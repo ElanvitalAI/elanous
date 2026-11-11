@@ -1,4 +1,4 @@
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { readHqLease, type HqDeps } from '../../hq/hq.js';
 import { measurePoolLease, measurePoolLeaseAsync, type PoolLeaseAsyncKubectl, type PoolLeaseMeasure, type PodLeaseMember } from '../../task-orchestrator/surfaces/pod-lease.js';
 import { parsePodPool, resolvePodPoolSpec, type PodPoolMember, type PoolKubectl } from '../../task-orchestrator/surfaces/pod-pool.js';

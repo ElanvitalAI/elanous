@@ -1,11 +1,15 @@
 import type { Command } from 'commander';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { writeStdoutJson } from '../cli/stdout-json.js';
 import type { GraphVariantPlan } from '../self-implement/graph-variant.js';
 import { debug } from '../debug/log.js';
 import { decideGraphApproval, graphRunAlive, lastJsonObject, latestGraphRun, listGraphRuns, manageGraphRun, runGraph, type GraphRunOptions, type GraphRunState } from './runner.js';
+import { createDefaultMarketDataRegistry } from './capability-providers/market-data/registry.js';
+import { importN8nExecuteWorkflow } from '../graph-v2/n8n-import.js';
+import { resolveGraphUnit } from '../self-implement/graph-unit-resolver.js';
+import { loadGraphPluginFromDir } from './graph-manifest-loader.js';
 
 function findGraphFile(graphId: string, extraRoots: string[] = []): string | undefined {
   const roots = [...extraRoots.map((root) => resolve(root)), resolve('graphs'), resolve(import.meta.dir, '../../graphs')];
@@ -29,8 +33,60 @@ function findGraphFile(graphId: string, extraRoots: string[] = []): string | und
 export function registerGraphCommands(program: Command, runsDeps: {
   root?: string; processStartMs?: (pid: number) => number | null; graphRoots?: string[];
   runBash?: NonNullable<GraphRunOptions['deps']>['runBash'];
+  capabilityProviders?: NonNullable<GraphRunOptions['deps']>['capabilityProviders'];
 } = {}): void {
   const graph = program.command('graph').description('Run a declared command graph or inspect its latest run');
+  graph.command('policy-check <plugin-dir>')
+    .description('Statically validate graph manifests and their declared execution policies before publishing')
+    .option('--json', 'Print the validation result as JSON')
+    .action((pluginDir: string, opts: { json?: boolean }) => {
+      try {
+        const loaded = loadGraphPluginFromDir(resolve(pluginDir));
+        const graphIds = Object.keys(loaded.graphs).sort();
+        if (opts.json) {
+          process.stdout.write(JSON.stringify({ ok: true, plugin: loaded.plugin.name, graphs: graphIds }) + '\n');
+        } else {
+          console.log(`graph policy-check: ${loaded.plugin.name} · ${graphIds.length} graph(s) valid`);
+        }
+      } catch (error) {
+        console.error(`graph policy-check: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
+  graph.command('import-n8n <file>')
+    .description('Convert a supported n8n Execute Workflow export into graph-v2 YAML')
+    .requiredOption('--unit <workflow-id=unit@version>', 'Map the Execute Workflow target id to an installed graph unit')
+    .option('--unit-root <path>', 'Directory containing the mapped graph unit (defaults to graphs/units)')
+    .requiredOption('--output <path>', 'Write YAML beside the graph-root/units directory so runGraph can resolve the unit')
+    .action((file: string, opts: { unit: string; unitRoot?: string; output: string }) => {
+      try {
+        const splitAt = opts.unit.indexOf('=');
+        if (splitAt < 1 || splitAt === opts.unit.length - 1) throw new Error('--unit must be workflow-id=unit@version');
+        const workflowId = opts.unit.slice(0, splitAt);
+        const call = opts.unit.slice(splitAt + 1);
+        const unitRoot = resolve(opts.unitRoot ?? 'graphs/units');
+        const resolved = resolveGraphUnit(call, join(unitRoot, 'n8n-import-source.json'));
+        const unit = resolved.template.unit;
+        if (!unit) throw new Error(`mapped graph is not an opted-in unit: ${call}`);
+        // Source: same conservative upper-bound formula used by lowerGraphV2.inferredUnitStepLimit.
+        const budget = resolved.template.allowance?.innerSteps ?? resolved.template.nodes.reduce((sum, node) => sum + node.maxVisits *
+          (node.kind === 'subgraph' ? (node.budget?.innerSteps ?? 1) : 1), 0);
+        // Source: graph-v2 unit-call budgets are positive safe integers.
+        if (!Number.isSafeInteger(budget) || budget < 1) throw new Error(`mapped unit has no executable step budget: ${call}`);
+        const source = importN8nExecuteWorkflow(readFileSync(resolve(file), 'utf8'), { units: {
+          [workflowId]: { call, budget, exits: unit.exits },
+        } });
+        const output = resolve(opts.output);
+        if (basename(output) === 'recipes.yaml') throw new Error('--output cannot replace the graph recipe file');
+        if (existsSync(output)) throw new Error('--output already exists; refusing to overwrite an input or graph file');
+        if (resolve(realpathSync(dirname(output)), 'units') !== realpathSync(unitRoot))
+          throw new Error('--output must be beside the mapped unit directory (<graph-root>/graph.yaml and <graph-root>/units/)');
+        writeFileSync(output, source, { flag: 'wx' });
+      } catch (error) {
+        console.error(`graph import-n8n: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
   graph.command('adapt-report')
     .description('Measure recorded graph path diversity, unit calls, adaptations and landings for one goal')
     .requiredOption('--goal <id>', 'Goal ID to measure')
@@ -119,7 +175,8 @@ export function registerGraphCommands(program: Command, runsDeps: {
           if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('--input must be a JSON object');
           input = parsed as Record<string, unknown>;
         }
-        const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from ? { fromNodeId: opts.from } : {}), ...(opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }) });
+        const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from ? { fromNodeId: opts.from } : {}), ...(opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }),
+          deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: runsDeps.capabilityProviders ?? createDefaultMarketDataRegistry() } });
         if (opts.json) await writeStdoutJson(JSON.stringify(state) + '\n');
         else console.log(`${state.graphId} ${state.runId}: ${state.status} (${(state.plannedPath ?? state.path).join(' → ')}, executed: ${state.executed})${state.pending ? ` — ${state.pending.message}` : ''}`);
         if (state.status !== 'done' && state.status !== 'awaiting-approval') process.exitCode = 1;

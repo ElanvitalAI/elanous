@@ -3,8 +3,7 @@
 // R1.3 policy lock: context-menu family uses the modal-surface
 // authority path (`tier: 'menu'`). Its lifecycle still belongs to the
 // broader overlay family, but its paint ownership stays with the
-// coordinator-owned modal stack. See
-// `src/display/transient-overlay-policy.ts`.
+// coordinator-owned modal stack.
 //
 // When a right-click lands on a view that declares `contextActions`,
 // the modal-adapter emits a ContextMenuRequest. This module consumes

@@ -12,6 +12,8 @@ const shell = findPowerShell();
 const executionTest = shell ? test : test.skip;
 const nonWindowsExecutionTest = process.platform === 'win32' ? test.skip : executionTest;
 const windowsExecutionTest = process.platform === 'win32' && shell ? test : test.skip;
+// Source: child-process contract treats a zero exit status as success.
+const successfulExitStatus = 0;
 const fixtures: string[] = [];
 
 function findPowerShell(): string | undefined {
@@ -41,11 +43,21 @@ function requiredFromBash(): string[] {
   return readFileSync(resolve(import.meta.dir, 'install.sh'), 'utf8').match(/REQUIRED_COMMANDS=\(([^)]*)\)/)?.[1].trim().split(/\s+/).sort() ?? [];
 }
 
-function run(args: string[], options: { home?: string; cwd?: string; path?: string; profile?: string; prefix?: string; script?: string; env?: Record<string, string> } = {}) {
+function run(args: string[], options: { home?: string; cwd?: string; path?: string; profile?: string; prefix?: string; script?: string; emptyProfile?: boolean; env?: Record<string, string> } = {}) {
   const home = options.home ?? fixture();
   const prefix = options.prefix ?? join(home, 'prefix');
   const profile = options.profile ?? join(home, 'profile.ps1');
-  const result = spawnSync(shell!, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', options.script ?? installer, ...args], {
+  let script = options.script ?? installer;
+  let scriptArgs = args;
+  if (options.emptyProfile) {
+    const wrapper = join(home, 'invoke-with-empty-profile.ps1');
+    const scriptLiteral = script.replaceAll("'", "''");
+    const argsLiteral = args.map((argument) => `'${argument.replaceAll("'", "''")}'`).join(' ');
+    writeFileSync(wrapper, `$PROFILE = ''\n. '${scriptLiteral}' ${argsLiteral}\nexit $LASTEXITCODE\n`);
+    script = wrapper;
+    scriptArgs = [];
+  }
+  const result = spawnSync(shell!, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, ...scriptArgs], {
     cwd: options.cwd ?? repoRoot,
     encoding: 'utf8',
     env: { ...process.env, HOME: home, USERPROFILE: home, ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_POWERSHELL_PROFILE: profile, ELANOUS_INSTALL_BUN_SCRIPT: '', ELANOUS_INSTALL_NO_USER_PATH: '1', ELANOUS_INSTALL_LANG: 'en', ...(options.path ? { PATH: options.path } : {}), ...options.env },
@@ -179,14 +191,16 @@ describe('scripts/install.ps1', () => {
     const source = readFileSync(installer, 'utf8');
     expect(source).toContain('rem elanous-wrapper');
     expect(source).toContain("Join-Path $binDirectory 'eln.cmd'");
-    expect(source).toContain('Get-Command eln -ErrorAction SilentlyContinue');
+    expect(source).toContain('not installer-owned; refusing to overwrite or claim it');
+    expect(source).toContain('[StringComparison]::OrdinalIgnoreCase');
     expect(source).toContain('Set-Content -LiteralPath $elnShim -Value $shimContent');
   });
 
   windowsExecutionTest('Windows execution: eln.cmd calls the same entrypoint and leaves an existing foreign shim untouched', () => {
     const home = fixture();
     const prefix = join(home, 'prefix');
-    const first = run(['-NoModifyPath'], { home, prefix });
+    const source = standalonePackage(home);
+    const first = run(['-NoModifyPath', '-Source', source], { home, prefix });
     expect(first.result.status, first.result.stderr).toBe(0);
     const bin = join(prefix, 'bin');
     const eln = join(bin, 'eln.cmd');
@@ -197,9 +211,9 @@ describe('scripts/install.ps1', () => {
     expect(short.status, short.stderr).toBe(0);
     expect(short.stdout).toBe(full.stdout);
     writeFileSync(eln, '@echo off\r\necho other\r\n');
-    const again = run(['-NoModifyPath'], { home, prefix });
-    expect(again.result.status, again.result.stderr).toBe(0);
-    expect(again.result.stdout).toContain('WARNING eln:');
+    const again = run(['-NoModifyPath', '-Source', source], { home, prefix });
+    expect(again.result.status).not.toBe(successfulExitStatus);
+    expect(again.result.stderr).toContain('not installer-owned; refusing to overwrite or claim it');
     expect(readFileSync(eln, 'utf8')).toBe('@echo off\r\necho other\r\n');
   }, 120_000);
 
@@ -222,8 +236,9 @@ describe('scripts/install.ps1', () => {
     expect(source).toContain('https://registry.npmjs.org/@oven%2fbun-windows-x64/$bunVersion');
     expect(source).toContain('Test-Sha512Integrity $npmArchive $npmIntegrity');
     expect(source).toContain('downloaded bun version mismatch');
-    expect(source).toContain("$bunUserBin = Join-Path (Join-Path $HOME '.bun') 'bin'");
-    expect(source).toContain('$runtimeDataHome = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA }');
+    expect(source).toContain("$bunUserBin = if ($installerUserHome) { Join-Path (Join-Path $installerUserHome '.bun') 'bin' } else { $null }");
+    expect(source).toContain('$runtimeDataHome = Resolve-InstallerDataHome');
+    expect(source).toContain('function Resolve-InstallerProfilePath');
     expect(source).toContain('Join-Path $bunBin $bunVersion');
     expect(source).toContain('custom ELANOUS_RELEASE_BASE download or checksum verification failed');
     expect(source).toContain("$registryMetadataUrl = 'https://registry.npmjs.org/elanous' + $registryVersion");
@@ -478,12 +493,20 @@ describe('scripts/install.ps1', () => {
   executionTest('PowerShell refuses to replace an ordinary current directory and preserves its contents', () => {
     const home = fixture();
     const prefix = join(home, 'prefix');
+    const testBin = process.platform === 'win32' ? undefined : join(home, 'test-bin');
+    if (testBin) {
+      mkdirSync(testBin, { recursive: true });
+      writeFakeBun(join(testBin, 'bun'), readFileSync(join(repoRoot, '.bun-version'), 'utf8').trim());
+    }
     const current = join(prefix, 'current');
     mkdirSync(current, { recursive: true });
     const sentinel = join(current, 'keep.txt');
     writeFileSync(sentinel, 'preserve me');
     const source = standalonePackage(home);
-    const { result } = run(['-NoModifyPath', '-Source', source], { home, prefix });
+    const { result } = run(['-NoModifyPath', '-Source', source], {
+      home, prefix,
+      ...(testBin ? { path: [testBin, process.env.PATH].filter(Boolean).join(process.platform === 'win32' ? ';' : ':') } : {}),
+    });
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('refusing to replace it');
     expect(readFileSync(sentinel, 'utf8')).toBe('preserve me');
@@ -651,6 +674,90 @@ describe('scripts/install.ps1', () => {
     expect(noModify.result.status, noModify.result.stderr).toBe(0);
     expect(existsSync(noModifyProfile)).toBe(false);
   }, 120_000);
+
+  executionTest('PowerShell simulation: empty USERPROFILE and $PROFILE use the LOCALAPPDATA fallback and expose the installed eln shim', () => {
+    const home = fixture();
+    const systemProfileHome = join(home, 'system-profile');
+    const prefix = join(home, 'system-prefix');
+    const earlierBin = join(home, 'earlier-bin');
+    const testBin = process.platform === 'win32' ? undefined : join(home, 'test-bin');
+    mkdirSync(earlierBin, { recursive: true });
+    writeFileSync(join(earlierBin, 'eln.cmd'), '@echo off\r\necho older eln\r\n');
+    if (testBin) {
+      mkdirSync(testBin, { recursive: true });
+      writeFakeBun(join(testBin, 'bun'), readFileSync(join(repoRoot, '.bun-version'), 'utf8').trim());
+    }
+    const localAppData = join(systemProfileHome, 'AppData', 'Local');
+    const fallbackProfile = join(systemProfileHome, 'Documents', 'WindowsPowerShell', 'Microsoft.PowerShell_profile.ps1');
+    const source = standalonePackage(home);
+    const installed = run([], {
+      home,
+      prefix,
+      profile: '',
+      emptyProfile: true,
+      path: [earlierBin, join(prefix, 'bin'), testBin, process.env.PATH].filter(Boolean).join(process.platform === 'win32' ? ';' : ':'),
+      env: { USERPROFILE: '', LOCALAPPDATA: localAppData, ELANOUS_POWERSHELL_PROFILE: '', ELANOUS_INSTALL_SOURCE: source },
+    });
+    const elnShim = join(prefix, 'bin', 'eln.cmd');
+    expect(installed.result.status, installed.result.stderr).toBe(successfulExitStatus);
+    expect(existsSync(fallbackProfile), installed.result.stdout).toBe(true);
+    expect(readFileSync(fallbackProfile, 'utf8')).toContain('# >>> elanous installer PATH >>>');
+    expect(existsSync(elnShim)).toBe(true);
+    expect(installed.result.stdout).toContain(`ELN command: ${elnShim}`);
+    expect(installed.result.stdout).toContain('ELN available on current PATH: True');
+  });
+
+  executionTest('PowerShell simulation: SYSTEM without USERPROFILE or LOCALAPPDATA installs under ProgramData and prints the eln shim path', () => {
+    const home = fixture();
+    const programData = join(home, 'ProgramData');
+    const prefix = join(programData, 'elanous');
+    const source = standalonePackage(home);
+    const requestedVersion = readFileSync(join(repoRoot, '.bun-version'), 'utf8').trim();
+    const bunArchive = join(home, 'bun-github.zip');
+    const fakeBun = join(home, 'bun-github.exe');
+    const checksums = join(home, 'bun-SHASUMS256.txt');
+    writeFileSync(bunArchive, 'mock Bun archive');
+    writeFakeBun(fakeBun, requestedVersion);
+    writeFileSync(checksums, `${createHash('sha256').update(readFileSync(bunArchive)).digest('hex')}  bun-windows-x64.zip\n`);
+    const wrapper = join(home, 'simulate-system-profile.ps1');
+    const quote = (value: string) => "'" + value.replace(/'/g, "''") + "'";
+    writeFileSync(wrapper, [
+      'function Invoke-WebRequest { param([string] $Uri, [string] $OutFile, [switch] $UseBasicParsing)',
+      "  if ($Uri -like 'https://github.com/oven-sh/bun/*/SHASUMS256.txt') { Copy-Item -LiteralPath $env:ELANOUS_TEST_BUN_CHECKSUMS -Destination $OutFile; return }",
+      "  if ($Uri -like 'https://github.com/oven-sh/bun/*/bun-windows-x64.zip') { Copy-Item -LiteralPath $env:ELANOUS_TEST_BUN_GITHUB_ARCHIVE -Destination $OutFile; return }",
+      '  throw "unexpected URL: $Uri"',
+      '}',
+      "function Expand-Archive { param([string] $LiteralPath, [string] $DestinationPath, [switch] $Force); New-Item -ItemType Directory -Force -Path $DestinationPath | Out-Null; $fakeBun = Join-Path $DestinationPath 'bun.exe'; Copy-Item -LiteralPath $env:ELANOUS_TEST_GITHUB_BUN -Destination $fakeBun; if ($env:OS -ne 'Windows_NT') { & chmod +x $fakeBun } }",
+      '& ' + quote(installer) + ' -NoModifyPath',
+    ].join('\n'));
+    const installed = run([], {
+      home,
+      profile: '',
+      emptyProfile: true,
+      script: wrapper,
+      path: process.platform === 'win32' ? `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32` : '/usr/bin:/bin',
+      env: {
+        HOME: '',
+        USERPROFILE: '',
+        LOCALAPPDATA: '',
+        ProgramData: programData,
+        ELANOUS_POWERSHELL_PROFILE: '',
+        ELANOUS_INSTALL_PREFIX: '',
+        ELANOUS_INSTALL_SOURCE: source,
+        ELANOUS_TEST_BUN_GITHUB_ARCHIVE: bunArchive,
+        ELANOUS_TEST_GITHUB_BUN: fakeBun,
+        ELANOUS_TEST_BUN_CHECKSUMS: checksums,
+      },
+    });
+    const elnShim = join(prefix, 'bin', 'eln.cmd');
+    const installedBun = join(programData, 'Elanous', 'runtime', 'bun', requestedVersion, 'bun.exe');
+    expect(installed.result.status, installed.result.stderr).toBe(successfulExitStatus);
+    expect(existsSync(elnShim)).toBe(true);
+    expect(existsSync(installedBun)).toBe(true);
+    expect(installed.result.stdout).toContain(`ELN command: ${elnShim}`);
+    expect(installed.result.stdout).toContain('ELN available on current PATH: True');
+    expect(installed.result.stdout).toContain('bootstrapped: bun');
+  });
 });
 
 // Runtime caller/wiring: Bun executes scripts/install-ps1.test.ts; run() invokes scripts/install.ps1 through spawnSync(shell, ['-File', installer, ...args]).

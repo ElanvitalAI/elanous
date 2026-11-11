@@ -22,7 +22,7 @@ function builtPages(directory: string): string[] {
   return [...pages, '/404'];
 }
 
-const retainedRoutes = ['/', '/404', '/setup', '/setup/done', '/chat', '/term', '/live-run', '/settings', '/editor', '/vault', '/apps', '/design-check'];
+const retainedRoutes = ['/', '/404', '/setup', '/setup/done', '/chat', '/share/received', '/term', '/live-run', '/live-run/adaptive', '/ops/release', '/settings', '/editor', '/vault', '/apps', '/board', '/design-check'];
 
 describe('feature maturity across surfaces', () => {
   test('each existing PWA page has exactly one PWA grade', () => {
@@ -41,10 +41,14 @@ describe('feature maturity across surfaces', () => {
     for (const route of ['/chat', '/term', '/editor']) {
       expect(maturityOn(route, 'pwa')).toBe('stable');
     }
-    for (const route of ['/live-run', '/settings', '/vault', '/apps']) {
+    for (const route of ['/live-run', '/live-run/adaptive', '/settings', '/vault', '/apps']) {
       expect(maturityOn(route, 'pwa')).toBe('beta');
     }
     expect(maturityOn('/design-check', 'pwa')).toBe('tool');
+    expect(maturityOn('/ops/release', 'pwa')).toBe('ops');
+    expect(visibleOn('/ops/release', 'pwa', 'owner')).toBe(true);
+    expect(visibleOn('/ops/release', 'pwa', 'contributor')).toBe(false);
+    expect(visibleOn('/ops/release', 'pwa', 'general')).toBe(false);
     expect(maturityOn('/autopilot', 'pwa')).toBeUndefined();
     expect(maturityOn('/missions/[id]', 'pwa')).toBeUndefined();
     expect(maturityOn('/approvals', 'pwa')).toBeUndefined();

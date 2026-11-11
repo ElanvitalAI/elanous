@@ -152,6 +152,8 @@ export interface NativeToolCatalogEntry {
   /** Coding Pipeline P1 — pair with `alwaysLoad`. See `alwaysLoad` doc
    *  for the full contract. Default undefined (treated as not-deferred). */
   shouldDefer?: boolean;
+  /** When false, a deferred schema stays search-only even when its intent scope matches. */
+  warmPreload?: boolean;
   /** Coding Pipeline P1 — when false, the tool is hidden from
    *  `ToolSearch` keyword/`select:` queries even if deferred. Use for
    *  safety-sensitive tools whose schema should never appear mid-turn.
@@ -305,6 +307,9 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['read-only'],
     supportsParallel: true,
     defaultEnabled: true,
+    alwaysLoad: false,
+    shouldDefer: true,
+    warmPreload: false,
     intentScope: 'ops-ui',
   },
   {
@@ -776,6 +781,9 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['mutating', 'network'],
     supportsParallel: false,
     defaultEnabled: true,
+    alwaysLoad: false,
+    shouldDefer: true,
+    warmPreload: false,
     intentScope: 'ops-fleet',
   },
   {
@@ -1747,6 +1755,9 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['read-only'],
     supportsParallel: true,
     defaultEnabled: true,
+    alwaysLoad: false,
+    shouldDefer: true,
+    warmPreload: false,
     intentScope: 'ops-ui',
     hintKeys: ['hasActivePtyModal'],
     probe: {
@@ -1767,6 +1778,9 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     safety: ['read-only'],
     supportsParallel: true,
     defaultEnabled: true,
+    alwaysLoad: false,
+    shouldDefer: true,
+    warmPreload: false,
     intentScope: 'ops-ui',
     hintKeys: ['hasActivePtyModal', 'hasSessionAttention'],
     probe: {
@@ -2339,15 +2353,13 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     intentScope: 'ops-ui',
   },
   {
-    // HT1 — view-switch from skill/dashboard chat. Numeric ids 1..6
-    // + shortcut '7' (Widget Playground) + labels like "agents" or
-    // "playground" all accepted. Non-destructive UI shift.
+    // HT1 — view-switch from skill/dashboard chat.
     id: 'dashboard_view_switch',
     kind: 'other',
     aliases: ['DashboardViewSwitch', 'dashboard_view_switch'],
     displayName: 'DashboardViewSwitch',
-    description: 'Switch dashboard to another view by id, label, or shortcut. Useful for scripted walkthroughs (e.g. V7 playground) without keyboard access.',
-    promptSummary: '`DashboardViewSwitch` (view — id/label/shortcut e.g. "7" or "playground")',
+    description: 'Switch dashboard to another view by id, label, or shortcut. Useful for scripted walkthroughs without keyboard access.',
+    promptSummary: '`DashboardViewSwitch` (view — id/label/shortcut e.g. "4" or "agents")',
     host: ['skill'],
     safety: ['process'],
     supportsParallel: false,
@@ -2356,12 +2368,12 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
   },
   {
     // HT2 — programmatic key injection at a widget instance. Enables
-    // automated smoke tests of the playground widget via tool call.
+    // automated smoke tests of widget behavior via tool call.
     id: 'dashboard_widget_invoke',
     kind: 'other',
     aliases: ['DashboardWidgetInvoke', 'dashboard_widget_invoke'],
     displayName: 'DashboardWidgetInvoke',
-    description: 'Send a synthetic KeyEvent { name, ctrl?, shift?, alt? } to a widget instance (e.g. wd-playground). Returns handled flag + post-invoke state snapshot. T2+ — this can mutate widget state.',
+    description: 'Send a synthetic KeyEvent { name, ctrl?, shift?, alt? } to a widget instance. Returns handled flag + post-invoke state snapshot. T2+ — this can mutate widget state.',
     promptSummary: '`DashboardWidgetInvoke` (id, key, ctrl?, shift?, alt? — synthetic keystroke + state snapshot)',
     host: ['skill'],
     safety: ['mutating', 'process'],

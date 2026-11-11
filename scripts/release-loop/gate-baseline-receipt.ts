@@ -1,6 +1,6 @@
 /** A full gate's reusable identity. Missing evidence is recorded, never promoted to a clean baseline. */
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { gateGitSync, gateCommitObjectExists } from './gate-git.js';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { gateTestBaseline } from '../lib/gate-test-env.js';
@@ -15,8 +15,9 @@ export function gateAssignableTestsAtCommit(repo: string, commit: string): strin
   if (!/^[0-9a-f]{40}$/i.test(commit)) return null;
   const snapshot = cachedCutSnapshot(repo, commit);
   if (!snapshot) {
-    const tree = spawnSync('git', ['ls-tree', '-r', '--name-only', commit], { cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
-    const cdp = spawnSync('git', ['grep', '-l', '-e', 'requireCdpBase', '-e', '9333', commit, '--', 'test', 'scripts'], { cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+    if (!gateCommitObjectExists(repo, commit)) return null;
+    const tree = gateGitSync(['ls-tree', '-r', '--name-only', commit], repo, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+    const cdp = gateGitSync(['grep', '-l', '-e', 'requireCdpBase', '-e', '9333', commit, '--', 'test', 'scripts'], repo, { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
     if (tree.status !== 0 || tree.error || (cdp.status !== 0 && cdp.status !== 1) || cdp.error) return null;
     const skipped = new Set(cdp.stdout.split(/\r?\n/).filter(Boolean).map((line) => line.slice(commit.length + 1)).filter((file) => file.endsWith('.test.ts')));
     return tree.stdout.split(/\r?\n/).filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file)
@@ -100,7 +101,7 @@ export function gateSourcePins(repo: string, commit: string): { graphSha: string
   const snapshot = cachedCutSnapshot(repo, commit);
   const read = (file: string): string | null => {
     if (snapshot) return snapshot.read(file) ?? null;
-    const result = spawnSync('git', ['show', commit + ':' + file], { cwd: repo, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    const result = gateGitSync(['show', commit + ':' + file], repo, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     return result.status === 0 && !result.error ? result.stdout : null;
   };
   const graph = read('graphs/release/release-loop.yaml');
@@ -117,7 +118,7 @@ export function gateShardRecipeIdentityAtCommit(repo: string, commit: string): {
   const snapshot = cachedCutSnapshot(repo, commit);
   const show = (file: string): string | null => {
     if (snapshot) return snapshot.read(file) ?? null;
-    const result = spawnSync('git', ['show', commit + ':' + file], { cwd: repo, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    const result = gateGitSync(['show', commit + ':' + file], repo, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     return result.status === 0 && !result.error ? result.stdout : null;
   };
   const graph = show('graphs/release/release-loop.yaml');

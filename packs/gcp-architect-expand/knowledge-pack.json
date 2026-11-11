@@ -1,0 +1,12 @@
+{
+  "kind": "knowledge-pack",
+  "name": "gcp-architect-expand",
+  "version": "0.1.0",
+  "description": "Official public Google Cloud architecture and cost decision references for a local-first expansion proposal.",
+  "dependencies": [],
+  "visibility": "public",
+  "content": [
+    { "kind": "document", "path": "content/decision-table.md" },
+    { "kind": "document", "path": "content/security-decision-table.md" }
+  ]
+}

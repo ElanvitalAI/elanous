@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { codeRevision, packageVersion } from '../version/code-revision.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export const ERROR_REPORT_URL = 'https://hooks.elanous.ai/v1/reports';
 const MAX_BYTES = 64 * 1024;

@@ -1,8 +1,8 @@
-import type { Command } from 'commander';
+import { Option, type Command } from 'commander';
 import { win32 } from 'node:path';
 import { applyMachineSetupPlan, type MachineSetupApplyDeps, type MachineSetupApplyResult } from './machine-setup-apply.js';
 import { buildMachineSetupPlan, formatMachineSetupPlan, readMachineCaptureForPlan } from './machine-setup-plan.js';
-import { applyMachineWslBootstrap, applyMachineWslProfile, runMachineWslCommand, type MachineWslSetupDeps } from './machine-wsl-setup.js';
+import { applyMachineWslBootstrap, applyMachineWslProfile, machineWslResumeTaskDefinitionPath, runMachineWslCommand, type MachineWslSetupDeps } from './machine-wsl-setup.js';
 
 export interface MachineApplyFromCaptureDeps extends MachineSetupApplyDeps {
   readonly platform?: () => string;
@@ -54,12 +54,13 @@ export function registerMachineApplyFromCaptureCommand(command: Command, deps: M
     .option('--platform <platform>', 'target platform; inferred from the current host when omitted')
     .option('--distribution <name>', 'WSL distribution to create', 'Ubuntu')
     .option('--resume-trigger <trigger>', 'Windows resume trigger: onstart (default) or onlogon fallback', 'onstart')
+    .addOption(new Option('--resume-task-wrapper <file>').hideHelp())
     .option('--wsl-user <name>', 'Linux account to create in the WSL distribution', 'elanous')
     .option('--resume', 'resume WSL setup after reboot; normally started by the scheduled task')
     .option('--allow-cloud-vm', 'explicitly continue WSL2 setup on a detected cloud VM despite reboot risk')
     .option('--yes', 'explicitly approve running package-manager commands')
     .option('--json', 'structured stdout; command stdout is suppressed while interactive prompts remain on the terminal')
-    .action((options: { from: string; profile: string; platform?: string; distribution: string; resumeTrigger: 'onstart' | 'onlogon'; wslUser: string; resume?: boolean; allowCloudVm?: boolean; yes?: boolean; json?: boolean }) => {
+    .action((options: { from: string; profile: string; platform?: string; distribution: string; resumeTrigger: 'onstart' | 'onlogon'; wslUser: string; resume?: boolean; resumeTaskWrapper?: string; allowCloudVm?: boolean; yes?: boolean; json?: boolean }) => {
       try {
         if (!['onstart', 'onlogon'].includes(options.resumeTrigger)) throw new Error('--resume-trigger must be onstart or onlogon');
         const capture = readMachineCaptureForPlan(options.from);
@@ -84,11 +85,14 @@ export function registerMachineApplyFromCaptureCommand(command: Command, deps: M
           if (!options.json) out.log(WSL_CODEX_CREDENTIAL_GUIDANCE);
           const bootstrap = applyMachineWslBootstrap({ capture: capturePath, profile: options.profile,
             distribution: options.distribution, user: options.wslUser, resume: options.resume === true, resumeTrigger: options.resumeTrigger,
-            deps: { ...deps.wsl, allowCloudVm: options.allowCloudVm === true } });
+            deps: { ...deps.wsl, resumeTaskWrapperPath: options.resumeTaskWrapper,
+              allowCloudVm: options.allowCloudVm === true } });
           const profileResult = bootstrap.status === 'complete'
             ? applyMachineWslProfile({ plan: buildMachineSetupPlan({ profile: options.profile, platform: 'wsl', sourceCapture: capture,
               distribution: options.distribution }),
-              distribution: options.distribution, user: options.wslUser, run: deps.wsl?.run ?? runMachineWslCommand })
+              distribution: options.distribution, user: options.wslUser, run: deps.wsl?.run ?? runMachineWslCommand,
+              resumeTaskDefinitionPath: machineWslResumeTaskDefinitionPath(deps.wsl?.env ?? process.env, deps.wsl?.resumeTaskDefinitionPath),
+              resumeTaskWrapperPath: options.resumeTaskWrapper })
             : undefined;
           const result = profileResult ? { ...bootstrap, status: profileResult.failures.length ? 'failed' as const : 'complete' as const,
             attempted: bootstrap.attempted + profileResult.attempted, profileResult,

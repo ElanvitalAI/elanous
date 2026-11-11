@@ -1,0 +1,8 @@
+{
+  "path": "src/ux-sim/graph-compose-trigger-sim.test.ts",
+  "disposition": "already-indexed",
+  "entryCommand": "bun test src/ux-sim/graph-compose-trigger-sim.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "The focused simulator inspects separate graph runs and isolated Nexus run-ledger rows.",
+  "deviceId": "graph-compose-trigger-sim"
+}

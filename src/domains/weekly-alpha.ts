@@ -17,7 +17,7 @@ import { textOnly } from '../llm/stream-text.js';
 
 import { buildFinanceTools } from './finance-tools.js';
 import { openSignalsDb, periodStats, topSignals } from './breaking-signals.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';

@@ -300,6 +300,15 @@ describe('streamLLMWithTools', () => {
 });
 
 describe('parseAnthropicSSELines', () => {
+  test('retains stop_reason on the final usage frame', async () => {
+    const lines = [
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":1}}}',
+      'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":8}}',
+      'data: {"type":"message_stop"}',
+    ];
+    expect((await collect(parseAnthropicSSELines(lines))).filter(e => e.type === 'usage'))
+      .toMatchObject([{ type: 'usage', usage: { stopReason: 'max_tokens', outputTokens: 8 } }]);
+  });
   test('emits text deltas from content_block_delta events', async () => {
     const lines = [
       `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,

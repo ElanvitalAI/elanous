@@ -88,6 +88,8 @@ export type L8ShadowEnqueueObservation = {
   pendingAfter: number;
 };
 export type L8ShadowQueueDeps = L8MergeQueueDeps & {
+  /** Admission check over origin/main ⊕ PR head; it must run before the shared queue ledger is written. */
+  rulesPreflight?: (input: { cwd: string; number: number; head: string }) => Promise<{ outcome: 'pass' | 'fail' | 'unmeasured'; detail?: string }>;
   observe?: (verdict: L8ShadowVerdict) => void | Promise<void>;
   observeEnqueue?: (entry: L8ShadowEnqueueObservation) => void | Promise<void>;
   resolveConflict?: (file: string, conflicted: string, target: string, worktree: string) => Promise<string>;
@@ -173,6 +175,8 @@ export async function enqueueL8ShadowQueue(cwd: string, number: number, deps: L8
     if (!view.headRefOid || !/^[0-9a-f]{40}$/i.test(view.headRefOid) || view.baseRefName !== 'main'
       || view.state !== 'OPEN' || view.isDraft !== false || view.isCrossRepository !== false) throw new Error('PR is not an open, ready, same-repository main PR');
     if (state.pending.some((p) => p.number === number)) throw new Error(`PR #${number} already queued`);
+    const rules = await (deps.rulesPreflight ?? runQueueRulesPreflight)({ cwd, number, head: view.headRefOid });
+    if (rules.outcome !== 'pass') throw new Error(`rules-contract preflight ${rules.outcome}: #${number} head=${view.headRefOid} ${rules.detail ?? 'no diagnostic returned'}`);
     const files = Array.isArray(view.files) && view.files.length < 100
       && view.files.every((file) => typeof file?.path === 'string')
       ? [...new Set(view.files.map((file) => file.path!))].sort()
@@ -215,6 +219,69 @@ export async function enqueueL8ShadowQueue(cwd: string, number: number, deps: L8
     }
     return publicShadowQueueState(state);
   });
+}
+
+/** Build the exact main ⊕ PR integration commit locally, then send that commit to the configured remote gate host.
+ *  The remote runs only rules-contract; setup/transport failures are unmeasured and therefore block queue admission. */
+async function runQueueRulesPreflight(input: { cwd: string; number: number; head: string }): Promise<{ outcome: 'pass' | 'fail' | 'unmeasured'; detail?: string }> {
+  const run = (args: string[]) => {
+    const result = command('git', args, input.cwd);
+    if (result.status !== 0) throw new Error((result.stderr || result.stdout || `git ${args.join(' ')} exit ${result.status}`).trim());
+    return result.stdout.trim();
+  };
+  let worktree = '';
+  let tempRoot = '';
+  let mainRef = '';
+  let headRef = '';
+  let previousOriginMain: string | undefined;
+  let originMainChanged = false;
+  try {
+    const suffix = `${input.number}-${process.pid}`;
+    mainRef = `refs/elanous/preflight/main-${suffix}`;
+    headRef = `refs/elanous/preflight/pr-${suffix}`;
+    run(['fetch', 'origin', `+refs/heads/main:${mainRef}`, `+refs/pull/${input.number}/head:${headRef}`]);
+    const main = run(['rev-parse', mainRef]);
+    const fetchedHead = run(['rev-parse', headRef]);
+    if (fetchedHead !== input.head) return { outcome: 'unmeasured', detail: `PR head changed during fetch: expected ${input.head}, got ${fetchedHead}` };
+    try { previousOriginMain = run(['rev-parse', '--verify', 'refs/remotes/origin/main']); } catch { /* first fetch in this checkout */ }
+    run(['update-ref', 'refs/remotes/origin/main', main]);
+    originMainChanged = true;
+    tempRoot = mkdtempSync(join(tmpdir(), 'eln-pr-rules-preflight-'));
+    worktree = join(tempRoot, 'tree');
+    run(['worktree', 'add', '--detach', worktree, main]);
+    const merge = command('git', ['-c', 'user.name=queue-preflight', '-c', 'user.email=queue-preflight@localhost', 'merge', '--no-ff', '--no-edit', input.head], worktree);
+    if (merge.status !== 0) return { outcome: 'unmeasured', detail: `main ⊕ PR merge conflict: ${merge.stderr.trim() || merge.stdout.trim()}` };
+    const commitSha = run(['-C', worktree, 'rev-parse', 'HEAD']);
+    const { runOnRemote, resolveGateRemoteSettings, realGateRemoteRunner } = await import('./gate-remote.js');
+    let gateConfig;
+    try {
+      const { getUserConfig } = await import('../user-config.js');
+      gateConfig = getUserConfig().gateRemote;
+    } catch { /* environment/default settings still require a remote preflight */ }
+    const settings = resolveGateRemoteSettings(gateConfig);
+    const result = runOnRemote({
+      repo: input.cwd, host: settings.host, mirror: settings.mirror, commit: commitSha, refs: [main],
+      argv: ['bun', 'test', 'test/rules-contract.test.ts'], hostCap: settings.hostCap,
+      timeoutMs: 15 * 60_000,
+    }, realGateRemoteRunner);
+    if (result.kind !== 'ran') return { outcome: 'unmeasured', detail: `remote ${settings.host}: ${result.kind === 'infra' ? result.reason : 'host busy'}` };
+    const output = `${result.stdout.toString('utf8')}\n${result.stderr.toString('utf8')}`.trim();
+    if (result.rc === 0) return { outcome: 'pass', detail: `host=${settings.host} main=${main} head=${input.head} integration=${commitSha}` };
+    const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    const diagnostic = lines.filter((line) => /\(fail\)|\.test\.[cm]?[jt]sx?:\d+|\b(?:NUMGUARD|FAIL|error:)\b/i.test(line)).slice(0, 12);
+    return { outcome: 'fail', detail: `host=${settings.host} main=${main} head=${input.head}; ${diagnostic.join(' · ') || lines.slice(-8).join(' · ') || `exit ${result.rc}`}` };
+  } catch (error) {
+    return { outcome: 'unmeasured', detail: error instanceof Error ? error.message : String(error) };
+  } finally {
+    if (worktree) command('git', ['worktree', 'remove', '--force', worktree], input.cwd);
+    if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+    if (mainRef) command('git', ['update-ref', '-d', mainRef], input.cwd);
+    if (headRef) command('git', ['update-ref', '-d', headRef], input.cwd);
+    if (originMainChanged) {
+      if (previousOriginMain) command('git', ['update-ref', 'refs/remotes/origin/main', previousOriginMain], input.cwd);
+      else command('git', ['update-ref', '-d', 'refs/remotes/origin/main'], input.cwd);
+    }
+  }
 }
 
 function shadowQueueSig(base: string, pending: readonly L8ShadowQueueItem[]): string {

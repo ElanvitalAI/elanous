@@ -7,6 +7,7 @@ import type { FoldMode } from "../log-entry.js";
 import type { StreamingMode } from "../session/streaming/stream-compositor.js";
 import type { ModelTier } from "../model-tier/types.js";
 import type { RubricAxis } from "../release-loop/rubric-types.js";
+import type { BashApprovalMode } from './shell.js';
 
 // ── SkillRouter (existing) ───────────────────────────────────────────
 
@@ -50,7 +51,7 @@ export type LLMProviderName =
   | 'openrouter'
   | 'opengateway'
   // 대표 2026-10-10 (BEDROCK-PROVIDER) — AWS Bedrock 의 Claude. 자격 = AWS 기본 자격 체인 · 명시 선택 전용(auto·폴백 후보 아님).
-  | 'bedrock';
+  | 'bedrock' | 'hq-proxy';
 
 /** Provider-agnostic reasoning intensity. The HUD click cycle and the
  *  `/reasoning` slash command both operate on this 4-state cycle —
@@ -845,9 +846,12 @@ export interface ShellConfig {
   allowDashboardPty: boolean;
   /** When true, the Bash tool is surfaced to the dashboard/chat LLM.
    *  Bash runs under `bash -c` with cwd=process.cwd(); ctx.signal
-   *  forwards so dashboard Esc kills in-flight children. Default OFF
-   *  because Bash has side effects without an approval gate. */
+   *  forwards so dashboard Esc kills in-flight children. Default OFF;
+   *  enabled TUI Bash uses the configured dangerous-command approval policy. */
   allowDashboardBash: boolean;
+  /** Require HITL before Bash dispatch for matched destructive commands by default.
+   *  `all` additionally requires confirmation for every Bash call. */
+  bashApproval: BashApprovalMode;
   /** When true, the TerminalModalInject tool is surfaced to the
    *  dashboard/chat LLM. Every call still goes through the approval
    *  modal (createInjectApprover), so enabling this doesn't bypass
@@ -909,10 +913,6 @@ export interface DashboardConfig {
    *  Defaults off so optional window navigation does not occupy keys
    *  required by essential input, reading, and escape controls. */
   enableVirtualWindowSwitchKeys: boolean;
-  /** Whether supplemental global dashboard keys are registered.
-   *  Defaults off so optional pane/window controls do not occupy keys
-   *  required by essential input, reading, and escape controls. */
-  enableSupplementalGlobalKeys: boolean;
   /** First-screen boot banner. Absent = `minimal`: only failures and first-run
    *  guidance reach the transcript; healthy daemon/PWA/hitl-port rows move to
    *  `/status`. `full` restores the historical band. */

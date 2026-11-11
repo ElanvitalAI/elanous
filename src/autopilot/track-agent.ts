@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { getOrCreatePersonaSession } from '../session/index.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { decideBudget, readBudgetInputsLive } from '../self-implement/budget-gate.js';
 import { findTrack } from './mission-phase-track.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';

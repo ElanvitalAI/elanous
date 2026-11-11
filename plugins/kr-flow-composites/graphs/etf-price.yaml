@@ -1,0 +1,12 @@
+graph_id: kr-etf-price-composite
+version: 1
+entry_node: etf-bars
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: etf-bars, kind: capability, recipe: none, requires: market.ohlcv@1, input: { market: KR, symbol: '471990', from: '2026-11-02', to: '2026-11-09' }, max_visits: 1 }
+  - { node_id: etf-compose, kind: agent, recipe: 'cmd:etf-compose', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: etf-bars, on: outcome, map: { ok: etf-compose, failed: failed } }
+  - { from: etf-compose, on: outcome, map: { ok: done, fail: failed, failed: failed } }

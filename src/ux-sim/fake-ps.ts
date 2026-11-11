@@ -18,6 +18,16 @@ export interface FakePsDevice {
   pidAlive(pid: number): boolean;
 }
 
+/** Read-only inventory seam consumed by lease reconciliation, independent of process restart operations. */
+export interface FakePsObserver {
+  /** null means the process inventory could not be measured; it is never an empty inventory. */
+  observe(host: string): ResourceMeasurement['processes'] | null;
+}
+
+export function createFakePsObserver(processTable: FakePsDevice): FakePsObserver {
+  return { observe: (host) => processTable.list(host) };
+}
+
 /** Mutable world process inventory shared by simulated `ps`, monkey, and host recovery. */
 export function createFakePsDevice(input: {
   readonly processes?: readonly SimWorldProcess[];

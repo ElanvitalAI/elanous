@@ -1,0 +1,15 @@
+{
+  "id": "log-volume-world",
+  "name": "Gate log volume and ALS propagation simulation",
+  "audience": "internal",
+  "checklistCells": ["GATE-OBS-ALS-PROPAGATION"],
+  "implementation": ["src/ux-sim/log-volume-device.ts", "src/graph-runner/runner.ts", "src/mss/logging/gate-correlation.ts"],
+  "tests": ["src/ux-sim/log-volume-world.test.ts"],
+  "target": "Runner gate observations keep run, invocation, batch and phase identity across asynchronous interleaving; reused context templates cannot leak phase.",
+  "inputs": ["simulated run identifiers", "shared gate identity template"],
+  "observations": ["correlated gate log envelopes", "current ALS context after all tasks"],
+  "entryCommands": ["bun test src/ux-sim/log-volume-world.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

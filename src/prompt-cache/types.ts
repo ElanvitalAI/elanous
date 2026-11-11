@@ -19,6 +19,8 @@ export interface LLMUsage {
   model?: string;
   inputTokens?: number;
   outputTokens?: number;
+  /** Provider's terminal reason for this request, e.g. stop or length. */
+  stopReason?: string;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
   /** Hidden reasoning tokens billed under output (OpenAI o1/o3 family,

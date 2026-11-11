@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-SIM-RECEIPT-TS",
+  "path": "src/ux-sim/sim-receipt.ts",
+  "boundary": "Builds an app simulation proof from validated app.yaml scenarios and measured network evidence, then binds its fingerprint only to a browser-parsed owned footer.",
+  "deviceIds": ["sim-receipt-proof"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

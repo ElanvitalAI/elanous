@@ -475,6 +475,8 @@ export const LLM_TIER_MAP_BY_PROVIDER: Readonly<Record<LlmTierProvider, TierMap>
   openrouter: OPENROUTER,
   opengateway: OPENGATEWAY,
   bedrock: BEDROCK,
+  // HQ proxy accepts the Codex model family and forwards those choices unchanged.
+  'hq-proxy': CODEX,
 } as const;
 
 /** 사람이 쓰는 tier 별칭 → canonical ModelTier. "grok low tier" 같은 자연어 헷갈림을 SSOT 로 흡수한다.
@@ -496,7 +498,7 @@ export function parseTierArg(raw: string): ModelTier | undefined {
  *  tsc 는 배열 누락을 못 잡는다(2026-09-23 `#19900` 이 `openrouter` 를 빠뜨려 배선 계약 자가 그것을
  *  한 번도 누르지 않았다). 자 = `provider-wiring-contract.test.ts`. */
 export const TIER_PROVIDERS: readonly LlmTierProvider[] = [
-  'anthropic', 'openai', 'openai-codex', 'gemini', 'grok', 'local', 'kimi', 'qwen', 'glm', 'openrouter', 'opengateway', 'bedrock',
+  'anthropic', 'openai', 'openai-codex', 'gemini', 'grok', 'local', 'kimi', 'qwen', 'glm', 'openrouter', 'opengateway', 'bedrock', 'hq-proxy',
 ];
 
 /** OpenRouter 모델 id(`openrouter/<vendor>/<model>` 또는 `<vendor>/<model>`)의 tier-map 칸.

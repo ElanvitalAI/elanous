@@ -1,0 +1,29 @@
+{
+  "id": "mini-board-card",
+  "name": "Mini board projection over the existing TaskCard journal",
+  "implementation": [
+    "src/ux-sim/mini-board-card.ts",
+    "apps/pwa/src/lib/task-card-model.ts",
+    "src/ux-sim/fake-nexus-board-server.ts"
+  ],
+  "tests": [
+    "src/ux-sim/mini-board-card.test.ts",
+    "src/ux-sim/mini-board-feed.test.ts",
+    "src/ux-sim/nexus-board-adapter.test.ts"
+  ],
+  "target": "Replays TaskCardEntry section events and projects the existing TaskCard model into the five requested mini-board columns without introducing a second persisted card shape.",
+  "inputs": [
+    "TaskCardEntry events for intake, landing, workspace, release test, and completed release"
+  ],
+  "observations": [
+    "the same TaskCard ID and title remain stable across transitions",
+    "result URL is exposed only after release completion",
+    "column order follows the existing task-card-model BoardColumn projection"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/mini-board-card.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

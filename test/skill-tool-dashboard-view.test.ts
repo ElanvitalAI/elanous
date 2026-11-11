@@ -16,7 +16,7 @@ afterEach(() => {
 function mkViewOps(partial: Partial<DashboardViewOps> = {}): DashboardViewOps {
   const views: DashboardViewInfo[] = [
     { id: '1', label: 'Normal', shortcut: '1', active: true },
-    { id: 'playground', label: 'Widget Playground', shortcut: '7', active: false },
+    { id: 'agents', label: 'Agents', shortcut: '4', active: false },
   ];
   return {
     list: () => views,
@@ -34,26 +34,26 @@ function mkWidgetOps(partial: Partial<DashboardWidgetInvokeOps> = {}): Dashboard
       if (id === 'unknown') return { ok: false, handled: false, reason: 'unknown id' };
       return { ok: true, handled: name !== 'escape' };
     },
-    snapshot: (id) => id === 'unknown' ? null : { type: 'playground', state: { cursor: 0, size: 'medium' } },
+    snapshot: (id) => id === 'unknown' ? null : { type: 'agents', state: { cursor: 0, size: 'medium' } },
     ...partial,
   };
 }
 
 describe('HT1 — DashboardViewSwitch', () => {
   test('refuses when tools not wired', async () => {
-    await expect(dispatchDashboardViewSwitch({ view: '7' })).rejects.toThrow(/not wired/);
+    await expect(dispatchDashboardViewSwitch({ view: '4' })).rejects.toThrow(/not wired/);
   });
 
   test('switches by shortcut', async () => {
     initDashboardViewTools(mkViewOps(), mkWidgetOps());
-    const r = await dispatchDashboardViewSwitch({ view: '7' });
-    expect(r.output).toContain('playground');
+    const r = await dispatchDashboardViewSwitch({ view: '4' });
+    expect(r.output).toContain('agents');
   });
 
   test('switches by label (case-insensitive)', async () => {
     initDashboardViewTools(mkViewOps(), mkWidgetOps());
-    const r = await dispatchDashboardViewSwitch({ view: 'widget playground' });
-    expect(r.output).toContain('playground');
+    const r = await dispatchDashboardViewSwitch({ view: 'agents' });
+    expect(r.output).toContain('agents');
   });
 
   test('throws with known views enumerated when needle unknown', async () => {
@@ -71,8 +71,8 @@ describe('HT1 — DashboardViewSwitch', () => {
 describe('HT2 — DashboardWidgetInvoke', () => {
   test('fires key at widget and returns handled + snapshot', async () => {
     initDashboardViewTools(mkViewOps(), mkWidgetOps());
-    const r = await dispatchDashboardWidgetInvoke({ id: 'wd-playground', key: 'right' });
-    expect(r.output).toContain('wd-playground');
+    const r = await dispatchDashboardWidgetInvoke({ id: 'wd-agent-roster', key: 'right' });
+    expect(r.output).toContain('wd-agent-roster');
     expect(r.output).toContain('← right');
     expect(r.output).toContain('handled: true');
     expect(r.output).toContain('cursor');
@@ -91,8 +91,8 @@ describe('HT2 — DashboardWidgetInvoke', () => {
         return { ok: true, handled: true };
       },
     }));
-    const r = await dispatchDashboardWidgetInvoke({ id: 'wd-playground', key: '7', ctrl: true });
-    expect(received).toEqual({ name: '7', ctrl: true, shift: false, alt: false });
+    const r = await dispatchDashboardWidgetInvoke({ id: 'wd-agent-roster', key: '4', ctrl: true });
+    expect(received).toEqual({ name: '4', ctrl: true, shift: false, alt: false });
     expect(r.output).toContain('+C');
   });
 

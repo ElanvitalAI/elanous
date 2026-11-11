@@ -62,7 +62,6 @@ describe('WidgetLab presets', () => {
   });
 
   test('preset lookup and cycling are stable', () => {
-    expect(getWidgetLabPreset('hover-overlay')?.title).toBe('Hover Overlay');
     expect(getWidgetLabPreset('notes-panel')?.title).toBe('Notes Panel');
     expect(getWidgetLabPreset('ask-user-flow')?.title).toBe('Ask User Flow');
     expect(cycleWidgetLabPreset('telemetry-stack')).not.toBe('telemetry-stack');

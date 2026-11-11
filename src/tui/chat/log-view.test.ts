@@ -1,6 +1,11 @@
 import { expect, test } from 'bun:test';
+import chalk from 'chalk';
 import type { SerializedMessage } from '../../session/index.js';
-import { TOOL_FOLD_LINE_LIMIT, fitLogLine, isToolFoldToggleKey, logViewLines, safeLogText, safeStatusText, streamReplyLines, toggleVisibleToolFold, toolFoldBlockRanges, toolFoldBlockStarts, toolFoldSummary, wheelScroll, WHEEL_SCROLL_LINES } from './log-view.js';
+import { TOOL_FOLD_LINE_LIMIT, fitLogLine, isToolFoldToggleKey, logViewLines, safeLogText, safeStatusText, streamReplyLines, toggleVisibleToolFold, toolFoldBlockRanges, toolFoldBlockStarts, toolFoldSummary, wheelScroll, wrapLogLines, WHEEL_SCROLL_LINES } from './log-view.js';
+
+test('rebase keeps the main attachment-area multiline export', () => {
+  expect(wrapLogLines('앞 장면 영수증', 5).join('').replace(/\s/g, '')).toContain('영수증');
+});
 
 test('history renders user and assistant text within terminal width without stored control codes', () => {
   const messages: SerializedMessage[] = [
@@ -10,13 +15,77 @@ test('history renders user and assistant text within terminal width without stor
   ];
   const lines = logViewLines(messages, 12);
   expect(lines.join('\n')).toContain('가나다라');
-  expect(lines.join('')).toContain('답변');
+  expect(lines.join('').replace(/\x1b\[[0-?]*[ -/]*m/g, '')).toContain('답변');
   expect(lines.join('\n')).not.toContain('hidden system prompt');
-  expect(lines.join('\n')).not.toContain('\x1b');
+  expect(lines.join('\n')).not.toContain('\x1b[31m'); // stored control codes do not survive sanitization
+  expect(lines.join('\n')).not.toContain('\x1b[2J');
+  expect(lines.join('\n')).not.toContain('\x1b]');
   expect(lines.join('\n')).not.toContain('0;evil');
   expect(lines.every((line) => Bun.stringWidth(line) <= 12)).toBe(true);
   expect(safeLogText('title\x1b[2J')).toBe('title');
   expect(Bun.stringWidth(fitLogLine('긴 제목 가나다라마바사', 12))).toBeLessThanOrEqual(12);
+});
+
+test('assistant history reuses classic markdown rendering after sanitizing raw terminal codes', () => {
+  const lines = logViewLines([
+    { role: 'assistant', content: '# Heading\n\n**bold** and `code`\n\n- item\n\n\x1b[2Jsafe', ts: '2026-11-10T00:00:00Z' },
+  ], 80);
+  const text = lines.join('\n');
+  expect(text).toContain('Heading');
+  expect(text).toContain('bold');
+  expect(text).toContain('code');
+  expect(text).toContain('- item');
+  expect(text).toContain('safe');
+  expect(text).not.toContain('# Heading');
+  expect(text).not.toContain('**bold**');
+  expect(text).not.toContain('`code`');
+  expect(text).not.toContain('\x1b[2J');
+  expect(lines.every((line) => Bun.stringWidth(line) <= 80)).toBe(true);
+});
+
+test('assistant Markdown styles continue across wrapped PTY lines', () => {
+  const priorColorLevel = chalk.level;
+  chalk.level = 1;
+  try {
+    const lines = logViewLines([
+      { role: 'assistant', content: '**abcdefghijklmnopqrstuvwxyz1234**', ts: '2026-11-10T00:00:00Z' },
+    ], 18);
+    const boldLines = lines.filter((line) => line.includes('\x1b[1m'));
+    // Source: .rules/30-harness/testing-gates.md — wrapping must yield a continuation to exercise SGR replay.
+    expect(boldLines.length).toBeGreaterThan(1);
+    expect(lines.every((line) => Bun.stringWidth(line) <= 18)).toBe(true);
+  } finally {
+    chalk.level = priorColorLevel;
+  }
+});
+
+test('live reply preview uses the same Markdown renderer and wrapping as saved assistant text', () => {
+  const priorColorLevel = chalk.level;
+  chalk.level = 1;
+  try {
+    // Source: .rules/30-harness/testing-gates.md — compare streaming and persisted rendering at one PTY width.
+    const columns = 24;
+    const content = '# Live title\n\n**bold text that intentionally crosses the PTY width boundary** and `code`\n\n- item\n\n\x1b[2Jsafe';
+    const savedLines = logViewLines([
+      { role: 'assistant', content, ts: '2026-11-10T00:00:00Z' },
+    ], columns);
+    savedLines.pop();
+
+    const liveLines = streamReplyLines(content, columns);
+    expect(liveLines).toEqual(savedLines);
+    const styledLines = liveLines.filter((line) => line.includes('\x1b[1m'));
+    const lastStyledLine = styledLines.pop();
+    const previousStyledLine = styledLines.pop();
+    expect(previousStyledLine).toContain('\x1b[1m');
+    expect(lastStyledLine).toContain('\x1b[1m');
+    expect(liveLines.join('\n')).not.toContain('# Live title');
+    expect(liveLines.join('\n')).not.toContain('**bold**');
+    expect(liveLines.join('\n')).not.toContain('`code`');
+    expect(liveLines.join('\n')).not.toContain('\x1b[2J');
+    expect(liveLines.every((line) => Bun.stringWidth(line) <= columns)).toBe(true);
+  } finally {
+    chalk.level = priorColorLevel;
+  }
 });
 
 test('empty history clearly marks the first slice as read only', () => {
@@ -52,10 +121,44 @@ test('untrusted error text cannot move the status line', () => {
 test('live reply preview keeps first text visible, wraps and strips terminal controls', () => {
   const lines = streamReplyLines('첫 토큰과 이어지는 문장\n\x1b[2J둘째 줄', 12);
   expect(lines[0]).toContain('엘라누스:');
-  expect(lines.join('')).toContain('첫 토큰');
+  expect(lines[0]).toContain('첫');
+  expect(lines.join('\n')).toContain('토큰');
   expect(lines.join('\n')).toContain('둘째 줄');
   expect(lines.join('\n')).not.toContain('\x1b');
   expect(lines.every((line) => Bun.stringWidth(line) <= 12)).toBe(true);
+});
+
+test('chat wraps at word boundaries and indents continuation rows', () => {
+  const user = logViewLines([{ role: 'user', content: 'alpha beta gamma delta', ts: '2026-11-10T00:00:00Z' }], 14);
+  expect(user.slice(0, 2)).toEqual(['나: alpha beta', '  gamma delta']);
+  expect(streamReplyLines('foo bar baz quux', 14)).toEqual(['엘라누스: foo ', '  bar baz quux']);
+  const longWord = logViewLines([{ role: 'user', content: 'supercalifragilistic', ts: '2026-11-10T00:00:00Z' }], 10);
+  expect(longWord.every((line) => Bun.stringWidth(line) <= 10)).toBe(true);
+  expect(longWord.slice(1, -1).every((line) => line.startsWith('  '))).toBe(true);
+});
+
+test('narrow chat preserves wide graphemes by shrinking continuation indent', () => {
+  const lines = logViewLines([{ role: 'user', content: '한글 👩‍💻', ts: '2026-11-10T00:00:00Z' }], 3);
+  const visible = lines.join('');
+  expect(visible).toContain('한');
+  expect(visible).toContain('글');
+  expect(visible).toContain('👩‍💻');
+  expect(lines.every(line => Bun.stringWidth(line) <= 3)).toBe(true);
+});
+
+test('SGR in the middle of a word keeps the whole word together', () => {
+  const previousLevel = chalk.level;
+  chalk.level = 1;
+  try {
+    const lines = logViewLines([{ role: 'assistant', content: 'ab**cd** ef', ts: '2026-11-10T00:00:00Z' }], 12);
+    const plain = lines.map(line => line.replace(/\x1b\[[0-?]*[ -/]*m/g, ''));
+    expect(plain[0]).toBe('엘라누스: ');
+    expect(plain[1]).toContain('abcd');
+    expect(lines[1]).toContain('\x1b[1m');
+    expect(lines.every(line => Bun.stringWidth(line) <= 12)).toBe(true);
+  } finally {
+    chalk.level = previousLevel;
+  }
 });
 
 test('wheel scrolls the log a few lines per notch and keeps following the bottom', () => {

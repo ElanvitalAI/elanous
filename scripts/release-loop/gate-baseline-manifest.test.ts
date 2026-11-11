@@ -23,9 +23,11 @@ test('baseline manifest validation and gate-node import boundary stay stable', (
 
     const macSmoke = readFileSync(join(import.meta.dir, 'mac-smoke-node.ts'), 'utf8');
     const gateNode = readFileSync(join(import.meta.dir, 'gate-node.ts'), 'utf8');
+    const gateRuntime = readFileSync(join(import.meta.dir, 'gate-runtime.ts'), 'utf8');
     expect(macSmoke).toContain("import { baselineCommit } from './gate-baseline-manifest.js';");
     expect(macSmoke).not.toMatch(/from ['"][^'"]*gate-node/);
-    expect(gateNode).toContain("export { baselineCommit } from './gate-baseline-manifest.js';");
+    expect(gateNode).toMatch(/export \{[^\n]*\bbaselineCommit\b[^\n]*\} from '\.\/gate-runtime\.js';/);
+    expect(gateRuntime).toContain("export { baselineCommit } from './gate-baseline-manifest.js';");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

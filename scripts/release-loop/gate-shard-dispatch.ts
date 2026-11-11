@@ -1,5 +1,7 @@
 /** Pure, fail-closed planning for a release gate measured across hosts. No host command runs here. */
 import { runtimeIdentityKey } from '../../src/runtime-identity.js';
+import { mapReduceHostForPiece, reduceMapReduceReceipt, validMapReducePieceReceipt, validMapReducePolicy,
+  type MapReducePieceReceipt, type MapReducePolicy } from '../../src/task-agent/map-run-ledger.js';
 
 export function gateShardRuntimeIdentityKey(identity: { bunVersion: string; platform: string;
   architecture: string; baseImageDigest?: string } | null | undefined, lockHash: string | null | undefined): string | null {
@@ -13,6 +15,8 @@ export interface GateShardIdentity {
   files: string[];
   /** Execution requirement, never a concrete host identity. */
   requiredOs?: 'darwin' | 'linux';
+  /** Conservative cost reservation per attempt, in the caller's documented unit. */
+  estimatedCost?: number;
 }
 
 export interface GateShardExecutionEvidence {
@@ -51,6 +55,8 @@ export interface GateShardReceipt extends GateShardIdentity {
   testedFileHashes?: Record<string, string>;
   /** Every Pod attempt that contributed to this logical shard; summary identity is valid only when these agree. */
   executions?: GateShardExecutionEvidence[];
+  /** Seed under which mapReducePiece was planned; required before policy-mode reuse. */
+  mapReduceSeed?: string;
   status: 'complete' | 'unmeasured';
   /** A complete measurement can contain existing or introduced failures. */
   failureIds: string[];
@@ -62,6 +68,7 @@ export interface GateShardReceipt extends GateShardIdentity {
   recordSha256?: string;
   measuredAt: string;
   attempt: number;
+  mapReducePiece?: MapReducePieceReceipt;
 }
 
 export interface GateShardHost {
@@ -147,6 +154,8 @@ export interface GateShardDispatchInput {
   environmentIdentity?: { baseImageDigest?: string; imageDigest?: string; bunVersion: string; platform: string; architecture: string; envFingerprint: string };
   lockfileHash?: string;
   testedFileHashesByShard?: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  /** Shared MAPREDUCE-FANOUT policy. Omitted for legacy single-attempt gate runs. */
+  mapReducePolicy?: MapReducePolicy;
 }
 
 /** Preserve the producer shard assignment while applying a changed-test import radius. Missing or incomplete inventory fails closed. */
@@ -180,7 +189,7 @@ export function planGateReceiptRadius(input: { receipts: readonly GateShardRecei
 
 export type GateShardAction =
   | { shardId: string; files: string[]; kind: 'reuse'; receipt: GateShardReceipt; reason: string }
-  | { shardId: string; files: string[]; kind: 'run'; host: string; reason: string; replacing?: GateShardReceipt }
+  | { shardId: string; files: string[]; kind: 'run'; host: string; reason: string; attempt?: number; costLimit?: number; replacing?: GateShardReceipt }
   | { shardId: string; files: string[]; kind: 'unmeasured'; reason: string };
 
 const SHA40 = /^[a-f0-9]{40}$/i;
@@ -193,7 +202,8 @@ export function validGateShardIdentity(head40: string, base40: string, shards: r
   const files = new Set<string>();
   for (const shard of shards) {
     if (!safeId(shard.id) || ids.has(shard.id) || shard.files.length === 0
-      || (shard.requiredOs !== undefined && shard.requiredOs !== 'darwin' && shard.requiredOs !== 'linux')) return false;
+      || (shard.requiredOs !== undefined && shard.requiredOs !== 'darwin' && shard.requiredOs !== 'linux')
+      || (shard.estimatedCost !== undefined && (!Number.isFinite(shard.estimatedCost) || shard.estimatedCost < 0))) return false;
     ids.add(shard.id);
     for (const file of shard.files) {
       if (!/^(?:[\w.-]+\/)*[\w.-]+\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file) || file.split('/').includes('..') || files.has(file)) return false;
@@ -243,14 +253,19 @@ export function eligibleGateShardReceipt(
 /** Reuse only exact complete measurements. A requested remeasure replaces one shard, not the whole sweep. */
 export function planGateShardDispatch(input: GateShardDispatchInput): GateShardAction[] {
   if (!validGateShardIdentity(input.head40, input.base40, input.shards)) throw new Error('invalid gate shard identity');
+  if (input.mapReducePolicy && !validMapReducePolicy(input.mapReducePolicy)) throw new Error('invalid shared map-reduce policy');
   if (input.rerouteShard && input.rerouteShard !== 'auto' && !input.shards.some((s) => s.id === input.rerouteShard))
     throw new Error(`unknown reroute shard: ${input.rerouteShard}`);
   if (input.shardHost && !input.hosts.some((host) => host.id === input.shardHost)) throw new Error(`unknown shard host: ${input.shardHost}`);
   const hosts = input.hosts.filter((host) => host.available && !host.reserved);
   const macPass = new Set(input.macPassShardIds ?? []);
   let nextHost = 0;
+  let reservedCost = 0; // Source: budget accumulation starts with no reservations (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
   const radiusUnchanged = new Set(input.radiusUnchangedShardIds ?? []);
-  return input.shards.map((shard) => {
+  const dispatchShards = input.mapReducePolicy
+    ? [...input.shards].sort((left, right) => left.id.localeCompare(right.id))
+    : input.shards;
+  return dispatchShards.map((shard) => {
     const prior = [...input.receipts].reverse().find((r) => r.id === shard.id && r.base40 === input.base40 && sameFiles(r.files, shard.files));
     const currentFileHashes = input.testedFileHashesByShard?.[shard.id];
     const currentLockfileValid = typeof input.lockfileHash === 'string' && /^[a-f0-9]{64}$/i.test(input.lockfileHash);
@@ -267,6 +282,9 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
       : prior ? 'shard-recipe-unmeasured' : undefined;
     const receipt = [...input.receipts].reverse().find((r) => eligibleGateShardReceipt(r, shard, input.head40, input.base40,
       radiusUnchanged.has(shard.id), r.head40 === input.head40)
+      && (!input.mapReducePolicy || r.mapReduceSeed === input.mapReducePolicy.seed
+        && r.mapReducePiece?.pieceId === shard.id
+        && validMapReducePieceReceipt(input.mapReducePolicy, r.mapReducePiece))
       && receiptFailureSetMatchesBaseline(r, shard, input.head40, input.sameHeadPreexistingFailureIds)
       && currentLockfileValid && r.lockfileHash === input.lockfileHash
       && currentFileHashesValid && sameTestedFileHashes(r.testedFileHashes, currentFileHashes)
@@ -281,8 +299,10 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
     const auto = input.rerouteShard === 'auto' && (prior?.status === 'unmeasured'
       || (macPass.has(shard.id) && !!prior && (prior.failureIds.length > 0 || prior.errorIds.length > 0)));
     const receiptHost = hosts.find((host) => host.id === receipt?.host);
-    if (receipt && (receipt.head40 === input.head40 || radiusUnchanged.has(shard.id)) && !forced && !auto && !invalidated && (!shard.requiredOs || receiptHost?.platform === shard.requiredOs))
+    if (receipt && (receipt.head40 === input.head40 || radiusUnchanged.has(shard.id)) && !forced && !auto && !invalidated && (!shard.requiredOs || receiptHost?.platform === shard.requiredOs)) {
+      if (input.mapReducePolicy && receipt.mapReducePiece) reservedCost += receipt.mapReducePiece.reservedCost;
       return { shardId: shard.id, files: [...shard.files], kind: 'reuse', receipt, reason: 'unchanged-radius-from-' + receipt.head40.slice(0, 12) };
+    }
     const testedContentMismatch = input.testedFileHashesByShard !== undefined
       && !sameTestedFileHashes(prior?.testedFileHashes, input.testedFileHashesByShard[shard.id]);
     const lockfileMismatch = input.lockfileHash !== undefined && prior?.lockfileHash !== input.lockfileHash;
@@ -296,8 +316,25 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
     else if (auto && macPass.has(shard.id)) candidates = candidates.filter((host) => host.platform === 'darwin');
     if ((forced || auto) && prior && candidates.some((host) => host.id !== prior.host)) candidates = candidates.filter((host) => host.id !== prior.host);
     if (!candidates.length) return { shardId: shard.id, files: [...shard.files], kind: 'unmeasured', reason: 'no eligible host' };
-    const host = candidates[nextHost++ % candidates.length]!;
-    return { shardId: shard.id, files: [...shard.files], kind: 'run', host: host.id, reason: rerunReason, ...(prior ? { replacing: prior } : {}) };
+    const previousAttempts = input.mapReducePolicy
+      ? prior?.mapReduceSeed === input.mapReducePolicy.seed ? prior?.mapReducePiece?.attempts.length ?? 0 : 0
+      : prior?.attempt ?? 0;
+    const attempt = previousAttempts + 1; // Source: gate attempt receipts are one-based (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
+    if (input.mapReducePolicy && prior && attempt > input.mapReducePolicy.retryMax + 1) // Source: one initial dispatch plus retry.max retries (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
+      return { shardId: shard.id, files: [...shard.files], kind: 'unmeasured', reason: 'retry-limit-exceeded' };
+    const cost = shard.estimatedCost;
+    if (input.mapReducePolicy && (!Number.isFinite(cost) || cost! < 0))
+      return { shardId: shard.id, files: [...shard.files], kind: 'unmeasured', reason: 'cost-estimate-unmeasured' };
+    const reservation = input.mapReducePolicy ? cost! * (input.mapReducePolicy.retryMax + 1) : 0; // Source: reserve one estimate for the initial attempt plus retry.max (내부 문서 `pod-federation-mapreduce` §3, NUMGUARD)
+    if (input.mapReducePolicy && reservedCost + reservation > input.mapReducePolicy.costLimit)
+      return { shardId: shard.id, files: [...shard.files], kind: 'unmeasured', reason: 'budget-exceeded' };
+    reservedCost += reservation;
+    const host = input.mapReducePolicy
+      ? mapReduceHostForPiece(input.mapReducePolicy.seed, shard.id, attempt, candidates.map((candidate) => candidate.id))
+      : candidates[nextHost++ % candidates.length]?.id;
+    if (!host) return { shardId: shard.id, files: [...shard.files], kind: 'unmeasured', reason: 'no eligible host' };
+    return { shardId: shard.id, files: [...shard.files], kind: 'run', host, reason: rerunReason,
+      ...(input.mapReducePolicy ? { attempt, costLimit: cost } : {}), ...(prior ? { replacing: prior } : {}) };
   });
 }
 
@@ -329,19 +366,34 @@ function validTestedFileHashesForFiles(hashes: Readonly<Record<string, string>> 
 }
 
 export type GateShardReduction =
-  | { status: 'complete'; failureIds: string[]; errorIds: string[]; receipts: GateShardReceipt[] }
-  | { status: 'unmeasured'; reason: string };
+  | { status: 'complete'; failureIds: string[]; errorIds: string[]; receipts: GateShardReceipt[]; mapReduceReceipt?: ReturnType<typeof reduceMapReduceReceipt> }
+  | { status: 'unmeasured'; reason: string; mapReduceReceipt?: ReturnType<typeof reduceMapReduceReceipt> };
 
 /** Require exactly one exact, complete receipt per expected shard; classification remains with judgeGate. */
-export function reduceGateShardReceipts(input: { head40: string; base40: string; shards: readonly GateShardIdentity[]; receipts: readonly GateShardReceipt[] }): GateShardReduction {
+export function reduceGateShardReceipts(input: { head40: string; base40: string; shards: readonly GateShardIdentity[]; receipts: readonly GateShardReceipt[]; mapReducePolicy?: MapReducePolicy; mapReducePieces?: readonly MapReducePieceReceipt[] }): GateShardReduction {
   if (!validGateShardIdentity(input.head40, input.base40, input.shards)) return { status: 'unmeasured', reason: 'invalid gate shard identity' };
   const selected: GateShardReceipt[] = [];
   for (const shard of input.shards) {
     const matched = input.receipts.filter((r) => eligibleGateShardReceipt(r, shard, input.head40, input.base40));
-    if (matched.length !== 1) return { status: 'unmeasured', reason: `${shard.id}: expected one complete receipt, found ${matched.length}` };
+    if (matched.length !== 1) {
+      const mapReduceReceipt = input.mapReducePolicy && input.mapReducePieces
+        ? reduceMapReduceReceipt(input.mapReducePolicy, input.shards.map((candidate) => candidate.id), input.mapReducePieces)
+        : undefined;
+      return { status: 'unmeasured', reason: `${shard.id}: expected one complete receipt, found ${matched.length}`,
+        ...(mapReduceReceipt ? { mapReduceReceipt } : {}) };
+    }
     selected.push(matched[0]!);
   }
+  const mapReduceReceipt = input.mapReducePolicy
+    ? reduceMapReduceReceipt(input.mapReducePolicy, input.shards.map((shard) => shard.id),
+      input.mapReducePieces ? [...input.mapReducePieces] : selected.flatMap((receipt, index) => receipt.mapReducePiece
+        ? [receipt.mapReducePiece]
+        : [{ pieceId: input.shards[index]!.id, host: null, status: 'unmeasured' as const,
+          reservedCost: 0, // Source: missing execution evidence carries no measured reservation (NUMGUARD)
+          attempts: [] }]))
+    : undefined;
   return { status: 'complete', receipts: selected,
     failureIds: [...new Set(selected.flatMap((r) => r.failureIds))].sort(),
-    errorIds: [...new Set(selected.flatMap((r) => r.errorIds))].sort() };
+    errorIds: [...new Set(selected.flatMap((r) => r.errorIds))].sort(),
+    ...(mapReduceReceipt ? { mapReduceReceipt } : {}) };
 }

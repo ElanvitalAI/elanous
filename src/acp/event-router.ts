@@ -42,7 +42,7 @@ export interface AcpSessionUpdate {
   title?: string;
   toolCallId?: string;
   status?: string;
-  _meta?: { reasoning?: unknown; elanous?: { textOperation?: unknown } };
+  _meta?: { reasoning?: unknown; status?: unknown; elanous?: { textOperation?: unknown } };
   /** Plan event 가 ref 를 직접 들고 오는 경우 (현재 ACP spec 에 없으면
    *  router 가 turn-기반 fallback ref 사용). */
   planId?: string;
@@ -200,6 +200,10 @@ export function createAcpEventRouter(): AcpEventRouter {
           turnSeq: state.turnSeq,
         });
       }
+      // Runtime status (for example request-size compaction) is transient UI
+      // feedback, not conversation content. Its owning surface routes it to
+      // its status line; persisting it here made it reappear in resumed chats.
+      if (u.sessionUpdate === 'agent_thought_chunk' && u._meta?.status === true) return;
       switch (u.sessionUpdate) {
         case 'agent_message_chunk': {
           const c = u.content;

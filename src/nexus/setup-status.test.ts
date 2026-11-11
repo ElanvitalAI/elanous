@@ -4,10 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { buildUserConfig } from '../user-config.js';
+import { createFakeCred } from '../ux-sim/fake-cred.js';
 import { USER_CONFIG_VERSION } from './config/types.js';
 import { SKILLS_STEP_COMMAND, UNATTENDED_SETUP_COMMAND, unattendedSetupHint } from '../onboarding/entry-hints.js';
 import {
   checkSetupStatus,
+  credentialSetupOptions,
+  credentialSetupOptionsWithHealth,
   readNexusSetupMode,
   setupBootMode,
   setupModeBootPlan,
@@ -15,6 +18,23 @@ import {
   type SetupCheckResult,
   type SetupItem,
 } from './setup-status.js';
+
+test('credential setup options attach per-slot health only when a metadata observer is supplied', () => {
+  const fake = createFakeCred({ now: () => 1_000 }); // Source: fixed simulation clock keeps expiry states deterministic.
+  fake.install('cred:eodhd.api_key', { permissions: ['read'], expiresAt: 2_000 });
+  fake.install('cred:krx.api_key', { permissions: ['write'], expiresAt: 2_000 });
+  const options = credentialSetupOptionsWithHealth({ inspect: fake.inspect, permissionFor: () => 'read', now: () => 1_000,
+    warningWindowMs: 100 }); // Source: fixture compares a short, explicit warning window.
+  expect(options.find((row) => row.id === 'cred:eodhd.api_key')?.healthStatus).toBe('valid');
+  expect(options.find((row) => row.id === 'cred:krx.api_key')?.healthStatus).toBe('insufficient-permission');
+  expect(options.find((row) => row.id === 'cred:kis.app_key')?.healthStatus).toBe('missing');
+  expect(credentialSetupOptions().every((row) => row.healthStatus === undefined)).toBe(true);
+  expect(options.filter((row) => row.registerable).map((row) => row.id)).toEqual(['cred:openai.api_key', 'cred:openrouter.api_key', 'cred:elevenlabs.api_key']);
+  expect(options.filter((row) => row.registerable).every((row) => row.registrationPath === '/credentials/register')).toBe(true);
+  expect(options.filter((row) => !row.registerable).every((row) => row.registrationPath === null)).toBe(true);
+  expect(JSON.stringify(options)).not.toContain('permissions');
+  expect(JSON.stringify(options)).not.toContain('expiresAt');
+});
 
 function requiredItem(id: 'llm' | 'pwa-build', label: string, passed: boolean): SetupItem {
   return { id, label, passed, hint: '' };

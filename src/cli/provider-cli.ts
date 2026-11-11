@@ -362,8 +362,8 @@ export function registerProviderCommands(program: Command): void {
         console.log(`⚠️ 선언된 홈은 ${active.declaredHome} 지만 «정본 기록»이 이긴다 — 실제로 쓰이는 것은 위의 홈이다`);
       }
       const rows = listCodexAccountsInStore();
-      if (rows.length === 0) { console.log('  (정본 스토어에 codex 계정 없음)'); return; }
-      for (const r of rows) console.log(`  ${r.name.padEnd(12)} storeKey=${r.storeKey}  authMode=${r.authMode ?? '-'}`);
+      if (rows.length === 0) { console.log('  (사용 가능한 codex 계정 없음)'); return; }
+      for (const r of rows) console.log(`  ${r.name.padEnd(12)} storeKey=${r.storeKey}  authMode=${r.authMode ?? '-'}${r.source ? `  source=${r.source}` : ''}`);
     });
 
   accountCmd

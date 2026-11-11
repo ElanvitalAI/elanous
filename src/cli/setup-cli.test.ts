@@ -714,4 +714,50 @@ describe('setup CLI', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test('setup keys imports finance dotenv entries, lists skipped unknown names, and shows metadata only', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'setup-finance-keys-'));
+    const cacheDir = join(root, 'key-cache');
+    const envPath = join(root, '.env');
+    const names = ['FDS_API_KEY', 'TWELVEDATA_API_KEY', 'KIS_APP_KEY', 'KIS_APP_SECRET', 'KIS_ACCOUNT', 'KRX_API_KEY',
+      'TOSSINVEST_CLIENT_ID', 'TOSSINVEST_CLIENT_SECRET', 'TOSSINVEST_ACCOUNT_SEQ', 'TOSSINVEST_BASE_URL'];
+    const values = new Map(names.map((name) => [name, `simulated-${name}`]));
+    const priorCache = process.env.ELANOUS_KEY_CACHE_DIR;
+    const priorEnv = new Map(names.map((name) => [name, process.env[name]]));
+    const output: string[] = [];
+    const errors: string[] = [];
+    const exitCodes: number[] = [];
+    const program = new Command();
+    process.env.ELANOUS_KEY_CACHE_DIR = cacheDir;
+    writeFileSync(envPath, [...values].map(([name, value]) => `${name}=${value}`).concat('UNLISTED_FINANCE_TOKEN=unknown-secret-canary').join('\n'));
+    try {
+      registerSetupCommand(program, {
+        getUserConfig: () => buildUserConfig(join(root, 'config.json')),
+        isStdinTty: () => false,
+        out: { log: value => output.push(value), error: value => errors.push(value) },
+        setExitCode: code => exitCodes.push(code),
+      });
+      await program.parseAsync(['setup', 'keys', '--import-env-file', envPath], { from: 'user' });
+      await program.parseAsync(['setup', 'keys', '--status'], { from: 'user' });
+      const text = output.join('\n');
+      expect(text).toContain('지원하지 않는 env 이름 건너뜀: UNLISTED_FINANCE_TOKEN · 값 출력 0');
+      expect(text).toContain('저장 완료:');
+      expect(text).toContain('Financial Datasets: 키 있음');
+      expect(text).toContain('Toss Securities Open API: 키 있음');
+      for (const value of values.values()) expect(text).not.toContain(value);
+      expect(text).not.toContain('unknown-secret-canary');
+      expect(readFileSync(join(cacheDir, 'fds_api_key'), 'utf8')).toBe('simulated-FDS_API_KEY\n');
+      expect(readFileSync(join(cacheDir, 'tossinvest_base_url'), 'utf8')).toBe('simulated-TOSSINVEST_BASE_URL\n');
+      expect(errors).toEqual([]);
+      expect(exitCodes).toEqual([0, 0]);
+    } finally {
+      if (priorCache === undefined) delete process.env.ELANOUS_KEY_CACHE_DIR;
+      else process.env.ELANOUS_KEY_CACHE_DIR = priorCache;
+      for (const [name, value] of priorEnv) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

@@ -73,6 +73,43 @@ test('incident 0306: release launch rejects a CLI checkout behind origin/main', 
   expect(() => assertReleaseCliCurrent(repo, cut)).toThrow(/uncommitted changes/);
 }));
 
+test('failed-run adoption freshness follows release head and branchCutBaseCommit, not origin/main', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-adopt-freshness-'));
+  try {
+    const remote = join(root, 'origin.git'), repo = join(root, 'repo');
+    mkdirSync(repo);
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    execFileSync('git', ['init', '--bare', remote], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    git(repo, 'init', '-b', 'main'); git(repo, 'config', 'user.name', 'release-sim'); git(repo, 'config', 'user.email', 'release-sim@example.invalid');
+    writeFileSync(join(repo, 'sentinel'), 'base'); git(repo, 'add', 'sentinel'); git(repo, 'commit', '-m', 'base');
+    const branchCutBaseCommit = git(repo, 'rev-parse', 'HEAD');
+    git(repo, 'remote', 'add', 'origin', remote); git(repo, 'push', '-u', 'origin', 'main');
+    git(repo, 'checkout', '-b', 'release/0.2.4');
+    writeFileSync(join(repo, 'sentinel'), 'release'); git(repo, 'commit', '-am', 'release tip');
+    const releaseHead = git(repo, 'rev-parse', 'HEAD');
+    git(repo, 'push', '-u', 'origin', 'release/0.2.4');
+    git(repo, 'checkout', 'main');
+    writeFileSync(join(repo, 'sentinel'), 'newer main'); git(repo, 'commit', '-am', 'main advanced'); git(repo, 'push', 'origin', 'main');
+    const mainHead = git(repo, 'rev-parse', 'HEAD');
+    git(repo, 'checkout', 'release/0.2.4');
+
+    expect(() => assertReleaseCliCurrent(repo, undefined, { version: '0.2.4', branchCutBaseCommit })).not.toThrow();
+    expect(() => assertReleaseCliCurrent(repo, undefined, { version: '0.2.4', branchCutBaseCommit: mainHead })).toThrow(/not a descendant of adopt branchCutBaseCommit/);
+    expect(git(repo, 'rev-parse', 'HEAD')).toBe(releaseHead);
+    git(repo, 'checkout', 'main');
+    expect(() => assertReleaseCliCurrent(repo, undefined, { version: '0.2.4', branchCutBaseCommit })).toThrow(/does not match origin\/release\/0\.2\.4/);
+
+    const state = join(root, 'state'); record(state, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
+    let observedAdopt: { version: string; branchCutBaseCommit?: string } | undefined;
+    await runUnattendedRelease({ version: '0.2.4', adoptFailedRunId: 'failed-run', branchCutBaseCommit }, {
+      ledgerRoot: state, config: { gatePodPool: 'pool' }, checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+      assertCliCurrent: (_repo, cutCommit, adopt) => { expect(cutCommit).toBeUndefined(); observedAdopt = adopt; },
+      graph: async () => ({ status: 'failed', runId: 'adopt-run' } as never),
+    });
+    expect(observedAdopt).toEqual({ version: '0.2.4', branchCutBaseCommit });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('incident 0306: a new request resumes the saved same-version failed run id', async () => {
   const root = mkdtempSync(join(tmpdir(), 'unattended-resume-same-cut-'));
   try {
@@ -192,8 +229,20 @@ test('release.loop config builds the full graph input with ledger previousVersio
   const loop = { gatePodPool: 'gate-pool', gatePodBunCache: '/var/cache/elanous-bun', gatePodShards: 4, gatePodShardTimeoutSeconds: 240,
     gateRemote: 'node-b', gateRemoteMirror: '/mirror/repo.git', opsHosts: ['local', 'node-b'], internalDist: '~/dist', opsRestart: true };
   writeFileSync(configPath, JSON.stringify({ release: { loop } }));
-  expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, configPath })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', gateExecutor: 'pod', gateImagePin: 'cut-commit', ...loop });
+  expect(buildReleaseRunInput('0.11.0', { ledgerRoot: root, configPath })).toEqual({ version: '0.11.0', previousVersion: '0.10.0', gateExecutor: 'pod', gateImagePin: 'cut-commit', graphCutover: 'legacy', ...loop });
 }));
+
+test('OP-approved failed-run adoption is carried into the graph input and restricted to branch cuts', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-adopt-input-'));
+  try {
+    record(root, '0.2.3', { version: '0.2.3', publishedAt: 'now' });
+    const preview = await runUnattendedRelease({ version: '0.2.4', dryRun: true, adoptFailedRunId: 'failed-old-run' },
+      { ledgerRoot: root, config: { gatePodPool: 'pool' } });
+    expect(preview.input).toMatchObject({ version: '0.2.4', branchCut: true, adoptFailedRunId: 'failed-old-run' });
+    await expect(runUnattendedRelease({ version: '0.2.4', dryRun: true, cutCommit: 'a'.repeat(40), adoptFailedRunId: 'failed-old-run' },
+      { ledgerRoot: root, config: { gatePodPool: 'pool' } })).rejects.toThrow('--adopt-failed-run requires the release-branch cut');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('freeze stops gate and publish graph; force-freeze records bypass and off resumes', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-freeze-'));
@@ -336,9 +385,9 @@ test('RELEASE-BRANCH: the default run cuts a release branch; --cut-commit and --
     await runUnattendedRelease({ version: '0.2.4', cutCommit: 'abc1234' }, deps);
     await runUnattendedRelease({ version: '0.2.4', mainCut: true }, deps);
     expect(inputs).toEqual([
-      { gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3', branchCut: true },
-      { gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3', cutCommit: 'abc1234' },
-      { gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3' },
+      { gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3', branchCut: true },
+      { gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3', cutCommit: 'abc1234' },
+      { gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.4', previousVersion: '0.2.3' },
     ]);
     enableLandingFreeze({ reason: 'emergency', by: 'OP' }, root);
     await expect(runUnattendedRelease({ version: '0.2.4' }, deps)).rejects.toThrow('동결 중 · emergency');
@@ -359,7 +408,7 @@ test('RELEASE-REHEARSAL-RC: --prerelease rc numbers the next free rc, skips the 
       checklist: () => { checklists++; return { ok: false, red: ['K1'], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
       graph: async (_p: string, o: { input?: unknown }) => { inputs.push(o.input as Record<string, unknown>); return { status: 'done' } as never; } };
     const preview = await runUnattendedRelease({ version: '0.2.18', prerelease: 'rc', dryRun: true }, deps);
-    expect(preview.input).toEqual({ gatePodPool: 'pool', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.18-rc.2', previousVersion: '0.2.17', branchCut: true });
+    expect(preview.input).toEqual({ gatePodPool: 'pool', graphCutover: 'legacy', gateExecutor: 'pod', gateImagePin: 'cut-commit', version: '0.2.18-rc.2', previousVersion: '0.2.17', branchCut: true });
     await runUnattendedRelease({ version: '0.2.18', prerelease: 'rc' }, deps);
     expect(inputs[0]!.version).toBe('0.2.18-rc.2');
     expect(checklists).toBe(0);

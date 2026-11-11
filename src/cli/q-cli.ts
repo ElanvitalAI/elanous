@@ -5,9 +5,9 @@ const ZSH_INIT = `eln-q-widget() {
   local replacement
   print -n '⏳' >&2
   replacement=$(command eln q --raw -- "$BUFFER")
-  local status=$?
+  local command_status=$?
   print -n '\\r\\033[K' >&2
-  if (( status == 0 )) && [[ -n "$replacement" ]]; then
+  if (( command_status == 0 )) && [[ -n "$replacement" ]]; then
     BUFFER="$replacement"
     CURSOR=\${#BUFFER}
   else
@@ -20,8 +20,8 @@ bindkey "$ELN_Q_KEY" eln-q-widget
 `;
 
 async function suggestCommand(request: string, onDelta?: (delta: string) => void): Promise<string> {
-  const [{ getUserConfig }, llm, { askBare }, tierMap] = await Promise.all([
-    import('../user-config.js'), import('../llm.js'), import('./ask-bare.js'), import('../model-tier/llm-tier-map.js'),
+  const [{ getUserConfig }, llm, { llmQuery }, tierMap] = await Promise.all([
+    import('../user-config.js'), import('../llm.js'), import('./llm-cli.js'), import('../model-tier/llm-tier-map.js'),
   ]);
   const config = getUserConfig();
   const selected = llm.decideProviderForConfig(config);
@@ -33,7 +33,7 @@ async function suggestCommand(request: string, onDelta?: (delta: string) => void
     `OS: ${platform()}; shell: ${process.env.SHELL ?? 'unknown'}; cwd: ${process.cwd()}.`,
     `Request: ${request}`,
   ].join('\n');
-  const result = await askBare({
+  const result = await llmQuery({
     text: prompt, model: tier.model, onDelta,
     deps: {
       getUserConfig,

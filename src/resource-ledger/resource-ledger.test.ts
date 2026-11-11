@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'bun:test';
-import { activeResourceLeases, activeResourcePools, admitGuardianHostLease, beginResourceLease, declareResourcePool, endGuardianHostLease, endResourceLease, guardianHostLeaseRecords, heartbeatResourceLease, latestWarmPoolPodReceipts, readResourceLedger, recordWarmPoolPodReceipt, requestGuardianHostLease,
+import { activeResourceLeases, activeResourcePools, admitGuardianHostLease, beginResourceLease, declareResourcePool, endGuardianHostLease, endResourceLease, guardianHostLeaseRecords, heartbeatResourceLease, latestWarmPoolPodReceipts, readResourceLedger, recordLlmProxyCall, recordWarmPoolPodReceipt, requestGuardianHostLease,
   reconcileResourceLeases, reapResourceLeaseIfCurrent, resourceMatrix, reassignResourcePools, type ResourceLease, type ResourceMeasurement } from './resource-ledger.js';
 import { buildResourceLedgerSnapshot, collectResourceMeasurement, registerResourceLedgerCommands, type ResourceCommandRunner } from '../cli/resource-ledger-cli.js';
 import { Command } from 'commander';
@@ -12,6 +12,16 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 const lease = (overrides: Partial<ResourceLease> = {}): ResourceLease => ({ id: 'fp_run001', fp: 'fp_run001', host: 'node-b', lane: 'ta',
   resources: { cpu: 2, memoryBytes: 1024 }, mission: { cell: 'TA-1' }, ttlMs: 1000,
   heartbeatAt: '2026-11-01T00:00:00.000Z', startedAt: '2026-11-01T00:00:00.000Z', ...overrides });
+
+test('proxy usage survives a resource-ledger read without credential material', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'proxy-ledger-')); dirs.push(dir);
+  const path = join(dir, 'events.jsonl');
+  const event = { event: 'llm-proxy-call' as const, at: new Date().toISOString(), host: 'pod-a', seat: 'R-PROXY',
+    purpose: 'review', pr: 42, model: 'gpt-6.1-terra', inputTokens: 12, outputTokens: 4,
+    costUsd: 0, costBasis: 'subscription' as const, status: 'ok' as const };
+  recordLlmProxyCall(event, path);
+  expect(readResourceLedger(path)).toEqual([event]);
+});
 
 test('Guardian host leases persist policy, enforce admission, expire, and release in the Nexus ledger', () => {
   const dir = mkdtempSync(join(tmpdir(), 'guardian-host-lease-')); dirs.push(dir);

@@ -1,6 +1,6 @@
 // HQ promotion runbook: read-only preview by default; all remote mutations are behind --apply.
 import { spawnSync } from 'node:child_process';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { debug } from '../debug/log.js';
 import { join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';

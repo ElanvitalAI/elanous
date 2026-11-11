@@ -1,0 +1,18 @@
+graph_id: verb-watch
+version: 1
+entry_node: watch
+terminal_nodes: [done, rework, needs-human, failed]
+unit:
+  inputs: [ask, context, prior]
+  outputs: [result, evidence]
+  exits: [done, rework, needs-human, failed]
+nodes:
+  - { node_id: watch, kind: gate, recipe: none, max_visits: 1, contract: { inputs: [ask, context, prior], tools: none, outputs: [result, evidence] } }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: rework, kind: gate, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: needs-human, kind: hitl, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1, contract: { inputs: [], tools: none, outputs: [result, evidence] } }
+edges:
+  - from: watch
+    on: outcome
+    map: { done: done, rework: rework, needs-human: needs-human, failed: failed }

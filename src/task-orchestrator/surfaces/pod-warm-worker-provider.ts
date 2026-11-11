@@ -10,7 +10,7 @@ import { debug } from '../../debug/log.js';
 import { listSchedules } from '../../release-loop/release-schedule.js';
 import { allocatePodPhaseCandidates, resolvePodPhasePlan, podPhaseGateIdentityMatches,
   type PodKind, type PodPhasePrewarmConfig } from './pod-warm-switch.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { resolveWarmPoolProfile, resolveWarmPoolQuota, type WarmPoolProfile, type WarmPoolTier } from '../../self-implement/pod-warm-pool-profile.js';
 import { WarmPodTransport, probeWarmPodContext, probeWarmPodRuntimeContract, imageReferencesDifferOnlyByDigest, warmWorkerPodManifest, type WarmPodSpec, type WarmPodTransportResult } from './pod-warm-worker-pod.js';
 import { parseWarmWorkerReply, type WarmWorkerCommand } from './pod-warm-worker-protocol.js';
@@ -882,9 +882,16 @@ export class WarmPodProvider {
   /** Kubernetes is the shared quarantine authority; missing or uncertain Pods cannot be leased. */
   private readClusterQuarantineState(candidate: WarmWorkerCandidate): 'available' | 'missing' | 'quarantined' | 'unavailable' {
     const spec = this.runtimeSpec(candidate);
-    const observed = this.kubectlForSpec(spec, ['get', 'pods', '-l',
-      `elanous.kind=warm-worker,${WARM_QUARANTINED_LABEL}!=true`, `--field-selector=metadata.name=${spec.name}`,
-      '--limit=25', '-o', 'json']);
+    // kubectl get does not expose the Kubernetes ListOptions limit/continue flags.
+    // Use the raw API for real clusters, while the injected boundary keeps its
+    // small fake-kubectl command contract.
+    const observed = this.kubectlForSpec(spec, this.options.kubectl
+      ? ['get', 'pods', '-l', `elanous.kind=warm-worker,${WARM_QUARANTINED_LABEL}!=true`,
+        `--field-selector=metadata.name=${spec.name}`, '--limit=25', '-o', 'json']
+      : ['get', '--raw', `/api/v1/namespaces/${encodeURIComponent(spec.namespace)}/pods?${new URLSearchParams({
+        labelSelector: `elanous.kind=warm-worker,${WARM_QUARANTINED_LABEL}!=true`,
+        fieldSelector: `metadata.name=${spec.name}`, limit: '25',
+      })}`]);
     if (observed.status !== 0) {
       return /notfound|not found|does not exist|pod missing/i.test(observed.stderr) ? 'missing' : 'unavailable';
     }

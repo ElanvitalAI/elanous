@@ -9,6 +9,16 @@ import { MAX_MARKDOWN_UTF8_BYTES, MAX_TITLE_CHARACTERS, type PublishRequest } fr
 import type { AppManifest } from './app-contract.js';
 import type { NexusAppHost } from './app-host.js';
 import { parsePublicAppHost } from '../../relay/relay-server.js';
+import { publicAppAddress } from './console-address.js';
+
+/** A deployment may report success only for the authenticated owner's exact app origin. */
+export function verifiedAppDeploymentUrl(appSlug: string, userSlug: string, value: string): string {
+  const expected = publicAppAddress({ appSlug, userSlug });
+  const url = new URL(value);
+  if (url.origin !== expected || url.protocol !== 'https:' || url.username || url.password || url.port
+    || url.pathname !== '/' || url.search || url.hash) throw new Error('public app URL is invalid');
+  return url.toString();
+}
 
 const APP_SLUG = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const APP_HOST_SUFFIX = '.app.localhost';
@@ -193,10 +203,12 @@ export function withAppPublishRenderEntry(appHost: NexusAppHost, entry: AppPubli
     issueInvitation: (appSlug, invitedBy, ttlMs, role) => appHost.issueInvitation(appSlug, invitedBy, ttlMs, role),
     issueOwnerSession: (appSlug, memberId) => appHost.issueOwnerSession(appSlug, memberId),
     resolveVerifiedOwner: (appSlug, credential, members, publicUserId) => appHost.resolveVerifiedOwner(appSlug, credential, members, publicUserId),
+    resolveVerifiedMemberOwner: (credential, members, publicUserId) => appHost.resolveVerifiedMemberOwner(credential, members, publicUserId),
     databaseBackupStatus: appSlug => appHost.databaseBackupStatus(appSlug),
     restoreDatabaseBackup: (appSlug, targetPath) => appHost.restoreDatabaseBackup(appSlug, targetPath),
     mountDirectory: appSlug => appHost.mountDirectory(appSlug),
     unmountDirectory: appSlug => appHost.unmountDirectory(appSlug),
+    setConceptProofResolver: resolver => appHost.setConceptProofResolver(resolver),
     close: () => appHost.close(),
     async handle(request) {
       const published = entry.handleShareRequest(request);

@@ -11,6 +11,7 @@ import { DaemonClient } from '@/lib/daemon-client';
 import { ThemeProvider } from '@/components/providers/ThemeProvider';
 import { NAV_SHOW_HIDDEN_KEY, NAV_SHOW_LABS_KEY } from './sidebar-nav-items';
 import { NAV_PREFS_EVENT } from './nav-visibility-prefs';
+import { userIntentLogger } from '@/lib/user-intent-logger';
 
 import { MobileBottomTabs } from './MobileBottomTabs';
 import { AppShell } from './AppShell';
@@ -76,19 +77,44 @@ function open(name: string) {
   return tree!.root.findByProps({ role: 'dialog' });
 }
 
-test('compact AppShell reserves space for four tabs and more, wide shell has no bottom tabs or spacing', () => {
+test('retained mobile links emit route intent for direct tabs and sheet destinations', () => {
+  const emit = spyOn(userIntentLogger, 'emit').mockResolvedValue({ ok: true });
+  try {
+    mount();
+    const chat = bottomNav().findAllByType('a').find((node) => node.props.href === '/chat')!;
+    act(() => chat.props.onClick({ currentTarget: { nodeName: 'A' }, defaultPrevented: false, preventDefault() {} }));
+    expect(emit).toHaveBeenCalledWith({
+      surface: 'pwa',
+      intent: { layer: 'navigation', kind: 'pwa.navigation.bottom_tab_open', target: { kind: 'route', id: '/chat' } },
+      surface_state: { route: '/chat' },
+    });
+
+    const sheet = open('만들기');
+    const term = sheet.findAllByType('a').find((node) => node.props.href === '/term')!;
+    act(() => term.props.onClick({ currentTarget: { nodeName: 'A' }, defaultPrevented: false, preventDefault() {} }));
+    expect(emit).toHaveBeenCalledWith({
+      surface: 'pwa',
+      intent: { layer: 'navigation', kind: 'pwa.navigation.bottom_tab_open', target: { kind: 'route', id: '/term' } },
+      surface_state: { route: '/chat' },
+    });
+  } finally {
+    emit.mockRestore();
+  }
+});
+
+test('compact AppShell reserves space for retained tabs and more, wide shell has no bottom tabs or spacing', () => {
   const config = { baseUrl: '', token: '', provider: '' };
   const daemon = { config, client: new DaemonClient(config), sessionId: 's', setSessionId() {}, setConfig() {} };
   mount(createElement(DaemonContext.Provider, { value: daemon }, createElement(ThemeProvider, null,
     createElement(AppShell, { activity: { kind: 'quiet' }, children: createElement('p', null, 'body') }))));
-  expect(bottomNav().findAllByType('button').map((node) => node.props['aria-label'])).toEqual(['오늘', '일', '만들기', '더보기']);
-  expect(bottomNav().findAllByType('a').map((node) => [node.props['aria-label'], node.props.href])).toContainEqual(['대화', '/chat']);
+  expect(bottomNav().findAllByType('button').map((node) => node.props['aria-label'])).toEqual(['만들기', '더보기']);
+  expect(bottomNav().findAllByType('a').map((node) => [node.props['aria-label'], node.props.href])).toEqual([['대화', '/chat'], ['실행', '/live-run']]);
   expect(bottomNav().props.className).toContain('h-[calc(3.5rem+env(safe-area-inset-bottom))]');
   expect(bottomNav().props.className).toContain('pb-[env(safe-area-inset-bottom)]');
   expect(bottomNav().findByType('div').props.className).toContain('h-full');
   expect(bottomNav().findAllByType('button').every((node) => node.props.className.includes('text-xs'))).toBe(true);
-  expect(bottomNav().findAllByType('span').map((node) => node.children.join(''))).toEqual(['오늘', '대화', '일', '만들기', '더보기']);
-  expect(bottomNav().findAllByType('svg')).toHaveLength(5);
+  expect(bottomNav().findAllByType('span').map((node) => node.children.join(''))).toEqual(['대화', '실행', '만들기', '더보기']);
+  expect(bottomNav().findAllByType('svg')).toHaveLength(4);
   const main = tree!.root.findByType('main');
   expect(main.props.className).toBe('flex-1 overflow-auto min-w-0');
   width = COMPACT_MAX_WIDTH + 1;
@@ -97,33 +123,30 @@ test('compact AppShell reserves space for four tabs and more, wide shell has no 
   expect(tree!.root.findByType('main').props.className).toBe('flex-1 overflow-auto min-w-0');
 });
 
-test('active group follows direct, nested and activeAlso routes, including more', () => {
-  pathname = '/outputs';
+test('active group follows retained direct and nested routes, including more', () => {
+  pathname = '/live-run/adaptive';
   mount();
-  expect(bottomNav().findByProps({ 'aria-label': '일' }).props.className).toContain('text-primary');
+  expect(bottomNav().findByProps({ 'aria-label': '실행' }).props.className).toContain('text-primary');
   act(() => tree!.unmount());
-  pathname = '/settings/devices';
+  pathname = '/settings';
   mount();
   expect(bottomNav().findByProps({ 'aria-label': '더보기' }).props.className).toContain('text-primary');
-  expect(bottomNav().findByProps({ 'aria-label': '일' }).props.className).not.toContain('text-primary');
+  expect(bottomNav().findByProps({ 'aria-label': '실행' }).props.className).not.toContain('text-primary');
 });
 
-test('today tab opens its remaining destinations; more groups files and settings, operator alone adds ops', () => {
+test('retained more sheet groups files and settings without retired operations routes', () => {
   mount();
-  const today = open('오늘');
-  expect(today.findAllByType('a').map((node) => node.props.href)).toEqual(['/today', '/intake']);
-  act(() => today.findByProps({ 'aria-label': '메뉴 닫기', className: 'rounded-md p-2' }).props.onClick());
   const more = open('더보기');
   expect(more.findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['자료', '설정']);
   expect(more.findAllByType('a').map((node) => node.props.href)).toContain('/settings');
-  expect(more.findAllByType('h2').map((node) => node.children.join(''))).toEqual(['자료']);
+  expect(more.findAllByType('h2')).toHaveLength(0);
   expect(more.findAllByType('a').map((node) => node.props.href)).not.toContain('/ops/release');
   act(() => tree!.unmount());
   operator = true;
   mount();
-  expect(open('더보기').findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['운영🔒', '자료', '설정']);
+  expect(open('더보기').findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['자료', '설정']);
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).not.toContain('/ops/release');
-  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/loops');
+  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toContain('/vault');
   const operatorHrefs = tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href);
   expect(operatorHrefs).not.toContain('/ops/checklist');
   expect(operatorHrefs).not.toContain('/ceo');
@@ -134,23 +157,21 @@ test('single visible item navigates directly without a sheet, and role/Labs hide
   mount();
   const nav = bottomNav();
   expect(nav.findAllByType('a').map((node) => node.props.href)).toContain('/chat');
-  // NAV2c (#23048): the general user's «오늘» group holds only /today → a direct link, no sheet
-  expect(nav.findAllByType('a').find((node) => node.props['aria-label'] === '오늘')?.props.href).toBe('/today');
-  expect(nav.findAllByType('a').find((node) => node.props['aria-label'] === '일')?.props.href).toBe('/live');
+  expect(nav.findAllByType('a').map((node) => node.props.href)).not.toContain('/live-run');
   expect(tree!.root.findAllByProps({ role: 'dialog' })).toHaveLength(0);
   // EDITOR-NAV-PUBLIC: 만들기 = 터미널 ⊕ 편집기 — 둘이라 시트로 연다(역할을 안 고른 기기에도 편집기가 보인다).
   expect(open('만들기').findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor']);
   act(() => tree!.root.findByProps({ 'aria-label': '메뉴 닫기', className: 'rounded-md p-2' }).props.onClick());
   const more = open('더보기');
-  expect(more.findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['자료', '설정']);
+  expect(more.findAllByType('section').map((node) => node.props['aria-label'])).toEqual(['설정']);
   expect(more.findAllByType('a').map((node) => node.props.href)).toContain('/settings');
   expect(more.findAllByType('a').map((node) => node.props.href)).not.toContain('/ops/release');
   act(() => tree!.unmount());
   store.set(PWA_ROLE_KEY, 'owner');
   mount();
-  expect(open('만들기').findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor']);
+  expect(open('만들기').findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/apps', '/design-check']);
   act(() => { store.set(NAV_SHOW_LABS_KEY, '1'); window.dispatchEvent(new Event(NAV_PREFS_EVENT)); });
-  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/workspace', '/showroom']);
+  expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).toEqual(['/term', '/editor', '/apps', '/design-check']);
   act(() => { store.set(NAV_SHOW_HIDDEN_KEY, '1'); window.dispatchEvent(new Event(NAV_PREFS_EVENT)); });
   expect(tree!.root.findByProps({ role: 'dialog' }).findAllByType('a').map((node) => node.props.href)).not.toContain('/control');
   act(() => tree!.root.findByProps({ role: 'dialog' }).findByProps({ 'aria-label': '메뉴 닫기', className: 'rounded-md p-2' }).props.onClick());

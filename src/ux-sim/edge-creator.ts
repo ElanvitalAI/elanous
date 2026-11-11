@@ -1,12 +1,13 @@
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gateEnvFingerprint } from '../../scripts/release-loop/gate-baseline-receipt.js';
 import { gateFileReceiptKey, gateFileReceiptKeyFromClosureDigest, planGateFileReceipts, type GateFileReceipt, type GateFileReceiptIdentity } from '../../scripts/release-loop/gate-file-receipts.js';
 import { judgeGate, writeGateVerdictRecord, type GateRunner } from '../../scripts/release-loop/gate-node.js';
 import { releaseResumeGateExecutor } from '../../scripts/release-loop/resume.js';
+import { HARNESS_CORE_KINDS } from '../graph-kinds/registry.js';
 import { runGraph, type GraphRunState } from '../graph-runner/runner.js';
 import type { InProcessHandlerRegistry, InProcessHandlerResult } from '../graph-runner/in-process-registry.js';
 
@@ -42,9 +43,27 @@ interface EdgeCreatorAppendProposal {
   edges?: Array<{ from: string; on?: string; map?: unknown }>;
 }
 
-export const EDGE_CREATOR_NODE_VISIT_LIMITS = { source: 1, resume: 2, done: 1, failed: 1, repair: 1 } as const;
+export const EDGE_CREATOR_NODE_VISIT_LIMITS = { source: 1, resume: 2, done: 1, failed: 1, repair: 2 } as const;
 // E6 invokes the real CLI in a test child; bound the subprocess using the recorded PR test budget.
-const EDGE_CREATOR_CHILD_TIMEOUT_MS = 10_000; // 출처: #35989 E6 subprocess bound
+export const EDGE_CREATOR_CHILD_TIMEOUT_MS = 10_000; // 출처: #35989 E6 subprocess bound
+
+export interface EdgeCreatorNodeResumeCase {
+  readonly id: string;
+  readonly nodeKind: typeof HARNESS_CORE_KINDS[number];
+  readonly interruption: 'mid-node' | 'before-join' | 'after-completed-node';
+  readonly resumeRunId: 'same';
+  readonly regression: '#36417' | 'completed-node-resume' | null;
+}
+
+/** Every harness kind gets an interrupted-in-node, same-run resume edge; regression cases stay pinned. */
+export function generateEdgeCreatorNodeResumeCases(): readonly EdgeCreatorNodeResumeCase[] {
+  return [
+    ...HARNESS_CORE_KINDS.map((nodeKind) => ({ id: `resume-${nodeKind}`, nodeKind,
+      interruption: 'mid-node' as const, resumeRunId: 'same' as const, regression: null })),
+    { id: 'resume-before-join-36417', nodeKind: 'gate', interruption: 'before-join', resumeRunId: 'same', regression: '#36417' },
+    { id: 'resume-after-completed-node', nodeKind: 'agent', interruption: 'after-completed-node', resumeRunId: 'same', regression: 'completed-node-resume' },
+  ];
+}
 
 const EDGE_CREATOR_AXES = {
   outcome: ['ok', 'fail', 'timeout', 'unmeasured'],
@@ -56,6 +75,8 @@ const EDGE_CREATOR_AXES = {
 export interface EdgeCreatorSeed {
   readonly incidentId: `E${number}`;
   readonly summary: string;
+  readonly touches: readonly string[];
+  readonly severity: 'S0' | 'S1' | 'S2';
   readonly axes: {
     readonly outcome: typeof EDGE_CREATOR_AXES.outcome[number];
     readonly interruption: typeof EDGE_CREATOR_AXES.interruption[number];
@@ -67,32 +88,97 @@ export interface EdgeCreatorSeed {
 
 /** Transcribed from the 2026-11-08 0.3.7 eight-event list in the SIM-EDGE-CREATOR checklist evidence. */
 export const EDGE_CREATOR_INCIDENT_SEEDS: readonly EdgeCreatorSeed[] = [
-  { incidentId: 'E1', summary: 'partial gate overwrote the previous completed receipt', axes: { outcome: 'timeout', interruption: 'receipt', mutation: 'receipt', environment: 'partial-shards' }, invariant: 'completed-receipts-survive-interruption' },
-  { incidentId: 'E2', summary: 'source image digest invalidated every appended receipt', axes: { outcome: 'unmeasured', interruption: 'append', mutation: 'image-pin', environment: 'image-drift' }, invariant: 'invalidate-only-source-affected-receipts' },
-  { incidentId: 'E3', summary: 'one node execution override expanded to the whole run', axes: { outcome: 'unmeasured', interruption: 'node', mutation: 'none', environment: 'same-host' }, invariant: 'node-scope-does-not-expand-run-scope' },
-  { incidentId: 'E4', summary: 'a failed gate omitted baseline receipts for passing shards', axes: { outcome: 'fail', interruption: 'receipt', mutation: 'receipt', environment: 'partial-shards' }, invariant: 'passing-shard-receipts-survive-peer-failure' },
-  { incidentId: 'E5', summary: 'dynamic repair append resumed in the same run', axes: { outcome: 'timeout', interruption: 'append', mutation: 'append', environment: 'same-host' }, invariant: 'same-run-resume-is-equivalent-and-idempotent' },
-  { incidentId: 'E6', summary: 'standalone gate lacked the cut image pin context', axes: { outcome: 'unmeasured', interruption: 'resume', mutation: 'image-pin', environment: 'image-drift' }, invariant: 'missing-cut-pin-refuses-standalone-gate' },
-  { incidentId: 'E7', summary: 'review waiver stores disagreed and rejected the review', axes: { outcome: 'fail', interruption: 'resume', mutation: 'receipt', environment: 'remote-user-missing' }, invariant: 'waiver-store-mismatch-fails-closed' },
-  { incidentId: 'E8', summary: 'train wrapper masked a build failure as success', axes: { outcome: 'fail', interruption: 'node', mutation: 'none', environment: 'remote-user-missing' }, invariant: 'child-failure-exit-code-is-preserved' },
+  { incidentId: 'E1', summary: 'partial gate overwrote the previous completed receipt', touches: ['scripts/release-loop/gate-node.ts', 'src/ux-sim/edge-creator.ts', 'src/ux-sim/edge-creator-nightly.ts'], severity: 'S2', axes: { outcome: 'timeout', interruption: 'receipt', mutation: 'receipt', environment: 'partial-shards' }, invariant: 'completed-receipts-survive-interruption' },
+  { incidentId: 'E2', summary: 'source image digest invalidated every appended receipt', touches: ['scripts/release-loop/gate-file-receipts.ts', 'src/ux-sim/edge-creator.ts', 'src/ux-sim/edge-creator-nightly.ts'], severity: 'S2', axes: { outcome: 'unmeasured', interruption: 'append', mutation: 'image-pin', environment: 'image-drift' }, invariant: 'invalidate-only-source-affected-receipts' },
+  { incidentId: 'E3', summary: 'one node execution override expanded to the whole run', touches: ['scripts/release-loop/resume.ts', 'src/ux-sim/edge-creator.ts', 'src/ux-sim/edge-creator-nightly.ts'], severity: 'S1', axes: { outcome: 'unmeasured', interruption: 'node', mutation: 'none', environment: 'same-host' }, invariant: 'node-scope-does-not-expand-run-scope' },
+  { incidentId: 'E4', summary: 'a failed gate omitted baseline receipts for passing shards', touches: ['scripts/release-loop/gate-node.ts', 'scripts/release-loop/gate-file-receipts.ts', 'src/ux-sim/edge-creator.ts', 'src/ux-sim/edge-creator-nightly.ts'], severity: 'S2', axes: { outcome: 'fail', interruption: 'receipt', mutation: 'receipt', environment: 'partial-shards' }, invariant: 'passing-shard-receipts-survive-peer-failure' },
+  { incidentId: 'E5', summary: 'dynamic repair append resumed in the same run', touches: ['src/graph-runner/runner.ts', 'src/ux-sim/edge-creator.ts', 'src/ux-sim/edge-creator-nightly.ts'], severity: 'S1', axes: { outcome: 'timeout', interruption: 'append', mutation: 'append', environment: 'same-host' }, invariant: 'same-run-resume-is-equivalent-and-idempotent' },
+  { incidentId: 'E6', summary: 'standalone gate lacked the cut image pin context', touches: ['scripts/release-loop/gate-node-cli.ts', 'src/ux-sim/edge-creator.ts', 'src/ux-sim/edge-creator-nightly.ts'], severity: 'S1', axes: { outcome: 'unmeasured', interruption: 'resume', mutation: 'image-pin', environment: 'image-drift' }, invariant: 'missing-cut-pin-refuses-standalone-gate' },
+  { incidentId: 'E7', summary: 'review waiver stores disagreed and rejected the review', touches: ['scripts/release-loop/op-waiver.ts', 'src/ux-sim/edge-creator.ts', 'src/ux-sim/edge-creator-nightly.ts'], severity: 'S1', axes: { outcome: 'fail', interruption: 'resume', mutation: 'receipt', environment: 'remote-user-missing' }, invariant: 'waiver-store-mismatch-fails-closed' },
+  { incidentId: 'E8', summary: 'train wrapper masked a build failure as success', touches: ['scripts/release-loop/train-manager.ts', 'src/ux-sim/edge-creator.ts', 'src/ux-sim/edge-creator-nightly.ts'], severity: 'S0', axes: { outcome: 'fail', interruption: 'node', mutation: 'none', environment: 'remote-user-missing' }, invariant: 'child-failure-exit-code-is-preserved' },
 ];
 
 export interface EdgeCreatorPlan {
+  readonly nodeResumeCases: readonly EdgeCreatorNodeResumeCase[];
   readonly scenarios: readonly {
     readonly id: string;
+    readonly scenarioHash: string;
     readonly axes: EdgeCreatorSeed['axes'];
     readonly incidentIds: readonly string[];
     readonly incidentSummaries: readonly string[];
     readonly invariants: readonly string[];
+    readonly touches: readonly string[];
+    readonly riskScore: number;
+    readonly disposition: 'run' | 'receipt-reuse' | 'dormant';
   }[];
   readonly incidentCount: number;
   readonly coveredIncidentIds: readonly string[];
+  readonly requiredIncidentIds: readonly string[];
   readonly requiredPairCount: number;
   readonly coveredPairCount: number;
+  readonly suppressedPairCount: number;
+  readonly skippedReceiptCount: number;
+  readonly dormantScenarioCount: number;
+  readonly deduplicatedScenarioCount: number;
 }
 
-/** Greedily generates a bounded pairwise plan, then pins every recorded incident tuple into it. */
-export function generateEdgeCreatorPlan(seeds: readonly EdgeCreatorSeed[] = EDGE_CREATOR_INCIDENT_SEEDS): EdgeCreatorPlan {
+export interface EdgeCreatorPlanOptions {
+  readonly changedTouches?: readonly string[];
+  readonly touchesByPair?: Readonly<Record<string, readonly string[]>>;
+  readonly incidentHistory?: Readonly<Record<string, number>>;
+  readonly maxScenarios?: number;
+  readonly head?: string;
+  readonly priorReceipts?: readonly { readonly head: string; readonly scenarioHash: string; readonly status: 'green' | 'red' }[];
+  readonly greenStreakByHash?: Readonly<Record<string, number>>;
+  /** Omit until first-week data establishes N. */
+  readonly dormantAfterGreenRuns?: number;
+  readonly newPairs?: readonly string[];
+  readonly traceByTuple?: Readonly<Record<string, EdgeCreatorScenarioTrace>>;
+}
+
+export interface EdgeCreatorScenarioTrace {
+  readonly nodeExitSequence: readonly string[];
+  readonly stateWrites: readonly string[];
+  readonly environment: string;
+  readonly invariantObservations: Readonly<Record<string, unknown>>;
+  readonly externalEffects: readonly string[];
+}
+
+/** Fingerprint includes environment and invariant observations so distinct semantic classes stay distinct. */
+export function edgeCreatorScenarioHash(input: {
+  axes: EdgeCreatorSeed['axes']; incidentIds?: readonly string[]; invariants?: readonly string[]; trace?: EdgeCreatorScenarioTrace;
+}): string {
+  const trace = input.trace;
+  const value = trace ? {
+    nodeExitSequence: trace.nodeExitSequence, stateWrites: trace.stateWrites, environment: trace.environment,
+    invariantObservations: sortEdgeCreatorJson(trace.invariantObservations), externalEffects: trace.externalEffects,
+    environmentAxis: input.axes.environment, incidentIds: [...(input.incidentIds ?? [])].sort(),
+    invariants: [...(input.invariants ?? [])].sort(),
+  } : { axes: input.axes, incidentIds: [...(input.incidentIds ?? [])].sort(), invariants: [...(input.invariants ?? [])].sort() };
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function sortEdgeCreatorJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortEdgeCreatorJson);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, child]) => [key, sortEdgeCreatorJson(child)]));
+}
+
+export function edgeCreatorTupleKey(axes: EdgeCreatorSeed['axes']): string {
+  return (Object.keys(EDGE_CREATOR_AXES) as (keyof EdgeCreatorSeed['axes'])[]).map((axis) => axes[axis]).join('|');
+}
+
+/** A registered directory touch covers a changed file below that directory. */
+export function edgeCreatorTouchMatchesPath(touch: string, changedPath: string): boolean {
+  return changedPath === touch || changedPath.startsWith(`${touch}/`);
+}
+
+/** Covers only registered in-radius pairs; candidates are derived from pairs, not the full Cartesian product. */
+export function generateEdgeCreatorPlan(
+  seeds: readonly EdgeCreatorSeed[] = EDGE_CREATOR_INCIDENT_SEEDS,
+  options: EdgeCreatorPlanOptions = {},
+): EdgeCreatorPlan {
   const incidentIds = new Set<string>();
   for (const seed of seeds) {
     if (incidentIds.has(seed.incidentId)) throw new Error(`duplicate edge incident seed: ${seed.incidentId}`);
@@ -100,25 +186,50 @@ export function generateEdgeCreatorPlan(seeds: readonly EdgeCreatorSeed[] = EDGE
     if (!seed.summary.trim() || !seed.invariant.trim()) throw new Error(`edge incident seed needs summary and invariant: ${seed.incidentId}`);
   }
   const axisNames = Object.keys(EDGE_CREATOR_AXES) as (keyof EdgeCreatorSeed['axes'])[];
-  const tupleKey = (axes: EdgeCreatorSeed['axes']) => axisNames.map((axis) => axes[axis]).join('|');
+  const tupleKey = edgeCreatorTupleKey;
   const pairKeys = (axes: EdgeCreatorSeed['axes']): string[] => axisNames.flatMap((left, index) =>
     axisNames.slice(index + 1).map((right) => `${left}:${axes[left]}|${right}:${axes[right]}`));
-  const candidates: EdgeCreatorSeed['axes'][] = [];
-  for (const outcome of EDGE_CREATOR_AXES.outcome) for (const interruption of EDGE_CREATOR_AXES.interruption)
-    for (const mutation of EDGE_CREATOR_AXES.mutation) for (const environment of EDGE_CREATOR_AXES.environment)
-      candidates.push({ outcome, interruption, mutation, environment });
-
   const requiredPairs = new Set<string>();
+  const touchesByPair = options.touchesByPair ?? Object.fromEntries([...new Set(seeds.flatMap((seed) => pairKeys(seed.axes)))].map((pair) => [pair,
+    [...new Set(seeds.filter((seed) => pairKeys(seed.axes).includes(pair)).flatMap((seed) => seed.touches))].sort()]));
   for (let i = 0; i < axisNames.length; i++) for (let j = i + 1; j < axisNames.length; j++) {
     const left = axisNames[i]!;
     const right = axisNames[j]!;
-    for (const leftValue of EDGE_CREATOR_AXES[left]) for (const rightValue of EDGE_CREATOR_AXES[right])
-      requiredPairs.add(`${left}:${leftValue}|${right}:${rightValue}`);
+    for (const leftValue of EDGE_CREATOR_AXES[left]) for (const rightValue of EDGE_CREATOR_AXES[right]) {
+      const key = `${left}:${leftValue}|${right}:${rightValue}`;
+      const touches = touchesByPair[key] ?? [];
+      if (Object.prototype.hasOwnProperty.call(touchesByPair, key)
+        && (options.changedTouches === undefined || touches.some((touch) => options.changedTouches!
+          .some((changedPath) => edgeCreatorTouchMatchesPath(touch, changedPath)))) ) requiredPairs.add(key);
+    }
   }
+  if (options.maxScenarios !== undefined && (!Number.isSafeInteger(options.maxScenarios) || options.maxScenarios < 0))
+    throw new Error('maxScenarios must be a non-negative safe integer');
+  if (options.dormantAfterGreenRuns !== undefined && (!Number.isSafeInteger(options.dormantAfterGreenRuns) || options.dormantAfterGreenRuns < 1))
+    throw new Error('dormantAfterGreenRuns must be a positive safe integer');
+  if (Object.values(options.incidentHistory ?? {}).some((count) => !Number.isSafeInteger(count) || count < 0))
+    throw new Error('incident history counts must be non-negative safe integers');
+  if (Object.values(options.greenStreakByHash ?? {}).some((count) => !Number.isSafeInteger(count) || count < 0))
+    throw new Error('GREEN streak counts must be non-negative safe integers');
   const uncovered = new Set(requiredPairs);
   const selected = new Map<string, EdgeCreatorSeed['axes']>();
-  while (uncovered.size > 0) {
-    const ranked = candidates.map((axes) => ({ axes, key: tupleKey(axes), score: pairKeys(axes).filter((key) => uncovered.has(key)).length }))
+  const candidates = new Map<string, EdgeCreatorSeed['axes']>();
+  const addCandidate = (axes: EdgeCreatorSeed['axes']) => candidates.set(tupleKey(axes), axes);
+  for (const seed of seeds) if (pairKeys(seed.axes).some((key) => requiredPairs.has(key))) addCandidate(seed.axes);
+  const firstValue = Object.fromEntries(axisNames.map((axis) => [axis, EDGE_CREATOR_AXES[axis][0]])) as EdgeCreatorSeed['axes'];
+  for (let i = 0; i < axisNames.length; i++) for (let j = i + 1; j < axisNames.length; j++) {
+    const left = axisNames[i]!;
+    const right = axisNames[j]!;
+    for (const leftValue of EDGE_CREATOR_AXES[left]) for (const rightValue of EDGE_CREATOR_AXES[right]) {
+      const pair = `${left}:${leftValue}|${right}:${rightValue}`;
+      if (!requiredPairs.has(pair)) continue;
+      const axes = { ...firstValue, [left]: leftValue, [right]: rightValue } as EdgeCreatorSeed['axes'];
+      addCandidate(axes);
+    }
+  }
+  while (uncovered.size > 0 && selected.size < (options.maxScenarios ?? Number.MAX_SAFE_INTEGER)) {
+    const ranked = [...candidates.entries()].map(([key, axes]) => ({ axes, key,
+      score: pairKeys(axes).filter((pair) => uncovered.has(pair)).reduce((sum, pair) => sum + 1 + Math.max(0, options.incidentHistory?.[pair] ?? 0), 0) }))
       .filter((candidate) => candidate.score > 0)
       .sort((a, b) => b.score - a.score || a.key.localeCompare(b.key));
     const best = ranked[0];
@@ -126,17 +237,73 @@ export function generateEdgeCreatorPlan(seeds: readonly EdgeCreatorSeed[] = EDGE
     selected.set(best.key, best.axes);
     for (const pair of pairKeys(best.axes)) uncovered.delete(pair);
   }
+  // Recorded incidents remain pinned unless an explicit cap prevents inclusion.
+  for (const seed of seeds) {
+    const key = tupleKey(seed.axes);
+    if (selected.has(key) || !pairKeys(seed.axes).some((pair) => requiredPairs.has(pair))) continue;
+    if (selected.size >= (options.maxScenarios ?? Number.MAX_SAFE_INTEGER)) break;
+    selected.set(key, seed.axes);
+    for (const pair of pairKeys(seed.axes)) uncovered.delete(pair);
+  }
 
-  for (const seed of seeds) selected.set(tupleKey(seed.axes), seed.axes);
+  const receiptHashes = new Set((options.priorReceipts ?? []).filter((receipt) => receipt.status === 'green' && receipt.head === options.head)
+    .map((receipt) => receipt.scenarioHash));
   const scenarios = [...selected.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, axes], index) => {
     const matching = seeds.filter((seed) => tupleKey(seed.axes) === key);
-    return { id: `edge-case-${String(index + 1).padStart(2, '0')}`, axes,
+    const incidentIds = matching.map((seed) => seed.incidentId);
+    const invariants = matching.map((seed) => seed.invariant);
+    const scenarioHash = edgeCreatorScenarioHash({ axes, incidentIds, invariants, trace: options.traceByTuple?.[key] });
+    const touches = [...new Set(pairKeys(axes).flatMap((pair) => touchesByPair[pair] ?? []))].sort();
+    const reactivated = (options.changedTouches !== undefined && touches.some((touch) => options.changedTouches!
+      .some((changedPath) => edgeCreatorTouchMatchesPath(touch, changedPath))))
+      || pairKeys(axes).some((pair) => options.newPairs?.includes(pair))
+      || pairKeys(axes).some((pair) => (options.incidentHistory?.[pair] ?? 0) > 0);
+    const greenStreak = options.greenStreakByHash?.[scenarioHash] ?? 0;
+    const isDormant = options.dormantAfterGreenRuns !== undefined && greenStreak >= options.dormantAfterGreenRuns && !reactivated;
+    return { id: `edge-case-${String(index + 1).padStart(2, '0')}`, scenarioHash, axes,
       incidentIds: matching.map((seed) => seed.incidentId), incidentSummaries: matching.map((seed) => seed.summary),
-      invariants: matching.map((seed) => seed.invariant) };
+      invariants, touches, riskScore: pairKeys(axes).reduce((sum, pair) => sum + (options.incidentHistory?.[pair] ?? 0), 0),
+      disposition: isDormant ? 'dormant' as const : receiptHashes.has(scenarioHash) ? 'receipt-reuse' as const : 'run' as const };
   });
-  const coveredIncidentIds = scenarios.flatMap((scenario) => scenario.incidentIds).sort();
-  return { scenarios, incidentCount: seeds.length, coveredIncidentIds,
-    requiredPairCount: requiredPairs.size, coveredPairCount: requiredPairs.size - uncovered.size };
+  const equivalenceClasses = new Map<string, (typeof scenarios)[number]>();
+  for (const scenario of scenarios) {
+    const prior = equivalenceClasses.get(scenario.scenarioHash);
+    equivalenceClasses.set(scenario.scenarioHash, prior ? { ...prior,
+      touches: [...new Set([...prior.touches, ...scenario.touches])].sort(), riskScore: Math.max(prior.riskScore, scenario.riskScore) } : scenario);
+  }
+  const distinctScenarios = [...equivalenceClasses.values()];
+  const coveredIncidentIds = distinctScenarios.flatMap((scenario) => scenario.incidentIds).sort();
+  const requiredIncidentIds = seeds.filter((seed) => pairKeys(seed.axes).some((pair) => requiredPairs.has(pair)));
+  const matchingRequiredIncidentIds = [...new Set(requiredIncidentIds.map((seed) => seed.incidentId))].sort();
+  return { nodeResumeCases: generateEdgeCreatorNodeResumeCases(), scenarios: distinctScenarios, incidentCount: seeds.length, coveredIncidentIds,
+    requiredIncidentIds: matchingRequiredIncidentIds,
+    requiredPairCount: requiredPairs.size, coveredPairCount: requiredPairs.size - uncovered.size,
+    suppressedPairCount: axisNames.reduce((sum, left, index) => sum + axisNames.slice(index + 1)
+      .reduce((count, right) => count + EDGE_CREATOR_AXES[left].length * EDGE_CREATOR_AXES[right].length, 0), 0) - requiredPairs.size,
+    skippedReceiptCount: distinctScenarios.filter((scenario) => scenario.disposition === 'receipt-reuse').length,
+    dormantScenarioCount: distinctScenarios.filter((scenario) => scenario.disposition === 'dormant').length,
+    deduplicatedScenarioCount: scenarios.length - distinctScenarios.length };
+}
+
+export interface EdgeCreatorPromotionEvidence {
+  readonly clusterId: string;
+  readonly scenarioResults: readonly { readonly scenarioHash: string; readonly verdict: 'green' | 'red' }[];
+  readonly changedPaths: readonly string[];
+  readonly clusterPaths: readonly string[];
+  readonly mutationRevertedVerdict: 'green' | 'red' | 'unmeasured';
+  readonly implementedBy: string;
+  readonly judgedBy: string;
+}
+
+/** Promotion collapses RED evidence to one minimal cause cluster and fails closed on missing proof. */
+export function evaluateEdgeCreatorPromotion(evidence: EdgeCreatorPromotionEvidence): { promotable: boolean; reasons: readonly string[]; paths: readonly string[] } {
+  const reasons: string[] = [];
+  if (!evidence.clusterId.trim()) reasons.push('missing-cluster-id');
+  if (!evidence.scenarioResults.length || evidence.scenarioResults.some((item) => item.verdict !== 'green')) reasons.push('cluster-simulation-not-green');
+  if (!evidence.changedPaths.length || !evidence.clusterPaths.length || evidence.changedPaths.some((path) => !evidence.clusterPaths.includes(path))) reasons.push('change-radius-not-minimal');
+  if (evidence.mutationRevertedVerdict !== 'red') reasons.push('mutation-did-not-reproduce-red');
+  if (!evidence.implementedBy || !evidence.judgedBy || evidence.implementedBy === evidence.judgedBy) reasons.push('implementation-and-judge-not-independent');
+  return { promotable: reasons.length === 0, reasons, paths: [...new Set(evidence.changedPaths)].sort() };
 }
 
 export function isExpectedEdgeCreatorAppend(value: unknown): boolean {
@@ -171,6 +338,7 @@ function isCompletedSourceReceipt(value: unknown): boolean {
 
 export interface EdgeCreatorE5Result {
   readonly runId: string;
+  readonly scenarioAxes?: EdgeCreatorSeed['axes'];
   readonly verdict: 'green' | 'red';
   readonly invariantViolations: readonly string[];
   readonly interruptedStatus: string;
@@ -193,15 +361,20 @@ export interface EdgeCreatorE5Result {
 
 export interface EdgeCreatorM2Result {
   readonly runId: string;
+  readonly scenarioHash?: string;
+  readonly scenarioAxes?: EdgeCreatorSeed['axes'];
   readonly status: string;
   readonly executedIncidentIds: readonly string[];
   readonly invariantEvidence: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
 }
 
 /** Execute the remaining receipt, scope, and cut-pin seeds through the production graph runner. */
-export async function runEdgeCreatorM2Simulation(seeds: readonly EdgeCreatorSeed[] = EDGE_CREATOR_INCIDENT_SEEDS): Promise<EdgeCreatorM2Result> {
+export async function runEdgeCreatorM2Simulation(seeds: readonly EdgeCreatorSeed[] = EDGE_CREATOR_INCIDENT_SEEDS,
+  scenario?: { axes: EdgeCreatorSeed['axes']; scenarioHash: string }): Promise<EdgeCreatorM2Result> {
   const root = mkdtempSync(join(tmpdir(), 'edge-creator-m2-'));
-  const runId = 'edge-creator-m2-production-helpers';
+  const selectedAxes = scenario?.axes;
+  const selectedScenarioSeeds = selectedAxes ? seeds.map((seed) => ({ ...seed, axes: selectedAxes })) : seeds;
+  const runId = `edge-creator-m2-production-helpers${scenario ? `-${scenario.scenarioHash.slice(0, 12)}` : ''}`;
   const executedIncidentIds: string[] = [];
   const invariantEvidence: Record<string, Record<string, unknown>> = {};
   const graphPath = join(root, 'edge-m2.yaml');
@@ -213,7 +386,7 @@ export async function runEdgeCreatorM2Simulation(seeds: readonly EdgeCreatorSeed
     'missing-cut-pin-refuses-standalone-gate': 'e6',
   } as const;
   type M2Invariant = keyof typeof scenarioByInvariant;
-  const selectedSeeds = seeds.filter((seed): seed is EdgeCreatorSeed & { invariant: M2Invariant } =>
+  const selectedSeeds = selectedScenarioSeeds.filter((seed): seed is EdgeCreatorSeed & { invariant: M2Invariant } =>
     Object.hasOwn(scenarioByInvariant, seed.invariant));
   const seedByInvariant = new Map(selectedSeeds.map((seed) => [seed.invariant, seed]));
   const done = (invariant: M2Invariant, passed: boolean, evidence: Record<string, unknown>): InProcessHandlerResult => {
@@ -388,13 +561,38 @@ export async function runEdgeCreatorM2Simulation(seeds: readonly EdgeCreatorSeed
     writeFileSync(graphPath, lines.join('\n'));
     writeFileSync(join(root, 'recipes.yaml'), '{}\n');
     const result = await runGraph(graphPath, { runId, quiet: true, deps: { root, inProcessHandlers: handlers } });
-    return { runId: result.runId, status: result.status, executedIncidentIds, invariantEvidence };
+    return { runId: result.runId, ...(scenario ? { scenarioHash: scenario.scenarioHash, scenarioAxes: scenario.axes } : {}),
+      status: result.status, executedIncidentIds, invariantEvidence };
   } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
+let edgeE5Queue: Promise<void> = Promise.resolve();
+
 /** Runs E5 through the production graph runner; each restart is a separate, timeout-bounded process. */
-export async function runEdgeCreatorE5Simulation(): Promise<EdgeCreatorE5Result> {
-  const root = mkdtempSync(join(tmpdir(), 'edge-creator-e5-'));
+export async function runEdgeCreatorE5Simulation(scenario?: { axes: EdgeCreatorSeed['axes']; scenarioHash: string }): Promise<EdgeCreatorE5Result> {
+  const previous = edgeE5Queue;
+  let release!: () => void;
+  edgeE5Queue = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try { return await runEdgeCreatorE5SimulationUnlocked(scenario); }
+  finally { release(); }
+}
+
+async function runEdgeCreatorE5SimulationUnlocked(scenario?: { axes: EdgeCreatorSeed['axes']; scenarioHash: string }): Promise<EdgeCreatorE5Result> {
+  const supportedAxes = EDGE_CREATOR_INCIDENT_SEEDS.find((seed) => seed.incidentId === 'E5')!.axes;
+  if (scenario && JSON.stringify(scenario.axes) !== JSON.stringify(supportedAxes)) {
+    return { runId: `edge-e5-unsupported-${scenario.scenarioHash}`, scenarioAxes: scenario.axes, verdict: 'red',
+      invariantViolations: ['E5-axis-unsupported'], interruptedStatus: 'not-run', resumedStatus: 'not-run',
+      baselineTerminal: undefined, resumedTerminal: undefined, baselineStatus: 'not-run', baselineAppendCount: 0,
+      baselineRepairCalls: 0, appendCount: 0, sourceReceiptPreserved: false, sourceReceiptBefore: {}, sourceReceiptAfter: {},
+      repairCallsByIdempotencyKey: {}, effectsByIdempotencyKey: {}, runNodeExecutionCount: 0,
+      declaredRunNodeExecutionLimit: 0, perRunTimeoutMs: 0 };
+  }
+  const axes = scenario?.axes ?? supportedAxes;
+  const exercisesAppendInterruption = axes.interruption === 'append' && axes.mutation === 'append'
+    && axes.environment === 'same-host' && axes.outcome === 'timeout';
+  if (!exercisesAppendInterruption) throw new Error('E5 axis configuration did not select the append-resume interruption');
+  const root = mkdtempSync(join(tmpdir(), `edge-creator-e5${scenario ? `-${scenario.scenarioHash.slice(0, 12)}` : ''}-`));
   try {
     const graphPath = join(root, 'edge-e5.yaml');
     const ledgerPath = join(root, 'fake-effects.json');
@@ -414,11 +612,12 @@ export async function runEdgeCreatorE5Simulation(): Promise<EdgeCreatorE5Result>
       '  - { from: resume, on: outcome, map: { ok: done, fail: failed } }', '',
     ].join('\n'));
 
-    const runId = 'edge-e5-same-run';
+    const runId = `edge-e5-same-run${scenario ? `-${scenario.scenarioHash.slice(0, 12)}` : ''}-${randomUUID()}`;
     const timeoutMs = 10_000;
     const baselineRunId = 'edge-e5-baseline';
     const baselineResult = runInBoundedChild(root, graphPath, ledgerPath, baselineRunId, 'baseline', timeoutMs, runNodeExecutionLimit);
-    const interrupted = runInBoundedChild(root, graphPath, ledgerPath, runId, 'repair-interrupt', timeoutMs, runNodeExecutionLimit, 87);
+    const interrupted = runInBoundedChild(root, graphPath, ledgerPath, runId,
+      axes.outcome === 'timeout' && axes.interruption === 'append' ? 'repair-interrupt' : 'baseline', timeoutMs, runNodeExecutionLimit, 87);
     const savedAtRepair = interrupted.state;
     const sourceReceiptAtRepair = readSourceReceipt(savedAtRepair);
     const appendCount = savedAtRepair.subscriptionGraphAppends?.length ?? 0;
@@ -461,7 +660,7 @@ export async function runEdgeCreatorE5Simulation(): Promise<EdgeCreatorE5Result>
     if (resumedState.status !== 'done') invariantViolations.push('I1-resume-status');
     if (resumedState.status === 'budget-exceeded') invariantViolations.push('I3-resume-visit-bound');
     return {
-      runId, verdict: invariantViolations.length === 0 ? 'green' : 'red', invariantViolations,
+      runId, ...(scenario ? { scenarioAxes: scenario.axes } : {}), verdict: invariantViolations.length === 0 ? 'green' : 'red', invariantViolations,
       interruptedStatus: String(savedAtRepair.status),
       resumedStatus: String(resumedState.status), baselineTerminal, resumedTerminal, appendCount,
       baselineStatus: String(baselineResult.state.status), baselineAppendCount: baselineResult.state.subscriptionGraphAppends?.length ?? 0,

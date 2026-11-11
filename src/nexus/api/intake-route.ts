@@ -10,7 +10,7 @@ import {
 } from '../../intake-plane/front-route-rules.js';
 import { classifyFrontInput, type FrontClassifierDecision } from '../../intake-plane/front-classifier.js';
 import { classifyIntakeFrontRoute } from '../../intake-plane/front-route-classifier.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { jsonResponse } from './json-response.js';
 
 /** 8KB. 초과·빈 text 는 400. */

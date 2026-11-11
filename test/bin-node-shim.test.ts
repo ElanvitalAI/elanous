@@ -45,7 +45,7 @@ describe.skipIf(!node)('bin/elanous.cjs (npm entry)', () => {
   test('Bun 이 없으면 다른 명령은 설치 안내와 함께 실패한다(묻지 않는다 · 비대화)', () => {
     const r = spawnSync(node!, [SHIM, 'where'], { env: noBunEnv(), encoding: 'utf8' });
     expect(r.status).toBe(1);
-    expect(r.stderr).toContain('bun.sh/install');
+    expect(r.stderr).toContain('ELANOUS_INSTALL_YES=1');
     expect(r.stderr).not.toContain('[y/N]');
   });
 
@@ -62,14 +62,22 @@ describe.skipIf(!node)('bin/elanous.cjs (npm entry)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'r6-sig-'));
     const marker = join(dir, 'got-term');
     const fakeBun = join(dir, 'bun');
-    writeFileSync(fakeBun, `#!/bin/sh\ntrap 'echo term > "${marker}"; exit 143' TERM\necho ready\nwhile :; do sleep 0.1; done\n`);
+    writeFileSync(fakeBun, `#!${node}\nif (process.argv[2] === '--version') { console.log(${JSON.stringify(process.versions.bun)}); process.exit(0); }\nprocess.on('SIGTERM', () => { require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'term'); process.exit(143); });\nconsole.log('ready');\nsetInterval(() => {}, 1000);\n`);
     chmodSync(fakeBun, 0o755);
-    const child = spawn(node!, [SHIM, 'anything'], { env: { ...noBunEnv(), ELANOUS_BUN: fakeBun } });
-    await new Promise<void>((ok) => child.stdout!.on('data', (d) => { if (String(d).includes('ready')) ok(); }));
-    const exited = new Promise<number | null>((ok) => child.on('exit', (code, signal) => ok(code ?? (signal ? 128 : null))));
-    child.kill('SIGTERM');
-    const code = await Promise.race([exited, new Promise<null>((ok) => setTimeout(() => ok(null), 5000))]);
-    expect(code).not.toBeNull();
-    expect(existsSync(marker)).toBe(true);
+    const child = spawn(node!, [SHIM, 'anything'], { env: { ...noBunEnv(), ELANOUS_BUN: fakeBun, ELANOUS_NO_AUTO_DOCTOR: '1' } });
+    try {
+      await new Promise<void>((ok, fail) => {
+        child.once('error', fail);
+        child.once('exit', () => fail(new Error('Node launcher exited before fake Bun was ready')));
+        child.stdout!.on('data', (d) => { if (String(d).includes('ready')) ok(); });
+      });
+      const exited = new Promise<number | null>((ok) => child.on('exit', (code, signal) => ok(code ?? (signal ? 128 : null))));
+      child.kill('SIGTERM');
+      const code = await Promise.race([exited, new Promise<null>((ok) => setTimeout(() => ok(null), 5000))]);
+      expect(code).not.toBeNull();
+      expect(existsSync(marker)).toBe(true);
+    } finally {
+      child.kill('SIGKILL');
+    }
   }, 15_000);
 });

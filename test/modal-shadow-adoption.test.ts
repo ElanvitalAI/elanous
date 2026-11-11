@@ -13,7 +13,6 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import chalk from 'chalk';
 import {
   createModelPickerRecipe,
-  createShellRollupPopupRecipe,
 } from '../src/mouse-action-recipes.js';
 import type { PopupPlacement } from '../src/status/popups.js';
 import { buildContextMenuPopup } from '../src/ui/context-menu-host.js';
@@ -70,23 +69,7 @@ describe('mouse-action-recipes shadow passthrough', () => {
     expect(out).not.toContain('▓');
   });
 
-  test('createShellRollupPopupRecipe with shadow paints a band that differs across themes', () => {
-    const mocha = createShellRollupPopupRecipe({
-      entries: [{ id: 's1', chip: '▶ run', mode: 'vw', status: 'running' }],
-      placement,
-      onPick: () => {},
-      shadow: { theme: CATPPUCCIN_MOCHA },
-    }).surface.paint();
-    const latte = createShellRollupPopupRecipe({
-      entries: [{ id: 's1', chip: '▶ run', mode: 'vw', status: 'running' }],
-      placement,
-      onPick: () => {},
-      shadow: { theme: CATPPUCCIN_LATTE },
-    }).surface.paint();
-    expect(mocha).toContain('▓');
-    expect(latte).toContain('▓');
-    expect(mocha).not.toBe(latte);
-  });
+
 });
 
 describe('buildContextMenuPopup shadow option', () => {

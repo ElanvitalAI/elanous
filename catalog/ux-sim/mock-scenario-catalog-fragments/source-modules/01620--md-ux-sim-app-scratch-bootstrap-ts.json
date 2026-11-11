@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-APP-SCRATCH-BOOTSTRAP-TS",
+  "path": "src/ux-sim/app-scratch-bootstrap.ts",
+  "boundary": "Exercises the production new-app bootstrap planner against synthetic request and folder states without initializing Git or writing project files.",
+  "deviceIds": [
+    "app-scratch-bootstrap"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

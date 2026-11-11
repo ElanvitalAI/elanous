@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import type { StreamLLMFn } from '../autopilot/llm-control-brain.js';
 import { establishElanousTuiIsolation, elanousTuiSpawnOptions, type ElanousTuiIsolation } from '../self-implement/elanous-tui-spawn.js';
 import { resolveObserveOnlyDecision } from '../self-implement/observe-only.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { verdictForFinalPtyScreen } from './pty-drive-verdict.js';
 import { debug } from '../debug/log.js';
 import { writeHarnessScreen } from '../harness/harness-screen.js';

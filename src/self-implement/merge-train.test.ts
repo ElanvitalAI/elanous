@@ -91,7 +91,8 @@ test('8 disjoint PRs pass with one gate and a 0.125 gate-per-landing observation
   });
   expect(result).toEqual({ verdicts: candidates.map((item) => ({ number: item.number, verdict: 'pass' })), gatesRun: 1, integrations: 1 });
   expect(calls).toBe(1);
-  expect(observed).toEqual([{ batch: [1, 2, 3, 4, 5, 6, 7, 8], deferred: [], gatesRun: 1,
+  expect(observed).toEqual([{ batch: [1, 2, 3, 4, 5, 6, 7, 8], heads: candidates.map(({ number, head }) => ({ number, head })),
+    gateAttempts: [{ integrationHead: 'b'.repeat(40), members: candidates.map(({ number, head }) => ({ number, head })), result: 'pass' }], deferred: [], gatesRun: 1,
     passed: [1, 2, 3, 4, 5, 6, 7, 8], culprits: [], unmeasured: [], gatesPerLanding: 0.125 }]);
 });
 
@@ -102,7 +103,8 @@ test('omitted deferred remains unknown in the train-verdict log rather than repo
     gate: () => 'pass',
     observe: (data) => { observed.push(data); },
   });
-  expect(observed).toEqual([{ batch: [1], deferred: null, gatesRun: 1,
+  expect(observed).toEqual([{ batch: [1], heads: candidates.slice(0, 1).map(({ number, head }) => ({ number, head })),
+    gateAttempts: [{ integrationHead: 'b'.repeat(40), members: candidates.slice(0, 1).map(({ number, head }) => ({ number, head })), result: 'pass' }], deferred: null, gatesRun: 1,
     passed: [1], culprits: [], unmeasured: [], gatesPerLanding: 1 }]);
 });
 
@@ -229,7 +231,10 @@ test('a failed combination with two passing halves remains unmeasured rather tha
   });
   expect(groups).toEqual([[1, 2, 3, 4], [1, 2], [3, 4]]);
   expect(result).toEqual({ verdicts: [1, 2, 3, 4].map((number) => ({ number, verdict: 'unmeasured' })), gatesRun: 3, integrations: 3 });
-  expect(observations).toEqual([{ batch: [1, 2, 3, 4], deferred: null, gatesRun: 3,
+  expect(observations).toEqual([{ batch: [1, 2, 3, 4], heads: candidates.slice(0, 4).map(({ number, head }) => ({ number, head })),
+    gateAttempts: ([[0, 4, 'fail'], [0, 2, 'pass'], [2, 4, 'pass']] as const).map(([start, end, result]) => ({
+      integrationHead: 'b'.repeat(40), members: candidates.slice(start, end).map(({ number, head }) => ({ number, head })),
+      result })), deferred: null, gatesRun: 3,
     passed: [], culprits: [], unmeasured: [1, 2, 3, 4], gatesPerLanding: 3 }]);
 });
 
@@ -453,8 +458,10 @@ test('shadow queue with two non-overlapping PRs runs one train gate and records 
     }
     return real(bin, args, cwd);
   };
-  await enqueueL8ShadowQueue(repo, 7, { command: execute, observeEnqueue: () => {} });
-  await enqueueL8ShadowQueue(repo, 8, { command: execute, observeEnqueue: () => {} });
+  const enqueueDeps = { command: execute, observeEnqueue: () => {},
+    rulesPreflight: async () => ({ outcome: 'pass' as const, detail: 'simulated integrated rules pass' }) };
+  await enqueueL8ShadowQueue(repo, 7, enqueueDeps);
+  await enqueueL8ShadowQueue(repo, 8, enqueueDeps);
   const headBefore = git(repo, 'rev-parse', 'HEAD');
   let gateCalls = 0;
   const gateBatches: number[][] = [];

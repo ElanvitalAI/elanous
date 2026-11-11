@@ -32,6 +32,15 @@ export type MessageBlockKind =
  *  agent_thought_chunk 는 둘 다 `'agent'` source · body.kind 로 구분. */
 export type MessageBlockSource = 'user' | 'agent' | 'tool' | 'system';
 
+/** Surface-neutral progressive detail. `level` is the richest detail available;
+ *  raw payloads stay behind a run/block reference and are fetched by the surface. */
+export interface MessageBlockDetail {
+  readonly level: 1 | 2 | 3;
+  readonly summary?: string;
+  readonly steps?: readonly string[];
+  readonly rawRef?: { readonly runId: string; readonly blockId: string };
+}
+
 export interface MessageBlock {
   /** Stable merge key. `makeXxxBlockId` helper 로 생성. UUID append-only
    *  아님 — 같은 toolCallId 의 update 는 같은 block id 를 다시 사용한다. */
@@ -40,6 +49,8 @@ export interface MessageBlock {
   readonly ts: number;
   readonly source: MessageBlockSource;
   readonly body: MessageBlockKind;
+  /** Optional detail tiers; never embeds L3 tool input/output. */
+  readonly detail?: MessageBlockDetail;
 }
 
 export type MessageBlockStreamEvent = 'append' | 'update';

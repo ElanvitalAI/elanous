@@ -18,6 +18,133 @@ function executeActualRecipe(body: string, env?: Record<string, string | undefin
   return { stdout: output, stderr: '', exitCode: 0 };
 }
 
+test('verb-make converts an outcome-less model response into its declared failed exit', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'verbs-make-exit-'));
+  roots.push(root);
+  const units = join(root, 'units');
+  mkdirSync(units, { recursive: true });
+  writeFileSync(join(units, 'verb-make.yaml'), readFileSync(new URL('../../graphs/units/verbs/make.yaml', import.meta.url), 'utf8'));
+  writeFileSync(join(units, 'recipes.yaml'), readFileSync(new URL('../../graphs/units/verbs/recipes.yaml', import.meta.url), 'utf8'));
+  writeFileSync(join(root, 'recipes.yaml'), '{}\n');
+  const graph = join(root, 'parent.yaml');
+  writeFileSync(graph, `graph_id: make-exit-parent
+version: 1
+entry_node: make
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: make
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: verb-make@1
+    input: { type: make, skill: absorb/card, uses: [llm-judge] }
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - from: make
+    on: outcome
+    map: { done: done, rework: failed, needs-human: failed, failed: failed }
+`);
+
+  let seenPrompt = '';
+  const run = await runGraph(graph, {
+    input: { ask: 'make a result', context: {}, prior: {} },
+    deps: { root, callLLM: async prompt => { seenPrompt = prompt; return '{"result":"partial","evidence":{}}'; } },
+  });
+
+  expect(seenPrompt).toContain('"skill":"absorb/card"');
+  expect(seenPrompt).toContain('"type":"make"');
+  expect(run.status).toBe('failed');
+  expect(run.path).toEqual(['make', 'failed']);
+  expect(run.unitCalls?.[0]).toMatchObject({ unit: 'verb-make', exit: 'failed' });
+  expect(run.nodes.find(node => node.nodeId === 'make')?.output).toContain('"outcome":"failed"');
+});
+
+test('verb-decide runs a prompt and carries graph-v2 skill metadata through its unit context', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'verbs-decide-context-'));
+  roots.push(root);
+  const units = join(root, 'units');
+  mkdirSync(units, { recursive: true });
+  writeFileSync(join(units, 'verb-decide.yaml'), readFileSync(new URL('../../graphs/units/verbs/decide.yaml', import.meta.url), 'utf8'));
+  writeFileSync(join(units, 'recipes.yaml'), readFileSync(new URL('../../graphs/units/verbs/recipes.yaml', import.meta.url), 'utf8'));
+  writeFileSync(join(root, 'recipes.yaml'), '{}\n');
+  const graph = join(root, 'parent.yaml');
+  writeFileSync(graph, `graph_id: decide-context-parent
+version: 1
+entry_node: decide
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: decide
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: verb-decide@1
+    input: { type: decide, skill: absorb/brief, uses: [llm-judge] }
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - from: decide
+    on: outcome
+    map: { done: done, rework: failed, needs-human: failed, failed: failed }
+`);
+
+  let seenPrompt = '';
+  const run = await runGraph(graph, {
+    input: { ask: 'summarize the cards', context: { memberId: 'member-demo' }, prior: { cards: ['card-1'] } },
+    deps: { root, callLLM: async prompt => { seenPrompt = prompt; return JSON.stringify({ outcome: 'done', result: { briefing: true }, evidence: { briefing: true } }); } },
+  });
+
+  expect(seenPrompt).toContain('"skill":"absorb/brief"');
+  expect(run.status).toBe('done');
+  expect(run.path).toEqual(['decide', 'done']);
+  expect(run.unitCalls?.[0]).toMatchObject({ unit: 'verb-decide', exit: 'done' });
+});
+
+test('verb-decide routes an outcome-less prompt response through its declared failed exit', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'verbs-decide-exit-'));
+  roots.push(root);
+  const units = join(root, 'units');
+  mkdirSync(units, { recursive: true });
+  writeFileSync(join(units, 'verb-decide.yaml'), readFileSync(new URL('../../graphs/units/verbs/decide.yaml', import.meta.url), 'utf8'));
+  writeFileSync(join(units, 'recipes.yaml'), readFileSync(new URL('../../graphs/units/verbs/recipes.yaml', import.meta.url), 'utf8'));
+  writeFileSync(join(root, 'recipes.yaml'), '{}\n');
+  const graph = join(root, 'parent.yaml');
+  writeFileSync(graph, `graph_id: decide-exit-parent
+version: 1
+entry_node: brief
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: brief
+    kind: subgraph
+    recipe: none
+    max_visits: 1
+    call: verb-decide@1
+    input: { type: decide, skill: absorb/brief, uses: [llm-judge] }
+    budget: { inner_steps: 10 }
+    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: observe, recipe: none, max_visits: 1 }
+edges:
+  - from: brief
+    on: outcome
+    map: { done: done, rework: failed, needs-human: failed, failed: failed }
+`);
+
+  const run = await runGraph(graph, {
+    input: { ask: 'summarize the cards', context: { memberId: 'member-demo' }, prior: { cards: ['card-1'] } },
+    deps: { root, callLLM: async () => JSON.stringify({ result: { briefing: true }, evidence: { briefing: true } }) },
+  });
+
+  expect(run.status).toBe('failed');
+  expect(run.path).toEqual(['brief', 'failed']);
+  expect(run.unitCalls?.[0]).toMatchObject({ unit: 'verb-decide', exit: 'failed' });
+  expect(run.nodes.find(node => node.nodeId === 'brief')?.output).toContain('"outcome":"failed"');
+});
+
 test('verb-make-doc receives the previous result and routes its named rework exit', async () => {
   const root = mkdtempSync(join(tmpdir(), 'verbs-runner-compat-'));
   roots.push(root);

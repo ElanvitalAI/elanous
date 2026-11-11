@@ -18,7 +18,7 @@
 
 import { pathToFileURL } from 'node:url';
 import { debug } from '../../../debug/log.js';
-import { getUserConfig } from '../../../user-config.js';
+import { getUserConfig } from '../../../user-config/reader.js';
 import { spawnLspClient, type LspClient } from './client.js';
 import {
   installHintError, probeLanguageBinary,

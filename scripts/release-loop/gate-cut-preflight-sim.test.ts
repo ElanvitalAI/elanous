@@ -13,6 +13,7 @@ import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.
 import type { RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import type { LogRecord } from '../../src/mss/logging/record.js';
 import { gateShardRuntimeIdentityKey, type GateShardReceipt } from './gate-shard-dispatch.js';
+import { readGateShardLedger } from '../../src/release-loop/gate-shard-ledger.js';
 
 const CHANGED = ['docs/TECH-harness-map-2026-10-06.md', 'package.json', 'scenarios/ux-sim/rla-arg-adaptive-heal.yaml'];
 const SCENARIO = '../../scenarios/ux-sim/release-cut-preflight-regressions.yaml';
@@ -143,6 +144,7 @@ test('synthetic cut commit routes a non-TypeScript diff through full-radius inva
     const currentNodeModules = resolve(repo, 'node_modules');
     if (existsSync(currentNodeModules)) symlinkSync(currentNodeModules, historicalNodeModules, 'dir');
     const receiptRoot = join(temp, 'receipts');
+    const ledgerPath = join(temp, 'shards-ledger.jsonl');
     mkdirSync(receiptRoot);
     const base40 = 'c'.repeat(40);
     const fingerprint = 'd'.repeat(64);
@@ -209,7 +211,7 @@ export function sameGateTestedFileHashes(a?: Record<string, string>, b?: Record<
         return { exitCode: 0, artifactsDir, job: `fake-pod-${shardIndex}`, artifacts: { files: 3, names: ['shard.log', 'shard.rc', 'junit.xml'], error: null } };
       }, new PodPoolScheduler([{ context: 'sim', capacity: 81, k3dCluster: 'sim' }]));
       const result = await runner.sweep(historicalRepo, undefined, { pool: 'sim', shards: 81, freshShards: false,
-        durationSource: '', shardsFile: { path: join(temp, 'shards.json'), version: '0.3.6', receiptRoot, base40,
+        durationSource: '', shardsFile: { path: join(temp, 'shards.json'), version: '0.3.6', ledgerPath, receiptRoot, base40,
           envFingerprint: fingerprint, expectedImageDigest: imageDigest,
           executionIdentity: { ...runtimeIdentity, imageDigest },
           graphPins: { graphSha: '1'.repeat(64), recipeSha: '2'.repeat(64), graphEntry: 'gate-entry-v1',
@@ -220,6 +222,9 @@ export function sameGateTestedFileHashes(a?: Record<string, string>, b?: Record<
     } finally { removeSink(); }
     const decisions = records.filter((record) => record.category === 'gate.receipt' && record.event === 'reuse-decision');
     expect(decisions).toHaveLength(81);
+    const ledger = readGateShardLedger(ledgerPath);
+    expect(ledger?.malformed).toBe(0);
+    expect(ledger?.rows.filter((row) => row.state === 'pending' && row.reuseReason === 'radius-invalidated')).toHaveLength(81);
     const decisionData = (record: typeof decisions[number]): Record<string, unknown> =>
       record.data && typeof record.data === 'object' ? record.data as Record<string, unknown> : {};
     expect(decisions.every((record) => decisionData(record).reason === 'radius-invalidated')).toBe(true);

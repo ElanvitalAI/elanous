@@ -2,7 +2,7 @@
  * GRAPH-WIZARD 단계 서재 — 마법사가 짓는 그래프의 `cmd:` 노드가 «이름만»이 아니라 실제로 도는 부품.
  *
  * 노드 하나 = 서재의 단계 하나(⊕ 인자). recipes.yaml 은 `elanous graph step <단계> --arg …` 를 부른다.
- * 단계는 기존 CLI 만 쓴다(research · ask --bare · notify · self review · gh) — 새 실행 경로를 만들지 않는다.
+ * 단계는 기존 CLI 만 쓴다(research · llm · notify · self review · gh) — 새 실행 경로를 만들지 않는다.
  * 계약: 표준출력 마지막 줄 = JSON {outcome, text?} (graph runner 의 lastJsonObject 가 읽는다).
  */
 import { spawnSync } from 'node:child_process';
@@ -131,7 +131,7 @@ function prNumber(arg: string | undefined, ctx: GraphContext): string | undefine
 }
 
 function ask(prompt: string): { ok: boolean; text: string; error?: string } {
-  const r = runElanous(['ask', '--bare', '--json', prompt]);
+  const r = runElanous(['llm', '--json', prompt]);
   const reply = lastJson(r.stdout)?.reply;
   return typeof reply === 'string' && r.code === 0 ? { ok: true, text: reply } : { ok: false, text: '', error: r.stderr.slice(-500) || 'ask failed' };
 }

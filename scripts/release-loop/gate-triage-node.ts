@@ -473,7 +473,7 @@ export function gateTriageShadowFromContext(context: GraphContext, evidence?: Ga
   const mainReceiptRoot = supplied.mainFileReceiptRoot;
   const hasKeyDiffEvidence = supplied.regressionKeyDiff !== undefined && shadow.introduced.length > 0;
   const mainTip = hasKeyDiffEvidence
-    ? spawnSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8', timeout: 15_000 }) : undefined;
+    ? spawnSync('git', ['rev-parse', 'origin/main'], { encoding: 'utf8', timeout: 15_000, maxBuffer: SPAWN_SYNC_MAX_BUFFER }) : undefined;
   const keyDiff = hasKeyDiffEvidence
     ? triageRegressionKeyDiffs(shadow.introduced, supplied.regressionKeyDiff,
       { repo: process.cwd(), mainTip: mainTip?.status === 0 ? mainTip.stdout.trim() : '',

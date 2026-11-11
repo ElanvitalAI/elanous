@@ -21,6 +21,7 @@ export const SUPERVISOR_VERDICT_EDGES = {
   'review-oscillating': { meaning: 'review oscillation needs a human decision (its one repair is spent or cannot run here)', next: 'human-gate' },
   'deliverable-unobserved': { meaning: 'deliverable was not observed', next: 'self-review' },
   'deliverable-merged': { meaning: 'deliverable is merged', next: 'harvest' },
+  'boundary-reject-loop': { meaning: 'repeated rejected tool calls were stopped before another repair round', next: 'human-gate' },
 } as const satisfies Record<SupervisorStopReason, SupervisorVerdictEdge>;
 
 const HUMAN_GATE_MERGE_REASONS: ReadonlySet<string> = new Set(['decision-signal-red', 'signal-incomplete', 'parent-unlanded', 'human-gate']);

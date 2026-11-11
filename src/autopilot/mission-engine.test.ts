@@ -1,7 +1,7 @@
 import { test, expect, describe } from 'bun:test';
-import { readFileSync } from 'node:fs';
 import { inferCronSchedule, materializeSchedulerMission, materializeMission, resolveDecomposeEffort } from './mission-engine.js';
 import { openAutopilotMissionsDb, createMission } from './mission-registry.js';
+import { dispatchAutopilotMissions } from './mission-tool.js';
 
 describe('resolveDecomposeEffort — tier 분기(병목 힘빼기 2026-07-21·#4846)', () => {
   const orig = process.env.ELANOUS_DECOMPOSE_EFFORT;
@@ -90,9 +90,10 @@ describe('materializeMission dispatcher — 모델별 라우팅', () => {
     const real = openAutopilotMissionsDb();
     const m = createMission(real, { goal: '오토파일럿 task 엔진 테스트', source: 'human-intent', triage: { executionModel: 'task', engine: 'tox' } });
     real.close();
-    const r = await materializeMission({ missionId: m.id });
+    const r = await dispatchAutopilotMissions({ action: 'materialize', id: m.id }) as { ok?: boolean; engine?: string; taskId?: string; missionId?: string };
     expect(r.ok).toBe(true);
     expect(r.engine).toBe('tox');
+    expect(r.missionId).toBe(m.id);
     expect(r.taskId).toBeTruthy();
     // cleanup — 미션 + 태스크
     const { TaskStore } = await import('../task-orchestrator/store.js');
@@ -112,10 +113,9 @@ describe('materializeMission dispatcher — 모델별 라우팅', () => {
 });
 
 describe('배선 가드 — mission-tool materialize', () => {
-  test('autopilot_missions 에 materialize 액션(dispatcher)', () => {
-    const src = readFileSync(new URL('./mission-tool.ts', import.meta.url), 'utf-8');
-    expect(src).toContain("action === 'materialize'");
-    expect(src).toContain('materializeMission(');
+  test('autopilot_missions materialize delegates a missing mission to the dispatcher', async () => {
+    const result = await dispatchAutopilotMissions({ action: 'materialize', id: 'apm_c8_missing' }) as { error?: string };
+    expect(result.error).toContain('미션 없음');
   });
 });
 

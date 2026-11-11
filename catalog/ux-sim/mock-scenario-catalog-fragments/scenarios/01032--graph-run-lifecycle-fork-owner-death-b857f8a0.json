@@ -1,0 +1,11 @@
+{
+  "id": "GRAPH-RUN-LIFECYCLE-FORK-OWNER-DEATH",
+  "name": "Fork interrupted run onto a descendant commit",
+  "kind": "graph-run-lifecycle",
+  "device": "graph-run-lifecycle-world",
+  "implementation": ["src/ux-sim/graph-run-lifecycle-world.ts"],
+  "tests": ["src/ux-sim/graph-run-lifecycle-world.test.ts"],
+  "trigger": "A graph node is interrupted by owner loss and the operator forks the saved instance to a descendant commit.",
+  "observe": ["source run remains unchanged", "fork has a new run ID and parent lineage", "target commit is recorded before resume"],
+  "expected": "The fork resumes independently on the descendant commit while the source instance remains paused with its original commit."
+}

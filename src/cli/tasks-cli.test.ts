@@ -2,7 +2,7 @@ import { afterAll, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -28,7 +28,7 @@ import { remoteLedgerMirrorDir } from '../task-agent/parent-host.js';
 import { adoptExistingPr, adoptedRunTerminal } from '../task-agent/adopt-pr.js';
 import { cardsBoard, type BoardNode } from '../task-agent/board.js';
 import { resetUserConfig } from '../user-config.js';
-import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, greenCloseDeclaredPaths, podParentLaunchSelectors, readTaskOutcomeModelSize, readTaskOutcomes, registerTasksCommands, spawnDetachedConfirmed, taskLauncherArgv, type DetachedSpawn, type TaskDoctorReport, type TaskOutcomeRow, type TasksCliDeps } from './tasks-cli.js';
+import { defaultTaskLauncher, ELANOUS_CLI_ENTRY, greenCloseDeclaredPaths, podParentLaunchSelectors, readTaskOutcomeModelSize, readTaskOutcomes, registerTasksCommands, spawnDetachedConfirmed, TASK_LAUNCH_SUPERVISOR_ENTRY, taskLauncherArgv, type DetachedSpawn, type TaskDoctorReport, type TaskOutcomeRow, type TasksCliDeps } from './tasks-cli.js';
 
 test('Pod in-place worktree opt-in reaches the remote parent without forwarding unrelated HQ env', () => {
   expect(podParentLaunchSelectors({}, { ELANOUS_POD_INPLACE_WORKTREE: '1', ELANOUS_POD_MEMORY_TIER: 'high', SECRET_TOKEN: 'private' }))
@@ -2089,11 +2089,15 @@ test('live checklist hand sends its slot through the production detached launche
 });
 
 /** A fake detached child that writes `stderr` to the fd it was handed and exits with `code` (or stays alive). */
-function exitingSpawn(code: number | null, stderr = ''): { spawn: DetachedSpawn; stdio: unknown[] } {
+function exitingSpawn(code: number | null, stderr = ''): { spawn: DetachedSpawn; stdio: unknown[]; calls: Array<{ command: string; args: string[] }>; exit: (exitCode?: number, signal?: string | null) => void } {
   const stdio: unknown[] = [];
-  const spawn = ((_command: string, _args: string[], options: { stdio: unknown }) => {
+  const calls: Array<{ command: string; args: string[] }> = [];
+  let lastHandlers: Record<string, (...args: unknown[]) => void> = {};
+  const spawn = ((command: string, args: string[], options: { stdio: unknown }) => {
     stdio.push(options.stdio);
+    calls.push({ command, args });
     const handlers: Record<string, (...args: unknown[]) => void> = {};
+    lastHandlers = handlers;
     setTimeout(() => {
       handlers.spawn?.();
       if (code === null) return;
@@ -2103,7 +2107,7 @@ function exitingSpawn(code: number | null, stderr = ''): { spawn: DetachedSpawn;
     }, 0);
     return { pid: 9, once: (event: string, fn: (...args: unknown[]) => void) => { handlers[event] = fn; }, removeListener: () => undefined, unref: () => undefined };
   }) as unknown as DetachedSpawn;
-  return { spawn, stdio };
+  return { spawn, stdio, calls, exit: (exitCode = 0, signal: string | null = null) => lastHandlers.exit?.(exitCode, signal) };
 }
 
 // ⛔ R7(2026-10-16): context 가 있으면 원격 부모 경로가 가짜 spawn 보다 먼저 돈다 — 시험은 `parentHost: null` 로 원격을 끈다
@@ -2120,7 +2124,7 @@ test('STOP-RECORD launch-failed: a child that exits nonzero right after launch w
   expect((stdio[0] as unknown[]).slice(0, 2)).toEqual(['ignore', 'ignore']);
   expect(written).toHaveLength(1);
   expect(written[0]).toMatchObject({ runId: 'run-launchfail-0001', event: 'stop', data: {
-    class: 'launch-failed', cause: "child rc=2: error: unknown command 'tick.ts'", evidenceRef: join(stderrDir, 'run-launchfail-0001.stderr'), nextMove: expect.any(String) } });
+    class: 'launch-failed', cause: "child rc=2: error: unknown command 'tick.ts'", evidenceRef: 'run-ledger:run-launchfail-0001:stop', nextMove: expect.any(String) } });
   expect(String(written[0]!.data.cause).length).toBeLessThanOrEqual(120);
   expect(String(written[0]!.data.cause)).not.toContain('frame');
 });
@@ -2134,7 +2138,7 @@ test('STOP-RECORD launch-failed: a warning before the fatal error does not repla
   expect(written).toHaveLength(1);
   expect(String(written[0]!.data.cause)).toContain('--child-llm-effort 거부');
   expect(String(written[0]!.data.cause)).not.toContain('스냅숏');
-  expect(written[0]!.data.evidenceRef).toBe(join(stderrDir, 'run-launchfail-effort.stderr'));
+  expect(written[0]!.data.evidenceRef).toBe('run-ledger:run-launchfail-effort:stop');
 });
 
 test('STOP-RECORD launch-failed: a child still running after the window (or exiting 0) records no stop and returns the receipt', async () => {
@@ -2184,6 +2188,44 @@ test('STOP-RECORD launch-failed: through task hand --live the card is launch-fai
   expect(cards[0]!.history[0]!.detail).toContain('child rc=2: error: bad argv');
   expect(written).toHaveLength(1);
   expect(written[0]!.data).toMatchObject({ class: 'launch-failed' });
+});
+
+test('TMP-DIR-LEAK: task launch stderr scratch is removed after success, child failure, and spawn failure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'tasks-cli-launch-root-'));
+  const written: RunLedgerEntry[] = [];
+  try {
+    const deps = { parentHost: null, stderrTempRoot: root, earlyExitWindowMs: 1_000, writeStop: (entry: RunLedgerEntry) => { written.push(entry); } };
+    await defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-scratch-success'), {
+      ...deps, spawn: exitingSpawn(0).spawn,
+    });
+    expect(readdirSync(root)).toEqual([]);
+
+    const childFailure = exitingSpawn(2, 'error: child failed\n');
+    await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-scratch-child-fail'), {
+      ...deps, spawn: childFailure.spawn,
+    })).rejects.toThrow('child rc=2');
+    expect(written[0]!.data).toMatchObject({ cause: 'child rc=2: error: child failed', evidenceRef: 'run-ledger:run-scratch-child-fail:stop' });
+    expect(childFailure.calls[0]).toEqual({ command: process.execPath, args: [TASK_LAUNCH_SUPERVISOR_ENTRY, expect.any(String), String(process.pid), process.execPath, expect.any(String), '--config-dir', expect.any(String), 'harness', 'say', 'x'] });
+    expect(readdirSync(root)).toEqual([]);
+
+    const running = exitingSpawn(null);
+    await defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-scratch-running'), {
+      ...deps, earlyExitWindowMs: 10, spawn: running.spawn,
+    });
+    const activeScratch = readdirSync(root);
+    expect(activeScratch).toHaveLength(1);
+    expect(readdirSync(join(root, activeScratch[0]!))).toEqual(['.launcher-finished', 'run-scratch-running.stderr']);
+    running.exit(0);
+    expect(readdirSync(root)).toEqual([]);
+
+    const spawnFailure = (() => { throw new Error('spawn failed'); }) as DetachedSpawn;
+    await expect(defaultTaskLauncher(['harness', 'say', 'x'], undefined, launchContext('run-scratch-spawn-fail'), {
+      ...deps, spawn: spawnFailure,
+    })).rejects.toThrow('spawn failed');
+    expect(readdirSync(root)).toEqual([]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('TASK-HAND-RETRY: live launch refusal prints its reason instead of the shadow hint', async () => {

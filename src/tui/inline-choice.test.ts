@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { createInlineChoice, formatInlineChoiceLines, InlineChoiceBroker } from './inline-choice.js';
+import { createInlineChoice, formatInlineChoiceLines, InlineChoiceBroker, splitInlineChoiceComposerInput } from './inline-choice.js';
 
 const spec = {
   id: 'stop-confirm',
@@ -44,6 +44,70 @@ describe('inline choice prompts', () => {
     expect(await other.promise).toEqual({ selected: [], otherText: 'keep the current run' });
   });
 
+  test('yes/no defaults to N on Enter and supports explicit keyboard selection without Other', async () => {
+    const panel: string[][] = [];
+    const defaultNo = createInlineChoice({ ...spec, yesNo: true }, {
+      appendLines: () => {}, renderPanel: (lines) => panel.push([...lines]),
+    });
+    expect(panel.at(-1)).toContain('  ▸ n. 계속');
+    expect(panel.at(-1)?.some((line) => line.includes('Other'))).toBe(false);
+    expect(defaultNo.handleInput('')).toBe(true);
+    expect(await defaultNo.promise).toEqual({ selected: ['continue'] });
+
+    const chooseYes = createInlineChoice({ ...spec, yesNo: true }, { appendLines: () => {} });
+    expect(chooseYes.handleKey('up')).toBe(true);
+    expect(chooseYes.handleInput('')).toBe(true);
+    expect(await chooseYes.promise).toEqual({ selected: ['stop'] });
+
+    const typedYes = createInlineChoice({ ...spec, yesNo: true }, { appendLines: () => {} });
+    expect(typedYes.handleInput('y')).toBe(true);
+    expect(await typedYes.promise).toEqual({ selected: ['stop'] });
+  });
+
+  test('bounds long option lists and keeps the selected row visible while scrolling', () => {
+    const long = {
+      ...spec,
+      options: Array.from({ length: 24 }, (_, index) => ({ value: `v${index}`, label: `Choice ${index + 1}` })),
+    };
+    const lines = formatInlineChoiceLines(long, 18);
+    expect(lines.filter((line) => line.includes('Choice '))).toEqual([
+      '    16. Choice 16',
+      '    17. Choice 17',
+      '    18. Choice 18',
+      '  ▸ 19. Choice 19',
+    ]);
+    expect(lines.some((line) => line.includes('↑'))).toBe(true);
+    expect(lines.some((line) => line.includes('↓'))).toBe(true);
+  });
+
+  test('reports invalid answer separately so the input owner can restore its draft', async () => {
+    const prompt = createInlineChoice({ ...spec, yesNo: true }, { appendLines: () => {} });
+    expect(prompt.handleInputResult('invalid')).toBe('rejected');
+    expect(prompt.handleInputResult('n')).toBe('accepted');
+    await expect(prompt.promise).resolves.toEqual({ selected: ['continue'] });
+  });
+
+  test('separates prompt answer from a draft present when the prompt opened', () => {
+    expect(splitInlineChoiceComposerInput('keep this draftn', 'keep this draft')).toEqual({
+      answer: 'n', restoreText: 'keep this draft',
+    });
+    expect(splitInlineChoiceComposerInput(' y ', 'keep this draft')).toEqual({
+      answer: 'y', restoreText: 'keep this draft',
+    });
+    expect(splitInlineChoiceComposerInput('2', 'keep this draft')).toEqual({
+      answer: '2', restoreText: 'keep this draft',
+    });
+  });
+
+  test('preserves edits to the draft instead of treating the whole edited draft as an answer', () => {
+    expect(splitInlineChoiceComposerInput('keep this revised draft', 'keep this draft')).toEqual({
+      answer: null, restoreText: 'keep this revised draft',
+    });
+    expect(splitInlineChoiceComposerInput('keep this revised draftn', 'keep this revised draft')).toEqual({
+      answer: 'n', restoreText: 'keep this revised draft',
+    });
+  });
+
   test('cancels and records an unattended timeout instead of guessing', async () => {
     const outcomes: string[] = [];
     const cancelled = createInlineChoice(spec, {
@@ -73,5 +137,16 @@ describe('inline choice prompts', () => {
     expect(broker.activeId).toBeNull();
     expect(broker.handleInput('1')).toBe(false);
     expect(lines).toEqual(formatInlineChoiceLines(spec));
+  });
+
+  test('streaming yes/no keys answer the active prompt without consuming ordinary text', async () => {
+    const broker = new InlineChoiceBroker({ appendLines: () => {} });
+    const answer = broker.ask({ ...spec, yesNo: true });
+    expect(broker.handleStreamingKey('x')).toBe(false);
+    expect(broker.handleStreamingKey({ name: 'y', ctrl: true })).toBe(false);
+    expect(broker.handleStreamingKey({ name: 'y', alt: true })).toBe(false);
+    expect(broker.handleStreamingKey({ name: 'y' })).toBe(true);
+    await expect(answer).resolves.toEqual({ selected: ['stop'] });
+    expect(broker.handleStreamingKey('n')).toBe(false);
   });
 });

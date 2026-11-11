@@ -1,4 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { StrictMode } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { QueryClient } from '@tanstack/react-query';
@@ -7,6 +9,7 @@ import { SearchParamsContext } from 'next/dist/shared/lib/hooks-client-context.s
 import { createNexusClient } from '@/nexus/client';
 import { NexusProvider } from '@/nexus/hooks/use-nexus-context';
 import LiveRunPage from './page';
+import { GraphInstanceLiveScreen } from '@/components/live-run/GraphInstanceLiveScreen';
 import { withFakeFetchDevice } from '../../test-devices/fake-fetch';
 
 const AUTO_FOLLOW_VALUE = '__auto_follow_latest__';
@@ -14,6 +17,7 @@ const client = createNexusClient({
   baseUrl: 'http://daemon',
   fetchImpl: (async () => new Response(JSON.stringify({ entries: [], finished: [] }), { status: 200 })) as unknown as typeof fetch,
 });
+const resourceView = JSON.parse(readFileSync(resolve(import.meta.dir, '../../../../../plugins/graph-instance-view/fixtures/resource.view.json'), 'utf8')) as unknown;
 const router = { replace: () => {} };
 let root: ReactTestRenderer | undefined;
 let queryClient: QueryClient | undefined;
@@ -57,12 +61,12 @@ function installConnectBrowser(hash: string, initial: Record<string, string> = {
   return { values, replacements };
 }
 
-async function renderPage(strict = false) {
+async function renderPage(strict = false, query = '', nexusClient = client) {
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const page = (
     <AppRouterContext.Provider value={router as never}>
-      <SearchParamsContext.Provider value={new URLSearchParams()}>
-        <NexusProvider client={client} queryClient={queryClient}>
+      <SearchParamsContext.Provider value={new URLSearchParams(query)}>
+        <NexusProvider client={nexusClient} queryClient={queryClient}>
           <LiveRunPage />
         </NexusProvider>
       </SearchParamsContext.Provider>
@@ -73,6 +77,37 @@ async function renderPage(strict = false) {
     await Bun.sleep(20);
   });
 }
+
+test('resource route is operator gated and drops unrelated URL identifiers', async () => {
+  await withFakeFetchDevice([
+    { url: '/v1/me', method: 'GET', response: () => Response.json({ operator: true }) },
+  ], async () => {
+    installConnectBrowser('', { 'elanous.nexus.baseUrl': 'https://new-nexus.example' });
+    const calls: string[] = [];
+    const resourceClient = createNexusClient({ baseUrl: 'https://nexus.test', fetchImpl: (async input => {
+      calls.push(String(input));
+      return Response.json(resourceView);
+    }) as typeof fetch });
+    await renderPage(false, 'view=instance&source=resource&run=other-run&graph=other-graph', resourceClient);
+    await Bun.sleep(20);
+    await act(async () => {});
+    expect(root!.root.findByType(GraphInstanceLiveScreen).props.instanceKey).toEqual({ source: 'resource' });
+    expect(calls).toEqual(['https://nexus.test/v1/graph-instance-view?source=resource']);
+    expect(JSON.stringify(root!.toJSON())).toContain('자원 현황');
+    expect(JSON.stringify(root!.toJSON())).toContain('mbp');
+  });
+});
+
+test('resource route denies a nonoperator before reading the view', async () => {
+  await withFakeFetchDevice([
+    { url: '/v1/me', method: 'GET', response: () => Response.json({ operator: false }) },
+  ], async () => {
+    installConnectBrowser('', { 'elanous.nexus.baseUrl': 'https://new-nexus.example' });
+    await renderPage(false, 'view=instance&source=resource');
+    expect(root!.root.findAllByType(GraphInstanceLiveScreen)).toHaveLength(0);
+    expect(root!.root.findByType('p').children.join('')).toBe('운영자만 볼 수 있습니다');
+  });
+});
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 afterEach(async () => {

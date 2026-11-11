@@ -21,6 +21,14 @@ import type { NexusEvent } from '../state/state.js';
 
 export type NexusEventListener = (ev: NexusEvent) => void;
 
+export interface AppRowChangeEvent {
+  appSlug: string;
+  table: string;
+  operation: 'insert' | 'update' | 'delete';
+  rowId: string;
+  row: Record<string, unknown>;
+}
+
 export class NexusEventBus {
   private listeners = new Set<{ cb: NexusEventListener; prefixes: string[] | undefined }>();
 
@@ -39,6 +47,15 @@ export class NexusEventBus {
       if (entry.prefixes && !entry.prefixes.some((p) => ev.kind.startsWith(p))) continue;
       try { entry.cb(ev); } catch { /* swallow — observability boundary */ }
     }
+  }
+
+  /** Publish a committed app row change on the shared Nexus event stream. */
+  publishAppRowChange(change: AppRowChangeEvent): void {
+    this.publish({
+      ts: Date.now(),
+      kind: `app.row.${change.operation}`,
+      detail: { ...change },
+    });
   }
 
   size(): number { return this.listeners.size; }

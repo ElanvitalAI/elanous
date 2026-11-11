@@ -135,7 +135,7 @@ describe('fake Google OAuth member boundary', () => {
         const callback = (await api.handle(new Request(`${REDIRECT}?code=${authorization.code}&state=${authorization.state}`, {
           headers: { cookie: authorization.stateCookie },
         })))!;
-        expect(callback.status).toBe(303);
+        expect(callback.status).toBe(200);
         const sessionCookie = callback.headers.get('set-cookie')!.split(';', 1)[0]!;
         const profile = (await api.handle(new Request('https://api.example.test/v1/members', {
           headers: { cookie: sessionCookie },
@@ -146,11 +146,92 @@ describe('fake Google OAuth member boundary', () => {
     } finally { store.close(); }
   });
 
+  test('native Google callback returns an allowlisted one-time state-bound app-slot exchange code', async () => {
+    let clock = Date.parse('2026-11-14T01:00:00.000Z');
+    const now = () => clock;
+    const store = createMemberStore({ path: ':memory:', now });
+    // Source: #93455 — fixture event code must cover both successful app-auth attempts.
+    store.provisionEventCode({ code: 'APP-AUTH', maxUses: 3 });
+    const googleWorld = world();
+    const google = createGoogleSignin({
+      clientId: async () => CLIENT_ID, clientSecret: async () => 'fake-google-client-secret',
+      stateEncryptionKey: async () => 'test-only-state-encryption-key', redirectUri: REDIRECT, store, now,
+      fetch: googleWorld.fetch, authorizationEndpoint: `${FAKE_GOOGLE_ISSUER}/o/oauth2/v2/auth`,
+      tokenEndpoint: `${FAKE_GOOGLE_ISSUER}/token`, userinfoEndpoint: `${FAKE_GOOGLE_ISSUER}/userinfo`,
+    });
+    const issued: Array<{ appSlug: string; memberId: string }> = [];
+    const api = createMembersApi({ store, google, successRedirectUri: 'https://app.example.test/signup/complete', now,
+      appAuthRedirectUris: ['elanous://auth/callback'],
+      issueOwnerSession: (appSlug, memberId) => {
+        issued.push({ appSlug, memberId });
+        return { sessionToken: 'aps-one-time-session', expiresAt: new Date(clock + 60_000).toISOString() };
+      },
+    });
+    const codeVerifier = 'app-verifier-0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMN';
+    const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+    const start = async (appRedirectUri = 'elanous://auth/callback') => api.handle(new Request('https://api.example.test/v1/members', {
+      method: 'POST', headers: { origin: 'https://app.example.test', 'content-type': 'application/json' },
+      body: JSON.stringify({ consents: { privacy: 'privacy-v1', terms: 'terms-v1' }, eventCode: 'APP-AUTH', appRedirectUri,
+        ...(appRedirectUri ? { appCodeChallenge: codeChallenge } : {}) }),
+    }));
+    try {
+      expect((await start('https://attacker.example/callback'))?.status).toBe(400);
+      const started = await start();
+      expect(started?.status).toBe(201);
+      const { authorizationUrl } = await started!.json() as { authorizationUrl: string };
+      const authorization = googleWorld.authorize(authorizationUrl);
+      const stateCookie = started!.headers.get('set-cookie')!.split(';', 1)[0]!;
+      const callback = await api.handle(new Request(`${REDIRECT}?code=${authorization.code}&state=${authorization.state}`, {
+        headers: { cookie: stateCookie },
+      }));
+      expect(callback?.status).toBe(303);
+      const appCallback = new URL(callback!.headers.get('location')!);
+      expect(`${appCallback.protocol}//${appCallback.host}${appCallback.pathname}`).toBe('elanous://auth/callback');
+      const exchangeCode = appCallback.searchParams.get('code')!;
+      const state = appCallback.searchParams.get('state')!;
+      expect(state).toBe(authorization.state);
+      expect(callback!.headers.get('set-cookie')).toContain('Max-Age=0');
+      expect(callback!.headers.get('set-cookie')).not.toContain('__Host-elanous_member_session=');
+
+      const exchange = (code: string, boundState: string, verifier = codeVerifier) => api.handle(new Request('https://api.example.test/v1/members/app-slot/exchange', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, state: boundState, codeVerifier: verifier }),
+      }));
+      expect((await exchange(exchangeCode, 'wrong-state'))?.status).toBe(401);
+      expect((await exchange(exchangeCode, state, `${codeVerifier}wrong`))?.status).toBe(401);
+      const exchanged = await exchange(exchangeCode, state);
+      expect(exchanged?.status).toBe(200);
+      const payload = await exchanged!.json() as { appId: string; sessionToken: string; tokenType: string; expiresAt: string };
+      expect(payload).toMatchObject({ appId: expect.stringMatching(/^kaist-/), sessionToken: 'aps-one-time-session', tokenType: 'Bearer' });
+      expect(Number.isFinite(Date.parse(payload.expiresAt))).toBe(true);
+      expect(issued).toHaveLength(1);
+      expect((await exchange(exchangeCode, state))?.status).toBe(401);
+      expect(isPublicRoute('POST', '/v1/members/app-slot/exchange', { setupMode: false })).toBe(true);
+
+      const expiredStart = await start();
+      const expiredAuthorization = googleWorld.authorize((await expiredStart!.json() as { authorizationUrl: string }).authorizationUrl);
+      const expiredCallback = await api.handle(new Request(`${REDIRECT}?code=${expiredAuthorization.code}&state=${expiredAuthorization.state}`, {
+        headers: { cookie: expiredStart!.headers.get('set-cookie')!.split(';', 1)[0]! },
+      }));
+      const expiredAppCallback = new URL(expiredCallback!.headers.get('location')!);
+      clock += 2 * 60_000 + 1;
+      expect(store.pruneExpiredAppAuthCodes?.(new Date(clock).toISOString())).toBe(1);
+      expect((await exchange(expiredAppCallback.searchParams.get('code')!, expiredAuthorization.state))?.status).toBe(401);
+    } finally { store.close(); }
+  });
+
   test('drives real signup, consent/code attribution, member session and deletion through fake Google', async () => {
     const now = () => Date.parse('2026-11-14T01:00:00.000Z');
     const store = createMemberStore({ path: ':memory:', now });
     const appLifecycle = createAppLifecycleStore(':memory:');
     let lifecycleLookups = 0;
+    let lifecycleCreateAttempts = 0;
+    const retryingAppLifecycle = {
+      ensureCreated: (event: Parameters<typeof appLifecycle.ensureCreated>[0]) => {
+        lifecycleCreateAttempts += 1;
+        if (lifecycleCreateAttempts === 1) throw new Error('temporary lifecycle write failure');
+        appLifecycle.ensureCreated(event);
+      },
+    };
     // Source: src/nexus/members/member-store.ts — the two-use event code permits two distinct members then exhausts.
     store.provisionEventCode({ code: 'KAIST-2026', maxUses: 2 });
     expect(store.validateCode('KAIST-2026', 'event', new Date(now()).toISOString())).toMatchObject({
@@ -185,7 +266,7 @@ describe('fake Google OAuth member boundary', () => {
       getAppLifecycle: () => {
         lifecycleLookups += 1;
         if (lifecycleLookups === 1) throw new Error('temporary lifecycle-store initialization failure');
-        return appLifecycle;
+        return retryingAppLifecycle;
       } });
     expect(isPublicRoute('POST', '/v1/members', { setupMode: false })).toBe(true);
     expect(isPublicRoute('GET', '/v1/members/oauth/google/callback', { setupMode: false })).toBe(true);
@@ -226,15 +307,37 @@ describe('fake Google OAuth member boundary', () => {
     expect(forged?.status).toBe(401);
     const completed = await routeRequest(new Request(callbackUrl, { headers: { cookie: stateCookie.split(';')[0]! } }),
       { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
-    expect(completed?.status).toBe(303);
-    expect(completed?.headers.get('location')).toBe('https://app.example.test/signup/complete');
+    expect(completed?.status).toBe(200);
+    expect(await completed!.text()).toContain('emk_');
     const setCookie = completed?.headers.get('set-cookie') ?? '';
     expect(setCookie).toContain('HttpOnly; Secure; SameSite=Lax');
+    const memberCookie = setCookie.split(';', 1)[0]!;
+    const keyList = await routeRequest(new Request('https://api.example.test/v1/member/keys', { headers: { cookie: memberCookie } }),
+      { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
+    expect(keyList?.status).toBe(200);
+    expect((await keyList!.json() as { keys: unknown[] }).keys).toHaveLength(1);
+    const keyPreflight = await routeRequest(new Request('https://api.example.test/v1/member/keys', {
+      method: 'OPTIONS', headers: { origin: 'https://app.example.test', 'access-control-request-method': 'POST' },
+    }), { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
+    expect(keyPreflight?.status).toBe(204);
+    expect(keyPreflight?.headers.get('access-control-allow-origin')).toBe('https://app.example.test');
+    const createdKey = await routeRequest(new Request('https://api.example.test/v1/member/keys', {
+      method: 'POST', headers: { cookie: memberCookie, origin: 'https://app.example.test', 'content-type': 'application/json' }, body: JSON.stringify({ name: 'device' }),
+    }), { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
+    expect(createdKey?.status).toBe(201);
+    expect(createdKey?.headers.get('access-control-allow-origin')).toBe('https://app.example.test');
+    const key = await createdKey!.json() as { id: string; key: string };
+    expect(key.key.startsWith('emk_')).toBe(true);
+    const revokedKey = await routeRequest(new Request(`https://api.example.test/v1/member/keys/${key.id}`, {
+      method: 'DELETE', headers: { cookie: memberCookie },
+    }), { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
+    expect(revokedKey?.status).toBe(200);
     expect((await api.handle(new Request(callbackUrl, { headers: { cookie: stateCookie.split(';')[0]! } })))?.status).toBe(401);
     const sessionCookie = setCookie.split(';')[0]!;
     const profile = await api.handle(new Request('https://api.example.test/v1/members', { headers: { cookie: sessionCookie, origin: 'https://app.example.test' } }));
     expect(profile?.status).toBe(200);
     expect(lifecycleLookups).toBe(2);
+    expect(lifecycleCreateAttempts).toBe(2);
     const profileBody = await profile!.json();
     expect(profileBody).toMatchObject({ member: { email: 'new@example.test', invitedBy: inviter.id, eventCode: 'KAIST-2026' } });
     expect(JSON.stringify(profileBody)).not.toContain('fake-google-access');
@@ -242,6 +345,7 @@ describe('fake Google OAuth member boundary', () => {
       headers: { cookie: sessionCookie, origin: 'https://app.example.test' },
     }), { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
     expect(slotResponse?.status).toBe(200);
+    expect(lifecycleLookups).toBe(2);
     const { appSlot } = await slotResponse!.json() as { appSlot: { appId: string; templateSlug: string; createdAt: string } };
     expect(appSlot).toMatchObject({ templateSlug: 'next-app-lecture-scrap' });
     expect(appSlot.appId).not.toBe(appSlot.templateSlug);
@@ -270,7 +374,8 @@ describe('fake Google OAuth member boundary', () => {
       headers: { cookie: `__Host-elanous_member_session=${encodeURIComponent(secondSession.token)}`, origin: 'https://app.example.test' },
     }), { membersApi: api } as never, {} as never, null, createDevProxyRuntimeRef());
     expect(secondMemberSlot?.status).toBe(200);
-    expect(await secondMemberSlot!.json()).toEqual({ appSlot: { appId: secondSlot?.appId, templateSlug: secondSlot?.templateSlug, createdAt: secondSlot?.createdAt } });
+    expect(await secondMemberSlot!.json()).toEqual({ appSlot: { appId: secondSlot?.appId, appSlug: secondSlot?.appSlug,
+      templateSlug: secondSlot?.templateSlug, createdAt: secondSlot?.createdAt, url: null } });
     const anonymousSlot = await api.handle(new Request('https://api.example.test/v1/members/app-slot', { headers: { origin: 'https://app.example.test' } }));
     expect(anonymousSlot?.status).toBe(401);
     appLifecycle.ensureCreated(createAppLifecycleEvent({ appId: appSlot.templateSlug, action: 'created', environment: 'simulation', actor: 'system',

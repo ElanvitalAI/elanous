@@ -1,5 +1,8 @@
 import { timingSafeEqual } from 'node:crypto';
-import { canonicalSeatId, type Message, type MsgStore } from './msg-store.js';
+import { join } from 'node:path';
+import { debug } from '../debug/log.js';
+import { clearPostOffice, livePostOffice, writeResidentPostOffice, type PostOfficeInfo } from './msg-post-office.js';
+import { canonicalSeatId, openMsgStore, openMsgStoreReadOnly, type Message, type MsgStore } from './msg-store.js';
 
 type Subscriber = { to: string; lastId: number; heartbeatAt: number; replaying: boolean; controller: ReadableStreamDefaultController<Uint8Array> };
 const encoder = new TextEncoder();
@@ -101,6 +104,8 @@ export function startMsgSseServer(input: {
     hostname,
     fetch(request) {
       const url = new URL(request.url);
+      if (url.pathname === '/health' && request.method === 'GET')
+        return new Response(null, { status: 204, headers: { 'X-Elanous-Service': 'msg-sse' } });
       if (url.pathname !== '/stream' || request.method !== 'GET') return new Response('Not Found', { status: 404 });
       if (!authorized(request, input.token)) return new Response('Unauthorized', { status: 401 });
       let to: string;
@@ -137,5 +142,44 @@ export function startMsgSseServer(input: {
     for (const subscriber of subscribers) { try { subscriber.controller.close(); } catch { /* disconnected */ } }
     subscribers.clear();
     server.stop(true);
+  } };
+}
+
+/** Nexus-owned lifetime: initialize the durable ledger, publish discovery, and release both on shutdown. */
+export async function startResidentMsgSseServer(input: {
+  stateRoot: string;
+  token: string;
+  port?: number;
+  pollMs?: number;
+}): Promise<{ port: number; stop: () => void } | null> {
+  const skip = (owner: PostOfficeInfo) => {
+    debug.log('msg.sse', 'resident-skipped-live-owner', { owner,
+      guidance: '독립 서버를 eln msg serve stop 으로 내리면 다음 Nexus 기동에 인계' }, { level: 'warn' });
+    return null;
+  };
+  const existing = livePostOffice(input.stateRoot);
+  if (existing) return skip(existing);
+  const path = join(input.stateRoot, 'msg', 'messages.db');
+  openMsgStore(path).close();
+  const store = openMsgStoreReadOnly(path);
+  let service: ReturnType<typeof startMsgSseServer> | undefined;
+  try {
+    service = startMsgSseServer({ store, token: input.token, port: input.port ?? 0,
+      ...(input.pollMs === undefined ? {} : { pollMs: input.pollMs }) });
+    const registered = await writeResidentPostOffice(input.stateRoot, { port: service.port });
+    if (registered.port !== service.port) {
+      service.stop();
+      store.close();
+      return skip(registered);
+    }
+  } catch (error) {
+    service?.stop();
+    store.close();
+    throw error;
+  }
+  return { port: service.port, stop: () => {
+    service.stop();
+    clearPostOffice(input.stateRoot, process.pid, service.port);
+    store.close();
   } };
 }

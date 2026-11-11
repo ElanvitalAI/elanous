@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-FAKE-APP-FAILURES-TS",
+  "path": "src/ux-sim/fake-app-failures.ts",
+  "boundary": "Provides deterministic build, deploy, and runtime app failure records tied to the active version of each declared simulation app, including an unclassified case.",
+  "deviceIds": ["fake-app-failures"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

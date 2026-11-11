@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-WORLD-REGRESSION-SUITE-TS",
+  "path": "src/ux-sim/world-regression-suite.ts",
+  "boundary": "Projects observations into reproducible step receipts, compares them with declared baselines, rejects nondeterministic replays before updates, and leaves real-target execution unmeasured unless a runner is supplied.",
+  "deviceIds": ["world-runtime", "world-regression-suite"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

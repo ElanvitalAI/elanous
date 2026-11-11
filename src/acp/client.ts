@@ -42,7 +42,7 @@ import { getAcpBackend, type AcpBackendSpec } from './backend-registry.js';
 import { grokApiKeyEnvName } from './grok-auth-probe.js';
 import { grokAuthHint, isGrokAuthError } from './grok-auth.js';
 import { providerEnvKey } from '../llm/provider-credentials.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { createAcpStderrSummarizer } from './stderr-summary.js';
 import {
   AcpForkSessionUnsupportedError,

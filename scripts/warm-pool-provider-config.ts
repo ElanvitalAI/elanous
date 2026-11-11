@@ -357,6 +357,7 @@ interface CliOptions {
   configPath: string;
   controlUrl: string;
   memberTokenFile: string;
+  ledgerTokenFiles: Record<string, string>;
   machineTokenFiles: Record<string, string>;
   output: string;
   dryRun: boolean;
@@ -368,6 +369,7 @@ interface CliOptions {
 
 function parseArgs(argv: readonly string[]): CliOptions {
   let configPath = userConfigPath(), controlUrl = '', memberTokenFile = '', output = '';
+  const ledgerTokenFiles: Record<string, string> = {};
   let dryRun = false, serve = false, singleCandidate: string | undefined, machinePoolsFile: string | undefined, resourceLedgerUrl: string | undefined;
   const machineTokenFiles: Record<string, string> = {};
   for (let index = 0; index < argv.length; index++) {
@@ -380,6 +382,12 @@ function parseArgs(argv: readonly string[]): CliOptions {
     if (arg === '--config') configPath = next();
     else if (arg === '--control-url') controlUrl = next();
     else if (arg === '--member-token-file') memberTokenFile = next();
+    else if (arg === '--ledger-token-file') {
+      const [host, file, extra] = next().split('=');
+      if (!host || !file || extra !== undefined) throw new Error('--ledger-token-file must be HOST=ABSOLUTE');
+      if (ledgerTokenFiles[host]) throw new Error(`duplicate --ledger-token-file host: ${host}`);
+      ledgerTokenFiles[host] = file;
+    }
     else if (arg === '--machine-token') {
       const [host, file, extra] = next().split('=');
       if (!host || !file || extra !== undefined) throw new Error('--machine-token must be HOST=FILE');
@@ -393,12 +401,13 @@ function parseArgs(argv: readonly string[]): CliOptions {
     else throw new Error(`unknown argument: ${arg}`);
   }
   if (!isAbsolute(configPath) || !controlUrl || !isAbsolute(memberTokenFile))
-    throw new Error('usage: --config ABSOLUTE --control-url URL --member-token-file ABSOLUTE --machine-token HOST=ABSOLUTE [--resource-ledger-url URL] [--output ABSOLUTE] [--single-candidate HOST/TIER] [--dry-run|--serve]');
+    throw new Error('usage: --config ABSOLUTE --control-url URL --member-token-file ABSOLUTE [--ledger-token-file HOST=ABSOLUTE ...] --machine-token HOST=ABSOLUTE [--resource-ledger-url URL] [--output ABSOLUTE] [--single-candidate HOST/TIER] [--dry-run|--serve]');
+  if (Object.values(ledgerTokenFiles).some(file => !isAbsolute(file))) throw new Error('--ledger-token-file paths must be absolute');
   if (Object.values(machineTokenFiles).some(file => !isAbsolute(file))) throw new Error('machine token files must be absolute');
   if (machinePoolsFile && !isAbsolute(machinePoolsFile)) throw new Error('--machine-pools path must be absolute');
   if (resourceLedgerUrl) assertResourceLedgerUrl(resourceLedgerUrl);
   if (dryRun && serve) throw new Error('--dry-run and --serve cannot be combined');
-  return { configPath, controlUrl, memberTokenFile, machineTokenFiles, machinePoolsFile, resourceLedgerUrl,
+  return { configPath, controlUrl, memberTokenFile, ledgerTokenFiles, machineTokenFiles, machinePoolsFile, resourceLedgerUrl,
     output: output || join(dirname(configPath), 'warm-pod-provider.json'), dryRun, serve, singleCandidate };
 }
 
@@ -451,10 +460,15 @@ async function fetchMachinePoolDeclarationsForHost(url: string, memberToken: str
     }, { level: 'warn' });
     throw new Error('Nexus resource-ledger response invalid');
   }
-  try { return parseMachinePoolDeclarations({ pools: body.pools }); }
+  try {
+    const declarations = parseMachinePoolDeclarations({ pools: body.pools });
+    if (host && declarations.some(pool => !pool.members.some(member => member.host === host)))
+      throw new Error('machine scope mismatch');
+    return declarations;
+  }
   catch {
     debug.log('pod.warm.provider-config', 'resource-ledger-read-failed', {
-      ...(host ? { host } : {}), status: response.status, reason: 'invalid-pool-declaration',
+      ...(host ? { host } : {}), status: response.status, reason: host ? 'invalid-or-unscoped-pool-declaration' : 'invalid-pool-declaration',
     }, { level: 'warn' });
     throw new Error('Nexus resource-ledger response invalid');
   }
@@ -473,8 +487,19 @@ export async function runWarmPoolProviderConfig(argv: readonly string[]): Promis
   if (options.resourceLedgerUrl) {
     const hostCredentials = Object.entries(machineTokens);
     if (hostCredentials.length === 0) throw new Error('--resource-ledger-url requires at least one host machine token');
-    const declarations = await Promise.all(hostCredentials.map(([host, credential]) =>
-      fetchMachinePoolDeclarationsForHost(options.resourceLedgerUrl!, credential, fetch, host)));
+    const ledgerHosts = Object.keys(options.ledgerTokenFiles);
+    if (ledgerHosts.length > 0 && (ledgerHosts.length !== hostCredentials.length
+      || ledgerHosts.some(host => !Object.hasOwn(machineTokens, host))))
+      throw new Error('--ledger-token-file hosts must match --machine-token hosts');
+    const declarations = Object.keys(options.ledgerTokenFiles).length
+      ? await Promise.all(hostCredentials.map(([host]) => {
+        const tokenPath = options.ledgerTokenFiles[host];
+        if (!tokenPath) throw new Error(`--ledger-token-file missing for host: ${host}`);
+        return fetchMachinePoolDeclarationsForHost(options.resourceLedgerUrl!,
+          readPrivateToken(tokenPath, `ledger token for ${host}`), fetch, host);
+      }))
+      : await Promise.all(hostCredentials.map(([host, credential]) =>
+        fetchMachinePoolDeclarationsForHost(options.resourceLedgerUrl!, credential, fetch, host)));
     const byIdentity = new Map<string, MachinePoolDeclaration>();
     for (const pool of declarations.flat()) {
       const identity = `${pool.purpose}/${pool.fanoutGroupId}`;

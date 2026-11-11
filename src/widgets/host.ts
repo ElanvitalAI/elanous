@@ -662,9 +662,8 @@ export class WidgetHost {
    *  implement onHover, or when the handler throws (isolated via
    *  try/catch so a buggy widget can't poison the hover pipeline).
    *
-   *  Called by the dashboard's hover-tracker subscriber after the
-   *  tracker has resolved which widget the pointer is over (via
-   *  HoverTarget.paneId). Widgets use this to drive row tinting /
+   *  A host may call this after resolving the pointer target. Widgets
+   *  use it to drive row tinting /
    *  preview refresh / auxiliary tooltip copy — visual effects only,
    *  hence the void return. Consume-able hover goes through
    *  onMouse(type:'motion') instead. */

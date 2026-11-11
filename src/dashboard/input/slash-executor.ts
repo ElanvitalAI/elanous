@@ -5,9 +5,7 @@ import { dashboardStatusSummaryLines } from '../dashboard-status-lines.js';
 export interface ImmediateDashboardSlashDeps {
   getStatusLines: () => string[];
   openPaneModal?: (pane: PaneFocus) => void;
-  openBrowserPreviewModal?: () => void;
-  openSurfaceInVw?: (surface: 'browser' | 'preview' | 'browser-preview' | 'scratch') => boolean;
-  openSurfaceCatalog?: () => boolean;
+  openSurfaceInVw?: (surface: 'browser' | 'preview' | 'scratch') => boolean;
   openCompanionSurface?: (
     surface: 'clipboard' | 'memo' | 'detail',
     target: 'popup' | 'vw',
@@ -32,16 +30,6 @@ export function executeImmediateDashboardSlash(
   if ((req.name === 'surface' || req.name === 'surf') && req.args.length >= 1) {
     const arg = req.args[0]!.toLowerCase();
     const target = (req.args[1] ?? '').toLowerCase();
-    if (arg === 'catalog' || arg === 'cat' || arg === 'menu') {
-      const opened = deps.openSurfaceCatalog?.() ?? false;
-      if (!opened) return null;
-      return {
-        ok: true,
-        name: req.name,
-        args: req.args,
-        logLines: ['Opened the surface catalog.'],
-      };
-    }
     const pane =
       arg === 'browser' || arg === 'b' ? 'browser'
       : arg === 'preview' || arg === 'p' ? 'preview'
@@ -52,7 +40,6 @@ export function executeImmediateDashboardSlash(
       : arg === 'skill-file' || arg === 'file' || arg === 'f' ? 'skill-file'
       : arg === 'agents' || arg === 'agent-roster' || arg === 'a' ? 'agent-roster'
       : arg === 'detail' || arg === 'd' ? 'agent-detail'
-      : arg === 'browser-preview' || arg === 'bp' ? 'browser-preview'
       : null;
     const companion =
       arg === 'clipboard' || arg === 'clip' || arg === 'c' ? 'clipboard'
@@ -74,7 +61,6 @@ export function executeImmediateDashboardSlash(
       if (
         pane === 'browser'
         || pane === 'preview'
-        || pane === 'browser-preview'
         || pane === 'scratch'
       ) {
         const opened = deps.openSurfaceInVw?.(pane) ?? false;
@@ -96,15 +82,6 @@ export function executeImmediateDashboardSlash(
         name: req.name,
         args: req.args,
         logLines: [`Opened ${companion} companion.`],
-      };
-    }
-    if (pane === 'browser-preview') {
-      deps.openBrowserPreviewModal?.();
-      return {
-        ok: true,
-        name: req.name,
-        args: req.args,
-        logLines: ['Opened browser + preview surface.'],
       };
     }
     if (pane) {

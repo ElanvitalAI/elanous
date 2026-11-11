@@ -15,6 +15,10 @@ export type TrainVerdict = { number: number; verdict: 'pass' | 'fail' | 'conflic
 export type TrainConflictPlanSummary = { number: number; files: string[]; decision: ConflictRepairPlan['decision'] | 'unmeasured'; reason: string; goal?: string };
 export type TrainObservation = {
   batch: number[];
+  /** PR heads pinned before integration; the integration commit is a different SHA. */
+  heads: { number: number; head: string }[];
+  /** Every gate attempt, including failed combinations and bisected retries. */
+  gateAttempts: { integrationHead: string; members: { number: number; head: string }[]; result: 'pass' | 'fail' | 'unmeasured' }[];
   deferred: TrainDeferred[] | null;
   gatesRun: number;
   passed: number[];
@@ -337,6 +341,7 @@ function uxSimMergeDriverArgs(repo: string): string[] {
   const driver = resolve(repo, 'scripts/ux-sim-merge-driver.mjs');
   return [
     '-c', `merge.uxsim-manual.driver=node \"${driver}\" manual \"%O\" \"%A\" \"%B\"`,
+    '-c', `merge.uxsim-history.driver=node \"${driver}\" catalog \"%O\" \"%A\" \"%B\"`,
   ];
 }
 
@@ -538,6 +543,7 @@ export async function runTrain(batch: readonly TrainCandidate[], deps: {
     batch: batch.map(({ number, head }) => ({ number, head })) });
   const verdicts = new Map<number, TrainVerdict['verdict']>();
   let gatesRun = 0;
+  const gateAttempts: TrainObservation['gateAttempts'] = [];
   let integrations = 0;
   let stopped = false;
   const conflictPlans: TrainConflictPlanSummary[] = [];
@@ -565,6 +571,8 @@ export async function runTrain(batch: readonly TrainCandidate[], deps: {
     if (!remaining.length) return;
     gatesRun++;
     const result = await deps.gate(integration.commitSha, remaining.map((item) => item.number));
+    gateAttempts.push({ integrationHead: integration.commitSha,
+      members: remaining.map(({ number, head }) => ({ number, head })), result });
     if (result === 'unmeasured') {
       stopped = true;
     } else if (result === 'pass' || remaining.length === 1) {
@@ -583,7 +591,8 @@ export async function runTrain(batch: readonly TrainCandidate[], deps: {
   const ordered = batch.map((item): TrainVerdict => ({ number: item.number, verdict: verdicts.get(item.number) ?? 'unmeasured' }));
   const passed = ordered.filter((item) => item.verdict === 'pass').map((item) => item.number);
   const data: TrainObservation = {
-    batch: batch.map((item) => item.number), deferred: deps.deferred ?? null, gatesRun,
+    batch: batch.map((item) => item.number), heads: batch.map(({ number, head }) => ({ number, head })),
+    gateAttempts, deferred: deps.deferred ?? null, gatesRun,
     passed, culprits: ordered.filter((item) => item.verdict === 'fail' || item.verdict === 'conflict').map((item) => item.number),
     unmeasured: ordered.filter((item) => item.verdict === 'unmeasured').map((item) => item.number),
     gatesPerLanding: gatesRun / Math.max(passed.length, 1),

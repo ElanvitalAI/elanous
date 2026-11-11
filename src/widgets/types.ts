@@ -447,7 +447,7 @@ export interface Widget<S = unknown, Config = Record<string, unknown>> {
   /** IDX-F5d Phase 2 (2026-04-22) — widget-level hover hook. Mirrors
    *  `View.onHover` (src/ui/view.ts:159) on the pane rail.
    *
-   *  Dispatched when the HoverTracker's pane-body target transitions
+   *  Dispatched when a pane-body pointer target transitions
    *  — on enter (pointer first crosses this widget), leave (pointer
    *  moves to a different widget / off-screen), over (subsequent
    *  position updates while still on this widget), and stable (the

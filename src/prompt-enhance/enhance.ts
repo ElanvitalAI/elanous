@@ -12,7 +12,8 @@
 //
 // 재사용: streamLLM(가산 스캐폴드 생성)·debug.log(관측). 원문 임베딩은 결정론(구조적 보존 보장).
 import { tierModel } from '../llm/model-defaults.js';
-import { streamLLM, type LLMMessage } from '../llm.js';
+import type { LLMMessage } from '../llm.js';
+import { streamRoleLlm } from '../llm/role-stream.js';
 import { debug } from '../debug/log.js';
 import type { LLMUsage } from '../prompt-cache/types.js';
 import { llmUsageCostFields } from '../budget/llm-cost.js';
@@ -465,9 +466,11 @@ export async function enhancePrompt(raw: string, opts: EnhanceOpts = {}): Promis
       firstTokenLogged = true;
       debug.log('prompt-enhance.stream', 'first-token', { model, ttftMs: Math.max(0, now() - requestStartedAt) });
     };
-    const rawOut = await streamLLM(messages, onChunk, {
-      model,
+    const rawOut = await streamRoleLlm('planning', messages, onChunk, {
+      config: opts.config ?? getUserConfig(),
+      ...(modelSource === 'config-role' && !process.env.ELANOUS_PROMPT_ENHANCE_MODEL ? {} : { roleModelOverride: model }),
       reasoningEffort: effort,
+      usagePhase: 'prompt-enhance',
       onUsage: (usage) => {
         logLlmUsage(model, usage);
         try { opts.onUsage?.(usage); } catch { /* usage observation must not change enhancement */ }

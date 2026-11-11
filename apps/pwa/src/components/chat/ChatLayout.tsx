@@ -9,6 +9,9 @@ import { useDaemon } from '@/components/providers/DaemonProvider';
 import { SeatsNowStrip } from './SeatsNowStrip';
 import { NowSpeakButton } from './NowSpeakButton';
 import { ChatApprovalsChip } from './ChatApprovalsChip';
+import { MemberProposalCard } from './MemberProposalCard';
+import { useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
+import { createMemberMiniBoardApi } from '@/lib/member-mini-board-api';
 import { DeployConfirmCard } from './DeployConfirmCard';
 import { ChatDecisionsChip } from './ChatDecisionsChip';
 import { MobileChatStatus } from './MobileChatStatus';
@@ -123,6 +126,8 @@ export interface ChatLayoutProps {
 }
 
 export function ChatLayout(props: ChatLayoutProps = {}) {
+  const memberNexus = useOptionalNexusClient();
+  const memberBoardApi = useMemo(() => memberNexus ? createMemberMiniBoardApi(memberNexus.baseUrl) : null, [memberNexus?.baseUrl]);
   const { compact } = useCompactMode();
   const [moreOpen, setMoreOpen] = useState(false);
   const [actionsOpen, setActionsOpen] = useState(false);
@@ -1432,6 +1437,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           flex-1 sizing 을 동시에 만족. voice 활성 시 overlay 가 fade-in. */}
       <div className="relative flex flex-1 min-h-0 flex-col">
         <ChatHistory messages={messages} pending={pending} mobileSimple={!!(props.mobileSimple && compact)} />
+        <MemberProposalCard api={memberBoardApi} />
         {deployConfirm && <DeployConfirmCard question={deployConfirm.question}
           onNo={() => askQuestion.submit({ answers: { confirm: deployConfirm.no } })}
           onYes={() => askQuestion.submit({ answers: { confirm: deployConfirm.yes } })} />}

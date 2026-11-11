@@ -18,7 +18,7 @@ function event(
   return createAppLifecycleEvent({
     appId,
     action,
-    environment: action === 'promoted' || action === 'paused' || action === 'rolled-back' ? 'live' : 'simulation',
+    environment: action === 'promoted' || action === 'upgrade' || action === 'paused' || action === 'rolled-back' ? 'live' : 'simulation',
     actor: 'user',
     ...extra,
   }, { id: () => `event-${String(++nextId).padStart(4, '0')}`, now: () => new Date(at) });
@@ -78,6 +78,17 @@ describe('app lifecycle projection core', () => {
       appId: 'voice-notes', status: 'live', currentVersion: 'v1', previousVersion: 'v2',
       latestReceiptId: 'receipt-1', eventCount: 9,
       latestEvent: { action: 'restored', outcome: 'succeeded' },
+    });
+  });
+
+  test('records an app feature upgrade as a new live version with the prior version retained', () => {
+    const events = [
+      event('lecture-scrap', 'created', { environment: 'live', appVersion: 'v1' }),
+      event('lecture-scrap', 'upgrade', { environment: 'live', appVersion: 'v2', receiptId: 'upgrade-receipt' }),
+    ];
+    expect(projectAppLifecycleSnapshot('lecture-scrap', events)).toMatchObject({
+      status: 'live', currentVersion: 'v2', previousVersion: 'v1', latestReceiptId: null,
+      latestEvent: { action: 'upgrade', appVersion: 'v2' },
     });
   });
 

@@ -13,9 +13,11 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 // 새 코어 앱 도구는 여기 spec+dispatch 만 추가하면 전 서피스가 자동 상속한다.
 
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { Database } from 'bun:sqlite';
 
 import { debug } from '../debug/log.js';
+import { listMemories, loadMemory, memoryRoot, saveMemory } from '../memory.js';
 import { runRecall, CONTEXT_NOW_SPEC, type RecallSearch } from '../tool-runtime/self-cognition-runtimes.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import { SCHEDULE_MANAGE_SPEC, dispatchScheduleManage } from './schedule-manage-tool.js';
@@ -54,6 +56,59 @@ const MEMORY_RECALL_SPEC: LLMToolSpec = {
     required: [],
   },
 };
+
+/** File-backed memory write, shared by every conversational surface. */
+const MEMORY_SAVE_SPEC: LLMToolSpec = {
+  name: 'memory_save',
+  description: '사용자가 명시적으로 기억해 달라고 한 지속 정보만 파일 기억에 저장한다. 새 대화와 재기동 후에도 주입된다.',
+  parameters: {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: '짧은 기억 제목' },
+      body: { type: 'string', description: '기억할 사실. 사용자 요청에 근거한 내용만.' },
+      type: { type: 'string', enum: ['user', 'feedback', 'project', 'reference'], description: '기억 종류' },
+      pinned: { type: 'boolean', description: '모든 대화에 항상 주입해야 하는 핵심 사실이면 true. 민감하거나 필요할 때만 검색할 사실이면 false.' },
+    },
+    required: ['name', 'body'],
+  },
+};
+
+export async function dispatchMemorySave(args: Record<string, unknown>, root: string = memoryRoot()): Promise<unknown> {
+  const name = typeof args.name === 'string' ? args.name.trim() : '';
+  const body = typeof args.body === 'string' ? args.body.trim() : '';
+  if (!name || name.length > 80 || !body || body.length > 2000) {
+    return { error: 'name(1..80)과 body(1..2000)가 필요하다.' };
+  }
+  const type = ['user', 'feedback', 'project', 'reference'].includes(String(args.type))
+    ? args.type as 'user' | 'feedback' | 'project' | 'reference' : 'user';
+  const id = `llm-${createHash('sha256').update(`${type}\0${name.toLowerCase()}\0${body}`).digest('hex').slice(0, 16)}`;
+  try {
+    // A user-name tool save always uses the same record as a direct command.
+    if (type === 'user' && ['사용자 이름', 'user name'].includes(name.toLowerCase())) {
+      const previous = loadMemory('tui-user-name', root);
+      const pinned = args.pinned === false ? false : true;
+      if (previous?.body.trim() === body && previous.pinned === pinned) {
+        debug.log('memory.persist', 'tool-already-saved', { id: 'tui-user-name', type });
+        return { saved: true, id: 'tui-user-name', type, pinned };
+      }
+      saveMemory({ id: 'tui-user-name', type: 'user', name: '사용자 이름',
+        description: '사용자가 직접 알려준 이름', body, pinned }, root);
+      debug.log('memory.persist', 'tool-updated', { id: 'tui-user-name', type });
+      return { saved: true, id: 'tui-user-name', type, pinned };
+    }
+    const sameFact = listMemories({ type }, root).find(entry => entry.body.trim() === body);
+    const pinned = typeof args.pinned === 'boolean' ? args.pinned : sameFact?.pinned ?? false;
+    const effectiveId = sameFact?.id ?? id;
+    if (!sameFact || sameFact.pinned !== pinned) {
+      saveMemory({ id: effectiveId, type, name, description: name, body, pinned }, root);
+    }
+    debug.log('memory.persist', sameFact ? 'tool-already-saved' : 'tool-saved', { id: effectiveId, type, pinned });
+    return { saved: true, id: effectiveId, type, pinned };
+  } catch (error) {
+    debug.log('memory.persist', 'tool-failed', { id, error: String(error) });
+    return { saved: false, error: '기억 저장에 실패했다.' };
+  }
+}
 
 /** memory_recall 코어(db 주입·테스트 가능). restoreId 지정 시 느린 복원(축B P2), 아니면 회상 + archive 발견.
  *  recency+importance+relevance 스코어. restoreDeps 는 테스트 S3 mock(생략 시 기본 S3). */
@@ -115,6 +170,7 @@ const CORE_TOOL_HANDLERS: Record<string, (args: Record<string, unknown>, onParti
   schedule_manage: dispatchScheduleManage,
   session_manage: (args) => dispatchSessionQuery(args), // 대화 세션 검색·열람·목록·삭제(내용/ID/텔레그램)
   memory_recall: dispatchMemoryRecall,
+  memory_save: (args) => dispatchMemorySave(args),
   context_now: async (args) => (await import('../context-bus/context-now.js')).contextNow({ ...(typeof args.topic === 'string' ? { topic: args.topic } : {}) }),
   fact_check: dispatchFactCheck, // 팩트체크 캐스케이드(내부 발송원장→외부 X/레딧/웹)·도메인 무관 코어
   self_recall: dispatchSelfRecall, // self-awareness(elanous 구현 이력)·도메인 무관 코어
@@ -143,7 +199,7 @@ const SELF_RECALL_BUDGET_SPEC: LLMToolSpec = {
     },
   },
 };
-export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, CONTEXT_NOW_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC, COO_ADMIN_SPEC, RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC, PROACT_METER_SPEC];
+export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, MEMORY_SAVE_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, CONTEXT_NOW_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC, COO_ADMIN_SPEC, RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC, PROACT_METER_SPEC];
 
 export interface CoreTools {
   specs: LLMToolSpec[];

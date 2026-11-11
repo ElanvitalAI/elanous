@@ -17,5 +17,5 @@
     "provider error event",
     "launch/recovery disposition"
   ],
-  "expected": "credential absence and temporary provider unavailability remain distinguishable"
+  "expected": "credential absence and temporary provider unavailability remain distinguishable; the default chain ends without prohibited Z.ai fallback"
 }

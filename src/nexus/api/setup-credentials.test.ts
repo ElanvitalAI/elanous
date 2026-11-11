@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
 import { consumeCredentialRegistrationBearer, issueSetupLinkToken } from '../../auth/setup-link-tokens.js';
-import { handleCredentialRegistrationClaim, handleCredentialRegistrationLinkCreate, handleCredentialRegistrationLinkRevoke, handleCredentialRegistrationSubmit } from './setup-credentials.js';
+import { handleCredentialRegistrationClaim, handleCredentialRegistrationLinkCreate, handleCredentialRegistrationLinkRevoke, handleCredentialRegistrationSubmit, handleCredentialSlotsGet } from './setup-credentials.js';
+import { createFakeCred } from '../../ux-sim/fake-cred.js';
 import { fileBackend } from '../config/secrets/file-backend.js';
 import { hasCredentialSlotWriteReceipt, registerBackend, resetBackendRegistry, useBackend, writeCredentialSlotBatchValue } from '../config/secrets/registry.js';
 
@@ -22,6 +23,54 @@ const interruptionFixtureEnv = (configDir: string): NodeJS.ProcessEnv => ({
   ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
   ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
   ELANOUS_CONFIG_DIR: configDir,
+});
+
+test('credential slots GET carries observed health without exposing the stored value or grant metadata', async () => {
+  // Source: a fixed fake clock and expiry keep the observed health deterministic.
+  const fake = createFakeCred({ now: () => 1_000 });
+  fake.install('cred:eodhd.api_key', { permissions: ['market.read'], expiresAt: 2_000 });
+  fake.install('cred:krx.api_key', { permissions: ['write'], expiresAt: 2_000 });
+  const secret = 'fixture-credential-value-must-stay-private';
+  writeCredentialSlotBatchValue({ 'cred:eodhd.api_key': secret, 'cred:krx.api_key': secret });
+  const response = await handleCredentialSlotsGet(new Request('https://nexus.example/v1/credentials/slots'), {
+    authorizeOwner: () => true,
+    healthObserver: { inspect: fake.inspect, permissionFor: () => 'market.read', now: () => 1_000,
+      warningWindowMs: 100 }, // Source: a short explicit warning window checks the response path.
+  });
+  expect(response.status).toBe(200);
+  const body = await response.text();
+  const parsed = JSON.parse(body) as { credentials: Array<{ id: string; present: boolean; healthStatus?: string }> };
+  expect(parsed.credentials.find((row) => row.id === 'cred:eodhd.api_key')).toMatchObject({ present: true, healthStatus: 'valid' });
+  expect(parsed.credentials.find((row) => row.id === 'cred:krx.api_key')).toMatchObject({ present: true, healthStatus: 'insufficient-permission' });
+  expect(parsed.credentials.find((row) => row.id === 'cred:fds.api_key')).toMatchObject({ present: false, healthStatus: 'missing' });
+  expect(body).not.toContain(secret);
+  expect(body).not.toContain('permissions');
+  expect(body).not.toContain('expiresAt');
+});
+
+test('credential slots GET reports opaque API key expiry as unmeasured and OAuth state from the token store', async () => {
+  const secret = 'private-key-not-for-response';
+  writeCredentialSlotBatchValue({ 'cred:eodhd.api_key': secret });
+  const storePath = join(dir, 'auth.json');
+  // Source: fixed OAuth fixture timestamps and scope separate valid from expiring and insufficient permission.
+  writeFileSync(storePath, JSON.stringify({ version: 1, providers: {
+    'openai-codex': { tokens: { accessToken: 'private-oauth-token', refreshToken: '', expiresAt: 1_000_000,
+      scope: 'openid profile email offline_access' }, lastRefresh: 'fixture' },
+    anthropic: { tokens: { accessToken: 'private-anthropic-token', refreshToken: '', expiresAt: 1_000_000 }, lastRefresh: 'fixture' },
+  } }));
+  const response = await handleCredentialSlotsGet(new Request('https://nexus.example/v1/credentials/slots'), {
+    authorizeOwner: () => true, oauthStorePath: storePath, now: () => 1_000,
+  });
+  const body = await response.text();
+  const parsed = JSON.parse(body) as { credentials: Array<{ id: string; present: boolean; healthStatus: string; healthLabel: string }>;
+    oauth: Array<{ provider: string; healthStatus: string }> };
+  expect(parsed.credentials.find((row) => row.id === 'cred:eodhd.api_key')).toMatchObject({ present: true, healthStatus: 'unmeasured', healthLabel: '있음 · 만료 정보 없음(측정 안 됨)' });
+  expect(parsed.credentials.find((row) => row.id === 'cred:krx.api_key')).toMatchObject({ present: false, healthStatus: 'missing' });
+  expect(parsed.oauth.find((row) => row.provider === 'openai-codex')?.healthStatus).toBe('valid');
+  expect(parsed.oauth.find((row) => row.provider === 'anthropic')?.healthStatus).toBe('unmeasured');
+  expect(body).not.toContain(secret);
+  expect(body).not.toContain('private-oauth-token');
+  expect(body).not.toContain('private-anthropic-token');
 });
 
 test('oversized streamed JSON is cancelled before the full request body is read', async () => {

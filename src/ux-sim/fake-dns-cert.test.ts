@@ -14,6 +14,9 @@ import {
 
 const EPOCH = Date.parse('2026-11-05T00:00:00Z');
 const DAY = 24 * 60 * 60 * 1000;
+// Source: local fake-ACME propagation scenarios model a delay longer than the configured simulated timeout.
+const CUSTOM_ACME_DELAY_MS = 30;
+const CUSTOM_ACME_TIMEOUT_MS = 20;
 
 async function settleAt<T>(operation: () => Promise<T>, clock: { tick(ms: number): void }, ms: number): Promise<T> {
   const pending = operation();
@@ -30,6 +33,64 @@ function advanceClock(clock: { tick(ms: number): void }, ms: number): void {
 }
 
 describe.serial('SIM-FAKE-DNS-CERT', () => {
+  it('requires app CNAME and owner TXT proof before ACME simulation can issue a custom-domain certificate', async () => {
+    const device = createFakeDnsCert();
+    device.registerApp('notes--alice.elanous.app');
+    const rejected = device.connectCustomDomain({ hostname: 'notes.example.test', appHost: 'notes--alice.elanous.app',
+      cnameTarget: 'other--alice.elanous.app', ownerTxt: { name: '_elanous-owner.notes.example.test', value: 'proof-a' }, expectedOwnerProof: 'proof-a' });
+    expect(rejected).toMatchObject({ status: 'rejected', reason: 'cname-mismatch', certificateReady: false });
+    expect(device.customDomain('notes.example.test')).toBeUndefined();
+    const verified = device.connectCustomDomain({ hostname: 'notes.example.test', appHost: 'notes--alice.elanous.app',
+      cnameTarget: 'notes--alice.elanous.app', ownerTxt: { name: '_elanous-owner.notes.example.test', value: 'proof-a' }, expectedOwnerProof: 'proof-a' });
+    expect(verified).toMatchObject({ status: 'verified', appHost: 'notes--alice.elanous.app', certificateReady: false });
+    expect(device.customDomain('notes.example.test')).toEqual({ appHost: 'notes--alice.elanous.app', certificateReady: false });
+    expect(await device.issueCustomCertificate('notes.example.test')).toMatchObject({ status: 'issued' });
+    expect(device.customDomain('notes.example.test')).toEqual({ appHost: 'notes--alice.elanous.app', certificateReady: true });
+    expect(device.connectCustomDomain({ hostname: 'other.example.test', appHost: 'notes--alice.elanous.app',
+      cnameTarget: 'notes--alice.elanous.app', ownerTxt: { name: '_elanous-owner.other.example.test', value: 'wrong' }, expectedOwnerProof: 'proof-a' }))
+      .toMatchObject({ status: 'rejected', reason: 'owner-proof-mismatch', certificateReady: false });
+    expect(device.connectCustomDomain({ hostname: 'voice.example.test', appHost: 'notes--alice.elanous.app',
+      cnameTarget: 'notes--alice.elanous.app', ownerTxt: { name: '_elanous-owner.voice.example.test', value: 'proof-b' },
+      expectedOwnerProof: 'proof-b', cloudflareTokenAvailable: true }))
+      .toMatchObject({ status: 'verified', dnsSetup: 'cloudflare-simulated', certificateReady: false });
+  });
+
+  it('keeps custom-domain TLS unready when CAA rejects issuance or TXT propagation times out', async () => {
+    const caaDenied = createFakeDnsCert({ caaAllowed: false });
+    caaDenied.registerApp('notes--alice.elanous.app');
+    caaDenied.connectCustomDomain({ hostname: 'notes.example.test', appHost: 'notes--alice.elanous.app',
+      cnameTarget: 'notes--alice.elanous.app', ownerTxt: { name: '_elanous-owner.notes.example.test', value: 'proof-a' }, expectedOwnerProof: 'proof-a' });
+    expect(await caaDenied.issueCustomCertificate('notes.example.test')).toMatchObject({ status: 'failed', reason: 'caa-rejected' });
+    expect(caaDenied.customDomain('notes.example.test')?.certificateReady).toBe(false);
+
+    await withSimClock(EPOCH, async (clock) => {
+      const delayed = createFakeDnsCert({ txtPropagationDelayMs: CUSTOM_ACME_DELAY_MS, propagationTimeoutMs: CUSTOM_ACME_TIMEOUT_MS });
+      delayed.registerApp('notes--alice.elanous.app');
+      delayed.connectCustomDomain({ hostname: 'notes.example.test', appHost: 'notes--alice.elanous.app',
+        cnameTarget: 'notes--alice.elanous.app', ownerTxt: { name: '_elanous-owner.notes.example.test', value: 'proof-a' }, expectedOwnerProof: 'proof-a' });
+      const result = await settleAt(() => delayed.issueCustomCertificate('notes.example.test'), clock, CUSTOM_ACME_TIMEOUT_MS);
+      expect(result).toMatchObject({ status: 'failed', reason: 'propagation-timeout' });
+      expect(delayed.customDomain('notes.example.test')?.certificateReady).toBe(false);
+    });
+  });
+
+  it('does not certify a custom domain after its verified app binding changes during ACME propagation', async () => {
+    await withSimClock(EPOCH, async (clock) => {
+      const device = createFakeDnsCert({ txtPropagationDelayMs: CUSTOM_ACME_DELAY_MS });
+      device.registerApp('notes--alice.elanous.app');
+      device.registerApp('voice--alice.elanous.app');
+      device.connectCustomDomain({ hostname: 'app.example.test', appHost: 'notes--alice.elanous.app',
+        cnameTarget: 'notes--alice.elanous.app', ownerTxt: { name: '_elanous-owner.app.example.test', value: 'proof-a' }, expectedOwnerProof: 'proof-a' });
+      const pending = device.issueCustomCertificate('app.example.test');
+      await Promise.resolve();
+      device.connectCustomDomain({ hostname: 'app.example.test', appHost: 'voice--alice.elanous.app',
+        cnameTarget: 'voice--alice.elanous.app', ownerTxt: { name: '_elanous-owner.app.example.test', value: 'proof-b' }, expectedOwnerProof: 'proof-b' });
+      clock.tick(CUSTOM_ACME_DELAY_MS);
+      expect(await pending).toMatchObject({ status: 'failed', reason: 'domain-changed' });
+      expect(device.customDomain('app.example.test')).toEqual({ appHost: 'voice--alice.elanous.app', certificateReady: false });
+    });
+  });
+
   it('matches one wildcard label and keeps one relay record for 100 app registrations', () => {
     const device = createFakeDnsCert();
     expect(device.zone.records).toEqual([{ name: '*.elanous.app', type: 'CNAME', value: 'relay-edge.elanous.net' }]);

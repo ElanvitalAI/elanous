@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 export type DirectiveSource = 'telegram' | 'pwa' | 'tui' | 'cli';
 export interface DirectiveIssue { id: string; identifier: string; title: string; description?: string | null }

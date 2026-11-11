@@ -63,6 +63,23 @@ export function defaultPluginStatuses(input: {
 
 const DEFAULT_PLUGIN_ROOT = resolve(import.meta.dir, '../../../plugins');
 
+/** The shipped board handler has exactly these three out-of-package host imports. */
+function knownAbsorbHostImports(packageRoot: string, security: ReturnType<typeof inspectPluginSecurity>): boolean {
+  const dangerous = security.findings.filter(finding => finding.level === 'dangerous');
+  if (dangerous.length !== 3 || dangerous.some(finding => finding.code !== 'unsafe-import')) return false;
+  const handler = join(packageRoot, 'handlers', 'board-approval.ts');
+  if (!existsSync(handler)) return false;
+  const imports = [...readFileSync(handler, 'utf8').matchAll(/^import\s+.+\s+from\s+['"]([^'"]+)['"];?\s*$/gm)]
+    .map(match => match[1]!)
+    .filter(target => target.startsWith('../') || target.startsWith('/') || target.startsWith('file:'));
+  const expected = [
+    '../../../src/nexus/api/board-api.js',
+    '../../../src/graph-runner/runner.js',
+    '../../../src/tool-router/index.js',
+  ];
+  return imports.length === expected.length && expected.every(target => imports.includes(target));
+}
+
 /** Install the curated default group from this distribution's packaged plugin assets. */
 export async function installDefaultPluginGroup(opts: InstallOptions = {}): Promise<InstalledPlugin[]> {
   const root = resolve(opts.root ?? elanousStateRoot());
@@ -506,6 +523,13 @@ export function pluginInstallPath(root: string, market: string, manifest: Plugin
 
 export async function installPlugin(spec: string, opts: InstallOptions = {}): Promise<InstalledPlugin> {
   const root = resolve(opts.root ?? elanousStateRoot());
+  // Only this distribution's bundled absorb handler imports host APIs outside
+  // its package. Author-supplied trust metadata cannot grant this exception.
+  const bundledAbsorb = (() => {
+    const candidate = resolve(opts.cwd ?? process.cwd(), spec);
+    const bundled = join(DEFAULT_PLUGIN_ROOT, 'absorb');
+    return existsSync(candidate) && existsSync(bundled) && realpathSync(candidate) === realpathSync(bundled);
+  })();
   const stageRoot = join(root, 'plugins', '.staging');
   assertInstallParents(root, join(stageRoot, 'plugin'));
   mkdirSync(stageRoot, { recursive: true });
@@ -559,11 +583,13 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     const capabilities = manifest.capabilities.map(capability => capability.kind);
     const required = capabilities.length > 0;
     const preConsent = decidePluginInstallation(security, capabilities, false);
-    if (!preConsent.ok && preConsent.reason === 'scan') fail('scan', 'plugin static security scan rejected package');
+    const bundledHostImports = bundledAbsorb && knownAbsorbHostImports(packageRoot, security);
+    if (!preConsent.ok && preConsent.reason === 'scan' && !bundledHostImports) fail('scan', 'plugin static security scan rejected package');
     emit({ event: 'consent', capabilities, required });
     const consented = !required || !!(opts.yes || await opts.consent?.(capabilities));
+    if (!consented) fail('consent-denied', 'plugin capabilities require consent');
     const decision = decidePluginInstallation(security, capabilities, consented);
-    if (!decision.ok) fail(decision.reason, decision.reason === 'scan'
+    if (!decision.ok && !(decision.reason === 'scan' && bundledHostImports)) fail(decision.reason, decision.reason === 'scan'
       ? 'plugin static security scan rejected package' : 'plugin capabilities require consent');
     const packs = await stageRequiredKnowledgePacks(manifest.requires?.knowledgePacks ?? [], source.market, stage, root, opts);
     emit({ event: 'credentials', connectors: (manifest.contributes.connectors ?? []).map(connector => ({
@@ -609,7 +635,8 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
         let installedSecurity: ReturnType<typeof inspectPluginSecurity>;
         try { installedSecurity = inspectPluginSecurity(destination); }
         catch { fail('scan', 'plugin package integrity verification failed'); }
-        if (installedSecurity.integrity !== security.integrity || installedSecurity.scan === 'dangerous') {
+        if (installedSecurity.integrity !== security.integrity ||
+          (installedSecurity.scan === 'dangerous' && !bundledHostImports)) {
           fail('scan', 'plugin package integrity changed during installation');
         }
         writeLedger(root, [...listInstalledPlugins(root), item]);

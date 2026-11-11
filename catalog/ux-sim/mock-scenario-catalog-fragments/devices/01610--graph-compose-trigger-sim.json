@@ -1,0 +1,32 @@
+{
+  "id": "graph-compose-trigger-sim",
+  "name": "Graph composition trigger and lineage simulator",
+  "implementation": [
+    "src/graph-runner/runner.ts",
+    "src/self-implement/graph-yaml.ts",
+    "src/self-implement/run-ledger.ts"
+  ],
+  "tests": [
+    "src/ux-sim/graph-compose-trigger-sim.test.ts"
+  ],
+  "target": "Simulate starting a separate target graph run from a parent run with declared input validation and Nexus run-ledger lineage.",
+  "inputs": [
+    "A fake target graph declaring required typed inputs",
+    "A parent run that triggers the target",
+    "Fire and await trigger modes",
+    "Missing and invalid target inputs"
+  ],
+  "observations": [
+    "Missing or wrong-type inputs refuse before a child run or ledger row is created",
+    "The target receives the supplied inputs in its own run",
+    "Fire mode lets the parent finish while the child remains pending",
+    "Await mode returns after the separate child run finishes",
+    "Nexus run-ledger rows link childRunId to parentRunId"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/graph-compose-trigger-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

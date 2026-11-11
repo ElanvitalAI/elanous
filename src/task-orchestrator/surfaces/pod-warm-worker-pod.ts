@@ -77,11 +77,12 @@ if (!(await warmIsolationEnforced())) throw new Error('warm Pod isolation not en
 
 /** Clone and verify source while the private mirror is mounted only here. */
 export const WARM_POD_PREPARE = `import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 const checked = (argv) => { const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); if (r.status !== 0) throw new Error(argv[0] + ': ' + r.stderr); return r.stdout.trim(); };
 checked(['git', 'clone', '--quiet', '--no-checkout', process.env.WARM_SOURCE_URL, '/workspace/repo']);
 checked(['git', '-C', '/workspace/repo', 'checkout', '--detach', '--quiet', process.env.WARM_CUT_SHA]);
 if (checked(['git', '-C', '/workspace/repo', 'rev-parse', 'HEAD']) !== process.env.WARM_CUT_SHA) throw new Error('warm source SHA mismatch');
-const { gateLockfileHash } = await import('/workspace/repo/src/self-implement/gate-receipt-registry.ts');
+const { gateLockfileHash } = await import(pathToFileURL('/workspace/repo/src/self-implement/gate-receipt-registry.ts').href);
 if (gateLockfileHash('/workspace/repo') !== process.env.WARM_LOCK_HASH) throw new Error('warm lock mismatch');
 checked(['git', '-C', '/workspace/repo', 'remote', 'remove', 'origin']);`;
 
@@ -177,6 +178,7 @@ process.stdout.write(readFileSync(process.argv.at(-1)).toString('base64'));`;
 
 /** Read-only runtime probe for an image-drifted standing Pod. */
 export const WARM_POD_RUNTIME_PROBE = `import { accessSync, constants } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { delimiter, join } from 'node:path';
 const request = JSON.parse(await Bun.stdin.text());
 const tools = Object.fromEntries(request.requiredTools.map((tool) => {
@@ -186,7 +188,7 @@ const tools = Object.fromEntries(request.requiredTools.map((tool) => {
   return [tool, found];
 }));
 const architecture = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch;
-const { gateLockfileHash } = await import('/workspace/repo/src/self-implement/gate-receipt-registry.ts');
+const { gateLockfileHash } = await import(pathToFileURL('/workspace/repo/src/self-implement/gate-receipt-registry.ts').href);
 process.stdout.write(JSON.stringify({ bunVersion: Bun.version, os: process.platform, architecture, tools, lockHash: gateLockfileHash('/workspace/repo') }));`;
 
 function imageRepositoryAndDigest(image: unknown): { repository: string; digest: string } | null {

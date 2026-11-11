@@ -28,7 +28,7 @@ export function createGateCorrelationContext(input: Partial<GateCorrelationConte
   const evidenceLevel = requestedLevel && evidenceLevels.has(requestedLevel) ? requestedLevel : 'unknown';
   return {
     runId,
-    invocation: input.invocation ?? processInvocation,
+    invocation: input.invocation ?? process.env.ELANOUS_GATE_INVOCATION ?? processInvocation,
     batch: input.batch ?? process.env.ELANOUS_BATCH_ID ?? 'unknown',
     shard: input.shard ?? null,
     attempt: input.attempt ?? null,
@@ -41,7 +41,8 @@ export function createGateCorrelationContext(input: Partial<GateCorrelationConte
 }
 
 export function withGateCorrelationContext<T>(context: GateCorrelationContext, run: () => T): T {
-  return contextStorage.run(context, run);
+  // A caller may reuse an identity template across concurrent observations. Phase updates stay local to each scope.
+  return contextStorage.run({ ...context }, run);
 }
 
 export function currentGateCorrelationContext(): GateCorrelationContext | undefined {

@@ -20,15 +20,6 @@ import {
 const names = (root: Command) => root.commands.map(command => command.name());
 
 describe('provider CLI registration', () => {
-  test('index calls the registrar at the original provider boundary before status-bar', () => {
-    const source = readFileSync(new URL('../index.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('registerProviderCommands(program);');
-    const statusBar = source.indexOf(".command('status-bar')", start);
-    expect(start).toBeGreaterThan(0);
-    expect(statusBar).toBeGreaterThan(start);
-    expect(source.slice(start, statusBar)).not.toContain(".command('provider');");
-  });
-
   test('the entry wires all provider commands into the root, leaving status-bar outside', async () => {
     const { program } = await import('../index.js');
     const expected = ['provider', 'provider:set', 'provider:restore', 'provider:rotate', 'provider:use'];

@@ -9,7 +9,7 @@ import type { BudgetGate } from './feedback-loop.js';
 import { PRIORITY_RANK } from './priority.js';
 import type { Task } from './types.js';
 import { decideBudget, readBudgetInputsLive, type ReadBudgetInputsDeps } from '../self-implement/budget-gate.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { projectLinearTask } from '../connectors/linear-projector.js';
 import type { TaskStore } from './store.js';

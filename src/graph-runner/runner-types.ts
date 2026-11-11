@@ -1,12 +1,14 @@
 import type { GraphEdgeAdditionApi, GraphSubgraphAppendProposal, GraphSubscriptionDispatch } from './graph-subscriptions.js';
 import type { GraphEvent, GraphEventBus } from './graph-events.js';
 import type { GraphNodeSpec } from '../self-implement/graph-yaml.js';
+import type { GraphV2ExtensionLedger } from '../graph-v2/lower.js';
 import type { GraphVariantPlan } from '../self-implement/graph-variant.js';
 import type { ResearchEdgeDecisionRegistry } from '../research/edge-decision.js';
 import type { WorkflowDeps } from '../workflow-runtime/types.js';
 import type { GrowthDecisionDeps, GrowthProposer, GrowthRecipeEffect, GraphGrowth, GrowthCommand } from './graph-grow.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
 import type { InProcessHandlerRegistry } from './in-process-registry.js';
+import type { GraphCapabilityProviders } from './capabilities.js';
 import type { ReleaseStageState } from '../release-loop/stage-mail.js';
 import type { AcceptedRegression, GateExecutorOverride, GatePodPoolOverride, GateShardRerouteOverride } from '../../scripts/release-loop/resume-types.js';
 import type { AdaptiveGateHealAppendNodeRequest, AdaptiveGateHealRerunGateRequest } from '../../scripts/release-loop/adaptive-gate-heal-adapter.js';
@@ -15,6 +17,9 @@ import type { MsgStore } from '../msg/msg-store.js';
 
 export type GraphGrowthScope = 'harness' | 'task-agent';
 type BashRun = WorkflowDeps['runBash'];
+
+/** Parent graph budgets inherited by child unit runs. Internal runGraph handoff only. */
+export interface GraphLoopBudgetScope { readonly graphId: string; readonly runId: string; readonly llmCalls: number }
 
 export interface GraphRunState {
   graphId: string;
@@ -25,7 +30,12 @@ export interface GraphRunState {
   pidStartedAt?: string;
   activeNode?: { nodeId: string; pid: number; pidStartedAt: string };
   stoppedAt?: string;
-  status: 'running' | 'done' | 'failed' | 'budget-exceeded' | 'awaiting-approval';
+  status: 'running' | 'paused' | 'cancelled' | 'done' | 'failed' | 'budget-exceeded' | 'awaiting-approval';
+  forkedFromRunId?: string;
+  forkedFromCommit?: string;
+  forkedToCommit?: string;
+  pausedAt?: string;
+  cancelledAt?: string;
   /** Original named terminal when status is its canonical done/failed mapping. */
   reason?: string;
   path: string[];
@@ -41,11 +51,13 @@ export interface GraphRunState {
   /** The node now running and when it started; cleared when its record is written. */
   currentNode?: { nodeId: string; executionId?: string; startedAt: string };
   input?: unknown;
-  pending?: { nodeId: string; message: string; since: string; notifiedAt?: string; decision?: 'approved' | 'rejected'; decidedBy?: string; decidedAt?: string };
+  pending?: { nodeId: string; message: string; since: string; inputSha256?: string; approvalNonce?: string; notifiedAt?: string; decision?: 'approved' | 'rejected'; decidedBy?: string; decidedAt?: string };
   approvalSourceHash?: string;
   /** Hash of the graph and recipes used for this run; required to safely restart a failed path. */
   sourceHash?: string;
   graphSnapshot?: { graphSha: string; recipesSha: string };
+  /** v2 extension data retained in the run ledger; graphHash binds it to the lowered IR. */
+  graphExtensionLedger?: { graphHash: string; ext: GraphV2ExtensionLedger };
   graphPath?: string;
   variant?: { overlayId: string; goal: string; plan: GraphVariantPlan };
   parentRunId?: string;
@@ -65,6 +77,10 @@ export interface GraphRunState {
   /** Subscriber-proposed event vocabulary and direct edges, durable across run resume. */
   adaptiveGraphVocabulary?: string[];
   adaptiveGraphEdges?: Array<{ from: string; to: string; triggerEvent: string; rationale: string; eventId: string; subscriberId: string }>;
+  /** Durable MRTR handoff emitted by a high-risk ARG open proposal. */
+  argInputRequests?: Array<{ eventId: string; resultType: 'input_required';
+    requestState: Readonly<Record<string, string | number>>;
+    inputRequests: readonly { readonly kind: 'approval'; readonly prompt: string }[] }>;
   /** Release ARG append receipts keyed by the originating bus event identity. */
   adaptiveGateNodeAppends?: Array<{ eventId: string; request: AdaptiveGateHealAppendNodeRequest; graphRevision: number }>;
   /** Same-run host-to-Pod reruns are idempotent per gate failure event. */
@@ -73,7 +89,7 @@ export interface GraphRunState {
   graphRevision?: number;
   /** Failed event envelopes remain byte-for-byte retryable so successful subscribers dedupe. */
   pendingGraphEvents?: GraphEvent[];
-  unitCalls?: Array<{ node: string; unit: string; version: number; hash: string; childRunId: string; exit: string; steps: number; entry?: string; visit?: number; enteredAtMs?: number; exitedAtMs?: number; durationMs?: number }>;
+  unitCalls?: Array<{ node: string; unit: string; version: number; hash: string; shapeHash?: string; childRunId: string; exit: string; steps: number; entry?: string; visit?: number; enteredAtMs?: number; exitedAtMs?: number; durationMs?: number }>;
   /** Persisted fan-out child identities and terminal results; successful branches are immutable on resume. */
   fanOuts?: Record<string, { from: string; join: string; branches: Record<string, {
     runId: string; status: 'running' | 'done' | 'failed'; startedAt: string; endedAt?: string;
@@ -90,6 +106,10 @@ export interface GraphRunState {
    * Legacy parked states without this field resume append-only, so their first recorded event may be applied/rejected. */
   growthEvents?: Array<{ phase: 'proposal' | 'parked' | 'applied' | 'rejected' | 'undo-available'; from: string; outcome: string; at: string; nodeId?: string; kind?: string; reason?: string; undo?: GraphGrowth['undo'] }>;
   growthPark?: { from: string; outcome: string; reason: string; decisionId: string; decisionRef: string; growth: GraphGrowth; command?: GrowthCommand; approval?: string };
+  /** An in-flight declared repair/detour survives a process restart before its rejoin. */
+  healPending?: { edgeRef: string; from: string; via: string; to: string; exhaustedTo: string };
+  /** The declared edge selected for each completed source visit. */
+  healTransitions?: Array<{ edgeRef: string; kind: string; from: string; visit: number; to: string }>;
   resume?: { from: string; visitId?: string; at: string; previousStatus: GraphRunState['status']; graph?: 'snapshot' | 'current'; budgetReset?: { reason: string; at: string; priorExecuted: number; resumedPrefixExecuted: number; priorUnitCalls: number; resumedPrefixUnitCalls: number } };
   /** GATE-HOST-EXECUTOR — every explicit input change a resume made (what was set and what it replaced), oldest first. */
   inputOverrides?: Array<GateExecutorOverride | GatePodPoolOverride | GateShardRerouteOverride>;
@@ -99,6 +119,8 @@ export interface GraphRunState {
 }
 
 export interface GraphRunOptions {
+  /** Event envelope clock for deterministic simulation; defaults to the wall clock. */
+  eventNow?: () => Date;
   input?: unknown;
   /** Merge a small compatibility repair into the saved input while holding the run's resume lock. */
   resumeInputPatch?: Record<string, unknown>;
@@ -135,6 +157,8 @@ export interface GraphRunOptions {
   useCurrentGraph?: boolean;
   /** Internal unit invocation context, propagated only by runGraph. */
   unitContext?: { parentRunId: string; ancestors: readonly string[]; remainingSteps: number; entryNodeId?: string };
+  /** Internal provider-call budget scopes inherited by child unit runs. */
+  loopBudgetScopes?: readonly GraphLoopBudgetScope[];
   /**
    * RELEASE-LEDGER-UNIVERSE — stamp every cmd: child with this run's ledger root (`ELANOUS_STATE_DIR`).
    * Without it a child launched from a non-leader tree (`bun scripts/...` with cwd = that tree) re-resolves
@@ -170,6 +194,8 @@ export interface GraphRunOptions {
     validateNodeBinding?: (nodeId: string, command: string | undefined) => void;
     /** Fault-injection hook for verifying lifecycle closure and persisted resume state. */
     beforePersist?: (state: GraphRunState) => void;
+    /** Run a state write inside a caller-owned persistence fence. */
+    withPersistFence?: (state: GraphRunState, persist: () => void) => void;
     beforeNode?: () => void;
     /** Observe heal-loop terminal failures without making notification delivery affect the saved verdict. */
     postOpAlert?: (body: string) => void;
@@ -181,6 +207,8 @@ export interface GraphRunOptions {
     classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect;
     growthDecision?: GrowthDecisionDeps & { list?: (filters: { status: 'all' }) => DecisionEntry[] };
     inProcessHandlers?: InProcessHandlerRegistry;
+    /** Generic provider bindings for the closed `cap:<name>` capability vocabulary. */
+    capabilityProviders?: GraphCapabilityProviders;
   };
 }
 

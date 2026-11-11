@@ -2,7 +2,7 @@ import type { Command } from 'commander';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { hostname } from 'node:os';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { parsePodPool } from '../task-orchestrator/surfaces/pod-pool.js';
 import { debug } from '../debug/log.js';
 import { listPtyManifestRows, listPtySidetabRegistrations, readPtySidetabRegistrationsReadOnly, registerPtySidetabEntry, unregisterPtySidetabEntry, type PtyManifestRow, type PtySidetabRegistration, PTY_MANIFEST_STALE_MS } from '../pty-shell/pty-manifest.js';

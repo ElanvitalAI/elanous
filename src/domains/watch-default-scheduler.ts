@@ -1,7 +1,7 @@
 import { debug } from '../debug/log.js';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { listSources, runDue } from '../intake-plane/intake-sources.js';
 import { runIntakeDigestCli } from '../cli/intake-cli.js';

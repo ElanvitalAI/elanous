@@ -20,7 +20,7 @@ import { applyDesignDirection, type ApplyDesignDirectionResult } from '../../des
 import { designCheckExitCode, resolveDesignCheck, type DesignCheckDeps } from '../../design/design-check.js';
 import { directionFromDesignMd, listAllDesignDirections, parseDeclaredDirection } from '../../design/design-directions.js';
 import { defaultDesignSystemsDir, listDesignSystems } from '../../design/design-systems.js';
-import { getUserConfig } from '../../user-config.js';
+import { getUserConfig } from '../../user-config/reader.js';
 import { jsonResponse } from './json-response.js';
 import { detectRepoRoot } from './worktrees.js';
 

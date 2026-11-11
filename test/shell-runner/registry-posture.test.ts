@@ -8,14 +8,13 @@
 //   3. shell status: running → killed
 //   4. attach initial snapshot (lazy lookup is instantly fresh)
 //
-// Real wiring throughout — actual VwSurface / ModalSurface are constructed
+// Real wiring throughout — actual VwSurface instances are constructed
 // and attached to a real registry. Per CLAUDE.md no mock.module() use.
 
 import { describe, expect, test } from 'bun:test';
 
 import { createShellRegistry } from '../../src/shell-runner/registry.js';
 import { createVwSurface } from '../../src/shell-runner/vw-surface.js';
-import { createModalSurface } from '../../src/shell-runner/modal-surface.js';
 import type {
   BoundaryEvent,
   BufferMark,
@@ -130,11 +129,11 @@ describe('ShellRegistry posture proxy (PR-1 G7)', () => {
 
   test('G7 transition 3 · running → killed flips exposure to unavailable', () => {
     const reg = createShellRegistry();
-    const handle = fakeHandle({ id: 'h-mod1', mode: 'modal' });
-    const modal = createModalSurface();
-    modal.attach(handle);
+    const handle = fakeHandle({ id: 'h-vw-killed', mode: 'vw' });
+    const vw = createVwSurface({ focusPolicy: 'interactive' });
+    vw.attach(handle);
     reg.register(handle);
-    reg.attachSurface(handle.id, modal);
+    reg.attachSurface(handle.id, vw);
 
     const transitions: string[] = [];
     reg.subscribePosture((e) => {
@@ -144,7 +143,7 @@ describe('ShellRegistry posture proxy (PR-1 G7)', () => {
     handle.emitStatus('killed');
 
     expect(transitions).toContain('user-interactive -> unavailable');
-    expect(reg.describePosture('h-mod1')?.userExposure).toBe('unavailable');
+    expect(reg.describePosture('h-vw-killed')?.userExposure).toBe('unavailable');
 
     reg.dispose();
   });
@@ -190,15 +189,15 @@ describe('ShellRegistry posture proxy (PR-1 G7)', () => {
   test('listWithPosture enumerates handles + their current posture', () => {
     const reg = createShellRegistry();
     const h1 = fakeHandle({ id: 'h-list1', mode: 'vw' });
-    const h2 = fakeHandle({ id: 'h-list2', mode: 'modal' });
+    const h2 = fakeHandle({ id: 'h-list2', mode: 'vw' });
     const vw = createVwSurface({ focusPolicy: 'output-only' });
     vw.attach(h1);
-    const modal = createModalSurface();
-    modal.attach(h2);
+    const vw2 = createVwSurface({ focusPolicy: 'interactive' });
+    vw2.attach(h2);
     reg.register(h1);
     reg.register(h2);
     reg.attachSurface(h1.id, vw);
-    reg.attachSurface(h2.id, modal);
+    reg.attachSurface(h2.id, vw2);
 
     const items = reg.listWithPosture();
     const byId = new Map(items.map((it) => [it.handle.id, it.posture]));

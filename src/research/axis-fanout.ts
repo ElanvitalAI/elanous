@@ -5,9 +5,8 @@ import { getAvailableResearchWebSearchProviders } from '../web-search/index.js';
 import type { WebSearchHit, WebSearchProvider } from '../web-search/provider.js';
 import { debug } from '../debug/log.js';
 import { dispatchWebFetch } from '../skills/tools/webfetch.js';
+import { CRAWL_PROVIDERS } from '../research-bridge/crawl.js';
 
-const RESEARCH_PAID_WEB_FALLBACK_IDS = ['exa', 'firecrawl'] as const;
-const RESEARCH_KEYLESS_WEB_FALLBACK_IDS = ['ddg-free'] as const;
 const RESEARCH_EXA_TIMEOUT_MS = 4_500;
 // Leave scheduler/logging headroom under the user-visible 15s aggregate cap.
 export const RESEARCH_SEARCH_BUDGET_MS = 14_500;
@@ -65,22 +64,23 @@ interface ProviderHealth {
   open: boolean;
 }
 
-/** Build one bounded searcher per research prepass. Paid Exa/Firecrawl routes
- * take precedence; DDG is used only when neither paid route is available. Grok
- * is reserved for explicit X intent.
+/** Build one bounded searcher per research prepass. Provider order comes from
+ * the web contract: keyless first, then BYOK. Grok stays on explicit X routes.
  * Per-engine serialization lets a timeout open that engine's
  * breaker before queued Bloom axes start. */
 export function createResearchAxisSearcher(
   availableProviders: readonly WebSearchProvider[] = getAvailableResearchWebSearchProviders(),
   now: () => number = Date.now,
 ): AxisSearch {
-  const paidProviders = RESEARCH_PAID_WEB_FALLBACK_IDS.flatMap(id => availableProviders.filter(provider => provider.id === id));
-  const webFallback = paidProviders.length > 0
-    ? paidProviders
-    : RESEARCH_KEYLESS_WEB_FALLBACK_IDS.flatMap(id => availableProviders.filter(provider => provider.id === id));
-  const allowed = [...webFallback];
-  const keylessFallback = paidProviders.length === 0 && allowed.some(provider =>
-    (RESEARCH_KEYLESS_WEB_FALLBACK_IDS as readonly string[]).includes(provider.id));
+  const metadata = new Map(CRAWL_PROVIDERS.map(provider => [provider.id, provider]));
+  const descriptor = (id: string) => metadata.get(id === 'ddg-free' ? 'ddg' : id);
+  const tierOrder = { free: 0, byok: 1, paid: 2 } as const;
+  const allowed = availableProviders.filter(provider => provider.id !== 'grok' && provider.id !== 'grok-api'
+    && descriptor(provider.id)?.provides.includes('search.web@1'))
+    .sort((a, b) => tierOrder[descriptor(a.id)!.tier] - tierOrder[descriptor(b.id)!.tier]
+      || descriptor(a.id)!.latency - descriptor(b.id)!.latency);
+  const webFallback = allowed;
+  const keylessFallback = allowed.find(provider => descriptor(provider.id)?.tier === 'free')?.id ?? null;
   const health = new Map(allowed.map(provider => [provider.id, { failures: 0, open: false }]));
   const deadline = now() + RESEARCH_SEARCH_BUDGET_MS;
   let searchBudgetExhausted = false;
@@ -89,7 +89,7 @@ export function createResearchAxisSearcher(
   debug.log('research.search', 'provider-preflight', {
     allowed: allowed.map(provider => provider.id),
     available: allowed.map(provider => provider.id),
-    keylessFallback: keylessFallback ? 'ddg-free' : null,
+    keylessFallback,
     excluded: availableProviders.filter(provider => !allowed.some(allowedProvider => allowedProvider.id === provider.id))
       .map(provider => provider.id),
     budgetMs: RESEARCH_SEARCH_BUDGET_MS,

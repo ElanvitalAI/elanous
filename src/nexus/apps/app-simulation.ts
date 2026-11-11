@@ -1,3 +1,5 @@
+import type { SimReceipt } from '../../ux-sim/sim-receipt.js';
+
 const APP_ID = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
@@ -17,6 +19,9 @@ export interface AppSimulationReceipt {
   readonly createdAt: string;
   readonly outcome: 'passed' | 'failed';
   readonly summary: string;
+  /** Source tree identity at simulation time; absent on legacy receipts, which cannot be promoted. */
+  readonly appFingerprint?: string;
+  readonly conceptProof?: SimReceipt;
 }
 
 export interface AppSimulationSnapshot {
@@ -30,6 +35,15 @@ export interface AppSimulationResult {
   readonly runId: string;
   readonly events: readonly Omit<AppSimulationEvent, 'id'>[];
   readonly receipts: readonly Omit<AppSimulationReceipt, 'createdAt'>[];
+}
+
+/** Receipts are newest-first; prefer a current passing proof, otherwise retain the newest proof for fail-closed display. */
+export function resolveConceptProofForFingerprint(
+  receipts: readonly Pick<AppSimulationReceipt, 'conceptProof'>[],
+  currentFingerprint: string,
+): SimReceipt | undefined {
+  const proofs = receipts.flatMap(receipt => receipt.conceptProof ? [receipt.conceptProof] : []);
+  return proofs.find(proof => proof.appFingerprint === currentFingerprint && proof.verdict === 'passed') ?? proofs[0];
 }
 
 export function validateAppSimulationResult(value: unknown): AppSimulationResult {
@@ -46,7 +60,8 @@ export function validateAppSimulationResult(value: unknown): AppSimulationResult
       || event.runId !== runId || typeof event.ts !== 'number' || !Number.isSafeInteger(event.ts)
       || !data || typeof data !== 'object' || Array.isArray(data)) throw new Error('invalid app simulation event');
     const details = data as Record<string, unknown>;
-    if (typeof details.step !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(details.step)
+    // Source: src/ux-sim/world.ts emits namespaced app execution steps such as rpc.addNote.completed.
+    if (typeof details.step !== 'string' || !/^[a-z][a-zA-Z0-9-]{0,63}(?:\.[a-zA-Z][a-zA-Z0-9-]{0,63})*$/.test(details.step)
       || typeof details.message !== 'string' || details.message.length > 500
       || typeof details.receiptId !== 'string' || !OPAQUE_ID.test(details.receiptId)) throw new Error('invalid app simulation event data');
     if ((details.path === undefined) !== (details.status === undefined)
@@ -74,9 +89,11 @@ export function validateAppSimulationResult(value: unknown): AppSimulationResult
     const receipt = row as Record<string, unknown>;
     if (typeof receipt.id !== 'string' || !OPAQUE_ID.test(receipt.id) || typeof receipt.appId !== 'string' || !APP_ID.test(receipt.appId)
       || receipt.runId !== runId || (receipt.outcome !== 'passed' && receipt.outcome !== 'failed')
-      || typeof receipt.summary !== 'string' || receipt.summary.length > 240) throw new Error('invalid app simulation receipt');
+      || typeof receipt.summary !== 'string' || receipt.summary.length > 240
+      || (receipt.appFingerprint !== undefined && (typeof receipt.appFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(receipt.appFingerprint)))) throw new Error('invalid app simulation receipt');
     const outcome = receipt.outcome as 'passed' | 'failed';
-    return { id: receipt.id, appId: receipt.appId, runId, outcome, summary: receipt.summary as string };
+    return { id: receipt.id, appId: receipt.appId, runId, outcome, summary: receipt.summary as string,
+      ...(receipt.appFingerprint === undefined ? {} : { appFingerprint: receipt.appFingerprint as string }) };
   });
   const receiptIds = new Set(receipts.map((receipt) => receipt.id));
   if (events.some((event) => !receiptIds.has(event.data.receiptId) || !receipts.some((receipt) => receipt.id === event.data.receiptId && receipt.appId === event.appId))) {

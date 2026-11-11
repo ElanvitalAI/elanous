@@ -10,8 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findClaudeModel } from '../anthropic/models.js';
 import { findCodexModel } from '../codex/models.js';
-import * as modelDefaults from '../llm/model-defaults.js';
-import * as llm from '../llm.js';
+import * as roleStream from '../llm/role-stream.js';
 import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 import { GOAL_DEVICE_LOAD_SAMPLES, GOAL_DEVICE_SEAM_TERM, driveAbandonedTimeoutCwdSeam, driveTimeoutCwdSeam, goalDeviceExecFile } from '../ux-sim/goal-device.js';
 
@@ -81,8 +80,7 @@ function fakeSkill(over: Partial<SkillIndexEntry>): SkillIndexEntry {
 describe('defaultSearchTerms 관측 계약', () => {
   test('uses the mock-device catalog as grounding search reference without replacing the goal', async () => {
     const client: NonNullable<Parameters<typeof defaultSearchTerms>[1]> = {
-      resolveDefaultProvider: () => undefined,
-      streamLLM: async (messages, onChunk) => {
+      streamRoleLlm: async (_role, messages, onChunk) => {
         expect(messages[0]?.content).toContain('Goal: inspect the authored completion boundary');
         expect(messages[0]?.content).toContain('Available mock-device and event-injection catalog (reference only):');
         expect(messages[0]?.content).toContain('fake-kubectl: inject Pod failure');
@@ -98,8 +96,7 @@ describe('defaultSearchTerms 관측 계약', () => {
     const logs: { category: string; event: string; data: unknown }[] = [];
     const goal = `${'a'.repeat(500)} tail-token`;
     const client: NonNullable<Parameters<typeof defaultSearchTerms>[1]> = {
-      resolveDefaultProvider: () => undefined,
-      streamLLM: async (messages, onChunk) => {
+      streamRoleLlm: async (_role, messages, onChunk) => {
         expect(messages[0]?.content).toContain(`Goal: ${'a'.repeat(500)}\nKeywords:`);
         expect(messages[0]?.content).not.toContain('tail-token');
         onChunk('observed-term', 'observed-term');
@@ -123,16 +120,15 @@ describe('defaultSearchTerms 관측 계약', () => {
 
   test('기본 LLM은 정적 초기화하지 않고 호출 시에만 동적으로 불러온다', () => {
     const source = readFileSync(new URL('./mission-codebase-gate.ts', import.meta.url), 'utf8');
-    expect(source).toContain("const client = llmClient ?? await import('../llm.js');");
-    expect(source).not.toContain("import * as llm from '../llm.js';");
+    expect(source).toContain("const client = llmClient ?? await import('../llm/role-stream.js');");
+    expect(source).not.toContain("import * as roleStream from '../llm/role-stream.js';");
   });
 
   test('LLM 실패는 전문 토큰 폴백과 그 경로를 관측한다', async () => {
     const logs: { category: string; event: string; data: unknown }[] = [];
     const goal = `${'한'.repeat(500)} full-goal-token`;
     const client: NonNullable<Parameters<typeof defaultSearchTerms>[1]> = {
-      resolveDefaultProvider: () => undefined,
-      streamLLM: async () => { throw new Error('test-llm-failure'); },
+      streamRoleLlm: async () => { throw new Error('test-llm-failure'); },
     };
     (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: unknown) => {
       logs.push({ category, event, data });
@@ -153,10 +149,9 @@ describe('defaultSearchTerms 관측 계약', () => {
 describe('LLM usage 관측', () => {
   test('주입된 검색어 호출은 usage 이벤트마다 원값과 site를 기록하고 텍스트를 유지한다', async () => {
     const log = spyOn(debug, 'log').mockImplementation(() => undefined);
-    const budget = spyOn(modelDefaults, 'budgetModel').mockReturnValue('usage-model');
     const client: NonNullable<Parameters<typeof defaultSearchTerms>[1]> = {
-      resolveDefaultProvider: () => undefined,
-      streamLLM: async (_messages, onChunk, opts) => {
+      streamRoleLlm: async (_role, _messages, onChunk, opts) => {
+        opts?.onResolvedProvider?.('anthropic', 'usage-model');
         opts?.onUsage?.({ provider: 'anthropic', inputTokens: 11, outputTokens: 7, cacheReadInputTokens: 3 });
         opts?.onUsage?.({ outputTokens: 2, cacheCreationInputTokens: 5 });
         onChunk('usage-term', 'usage-term');
@@ -178,22 +173,22 @@ describe('LLM usage 관측', () => {
           cost: { kind: 'unknown', model: 'usage-model' },
         },
       ]);
-    } finally { log.mockRestore(); budget.mockRestore(); }
+    } finally { log.mockRestore(); }
   });
 
   test('동적 skill 호출은 onUsage를 실행하고 카탈로그 단가를 debug.log에 싣는다', async () => {
     const log = spyOn(debug, 'log').mockImplementation(() => undefined);
-    const stream = spyOn(llm, 'streamLLM').mockImplementation(async (_messages, onChunk, opts) => {
+    let modelCall = 0;
+    const stream = spyOn(roleStream, 'streamRoleLlm').mockImplementation(async (_role, _messages, onChunk, opts) => {
+      const model = modelCall++ === 0 ? 'gpt-5.6-terra' : 'gpt-5.6-luna';
+      opts?.onResolvedProvider?.('openai-codex', model);
       opts?.onUsage?.({ inputTokens: 1_000_000, outputTokens: 0 });
       onChunk('photo-intake-ocr', 'photo-intake-ocr');
       return 'photo-intake-ocr';
     });
-    const model = spyOn(modelDefaults, 'budgetModel');
     const skills = [fakeSkill({ name: 'photo-intake-ocr' })];
     try {
-      model.mockReturnValue('gpt-5.6-terra');
       expect(await pickSkillsViaLlm('reuse photo intake', skills, 1)).toEqual(['photo-intake-ocr']);
-      model.mockReturnValue('gpt-5.6-luna');
       expect(BUILTIN_CATALOG.models.find((entry) => entry.id === 'gpt-5.6-luna')?.inputPerMtok).toBe(1);
       expect(await pickSkillsViaLlm('reuse photo intake', skills, 1)).toEqual(['photo-intake-ocr']);
       const usageLogs = log.mock.calls.filter((call) => call[0] === 'llm.usage' && call[1] === 'llm-usage');
@@ -210,7 +205,6 @@ describe('LLM usage 관측', () => {
         },
       ]);
     } finally {
-      model.mockRestore();
       stream.mockRestore();
       log.mockRestore();
     }
@@ -231,16 +225,16 @@ describe('LLM usage 관측', () => {
     expect(cacheWrite).toBeDefined();
 
     const log = spyOn(debug, 'log').mockImplementation(() => undefined);
-    const budget = spyOn(modelDefaults, 'budgetModel').mockReturnValueOnce('gpt-5.6-terra').mockReturnValueOnce('claude-sonnet-4-6');
     const injected: NonNullable<Parameters<typeof defaultSearchTerms>[1]> = {
-      resolveDefaultProvider: () => undefined,
-      streamLLM: async (_messages, onChunk, opts) => {
+      streamRoleLlm: async (_role, _messages, onChunk, opts) => {
+        opts?.onResolvedProvider?.('openai-codex', 'gpt-5.6-terra');
         opts?.onUsage?.({ inputTokens: 1_000_000, outputTokens: 0 });
         onChunk('usage-term', 'usage-term');
         return 'usage-term';
       },
     };
-    const stream = spyOn(llm, 'streamLLM').mockImplementation(async (_messages, onChunk, opts) => {
+    const stream = spyOn(roleStream, 'streamRoleLlm').mockImplementation(async (_role, _messages, onChunk, opts) => {
+      opts?.onResolvedProvider?.('anthropic', 'claude-sonnet-4-6');
       opts?.onUsage?.({
         provider: 'anthropic',
         inputTokens: 0,
@@ -274,7 +268,7 @@ describe('LLM usage 관측', () => {
           },
         },
       ]);
-    } finally { log.mockRestore(); budget.mockRestore(); stream.mockRestore(); }
+    } finally { log.mockRestore(); stream.mockRestore(); }
   });
 
   test('usage logging failure is swallowed and does not change search terms', async () => {
@@ -282,8 +276,7 @@ describe('LLM usage 관측', () => {
       if (category === 'llm.usage') throw new Error('usage log failed');
     }) as typeof debug.log);
     const client: NonNullable<Parameters<typeof defaultSearchTerms>[1]> = {
-      resolveDefaultProvider: () => undefined,
-      streamLLM: async (_messages, onChunk, opts) => {
+      streamRoleLlm: async (_role, _messages, onChunk, opts) => {
         opts?.onUsage?.({ inputTokens: 1 });
         onChunk('usage-term', 'usage-term');
         return 'usage-term';

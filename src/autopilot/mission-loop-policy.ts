@@ -15,7 +15,7 @@
 // 소비: scripts/run-mission.ts 가 phaseKind 확정 직후 이 정책으로 goalLoopMaxIterations 를 산출해
 //   walker runTurnImpl 에 실어 보낸다(operational=바운디드·implementation/미지=undefined→기본 유지).
 
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import type { PhaseKind } from './mission-se-bridge.js';
 
 /** operational(조사) 기본 goal-loop 반복 상한 — 최초 턴 + 1회 재주입. 재주입 폭주(예산 소진) 근절.

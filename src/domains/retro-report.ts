@@ -6,7 +6,7 @@ import { textOnly } from '../llm/stream-text.js';
 // 리밸런싱 제안은 R2(retro-rebalance)가 붙임. [[ROADMAP-...]] R1.
 
 import type { PeriodSummary, RetroPeriod } from './retro-aggregate.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { getProviderForConfig, anyProviderAvailable, type LLMMessage } from '../llm.js';
 
 const PERIOD_KO: Record<RetroPeriod, string> = { weekly: '주간', monthly: '월간', quarterly: '분기', annual: '연간' };

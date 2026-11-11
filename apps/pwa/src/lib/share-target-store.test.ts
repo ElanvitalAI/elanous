@@ -22,7 +22,8 @@ interface StubResponse {
 interface StubCache {
   match: (url: string) => Promise<StubResponse | undefined>;
   put: (url: string, res: StubResponse) => Promise<void>;
-  delete: (url: string) => Promise<boolean>;
+  delete: (url: string | Request) => Promise<boolean>;
+  keys: () => Promise<Request[]>;
 }
 
 interface StubCaches {
@@ -49,7 +50,8 @@ function createStubCaches(): {
         put: async (url: string, res: StubResponse) => {
           bucket!.set(url, res);
         },
-        delete: async (url: string) => bucket!.delete(url),
+        delete: async (url: string | Request) => bucket!.delete(typeof url === 'string' ? url : new URL(url.url).pathname),
+        keys: async () => [...bucket!.keys()].map((url) => new Request(new URL(url, 'https://nexus.test'))),
       };
       return cache;
     },

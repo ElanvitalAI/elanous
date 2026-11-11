@@ -34,7 +34,7 @@ import {
 } from '../acp/content-blocks.js';
 import { debug } from '../debug/log.js';
 import { streamLLM, type LLMMessage } from '../llm.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { resolveAutoRoute, lookupLlmTierSpec, logRouterDecision } from '../model-tier/index.js';
 import type { LlmRunner } from '../model-tier/preset-suggest-llm.js';
 import type {

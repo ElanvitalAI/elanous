@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-RLA-MACROPHAGE-HEAL-TIMEOUT-STALE-OUTPUT-SIM-TS",
+  "path": "src/ux-sim/rla-macrophage-heal-timeout-stale-output-sim.ts",
+  "boundary": "Runs the production macrophage planner with isolated synthetic timeout and generated-artifact evidence; no live cleanup, schedule, or parent sink is invoked.",
+  "deviceIds": ["rla-macrophage-heal-timeout-stale-output"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

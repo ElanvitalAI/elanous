@@ -23,7 +23,8 @@ import { registerCredCommands } from './cred-cli.js';
 import { appSecretId, appSecretIdForExistingApp } from '../nexus/config/secrets/app-secret-ledger.js';
 import type { SecretBackendId } from '../nexus/config/secrets/types.js';
 import { revokeAppSecretValues, setAppSecretValue, type AppSecretRevokeResult } from '../nexus/config/secrets/file-backend.js';
-import { deleteCredentialSlotAsync, listCredentialSlotsAsync, parseCredentialSlotId, setCredentialSlotAsync } from '../nexus/config/secrets/cred-slots.js';
+import { deleteCredentialSlotAsync, listCredentialSlotsAsync, parseCredentialSlotId, setCredentialSlotAsync, setCredentialSlotBatchAsync } from '../nexus/config/secrets/cred-slots.js';
+import { credentialSlotWizardPlan, runCredentialSlotWizard } from '../nexus/config/secrets/cred-slot-wizard.js';
 
 export interface SecretCliDeps {
   isInteractive?: () => boolean;
@@ -46,6 +47,7 @@ export interface SecretCliDeps {
   syncBundle?: (host: string, contents: string) => Promise<void>;
   importSecrets?: (secrets: Readonly<Record<string, string>>, overwrite: boolean, expectedConflicts?: readonly string[]) => Promise<{ imported: boolean; conflicts: string[]; changedSinceConfirmation: boolean }>;
   saveCredentialSlot?: (id: string, value: string) => Promise<void>;
+  saveCredentialSlotBatch?: (values: Readonly<Record<string, string>>) => Promise<void>;
   removeCredentialSlot?: (id: string) => Promise<boolean>;
   listCredentialSlots?: typeof listCredentialSlotsAsync;
 }
@@ -121,6 +123,7 @@ function resolveDeps(deps: SecretCliDeps) {
     promptSecret: deps.promptSecret ?? createSecretPrompt(),
     saveSecret: deps.saveSecret ?? setSecretAsync,
     saveCredentialSlot: deps.saveCredentialSlot ?? setCredentialSlotAsync,
+    saveCredentialSlotBatch: deps.saveCredentialSlotBatch ?? setCredentialSlotBatchAsync,
     removeCredentialSlot: deps.removeCredentialSlot ?? deleteCredentialSlotAsync,
     listCredentialSlots: deps.listCredentialSlots ?? listCredentialSlotsAsync,
     saveAppSecret: deps.saveAppSecret ?? deps.saveSecret ?? setAppSecretValue,
@@ -189,6 +192,27 @@ export function registerSecretCommands(program: Command, deps: SecretCliDeps = {
         cli.setExitCode(0);
       } catch {
         cli.output.error('credential slot list failed');
+        cli.setExitCode(1);
+      }
+    });
+
+  slots.command('setup <service>')
+    .description('Prompt privately for every catalogued credential field and save the service in one batch.')
+    .allowExcessArguments(false)
+    .action(async (service: string) => {
+      const plan = credentialSlotWizardPlan(service);
+      if (!plan) { cli.output.error('credential slot setup unsupported'); cli.setExitCode(2); return; }
+      if (!cli.isInteractive()) { cli.output.error('credential slot setup requires an interactive terminal'); cli.setExitCode(1); return; }
+      try {
+        cli.initializeBackend();
+        const result = await runCredentialSlotWizard(plan, {
+          prompt: (slot) => cli.promptSecret(`${slot}: `),
+          saveBatch: cli.saveCredentialSlotBatch,
+        });
+        cli.output.log(`saved ${result.slots.join(', ')} · success`);
+        cli.setExitCode(0);
+      } catch {
+        cli.output.error('credential slot setup failed');
         cli.setExitCode(1);
       }
     });

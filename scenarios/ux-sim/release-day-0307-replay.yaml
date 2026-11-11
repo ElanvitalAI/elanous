@@ -1,9 +1,20 @@
 scenario: release-day-0307-replay
 version: 0.3.7
+previousVersion: 0.3.6
 runId: release-sim-release-day-0307-replay-replay
 manifest: ../../graphs/release/plugin.json
 policies:
   gate.plan.promoteToFull: [dep-layer, verdict-files, opaque-closure, cost-crossover]
+proposal:
+  type: release.gate.receipt-gap-observed
+  nodeId: gate-triage
+  matchNodeId: gate
+  eventNodeId: event-release-gate-receipt-gap-observed
+  planNodeId: event-gate-recheck-plan
+  fullRecheckNodeId: event-policy-full-recheck
+  appendPlanNodeId: event-policy-append-recheck
+  appendRunNodeId: event-policy-append-run
+  rationale: A newly observed release event must be proposed as a graph diff and exercised before adoption.
 events:
   - id: A1
     type: release.cut.appended
@@ -55,9 +66,8 @@ events:
     action: run-gate-independent-of-export
     mechanism: edge
     binding: outcome
-    rationale: The gate routes into receipt auditing independently of export-check.
-    from: gate
-    to: receipt-audit
+    rationale: Follow the successful gate route declared by the release graph and keep it independent of export-check.
+  # Scenario-only branch-control input for exercising policy routing; these are not historical file/time measurements.
   - id: A8
     type: release.cut.appended
     action: append-radius-recheck
@@ -65,10 +75,10 @@ events:
     recipe: gate-same-run-recheck
     binding: gate-same-run-recheck
     rationale: Recheck the changed-file radius and promote to a full sweep only by declared policy.
-    changedFiles: [scripts/release-loop/hand-response-node.ts]
+    changedFiles: [scripts/release-loop/gate-node.ts]
     pickShas: [cccccccccccccccccccccccccccccccccccccccc]
     dependencyLayerChanged: false
-    verdictFilesChanged: false
+    verdictFilesChanged: true
     closureOpaque: false
     receiptCosts: { partialMs: 3, fullMs: 5, source: simulation-same-ledger }
   - id: A9

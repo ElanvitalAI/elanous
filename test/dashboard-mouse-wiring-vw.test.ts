@@ -29,6 +29,7 @@ function mkDeps(overrides: Partial<Parameters<typeof createDashboardMouseWiring>
       setActiveModel: () => {},
       getRecentWds: () => ['/home/a'],
       setSessionWd: () => {},
+      onExitProgram: () => {},
       pushModalSurface: surface => {
         pushed.push(surface);
         return { dispose: () => { pushed.splice(pushed.indexOf(surface), 1); } };

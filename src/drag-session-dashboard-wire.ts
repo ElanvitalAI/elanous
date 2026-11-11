@@ -3,8 +3,7 @@
 //
 // R1.3 policy lock: drag ghost / highlight / banner belong to the
 // `drag-overlay` family, whose allowed authority path is the shared
-// transient overlay host (`overlay-host`). See
-// `src/display/transient-overlay-policy.ts`.
+// transient overlay host (`overlay-host`).
 //
 // Role
 // ────

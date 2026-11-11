@@ -1,0 +1,11 @@
+{
+  "id": "GRAPH-RUN-LIFECYCLE-CANCEL-OWNER-DEATH",
+  "name": "Cancel after active node owner loss",
+  "kind": "graph-run-lifecycle",
+  "device": "graph-run-lifecycle-world",
+  "implementation": ["src/ux-sim/graph-run-lifecycle-world.ts"],
+  "tests": ["src/ux-sim/graph-run-lifecycle-world.test.ts"],
+  "trigger": "A graph node is active when its runner owner disappears and the operator cancels the persisted run.",
+  "observe": ["cancelled status is durable", "resume is refused", "completed prefix remains unchanged"],
+  "expected": "Cancellation is terminal and the interrupted node cannot execute again under the cancelled run ID."
+}

@@ -8,7 +8,7 @@ import { debug } from '../debug/log.js';
 import { effectiveReasoningLevel } from '../llm.js';
 import { clearSurfaceRouteDecision, currentRouteDecision, recordCurrentRouteDecision, recordRouteExecution, resolveRouteDecision, sessionModelPin } from '../llm/route-decision.js';
 import { inspectActiveProvider } from '../provider-summary.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 /** The model the next dashboard turn runs, recorded as the surface's current route decision.
  *  A `/model` session pin goes in as `explicitModel`, so it beats the Codex tier policy. */

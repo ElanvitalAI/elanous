@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { discoverCapability, type CapabilityCandidate } from '../agent-mission/discover-capability.js';
 import { ensureMarketIndex, type MarketIndex } from '../plugins/install/market-fetch.js';
 import { installPlugin, type InstalledPlugin } from '../plugins/install/plugin-install.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 
 const MAX_CANDIDATES = 5;
 const MAX_GAP_LENGTH = 240;

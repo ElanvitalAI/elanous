@@ -1,5 +1,6 @@
 import { parse as parseYaml } from 'yaml';
 import { loadMockScenarioCatalog } from './mock-scenario-catalog.js';
+import { parseSimWorldLlmConfig, type SimWorldLlmConfig } from './fake-llm.js';
 
 export interface SimWorldSpec {
   readonly world: string;
@@ -14,6 +15,7 @@ export interface SimWorldSpec {
     readonly egress: boolean;
   }[];
   readonly providers?: Readonly<Record<string, Readonly<Record<string, unknown>>>>;
+  readonly llm?: SimWorldLlmConfig;
   readonly github?: { readonly repo: string; readonly openPRs: number };
   readonly apps?: readonly SimWorldApp[];
   readonly seats?: readonly string[];
@@ -42,6 +44,8 @@ export interface SimWorldProcess {
   readonly id: string;
   readonly host: string;
   readonly releaseVersion: string;
+  /** Identifies the unique process that disaster chaos may hand off to a survivor. */
+  readonly role?: 'headquarters';
   readonly fingerprint?: string;
   readonly lane?: string;
   readonly mission?: string;
@@ -57,7 +61,8 @@ export interface SimWorldInjection {
 export type SimMonkeyFault = { readonly at: string; readonly monkey: { readonly kill: string; readonly signal: 'KILL' | 'TERM' } };
 /** Gorilla = one host's egress, CPU, and down state; every process on that host dies. */
 export type SimGorillaFault = { readonly at: string; readonly gorilla: { readonly host: string; readonly egress: false; readonly cpu: number; readonly for: string } };
-export type SimHostChaosFault = SimGorillaFault;
+export type SimDisasterFault = { readonly at: string; readonly disaster: { readonly host: string; readonly down: true } };
+export type SimHostChaosFault = SimGorillaFault | SimDisasterFault;
 export type SimChaosFault = SimMonkeyFault | SimHostChaosFault;
 
 export interface SimRecoveryExpectation {
@@ -70,7 +75,7 @@ const WORLD_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const HOST_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const SEAT_ID = /^[A-Z][A-Z0-9-]{0,31}$/;
 const EVENT_OFFSET = /^\+(?:0|[1-9]\d*)(?:ms|s|m|h)$/;
-const TOP_LEVEL_KEYS = ['world', 'seed', 'devices', 'clock', 'hosts', 'providers', 'github', 'apps', 'seats', 'processes', 'events', 'injections', 'chaos', 'expect'];
+const TOP_LEVEL_KEYS = ['world', 'seed', 'devices', 'clock', 'hosts', 'providers', 'llm', 'github', 'apps', 'seats', 'processes', 'events', 'injections', 'chaos', 'expect'];
 const WORLD_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|([+-])(\d{2}):(\d{2}))$/;
 
 function object(value: unknown, path: string): Record<string, unknown> {
@@ -122,7 +127,7 @@ export function parseSimWorldProcesses(value: unknown, hosts: SimWorldSpec['host
   return value.map((candidate, index) => {
     const path = `world.processes[${index}]`;
     const row = object(candidate, path);
-    onlyKeys(row, ['id', 'host', 'releaseVersion', 'fingerprint', 'lane', 'mission', 'command'], path);
+    onlyKeys(row, ['id', 'host', 'releaseVersion', 'role', 'fingerprint', 'lane', 'mission', 'command'], path);
     const id = string(row.id, `${path}.id`);
     if (!/^[a-z][a-z0-9-]{0,62}$/.test(id)) throw new Error(`${path}.id must be a lowercase process id`);
     const host = string(row.host, `${path}.host`);
@@ -134,11 +139,13 @@ export function parseSimWorldProcesses(value: unknown, hosts: SimWorldSpec['host
     if (!/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(releaseVersion)) {
       throw new Error(`${path}.releaseVersion must be a semantic version`);
     }
+    if (row.role !== undefined && row.role !== 'headquarters') throw new Error(`${path}.role must be headquarters when specified`);
+    const role = row.role as SimWorldProcess['role'];
     const fingerprint = row.fingerprint === undefined ? undefined : string(row.fingerprint, `${path}.fingerprint`);
     const lane = row.lane === undefined ? undefined : string(row.lane, `${path}.lane`);
     const mission = row.mission === undefined ? undefined : string(row.mission, `${path}.mission`);
     const command = row.command === undefined ? undefined : string(row.command, `${path}.command`);
-    return { id, host, releaseVersion, ...(fingerprint ? { fingerprint } : {}), ...(lane ? { lane } : {}),
+    return { id, host, releaseVersion, ...(role ? { role } : {}), ...(fingerprint ? { fingerprint } : {}), ...(lane ? { lane } : {}),
       ...(mission ? { mission } : {}), ...(command ? { command } : {}) };
   });
 }
@@ -149,8 +156,8 @@ export function parseSimChaos(value: unknown, processes: SimWorldSpec['processes
   const faults: SimChaosFault[] = value.map((candidate, index): SimChaosFault => {
     const path = `world.chaos[${index}]`;
     const row = object(candidate, path);
-    const variant = ['monkey', 'gorilla'].filter((key) => Object.hasOwn(row, key));
-    if (variant.length !== 1) throw new Error(`${path} must declare exactly one supported fault: monkey, gorilla`);
+    const variant = ['monkey', 'gorilla', 'disaster'].filter((key) => Object.hasOwn(row, key));
+    if (variant.length !== 1) throw new Error(`${path} must declare exactly one supported fault: monkey, gorilla, disaster`);
     const kind = variant[0]!;
     onlyKeys(row, ['at', kind], path);
     const at = duration(row.at, `${path}.at`);
@@ -176,14 +183,22 @@ export function parseSimChaos(value: unknown, processes: SimWorldSpec['processes
       if (/^\+0(?:ms|s|m|h)$/.test(forDuration)) throw new Error(`${path}.gorilla.for must be greater than zero`);
       return { at, gorilla: { host, egress: false, cpu, for: forDuration } };
     }
-    throw new Error(`${path}.${kind} belongs to SIM-CHAOS PR②b`);
+    onlyKeys(fault, ['host', 'down'], `${path}.disaster`);
+    if (fault.down !== true) throw new Error(`${path}.disaster.down must be true`);
+    if ((hosts?.length ?? 0) < 2) throw new Error(`${path}.disaster needs a surviving declared host for headquarters handoff`);
+    const headquarters = processes?.filter((process) => process.role === 'headquarters') ?? [];
+    if (headquarters.length !== 1 || headquarters[0]?.host !== host
+      || !headquarters[0]?.fingerprint || !headquarters[0].lane || !headquarters[0].mission) {
+      throw new Error(`${path}.disaster.host must identify the world's exactly one headquarters process with fingerprint, lane, and mission`);
+    }
+    return { at, disaster: { host, down: true } };
   });
   const intervals = new Map<string, { start: number; end: number; index: number }[]>();
   faults.forEach((fault, index) => {
-    if (!('gorilla' in fault)) return;
-    const host = fault.gorilla.host;
+    if (!('gorilla' in fault) && !('disaster' in fault)) return;
+    const host = 'gorilla' in fault ? fault.gorilla.host : fault.disaster.host;
     const start = relativeDurationMs(fault.at);
-    const end = start + relativeDurationMs(fault.gorilla.for);
+    const end = 'gorilla' in fault ? start + relativeDurationMs(fault.gorilla.for) : Number.POSITIVE_INFINITY;
     const rows = intervals.get(host) ?? [];
     rows.push({ start, end, index });
     intervals.set(host, rows);
@@ -281,6 +296,7 @@ function inferredDevices(value: {
   clock?: unknown;
   hosts?: unknown;
   providers?: unknown;
+  llm?: unknown;
   github?: unknown;
   seats?: unknown;
   apps?: SimWorldApp[];
@@ -294,6 +310,7 @@ function inferredDevices(value: {
   value.devices.forEach((id, index) => requireDevice(id, `world.devices[${index}]`));
   if (value.hosts !== undefined) requireDevice('fake-kubectl', 'world.hosts');
   if (value.providers !== undefined) requireDevice('fake-llm', 'world.providers');
+  if (value.llm !== undefined) requireDevice('fake-llm', 'world.llm');
   if (value.github !== undefined) requireDevice('fake-github', 'world.github');
   if (value.clock !== undefined) requireDevice('fake-clock', 'world.clock');
   if (value.apps?.length) requireDevice('fake-clock', 'world.apps');
@@ -405,6 +422,8 @@ export function parseSimWorld(source: string): SimWorldSpec {
     }));
   }
 
+  const llm = value.llm === undefined ? undefined : parseSimWorldLlmConfig(value.llm);
+
   let github: SimWorldSpec['github'];
   if (value.github !== undefined) {
     const row = object(value.github, 'world.github');
@@ -458,11 +477,11 @@ export function parseSimWorld(source: string): SimWorldSpec {
   const injections = parseSimWorldInjections(value.injections);
   const expect = parseSimWorldExpectation(value.expect);
   if (expect && !chaos?.length) throw new Error('world.expect.recovers requires world.chaos');
-  if (expect && !injections?.some((injection) => injection.ledger?.length)) {
+  if (expect && !injections?.some((injection) => injection.ledger?.length) && !chaos?.some((fault) => 'disaster' in fault)) {
     throw new Error('world.expect.recovers requires injected ledger rows to measure losses');
   }
 
-  const devices = inferredDevices({ devices: requestedDevices, processes, chaos, clock, hosts, providers, github, seats, apps });
+  const devices = inferredDevices({ devices: requestedDevices, processes, chaos, clock, hosts, providers, llm, github, seats, apps });
   return {
     world: id,
     seed,
@@ -470,6 +489,7 @@ export function parseSimWorld(source: string): SimWorldSpec {
     ...(clock ? { clock } : {}),
     ...(hosts ? { hosts } : {}),
     ...(providers ? { providers } : {}),
+    ...(llm ? { llm } : {}),
     ...(github ? { github } : {}),
     ...(apps ? { apps } : {}),
     ...(seats ? { seats } : {}),

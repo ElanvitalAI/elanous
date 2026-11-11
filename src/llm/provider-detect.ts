@@ -4,6 +4,7 @@ import { delimiter, join } from 'node:path';
 import { homedir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { authStorePath } from '../oauth/store.js';
+import { codexAccountReadStorePath } from '../oauth/codex-owner-mirror.js';
 import { envLiteral } from '../platform/env-literal.js';
 
 /** Discovery is read-only; agent-cli entries are not direct-call LLM providers. */
@@ -147,7 +148,7 @@ export async function detectProviders(deps: ProviderDetectDeps = {}): Promise<De
     // Read stores concurrently so a slow or unreadable store cannot hide the others.
     const storePath = env.XDG_CONFIG_HOME?.trim()
       ? join(env.XDG_CONFIG_HOME, 'elanous', 'auth.json')
-      : deps.authStore ?? authStorePath();
+      : deps.authStore ?? codexAccountReadStorePath(authStorePath());
     for (const [provider, keys] of Object.entries(ENV_KEYS)) {
       const key = keys.find((name) => populated(env[name]));
       if (key) add(provider, 'apikey', `env:${key}`);

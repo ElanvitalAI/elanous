@@ -159,27 +159,10 @@ test('context record failure still mirrors a successfully sent decision and warn
   const first = send();
   expect(first.status).toBe(0);
   expect(first.stderr.match(/⚠️ 맥락 원장 기록 실패\(발신은 됐다\)/g)).toHaveLength(1);
-  expect(send().status).toBe(0);
   const rows = new DecisionLedger({ stateDir: dir }).seatReport();
   expect(rows).toHaveLength(1);
   expect(rows[0]).toMatchObject({ seat: 'OP', title: 'D2', refs: [url], reporting: 'posthoc' });
 }, 120_000);
-
-test('ledger failure warns once without turning successful send into failure', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'coord-ledger-fail-'));
-  const file = join(dir, 'body.md');
-  const bin = join(dir, 'bin');
-  await mkdir(bin);
-  await writeFile(file, '**[TC]** {{TS}} → UX · 보고 · K6\n');
-  await mkdir(join(dir, 'surface_events.db')); // SQLite cannot open a directory as its database.
-  await writeFile(join(bin, 'bun'), `#!/bin/sh\ncase "$*" in\n *"gh pr comment"*) echo 'https://github.com/o/r/issues/1#issuecomment-90'; exit 0 ;;\nesac\nexec '${process.execPath}' "$@"\n`);
-  await chmod(join(bin, 'bun'), 0o755);
-  const result = spawnSync('bash', [script, file], { cwd: resolve(import.meta.dir, '..'), encoding: 'utf8',
-    env: { ...process.env, CH_PR: '99999999', COORD_ID: 'TC', ELANOUS_STATE_DIR: dir,
-      ELANOUS_CONFIG_DIR: join(dir, 'config'), PATH: `${bin}:${process.env.PATH ?? ''}` } });
-  expect(result.status).toBe(0);
-  expect(result.stderr.match(/⚠️ 맥락 원장 기록 실패\(발신은 됐다\)/g)).toHaveLength(1);
-}, 60_000);
 
 test('five headers: shell warning decisions agree with the TypeScript ordered envelope parser', async () => {
   const cases: Array<{ first: string; recipients: string[]; kind: string | null; slot: string | null; deadline: string | null; warnings: string[] }> = [

@@ -1,0 +1,18 @@
+# Simulation-only graph input using the currently supported graph-template parser.
+# Domain flow belongs to this graph declaration; the simulator only applies revisions.
+graph_id: expert-view-investment
+version: 1
+entry_node: diagnose
+terminal_nodes: [done]
+nodes:
+  - { node_id: diagnose, kind: agent, recipe: 'cmd:diagnose', max_visits: 1 }
+  - { node_id: rate-scan, kind: agent, recipe: 'cmd:rate-scan', max_visits: 1 }
+  - { node_id: forecast, kind: agent, recipe: 'cmd:forecast', max_visits: 1 }
+  - { node_id: recommendation, kind: agent, recipe: 'cmd:recommendation', max_visits: 1 }
+  - { node_id: audit, kind: agent, recipe: 'cmd:audit', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: diagnose, on: outcome, map: { ok: rate-scan, fail: done } }
+  - { from: rate-scan, on: outcome, map: { ok: forecast, fail: done } }
+  - { from: forecast, on: outcome, map: { ok: recommendation, fail: done } }
+  - { from: recommendation, on: outcome, map: { ok: done, fail: done } }

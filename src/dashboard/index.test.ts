@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
+import { LONG_SHELL_ESC_CONFIRMATION_MS } from '../esc-abort-gate.js';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -29,6 +30,7 @@ import {
   createEscAbortToolState,
   trackEscAbortToolCall,
   settleEscAbortToolCall,
+  hasLongRunningEscShell,
   cancelDelegatedToolOnEscape,
   createDashboardPluginRouteBridge,
   buildClassicDashboardTuiTurnTools,
@@ -45,6 +47,7 @@ import {
   SYNCHRONIZED_OUTPUT_END,
   type LogZoneClickWidgetHost,
 } from './index.js';
+import { createDashboardTuiConfirmContext } from './plugin-route-adapter.js';
 import { buildAdRunSetup } from '../ad-pipeline/ad-run-setup.js';
 import type { CommandRunner } from '../ad-pipeline/higgsfield-backend.js';
 import { dispatchDashboardSessionRuntimeTool } from './session-runtime-dispatch.js';
@@ -963,6 +966,23 @@ test('ESC selects only one identified active SelfImplement call, never a stale o
   expect(activeEscHarnessSpace(calls, spaces)).toBeNull();
 });
 
+test('ESC shell confirmation uses the elapsed execution age and clears it when the tool settles', async () => {
+  const calls = createEscAbortToolState();
+  const startedAtMs = performance.now();
+  // Source: the elapsed boundary comes from the OP-provided production constant.
+  trackEscAbortToolCall(calls, { id: 'shell-call', name: 'Bash' }, startedAtMs);
+  expect(hasLongRunningEscShell(calls, startedAtMs + LONG_SHELL_ESC_CONFIRMATION_MS - (LONG_SHELL_ESC_CONFIRMATION_MS / LONG_SHELL_ESC_CONFIRMATION_MS))).toBe(false);
+  expect(hasLongRunningEscShell(calls, startedAtMs + LONG_SHELL_ESC_CONFIRMATION_MS)).toBe(true);
+  trackEscAbortToolCall(calls, { id: 'other-call', name: 'Read' }, startedAtMs + LONG_SHELL_ESC_CONFIRMATION_MS);
+  expect(hasLongRunningEscShell(calls, startedAtMs + LONG_SHELL_ESC_CONFIRMATION_MS + LONG_SHELL_ESC_CONFIRMATION_MS)).toBe(true);
+  trackEscAbortToolCall(calls, { id: 'second-shell', name: 'RunShell' }, startedAtMs + LONG_SHELL_ESC_CONFIRMATION_MS);
+  expect(hasLongRunningEscShell(calls, startedAtMs + LONG_SHELL_ESC_CONFIRMATION_MS + LONG_SHELL_ESC_CONFIRMATION_MS)).toBe(true);
+  settleEscAbortToolCall(calls, { id: 'shell-call' });
+  expect(hasLongRunningEscShell(calls, startedAtMs + LONG_SHELL_ESC_CONFIRMATION_MS + LONG_SHELL_ESC_CONFIRMATION_MS)).toBe(true);
+  settleEscAbortToolCall(calls, { id: 'second-shell' });
+  expect(hasLongRunningEscShell(calls, startedAtMs + LONG_SHELL_ESC_CONFIRMATION_MS + LONG_SHELL_ESC_CONFIRMATION_MS)).toBe(false);
+});
+
 test.skipIf(!ptyAvailable())('TUI-LEGACY-STREAM-CANCEL-TERM: isolated --legacy Esc terminates a delegated long-running tool', async () => {
   const root = mkdtempSync(join(tmpdir(), 'legacy-stream-cancel-'));
   const pidPath = join(root, 'child.pid');
@@ -1245,6 +1265,27 @@ describe('dashboard tool dispatch signal observation', () => {
       'release_status', 'logs_query', 'ops_status',
     ]);
     expect(pluginCalls).toEqual([]);
+  });
+
+  test('production TUI bridge supplies the native deploy confirmation context to app_deploy', async () => {
+    let contextReads = 0;
+    const bridge = createDashboardPluginRouteBridge({
+      pluginRoot: resolve(import.meta.dir, '../../plugins'),
+      dispatchCore: async () => undefined,
+      dispatchPlugin: async () => ({ ok: false, error: 'unexpected plugin handler path' }),
+      getTuiDispatchContext: () => {
+        contextReads += 1;
+        return createDashboardTuiConfirmContext(undefined, null, async () => false);
+      },
+      dispatchAppDeploy: async (_args, context) => await context?.confirmChannels?.[0]?.request({
+        prompt: '공개 배포할까요?', header: '배포', yesLabel: 'y', noLabel: 'N',
+      }),
+    });
+    await expect(bridge.dispatch('app_deploy', { appId: 'lecture-scrap', requestText: 'publish' })).resolves.toEqual({
+      ok: true,
+      result: false,
+    });
+    expect(contextReads).toBe(1);
   });
 
   test('records signal provenance on a separate category before the existing runtime dispatch call', () => {

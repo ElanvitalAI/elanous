@@ -1,4 +1,5 @@
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
+import { buildToolSearchRouteIndex, dispatchToolSearch } from './tool-search.js';
 // ── 소환기 라우팅 불변식 · 소비자 전수 가드 (elanous review #5460 should-fix) ──
 //
 // tier-flip 은 라우터 지원 여부와 **무관하게** ToolSearch 를 주입한다(그게 맞다 —
@@ -132,6 +133,42 @@ describe('routeToolSearch', () => {
     expect(isToolSearchCall(TOOL_SEARCH_NAME)).toBe(true);
     expect(isToolSearchCall('toolsearch')).toBe(false);
     expect(isToolSearchCall('SelfImplement')).toBe(false);
+  });
+});
+
+describe('production ToolSearch graph route allowlist', () => {
+  test('discovers only graph IDs declared by each active plugin and keeps native routes', () => {
+    const route = { triggers: ['run graph'], examples: [], sideEffects: 'external' as const,
+      risk: 'high' as const, cost: 'spawns-run' as const, requiresConfirm: true };
+    const specs: LLMToolSpec[] = [
+      { name: 'RunMissingBefore', description: 'run graph missing before', parameters: {}, pluginId: 'declared-plugin', route,
+        handlerRef: 'graph:declared' },
+      { name: 'RunDeclared', description: 'run graph declared', parameters: {}, pluginId: 'declared-plugin', route,
+        handlerRef: 'graph:declared', allowedGraphIds: ['declared'] },
+      { name: 'RunForeign', description: 'run graph foreign', parameters: {}, pluginId: 'foreign-plugin', route,
+        handlerRef: 'graph:declared', allowedGraphIds: ['other'] },
+      { name: 'RunUnlisted', description: 'run graph unlisted', parameters: {}, pluginId: 'declared-plugin', route,
+        handlerRef: 'graph:unlisted', allowedGraphIds: ['declared'] },
+      { name: 'RunMissingAfter', description: 'run graph missing after', parameters: {}, pluginId: 'declared-plugin', route,
+        handlerRef: 'graph:declared' },
+      { name: 'NativeGraphStatus', description: 'run graph status', parameters: {}, pluginId: 'native-plugin', route,
+        handlerRef: 'native:ops_status' },
+    ];
+    const { index } = buildToolSearchRouteIndex(specs);
+    expect(index.entries.map(({ name }) => name)).toEqual(['RunDeclared', 'NativeGraphStatus']);
+    const result = dispatchToolSearch({ query: 'route: run graph', max_results: specs.length }, { specs, surface: 'test' });
+    expect(result.matched).toContain('RunDeclared');
+    expect(result.matched).not.toContain('RunForeign');
+    expect(result.matched).toContain('NativeGraphStatus');
+
+    const duplicateAllowed: LLMToolSpec = { name: 'RunDuplicate', description: 'duplicate graph route', parameters: {},
+      pluginId: 'declared-plugin', route, handlerRef: 'graph:declared', allowedGraphIds: ['declared'] };
+    const duplicateMissing: LLMToolSpec = { name: 'RunDuplicate', description: 'duplicate graph route', parameters: {},
+      pluginId: 'declared-plugin', route, handlerRef: 'graph:declared' };
+    for (const order of [[duplicateAllowed, duplicateMissing], [duplicateMissing, duplicateAllowed]]) {
+      const duplicateIndex = buildToolSearchRouteIndex(order);
+      expect(duplicateIndex.index.entries.map(({ name }) => name)).not.toContain('RunDuplicate');
+    }
   });
 });
 

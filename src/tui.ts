@@ -567,7 +567,6 @@ export function renderHelp(context: 'dashboard' | 'select-multi' | 'select-singl
     lines.push(b(key('Ctrl+4',            'View 4 — Agents')));
     lines.push(b(key('Ctrl+5',            'View 5 — Debug')));
     lines.push(b(key('Ctrl+6',            'View 6 — Scheduler')));
-    lines.push(b(key('Ctrl+7 / Ctrl+/ / /view 7',  'View 7 — Widget Playground')));
 
     section('Browse \u2014 Middle pane modes');
     lines.push(b(key('f',                 'Files (file tree)')));

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-CENSUS-ORACLE-AXIS-WORLD-TS",
+  "path": "src/ux-sim/census-oracle-axis-world.ts",
+  "boundary": "Isolated JUnit and source fixture for census oracle axis replay; no release gate, host, or production ledger is touched.",
+  "deviceIds": [
+    "census-oracle-axis-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

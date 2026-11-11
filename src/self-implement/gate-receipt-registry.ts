@@ -172,9 +172,16 @@ export function gateEnvFingerprint(env: NodeJS.ProcessEnv): string {
 
 /** 후보 워크트리가 실제로 설치·실행할 Bun dependency graph 지문. 불투명 lockfile 은 raw SHA로 fail-closed. */
 export function gateLockfileHash(worktree: string): string {
-  for (const name of ['bun.lock', 'bun.lockb']) {
+  for (const name of ['bun.lock', 'bun.lockb'] as const) {
     if (!existsSync(join(worktree, name))) continue;
     const bytes = readFileSync(join(worktree, name));
+    return gateLockfileHashBytes(bytes, name);
+  }
+  return 'absent';
+}
+
+/** Apply the same dependency-graph identity to a lock read from a pinned commit. */
+export function gateLockfileHashBytes(bytes: Buffer, name: 'bun.lock' | 'bun.lockb' = 'bun.lock'): string {
     if (name === 'bun.lock') {
       try {
         const parsed: unknown = Bun.JSONC.parse(bytes.toString('utf8'));
@@ -261,6 +268,4 @@ export function gateLockfileHash(worktree: string): string {
       } catch { /* malformed or unsupported lockfiles remain fail-closed via their raw-byte fingerprint */ }
     }
     return createHash('sha256').update(bytes).digest('hex');
-  }
-  return 'absent';
 }

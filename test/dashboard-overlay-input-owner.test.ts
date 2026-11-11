@@ -50,10 +50,10 @@ describe('dashboard overlay input owner', () => {
     expect(isOverlayInputSurface(surface)).toBe(false);
   });
 
-  test('focus:owns picker (search-modal, slash-launcher) DOES own overlay input', () => {
+  test('focus:owns picker captures overlay input', () => {
     // Distinguish from the participates case: pickers built via
-    // `mountViewAsModalSurface` (search-modal, slash-launcher,
-    // vw-local-input-target-popup) declare `focus: 'owns'` because
+    // `mountViewAsModalSurface` pickers with their own query input
+    // declare `focus: 'owns'` because
     // they have their own query input and capture the keystrokes.
     const surface = modal('picker:owning', {
       tier: 'picker',

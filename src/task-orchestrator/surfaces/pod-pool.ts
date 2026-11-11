@@ -31,6 +31,8 @@ import { harnessCpuSlotsBesideGate, measurePoolLease, recommendConcurrency, type
 
 export interface PodPoolMember {
   readonly context: string;
+  /** Optional federation role; an unmarked member remains available to existing callers. */
+  readonly federationRole?: 'task' | 'gate' | 'cloud';
   /** 원격 클러스터가 도는 기계(ssh 호스트). 없으면 이 기계의 docker 에 있다. */
   readonly sshHost?: string;
   readonly capacity: number;
@@ -368,6 +370,7 @@ export function podPoolHostLease(members: readonly PodPoolMember[]): HostPoolLea
 }
 
 export class PodPoolScheduler {
+  private readonly memberList: PodPoolMember[];
   private readonly inflight = new Map<string, number>();
   private readonly admission: PodLeaseAdmission;
   /**
@@ -378,6 +381,9 @@ export class PodPoolScheduler {
   /** A launch with an explicit memory limit must be measured with that limit, not the pool's 16Gi default. */
   private readonly memoryAdmissions = new Map<string, { admission: PodLeaseAdmission; reading: () => PoolLeaseRecommendation | null; measure: () => Promise<PoolLeaseRecommendation>; take: () => void; release: () => void }>();
   private readonly outstanding = new Set<PodLeaseRelease>();
+  private readonly waitingRequestIds = new Set<string>();
+  private readonly waiterAbortCleanups = new Map<string, () => void>();
+  private cloudStarvationHandler?: (pressure: { queueDepth: number; blockedCount: number; reason: string }) => void | Promise<void>;
   private lastFree = 0;
   private budget = 0;
   /** GATE-RESERVE-AUTO — local permits whose Pod was observed (Running/terminal): already inside the CPU reading. */
@@ -393,18 +399,19 @@ export class PodPoolScheduler {
   private readonly pollMs: number;
   private readonly occupancy: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>;
   private readonly memberMemory: () => Array<{ context: string; allocatableMemoryBytes: number | null }> | Promise<Array<{ context: string; allocatableMemoryBytes: number | null }>>;
-  constructor(readonly members: readonly PodPoolMember[], options: { status?: (memoryLimit?: string) => PoolLeaseRecommendation | Promise<PoolLeaseRecommendation>; kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; pollMs?: number; hostLease?: HostPoolLease; memberMemory?: () => Array<{ context: string; allocatableMemoryBytes: number | null }> | Promise<Array<{ context: string; allocatableMemoryBytes: number | null }>>; occupancy?: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>; dependencyMerged?: (after: PodLeasePredecessor, signal?: AbortSignal) => PredecessorState | boolean | Promise<PredecessorState | boolean> } = {}) {
+  constructor(members: readonly PodPoolMember[], options: { status?: (memoryLimit?: string) => PoolLeaseRecommendation | Promise<PoolLeaseRecommendation>; kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe; pollMs?: number; hostLease?: HostPoolLease; memberMemory?: () => Array<{ context: string; allocatableMemoryBytes: number | null }> | Promise<Array<{ context: string; allocatableMemoryBytes: number | null }>>; occupancy?: () => Record<string, MemberOccupancy> | Promise<Record<string, MemberOccupancy>>; dependencyMerged?: (after: PodLeasePredecessor, signal?: AbortSignal) => PredecessorState | boolean | Promise<PredecessorState | boolean> } = {}) {
+    this.memberList = [...members];
     this.pollMs = options.pollMs ?? 15_000;
     // One lease directory per pool (contexts, not caps) — every CLI process launching into the same clusters shares it.
-    this.hostLease = options.hostLease ?? podPoolHostLease(members);
+    this.hostLease = options.hostLease ?? podPoolHostLease(this.memberList);
     // GATE-RESERVE-AUTO: the gate reservation is returned beside the recommendation, never folded into it — the
     // delta budget below must not see a gate start/end as a free-slot change (that made the result order-dependent).
     const measureStatus: (memoryLimit?: string) => Promise<{ status: PoolLeaseRecommendation; gateSlots: number | null | undefined }> = options.status
       ? async (memoryLimit) => ({ status: await options.status!(memoryLimit), gateSlots: undefined })
       : async (memoryLimit) => {
         // POD-ADMIT-BY-USAGE: admission reads observed Pod usage (`kubectl top`); tryAcquire's occupancy read does not.
-        const measure = measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}), measureUsage: true });
-        return { status: recommendConcurrency(measure, { capacity: members.reduce((n, m) => n + m.capacity, 0), ...(memoryLimit ? { perGoalMemory: memoryLimit } : {}), accounts: 0, perAccount: 0 }), gateSlots: harnessCpuSlotsBesideGate(measure) };
+        const measure = measurePoolLease(this.memberList, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}), measureUsage: true });
+        return { status: recommendConcurrency(measure, { capacity: this.memberList.reduce((n, m) => n + m.capacity, 0), ...(memoryLimit ? { perGoalMemory: memoryLimit } : {}), accounts: 0, perAccount: 0 }), gateSlots: harnessCpuSlotsBesideGate(measure) };
       };
     /** Cluster-level additional slots for the cross-process host lease: the measured free slots, capped by the gate's CPU. */
     const capped = ({ status, gateSlots }: { status: PoolLeaseRecommendation; gateSlots: number | null | undefined }): PoolLeaseRecommendation =>
@@ -414,9 +421,9 @@ export class PodPoolScheduler {
     this.measure = async () => { const reading = await measureStatus(); this.lastUncapped = reading.status; return capped(reading); };
     this.measureForMemory = async (memoryLimit) => capped(await measureStatus(memoryLimit));
     // An injected status (tests, callers with their own measurement) without memberMemory never shells out to kubectl here.
-    this.memberMemory = options.memberMemory ?? (options.status ? (() => []) : () => measurePoolLease(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) }).members
+    this.memberMemory = options.memberMemory ?? (options.status ? (() => []) : () => measurePoolLease(this.memberList, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) }).members
       .map((m: PodLeaseMember) => ({ context: m.context, allocatableMemoryBytes: m.allocatableMemoryBytes })));
-    this.occupancy = options.occupancy ?? (() => measureMemberOccupancy(members, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) }));
+    this.occupancy = options.occupancy ?? (() => measureMemberOccupancy(this.memberList, { ...(options.kubectl ? { kubectl: options.kubectl } : {}), ...(options.dns ? { dns: options.dns } : {}) }));
     const decide = async (gate: boolean): Promise<PoolLeaseRecommendation> => {
       const reading = await measureStatus();
       const measured = reading.status;
@@ -468,6 +475,37 @@ export class PodPoolScheduler {
     this.dependencyMerged = options.dependencyMerged ?? ((after: PodLeasePredecessor, signal?: AbortSignal) => predecessorState(after, {}, signal));
     this.admission = new PodLeaseAdmission({ status: () => decide(false), ...(options.pollMs ? { pollMs: options.pollMs } : {}), dependencyMerged: this.dependencyMerged });
     this.gateAdmission = new PodLeaseAdmission({ status: () => decide(true), ...(options.pollMs ? { pollMs: options.pollMs } : {}), dependencyMerged: this.dependencyMerged });
+  }
+  get members(): readonly PodPoolMember[] { return this.memberList; }
+  /** Attach the automatic cloud-burst reconciler to real no-slot observations. */
+  setCloudStarvationHandler(handler: (pressure: { queueDepth: number; blockedCount: number; reason: string }) => void | Promise<void>): void {
+    this.cloudStarvationHandler = handler;
+  }
+  /** Refresh demand after jobs finish as well as on no-slot observations. */
+  async reconcileCloudCapacity(reason = 'periodic capacity observation'): Promise<void> {
+    await this.cloudStarvationHandler?.({ queueDepth: this.waitingRequestIds.size, blockedCount: this.waitingRequestIds.size, reason });
+  }
+  /** Replace the reserved zero-capacity cloud candidate after join and warm checks pass. */
+  enableCloudMember(member: PodPoolMember): void {
+    const index = this.memberList.findIndex(item => item.context === member.context);
+    if (index < 0 || this.memberList[index]?.federationRole !== 'cloud') throw new Error(`cloud pool member was not reserved: ${member.context}`);
+    if (member.federationRole !== 'cloud' || member.capacity < 1) throw new Error('cloud pool member requires cloud role and positive capacity');
+    this.memberList[index] = member;
+  }
+  /** Withdraw a burst member from new placements while its existing Pods drain. */
+  disableCloudMember(context: string): void {
+    const index = this.memberList.findIndex(item => item.context === context && item.federationRole === 'cloud');
+    if (index < 0) return;
+    this.memberList[index] = { ...this.memberList[index]!, capacity: 0 };
+  }
+  /** Running and Pending Pods plus this process's placements; unknown occupancy blocks shutdown. */
+  async activeMemberLeases(context: string): Promise<number> {
+    try {
+      const reading = await this.occupancy();
+      const occupied = reading[context]?.occupied;
+      if (occupied === null || occupied === undefined) return Number.MAX_SAFE_INTEGER;
+      return Math.max(0, occupied) + (this.inflight.get(context) ?? 0);
+    } catch { return Number.MAX_SAFE_INTEGER; }
   }
   private memoryAdmission(memoryLimit: string): { admission: PodLeaseAdmission; reading: () => PoolLeaseRecommendation | null; measure: () => Promise<PoolLeaseRecommendation>; take: () => void; release: () => void } {
     const existing = this.memoryAdmissions.get(memoryLimit);
@@ -631,7 +669,20 @@ export class PodPoolScheduler {
    * member the 0.2.15 gate launched its shards one at a time.
    * Ties keep the configured member order. Returns null when every readable member is full.
    */
-  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void, mode: { selfCapped?: boolean; kind?: PodPlacementKind | null; /** MINIH-MODE: a declared location gates new standard-Job admission (home 1 · external 2). */ minihLocation?: MinihLocation | null; onPlacement?: (placement: PodPlacement) => void; signal?: AbortSignal } = {}): Promise<PodPoolMember | null> {
+  async tryAcquire(skip?: ReadonlySet<string>, onEmpty?: (reason: string) => void, mode: { selfCapped?: boolean; kind?: PodPlacementKind | null; gate?: boolean; /** MINIH-MODE: a declared location gates new standard-Job admission (home 1 · external 2). */ minihLocation?: MinihLocation | null; onPlacement?: (placement: PodPlacement) => void; signal?: AbortSignal; waiterId?: string } = {}): Promise<PodPoolMember | null> {
+    const previousCleanup = mode.waiterId ? this.waiterAbortCleanups.get(mode.waiterId) : undefined;
+    previousCleanup?.();
+    let cleanupWaiter = () => {};
+    cleanupWaiter = () => {
+      if (mode.waiterId && this.waiterAbortCleanups.get(mode.waiterId) === cleanupWaiter) {
+        this.waitingRequestIds.delete(mode.waiterId);
+        this.waiterAbortCleanups.delete(mode.waiterId);
+      }
+      mode.signal?.removeEventListener('abort', cleanupWaiter);
+    };
+    if (mode.waiterId) this.waiterAbortCleanups.set(mode.waiterId, cleanupWaiter);
+    if (mode.signal?.aborted) { cleanupWaiter(); throw mode.signal.reason ?? new Error('pod pool acquisition aborted'); }
+    mode.signal?.addEventListener('abort', cleanupWaiter, { once: true });
     const selfCapped = mode.selfCapped === true;
     const kind = mode.kind ?? null;
     const minihLocation = mode.minihLocation ?? null;
@@ -646,7 +697,7 @@ export class PodPoolScheduler {
       reading = Object.fromEntries(this.members.map((m) => [m.context, { occupied: null, reason }]));
     }
     // A caller may abandon a slow occupancy read. Never acquire its lease after cancellation.
-    if (mode.signal?.aborted) throw mode.signal.reason ?? new Error('pod pool acquisition aborted');
+    if (mode.signal?.aborted) { cleanupWaiter(); throw mode.signal.reason ?? new Error('pod pool acquisition aborted'); }
     // MINIH-MODE: only node-c candidates are held. Other pool members retain their own configured capacity.
     // Running/Pending Pods already in the pool stay exactly as they are.
     const minihHeld = this.minihHold(kind, minihLocation, reading);
@@ -663,6 +714,8 @@ export class PodPoolScheduler {
     for (const m of this.members) {
       // A capacity-0 member is off — never chosen (and no division by zero in the share).
       if (m.capacity <= 0) continue;
+      // Federation gate hosts are reserved before scoring; legacy pools without roles keep their behavior.
+      if (mode.gate ? (this.members.some((item) => item.federationRole === 'gate') && m.federationRole !== 'gate') : m.federationRole === 'gate') continue;
       if (minihHeld && (m.sshHost === 'node-c' || m.context === 'pool-node-c')) {
         free[m.context] = 0;
         continue;
@@ -687,8 +740,18 @@ export class PodPoolScheduler {
         debug.log('pod.pool', 'node-c-drain-hold', { location: minihLocation, capacity: minihHeld.capacity, occupied: minihHeld.occupied, draining: minihHeld.draining, kind });
         onEmpty?.(reason);
       } else onEmpty?.(`no free slot · free=${JSON.stringify(free)} · measured=${JSON.stringify(measured)}${selfCapped ? ' · selfCapped' : ''}${skip?.size ? ` · skipped=${[...skip].join(',')}` : ''}${kind ? ` · kind=${kind}` : ''}`);
+      const reason = minihHeld ? `node-c drain or cap · occupied=${minihHeld.occupied}` : 'no free pool slot';
+      if (mode.waiterId && !mode.signal?.aborted) this.waitingRequestIds.add(mode.waiterId);
+      if (this.cloudStarvationHandler && this.waitingRequestIds.size > 0) {
+        try {
+          const result = this.cloudStarvationHandler({ queueDepth: this.waitingRequestIds.size, blockedCount: this.waitingRequestIds.size, reason });
+          if (result && typeof (result as Promise<void>).catch === 'function') void (result as Promise<void>).catch(error =>
+            debug.log('pod.pool', 'cloud-burst-reconcile-failed', { error: error instanceof Error ? error.message : String(error) }, { level: 'warn' }));
+        } catch (error) { debug.log('pod.pool', 'cloud-burst-reconcile-failed', { error: error instanceof Error ? error.message : String(error) }, { level: 'warn' }); }
+      }
       return null;
     }
+    cleanupWaiter();
     const chosen: { member: PodPoolMember; slots: number; measured: boolean; preferred: boolean } = best;
     this.inflight.set(chosen.member.context, (this.inflight.get(chosen.member.context) ?? 0) + 1);
     const share = Object.fromEntries(this.members.map((m) => [m.context, m.capacity > 0 ? Math.round(Math.max(0, free[m.context] ?? 0) / m.capacity * 100) / 100 : 0]));

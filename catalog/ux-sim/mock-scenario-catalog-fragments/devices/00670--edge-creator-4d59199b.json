@@ -7,11 +7,13 @@
   "implementation": [
     "src/ux-sim/edge-creator.ts",
     "src/graph-runner/runner.ts",
-    "src/ux-sim/edge-creator-nightly.ts"
+    "src/ux-sim/edge-creator-nightly.ts",
+    "src/ux-sim/ios-chat-edge-adapter.ts"
   ],
   "tests": [
     "src/ux-sim/edge-creator.test.ts",
-    "src/ux-sim/edge-creator-nightly.test.ts"
+    "src/ux-sim/edge-creator-nightly.test.ts",
+    "src/ux-sim/ios-chat-edge-adapter.test.ts"
   ],
   "target": "Generate bounded pairwise cases from four graph-edge axes and pin all eight recorded incidents; run E5 through the production graph runner with dynamic repair append, interruption, and same-runId resume",
   "inputs": [
@@ -32,7 +34,8 @@
   ],
   "entryCommands": [
     "bun test src/ux-sim/edge-creator.test.ts",
-    "bun test src/ux-sim/edge-creator-nightly.test.ts"
+    "bun test src/ux-sim/edge-creator-nightly.test.ts",
+    "bun test src/ux-sim/ios-chat-edge-adapter.test.ts"
   ],
   "logsRecorded": "no",
   "eventNames": [

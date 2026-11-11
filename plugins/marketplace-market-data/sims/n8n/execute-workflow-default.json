@@ -1,0 +1,15 @@
+{
+  "id": "n8n-default-envelope",
+  "name": "Execute Workflow with the default envelope",
+  "nodes": [
+    {
+      "id": "execute-market-quote",
+      "name": "Execute market quote",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [240, 180],
+      "parameters": { "workflowId": "market-quote" }
+    }
+  ],
+  "connections": {}
+}

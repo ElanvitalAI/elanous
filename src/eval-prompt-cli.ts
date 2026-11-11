@@ -876,7 +876,8 @@ export async function runEvalPrompt(opts: EvalPromptOpts): Promise<EvalPromptRes
   const { applyDeferredTools } = await import('./session-runtime/tier-flip.js');
   const deferredSplit = applyDeferredTools(messages, tools, {
     userText: opts.prompt,
-    ...(opts.routingStrategy === undefined ? {} : { enabled: opts.routingStrategy === 'index' }),
+    routingStrategy: opts.routingStrategy,
+    activePluginIds: new Set(tools.flatMap((tool) => tool.pluginId ? [tool.pluginId] : [])),
   });
   if (!opts.silent && deferredSplit.stats.deferredCount > 0) {
     process.stdout.write(

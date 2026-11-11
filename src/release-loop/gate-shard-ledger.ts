@@ -8,6 +8,8 @@ export interface GateShardLedgerRow {
   v: 1;
   /** Release graph invocation that owns this observation; lets the HQ ledger be queried by one run. */
   runId?: string;
+  /** Which gate entrypoint emitted the row; older release-loop rows predate this label. */
+  entrypoint?: 'release' | 'rehearsal' | 'self-gate' | 'train';
   /** Invocation identity used to prevent shard summaries from mixing repeated same-head gates. */
   invocationId?: string;
   version: string;
@@ -74,7 +76,7 @@ export function gateShardLedgerBatchComplete(rows: readonly GateShardLedgerRow[]
   const batch = rows.filter((row) => row.batchId === expected.batchId);
   if (batch.length !== expected.shardIds.length || new Set(batch.map((row) => row.shardId)).size !== batch.length
     || !batch.every((row) => row.version === expected.version && row.commit === expected.commit && row.phase === expected.phase
-      && row.observedAt === expected.observedAt && row.batchSize === expected.shardIds.length && row.state === 'done')
+      && row.observedAt === expected.observedAt && row.batchSize === expected.shardIds.length && (row.state === 'done' || row.state === 'failed'))
     || expected.shardIds.some((id) => !batch.some((row) => row.shardId === id))) return false;
 
   // Batch completeness is a persistence contract, not a reuse verdict. Keep a complete record of every
@@ -92,7 +94,7 @@ export function gateShardLedgerBatchComplete(rows: readonly GateShardLedgerRow[]
 export function gateShardLedgerBatchReusable(rows: readonly GateShardLedgerRow[], expected: GateShardLedgerBatchExpectation): boolean {
   if (!gateShardLedgerBatchComplete(rows, expected)) return false;
   const batch = rows.filter((row) => row.batchId === expected.batchId);
-  return batch.every((row) => row.attribution === 'complete' && !row.retryGroupId && !row.unmeasuredFiles?.length
+  return batch.every((row) => row.state === 'done' && row.attribution === 'complete' && !row.retryGroupId && !row.unmeasuredFiles?.length
     && row.pass !== null && row.fail !== null && row.errors !== null && row.ran !== null
     && !!row.failureIds && !!row.errorIds && row.fail === row.failureIds.length && row.errors === row.errorIds.length
     && row.rc === (row.fail + row.errors > 0 ? 1 : 0));
@@ -135,7 +137,7 @@ export function appendGateShardLedgerBatch(path: string, rows: readonly GateShar
     if (new Set(shardIds).size !== shardIds.length) throw new Error('duplicate shard id in result batch');
     for (const row of rows) {
       if (row.version !== rows[0]!.version || row.commit !== rows[0]!.commit || row.phase !== 'cut'
-        || row.state !== 'done' || !Number.isSafeInteger(row.ran) || row.ran! < 0
+        || (row.state !== 'done' && row.state !== 'failed') || !Number.isSafeInteger(row.ran) || row.ran! < 0
         || (row.attribution !== 'complete' && row.attribution !== 'unmeasured')
         || (row.attribution === 'complete' && (row.pass === null || row.fail === null || row.errors === null
           || !row.failureIds || !row.errorIds || row.fail !== row.failureIds.length || row.errors !== row.errorIds.length)))
@@ -174,7 +176,7 @@ export function readGateShardLedger(path: string): { rows: GateShardLedgerRow[];
     const size = batch[0]?.batchSize;
     if (batch.every((row) => row.batchSize === undefined)) return false;
     if (!Number.isSafeInteger(size) || size! < 1 || batch.length !== size
-      || batch.some((row) => row.batchSize !== size || row.state !== 'done'
+      || batch.some((row) => row.batchSize !== size || (row.state !== 'done' && row.state !== 'failed')
         || (row.attribution !== 'complete' && row.attribution !== 'unmeasured')
         || row.version !== batch[0]!.version || row.commit !== batch[0]!.commit || row.phase !== batch[0]!.phase)
       || new Set(batch.map((row) => row.shardId)).size !== batch.length) return true;

@@ -9,7 +9,6 @@ body-dynamic-import	apps/pwa/src/components/terminal/TerminalTabs.interaction.te
 body-dynamic-import	apps/pwa/src/components/vault/MermaidDiagram.integration.test.tsx	3
 body-dynamic-import	apps/pwa/src/components/vault/vault-write.interaction.test.tsx	5
 body-dynamic-import	apps/pwa/src/components/workflows/ExpressionInput.test.tsx	1
-body-dynamic-import	apps/pwa/src/lib/live-graph.test.ts	3
 body-dynamic-import	apps/pwa/src/lib/merge-approvals-api.test.ts	1
 body-dynamic-import	plugins/doc-draft/graphs/run-step.test.ts	1
 body-dynamic-import	scripts/announce-loop/spawn-node.test.ts	1
@@ -36,7 +35,6 @@ body-dynamic-import	src/boot/daemon-tools/index.test.ts	2
 body-dynamic-import	src/channel-bot-token.test.ts	4
 body-dynamic-import	src/cli/config-test-sync.test.ts	1
 body-dynamic-import	src/cli/connector-cli.test.ts	1
-body-dynamic-import	src/cli/msg-cli.test.ts	7
 body-dynamic-import	src/cli/pod-cli.test.ts	2
 body-dynamic-import	src/cli/provider-cli.test.ts	2
 body-dynamic-import	src/cli/pty-drive-size.test.ts	2

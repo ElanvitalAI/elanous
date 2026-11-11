@@ -19,7 +19,7 @@ import { HARNESS_RUN_ID_ENV, resolveRunIdentity as defaultResolveRunIdentity } f
 import { decomposeSelfDevGoal, type SelfDevDecomposition, type SelfDevDecomposeOptions } from './decompose.js';
 import { decomposeFabricRequest, type FabricDecomposeRequestOptions, type FabricDecomposeRequestResult } from './fabric-decompose-adapter.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig } from '../user-config/reader.js';
 import { resolveObserveOnlyDecision } from '../self-implement/observe-only.js';
 import { inspectArtifactLaunchDeclaration, writeAuthoredGoal } from '../self-implement/goal-author.js';
 import { classifyReviewProviderFailure } from './review-provider-fallback.js';

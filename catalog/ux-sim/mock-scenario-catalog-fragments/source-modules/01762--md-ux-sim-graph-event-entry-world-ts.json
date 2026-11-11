@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-GRAPH-EVENT-ENTRY-WORLD-TS",
+  "path": "src/ux-sim/graph-event-entry-world.ts",
+  "boundary": "Injects out-of-order external event deliveries into an entry adapter and publishes an internal event on the production graph event bus scoped to an existing run.",
+  "deviceIds": ["graph-event-entry-world"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}
