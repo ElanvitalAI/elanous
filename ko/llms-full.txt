@@ -113,9 +113,16 @@ If you run the installer as **root** on Debian or Ubuntu, it installs any missin
 As a regular user it only tells you what is missing, so install the basics first:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y curl ca-certificates unzip git
-curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
-source ~/.bashrc
+sudo apt-get update && sudo apt-get install -y curl ca-certificates unzip git &&
+(
+  tmp="$(mktemp)" &&
+  trap 'rm -f "$tmp"' EXIT &&
+  curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh -o "$tmp" &&
+  test -s "$tmp" &&
+  bash -n "$tmp" &&
+  bash "$tmp" --yes
+) &&
+source ~/.bashrc &&
 elanous --version && elanous doctor
 ```
 
@@ -5190,6 +5197,22 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 - The web app's Terminal shows each driven terminal side by side with a strip of what elanous just did and why; you can take over with the keyboard or mouse.
 
 - On a credit policy, the hourly limit alert adds up the credits across your Codex accounts and their combined burn rate, and says when they will run out.
+
+---
+
+# 0.3.11
+
+Source: https://docs.elanous.ai/releases/0-3-11/
+
+## Behavior changes
+
+- New local sessions open in the Next TUI by default, with clearer first-run model selection, session controls, and failure guidance.
+- App and dashboard updates improve chat provenance, member access, and the six-scene demo flow.
+- Release and test orchestration carry stronger image, shard, and recovery evidence.
+
+The release package was checked by clean installation, version output, a Next TUI conversation, focused regression tests, and checksums. The full automated sweep was interrupted by test-host resource exhaustion, so its incomplete result was not counted as a passing gate. Live post-publish checks are in progress.
+
+Installers and assets are available from the [v0.3.11 release](https://github.com/ElanvitalAI/elanous/releases/tag/v0.3.11).
 
 ---
 
