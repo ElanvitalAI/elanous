@@ -28,6 +28,7 @@ export function MemberMiniBoardView({
         <p className="mt-2 text-sm text-muted-foreground">내 제안부터 배포까지의 상태와 오늘의 브리핑</p>
       </div>
       <div className="flex items-center gap-3 text-sm text-muted-foreground">
+        <a href="/app/member/invite/" className="rounded-lg border border-border bg-card px-3 py-2 font-medium text-foreground">내 초대 링크</a>
         {refreshedAt && <span>갱신 {refreshedAt}</span>}
         <button type="button" onClick={onRefresh} disabled={loading}
           className="rounded-lg border border-border bg-card px-3 py-2 font-medium text-foreground disabled:opacity-60">

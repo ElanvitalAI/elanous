@@ -89,6 +89,10 @@ test('pool declaration client posts owner bearer without exposing response bodie
   expect(calls[0]?.url).toBe('https://nexus.example/v1/resource-ledger/pools');
   expect(calls[0]?.headers.get('authorization')).toBe('Bearer owner-sentinel-token');
   expect(await calls[0]?.json()).toEqual({ pool });
+  const next = { ...pool, members: [{ ...pool.members[0]!, digest: 'sha256:' + 'b'.repeat(64) }] };
+  expect(await postResourcePoolDeclaration(next, { baseUrl: 'https://nexus.example', bearerToken: 'owner-sentinel-token',
+    expectedPool: pool, fetch: fetcher })).toBe(false);
+  expect(await calls[2]?.json()).toEqual({ pool: next, expectedPool: pool });
   let refusedMessage = '';
   try { await postResourcePoolDeclaration(pool, { baseUrl: 'https://nexus.example', bearerToken: 'owner-sentinel-token',
     fetch: (async () => Response.json({ error: 'owner-sentinel-token' }, { status: 403 })) as unknown as typeof fetch }); }

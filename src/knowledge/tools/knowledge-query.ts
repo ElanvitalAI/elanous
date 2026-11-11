@@ -1,9 +1,11 @@
 import type { LLMToolSpec } from '../../llm/tool-spec.js';
+import { debug } from '../../debug/log.js';
 // ── PFC-S4.2: KnowledgeQuery LLM tool ──
 
 
 import { discoverObsidianVault, type ObsidianVault } from '../../auto-research/obsidian-bridge.js';
-import { knowledgeQuery, queryInstalledPack } from '../query.js';
+import { knowledgeQuery, queryInstalledPack, resolveInstalledKnowledgePack, selectInstalledKnowledgePack,
+  type InstalledKnowledgePackDecision } from '../query.js';
 import type { KnowledgeQueryInput, KnowledgeQueryResult } from '../types.js';
 
 export interface KnowledgeQueryToolInput {
@@ -19,8 +21,12 @@ export interface KnowledgeQueryToolInput {
 
 export interface KnowledgeQueryToolResult {
   output: string;
-  /** Cited cards when pack_id is supplied; absent on the existing vault query path. */
+  /** Cited cards when an installed pack was explicitly or automatically selected. */
   pack_hits?: ReturnType<typeof queryInstalledPack>;
+  /** The unique installed pack selected from its metadata for a question-only call. */
+  selectedPack?: { id: string; title: string };
+  /** A one-line user choice request when equal-ranked installed packs match the same intent tags. */
+  selectionQuestion?: string;
   results: KnowledgeQueryResult['results'];
   total: number;
   truncated: boolean;
@@ -30,6 +36,32 @@ export interface KnowledgeQueryToolResult {
 export interface KnowledgeQueryDispatchOpts {
   vault?: ObsidianVault;
   searchPack?: typeof queryInstalledPack;
+  selectPack?: typeof selectInstalledKnowledgePack;
+  resolvePack?: typeof resolveInstalledKnowledgePack;
+}
+
+function searchPack(packId: string, question: string, opts: KnowledgeQueryDispatchOpts,
+  selectedPack?: { id: string; title: string }): KnowledgeQueryToolResult {
+  try {
+    const hits = (opts.searchPack ?? queryInstalledPack)(packId, question);
+    const selected = selectedPack ? `Selected installed pack ${selectedPack.id} (${selectedPack.title}).\n` : '';
+    return {
+      output: selected + (hits.map(hit => `[${hit.ref}] ${hit.title}: ${hit.body}`).join('\n') || 'No matching installed pack cards.'),
+      pack_hits: hits, results: [], total: hits.length, truncated: false,
+      ...(selectedPack ? { selectedPack } : {}),
+    };
+  } catch (error) {
+    if (selectedPack) {
+      debug.log('knowledge-pack.select', 'provider-failed', {
+        stage: 'pack-search',
+        fallback: 'none',
+        packId: selectedPack.id,
+        errorType: error instanceof Error ? error.name : typeof error,
+      }, { level: 'warn' });
+    }
+    return { output: `KnowledgeQuery failed: ${error instanceof Error ? error.message : String(error)}`,
+      pack_hits: [], results: [], total: 0, truncated: false };
+  }
 }
 
 export async function dispatchKnowledgeQuery(
@@ -37,15 +69,50 @@ export async function dispatchKnowledgeQuery(
   opts: KnowledgeQueryDispatchOpts = {},
 ): Promise<KnowledgeQueryToolResult> {
   if (input.pack_id !== undefined) {
+    if (!input.question?.trim()) return { output: 'KnowledgeQuery failed: question required for pack search',
+      pack_hits: [], results: [], total: 0, truncated: false };
+    return searchPack(input.pack_id, input.question, opts);
+  }
+  const hasVaultSearchOptions = input.tags !== undefined || input.fulltext !== undefined
+    || input.kind !== undefined || input.limit !== undefined || input.offset !== undefined
+    || input.include_body !== undefined;
+  if (input.question?.trim() && !hasVaultSearchOptions) {
+    let decision: InstalledKnowledgePackDecision = { kind: 'none' };
     try {
-      if (!input.question?.trim()) throw new Error('question required for pack search');
-      const hits = (opts.searchPack ?? queryInstalledPack)(input.pack_id, input.question);
-      return { output: hits.map(hit => `[${hit.ref}] ${hit.title}: ${hit.body}`).join('\n') || 'No matching installed pack cards.',
-        pack_hits: hits, results: [], total: hits.length, truncated: false };
+      if (opts.resolvePack) {
+        decision = opts.resolvePack(input.question);
+      } else if (opts.selectPack) {
+        const selected = opts.selectPack(input.question);
+        decision = selected ? { kind: 'selected', pack: selected, priority: 0, intentTags: [] } : { kind: 'none' };
+      } else {
+        decision = resolveInstalledKnowledgePack(input.question);
+      }
     } catch (error) {
-      return { output: `KnowledgeQuery failed: ${error instanceof Error ? error.message : String(error)}`,
-        pack_hits: [], results: [], total: 0, truncated: false };
+      debug.log('knowledge-pack.select', 'failed', {
+        fallback: 'vault',
+        errorType: error instanceof Error ? error.name : typeof error,
+      }, { level: 'warn' });
     }
+    if (decision.kind === 'ambiguous') {
+      const names = decision.candidates.map(candidate => candidate.title);
+      const selectionQuestion = `어느 지식 팩을 사용할까요? ${names.join(' / ')} 중에서 선택해 주세요.`;
+      debug.log('knowledge-pack.select', 'choice-needed', {
+        priority: decision.priority,
+        intentTags: decision.intentTags,
+        candidateIds: decision.candidates.map(candidate => candidate.id),
+        candidateNames: names,
+      });
+      return { output: selectionQuestion, selectionQuestion, results: [], total: 0, truncated: false };
+    }
+    if (decision.kind === 'selected') {
+      debug.log('knowledge-pack.select', 'selected', {
+        priority: decision.priority,
+        intentTags: decision.intentTags,
+        packId: decision.pack.id,
+      });
+      return searchPack(decision.pack.id, input.question, opts, decision.pack);
+    }
+    debug.log('knowledge-pack.select', 'vault-fallback', { reason: 'no-match' });
   }
   const vault = opts.vault ?? discoverObsidianVault();
   const notices: string[] = [];
@@ -92,7 +159,7 @@ export function buildKnowledgeQueryTool(): LLMToolSpec {
   return {
     name: 'KnowledgeQuery',
     description:
-      'Search an explicitly installed knowledge pack by pack_id and question for cited cards, or search the Obsidian knowledge vault (or simulated fallback) for notes matching tags, fulltext regex, '
+      'For a domain-specific design request, call this before drafting with a concise topic question; omitting pack_id auto-selects a unique matching installed knowledge pack and returns cited cards. You may also search an explicitly installed pack by pack_id, or search the Obsidian knowledge vault (or simulated fallback) for notes matching tags, fulltext regex, '
       + 'or kind. Returns paths + parsed frontmatter + excerpts (and optionally full body). Use this to look '
       + 'up prior incident analyses, tool docs, repo maps, or any markdown you or another agent wrote earlier. '
       + 'For writing, use KnowledgeWrite.',
@@ -100,7 +167,7 @@ export function buildKnowledgeQueryTool(): LLMToolSpec {
       type: 'object',
       properties: {
         pack_id: { type: 'string', description: 'Installed pack id, e.g. pack:semiconductor-process-public@0.1.0. Requires question.' },
-        question: { type: 'string', description: 'Search words when pack_id is provided.' },
+        question: { type: 'string', description: 'Concise topic words for automatic installed-pack selection, or search words for an explicit pack_id.' },
         tags: {
           type: 'array',
           items: { type: 'string' },

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "공통 패턴 — 샤딩 도입 문턱",
+  "source": "https://learn.microsoft.com/en-us/azure/architecture/patterns/sharding",
+  "body": "적용 시점: 단일 노드의 저장·쓰기 한계를 계측했고 쿼리를 파티션 키로 라우팅할 수 있을 때.\n용량 단계: 단일 DB 인덱스·읽기 분리부터; 수직 확장과 query tuning 이후에도 용량이 부족하면 샤딩한다.\nGCP 대응: Cloud SQL partitioning/read replica에서 시작해, 독립 수평 용량이 필요하면 Spanner/Bigtable 등의 적합성을 검토한다.\n비용 축: 노드 중복·교차 shard 집계·운영·백업·균형 조정이 총비용을 높인다.\n결정과 반증: 핫 파티션·cross-shard transaction·재균형 동안의 SLO를 대표 부하로 측정한다."
+}

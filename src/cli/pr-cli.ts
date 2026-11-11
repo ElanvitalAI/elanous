@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, openSync, closeSync, writeSync, realpathSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { existsSync, mkdirSync, openSync, closeSync, writeSync, realpathSync, readdirSync, readFileSync, statSync, writeFileSync, renameSync, rmSync, lstatSync, readlinkSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir, hostname, loadavg } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -69,7 +69,7 @@ import type { VerifyOverlapEvidenceInput } from './pr-land-overlap-evidence.js';
 import { classifyTypecheckDrift, executeDriftPlan, planDriftRepair, resolveDriftAutorepairMode, type DriftDeps } from './pr-land-drift-repair.js';
 import { needsConductorMapRefresh, openConductorMapRefreshPr } from './pr-land-conductor-map.js';
 import { runTypeDriftRadarAfterLanding } from './pr-land-drift-radar.js';
-import { loadGateReceipts } from '../self-implement/gate-receipt-registry.js';
+import { gateEnvFingerprint, gateLockfileHash, loadGateReceipts } from '../self-implement/gate-receipt-registry.js';
 import { getUserConfig } from '../user-config/reader.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
@@ -303,6 +303,8 @@ export interface PrLandDeps {
   out?: { log: (message: string) => void; error: (message: string) => void };
   setExitCode?: (code: number) => void;
   runTypecheckGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
+  /** Isolated receipt directory; injected typecheck seams opt into receipt reuse only with this path. */
+  typecheckReceiptDir?: string;
   driftAutorepair?: { mode?: 'off' | 'shadow' | 'live'; deps?: DriftDeps; attemptsByHead?: number; attemptsByPr?: number; readAttempts?: (pr: number, head: string) => { byHead: number; byPr: number }; recordAttempt?: (pr: number, head: string) => void; launch?: (goal: string, boundaryFiles: readonly string[]) => void; escalate?: (mail: string) => void };
   /** Post-landing export drift radar; test seam keeps remote checks and owner mail out of unit tests. */
   driftRadar?: (input: { cwd: string; mergeCommit: string }) => { scanned: number; warned: number; skipped: number };
@@ -467,7 +469,7 @@ function canonicalCheckoutPath(cwd: string): string {
 export function runPrLandTypecheckGate(
   out: { log: (message: string) => void; error: (message: string) => void },
   cwd: string,
-  options: { env?: NodeJS.ProcessEnv; host?: string; runRemote?: PrLandRemoteTypecheckRunner } = {},
+  options: { env?: NodeJS.ProcessEnv; host?: string; baseRef?: string; runRemote?: PrLandRemoteTypecheckRunner } = {},
 ): boolean {
   const targetCwd = canonicalCheckoutPath(cwd);
   const env = options.env ?? process.env;
@@ -486,7 +488,7 @@ export function runPrLandTypecheckGate(
       return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
     });
     const result = runRemote(process.execPath, args, {
-      cwd: targetCwd, env: { ...env }, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
+      cwd: targetCwd, env: { ...env, ...(options.baseRef ? { TSC_BASE_REF: options.baseRef } : {}) }, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
     });
     for (const line of result.stdout.split(/\r?\n/u).filter(Boolean)) out.log(line);
     for (const line of result.stderr.split(/\r?\n/u).filter(Boolean)) out.error(line);
@@ -501,12 +503,104 @@ export function runPrLandTypecheckGate(
     throw new Error(`ci-typecheck-changed exited ${code}`);
   });
   try {
-    runChangedTypecheckGate({ log: out.log, warn: out.error, error: out.error, exit, cwd: targetCwd,
+    runChangedTypecheckGate({ log: out.log, warn: out.error, error: out.error, exit, cwd: targetCwd, baseRef: options.baseRef,
       forbidFullLocal: forbidFullTypecheckOnLocal(env, host, targetCwd), allowMissingCheckoutDependencies: true });
   } catch (error) {
     if (!failed) throw error;
   }
   return !failed;
+}
+
+interface PrLandTypecheckReceipt {
+  schema: 1;
+  pr: number;
+  head: string;
+  base: string;
+  inputHash: string;
+  verdict: 'passed';
+  savedAt: string;
+}
+
+export interface PrLandTypecheckReceiptInput {
+  pr: number;
+  head: string;
+  base: string;
+  cwd: string;
+  changedPaths: readonly string[];
+  host: string;
+  env?: NodeJS.ProcessEnv;
+  receiptDir?: string;
+}
+
+/** Filesystem metadata makes a changed or removed installed dependency invalidate a cached pass. */
+function installedTypeDependencyHash(cwd: string): string | undefined {
+  const roots = ['node_modules', ...(existsSync(join(cwd, 'apps', 'pwa')) ? ['apps/pwa/node_modules'] : [])];
+  const hash = createHash('sha256');
+  const visitedTargets = new Set<string>();
+  const walk = (relativePath: string): void => {
+    const path = join(cwd, relativePath);
+    const entry = lstatSync(path, { bigint: true });
+    hash.update(`${relativePath}\0${entry.mode}\0${entry.size}\0${entry.mtimeNs}\0${entry.ctimeNs}\0`);
+    if (entry.isSymbolicLink()) {
+      const target = realpathSync(path);
+      const targetPath = relative(cwd, target);
+      if (!targetPath || targetPath === '..' || targetPath.startsWith(`..${sep}`) || isAbsolute(targetPath))
+        throw new Error('external installed dependency cannot be reused');
+      hash.update(`link:${readlinkSync(path)}\0target:${targetPath}\0`);
+      if (!roots.some(root => targetPath === root || targetPath.startsWith(`${root}${sep}`))
+        && !visitedTargets.has(target)) {
+        visitedTargets.add(target);
+        walk(targetPath);
+      }
+    }
+    if (entry.isDirectory()) for (const name of readdirSync(path).sort()) walk(join(relativePath, name));
+  };
+  try { for (const root of roots) walk(root); return hash.digest('hex'); }
+  catch { return undefined; }
+}
+
+/** Reuse only an exact PR/head/base pass of the combined changed-tsc, TSC and ratchet gate. */
+export function runPrLandTypecheckWithReceipt(input: PrLandTypecheckReceiptInput, gate: () => boolean): { ok: boolean; source: 'receipt' | 'gate' } {
+  const sha = /^[a-f0-9]{40}$/i;
+  if (!Number.isSafeInteger(input.pr) || input.pr <= 0 || !sha.test(input.head) || !sha.test(input.base))
+    return { ok: gate(), source: 'gate' };
+  const dir = input.receiptDir ?? join(getElanousConfigDir(), 'pr-land-typecheck-receipts');
+  const path = join(dir, `${input.pr}.json`);
+  let inputHash: string | undefined;
+  try {
+    const env = input.env ?? process.env;
+    const installed = installedTypeDependencyHash(input.cwd);
+    if (!installed) throw new Error('installed type dependencies unavailable');
+    const dispatch = typecheckDispatchFlags({ local: false, rest: [] }, env, input.host, canonicalCheckoutPath(input.cwd));
+    if (dispatch.error) throw new Error(dispatch.error);
+    inputHash = createHash('sha256').update(JSON.stringify({
+      head: input.head.toLowerCase(), base: input.base.toLowerCase(),
+      checkout: canonicalCheckoutPath(input.cwd), paths: [...new Set(input.changedPaths)].sort(),
+      bun: Bun.version, lock: gateLockfileHash(input.cwd), installed,
+      environment: gateEnvFingerprint(env), host: input.host, remote: dispatch.remote ?? null,
+      options: Object.fromEntries(['CI', 'ELANOUS_TSC_AFFECTED_ROOTS', 'TSC_GATE_ROOTS', 'TSC_HEAP_MB',
+        'NODE_OPTIONS', 'ELANOUS_TYPECHECK_REMOTE'].map(key => [key, env[key] ?? null])),
+    })).digest('hex');
+    const saved: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
+      const receipt = saved as Partial<PrLandTypecheckReceipt>;
+      if (receipt.schema === 1 && receipt.pr === input.pr && receipt.head?.toLowerCase() === input.head.toLowerCase()
+        && receipt.base?.toLowerCase() === input.base.toLowerCase() && receipt.inputHash === inputHash
+        && receipt.verdict === 'passed' && typeof receipt.savedAt === 'string') return { ok: true, source: 'receipt' };
+    }
+  } catch { /* Missing or unreadable evidence runs the gate. */ }
+  const ok = gate();
+  if (ok && inputHash) {
+    const receipt: PrLandTypecheckReceipt = { schema: 1, pr: input.pr, head: input.head.toLowerCase(),
+      base: input.base.toLowerCase(), inputHash, verdict: 'passed', savedAt: new Date().toISOString() };
+    const temp = join(dir, `.${input.pr}.${process.pid}.${randomUUID()}.tmp`);
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      writeFileSync(temp, `${JSON.stringify(receipt)}\n`, { mode: 0o600, flag: 'wx' });
+      renameSync(temp, path);
+    } catch { rmSync(temp, { force: true }); /* Receipt persistence cannot change the gate verdict. */ }
+  }
+  return { ok, source: 'gate' };
 }
 
 // ⛔⭐⭐ `args: []` 가 «필수»다 — 기본값이 `process.argv.slice(2)` 라, 그냥 부르면
@@ -2378,12 +2472,39 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   };
   const confirmPinnedOverlapFresh = async (): Promise<number | undefined> => {
     if (!pinned) return undefined;
+    if (opts.heavyRemote) {
+      const latestMain = currentMain();
+      if (!latestMain) { out.error('✗ heavy-remote: 병합 직전 main SHA 재조회 실패.'); return 1; }
+      if (latestMain.toLowerCase() !== verifiedHeavyBase?.toLowerCase()) {
+        const remeasured = await confirmHeavyBaseStable();
+        if (remeasured !== undefined) return remeasured;
+      }
+    }
     const currentBase = opts.heavyRemote ? verifiedHeavyBase : currentPinnedBase();
     if (!currentBase) {
       out.error(`✗ overlap-preflight: 병합 직전 ${base} 최신 SHA를 가져오지 못했다.`);
       return 1;
     }
-    return recheckOverlapAtBase(currentBase);
+    const measuredBase = overlapCheckedBase;
+    const overlap = await recheckOverlapAtBase(currentBase);
+    if (overlap !== undefined) return overlap;
+    if (!opts.heavyRemote && measuredBase !== currentBase) {
+      const recheckOut = { log: (message: string) => out.log(message), error: (message: string) => out.error(message) };
+      const gate = () => deps.runTypecheckGate
+        ? deps.runTypecheckGate(recheckOut)
+        : runPrLandTypecheckGate(recheckOut, cwd, { host: deps.hostName?.() ?? hostname(), baseRef: currentBase });
+      const result = opts.pr && opts.expectedHead && (!deps.runTypecheckGate || deps.typecheckReceiptDir)
+        ? runPrLandTypecheckWithReceipt({ pr: Number(opts.pr), head: opts.expectedHead, base: currentBase,
+          cwd, changedPaths, host: deps.hostName?.() ?? hostname(), receiptDir: deps.typecheckReceiptDir }, gate)
+        : { ok: gate(), source: 'gate' as const };
+      record('typecheck-base-recheck', result.ok, { head: opts.expectedHead, base: currentBase, source: result.source });
+      if (!result.ok) {
+        out.error('✗ typecheck: moved base requires a fresh changed-tsc, TSC and ratchet pass.');
+        return 1;
+      }
+      out.log(`✓ typecheck: moved base ${currentBase.slice(0, 12)} ${result.source === 'receipt' ? 'exact receipt reused' : 'remeasured'}.`);
+    }
+    return undefined;
   };
   // The production gate must receive this land invocation's --cwd, never the launching shell's cwd.
   const typecheckOutput: string[] = [];
@@ -2392,10 +2513,19 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     error: (message: string) => { typecheckOutput.push(message); out.error(message); },
   };
   const hostName = deps.hostName?.() ?? hostname();
-  const typecheckOk = opts.heavyRemote || (deps.runTypecheckGate
+  const measureTypecheck = (baseSha?: string) => deps.runTypecheckGate
     ? deps.runTypecheckGate(typecheckOut)
-    : runPrLandTypecheckGate(typecheckOut, cwd, { host: hostName }));
-  record('typecheck', typecheckOk);
+    : runPrLandTypecheckGate(typecheckOut, cwd, { host: hostName, baseRef: baseSha });
+  const receiptInput = pinned && !opts.heavyRemote && opts.pr && opts.expectedHead && overlapCheckedBase
+    && (!deps.runTypecheckGate || deps.typecheckReceiptDir)
+    ? { pr: Number(opts.pr), head: opts.expectedHead, base: overlapCheckedBase, cwd,
+      changedPaths, host: hostName, receiptDir: deps.typecheckReceiptDir }
+    : undefined;
+  const typecheck = opts.heavyRemote ? { ok: true, source: 'heavy-remote' as const }
+    : receiptInput ? runPrLandTypecheckWithReceipt(receiptInput, () => measureTypecheck(receiptInput.base))
+      : { ok: measureTypecheck(), source: 'gate' as const };
+  const typecheckOk = typecheck.ok;
+  record('typecheck', typecheckOk, { source: typecheck.source, ...(receiptInput ? { pr: receiptInput.pr, head: receiptInput.head, base: receiptInput.base } : {}) });
   if (!typecheckOk) {
     try {
       const main = currentMain();
@@ -2440,7 +2570,9 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
   out.log(opts.heavyRemote
     ? '✓ typecheck: node-b exact-head heavy gate PASS — changed files have no new type errors.'
-    : '✓ typecheck: scripts/ci-typecheck-changed.ts PASS — changed files have no new type errors.');
+    : typecheck.source === 'receipt'
+      ? `✓ typecheck: exact PR/head/base receipt reused — changed-tsc, TSC and ratchet PASS (${receiptInput!.base.slice(0, 12)}).`
+      : '✓ typecheck: scripts/ci-typecheck-changed.ts PASS — changed files have no new type errors.');
 
   if (shouldRefusePrLandLocalHeavySteps(process.env, hostName, cwd, opts.heavyRemote === true)) {
     out.error(`✗ HQ-HEAVY-LOCAL-GUARD: pr land stopped before local test-suite/PWA heavy gates on HQ. Use pinned --heavy-remote; typecheck remote defaults to ${process.env.ELANOUS_TYPECHECK_REMOTE?.trim() || 'node-b'}.`);
@@ -3100,6 +3232,44 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   return 0;
 }
 
+type HqTrainIncident =
+  | { kind: 'worker-start-failed'; workerPid: number; stage: string; reason: string }
+  | { kind: 'worker-no-progress'; workerPid: number; stage: string; remainingMs: number; elapsedMs: number }
+  | { kind: 'needs-solo-starvation'; readyBundle: number[]; blockingPr: number }
+  | { kind: 'main-check-failed'; checks: ('tsc' | 'rules-contract')[]; baseSha: string };
+
+function hqTrainIncident(kind: string, runId: string, eventId: string, rawData: string): HqTrainIncident {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(runId) || runId === '.' || runId === '..')
+    throw new Error('train-event run id must be a stable alphanumeric id');
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(eventId))
+    throw new Error('train-event event id must be a stable alphanumeric id');
+  let parsed: unknown;
+  try { parsed = JSON.parse(rawData); } catch { throw new Error('train-event data must be valid JSON'); }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('train-event data must be a JSON object');
+  const data = parsed as Record<string, unknown>;
+  const exactKeys = (expected: readonly string[]) => Object.keys(data).sort().join(',') === [...expected].sort().join(',');
+  const positiveInt = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) > 0;
+  const nonNegativeInt = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+  if (kind === 'worker-start-failed' && exactKeys(['workerPid', 'stage', 'reason'])
+    && positiveInt(data.workerPid) && typeof data.stage === 'string' && data.stage.length > 0 && data.stage.length <= 64
+    && typeof data.reason === 'string' && data.reason.length > 0 && data.reason.length <= 256)
+    return { kind: 'worker-start-failed', workerPid: data.workerPid, stage: data.stage, reason: data.reason };
+  if (kind === 'worker-no-progress' && exactKeys(['workerPid', 'stage', 'remainingMs', 'elapsedMs'])
+    && positiveInt(data.workerPid) && typeof data.stage === 'string' && data.stage.length > 0 && data.stage.length <= 64
+    && nonNegativeInt(data.remainingMs) && nonNegativeInt(data.elapsedMs))
+    return { kind: 'worker-no-progress', workerPid: data.workerPid, stage: data.stage, remainingMs: data.remainingMs, elapsedMs: data.elapsedMs };
+  if (kind === 'needs-solo-starvation' && exactKeys(['readyBundle', 'blockingPr'])
+    && Array.isArray(data.readyBundle) && data.readyBundle.length > 0 && data.readyBundle.every(positiveInt)
+    && positiveInt(data.blockingPr))
+    return { kind: 'needs-solo-starvation', readyBundle: [...data.readyBundle], blockingPr: data.blockingPr };
+  if (kind === 'main-check-failed' && exactKeys(['checks', 'baseSha'])
+    && Array.isArray(data.checks) && data.checks.length > 0
+    && data.checks.every((check) => check === 'tsc' || check === 'rules-contract')
+    && typeof data.baseSha === 'string' && /^[0-9a-f]{40,64}$/i.test(data.baseSha))
+    return { kind: 'main-check-failed', checks: [...data.checks], baseSha: data.baseSha };
+  throw new Error(`unsupported or invalid HQ train incident: ${kind}`);
+}
+
 export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queueDeps: L8ShadowQueueDeps = {}): void {
   const pr = program.command('pr').description('PR landing commands');
   const prToolRun = deps.run ?? defaultCmdRunner;
@@ -3211,6 +3381,24 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}, queu
   };
   queue.command('status').description('Show pending PRs and shadow verdicts').action(() => queueAction(async () => (await import('../self-implement/l8-merge-queue.js')).statusL8ShadowQueue(process.cwd(), queueDeps)));
   queue.command('enqueue <pr>').description('Pin a ready PR at the tail of the shadow queue').action(async (prNumber: string) => queueAction(async () => { const queueMod = await import('../self-implement/l8-merge-queue.js'); return queueMod.enqueueL8ShadowQueue(process.cwd(), queueMod.shadowPrNumber(prNumber), queueDeps); }));
+  queue.command('train-event <kind>').description('Publish a validated live HQ train incident to the release macrophage')
+    .requiredOption('--run-id <id>', 'Stable train run id')
+    .requiredOption('--event-id <id>', 'Stable idempotency id for this incident')
+    .requiredOption('--data-json <json>', 'Incident evidence JSON')
+    .action(async (kind: string, opts: { runId: string; eventId: string; dataJson: string }) => queueAction(async () => {
+      const incident = hqTrainIncident(kind, opts.runId, opts.eventId, opts.dataJson);
+      debug.log('self-implement.merge-train', 'hq-incident-received', {
+        runId: opts.runId, eventId: opts.eventId, kind: incident.kind, source: 'hq-train-manager',
+      });
+      const macrophage = createMacrophageRuntime({ runId: opts.runId, mode: 'live' });
+      try {
+        await macrophage.eventBus.publish({ graphId: 'release-loop', runId: opts.runId, eventId: opts.eventId,
+          type: 'merge-train.incident', source: { kind: 'runner' },
+          data: incident as unknown as Record<string, unknown> });
+        return { accepted: true, duplicate: macrophage.decisions.length === 0,
+          eventId: opts.eventId, runId: opts.runId, type: 'merge-train.incident', decisions: macrophage.decisions.length };
+      } finally { macrophage.dispose(); }
+    }));
   queue.command('run').description('Evaluate the first PR without merging').requiredOption('--shadow', 'Only evaluate; never land').action(() => queueAction(async () => {
     const runId = `merge-train-${randomUUID()}`;
     const macrophage = createMacrophageRuntime({ runId, mode: 'live' });

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { takeSharedPayload, markSharedPayloadProgress, readSharedPayloadProgress, acknowledgeSharedPayloadFiles, withSharedPayloadLock } from './share-target-store';
 import { saveSharedScraps } from './share-scraps';
+import type { ShareFetch } from './share-scraps';
 
 test('fake Web Share Target POST stores media and redirects to exported scrap receiver', async () => {
   const handlers = new Map<string, (event: any) => void>();
@@ -96,7 +97,7 @@ test('fake Web Share Target POST stores media and redirects to exported scrap re
     });
     const concurrentId = new URL((await concurrentHandled!).headers.get('location')!, 'https://nexus.test').searchParams.get('shared')!;
     let scrapPosts = 0;
-    const fetcher: typeof fetch = async (input) => {
+    const fetcher: ShareFetch = async (input) => {
       if (new URL(String(input)).pathname === '/v1/members') return Response.json({ member: { id: 'member-a' } });
       scrapPosts++;
       return Response.json({ id: `scrap-${scrapPosts}` }, { status: 201 });

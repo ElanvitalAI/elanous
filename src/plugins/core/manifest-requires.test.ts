@@ -35,6 +35,20 @@ test('top-level requires is parsed without replacing the existing dependency fie
   expect(parsePluginManifest({ id: 'legacy', dependencies: { widgets: ['chart'] } }).requires).toBeUndefined();
 });
 
+test('plugin dependencies preserve required ranges and optional market references', () => {
+  const manifest = parsePluginManifest({ id: 'sample', dependencies: { plugins: [
+    'base-plugin@^1.2.0',
+    { id: 'optional-helper', version: '~2.0.0', optional: true, market: 'signed-market' },
+  ] } });
+  expect(manifest.dependencies?.plugins).toEqual([
+    'base-plugin@^1.2.0',
+    { id: 'optional-helper', version: '~2.0.0', optional: true, market: 'signed-market' },
+  ]);
+  for (const invalid of [42, { id: 'helper', optional: 'yes' }, { id: ' ' }]) {
+    expect(() => parsePluginManifest({ id: 'sample', dependencies: { plugins: [invalid] } })).toThrow();
+  }
+});
+
 test('requires.knowledgePacks must be an array of non-empty strings', () => {
   for (const knowledgePacks of ['sales', [42], ['  ']]) {
     expect(() => parsePluginManifest({ id: 'sample', requires: { knowledgePacks } })).toThrow();

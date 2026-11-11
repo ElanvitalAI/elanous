@@ -1,5 +1,5 @@
-import { createLoopScheduler, type LoopScheduler } from '../dashboard/loop-scheduler.js';
-import type { InternalTurnGate } from '../dashboard/input/internal-turn.js';
+import { createLoopScheduler, type LoopScheduler } from '../loops/loop-scheduler.js';
+import type { InternalTurnGate } from '../tui/input/internal-turn.js';
 
 export interface NextLoopCommand {
   run(raw: string): string[];

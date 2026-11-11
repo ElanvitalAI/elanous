@@ -26,7 +26,13 @@
 
 import { debug } from '../../debug/log.js';
 import type { LLMToolDef } from '../../plugins/core/types.js';
-import type { InternalTurnGate, StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../../dashboard/input/internal-turn.js';
+import type { StartTurnIfIdleOptions, StartTurnIfIdleResult } from '../../chat/internal-turn-contract.js';
+
+interface WakeupTurnGate {
+  startTurnIfIdle(input: string, opts: StartTurnIfIdleOptions): StartTurnIfIdleResult;
+  isInternalTurnActive(): boolean;
+  lastTurnId(): string | null;
+}
 
 export const SCHEDULE_WAKEUP_TOOL_NAME = 'ScheduleWakeup';
 export const WAKEUP_MIN_DELAY_MS = 60_000;
@@ -446,7 +452,7 @@ export function buildScheduleWakeupHostTool(scheduler: WakeupScheduler): LLMTool
 
 /** 대시보드의 H2 문에 스케줄러를 잇는다 — 직전 회차 판정 = «그 예약이 연 내부 턴이 아직 도나». */
 export function createDashboardWakeupScheduler(
-  gate: Pick<InternalTurnGate, 'startTurnIfIdle' | 'isInternalTurnActive' | 'lastTurnId'>,
+  gate: WakeupTurnGate,
   deps: Omit<WakeupSchedulerDeps, 'startTurnIfIdle' | 'isTurnActive'> = {},
 ): WakeupScheduler {
   // The N03 real-TUI scenario must cover a scheduled wake while a turn is busy,

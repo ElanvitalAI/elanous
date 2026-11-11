@@ -1430,9 +1430,6 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     const { startErrorReportPruneTick } = await import('./api/error-reports.js');
     errorReportPrune = startErrorReportPruneTick({ ...(opts.errorReportPruneScheduleForTesting ? { schedule: opts.errorReportPruneScheduleForTesting } : {}) });
   } catch (err) { console.warn(`[nexus] error-report prune wiring failed: ${(err as Error).message}`); }
-  // ★ UR4d — 조율자 저지연 push watcher(logs.db tail edge-trigger). opt-in·기본 OFF.
-  // cleared in shutdown hook(내부 타이머는 unref 이나 명시 정지).
-  let coordinatorPushWatcher: { stop(): void } | undefined;
   // V2.2-3 (2026-05-12) — NEXUS-hosted Discord workflow trigger bot.
   // Wired below once the workflow daemon is constructed.
   let webPushDecisionTimer: ReturnType<typeof setInterval> | undefined;
@@ -2862,51 +2859,6 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
           console.warn(`[nexus] presence sweeper wiring failed: ${(err as Error).message}`);
         }
 
-        // ★ UR4b 조율자 상주 thread-awareness sweep (opt-in·autopilot.threadRegistry·기본 OFF·2026-07-19)
-        //   — 데몬 상주 루프가 활성 미션 thread 를 주기적으로 인지: 스톨(replan/escalate)·pending goto·고아
-        //   감지 → 관측(mission.registry). 데몬이 thread 를 관장(Option B)하는 상주 인지 심장박동. read-only·
-        //   fail-soft(틱 실패가 데몬 안 죽인다)·.unref(무차단). 게이트 OFF 면 타이머 미설치(회귀 0).
-        try {
-          const { getUserConfig } = await import('../user-config.js');
-          const ap = getUserConfig().raw?.autopilot as { threadRegistry?: unknown; coordinatorGovern?: unknown; coordinatorPush?: unknown } | undefined;
-          const threadRegistryOn = ap?.threadRegistry === true;
-          // ★ UR4c 능동 관장 게이트(opt-in·기본 OFF) — ON 이면 sweep 이 감지한 stuck/pending-goto 를 데몬이
-          //   능동 수복(run-mission 재spawn·run-lock 가드). OFF 면 observe-only sweep(UR4b). threadRegistry 전제.
-          const governOn = threadRegistryOn && ap?.coordinatorGovern === true;
-          // ★ UR4d 저지연 push 게이트(opt-in·기본 OFF) — ON 이면 logs.db worker 활동을 edge-trigger 로 감지해
-          //   sweep/govern 을 즉시(coalesced) 깨운다. interval 은 안전망(truth)으로 유지. threadRegistry 전제.
-          const pushOn = threadRegistryOn && ap?.coordinatorPush === true;
-          if (threadRegistryOn) {
-            const { sweepMissionThreads, governMissionThreads } = await import('../autopilot/pipeline/mission-thread-registry.js');
-            const { defaultSpawnRunMission } = await import('../autopilot/mission-engine.js');
-            // interval(안전망)·push(edge) 둘 다 부르는 단일 틱 — trigger 만 다르다.
-            const runThreadTick = (trigger: 'interval' | 'push'): void => {
-              try {
-                const s = governOn
-                  ? governMissionThreads({ spawnRun: defaultSpawnRunMission })  // 능동: stuck/goto → 재spawn(수복)
-                  : sweepMissionThreads();                                        // 관측만
-                const resumed = (s as { resumed?: string[] }).resumed?.length ?? 0;
-                if (s.stuckCount > 0 || s.stalledCount > 0 || s.pendingCursorCount > 0 || resumed > 0) {
-                  console.debug(`[nexus] thread ${governOn ? 'govern' : 'sweep'} (${trigger}): ${s.activeCount} active · ${s.stuckCount} stuck/dead · ${s.stalledCount} stalled · ${s.pendingCursorCount} pending-goto${governOn ? ` · ${resumed} resumed` : ''}`);
-                }
-              } catch (err) { console.warn(`[nexus] thread registry ${governOn ? 'govern' : 'sweep'} tick failed: ${(err as Error).message}`); }
-            };
-            const threadSweepHandle = setInterval(() => runThreadTick('interval'), 180_000);
-            if (typeof (threadSweepHandle as { unref?: () => void }).unref === 'function') {
-              (threadSweepHandle as { unref: () => void }).unref();
-            }
-            console.log(`[nexus] 조율자 상주 thread ${governOn ? '능동 관장(govern·stuck/goto 재spawn)' : 'awareness sweep'} 활성(autopilot.${governOn ? 'coordinatorGovern' : 'threadRegistry'}·3분)`);
-            // ★ UR4d — 저지연 push watcher 부착(edge-trigger → 같은 틱). interval 은 안전망으로 남는다.
-            if (pushOn) {
-              const { watchMissionActivity } = await import('../autopilot/pipeline/mission-thread-push.js');
-              coordinatorPushWatcher = watchMissionActivity({ onWake: () => runThreadTick('push') });
-              console.log(`[nexus] 조율자 저지연 push 레이어 활성(autopilot.coordinatorPush·logs.db tail edge-trigger·폴링 truth 유지)`);
-            }
-          }
-        } catch (err) {
-          console.warn(`[nexus] thread registry sweeper wiring failed: ${(err as Error).message}`);
-        }
-
         // V2.2-3 (2026-05-12) — wire a NEXUS-hosted Discord bot that
         // forwards inbound messages to `workflowDaemon.dispatchDiscord`
         // so `discordTrigger` nodes fire from real traffic. Skipped
@@ -3907,8 +3859,6 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     // §P2 — stop the session presence grace sweeper.
     if (presenceSweepHandle) { clearInterval(presenceSweepHandle); presenceSweepHandle = undefined; }
     if (errorReportPrune) { errorReportPrune.stop(); errorReportPrune = undefined; }
-    // ★ UR4d — stop the coordinator low-latency push watcher(logs.db tail + debounce).
-    if (coordinatorPushWatcher) { try { coordinatorPushWatcher.stop(); } catch { /* ignore */ } coordinatorPushWatcher = undefined; }
     // Phase 2 (2026-05-13) — dispose the TOX boot handle. dispose()
     // stops the feedback loop + retry policy, tears down andon, and
     // resets runtime-deps so a subsequent NEXUS boot starts fresh.

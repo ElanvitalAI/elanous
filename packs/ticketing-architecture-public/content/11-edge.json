@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "엣지 레이트 리밋과 재시도",
+  "source": "https://docs.nginx.com/nginx/admin-guide/security-controls/controlling-access-proxied-http",
+  "body": "프록시는 인증·TLS·rate limit·버스트 제어를 맡고 429/Retry-After와 대기 UX를 계약에 넣는다. GET의 안전한 재시도와 달리 POST 예약·결제는 멱등 키 없이 자동 재시도하면 중복 위험이 있다. IP 공유 NAT를 고려해 사용자/토큰/디바이스 등 키를 조합한다."
+}

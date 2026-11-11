@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createMacrophageSafeCleanup } from './macrophage-safe-cleanup.js';
 
 test('safe live cleanup inventory includes only merged rows and clean inactive merged worktrees under HQ work', () => {
@@ -39,4 +39,21 @@ test('safe live cleanup inventory includes only merged rows and clean inactive m
     expect(calls.some((call) => call.includes(`worktree remove ${join(worktreeRoot, 'merged')}`))).toBe(true);
     expect(calls.some((call) => call.includes('worktree remove') && call.includes('outside'))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('cleanup never removes its own checkout when no active terminal is registered', () => {
+  const cwd = process.cwd();
+  const commands: string[] = [];
+  const cleanup = createMacrophageSafeCleanup({ repoRoot: cwd, worktreeRoot: dirname(cwd),
+    activeDirectories: () => [], run: (command, args) => {
+      commands.push(`${command} ${args.join(' ')}`);
+      if (args[0] === 'worktree' && args[1] === 'list') return { status: 0,
+        stdout: `worktree ${cwd}\nHEAD ${'a'.repeat(40)}\nbranch refs/heads/merged-clean\n`, stderr: '' };
+      if (args[0] === 'branch') return { status: 0, stdout: 'merged-clean\n', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    } });
+  expect(cleanup.inventory()).toEqual([]);
+  expect(cleanup.cleanup({ id: 'current', kind: 'orphan-worktree', owner: 'merged-clean', evidence: {
+    ownerRunStatus: 'done', ownershipVerified: true, mergedMainline: true, worktreePath: cwd } })).toBeUndefined();
+  expect(commands.some((command) => command.includes('worktree remove'))).toBe(false);
 });

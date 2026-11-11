@@ -74,8 +74,10 @@ export function createBoardApprovalDispatch(deps: BoardApprovalHandlerDeps): Non
       const providers = deps.graphOptions?.deps?.capabilityProviders;
       if (!providers || !('contracts' in providers)
         || !providers.contracts['store.read@1'] || !providers.contracts['app-publish.action@1']
+        || !providers.contracts['store.events@1']
         || !providers.providers.some(item => item.provides.includes('store.read@1'))
-        || !providers.providers.some(item => item.provides.includes('app-publish.action@1'))) {
+        || !providers.providers.some(item => item.provides.includes('app-publish.action@1'))
+        || !providers.providers.some(item => item.provides.includes('store.events@1'))) {
         throw new Error('absorb graph capability providers are unavailable');
       }
     }
@@ -84,7 +86,7 @@ export function createBoardApprovalDispatch(deps: BoardApprovalHandlerDeps): Non
     const startedAt = (deps.now ?? (() => new Date()))().toISOString();
     const options: GraphRunOptions = {
       runId, quiet: true,
-      input: { suggestionId: approved.cardId, startedAt, context: { memberId: owner.memberId, appRef: owner.appSlug, target } },
+      input: { suggestionId: approved.cardId, startedAt, context: { memberId: owner.memberId, appRef: owner.appSlug, target, runId } },
       ...(deps.graphOptions?.deps ? { deps: deps.graphOptions.deps } : {}),
     };
     return { acceptanceId: runId, start: async () => {

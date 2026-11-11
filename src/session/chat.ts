@@ -21,7 +21,7 @@ import {
 import { debug } from '../debug/log.js';
 import { createRequestSizeGuard, formatRequestSizeStatus, type RequestSizeGuard } from './request-size-guard.js';
 import type { InputSourceKind } from '../input/input-source-kind.js';
-import { getProviderForConfigAsync, streamLLMWithTools, type LLMMessage, type LLMOpts, type LLMProvider, type ContentBlock } from '../llm.js';
+import { getProviderForConfigAsync, streamLLM, streamLLMWithTools, resolveDefaultOutputTokens, type LLMMessage, type LLMOpts, type LLMProvider, type ContentBlock } from '../llm.js';
 import type { LLMProviderName, UserConfig } from '../user-config/types.js';
 import {
   estimateMessagesTokens, estimateTokens, trimToBudget, budget, formatBudget,
@@ -179,6 +179,7 @@ export interface RunTurnOpts {
 
 export interface RunTurnResult {
   text: string;
+  finishReason?: string;
   meta: SessionMeta;
   usedTokens: number;
   droppedMessages: number;
@@ -448,6 +449,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     }, { level: 'info' });
     effectiveSystemPrompt = 'Answer this stable factual question directly and briefly in the user’s language. If uncertain, say so; do not invent.';
   }
+  const longAnswer = /설계|아키텍처|RFC|상세|자세히|보고서|design|architecture|detailed|comprehensive/i.test(opts.userText);
+  const outputTokens = llmOpts?.maxTokens ?? resolveDefaultOutputTokens(llmOpts?.model ?? provider.defaultModel, llmOpts?.usageRole, longAnswer);
+  let finishReason: string | undefined;
 
   // 2) Assemble, trim, call. When images are attached for THIS turn,
   //    swap the string content of the latest user message for
@@ -666,6 +670,9 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       },
       {
         ...(guardedTurnLlmOpts ?? {}),
+        maxTokens: guardedTurnLlmOpts?.maxTokens ?? outputTokens,
+        longAnswer,
+        onFinishReason: (reason: string) => { finishReason = reason; llmOpts?.onFinishReason?.(reason); },
         tools: turnTools,
         provider,
         // ★ /cancel 범용화(대표 2026-07-12) — per-turn abort signal 을 tool 루프·llm 호출에 전파.
@@ -681,21 +688,13 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     ({ kept, dropped, used } = assembleTurnMessages(effectiveSystemPrompt));
     const plainOpts = {
       ...(llmOpts ?? {}),
+      maxTokens: outputTokens,
+      longAnswer,
+      onFinishReason: (reason: string) => { finishReason = reason; llmOpts?.onFinishReason?.(reason); },
       ...(requestSizeGuard ? { requestSizeGuard: llmOpts?.requestSizeGuard ?? requestSizeGuard } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
     };
-    const stream = provider.streamChat
-      ? provider.streamChat(kept, plainOpts)
-      : wrapTextOnly(provider.chat(kept, plainOpts));
-    for await (const ev of stream) {
-      if (ev.type === 'text' && ev.delta) {
-        text += ev.delta;
-        opts.onDelta?.(ev.delta);
-      }
-      // tool_call events are ignored in this helper — session-chat is
-      // for straight conversational turns. Skill execution uses the
-      // skill-runner path with its own tool loop.
-    }
+    text = await streamLLM(kept, (delta) => { opts.onDelta?.(delta); }, { ...plainOpts, provider, preferExplicitProvider: true });
   }
   const turnSeconds = (Date.now() - turnStartedAt) / 1000;
 
@@ -746,6 +745,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
 
   return {
     text,
+    ...(finishReason ? { finishReason } : {}),
     meta: updatedMeta,
     usedTokens: used,
     droppedMessages: dropped,
@@ -755,14 +755,6 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     ...(goalComplete ? { goalComplete: true } : {}),
     ...(goalStopReason ? { goalStopReason } : {}),
   };
-}
-
-/** Helper to normalize a `chat()` string-generator into the unified
- *  stream-event shape used by streamChat. */
-async function* wrapTextOnly(
-  gen: AsyncGenerator<string, void, unknown>,
-): AsyncGenerator<{ type: 'text'; delta: string }, void, unknown> {
-  for await (const s of gen) yield { type: 'text', delta: s };
 }
 
 // ── Higher-level helpers ─────────────────────────────────────────────

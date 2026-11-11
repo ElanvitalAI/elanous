@@ -75,8 +75,8 @@ export function elanousSelfAccessPrompt(sessionId?: string): string {
     // ⭐ F1 소환 인지(RFC-observability-driven-tool-selection · 2026-07-26) — 실전검증에서
     //   에이전트가 deferred 된 SelfImplement 를 "없는 툴"로 취급하고 PtyShell 로 CLI 셸아웃한
     //   사건의 프롬프트 층 수리. 배틀쉽은 목록에만 있고 스키마는 접혀 있다는 사실을 명시한다.
-    '- ★ 툴 소환(deferred): 시스템 프롬프트에 "이름만" 나열된 툴(예: SelfImplement·RunDevHarness·',
-    '  SolveMission)은 **없는 게 아니라 스키마가 접혀 있는 것**이다. 목록에 있으면 그 툴은 존재한다.',
+    '- ★ 툴 소환(deferred): 시스템 프롬프트에 "이름만" 나열된 툴(예: SelfImplement·RunDevHarness)은',
+    '  **없는 게 아니라 스키마가 접혀 있는 것**이다. 목록에 있으면 그 툴은 존재한다.',
     '  쓰려면 먼저 ToolSearch({query:"select:<이름>"}) 로 스키마를 펼친 뒤 호출하라. 목록에 있는 툴을',
     '  "가용하지 않다"고 단정하거나, 스키마가 안 보인다는 이유로 셸 우회를 택하지 마라.',
     ...(safeSessionId ? [`- 현재 요청의 session ID: ${safeSessionId}. 이 값은 이번 턴의 식별자이며 다른 세션에 재사용·추측하지 마라.`] : []),

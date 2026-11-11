@@ -112,6 +112,68 @@ test('contract registry fails closed for missing providers and schema violations
     .toMatchObject({ ok: false, error: 'contract-violation', evidence: { side: 'output' } });
 });
 
+test('guarded store writes are checked at dispatch and hide the proof field from providers', async () => {
+  const fields = ['op', 'collection', 'owner', 'key', 'value', 'ownerScoped'] as const;
+  const validatedPayload = { op: 'upsert', collection: 'design-packs', owner: 'member-7', key: 'brief-7',
+    value: { appId: 'app-7', title: 'verified' }, ownerScoped: true };
+  let calls = 0;
+  let received: unknown;
+  const writeContract: GraphCapabilityContract = { id: 'store.write@1', input: { type: 'object' }, output: { type: 'object' } };
+  const registry = registerGraphCapabilityProviderDeclaration(
+    registerGraphCapabilityContract(emptyGraphCapabilityRegistry(), writeContract), {
+      id: 'store-writer', provides: ['store.write@1'], tier: 'free',
+      invoke: ({ input }) => { calls++; received = input; return { ok: true, outcome: 'done', result: { persisted: true } }; },
+    });
+  const context = (nodeInput: Record<string, unknown>) => ({ graphId: 'guarded-store-write', runId: 'run', nodeId: 'persist',
+    input: { context: { memberId: 'member-7' } }, nodeInput, outputs: {} });
+
+  expect(await dispatchGraphContract('store.write@1', context(validatedPayload), registry))
+    .toMatchObject({ ok: false, outcome: 'failed', error: 'store write is missing its validated payload' });
+  expect(calls).toBe(0);
+  expect(await dispatchGraphContract('store.write@1', context({ ...validatedPayload, __validatedWrite: validatedPayload }), registry))
+    .toMatchObject({ ok: true, outcome: 'done' });
+  expect(calls).toBe(1);
+  expect(received).toEqual(validatedPayload);
+  for (const field of fields) {
+    const changed = { ...validatedPayload, __validatedWrite: validatedPayload,
+      [field]: field === 'value' ? { appId: 'app-7', title: 'tampered' }
+        : field === 'ownerScoped' ? false : `${validatedPayload[field]}-tampered` };
+    expect(await dispatchGraphContract('store.write@1', context(changed), registry))
+      .toMatchObject({ ok: false, outcome: 'failed', error: 'store write input differs from its validated payload' });
+  }
+  expect(await dispatchGraphContract('store.write@1', context({ ...validatedPayload, __validatedWrite: validatedPayload,
+    bypassPolicy: true }), registry))
+    .toMatchObject({ ok: false, outcome: 'failed', error: 'store write input differs from its validated payload' });
+  const sparseWithUndefined = new Array<unknown>(2);
+  sparseWithUndefined[1] = 'safe';
+  const comparisonCases: Array<{ name: string; expected: unknown; actual: unknown; extraField?: boolean; accepted: boolean }> = [
+    { name: 'Date instant is tagged and compared', expected: { at: new Date('2026-11-11T00:00:00.000Z') },
+      actual: { at: new Date('2026-11-12T00:00:00.000Z') }, accepted: false },
+    { name: 'Date does not equal its ISO string', expected: { at: new Date('2026-11-11T00:00:00.000Z') },
+      actual: { at: '2026-11-11T00:00:00.000Z' }, accepted: false },
+    { name: 'array hole differs from explicit undefined', expected: { tags: [undefined, 'safe'] },
+      actual: { tags: sparseWithUndefined }, accepted: false },
+    { name: 'unproved extra field is rejected', expected: { tags: ['safe'] }, actual: { tags: ['safe'] },
+      extraField: true, accepted: false },
+    { name: 'object key order is normalized', expected: { first: 'a', second: 'b' },
+      actual: { second: 'b', first: 'a' }, accepted: true },
+    { name: 'NaN has a stable typed representation', expected: { score: Number.NaN },
+      actual: { score: Number.NaN }, accepted: true },
+    { name: 'NaN differs from null', expected: { score: Number.NaN }, actual: { score: null }, accepted: false },
+    { name: 'negative zero differs from positive zero', expected: { score: -0 }, actual: { score: 0 }, accepted: false },
+  ];
+  for (const testCase of comparisonCases) {
+    const proof = { ...validatedPayload, value: testCase.expected };
+    const request = { ...validatedPayload, value: testCase.actual, __validatedWrite: proof,
+      ...(testCase.extraField ? { bypassPolicy: true } : {}) };
+    const result = await dispatchGraphContract('store.write@1', context(request), registry);
+    expect(result.ok).toBe(testCase.accepted);
+    if (!testCase.accepted)
+      expect(result).toMatchObject({ error: 'store write input differs from its validated payload' });
+  }
+  expect(calls).toBe(3);
+});
+
 test('store.events@1 is a member-scoped shared contract and providers may omit unmeasured latency', async () => {
   let registry = registerGraphCapabilityContract(emptyGraphCapabilityRegistry(), STORE_EVENTS_CONTRACT);
   registry = registerGraphCapabilityProviderDeclaration(registry, {

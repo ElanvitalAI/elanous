@@ -118,7 +118,9 @@ function setupSteps(deps: SetupCliDeps): SetupStep[] {
     },
     {
       name: 'LLM provider configuration',
-      complete: config.llm.provider === 'openai-codex'
+      // Setup can also follow a completed OpenRouter/Solar first run.  An
+      // explicit provider is already a choice; do not replace it with Codex.
+      complete: Boolean(config.llm.provider && config.llm.provider !== 'auto')
         || (config.llm.provider === 'auto'
           && (deps.resolveRuntimeProvider ?? defaultResolveRuntimeProvider)(config) === 'auto:openai-codex'),
       command: PROVIDER_COMMAND,

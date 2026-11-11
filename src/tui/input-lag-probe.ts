@@ -61,7 +61,7 @@ export interface InputLagProbe {
   noteKey(count?: number): void;
   notePaint(): void;
   measureTurnStart<T>(fn: () => T, turnId?: string): T;
-  /** 같은 심장박동을 다른 관측(턴 시작 덩어리 · `dashboard/turn-start-segments.ts`)이 읽는 창 — 시계·할당 0. */
+  /** 같은 심장박동을 다른 관측(턴 시작 덩어리 · `tui/turn-start-segments.ts`)이 읽는 창 — 시계·할당 0. */
   beats: InputLagBeatView;
   dispose(): void;
 }

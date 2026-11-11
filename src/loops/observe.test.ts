@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { readFailureInbox } from '../self-implement/heal-intake.js';
 import { debug } from '../debug/log.js';
+import { runStewardStage } from '../steward/triage.js';
 import { LOOP_EVENTS, loopCategory, loopEvent } from './observe.js';
 
 let log: ReturnType<typeof spyOn<typeof debug, 'log'>>;
@@ -27,6 +28,25 @@ test('RFC event vocabulary emits only under the validated manifest category with
       { ...context, tokens: 0, loopId: 'tc-seat', missingRequired: [] },
     ]);
   }
+});
+
+test('derived loop observations inherit simulation provenance and cannot count as real', () => {
+  const sim = { universe: 'sim', source: 'sim', device: 'ux-sim', scenario: 'failed-tick', clock: 'sim' } as const;
+  loopEvent('steward', 'tick', { ...context, causedByProvenance: [{ universe: 'prod', source: 'real' }, sim] });
+  expect(log.mock.calls[0]?.[3]).toEqual({ provenance: sim });
+  log.mockClear();
+  loopEvent('steward', 'tick', { ...context, provenance: { universe: 'prod', source: 'real' }, causedByProvenance: [sim] });
+  expect(log.mock.calls[0]?.[2]).toMatchObject({ provenance: sim });
+  expect(log.mock.calls[0]?.[3]).toEqual({ provenance: sim });
+  log.mockClear();
+  loopEvent('steward', 'tick', { ...context, provenance: { universe: 'prod', source: 'real' }, causedByProvenance: [null] });
+  expect(log.mock.calls[0]?.[3]?.provenance).toMatchObject({ source: 'unknown' });
+  log.mockClear();
+  loopEvent('steward', 'tick', { ...context, provenance: { universe: 'prod', source: 'real' }, causedByProvenance: 'bad-input' });
+  expect(log.mock.calls[0]?.[3]?.provenance).toMatchObject({ source: 'unknown' });
+  log.mockClear();
+  loopEvent('steward', 'tick', { ...context, provenance: { universe: 'prod', source: 'real' }, causedByProvenance: { universe: 'prod', source: 'real' } });
+  expect(log.mock.calls[0]?.[3]?.provenance).toMatchObject({ source: 'unknown' });
 });
 
 test('valid events expose missing required context without fabricating values or changing supplied data', () => {
@@ -78,11 +98,66 @@ test('only failed ticks reach the heal inbox; repeats fold by source and loop id
     loopEvent('steward', 'tick', { ...context, outcome: 'ok' });
     loopEvent('steward', 'exchange', { ...context, outcome: 'failed' });
     expect(readFailureInbox({}, root)).toEqual([]);
-    loopEvent('steward', 'tick', { ...context, outcome: 'failed' });
-    loopEvent('steward', 'tick', { ...context, outcome: 'failed' });
+    const real = { universe: 'prod', source: 'real' } as const;
+    loopEvent('steward', 'tick', { ...context, outcome: 'failed', provenance: real });
+    loopEvent('steward', 'tick', { ...context, outcome: 'failed', provenance: real });
     expect(readFailureInbox({}, root)).toEqual([{
       source: 'loop-tick', kind: 'tick', ref: 'steward', summary: 'Loop steward tick failed', at: expect.any(String),
     }]);
+  } finally {
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('live steward failure tick carries production provenance and reaches the heal inbox', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'heal-steward-production-'));
+  const priorNodeEnv = process.env.NODE_ENV;
+  const priorStateDir = process.env.ELANOUS_STATE_DIR;
+  setElanousConfigDir(root);
+  process.env.NODE_ENV = 'production';
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    await expect(runStewardStage('triage', { root, launchSettings: { mode: 'live' }, getSecret: async () => '' }))
+      .rejects.toThrow('connector.linear.apiKey missing');
+    const tick = log.mock.calls.find(([category, event, data]) => category === 'loop.steward' && event === 'tick'
+      && (data as Record<string, unknown>).outcome === 'fail');
+    expect(tick?.[3]).toEqual({ provenance: { universe: 'prod', source: 'real' } });
+    expect(readFailureInbox({}, root)).toEqual([expect.objectContaining({ source: 'loop-tick', kind: 'tick', ref: 'steward' })]);
+  } finally {
+    resetElanousConfigDir();
+    if (priorNodeEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = priorNodeEnv;
+    if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = priorStateDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('simulated failed ticks do not enter the production heal inbox', () => {
+  const root = mkdtempSync(join(tmpdir(), 'heal-loop-sim-'));
+  setElanousConfigDir(root);
+  try {
+    loopEvent('steward', 'tick', {
+      ...context,
+      outcome: 'failed',
+      provenance: { universe: 'sim', source: 'sim', device: 'ux-sim' },
+    });
+    expect(readFailureInbox({}, root)).toEqual([]);
+  } finally {
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('production source with a simulated clock does not enter the production heal inbox', () => {
+  const root = mkdtempSync(join(tmpdir(), 'heal-loop-sim-clock-'));
+  setElanousConfigDir(root);
+  try {
+    loopEvent('steward', 'tick', {
+      ...context,
+      outcome: 'failed',
+      provenance: { universe: 'prod', source: 'real', clock: 'sim' },
+    });
+    expect(readFailureInbox({}, root)).toEqual([]);
   } finally {
     resetElanousConfigDir();
     rmSync(root, { recursive: true, force: true });
@@ -94,9 +169,10 @@ test('heal inbox write failure leaves the original loop event unchanged and repo
   setElanousConfigDir(root);
   writeFileSync(join(root, 'heal'), 'not a directory');
   try {
-    expect(() => loopEvent('steward', 'tick', { ...context, outcome: 'failed' })).not.toThrow();
+    const real = { universe: 'prod', source: 'real' } as const;
+    expect(() => loopEvent('steward', 'tick', { ...context, outcome: 'failed', provenance: real })).not.toThrow();
     expect(log.mock.calls[0]).toEqual(['loop.steward', 'tick',
-      { ...context, outcome: 'failed', loopId: 'steward', missingRequired: [] }]);
+      { ...context, outcome: 'failed', provenance: real, loopId: 'steward', missingRequired: [] }, { provenance: real }]);
     expect(log.mock.calls[1]).toEqual(['heal.intake', 'record-failed',
       expect.objectContaining({ source: 'loop-tick', kind: 'tick', ref: 'steward' }), { level: 'error' }]);
   } finally {

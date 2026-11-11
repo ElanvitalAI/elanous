@@ -4,6 +4,13 @@ import type { PromptFrame } from '../../display/prompt-frame.js';
 import { paintCursor, type CursorState } from '../../display/cursor-state.js';
 import { buildPromptFramePlaceholderRows } from '../../display/prompt-frame-paint.js';
 import { visibleWidth } from '../../tui.js';
+export {
+  resolveEssentialFrameCursor,
+  resolveEssentialFrameCursorDecision,
+  type EssentialFrameCursorDecision,
+  type EssentialFrameCursorInput,
+  type EssentialFrameCursorSource,
+} from '../../display/essential-frame-cursor.js';
 
 export interface TurnTypeaheadPromptRowsInput {
   frame: PromptFrame;
@@ -24,37 +31,6 @@ export interface TurnTypeaheadPromptPaint {
 }
 
 export type TurnTypeaheadPromptPaintSink = (paint: TurnTypeaheadPromptPaint) => void;
-
-export type EssentialFrameCursorSource = 'claim' | 'suppressed' | 'prompt' | 'none';
-
-export interface EssentialFrameCursorDecision {
-  cursor: CursorState | null;
-  source: EssentialFrameCursorSource;
-  reason: 'visible-claim' | 'prompt-area-suppressed' | 'prompt-caret' | 'no-cursor';
-}
-
-export interface EssentialFrameCursorInput {
-  claimedCursor: CursorState | null;
-  promptCaret: CursorState | null;
-  suppressPromptArea: boolean;
-}
-
-export function resolveEssentialFrameCursorDecision(input: EssentialFrameCursorInput): EssentialFrameCursorDecision {
-  if (input.claimedCursor?.visible) {
-    return { cursor: input.claimedCursor, source: 'claim', reason: 'visible-claim' };
-  }
-  if (input.suppressPromptArea) {
-    return { cursor: null, source: 'suppressed', reason: 'prompt-area-suppressed' };
-  }
-  if (input.promptCaret) {
-    return { cursor: input.promptCaret, source: 'prompt', reason: 'prompt-caret' };
-  }
-  return { cursor: null, source: 'none', reason: 'no-cursor' };
-}
-
-export function resolveEssentialFrameCursor(input: EssentialFrameCursorInput): CursorState | null {
-  return resolveEssentialFrameCursorDecision(input).cursor;
-}
 
 /** The dashboard frame owns the durable typeahead echo; an imperative
  * paint may make keypress feedback immediate, but later draws must reproduce it. */

@@ -2,11 +2,86 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "gcp-architect-expand",
   "version": "0.1.0",
+  "dependencies": { "plugins": ["architecture-deliverables@^0.1.0"] },
   "description": "Local-first capacity and cost proposal graph. Declaration and fake-world simulation only; no Google Cloud calls.",
+  "contributes": {
+    "aiTools": [
+      {
+        "name": "gcp_architect_expand",
+        "description": "로컬 CPU·메모리·디스크·대기열 용량 부족을 검토해 Google Cloud(GCP) 확장 아키텍처, 비용 계산식·절감안·보안 등급을 제안합니다. 비용 발생 작업은 사용자 승인 후에만 진행합니다.",
+        "handler": "graph:gcp-architect-expand",
+        "parameters": {
+          "type": "object",
+          "properties": {
+          "ticketDesignPath": { "type": "string", "description": "#36522 시스템 설계의 구조화된 JSON 파일 경로(ticketDesign 또는 design 노드 결과). 가짜 세계 테스트에서는 평탄한 fixture 경로도 허용합니다." }
+          },
+          "required": ["ticketDesignPath"],
+          "additionalProperties": false
+        },
+        "route": {
+          "triggers": ["클라우드 확장", "GCP", "용량 부족", "시스템 아키텍처 설계", "GCP 확장안", "클라우드 용량 부족", "Google Cloud 확장", "로컬 CPU 메모리 디스크 대기열 부족"],
+          "examples": ["티켓팅 설계를 바탕으로 GCP 확장안을 제안해줘", "내 PC 용량이 부족하면 클라우드 확장 비용과 절감 방법을 알려줘"],
+          "sideEffects": "external",
+          "risk": "high",
+          "cost": "spends-cloud",
+          "requiresConfirm": true,
+          "confirmation": {
+            "prompt": "GCP 확장 설계 그래프를 실행할까요? 실제 자원 생성은 별도 사용자 비용 승인 후에만 진행합니다. (y/N)",
+            "default": "N"
+          }
+        }
+      },
+      {
+        "name": "gcp_architect_tiered_design",
+        "description": "명시된 트래픽 요구 하나로 소·중·대 GCP 설계안과 SIM 비용·도식·PDF를 생성합니다. 비용은 실제 견적이 아닙니다.",
+        "handler": "graph:gcp-advanced-tiered-design",
+        "parameters": {
+          "type": "object",
+          "properties": { "requirementPath": { "type": "string", "description": "요구사항·트래픽 JSON 파일 경로" } },
+          "required": ["requirementPath"],
+          "additionalProperties": false
+        },
+        "route": {
+          "triggers": ["GCP 소중대 설계", "GCP 3안", "클라우드 용량 비교"],
+          "examples": ["이 요구사항으로 GCP 소·중·대 설계와 PDF를 만들어줘"],
+          "sideEffects": "mutating",
+          "risk": "medium",
+          "cost": "cheap",
+          "requiresConfirm": true,
+          "confirmation": { "prompt": "로컬 GCP 3안 설계 시뮬레이션을 실행할까요? 실제 GCP 호출은 없습니다. (y/N)", "default": "N" }
+        }
+      }
+    ]
+  },
   "extensions": {
     "ai.elanous": {
-      "graphs": ["./graph.yaml"],
-      "capabilities": ["fs:workdir"],
+      "graphs": ["./graph.yaml", "./tiered-graph.yaml"],
+      "capabilities": ["cloud-resource", "fs:workdir"],
+      "graphManifests": {
+        "gcp-architect-expand": {
+          "purpose": "Local-first GCP architecture proposal with an explicit spending HITL gate",
+          "allow": {
+            "recipes": ["cmd:*@./recipes.yaml"],
+            "capabilities": ["cloud-resource"],
+            "skills": [],
+            "domainPacks": ["gcp-architect-expand"]
+          },
+          "hitl": ["approve"],
+          "observe": { "categories": ["graph.run", "graph.unit", "cloud-resource"] }
+        },
+        "gcp-advanced-tiered-design": {
+          "purpose": "Offline three-option GCP architecture simulation with an explicit spending HITL gate",
+          "allow": {
+            "recipes": ["cmd:*@./recipes.yaml"],
+            "capabilities": ["cloud-resource"],
+            "skills": [],
+            "domainPacks": ["gcp-architect-expand"]
+          },
+          "hitl": ["approve"],
+          "observe": { "categories": ["graph.run", "graph.unit", "cloud-resource"] }
+        }
+      },
+      "outputContract": "./output-contract.json",
       "connectors": [],
       "pricing": { "model": "free" },
       "category": "Infrastructure"

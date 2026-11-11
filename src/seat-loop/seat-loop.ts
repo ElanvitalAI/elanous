@@ -17,6 +17,7 @@ import { isRescueAllowedAction } from '../steward/rescue.js';
 import { DecisionLedger, type DecisionEntry, type DecisionOption, type Recommendation } from '../decisions/decision-ledger.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js';
 import { loopEvent } from '../loops/observe.js';
+import { runtimeUniverse } from '../provenance/provenance.js';
 import { getUserConfig } from '../user-config/reader.js';
 import type { PersonaLoopConfig, SeatLoopConfig, UserConfig } from '../user-config/types.js';
 import { checkSeatBudget, type RunningSeatPod } from '../org/seat-budget.js';
@@ -264,17 +265,21 @@ export async function runSeatLoopTurn(seat: string, deps: SeatDeps = {}): Promis
     const context = { runId: 'runId' in result && result.runId ? result.runId : `seat-turn-${randomUUID()}`,
       profile, sourceRef: `docs/roles/${seat}.md` };
     const loopId = `${seat.toLowerCase()}-seat`;
-    loopEvent(loopId, 'tick', { ...context, outcome: result.status, reason: result.status });
+    const active = (profile === 'on' || profile === 'live-safe') && result.status !== 'shadow' && result.status !== 'skipped-off';
+    const provenance = active
+      ? { universe: runtimeUniverse(), source: 'real' as const }
+      : { universe: runtimeUniverse(), source: 'shadow' as const, device: 'seat-loop' };
+    loopEvent(loopId, 'tick', { ...context, outcome: result.status, reason: result.status, provenance });
     if ('inquiry' in result && result.inquiry && (result.status === 'asked' || result.status === 'hitl')) {
       loopEvent(loopId, 'exchange', { ...context, outcome: result.status, reason: 'delegation',
-        from: seat, to: result.inquiry.to, itemId: result.item?.id });
+        from: seat, to: result.inquiry.to, itemId: result.item?.id, provenance });
     }
     if ('escalated' in result && result.escalated && result.status === 'skipped-budget') {
       loopEvent(loopId, 'exchange', { ...context, outcome: result.status, reason: 'delegation',
-        from: seat, to: (config.stall?.parents ?? {})[seat] ?? DEFAULT_STALL_PARENTS[seat], itemId: result.item?.id });
+        from: seat, to: (config.stall?.parents ?? {})[seat] ?? DEFAULT_STALL_PARENTS[seat], itemId: result.item?.id, provenance });
     } else if (result.status === 'skipped-budget') {
       loopEvent(loopId, 'exchange', { ...context, outcome: result.status, reason: 'requeue',
-        itemId: result.item?.id });
+        itemId: result.item?.id, provenance });
     }
   } catch { /* observation cannot change a completed seat turn */ }
   return result;

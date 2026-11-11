@@ -1,0 +1,19 @@
+apiVersion: elanous.dev/graph/v2
+graph: { id: release-win-smoke, version: 1.0.0, layer: flow, purpose: "Install Elanous on a simulated Windows host, verify eln, and capture the machine once" }
+entry: install
+observe: { categories: [release.win-smoke] }
+sims: [../sims/release-win-smoke.yaml]
+nodes:
+  # // Source: the generic verb-execute unit budget reserves one process action and two terminal/report steps.
+  - { id: install, type: execute, budget: { inner_steps: 3 }, skill: release-win-smoke/install, with: { ask: "Run the public Windows installer once: irm https://github.com/ElanvitalAI/elanous/releases/latest/download/install.ps1 | iex" } }
+  # // Source: the generic verb-execute unit budget reserves one process action and two terminal/report steps.
+  - { id: version, type: execute, budget: { inner_steps: 3 }, skill: release-win-smoke/install, with: { ask: "Run eln --version once" } }
+  # // Source: the generic verb-execute unit budget reserves one process action and two terminal/report steps.
+  - { id: capture, type: execute, budget: { inner_steps: 3 }, skill: release-win-smoke/install, with: { ask: "Run eln machine capture once" } }
+  - { id: done, type: gate }
+  - { id: failed, type: gate }
+edges:
+  - { from: install, on: outcome, map: { done: version, failed: failed } }
+  - { from: version, on: outcome, map: { done: capture, failed: failed } }
+  - { from: capture, on: outcome, map: { done: done, failed: failed } }
+terminal: [done, failed]

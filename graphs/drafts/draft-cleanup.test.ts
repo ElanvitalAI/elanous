@@ -35,7 +35,8 @@ describe('draft-cleanup graph', () => {
     expect(calls.map(({ node }) => node)).toEqual(['classify']);
     expect(calls[0]!.command).toBe(recipes.classify!.command);
     expect(recipes.classify!.command).toContain('"sweep", "--json"');
-    expect(recipes.classify!.command).toContain('"--max-pages", "100", "--max-drafts", "300", "--max-merged", "1000"');
+    expect(recipes.classify!.command).toContain('"--max-pages", "100", "--max-drafts", "300"');
+    expect(recipes.classify!.command).not.toContain('"--max-merged"');
     expect(recipes.classify!.command).toContain('ELANOUS_GRAPH_DIR');
     expect(recipes.classify!.command).toContain('"shadow"');
     expect(recipes.classify!.command).toContain('result.apply !== false');

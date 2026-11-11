@@ -33,7 +33,7 @@ export type HintScope = 'turn' | 'session' | 'project' | 'global';
  *  for the local dashboard surface (windows · panes · terminal matrix/
  *  modal · context inspector · layout · vw · widget · scenario).
  */
-export type ToolIntentScope = 'coding' | 'browse' | 'viz' | 'capture' | 'ops-fleet' | 'ops-ui' | 'always';
+export type ToolIntentScope = 'coding' | 'browse' | 'viz' | 'capture' | 'ops-fleet' | 'ops-ui' | 'knowledge' | 'always';
 
 /** Effect a hint has on the gate decision.
  *  - prefer/boost:    raise priority (first to be quoted in prompt)

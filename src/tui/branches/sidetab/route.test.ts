@@ -26,6 +26,9 @@ test('sidetab branch handles state transitions, selection and help through host 
     toggle: async () => { open = !open; calls.push(`open:${open}`); },
     refreshRows: () => calls.push('refresh'),
     killSelected: async () => { calls.push('kill'); return true; },
+    spawnSideAgent: async (agent) => { calls.push(`spawn:${agent}`); return `fake-${agent}`; },
+    sendSelectedAgent: async (message) => { calls.push(`send:${message}`); return true; },
+    readSelectedAgent: async () => { calls.push('read'); return 'fake screen'; },
     addHelp: (...lines) => calls.push(`help:${lines.length}`),
     setStatus: (message) => calls.push(`status:${message}`),
   };

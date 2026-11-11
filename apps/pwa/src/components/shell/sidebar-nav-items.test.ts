@@ -12,7 +12,7 @@ import {
 } from './sidebar-nav-items';
 
 const app = resolve(dirname(import.meta.path), '../../app');
-const retainedRoutes = ['/', '/404', '/apps', '/apps/report', '/board', '/chat', '/credentials', '/credentials/register', '/credentials/register/claim', '/design-check', '/editor', '/live-run', '/live-run/adaptive', '/ops/release', '/settings', '/setup', '/setup/done', '/share/received', '/term', '/vault'];
+const retainedRoutes = ['/', '/404', '/apps', '/apps/report', '/board', '/chat', '/credentials', '/credentials/register', '/credentials/register/claim', '/design-check', '/editor', '/live-run', '/live-run/adaptive', '/member/invite', '/ops/release', '/settings', '/setup', '/setup/done', '/share/received', '/signup', '/signup/complete', '/term', '/vault'];
 
 function builtRoutes(directory = app): string[] {
   const pages: string[] = [];
@@ -49,6 +49,8 @@ describe('PWA screens-out navigation', () => {
     expect(built.sort()).toEqual([...retainedRoutes].sort());
     expect(new Set(accounted).size).toBe(accounted.length);
     expect(accounted.sort()).toEqual([...retainedRoutes].sort());
+    expect(NON_MENU_SIDEBAR_ROUTES.filter((route) => route.category === 'member-signup').map((route) => route.href))
+      .toEqual(['/signup', '/signup/complete']);
   });
 
   test('role and beta filtering only affects the retained menu', () => {

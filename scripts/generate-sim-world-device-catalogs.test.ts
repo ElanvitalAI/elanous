@@ -34,6 +34,37 @@ test('current membership derives from the catalog while historical versions matc
   assertHistoricalDeviceCatalogSnapshots(snapshots, baseline, 2, catalog.deviceCatalogVersion);
 });
 
+test('GCP architect fake world remains linked to its source module and device snapshots', () => {
+  const catalog = loadMockScenarioCatalog();
+  const moduleId = 'MD-UX-SIM-GCP-ARCHITECT-EXPAND-FAKE-WORLD-TS';
+  const sourcePath = 'src/ux-sim/gcp-architect-expand-fake-world.ts';
+  expect(catalog.devices.find(({ id }) => id === 'gcp-architect-expand-fake-world')?.implementation)
+    .toContain(sourcePath);
+  expect(catalog.sourceModules.find(({ id }) => id === moduleId)).toMatchObject({
+    path: sourcePath,
+    deviceIds: ['gcp-architect-expand-fake-world'],
+  });
+  const snapshots = buildSimWorldDeviceCatalogSnapshots();
+  expect(snapshots['31']).toContain(moduleId);
+  expect(snapshots[String(catalog.deviceCatalogVersion)]).toContain(moduleId);
+});
+
+test('GCP tiered design simulation is discoverable through the device catalog', () => {
+  const catalog = loadMockScenarioCatalog();
+  const sourcePath = 'src/ux-sim/gcp-architect-expand/tiered-design.ts';
+  const moduleId = 'MD-UX-SIM-GCP-ARCHITECT-EXPAND-TIERED-DESIGN-TS';
+  const deviceId = 'gcp-architect-tiered-design';
+  expect(catalog.devices.find(({ id }) => id === deviceId)).toMatchObject({
+    implementation: [sourcePath],
+    tests: ['src/ux-sim/gcp-architect-expand/tiered-design.test.ts'],
+  });
+  expect(catalog.sourceModules.find(({ id }) => id === moduleId)).toMatchObject({
+    path: sourcePath,
+    deviceIds: [deviceId],
+  });
+  expect(buildSimWorldDeviceCatalogSnapshots()[String(catalog.deviceCatalogVersion)]).toContain(moduleId);
+});
+
 test('history generation preserves an already-finalized current version and rejects rewriting it', () => {
   const repo = mkdtempSync(join(tmpdir(), 'sim-world-history-preserve-'));
   const target = join(repo, 'history.json');

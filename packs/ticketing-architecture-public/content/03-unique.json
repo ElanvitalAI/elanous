@@ -1,0 +1,7 @@
+{
+  "type": "rule",
+  "title": "확정 좌석 유일성",
+  "source": "https://www.postgresql.org/docs/current/indexes-partial.html",
+  "scope": "공연과 좌석의 확정 판매.",
+  "basis": "판매 이력에 취소·실패 주문을 보존하려면 (show_id,seat_id) WHERE status=CONFIRMED 부분 UNIQUE 인덱스를 둔다. 원장 트랜잭션 실패 시 외부 캐시의 SOLD 표시를 진실로 삼지 않는다. 홀드 소유자와 만료도 트랜잭션에서 다시 검사한다."
+}

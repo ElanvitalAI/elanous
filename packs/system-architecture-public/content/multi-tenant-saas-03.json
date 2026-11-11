@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "다중 테넌트 SaaS — 시끄러운 이웃과 quota",
+  "source": "https://learn.microsoft.com/en-us/azure/architecture/patterns/rate-limiting-pattern",
+  "body": "적용 시점: 한 고객이 공유 CPU·DB·큐를 독점할 위험이 있을 때.\n용량 단계: 초기에는 전체 한도와 tenant별 계량; 불공정이 관측되면 token bucket·fair queue·isolated pool을 단계 적용한다.\nGCP 대응: Cloud Armor/API Gateway/서비스 계층의 rate limit, Cloud Tasks/Pub/Sub quota, 테넌트별 billing labels.\n비용 축: 제한 상태의 유휴 용량과 격리 pool, 측정·과금 데이터 보존이 비용 축이다.\n결정과 반증: 한 tenant의 burst가 다른 tenant의 SLO를 해치지 않는지 noisy-neighbor 부하 시험을 한다."
+}

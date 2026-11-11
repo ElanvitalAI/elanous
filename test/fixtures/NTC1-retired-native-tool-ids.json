@@ -1,5 +1,7 @@
 {
   "retiredIds": [
+    "elanous_autopilot_launch",
+    "solve_mission",
     "layout_save",
     "layout_load",
     "layout_apply_preset",

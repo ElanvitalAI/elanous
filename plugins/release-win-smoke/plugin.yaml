@@ -1,0 +1,11 @@
+apiVersion: elanous.dev/plugin/v2
+id: release-win-smoke
+name: Release Windows Smoke
+version: 0.3.9
+description: Mockable Windows installation and machine-capture smoke graph for release rehearsal.
+graphs: [./graphs/release-win-smoke.yaml]
+capabilities: [proc:elanous]
+trust: builtin
+sims: [./sims/release-win-smoke.yaml]
+skills:
+  - { id: release-win-smoke/install, path: ./skills/install/SKILL.md, sideEffects: write }

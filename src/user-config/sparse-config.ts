@@ -1,10 +1,8 @@
+import { isObject } from '../primitives/guards.js';
+
 const OMIT = Symbol('omit-config-default');
 
 type ConfigObject = Record<string, unknown>;
-
-function isObject(value: unknown): value is ConfigObject {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
 
 function hasKey(value: unknown, key: string): value is ConfigObject {
   return isObject(value) && Object.prototype.hasOwnProperty.call(value, key);

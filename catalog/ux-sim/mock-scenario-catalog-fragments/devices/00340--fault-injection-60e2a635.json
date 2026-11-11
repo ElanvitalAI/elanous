@@ -13,6 +13,7 @@
     "src/ux-sim/fault-scope-escape-lift.ts",
     "src/ux-sim/fault-sqlite-busy.ts",
     "src/ux-sim/fault-tui-400-autoheal.ts",
+    "src/ux-sim/tui-400-runtime-contract.ts",
     "src/ux-sim/gate-shard-host-reroute.ts"
   ],
   "tests": [

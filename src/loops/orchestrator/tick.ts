@@ -25,6 +25,7 @@ import { isLaunchEligible, isTrafficLaunch, recordDispatchCycle, seatOfTree, typ
 import { defaultListHarnessProcesses } from '../../harness/harness-cli-command.js';
 import * as testGuard from '../../instance/test-write-guard.js';
 import { seatCapDetails } from '../budget.js';
+import { enqueuePreparedTask, readPreparedTaskKeys, readPreparedTasks } from './ready-queue.js';
 export { isLaunchEligible } from './traffic.js';
 import { readTaskAgentState, TASK_SEATS, type HandTaskOptions, type TaskCard as TaskAgentCard, type HandTaskResult, type TaskLauncher, type TaskSeat } from '../../task-agent/task-hand.js';
 import { runAskOpContextInbox, runCoordinatorAgentInbox, type CoordinatorInboxResult } from './inbox.js';
@@ -706,16 +707,20 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
         state.deferredCells = [];
         state.delegatedKeys = [];
       }
-      const path = journal(root);
-      // 모드와 칸 필터는 따로 푼다 — 주입으로 모드만 줘도 설정의 칸 필터는 그대로 먹는다.
+      // Existing prepared keys always suppress a second consumer. Full queue validation is only
+      // required when this tick can write a new live TASK-AGENT assignment.
       const handConfig: Partial<OrchestratorLoopConfig> = deps.handToTaskAgent !== undefined && deps.handToTaskAgentCell !== undefined ? {} : getUserConfig().loops?.orchestrator ?? {};
+      const handMode = deps.handToTaskAgent ?? handConfig.handToTaskAgent ?? 'off';
+      const readyKeys = mode !== 'live' ? [] : handMode === 'live'
+        ? readPreparedTasks(root).map(row => row.key) : [...readPreparedTaskKeys(root)];
+      const path = journal(root);
       // live 로 넘긴 칸은 지금 설정(off·칸 필터)과 무관하게 자리 경로로 다시 안 간다 — 발사 주체가 둘이 되지 않게.
       // ⭐ 넘김 claim 과 자리 저널 기록은 «같은 잠금»(자리 저널 잠금) 아래에서 서로를 다시 읽는다 — 동시 틱이 낡은 값을 보지 않게.
       const ledger = handedLedger(root);
       const liveHanded = handedKeys(ledger);
       // Earlier runs' (would-)assignments only count while a cap is configured — they are what the cap carried over.
       // With no cap the tick behaves as before: shadow would-delegates every cell again, live dedups on the seat journal.
-      const keys = new Set([...readRequests(root).map(row => row.key), ...(cap !== undefined ? previous.keys : [])]);
+      const keys = new Set([...readRequests(root).map(row => row.key), ...readyKeys, ...(cap !== undefined ? previous.keys : [])]);
       // 넘김 뒤 상태 저장 전에 죽은 같은 run 이 다시 돌면 원장에서 handed[] 를 되살린다.
       const ledgerHanded = handedRows(ledger);
       const restoreHanded = (handKey: string, key: string, rows: Map<string, HandedRow> = handedRows(ledger)): void => {
@@ -775,7 +780,6 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
         const capped = !unplacedLive && cap !== undefined && state.delegatedKeys!.length >= cap;
         // ORCH-TA-HAND: hand the picked cell to TASK-AGENT. shadow = card only (the seat path below is unchanged);
         // live (tick live ⊕ hand live) = launch through TASK-AGENT and skip the seat journal so the cell launches once.
-        const handMode = deps.handToTaskAgent ?? handConfig.handToTaskAgent ?? 'off';
         const handCell = deps.handToTaskAgentCell ?? handConfig.handToTaskAgentCell;
         if (handMode !== 'off' && (!handCell || handCell === cell.id) && (TASK_SEATS as readonly string[]).includes(cell.seat)) {
           // live 는 tick 도 live 이고 배치(유효한 판)가 된 칸만 — 나머지는 카드만(shadow · 배치 전 칸도 표본이 된다).
@@ -805,6 +809,29 @@ export async function runOrchestratorNode(node: Node, deps: TickDeps = {}): Prom
           });
           if (claimed) {
             try {
+              // Production coordinator only writes a durable contract. The resident dispatcher is the sole
+              // component that will turn this ready row into a TASK-AGENT launch. Explicit handTask injection
+              // and launcher injection remain test seams for legacy crash/race characterization cases.
+              if (handLive && !deps.handTask && !deps.taskLauncher) {
+                const priority = cell.priority === 'P0' || cell.priority === 'P1' ? cell.priority : 'P2';
+                const preparedKey = `orch:${cell.cardId}:${cell.id}`;
+                enqueuePreparedTask(root, {
+                  schemaVersion: 1,
+                  key: preparedKey,
+                  priority,
+                  seat: cell.seat!,
+                  contract: { title: cell.title, text: cell.title, checklistId: cell.id, sourceCardId: cell.cardId, sourceRunId: runId },
+                  status: 'ready',
+                  createdAt: now.toISOString(),
+                });
+                withFileLockSync(`${path}.lock`, () => appendFileSync(ledger, `${JSON.stringify({ key: handKey, cell: cell.id, mode: 'live', status: 'prepared', runId, at: now.toISOString() })}\n`));
+                keys.add(key);
+                (state.delegatedKeys ??= []).push(key);
+                state.delegated++;
+                observe('prepared-for-dispatch', `${key}:${priority}`, 1, 'task-agent');
+                if (anomaly.isHeld(anomalyGoal, anomalyHost)) anomaly.release(anomalyGoal, anomalyHost, '원인 판정: TASK-AGENT 준비 큐 기록 성공');
+                continue;
+              }
               const result = await (deps.handTask ?? (async (opts: HandTaskOptions) => (await import('../../task-agent/task-hand.js')).handTask(opts)))({
                 text: cell.title, seat: cell.seat as TaskSeat, checklistId: cell.id, live: handLive, now: () => now,
                 statePath: join(root, 'task-agent-actions.json'),

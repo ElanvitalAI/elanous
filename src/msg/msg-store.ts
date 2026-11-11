@@ -4,6 +4,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
+import { validateProvenance, type Provenance } from '../provenance/provenance.js';
 
 export interface MessageEnvelope {
   from: string;
@@ -14,6 +15,7 @@ export interface MessageEnvelope {
   expiresAt?: string;
   priority?: number;
   supersedes?: number;
+  provenance?: Provenance;
 }
 
 export interface Message extends MessageEnvelope {
@@ -88,7 +90,8 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
   if (record.expiresAt !== undefined && (typeof record.expiresAt !== 'string' || !Number.isFinite(Date.parse(record.expiresAt)))) throw new Error('expiresAt must be an ISO timestamp');
   if (record.priority !== undefined && (typeof record.priority !== 'number' || !Number.isFinite(record.priority))) throw new Error('priority must be a finite number');
   if (record.supersedes !== undefined && (typeof record.supersedes !== 'number' || !Number.isSafeInteger(record.supersedes) || record.supersedes < 1)) throw new Error('supersedes must be a positive message ID');
-  if (Object.keys(record).some(key => !['from', 'to', 'body', 'kind', 'replyTo', 'expiresAt', 'priority', 'supersedes'].includes(key))) throw new Error('unknown message field');
+  if (record.provenance !== undefined && !validateProvenance(record.provenance)) throw new Error('invalid message provenance');
+  if (Object.keys(record).some(key => !['from', 'to', 'body', 'kind', 'replyTo', 'expiresAt', 'priority', 'supersedes', 'provenance'].includes(key))) throw new Error('unknown message field');
   return {
     from, to, body: record.body,
     ...(record.kind === undefined ? {} : { kind: record.kind as string }),
@@ -96,6 +99,7 @@ export function validateMessageEnvelope(input: unknown): MessageEnvelope {
     ...(record.expiresAt === undefined ? {} : { expiresAt: normalizeExpiry(record.expiresAt as string) }),
     ...(record.priority === undefined ? {} : { priority: record.priority as number }),
     ...(record.supersedes === undefined ? {} : { supersedes: record.supersedes as number }),
+    ...(record.provenance === undefined ? {} : { provenance: Object.freeze({ ...(record.provenance as Provenance) }) }),
   };
 }
 
@@ -167,6 +171,7 @@ interface MessageRow {
   expires_at?: string | null;
   priority?: number | null;
   supersedes?: number | null;
+  provenance_json?: string | null;
 }
 
 function fromRow(row: MessageRow): Message {
@@ -176,7 +181,15 @@ function fromRow(row: MessageRow): Message {
     ...(row.expires_at == null ? {} : { expiresAt: row.expires_at }),
     ...(row.priority == null ? {} : { priority: row.priority }),
     ...(row.supersedes == null ? {} : { supersedes: row.supersedes }),
+    ...(parseStoredProvenance(row.provenance_json) ? { provenance: parseStoredProvenance(row.provenance_json)! } : {}),
     createdAt: row.created_at };
+}
+
+function parseStoredProvenance(json: string | null | undefined): Provenance | undefined {
+  if (json) {
+    try { const value: unknown = JSON.parse(json); if (validateProvenance(value)) return value; } catch { /* corrupt or legacy metadata is unknown */ }
+  }
+  return undefined;
 }
 
 /** SQLite owns both append order and per-recipient acknowledgement progress. */
@@ -190,15 +203,20 @@ export class MsgStore {
       .get() as { count: number }).count > 0;
   }
 
+  private get hasProvenance(): boolean {
+    return (this.db.query(`SELECT COUNT(*) AS count FROM pragma_table_info('msg_messages') WHERE name = 'provenance_json'`)
+      .get() as { count: number }).count > 0;
+  }
+
   private get hasGroupMemberships(): boolean {
     return (this.db.query("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'msg_group_memberships'")
       .get() as { count: number }).count > 0;
   }
 
-  private readWithSchema<T>(read: (hasReplyTo: boolean, hasGroupMemberships: boolean) => T): T {
+  private readWithSchema<T>(read: (hasReplyTo: boolean, hasGroupMemberships: boolean, hasProvenance: boolean) => T): T {
     // The schema projection and rows must share one SQLite snapshot. Otherwise a writer can
     // migrate between them and a reader could advance past a reply with its link erased.
-    return this.db.transaction(() => read(this.hasReplyTo, this.hasGroupMemberships)).deferred();
+    return this.db.transaction(() => read(this.hasReplyTo, this.hasGroupMemberships, this.hasProvenance)).deferred();
   }
 
   constructor(path: string = defaultMsgStorePath(), options: { readOnly?: boolean; now?: () => Date } = {}) {
@@ -214,7 +232,8 @@ export class MsgStore {
       body TEXT NOT NULL,
       kind TEXT,
       reply_to INTEGER,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      provenance_json TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_msg_messages_recipient_id ON msg_messages(recipient, id);
     CREATE INDEX IF NOT EXISTS idx_msg_messages_created_at_id ON msg_messages(created_at, id);
@@ -262,6 +281,7 @@ export class MsgStore {
       if (!columns.has('expires_at')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN expires_at TEXT');
       if (!columns.has('priority')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN priority REAL');
       if (!columns.has('supersedes')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN supersedes INTEGER');
+      if (!columns.has('provenance_json')) this.db.exec('ALTER TABLE msg_messages ADD COLUMN provenance_json TEXT');
       this.db.exec('CREATE INDEX IF NOT EXISTS idx_msg_messages_reply_to ON msg_messages(reply_to, id)');
     }).immediate();
   }
@@ -282,7 +302,7 @@ export class MsgStore {
       throw new Error('provenance recipient does not match message recipient');
     }
     return this.db.transaction(() => {
-      const existing = this.db.query(`SELECT m.id, m.sender, m.recipient, m.body, m.kind, m.reply_to, m.created_at
+      const existing = this.db.query(`SELECT m.id, m.sender, m.recipient, m.body, m.kind, m.reply_to, m.created_at, m.provenance_json
         FROM msg_provenance p JOIN msg_messages m ON m.id = p.message_id WHERE p.provenance_key = ?`)
         .get(provenanceKey) as MessageRow | null;
       if (existing) return fromRow(existing);
@@ -307,8 +327,8 @@ export class MsgStore {
     }
     const createdAt = new Date().toISOString();
     if (msg.supersedes !== undefined && !this.db.query('SELECT 1 FROM msg_messages WHERE id = ?').get(msg.supersedes)) throw new Error(`superseded message not found: #${msg.supersedes}`);
-    const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, reply_to, created_at, expires_at, priority, supersedes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, msg.replyTo ?? null, createdAt, msg.expiresAt ?? null, msg.priority ?? null, msg.supersedes ?? null);
+    const result = this.db.query(`INSERT INTO msg_messages(sender, recipient, body, kind, reply_to, created_at, expires_at, priority, supersedes, provenance_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(msg.from, msg.to, msg.body, msg.kind ?? null, msg.replyTo ?? null, createdAt, msg.expiresAt ?? null, msg.priority ?? null, msg.supersedes ?? null, msg.provenance ? JSON.stringify(msg.provenance) : null);
     return { id: Number(result.lastInsertRowid), ...msg, createdAt };
   }
 
@@ -454,7 +474,7 @@ export class MsgStore {
     if (to === 'ALL') throw new Error('ALL is a topic, not a recipient');
     validCursor(after);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
-    return this.readWithSchema((hasReplyTo, hasGroupMemberships) => {
+    return this.readWithSchema((hasReplyTo, hasGroupMemberships, hasProvenance) => {
       const hasAcks = hasMessageAckTable(this.db);
       const hasMetadata = hasEnvelopeMetadata(this.db);
       const groupClause = hasGroupMemberships ? ` OR EXISTS (
@@ -465,8 +485,9 @@ export class MsgStore {
       const ackFilter = hasAcks ? 'AND a.message_id IS NULL' : '';
       const expiryFilter = hasMetadata ? "AND (m.expires_at IS NULL OR julianday(m.expires_at) > julianday('now'))" : '';
       const metadata = hasMetadata ? 'm.expires_at, m.priority, m.supersedes' : 'NULL AS expires_at, NULL AS priority, NULL AS supersedes';
+      const provenance = hasProvenance ? 'm.provenance_json' : 'NULL AS provenance_json';
       const params = [...(hasAcks ? [to] : []), after, to, to, ...(hasGroupMemberships ? [to] : []), limit];
-      return (this.db.query(`SELECT m.id, m.sender, m.recipient, m.body, m.kind, ${hasReplyTo ? 'm.reply_to' : 'NULL AS reply_to'}, m.created_at, ${metadata} FROM msg_messages m ${acksJoin}
+      return (this.db.query(`SELECT m.id, m.sender, m.recipient, m.body, m.kind, ${hasReplyTo ? 'm.reply_to' : 'NULL AS reply_to'}, m.created_at, ${metadata}, ${provenance} FROM msg_messages m ${acksJoin}
         WHERE m.id > ? ${expiryFilter} ${ackFilter} AND (m.recipient = ? OR (m.recipient = 'ALL' AND m.sender <> ?)${groupClause}) ORDER BY m.id ASC LIMIT ?`)
         .all(...params) as MessageRow[]).map(fromRow);
     });
@@ -475,9 +496,10 @@ export class MsgStore {
   /** One message by durable ID, or null when absent. */
   getMessage(messageId: number): Message | null {
     if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
-    return this.readWithSchema(hasReplyTo => {
+    return this.readWithSchema((hasReplyTo, _groups, hasProvenance) => {
       const metadata = hasEnvelopeMetadata(this.db) ? 'expires_at, priority, supersedes' : 'NULL AS expires_at, NULL AS priority, NULL AS supersedes';
-      const row = this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at, ${metadata} FROM msg_messages
+      const provenance = hasProvenance ? 'provenance_json' : 'NULL AS provenance_json';
+      const row = this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at, ${metadata}, ${provenance} FROM msg_messages
         WHERE id = ?`).get(messageId) as MessageRow | null;
       return row === null ? null : fromRow(row);
     });
@@ -504,8 +526,8 @@ export class MsgStore {
     if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
     validCursor(afterId);
-    return this.readWithSchema(hasReplyTo => hasReplyTo
-      ? (this.db.query(`SELECT id, sender, recipient, body, kind, reply_to, created_at FROM msg_messages
+    return this.readWithSchema((hasReplyTo, _groups, hasProvenance) => hasReplyTo
+      ? (this.db.query(`SELECT id, sender, recipient, body, kind, reply_to, created_at, ${hasProvenance ? 'provenance_json' : 'NULL AS provenance_json'} FROM msg_messages
         WHERE reply_to = ? AND id > ? ORDER BY id ASC LIMIT ?`).all(messageId, afterId, limit) as MessageRow[]).map(fromRow)
       : []);
   }
@@ -515,12 +537,12 @@ export class MsgStore {
     if (!Number.isSafeInteger(messageId) || messageId < 1) throw new Error('message ID must be a positive integer');
     validCursor(after);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
-    return this.readWithSchema(hasReplyTo => {
+    return this.readWithSchema((hasReplyTo, _groups, hasProvenance) => {
       const target = this.db.query(`SELECT id, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'} FROM msg_messages WHERE id = ?`)
         .get(messageId) as { id: number; reply_to: number | null } | null;
       if (target === null) throw new Error(`message not found: #${messageId}`);
       const rootId = target.reply_to ?? target.id;
-      const rows = this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
+      const rows = this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at, ${hasProvenance ? 'provenance_json' : 'NULL AS provenance_json'} FROM msg_messages
         WHERE id > ? AND (id = ? ${hasReplyTo ? 'OR reply_to = ?' : ''}) ORDER BY id ASC LIMIT ?`)
         .all(...(hasReplyTo ? [after, rootId, rootId, limit] : [after, rootId, limit])) as MessageRow[];
       return rows.map(fromRow);
@@ -535,7 +557,7 @@ export class MsgStore {
   listAfter(after: number, limit: number = 1000): Message[] {
     validCursor(after);
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('limit must be between 1 and 1000');
-    return this.readWithSchema(hasReplyTo => (this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
+    return this.readWithSchema((hasReplyTo, _groups, hasProvenance) => (this.db.query(`SELECT id, sender, recipient, body, kind, ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at, ${hasProvenance ? 'provenance_json' : 'NULL AS provenance_json'} FROM msg_messages
       WHERE id > ? ORDER BY id ASC LIMIT ?`).all(after, limit) as MessageRow[]).map(fromRow));
   }
 
@@ -544,8 +566,8 @@ export class MsgStore {
     const startMs = Date.parse(start);
     const endMs = Date.parse(end);
     if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) throw new Error('invalid message time window');
-    return this.readWithSchema(hasReplyTo => (this.db.query(`SELECT id, sender, recipient, body, kind,
-      ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at FROM msg_messages
+    return this.readWithSchema((hasReplyTo, _groups, hasProvenance) => (this.db.query(`SELECT id, sender, recipient, body, kind,
+      ${hasReplyTo ? 'reply_to' : 'NULL AS reply_to'}, created_at, ${hasProvenance ? 'provenance_json' : 'NULL AS provenance_json'} FROM msg_messages
       WHERE created_at >= ? AND created_at < ? ORDER BY id ASC`).all(new Date(startMs).toISOString(), new Date(endMs).toISOString()) as MessageRow[]).map(fromRow));
   }
 

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import * as setupLinkTokens from './setup-link-tokens.js';
-import { claimCredentialRegistrationLinkToken, claimSetupLinkToken, consumeCredentialRegistrationBearer, issueCredentialRegistrationLinkToken, issueSetupLinkToken, matchSetupBearer, revokeCredentialRegistrationLinkToken, SETUP_LINK_TTL_MS } from './setup-link-tokens.js';
+import { claimCredentialRegistrationLinkToken, claimSetupLinkToken, commitCredentialRegistrationBearer, consumeCredentialRegistrationBearer, credentialRegistrationCompleted, issueCredentialRegistrationLinkToken, issueSetupLinkToken, matchSetupBearer, revokeCredentialRegistrationLinkToken, SETUP_LINK_TTL_MS } from './setup-link-tokens.js';
 import { issueTempToken, matchTempToken } from './temp-tokens.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
@@ -93,6 +93,26 @@ describe('setup-link token storage and claim', () => {
       .toEqual({ ok: false, reason: 'expired' });
     expect(store()).not.toContain(link.token);
     expect(store()).not.toContain(claimed.bearer);
+  });
+
+  test('OpenRouter phone link is complete only after its own verified credential commit', () => {
+    const oldValue = 'old-openrouter-key';
+    const freshValue = 'new-openrouter-key';
+    const link = issueCredentialRegistrationLinkToken('cred:openrouter.api_key', { now });
+    expect(credentialRegistrationCompleted(link.token, 'cred:openrouter.api_key', { dir })).toBe(false);
+    const claimed = claimCredentialRegistrationLinkToken(link.token, { now: now + 1 });
+    if (!claimed.ok) throw new Error('expected OpenRouter link claim');
+    expect(credentialRegistrationCompleted(link.token, 'cred:openrouter.api_key', { dir })).toBe(false);
+    expect(consumeCredentialRegistrationBearer(claimed.bearer, claimed.slot, { now: now + 2, submissionValue: freshValue }))
+      .toEqual({ ok: true, slot: 'cred:openrouter.api_key' });
+    expect(credentialRegistrationCompleted(link.token, 'cred:openrouter.api_key', { dir })).toBe(false);
+    let saved = oldValue;
+    expect(commitCredentialRegistrationBearer(claimed.bearer, claimed.slot, freshValue,
+      () => { saved = freshValue; }, { dir, now: now + 3 })).toEqual({ ok: true });
+    expect(saved).toBe(freshValue);
+    expect(credentialRegistrationCompleted(link.token, 'cred:openrouter.api_key', { dir })).toBe(true);
+    expect(credentialRegistrationCompleted(link.token, 'cred:openai.api_key', { dir })).toBe(false);
+    expect(credentialRegistrationCompleted('els_' + 'A'.repeat(43), 'cred:openrouter.api_key', { dir })).toBe(false);
   });
 
   test('credential claim checks expiry after waiting for the token-store lock', async () => {

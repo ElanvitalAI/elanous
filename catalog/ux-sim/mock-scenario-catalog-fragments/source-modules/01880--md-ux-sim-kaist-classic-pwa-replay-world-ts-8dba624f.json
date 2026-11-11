@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-KAIST-CLASSIC-PWA-REPLAY-WORLD-TS",
+  "path": "src/ux-sim/kaist-classic-pwa-replay-world.ts",
+  "boundary": "Maps a captured fake-member classic PTY receipt to the PWA's existing local Nexus API response contracts; no production Nexus or external API is called.",
+  "deviceIds": ["kaist-classic-pwa-browser-replay"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "CQRS·이벤트 소싱 — 읽기 모델 분리(CQRS)",
+  "source": "https://microservices.io/patterns/data/cqrs.html",
+  "body": "적용 시점: 쓰기 모델과 읽기 질의가 서로 다른 부하·형태로 진화할 때.\n용량 단계: 한 저장 모델로 버티는 동안은 분리하지 않는다; 읽기 병목이나 모델 복잡성이 실측되면 projection을 분리한다.\nGCP 대응: Cloud SQL 쓰기 모델 + Pub/Sub 이벤트 + BigQuery/Firestore 등 읽기 모델은 요구된 일관성으로 선택한다.\n비용 축: 중복 읽기 저장소, 이벤트 전송, projection 컴퓨트와 데이터 복제가 비용 축이다.\n결정과 반증: projection 지연·재구축 비용·읽기 정합성 허용 범위를 먼저 측정한다."
+}

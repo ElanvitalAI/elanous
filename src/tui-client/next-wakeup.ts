@@ -16,7 +16,7 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 //   인지 = 예약 시각 도래 ∧ 문 판정(NotIdle · HumanTyping …)
 //   힐링 = 문이 열리면 next 가 내부 턴 한 번 · 바쁘면 1분마다 미룸(상한 30분) · 끝내 못 열면 «⏰ 예약 깨움 놓침» 한 줄
 
-import { createInternalTurnGate, formatInternalTurnBanner, isInternalTurnEnabledByEnv, type InternalTurnGate, type InternalTurnRequest } from '../dashboard/input/internal-turn.js';
+import { createInternalTurnGate, formatInternalTurnBanner, isInternalTurnEnabledByEnv, type InternalTurnGate, type InternalTurnRequest } from '../tui/input/internal-turn.js';
 
 import type { LLMToolDef, PluginContext } from '../plugins/core/types.js';
 import {

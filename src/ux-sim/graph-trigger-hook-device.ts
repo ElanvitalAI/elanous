@@ -95,7 +95,7 @@ export function createGraphTriggerHookDevice(source: string, options: {
   let activeRunId: string | undefined;
   const initialRunningSnapshots = new Map<string, GraphRunState>();
   return {
-    root, graphPath, stateRoot, events, calls,
+    root, graphPath, stateRoot, events, calls, eventBus: bus,
     now: () => new Date(clock),
     advanceTo(value: string) { clock = new Date(value); },
     async fire(ingress: GraphSimIngress, input?: Record<string, unknown>, runId?: string): Promise<GraphRunState> {

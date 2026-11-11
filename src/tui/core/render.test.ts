@@ -172,6 +172,9 @@ test('Next history hides internal child-agent polling while classic history rema
     internal('Agent', 'Agent started: child-2'),
     internal('Agent', 'Agent completed: 42'),
     internal('Agent', 'Agent completed: analysis follows\nsubstantive result tail'),
+    internal('Agent', '{"output":"(running in background — taskId=child-3)","background":true}'),
+    internal('Agent', '(running in background — taskId=child-4)'),
+    internal('Agent', JSON.stringify({ output: '(running in background — taskId=child-5)\nsubstantive result tail after dispatch' })),
     internal('Agent', ''),
     internal('AgentOutput', '{"taskId":"child-1","state":"done","output":"child result secret"}'),
     internal('AgentList', '{"tasks":["child-1"]}'),
@@ -217,6 +220,10 @@ test('Next history hides internal child-agent polling while classic history rema
   expect(screen).toContain('Agent child error despite lifecycle output');
   expect(screen).toContain('substantive answer survives empty error');
   expect(screen).toContain('substantive result tail');
+  expect(screen).toContain('substantive result tail after dispatch');
+  expect(screen.match(/running in background/g)?.length).toBe(1); // Source: the one fixture with a substantive result tail remains visible.
+  expect(screen).not.toContain('child-3');
+  expect(screen).not.toContain('child-4');
   expect(screen).not.toContain('child result secret');
   expect(screen).toContain('AgentOutput failure visible');
   expect(screen).toContain('AgentList failure visible');

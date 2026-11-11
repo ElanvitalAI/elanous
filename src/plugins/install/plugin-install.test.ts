@@ -47,6 +47,53 @@ describe('plugin installation', () => {
     expect(listInstalledPlugins(root)).toEqual([]);
   });
 
+  test('declared plugin dependency requires an installed exact version before the candidate is committed', async () => {
+    const root = fixture();
+    const base = packageAt(join(root, 'base'), 'base-plugin', '1.0.0');
+    const dependent = packageAt(join(root, 'dependent'), 'dependent-plugin', '1.0.0');
+    const declare = (requirements: string[]) => {
+      const path = join(dependent, 'plugin.json');
+      const manifest = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+      writeFileSync(path, JSON.stringify({ ...manifest, dependencies: { plugins: requirements } }));
+    };
+    declare(['base-plugin@2.0.0']);
+    await expect(installPlugin(dependent, { root, yes: true })).rejects.toMatchObject({
+      reason: 'conflict', message: 'required plugin not installed: base-plugin@2.0.0',
+    });
+    expect(listInstalledPlugins(root)).toEqual([]);
+
+    await installPlugin(base, { root, yes: true });
+    await expect(installPlugin(dependent, { root, yes: true })).rejects.toMatchObject({
+      reason: 'conflict', message: 'required plugin not installed: base-plugin@2.0.0',
+    });
+    declare(['base-plugin@1.0.0']);
+    const installed = await installPlugin(dependent, { root, yes: true });
+    expect(installed.name).toBe('dependent-plugin');
+    expect(listInstalledPlugins(root).map(item => item.name)).toEqual(['base-plugin', 'dependent-plugin']);
+  });
+
+  test('declared transitive dependency is checked after an earlier plugin is removed', async () => {
+    const root = fixture();
+    const base = packageAt(join(root, 'base'), 'base-plugin', '1.0.0');
+    const middle = packageAt(join(root, 'middle'), 'middle-plugin', '1.0.0');
+    const top = packageAt(join(root, 'top'), 'top-plugin', '1.0.0');
+    const declare = (path: string, requirement: string) => {
+      const manifest = JSON.parse(readFileSync(join(path, 'plugin.json'), 'utf8')) as Record<string, unknown>;
+      writeFileSync(join(path, 'plugin.json'), JSON.stringify({ ...manifest, dependencies: { plugins: [requirement] } }));
+    };
+    declare(middle, 'base-plugin');
+    declare(top, 'middle-plugin');
+    const installedBase = await installPlugin(base, { root, yes: true });
+    await installPlugin(middle, { root, yes: true });
+    expect(() => removePlugin('base-plugin', root)).toThrow('required by installed plugin');
+    // Simulate an external filesystem deletion that bypassed removePlugin; the next install must still reject the broken chain.
+    rmSync(installedBase.path, { recursive: true, force: true });
+    await expect(installPlugin(top, { root, yes: true })).rejects.toMatchObject({
+      reason: 'conflict', message: 'required plugin not installed: base-plugin@*',
+    });
+    expect(listInstalledPlugins(root).map(item => item.name)).toEqual(['middle-plugin']);
+  });
+
   test('registered nodes come from valid staged node definitions, not vocab; timestamp survives ledger writes and legacy rows stay undated', async () => {
     const root = fixture();
     const pkg = packageAt(join(root, 'source'));

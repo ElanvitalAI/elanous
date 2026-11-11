@@ -18,12 +18,99 @@ export function listInstalledPacks(store: Pick<KgsSqliteStore, 'listPacksByKind'
   return PACK_KINDS.flatMap(kind => store.listPacksByKind(kind).map(pack => ({ id: packIdString(pack.metadata.id), title: pack.metadata.title })));
 }
 
+export interface KnowledgePackCandidate { id: string; title: string }
+
+export type InstalledKnowledgePackDecision =
+  | { kind: 'selected'; pack: KnowledgePackCandidate; priority: number; intentTags: string[] }
+  | { kind: 'ambiguous'; candidates: KnowledgePackCandidate[]; priority: number; intentTags: string[] }
+  | { kind: 'none' };
+
+/** Rank installed packs by searchable metadata; equal top tag/score matches need a user choice. */
+export function resolveInstalledKnowledgePack(
+  question: string,
+  store: Pick<KgsSqliteStore, 'listPacksByKind'> = kgsStoreSingleton(),
+): InstalledKnowledgePackDecision {
+  const queryTerms = searchTerms(question);
+  if (queryTerms.size === 0) return { kind: 'none' };
+
+  const ranked: Array<{ pack: KnowledgePackCandidate; priority: number; intentTags: string[] }> = [];
+  for (const kind of PACK_KINDS) {
+    for (const pack of store.listPacksByKind(kind)) {
+      const metadataTerms = searchTerms([
+        pack.metadata.id.slug,
+        pack.metadata.title,
+        pack.metadata.intent,
+        ...pack.metadata.tags,
+      ].join(' '));
+      const priority = [...queryTerms].filter(term => metadataTerms.has(term)).length;
+      if (priority === 0) continue;
+      const intentTags = pack.metadata.tags
+        .filter(tag => [...searchTerms(tag)].some(term => queryTerms.has(term)))
+        .map(tag => tag.trim().toLocaleLowerCase())
+        .sort((a, b) => a.localeCompare(b));
+      ranked.push({ pack: { id: packIdString(pack.metadata.id), title: pack.metadata.title }, priority, intentTags });
+    }
+  }
+  if (ranked.length === 0) return { kind: 'none' };
+  ranked.sort((a, b) => b.priority - a.priority || a.pack.id.localeCompare(b.pack.id));
+  const top = ranked.filter(candidate => candidate.priority === ranked[0]!.priority);
+  if (top.length === 1) {
+    const best = top[0]!;
+    return { kind: 'selected', pack: best.pack, priority: best.priority, intentTags: best.intentTags };
+  }
+  const [first, second] = top;
+  const sameIntentTags = !!second && first!.intentTags.length > 0
+    && second.intentTags.join('\0') === first!.intentTags.join('\0');
+  if (sameIntentTags) {
+    return { kind: 'ambiguous', candidates: [first!.pack, second!.pack],
+      priority: first!.priority, intentTags: first!.intentTags };
+  }
+  return { kind: 'none' };
+}
+
+/** Compatibility helper for callers that only accept a unique winner. */
+export function selectInstalledKnowledgePack(
+  question: string,
+  store: Pick<KgsSqliteStore, 'listPacksByKind'> = kgsStoreSingleton(),
+): KnowledgePackCandidate | null {
+  const decision = resolveInstalledKnowledgePack(question, store);
+  return decision.kind === 'selected' ? decision.pack : null;
+}
+
+function searchTerms(text: string): Set<string> {
+  const ignored = new Set([
+    'a', 'an', 'and', 'architecture', 'build', 'can', 'could', 'create', 'design', 'do', 'does', 'for', 'help', 'how', 'i', 'make', 'me', 'need', 'of', 'or', 'please', 'service', 'should', 'system', 'the', 'to', 'want',
+    'what', 'when', 'where', 'which', 'who', 'why',
+    '가정', '가정해줘', '누구', '무슨', '무엇', '뭐', '방법', '설계', '설계하', '설계해', '설계해줘', '설계해주세요', '설계하는', '설계할', '설계하기', '시스템', '사용자', '어디', '어떻게', '어느', '어떤', '언제', '왜', '핵심', '해줘', '해줘.', '동시', '제약',
+  ]);
+  const koreanParticles = [
+    '으로부터', '에서부터', '에게서는', '한테서는', '에서는', '으로는', '으로도', '에게는', '한테는',
+    '에게서', '한테서', '에서', '에게', '한테', '으로', '까지', '부터', '처럼', '보다', '께서',
+    '은', '는', '이', '가', '을', '를', '와', '과', '에', '로', '의', '도', '만', '랑', '께',
+  ];
+  const tokens = text.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  const candidates = new Set(tokens);
+  for (const token of tokens) {
+    let normalized = token;
+    while (true) {
+      const particle = koreanParticles.find(suffix => normalized.endsWith(suffix));
+      if (!particle || normalized.length - particle.length < 2) break;
+      normalized = normalized.slice(0, -particle.length);
+      candidates.add(normalized);
+    }
+  }
+  return new Set([...candidates]
+    // Source: single-character Korean particles and fragments are not stable pack-topic terms.
+    .filter(term => term.length > 1 && !ignored.has(term)));
+}
+
 export function queryInstalledPack(packId: string, question: string, store: Pick<KgsSqliteStore, 'readPack'> = kgsStoreSingleton()): Array<{ id: string; title: string; body: string; ref: string; updatedAt: string }> {
   const id = parsePackIdString(packId);
   if (!id) throw new Error(`invalid pack id: ${packId}`);
   const pack = store.readPack(id.slug, id.version);
   if (!pack) throw new Error(`pack not installed: ${packId}`);
-  const words = question.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  const words = [...searchTerms(question)];
+  if (question.trim() && words.length === 0) return [];
   return pack.cards.map(card => ({ card, score: words.filter(word => `${card.title} ${card.body}`.toLocaleLowerCase().includes(word)).length }))
     .filter(hit => hit.score > 0 || words.length === 0)
     .sort((a, b) => b.score - a.score || a.card.id.localeCompare(b.card.id))

@@ -826,7 +826,7 @@ describe('runAcpForeignTurnObserver — CV-1 cross-surface mirror', () => {
     const dispose = runAcpForeignTurnObserver(acp, 'sess-boundary-compat', {
       onPlaceholder: () => `ph-${finalized.length}`,
       onPartialBlocks: () => {},
-      onFinalize: (id, info) => { finalized.push({ id, stopReason: info.stopReason }); },
+      onFinalize: (id, info) => { finalized.push({ id, stopReason: info!.stopReason }); },
     });
     emit(chunkUpdate('sess-boundary-compat', { sessionUpdate: 'elanous_turn_begin' }));
     emit(chunkUpdate('sess-boundary-compat', { sessionUpdate: 'elanous_turn_end', text: 'legacy', stopReason: 'end_turn' }));

@@ -1,0 +1,42 @@
+{
+  "id": "kaist-classic-pwa-browser-replay",
+  "name": "KAIST classic PTY to static PWA browser replay",
+  "audience": "internal",
+  "checklistCells": ["KAIST-PWA-REPLAY-RECEIPT", "KCB-PWA-REPLAY-TICKET-SCENARIO"],
+  "implementation": [
+    "src/ux-sim/kaist-classic-pwa-replay-world.ts",
+    "src/ux-sim/kaist-classic-pwa-browser-replay.ts",
+    "src/ux-sim/fixtures/kaist-classic-pty-receipt.json",
+    "src/ux-sim/fixtures/kcb-ticket-classic-pty-receipt.json",
+    "src/ux-sim/fixtures/kcb-ticket-requirements-mapping.json",
+    "src/dashboard/plugin-route-adapter.test.ts"
+  ],
+  "tests": [
+    "src/ux-sim/kaist-classic-pwa-replay-world.test.ts",
+    "src/ux-sim/kaist-classic-pwa-browser-replay.test.ts",
+    "src/dashboard/plugin-route-adapter.test.ts"
+  ],
+  "target": "Replays one real fake-member classic PTY absorb-build receipt through fixed loopback Nexus API responses and a built static PWA, then captures browser receipts for scenes 2, 3, 5, and 6 with the source build runId preserved.",
+  "inputs": [
+    "captured KAIST_KCB_RECEIPTS or KCB_TICKET_RECEIPTS output from the classic PTY graph route test",
+    "static PWA export built from the current checkout",
+    "fake member owner, briefing, suggestion, board, graph-run, and app-artifact fields from the PTY receipt"
+  ],
+  "observations": [
+    "scenes 2 and 3 retain the shared briefing runId from the classic PTY output",
+    "scenes 5 and 6 retain the shared absorb-build runId and matching graph, board card, result URL, and attachment SHA-256",
+    "real headless Chromium renders each expected screen and saves a PNG plus JSON receipt",
+    "API fixtures bind only to the captured fake member; unknown API paths fail closed and external requests fail the replay",
+    "KCB ticketing receipt records briefing/acceptance/capacity contract mapping; fields absent from actual PTY output stay marked missing"
+  ],
+  "entryCommands": [
+    "bun test src/dashboard/plugin-route-adapter.test.ts -t \"classic dashboard PTY carries KAIST scenes 1–6\"",
+    "CLASSIC_TICKET_SCENARIO=1 ELANOUS_TRACK=OP bun test src/dashboard/plugin-route-adapter.test.ts -t \"classic dashboard PTY carries KAIST scenes 1–6\"",
+    "ELANOUS_TRACK=OP bun bin/elanous.mjs nexus build --cwd apps/pwa",
+    "ELANOUS_REMOTE_HOST=node-b CHROME_BIN=\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" bun test src/ux-sim/kaist-classic-pwa-replay-world.test.ts src/ux-sim/kaist-classic-pwa-browser-replay.test.ts",
+    "KAIST_CLASSIC_PTY_RECEIPT_PATH=src/ux-sim/fixtures/kcb-ticket-classic-pty-receipt.json ELANOUS_REMOTE_HOST=node-b CHROME_BIN=\"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" bun test src/ux-sim/kaist-classic-pwa-replay-world.test.ts src/ux-sim/kaist-classic-pwa-browser-replay.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

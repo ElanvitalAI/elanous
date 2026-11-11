@@ -39,7 +39,7 @@ test('small next TUI shows the selected slash row and ignores Tab while the pick
     }
   };
   try {
-    expect((await waitFor('Ctrl+Q 종료')).split('\n')).toContain(NEXT_TUI_TITLE);
+    expect((await waitFor('Enter 전송')).split('\n')).toContain(NEXT_TUI_TITLE);
     pty.write('/mo');
     expect(await waitFor('▸ /model')).toContain('❯ /mo');
     pty.write('\x1b[B');

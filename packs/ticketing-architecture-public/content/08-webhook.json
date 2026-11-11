@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "웹훅 재전송과 순서",
+  "source": "https://docs.stripe.com/webhooks",
+  "body": "서명 검증 후 event_id로 중복을 제거한다. 이벤트 도착 순서 보장을 가정하지 않고 PG 객체의 현재 상태를 조회해 원장 전이를 결정한다. 2xx 응답 전에 지속 저장 여부를 정하고 재전송/수동 재처리/늦은 성공을 시험한다."
+}

@@ -1,6 +1,6 @@
 import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -62,6 +62,87 @@ test('post reads piped stdin, accepts literal body and kind; human and JSON outp
   f.stdout.length = 0;
   await f.run('post', '--body', 'from flag', '--from', 'OP', '--to', 'MK', '--json');
   expect(JSON.parse(f.stdout[0]!).body).toBe('from flag');
+});
+
+test('post reads --body-file and explicit stdin without evaluating literal backticks', async () => {
+  const f = fixture('stdin `bun test`', ({ path }) => ({ registerLogSink: async () => undefined }));
+  const bodyPath = join(dirname(f.path), 'report.txt');
+  writeFileSync(bodyPath, 'file `bun install`\nsecond line');
+  await f.run('post', '--from', 'OP', '--to', 'MK', '--body-file', bodyPath, '--json');
+  await f.run('post', '--from', 'OP', '--to', 'MK', '--body-file', '-', '--json');
+  const store = f.store();
+  try { expect(store.list('MK').map(row => row.body)).toEqual(['file `bun install`\nsecond line', 'stdin `bun test`']); }
+  finally { store.close(); }
+  expect(f.stderr.filter(line => line.includes('msg post 경고: 백틱이 포함됨'))).toHaveLength(2);
+});
+
+test('post warns when shell substitution has erased command names from a report', async () => {
+  const f = fixture();
+  const fakeBin = join(dirname(f.path), 'fake-bin');
+  const trace = join(dirname(f.path), 'shell-trace.txt');
+  mkdirSync(fakeBin);
+  writeFileSync(join(fakeBin, 'bun'), '#!/bin/sh\nprintf "%s\\n" "$1" >> "$MSG_GUARD_TRACE"\n');
+  chmodSync(join(fakeBin, 'bun'), 0o755);
+  const shell = spawnSync('/bin/sh', ['-c', 'printf "%s" "mbp에서 `bun install` 와 `bun test` 실행; install=, test="'], {
+    encoding: 'utf8', env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}`, MSG_GUARD_TRACE: trace },
+  });
+  expect(shell.status).toBe(0);
+  expect(readFileSync(trace, 'utf8')).toBe('install\ntest\n');
+  await f.run('post', '--from', 'OP', '--to', 'MK', '--body', shell.stdout, '--json');
+  expect(f.stderr.some(line => line.includes('문장 중간 연속 공백'))).toBe(true);
+  expect(f.stderr.some(line => line.includes('빈 값 패턴'))).toBe(true);
+  const store = f.store();
+  try { expect(store.list('MK')[0]?.body).toBe('mbp에서  와  실행; install=, test='); }
+  finally { store.close(); }
+});
+
+test('post warns for a Unicode empty value and mixed interior whitespace', async () => {
+  const f = fixture();
+  await f.run('post', '--from', 'OP', '--to', 'MK', '--body', '상태=, 다음', '--json');
+  expect(f.stderr.some(line => line.includes('빈 값 패턴'))).toBe(true);
+  f.stderr.length = 0;
+  await f.run('post', '--from', 'OP', '--to', 'MK', '--body', 'cafe\u0301=, 다음', '--json');
+  expect(f.stderr.some(line => line.includes('빈 값 패턴'))).toBe(true);
+  for (const separator of ['\u2028', '\u2029']) {
+    f.stderr.length = 0;
+    await f.run('post', '--from', 'OP', '--to', 'MK', '--body', `상태=${separator}다음`, '--json');
+    expect(f.stderr.some(line => line.includes('빈 값 패턴'))).toBe(true);
+  }
+  f.stderr.length = 0;
+  await f.run('post', '--from', 'OP', '--to', 'MK', '--body', '앞  \t뒤', '--json');
+  expect(f.stderr.some(line => line.includes('문장 중간 연속 공백'))).toBe(true);
+  const store = f.store();
+  try { expect(store.list('MK').map(row => row.body)).toEqual(['상태=, 다음', 'cafe\u0301=, 다음', '상태=\u2028다음', '상태=\u2029다음', '앞  \t뒤']); }
+  finally { store.close(); }
+});
+
+test('post scans a long body without repeatedly searching each key suffix', async () => {
+  const f = fixture();
+  const longKey = '가'.repeat(200_000); // Source: regression input exceeds ordinary seat reports by several orders of magnitude.
+  const bodyPath = join(dirname(f.path), 'long-report.txt');
+  writeFileSync(bodyPath, `${longKey}=,`);
+  await f.run('post', '--from', 'OP', '--to', 'MK', '--body-file', bodyPath, '--json');
+  expect(f.stderr.some(line => line.includes('빈 값 패턴'))).toBe(true);
+  f.stderr.length = 0;
+  await f.run('post', '--from', 'OP', '--to', 'MK', '--body', longKey, '--json');
+  expect(f.stderr.some(line => line.includes('빈 값 패턴'))).toBe(false);
+});
+
+test('post rejects an ambiguous body source before saving', async () => {
+  const f = fixture();
+  const bodyPath = join(dirname(f.path), 'report.txt');
+  writeFileSync(bodyPath, 'report');
+  for (const args of [
+    ['post', '--from', 'OP', '--to', 'MK', '--body', 'inline', '--body-file', bodyPath],
+    ['post', '-', '--from', 'OP', '--to', 'MK', '--body-file', bodyPath],
+    ['post', '-', '--from', 'OP', '--to', 'MK', '--body', 'inline'],
+  ]) {
+    await f.run(...args);
+    expect(f.stderr.at(-1)).toContain('provide body once');
+  }
+  const store = f.store();
+  try { expect(store.list('MK')).toEqual([]); }
+  finally { store.close(); }
 });
 
 test('msg hook CLI derives seat from cwd, loads unread messages, and emits no duplicate bundle', async () => {

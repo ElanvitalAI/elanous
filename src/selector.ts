@@ -18,7 +18,7 @@ import { getLocalSkills, executeSync } from './sync.js';
 import { getAllSnapshots } from './db.js';
 import chalk from 'chalk';
 import { C, ICONS, ansi, initTui, closeTui, readKey, render, termSize, pad, truncate, visibleWidth, timeSince, hLine, showHelp } from './tui.js';
-import { dashboardCanUseTty, dashboardTtyRefusalMessage } from './dashboard/tty-required.js';
+import { dashboardCanUseTty, dashboardTtyRefusalMessage } from './terminal/tty-required.js';
 import type { SyncMode, SkillSnapshot, SyncEntry } from './types.js';
 
 const MODES: { id: SyncMode; label: string; color: (s: string) => string }[] = [

@@ -62,7 +62,7 @@ describe('onboarding first-run menu device', () => {
     expect(FIRST_RUN_MENU_MARKERS).toEqual(['Choose LLM', '처음 실행 LLM 설정']);
     expect(FIRST_RUN_MENU_CHOICE_MARKERS).toEqual([
       '1 Codex, 2 Grok, 3 Claude, 4 OpenRouter, 5 GLM',
-      '1 Codex 구독 로그인 · 2 API 키 입력 · Enter 건너뛰기',
+      '1 Codex 구독 로그인 (권장) · 2 OpenRouter 내 키 사용 · 3 기타 API 키 입력 · Enter 건너뛰기',
     ]);
   });
 

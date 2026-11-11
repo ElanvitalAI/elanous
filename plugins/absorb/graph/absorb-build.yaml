@@ -12,31 +12,109 @@ nodes:
       id: "$input.suggestionId"
       owner: "$context.memberId"
       ownerScoped: true
+  - id: board-building
+    type: capability
+    requires: store.events@1
+    with:
+      operation: append
+      memberId: "$context.memberId"
+      event:
+        type: board.card
+        cardId: "$input.suggestionId"
+        memberId: "$context.memberId"
+        state: building
+        title: "$lookup-suggestion.evidence.suggestion.ask"
+        summary: 앱 빌드 시작
+        runId: "$context.runId"
+        at: "$context.nodeStartedAt"
   - id: build
     type: make
     call: verb-make@^1
     skill: absorb/build
     uses: [llm-judge]
     with: { ask: "$lookup-suggestion.evidence.suggestion.ask" }
-    contract: { inputs: [ask, context, prior], tools: read-only, outputs: [result, evidence] }
+    contract:
+      inputs: [ask, context, prior]
+      tools: read-only
+      outputs: [result, evidence]
+      output_schema:
+        type: object
+        required: [result, evidence]
+        properties:
+          result:
+            type: object
+            required: [artifact, service, capacityAssumption]
+            properties:
+              artifact: { type: object }
+              service: { type: string }
+              capacityAssumption:
+                type: object
+                required: [concurrentUsers, rationale, source, userSpecified]
+                properties:
+                  concurrentUsers: { type: integer }
+                  rationale: { type: string }
+                  source: { type: string }
+                  userSpecified: { type: boolean }
+          evidence: { type: object }
+    post:
+      - "result.service != ''"
+      - "result.capacityAssumption.concurrentUsers > 0"
+      - "result.capacityAssumption.rationale != ''"
     budget: { inner_steps: 2 }
   - id: simulate
     type: app-publish
     requires: app-publish.action@1
     with: { action: simulate, isolated: true, requireOwner: "$context.memberId", suggestion: "$lookup-suggestion.evidence.suggestion", artifact: "$build.evidence.artifact" }
+  - id: board-testing
+    type: capability
+    requires: store.events@1
+    with:
+      operation: append
+      memberId: "$context.memberId"
+      event:
+        type: board.card
+        cardId: "$input.suggestionId"
+        memberId: "$context.memberId"
+        state: testing
+        title: "$lookup-suggestion.evidence.suggestion.ask"
+        summary: 앱 격리 시험 통과
+        runId: "$context.runId"
+        at: "$context.nodeStartedAt"
   - id: approve-publish
     type: hitl
     hitl: { options: [{ key: y, exit: approved }, { key: N, exit: rejected, default: true }] }
   - id: publish
     type: app-publish
     requires: app-publish.action@1
-    with: { action: publish, isolated: true, owner: "$context.memberId", requireOwner: "$context.memberId", requirePassingReceipt: true, receipt: "$simulate.evidence.receipt", artifact: "$build.evidence.artifact" }
+    with: { action: publish, isolated: true, owner: "$context.memberId", requireOwner: "$context.memberId", requirePassingReceipt: true, receipt: "$simulate.evidence.receipt", artifact: "$build.evidence.artifact", service: "$build.result.service", capacityAssumption: "$build.result.capacityAssumption" }
+  - id: board-deployed
+    type: capability
+    requires: store.events@1
+    with:
+      operation: append
+      memberId: "$context.memberId"
+      event:
+        type: board.card
+        cardId: "$input.suggestionId"
+        memberId: "$context.memberId"
+        state: released
+        title: "$lookup-suggestion.evidence.suggestion.ask"
+        summary: 앱 배포 완료
+        runId: "$context.runId"
+        result:
+          publicUrl: "$publish.result.resultUrl"
+          resultUrl: "$publish.result.resultUrl"
+        attachments: "$input.attachments"
+        at: "$context.nodeStartedAt"
 edges:
-  - { from: lookup-suggestion, on: outcome, map: { done: build, failed: failed } }
+  - { from: lookup-suggestion, on: outcome, map: { done: board-building, failed: failed } }
+  - { from: board-building, on: outcome, map: { ok: build, fail: failed, failed: failed } }
   - { from: build, on: outcome, map: { done: simulate, rework: build, needs-human: failed, failed: failed } }
-  - { from: simulate, on: outcome, map: { done: approve-publish, failed: failed } }
+  - { from: simulate, on: outcome, map: { done: board-testing, failed: failed } }
+  - { from: board-testing, on: outcome, map: { ok: approve-publish, fail: failed, failed: failed } }
   - { from: approve-publish, on: outcome, map: { approved: publish, rejected: failed } }
-  - { from: publish, on: outcome, map: { done: done, failed: failed } }
+  - { from: publish, on: outcome, map: { done: board-deployed, failed: failed } }
+  - { from: board-deployed, on: outcome, map: { ok: done, fail: failed, failed: failed } }
 terminal: [done, failed]
 observe: { categories: [graph.run, graph.unit, app-publish] }
 sims: [sims/absorb-demo-world.yaml]

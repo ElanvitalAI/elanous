@@ -49,3 +49,41 @@ export async function loadDeclaredPluginHandler<T extends (...args: never[]) => 
   if (typeof handler !== 'function') throw new Error(`plugin handler export missing: ${handlerName}`);
   return handler as T;
 }
+
+function declaredPluginHttpGetHandler(pluginsRoot: string, pathname: string): string | null {
+  if (!existsSync(pluginsRoot)) return null;
+  const matches: string[] = [];
+  for (const entry of readdirSync(pluginsRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const manifestPath = join(pluginsRoot, entry.name, 'plugin.yaml');
+    if (!existsSync(manifestPath)) continue;
+    let raw: unknown;
+    try { raw = parseYaml(readFileSync(manifestPath, 'utf8')); }
+    catch { continue; }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const declaration = (raw as Record<string, unknown>).httpGet;
+    if (!declaration || typeof declaration !== 'object' || Array.isArray(declaration)) continue;
+    const { path, handler } = declaration as Record<string, unknown>;
+    if (typeof path !== 'string' || !/^\/v1\/[a-z][a-z0-9-]*$/.test(path)
+      || typeof handler !== 'string' || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(handler)) {
+      throw new Error(`invalid plugin httpGet declaration: ${manifestPath}`);
+    }
+    if (path === pathname) matches.push(handler);
+  }
+  if (matches.length === 0) return null;
+  if (matches.length !== 1) throw new Error(`ambiguous plugin GET route: ${pathname}`);
+  return matches[0]!;
+}
+
+/** A manifest route may enter the operator proxy auth gate without a feature path in core. */
+export function hasDeclaredPluginHttpGet(pluginsRoot: string, pathname: string): boolean {
+  return declaredPluginHttpGetHandler(pluginsRoot, pathname) !== null;
+}
+
+/** Resolve manifest-declared read-only plugin endpoints without teaching core feature paths. */
+export async function loadDeclaredPluginHttpGet<T extends (req: Request, context: { operator: boolean }) => Response | Promise<Response>>(
+  pluginsRoot: string, pathname: string,
+): Promise<T | null> {
+  const handler = declaredPluginHttpGetHandler(pluginsRoot, pathname);
+  return handler ? loadDeclaredPluginHandler<T>(pluginsRoot, handler) : null;
+}

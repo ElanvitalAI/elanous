@@ -14,6 +14,7 @@ import {
   CODEX_DEVICE_USERCODE_URL, CODEX_DEVICE_TOKEN_URL, CODEX_OAUTH_TOKEN_URL,
 } from '../src/oauth/codex';
 import { loadTokens } from '../src/oauth/store';
+import { installCodexOwnerTestWorld } from './fixtures/codex-owner-test-world.js';
 
 type Call = { url: string; body: any; contentType?: string };
 
@@ -38,12 +39,16 @@ function makeFetch(responder: (call: Call) => { status: number; json: any }): { 
 }
 
 let root: string;
+let restoreCodexWorld: (() => void) | undefined;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'oauth-codex-'));
   process.env.XDG_CONFIG_HOME = root;
   process.env.CODEX_HOME = join(root, 'codex-home');
+  restoreCodexWorld = installCodexOwnerTestWorld(root);
 });
 afterEach(() => {
+  restoreCodexWorld?.();
+  restoreCodexWorld = undefined;
   rmSync(root, { recursive: true, force: true });
   delete process.env.XDG_CONFIG_HOME;
   delete process.env.CODEX_HOME;

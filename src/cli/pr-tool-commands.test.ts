@@ -12,7 +12,7 @@ test('pr command list snapshot keeps queue, land, and granularity beside the new
   const pr = root.commands.find(command => command.name() === 'pr');
   expect(pr?.commands.map(command => command.name())).toEqual(['supersede-drafts', 'lineage', 'census', 'open-guard', 'queue', 'land', 'granularity']);
   expect(pr?.commands.find(command => command.name() === 'queue')?.commands.map(command => command.name()))
-    .toEqual(['status', 'enqueue', 'run']);
+    .toEqual(['status', 'enqueue', 'train-event', 'run']);
 });
 
 test('read-only open-guard reports unknown without spending the new-PR allowance', async () => {

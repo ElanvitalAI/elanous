@@ -1,5 +1,25 @@
 import { expect, spyOn, test } from 'bun:test';
-import { createNextTuiBackgroundBridge } from './index.js';
+import { completedNestedAgents, createNextTuiBackgroundBridge } from './index.js';
+import type { AgentTask } from '../agent/types.js';
+
+test('only completed descendants of this session roots enter the persistent frame', () => {
+  const task = (id: string, parentTaskId?: string, state: AgentTask['state'] = 'done') => ({
+    id, parentTaskId, state, label: id, definition: { name: id },
+  }) as AgentTask;
+  const tasks = [task('ours'), task('child', 'ours'), task('grandchild', 'child'),
+    task('other'), task('foreign-grandchild', 'other'), task('pending', 'ours', 'running')];
+  expect(completedNestedAgents(tasks, new Set(['ours']))).toEqual([
+    { id: 'child', description: '↳ child', status: 'done' },
+    { id: 'grandchild', description: '↳ grandchild', status: 'done' },
+  ]);
+  // At the next turn boundary the root set is replaced, even if a
+  // grandchild from that tree is still running.
+  expect(completedNestedAgents(tasks, new Set())).toEqual([]);
+  tasks[5]!.state = 'done';
+  expect(completedNestedAgents(tasks, new Set(['other']))).toEqual([
+    { id: 'foreign-grandchild', description: '↳ foreign-grandchild', status: 'done' },
+  ]);
+});
 
 test('an unregistered Agent promise remains visible across later turns', () => {
   const previous = process.env.ELANOUS_NEXT_TUI_BG_STATUS;

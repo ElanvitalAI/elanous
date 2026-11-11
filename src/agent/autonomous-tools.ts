@@ -4,11 +4,11 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 // 메신저 서피스(telegram/discord)가 노출하던 무거운 자율툴 5종의 spec 조립 + per-turn
 // dispatch 배선을 makeElanousAgentRunTurn 인라인에서 이 헬퍼로 추출한다. 종전 telegram 이 ~120줄
 // 인라인으로 굴리던 것(delegate_code_agent · SelfImplement · RelayShellPrompt · RunDevHarness ·
-// SolveMission)을 단일 출처로 — daemon-tools 가 부분 중복(delegate·SelfImplement)하던 것도 이후
+// 기존 SolveMission)을 단일 출처로 추출했다. daemon-tools 가 부분 중복(delegate·SelfImplement)하던 것도 이후
 // 이 헬퍼로 수렴 가능. 공통 앱 tool 단일화(Phase 0 buildSharedAppTools)의 자율tool 대응편.
 //
 // 골든룰(turn 조립기 통일) — 추출 전후 spec 이름배열 diff=0. buildAutonomousToolSpecs() 의 이름
-// 배열이 종전 인라인 `[delegateSpec, …(nest? []: [SelfImplement, RunDevHarness, SolveMission])]`
+// 배열이 종전 인라인 `[delegateSpec, …(nest? []: [SelfImplement, RunDevHarness])]`
 // 과 정확히 일치(autonomous-tools.test 스냅샷 가드). dispatch 배선(HITL 채널·wrapAutonomousTool·
 // nest-cap)은 서피스-무관 ctx 로만 파라미터화 — 서피스 고유(delegate 아밍·footer 추적)는 onDelegated
 // 콜백으로 위임(tgChat/dcChannel 정체성은 서피스가 소유).
@@ -19,7 +19,6 @@ import { buildSelfImplementDaemonSpec, dispatchSelfImplement, dispatchSelfImplem
 import { SELF_IMPLEMENT_TOOL_NAMES } from '../boot/daemon-tools/self-implement-names.js';
 import { dispatchRelayShellPrompt } from '../skills/tools/relay-shell.js';
 import { dispatchRunDevHarness, buildRunDevHarnessTool, isDevHarnessModelSurfaceEnabled } from '../skills/tools/dev-harness.js';
-import { dispatchSolveMission, buildSolveMissionTool } from '../skills/tools/solve-mission.js';
 import { nestCapReached } from './nest-depth.js';
 import { wrapAutonomousTool } from './surface-ux/wrap.js';
 
@@ -47,7 +46,6 @@ export const DEV_REQUEST_HARNESS_TOOL_NAMES: readonly string[] = [
   //    근본은 순환이었고 `self-implement-names.ts` 로 끊었으므로 다시 편다.)
   ...SELF_IMPLEMENT_TOOL_NAMES,
   'RunDevHarness',
-  'SolveMission',
 ];
 
 export const AUTONOMOUS_TOOL_NAMES: readonly string[] = [
@@ -63,15 +61,14 @@ export function isAutonomousTool(name: string): boolean {
   return AUTONOMOUS_TOOL_NAME_SET.has(name);
 }
 
-/** 메신저 서피스가 노출하는 자율tool spec 5종. 종전 telegram 인라인 조립과 동일 순서·nest-cap 규율:
- *  delegate 는 항상, 무거운 spawn 3종(SelfImplement/RunDevHarness/SolveMission)은 액자 상한 초과 시 제외. */
+/** 메신저 서피스가 노출하는 자율tool spec. delegate 는 항상,
+ *  무거운 spawn 도구(SelfImplement/RunDevHarness)는 액자 상한 초과 시 제외. */
 export function buildAutonomousToolSpecs(): LLMToolSpec[] {
   return [
     buildDelegateAgentTool(),
     ...(nestCapReached() ? [] : [
       buildSelfImplementDaemonSpec(),
       ...(isDevHarnessModelSurfaceEnabled() ? [buildRunDevHarnessTool()] : []),
-      buildSolveMissionTool(),
     ]),
   ];
 }
@@ -88,7 +85,7 @@ export interface AutonomousToolTurnCtx {
   surfaceQuestionChannels?: QuestionChannel[];
   surfaceFileSink?: FileSink;
   emitFeedback?: (env: FeedbackEnvelope) => void;
-  /** #24 auto_drive 추론(RunDevHarness) + SolveMission 원본 텍스트. */
+  /** #24 auto_drive 추론(RunDevHarness)을 위한 원본 텍스트. */
   userText?: string;
   /** 테스트에서 전역 mock 없이 SelfImplement 디스패치 컨텍스트를 관측하는 per-call seam. */
   selfImplementDispatch?: typeof dispatchSelfImplement;
@@ -195,28 +192,6 @@ export async function dispatchAutonomousTool(
         toolNames: ['RunDevHarness'],
         label: 'RunDevHarness',
         run: () => dispatchRunDevHarness(args, hctx as Parameters<typeof dispatchRunDevHarness>[1]),
-      },
-      args,
-      hctx,
-    );
-  }
-
-  // SolveMission(P3): 기존 코딩 미션을 하니스로 read-only solve. RunDevHarness 동형. 미션 DB 무접촉.
-  if (name === 'SolveMission') {
-    const hctx = {
-      cwd: ctx.cwd,
-      signal: ctx.signal,
-      ...(ctx.userText ? { userText: ctx.userText } : {}),
-      ...(surfaceChannels ? { surfaceHitlChannels: surfaceChannels } : {}),
-      ...(surfaceQuestionChannels ? { surfaceQuestionChannels } : {}),
-      ...(surfaceFileSink ? { surfaceFileSink } : {}),
-      ...(ctx.emitFeedback ? { emitFeedback: ctx.emitFeedback } : {}),
-    };
-    return wrapAutonomousTool(
-      {
-        toolNames: ['SolveMission'],
-        label: 'SolveMission',
-        run: () => dispatchSolveMission(args, hctx as Parameters<typeof dispatchSolveMission>[1]),
       },
       args,
       hctx,

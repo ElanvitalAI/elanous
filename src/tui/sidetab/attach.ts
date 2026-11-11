@@ -12,14 +12,18 @@ import type { Key } from '../../tui.js';
 import type { SidetabRow } from './list.js';
 import { createHerdrSidetabPortal, herdrPaneIdFromSidetabRow, type HerdrSidetabPortal } from './herdr-portal.js';
 import { createSidetabMissionBranch, type AgentCliDetection } from '../branches/sidetab/mission.js';
+import { readSidetabAgent, sendSidetabAgent, sidetabAgentLaunch, type SidetabAgent } from '../../tui-client/sidetab-agent-pty.js';
 
-export type SidetabCharacter = 'shell' | 'elanous' | VisibleAgentCli;
+export type SidetabCharacter = 'shell' | 'elanous' | VisibleAgentCli | 'hermes';
 
 export interface SidetabAttachmentController {
   attach(row: SidetabRow): boolean;
   select(row: SidetabRow): boolean;
   showMain(): void;
   spawn(character: SidetabCharacter): boolean;
+  spawnSideAgent(agent: SidetabAgent): string | undefined;
+  readSideAgent(row: SidetabRow): string | undefined;
+  sendSideAgent(row: SidetabRow, input: string): Promise<boolean>;
   runMission(agent: VisibleAgentCli, mission: string): Promise<Awaited<ReturnType<typeof runVisibleAgentMission>>>;
   runMissionPair(agent: 'codex' | 'claude', mission: string, parallelMission: string): Promise<unknown>;
   kill(row: SidetabRow): boolean;
@@ -251,7 +255,7 @@ export function createSidetabAttachmentController(deps: {
     return true;
   };
 
-  const spawn = (character: SidetabCharacter): boolean => {
+  const spawn = (character: SidetabCharacter, background = false): boolean => {
     const { cols, rows } = deps.termSize();
     if (cols < 40 || rows < 8) {
       deps.setStatus('PTY 모달은 최소 40칸 × 8줄이 필요합니다');
@@ -271,14 +275,19 @@ export function createSidetabAttachmentController(deps: {
       registryPurpose: `next-tui-sidetab:${id}`,
       registrySeat: process.env.COORD_ID?.trim() || 'unknown',
       kind: character === 'shell' ? 'shell' as const : 'coding-agent' as const,
-      ...(character === 'claude' ? { agentBrand: 'claude-code' as const } : character === 'codex' || character === 'grok' ? { agentBrand: character } : {}),
+      ...(character === 'claude' ? { agentBrand: 'claude-code' as const } : character === 'codex' || character === 'grok' || character === 'hermes' ? { agentBrand: character } : {}),
     };
     try {
       let command: string | undefined;
       let env: Record<string, string> | undefined;
       let unsetEnv: string[] | undefined;
       if (character === 'elanous') command = 'elanous --tui next';
-      if (character === 'codex' || character === 'claude' || character === 'grok') {
+      if (character === 'codex' || character === 'claude' || character === 'hermes') {
+        const spec = sidetabAgentLaunch(character, process.env);
+        command = spec.command;
+        env = spec.env;
+        unsetEnv = [...spec.unsetEnv];
+      } else if (character === 'grok') {
         const backend = visibleAgentBackend(character);
         const spec = resolveBackendSpawn(backend, process.env);
         command = [spec.cmd, ...spec.args].map(shellQuote).join(' ');
@@ -302,8 +311,13 @@ export function createSidetabAttachmentController(deps: {
         },
       }, { termCols: cols, termRows: rows });
       lastSpawnedSession = session;
-      if (character === 'codex' || character === 'claude') {
+      if (character === 'codex' || character === 'claude' || character === 'hermes') {
         deps.setStatus(`${character} 실행 · agent-mission 구독 경로 scrub 적용(${unsetEnv?.length ?? 0}개 env 제거)`);
+      }
+      if (background) {
+        registry.detach(session.id);
+        deps.setStatus(`${character} 사이드탭 PTY 실행 · ${session.id}`);
+        return true;
       }
       return setModal(session);
     } catch (error) {
@@ -357,6 +371,15 @@ export function createSidetabAttachmentController(deps: {
     },
     showMain,
     spawn,
+    spawnSideAgent(agent) {
+      return spawn(agent, true) ? lastSpawnedSession?.id : undefined;
+    },
+    readSideAgent(row) {
+      return row.sessionId ? readSidetabAgent(registry, row.sessionId) : undefined;
+    },
+    sendSideAgent(row, input) {
+      return row.sessionId ? sendSidetabAgent(registry, row.sessionId, input) : Promise.resolve(false);
+    },
     runMission: missionBranch.runMission,
     runMissionPair: missionBranch.runMissionPair,
     kill(row) {

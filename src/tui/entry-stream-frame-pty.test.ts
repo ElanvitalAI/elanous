@@ -22,11 +22,11 @@ test('next TUI paints the first chunk while the response is still streaming', as
       },
       ready: { label: 'boot', until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
       steps: [{ label: 'first chunk while busy', text: 'stream probe', until: (s) =>
-        s.includes('엘라누스: STREAM-FIRST-CHUNK') && s.includes('응답 중') && !s.includes('응답 완료') }],
+        s.includes('엘라누스: STREAM-FIRST-CHUNK') && s.includes('턴 스트리밍') && !s.includes('응답 완료') }],
     });
     const stream = run.frames[1]?.screen ?? '';
     expect(stream).toContain('엘라누스: STREAM-FIRST-CHUNK');
-    expect(stream).toContain('응답 중');
+    expect(stream).toContain('턴 스트리밍');
     expect(stream).not.toContain('NEVER-FINAL');
     expect(run.exitCode).toBe(0);
   } finally {

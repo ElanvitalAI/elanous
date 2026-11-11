@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "ML 서빙 — 온라인 추론 endpoint",
+  "source": "https://docs.cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning",
+  "body": "적용 시점: 요청 시점 입력으로 짧은 지연 안에 예측을 돌려야 할 때.\n용량 단계: 초기에는 단일 endpoint와 모델 버전 고정; 실제 QPS·tail latency·GPU 사용이 커지면 autoscaling/전용 가속기를 검토한다.\nGCP 대응: Vertex AI endpoint 또는 Cloud Run 서비스, 모델 artifact는 Cloud Storage/Artifact Registry에서 버전 고정.\n비용 축: 인스턴스/GPU 점유, 모델 메모리, 요청 유휴 대기, 입출력 네트워크가 비용 축이다.\n결정과 반증: 모델 warm/cold 지연과 동시 요청·입력 크기 분포를 측정해 서비스 SLO를 정한다."
+}

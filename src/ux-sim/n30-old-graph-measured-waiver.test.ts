@@ -23,6 +23,7 @@ test('N30 old-graph measured waiver refuses before dispatch and preserves the fa
       injectedEvidence: { oldGraphMissingKnownIssues: true, stateStayedFailedWithoutWaiver: true },
     });
     expect(result.cases[0]?.refusal).toContain('measured gate regressions cannot be waived');
+    expect(result.cases[0]?.injectedEvidence.initialPath).toContain('cloud-leave-fail');
   } finally {
     setTestStateRoot(previous ?? null);
     rmSync(root, { recursive: true, force: true });

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "공통 패턴 — Transactional Outbox",
+  "source": "https://microservices.io/patterns/data/transactional-outbox.html",
+  "body": "적용 시점: DB 상태 변경과 이벤트 발행을 한 원자적 업무로 보장해야 할 때.\n용량 단계: 단일 DB 트랜잭션에 outbox row를 두고 relay를 분리; 처리량이 커지면 poll/CDC 경로를 비교한다.\nGCP 대응: Cloud SQL transaction + outbox relay → Pub/Sub; consumer는 별도 멱등 테이블을 유지한다.\n비용 축: outbox 저장·삭제, relay scanning/CDC, 브로커 전달 및 재처리 비용이 든다.\n결정과 반증: DB commit 뒤 프로세스 종료, broker timeout, relay 재실행에서 누락 0과 중복 안전성을 검증한다."
+}

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "복구를 시험하는 신뢰성 검토",
+  "source": "https://docs.aws.amazon.com/wellarchitected/latest/framework/rel-dp.html",
+  "body": "AWS Well-Architected의 신뢰성 설계 원칙을 공급자 독립 검토 질문으로 바꾼다. 핵심 구성 요소의 고장을 감지할 수 있는가, 자동 복구와 수동 절차가 있는가, 복구 절차를 장애 주입으로 시험했는가, 수요 변화 때 입장률/리소스 상한을 조절하는가를 점검한다. 특정 AWS 서비스 채택이 전제는 아니다."
+}

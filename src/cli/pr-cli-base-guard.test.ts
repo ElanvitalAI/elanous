@@ -54,12 +54,14 @@ function land(
     head: 'a'.repeat(40), main: 'b'.repeat(40),
     sourceRepository: 'example/repo', baseRepository: 'example/repo',
   },
+  mainTips: readonly string[] = [],
 ) {
   const lines: string[] = [];
   const waits: number[] = [];
   let merges = 0;
   let baseRead = 0;
   let finalBaseRead = 0;
+  let mainTipRead = 0;
   const finalBaseTargets: string[] = [];
   const gitCommands: string[] = [];
   const ghCommands: string[] = [];
@@ -76,7 +78,8 @@ function land(
         return { ok: true, out: JSON.stringify({ url: `https://github.com/${remoteIdentity.baseRepository}/pull/26022` }) };
       }
       if (command === 'gh' && args[0] === 'api' && String(args[1] ?? '').includes('/pulls/')) return { ok: true, out: `${remoteIdentity.baseRepository}\n` };
-      if (command === 'gh' && args[0] === 'api') return { ok: true, out: remoteIdentity.main };
+      if (command === 'gh' && args[0] === 'api') return { ok: true,
+        out: mainTips[Math.min(mainTipRead++, mainTips.length - 1)] ?? remoteIdentity.main };
       if (command === 'git' && args[0] === 'remote') return { ok: true, out: args[1] === 'get-url' ? `https://github.com/${remoteIdentity.sourceRepository}.git` : 'origin' };
       if (command === 'git' && args[0] === 'rev-parse') return { ok: true, out: args[1] === 'HEAD' ? remoteIdentity.head : args[2] === `${'c'.repeat(40)}^1` || args[2] === 'origin/main' ? remoteIdentity.main : '/tmp/guard-test' };
       if (command === 'gh' && args.some((arg) => arg.includes('mergeCommit'))) return { ok: true, out: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: 'c'.repeat(40) } }) };
@@ -148,6 +151,18 @@ test('matching remote Git result lets real land orchestration reach merge withou
   expect(result.merges()).toBe(1);
   expect(result.gitCommands.some((command) => command.startsWith('fetch '))).toBe(false);
   expect(result.lines.some((line) => line.startsWith('✓ remote-git: host=node-b'))).toBe(true);
+});
+
+test('heavy remote remeasures when main moves after the first premerge stability check', async () => {
+  const oldMain = 'b'.repeat(40);
+  const newMain = 'c'.repeat(40);
+  const measured: string[] = [];
+  const result = await land('main', { heavyRemote: true, pr: '26022', base: 'main', expectedHead: 'a'.repeat(40) },
+    [], [], input => { measured.push(input.main); return passingHeavyRemote(input); }, undefined, undefined,
+    [oldMain, oldMain, newMain, newMain, newMain]);
+  expect(result.code).toBe(0);
+  expect(measured).toEqual([oldMain, newMain]);
+  expect(result.merges()).toBe(1); // Source: PRLAND-REUSE-EXACT-HEAD-CHECKS merge follows the gate for the moved base.
 });
 
 test('real land path runs the real remote Git worker with fork head and upstream base boundaries', async () => {

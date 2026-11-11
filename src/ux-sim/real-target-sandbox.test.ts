@@ -197,30 +197,54 @@ export async function run() {
   expect(receipt).toMatchObject({ pass: true, steps: [{ outcome: 'true' }] });
 });
 
-test.skipIf(!linuxBwrapAvailable)('sim suite CLI connects a configured real target through the OS worker', async () => {
-  const { root, adapterPath } = fixture();
+test('sim suite CLI validates target guards and fails closed before world wiring', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'real-target-suite-cli-'));
+  roots.push(root);
+  setTestStateRoot(null);
+  const adapterPath = join(root, 'adapter.mjs');
   const suite = join(root, 'suite');
   const caseDir = join(suite, 'incident');
   mkdirSync(caseDir, { recursive: true });
   writeFileSync(join(suite, 'suite.json'), JSON.stringify({ durationTolerancePercent: 10 })); // Source: regression suite fixture requires explicit tolerance.
   writeFileSync(join(caseDir, 'world.yaml'), 'world: incident\nseed: 1\ndevices: [fake-clock]\nevents: []\n');
-  writeFileSync(join(caseDir, 'scenario.yaml'), 'world: incident\nsteps: []\n');
+  writeFileSync(join(caseDir, 'scenario.yaml'), 'world: incident\ntarget: real\nreal:\n  allowWrites: []\n  budget: { llmCalls: 0, wallClockMs: 0, externalWrites: 0 } # Source: fail-closed pre-wiring fixture.\n  syntheticMarker: true\n  stopFile: /test/stop\n  targets: []\nsteps: []\n');
   writeFileSync(adapterPath, `export async function run() { return { pass: true,
     steps: [{ id: 'real-worker', outcome: 'ran', invariant: 'pass', durationMs: null }], eventKinds: ['real-worker'] }; }`);
   process.env.ELANOUS_SIM_REAL_TARGET_ADAPTER = adapterPath;
   const originalLog = console.log;
+  const originalError = console.error;
   const originalExitCode = process.exitCode;
   const output: string[] = [];
   try {
     console.log = (...parts: unknown[]) => { output.push(parts.map(String).join(' ')); };
+    console.error = (...parts: unknown[]) => { output.push(parts.map(String).join(' ')); };
     process.exitCode = 0;
-    const program = new Command();
-    registerSimCommands(program);
-    await program.parseAsync(['node', 'test', 'sim', 'suite', suite, '--target', 'real', '--update-baseline']);
-    expect(process.exitCode).toBe(0);
-    expect(output).toContain('suite 1 scenario(s): no differences'); // Source: one real case creates a measured baseline.
-    expect(readFileSync(join(caseDir, 'baseline.real.json'), 'utf8')).toContain('real-worker');
-  } finally { console.log = originalLog; process.exitCode = originalExitCode ?? 0; }
+    const omittedTargetProgram = new Command();
+    registerSimCommands(omittedTargetProgram);
+    await omittedTargetProgram.parseAsync(['node', 'test', 'sim', 'suite', suite]);
+    expect(process.exitCode).toBe(2);
+    expect(output.join('\n')).toContain('real scenario target requires an explicit --test universe');
+    expect(existsSync(join(caseDir, 'baseline.real.json'))).toBe(false);
+    setTestStateRoot(join(root, 'explicit-test-universe'));
+    output.length = 0;
+    process.exitCode = 0;
+    const explicitTestProgram = new Command();
+    registerSimCommands(explicitTestProgram);
+    await explicitTestProgram.parseAsync(['node', 'test', 'sim', 'suite', suite]);
+    expect(process.exitCode).toBe(2);
+    expect(output.join('\n')).toContain('real scenario execution requires R-FRAG-2 world runner wiring');
+    expect(existsSync(join(caseDir, 'baseline.real.json'))).toBe(false);
+    setTestStateRoot(null);
+    output.length = 0;
+    process.exitCode = 0;
+    const explicitSimProgram = new Command();
+    registerSimCommands(explicitSimProgram);
+    await explicitSimProgram.parseAsync(['node', 'test', 'sim', 'suite', suite, '--target', 'sim']);
+    expect(process.exitCode).toBe(1);
+    expect(output.join('\n')).toContain('"field":"baseline"');
+    expect(output.join('\n')).not.toContain('real scenario execution requires R-FRAG-2 world runner wiring');
+    expect(existsSync(join(caseDir, 'baseline.sim.json'))).toBe(false);
+  } finally { console.log = originalLog; console.error = originalError; process.exitCode = originalExitCode ?? 0; }
 });
 
 test('macOS worker profile denies network, arbitrary writes, and detached children while allowing declared writes', () => {

@@ -989,64 +989,6 @@ export function defaultTelegramCommands(
       },
     },
     {
-      // goal control — 현재 미션 조회(삭제할 id 확인용).
-      name: 'missions',
-      description: '현재 활성 미션 목록(id·상태·골) — 삭제는 /mission_del',
-      handler: async () => {
-        const { listMissions, openAutopilotMissionsDb } = await import('./autopilot/mission-registry.js');
-        const store = openAutopilotMissionsDb();
-        try {
-          const rows = listMissions(store, {}).filter((m) => !['done', 'cancelled', 'failed'].includes(m.status));
-          if (rows.length === 0) return '_활성 미션 없음._';
-          const lines = ['**활성 미션**', ''];
-          for (const m of rows) {
-            const short = m.id.split('_').pop() ?? m.id;
-            lines.push(`• [${m.status}] ${m.goal.slice(0, 46)}`);
-            lines.push(`  \`${m.id}\`  → 삭제: /mission_del ${short}`);
-          }
-          return lines.join('\n');
-        } finally {
-          store.close();
-        }
-      },
-    },
-    {
-      // goal control — 미션 + 파생물(크론 autopilot_id·태스크 goalSlug) 태그 cascade 삭제.
-      name: 'mission_del',
-      description: '미션 + 파생 크론·태스크 일괄 삭제 — /mission_del <id 또는 끝6자리>',
-      handler: async (args) => {
-        const idArg = (args[0] ?? '').trim();
-        if (!idArg) return '사용법: `/mission_del <미션id 또는 끝6자리 hash>` (/missions 로 id 확인)';
-        const { listMissions, openAutopilotMissionsDb } = await import('./autopilot/mission-registry.js');
-        const { cancelMission } = await import('./autopilot/mission-lifecycle.js');
-        let fullId = idArg;
-        if (!idArg.startsWith('apm_')) {
-          const store = openAutopilotMissionsDb();
-          try {
-            const hit = listMissions(store, {}).find((m) => m.id.split('_').pop() === idArg || m.id.endsWith(`_${idArg}`));
-            if (!hit) return `미션 못 찾음: \`${idArg}\` (/missions 로 확인)`;
-            fullId = hit.id;
-          } finally {
-            store.close();
-          }
-        }
-        // 대량 파생 크론(투자 앵커 등) 오삭제 방지 — >3 이면 confirm 요구.
-        const { openSchedulesDb, listSchedules } = await import('./domains/schedule-registry.js');
-        const sdb = openSchedulesDb();
-        let cronCount = 0;
-        try { cronCount = listSchedules(sdb).filter((r) => r.autopilot_id === fullId).length; } finally { sdb.close(); }
-        const confirmed = (args[1] ?? '').trim().toLowerCase() === 'confirm';
-        if (cronCount > 3 && !confirmed) {
-          return `⚠️ 이 미션은 파생 크론 **${cronCount}개**를 함께 삭제합니다(대량·투자 앵커 등 주의).\n확실하면 \`/mission_del ${idArg} confirm\` 으로 다시 실행.`;
-        }
-        const r = await cancelMission(fullId);
-        if (!r.ok) return `삭제 실패: ${r.error}`;
-        const lines = ['✅ 미션 삭제(파생물 cascade)', `\`${fullId}\``, `· 파생 크론 ${r.releasedCrons} 삭제`, `· 태스크 ${r.releasedTasks} 정리`];
-        if (r.releasedWorkflows) lines.push(`· workflow 정의 ${r.releasedWorkflows} 삭제(재발견 방지)`);
-        return lines.join('\n');
-      },
-    },
-    {
       name: 'taste',
       description: 'taste 제안 확인·승인·기각 (list | approve <테마> | reject <테마>)',
       handler: async (args) => {

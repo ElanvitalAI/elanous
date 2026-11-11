@@ -933,11 +933,7 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
 
 /** 설치본의 `install.json` 에서 `source` 를 읽는다 — prefix 는 판 폴더·`current`·prefix 셋 중 install.json 이 있는 곳. */
 function readInstallSource(cliRoot: string, exists: (path: string) => boolean, readText: (path: string) => string = (p) => readFileSync(p, 'utf8')): string | null {
-  const holder = resolve(cliRoot, '..', '..');
-  const parent = resolve(holder, '..');
-  const prefix = basename(parent) === 'versions' && exists(join(resolve(parent, '..'), 'install.json')) ? resolve(parent, '..')
-    : basename(holder) === 'current' && exists(join(parent, 'install.json')) ? parent
-    : exists(join(holder, 'install.json')) ? holder : null;
+  const prefix = installPrefixForCliRoot(cliRoot, exists);
   if (!prefix) return null;
   try {
     const metadata = JSON.parse(readText(join(prefix, 'install.json'))) as { source?: unknown };
@@ -945,6 +941,14 @@ function readInstallSource(cliRoot: string, exists: (path: string) => boolean, r
   } catch {
     return null;
   }
+}
+
+function installPrefixForCliRoot(cliRoot: string, exists: (path: string) => boolean): string | null {
+  const holder = resolve(cliRoot, '..', '..');
+  const parent = resolve(holder, '..');
+  return basename(parent) === 'versions' && exists(join(resolve(parent, '..'), 'install.json')) ? resolve(parent, '..')
+    : basename(holder) === 'current' && exists(join(parent, 'install.json')) ? parent
+    : exists(join(holder, 'install.json')) ? holder : null;
 }
 
 /** Output only; never uses a title to decide whether to install. */
@@ -1138,6 +1142,22 @@ export async function runUpdateForInstallation(
     //   (2026-09-25 실측: `~/.local/share/elanous/install.json` source = pilot 체크아웃). 그것을 릴리스로 보내면 없는 공개판을 받으러 간다.
     //   ⇒ source 가 http(s) 면 릴리스 · 로컬 경로면 그 체크아웃으로 git 갱신 · 못 읽으면 멈춘다(추측하지 않는다).
     const source = readInstallSource(cliRoot, exists, deps.readText);
+    if (options.dryRun) {
+      // A dry run must stop before either installer path: release scripts and checkout install.sh both write `current`/install.json.
+      const routesToRelease = Boolean(source && /^https?:\/\/|^file:\/\//.test(source));
+      const routesToCheckout = Boolean(source && options.version === undefined && exists(join(source, 'scripts/install.sh')));
+      if (routesToRelease || routesToCheckout) {
+        const prefix = installPrefixForCliRoot(cliRoot, exists);
+        const record = prefix ? readInstallRecord(prefix) : null;
+        const installedVersion = typeof record?.version === 'string' && record.version.trim() ? record.version.trim() : null;
+        const result: SelfUpdateResult = installedVersion
+          ? { exitCode: 0, installedVersion, decision: null, restarted: false, reason: 'dry-run: 설치 파일을 변경하지 않았습니다' }
+          : { exitCode: 2, installedVersion: null, decision: null, restarted: false, reason: 'dry-run을 안전하게 확인할 설치 버전을 install.json에서 읽지 못했습니다' };
+        const out = (routesToRelease ? deps.release?.out : deps.checkout?.out) ?? console;
+        out.log(options.json ? JSON.stringify(result) : `self-update: ${result.reason}${installedVersion ? ` (현재 ${installedVersion})` : ''}`);
+        return result;
+      }
+    }
     if (source && /^https?:\/\/|^file:\/\//.test(source)) {
       return runReleaseUpdate({ version: options.version, restart: options.restart, json: options.json, alert: options.alert, keep: options.keep }, { packageRoot: cliRoot, ...deps.release });
     }

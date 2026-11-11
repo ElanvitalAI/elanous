@@ -462,8 +462,8 @@ test('a dangling symlink at the wrapper path is refused, not silently replaced',
 
 test('audit detection warns only for wrapper worktree cd, not installed build cd', () => {
   expect(repositoryWorktreeCdWarning('cd /Users/example/src/wt-ops-hq || exit 1')).toContain('warning');
-  expect(repositoryWorktreeCdWarning('cd /home/user/repo.worktrees/wt-ops-hq && bun entry')).toContain('warning');
-  expect(repositoryWorktreeCdWarning('cd /home/user/.local/share/elanous/current/node_modules/elanous && bun entry')).toBeUndefined();
+  expect(repositoryWorktreeCdWarning('cd /home/ubuntu/repo.worktrees/wt-ops-hq && bun entry')).toContain('warning');
+  expect(repositoryWorktreeCdWarning('cd /home/ubuntu/.local/share/elanous/current/node_modules/elanous && bun entry')).toBeUndefined();
   expect(repositoryWorktreeCdWarning('cd /Users/example/src/wt-ops-hq # fence tree')).toContain('warning');
   expect(repositoryWorktreeCdWarning('cd /Users/example/src/wt-ops-hq#x')).toContain('warning');
   // Known limit: a worktree path assembled from a variable is not detected.

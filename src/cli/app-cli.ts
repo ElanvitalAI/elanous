@@ -5,9 +5,10 @@ import type { Command } from 'commander';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { nexusRootDir } from '../nexus/paths.js';
-import { parseAppManifest } from '../nexus/apps/app-contract.js';
+import { parseAppManifest, type AppManifest } from '../nexus/apps/app-contract.js';
 import { createAppLifecycleStore, type AppLifecycleStore } from '../nexus/apps/app-db.js';
 import { appManifestToOpenApi, serializeOpenApi } from '../nexus/apps/app-openapi.js';
+import { planAppApiRoleChecks } from '../nexus/apps/app-api-contract-check.js';
 import { createAppSourceSnapshot, restoreAppSourceSnapshot, type AppSourceSnapshotOptions } from '../nexus/apps/app-source-snapshot.js';
 import { createObjectStore, readRawConfig, resolveStorageConfig, type ObjectStore } from '../storage/object-store.js';
 
@@ -76,6 +77,10 @@ export function renderAppOpenApi(slug: string, appsRoot: string, readFile: typeo
 }
 
 function renderAppOpenApiAt(slug: string, appDir: string, readFile: typeof readFileSync): string {
+  return serializeOpenApi(appManifestToOpenApi(readAppManifestAt(slug, appDir, readFile)));
+}
+
+function readAppManifestAt(slug: string, appDir: string, readFile: typeof readFileSync): AppManifest {
   if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(slug) || slug.includes('--') || slug.length > 63) {
     throw new Error('invalid app slug');
   }
@@ -83,7 +88,11 @@ function renderAppOpenApiAt(slug: string, appDir: string, readFile: typeof readF
   const parsed = parseAppManifest(String(source));
   if (!parsed.ok) throw new Error(`invalid app contract (${parsed.errors.map(issue => `${issue.path}: ${issue.reason}`).join('; ')})`);
   if (parsed.manifest.slug !== slug) throw new Error('app slug does not match its directory');
-  return serializeOpenApi(appManifestToOpenApi(parsed.manifest));
+  return parsed.manifest;
+}
+
+export function renderAppRoleChecks(slug: string, appsRoot: string, readFile: typeof readFileSync = readFileSync): string {
+  return `${JSON.stringify(planAppApiRoleChecks(readAppManifestAt(slug, join(appsRoot, slug), readFile)))}\n`;
 }
 
 export function registerAppCommands(program: Command, deps: AppCliDeps = {}): void {
@@ -111,6 +120,19 @@ export function registerAppCommands(program: Command, deps: AppCliDeps = {}): vo
         write(renderAppOpenApi(slug, deps.appsRoot ?? join(nexusRootDir(), 'apps'), deps.readFile));
       } catch (error) {
         process.stderr.write(`app openapi: ${error instanceof Error ? error.message : String(error)}\n`);
+        setExitCode(1);
+      }
+    });
+
+  app.command('role-checks <slug>')
+    .description('Plan deterministic allowed and denied API role checks from a local app contract')
+    .action((slug: string) => {
+      const write = deps.write ?? ((text: string) => process.stdout.write(text));
+      const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
+      try {
+        write(renderAppRoleChecks(slug, deps.appsRoot ?? join(nexusRootDir(), 'apps'), deps.readFile));
+      } catch (error) {
+        process.stderr.write(`app role-checks: ${error instanceof Error ? error.message : String(error)}\n`);
         setExitCode(1);
       }
     });

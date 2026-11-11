@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "웹 3계층 — 계층 경계와 책임",
+  "source": "https://docs.cloud.google.com/application-design-center/docs/three-tier-web-app",
+  "body": "적용 시점: 브라우저/API/데이터 책임이 서로 다른 변경·보안 경계를 가질 때.\n용량 단계: 초기에는 단일 배포물의 논리 계층으로 시작하고, 독립 부하나 릴리스가 관측될 때만 분리한다.\nGCP 대응: HTTPS Load Balancing → Cloud Run 또는 App Engine → Cloud SQL; 정적 파일은 Cloud Storage와 CDN.\n비용 축: 요청 컴퓨트, DB 연결·저장, 정적 파일 전송량이 주요 축이다.\n결정과 반증: 계층 수 자체를 목표로 삼지 말고 인증·검증·영속성의 책임 경계를 먼저 고정한다."
+}

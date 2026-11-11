@@ -1,5 +1,6 @@
 import { initTui, closeTui, injectKey, readKey, type Key } from '../tui.js';
-import { createNextTuiHistoryCache, fitLogLine, foldTargetAtScreenRow, isNextTuiContextCountStatus, isToolFoldToggleKey, logViewLines, NEXT_TUI_TITLE, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, nextVisibleFoldTarget, renderNextTuiLogFrame, safeLogText, safeStatusText, streamReplyLines, toggleVisibleToolFold, toolFoldBlockStarts, wheelScroll, wrapLogLines } from './core/render.js';
+import { createNextTuiHistoryCache, fitLogLine, foldTargetAtScreenRow, isNextTuiContextCountStatus, isToolFoldToggleKey, NEXT_TUI_TITLE, nextTuiCompactActionStatus, nextTuiCompactHeight, nextTuiStatusAfterWelcome, nextVisibleFoldTarget, safeStatusText, streamReplyLines, toolFoldBlockStarts, wheelScroll, wrapLogLines } from './core/render.js';
+import { renderNextTuiEntryFrame, shellApprovalCommandViewport } from './core/entry-render.js';
 import type { MessageBlock } from '../conv-substrate/message-block.js';
 import { nextMessageBlockDetailLevel } from './chat/message-block-view.js';
 import { createMessageBlockSessionStore, upsertMessageBlock } from './core/message-block-session.js';
@@ -16,7 +17,8 @@ import { COMPACT_BUSY_STATUS, COMPACT_NO_SESSION_STATUS } from './slash/compact-
 import { RESUME_BUSY_STATUS, parseResumeCommand } from './slash/resume-command.js';
 import { reportTuiProgress, reportTuiTurn } from '../pty-shell/tui-run-state.js';
 import { createNextTuiQueue, nextTuiQueueSuffix } from './core/queue.js';
-import { agentDisplayLines, applyAgentEvent, reconcileAgentOutputStatuses, type AgentDisplay } from './core/agents.js';
+import { agentDisplayLine, agentDisplayLines, applyAgentEvent, reconcileAgentOutputStatuses, reconcileNestedAgentSnapshot, type AgentDisplay } from './core/agents.js';
+import { formatNextTuiStatusLine } from './chat/status-line.js';
 import { decideNextTuiAutoContinue, startNextTuiTurn } from './core/turn.js';
 import { debug } from '../debug/log.js';
 import { setCliStderrSink } from '../git-fs/cli-stderr.js';
@@ -32,7 +34,8 @@ import { startMissionWatch as startMissionWatchLoop } from './mission-watch.js';
 import { nextSlashCandidates } from './input/slash-complete.js';
 import { nextFirstScreenLines } from './branches/first-screen.js';
 import type { NextTuiHarnessRunner } from './branches/harness.js';
-import { monotonicNowMs, requiresLongShellEscConfirmation } from '../esc-abort-gate.js';
+import type { GraphInstanceView } from '../../plugins/graph-instance-view/handlers/view-model.js';
+import { monotonicNowMs, requiresLongShellEscConfirmation } from '../esc-shell-timing.js';
 import { applyShellApprovalKey, NEXT_TUI_SHELL_APPROVAL_TIMEOUT_MS } from '../tui-client/next-shell-approval.js';
 import { SYNCHRONIZED_OUTPUT_BEGIN, SYNCHRONIZED_OUTPUT_END, openSynchronizedOutputRegion, synchronizedOutputDisabledByEnv } from '../display/synchronized-output-region.js';
 import { remoteFrameRows, ScreenPaintCache } from './core/screen-paint-cache.js';
@@ -57,41 +60,7 @@ export function nextTuiShellEscDecision(
     requiresLongShellEscConfirmation(name, nowMs - startedAtMonotonicMs)) ? 'confirm' : 'abort';
 }
 
-const shellApprovalSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
-function shellApprovalCommandLines(command: string, columns: number): string[] {
-  const width = Math.max(1, columns - 2);
-  const lines: string[] = [];
-  for (const sourceLine of safeLogText(command).split(/\r?\n/)) {
-    let line = '';
-    let used = 0;
-    for (const { segment } of shellApprovalSegmenter.segment(sourceLine)) {
-      const cells = Bun.stringWidth(segment);
-      if (used > 0 && used + cells > width) {
-        lines.push(`  ${line}`);
-        line = '';
-        used = 0;
-      }
-      if (cells > width) continue;
-      line += segment;
-      used += cells;
-    }
-    lines.push(`  ${line}`);
-  }
-  return lines.length ? lines : ['  '];
-}
-
-export function shellApprovalCommandViewport(
-  command: string,
-  terminalColumns: number,
-  sidetabWidth: number,
-  rows: number,
-  scroll: number,
-): { readonly lines: readonly string[]; readonly pageSize: number; readonly scroll: number } {
-  const chatColumns = Math.max(1, terminalColumns - (sidetabWidth > 0 ? sidetabWidth + 1 : 0));
-  const lines = shellApprovalCommandLines(command, chatColumns);
-  const pageSize = Math.max(1, Math.min(8, rows - 6));
-  return { lines, pageSize, scroll: Math.min(Math.max(0, scroll), Math.max(0, lines.length - pageSize)) };
-}
+export { shellApprovalCommandViewport };
 
 type NextTuiTermSession = {
   id: string;
@@ -114,6 +83,8 @@ export interface NextTuiOptions {
   };
   /** Test seam for the registry-loaded harness branch; production reuses the local CLI adapter. */
   readonly harnessRunner?: NextTuiHarnessRunner;
+  /** Test seam for rendering the real attachment footer without invoking a file picker. */
+  readonly contextAttachmentsForTest?: readonly (readonly [token: string, path: string])[];
 }
 
 const sidetabOpenBySession = new Map<string, boolean>();
@@ -138,8 +109,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   if ((process.stdout.columns || 0) < 20 || (process.stdout.rows || 0) < 6) {
     throw new Error('elanous --tui next requires at least 20 columns and 6 rows');
   }
+  const { readNextTuiStatusModel } = await import('./chat/status-model.js');
   const dashboardRuntime = await (await import('../tui-client/next-dashboard-runtime.js')).loadNextTuiDashboardRuntime();
-  const { appendMessage, createSession, getActiveSessionId, loadSession, resolveSessionId, setActiveSessionId, updateSessionMeta } = await import('../session/index.js');
+  const { appendMessage, createSession, loadSession, resolveSessionId, setActiveSessionId, updateSessionMeta } = await import('../session/index.js');
   const simWorldId = process.env.ELANOUS_SIM_WORLD_ID?.trim();
   const simWorld = simWorldId ? (await import('../ux-sim/world.js')).loadWorld(simWorldId) : null;
   const simWorldWatch = simWorld ? await import('../ux-sim/world-watch.js') : null;
@@ -162,6 +134,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const mailLine = seatMailLine(readSeatMailSnapshot(process.cwd()));
   const input = createNextTuiCoreInput();
   let status = 'Enter 전송 · Esc 취소 · Ctrl+Q 종료';
+  let executionModelBadge: string | undefined;
+  let resolveExecutionModelBadge: (() => string | undefined) | undefined;
+  let executionModelBadgeLoading = false;
+  let tuiClosed = false;
   let welcomePending = true;
   const compactHeight = nextTuiCompactHeight(process.env.ELANOUS_NEXT_TUI_COMPACT_HEIGHT, options.compactHeight);
   const missionWatchCancellation: { cancel?: () => void } = {};
@@ -178,6 +154,20 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let sidetabOpen = sidetabEnabled && (session?.meta.uiState?.sidetabOpen ?? sidetabOpenBySession.get(id!) ?? options.sidetabMode === 'open');
   let sidetabSelected = 0;
   let sidetabMode: 'list' | 'new' = 'list';
+  let sidetabRich = false;
+  let richView: GraphInstanceView | null = null;
+  let richSelectedIndex = 0;
+  let richRead: ((runId?: string) => GraphInstanceView | null) | null = null;
+  let richRender: ((view: GraphInstanceView, width: number, height: number, selectedNodeId?: string) => string[]) | null = null;
+  const refreshRichView = (): void => {
+    if (!sidetabRich || !richRead) return;
+    try {
+      richView = richRead(sidetabRows[sidetabSelected]?.runId);
+      richSelectedIndex = Math.min(richSelectedIndex, Math.max(0, (richView?.nodes.length ?? 1) - 1));
+    }
+    catch { richView = null; }
+  };
+  const richNodeCount = (): number => richView?.nodes.length ?? 0;
   let sidetabFocused = false;
   let sidetabChordPending = false;
   let sidetabChordTimer: ReturnType<typeof setTimeout> | null = null;
@@ -230,7 +220,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   let dismissedAtQuery = '';
   let slashNavigated = false;
   let dismissedSlashDraft = '';
-  const atAttachmentTokens = new Map<string, string>();
+  const atAttachmentTokens = new Map<string, string>(options.contextAttachmentsForTest ?? []);
   let contextAttachmentArea: string[] = [];
   let contextAttachmentAreaVisible = false;
   let contextAttachmentPage = 0;
@@ -272,7 +262,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   };
   let logWindow: { start: number; rows: number; columns: number; bodyTop: number; leadingBlankRows: number; foldTargets: readonly ({ kind: 'message'; id: string; start: number; end: number } | { kind: 'tool'; index: number; start: number; end: number })[] } = { start: 0, rows: 0, columns: 80, bodyTop: 1, leadingBlankRows: 0, foldTargets: [] };
   let lastFoldTargetKey: string | null = null;
-  let streamingReply = '';
   let pendingEcho: SerializedMessage | null = null;
   let pendingEchoStart = 0;
   const screenPaintCache = new ScreenPaintCache();
@@ -336,7 +325,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     backgroundSubscription.stop?.();
     backgroundSubscription.stop = onBackground(sessionId, (frame) => {
       if (frame === null) backgroundJobs.clear();
-      else backgroundJobs.accept(frame);
+      else if (backgroundJobs.accept(frame) && id === sessionId) {
+        try {
+          agents = reconcileNestedAgentSnapshot(agents, (JSON.parse(frame) as { nestedAgents?: unknown }).nestedAgents);
+        } catch { /* background status has its own validator */ }
+      }
       if (id === sessionId && !busy) {
         session = loadSession(sessionId);
         messages = session?.messages ?? messages;
@@ -349,6 +342,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
   const slashHandlers = new Map<string, (args: string[], context: SignalsSlashContext) => Promise<void>>();
   slashHandlers.set('signals', handleSignalsSlash);
   slashHandlers.set('status', async (_args, context) => (await import('./branches/status.js')).runNextTuiStatusBranchRoute('/status', { addLines: (...lines) => context.chatLines.push(...lines), sessionId: id ?? undefined }));
+  slashHandlers.set('remaining', async (args, context) => (await import('./branches/remaining.js')).handleNextTuiRemainingSlash(args, context));
+  slashHandlers.set('loop', async (args, context) => {
+    context.chatLines.push(...await runLoopCommand(args.join(' ')));
+  });
   const dispatchSlash = async (name: string, args: string[], context: SignalsSlashContext): Promise<boolean> => {
     const handler = slashHandlers.get(name);
     if (!handler) return false;
@@ -365,6 +362,8 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     warning: (text) => text,
     info: (text) => text,
   };
+  // Load the presentation leaf before rendering without adding to the audited static entry imports.
+  const { nextTuiStatusLine } = await import('./chat/status-line.js');
 
   // TURN-START-BLOCK-REST — 턴 경계 recorder: showNextTui → runLocalChatTurn 위임 턴의
   // 시작 경계(begin)와 첫 응답 경계(end · stream-open)를 세션 키로 열고 닫아
@@ -407,12 +406,44 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const sidetabWidth = sidetabOpen ? sidetabApi!.sidetabWidthForTerminal(columns) : 0;
     const chatColumns = columns - sidetabWidth - (sidetabOpen ? 1 : 0);
     const backgroundLine = backgroundJobs.line();
+    let modelBadgeResolutionFailed = false;
+    const resolveModelBadgeSafely = (): string | undefined => {
+      try {
+        return resolveExecutionModelBadge?.();
+      } catch {
+        // Model/config status is optional; a transient config read must not
+        // make the interactive renderer fail. Clear the resolver so the next
+        // render can retry after the underlying state recovers.
+        resolveExecutionModelBadge = undefined;
+        executionModelBadgeLoading = false;
+        modelBadgeResolutionFailed = true;
+        return undefined;
+      }
+    };
+    if (resolveExecutionModelBadge) {
+      // The active route/config can change between turns; keep the footer badge
+      // aligned with the model that the next turn will actually use.
+      executionModelBadge = resolveModelBadgeSafely();
+    } else if (!executionModelBadgeLoading) {
+      executionModelBadgeLoading = true;
+      void import('./chat/execution-badge.js').then(({ resolveDashboardExecutionBadge }) => {
+        resolveExecutionModelBadge = resolveDashboardExecutionBadge;
+        executionModelBadge = resolveModelBadgeSafely();
+        if (!modelBadgeResolutionFailed && !tuiClosed) render();
+      }).catch(() => {
+        // Let a later render retry a failed lazy load instead of leaving the
+        // badge permanently unavailable for this TUI session.
+        executionModelBadgeLoading = false;
+      });
+    }
     const title = fitLogLine(NEXT_TUI_TITLE, chatColumns);
     const header = [title, mailLine ? fitLogLine(mailLine, chatColumns) : '─'.repeat(Math.max(0, chatColumns))];
     const rawTurnStatus = (!busy && focus === 'log'
       ? `로그 탐색 · ↑↓ 스크롤${toolFoldBlockStarts(messages, chatColumns).length > 0 ? ' · Enter 접기/펼치기' : ''} · Esc 입력`
       : status);
-    const turnStatusBase = (isNextTuiContextCountStatus(rawTurnStatus) ? '' : nextTuiStatusAfterWelcome(rawTurnStatus)) + nextTuiQueueSuffix(queue.count);
+    const turnStatusBase = isNextTuiContextCountStatus(rawTurnStatus) ? '' : nextTuiStatusAfterWelcome(rawTurnStatus);
+    const background = backgroundJobs.snapshot();
+    const backgroundTasks = background ? background.running + background.pending : 0;
     const activeShellApproval = shellApprovalPrompt.current;
     const approvalViewport = activeShellApproval
       ? shellApprovalCommandViewport(activeShellApproval.command, columns, sidetabOpen ? sidetabWidth : 0, rows, activeShellApproval.scroll)
@@ -431,18 +462,46 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     contextAttachmentScroll = Math.max(0, Math.min(contextAttachmentScroll, contextAttachmentScrollMax));
     contextAttachmentScrollPage = Math.floor(contextAttachmentScroll / attachmentBodyRows) + 1;
     const attachmentOverflow = contextAttachmentScrollMax > 0;
-    const attachmentHint = attachmentOverflow && focus === 'input' && !atPicker && !slashPicker && !activeShellApproval
+    const rawAttachmentHint = attachmentOverflow && focus === 'input' && !atPicker && !slashPicker && !activeShellApproval
       ? `첨부 경로 ${contextAttachmentScrollPage}/${contextAttachmentScrollPages} · PgUp/PgDn`
       : null;
-    const turnStatus = [attachmentHint, turnStatusBase].filter(Boolean).join(' · ');
+    const statusMinimumWidth = Bun.stringWidth(`실패·미·Q${queue.count}·B${backgroundTasks}`);
+    const hintWidth = chatColumns - statusMinimumWidth - Bun.stringWidth(' · ');
+    const attachmentHint = rawAttachmentHint && hintWidth > 0
+      ? [
+          rawAttachmentHint,
+          `${contextAttachmentScrollPage}/${contextAttachmentScrollPages} PgUp/PgDn`,
+          'PgUp/PgDn',
+          `첨부 경로 ${contextAttachmentScrollPage}/${contextAttachmentScrollPages}`,
+          '첨부 경로',
+        ].find((candidate) => Bun.stringWidth(candidate) <= hintWidth) ?? null
+      : null;
+    const statusWidth = Math.max(1, chatColumns - (attachmentHint ? Bun.stringWidth(`${attachmentHint} · `) : 0));
+    const statusLine = formatNextTuiStatusLine({
+      turnState: turnStatusBase,
+      model: readNextTuiStatusModel(id ?? undefined, session?.meta),
+      queued: queue.count,
+      backgroundTasks,
+      width: statusWidth,
+    });
+    const turnStatus = [statusLine, attachmentHint].filter(Boolean).join(' · ');
     const compactActionStatus = nextTuiCompactActionStatus(turnStatus);
     const attachmentFooter = attachmentLines.length
       ? [attachmentLines[0]!, ...attachmentContent.slice(contextAttachmentScroll, contextAttachmentScroll + attachmentBodyRows)]
       : [];
     const withAttachmentFooter = (lines: string[]): string[] => [...attachmentFooter, ...lines];
     const statusFooter = rows <= compactHeight
-      ? (welcomePending ? [fitLogLine('Enter 전송 · Esc 취소 · Ctrl+Q 종료', chatColumns)]
-        : compactActionStatus ? [fitLogLine(compactActionStatus, chatColumns)] : [])
+      ? [
+          ...(backgroundLine ? [fitLogLine(backgroundLine, chatColumns)] : []),
+          nextTuiStatusLine({
+            state: welcomePending ? 'Enter 전송 · Esc 취소 · Ctrl+Q 종료'
+              : (compactActionStatus ?? turnStatusBase) || (busy ? '응답 중' : '대기'),
+            ...(executionModelBadge ? { model: executionModelBadge } : {}),
+            queued: queue.count,
+            activeChildren: agents.filter(({ status: agentStatus }) => agentStatus === 'running' || agentStatus === 'background').length,
+            columns: chatColumns,
+          }),
+        ]
       : [
           ...(backgroundLine ? [fitLogLine(backgroundLine, chatColumns)] : []),
           ...(welcomePending ? [fitLogLine('Enter 전송 · Esc 취소 · Ctrl+Q 종료', chatColumns)] : []),
@@ -488,8 +547,10 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     const visibleMessages = pendingEcho && !messages.slice(pendingEchoStart).some((message) =>
       message.role === 'user' && message.content === pendingEcho!.content)
       ? [...messages, pendingEcho] : messages;
+    const reconciledAgents = reconcileAgentOutputStatuses(agents, messages, backgroundJobs.snapshot()?.tasks);
     const displayActivity = [
-      ...agentDisplayLines(reconcileAgentOutputStatuses(agents, messages)),
+      ...agentDisplayLines(reconciledAgents),
+      ...reconciledAgents.map(agentDisplayLine),
       ...activity,
       ...(backgroundJobs.taskLines?.() ?? []).map(safeStatusText),
     ];
@@ -509,11 +570,14 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     })), columns: chatColumns, rows,
       header, footer, promptLine: prompt.line, promptLines: prompt.lines, notices, activity: [...firstScreen, ...displayActivity], scroll,
       expandedToolIndexes: expandedToolBlocks };
-    const frame = renderNextTuiLogFrame(frameInput, prepareHistory(frameInput));
+    const frame = renderNextTuiEntryFrame(frameInput, prepareHistory(frameInput));
     ({ scroll, maxScroll, logWindow } = frame);
     const { lines, promptRow } = frame;
     const sidetabLines = sidetabOpen
-      ? sidetabApi!.formatSidetabLines(sidetabRows, sidetabSelected, sidetabWidth, Math.max(1, rows - 1), sidetabMode)
+      ? sidetabRich && richView && richRender
+        ? richRender(richView, sidetabWidth, Math.max(1, rows - 1), richView.nodes[richSelectedIndex]?.id)
+        : sidetabRich ? [fitLogLine('원장 조회 불가 · g 목록', sidetabWidth)]
+          : sidetabApi!.formatSidetabLines(sidetabRows, sidetabSelected, sidetabWidth, Math.max(1, rows - 1), sidetabMode)
       : [];
     const screenLineCount = sidetabOpen ? Math.max(lines.length, sidetabLines.length) : lines.length;
     const screenLines = Array.from({ length: screenLineCount }, (_, index) => {
@@ -609,6 +673,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       sidetabRefreshTimer = setInterval(() => {
         if (!sidetabOpen || !sidetabApi) return;
         refreshSidetabRows();
+        refreshRichView();
         void refreshHerdrSidetabRows();
         if (process.env.ELANOUS_REMOTE_SIDETAB === '1') void refreshRemoteSidetabRows();
         render();
@@ -627,6 +692,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     sidetabSelected = preservedIndex >= 0
       ? preservedIndex
       : Math.min(sidetabSelected, Math.max(0, sidetabRows.length - 1));
+    refreshRichView();
   };
   const toggleWorkspaceRow = (row: { id: string; kind: string }): boolean => {
     if (sidetabViewMode !== 'workspaces' || row.kind !== 'workspace') return false;
@@ -705,7 +771,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     activity = [];
     agents = [];
     activeShellCalls.clear();
-    streamingReply = '';
     scroll = 0;
     maxScroll = 0;
     status = '세션 전환됨 · Enter 전송 · Ctrl+Q 종료';
@@ -716,7 +781,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     if (!sidetabOpen) await toggleSidetab();
     sidetabMode = 'list';
     sidetabFocused = true;
-    status = '사이드탭 포커스 · 1–9 선택 · Esc 입력';
+    status = '사이드탭 포커스 · g 그래프/자원 · 1–9 선택 · Esc 입력';
   };
   const returnToParent = (): void => {
     sidetabAttachments?.showMain();
@@ -874,7 +939,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     pushNowSnapshotPending = false;
     pushNowRequestId = null;
     pushNowPhase = null;
-    streamingReply = '';
     const attachments = [...atAttachmentTokens].filter(([token]) => turnText.includes(token)).map(([, path]) => path);
     if (!id) {
       id = createSession({ source: 'tui' }).id;
@@ -943,7 +1007,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       onProgress: reportTuiProgress,
       onStreamOpen: () => dashboardRuntime.endTurnStartSegments(turnSessionId, 'stream-open'),
       onPreview: (preview) => {
-        streamingReply = preview;
         activity = preview ? streamReplyLines(preview, process.stdout.columns || 80) : [];
         render();
       },
@@ -1001,10 +1064,9 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         session = loadSession(turnSessionId);
         messages = session?.messages ?? [];
         activity = outcome.kind === 'failed'
-          ? [`✘ 응답 실패: ${safeStatusText(outcome.error ?? 'unknown error')}`,
-            '다음 행동: ↑ 이전 입력 · Enter 재시도 · 반복되면 /new']
+          ? (await import('./chat/error-card.js')).nextTuiErrorCard(outcome.error ?? 'unknown error')
           : [];
-        streamingReply = '';
+        // Keep the completed tree visible after settlement; a new turn resets it.
         busy = false;
         turnAbort = null;
         scroll = 0;
@@ -1053,6 +1115,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
     sidetabRefreshTimer = setInterval(() => {
       if (!sidetabApi || !sidetabOpen) return;
       refreshSidetabRows();
+      refreshRichView();
       void refreshHerdrSidetabRows();
       render();
     }, 1_000);
@@ -1376,7 +1439,24 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         continue;
       }
       if (sidetabFocused && key.name === 'escape') {
+        if (sidetabRich) { sidetabRich = false; render(); continue; }
         returnToInput();
+        render();
+        continue;
+      }
+      if (sidetabFocused && sidetabOpen && key.name.toLowerCase() === 'g') {
+        if (sidetabRich) sidetabRich = false;
+        else {
+          try {
+            const [{ loadDeclaredPluginHandler }, { BUILTIN_DIR }] = await Promise.all([
+              import('../plugins/core/declared-handler.js'), import('../plugins/core/host.js'),
+            ]);
+            richRead = await loadDeclaredPluginHandler<(runId?: string) => GraphInstanceView | null>(BUILTIN_DIR, 'richSidetabRead');
+            richRender = await loadDeclaredPluginHandler<(view: GraphInstanceView, width: number, height: number, selectedNodeId?: string) => string[]>(BUILTIN_DIR, 'graphInstanceTerminal');
+            sidetabRich = Boolean(richRead && richRender);
+            refreshRichView();
+          } catch { status = '그래프 사이드탭을 열 수 없습니다'; }
+        }
         render();
         continue;
       }
@@ -1477,6 +1557,12 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       }
       if (sidetabFocused && /^[1-9]$/.test(key.name)) {
         await selectSidetabIndex(Number(key.name) - 1);
+        render();
+        continue;
+      }
+      if (sidetabFocused && sidetabRich && (key.name === 'up' || key.name === 'down')) {
+        const count = richNodeCount();
+        if (count > 0) richSelectedIndex = (richSelectedIndex + (key.name === 'up' ? -1 : 1) + count) % count;
         render();
         continue;
       }
@@ -1845,7 +1931,6 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             backgroundJobs.setSessionId(id);
             backgroundJobs.clear();
             activity = [];
-            streamingReply = '';
             scroll = 0;
             focus = 'input';
             input.clearHistory();
@@ -1916,18 +2001,11 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
             backgroundJobs.setSessionId(id);
             backgroundJobs.clear();
             activity = [];
-            streamingReply = '';
             scroll = 0;
             focus = 'input';
             input.clearHistory();
           }
           status = safeStatusText(next.status);
-          render();
-          continue;
-        }
-        if (route?.id === 'loop') {
-          activity = await runLoopCommand(submitted.slice('/loop'.length));
-          status = 'Enter 전송';
           render();
           continue;
         }
@@ -2052,12 +2130,25 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
         }
         if (route?.branchHost === 'now' && route.branchModule) {
           const branch = await import(route.branchModule) as typeof import('./branches/now.js');
-          await branch.runNextTuiNowBranchRoute(submitted, {
+          activity = ['현재 맥락 조회 중…'];
+          busy = true;
+          status = '현재 맥락 조회 중 · Esc 취소';
+          const abort = new AbortController();
+          turnAbort = abort;
+          render();
+          turnDone = branch.runNextTuiNowBranchRoute(submitted, {
             chatLines: activity,
             setChatScrollOffset: (value) => { scroll = Math.max(0, Math.min(value, maxScroll)); },
+            signal: abort.signal,
+            onUpdate: render,
+          }).finally(() => {
+            activity.shift();
+            busy = false;
+            turnAbort = null;
+            status = 'Enter 전송';
+            settle();
+            render();
           });
-          status = 'Enter 전송';
-          render();
           continue;
         }
         if (route?.branchHost === 'context' && route.branchModule) {
@@ -2113,6 +2204,28 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
               sidetabAttachments?.kill(selected);
               refreshSidetabRows();
               return true;
+            },
+            spawnSideAgent: async (agent) => {
+              await ensureSidetabAttachments();
+              const sessionId = sidetabAttachments!.spawnSideAgent(agent);
+              refreshSidetabRows();
+              if (sessionId) {
+                const index = sidetabRows.findIndex((row) => row.sessionId === sessionId);
+                if (index >= 0) sidetabSelected = index;
+              }
+              return sessionId;
+            },
+            sendSelectedAgent: async (message) => {
+              const row = sidetabRows[sidetabSelected];
+              if (!row) return false;
+              await ensureSidetabAttachments();
+              return sidetabAttachments!.sendSideAgent(row, message);
+            },
+            readSelectedAgent: async () => {
+              const row = sidetabRows[sidetabSelected];
+              if (!row) return undefined;
+              await ensureSidetabAttachments();
+              return sidetabAttachments!.readSideAgent(row);
             },
             addHelp: (...lines) => { activity.push(...lines); },
             setStatus: (message) => { status = message; },
@@ -2184,6 +2297,7 @@ export async function showNextTui(options: NextTuiOptions = {}): Promise<void> {
       render();
     }
   } finally {
+    tuiClosed = true;
     missionWatchCancellation.cancel?.();
     delete missionWatchCancellation.cancel;
     if (simWatchTimer !== null) clearInterval(simWatchTimer);

@@ -1111,12 +1111,11 @@ function goalPathTokens(paths: readonly string[]): Set<string> {
 }
 
 function goalPathStems(paths: readonly string[]): Set<string> {
-  return new Set(paths.map((path) => (path.split(/[\\/]/u).at(-1) ?? path).toLowerCase()
-    .replace(/\.(?:test|spec)\.[^.]+$/u, '')
-    .replace(/\.[^.]+$/u, '')));
+  return new Set(paths.map((path) => path.replaceAll('\\', '/').replace(/^\.\//u, '').toLowerCase()
+    .replace(/\.(?:(?:test|spec)\.)?[cm]?[jt]sx?$/u, '')));
 }
 
-function matchingPathCount(paths: readonly string[], targetPaths: readonly string[]): number {
+export function matchingPathCount(paths: readonly string[], targetPaths: readonly string[]): number {
   const targetStems = goalPathStems(targetPaths);
   if ([...goalPathStems(paths)].some((stem) => targetStems.has(stem))) return 10;
   const targetTokens = goalPathTokens(targetPaths);
@@ -1170,8 +1169,7 @@ function nextGoalScenarioId(catalogIds: readonly string[], targets: readonly str
   return `${prefix}-${Date.now().toString(36).toUpperCase()}`;
 }
 
-function selectGoalMockStage(ask: string, targets: readonly string[]): { device: MockScenarioDevice; scenario?: MockScenarioEntry; pathMatched: boolean } | undefined {
-  const catalog = loadMockScenarioCatalog();
+export function selectGoalMockStage(ask: string, targets: readonly string[], catalog: MockScenarioCatalog = loadMockScenarioCatalog()): { device: MockScenarioDevice; scenario?: MockScenarioEntry; pathMatched: boolean } | undefined {
   const matched = catalog.devices
     .map((candidate) => ({ candidate, score: matchingPathCount([...candidate.implementation, ...candidate.tests], targets) }))
     .filter((entry) => entry.score >= 2)

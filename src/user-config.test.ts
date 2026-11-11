@@ -35,6 +35,20 @@ function writeConfig(value: unknown): void {
   writeFileSync(configPath, JSON.stringify(value));
 }
 
+test('removing a roleLlm entry survives save and reload', () => {
+  writeConfig({ roleLlm: {
+    classify: { provider: 'openrouter', model: 'openrouter/upstage/solar-mini4' },
+    planning: { provider: 'openrouter', model: 'openrouter/upstage/solar-pro4' },
+  } });
+  const cfg = buildUserConfig(configPath);
+  expect(cfg.roleLlm?.classify).toBeDefined();
+  if (cfg.roleLlm) delete cfg.roleLlm.classify;
+  saveUserConfig(cfg, configPath);
+  const reloaded = buildUserConfig(configPath);
+  expect(reloaded.roleLlm?.classify).toBeUndefined();
+  expect(reloaded.roleLlm?.planning?.model).toBe('openrouter/upstage/solar-pro4');
+});
+
 test('intake.briefingTopic is a trimmed config value and survives save', () => {
   writeConfig({ intake: { briefingTopic: '  2027 사업계획: 호르무즈·중간선거 이후 원가·환율·물류  ' } });
   const config = buildUserConfig(configPath);

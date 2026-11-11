@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "다중 테넌트 SaaS — 격리 모델 선택",
+  "source": "https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/welcome.html",
+  "body": "적용 시점: 여러 고객이 같은 서비스 운영을 공유하되 데이터·자원 경계가 계약 대상일 때.\n용량 단계: 초기에는 논리 격리+검증된 tenant context; 규제·부하 차이가 입증되면 silo 또는 hybrid 셀을 검토한다.\nGCP 대응: 공유 DB row에 검증된 tenant_id, Cloud IAM workload identity, 강한 분리가 필요하면 프로젝트/DB 분리.\n비용 축: 공유 모델은 tenant별 사용량·저장; silo는 유휴 용량·네트워크·운영 복제가 비용 축이다.\n결정과 반증: 모든 읽기·쓰기·비동기 메시지에 tenant 경계가 전파되고 교차 조회가 차단되는지 시험한다."
+}

@@ -6,6 +6,16 @@ const meta = (opened = 2, unopened = 0) => JSON.stringify({ _meta: { type: 'log-
 const event = (ts: string, name: string, data: Record<string, unknown> = {}) => JSON.stringify({ ts, category: 'mission-loop.composite', event: name, data });
 
 describe('cycle fired judge', () => {
+  test('array JSONL and array event data stay harmless while a later valid cycle is counted', () => {
+    const decision = judgeCycleFired([
+      '[]',
+      JSON.stringify({ ts: '2026-09-03T23:05:01.995Z', category: 'mission-loop.composite', event: 'cycle-started', data: [] }),
+      JSON.stringify({ ts: '2026-09-03T23:06:01.995Z', category: 'mission-loop.composite', event: 'request-decision', data: [] }),
+      event('2026-09-03T23:07:01.995Z', 'cycle-completed'),
+    ].join('\n'), measuredAt);
+    expect(decision).toMatchObject({ status: 'fired', decisions: ['unknown'], seenEventRows: 4 });
+  });
+
   test('today KST started and completed is fired, includes decisions and excludes meta from row count', () => {
     const decision = judgeCycleFired([
       meta(3, 1),

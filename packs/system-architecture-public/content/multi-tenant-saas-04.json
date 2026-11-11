@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "다중 테넌트 SaaS — 셀 단위 확장",
+  "source": "https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/silo-isolation.html",
+  "body": "적용 시점: 일부 테넌트의 크기·규제·장애 영향이 공유 풀의 가정을 넘을 때.\n용량 단계: 공유 pool을 기본으로 두고 배치 기준을 측정; 영향 반경 또는 한도 초과 시 tenant를 별도 cell로 이동한다.\nGCP 대응: GCP project/region/Cloud SQL pool 단위 cell, 공통 control plane은 tenant route와 provisioning을 관리한다.\n비용 축: cell당 최소 자원·복제 비용과 입주율, 이동·백업·관측 운영비가 tradeoff다.\n결정과 반증: cell 장애가 제한된 tenant만 영향을 주고 이동 후 권한·데이터 경계가 유지되는지 확인한다."
+}

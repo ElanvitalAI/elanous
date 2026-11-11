@@ -1,0 +1,24 @@
+{
+  "id": "KAIST-APP-QR-LIVE",
+  "name": "KAIST app QR public name and isolation rehearsal",
+  "kind": "fake-public-name-app-host-isolation",
+  "device": "kaist-app-qr-public-isolation",
+  "implementation": [
+    "src/ux-sim/kaist-app-qr-sim.ts",
+    "src/ux-sim/fake-app-host.ts",
+    "src/nexus/apps/app-host.ts",
+    "src/relay/relay-server.ts"
+  ],
+  "tests": [
+    "src/ux-sim/kaist-app-qr-sim.test.ts"
+  ],
+  "trigger": "Deploy two static app artifacts into a temporary Nexus app root, resolve each HTTPS QR hostname through the fake name resolver, then exercise the actual Nexus app-host handler.",
+  "observe": [
+    "both QR targets render the expected app",
+    "one app session cannot query the other app",
+    "per-app RPC rows remain isolated",
+    "browser storage is isolated by public origin",
+    "HTTP and malformed names fail closed"
+  ],
+  "expected": "The fake app deployment and public-name boundary exercise the production Nexus app-host, while cookies, app database rows, and browser storage remain isolated across the two app origins."
+}

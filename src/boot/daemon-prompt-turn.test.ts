@@ -243,15 +243,17 @@ describe('short question daemon turn wiring', () => {
     spyOn(coreTurnModule, 'runCoreTurn').mockImplementation(async (ctx) => {
       expect(ctx.tools).toEqual([]);
       ctx.callbacks?.onText?.('안녕', '안녕');
-      return { stopReason: 'end_turn', finalText: '안녕' };
+      return { stopReason: 'end_turn', finalText: '안녕', providerFinishReason: 'stop' };
     });
     const response = await handlePromptStreamPost(new Request('http://localhost/v1/prompt/stream', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: 'fast-stream-test', userText: '안녕' }),
     }), { noAuth: true, history: new DaemonSessionHistory(), toolSurface, toolCwd: process.cwd() });
     expect(response.status).toBe(200);
-    const events = (await response.text()).split('\n').filter((line) => line.startsWith('event: ')).map((line) => line.slice(7));
+    const sse = await response.text();
+    const events = sse.split('\n').filter((line) => line.startsWith('event: ')).map((line) => line.slice(7));
     expect(events.filter((event) => event !== 'feedback')).toEqual(['turn-begin', 'text-delta', 'turn-end']);
+    expect(sse).toContain('"providerFinishReason":"stop"');
   });
 
   test('stream keeps the same event order for a non-fast task', async () => {

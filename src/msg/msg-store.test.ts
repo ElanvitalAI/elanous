@@ -119,6 +119,23 @@ describe('message identity and envelope', () => {
 });
 
 describe('durable message log and cursor', () => {
+  test('hybrid source provenance survives message persistence and is absent for legacy/unknown rows', () => {
+    const path = diskPath();
+    const store = new MsgStore(path);
+    const simulated = { universe: 'sim', source: 'sim', device: 'fake-herdr', scenario: 'human-present', clock: 'sim' } as const;
+    try {
+      const tagged = store.post({ from: 'UX', to: 'OP', body: 'sim event', kind: 'event', provenance: simulated });
+      const untagged = store.post({ from: 'UX', to: 'OP', body: 'legacy-compatible event' });
+      expect(store.getMessage(tagged.id)?.provenance).toEqual(simulated);
+      expect(store.listByRecipient('OP').find(message => message.id === tagged.id)?.provenance).toEqual(simulated);
+      expect(store.getMessage(untagged.id)).not.toHaveProperty('provenance');
+      expect(() => store.post({ from: 'UX', to: 'OP', body: 'invalid source', provenance: { universe: 'sim', source: 'sim' } as never })).toThrow('invalid message provenance');
+    } finally { store.close(); }
+    const reopened = new MsgStore(path);
+    try { expect(reopened.listByRecipient('OP')[0]?.provenance).toEqual(simulated); }
+    finally { reopened.close(); }
+  });
+
   test('MSG-CHANNELS: create, join, leave and group membership gate delivery on each seat cursor', () => {
     const store = new MsgStore(':memory:');
     try {

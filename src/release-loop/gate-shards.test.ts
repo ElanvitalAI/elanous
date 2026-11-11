@@ -146,6 +146,23 @@ test('a runner flush merges only its changed rows and preserves concurrent shard
   expect(merged.verdict).toEqual({ introduced: 1, preexisting: 0 });
 });
 
+test('a runner flush accepts the same persisted shard even when JSON key order changed', () => {
+  const startedAt = ago(1);
+  const previous = { id: 'pod-0', state: 'running' as const, plannedMin: 0, startedAt, job: undefined };
+  const current: GateShardsFile = { v: 1, version: '0.3.8', updatedAt: ago(1), shards: [
+    { id: 'pod-0', state: 'running', startedAt, plannedMin: 0 },
+  ] };
+  const desired = { ...previous, state: 'done' as const, endedAt: ago(0) };
+  expect(mergeGateShardBoardChanges(current, [previous], [desired]).shards[0]).toEqual(desired);
+});
+
+test('a runner flush adds a newly planned shard absent from the previous board file', () => {
+  const prior = { id: 'pod-0', state: 'done' as const };
+  const appended = { id: 'pod-1', state: 'pending' as const };
+  const current: GateShardsFile = { v: 1, version: '0.3.8', updatedAt: ago(1), shards: [prior] };
+  expect(mergeGateShardBoardChanges(current, [prior, appended], [prior, appended]).shards).toEqual([prior, appended]);
+});
+
 test('concurrent board updates serialize and retain both shard transitions', async () => {
   const root = mkdtempSync(join(tmpdir(), 'gate-shard-board-lock-'));
   try {

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "파일·미디어 처리 — 원본·파생물 수명 주기",
+  "source": "https://cloud.google.com/storage/docs/lifecycle",
+  "body": "적용 시점: 원본 보존과 변환 산출물이 서로 다른 비용·복구 정책을 가질 때.\n용량 단계: 필요한 복구기간과 파생물 재생성 비용을 비교한 뒤 lifecycle 규칙을 둔다.\nGCP 대응: Cloud Storage lifecycle, object versioning/retention policy, 메타데이터 원장에 derivation version 기록.\n비용 축: 저장 클래스, 버전 수, retrieval fee, 복제와 삭제 요청이 비용 축이다.\n결정과 반증: 파생물을 삭제해도 원본으로 재생성 가능한지, 보존 잠금이 정책과 맞는지 시험한다."
+}

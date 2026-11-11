@@ -24,8 +24,14 @@ test('GATE-MOCK-EVENT-SCENARIOS: distinct injected evidence pins gate judgements
       if (scenario.planner === 'dispatch') {
         expect(judged.evidence.kind).toBe('dispatch');
         if (judged.evidence.kind !== 'dispatch') throw new Error(`${scenario.id} needs dispatch evidence`);
-        if (scenario.expectedDispatchKinds) expect(judged.evidence.actions.map((item) => item.kind), scenario.id).toEqual(scenario.expectedDispatchKinds);
+        const actions = judged.evidence.actions;
+        if (scenario.expectedDispatchKinds) expect(actions.map((item) => item.kind), scenario.id).toEqual(scenario.expectedDispatchKinds);
         if (scenario.expectedDispatchSummary) expect(judged.evidence.summary, scenario.id).toEqual(scenario.expectedDispatchSummary);
+        if (scenario.expectedDispatchReasons) {
+          const reasons = Object.fromEntries([...new Set(actions.map((item) => item.reason))]
+            .map((reason) => [reason, actions.filter((item) => item.reason === reason).length]));
+          expect(reasons, scenario.id).toEqual(scenario.expectedDispatchReasons);
+        }
       }
       if (scenario.planner === 'partial') {
         expect(judged.evidence.kind).toBe('partial');
@@ -38,7 +44,7 @@ test('GATE-MOCK-EVENT-SCENARIOS: distinct injected evidence pins gate judgements
   console.log(['GATE-MOCK-EVENT-SCENARIOS', 'scenario | injected input | gate | decision', ...rows.map((row) =>
     `${row.scenario} | ${row.injectedInput} | ${row.outcome} | ${row.actual}`)].join('\n'));
 
-  expect(rows).toHaveLength(22);
+  expect(rows).toHaveLength(23);
 });
 
 test('GATE-MOCK-EVENT-SCENARIOS: injected HOLDs and malformed sweep summaries stay HOLD', async () => {

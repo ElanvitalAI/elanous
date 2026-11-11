@@ -16,6 +16,8 @@
 // is recorded in runtime.json + printed in boot banner.
 
 import { setInProcessOutbound } from '../../domains/outbound-alert.js';
+import { hasDeclaredPluginHttpGet, loadDeclaredPluginHttpGet } from '../../plugins/core/declared-handler.js';
+import { BUILTIN_DIR } from '../../plugins/core/host.js';
 import { getUserConfig, resolveNexusRelayConfig } from '../../user-config.js';
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { spawnSync } from 'node:child_process';
@@ -42,7 +44,7 @@ import { handleHqLlmProxy, HQ_LLM_PROXY_PATH, type HqLlmProxyDeps } from './hq-l
 import { recordLlmProxyCall } from '../../resource-ledger/resource-ledger.js';
 import { codexOAuthAvailable, getProviderForConfigAsync } from '../../llm.js';
 import { getSecretAsync } from '../config/secrets/index.js';
-import { handleResourceLedgerPoolDeclarationPost, handleResourceLedgerPoolsApi } from './resource-ledger.js';
+import { handleResourceLedgerHostReadinessPost, handleResourceLedgerPoolDeclarationPost, handleResourceLedgerPoolsApi } from './resource-ledger.js';
 import { handleMissionLineRequest, MissionLineHttpError } from '../../agent-mission/mission-line.js';
 import { resolveVerifiedMemberOwner as resolveVerifiedAppMemberOwner, resolveVerifiedOwner, type NexusAppHost } from '../apps/app-host.js';
 import type { AppLifecycleSnapshot } from '../apps/app-lifecycle-ledger.js';
@@ -69,6 +71,7 @@ import { OPENAI_RELAY_PATH, tryHandleOpenAiRelay } from './openai-relay.js';
 import { handleHealth, type HealthSetupContext } from './health.js';
 import { handleTabsList, handleTabDetail, handleNexusSnapshot } from './tabs.js';
 import { handleSseEvents } from './events.js';
+import { handleGraphRunEvents } from './graph-run-events.js';
 import { handleInsideEvents, INSIDE_EVENTS_PATH, startInsideEventRelay } from './inside-events.js';
 import { dispatchIntentPredictionRoute } from './intent-prediction.js';
 import { handleNotificationAction } from './notification-action.js';
@@ -1363,6 +1366,17 @@ export async function routeRequest(
     return jsonResponse({ error: 'method-not-allowed' }, 405);
   }
 
+  // Host heartbeats are accepted only over the protected machine transport and are bound to their expiring machine token.
+  if (pathname === '/v1/resource-ledger/host-readiness') {
+    if (method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
+    if (!isResourceLedgerTransportSecure(req, opts, server)) return jsonResponse({ error: 'secure-transport-required' }, 403);
+    const offered = req.headers.get('authorization');
+    const presented = offered?.startsWith('Bearer ') ? offered.slice(7).trim() : '';
+    const machine = presented ? machineForExpiringToken(presented, effectiveInstanceRoot()) : undefined;
+    if (!machine) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleResourceLedgerHostReadinessPost(req, machine);
+  }
+
   if (pathname === HQ_LLM_PROXY_PATH) {
     const bearer = /^Bearer\s+(\S+)$/i.exec(req.headers.get('authorization') ?? '')?.[1];
     // A short-lived member bearer still carries paid capability and request content.
@@ -1464,7 +1478,10 @@ export async function routeRequest(
       && compareTokenConstTime(offered.slice('Bearer '.length).trim(), fallbackToken);
     const graphPeerAuthorized = (method === 'GET' || method === 'PUT')
       && graphAccessForRequest(pathname, method, offered?.startsWith('Bearer ') ? offered.slice(7).trim() : null);
-    if (!(opts.metaApi ? checkAuth(req, opts.metaApi) : fallbackAuthorized) && !graphPeerAuthorized) {
+    const pluginOperator = method === 'GET' && !!opts.metaApi
+      && operatorSignal(req, opts.metaApi).operatorSource === 'op-proxy'
+      && hasDeclaredPluginHttpGet(BUILTIN_DIR, pathname);
+    if (!(opts.metaApi ? checkAuth(req, opts.metaApi) : fallbackAuthorized) && !graphPeerAuthorized && !pluginOperator) {
       const name = method === 'POST' && (pathname === '/v1/tasks' || pathname === '/v1/reports/ingest') && opts.metaApi
         ? matchIngestAuthorization(req)?.name
         : undefined;
@@ -3604,6 +3621,10 @@ export async function routeRequest(
     });
     if (response) return response;
   }
+  if (pathname.startsWith('/v1/graph-runs/')) {
+    const graphRunEvents = handleGraphRunEvents(req, url);
+    if (graphRunEvents) return graphRunEvents;
+  }
   if (pathname === '/v1/events') {
     const topics = (url.searchParams.get('topics') ?? '').split(',').map(topic => topic.trim()).filter(Boolean);
     const hasBoardTopic = topics.includes('board.card');
@@ -3752,6 +3773,17 @@ export async function routeRequest(
     }
   }
 
+  if (method === 'GET') {
+    try {
+      const handler = await loadDeclaredPluginHttpGet<(request: Request, context: { operator: boolean }) => Response | Promise<Response>>(BUILTIN_DIR, pathname);
+      if (handler) {
+        const signal = opts.metaApi ? operatorSignal(req, opts.metaApi) : { operator: false, operatorSource: null };
+        const owner = !!opts.metaApi && bearerCredential(req, opts.metaApi) === 'bearer-match';
+        if (!owner) return jsonResponse({ error: 'unauthorized' }, 401);
+        return handler(req, { operator: signal.operator });
+      }
+    } catch { return jsonResponse({ error: 'plugin-read-unavailable' }, 503); }
+  }
   return jsonResponse({ error: 'not-found', path: pathname }, 404);
 }
 

@@ -37,9 +37,11 @@ export function runWithUserConfigSnapshot<T>(snapshot: UserConfig, run: () => T)
   return scopedConfigSnapshot.run(snapshot, run);
 }
 
-export function setUserConfigOverlay(fn: ((config: UserConfig) => UserConfig) | null): void {
+export function setUserConfigOverlay(fn: ((config: UserConfig) => UserConfig) | null): ((config: UserConfig) => UserConfig) | null {
+  const previous = configOverlay;
   configOverlay = fn;
   resetUserConfig();
+  return previous;
 }
 
 /** Pure ISO-2 conversion policy retained for config sync callers. */

@@ -26,11 +26,12 @@
 import { execFileSync } from 'node:child_process';
 import { chmodSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { DEFAULT_CODEX_ACCOUNT, codexStoreKey, isValidAccountName, resolveCodexAccount, effectiveCodexHome, type CodexAccountResolution } from './codex-account.js';
+import { DEFAULT_CODEX_ACCOUNT, codexStoreKey, isValidAccountName, effectiveCodexHome, type CodexAccountResolution } from './codex-account.js';
 import { importCodexAccountFromHome, resolveCodexAccountForRun } from './codex-account-store.js';
 import { decodeJWTPayload } from './jwt.js';
-import { authStorePath, isUnderTestRunner, readCodexMirrorTokens } from './store.js';
+import { authStorePath, isUnderTestRunner } from './store.js';
 import { codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
+import { getUserConfig } from '../user-config.js';
 import { platform, release, arch } from 'node:os';
 import {
   saveTokens, loadTokens, expiresAtFromSeconds,
@@ -465,37 +466,29 @@ function remainingSeconds(state: ProviderAuthState | null): number | null {
   return Math.round((exp - Date.now()) / 1000);
 }
 
-function hasLocalCodexLogin(): boolean {
-  try {
-    const account = resolveCodexAccount(process.env, { storedHome: (key) => loadTokens(key)?.codexHome });
-    if (loadTokens(account.storeKey)) return true;
-    const home = effectiveCodexHome(account, null, process.env).home;
-    return Boolean(home && readCodexMirrorTokens(join(home, 'auth.json')));
-  } catch {
-    return false;
-  }
+/** Shared remote consumer for availability probes and every Codex provider request. */
+export function readCodexOwnerMirrorForRun(ownerMirrorPath?: string): { state: ProviderAuthState; storeKey: string } {
+  const mirrorPath = ownerMirrorPath ?? codexOwnerMirrorAuthPath();
+  const account = resolveCodexAccountForRun(process.env, { storePath: mirrorPath });
+  return { state: readCodexOwnerAccessMirror(account.storeKey, { path: mirrorPath }), storeKey: account.storeKey };
 }
 
 export async function loadFreshCodexAuthState(
   opts: { fetchImpl?: typeof fetch; mirrorCodex?: boolean; ownerMirrorPath?: string } = {},
 ): Promise<ProviderAuthState | null> {
-  let tokenOwnerHost = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY !== '1' && isUnderTestRunner();
-  if (!tokenOwnerHost && process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY !== '1' && hasLocalCodexLogin()) {
-    // A standalone machine with a user's own Codex login is an owner. Seats and Pods
-    // stay mirror-only because their access-only environment is an explicit fence.
-    tokenOwnerHost = true;
-  }
-  if (!tokenOwnerHost && process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY !== '1' && isCodexTokenOwnerHost()) {
+  const accessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1';
+  const ownerConfig = getUserConfig();
+  const testRunner = isUnderTestRunner();
+  let tokenOwnerHost = !accessOnly && isCodexTokenOwnerHost(ownerConfig);
+  if (tokenOwnerHost && !testRunner) {
     const { hqFenceDecision } = await import('../hq/hq.js');
     tokenOwnerHost = hqFenceDecision('ledger-cli').run;
   }
   if (!tokenOwnerHost) {
     // A non-owner host reads only the HQ-pushed access snapshot. It never
     // reconciles ~/.codex or reaches the refresh endpoint with local credentials.
-    const mirrorPath = opts.ownerMirrorPath ?? codexOwnerMirrorAuthPath();
-    const account = resolveCodexAccountForRun(process.env, { storePath: mirrorPath });
-    const state = readCodexOwnerAccessMirror(account.storeKey, { path: mirrorPath });
-    observeCodexAuth('fresh', { storeKey: account.storeKey, remainingSeconds: remainingSeconds(state), refreshed: false, source: 'owner-cli-mirror' });
+    const { state, storeKey } = readCodexOwnerMirrorForRun(opts.ownerMirrorPath);
+    observeCodexAuth('fresh', { storeKey, remainingSeconds: remainingSeconds(state), refreshed: false, source: 'owner-cli-mirror' });
     return state;
   }
   // ⭐ 어느 «계정»의 토큰인가 — 기본 계정이면 종전과 동일한 키(`openai-codex`)다.

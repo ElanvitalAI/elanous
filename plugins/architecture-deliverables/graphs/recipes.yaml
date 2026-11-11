@@ -1,0 +1,12 @@
+design:
+  command: 'bun "$ELANOUS_RUNTIME_ROOT/src/graph-runner/architecture-output/run-step.ts" design'
+  timeout_ms: 30000
+diagram:
+  command: 'bun "$ELANOUS_RUNTIME_ROOT/src/graph-runner/architecture-output/run-step.ts" diagram'
+  timeout_ms: 600000
+pdf:
+  command: 'bun "$ELANOUS_RUNTIME_ROOT/src/graph-runner/architecture-output/run-step.ts" pdf'
+  timeout_ms: 600000
+verify:
+  command: 'bun "$ELANOUS_RUNTIME_ROOT/src/graph-runner/architecture-output/run-step.ts" verify'
+  timeout_ms: 30000

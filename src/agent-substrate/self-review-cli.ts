@@ -22,6 +22,7 @@ import { appendWaiverEvent, appendWaiverEvents, consumeWaiverEvent, evaluateWaiv
 import { tierModel } from '../llm/model-defaults.js';
 import { buildReviewObservation, reviewIntentFingerprint, safeLogText } from './review-observation.js';
 import { checkCitedReviewPathsAtHead, citedReviewPaths, reviewFindingKey } from './review-finding-key.js';
+import { assessReviewRoundDesignTrigger } from './review-round-design-trigger.js';
 import { DEFAULT_REVIEW_BACKEND, defaultAcpReviewTimeoutSec } from './acp-reviewer.js';
 import { ZAI_OPENROUTER_FALLBACK_MODEL } from '../llm/zai-coding-plan.js';
 import { debug } from '../debug/log.js';
@@ -34,6 +35,7 @@ import { getUserConfig } from '../user-config/reader.js';
 import type { LLMProviderName, ReviewerMixSpec, RoleLlmSpec, SubscriptionReviewerSpec } from '../user-config/types.js';
 import { loadLlmPolicy } from '../policy/llm-policy.js';
 import { listRunLedgers, lookupPrGoalAcceptance, lookupRunLedger, type PrGoalAcceptanceLookup, type RunLedgerEntry, type RunLedgerLookup } from '../self-implement/run-ledger.js';
+import { decideReviewCapPolicy, REVIEW_CAP_R5_LIMIT, REVIEW_CAP_RELEASE_PATHS, reviewCapIncidentId } from './review-cap-policy.js';
 
 /** SUBSCRIPTION-EXHAUST-REROUTE — API reviewer when the configured `roleLlm.reviewer` lane is unavailable (off codex). */
 export const ROLE_REVIEWER_FALLBACK_MODEL = 'openrouter/z-ai/glm-5.3';
@@ -189,6 +191,8 @@ interface SavedReviewEvidence {
   fixedFindings: string[];
   latestFixedFindings: string[];
   priorFindings: string[];
+  immediatelyPreviousReview: { head: string; findings: string[] } | null;
+  verifiedOrderedHeads: string[];
   unreadableFiles: string[];
 }
 
@@ -276,15 +280,18 @@ function readReviewLoopBreakerLock(pr: string, root = effectiveInstanceRoot()): 
   const record = value as Record<string, unknown>;
   const validReason = record.reason === 'two-consecutive-stale-reopen-rounds'
     || record.reason === 'review-cap-exceeded';
-  return record.pr === pr && record.state === 'waiver-needed'
-    && typeof record.head === 'string' && COMMIT_OID.test(record.head)
-    && validReason ? record : corrupt();
+  if (record.pr !== pr || record.state !== 'waiver-needed'
+    || typeof record.head !== 'string' || !COMMIT_OID.test(record.head) || !validReason) return corrupt();
+  const incidentId = reviewCapIncidentId(pr, record.head);
+  return record.incidentId === undefined || record.incidentId === incidentId
+    ? { ...record, incidentId, releasePaths: REVIEW_CAP_RELEASE_PATHS } : corrupt();
 }
 
 function writeReviewLoopBreakerLock(pr: string, head: string, reason: string, root = effectiveInstanceRoot()): void {
   const path = reviewLoopBreakerLockPath(pr, root);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify({ pr, head, state: 'waiver-needed', reason, writtenAt: Date.now() }) + '\n');
+  writeFileSync(path, JSON.stringify({ pr, head, incidentId: reviewCapIncidentId(pr, head),
+    releasePaths: REVIEW_CAP_RELEASE_PATHS, state: 'waiver-needed', reason, writtenAt: Date.now() }) + '\n');
 }
 
 interface SavedReviewForDelta {
@@ -564,14 +571,18 @@ function savedReviewEvidence(
 ): SavedReviewEvidence {
   const dir = join(root, 'review-results');
   let names: string[];
-  try { names = readdirSync(dir); } catch { return { heads: [], records: [], loopRounds: [], fixedFindings: [], latestFixedFindings: [], priorFindings: [], unreadableFiles: [] }; }
+  try { names = readdirSync(dir); } catch { return { heads: [], records: [], loopRounds: [], fixedFindings: [], latestFixedFindings: [], priorFindings: [], immediatelyPreviousReview: null, verifiedOrderedHeads: [], unreadableFiles: [] }; }
   const escapedPr = pr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const matchingPrInName = new RegExp(`(?:^|-)${escapedPr}(?:-|\\.json$)`, 'i');
   const records = new Map<string, { head: string; reviewedAt: number; model?: string; capExempt?: boolean }>();
   const loopRounds = new Map<string, { head: string; reviewedAt: number; state: 'clear' | 'stale-reopen' }>();
   const fixedFindings = new Map<string, string>();
   let latestFindings: { reviewedAt: number; findings: string[] } | undefined;
+  let latestReviewed: { head: string; reviewedAt: number; findings: string[] } | undefined;
+  let latestReviewedAmbiguous = false;
   let latestFixed: { reviewedAt: number; findings: string[] } | undefined;
+  const reviewLinks = new Map<string, { basedOn: string | null; findings: string[]; reviewedAt: number }>();
+  const ambiguousLinks = new Set<string>();
   const unreadableFiles: string[] = [];
   for (const name of names) {
     if (!name.toLowerCase().endsWith('.json')) continue;
@@ -606,6 +617,22 @@ function savedReviewEvidence(
       if (!latestFindings || reviewedAt > latestFindings.reviewedAt) latestFindings = { reviewedAt, findings };
       const fixedThisRound: string[] = [];
       const normalized = head.toLowerCase();
+      const basedOn = typeof result.basedOn === 'string' && COMMIT_OID.test(result.basedOn)
+        ? result.basedOn.toLowerCase() : null;
+      const earlierLink = reviewLinks.get(normalized);
+      if (earlierLink && (earlierLink.basedOn !== basedOn
+        || (earlierLink.reviewedAt === reviewedAt && JSON.stringify(earlierLink.findings) !== JSON.stringify(findings)))) {
+        ambiguousLinks.add(normalized);
+      }
+      if (!earlierLink || reviewedAt > (records.get(normalized)?.reviewedAt ?? -1)) {
+        reviewLinks.set(normalized, { basedOn, findings, reviewedAt });
+      }
+      if (!latestReviewed || reviewedAt > latestReviewed.reviewedAt) {
+        latestReviewed = { head: normalized, reviewedAt, findings };
+        latestReviewedAmbiguous = false;
+      } else if (reviewedAt === latestReviewed.reviewedAt) {
+        latestReviewedAmbiguous = true;
+      }
       const model = [result.model, result.respondedModel, result.requestedModel]
         .find((value): value is string => typeof value === 'string' && value.trim().length > 0);
       const existing = records.get(normalized);
@@ -640,9 +667,28 @@ function savedReviewEvidence(
     }
   }
   const saved = [...records.values()];
+  // Source: OP REVIEW-ROUND-DESIGN-TRIGGER Terra review #36735; timestamps alone do not prove PR head order.
+  const orderedRecords = saved.filter((record) => !record.capExempt);
+  const linkedBy = new Set(orderedRecords.map((record) => reviewLinks.get(record.head)?.basedOn).filter((head): head is string => !!head));
+  const tips = orderedRecords.filter((record) => !linkedBy.has(record.head));
+  const verifiedOrderedHeads: string[] = [];
+  if (tips.length === 1 && ambiguousLinks.size === 0) {
+    let cursor: string | null = tips[0]!.head;
+    const seen = new Set<string>();
+    while (cursor && !seen.has(cursor) && records.has(cursor)) {
+      seen.add(cursor);
+      verifiedOrderedHeads.unshift(cursor);
+      cursor = reviewLinks.get(cursor)?.basedOn ?? null;
+    }
+    if (cursor || verifiedOrderedHeads.length !== orderedRecords.length) verifiedOrderedHeads.length = 0;
+  }
+  const verifiedTip = verifiedOrderedHeads.at(-1);
   return { heads: saved.filter((record) => !record.capExempt).map(({ head }) => head), records: saved, loopRounds: [...loopRounds.values()],
     fixedFindings: [...fixedFindings.values()], latestFixedFindings: latestFixed?.findings ?? [],
-    priorFindings: latestFindings?.findings ?? [], unreadableFiles };
+    priorFindings: latestFindings?.findings ?? [],
+    immediatelyPreviousReview: verifiedTip && reviewLinks.has(verifiedTip)
+      ? { head: verifiedTip, findings: reviewLinks.get(verifiedTip)!.findings } : null,
+    verifiedOrderedHeads, unreadableFiles };
 }
 
 export function savedReviewHeads(pr: string, root = effectiveInstanceRoot()): string[] {
@@ -785,7 +831,7 @@ interface DiffRead {
   refetched: boolean;
   source: DiffSource;
   /** `sha-pinned` 를 못 쓴 이유. 폴백했을 때만 채운다. ⛔ 부재와 미지를 같은 값으로 두지 않는다. */
-  pinFallbackReason?: 'head-unknown' | 'base-oid-unknown' | 'repo-unknown' | 'compare-failed';
+  pinFallbackReason?: 'head-unknown' | 'base-oid-unknown' | 'repo-unknown' | 'compare-failed' | 'compare-empty';
   baseCommit?: string;
   excludedMainMergeFiles?: number;
 }
@@ -1075,7 +1121,11 @@ function readDiffPinnedToSha(pr: string, head: CommitIdentity, deps: SelfReviewC
     ['api', `repos/${repo}/compare/${baseOid}...${head.value}`, '-H', 'Accept: application/vnd.github.diff'],
     25_000,
   );
+  // Some remote gh compare calls have returned exit 0 with an empty body.
+  // A successful exit alone is not evidence of a reviewable diff: retry via
+  // the head-sandwich path and keep the weaker provenance visible.
   if (diff.status !== 0) return { fallback: 'compare-failed' };
+  if (!diff.stdout.trim()) return { fallback: 'compare-empty' };
   // ⛔⭐ **결속과 최신성은 다른 것이다.** SHA 고정은 *"이 diff 가 이 SHA 의 것"* 을 보장하지만
   //    *"이 SHA 가 지금 PR 의 head"* 는 보장하지 않는다. `gh pr view` 는 push 직후 **낡은
   //    `headRefOid`** 를 줄 수 있고(실측 2026-07-30: PR head `8d4569221` 인데 조회가
@@ -2057,7 +2107,7 @@ export async function runSelfReviewCliCommand(
         let completedWithError = false;
         const pinnedHead = initialHead.value;
         const priorEvidence = savedReviewEvidence(pr);
-        const capWasActive = priorEvidence.heads.length + priorEvidence.unreadableFiles.length >= 5;
+        const capWasActive = priorEvidence.heads.length + priorEvidence.unreadableFiles.length >= REVIEW_CAP_R5_LIMIT;
         const canonicalResultPath = join(effectiveInstanceRoot(), 'review-results', `pr-${pr}-${pinnedHead.slice(0, 12)}.json`);
         if (capWasActive && existsSync(canonicalResultPath)
           && !isReplaceableErrorArtifact(canonicalResultPath, pr, pinnedHead)) {
@@ -2309,34 +2359,43 @@ async function runSelfReviewCliCommandPinned(
     });
     const previousHeads = savedEvidence.heads;
     const previousRoundCount = previousHeads.length + savedEvidence.unreadableFiles.length;
-    const shouldPersistCapResult = previousRoundCount >= 5 && !opts.reviewerMixPrimaryLane;
+    const shouldPersistCapResult = previousRoundCount >= REVIEW_CAP_R5_LIMIT && !opts.reviewerMixPrimaryLane;
     const reason = opts.overCapReason?.trim();
-    const authorization = previousRoundCount >= 5 ? readCapOverride(pr) : undefined;
+    const authorization = previousRoundCount >= REVIEW_CAP_R5_LIMIT ? readCapOverride(pr) : undefined;
     const capPreflightHead = savedEvidence.records.length > 0 ? prHeadCommit(pr, deps).value.toLowerCase() : undefined;
+    const capPolicyHead = capPreflightHead ?? (previousRoundCount >= REVIEW_CAP_R5_LIMIT
+      ? prHeadCommit(pr, deps).value.toLowerCase() : 'unpinned');
     const capPreflightAnchors = savedEvidence.records.length > 0 ? prCompareAnchors(pr, deps) : {};
     const capExemptHead = savedEvidence.records.length > 0 && !opts.reviewerMixPrimaryLane && !opts.reviewerMixCapClaimed
       ? mainMergeOnlyCapExemptHead(savedEvidence.records, capPreflightHead, capPreflightAnchors.baseRefName, capPreflightAnchors.baseOid, deps.git)
       : undefined;
     deps.observeDoctorReview?.('round-counted', { pr, previousRoundCount, round: previousRoundCount + 1 });
-    const opAllowed = previousRoundCount >= 5 && opAllowsReviewOverCap(pr);
-    if (previousRoundCount >= 5) {
+    const opAllowed = opAllowsReviewOverCap(pr);
+    const capPreflightPolicy = decideReviewCapPolicy({ pr, head: capPolicyHead,
+      previousReviewCount: previousRoundCount, opAllowlisted: opAllowed, overCapReason: reason,
+      priorAuthorization: authorization !== undefined && opAllowed, capClaimed: opts.reviewerMixCapClaimed,
+      mainMergeReviewInherited: capExemptHead !== undefined });
+    if (previousRoundCount >= REVIEW_CAP_R5_LIMIT) {
       deps.observeDoctorReview?.('cap-attempt', { pr, previousRoundCount, round: previousRoundCount + 1, reasonProvided: Boolean(reason), opAllowed, mainMergeExempt: capExemptHead !== undefined }, { level: 'warn' });
     }
-    if (previousRoundCount >= 5 && !capExemptHead && (!opAllowed || (!authorization && !reason && !opts.reviewerMixCapClaimed))) {
-      const refusalHead = capPreflightHead ?? prHeadCommit(pr, deps).value;
+    if (!capPreflightPolicy.allowed) {
+      const refusalHead = capPolicyHead;
       if (COMMIT_OID.test(refusalHead)) writeReviewLoopBreakerLock(pr, refusalHead, 'review-cap-exceeded');
       const message = !opAllowed
         ? `PR ${pr}: r5 상한 초과 리뷰는 OP traffic.json reviewOverCapAllow 허용 목록에 있어야 합니다.`
         : `PR ${pr}: 저장된 서로 다른 head 리뷰 ${previousRoundCount}개로 r5 상한에 도달했습니다. OP 허용 상태와 --over-cap-reason <사유>가 필요합니다.`;
       deps.observeDoctorReview?.('cap-refused', { pr, head: refusalHead, previousRoundCount, round: previousRoundCount + 1,
+        incidentId: capPreflightPolicy.incidentId, releasePaths: capPreflightPolicy.releasePaths,
         reason: opAllowed ? 'missing-reason' : 'not-op-allowlisted' }, { level: 'warn' });
-      deps.log('review.loop-breaker', { pr, head: refusalHead, state: 'waiver-needed', reason: 'review-cap-exceeded', previousRoundCount }, { level: 'warn' });
+      deps.log('review.loop-breaker', { pr, head: refusalHead, incidentId: capPreflightPolicy.incidentId,
+        releasePaths: capPreflightPolicy.releasePaths, state: 'waiver-needed', reason: 'review-cap-exceeded', previousRoundCount }, { level: 'warn' });
       if (opts.sinceReview !== undefined) deps.log('review.delta-heal', {
         pr, cause: 'cap-refused', prescription: 'retain-explicit-refusal', result: 'refused', headCommit: refusalHead,
       }, { level: 'warn' });
       deps.error(message);
       if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'waiver-needed', failureReason: 'waiver-needed',
-        loopBreaker: { state: 'waiver-needed', reason: 'review-cap-exceeded' },
+        loopBreaker: { state: 'waiver-needed', reason: 'review-cap-exceeded', incidentId: capPreflightPolicy.incidentId,
+          releasePaths: capPreflightPolicy.releasePaths },
         ...(opts.sinceReview !== undefined ? { verdict: null, deltaOutcome: 'refused', deltaRefusal: 'waiver-needed' } : {}),
         previousRoundCount, headCommit: refusalHead });
       failed += 1;
@@ -2386,6 +2445,14 @@ async function runSelfReviewCliCommandPinned(
       deltaBase = undefined;
       diffResult = { read: readDiffAtHead(pr, deps) };
     }
+    // A head containing only clean main merges has no PR-authored delta.
+    // Review the complete SHA-pinned PR diff instead of treating that empty
+    // authored segment as a failed GitHub diff read.
+    if (deltaBase && opts.sinceReview === undefined && 'read' in diffResult && !diffResult.read.diff.stdout.trim()) {
+      deltaFallbackReason = 'delta-no-authored-change';
+      deltaBase = undefined;
+      diffResult = { read: readDiffAtHead(pr, deps) };
+    }
     if ('error' in diffResult) {
       if (diffResult.error === 'no-new-head-since-review' && deltaBase) {
         const reused = { ...deltaBase.result, deltaOutcome: 'reused', deltaHeal: {
@@ -2416,12 +2483,19 @@ async function runSelfReviewCliCommandPinned(
         && diffRead.currentHeadCommitState === 'known'
         && diffRead.currentHeadCommit.toLowerCase() === diffRead.headCommit.toLowerCase()
         && rechecked === diffRead.headCommit.toLowerCase();
-      if (!mainMergeCapExempt && previousRoundCount >= 5 && (!opAllowed || (!authorization && !reason && !opts.reviewerMixCapClaimed))) {
+      const pinnedCapPolicy = decideReviewCapPolicy({ pr, head: diffRead.headCommit,
+        previousReviewCount: previousRoundCount, opAllowlisted: opAllowed, overCapReason: reason,
+        priorAuthorization: authorization !== undefined && opAllowed, capClaimed: opts.reviewerMixCapClaimed,
+        mainMergeReviewInherited: mainMergeCapExempt });
+      if (!pinnedCapPolicy.allowed) {
         const message = `PR ${pr}: pinned diff head가 main-merge-only 예외를 충족하지 않아 r5 상한 예외가 필요합니다.`;
         if (COMMIT_OID.test(diffRead.headCommit)) writeReviewLoopBreakerLock(pr, diffRead.headCommit, 'review-cap-exceeded');
-        deps.observeDoctorReview?.('cap-refused', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason: 'merge-only-head-recheck-failed' }, { level: 'warn' });
+        deps.observeDoctorReview?.('cap-refused', { pr, head: diffRead.headCommit, incidentId: pinnedCapPolicy.incidentId,
+          releasePaths: pinnedCapPolicy.releasePaths, previousRoundCount, round: previousRoundCount + 1,
+          reason: 'merge-only-head-recheck-failed' }, { level: 'warn' });
         deps.error(message);
-        if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'waiver-needed', previousRoundCount, headCommit: diffRead.headCommit });
+        if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, refusal: 'waiver-needed',
+          previousRoundCount, headCommit: diffRead.headCommit, reviewCapPolicy: pinnedCapPolicy });
         failed += 1;
         continue;
       }
@@ -2430,13 +2504,9 @@ async function runSelfReviewCliCommandPinned(
     // A cap refusal writes a loop-breaker lock before an OP can authorize the
     // retry. A same-head stale-reopen lock can likewise predate the one-use
     // cap grant; let the normal cap preflight/claim govern that single attempt.
-    const sameHeadLoopLock = loopLock?.reason === 'two-consecutive-stale-reopen-rounds'
-      && (!COMMIT_OID.test(diffRead.headCommit) || loopLock.head === diffRead.headCommit);
-    const opAuthorizedCapRetry = (loopLock?.reason === 'review-cap-exceeded' || sameHeadLoopLock)
-      && previousRoundCount >= 5 && opAllowsReviewOverCap(pr) && Boolean(reason);
     // REVIEW-CAP-MAINMERGE-EXEMPT: a cap refusal lock on a merge-only successor head is
     // bypassed without the OP allowance loop — the head itself is exempt from the cap.
-    const capExemptLockHead = loopLock?.reason === 'review-cap-exceeded' && previousRoundCount >= 5
+    const capExemptLockHead = loopLock?.reason === 'review-cap-exceeded' && previousRoundCount >= REVIEW_CAP_R5_LIMIT
       && !opts.reviewerMixPrimaryLane && !opts.reviewerMixCapClaimed
       ? (() => {
         const anchors = prCompareAnchors(pr, deps);
@@ -2445,17 +2515,29 @@ async function runSelfReviewCliCommandPinned(
       : undefined;
     const mainMergeCapExemptRetry = capExemptLockHead !== undefined && capExemptLockHead === diffRead.headCommit.toLowerCase();
     mainMergeCapExempt ||= mainMergeCapExemptRetry;
+    const loopWaiverClaimRequired = loopLock?.reason === 'two-consecutive-stale-reopen-rounds'
+      && loopLock.head === diffRead.headCommit.toLowerCase() && !mainMergeCapExempt;
+    const loopPolicy = decideReviewCapPolicy({ pr, head: diffRead.headCommit, previousReviewCount: previousRoundCount,
+      opAllowlisted: opAllowed, overCapReason: reason,
+      priorAuthorization: authorization !== undefined && opAllowed, capClaimed: opts.reviewerMixCapClaimed,
+      mainMergeReviewInherited: mainMergeCapExempt,
+      ...(loopLock ? { loopBreaker: { reason: String(loopLock.reason ?? 'review-loop-lock-corrupt'),
+        ...(typeof loopLock.head === 'string' ? { head: loopLock.head } : {}) } } : {}),
+    });
     // Stale-reopen locks belong to the exact head that produced them. Other
     // waiver-needed reasons retain their existing global stop/OP-cap semantics.
-    if (loopLock && (loopLock.reason !== 'two-consecutive-stale-reopen-rounds' || sameHeadLoopLock)
-      && !opAuthorizedCapRetry && !mainMergeCapExemptRetry) {
+    if (loopLock && !loopPolicy.allowed) {
       const message = loopLock.reason === 'review-loop-lock-corrupt'
         ? `PR ${pr}: 반복 리뷰 lock 파일이 손상됐거나 신원이 맞지 않아 fail-closed 했습니다. lock 파일 점검이 필요합니다.`
         : `PR ${pr}: 반복 리뷰 중단 (${String(loopLock.reason ?? 'waiver-needed')}); OP 웨이버가 필요합니다.`;
-      deps.observeDoctorReview?.('loop-breaker', { pr, head: diffRead.headCommit, state: 'waiver-needed', reason: loopLock.reason }, { level: 'warn' });
-      deps.log('review.loop-breaker', { pr, head: diffRead.headCommit, state: 'waiver-needed', reason: loopLock.reason }, { level: 'warn' });
+      deps.observeDoctorReview?.('loop-breaker', { pr, head: diffRead.headCommit, incidentId: loopPolicy.incidentId,
+        releasePaths: loopPolicy.releasePaths, state: 'waiver-needed', reason: loopLock.reason }, { level: 'warn' });
+      deps.log('review.loop-breaker', { pr, head: diffRead.headCommit, incidentId: loopPolicy.incidentId,
+        releasePaths: loopPolicy.releasePaths, state: 'waiver-needed', reason: loopLock.reason }, { level: 'warn' });
       if (opts.json || opts.save !== undefined) results.push({ pr, error: message, reviewed: false, verdict: null,
-        refusal: 'waiver-needed', failureReason: 'waiver-needed', loopBreaker: { state: 'waiver-needed', reason: loopLock.reason }, headCommit: diffRead.headCommit });
+        refusal: 'waiver-needed', failureReason: 'waiver-needed', reviewCapPolicy: loopPolicy,
+        loopBreaker: { state: 'waiver-needed', reason: loopLock.reason, incidentId: loopPolicy.incidentId,
+          releasePaths: loopPolicy.releasePaths }, headCommit: diffRead.headCommit });
       else deps.error(message);
       failed += 1;
       continue;
@@ -2491,7 +2573,7 @@ async function runSelfReviewCliCommandPinned(
       failed += 1;
       continue;
     }
-    if (previousRoundCount >= 5 && authorization && diffRead.headCommit.toLowerCase() === authorization.head
+    if (previousRoundCount >= REVIEW_CAP_R5_LIMIT && authorization && diffRead.headCommit.toLowerCase() === authorization.head
       && !opts.reviewerMixCapClaimed) {
       const resultExists = canonicalResultPath && existsSync(canonicalResultPath);
       const message = resultExists
@@ -2503,7 +2585,7 @@ async function runSelfReviewCliCommandPinned(
       failed += 1;
       continue;
     }
-    if (previousRoundCount >= 5 && authorization && reason && reason !== authorization.reason) {
+    if (previousRoundCount >= REVIEW_CAP_R5_LIMIT && authorization && reason && reason !== authorization.reason) {
       const message = `PR ${pr}: 기존 PR 승인의 사유와 일치하지 않습니다.`;
       deps.observeDoctorReview?.('cap-refused', { pr, head: diffRead.headCommit, previousRoundCount, round: previousRoundCount + 1, reason: 'authorization-reason-mismatch' }, { level: 'warn' });
       deps.error(message);
@@ -2512,7 +2594,7 @@ async function runSelfReviewCliCommandPinned(
       continue;
     }
     let mergeOnlyDeltaRange: { base: string; head: string } | undefined;
-    if (previousRoundCount >= 5 && authorization && !opts.reviewerMixCapClaimed) {
+    if (previousRoundCount >= REVIEW_CAP_R5_LIMIT && authorization && !opts.reviewerMixCapClaimed) {
       const git = deps.git;
       if (!git || diffRead.source !== 'sha-pinned' || diffRead.headCommitState !== 'known'
         || diffRead.currentHeadCommitState !== 'known' || diffRead.stale || diffRead.diff.status !== 0) {
@@ -2574,7 +2656,8 @@ async function runSelfReviewCliCommandPinned(
         }
         if (commits.stdout.trim() === '') mergeOnlyDeltaRange = { base: classificationBase, head: diffRead.headCommit.toLowerCase() };
       }
-    } else if (previousRoundCount >= 5 && reason && !opts.reviewerMixCapClaimed) {
+    } else if ((previousRoundCount >= REVIEW_CAP_R5_LIMIT || loopWaiverClaimRequired)
+      && reason && !opts.reviewerMixCapClaimed) {
       // Claim only the exact SHA-pinned diff that the reviewer will see; never spend an OP
       // authorization on a separately read head that may move before readDiffAtHead.
       const claimable = diffRead.source === 'sha-pinned' && diffRead.headCommitState === 'known'
@@ -2623,7 +2706,7 @@ async function runSelfReviewCliCommandPinned(
       diffRead.diff = delta;
       diffRead.baseCommit = mergeOnlyDeltaRange.base;
     }
-    if (previousRoundCount >= 5 && authorization && !opts.reviewerMixCapClaimed
+    if (previousRoundCount >= REVIEW_CAP_R5_LIMIT && authorization && !opts.reviewerMixCapClaimed
       && !claimCapOverride(pr, diffRead.headCommit, authorization.reason, deps.now())) {
       const message = `PR ${pr}: 후속 head 승인 사용 기록을 남기지 못했습니다.`;
       deps.error(message);
@@ -2631,7 +2714,7 @@ async function runSelfReviewCliCommandPinned(
       failed += 1;
       continue;
     }
-    if (previousRoundCount >= 5 && authorization && !opts.reviewerMixCapClaimed) {
+    if (previousRoundCount >= REVIEW_CAP_R5_LIMIT && authorization && !opts.reviewerMixCapClaimed) {
       claimedCapPath = join(effectiveInstanceRoot(), 'review-results', `cap-override-${pr}-head-${diffRead.headCommit.toLowerCase()}.json`);
       let capWaiverObservations: Array<Record<string, unknown>>;
       try { capWaiverObservations = recordReviewCapWaiverEvents(pr, diffRead.headCommit, authorization.reason, deps.now(), claimedCapPath); }
@@ -2767,13 +2850,19 @@ async function runSelfReviewCliCommandPinned(
       // ⭐ `warning` 이 이미 행동 문구를 품는다(두 생성기가 같은 형상) — ⛔ 여기서 action 을 또 붙이면
       //    같은 문장이 두 번 나온다(리뷰 must-fix).
       if (mismatchWarning) deps.error(mismatchWarning.warning);
-      const err = `gh pr diff 실패: ${(diff.stderr || '').slice(0, 140)}`;
+      const reason = diff.status === 0 && !diff.stdout.trim()
+        ? `empty diff body${diffRead.pinFallbackReason ? ` after ${diffRead.pinFallbackReason} fallback` : ''}`
+        : (diff.stderr || '').slice(0, 140);
+      const err = `gh pr diff 실패: ${reason}`;
       deps.log('diff-fail',
-        { pr: safeLogText(pr), exit: diff.status, error: safeLogText(diff.stderr || err, 160) },
+        { pr: safeLogText(pr), exit: diff.status, error: safeLogText(diff.stderr || err, 160),
+          diffSource: diffRead.source, pinFallbackReason: diffRead.pinFallbackReason ?? null,
+          stdoutBytes: Buffer.byteLength(diff.stdout, 'utf8') },
         { level: 'warn' });
       const contextOutput = reviewerContextOutput(reviewerContext, decompositionContext);
       const errorResult = { pr, error: err, reviewed: false, headCommit: diffRead.headCommit,
         currentHeadCommit: diffRead.currentHeadCommit, stale: diffRead.stale,
+        diffSource: diffRead.source, ...(diffRead.pinFallbackReason ? { diffPinFallbackReason: diffRead.pinFallbackReason } : {}),
         ...contextOutput, ...comparisonData, ...(mismatchWarning ?? {}) };
       if (opts.json || opts.save !== undefined) results.push(errorResult);
       if (canonicalResultPath && COMMIT_OID.test(diffRead.headCommit)
@@ -3089,7 +3178,14 @@ async function runSelfReviewCliCommandPinned(
       // stale-reopen streak remains over threshold. The one-use claim prevents
       // another same-head attempt; preserve the loop state for observability.
       const capReviewClaimed = Boolean(claimedCapPath) || opts.reviewerMixCapClaimed === true;
-      if (nextStreak >= 2 && !capReviewClaimed) {
+      const postReviewLoopPolicy = decideReviewCapPolicy({ pr, head: diffRead.headCommit, previousReviewCount: previousRoundCount,
+      opAllowlisted: opAllowed, overCapReason: reason,
+        priorAuthorization: authorization !== undefined && opAllowed,
+        capClaimed: capReviewClaimed && previousRoundCount >= REVIEW_CAP_R5_LIMIT,
+        mainMergeReviewInherited: mainMergeCapExempt,
+        ...(nextStreak >= 2 ? { loopBreaker: { reason: 'two-consecutive-stale-reopen-rounds', head: diffRead.headCommit } } : {}),
+      });
+      if (nextStreak >= 2 && !postReviewLoopPolicy.allowed) {
         loopReason = 'two-consecutive-stale-reopen-rounds';
         writeReviewLoopBreakerLock(pr, diffRead.headCommit, loopReason);
         review = { ...review, reviewed: false, verdict: 'fail', failureReason: 'waiver-needed' };
@@ -3097,11 +3193,14 @@ async function runSelfReviewCliCommandPinned(
         if (deltaBase) deltaReceipt = { ...deltaReceipt, deltaOutcome: 'refused', deltaRefusal: 'waiver-needed' };
       }
       loopBreakerOutput = { loopBreaker: { state: loopState, fixedFindings,
+        incidentId: postReviewLoopPolicy.incidentId, releasePaths: postReviewLoopPolicy.releasePaths,
+        ...(postReviewLoopPolicy.releasePath ? { releasePath: postReviewLoopPolicy.releasePath } : {}),
         ...(loopReason ? { reason: loopReason } : {}),
         ...(loopAssessment.staleFindings.length ? { staleFindings: loopAssessment.staleFindings } : {}),
-        staleReopenRounds: nextStreak } };
+        staleReopenRounds: nextStreak }, reviewCapPolicy: postReviewLoopPolicy };
       if (loopState !== 'clear' || deltaBase || fixedFindings.length) {
-        deps.observeDoctorReview?.('loop-breaker', { pr, head: diffRead.headCommit, state: loopState,
+        deps.observeDoctorReview?.('loop-breaker', { pr, head: diffRead.headCommit, incidentId: postReviewLoopPolicy.incidentId,
+          releasePaths: postReviewLoopPolicy.releasePaths, state: loopState,
           ...(loopReason ? { reason: loopReason } : {}), staleReopenRounds: nextStreak,
           staleFindingCount: loopAssessment.staleFindings.length });
         deps.log('review.loop-breaker', { pr, head: diffRead.headCommit, state: loopState,
@@ -3254,8 +3353,24 @@ async function runSelfReviewCliCommandPinned(
       ...(deltaBase ? {} : { deltaOutcome: review.reviewed === true && landingGateAdmitted ? 'healed-full-review' : 'refused' }),
       deltaHeal: { ...deltaHeal, result: deltaHealResult },
     } : {};
-    const resultOutput = { pr, model: selectedModel, ...jsonReview, ...loopBreakerOutput, reviewInputChars, reviewDurationMs,
-      ...(deltaBase ? deltaReceipt : {}), ...deltaHealOutput, ...reviewProvenance, ...respondedOutput, ...reviewerSelection,
+    const immediatelyPreviousReview = savedEvidence.immediatelyPreviousReview;
+    const priorDistinctHeads = previousHeads.filter((head) => head !== diffRead.headCommit.toLowerCase());
+    const designTransition = review.reviewed === true && landingGateAdmitted
+      && savedEvidence.unreadableFiles.length === 0 && priorDistinctHeads.length >= 2
+      && savedEvidence.verifiedOrderedHeads.length === previousHeads.length
+      && !!immediatelyPreviousReview
+      && deps.git?.(['merge-base', '--is-ancestor', immediatelyPreviousReview.head, diffRead.headCommit], 10_000)?.status === 0
+      && immediatelyPreviousReview && immediatelyPreviousReview.head !== diffRead.headCommit.toLowerCase()
+      ? assessReviewRoundDesignTrigger({ round: priorDistinctHeads.length + 1,
+        previousReviewFindings: immediatelyPreviousReview.findings, currentFindings: review.mustFix }) : null;
+    if (designTransition) {
+      const observation = { pr, head: diffRead.headCommit, ...designTransition };
+      deps.log('review.design-transition', observation, { level: 'warn' });
+      debug.log('review.design-transition', 'same-category-new-must-fix', observation, { level: 'warn' });
+    }
+    const resultOutput = { pr, model: selectedModel, ...jsonReview, ...loopBreakerOutput,
+      reviewCapPolicy: loopBreakerOutput.reviewCapPolicy ?? loopPolicy, reviewInputChars, reviewDurationMs,
+      ...(deltaBase ? deltaReceipt : {}), ...deltaHealOutput, ...(designTransition ? { designTransition } : {}), ...reviewProvenance, ...respondedOutput, ...reviewerSelection,
       ...(deltaFallbackReason ? { deltaFallbackReason } : {}),
       ...reviewCwdOutput, ...provenance, ...contextOutput, ...refusalOverride, ...landingGateFields,
       ...(mainMergeCapExempt ? { mainMergeOnlyCapExempt: true } : {}),
@@ -3279,7 +3394,7 @@ async function runSelfReviewCliCommandPinned(
     }
     if (!opts.json) {
       if (!landingGateAdmitted) deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n⛔ LANDING GATE: review-forbidden-acp-backend (${landingGateDeniedBackend ?? 'unknown'}) — 이 리뷰는 착지 근거가 아닙니다.\n${reviewerContextStatus}`);
-      else deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n${evidenceLine}\n${reviewerContextStatus}\n${deps.renderReview(review)}${pathWarnings.length ? `\n${pathWarnings.join('\n')}` : ''}`);
+      else deps.print(`\n━━ PR ${pr} (${selectedModel}) ━━\n${renderProvenance(diffRead)}\n${evidenceLine}\n${reviewerContextStatus}\n${deps.renderReview(review)}${pathWarnings.length ? `\n${pathWarnings.join('\n')}` : ''}${designTransition ? `\n⚠ 설계 전환 신호 (${designTransition.category}, 라운드 ${designTransition.round}): ${designTransition.recommendation}` : ''}`);
     }
     // REVIEW-ERROR-RC — 기본(API)·role 경로가 1차·폴백 모두 실패해 reviewed≠true 로 끝나도 «못 리뷰한 PR» 이다(verdict:null).
     // ⛔ 착지 관문 거부도 같은 회계다 — 금지 백엔드가 판정을 냈으면 리뷰가 «성공»해도 근거가 아니다(rc≠0).

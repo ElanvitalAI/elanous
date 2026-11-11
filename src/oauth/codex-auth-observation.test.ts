@@ -10,6 +10,7 @@ import {
 } from './codex.js';
 import { CODEX_OWNER_MIRROR_REQUIRED } from './codex-owner-mirror.js';
 import { authStorePath } from './store.js';
+import { setUserConfigOverlay } from '../user-config.js';
 
 // ⛔⭐ 관측을 «넣었는데 무는 테스트가 없었다»를 고치는 파일 (리뷰 3·4라운드 must-fix).
 //
@@ -63,10 +64,12 @@ beforeEach(() => {
   savedRemoteAccessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
   process.env.XDG_CONFIG_HOME = join(home, '.config');
   process.env.CODEX_HOME = join(home, '.codex');
+  setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm, codexTokenOwnerHost: 'mshq' }, hq: { ...config.hq, hostName: 'mshq' } }));
   _setCodexAuthObserverForTesting((event, data) => { seen.push({ event, data }); observedEvents.add(event); });
 });
 
 afterEach(() => {
+  setUserConfigOverlay(null);
   _setCodexAuthObserverForTesting(null);
   // ⛔ 원래 값을 «복원»한다 — 지우면 실행 환경·병렬 테스트를 오염시킨다(리뷰 should-fix).
   if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = savedXdg;

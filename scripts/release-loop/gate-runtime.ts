@@ -590,7 +590,7 @@ export async function runWarmPrecutCanary(input: { opts: GateOptions; runner: Ga
   if (baseline.rc !== 0) throw new Error(`pre-cut canary baseline commit is absent: ${opts.baselineCommit.slice(0, 12)}`);
   const trackedFile = await runner.localCommand('git', ['cat-file', '-e', `${opts.commit}:${input.file}`], opts.repo ?? process.cwd());
   if (trackedFile.rc !== 0) throw new Error(`pre-cut canary test file is absent from cut ${opts.commit.slice(0, 12)}`);
-  const lockHash = gateLockfileHash(repo);
+  const lockHash = gateLockfileHashBytes(Buffer.from(lock.output));
   const pod = { ...opts.pod, warmProducerEnabled: false, warmCutSha: opts.commit, warmBaselineSha: opts.baselineCommit,
     warmEligible: true, warmReplayOwner: true, warmShadowScope: { requested: false, attempts: 0 } };
   const observations: WarmShadowObservation[] = [];
@@ -851,8 +851,8 @@ function deterministicSubrunCounts(output: string): { fail: number; error: numbe
   return runs.reduce((sum, run) => ({ fail: sum.fail + run.fail, error: sum.error + run.error }), { fail: 0, error: 0 });
 }
 /** bun reads a bare positional as a substring filter (`test` matches every *.test.ts); `./` makes it a path. */
-/** A Pod path (`/home/<user>/repo/src/…` · `../../home/<user>/repo/src/…`) as a repository-relative one. */
-const podRelative = (path: string) => path.replace(/^(?:(?:\.\.\/){2,}|\/)home\/[^/]+\/repo\//, '');
+/** A Pod path (`~/repo/src/…` · `../..~/repo/src/…`) as a repository-relative one. */
+const podRelative = (path: string) => path.replace(/^(?:\.\.\/)*\/?home\/ubuntu\/repo\//, '');
 /** `file > [error]` ids of bun's «Unhandled error between tests» blocks, or undefined when one cannot be attributed. */
 function unhandledErrorIds(output: string): string[] | undefined {
   const errors: string[] = [];
@@ -1345,10 +1345,10 @@ export function previousShardResult(logDir: string, name: string, commit: string
 }
 
 /** 0.2.18 gate: a test that changed process.cwd made bun print later test files relative to that cwd
- *  (`../../home/<user>/repo/src/…`), and the safe-path check stopped the whole gate. The Pod clone root is
- *  `/home/<user>/repo`; strip it back to a repository-relative path before any id is read. */
+ *  (`../..~/repo/src/…`), and the safe-path check stopped the whole gate. The Pod clone root is
+ *  `~/repo`; strip it back to a repository-relative path before any id is read. */
 export function stripPodRepoRoot(output: string): string {
-  return output.replace(/^(\s*(?:\(fail\)\s+)?)(?:(?:\.\.\/){2,}|\/)home\/[^/]+\/repo\//gm, '$1');
+  return output.replace(/^(\s*(?:\(fail\)\s+)?)(?:\.\.\/)*(?:\/)?home\/ubuntu\/repo\//gm, '$1');
 }
 
 function failuresOf(run: CommandResult, label: string): SweepFailures {
@@ -1859,7 +1859,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     if (hasDigest !== hasRunId) throw new Error('gate pinned image: both pinnedImageDigest and pinnedRunId are required');
     if (!hasDigest) return undefined;
     return async (members, image, localCommit) => {
-      if (localCommit !== commit) throw new Error('gate pinned image: requested source commit changed');
+      if (localCommit !== (pod.imageTagCommit ?? commit)) throw new Error('gate pinned image: requested image tag commit changed');
       const probe = preflightGateImageDigest;
       const poolSpecFor = (member: PodPoolMember) => `${member.context}${member.sshHost ? `@${member.sshHost}` : ''}:${member.capacity}#${member.registry ?? NODE_REGISTRY}`;
       const imageTagCommit = pod.imageTagCommit ?? commit;
@@ -1964,7 +1964,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const cdpPatterns = cdp.output.split(/\r?\n/).filter((path) => path.endsWith('.test.ts'));
     // CDP 시험은 `test:deterministic` 이 스스로 뺀다 — 조각에 그것만 남으면 bun «시험 없음» exit 1 을 «불완전»으로 읽었다(09-30 G1d 실측 둘).
     // bun 의 탐색은 숨은 디렉터리(`.x/`)를 안 연다 — 사람의 `bun test` 가 한 번도 안 돌리는 빈 픽스처가 조각에 혼자 남아 «Ran 0 tests» 를 «불완전»으로 읽었다(09-30 G1e 5번 조각).
-    const allAssignable = allFiles.filter((file) => !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
+    // The audit ratchet sentinel is tracked with a .test.ts suffix but contains no tests.
+    // A single-file retry otherwise reports rc 0 / Ran 0 and makes the whole gate incomplete.
+    const isEmptyFixture = (file: string) => file === 'test/__audit-ratchet-fake.test.ts';
+    const allAssignable = allFiles.filter((file) => !isEmptyFixture(file) && !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
       && !file.split('/').some((part) => part.startsWith('.')));
     const verdictRoot = pod.shardsFile?.path
       ? dirname(dirname(dirname(dirname(dirname(pod.shardsFile.path))))) : undefined;
@@ -1981,7 +1984,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     }
     const rulesBaseSha = await rulesGateBaseFor(commit, files);
     if (!files.length) throw new Error('sweep incomplete: no tests ran');
-    let assignable = files.filter((file) => !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
+    let assignable = files.filter((file) => !isEmptyFixture(file) && !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
       && !file.split('/').some((part) => part.startsWith('.')));
     const integrationOnly = files.filter((file) => POD_SWEEP_INTEGRATION_ONLY.includes(file));
     if (integrationOnly.length) debug.log('release-loop.gate', 'pod-sweep-integration-only', { files: integrationOnly });
@@ -2091,6 +2094,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     type GateShardExecution = NonNullable<ReturnType<typeof parseGatePodRuntimeIdentity>>;
     type GateShardDetail = Partial<GateShardLedgerRow> & { runtimeIdentity?: GateShardExecution };
     const detailsById = new Map<string, GateShardDetail>();
+    type GateAttemptFailure = { reason: NonNullable<GateResult['stalledShards']>[number]['reason']; fingerprint: string; detail?: string };
+    const attemptsByShardFiles = new Map<string, number>();
+    const firstFailureByShardFiles = new Map<string, GateAttemptFailure>();
+    const firstFailureByAttemptKind = new Map<string, GateAttemptFailure>();
     const executionsByShard = new Map<string, Array<{ branch: string; attemptId: string; imageDigest: string | null;
       runtimeIdentity: GateShardExecution | null; host: string | null }>>();
     const receiptChecks = shards.map((item, shard) => {
@@ -2345,9 +2352,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       const detail = detailsById.get(row.id);
       const measuredFailureCount = typeof detail?.fail === 'number' && typeof detail.errors === 'number'
         ? detail.fail + detail.errors : row.state === 'done' && row.rc === 0 ? 0 : null;
+      const failureIds = detail?.attribution === 'complete' ? [...(detail.failureIds ?? []), ...(detail.errorIds ?? [])] : null;
+      const preexisting = failureIds === null ? null : failureIds.filter((id) => knownFailures.has(id)).length;
+      const introduced = failureIds === null ? null : failureIds.length - (preexisting ?? 0);
       return { id: row.id, state: row.state === 'retry' ? 'running' : row.state === 'stop-requested' ? 'unmeasured' : row.state,
         rawState: row.state, ...(row.attemptId ? { attemptId: row.attemptId } : {}),
-        failureCount: measuredFailureCount,
+        failureCount: measuredFailureCount, introduced, preexisting,
+        unmeasured: detail?.attribution === 'complete' ? 0 : null,
         ...(row.host ? { host: row.host } : {}),
         ...(row.startedAt ? { startedAtMs: Date.parse(row.startedAt) } : {}),
         ...(row.endedAt ? { endedAtMs: Date.parse(row.endedAt) } : {}),
@@ -2523,6 +2534,16 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       release: (member: Parameters<PodPoolScheduler['release']>[0]) => poolScheduler.release(member),
     }) as unknown as PodPoolScheduler;
     const runShardImpl = async (paths: string[], shard: number, depth = 0, branch = '', retriedNoOutput = false, fresh = pod.freshShards === true, parentAttempt?: string, hostRetries = 0, batchIsolation = false, skipMembers: ReadonlySet<string> = new Set(), singleShotTail = false): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
+      // Keep the retry budget across the whole file set; duplicate detection is narrower and tracks attempt kind.
+      const fileSetKey = `${shard}:${[...paths].sort().join('\n')}`;
+      // A planned no-output retry, split depth, batch isolation, or alternate-host tail probe is a distinct observation.
+      const attemptKind = `${branch || 'root'}:depth-${depth}:${batchIsolation ? 'batch' : 'shard'}:${singleShotTail ? 'tail' : 'normal'}`;
+      const attemptKindKey = `${fileSetKey}:${attemptKind}`;
+      const shardAttempt = (attemptsByShardFiles.get(fileSetKey) ?? 0) + 1;
+      attemptsByShardFiles.set(fileSetKey, shardAttempt);
+      const firstFailure = firstFailureByShardFiles.get(fileSetKey);
+      if (shardAttempt > 3 && firstFailure) return { runs: [], stalled: [{ shard, files: paths, reason: firstFailure.reason,
+        detail: firstFailure.detail ?? 'gate shard retry cap reached; original failure preserved' }] };
       // 파일별 소요는 junit 으로 남긴다 — 콘솔 요약(판정 원천)은 그대로이고, 느린 시험 목록(K10 D4)·계층 분리(D2)의 자가 된다.
       // GATE-TIMEOUT-HEAL: parts (each with its own junit) under a soft deadline inside this shard's own Job deadline.
       const shardDeadline = shardDeadlineSeconds(batchIsolation ? Math.max(...paths.map((file) => estimated([file]))) * Math.ceil(paths.length / batchWidth) : estimated(paths), deadlineSeconds);
@@ -2545,6 +2566,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       let podLifecycle: Record<string, string> | undefined;
       let imageDigest: string | null = null;
       let runtimeIdentity: ReturnType<typeof parseGatePodRuntimeIdentity> | undefined;
+      let installFailed = false;
       let podJobName: string | undefined;
       let batchArtifactsComplete = true;
       let junit: string | undefined;
@@ -2844,6 +2866,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         batchArtifactDir = job.artifactsDir;
         const read = readShardArtifacts(job.artifactsDir, parts);
         runtimeIdentity = read.runtimeIdentity;
+        installFailed = read.installFailed === true;
         if (logDir) {
           mkdirSync(logDir, { recursive: true });
           let retryArtifactIndex = 0;
@@ -3083,6 +3106,22 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
             } catch { /* 그래도 못 맞추면 원래대로 멈춘다 */ }
           }
         }
+      }
+      // An install failure happens before test execution. Retrying or splitting only repeats the broken checkout
+      // operation and can fan one infrastructure error into many zero-test Pods; preserve the first diagnostic.
+      if (installFailed && !finished.length) return { runs: [], stalled: [{ shard, files: paths, reason: 'job-failed',
+        detail: output ?? unfinishedLog ?? jobError, ...(placedOn ? { lastHost: placedOn } : {}) }] };
+      if (reason) {
+        const diagnosticSource = [jobError, clean, output, unfinishedLog].find((value) => typeof value === 'string' && value.trim().length > 0) ?? '';
+        const diagnostic = diagnosticSource.trim().replace(/\s+/g, ' ');
+        const fingerprint = createHash('sha256').update(`${reason}\0${diagnostic}`).digest('hex');
+        const failure = { reason, fingerprint, ...(diagnostic ? { detail: diagnostic.slice(0, 300) } : {}) };
+        if (!firstFailureByShardFiles.has(fileSetKey)) firstFailureByShardFiles.set(fileSetKey, failure);
+        const previous = firstFailureByAttemptKind.get(attemptKindKey);
+        if (!previous) firstFailureByAttemptKind.set(attemptKindKey, failure);
+        else if (previous.reason === reason && previous.fingerprint === fingerprint) return { runs: [], stalled: [{ shard, files: paths, reason: previous.reason,
+          detail: previous.detail ?? 'repeated same-shard failure; original reason preserved',
+          ...(placedOn ? { lastHost: placedOn } : {}) }] };
       }
       // A reused result that the current tool cannot read cleanly is not a verdict: run that shard for real.
       if (reused && reason) {
@@ -4531,8 +4570,8 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
           // An opaque or unavailable file-CAS decision cannot be replaced by a broader shard receipt.
           partial = null;
           selectedFormalReceiptPlan = null;
-        } else if (fileCasPlan.receipts.length === 0 && selectedFormalReceiptPlan) {
-          // Formal shard receipts are the fallback only when file-CAS has no evidence to judge.
+        } else if (fileCasPlan.receipts.length === 0 && (selectedFormalReceiptPlan || trainReceiptPlan?.carriedFiles.length || radius?.plan)) {
+          // An empty file-CAS set keeps an already judged train, formal, or rehearsal radius plan.
           fileCasPlan = null;
         }
       } else {
@@ -4631,7 +4670,7 @@ export async function judgeGate(opts: GateOptions, runner?: GateRunner,
             shardTotal: latest.groups.length, host: group.host ?? null,
             state: group.rawState ?? group.state, attemptId: group.attemptId ?? null,
             durationMs: group.startedAtMs === undefined ? null : Math.max(0, nowMs - group.startedAtMs),
-            failureCount: group.failureCount ?? null, introduced: null, preexisting: null, unmeasured: null,
+            failureCount: group.failureCount ?? null, introduced: group.introduced ?? null, preexisting: group.preexisting ?? null, unmeasured: group.unmeasured ?? null,
             runId: opts.graphRunId ?? null, at: new Date(nowMs).toISOString() };
           emitGatePhaseProgress(phase, phaseEvent);
         }
@@ -5530,7 +5569,16 @@ export function requestedGateExecutor(args: string[], env: NodeJS.ProcessEnv): {
 }
 
 function usesGraphContext(args: string[], env: NodeJS.ProcessEnv): boolean {
-  return !!env.ELANOUS_GRAPH_CONTEXT && args.length > 0 && args.every(arg => arg === '--json');
+  if (!env.ELANOUS_GRAPH_CONTEXT || !args.includes('--json')) return false;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--json' || args[i] === '--full') continue;
+    if (args[i] === '--precut-canary-file' && args[i + 1] && !args[i + 1]!.startsWith('--')) {
+      i++;
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOptions | 'help' {

@@ -104,7 +104,6 @@ import {
 } from './tools/terminal-modal.js';
 import {
   buildTerminalModalInjectTool,
-  dispatchTerminalModalInject,
 } from './tools/terminal-modal-inject.js';
 import {
   buildSnapshotPtyStateTool,
@@ -538,7 +537,7 @@ export function skillFoldRenderOpts(foldMode?: FoldMode, expandHint?: boolean): 
 function collectTerminalSessionSignals(): import('../tool-hints/signals.js').TerminalSessionSignals | undefined {
   try {
     // Late-bind to avoid a top-level import cycle with skill-tool-terminal-modal.
-    const { getDashboardTerminalSessions } = require('../dashboard/terminal/session.js') as typeof import('../dashboard/terminal/session.js');
+    const { getDashboardTerminalSessions } = require('../terminal/session-access.js') as typeof import('../terminal/session-access.js');
     const registry = getDashboardTerminalSessions();
     const all = registry.list();
     const alive = all.filter(s => s.state !== 'exited');
@@ -568,7 +567,7 @@ function collectTerminalSessionSummary(): Array<{
   lastNotification?: string;
 }> {
   try {
-    const { getDashboardTerminalSessions } = require('../dashboard/terminal/session.js') as typeof import('../dashboard/terminal/session.js');
+    const { getDashboardTerminalSessions } = require('../terminal/session-access.js') as typeof import('../terminal/session-access.js');
     const registry = getDashboardTerminalSessions();
     return registry.list().map(s => ({
       id: s.id,
@@ -1346,8 +1345,8 @@ async function executeSkillUnrecorded(
     TerminalModalDetach:  (a) => dispatchTerminalModalDetach(a),
     TerminalModalKill:    (a) => dispatchTerminalModalKill(a),
     TerminalModalInject:  async (a) => {
-      const { createInjectApprover } = await import('../dashboard/runtime/approvers.js');
-      return dispatchTerminalModalInject(a, { approver: createInjectApprover() });
+      const { terminalInjectRuntime } = await import('../tool-runtime/terminal-inject-runtime.js');
+      return terminalInjectRuntime.run(a, { surface: 'skill' });
     },
     // H5 P2 · embodied-agent TTY observability.
     SnapshotPtyState:     (a) => dispatchSnapshotPtyState(a),

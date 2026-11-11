@@ -1,0 +1,21 @@
+# Declarative work graph only; harness-say remains the execution owner until its unit is wired.
+graph_id: work-web-app
+version: 1 # Source: graphs/work/code-pr.yaml work graph declaration
+launcher: harness-say
+entry_node: compose-web-app
+terminal_nodes: [done, needs-human, failed]
+nodes:
+  - node_id: compose-web-app
+    kind: subgraph
+    recipe: none
+    max_visits: 1 # Source: graphs/work/code-pr.yaml work graph declaration
+    call: web-app@1
+    budget: { inner_steps: 20 } # Source: graphs/work/code-pr.yaml subgraph budget
+    contract: { inputs: [ask, context, prior], tools: harness-say, outputs: [result, evidence] }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 } # Source: graphs/work/code-pr.yaml terminal node declaration
+  - { node_id: needs-human, kind: gate, recipe: none, max_visits: 1 } # Source: graphs/work/code-pr.yaml terminal node declaration
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 } # Source: graphs/work/code-pr.yaml terminal node declaration
+edges:
+  - from: compose-web-app
+    on: outcome
+    map: { done: done, rework: needs-human, needs-human: needs-human, failed: needs-human }

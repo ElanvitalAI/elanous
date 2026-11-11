@@ -192,6 +192,8 @@ export interface CoreTurnContext {
 export interface CoreTurnResult {
   stopReason: CoreTurnStopReason;
   finalText: string;
+  /** Terminal reason from the underlying model stream, when reported. */
+  providerFinishReason?: string;
   /** The completed provider response explicitly marked its last assistant answer as final. */
   finalPhaseAnswer?: boolean;
   /** `auth_rejected` 일 때만 — 공급자 오류 원문(비밀값 가림). 호스트가 처방 줄에 원문을 붙인다. */

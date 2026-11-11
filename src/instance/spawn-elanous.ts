@@ -40,6 +40,16 @@ export function spawnElanous(args: readonly string[], opts: SpawnElanousOptions 
   return spawn(inv.command, inv.args, { ...rest, cwd: opts.cwd, env: inv.env });
 }
 
+/** Bun IPC callers use the same child universe stamp as Node child processes. */
+export function spawnElanousBun(
+  args: readonly string[],
+  opts: SpawnElanousOptions & Omit<Bun.SpawnOptions.SpawnOptions<'pipe', 'pipe', 'pipe'>, 'cmd' | 'env'>,
+): Bun.Subprocess<'pipe', 'pipe', 'pipe'> {
+  const { stateDir: _s, bin: _b, executable: _x, env: _e, ...spawnOptions } = opts;
+  const inv = elanousInvocation(args, opts);
+  return Bun.spawn({ ...spawnOptions, cmd: [inv.command, ...inv.args], env: inv.env });
+}
+
 export function spawnElanousSync(args: readonly string[], opts: SpawnElanousOptions & Omit<SpawnSyncOptions, 'env' | 'cwd'> = {}): SpawnSyncReturns<string | Buffer> {
   const { stateDir: _s, bin: _b, executable: _x, env: _e, ...rest } = opts;
   const inv = elanousInvocation(args, opts);

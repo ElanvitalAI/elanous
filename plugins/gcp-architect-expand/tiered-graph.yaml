@@ -1,0 +1,39 @@
+# Declarative Graph v2. No production cloud-resource provider is bundled:
+# without an explicitly injected test-world provider the graph fails closed.
+apiVersion: elanous.dev/graph/v2
+graph:
+  id: gcp-advanced-tiered-design
+  version: 1.0.0
+  layer: flow
+  purpose: "요구사항 한 건에서 GCP 소·중·대 설계와 산출물을 생성하고 사용자 확인 후 종료"
+entry: detect
+nodes:
+  - id: detect
+    type: cloud-resource
+    requires: cloud-resource.observe@1
+    with: { action: read-existing-local-signals }
+  - id: design
+    type: cloud-resource
+    requires: cloud-resource.design@1
+    with: { action: propose-tiered }
+  - id: deliverables
+    type: cloud-resource
+    requires: cloud-resource.architecture-deliverables@1
+    with:
+      action: run-tiered-architecture-deliverables
+      graph: plugins/architecture-deliverables/graphs/architecture-deliverables.yaml
+      input: "$design.result.plans"
+  - id: approve
+    type: hitl
+    with: { prompt: "소·중·대 설계 시뮬레이션을 확인했습니까? 이 그래프는 GCP 자원을 생성하지 않습니다." }
+    hitl:
+      options:
+        - { key: y, exit: approved, default: false }
+        - { key: N, exit: declined, default: true }
+edges:
+  - { from: detect, on: outcome, map: { shortage: design, none: done, unknown: failed, failed: failed } }
+  - { from: design, on: outcome, map: { proposed: deliverables, failed: failed } }
+  - { from: deliverables, on: outcome, map: { done: approve, failed: failed } }
+  - { from: approve, on: outcome, map: { approved: done, declined: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, graph.unit, cloud-resource] }

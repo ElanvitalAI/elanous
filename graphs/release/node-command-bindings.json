@@ -12,6 +12,33 @@
     "recipe": "cmd:pwa-formal-update",
     "command": "bun scripts/release-loop/pwa-formal-update-node.ts"
   },
+  "cloud-approval-check": {
+    "recipe": "cmd:cloud-approval-check",
+    "command": "bun scripts/release-loop/cloud-elastic-node.ts approval-check"
+  },
+  "approve-cloud-elastic": {
+    "recipe": "approval:cloud-elastic"
+  },
+  "cloud-join": {
+    "recipe": "cmd:cloud-join",
+    "command": "bun scripts/release-loop/cloud-elastic-node.ts join"
+  },
+  "cloud-leave-ok": {
+    "recipe": "cmd:cloud-leave",
+    "command": "bun scripts/release-loop/cloud-elastic-node.ts leave"
+  },
+  "cloud-leave-fail": {
+    "recipe": "cmd:cloud-leave",
+    "command": "bun scripts/release-loop/cloud-elastic-node.ts leave"
+  },
+  "cloud-leave-error": {
+    "recipe": "cmd:cloud-leave",
+    "command": "bun scripts/release-loop/cloud-elastic-node.ts leave"
+  },
+  "cloud-leave-join-fail": {
+    "recipe": "cmd:cloud-leave",
+    "command": "bun scripts/release-loop/cloud-elastic-node.ts leave"
+  },
   "pod-reuse-prep": {
     "recipe": "none"
   }

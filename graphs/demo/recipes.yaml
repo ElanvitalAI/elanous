@@ -10,6 +10,14 @@ review:
 publish:
   command: 'sleep 0.01; printf ''{"outcome":"ok"}\n'''
   timeout_ms: 30000
+ticketing-proposal-prompt:
+  prompt: >-
+    Given the absorbed article brief, propose building a ticketing service for the festival. Return a concise proposal
+    and a yes/no question. Brief: $ARGUMENTS
+ticketing-proposal-approval:
+  approval: '우리 행사용 티켓팅 서비스를 만들까요? y/N'
+gcp-expansion:
+  approval: 'GCP 확장 계획과 월 비용·절감·보안 등급을 확인했습니다. 확장할까요? y/N'
 solar-summary:
   prompt: |
     You are Solar for the scene-four demo. Summarize the request and decide whether the reviewed work can be published.

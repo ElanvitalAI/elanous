@@ -43,6 +43,9 @@ test('each completed off, shadow, on and launched turn emits exactly one tick wi
     expect(ticks.map(({ data }) => (data as { profile: string }).profile)).toEqual(['off', 'off', 'shadow', 'on', 'on']);
     for (const { data } of ticks) expect(data).toMatchObject({ loopId: 'tc-seat', sourceRef: 'docs/roles/TC.md', missingRequired: [], runId: expect.any(String) });
     expect(ticks[4]?.data).toMatchObject({ runId });
+    const tickCalls = log.mock.calls.filter(([category, event]) => category === 'loop.tc-seat' && event === 'tick');
+    expect(tickCalls[4]?.[3]?.provenance).toMatchObject({ universe: 'test', source: 'unknown' });
+    expect(tickCalls[2]?.[3]?.provenance).toMatchObject({ source: 'shadow', device: 'seat-loop' });
   } finally { log.mockRestore(); f.close(); }
 });
 

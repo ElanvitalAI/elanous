@@ -15,6 +15,7 @@
 // environment values. Behaviour of the real tool stays with
 // tests that run where the tool exists.
 import { spawnSync, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, isAbsolute, join, resolve } from 'node:path';
@@ -134,18 +135,25 @@ export function utilLinuxScript(): string | null {
 }
 
 function script(name: string, spec: FakeBinSpec, dataDir: string, logPath: string): string {
-  const config = JSON.stringify({ name, spec, logPath, dataDir, ptyPath: spec.pty ? utilLinuxScript() : null, nodePath: process.execPath });
-  return `#!/usr/bin/env -S -u PERL5OPT ${fakeShimRuntime()}\n` + [
+  const perlPath = fakeShimRuntime();
+  const config = JSON.stringify({ name, spec, logPath, dataDir, ptyPath: spec.pty ? utilLinuxScript() : null,
+    nodePath: process.execPath, perlPath, restorePrefix: `ELANOUS_FAKE_BIN_RESTORE_${randomUUID().replace(/-/g, '')}_` });
+  const perl = perlPath.replace(/(["\\$])/g, '\\$1');
+  return [
+    // Perl taint mode ignores PERL5OPT at startup but keeps the original env for recording and delegation.
+    `#!/usr/bin/env -S "${perl}" -T`,
     'use strict;',
     'use JSON::PP qw(decode_json);',
-    'use Encode qw(decode FB_CROAK);',
+    'use Encode qw(decode FB_CROAK LEAVE_SRC);',
     'use Fcntl qw(O_WRONLY O_APPEND);',
     'use IO::Handle;',
     'my $config = decode_json(<<\'FAKE_BIN_CONFIG\');',
     config,
     'FAKE_BIN_CONFIG',
-    'my @argv = map { decode("UTF-8", $_, FB_CROAK) } @ARGV;',
-    'my %env = map { $_ => (exists $ENV{$_} ? decode("UTF-8", $ENV{$_}, FB_CROAK) : undef) } @{$config->{spec}{recordEnv} // []};',
+    'if (defined $ENV{PATH}) { $ENV{PATH} =~ /\\A(.*)\\z/s; $ENV{PATH} = $1; }',
+    // Delegation uses the list form of exec, so argv is never shell-evaluated.
+    'my @argv = map { my $value = decode("UTF-8", $_, FB_CROAK | LEAVE_SRC); $value =~ /\\A(.*)\\z/s; $1 } @ARGV;',
+    'my %env = map { $_ => (exists $ENV{$_} ? decode("UTF-8", $ENV{$_}, FB_CROAK | LEAVE_SRC) : undef) } @{$config->{spec}{recordEnv} // []};',
     'my %call = (name => $config->{name}, argv => \\@argv);',
     '$call{env} = \\%env if keys %env;',
     'my $record = JSON::PP->new->utf8->encode(\\%call) . "\\n";',
@@ -154,7 +162,19 @@ function script(name: string, spec: FakeBinSpec, dataDir: string, logPath: strin
     'close($log);',
     'die "fake-bin: short append write\\n" unless defined($written) && $written == length($record);',
     'my $matches = sub { my ($prefix) = @_; return 0 unless defined $prefix; for my $i (0 .. $#$prefix) { return 0 if !defined($argv[$i]) || $argv[$i] ne $prefix->[$i]; } return 1; };',
-    'my $delegate = sub { my ($path) = @_; exec { $path } $path, @argv; die "fake-bin: exec $path: $!\\n"; };',
+    // The tainted shim starts a clean Perl helper, which restores the exact caller environment
+    // before an argv-preserving exec. Unlike env(1), it cannot interpret '=' in the target path.
+    'my $delegate = sub {',
+    '  my ($path) = @_; my $prefix = $config->{restorePrefix};',
+    '  $prefix .= "_" while grep { index($_, $prefix) == 0 } keys %ENV;',
+    '  for my $key (qw(PATH IFS CDPATH ENV BASH_ENV PERL5OPT)) {',
+    '    $ENV{"${prefix}${key}"} = $ENV{$key} if exists $ENV{$key}; delete $ENV{$key};',
+    '  }',
+    '  $ENV{PATH} = "/usr/bin:/bin";',
+    '  my $code = q{my $prefix = shift @ARGV; for my $key (qw(PATH IFS CDPATH ENV BASH_ENV PERL5OPT)) { my $stage = "${prefix}${key}"; if (exists $ENV{$stage}) { $ENV{$key} = delete $ENV{$stage}; } else { delete $ENV{$key}; } } my $path = shift @ARGV; exec { $path } $path, @ARGV; die "fake-bin: exec $path: $!\\n";};',
+    '  exec { $config->{perlPath} } $config->{perlPath}, "-e", $code, $prefix, $path, @argv;',
+    '  die "fake-bin: exec helper: $!\\n";',
+    '};',
     'my $spec = $config->{spec};',
     'if (my $install = $spec->{installArtifacts}) {',
     '  exit(78) unless defined($ENV{$install->{prefixEnv}}) && $ENV{$install->{prefixEnv}} eq $install->{prefix};',

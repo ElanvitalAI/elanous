@@ -1,0 +1,4 @@
+{
+  "deviceKey": "gcp-architect-tiered-design",
+  "review": "> 📅 **2026-11-12 재검토 (TF · GCP-CATALOG)** — GCP 3단계 설계 시뮬레이터의 장치·소스 모듈·현재 v32 snapshot을 등록했다. 등록 전 누락 실패와 수리 후 catalog 및 --test CLI 출력이 일치하며, 실제 GCP 경계는 호출하지 않는다."
+}

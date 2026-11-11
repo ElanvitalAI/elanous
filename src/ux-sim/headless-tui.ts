@@ -1,7 +1,7 @@
 // Capture the real dashboard/tui renderer at the stdout boundary, then let
 // the already-installed xterm parser interpret its ANSI bytes. No child PTY.
 import { Terminal } from '@xterm/headless';
-import { renderDashboardFrame, type DashboardFrameInput } from '../dashboard/index.js';
+import { renderDashboardFrame, type DashboardFrameInput } from '../display/dashboard-frame.js';
 import { resetRenderCache } from '../tui.js';
 
 export interface HeadlessDashboardFrame {

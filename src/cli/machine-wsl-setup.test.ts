@@ -276,9 +276,16 @@ test('registration failure reports task XML cleanup failure for both bootstrap e
 test('MACHINE-WSL-ZERO-TOUCH simulation resumes through fake schtasks and WSL without a guest password', () => {
   const calls: { command: string; args: string[] }[] = [];
   const events: string[] = [];
+  // Source: src/cli/machine-wsl-setup.ts uses status zero for success.
+  const successfulStatus = 0;
+  // Source: src/cli/machine-wsl-setup.ts uses exit 44 when docker or k3d is absent.
+  const missingToolStatus = 44;
   let taskRegistered = false;
   let distroInstalled = false;
   let userCreated = false;
+  let curlAvailable = false;
+  let dockerInstalled = false;
+  let k3dInstalled = false;
   const run = (command: string, args: readonly string[]) => {
     const row = { command, args: [...args] };
     calls.push(row);
@@ -291,9 +298,52 @@ test('MACHINE-WSL-ZERO-TOUCH simulation resumes through fake schtasks and WSL wi
     if (command !== 'wsl.exe') return { status: 0 };
     if (args[0] === '--install') { distroInstalled = true; events.push('wsl-installed'); return { status: 0 }; }
     if (line === '--list --verbose') return { status: 0, stdout: distroInstalled ? 'NAME STATE VERSION\n* Ubuntu Stopped 2\n' : 'NAME STATE VERSION\n' };
+    if (line.includes('command -v docker')) return { status: dockerInstalled ? successfulStatus : missingToolStatus };
+    if (line.includes('command -v k3d')) return { status: k3dInstalled ? successfulStatus : missingToolStatus };
+    if (line.includes('command -v curl') && line.includes('apt-get install --yes --no-install-recommends ca-certificates curl')) {
+      curlAvailable = true;
+      events.push('curl-tools-installed');
+      return { status: successfulStatus };
+    }
+    if (line.includes('download.docker.com/linux/')) {
+      if (!curlAvailable) return { status: missingToolStatus };
+      events.push('docker-repository-configured');
+      return { status: successfulStatus };
+    }
+    if (line.includes('/usr/bin/systemctl enable --now docker')) {
+      events.push('docker-service-enabled');
+      return { status: successfulStatus };
+    }
+    if (line.includes('/usr/sbin/usermod --append --groups docker elanous')) {
+      events.push('docker-group-added');
+      return { status: successfulStatus };
+    }
+    if (line.includes('apt-get') && line.includes('docker-ce')) {
+      dockerInstalled = true;
+      events.push('root-apt-batch');
+      events.push('docker-ce-installed');
+      return { status: successfulStatus };
+    }
+    if (line.includes('docker info')) {
+      if (!dockerInstalled) return { status: missingToolStatus };
+      events.push('docker-engine-verified');
+      return { status: successfulStatus };
+    }
+    if (line.includes('raw.githubusercontent.com/k3d-io/k3d/main/install.sh')) {
+      k3dInstalled = true;
+      events.push('k3d-installed');
+      return { status: successfulStatus };
+    }
+    if (line.includes('k3d version')) {
+      if (!k3dInstalled) return { status: missingToolStatus };
+      events.push('k3d-version-verified');
+      return { status: successfulStatus };
+    }
     if (line.includes('/usr/bin/id -u')) return userCreated ? { status: 0, stdout: '1000\n' } : { status: 1, stderr: 'id: \'elanous\': no such user\n' };
     if (line.includes('/usr/sbin/useradd')) { userCreated = true; events.push('linux-user-created'); return { status: 0 }; }
-    if (line.includes('/usr/bin/passwd') || line.includes('/usr/sbin/usermod')) return { status: 90, stderr: 'interactive guest password is not allowed' };
+    if (/(?:^|[\s;&|])(?:\S*\/)?(?:passwd|chpasswd)(?=\s|$)/.test(line)) {
+      return { status: 90, stderr: 'interactive guest password is not allowed' };
+    }
     if (line.includes('cat /etc/wsl.conf')) return { status: 0, stdout: '__ELANOUS_WSL_CONF_MISSING__' };
     if (line.includes('systemctl is-system-running')) return { status: 0, stdout: 'running\n' };
     if (args.includes('--user') && args[args.indexOf('--user') + 1] === 'root' && line.includes('apt-get')) { events.push('root-apt-batch'); return { status: 0 }; }
@@ -320,9 +370,12 @@ test('MACHINE-WSL-ZERO-TOUCH simulation resumes through fake schtasks and WSL wi
   rmSync(taskDirectory, { recursive: true, force: true });
   expect(taskRegistered).toBe(false);
   expect(calls.some(call => call.command === 'reg.exe' && call.args.some(arg => arg.includes('RunOnce')))).toBe(false);
-  expect(calls.some(call => call.command === 'wsl.exe' && call.args.some(arg => arg.includes('/usr/bin/passwd')))).toBe(false);
-  expect(calls.some(call => call.command === 'wsl.exe' && call.args.some(arg => arg.includes('/usr/sbin/usermod')))).toBe(false);
-  expect(events).toEqual(['startup-task-created', 'wsl-installed', 'reboot-consented', 'linux-user-created', 'root-apt-batch', 'elanous-installed', 'startup-task-deleted']);
+  expect(calls.some(call => call.command === 'wsl.exe' && /(?:^|[\s;&|])(?:\S*\/)?(?:passwd|chpasswd)(?=\s|$)/.test(call.args.join(' '))))
+    .toBe(false);
+  expect(calls.some(call => call.command === 'wsl.exe' && call.args.join(' ').includes('/usr/sbin/usermod --append --groups docker elanous'))).toBe(true);
+  expect(events).toEqual(['startup-task-created', 'wsl-installed', 'reboot-consented', 'linux-user-created', 'curl-tools-installed',
+    'docker-repository-configured', 'root-apt-batch', 'docker-ce-installed', 'docker-service-enabled', 'docker-group-added',
+    'docker-engine-verified', 'k3d-installed', 'k3d-version-verified', 'elanous-installed', 'startup-task-deleted']);
   expect(buildMachineSetupPlan({ profile: 'developer', platform: 'wsl' }).packages.map(item => item.name))
     .toEqual(expect.arrayContaining(['build-essential', 'python3-venv', 'unzip', 'curl']));
   expect(calls.flatMap(call => call.args).join(' ')).not.toMatch(/auth\.json|api[_-]?key|credential/i);

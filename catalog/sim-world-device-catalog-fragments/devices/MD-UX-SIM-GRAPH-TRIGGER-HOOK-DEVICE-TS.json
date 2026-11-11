@@ -1,4 +1,9 @@
 {
   "id": "MD-UX-SIM-GRAPH-TRIGGER-HOOK-DEVICE-TS",
-  "versions": [29]
+  "versions": [
+    29,
+    30,
+    31,
+    32
+  ]
 }

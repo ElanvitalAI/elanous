@@ -9,7 +9,7 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 // drive web terminals without booting the dashboard TUI.
 
 
-import { recordToolCatalog } from '../../dashboard/tool-catalog-observability.js';
+import { recordToolCatalog } from './tool-catalog-observability.js';
 import {
   buildBrowserNavigateTool,
   buildBrowserReadTool,
@@ -82,7 +82,6 @@ import {
 import { isToolSearchCall, routeToolSearch } from '../../skills/tools/tool-search-route.js';
 // dev-harness front door(2026-07-20) — 스테이지드 하니스(P→E→R→D) 노출. self-build 처럼 자식 spawn(⑩ 상한 게이트).
 import { buildRunDevHarnessTool, dispatchRunDevHarness, isDevHarnessModelSurfaceEnabled } from '../../skills/tools/dev-harness.js';
-import { buildSolveMissionTool, dispatchSolveMission } from '../../skills/tools/solve-mission.js';
 // ⑩ 재귀 depth cap(액자 방지) — 상한 도달 시 자식-spawn 툴(SelfImplement·delegate) 제외+거부.
 import { nestCapReached, nestInfo } from '../../agent/nest-depth.js';
 import { debug } from '../../debug/log.js';
@@ -487,7 +486,6 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
     //   이 저장소는 그 꼴로 비-codex 프로바이더가 400 을 내는 것을 이미 겪었다.
     //   ⇒ 시험 `챗과 webterm 이 «같은» SelfImplement 를 본다` 가 이 중복을 문다.
     ...(capped || !isDevHarnessModelSurfaceEnabled() ? [] : [buildRunDevHarnessTool()]), // dev-harness front door(P→E→R→D·⑩ 상한/모델 표면 off 시 제외)
-    ...(capped ? [] : [buildSolveMissionTool()]),         // 기존 미션 read-only solve(P3·⑩ 상한 시 제외)
     ...buildWebTerminalSpecs(),
     ...buildPtyShellSpecs(),
   ];
@@ -504,7 +502,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
       ctx: DaemonToolDispatchCtx,
     ): Promise<unknown> {
       // ⭐ 소환기 먼저 — webterm 이 defer 하는 배틀쉽(SelfImplement·RunDevHarness·
-      //   SolveMission)의 스키마를 하이드레이트할 유일한 경로.
+      //   도구의 스키마를 하이드레이트할 유일한 경로.
       if (isToolSearchCall(name)) return routeToolSearch(args, webtermLive.specs(), { surface: 'daemon-webterm' });
       const webtermRegistryName = webtermLive.registryNameOf(name);
       if (webtermRegistryName) return dispatchDaemonMcpRuntime(webtermRegistryName, args, ctx);
@@ -546,14 +544,6 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
         // ★ #24 A — subprocess 위임(auto_drive on·데몬 이벤트루프 격리)은 dispatchRunDevHarness 내부에서
         //   판정한다(두 caller: 여기 + monad-agent-turn 직접호출 모두 커버·재귀 가드 ELANOUS_HARNESS_DETACHED).
         return dispatchRunDevHarness(args, ctx);
-      }
-      if (name === 'SolveMission') {
-        if (nestCapReached()) {
-          debug.log('substrate.nest', 'spawn-refused', { tool: name, ...nestInfo() }, { level: 'warn' });
-          return { error: `nest-cap: 재귀 상한(${nestInfo().max}중) 도달 — SolveMission 비활성(액자 폭주 방지)` };
-        }
-        // subprocess 위임(#24 격리)은 dispatchSolveMission 내부 판정(RunDevHarness 동형).
-        return dispatchSolveMission(args, ctx);
       }
       if ((WEB_TERMINAL_TOOL_NAMES as readonly string[]).includes(name)) {
         return dispatchWebTerminalTool(name, args, ctx);

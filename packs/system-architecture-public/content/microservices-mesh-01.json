@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "마이크로서비스·서비스 메시 — 업무 경계로 서비스 분해",
+  "source": "https://microservices.io/patterns/decomposition/decompose-by-business-capability.html",
+  "body": "적용 시점: 팀·도메인 경계가 명확하고 독립 배포·확장이 반복해서 이득일 때.\n용량 단계: 초기에는 모듈형 단일체; 독립 소유권이나 부하 병목이 증명된 경계부터 분리한다.\nGCP 대응: Cloud Run 서비스와 API Gateway/External Application Load Balancer; 상태는 서비스 소유 DB에 둔다.\n비용 축: 서비스 수에 따른 요청 홉, 로그·추적, 배포 파이프라인, DB 복제가 비용 축이다.\n결정과 반증: 네트워크 경계 추가 뒤에도 업무 트랜잭션·데이터 소유권이 명료한지 검증한다."
+}

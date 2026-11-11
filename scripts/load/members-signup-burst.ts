@@ -16,15 +16,16 @@ import { createFakeGoogleOAuthWorld, FAKE_GOOGLE_ISSUER } from '../../src/ux-sim
 
 const count = Number(process.argv.find(arg => arg.startsWith('--count='))?.split('=')[1] ?? 300);
 const sharedCount = Number(process.argv.find(arg => arg.startsWith('--shared-count='))?.split('=')[1] ?? count);
+const eventCode = process.argv.find(arg => arg.startsWith('--event-code='))?.split('=')[1] ?? 'KAIST-2026';
 if (!Number.isSafeInteger(count) || count < 1 || count > 10_000 || !Number.isSafeInteger(sharedCount)
-  || sharedCount < 0 || sharedCount > count) throw new Error('invalid count or shared-count');
+  || sharedCount < 0 || sharedCount > count || !/^[A-Z0-9-]{3,40}$/.test(eventCode)) throw new Error('invalid count, shared-count or event-code');
 
 const root = mkdtempSync(join(tmpdir(), 'elanous-member-burst-'));
 const dbPath = join(root, 'members.sqlite');
 const redirectUri = 'https://api.example.test/v1/members/oauth/google/callback';
 const now = () => Date.parse('2026-11-14T01:00:00.000Z');
 const store = createMemberStore({ path: dbPath, now });
-store.provisionEventCode({ code: 'KAIST-2026', maxUses: count });
+store.provisionEventCode({ code: eventCode, maxUses: count });
 const expectedByState = new Map<string, number>();
 const world = createFakeGoogleOAuthWorld({
   clientId: 'member-burst-test', redirectUri,
@@ -74,7 +75,7 @@ async function signup(index: number): Promise<Result> {
   try {
     const start = await throughNexus(new Request('https://api.example.test/v1/members', {
       method: 'POST', headers: { origin: 'https://app.example.test', 'content-type': 'application/json' },
-      body: JSON.stringify({ consents: { privacy: 'privacy-v1', terms: 'terms-v1' }, eventCode: 'KAIST-2026' }),
+      body: JSON.stringify({ consents: { privacy: 'privacy-v1', terms: 'terms-v1' }, eventCode }),
     }), networkKey);
     const startMs = elapsed(startedAt);
     if (start.status !== 201) return { start: start.status, startMs, totalMs: elapsed(startedAt) };
@@ -118,7 +119,7 @@ try {
   const successful = results.filter(result => result.start === 201 && result.callback === 200
     && result.profile === 200 && !result.error).length;
   const summary = {
-    universe: 'Nexus routeRequest + isolated SQLite + fake Google', count, sharedCount,
+    universe: 'Nexus routeRequest + isolated SQLite + fake Google', count, sharedCount, eventCode,
     successful, successRate: successful / count, wallMs: elapsed(wallAt),
     p95Ms: {
       start: percentile(results.map(result => result.startMs), 0.95),

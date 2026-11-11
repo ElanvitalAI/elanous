@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "ML 서빙 — 배치 추론과 온라인 분리",
+  "source": "https://docs.cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning",
+  "body": "적용 시점: 대량 예측이 대화형 요청의 latency·용량을 방해할 때.\n용량 단계: 작은 데이터는 예약 배치; 온라인 부하와 자원 간섭이 관측되면 별도 queue/job pool로 분리한다.\nGCP 대응: BigQuery ML/Vertex batch prediction 또는 Dataflow job을 online endpoint와 분리한다.\n비용 축: 배치 처리 단가·데이터 scan, 유휴 accelerator와 online minimum capacity가 비용 축이다.\n결정과 반증: 같은 시간에 배치가 돌아도 online latency SLO가 유지되는지 공존 부하 시험을 한다."
+}

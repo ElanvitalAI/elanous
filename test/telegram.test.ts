@@ -1400,6 +1400,32 @@ describe('TelegramBot', () => {
 });
 
 describe('botFromConfig end-to-end', () => {
+  test('mission-marked Telegram text reaches the ordinary turn', async () => {
+    const updates = [
+      { update_id: 1, message: { message_id: 10, from: { id: 42 }, chat: { id: -42, type: 'group' }, text: '미션: 티켓팅 설계해줘' } },
+    ];
+    let served = false;
+    let bot: TelegramBot;
+    const seen: string[] = [];
+    const { fetchImpl, calls } = makeStubFetch((call) => {
+      if (call.url.endsWith('getUpdates')) {
+        if (!served) { served = true; return updates; }
+        bot.stop();
+        return [];
+      }
+      if (call.url.endsWith('/sendMessage')) return { message_id: 777 };
+      return {};
+    });
+    bot = botFromConfig({
+      userConfig: baseConfig(), fetchImpl, telegramBotOpts: FAST_TG_OPTS,
+      runTurnImpl: (async ({ userText }: { userText: string }) => { seen.push(userText); return { text: '설계 응답' }; }) as never,
+    });
+    await bot.start();
+    expect(seen).toEqual(['미션: 티켓팅 설계해줘']);
+    expect(calls.some(call => call.url.endsWith('/editMessageText') && String(call.body.text).includes('설계 응답'))).toBe(true);
+    expect(calls.some(call => call.url.endsWith('/sendMessage') && String(call.body.text).includes('미션 등록'))).toBe(false);
+  });
+
   test('creates session on first telegram message, reuses on second', async () => {
     const cfg = baseConfig();
     const updates1 = [

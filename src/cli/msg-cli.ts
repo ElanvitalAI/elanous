@@ -1,6 +1,7 @@
 import type { Command } from 'commander';
 import { formatMessage, registerMsgListCommand } from './msg-list-cli.js';
 import { mkdirSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { ensureAuthToken } from '../auth/acp-token.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
@@ -92,6 +93,34 @@ function integer(raw: string | undefined, flag: string, fallback: number, min: n
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < min || value > max) throw new Error(`${flag} must be an integer between ${min} and ${max}`);
   return value;
+}
+
+function hasEmptyAssignment(body: string): boolean {
+  let keyTail = false;
+  let awaitingValue = false;
+  for (const char of body) {
+    if (awaitingValue) {
+      if (char === ' ' || char === '\t') continue;
+      if (',;|)]}\r\n\u2028\u2029'.includes(char)) return true;
+      awaitingValue = false;
+    }
+    if (char === '=' || char === ':') {
+      awaitingValue = keyTail;
+      keyTail = false;
+    } else {
+      keyTail = /[\p{L}\p{M}\p{N}_.-]/u.test(char);
+    }
+  }
+  return awaitingValue;
+}
+
+function postBodyWarnings(body: string): string[] {
+  const warnings: string[] = [];
+  if (body.includes('`')) warnings.push('백틱이 포함됨');
+  if (/\S[^\S\r\n]{2,}\S/.test(body)) warnings.push('문장 중간 연속 공백: 셸 명령 치환으로 내용이 사라졌을 수 있음');
+  if (hasEmptyAssignment(body))
+    warnings.push('빈 값 패턴: 셸 명령 치환 결과를 확인하세요');
+  return warnings;
 }
 
 /** Register the durable, recipient-addressed CLI. Reading never advances the acknowledgement cursor. */
@@ -318,13 +347,14 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       out.error(`msg: post office 재시작 (port ${result.port}) — 원장이 정본이라 저장된 글은 다시 밀린다`);
   };
 
-  msg.command('post [body]').description('Post a message; use - or omit body to read stdin')
+  msg.command('post [body]').description('Post a message; use --body-file <path>, - or omit body to read stdin')
     .option('--from <seat>').option('--to <seat>').option('--kind <kind>').option('--body <text>')
+    .option('--body-file <path>', 'read the message body from a UTF-8 file; use - for stdin')
     .option('--reject-undeclared', 'reject a recipient that has no routable seat or pane instead of storing it with a warning')
     .option('--reply-to <id>', 'point this reply at a question message ID')
     .option('--agent-reply <address>', 'let this address\'s agent body (COORDINATOR · GUARDIAN) answer the saved message once')
     .option('--origin-key <key>', 'deduplicate a channel mirror by coord:<commentId>:<recipient>').option('--json')
-    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; replyTo?: string; originKey?: string; agentReply?: string; rejectUndeclared?: boolean }) => run(async () => {
+    .action((body: string | undefined, opts: CommonOptions & { from?: string; to?: string; kind?: string; body?: string; bodyFile?: string; replyTo?: string; originKey?: string; agentReply?: string; rejectUndeclared?: boolean }) => run(async () => {
       const from = seat(opts.from, '--from');
       const unsupported = opts.to === undefined ? null : unsupportedLoopAddressNotice(opts.to);
       if (unsupported) out.error(unsupported);
@@ -340,8 +370,16 @@ export function registerMsgCommands(program: Command, deps: MsgCliDeps = {}): vo
       // Validate the auto-reply target before saving — a mismatched flag must not leave a stored message behind.
       const agentAddress = agentReplyAddress(opts.agentReply);
       if (agentAddress !== null) requireAgentTarget(agentAddress, to);
-      if (body !== undefined && body !== '-' && opts.body !== undefined) throw new Error('provide body once (argument or --body)');
-      const text = opts.body ?? (body !== undefined && body !== '-' ? body : await readStdin());
+      const positionalBody = body !== undefined && body !== '-' ? body : undefined;
+      if ((body === '-' && (opts.body !== undefined || opts.bodyFile !== undefined))
+        || [positionalBody, opts.body, opts.bodyFile].filter(value => value !== undefined).length > 1)
+        throw new Error('provide body once (argument, --body, or --body-file)');
+      if (opts.bodyFile === '') throw new Error('--body-file requires a path or - for stdin');
+      const text = opts.bodyFile === undefined
+        ? opts.body ?? positionalBody ?? await readStdin()
+        : opts.bodyFile === '-' ? await readStdin() : await readFile(opts.bodyFile, 'utf8');
+      for (const warning of postBodyWarnings(text))
+        out.error(`msg post 경고: ${warning} — 본문을 확인하고 다음 보고는 --body-file 또는 stdin 사용`);
       const envelope = { from, to, body: text,
         ...(opts.kind === undefined ? {} : { kind: opts.kind }),
         ...(opts.replyTo === undefined ? {} : { replyTo: integer(opts.replyTo, '--reply-to', 0, 1, Number.MAX_SAFE_INTEGER) }) };

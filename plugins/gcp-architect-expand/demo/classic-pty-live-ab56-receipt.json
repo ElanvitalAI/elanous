@@ -1,0 +1,52 @@
+{
+  "checkedAt": "2026-11-10T07:53:00Z",
+  "surface": "actual Elanous classic TUI PTY, browse mode, isolated --test universe",
+  "command": "bun bin/elanous.mjs --test=<isolated> --config-dir <isolated> --legacy",
+  "testWorktree": "/home/ubuntu/elanous-hq/seats/R-GCPX/GCPX-LIVE-AB56",
+  "testStack": {
+    "routeSeamPr": 36517,
+    "routeSeamAncestor": "d1a46cd68483b70f3d7a7cf0cc3f97c914422b20",
+    "toolSearchPr": 36536,
+    "testHead": "ab56c614d8733a81ea1bf877c830026098a668c1",
+    "pluginSource": "PR #36512 copied to test worktree; no test-stack commit in PR",
+    "stackMethod": "test-only git merge --no-commit --no-ff d1a46cd into ab56c614 worktree; PR excludes merge"
+  },
+  "modelWorld": "local loopback fake model; no live GCP calls",
+  "userPrompt": "GCP 확장안 실행해줘",
+  "toolSearchQuery": "route:GCP 확장안",
+  "firstRequest": {
+    "toolCount": 53,
+    "toolSearchAdvertised": true,
+    "gcpRouteAdvertised": false
+  },
+  "hydratedRequest": {
+    "toolCount": 54,
+    "toolSearchAdvertised": true,
+    "gcpRouteAdvertised": true
+  },
+  "toolSearchResult": "1 matched: gcp_architect_expand",
+  "routeCallArgs": {
+    "ticketDesignPath": "plugins/gcp-architect-expand/demo/fixtures/ticketing-design.json"
+  },
+  "inlineConfirmation": {
+    "panelSeen": true,
+    "choice": "y",
+    "inputMethod": "elanous pty text tui:304983 y --enter",
+    "delivered": true,
+    "default": "N",
+    "panelEvidence": "GCP 확장 설계 그래프를 실행할까요? 실제 자원 생성은 별도 사용자 비용 승인 후에만 진행합니다. (y/N)\ny. y\n▸ n. N\ny/n · 기본 n · Esc 취소"
+  },
+  "routeResult": {
+    "error": "Error: graph route requires a verified owner context",
+    "verifiedBySessionToolResult": true
+  },
+  "runGraphEntered": false,
+  "diagramProducedInThisPty": false,
+  "pdfProducedInThisPty": false,
+  "boardAttachmentObserved": false,
+  "realGcpCalls": 0,
+  "blocker": "src/dashboard/index.ts getTuiDispatchContext calls createDashboardTuiConfirmContext, which supplies confirmation but no verifiedOwner; dispatchVerifiedDashboardGraph rejects before runGraph.",
+  "secondaryBlocker": "Graph v2 cloud-resource capability providers are not registered in production; after owner wiring the current graph still fails closed until fake-world provider injection.",
+  "promptCaveat": "A longer design prompt containing 설계 triggered deep-bloom nonresearch filtering and omitted ToolSearch; short route prompt did expose it.",
+  "verdict": "Search → GCP route → inline y succeeded in actual classic PTY. runGraph and diagram/PDF did not execute."
+}

@@ -8,6 +8,7 @@ clock:
   start: 2026-11-09T06:59:00+09:00
 providers:
   store: fake-member-store
+  events: fake-member-event-journal
   extract: fake-extractors
   stt: fake-stt
   ocr: fake-ocr
@@ -26,7 +27,8 @@ fixtures:
       byok: false
       apps: []
   scraps:
-    - { id: scrap-text, owner: member-demo, kind: text, status: new, text: "시험 텍스트 노트" }
+    # Source: 내부 문서 `DEMO-INTEGRATED-NORTH-STAR` scene 1; the three concerns continue in the fake briefing output.
+    - { id: scrap-text, owner: member-demo, kind: text, status: new, text: "축제·콘서트 티켓 대란, 접속 폭주로 예매 실패" }
     - { id: scrap-web, owner: member-demo, kind: web, status: new, url: https://example.test/article }
     - { id: scrap-x, owner: member-demo, kind: x, status: new, url: https://x.com/example/status/1 }
     - { id: scrap-youtube, owner: member-demo, kind: youtube, status: new, url: https://youtu.be/example }

@@ -88,6 +88,8 @@ publish:
   approval: 'v{{input.version}} 공개 발행 — 되돌릴 수 없다. 승인하시겠습니까?'
 continue-publish:
   approval: 'publishProcess와 partialPublish 증거를 확인하세요. 공개 발행이 완료됐으면 publish를 다시 실행하지 말고 npm-publish 단계부터 같은 런을 이어가시겠습니까? 부분 발행이 확인되지 않으면 거부하세요.'
+cloud-elastic:
+  approval: '클라우드 VM 사용을 승인합니까? 이 그래프 런의 변경 불가 요청과 월 지출 스냅샷을 확인하세요: {{input.cloudElastic}} · 월 지출 24시간 이내 실측 필수 · 비용 상한 5,000,000 KRW · 승인 시 이 요청만 join 합니다.'
 repair-recovery:
   approval: 'Gate repair PR 착지 조회·기록 복구가 소진됐습니다. gate-repair 출력에서 run ID·PR 번호·검증된 inspection head를 읽고 현재 PR 및 main 병합과 대조하세요. 확인되면 승인해 같은 런에서 gate를 재측정하고, 아니면 거부하세요.'
 gate-heal-decision:
@@ -98,6 +100,15 @@ gate-same-run-recheck:
 gate-append-recheck-plan:
   command: 'bun scripts/release-loop/gate-append-recheck-plan-node.ts'
   timeout_ms: 30000
+cloud-join:
+  command: 'bun scripts/release-loop/cloud-elastic-node.ts join'
+  timeout_ms: 10800000
+cloud-approval-check:
+  command: 'bun scripts/release-loop/cloud-elastic-node.ts approval-check'
+  timeout_ms: 30000
+cloud-leave:
+  command: 'bun scripts/release-loop/cloud-elastic-node.ts leave'
+  timeout_ms: 7200000
 publish-command:
   command: 'bun scripts/release-loop/publish-node.ts'
   # 30m scheduled wait + 30m publish subprocess + 30m bounded asset polling.

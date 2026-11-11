@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "검색 — 재색인과 점진 전환",
+  "source": "https://cloud.google.com/generative-ai-app-builder/docs/enterprise-search-introduction",
+  "body": "적용 시점: 검색 분석기·스키마·랭킹을 바꾸면서 질의 중단을 피해야 할 때.\n용량 단계: 초기에는 인플레이스 변경; 재색인 시간이 SLO를 침해하면 새 인덱스 병렬 구축 후 alias를 전환한다.\nGCP 대응: 원본 저장소에서 새 검색 인덱스로 backfill하고 증분 이벤트를 따라잡은 뒤 트래픽을 점진 전환한다.\n비용 축: 기존/신규 인덱스 중복 저장·backfill 컴퓨트·이벤트 catch-up이 임시 비용이다.\n결정과 반증: 새 인덱스 결과 차이와 lag가 수용 범위에 들어온 뒤 cutover하고 rollback을 검증한다."
+}

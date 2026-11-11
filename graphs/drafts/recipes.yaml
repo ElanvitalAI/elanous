@@ -9,7 +9,7 @@ classify:
     const evidence={stdout:contextPath+".draft-cleanup.stdout",stderr:contextPath+".draft-cleanup.stderr",meta:contextPath+".draft-cleanup.evidence.json"};
     const {writeFile,chmod}=await import("node:fs/promises");
     const maxOutputBytes=16*1024*1024;
-    const run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "harness", "drafts", "sweep", "--json", "--emit-apply-plan", "--max-pages", "100", "--max-drafts", "300", "--max-merged", "1000"], {cwd:process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD || repo,timeout:540000,maxBuffer:maxOutputBytes,stdout:"pipe",stderr:"pipe"});
+    const run=Bun.spawnSync(["bun", repo+"/bin/elanous.mjs", "harness", "drafts", "sweep", "--json", "--emit-apply-plan", "--max-pages", "100", "--max-drafts", "300"], {cwd:process.env.ELANOUS_DRAFT_SWEEP_GIT_CWD || repo,timeout:540000,maxBuffer:maxOutputBytes,stdout:"pipe",stderr:"pipe"});
     await writeFile(evidence.stdout, run.stdout, {mode:0o600}); await writeFile(evidence.stderr, run.stderr, {mode:0o600});
     await writeFile(evidence.meta,JSON.stringify({exitCode:run.exitCode,stdoutBytes:run.stdout.byteLength,stderrBytes:run.stderr.byteLength,maxOutputBytes,truncated:run.exitedDueToMaxBuffer === true,stdoutPath:evidence.stdout,stderrPath:evidence.stderr,recordedAt:new Date().toISOString()}), {mode:0o600});
     if (run.exitedDueToMaxBuffer) throw new Error("draft cleanup inventory incomplete (truncated: output exceeded "+maxOutputBytes+" bytes); raw evidence="+evidence.meta);

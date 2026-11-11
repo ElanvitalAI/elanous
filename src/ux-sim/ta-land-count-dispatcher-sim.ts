@@ -3,6 +3,8 @@
  * It parses only an injected command receipt; it never launches a process, reads a
  * ledger, or starts a task itself.
  */
+import { isStringArray } from '../primitives/guards.js';
+
 export interface LandCountCommandEvidence {
   readonly argv: readonly string[];
   readonly exitCode: number;
@@ -40,17 +42,15 @@ export interface TaLandCountDispatchResult {
 
 const EXPECTED_ARGV = ['eln', 'tasks', 'land-count', '--json'] as const;
 
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((entry) => typeof entry === 'string' && entry.length > 0);
-}
-
 function parseLandCount(stdout: string): LandCountJson | null {
   try {
     const parsed: unknown = JSON.parse(stdout);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     const value = parsed as Record<string, unknown>;
     if (value.count !== null && (!Number.isInteger(value.count) || Number(value.count) < 0)) return null;
-    if (!isStringArray(value.active) || !isStringArray(value.terminal) || !isStringArray(value.unknown)) return null;
+    if (!isStringArray(value.active) || !value.active.every(Boolean)
+      || !isStringArray(value.terminal) || !value.terminal.every(Boolean)
+      || !isStringArray(value.unknown) || !value.unknown.every(Boolean)) return null;
     if (value.error !== undefined && typeof value.error !== 'string') return null;
     return {
       count: value.count as number | null,

@@ -2,6 +2,7 @@ import type { GraphEvent, GraphEventBus, GraphEventScope } from '../../src/graph
 import type { GateResult } from './gate-types.js';
 import { planAdaptiveGateHeal, type AdaptiveGateHealPlan, type AdaptiveGateRepairNode, type AdaptiveGateImageRepairNode } from './adaptive-gate-heal.js';
 import type { GateTriageShadow } from './gate-triage-types.js';
+import { isRecord } from '../../src/primitives/guards.js';
 
 export const RELEASE_GATE_FAILED_EVENT = 'release.gate.failed';
 
@@ -14,8 +15,10 @@ export interface AdaptiveGateHealAppendNodeRequest {
   readonly node: AdaptiveGateRepairNode | AdaptiveGateImageRepairNode;
   readonly resumeFrom: string;
   readonly rerunGateAt: 'gate';
+  /** Declared post-measurement target; the runner verifies the live graph route before append. */
+  readonly auditAfterGate?: string;
   readonly visitState: { readonly gate: number; readonly gateTriage: number };
-  readonly visitLimits: { readonly gate: 2; readonly gateTriage: 2 };
+  readonly visitLimits: { readonly gate: 2 | 3; readonly gateTriage: 2 | 3 };
   readonly maxRepairRetries: 1;
 }
 
@@ -31,7 +34,7 @@ export interface AdaptiveGateHealRerunGateRequest {
   readonly resumeFrom: 'gate';
   readonly gatePodPool: string;
   readonly visitState: { readonly gate: number; readonly gateTriage: number };
-  readonly visitLimits: { readonly gate: 2; readonly gateTriage: 2 };
+  readonly visitLimits: { readonly gate: 2 | 3; readonly gateTriage: 2 | 3 };
 }
 
 /** Implemented by the graph-runner owner; appends durably and schedules the resume before resolving. */
@@ -46,6 +49,7 @@ export interface AdaptiveGateHealEventData {
   readonly sourceOutcome?: GateResult['outcome'] | 'fail';
   readonly gateExecutor?: 'host' | 'pod';
   readonly gatePodPool?: string;
+  readonly autoAppendRepair?: boolean;
   readonly visitState?: { readonly gate: number; readonly gateTriage: number };
 }
 
@@ -53,10 +57,6 @@ export interface AdaptiveGateHealAdapterDeps {
   readonly appendNode: AdaptiveGateHealAppendNode;
   readonly rerunGate?: (request: AdaptiveGateHealRerunGateRequest) => Promise<{ disposition: 'queued' | 'already-queued' }>;
   readonly onPlan?: (plan: AdaptiveGateHealPlan, event: GraphEvent) => void | Promise<void>;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function eventData(event: GraphEvent): AdaptiveGateHealEventData {
@@ -82,6 +82,7 @@ function eventData(event: GraphEvent): AdaptiveGateHealEventData {
   const gateExecutor = value.gateExecutor;
   const gatePodPool = typeof value.gatePodPool === 'string' && value.gatePodPool.trim() ? value.gatePodPool : undefined;
   return { version: value.version, gate, triage,
+    ...(value.autoAppendRepair === true ? { autoAppendRepair: true } : {}),
     ...(Object.prototype.hasOwnProperty.call(value, 'macrophageRepairLadder')
       ? { macrophageRepairLadder: value.macrophageRepairLadder } : {}),
     ...(sourceOutcome === 'ok' || sourceOutcome === 'regression' || sourceOutcome === 'error' || sourceOutcome === 'fail'
@@ -122,7 +123,7 @@ export function registerAdaptiveGateHealAdapter(
     const disposition = plan.disposition;
     const receipt = await deps.appendNode({ graphId: event.graphId, runId: event.runId, eventId: event.eventId,
       afterNodeId: 'gate-triage', node: disposition.repairNode, resumeFrom: disposition.resumeFrom,
-      rerunGateAt: disposition.rerunGateAt, visitState: disposition.visitState,
+      rerunGateAt: disposition.rerunGateAt, auditAfterGate: disposition.auditAfterGate, visitState: disposition.visitState,
       visitLimits: disposition.visitLimits, maxRepairRetries: disposition.maxRepairRetries });
     if (!Number.isSafeInteger(receipt.graphRevision) || receipt.graphRevision < 1 ||
       !['appended', 'already-appended'].includes(receipt.disposition)) {

@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { isMainThread, parentPort, workerData, Worker } from 'node:worker_threads';
 import { queryRunningRuns, type QueriedRunningRunsResult } from '../self-implement/running-runs.js';
 import { loadRunLedger, resolveFederatedRunLedgerDirectories, runLedgerDir } from '../self-implement/run-ledger.js';
-import { localLoopRows } from '../dashboard/slash-runtime/loops-table.js';
+import { localLoopRows } from '../loops/loops-table.js';
 import { checkBrand } from '../../scripts/brand/check.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry } from '../decisions/decision-ledger.js';
@@ -424,7 +424,7 @@ function unreadableReason(error: unknown): string {
 }
 
 /** Read a bounded, source-labelled view of current ledgers, never a transcript or decision body. */
-export function contextNow(options: { topic?: string; limit?: number; audience?: 'operator' | 'user' | 'public-demo' } = {}, deps: ContextNowDeps = {}): ContextNowAnswer {
+export function contextNow(options: { topic?: string; limit?: number; audience?: 'operator' | 'user' | 'public-demo'; section?: 'core' | 'operations' } = {}, deps: ContextNowDeps = {}): ContextNowAnswer {
   const now = (deps.now ?? (() => new Date()))();
   const at = `${now.toISOString().slice(0, 16)}:00.000Z`;
   const topic = options.topic?.trim() || null;
@@ -433,7 +433,7 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
   const version = (deps.version ?? devVersion)().replace(/-.*$/, '');
   const next = version.replace(/^(\d+)\.(\d+)\.(\d+)$/, (_, major: string, minor: string, patch: string) => `${major}.${minor}.${Number(patch) + 1}`);
   const facts: ContextFact[] = [];
-  for (const v of [...new Set([version, next])]) {
+  for (const v of options.section === 'operations' ? [] : [...new Set([version, next])]) {
     const checklist = (deps.checklist ?? listChecklist)(v);
     if (v === version) facts.push({ kind: 'version', version: v, source: `elanous://release/${v}/checklist` });
     for (const item of checklist.items) {
@@ -443,19 +443,21 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
         source: `elanous://release/${v}/checklist#${encodeURIComponent(item.id)}` });
     }
   }
-  for (const item of (deps.decisions ?? (() => new DecisionLedger().list({ status: 'open' })))()) {
+  for (const item of options.section === 'operations' ? [] : (deps.decisions ?? (() => new DecisionLedger().list({ status: 'open' })))()) {
     if (item.status !== 'open') continue;
     facts.push({ kind: 'decision', id: item.id, title: redactSecretText(item.title.split(/\r?\n/, 1)[0] ?? '').slice(0, 120),
       status: item.status, dueAt: item.dueAt ?? null, source: `elanous://decisions/${encodeURIComponent(item.id)}` });
   }
-  facts.push(...(deps.seatEntries ?? todaySeatEntries)(now).map(seatFact));
-  const rawEvents = (deps.events ?? (since => listCoordEvents({ since })))(new Date(now.getTime() - 7 * 86_400_000).toISOString());
+  if (options.section !== 'operations') facts.push(...(deps.seatEntries ?? todaySeatEntries)(now).map(seatFact));
+  // The operations scan must not wait on the event ledger also read by core.
+  const rawEvents = options.section === 'operations' ? []
+    : (deps.events ?? (since => listCoordEvents({ since })))(new Date(now.getTime() - 7 * 86_400_000).toISOString());
   const chronologicalEvents = rawEvents.slice().sort((a, b) => a.at.localeCompare(b.at));
   const matches = (text: string) => !topic || text.toLocaleLowerCase().includes(topic.toLocaleLowerCase());
   const operationsTopic = topic?.toLocaleLowerCase() === 'ops';
   const asksRelease = operationsTopic || Boolean(topic && /발행|출시|릴리스|release|게이트|gate/i.test(topic));
   const operational: ContextFact[] = [];
-  if (options.audience !== 'public-demo') {
+  if (options.audience !== 'public-demo' && options.section !== 'core') {
     try { operational.push(...(deps.runningRuns ?? (date => runningRunFacts(date, deps.queryRuns)))(now)); }
     catch (error) { operational.push({ kind: 'run', goal: '', phase: '', elapsed: '', source: runSource, unreadable: unreadableReason(error) }); }
     try {
@@ -496,8 +498,8 @@ export function contextNow(options: { topic?: string; limit?: number; audience?:
     at: event.at, kind: event.kind, summary: redactSecretText(event.summary.split(/\r?\n/, 1)[0] ?? '').slice(0, 120),
     source: event.refs.source ?? event.refs.url ?? `elanous://context/event/${encodeURIComponent(event.id)}`,
   }));
-  const selectedEvents = summaries.filter(event => matches(event.summary)).reverse().slice(0, limit);
-  const guide = summaries.filter(event => event.kind === 'guide-changed' || event.kind === 'guidance-changed' || event.summary.startsWith('📌안내'))
+  const selectedEvents = (options.section === 'operations' ? [] : summaries).filter(event => matches(event.summary)).reverse().slice(0, limit);
+  const guide = (options.section === 'operations' ? [] : summaries).filter(event => event.kind === 'guide-changed' || event.kind === 'guidance-changed' || event.summary.startsWith('📌안내'))
     .filter(event => matches(event.summary)).reverse().slice(0, limit)
     .map(event => `📌 ${event.summary} — ${event.source}`);
   const answer = { at, topic, facts: boundedFacts, events: selectedEvents, guide };
@@ -594,10 +596,16 @@ const WORKER_SCAN_TIMEOUT_MS = 60_000;
 let workerScanTail: Promise<void> = Promise.resolve();
 
 /** Keep the ledger scan off the TUI event loop. Repeated identical reads share one scan. */
-export function contextNowInWorker(options: Parameters<typeof contextNow>[0] = {}): Promise<ContextNowAnswer> {
+type ContextNowWorkerOptions = Parameters<typeof contextNow>[0] & { signal?: AbortSignal };
+
+export function contextNowInWorker(options: ContextNowWorkerOptions = {}): Promise<ContextNowAnswer> {
+  const { signal, ...scanOptions } = options;
   const stateRoot = process.env.ELANOUS_STATE_DIR;
   const selectedRoot = effectiveInstanceRoot();
-  const key = JSON.stringify([selectedRoot, stateRoot ?? null, options.topic ?? null, options.limit ?? null, options.audience ?? null]);
+  // An interactive cancellation owns its worker. Keep shared cached scans for
+  // callers without a signal so one caller cannot cancel another's answer.
+  if (signal) return scanContextNowInWorker(options, stateRoot, selectedRoot);
+  const key = JSON.stringify([selectedRoot, stateRoot ?? null, scanOptions.topic ?? null, scanOptions.limit ?? null, scanOptions.audience ?? null, scanOptions.section ?? null]);
   const now = Date.now();
   for (const [cachedKey, cached] of workerAnswers) {
     if (cached.expiresAt < now) workerAnswers.delete(cachedKey);
@@ -613,27 +621,32 @@ export function contextNowInWorker(options: Parameters<typeof contextNow>[0] = {
   return promise;
 }
 
-export function scanContextNowInWorker(options: Parameters<typeof contextNow>[0], stateRoot: string | undefined, selectedRoot: string,
+export function scanContextNowInWorker(options: ContextNowWorkerOptions, stateRoot: string | undefined, selectedRoot: string,
   createWorker: () => Worker = () => new Worker(new URL(import.meta.url), { workerData: { kind: 'context-now' } }),
   timeoutMs = WORKER_SCAN_TIMEOUT_MS): Promise<ContextNowAnswer> {
+  const { signal, ...scanOptions } = options;
   const worker = createWorker();
   const startedAt = Date.now();
   return new Promise((resolve, reject) => {
     let settled = false;
     const timeout = setTimeout(() => {
-      debug.log('context.now', 'worker-timeout', { timeoutMs, topic: options?.topic ?? null, selectedRoot });
+      debug.log('context.now', 'worker-timeout', { timeoutMs, topic: options?.topic ?? null, section: options.section ?? null, selectedRoot });
       finish(new Error(`context_now worker timed out after ${timeoutMs}ms`));
     }, timeoutMs);
     const finish = (error?: Error, answer?: ContextNowAnswer): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
       // 첫 호출 지연은 색인과 무관하게 «따로» 재야 판정선과 비교할 수 있다 — 스캔 자체의 ms 를 남긴다.
-      debug.log('context.now', 'worker-answer', { topic: options?.topic ?? null, ok: !error, ms: Date.now() - startedAt });
+      debug.log('context.now', 'worker-answer', { topic: options?.topic ?? null, section: options.section ?? null, ok: !error, ms: Date.now() - startedAt });
       void worker.terminate();
       if (error) reject(error);
       else resolve(answer!);
     };
+    const onAbort = (): void => finish(new Error('context_now cancelled'));
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener('abort', onAbort, { once: true });
     worker.on('message', (message: { answer?: ContextNowAnswer; error?: string }) => {
       if (message.error) finish(new Error(message.error));
       else if (message.answer) finish(undefined, message.answer);
@@ -641,7 +654,7 @@ export function scanContextNowInWorker(options: Parameters<typeof contextNow>[0]
     worker.on('error', error => finish(error instanceof Error ? error : new Error(String(error))));
     worker.on('exit', code => { if (!settled) finish(new Error(`context_now worker exited before answering: ${code}`)); });
     // Preserve both caller roots: a programmatic config override is not inherited by workers.
-    worker.postMessage({ options, stateRoot, selectedRoot });
+    worker.postMessage({ options: scanOptions, stateRoot, selectedRoot });
   });
 }
 

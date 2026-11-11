@@ -1,0 +1,32 @@
+{
+  "id": "kcb-integrated-pwa-lap",
+  "name": "KCB integrated PWA browser lap",
+  "audience": "internal",
+  "checklistCells": ["DEMO-INT-PWA-LAP"],
+  "implementation": [
+    "src/ux-sim/kaist-classic-pwa-replay-world.ts",
+    "src/ux-sim/kaist-classic-pwa-browser-replay.ts",
+    "src/ux-sim/kcb-phone-rehearsal.ts",
+    "src/ux-sim/fixtures/kcb-ticket-classic-pty-receipt.json",
+    "plugins/gcp-architect-expand/sim/sample-output/board-attachments.json"
+  ],
+  "tests": ["src/ux-sim/kaist-classic-pwa-browser-replay.test.ts", "src/ux-sim/kcb-phone-rehearsal.test.ts"],
+  "target": "Replay KCB scenes 2, 3, 5, and 6 in one mobile PWA browser session, including a visible GCP approval and opening verified diagram and PDF sample bytes.",
+  "inputs": [
+    "KCB classic PTY receipt for absorb and board scenes",
+    "GCP architect direct Graph receipt at awaiting-approval and hash-verified sample artifacts",
+    "static PWA export, isolated loopback member session, and headless Chrome"
+  ],
+  "observations": [
+    "scene 2 briefing, scene 3 one owner-cookie approval POST, and scene 5 one GCP approval POST",
+    "scene 6 shows diagram and PDF links; each real windowOpen popup is paused and closed before network, then verified sample bytes open in the fenced parent tab",
+    "receipt names separate absorb and GCP source run IDs and marks their cross-graph handoff unmeasured; no real GCP or public publish"
+  ],
+  "entryCommands": [
+    "KAIST_PWA_OUT_DIR=${KAIST_PWA_OUT_DIR:?set-static-export-dir} CHROME_BIN=${CHROME_BIN:?set-Chrome-executable} ELANOUS_REMOTE_HOST=${ELANOUS_REMOTE_HOST:?set-remote-host} bun test --timeout 180000 src/ux-sim/kaist-classic-pwa-browser-replay.test.ts -t \"KCB integrated demo\"",
+    "bun test src/ux-sim/kcb-phone-rehearsal.test.ts"
+  ],
+  "logsRecorded": "yes",
+  "eventNames": ["KAIST_PWA_BROWSER_RECEIPT"],
+  "recentUse": null
+}

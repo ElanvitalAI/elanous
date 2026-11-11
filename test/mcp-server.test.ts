@@ -15,7 +15,6 @@ import {
   listToolRuntimes,
   registerToolRuntime,
 } from '../src/tool-runtime/registry';
-import { elanousAutopilotLaunchRuntime } from '../src/tool-runtime/elanous-autopilot-launch-runtime';
 import type { ToolRuntime } from '../src/tool-runtime/types';
 import {
   setPtyAdapterForTesting, resetForTesting,
@@ -198,7 +197,7 @@ describe('MCP tools/list', () => {
 
     const runtimeNames = listToolRuntimes('mcp').map(runtime => runtime.id);
     expect(runtimeNames).toContain('aside.repl');
-    expect(runtimeNames).toContain('elanous_autopilot_launch');
+    expect(runtimeNames).not.toContain('elanous_autopilot_launch');
     expect(runtimeNames.some(name => !name.startsWith('aside.') && !name.startsWith('xcodebuild.'))).toBe(true);
 
     const resp = await handleMcpRequest({
@@ -207,7 +206,7 @@ describe('MCP tools/list', () => {
     const result = resp.result as { tools: Array<{ name: string; description: string }> };
     const names = result.tools.map(t => t.name);
     expect(names).toContain('aside.repl');
-    expect(names).toContain('elanous_autopilot_launch');
+    expect(names).not.toContain('elanous_autopilot_launch');
     expect(names).toContain('GetDashboardState');
     expect(names).toContain('PtyShellList');
     expect(names).not.toContain('Bash');
@@ -238,23 +237,13 @@ describe('MCP tools/call', () => {
     setPtyAdapterForTesting(null);
   });
 
-  test('harness launch tools/call returns the identifier produced by its runtime', async () => {
-    const runId = 'run-from-harness-seam';
-    registerToolRuntime({
-      ...elanousAutopilotLaunchRuntime,
-      run: async () => ({ output: runId, runId }),
-    });
-
+  test('retired launch is absent from the MCP call surface', async () => {
+    registerAllDefaultToolRuntimes();
     const resp = await handleMcpRequest({
       jsonrpc: '2.0', id: 5, method: 'tools/call',
       params: { name: 'elanous_autopilot_launch', arguments: { mission: 'start this harness run' } },
     });
-    const result = resp.result as {
-      content: Array<{ type: string; text: string }>;
-      structuredContent: { output: string; runId: string };
-    };
-    expect(result.content).toEqual([{ type: 'text', text: runId }]);
-    expect(result.structuredContent.runId).toBe(runId);
+    expect(resp.error?.code).toBe(-32601); // Source: JSON-RPC method-not-found contract in src/mcp/server.ts.
   });
 
   test('unknown tool name → -32601', async () => {

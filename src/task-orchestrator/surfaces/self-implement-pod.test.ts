@@ -2231,7 +2231,7 @@ describe('podSelfImplementSpawn', () => {
   });
 
   test('applies secret then job, polls to Complete, parses the last JSON line, deletes the secret, drops the pod-internal worktreePath', async () => {
-    const json = JSON.stringify({ stage: 'pr-opened', ok: true, worktreePath: '/home/user/x', prUrl: 'https://github.com/o/r/pull/9', prNumber: 9 });
+    const json = JSON.stringify({ stage: 'pr-opened', ok: true, worktreePath: '/home/ubuntu/x', prUrl: 'https://github.com/o/r/pull/9', prNumber: 9 });
     const { k, calls } = fakeKubectl(['', '', 'Complete'], `noise\n${json}\n`);
     const spawn = podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS, env: { ELANOUS_RUN_ID: 'run-7' } });
     const { address, done } = spawn({ feature: 'do x', spaceId: 'orch-1', openPr: true });
@@ -3021,7 +3021,7 @@ describe('podSelfImplementSpawn', () => {
   });
 
   test('failed child reports the last result line, GraphQL failure and redacted first/last error lines', async () => {
-    const error = 'draft PR 생성 실패(worktree·branch 보존 · self-impl/src-nexus-api-trace-ts-src-nexus-api-tra-4131fa54 · /home/user/.elanous/worktrees/ubuntu-678d8d02/repo.worktrees/self-impl-src-nexus-api-trace-ts-src-nexus-api-tra-4131fa54)\nself-implement PR gh 실패: GraphQL: API rate limit already exceeded for user ID 19355785.';
+    const error = 'draft PR 생성 실패(worktree·branch 보존 · self-impl/src-nexus-api-trace-ts-src-nexus-api-tra-4131fa54 · /home/ubuntu/.elanous/worktrees/ubuntu-678d8d02/repo.worktrees/self-impl-src-nexus-api-trace-ts-src-nexus-api-tra-4131fa54)\nself-implement PR gh 실패: GraphQL: API rate limit already exceeded for user ID 19355785.';
     const finalLine = JSON.stringify({ stage: 'error', ok: false, error });
     const previous = JSON.stringify({ stage: 'earlier', ok: false, error: 'not the failure' });
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -3042,13 +3042,13 @@ describe('podSelfImplementSpawn', () => {
       expect(result.error?.message).toContain('container=Error/1');
       expect(result.error?.message).toContain('GraphQL: API rate limit already exceeded');
       expect(result.error?.message).toContain('~/.elanous/worktrees/');
-      expect(result.error?.message).not.toContain('/home/user/');
+      expect(result.error?.message).not.toContain('/home/ubuntu/');
       expect(result.error?.message).not.toContain('not the failure');
       expect(result.error?.message?.split('childError=')[1]?.split('\n')).toHaveLength(2);
       expect(result.error?.message?.split('childError=')[1]?.split('\n').every((line) => line.length <= 240)).toBe(true);
       expect(events).toContainEqual({ event: 'child-error', data: expect.objectContaining({ job: podJobName('pr-rate-limit'), stage: 'error', error: expect.stringContaining('GraphQL: API rate limit already exceeded') }) });
       expect(events.find((e) => e.event === 'job-finished')?.data).toMatchObject({ childStage: 'error', childError: expect.stringContaining('GraphQL: API rate limit already exceeded') });
-      expect(String(events.find((e) => e.event === 'job-finished')?.data.childError)).not.toContain('/home/user/');
+      expect(String(events.find((e) => e.event === 'job-finished')?.data.childError)).not.toContain('/home/ubuntu/');
       expect(events.find((e) => e.event === 'job-finished')?.data.childError).toEqual(result.error?.message?.split('childError=')[1]);
     } finally { off(); }
   });
@@ -6071,7 +6071,11 @@ describe('pod remote continuity', () => {
       const childEnv: NodeJS.ProcessEnv = { ...process.env, HOME: home, ELANOUS_STATE_DIR: pjoin(home, '.elanous/isolated-child-state'),
         BUN_TEST: '1', EXPECTED_CODEX_ACCESS_TEAM: accessByAccount.get('team')!, EXPECTED_CODEX_ACCESS_THIRD: accessByAccount.get('third')! };
       delete childEnv.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
-      const verify = spawnSync('bash', ['-c', `${accessOnlyExport}\n${mirrorPathExport}\nbun -e 'import { loadFreshCodexAuthState } from "./src/oauth/codex.js"; for (const name of ["team", "third"]) { process.env.ELANOUS_CODEX_ACCOUNT=name; const state=await loadFreshCodexAuthState(); if(state?.tokens.accessToken!==process.env["EXPECTED_CODEX_ACCESS_"+name.toUpperCase()])process.exit(7); }'`],
+      // The Pod supplies each selected account's home. Do not let the test host's CODEX_HOME
+      // override the injected access-only mirror path or influence this synthetic child.
+      delete childEnv.CODEX_HOME;
+      delete childEnv.ELANOUS_CODEX_ACCOUNT_HOME;
+      const verify = spawnSync('bash', ['-c', `${accessOnlyExport}\n${mirrorPathExport}\nbun -e 'import { loadFreshCodexAuthState } from "./src/oauth/codex.js"; for (const [index, name] of ["team", "third"].entries()) { process.env.ELANOUS_CODEX_ACCOUNT=name; process.env.ELANOUS_CODEX_ACCOUNT_HOME=process.env.HOME+"/.elanous/codex-accounts/"+index; const state=await loadFreshCodexAuthState(); if(state?.tokens.accessToken!==process.env["EXPECTED_CODEX_ACCESS_"+name.toUpperCase()])process.exit(7); }'`],
         { cwd: process.cwd(), env: childEnv, encoding: 'utf8' });
       if (verify.status !== 0) throw new Error(`Pod provider did not resolve the injected owner mirror for both accounts (${verify.status})`);
       expect(mirrorPathExport).toBe('export ELANOUS_REMOTE_CODEX_MIRROR_PATH="$HOME/.elanous/remote-parent-credentials/cli-mirror/auth.json"');

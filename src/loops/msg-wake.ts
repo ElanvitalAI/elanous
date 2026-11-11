@@ -78,7 +78,7 @@ export interface WakeDeps {
   /** Herdr pane census seam used for explicit pane/session addresses and undeclared-seat recovery. */
   listHerdrPanes?: () => Array<{ paneId: string; sessionId?: string; title?: string; cwd?: string; host?: string; status?: string }> | null;
   /** Process boundary seam for testing Herdr's JSON command and failure modes. */
-  runHerdrPaneList?: () => { status: number | null; stdout: string; error?: unknown };
+  runHerdrPaneList?: (args: readonly string[]) => { status: number | null; stdout: string; stderr?: string; error?: unknown };
   /** Reads one seat-folder file (`pty.ref` · `herdr.pane`); null when absent. */
   readPane?: (path: string) => string | null;
   /** Does this seat-folder opt-in file exist (`<seat>/wake-inject`)? */
@@ -106,7 +106,13 @@ let paneCensusCache: HerdrPane[] | null = null;
 
 function herdrPaneCensus(run?: WakeDeps['runHerdrPaneList']): HerdrPane[] | null {
   if (!run && paneCensusHasValue && Date.now() - paneCensusCachedAt < 500) return paneCensusCache;
-  const result = (run ?? (() => spawnSync('herdr', ['pane', 'list', '--json'], { encoding: 'utf8', timeout: 1500, windowsHide: true })))();
+  const command = run ?? ((args: readonly string[]) => spawnSync('herdr', [...args], { encoding: 'utf8', timeout: 1500, windowsHide: true }));
+  let result = command(['pane', 'list', '--json']);
+  // Herdr 0.9.1 emits JSON by default and rejects --json. Retry only that
+  // version mismatch; other failures must remain an unknown census.
+  if (result.status === 2 && /unknown option[^\n]*--json/i.test(result.stderr ?? '')) {
+    result = command(['pane', 'list']);
+  }
   let parsed: HerdrPane[] | null = null;
   if (result.status !== 0 || result.error) {
     parsed = null;

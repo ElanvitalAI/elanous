@@ -1,0 +1,5 @@
+{
+  "structuredDesignPath": "/absolute/path/to/structured-ticketing-gcp.json",
+  "outDir": "/absolute/path/to/output",
+  "resourceRoot": "/absolute/path/to/elanous-repository"
+}

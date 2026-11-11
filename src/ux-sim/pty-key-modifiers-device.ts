@@ -36,9 +36,11 @@ export async function runPtyKeyModifiersDevice(spec: PtyKeyModifiersSpec): Promi
   const capturePath = join(root, 'fake-llm-requests.jsonl');
   const bytes = resolvePtySpecialKey('shift+enter', { encoding: spec.encoding });
   const ready = spec.tui === 'next'
-    ? (s: string) => s.includes('elanous next ·') && s.includes('Ctrl+Q 종료')
-    : (s: string) => s.includes('elanous | daemon') && s.includes('❯');
-  const answered = (s: string) => s.includes(REPLY) && (spec.tui === 'next' ? s.includes('응답 완료') : /✔ 완료/.test(s));
+    ? (s: string) => s.includes('Enter 전송') && s.includes('❯ ')
+    : (s: string) => (s.includes('elanous | daemon') || s.includes('Opening web setup…') || s.includes('웹 화면을 여는 중…'))
+      && s.includes('실행 ') && s.includes('❯');
+  const answered = (s: string) => s.includes(REPLY)
+    && (s.includes('응답 완료') || s.includes('턴 완료') || /✔ 완료/.test(s));
   const steps: SeatPtyStep[] = [
     { label: 'first line', keys: PTY_KEY_FIRST, until: (s) => s.includes(PTY_KEY_FIRST) },
     { label: 'shift+enter', keys: bytes, until: () => true },
@@ -47,7 +49,7 @@ export async function runPtyKeyModifiersDevice(spec: PtyKeyModifiersSpec): Promi
   ];
   const run = await mockSeatPtySequence({
     executable: spec.executable,
-    args: [spec.entry, '--config-dir', '{root}', '--test-state-dir', '{root}', ...(spec.tui === 'next' ? ['--tui', 'next'] : [])],
+    args: [spec.entry, '--tui', spec.tui, '--config-dir', '{root}', '--test-state-dir', '{root}'],
     root,
     rows: 30,
     cols: 100,

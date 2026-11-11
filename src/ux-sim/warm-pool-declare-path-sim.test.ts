@@ -34,7 +34,8 @@ test('owner-auth declaration posts through Nexus and machine-auth GET reads the 
   const eventBus = new NexusEventBus();
   state.bus = eventBus;
   const opts = { state, registry: new TabRegistry(state), eventBus,
-    metaApi: { bearerToken: ownerToken, noAuth: false } } as NexusHttpServerOpts;
+    metaApi: { bearerToken: ownerToken, noAuth: false },
+    allowInsecureResourceLedgerLoopbackForTests: true } as NexusHttpServerOpts;
   const server = { requestIP: () => ({ address: '127.0.0.1' }) } as never;
   const endpoint = 'http://127.0.0.1:31415/v1/resource-ledger/pools';
   const calls: Array<{ method: string; authorization: string | null }> = [];

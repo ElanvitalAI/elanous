@@ -42,7 +42,7 @@ test('Next TUI real PTY denies rm -rf on default Enter and runs it only after di
         ready: { label: `${label}-boot`, until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료'), timeoutMs: PTY_APPROVAL_STEP_TIMEOUT_MS },
         steps: [
           { label: `${label}-approval-prompt`, text: 'delete fixture', until: (screen) => screen.includes('Bash 실행 승인 · 전체 명령') && screen.includes('Enter 기본 N') && screen.includes(command.slice(0, 45)) },
-          { label: `${label}-decision`, keys: answer, until: (screen) => screen.includes('응답 완료'), timeoutMs: PTY_APPROVAL_STEP_TIMEOUT_MS },
+          { label: `${label}-decision`, keys: answer, until: (screen) => screen.includes('응답 완료') || screen.includes('턴 완료'), timeoutMs: PTY_APPROVAL_STEP_TIMEOUT_MS },
         ],
       }).then((evidence) => ({ evidence, target }));
     };

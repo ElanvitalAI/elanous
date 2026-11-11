@@ -1,0 +1,260 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "commit": "2111e1379cb2be8cfd70c1ac81fc7f39e67051da",
+    "test": "src/dashboard/plugin-route-adapter.test.ts -t classic dashboard PTY carries KAIST scenes 1–6",
+    "host": "aws2",
+    "runCommand": "CLASSIC_TICKET_SCENARIO=1 ELANOUS_TRACK=OP bun test src/dashboard/plugin-route-adapter.test.ts -t \"classic dashboard PTY carries KAIST scenes 1–6\"",
+    "verdict": "pass",
+    "observedAt": "2026-11-10T19:06:13.866Z"
+  },
+  "receipt": {
+    "owner": "member-from-fake-nexus",
+    "scenes": {
+      "1": {
+        "runId": "5f88f42f-9465-48dc-bfe4-d55d905dfb3d",
+        "scene": 1,
+        "input": {
+          "kind": "text",
+          "text": "KAIST 강의 자료에서 강의 노트 앱으로 이어 읽기"
+        },
+        "output": {
+          "scrapId": "kaist-scrap-shared-text",
+          "owner": "member-from-fake-nexus"
+        }
+      },
+      "2": {
+        "runId": "35dfa74c-68a4-41ce-a73f-80b846cb5dfc",
+        "scene": 2,
+        "input": {
+          "input": "오늘 브리핑",
+          "kinds": [
+            "web",
+            "x",
+            "youtube",
+            "voice",
+            "video",
+            "photo",
+            "text"
+          ]
+        },
+        "output": {
+          "extracted": 7,
+          "kinds": [
+            "web",
+            "x",
+            "youtube",
+            "voice",
+            "video",
+            "photo",
+            "text"
+          ],
+          "scrapIds": [
+            "kaist-scrap-web",
+            "kaist-scrap-x",
+            "kaist-scrap-youtube",
+            "kaist-scrap-voice",
+            "kaist-scrap-video",
+            "kaist-scrap-photo",
+            "kaist-scrap-shared-text"
+          ]
+        }
+      },
+      "3": {
+        "runId": "35dfa74c-68a4-41ce-a73f-80b846cb5dfc",
+        "scene": 3,
+        "input": {
+          "owner": "member-from-fake-nexus",
+          "briefingId": "brief-kaist-1"
+        },
+        "output": {
+          "briefingId": "brief-kaist-1",
+          "channels": [
+            "android",
+            "tui",
+            "telegram"
+          ],
+          "briefing": {
+            "id": "brief-kaist-1",
+            "topics": [
+              {
+                "summary": "KAIST lecture materials",
+                "sourceScrapIds": [
+                  "kaist-scrap-web",
+                  "kaist-scrap-x",
+                  "kaist-scrap-youtube",
+                  "kaist-scrap-voice",
+                  "kaist-scrap-video",
+                  "kaist-scrap-photo",
+                  "kaist-scrap-shared-text"
+                ]
+              }
+            ],
+            "scrapIds": [
+              "kaist-scrap-web",
+              "kaist-scrap-x",
+              "kaist-scrap-youtube",
+              "kaist-scrap-voice",
+              "kaist-scrap-video",
+              "kaist-scrap-photo",
+              "kaist-scrap-shared-text"
+            ]
+          }
+        }
+      },
+      "4": {
+        "runId": "5ebb6c10-ae96-40df-bcf9-9e5701c5076f",
+        "scene": 4,
+        "input": {
+          "owner": "member-from-fake-nexus"
+        },
+        "output": {
+          "suggestionId": "suggestion-2026-11-09-1",
+          "suggestionIds": [
+            "suggestion-2026-11-09-1"
+          ],
+          "sourceScrapIds": [
+            "kaist-scrap-web",
+            "kaist-scrap-x",
+            "kaist-scrap-youtube",
+            "kaist-scrap-voice",
+            "kaist-scrap-video",
+            "kaist-scrap-photo",
+            "kaist-scrap-shared-text"
+          ],
+          "suggestion": {
+            "id": "suggestion-2026-11-09-1",
+            "appId": "kaist-fake-app",
+            "ask": "Add a lesson timer",
+            "evidenceScrapIds": [
+              "kaist-scrap-web",
+              "kaist-scrap-x",
+              "kaist-scrap-youtube",
+              "kaist-scrap-voice",
+              "kaist-scrap-video",
+              "kaist-scrap-photo",
+              "kaist-scrap-shared-text"
+            ],
+            "owner": "member-from-fake-nexus"
+          }
+        }
+      },
+      "5": {
+        "runId": "c2a13900-1c1d-4cae-a98b-1acfc70831dd",
+        "scene": 5,
+        "input": {
+          "suggestionId": "suggestion-2026-11-09-1",
+          "confirmation": "y"
+        },
+        "output": {
+          "boardCardId": "kaist-board-card-1",
+          "attachment": {
+            "id": "artifact-suggestion-2026-11-09-1",
+            "kind": "app-artifact",
+            "sha256": "5628789d0c92f4b8ba323445269ff2053c64ce2677243a79e3622fa9750cc556",
+            "files": [
+              "/index.html"
+            ]
+          },
+          "graphRun": {
+            "graphId": "absorb-build",
+            "runId": "c2a13900-1c1d-4cae-a98b-1acfc70831dd",
+            "status": "done",
+            "path": [
+              "lookup-suggestion",
+              "build",
+              "simulate",
+              "approve-publish",
+              "publish",
+              "done"
+            ]
+          }
+        }
+      },
+      "6": {
+        "runId": "c2a13900-1c1d-4cae-a98b-1acfc70831dd",
+        "scene": 6,
+        "input": {
+          "boardCardId": "kaist-board-card-1"
+        },
+        "output": {
+          "resultUrl": "https://kaist-fake-app.app.sim.invalid/",
+          "boardCardId": "kaist-board-card-1",
+          "boardCard": {
+            "id": "kaist-board-card-1",
+            "owner": "member-from-fake-nexus",
+            "title": "Add a lesson timer",
+            "state": "released",
+            "stateHistory": [
+              "building",
+              "testing",
+              "released"
+            ],
+            "resultUrl": "https://kaist-fake-app.app.sim.invalid/"
+          },
+          "attachment": {
+            "id": "artifact-suggestion-2026-11-09-1",
+            "kind": "app-artifact",
+            "sha256": "5628789d0c92f4b8ba323445269ff2053c64ce2677243a79e3622fa9750cc556",
+            "files": [
+              "/index.html"
+            ]
+          }
+        }
+      }
+    },
+    "graphPath": [
+      "lookup-suggestion",
+      "build",
+      "simulate",
+      "approve-publish",
+      "publish",
+      "done"
+    ],
+    "graph": "absorb-build",
+    "status": "done",
+    "boardCard": {
+      "id": "kaist-board-card-1",
+      "owner": "member-from-fake-nexus",
+      "title": "Add a lesson timer",
+      "state": "released",
+      "stateHistory": [
+        "building",
+        "testing",
+        "released"
+      ],
+      "resultUrl": "https://kaist-fake-app.app.sim.invalid/"
+    },
+    "attachment": {
+      "id": "artifact-suggestion-2026-11-09-1",
+      "kind": "app-artifact",
+      "sha256": "5628789d0c92f4b8ba323445269ff2053c64ce2677243a79e3622fa9750cc556",
+      "files": [
+        "/index.html"
+      ]
+    },
+    "receipt": {
+      "id": "fake-pass-receipt",
+      "artifactId": "artifact-suggestion-2026-11-09-1",
+      "owner": "member-from-fake-nexus",
+      "status": "passed",
+      "attachment": {
+        "id": "artifact-suggestion-2026-11-09-1",
+        "kind": "app-artifact"
+      }
+    },
+    "graphRun": {
+      "graphId": "absorb-build",
+      "runId": "c2a13900-1c1d-4cae-a98b-1acfc70831dd",
+      "status": "done",
+      "path": [
+        "lookup-suggestion",
+        "build",
+        "simulate",
+        "approve-publish",
+        "publish",
+        "done"
+      ]
+    }
+  }
+}

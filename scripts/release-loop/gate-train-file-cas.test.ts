@@ -4,9 +4,23 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { planTrainFileCas, recordTrainFileCasResult } from './gate-train-file-cas.js';
+import { gateFileReceiptIdentityFromClosure } from './gate-file-receipts.js';
+import type { ClosureTree } from './gate-closure.js';
 
 const files = ['test/a.test.ts', 'test/b.test.ts'];
 const imageDigest = `sha256:${'a'.repeat(64)}`;
+
+test('file CAS identities reuse the same tip graph across test files', () => {
+  const testFiles = Array.from({ length: 12 }, (_, index) => `test/case-${index}.test.ts`);
+  const allFiles = [...testFiles, ...Array.from({ length: 80 }, (_, index) => `src/other-${index}.ts`)];
+  let reads = 0;
+  const tree: ClosureTree = { files: allFiles, preload: [], read: () => { reads++; return 'export const value = 1;'; } };
+  expect(gateFileReceiptIdentityFromClosure(tree, testFiles[0]!, imageDigest)?.file).toBe(testFiles[0]);
+  reads = 0;
+  for (const file of testFiles) expect(gateFileReceiptIdentityFromClosure(tree, file, imageDigest)?.file).toBe(file);
+  // Each independent test needs one content-hash read; a second graph build would read allFiles again.
+  expect(reads).toBe(testFiles.length);
+});
 
 function git(repo: string, ...args: string[]): string {
   const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });

@@ -1,0 +1,31 @@
+{
+  "id": "knowledge-pack-auto-select",
+  "name": "Installed knowledge pack auto selection",
+  "implementation": [
+    "src/ux-sim/knowledge-pack-auto-select.ts",
+    "src/session-runtime/tier-flip.ts",
+    "src/tool-hints/signals.ts",
+    "src/knowledge/tools/knowledge-query.ts",
+    "src/knowledge/query.ts"
+  ],
+  "tests": [
+    "src/ux-sim/knowledge-pack-auto-select.test.ts"
+  ],
+  "target": "Production design-intent preload and KnowledgeQuery installed-pack selection with cited-card output",
+  "inputs": [
+    "three-line Korean ticketing design request",
+    "default and Solar profile labels",
+    "in-memory installed KGS pack fixture"
+  ],
+  "observations": [
+    "KnowledgeQuery is active and warm-preloaded",
+    "installed pack selection and KGS dispatch count",
+    "pack card citation references"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/knowledge-pack-auto-select.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

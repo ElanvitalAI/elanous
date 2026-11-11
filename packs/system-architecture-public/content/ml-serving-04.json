@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "ML 서빙 — 특징 일관성과 추적",
+  "source": "https://docs.cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning",
+  "body": "적용 시점: 훈련/추론 간 전처리 차이가 예측 품질을 흔들 수 있을 때.\n용량 단계: 초기에는 공유 변환 코드와 버전 기록; 피처 재사용·지연이 늘면 feature store를 검토한다.\nGCP 대응: Vertex AI Feature Store 또는 BigQuery/Cloud Storage 기반 feature contract를 선택한다.\n비용 축: 피처 저장·온라인 lookup, 중복 materialization·갱신 파이프라인이 비용 축이다.\n결정과 반증: 학습 시점과 serving 시점에 같은 입력이 같은 feature vector를 내는지 golden fixture로 비교한다."
+}

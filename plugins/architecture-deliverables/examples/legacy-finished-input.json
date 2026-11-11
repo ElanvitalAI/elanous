@@ -1,0 +1,5 @@
+{
+  "designHtmlPath": "/absolute/path/to/architecture.html",
+  "diagramSourcePath": "/absolute/path/to/architecture.excalidraw",
+  "outDir": "/absolute/path/to/output"
+}

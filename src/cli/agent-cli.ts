@@ -702,7 +702,7 @@ export async function runChatTurnCli(opts: {
     if (!opts.json && !opts.enableTools) process.stdout.write(result.text);
   }
   closeSegment();
-  const incomplete = sawToolCall && finalMessage.length === 0;
+  const incomplete = (sawToolCall && finalMessage.length === 0) || result.finishReason === 'length';
   if (opts.json) {
     let logPath: string | null = null;
     try {
@@ -714,6 +714,8 @@ export async function runChatTurnCli(opts: {
       sessionId: session.id,
       provider: result.provider,
       model: result.model ?? null,
+      finishReason: result.finishReason ?? null,
+      stopReason: result.finishReason ?? null,
       reply: finalMessage,
       transcript: replyChunks.join(''),
       finalReply: sawToolCall ? finalMessage : lastSegment,

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "demo-brief-to-requirements",
+  "version": "0.1.0",
+  "description": "Converts an accepted, source-linked briefing into three architecture requirement lines.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": ["./graphs/brief-to-requirements.yaml", "./graphs/scene4-architecture.yaml"],
+      "graphProviders": {
+        "./graphs/scene4-architecture.yaml": {
+          "module": "src/graph-runner/ticketing-scene4.ts",
+          "factory": "createScene4Registry"
+        }
+      },
+      "capabilities": ["fs:workdir", "proc:bun"],
+      "connectors": [],
+      "pricing": { "model": "free" },
+      "trust": "official",
+      "category": "Productivity",
+      "inputContract": {
+        "graphInputKeys": {
+          "demo-brief-to-requirements": ["briefPath", "outDir"],
+          "demo-scene4-architecture": ["prompt", "answer", "outDir", "stateRoot", "resourceRoot", "architecturePluginRoot", "graphPath"]
+        },
+        "briefPath": "Absolute path to accepted briefing JSON in references/input-contract.md",
+        "outDir": "Absolute output directory for requirements.txt and requirements.json",
+        "scene4": "Three-line ticketing prompt plus completed model answer; KGS and shared architecture output graph produce RFC, structured JSON, Excalidraw, PNG and PDF"
+      }
+    }
+  }
+}

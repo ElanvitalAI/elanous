@@ -352,12 +352,16 @@ test('production release-loop re-entry audits same-run receipts and keeps failed
     let trafficPassed = false;
     let publishCalled = false;
     try {
-      const state = await runGraph(graphPath, { runId, input: { version: '0.3.8', previousVersion: '0.3.7' }, deps: { root,
+      const state = await runGraph(graphPath, { runId, input: { version: '0.3.8', previousVersion: '0.3.7',
+        cutSha: commit, candidatePath: 'sim:receipt-audit' }, deps: { root,
         runBash: async (_command, options) => {
           const contextPath = options.env?.ELANOUS_GRAPH_CONTEXT;
           if (!contextPath) throw new Error('production graph context missing');
           const context = JSON.parse(readFileSync(contextPath, 'utf8')) as GraphContext;
           const output = (value: unknown, exitCode = 0) => ({ stdout: JSON.stringify(value) + '\n', stderr: '', exitCode });
+          if (context.graphId === 'pod-reuse-prep') return output({ outcome: 'legacy', verdict: 'legacy',
+            reason: 'prep-body-pending', receiptPath: '' });
+          if (context.nodeId === 'gate-cutover-switch') return output({ outcome: 'audit' });
           if (context.nodeId === 'version-release' || context.nodeId === 'cutoff') return output({ outcome: 'ok', commit });
           if (context.nodeId === 'gate') return output({ outcome: 'ok', commit, introduced: [] });
           if (context.nodeId === 'receipt-audit' || context.nodeId === 'receipt-audit-recheck') {

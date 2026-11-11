@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { realpath } from 'node:fs/promises';
-import { startClassicMissionCli } from '../dashboard/mission-cli-consumer.js';
-import type { MissionCliConsumerDeps } from '../dashboard/mission-cli-consumer.js';
+import { startClassicMissionCli } from '../agent-mission/cli-consumer.js';
+import type { MissionCliConsumerDeps } from '../agent-mission/cli-consumer.js';
 import { requestQuestion, getDefaultQuestionChannels } from '../hitl/question.js';
 import type { QuestionChannel } from '../hitl/question.js';
 import { sendOutbound } from '../domains/outbound-alert.js';

@@ -91,13 +91,17 @@ export interface GateProgressGroup {
   host?: string;
   /** Exact failure and error case count when shard output is complete; unknown otherwise. */
   failureCount?: number | null;
+  introduced?: number | null;
+  preexisting?: number | null;
+  unmeasured?: number | null;
   startedAtMs?: number;
   endedAtMs?: number;
 }
 
 /** Deduplicate repeated observations while preserving raw retry and attempt transitions. */
 export function gateProgressTransitionKey(group: GateProgressGroup): string {
-  return JSON.stringify([group.rawState ?? group.state, group.attemptId ?? null, group.failureCount ?? null]);
+  return JSON.stringify([group.rawState ?? group.state, group.attemptId ?? null, group.failureCount ?? null,
+    group.introduced ?? null, group.preexisting ?? null, group.unmeasured ?? null]);
 }
 
 export interface GateProgressSummary {
@@ -306,7 +310,7 @@ export function planGateShardDispatch(input: GateShardDispatchInput): GateShardA
     const testedContentMismatch = input.testedFileHashesByShard !== undefined
       && !sameTestedFileHashes(prior?.testedFileHashes, input.testedFileHashesByShard[shard.id]);
     const lockfileMismatch = input.lockfileHash !== undefined && prior?.lockfileHash !== input.lockfileHash;
-    const rerunReason = invalidated ? 'radius-invalidated' : !currentLockfileValid ? 'runtime-lockfile-unmeasured'
+    const rerunReason = !prior ? 'receipt-missing' : invalidated ? 'radius-invalidated' : !currentLockfileValid ? 'runtime-lockfile-unmeasured'
       : !currentFileHashesValid ? 'tested-file-identity-unmeasured' : testedContentMismatch ? 'tested-file-content-mismatch'
       : failureBaselineMismatch ? 'baseline-failure-identity-mismatch'
         : lockfileMismatch ? 'runtime-lockfile-mismatch' : (prior && prior.head40 !== input.head40 && !radiusUnchanged.has(shard.id)) ? 'radius-proof-missing' : environmentMismatch ? 'environment-' + environmentMismatch + '-mismatch'

@@ -10,10 +10,10 @@ import { mockSeatPtySequence, type SeatPtySequenceEvidence, type SeatPtyStep } f
 import { GOAL_INTERIM_NOT_DONE_REPLY, GOAL_INTERIM_TOOL_CALL } from './goal-interim-trace.js';
 export { GOAL_INTERIM_NOT_DONE_REPLY, GOAL_INTERIM_TOOL_CALL } from './goal-interim-trace.js';
 import { pasteFoldToken } from '../chat/paste-fold.js';
-import { DEFAULT_GOAL_CONTINUE_CAP } from '../dashboard/input/goal-continue.js';
+import { DEFAULT_GOAL_CONTINUE_CAP } from '../tui/input/goal-continue.js';
 import { LONG_SHELL_ESC_CONFIRMATION_MS } from '../esc-abort-gate.js';
 import {
-  TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_SCRIPT_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
+  TEST_FAKE_LLM_DELAY_MS_ENV, TEST_FAKE_LLM_DELAY_WHEN_ENV, TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_SCRIPT_ENV, TEST_FAKE_LLM_SCRIPT_SKIP_WHEN_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV,
 } from './fake-llm.js';
 
 export const NEXT_TUI_SCENARIOS = ['next-new-session', 'next-clear-session', 'next-compact', 'next-resume', 'next-queue', 'next-wakeup', 'next-tool-fold', 'next-tool-fold-read', 'next-esc-confirm-long-shell', 'next-goal-continue', 'next-goal-interim', 'next-proactive-continue', 'next-paste', 'next-at-picker', 'next-context-area-clear', 'next-dock-long-stream', 'next-subagent-e4', 'next-seat-turn-cap', 'next-core-harden'] as const;
@@ -38,7 +38,7 @@ export interface NextTuiScenarioResult {
   store: Record<string, unknown>;
   /** Raw `logs --json` lines read through the same binary in the same universe. */
   logs: { command: string; rc: number | null; lines: string[]; eventCount: number; limit: number };
-  checks: Record<string, boolean>;
+  checks: Record<string, boolean | number>;
 }
 
 const DEFAULT_REPLY = '[fake-llm] 답했습니다';
@@ -78,6 +78,15 @@ export function readLogs(spec: Pick<NextTuiScenarioSpec, 'root' | 'executable' |
 }
 
 const count = (screen: string, text: string) => screen.split(text).length - 1;
+function nextTuiCurrentStatus(screen: string): string {
+  const lines = screen.split('\n');
+  const composer = lines.reduce((last, line, index) => line.startsWith('❯ ') ? index : last, -1);
+  return composer > 0 ? lines[composer - 1]!.trim() : '';
+}
+const isSettledNextTuiScreen = (screen: string) => {
+  const status = nextTuiCurrentStatus(screen);
+  return status.startsWith('턴 완료 ·') && !/대기\s+[1-9]\d*/.test(status);
+};
 
 /** A malformed `data` field becomes `{}` so the check reads false instead of the scenario throwing. */
 export function parseData<T>(data: unknown): Partial<T> {
@@ -113,9 +122,12 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       } : {}),
       ...(seatTurnCapScenario ? { COORD_ID: 'UX' } : {}),
     },
-    ready: { label: 'boot', until: (s: string) => s.includes('elanous next ·') && s.includes('Ctrl+Q 종료') },
+    // The renderer title is `elanous`; at narrow PTY widths the quit hint may
+    // wrap. The send affordance plus composer prompt identifies next TUI readiness.
+    ready: { label: 'boot', until: (s: string) => s.includes('Enter 전송') && s.includes('❯ ') },
   };
-  const done = (n: number, also?: string) => (s: string) => count(s, reply) === n && s.includes('응답 완료') && (!also || s.includes(also));
+  const done = (n: number, also?: string) => (s: string) => count(s, reply) === n
+    && isSettledNextTuiScreen(s) && s.includes('❯ ') && (!also || s.includes(also));
 
   if (spec.scenario === 'next-core-harden') {
     const cases = [
@@ -136,7 +148,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       queueBacklogPreservesOrder: results[1]?.result.checks.userTurnsInOrder === true,
       escapeDuringTurnRestoresQueuedPrompt: results[1]?.result.checks.escRestoresQueue === true,
       longToolOutputRendersAndRefolds: results[2]?.result.checks.realToolResultStored === true
-        && results[2]?.result.checks.collapsedAfterTurn === true && results[2]?.result.checks.expandedOnEnter === true
+        && results[2]?.result.checks.collapsedAfterTurn === true && results[2]?.result.checks.expandedOnL3 === true
         && results[2]?.result.checks.foldedAgainOnEnter === true,
       multipleSubagentsInheritTools: results.slice(3).length === 2 && results.slice(3).every(({ result }) =>
         result.checks.childDispatchObservedInIsolatedLedger === true && result.checks.childInheritedTools === true),
@@ -163,7 +175,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       },
       steps: [
         { label: 'seat tool cap ends the real turn', text: '목표: CAP-BOUNDARY 한 번만 실행하고 자리 턴을 닫아줘', until: (screen) => screen.includes(reply) && screen.includes('Turn cap reached') },
-        { label: 'next human turn is submitted and finishes', text: '다음 실제 요청', until: (screen) => count(screen, reply) >= 2 && screen.includes('응답 완료') },
+        { label: 'next human turn is submitted and finishes', text: '다음 실제 요청', until: done(2) },
         { label: 'next idle turn accepts a draft', text: '다음 대기 초안', enter: false, until: (screen) => screen.includes('다음 대기 초안') },
         { label: 'idle Escape cancels only the draft', keys: '\x1b', until: (screen) => screen.includes('입력 취소됨') && screen.includes(reply) },
       ],
@@ -183,7 +195,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       nextDraftReachedIdleComposer: run.frames.find((frame) => frame.label === 'next idle turn accepts a draft')?.screen.includes('다음 대기 초안') === true,
       nextSubmittedHumanTurnFinished: (() => {
         const screen = run.frames.find((frame) => frame.label === 'next human turn is submitted and finishes')?.screen ?? '';
-        return count(screen, reply) >= 2 && screen.includes('응답 완료');
+        return done(2)(screen);
       })(),
       escapeCanceledIdleDraft: run.frames.find((frame) => frame.label === 'idle Escape cancels only the draft')?.screen.includes('입력 취소됨') === true,
       onlyFakeProvider: routes.length > 0 && routes.every((route) => route.provider === 'test-fake-llm'),
@@ -194,7 +206,13 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
 
   if (spec.scenario === 'next-subagent-e4') {
     const capture = join(root, 'fake-llm.jsonl');
+    const captureOffset = existsSync(capture) ? statSync(capture).size : 0;
+    const routeLogsBefore = readLogs(spec, 'llm.route-decision');
+    const routeEventIdsBefore = new Set(parseEvents(routeLogsBefore).map((event) => event.id).filter((id): id is number => typeof id === 'number'));
+    const completionLogsBefore = readLogs(spec, 'tui.local-chat');
+    const completionEventIdsBefore = new Set(parseEvents(completionLogsBefore).map((event) => event.id).filter((id): id is number => typeof id === 'number'));
     const debugDir = join(root, '.elanous', 'debug');
+    mkdirSync(debugDir, { recursive: true });
     const debugFileOffsets = new Map<string, number>();
     if (existsSync(debugDir)) {
       for (const name of readdirSync(debugDir).filter((entry) => (entry.startsWith('debug-') || entry.startsWith('chat-')) && entry.endsWith('.log'))) {
@@ -217,10 +235,11 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
         }),
       },
       steps: [
-        { label: 'agent dispatch', text: '서브에이전트로 확인해줘', until: (screen) => screen.includes(reply) && screen.includes('응답 완료'), timeoutMs: 90_000 },
+        { label: 'agent dispatch', text: '서브에이전트로 확인해줘', until: (screen) => screen.includes(reply)
+          && screen.includes('✓ 하위 에이전트 · 완료 1') && isSettledNextTuiScreen(screen) && screen.includes('❯ '), timeoutMs: 90_000 },
       ],
     });
-    const captured = readFileSync(capture, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as {
+    const captured = readFileSync(capture).subarray(captureOffset).toString('utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as {
       messages: Array<{ role: string; content: unknown }>;
     });
     const childRequest = captured.find((request) => request.messages.some((message) =>
@@ -239,7 +258,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       .filter((line) => {
         try {
           const event = JSON.parse(line) as { category?: string };
-          return event.category === 'agent.spawn' || event.category === 'llm.route-decision' || event.category === 'llm.router';
+          return event.category === 'agent.spawn' || event.category === 'llm.route-decision' || event.category === 'llm.router' || event.category === 'tui.next';
         } catch { return false; }
       });
     const logs = {
@@ -250,8 +269,27 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       limit: 200,
     };
     const events = parseEvents(logs);
+    const routeLogsAfter = readLogs(spec, 'llm.route-decision');
+    const routeEvents = parseEvents(routeLogsAfter).filter((event) => event.category === 'llm.route-decision'
+      && event.event === 'local-chat-executed' && !routeEventIdsBefore.has(event.id ?? -1));
+    logs.lines.push(...routeEvents.map((event) => JSON.stringify(event)));
+    const completionEvents = parseEvents(readLogs(spec, 'tui.local-chat')).filter((event) => event.event === 'result-frame-accepted'
+      && !completionEventIdsBefore.has(event.id ?? -1));
+    logs.lines.push(...completionEvents.map((event) => JSON.stringify(event)));
+    logs.eventCount = logs.lines.length;
+    events.push(...routeEvents);
+    events.push(...completionEvents);
     const spawnDispatch = events.filter((event) => event.category === 'agent.spawn' && event.event === 'dispatch');
     const toolFilter = events.filter((event) => event.category === 'agent.spawn' && event.event === 'tool-filter');
+    const parentSessionId = withStore(root, () => getActiveSessionId() ?? '');
+    // Count the receipt emitted only when the parent accepts a result frame for
+    // this exact TUI session/turn; do not infer completion from stored text.
+    const acceptedParentResultFrameCount = completionEvents.filter((event) => {
+      const receipt = parseData<{ sessionId: string; turnId: string; event?: string }>(event.data);
+      return event.category === 'tui.local-chat' && event.event === 'result-frame-accepted'
+        && receipt.sessionId === parentSessionId && receipt.turnId === 'tui-1'
+        && (receipt.event === 'legacy' || receipt.event === 'result');
+    }).length;
     const checks = {
       parentAndChildProviderCallsObserved: captured.length >= 3 && Boolean(childRequest),
       childWasNotForcedTextOnly: Boolean(childRequest) && !childPrompt.includes('No tools are available'),
@@ -263,9 +301,9 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
         && parseData<{ tools: string[] }>(spawnDispatch[0]?.data).tools?.includes('Read') === true
         && parseData<{ tools: string[] }>(spawnDispatch[0]?.data).tools?.includes('Bash') === true
         && parseData<{ tools: string[] }>(spawnDispatch[0]?.data).tools?.length === parseData<{ available: number }>(toolFilter[0]?.data).available,
-      parentTurnCompletedOnce: count(run.frames.at(-1)?.screen ?? '', '응답 완료') === 1
-        && (run.frames.at(-1)?.screen ?? '').includes(reply)
-        && run.frames.at(-1)?.screen.includes('응답 완료') === true,
+      parentTurnCompletedOnce: acceptedParentResultFrameCount === 1
+        && isSettledNextTuiScreen(run.frames.at(-1)?.screen ?? '')
+        && (run.frames.at(-1)?.screen ?? '').includes(reply),
       onlyFakeProvider: events.filter((event) => event.category === 'llm.router' && event.event === 'streamLLMWithTools')
         .every((event) => parseData<{ provider: string }>(event.data).provider === 'test-fake-llm')
         && events.some((event) => event.category === 'llm.router' && event.event === 'streamLLMWithTools'),
@@ -283,8 +321,8 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       rows: 24,
       env: { ...base.env, [TEST_FAKE_LLM_SCRIPT_ENV]: `stall:${streamedReply}` },
       steps: [
-        { label: 'long output remains streaming', text: 'stream a long answer', until: (s) => s.includes('dock-stream-line-36') && s.includes('응답 중 · Esc 취소') },
-        { label: 'long output cancelled', keys: '\x1b', until: (s) => s.includes('응답 취소됨 · Enter 전송') },
+        { label: 'long output remains streaming', text: 'stream a long answer', until: (s) => s.includes('dock-stream-line-36') && s.includes('턴 스트리밍') },
+        { label: 'long output cancelled', keys: '\x1b', until: (s) => s.includes('응답 취소됨') },
         { label: 'picker open after long output', text: 'Read @picked', enter: false, until: (s) => s.includes('▸ picked.txt') && s.includes('@ 파일 첨부') },
         { label: 'picker closed after long output', keys: '\x1b', until: (s) => s.includes('Read @picked') && !s.includes('@ 파일 첨부') },
       ],
@@ -298,7 +336,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     return {
       scenario: spec.scenario, universe: root, run, store: {}, logs: readLogs(spec, 'tui.next,llm.route-decision'), checks: {
         longOutputVisibleWhileBusy: frame('long output remains streaming').includes('dock-stream-line-36')
-          && frame('long output remains streaming').includes('응답 중 · Esc 취소'),
+          && frame('long output remains streaming').includes('턴 스트리밍'),
         composerPinnedDuringLongOutput: composerPinned('long output remains streaming'),
         composerPinnedAfterCancel: composerPinned('long output cancelled'),
         composerPinnedWhilePickerOpen: composerPinned('picker open after long output'),
@@ -329,7 +367,8 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
           ...base.env,
           ELANOUS_SESSION_ROOT: join(caseRoot, 'sessions'), ELANOUS_CONFIG_DIR: caseRoot, ELANOUS_STATE_DIR: caseRoot,
           ELANOUS_TEST_FAKE_LLM_CAPTURE: capture,
-          [TEST_FAKE_LLM_SCRIPT_ENV]: 'ok,stall:inline confirmation test hold',
+          [TEST_FAKE_LLM_SCRIPT_ENV]: 'stall:inline-confirm-pending',
+          [TEST_FAKE_LLM_SCRIPT_SKIP_WHEN_ENV]: 'Read [attached 1: picked.txt]',
         },
         ...(artifactPath ? { artifactPath } : {}),
         steps: [
@@ -343,8 +382,8 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
           // The compact route is above the 24-row viewport after /help appends the full
           // command list. Page up to make that output visible before asserting it.
           { label: 'slash command output remains scrollable', keys: '\x1b[5~', until: (s) => s.includes('/compact — 대화 정리') && !s.includes('/ 명령') },
-          { label: 'ordinary turn pending', text: 'inline-confirm', until: (s) => s.includes('inline confirmation test hold') && s.includes('응답 중 · Esc 취소') },
-          { label: 'ordinary Esc cancels immediately', keys: '\x1b', until: (s) => s.includes('응답 취소됨 · Enter 전송') },
+          { label: 'ordinary turn pending', text: 'inline-confirm', until: (s) => s.includes('inline-confirm') && s.includes('턴 스트리밍') },
+          { label: 'ordinary Esc cancels immediately', keys: '\x1b', until: (s) => s.includes('응답 취소됨') },
         ],
       });
       const logs = readLogs(caseSpec, 'tui.next,llm.route-decision');
@@ -388,7 +427,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
         })(),
         ordinaryTurnEscCancelsImmediately: (() => {
           const frame = run.frames.find((item) => item.label === 'ordinary Esc cancels immediately')?.screen ?? '';
-          return frame.includes('응답 취소됨 · Enter 전송') && !frame.includes('응답 중단 확인');
+          return frame.includes('응답 취소됨') && !frame.includes('응답 중단 확인');
         })(),
         selectedPathRecorded: selected.length === 1 && (parseData<{ path: string }>(selected[0]?.data).path ?? '').endsWith('/picked.txt'),
         moduleLoadedOnlyOnTypedAt: loaded.length === 1 && parseData<{ onDemand: boolean }>(loaded[0]?.data).onDemand === true,
@@ -413,43 +452,58 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
   }
 
   if (spec.scenario === 'next-context-area-clear') {
-    const fixtureA = join(root, 'a.txt');
-    const fixtureB = join(root, 'b.txt');
-    const fixtureC = join(root, 'c.txt');
+    const scenarioRoot = join(root, 'attachment-path-'.repeat(12), 'attachment-path-'.repeat(12));
+    mkdirSync(scenarioRoot, { recursive: true });
+    writeFileSync(join(scenarioRoot, 'config.json'), readFileSync(join(root, 'config.json')));
+    const fixtureA = join(scenarioRoot, 'a.txt');
+    const fixtureB = join(scenarioRoot, 'b.txt');
+    const fixtureC = join(scenarioRoot, 'c.txt');
     writeFileSync(fixtureA, 'attachment area first fixture');
     writeFileSync(fixtureB, 'attachment area second fixture');
     writeFileSync(fixtureC, 'attachment area third fixture');
     const withoutLayout = (value: string): string => value
       .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
       .replace(/[\s\u0000-\u001f]/gu, '');
-    const containsPath = (value: string, path: string): boolean => withoutLayout(value).includes(withoutLayout(path));
+    const showsAttachment = (value: string, index: number, name: string): boolean =>
+      withoutLayout(value).includes(withoutLayout("[attached " + index + ": " + name + "]"));
+    const storedReplyCount = (): number => withStore(scenarioRoot, () => {
+      const sid = getActiveSessionId();
+      return sid ? (loadSession(sid)?.messages ?? []).filter((message) => message.role === 'assistant' && message.content.includes(reply)).length : 0;
+    });
     const run = await mockSeatPtySequence({
       ...base,
+      root: scenarioRoot,
+      env: {
+        ...base.env,
+        ELANOUS_SESSION_ROOT: join(scenarioRoot, 'sessions'),
+        ELANOUS_CONFIG_DIR: scenarioRoot,
+        ELANOUS_STATE_DIR: scenarioRoot,
+      },
       cols: 44,
       rows: 12,
       steps: [
         { label: 'first attachment picker opened', text: 'Read @a', enter: false, until: (s) => s.includes('▸ a.txt') && s.includes('@ 파일 첨부') },
         { label: 'first attachment selected', keys: '\r', until: (s) => s.includes('[attached 1: a.txt]') && !s.includes('@ 파일 첨부') },
         { label: 'second attachment picker opened', text: '@b', enter: false, until: (s) => s.includes('▸ b.txt') && s.includes('@ 파일 첨부') },
-        { label: 'second attachment selected', keys: '\r', until: (s) => s.includes('[attached 2: b.txt]') && !s.includes('@ 파일 첨부') },
-        { label: 'attachments sent', keys: '\r', until: (s) => count(s, reply) === 1 && s.includes('응답 완료') },
-        { label: 'attachment page one', text: '/context', enter: true, until: (s) => s.includes('첨부 2건 · 1/2쪽') && containsPath(s, fixtureA.slice(0, 40)) },
-        { label: 'attachment page two', text: '/context page 2', enter: true, until: (s) => s.includes('2/2쪽') && containsPath(s, fixtureB.slice(0, 40)) },
+        { label: 'second attachment selected', keys: '\r', until: (s) => withoutLayout(s).includes(withoutLayout('[attached 2: b.txt]')) && !s.includes('@ 파일 첨부') },
+        { label: 'attachments sent', keys: '\r', until: done(1) },
+        { label: 'attachment page one', text: '/context', enter: true, until: (s) => s.includes('첨부 2건 · 1/2쪽') && showsAttachment(s, 1, 'a.txt') },
+        { label: 'attachment page two', text: '/context page 2', enter: true, until: (s) => s.includes('2/2쪽') && showsAttachment(s, 2, 'b.txt') },
         { label: 'attachment path page two down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
         { label: 'attachment path page three down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 3/') && s.includes('❯') },
         { label: 'attachment path page up keeps input', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
         { label: 'attachment first path page', keys: '\x1b[5~', until: (s) => s.includes('첨부 경로 1/') && s.includes('❯') },
-        { label: 'page up at first attachment page enters log navigation', keys: '\x1b[5~', until: (s) => s.includes('로그 탐색') },
+        { label: 'page up at first attachment page enters log navigation', keys: '\x1b[5~', until: (s) => s.includes('턴 로그') },
         { label: 'escape returns to composer after log navigation', keys: '\x1b', until: (s) => s.includes('❯') },
         { label: 'attachment page down after log navigation', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
         { label: 'long activity keeps attachment area pinned', text: '/help', enter: true, until: (s) => s.includes('첨부 경로 2/') && s.includes('❯') },
         { label: 'third attachment picker opened', text: '@c', enter: false, until: (s) => s.includes('▸ c.txt') && s.includes('@ 파일 첨부') },
         { label: 'third attachment selected refreshes area', keys: '\r', until: (s) => s.includes('첨부 3건 · 2/3쪽') && s.includes('❯') },
-        { label: 'third attachment sent', keys: '\r', until: (s) => s.includes('응답 완료') },
-        { label: 'attachment page three shows new item', text: '/context page 3', enter: true, until: (s) => s.includes('첨부 3건 · 3/3쪽') && containsPath(s, fixtureC.slice(0, 40)) },
+        { label: 'third attachment sent', keys: '\r', until: (s) => storedReplyCount() >= 2 && s.includes('완료') && s.includes('❯ ') },
+        { label: 'attachment page three shows new item', text: '/context page 3', enter: true, until: (s) => s.includes('첨부 3건 · 3/3쪽') && showsAttachment(s, 3, 'c.txt') },
         { label: 'new attachment path page two down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 2/3') && s.includes('❯') },
         { label: 'new attachment path page three down', keys: '\x1b[6~', until: (s) => s.includes('첨부 경로 3/3') && s.includes('❯') },
-        { label: 'second attachment dropped', text: '/context drop 2', enter: true, until: (s) => s.includes('첨부 #2 삭제') && containsPath(s, fixtureA.slice(0, 40)) },
+        { label: 'second attachment dropped', text: '/context drop 2', enter: true, until: (s) => s.includes('첨부 #2 삭제') && showsAttachment(s, 1, 'a.txt') },
         { label: 'attachment area cleared', text: '/context clear', enter: true, until: (s) => s.includes('첨부 2건 삭제') },
         { label: 'empty attachment area', text: '/context', enter: true, until: (s) => s.includes('/context: (없음)') },
       ],
@@ -472,13 +526,13 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
       'attachment page three shows new item', 'new attachment path page two down', 'new attachment path page three down',
     ].map(attachmentViewportText).join('');
     return {
-      scenario: spec.scenario, universe: root, run, store: { fixtureA, fixtureB, fixtureC }, logs: readLogs(spec, 'tui.next'), checks: {
-        firstPageShowsFixture: containsPath(screen('attachment page one'), fixtureA.slice(0, 40)),
+      scenario: spec.scenario, universe: scenarioRoot, run, store: { fixtureA, fixtureB, fixtureC }, logs: readLogs({ ...spec, root: scenarioRoot }, 'tui.next'), checks: {
+        firstPageShowsFixture: showsAttachment(screen('attachment page one'), 1, 'a.txt'),
         secondPageShowsFixture: longPathAcrossPages.includes(withoutLayout(fixtureB)),
         longPathIsNavigable: longPathAcrossPages.includes(withoutLayout(fixtureB)),
         inputRemainsVisibleDuringPathNavigation: ['attachment path page two down', 'attachment path page three down', 'attachment path page up keeps input']
           .every((label) => screen(label).includes('❯')),
-        pageUpAtFirstAttachmentPageEntersLogNavigation: screen('page up at first attachment page enters log navigation').includes('로그 탐색'),
+        pageUpAtFirstAttachmentPageEntersLogNavigation: screen('page up at first attachment page enters log navigation').includes('턴 로그'),
         logNavigationReturnsToComposer: screen('escape returns to composer after log navigation').includes('❯'),
         areaStaysVisibleAfterLongActivity: screen('long activity keeps attachment area pinned').includes('첨부 2건 · 2/2쪽'),
         longPathStaysVisibleAfterLongActivity: attachmentViewportText('long activity keeps attachment area pinned').length > 0,
@@ -519,7 +573,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     const routes = events.filter((e) => e.category === 'llm.route-decision' && e.event === 'local-chat-executed').map((e) => parseData<{ provider: string; sessionId: string }>(e.data));
     const afterNew = run.frames.find((f) => f.label === `after ${newSessionCommand}`)?.screen ?? '';
     const checks = {
-      screenClearedWithNewTitle: afterNew.includes('elanous next · 새 대화') && !afterNew.includes('첫 메시지') && !afterNew.includes(reply),
+      screenClearedWithNewTitle: afterNew.includes('새 대화 · 이전 =') && !afterNew.includes('첫 메시지') && !afterNew.includes(reply),
       statusNamesPrevious: Boolean(oldId) && afterNew.includes(`새 대화 · 이전 = ${oldId.slice(0, 8)}`),
       sessionNewObservedOnce: sessionNew.length === 1,
       nextTurnInNewSession: routes.length >= 3 && routes[2]?.sessionId === fromTo.to && routes[0]?.sessionId === oldId,
@@ -534,7 +588,7 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
 
   if (spec.scenario === 'next-resume') return runNextResumeScenario(spec, root, base, reply, done);
 
-  if (spec.scenario === 'next-tool-fold') return runNextToolFoldScenario(spec, root, base, reply, done);
+  if (spec.scenario === 'next-tool-fold') return runNextToolFoldScenario(spec, root, base);
   if (spec.scenario === 'next-esc-confirm-long-shell') return runNextEscConfirmLongShellScenario(spec, root, base, reply, done);
   if (spec.scenario === 'next-tool-fold-read') return runNextToolFoldReadScenario(spec, root, base, done);
   if (spec.scenario === 'next-queue') return runNextQueueScenario(spec, root, base, reply, done);
@@ -555,8 +609,8 @@ export async function runNextTuiScenario(spec: NextTuiScenarioSpec): Promise<Nex
     return sid;
   });
   const steps: SeatPtyStep[] = [
-    { label: 'after turn (auto compact)', text: '긴 대화 뒤 질문', until: (s) => s.includes('응답 완료') && s.includes(reply) },
-    { label: 'after /compact', text: '/compact', until: /압축 \d+→\d+ 메시지 · Enter 전송/ },
+    { label: 'after turn (auto compact)', text: '긴 대화 뒤 질문', until: (s) => count(s, reply) === 1 && /턴 압축 12→\d+ 메시지 · 응답 완료/.test(s) && s.includes('❯ ') },
+    { label: 'after /compact', text: '/compact', until: (s) => /압축 \d+→\d+ 메시지/.test(s) && s.includes('❯ ') },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -635,7 +689,7 @@ async function runNextResumeScenario(spec: NextTuiScenarioSpec, root: string, ba
 
 type ScenarioBase = Omit<Parameters<typeof mockSeatPtySequence>[0], 'steps'> & { env: Record<string, string> };
 type Done = (n: number, also?: string) => (s: string) => boolean;
-type LogEvent = { category?: string; event?: string; data?: string; ts?: string };
+type LogEvent = { id?: number; category?: string; event?: string; data?: string; ts?: string };
 
 function parseEvents(logs: NextTuiScenarioResult['logs']): LogEvent[] {
   return logs.lines.map((l) => { try { return JSON.parse(l) as LogEvent; } catch { return {}; } });
@@ -651,26 +705,31 @@ function activeUserTexts(root: string): { id: string; user: string[] } {
   return { id, user: id ? userTexts(root, id) : [] };
 }
 
-/** TUI-NEXT-QUEUE-AND-WAKE ① — two sentences ⊕ a draft typed while one slow turn runs; confirm Esc before restoring queued input. */
+/** TUI-NEXT-QUEUE-AND-WAKE ① — two sentences and a draft typed while one slow turn runs; Esc immediately restores queued input and draft. */
 async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, reply: string, done: Done): Promise<NextTuiScenarioResult> {
   const slow = '천천히';
   const steps: SeatPtyStep[] = [
     // One slow turn; while it runs: two submissions and an unsent draft.
     { label: 'busy with two queued', chunks: [`첫 질문 ${slow}`, '\r', '둘째 질문', '\r', '셋째 질문', '\r', '쓰던 초안'], gapMs: 300, until: (s) => s.includes('대기 2') && s.includes('쓰던 초안') },
-    { label: 'after settle', until: (s) => done(3)(s) && s.includes('셋째 질문') && s.includes('쓰던 초안') && !s.includes('대기'), timeoutMs: 60_000 },
-    // The draft becomes a slow turn; one more is queued behind it. Esc asks for confirmation;
-    // only the explicit y cancels the turn and restores that queued input to the composer.
-    { label: 'slow draft turn started', text: ` ${slow}`, until: (s) => s.includes('응답 중 · Esc 취소'), timeoutMs: 10_000 },
+    { label: 'after settle', until: (s) => done(3)(s) && s.includes('셋째 질문') && s.includes('쓰던 초안')
+      && !s.includes('대기 1') && !s.includes('대기 2'), timeoutMs: 60_000 },
+    // The draft becomes a slow turn; one more is queued behind it. Esc cancels this
+    // ordinary chat turn and restores that queued input to the composer.
+    { label: 'slow draft turn started', text: ` ${slow}`, until: (s) => s.includes('slow draft held') && s.includes('턴 스트리밍'), timeoutMs: 30_000 },
     { label: 'fifth turn queued', text: '다섯째', until: (s) => s.includes('대기 1'), timeoutMs: 10_000 },
     { label: 'unsent draft stays behind queue', text: '미전송 초안', enter: false, until: (s) => s.includes('대기 1') && s.includes('미전송 초안'), timeoutMs: 10_000 },
-    { label: 'esc opens queue stop confirmation', keys: '\x1b', until: (s) => s.includes('응답 중단 확인') && s.includes('n. 계속'), timeoutMs: 10_000 },
-    { label: 'n keeps the queued turn and draft pending', keys: 'n', until: (s) => s.includes('응답 중 · Esc 취소') && s.includes('대기 1') && s.includes('미전송 초안'), timeoutMs: 10_000 },
-    { label: 'second esc opens confirmation', keys: '\x1b', until: (s) => s.includes('응답 중단 확인') && s.includes('n. 계속'), timeoutMs: 10_000 },
-    { label: 'y cancels and restores queue', keys: 'y', until: (s) => s.includes('대기 1건을 입력칸으로') && s.includes('다섯째') && !s.includes('응답 중단 확인'), timeoutMs: 30_000 },
+    // Source: .rules/30-harness/testing-gates.md — immediate Esc recovery has a two-second upper bound.
+    { label: 'esc immediately cancels and restores queue with draft', keys: '\x1b', until: (s) => s.includes('대기 1건을 입력칸으로') && s.includes('다섯째') && !s.includes('응답 중단 확인'), timeoutMs: 2_000 },
   ];
   const run = await mockSeatPtySequence({
     ...base,
-    env: { ...base.env, [TEST_FAKE_LLM_DELAY_MS_ENV]: '3000', [TEST_FAKE_LLM_DELAY_WHEN_ENV]: slow },
+    // Keep earlier turns deterministic and hold only the slow-draft response until Esc aborts it.
+    env: {
+      ...base.env,
+      [TEST_FAKE_LLM_DELAY_MS_ENV]: '6000',
+      [TEST_FAKE_LLM_DELAY_WHEN_ENV]: '첫 질문 천천히',
+      [TEST_FAKE_LLM_SCRIPT_ENV]: 'ok,ok,ok,stall:slow draft held',
+    },
     steps,
   });
   const logs = readLogs(spec, 'tui.next,llm.route-decision');
@@ -678,16 +737,20 @@ async function runNextQueueScenario(spec: NextTuiScenarioSpec, root: string, bas
   const store = activeUserTexts(root);
   const frame = (label: string) => run.frames.find((f) => f.label === label)?.screen ?? '';
   const promptLine = (screen: string) => screen.split('\n').at(-1) ?? '';
+  const restoredComposerLines = frame('esc immediately cancels and restores queue with draft').split('\n').slice(-2).map(line => line.trim());
+  const queueRestoredEvents = events.filter((event) => event.category === 'tui.next' && event.event === 'queue-restored');
+  const queueRestoreData = parseData<{ count: number }>(queueRestoredEvents[0]?.data);
   const checks = {
     queueShownWhileBusy: frame('busy with two queued').includes('대기 2'),
     userTurnsInOrder: JSON.stringify(store.user.slice(0, 3)) === JSON.stringify([`첫 질문 ${slow}`, '둘째 질문', '셋째 질문']),
     threeReplies: count(frame('after settle'), reply) === 3,
     draftKept: promptLine(frame('after settle')).includes('쓰던 초안'),
-    escConfirmationKeepsQueuePending: frame('esc opens queue stop confirmation').includes('응답 중단 확인')
-      && frame('n keeps the queued turn and draft pending').includes('대기 1')
-      && frame('n keeps the queued turn and draft pending').includes('응답 중 · Esc 취소')
-      && promptLine(frame('n keeps the queued turn and draft pending')).includes('미전송 초안'),
-    escRestoresQueue: promptLine(frame('y cancels and restores queue')).includes('다섯째↵미전송 초안') && !store.user.includes('다섯째'),
+    escRestoresQueueAndDraft: frame('esc immediately cancels and restores queue with draft').includes('대기 1건을 입력칸으로')
+      && restoredComposerLines[0] === '❯ 다섯째' && restoredComposerLines[1] === '미전송 초안'
+      && !store.user.includes('다섯째'),
+    escCancelsWithoutShellConfirmation: !frame('esc immediately cancels and restores queue with draft').includes('응답 중단 확인'),
+    escRestoresQueue: restoredComposerLines[0] === '❯ 다섯째' && !store.user.includes('다섯째'),
+    queueRestoreEventCarriesRestoredCount: queueRestoredEvents.length === 1 && queueRestoreData.count === 1,
     onlyFakeProvider: onlyFake(events),
     exitedClean: run.exitCode === 0,
   };
@@ -708,21 +771,21 @@ async function runNextProactiveContinueScenario(spec: NextTuiScenarioSpec, root:
     mkdirSync(caseRoot, { recursive: true });
     writeFileSync(join(caseRoot, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
     const caseSpec = { ...spec, root: caseRoot };
-    const caseBase = { ...base, root: caseRoot, args: [spec.entry, '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'], env: { ...base.env, [TEST_FAKE_LLM_RESPONSE_ENV]: c.reply, ...(c.name === 'remaining' || c.name === 'buffer' ? { [TEST_FAKE_LLM_DELAY_MS_ENV]: '1500', [TEST_FAKE_LLM_DELAY_WHEN_ENV]: '천천히' } : {}) } };
+    const caseBase = { ...base, root: caseRoot, args: [spec.entry, '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'], env: { ...base.env, [TEST_FAKE_LLM_RESPONSE_ENV]: c.reply, ...(c.name === 'remaining' || c.name === 'buffer' ? { [TEST_FAKE_LLM_DELAY_MS_ENV]: c.name === 'buffer' ? '4000' : '1500', [TEST_FAKE_LLM_DELAY_WHEN_ENV]: '천천히' } : {}) } };
     const steps: SeatPtyStep[] = c.name === 'remaining'
       ? [
         { label: 'remaining: user input queues before turn boundary', chunks: [c.prompt, '\r', '검증 결과를 먼저 보여줘', '\r'], gapMs: 300, until: (s) => s.includes('대기 1'), timeoutMs: 30_000 },
-        { label: 'remaining: queued user turn is next', until: (s) => count(s, c.reply) >= 2 && s.includes('응답 완료'), timeoutMs: 30_000 },
-        { label: 'remaining: auto continuation settled', until: (s) => count(s, c.reply) >= c.turns && s.includes('응답 완료'), timeoutMs: 30_000 },
+        { label: 'remaining: queued user turn is next', until: (s) => count(s, c.reply) >= 2 && isSettledNextTuiScreen(s), timeoutMs: 30_000 },
+        { label: 'remaining: auto continuation settled', until: (s) => count(s, c.reply) >= c.turns && isSettledNextTuiScreen(s), timeoutMs: 30_000 },
       ]
       : c.name === 'cap'
-        ? [{ label: 'cap: three automatic turns stop', text: c.prompt, until: (s) => s.includes('골 이어가기 상한(3회 연속)') && s.includes('응답 완료'), timeoutMs: 60_000 }]
+      ? [{ label: 'cap: three automatic turns stop', text: c.prompt, until: (s) => s.includes('골 이어가기 상한(3회 연속)') && isSettledNextTuiScreen(s), timeoutMs: 60_000 }]
       : c.name === 'buffer'
         ? [
-          { label: 'buffer: draft typed while the turn is busy', chunks: [c.prompt, '\r', '미전송 초안'], gapMs: 300, until: (s) => s.includes('응답 중') && s.includes('미전송 초안'), timeoutMs: 30_000 },
-          { label: 'buffer: response ends with draft preserved', until: (s) => s.includes(c.reply) && s.includes('미전송 초안') && s.includes('응답 완료'), timeoutMs: 30_000 },
+          { label: 'buffer: draft typed while the turn is busy', chunks: [c.prompt, '\r', '미전송 초안'], gapMs: 300, until: (s) => (s.includes('응답 중') || s.includes('턴 스트리밍')) && s.includes('미전송 초안'), timeoutMs: 30_000 },
+          { label: 'buffer: response ends with draft preserved', until: (s) => s.includes(c.reply) && s.includes('미전송 초안') && isSettledNextTuiScreen(s), timeoutMs: 30_000 },
         ]
-      : [{ label: `${c.name}: human turn`, text: c.prompt, until: (s) => count(s, c.reply) >= 1 && s.includes('응답 완료'), timeoutMs: 30_000 }];
+      : [{ label: `${c.name}: human turn`, text: c.prompt, until: (s) => count(s, c.reply) >= 1 && isSettledNextTuiScreen(s), timeoutMs: 30_000 }];
     const run = await mockSeatPtySequence({ ...caseBase, steps });
     results.push({ name: c.name, run, store: activeUserTexts(caseRoot), logs: readLogs(caseSpec, 'tui.next,tui.proactive,tui.goal-continue,tui.autoturn,llm.route-decision') });
   }
@@ -774,7 +837,7 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
       text: '60초 뒤 예약해줘',
       until: (s) => done(1)(s) && s.includes('⏰ 예약 깨움'),
     },
-    { label: 'busy over the due time', text: '긴 작업 하나', until: (s) => s.includes('응답 중'), timeoutMs: 30_000 },
+    { label: 'busy over the due time', text: '긴 작업 하나', until: (s) => s.includes('응답 중') || s.includes('턴 스트리밍'), timeoutMs: 30_000 },
     { label: 'long turn done', until: done(2, '긴 작업 하나'), timeoutMs: 30_000 },
     { label: 'woke after one deferral', until: (s) => s.includes(banner) && done(3)(s), timeoutMs: 30_000 },
   ];
@@ -784,7 +847,7 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
       ...base.env,
       ELANOUS_TEST_FAST_WAKEUP_CLOCK: '1',
       [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: '예약해줘', name: 'ScheduleWakeup', args: { delaySeconds: 60, reason: '점검' } }),
-      [TEST_FAKE_LLM_DELAY_MS_ENV]: '3000',
+      [TEST_FAKE_LLM_DELAY_MS_ENV]: '6000',
       [TEST_FAKE_LLM_DELAY_WHEN_ENV]: '긴 작업',
     },
     steps,
@@ -810,9 +873,9 @@ async function runNextWakeupScenario(spec: NextTuiScenarioSpec, root: string, ba
 
 /** TUI-NEXT-FOLD-DEFAULT — real Bash tool call; both progressive MessageBlock and saved tool row are selectable. */
 export const NEXT_TOOL_FOLD_COMMAND = "seq -f fold-line-%02g 0 29; printf 'fold-stderr-marker\\n' >&2; exit 7";
-async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, reply: string, done: Done): Promise<NextTuiScenarioResult> {
+async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase): Promise<NextTuiScenarioResult> {
   const ask = '도구 출력 접기 시험';
-  const summaryRe = /▸ 도구 · Bash 결과 \(접힘\)/;
+  const summaryRe = /^▸ 도구 · Bash 결과$/m;
   // Whole stored session, read at the moment each screen is reached: before the toggles and after both.
   const snapshot = (): string => withStore(root, () => {
     const sid = getActiveSessionId() ?? '';
@@ -823,18 +886,18 @@ async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, 
   const steps: SeatPtyStep[] = [
     {
       label: 'after tool turn (folded)', text: ask, timeoutMs: 60_000,
-      until: (s) => { const ok = done(1)(s) && summaryRe.test(s); if (ok && !beforeToggle) beforeToggle = snapshot(); return ok; },
+      until: (s) => { const ok = isSettledNextTuiScreen(s) && summaryRe.test(s); if (ok && !beforeToggle) beforeToggle = snapshot(); return ok; },
     },
-    { label: 'log focus (PageUp)', keys: '\x1b[5~', until: '로그 탐색' },
-    { label: 'L1 summary (Enter)', keys: '\r', until: (s) => s.includes('도구 · Bash 결과') && !summaryRe.test(s), timeoutMs: 15_000 },
-    { label: 'L2 steps (Enter)', keys: '\r', until: (s) => s.includes('호출 인자 전달') && s.includes('도구 · Bash 결과'), timeoutMs: 15_000 },
-    { label: 'L3 raw reference (Enter)', keys: '\r', until: (s) => s.includes('fold-line-29') && s.includes('입력'), timeoutMs: 15_000 },
+    { label: 'log focus (PageUp)', keys: '\x1b[5~', until: '턴 로그' },
+    { label: 'L1 summary (Enter)', keys: '\r', until: (s) => s.includes('▾ 도구 · Bash 결과'), timeoutMs: 15_000 },
+    { label: 'L2 steps (Enter)', keys: '\r', until: (s) => s.includes('호출 인자 전달') && s.includes('도구 결과 수신'), timeoutMs: 15_000 },
+    { label: 'L3 raw reference (Enter)', keys: '\r', until: (s) => s.includes('fold-stderr-marker') && s.includes('종료 상태') && s.includes('입력'), timeoutMs: 15_000 },
     {
-      label: 'MessageBlock folds again (Enter)', keys: '\r', timeoutMs: 15_000,
-      until: (s) => { const ok = summaryRe.test(s) && !s.split('\n').some((line) => line.trim() === '입력'); if (ok && !afterToggles) afterToggles = snapshot(); return ok; },
+      label: 'fold row after key cycle', keys: '\r', timeoutMs: 15_000,
+      until: (s) => s.includes('▸ 도구 Bash ·') && !s.includes('fold-line-25'),
     },
-    { label: 'saved tool row is selectable (Enter)', keys: '\r', until: (s) => s.includes('fold-line-29') && s.includes('fold-stderr-marker')
-      && !s.split('\n').some((line) => line.trim() === '입력'), timeoutMs: 15_000 },
+    { label: 'folded again view (PageUp)', keys: '\x1b[5~\x1b[5~\x1b[5~\x1b[5~', timeoutMs: 15_000,
+      until: (s) => { const ok = summaryRe.test(s) && s.includes('▸ 도구 Bash ·'); if (ok && !afterToggles) afterToggles = snapshot(); return ok; } },
   ];
   const run = await mockSeatPtySequence({
     ...base,
@@ -856,7 +919,7 @@ async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, 
   })();
   const screen = (label: string) => run.frames.find((f) => f.label === label)?.screen ?? '';
   const folded0 = screen('after tool turn (folded)');
-  const folded1 = screen('MessageBlock folds again (Enter)');
+  const folded1 = screen('folded again view (PageUp)');
   const expanded = screen('L3 raw reference (Enter)');
   const checks = {
     // The 30 lines come from the Bash tool actually running in the turn loop.
@@ -865,12 +928,9 @@ async function runNextToolFoldScenario(spec: NextTuiScenarioSpec, root: string, 
     collapsedAfterTurn: summaryRe.test(folded0) && !folded0.includes('fold-line-12'),
     summaryAtL1: screen('L1 summary (Enter)').includes('도구 · Bash 결과'),
     stepsAtL2: screen('L2 steps (Enter)').includes('호출 인자 전달'),
-    expandedOnL3: expanded.includes('fold-line-29') && expanded.includes('fold-stderr-marker')
+    expandedOnL3: expanded.includes('fold-stderr-marker')
       && /종료 상태\s+7/.test(expanded) && !summaryRe.test(expanded),
-    savedToolFoldIsSelectable: screen('saved tool row is selectable (Enter)').includes('fold-line-29')
-      && screen('saved tool row is selectable (Enter)').includes('fold-stderr-marker')
-      && !screen('saved tool row is selectable (Enter)').split('\n').some((line) => line.trim() === '입력'),
-    foldedAgainOnEnter: summaryRe.test(folded1) && !folded1.split('\n').some((line) => line.trim() === '입력'),
+    foldedAgainOnEnter: summaryRe.test(folded1) && folded1.includes('▸ 도구 Bash ·'),
     // Fold state is screen-only: the whole stored session read right after the first folded screen
     // equals the one read right after the second Enter (and it holds the real tool result).
     sessionUnchanged: beforeToggle !== '' && beforeToggle === afterToggles && beforeToggle.includes('fold-line-29'),
@@ -910,14 +970,14 @@ async function runNextEscConfirmLongShellScenario(
       }),
     },
     steps: [
-      { label: 'long Bash running', text: ask, until: (screen) => screen.includes('Bash 실행 중') },
+      { label: 'long Bash running', text: ask, until: (screen) => screen.includes('턴 도구 실행') },
       {
         label: 'long Bash Esc asks y/N', chunks: ['', '\u001b'], gapMs: LONG_SHELL_PTY_GAP_MS,
         until: (screen) => screen.includes('긴 셸 명령 중단 확인') && screen.includes('y/n 입력 · 기본 N'),
       },
       { label: 'N keeps Bash running', keys: 'n', until: (screen) => screen.includes('긴 셸 명령 계속 실행') },
-      { label: 'N command completes', until: (screen) => done(1)(screen) && screen.includes('응답 완료') },
-      { label: 'second long Bash running', text: ask, until: (screen) => screen.includes('Bash 실행 중') },
+      { label: 'N command completes', until: (screen) => done(1)(screen) },
+      { label: 'second long Bash running', text: ask, until: (screen) => screen.includes('턴 도구 실행') },
       {
         label: 'second long Bash Esc asks y/N', chunks: ['', '\u001b'], gapMs: LONG_SHELL_PTY_GAP_MS,
         until: (screen) => screen.includes('긴 셸 명령 중단 확인') && screen.includes('y/n 입력 · 기본 N'),
@@ -930,10 +990,10 @@ async function runNextEscConfirmLongShellScenario(
   const events = parseEvents(logs);
   const frame = (label: string) => run.frames.find((entry) => entry.label === label)?.screen ?? '';
   const checks = {
-    longShellShownWhileRunning: frame('long Bash running').includes('Bash 실행 중'),
+    longShellShownWhileRunning: frame('long Bash running').includes('▸ 도구 · Bash 실행') && frame('long Bash running').includes('턴 도구 실행'),
     longEscShowsDefaultNInlinePanel: frame('long Bash Esc asks y/N').includes('y/n 입력 · 기본 N'),
     noKeepsTheSameShellRunning: frame('N keeps Bash running').includes('긴 셸 명령 계속 실행'),
-    declinedShellCompletesNormally: done(1)(frame('N command completes')) && frame('N command completes').includes('응답 완료'),
+    declinedShellCompletesNormally: done(1)(frame('N command completes')),
     yesStopsTheSecondTurn: frame('y stops Bash turn').includes('응답 취소됨'),
     cancelledShellProcessExitedAtYConfirmation: Number.isInteger(cancelledShellPid) && cancelledShellPid > 0 && shellPidHasExited(),
     onlyFakeProvider: onlyFake(events),
@@ -995,12 +1055,16 @@ export const bracketedPaste = (text: string): string => `\x1b[200~${text}\x1b[20
 export const CLIP_TEXT = Array.from({ length: 6 }, (_, i) => `clip-line-${i}`).join('\n');
 export const CLIP_TOKEN = pasteFoldToken(2, CLIP_TEXT);
 
-/** PATH shims so Ctrl+V reads a known clipboard instead of the person's: `pbpaste` prints CLIP_TEXT and
- *  `osascript` answers «no image». The TUI's own clipboard module spawns them by name from PATH. */
+/** PATH shims so Ctrl+V reads a known clipboard instead of the person's on macOS and Linux.
+ *  The TUI's own clipboard module spawns the platform reader by name from PATH. */
 export function clipboardShimPath(root: string): string {
   const bin = join(root, 'clip-bin');
   mkdirSync(bin, { recursive: true });
   writeFileSync(join(bin, 'pbpaste'), `#!/bin/sh\nprintf '%s' '${CLIP_TEXT.replace(/\n/g, '\\n')}' | sed 's/\\\\n/\\n/g'\n`);
+  for (const command of ['xclip', 'wl-paste']) {
+    writeFileSync(join(bin, command), readFileSync(join(bin, 'pbpaste')));
+    chmodSync(join(bin, command), 0o755);
+  }
   writeFileSync(join(bin, 'osascript'), '#!/bin/sh\necho no\n');
   chmodSync(join(bin, 'pbpaste'), 0o755);
   chmodSync(join(bin, 'osascript'), 0o755);
@@ -1010,13 +1074,15 @@ export function clipboardShimPath(root: string): string {
 /** TUI-PASTE-ECHO — a short bracketed paste shows as typed; a 50-line paste shows one placeholder and the
  *  submitted turn carries the whole original text. */
 async function runNextPasteScenario(spec: NextTuiScenarioSpec, root: string, base: ScenarioBase, reply: string): Promise<NextTuiScenarioResult> {
+  const settledPaste = (expectedReplies: number) => (screen: string) => screen.split(reply).length - 1 === expectedReplies
+    && isSettledNextTuiScreen(screen) && screen.includes('❯ ');
   const steps: SeatPtyStep[] = [
     { label: 'short pasted', keys: bracketedPaste(PASTE_SHORT), until: (s) => s.includes(`❯ ${PASTE_SHORT}`) },
     { label: 'cleared', keys: '\x15', until: (s) => !s.includes(PASTE_SHORT) },
     { label: 'long pasted', keys: bracketedPaste(PASTE_LONG), until: (s) => s.includes(PASTE_LONG_TOKEN) },
-    { label: 'submitted', keys: '\r', until: (s) => s.includes(reply) && s.includes('응답 완료'), timeoutMs: 30_000 },
+    { label: 'submitted', keys: '\r', until: settledPaste(1), timeoutMs: 30_000 },
     { label: 'ctrl+v', keys: '\x16', until: (s) => s.includes(CLIP_TOKEN) },
-    { label: 'clip submitted', keys: '\r', until: (s) => s.split(reply).length - 1 === 2 && s.includes('응답 완료'), timeoutMs: 30_000 },
+    { label: 'clip submitted', keys: '\r', until: settledPaste(2), timeoutMs: 30_000 },
   ];
   const run = await mockSeatPtySequence({ ...base, env: { ...base.env, PATH: clipboardShimPath(root) }, steps });
   const logs = readLogs(spec, 'tui.paste,llm.route-decision');
@@ -1056,7 +1122,7 @@ async function runNextGoalContinueScenario(spec: NextTuiScenarioSpec, root: stri
     {
       label: 'continued',
       until: (s) => {
-        const ok = s.includes(banner) && replies(s) === 2 && s.includes('응답 완료');
+        const ok = s.includes(banner) && replies(s) === 2 && isSettledNextTuiScreen(s);
         if (ok && settledAt === 0) settledAt = Date.now();
         return ok;
       },
@@ -1086,7 +1152,7 @@ async function runNextGoalContinueScenario(spec: NextTuiScenarioSpec, root: stri
 }
 
 
-/** TUI-GOAL-INTERIM-QUIET — every step ends with «아직 못 했다» (a different reply per turn via `{step}`, so the
+/** TUI-GOAL-INTERIM-QUIET — every step ends with «아직 못 했다» (a different reply per turn via `{reply}`, so the
  *  same-reply stop does not end it early). The fake reply's honesty sentence, counted on screen. */
 const GOAL_INTERIM_STEP_MARK = '단계 렌더를 진행했습니다';
 const GOAL_INTERIM_NOT_DONE_MARK = '아직 못 했습니다';
@@ -1112,7 +1178,7 @@ async function runNextGoalInterimScenario(spec: NextTuiScenarioSpec, root: strin
       label: 'settled',
       // goal-continue stops at its consecutive cap (a «⏸ … 상한» line) after the last internal turn settles.
       until: (s) => {
-        const ok = s.includes(capLine) && s.includes('응답 완료');
+        const ok = s.includes(capLine) && isSettledNextTuiScreen(s);
         if (ok && settledAt === 0) settledAt = Date.now();
         return ok;
       },
@@ -1130,15 +1196,17 @@ async function runNextGoalInterimScenario(spec: NextTuiScenarioSpec, root: strin
   const store = activeUserTexts(root);
   const finalScreen = run.frames.at(-1)?.screen ?? '';
   const last = goalInterimScreenCounts(finalScreen);
-  const stepLines = finalScreen.split('\n').filter((line) => line.includes(GOAL_INTERIM_STEP_MARK));
+  const stepLines = finalScreen.split('\n').filter((line) => line.startsWith('엘라누스:') && line.includes(GOAL_INTERIM_STEP_MARK));
+  const foldedReplyLines = stepLines.filter((line) => line.includes('(접힘)'));
   const checks = {
     continuedSeveral: opened >= 2,
-    eachInterimOneLine: stepLines.filter((line) => line.includes('(접힘)')).length === opened
-      && stepLines.every((line) => !line.includes(GOAL_INTERIM_NOT_DONE_MARK)),
-    everyStepOnScreen: last.steps === opened + 1,
+    eachInterimOneLine: foldedReplyLines.length === opened + 1
+      && foldedReplyLines.every((line) => !line.includes(GOAL_INTERIM_NOT_DONE_MARK)),
+    // The first turn's ScheduleWakeup yields a tool-result reply before the human turn settles.
+    everyStepOnScreen: stepLines.length === opened + 2,
     notDoneAtMostOnce: last.notDone <= 1,
     finalReportShown: last.notDone === 1 && finalScreen.split('\n').some((line) => line.includes(GOAL_INTERIM_NOT_DONE_MARK) && !line.includes('(접힘)')),
-    foldedEachContinued: last.folded === opened && Math.max(0, ...foldedLogged) === opened,
+    foldedEachContinued: foldedReplyLines.length === opened + 1 && Math.max(0, ...foldedLogged) === opened + 1,
     noUserHeaderForInternal: run.frames.every((f) => !INTERNAL_TURN_USER_HEADER.test(f.screen)),
     // The first turn's tool line survives the fold of that turn's reply (only the reply block folds).
     toolLineKept: (run.frames.at(-1)?.screen ?? '').includes('ScheduleWakeup'),

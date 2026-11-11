@@ -12,6 +12,7 @@ import { createGateCorrelationContext, GATE_HEARTBEAT_INTERVAL_MS, withGateCorre
 import { observeModelInputTokens } from '../harness/model-input-observation.js';
 import { publishInsideEvent } from '../nexus/api/inside-events.js';
 import { getTestStateRoot } from '../nexus/paths.js';
+import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { listInstalledPlugins } from '../plugins/install/plugin-install.js';
 import { credentialStatus, pluginEnv } from '../plugins/install/plugin-credentials.js';
@@ -29,9 +30,13 @@ import { createGraphUnitResolver, resolveGraphUnit, UnitNotFoundError, type Reso
 import { flattenGraphUnits } from '../self-implement/graph-unit-flatten.js';
 import { shapeGraphUnit } from './unit-shape.js';
 import { createGraphEventBus, createScopedGraphEventBus, publishNodeGraphEvent, type GraphEvent, type GraphEventBus } from './graph-events.js';
+import { appendGraphRunEvent, graphRunEventLedgerPath } from './graph-run-event-ledger.js';
+import { registerGraphRunMsgSubscribers } from './graph-run-msg-subscriptions.js';
 import { registerGraphSubscriptions, type GraphEdgeAdditionApi, type GraphSubgraphAppendProposal, type GraphSubscriptionDispatch } from './graph-subscriptions.js';
 import { registerReleaseGraphEventAdapters } from '../release-loop/graph-event-adapters.js';
 import { releaseGateCutoverPath } from './release-gate-cutover-policy.js';
+import { ArgFeedbackLedger, type ArgFeedbackIdentity } from './arg-feedback-lifecycle.js';
+import { ArgFeedbackDurabilityError, readDurableArgFeedbackOutcome } from './arg-feedback-consumer.js';
 export { UnitNotFoundError } from '../self-implement/graph-unit-resolver.js';
 import { createGraphVariant } from '../self-implement/graph-variant.js';
 import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js';
@@ -43,6 +48,8 @@ import { interpolate } from '../workflow-runtime/variables.js';
 import { assertGraphManifestRecipeAllowed, assertGraphManifestTemplate, loadGraphManifestForFile, type GraphManifestDeclaration } from './graph-manifest-loader.js';
 import type { BashNode, ClassifyNode, NodeExecContext, NodeOutput, WorkflowDeps } from '../workflow-runtime/types.js';
 import { releaseResumeAcceptedRegressions, releaseResumeGateExecutor, releaseResumeGatePodPool, releaseResumeGateShardReroute, releaseResumeWaiver } from '../../scripts/release-loop/resume.js';
+import { RELEASE_NODE_COMMANDS } from '../../scripts/release-loop/runner-release-node-commands.js';
+import { activeReleaseCloudDeadline } from '../../scripts/release-loop/cloud-lease-deadline.js';
 import type { AcceptedRegression, GateExecutorOverride, GatePodPoolOverride, GateShardRerouteOverride } from '../../scripts/release-loop/resume-types.js';
 import { gateUnmeasuredDetail } from '../../scripts/release-loop/resume.js';
 import { registerAdaptiveGateHealAdapter, RELEASE_GATE_FAILED_EVENT, type AdaptiveGateHealAppendNodeRequest, type AdaptiveGateHealAppendNodeReceipt, type AdaptiveGateHealRerunGateRequest } from '../../scripts/release-loop/adaptive-gate-heal-adapter.js';
@@ -50,6 +57,7 @@ import type { AdaptiveGateHealPlan } from '../../scripts/release-loop/adaptive-g
 import { resolveChildAllowance } from './arg-allowance.js';
 import { withGraphProviderContextExtensions } from './provider-context.js';
 import { lowerGraphV2, type LowerGraphV2Result } from '../graph-v2/lower.js';
+import { bindGraphV2NodeInput, bindGraphV2StoreWriteInput } from '../graph-v2/input-bindings.js';
 import { emitReleaseStageTransition, postReleaseStageMail, type ReleaseStageState } from '../release-loop/stage-mail.js';
 import { applyReleaseOpCommand, emptyReleaseOpState, parseReleaseOpBufferedEvent, parseReleaseOpCommand, recordReleaseOpEvent, shadowReleaseOpDecision, type ReleaseOpEvent, type ReleaseOpState } from '../release-loop/op-channel.js';
 import { openMsgStore } from '../msg/msg-store.js';
@@ -61,6 +69,8 @@ import { declaredHealEdges, graphHealManifest, type DeclaredHealEdge } from './d
 import type { GraphGrowthScope, GraphLoopBudgetScope, GraphNodeLifecycleEvent, GraphNodeLifecyclePhase, GraphRun, GraphRunOptions, GraphRunState } from './runner-types.js';
 export { nextNode } from './runner-routing.js';
 export { lastJsonObject, STOPPED_NODE_ERROR } from './runner-primitives.js';
+export { RELEASE_NODE_COMMANDS } from '../../scripts/release-loop/runner-release-node-commands.js';
+export { activeReleaseCloudDeadline } from '../../scripts/release-loop/cloud-lease-deadline.js';
 export type { GraphGrowthScope, GraphNodeLifecycleEvent, GraphNodeLifecyclePhase, GraphRun, GraphRunOptions, GraphRunState } from './runner-types.js';
 
 type BashRun = WorkflowDeps['runBash'];
@@ -79,6 +89,7 @@ export function withGraphGrowthScope<T>(scope: GraphGrowthScope, work: () => T):
 }
 const DEFAULT_BASH_TIMEOUT_MS = 5 * 60 * 1_000;
 const eventBusSequences = new WeakMap<GraphEventBus, number>();
+const GRAPH_NODE_LIFECYCLE_EVENTS = new Set(['node-arrival', 'node-start', 'node-end', 'node-leave']);
 const fanOutDailyBudgetExemptRunIds = new Set<string>();
 
 function stableSha256(value: unknown): string {
@@ -194,60 +205,6 @@ function completionArtifactSnapshot(output: unknown, baseDir: string): { sha256:
   const valid = files.every((file) => file.sha256 !== null);
   return { sha256: stableSha256({ output, files }), valid };
 }
-
-// Independent of graph YAML and recipe snapshots: an already-wrong saved binding must fail closed.
-export const RELEASE_NODE_COMMANDS: Readonly<Record<string, Readonly<{ recipe: string; command?: string }>>> = {
-  'version-release': { recipe: 'cmd:version-release', command: 'bun scripts/release-loop/version-node.ts release --json' },
-  'readiness-countdown': { recipe: 'cmd:readiness-countdown', command: 'bun scripts/release-loop/release-readiness.ts --image-t60-hold' },
-  'traffic-cut-start': { recipe: 'cmd:traffic-cut-start', command: 'bun scripts/release-loop/traffic-node.ts traffic-cut-start' },
-  cutoff: { recipe: 'cmd:cutoff', command: 'bun scripts/release-loop/node-verdict.ts cutoff' },
-  'rla-cloud-join': { recipe: 'cmd:cloud-join', command: 'bun scripts/release-loop/hand-response-node.ts rla-cloud-join' },
-  'checklist-gate': { recipe: 'cmd:checklist-gate', command: 'bun scripts/release-loop/checklist-gate-node.ts' },
-  tsc: { recipe: 'cmd:tsc', command: 'bun run scripts/ci-typecheck-changed.ts' },
-  ratchet: { recipe: 'cmd:ratchet', command: 'bash scripts/ratchets/train-side-invariants.sh' },
-  prefetch: { recipe: 'cmd:docs', command: 'bun scripts/release-loop/docs-node.ts --json' },
-  'pre-gate-join': { recipe: 'none' },
-  gate: { recipe: 'cmd:gate', command: 'bun scripts/release-loop/gate-node.ts --json' },
-  'emergency-switch': { recipe: 'cmd:emergency-switch', command: 'bun scripts/release-loop/emergency-publish-switch-sim.ts' },
-  'emergency-gate': { recipe: 'cmd:emergency-gate', command: 'bun scripts/release-loop/emergency-publish-gate-node.ts' },
-  'receipt-audit': { recipe: 'cmd:receipt-audit', command: 'bun scripts/release-loop/gate-file-receipt-audit-node.ts' },
-  'residual-run': { recipe: 'cmd:gate', command: 'bun scripts/release-loop/gate-node.ts --json' },
-  'receipt-audit-recheck': { recipe: 'cmd:receipt-audit', command: 'bun scripts/release-loop/gate-file-receipt-audit-node.ts' },
-  'traffic-gate-passed': { recipe: 'cmd:traffic-gate-passed', command: 'bun scripts/release-loop/traffic-node.ts traffic-gate-passed' },
-  'gate-triage': { recipe: 'cmd:gate-triage', command: 'bun scripts/release-loop/gate-triage-node.ts' },
-  'gate-repair-recovery': { recipe: 'approval:repair-recovery' },
-  'gate-heal-decision': { recipe: 'approval:gate-heal-decision' },
-  'gate-same-run-recheck': { recipe: 'cmd:gate-same-run-recheck', command: 'bun scripts/release-loop/gate-same-run-recheck-node.ts' },
-  'mac-smoke': { recipe: 'cmd:mac-smoke', command: 'bun scripts/release-loop/mac-smoke-node.ts' },
-  'export-check': { recipe: 'cmd:export-check', command: 'bun scripts/release-loop/export-check-node.ts' },
-  pwa: { recipe: 'cmd:pwa', command: 'bun scripts/release-loop/node-verdict.ts pwa' },
-  'pre-prepare-join': { recipe: 'none' },
-  prepare: { recipe: 'cmd:prepare', command: 'bun scripts/release-loop/prepare-node.ts' },
-  upgrade: { recipe: 'cmd:upgrade', command: 'bun scripts/release-loop/upgrade-node.ts' },
-  tui: { recipe: 'cmd:docs', command: 'bun scripts/release-loop/docs-node.ts --json' },
-  docs: { recipe: 'cmd:docs', command: 'bun scripts/release-loop/docs-node.ts --json' },
-  'known-issues': { recipe: 'cmd:known-issues', command: 'bun scripts/release-loop/known-issues-node.ts' },
-  'notes-check': { recipe: 'cmd:notes-check', command: 'bun scripts/announce-loop/check-node.ts --json' },
-  'notes-repair': { recipe: 'cmd:docs', command: 'bun scripts/release-loop/docs-node.ts --json' },
-  'notes-recheck': { recipe: 'cmd:notes-check', command: 'bun scripts/announce-loop/check-node.ts --json' },
-  'auto-approve': { recipe: 'cmd:auto-approve', command: 'bun scripts/release-loop/auto-approve-node.ts' },
-  'approve-publish': { recipe: 'approval:publish' },
-  'approve-continue': { recipe: 'approval:continue-publish' },
-  publish: { recipe: 'cmd:publish-command', command: 'bun scripts/release-loop/publish-node.ts' },
-  'npm-publish': { recipe: 'cmd:npm-publish', command: 'bun scripts/release-loop/npm-publish-node.ts' },
-  'traffic-npm-published': { recipe: 'cmd:traffic-npm-published', command: 'bun scripts/release-loop/traffic-node.ts traffic-npm-published' },
-  'release-post-publish-join': { recipe: 'none' },
-  'docs-land': { recipe: 'cmd:docs-land', command: 'bun scripts/release-loop/docs-land-node.ts' },
-  verify: { recipe: 'cmd:verify', command: 'bun scripts/release-loop/verify-node.ts' },
-  'traffic-verify-complete': { recipe: 'cmd:traffic-verify-complete', command: 'bun scripts/release-loop/traffic-node.ts traffic-verify-complete' },
-  'traffic-failed-restore': { recipe: 'cmd:traffic-failed-restore', command: 'bun scripts/release-loop/traffic-node.ts traffic-failed-restore' },
-  'vault-note': { recipe: 'cmd:vault-note', command: 'bun scripts/release-loop/vault-note-node.ts' },
-  'release-story': { recipe: 'cmd:release-story', command: 'bun scripts/release-story/draft.ts --graph' },
-  'ops-upgrade': { recipe: 'cmd:ops-upgrade', command: 'bun scripts/release-loop/ops-upgrade-node.ts' },
-  'version-dev-bump': { recipe: 'cmd:version-dev-bump', command: 'bun scripts/release-loop/version-node.ts dev-bump --json' },
-  done: { recipe: 'none' },
-  failed: { recipe: 'none' },
-};
 
 function releasePluginCommandBinding(node: GraphNodeSpec, manifest?: GraphManifestDeclaration): Readonly<{ recipe: string; command?: string }> | undefined {
   const path = fileURLToPath(new URL('../../graphs/release/node-command-bindings.json', import.meta.url));
@@ -580,7 +537,7 @@ function recipesFor(path: string, recipeSource: string): Record<string, Recipe> 
   return recipes;
 }
 
-function realRunBash(onSpawn: (pid: number) => boolean): BashRun {
+export function realRunBash(onSpawn: (pid: number) => boolean): BashRun {
   return (body, opts) => new Promise((resolve, reject) => {
     let unverified: ReturnType<typeof setTimeout> | undefined;
     const child = execFile('/bin/bash', ['-c', body], { cwd: opts.cwd, env: opts.env, timeout: opts.timeoutMs, signal: opts.signal, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -1223,9 +1180,77 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const graphsDir = join(item.path, 'graphs');
     return existsSync(graphsDir) && graphFile.startsWith(`${realpathSync(graphsDir)}${sep}`);
   });
-  const credentials = owner ? pluginEnv(owner.name, pluginRoot) : {};
-  const redactCredentials = (text: string) => Object.values(credentials).filter(value => value.length > 0)
-    .reduce((safe, value) => safe.replaceAll(value, '[REDACTED]'), text);
+  const credentials: Record<string, string> = owner ? pluginEnv(owner.name, pluginRoot) : {};
+  const graphSecretValues = new Set<string>();
+  const allCredentialValues = () => [...new Set([...Object.values(credentials), ...graphSecretValues])].filter(value => value.length > 0);
+  const redactValues = (text: string, values: string[], protectedValues: string[] = values): string => {
+    if (!values.length) return text;
+    const protectedVariants = protectedValues.flatMap(value => [value, JSON.stringify(value).slice(1, -1)]).filter(Boolean);
+    let marker = '[REDACTED]';
+    if (protectedVariants.some(value => value.includes(marker) || marker.includes(value))) {
+      const privateUseRanges: Array<[number, number]> = [[0xe000, 0xf8ff], [0xf0000, 0xffffd], [0x100000, 0x10fffd]];
+      marker = '';
+      for (const [start, end] of privateUseRanges) {
+        for (let codePoint = start; codePoint <= end; codePoint++) {
+          const candidate = String.fromCodePoint(codePoint);
+          if (!protectedVariants.some(value => value.includes(candidate))) { marker = candidate.repeat(3); break; }
+        }
+        if (marker) break;
+      }
+    }
+    if (!marker) throw new Error('unable to select a safe secret redaction token');
+    const safe = values.reduce((result, value) => {
+      const escaped = JSON.stringify(value).slice(1, -1);
+      return result.replaceAll(value, marker).replaceAll(escaped, marker);
+    }, text);
+    return protectedVariants.some(value => safe.includes(value)) ? marker : safe;
+  };
+  const redactCredentials = (text: string) => {
+    const values = allCredentialValues();
+    return redactValues(text, values, values);
+  };
+  const redactStructuredValue = (value: unknown): unknown => {
+    if (typeof value === 'string') return redactCredentials(value);
+    if (Array.isArray(value)) return value.map(redactStructuredValue);
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value)
+      .map(([key, child]) => [redactCredentials(key), redactStructuredValue(child)]));
+    return value;
+  };
+  const redactSerializedJson = (value: unknown): string | undefined => {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) return undefined;
+    // Normalize with the original JSON semantics first (including Date/toJSON), then redact actual string values.
+    return JSON.stringify(redactStructuredValue(JSON.parse(serialized)));
+  };
+  const redactCommandOutput = (text: string): string => {
+    try {
+      const safeJson = redactSerializedJson(JSON.parse(text));
+      if (safeJson !== undefined) return safeJson;
+    } catch { /* Non-JSON command output remains text and uses literal redaction. */ }
+    const allValues = allCredentialValues();
+    const multilineValues = allValues.filter(value => /[\r\n]/.test(value));
+    const textWithoutMultilineSecrets = redactValues(text, multilineValues, allValues);
+    return textWithoutMultilineSecrets.split('\n').map(line => {
+      try {
+        const safeJson = redactSerializedJson(JSON.parse(line));
+        if (safeJson !== undefined) return safeJson;
+      } catch { /* Keep ordinary command logs as text. */ }
+      return redactCredentials(line);
+    }).join('\n');
+  };
+  const resolveNodeSecrets = async (node: GraphNodeSpec): Promise<Record<string, string>> => {
+    const resolved: Record<string, string> = Object.create(null);
+    for (const [envName, secretName] of Object.entries(node.secrets ?? {})) {
+      let value: string | undefined;
+      try { value = await (options.deps?.resolveGraphSecret ?? getSecretAsync)(secretName); }
+      catch { throw new Error(`graph secret unavailable for node ${node.nodeId} (${envName})`); }
+      if (typeof value !== 'string' || value.length === 0)
+        throw new Error(`graph secret unavailable for node ${node.nodeId} (${envName})`);
+      resolved[envName] = value;
+      graphSecretValues.add(value);
+    }
+    return resolved;
+  };
   const declaredEnv = [...new Set(installed.map(item => item.name))]
     .flatMap(name => credentialStatus(name, pluginRoot).fields.map(field => field.env));
   const credentialFields = owner ? credentialStatus(owner.name, pluginRoot).fields.filter(field => field.set).map(field => field.name) : [];
@@ -1339,19 +1364,52 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   }, (event) => {
     if (!eventRunState || !eventRunOwner) return;
     eventRunState.pendingGraphEvents ??= [];
-    if (!eventRunState.pendingGraphEvents.some((pending) => pending.eventId === event.eventId))
+    const newlyPending = !eventRunState.pendingGraphEvents.some((pending) => pending.eventId === event.eventId);
+    if (newlyPending)
       eventRunState.pendingGraphEvents.push(event);
-    persistEventState(eventRunState, eventRunOwner);
+    try {
+      persistEventState(eventRunState, eventRunOwner);
+    } catch (error) {
+      // A rejected state write did not publish this event. A later leave event may
+      // still be durable, so do not replay this older sequence after that tail.
+      if (newlyPending) eventRunState.pendingGraphEvents = eventRunState.pendingGraphEvents.filter(
+        (pending) => pending.eventId !== event.eventId);
+      throw error;
+    }
+    appendGraphRunEvent(graphRunEventLedgerPath(root, graphId, runId), event);
   }, (_scope, eventIds) => {
     if (!eventRunState || !eventRunOwner || eventIds.length === 0) return;
     const delivered = new Set(eventIds);
+    const flushedEvents = (eventRunState.pendingGraphEvents ?? []).filter((event) => delivered.has(event.eventId));
     const pendingApproval = eventRunState.pending;
-    for (const event of eventRunState.pendingGraphEvents ?? []) {
-      if (pendingApproval && delivered.has(event.eventId) && event.type === 'release-stage' && event.data?.state === 'wait' &&
+    for (const event of flushedEvents) {
+      if (pendingApproval && event.type === 'release-stage' && event.data?.state === 'wait' &&
           pendingApproval.nodeId === event.source.nodeId && !pendingApproval.notifiedAt) {
         eventRunState.pending = { ...pendingApproval, notifiedAt: new Date().toISOString() };
       }
     }
+    const routableEvents = options.routeGraphEvents === false || (options.resumeRunId ? saved?.dryRun === true : options.dryRun === true) ? []
+      : flushedEvents.filter((event) => !GRAPH_NODE_LIFECYCLE_EVENTS.has(event.type));
+    const routingFailures = new Set<string>();
+    const routeAndAcknowledge = async (): Promise<void> => {
+      for (const event of routableEvents) {
+        try {
+          const { dispatchGraphEventToDeclaredTargets } = await import('../loops/graph-trigger-dispatch.js');
+          const graphRoot = options.graphEventTriggerRoot ?? (await import('../loops/registry.js')).defaultLoopRoot();
+          await dispatchGraphEventToDeclaredTargets(event, { graphRoot, registryRoot: root, stateRoot: root,
+            eventNow: options.eventNow });
+        } catch (error) {
+          routingFailures.add(event.eventId);
+          debug.log('graph.trigger-router', 'dispatch-failed', { graphId, runId, eventId: event.eventId,
+            type: event.type, error: String(error).slice(0, 300) }, { level: 'warn' });
+        }
+      }
+    };
+    if (routableEvents.length) return routeAndAcknowledge().then(() => {
+      eventRunState!.pendingGraphEvents = (eventRunState!.pendingGraphEvents ?? []).filter((event) =>
+        !delivered.has(event.eventId) || routingFailures.has(event.eventId));
+      persistEventState(eventRunState!, eventRunOwner!);
+    });
     eventRunState.pendingGraphEvents = (eventRunState.pendingGraphEvents ?? []).filter((event) => !delivered.has(event.eventId));
     persistEventState(eventRunState, eventRunOwner);
   });
@@ -1590,6 +1648,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   try {
   for (const eventType of saved?.adaptiveGraphVocabulary ?? []) if (!eventBus.hasType(eventType)) eventBus.registerType(eventType);
   registerGraphSubscriptionNodes(graph.nodes);
+  graphSubscriptionDisposers.push(registerGraphRunMsgSubscribers(eventBus,
+    { graphId, runId, dryRun: options.resumeRunId ? saved?.dryRun === true : options.dryRun === true }, root));
   if (eventBus && isReleaseLoop && useReleaseGraphEventAdapters) disposeReleaseGraphEventAdapters = registerReleaseGraphEventAdapters(eventBus,
     { graphId, runId, dryRun: options.resumeRunId ? saved?.dryRun === true : options.dryRun === true }, { root, ...(options.deps?.releaseStageMail ? { stageMail: options.deps.releaseStageMail } : {}),
       ...(options.deps?.log ? { log: options.deps.log } : {}) });
@@ -1623,6 +1683,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   eventRunState = state;
   eventRunOwner = runnerOwner;
   subscriptionRunState = state;
+  // Source: pendingGraphEvents survives a crash between the state write and journal append.
+  for (const pendingEvent of state.pendingGraphEvents ?? [])
+    appendGraphRunEvent(graphRunEventLedgerPath(root, graphId, runId), pendingEvent);
   if (options.fromVisitId) {
     const matches = state.nodes.filter((record) => record.executionId === options.fromVisitId);
     if (matches.length !== 1) throw new Error(`--from-visit must identify one saved node execution: ${options.fromVisitId}`);
@@ -2142,9 +2205,22 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   const appendAdaptiveGateNode = async (request: AdaptiveGateHealAppendNodeRequest): Promise<AdaptiveGateHealAppendNodeReceipt> => {
     const regressionRepair = request.node.recipe === 'cmd:gate-repair' && /^gate-repair-[a-f0-9]{12}$/.test(request.node.nodeId);
     const imageRepair = request.node.recipe === 'cmd:gate-image-repair' && /^gate-image-repair-[a-f0-9]{12}$/.test(request.node.nodeId);
+    const releaseInput = state.input as Record<string, unknown>;
+    const appendReentry = request.rerunGateAt === 'gate' && releaseInput.autoAppendRepair === true
+      && request.visitLimits.gate === 3 && request.visitLimits.gateTriage === 3
+      && typeof request.auditAfterGate === 'string'
+      && graph.nodes.some((node) => node.nodeId === request.auditAfterGate && node.kind === 'gate' && node.maxVisits >= 3)
+      && graph.edges.some((edge) => edge.from === request.rerunGateAt && edge.map?.ok === 'cloud-leave-ok')
+      && graph.edges.some((edge) => edge.from === 'cloud-leave-ok' && edge.map?.ok === 'gate-cutover-switch')
+      && graph.edges.some((edge) => edge.from === 'gate-cutover-switch' && edge.map?.audit === request.auditAfterGate);
+    const legacyReentry = request.rerunGateAt === 'gate'
+      && request.auditAfterGate === undefined
+      && ((request.visitLimits.gate === 2 && request.visitLimits.gateTriage === 2)
+        || (imageRepair && releaseInput.autoAppendRepair === true
+          && request.visitLimits.gate === 3 && request.visitLimits.gateTriage === 3));
     if (!isReleaseLoop || state.dryRun || request.graphId !== graphId || request.runId !== runId ||
-      request.afterNodeId !== 'gate-triage' || request.resumeFrom !== request.node.nodeId || request.rerunGateAt !== 'gate' ||
-      request.maxRepairRetries !== 1 || request.visitLimits.gate !== 2 || request.visitLimits.gateTriage !== 2 ||
+      request.afterNodeId !== 'gate-triage' || request.resumeFrom !== request.node.nodeId ||
+      !(appendReentry || legacyReentry) || request.maxRepairRetries !== 1 ||
       request.node.kind !== 'agent' || request.node.maxVisits !== 1 || !(regressionRepair || imageRepair)) {
       throw new Error('adaptive gate append request is outside the release ARG contract');
     }
@@ -2180,7 +2256,6 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const attributedRepairValid = regressionRepair && commonPlanValid && Array.isArray(attributedFailureIds)
       && Array.isArray(triagedIntroduced)
       && JSON.stringify([...attributedFailureIds].sort()) === JSON.stringify([...triagedIntroduced].sort());
-    const releaseInput = state.input as Record<string, unknown>;
     const gateError = typeof gateRecord.error === 'string' ? gateRecord.error : '';
     const imageFailureCode = nodeInput.failureCode;
     const imageRepairValid = imageRepair && commonPlanValid && gateRecord.outcome === 'error' &&
@@ -2237,7 +2312,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   };
   const rerunAdaptiveGateOnPod = async (request: AdaptiveGateHealRerunGateRequest): Promise<{ disposition: 'queued' | 'already-queued' }> => {
     if (!isReleaseLoop || state.dryRun || request.graphId !== graphId || request.runId !== runId || request.resumeFrom !== 'gate'
-      || request.visitLimits.gate !== 2 || request.visitLimits.gateTriage !== 2 || !request.gatePodPool.trim())
+      || !([2, 3].includes(request.visitLimits.gate) && request.visitLimits.gate === request.visitLimits.gateTriage)
+      || !request.gatePodPool.trim())
       throw new Error('adaptive gate Pod rerun request is outside the release ARG contract');
     const prior = state.adaptiveGateReruns?.find((rerun) => rerun.eventId === request.eventId);
     if (prior) {
@@ -2286,18 +2362,45 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (process.env.ELANOUS_RLA_ARG_LIVE !== '1' || state.dryRun ||
         releaseGateCutoverPath(input) !== 'audit') return;
     const { runArgSupervisorTick } = await import('./arg-supervisor.js');
+    const feedbackIdentity: ArgFeedbackIdentity = { member: 'loop:rla@1',
+      universe: options.deps?.argFeedbackUniverse ?? (getTestStateRoot() ? 'test' : 'prod'), template: graphId };
+    const feedbackLedger = new ArgFeedbackLedger(root, feedbackIdentity);
+    const feedbackTriage = event.data?.triage;
+    const feedbackReason = feedbackTriage && typeof feedbackTriage === 'object' &&
+      !Array.isArray(feedbackTriage) && typeof (feedbackTriage as { reason?: unknown }).reason === 'string'
+      ? (feedbackTriage as { reason: string }).reason : '';
+    const feedbackFor = (effect: 'retry-edge' | 'vocabulary') => ({ ledger: feedbackLedger,
+      signature: { nodeId: 'gate-triage', testName: 'release-gate',
+        errorSignature: `${effect}:${stableSha256({ classification: plan.attribution.classification,
+          failureIds: plan.attribution.failureIds, reason: feedbackReason })}` },
+      readCommitted: (targetRunId: string, signature: { nodeId: string; testName: string; errorSignature: string }) =>
+        readDurableArgFeedbackOutcome(root, feedbackIdentity, targetRunId, signature) });
     const beforeRevision = state.graphRevision ?? 1;
     const beforeVocabulary = [...(state.adaptiveGraphVocabulary ?? [])];
     const beforeEdges = [...(state.adaptiveGraphEdges ?? [])];
     const beforeGraph = graph;
+    let fallbackRevision = beforeRevision;
+    let fallbackVocabulary = beforeVocabulary;
+    let fallbackEdges = beforeEdges;
+    let fallbackGraph = beforeGraph;
     const vocabularyOverlayPath = join(`${state.statePath}.graph`, 'release-edge-vocabulary.yaml');
-    const priorVocabularyOverlay = existsSync(vocabularyOverlayPath) ? readFileSync(vocabularyOverlayPath, 'utf8') : undefined;
+    let fallbackVocabularyOverlay = existsSync(vocabularyOverlayPath) ? readFileSync(vocabularyOverlayPath, 'utf8') : undefined;
+    const markFeedbackCommitted = (): void => {
+      fallbackRevision = state.graphRevision ?? fallbackRevision;
+      fallbackVocabulary = [...(state.adaptiveGraphVocabulary ?? [])];
+      fallbackEdges = [...(state.adaptiveGraphEdges ?? [])];
+      fallbackGraph = graph;
+      try { fallbackVocabularyOverlay = existsSync(vocabularyOverlayPath) ? readFileSync(vocabularyOverlayPath, 'utf8') : undefined; }
+      catch (error) {
+        throw new ArgFeedbackDurabilityError(`ARG feedback committed but graph overlay snapshot is unreadable: ${String(error)}`);
+      }
+    };
     const restoreVocabularyOverlay = (): void => {
-      if (priorVocabularyOverlay === undefined) {
+      if (fallbackVocabularyOverlay === undefined) {
         if (existsSync(vocabularyOverlayPath)) unlinkSync(vocabularyOverlayPath);
       } else {
         const temporary = `${vocabularyOverlayPath}.${randomUUID()}.tmp`;
-        writeFileSync(temporary, priorVocabularyOverlay);
+        writeFileSync(temporary, fallbackVocabularyOverlay);
         renameSync(temporary, vocabularyOverlayPath);
       }
     };
@@ -2312,6 +2415,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       const result = await runArgSupervisorTick({ loopPath: resolve(dirname(path), 'rla/loop.yaml'), root,
         targetGraphId: graphId, targetRunId: runId, gateEventId: event.eventId,
         graphRevision: beforeRevision, operation: 'reroute', mutableState: state,
+        feedback: { ...feedbackFor('retry-edge'), onCommitted: markFeedbackCommitted },
         ports: {
           persist: () => { graph = withAdaptiveGraphEdges(beforeGraph,
             state.adaptiveGraphEdges ?? [], state.adaptiveGraphVocabulary ?? []); persist(); },
@@ -2326,6 +2430,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
             ? ok('retry edge durable before Pod scheduler') : { outcome: 'fail', evidence: 'retry edge missing' },
         } });
       if (result.graphRun.path.at(-1) !== 'done') throw new Error('RLA tick did not verify the retry edge');
+      markFeedbackCommitted();
       }
       const triage = event.data?.triage;
       if (callLLM && triage && typeof triage === 'object' && !Array.isArray(triage) &&
@@ -2336,6 +2441,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         const open = await runArgSupervisorTick({ loopPath: resolve(dirname(path), 'rla/loop.yaml'), root,
           targetGraphId: graphId, targetRunId: runId, gateEventId: event.eventId,
           graphRevision: openBefore, operation: 'reroute', mutableState: state,
+          feedback: { ...feedbackFor('vocabulary'), onCommitted: markFeedbackCommitted },
           vocabularyOverlay: { sourcePath: resolve(dirname(path), 'release-edge-vocabulary.yaml'), path: vocabularyOverlayPath },
           openProposal: { observation: { gate: event.data?.gate, triage, plan: plan.disposition }, memory, callLLM },
           ports: {
@@ -2370,14 +2476,21 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           restoreVocabularyOverlay();
           persist();
         } else {
+          markFeedbackCommitted();
           for (const term of state.adaptiveGraphVocabulary ?? []) if (!eventBus.hasType(term)) eventBus.registerType(term);
         }
       }
     } catch (error) {
-      state.adaptiveGraphEdges = beforeEdges;
-      state.adaptiveGraphVocabulary = beforeVocabulary;
-      state.graphRevision = beforeRevision;
-      graph = beforeGraph;
+      if (error instanceof ArgFeedbackDurabilityError) {
+        try { (options.deps?.log ?? ((name, data) => debug.log('graph.runner', name, data)))('rla-arg-feedback-durability-unknown',
+          { graphId, runId, eventId: event.eventId, reason: String(error), graphRevision: state.graphRevision }); }
+        catch { /* diagnostic only */ }
+        throw error;
+      }
+      state.adaptiveGraphEdges = fallbackEdges;
+      state.adaptiveGraphVocabulary = fallbackVocabulary;
+      state.graphRevision = fallbackRevision;
+      graph = fallbackGraph;
       restoreVocabularyOverlay();
       persist();
       try { (options.deps?.log ?? ((name, data) => debug.log('graph.runner', name, data)))('rla-arg-legacy-fallback',
@@ -2538,7 +2651,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     state.status = 'running';
     const startedAt = performance.now();
-    const nodeStartedAt = new Date().toISOString();
+    // Keep persisted node timestamps strictly ordered even when adjacent nodes finish in one clock tick.
+    const priorNodeEndedAt = [...state.nodes].reverse()
+      .map((record) => Date.parse(record.endedAt ?? ''))
+      .find((timestamp) => Number.isFinite(timestamp));
+    const nodeStartedAt = new Date(Math.max(Date.now(), (priorNodeEndedAt ?? 0) + 1)).toISOString();
     if (!resumingCompleted) state.currentNode = { nodeId: current, executionId, startedAt: nodeStartedAt };
     await emitVisitLifecycle('start', current, visit);
     if (!options.quiet) console.error(`[graph] ${current} start (0.00s)`);
@@ -2572,6 +2689,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     let exit: number | null = null;
     let error: string | undefined;
     let commandFailureReason: string | undefined;
+    let commandReportedOutcome: unknown;
     let output: unknown;
     if (operatorNoGo) {
       exit = 1;
@@ -2629,6 +2747,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const capabilityName = node.kind === 'capability' && !requiredContract ? capabilityNameFromRecipe(node.recipe) : undefined;
     const inProcessHandler = capabilityName || requiredContract ? undefined : requireInProcessHandler(node.recipe, current, options.deps?.inProcessHandlers);
     let handlerExecuted = false;
+    let reportedNodeOutcome: unknown;
     if ((inProcessHandler || capabilityName || requiredContract) && !operatorNoGo && !waiving && !state.dryRun && !resumingCompleted) {
       const eventNodeId = node.nodeId;
       const outputs: Record<string, unknown> = Object.assign(Object.create(null), options.branchParentOutputs ?? {});
@@ -2636,16 +2755,34 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       for (const fanout of Object.values(state.fanOuts ?? {})) for (const [branchId, branch] of Object.entries(fanout.branches))
         if (branch.output !== undefined) outputs[branchId] = lastJsonObject(branch.output) ?? branch.output;
       const mapBinding = bindGraphV2StaticMapItem(node.input, outputs);
+      const graphInputForBinding = state.input && typeof state.input === 'object'
+        ? { ...(state.input as Record<string, unknown>), context: {
+          ...((state.input as Record<string, unknown>).context && typeof (state.input as Record<string, unknown>).context === 'object'
+            ? (state.input as Record<string, unknown>).context as Record<string, unknown> : {}),
+          nodeStartedAt,
+        } } : state.input;
       handlerExecuted = true;
       debug.log('graph.run', 'handler-dispatch', { graphId, runId, nodeId: current, recipe: node.recipe });
       try {
+        const nodeSecrets = await resolveNodeSecrets(node);
         const handlerContext = { graphId, runId, nodeId: current, input: state.input ?? null,
+          ...(Object.keys(nodeSecrets).length ? { secrets: nodeSecrets } : {}),
           ...(node.requires === undefined ? {} : { requires: node.requires }),
-          ...(Object.hasOwn(node, 'input') ? { nodeInput: mapBinding.nodeInput } : {}), outputs,
-          ...(eventBus === undefined ? {} : { emitEvent: (type: string, data?: Readonly<Record<string, unknown>>) => publishNodeGraphEvent(eventBus,
-            { graphId, runId, type, source: { kind: 'node', nodeId: eventNodeId }, ...(data === undefined ? {} : { data }) }, node.emits ?? []) }) };
+          ...(Object.hasOwn(node, 'input') ? { nodeInput: mapBinding.skipped
+            ? mapBinding.nodeInput : node.kind === 'capability'
+              ? requiredContract === 'store.write@1'
+                ? bindGraphV2StoreWriteInput(mapBinding.nodeInput, graphInputForBinding, outputs)
+                : bindGraphV2NodeInput(mapBinding.nodeInput, graphInputForBinding, outputs)
+              : mapBinding.nodeInput } : {}), outputs,
+          ...(eventBus === undefined ? {} : { emitEvent: (type: string, data?: Readonly<Record<string, unknown>>) => {
+            const safeDataText = data === undefined ? undefined : redactSerializedJson(data);
+            const safeData = safeDataText === undefined ? undefined : JSON.parse(safeDataText) as Record<string, unknown>;
+            return publishNodeGraphEvent(eventBus,
+              { graphId, runId, type, source: { kind: 'node', nodeId: eventNodeId }, ...(safeData === undefined ? {} : { data: safeData }) }, node.emits ?? []);
+          } }) };
         if (mapBinding.skipped) {
           output = JSON.stringify({ evidence: { mapItemSkipped: true, ...mapBinding.skipped }, outcome: 'done' });
+          reportedNodeOutcome = 'done';
           ok = true;
           exit = 0;
         } else {
@@ -2658,12 +2795,13 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
           await eventBus?.flush({ graphId, runId });
           if (!result || typeof result.ok !== 'boolean' || typeof result.outcome !== 'string' || !result.outcome.trim())
             throw new Error(`invalid in-process handler result: ${current}`);
-          output = JSON.stringify({ ...(result.result === undefined ? {} : { result: result.result }),
+          reportedNodeOutcome = result.outcome;
+          output = redactSerializedJson({ ...(result.result === undefined ? {} : { result: result.result }),
             ...(result.evidence === undefined ? {} : { evidence: result.evidence }), outcome: result.outcome,
-            ...(result.error ? { error: result.error } : {}) });
+            ...(result.error ? { error: result.error } : {}) }) ?? 'null';
           ok = result.ok;
           exit = ok ? 0 : 1;
-          error = result.error;
+          error = result.error ? redactCredentials(result.error) : undefined;
         }
       } catch (cause) {
         ok = false;
@@ -2675,7 +2813,14 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         outcome: lastJsonObject(output)?.outcome ?? null, ...(error ? { error } : {}) });
       state.executed++;
     }
-    if (command && !operatorNoGo && !waiving && (!approval || state.dryRun || ok) && (!state.dryRun || command.dry_run_command) && !resumingCompleted) {
+    let commandSecrets: Record<string, string> = {};
+    let commandSecretError: string | undefined;
+    if (command && Object.keys(node.secrets ?? {}).length > 0 && !operatorNoGo && !waiving &&
+      (!approval || state.dryRun || ok) && (!state.dryRun || command.dry_run_command) && !resumingCompleted) {
+      try { commandSecrets = await resolveNodeSecrets(node); }
+      catch (cause) { commandSecretError = redactCredentials(cause instanceof Error ? cause.message : 'graph secret unavailable'); }
+    }
+    if (command && !commandSecretError && !operatorNoGo && !waiving && (!approval || state.dryRun || ok) && (!state.dryRun || command.dry_run_command) && !resumingCompleted) {
       const outputs: Record<string, unknown> = Object.assign(Object.create(null), options.branchParentOutputs ?? {});
       // 구조 산출(마지막 JSON 줄)이 있으면 그것을, 없으면 원문을 준다 — 다음 노드가 판단을 «값»으로 받는다.
       for (const previous of state.nodes) outputs[previous.nodeId] = lastJsonObject(previous.output) ?? previous.output ?? null;
@@ -2857,7 +3002,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
             : redactCredentials;
           const stderr = scrubCommandDiagnostic(result.stderr);
           commandFailureReason = failedCommandStderrTail(result.exitCode, stderr);
-          return { ...result, stdout: redactCredentials(result.stdout), stderr };
+          return { ...result, stderr };
         } finally {
           readingProgress = false;
           await progressPump;
@@ -2871,6 +3016,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       const env = { ...process.env };
       for (const key of declaredEnv) delete env[key];
       Object.assign(env, credentials);
+      Object.assign(env, commandSecrets);
       // An explicit --config-dir is process-local. Pin its effective root via the
       // state stamp so a cmd: child resolves its default config in the same universe.
       // The ignored config-dir environment variable must not appear to propagate the flag.
@@ -2889,18 +3035,31 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       env.ELANOUS_GRAPH_CONTEXT = contextPath;
       env.ELANOUS_GRAPH_DRY_RUN = state.dryRun ? '1' : '0';
       env.ELANOUS_GRAPH_DIR = dirname(resolve(path));
+      env.ELANOUS_RUNTIME_ROOT = resolve(import.meta.dir, '../..');
       const ctx = { arguments: '', artifactsDir: dirname(statePath), outputs: {}, resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {}, env,
         ...(options.signal ? { signal: options.signal } : {}) } as NodeExecContext;
+      const cloudDeadlineAt = isReleaseLoop && current === 'gate' ? activeReleaseCloudDeadline(state.nodes) : undefined;
+      const remainingCloudLeaseMs = typeof cloudDeadlineAt === 'number' ? cloudDeadlineAt - Date.now() : undefined;
+      const nodeTimeoutMs = remainingCloudLeaseMs === undefined
+        ? command.timeout_ms ?? DEFAULT_BASH_TIMEOUT_MS
+        : Math.max(1, Math.min(command.timeout_ms ?? DEFAULT_BASH_TIMEOUT_MS, remainingCloudLeaseMs));
       const result = await executeBashNode({ id: current, type: 'bash', bash: state.dryRun ? command.dry_run_command! : command.command,
-        idle_timeout: command.timeout_ms ?? DEFAULT_BASH_TIMEOUT_MS } as BashNode, ctx, { runBash } as WorkflowDeps);
-      output = result.output;
-      if (isReleaseLoop && (current === 'gate' || current === 'residual-run') && typeof output === 'string') {
-        const gateOutput = lastJsonObject(output);
+        idle_timeout: nodeTimeoutMs } as BashNode, ctx, { runBash } as WorkflowDeps);
+      const rawCommandOutput = result.output;
+      commandReportedOutcome = lastJsonObject(rawCommandOutput)?.outcome;
+      output = typeof rawCommandOutput === 'string' ? redactCommandOutput(rawCommandOutput)
+        : redactSerializedJson(rawCommandOutput) ?? rawCommandOutput;
+      if (isReleaseLoop && current === 'gate' && cloudDeadlineAt !== undefined && !result.ok && Date.now() >= cloudDeadlineAt) {
+        // A timed-out bash child has no verdict JSON; record the runner's deadline failure so triage can clean up the lease.
+        output = JSON.stringify({ outcome: 'fail', verdict: 'fail', summary: 'approved cloud VM lease deadline elapsed', executionId });
+      }
+      if (isReleaseLoop && (current === 'gate' || current === 'residual-run') && typeof rawCommandOutput === 'string') {
+        const gateOutput = lastJsonObject(rawCommandOutput);
         if (gateOutput) {
           if (gateOutput.executionId !== undefined && gateOutput.executionId !== executionId) {
             throw new Error('gate output execution id does not match the current gate execution (gate or residual-run)');
           }
-          output = JSON.stringify({ ...gateOutput, executionId });
+          output = redactCommandOutput(JSON.stringify({ ...gateOutput, executionId }));
         }
       }
       ok = result.ok;
@@ -2909,6 +3068,12 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         ? scrubReleaseFailureText(result.error, options.deps?.root ?? process.cwd(), redactCredentials)
         : redactCredentials(result.error)) : undefined;
       state.executed++;
+    }
+    if (commandSecretError) {
+      ok = false;
+      exit = 1;
+      error = commandSecretError;
+      output = JSON.stringify({ outcome: 'fail', error });
     }
     let unitExecuted = false;
     const plannedStep: PlannedStep | undefined = harnessLoopRoute?.get(current);
@@ -2983,7 +3148,6 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       if (optionalInputMissing && unit.template.unit!.exits.includes('skip')) {
         output = JSON.stringify({ outcome: 'skip', verdict: 'skip', reason: 'candidate-path-unavailable', receiptPath: '' });
         ok = true;
-        state.executed++;
       } else if (allowance.kind === 'needs-human') {
         const exitName = unit.template.unit!.exits.includes('needs-human') ? 'needs-human'
           : unit.template.unit!.exits.includes('rework') ? 'rework' : undefined;
@@ -3145,10 +3309,66 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (resumingCompleted && completed) {
       ok = completed.ok;
       exit = completed.exit;
-      output = completed.output;
+      const persistedOutcome = lastJsonObject(completed.output)?.outcome;
+      if (command) commandReportedOutcome = persistedOutcome;
+      else if (inProcessHandler || capabilityName || requiredContract) reportedNodeOutcome = persistedOutcome;
+      // Older ledgers may contain a redacted outcome but predate resumeNextNode. Only query
+      // credentials when the saved outcome visibly contains a redaction marker.
+      const privateUseMarker = typeof persistedOutcome === 'string'
+        && /[\uE000-\uF8FF]{3}|[\u{F0000}-\u{FFFFD}]{3}|[\u{100000}-\u{10FFFD}]{3}/u.test(persistedOutcome);
+      const hasRedactionMarker = typeof persistedOutcome === 'string'
+        && (persistedOutcome.includes('[REDACTED]') || privateUseMarker);
+      if (hasRedactionMarker && typeof completed.resumeNextNode !== 'string' && typeof completed.commandNextNode !== 'string'
+          && Object.keys(node.secrets ?? {}).length > 0) {
+        const declaredRoutes = new Set(graph.edges.filter(edge => edge.from === current)
+          .flatMap(edge => [...Object.keys(edge.map ?? {}), ...Object.keys(edge.branches ?? {})]));
+        if (declaredRoutes.size) {
+          const oldNodeSecrets = await resolveNodeSecrets(node);
+          const secretValues = Object.values(oldNodeSecrets).filter(value => value.length > 0);
+          const matchingRoutes = [...declaredRoutes].filter(route => redactCredentials(route) === persistedOutcome);
+          if (matchingRoutes.length === 1 && secretValues.some(secret => matchingRoutes[0]!.includes(secret))) {
+            if (command) commandReportedOutcome = matchingRoutes[0];
+            else if (inProcessHandler || capabilityName || requiredContract) reportedNodeOutcome = matchingRoutes[0];
+          } else {
+            state.status = 'failed';
+            state.reason = 'secret-redacted outcome cannot be safely recovered for resume routing';
+            persist();
+            throw new Error(state.reason);
+          }
+        }
+      }
+      output = command && typeof completed.output === 'string' ? redactCommandOutput(completed.output)
+        : typeof completed.output === 'string' ? redactCredentials(completed.output)
+        : redactSerializedJson(completed.output) ?? completed.output;
+      completed.output = output;
       error = completed.error;
       commandFailureReason = completed.reason;
     } else {
+      if (isReleaseLoop && (state.input as Record<string, unknown> | undefined)?.autoAppendRepair === true
+        && /^gate-repair-[a-f0-9]{12}$/.test(current) && ok) {
+        const repair = lastJsonObject(output);
+        const picks = repair?.appendedPicks;
+        const repairs = repair?.repairs;
+        const repairedFiles = repair?.repairedFiles;
+        const picked = Array.isArray(picks) && picks.length > 0 && picks.every((pick) =>
+          typeof pick === 'string' && /^[a-f0-9]{40}$/i.test(pick)) && new Set(picks).size === picks.length;
+        const repairProof = Array.isArray(repairs) && repairs.length > 0 && repairs.every((entry) =>
+          !!entry && typeof entry === 'object' && !Array.isArray(entry)
+          && (entry as Record<string, unknown>).status === 'repaired'
+          && typeof (entry as Record<string, unknown>).mergeSha === 'string'
+          && /^[a-f0-9]{40}$/i.test((entry as Record<string, unknown>).mergeSha as string))
+          && JSON.stringify((repairs as Array<Record<string, unknown>>).map((entry) => entry.mergeSha).sort())
+            === JSON.stringify((picks as string[] | undefined)?.slice().sort());
+        if (repair?.requiresReceiptAudit !== true || typeof repair.commit !== 'string'
+          || !/^[a-f0-9]{40}$/i.test(repair.commit) || !picked || !repairProof
+          || !Array.isArray(repairedFiles) || repairedFiles.length === 0
+          || !repairedFiles.every((file) => typeof file === 'string' && file.length > 0)) {
+          ok = false;
+          exit = 1;
+          error = 'automatic repair did not prove a cut append and receipt-audit reentry';
+          output = JSON.stringify({ outcome: 'fail', verdict: 'fail', summary: error });
+        }
+      }
       // 승인 노드도 결과를 «값»으로 남긴다 — 뒤 노드가 문맥(outputs)에서 승인 여부를 확인할 수 있게(발행 노드가 승인 없이 돌지 않도록).
       if (approval && !state.dryRun && !command) {
         const rejectionReason = state.pending?.decision === 'rejected'
@@ -3211,25 +3431,33 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       delete state.pending;
       delete state.approvalSourceHash;
     }
-    const reported: unknown = joinedFanout || waiving || approval || harnessLoopRoute || units.has(current) || handlerExecuted || (resumingCompleted && inProcessHandler) || (prompt && !state.dryRun) || (command && (!state.dryRun || command.dry_run_command)) ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
+    const reportsOutcome = joinedFanout || waiving || approval || harnessLoopRoute || units.has(current) || handlerExecuted ||
+      (resumingCompleted && (inProcessHandler || capabilityName || requiredContract)) || (prompt && !state.dryRun) ||
+      (command && (!state.dryRun || command.dry_run_command));
+    const reported: unknown = !reportsOutcome ? undefined
+      : commandReportedOutcome !== undefined ? commandReportedOutcome
+        : reportedNodeOutcome !== undefined ? reportedNodeOutcome
+          : lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome;
     // A dry run never executes the switch recipe; preview its pinned policy choice instead.
     const dryRunCutover = state.dryRun && graphId === 'release-loop' && current === 'gate-cutover-switch'
       ? releaseGateCutoverPath(state.input) : undefined;
     const namedOutcome: string | undefined = typeof dryRunCutover === 'string' ? dryRunCutover
       : typeof reported === 'string' ? reported : undefined;
+    const publicOutcome = namedOutcome === undefined ? undefined : redactCredentials(namedOutcome);
+    const outcomeIsSecret = namedOutcome !== undefined && publicOutcome !== namedOutcome;
     if (!options.quiet) console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
     const nodeFailure = state.nodes.at(-1)?.nodeId === current ? state.nodes.at(-1)?.failure : undefined;
     const nodeReason = state.nodes.at(-1)?.nodeId === current ? state.nodes.at(-1)?.reason : undefined;
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit,
       ...(nodeReason ? { reason: nodeReason } : {}), ...(nodeFailure ? { failure: nodeFailure } : {}) });
     publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds });
-    publishInsideEvent({ kind: 'verdict', graphId, runId, nodeId: current, verdict: ok ? 'ok' : 'fail', ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }) });
+    publishInsideEvent({ kind: 'verdict', graphId, runId, nodeId: current, verdict: ok ? 'ok' : 'fail', ...(publicOutcome === undefined ? {} : { outcome: publicOutcome }) });
     log('node-end', { graphId, runId, nodeId: current, ok, exit,
       ...(nodeReason ? { reason: nodeReason } : {}), ...(nodeFailure ? { failure: nodeFailure } : {}),
-      ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }), dryRun: state.dryRun });
+      ...(publicOutcome === undefined ? {} : { outcome: publicOutcome }), dryRun: state.dryRun });
     await emitVisitLifecycle('end', current, visit, { outcome: ok ? 'ok' : 'fail', ...(nodeReason ? { reason: nodeReason } : {}) },
       { nodeId: current, ok, exit, ...(nodeReason === undefined ? {} : { reason: nodeReason }),
-        ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }), dryRun: state.dryRun });
+        ...(publicOutcome === undefined ? {} : { outcome: publicOutcome }), dryRun: state.dryRun });
     if (!resumingCompleted) {
       // Recipe commands expose stdout/exit but no provider usage; never infer zero from success.
       observeModelInputTokens({ scope: 'harness-node', nodeKind: node.kind, runId, nodeId: current });
@@ -3251,6 +3479,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       releaseGateFailedEvent = eventBus.prepare({ graphId, runId, type: RELEASE_GATE_FAILED_EVENT,
         source: { kind: 'node', nodeId: 'gate-triage' },
         data: { version: releaseInput.version, gate: normalizedGate, triage: triageOutput,
+          ...(releaseInput.autoAppendRepair === true ? { autoAppendRepair: true } : {}),
           ...(Object.prototype.hasOwnProperty.call(releaseInput, 'macrophageRepairLadder')
             ? { macrophageRepairLadder: releaseInput.macrophageRepairLadder } : {}),
           ...(sourceOutcome === 'ok' || sourceOutcome === 'regression' || sourceOutcome === 'error' || sourceOutcome === 'fail'
@@ -3265,6 +3494,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     // Persist the completed triage record and its ARG event outbox entry in one ledger write.
     persist();
+    if (releaseGateFailedEvent) appendGraphRunEvent(graphRunEventLedgerPath(root, graphId, runId), releaseGateFailedEvent);
     if (releaseGateFailedEvent) await publishLifecycleEvent(releaseGateFailedEvent);
     if (options.signal?.aborted) {
       await emitVisitLifecycle('leave', current, visit, { outcome: ok ? 'ok' : 'fail', reason: 'cancelled' });
@@ -3290,15 +3520,15 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     const fromNodeId = current;
     const edge = graph.edges.find((candidate) => candidate.from === current);
-    if (!growthScope && !growthScopeSkipLogged && !resumedGrowth && document.grow === 'on' && !state.dryRun && namedOutcome !== undefined &&
+    if (!growthScope && !growthScopeSkipLogged && !resumedGrowth && document.grow === 'on' && !state.dryRun && namedOutcome !== undefined && !outcomeIsSecret &&
         (state.growthAttempts ?? 0) < 8 && (state.growth?.length ?? 0) < 3 &&
         edge?.on === 'outcome' && edge.map && !Object.hasOwn(edge.map, namedOutcome) &&
         !state.growth?.some((item) => item.undo.removeOutcome.from === current && item.undo.removeOutcome.outcome === namedOutcome) &&
         !state.growthRejections?.some((item) => item.from === current && item.outcome === namedOutcome)) {
       growthScopeSkipLogged = true;
-      log('growth-skipped-no-scope', { graphId, runId, from: current, outcome: namedOutcome });
+      log('growth-skipped-no-scope', { graphId, runId, from: current, outcome: publicOutcome });
     }
-    if (growthScope && !growthCapReachedLogged && !resumedGrowth && document.grow === 'on' && !state.dryRun && namedOutcome !== undefined &&
+    if (growthScope && !growthCapReachedLogged && !resumedGrowth && document.grow === 'on' && !state.dryRun && namedOutcome !== undefined && !outcomeIsSecret &&
         edge?.on === 'outcome' && edge.map && !Object.hasOwn(edge.map, namedOutcome) &&
         !state.growth?.some((item) => item.undo.removeOutcome.from === current && item.undo.removeOutcome.outcome === namedOutcome) &&
         !state.growthRejections?.some((item) => item.from === current && item.outcome === namedOutcome)) {
@@ -3335,9 +3565,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         state.growthEvents.push({ phase: 'undo-available', from: current, outcome: namedOutcome, at: new Date().toISOString(),
           nodeId: result.growth.node.nodeId, undo: result.growth.undo });
         persist();
-        log('edge-added', { graphId, runId, from: current, outcome: namedOutcome, to: result.growth.node.nodeId });
-        debug.log('graph.run', 'edge-added', { graphId, runId, from: current, outcome: namedOutcome, to: result.growth.node.nodeId });
-        publishInsideEvent({ kind: 'edge-added', graphId, runId, from: current, outcome: namedOutcome, to: result.growth.node.nodeId });
+        log('edge-added', { graphId, runId, from: current, outcome: publicOutcome ?? namedOutcome, to: result.growth.node.nodeId });
+        debug.log('graph.run', 'edge-added', { graphId, runId, from: current, outcome: publicOutcome ?? namedOutcome, to: result.growth.node.nodeId });
+        publishInsideEvent({ kind: 'edge-added', graphId, runId, from: current, outcome: publicOutcome ?? namedOutcome, to: result.growth.node.nodeId });
       } else {
         state.growthRejections ??= [];
         const capped = result.reason === 'growth proposal limit 8 reached' || result.reason === 'growth limit 3 reached';
@@ -3422,7 +3652,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       || (matchingHealEdge?.kind === 'accept' && acceptBeforeFanOut === false)
       || (state.healPending?.via === completedNodeId && !ok);
     const selectedBranchOutcome = healingBeforeFanOut ? undefined : branchOutcome;
-    if (!plannedStep && outgoing?.branches && selectedBranchOutcome !== undefined && outgoing.join) {
+    const savedResumeNextNode = completed?.resumeNextNode ?? completed?.commandNextNode;
+    const replayingCompletedRoute = resumingCompleted && typeof savedResumeNextNode === 'string';
+    if (replayingCompletedRoute) {
+      current = savedResumeNextNode!;
+    } else if (!plannedStep && outgoing?.branches && selectedBranchOutcome !== undefined && outgoing.join) {
       const destinations = outgoing.branches[selectedBranchOutcome]!;
       const fanOutKey: string = `${current}:${selectedBranchOutcome}`;
       const fanout: NonNullable<GraphRunState['fanOuts']>[string] = state.fanOuts?.[fanOutKey] ?? { from: current, join: outgoing.join, branches: {} };
@@ -3519,7 +3753,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       current = plannedStep ? plannedStep.to
         : nextNode(graph.edges, current, edgeOutcome, namedOutcome);
     }
-    if (!plannedStep && healEdges.length) {
+    if (!replayingCompletedRoute && !plannedStep && healEdges.length) {
       const priorTransition = (state.healTransitions ?? []).find((item) => item.from === completedNodeId
         && item.visit === (visits.get(completedNodeId) ?? 0));
       if (priorTransition) {
@@ -3646,10 +3880,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       }
       }
     }
-    const naturalNext: string | undefined = current;
+    const naturalNext: string | undefined = replayingCompletedRoute ? savedResumeNextNode : current;
     const continuation = wakeContinuation;
     let scheduledNext: string | undefined = naturalNext;
-    if (continuation && (continuation.nodeId === completedNodeId || continuation.appendNodeIds?.includes(completedNodeId))) {
+    if (!replayingCompletedRoute && continuation && (continuation.nodeId === completedNodeId || continuation.appendNodeIds?.includes(completedNodeId))) {
       const isAppendedNode = continuation.appendNodeIds?.includes(completedNodeId) === true;
       const isLastAppendedNode = !isAppendedNode || continuation.appendNodeIds?.at(-1) === completedNodeId;
       if (isLastAppendedNode) {
@@ -3663,8 +3897,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         scheduledNext = naturalNext;
       }
     }
-    const action = pendingSubscriptionActions.shift();
-    state.pendingSubscriptionActions = [...pendingSubscriptionActions];
+    const action = replayingCompletedRoute ? undefined : pendingSubscriptionActions.shift();
+    if (!replayingCompletedRoute) state.pendingSubscriptionActions = [...pendingSubscriptionActions];
     if (action) {
       const target = graph.nodes.find((candidate) => candidate.nodeId === action.nodeId);
       if (!target || ((visits.get(action.nodeId) ?? 0) >= target.maxVisits && scheduledNext !== action.nodeId)) {
@@ -3691,6 +3925,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       } else {
         logSubscriptionAction('handled', action);
       }
+    }
+    if (scheduledNext !== undefined) {
+      const completedVisit = state.nodes.at(-1);
+      if (completedVisit?.nodeId === completedNodeId) completedVisit.resumeNextNode = scheduledNext;
     }
     current = scheduledNext;
     persist();

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "마이크로서비스·서비스 메시 — 동기 호출과 장애 전파",
+  "source": "https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker",
+  "body": "적용 시점: 동기 의존 호출이 사용자 응답 경로에 있고 다운스트림 장애 전파를 막아야 할 때.\n용량 단계: 초기에는 timeout·한도·관측을 둔다; 장애 전파가 확인되면 circuit breaker와 비동기 분리를 추가한다.\nGCP 대응: Cloud Run 서비스 간 요청 제한, API Gateway, Pub/Sub 비동기 작업; trace로 경로 지연을 확인한다.\n비용 축: 재시도 증폭, 프록시 홉, 대체 경로와 중복 컴퓨트가 비용 축이다.\n결정과 반증: 지수 재시도가 장애를 키우지 않으며 회로 열림 상태가 복구 후 닫히는지 fault injection으로 확인한다."
+}

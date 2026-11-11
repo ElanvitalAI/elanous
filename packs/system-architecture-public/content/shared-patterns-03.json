@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "공통 패턴 — 요청 rate limit",
+  "source": "https://learn.microsoft.com/en-us/azure/architecture/patterns/rate-limiting-pattern",
+  "body": "적용 시점: 공유 API를 과부하·오용·공정성 위반에서 보호해야 할 때.\n용량 단계: 먼저 서비스 전체 안전 한도; 고객별 quota가 필요하면 token bucket/sliding-window와 명확한 초과 응답을 더한다.\nGCP 대응: Cloud Armor/API Gateway에서 edge 제한, 업무별 동적 quota는 Cloud Run service와 Redis/Firestore에서 적용한다.\n비용 축: 요청 카운터·상태 저장·전역 복제의 비용과 과도한 차단의 기회비용이 축이다.\n결정과 반증: 동시 요청에서 한도 초과가 원자적이고, 정상 테넌트가 다른 tenant의 burst에 막히지 않는지 확인한다."
+}

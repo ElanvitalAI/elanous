@@ -129,6 +129,13 @@ test('missing or invalid duration in baseline and runner receipts fails before c
     .rejects.toThrow('invalid suite receipt');
 });
 
+test('runner receipts reject non-JSON fields before persistence', async () => {
+  const root = suite();
+  await expect(runWorldRegressionSuite({ folder: root, target: 'sim', updateBaseline: true,
+    run: async () => ({ ...receipt(), extra: undefined }) }))
+    .rejects.toThrow('only JSON values');
+});
+
 test('an already failing baseline never makes a failing scenario a passing suite', async () => {
   const root = suite();
   await runWorldRegressionSuite({ folder: root, target: 'real', updateBaseline: true, run: async () => receipt() });

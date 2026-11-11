@@ -100,6 +100,12 @@ function failedAfterGate(state: GraphRunState, index: number): boolean {
   if (failedAfterTrafficRestore(state, index)) return true;
   const nextNode = state.path[index + 1];
   const nextRecord = state.nodes[index + 1];
+  // Cloud cleanup may run between a failed gate and its existing triage path. A failed cleanup
+  // is a separate failure, so only a completed cleanup keeps the gate as the waiver boundary.
+  if ((nextNode === 'cloud-leave-fail' || nextNode === 'cloud-leave-error') &&
+      nextRecord?.nodeId === nextNode && nextRecord.executed === true && nextRecord.ok === true) {
+    return failedAfterGate(state, index + 1);
+  }
   if (nextNode === 'emergency-switch' && nextRecord?.nodeId === 'emergency-switch' && nextRecord.executed === true) {
     const triage = state.nodes[index + 2];
     return state.path[index + 2] === 'gate-triage' && triage?.nodeId === 'gate-triage' && triage.executed === true

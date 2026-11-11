@@ -4,6 +4,8 @@ import { describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { debug } from '../src/debug/log';
+import type { LogRecord } from '../src/mss/logging/record';
 import {
   buildKnowledgeQueryTool,
   dispatchKnowledgeQuery,
@@ -34,6 +36,65 @@ describe('KnowledgeQuery tool', () => {
     const r = await dispatchKnowledgeQuery({ tags: ['x'] }, { vault });
     expect(r.total).toBe(1);
     expect(r.output).toContain('1/1 result');
+  });
+
+  test('question with vault filters remains a vault query instead of selecting a pack', async () => {
+    const vault = seedVault();
+    let selections = 0;
+    const selectPack = () => { selections += 1; return { id: 'pack:fixture@1', title: 'fixture' }; };
+    for (const input of [
+      { question: 'ticketing design', tags: ['x'] },
+      { question: 'ticketing design', fulltext: 'world' },
+      { question: 'ticketing design', kind: 'incident' as const },
+    ]) {
+      const result = await dispatchKnowledgeQuery(input, { vault, selectPack });
+      expect(result.pack_hits).toBeUndefined();
+      expect(result.results).toHaveLength(1);
+    }
+    expect(selections).toBe(0);
+  });
+
+  test('auto-select failure is observed and falls back to the vault query', async () => {
+    const vault = seedVault();
+    const events: LogRecord[] = [];
+    const unregister = debug.registerSink({ name: 'knowledge-query-test', emit: event => events.push(event) });
+    try {
+      const result = await dispatchKnowledgeQuery({ question: 'ticketing design' }, {
+        vault,
+        selectPack: () => { throw new Error('KGS store unavailable'); },
+      });
+
+      expect(result.pack_hits).toBeUndefined();
+      expect(result.total).toBe(1);
+      expect(result.results[0]?.relPath).toBe('Incidents/a.md');
+      expect(events).toContainEqual(expect.objectContaining({
+        category: 'knowledge-pack.select', event: 'failed', level: 'warn',
+        data: expect.objectContaining({ fallback: 'vault', errorType: 'Error' }),
+      }));
+    } finally {
+      unregister();
+    }
+  });
+
+  test('an auto-selected pack search failure is logged without the raw question', async () => {
+    const events: LogRecord[] = [];
+    const unregister = debug.registerSink({ name: 'knowledge-query-provider-failure', emit: event => events.push(event) });
+    const question = 'private ticketing question';
+    try {
+      const result = await dispatchKnowledgeQuery({ question }, {
+        resolvePack: () => ({ kind: 'selected', pack: { id: 'pack:ticketing@1.0.0', title: 'Ticketing' }, priority: 1, intentTags: ['ticketing'] }),
+        searchPack: () => { throw new Error('provider unavailable'); },
+      });
+
+      expect(result.output).toContain('KnowledgeQuery failed: provider unavailable');
+      expect(events).toContainEqual(expect.objectContaining({
+        category: 'knowledge-pack.select', event: 'provider-failed', level: 'warn',
+        data: expect.objectContaining({ stage: 'pack-search', fallback: 'none', packId: 'pack:ticketing@1.0.0', errorType: 'Error' }),
+      }));
+      expect(JSON.stringify(events)).not.toContain(question);
+    } finally {
+      unregister();
+    }
   });
 
   test('kind filter routes correctly', async () => {

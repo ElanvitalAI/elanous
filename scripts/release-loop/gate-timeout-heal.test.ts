@@ -444,8 +444,8 @@ test('reproduction through the sweep: a cut shard is reason=timeout, keeps its f
   expect(meta).toMatchObject({ reason: 'timeout', rc: null, finishedFiles: POD_SHARD_FILE_CAP, deadlineSeconds: 1200 });
   const board = readGateShards(shardsPath);
   expect(board).toMatchObject({ version: '9.9.9', shards: [
-    // A runtime-lockfile change invalidates the prior shard receipt; assert its rerun reason, not old install timing.
-    { id: 'pod-0', state: 'done', rc: 0, reuseDecision: 'rerun', reuseReason: 'runtime-lockfile-unmeasured' },
+    // This synthetic sweep has no prior receipt; the completed files still carry into the narrowed retry.
+    { id: 'pod-0', state: 'done', rc: 0, reuseDecision: 'rerun', reuseReason: 'receipt-missing' },
     { id: 'pod-0-n', state: 'done' },
   ] });
   expect(typeof board!.shards[0]!.endedAt).toBe('string');

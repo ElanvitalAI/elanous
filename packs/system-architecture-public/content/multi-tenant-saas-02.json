@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "다중 테넌트 SaaS — 테넌트 식별 전파",
+  "source": "https://docs.aws.amazon.com/wellarchitected/latest/saas-lens/layers-hide-tenant-details.html",
+  "body": "적용 시점: API·큐·배치·감사에 동일 tenant 소유권을 전달해야 할 때.\n용량 단계: 모든 ingress에서 인증된 식별자를 만들고 downstream context는 위조 가능한 입력과 분리한다.\nGCP 대응: API Gateway/Cloud Run middleware에서 tenant identity 생성, Pub/Sub attributes와 DB 정책까지 전달한다.\n비용 축: 태그·감사·사용량 계측은 비용 관리에 필요하며 tenant 수와 이벤트량에 비례한다.\n결정과 반증: 본문이 주장한 tenant_id가 아닌 서버 인증 주체로 범위를 정하고, 누락 컨텍스트는 fail closed 한다."
+}

@@ -299,7 +299,16 @@ describe('member board Nexus routes · fake cap:store world', () => {
       expect(queried).toMatchObject({ ok: true, result: { events: [
         { cardId: 'card-a', state: 'suggested' }, { cardId: 'card-a', state: 'approved' },
       ] } });
-      expect(observed.map(event => (event as { state?: string }).state)).toEqual(['suggested', 'approved']);
+      const progress = await dispatchGraphContract('store.events@1', {
+        graphId: 'absorb-build', runId: 'build-run-1', nodeId: 'board-testing',
+        input: { operation: 'append', memberId: 'member-a', event: { ...events[0], state: 'testing', runId: 'build-run-1', at: '2026-11-09T02:01:00.000Z' } }, outputs: {},
+      }, registry);
+      expect(progress).toMatchObject({ ok: true, outcome: 'ok', result: { appended: true } });
+      expect(observed.at(-1)).toMatchObject({ cardId: 'card-a', state: 'testing', memberId: 'member-a', runId: 'build-run-1' });
+      const progressedBoard = await handleBoardRoute(request('/v1/board'), '/v1/board', deps);
+      expect((await progressedBoard!.json() as { cards: Array<{ id: string; state: string; runId: string }> }).cards)
+        .toMatchObject([{ id: 'card-a', state: 'testing', runId: 'build-run-1' }]);
+      expect(observed.map(event => (event as { state?: string }).state)).toEqual(['suggested', 'approved', 'testing']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

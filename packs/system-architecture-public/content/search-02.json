@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "검색 — 검색 스키마와 랭킹",
+  "source": "https://cloud.google.com/generative-ai-app-builder/docs/enterprise-search-introduction",
+  "body": "적용 시점: 텍스트·필터·정렬·권한 필터를 조합한 질의가 늘어날 때.\n용량 단계: 초기에는 단순 텍스트 인덱스; 실제 관련성 평가 후 analyzer·facet·ranking 기능을 늘린다.\nGCP 대응: Vertex AI Search 또는 자체 검색 서비스. 문서 권한은 질의 때 사용자 범위로 강제한다.\n비용 축: 문서 수·필드 수·벡터 차원·검색 요청·재색인 빈도에 따라 비용이 커진다.\n결정과 반증: 대표 질의 corpus의 relevance와 권한 누출 0을 동시에 판정한다."
+}

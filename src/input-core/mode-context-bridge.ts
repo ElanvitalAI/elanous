@@ -19,12 +19,12 @@
 
 import { activeMode, subscribeMode, type ModeId } from './mode.js';
 import type { ContextKeyService } from './context-keys.js';
-import { getDashboardContextKeyService } from '../dashboard/context/keys.js';
+import { getRuntimeContextKeyService } from './context-key-runtime.js';
 
 export function wireInputModeContextBridge(
   service?: ContextKeyService,
 ): () => void {
-  const svc = service ?? getDashboardContextKeyService();
+  const svc = service ?? getRuntimeContextKeyService();
   const publish = (mode: ModeId): void => {
     svc.update({
       // Always false — sync was retired from ModeManager (Arc A).

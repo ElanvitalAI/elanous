@@ -18,6 +18,7 @@ import { runSelfImplement } from '../self-implement/orchestrator.js';
 import { seams } from '../self-implement/test-seams.js';
 import type { DecisionEntry } from '../decisions/decision-ledger.js';
 import { createGraphEventBus, publishNodeGraphEvent } from './graph-events.js';
+import { graphRunEventLedgerPath, readGraphRunEvents } from './graph-run-event-ledger.js';
 import { classifyGateShadow } from '../../scripts/release-loop/gate-triage-node.js';
 import { writeReleaseGraphFixture } from '../../test/helpers/release-graph-fixture.js';
 
@@ -489,6 +490,9 @@ test('a transient ledger persist exception closes the visit and resume continues
   expect(resumedEvents[0]!.seq).toBeGreaterThan(firstEvents.at(-1)!.seq);
   expect(new Set([...firstEvents, ...resumedEvents].map((event) => event.eventId)).size)
     .toBe(firstEvents.length + resumedEvents.length);
+  const journal = readGraphRunEvents(graphRunEventLedgerPath(root, 'test-graph', runId));
+  expect(journal.map((event) => event.sequence)).toEqual([...journal.map((event) => event.sequence)].sort((a, b) => a - b));
+  expect(journal.at(-1)?.sequence).toBe(resumedEvents.at(-1)?.seq);
 });
 
 test('runGraph publishes ordered node lifecycle events and dispatches matching node subscriptions', async () => {
@@ -903,6 +907,8 @@ test('release resume validates the adaptive repair return edge after a failed re
       repairVisits++;
       return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
     }
+    if (command.includes('gate-cutover-switch-node.ts'))
+      return { exitCode: 0, stdout: JSON.stringify({ outcome: 'legacy' }), stderr: '' };
     return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok' }), stderr: '' };
   };
   const input = { version: '0.3.7', previousVersion: '0.3.6', gateExecutor: 'pod' };
@@ -2172,6 +2178,28 @@ test('failed command-spawn nodes persist exit and masked stderr tail on node-end
       reason: expect.stringContaining('bash exit 9'),
       failure: { errorCode: 'GRAPH_NODE_FAILED', stage: 'command-execution', message: expect.stringContaining('bash exit 9') },
     });
+
+    const rejectedEvents: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const rejectedError = Object.assign(new Error('Command failed: /bin/bash -c simulated-timeout'), {
+      stderr: Buffer.from('timed out while syncing; final diagnostic node-secret'),
+    });
+    const rejected = await runGraph(pluginGraph, { runId: 'rejected-command-with-stderr', deps: { root,
+      runBash: async () => { throw rejectedError; },
+      log: (event, data) => rejectedEvents.push({ event, data }),
+    } });
+    const rejectedReason = rejected.nodes[0]?.reason ?? '';
+    expect(rejected).toMatchObject({ status: 'failed' });
+    expect(rejected.nodes[0]).toMatchObject({ ok: false, error: expect.stringContaining('final diagnostic [REDACTED]'),
+      reason: expect.stringContaining('final diagnostic [REDACTED]'),
+      failure: { stage: 'command-execution', message: expect.stringContaining('final diagnostic [REDACTED]') } });
+    expect(rejectedEvents.find(entry => entry.event === 'node-end' && entry.data.nodeId === 'first')?.data)
+      .toMatchObject({ ok: false, reason: expect.stringContaining('final diagnostic [REDACTED]') });
+    const persistedRejected = JSON.parse(readFileSync(rejected.statePath, 'utf8')) as { nodes: Array<{ error?: string; reason?: string }> };
+    expect(persistedRejected.nodes[0]).toMatchObject({ error: expect.stringContaining('final diagnostic [REDACTED]'),
+      reason: expect.stringContaining('final diagnostic [REDACTED]') });
+    expect(JSON.stringify(persistedRejected.nodes)).not.toContain('node-secret');
+    expect(rejectedReason).not.toContain('node-secret');
+    expect(JSON.stringify(rejectedEvents)).not.toContain('node-secret');
   } finally {
     if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previousState;
@@ -3023,7 +3051,7 @@ test('approval pauses without running b; undecided resume stays pending; decisio
 
 test('resume keeps persisted input and exposes pre-approval outputs to the next cmd', async () => {
   const { graph, root } = approvalFixture();
-  const contexts: Array<{ graphId: string; runId: string; startedAt: string; executionId: string; nodeId: string; input: unknown; outputs: Record<string, unknown> }> = [];
+  const contexts: Array<{ graphId: string; runId: string; startedAt: string; executionId: string; nodeId: string; input: unknown; outputs: Record<string, unknown>; nodeHistory?: Array<{ nodeId: string; executionId: string; output: unknown }> }> = [];
   const deps = { root, runBash: async (_body: string, opts: { env?: NodeJS.ProcessEnv }) => {
     contexts.push(JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')));
     return { stdout: `output-${contexts.length}`, stderr: '', exitCode: 0 };
@@ -3326,7 +3354,7 @@ test('resuming a running run skips completed command nodes', async () => {
   expect(resumed.executed).toBe(2);
   expect(resumed.nodes.filter((node) => node.nodeId === 'first')).toHaveLength(1);
   expect(calls.filter((body) => body.includes('first-output'))).toHaveLength(1);
-  expect(JSON.parse(readFileSync(resumed.statePath, 'utf8')).nodes[0].output).toBe('{"outcome":"ok"}\n');
+  expect(JSON.parse(JSON.parse(readFileSync(resumed.statePath, 'utf8')).nodes[0].output)).toEqual({ outcome: 'ok' });
 });
 
 test('a loop resume branches from the last visit, not the first execution record', async () => {

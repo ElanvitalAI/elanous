@@ -13,15 +13,16 @@ const hooks: HostHooks = {
   log: () => {}, hudSet: () => {}, requestRender: () => {}, focusPane: () => {},
 };
 
-function fixture(configs: Array<{ id: string; multi?: boolean; deny?: string[] }>): PluginHost {
+function fixture(configs: Array<{ id: string; multi?: boolean; deny?: string[]; depends?: string[] }>): PluginHost {
   const userDir = mkdtempSync(join(tmpdir(), 'elanous-multi-active-'));
   dirs.push(userDir);
-  for (const { id, multi, deny } of configs) {
+  for (const { id, multi, deny, depends } of configs) {
     const dir = join(userDir, id);
     mkdirSync(dir);
     writeFileSync(join(dir, 'plugin.json'), JSON.stringify({
       id, name: id, version: '1.0.0', main: './plugin.ts',
       allowMultiActive: multi,
+      dependencies: depends ? { plugins: depends } : undefined,
       activePeerCompat: deny ? { deny } : undefined,
     }));
     writeFileSync(join(dir, 'plugin.ts'), `export default {
@@ -33,6 +34,30 @@ function fixture(configs: Array<{ id: string; multi?: boolean; deny?: string[] }
   }
   return new PluginHost(hooks, null, { userDir });
 }
+
+test('activating a dependent activates its required plugins first', async () => {
+  const host = fixture([
+    { id: 'base-plugin', multi: true },
+    { id: 'root-plugin', multi: true, depends: ['base-plugin@^1.0.0'] },
+  ]);
+  await host.discover();
+  await host.activate('root-plugin');
+  expect(host.activePlugins().map(plugin => plugin.name)).toEqual(['base-plugin', 'root-plugin']);
+  await host.deactivateAll();
+});
+
+test('activation rejects a missing requirement and incompatible single-active plugins', async () => {
+  const missing = fixture([{ id: 'root-plugin', multi: true, depends: ['absent-plugin@^1.0.0'] }]);
+  await missing.discover();
+  await expect(missing.activate('root-plugin')).rejects.toThrow('requires active plugin');
+  expect(missing.activePlugins()).toEqual([]);
+  const single = fixture([
+    { id: 'base-plugin' }, { id: 'root-plugin', multi: true, depends: ['base-plugin@^1.0.0'] },
+  ]);
+  await single.discover();
+  await expect(single.activate('root-plugin')).rejects.toThrow('allowMultiActive');
+  expect(single.activePlugins()).toEqual([]);
+});
 
 test('opted-in plugins coexist and keep their own tool contexts through focus changes', async () => {
   const host = fixture([{ id: 'alpha', multi: true }, { id: 'beta', multi: true }]);

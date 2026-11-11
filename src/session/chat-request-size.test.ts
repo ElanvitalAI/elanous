@@ -8,6 +8,7 @@ import { resetAutoCompactStateForTest } from '../compact/auto-state.js';
 import { appendMessage, createSession, loadSession } from './index.js';
 import { runTurn } from './chat.js';
 import { saveTokens } from '../oauth/store.js';
+import { installCodexOwnerTestWorld } from '../../test/fixtures/codex-owner-test-world.js';
 import { createRequestSizeGuard } from './request-size-guard.js';
 import { dispatchRead } from '../code-edit/tools.js';
 import { acquireFakeFetchDevice, type FakeFetchDevice } from '../ux-sim/fake-fetch.js';
@@ -19,6 +20,7 @@ let fetchDevice: FakeFetchDevice | undefined;
 let captures: FetchCapture[] = [];
 const envKeys = ['HOME', 'XDG_CONFIG_HOME', 'CODEX_HOME', 'ELANOUS_SESSION_ROOT', 'ELANOUS_TEST_FAKE_LLM'] as const;
 let savedEnv: Partial<Record<typeof envKeys[number], string>> = {};
+let restoreCodexWorld: (() => void) | undefined;
 
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'tui-request-size-compact-'));
@@ -28,6 +30,7 @@ beforeEach(async () => {
   process.env.CODEX_HOME = join(root, 'codex');
   process.env.ELANOUS_SESSION_ROOT = join(root, 'sessions');
   process.env.ELANOUS_TEST_FAKE_LLM = '1';
+  restoreCodexWorld = installCodexOwnerTestWorld(root);
   captures = [];
   resetAutoCompactStateForTest();
   saveTokens('openai-codex', {
@@ -68,6 +71,8 @@ afterEach(() => {
     try { device?.restore(); }
     finally {
       resetAutoCompactStateForTest();
+      restoreCodexWorld?.();
+      restoreCodexWorld = undefined;
       for (const key of envKeys) {
         const value = savedEnv[key];
         if (value === undefined) delete process.env[key];

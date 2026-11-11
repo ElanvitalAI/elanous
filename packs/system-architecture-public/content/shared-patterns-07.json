@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "공통 패턴 — Bulkhead 자원 격리",
+  "source": "https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead",
+  "body": "적용 시점: 서로 다른 우선순위의 업무가 thread·connection·queue를 공유해 연쇄 고갈될 수 있을 때.\n용량 단계: 초기에는 전체 concurrency 상한; 특정 업무가 다른 흐름을 압도하면 pool·queue·service 경계를 나눈다.\nGCP 대응: Cloud Tasks queue별 dispatch limit, Cloud Run service 분리, Cloud SQL connection pool budget.\n비용 축: 예약된 유휴 capacity와 queue별 monitoring·배포 단위가 비용 축이다.\n결정과 반증: 느린 저우선순위 작업을 포화해도 건강한 critical 경로가 완료되는지 포화 시험한다."
+}

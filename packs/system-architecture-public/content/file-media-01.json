@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "파일·미디어 처리 — 업로드와 메타데이터 경계",
+  "source": "https://docs.aws.amazon.com/solutions/latest/serverless-image-handler/welcome.html",
+  "body": "적용 시점: 대용량 파일을 앱 서버 메모리·디스크를 통과시키지 않고 받아야 할 때.\n용량 단계: 초기부터 객체 저장에 직접 업로드; 처리량이 늘면 multipart/resumable과 업로드 quota를 도입한다.\nGCP 대응: Cloud Storage signed URL/resumable upload, 메타데이터는 Cloud SQL/Firestore에 별도 저장.\n비용 축: 객체 크기·요청 횟수·저장 클래스·다운로드 egress·미완료 multipart가 비용 축이다.\n결정과 반증: 만료되거나 다른 회원 소유인 upload reference를 서버가 거부하는지 검증한다."
+}

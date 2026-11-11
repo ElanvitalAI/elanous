@@ -10,6 +10,7 @@ import { registerStandaloneLogSink } from '../../src/domains/standalone-log-sink
 import { readGraphContext, finishNode, errorResult, type GraphContext } from './node-verdict.js';
 import { RepairLandingRecoveryExhaustedError, waitForRepairPrLanded, type RepairPrLandedEvent } from './repair-pr-landed.js';
 import { attributeReleaseFailures, type ReleaseFailureAttribution } from '../../src/release-loop/release-failure-attribution.js';
+import { cutReleaseBranch } from './cut-branch.js';
 
 export interface RepairChildResult {
   ok: boolean;
@@ -31,6 +32,7 @@ export interface GateRepairNodeDeps {
   isAncestor?: (ancestor: string, descendant: string, repo: string) => boolean;
   refreshMainlineHead?: (repo: string) => string;
   attributeFailures?: typeof attributeReleaseFailures;
+  appendCut?: typeof cutReleaseBranch;
 }
 
 interface RepairAttributionEvidence {
@@ -518,6 +520,28 @@ export async function runGateRepairNode(context: GraphContext, deps: GateRepairN
       repairedFiles: presentOnMainline.map(({ file }) => file),
       humanRequired: allHumanRequired,
       remainingFailureIds, repairs };
+  }
+  if (context.input.autoAppendRepair === true && presentOnMainline.length) {
+    const picks = [...presentOnMainline].sort((a, b) => Date.parse(a.mergedAt) - Date.parse(b.mergedAt))
+      .map((repair) => repair.mergeSha);
+    try {
+      const result = (deps.appendCut ?? cutReleaseBranch)({ version, append: true, expectedTip: commit, pick: picks, repoRoot: repo,
+        log: (line) => debug.log('release-loop.gate-repair', 'cut-append-progress', { version, runId, line }) });
+      if (!result.commit || !/^[a-f0-9]{40}$/i.test(result.commit)) throw new Error('cut append returned no full commit');
+      debug.log('release-loop.gate-repair', 'cut-appended', { version, runId, previousCut: commit,
+        cutCommit: result.commit, picks, repairedFiles: repaired.map(({ file }) => file) });
+      return { outcome: 'ok' as const, verdict: 'pass' as const,
+        summary: `repair commits appended to ${result.branch}; receipt audit must re-enter before publish`,
+        commit: result.commit, appendedPicks: picks, requiresReceiptAudit: true,
+        repairedFiles: repaired.map(({ file }) => file), repairs };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      debug.log('release-loop.gate-repair', 'cut-append-failed', { version, runId, reason, picks }, { level: 'error' });
+      return { outcome: 'fail' as const, verdict: 'fail' as const,
+        summary: `verified repair PRs could not be appended to the cut: ${reason}`,
+        repairedFiles: [], humanRequired: repaired.map(({ file, failureIds: ids }) => ({ file, failureIds: ids, reason })),
+        remainingFailureIds: failureIds, repairs };
+    }
   }
   return { outcome: 'ok' as const, verdict: 'pass' as const,
     summary: `all ${files.length} attributed gate repair PRs are present on refreshed mainline; gate will remeasure the repaired files`,

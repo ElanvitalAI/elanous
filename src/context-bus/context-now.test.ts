@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
+import { once } from 'node:events';
 import { askOpContextBundle, buildAskOpContextBundle, contextNow, contextNowInWorker, scanContextNowInWorker, seatStatusNow, type ContextNowAnswer, type ContextNowDeps } from './context-now.js';
 import { renderTuiNow, renderVoiceNow } from './context-now-surfaces.js';
 import type { QueriedRunningRunsResult } from '../self-implement/running-runs.js';
@@ -19,7 +20,7 @@ import { SELF_COGNITION_RUNTIMES } from '../tool-runtime/self-cognition-runtimes
 import { buildCoreTools } from '../domains/core-tools.js';
 import { getElanousConfigDirOverride, setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import { openSchedulesDb } from '../domains/schedule-registry.js';
-import { localLoopRows } from '../dashboard/slash-runtime/loops-table.js';
+import { localLoopRows } from '../loops/loops-table.js';
 
 // The HTTP/chat parity test now reads the live operational sources (running runs scan the federated ledgers);
 // that alone took ~6 s on a loaded host, past Bun's 5 s default.
@@ -27,6 +28,27 @@ setDefaultTimeout(30_000);
 
 const at = '2026-10-03T04:00:00.000Z';
 const noOperations: ContextNowDeps = { runningRuns: () => [], releaseRun: () => null, lateSchedules: () => null };
+
+test('split /now scans read independent core and operational sources', () => {
+  const core = contextNow({ section: 'core' }, {
+    now: () => new Date(at), version: () => '0.3.11',
+    checklist: version => ({ version, released: '', dev: '', items: [], history: [] }),
+    decisions: () => [], seatEntries: () => [], events: () => [],
+    runningRuns: () => { throw new Error('core read operations'); },
+  });
+  expect(core.facts.map(fact => fact.kind)).toEqual(['version']);
+  const operations = contextNow({ section: 'operations' }, {
+    now: () => new Date(at), version: () => '0.3.11',
+    events: () => { throw new Error('operations read events'); },
+    checklist: () => { throw new Error('operations read checklist'); },
+    decisions: () => { throw new Error('operations read decisions'); },
+    seatEntries: () => { throw new Error('operations read seats'); },
+    runningRuns: () => [{ kind: 'run', goal: 'live', phase: 'review', elapsed: '2분', source: 'run://one' }],
+    releaseRun: () => null, lateSchedules: () => null,
+  });
+  expect(operations.facts.map(fact => fact.kind)).toEqual(['run']);
+  expect(operations.events).toEqual([]);
+});
 
 test('ASK-OP bundle selects required cells with source and read time, within limit', () => {
   const snapshot: ContextNowAnswer = { at, topic: null, guide: [], events: [], facts: [
@@ -239,6 +261,21 @@ test('context_now worker times out and releases a stalled scan', async () => {
   await expect(scanContextNowInWorker({}, undefined, '/tmp/context-now-timeout-probe',
     () => new Worker('setInterval(() => {}, 1000)', { eval: true }), 25))
     .rejects.toThrow('context_now worker timed out after 25ms');
+});
+
+test('repeated context_now cancellations terminate each active worker', async () => {
+  for (const topic of ['first', 'second', 'third']) {
+    const abort = new AbortController();
+    let worker!: Worker;
+    const pending = scanContextNowInWorker({ topic, signal: abort.signal }, undefined, '/tmp/context-now-abort-probe',
+      () => { worker = new Worker('setInterval(() => {}, 1000)', { eval: true }); return worker; },
+      60_000); // Source: context-now.ts WORKER_SCAN_TIMEOUT_MS
+    const exited = once(worker, 'exit');
+    abort.abort();
+    await expect(pending).rejects.toThrow('context_now cancelled');
+    await exited;
+    expect(worker.threadId).toBe(-1); // Source: node:worker_threads Worker.threadId after exit
+  }
 });
 
 test('unrelated workers importing context-now do not register its message handler', async () => {

@@ -20,13 +20,13 @@ test('unsafe daemon source does not become a title attribute', () => {
   const projected = contextSources({
     at: '2026-10-03T05:30:00Z', topic: null, guide: [], events: [],
     facts: [
-      { kind: 'seat', seat: 'TC', at: '2026-10-03T05:25:00Z', status: 'now', id: null, title: '작업', source: '/home/user/private' },
+      { kind: 'seat', seat: 'TC', at: '2026-10-03T05:25:00Z', status: 'now', id: null, title: '작업', source: '/home/ubuntu/private' },
       { kind: 'decision', id: 'D-1', title: '결정', status: 'open', dueAt: null, source: 'elanous://decisions/D-1' },
     ],
   }, Date.parse('2026-10-03T05:30:00Z'));
   const html = renderToStaticMarkup(<ContextSourcesCard sources={projected ?? []} />);
   expect(html).toContain('title="elanous://decisions/D-1"');
-  expect(html).not.toContain('/home/user/private');
+  expect(html).not.toContain('/home/ubuntu/private');
 });
 
 test('no sources or empty sources render no card', () => {

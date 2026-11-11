@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "시간 제한 임대와 좌석 홀드의 경계",
+  "source": "https://martinfowler.com/articles/patterns-of-distributed-systems/lease.html",
+  "body": "분산 시스템의 lease 패턴은 소유자가 죽거나 연결이 끊겨도 독점 권한이 무기한 남지 않게 만료 시간을 둔다. 좌석 홀드에 적용하는 것은 설계 유추다. 홀드 소유자·만료를 원장 트랜잭션에서 다시 판정하고, 만료 뒤 낡은 소유자가 결제를 완료해도 좌석을 다시 팔지 않는다. lease의 갱신 허용 여부는 티켓팅 제품 정책으로 별도 고정한다."
+}

@@ -104,6 +104,10 @@ test('GATE-G runtime and tested blobs key same-cut repair reuse and changed-key 
   const missingFileHashes = planGateShardDispatch({ ...common, head40: repairCommit, radiusUnchangedShardIds: shards.map((shard) => shard.id), testedFileHashesByShard: {} });
   expect(missingFileHashes.every((action) => action.kind === 'run')).toBe(true);
   expect(missingFileHashes[0]?.reason).toBe('tested-file-identity-unmeasured');
+  const missingAndInvalidatedReceipt = planGateShardDispatch({ ...common, head40: repairCommit, receipts: [],
+    radiusUnchangedShardIds: [], invalidatedShardIds: ['pod-0'] });
+  expect(missingAndInvalidatedReceipt[0]?.kind).toBe('run');
+  expect(missingAndInvalidatedReceipt[0]?.reason).toBe('receipt-missing');
   const failedReceipt = receipts.map((receipt) => receipt.id === 'pod-0' ? { ...receipt, failureIds: ['src/a.test.ts > fail'] } : receipt);
   const sameHeadBaselineFailures = ['src/a.test.ts > fail', 'src/b.test.ts > failed before repair'];
   const failedReceiptPlan = planGateShardDispatch({ ...common, head40: priorCommit, receipts: failedReceipt,

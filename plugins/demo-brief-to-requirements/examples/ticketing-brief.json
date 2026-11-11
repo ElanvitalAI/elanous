@@ -1,0 +1,20 @@
+{
+  "briefing": {
+    "id": "brief-2026-11-10-ticketing",
+    "owner": "demo-member",
+    "topics": [
+      { "summary": "접속 폭주 시 공정한 대기열", "sourceScrapIds": ["scrap-ticketing-article"] },
+      { "summary": "같은 좌석 중복 예매 0건과 결제 실패 복구", "sourceScrapIds": ["scrap-ticketing-article"] }
+    ]
+  },
+  "acceptance": {
+    "suggestionId": "suggest-ticketing-app",
+    "owner": "demo-member",
+    "accepted": true,
+    "service": "콘서트 티켓팅"
+  },
+  "capacityAssumption": {
+    "concurrentUsers": 100000,
+    "rationale": "공연 오픈 피크를 가정해 검증"
+  }
+}

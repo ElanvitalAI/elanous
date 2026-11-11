@@ -110,6 +110,42 @@ describe('outbound-guard-sim', () => {
     expect(guard.observations().map(observation => observation.universe)).toEqual(['unknown', 'unknown']);
   });
 
+  test('a real-looking event inherits a non-real or unknown cause and fails closed', () => {
+    const guard = createOutboundGuardSim();
+    const sinkCalls: OutboundGuardAction[] = [];
+    const action = billingAction();
+    const causes: OutboundGuardProvenance[] = [
+      { universe: 'test', source: 'real', causedBy: [{ universe: 'sim', source: 'sim', device: 'fake-cloud-billing-world' }] },
+      { universe: 'test', source: 'real', causedBy: [{ source: 'real' }] },
+    ];
+
+    for (const provenance of causes) {
+      expect(guard.attempt(provenance, action, outbound => sinkCalls.push(outbound)).allowed).toBe(false);
+    }
+
+    expect(sinkCalls).toEqual([]);
+    expect(guard.observations()).toMatchObject([
+      { type: 'sim.leak-blocked', source: 'sim', universe: 'sim', reason: 'source-not-real' },
+      { type: 'sim.leak-blocked', source: 'real', universe: 'unknown', reason: 'provenance-incomplete' },
+    ]);
+  });
+
+  test('a complete real cause chain reaches only the injected fake sink', () => {
+    const guard = createOutboundGuardSim();
+    const sinkCalls: OutboundGuardAction[] = [];
+    const action = billingAction();
+
+    const decision = guard.attempt(
+      { universe: 'test', source: 'real', causedBy: [{ universe: 'test', source: 'real' }] },
+      action,
+      outbound => sinkCalls.push(outbound),
+    );
+
+    expect(decision).toEqual({ allowed: true, actionId: action.id });
+    expect(sinkCalls).toEqual([action]);
+    expect(guard.observations()).toEqual([]);
+  });
+
   test('replay, injected, shadow, synthetic, missing and incomplete provenance fail closed', () => {
     const guard = createOutboundGuardSim();
     const sinkCalls: OutboundGuardAction[] = [];

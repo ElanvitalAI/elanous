@@ -888,6 +888,7 @@ export async function handlePromptPost(
       sessionId: result.sessionId,
       text: result.text,
       stopReason: result.stopReason,
+      ...(result.providerFinishReason ? { providerFinishReason: result.providerFinishReason } : {}),
       ...(provider ? { provider } : {}),
       ...(model ? { model } : {}),
     }, 200);
@@ -1280,6 +1281,7 @@ export async function handlePromptStreamPost(
           sessionId: result.sessionId,
           text: result.text,
           stopReason: result.stopReason,
+          ...(result.providerFinishReason ? { providerFinishReason: result.providerFinishReason } : {}),
           ...(provider ? { provider } : {}),
           ...(model ? { model } : {}),
         });

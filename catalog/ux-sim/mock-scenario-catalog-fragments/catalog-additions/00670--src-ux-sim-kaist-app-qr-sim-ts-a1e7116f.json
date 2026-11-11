@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/kaist-app-qr-sim.ts",
+  "reason": "KAIST app QR simulation for public host resolution and tenant isolation."
+}

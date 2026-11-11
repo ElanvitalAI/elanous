@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "검색 — 검색 인덱스 비동기 투영",
+  "source": "https://github.com/donnemartin/system-design-primer",
+  "body": "적용 시점: 사용자 질의 형태가 원장 스키마와 다르고 부분 일관성을 허용할 때.\n용량 단계: 초기에는 DB 인덱스로 시작; 질의·랭킹·텍스트 요구가 병목이 되면 검색 인덱스를 분리한다.\nGCP 대응: Cloud SQL/Firestore 원장 → Pub/Sub/Dataflow 또는 worker → Vertex AI Search/Elastic 계열 인덱스.\n비용 축: 색인 용량, replica, 문서 업데이트율, query QPS, 저장·전송이 주요 축이다.\n결정과 반증: 원장 수정 뒤 검색 반영 지연과 색인 재구축 동안 원본 유실이 없는지 확인한다."
+}

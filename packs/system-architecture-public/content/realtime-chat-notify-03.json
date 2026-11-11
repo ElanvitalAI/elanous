@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "실시간 채팅·알림 — presence와 연결 수평 확장",
+  "source": "https://docs.cloud.google.com/architecture/scalable-and-resilient-apps",
+  "body": "적용 시점: 온라인 여부가 기능에 필요하지만 일관된 영속 사실은 아닌 경우.\n용량 단계: 초기에는 TTL 기반 ephemeral presence; 규모 증가 시 지역·채널별 fanout을 제한한다.\nGCP 대응: Memorystore/Redis TTL 또는 Firestore ephemeral collection; 실시간 연결 gateway와 분리한다.\n비용 축: 연결 유지 자원, 갱신 heartbeat, 지역 간 전파와 만료 없는 데이터 누수가 비용 축이다.\n결정과 반증: 클라이언트 강제 종료와 네트워크 단절 뒤 presence가 만료되고 stale 온라인 표기가 사라지는지 확인한다."
+}

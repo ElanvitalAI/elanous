@@ -76,6 +76,14 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     why: 'member profile uses only the revocable HttpOnly member-session cookie',
   },
   {
+    method: 'POST', match: 'exact', path: '/v1/members/referral-code', selfVerified: true,
+    why: 'referral code rotation verifies the member session and revokes earlier invite links',
+  },
+  {
+    method: 'DELETE', match: 'exact', path: '/v1/members/referral-code', selfVerified: true,
+    why: 'referral code revocation verifies the member session',
+  },
+  {
     method: 'GET', match: 'exact', path: '/v1/members/app-slot', selfVerified: true,
     why: 'member app slot is scoped by the revocable HttpOnly member-session cookie',
   },

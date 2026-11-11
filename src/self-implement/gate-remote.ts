@@ -582,7 +582,7 @@ export interface DispatchOptions {
   stableCheckout?: boolean;
   /** Self gate CLI only: name the host for both automatic and explicit remote execution. */
   reportRemoteHost?: boolean;
-  /** Release gate host reservations shared by self gate and changed typecheck. */
+  /** Release gate host reservations shared by every heavy remote check. */
   reservationRoot?: string;
   /** Self gate only: hosts to try when the first host holds a release reservation (default: `host-e-wsl` for
    *  `node-b`, the same alternative the unmeasured hint names — a reservation is never a local fallback). */
@@ -661,8 +661,7 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
   let host = decision.host!;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = deps.now ?? Date.now;
-  const reservationRoot = opts.tool === 'self-gate' || opts.tool === 'ci-typecheck-changed'
-    ? opts.reservationRoot ?? (deps.runner ? undefined : gateHostReservationRoot()) : undefined;
+  const reservationRoot = opts.reservationRoot ?? (deps.runner ? undefined : gateHostReservationRoot());
   if (reservationRoot) {
     try { ensureGateHostReservationDirectory(reservationRoot); }
     catch (error) {
@@ -753,12 +752,14 @@ export async function dispatchHeavyCheck(opts: DispatchOptions, deps: DispatchDe
           const latestPodPoolReason = latest.podReservations === undefined
             ? undefined : `Pod resource pool occupied (${latest.podReservations} reservations) on ${reservationHost}`;
           const reason = latestPodPoolReason ?? `host-reserved: ${host} (${latest.reason})`;
-          const manualAlternative = reservationHost === 'node-b'
-            ? '; if available, non-PWA checks may explicitly select --remote host-e-wsl' : '';
+          const manualAlternative = reservationHost === 'aws1'
+            ? '; try --remote aws2 or --remote minim5 after checking availability'
+            : reservationHost === 'node-b'
+              ? '; if available, non-PWA checks may explicitly select --remote host-e-wsl' : '';
           debug.log('gate.remote', 'host-reserved-unmeasured', { host, reason, ...(latestPodPoolReason ? { podReservations: latest.podReservations } : { owner }), reservedAt: latest.reservedAt ?? first.reservedAt, observedAt, waitedMs, alternates: alternates.length });
           write.err(opts.tool === 'self-gate'
             ? `[gate.remote] remote unmeasured on ${host} (stage=host-reserved, rc=unknown) — ${reason}${latestPodPoolReason ? '' : `; owner=${owner} ${stamp}`} waited=${Math.floor(waitedMs / 1000)}s${manualAlternative}\n`
-            : `[gate.remote] remote unmeasured — ${reason}\n`);
+            : `[gate.remote] remote unmeasured — ${reason}${manualAlternative}\n`);
           return 1;
         }
       }

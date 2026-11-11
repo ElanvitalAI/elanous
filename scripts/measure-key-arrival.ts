@@ -1,3 +1,5 @@
+import { isRecord } from '../src/primitives/guards.js';
+
 export const DISPLAY_KEY_CATEGORY = 'display.key';
 export const DEFAULT_ELANOUS_COMMAND = ['bun', 'bin/elanous.mjs'] as const;
 export const DEFAULT_KEY_ARRIVAL_LOG_SINCE = '5m';
@@ -290,10 +292,6 @@ function parseQueryItems(raw: string): unknown[] | null {
     }
     return items;
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function isMetaLine(value: unknown): value is { _meta: Record<string, unknown> } {

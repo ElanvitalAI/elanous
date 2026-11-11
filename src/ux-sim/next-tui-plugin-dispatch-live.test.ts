@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { mockSeatPtySequence } from './mock-seat-pty-sequence.js';
+import { NEXT_TUI_TITLE } from '../tui/core/render.js';
 
 test('next TUI PTY hydrates a plugin graph tool, then refuses an ownerless call before confirmation', async () => {
   const keptRoot = process.env.ELANOUS_PLUGIN_DISPATCH_LIVE_OUT?.trim();
@@ -34,11 +35,11 @@ test('next TUI PTY hydrates a plugin graph tool, then refuses an ownerless call 
         ELANOUS_CONFIG_DIR: root,
         ELANOUS_STATE_DIR: root,
       },
-      ready: { label: 'boot', until: (screen) => screen.includes('elanous next ·') && screen.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') && screen.includes('❯') },
       steps: [{
         // Source: 내부 문서 `next-tui-production` B2 PTY receipt uses a bounded isolated turn.
         label: 'plugin round', text: 'PLUGIN-LIVE 제안 적용해줘', timeoutMs: 60_000,
-        until: (screen) => screen.includes('graph route requires a verified owner context') && screen.includes('응답 완료'),
+        until: (screen) => screen.includes('graph route requires a verified owner context') && screen.includes('턴 완료'),
       }],
       ...(keptRoot ? { artifactPath: join(root, 'pty.json') } : {}),
     });
@@ -53,6 +54,7 @@ test('next TUI PTY hydrates a plugin graph tool, then refuses an ownerless call 
     expect(JSON.parse(graph?.toolResult ?? '{}')).toEqual({ error: 'graph route requires a verified owner context' });
     const screen = run.frames.find(frame => frame.label === 'plugin round')?.screen ?? '';
     expect(screen).toContain('도구: suggest_accept · 오류');
+    expect(screen).not.toContain('응답 완료');
     expect(screen).not.toContain('y/n');
     expect(run.exitCode).toBe(0);
     expect(run.binarySha256).toHaveLength(64);

@@ -6,14 +6,16 @@ import { join } from 'node:path';
 import { acquireL8MergeQueue, enqueueL8ShadowQueue, evaluateL8Integration, runL8MergeQueue, runL8ShadowQueue, statusL8ShadowQueue, type L8MergeQueueDeps, type L8ShadowQueueDeps, type L8ShadowVerdict } from './l8-merge-queue.js';
 import type { TrainReachObservation } from './train-reach-grouping.js';
 import { integrateTrain, type TrainCandidate } from './merge-train.js';
-import { createMacrophageRuntime } from '../release-loop/macrophage-heal-node.js';
 import { Command } from 'commander';
 import { registerPrCommands } from '../cli/pr-cli.js';
+import { debug } from '../debug/log.js';
 
 const roots: string[] = [];
+const debugSinkDisposers: (() => void)[] = [];
 const originalCwd = process.cwd();
 const originalStateDir = process.env.ELANOUS_STATE_DIR;
 afterEach(() => {
+  for (const dispose of debugSinkDisposers.splice(0)) dispose();
   process.chdir(originalCwd);
   if (originalStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
   else process.env.ELANOUS_STATE_DIR = originalStateDir;
@@ -100,7 +102,7 @@ function deps(remote: string, opts: { failTest?: boolean; failInstall?: boolean;
 function shadowDeps(remote: string, resolveConflict?: (file: string, conflicted: string, target: string, worktree: string) => Promise<string>, onIntegrated?: (cwd: string) => void) {
   const { injected, calls, pushes } = deps(remote);
   const observed: unknown[] = [];
-  const queueDeps = { ...injected, resolveConflict, rulesPreflight: async () => ({ outcome: 'pass' as const, detail: 'simulated integrated rules pass' }), observe: (verdict: unknown) => { observed.push(verdict); },
+  const queueDeps: L8ShadowQueueDeps = { ...injected, resolveConflict, rulesPreflight: async () => ({ outcome: 'pass' as const, detail: 'simulated integrated rules pass' }), observe: (verdict: unknown) => { observed.push(verdict); },
     command: (bin: string, args: readonly string[], cwd: string) => {
       if (bin === 'bun' && args[0] === 'run' && args[1] === 'test:deterministic') {
         calls.push([...args]);
@@ -532,6 +534,17 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
   const gateBatches: number[][] = [];
   const macroRoot = join(root, 'macro-state');
   const emittedProgress: string[] = [];
+  const trainDebugEvents: { category: string; event: string; data: unknown }[] = [];
+  const macrophageDebugEvents: { category: string; event: string; data: unknown }[] = [];
+  debugSinkDisposers.push(debug.registerSink({ name: 'rla-all-live-train-events-test', emit: (record) => {
+    if (record.category === 'self-implement.merge-train' && (record.event === 'merge-train.batch' || record.event === 'merge-train.verdict')) {
+      trainDebugEvents.push({ category: record.category, event: record.event, data: record.data });
+    }
+    if (record.category === 'release-loop.macrophage' && record.event === 'decision')
+      macrophageDebugEvents.push({ category: record.category, event: record.event, data: record.data });
+    if (record.category === 'self-implement.merge-train' && record.event === 'hq-incident-received')
+      macrophageDebugEvents.push({ category: record.category, event: record.event, data: record.data });
+  } }));
   queueDeps.emitTrainProgress = (event) => { emittedProgress.push(event.type); };
   process.env.ELANOUS_STATE_DIR = macroRoot;
   process.chdir(cwd);
@@ -555,6 +568,11 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
   const macroRunId = contextFiles[0]!.slice(0, -'.json.contexts'.length);
   expect(verdict).toMatchObject({ number: 7, verdict: 'pass', base: mainBefore, tests: ['test/shared.test.ts'] });
   expect(emittedProgress).toEqual(['merge-train.batch', 'merge-train.verdict']);
+  expect(debug.isFileEnabled()).toBe(true);
+  expect(trainDebugEvents.map(({ category, event }) => ({ category, event }))).toEqual([
+    { category: 'self-implement.merge-train', event: 'merge-train.batch' },
+    { category: 'self-implement.merge-train', event: 'merge-train.verdict' },
+  ]);
   expect(verdict?.detail).toContain('reach [7,8,9]');
   expect(integratedBatches[0]?.map(({ number, title, body }) => ({ number, title, body }))).toEqual([
     { number: 7, title: 'PR 7 intent', body: 'Body for PR 7' },
@@ -580,24 +598,44 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
   expect(git(remote, 'rev-parse', 'main')).toBe(mainBefore);
   expect(git(cwd, 'rev-parse', 'HEAD')).toBe(checkoutBefore);
   for (const number of Object.keys(files)) expect(git(remote, 'rev-parse', `refs/pull/${number}/head`)).toBe(pullBefore[number]);
-  const macrophage = createMacrophageRuntime({ runId: macroRunId, root: macroRoot, mode: 'simulation' });
-  for (const [index, incident] of [
-    { kind: 'worker-start-failed', workerPid: 4102, stage: 'start', reason: 'run-id prefix collision' },
-    { kind: 'worker-no-progress', workerPid: 4102, stage: 'shard-8', remainingMs: 31_000, elapsedMs: 15 * 60_000 },
-    { kind: 'needs-solo-starvation', readyBundle: [7, 8, 9], blockingPr: 10 },
-    { kind: 'main-check-failed', checks: ['tsc', 'rules-contract'], baseSha: mainBefore },
-  ].entries()) {
-    await macrophage.eventBus.publish({ graphId: 'release-loop', runId: macroRunId,
-      eventId: `${macroRunId}:incident:${index}`, type: 'merge-train.incident',
-      source: { kind: 'runner', nodeId: 'fake-train-manager' }, data: incident });
+  const incidents = [
+    { kind: 'worker-start-failed', data: { workerPid: 4102, stage: 'start', reason: 'run-id prefix collision' } },
+    { kind: 'worker-no-progress', data: { workerPid: 4102, stage: 'shard-8', remainingMs: 20 * 60_000, elapsedMs: 5 * 60_000 } },
+    { kind: 'needs-solo-starvation', data: { readyBundle: [7, 8, 9], blockingPr: 10 } },
+    { kind: 'main-check-failed', data: { checks: ['tsc', 'rules-contract'], baseSha: mainBefore } },
+  ] as const;
+  for (const [index, incident] of incidents.entries()) {
+    const incidentProgram = new Command();
+    incidentProgram.exitOverride();
+    const incidentOutput: string[] = [];
+    registerPrCommands(incidentProgram, { out: { log: (value) => incidentOutput.push(value), error: (error) => { throw new Error(error); } } });
+    await incidentProgram.parseAsync(['node', 'elanous', 'pr', 'queue', 'train-event', incident.kind,
+      '--run-id', macroRunId, '--event-id', `${macroRunId}:incident:${index}`, '--data-json', JSON.stringify(incident.data)]);
+    expect(JSON.parse(incidentOutput.at(-1)!)).toMatchObject({ accepted: true, duplicate: false,
+      runId: macroRunId, eventId: `${macroRunId}:incident:${index}`, type: 'merge-train.incident', decisions: 1 });
   }
-  expect(macrophage.decisions).toHaveLength(4);
-  expect(macrophage.decisions.map((event) => event.data?.sourceEventType)).toEqual([
-    'merge-train.incident', 'merge-train.incident', 'merge-train.incident', 'merge-train.incident',
-  ]);
+  const duplicateProgram = new Command();
+  duplicateProgram.exitOverride();
+  const duplicateOutput: string[] = [];
+  registerPrCommands(duplicateProgram, { out: { log: (value) => duplicateOutput.push(value), error: (error) => { throw new Error(error); } } });
+  const firstIncident = incidents[0]!;
+  await duplicateProgram.parseAsync(['node', 'elanous', 'pr', 'queue', 'train-event', firstIncident.kind,
+    '--run-id', macroRunId, '--event-id', `${macroRunId}:incident:0`, '--data-json', JSON.stringify(firstIncident.data)]);
+  expect(JSON.parse(duplicateOutput.at(-1)!)).toMatchObject({ accepted: true, duplicate: true, decisions: 0 });
+  const incidentDecisions = macrophageDebugEvents.filter(({ event, data }) => event === 'decision'
+    && !!data && typeof data === 'object' && (data as Record<string, unknown>).sourceEventType === 'merge-train.incident');
+  const incidentIngress = macrophageDebugEvents.filter(({ event }) => event === 'hq-incident-received');
+  expect(incidentDecisions).toHaveLength(4);
+  expect(incidentIngress).toHaveLength(5);
+  expect(incidentIngress.every(({ data }) => !!data && typeof data === 'object' && !('shadow' in data))).toBe(true);
   const receiptPath = join(contextsDir, `${macroRunId}.json.contexts`, 'macrophage.jsonl');
   const receipts = readFileSync(receiptPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   expect(receipts).toHaveLength(6);
+  expect(receipts.slice(0, 2).map((entry) => ({ source: entry.source,
+    sourceEventType: entry.data.sourceEventType, status: entry.data.status, applied: entry.data.applied }))).toEqual([
+    { source: { kind: 'runner' }, sourceEventType: 'merge-train.batch', status: 'planned', applied: false },
+    { source: { kind: 'runner' }, sourceEventType: 'merge-train.verdict', status: 'planned', applied: false },
+  ]);
   const incidentEvidence = receipts.slice(2).map((entry) => entry.data.evidence as string);
   expect(incidentEvidence).toEqual(expect.arrayContaining([
     expect.stringContaining('"kind":"worker-start-failed"'), expect.stringContaining('"workerPid":4102'),
@@ -605,5 +643,4 @@ test('runL8ShadowQueue groups a pinned queue by reach, bisects on the fake host 
     expect.stringContaining('"stage":"shard-8"'), expect.stringContaining('"kind":"needs-solo-starvation"'),
     expect.stringContaining('"kind":"main-check-failed"'), expect.stringContaining('"checks":["tsc","rules-contract"]'),
   ]));
-  macrophage.dispose();
 }, 30_000);

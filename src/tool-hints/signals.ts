@@ -32,6 +32,8 @@ export interface SignalSnapshot {
   /** Deep multi-source research route; quick fact lookups remain capped. */
   researchAgent?: boolean;
   intentDiagram: boolean;
+  /** Domain design request; used by turn-preload to expose installed-pack search. */
+  intentKnowledge?: boolean;
   recentNetworkError: boolean;
 
   // Arc H — intent scopes for tool count discipline. Each boolean is
@@ -187,6 +189,8 @@ export function isOrderedLinearResearchWorkflow(text: string | undefined): boole
 }
 const DIAGRAM_ASCII_RE = /\b(diagrams?|flowcharts?|sequence|mermaid|graphs?|charts?|visuali[sz]e|architecture)\b/i;
 const DIAGRAM_KO_RE = /(시퀀스|플로우|다이어그램|도식|그래프|시각화|아키텍처|구조도)/;
+const KNOWLEDGE_DESIGN_ASCII_RE = /\b(?:design|architecture|system design|service design)\b/i;
+const KNOWLEDGE_DESIGN_KO_RE = /(설계|아키텍처|요구사항.{0,12}구조)/;
 
 // Arc H — intent scope regex. Conservative ASCII \b boundaries + bare
 // Korean substring match (same rule as RESEARCH/DIAGRAM above). Each
@@ -285,6 +289,7 @@ export function collectSignals(ctx: SignalContext = {}): SignalSnapshot {
     intentResearch: hasResearchTurnIntent(ctx.recentUserText),
     researchAgent: isResearchAgentIntent(ctx.recentUserText),
     intentDiagram: matchesIntent(ctx.recentUserText, DIAGRAM_ASCII_RE, DIAGRAM_KO_RE),
+    intentKnowledge: matchesIntent(ctx.recentUserText, KNOWLEDGE_DESIGN_ASCII_RE, KNOWLEDGE_DESIGN_KO_RE),
     recentNetworkError: hasRecentNetworkError(ctx.recentToolResults),
 
     intentBrowse: matchesIntent(ctx.recentUserText, BROWSE_ASCII_RE, BROWSE_KO_RE),
@@ -358,6 +363,7 @@ function fingerprintOf(s: SignalSnapshot): string {
     s.intentResearch ? 'research' : '-',
     s.researchAgent ? 'research-agent' : '-',
     s.intentDiagram ? 'diagram' : '-',
+    s.intentKnowledge ? 'knowledge' : '-',
     s.recentNetworkError ? 'neterr' : '-',
     s.modelFamily ?? '-',
     s.modelTier ?? '-',
@@ -386,6 +392,7 @@ export function signalsSummary(s: SignalSnapshot): string {
     on('hasGitRemote', 'git-remote'),
     on('intentResearch', 'intent:research'),
     on('intentDiagram', 'intent:diagram'),
+    on('intentKnowledge', 'intent:knowledge'),
     on('recentNetworkError', 'neterr'),
     on('paidKeyGrok', 'grok-key'),
     on('paidCliFirecrawl', 'firecrawl-key'),

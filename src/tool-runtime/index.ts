@@ -68,7 +68,6 @@ import { elanousLinearIssueRuntime } from './elanous-linear-issue-runtime.js';
 import { elanousFsListRuntime } from './elanous-fs-list-runtime.js';
 import { elanousFsReadRuntime } from './elanous-fs-read-runtime.js';
 import { elanousShowroomBroadcastRuntime } from './elanous-showroom-broadcast-runtime.js';
-import { elanousAutopilotLaunchRuntime } from './elanous-autopilot-launch-runtime.js';
 import { elanousTaskSubmitRuntime } from './elanous-task-submit-runtime.js';
 import { asideSelectionRuntime } from './aside-selection-runtime.js';
 import { GRAPH_MCP_RUNTIMES } from './graph-mcp-runtimes.js';
@@ -178,7 +177,6 @@ export function registerAllDefaultToolRuntimes(opts: RegisterAllDefaultToolRunti
   registerToolRuntime(elanousFsListRuntime);
   registerToolRuntime(elanousFsReadRuntime);
   registerToolRuntime(elanousShowroomBroadcastRuntime);
-  registerToolRuntime(elanousAutopilotLaunchRuntime);
   registerToolRuntime(elanousTaskSubmitRuntime);
   registerToolRuntime(asideSelectionRuntime);
   for (const rt of GRAPH_MCP_RUNTIMES) registerToolRuntime(rt);

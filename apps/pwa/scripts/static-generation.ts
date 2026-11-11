@@ -1,5 +1,5 @@
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,60 @@ export function validateStaticExport(candidate: string): void {
 
 export function resolveNextBuildBin(appDir: string): string {
   return createRequire(join(resolve(appDir), 'package.json')).resolve('next/dist/bin/next');
+}
+
+function resolveRepositoryNodeModules(repoRoot: string): string[] {
+  const sources: string[] = [];
+  // Node checks node_modules beside each parent directory, skipping a
+  // directory already named node_modules. This also reaches a sibling such as
+  // /project/node_modules from /project/foo/node_modules/a/node_modules/elanous.
+  for (let parent = repoRoot; ; parent = dirname(parent)) {
+    if (basename(parent) !== 'node_modules') {
+      const candidate = join(parent, 'node_modules');
+      if (existsSync(candidate) && !sources.includes(candidate)) sources.push(candidate);
+    }
+    if (parent === dirname(parent)) break;
+  }
+  if (sources.length === 0) throw new Error(`cannot find node_modules for installed package at ${repoRoot}`);
+  return sources;
+}
+
+function linkRepositoryNodeModules(repoRoot: string, stagedRepo: string, appNodeModules?: string): void {
+  const sources = resolveRepositoryNodeModules(repoRoot);
+  if (appNodeModules && existsSync(appNodeModules) && !sources.includes(appNodeModules)) sources.push(appNodeModules);
+  if (sources.length === 1) {
+    symlinkSync(sources[0]!, join(stagedRepo, 'node_modules'), 'dir');
+    return;
+  }
+
+  const stagedModules = join(stagedRepo, 'node_modules');
+  mkdirSync(stagedModules, { recursive: true });
+  // Local package dependencies shadow hoisted dependencies in Node resolution.
+  for (const source of sources) {
+    for (const name of readdirSync(source)) {
+      const sourceEntry = join(source, name);
+      const stagedEntry = join(stagedModules, name);
+      if (name.startsWith('@') && existsSync(sourceEntry) && lstatSync(sourceEntry).isDirectory()) {
+        mkdirSync(stagedEntry, { recursive: true });
+        for (const scopedName of readdirSync(sourceEntry)) {
+          const scopedSource = join(sourceEntry, scopedName);
+          const scopedStaged = join(stagedEntry, scopedName);
+          if (!existsSync(scopedStaged)) symlinkSync(scopedSource, scopedStaged, 'dir');
+        }
+      } else if (!existsSync(stagedEntry)) {
+        symlinkSync(sourceEntry, stagedEntry, lstatSync(sourceEntry).isDirectory() ? 'dir' : 'file');
+      }
+    }
+  }
+}
+
+/** Stage a repository-owned directory that Next imports across the app/repo boundary. */
+export function linkStagedRepoDirectory(repoRoot: string, stagedRepo: string, name: string): string {
+  const source = join(repoRoot, name);
+  const destination = join(stagedRepo, name);
+  mkdirSync(dirname(destination), { recursive: true });
+  symlinkSync(source, destination, 'dir');
+  return destination;
 }
 
 export function migrateStoppedOut(outDir: string, afterLegacyMoved?: () => void): string {
@@ -75,31 +129,51 @@ function recoverStoppedMigration(out: string): string | undefined {
   return undefined;
 }
 
-export async function runStaticBuild(appDir = resolve(import.meta.dir, '..')): Promise<void> {
+export interface StaticBuildTestHooks {
+  /** Test seam invoked after staging; production always runs Next.js directly. */
+  readonly runBuild?: (appDir: string, stagedRepo: string, stagedApp: string) => number;
+}
+
+export async function runStaticBuild(appDir = resolve(import.meta.dir, '..'), hooks: StaticBuildTestHooks = {}): Promise<void> {
   const temporaryRoot = mkdtempSync(join(tmpdir(), 'elanous-pwa-build-'));
   const stagedRepo = join(temporaryRoot, 'repo');
   const stagedApp = join(stagedRepo, 'apps', 'pwa');
   const repoRoot = resolve(appDir, '../..');
   try {
     mkdirSync(dirname(stagedApp), { recursive: true });
-    cpSync(appDir, stagedApp, { recursive: true, filter: (source) => !source.includes('/node_modules') && !source.includes('/.next') && !source.endsWith('/out') && !source.includes('/.pwa-generations') });
+    cpSync(appDir, stagedApp, {
+      recursive: true,
+      filter: (source) => {
+        // The installed package itself can live below node_modules. Filter only
+        // generated paths inside apps/pwa, not matching ancestor directories.
+        const segments = relative(appDir, source).split(sep);
+        return !segments.includes('node_modules') && !segments.includes('.next') &&
+          segments.at(-1) !== 'out' && !segments.includes('.pwa-generations');
+      },
+    });
     cpSync(join(repoRoot, 'src'), join(stagedRepo, 'src'), { recursive: true });
     cpSync(join(repoRoot, 'scripts'), join(stagedRepo, 'scripts'), { recursive: true });
     cpSync(join(repoRoot, 'skills', 'omni-crawl'), join(stagedRepo, 'skills', 'omni-crawl'), { recursive: true });
     // Source modules imported by Next can resolve scenario fixtures during type checking.
-    symlinkSync(join(repoRoot, 'scenarios'), join(stagedRepo, 'scenarios'), 'dir');
+    linkStagedRepoDirectory(repoRoot, stagedRepo, 'scenarios');
+    // First-run provider selection imports its curated model list from catalog/.
+    linkStagedRepoDirectory(repoRoot, stagedRepo, 'catalog');
+    // The OpenRouter model picker also imports its Solar profile from docs/.
+    linkStagedRepoDirectory(repoRoot, stagedRepo, 'docs/profiles');
     mkdirSync(join(stagedRepo, 'plugins'), { recursive: true });
     symlinkSync(join(repoRoot, 'plugins', 'graph-instance-view'), join(stagedRepo, 'plugins', 'graph-instance-view'), 'dir');
-    symlinkSync(join(repoRoot, 'node_modules'), join(stagedRepo, 'node_modules'), 'dir');
     const appNodeModules = join(appDir, 'node_modules');
+    linkRepositoryNodeModules(repoRoot, stagedRepo, appNodeModules);
     if (existsSync(appNodeModules)) symlinkSync(appNodeModules, join(stagedApp, 'node_modules'), 'dir');
     const buildSha = spawnSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: appDir, encoding: 'utf8' }).stdout.trim();
-    const result = spawnSync(process.execPath, [resolveNextBuildBin(appDir), 'build'], {
-      cwd: stagedApp,
-      stdio: 'inherit',
-      env: { ...process.env, ...(buildSha ? { ELANOUS_PWA_BUILD_SHA: buildSha } : {}) },
-    });
-    if (result.status !== 0) throw new Error(`next build failed (${result.status ?? result.signal})`);
+    const status = hooks.runBuild
+      ? hooks.runBuild(appDir, stagedRepo, stagedApp)
+      : spawnSync(process.execPath, [resolveNextBuildBin(appDir), 'build'], {
+        cwd: stagedApp,
+        stdio: 'inherit',
+        env: { ...process.env, ...(buildSha ? { ELANOUS_PWA_BUILD_SHA: buildSha } : {}) },
+      }).status ?? 1;
+    if (status !== 0) throw new Error(`next build failed (${status})`);
     await publishStaticGeneration(join(stagedApp, 'out'), appDir);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });

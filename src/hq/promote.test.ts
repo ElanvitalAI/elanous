@@ -526,7 +526,7 @@ test('MK checksum verification runs against a real generated standby snapshot be
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }, 120_000);
 
-test('real CLI routes a dry-run to a fake host executable without invoking remote writes', () => {
+test('real CLI accepts mshq for the Joosungui-MacStudio host without invoking remote writes', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hq-promote-cli-'));
   try {
     const fake = join(dir, 'ssh');
@@ -534,9 +534,9 @@ test('real CLI routes a dry-run to a fake host executable without invoking remot
     const configDir = join(dir, 'config');
     mkdirSync(configDir);
     writeFileSync(join(configDir, 'config.json'), JSON.stringify({ hq: { arbiter: 'cloud-vm' } }));
-    writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' "$*" >> "$HQ_FAKE_LOG"\ncase "$*" in\n *'date +%s && echo ----'*) printf '1000000\\n----\\n{"holder":"MacStudioB1","generation":7,"acquiredAt":999000,"renewedAt":999999,"ttlSeconds":1500}\\n';;\n *'standby-verify.ts'*) printf '%s\\n' '{"ok":true,"tiers":[{"tier":"core","generation":"core-gen","manifestSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","checked":1,"entries":1},{"tier":"big","generation":"big-gen","manifestSha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","checked":1,"entries":1}]}';;\n *'hq promote --help'*) echo host=MacStudioB1;;\n *) echo OK;;\nesac\n`);
+    writeFileSync(fake, `#!/bin/sh\nprintf '%s\\n' "$*" >> "$HQ_FAKE_LOG"\ncase "$*" in\n *'date +%s && echo ----'*) printf '1000000\\n----\\n{"holder":"Joosungui-MacStudio","generation":7,"acquiredAt":999000,"renewedAt":999999,"ttlSeconds":1500}\\n';;\n *'standby-verify.ts'*) printf '%s\\n' '{"ok":true,"tiers":[{"tier":"core","generation":"core-gen","manifestSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","checked":1,"entries":1},{"tier":"big","generation":"big-gen","manifestSha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","checked":1,"entries":1}]}';;\n *'hq promote --help'*) echo host=Joosungui-MacStudio;;\n *) echo OK;;\nesac\n`);
     chmodSync(fake, 0o700);
-    const cli = spawnSync('bun', [join(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir, 'hq', 'promote', '--to', 'node-b', '--json'], {
+    const cli = spawnSync('bun', [join(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir, 'hq', 'promote', '--to', 'mshq', '--json'], {
       encoding: 'utf8', timeout: 60_000, env: { ...process.env, HOME: dir, PATH: `${dir}:${process.env.PATH}`, HQ_FAKE_LOG: log },
     });
     expect(cli.status, cli.stderr).toBe(0);
@@ -546,8 +546,8 @@ test('real CLI routes a dry-run to a fake host executable without invoking remot
     expect(readFileSync(log, 'utf8')).not.toMatch(/HQ_PROMOTE_CORE=|mkdtemp|nexus run|steward mode rescue/);
     expect(report.apply).toBe(false);
     const absent = join(dir, 'absent');
-    writeFileSync(fake, readFileSync(fake, 'utf8').replace('"holder":"MacStudioB1"', '"holder":"MacBookProM5"'));
-    const denied = spawnSync('bun', [join(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir, 'hq', 'promote', '--to', 'node-b', '--apply', '--json'], {
+    writeFileSync(fake, readFileSync(fake, 'utf8').replace('"holder":"Joosungui-MacStudio"', '"holder":"MacBookProM5"'));
+    const denied = spawnSync('bun', [join(import.meta.dir, '../../bin/elanous.mjs'), '--test', '--config-dir', configDir, 'hq', 'promote', '--to', 'mshq', '--apply', '--json'], {
       encoding: 'utf8', timeout: 60_000, env: { ...process.env, HOME: dir, PATH: `${dir}:${process.env.PATH}`, HQ_FAKE_LOG: absent },
     });
     expect(denied.status).toBe(1);

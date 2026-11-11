@@ -34,7 +34,7 @@ test('skips null and cleaned-empty rows; zero rows and null input yield []', () 
 });
 
 test('public text masks a private path before truncating', () => {
-  const [line] = seatsNowLine(data(row('OP', '/home/user/.ssh/id_rsa 진행 중')), clock);
-  expect(line!.text).not.toContain('/home/user');
+  const [line] = seatsNowLine(data(row('OP', '/home/ubuntu/.ssh/id_rsa 진행 중')), clock);
+  expect(line!.text).not.toContain('/home/ubuntu');
   expect(line!.text).toContain('진행 중');
 });

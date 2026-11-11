@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import type { WorldScenarioResult } from './world.js';
+import { assertScenarioReceiptJsonSafe } from './scenario-target.js';
 
 export type SuiteTarget = 'sim' | 'real';
 export interface SuiteReceipt {
@@ -126,6 +127,7 @@ function validateReceipt(value: unknown, label: string): SuiteReceipt {
         || !Number.isFinite(step.durationMs) || step.durationMs < 0)))) {
     throw new Error(`invalid suite receipt: ${label}`);
   }
+  assertScenarioReceiptJsonSafe(value);
   return receipt as SuiteReceipt;
 }
 

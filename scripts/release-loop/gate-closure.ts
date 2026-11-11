@@ -24,8 +24,6 @@ const isTestSide = (file: string): boolean => TEST_FILE.test(file) || TEST_SIDE_
   || TEST_SIDE_NAME.test((file.split('/').pop() ?? file).replace(CODE_FILE, ''));
 /** A test-side file that lists directories or tracked files reads paths we cannot see. */
 const FS_SCAN = /\b(?:readdirSync|readdir|opendirSync|opendir|globSync|Glob|walkSync)\b|\bls-files\b/;
-/** Existing live guard stays broad; only shadow measurement uses the AST-bound reader candidate. */
-const FS_READ = /\b(?:readFileSync|readFile|createReadStream|openSync|open)\s*\(/;
 /** `import(x)` / `require(x)` with a non-literal argument loads a module we cannot name. */
 const NON_LITERAL_LOAD = /(?<![.\w$])(?:import|require)\s*\(\s*(?!['"`)\s])([^)]*)\)?/g;
 /** `const NAME = "literal"` bindings — `import(NAME)` with such a NAME loads that literal. */
@@ -383,14 +381,14 @@ function hasCommandSpawnCandidate(code: string, file: string, includeFunctionLoc
 }
 function importsFileReaderCandidate(code: string, file: string): boolean {
   const readApis = new Set(['readFileSync', 'readFile', 'createReadStream', 'openSync', 'open']);
-  const modules = new Set(['fs', 'node:fs', 'fs/promises', 'node:fs/promises']);
+  const modules = new Set(['fs', 'node:fs', 'fs/promises', 'node:fs/promises', 'fs-extra', 'fs-extra/esm', 'graceful-fs']);
   const kind = /\.tsx?$/.test(file) ? (file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS) : ts.ScriptKind.JS;
   const ast = ts.createSourceFile(file, code, ts.ScriptTarget.Latest, true, kind);
   const direct = new Set<string>();
   const namespaces = new Set<string>();
   const isFsRequire = (node: ts.Expression | undefined): boolean => !!node && ts.isCallExpression(node)
     && ts.isIdentifier(node.expression) && node.expression.text === 'require' && node.arguments.length === 1
-    && ts.isStringLiteralLike(node.arguments[0]!) && modules.has(node.arguments[0]!.text);
+    && ts.isStringLiteralLike(node.arguments[0]!);
   const bindRequire = (name: ts.BindingName): void => {
     if (ts.isIdentifier(name)) namespaces.add(name.text);
     else for (const item of name.elements) {
@@ -402,14 +400,18 @@ function importsFileReaderCandidate(code: string, file: string): boolean {
   };
   for (const statement of ast.statements) {
     if (ts.isImportDeclaration(statement) && ts.isStringLiteralLike(statement.moduleSpecifier)
-      && modules.has(statement.moduleSpecifier.text) && statement.importClause) {
+      && statement.importClause) {
       const bindings = statement.importClause;
+      const fsModule = modules.has(statement.moduleSpecifier.text);
+      // Any imported namespace may wrap a file reader; a local receiver with no imported
+      // binding is the only case this precision candidate can safely exclude.
       if (bindings.name) namespaces.add(bindings.name.text);
       if (bindings.namedBindings && ts.isNamespaceImport(bindings.namedBindings)) namespaces.add(bindings.namedBindings.name.text);
       if (bindings.namedBindings && ts.isNamedImports(bindings.namedBindings)) for (const item of bindings.namedBindings.elements) {
         const imported = item.propertyName?.text ?? item.name.text;
+        // Imported reader APIs can be wrappers around fs even when their package is not node:fs.
         if (readApis.has(imported)) direct.add(item.name.text);
-        if (imported === 'promises') namespaces.add(item.name.text);
+        if (fsModule && imported === 'promises') namespaces.add(item.name.text);
       }
     }
     if (ts.isImportEqualsDeclaration(statement) && ts.isExternalModuleReference(statement.moduleReference)
@@ -589,18 +591,6 @@ function hasCommandSpawnLegacy(code: string, file: string): boolean {
   visit(ast);
   return found;
 }
-function importsFileReaderLegacy(code: string): boolean {
-  const imports = /\bimport\s*\{([^}]*)\}\s*from\s*(['"])(?:node:)?fs(?:\/promises)?\2/g;
-  for (const match of code.matchAll(imports)) {
-    for (const item of match[1]!.split(',')) {
-      const reader = item.trim().match(/^(?:type\s+)?(readFileSync|readFile|createReadStream|openSync|open)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/);
-      if (!reader) continue;
-      const local = reader[2] ?? reader[1]!;
-      if (new RegExp(`(?<![\\w$])${local}\\s*\\(`).test(code)) return true;
-    }
-  }
-  return false;
-}
 /** An npm package specifier (`x`, `x/sub`, `@scope/x/sub`). */
 const PACKAGE_NAME = /^(?:@[a-z0-9][\w.~-]*\/)?[a-z0-9][\w.~-]*(?:\/[^\s]*)?$/i;
 const SUFFIXES = ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'];
@@ -635,7 +625,7 @@ export interface ClosureOptions {
   omitFunctionLocalRequires?: boolean;
   /** Shadow-only candidate: local process launches in production modules do not widen the test radius. */
   omitFunctionLocalProcessSpawnOpacity?: boolean;
-  /** Use AST-bound reader recognition in the shadow candidate; live keeps FS_READ's broad guard. */
+  /** Use AST-bound process spawn recognition in the shadow candidate. */
   shadowCandidatePrecision?: boolean;
 }
 
@@ -842,9 +832,9 @@ export function buildClosureGraph(tree: ClosureTree, options: ClosureOptions = {
     // A code module may read a repo fixture through a variable, member access, or helper call. Literal edges above
     // are useful evidence, but cannot prove that every read's runtime-selected path is covered. Mark the module
     // opaque so tests importing it are rerun when source inputs change.
-    const fileReadOpaque = options.shadowCandidatePrecision
-      ? importsFileReaderCandidate(code, file)
-      : FS_READ.test(code) || importsFileReaderLegacy(code);
+    // A literal dynamic fs import can return readers through destructuring or an escaped namespace.
+    const fileReadOpaque = importsFileReaderCandidate(code, file)
+      || /\bimport\s*\(\s*['"`](?:(?:node:)?fs(?:\/promises)?|fs-extra(?:\/esm)?|graceful-fs)['"`]\s*\)/.test(code);
     if (fileReadOpaque || /\brequire\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)/.test(code))
       blindAs(file, 'reads a file through an opaque path');
     if (eager.has(file)) selfStaticImports.add(file);

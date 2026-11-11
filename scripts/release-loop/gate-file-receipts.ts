@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
-import { buildClosureGraph, type ClosureTree } from './gate-closure.js';
+import { buildClosureGraph, type ClosureGraph, type ClosureTree } from './gate-closure.js';
+
+// A cut tree is immutable. One gate plans thousands of file receipts from that same tree;
+// rebuilding the whole import graph for every file stalls before the first Pod starts.
+const graphByTree = new WeakMap<ClosureTree, ClosureGraph>();
 
 export interface GateFileReceiptIdentity {
   file: string;
@@ -37,7 +41,11 @@ export interface GateFileReceiptEnvelope extends GateFileReceipt {
 /** Hash every tracked input reachable from one test, including literal non-code assets; opaque/missing inputs fail closed. */
 export function gateFileReceiptIdentityFromClosure(tree: ClosureTree, file: string, imageDigest: string): GateFileReceiptIdentity | null {
   if (!tree.files.includes(file) || !/^sha256:[a-f0-9]{64}$/i.test(imageDigest)) return null;
-  const graph = buildClosureGraph(tree);
+  let graph = graphByTree.get(tree);
+  if (!graph) {
+    graph = buildClosureGraph(tree);
+    graphByTree.set(tree, graph);
+  }
   const pending = [file];
   const closure = new Set<string>();
   const opaqueReasons = new Set<string>();

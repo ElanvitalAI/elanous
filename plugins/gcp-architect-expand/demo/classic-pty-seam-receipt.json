@@ -1,0 +1,21 @@
+{
+  "checkedAt": "2026-11-10T07:03:00Z",
+  "surface": "actual Elanous classic TUI PTY, browse mode",
+  "command": "bun bin/elanous.mjs --test=<isolated> --config-dir <isolated> --legacy",
+  "seamPr": 36517,
+  "seamHead": "81235ef7b80617245fdb68aec69018c65aebe78c",
+  "pluginManifestSource": "PR #36512 head with route search triggers",
+  "modelWorld": "local loopback fake model; no real provider or GCP calls",
+  "intendedPath": ["ToolSearch(route:GCP 확장안)", "select gcp_architect_expand", "runGraph", "inline y/N", "board attachments"],
+  "initialModelToolCount": 50,
+  "initialToolSearchAdvertised": false,
+  "initialGcpRouteAdvertised": false,
+  "initialGcpRouteAbsenceExpected": true,
+  "forcedSearchCallResult": "INVALID TOOL — ToolSearch is not a registered tool name",
+  "routeSearchCompleted": false,
+  "runGraphCalledFromActualTui": false,
+  "inlineConfirmationSeen": false,
+  "boardCardAttachmentsSeen": false,
+  "integratedDemoReceipt": false,
+  "blocker": "The classic browse turn's model-facing tool list omitted ToolSearch, so the intended deferred-route discovery could not start."
+}

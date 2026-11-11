@@ -554,14 +554,6 @@ export function buildMemoryInjection(
   const injected: string[] = [];
   let usedTokens = 0;
 
-  if (alwaysIdx) {
-    const idxTok = estimateTokens(index);
-    if (idxTok <= maxTokens) {
-      parts.push('## Memory index\n\n' + index.trim());
-      usedTokens += idxTok;
-    }
-  }
-
   // 📌 pinned 기억 — 키워드 무관 항상 주입(relevance gate bypass · Letta pinned block /
   //    claude-code MEMORY.md tier 동형). priority 높은 순. core/safety/ref-location 사실용.
   const alwaysInject = opts.alwaysInject;
@@ -572,12 +564,20 @@ export function buildMemoryInjection(
   for (const e of pinnedMems) {
     const chunk = pinnedChunk(e);
     const tok = estimateTokens(chunk);
-    if (usedTokens + tok > maxTokens) break;
+    if (usedTokens + tok > maxTokens) continue;
     pinnedParts.push(chunk);
     injected.push(e.id);
     usedTokens += tok;
   }
   if (pinnedParts.length > 0) parts.push('## Pinned memories\n\n' + pinnedParts.join('\n\n'));
+  // Reserve the budget for pinned facts before the potentially large index.
+  if (alwaysIdx) {
+    const idxTok = estimateTokens(index);
+    if (usedTokens + idxTok <= maxTokens) {
+      parts.unshift('## Memory index\n\n' + index.trim());
+      usedTokens += idxTok;
+    }
+  }
 
   // low-context guard(claude-code attachments.ts:2378 이식) — 토큰 1개 이하 쿼리(bare "ref" 등)는
   //    의도 판정 불가라 키워드 recall 을 아예 스킵(오차용 방지). pinned + index 만 남는다.
@@ -724,21 +724,23 @@ export async function buildMemoryInjectionLLM(
   const injected: string[] = [];
   let usedTokens = 0;
 
-  if (alwaysIdx) {
-    const idxTok = estimateTokens(index);
-    if (idxTok <= maxTokens) { parts.push('## Memory index\n\n' + index.trim()); usedTokens += idxTok; }
-  }
-
   // pinned 항상주입(키워드/판정 무관).
   const pinnedMems = listMemories({}, root).filter((m) => m.pinned && m.contextCard?.status !== 'retired').sort((a, b) => b.priority - a.priority);
   const pinnedParts: string[] = [];
   for (const e of pinnedMems) {
     const chunk = pinnedChunk(e);
     const tok = estimateTokens(chunk);
-    if (usedTokens + tok > maxTokens) break;
+    if (usedTokens + tok > maxTokens) continue;
     pinnedParts.push(chunk); injected.push(e.id); usedTokens += tok;
   }
   if (pinnedParts.length > 0) parts.push('## Pinned memories\n\n' + pinnedParts.join('\n\n'));
+  if (alwaysIdx) {
+    const idxTok = estimateTokens(index);
+    if (usedTokens + idxTok <= maxTokens) {
+      parts.unshift('## Memory index\n\n' + index.trim());
+      usedTokens += idxTok;
+    }
+  }
 
   // low-context guard + LLM 판정(실패 시 keyword fallback).
   const lowContext = extractKeywords(userText).length < 2;

@@ -25,7 +25,7 @@ import { defaultTelegramCommands } from '../src/telegram-commands.js';
 const KNOWN_TELEGRAM_COMMANDS = [
   'help', 'status', 'new', 'clear', 'reset', 'brain', 'ping', 'provider', 'skills', 'skill',
   'digest', 'cc', 'cdx', 'gem', 'cc_clear', 'local', 'attach', 'detach', 'sessions', 'fork',
-  'resume', 'intake', 'cancel', 'missions', 'mission_del', 'taste', 'bots', 'bot', 'screen', 'botsay',
+  'resume', 'intake', 'cancel', 'taste', 'bots', 'bot', 'screen', 'botsay',
 ] as const;
 
 const BOTS = [

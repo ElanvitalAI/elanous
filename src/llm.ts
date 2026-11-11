@@ -13,6 +13,7 @@ import { testFakeLlmDefaultSelected, testFakeLlmEnabled, testFakeLlmProvider } f
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { globalAnchorPath } from './prompt-library/universal-preamble.js';
+import { isSolarPro4Model, solarOptimizationEnabled } from './prompt-library/providers/solar.js';
 import type { LLMUsage } from './prompt-cache/types.js';
 import { applyOpenRouterCacheControl, openRouterPromptCacheFamily } from './prompt-cache/openrouter.js';
 import { detectLocale, type Locale } from './expression/locale.js';
@@ -33,8 +34,7 @@ import {
 import { debug, redactSecrets, redactSecretText } from './debug/log.js';
 import { estimateMessagesTokens } from './tokens.js';
 import { isVerifiedOpenGatewayModel } from './llm/opengateway-models.js';
-import { resolveCodexAccountForRun } from './oauth/codex-account-store.js';
-import { codexAccountReadStorePath, codexOwnerMirrorAuthPath, readCodexOwnerAccessMirror } from './oauth/codex-owner-mirror.js';
+import { codexAccountReadStorePath } from './oauth/codex-owner-mirror.js';
 import { llmUsageCostFields } from './budget/llm-cost.js';
 import { accumulateByokUsage } from './llm/openrouter-byok-cost.js';
 import { ACTION_PHASE_OPS_TOOLS, isSteeredShellRejection, REPAIR_PHASE_READ_ONLY_OPS_TOOLS } from './llm/tool-loop-steered-rejection.js';
@@ -298,6 +298,7 @@ function restoreProviderToolCallNames(
  *  ignore it; `textOnly()` filters it out. */
 export type LLMStreamEvent =
   | { type: 'text'; delta: string; phase?: 'commentary' | 'final' }
+  | { type: 'finish'; reason: string }
   | { type: 'text_phase'; phase: 'commentary' | 'final' }
   | { type: 'turn_end'; endTurn: boolean }
   | { type: 'codex_reasoning_item'; item: { type: 'reasoning'; encrypted_content: string; summary: unknown[]; id?: string } }
@@ -381,6 +382,10 @@ export interface LLMOpts {
   maxTokens?: number;
   /** Internal: distinguishes a caller cap from a role/model default passed to a provider. */
   maxTokensExplicit?: boolean;
+  /** Set for prompts that explicitly request a substantial design or report. */
+  longAnswer?: boolean;
+  /** Receives the terminal provider reason, including after a continuation. */
+  onFinishReason?(reason: string): void;
   signal?: AbortSignal;
   /** Override the text-stream idle watchdog per request (milliseconds). */
   streamIdleTimeoutMs?: number;
@@ -1077,6 +1082,7 @@ export async function* parseOpenAISSELines(
       }
       toolCalls.clear();
     }
+    if (typeof choice.finish_reason === 'string') yield { type: 'finish', reason: choice.finish_reason };
   }
   // Flush any trailing partial Harmony marker as literal content so a
   // truncated `<|cha` doesn't get silently dropped at stream end.
@@ -3064,6 +3070,9 @@ export async function* streamGeminiEvents(
             };
           }
         }
+        if (typeof finish === 'string' && finish.length > 0) {
+          yield { type: 'finish', reason: finish === 'MAX_TOKENS' ? 'length' : finish === 'STOP' ? 'stop' : finish };
+        }
       }
 
       const u = chunk.usageMetadata;
@@ -3152,7 +3161,11 @@ export async function* parseAnthropicSSELines(
     if (parsed.type === 'message_start' || parsed.type === 'message_delta') {
       const usage = parseAnthropicUsage(parsed);
       if (usage) pendingUsage = { ...(pendingUsage ?? {}), ...usage };
-      if (typeof parsed.delta?.stop_reason === 'string') stopReason = parsed.delta.stop_reason;
+      if (parsed.type === 'message_delta' && typeof parsed.delta?.stop_reason === 'string') {
+        const reason = parsed.delta.stop_reason;
+        stopReason = reason;
+        yield { type: 'finish', reason: reason === 'max_tokens' ? 'length' : reason === 'end_turn' ? 'stop' : reason === 'tool_use' ? 'tool_calls' : reason };
+      }
       continue;
     }
     if (parsed.type === 'message_stop') {
@@ -4074,9 +4087,7 @@ function providerDecisionCandidates(): Array<LLMProvider & { name: ProviderDecis
 export function codexOAuthAvailable(): boolean {
   if (process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1' || codexAccountReadStorePath(authStorePath()) !== authStorePath()) {
     try {
-      const mirrorPath = codexOwnerMirrorAuthPath();
-      const account = resolveCodexAccountForRun(process.env, { storePath: mirrorPath });
-      readCodexOwnerAccessMirror(account.storeKey, { path: mirrorPath });
+      readCodexOwnerMirrorForRun();
       return true;
     } catch {
       return false;
@@ -4486,10 +4497,15 @@ export function getProvider(model?: string): LLMProvider {
     const resolved = resolveModelAlias(model) ?? model;
     const glmDirect = activeGlmProviderForModel(resolved);
     if (glmDirect) return glmDirect;
+    const adapted = inferProviderFromModel(resolved);
+    // Remote access-only hosts receive Codex OAuth mirrors, not OpenAI API keys.
+    // Do not let the historical GPT → Chat Completions route bypass that mirror.
+    if (process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1' && adapted === 'openai-codex') {
+      return PROVIDERS['openai-codex']!;
+    }
     // Preserve the historical Chat Completions route for gpt-* model-only
     // requests, including future ids that the current catalog does not list.
     if (resolved.toLowerCase().startsWith('gpt-')) return PROVIDERS.openai!;
-    const adapted = inferProviderFromModel(resolved);
     if (adapted === 'openai-codex') return PROVIDERS['openai-codex']!;
     const inferred = registryInferProviderFromModel(resolved);
     if (inferred && PROVIDERS[inferred]) return PROVIDERS[inferred]!;
@@ -4690,8 +4706,19 @@ export function isLikelyVisionModel(model: string | undefined): boolean {
 type ObservedUsage = Pick<LLMUsage, 'inputTokens' | 'outputTokens' | 'cacheReadInputTokens' | 'cacheCreationInputTokens' | 'reportedCostUsd' | 'byok' | 'upstreamCostUsd' | 'stopReason'>;
 
 type ProviderTextResult =
-  | { ok: true; full: string; usage: ObservedUsage | 'unmeasured' }
+  | { ok: true; full: string; usage: ObservedUsage | 'unmeasured'; finishReason?: string }
   | { ok: false; full: string; error: unknown };
+
+/** Role budget is capped by the model catalog's reserved output allowance. */
+export function resolveDefaultOutputTokens(model: string, role?: ModelRole, longAnswer = false): number {
+  const catalog = BUILTIN_CATALOG.models.find((entry) => entry.id === (resolveModelAlias(model) ?? model));
+  const modelLimit = catalog?.reservedOutputTokens ?? 8_192;
+  const requested = role === 'classify' ? 512
+    : role === 'guardian' || role === 'coordinator' ? 2_048
+    : longAnswer || role === 'planning' || role === 'research' || role === 'audit' || role === 'implement' || role === 'review' ? 8_192
+    : 4_096;
+  return Math.max(512, Math.min(requested, modelLimit));
+}
 
 function resolveStreamIdleTimeout(opts: LLMOpts, provider: LLMProvider, model: string): { ms: number; source: 'call' | 'config' | 'default' } {
   if (opts.streamIdleTimeoutMs !== undefined
@@ -4725,6 +4752,7 @@ async function consumeProviderText(
   let iterator: AsyncIterator<string | LLMStreamEvent>;
   let full = '';
   let usage: ObservedUsage | undefined;
+  let finishReason: string | undefined;
   try {
     const wf = wellFormedLLMMessages(messages);
     if (wf.fixedMessages > 0) {
@@ -4774,7 +4802,7 @@ async function consumeProviderText(
       void closeIterator();
       return { ok: false, full, error };
     }
-    if (step.result.done) return { ok: true, full, usage: usage ?? 'unmeasured' };
+    if (step.result.done) return { ok: true, full, usage: usage ?? 'unmeasured', finishReason };
     const event = typeof step.result.value === 'string' ? { type: 'text' as const, delta: step.result.value } : step.result.value;
     if (event.type === 'usage') {
       usage = accumulateUsage(usage, event.usage);
@@ -4785,6 +4813,7 @@ async function consumeProviderText(
       }
       continue;
     }
+    if (event.type === 'finish') { finishReason = event.reason; continue; }
     if (event.type !== 'text') continue;
     full += event.delta;
     try {
@@ -4834,6 +4863,8 @@ export async function streamLLM(
   onChunk: (delta: string, full: string) => void,
   opts: LLMOpts & {
     provider?: LLMProvider;
+    /** Session turns already resolved a provider and must keep it under test. */
+    preferExplicitProvider?: boolean;
     initialProvider?: LLMProvider;
     onResolvedProvider?: (provider: string, model: string) => void;
     skipProviders?: readonly string[];
@@ -4841,7 +4872,9 @@ export async function streamLLM(
 ): Promise<string> {
   const started = Date.now();
   const fakeDefault = testFakeLlmDefaultSelected();
-  let activeProvider = fakeDefault ? testFakeLlmProvider : opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
+  let activeProvider = opts.preferExplicitProvider && opts.provider
+    ? opts.provider
+    : fakeDefault ? testFakeLlmProvider : opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
   const attemptedProviders = new Set<string>([activeProvider.name, ...(opts.skipProviders ?? [])]);
   let blockedProviders: ProviderFallbackAttempt[] = [];
   let modelOverride = opts.model;
@@ -4865,6 +4898,7 @@ export async function streamLLM(
     if (!opts.usageRole) debug.log('llm.role', 'outside-role', {
       provider: activeProvider.name, model: activeModel, site: opts.usageSite ?? 'stream-llm',
     }, { level: 'warn' });
+    const effectiveOpts = { ...opts, ...(maxTokens !== undefined ? { maxTokens } : {}) };
     debug.log('llm.router', 'streamLLM', {
       provider: activeProvider.name,
       model: activeModel,
@@ -4877,11 +4911,11 @@ export async function streamLLM(
       temperature: opts.temperature,
     }, { level: 'info' });
     // Keep text-only stream failures on streamLLM's existing provider fallback path.
-    const consumed = await consumeProviderText(
+    let consumed = await consumeProviderText(
       activeProvider,
       messages,
       {
-        ...opts,
+        ...effectiveOpts,
         model: activeModel,
         maxTokens,
         maxTokensExplicit: opts.maxTokensExplicit ?? opts.maxTokens !== undefined,
@@ -4889,7 +4923,25 @@ export async function streamLLM(
       },
       onChunk,
     );
-    const full = consumed.full;
+    let full = consumed.full;
+    if (consumed.ok && consumed.finishReason === 'length' && full.length > 0 && !opts.signal?.aborted) {
+      debug.log('llm', 'output-limit-continue', { provider: activeProvider.name, model: activeModel, maxTokens: effectiveOpts.maxTokens, firstChars: full.length });
+      const prefix = full;
+      const continued = await consumeProviderText(activeProvider, [
+        ...messages,
+        { role: 'assistant', content: prefix },
+        { role: 'user', content: 'Continue exactly where you stopped. Complete the answer without repeating earlier text.' },
+      ], { ...effectiveOpts, model: activeModel, remainingFallbacks: 0 }, (delta, retryFull) => onChunk(delta, prefix + retryFull));
+      // The continuation callback must retain the full combined text for streaming clients.
+      if (continued.ok) {
+        full = prefix + continued.full;
+        const usage = continued.usage === 'unmeasured' ? consumed.usage
+          : accumulateUsage(consumed.usage === 'unmeasured' ? undefined : consumed.usage, continued.usage);
+        consumed = { ...continued, full, usage };
+      }
+      else { full = prefix + continued.full; consumed = continued; }
+    }
+    if (consumed.ok) opts.onFinishReason?.(consumed.finishReason ?? 'unknown');
     if (consumed.ok) {
       await recordChildFirstLlmResponse({ status: 'ok' });
       if (consumed.usage !== 'unmeasured') {
@@ -4897,12 +4949,13 @@ export async function streamLLM(
           logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: opts.usageSite ?? 'stream-llm', role: opts.usageRole, phase: opts.usagePhase, jobKind: opts.usageJobKind });
         } catch { /* best-effort observation */ }
       }
-      debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'ok', kind: 'streamLLM', durationMs: Date.now() - started });
+      debug.log('llm', 'outcome', { provider: activeProvider.name, status: 'ok', kind: 'streamLLM', finishReason: consumed.finishReason ?? null, durationMs: Date.now() - started });
       debug.log('llm.router.done', 'streamLLM', {
         provider: activeProvider.name,
         model: activeModel,
         durationMs: Date.now() - started,
         textChars: full.length,
+        finishReason: consumed.finishReason ?? null,
         usage: consumed.usage,
       });
       (await import('./session-runtime/provider-circuit.js')).recordProviderSuccess(activeProvider.name, Date.now());
@@ -8391,7 +8444,14 @@ export async function streamLLMWithTools(
   const circuit = !opts.provider && !opts.initialProvider && !testFakeLlmDefaultSelected()
     ? await import('./session-runtime/provider-circuit.js')
     : undefined;
-  const fakeDefault = testFakeLlmDefaultSelected();
+  // NODE_ENV=test chooses a fake default, but an injected fixture provider
+  // owns this turn. Explicit fake and sim-world switches still forbid using it.
+  const forcedFake = process.env.ELANOUS_LLM_MODE === 'fake'
+    || process.env.ELANOUS_TEST_FAKE_LLM === '1'
+    || Boolean(process.env.ELANOUS_UX_SIM_RUN_ID?.trim())
+    || process.env.ELANOUS_SIM_UNIVERSE === '1';
+  const fakeDefault = testFakeLlmDefaultSelected()
+    && (!(opts.provider ?? opts.initialProvider) || forcedFake);
   const provider = fakeDefault ? testFakeLlmProvider : opts.provider ?? opts.initialProvider ?? await resolveDefaultProviderAsync(opts.model);
   const initial = finalizeStreamingProviderModel(provider, opts.model ?? provider.defaultModel);
   let activeProvider = initial.provider;
@@ -8827,7 +8887,9 @@ export async function streamLLMWithTools(
   let loopTermination: 'budget-exhausted' | 'aborted' = 'budget-exhausted';
   let terminalTurn = maxTurns;
 
-  for (let turn = 0; turn < maxTurns || ((completionNeedsFinalTurn || codexContinuationNeeded) && turn === maxTurns); turn++) {
+  let lengthContinuationUsed = false;
+  let lengthContinuationNeeded = false;
+  for (let turn = 0; turn < maxTurns || ((completionNeedsFinalTurn || codexContinuationNeeded || lengthContinuationNeeded) && turn === maxTurns); turn++) {
     // ★ /cancel 범용화(대표 2026-07-12) — abort 신호가 오면 tool 루프를 즉시 중단한다. 이게 없으면
     //   fetch 는 abort 돼도 루프가 다음 turn 으로 계속 돌아 tool 반복(grep 폭주 등)이 멈추지 않는다.
     if (opts.signal?.aborted) {
@@ -8864,6 +8926,7 @@ export async function streamLLMWithTools(
       }
     }
     let turnText = '';
+    let turnFinishReason: string | undefined;
     let turnTextPhase: 'commentary' | 'final' | undefined;
     let turnEnd: boolean | undefined;
     codexContinuationNeeded = false;
@@ -9326,6 +9389,10 @@ export async function streamLLMWithTools(
         if (ev.phase) turnCodexTextPhase = ev.phase === 'final' ? 'final_answer' : 'commentary';
         fullText += ev.delta;
         emitRetryDisplayStep(retryDisplay.onText(ev.delta, turnText));
+      } else if (ev.type === 'finish') {
+        turnFinishReason = ev.reason;
+        opts.onFinishReason?.(ev.reason);
+        debug.log('llm.stream', 'provider-finish', { provider: activeProvider.name, model: activeModel, turn, finishReason: ev.reason });
       } else if (ev.type === 'text_phase') {
         turnTextPhase = ev.phase;
         turnCodexTextPhase = ev.phase === 'final' ? 'final_answer' : 'commentary';
@@ -9485,6 +9552,15 @@ export async function streamLLMWithTools(
       if (turn >= maxTurns) break;
       continue;
     }
+    if (pendingCalls.length === 0 && turnFinishReason === 'length' && turnText.length > 0 && !lengthContinuationUsed && !opts.signal?.aborted) {
+      lengthContinuationUsed = true;
+      lengthContinuationNeeded = true;
+      history.push({ role: 'assistant', content: turnText });
+      history.push({ role: 'user', content: 'Continue exactly where you stopped. Complete the answer without repeating earlier text.' });
+      debug.log('llm.stream', 'output-limit-continue', { provider: activeProvider.name, model: activeModel, turn, maxTokens: turnOpts.maxTokens ?? null });
+      continue;
+    }
+    lengthContinuationNeeded = false;
     // No tool calls + non-empty text = the model gave its final answer.
     if (pendingCalls.length === 0 && turnText.length > 0) {
       const visibleText = finalizeVisibleAssistantText(fullText, turnText, sawToolRound);
@@ -11827,7 +11903,7 @@ import { resolveCodexAccount, effectiveCodexHome } from './oauth/codex-account.j
 import { codexCreditSpendReason } from './oauth/codex-billing-route.js';
 import { join } from 'node:path';
 import {
-  CODEX_API_BASE_URL, getCodexUserAgent, loadFreshCodexAuthState,
+  CODEX_API_BASE_URL, getCodexUserAgent, loadFreshCodexAuthState, readCodexOwnerMirrorForRun,
 } from './oauth/codex.js';
 import { extractChatGPTClaims } from './oauth/jwt.js';
 
@@ -11916,6 +11992,7 @@ function makeOpenAICompatProvider(
       const activeModel = opts.model || model;
       if (getModelFamily(activeModel) === 'claude') assertNoTopLevelToolSchemaCombinators(opts.tools);
       const wireModel = name === 'openrouter' ? openRouterWireModel(activeModel) : activeModel;
+      const solar = name === 'openrouter' && solarOptimizationEnabled() && isSolarPro4Model(activeModel);
       const tools = toOpenAITools(
         opts.tools,
         name === 'openrouter' && openRouterNeedsKimiToolSchema(wireModel),
@@ -11991,7 +12068,9 @@ function makeOpenAICompatProvider(
             //   hermes 는 kimi 에 temperature 를 «아예» 안 보내고(게이트웨이가 thinking 1.0 / 비thinking 0.6 을 고름),
             //   openclaw 는 always-thinking(kimi-k3 등)에서 sampling 칸을 지운다. ⇒ 호출자가 «명시»할 때만 싣는다.
             if (wire.omitDefaultTemperature && opts.temperature === undefined) delete (fields as Record<string, number>).temperature;
-            if (wire.omitMaxTokens) {
+            // Solar honors an explicit caller budget. Other OpenRouter models retain their
+            // existing unbounded output behavior; absent Solar budgets remain unbounded too.
+            if (wire.omitMaxTokens && !(solar && opts.maxTokens !== undefined)) {
               delete (fields as Record<string, number>).max_tokens;
               delete (fields as Record<string, number>).max_completion_tokens;
             }
@@ -12001,8 +12080,8 @@ function makeOpenAICompatProvider(
           ...(toolChoice !== undefined ? { tool_choice: toolChoice } : {}),
           ...(wire.extraBody ?? {}),
           ...deepSeekProvider,
-          ...(name === 'openrouter' && opts.responseFormat ? {
-            response_format: opts.responseFormat,
+          ...(name === 'openrouter' && (opts.responseFormat || (solar && tools)) ? {
+            ...(opts.responseFormat ? { response_format: opts.responseFormat } : {}),
             provider: {
               ...((wire.extraBody as { provider?: Record<string, unknown> } | undefined)?.provider ?? {}),
               ...((deepSeekProvider as { provider?: Record<string, unknown> }).provider ?? {}),

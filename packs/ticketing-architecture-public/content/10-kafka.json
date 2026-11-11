@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "이벤트 소비자 멱등",
+  "source": "https://kafka.apache.org/40/design/design/",
+  "body": "브로커의 at-least-once 전달에서는 중복을 예상한다. 소비자는 event_id UNIQUE 기록과 비즈니스 반영을 같은 DB 트랜잭션에 넣고 성공 후 offset을 커밋한다. 중복·재시작·브로커 중단에서 고객에게 티켓 확정 알림이 중복되거나 누락되는지 시험한다. 파티션 키는 공연/주문 순서 요구에 맞춘다."
+}

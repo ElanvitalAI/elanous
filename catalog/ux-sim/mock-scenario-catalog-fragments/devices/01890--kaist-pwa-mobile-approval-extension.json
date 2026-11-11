@@ -1,0 +1,32 @@
+{
+  "id": "kaist-pwa-mobile-approval-extension",
+  "name": "KAIST PWA mobile approval extension",
+  "audience": "internal",
+  "checklistCells": ["DEMO-BRIEF-TO-REQUIREMENTS", "DEMO-BOARD-FROM-GRAPH"],
+  "implementation": [
+    "src/ux-sim/kaist-classic-pwa-replay-world.ts",
+    "src/ux-sim/kaist-classic-pwa-browser-replay.ts",
+    "apps/pwa/src/components/chat/MemberProposalCard.test.tsx"
+  ],
+  "tests": [
+    "src/ux-sim/kaist-classic-pwa-browser-replay.test.ts",
+    "apps/pwa/src/components/chat/MemberProposalCard.test.tsx"
+  ],
+  "target": "Extend the canonical KAIST classic PTY to PWA browser replay with a 390px mobile viewport and one explicit owner-session approval POST that returns the same graph runId.",
+  "inputs": [
+    "the canonical 01880 classic PTY receipt and loopback PWA replay world",
+    "fake member session and declared absorb suggest_accept dispatch"
+  ],
+  "observations": [
+    "scene 3 clicks OK in the rendered PWA and records exactly one approval POST with the fake member cookie",
+    "the approval response and component dispatch use the classic PTY graph runId",
+    "the 390x844 mobile replay retains scene screenshots and the canonical external-request fence"
+  ],
+  "entryCommands": [
+    "CHROME_BIN=${CHROME_BIN:?set-Chrome-executable} bun test src/ux-sim/kaist-classic-pwa-browser-replay.test.ts",
+    "bun test --timeout 180000 apps/pwa/src/components/chat/MemberProposalCard.test.tsx"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

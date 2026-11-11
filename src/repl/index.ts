@@ -40,7 +40,7 @@ import {
 import { getUserConfig, reloadUserConfig, saveUserConfig, jumpToRotationEntry } from '../user-config.js';
 import type { UserConfig } from '../user-config/types.js';
 import { setAmbientSessionId, debug } from '../debug/log.js';
-import { buildInstalledSkillCatalogMessage, type InstalledSkillSummary } from '../dashboard/skill-catalog-preamble.js';
+import { buildInstalledSkillCatalogMessage, type InstalledSkillSummary } from '../skills/skill-catalog-preamble.js';
 import { resolveModelContextWindow } from '../models/context-window.js';
 import { decideSigintAction } from './sigint.js';
 import { decideSessionStart, observeSessionStart } from '../session/session-start.js';
@@ -50,7 +50,7 @@ import { inspectActiveProvider } from '../provider-summary.js';
 import { parse as parseYaml } from 'yaml';
 import type { PendingTaskNotification } from '../agent/task-notification.js';
 import { dispatchReplMessageTool, isReplMessageTool } from './ops-msg-bridge.js';
-import { buildSeatBootSystemMessages, type SeatBootDeps } from '../dashboard/seat-boot-preamble.js';
+import { buildSeatBootSystemMessages, type SeatBootDeps } from '../seat/seat-boot-preamble.js';
 import { installNextTuiSelfHealthTracker } from '../tui/chat/self-health-status.js';
 import { bashApprovalFinding } from '../tool-runtime/bash-approval.js';
 import { createReplShellApprover, dispatchNextTuiBash, type ShellApprovalIpcProcess } from '../tui-client/next-shell-approval.js';
@@ -61,9 +61,29 @@ import { monotonicNowMs } from '../esc-abort-gate.js';
 import { createPushNowRouter, createShellSnapshotRouter } from './shell-snapshot-router.js';
 import { nextTuiPushNowDecision } from '../tui/core/queue.js';
 import { setSessionTierOverride } from '../model-tier/session-override.js';
+import { parseToolResultEnvelope } from '../chat/tool-render/result-text.js';
+import type { AgentTask } from '../agent/types.js';
 
 /** Private side channel for the next TUI. Ordinary REPL JSONL stdout is unchanged. */
 const NEXT_TUI_BG_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
+type NestedTask = Pick<AgentTask, 'id' | 'parentTaskId' | 'label' | 'definition' | 'state'>;
+
+/** A completed descendant belongs to a turn only through its registered root Agent task. */
+export function completedNestedAgents(tasks: readonly NestedTask[], roots: ReadonlySet<string>) {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  return tasks.filter((task) => {
+    if (!task.parentTaskId || !['done', 'error', 'aborted'].includes(task.state)) return false;
+    const seen = new Set([task.id]);
+    let parent: string | undefined = task.parentTaskId;
+    while (parent && !seen.has(parent)) {
+      if (roots.has(parent)) return true;
+      seen.add(parent);
+      parent = byId.get(parent)?.parentTaskId;
+    }
+    return false;
+  }).map((task) => ({ id: task.id, description: `↳ ${task.label ?? task.definition.name}`,
+    status: task.state === 'done' ? 'done' as const : 'failed' as const }));
+}
 type ReplShellActivity =
   | { phase: 'start'; id: string; name: 'Bash' | 'RunShell'; startedAtMonotonicMs: number }
   | { phase: 'finish'; id: string; name: 'Bash' | 'RunShell' }
@@ -84,6 +104,7 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
   const { globalTaskNotificationQueue } = require('../agent/task-notification.js') as typeof import('../agent/task-notification.js');
   const unregisteredPromises = new Set<string>();
   const backgroundTaskIds = new Set<string>();
+  const ownedRootTaskIds = new Set<string>();
   let last = '';
   const emit = () => {
     const tasks = globalAgentRegistry.list();
@@ -97,7 +118,8 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
     }).map((task) => ({
       id: task.id, label: task.label ?? task.definition.name, state: task.state,
     }));
-    const frame = JSON.stringify({ sessionId, promised: unregisteredPromises.size > 0, running, pending: globalTaskNotificationQueue.size + bufferedCount(), tasks: roster });
+    const nestedAgents = completedNestedAgents(tasks, ownedRootTaskIds);
+    const frame = JSON.stringify({ sessionId, promised: unregisteredPromises.size > 0, running, pending: globalTaskNotificationQueue.size + bufferedCount(), tasks: roster, nestedAgents });
     if (frame === last) return;
     last = frame;
     process.stderr.write(`${NEXT_TUI_BG_PREFIX}${frame}\n`);
@@ -116,13 +138,20 @@ export function createNextTuiBackgroundBridge(sessionId: string, bufferedCount: 
   timer.unref();
   emit();
   return {
-    beginTurn() { emit(); },
+    beginTurn() {
+      // A late descendant remains visible after its own turn settles, but
+      // an old tree must not reappear once the next human turn begins.
+      ownedRootTaskIds.clear();
+      emit();
+    },
     observeToolResult(name: string, args: Record<string, unknown>, result: unknown) {
-      if (name !== 'Agent' || args.run_in_background !== true) return;
-      if (!result || typeof result !== 'object') return;
-      const spawned = result as { taskId?: unknown; background?: unknown };
-      if (spawned.background !== true || typeof spawned.taskId !== 'string') return;
-      unregisteredPromises.add(spawned.taskId);
+      if (name !== 'Agent') return;
+      const parsed = typeof result === 'string' ? parseToolResultEnvelope(result).value : result;
+      if (!parsed || typeof parsed !== 'object') return;
+      const spawned = parsed as { taskId?: unknown; background?: unknown };
+      if (typeof spawned.taskId !== 'string') return;
+      ownedRootTaskIds.add(spawned.taskId);
+      if (args.run_in_background === true && spawned.background === true) unregisteredPromises.add(spawned.taskId);
       emit();
     },
     emit,
@@ -344,7 +373,7 @@ function buildAgentSystemPrompt(
  * 자식으로 턴을 돌린다. 그래서 legacy 대시보드의 `buildDashboardTurnPreamble` 부트 경로는 지나지 않고
  * «여기»만 지난다 — 자리 역할·미읽음 수를 첫 턴의 모델 입력에 싣는 자리도 여기 하나뿐이다.
  *
- * 카드는 `dashboard/seat-boot-preamble.ts` 의 `buildSeatBootSystemMessages` 를 그대로 쓴다(새 주입 로직 없음).
+ * 카드는 `seat/seat-boot-preamble.ts` 의 `buildSeatBootSystemMessages` 를 그대로 쓴다(새 주입 로직 없음).
  * 자리 판정이 서면 카드 한 장(대화마다 한 번 만든 같은 문면) · 자리가 아니면 빈 배열이라 주입 0건이다.
  * 도구 표면이 꺼져 있으면(`enabledToolNames === undefined`) 종전처럼 범용 preamble 은 빠지고 카드만 남는다.
  */

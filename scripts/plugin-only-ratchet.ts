@@ -172,23 +172,48 @@ export function regenerateBaseline(root: string, ref: string): PluginOnlyBaselin
   return { schema: 1, sourceRef, ...inventoryAtRef(root, ref) };
 }
 
+function isUnchangedMainBaselineInShallowCheckout(root: string): boolean {
+  try {
+    const shallow = execFileSync('git', ['rev-parse', '--is-shallow-repository'], {
+      cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() === 'true';
+    if (!shallow) return false;
+
+    const baselinePath = join(root, PLUGIN_ONLY_BASELINE);
+    const workingBaselineBlob = execFileSync('git', ['hash-object', baselinePath], {
+      cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const mainBaselineBlob = execFileSync('git', ['rev-parse', `origin/main:${PLUGIN_ONLY_BASELINE}`], {
+      cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return workingBaselineBlob === mainBaselineBlob;
+  } catch {
+    return false;
+  }
+}
+
 export function checkPluginOnlyRatchet(root: string): string[] {
   const baseline = JSON.parse(readFileSync(join(root, PLUGIN_ONLY_BASELINE), 'utf8')) as PluginOnlyBaseline;
   if (baseline.schema !== 1) throw new Error(`unsupported plugin-only baseline schema: ${baseline.schema}`);
-  try {
-    execFileSync('git', ['merge-base', '--is-ancestor', baseline.sourceRef, 'HEAD'], { cwd: root, stdio: 'ignore' });
-  } catch {
-    throw new Error(`plugin-only baseline sourceRef is not an ancestor of HEAD: ${baseline.sourceRef}`);
-  }
-  try {
-    execFileSync('git', ['merge-base', '--is-ancestor', baseline.sourceRef, 'origin/main'], { cwd: root, stdio: 'ignore' });
-  } catch {
-    throw new Error(`plugin-only baseline sourceRef must come from origin/main: ${baseline.sourceRef}`);
-  }
-  const sourceInventory = inventoryAtRef(root, baseline.sourceRef);
-  if (JSON.stringify(sourceInventory.pluginCodeFiles) !== JSON.stringify(baseline.pluginCodeFiles)
-    || JSON.stringify(sourceInventory.coreFeatureIdentifiers) !== JSON.stringify(baseline.coreFeatureIdentifiers)) {
-    throw new Error(`plugin-only baseline does not match sourceRef inventory: ${baseline.sourceRef}`);
+  // Shallow test checkouts may not contain the old sourceRef object even though
+  // this unchanged baseline is already part of origin/main. Trust only that
+  // exact main blob; PR edits to the frozen baseline still require full ancestry.
+  if (!isUnchangedMainBaselineInShallowCheckout(root)) {
+    try {
+      execFileSync('git', ['merge-base', '--is-ancestor', baseline.sourceRef, 'HEAD'], { cwd: root, stdio: 'ignore' });
+    } catch {
+      throw new Error(`plugin-only baseline sourceRef is not an ancestor of HEAD: ${baseline.sourceRef}`);
+    }
+    try {
+      execFileSync('git', ['merge-base', '--is-ancestor', baseline.sourceRef, 'origin/main'], { cwd: root, stdio: 'ignore' });
+    } catch {
+      throw new Error(`plugin-only baseline sourceRef must come from origin/main: ${baseline.sourceRef}`);
+    }
+    const sourceInventory = inventoryAtRef(root, baseline.sourceRef);
+    if (JSON.stringify(sourceInventory.pluginCodeFiles) !== JSON.stringify(baseline.pluginCodeFiles)
+      || JSON.stringify(sourceInventory.coreFeatureIdentifiers) !== JSON.stringify(baseline.coreFeatureIdentifiers)) {
+      throw new Error(`plugin-only baseline does not match sourceRef inventory: ${baseline.sourceRef}`);
+    }
   }
   const declared = declaredPluginHandlers(root);
   return compareInventory(inventoryFromTree(root), baseline)

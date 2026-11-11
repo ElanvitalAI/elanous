@@ -1,0 +1,15 @@
+apiVersion: elanous.dev/graph/v2
+graph: { id: demo-scene4-architecture, version: 1.0.0, layer: flow, purpose: "TUI 3줄 설계 답 → KGS 근거 → 구조화 설계 → 공용 다이어그램/PDF" }
+entry: knowledge
+nodes:
+  - { id: knowledge, type: capability, requires: scene4.knowledge@1, with: { stage: knowledge } }
+  - { id: normalize, type: capability, requires: scene4.normalize@1, with: { stage: normalize } }
+  - { id: render, type: capability, requires: scene4.render@1, with: { stage: render } }
+  - { id: verify, type: capability, requires: scene4.verify@1, with: { stage: verify } }
+edges:
+  - { from: knowledge, on: outcome, map: { ok: normalize, fail: failed } }
+  - { from: normalize, on: outcome, map: { ok: render, fail: failed } }
+  - { from: render, on: outcome, map: { ok: verify, fail: failed } }
+  - { from: verify, on: outcome, map: { ok: done, fail: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, graph.unit, scene4.architecture] }

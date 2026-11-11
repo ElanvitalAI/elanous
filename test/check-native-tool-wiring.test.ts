@@ -60,11 +60,11 @@ describe('HT3 — native-tool wiring lint', () => {
     expect(new Set(retiredCatalogIds.retiredIds).size).toBe(retiredCatalogIds.retiredIds.length);
     expect(ids.filter(id => retiredCatalogIds.retiredIds.includes(id))).toEqual([]);
     expect(new Set(retiredCatalogIds.baselineIds).size).toBe(retiredCatalogIds.baselineIds.length);
-    // NTC1 baseline is historical: MsgAsk, Linear tools, graph MCP controls,
+    // NTC1 baseline is historical: MsgAsk/MsgInbox, Linear tools, graph MCP controls,
     // the Nexus mock-device catalog tool, and the five Phone adb tools are
     // intentional additions, not part of the pre-retirement catalog snapshot.
     const postBaselineAdditions = new Set([
-      'msg_ask', 'elanous_linear_secretary', 'elanous_linear_issue',
+      'msg_ask', 'msg_inbox', 'elanous_linear_secretary', 'elanous_linear_issue',
       'graph_compose', 'graph_run_start', 'graph_run_status', 'graph_node_op',
       'elanous_ux_sim_devices',
       'phone_adb_screenshot', 'phone_adb_ui_dump', 'phone_adb_tap', 'phone_adb_type', 'phone_adb_open_url',

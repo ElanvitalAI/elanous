@@ -6,6 +6,7 @@ import { elanousConfigDir } from '../paths.js';
 import { parseCredentialSlotId } from './cred-slot-schema.js';
 
 export const CODEX_CREDENTIAL_SLOT = 'cred:codex-login';
+/** @deprecated Legacy compatibility label only. Ownership is resolved from the setting or lease. */
 export const CODEX_CREDENTIAL_OWNER_HOST = 'mbp';
 
 export interface CredentialOwnerMirror {
@@ -54,8 +55,6 @@ function readLedger(path: string): OwnerLedger {
     });
     if (new Set(mirrors.map((mirror) => mirror.host)).size !== mirrors.length || mirrors.some((mirror) => mirror.host === ownerHost))
       throw new Error('CREDENTIAL_OWNER_LEDGER_CORRUPT');
-    if (row.slot === CODEX_CREDENTIAL_SLOT && ownerHost !== CODEX_CREDENTIAL_OWNER_HOST)
-      throw new Error('CREDENTIAL_OWNER_LEDGER_CORRUPT');
     return { slot: row.slot, ownerHost, mirrors };
   });
   if (new Set(slots.map((row) => row.slot)).size !== slots.length) throw new Error('CREDENTIAL_OWNER_LEDGER_CORRUPT');
@@ -73,7 +72,15 @@ export function readCredentialOwner(slot: string, path = credentialOwnerLedgerPa
   return row ? copyRecord(row) : undefined;
 }
 
-/** Called only after a mirror install succeeds; one original host is immutable for a slot. */
+/** This release reads the configured fleet owner; the shared resource lease is a follow-up. */
+export function resolveCodexCredentialOwnerHost(
+  config: { readonly llm?: { readonly codexTokenOwnerHost?: string } },
+): string | undefined {
+  const configured = config.llm?.codexTokenOwnerHost?.trim();
+  return configured ? normalizeCredentialHost(configured) : undefined;
+}
+
+/** Called only after a mirror install succeeds; this local file records the latest push receipt, not authority. */
 export function recordCredentialMirror(input: {
   readonly slot: string;
   readonly ownerHost: string;
@@ -84,8 +91,6 @@ export function recordCredentialMirror(input: {
   const ownerHost = normalizeCredentialHost(input.ownerHost);
   const mirrorHost = normalizeCredentialHost(input.mirrorHost);
   if (ownerHost === mirrorHost) throw new Error('credential owner cannot be a mirror');
-  if (input.slot === CODEX_CREDENTIAL_SLOT && ownerHost !== CODEX_CREDENTIAL_OWNER_HOST)
-    throw new Error('Codex owner host must be mbp');
   const recordedAt = input.recordedAt ?? new Date().toISOString();
   if (!Number.isFinite(Date.parse(recordedAt))) throw new Error('CREDENTIAL_OWNER_TIME_INVALID');
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -95,8 +100,11 @@ export function recordCredentialMirror(input: {
     const rows = ledger.slots.map(copyRecord);
     const index = rows.findIndex((row) => row.slot === input.slot);
     const previous = rows[index];
-    if (previous && previous.ownerHost !== ownerHost) throw new Error('credential slot already has another owner host');
-    const mirrors = previous?.mirrors.filter((mirror) => mirror.host !== mirrorHost) ?? [];
+    if (previous && previous.ownerHost !== ownerHost && input.slot !== CODEX_CREDENTIAL_SLOT)
+      throw new Error('credential slot already has another owner host');
+    const mirrors = previous && previous.ownerHost !== ownerHost
+      ? [] // The owner-source boundary changed; never attribute old-owner mirror receipts to the new source.
+      : previous?.mirrors.filter((mirror) => mirror.host !== ownerHost && mirror.host !== mirrorHost) ?? [];
     const next: CredentialOwnerRecord = { slot: input.slot, ownerHost,
       mirrors: [...mirrors, { host: mirrorHost, mode: 'access-only', recordedAt }] };
     if (index < 0) rows.push(next);

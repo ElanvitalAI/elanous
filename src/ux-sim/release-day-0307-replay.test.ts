@@ -1,8 +1,8 @@
-import { expect, test } from 'bun:test';
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, expect, test } from 'bun:test';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { loadReleaseGraphManifest, assertReleaseRecipeAllowed, bindReleaseGraphInstance } from '../graph-runner/release-graph-manifest.js';
 import { type GraphRunState } from '../graph-runner/runner.js';
 import { runHandResponseNode } from '../../scripts/release-loop/hand-response-node.js';
@@ -12,56 +12,116 @@ import { writeRecheckPlan } from '../../scripts/release-loop/gate-partial.js';
 import { selectGateAppendRecheckEdge } from '../../scripts/release-loop/gate-partial.js';
 import { releaseResumeGateWaiverCoverage } from '../../scripts/release-loop/resume.js';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
-import { proposeGraphForUnseenEvent, runReleaseDay0307Replay, writeSameRunReplayReceiptFixture } from './release-day-0307-replay.js';
+import { proposeGraphForUnseenEvent, releaseDay0307GraphRoute, runReleaseDay0307Replay, writeSameRunReplayReceiptFixture } from './release-day-0307-replay.js';
 
 const REPO_ROOT = join(import.meta.dir, '../..');
 const SCENARIO_PATH = join(REPO_ROOT, 'scenarios/ux-sim/release-day-0307-replay.yaml');
 const MANIFEST_PATH = join(REPO_ROOT, 'graphs/release/plugin.json');
 const GRAPH_PATH = join(REPO_ROOT, 'graphs/release/release-loop.yaml');
 
-type ReleaseGraphFixture = { nodes: Array<Record<string, unknown>>; edges: Array<Record<string, unknown>> };
-
-function replayRouteFailures(graph: ReleaseGraphFixture): string[] {
-  const nodeForRecipe = (recipe: string) => graph.nodes.find((node) => node.recipe === recipe);
-  const outcomeMap = (nodeId: unknown) => {
-    const edge = graph.edges.find((candidate) => candidate.from === nodeId && candidate.on === 'outcome');
-    return edge?.map && typeof edge.map === 'object' ? edge.map as Record<string, unknown> : {};
-  };
-  const cutover = nodeForRecipe('cmd:gate-cutover-switch');
-  const autoApprove = nodeForRecipe('cmd:auto-approve');
-  const receiptAudit = nodeForRecipe('cmd:receipt-audit');
-  const publishApproval = graph.nodes.find((node) => node.kind === 'hitl' && node.recipe === 'approval:publish');
-  const auditTarget = outcomeMap(cutover?.node_id).audit;
-  const approvalTarget = outcomeMap(autoApprove?.node_id).fail;
-  const failures: string[] = [];
-  if (!receiptAudit || auditTarget !== receiptAudit.node_id) failures.push('cutover audit edge must target the cmd:receipt-audit node');
-  if (!publishApproval || approvalTarget !== publishApproval.node_id) failures.push('auto-approve failure edge must target the approval:publish HITL node');
-  return failures;
-}
+type ReleaseGraphFixture = {
+  nodes: Array<Record<string, unknown> & { node_id?: string; kind?: string; recipe?: string }>;
+  edges: Array<Record<string, unknown>>;
+};
 
 test('RELEASE-GRAPH-ABSORB-ALL graph semantics: audit and publication approval routes follow node recipes', () => {
   const graph = parseYaml(readFileSync(GRAPH_PATH, 'utf8')) as ReleaseGraphFixture;
-  expect(replayRouteFailures(graph)).toEqual([]);
+  const route = releaseDay0307GraphRoute(graph);
+  expect(route.failures).toEqual([]);
+  expect(route.receiptAuditId).toBe(graph.nodes.find((node) => node.recipe === 'cmd:receipt-audit')?.node_id);
+  expect(route.publishApprovalId).toBe(graph.nodes.find((node) => node.kind === 'hitl' && node.recipe === 'approval:publish')?.node_id);
 });
 
-test('RELEASE-GRAPH-ABSORB-ALL graph semantics: routing to another HITL does not satisfy publication approval', () => {
-  const graph = structuredClone(parseYaml(readFileSync(GRAPH_PATH, 'utf8'))) as ReleaseGraphFixture;
-  const autoApprove = graph.nodes.find((node) => node.recipe === 'cmd:auto-approve');
-  const continueApproval = graph.nodes.find((node) => node.kind === 'hitl' && node.recipe === 'approval:continue-publish');
-  const edge = graph.edges.find((candidate) => candidate.from === autoApprove?.node_id && candidate.on === 'outcome');
-  expect(edge?.map && typeof edge.map === 'object').toBe(true);
-  (edge!.map as Record<string, unknown>).fail = continueApproval?.node_id;
-  expect(replayRouteFailures(graph)).toContain('auto-approve failure edge must target the approval:publish HITL node');
+test('release graph route keeps a labelled error for a non-record root', () => {
+  for (const value of [null, [], 'invalid']) {
+    expect(() => releaseDay0307GraphRoute(value)).toThrow('release graph route must be an object');
+  }
 });
 
-test('RELEASE-GRAPH-ABSORB-ALL graph semantics: bypassing the receipt-audit recipe fails the route contract', () => {
-  const graph = structuredClone(parseYaml(readFileSync(GRAPH_PATH, 'utf8'))) as ReleaseGraphFixture;
-  const cutover = graph.nodes.find((node) => node.recipe === 'cmd:gate-cutover-switch');
-  const trafficGate = graph.nodes.find((node) => node.recipe === 'cmd:traffic-gate-passed');
-  const edge = graph.edges.find((candidate) => candidate.from === cutover?.node_id && candidate.on === 'outcome');
-  expect(edge?.map && typeof edge.map === 'object').toBe(true);
-  (edge!.map as Record<string, unknown>).audit = trafficGate?.node_id;
-  expect(replayRouteFailures(graph)).toContain('cutover audit edge must target the cmd:receipt-audit node');
+async function replayWithGraphMutation(mutate: (graph: ReleaseGraphFixture) => string,
+  nodeOutcomes: Readonly<Record<string, 'ok' | 'fail' | 'error' | 'legacy' | 'audit'>>) {
+  const graph = parseYaml(readFileSync(GRAPH_PATH, 'utf8')) as ReleaseGraphFixture;
+  const wrongTarget = mutate(graph);
+  const testRoot = mkdtempSync(join(tmpdir(), 'release-day-route-negative-'));
+  const graphDir = join(testRoot, 'graphs', 'release');
+  const unitDir = join(graphDir, 'units');
+  const graphPath = join(graphDir, 'release-loop.yaml');
+  mkdirSync(unitDir, { recursive: true });
+  writeFileSync(join(graphDir, 'recipes.yaml'), readFileSync(join(REPO_ROOT, 'graphs/release/recipes.yaml'), 'utf8'));
+  writeFileSync(graphPath, stringifyYaml(graph));
+  writeFileSync(join(unitDir, 'recipes.yaml'), `observe:\n  command: 'true'\ndecide:\n  command: 'true'\n`);
+  writeFileSync(join(unitDir, 'pod-reuse-prep.yaml'), `graph_id: pod-reuse-prep
+version: 1
+unit:
+  inputs: [cutSha, candidatePath]
+  outputs: [verdict, reason, receiptPath]
+  exits: [reuse, legacy, skip, failed, error]
+entry_node: step-1
+terminal_nodes: [reuse, legacy, skip, failed, error]
+nodes:
+  - { node_id: step-1, kind: agent, recipe: 'cmd:observe', max_visits: 1 }
+  - { node_id: step-2, kind: agent, recipe: 'cmd:decide', max_visits: 1 }
+  - { node_id: reuse, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: legacy, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: skip, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: error, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: step-1, on: outcome, map: { ok: step-2 } }
+  - { from: step-2, on: outcome, map: { reuse: reuse, legacy: legacy, skip: skip, failed: failed, error: error } }
+`);
+  const previousTestRoot = getTestStateRoot();
+  try {
+    setTestStateRoot(testRoot);
+    return { replay: await runReleaseDay0307Replay({ graphSource: stringifyYaml(graph), graphPath, nodeOutcomes, routeValidationOnly: true }), wrongTarget };
+  } finally {
+    setTestStateRoot(previousTestRoot ?? null);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+}
+
+describe.serial('RELEASE-GRAPH-ABSORB-ALL graph semantics: actual replay rejects route mutations', () => {
+  test('actual replay refuses injected graphs when it cannot execute them', async () => {
+    const previousTestRoot = getTestStateRoot();
+    setTestStateRoot(null);
+    try {
+      await expect(runReleaseDay0307Replay({ graphSource: readFileSync(GRAPH_PATH, 'utf8') }))
+        .rejects.toThrow('injected release graph requires an isolated test state root so the injected graph is executed');
+    } finally {
+      setTestStateRoot(previousTestRoot ?? null);
+    }
+  });
+
+  test('actual replay rejects auto-approve failure routed to a non-publication HITL', async () => {
+    const { replay, wrongTarget } = await replayWithGraphMutation((graph) => {
+      const autoApprove = graph.nodes.find((node) => node.recipe === 'cmd:auto-approve');
+      const continueApproval = graph.nodes.find((node) => node.kind === 'hitl' && node.recipe === 'approval:continue-publish');
+      const edge = graph.edges.find((candidate) => candidate.from === autoApprove?.node_id && candidate.on === 'outcome');
+      const target = String(continueApproval?.node_id);
+      if (!edge?.map || typeof edge.map !== 'object') throw new Error('auto-approve outcome edge missing');
+      (edge.map as Record<string, unknown>).fail = target;
+      return target;
+    }, { 'gate-cutover-switch': 'legacy', 'auto-approve': 'fail' });
+    expect(wrongTarget).toBe('approve-continue');
+    if (!replay.graphPath.includes(wrongTarget)) throw new Error(JSON.stringify(replay.nodeResults));
+    expect(replay.graphPath).toContain(wrongTarget);
+    expect(replay.contractFailures).toContain('auto-approve failure must route to the graph-declared publication approval node');
+  });
+
+  test('actual replay rejects cutover audit routed around the receipt-audit recipe', async () => {
+    const { replay, wrongTarget } = await replayWithGraphMutation((graph) => {
+      const cutover = graph.nodes.find((node) => node.recipe === 'cmd:gate-cutover-switch');
+      const trafficGate = graph.nodes.find((node) => node.recipe === 'cmd:traffic-gate-passed');
+      const edge = graph.edges.find((candidate) => candidate.from === cutover?.node_id && candidate.on === 'outcome');
+      const target = String(trafficGate?.node_id);
+      if (!edge?.map || typeof edge.map !== 'object') throw new Error('gate cutover outcome edge missing');
+      (edge.map as Record<string, unknown>).audit = target;
+      return target;
+    }, { 'gate-cutover-switch': 'audit' });
+    if (!replay.graphPath.includes(wrongTarget)) throw new Error(JSON.stringify(replay.nodeResults));
+    expect(replay.graphPath).toContain(wrongTarget);
+    expect(replay.contractFailures).toContain('gate cutover audit target must use the graph-declared receipt-audit recipe');
+  });
 });
 
 test('RELEASE-GRAPH-ABSORB-ALL: actual same-run recheck accepts only complete local receipt evidence', () => {
@@ -190,7 +250,7 @@ test('RELEASE-GRAPH-ABSORB-ALL: release-day replay stays in declared recipes, po
   expect(manifest.graph).toBe('release-loop');
   expect(manifest.identity).toBe('elanous-0.x-release');
   expect(manifest.inputs).toEqual(['manual', 'release.cut.due']);
-  expect(manifest.hitlNodes).toEqual(['approve-publish', 'approve-continue', 'gate-repair-recovery', 'gate-heal-decision']);
+  expect(manifest.hitlNodes).toEqual(['approve-publish', 'approve-continue', 'gate-repair-recovery', 'gate-heal-decision', 'approve-cloud-elastic']);
   expect(manifest.domainPackRules.filter((id) => id.startsWith('release-gate:'))).toHaveLength(6);
   expect(manifest.domainPackRules).toContain('release-gate:fail-unmeasured-disjoint');
   expect(manifest.edgeVocabulary).toEqual(['outcome', 'heal', 'retry', 'detour', 'rejoin', 'append-recheck', 'accept', 'escalate']);

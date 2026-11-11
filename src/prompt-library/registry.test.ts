@@ -9,9 +9,19 @@ import { GEMINI_CHAT_VARIANT } from './providers/gemini.js';
 import { GPT_CHAT_VARIANT } from './providers/gpt.js';
 import { GROK_CHAT_VARIANT } from './providers/grok.js';
 import { LOCAL_CHAT_VARIANT } from './providers/local.js';
+import { SOLAR_CHAT_VARIANT } from './providers/solar.js';
 import { resolveBuiltinChatVariant, resolveChatSystemPrompt } from './registry.js';
 
 const DEFAULT_CONFIG = { taskVariant: 'default' } as const;
+
+test('Solar Pro 4 selects its own prompt for app and wire ids', () => {
+  for (const model of ['openrouter/upstage/solar-pro4', 'upstage/solar-pro4']) {
+    expect(resolveChatSystemPrompt({ model, config: DEFAULT_CONFIG })).toMatchObject({
+      source: 'builtin', variant: 'solar', text: SOLAR_CHAT_VARIANT,
+    });
+  }
+  expect(resolveBuiltinChatVariant('openrouter/z-ai/glm-5.3')).toBe(GPT_CHAT_VARIANT);
+});
 
 describe('resolveBuiltinChatVariant — grok family', () => {
   test('grok-4.6 is already classified as grok and must stay that way', () => {

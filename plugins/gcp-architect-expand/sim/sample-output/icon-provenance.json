@@ -1,0 +1,14 @@
+{
+  "sourcePage": "https://cloud.google.com/icons",
+  "checkedAt": "2026-11-10T04:31:00Z",
+  "sourceZips": [
+    "https://services.google.com/fh/files/misc/core-products-icons.zip",
+    "https://services.google.com/fh/files/misc/category-icons.zip"
+  ],
+  "embeddedSha256": {
+    "compute": "488da11fc15e34bef89eb1e8d81fdb00b12b86d3b21f2a178a07814baa9b8344",
+    "storage": "c93e9108ffcca2685686bf144b32c1fe4fe237f27448516decf12980745c34b8",
+    "observe": "7df67bd62261998d306dd24fca0794867e0bf3d1c39a1ccc1d7a562fa0127239",
+    "security": "629e38daa5626578797f9c47c57129d569ff0a397ff24999924ff5733b115e25"
+  }
+}

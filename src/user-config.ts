@@ -70,6 +70,7 @@ export type {
 } from "./user-config/types.js";
 
 import { isRuntimeLlmModelCompatibleWithProvider } from './llm/runtime-model-family.js';
+import { isRecord } from './primitives/guards.js';
 export { inferRuntimeLlmModelFamily, isRuntimeLlmModelCompatibleWithProvider } from './llm/runtime-model-family.js';
 export type { RuntimeLlmModelFamily } from './llm/runtime-model-family.js';
 import { DRAFT_ON_STOP_MODES, parseDraftOnStopMode, type DraftOnStopMode } from './self-implement/draft-on-stop-mode.js';
@@ -379,6 +380,8 @@ export function urlRoutingDefaults(): UrlRoutingConfig {
       'implement', 'clone', 'fix', 'debug', 'refactor', 'based on',
       // argumentative / comparative analysis — not a plain digest
       '반박', '비교', '평가해', '검증해',
+      // explicit save intent — the URL is data to save, not a digest target
+      '저장', '스크랩', 'save', 'bookmark',
     ],
     absorbKeywords: ['absorb', '흡수', '지식화', 'vault', '지식창고'],
     map: { youtube: 'youtube-master', x: 'omni-digest', github: 'omni-digest', web: 'omni-digest' },
@@ -693,8 +696,8 @@ function spreadIfDefined<K extends string, V>(
   return value === undefined ? {} : ({ [key]: value } as Record<K, V>);
 }
 function parseTasteConfig(raw: unknown): TasteConfig | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const r = raw as Record<string, unknown>;
+  if (!isRecord(raw)) return undefined;
+  const r = raw;
   const out: TasteConfig = {};
   if (typeof r.captureEnabled === 'boolean') out.captureEnabled = r.captureEnabled;
   if (typeof r.model === 'string' && r.model.trim()) out.model = r.model.trim();
@@ -705,8 +708,8 @@ function parseTasteConfig(raw: unknown): TasteConfig | undefined {
 }
 
 function parseOpenDesignConfig(raw: unknown): OpenDesignConfig | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const r = raw as Record<string, unknown>;
+  if (!isRecord(raw)) return undefined;
+  const r = raw;
   const out: OpenDesignConfig = {};
   if (typeof r.url === 'string' && r.url.trim()) out.url = r.url.trim();
   if (typeof r.tokenFile === 'string' && r.tokenFile.trim()) out.tokenFile = r.tokenFile.trim();
@@ -714,8 +717,8 @@ function parseOpenDesignConfig(raw: unknown): OpenDesignConfig | undefined {
 }
 
 export function parseDiagnosticsConfig(raw: unknown): UserConfig['diagnostics'] {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const value = (raw as Record<string, unknown>).uploadUrl;
+  if (!isRecord(raw)) return undefined;
+  const value = raw.uploadUrl;
   if (typeof value !== 'string' || !value.trim()) return undefined;
   try {
     const url = new URL(value.trim());
@@ -725,23 +728,23 @@ export function parseDiagnosticsConfig(raw: unknown): UserConfig['diagnostics'] 
 }
 
 function parseDesignConfig(raw: unknown): DesignConfig | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const r = raw as Record<string, unknown>;
+  if (!isRecord(raw)) return undefined;
+  const r = raw;
   const openDesign = parseOpenDesignConfig(r.openDesign);
   return openDesign ? { openDesign } : undefined;
 }
 function parseWebSearchConfig(raw: unknown): WebSearchConfig | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const r = raw as Record<string, unknown>;
+  if (!isRecord(raw)) return undefined;
+  const r = raw;
   const out: WebSearchConfig = {};
-  if (r.tavily && typeof r.tavily === 'object' && !Array.isArray(r.tavily)) {
-    const t = r.tavily as Record<string, unknown>;
+  if (isRecord(r.tavily)) {
+    const t = r.tavily;
     if (typeof t.enabled === 'boolean') out.tavily = { enabled: t.enabled };
   }
   for (const key of ['grokApi', 'firecrawl'] as const) {
     const section = r[key];
-    if (section && typeof section === 'object' && !Array.isArray(section)) {
-      const enabled = (section as Record<string, unknown>).enabled;
+    if (isRecord(section)) {
+      const enabled = section.enabled;
       if (typeof enabled === 'boolean') out[key] = { enabled };
     }
   }
@@ -760,20 +763,20 @@ export function isPaidWebSearchEnabled(provider: 'grokApi' | 'firecrawl', cfg: P
 }
 
 function parseSessionFabricConfig(raw: unknown): SessionFabricConfig | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const r = raw as Record<string, unknown>;
+  if (!isRecord(raw)) return undefined;
+  const r = raw;
   const out: SessionFabricConfig = {};
   if (typeof r.shadowFanout === 'boolean') out.shadowFanout = r.shadowFanout;
-  if (r.primary && typeof r.primary === 'object' && !Array.isArray(r.primary)) {
-    const p = r.primary as Record<string, unknown>;
+  if (isRecord(r.primary)) {
+    const p = r.primary;
     const primary: { telegram?: boolean; discord?: boolean; pwaMsg?: boolean } = {};
     if (typeof p.telegram === 'boolean') primary.telegram = p.telegram;
     if (typeof p.discord === 'boolean') primary.discord = p.discord;
     if (typeof p.pwaMsg === 'boolean') primary.pwaMsg = p.pwaMsg;
     if (Object.keys(primary).length > 0) out.primary = primary;
   }
-  if (r.streaming && typeof r.streaming === 'object' && !Array.isArray(r.streaming)) {
-    const p = r.streaming as Record<string, unknown>;
+  if (isRecord(r.streaming)) {
+    const p = r.streaming;
     const streaming: { telegram?: boolean; discord?: boolean; acp?: boolean } = {};
     if (typeof p.telegram === 'boolean') streaming.telegram = p.telegram;
     if (typeof p.discord === 'boolean') streaming.discord = p.discord;
@@ -782,8 +785,8 @@ function parseSessionFabricConfig(raw: unknown): SessionFabricConfig | undefined
   }
   for (const surf of ['telegram', 'discord'] as const) {
     const raw = r[surf];
-    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-      const s = raw as Record<string, unknown>;
+    if (isRecord(raw)) {
+      const s = raw;
       const surfCfg: { streamingMode?: StreamingMode; editGapMs?: number; typing?: boolean; fairQueue?: boolean; rotate?: boolean } = {};
       if (isStreamingMode(s.streamingMode)) surfCfg.streamingMode = s.streamingMode;
       if (typeof s.editGapMs === 'number' && Number.isFinite(s.editGapMs) && s.editGapMs > 0) surfCfg.editGapMs = s.editGapMs;
@@ -800,11 +803,11 @@ function parseSessionFabricConfig(raw: unknown): SessionFabricConfig | undefined
 }
 
 function parseNextFluentConfig(raw: unknown): UserConfig['nextFluent'] {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const r = raw as Record<string, unknown>;
+  if (!isRecord(raw)) return undefined;
+  const r = raw;
   const out: NonNullable<UserConfig['nextFluent']> = {};
   if (typeof r.personas === 'boolean') out.personas = r.personas;
-  if (r.models && typeof r.models === 'object' && !Array.isArray(r.models)) {
+  if (isRecord(r.models)) {
     out.models = Object.fromEntries(
       Object.entries(r.models).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
     );

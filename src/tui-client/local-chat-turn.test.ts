@@ -36,6 +36,7 @@ test('a prompt reaches JSONL stdin and never appears in child argv', async () =>
     if (process.argv[configFlag + 2] !== 'repl') process.exit(6);
       if (process.argv.includes('--no-tools')) process.exit(5);
       console.log(JSON.stringify({ reply: 'ok', provider: 'grok', model: 'grok-4.7', goalComplete: true, goalStopReason: 'max_turns' }));
+      console.log(JSON.stringify({ reply: 'duplicate', provider: 'grok', model: 'grok-4.7' }));
     }
   `);
   const routeLog = spyOn(debug, 'log');
@@ -55,6 +56,7 @@ test('a prompt reaches JSONL stdin and never appears in child argv', async () =>
     expect(routeLog).toHaveBeenCalledWith('llm.route-decision', 'local-chat-executed', {
       surface: 'tui-local', sessionId: 'test-session', provider: 'grok', model: 'grok-4.7',
     });
+    expect(routeLog.mock.calls.filter((call) => call[0] === 'tui.local-chat' && call[1] === 'result-frame-accepted')).toHaveLength(1);
   } finally {
     clearSessionTierOverride('test-session');
     await closeLocalChatSession('test-session');
@@ -648,7 +650,7 @@ test('the real REPL onboarding gate reaches the Next TUI without a JSONL frame',
   setElanousConfigDir(dir);
   try {
     await expect(runLocalChatTurn('real-onboarding-refusal', 'first prompt', new AbortController().signal, cli))
-      .rejects.toThrow('No config yet — run `elanous` once interactively (onboarding)');
+      .rejects.toThrow('No config yet — run `elanous` once interactively before using the Next TUI REPL.');
   } finally {
     await closeLocalChatSession('real-onboarding-refusal');
     resetElanousConfigDir();
@@ -932,7 +934,7 @@ test('next TUI in a real PTY (L3): a long session compacts before the turn, then
     pty.write('\r');
   };
   try {
-    await waitFor('before (12 seeded messages)', (s) => s.includes('elanous next ·') && s.includes('Ctrl+Q 종료') && s.includes('xxxx'));
+    await waitFor('before (12 seeded messages)', (s) => /^elanous$/m.test(s) && s.includes('Ctrl+Q 종료') && s.includes('xxxx'));
     await send('긴 대화 뒤 질문');
     const after = await waitFor('after turn (auto compact)', (s) => s.includes('응답 완료') && s.includes(reply));
     const auto = /압축 (\d+)→(\d+) 메시지/.exec(after);
@@ -947,8 +949,9 @@ test('next TUI in a real PTY (L3): a long session compacts before the turn, then
     expect(summary?.content).toContain(reply);
     expect(stored.slice(-2).map((m) => m.content)).toEqual(['긴 대화 뒤 질문', reply]);
     await send('/compact');
-    const manual = await waitFor('after /compact', (s) => /압축 \d+→\d+ 메시지 · Enter 전송/.test(s));
-    const forced = /압축 (\d+)→(\d+) 메시지 · Enter 전송/.exec(manual)!;
+    const manualPattern = new RegExp(`압축 (${autoAfter + 2})→(\\d+) 메시지`);
+    const manual = await waitFor('after /compact', (s) => manualPattern.test(s));
+    const forced = manualPattern.exec(manual)!;
     expect(Number(forced[1])).toBe(autoAfter + 2);
     expect(Number(forced[2])).toBeLessThan(Number(forced[1]));
     expect(loadSession(id)?.messages.length).toBe(Number(forced[2]));

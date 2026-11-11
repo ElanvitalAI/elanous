@@ -18,6 +18,9 @@ const client = createNexusClient({
   fetchImpl: (async () => new Response(JSON.stringify({ entries: [], finished: [] }), { status: 200 })) as unknown as typeof fetch,
 });
 const resourceView = JSON.parse(readFileSync(resolve(import.meta.dir, '../../../../../plugins/graph-instance-view/fixtures/resource.view.json'), 'utf8')) as unknown;
+const routeViews = Object.fromEntries(['graph', 'harness', 'release'].map(source => [source,
+  JSON.parse(readFileSync(resolve(import.meta.dir, `../../../../../plugins/graph-instance-view/fixtures/${source}.view.json`), 'utf8')) as unknown,
+])) as Record<'graph' | 'harness' | 'release', unknown>;
 const router = { replace: () => {} };
 let root: ReactTestRenderer | undefined;
 let queryClient: QueryClient | undefined;
@@ -108,6 +111,47 @@ test('resource route denies a nonoperator before reading the view', async () => 
     expect(root!.root.findByType('p').children.join('')).toBe('운영자만 볼 수 있습니다');
   });
 });
+
+// #36563 provides the Nexus route; this test keeps its response as a fixture while checking the PWA request and screen.
+for (const { source, query, key, path, title } of [
+  { source: 'graph', query: 'view=instance&source=graph&run=graph-demo-1&graph=research-flow',
+    key: { source: 'graph', runId: 'graph-demo-1', graphId: 'research-flow' },
+    path: '/v1/graph-instance-view?source=graph&runId=graph-demo-1&graphId=research-flow', title: 'Research flow' },
+  { source: 'graph', query: 'view=instance&source=graph&run=graph-demo-1',
+    key: { source: 'graph', runId: 'graph-demo-1' },
+    path: '/v1/graph-instance-view?source=graph&runId=graph-demo-1', title: 'Research flow' },
+  { source: 'harness', query: 'view=instance&source=harness&run=harness-demo-1',
+    key: { source: 'harness', runId: 'harness-demo-1' },
+    path: '/v1/graph-instance-view?source=harness&runId=harness-demo-1', title: 'Implement card' },
+  { source: 'harness', query: 'view=instance&source=harness&run=harness-demo-1&graph=ignored',
+    key: { source: 'harness', runId: 'harness-demo-1' },
+    path: '/v1/graph-instance-view?source=harness&runId=harness-demo-1', title: 'Implement card' },
+  { source: 'release', query: 'view=instance&source=release&run=release-demo-1&graph=release-loop',
+    key: { source: 'release', runId: 'release-demo-1', graphId: 'release-loop' },
+    path: '/v1/graph-instance-view?source=release&runId=release-demo-1&graphId=release-loop', title: 'Release loop' },
+  { source: 'release', query: 'view=instance&source=release&run=release-demo-1',
+    key: { source: 'release', runId: 'release-demo-1' },
+    path: '/v1/graph-instance-view?source=release&runId=release-demo-1', title: 'Release loop' },
+] as const) {
+  test(`instance link selects the ${source} plugin route and renders its projection`, async () => {
+    await withFakeFetchDevice([
+      { url: '/v1/me', method: 'GET', response: () => Response.json({ operator: false }) },
+    ], async () => {
+      installConnectBrowser('', { 'elanous.nexus.baseUrl': 'https://new-nexus.example' });
+      const calls: string[] = [];
+      const routeClient = createNexusClient({ baseUrl: 'https://nexus.test', token: 'test-token', fetchImpl: (async input => {
+        calls.push(String(input));
+        return Response.json(routeViews[source]);
+      }) as typeof fetch });
+      await renderPage(false, query, routeClient);
+      await Bun.sleep(20);
+      await act(async () => {});
+      expect(root!.root.findByType(GraphInstanceLiveScreen).props.instanceKey).toEqual(key);
+      expect(calls).toEqual([`https://nexus.test${path}`]);
+      expect(JSON.stringify(root!.toJSON())).toContain(title);
+    });
+  });
+}
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 afterEach(async () => {

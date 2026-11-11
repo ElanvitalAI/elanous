@@ -14,7 +14,7 @@ const parityLine = '짝: PWA ✅ · 데스크톱 ✅ · 폴드 ✅ · 아이폰 
 function cli(root: string, ...args: string[]) {
   return runTestCli(['release', 'checklist', ...args], {
     cwd, stateRoot: root, configRoot: root,
-    env: { NODE_ENV: 'test' }, allowPaths: [
+    env: { NODE_ENV: 'test', ELANOUS_TRACK: 'OP' }, allowPaths: [
       ['release', 'checklist', 'add'], ['release', 'checklist', 'retitle'], ['release', 'checklist', 'set'],
       ['release', 'checklist', 'status'], ['release', 'checklist', 'list'],
     ],
@@ -29,7 +29,7 @@ describe('release checklist five-surface parity through CLI dispatch', () => {
       addItem(version, { id: 'ORDER', title: 'flag order' });
       const result = await runTestCli(['release', 'checklist', '--version', version, 'set', 'ORDER', '--status', 'green'], {
         mode: 'spawn', entrypoint: join(cwd, 'bin/elanous.mjs'), cwd, stateRoot: root, configRoot: root,
-        env: { NODE_ENV: 'test' }, allowPaths: [['release']],
+        env: { NODE_ENV: 'test', ELANOUS_TRACK: 'OP' }, allowPaths: [['release']],
       });
       expect(result.exitCode, result.stderr).toBe(0);
       expect(listChecklist(version).items.find((item) => item.id === 'ORDER')?.status).toBe('green');
@@ -115,6 +115,8 @@ describe('release checklist five-surface parity through CLI dispatch', () => {
     const { Command } = await import('commander');
     const { registerReleaseCommands } = await import('./release-cli.js');
     const root = mkdtempSync(join(tmpdir(), 'release-cli-parity-'));
+    const previousTrack = process.env.ELANOUS_TRACK;
+    process.env.ELANOUS_TRACK = 'OP';
     setElanousConfigDir(root);
     const observed: unknown[] = [];
     const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
@@ -133,6 +135,7 @@ describe('release checklist five-surface parity through CLI dispatch', () => {
     } finally {
       log.mockRestore(); error.mockRestore(); output.mockRestore();
       resetElanousConfigDir(); rmSync(root, { recursive: true, force: true });
+      if (previousTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previousTrack;
     }
   });
 

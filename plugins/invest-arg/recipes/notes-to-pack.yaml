@@ -1,0 +1,10 @@
+id: notes-to-pack
+version: 1
+input: attributed-expert-notes
+output: kpack1-expert-view-cards
+implementation: src/knowledge/notes-to-pack.ts
+simulation:
+  notes: 3
+  cards_per_note: 3
+  bloom_levels: [4, 5]
+  missing_source: 근거 없음

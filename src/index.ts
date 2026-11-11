@@ -94,7 +94,7 @@ function selectedIndexFastRoot(args: readonly string[]): string | undefined {
 function selectedIndexNextTuiRoot(args: readonly string[]): '__tui_next__' | undefined {
   const rootTui = extractRootTuiEntry(args);
   if (rootTui.error || rootTui.entry !== 'next') return undefined;
-  const remaining = rootTui.args.filter((arg) => arg !== '--test' && !arg.startsWith('--test='));
+  const remaining = rootTui.args.filter((arg) => arg !== '--test' && !arg.startsWith('--test=') && arg !== '--');
   return remaining.length === 0 ? '__tui_next__' : undefined;
 }
 // Test files import this module to inspect the complete Commander tree. An
@@ -1176,6 +1176,10 @@ prShell.command('open-guard').description('착수·새 PR 전에 같은 파일 O
 const prQueueShell = prShell.command('queue').description('Shadow merge queue (never lands PRs)');
 prQueueShell.command('status').description('Show pending PRs and shadow verdicts');
 prQueueShell.command('enqueue <pr>').description('Pin a ready PR at the tail of the shadow queue');
+prQueueShell.command('train-event <kind>').description('Publish a validated live HQ train incident to the release macrophage')
+  .requiredOption('--run-id <id>', 'Stable train run id')
+  .requiredOption('--event-id <id>', 'Stable idempotency id for this incident')
+  .requiredOption('--data-json <json>', 'Incident evidence JSON');
 prQueueShell.command('run').description('Evaluate the first PR without merging').requiredOption('--shadow', 'Only evaluate; never land');
 prShell.command('land').description('현재 브랜치 PR을 생성 또는 갱신해 ready 상태로 만들고 squash merge')
   .option('--base <branch>', 'PR base branch').option('--cwd <path>', '작업 트리 경로')
@@ -1875,8 +1879,8 @@ program
   )
   // Documentation-only — `readDashboardNameFlag` 가 Commander «전»에 argv 에서 걷어낸다.
   .option('--name <name>', '대시보드 TUI 의 PTY 행(tui:<pid>)에 별명을 달고 뜬다 — `elanous pty list` 에 보이고 `pty snapshot <name>` 으로 부른다. 뜬 뒤 바꾸려면 `elanous pty rename <ref> <name>`.')
-  .option('--legacy', '기존 대시보드 TUI로 시작한다(--tui classic 의 짧은 표기). 기본 진입도 기존 대시보드이며 새 TUI는 --tui next 로만 연다.')
-  .option('--tui <mode>', '루트 TUI를 명시한다(classic|next). 기본은 classic이고 새 TUI는 --tui next 로 연다. --legacy는 classic의 짧은 표기다.')
+  .option('--legacy', '기존 대시보드 TUI로 시작한다(--tui classic 의 짧은 표기). 로컬 기본 진입은 next 다.')
+  .option('--tui <mode>', '루트 TUI를 명시한다(classic|next). 로컬 기본은 next 이고 원격 기본은 classic 이다. --legacy는 classic의 짧은 표기다.')
   .option('--help-all', '시스템 명령을 제외한 모든 최상위 명령 표시');
 program.addHelpText('after', acpServerHelpText());
 
@@ -1948,7 +1952,8 @@ mcpCmd
         warn: (line) => process.stderr.write(line + '\n'),
       },
     });
-    const stdio = startMcpStdioServer({ origin: 'mcp-stdio' });
+    const authenticatedSeat = process.env.ELANOUS_MCP_AUTHENTICATED_SEAT?.trim();
+    const stdio = startMcpStdioServer({ origin: 'mcp-stdio', ...(authenticatedSeat ? { authenticatedSeat } : {}) });
     let shuttingDown = false;
     const shutdown = async (): Promise<void> => {
       if (shuttingDown) return;
@@ -8975,13 +8980,12 @@ const missionCmd = configCmd
   .command('mission')
   .description('Inspect or edit llm.missionRouting (mission → provider table)');
 
-function persistMissionOutcome(outcome: ReturnType<typeof describeMissionRouting>): void {
+function persistMissionOutcome(cfg: ReturnType<typeof getUserConfig>, outcome: ReturnType<typeof describeMissionRouting>): void {
   for (const line of outcome.lines) console.log(line);
   if (outcome.next === undefined) {
     if (outcome.exitCode !== 0) process.exit(outcome.exitCode);
     return;
   }
-  const cfg = getUserConfig();
   backupUserConfig(userConfigPath());
   cfg.llm.missionRouting = outcome.next.missions === undefined && outcome.next.mode === undefined
     ? undefined
@@ -8996,7 +9000,7 @@ missionCmd
   .description('Show current routing (all missions or one)')
   .action((mission?: string) => {
     const cfg = getUserConfig();
-    persistMissionOutcome(describeMissionRouting(cfg.llm.missionRouting, mission));
+    persistMissionOutcome(cfg, describeMissionRouting(cfg.llm.missionRouting, mission));
   });
 
 missionCmd
@@ -9004,7 +9008,7 @@ missionCmd
   .description('Override one mission. Example: elanous config mission set plan claude claude-opus-4-7')
   .action((mission: string, provider: string, model?: string) => {
     const cfg = getUserConfig();
-    persistMissionOutcome(setMissionEntry(cfg.llm.missionRouting, mission, provider, model));
+    persistMissionOutcome(cfg, setMissionEntry(cfg.llm.missionRouting, mission, provider, model));
   });
 
 missionCmd
@@ -9012,7 +9016,7 @@ missionCmd
   .description('Reset one mission (or all when omitted) back to built-in defaults')
   .action((mission?: string) => {
     const cfg = getUserConfig();
-    persistMissionOutcome(resetMissionEntry(cfg.llm.missionRouting, mission));
+    persistMissionOutcome(cfg, resetMissionEntry(cfg.llm.missionRouting, mission));
   });
 
 missionCmd
@@ -9020,7 +9024,7 @@ missionCmd
   .description("Set routing mode: 'auto' (predictor decides) or 'manual' (chip selection wins)")
   .action((mode: string) => {
     const cfg = getUserConfig();
-    persistMissionOutcome(setMissionMode(cfg.llm.missionRouting, mode));
+    persistMissionOutcome(cfg, setMissionMode(cfg.llm.missionRouting, mode));
   });
 
 // Stateless shell bridge for Codex/Claude agent missions. State is scoped to
@@ -12717,6 +12721,9 @@ async function main(): Promise<void> {
     return;
   }
   rawArgs = rootTui.args;
+  // A terminal `--` with no following subcommand still means the root TUI.
+  // Consume it here so Commander does not turn that launch into help output.
+  if (rootTui.entry === 'next' && rawArgs.at(-1) === '--') rawArgs = rawArgs.slice(0, -1);
 
   rawArgs = rewriteBareNexusToStatus({ rawArgs });
 
@@ -12956,6 +12963,9 @@ async function main(): Promise<void> {
   // this host emit one hint so the user knows the dashboard + daemon
   // coexist. See 내부 문서 `REPORT-tui-observation-methodology-2026-07-24` §12.
   if (args.length === 0) {
+    if (remote && tuiEntry === 'classic') {
+      console.log('로컬 기본 TUI는 next입니다. 원격 연결은 현재 classic TUI로 열립니다. 원격 next TUI는 지원하지 않습니다.');
+    }
     const { isNexusDaemonLive, nexusDaemonLiveHint } = await import('./cli/nexus-daemon-hint.js');
     if (isNexusDaemonLive()) console.log(nexusDaemonLiveHint());
   }
@@ -13019,10 +13029,22 @@ async function main(): Promise<void> {
     if (process.stdin.isTTY === true) {
       const setupIO = (await import('./onboarding.js')).realIO();
       try {
-        const result = await runFirstRun({ config: cfg, setupWhenNoProvider: async (config) => {
+        const result = await runFirstRun({
+          config: cfg,
+          chooseProvider: async (detected) => {
+            const { promptProviderMenu } = await import('./onboarding/first-run.js');
+            return promptProviderMenu((prompt) => setupIO.ask(prompt), detected);
+          },
+          chooseOpenRouterModel: async (current) => {
+            const { promptOpenRouterModel } = await import('./onboarding/openrouter-model-picker.js');
+            return promptOpenRouterModel((prompt) => setupIO.ask(prompt), (line) => setupIO.print(line), current, detectLocale());
+          },
+          promptSecret: async (message) => setupIO.askSecret?.(message),
+          setupWhenNoProvider: async (config) => {
           const { runFirstRunProviderSetup } = await import('./cli/setup-keys.js');
           return runFirstRunProviderSetup(setupIO, { config, loginWithCodex });
-        } });
+          },
+        });
         if (result.outcome !== 'ready') return;
       } finally { setupIO.close(); }
     } else if ((await runFirstRun({ config: cfg })).outcome !== 'ready') return;
@@ -13035,7 +13057,7 @@ async function main(): Promise<void> {
   const noticeConfig = getUserConfig();
   // Only a run that will draw the dashboard (stdin TTY) counts as a person having seen the notice;
   // a piped/CI run that stops at the TTY gate must not mark it shown.
-  const noticeSeen = (await import('./dashboard/tty-required.js')).dashboardCanUseTty();
+  const noticeSeen = (await import('./terminal/tty-required.js')).dashboardCanUseTty();
   if (noticeSeen && noticeConfig.errorReports?.enabled !== false && noticeConfig.errorReports?.noticeShown !== true) {
     console.log((await import('./error-report/report.js')).errorReportNoticeLine(noticeConfig.errorReports));
     saveUserConfig({ ...noticeConfig, errorReports: { ...noticeConfig.errorReports, noticeShown: true } }, userConfigPath());
@@ -13067,7 +13089,7 @@ async function main(): Promise<void> {
   // 한다. 인터랙티브 TUI 는 데몬 sink 를 상속 안 하므로 안 붙이면 debug.log 가 no-op
   // (제1원칙 관측 갭 · tui-sim 드라이브에서 agent.source 0건으로 실측 2026-07-19).
   // PR#4622(self utterance CLI)·session-cli 미러. fail-open·비블로킹.
-  const bootTimer = (await import('./dashboard/boot-timing.js')).createBootTimer();
+  const bootTimer = (await import('./tui/boot-timing.js')).createBootTimer();
   bootTimer.begin();
   // 창은 sink 등록 «직전» 에 닫는다(등록 전 debug.log 는 no-op 이라 발행은 등록 뒤).
   const procToLogSinkMs = performance.now();
@@ -13101,7 +13123,7 @@ async function main(): Promise<void> {
   // ⛔ stdin 이 TTY 가 아니면 «뜨지 않는다» — 뜨면 readKey 가 엔터를 지어내 초당 수백 프레임을
   //   다시 그린다(엔터 폭풍 · 2026-09-17 실측). 기전·수치는 dashboard/tty-required.ts 머리말.
   {
-    const { dashboardCanUseTty, dashboardTtyRefusalMessage } = await import('./dashboard/tty-required.js');
+    const { dashboardCanUseTty, dashboardTtyRefusalMessage } = await import('./terminal/tty-required.js');
     if (!dashboardCanUseTty()) {
       console.error(dashboardTtyRefusalMessage());
       process.exitCode = 1;

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "실시간 채팅·알림 — 알림 채널과 재시도",
+  "source": "https://docs.aws.amazon.com/sns/latest/dg/sns-message-delivery-retries.html",
+  "body": "적용 시점: 실시간 소켓 외에 푸시·이메일 같은 전달 채널이 필요할 때.\n용량 단계: 채널별 공급자를 분리하고, 실패 분류와 사용자 opt-out을 저장한 뒤 재시도를 제한한다.\nGCP 대응: Pub/Sub/Cloud Tasks에서 FCM, 이메일 공급자 등으로 fan-out; 결과와 attempt ID를 기록한다.\n비용 축: 채널별 건당 발송·재시도·전송 egress·DLQ 운영비가 축이다.\n결정과 반증: 공급자 timeout 뒤 같은 알림이 중복되거나 opt-out 사용자가 수신하지 않는지 시뮬레이션한다."
+}

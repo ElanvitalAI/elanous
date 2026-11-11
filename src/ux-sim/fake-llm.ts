@@ -40,9 +40,12 @@ export function testFakeLlmDefaultSelected(env: NodeJS.ProcessEnv = process.env)
 /** `{step}` in the response becomes the number of user messages (tool results excluded) the model received — a different reply per
  *  turn of one conversation (TUI-GOAL-INTERIM-QUIET: «every step ends with 아직 못 했다» without same-reply stops). */
 const TEST_FAKE_LLM_STEP_TOKEN = '{step}';
+const TEST_FAKE_LLM_REPLY_TOKEN = '{reply}';
+let responseSequence = 0;
 
 export function testFakeLlmResponse(messages?: readonly LLMMessage[]): string {
   const text = process.env[TEST_FAKE_LLM_RESPONSE_ENV] ?? '[test-fake-llm] OK';
+  if (text.includes(TEST_FAKE_LLM_REPLY_TOKEN)) return text.split(TEST_FAKE_LLM_REPLY_TOKEN).join(String(++responseSequence));
   if (!text.includes(TEST_FAKE_LLM_STEP_TOKEN)) return text;
   // Person/internal-turn text only — a tool result travels as a user-role message and must not count as a step.
   const step = (messages ?? []).filter((m) => m.role === 'user'
@@ -69,6 +72,7 @@ let scriptCursorFor: string | undefined;
 export function resetTestFakeLlmScript(): void {
   scriptCursor = 0;
   scriptCursorFor = undefined;
+  responseSequence = 0;
 }
 
 /** TUI-ORPHAN-AUTO-RESUME-STOP — 마지막 사람 발화가 이 표지를 담으면 스크립트 칸을 안 쓰고 답한다
@@ -129,9 +133,67 @@ function lastHumanText(messages: LLMMessage[]): string | null {
 function scriptedToolCall(messages: LLMMessage[]): LLMStreamEvent | null {
   const raw = process.env[TEST_FAKE_LLM_TOOL_CALL_ENV];
   if (!raw) return null;
-  let spec: { when?: unknown; name?: unknown; args?: unknown; after?: { name?: unknown; args?: unknown } };
-  try { spec = JSON.parse(raw) as typeof spec; } catch { return null; }
-  if (typeof spec.when !== 'string' || typeof spec.name !== 'string') return null;
+  type ToolRule = { when?: unknown; name?: unknown; args?: unknown; after?: { name?: unknown; args?: unknown };
+    calls?: Array<{ name?: unknown; args?: unknown }> };
+  let rules: ToolRule[];
+  try {
+    const parsed = JSON.parse(raw) as ToolRule | ToolRule[];
+    rules = Array.isArray(parsed) ? parsed : [parsed];
+  } catch { return null; }
+  for (const spec of rules) {
+  if (typeof spec?.when !== 'string') continue;
+  if (Array.isArray(spec.calls)) {
+    if (spec.calls.length === 0 || spec.calls.some((call) => !call || typeof call.name !== 'string')) continue;
+    let promptIndex = -1;
+    let promptText: string | null = null;
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]!;
+      if (message.role !== 'user') continue;
+      const text = lastHumanText([message]);
+      if (text === null) continue;
+      promptIndex = index;
+      promptText = text;
+      break;
+    }
+    if (promptIndex < 0 || !promptText?.includes(spec.when)) continue;
+    let completedCalls = 0;
+    let previousSuccessfulResult: string | null = null;
+    const sequenceCallStages = new Map<string, number>();
+    for (let index = promptIndex + 1; index < messages.length && completedCalls < spec.calls.length; index++) {
+      const message = messages[index]!;
+      if (message.role === 'assistant' && typeof message.content !== 'string') {
+        for (const block of message.content) {
+          if (block.type !== 'tool_use') continue;
+          const expected = spec.calls[completedCalls];
+          const sequenceStep = /^call_fake_llm_tool_\d+_sequence_(\d+)$/.exec(block.id);
+          if (!expected || !sequenceStep || Number(sequenceStep[1]) !== completedCalls || block.name !== expected.name) continue;
+          sequenceCallStages.set(block.id, completedCalls);
+        }
+        continue;
+      }
+      if (message.role !== 'user' || typeof message.content === 'string') continue;
+      for (const result of message.content) {
+        if (result.type !== 'tool_result' || result.isError === true || sequenceCallStages.get(result.tool_use_id) !== completedCalls) continue;
+        const completed = typeof result.content === 'string'
+          ? result.content
+          : result.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n');
+        completedCalls += 1;
+        previousSuccessfulResult = completed;
+        if (completedCalls >= spec.calls.length) break;
+      }
+    }
+    const next = spec.calls[completedCalls];
+    if (!next) continue;
+    const args = next.args && typeof next.args === 'object' ? { ...next.args as Record<string, unknown> } : {};
+    if (args.taskId === '$previousToolResult.taskId' && previousSuccessfulResult !== null) {
+      try {
+        const result = JSON.parse(previousSuccessfulResult) as { taskId?: unknown };
+        if (typeof result.taskId === 'string') args.taskId = result.taskId;
+      } catch { /* The marker remains literal when the prior tool result is not JSON. */ }
+    }
+    return { type: 'tool_call', id: `call_fake_llm_tool_${++toolCallSeq}_sequence_${completedCalls}`, name: next.name as string, args };
+  }
+  if (typeof spec.name !== 'string') continue;
   const text = lastHumanText(messages);
   let selectedName: string = spec.name;
   let selectedArgs: unknown = spec.args;
@@ -143,12 +205,14 @@ function scriptedToolCall(messages: LLMMessage[]): LLMStreamEvent | null {
       || prior?.role !== 'assistant' || !Array.isArray(prior.content)
       || !prior.content.some(block => block.type === 'tool_use' && block.name === spec.name)
       || result?.role !== 'user' || !Array.isArray(result.content)
-      || !result.content.some(block => block.type === 'tool_result')) return null;
+      || !result.content.some(block => block.type === 'tool_result')) continue;
     selectedName = after.name;
     selectedArgs = after.args;
-  } else if (!text.includes(spec.when)) return null;
+  } else if (!text.includes(spec.when)) continue;
   const args = selectedArgs && typeof selectedArgs === 'object' ? selectedArgs as Record<string, unknown> : {};
   return { type: 'tool_call', id: `call_fake_llm_tool_${++toolCallSeq}`, name: selectedName, args };
+  }
+  return null;
 }
 
 async function scriptedDelay(messages: LLMMessage[], signal?: AbortSignal): Promise<boolean> {

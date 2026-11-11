@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-KAIST-CLASSIC-PWA-BROWSER-REPLAY-TS",
+  "path": "src/ux-sim/kaist-classic-pwa-browser-replay.ts",
+  "boundary": "Serves a built static PWA and the captured receipt's loopback-only fake API, drives headless Chromium over CDP, and stores screenshots plus a replay JSON receipt.",
+  "deviceIds": ["kaist-classic-pwa-browser-replay"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

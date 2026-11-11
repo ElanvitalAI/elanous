@@ -1,0 +1,210 @@
+{
+  "schemaVersion": 1,
+  "title": "Concert ticketing on Google Cloud",
+  "version": "1.0",
+  "summary": "동시 접속 10만 명을 공정한 대기열로 제어하고 Cloud SQL의 좌석 원장으로 중복 확정을 막는다. 비용은 가상 단가로 산정한다.",
+  "background": "공연 오픈 시 10만 명이 한정된 지정 좌석을 동시에 조회하고 결제한다. 입장률과 DB 연결 수를 별도로 제한하고, 늦은 PG 성공은 환불 보상으로 처리한다.",
+  "deployment": {
+    "provider": "gcp",
+    "project": "ticketing-prod-sim",
+    "region": "asia-northeast3",
+    "vpc": "ticketing-vpc"
+  },
+  "nodes": [
+    {
+      "id": "fans",
+      "label": "Fans",
+      "layer": "users",
+      "zone": "external",
+      "service": "Browser clients",
+      "details": [
+        "100k concurrent",
+        "Signed admission token"
+      ]
+    },
+    {
+      "id": "edge",
+      "label": "Public edge",
+      "layer": "edge",
+      "zone": "project",
+      "service": "Cloud CDN + Armor",
+      "details": [
+        "TLS and rate limits"
+      ],
+      "icon": "Category Icons/Networking/PNG/Networking-512-color.png"
+    },
+    {
+      "id": "booking",
+      "label": "Booking API",
+      "layer": "application",
+      "zone": "vpc",
+      "service": "GKE booking pods",
+      "details": [
+        "HPA and pool cap",
+        "Idempotency keys"
+      ],
+      "icon": "Unique Icons/GKE/PNG/GKE-512-color.png"
+    },
+    {
+      "id": "queue",
+      "label": "Queue/cache",
+      "layer": "data",
+      "zone": "vpc",
+      "service": "Memorystore Redis",
+      "details": [
+        "Admission order",
+        "Short seat map TTL"
+      ],
+      "icon": "Category Icons/Databases/PNG/Databases-512-color.png"
+    },
+    {
+      "id": "ledger",
+      "label": "Seat ledger",
+      "layer": "data",
+      "zone": "vpc",
+      "service": "Cloud SQL PostgreSQL",
+      "details": [
+        "Seat/order/outbox",
+        "Confirmed UNIQUE"
+      ],
+      "icon": "Unique Icons/Cloud SQL/PNG/CloudSQL-512-color.png"
+    },
+    {
+      "id": "observe",
+      "label": "Telemetry",
+      "layer": "observability",
+      "zone": "vpc",
+      "service": "Cloud Monitoring",
+      "details": [
+        "p95, conflicts, queue lag"
+      ],
+      "icon": "Category Icons/Observability/PNG/Observability-512-color.png"
+    },
+    {
+      "id": "security",
+      "label": "Trust boundary",
+      "layer": "security",
+      "zone": "external",
+      "service": "Security controls",
+      "details": [
+        "Least privilege",
+        "PII masking"
+      ],
+      "icon": "Category Icons/Security Identity/PNG/SecurityIdentity-512-color.png"
+    }
+  ],
+  "flows": [
+    {
+      "from": "fans",
+      "to": "edge",
+      "label": "TLS request",
+      "kind": "sync"
+    },
+    {
+      "from": "edge",
+      "to": "booking",
+      "label": "admitted request",
+      "kind": "sync"
+    },
+    {
+      "from": "booking",
+      "to": "queue",
+      "label": "queue and cache read",
+      "kind": "sync"
+    },
+    {
+      "from": "booking",
+      "to": "ledger",
+      "label": "transactional hold and confirm",
+      "kind": "sync"
+    },
+    {
+      "from": "booking",
+      "to": "observe",
+      "label": "metrics and traces",
+      "kind": "telemetry"
+    }
+  ],
+  "requirements": [
+    {
+      "id": "R1",
+      "kind": "correctness",
+      "statement": "확정 좌석 중복 0건",
+      "verification": "동일 좌석 500명 경쟁·DB UNIQUE 위반 0건"
+    },
+    {
+      "id": "R2",
+      "kind": "resilience",
+      "statement": "결제 실패·지연 성공 복구",
+      "verification": "웹훅 중복·역순·지연 주입"
+    }
+  ],
+  "security": [
+    {
+      "class": "public",
+      "data": "공연·좌석 공개 정보",
+      "controls": "CDN 공개 객체만 공유 캐시, TLS와 WAF"
+    },
+    {
+      "class": "confidential",
+      "data": "구매자·결제 식별자",
+      "controls": "비공개 DB, 최소 권한, 로그 마스킹"
+    }
+  ],
+  "capacity": [
+    {
+      "item": "동시 사용자",
+      "assumption": "100,000; 입장률은 DB 처리량에 맞춰 계측",
+      "verification": "대기열 역전 0·DB 연결 상한 유지"
+    },
+    {
+      "item": "애플리케이션",
+      "assumption": "최대 Pod 수 × Pod당 연결 풀 ≤ DB 한도",
+      "verification": "피크 부하·존 손실·Redis 다운"
+    }
+  ],
+  "costs": [
+    {
+      "item": "GKE 상당량",
+      "formula": "가상 단가 × 730시간",
+      "monthlyUsd": 1000
+    },
+    {
+      "item": "Cloud SQL HA",
+      "formula": "가상 단가 × 730시간",
+      "monthlyUsd": 1800
+    }
+  ],
+  "savings": [
+    {
+      "name": "정적 콘텐츠 CDN",
+      "mechanism": "반복 이미지 송신·API 부하 감소",
+      "guardrail": "개인화 응답 공유 캐시 금지"
+    }
+  ],
+  "alternatives": [
+    {
+      "name": "Redis 최종 재고 원장",
+      "when": "DB 없는 초저지연 모델을 증명할 때",
+      "tradeoff": "장애·유실 시 확정 불변식 증명 어려움"
+    }
+  ],
+  "decisions": [
+    {
+      "id": "ADR-1",
+      "decision": "Cloud SQL을 좌석 확정 원장으로 사용",
+      "rationale": "트랜잭션과 부분 UNIQUE로 중복 확정 방지",
+      "revisit": "단일 리전 쓰기 한계 실측 시"
+    }
+  ],
+  "references": [
+    {
+      "title": "PostgreSQL explicit locking",
+      "url": "https://www.postgresql.org/docs/current/explicit-locking.html"
+    },
+    {
+      "title": "Google Cloud icons",
+      "url": "https://cloud.google.com/icons"
+    }
+  ]
+}

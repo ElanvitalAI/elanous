@@ -333,11 +333,11 @@ describe('nativeToolCatalog — metadata invariants', () => {
       ['mcp', 22],
       // The five Phone adb operations are skill tools (#35968).
       ['skill', 38],
-      ['skill,tui', 99],
+      ['skill,tui', 97],
       // 🆕 AskUserQuestion — 챗에서 띄운 자식이 사람에게 «되물을» 수 있어야 한다(2026-09-08).
       //   ⛔ #16003 이 SelfImplement 만 열고 이 짝을 안 열어서 챗 자식은 물을 도구가 없었다.
       ['skill,tui,chat', 1],
-      ['skill,tui,mcp', 35],
+      ['skill,tui,mcp', 36],
       // 🆕 SelfImplement — 챗에서도 부를 수 있다(2026-09-07 · 대표).
       //   ⭐ 이 툴은 «헤드리스 자식»을 띄우므로 ***부르는 쪽에 PTY 가 필요 없다.***
       ['skill,tui,mcp,chat', 1],

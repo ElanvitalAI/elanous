@@ -108,6 +108,19 @@ function containsAny(haystack: string, needles: string[]): string | null {
   return null;
 }
 
+const SAVE_INTENT_GUARDS = new Set(['저장', '스크랩', 'save', 'bookmark']);
+
+function containsExplicitSaveIntent(text: string): boolean {
+  // Korean verbs are commonly written without a space before their ending;
+  // match those endings while avoiding compounds such as «저장소».
+  if (/(?:^|[^가-힣])(?:저장|스크랩)(?=$|[\s,.!?]|해|하|도|을|를)/u.test(text)) return true;
+  return /\b(?:save|bookmark)\b/i.test(text);
+}
+
+function containsExplicitSummaryRequest(text: string): boolean {
+  return /요약|정리|summari[sz]e|\bsummary\b|\bdigest\b/i.test(text);
+}
+
 // ── Work-context guard (URL-ROUTE-WORK-CONTEXT-GUARD · 10-22) ──
 // Observed: a long n8n work instruction carrying «RSS URL https://hnrss.org/frontpage
 // · Limit 5 …» (a value to type into a node) was rewritten into an omni-digest run.
@@ -169,8 +182,12 @@ export function detectUrlRoute(
 
   // Guard-first (R5/R8): a URL used mid-instruction ("이 코드 참고해",
   // "반박해봐", "구현해줘") is NOT a digest request — defer to the LLM.
-  const guardHit = containsAny(haystack, cfg.guardKeywords);
-  if (guardHit) return null;
+  const nonSaveGuardKeywords = cfg.guardKeywords.filter(keyword => !SAVE_INTENT_GUARDS.has((keyword ?? '').toLowerCase().trim()));
+  const guardHit = containsAny(haystack, nonSaveGuardKeywords);
+  const hasSaveGuard = cfg.guardKeywords.some(keyword => SAVE_INTENT_GUARDS.has((keyword ?? '').toLowerCase().trim()));
+  const requestText = text.replace(URL_RE, ' ');
+  const saveIntentHit = hasSaveGuard && containsExplicitSaveIntent(requestText);
+  if (guardHit || (saveIntentHit && !containsExplicitSummaryRequest(requestText))) return null;
   if (workContextGuardReason(text)) return null;
 
   const url = urls[0]!;

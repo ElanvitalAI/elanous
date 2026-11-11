@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "workflow": ["design", "diagram", "pdf", "verify", "approve", "provision", "schedule", "idle-stop"],
+  "requiredArtifacts": [
+    { "name": "architecture.excalidraw", "format": "Excalidraw JSON", "editable": true },
+    { "name": "architecture.png", "format": "PNG", "renderOf": "architecture.excalidraw" },
+    { "name": "architecture-design.pdf", "format": "PDF", "source": "architecture-design.html" },
+    { "name": "icon-provenance.json", "format": "JSON", "source": "https://cloud.google.com/icons" }
+  ],
+  "tieredSimulation": {
+    "choices": ["small", "medium", "large"],
+    "perChoiceArtifacts": ["architecture.excalidraw", "architecture.png", "architecture.html", "architecture.pdf", "verification.json"],
+    "receipt": "tiered-design-receipt.json",
+    "costStatus": "synthetic-only",
+    "approvalOutcome": "Approval closes the simulation graph without provisioning or scheduling resources."
+  },
+  "requiredSections": ["배경", "요구사항", "구성도", "데이터 흐름", "보안 등급", "비용 예측", "절감안", "대안", "결정 기록"],
+  "requiredDocumentParts": ["cover", "summary", "diagram", "flows", "economics", "appendix"],
+  "diagramQuality": {
+    "requiredBoundaryLabels": ["USER DEVICE", "GCP PROJECT", "REGION", "VPC"],
+    "requiredLayerLabels": ["사용자", "엣지", "앱", "데이터", "관측", "보안"],
+    "minimumNumberedFlows": 8,
+    "minimumOfficialIcons": 4,
+    "minimumTextBorderInsetPx": 5,
+    "requiresLegend": true,
+    "requiresVersion": true
+  },
+  "diagramRenderer": "skills/diagram-master/references/engines/excalidraw/render_excalidraw.py",
+  "pdfRenderer": "skills/lecture-note-digitizer/references/convert_to_pdf.py",
+  "gate": "All artifacts must pass verification before HITL approval; an artifact never authorizes spending."
+}

@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runOnboarding, runOnboardingStep, scriptedIO, needsOnboarding, resetOnboardingMarker, shouldRefuseInteractiveOnboarding } from '../src/onboarding';
 import { CODEX_MODELS } from '../src/codex/models';
-import { buildUserConfig, resetUserConfig } from '../src/user-config';
+import { buildUserConfig, resetUserConfig, saveUserConfig } from '../src/user-config';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -181,6 +181,55 @@ describe('interactive onboarding refusal', () => {
 });
 
 describe('onboarding wizard', () => {
+  test('editing skills preserves an existing custom OpenRouter role choice', async () => {
+    const existing = buildUserConfig(cfgPath);
+    existing.llm.provider = 'openrouter';
+    existing.llm.model = 'openrouter/upstage/solar-mini4';
+    existing.roleLlm = { ...existing.roleLlm,
+      classify: { provider: 'openrouter', model: 'openrouter/upstage/solar-pro4' } };
+    saveUserConfig(existing, cfgPath);
+    await runOnboardingStep('skills', { io: scriptedIO(['1']), path: cfgPath });
+    expect(buildUserConfig(cfgPath).roleLlm?.classify?.model).toBe('openrouter/upstage/solar-pro4');
+  });
+  test('reselecting the current OpenRouter model fills missing roles and keeps explicit choices', async () => {
+    const existing = buildUserConfig(cfgPath);
+    existing.llm.provider = 'openrouter';
+    existing.llm.model = 'openrouter/upstage/solar-pro4';
+    existing.llm.apiKey = 'sk-or-test-1234567890abcdef';
+    existing.roleLlm = { implement: { provider: 'openrouter', model: 'openrouter/example/explicit-role' } };
+    saveUserConfig(existing, cfgPath);
+    const io = scriptedIO(['11', '', '', '2']);
+    const cfg = await runOnboardingStep('llm', { io, path: cfgPath, grokDeps: NO_SUBSCRIPTION_DETECT });
+    expect(cfg.llm.model).toBe(existing.llm.model);
+    const saved = buildUserConfig(cfgPath);
+    expect(saved.roleLlm?.implement).toEqual(existing.roleLlm.implement);
+    expect(saved.roleLlm?.coordinator).toEqual({ provider: 'openrouter', model: existing.llm.model });
+  });
+
+  test('OpenRouter wizard resolves a numbered catalog pick into role defaults', async () => {
+    const io = scriptedIO(['11', 'sk-or-test-1234567890abcdef', '8', '2']);
+    const cfg = await runOnboardingStep('llm', { io, path: cfgPath, grokDeps: NO_SUBSCRIPTION_DETECT });
+    expect(cfg.llm.provider).toBe('openrouter');
+    expect(cfg.llm.model).toBe('openrouter/qwen/qwen3.8-max-0902');
+    expect(buildUserConfig(cfgPath).roleLlm?.coordinator).toEqual({ provider: 'openrouter', model: cfg.llm.model });
+    expect(io.outputs.join('\n')).toContain('Solar Pro 4');
+  });
+
+  test('OpenRouter wizard offers Solar Mini 4 as a catalog choice', async () => {
+    const io = scriptedIO(['11', 'sk-or-test-1234567890abcdef', '6', '2']);
+    const cfg = await runOnboardingStep('llm', { io, path: cfgPath, grokDeps: NO_SUBSCRIPTION_DETECT });
+    expect(cfg.llm.provider).toBe('openrouter');
+    expect(cfg.llm.model).toBe('openrouter/upstage/solar-mini4');
+    expect(io.outputs.join('\n')).toContain('Solar Mini 4');
+  });
+  test('OpenRouter wizard reprints the catalog after an invalid number', async () => {
+    const io = scriptedIO(['11', 'sk-or-test-1234567890abcdef', '99', '8', '2']);
+    const cfg = await runOnboardingStep('llm', { io, path: cfgPath, grokDeps: NO_SUBSCRIPTION_DETECT });
+    expect(cfg.llm.model).toBe('openrouter/qwen/qwen3.8-max-0902');
+    expect(io.outputs.join('\n')).toContain('OpenRouter 목록의 번호를 입력하세요.');
+    expect(io.outputs.filter((line) => line.includes('OpenRouter 모델 목록'))).toHaveLength(2);
+  });
+
   test('openai-codex provider (API-key mode) + opencode skills + obsidian + telegram off', async () => {
     const skillDir = join(root, 'skills-a');
     mkdirSync(skillDir);

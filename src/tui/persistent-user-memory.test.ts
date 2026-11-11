@@ -2,7 +2,8 @@ import { afterAll, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildMemoryInjection, listMemories } from '../memory.js';
+import { buildMemoryInjection, buildMemoryInjectionLLM, listMemories, readIndex, saveMemory } from '../memory.js';
+import { estimateTokens } from '../tokens.js';
 import { dispatchMemorySave } from '../domains/core-tools.js';
 import { debug } from '../debug/log.js';
 import { rememberExplicitTuiUserFact } from './persistent-user-memory.js';
@@ -20,6 +21,23 @@ test('explicit user name survives a new turn through the pinned memory layer', (
   expect(rememberExplicitTuiUserFact('내 이름은 미르, 기억해.', root)).toBe(true);
   expect(listMemories({}, root)).toHaveLength(1);
   expect(buildMemoryInjection('내 이름?', {}, root).block).toContain('미르');
+});
+
+test('explicitly remembered fact remains available when the index nearly fills recall budget', async () => {
+  const separate = mkdtempSync(join(tmpdir(), 'tui-memory-index-budget-'));
+  try {
+    saveMemory({ name: 'Earlier note', description: 'Background '.repeat(30), body: 'Earlier fact', type: 'user' }, separate);
+    expect(rememberExplicitTuiUserFact('나는 한국어로 짧고 근거를 붙인 답을 선호해, 기억해.', separate)).toBe(true);
+    const budget = estimateTokens(readIndex(separate)) + 1;
+    for (const result of [
+      buildMemoryInjection('?', { maxTokens: budget }, separate),
+      await buildMemoryInjectionLLM('?', { maxTokens: budget }, separate),
+    ]) {
+      expect(result.block).toContain('나는 한국어로 짧고 근거를 붙인 답을 선호해');
+      expect(result.injectedIds).toHaveLength(1);
+      expect(result.tokens).toBeLessThanOrEqual(budget);
+    }
+  } finally { rmSync(separate, { recursive: true, force: true }); }
 });
 
 test('ordinary chat and ambiguous memory requests create no entry', () => {
@@ -95,6 +113,25 @@ test('one declarative fact followed by standalone 기억해 saves before model r
       expect(rememberExplicitTuiUserFact(text, separate)).toBe(false);
     }
     expect(buildMemoryInjection('내 이름?', {}, separate).block).not.toContain('가온');
+  } finally { rmSync(separate, { recursive: true, force: true }); }
+});
+
+test('vowel-final Korean name drops the spoken copula before persistent recall', () => {
+  const separate = mkdtempSync(join(tmpdir(), 'tui-memory-vowel-name-'));
+  try {
+    expect(rememberExplicitTuiUserFact('내 이름은 미로야. 기억해.', separate)).toBe(true);
+    const block = buildMemoryInjection('내 이름?', {}, separate).block;
+    expect(block).toContain('사용자가 직접 알려준 이름: 미로');
+    expect(block).not.toContain('미로야');
+    expect(rememberExplicitTuiUserFact('내 이름은 마야. 기억해.', separate)).toBe(true);
+    expect(buildMemoryInjection('내 이름?', {}, separate).block).toContain('사용자가 직접 알려준 이름: 마야');
+    expect(rememberExplicitTuiUserFact('내 이름은 마리야예요. 기억해.', separate)).toBe(true);
+    expect(buildMemoryInjection('내 이름?', {}, separate).block).toContain('사용자가 직접 알려준 이름: 마리야');
+    expect(rememberExplicitTuiUserFact('My name is 미로야, remember this.', separate)).toBe(true);
+    expect(buildMemoryInjection('내 이름?', {}, separate).block).toContain('사용자가 직접 알려준 이름: 미로야');
+    expect(rememberExplicitTuiUserFact('My name is 하린이에요, remember this.', separate)).toBe(true);
+    expect(buildMemoryInjection('내 이름?', {}, separate).block).toContain('사용자가 직접 알려준 이름: 하린');
+    expect(buildMemoryInjection('내 이름?', {}, separate).block).not.toContain('하린이에요');
   } finally { rmSync(separate, { recursive: true, force: true }); }
 });
 

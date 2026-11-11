@@ -23,7 +23,7 @@ import {
   DASHBOARD_PROVIDER_SETUP_OPTIONS,
   findProviderSetupOption,
   type DashboardProviderSetupOption,
-} from '../../dashboard/setup-inline.js';
+} from '../../setup/provider-options.js';
 import {
   getUserConfig,
   reloadUserConfig,

@@ -149,7 +149,6 @@
   "src/ops/overview.test.ts": 1,
   "src/plugins/examples/job-coach.test.ts": 6,
   "src/relay/relay-server.test.ts": 1,
-  "src/release-loop/rehearsal.test.ts": 9,
   "src/retro/daily.test.ts": 3,
   "src/rfc-registry/registry.test.ts": 1,
   "src/seat-dispatch/seat-answer-cli.test.ts": 3,

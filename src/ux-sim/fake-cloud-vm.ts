@@ -43,6 +43,78 @@ export type FakeCloudVmEvent =
   | { readonly type: 'vm-disappeared'; readonly id: string; readonly lostLeases: number; readonly at: number }
   | { readonly type: 'forbidden-terminate'; readonly id: string; readonly known: boolean; readonly protected: boolean; readonly at: number };
 
+export interface FakeCloudProviderRequest {
+  readonly id: string; readonly imageDigest: string; readonly expectedHours: number; readonly hourlyCostKrw: number;
+}
+export interface FakeCloudProviderOptions {
+  readonly monthlySpentKrw?: number; readonly monthlyCapKrw?: number; readonly quota?: number;
+  readonly readyAfterMs?: number; readonly failStart?: boolean;
+}
+export type FakeCloudProviderEvent =
+  | { readonly type: 'start-requested'; readonly id: string; readonly at: number; readonly estimateKrw: number }
+  | { readonly type: 'start-denied'; readonly id: string; readonly at: number; readonly reason: 'monthly-cap' | 'quota' | 'provider-failure' }
+  | { readonly type: 'vm-started'; readonly id: string; readonly at: number; readonly readyAt: number }
+  | { readonly type: 'joined'; readonly id: string; readonly at: number }
+  | { readonly type: 'left'; readonly id: string; readonly at: number; readonly costKrw: number }
+  | { readonly type: 'orphan'; readonly id: string; readonly at: number; readonly reason: string };
+
+/** Provider boundary for release-loop simulations: quota, start failure and cost approval never touch a real API. */
+export function createFakeCloudProvider(options: FakeCloudProviderOptions = {}) {
+  let monthlySpentKrw = options.monthlySpentKrw ?? 0;
+  const monthlyCapKrw = options.monthlyCapKrw ?? 5_000_000;
+  const quota = options.quota ?? 1;
+  const readyAfterMs = options.readyAfterMs ?? 0;
+  if (![monthlySpentKrw, monthlyCapKrw, quota, readyAfterMs].every(Number.isFinite)
+    || monthlySpentKrw < 0 || monthlyCapKrw < 0 || quota < 0 || readyAfterMs < 0) throw new Error('fake-cloud-provider options must be nonnegative finite numbers');
+  const fleet = createFakeCloudVm();
+  const events: FakeCloudProviderEvent[] = [];
+  const joined = new Set<string>();
+  const reservations = new Map<string, number>();
+  return {
+    get monthlySpentKrw() { return monthlySpentKrw; },
+    start(request: FakeCloudProviderRequest): FakeCloudVmSnapshot {
+      if (!Number.isFinite(request.expectedHours) || request.expectedHours <= 0 || !Number.isFinite(request.hourlyCostKrw) || request.hourlyCostKrw < 0) throw new Error('fake-cloud-provider request cost and expectedHours are invalid');
+      const at = Date.now(); const estimateKrw = request.expectedHours * request.hourlyCostKrw;
+      events.push({ type: 'start-requested', id: request.id, at, estimateKrw });
+      const reservedKrw = fleet.statusAll().reduce((sum, vm) => {
+        if (vm.state === 'parked' || vm.state === 'disappeared') return sum;
+        return sum + Math.max(reservations.get(vm.id) ?? 0, vm.estimatedCost);
+      }, 0);
+      if (monthlySpentKrw + reservedKrw + estimateKrw > monthlyCapKrw) {
+        events.push({ type: 'start-denied', id: request.id, at, reason: 'monthly-cap' });
+        throw new Error(`fake-cloud-provider: monthly cap exceeded (${monthlySpentKrw + reservedKrw + estimateKrw} > ${monthlyCapKrw})`);
+      }
+      const activeVms = fleet.statusAll().filter(vm => vm.state !== 'parked' && vm.state !== 'disappeared').length;
+      if (activeVms >= quota) {
+        events.push({ type: 'start-denied', id: request.id, at, reason: 'quota' });
+        throw new Error('fake-cloud-provider: quota exhausted');
+      }
+      if (options.failStart) {
+        events.push({ type: 'start-denied', id: request.id, at, reason: 'provider-failure' });
+        throw new Error('fake-cloud-provider: provider start failed');
+      }
+      const vm = fleet.createFromImage({ id: request.id, imageDigest: request.imageDigest, hourlyCost: request.hourlyCostKrw, readyAfterMs, terminationProtected: true });
+      reservations.set(vm.id, estimateKrw);
+      events.push({ type: 'vm-started', id: request.id, at, readyAt: vm.readyAt });
+      return vm;
+    },
+    join(id: string): FakeCloudVmSnapshot {
+      const vm = fleet.openLease(id); joined.add(id); events.push({ type: 'joined', id, at: Date.now() }); return vm;
+    },
+    leave(id: string): FakeCloudVmSnapshot {
+      if (joined.has(id)) { fleet.closeLease(id); joined.delete(id); }
+      const vm = fleet.stop(id);
+      monthlySpentKrw += vm.estimatedCost;
+      reservations.delete(id);
+      events.push({ type: 'left', id, at: Date.now(), costKrw: vm.estimatedCost }); return vm;
+    },
+    markOrphan(id: string, reason: string): void { events.push({ type: 'orphan', id, at: Date.now(), reason }); },
+    status(id: string): FakeCloudVmSnapshot { return fleet.status(id); },
+    vms(): FakeCloudVmSnapshot[] { return fleet.statusAll(); },
+    events(): FakeCloudProviderEvent[] { return events.map((event) => ({ ...event })); },
+  };
+}
+
 interface VmRecord {
   readonly id: string;
   readonly imageDigest: string;

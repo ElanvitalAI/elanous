@@ -26,6 +26,35 @@ test('history renders user and assistant text within terminal width without stor
   expect(Bun.stringWidth(fitLogLine('긴 제목 가나다라마바사', 12))).toBeLessThanOrEqual(12);
 });
 
+test('resumed classic dashboard context renders only its question in Next history', () => {
+  const classicUser = 'Context:\nDashboard mode: browse\n\nRecent status output:\n  ✓ resumed local session: a1b2c3d4\n  ⚠ plugin warning\n\nQuestion: 이어쓰기 1 classic 질문';
+  const lines = logViewLines([{ role: 'user', content: classicUser, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
+  expect(lines).toContain('나: 이어쓰기 1 classic 질문');
+  expect(lines).not.toContain('나: Context:');
+  expect(lines).not.toContain('Dashboard mode: browse');
+  expect(lines).not.toContain('plugin warning');
+  expect(classicUser).toContain('Recent status output:'); // stored history stays intact
+});
+
+test('ordinary user-authored Context prose and similar headings stay visible', () => {
+  const ordinary = 'Context: This is my own note.\nDashboard mode: browse\n\nQuestion: keep this whole message';
+  const nearMiss = 'Context:\nDashboard mode: browse\n\nQuestion: keep this whole message too';
+  const quotedStatus = 'Context:\nDashboard mode: browse\n\nRecent status output:\nmy own notes\n\nQuestion: keep this whole message and mention ✓ resumed local session: abc123';
+  for (const content of [ordinary, nearMiss, quotedStatus]) {
+    const lines = logViewLines([{ role: 'user', content, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
+    expect(lines).toContain('나: Context:');
+    expect(lines).toContain('Question: keep this whole message');
+  }
+});
+
+test('resumed classic question keeps later Question headings in the actual user text', () => {
+  const classicUser = 'Context:\nDashboard mode: browse\n\nRecent status output:\n  ✓ resumed local session: a1b2c3d4\n\nQuestion: 첫 문단\n\nQuestion: 두 번째 문단';
+  const lines = logViewLines([{ role: 'user', content: classicUser, ts: '2026-11-12T00:00:00Z' }], 110).join('\n');
+  expect(lines).toContain('나: 첫 문단');
+  expect(lines).toContain('Question: 두 번째 문단');
+  expect(lines).not.toContain('Dashboard mode: browse');
+});
+
 test('assistant history reuses classic markdown rendering after sanitizing raw terminal codes', () => {
   const lines = logViewLines([
     { role: 'assistant', content: '# Heading\n\n**bold** and `code`\n\n- item\n\n\x1b[2Jsafe', ts: '2026-11-10T00:00:00Z' },

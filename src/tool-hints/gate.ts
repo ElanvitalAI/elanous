@@ -331,5 +331,6 @@ function activeIntentScopes(signals: SignalSnapshot): Set<ToolIntentScope> {
   if (signals.intentCapture) active.add('capture');
   if (signals.intentOpsFleet) active.add('ops-fleet');
   if (signals.intentOpsUi) active.add('ops-ui');
+  if (signals.intentKnowledge) active.add('knowledge');
   return active;
 }

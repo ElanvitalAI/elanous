@@ -19,6 +19,7 @@ def main():
         page.pdf(
             path=str(pdf_path),
             format="A4",
+            prefer_css_page_size=True,
             margin={"top": "15mm", "bottom": "15mm",
                     "left": "15mm", "right": "15mm"},
             print_background=True,

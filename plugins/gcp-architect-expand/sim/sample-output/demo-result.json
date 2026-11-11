@@ -1,0 +1,22 @@
+{
+  "status": "verified-offline-demo",
+  "sourceKind": "synthetic-ticket-design-fixture",
+  "inputSha256": "4c7c693ad20d51a22fee6b808c94da303d212735fb431e92869f0d7fa8934858",
+  "proposalId": "ticket-demo-4c7c693ad20d",
+  "architecture": "batch-spot",
+  "costStatus": "미산정 — 공식 SKU 실조회 없음",
+  "securityGrade": "internal",
+  "syntheticApproval": true,
+  "realGcpCalls": 0,
+  "activeLeases": 0,
+  "artifacts": [
+    "proposal.json",
+    "architecture.excalidraw",
+    "architecture.png",
+    "architecture-design.pdf",
+    "architecture-design.html",
+    "fake-world.json",
+    "icon-provenance.json",
+    "board-attachments.json"
+  ]
+}

@@ -163,6 +163,71 @@ function providerAvailable(provider: GraphCapabilityProviderDeclaration, context
   return true;
 }
 
+/** Serialize supported write values with explicit runtime type and array-slot tags. */
+function serializeWriteValue(value: unknown): string | undefined {
+  const ancestors = new WeakSet<object>();
+  const normalize = (current: unknown): unknown | undefined => {
+    if (current === null) return ['null'];
+    if (current === undefined) return ['undefined'];
+    if (typeof current === 'string') return ['string', current];
+    if (typeof current === 'boolean') return ['boolean', current];
+    if (typeof current === 'number') {
+      const normalized = Number.isNaN(current) ? 'NaN'
+        : current === Number.POSITIVE_INFINITY ? '+Infinity'
+          : current === Number.NEGATIVE_INFINITY ? '-Infinity'
+            : Object.is(current, -0) ? '-0' : String(current);
+      return ['number', normalized];
+    }
+    if (typeof current !== 'object') return undefined;
+    if (ancestors.has(current)) return undefined;
+    ancestors.add(current);
+    try {
+      if (current instanceof Date) {
+        if (Object.getPrototypeOf(current) !== Date.prototype || Reflect.ownKeys(current).length !== 0
+          || Number.isNaN(Date.prototype.getTime.call(current))) return undefined;
+        return ['date', Date.prototype.toISOString.call(current)];
+      }
+      if (Array.isArray(current)) {
+        if (Object.getPrototypeOf(current) !== Array.prototype) return undefined;
+        const length = current.length;
+        const slots: unknown[] = [];
+        for (const key of Reflect.ownKeys(current)) {
+          if (key === 'length') continue;
+          if (typeof key !== 'string' || !/^(0|[1-9]\d*)$/.test(key) || Number(key) >= length) return undefined;
+          const descriptor = Object.getOwnPropertyDescriptor(current, key);
+          if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) return undefined;
+        }
+        for (let index = 0; index < length; index++) {
+          if (!Object.hasOwn(current, index)) { slots.push(['hole']); continue; }
+          const normalized = normalize(current[index]);
+          if (normalized === undefined) return undefined;
+          slots.push(['slot', normalized]);
+        }
+        return ['array', slots];
+      }
+      const prototype = Object.getPrototypeOf(current);
+      if (prototype !== Object.prototype && prototype !== null) return undefined;
+      const entries: unknown[] = [];
+      const keys = Reflect.ownKeys(current);
+      if (keys.some((key) => typeof key !== 'string')) return undefined;
+      for (const key of (keys as string[]).sort()) {
+        const descriptor = Object.getOwnPropertyDescriptor(current, key);
+        if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) return undefined;
+        const normalized = normalize(descriptor.value);
+        if (normalized === undefined) return undefined;
+        entries.push([key, normalized]);
+      }
+      return [prototype === null ? 'null-prototype-object' : 'object', entries];
+    } catch {
+      return undefined;
+    } finally {
+      ancestors.delete(current);
+    }
+  };
+  const normalized = normalize(value);
+  return normalized === undefined ? undefined : JSON.stringify(normalized);
+}
+
 /** Match by contract, then tier and declared latency; absent matches fail closed. */
 export async function dispatchGraphContract(
   contractId: string,
@@ -174,8 +239,32 @@ export async function dispatchGraphContract(
   const contractInput = context.nodeInput === undefined ? context.input : context.nodeInput;
   if (!graphContractValueMatches(contract.input, contractInput))
     return { ok: false, outcome: 'failed', error: 'contract-violation', evidence: { contractId, side: 'input' } };
-  const providerContext = context.nodeInput === undefined ? context
-    : { ...context, graphInput: context.input, input: context.nodeInput };
+  let dispatchInput = contractInput;
+  if (contractId === 'store.write@1') {
+    if (contractInput === null || typeof contractInput !== 'object' || Array.isArray(contractInput)
+      || !Object.hasOwn(contractInput, '__validatedWrite')) {
+      return { ok: false, outcome: 'failed', error: 'store write is missing its validated payload' };
+    }
+    const { __validatedWrite: expected, ...actual } = contractInput as Record<string, unknown>;
+    const isRecord = (value: unknown): value is Record<string, unknown> =>
+      value !== null && typeof value === 'object' && !Array.isArray(value);
+    const fields = ['op', 'collection', 'owner', 'key', 'value', 'ownerScoped', 'status'] as const;
+    const actualFields = Object.keys(actual).sort();
+    const expectedFields = isRecord(expected) ? Object.keys(expected).sort() : [];
+    if (!isRecord(expected) || actualFields.length !== expectedFields.length
+      || actualFields.some((field, index) => field !== expectedFields[index])
+      || actualFields.some(field => !fields.includes(field as typeof fields[number]))
+      || ['op', 'collection', 'owner', 'value', 'ownerScoped'].some(field => !Object.hasOwn(actual, field))
+      || actualFields.some(field =>
+      !Object.hasOwn(expected, field) || !Object.hasOwn(actual, field)
+      || serializeWriteValue(expected[field]) === undefined
+      || serializeWriteValue(expected[field]) !== serializeWriteValue(actual[field]))) {
+      return { ok: false, outcome: 'failed', error: 'store write input differs from its validated payload' };
+    }
+    dispatchInput = actual;
+  }
+  const providerContext = context.nodeInput === undefined ? { ...context, input: dispatchInput }
+    : { ...context, graphInput: context.input, input: dispatchInput, nodeInput: dispatchInput };
   const tierOrder = { free: 0, byok: 1, paid: 2 } as const;
   const candidates = [...(registry?.providers ?? [])]
     .filter((item) => item.provides.includes(contractId as GraphContractId) && providerAvailable(item, context)

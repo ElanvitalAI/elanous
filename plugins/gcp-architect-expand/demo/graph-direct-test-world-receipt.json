@@ -1,0 +1,114 @@
+{
+  "checkedAt": "2026-11-10T08:09:42.170Z",
+  "mode": "direct runGraph in isolated test world",
+  "graphId": "gcp-architect-expand",
+  "runId": "642e4d55-1470-46d4-a800-7eea1bd5e867",
+  "status": "awaiting-approval",
+  "pendingNode": "approve",
+  "executedNodes": [
+    "detect",
+    "design",
+    "deliverables"
+  ],
+  "spendingNodesExecuted": false,
+  "realGcpCalls": 0,
+  "input": {
+    "ticketDesignPath": "/home/ubuntu/elanous-hq/seats/R-GCPX/GCP-ARCHITECT/plugins/gcp-architect-expand/demo/fixtures/ticketing-design.json",
+    "pressurePath": "/home/ubuntu/elanous-hq/seats/R-GCPX/GCP-ARCHITECT/plugins/gcp-architect-expand/demo/fixtures/pressure.json",
+    "proposalPath": "/home/ubuntu/elanous-hq/seats/R-GCPX/GCP-ARCHITECT/plugins/gcp-architect-expand/sim/sample-output/proposal.json",
+    "sourceHtml": "/home/ubuntu/elanous-hq/seats/R-GCPX/GCP-ARCHITECT/plugins/gcp-architect-expand/sim/sample-output/architecture-design.html",
+    "sourceDiagram": "/home/ubuntu/elanous-hq/seats/R-GCPX/GCP-ARCHITECT/plugins/gcp-architect-expand/sim/sample-output/architecture.excalidraw"
+  },
+  "sharedGraphId": "architecture-deliverables",
+  "sharedGraphRunId": "e8a51899-7c7c-45a7-be39-3ea189378558",
+  "verification": {
+    "status": "verified",
+    "contract": "system-architecture/cloud-expansion@2",
+    "quality": "reference",
+    "pages": 6,
+    "iconLibraryUrl": "https://cloud.google.com/icons",
+    "verifiedIcons": 4,
+    "files": [
+      "architecture.excalidraw",
+      "architecture.png",
+      "architecture.html",
+      "architecture.pdf"
+    ],
+    "pdfSections": [
+      "배경",
+      "요구사항",
+      "구성도",
+      "데이터 흐름",
+      "보안 등급",
+      "비용 예측",
+      "절감안",
+      "대안",
+      "결정 기록"
+    ],
+    "elements": 83,
+    "pngBytes": 872985,
+    "pdfBytes": 883795
+  },
+  "files": [
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/evidence/20261110/gcpx-direct-graph-final/artifacts/architecture.excalidraw",
+      "sha256": "f34119d04ae7fb0adb34e1760d51c29a14bd67df9c4b700b0f80cadc17ff09a4"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/evidence/20261110/gcpx-direct-graph-final/artifacts/architecture.png",
+      "sha256": "94a66cc80fde5281042ffa8eee2dd69e09774896073222785a0941254e28e172"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/evidence/20261110/gcpx-direct-graph-final/artifacts/architecture.pdf",
+      "sha256": "b5307ffa9a42eaaa6f54fdffcfcbbd09967a5b828a00193dc3fe2c637cd362fa"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/evidence/20261110/gcpx-direct-graph-final/artifacts/architecture.html",
+      "sha256": "080442931c418b3d1f48b750191708aaf8bafa28bc1fd7d5869d14f09ea30b30"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/evidence/20261110/gcpx-direct-graph-final/artifacts/verification.json",
+      "sha256": "56ae788efc03c8c92f5de9bc7cc580326a9b1c1c613c97dd86eb52e31a7e4833"
+    }
+  ],
+  "attachments": [
+    {
+      "kind": "diagram-source",
+      "title": "편집 가능한 아키텍처 도면",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/evidence/20261110/gcpx-direct-graph-final/artifacts/architecture.excalidraw",
+      "mime": "application/json",
+      "sha256": "f34119d04ae7fb0adb34e1760d51c29a14bd67df9c4b700b0f80cadc17ff09a4",
+      "producedBy": "diagram"
+    },
+    {
+      "kind": "diagram",
+      "title": "GCP 확장 구성도",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/evidence/20261110/gcpx-direct-graph-final/artifacts/architecture.png",
+      "mime": "image/png",
+      "sha256": "94a66cc80fde5281042ffa8eee2dd69e09774896073222785a0941254e28e172",
+      "producedBy": "diagram"
+    },
+    {
+      "kind": "pdf",
+      "title": "시스템 아키텍처 설계 문서",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/evidence/20261110/gcpx-direct-graph-final/artifacts/architecture.pdf",
+      "mime": "application/pdf",
+      "sha256": "b5307ffa9a42eaaa6f54fdffcfcbbd09967a5b828a00193dc3fe2c637cd362fa",
+      "producedBy": "pdf"
+    },
+    {
+      "kind": "html",
+      "title": "설계 문서 HTML 원본",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/evidence/20261110/gcpx-direct-graph-final/artifacts/architecture.html",
+      "mime": "text/html",
+      "sha256": "080442931c418b3d1f48b750191708aaf8bafa28bc1fd7d5869d14f09ea30b30",
+      "producedBy": "pdf"
+    }
+  ],
+  "limitations": [
+    "synthetic ticket and pressure fixtures",
+    "diagram/PDF content is the existing fake-world sample adapted for the common output contract",
+    "no HITL approval or GCP provisioning executed",
+    "not a classic TUI/board attachment receipt"
+  ]
+}

@@ -347,7 +347,9 @@ wheels = [
 name = "diagram-master"
 version = "2.0.0"
 source = { virtual = "." }
-dependencies = [
+
+[package.optional-dependencies]
+python-engines = [
     { name = "google-generativeai" },
     { name = "matplotlib" },
     { name = "numpy" },
@@ -358,13 +360,14 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "google-generativeai", specifier = ">=0.8" },
-    { name = "matplotlib", specifier = ">=3.9" },
-    { name = "numpy", specifier = ">=1.26" },
-    { name = "pillow", specifier = ">=10.0" },
-    { name = "playwright", specifier = ">=1.40.0" },
-    { name = "pymupdf", specifier = ">=1.27.2.2" },
+    { name = "google-generativeai", marker = "extra == 'python-engines'", specifier = ">=0.8" },
+    { name = "matplotlib", marker = "extra == 'python-engines'", specifier = ">=3.9" },
+    { name = "numpy", marker = "extra == 'python-engines'", specifier = ">=1.26" },
+    { name = "pillow", marker = "extra == 'python-engines'", specifier = ">=10.0" },
+    { name = "playwright", marker = "extra == 'python-engines'", specifier = ">=1.40.0" },
+    { name = "pymupdf", marker = "extra == 'python-engines'", specifier = ">=1.27.2.2" },
 ]
+provides-extras = ["python-engines"]
 
 [[package]]
 name = "fonttools"

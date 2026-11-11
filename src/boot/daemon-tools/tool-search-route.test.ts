@@ -56,8 +56,8 @@ describe('소환로 · webterm 서피스', () => {
       ctx(),
     );
     const r = result as { matched?: string[]; unknown?: string[] };
-    expect(r.matched).toEqual(['SelfImplement', 'SolveMission']);
-    expect(r.unknown).toEqual(['RunDevHarness']);
+    expect(r.matched).toEqual(['SelfImplement']);
+    expect(r.unknown).toEqual(['RunDevHarness', 'SolveMission']);
   });
 
   test('빈 query 는 에러로 반환한다(throw 아님 — 모델이 재시도 가능)', async () => {
@@ -138,7 +138,7 @@ describe('소환로 · 사슬 e2e (tier-flip → dispatch)', () => {
   //   모델 표면에 되돌렸다. ⇒ webterm 에서도 «이름 슬롯»으로 서고 스키마는 ToolSearch 가 수화한다.
   //   ⛔ 종전엔 카탈로그에서 «내려져» 있어(#7476) 이 서피스에서 그냥 active 였다 — 그 상태를 못 박고 있었다.
   //   📄 왜 되돌렸나 = FINDING-dev-harness-is-not-dead-it-is-switched-off-2026-08-11.
-  test('webterm 스펙을 tier-flip 에 태우면 SelfImplement 는 active 이고 하니스·SolveMission 은 defer 된다', () => {
+  test('webterm 스펙을 tier-flip 에 태우면 SelfImplement 는 active 이고 은퇴 도구는 없다', () => {
     const surface = toolSurface('webterm');
     const split = splitDeferredToolSpecs(surface.specs);
     const activeNames = split.active.map((s) => s.name);
@@ -147,7 +147,7 @@ describe('소환로 · 사슬 e2e (tier-flip → dispatch)', () => {
     expect(activeNames).not.toContain('RunDevHarness');
     expect(deferredNames).not.toContain('SelfImplement');
     expect(deferredNames).not.toContain('RunDevHarness');
-    expect(deferredNames).toContain('SolveMission');
+    expect(deferredNames).not.toContain('SolveMission');
     expect(activeNames).toContain('ToolSearch');
     expect(split.unhydratable).toEqual([]);
   });

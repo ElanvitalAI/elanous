@@ -24,8 +24,8 @@ describe('buildRunTraversal graph replay sequence', () => {
     expect(response.status).toBe(200);
     expect(wire.graphEvents.filter((event: { type: string }) => event.type === 'node-added')).toEqual([
       expect.objectContaining({ seq: 1, node: 'fx-scenario-quantification', decider: 'runtime-overlay' }),
-      expect.objectContaining({ seq: 12, node: 'subscription-repair', decider: 'scenario-injection', kind: 'judge', scene: 'B', demo1104Scene: 'B', reason: 'paid-wall recovery mock' }),
-      expect.objectContaining({ seq: 17, node: 'headline-refresh', decider: 'scenario-injection', kind: 'researcher', scene: 'C', demo1104Scene: 'C', reason: 'new headline reordering mock' }),
+      expect.objectContaining({ seq: 12, node: 'subscription-repair', decider: 'scenario-injection', kind: 'judge', source: 'injected', scene: 'B', demo1104Scene: 'B', reason: 'paid-wall recovery mock' }),
+      expect.objectContaining({ seq: 17, node: 'headline-refresh', decider: 'scenario-injection', kind: 'researcher', source: 'replay', scene: 'C', demo1104Scene: 'C', reason: 'new headline reordering mock' }),
     ]);
     expect(wire.graphEvents).toHaveLength(9);
     expect(wire.journeyEdges.filter((edge: { injected?: boolean }) => edge.injected)).toHaveLength(4);
@@ -79,6 +79,19 @@ describe('buildRunTraversal graph replay sequence', () => {
     ]);
     const pwaContract: HarnessGraphEventWire[] = traversal.graphEvents ?? [];
     expect(pwaContract).toHaveLength(2);
+  });
+
+  test('preserves provenance source from the run ledger through the traversal HTTP response', async () => {
+    const response = handleHarnessRunTraversalGet(new Request(`http://localhost/v1/harness/run-traversal?runId=${runId}`), {
+      loadLedger: () => [
+        row('node-added', 1, { node: 'scenario-node', kind: 'judge', decider: 'scenario', reason: 'controlled fixture', source: 'sim', scene: 'secret-host' }),
+      ],
+    });
+    const wire = await response.json();
+    expect(response.status).toBe(200);
+    expect(wire.graphEvents).toEqual([expect.objectContaining({
+      type: 'node-added', node: 'scenario-node', source: 'sim', scene: 'secret-host', reason: 'controlled fixture',
+    })]);
   });
 
   test('preserves graph events and traversal sequence through the HTTP handler', async () => {

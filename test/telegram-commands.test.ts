@@ -77,7 +77,7 @@ const LEGACY_TELEGRAM_HANDLERS = [
   'help', 'now', 'loops', 'status', 'new', 'clear', 'reset', 'brain', 'ping', 'provider',
   'skills', 'skill', 'digest', 'cc', 'cdx', 'gem', 'cc_clear', 'local', 'attach', 'detach',
   'sessions', 'project', 'wish', 'fork', 'resume', 'ad', 'intake', 'decisions',
-  'coo', 'cto', 'cmo', 'cxo', 'work', 'harness', 'cancel', 'missions', 'mission_del',
+  'coo', 'cto', 'cmo', 'cxo', 'work', 'harness', 'cancel',
   'taste', 'bots', 'bot', 'screen', 'chart', 'routines', 'botsay',
 ] as const;
 
@@ -119,8 +119,6 @@ const LEGACY_TELEGRAM_PROBES: Record<(typeof LEGACY_TELEGRAM_HANDLERS)[number], 
   work: { text: '/work', matches: /^Usage: \/work/ },
   harness: { text: '/harness', matches: /^Usage: \/harness/ },
   cancel: { text: '/cancel', matches: /No ACP turn/ },
-  missions: { text: '/missions', matches: /활성 미션/ },
-  mission_del: { text: '/mission_del', matches: /사용법: `\/mission_del/ },
   taste: { text: '/taste', matches: /taste 제안이 없습니다|taste 제안 \d+건/ },
   bots: { text: '/bots', matches: /봇이 없습니다|봇 목록을 읽지 못했습니다|🤖 봇/ },
   bot: { text: '/bot', matches: /봇이 없습니다|봇 목록을 읽지 못했습니다|봇 ''을 찾을 수 없습니다/ },
@@ -247,6 +245,8 @@ describe('Telegram common slash catalog wiring', () => {
       const commands = defaultTelegramCommands();
       const names = commands.map(command => command.name);
       expect(new Set(names).size).toBe(names.length);
+      expect(names).not.toContain('missions');
+      expect(names).not.toContain('mission_del');
       const config = baseConfig();
       for (const name of LEGACY_TELEGRAM_HANDLERS) {
         const probe = LEGACY_TELEGRAM_PROBES[name];
@@ -289,6 +289,7 @@ describe('Telegram common slash catalog wiring', () => {
       expect(registered.some(entry => entry.command === 'persona' && entry.description.includes('텔레그램 미지원'))).toBe(true);
       expect(registered.some(entry => entry.command === 'askop' && entry.description.includes('운영 책임자'))).toBe(true);
       for (const name of LEGACY_TELEGRAM_HANDLERS) expect(registered.some(entry => entry.command === name)).toBe(true);
+      expect(registered.some(entry => entry.command === 'missions' || entry.command === 'mission_del')).toBe(false);
     } finally {
       if (previous === undefined) delete grades.persona;
       else grades.persona = previous;

@@ -324,6 +324,18 @@ function appendFixture() {
   return { f, cut, mainCut };
 }
 
+test('automatic append refuses a cut tip that moved after the gate measurement', () => {
+  const { f, cut } = appendFixture();
+  f.git(f.repo, 'push', '-q', 'origin', `${cut}:refs/heads/release/9.9.9`);
+  f.git(f.repo, 'checkout', '-q', 'main');
+  const added = f.commit('repair-three.txt', 'fourth\n');
+  f.git(f.repo, 'push', '-q', 'origin', 'main');
+  expect(() => cutReleaseBranch({ version: '9.9.9', pick: [added], append: true,
+    expectedTip: 'a'.repeat(40), repoRoot: f.repo, log: () => {} }))
+    .toThrow('remote tip differs from measured cut');
+  expect(f.git(f.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/9.9.9').split('\t')[0]).toBe(cut);
+}, 120_000);
+
 test('RELEASE-APPEND-BASE-AUTO: --append resolves the main cut from the release tip first parent when --base is omitted', () => {
   const { f, cut, mainCut } = appendFixture();
   f.git(f.repo, 'push', '-q', 'origin', `${cut}:refs/heads/release/9.9.9`);

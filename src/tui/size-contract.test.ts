@@ -153,18 +153,11 @@ function configGateKeys(node: ts.Node, includeLogicalResults: boolean): string[]
   return [...keys];
 }
 
-test('every src/tui TypeScript file stays below the 4,000 line limit', () => {
+test('every src/tui production TypeScript file stays below the 4,000 line limit', () => {
   const root = import.meta.dir;
-  const files: string[] = [];
-  const visit = (dir: string): void => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const path = join(dir, entry.name);
-      if (entry.isDirectory()) visit(path);
-      else if (entry.isFile() && entry.name.endsWith('.ts')) files.push(path);
-    }
-  };
-  visit(root);
-  const oversized = files.filter((path) => readFileSync(path, 'utf8').split('\n').length > 4_000);
+  const oversized = sourceFiles(root)
+    .filter((path) => readFileSync(path, 'utf8').split('\n').length > 4_000)
+    .map((path) => path.slice(root.length + 1));
   expect(oversized).toEqual([]);
 });
 

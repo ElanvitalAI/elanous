@@ -67,6 +67,10 @@ export type MemberCodeValidation =
   | { readonly valid: false; readonly reason: 'invalid' | 'inactive' | 'exhausted' };
 
 export interface MemberStore {
+  activeReferralCodeForMember(memberId: string): string | null;
+  referralsForMember(memberId: string): Array<{ inviteeId: string; referralCode: string; eventCode: string | null; invitedAt: string }>;
+  rotateReferralCode(memberId: string, now?: string): string;
+  revokeReferralCode(memberId: string, now?: string): boolean;
   provisionEventCode(input: {
     readonly code: string;
     readonly maxUses: number;
@@ -97,11 +101,16 @@ export interface MemberStore {
   createAppSlotForMember(memberId: string, now?: string): MemberAppSlotCreation;
   createSession(memberId: string, now?: string): { token: string; expiresAt: string };
   memberForSession(token: string, now?: string): MemberProfile | null;
+  reserveEventTry(memberId: string, eventCode: string, maxAttempts: number, now?: string): string | null;
+  completeEventTry(reservationId: string, now?: string): boolean;
+  releaseEventTry(reservationId: string): boolean;
   requestDeletion(token: string, now?: string): boolean;
   close(): void;
 }
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60_000;
+// Source: KCB try execution is deadline-capped; this lease permits process recovery after a crash.
+const MEMBER_TRY_RESERVATION_TTL_MS = 2 * 60_000;
 const EVENT_START = '2026-11-13T15:00:00.000Z'; // 2026-11-14 00:00 Asia/Seoul
 const EVENT_END = '2026-11-15T15:00:00.000Z';   // 2026-11-16 00:00 Asia/Seoul
 const EVENT_WINDOW_ISO_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})$/; // Source: event-window inputs use ISO 8601 extended date-time form.
@@ -127,7 +136,7 @@ function eventWindowTimestamp(value: string | undefined, fallback: string): stri
   const milliseconds = Date.parse(timestamp);
   return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : null;
 }
-function referralCode(): string { return randomBytes(6).toString('base64url').toUpperCase().replace(/[-_]/g, 'X'); }
+function referralCode(): string { return randomBytes(16).toString('base64url'); }
 function base62(bytes: Buffer): string {
   const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
   let value = BigInt(`0x${bytes.toString('hex')}`);
@@ -155,6 +164,18 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       name TEXT NOT NULL, referral_code TEXT NOT NULL UNIQUE, invited_by TEXT REFERENCES members(id),
       event_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS member_referral_codes (
+      code TEXT PRIMARY KEY COLLATE BINARY, member_id TEXT NOT NULL REFERENCES members(id),
+      created_at TEXT NOT NULL, revoked_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS member_referral_codes_owner ON member_referral_codes(member_id, revoked_at);
+    CREATE TABLE IF NOT EXISTS member_referrals (
+      invitee_id TEXT PRIMARY KEY REFERENCES members(id), inviter_id TEXT NOT NULL REFERENCES members(id),
+      code TEXT NOT NULL COLLATE BINARY REFERENCES member_referral_codes(code),
+      event_code TEXT, invited_at TEXT NOT NULL,
+      CHECK(invitee_id != inviter_id)
+    );
+    CREATE INDEX IF NOT EXISTS member_referrals_inviter ON member_referrals(inviter_id, invited_at);
     CREATE TABLE IF NOT EXISTS member_plan_catalog (
       plan TEXT PRIMARY KEY, entitlements_json TEXT NOT NULL
     );
@@ -195,6 +216,12 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT
     );
     CREATE INDEX IF NOT EXISTS member_sessions_member ON member_sessions(member_id, expires_at);
+    CREATE TABLE IF NOT EXISTS member_event_try_attempts (
+      id TEXT PRIMARY KEY, member_id TEXT NOT NULL REFERENCES members(id), event_code TEXT NOT NULL,
+      requested_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'completed' CHECK(status IN ('reserved', 'completed')),
+      reservation_expires_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS member_event_try_attempts_member ON member_event_try_attempts(member_id, event_code);
     CREATE TABLE IF NOT EXISTS member_key_salts (
       member_id TEXT PRIMARY KEY REFERENCES members(id), salt TEXT NOT NULL
     );
@@ -220,6 +247,59 @@ export function createMemberStore(options: { readonly path?: string; readonly no
     );
     DROP TABLE IF EXISTS member_signup_states;
   `);
+  // Old referral tables used NOCASE, which made each mixed-case secret accept many spellings.
+  // Rebuild both linked tables once, preserving the exact bytes of every issued code and ledger row.
+  const referralSchema = (db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'member_referral_codes'").get() as { sql: string }).sql;
+  if (/code\s+TEXT\s+PRIMARY KEY\s+COLLATE\s+NOCASE/i.test(referralSchema)) {
+    db.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
+    try {
+      db.exec(`
+        CREATE TABLE member_referral_codes_exact (
+          code TEXT PRIMARY KEY COLLATE BINARY, member_id TEXT NOT NULL REFERENCES members(id),
+          created_at TEXT NOT NULL, revoked_at TEXT
+        );
+        INSERT INTO member_referral_codes_exact SELECT code, member_id, created_at, revoked_at FROM member_referral_codes;
+        CREATE TABLE member_referrals_exact (
+          invitee_id TEXT PRIMARY KEY REFERENCES members(id), inviter_id TEXT NOT NULL REFERENCES members(id),
+          code TEXT NOT NULL COLLATE BINARY REFERENCES member_referral_codes(code),
+          event_code TEXT, invited_at TEXT NOT NULL, CHECK(invitee_id != inviter_id)
+        );
+        INSERT INTO member_referrals_exact
+          SELECT r.invitee_id, r.inviter_id, c.code, r.event_code, r.invited_at
+          FROM member_referrals r JOIN member_referral_codes c ON c.code = r.code COLLATE NOCASE;
+      `);
+      const oldRows = (db.query('SELECT COUNT(*) AS count FROM member_referrals').get() as { count: number }).count;
+      const copiedRows = (db.query('SELECT COUNT(*) AS count FROM member_referrals_exact').get() as { count: number }).count;
+      if (oldRows !== copiedRows) throw new Error('referral migration lost ledger rows');
+      db.exec(`
+        DROP TABLE member_referrals;
+        DROP TABLE member_referral_codes;
+        ALTER TABLE member_referral_codes_exact RENAME TO member_referral_codes;
+        ALTER TABLE member_referrals_exact RENAME TO member_referrals;
+        CREATE INDEX member_referral_codes_owner ON member_referral_codes(member_id, revoked_at);
+        CREATE INDEX member_referrals_inviter ON member_referrals(inviter_id, invited_at);
+      `);
+      const foreignKeyErrors = db.query('PRAGMA foreign_key_check').all();
+      if (foreignKeyErrors.length) throw new Error(`referral migration foreign key mismatch: ${JSON.stringify(foreignKeyErrors)}`);
+      db.exec('COMMIT');
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+    finally { db.exec('PRAGMA foreign_keys = ON'); }
+  }
+  // Preserve existing links and attribution when opening a pre-referral-ledger database.
+  db.query(`INSERT OR IGNORE INTO member_referral_codes (code, member_id, created_at)
+    SELECT referral_code, id, created_at FROM members`).run();
+  db.query(`INSERT OR IGNORE INTO member_referrals (invitee_id, inviter_id, code, event_code, invited_at)
+    SELECT invited.id, invited.invited_by, inviter.referral_code, invited.event_code, invited.created_at
+    FROM members invited JOIN members inviter ON inviter.id = invited.invited_by
+    WHERE invited.invited_by IS NOT NULL AND invited.id != invited.invited_by`).run();
+  const eventTryColumns = db.query('PRAGMA table_info(member_event_try_attempts)').all() as Array<{ name: string }>;
+  if (!eventTryColumns.some(column => column.name === 'status')) {
+    db.exec("ALTER TABLE member_event_try_attempts ADD COLUMN status TEXT NOT NULL DEFAULT 'completed' CHECK(status IN ('reserved', 'completed'))");
+  }
+  if (!eventTryColumns.some(column => column.name === 'reservation_expires_at')) {
+    db.exec('ALTER TABLE member_event_try_attempts ADD COLUMN reservation_expires_at TEXT');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS member_event_try_attempts_reservation_expiry ON member_event_try_attempts(status, reservation_expires_at)');
   const appAuthColumns = db.query('PRAGMA table_info(member_app_auth_codes)').all() as Array<{ name: string }>;
   if (!appAuthColumns.some(column => column.name === 'code_challenge')) {
     // Existing installations can have one-time codes from the pre-PKCE schema. A nullable
@@ -314,13 +394,14 @@ export function createMemberStore(options: { readonly path?: string; readonly no
   }
 
   function validate(code: string, kind?: 'referral' | 'event', at = iso(nowMs())): MemberCodeValidation {
-    const normalized = code.trim().toUpperCase();
-    if (!normalized || normalized.length > 80) return { valid: false, reason: 'invalid' };
+    const exact = code.trim();
+    if (!exact || exact.length > 80) return { valid: false, reason: 'invalid' };
     if (kind !== 'event') {
-      const referral = db.query('SELECT id FROM members WHERE referral_code = ? COLLATE NOCASE').get(normalized) as { id: string } | null;
+      const referral = db.query('SELECT member_id FROM member_referral_codes WHERE code = ? COLLATE BINARY AND revoked_at IS NULL').get(exact) as { member_id: string } | null;
       if (referral) return { valid: true, kind: 'referral', referredReward: 'none' };
       if (kind === 'referral') return { valid: false, reason: 'invalid' };
     }
+    const normalized = exact.toUpperCase();
     const event = db.query('SELECT starts_at, ends_at, max_uses FROM member_event_codes WHERE code = ? COLLATE NOCASE').get(normalized) as { starts_at: string; ends_at: string; max_uses: number } | null;
     if (event) {
       if (at < event.starts_at || at >= event.ends_at) return { valid: false, reason: 'inactive' };
@@ -332,6 +413,35 @@ export function createMemberStore(options: { readonly path?: string; readonly no
   }
 
   return {
+    activeReferralCodeForMember(memberId) {
+      assertOpen();
+      return (db.query(`SELECT code FROM member_referral_codes WHERE member_id = ? AND revoked_at IS NULL
+        ORDER BY created_at DESC LIMIT 1`).get(memberId) as { code: string } | null)?.code ?? null;
+    },
+    referralsForMember(memberId) {
+      assertOpen();
+      return (db.query(`SELECT invitee_id, code, event_code, invited_at FROM member_referrals
+        WHERE inviter_id = ? ORDER BY invited_at, invitee_id`).all(memberId) as Array<{ invitee_id: string; code: string; event_code: string | null; invited_at: string }>)
+        .map(row => ({ inviteeId: row.invitee_id, referralCode: row.code, eventCode: row.event_code, invitedAt: row.invited_at }));
+    },
+    rotateReferralCode(memberId, at = iso(nowMs())) {
+      assertOpen();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if (!db.query('SELECT 1 FROM members WHERE id = ?').get(memberId)) throw new Error('member not found');
+        let code = referralCode();
+        while (db.query('SELECT 1 FROM member_referral_codes WHERE code = ? COLLATE BINARY').get(code)) code = referralCode();
+        db.query('UPDATE member_referral_codes SET revoked_at = ? WHERE member_id = ? AND revoked_at IS NULL').run(at, memberId);
+        db.query('INSERT INTO member_referral_codes (code, member_id, created_at) VALUES (?, ?, ?)').run(code, memberId, at);
+        db.query('UPDATE members SET referral_code = ?, updated_at = ? WHERE id = ?').run(code, at, memberId);
+        db.exec('COMMIT');
+        return code;
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    revokeReferralCode(memberId, at = iso(nowMs())) {
+      assertOpen();
+      return Number(db.query('UPDATE member_referral_codes SET revoked_at = ? WHERE member_id = ? AND revoked_at IS NULL').run(at, memberId).changes) > 0;
+    },
     provisionEventCode(input) {
       assertOpen();
       if (!input.code.trim() || !Number.isSafeInteger(input.maxUses) || input.maxUses < 1) throw new Error('invalid event code configuration');
@@ -423,6 +533,7 @@ export function createMemberStore(options: { readonly path?: string; readonly no
         let initialKey: IssuedMemberKey | undefined;
         if (existing) {
           const memberId = String(existing.id);
+          if (intent.referralCode) throw new Error('existing member cannot accept another referral');
           let eventCode = existing.event_code == null ? null : String(existing.event_code);
           if (intent.eventCode) {
             const requestedCode = intent.eventCode.trim().toUpperCase();
@@ -444,8 +555,8 @@ export function createMemberStore(options: { readonly path?: string; readonly no
           if (intent.referralCode) {
             const referral = validate(intent.referralCode, 'referral', at);
             if (!referral.valid) throw new Error('invalid referral code');
-            const referrer = db.query('SELECT id FROM members WHERE referral_code = ? COLLATE NOCASE').get(intent.referralCode.trim()) as { id: string } | null;
-            inviter = referrer?.id ?? null;
+            const referrer = db.query('SELECT member_id FROM member_referral_codes WHERE code = ? COLLATE BINARY AND revoked_at IS NULL').get(intent.referralCode.trim()) as { member_id: string } | null;
+            inviter = referrer?.member_id ?? null;
           }
           let eventCode: string | null = null;
           if (intent.eventCode) {
@@ -455,9 +566,12 @@ export function createMemberStore(options: { readonly path?: string; readonly no
           }
           const id = randomUUID();
           let ownCode = referralCode();
-          while (db.query('SELECT 1 FROM members WHERE referral_code = ?').get(ownCode)) ownCode = referralCode();
+          while (db.query('SELECT 1 FROM member_referral_codes WHERE code = ? COLLATE BINARY').get(ownCode)) ownCode = referralCode();
           db.query(`INSERT INTO members (id, google_sub, email, name, referral_code, invited_by, event_code, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, identity.sub, identity.email, identity.name, ownCode, inviter, eventCode, at, at);
+          db.query('INSERT INTO member_referral_codes (code, member_id, created_at) VALUES (?, ?, ?)').run(ownCode, id, at);
+          if (inviter) db.query(`INSERT INTO member_referrals (invitee_id, inviter_id, code, event_code, invited_at)
+            VALUES (?, ?, ?, ?, ?)`).run(id, inviter, intent.referralCode!.trim(), eventCode, at);
           initialKey = insertMemberKey(id, 'signup', at);
           row = db.query('SELECT * FROM members WHERE id = ?').get(id) as Record<string, unknown>;
           db.query(`INSERT INTO member_plan_assignments (member_id, plan) VALUES (?, 'free')`).run(id);
@@ -639,6 +753,36 @@ export function createMemberStore(options: { readonly path?: string; readonly no
       const row = db.query(`SELECT m.* FROM member_sessions s JOIN members m ON m.id = s.member_id
         WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?`).get(hash(token), at) as Record<string, unknown> | null;
       return row ? profile(row) : null;
+    },
+    reserveEventTry(memberId, eventCode, maxAttempts, at = iso(nowMs())) {
+      assertOpen();
+      if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) return null;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.query(`DELETE FROM member_event_try_attempts WHERE status = 'reserved' AND reservation_expires_at <= ?`).run(at);
+        const member = db.query('SELECT event_code FROM members WHERE id = ?').get(memberId) as { event_code: string | null } | null;
+        const count = db.query('SELECT count(*) AS n FROM member_event_try_attempts WHERE member_id = ? AND event_code = ?')
+          .get(memberId, eventCode) as { n: number };
+        if (member?.event_code?.toUpperCase() !== eventCode.toUpperCase() || count.n >= maxAttempts) {
+          db.exec('COMMIT');
+          return null;
+        }
+        const reservationId = randomUUID();
+        const expiresAt = iso(Date.parse(at) + MEMBER_TRY_RESERVATION_TTL_MS);
+        db.query(`INSERT INTO member_event_try_attempts (id, member_id, event_code, requested_at, status, reservation_expires_at)
+          VALUES (?, ?, ?, ?, 'reserved', ?)`).run(reservationId, memberId, eventCode, at, expiresAt);
+        db.exec('COMMIT');
+        return reservationId;
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
+    completeEventTry(reservationId, at = iso(nowMs())) {
+      assertOpen();
+      return Number(db.query(`UPDATE member_event_try_attempts SET status = 'completed', reservation_expires_at = NULL
+        WHERE id = ? AND status = 'reserved' AND reservation_expires_at > ?`).run(reservationId, at).changes) > 0;
+    },
+    releaseEventTry(reservationId) {
+      assertOpen();
+      return Number(db.query(`DELETE FROM member_event_try_attempts WHERE id = ? AND status = 'reserved'`).run(reservationId).changes) > 0;
     },
     requestDeletion(token, at = iso(nowMs())) {
       assertOpen();

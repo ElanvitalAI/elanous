@@ -17,23 +17,6 @@ export function resolveDashboardChatMainSubmitIntent(
   const commandText = inputText.trim();
   const source = deps.source ?? { kind: 'keyboard', surface: 'dashboard-chat-main' };
   const textBytes = Buffer.byteLength(commandText, 'utf8');
-  if (commandText.toLowerCase() === 'exit' || commandText.toLowerCase() === 'quit') {
-    const intent = {
-      kind: 'control-turn',
-      source,
-      command: 'slash-command',
-      commandText: '/exit',
-    } satisfies ControlTurnIntent;
-    if (debug.enabled) {
-      debug.log('input.intent', 'resolve', {
-        route: intent.command,
-        sourceKind: source.kind,
-        implicitExit: true,
-        textBytes,
-      });
-    }
-    return intent;
-  }
   if (deps.stickyBackend && commandText.length > 0 && !commandText.startsWith('/')) {
     const intent = {
       kind: 'submit-turn',

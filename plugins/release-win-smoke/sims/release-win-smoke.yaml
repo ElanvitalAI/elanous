@@ -1,0 +1,9 @@
+id: release-win-smoke
+world: fake-windows-host
+cases:
+  - id: installer-version-capture-success
+    input: { scenario: success }
+    receipt: { terminal: done, steps: [install, version, capture], observation: release.win-smoke }
+  - id: missing-libc-fails-version-before-capture
+    input: { scenario: missing-libc }
+    receipt: { terminal: failed, steps: [install, version], failure: "libc.so.6 unavailable", observation: release.win-smoke }

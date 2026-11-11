@@ -74,6 +74,8 @@ export interface GraphNodeSpec {
   readonly requires?: `${string}.${string}@${number}`;
   /** Named shared resources; nodes with a common lock are never dispatched together. */
   readonly resourceLocks?: readonly string[];
+  /** Environment variable to Elanous secret-store name bindings; values are resolved only at dispatch. */
+  readonly secrets?: Readonly<Record<string, string>>;
   /** L0 journey-stage declaration (optional for other graph templates). */
   readonly journeyStage?: string;
   readonly progress?: readonly string[];
@@ -130,7 +132,8 @@ export interface GraphSupervisorSpec {
   readonly ref: `loop:${string}@${number}`;
   readonly role: 'primary' | 'observer' | 'healer';
   readonly scope: 'run' | 'template';
-  readonly authority: readonly ('reroute' | 'add-node' | 'repair' | 'hitl' | 'cleanup')[];
+  readonly authority: readonly ('reroute' | 'add-node' | 'repair' | 'hitl' | 'cleanup'
+    | 'skip-node' | 'gate-waiver' | 'regression-response' | 'emergency-release')[];
   readonly requires: readonly string[];
 }
 
@@ -263,7 +266,8 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
           errors.push({ path: `${at}/role`, message: 'role 은 primary|observer|healer 이어야 한다' });
         if (value.scope !== undefined && value.scope !== 'run' && value.scope !== 'template')
           errors.push({ path: `${at}/scope`, message: 'scope 는 run|template 이어야 한다' });
-        const authorities = ['reroute', 'add-node', 'repair', 'hitl', 'cleanup'];
+        const authorities = ['reroute', 'add-node', 'repair', 'hitl', 'cleanup',
+          'skip-node', 'gate-waiver', 'regression-response', 'emergency-release'];
         if (!Array.isArray(value.authority) || value.authority.length === 0 ||
             value.authority.some(item => typeof item !== 'string' || !authorities.includes(item)) ||
             new Set(value.authority).size !== value.authority.length)
@@ -358,6 +362,22 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
         errors.push({ path: `${at}/resource_locks`, message: 'resource_locks 는 중복 없는 비어 있지 않은 문자열 목록이어야 한다' });
       } else resourceLocks = n.resource_locks as string[];
     }
+    let secrets: Record<string, string> | undefined;
+    if (n.secrets !== undefined) {
+      if (!n.secrets || typeof n.secrets !== 'object' || Array.isArray(n.secrets) || Object.keys(n.secrets).length === 0) {
+        errors.push({ path: `${at}/secrets`, message: 'secrets 는 환경 변수 이름에서 Elanous secret 이름으로 잇는 비어 있지 않은 맵이어야 한다' });
+      } else {
+        const entries = Object.entries(n.secrets as Record<string, unknown>);
+        const reservedEnv = new Set(['PATH', 'HOME', 'SHELL', 'PWD', 'NODE_OPTIONS', 'BASH_ENV', 'ENV', 'ELANOUS_STATE_DIR', 'ELANOUS_CONFIG_DIR']);
+        const invalid = entries.find(([envName, secretName]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)
+          || reservedEnv.has(envName) || envName.startsWith('ELANOUS_')
+          || typeof secretName !== 'string' || !/^[a-z][a-z0-9._:-]{0,127}$/.test(secretName));
+        if (invalid) errors.push({ path: `${at}/secrets`, message: 'secrets 는 유효한 환경 변수 이름과 Elanous secret 이름만 허용한다' });
+        else secrets = Object.fromEntries(entries as Array<[string, string]>);
+      }
+    }
+    if (secrets && !(kind === 'agent' && recipe.startsWith('cmd:')) && !recipe.startsWith('handler:') && kind !== 'capability')
+      errors.push({ path: `${at}/secrets`, message: 'secrets 는 실행 경계가 있는 cmd·handler·capability 노드에서만 선언할 수 있다' });
     if (n.journey_stage !== undefined && (typeof n.journey_stage !== 'string' || !n.journey_stage.trim()
       || (Array.isArray(journeyStages) && !journeyStages.includes(n.journey_stage)))) {
       errors.push({ path: `${at}/journey_stage`, message: typeof n.journey_stage === 'string' && n.journey_stage.trim()
@@ -535,6 +555,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
       ...(typeof n.requires === 'string' ? { requires: n.requires as `${string}.${string}@${number}` } : {}),
       ...(needs === undefined ? {} : { needs }),
       ...(resourceLocks === undefined ? {} : { resourceLocks }),
+      ...(secrets === undefined ? {} : { secrets }),
       ...(typeof n.journey_stage === 'string' ? { journeyStage: n.journey_stage } : {}),
       ...(Array.isArray(n.progress) ? { progress: n.progress.filter((v): v is string => typeof v === 'string') } : {}),
       ...(Array.isArray(n.phases) ? { phases: n.phases.filter((v): v is string => typeof v === 'string') } : {}),

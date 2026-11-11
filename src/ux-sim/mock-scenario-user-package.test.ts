@@ -9,7 +9,7 @@ test('user package exposes only connector devices with the secret-free default p
   expect(packagedIds).toEqual([
     'SIM-FAKE-PROVIDERS-AV', 'fake-app-auth', 'fake-app-drive-world', 'fake-app-realtime',
     'fake-app-storage', 'fake-app-traffic', 'fake-dns-cert', 'fake-google-drive-world',
-    'fake-higgsfield', 'fake-payment',
+    'fake-higgsfield', 'fake-payment', 'multi-actor-world',
   ].sort());
   expect(packaged.every((device) => device.defaultProfile.credentials === 'fake-only'
     && device.defaultProfile.network === 'loopback-only'

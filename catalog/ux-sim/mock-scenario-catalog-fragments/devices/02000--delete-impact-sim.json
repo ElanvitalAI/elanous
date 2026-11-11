@@ -1,0 +1,28 @@
+{
+  "id": "delete-impact-sim",
+  "name": "Virtual feature deletion impact world",
+  "checklistCells": ["DELETE-IMPACT-SIM"],
+  "implementation": [
+    "src/ux-sim/delete-impact-sim.ts",
+    "scripts/sim-impact.ts",
+    "scripts/test-census.ts"
+  ],
+  "tests": ["src/ux-sim/delete-impact-sim.test.ts"],
+  "target": "Simulate a feature deletion against the shared import closure, JUnit test census, declared callers, affected checks, and 30-day call evidence without deleting repository files",
+  "inputs": [
+    "tracked source tree and paths to remove virtually",
+    "complete feature call-key inventory and test-census JSON from JUnit",
+    "complete or incomplete 30-day call window",
+    "fake selected-test and changed-scope typecheck executors"
+  ],
+  "observations": [
+    "reverse import closure and remaining CLI, menu, graph, config callers",
+    "only affected tests and simulation scenarios selected",
+    "virtual tree omits target paths while real tree stays intact",
+    "delete-safe requires passing receipts, complete caller inventory, and a complete zero-call window; uncertainty is delete-risk"
+  ],
+  "entryCommands": ["bun test src/ux-sim/delete-impact-sim.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -14,12 +14,13 @@
 // 관측 = 결과 provider · llm.retry 관측 · llm.router 이벤트 · 영수증(명령 ⊕ injectionId ⊕ 결과) · 층 L1.
 
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { _resetKeyCacheForTests } from '../config.js';
 import { debug } from '../debug/log.js';
 import { PROVIDERS, streamLLMWithTools } from '../llm.js';
+import { CODEX_OWNER_MIRROR_RELATIVE_PATH } from '../oauth/codex-owner-mirror.js';
 import { ZAI_CODING_PLAN_URL } from '../llm/zai-coding-plan.js';
 import { DEFAULT_FALLBACK_CHAIN, type FallbackStep } from '../oauth/fallback-chain.js';
 import { setUserConfigOverlay } from '../user-config.js';
@@ -134,6 +135,18 @@ export async function simPodCodex503(scenario: PodCodex503Scenario = podCodex503
     process.env.CODEX_HOME = join(home, '.codex');
     // zai 한도 원장·quota 신호(quotaSignalDir)가 운영 ~/.elanous/budget 이 아니라 임시 뿌리로 간다.
     process.env.ELANOUS_STATE_DIR = join(home, 'state');
+    // Production Codex now reads a refresh-less owner mirror before HTTP. Supply a synthetic,
+    // isolated mirror so this device reaches its injected 503/401 boundary rather than failing
+    // early with missing-file. Source: readCodexOwnerAccessMirror rejects expiry within 120s;
+    // this synthetic token remains valid for 3,600s so the synchronous simulation cannot expire mid-run.
+    const ownerMirrorPath = join(process.env.ELANOUS_STATE_DIR, CODEX_OWNER_MIRROR_RELATIVE_PATH);
+    mkdirSync(dirname(ownerMirrorPath), { recursive: true });
+    const expirySeconds = Math.floor(Date.now() / 1000) + 3600;
+    const accessToken = `header.${Buffer.from(JSON.stringify({ exp: expirySeconds })).toString('base64url')}.signature`;
+    writeFileSync(ownerMirrorPath, JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { access_token: accessToken, refresh_token: '', account_id: 'sim-codex-account' },
+    }), { mode: 0o600 });
     // Fake LLM은 기본 test universe 안전장치다. 이 sim은 가짜 HTTP 경계에서만 production retry를 검증한다.
     process.env.ELANOUS_LLM_MODE = 'real';
     for (const key of ISOLATED_LLM_ENV_KEYS) delete process.env[key];
@@ -161,7 +174,7 @@ export async function simPodCodex503(scenario: PodCodex503Scenario = podCodex503
           return new Response('zai fallback prohibited by the simulation policy', { status: 403 });
         }
         if (scenario.codexResponds) {
-          return new Response('data: {"choices":[{"delta":{"content":"fake-codex-answer"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+          return new Response('data: {"type":"response.output_text.delta","delta":"fake-codex-answer"}\n\ndata: {"type":"response.completed","response":{"id":"fake-codex-response","status":"completed","end_turn":true}}\n\ndata: [DONE]\n\n', {
             status: 200, headers: { 'content-type': 'text/event-stream' },
           });
         }

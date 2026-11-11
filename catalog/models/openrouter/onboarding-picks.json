@@ -1,0 +1,16 @@
+{
+  "source": "https://openrouter.ai/api/v1/models",
+  "checkedAt": "2026-11-10",
+  "models": [
+    { "id": "openai/gpt-5.3-codex", "label": "GPT-5.3 Codex", "family": "Codex" },
+    { "id": "openai/gpt-5.1-codex-mini", "label": "GPT-5.1 Codex Mini", "family": "Codex" },
+    { "id": "anthropic/claude-sonnet-5.5", "label": "Claude Sonnet 5.5", "family": "Claude" },
+    { "id": "anthropic/claude-opus-5.5", "label": "Claude Opus 5.5", "family": "Claude" },
+    { "id": "upstage/solar-pro4", "label": "Solar Pro 4", "family": "Solar" },
+    { "id": "upstage/solar-mini4", "label": "Solar Mini 4", "family": "Solar" },
+    { "id": "z-ai/glm-5.3-flash", "label": "GLM 5.3 Flash", "family": "GLM" },
+    { "id": "qwen/qwen3.8-max-0902", "label": "Qwen3.8 Max", "family": "Qwen" },
+    { "id": "qwen/qwen3.8-flash", "label": "Qwen3.8 Flash", "family": "Qwen" },
+    { "id": "deepseek/deepseek-v4.1-flash", "label": "DeepSeek V4.1 Flash", "family": "DeepSeek" }
+  ]
+}

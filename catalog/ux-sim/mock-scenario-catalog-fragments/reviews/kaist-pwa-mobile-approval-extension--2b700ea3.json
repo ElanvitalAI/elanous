@@ -1,0 +1,4 @@
+{
+  "deviceKey": "kaist-pwa-mobile-approval-extension",
+  "review": "> 📅 **2026-11-11 재검토 (DEMO-BRIEF-TO-REQUIREMENTS · DEMO-BOARD-FROM-GRAPH)** — 정본 01880 브라우저 장치에 모바일 화면과 명시적 승인 POST를 더한다. 별도 장면 재생기·영수증·그래프 생산자를 만들지 않고 fake member 쿠키와 같은 graph runId를 확인한다."
+}

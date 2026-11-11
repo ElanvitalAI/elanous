@@ -17,6 +17,7 @@ import { ReleaseRunClaimConflict, findActiveReleaseRun } from '../../src/cli/rel
 import { releaseRunUniverse } from './release-universe.js';
 import { baseVersion, isStableVersion, nextPrereleaseVersion, type PrereleaseKind } from './release-version.js';
 import { publishAtError } from './publish-at.js';
+import type { CloudElasticGraphRequest } from '../../src/release-loop/cloud-elastic.js';
 import { checkGateExecutorChoice, type GateExecutor } from './gate-executor.js';
 import { readReleaseGateRehearsal, readReleaseOpsPolicy, selectReleaseGateMethod } from './gate-method.js';
 import { createMacrophageRuntime } from '../../src/release-loop/macrophage-heal-node.js';
@@ -49,34 +50,11 @@ function gitOutput(repo: string, args: string[]): string {
 }
 
 /** A stale installed/seat CLI must not start a release graph with recipes that differ from main. */
-export function assertReleaseCliCurrent(
-  repo: string,
-  cutCommit?: string,
-  adopt?: { version: string; branchCutBaseCommit?: string },
-): void {
+export function assertReleaseCliCurrent(repo: string, cutCommit?: string): void {
   if (gitOutput(repo, ['status', '--porcelain', '--untracked-files=all'])) {
     throw new Error('release CLI checkout has uncommitted changes');
   }
   const head = gitOutput(repo, ['rev-parse', 'HEAD']);
-  if (adopt) {
-    if (!VERSION.test(adopt.version) || !adopt.branchCutBaseCommit) {
-      throw new Error('failed-run adoption requires a release version and branchCutBaseCommit');
-    }
-    const releaseRef = `refs/heads/release/${adopt.version}`;
-    const releaseTip = gitOutput(repo, ['ls-remote', 'origin', releaseRef]).split(/\s+/)[0];
-    if (!releaseTip || !/^[0-9a-f]{40,64}$/iu.test(releaseTip)) {
-      throw new Error(`cannot resolve origin/release/${adopt.version} for release CLI freshness check`);
-    }
-    const base = gitOutput(repo, ['rev-parse', '--verify', `${adopt.branchCutBaseCommit}^{commit}`]);
-    const descendant = spawnSync('git', ['merge-base', '--is-ancestor', base, head], { cwd: repo, encoding: 'utf8', maxBuffer: SPAWN_SYNC_MAX_BUFFER });
-    if (descendant.error || descendant.status !== 0) {
-      throw new Error(`stale release CLI: HEAD ${head} is not a descendant of adopt branchCutBaseCommit ${base}`);
-    }
-    if (head !== releaseTip) {
-      throw new Error(`stale release CLI: HEAD ${head} does not match origin/release/${adopt.version} ${releaseTip}`);
-    }
-    return;
-  }
   const remoteMain = gitOutput(repo, ['ls-remote', 'origin', 'refs/heads/main']).split(/\s+/)[0];
   if (!remoteMain || !/^[0-9a-f]{40,64}$/i.test(remoteMain)) throw new Error('cannot resolve origin/main for release CLI freshness check');
   const cutParent = cutCommit ? gitOutput(repo, ['rev-parse', `${cutCommit}^{commit}^`]) : undefined;
@@ -86,6 +64,8 @@ export function assertReleaseCliCurrent(
 }
 
 export interface ReleaseLoopConfig {
+  /** Explicitly allow bounded same-run cut repair; a repaired cut must use receipt audit. */
+  autoAppendRepair?: boolean;
   /** OP-controlled gate route. The absent value keeps the established gate path. */
   graphCutover?: 'legacy' | 'audit';
   /** OP decision record covering the hard rehearsal and shadow comparison. */
@@ -140,10 +120,10 @@ export interface ReleaseRunInput extends ReleaseLoopConfig {
   gateImagePin?: 'cut-commit';
   forceFreeze?: boolean;
   publishAt?: string;
+  /** Opt-in temporary VM request. OP approval is bound to its exact estimated amount. */
+  cloudElastic?: CloudElasticGraphRequest;
   /** RELEASE-BRANCH: version-release cuts release/<v> from main HEAD and bumps only the branch. */
   branchCut?: boolean;
-  /** Explicit OP-authorized transfer of an existing failed release branch to this run. */
-  adoptFailedRunId?: string;
   /** MACRO-PREFLIGHT-CLI-FRESH: exact main commit checked by the CLI before graph launch. */
   branchCutBaseCommit?: string;
 }
@@ -157,7 +137,7 @@ export interface UnattendedReleaseDeps {
   graph?: (path: string, options: { input: ReleaseRunInput; runId?: string; resumeRunId?: string; useCurrentGraph?: boolean;
     resumeInputPatch?: Record<string, unknown>; fromNodeId?: string; pinChildUniverse?: boolean;
     deps?: { root?: string; dispatchGraphSubscription?: GraphSubscriptionHandler } }) => Promise<GraphRunState>;
-  assertCliCurrent?: (repo: string, cutCommit?: string, adopt?: { version: string; branchCutBaseCommit?: string }) => void;
+  assertCliCurrent?: (repo: string, cutCommit?: string) => void;
   registerLogSink?: (surface: string) => Promise<boolean>;
   checklist?: (version: string) => Pick<ReturnType<typeof cutChecklistGate>, 'ok' | 'red' | 'undecided' | 'blocked'>;
   freezeRoot?: string;
@@ -304,7 +284,7 @@ function assertReleaseCutCompatible(run: GraphRunState, requested: ReleaseRunInp
 }
 
 export async function runUnattendedRelease(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string; branchCutBaseCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; adoptFailedRunId?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; branchCutBaseCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
   deps: UnattendedReleaseDeps = {},
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // A dry run only builds the input and mutates nothing, so it neither creates nor waits on the OP-seat lock.
@@ -315,7 +295,7 @@ export async function runUnattendedRelease(
 }
 
 async function runUnattendedReleaseLocked(
-  opts: { version: string; dryRun?: boolean; cutCommit?: string; branchCutBaseCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; adoptFailedRunId?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string; branchCutBaseCommit?: string; forceFreeze?: boolean; forceNew?: boolean; mainCut?: boolean; prerelease?: PrereleaseKind; publishAt?: string; gateExecutor?: string; gateHost?: string; triggerEvent?: ReleaseRunInput['triggerEvent'] },
   deps: UnattendedReleaseDeps,
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
   // RELEASE-BRANCH (10-06): the default cut is a release branch, so main keeps landing and the run no longer needs a
@@ -323,8 +303,6 @@ async function runUnattendedReleaseLocked(
   // `--cut-commit` (an already-cut branch) and `--main-cut` keep the old main-bump path.
   const branchCut = opts.cutCommit === undefined && !opts.mainCut;
   if (opts.prerelease && !branchCut) throw new Error('--prerelease needs the release-branch cut (no --cut-commit / --main-cut): a rehearsal must never bump main');
-  if (opts.adoptFailedRunId && !branchCut) throw new Error('--adopt-failed-run requires the release-branch cut');
-  if (opts.adoptFailedRunId && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(opts.adoptFailedRunId)) throw new Error('invalid --adopt-failed-run run id');
   if (!opts.dryRun) {
     const frozen = readLandingFreeze(deps.freezeRoot);
     if (frozen) {
@@ -342,13 +320,11 @@ async function runUnattendedReleaseLocked(
   }
   if (opts.forceFreeze) input.forceFreeze = true;
   if (branchCut) input.branchCut = true;
-  if (opts.adoptFailedRunId) input.adoptFailedRunId = opts.adoptFailedRunId;
   if (branchCut && opts.branchCutBaseCommit !== undefined) input.branchCutBaseCommit = opts.branchCutBaseCommit;
   debug.log('release.run', 'input', { version, requested: opts.version, branchCut, prerelease: opts.prerelease ?? null, dryRun: opts.dryRun === true,
     ...(input.gateExecutor ? { gateExecutor: input.gateExecutor, gateHost: input.gateExecutor === 'host' ? input.gateRemote ?? null : null } : {}) });
   if (opts.dryRun) return { input, dryRun: true };
-  (deps.assertCliCurrent ?? assertReleaseCliCurrent)(REPOSITORY_ROOT, opts.cutCommit,
-    opts.adoptFailedRunId ? { version: opts.version, branchCutBaseCommit: opts.branchCutBaseCommit } : undefined);
+  (deps.assertCliCurrent ?? assertReleaseCliCurrent)(REPOSITORY_ROOT, opts.cutCommit);
   if (opts.prerelease) {
     // A rehearsal neither judges nor carries the stable version's checklist cells.
     debug.log('release.run', 'checklist-skipped', { version, reason: 'prerelease' });

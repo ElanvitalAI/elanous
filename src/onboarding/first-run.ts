@@ -10,8 +10,11 @@ import { getSecretAsync, setSecretAsync } from '../nexus/config/secrets/index.js
 import { probeProvider } from '../llm/provider-probe.js';
 import { createSecretPrompt } from './secret-prompt.js';
 import { parseMenuAnswer as parseNumericMenuAnswer } from './menu-answer.js';
-import { getUserConfig, saveUserConfig, userConfigPath } from '../user-config.js';
+import { getUserConfig, saveUserConfig, userConfigPath, MODEL_ROLES } from '../user-config.js';
 import type { LLMProviderName, UserConfig } from '../user-config/types.js';
+import { OPENROUTER_ONBOARDING_CHOICES, SOLAR_DEMO_PRESET_ID, type OpenRouterPick } from '../cli/first-run/openrouter-picker.js';
+import { promptOpenRouterModel, SOLAR_DEMO_CHAT_MODEL } from './openrouter-model-picker.js';
+import { solarDemoRoleDefaults } from './openrouter-model-picker.js';
 
 export interface FirstRunDeps {
   config?: UserConfig;
@@ -22,6 +25,7 @@ export interface FirstRunDeps {
   /** Locale for user-facing wording; defaults to the shared ambient decision (detectLocale). */
   locale?: Locale;
   chooseProvider?: (detected: readonly LLMProviderName[]) => Promise<LLMProviderName | null>;
+  chooseOpenRouterModel?: (current?: string) => Promise<OpenRouterPick>;
   promptSecret?: (message: string) => Promise<string | undefined>;
   getSecretAsync?: typeof getSecretAsync;
   setSecretAsync?: typeof setSecretAsync;
@@ -31,7 +35,8 @@ export interface FirstRunDeps {
   saveConfig?: (config: UserConfig, path: string) => void;
 }
 
-export type FirstRunProviderSetupResult = LLMProviderName | null | { kind: 'needs-llm' };
+export type FirstRunProviderSetupResult = LLMProviderName | null | { kind: 'needs-llm' }
+  | { provider: 'openrouter'; model: string; solar: boolean };
 
 const CHOICE_BASE: readonly LLMProviderName[] = ['openai-codex', 'grok', 'anthropic', 'openrouter', 'glm'];
 const CHOICE_LABEL: Partial<Record<LLMProviderName, string>> = { 'openai-codex': 'Codex', grok: 'Grok', anthropic: 'Claude', openrouter: 'OpenRouter', glm: 'GLM' };
@@ -150,6 +155,8 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
   if (!configured && provider) print(detectionLine(provider));
   let inputs = 0;
   let providerSetUpInPlace = false;
+  let selectedModel: string | undefined;
+  let solarDemoPreset = false;
   if (!provider) {
     if (providers.length > 0) {
       print(detectionLine(usable.length === 0
@@ -163,10 +170,15 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
     if (deps.setupWhenNoProvider && usable.length === 0) {
       inputs = 1;
       const setupResult = await deps.setupWhenNoProvider(cfg);
-      if (typeof setupResult === 'object' && setupResult !== null && setupResult.kind === 'needs-llm') {
+      if (typeof setupResult === 'object' && setupResult !== null && 'kind' in setupResult && setupResult.kind === 'needs-llm') {
         return needsLlm(inputs);
       }
-      provider = typeof setupResult === 'string' ? setupResult : null;
+      provider = typeof setupResult === 'string' ? setupResult
+        : setupResult && 'provider' in setupResult ? setupResult.provider : null;
+      if (setupResult && typeof setupResult === 'object' && 'model' in setupResult) {
+        selectedModel = setupResult.model;
+        solarDemoPreset = setupResult.solar;
+      }
       if (!provider) {
         print('LLM 없이 첫 화면을 엽니다. LLM 기능은 사용할 수 없습니다. 다시 설정: `elanous setup keys` 또는 `elanous login openai-codex`.');
         // Skipping provider setup keeps this invocation reachable, but it must
@@ -195,6 +207,43 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
   // usable provider even when no API key exists; sending them into key setup
   // would contradict the subscription choice and prompt for an irrelevant key.
   const selectedSubscription = subscriptions.some((item) => item.provider === provider);
+  const selectModel = async () => {
+    if (provider !== 'openrouter' || selectedModel || cfg.llm.provider === 'openrouter' && cfg.llm.model) return;
+    if ((deps.isTTY ?? process.stdin.isTTY) !== true) {
+      selectedModel = `openrouter/${OPENROUTER_ONBOARDING_CHOICES[0]!.id}`;
+      return;
+    }
+    const currentModel = cfg.llm.provider === 'openrouter' ? cfg.llm.model : undefined;
+    const chosen = await (deps.chooseOpenRouterModel ?? (async (current?: string) => {
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      try { return await promptOpenRouterModel((prompt) => rl.question(prompt), print, current, deps.locale ?? detectLocale()); }
+      finally { rl.close(); }
+    }))(currentModel);
+    if (!OPENROUTER_ONBOARDING_CHOICES.some((model) => model.id === chosen.id)) return;
+    solarDemoPreset = chosen.id === SOLAR_DEMO_PRESET_ID;
+    selectedModel = solarDemoPreset ? SOLAR_DEMO_CHAT_MODEL : `openrouter/${chosen.id}`;
+    if (!solarDemoPreset && MODEL_ROLES.some((role) => {
+      const roleModel = cfg.roleLlm?.[role]?.model;
+      return Boolean(roleModel && roleModel !== selectedModel);
+    })) {
+      print('기존 역할별 모델 설정은 유지했습니다. 역할 모델을 바꾸려면 설정에서 직접 변경하세요.');
+    }
+  };
+  const roleDefaults = (): UserConfig['roleLlm'] => {
+    if (solarDemoPreset) return solarDemoRoleDefaults();
+    if (provider === 'openrouter' && selectedModel) {
+      return { ...cfg.roleLlm, ...Object.fromEntries(MODEL_ROLES.map((role) => [role, cfg.roleLlm?.[role] ?? {
+        provider: 'openrouter', model: selectedModel,
+      }])) } as UserConfig['roleLlm'];
+    }
+    if (!configured && provider === 'openai-codex') {
+      return { ...cfg.roleLlm, ...Object.fromEntries(MODEL_ROLES.map((role) => [role, cfg.roleLlm?.[role] ?? {
+        provider,
+        ...(selectedModel ? { model: selectedModel } : {}),
+      }])) } as UserConfig['roleLlm'];
+    }
+    return cfg.roleLlm;
+  };
   if (inputs === 1 && credential?.source === 'none'
     && !selectedSubscription
     && !(providerSetUpInPlace && provider === 'openai-codex')) {
@@ -227,6 +276,7 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
         secretStoreApiKey: storedValue,
       });
       if (!storedValue?.trim() || storedCredential.source === 'none') return needsLlm(inputs, [text.keyStoredNotReady]);
+      await selectModel();
       // Only remove any legacy config key after the runtime can read its replacement.
       // A failed SecretStore write/readback must leave the prior working config intact.
       (deps.saveConfig ?? saveUserConfig)({
@@ -235,8 +285,10 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
           ...cfg.llm,
           provider,
           apiKey: undefined,
-          ...(provider !== cfg.llm.provider ? { baseUrl: undefined, model: undefined } : {}),
+          ...(provider !== cfg.llm.provider ? { baseUrl: undefined, model: selectedModel } : {}),
+          ...(selectedModel ? { model: selectedModel } : {}),
         },
+        roleLlm: roleDefaults(),
       }, path);
       (deps.saveConfig ?? saveUserConfig)({
         ...cfg,
@@ -244,8 +296,10 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
           ...cfg.llm,
           provider,
           apiKey: undefined,
-          ...(provider !== cfg.llm.provider ? { baseUrl: undefined, model: undefined } : {}),
+          ...(provider !== cfg.llm.provider ? { baseUrl: undefined, model: selectedModel } : {}),
+          ...(selectedModel ? { model: selectedModel } : {}),
         },
+        roleLlm: roleDefaults(),
         onboarding: { ...cfg.onboarding, ready: true },
       }, path);
       observe('ready', inputs);
@@ -254,16 +308,19 @@ export async function runFirstRun(deps: FirstRunDeps = {}): Promise<{
       return needsLlm(inputs, [text.keySetupFailed]);
     }
   }
+  await selectModel();
   (deps.saveConfig ?? saveUserConfig)({
     ...cfg,
     llm: { ...cfg.llm, provider,
       ...(provider !== cfg.llm.provider ? {
         apiKey: credential?.source === 'rotation' ? credential.apiKey : undefined,
         baseUrl: credential?.baseUrl,
-        model: undefined,
+        model: selectedModel,
       } : {}),
+      ...(selectedModel ? { model: selectedModel } : {}),
       ...(credential?.source === 'rotation' && credential.apiKey ? { apiKey: credential.apiKey } : {}),
       ...(credential?.baseUrl ? { baseUrl: credential.baseUrl } : {}) },
+    roleLlm: roleDefaults(),
     onboarding: { ...cfg.onboarding, ready: true },
   }, path);
   observe('ready', inputs);

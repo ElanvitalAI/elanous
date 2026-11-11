@@ -79,7 +79,8 @@
       "decider": "scenario-injection",
       "reason": "paid-wall recovery mock",
       "scene": "B",
-      "demo1104Scene": "B"
+      "demo1104Scene": "B",
+      "source": "injected"
     },
     {
       "seq": 13,
@@ -116,7 +117,8 @@
       "decider": "scenario-injection",
       "reason": "new headline reordering mock",
       "scene": "C",
-      "demo1104Scene": "C"
+      "demo1104Scene": "C",
+      "source": "replay"
     },
     {
       "seq": 18,

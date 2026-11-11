@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "웹 3계층 — 무상태 웹 계층",
+  "source": "https://docs.aws.amazon.com/whitepapers/latest/serverless-multi-tier-architectures-api-gateway-lambda/serverless-multi-tier-architectures-api-gateway-lambda.html",
+  "body": "적용 시점: 요청 간 상태를 서버 메모리에 보존할 이유가 없고 수평 확장이 필요할 때.\n용량 단계: 초기 단일 인스턴스에서 시작해 부하·가용성 관측 후 여러 인스턴스로 늘린다; 세션은 외부 저장소로 옮긴다.\nGCP 대응: Cloud Run/서비스 자동확장과 외부 세션 저장소(예: Memorystore 또는 Cloud SQL).\n비용 축: 요청 수와 CPU·메모리 사용 시간, 외부 세션 저장소 비용이 함께 움직인다.\n결정과 반증: 인스턴스 교체 후에도 로그인·요청 결과가 보존되는지 재시작 시험으로 반증한다."
+}

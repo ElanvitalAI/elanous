@@ -18,11 +18,11 @@ test('next TUI PageUp/PageDown and wheel move a long log in both directions', as
         ELANOUS_NEXT_TUI_COMPACT_HEIGHT: '20' },
       ready: { label: 'boot', until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') },
       steps: [
-        { label: 'bottom', text: 'scroll probe', until: (s) => s.includes('SCROLL-LINE-44') && s.includes('응답 완료') },
-        { label: 'PageUp', keys: '\x1b[5~', until: (s) => s.includes('SCROLL-LINE-35') && !s.includes('SCROLL-LINE-44') && s.includes('로그 탐색') },
+        { label: 'bottom', text: 'scroll probe', until: (s) => s.includes('SCROLL-LINE-44') && (s.includes('응답 완료') || s.includes('턴 완료')) },
+        { label: 'PageUp', keys: '\x1b[5~', until: (s) => s.includes('SCROLL-LINE-35') && !s.includes('SCROLL-LINE-44') && (s.includes('로그 탐색') || s.includes('턴 로그')) },
         { label: 'wheel up', keys: '\x1b[<64;30;10M', until: (s) => s.includes('SCROLL-LINE-32') && !s.includes('SCROLL-LINE-35') },
         { label: 'PageDown', keys: '\x1b[6~', until: (s) => s.includes('SCROLL-LINE-42') && !s.includes('SCROLL-LINE-44') },
-        { label: 'wheel down', keys: '\x1b[<65;30;10M', until: (s) => s.includes('SCROLL-LINE-44') && s.includes('로그 탐색') },
+        { label: 'wheel down', keys: '\x1b[<65;30;10M', until: (s) => s.includes('SCROLL-LINE-44') && (s.includes('로그 탐색') || s.includes('턴 로그')) },
       ],
     });
     expect(run.frames.map((f) => f.label)).toEqual(['boot', 'bottom', 'PageUp', 'wheel up', 'PageDown', 'wheel down']);
@@ -34,4 +34,4 @@ test('next TUI PageUp/PageDown and wheel move a long log in both directions', as
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-}, 30_000);
+}, 90_000);

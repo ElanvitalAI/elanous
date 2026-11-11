@@ -1,5 +1,25 @@
 import { expect, test } from 'bun:test';
-import { agentDisplayLines, agentResultStatus, agentTraceLine, applyAgentEvent, reconcileAgentOutputStatuses } from './agents.js';
+import { agentDisplayLine, agentDisplayLines, agentResultStatus, agentTraceLine, applyAgentEvent, reconcileAgentOutputStatuses, reconcileNestedAgentSnapshot } from './agents.js';
+
+test('AgentOutput settlement agrees in the summary and individual row', () => {
+  const started = applyAgentEvent([], { phase: 'start', id: 'task-1', description: 'worker' });
+  const background = applyAgentEvent(started, { phase: 'finish', id: 'task-1', status: 'background' });
+  const settled = reconcileAgentOutputStatuses(background, [{ role: 'tool', content: '⚙️ AgentOutput',
+    toolName: 'AgentOutput', toolResult: JSON.stringify({ taskId: 'task-1', retrievalStatus: 'success', state: 'done' }), ts: 't' }]);
+  expect(agentDisplayLines(settled)).toEqual(['✓ 하위 에이전트 · 완료 1']);
+  expect(settled.map(agentDisplayLine)).toEqual(['✓ Agent(worker) · 완료']);
+});
+
+test('late nested completion updates the settled display without replacing top-level agents', () => {
+  const top = applyAgentEvent([], { phase: 'start', id: 'root', description: 'root' });
+  const nested = reconcileNestedAgentSnapshot(top, [{ id: 'grandchild', description: '↳ grandchild', status: 'done' }]);
+  expect(nested).toEqual([...top, { id: 'grandchild', description: '↳ grandchild', status: 'done', source: 'nested' }]);
+  expect(reconcileNestedAgentSnapshot(nested, [{ id: 'grandchild', description: '↳ grandchild', status: 'failed' }]))
+    .toEqual([...top, { id: 'grandchild', description: '↳ grandchild', status: 'failed', source: 'nested' }]);
+  const userNamed = applyAgentEvent(nested, { phase: 'start', id: 'named', description: '↳ user named' });
+  expect(reconcileNestedAgentSnapshot(userNamed, [])).toEqual([...top,
+    { id: 'named', description: '↳ user named', status: 'running' }]);
+});
 import { logViewLines, toolFoldBlockStarts } from '../chat/log-view.js';
 
 test('Agent child start, completion, failure, and background handoff each occupy one line', () => {
@@ -28,6 +48,25 @@ test('three child tasks stay one grouped card and AgentOutput changes running to
   expect(agentDisplayLines(agents)).toEqual(['◐ 하위 에이전트 · 실행 중 2 · 완료 1']);
   agents = reconcileAgentOutputStatuses(agents, outputs);
   expect(agentDisplayLines(agents)).toEqual(['✓ 하위 에이전트 · 완료 3']);
+});
+
+test('background task snapshot replaces a stale running card before AgentOutput is consumed', () => {
+  const started = ['call-a', 'call-b'].reduce((items, id) =>
+    applyAgentEvent(items, { phase: 'start', id, description: `child ${id}` }), [] as ReturnType<typeof applyAgentEvent>);
+  const messages = ['a', 'b'].map((id) => ({
+    role: 'tool' as const, content: 'Agent', toolName: 'Agent', toolCallId: `call-${id}`,
+    toolResult: JSON.stringify({ background: true, taskId: `task-${id}`, output: `(running in background — taskId=task-${id})` }), ts: 't',
+  }));
+  const tasks = [
+    { id: 'task-a', label: 'child a', state: 'done' as const },
+    { id: 'task-b', label: 'child b', state: 'error' as const },
+  ];
+  expect(agentDisplayLines(reconcileAgentOutputStatuses(started, messages, tasks)))
+    .toEqual(['✗ 하위 에이전트 · 완료 1 · 실패 1']); // Source: the terminal states in this background task snapshot.
+  const output = [{ role: 'tool' as const, content: 'AgentOutput', toolName: 'AgentOutput',
+    toolResult: JSON.stringify({ taskId: 'task-b', retrievalStatus: 'success', state: 'done' }), ts: 't' }];
+  expect(agentDisplayLines(reconcileAgentOutputStatuses(started, [...messages, ...output], tasks)))
+    .toEqual(['✓ 하위 에이전트 · 완료 2']); // Source: the authoritative AgentOutput marks task-b done.
 });
 
 test('Agent history shows a bounded status line instead of a folded child transcript', () => {

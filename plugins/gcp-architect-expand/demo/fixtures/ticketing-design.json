@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "sourceKind": "synthetic-ticket-design-fixture",
+  "title": "공연 티켓팅 플랫폼",
+  "summary": "구매 API와 좌석 재고·결제 경로는 로컬에 유지한다. 비식별 이벤트 집계와 리포트 생성만 비동기 배치로 분리한다.",
+  "requirements": [
+    "좌석 예약과 결제는 멱등 키로 중복 처리를 막는다",
+    "구매 경로와 분석 배치의 장애 영역을 분리한다",
+    "집계 작업은 재시도·체크포인트 가능하고 사용자 요청 지연에 영향을 주지 않는다"
+  ],
+  "localComponents": ["구매 API", "좌석 재고", "결제", "작업 대기열"],
+  "offloadWorkload": "비식별 이벤트 집계·리포트 생성",
+  "offloadKind": "batch",
+  "retryable": true,
+  "checkpointable": true,
+  "exportData": "식별자 제거된 집계 이벤트",
+  "containsPii": false,
+  "dataClass": "internal",
+  "region": "asia-northeast3",
+  "usage": { "vcpuHours": 4, "gibHours": 8 }
+}

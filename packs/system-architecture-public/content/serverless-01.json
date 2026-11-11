@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "서버리스 — 요청형 서버리스 적합성",
+  "source": "https://docs.aws.amazon.com/whitepapers/latest/serverless-multi-tier-architectures-api-gateway-lambda/serverless-multi-tier-architectures-api-gateway-lambda.html",
+  "body": "적용 시점: 요청이 간헐적이거나 변동이 크고 운영팀이 서버 관리보다 제품 로직에 집중할 때.\n용량 단계: 초기·변동 부하는 요청형으로 시작; 지속 고부하·시작지연·비용이 나빠지면 상시 인스턴스와 비교한다.\nGCP 대응: Cloud Run, Cloud Functions, API Gateway, Cloud SQL/Firestore를 요청 특성에 따라 조합한다.\n비용 축: 요청 수, 실행 시간·메모리, cold start 대책, 네트워크 egress와 최소 인스턴스가 축이다.\n결정과 반증: 실제 유휴·피크 분포로 요청형과 상시형의 총비용 및 tail latency를 비교한다."
+}

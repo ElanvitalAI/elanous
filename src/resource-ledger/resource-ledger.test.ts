@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'bun:test';
-import { activeResourceLeases, activeResourcePools, admitGuardianHostLease, beginResourceLease, declareResourcePool, endGuardianHostLease, endResourceLease, guardianHostLeaseRecords, heartbeatResourceLease, latestWarmPoolPodReceipts, readResourceLedger, recordLlmProxyCall, recordWarmPoolPodReceipt, requestGuardianHostLease,
+import { activeResourceLeases, activeResourcePools, admitGuardianHostLease, beginResourceLease, declareResourcePool, endGuardianHostLease, endResourceLease, guardianHostLeaseRecords, heartbeatResourceLease, latestWarmPoolPodReceipts, readResourceLedger, recordLlmProxyCall, recordWarmPoolPodReceipt, replaceResourcePool, requestGuardianHostLease,
   reconcileResourceLeases, reapResourceLeaseIfCurrent, resourceMatrix, reassignResourcePools, type ResourceLease, type ResourceMeasurement } from './resource-ledger.js';
 import { buildResourceLedgerSnapshot, collectResourceMeasurement, registerResourceLedgerCommands, type ResourceCommandRunner } from '../cli/resource-ledger-cli.js';
 import { Command } from 'commander';
@@ -113,6 +113,29 @@ test('HQ pool reassignment appends a new authoritative declaration and leaves pr
   expect(reassignResourcePools('mbp', 'node-b', new Date('2026-11-09T00:01:00Z'), path)).toBe(1);
   expect(activeResourcePools(readResourceLedger(path))[0]?.members[0]?.host).toBe('node-b');
   expect(readResourceLedger(path)).toHaveLength(2);
+});
+
+test('pool digest rotation requires the exact previous declaration and preserves append-only history', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'resource-ledger-pool-rotate-')); dirs.push(dir);
+  const path = join(dir, 'events.jsonl');
+  const previous = { purpose: 'gate' as const, fanoutGroupId: 'gate-shards-0.3.11',
+    members: [{ host: 'node-b', count: 80, digest: 'sha256:' + 'a'.repeat(64), role: 'executor' as const }],
+    fanoutGroup: { shard: { kind: 'gate' as const, input: 'shard', result: 'receipt', fingerprint: 'cut' } },
+    fingerprint: { runtime: 'bun', environment: 'gate-v1', skillPacks: [] },
+    cleanup: { procedure: 'reset', verify: 'clean' } };
+  const next = { ...previous, members: [{ ...previous.members[0]!, digest: 'sha256:' + 'b'.repeat(64) }] };
+  expect(() => replaceResourcePool(next, previous, new Date('2026-11-11T00:00:00Z'), path))
+    .toThrow('resource pool replacement target missing');
+  declareResourcePool(previous, new Date('2026-11-11T00:00:00Z'), path);
+  expect(replaceResourcePool(next, previous, new Date('2026-11-11T01:00:00Z'), path)).toBe(true);
+  expect(replaceResourcePool(next, previous, new Date('2026-11-11T01:00:01Z'), path)).toBe(false);
+  const staleExpected = { ...previous, members: [{ ...previous.members[0]!, digest: 'sha256:' + 'c'.repeat(64) }] };
+  expect(() => replaceResourcePool(next, staleExpected, new Date('2026-11-11T01:00:01Z'), path))
+    .toThrow('resource pool replacement stale');
+  expect(() => replaceResourcePool(previous, previous, new Date('2026-11-11T01:00:02Z'), path))
+    .toThrow('resource pool replacement stale');
+  expect(activeResourcePools(readResourceLedger(path))).toEqual([next]);
+  expect(readResourceLedger(path).filter(row => row.event === 'pool-declared')).toHaveLength(2);
 });
 
 test('lease C/U/D appends an auditable history and active view reflects terminal endRun', () => {

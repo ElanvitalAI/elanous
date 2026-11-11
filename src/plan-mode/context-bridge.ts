@@ -11,12 +11,12 @@
 
 import { isPlanModeActive, subscribePlanMode } from './session.js';
 import type { ContextKeyService } from '../input-core/context-keys.js';
-import { getDashboardContextKeyService } from '../dashboard/context/keys.js';
+import { getRuntimeContextKeyService } from '../input-core/context-key-runtime.js';
 
 export function wirePlanModeContextBridge(
   service?: ContextKeyService,
 ): () => void {
-  const svc = service ?? getDashboardContextKeyService();
+  const svc = service ?? getRuntimeContextKeyService();
   // Seed immediately — startup state flows into ContextKeys before
   // the first plan enter/exit.
   svc.update({ planModeActive: isPlanModeActive() });

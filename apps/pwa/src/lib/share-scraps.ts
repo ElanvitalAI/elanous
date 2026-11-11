@@ -3,6 +3,7 @@ import type { SharedPayload } from './share-target-store';
 type ScrapKind = 'text' | 'web' | 'x' | 'youtube' | 'voice' | 'video' | 'photo';
 type ScrapRaw = { text?: string; url?: string; mediaRef?: string; mime?: string };
 export interface ShareScrapResult { saved: string[]; failed: string[] }
+export type ShareFetch = (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => Promise<Response>;
 export class ScrapsUnavailableError extends Error {}
 
 function urlKind(value: string): ScrapKind {
@@ -50,7 +51,7 @@ async function responseJson(response: Response, label: string): Promise<Record<s
 /** Browser member cookie identifies the owner; never send memberId in the scrap body. */
 export async function saveSharedScraps(
   payload: SharedPayload,
-  options: { baseUrl: string; daemonToken?: string; fetcher?: typeof fetch; completedKeys?: ReadonlySet<string>; onSaved?: (key: string) => void | Promise<void> },
+  options: { baseUrl: string; daemonToken?: string; fetcher?: ShareFetch; completedKeys?: ReadonlySet<string>; onSaved?: (key: string) => void | Promise<void> },
 ): Promise<ShareScrapResult> {
   const request = options.fetcher ?? fetch;
   const base = new URL(options.baseUrl || window.location.origin);

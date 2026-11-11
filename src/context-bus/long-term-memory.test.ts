@@ -7,12 +7,20 @@ import type { DecisionEntry } from '../decisions/decision-ledger.js';
 import { runContextCondense } from './condense.js';
 import type { CoordEvent } from './coord-events.js';
 import {
-  condenseContextDay, condenseContextWindowWithReport, importClaudeMemories, importClaudeMemory,
+  condenseContextDay, condenseContextWindowWithReport, guardianRetireAged, importClaudeMemories, importClaudeMemory,
   type MemorySource,
 } from './long-term-memory.js';
 
 const day = '2026-10-02';
 const now = new Date('2026-10-03T00:00:00.000Z');
+
+test('ARG feedback survives the guardian age rule while ordinary aged memory retires', () => {
+  const aged = { project: 'release', seat: 'R-MEMORY', topic: 'rare emergency', summary: 'retain while reachable',
+    source: 'elanous://arg-feedback/rare-emergency', updatedAt: '2026-01-01T00:00:00Z', status: 'active' as const };
+  expect(guardianRetireAged([{ ...aged, lifecycle: 'arg-feedback' }, aged,
+    { ...aged, source: 'https://example.test/ordinary' }], new Date('2026-11-10T00:00:00Z'))
+    .map(item => item.status)).toEqual(['active', 'active', 'retired']);
+});
 const event = (n: number, seat = 'TC', kind = '보고'): CoordEvent => ({
   id: `event-${n}`, at: `${day}T${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}:00.000Z`,
   kind, text: `project-alpha/topic-${n}/on`, summary: `project-alpha/topic-${n}/on`,

@@ -3,7 +3,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'nod
 import { homedir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { LAST_SESSION_FILE } from '../dashboard/seat-local-instructions.js';
+import { PROJECT_ANCHOR_LAST_SESSION_FILE as LAST_SESSION_FILE } from '../prompt-library/universal-preamble.js';
 import { redactSecretText } from '../debug/log.js';
 import { defaultMsgStorePath, readUnreadCount } from '../msg/msg-store.js';
 import { parseKnowhowItems, splitKnowhow } from '../seat-loop/seat-knowhow.js';
@@ -114,7 +114,7 @@ function seatRoleSection(home: string, seat: string): { source: string; updated:
   }
 }
 
-/** «지난 세션» 절 — TUI 가 대화 끝마다 자리 작업 디렉터리 루트에 갈아 쓰는 `LAST_SESSION_FILE`(`dashboard/seat-local-instructions.ts`)이 곧 지난 세션의 정본이다.
+/** «지난 세션» 절 — TUI 가 대화 끝마다 자리 작업 디렉터리 루트에 갈아 쓰는 `LAST_SESSION_FILE`(`prompt-library/universal-preamble.ts`)이 곧 지난 세션의 정본이다.
  *  카드도 같은 정본을 읽는다 — 머리 보일러플레이트(`## …`)는 빼고 요약 줄만 실는다. */
 function lastSessionSection(home: string, seat: string): { source: string; updated: string; rows: readonly string[]; reason?: string } {
   const path = join(home, 'elanous-hq', 'seats', seat, LAST_SESSION_FILE);

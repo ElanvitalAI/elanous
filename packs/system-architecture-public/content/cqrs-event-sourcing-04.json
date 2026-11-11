@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "CQRS·이벤트 소싱 — 이벤트 소싱 대신 Outbox",
+  "source": "https://microservices.io/patterns/data/transactional-outbox.html",
+  "body": "적용 시점: 업무 DB 쓰기와 이벤트 발행을 원자적으로 맞춰야 하지만 전체 상태 이벤트화는 필요 없을 때.\n용량 단계: 단일 DB와 소수 소비자는 같은 트랜잭션의 outbox로 시작; 처리량 한계에서 relay를 확장한다.\nGCP 대응: Cloud SQL 업무 테이블+outbox row, 별도 relay가 Pub/Sub로 발행하고 소비자는 멱등 처리한다.\n비용 축: outbox 보관·poll/CDC 처리·재전송과 큐 비용이 추가되며 두 시스템의 원장 비용은 피한다.\n결정과 반증: DB 커밋 성공/브로커 장애 조합에서 이벤트 유실이 없는지, relay 중복이 안전한지 확인한다."
+}

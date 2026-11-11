@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "이벤트 기반·큐 — 실패 큐와 재시도",
+  "source": "https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html",
+  "body": "적용 시점: 일시 오류를 재시도하되 영구 오류를 정상 처리 흐름에서 격리해야 할 때.\n용량 단계: 초기에는 제한된 재시도와 명시적 오류 로그; 실패량이 운영자 처리 능력을 넘으면 DLQ와 재처리 절차를 둔다.\nGCP 대응: Pub/Sub dead-letter topic 또는 Cloud Tasks retry 설정; 실패 표본은 Cloud Logging에 상관관계 ID로 남긴다.\n비용 축: 실패 재시도 호출량, DLQ 보존 기간, 운영 재처리 컴퓨트와 저장이 비용 축이다.\n결정과 반증: 영구 오류가 무한 재시도되지 않고 재처리 후 중복 부작용이 없는지 확인한다."
+}

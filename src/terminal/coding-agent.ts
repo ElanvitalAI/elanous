@@ -153,6 +153,7 @@ function binaryForBrand(brand: CodingAgentBrand): string {
     case 'codex':       return 'codex';
     case 'gemini':      return 'gemini';
     case 'grok':        return 'grok';
+    case 'hermes':      return 'hermes';
   }
 }
 

@@ -4,12 +4,14 @@ import { resolve } from 'node:path';
 import { createElement } from 'react';
 import { act, create } from 'react-test-renderer';
 import { environmentManager, focusManager, QueryClient } from '@tanstack/react-query';
-import { createNexusClient } from '@/nexus/client';
+import { createNexusClient, NexusApiError } from '@/nexus/client';
 import { NexusProvider } from '@/nexus/hooks/use-nexus-context';
 import { GraphInstanceLiveScreen, graphInstanceRefreshInterval, matchingGraphInstanceView } from './GraphInstanceLiveScreen';
 
 const graph = JSON.parse(readFileSync(resolve(import.meta.dir, '../../../../../plugins/graph-instance-view/fixtures/graph.view.json'), 'utf8')) as unknown;
 const resource = JSON.parse(readFileSync(resolve(import.meta.dir, '../../../../../plugins/graph-instance-view/fixtures/resource.view.json'), 'utf8')) as unknown;
+const harness = JSON.parse(readFileSync(resolve(import.meta.dir, '../../../../../plugins/graph-instance-view/fixtures/harness.view.json'), 'utf8')) as unknown;
+const release = JSON.parse(readFileSync(resolve(import.meta.dir, '../../../../../plugins/graph-instance-view/fixtures/release.view.json'), 'utf8')) as unknown;
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 test('PWA reads the contracted graph instance route with the selected key and shared JSON body', async () => {
@@ -39,6 +41,43 @@ test('resource read omits runId and graphId and accepts only the resource view',
   expect(matchingGraphInstanceView(value, { source: 'harness' })).toBeNull();
   await client.getGraphInstanceView({ source: 'resource', runId: 'ignore-me', graphId: 'ignore-me' });
   expect(calls[1]).toBe('https://nexus.test/v1/graph-instance-view?source=resource');
+});
+
+// #36563 provides the server route; these cases freeze the PWA request and response with fixture data.
+test('PWA prepares all four source requests for the declared plugin GET route', async () => {
+  const cases = [
+    { key: { source: 'graph' as const, runId: 'graph-demo-1', graphId: 'research-flow' }, view: graph,
+      path: '/v1/graph-instance-view?source=graph&runId=graph-demo-1&graphId=research-flow' },
+    { key: { source: 'harness' as const, runId: 'harness-demo-1' }, view: harness,
+      path: '/v1/graph-instance-view?source=harness&runId=harness-demo-1' },
+    { key: { source: 'release' as const, runId: 'release-demo-1', graphId: 'release-loop' }, view: release,
+      path: '/v1/graph-instance-view?source=release&runId=release-demo-1&graphId=release-loop' },
+    { key: { source: 'resource' as const }, view: resource,
+      path: '/v1/graph-instance-view?source=resource' },
+  ];
+  for (const { key, view, path } of cases) {
+    const calls: Array<{ url: string; method: string | undefined; authorization: string | null }> = [];
+    const client = createNexusClient({ baseUrl: 'https://nexus.test', token: 'test-token', fetchImpl: (async (input, init) => {
+      calls.push({ url: String(input), method: init?.method, authorization: new Headers(init?.headers).get('authorization') });
+      return Response.json(view);
+    }) as typeof fetch });
+    const result = await client.getGraphInstanceView(key);
+    expect(calls).toEqual([{ url: `https://nexus.test${path}`, method: 'GET', authorization: 'Bearer test-token' }]);
+    expect(matchingGraphInstanceView(result, key)?.instance.source).toBe(key.source);
+  }
+});
+
+test('PWA keeps plugin route authorization and missing-run failures visible', async () => {
+  for (const { key, status, error } of [
+    { key: { source: 'resource' as const }, status: 403, error: 'forbidden' },
+    { key: { source: 'harness' as const, runId: 'missing-run' }, status: 404, error: 'not-found' },
+  ]) {
+    const client = createNexusClient({ baseUrl: 'https://nexus.test', token: 'test-token', fetchImpl: (async () =>
+      Response.json({ error }, { status })) as unknown as typeof fetch });
+    await expect(client.getGraphInstanceView(key)).rejects.toMatchObject({
+      name: NexusApiError.name, status, body: { error },
+    });
+  }
 });
 
 test('waiting and transient errors poll again; completed views stop polling', () => {

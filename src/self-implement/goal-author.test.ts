@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test';
-import { draftMissingGoalDoneBoundary, explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary, normalizeGoalDoneBoundaryDocument, validateGoalDoneEvidenceCommand, authorVerificationPlan, readVerificationMenuDocs, verificationBehaviour, operationalInputDeclared, VERIFICATION_PLAN_HEADING } from './goal-author.js';
+import { draftMissingGoalDoneBoundary, explicitGoalDoneBoundaryLines, inspectGoalDoneBoundary, matchingPathCount, normalizeGoalDoneBoundaryDocument, selectGoalMockStage, validateGoalDoneEvidenceCommand, authorVerificationPlan, readVerificationMenuDocs, verificationBehaviour, operationalInputDeclared, VERIFICATION_PLAN_HEADING } from './goal-author.js';
+import { loadMockScenarioCatalog } from '../ux-sim/mock-scenario-catalog.js';
 import { existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -376,6 +377,36 @@ describe('goal author grade', () => {
       '완료 경계 증거 명령: bun test src/self-implement/unrelated-goal-file.test.ts',
     ].join('\n'), process.cwd());
     expect(semanticOnlyFallback.some((line) => line.includes('목장치 치환안:'))).toBe(false);
+  });
+
+  test('dotted directory keeps distinct catalog device and target request paths', () => {
+    const devicePaths = ['src/pkg.v1/query.ts', 'src/pkg.v1/query.test.ts'];
+    const unrelatedTargets = ['src/pkg.v1/other.ts', 'src/pkg.v1/other.test.ts'];
+    expect(matchingPathCount(devicePaths, unrelatedTargets)).toBe(0);
+    expect(matchingPathCount(devicePaths, ['src/pkg.v1/query.ts'])).toBe(10);
+
+    const catalog = loadMockScenarioCatalog();
+    const dottedDevice = {
+      ...catalog.devices[0]!,
+      id: 'dotted-query-device',
+      implementation: ['src/pkg.v1/query.foo.ts'],
+      tests: ['src/pkg.v1/query.foo.test.ts'],
+    };
+    const dottedCatalog = { ...catalog, devices: [dottedDevice], scenarios: [] };
+    const unrelatedDottedTargets = ['src/pkg.v1/query.bar.ts', 'src/pkg.v1/query.bar.test.ts'];
+    expect(selectGoalMockStage('', unrelatedDottedTargets, dottedCatalog)).toBeUndefined();
+    expect(selectGoalMockStage('', dottedDevice.implementation, dottedCatalog)).toMatchObject({
+      device: { id: 'dotted-query-device' },
+      pathMatched: true,
+    });
+
+    const unrelatedRequest = explicitGoalDoneBoundaryLines([
+      `대상 경로: ${unrelatedTargets.join(' · ')}`,
+      '완료 경계 코드: other result remains stable',
+      '완료 경계 실물: 실물 점검으로 other result remains stable',
+      '완료 경계 증거 명령: bun test src/pkg.v1/other.test.ts',
+    ].join('\n'), process.cwd());
+    expect(unrelatedRequest.some((line) => line.includes('목장치 치환안:'))).toBe(false);
   });
 
   test('typecheck-only evidence is rewritten to a target test and creates a TDD green command', async () => {

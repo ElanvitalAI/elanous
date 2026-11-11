@@ -440,28 +440,28 @@ test('an unsafe issue is replaced without dropping a safe issue from the other s
 test('internal absolute paths outside /Users are replaced before publishing', () => {
   const f = fixture();
   try {
-    const { code, result } = f.invoke(checklist, [], { reply: response([['K13', 'Export delays: look in {/home/user/private.txt} for details.']]) });
+    const { code, result } = f.invoke(checklist, [], { reply: response([['K13', 'Export delays: look in {/home/ubuntu/private.txt} for details.']]) });
     expect(code).toBe(0);
     expect(result).toMatchObject({ outcome: 'ok', count: 1, bullets: [fallback], fallbackUsed: true });
     const text = readFileSync(f.notes, 'utf8');
     expect(text).toContain(`- ${fallback}\n`);
-    expect(text).not.toContain('/home/user/private.txt');
-    expect(f.git(['show', `release-docs/${version}:release/public/docs/releases/${version}.md`], f.remote)).not.toContain('/home/user/private.txt');
-    const literal = f.invoke(checklist, [], { reply: response([['K13', 'Look in {/home/user/private.txt} for details.']]) });
+    expect(text).not.toContain('/home/ubuntu/private.txt');
+    expect(f.git(['show', `release-docs/${version}:release/public/docs/releases/${version}.md`], f.remote)).not.toContain('/home/ubuntu/private.txt');
+    const literal = f.invoke(checklist, [], { reply: response([['K13', 'Look in {/home/ubuntu/private.txt} for details.']]) });
     expect(literal.result).toMatchObject({ outcome: 'ok', bullets: [fallback], fallbackUsed: true });
-    expect(readFileSync(f.notes, 'utf8')).not.toContain('/home/user/private.txt');
-    const bracket = f.invoke(checklist, [], { reply: response([['K13', 'Look in [/home/user/private.txt] for details.']]) });
+    expect(readFileSync(f.notes, 'utf8')).not.toContain('/home/ubuntu/private.txt');
+    const bracket = f.invoke(checklist, [], { reply: response([['K13', 'Look in [/home/ubuntu/private.txt] for details.']]) });
     expect(bracket.result).toMatchObject({ bullets: [fallback], fallbackUsed: true });
-    expect(readFileSync(f.notes, 'utf8')).not.toContain('/home/user/private.txt');
-    const curl = f.invoke(checklist, [], { reply: response([['K13', 'Look in curl(/home/user/private.txt) for details.']]) });
+    expect(readFileSync(f.notes, 'utf8')).not.toContain('/home/ubuntu/private.txt');
+    const curl = f.invoke(checklist, [], { reply: response([['K13', 'Look in curl(/home/ubuntu/private.txt) for details.']]) });
     expect(curl.result).toMatchObject({ bullets: [fallback], fallbackUsed: true });
-    expect(readFileSync(f.notes, 'utf8')).not.toContain('/home/user/private.txt');
+    expect(readFileSync(f.notes, 'utf8')).not.toContain('/home/ubuntu/private.txt');
     const second = f.invoke(checklist, [], { reply: response([['K13', 'A report is stored at /etc/private.txt.']]) });
     expect(second.result).toMatchObject({ bullets: [fallback], fallbackUsed: true });
     expect(readFileSync(f.notes, 'utf8')).not.toContain('/etc/private.txt');
-    const fileUri = f.invoke(checklist, [], { reply: response([['K13', 'A report is stored at file:///home/user/private.txt.']]) });
+    const fileUri = f.invoke(checklist, [], { reply: response([['K13', 'A report is stored at file:///home/ubuntu/private.txt.']]) });
     expect(fileUri.result).toMatchObject({ bullets: [fallback], fallbackUsed: true });
-    expect(readFileSync(f.notes, 'utf8')).not.toContain('file:///home/user/private.txt');
+    expect(readFileSync(f.notes, 'utf8')).not.toContain('file:///home/ubuntu/private.txt');
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -541,9 +541,9 @@ test('public paths remain allowed while brace-wrapped private paths are rejected
     expect(code).toBe(0);
     expect(result.fallbackUsed).toBe(false);
     expect(readFileSync(f.notes, 'utf8')).toContain('https://example.com/releases');
-    const privatePath = f.invoke(checklist, [], { reply: response([['K13', 'Export delays: see {/home/user/private.txt}.']]) });
+    const privatePath = f.invoke(checklist, [], { reply: response([['K13', 'Export delays: see {/home/ubuntu/private.txt}.']]) });
     expect(privatePath.result).toMatchObject({ bullets: [fallback], fallbackUsed: true });
-    expect(readFileSync(f.notes, 'utf8')).not.toContain('/home/user/private.txt');
+    expect(readFileSync(f.notes, 'utf8')).not.toContain('/home/ubuntu/private.txt');
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 

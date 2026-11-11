@@ -235,7 +235,7 @@ export function parseVoiceSurfaceIntent(
  */
 import type {
   SerializableSurfaceIntent,
-} from '../../dashboard/terminal-surface-intent.js';
+} from '../../surface/terminal-surface-intent.js';
 import { deriveTerminalCapability, type TerminalExposureSnapshot } from '../../terminal/posture.js';
 
 export interface VoiceIntentEnvelopeOpts {

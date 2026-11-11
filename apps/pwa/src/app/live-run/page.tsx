@@ -73,10 +73,10 @@ function LiveRunRoute() {
     const graphId = params.get('graph')?.trim();
     if (source === 'resource' && !operator) return <p className="p-4">운영자만 볼 수 있습니다</p>;
     if (!['harness', 'graph', 'release', 'resource'].includes(source ?? '')
-      || (source !== 'resource' && !runId) || ((source === 'graph' || source === 'release') && !graphId))
+      || (source !== 'resource' && !runId))
       return <p role="alert" className="p-4">인스턴스 출처와 런 식별자를 확인해 주세요.</p>;
     return <GraphInstanceLiveScreen instanceKey={source === 'resource' ? { source: 'resource' }
-      : { source: source as 'harness' | 'graph' | 'release', ...(runId ? { runId } : {}), ...(graphId ? { graphId } : {}) }} />;
+      : { source: source as 'harness' | 'graph' | 'release', ...(runId ? { runId } : {}), ...(source !== 'harness' && graphId ? { graphId } : {}) }} />;
   }
   if (params.get('view') === 'release') return operator ? <ReleaseRunsView /> : <p className="p-4">운영자만 볼 수 있습니다</p>;
   const runId = params.get('run')?.trim() || null;

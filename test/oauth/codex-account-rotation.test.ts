@@ -12,6 +12,7 @@
 // ⭐ 판정이 순수 함수라 실물(스토어·네트워크) 없이 전수로 문다.
 
 import { describe, expect, mock, test } from 'bun:test';
+import { installCodexOwnerTestWorld } from '../fixtures/codex-owner-test-world.js';
 
 const defaultOutboundCalls: Array<{ text: string; kind: string | undefined }> = [];
 const outboundAlert = await import('../../src/domains/outbound-alert.js');
@@ -679,6 +680,7 @@ describe('진입점 — loadFreshCodexAuthState 가 «넘어간 계정»으로 �
   test('⛔ A 가 찼으면 team 의 토큰으로 갱신하고, 미러는 «team 의 홈»으로만 간다', async () => {
     const root = mkdtempSync(join(tmpdir(), 'rotate-entry-'));
     const prior = { state: process.env.ELANOUS_STATE_DIR, home: process.env.CODEX_HOME, xdg: process.env.XDG_CONFIG_HOME, run: process.env.ELANOUS_RUN_ID };
+    const restoreCodexWorld = installCodexOwnerTestWorld(root);
     try {
       process.env.ELANOUS_STATE_DIR = root;
       process.env.XDG_CONFIG_HOME = root;          // 정본 스토어를 격리로
@@ -726,6 +728,7 @@ describe('진입점 — loadFreshCodexAuthState 가 «넘어간 계정»으로 �
       expect(JSON.parse(readFileSync(join(homeB, 'auth.json'), 'utf8')).tokens.refresh_token).toBe('NEW-R');
       expect(() => readFileSync(join(homeA, 'auth.json'), 'utf8')).toThrow();
     } finally {
+      restoreCodexWorld();
       _restore(prior);
       try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
       const { _resetCodexRotationPinForTesting } = await import('../../src/oauth/codex-account-store');
@@ -996,6 +999,7 @@ describe('진입점도 config false 를 지킨다 — 호출자가 설정을 다
     const root = mkdtempSync(join(tmpdir(), 'rotate-entry-off-'));
     const prior = { state: process.env.ELANOUS_STATE_DIR, home: process.env.CODEX_HOME, xdg: process.env.XDG_CONFIG_HOME, run: process.env.ELANOUS_RUN_ID };
     const store2 = await import('../../src/oauth/codex-account-store');
+    const restoreCodexWorld = installCodexOwnerTestWorld(root);
     try {
       process.env.ELANOUS_STATE_DIR = root;
       process.env.XDG_CONFIG_HOME = root;
@@ -1030,6 +1034,7 @@ describe('진입점도 config false 를 지킨다 — 호출자가 설정을 다
       // ⛔ 꺼져 있으므로 A 의 토큰으로 갱신해야 한다 — 종전 우회에서는 B-R 이 나갔다
       expect(calls[0]).toBe('A-R');
     } finally {
+      restoreCodexWorld();
       store2._setRotationConfigReaderForTesting(null);
       store2._resetCodexRotationPinForTesting();
       _restore(prior);

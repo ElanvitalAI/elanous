@@ -1,0 +1,119 @@
+{
+  "checkedAt": "2026-11-10T10:12:10.692Z",
+  "mode": "direct runGraph in isolated test world",
+  "graphId": "gcp-architect-expand",
+  "runId": "7d48b23c-7843-4cec-8a1f-2122e7874dc7",
+  "status": "awaiting-approval",
+  "pendingNode": "approve",
+  "executedNodes": [
+    "detect",
+    "design",
+    "deliverables"
+  ],
+  "spendingNodesExecuted": false,
+  "realGcpCalls": 0,
+  "input": {
+    "ticketDesignPath": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/design-envelope.json",
+    "designResultSha256": "fbd097203ecc5ce5a4d45000f2f4480448eb024483d832eed70294a4f2f7dfff",
+    "sourceKind": "synthetic-ticket-design-fixture",
+    "sourceSessionId": "test-solar-session",
+    "sourceGraphRunId": "test-design-run",
+    "pressurePath": "/home/ubuntu/elanous-hq/seat-state/OP/solar/fixtures/pressure.json",
+    "proposalPath": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/generated-from-design/proposal.json",
+    "sourceHtml": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/generated-from-design/architecture-design.html",
+    "sourceDiagram": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/generated-from-design/architecture.excalidraw"
+  },
+  "sharedGraphId": "architecture-deliverables",
+  "sharedGraphRunId": "6aa6dc86-6954-4e9e-af12-cf92a9ea5741",
+  "verification": {
+    "status": "verified",
+    "contract": "system-architecture/cloud-expansion@2",
+    "quality": "reference",
+    "pages": 6,
+    "iconLibraryUrl": "https://cloud.google.com/icons",
+    "verifiedIcons": 4,
+    "files": [
+      "architecture.excalidraw",
+      "architecture.png",
+      "architecture.html",
+      "architecture.pdf"
+    ],
+    "pdfSections": [
+      "배경",
+      "요구사항",
+      "구성도",
+      "데이터 흐름",
+      "보안 등급",
+      "비용 예측",
+      "절감안",
+      "대안",
+      "결정 기록"
+    ],
+    "elements": 83,
+    "pngBytes": 872985,
+    "pdfBytes": 883763
+  },
+  "files": [
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/artifacts/architecture.excalidraw",
+      "sha256": "f34119d04ae7fb0adb34e1760d51c29a14bd67df9c4b700b0f80cadc17ff09a4"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/artifacts/architecture.png",
+      "sha256": "94a66cc80fde5281042ffa8eee2dd69e09774896073222785a0941254e28e172"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/artifacts/architecture.pdf",
+      "sha256": "60aa32e9a12202d3d28b37c40ff3ea50a14db5bb8742b6746c3e1301caa855c6"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/artifacts/architecture.html",
+      "sha256": "8bef289b2da673e2e3ecabeaf99e466a3d803395a324ac6241afc529beff2e0c"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/artifacts/verification.json",
+      "sha256": "ed176474914b1507f5270f61dc374707f268f5a0f74a6bfbcd631bf1534e6116"
+    }
+  ],
+  "attachments": [
+    {
+      "kind": "diagram-source",
+      "title": "편집 가능한 아키텍처 도면",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/artifacts/architecture.excalidraw",
+      "mime": "application/json",
+      "sha256": "f34119d04ae7fb0adb34e1760d51c29a14bd67df9c4b700b0f80cadc17ff09a4",
+      "producedBy": "diagram"
+    },
+    {
+      "kind": "diagram",
+      "title": "GCP 확장 구성도",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/artifacts/architecture.png",
+      "mime": "image/png",
+      "sha256": "94a66cc80fde5281042ffa8eee2dd69e09774896073222785a0941254e28e172",
+      "producedBy": "diagram"
+    },
+    {
+      "kind": "pdf",
+      "title": "시스템 아키텍처 설계 문서",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/artifacts/architecture.pdf",
+      "mime": "application/pdf",
+      "sha256": "60aa32e9a12202d3d28b37c40ff3ea50a14db5bb8742b6746c3e1301caa855c6",
+      "producedBy": "pdf"
+    },
+    {
+      "kind": "html",
+      "title": "설계 문서 HTML 원본",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/solar/test-bridge/graph/artifacts/architecture.html",
+      "mime": "text/html",
+      "sha256": "8bef289b2da673e2e3ecabeaf99e466a3d803395a324ac6241afc529beff2e0c",
+      "producedBy": "pdf"
+    }
+  ],
+  "limitations": [
+    "structured architecture JSON supplied by caller",
+    "synthetic pressure fixture",
+    "diagram/PDF content uses the existing fake-world renderer adapted for the common output contract",
+    "no HITL approval or GCP provisioning executed",
+    "not a classic TUI/board attachment receipt"
+  ]
+}

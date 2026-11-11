@@ -115,6 +115,7 @@ describe('member mini board surface', () => {
       expect(html).toContain(label);
     }
     expect(html).toContain('https://demo.example.test');
+    expect(html).toContain('href="/app/member/invite/"');
     expect(html).not.toContain('운영자 전용');
   });
 });

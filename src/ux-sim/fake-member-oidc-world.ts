@@ -13,6 +13,7 @@ export interface FakeMemberOidcWorldOptions {
   readonly now?: () => number;
   readonly identity?: FakeGoogleIdentity | ((authorizationUrl: URL, sequence: number) => FakeGoogleIdentity);
   readonly successRedirectUri?: string;
+  readonly runTryExample?: NonNullable<Parameters<typeof createMembersApi>[0]['runTryExample']>;
   /** Test-only app session issuer. Never configure this on a deployed members API. */
   readonly issueOwnerSession?: (appId: string, memberId: string) => { readonly sessionToken: string; readonly expiresAt: string };
   /** Explicit test-universe Nexus authority. Production boot never imports or configures this simulator seam. */
@@ -68,6 +69,7 @@ export function createFakeMemberOidcWorld(options: FakeMemberOidcWorldOptions = 
     successRedirectUri: options.successRedirectUri ?? 'https://app.example.test/signup/complete',
     now,
     getAppLifecycle: () => appLifecycle,
+    ...(options.runTryExample ? { runTryExample: options.runTryExample } : {}),
     appAuthRedirectUris: ['elanous://auth/callback'],
     issueOwnerSession: options.issueOwnerSession ?? (testNexus
       ? (appSlug, memberId) => testAppHost().issueOwnerSession(appSlug, memberId)

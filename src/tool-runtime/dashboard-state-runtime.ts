@@ -15,7 +15,7 @@ import {
 import type { ToolRuntime } from './types.js';
 
 type GetTerminalSessions = () => Array<{ id: string; title: string; state: string }>;
-type GetTerminalMouseIntents = () => import('../dashboard/runtime/state-snapshot.js').SnapshotTerminalMouseIntent[];
+type GetTerminalMouseIntents = () => import('./dashboard-state-snapshot.js').SnapshotTerminalMouseIntent[];
 
 let terminalSessionsGetter: GetTerminalSessions | null = null;
 let terminalMouseIntentsGetter: GetTerminalMouseIntents | null = null;

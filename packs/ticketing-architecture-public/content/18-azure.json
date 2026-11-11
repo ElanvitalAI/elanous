@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "두 종류의 큐를 구별한 부하 평준화",
+  "source": "https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling",
+  "body": "Azure Architecture Center의 queue-based load leveling은 비동기 작업 앞에 버퍼를 두어 수요 급증을 평준화하는 패턴이다. 티켓팅에 적용할 때 사용자 입장 대기열은 공정한 순번·입장권·입장률 정책을 추가로 요구한다. 결제 후 알림/이메일 같은 비동기 작업 큐는 재전송·멱등 소비자를 요구한다. 두 큐의 의미를 혼동하거나, 좌석 확정 자체를 비동기 큐만으로 판정하지 않는다."
+}

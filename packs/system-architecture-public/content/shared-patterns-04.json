@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "공통 패턴 — 멱등 키와 중복 소비",
+  "source": "https://microservices.io/patterns/communication-style/idempotent-consumer.html",
+  "body": "적용 시점: 클라이언트 재시도·브로커 재전달로 같은 명령이 다시 올 수 있을 때.\n용량 단계: 처음부터 command identity와 결과를 원자 저장; 보존기간은 재시도 가능 기간·업무 위험으로 정한다.\nGCP 대응: Cloud SQL unique constraint/transaction 또는 Firestore transaction으로 tenant+key 결과를 기록한다.\n비용 축: 키 저장 공간, 결과 보존, 중복 조회와 장기 정리 작업이 비용 축이다.\n결정과 반증: 동일 키 동시 요청·같은 키 다른 payload·응답 유실 후 retry에서 부작용 하나인지 시험한다."
+}

@@ -185,7 +185,7 @@ test('RLA-ARG-ADAPTIVE-HEAL runner: real release event appends, runs once, and r
     expect(state.adaptiveGateNodeAppends).toHaveLength(1);
     expect(state.adaptiveGateNodeAppends?.[0]).toMatchObject({ graphRevision: 2,
       request: { runId: 'arg-runner-integration', visitState: { gate: 1, gateTriage: 1 }, maxRepairRetries: 1 } });
-    expect(state.path.indexOf(state.adaptiveGateNodeAppends![0]!.request.node.nodeId)).toBe(state.path.indexOf('gate') + 3);
+    expect(state.path.indexOf(state.adaptiveGateNodeAppends![0]!.request.node.nodeId)).toBe(state.path.indexOf('gate-triage') + 1);
     expect(state.path[state.path.indexOf(state.adaptiveGateNodeAppends![0]!.request.node.nodeId) + 1]).toBe('gate');
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -288,9 +288,10 @@ test('RLA-ALL-LIVE sim: receipt audit rejects host attribution gaps and residual
     const productionGraph = readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8');
     // Isolate receipt-audit recovery in a declared fixture; an undeclared YAML sibling under
     // graphs/release is correctly denied by the production graph asset manifest.
-    const productionErrorEdge = 'error: gate-triage }';
+    const productionErrorEdge = 'from: gate, on: outcome, map: { ok: cloud-leave-ok, fail: cloud-leave-fail, error: cloud-leave-error }';
     expect(productionGraph).toContain(productionErrorEdge);
-    const receiptAuditGraph = productionGraph.replace(productionErrorEdge, 'error: receipt-audit }');
+    const receiptAuditGraph = productionGraph.replace(productionErrorEdge,
+      'from: gate, on: outcome, map: { ok: cloud-leave-ok, fail: cloud-leave-fail, error: receipt-audit }');
     expect(receiptAuditGraph).not.toBe(productionGraph);
     writeReleaseGraphFixture(graphPath, receiptAuditGraph);
     copyFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), join(graphDir, 'recipes.yaml'));
@@ -358,7 +359,11 @@ test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the sam
     const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
     const cwd = join(import.meta.dir, '../..');
     const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (body, opts) => {
-      const rawContext = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { graphId?: string };
+      const rawContext = JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')) as { graphId?: string; nodeId?: string };
+      if (rawContext.nodeId === 'cutoff')
+        return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', cutoff: { sha: commit }, candidatePath: 'fixture:legacy' }), stderr: '' };
+      if (rawContext.nodeId === 'gate-cutover-switch')
+        return { exitCode: 0, stdout: JSON.stringify({ outcome: 'legacy' }), stderr: '' };
       if (rawContext.graphId === 'pod-reuse-prep')
         return { exitCode: 0, stdout: JSON.stringify({ outcome: 'legacy', verdict: 'legacy',
           reason: 'prep-body-pending', receiptPath: '' }), stderr: '' };
@@ -386,7 +391,7 @@ test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the sam
       version: '0.3.7', previousVersion: '0.3.6', gateExecutor: 'host', gatePodPool: 'pool-aws2@aws2:1',
       cutSha: commit, candidatePath: 'fixture:legacy',
       graphCutover: 'audit', graphCutoverEvidenceId: 'RLA-ARG-LIVE-sim',
-    }, deps: { root, runBash, callLLM: async prompt => {
+    }, deps: { root, runBash, argFeedbackUniverse: 'test', callLLM: async prompt => {
       expect(prompt).toContain('attemptsPolicy');
       expect(prompt).not.toContain('release.gate.failure.attribution-gap');
       proposalCalls++;
@@ -421,6 +426,15 @@ test('RLA-ALL-LIVE sim: host attribution prescription reruns pod once in the sam
       source: 'rla-open-proposal', graphRevision: 3, // Source: RLA-SUPERVISOR-ARG-GRAPH edge and vocabulary apply contracts.
     });
     expect(readFileSync(join(root, 'graph-supervisors/actions.jsonl'), 'utf8')).toContain('"verb":"verify"');
+    const feedbackPartitions = readdirSync(join(root, 'arg-feedback'));
+    expect(feedbackPartitions).toHaveLength(1);
+    const feedback = JSON.parse(readFileSync(join(root, 'arg-feedback', feedbackPartitions[0]!, 'patterns.json'), 'utf8')) as {
+      identity: { member: string; universe: string; template: string };
+      records: Array<{ effect: string; successfulRuns: string[] }>;
+    };
+    expect(feedback.identity).toMatchObject({ member: 'loop:rla@1', universe: 'test', template: 'release-loop' });
+    expect(feedback.records.filter(record => record.successfulRuns.includes(state.runId)).map(record => record.effect.split(':')[0]).sort())
+      .toEqual(['retry-edge', 'vocabulary']);
     const candidateDirectory = argCandidateDirectory(root, state.runId);
     expect(JSON.parse(readFileSync(join(candidateDirectory, readdirSync(candidateDirectory)[0]!), 'utf8')).status).toBe('candidate');
     expect(existsSync(join(root, 'graph-supervisors/template-memory.json'))).toBe(false);
@@ -458,6 +472,9 @@ test('RELEASE-RUN-HEAL-IMAGE-MISSING sim: same run builds and pins cut image, th
   const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (body, opts) => {
     commands.push(body);
     const env = opts.env!;
+    const nodeId = readGraphContext(env).nodeId;
+    if (nodeId === 'cutoff') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', cutoff: { sha: cut } }), stderr: '' };
+    if (nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'legacy' }), stderr: '' };
     if (body.includes('version-node.ts release'))
       return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', commit: cut }), stderr: '' };
     if (body.includes('gate-node.ts --json')) {
@@ -576,6 +593,9 @@ test('RLA-ARG-ADAPTIVE-HEAL runner: gate-triage outbox replays after dispatch in
     subscribe: (handler, filter) => backingBus.subscribe(handler, filter),
   };
   const runBash: NonNullable<GraphRunOptions['deps']>['runBash'] = async (body, opts) => {
+    const nodeId = readGraphContext(opts.env!).nodeId;
+    if (nodeId === 'cutoff') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', cutoff: { sha: 'd'.repeat(40) } }), stderr: '' };
+    if (nodeId === 'gate-cutover-switch') return { exitCode: 0, stdout: JSON.stringify({ outcome: 'legacy' }), stderr: '' };
     if (body.includes('gate-node.ts --json')) {
       gateVisits++;
       return gateVisits === 1

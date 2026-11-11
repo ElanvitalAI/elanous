@@ -14,7 +14,7 @@ export function effectiveRootTuiEntry(root: RootTuiEntry, hasRemote: boolean): '
 export function extractRootTuiEntry(rawArgs: readonly string[]): RootTuiEntry {
   for (let i = 0; i < rawArgs.length; i++) {
     const arg = rawArgs[i]!;
-    if (arg === '--') break;
+    if (arg === '--') return { args: [...rawArgs], entry: i === rawArgs.length - 1 ? 'next' : 'classic', explicit: false };
     if (arg === '--legacy') {
       const args = [...rawArgs.slice(0, i), ...rawArgs.slice(i + 1)];
       const other = extractRootTuiEntry(args);
@@ -41,8 +41,8 @@ export function extractRootTuiEntry(rawArgs: readonly string[]): RootTuiEntry {
       if (rawArgs[i + 1] && !rawArgs[i + 1]!.startsWith('-')) i++;
       continue;
     }
-    if (!arg.startsWith('-')) break;
+    if (!arg.startsWith('-')) return { args: [...rawArgs], entry: 'classic', explicit: false };
   }
-  // Bare launch opens the classic dashboard; the next TUI is opt-in via `--tui next`.
-  return { args: [...rawArgs], entry: 'classic', explicit: false };
+  // A local root launch opens Next; subcommands above keep their own routing.
+  return { args: [...rawArgs], entry: 'next', explicit: false };
 }

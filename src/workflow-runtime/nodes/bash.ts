@@ -48,10 +48,15 @@ export async function executeBashNode(
       durationMs: Date.now() - startedAt,
     };
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const rawStderr = err && typeof err === 'object' && 'stderr' in err ? err.stderr : undefined;
+    const stderr = typeof rawStderr === 'string' ? rawStderr
+      : Buffer.isBuffer(rawStderr) ? rawStderr.toString('utf8')
+        : '';
     return {
       ok: false,
       output: '',
-      error: err instanceof Error ? err.message : String(err),
+      error: stderr.trim() ? `${message}: ${formatBashStderr(stderr)}` : message,
       durationMs: Date.now() - startedAt,
     };
   }

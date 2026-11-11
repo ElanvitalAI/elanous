@@ -1,4 +1,9 @@
 {
   "id": "MD-UX-SIM-HOTSPOT-FILE-LEASE-WORLD-TS",
-  "versions": [29]
+  "versions": [
+    29,
+    30,
+    31,
+    32
+  ]
 }

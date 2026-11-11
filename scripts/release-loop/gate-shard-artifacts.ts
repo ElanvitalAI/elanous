@@ -17,6 +17,8 @@ export interface ShardArtifacts {
   /** 0|1 when every part finished · the failing part's exit when one crashed · undefined when the deadline cut the shard. */
   rc?: number;
   timedOut: boolean;
+  /** Installation failed before any test process could produce a verdict. */
+  installFailed?: boolean;
   /** Files of the parts that finished with a readable summary. */
   finished: string[];
   /** Raw logs of the parts that did not finish (diagnostics · last started file). */
@@ -44,7 +46,7 @@ export function readShardArtifacts(dir: string, parts: readonly (readonly string
   }
   const timedOut = read('shard.timeout') !== undefined;
   if (installRc !== 0) return { output: install, ...(installRc !== undefined ? { rc: installRc } : {}),
-    ...(runtimeIdentity ? { runtimeIdentity } : {}), timedOut, finished: [] };
+    ...(runtimeIdentity ? { runtimeIdentity } : {}), timedOut, installFailed: true, finished: [] };
   const good: Array<{ log: string; junit?: string; rc: 0 | 1; files: readonly string[]; loadFlaky?: string[]; retryPass?: RetryPassEvidence[] }> = [];
   const bad: string[] = [];
   const exitAnomaly: string[] = [];

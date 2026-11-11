@@ -10,6 +10,7 @@ export type ModelProvider =
   | 'qwen'      // Alibaba DashScope (OpenAI-compat)
   | 'glm'       // Zhipu BigModel / Z.ai (OpenAI-compat)
   | 'nemotron'  // NVIDIA build.nvidia.com NIM (OpenAI-compat)
+  | 'openrouter' // OpenRouter model ids include the vendor prefix
   | 'ollama'
   | 'local'
   | 'other';

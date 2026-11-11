@@ -1,0 +1,4 @@
+{
+  "deviceKey": "kaist-classic-pwa-browser-replay",
+  "review": "> 📅 **2026-11-11 재검토 (KCB-PWA-REPLAY-TICKET-SCENARIO)** — 같은 장치의 fake-member classic PTY에 «티켓 예매 서비스 · 동시 300명» 입력을 넣고, 실제 출력의 briefing·acceptance·capacity 계약을 매핑한다. 없는 briefing.owner 값은 생성하지 않고 missing 증거로 기록한다. PWA 장면 2·3·5·6은 같은 build runId로 재생하며 Chromium 외부 HTTP(S) 요청은 CDP에서 차단하고 WebSocket 생성은 same-host/port만 허용한다."
+}

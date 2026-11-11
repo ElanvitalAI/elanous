@@ -18,6 +18,7 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
   const { parseProjectRubricAxes, stripUndef, acpApprovalTimeoutMs, acpApprovalTimeoutEnv,
     acpDefaults, vwOrderDefault, vwEntryDefaults, parseModelTierConfig, parseDiagnosticsConfig } = deps;
   const rawRest = { ...(cfg.raw ?? {}) };
+  delete rawRest.roleLlm;
   const rawOutbound = rawRest.outbound && typeof rawRest.outbound === 'object' && !Array.isArray(rawRest.outbound)
     ? rawRest.outbound as Record<string, unknown> : undefined;
   delete rawRest.outbound;
@@ -109,6 +110,7 @@ export function serializeUserConfig(cfg: UserConfig, deps: UserConfigSerializerD
       helper: cfg.harness?.helper ?? rawHarness.helper,
     }),
     ...rawRest,
+    ...(cfg.roleLlm ? { roleLlm: cfg.roleLlm } : {}),
     ...(savedProjects ? { projects: savedProjects } : rawProjectsValue !== undefined ? { projects: rawProjectsValue } : {}),
     ...(cfg.starter ? { starter: cfg.starter } : {}),
     ...(cfg.watch ? { watch: cfg.watch } : {}),

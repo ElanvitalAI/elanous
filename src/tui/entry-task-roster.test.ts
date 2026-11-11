@@ -5,6 +5,45 @@ import { join } from 'node:path';
 import { mockSeatPtySequence } from '../ux-sim/mock-seat-pty-sequence.js';
 import { simAgentRegistry } from '../ux-sim/interaction.js';
 
+test('Next PTY groups background Agents without raw dispatch rows and settles the card', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'next-agent-noise-'));
+  const args = { description: 'noise worker', prompt: 'slow-child task', run_in_background: true, max_turns: 1 }; // Source: #36642 background Agent fixture.
+  try {
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+    const run = await mockSeatPtySequence({
+      executable: process.execPath,
+      args: [join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs'), '--test={root}', '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', 'next'],
+      root, rows: 40, cols: 100,
+      env: {
+        ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_CONFIG_DIR: root,
+        ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
+        ELANOUS_TEST_FAKE_LLM_RESPONSE: 'NOISE_REPLY',
+        ELANOUS_TEST_FAKE_LLM_DELAY_MS: '2500', ELANOUS_TEST_FAKE_LLM_DELAY_WHEN: 'slow-child',
+        ELANOUS_TEST_FAKE_LLM_TOOL_CALL: JSON.stringify({ when: 'noise-parent', name: 'Agent', args, after: { name: 'Agent', args } }),
+      },
+      ready: { label: 'boot', until: 'Ctrl+Q 종료' },
+      steps: [
+        { label: 'running', text: 'noise-parent', until: (screen) => screen.includes('◐ 하위 에이전트 · 실행 중 5'), timeoutMs: 30_000 }, // Source: #36642 five-child dispatch fixture.
+        { label: 'settled', until: (screen) => screen.includes('✓ 결과 대기 5'), timeoutMs: 30_000 }, // Source: #36642 five-child dispatch fixture and BackgroundJobStatus pending-result state.
+      ],
+    });
+    if (process.env.ELANOUS_TUI_EVIDENCE_PATH) {
+      writeFileSync(process.env.ELANOUS_TUI_EVIDENCE_PATH, JSON.stringify(run, null, 2));
+    }
+    expect(run.exitCode).toBe(0);
+    const runningFrame = run.frames.find((frame) => frame.label === 'running')!.screen;
+    expect(runningFrame.match(/하위 에이전트/g)?.length).toBe(1); // Source: one grouped card in the captured running frame.
+    expect(runningFrame).not.toContain('(running in background — taskId=');
+    expect(runningFrame).not.toContain('도구: Agent result');
+    const settledFrame = run.frames.find((frame) => frame.label === 'settled')!.screen;
+    expect(settledFrame).toContain('✓ 하위 에이전트 · 완료 5'); // Source: five terminal tasks in the captured PTY frame.
+    expect(settledFrame).not.toContain('하위 에이전트 · 실행 중');
+    expect(settledFrame).not.toContain('(running in background — taskId=');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 65_000); // Source: two 30-second PTY step bounds plus CLI startup/exit.
+
 test('five background Agents stay listed while typing, and one can be stopped by ID', async () => {
   const root = mkdtempSync(join(tmpdir(), 'next-task-roster-'));
   const capture = join(root, 'requests.jsonl');

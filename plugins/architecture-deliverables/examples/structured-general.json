@@ -1,0 +1,204 @@
+{
+  "schemaVersion": 1,
+  "title": "Concert ticketing system architecture",
+  "version": "1.0",
+  "summary": "동시 접속 피크를 공정한 대기열로 제어하고 PostgreSQL 좌석 원장으로 중복 확정을 막는 일반 시스템 설계다.",
+  "background": "한정된 지정 좌석을 동시에 조회하고 결제하는 공연 예매 시스템이다. 용량과 비용은 검증 전 가정으로 둔다.",
+  "deployment": {
+    "provider": "generic",
+    "project": "ticketing-system",
+    "region": "primary-zone",
+    "vpc": "private-network"
+  },
+  "nodes": [
+    {
+      "id": "fans",
+      "label": "Fans",
+      "layer": "users",
+      "zone": "external",
+      "service": "Browser clients",
+      "details": [
+        "100k concurrent",
+        "Signed admission token"
+      ]
+    },
+    {
+      "id": "edge",
+      "label": "Public edge",
+      "layer": "edge",
+      "zone": "project",
+      "service": "TLS reverse proxy and rate limiter",
+      "details": [
+        "TLS and rate limits"
+      ]
+    },
+    {
+      "id": "booking",
+      "label": "Booking API",
+      "layer": "application",
+      "zone": "vpc",
+      "service": "Stateless booking API workers",
+      "details": [
+        "HPA and pool cap",
+        "Idempotency keys"
+      ]
+    },
+    {
+      "id": "queue",
+      "label": "Queue/cache",
+      "layer": "data",
+      "zone": "vpc",
+      "service": "Queue and cache service",
+      "details": [
+        "Admission order",
+        "Short seat map TTL"
+      ]
+    },
+    {
+      "id": "ledger",
+      "label": "Seat ledger",
+      "layer": "data",
+      "zone": "vpc",
+      "service": "PostgreSQL seat ledger",
+      "details": [
+        "Seat/order/outbox",
+        "Confirmed UNIQUE"
+      ]
+    },
+    {
+      "id": "observe",
+      "label": "Telemetry",
+      "layer": "observability",
+      "zone": "vpc",
+      "service": "Metrics and tracing",
+      "details": [
+        "p95, conflicts, queue lag"
+      ]
+    },
+    {
+      "id": "security",
+      "label": "Trust boundary",
+      "layer": "security",
+      "zone": "external",
+      "service": "Identity and policy controls",
+      "details": [
+        "Least privilege",
+        "PII masking"
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "from": "fans",
+      "to": "edge",
+      "label": "TLS request",
+      "kind": "sync"
+    },
+    {
+      "from": "edge",
+      "to": "booking",
+      "label": "admitted request",
+      "kind": "sync"
+    },
+    {
+      "from": "booking",
+      "to": "queue",
+      "label": "queue and cache read",
+      "kind": "sync"
+    },
+    {
+      "from": "booking",
+      "to": "ledger",
+      "label": "transactional hold and confirm",
+      "kind": "sync"
+    },
+    {
+      "from": "booking",
+      "to": "observe",
+      "label": "metrics and traces",
+      "kind": "telemetry"
+    }
+  ],
+  "requirements": [
+    {
+      "id": "R1",
+      "kind": "correctness",
+      "statement": "확정 좌석 중복 0건",
+      "verification": "동일 좌석 500명 경쟁·DB UNIQUE 위반 0건"
+    },
+    {
+      "id": "R2",
+      "kind": "resilience",
+      "statement": "결제 실패·지연 성공 복구",
+      "verification": "웹훅 중복·역순·지연 주입"
+    }
+  ],
+  "security": [
+    {
+      "class": "public",
+      "data": "공연·좌석 공개 정보",
+      "controls": "CDN 공개 객체만 공유 캐시, TLS와 WAF"
+    },
+    {
+      "class": "confidential",
+      "data": "구매자·결제 식별자",
+      "controls": "비공개 DB, 최소 권한, 로그 마스킹"
+    }
+  ],
+  "capacity": [
+    {
+      "item": "동시 사용자",
+      "assumption": "100,000; 입장률은 DB 처리량에 맞춰 계측",
+      "verification": "대기열 역전 0·DB 연결 상한 유지"
+    },
+    {
+      "item": "애플리케이션",
+      "assumption": "최대 Pod 수 × Pod당 연결 풀 ≤ DB 한도",
+      "verification": "피크 부하·존 손실·Redis 다운"
+    }
+  ],
+  "costs": [
+    {
+      "item": "앱 워커 용량",
+      "formula": "가상 단가 × 730시간",
+      "monthlyUsd": 1000
+    },
+    {
+      "item": "PostgreSQL HA",
+      "formula": "가상 단가 × 730시간",
+      "monthlyUsd": 1800
+    }
+  ],
+  "savings": [
+    {
+      "name": "정적 콘텐츠 CDN",
+      "mechanism": "반복 이미지 송신·API 부하 감소",
+      "guardrail": "개인화 응답 공유 캐시 금지"
+    }
+  ],
+  "alternatives": [
+    {
+      "name": "Redis 최종 재고 원장",
+      "when": "DB 없는 초저지연 모델을 증명할 때",
+      "tradeoff": "장애·유실 시 확정 불변식 증명 어려움"
+    }
+  ],
+  "decisions": [
+    {
+      "id": "ADR-1",
+      "decision": "PostgreSQL을 좌석 확정 원장으로 사용",
+      "rationale": "트랜잭션과 부분 UNIQUE로 중복 확정 방지",
+      "revisit": "단일 리전 쓰기 한계 실측 시"
+    }
+  ],
+  "references": [
+    {
+      "title": "PostgreSQL explicit locking",
+      "url": "https://www.postgresql.org/docs/current/explicit-locking.html"
+    },
+    {
+      "title": "Architecture source reference",
+      "url": "https://cloud.google.com/icons"
+    }
+  ]
+}

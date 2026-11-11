@@ -6,6 +6,7 @@ import { refuseProductionLedgerWriteInTest } from '../harness/ledger-write-guard
 import { acquireLockSync } from '../storage/file-lock.js';
 import { evaluateHostLeasePolicy, HOST_LEASE_ALTERNATIVE_HOSTS } from '../guardian/host-lease-policy.js';
 import { debug } from '../debug/log.js';
+import { isRecord } from '../primitives/guards.js';
 
 export const RESOURCE_LANES = ['gate', 'train', 'ta', 'hand', 'warm', 'bench', 'unknown'] as const;
 export type ResourceLane = typeof RESOURCE_LANES[number];
@@ -69,6 +70,32 @@ export interface TrainWorkerPolicy {
   gateReserveWorkers: number;
 }
 
+/** A provider-reported cumulative monthly total; ingestion authority is established by its adapter. */
+export interface GuardianCostSnapshot {
+  measurementId: string;
+  provider: string;
+  month: string;
+  spentKrw: number;
+  measuredAt: string;
+  evidenceRef: string;
+}
+
+export interface HostReadinessHeartbeat {
+  host: string;
+  at: string;
+  sshAvailable: boolean;
+  maintenance: boolean;
+  gateProtected: boolean;
+  tools: Record<string, boolean>;
+  sample?: {
+    loadPercent: number;
+    load15Percent: number;
+    memoryAvailablePercent: number;
+    rootDiskUsedPercent: number;
+    tmpDiskUsedPercent: number;
+  };
+}
+
 export type GuardianHostLeaseEvent = { event: 'guardian-host-lease'; at: string; record: GuardianHostLeaseRecord };
 export type GuardianHostLeaseConflictEvent = { event: 'guardian-host-lease-conflict'; at: string; requestId: string; existingLeaseId: string; attemptedRequest: GuardianHostLeaseRequest };
 export type GuardianHostLeaseAdmittedEvent = { event: 'guardian-host-lease-admitted'; at: string; leaseId: string; host: string; runId: string; consumer: string };
@@ -86,7 +113,9 @@ export type ResourceLedgerEvent =
   | GuardianHostLeaseConflictEvent
   | GuardianHostLeaseAdmittedEvent
   | GuardianHostLeaseAdmissionDeniedEvent
-  | { event: 'train-worker-policy'; at: string; policy: TrainWorkerPolicy };
+  | { event: 'train-worker-policy'; at: string; policy: TrainWorkerPolicy }
+  | { event: 'guardian-cost-snapshot'; at: string; snapshot: GuardianCostSnapshot }
+  | { event: 'host-readiness-heartbeat'; at: string; heartbeat: HostReadinessHeartbeat };
 
 export interface ResourceMeasurement {
   host: string;
@@ -132,7 +161,6 @@ const validHost = (host: string) => /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/.test(h
 const validFp = (fp: string) => /^fp_[A-Za-z0-9_-]{6,128}$/.test(fp);
 const positive = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value > 0;
 const validTimestamp = (value: unknown) => typeof value === 'string' && Number.isFinite(Date.parse(value));
-const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 function validResources(value: unknown): boolean {
   return isRecord(value) && Object.entries(value).every(([key, amount]) =>
     ['cpu', 'memoryBytes', 'shards', 'pods'].includes(key) && typeof amount === 'number' && Number.isFinite(amount) && amount >= 0);
@@ -166,6 +194,13 @@ export function recordTrainWorkerPolicy(policy: TrainWorkerPolicy, now = new Dat
   withLedgerLock(path, () => appendEvent(event, path));
 }
 
+/** Persist one validated host readiness heartbeat into the Nexus resource ledger. */
+export function recordHostReadinessHeartbeat(heartbeat: HostReadinessHeartbeat, path = resourceLedgerPath()): void {
+  const event: ResourceLedgerEvent = { event: 'host-readiness-heartbeat', at: heartbeat.at, heartbeat };
+  parseResourceLedgerEvents(`${JSON.stringify(event)}\n`);
+  withLedgerLock(path, () => appendEvent(event, path));
+}
+
 /** Resource-ledger view for callers that need explicit forward-compatibility observations. */
 export function readResourceLedgerWithObservations(path = resourceLedgerPath()): {
   events: ResourceLedgerEvent[];
@@ -181,7 +216,7 @@ const KNOWN_RESOURCE_LEDGER_EVENT_TYPES = new Set([
   'llm-proxy-call',
   'lease-created', 'lease-heartbeat', 'lease-ended', 'lease-reaped', 'pool-declared', 'pool-pod-receipt',
   'guardian-host-lease', 'guardian-host-lease-conflict', 'guardian-host-lease-admitted', 'guardian-host-lease-admission-denied',
-  'train-worker-policy',
+  'train-worker-policy', 'guardian-cost-snapshot', 'host-readiness-heartbeat',
 ]);
 
 export function parseResourceLedgerEvents(text: string): ResourceLedgerEvent[] {
@@ -289,6 +324,20 @@ function parseResourceLedgerEventsWithObservations(text: string): {
         || !Array.isArray(row.alternatives) || !row.alternatives.every(validGuardianText))
         throw new Error(`resource ledger invalid Guardian host lease admission denial at line ${index + 1}`);
     }
+    if (eventType === 'host-readiness-heartbeat') {
+      const heartbeat = row.heartbeat;
+      // Source: BRIEF-LOCAL-FIRST-PLACEMENT-1111.md, all readiness resource values are percentages from 0 to 100.
+      const isPercent = (sample: unknown) => typeof sample === 'number' && Number.isFinite(sample) && sample >= 0 && sample <= 100;
+      if (!isRecord(heartbeat) || !validHost(String(heartbeat.host ?? '')) || !validTimestamp(heartbeat.at)
+        || heartbeat.at !== row.at || typeof heartbeat.sshAvailable !== 'boolean'
+        || typeof heartbeat.maintenance !== 'boolean' || typeof heartbeat.gateProtected !== 'boolean'
+        || !isRecord(heartbeat.tools) || !Object.entries(heartbeat.tools).every(([tool, available]) => validGuardianText(tool) && typeof available === 'boolean')
+        || (heartbeat.sample !== undefined && (!isRecord(heartbeat.sample)
+          || !isPercent(heartbeat.sample.loadPercent) || !isPercent(heartbeat.sample.load15Percent)
+          || !isPercent(heartbeat.sample.memoryAvailablePercent) || !isPercent(heartbeat.sample.rootDiskUsedPercent)
+          || !isPercent(heartbeat.sample.tmpDiskUsedPercent))))
+        throw new Error(`resource ledger invalid host readiness heartbeat at line ${index + 1}`);
+    }
     if (eventType === 'train-worker-policy') {
       const policy = row.policy;
       // Source: worker counts are nonnegative integers and CPU utilization is a percentage on the 0–100 scale.
@@ -300,6 +349,8 @@ function parseResourceLedgerEventsWithObservations(text: string): {
         || !Number.isSafeInteger(policy.gateReserveWorkers) || Number(policy.gateReserveWorkers) < 0)
         throw new Error(`resource ledger invalid train worker policy at line ${index + 1}`);
     }
+    if (eventType === 'guardian-cost-snapshot' && !validGuardianCostSnapshot(row.snapshot))
+      throw new Error(`resource ledger invalid Guardian cost snapshot at line ${index + 1}`);
     events.push(value as ResourceLedgerEvent);
   }
   return { events, unknownEvents: [...unknownCounts].map(([eventType, count]) => ({ eventType, count })) };
@@ -321,6 +372,68 @@ export function guardianHostLeaseRecords(events: readonly ResourceLedgerEvent[])
 }
 
 const validGuardianText = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+const validGuardianCostSnapshot = (value: unknown): value is GuardianCostSnapshot => isRecord(value)
+  && Object.keys(value).length === 6
+  && typeof value.measurementId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.measurementId)
+  && typeof value.provider === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.provider)
+  && typeof value.month === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(value.month)
+  && Number.isSafeInteger(value.spentKrw) && Number(value.spentKrw) >= 0
+  && typeof value.measuredAt === 'string' && validTimestamp(value.measuredAt)
+  && value.month <= new Date(Date.parse(value.measuredAt)).toISOString().slice(0, 7)
+  && typeof value.evidenceRef === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/:#-]{0,255}$/.test(value.evidenceRef);
+
+/** Missing or stale provider reports stay unknown; estimates are never silently counted as measured KRW. */
+export function guardianMonthlyCost(events: readonly ResourceLedgerEvent[], month: string, providers: readonly string[],
+  now = new Date(), maxAgeMs = 24 * 60 * 60 * 1000) { // Source: #35378
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month) || providers.length === 0 || new Set(providers).size !== providers.length ||
+    providers.some(provider => !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(provider)) ||
+    !Number.isFinite(now.getTime()) || !Number.isFinite(maxAgeMs) || maxAgeMs <= 0)
+    throw new Error('invalid Guardian cost query');
+  const latest = new Map<string, GuardianCostSnapshot>();
+  const measurementIds = new Map<string, GuardianCostSnapshot>();
+  for (const event of events) if (event.event === 'guardian-cost-snapshot') {
+    if (!validGuardianCostSnapshot(event.snapshot)) throw new Error('invalid Guardian cost snapshot in query');
+    const existing = measurementIds.get(event.snapshot.measurementId);
+    if (existing && (['measurementId', 'provider', 'month', 'spentKrw', 'measuredAt', 'evidenceRef'] as const)
+      .some(key => existing[key] !== event.snapshot[key])) throw new Error('Guardian cost measurement ID conflict');
+    measurementIds.set(event.snapshot.measurementId, event.snapshot);
+    if (event.snapshot.month !== month || !providers.includes(event.snapshot.provider)) continue;
+    const prior = latest.get(event.snapshot.provider);
+    // Equal timestamps resolve to the lexicographically larger measurement ID, independent of input order.
+    if (!prior || Date.parse(event.snapshot.measuredAt) > Date.parse(prior.measuredAt) ||
+      (event.snapshot.measuredAt === prior.measuredAt && event.snapshot.measurementId > prior.measurementId))
+      latest.set(event.snapshot.provider, event.snapshot);
+  }
+  const missingProviders = providers.filter(provider => !latest.has(provider));
+  const staleProviders = providers.filter(provider => {
+    const snapshot = latest.get(provider);
+    return snapshot && (Date.parse(snapshot.measuredAt) > now.getTime() || now.getTime() - Date.parse(snapshot.measuredAt) > maxAgeMs);
+  });
+  if (missingProviders.length || staleProviders.length)
+    return { status: 'unknown' as const, totalKrw: null, missingProviders, staleProviders };
+  const totalKrw = providers.reduce((sum, provider) => sum + latest.get(provider)!.spentKrw, 0);
+  if (!Number.isSafeInteger(totalKrw)) throw new Error('Guardian monthly cost exceeds safe integer range');
+  return { status: 'measured' as const, totalKrw,
+    missingProviders: [], staleProviders: [] };
+}
+
+/** The adapter supplies provider evidence; this writer deduplicates IDs and preserves the raw report. */
+export function recordGuardianCostSnapshot(snapshot: GuardianCostSnapshot, now = new Date(), path = resourceLedgerPath()): void {
+  if (!validGuardianCostSnapshot(snapshot) || !Number.isFinite(now.getTime()) || Date.parse(snapshot.measuredAt) > now.getTime() ||
+    snapshot.month > new Date(Date.parse(snapshot.measuredAt)).toISOString().slice(0, 7))
+    throw new Error('invalid Guardian cost snapshot');
+  withLedgerLock(path, () => {
+    const prior = readResourceLedger(path).find((event): event is Extract<ResourceLedgerEvent, { event: 'guardian-cost-snapshot' }> =>
+      event.event === 'guardian-cost-snapshot' &&
+      event.snapshot.measurementId === snapshot.measurementId);
+    if (prior) {
+      if (Object.entries(snapshot).some(([key, value]) => prior.snapshot[key as keyof GuardianCostSnapshot] !== value))
+        throw new Error('Guardian cost measurement ID conflict');
+      return;
+    }
+    appendEvent({ event: 'guardian-cost-snapshot', at: now.toISOString(), snapshot }, path);
+  });
+}
 /** Atomically persist the host-policy decision in the Nexus resource ledger before dispatch. */
 export function requestGuardianHostLease(request: GuardianHostLeaseRequest, now = new Date(), path?: string): GuardianHostLeaseRecord {
   const target = path ?? resourceLedgerPath();
@@ -487,6 +600,33 @@ export function declareResourcePool(pool: MachinePoolDeclaration, now = new Date
     created = true;
   });
   return created;
+}
+
+/** Replace one declaration with a compare-and-swap against the exact previous value. */
+export function replaceResourcePool(pool: MachinePoolDeclaration, expectedPool: MachinePoolDeclaration,
+  now = new Date(), path?: string): boolean {
+  const replacement = parseMachinePoolDeclarations({ pools: [pool] })[0]!;
+  const expected = parseMachinePoolDeclarations({ pools: [expectedPool] })[0]!;
+  if (replacement.purpose !== expected.purpose || replacement.fanoutGroupId !== expected.fanoutGroupId)
+    throw new Error('resource pool replacement identity mismatch');
+  const target = path ?? resourceLedgerPath();
+  let replaced = false;
+  withLedgerLock(target, () => {
+    const events = readResourceLedger(target);
+    const current = activeResourcePools(events).find(row => row.purpose === replacement.purpose
+      && row.fanoutGroupId === replacement.fanoutGroupId);
+    if (!current) throw new Error('resource pool replacement target missing');
+    if (JSON.stringify(current) === JSON.stringify(replacement)) {
+      const declarations = events.filter((row): row is Extract<ResourceLedgerEvent, { event: 'pool-declared' }> => row.event === 'pool-declared'
+        && row.pool.purpose === replacement.purpose && row.pool.fanoutGroupId === replacement.fanoutGroupId);
+      if (declarations.length > 1 && JSON.stringify(declarations.at(-2)!.pool) === JSON.stringify(expected)) return;
+      throw new Error('resource pool replacement stale');
+    }
+    if (JSON.stringify(current) !== JSON.stringify(expected)) throw new Error('resource pool replacement stale');
+    appendEvent({ event: 'pool-declared', at: now.toISOString(), pool: replacement }, target);
+    replaced = true;
+  });
+  return replaced;
 }
 
 /** Reassign active pool declarations when an HQ host is promoted; append-only history stays auditable. */

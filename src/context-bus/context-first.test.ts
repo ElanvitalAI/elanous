@@ -91,7 +91,7 @@ test('Telegram /attach routes a follow-up into the TUI transcript after context-
     const sent: string[] = [];
     const delivered: Array<{ method: string; text: string }> = [];
     const seen: Array<{ sessionId: string; userText: string; llmMessages: string[] }> = [];
-    const provider = { streamChat: async function* (messages: Array<{ role: string; content: unknown }>) {
+    const provider = { name: 'test-context-first', streamChat: async function* (messages: Array<{ role: string; content: unknown }>) {
       const llmMessages = messages.map(m => String(m.content));
       seen.push({ sessionId: tui.id, userText: llmMessages.at(-1) ?? '', llmMessages });
       yield { type: 'text' as const, delta: llmMessages.includes('TG-CTX 배포는 승인 대기야')

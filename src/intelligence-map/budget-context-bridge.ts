@@ -22,7 +22,7 @@ import {
   weeklyCapStatus,
 } from './cost-meter.js';
 import type { ContextKeyService } from '../input-core/context-keys.js';
-import { getDashboardContextKeyService } from '../dashboard/context/keys.js';
+import { getRuntimeContextKeyService } from '../input-core/context-key-runtime.js';
 
 export interface WireBudgetContextBridgeOpts {
   /** Override the ContextKeyService (tests). Production uses the
@@ -38,7 +38,7 @@ export interface WireBudgetContextBridgeOpts {
 export function wireBudgetContextBridge(
   opts: WireBudgetContextBridgeOpts = {},
 ): () => void {
-  const svc = opts.service ?? getDashboardContextKeyService();
+  const svc = opts.service ?? getRuntimeContextKeyService();
   const load = opts.loadConfig ?? loadCostConfig;
   const snap = opts.snapshot ?? snapshotCost;
 

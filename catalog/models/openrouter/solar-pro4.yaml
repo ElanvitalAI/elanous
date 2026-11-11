@@ -1,0 +1,27 @@
+id: openrouter/upstage/solar-pro4
+provider: openrouter
+displayName: Solar Pro 4 (OpenRouter)
+family: solar-pro4
+# OpenRouter /api/v1/models and /models/upstage/solar-pro4/endpoints, 2026-11-10.
+# Upstage endpoint: 524288 context, 131072 max output; tools and reasoning_effort supported.
+# Endpoint price has a 50% promotion: current $0.15/$0.60/$0.03 per million.
+# Store the undiscounted price here so the catalog remains valid after the promotion.
+contextSize: 524288
+outputMaxTokens: 131072
+vision: null
+reasoning: high
+toolCalling: native-openai
+streamingProtocol: sse
+pricing:
+  inputPerMTok: 0.30
+  outputPerMTok: 1.20
+  cachedInputPerMTok: 0.06
+deprecated: null
+tokenizer: unknown
+kind: chat
+releaseDate: 2026-08-10
+discoveryMeta:
+  source: manual
+  lastSeen: 2026-11-10
+  autoFilled: false
+  confidence: high

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "데이터 파이프라인·스트리밍 — 재처리 가능한 원본",
+  "source": "https://cloud.google.com/storage/docs/lifecycle",
+  "body": "적용 시점: 집계·모델·정제 규칙이 바뀌어 기존 데이터를 다시 처리해야 할 때.\n용량 단계: 원본량이 작을 때는 버전이 있는 객체 저장; 증가 시 partition과 수명 주기를 도입한다.\nGCP 대응: Cloud Storage 원본 zone → Dataflow/BigQuery transform → curated table; 각 단계에 schema/version 기록.\n비용 축: 원본 보존량, 스캔 바이트, 임시 셔플, cross-region egress가 비용을 좌우한다.\n결정과 반증: 고정 입력을 동일한 transform 버전으로 재생해 결과 해시와 건수 차이를 비교한다."
+}

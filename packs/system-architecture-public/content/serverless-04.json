@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "서버리스 — cold start와 최소용량",
+  "source": "https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html",
+  "body": "적용 시점: 서버리스 tail latency가 사용자 SLO에 영향을 주는지 계측할 때.\n용량 단계: 기본은 scale-to-zero; 실제 지연 표본이 요구를 깨면 최소 인스턴스·예약 용량과 비교한다.\nGCP 대응: Cloud Run min instances, startup CPU boost 또는 상시 서비스 계층을 측정해 선택한다.\n비용 축: 유휴 최소 인스턴스의 상시 비용과 낮은 지연의 제품 가치가 맞교환이다.\n결정과 반증: 평균 대신 시작 직후 p95/p99를 측정하고 warm 인스턴스 비용 대비 사용자 영향으로 판정한다."
+}

@@ -3218,7 +3218,7 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
     .option('--close-cap <n>', '이번 틱 최대 종료 수 (1~100 · config tools.selfImplement.draftSweepCloseCap 보다 우선 · 기본 10)')
     .option('--max-pages <n>', 'inventory 상한 (페이지, dry-run 기본 1 · apply 기본 100 · 1~100)')
     .option('--max-drafts <n>', 'draft 상한 (dry-run 기본 10 · apply 기본 무제한)')
-    .option('--max-merged <n>', 'merged PR 상한 (dry-run 기본 50 · apply 기본 무제한)')
+    .option('--max-merged <n>', '선택적 merged PR 상한 (생략하면 전체 페이지를 읽음)')
     .option('--emit-apply-plan', '완전한 dry-run 분류에서 고정 적용 계획을 JSON에 포함 (모든 PR에 head SHA와 updatedAt 필요)')
     .option('--apply-plan-file <path>', '고정 적용 계획 JSON 파일 (apply 전용)')
     .action(async (opts: { apply?: boolean; json?: boolean; repo?: string; closeCap?: string; maxPages?: string; maxDrafts?: string; maxMerged?: string; emitApplyPlan?: boolean; applyPlanFile?: string }) => {
@@ -3247,7 +3247,7 @@ function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraft
         const inventoryLimits = {
           maxInventoryPages: readLimit(opts.maxPages, applying ? 100 : 1, '--max-pages', 100),
           maxDrafts: opts.maxDrafts === undefined && applying ? undefined : readLimit(opts.maxDrafts, 10, '--max-drafts', 1_000),
-          maxMerged: opts.maxMerged === undefined && applying ? undefined : readLimit(opts.maxMerged, 50, '--max-merged', 1_000),
+          maxMerged: opts.maxMerged === undefined ? undefined : readLimit(opts.maxMerged, 1, '--max-merged', 1_000),
           onInventoryProgress: ({ state, page, rows }: { state: 'open' | 'closed'; page: number; rows: number }) =>
             console.error(`[draft-sweep] inventory state=${state} page=${page} rows=${rows}`),
         };

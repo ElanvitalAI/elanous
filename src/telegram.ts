@@ -2600,7 +2600,6 @@ import { createSession, findSessionByTelegramChat, findTelegramSession } from '.
 import { makeChunkProducer } from './session/streaming/chunk-producer.js';
 import { getUserConfig } from './user-config/reader.js';
 import { runTurn } from './session/chat.js';
-import { submitIntent } from './intent-gate/gate.js';
 import type { UserConfig } from './user-config/types.js';
 import type { ContentBlock } from './llm.js';
 import { extractPdf, extractDocx, extractXlsx, readText } from './extractors.js';
@@ -2772,44 +2771,6 @@ export function botFromConfig(opts: BotFromConfigOpts): TelegramBot {
       } catch (err) {
         log(`telegram tui-bridge dispatch failed: ${err instanceof Error ? err.message : String(err)}`);
         return 'Failed to route text into the dashboard input.';
-      }
-    }
-
-    // ── Narrow Waist 의도 게이트 (V2 · 2026-07-09) ──────────────────────────
-    // 명시 마커("미션:" / "이건 미션이야" / "/mission")가 붙은 발화 = 미션 의도.
-    // 게이트가 Mission(planning)을 생성하고 LLM 턴을 건너뛴 채 확인만 회신한다.
-    // 마커 없으면 통과(passthrough) — 기존 Q&A/agent 동작 그대로. 미션 "생성"은
-    // 실행이 아니라 의도 등록이므로 finance HARD RULE(주문 실행 금지)과 무관.
-    // 설계: 내부 문서 `DESIGN-intent-narrow-waist-2026-07-09` §3·§8.
-    {
-      // ★ origin 전달 — 준비 완료 알림을 던진 그 대화창(main 봇+chatId)으로 되돌리기 위해
-      //   (대표 지시 2026-07-11 채널 정정). 없으면 se-mission-prepare 가 report 폴백.
-      const gate = await submitIntent({
-        text: ctx.text, channel: 'telegram', source: 'human-intent',
-        origin: { channel: 'telegram', chatId: ctx.chatId, ...(ctx.botId ? { botId: ctx.botId } : {}), ...(ctx.threadId !== undefined ? { threadId: ctx.threadId } : {}) },
-      });
-      if (gate.route === 'mission') {
-        log(`[telegram] intent-gate: mission ${gate.missionId} (${gate.executionModel}) task=${gate.taskId ?? '-'} heavy=${gate.heavy ?? false} researchGate=${gate.needsResearchGate ?? false}`);
-        const lines = [
-          `🎯 미션 등록: ${gate.goal}`,
-          `· 실행모델 ${gate.executionModel} (${gate.tier === 'heavy' ? '무거움' : '가벼움'})`,
-        ];
-        if (gate.needsResearchGate) {
-          // ★ human-intent → 외부조사 보강 + 크기적응 분해 준비 중(백그라운드). 자동 실행 없음 —
-          //   수렴점은 사람 확인(대표 지시 2026-07-11·과도한 노력/defer 판단 위해).
-          if (gate.verifyDecompose) lines.push(`· 🧪 분해 검증 모드 — 외부조사 보강 + 멀티페이즈 분해까지만(실행 없음)`);
-          else lines.push(`· 🔎 외부조사 보강${gate.heavy ? ' + 멀티페이즈 분해' : ''} 준비 중 (백그라운드·수십초~분)`);
-          if (gate.inferredCron) lines.push(`· 추천 스케줄 ${gate.inferredCron}`);
-          lines.push(`· 준비되면 PWA Autopilot → Missions 에서 플랜 검토 (trim/defer/교정 가능)`);
-        } else if (gate.taskId) {
-          lines.push(`· 자동 분해 완료 → 태스크 backlog(아직 실행 안 함)`);
-          if (gate.inferredCron) lines.push(`· 추천 스케줄 ${gate.inferredCron}`);
-          lines.push(`· 승인 대기 — PWA Autopilot → Missions 에서 "승인"하면 실행 시작`);
-        } else {
-          lines.push(`· PWA Autopilot → Missions 에서 확인·구체화하세요`);
-        }
-        lines.push(`· id ${gate.missionId}`);
-        return lines.join('\n');
       }
     }
 

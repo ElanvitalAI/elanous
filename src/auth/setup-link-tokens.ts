@@ -14,7 +14,7 @@ const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const LINK_PATTERN = /^els_[A-Za-z0-9_-]{43}$/;
 const BEARER_PATTERN = /^elsb_[A-Za-z0-9_-]{43}$/;
 const CREDENTIAL_BEARER_PATTERN = /^elcr_[A-Za-z0-9_-]{43}$/;
-const CREDENTIAL_SLOT_PATTERN = /^cred:(?:openai\.api_key|elevenlabs\.api_key|higgsfield\.(?:key_id|secret))$/;
+const CREDENTIAL_SLOT_PATTERN = /^cred:(?:openai\.api_key|openrouter\.api_key|elevenlabs\.api_key|higgsfield\.(?:key_id|secret))$/;
 
 interface SetupLinkEntry {
   hash: string;
@@ -158,6 +158,17 @@ export function issueCredentialRegistrationLinkToken(slot: string, opts: { dir?:
   const expiresAt = new Date(now + SETUP_LINK_TTL_MS).toISOString();
   withLock(dir, () => writeStore(dir, [...readStore(dir), { hash: hashOf(token), expiresAt, credentialSlot: slot }]));
   return { token, expiresAt };
+}
+
+/** Metadata-only completion check for one link and one slot; existing slot presence is insufficient. */
+export function credentialRegistrationCompleted(token: string, slot: string, opts: { dir?: string } = {}): boolean {
+  if (!LINK_PATTERN.test(token) || !CREDENTIAL_SLOT_PATTERN.test(slot)) return false;
+  const dir = opts.dir ?? getElanousConfigDir();
+  return withLock(dir, () => {
+    const digest = Buffer.from(hashOf(token), 'hex');
+    const hit = readStore(dir).find((entry) => timingSafeEqual(digest, Buffer.from(entry.hash, 'hex')));
+    return hit?.credentialSlot === slot && Boolean(hit.credentialSubmissionCompletedAt) && !hit.credentialRevokedAt;
+  });
 }
 
 /** Claim exactly once under the same lock used by issuance. Expired and used links retain their diagnostic status. */

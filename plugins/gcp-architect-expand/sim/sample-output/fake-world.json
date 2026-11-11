@@ -1,0 +1,46 @@
+{
+  "deniedBeforeSideEffect": true,
+  "syntheticApproval": true,
+  "project": {
+    "id": "fake-project-1",
+    "provider": "fake-gcp",
+    "region": "asia-northeast3"
+  },
+  "proposalId": "ticket-demo-4c7c693ad20d",
+  "architecture": "batch-spot",
+  "shortage": [
+    "cpu",
+    "memory",
+    "disk",
+    "queue"
+  ],
+  "approval": "fake-user",
+  "findings": [],
+  "costLedger": [
+    {
+      "event": "estimate",
+      "at": "2026-11-10T04:00:00.000Z",
+      "proposalId": "ticket-demo-4c7c693ad20d",
+      "amount": "unpriced",
+      "formula": "예상 vCPU시간 × 해당 리전 Spot vCPU 공식 SKU 단가 + 예상 GiB시간 × Spot 메모리 공식 SKU 단가 + 디스크 + 네트워크 + 로그"
+    },
+    {
+      "event": "usage",
+      "at": "2026-11-10T04:00:30.000Z",
+      "proposalId": "ticket-demo-4c7c693ad20d",
+      "amount": "unpriced",
+      "usage": {
+        "vcpuHours": 0.03333333333333333,
+        "gibHours": 0.03333333333333333
+      }
+    },
+    {
+      "event": "stopped",
+      "at": "2026-11-10T04:01:00.000Z",
+      "proposalId": "ticket-demo-4c7c693ad20d",
+      "amount": "unpriced"
+    }
+  ],
+  "activeLeases": 0,
+  "realGcpCalls": 0
+}

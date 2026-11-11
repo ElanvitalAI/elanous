@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "실시간 채팅·알림 — 전달 보장 분리",
+  "source": "https://cloud.google.com/run/docs/triggering/websockets",
+  "body": "적용 시점: 화면 즉시 갱신과 영속적인 메시지 보장을 동시에 다뤄야 할 때.\n용량 단계: 초기에는 DB 원장을 진실로 두고 WebSocket/push는 알림 채널로 취급; 동시 연결 증가 시 연결 계층을 분리한다.\nGCP 대응: Cloud Run WebSockets 또는 별도 gateway, 메시지 원장은 Cloud SQL/Firestore, 팬아웃은 Pub/Sub.\n비용 축: 동시 연결 시간, heartbeat, fan-out, 재연결, 저장·전송량이 비용 축이다.\n결정과 반증: 클라이언트 연결 단절 중 보낸 메시지를 재접속 시 원장에서 복구할 수 있는지 확인한다."
+}

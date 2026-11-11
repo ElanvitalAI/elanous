@@ -1,10 +1,11 @@
 import type { SerializedMessage } from '../../session/index.js';
 import { parseToolResultEnvelope } from '../../chat/tool-render/result-text.js';
+import type { BackgroundTaskSnapshot } from '../chat/background-job-status.js';
 
 export type AgentDisplayStatus = 'running' | 'background' | 'done' | 'failed';
-export interface AgentDisplay { readonly id: string; readonly description: string; readonly status: AgentDisplayStatus }
+export interface AgentDisplay { readonly id: string; readonly description: string; readonly status: AgentDisplayStatus; readonly source?: 'nested' }
 export type AgentDisplayEvent =
-  | { readonly phase: 'start'; readonly id: string; readonly description?: string }
+  | { readonly phase: 'start'; readonly id: string; readonly description?: string; readonly source?: 'nested' }
   | { readonly phase: 'finish'; readonly id: string; readonly status: Exclude<AgentDisplayStatus, 'running'> };
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -31,21 +32,48 @@ export function agentResultStatus(result: unknown): Exclude<AgentDisplayStatus, 
 export function applyAgentEvent(current: readonly AgentDisplay[], event: AgentDisplayEvent): AgentDisplay[] {
   const previous = current.find((item) => item.id === event.id);
   const next: AgentDisplay = event.phase === 'start'
-    ? { id: event.id, description: description(event.description), status: 'running' }
-    : { id: event.id, description: previous?.description ?? '', status: event.status };
+    ? { id: event.id, description: description(event.description), status: 'running', ...(event.source ? { source: event.source } : {}) }
+    : { id: event.id, description: previous?.description ?? '', status: event.status, ...(previous?.source ? { source: previous.source } : {}) };
   return [...current.filter((item) => item.id !== event.id), next];
+}
+
+/** Replace completed descendants from the sticky REPL status frame. */
+export function reconcileNestedAgentSnapshot(current: readonly AgentDisplay[], value: unknown): AgentDisplay[] {
+  if (!Array.isArray(value)) return [...current];
+  let next = current.filter((item) => item.source !== 'nested');
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || typeof item.id !== 'string'
+      || typeof item.description !== 'string' || !item.description.startsWith('↳ ')
+      || (item.status !== 'done' && item.status !== 'failed')) continue;
+    next = applyAgentEvent(next, { phase: 'start', id: item.id, description: item.description, source: 'nested' });
+    next = applyAgentEvent(next, { phase: 'finish', id: item.id, status: item.status });
+  }
+  return next;
 }
 
 /** AgentOutput is the authoritative terminal result for a background Agent card. */
 export function reconcileAgentOutputStatuses(
   current: readonly AgentDisplay[],
   messages: readonly SerializedMessage[],
+  tasks: readonly BackgroundTaskSnapshot[] = [],
 ): AgentDisplay[] {
   const statuses = new Map(current.map((item) => [item.id, item.status]));
+  const callByTaskId = new Map<string, string>();
+  for (const message of messages) {
+    if (message.role !== 'tool' || message.toolName !== 'Agent' || !message.toolCallId) continue;
+    const taskId = record(message.toolResult)?.taskId;
+    if (typeof taskId === 'string') callByTaskId.set(taskId, message.toolCallId);
+  }
+  for (const task of tasks) {
+    const callId = callByTaskId.get(task.id) ?? task.id;
+    if (!statuses.has(callId)) continue;
+    if (task.state === 'done') statuses.set(callId, 'done');
+    if (task.state === 'error' || task.state === 'aborted') statuses.set(callId, 'failed');
+  }
   for (const message of messages) {
     if (message.role !== 'tool' || message.toolName !== 'AgentOutput' || message.toolResult === undefined) continue;
     const output = record(message.toolResult);
-    const id = typeof output?.taskId === 'string' ? output.taskId : '';
+    const id = typeof output?.taskId === 'string' ? (callByTaskId.get(output.taskId) ?? output.taskId) : '';
     if (!statuses.has(id) || output?.retrievalStatus !== 'success') continue;
     statuses.set(id, output.state === 'done' ? 'done' : 'failed');
   }

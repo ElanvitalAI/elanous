@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dispatchReleaseStatus } from '../domains/release-tool.js';
-import { buildDashboardSlashRegistry, type DashboardSlashContext } from '../dashboard/slash-runtime/dashboard-handlers.js';
+import { releaseTuiStatusLines } from '../context-bus/release-tui-status.js';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { openSurfaceEventsDb } from '../domains/surface-events.js';
 import { listCoordEvents } from '../context-bus/coord-events.js';
@@ -29,10 +29,7 @@ async function telegramReleaseReply(deps: ContextNowDeps): Promise<string> {
 }
 
 async function tuiReleaseReply(deps: ContextNowDeps): Promise<string[]> {
-  const lines: string[] = [];
-  const ctx = { pushChatLine: (line: string) => lines.push(line) } as unknown as DashboardSlashContext;
-  await buildDashboardSlashRegistry(deps).dispatch('release', [], ctx);
-  return lines;
+  return releaseTuiStatusLines(deps);
 }
 
 /** Drives a real isolated release graph through node-arrival and samples all three consumers there. */

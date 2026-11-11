@@ -276,7 +276,7 @@ function messageLines(
   if (message.role === 'assistant') {
     lines.push(...assistantMarkdownLines(message.content, columns, label));
   } else {
-    const content = safeLogText(message.content);
+    const content = safeLogText(visibleUserText(message.content));
     const parts = content.split('\n');
     for (let i = 0; i < parts.length; i++) {
       lines.push(...wrapLine(`${i === 0 ? label : '  '}${parts[i]}`, columns));
@@ -284,6 +284,16 @@ function messageLines(
   }
   lines.push('');
   return lines;
+}
+
+/** Classic dashboard resume stored its runtime context inside the user turn. Show the actual question only. */
+function visibleUserText(content: string): string {
+  const prefix = 'Context:\nDashboard mode: browse\n\nRecent status output:\n';
+  const questionMarker = '\n\nQuestion: ';
+  if (!content.startsWith(prefix)) return content;
+  const questionAt = content.indexOf(questionMarker, prefix.length);
+  if (questionAt < prefix.length || !/(?:^|\n)  ✓ resumed local session: [a-zA-Z0-9-]+(?:\n|$)/.test(content.slice(prefix.length, questionAt))) return content;
+  return content.slice(questionAt + questionMarker.length);
 }
 
 const isLogRole = (message: SerializedMessage): boolean =>

@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-SCENARIO-TARGET-TS",
+  "path": "src/ux-sim/scenario-target.ts",
+  "boundary": "Selects sim or real execution and validates the real target guards before the world runner enters its sandbox.",
+  "deviceIds": [
+    "world-runtime"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -28,6 +28,14 @@ function inside(root: string, path: string): boolean {
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
+/** The cleanup worker itself is an active user of its checkout even without a registered terminal. */
+function containsCurrentProcess(worktreePath: string): boolean {
+  try {
+    const rel = relative(realpathSync(worktreePath), realpathSync(process.cwd()));
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  } catch { return true; }
+}
+
 function parseWorktrees(output: string): Array<{ path: string; branch: string }> {
   const rows: Array<{ path: string; branch: string }> = [];
   let current: { path?: string; branch?: string } = {};
@@ -106,7 +114,8 @@ export function createMacrophageSafeCleanup(options: MacrophageSafeCleanupOption
     const active = readActiveDirectories();
     if (!active.ok) return scraps;
     for (const worktree of parseWorktrees(listed.stdout)) {
-      if (!inside(worktreeRoot, worktree.path) || !mergedBranches.has(worktree.branch)) continue;
+      if (!inside(worktreeRoot, worktree.path) || !mergedBranches.has(worktree.branch)
+        || containsCurrentProcess(worktree.path)) continue;
       const status = run('git', ['status', '--porcelain', '--untracked-files=all'], worktree.path);
       if (status.status !== 0 || status.stdout.trim() || isWorktreeInUse(worktree.path, active.value)) continue;
       scraps.push({ id: `worktree:${worktree.branch}:${basename(worktree.path)}`, kind: 'orphan-worktree',
@@ -135,7 +144,8 @@ export function createMacrophageSafeCleanup(options: MacrophageSafeCleanupOption
     if (scrap.kind === 'orphan-worktree') {
       const worktreePath = scrap.evidence.worktreePath;
       const branch = scrap.owner;
-      if (typeof worktreePath !== 'string' || !branch || !scrap.evidence.mergedMainline || !inside(worktreeRoot, worktreePath)) return undefined;
+      if (typeof worktreePath !== 'string' || !branch || !scrap.evidence.mergedMainline
+        || !inside(worktreeRoot, worktreePath) || containsCurrentProcess(worktreePath)) return undefined;
       const merged = run('git', ['merge-base', '--is-ancestor', branch, 'origin/main'], repoRoot);
       const status = run('git', ['status', '--porcelain', '--untracked-files=all'], worktreePath);
       if (merged.status !== 0 || status.status !== 0 || status.stdout.trim()) return undefined;

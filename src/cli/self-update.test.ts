@@ -555,6 +555,88 @@ describe('self-update routing by install source (2026-09-25 🅣)', () => {
     return { prefix, packageRoot };
   }
 
+  test('installed --dry-run does not invoke either installer or change install.json/current for release and checkout sources', async () => {
+    for (const source of ['https://github.com/ElanvitalAI/elanous/releases/latest/download/elanous.tgz', checkout]) {
+      const inst = installed(source);
+      const currentTarget = 'versions/1.0.0-abcdef123456';
+      symlinkSync(currentTarget, join(inst.prefix, 'current'));
+      const installJsonBefore = readFileSync(join(inst.prefix, 'install.json'), 'utf8');
+      const calls: string[] = [];
+      const releaseLogs: string[] = [];
+      const checkoutLogs: string[] = [];
+      const routesToRelease = /^https?:\/\//.test(source);
+      try {
+        const result = await runUpdateForInstallation({ dryRun: true, json: true }, {
+          cliRoot: inst.packageRoot,
+          release: {
+            out: { log: (line) => releaseLogs.push(line), error: () => {} },
+            fetchInstaller: async () => { calls.push('fetch'); return 'installer'; },
+            run: (command) => { calls.push(command); return { status: 0, stderr: '' }; },
+          },
+          checkout: {
+            out: { log: (line) => checkoutLogs.push(line), error: () => {} },
+            run: (command) => { calls.push(command); return { status: 0, stderr: '' }; },
+          },
+        });
+
+        expect(result).toMatchObject({ exitCode: 0, installedVersion: '1.0.0', restarted: false });
+        expect(result.reason).toContain('dry-run');
+        expect(calls).toEqual([]);
+        expect(routesToRelease ? releaseLogs : checkoutLogs).toEqual([JSON.stringify(result)]);
+        expect(routesToRelease ? checkoutLogs : releaseLogs).toEqual([]);
+        expect(readFileSync(join(inst.prefix, 'install.json'), 'utf8')).toBe(installJsonBefore);
+        expect(readlinkSync(join(inst.prefix, 'current'))).toBe(currentTarget);
+      } finally { rmSync(inst.prefix, { recursive: true, force: true }); }
+    }
+  });
+
+  test('installed --dry-run keeps invalid source and versioned checkout fail-closed without writes', async () => {
+    for (const [source, options] of [['not-a-source', { dryRun: true }], [checkout, { dryRun: true, version: '0.2.0' }]] as const) {
+      const inst = installed(source);
+      const currentTarget = 'versions/1.0.0-abcdef123456';
+      symlinkSync(currentTarget, join(inst.prefix, 'current'));
+      const installJsonBefore = readFileSync(join(inst.prefix, 'install.json'), 'utf8');
+      const calls: string[] = [];
+      try {
+        const result = await runUpdateForInstallation(options, {
+          cliRoot: inst.packageRoot,
+          release: { fetchInstaller: async () => { calls.push('fetch'); return 'installer'; }, run: (command) => { calls.push(command); return { status: 0, stderr: '' }; } },
+          checkout: { run: (command) => { calls.push(command); return { status: 0, stderr: '' }; } },
+        });
+
+        expect(result).toMatchObject({ exitCode: 2, installedVersion: null });
+        expect(result.reason).toContain('설치 출처');
+        expect(calls).toEqual([]);
+        expect(readFileSync(join(inst.prefix, 'install.json'), 'utf8')).toBe(installJsonBefore);
+        expect(readlinkSync(join(inst.prefix, 'current'))).toBe(currentTarget);
+      } finally { rmSync(inst.prefix, { recursive: true, force: true }); }
+    }
+  });
+
+  test('installed release --dry-run does not fall back to the checkout sink when its selected sink is absent', async () => {
+    const inst = installed('https://github.com/ElanvitalAI/elanous/releases/latest/download/elanous.tgz');
+    const checkoutLogs: string[] = [];
+    const consoleLogs: string[] = [];
+    const consoleSpy = spyOn(console, 'log').mockImplementation((line: string) => { consoleLogs.push(line); });
+    try {
+      const result = await runUpdateForInstallation({ dryRun: true, json: true }, {
+        cliRoot: inst.packageRoot,
+        release: {
+          fetchInstaller: async () => { throw new Error('dry-run must not fetch'); },
+          run: () => { throw new Error('dry-run must not install'); },
+        },
+        checkout: { out: { log: (line) => checkoutLogs.push(line), error: () => {} } },
+      });
+
+      expect(result).toMatchObject({ exitCode: 0, installedVersion: '1.0.0', restarted: false });
+      expect(checkoutLogs).toEqual([]);
+      expect(consoleLogs).toEqual([JSON.stringify(result)]);
+    } finally {
+      consoleSpy.mockRestore();
+      rmSync(inst.prefix, { recursive: true, force: true });
+    }
+  });
+
   test('a checkout-sourced install (this machine: source = pilot checkout) updates from that checkout, never from a release', async () => {
     const f = fixture();
     const inst = installed(checkout);

@@ -45,7 +45,7 @@ export function createScopedGraphEventBus(
   bus: GraphEventBus,
   prepareEvent: (input: GraphEventInput) => GraphEvent,
   onQueued?: (event: GraphEvent) => void,
-  onFlushed?: (scope: GraphEventScope | undefined, eventIds: readonly string[]) => void,
+  onFlushed?: (scope: GraphEventScope | undefined, eventIds: readonly string[]) => void | Promise<void>,
 ): GraphEventBus & { prepare(input: GraphEventInput): GraphEvent } {
   const queuedByScope = new Map<string, Set<string>>();
   return {
@@ -76,7 +76,8 @@ export function createScopedGraphEventBus(
       }
       const ids = keys.flatMap((key) => [...(queuedByScope.get(key) ?? [])]);
       for (const key of keys) queuedByScope.delete(key);
-      onFlushed?.(scope, ids);
+      const flushed = onFlushed?.(scope, ids);
+      if (flushed) await flushed;
     },
     subscribe: (handler, filter) => bus.subscribe(handler, filter),
   };
@@ -199,4 +200,67 @@ export function createGraphEventBus(options: {
       return () => { subscribers.delete(id); };
     },
   };
+}
+
+/** External event envelope is separate from run-scoped GraphEvent: it has no graph/run owner yet. */
+export interface GraphExternalTriggerEvent {
+  readonly eventId: string;
+  readonly type: string;
+  readonly dedupeKey: string;
+  readonly at: string;
+  readonly sequence?: number;
+  readonly payload: Readonly<Record<string, unknown>>;
+}
+
+export type GraphExternalTriggerDispatchResult =
+  | { readonly disposition: 'ignored'; readonly reason: 'event-not-declared'; readonly graphId: string; readonly eventId: string }
+  | { readonly disposition: 'started' | 'resumed' | 'duplicate' | 'busy'; readonly graphId: string; readonly eventId: string;
+      readonly runId: string; readonly state?: import('./runner.js').GraphRunState };
+
+/** Starts a graph only when its YAML declares this external event; the dispatch registry owns idempotency.
+ *  Internal GraphEventBus subscribers remain scoped to an existing graph/run and never call this ingress. */
+export async function dispatchDeclaredGraphExternalEvent(graphPath: string, event: GraphExternalTriggerEvent, options: {
+  registryRoot?: string;
+  stateRoot?: string;
+  runRoot?: string;
+  now?: () => number;
+  leaseMs?: number;
+  createRunId?: () => string;
+  eventNow?: () => Date;
+  graphRunOptions?: Pick<import('./runner.js').GraphRunOptions, 'eventBus' | 'quiet' | 'deps' | 'routeGraphEvents'>;
+} = {}): Promise<GraphExternalTriggerDispatchResult> {
+  if (!event.eventId.trim()) throw new Error('external graph event requires eventId');
+  if (!event.type.trim()) throw new Error('external graph event requires type');
+  if (!event.dedupeKey.trim()) throw new Error('external graph event requires dedupeKey');
+  if (!Number.isFinite(Date.parse(event.at))) throw new Error('external graph event requires a valid at timestamp');
+
+  const { readFileSync } = await import('node:fs');
+  const { parse: parseYaml } = await import('yaml');
+  const document: unknown = parseYaml(readFileSync(graphPath, 'utf8'));
+  const root = document && typeof document === 'object' && !Array.isArray(document)
+    ? document as Record<string, unknown> : {};
+  const graphId = typeof root.graph_id === 'string' ? root.graph_id : '';
+  if (!graphId) throw new Error('external graph event target requires graph_id');
+  const loop = root.loop && typeof root.loop === 'object' && !Array.isArray(root.loop)
+    ? root.loop as Record<string, unknown> : {};
+  const trigger = loop.trigger && typeof loop.trigger === 'object' && !Array.isArray(loop.trigger)
+    ? loop.trigger as Record<string, unknown> : {};
+  const declarations = Array.isArray(trigger.events) ? trigger.events : [];
+  if (!declarations.includes(event.type))
+    return { disposition: 'ignored', reason: 'event-not-declared', graphId, eventId: event.eventId };
+
+  const { dispatchGraphTriggerRun } = await import('../loops/graph-trigger-dispatch.js');
+  const result = await dispatchGraphTriggerRun({
+    graphId,
+    graphPath,
+    triggerId: `event:${graphId}:${event.type}`,
+    dedupeKey: event.dedupeKey,
+    payload: { ...event.payload, graphEvent: { eventId: event.eventId, type: event.type, dedupeKey: event.dedupeKey,
+      at: event.at, ...(event.sequence === undefined ? {} : { sequence: event.sequence }) } },
+  }, options);
+  const disposition = !result.claimed ? 'busy'
+    : result.mode === 'start' ? 'started'
+      : result.mode === 'resume' ? 'resumed' : 'duplicate';
+  return { disposition, graphId, eventId: event.eventId, runId: result.registration.runId,
+    ...(result.state ? { state: result.state } : {}) };
 }

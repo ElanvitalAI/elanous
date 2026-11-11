@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "요구사항과 용량 산정",
+  "source": "https://sre.google/sre-book/handling-overload/",
+  "body": "PRD에 지정 좌석·공정성·판매 불변식·실패 UX·SLO를 분리한다. 동시 사용자 수는 RPS가 아니다. 유입 RPS=입장 대기 사용자/유입 시간, 폴링 RPS=대기 인원/권고 주기, 예약 RPS=입장률×시도율로 계산한다. 부하 시험에서 p95/p99와 DB 연결 수를 검증하고 가정값은 운영 측정과 구분한다."
+}

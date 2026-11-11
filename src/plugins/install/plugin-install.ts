@@ -4,6 +4,7 @@ import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openS
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { dlopen, FFIType } from 'bun:ffi';
+import { compare as compareSemver, maxSatisfying, satisfies as satisfiesSemver, validRange } from 'semver';
 import { loadPluginManifestFromDir, type PluginManifest } from '../core/manifest.js';
 import { inspectPluginSecurity } from '../core/capability-policy.js';
 import { decidePluginInstallation } from '../core/trust-store.js';
@@ -110,6 +111,8 @@ export interface InstalledPlugin {
   sha256: string | null;
   /** Absent for installations recorded before timestamps were introduced. */
   installedAt?: string;
+  /** New packages installed for one dependency request share this receipt id. */
+  installBundleId?: string;
 }
 
 export interface InstallOptions {
@@ -128,6 +131,12 @@ export interface InstallOptions {
   configPath?: string;
   /** Enterprise context for knowledge packs in a private market. */
   enterpriseId?: string;
+  /** Internal pin after a signed dependency range has been resolved. */
+  requestedPluginVersion?: string;
+  /** Internal branch exclusion while backtracking an unpinned root request. */
+  excludedPluginVersions?: ReadonlySet<string>;
+  /** Test seam; production runs only the fixed uv commands derived from validated runtime declarations. */
+  runRuntimeCommand?: (command: string, args: readonly string[], cwd: string) => { status: number | null; stderr?: string };
 }
 
 export class PluginInstallError extends Error {
@@ -135,6 +144,10 @@ export class PluginInstallError extends Error {
     super(message);
     this.name = 'PluginInstallError';
   }
+}
+
+class RootAlreadyInstalled extends PluginInstallError {
+  constructor(name: string, version: string) { super('conflict', `plugin already installed: ${name}@${version}`); }
 }
 
 function fail(reason: PluginInstallError['reason'], detail: string): never {
@@ -213,7 +226,12 @@ function samePackTree(existing: string, verified: string): boolean {
 function copyPlugin(source: string, destination: string): void {
   if (!existsSync(source) || !lstatSync(source).isDirectory()) fail('io', `plugin directory not found: ${source}`);
   safeTree(source);
-  cpSync(source, destination, { recursive: true, filter: path => basename(path) !== '.git' });
+  // This bundled demo keeps binary screenshots and PDFs under sim/. Its
+  // published package uses none of them; keep every other plugin's sim/ intact.
+  const gcpDemo = join(DEFAULT_PLUGIN_ROOT, 'gcp-architect-expand');
+  const bundledGcpDemo = existsSync(gcpDemo) && realpathSync(source) === realpathSync(gcpDemo);
+  cpSync(source, destination, { recursive: true,
+    filter: path => basename(path) !== '.git' && !(bundledGcpDemo && relative(source, path) === 'sim') });
 }
 
 function indexPath(market: string, opts: InstallOptions): string {
@@ -245,7 +263,12 @@ function marketEntry(spec: string, opts: InstallOptions): { market: string; entr
     index = result.index;
   }
   if (!index || index.name !== market || !Array.isArray(index.plugins)) fail('io', `invalid market index: ${market}`);
-  const matches = index.plugins.filter(plugin => plugin && plugin.name === name);
+  const candidates = index.plugins.filter(plugin => plugin && plugin.name === name);
+  const versions = candidates.map(plugin => plugin.version);
+  const eligible = versions.filter(version => !opts.excludedPluginVersions?.has(version));
+  const version = opts.requestedPluginVersion ?? maxSatisfying(eligible, '*') ?? maxSatisfying(eligible, '*', { includePrerelease: true });
+  if (!version && opts.excludedPluginVersions?.size) fail('conflict', `no remaining plugin version: ${name}@${market}`);
+  const matches = candidates.filter(plugin => plugin.version === version);
   if (matches.length !== 1 || !matches[0]?.source || typeof matches[0].source.source !== 'string' || typeof matches[0]?.version !== 'string') fail('io', `plugin not found or malformed in ${market}: ${name}`);
   return { market, entry: matches[0]!, signature };
 }
@@ -330,7 +353,12 @@ async function fetchedMarketSource(spec: string, target: string, opts: InstallOp
     } else if (error instanceof MarketFetchError) throw new PluginInstallError(error.reason, error.message);
     else throw error;
   }
-  const matches = marketIndex.index.plugins.filter(entry => entry.name === name);
+  const candidates = marketIndex.index.plugins.filter(entry => entry.name === name);
+  const versions = candidates.map(entry => entry.version);
+  const eligible = versions.filter(version => !opts.excludedPluginVersions?.has(version));
+  const version = opts.requestedPluginVersion ?? maxSatisfying(eligible, '*') ?? maxSatisfying(eligible, '*', { includePrerelease: true });
+  if (!version && opts.excludedPluginVersions?.size) fail('conflict', `no remaining plugin version: ${name}@${marketName}`);
+  const matches = candidates.filter(entry => entry.version === version);
   if (matches.length !== 1) fail('io', `plugin not found or ambiguous in ${marketName}: ${name}`);
   const entry = matches[0]!;
   await fetchVerifiedArtifact(entry.artifact, marketIndex.market.url, target, opts);
@@ -521,7 +549,260 @@ export function pluginInstallPath(root: string, market: string, manifest: Plugin
   return join(root, 'plugins', market, manifest.id, manifest.version);
 }
 
+type DeclaredPluginRef = { id: string; range: string; optional: boolean; market?: string };
+
+export function parseDeclaredPluginRef(value: NonNullable<NonNullable<PluginManifest['dependencies']>['plugins']>[number]): DeclaredPluginRef {
+  const at = typeof value === 'string' ? value.indexOf('@') : -1;
+  const id = typeof value === 'string' ? at < 0 ? value : value.slice(0, at) : value.id;
+  const range = typeof value === 'string' ? at < 0 ? '*' : value.slice(at + 1) : value.version ?? '*';
+  const optional = typeof value === 'string' ? false : value.optional === true;
+  const market = typeof value === 'string' ? undefined : value.market;
+  if (!NAME.test(id) || !validRange(range) || (market !== undefined && !NAME.test(market))) {
+    fail('io', `invalid plugin dependency: ${typeof value === 'string' ? value : JSON.stringify(value)}`);
+  }
+  return { id, range, optional, ...(market ? { market } : {}) };
+}
+
+function prepareDeclaredRuntime(manifest: PluginManifest, destination: string, opts: InstallOptions, bundledSource: boolean): void {
+  for (const runtime of manifest.dependencies?.runtime ?? []) {
+    const distributionProject = runtime.project.startsWith('@distribution/');
+    if (distributionProject && !bundledSource) fail('io', `runtime project unavailable: ${manifest.id}`);
+    const projectRoot = distributionProject ? dirname(DEFAULT_PLUGIN_ROOT) : destination;
+    const project = inside(projectRoot, distributionProject ? runtime.project.slice('@distribution/'.length) : runtime.project);
+    const canonicalRoot = realpathSync(projectRoot);
+    if (!existsSync(project) || !realpathSync(project).startsWith(`${canonicalRoot}${sep}`) ||
+      !existsSync(join(project, 'pyproject.toml')) || !lstatSync(join(project, 'pyproject.toml')).isFile()) {
+      fail('io', `runtime project missing or unsafe: ${manifest.id}`);
+    }
+    const extraArgs = runtime.extras.flatMap(extra => ['--extra', extra]);
+    const commands: string[][] = [
+      ['sync', ...extraArgs],
+      ...(runtime.browser === 'chromium' ? [['run', ...extraArgs, 'python', '-m', 'playwright', 'install', 'chromium']] : []),
+    ];
+    for (const args of commands) {
+      let status: number | null;
+      try {
+        status = opts.runRuntimeCommand
+          ? opts.runRuntimeCommand('uv', args, project).status
+          : spawnSync('uv', args, { cwd: project, encoding: 'utf8', timeout: 300_000, maxBuffer: 64 * 1024 }).status;
+      } catch { status = null; }
+      if (status !== 0) fail('io', `runtime preparation failed: ${manifest.id} requires uv/python${runtime.browser ? ' and Playwright Chromium' : ''}; install uv or check the declared project`);
+    }
+  }
+}
+
+/** Verify declared plugin requirements against installed package manifests; never install them implicitly here. */
+function assertDeclaredPluginDependencies(manifest: PluginManifest, root: string): void {
+  if (!manifest.dependencies?.plugins?.length) return;
+  const installed = listInstalledPlugins(root);
+  const checked = new Set<string>();
+  const visiting = new Set<string>();
+  const visit = (owner: PluginManifest, ownerKey: string): void => {
+    if (checked.has(ownerKey)) return;
+    if (visiting.has(ownerKey)) fail('conflict', `plugin dependency cycle: ${owner.id}@${owner.version}`);
+    visiting.add(ownerKey);
+    for (const declaration of owner.dependencies?.plugins ?? []) {
+      const ref = parseDeclaredPluginRef(declaration);
+      if (ref.optional) continue;
+      if (ref.id === owner.id) fail('conflict', `plugin cannot depend on itself: ${ref.id}`);
+      const matches = installed.filter(item => item.name === ref.id && (!ref.market || item.market === ref.market)
+        && satisfiesSemver(item.version, ref.range)).sort((a, b) => compareSemver(b.version, a.version));
+      if (!matches.length) {
+        fail('conflict', `required plugin not installed: ${ref.id}@${ref.range}`);
+      }
+      if (matches.length > 1 && matches[0]!.version === matches[1]!.version) fail('conflict', `ambiguous plugin dependency: ${ref.id}@${ref.range}`);
+      const match = matches[0]!;
+      const dependency = loadPluginManifestFromDir(match.path, { id: match.name, version: match.version }).manifest;
+      visit(dependency, `${match.market}/${match.name}/${match.version}`);
+    }
+    visiting.delete(ownerKey);
+    checked.add(ownerKey);
+  };
+  visit(manifest, `candidate/${manifest.id}/${manifest.version}`);
+}
+
+interface DependencyInstallContext {
+  stack: string[];
+  selected: Map<string, { version: string; market: string }>;
+  constraints: Map<string, DeclaredPluginRef[]>;
+  excludedVersions: Map<string, Set<string>>;
+  created: InstalledPlugin[];
+  createdPacks: Array<{ path: string; dev: number; ino: number }>;
+  bundleId?: string;
+}
+
+class DependencyReplan extends Error {}
+
+async function signedDependencyVersion(ref: DeclaredPluginRef, market: string, opts: InstallOptions,
+  constraints: DeclaredPluginRef[], excluded: ReadonlySet<string> = new Set()): Promise<string> {
+  let index: MarketplaceIndex;
+  try {
+    const result = await ensureMarketIndex(market, { root: opts.root, marketDir: opts.marketDir,
+      configPath: opts.configPath, fetcher: opts.fetcher, refresh: opts.refresh,
+      verifySignature: opts.verifySignature, trustedKeys: opts.trustedKeys });
+    index = result.index;
+  } catch (error) {
+    if (error instanceof MarketFetchError) throw new PluginInstallError(error.reason, error.message);
+    throw error;
+  }
+  const versions = index.plugins.filter(entry => entry.name === ref.id).map(entry => entry.version);
+  if (!versions.length) fail('conflict', `required plugin not found in ${market}: ${ref.id}`);
+  const selected = versions.filter(version => !excluded.has(version) && constraints.every(item => satisfiesSemver(version, item.range)))
+    .sort((a, b) => compareSemver(b, a))[0];
+  if (!selected) fail('conflict', `plugin version conflict: ${ref.id}@${ref.range} in ${market}`);
+  return selected;
+}
+
+async function ensureDeclaredPluginDependencies(
+  manifest: PluginManifest, sourceMarket: string, root: string, opts: InstallOptions, context: DependencyInstallContext,
+  sourcePath?: string,
+): Promise<void> {
+  const declarations = manifest.dependencies?.plugins ?? [];
+  if (declarations.length) context.bundleId ??= randomUUID();
+  for (const declaration of declarations) {
+    const ref = parseDeclaredPluginRef(declaration);
+    // Optional integrations never constrain the required install graph.
+    if (ref.optional) continue;
+    if (ref.id === manifest.id || context.stack.includes(ref.id)) fail('conflict', `plugin dependency cycle: ${[...context.stack, ref.id].join(' -> ')}`);
+    const constraints = context.constraints.get(ref.id) ?? [];
+    if (!constraints.some(item => item.range === ref.range && item.market === ref.market)) constraints.push(ref);
+    context.constraints.set(ref.id, constraints);
+    const markets = [...new Set(constraints.map(item => item.market).filter((value): value is string => !!value))];
+    if (markets.length > 1) fail('conflict', `plugin market conflict: ${ref.id}`);
+    const market = markets[0] ?? sourceMarket;
+    const excluded = context.excludedVersions.get(ref.id) ?? new Set<string>();
+    const installed = listInstalledPlugins(root).filter(item => item.name === ref.id && (!markets.length || item.market === market)
+      && !excluded.has(item.version) && constraints.every(constraint => satisfiesSemver(item.version, constraint.range)))
+      .sort((a, b) => compareSemver(b.version, a.version));
+    if (installed.length > 1 && installed[0]!.version === installed[1]!.version) fail('conflict', `ambiguous plugin dependency: ${ref.id}@${ref.range}`);
+    const existing = installed[0];
+    if (existing) {
+      const chosen = context.selected.get(ref.id);
+      if (chosen && (chosen.version !== existing.version || chosen.market !== existing.market)) {
+        throw new DependencyReplan(`plugin ${ref.id} must be reselected`);
+      }
+      context.selected.set(ref.id, { version: existing.version, market: existing.market });
+      continue;
+    }
+    if (market === 'local') {
+      if (!sourcePath) fail('conflict', `required plugin not installed: ${ref.id}@${ref.range}`);
+      const sibling = join(dirname(sourcePath), ref.id);
+      if (!existsSync(sibling)) fail('conflict', `required plugin not installed: ${ref.id}@${ref.range}`);
+      const local = loadPluginManifestFromDir(sibling, { id: ref.id }).manifest;
+      if (local.id !== ref.id || !satisfiesSemver(local.version, ref.range)) {
+        fail('conflict', `plugin version conflict: ${ref.id}@${ref.range}`);
+      }
+      const chosen = context.selected.get(ref.id);
+      if (chosen && (chosen.version !== local.version || chosen.market !== 'local')) {
+        throw new DependencyReplan(`plugin ${ref.id} must be reselected`);
+      }
+      context.selected.set(ref.id, { version: local.version, market: 'local' });
+      await installPluginInternal(sibling, opts, context);
+      continue;
+    }
+    const chosen = context.selected.get(ref.id);
+    const version = await signedDependencyVersion(ref, market, opts, constraints, excluded);
+    if (chosen && (chosen.version !== version || chosen.market !== market)) {
+      throw new DependencyReplan(`plugin ${ref.id} must be reselected`);
+    }
+    context.selected.set(ref.id, { version, market });
+    await installPluginInternal(`${ref.id}@${market}`, { ...opts, requestedPluginVersion: version }, context);
+  }
+}
+
+function rollbackDependencyInstall(context: DependencyInstallContext, root: string): void {
+  if (!context.created.length && !context.createdPacks.length) return;
+  withLedgerLock(root, () => {
+    const current = listInstalledPlugins(root);
+    const owned = context.created.filter(item => current.some(candidate => candidate.market === item.market
+      && candidate.name === item.name && candidate.version === item.version
+      && candidate.installBundleId === item.installBundleId && candidate.installedAt === item.installedAt));
+    const createdKeys = new Set(owned.map(item => `${item.market}/${item.name}/${item.version}`));
+    const retained = new Set<string>();
+    // An independently committed plugin may have started using a staged dependency.
+    // Keep that dependency and its transitive requirements when rolling back this bundle.
+    const visitRequired = (item: InstalledPlugin): void => {
+      const key = `${item.market}/${item.name}/${item.version}`;
+      if (retained.has(key)) return;
+      retained.add(key);
+      const manifest = loadPluginManifestFromDir(item.path, { id: item.name, version: item.version }).manifest;
+      for (const declaration of manifest.dependencies?.plugins ?? []) {
+        const ref = parseDeclaredPluginRef(declaration);
+        if (ref.optional) continue;
+        for (const dependency of current.filter(candidate => candidate.name === ref.id &&
+          (!ref.market || candidate.market === ref.market) && satisfiesSemver(candidate.version, ref.range))) visitRequired(dependency);
+      }
+    };
+    for (const item of current) {
+      if (!createdKeys.has(`${item.market}/${item.name}/${item.version}`)) visitRequired(item);
+    }
+    for (const item of context.created.reverse()) {
+      if (!createdKeys.has(`${item.market}/${item.name}/${item.version}`)) continue;
+      if (retained.has(`${item.market}/${item.name}/${item.version}`)) continue;
+      assertInstallParents(root, item.path);
+      rmSync(item.path, { recursive: true, force: true });
+    }
+    const retainedPacks = new Set<string>();
+    for (const item of current) {
+      if (!retained.has(`${item.market}/${item.name}/${item.version}`)) continue;
+      const manifest = loadPluginManifestFromDir(item.path, { id: item.name, version: item.version }).manifest;
+      for (const name of manifest.requires?.knowledgePacks ?? []) retainedPacks.add(`${item.market}/${name}`);
+    }
+    for (const pack of context.createdPacks) {
+      const { path } = pack;
+      const market = basename(dirname(dirname(path)));
+      const name = basename(dirname(path));
+      if (retainedPacks.has(`${market}/${name}`)) continue;
+      assertInstallParents(root, path);
+      if (!packPathExists(path)) continue;
+      const currentPack = lstatSync(path);
+      if (currentPack.dev !== pack.dev || currentPack.ino !== pack.ino) continue;
+      rmSync(path, { recursive: true, force: true });
+    }
+    writeLedger(root, listInstalledPlugins(root).map(item => retained.has(`${item.market}/${item.name}/${item.version}`) && createdKeys.has(`${item.market}/${item.name}/${item.version}`)
+      ? { ...item, installBundleId: undefined } : item));
+  });
+}
+
 export async function installPlugin(spec: string, opts: InstallOptions = {}): Promise<InstalledPlugin> {
+  const root = resolve(opts.root ?? elanousStateRoot());
+  type ExclusionPlan = Map<string, Set<string>>;
+  const pending: ExclusionPlan[] = [new Map()];
+  const seen = new Set<string>(['[]']);
+  let attempts = 0;
+  let lastConflict: unknown;
+  while (pending.length) {
+    // Source: bounded search keeps a crafted signed market from multiplying install attempts without limit.
+    if (++attempts > 256) fail('conflict', 'plugin dependency search exceeded its attempt limit');
+    const excludedVersions = pending.pop()!;
+    // Constraints are scoped to this candidate graph; another version may declare different transitive requirements.
+    const context: DependencyInstallContext = { stack: [], selected: new Map(), constraints: new Map(), excludedVersions, created: [], createdPacks: [] };
+    try { return await installPluginInternal(spec, opts, context); }
+    catch (error) {
+      try { rollbackDependencyInstall(context, root); }
+      catch (rollbackError) { fail('io', `plugin dependency rollback failed: ${String(rollbackError)}`); }
+      if (error instanceof RootAlreadyInstalled) throw error;
+      if (!(error instanceof DependencyReplan || error instanceof PluginInstallError && error.reason === 'conflict')) throw error;
+      lastConflict ??= error;
+      // Explore a sibling for each selected candidate, most recently chosen first.
+      // Exclusions belong to that branch only; a version needed by another sibling remains eligible.
+      for (const [id, choice] of context.selected) {
+        const next: ExclusionPlan = new Map([...excludedVersions].map(([key, versions]) => [key, new Set(versions)]));
+        const banned = next.get(id) ?? new Set<string>();
+        banned.add(choice.version);
+        next.set(id, banned);
+        const key = JSON.stringify([...next].sort(([a], [b]) => a.localeCompare(b)).map(([plugin, versions]) => [plugin, [...versions].sort()]));
+        if (seen.has(key)) continue;
+        seen.add(key);
+        pending.push(next);
+      }
+    }
+  }
+  if (lastConflict) throw lastConflict;
+  fail('conflict', 'no compatible plugin dependency graph');
+}
+
+async function installPluginInternal(spec: string, opts: InstallOptions, context: DependencyInstallContext): Promise<InstalledPlugin> {
   const root = resolve(opts.root ?? elanousStateRoot());
   // Only this distribution's bundled absorb handler imports host APIs outside
   // its package. Author-supplied trust metadata cannot grant this exception.
@@ -535,10 +816,18 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
   mkdirSync(stageRoot, { recursive: true });
   assertInstallParents(root, join(stageRoot, 'plugin'));
   const stage = mkdtempSync(join(stageRoot, 'plugin-'));
+  let stackPushed = false;
   try {
-    const source = marketSpec(spec, opts)
-      ? await fetchedMarketSource(spec, join(stage, 'package'), opts)
+    const isMarketSpec = marketSpec(spec, opts);
+    const isRootRequest = context.stack.length === 0;
+    const rootMarketName = isMarketSpec && isRootRequest ? spec.split('@')[0] : undefined;
+    const sourceOpts = rootMarketName ? { ...opts, excludedPluginVersions: context.excludedVersions.get(rootMarketName) } : opts;
+    const source = isMarketSpec
+      ? await fetchedMarketSource(spec, join(stage, 'package'), sourceOpts)
       : resolvePluginSource(spec, join(stage, 'package'), opts);
+    const originalSource = isMarketSpec ? undefined : resolve(opts.cwd ?? process.cwd(), spec);
+    const bundledSource = !!originalSource && existsSync(originalSource) &&
+      realpathSync(originalSource).startsWith(`${realpathSync(DEFAULT_PLUGIN_ROOT)}${sep}`);
     const stagedManifest = join(stage, 'package', 'plugin.json');
     if (existsSync(stagedManifest)) {
       const rawManifest: unknown = JSON.parse(readFileSync(stagedManifest, 'utf8'));
@@ -556,6 +845,7 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     const manifest: PluginManifest = loadPluginManifestFromDir(join(stage, 'package'), { id: source.expectedName ?? basename(spec) }).manifest;
     if (!NAME.test(manifest.id) || !VERSION.test(manifest.version)) fail('io', 'invalid plugin name or version');
     if (source.expectedName && (manifest.id !== source.expectedName || manifest.version !== source.expectedVersion)) fail('conflict', 'market name or version differs from manifest');
+    if (rootMarketName) context.selected.set(manifest.id, { version: manifest.version, market: source.market });
     // [wiring] installPlugin is the caller: the PluginManifest normalized above by
     // loadPluginManifestFromDir (present manifest or the loader's manifest-absent
     // fallback) is handed into the install path here, past the NAME/VERSION gates.
@@ -570,6 +860,9 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     }
     const name = manifest.id;
     const version = manifest.version;
+    if (context.stack.includes(name)) fail('conflict', `plugin dependency cycle: ${[...context.stack, name].join(' -> ')}`);
+    context.stack.push(name);
+    stackPushed = true;
     for (const asset of [...(manifest.contributes.graphs ?? []), ...(manifest.contributes.vocab ?? [])]) {
       const path = inside(packageRoot, asset);
       if (!existsSync(path) || !realpathSync(path).startsWith(`${realpathSync(packageRoot)}${sep}`)) fail('io', `plugin asset not found or unsafe: ${asset}`);
@@ -581,6 +874,13 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     catch { fail('scan', 'plugin static security scan failed'); }
     emit({ event: 'verify', signature: source.signature, scan: security.scan });
     const capabilities = manifest.capabilities.map(capability => capability.kind);
+    if (manifest.dependencies?.runtime?.length && !bundledSource) {
+      // uv may run project build hooks. A signature authenticates the artifact,
+      // but a separate explicit approval is needed before executing its code.
+      if (source.signature !== 'ok' || !await opts.consent?.(['runtime:uv-python'])) {
+        fail('consent-denied', `runtime preparation requires signed plugin and explicit approval: ${manifest.id}`);
+      }
+    }
     const required = capabilities.length > 0;
     const preConsent = decidePluginInstallation(security, capabilities, false);
     const bundledHostImports = bundledAbsorb && knownAbsorbHostImports(packageRoot, security);
@@ -591,6 +891,9 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     const decision = decidePluginInstallation(security, capabilities, consented);
     if (!decision.ok && !(decision.reason === 'scan' && bundledHostImports)) fail(decision.reason, decision.reason === 'scan'
       ? 'plugin static security scan rejected package' : 'plugin capabilities require consent');
+    await ensureDeclaredPluginDependencies(manifest, source.market, root, opts, context,
+      isMarketSpec ? undefined : resolve(opts.cwd ?? process.cwd(), spec));
+    assertDeclaredPluginDependencies(manifest, root);
     const packs = await stageRequiredKnowledgePacks(manifest.requires?.knowledgePacks ?? [], source.market, stage, root, opts);
     emit({ event: 'credentials', connectors: (manifest.contributes.connectors ?? []).map(connector => ({
       id: connector.id, fields: (connector.fields ?? connector.userConfig?.map(field => ({ name: field.key, secret: field.secret })) ?? [])
@@ -609,8 +912,13 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     const { nodes, nodeErrors } = inspectPluginNodes(packageRoot, manifest);
     emit({ event: 'registered', kinds, nodes, nodeErrors, graphs, skills });
     const installed = withLedgerLock(root, () => {
+      // Recheck under the ledger lock: another installer/remover may have changed dependencies after staging.
+      assertDeclaredPluginDependencies(manifest, root);
       assertInstallParents(root, destination);
-      if (existsSync(destination)) fail('conflict', `plugin already installed: ${name}@${version}`);
+      if (existsSync(destination)) {
+        if (isRootRequest) throw new RootAlreadyInstalled(name, version);
+        fail('conflict', `plugin already installed: ${name}@${version}`);
+      }
       for (const pack of packs) {
         assertInstallParents(root, pack.destination);
         if (packPathExists(pack.destination) && !samePackTree(pack.destination, pack.staged)) {
@@ -631,7 +939,8 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
         assertInstallParents(root, destination);
         renameSync(join(stage, 'package'), destination);
         moved.push(destination);
-        const item = { name, version, market: source.market, path: destination, sha256: source.sha256, installedAt: new Date().toISOString() };
+        const item = { name, version, market: source.market, path: destination, sha256: source.sha256,
+          installedAt: new Date().toISOString(), ...(context.bundleId ? { installBundleId: context.bundleId } : {}) };
         let installedSecurity: ReturnType<typeof inspectPluginSecurity>;
         try { installedSecurity = inspectPluginSecurity(destination); }
         catch { fail('scan', 'plugin package integrity verification failed'); }
@@ -639,7 +948,13 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
           (installedSecurity.scan === 'dangerous' && !bundledHostImports)) {
           fail('scan', 'plugin package integrity changed during installation');
         }
+        prepareDeclaredRuntime(manifest, destination, opts, bundledSource);
+        const movedPackIdentities = packs.filter(pack => moved.includes(pack.destination)).map(pack => {
+          const identity = lstatSync(pack.destination);
+          return { path: pack.destination, dev: identity.dev, ino: identity.ino };
+        });
         writeLedger(root, [...listInstalledPlugins(root), item]);
+        context.createdPacks.push(...movedPackIdentities);
         return item;
       } catch (error) {
         for (const path of moved.reverse()) {
@@ -652,11 +967,13 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     // The install is committed above; a listener that throws must not turn a finished install into a failure
     // (the ledger would say «installed» while the caller saw «io», and a retry would hit «conflict»).
     try { emit({ event: 'done', plugin: name, version, path: destination }); } catch { /* listener failure only */ }
+    context.created.push(installed);
     return installed;
   } catch (error) {
-    if (error instanceof PluginInstallError) throw error;
+    if (error instanceof PluginInstallError || error instanceof DependencyReplan) throw error;
     throw new PluginInstallError('io', error instanceof Error ? error.message : String(error));
   } finally {
+    if (stackPushed) context.stack.pop();
     rmSync(stage, { recursive: true, force: true });
   }
 }
@@ -730,8 +1047,9 @@ function writeLedger(root: string, entries: InstalledPlugin[]): void {
   const unique = new Map(entries.map(entry => [`${entry.market}/${entry.name}/${entry.version}`, entry]));
   const temp = `${ledger}.${process.pid}.tmp`;
   try {
-    writeFileSync(temp, JSON.stringify([...unique.values()].map(({ name, version, market, sha256, installedAt }) =>
-      ({ name, version, market, sha256, ...(installedAt === undefined ? {} : { installedAt }) })), null, 2));
+    writeFileSync(temp, JSON.stringify([...unique.values()].map(({ name, version, market, sha256, installedAt, installBundleId }) =>
+      ({ name, version, market, sha256, ...(installedAt === undefined ? {} : { installedAt }),
+        ...(installBundleId === undefined ? {} : { installBundleId }) })), null, 2));
     renameSync(temp, ledger);
   } finally {
     rmSync(temp, { force: true });
@@ -742,7 +1060,7 @@ export function listInstalledPlugins(root = elanousStateRoot()): InstalledPlugin
   const base = join(root, 'plugins');
   if (!existsSync(base)) return [];
   const result: InstalledPlugin[] = [];
-  let ledger: Array<Pick<InstalledPlugin, 'name' | 'version' | 'market' | 'sha256' | 'installedAt'>> = [];
+  let ledger: Array<Pick<InstalledPlugin, 'name' | 'version' | 'market' | 'sha256' | 'installedAt' | 'installBundleId'>> = [];
   try {
     ledger = JSON.parse(readFileSync(join(base, 'installed.json'), 'utf8'));
     if (!Array.isArray(ledger)) ledger = [];
@@ -762,7 +1080,8 @@ export function listInstalledPlugins(root = elanousStateRoot()): InstalledPlugin
             const recorded = ledger.find(entry => entry.name === name.name && entry.version === version.name && entry.market === market.name);
             result.push({ name: name.name, version: version.name, market: market.name, path,
               sha256: recorded?.sha256 ?? null,
-              ...(typeof recorded?.installedAt === 'string' ? { installedAt: recorded.installedAt } : {}) });
+              ...(typeof recorded?.installedAt === 'string' ? { installedAt: recorded.installedAt } : {}),
+              ...(typeof recorded?.installBundleId === 'string' ? { installBundleId: recorded.installBundleId } : {}) });
           }
         } catch { /* malformed packages are not installed plugins */ }
       }
@@ -774,8 +1093,16 @@ export function listInstalledPlugins(root = elanousStateRoot()): InstalledPlugin
 export function removePlugin(name: string, root = elanousStateRoot()): number {
   if (!NAME.test(name)) fail('io', `invalid plugin name: ${name}`);
   return withLedgerLock(root, () => {
-    const entries = listInstalledPlugins(root).filter(item => item.name === name);
+    const installed = listInstalledPlugins(root);
+    const entries = installed.filter(item => item.name === name);
     if (!entries.length) return 0;
+    for (const dependent of installed.filter(item => item.name !== name)) {
+      const manifest = loadPluginManifestFromDir(dependent.path, { id: dependent.name, version: dependent.version }).manifest;
+      if ((manifest.dependencies?.plugins ?? []).some(item => {
+        const ref = parseDeclaredPluginRef(item);
+        return !ref.optional && ref.id === name;
+      })) fail('conflict', `plugin ${name} is required by installed plugin ${dependent.name}@${dependent.version}`);
+    }
     const staging = join(root, 'plugins', '.staging');
     mkdirSync(staging, { recursive: true });
     const quarantine = mkdtempSync(join(staging, 'remove-'));

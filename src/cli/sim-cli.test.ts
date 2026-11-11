@@ -499,6 +499,28 @@ actions:
     expect(JSON.parse(output.pop()!)).toEqual({ world: 'cli-world', seed: 0, devices: ['fake-clock'], events: [] });
   });
 
+  test('validates the self-contained voice-note demo with the same parser used by world creation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sim-world-cli-demo-validate-'));
+    roots.push(root);
+    priorTestRoot = getTestStateRoot();
+    setTestStateRoot(root);
+    const output: string[] = [];
+    const errors: string[] = [];
+    console.log = (...parts: unknown[]) => { output.push(parts.map(String).join(' ')); };
+    console.error = (...parts: unknown[]) => { errors.push(parts.map(String).join(' ')); };
+    process.exitCode = 0;
+    const program = new Command();
+    registerSimCommands(program);
+
+    await program.parseAsync(['node', 'test', 'sim', 'world', 'validate',
+      join(import.meta.dir, '../../scenarios/ux-sim/app-demo-1114.yaml')]);
+    expect(process.exitCode).toBe(0);
+    expect(errors).toEqual([]);
+    const parsed = JSON.parse(output.pop()!) as { world: string; apps: Array<{ slug: string }> };
+    expect(parsed.world).toBe('app-demo-1114');
+    expect(parsed.apps.map(app => app.slug)).toEqual(['voice-notes', 'shop-studio']);
+  });
+
   test('registers fidelity replay and device-status commands in the isolated test universe', async () => {
     const root = mkdtempSync(join(tmpdir(), 'sim-fidelity-cli-'));
     roots.push(root);

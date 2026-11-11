@@ -13,6 +13,8 @@ export interface MemoryItem {
   source: string;
   updatedAt: string;
   status: 'active' | 'retired';
+  /** ARG feedback is retired by graph/code reachability audits, not by age. */
+  lifecycle?: 'arg-feedback';
   /** A normalized, comparable assertion supplied by the summarizer; absent means no conflict judgment. */
   claim?: { key: string; value: string };
   conflict?: { owner: 'OP'; sources: [string, string] };
@@ -22,7 +24,8 @@ export interface MemoryItem {
 export function guardianRetireAged(items: readonly MemoryItem[], now: Date): MemoryItem[] {
   const cutoff = now.getTime() - 30 * DAY_MS;
   return items.map(item => ({ ...item,
-    status: Date.parse(item.updatedAt) < cutoff ? 'retired' as const : item.status,
+    status: item.lifecycle !== 'arg-feedback' && !item.source.startsWith('elanous://arg-feedback/') &&
+      Date.parse(item.updatedAt) < cutoff ? 'retired' as const : item.status,
   }));
 }
 

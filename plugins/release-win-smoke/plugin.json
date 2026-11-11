@@ -1,0 +1,46 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "id": "release-win-smoke",
+  "name": "Release Windows Smoke",
+  "version": "0.3.9",
+  "description": "Mockable Windows installation and machine-capture smoke graph for release rehearsal.",
+  "contributes": {
+    "skills": [
+      {
+        "id": "release-win-smoke/install",
+        "path": "./skills/install/SKILL.md",
+        "sideEffects": "write"
+      }
+    ]
+  },
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [
+        "./graphs/release-win-smoke.yaml"
+      ],
+      "graphManifests": {
+        "release-win-smoke": {
+          "purpose": "Install Elanous on a simulated Windows host, verify eln, and capture the machine once",
+          "allow": {
+            "recipes": [],
+            "skills": [],
+            "domainPacks": []
+          },
+          "hitl": [],
+          "observe": {
+            "categories": [
+              "release.win-smoke"
+            ]
+          }
+        }
+      },
+      "capabilities": [
+        "proc:elanous"
+      ],
+      "authoredTrust": "builtin",
+      "sims": [
+        "./sims/release-win-smoke.yaml"
+      ]
+    }
+  }
+}

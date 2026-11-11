@@ -122,7 +122,7 @@ else if (args[0] === 'merge-base') {
   process.exit(state.onMain === false ? 1 : 0);
 }
 else if (args[0] === 'log' && args.includes('--grep=^Cut from main ')) console.log(state.recordedCutBase ? (state.cutCommit || 'e'.repeat(40)) + '\x1fCut from main ' + state.recordedCutBase + '.' : '');
-else if (args[0] === 'log') process.stdout.write(state.branchOwner ? 'Elanous-Release-Run: ' + state.branchOwner + '\\nElanous-Release-Attempt: ' + (state.branchAttempt || 0) + '\\n' : '');
+else if (args[0] === 'log') process.stdout.write(state.branchOwner ? 'Elanous-Release-Run: ' + state.branchOwner + '\\nElanous-Release-Attempt: 0\\n' : '');
 else if (args[0] === 'rev-list' && args[1] === '--parents') {
   const sha = args.at(-1);
   const parents = (state.parents || {})[sha] || [];
@@ -299,13 +299,12 @@ test('nextDevVersion increments patch without changing major/minor', () => {
   expect(() => nextDevVersion('0.2.3-dev.0')).toThrow();
 });
 
-test('RELEASE-BRANCH-ADOPT: only an explicit adoption flag transfers a failed run cut', () => {
+test('incident 0306: a new run adopts a verified stable cut from a failed gate run', () => {
   const { root } = fixture('0.2.4-dev.0');
   const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
   const cut = 'a'.repeat(40);
-  const tip = 'd'.repeat(40);
-  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, branchTip: tip, branchOwner: 'prior-cut-run', branchAttempt: 7, chosen: tip,
-    chosenVersion: '0.2.4', onMain: false, ancestor: { [`--is-ancestor ${cut} ${tip}`]: true } }));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, branchTip: cut, branchOwner: 'prior-cut-run', chosen: cut,
+    chosenVersion: '0.2.4', onMain: false }));
   const priorRun = join(root, 'graph-runs', 'release-loop', 'prior-cut-run.json');
   mkdirSync(dirname(priorRun), { recursive: true });
   writeFileSync(priorRun, JSON.stringify({ graphId: 'release-loop', runId: 'prior-cut-run', status: 'failed',
@@ -317,14 +316,8 @@ test('RELEASE-BRANCH-ADOPT: only an explicit adoption flag transfers a failed ru
   process.env.PATH = `${join(root, 'bin')}:${previousPath}`;
   process.env.VERSION_NODE_TEST_ROOT = root;
   try {
-    expect(() => cutReleaseBranchForRun(root, '0.2.4', { runId: 'new-run-after-gate-failure', root, freeze: () => null }))
-      .toThrow('refusing to replace a foreign release branch');
-    const adopted = cutReleaseBranchForRun(root, '0.2.4', { runId: 'new-run-after-gate-failure', adoptFailedRunId: 'prior-cut-run', root, freeze: () => null });
-    expect(adopted).toMatchObject({ outcome: 'ok', version: '0.2.4', commit: tip, branch: 'release/0.2.4', existing: true,
-      artifactOwner: { runId: 'new-run-after-gate-failure' }, branchAdoption: { fromRunId: 'prior-cut-run', toRunId: 'new-run-after-gate-failure',
-        version: '0.2.4', cutCommit: cut, branchTip: tip } });
-    expect(adopted.branchAdoption?.event).toBe('release-branch-adopted');
-    expect(existsSync(join(root, 'release/0.2.4/branch-adoptions'))).toBe(false);
+    expect(cutReleaseBranchForRun(root, '0.2.4', { runId: 'new-run-after-gate-failure', root, freeze: () => null }))
+      .toMatchObject({ outcome: 'ok', version: '0.2.4', commit: cut, branch: 'release/0.2.4', existing: true });
   } finally {
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
     if (previousRoot === undefined) delete process.env.VERSION_NODE_TEST_ROOT; else process.env.VERSION_NODE_TEST_ROOT = previousRoot;
@@ -347,136 +340,11 @@ test('incident 0306: a live foreign run does not lend its cut to a replacement r
   process.env.PATH = `${join(root, 'bin')}:${previousPath}`;
   process.env.VERSION_NODE_TEST_ROOT = root;
   try {
-    expect(() => cutReleaseBranchForRun(root, '0.2.4', { runId: 'replacement-run', adoptFailedRunId: 'live-cut-run', root, freeze: () => null }))
-      .toThrow('not a failed release/0.2.4 branch-cut run');
-  } finally {
-    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
-    if (previousRoot === undefined) delete process.env.VERSION_NODE_TEST_ROOT; else process.env.VERSION_NODE_TEST_ROOT = previousRoot;
-  }
-});
-
-test('RELEASE-BRANCH-ADOPT: a same-tip run ledger cannot bypass a foreign live owner', () => {
-  const { root } = fixture('0.2.4-dev.0');
-  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
-  const tip = 'e'.repeat(40);
-  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, branchTip: tip, branchOwner: 'foreign-live-run', chosen: tip,
-    chosenVersion: '0.2.4', onMain: false }));
-  const path = join(root, 'graph-runs', 'release-loop', 'current-run.json');
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify({ graphId: 'release-loop', runId: 'current-run', status: 'running',
-    input: { version: '0.2.4', branchCut: true }, nodes: [{ nodeId: 'version-release', ok: true,
-      output: JSON.stringify({ outcome: 'ok', version: '0.2.4', commit: tip, branch: 'release/0.2.4' }) }] }));
-  const previousPath = process.env.PATH;
-  const previousRoot = process.env.VERSION_NODE_TEST_ROOT;
-  process.env.PATH = `${join(root, 'bin')}:${previousPath}`;
-  process.env.VERSION_NODE_TEST_ROOT = root;
-  try {
-    expect(() => cutReleaseBranchForRun(root, '0.2.4', { runId: 'current-run', root, freeze: () => null }))
+    expect(() => cutReleaseBranchForRun(root, '0.2.4', { runId: 'replacement-run', root, freeze: () => null }))
       .toThrow('refusing to replace a foreign release branch');
   } finally {
     if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
     if (previousRoot === undefined) delete process.env.VERSION_NODE_TEST_ROOT; else process.env.VERSION_NODE_TEST_ROOT = previousRoot;
-  }
-});
-
-test('RELEASE-BRANCH-ADOPT: transfer is one-time and its event is the successful node receipt', () => {
-  const { root } = fixture('0.2.4-dev.0');
-  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
-  const cut = 'a'.repeat(40);
-  const tip = 'd'.repeat(40);
-  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, branchTip: tip, branchOwner: 'prior-cut-run', branchAttempt: 7, chosen: tip,
-    chosenVersion: '0.2.4', onMain: false, ancestor: { [`--is-ancestor ${cut} ${tip}`]: true } }));
-  const ledgerDir = join(root, 'graph-runs', 'release-loop');
-  mkdirSync(ledgerDir, { recursive: true });
-  writeFileSync(join(ledgerDir, 'prior-cut-run.json'), JSON.stringify({ graphId: 'release-loop', runId: 'prior-cut-run', status: 'failed',
-    input: { version: '0.2.4', branchCut: true }, nodes: [{ nodeId: 'version-release', ok: true,
-      output: JSON.stringify({ outcome: 'ok', version: '0.2.4', commit: cut, branch: 'release/0.2.4' }) }] }));
-  const previousPath = process.env.PATH;
-  const previousRoot = process.env.VERSION_NODE_TEST_ROOT;
-  process.env.PATH = `${join(root, 'bin')}:${previousPath}`;
-  process.env.VERSION_NODE_TEST_ROOT = root;
-  try {
-    const adopted = cutReleaseBranchForRun(root, '0.2.4', { runId: 'new-run', adoptFailedRunId: 'prior-cut-run', root, freeze: () => null });
-    expect(adopted).toMatchObject({ artifactOwner: { runId: 'new-run' }, branchAdoption: {
-      event: 'release-branch-adopted', fromRunId: 'prior-cut-run', toRunId: 'new-run', version: '0.2.4', cutCommit: cut, branchTip: tip,
-    } });
-    expect(existsSync(join(root, 'release/0.2.4/branch-adoptions'))).toBe(false);
-    const savedOutput = JSON.stringify({ ...adopted });
-    writeFileSync(join(ledgerDir, 'new-run.json'), JSON.stringify({ graphId: 'release-loop', runId: 'new-run', status: 'failed',
-      input: { version: '0.2.4', branchCut: true }, nodes: [{ nodeId: 'version-release', ok: true, output: savedOutput }] }));
-    const attemptsDir = join(root, 'release', '0.2.4', 'resume-attempts');
-    mkdirSync(attemptsDir, { recursive: true });
-    writeFileSync(join(attemptsDir, 'new-run.json'), JSON.stringify({ version: '0.2.4', runId: 'new-run',
-      attempts: ['2026-11-10T00:00:00Z', '2026-11-10T00:01:00Z'] }));
-    const resumedAdoption = cutReleaseBranchForRun(root, '0.2.4', { runId: 'new-run', root, freeze: () => null });
-    expect(resumedAdoption).toMatchObject({ artifactOwner: { runId: 'new-run', attempt: 7 }, branchAdoption: adopted.branchAdoption });
-    expect(() => cutReleaseBranchForRun(root, '0.2.4', { runId: 'prior-cut-run', root, freeze: () => null }))
-      .toThrow('was already adopted by new-run');
-    expect(() => cutReleaseBranchForRun(root, '0.2.4', { runId: 'replacement-run', adoptFailedRunId: 'prior-cut-run', root, freeze: () => null }))
-      .toThrow('was already adopted by new-run');
-    expect(() => cutReleaseBranchForRun(root, '0.2.4', { runId: 'third-run', adoptFailedRunId: 'new-run', root, freeze: () => null }))
-      .toThrow('was already adopted by new-run');
-  } finally {
-    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
-    if (previousRoot === undefined) delete process.env.VERSION_NODE_TEST_ROOT; else process.env.VERSION_NODE_TEST_ROOT = previousRoot;
-  }
-});
-
-test('RELEASE-BRANCH-ADOPT: a successful own cut ledger resumes even without an owner trailer', () => {
-  const { root } = fixture('0.2.4-dev.0');
-  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
-  const tip = 'f'.repeat(40);
-  delete state.branchOwner;
-  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, branchTip: tip, chosen: tip, chosenVersion: '0.2.4', onMain: false }));
-  const ledger = join(root, 'graph-runs', 'release-loop', 'legacy-owner.json');
-  mkdirSync(dirname(ledger), { recursive: true });
-  writeFileSync(ledger, JSON.stringify({ graphId: 'release-loop', runId: 'legacy-owner', status: 'failed',
-    input: { version: '0.2.4', branchCut: true }, nodes: [{ nodeId: 'version-release', ok: true,
-      output: JSON.stringify({ outcome: 'ok', version: '0.2.4', commit: tip, branch: 'release/0.2.4' }) }] }));
-  const previousPath = process.env.PATH;
-  const previousRoot = process.env.VERSION_NODE_TEST_ROOT;
-  process.env.PATH = `${join(root, 'bin')}:${previousPath}`;
-  process.env.VERSION_NODE_TEST_ROOT = root;
-  try {
-    expect(cutReleaseBranchForRun(root, '0.2.4', { runId: 'legacy-owner', root, freeze: () => null }))
-      .toMatchObject({ outcome: 'ok', commit: tip, artifactOwner: { runId: 'legacy-owner', attempt: 0 } });
-  } finally {
-    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
-    if (previousRoot === undefined) delete process.env.VERSION_NODE_TEST_ROOT; else process.env.VERSION_NODE_TEST_ROOT = previousRoot;
-  }
-});
-
-test('RELEASE-BRANCH-ADOPT: failed image prebuild leaves no event so the same run can retry', () => {
-  const { root } = fixture('0.2.4-dev.0');
-  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
-  const cut = 'a'.repeat(40);
-  const tip = 'd'.repeat(40);
-  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, branchTip: tip, branchOwner: 'prior-cut-run', chosen: tip,
-    chosenVersion: '0.2.4', onMain: false, ancestor: { [`--is-ancestor ${cut} ${tip}`]: true } }));
-  const priorRun = join(root, 'graph-runs', 'release-loop', 'prior-cut-run.json');
-  mkdirSync(dirname(priorRun), { recursive: true });
-  writeFileSync(priorRun, JSON.stringify({ graphId: 'release-loop', runId: 'prior-cut-run', status: 'failed',
-    input: { version: '0.2.4', branchCut: true }, nodes: [{ nodeId: 'version-release', ok: true,
-      output: JSON.stringify({ outcome: 'ok', version: '0.2.4', commit: cut, branch: 'release/0.2.4' }) }] }));
-  const previous = { path: process.env.PATH, context: process.env.ELANOUS_GRAPH_CONTEXT, state: process.env.ELANOUS_STATE_DIR,
-    fakeRoot: process.env.VERSION_NODE_TEST_ROOT };
-  process.env.PATH = `${join(root, 'bin')}:${previous.path}`;
-  process.env.ELANOUS_STATE_DIR = root;
-  process.env.VERSION_NODE_TEST_ROOT = root;
-  process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ runId: 'retry-run', input: { version: '0.2.4', branchCut: true,
-    adoptFailedRunId: 'prior-cut-run', gateExecutor: 'pod', gateImagePin: 'cut-commit', gatePodPool: 'preview-pool' }, outputs: {} });
-  try {
-    const failed = versionNodeMain(['release', '--json'], root, { prebuildGateImage: () => ({ outcome: 'failed', reason: 'simulated prebuild failure' }) });
-    expect(failed).toMatchObject({ outcome: 'error', error: 'cut gate image prebuild failed: simulated prebuild failure' });
-    expect(existsSync(join(root, 'graph-runs', 'release-loop', 'retry-run.json'))).toBe(false);
-    const retried = versionNodeMain(['release', '--json'], root, { prebuildGateImage: (input) => ({ outcome: 'built', runId: input.runId,
-      cutCommit: input.commit, digest: `sha256:${'c'.repeat(64)}`, eligiblePools: ['preview-pool'] }) });
-    expect(retried).toMatchObject({ outcome: 'ok', branchAdoption: { event: 'release-branch-adopted', fromRunId: 'prior-cut-run', toRunId: 'retry-run' } });
-  } finally {
-    if (previous.path === undefined) delete process.env.PATH; else process.env.PATH = previous.path;
-    if (previous.context === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = previous.context;
-    if (previous.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous.state;
-    if (previous.fakeRoot === undefined) delete process.env.VERSION_NODE_TEST_ROOT; else process.env.VERSION_NODE_TEST_ROOT = previous.fakeRoot;
   }
 });
 

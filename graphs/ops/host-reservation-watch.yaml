@@ -1,0 +1,18 @@
+graph_id: host-reservation-watch
+loop:
+  title: Host reservation watch
+  description: Shadow observation of seat processes on a release gate reserved host; emit an incident and notify the seat without stopping work
+  owner: K-EAST
+  trigger:
+    cron: '*/5 * * * *' # // Source: LOOP-HOST-RESERVATION-WATCH assignment specifies a five-minute tick.
+    events: [manual]
+version: 1
+entry_node: shadow
+terminal_nodes: [done, partial, failed]
+nodes:
+  - { node_id: shadow, kind: agent, recipe: 'cmd:host-reservation-watch-shadow', max_visits: 1 }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: partial, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: shadow, on: outcome, map: { ok: done, partial: partial, fail: failed, error: failed } }

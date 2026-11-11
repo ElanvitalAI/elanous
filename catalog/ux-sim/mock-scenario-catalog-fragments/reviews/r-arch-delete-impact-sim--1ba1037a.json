@@ -1,0 +1,4 @@
+{
+  "deviceKey": "r-arch-delete-impact-sim",
+  "review": "# 📅 2026-11-10 재검토 (R-ARCH · DELETE-IMPACT-SIM) — sim-impact의 역 import 그래프와 test-census의 JUnit 목록을 재사용하는 가상 삭제 장치를 등록했다. 가짜 검사 결과와 30일 로그가 빠지면 삭제 안전 판정을 내리지 않으며 실제 파일 삭제·운영 호출은 없다."
+}

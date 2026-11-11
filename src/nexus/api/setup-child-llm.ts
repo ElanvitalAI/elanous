@@ -9,7 +9,7 @@ import { asRecord } from '../../primitives/guards.js';
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { debug } from '../../debug/log.js';
-import { DASHBOARD_PROVIDER_SETUP_OPTIONS } from '../../dashboard/setup-inline.js';
+import { DASHBOARD_PROVIDER_SETUP_OPTIONS } from '../../setup/provider-options.js';
 import { resolveChildLlmPreference, type ResolvedChildLlmPreference } from '../../self-implement/child-llm-preference.js';
 import { getUserConfig, parseChildLlmPreference, parseHarnessBudgetGate, reloadUserConfig, userConfigPath } from '../../user-config.js';
 import type { ChildLlmPreferenceConfig, HarnessBudgetGateConfig } from '../../user-config/types.js';

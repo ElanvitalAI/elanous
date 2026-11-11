@@ -238,7 +238,10 @@ export interface PluginManifest {
   requires?: PluginDependency;
   dependencies?: {
     widgets?: string[];
-    plugins?: string[];
+    /** A string is a required id or id@semver-range; object form can mark a dependency optional. */
+    plugins?: Array<string | { id: string; version?: string; optional?: boolean; market?: string }>;
+    /** A package-relative uv project, or a distribution project for a bundled plugin. */
+    runtime?: Array<{ kind: 'uv-python'; project: string; extras: string[]; browser?: 'chromium' }>;
   };
   source?: PluginSource;
   /** PX-6: opt-in multi-active flag. When true, plugin-host lets
@@ -1203,8 +1206,41 @@ function parseDependencies(value: unknown): PluginManifest['dependencies'] | und
   const raw = value as Record<string, unknown>;
   return {
     ...(raw.widgets !== undefined ? { widgets: stringArrayOr(raw.widgets, []) } : {}),
-    ...(raw.plugins !== undefined ? { plugins: stringArrayOr(raw.plugins, []) } : {}),
+    ...(raw.plugins !== undefined ? { plugins: parsePluginDependencies(raw.plugins) } : {}),
+    ...(raw.runtime !== undefined ? { runtime: parseRuntimeDependencies(raw.runtime) } : {}),
   };
+}
+
+function parseRuntimeDependencies(value: unknown): NonNullable<PluginManifest['dependencies']>['runtime'] {
+  if (!Array.isArray(value)) throw new Error('dependencies.runtime must be an array');
+  return value.map((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error(`dependencies.runtime[${index}] must be an object`);
+    const raw = item as Record<string, unknown>;
+    if (raw.kind !== 'uv-python') throw new Error(`dependencies.runtime[${index}].kind must be uv-python`);
+    const project = stringOr(raw.project);
+    if (project.startsWith('/') || project.split(/[\\/]/).some(part => part === '..' || part === '.') || project.includes('\0')) {
+      throw new Error(`dependencies.runtime[${index}].project is unsafe`);
+    }
+    const extras = stringArrayOr(raw.extras, []);
+    if (extras.some(extra => !/^[a-z0-9][a-z0-9-]*$/.test(extra))) throw new Error(`dependencies.runtime[${index}].extras is invalid`);
+    if (raw.browser !== undefined && raw.browser !== 'chromium') throw new Error(`dependencies.runtime[${index}].browser must be chromium`);
+    return { kind: 'uv-python' as const, project, extras, ...(raw.browser === 'chromium' ? { browser: 'chromium' as const } : {}) };
+  });
+}
+
+function parsePluginDependencies(value: unknown): NonNullable<PluginManifest['dependencies']>['plugins'] {
+  if (!Array.isArray(value)) throw new Error('dependencies.plugins must be an array');
+  return value.map((item, index) => {
+    if (typeof item === 'string') return stringOr(item);
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error(`dependencies.plugins[${index}] must be a string or object`);
+    const raw = item as Record<string, unknown>;
+    const id = stringOr(raw.id);
+    const version = raw.version === undefined ? undefined : stringOr(raw.version);
+    const market = raw.market === undefined ? undefined : stringOr(raw.market);
+    if (raw.optional !== undefined && typeof raw.optional !== 'boolean') throw new Error(`dependencies.plugins[${index}].optional must be boolean`);
+    return { id, ...(version ? { version } : {}), ...(market ? { market } : {}),
+      ...(raw.optional !== undefined ? { optional: raw.optional } : {}) };
+  });
 }
 
 function stringOr(value: unknown, fallback?: string): string {

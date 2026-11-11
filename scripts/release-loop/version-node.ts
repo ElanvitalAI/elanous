@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { SPAWN_SYNC_MAX_BUFFER } from '../../src/util/spawn-sync-output.js';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { emitNodeResult } from './node-verdict.js';
@@ -16,8 +16,7 @@ type Kind = 'release' | 'dev-bump';
 type Output = { outcome: 'ok' | 'error'; kind: Kind | null; version: string | null; commit: string | null; pr: number | null; files?: string[]; worktree?: string; error?: string;
   /** RELEASE-BRANCH: the release branch the cut lives on and the main commit it was cut from. */
   branch?: string; base?: string; existing?: boolean; skipped?: string;
-  artifactOwner?: { runId: string; attempt: number }; gateImagePrebuild?: CutGateImagePrebuildOutcome;
-  branchAdoption?: { event: 'release-branch-adopted'; fromRunId: string; toRunId: string; version: string; cutCommit: string; branchTip: string } };
+  artifactOwner?: { runId: string; attempt: number }; gateImagePrebuild?: CutGateImagePrebuildOutcome };
 
 export function nextDevVersion(version: string): string {
   const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(isReleaseVersion(version) ? baseVersion(version) : version);
@@ -158,8 +157,6 @@ export interface BranchCutDeps {
   baseCommit?: string;
   /** Release run ledger universe; defaults to the active instance root. */
   root?: string;
-  /** OP-approved transfer from a failed release run whose cut still contains the branch tip. */
-  adoptFailedRunId?: string;
 }
 
 function releaseOwner(version: string, deps: BranchCutDeps): { runId: string; attempt: number } | undefined {
@@ -198,62 +195,21 @@ function priorRunOwnsTip(version: string, tip: string, owner: { runId: string; a
   }) ?? false;
 }
 
-function failedRunCut(version: string, runId: string, root: string): string {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(runId) || runId === '.' || runId === '..') throw new Error(`invalid failed run id: ${runId}`);
-  const path = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
-  if (!existsSync(path)) throw new Error(`failed release run ledger missing: ${runId}`);
+/** A terminal prior run may lend its verified stable cut to a replacement run; a foreign or live run may not. */
+function completedRunOwnsTip(version: string, tip: string, owner: { runId: string }, root: string): boolean {
+  const path = join(root, 'graph-runs', 'release-loop', `${owner.runId}.json`);
+  if (!existsSync(path)) return false;
   const state = JSON.parse(readFileSync(path, 'utf8')) as { graphId?: unknown; runId?: unknown; status?: unknown;
     input?: { version?: unknown; branchCut?: unknown }; nodes?: Array<{ nodeId?: unknown; ok?: unknown; output?: unknown }> };
-  if (state.graphId !== 'release-loop' || state.runId !== runId || state.status !== 'failed'
-    || state.input?.version !== version || state.input?.branchCut !== true) throw new Error(`run ${runId} is not a failed release/${version} branch-cut run`);
-  const record = state.nodes?.find((node) => node.nodeId === 'version-release' && node.ok === true);
-  if (record && typeof record.output === 'string') {
-    let output: { version?: unknown; commit?: unknown; branch?: unknown };
-    try { output = JSON.parse(record.output.trim().split('\n').at(-1)!); }
-    catch { throw new Error(`failed run ${runId} has malformed version-release output`); }
-    if (output.version !== version || output.branch !== `release/${version}` || typeof output.commit !== 'string'
-      || !/^[0-9a-f]{40}$/i.test(output.commit)) throw new Error(`failed run ${runId} cut identity does not match release/${version}`);
-    return output.commit;
-  }
-  throw new Error(`failed run ${runId} has no successful version-release cut`);
-}
-
-function verifyCutAncestor(repo: string, cutCommit: string, tip: string): boolean {
-  if (cutCommit === tip) return true;
-  const result = spawnSync('git', ['merge-base', '--is-ancestor', cutCommit, tip], { cwd: repo, encoding: 'utf8', timeout: 10_000 });
-  if (result.error || (result.status !== 0 && result.status !== 1)) throw new Error(`git merge-base failed: ${result.error || result.stderr || 'unknown'}`);
-  return result.status === 0;
-}
-
-function readBranchAdoption(version: string, runId: string, root: string): NonNullable<Output['branchAdoption']> | undefined {
-  const path = join(root, 'graph-runs', 'release-loop', `${runId}.json`);
-  if (!existsSync(path)) return undefined;
-  const ledger = JSON.parse(readFileSync(path, 'utf8')) as { graphId?: unknown; runId?: unknown; input?: { version?: unknown; branchCut?: unknown };
-    nodes?: Array<{ nodeId?: unknown; ok?: unknown; output?: unknown }> };
-  if (ledger.graphId !== 'release-loop' || ledger.runId !== runId) throw new Error(`invalid release run ledger for branch adoption ${runId}`);
-  if (ledger.input?.version !== version || ledger.input?.branchCut !== true) return undefined;
-  const node = ledger.nodes?.find((candidate) => candidate.nodeId === 'version-release' && candidate.ok === true);
-  if (!node || typeof node.output !== 'string') return undefined;
-  let output: Output;
-  try { output = JSON.parse(node.output.trim().split('\n').at(-1)!); }
-  catch { throw new Error(`invalid version-release output for branch adoption ${runId}`); }
-  const saved = output.branchAdoption;
-  if (!saved) return undefined;
-  if (saved.event !== 'release-branch-adopted' || saved.version !== version || saved.toRunId !== runId
-    || typeof saved.fromRunId !== 'string' || typeof saved.cutCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(saved.cutCommit)
-    || typeof saved.branchTip !== 'string' || !/^[0-9a-f]{40}$/i.test(saved.branchTip))
-    throw new Error(`invalid branch adoption event for ${runId}`);
-  return saved;
-}
-
-function branchAdoptions(version: string, root: string): NonNullable<Output['branchAdoption']>[] {
-  const dir = join(root, 'graph-runs', 'release-loop');
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir).filter((name) => name.endsWith('.json')).flatMap((name) => {
-    const runId = name.slice(0, -5);
-    const event = readBranchAdoption(version, runId, root);
-    return event ? [event] : [];
-  });
+  if (state.graphId !== 'release-loop' || state.runId !== owner.runId || (state.status !== 'done' && state.status !== 'failed')
+    || state.input?.version !== version || state.input?.branchCut !== true) return false;
+  return state.nodes?.some((node) => {
+    if (node.nodeId !== 'version-release' || node.ok !== true || typeof node.output !== 'string') return false;
+    try {
+      const result = JSON.parse(node.output.trim().split('\n').at(-1)!) as { commit?: unknown; branch?: unknown };
+      return result.commit === tip && result.branch === `release/${version}`;
+    } catch { return false; }
+  }) ?? false;
 }
 
 function preserveForeignBranch(repo: string, version: string, tip: string): string {
@@ -316,33 +272,11 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
     const tip = git(repo, 'rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`);
     if (tip !== advertised) throw new Error(`${branch} moved while it was read (${advertised} → ${tip})`);
     const recordedOwner = owner ? recordedBranchOwner(repo, tip) : undefined;
-    const root = deps.root ?? effectiveInstanceRoot();
-    const ledgerOwnsTip = owner ? priorRunOwnsTip(version, tip, owner, root) : false;
-    const adoptions = branchAdoptions(version, root);
-    const savedOwnerAdoption = owner ? readBranchAdoption(version, owner.runId, root) : undefined;
-    const adoptionOwnsTip = !!owner && !!savedOwnerAdoption && (!recordedOwner || savedOwnerAdoption.fromRunId === recordedOwner.runId)
-      && adoptions.length === 1 && verifyCutAncestor(repo, savedOwnerAdoption.branchTip, tip);
-    const ledgerOwned = !!owner && ((ledgerOwnsTip && adoptions.length === 0 && (!recordedOwner || recordedOwner.runId === owner.runId))
-      || adoptionOwnsTip);
-    if (owner && adoptions.length > 0 && !adoptionOwnsTip)
-      throw new Error(`${branch} was already adopted by ${adoptions.map((event) => event.toRunId).join(', ')}`);
-    let branchAdoption: Output['branchAdoption'] = adoptionOwnsTip ? savedOwnerAdoption : undefined;
-    if (deps.adoptFailedRunId && ledgerOwned && owner) {
-      const savedAdoption = readBranchAdoption(version, owner.runId, root);
-      if (!savedAdoption || savedAdoption.fromRunId !== deps.adoptFailedRunId)
-        throw new Error(`release/${version} is not adopted from ${deps.adoptFailedRunId}`);
-    }
-    if (owner && !ledgerOwned && deps.adoptFailedRunId) {
-      if (!recordedOwner) throw new Error(`release/${version} has no verifiable branch owner`);
-      if (adoptions.length) throw new Error(`release/${version} was already adopted by ${adoptions.map((event) => event.toRunId).join(', ')}`);
-      if (deps.adoptFailedRunId !== recordedOwner.runId)
-        throw new Error(`--adopt-failed-run must name the recorded original owner ${recordedOwner.runId}`);
-      const cutCommit = failedRunCut(version, deps.adoptFailedRunId, root);
-      if (!verifyCutAncestor(repo, cutCommit, tip)) throw new Error(`release/${version} tip ${tip} is not a descendant of failed run ${deps.adoptFailedRunId} cut ${cutCommit}`);
-      branchAdoption = { event: 'release-branch-adopted', fromRunId: deps.adoptFailedRunId, toRunId: owner.runId, version, cutCommit, branchTip: tip };
-    }
-    if (deps.adoptFailedRunId && !branchAdoption && !ledgerOwned) throw new Error(`--adopt-failed-run ${deps.adoptFailedRunId} did not adopt release/${version}`);
-    if (owner && recordedOwner?.runId !== owner.runId && !ledgerOwned && !branchAdoption) {
+    const ledgerOwned = owner && !recordedOwner
+      ? priorRunOwnsTip(version, tip, owner, deps.root ?? effectiveInstanceRoot()) : false;
+    const completedPriorCut = owner && recordedOwner && recordedOwner.runId !== owner.runId && prereleaseKind(version) === null
+      ? completedRunOwnsTip(version, tip, recordedOwner, deps.root ?? effectiveInstanceRoot()) : false;
+    if (owner && recordedOwner?.runId !== owner.runId && !ledgerOwned && !completedPriorCut) {
       const backupBranch = preserveForeignBranch(repo, version, tip);
       throw new Error(`${branch} belongs to ${recordedOwner?.runId ?? 'an unknown run'}; preserved ${tip} at ${backupBranch}; refusing to replace a foreign release branch`);
     }
@@ -374,12 +308,10 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
       throw new Error(`${branch} forks from main at ${fork} (version ${forkVersion}) — not a cut of ${stableLine}-dev.N`);
     }
     // A legacy saved version-release node was the initial cut; later resume counts do not change its owner attempt.
-    const artifactOwner = ledgerOwned && owner ? { runId: owner.runId, attempt: recordedOwner?.attempt ?? 0 } : branchAdoption && owner ? owner : recordedOwner;
+    const artifactOwner = recordedOwner ?? (ledgerOwned && owner ? { runId: owner.runId, attempt: 0 } : undefined);
     debug.log('release-loop.cut', 'chosen', { version, source: 'release-branch', commit: tip, branch, existing: true, artifactOwner });
-    return { outcome: 'ok', kind: 'release', version, commit: tip, pr: null, branch, existing: true,
-      ...(artifactOwner ? { artifactOwner } : {}), ...(branchAdoption ? { branchAdoption } : {}) };
+    return { outcome: 'ok', kind: 'release', version, commit: tip, pr: null, branch, existing: true, ...(artifactOwner ? { artifactOwner } : {}) };
   }
-  if (deps.adoptFailedRunId) throw new Error(`--adopt-failed-run requires an existing release/${version} branch`);
   const base = deps.baseCommit === undefined ? git(repo, 'rev-parse', 'origin/main') : git(repo, 'rev-parse', '--verify', `${deps.baseCommit}^{commit}`);
   const current = versionAt(repo, base);
   const stable = baseVersion(version);
@@ -419,8 +351,8 @@ export function cutReleaseBranchForRun(repo: string, version: string, deps: Bran
   }
 }
 
-function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false, branchCut = false, devTarget?: string, runId?: string, branchCutBaseCommit?: string, adoptFailedRunId?: string): Output {
-  if (kind === 'release' && branchCut && cutCommit === undefined) return cutReleaseBranchForRun(repo, releaseVersion, { forceFreeze, runId, adoptFailedRunId, ...(branchCutBaseCommit ? { baseCommit: branchCutBaseCommit } : {}) });
+function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string, forceFreeze = false, branchCut = false, devTarget?: string, runId?: string, branchCutBaseCommit?: string): Output {
+  if (kind === 'release' && branchCut && cutCommit === undefined) return cutReleaseBranchForRun(repo, releaseVersion, { forceFreeze, runId, ...(branchCutBaseCommit ? { baseCommit: branchCutBaseCommit } : {}) });
   if (kind === 'dev-bump' && prereleaseKind(releaseVersion) !== null) {
     // A prerelease (rehearsal) never moves main: the next stable release still owns this -dev line.
     debug.log('release-loop.version-dev-bump', 'skipped', { version: releaseVersion, reason: 'prerelease' });
@@ -591,7 +523,6 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
   let branchCut = false;
   let branchCutBaseCommit: string | undefined;
   let runId: string | undefined;
-  let adoptFailedRunId: string | undefined;
   let gatePodPool: string | undefined;
   let gateExecutor: string | undefined;
   let gateImagePin: string | undefined;
@@ -619,7 +550,7 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
       const location = process.env.ELANOUS_GRAPH_CONTEXT;
       const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as {
         runId?: unknown; input?: { version?: unknown; cutCommit?: unknown; forceFreeze?: unknown; branchCut?: unknown;
-          branchCutBaseCommit?: unknown; gatePodPool?: unknown; gateExecutor?: unknown; gateImagePin?: unknown; adoptFailedRunId?: unknown };
+          branchCutBaseCommit?: unknown; gatePodPool?: unknown; gateExecutor?: unknown; gateImagePin?: unknown };
         outputs?: Record<string, { outcome?: unknown; commit?: unknown; base?: unknown; branch?: unknown } | undefined> };
       if (context.runId !== undefined) {
         if (typeof context.runId !== 'string') throw new Error('runId must be a string');
@@ -629,10 +560,6 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
       if (typeof context.input?.gatePodPool === 'string') gatePodPool = context.input.gatePodPool;
       if (typeof context.input?.gateExecutor === 'string') gateExecutor = context.input.gateExecutor;
       if (typeof context.input?.gateImagePin === 'string') gateImagePin = context.input.gateImagePin;
-      if (context.input?.adoptFailedRunId !== undefined) {
-        if (typeof context.input.adoptFailedRunId !== 'string') throw new Error('adoptFailedRunId must be a string');
-        adoptFailedRunId = context.input.adoptFailedRunId;
-      }
       forceFreeze = context.input?.forceFreeze === true;
       if (context.input?.branchCutBaseCommit !== undefined) {
         if (typeof context.input.branchCutBaseCommit !== 'string' || !/^[0-9a-f]{40}$/i.test(context.input.branchCutBaseCommit))
@@ -680,7 +607,7 @@ export function main(args: string[] = process.argv.slice(2), repo = process.cwd(
         ...(gateImagePrebuild ? { gateImagePrebuild } : {}), ...(dryRun ? { skipped: 'dry-run' } : {}) };
     }
     if (kind === 'dev-bump' && cutCommit !== undefined) throw new Error('--cut-commit is only valid for release');
-    const output = landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze, branchCut, undefined, runId, branchCutBaseCommit, adoptFailedRunId);
+    const output = landing(resolve(repo), kind, version, cut, cutCommit, forceFreeze, branchCut, undefined, runId, branchCutBaseCommit);
     const gateImagePrebuild = kind === 'release' && branchCut ? prebuildGateImage(output.commit) : undefined;
     return gateImagePrebuild ? { ...output, gateImagePrebuild } : output;
   } catch (error) {

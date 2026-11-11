@@ -51,6 +51,7 @@ type TrackedAnswer = {
 const TRACKED_ANSWERS: readonly TrackedAnswer[] = [
   { section: 'llm', field: 'provider', label: 'llm.provider' },
   { section: 'llm', field: 'apiKey', label: 'llm.apiKey' },
+  { section: 'llm', field: 'model', label: 'llm.model' },
   { section: 'skills', field: 'activeSet', label: 'skills.activeSet' },
   { section: 'obsidian', field: 'vault', label: 'obsidian.vault' },
   { section: 'telegram', field: 'enabled', label: 'telegram.enabled' },

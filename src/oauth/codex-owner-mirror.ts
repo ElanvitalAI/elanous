@@ -1,12 +1,13 @@
 import { hostname } from 'node:os';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config/reader.js';
-import { CODEX_CREDENTIAL_OWNER_HOST, CODEX_CREDENTIAL_SLOT, normalizeCredentialHost, readCredentialOwner, recordCredentialMirror, type CredentialOwnerRecord } from '../nexus/config/secrets/cred-owner.js';
+import { CODEX_CREDENTIAL_SLOT, credentialOwnerLedgerPath, normalizeCredentialHost, readCredentialOwner, recordCredentialMirror, resolveCodexCredentialOwnerHost, type CredentialOwnerRecord } from '../nexus/config/secrets/cred-owner.js';
 import { loadTokens, type ProviderAuthState } from './store.js';
+import { decodeJWTPayload } from './jwt.js';
 
 export const CODEX_OWNER_MIRROR_RELATIVE_PATH = join('remote-parent-credentials', 'cli-mirror', 'auth.json');
 export const CODEX_OWNER_MIRROR_REQUIRED = 'Codex owner access mirror rejected â€” inspect llm.codex/owner-mirror-rejected for the precise reason';
@@ -14,13 +15,16 @@ export const CODEX_OWNER_MIRROR_REQUIRED = 'Codex owner access mirror rejected â
 export function codexOwnerMirrorAuthPath(): string {
   const stateRoot = elanousStateRoot();
   const derivedPath = join(stateRoot, CODEX_OWNER_MIRROR_RELATIVE_PATH);
-  const configuredPath = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1'
+  const accessOnly = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY === '1';
+  const explicitCodexHome = accessOnly ? process.env.CODEX_HOME?.trim() : undefined;
+  const codexHomePath = explicitCodexHome ? join(resolve(explicitCodexHome), 'auth.json') : undefined;
+  const configuredPath = accessOnly
     ? process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH?.trim()
     : undefined;
-  const path = configuredPath && isAbsolute(configuredPath) ? configuredPath : derivedPath;
+  const path = codexHomePath ?? (configuredPath && isAbsolute(configuredPath) ? configuredPath : derivedPath);
   try {
     debug.log('llm.codex', 'owner-mirror-path-compared', {
-      source: path === derivedPath ? 'state-root' : 'remote-explicit',
+      source: path === codexHomePath ? 'codex-home' : path === derivedPath ? 'state-root' : 'remote-explicit',
       stateRootSha256: rootFingerprint(stateRoot),
       derivedMirrorRootSha256: rootFingerprint(dirname(dirname(dirname(derivedPath)))),
       resolvedMirrorRootSha256: rootFingerprint(dirname(dirname(dirname(path)))),
@@ -34,12 +38,13 @@ function rootFingerprint(root: string): string {
   return createHash('sha256').update(root).digest('hex').slice(0, 16);
 }
 
-/** The HQ-configured machine identity is the stable short name used by the lease. */
+/** The HQ-configured machine identity is compared to the configured fleet owner. */
 export function isCodexTokenOwnerHost(config = getUserConfig(), machine = hostname()): boolean {
   try {
-    const owner = normalizeCredentialHost(config.llm.codexTokenOwnerHost || CODEX_CREDENTIAL_OWNER_HOST);
+    const owner = resolveCodexCredentialOwnerHost(config);
+    if (!owner) return false;
     const local = normalizeCredentialHost(config.hq?.hostName || machine);
-    return owner === CODEX_CREDENTIAL_OWNER_HOST && local === owner;
+    return local === owner;
   } catch { return false; }
 }
 
@@ -49,12 +54,14 @@ export function deliverCodexMirrorAndRecord(
   deliver: () => void,
   options: { readonly config?: ReturnType<typeof getUserConfig>; readonly machine?: string; readonly ledgerPath?: string } = {},
 ): CredentialOwnerRecord {
-  if (!isCodexTokenOwnerHost(options.config ?? getUserConfig(), options.machine ?? hostname()))
-    throw new Error('Codex owner host must be mbp');
+  const config = options.config ?? getUserConfig();
+  const ledgerPath = options.ledgerPath ?? credentialOwnerLedgerPath();
+  const ownerHost = resolveCodexCredentialOwnerHost(config);
+  if (!ownerHost || !isCodexTokenOwnerHost(config, options.machine ?? hostname()))
+    throw new Error('Codex mirror push requires the configured or leased owner host');
   const mirrorHost = normalizeCredentialHost(targetHost);
-  if (mirrorHost === CODEX_CREDENTIAL_OWNER_HOST) throw new Error('credential owner cannot be a mirror');
-  const previous = readCredentialOwner(CODEX_CREDENTIAL_SLOT, options.ledgerPath);
-  if (previous && previous.ownerHost !== CODEX_CREDENTIAL_OWNER_HOST) throw new Error('Codex owner host must be mbp');
+  if (mirrorHost === ownerHost) throw new Error('credential owner cannot be a mirror');
+  readCredentialOwner(CODEX_CREDENTIAL_SLOT, ledgerPath); // Parse the local receipt before side effects; it is not the owner authority.
   try { deliver(); }
   catch (error) {
     const candidate = error as { code?: unknown; rc?: unknown } | null;
@@ -64,7 +71,7 @@ export function deliverCodexMirrorAndRecord(
       ? Number(candidate?.rc) : undefined; // Source: SSH process exit status is an unsigned byte; never include raw error text.
     throw new Error(`CODEX_MIRROR_DELIVERY_FAILED (reason=${safeCode ?? 'unknown'}${safeRc === undefined ? '' : `; rc=${safeRc}`})`);
   }
-  return recordCredentialMirror({ slot: CODEX_CREDENTIAL_SLOT, ownerHost: CODEX_CREDENTIAL_OWNER_HOST, mirrorHost }, options.ledgerPath);
+  return recordCredentialMirror({ slot: CODEX_CREDENTIAL_SLOT, ownerHost, mirrorHost }, ledgerPath);
 }
 
 /** Account discovery and rotation must read the same remote snapshot as execution. */
@@ -85,15 +92,16 @@ export function readCodexOwnerAccessMirror(
   const path = opts.path ?? codexOwnerMirrorAuthPath();
   const now = opts.now ?? Date.now();
   let state: ProviderAuthState | null = null;
+  let parsed: unknown;
   let readFailure: 'missing-file' | 'read-error' | 'invalid-json' | undefined;
   try {
     const raw = readFileSync(path, 'utf8');
-    try { JSON.parse(raw); } catch { readFailure = 'invalid-json'; }
+    try { parsed = JSON.parse(raw); } catch { readFailure = 'invalid-json'; }
   } catch (error) {
     readFailure = (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing-file' : 'read-error';
   }
   if (!readFailure) {
-    try { state = loadTokens(storeKey, path); } catch { /* classify safely below */ }
+    try { state = loadTokens(storeKey, path) ?? codexHomeAccessState(parsed); } catch { /* classify safely below */ }
   }
   const tokenFields = state?.tokens as (ProviderAuthState['tokens'] & { refresh_token?: unknown }) | undefined;
   const expiresAt = state?.tokens.expiresAt;
@@ -110,6 +118,31 @@ export function readCodexOwnerAccessMirror(
     throw new Error(`${CODEX_OWNER_MIRROR_REQUIRED} (reason=${reason}; storeKey=${storeKey}; rootSha256=${rootFingerprint(root)})`);
   }
   return state!;
+}
+
+/** Convert the Codex CLI's native access-only mirror into the shared provider shape. */
+function codexHomeAccessState(value: unknown): ProviderAuthState | null {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as { auth_mode?: unknown; last_refresh?: unknown; tokens?: Record<string, unknown> };
+  const tokens = record.tokens;
+  if (record.auth_mode !== 'chatgpt' || !tokens || typeof tokens.access_token !== 'string'
+      || typeof tokens.refresh_token !== 'string') return null;
+  const expiresAt = decodeJWTPayload(tokens.access_token)?.exp;
+  if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) return null;
+  const normalizedTokens = {
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    refresh_token: tokens.refresh_token,
+    expiresAt: expiresAt * 1000,
+    tokenType: 'Bearer',
+  } as ProviderAuthState['tokens'] & { refresh_token?: string };
+  return {
+    source: 'mirror',
+    authMode: 'chatgpt',
+    lastRefresh: typeof record.last_refresh === 'string' ? record.last_refresh : '',
+    ...(typeof tokens.account_id === 'string' ? { accountUuid: tokens.account_id } : {}),
+    tokens: normalizedTokens,
+  };
 }
 
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { asRecord } from '../../src/primitives/guards.js';
 /** 힐 판 역할 하나 — ELANOUS_GRAPH_CONTEXT 를 읽고 마지막 줄에 {outcome, …} JSON 을 낸다. */
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -37,14 +38,14 @@ function readContext(): GraphContext {
   }
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+function recordOrUndefined(value: unknown): Record<string, unknown> | undefined {
+  return asRecord(value, { fallback: 'undefined' });
 }
 
 function citationsOf(value: unknown): HealCitation[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item) => {
-    const record = asRecord(item);
+    const record = recordOrUndefined(item);
     return typeof record?.title === 'string' && typeof record.url === 'string' && record.url.trim()
       && typeof record.snippet === 'string'
       ? [{ title: record.title, url: record.url, snippet: record.snippet }]
@@ -85,8 +86,8 @@ function materializedFacts(entries: readonly RunLedgerEntry[]): Record<string, u
 }
 
 function failureOf(ctx: GraphContext): HealFailureSignature {
-  const input = asRecord(ctx.input);
-  const raw = asRecord(input?.failure) ?? input ?? {};
+  const input = recordOrUndefined(ctx.input);
+  const raw = recordOrUndefined(input?.failure) ?? input ?? {};
   const unverified = Array.isArray(raw.unverified) ? raw.unverified.filter((item): item is string => typeof item === 'string') : [];
   const citations = citationsOf(raw.citations);
   return {
@@ -113,24 +114,24 @@ function historyOf(ctx: GraphContext): HealTriageHistory {
 }
 
 function accountCount(failure: Record<string, unknown>): number | undefined {
-  const evidence = asRecord(failure.environmentEvidence);
+  const evidence = recordOrUndefined(failure.environmentEvidence);
   const count = evidence?.accountCount ?? failure.accountCount;
   return typeof count === 'number' ? count : undefined;
 }
 
 function exitCode(failure: Record<string, unknown>): number | undefined {
-  const evidence = asRecord(failure.environmentEvidence);
+  const evidence = recordOrUndefined(failure.environmentEvidence);
   const code = evidence?.exitCode ?? failure.exitCode;
   return typeof code === 'number' ? code : undefined;
 }
 
 function credentialMissing(failure: Record<string, unknown>): boolean {
-  const evidence = asRecord(failure.environmentEvidence);
+  const evidence = recordOrUndefined(failure.environmentEvidence);
   return evidence?.credentialFile === 'missing' || failure.credentialFile === 'missing';
 }
 
 function accountsFullOrExpired(failure: Record<string, unknown>): boolean {
-  const evidence = asRecord(failure.environmentEvidence);
+  const evidence = recordOrUndefined(failure.environmentEvidence);
   return evidence?.accounts === 'full' || evidence?.accounts === 'expired'
     || failure.accounts === 'full' || failure.accounts === 'expired';
 }
@@ -158,7 +159,7 @@ function defaultExists(worktree: string): (path: string) => PathExists {
 }
 
 function signatureFromUnknown(value: unknown): HealFailureSignature | undefined {
-  const raw = asRecord(value);
+  const raw = recordOrUndefined(value);
   if (!raw) return undefined;
   const unverified = Array.isArray(raw.unverified) ? raw.unverified.filter((item): item is string => typeof item === 'string') : undefined;
   const citations = citationsOf(raw.citations);
@@ -186,9 +187,9 @@ function outputRecord(outputs: Record<string, unknown> | undefined, nodeId: stri
   const raw = outputs?.[nodeId];
   if (typeof raw === 'string') {
     const line = raw.split('\n').map((row) => row.trim()).filter(Boolean).at(-1);
-    return line?.startsWith('{') ? asRecord(JSON.parse(line) as unknown) : undefined;
+    return line?.startsWith('{') ? recordOrUndefined(JSON.parse(line) as unknown) : undefined;
   }
-  return asRecord(raw);
+  return recordOrUndefined(raw);
 }
 
 function collectSignature(outputs: Record<string, unknown> | undefined): HealFailureSignature | undefined {
@@ -263,17 +264,17 @@ function defaultSearch(query: string): unknown {
 function searchCitations(value: unknown): HealCitation[] {
   if (Array.isArray(value)) {
     return value.flatMap((item) => {
-      const raw = asRecord(item);
+      const raw = recordOrUndefined(item);
       const snippet = raw?.snippet ?? raw?.text;
       return typeof raw?.url === 'string' && raw.url.trim() && typeof raw.title === 'string' && typeof snippet === 'string'
         ? [{ title: raw.title, url: raw.url, snippet: snippet.slice(0, 200) }]
         : [];
     }).slice(0, 5);
   }
-  const payload = asRecord(value);
+  const payload = recordOrUndefined(value);
   if (!Array.isArray(payload?.results)) return [];
   return searchCitations(payload.results.flatMap((result) => {
-    const record = asRecord(result);
+    const record = recordOrUndefined(result);
     return Array.isArray(record?.items) ? record.items : [result];
   }));
 }
@@ -285,12 +286,12 @@ function groundQuery(signature: HealFailureSignature, failure: Record<string, un
 }
 
 export function roleResult(role: string, ctx: GraphContext, deps: HealRoleDeps = {}): Record<string, unknown> {
-  const input = asRecord(ctx.input) ?? {};
-  const failure = asRecord(input.failure) ?? input;
+  const input = recordOrUndefined(ctx.input) ?? {};
+  const failure = recordOrUndefined(input.failure) ?? input;
   const signature = failureOf(ctx);
   switch (role) {
     case 'observe-ledger': {
-      const selector = asRecord(input.failureEvent);
+      const selector = recordOrUndefined(input.failureEvent);
       if (selector) {
         if (typeof selector.source !== 'string' || typeof selector.ref !== 'string' || !selector.source || !selector.ref) {
           return withAddedFacts({ outcome: 'fail', reason: 'invalid-failure-event-selector' }, []);
@@ -313,7 +314,7 @@ export function roleResult(role: string, ctx: GraphContext, deps: HealRoleDeps =
         return withAddedFacts({ outcome: 'ok', entries: [{ errorText: event.summary, goalText: event.goalText,
           goalId: event.goalId, goalFile: event.goalFile, ...facts, doctorVisits: visits }], event }, ['errorText', 'materializedPaths', 'doctorVisits']);
       }
-      if (!asRecord(input.failure) && Object.keys(failure).length === 0) return withAddedFacts({ outcome: 'empty' }, []);
+      if (!recordOrUndefined(input.failure) && Object.keys(failure).length === 0) return withAddedFacts({ outcome: 'empty' }, []);
       const worktree = typeof input.worktree === 'string' ? input.worktree : '';
       const runId = typeof input.runId === 'string' ? input.runId : '';
       const ledger = runId ? (deps.loadLedger
@@ -360,7 +361,7 @@ export function roleResult(role: string, ctx: GraphContext, deps: HealRoleDeps =
     }
     case 'revise-goal': {
       const collected = outputRecord(ctx.outputs, 'collect');
-      const collectedEntry = Array.isArray(collected?.entries) ? asRecord(collected.entries[0]) : undefined;
+      const collectedEntry = Array.isArray(collected?.entries) ? recordOrUndefined(collected.entries[0]) : undefined;
       const goal = typeof input.goal === 'string' ? input.goal : typeof collectedEntry?.goalText === 'string' ? collectedEntry.goalText
         : typeof failure.goal === 'string' ? failure.goal : '';
       const paths = stringsAt(collectedEntry ?? failure, ['materializedPaths']);

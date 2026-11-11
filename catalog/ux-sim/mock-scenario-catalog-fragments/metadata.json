@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "deviceCatalogVersion": 30,
+  "deviceCatalogVersion": 32,
   "runEvidence": {
     "scope": "ScenarioV0 YAML runs only; catalog entries reference reusable devices/tests, and list/show/devices do not execute them",
     "runId": "uuid per execution",

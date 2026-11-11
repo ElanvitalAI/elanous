@@ -1,8 +1,8 @@
 // ── Ops-ledger tool runtimes (우편 msg · 판 release checklist) ──
 //
-// Registers the nine in-process ledger tools with the tool-runtime
+// Registers the in-process ledger tools with the tool-runtime
 // layer so every surface (skill-runner, TUI) can call them by name:
-// MsgList / MsgPost / MsgAsk / MsgAck and ChecklistList / ChecklistAdd /
+// MsgList / MsgPost / MsgAsk / MsgAck / MsgInbox and ChecklistList / ChecklistAdd /
 // ChecklistSet / ChecklistEdit / ChecklistMove. Dispatchers live in
 // src/skills/tools/ops-ledger.ts; this file is a thin adapter — the
 // same pattern as team-tool-runtimes.ts. Every call goes through
@@ -24,6 +24,8 @@ import {
 } from '../skills/tools/ops-ledger.js';
 import type { ToolRuntime } from './types.js';
 import { buildMsgAskTool, dispatchMsgAsk, type MsgAskResult } from '../skills/tools/msg-ask.js';
+import { dispatchMsgInbox, type MsgInboxResult } from '../skills/tools/msg-inbox.js';
+import { canonicalSeatId } from '../msg/msg-store.js';
 
 export const msgListRuntime: ToolRuntime<Record<string, unknown>, MsgListResult> = {
   id: 'msg_list',
@@ -46,7 +48,36 @@ export const msgAskRuntime: ToolRuntime<Record<string, unknown>, MsgAskResult> =
 export const msgAckRuntime: ToolRuntime<Record<string, unknown>, MsgAckResult> = {
   id: 'msg_ack',
   spec: buildMsgAckTool(),
-  async run(req) { return observeLedgerCall('MsgAck', req, () => dispatchMsgAck(req), (a, r) => ({ to: a.to, id: a.id, ...(r ? { cursor: r.cursor } : {}) })); },
+  async run(req, ctx) {
+    if (ctx.surface === 'mcp') {
+      const seat = ctx.authenticatedSeat;
+      if (!seat) throw new Error('MsgAck requires a host-authenticated seat');
+      if (Object.keys(req).some(key => key !== 'id')) throw new Error('MCP MsgAck accepts only id; recipient is bound by the host');
+      const to = canonicalSeatId(seat);
+      if (to === 'ALL') throw new Error('ALL is a topic, not an authenticated seat');
+      const bound = { to, id: req.id };
+      return observeLedgerCall('MsgAck', bound, () => dispatchMsgAck(bound), (a, r) => ({ to: a.to, id: a.id, ...(r ? { cursor: r.cursor } : {}) }));
+    }
+    return observeLedgerCall('MsgAck', req, () => dispatchMsgAck(req), (a, r) => ({ to: a.to, id: a.id, ...(r ? { cursor: r.cursor } : {}) }));
+  },
+};
+
+export const msgInboxRuntime: ToolRuntime<Record<string, unknown>, MsgInboxResult> = {
+  id: 'msg_inbox',
+  spec: {
+    name: 'MsgInbox',
+    description: 'Read unread durable messages for the host-authenticated seat. Reading never advances the acknowledgement cursor.',
+    parameters: {
+      type: 'object', properties: {
+        after: { type: 'integer', description: 'Optional exclusive message ID; omitted starts at the authenticated seat acknowledgement cursor.' },
+        limit: { type: 'integer', description: 'Maximum messages to return, 1–100 (default 100).' },
+      }, additionalProperties: false,
+    },
+  },
+  async run(req, ctx) {
+    if (!ctx.authenticatedSeat) throw new Error('MsgInbox requires a host-authenticated seat');
+    return dispatchMsgInbox(req, { seat: ctx.authenticatedSeat });
+  },
 };
 
 export const checklistListRuntime: ToolRuntime<Record<string, unknown>, ChecklistListResult> = {
@@ -84,6 +115,7 @@ export const ALL_OPS_LEDGER_RUNTIMES: ToolRuntime<any, any>[] = [
   msgPostRuntime,
   msgAskRuntime,
   msgAckRuntime,
+  msgInboxRuntime,
   checklistListRuntime,
   checklistAddRuntime,
   checklistSetRuntime,

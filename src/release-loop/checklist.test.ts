@@ -31,6 +31,81 @@ test('PATH-SEPARATOR-MULTI: release checklist storage preserves comma, middle-do
 });
 
 describe('release checklist ledger', () => {
+  test('explicit checklist evidence provenance is appended without replacing human evidence', () => {
+    root();
+    addItem('9.9.9', { id: 'PROV', title: 'evidence source' });
+    setItem('9.9.9', 'PROV', {
+      evidence: 'sim green · run=run-1',
+      provenance: { universe: 'sim', source: 'sim', device: 'ux-sim', scenario: 'graph-run', clock: 'sim' },
+    }, 'UX');
+    expect(listChecklist('9.9.9').items[0]?.evidence)
+      .toBe('sim green · run=run-1\nprovenance: sim/sim · device=ux-sim · scenario=graph-run · clock=sim');
+  });
+
+  test('explicit checklist evidence provenance rejects a conflicting preexisting tag', () => {
+    const sim = { universe: 'sim', source: 'sim', device: 'ux-sim', scenario: 'graph-run', clock: 'sim' } as const;
+    root();
+    addItem('9.9.9', { id: 'TAG-CONFLICT', title: 'tag conflict' });
+    expect(() => setItem('9.9.9', 'TAG-CONFLICT', { evidence: 'human note\nprovenance: prod/real', provenance: sim }, 'UX'))
+      .toThrow('근거 출처 꼬리표와 새 꼬리표가 충돌한다');
+  });
+
+  test('checklist evidence rejects duplicate provenance rows instead of trusting the first', () => {
+    root();
+    addItem('9.9.9', { id: 'TAG-DUPLICATE', title: 'duplicate provenance' });
+    expect(() => setItem('9.9.9', 'TAG-DUPLICATE', {
+      evidence: 'human note\nprovenance: sim/sim · device=ux-sim\nprovenance: prod/real',
+    }, 'UX')).toThrow('근거에 출처 꼬리표가 중복됐다');
+  });
+
+  test('checklist evidence rejects malformed or unvalidated provenance rows at the save boundary', () => {
+    root();
+    addItem('9.9.9', { id: 'TAG-MALFORMED', title: 'malformed provenance' });
+    for (const evidence of [
+      'provenance: prod/real',
+      'provenance: prod/real · device=x · scenario=y=z',
+      'provenance: prod/real · device=x · scenario=y · device=z',
+      'human note\nprovenance: prod/real · device=x · scenario=y',
+    ]) {
+      expect(() => setItem('9.9.9', 'TAG-MALFORMED', { evidence }, 'UX')).toThrow('잘못된 근거 출처 꼬리표');
+    }
+  });
+
+  test('checklist evidence can replace legacy malformed provenance rows without trusting them', () => {
+    const dir = root();
+    addItem('9.9.9', { id: 'TAG-RECOVER', title: 'recover malformed provenance' });
+    setItem('9.9.9', 'TAG-RECOVER', { evidence: 'original evidence' }, 'UX');
+    const db = new Database(join(dir, 'release/features.sqlite'));
+    try {
+      db.query('UPDATE assignments SET evidence = ? WHERE feature_id = ? AND version = ?')
+        .run('legacy evidence\nprovenance: prod/real · device=x · scenario=y=z', 'TAG-RECOVER', '9.9.9');
+    } finally { db.close(); }
+
+    setItem('9.9.9', 'TAG-RECOVER', { evidence: 'recovered evidence' }, 'UX');
+    expect(listChecklist('9.9.9').items[0]?.evidence).toBe('recovered evidence');
+
+    const db2 = new Database(join(dir, 'release/features.sqlite'));
+    try {
+      db2.query('UPDATE assignments SET evidence = ? WHERE feature_id = ? AND version = ?')
+        .run('legacy again\nprovenance: prod/real · device=x · scenario=y=z', 'TAG-RECOVER', '9.9.9');
+    } finally { db2.close(); }
+    const sim = { universe: 'sim', source: 'sim', device: 'ux-sim', scenario: 'recovery' } as const;
+    setItem('9.9.9', 'TAG-RECOVER', { provenance: sim }, 'UX');
+    expect(listChecklist('9.9.9').items[0]?.evidence)
+      .toBe('legacy again\nprovenance: sim/sim · device=ux-sim · scenario=recovery');
+  });
+
+  test('provenance-only evidence update persists the tag and a later evidence edit retains it', () => {
+    root();
+    addItem('9.9.9', { id: 'TAG-PRESERVE', title: 'tag preserve' });
+    const sim = { universe: 'sim', source: 'sim', device: 'ux-sim', scenario: 'graph-run' } as const;
+    setItem('9.9.9', 'TAG-PRESERVE', { provenance: sim }, 'UX');
+    expect(listChecklist('9.9.9').items[0]?.evidence).toBe('provenance: sim/sim · device=ux-sim · scenario=graph-run');
+    setItem('9.9.9', 'TAG-PRESERVE', { evidence: 'updated human evidence' }, 'UX');
+    expect(listChecklist('9.9.9').items[0]?.evidence)
+      .toBe('updated human evidence\nprovenance: sim/sim · device=ux-sim · scenario=graph-run');
+  });
+
   test('CHECKLIST-EVIDENCE-CHAIN: any missing/unmeasurable stage fails closed without mutating the ledger', () => {
     root();
     addItem('9.9.9', { id: 'CHAIN', title: '대상 경로: src/a.ts\n- 완료 경계 실물: CLI 결과 확인\n- 완료 경계 증거 명령: bun test src/a.test.ts' });
@@ -809,6 +884,68 @@ describe('release checklist ledger', () => {
     ], history: [] }));
     setItem('8.8.8', 'OLD', { evidence: 'verified' }, 'TC');
     expect(listChecklist('8.8.8').items[0]).toMatchObject({ owner: 'TC·UX', evidence: 'verified' });
+  });
+
+  test('declared seat addresses work for set, claim, and owner filters while free-form names fail closed', async () => {
+    const dir = root();
+    const seatState = join(dir, 'seat-state');
+    mkdirSync(seatState, { recursive: true });
+    const registryPath = join(seatState, 'seat-registry.json');
+    const registry = JSON.stringify({ version: 1, seats: [
+      { address: 'R-PRUNE', host: 'mshq', wake: 'none', replyBody: 'agent', optIn: false },
+    ] });
+    writeFileSync(registryPath, registry);
+    expect(parseOwner('R-PRUNE')).toEqual({ seat: 'R-PRUNE' });
+    rmSync(registryPath);
+    expect(() => parseOwner('R-PRUNE')).toThrow(CliUserError);
+    writeFileSync(registryPath, registry);
+    const version = '9.9.9';
+    const seats = ['R-OAUTH', 'Q-1', 'R-PRUNE', 'WIN-AZ'];
+    for (const seat of seats) {
+      const setId = `SET-${seat}`;
+      addItem(version, { id: setId, title: 'declared seat owner' });
+      setItem(version, setId, { owner: seat }, 'OP');
+      expect(listChecklist(version).items.find((item) => item.id === setId)?.owner).toBe(seat);
+      expect(ownerMatches(seat, seat)).toBe(true);
+
+      const claimId = `CLAIM-${seat}`;
+      addItem(version, { id: claimId, title: 'declared seat claim', owner: `${seat}/rel` });
+      claimItem(version, claimId, seat, { actor: seat });
+      expect(listChecklist(version).items.find((item) => item.id === claimId)?.owner).toBe(seat);
+      expect(ownerMatches(`${seat}/rel`, seat)).toBe(true);
+    }
+
+    expect(() => parseOwner('foo bar')).toThrow(CliUserError);
+    expect(() => parseOwner('R-NOT-REGISTERED')).toThrow(CliUserError);
+    expect(() => addItem(version, { id: 'INVALID', title: 'free-form owner', owner: 'foo bar' })).toThrow(CliUserError);
+    expect(() => addItem(version, { id: 'UNDECLARED', title: 'undeclared owner', owner: 'R-NOT-REGISTERED' })).toThrow(CliUserError);
+    expect(() => claimItem(version, 'CLAIM-R-OAUTH', 'foo bar', { actor: 'R-OAUTH' })).toThrow(CliUserError);
+    expect(ownerMatches('foo bar', 'TC')).toBe(false);
+    expect(ownerMatches('R-NOT-REGISTERED', 'TC')).toBe(false);
+    expect(ownerMatches('TC', 'foo bar')).toBe(false);
+    expect(listChecklist(version).items.some((item) => ['INVALID', 'UNDECLARED'].includes(item.id))).toBe(false);
+
+    addItem(version, { id: 'FILTER-OTHER', title: 'unrelated owner', owner: 'OP' });
+    const previousNexusUrl = process.env.ELANOUS_NEXUS_URL;
+    const previousNexusTokenFile = process.env.ELANOUS_NEXUS_TOKEN_FILE;
+    delete process.env.ELANOUS_NEXUS_URL;
+    delete process.env.ELANOUS_NEXUS_TOKEN_FILE;
+    try {
+      for (const seat of seats) {
+        const chunks: string[] = [];
+        const output = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { chunks.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+        try {
+          const program = new Command();
+          registerReleaseChecklistReadCommands(program);
+          await program.parseAsync(['release', 'checklist', '--version', version, 'list', '--owner', seat, '--json'], { from: 'user' });
+          const result = JSON.parse(chunks.join('')) as { items: Array<{ id: string }> };
+          expect(result.items.map(({ id }) => id)).toEqual([`SET-${seat}`, `CLAIM-${seat}`]);
+        } finally { output.mockRestore(); }
+      }
+    } finally {
+      if (previousNexusUrl === undefined) delete process.env.ELANOUS_NEXUS_URL; else process.env.ELANOUS_NEXUS_URL = previousNexusUrl;
+      if (previousNexusTokenFile === undefined) delete process.env.ELANOUS_NEXUS_TOKEN_FILE; else process.env.ELANOUS_NEXUS_TOKEN_FILE = previousNexusTokenFile;
+    }
   });
 
   test('옛 잘못된 owner 는 원문 byOwner 에만 남고 자리별 집계·필터에는 들어가지 않는다', () => {

@@ -36,15 +36,9 @@ test('virtual-window control and context tools are absent while essential tools 
   });
 });
 
-describe('solve_mission native catalog entry', () => {
-  test('names self-implement as the default and staged as explicit option', () => {
-    const entry = nativeToolCatalog.find((tool) => tool.id === 'solve_mission');
-    expect(entry).toBeDefined();
-    expect(entry!.description).toContain('default executor is self-implement');
-    expect(entry!.description).toContain('executor: "staged"');
-    expect(entry!.description).not.toContain('through the full staged harness');
-    expect(entry!.promptSummary).toContain('self-implement default');
-    expect(entry!.promptSummary).toContain('executor: staged explicitly selects');
+describe('retired solve_mission native catalog entry', () => {
+  test('is absent from the model tool catalog', () => {
+    expect(nativeToolCatalog.some((tool) => tool.id === 'solve_mission')).toBe(false);
   });
 });
 

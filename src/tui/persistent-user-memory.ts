@@ -9,10 +9,17 @@ const USER_NAME_MEMORY_ID = 'tui-user-name';
 export function rememberExplicitTuiUserFact(userText: string, root: string = memoryRoot(), onFailure?: () => void): boolean {
   const statement = findRememberRequestClause(userText);
   if (!statement) return false;
-  const rawName = /^(?:참고로\s+)?내\s*이름은\s+([^\n,.;!?。，！？]{1,40})/u.exec(statement)?.[1]
-    ?? /^my\s+name\s+is\s+([^\n,.;!?]{1,40})/i.exec(statement)?.[1];
-  const name = rawName?.trim().replace(/\s*(?:기억해(?:\s*줘)?|remember).*$/iu, '')
-    .replace(/(?:이야|이에요|입니다)$/u, '').trim();
+  const koreanName = /^(?:참고로\s+)?내\s*이름은\s+([^\n,.;!?。，！？]{1,40})/u.exec(statement)?.[1];
+  const rawName = koreanName ?? /^my\s+name\s+is\s+([^\n,.;!?]{1,40})/i.exec(statement)?.[1];
+  const statedName = rawName?.trim().replace(/\s*(?:기억해(?:\s*줘)?|remember).*$/iu, '').trim();
+  const fullCopula = /(?:이야|이에요|입니다|예요)$/u;
+  const hadFullCopula = fullCopula.test(statedName ?? '');
+  const withoutFullCopula = statedName?.replace(fullCopula, '').trim();
+  // A vowel-final Korean name can take a spoken 야. Keep short names such as
+  // 마야 intact, and never reinterpret an English name statement this way.
+  const name = koreanName && !hadFullCopula && withoutFullCopula
+    ? withoutFullCopula.replace(/^([가-힣]{2,})야$/u, '$1').trim()
+    : withoutFullCopula;
   if (!name || name.length > 40 || /[<>{}\[\]\\/]/u.test(name)) {
     // Explicit instructions in either order are stored without asking the
     // model to discover a CLI command. Questions and quoted examples are not.

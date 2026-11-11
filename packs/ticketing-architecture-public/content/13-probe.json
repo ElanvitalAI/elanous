@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "반증 시험과 관측",
+  "source": "https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/",
+  "body": "동일 좌석 N명 동시 장벽 시험: 확정 1, 패자 N-1, 중복 0을 원장 조회로 검증한다. 홀드 만료 정각, 콜백 중복/역순/늦은 성공, Redis/Kafka 중단, HPA 증가와 DB 연결 소진을 주입한다. 대기 시간, 409/429 비율, hold→paid 전환, 환불 대기량, outbox lag, p95/p99를 관측한다. 테스트 통과와 운영 용량 보증을 혼동하지 않는다."
+}

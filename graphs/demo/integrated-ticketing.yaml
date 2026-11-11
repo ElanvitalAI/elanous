@@ -1,0 +1,40 @@
+# Source diagram for the 1:30–1:50 graph-runner segment. TUI, PWA, and iPhone
+# are surfaces over this same six-scene scenario; execution receipts remain per-surface.
+graph_id: integrated-ticketing-demo
+version: 1
+loop:
+  title: Integrated ticketing demo — KCB and Timely
+  description: >-
+    Six-scene graph source for the shared demo: article share/scrape; absorb and brief; propose a ticketing app and
+    receive y; turn the brief into three requirements and an architecture pack; produce a GCP expansion plan and ask
+    y/N through HITL; run the app build/test/publish flow and attach its diagram and PDF to the board card. TUI, PWA,
+    and iPhone receipts are driven separately. Slow architecture, GCP calculation, and build steps may be shown as
+    clearly marked recordings. This graph is a diagram/storyboard source, not a claim that all live receipts exist.
+  trigger:
+    events: [manual]
+entry_node: scene-1-scrap
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: scene-1-scrap, kind: agent, recipe: 'handler:scrap-share', max_visits: 1, journey_stage: intake }
+  - { node_id: scene-2-absorb-brief, kind: agent, recipe: 'handler:absorb-brief', max_visits: 1, journey_stage: brief }
+  - { node_id: scene-3-proposal, kind: prompt, recipe: 'prompt:ticketing-proposal-prompt', max_visits: 1, journey_stage: propose }
+  - { node_id: scene-3-approve-y, kind: hitl, recipe: 'approval:ticketing-proposal-approval', max_visits: 1, journey_stage: approve }
+  - { node_id: scene-4-requirements, kind: agent, recipe: 'handler:brief-to-requirements', max_visits: 1, journey_stage: design }
+  - { node_id: scene-4-architecture-pack, kind: agent, recipe: 'handler:architecture-pack', max_visits: 1, journey_stage: design }
+  - { node_id: scene-5-gcp-expansion, kind: agent, recipe: 'handler:gcp-expansion-plan', max_visits: 1, journey_stage: expand }
+  - { node_id: scene-5-approve-y-or-n, kind: hitl, recipe: 'approval:gcp-expansion', max_visits: 1, journey_stage: approve }
+  - { node_id: scene-6-build-test-publish, kind: agent, recipe: 'handler:ticketing-build-test-publish', max_visits: 1, journey_stage: deliver }
+  - { node_id: scene-6-board-card, kind: agent, recipe: 'handler:board-card-with-diagram-pdf', max_visits: 1, journey_stage: deliver }
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+  - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
+edges:
+  - { from: scene-1-scrap, on: outcome, map: { ok: scene-2-absorb-brief, fail: failed, error: failed } }
+  - { from: scene-2-absorb-brief, on: outcome, map: { ok: scene-3-proposal, fail: failed, error: failed } }
+  - { from: scene-3-proposal, on: outcome, map: { ok: scene-3-approve-y, fail: failed, error: failed } }
+  - { from: scene-3-approve-y, on: outcome, map: { approved: scene-4-requirements, rejected: done, error: failed } }
+  - { from: scene-4-requirements, on: outcome, map: { ok: scene-4-architecture-pack, fail: failed, error: failed } }
+  - { from: scene-4-architecture-pack, on: outcome, map: { ok: scene-5-gcp-expansion, fail: failed, error: failed } }
+  - { from: scene-5-gcp-expansion, on: outcome, map: { ok: scene-5-approve-y-or-n, fail: failed, error: failed } }
+  - { from: scene-5-approve-y-or-n, on: outcome, map: { approved: scene-6-build-test-publish, rejected: done, error: failed } }
+  - { from: scene-6-build-test-publish, on: outcome, map: { ok: scene-6-board-card, fail: failed, error: failed } }
+  - { from: scene-6-board-card, on: outcome, map: { ok: done, fail: failed, error: failed } }

@@ -2,12 +2,18 @@
 spend:
   approval: 'GCP 프로젝트·API·IAM·예산·작업 생성 전에 사용자 비용 승인이 필요합니다.'
 detect:
-  command: 'false'
-propose:
-  command: 'false'
+  command: 'bun "${ELANOUS_ARCHITECTURE_RESOURCE_ROOT:-$ELANOUS_GRAPH_DIR/../..}/src/ux-sim/gcp-architect-expand/detect-step.ts"'
+design:
+  command: 'bun "${ELANOUS_ARCHITECTURE_RESOURCE_ROOT:-$ELANOUS_GRAPH_DIR/../..}/src/ux-sim/gcp-architect-expand/unimplemented.ts"'
+diagram:
+  command: 'bun "${ELANOUS_ARCHITECTURE_RESOURCE_ROOT:-$ELANOUS_GRAPH_DIR/../..}/src/ux-sim/gcp-architect-expand/unimplemented.ts"'
+pdf:
+  command: 'bun "${ELANOUS_ARCHITECTURE_RESOURCE_ROOT:-$ELANOUS_GRAPH_DIR/../..}/src/ux-sim/gcp-architect-expand/unimplemented.ts"'
+verify:
+  command: 'bun "${ELANOUS_ARCHITECTURE_RESOURCE_ROOT:-$ELANOUS_GRAPH_DIR/../..}/src/ux-sim/gcp-architect-expand/verify-step.ts"'
 provision:
-  command: 'false'
+  command: 'bun "${ELANOUS_ARCHITECTURE_RESOURCE_ROOT:-$ELANOUS_GRAPH_DIR/../..}/src/ux-sim/gcp-architect-expand/unimplemented.ts"'
 schedule:
-  command: 'false'
+  command: 'bun "${ELANOUS_ARCHITECTURE_RESOURCE_ROOT:-$ELANOUS_GRAPH_DIR/../..}/src/ux-sim/gcp-architect-expand/unimplemented.ts"'
 idle-stop:
-  command: 'false'
+  command: 'bun "${ELANOUS_ARCHITECTURE_RESOURCE_ROOT:-$ELANOUS_GRAPH_DIR/../..}/src/ux-sim/gcp-architect-expand/unimplemented.ts"'

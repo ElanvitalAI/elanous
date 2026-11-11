@@ -34,7 +34,7 @@ import {
   buildTerminalMouseIntentEvent,
   type TerminalMouseIntentEvent,
   type TerminalMouseIntentSpec,
-} from '../dashboard/terminal-surface-intent.js';
+} from '../surface/terminal-surface-intent.js';
 
 export interface TerminalHostFacadeDeps {
   displayEvents: DisplayEventBus;

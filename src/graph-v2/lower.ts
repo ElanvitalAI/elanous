@@ -316,7 +316,7 @@ export function lowerGraphV2(source: string, options: LowerGraphV2Options = {}):
       errors.push({ path: `${path}/id`, message: 'node.id 는 유효한 id 여야 한다' }); continue;
     }
     const ext = parseExt(combineExt(`${path}/ext`, errors, parseExt(node.ext, `${path}/ext`, errors),
-      namespaceUnmappedExtensions(node, sourceNamespace, ['id', 'type', 'call', 'call_entry', 'cap', 'requires', 'skill', 'uses', 'with', 'packs', 'map', 'post', 'contract', 'budget', 'max_visits', 'hitl', 'ext'])), `${path}/ext`, errors);
+      namespaceUnmappedExtensions(node, sourceNamespace, ['id', 'type', 'call', 'call_entry', 'cap', 'requires', 'skill', 'uses', 'with', 'packs', 'map', 'post', 'contract', 'budget', 'max_visits', 'hitl', 'secrets', 'ext'])), `${path}/ext`, errors);
     nodeExtById.set(node.id, ext);
     const map = record(node.map);
     if (node.map !== undefined && (!map || Object.keys(map).some(key => !['over', 'as', 'max_parallel', 'partial'].includes(key)) ||
@@ -408,6 +408,7 @@ export function lowerGraphV2(source: string, options: LowerGraphV2Options = {}):
     v1Nodes.push({ node_id: node.id, kind, recipe, max_visits: maxVisits, ...(requires ? { requires } : {}),
       ...(typeof node.call_entry === 'string' ? { call_entry: node.call_entry } : {}),
       ...(node.hitl === undefined ? {} : { hitl: node.hitl }),
+      ...(node.secrets === undefined ? {} : { secrets: node.secrets }),
       ...(loweredCall ? { call: loweredCall, budget: { inner_steps: callStepLimit ?? 1 },
         contract: contract ?? { inputs: ['ask', 'context', 'prior'], tools: 'read-only', outputs: ['result', 'evidence'] } } : {}),
       ...(isCapability ? { contract: contract ?? { inputs: ['input', 'nodeInput', 'outputs'], tools: 'read-only', outputs: ['result', 'evidence'] } } : {}),

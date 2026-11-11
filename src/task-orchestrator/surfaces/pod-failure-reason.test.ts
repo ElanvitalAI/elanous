@@ -67,9 +67,9 @@ describe('classifyPodExit', () => {
 
   test('excludes bookkeeping-only output from the bounded tail', () => {
     const result = classifyPodExit({ logs: [
-      'ELANOUS_POD_STATUS /home/user/private/status',
+      'ELANOUS_POD_STATUS /home/ubuntu/private/status',
       '[graph] collect fail (0.28s)',
-      'at /home/user/private/worker.ts:42',
+      'at /home/ubuntu/private/worker.ts:42',
     ].join(String.fromCharCode(10)) });
     expect(result.class).toBe('no-result-line');
     expect(result.tail).toEqual([]);
@@ -190,10 +190,10 @@ describe('extractPodFailureReason', () => {
   });
 
   test('bounds and redacts a long filesystem-path error before it enters the outer result', () => {
-    const logs = `Error: /home/user/private/file: ${'x'.repeat(400)}\n`;
+    const logs = `Error: /home/ubuntu/private/file: ${'x'.repeat(400)}\n`;
     const reason = extractPodFailureReason({ logs });
     expect(reason).toStartWith('Error: ~/private/file: ');
-    expect(reason).not.toContain('/home/user/');
+    expect(reason).not.toContain('/home/ubuntu/');
     expect(reason.length).toBeLessThanOrEqual(240);
   });
 });
@@ -218,7 +218,7 @@ test('POD-NORESULT: a readable error line still wins over the result row, and no
 test('classifyPodExit — a non-terminal progress JSON line mentioning error is not a child error line; /home/ paths fold in tail', () => {
   const progressOnly = classifyPodExit({ logs: '{"kind":"progress","note":"retry after error"}\n' });
   expect(progressOnly.class).toBe('no-result-line');
-  const childError = classifyPodExit({ logs: 'Error: child failed at /home/user/repo/x.ts\n' });
+  const childError = classifyPodExit({ logs: 'Error: child failed at /home/ubuntu/repo/x.ts\n' });
   expect(childError.class).toBe('child-error');
   expect(childError.tail.join('\n')).toContain('~/repo/x.ts');
   expect(childError.tail.join('\n')).not.toContain('/home/');

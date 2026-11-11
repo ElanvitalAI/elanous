@@ -1,0 +1,13 @@
+{
+  "roleLlm": {
+    "implement": { "provider": "openrouter", "model": "openrouter/upstage/solar-pro4" },
+    "review": { "provider": "openrouter", "model": "openrouter/upstage/solar-pro4" },
+    "research": { "provider": "openrouter", "model": "openrouter/upstage/solar-mini4" },
+    "planning": { "provider": "openrouter", "model": "openrouter/upstage/solar-pro4" },
+    "audit": { "provider": "openrouter", "model": "openrouter/upstage/solar-mini4" },
+    "classify": { "provider": "openrouter", "model": "openrouter/upstage/solar-mini4" },
+    "graph-grow": { "provider": "openrouter", "model": "openrouter/upstage/solar-pro4" },
+    "coordinator": { "provider": "openrouter", "model": "openrouter/upstage/solar-pro4" },
+    "guardian": { "provider": "openrouter", "model": "openrouter/upstage/solar-pro4" }
+  }
+}

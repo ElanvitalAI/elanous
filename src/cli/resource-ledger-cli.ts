@@ -208,7 +208,7 @@ export function buildResourceLedgerSnapshot(deps: Required<Pick<ResourceLedgerCl
 }
 
 export async function postResourcePoolDeclaration(pool: MachinePoolDeclaration, options: {
-  baseUrl: string; bearerToken: string; fetch?: typeof fetch;
+  baseUrl: string; bearerToken: string; fetch?: typeof fetch; expectedPool?: MachinePoolDeclaration;
 }): Promise<boolean> {
   if (!options.bearerToken) throw new Error('owner bearer unavailable');
   let endpoint: URL;
@@ -224,7 +224,7 @@ export async function postResourcePoolDeclaration(pool: MachinePoolDeclaration, 
     response = await (options.fetch ?? fetch)(endpoint, {
       method: 'POST',
       headers: { authorization: 'Bearer ' + options.bearerToken, 'content-type': 'application/json' },
-      body: JSON.stringify({ pool }),
+      body: JSON.stringify({ pool, ...(options.expectedPool ? { expectedPool: options.expectedPool } : {}) }),
       signal: AbortSignal.timeout(5000),
     });
   } catch { throw new Error('resource pool declaration endpoint unavailable'); }
@@ -238,13 +238,19 @@ export function registerResourceLedgerCommands(resources: Command, overrides: Re
     run: overrides.run ?? defaultResourceRun, now: overrides.now ?? (() => new Date()) };
   resources.command('declare-pool').description('owner-auth Nexus 원장에 기계 풀 선언을 추가 (YAML/JSON pools 입력)')
     .requiredOption('--file <path>', 'pools 배열이 있는 YAML/JSON 선언 파일')
+    .option('--expected-file <path>', '교체 시 현재 원장 선언을 담은 YAML/JSON 파일 (정확 일치 CAS)')
     .option('--url <url>', 'Nexus base URL (기본: ELANOUS_NEXUS_URL 또는 실행 중인 로컬 Nexus)')
     .option('--json', 'JSON 출력')
-    .action(async (opts: { file: string; url?: string; json?: boolean }) => {
+    .action(async (opts: { file: string; expectedFile?: string; url?: string; json?: boolean }) => {
       try {
         const parsed = parse(readFileSync(opts.file, 'utf8')) as unknown;
         const pools = parseMachinePoolDeclarations(parsed);
         if (pools.length === 0) throw new Error('pool declarations are empty');
+        const expected = opts.expectedFile
+          ? parseMachinePoolDeclarations(parse(readFileSync(opts.expectedFile, 'utf8')) as unknown) : undefined;
+        if (expected && (expected.length !== pools.length || pools.some(pool => !expected.some(row =>
+          row.purpose === pool.purpose && row.fanoutGroupId === pool.fanoutGroupId))))
+          throw new Error('expected pool declarations must match replacement identities');
         const runtime = readNexusRuntime();
         const baseUrl = opts.url ?? process.env.ELANOUS_NEXUS_URL
           ?? (runtime?.httpPort ? 'http://127.0.0.1:' + runtime.httpPort : undefined);
@@ -252,7 +258,8 @@ export function registerResourceLedgerCommands(resources: Command, overrides: Re
         const bearerToken = ensureAuthToken().token;
         const results: Array<{ purpose: string; fanoutGroupId: string; created: boolean }> = [];
         for (const pool of pools) {
-          const created = await postResourcePoolDeclaration(pool, { baseUrl, bearerToken });
+          const expectedPool = expected?.find(row => row.purpose === pool.purpose && row.fanoutGroupId === pool.fanoutGroupId);
+          const created = await postResourcePoolDeclaration(pool, { baseUrl, bearerToken, expectedPool });
           results.push({ purpose: pool.purpose, fanoutGroupId: pool.fanoutGroupId, created });
         }
         if (opts.json) console.log(JSON.stringify({ ok: true, declarations: results }));

@@ -71,6 +71,15 @@ test('test execution defaults to a fixed fake stream without network access; rea
   expect(testFakeLlmProvider.available()).toBe(false);
 });
 
+test('{reply} advances for each emitted fake response even when turn history has the same user count', async () => {
+  resetTestFakeLlmScript();
+  process.env.ELANOUS_TEST_FAKE_LLM_RESPONSE = 'step {reply}';
+  const messages = [{ role: 'user' as const, content: 'continue' }];
+  expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(messages))).toEqual([{ type: 'text', delta: 'step 1' }]);
+  expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(messages))).toEqual([{ type: 'text', delta: 'step 2' }]);
+  resetTestFakeLlmScript();
+});
+
 test('capture env appends each request (role · string content) as one JSONL row — off when unset', async () => {
   process.env.ELANOUS_TEST_FAKE_LLM = '1';
   const dir = mkdtempSync(join(tmpdir(), 'fake-llm-capture-'));
@@ -290,6 +299,120 @@ test('도구 호출 스크립트: 표지 있는 사람 발화엔 도구 호출 �
   // 틀린 JSON 은 스크립트가 없는 것과 같다(시험 무대가 공급자를 깨지 않는다).
   process.env[TEST_FAKE_LLM_TOOL_CALL_ENV] = '{';
   expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(asked))).toEqual([{ type: 'text', delta: '[test-fake-llm] OK' }]);
+});
+
+test('도구 호출 시퀀스: 한 사람 발화의 연속 tool 결과마다 다음 호출을 내고 끝나면 고정 응답', async () => {
+  process.env.ELANOUS_TEST_FAKE_LLM = '1';
+  process.env[TEST_FAKE_LLM_TOOL_CALL_ENV] = JSON.stringify({ when: '세 자식', calls: [
+    { name: 'Agent', args: { description: 'child 1' } },
+    { name: 'Agent', args: { description: 'child 2' } },
+    { name: 'Agent', args: { description: 'child 3' } },
+  ] });
+  const asked = [{ role: 'user' as const, content: '세 자식으로 조사해줘' }];
+  const first = await Array.fromAsync(testFakeLlmProvider.streamChat!(asked));
+  expect(first).toMatchObject([{ type: 'tool_call', name: 'Agent', args: { description: 'child 1' } }]);
+  const firstId = (first[0] as Extract<LLMStreamEvent, { type: 'tool_call' }>).id;
+  const afterResult = (prior: typeof asked, id: string) => [
+    ...prior,
+    { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id, name: 'Agent', input: {} }] },
+    { role: 'user' as const, content: [{ type: 'tool_result' as const, tool_use_id: id, content: '{}' }] },
+  ];
+  const afterFirst = afterResult(asked, firstId);
+  const second = await Array.fromAsync(testFakeLlmProvider.streamChat!(afterFirst as never));
+  expect(second)
+    .toMatchObject([{ type: 'tool_call', name: 'Agent', args: { description: 'child 2' } }]);
+  const secondId = (second[0] as Extract<LLMStreamEvent, { type: 'tool_call' }>).id;
+  const afterSecond = afterResult(afterFirst as typeof asked, secondId);
+  const third = await Array.fromAsync(testFakeLlmProvider.streamChat!(afterSecond as never));
+  expect(third)
+    .toMatchObject([{ type: 'tool_call', name: 'Agent', args: { description: 'child 3' } }]);
+  const thirdId = (third[0] as Extract<LLMStreamEvent, { type: 'tool_call' }>).id;
+  const afterThird = afterResult(afterSecond as typeof asked, thirdId);
+  expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(afterThird as never)))
+    .toEqual([{ type: 'text', delta: '[test-fake-llm] OK' }]);
+
+  const pendingFirst = await Array.fromAsync(testFakeLlmProvider.streamChat!(asked));
+  const pendingFirstId = (pendingFirst[0] as Extract<LLMStreamEvent, { type: 'tool_call' }>).id;
+  const pendingHistory = [
+    ...asked,
+    { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id: pendingFirstId, name: 'Agent', input: { description: 'child 1' } }] },
+  ];
+  const retriedFirst = await Array.fromAsync(testFakeLlmProvider.streamChat!(pendingHistory as never));
+  const retriedFirstId = (retriedFirst[0] as Extract<LLMStreamEvent, { type: 'tool_call' }>).id;
+  const duplicateFirstSuccesses = [
+    ...asked,
+    { role: 'assistant' as const, content: [
+      { type: 'tool_use' as const, id: pendingFirstId, name: 'Agent', input: { description: 'child 1' } },
+      { type: 'tool_use' as const, id: retriedFirstId, name: 'Agent', input: { description: 'child 1' } },
+    ] },
+    { role: 'user' as const, content: [
+      { type: 'tool_result' as const, tool_use_id: pendingFirstId, content: '{}' },
+      { type: 'tool_result' as const, tool_use_id: retriedFirstId, content: '{}' },
+    ] },
+  ];
+  expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(duplicateFirstSuccesses as never)))
+    .toMatchObject([{ type: 'tool_call', name: 'Agent', args: { description: 'child 2' } }]);
+
+  const outOfOrderStages = [
+    ...asked,
+    { role: 'assistant' as const, content: [
+      { type: 'tool_use' as const, id: firstId, name: 'Agent', input: { description: 'child 1' } },
+      { type: 'tool_use' as const, id: secondId, name: 'Agent', input: { description: 'child 2' } },
+    ] },
+    { role: 'user' as const, content: [
+      { type: 'tool_result' as const, tool_use_id: secondId, content: '{}' },
+      { type: 'tool_result' as const, tool_use_id: firstId, content: '{}' },
+    ] },
+  ];
+  expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(outOfOrderStages as never)))
+    .toMatchObject([{ type: 'tool_call', name: 'Agent', args: { description: 'child 2' } }]);
+
+  const orphanedCall = [
+    ...asked,
+    { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id: 'call_fake_llm_tool_pending', name: 'Agent', input: {} }] },
+  ];
+  expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(orphanedCall as never)))
+    .toMatchObject([{ type: 'tool_call', name: 'Agent', args: { description: 'child 1' } }]);
+  const failedCall = [
+    ...orphanedCall,
+    { role: 'user' as const, content: [{ type: 'tool_result' as const, tool_use_id: 'call_fake_llm_tool_pending', content: 'failed', isError: true }] },
+  ];
+  expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(failedCall as never)))
+    .toMatchObject([{ type: 'tool_call', name: 'Agent', args: { description: 'child 1' } }]);
+  const unrelatedSameName = [
+    ...asked,
+    { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id: 'unrelated-call', name: 'Agent', input: {} }] },
+    { role: 'user' as const, content: [{ type: 'tool_result' as const, tool_use_id: 'unrelated-call', content: 'done' }] },
+  ];
+  expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(unrelatedSameName as never)))
+    .toMatchObject([{ type: 'tool_call', name: 'Agent', args: { description: 'child 1' } }]);
+  const mismatchedResult = [
+    ...asked,
+    { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id: 'call_fake_llm_tool_unmatched', name: 'Agent', input: {} }] },
+    { role: 'user' as const, content: [{ type: 'tool_result' as const, tool_use_id: 'another-call', content: 'done' }] },
+  ];
+  expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(mismatchedResult as never)))
+    .toMatchObject([{ type: 'tool_call', name: 'Agent', args: { description: 'child 1' } }]);
+  const newHumanPrompt = [...failedCall, { role: 'user' as const, content: '다른 질문' }];
+  expect(await Array.fromAsync(testFakeLlmProvider.streamChat!(newHumanPrompt as never)))
+    .toEqual([{ type: 'text', delta: '[test-fake-llm] OK' }]);
+});
+
+test('도구 호출 시퀀스는 이전 성공 결과의 taskId 표지를 다음 호출 인자로 연결한다', async () => {
+  process.env.ELANOUS_TEST_FAKE_LLM = '1';
+  process.env[TEST_FAKE_LLM_TOOL_CALL_ENV] = JSON.stringify({ when: 'background child', calls: [
+    { name: 'Agent', args: { run_in_background: true } },
+    { name: 'AgentOutput', args: { taskId: '$previousToolResult.taskId', block: true } },
+  ] });
+  const asked = [{ role: 'user' as const, content: 'background child 확인' }];
+  const first = await Array.fromAsync(testFakeLlmProvider.streamChat!(asked));
+  const firstId = (first[0] as Extract<LLMStreamEvent, { type: 'tool_call' }>).id;
+  const next = await Array.fromAsync(testFakeLlmProvider.streamChat!([
+    ...asked,
+    { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id: firstId, name: 'Agent', input: {} }] },
+    { role: 'user' as const, content: [{ type: 'tool_result' as const, tool_use_id: firstId, content: JSON.stringify({ taskId: 'task-from-agent' }) }] },
+  ] as never));
+  expect(next).toMatchObject([{ type: 'tool_call', name: 'AgentOutput', args: { taskId: 'task-from-agent', block: true } }]);
 });
 
 test('지연: 표지 있는 마지막 사람 발화만 그만큼 늦게 답한다(«바쁜 턴» 무대)', async () => {

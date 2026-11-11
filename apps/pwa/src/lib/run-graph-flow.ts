@@ -13,7 +13,7 @@ export interface RunGraphNodeData extends Record<string, unknown> {
   inputHandles: string[];
   outputHandles: string[];
   height: number;
-  provenance?: { type: 'scenario-injection'; scene?: string; reason: string; mock?: boolean };
+  provenance?: { source?: string; type?: string; scene?: string; reason?: string; mock?: boolean };
 }
 
 export const RUN_NODE_WIDTH = 190;
@@ -43,20 +43,22 @@ export function runGraphAdaptiveEvidence(events: readonly HarnessGraphEventWire[
 
 /** Replay the traversal route's existing structural events without mutating the loaded YAML graph. */
 export function applyRunGraphEvents(graph: RunGraphDetail, events: readonly HarnessGraphEventWire[]): RunGraphDetail {
-  return [...events].sort((left, right) => left.seq - right.seq).reduce((current, event) => {
+  const replay = (current: RunGraphDetail, event: HarnessGraphEventWire): RunGraphDetail => {
     if (event.type === 'node-added') {
       const scene = event.scene ?? event.demo1104Scene;
-      const provenance = event.decider === 'scenario-injection'
-        ? { type: 'scenario-injection' as const, ...(scene ? { scene } : {}), reason: event.reason, ...( /\bmock$/i.test(event.reason.trim()) && !/\bnot\s+mock$/i.test(event.reason.trim()) ? { mock: true } : {}) }
-        : undefined;
+      const provenance = {
+        source: event.source?.trim() || 'unknown',
+        ...(scene ? { scene } : {}),
+        reason: event.reason,
+        ...( /\bmock$/i.test(event.reason.trim()) && !/\bnot\s+mock$/i.test(event.reason.trim()) ? { mock: true } : {}),
+      };
       const existing = current.nodes.findIndex((node) => node.node_id === event.node);
       if (existing >= 0) {
-        if (!provenance) return current;
         return { ...current, nodes: current.nodes.map((node, index) => index === existing ? { ...node, provenance } : node) };
       }
       return { ...current, nodes: [...current.nodes, {
         node_id: event.node, kind: event.kind, recipe: `runtime:${event.decider}`, max_visits: 1,
-        ...(provenance ? { provenance } : {}),
+        provenance,
       }] };
     }
     if (event.type !== 'edge-rerouted') return current;
@@ -89,7 +91,8 @@ export function applyRunGraphEvents(graph: RunGraphDetail, events: readonly Harn
       : edges;
     if (event.outcome !== '$default' && mapped.some((edge, index) => edge !== edges[index])) return { ...current, edges: mapped };
     return { ...current, edges: [...edges, { from: event.from, to: event.to }] };
-  }, graph);
+  };
+  return [...events].sort((left, right) => left.seq - right.seq).reduce(replay, graph);
 }
 
 /** GRAPH-EDGE-TIDY — outcomes that share a target merge into one edge labelled «a · b»; ranks follow forward edges

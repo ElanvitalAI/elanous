@@ -447,6 +447,18 @@ const BEDROCK: TierMap = {
 /** 가격·창 미측정이라 기존 tier 배치를 바꾸지 않고 명시 모델로만 고르는 칸.
  *  소비 경로 = `lookupOpenRouterModelSpec()` ← `resolveRunFallback()`(openrouter 폴백 판정의 관측·ROUTE 결정). */
 const OPENROUTER_EXPLICIT_MODELS: Readonly<Record<string, LlmTierSpec>> = {
+  'upstage/solar-mini4': {
+    model: 'openrouter/upstage/solar-mini4',
+    label: 'Solar Mini 4 (OpenRouter)',
+    rationale: 'Solar-only light work',
+    status: 'shipping',
+  },
+  'upstage/solar-pro4': {
+    model: 'openrouter/upstage/solar-pro4',
+    label: 'Solar Pro 4 (OpenRouter)',
+    rationale: 'Solar-only complex judgment and implementation',
+    status: 'shipping',
+  },
   'z-ai/glm-5.3-flash': {
     model: 'openrouter/z-ai/glm-5.3-flash',
     label: 'GLM 5.3 Flash (OpenRouter)',

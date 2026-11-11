@@ -22,11 +22,8 @@ import type { LLMToolSpec } from '../../llm/tool-spec.js';
 //   complex worker can do 5+ tool rounds without crowding the
 //   parent's loop budget.
 //
-// Recursion: the sub-agent's tool list excludes Agent itself by
-// default — one level of nesting is enough for the use cases we care
-// about (skill orchestrator → expert workers → tools). Allowing
-// arbitrary nesting risks exponential token spend; revisit if a
-// concrete use case demands it.
+// Recursion: a child may spawn one grandchild. The grandchild's catalog
+// excludes Agent, bounding the tree independently of the registry hop cap.
 //
 // Debug instrumentation: every spawn / completion / error / tool
 // call emits a debug.log event under category `agent.*` so /debug
@@ -443,9 +440,9 @@ export function buildAgentTool(): LLMToolSpec {
 export interface DispatchAgentOpts {
   /** Owning conversation session, copied to background completion receipts. */
   parentSessionId?: string;
-  /** Tools the host makes available — typically the same tool list the
-   *  parent skill is using, MINUS the Agent tool itself (no recursion).
-   *  When omitted, the sub-agent runs with no tools (text-only). */
+  /** Registry parent for a nested Agent call; omitted for a top-level child. */
+  parentTaskId?: string;
+  /** Tools the host makes available. When omitted, the child is text-only. */
   hostTools?: LLMToolSpec[];
   /** Host-selected cwd when there is no parent session (e.g. MCP). */
   cwd?: string;
@@ -909,9 +906,8 @@ export async function dispatchAgent(
     }, { level: 'warn' });
   }
 
-  // Strip the Agent tool itself from the sub-agent's available tools.
-  // One level of nesting only — see file header rationale.
-  childTools = stripAgentToolForOneLevelNesting(childTools);
+  // A first-level child may spawn one grandchild; the grandchild cannot recurse.
+  if (opts.parentTaskId) childTools = stripAgentToolForOneLevelNesting(childTools);
   // Wave 5 E1 — apply per-spawn tool_filter (SUBAGENT-TOOLS-EMPTY · 0.2.36 · 대표 «서브에이전트에 제약이 생기지 않게»).
   //   기본 = 메인과 같은 도구 전부(필터 없음). allow 는 «좁히기»일 때만 — 모르는 이름은 무시하고 경고,
   //   아는 이름이 하나도 없으면 allow 전체를 무시(이름 불일치로 49→0 이 되던 10-22 실물). 결과가 0개면
@@ -983,18 +979,43 @@ export async function dispatchAgent(
     && BUILTIN_GENERAL_PURPOSE_DEFAULT_TOOLS.every((name, index) => definition.tools?.[index] === name);
   const spawnDefinition = opts.inheritGeneralPurposeToolCatalog === true && isBuiltinGeneralPurposeDefault
     ? { ...definition, tools: childTools.map(tool => tool.name) }
+    : isBuiltinGeneralPurposeDefault && childTools.some(tool => tool.name === 'Agent') && !opts.parentTaskId
+    ? { ...definition, tools: [...BUILTIN_GENERAL_PURPOSE_DEFAULT_TOOLS, 'Agent'] }
     : definition;
 
   const startedAt = Date.now();
+  let spawnedTaskId: string | undefined;
+  const dispatchChildTool = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
+    if (name === 'Agent') {
+      debug.log('agent.spawn', 'nested-request', { parentTaskId: spawnedTaskId, description: args.description });
+      if (!spawnedTaskId) throw new Error('Agent task is not registered');
+      return dispatchAgent(args, {
+        parentTaskId: spawnedTaskId,
+        parentSessionId: opts.parentSessionId,
+        parentCorrelationId: debugCorrelationId,
+        hostTools: childTools,
+        dispatchTool: childDispatchTool,
+        buildChildToolCatalog: opts.buildChildToolCatalog,
+        inheritGeneralPurposeToolCatalog: opts.inheritGeneralPurposeToolCatalog,
+        resolveAgentDef: opts.resolveAgentDef,
+        provider: opts.provider,
+        signal: opts.signal,
+        cwd: childCwd,
+      });
+    }
+    if (!childDispatchTool) throw new Error(`No dispatcher for ${name}`);
+    return childDispatchTool(name, args);
+  };
   const handle = globalAgentRegistry.spawn({
     definition: spawnDefinition,
     prompt: childPrompt,
     ...(opts.parentSessionId ? { parentSessionId: opts.parentSessionId } : {}),
+    ...(opts.parentTaskId ? { parentTaskId: opts.parentTaskId } : {}),
     label: spawnName ?? description,   // PFC-S1 P1: explicit `name`
                           // wins, else fall back to the task label
                           // (kept for existing callers).
     tools: childTools,
-    dispatchTool: childDispatchTool,
+    dispatchTool: dispatchChildTool,
     provider: opts.provider,
     maxTurns: requestedMaxTurns,
     // P5.1: stamp the correlation ID on the registry task so the
@@ -1012,6 +1033,7 @@ export async function dispatchAgent(
     ...(runInBackground ? { background: true } : {}),
     ...(runInBackground ? { completionDelivery } : {}),
   });
+  spawnedTaskId = handle.task.id;
 
   // Terminal release for this dispatch's reserved fan-out slot: the
   // registry fires this exactly once per task when it reaches a

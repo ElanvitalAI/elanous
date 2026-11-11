@@ -6,6 +6,7 @@ import { listCredentialSlotsAsync } from '../config/secrets/cred-slots.js';
 import { hasCredentialSlotWriteReceipt, writeCredentialSlotBatchValue } from '../config/secrets/registry.js';
 import { verifyServiceKey, type ServiceKeyVerification } from '../../setup/service-keys.js';
 import { jsonResponse } from './json-response.js';
+import { asRecord } from '../../primitives/guards.js';
 
 export interface SetupCredentialDeps {
   dir?: string;
@@ -23,9 +24,6 @@ function reconcileCredentialSubmission(receiptId: string, valueHash: string): 'c
     return hasCredentialSlotWriteReceipt(receiptId, valueHash) ? 'committed' : 'not-committed';
   } catch { return 'unknown'; }
 }
-
-const asRecord = (value: unknown): Record<string, unknown> | undefined =>
-  value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 
 async function readJson(req: Request): Promise<Record<string, unknown> | null> {
   const lengthHeader = req.headers.get('content-length');
@@ -51,7 +49,7 @@ async function readJson(req: Request): Promise<Record<string, unknown> | null> {
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
     const text = new TextDecoder().decode(bytes);
-    return asRecord(JSON.parse(text)) ?? null;
+    return asRecord(JSON.parse(text), { fallback: 'undefined' }) ?? null;
   } catch {
     try { await reader.cancel(); } catch { /* already closed */ }
     return null;

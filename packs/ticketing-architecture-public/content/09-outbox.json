@@ -1,0 +1,12 @@
+{
+  "type": "procedure",
+  "title": "트랜잭션 아웃박스",
+  "source": "https://microservices.io/patterns/data/transactional-outbox.html",
+  "preconditions": "주문 확정과 알림/이벤트 발행이 함께 필요하다.",
+  "steps": [
+    "1) 같은 DB 트랜잭션에서 주문 확정과 outbox 행 삽입",
+    "2) 릴레이가 미발행 행을 브로커로 보냄",
+    "3) 발행 확인 뒤 처리 표기",
+    "4) 릴레이 재시작 때 중복 발행을 허용하고 소비자 멱등으로 제거. 원장 커밋과 브로커 발행 사이의 이중 쓰기 공백을 없애되 재전송은 남는다."
+  ]
+}

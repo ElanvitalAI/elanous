@@ -1,0 +1,182 @@
+{
+  "checkedAt": "2026-11-10T10:35:30.332Z",
+  "mode": "direct runGraph in isolated test world",
+  "graphId": "gcp-architect-expand",
+  "runId": "eac3462a-be88-4c1e-8b28-16cdbfbbe55d",
+  "status": "awaiting-approval",
+  "pendingNode": "approve",
+  "executedNodes": [
+    "detect",
+    "design",
+    "deliverables"
+  ],
+  "spendingNodesExecuted": false,
+  "realGcpCalls": 0,
+  "input": {
+    "ticketDesignPath": "/home/ubuntu/elanous-hq/seat-state/OP/solar/structured-design.json",
+    "designResultSha256": "6c4a91bfd1beb76820a94049f76c09f937d12e80f61a90ef18f7077753a1285f",
+    "sourceKind": "structured-architecture-design-json",
+    "sourceSessionId": null,
+    "sourceGraphRunId": null,
+    "pressurePath": "/home/ubuntu/elanous-hq/seats/R-GCPX/GCP-ARCHITECT/plugins/gcp-architect-expand/demo/fixtures/pressure.json",
+    "proposalPath": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/generated-from-design/proposal.json",
+    "sourceHtml": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/generated-from-design/architecture-design.html",
+    "sourceDiagram": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/generated-from-design/architecture.excalidraw"
+  },
+  "assumptions": [
+    {
+      "field": "offloadKind",
+      "value": "batch",
+      "source": "gcp-adapter-default",
+      "requiresConfirmation": true
+    },
+    {
+      "field": "retryable",
+      "value": true,
+      "source": "gcp-adapter-default",
+      "requiresConfirmation": true
+    },
+    {
+      "field": "checkpointable",
+      "value": true,
+      "source": "gcp-adapter-default",
+      "requiresConfirmation": true
+    },
+    {
+      "field": "containsPii",
+      "value": false,
+      "source": "gcp-adapter-default",
+      "requiresConfirmation": true
+    },
+    {
+      "field": "dataClass",
+      "value": "internal",
+      "source": "gcp-adapter-default",
+      "requiresConfirmation": true
+    },
+    {
+      "field": "exportData",
+      "value": "식별자 제거된 집계 이벤트",
+      "source": "gcp-adapter-default",
+      "requiresConfirmation": true
+    },
+    {
+      "field": "offloadWorkload",
+      "value": "비식별 이벤트 집계·리포트 생성",
+      "source": "gcp-adapter-default",
+      "requiresConfirmation": true
+    },
+    {
+      "field": "region",
+      "value": "asia-northeast3",
+      "source": "gcp-adapter-default",
+      "requiresConfirmation": true
+    },
+    {
+      "field": "usage.vcpuHours",
+      "value": 4,
+      "source": "gcp-adapter-default",
+      "requiresConfirmation": true
+    },
+    {
+      "field": "usage.gibHours",
+      "value": 8,
+      "source": "gcp-adapter-default",
+      "requiresConfirmation": true
+    }
+  ],
+  "assumptionStatus": "unconfirmed",
+  "sharedGraphId": "architecture-deliverables",
+  "sharedGraphRunId": "426e7e3b-bdcf-40e8-a2eb-851ddb32af50",
+  "verification": {
+    "status": "verified",
+    "contract": "system-architecture/cloud-expansion@2",
+    "quality": "reference",
+    "pages": 6,
+    "iconLibraryUrl": "https://cloud.google.com/icons",
+    "verifiedIcons": 4,
+    "files": [
+      "architecture.excalidraw",
+      "architecture.png",
+      "architecture.html",
+      "architecture.pdf"
+    ],
+    "pdfSections": [
+      "배경",
+      "요구사항",
+      "구성도",
+      "데이터 흐름",
+      "보안 등급",
+      "비용 예측",
+      "절감안",
+      "대안",
+      "결정 기록"
+    ],
+    "elements": 83,
+    "pngBytes": 880340,
+    "pdfBytes": 889718
+  },
+  "files": [
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/artifacts/architecture.excalidraw",
+      "sha256": "e6dc18119edcceab1e1c90e115ea3cc04171954f3c527dd6a285bbb3b9111ce7"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/artifacts/architecture.png",
+      "sha256": "690a3e9c813dcbe35f008b81f089a0fac3690eb816b30a09c93d930e651a07bc"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/artifacts/architecture.pdf",
+      "sha256": "2987e36a208b28e3ff97a2e4e805193127995c35d6ccfe2e94ebc50c6e9403c1"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/artifacts/architecture.html",
+      "sha256": "9d694c64ea2b9230d116a95f7ae4f174c165e834039a28ef2d68afd22f46a9f5"
+    },
+    {
+      "path": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/artifacts/verification.json",
+      "sha256": "632772fe6aadc5880797991b70cba31cbf909720098809fd918faf6d65e6410b"
+    }
+  ],
+  "attachments": [
+    {
+      "kind": "diagram-source",
+      "title": "편집 가능한 아키텍처 도면",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/artifacts/architecture.excalidraw",
+      "mime": "application/json",
+      "sha256": "e6dc18119edcceab1e1c90e115ea3cc04171954f3c527dd6a285bbb3b9111ce7",
+      "producedBy": "diagram"
+    },
+    {
+      "kind": "diagram",
+      "title": "GCP 확장 구성도",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/artifacts/architecture.png",
+      "mime": "image/png",
+      "sha256": "690a3e9c813dcbe35f008b81f089a0fac3690eb816b30a09c93d930e651a07bc",
+      "producedBy": "diagram"
+    },
+    {
+      "kind": "pdf",
+      "title": "시스템 아키텍처 설계 문서",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/artifacts/architecture.pdf",
+      "mime": "application/pdf",
+      "sha256": "2987e36a208b28e3ff97a2e4e805193127995c35d6ccfe2e94ebc50c6e9403c1",
+      "producedBy": "pdf"
+    },
+    {
+      "kind": "html",
+      "title": "설계 문서 HTML 원본",
+      "url": "/home/ubuntu/elanous-hq/seat-state/OP/solar/gcpx-solar-original-retest-1110/artifacts/architecture.html",
+      "mime": "text/html",
+      "sha256": "9d694c64ea2b9230d116a95f7ae4f174c165e834039a28ef2d68afd22f46a9f5",
+      "producedBy": "pdf"
+    }
+  ],
+  "limitations": [
+    "structured architecture JSON supplied by caller",
+    "synthetic pressure fixture",
+    "diagram/PDF content uses the existing fake-world renderer adapted for the common output contract",
+    "no HITL approval or GCP provisioning executed",
+    "not a classic TUI/board attachment receipt"
+  ]
+}

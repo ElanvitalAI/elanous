@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "파일·미디어 처리 — 비동기 변환 파이프라인",
+  "source": "https://docs.aws.amazon.com/solutions/latest/serverless-image-handler/welcome.html",
+  "body": "적용 시점: 썸네일·트랜스코딩·OCR처럼 사용자 요청보다 오래 걸리는 작업일 때.\n용량 단계: 초기 소량은 단일 worker queue; 대기 시간이 사용자 계약을 넘거나 파일종류가 늘면 단계별 worker로 나눈다.\nGCP 대응: Cloud Storage finalize → Eventarc/Pub/Sub → Cloud Run job 또는 Transcoder API → 결과 bucket.\n비용 축: CPU/GPU 시간, 입력·출력 저장, 임시 파일과 egress가 주요 축이다.\n결정과 반증: worker 재시작·중복 이벤트·부분 산출물에서 완료 표식이 잘못 앞서지 않는지 시험한다."
+}

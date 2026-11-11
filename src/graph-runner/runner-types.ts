@@ -43,6 +43,10 @@ export interface GraphRunState {
   plannedPath?: string[];
   /** startedAt/endedAt (ISO) and seconds are written when the node runs; ledgers before GRAPH-NODE-TIMES (0.2.19) have none. */
   nodes: Array<{ nodeId: string; executionId?: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; reason?: string;
+    /** Safe destination selected before output redaction; preserves resume routing without storing the outcome value. */
+    resumeNextNode?: string;
+    /** Legacy destination field written by the previous secret-binding revision. */
+    commandNextNode?: string;
     completionReceipt?: { inputSha256: string; commit: string; artifactSha256: string };
     invalidatedByEvent?: string;
     failure?: { errorCode: string; message: string; stage: string }; decidedBy?: string; decidedAt?: string;
@@ -133,6 +137,10 @@ export interface GraphRunOptions {
   runId?: string;
   /** Optional structured event sink for actual node lifecycle events and declared subscriptions. */
   eventBus?: GraphEventBus;
+  /** Root containing graph declarations with triggers.event: { from, on }. */
+  graphEventTriggerRoot?: string;
+  /** Internal dispatch runs disable routing to keep one event delivery from recursively fanning out. */
+  routeGraphEvents?: boolean;
   resumeRunId?: string;
   resumeGraphId?: string;
   fromNodeId?: string;
@@ -177,7 +185,11 @@ export interface GraphRunOptions {
   researchEdgeDecisionRegistry?: ResearchEdgeDecisionRegistry;
   deps?: {
     root?: string;
+    /** Trusted caller's ARG feedback universe; release operations default to prod. */
+    argFeedbackUniverse?: 'test' | 'prod';
     runBash?: BashRun;
+    /** Resolve a graph YAML secret name from the Elanous secret store (injectable for simulations). */
+    resolveGraphSecret?: (name: string) => Promise<string | undefined>;
     callLLM?: (prompt: string) => Promise<string>;
     log?: (event: string, data: Record<string, unknown>) => void;
     releaseStageMail?: (input: { runId: string; nodeId: string; state: ReleaseStageState }) => unknown;

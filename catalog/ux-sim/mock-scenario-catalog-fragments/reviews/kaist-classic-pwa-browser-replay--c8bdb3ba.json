@@ -1,0 +1,4 @@
+{
+  "deviceKey": "kaist-classic-pwa-browser-replay",
+  "review": "> 📅 **2026-11-11 재검토 (KAIST-PWA-REPLAY-RECEIPT)** — classic PTY의 fake member·absorb-build receipt를 PWA의 loopback API 응답으로 재생하고 Chromium에서 보이는 내용을 캡처한다. run ID·owner·보드 카드·첨부 SHA를 PTY 출력과 일치시키고 test-world 밖 요청은 금지한다. 매뉴얼 행은 이 catalog fragment에서 생성한다."
+}

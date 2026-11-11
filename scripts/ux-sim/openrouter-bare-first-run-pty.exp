@@ -1,0 +1,35 @@
+# Manual macOS PTY driver. Run from the repository root with a prepared /tmp/test-* root.
+set timeout 35
+set root [lindex $argv 0]
+if {![string match "/tmp/test-*" $root]} {
+  puts stderr "expected a /tmp/test-* root"
+  exit 1
+}
+log_file -noappend "$root/bare-flow-pty.log"
+spawn env -i PATH=$env(PATH) HOME=$root/home CODEX_HOME=$root/home/.codex ELANOUS_STATE_DIR=$root/state ELANOUS_LANG=ko OPENROUTER_API_KEY=synthetic-pty-fixture-key ELANOUS_KEY_CACHE_DIR=$root/cache TERM=xterm-256color bun --preload ./scripts/ux-sim/openrouter-bare-first-run-no-network.ts bin/elanous.mjs --test --config-dir $root/cfg
+expect {
+  -re {선택: } {}
+  eof { puts stderr "bare CLI exited before provider selection"; exit 2 }
+  timeout { puts stderr "provider setup prompt timeout"; exit 2 }
+}
+send "2\r"
+expect {
+  -re {이 키를 사용할까요\? \(y/n\): } {}
+  eof { puts stderr "bare CLI exited before synthetic key confirmation"; exit 3 }
+  timeout { puts stderr "synthetic key confirmation timeout"; exit 3 }
+}
+send "y\r"
+expect {
+  -re {OpenRouter 모델 .*Enter=첫 모델\): } {}
+  eof { puts stderr "bare CLI exited before model selection"; exit 4 }
+  timeout { puts stderr "model picker timeout"; exit 4 }
+}
+send "5\r"
+expect {
+  -re {\[elanous\].*openrouter/upstage/solar-pro4} {}
+  eof { puts stderr "bare CLI exited before saved provider banner"; exit 5 }
+  timeout { puts stderr "saved provider banner timeout"; exit 5 }
+}
+after 500
+send "\003"
+expect eof

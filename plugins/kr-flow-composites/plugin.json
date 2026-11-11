@@ -3,6 +3,7 @@
   "name": "kr-flow-composites",
   "version": "0.1.0",
   "description": "Read-only Korean sector, battery, and ETF market-data composition graphs.",
+  "dependencies": { "plugins": [{ "id": "marketplace-market-data", "version": "^0.1.0", "optional": true }] },
   "extensions": {
     "ai.elanous": {
       "graphs": ["./graphs/sector-flow.yaml", "./graphs/battery-signal.yaml", "./graphs/etf-price.yaml"],

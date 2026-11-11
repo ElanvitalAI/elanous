@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 
 import { ansi, type RenderOptions } from '../src/tui.js';
 import {
   createDashboardEssentialCursorObserver,
   renderDashboardFrame,
-} from '../src/dashboard/index.js';
+} from '../src/display/dashboard-frame.js';
 import { paintCursor } from '../src/display/cursor-state.js';
 import { tuiSourceText } from './helpers/dashboard-source.js';
 
@@ -193,15 +194,17 @@ describe('dashboard frame cursor wiring', () => {
   test('showDashboard 의 프레임 flush 가 헬퍼를 지난다', () => {
     const src = tuiSourceText();
     const showDashboardAt = src.indexOf('export async function showDashboard(');
-    // ⛔ 함수 **정의**만으로 참이 되면 가드가 아니다 — 등장 횟수로 정의와 호출을 가른다.
-    //    (파일 끝까지 훑는 것으로는 "이후 어딘가의 우연한 호출"에 속는다 — 무인 리뷰 should-fix.)
+    // The definition now lives in the shared display module. Keep the
+    // dashboard call, so extracting the function cannot leave it unused.
+    const frameSource = readFileSync(new URL('../src/display/dashboard-frame.ts', import.meta.url), 'utf8');
     const occurrences = src.split('renderDashboardFrame(').length - 1;
     const callAt = src.indexOf('renderDashboardFrame(', showDashboardAt);
     // ⚠️ 소스를 단언 대상으로 넘기지 않는다 — 실패 메시지가 파일 전체(수만 자)를 토한다.
     const bareRenderCall = /\brender\(\s*baseLines\s*,/.exec(src.slice(showDashboardAt))?.[0] ?? null;
 
     expect(showDashboardAt).toBeGreaterThan(-1);
-    expect(occurrences).toBe(2);              // 정의 1 · 호출 1
+    expect(frameSource).toContain('export function renderDashboardFrame(');
+    expect(occurrences).toBe(1);
     expect(callAt).toBeGreaterThan(showDashboardAt);
     expect(bareRenderCall).toBeNull();
   });

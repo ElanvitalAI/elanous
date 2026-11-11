@@ -176,7 +176,7 @@ describe('dispatchAgent — helpers on the existing path', () => {
     expect(def.maxTurns).toBe(AGENT_TOOL_DEFAULT_MAX_TURNS);
   });
 
-  test('child tool list is stripped of Agent (one-level nest)', async () => {
+  test('first child may call Agent; its grandchild cannot recurse', async () => {
     let childToolNames: string[] = [];
     const provider: LLMProvider = {
       name: 'capture',
@@ -196,11 +196,43 @@ describe('dispatchAgent — helpers on the existing path', () => {
     const def: AgentDefinition = { ...stubDef, tools: ['Bash', 'Read', 'Agent'] };
     await dispatchAgent(
       { description: 'd', prompt: 'p' },
-      { provider, hostTools, resolveAgentDef: () => def },
+      { provider, hostTools, dispatchTool: async () => 'ok', resolveAgentDef: () => def },
     );
     expect(childToolNames).toContain('Bash');
     expect(childToolNames).toContain('Read');
+    expect(childToolNames).toContain('Agent');
+    await dispatchAgent(
+      { description: 'grandchild', prompt: 'p' },
+      { provider, hostTools, dispatchTool: async () => 'ok', resolveAgentDef: () => def, parentTaskId: 'parent-task' },
+    );
     expect(childToolNames).not.toContain('Agent');
+  });
+
+  test('nested Agent resolves a caller-provided grandchild definition', async () => {
+    const parent: AgentDefinition = { name: 'custom-parent', systemPrompt: 'parent', tools: ['Agent'] };
+    const grandchild: AgentDefinition = { name: 'custom-grandchild', systemPrompt: 'grandchild', tools: [] };
+    const resolved: string[] = [];
+    const provider = fakeProvider([
+      [{ type: 'tool_call', id: 'nested-1', name: 'Agent', args: {
+        description: 'grandchild task', prompt: 'grandchild prompt', subagent_type: 'custom-grandchild',
+      } }, { type: 'turn_end', endTurn: false }],
+      [{ type: 'text', delta: 'grandchild done' }],
+      [{ type: 'text', delta: 'parent done' }],
+    ]);
+    const priorMode = process.env.ELANOUS_LLM_MODE;
+    process.env.ELANOUS_LLM_MODE = 'real';
+    try {
+      await dispatchAgent({ description: 'parent task', prompt: 'parent prompt', subagent_type: 'custom-parent' }, {
+        provider, hostTools: [{ name: 'Agent', description: 'spawn', parameters: { type: 'object' } }],
+        resolveAgentDef: (name) => { resolved.push(name); return name === 'custom-parent' ? parent
+          : name === 'custom-grandchild' ? grandchild : undefined; },
+      });
+      expect(resolved).toContain('custom-grandchild');
+      expect(globalAgentRegistry.list().some((task) => task.parentTaskId && task.definition.name === 'custom-grandchild')).toBe(true);
+    } finally {
+      if (priorMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+      else process.env.ELANOUS_LLM_MODE = priorMode;
+    }
   });
 });
 

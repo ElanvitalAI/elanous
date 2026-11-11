@@ -1,6 +1,7 @@
 import type { Command } from 'commander';
 import { existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { writeStdoutJson } from '../cli/stdout-json.js';
 import type { GraphVariantPlan } from '../self-implement/graph-variant.js';
@@ -10,6 +11,9 @@ import { createDefaultMarketDataRegistry } from './capability-providers/market-d
 import { importN8nExecuteWorkflow } from '../graph-v2/n8n-import.js';
 import { resolveGraphUnit } from '../self-implement/graph-unit-resolver.js';
 import { loadGraphPluginFromDir } from './graph-manifest-loader.js';
+import { watchGraphRunEvents } from './graph-run-event-ledger.js';
+import { saveGraphRunMsgSubscriber } from './graph-run-msg-subscriptions.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 
 function findGraphFile(graphId: string, extraRoots: string[] = []): string | undefined {
   const roots = [...extraRoots.map((root) => resolve(root)), resolve('graphs'), resolve(import.meta.dir, '../../graphs')];
@@ -28,6 +32,27 @@ function findGraphFile(graphId: string, extraRoots: string[] = []): string | und
     }
   }
   return undefined;
+}
+
+async function defaultCapabilityRegistryForGraph(file: string) {
+  const graphPath = resolve(file);
+  const pluginRoot = resolve(dirname(graphPath), '..');
+  const manifestPath = join(pluginRoot, 'plugin.json');
+  if (!existsSync(manifestPath)) return createDefaultMarketDataRegistry();
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { extensions?: { 'ai.elanous'?: {
+    graphs?: string[]; graphProviders?: Record<string, { module: string; factory: string; withPluginRoot?: boolean }> } } };
+  const extension = manifest.extensions?.['ai.elanous'];
+  const relativeGraph = `./graphs/${basename(graphPath)}`;
+  if (!extension?.graphs?.includes(relativeGraph)) return createDefaultMarketDataRegistry();
+  const declaration = extension.graphProviders?.[relativeGraph];
+  if (!declaration) return createDefaultMarketDataRegistry();
+  const modulePath = realpathSync(resolve(import.meta.dir, '../..', declaration.module));
+  const providerRoot = realpathSync(resolve(import.meta.dir, '.'));
+  if (!modulePath.startsWith(providerRoot + '/')) throw new Error('plugin graph provider must use the shared graph runner');
+  const module = await import(pathToFileURL(modulePath).href) as Record<string, unknown>;
+  const factory = module[declaration.factory];
+  if (typeof factory !== 'function') throw new Error(`plugin graph provider factory missing: ${declaration.factory}`);
+  return declaration.withPluginRoot ? factory(pluginRoot) : factory();
 }
 
 export function registerGraphCommands(program: Command, runsDeps: {
@@ -176,7 +201,7 @@ export function registerGraphCommands(program: Command, runsDeps: {
           input = parsed as Record<string, unknown>;
         }
         const state = await runGraph(file, { ...(opts.resume ? { resumeRunId: opts.resume } : { dryRun: opts.dryRun }), ...(opts.from ? { fromNodeId: opts.from } : {}), ...(opts.fromVisit ? { fromVisitId: opts.fromVisit } : {}), useCurrentGraph: opts.useCurrentGraph, ...(input === undefined ? {} : { input }),
-          deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: runsDeps.capabilityProviders ?? createDefaultMarketDataRegistry() } });
+          deps: { ...(runsDeps.root ? { root: runsDeps.root } : {}), capabilityProviders: runsDeps.capabilityProviders ?? await defaultCapabilityRegistryForGraph(file) } });
         if (opts.json) await writeStdoutJson(JSON.stringify(state) + '\n');
         else console.log(`${state.graphId} ${state.runId}: ${state.status} (${(state.plannedPath ?? state.path).join(' → ')}, executed: ${state.executed})${state.pending ? ` — ${state.pending.message}` : ''}`);
         if (state.status !== 'done' && state.status !== 'awaiting-approval') process.exitCode = 1;
@@ -458,6 +483,56 @@ export function registerGraphCommands(program: Command, runsDeps: {
     finishedAt: state.finishedAt ?? null, alive: alive(state),
   });
   const warning = (unreadable: number) => { if (unreadable) console.error(`⚠ 못 읽은 원장 ${unreadable}`); };
+  runs.command('watch <run_id>')
+    .description('Replay and optionally follow durable events for one graph run')
+    .option('--type <type>', 'Only show this event type')
+    .option('--follow', 'Keep watching until the run completes or interrupted')
+    .option('--json', 'Print one JSON event per line')
+    .action(async (runId: string, opts: { type?: string; follow?: boolean; json?: boolean }) => {
+      const controller = new AbortController();
+      const interrupt = () => controller.abort();
+      if (opts.follow) process.once('SIGINT', interrupt);
+      try {
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(runId) || runId === '.' || runId === '..') throw new Error(`invalid run id: ${runId}`);
+        const { runs: all } = listGraphRuns(runsDeps.root);
+        const exact = all.filter(state => state.runId === runId);
+        const matches = exact.length ? exact : all.filter(state => state.runId.startsWith(runId));
+        if (matches.length !== 1) throw new Error(matches.length ? `ambiguous run id: ${runId}` : `no run: ${runId}`);
+        const saved = matches[0]!;
+        for await (const event of watchGraphRunEvents(runsDeps.root ?? effectiveInstanceRoot(), saved.graphId, saved.runId,
+          { type: opts.type, follow: opts.follow, signal: controller.signal })) {
+          if (opts.json) await writeStdoutJson(JSON.stringify(event) + '\n');
+          else console.log(`${event.sequence} · ${event.emittedAt} · ${event.type} · ${event.source.nodeId ?? 'runner'} · ${event.eventId}`);
+        }
+      } catch (error) {
+        console.error(`graph runs watch: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      } finally {
+        if (opts.follow) process.removeListener('SIGINT', interrupt);
+      }
+    });
+  runs.command('subscribe <run_id>')
+    .description('Send matching run events to one seat via eln msg')
+    .requiredOption('--to <seat>', 'Subscriber seat address')
+    .option('--type <type>', 'Event type (defaults to failed node-end)')
+    .option('--node <node_id>', 'Filter by source node')
+    .option('--outcome <outcome>', 'Filter by outcome')
+    .action((runId: string, opts: { to: string; type?: string; node?: string; outcome?: string }) => {
+      try {
+        const { runs: all } = listGraphRuns(runsDeps.root);
+        const matches = all.filter(state => state.runId === runId);
+        if (matches.length !== 1) throw new Error(matches.length ? `ambiguous run id: ${runId}` : `no run: ${runId}`);
+        const saved = matches[0]!;
+        const match = { ...(opts.node ? { nodeId: opts.node } : {}),
+          ...(opts.outcome ? { outcome: opts.outcome } : !opts.type ? { outcome: 'fail' } : {}) };
+        saveGraphRunMsgSubscriber(runsDeps.root ?? effectiveInstanceRoot(), saved.graphId, saved.runId,
+          { to: opts.to, type: opts.type ?? 'node-end', ...(Object.keys(match).length ? { match } : {}) });
+        console.log(`${saved.graphId}/${saved.runId}: ${opts.to} subscribed to ${opts.type ?? 'node-end'}`);
+      } catch (error) {
+        console.error(`graph runs subscribe: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
   runs.command('list')
     .option('--graph <id>', 'Filter by graph id')
     .option('--state <status>', 'Filter by run status')

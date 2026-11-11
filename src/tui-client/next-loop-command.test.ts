@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { createNextLoopCommand } from './next-loop-command.js';
-import type { InternalTurnGate } from '../dashboard/input/internal-turn.js';
+import type { InternalTurnGate } from '../tui/input/internal-turn.js';
 
 describe('Next TUI /loop command', () => {
   test('fake clock retries while human input owns the turn, then fires once and stops', () => {

@@ -1,6 +1,9 @@
 // Tests that plugins/agent-team/ ships the 5 PFC builtins correctly (PFC PX-1 Phase 5).
 
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { loadPluginContributedAgents } from '../src/agent/plugin-agents.js';
 import { RESERVED_AGENT_IDS } from '../src/agent/definition-registry.js';
 import { composeSystemPrompt } from '../src/agent/loader.js';
@@ -8,7 +11,10 @@ import { composeSystemPrompt } from '../src/agent/loader.js';
 const PROJECT_ROOT = new URL('..', import.meta.url).pathname;
 
 describe('plugins/agent-team — shipped 5 PFC builtins', () => {
-  const { defs, errors } = loadPluginContributedAgents(PROJECT_ROOT);
+  const pluginsRoot = mkdtempSync(join(tmpdir(), 'pfc-agent-team-'));
+  symlinkSync(join(PROJECT_ROOT, 'plugins/agent-team'), join(pluginsRoot, 'agent-team'), 'dir');
+  afterAll(() => rmSync(pluginsRoot, { recursive: true, force: true }));
+  const { defs, errors } = loadPluginContributedAgents(PROJECT_ROOT, pluginsRoot);
 
   test('loads without errors', () => {
     expect(errors).toHaveLength(0);

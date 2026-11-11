@@ -1,0 +1,3 @@
+convert:
+  command: 'bun "$ELANOUS_RUNTIME_ROOT/src/graph-runner/briefing-requirements/run-step.ts"'
+  timeout_ms: 10000

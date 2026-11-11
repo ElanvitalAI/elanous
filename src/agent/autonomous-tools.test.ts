@@ -23,7 +23,7 @@ describe('autonomous-tools — Phase 1 골든룰(이름배열 diff=0)', () => {
     //   ⛔ 지운 것이 아니라 스위치(`tools.runDevHarness.modelSurface`)가 기본 false 인 것이고,
     //     켜면 종전 배열이 그대로 돌아온다 — 그 대칭은 `test/dev-harness-model-surface.test.ts` 가 문다.
     //   ⛔ 그리고 dispatch 경로(CLI·파이프라인)는 이 배열과 «무관»하게 산다.
-    expect(names).toEqual(['delegate_code_agent', 'SelfImplement', 'SolveMission']);
+    expect(names).toEqual(['delegate_code_agent', 'SelfImplement']);
   });
 
   test('AUTONOMOUS_TOOL_NAMES 는 dispatch 라우팅 대상 전체(SelfImplement 별칭 self_implement 포함)', () => {
@@ -37,7 +37,6 @@ describe('autonomous-tools — Phase 1 골든룰(이름배열 diff=0)', () => {
       'SelfImplement',
       'self_implement',
       'RunDevHarness',
-      'SolveMission',
       'RelayShellPrompt',
     ]);
   });

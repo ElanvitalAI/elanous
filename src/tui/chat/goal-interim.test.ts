@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { formatGoalContinuePrompt } from '../../dashboard/input/goal-continue.js';
+import { formatGoalContinuePrompt } from '../input/goal-continue.js';
 import { logViewLines } from './log-view.js';
 import { classifyInterimReply, planInterimDisplay } from './goal-interim.js';
 

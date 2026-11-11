@@ -65,10 +65,11 @@ describe('parseOpenAISSELines', () => {
       `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
     ];
     const events = await collect(parseOpenAISSELines(lines));
-    expect(events).toHaveLength(1);
+    expect(events).toHaveLength(2);
     expect(events[0]).toEqual({
       type: 'tool_call', id: 'call_abc', name: 'bump', args: { by: 3 },
     });
+    expect(events[1]).toEqual({ type: 'finish', reason: 'tool_calls' });
   });
 
   test('mixed text and tool_call in same stream', async () => {
@@ -81,6 +82,7 @@ describe('parseOpenAISSELines', () => {
     expect(events).toEqual([
       { type: 'text', delta: 'thinking...' },
       { type: 'tool_call', id: 'c1', name: 'f', args: {} },
+      { type: 'finish', reason: 'tool_calls' },
     ]);
   });
 
@@ -100,9 +102,10 @@ describe('parseOpenAISSELines', () => {
       `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
     ];
     const events = await collect(parseOpenAISSELines(lines));
-    expect(events).toHaveLength(2);
+    expect(events).toHaveLength(3);
     expect(events[0]).toEqual({ type: 'tool_call', id: 'a', name: 'x', args: { n: 1 } });
     expect(events[1]).toEqual({ type: 'tool_call', id: 'b', name: 'y', args: { m: 2 } });
+    expect(events[2]).toEqual({ type: 'finish', reason: 'tool_calls' });
   });
 });
 

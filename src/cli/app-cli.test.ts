@@ -36,6 +36,19 @@ describe('app openapi CLI', () => {
     expect(JSON.parse(output.join('')).paths['/rpc/ping'].post.operationId).toBe('rpc_ping');
   });
 
+  test('app role-checks consumes the generated role matrix through the CLI', async () => {
+    const output: string[] = [];
+    const program = new Command();
+    program.exitOverride();
+    registerAppCommands(program, { appsRoot: fixture(), write: text => output.push(text) });
+    await program.parseAsync(['node', 'eln', 'app', 'role-checks', 'voice-note'], { from: 'node' });
+    expect(JSON.parse(output.join(''))).toEqual([
+      { method: 'POST', path: '/rpc/ping', role: 'owner', auth: 'declared', expected: 'allow' },
+      { method: 'POST', path: '/rpc/ping', role: 'anon', auth: 'anonymous', expected: 'deny' },
+      { method: 'POST', path: '/rpc/ping', role: '__undeclared_role__', auth: 'undeclared', expected: 'deny' },
+    ]);
+  });
+
   test('app build command snapshots then builds from the immutable source revision path', async () => {
     const appsRoot = fixture();
     const appSource = join(appsRoot, 'voice-note');

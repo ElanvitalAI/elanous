@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GCP-ARCHITECT-EXPAND-FAKE-WORLD-TS",
+  "path": "src/ux-sim/gcp-architect-expand-fake-world.ts",
+  "boundary": "Runs the offline fake GCP project and resource ledger; no Google Cloud SDK, CLI, credentials, or network access.",
+  "deviceIds": [
+    "gcp-architect-expand-fake-world"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

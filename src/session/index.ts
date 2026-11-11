@@ -31,6 +31,7 @@ import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { InputSourceKind } from '../input/input-source-kind.js';
 import { resolveInstanceName } from '../instance-identity.js';
+import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { isInHarnessSpace } from '../harness/harness-space.js';
 import { recordSessionObservation } from './session-observation.js';
 import { telegramEndpointKey, discordEndpointKey, telegramOldPathTarget } from './session-endpoint-key.js';
@@ -69,6 +70,11 @@ export function sessionRoot(): string {
   // dir. Prod never sets it, so behavior is unchanged.
   const override = process.env.ELANOUS_SESSION_ROOT?.trim();
   if (override) return override;
+  // --config-dir selects the parent TUI universe before it creates a session.
+  // The REPL child receives that same root as ELANOUS_STATE_DIR; without this
+  // branch the parent writes to ~/.elanous while the child reads elsewhere.
+  const configDir = getElanousConfigDirOverride()?.trim();
+  if (configDir) return join(configDir, 'sessions');
   // ELANOUS_STATE_DIR — the unified isolated-state knob (sessions +
   // acp-sessions + surface_events + codex-threads under one dir). Lets a
   // process like `elanous telegram-test` keep ALL mutable state separate

@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "kind": "gcp-architect-board-attachment-handoff",
+  "cardTitle": "공연 티켓팅 플랫폼",
+  "proposalId": "ticket-demo-4c7c693ad20d",
+  "inputSha256": "4c7c693ad20d51a22fee6b808c94da303d212735fb431e92869f0d7fa8934858",
+  "status": "artifacts-ready",
+  "deploymentStatus": "unverified",
+  "realGcpCalls": 0,
+  "attachments": [
+    {
+      "kind": "diagram-source",
+      "title": "편집 가능한 아키텍처 도면",
+      "url": "./architecture.excalidraw",
+      "mime": "application/json",
+      "sha256": "f8c1796c7aa870e19b6ecb8e861170a2e778c5a2d9adc324c2e2e631e2a73411",
+      "producedBy": "diagram"
+    },
+    {
+      "kind": "diagram",
+      "title": "GCP 확장 구성도",
+      "url": "./architecture.png",
+      "mime": "image/png",
+      "sha256": "19e05b207b647874e76284c8f1751bade69ea7fac563e628c050848efb3b2681",
+      "producedBy": "diagram"
+    },
+    {
+      "kind": "pdf",
+      "title": "시스템 아키텍처 설계 문서",
+      "url": "./architecture-design.pdf",
+      "mime": "application/pdf",
+      "sha256": "ea902e8c40f52e1a80db876fe3c55c01a3a88ac7a0d83c233fb40c61094eb101",
+      "producedBy": "pdf"
+    },
+    {
+      "kind": "html",
+      "title": "설계 문서 HTML 원본",
+      "url": "./architecture-design.html",
+      "mime": "text/html",
+      "sha256": "467dd46b1d3db271ffd6538fb64526a70e25d975a49ff3f750a042c2c80039e2",
+      "producedBy": "pdf"
+    }
+  ],
+  "consumerRule": "Relative URLs are test-universe artifact references only. For board.card, publish exact bytes through an authenticated route and regenerate with --attachment-url-base. Deployment status comes only from harness events."
+}

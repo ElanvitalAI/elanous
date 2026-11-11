@@ -12,7 +12,9 @@
  *   개수를 박으면 그래프를 정당하게 늘릴 때 거짓 빨강이 난다.
  */
 import { describe, expect, test } from 'bun:test';
-import { loadGraphTemplates } from '../src/self-implement/graph-yaml.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { loadGraphTemplates, parseGraphTemplateYaml } from '../src/self-implement/graph-yaml.js';
 import { loadGraphTemplatesFrom, defaultGraphsDir } from '../src/self-implement/graph-templates.js';
 
 describe('graphs/ 디렉토리는 «전부» 파싱돼야 한다', () => {
@@ -28,5 +30,17 @@ describe('graphs/ 디렉토리는 «전부» 파싱돼야 한다', () => {
 
   test('📏 스캔은 했나 — 「0개 읽었다」와 「디렉토리가 없다」를 가른다', () => {
     expect(loadGraphTemplates(defaultGraphsDir()).scannedFiles).toBeGreaterThan(0);
+  });
+
+  test('WORK-COMPOSE-WEBAPP 선언은 작업 그래프 로더가 읽는다', () => {
+    const file = join(import.meta.dir, '../graphs/work/web-app.yaml');
+    const parsed = parseGraphTemplateYaml(readFileSync(file, 'utf8'), 'graphs/work/web-app.yaml');
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.template?.graphId).toBe('work-web-app');
+    expect(parsed.template?.nodes.find((node) => node.nodeId === 'compose-web-app')).toMatchObject({
+      kind: 'subgraph',
+      call: 'web-app@1',
+      contract: { inputs: ['ask', 'context', 'prior'], tools: 'harness-say', outputs: ['result', 'evidence'] },
+    });
   });
 });

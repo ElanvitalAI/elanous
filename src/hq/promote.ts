@@ -27,6 +27,7 @@ if [ "$port_rc" -ne 1 ] || [ -n "$port_detail" ]; then echo "port=31416 occupied
 python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 31416)); s.close(); print("port=31416 available")'`;
 // The drill uses short SSH aliases; host-local hq.hostName may use either the short or full name.
 const hostNamesFor = (host: string): string[] => host === 'node-b' ? ['node-b', 'MacStudioB1']
+  : host === 'mshq' ? ['mshq', 'Joosungui-MacStudio']
   : host === 'mbp' ? ['mbp', 'MacBookProM5'] : [host];
 const checks: Array<[string, string]> = [
   ['PWA build', `test -f "$HOME/.local/share/elanous/current/node_modules/elanous/apps/pwa/out/index.html" && echo 'index.html present'`],

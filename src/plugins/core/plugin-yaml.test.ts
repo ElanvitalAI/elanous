@@ -106,6 +106,7 @@ test('shipped absorb v2 manifest compiles and installs with all declared graph t
     const generated = compilePluginYaml(source);
     expect(readFileSync(join(source, 'plugin.json'), 'utf8')).toBe(generated);
     const loaded = loadPluginManifestFromDir(source, { id: 'absorb' }).manifest;
+    expect(loaded.dependencies?.plugins).toEqual([{ id: 'elanous-app-deploy', version: '^0.3.9', optional: true }]);
     expect(loaded.contributes.aiTools?.map(tool => tool.name)).toEqual([
       'scrap_add', 'brief_today', 'suggest_list', 'suggest_accept',
     ]);

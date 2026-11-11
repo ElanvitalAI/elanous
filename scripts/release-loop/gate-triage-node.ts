@@ -594,6 +594,7 @@ if (import.meta.main) {
     const adaptiveHeal = context && gateOutput ? planAdaptiveGateHeal({ version, runId: context.runId ?? 'unknown',
       gate: (gateOutput.outcome === 'fail' ? { ...gateOutput, outcome: 'regression' } : gateOutput) as unknown as GateResult,
       triage: result, sourceOutcome: gateOutput.outcome as GateResult['outcome'] | 'fail',
+      ...(context.input.autoAppendRepair === true ? { autoAppendRepair: true } : {}),
       ...(visitState ? { visitState } : {}),
       ...(macroInputPresent
         ? { macrophageRepairLadder: context.input.macrophageRepairLadder as MacrophageRepairLadderInput } : {}),

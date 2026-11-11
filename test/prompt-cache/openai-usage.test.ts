@@ -81,6 +81,7 @@ describe('parseOpenAISSELines — usage chunk emitted', () => {
           cacheCreationInputTokens: 0,
         },
       },
+      { type: 'finish', reason: 'stop' },
     ]);
   });
 

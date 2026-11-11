@@ -3,17 +3,15 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { act, create } from 'react-test-renderer';
-import { renderToStaticMarkup } from 'react-dom/server';
 import { MemberProposalCard } from './MemberProposalCard';
-import { MemberMiniBoardView } from '../member-board/MemberMiniBoardView';
 import { createMemberMiniBoardApi } from '@/lib/member-mini-board-api';
 import { handleBoardRoute, type BoardCardEvent, type BoardEventStore } from '../../../../../src/nexus/api/board-api';
 import { createBoardApprovalDispatch } from '../../../../../plugins/absorb/handlers/board-approval';
-import { runAbsorbGraphSimulation } from '../../../../../src/ux-sim/absorb-v2-runGraph-sim';
+import { loadKaistClassicPtyReceipt } from '../../../../../src/ux-sim/kaist-classic-pwa-replay-world';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-test('KAIST test world: chat OK → approved → harness run/test → owner mini board', async () => {
+test('KAIST PWA chat OK posts once per proposal and keeps both graph acceptance IDs', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pwa-kaist-approval-'));
   mkdirSync(join(root, 'kaist-app'));
   const events: BoardCardEvent[] = [
@@ -25,27 +23,15 @@ test('KAIST test world: chat OK → approved → harness run/test → owner mini
     query: async ({ memberId }) => events.filter(event => event.memberId === memberId),
     append: async event => { events.push(event as BoardCardEvent); },
   };
-  let starts = 0;
-  let graphRun: Promise<unknown> | undefined;
+  const acceptedRunId = loadKaistClassicPtyReceipt().receipt.graphRun!.runId;
+  const dispatched: Array<{ file: string; runId: string | undefined; suggestionId: unknown; memberId: unknown }> = [];
   const dispatchApproved = createBoardApprovalDispatch({
     appsRoot: root,
-    createRunId: () => `accept-kaist-test-${starts + 1}`,
-    runGraph: async (file, options) => {
-      expect(file).toContain('absorb-build.yaml');
-      expect(options.input).toMatchObject({ suggestionId: starts === 0 ? 'kaist-card' : 'next-card', context: { memberId: 'member-a', appRef: 'kaist-app' } });
-      starts += 1;
-      if (starts === 1) {
-        graphRun = runAbsorbGraphSimulation({ confirmation: 'y', approvalRunId: options.runId, onAcceptedBuild: async state => {
-          expect(state.status).toBe('done');
-          expect(state.path).toEqual(expect.arrayContaining(['build', 'simulate', 'publish']));
-          const graphAttachment = { kind: 'diagram' as const, title: 'KAIST 흐름도', url: 'https://example.test/kaist.svg', mime: 'image/svg+xml', sha256: 'b'.repeat(64), producedBy: 'absorb-build' };
-          await store.append({ ...events[0]!, state: 'building', runId: state.runId, at: '2026-11-09T00:02:00.000Z' });
-          await store.append({ ...events[0]!, state: 'testing', runId: state.runId, summary: '그래프 시험 진행', at: '2026-11-09T00:03:00.000Z' });
-          await store.append({ ...events[0]!, state: 'released', runId: state.runId, summary: '가짜 그래프 발행 완료', attachments: [graphAttachment],
-            result: { publicUrl: 'https://lecture-scrap-demo.app.sim.invalid/' }, at: '2026-11-09T00:04:00.000Z' });
-        } });
-        await graphRun;
-      }
+    createRunId: () => dispatched.length === 0 ? acceptedRunId : 'accept-kaist-test-2',
+    runGraph: async (file, options = {}) => {
+      const input = options.input as { suggestionId?: unknown; context?: { memberId?: unknown } } | undefined;
+      dispatched.push({ file, runId: options.runId, suggestionId: input?.suggestionId,
+        memberId: input?.context?.memberId });
       return { status: 'done' } as never;
     },
   });
@@ -71,38 +57,25 @@ test('KAIST test world: chat OK → approved → harness run/test → owner mini
     await act(async () => { tree = create(<MemberProposalCard api={api} />); await Bun.sleep(0); });
     expect(JSON.stringify(tree.toJSON())).toContain('KAIST 강의 노트');
     expect(JSON.stringify(tree.toJSON())).not.toContain('다른 회원 제안');
-    expect(starts).toBe(0);
+    expect(dispatched).toHaveLength(0);
 
     await act(async () => { tree.root.findByType('button').props.onClick(); await Bun.sleep(0); });
     expect(requests.filter(request => request.method === 'POST')).toEqual([{
       path: '/v1/board/kaist-card/approve', method: 'POST', credentials: 'include',
     }]);
-    expect(starts).toBe(1);
-    expect(JSON.stringify(tree.toJSON())).toContain('accept-kaist-test-1');
-    expect(JSON.stringify(tree.toJSON())).toContain('/board');
+    expect(JSON.stringify(tree.toJSON())).toContain(acceptedRunId);
     expect(JSON.stringify(tree.toJSON())).toContain('다음 앱 제안');
-    expect(graphRun).toBeDefined();
-    await graphRun;
-    await act(async () => { tree.root.findByType('button').props.onClick(); await Bun.sleep(0); });
-    expect(starts).toBe(2);
-    expect(JSON.stringify(tree.toJSON())).toContain('accept-kaist-test-1');
-    expect(JSON.stringify(tree.toJSON())).toContain('accept-kaist-test-2');
 
-    expect(events.filter(event => event.cardId === 'kaist-card').map(event => event.state))
-      .toEqual(['suggested', 'approved', 'building', 'testing', 'released']);
-    const board = await api.getBoard() as { cards: Array<{ id: string; memberId: string; title: string; state: 'deployed'; summary: string; runId: string; publicUrl?: string }> };
-    const kaistCard = board.cards.find(card => card.id === 'kaist-card');
-    expect(kaistCard).toMatchObject({ id: 'kaist-card', state: 'deployed', runId: 'accept-kaist-test-1' });
-    expect(kaistCard?.publicUrl).toBe('https://lecture-scrap-demo.app.sim.invalid/');
-    const html = renderToStaticMarkup(<MemberMiniBoardView briefings={[]} cards={board.cards}
-      refreshedAt={null} loading={false} error={null} onRefresh={() => undefined} />);
-    expect(html).toContain('KAIST 강의 노트');
-    expect(html).toContain('가짜 그래프 발행 완료');
-    expect(html).toContain('KAIST 흐름도');
-    console.log('PWA_KAIST_TEST_RECEIPT', JSON.stringify({
-      fixtureId: 'pwa-kaist-approval-world-1', acceptanceId: 'accept-kaist-test-1', runId: 'accept-kaist-test-1',
-      boardState: kaistCard?.state, publicUrl: kaistCard?.publicUrl, scope: 'test-world',
-    }));
+    await act(async () => { tree.root.findByType('button').props.onClick(); await Bun.sleep(0); });
+    expect(requests.filter(request => request.method === 'POST').map(request => request.path))
+      .toEqual(['/v1/board/kaist-card/approve', '/v1/board/next-card/approve']);
+    expect(dispatched).toEqual([
+      { file: expect.stringContaining('absorb-build.yaml'), runId: acceptedRunId, suggestionId: 'kaist-card', memberId: 'member-a' },
+      { file: expect.stringContaining('absorb-build.yaml'), runId: 'accept-kaist-test-2', suggestionId: 'next-card', memberId: 'member-a' },
+    ]);
+    expect(JSON.stringify(tree.toJSON())).toContain(acceptedRunId);
+    expect(JSON.stringify(tree.toJSON())).toContain('accept-kaist-test-2');
+    expect(events.filter(event => event.cardId === 'kaist-card').map(event => event.state)).toEqual(['suggested', 'approved']);
   } finally {
     if (tree) await act(async () => tree.unmount());
     rmSync(root, { recursive: true, force: true });

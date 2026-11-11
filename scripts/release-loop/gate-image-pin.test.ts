@@ -3,7 +3,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gateImagePinPath, pinnedGateImageSync, readGateImagePin, replaceGateImagePin, resolveGateImagePin, supersedeGateImagePin,
-  gateImageLayerRuntimeKey, prebuildGateImagePinAtCut, runCutGateImagePrebuild, writeGateImagePin } from './gate-image-pin.js';
+  gateImageLayerRuntimeKey, gateRuntimeBaseReuseMode, prebuildGateImagePinAtCut, prebuildGateImagePinForRuntimeBases,
+  runCutGateImagePrebuild, writeGateImagePin } from './gate-image-pin.js';
 import { podCommandJobManifest } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { gateImageReadinessPendingPath, gateImageReadinessSignalPath,
   readGateImageReadinessSignal, waitForGateImageT60 } from './release-readiness.js';
@@ -164,6 +165,47 @@ it('keys the reusable source-free layer only by measured runtime identity', () =
   expect(gateImageLayerRuntimeKey({ ...identity, gateDepsDigest: 'a'.repeat(12) })).not.toBe(key);
   expect(gateImageLayerRuntimeKey({ ...identity, skillsDigest: 'none' })).not.toBe(key);
   expect(() => gateImageLayerRuntimeKey({ ...identity, lockHash: '' })).toThrow('identity is incomplete');
+});
+
+it('reuses a mixed-base runtime only when every pool already has the same immutable tag digest', () => {
+  const arm = { digest: digestA, architecture: 'aarch64' };
+  const amd = { digest: digestB, architecture: 'x86_64' };
+  expect(gateRuntimeBaseReuseMode([arm, arm], [])).toBe('uniform-base');
+  expect(gateRuntimeBaseReuseMode([arm, amd], [digestC, digestC])).toBe('shared-tag');
+  expect(() => gateRuntimeBaseReuseMode([arm, amd], [digestC, null])).toThrow('no shared pinned image tag');
+  expect(() => gateRuntimeBaseReuseMode([arm, amd], [digestC, digestB])).toThrow('no shared pinned image tag');
+  expect(() => gateRuntimeBaseReuseMode([arm, null], [digestC, digestC])).toThrow('could not be measured');
+});
+
+it('persists a mixed-base shared tag for the new run without building, and rejects missing or drifting pools', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'gate-mixed-base-prebuild-'));
+  const commit = 'd'.repeat(40);
+  const image = 'elanous-harness:shared-tag';
+  const members = [{ context: 'pool-arm' }, { context: 'pool-amd' }];
+  const runtimeBases = [{ digest: digestA, architecture: 'aarch64' }, { digest: digestB, architecture: 'x86_64' }];
+  const observed = new Map(members.map((member) => [member.context, digestC]));
+  let builds = 0;
+  const input = {
+    root, version: '0.3.6', commit, image, members, runtimeBases,
+    probe: (member: { context: string }) => observed.get(member.context) ?? null,
+    sync: async () => { builds++; return new Map(); },
+  };
+  try {
+    expect(await prebuildGateImagePinForRuntimeBases({ ...input, runId: 'shared-run' })).toEqual({
+      outcome: 'reused', digest: digestC, eligiblePools: members.map((member) => member.context),
+    });
+    expect(JSON.parse(readFileSync(gateImagePinPath(root, input.version, 'shared-run'), 'utf8')))
+      .toMatchObject({ runId: 'shared-run', commit, image, digest: digestC });
+    observed.set('pool-amd', digestB);
+    await expect(prebuildGateImagePinForRuntimeBases({ ...input, runId: 'drift-run' }))
+      .rejects.toThrow('no shared pinned image tag');
+    expect(existsSync(gateImagePinPath(root, input.version, 'drift-run'))).toBe(false);
+    observed.delete('pool-amd');
+    await expect(prebuildGateImagePinForRuntimeBases({ ...input, runId: 'missing-run' }))
+      .rejects.toThrow('no shared pinned image tag');
+    expect(existsSync(gateImagePinPath(root, input.version, 'missing-run'))).toBe(false);
+    expect(builds).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 it('GATE-IMAGE-PREBUILD-AT-CUT sim: builds after cut and persists the exact run pin', async () => {

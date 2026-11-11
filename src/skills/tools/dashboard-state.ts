@@ -17,7 +17,7 @@ import {
   renderDashboardStateForSystemPrompt,
   type DashboardStateSnapshot,
   type CaptureOpts,
-} from '../../dashboard/runtime/state-snapshot.js';
+} from '../../tool-runtime/dashboard-state-snapshot.js';
 
 export function buildGetDashboardStateTool(): LLMToolSpec {
   return {

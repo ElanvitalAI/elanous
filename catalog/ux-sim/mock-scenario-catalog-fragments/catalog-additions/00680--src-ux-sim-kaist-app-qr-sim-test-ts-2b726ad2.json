@@ -1,0 +1,4 @@
+{
+  "path": "src/ux-sim/kaist-app-qr-sim.test.ts",
+  "reason": "Focused acceptance test for the KAIST app QR simulation."
+}

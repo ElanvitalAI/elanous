@@ -1,5 +1,6 @@
 import { debug } from '../debug/log.js';
 import { recordFailureEvent } from '../self-implement/heal-intake.js';
+import { countsAsReal, inheritProvenance, unknownProvenance, type Provenance } from '../provenance/provenance.js';
 
 /** Event vocabulary of the loop-agent manifest observability contract. */
 export const LOOP_EVENTS = [
@@ -60,10 +61,22 @@ export function loopEvent(loopId: string, event: string, data: Record<string, un
     if (typeof payload.reason === 'string') payload.reason = oneLine(payload.reason);
     if (typeof payload.sourceRef === 'string') payload.sourceRef = oneLine(payload.sourceRef);
   }
+  const hasExplicit = Object.hasOwn(payload, 'provenance');
+  const hasCauses = Object.hasOwn(payload, 'causedByProvenance');
+  const causes = payload.causedByProvenance;
+  const provenance = hasExplicit || hasCauses
+    ? inheritProvenance([
+      ...(hasExplicit ? [payload.provenance] : []),
+      ...(hasCauses ? Array.isArray(causes) ? causes : [undefined] : []),
+    ])
+    : undefined;
   const missingRequired = REQUIRED_CONTEXT.filter(field =>
     typeof payload[field] !== 'string' || !(payload[field] as string).trim());
-  debug.log(`loop.${loopId}`, event, { ...payload, loopId, missingRequired });
-  if (event === 'tick' && (data.outcome === 'failed' || data.status === 'failed')) {
+  const observed = { ...payload, ...(provenance ? { provenance } : {}), loopId, missingRequired };
+  if (provenance) debug.log(`loop.${loopId}`, event, observed, { provenance });
+  else debug.log(`loop.${loopId}`, event, observed);
+  if (event === 'tick' && (data.outcome === 'failed' || data.outcome === 'fail' || data.status === 'failed')
+    && countsAsReal(provenance ?? unknownProvenance())) {
     try {
       recordFailureEvent({ source: 'loop-tick', kind: event, ref: loopId,
         summary: `Loop ${loopId} tick failed`, at: new Date().toISOString() });

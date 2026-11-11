@@ -16,6 +16,8 @@ import {
   type RenderOpts,
 } from '../log-entry.js';
 import type { ExecuteSkillOpts, SkillManifest } from './runner.js';
+import type { TerminalSessionRegistry } from '../terminal/session-registry.js';
+import { setTerminalInjectApprover, setTerminalInjectRegistryForTesting } from '../tool-runtime/terminal-inject-runtime.js';
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const strip = (s: string): string => s.replace(ANSI_RE, '');
@@ -66,6 +68,8 @@ const skillRunnerSpies = [
         mermaidDispatchResult = toolResult;
         return toolResult;
       })
+      : call.name === 'TerminalModalInject'
+        ? await handlers.dispatchTool(call.name, call.args, { callId: call.id })
       : TOOL_OUTPUT;
     handlers.onToolResult?.({ id: call.id, name: call.name, result });
     return 'ok';
@@ -200,6 +204,27 @@ describe('executeSkill final response', () => {
     expect(result.finalResponse).toBe('ok');
     expect(result.finalResponse).not.toContain('Read');
   }, 20_000);
+});
+
+test('skill runner keeps terminal injection behind the approval binding', async () => {
+  const written: string[] = [];
+  const session = {
+    id: 'test-terminal',
+    title: 'test terminal',
+    state: 'foreground',
+    preview: { write: (bytes: string) => written.push(bytes) },
+  };
+  setTerminalInjectRegistryForTesting({ get: () => session } as unknown as TerminalSessionRegistry);
+  setTerminalInjectApprover(null);
+  streamToolCall = { name: 'TerminalModalInject', args: { id: session.id, input: 'blocked' } };
+  try {
+    await expect(runExecuteSkill()).rejects.toThrow('no approver is wired');
+    expect(written).toEqual([]);
+  } finally {
+    streamToolCall = { name: 'Read', args: { file_path: '/tmp/demo.txt' } };
+    setTerminalInjectApprover(null);
+    setTerminalInjectRegistryForTesting(null);
+  }
 });
 
 describe('DIAG-LITE: production runner executes MermaidRender with zero Python calls', () => {

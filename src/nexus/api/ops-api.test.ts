@@ -21,6 +21,7 @@ import { buildResourceLedgerSnapshot } from '../../cli/resource-ledger-cli.js';
 import { createOverviewCache } from '../../ops/overview-cache.js';
 import { okCell, unmeasured, type OverviewSnapshot } from '../../ops/overview.js';
 import { gateShardsPath, writeGateShards } from '../../release-loop/gate-shards.js';
+import { issueMemberToken } from '../../control-plane/member-tokens.js';
 
 const SECRET = 'op-proxy-secret-0123456789abcdef';
 const API_KEY = 'sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456';
@@ -65,6 +66,10 @@ function fixture(enabled: boolean | undefined) {
     const request = new Request(`http://ops.test${path}`, { method, signal, headers: { 'sec-fetch-site': 'cross-site', ...headers } });
     return routeRequest(request, opts, {} as never, null, createDevProxyRuntimeRef());
   };
+  const sendSecure = (path: string, headers: Record<string, string>, method: string, body?: string) => {
+    const request = new Request(`https://ops.test${path}`, { method, ...(body === undefined ? {} : { body }), headers });
+    return routeRequest(request, opts, {} as never, null, createDevProxyRuntimeRef());
+  };
   const run = (id: string, startedAt: string, version = '0.2.9', output: unknown = JSON.stringify({ summary: 'ok' })) => {
     const folder = join(dir, 'graph-runs', 'release-loop');
     mkdirSync(folder, { recursive: true });
@@ -73,7 +78,7 @@ function fixture(enabled: boolean | undefined) {
       input: { version }, nodes: [{ nodeId: 'version-release', ok: true, exit: 0, output }],
     }));
   };
-  return { dir, send, run };
+  return { dir, send, sendSecure, run };
 }
 
 test('train throughput source defaults to the canonical OP artifact directory and allows an explicit override', () => {
@@ -195,6 +200,24 @@ test('resource ledger: operator-gated handler returns the mocked host/lane snaps
   expect(reads).toBe(1);
   expect((await send('/v1/ops/resources/ledger', { 'x-elanous-operator': SECRET }, 'POST'))?.status).toBe(405);
   expect(reads).toBe(1);
+});
+
+test('resource ledger accepts host heartbeat only from its matching expiring machine token', async () => {
+  const { dir, sendSecure } = fixture(undefined);
+  const token = issueMemberToken('minim5', dir);
+  const heartbeat = { at: new Date().toISOString(), sshAvailable: true, maintenance: false, gateProtected: false,
+    tools: { bun: true, repoGit: true }, sample: { loadPercent: 10, load15Percent: 20, memoryAvailablePercent: 50,
+      rootDiskUsedPercent: 60, tmpDiskUsedPercent: 60 } };
+  const path = '/v1/resource-ledger/host-readiness';
+  const mismatched = await sendSecure(path, { authorization: `Bearer ${token}` }, 'POST', JSON.stringify({ ...heartbeat, host: 'aws1' }));
+  expect(mismatched?.status).toBe(403);
+  expect(resourceLedger.readResourceLedger(resourceLedger.resourceLedgerPath(dir))).toEqual([]);
+  const accepted = await sendSecure(path, { authorization: `Bearer ${token}` }, 'POST', JSON.stringify(heartbeat));
+  expect(accepted?.status).toBe(201);
+  expect(accepted?.headers.get('cache-control')).toBe('no-store');
+  expect(resourceLedger.readResourceLedger(resourceLedger.resourceLedgerPath(dir))).toMatchObject([
+    { event: 'host-readiness-heartbeat', heartbeat: { host: 'minim5', at: heartbeat.at } },
+  ]);
 });
 
 test('guardian resource route is a read-only projection of the cached snapshot', async () => {

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "공통 패턴 — 캐시 적합성·무효화",
+  "source": "https://learn.microsoft.com/en-us/azure/architecture/patterns/cache-aside",
+  "body": "적용 시점: 재계산·원본 조회가 비싸고 허용 가능한 stale window를 정의할 수 있을 때.\n용량 단계: 먼저 원본 DB와 query를 최적화; 반복 핫키가 측정되면 cache-aside와 TTL/무효화 정책을 추가한다.\nGCP 대응: Memorystore/Redis 또는 CDN; cache miss는 원본 서비스로 돌아가며 키에는 tenant scope를 포함한다.\n비용 축: 메모리 상주 데이터·복제·miss 원본 부하·invalidation 이벤트가 비용 축이다.\n결정과 반증: 갱신·삭제 직후 stale 노출과 cache outage 시 원본 overload를 함께 시험한다."
+}

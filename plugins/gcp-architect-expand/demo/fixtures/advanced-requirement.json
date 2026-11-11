@@ -1,0 +1,19 @@
+{
+  "$comment": "// Source: synthetic GCP tiered-design test world; all traffic numbers are fixtures, not observed user traffic or cloud prices.",
+  "title": "예약 현황 웹 서비스",
+  "summary": "사용자가 예약 현황을 조회하고 변경 알림을 받는 서비스",
+  "requirements": ["예약 현황 조회와 변경 알림을 제공한다"],
+  "region": "asia-northeast3",
+  "dataClass": "internal",
+  "traffic": {
+    "monthlyRequests": 300000,
+    "cpuSecondsPerRequest": 0.1,
+    "memoryGibSecondsPerRequest": 0.2,
+    "peakConcurrent": 100,
+    "targetLatencySeconds": 1,
+    "monthlyNotifications": 30000,
+    "storageGib": 20,
+    "egressGib": 50,
+    "logGib": 5
+  }
+}

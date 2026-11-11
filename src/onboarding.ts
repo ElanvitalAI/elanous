@@ -38,6 +38,7 @@ import {
   KIMI_MODEL, QWEN_MODEL, GLM_MODEL, OPENROUTER_MODEL,
 } from './config.js';
 import { CODEX_DEFAULT_MODEL } from './llm.js';
+import { OPENROUTER_MODEL_PICKS, updateOpenRouterRoleDefaults } from './onboarding/openrouter-model-picker.js';
 import { suggestSetupModel } from './model-tier/index.js';
 import { loginWithCodex, CODEX_DEVICE_LOGIN_URL } from './oauth/codex.js';
 import { loginWithCodexBrowser } from './oauth/codex-browser-login.js';
@@ -216,7 +217,6 @@ async function realAskSecret(prompt: string): Promise<string> {
     finally { rl.close(); }
   }
   return new Promise<string>((resolve) => {
-    output.write(prompt);
     const chars: string[] = [];
     const wasRaw = input.isRaw;
     input.setRawMode(true);
@@ -251,13 +251,13 @@ async function realAskSecret(prompt: string): Promise<string> {
     const cleanup = () => {
       input.removeListener('data', onData);
       input.setRawMode(wasRaw);
-      // NOTE: do NOT input.pause() here. The shared readline interface
-      // (realIO's `rl`) keeps stdin flowing for follow-up `rl.question`
-      // calls; pausing makes the next prompt receive EOF and silently
-      // collapses the rest of the wizard (telegram allowedUsers / home
-      // channel + step 5 entirely).
+      // Do not pause stdin: realIO creates the next readline interface after
+      // this prompt, and that interface must receive the following answer.
     };
     input.on('data', onData);
+    // Advertise the prompt only after raw mode and the listener are ready;
+    // fast PTY clients otherwise send a key while terminal echo is still on.
+    output.write(prompt);
   });
 }
 
@@ -271,7 +271,13 @@ async function realAskSecret(prompt: string): Promise<string> {
  *  (`showError`/`showHelp`/`showSuccess`) get tinted single-line
  *  variants so wizards on a TTY pick up the visual immediately. */
 export function realIO(): WizardIO {
-  const rl = readline.createInterface({ input, output, terminal: input.isTTY });
+  const interruptSubscriptions = new Set<{ handler: () => void }>();
+  const createReadline = () => {
+    const next = readline.createInterface({ input, output, terminal: input.isTTY });
+    for (const subscription of interruptSubscriptions) next.on('SIGINT', subscription.handler);
+    return next;
+  };
+  let rl = createReadline();
   if (debug.enabled) {
     debug.log('onboarding.realIO.create', 'instantiated', {
       isTTY: !!input.isTTY,
@@ -280,12 +286,24 @@ export function realIO(): WizardIO {
   }
   return {
     ask: async (prompt) => (await rl.question(prompt)).trim(),
-    askSecret: realAskSecret,
+    askSecret: async (prompt) => {
+      // The ordinary readline interface would process raw secret bytes into
+      // history even if its output were hidden. Close it before taking secret
+      // input and create a fresh history for the next ordinary prompt.
+      rl.close();
+      try { return await realAskSecret(prompt); }
+      finally { rl = createReadline(); }
+    },
     print: (text) => { output.write(text + '\n'); },
     updateLine: (text) => { output.write('\r' + text + '\x1b[K'); },
     finishLine: () => { output.write('\n'); },
-    onInterrupt: (handler) => { rl.on('SIGINT', handler); return () => { rl.off('SIGINT', handler); }; },
-    close: () => { rl.close(); },
+    onInterrupt: (handler) => {
+      const subscription = { handler };
+      interruptSubscriptions.add(subscription);
+      rl.on('SIGINT', handler);
+      return () => { interruptSubscriptions.delete(subscription); rl.off('SIGINT', handler); };
+    },
+    close: () => { rl.close(); interruptSubscriptions.clear(); },
     showStep: (spec) => {
       if (debug.enabled) {
         debug.log('onboarding.realIO.showStep', `step ${spec.index}/${spec.total}`, {
@@ -559,9 +577,10 @@ async function askLLM(
   const hint = subscriptionHint(detected);
   for (const found of hint.found) io.print(found.line);
   const configured = current.provider && current.provider !== 'auto' ? current.provider : undefined;
-  const currentIdx = PROVIDER_CHOICES.findIndex(c => c.key === (configured ?? hint.preferred));
+  const availableChoices = PROVIDER_CHOICES;
+  const currentIdx = availableChoices.findIndex(c => c.key === (configured ?? hint.preferred));
   const providerOptions: ChoiceOption<ProviderChoice | WizardBackValue>[] =
-    PROVIDER_CHOICES.map((c, i) => ({
+    availableChoices.map((c, i) => ({
       key: String(i + 1),
       label: c.label,
       value: c,
@@ -729,6 +748,7 @@ async function askLLM(
     // `choice.key` is one of grok / openai / anthropic / gemini.
     const envDetection = detectProviderEnvKeys()[choice.key as Exclude<LLMProviderName, 'auto'>];
     const envValue = envDetection?.value;
+    const existingKey = current.provider === choice.key ? current.apiKey : undefined;
     // A resolved grok subscription wins on blank input (see `defaulted` and the save branch below),
     // so the env-key hint would promise a key that is never saved. Only show it without a subscription.
     if (envValue && !grokSubscription) {
@@ -738,14 +758,14 @@ async function askLLM(
     const defaulted = grokSubscription
       ? ' (press enter to use the subscription)'
       : envValue ? ` (press enter to use ${envDetection!.source})`
-      : current.apiKey ? ' (press enter to keep existing)' : '';
+      : existingKey ? ' (press enter to keep existing)' : '';
     const key = await askValidated(
       io,
       `  ${choice.label} — API key${defaulted}: `,
       (v) => {
         const t = v.trim();
         if (!t) {
-          if (grokSubscription || envValue || current.apiKey) return null;
+          if (grokSubscription || envValue || existingKey) return null;
           return `${choice.label} API key required.`;
         }
         return validateApiKey(`${choice.label} API key`)(t) as string | null;
@@ -755,7 +775,7 @@ async function askLLM(
     const trimmed = key.trim();
     if (trimmed) out.apiKey = trimmed;
     else if (envValue && !grokSubscription) out.apiKey = envValue;
-    else if (current.apiKey && !grokSubscription) out.apiKey = current.apiKey;
+    else if (existingKey && !grokSubscription) out.apiKey = existingKey;
   }
   // PLAN-model-intelligence-router · Phase B4 — the model prompt is
   // dual-purpose: type a concrete model id (a single token, e.g.
@@ -764,19 +784,34 @@ async function askLLM(
   // that intent (setup-once cadence ②). Intent is detected by whitespace
   // — a real model id never contains a space — so NO new prompt slot is
   // added and existing scripted flows (model id / blank) are unaffected.
-  const modelDefault = current.model || choice.defaultModel || '';
-  const modelInput = await askWithHelp(
-    io,
-    `  Model [${modelDefault}] (또는 용도를 한 줄로 적으면 자동 추천): `,
-    { topic: 'llm', field: 'model' },
-  );
-  const trimmedModel = modelInput.trim();
+  const printOpenRouterModels = () => {
+    io.print('  OpenRouter 모델 목록 (번호 또는 모델 ID 입력):');
+    OPENROUTER_MODEL_PICKS.forEach((entry, index) => io.print(`    ${index + 1} ${entry.label} · ${entry.model}`));
+  };
+  if (choice.key === 'openrouter') printOpenRouterModels();
+  const modelDefault = choice.key === 'openrouter'
+      ? (current.provider === 'openrouter' && current.model ? current.model : OPENROUTER_MODEL_PICKS[0]!.model)
+      : current.model || choice.defaultModel || '';
+  let trimmedModel: string;
+  let numberedModel: string | undefined;
+  for (;;) {
+    const modelInput = await askWithHelp(io,
+      `  Model [${modelDefault}] (또는 용도를 한 줄로 적으면 자동 추천): `,
+      { topic: 'llm', field: 'model' });
+    trimmedModel = modelInput.trim();
+    numberedModel = choice.key === 'openrouter' && /^[1-9][0-9]*$/.test(trimmedModel)
+      ? OPENROUTER_MODEL_PICKS[Number(trimmedModel) - 1]?.model
+      : undefined;
+    if (choice.key !== 'openrouter' || !/^[1-9][0-9]*$/.test(trimmedModel) || numberedModel) break;
+    io.print('  OpenRouter 목록의 번호를 입력하세요.');
+    printOpenRouterModels();
+  }
   if (looksLikeModelIntent(trimmedModel)) {
     const suggestion = await suggestSetupModel(trimmedModel, { provider: choice.key });
     io.print(`  → 추천: ${suggestion.model} · ${suggestion.tier} tier — ${suggestion.rationale}`);
     out.model = suggestion.model;
   } else {
-    out.model = trimmedModel || modelDefault || undefined;
+    out.model = numberedModel || trimmedModel || modelDefault || undefined;
   }
 
   if (choice.needsBaseUrl) {
@@ -1565,6 +1600,11 @@ export async function runOnboarding(opts: RunWizardOpts = {}): Promise<UserConfi
       }
     }
 
+    if (next.llm.provider === 'openrouter' && next.llm.model) {
+      // Fill missing roles even when the same model is selected again.
+      // Explicit role choices are preserved by updateOpenRouterRoleDefaults.
+      next.roleLlm = updateOpenRouterRoleDefaults(next.roleLlm, initial.llm.provider === 'openrouter' ? initial.llm.model : undefined, next.llm.model);
+    }
     const marked = markOnboardingComplete(next);
     saveUserConfig(marked, path);
 
@@ -1741,6 +1781,9 @@ export async function runOnboardingStep(
       else delete next.modelTier;
       if (answer.budget) next.budget = answer.budget;
       else delete next.budget;
+    }
+    if (step === 'llm' && next.llm.provider === 'openrouter' && next.llm.model) {
+      next.roleLlm = updateOpenRouterRoleDefaults(next.roleLlm, initial.llm.provider === 'openrouter' ? initial.llm.model : undefined, next.llm.model);
     }
     const marked = markOnboardingComplete(next);
     saveUserConfig(marked, path);

@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkPluginOnlyRatchet, compareInventory, declaredPluginHandlers, inventoryFromTree, regenerateBaseline } from './plugin-only-ratchet.js';
+import { checkPluginOnlyRatchet, compareInventory, declaredPluginHandlers, inventoryFromTree, PLUGIN_ONLY_BASELINE, regenerateBaseline } from './plugin-only-ratchet.js';
 
 describe('PLUGIN-ONLY-RATCHET', () => {
   test('permits only a manifest-declared handler with an owning skill', () => {
@@ -139,6 +139,59 @@ describe('PLUGIN-ONLY-RATCHET', () => {
       }));
       expect(() => checkPluginOnlyRatchet(root)).toThrow(`plugin-only baseline sourceRef must come from origin/main: ${prHead}`);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('shallow checkout accepts an unchanged main baseline but still rejects edits and new identifiers', () => {
+    const root = mkdtempSync(join(tmpdir(), 'plugin-only-ratchet-shallow-test-'));
+    const clone = join(tmpdir(), `plugin-only-ratchet-shallow-clone-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    const git = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, stdio: 'ignore' });
+    try {
+      git(root, 'init', '-b', 'main');
+      git(root, 'config', 'user.name', 'Ratchet Test');
+      git(root, 'config', 'user.email', 'ratchet-test@example.invalid');
+      mkdirSync(join(root, 'src'), { recursive: true });
+      mkdirSync(join(root, 'plugins'), { recursive: true });
+      mkdirSync(join(root, 'scripts'), { recursive: true });
+      writeFileSync(join(root, 'plugins/.keep'), 'fixture\n');
+      writeFileSync(join(root, 'src/runner.ts'), "export const graphId = 'base-graph';\n");
+      git(root, 'add', 'src/runner.ts', 'plugins/.keep');
+      git(root, 'commit', '-m', 'source inventory');
+      const sourceRef = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+      const inventory = inventoryFromTree(root);
+      const baselinePath = join(root, PLUGIN_ONLY_BASELINE);
+      writeFileSync(baselinePath, JSON.stringify({
+        schema: 1, sourceRef, ...inventory,
+      }));
+      git(root, 'add', PLUGIN_ONLY_BASELINE);
+      git(root, 'commit', '-m', 'record frozen source baseline');
+      const mainRef = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
+      git(root, 'clone', '--depth=1', `file://${root}`, clone);
+
+      expect(execFileSync('git', ['rev-parse', '--is-shallow-repository'], { cwd: clone, encoding: 'utf8' }).trim()).toBe('true');
+      expect(execFileSync('git', ['rev-parse', 'origin/main'], { cwd: clone, encoding: 'utf8' }).trim()).toBe(mainRef);
+      expect(() => execFileSync('git', ['cat-file', '-e', `${sourceRef}^{commit}`], { cwd: clone, stdio: 'ignore' })).toThrow();
+      expect(checkPluginOnlyRatchet(clone)).toEqual([]);
+
+      writeFileSync(join(clone, 'src/runner.ts'), "export const graphId = 'base-graph';\nif (graphId === 'new-graph') {}\n");
+      expect(checkPluginOnlyRatchet(clone)).toEqual([
+        'core-feature-hardcode-added:src/runner.ts:comparison:graphId:new-graph',
+      ]);
+
+      writeFileSync(join(clone, 'src/runner.ts'), "export const graphId = 'base-graph';\n");
+      writeFileSync(join(clone, PLUGIN_ONLY_BASELINE), JSON.stringify({
+        schema: 1, sourceRef,
+        pluginCodeFiles: [...inventory.pluginCodeFiles, 'plugins/new.ts'],
+        coreFeatureIdentifiers: inventory.coreFeatureIdentifiers,
+      }));
+      expect(() => checkPluginOnlyRatchet(clone)).toThrow(`plugin-only baseline sourceRef is not an ancestor of HEAD: ${sourceRef}`);
+
+      git(clone, 'checkout', '--', PLUGIN_ONLY_BASELINE);
+      git(clone, 'update-ref', '-d', 'refs/remotes/origin/main');
+      expect(() => checkPluginOnlyRatchet(clone)).toThrow(`plugin-only baseline sourceRef is not an ancestor of HEAD: ${sourceRef}`);
+    } finally {
+      rmSync(clone, { recursive: true, force: true });
       rmSync(root, { recursive: true, force: true });
     }
   });

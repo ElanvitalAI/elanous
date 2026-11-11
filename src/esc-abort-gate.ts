@@ -38,19 +38,7 @@ import { SELF_IMPLEMENT_TOOL_NAMES } from './boot/daemon-tools/self-implement-na
 
 export const DASHBOARD_CLARIFICATION_REQUEST = Symbol.for('elanous.dashboard.clarification-request');
 
-// Source: OP #96145 sets the confirmation boundary for a long Bash/RunShell execution to about five seconds.
-export const LONG_SHELL_ESC_CONFIRMATION_MS = 5_000;
-
-export function monotonicNowMs(): number {
-  // Source: Node process.hrtime.bigint() shares the host monotonic clock across the REPL and TUI processes.
-  return Number(process.hrtime.bigint() / 1_000_000n);
-}
-
-export function requiresLongShellEscConfirmation(toolName: string, elapsedMs: number): boolean {
-  return (toolName === 'Bash' || toolName === 'RunShell')
-    && Number.isFinite(elapsedMs)
-    && elapsedMs >= LONG_SHELL_ESC_CONFIRMATION_MS;
-}
+export { LONG_SHELL_ESC_CONFIRMATION_MS, monotonicNowMs, requiresLongShellEscConfirmation } from './esc-shell-timing.js';
 
 export interface EscAbortGateDeps {
   abortCtrl: AbortController;

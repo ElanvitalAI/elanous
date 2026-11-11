@@ -7,8 +7,10 @@ import { MODEL_ROLES, resolveRoleLlm, userConfigPath } from '../user-config.js';
 import type { LLMProviderName, UserConfig } from '../user-config/types.js';
 import { parseMenuAnswer } from '../onboarding/menu-answer.js';
 import { isHeadlessEnv } from '../acp/codex-auth.js';
-import { listCredentialSlotsAsync, selectBackendFromConfig, setCredentialSlotBatchAsync } from '../nexus/config/secrets/index.js';
+import { listCredentialSlotsAsync, selectBackendFromConfig, setCredentialSlotAsync, setCredentialSlotBatchAsync } from '../nexus/config/secrets/index.js';
 import { scanCredentialImports, type CredentialImportScan } from '../setup/cred-import-scan.js';
+import { pickOpenRouterModel, SOLAR_DEMO_PRESET_ID } from './first-run/openrouter-picker.js';
+import { existingOpenRouterKey, openRouterHeadless, openRouterKeySuffix, openRouterPkce, registerOpenRouterByPhone, scanOpenRouterKeyCandidates } from './first-run/openrouter-key-supply.js';
 
 export interface SetupKeysIO {
   ask(prompt: string): Promise<string>;
@@ -43,11 +45,16 @@ export interface SetupKeysOptions {
   initializeCredentialBackend?: () => void;
   listCredentialSlots?: typeof listCredentialSlotsAsync;
   saveCredentialSlotBatch?: typeof setCredentialSlotBatchAsync;
+  saveCredentialSlot?: typeof setCredentialSlotAsync;
 }
 
 export interface FirstRunProviderSetupOptions extends SetupKeysOptions {
   /** Required so the first-run OAuth boundary is explicit and observable in tests. */
   loginWithCodex: typeof loginWithCodex;
+  /** Simulate the external browser and phone flows without network or a real credential. */
+  openRouterPkce?: typeof openRouterPkce;
+  registerOpenRouterByPhone?: typeof registerOpenRouterByPhone;
+  readOpenRouterSecret?: typeof existingOpenRouterKey;
 }
 
 function providerForService(id: string): string | undefined {
@@ -138,7 +145,8 @@ export async function importServiceKeys(values: ParsedServiceKeyEnv, io: Pick<Se
     const item = SERVICE_KEY_CATALOG.find(candidate => candidate.kind === 'api-key' && candidate.envNames.includes(name));
     if (item?.id === 'openrouter' && item.storeIds?.[0]) {
       try {
-        await (options.saveCredentialSlotBatch ?? setCredentialSlotBatchAsync)({ [item.storeIds[0]]: value });
+        if (options.saveCredentialSlotBatch) await options.saveCredentialSlotBatch({ [item.storeIds[0]]: value });
+        else await (options.saveCredentialSlot ?? setCredentialSlotAsync)(item.storeIds[0], value);
         env[name] = value;
         stored.push(name);
       } catch { rejected.push(name); }
@@ -247,12 +255,12 @@ export async function runSetupKeys(io: SetupKeysIO, options: SetupKeysOptions): 
 }
 
 export const FIRST_RUN_PROVIDER_SETUP_MENU_HEADING = '처음 실행 LLM 설정';
-export const FIRST_RUN_PROVIDER_SETUP_MENU_CHOICES = '1 Codex 구독 로그인 · 2 API 키 입력 · Enter 건너뛰기';
+export const FIRST_RUN_PROVIDER_SETUP_MENU_CHOICES = '1 Codex 구독 로그인 (권장) · 2 OpenRouter 내 키 사용 · 3 기타 API 키 입력 · Enter 건너뛰기';
 export const FIRST_RUN_PROVIDER_SETUP_MENU_MAX_MISSES = 3;
 
-/** First-run entry: offer the existing Codex device login or the same verified-key flow as `setup keys`. */
+/** First-run entry: offer Codex login, catalog-backed OpenRouter BYOK, or the existing key setup. */
 export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRunProviderSetupOptions): Promise<FirstRunProviderSetupResult> {
-  const choices = ['codex-login', 'api-key'] as const;
+  const choices = ['codex-login', 'openrouter-byok', 'api-key'] as const;
   let misses = 0;
   let choice: typeof choices[number];
   for (;;) {
@@ -343,6 +351,61 @@ export async function runFirstRunProviderSetup(io: SetupKeysIO, options: FirstRu
       cancelLogin?.();
       if (cancelled) void login.catch(() => {});
     }
+  }
+  if (choice === 'openrouter-byok') {
+    const env = options.env ?? process.env;
+    let ready = false;
+    let storedValue: string | undefined;
+    try { storedValue = await (options.readOpenRouterSecret ?? existingOpenRouterKey)(); } catch { /* unavailable backend */ }
+    const candidates = [
+      ...(storedValue ? [{ source: 'elanous secret', lastFour: openRouterKeySuffix(storedValue), read: () => storedValue! }] : []),
+      ...scanOpenRouterKeyCandidates(options),
+    ];
+    for (const candidate of candidates) {
+      io.print(`OpenRouter 키 발견: ${candidate.source} · 끝 4자리 ${candidate.lastFour}`);
+      const answer = (await io.ask('이 키를 사용할까요? (y/n): ')).trim().toLowerCase();
+      if (answer !== 'y' && answer !== 'yes') {
+        // A rejected inherited key must not remain available to the provider
+        // after the user chooses a different source or skips setup.
+        if (candidate.source === '환경변수 OPENROUTER_API_KEY') delete env.OPENROUTER_API_KEY;
+        continue;
+      }
+      if (candidate.source === 'elanous secret') {
+        env.OPENROUTER_API_KEY = candidate.read();
+        ready = true;
+        break;
+      }
+      const imported = await importServiceKeys(new Map([['OPENROUTER_API_KEY', candidate.read()]]), io, { ...options, env });
+      if (imported.stored.includes('OPENROUTER_API_KEY')) { ready = true; break; }
+    }
+    while (!ready) {
+      io.print('OpenRouter 키 공급: 1 브라우저 OAuth 로그인 (권장) · 2 폰 QR/PWA 등록 · 3 숨김 붙여넣기 · Enter 건너뛰기');
+      const answer = (await io.ask('키 공급 선택: ')).trim();
+      if (!answer) return { kind: 'needs-llm' };
+      if (answer === '2') {
+        ready = await (options.registerOpenRouterByPhone ?? registerOpenRouterByPhone)(io, options);
+        if (ready) {
+          let selected: string | undefined;
+          try { selected = await (options.readOpenRouterSecret ?? existingOpenRouterKey)(); }
+          catch { /* registration cannot become active without a readable key */ }
+          if (selected?.trim()) env.OPENROUTER_API_KEY = selected.trim();
+          else ready = false;
+        }
+        if (!ready) io.print('폰 등록이 확인되지 않았습니다. 다시 선택하세요.');
+        continue;
+      }
+      let value: string | undefined;
+      if (answer === '1') value = await (options.openRouterPkce ?? openRouterPkce)(io, { headless: openRouterHeadless(options) });
+      else if (answer === '3') value = io.askSecret ? (await io.askSecret('OPENROUTER_API_KEY (Enter=건너뜀): ')).trim() : undefined;
+      else continue;
+      if (!value) { io.print('OpenRouter 키를 받지 못했습니다. 다시 선택하세요.'); continue; }
+      const imported = await importServiceKeys(new Map([['OPENROUTER_API_KEY', value]]), io, { ...options, env });
+      ready = imported.stored.includes('OPENROUTER_API_KEY');
+    }
+    const model = await pickOpenRouterModel(io.ask);
+    return { provider: 'openrouter',
+      model: model.id === SOLAR_DEMO_PRESET_ID ? 'openrouter/upstage/solar-pro4' : `openrouter/${model.id}`,
+      solar: model.id === SOLAR_DEMO_PRESET_ID };
   }
   // Keep the exact environment object through storage and rediscovery: storeServiceKeys
   // writes accepted values into it as well as the protected cache, so a newly entered

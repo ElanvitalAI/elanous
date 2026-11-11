@@ -8,10 +8,11 @@ import {
   TUI_400_AUTOHEAL_LEVEL, TUI_400_CODEX_ANSWER, TUI_400_SUMMARY, TUI_400_ZAI_ANSWER,
   renderTui400, simTui400Autoheal, tui400Receipt,
 } from './fault-tui-400-autoheal.js';
+import { dashboardTui400Runtime } from '../dashboard/tui-400-runtime-adapter.js';
 
 describe('fault-tui-400-autoheal — L1 결함 주입 «TUI 턴 400 자동 회복»', () => {
   test('RED 재현: 자동 회복 배선이 없으면(수리 전) 400 한 번에 멈추고 사람에게 «/session new» 를 시킨다', async () => {
-    const o = await simTui400Autoheal('heal-new-session', { autoheal: false });
+    const o = await simTui400Autoheal('heal-new-session', { autoheal: false }, dashboardTui400Runtime);
     console.log(renderTui400(o).join('\n'));
     expect(o.status).toBe('failed');
     expect(o.result).toBe('stopped');
@@ -22,7 +23,7 @@ describe('fault-tui-400-autoheal — L1 결함 주입 «TUI 턴 400 자동 회�
   });
 
   test('① codex 400 → 새 세션 ⊕ 요약 → 재시도 성공(사람 손 0)', async () => {
-    const o = await simTui400Autoheal('heal-new-session');
+    const o = await simTui400Autoheal('heal-new-session', {}, dashboardTui400Runtime);
     console.log(renderTui400(o).join('\n'));
     expect(o.level).toBe(TUI_400_AUTOHEAL_LEVEL);
     expect(o.status).toBe('completed');
@@ -42,7 +43,7 @@ describe('fault-tui-400-autoheal — L1 결함 주입 «TUI 턴 400 자동 회�
   });
 
   test('② 또 400 → fallbackChain 다음 공급자(glm)로 그 턴을 끝낸다', async () => {
-    const o = await simTui400Autoheal('heal-provider');
+    const o = await simTui400Autoheal('heal-provider', {}, dashboardTui400Runtime);
     console.log(renderTui400(o).join('\n'));
     expect(o.status).toBe('completed');
     expect(o.result).toBe('recovered-provider');
@@ -58,7 +59,7 @@ describe('fault-tui-400-autoheal — L1 결함 주입 «TUI 턴 400 자동 회�
   });
 
   test('③ 둘 다 실패 → 2회 상한 · 이유 한 줄 · 더 안 보낸다', async () => {
-    const o = await simTui400Autoheal('exhausted');
+    const o = await simTui400Autoheal('exhausted', {}, dashboardTui400Runtime);
     console.log(renderTui400(o).join('\n'));
     expect(o.status).toBe('failed');
     expect(o.result).toBe('stopped');

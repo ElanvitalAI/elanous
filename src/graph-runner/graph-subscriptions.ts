@@ -64,7 +64,7 @@ export interface GraphSubscriptionScope {
   readonly runId: string;
 }
 
-function matches(event: GraphEvent, match: Readonly<Record<string, unknown>> | undefined): boolean {
+export function matchesGraphSubscriptionEvent(event: GraphEvent, match: Readonly<Record<string, unknown>> | undefined): boolean {
   if (!match) return true;
   return Object.entries(match).every(([key, expected]) => {
     const actual = key === 'graphId' || key === 'runId' || key === 'type' || key === 'eventId' || key === 'sequence'
@@ -89,7 +89,7 @@ export function registerGraphSubscriptions(
         const subscriberId = `${options.scope.graphId}/${options.scope.runId}/${node.nodeId}:${index}`;
         dispose.push(bus.subscribe(async (event) => {
           if (event.graphId !== options.scope.graphId || event.runId !== options.scope.runId) return;
-          if (!matches(event, subscription.match)) return;
+          if (!matchesGraphSubscriptionEvent(event, subscription.match)) return;
           const proposeEdge: GraphEdgeAdditionApi | undefined = options.proposeEdge === undefined ? undefined : async (proposal) => {
             if (proposal.mode === 'shadow' && !proposal.unmeasuredAxis.trim())
               throw new Error('shadow graph edge proposal requires a non-empty unmeasuredAxis');

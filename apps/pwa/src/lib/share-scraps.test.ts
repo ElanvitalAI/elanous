@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleScraps } from '../../../../src/nexus/api/scraps';
 import { saveSharedScraps, ScrapsUnavailableError } from './share-scraps';
+import type { ShareFetch } from './share-scraps';
 import type { SharedPayload } from './share-target-store';
 
 function payload(files: File[] = []): SharedPayload {
@@ -14,7 +15,7 @@ function payload(files: File[] = []): SharedPayload {
 test('fake member session, signed media upload, and scraps ingest cover Web Share Target kinds', async () => {
   const posted: Array<{ kind: string; source: string; raw: Record<string, string>; memberId?: string }> = [];
   const uploads: string[] = [];
-  const fetcher: typeof fetch = async (input, init) => {
+  const fetcher: ShareFetch = async (input, init) => {
     const url = new URL(String(input));
     if (url.pathname === '/v1/members') {
       expect(init?.credentials).toBe('include');
@@ -61,7 +62,7 @@ test('PWA media object key is accepted and member-scoped by the landed ABSORB ro
   try {
     let sentMediaRef = '';
     let normalizedMediaRef = '';
-    const fetcher: typeof fetch = async (input, init) => {
+    const fetcher: ShareFetch = async (input, init) => {
       const path = new URL(String(input)).pathname;
       if (path === '/v1/members') return Response.json({ member: { id: 'member-a' }, appSlot: { appSlug: 'my-app' } });
       if (path.endsWith('/storage/uploads')) return Response.json({ url: 'https://nexus.test/upload/photo' });
@@ -93,8 +94,8 @@ test('PWA media object key is accepted and member-scoped by the landed ABSORB ro
 });
 
 test('embedded URL is classified as a link and keeps surrounding commentary', async () => {
-  const posted: Array<{ kind: string; raw: { text: string; url: string } }> = [];
-  const fetcher: typeof fetch = async (input, init) => {
+  const posted: Array<{ kind: string; source: string; raw: { text: string; url: string } }> = [];
+  const fetcher: ShareFetch = async (input, init) => {
     if (new URL(String(input)).pathname === '/v1/members') return Response.json({ member: { id: 'member-a' } });
     if (init?.method === 'GET') return Response.json({ scraps: [] });
     posted.push(JSON.parse(String(init?.body)));
@@ -106,8 +107,8 @@ test('embedded URL is classified as a link and keeps surrounding commentary', as
 });
 
 test('a second shared URL remains available as text alongside the classified link', async () => {
-  const posted: Array<{ kind: string; raw: { text?: string; url?: string } }> = [];
-  const fetcher: typeof fetch = async (input, init) => {
+  const posted: Array<{ kind: string; source: string; raw: { text?: string; url?: string } }> = [];
+  const fetcher: ShareFetch = async (input, init) => {
     const path = new URL(String(input)).pathname;
     if (path === '/v1/scraps' && init?.method === 'GET') return Response.json({ scraps: [] });
     if (path === '/v1/members') return Response.json({ member: { id: 'member-a' } });
@@ -122,7 +123,7 @@ test('a second shared URL remains available as text alongside the classified lin
 
 test('media without supported upload credential keeps the share for chat', async () => {
   let signed = false;
-  const fetcher: typeof fetch = async (input, init) => {
+  const fetcher: ShareFetch = async (input, init) => {
     const path = new URL(String(input)).pathname;
     if (path === '/v1/members') return Response.json({ member: { id: 'member-a' }, appSlot: { appSlug: 'my-app' } });
     if (path === '/v1/scraps' && init?.method === 'GET') return Response.json({ scraps: [] });
@@ -138,7 +139,7 @@ test('media without supported upload credential keeps the share for chat', async
 test('media with no app slot or a rejected upload signature preserves chat handoff', async () => {
   const media = { ...payload([new File(['photo'], 'photo.png')]), title: '', text: '' };
   for (const outcome of ['no-slot', 'sign-401', 'sign-403'] as const) {
-    const fetcher: typeof fetch = async (input) => {
+    const fetcher: ShareFetch = async (input) => {
       const path = new URL(String(input)).pathname;
       if (path === '/v1/members') return Response.json({ member: { id: 'member-a' },
         ...(outcome === 'no-slot' ? {} : { appSlot: { appSlug: 'my-app' } }) });
@@ -150,8 +151,8 @@ test('media with no app slot or a rejected upload signature preserves chat hando
 });
 
 test('non-HTTP shared URL is retained as text instead of disappearing', async () => {
-  const posted: Array<{ kind: string; raw: { text: string } }> = [];
-  const fetcher: typeof fetch = async (input, init) => {
+  const posted: Array<{ kind: string; source: string; raw: { text: string } }> = [];
+  const fetcher: ShareFetch = async (input, init) => {
     if (new URL(String(input)).pathname === '/v1/members') return Response.json({ member: { id: 'member-a' } });
     posted.push(JSON.parse(String(init?.body)));
     return Response.json({ id: 'scrap-1' }, { status: 201 });
@@ -161,8 +162,8 @@ test('non-HTTP shared URL is retained as text instead of disappearing', async ()
 });
 
 test('non-HTTP URL remains in the scrap when commentary contains an HTTP link', async () => {
-  const posted: Array<{ kind: string; raw: { text: string; url: string } }> = [];
-  const fetcher: typeof fetch = async (input, init) => {
+  const posted: Array<{ kind: string; source: string; raw: { text: string; url: string } }> = [];
+  const fetcher: ShareFetch = async (input, init) => {
     if (new URL(String(input)).pathname === '/v1/members') return Response.json({ member: { id: 'member-a' } });
     posted.push(JSON.parse(String(init?.body)));
     return Response.json({ id: 'scrap-1' }, { status: 201 });
@@ -176,8 +177,8 @@ test('non-HTTP URL remains in the scrap when commentary contains an HTTP link', 
 });
 
 test('non-HTTP shared URL survives when commentary has multiple HTTP links', async () => {
-  const posted: Array<{ kind: string; raw: { text?: string; url?: string } }> = [];
-  const fetcher: typeof fetch = async (input, init) => {
+  const posted: Array<{ kind: string; source: string; raw: { text?: string; url?: string } }> = [];
+  const fetcher: ShareFetch = async (input, init) => {
     if (new URL(String(input)).pathname === '/v1/members') return Response.json({ member: { id: 'member-a' } });
     posted.push(JSON.parse(String(init?.body)));
     return Response.json({ id: `scrap-${posted.length}` }, { status: 201 });
@@ -191,8 +192,8 @@ test('non-HTTP shared URL survives when commentary has multiple HTTP links', asy
 });
 
 test('explicit HTTP URL retains trailing punctuation that belongs to the URL', async () => {
-  const posted: Array<{ kind: string; raw: { text?: string; url?: string } }> = [];
-  const fetcher: typeof fetch = async (input, init) => {
+  const posted: Array<{ kind: string; source: string; raw: { text?: string; url?: string } }> = [];
+  const fetcher: ShareFetch = async (input, init) => {
     if (new URL(String(input)).pathname === '/v1/members') return Response.json({ member: { id: 'member-a' } });
     posted.push(JSON.parse(String(init?.body)));
     return Response.json({ id: 'scrap-1' }, { status: 201 });
@@ -203,7 +204,7 @@ test('explicit HTTP URL retains trailing punctuation that belongs to the URL', a
 });
 
 test('unavailable ABSORB route preserves the share for the chat fallback', async () => {
-  const fetcher: typeof fetch = async (input) => new URL(String(input)).pathname === '/v1/members'
+  const fetcher: ShareFetch = async (input) => new URL(String(input)).pathname === '/v1/members'
     ? Response.json({ member: { id: 'member-a' } })
     : Response.json({ error: 'not-found' }, { status: 404 });
   await expect(saveSharedScraps(payload(), { baseUrl: 'https://nexus.test', fetcher })).rejects.toBeInstanceOf(ScrapsUnavailableError);
@@ -211,7 +212,7 @@ test('unavailable ABSORB route preserves the share for the chat fallback', async
 
 test('media-only share falls back when its scrap POST route is unavailable', async () => {
   let uploaded = false;
-  const fetcher: typeof fetch = async (input, init) => {
+  const fetcher: ShareFetch = async (input, init) => {
     const path = new URL(String(input)).pathname;
     if (path === '/v1/members') return Response.json({ member: { id: 'member-a' }, appSlot: { appSlug: 'my-app' } });
     if (path.endsWith('/storage/uploads')) return Response.json({ url: 'https://nexus.test/upload/photo' });
@@ -230,7 +231,7 @@ test('media-only share falls back when its scrap POST route is unavailable', asy
 
 test('member network, authorization, and malformed-response errors preserve chat handoff', async () => {
   for (const outcome of ['network', 'forbidden', 'malformed'] as const) {
-    const fetcher: typeof fetch = async () => {
+    const fetcher: ShareFetch = async () => {
       if (outcome === 'network') throw new Error('offline');
       if (outcome === 'forbidden') return Response.json({ error: 'forbidden' }, { status: 403 });
       return Response.json({ member: {} });
@@ -241,7 +242,7 @@ test('member network, authorization, and malformed-response errors preserve chat
 
 test('member session failure keeps the share for the chat fallback', async () => {
   let posted = false;
-  const fetcher: typeof fetch = async (input) => {
+  const fetcher: ShareFetch = async (input) => {
     if (new URL(String(input)).pathname === '/v1/members') return Response.json({ error: 'unauthorized' }, { status: 401 });
     posted = true;
     return Response.json({ id: 'unexpected' });

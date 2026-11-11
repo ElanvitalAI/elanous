@@ -29,7 +29,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { join, resolve } from 'node:path';
 import { openMsgStore } from '../msg/msg-store.js';
 import { resolveInstance } from '../instance/resolve.js';
-import { SEAT_MEMORY_RECALL_MAX_CHARS, SEAT_MEMORY_RECALL_PREFIX } from '../dashboard/seat-boot-preamble.js';
+import { SEAT_MEMORY_RECALL_MAX_CHARS, SEAT_MEMORY_RECALL_PREFIX } from '../seat/seat-boot-preamble.js';
 import { AUTOHEAL_MAX_ATTEMPTS } from '../self-health/autoheal.js';
 import { mockSeatPtySequence, type SeatPtySequenceEvidence, type SeatPtyStep } from './mock-seat-pty-sequence.js';
 import {
@@ -155,7 +155,7 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
   };
   const base = {
     executable: spec.executable,
-    args: [spec.entry, '--config-dir', '{root}', '--test-state-dir', '{root}'],
+    args: [spec.entry, '--tui', 'classic', '--config-dir', '{root}', '--test-state-dir', '{root}'],
     root,
     rows: spec.rows ?? 30,
     cols: 100,
@@ -198,7 +198,7 @@ export async function runClassicTuiScenario(spec: ClassicTuiScenarioSpec): Promi
         { label: 'slash dismissed', keys: '\x1b', until: (screen) => screen.includes('/he') && !screen.includes('/ 명령') },
         { label: 'slash draft extended', text: 'x', enter: false, until: (screen) => screen.includes('❯ /hex') },
         { label: 'slash draft cleared', keys: '\x15', until: (screen) => screen.includes('❯') && !screen.includes('❯ /hex') },
-        { label: 'y/N confirmation opened', text: 'inline-confirm', until: (screen) => screen.includes('⏺ Agent(') },
+        { label: 'y/N confirmation opened', text: 'inline-confirm', until: (screen) => screen.includes('Agent(') },
         { label: 'y/N choices visible', keys: '\x1b', until: (screen) => screen.includes('도는 작업과 하위 에이전트를 함께 중단할까요?') && screen.includes('y/n · 기본 n') },
         { label: 'n selected and turn restored', text: 'n', until: (screen) => screen.includes('✔ 완료') && !screen.includes('y/n · 기본 n'), timeoutMs: 30_000 },
       ],

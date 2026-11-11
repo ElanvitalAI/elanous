@@ -57,7 +57,7 @@ describe('RunDevHarness model surface switch', () => {
     expect(isDevHarnessModelSurfaceEnabled()).toBe(false);
     expect(names(buildAutonomousToolSpecs())).not.toContain('RunDevHarness');
     expect(names(buildAutonomousToolSpecs())).toContain('SelfImplement');
-    expect(names(buildAutonomousToolSpecs())).toContain('SolveMission');
+    expect(names(buildAutonomousToolSpecs())).not.toContain('SolveMission');
     expect(names(toolSurface('webterm').specs)).not.toContain('RunDevHarness');
     expect(shouldExposeDevHarnessSessionTool('하니스로 구현해줘')).toBe(false);
     expect(names(resolveDynamicSessionNativeToolSpecs({
@@ -73,15 +73,15 @@ describe('RunDevHarness model surface switch', () => {
     try {
       const retiredDescription = buildRunDevHarnessTool().description;
       expect(retiredDescription).toContain('DEPRECATED(nl-run-dev-harness)');
-      expect(retiredDescription).toContain('SelfImplement 또는 SolveMission');
+      expect(retiredDescription).toContain('SelfImplement');
       expect(retiredDescription).toContain('Use this tool when the user mentions the harness');
 
-      (entrance as { status: 'live' | 'retired' }).status = 'live';
+      (entrance as { status: typeof originalStatus }).status = 'live';
       const liveDescription = buildRunDevHarnessTool().description;
       expect(liveDescription).not.toContain('DEPRECATED');
-      expect(liveDescription).toBe(retiredDescription.replace(/^⚠️ DEPRECATED\(nl-run-dev-harness\) — 대신 `SelfImplement 또는 SolveMission` 를 쓰세요\. /, ''));
+      expect(liveDescription).toBe(retiredDescription.replace(/^⚠️ DEPRECATED\(nl-run-dev-harness\) — 대신 `SelfImplement` 를 쓰세요\. /, ''));
     } finally {
-      (entrance as { status: 'live' | 'retired' }).status = originalStatus;
+      (entrance as { status: typeof originalStatus }).status = originalStatus;
     }
   });
 
@@ -133,11 +133,10 @@ describe('RunDevHarness model surface switch', () => {
       'delegate_code_agent',
       'SelfImplement',
       'RunDevHarness',
-      'SolveMission',
     ]);
     expect(names(toolSurface('webterm').specs)).toContain('RunDevHarness');
     expect(names(toolSurface('webterm').specs)).toContain('SelfImplement');
-    expect(names(toolSurface('webterm').specs)).toContain('SolveMission');
+    expect(names(toolSurface('webterm').specs)).not.toContain('SolveMission');
     expect(shouldExposeDevHarnessSessionTool('하니스로 구현해줘')).toBe(true);
     expect(names(resolveDynamicSessionNativeToolSpecs({
       userText: '하니스로 구현해줘',

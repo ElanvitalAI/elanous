@@ -463,7 +463,7 @@ export interface RunGraphDetail {
   graph_hash?: string;
   entry_node: string;
   terminal_nodes: string[];
-  nodes: Array<{ node_id: string; kind: string; recipe: string; max_visits: number; provenance?: { type: 'scenario-injection'; scene?: string; reason: string; mock?: boolean } }>;
+  nodes: Array<{ node_id: string; kind: string; recipe: string; max_visits: number; provenance?: { source?: string; type?: string; scene?: string; reason?: string; mock?: boolean } }>;
   edges: Array<{
     from: string;
     to?: string;

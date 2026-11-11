@@ -18,7 +18,7 @@ import { getSessionCwd } from '../../session/working-dir.js';
 import type { TerminalSession, TerminalSessionRegistry } from '../../terminal/session-registry.js';
 
 async function getDashboardTerminalSessions(): Promise<TerminalSessionRegistry> {
-  const { getDashboardTerminalSessions: getSessions } = await import('../../dashboard/terminal/session.js');
+  const { getDashboardTerminalSessions: getSessions } = await import('../../terminal/session-access.js');
   return getSessions() as TerminalSessionRegistry;
 }
 

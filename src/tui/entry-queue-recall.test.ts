@@ -19,12 +19,12 @@ async function runQueueKeys(kind: 'recall' | 'push') {
         ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
         ELANOUS_TEST_FAKE_LLM_DELAY_MS: '8000', ELANOUS_TEST_FAKE_LLM_DELAY_WHEN: 'slow',
       },
-      ready: { label: 'boot', until: (s) => s.includes('elanous next ·') && s.includes('Ctrl+Q 종료') },
+      ready: { label: 'boot', until: (s) => s.includes('elanous') && s.includes('Enter 전송') },
       steps: [
         { label: 'queued', chunks: ['slow first', '\r', 'queued second', '\r'], gapMs: 350, until: (s) => s.includes('대기 1') },
         kind === 'recall'
           ? { label: 'Ctrl+Up', keys: '\x1b[1;5A', until: (s) => s.includes('❯ queued second') && s.includes('대기 1건을 입력칸으로') && s.includes('응답 중') }
-          : { label: 'empty Enter', keys: '\r', until: (s) => s.includes('나: queued second') && s.includes('응답 완료') },
+          : { label: 'empty Enter', keys: '\r', until: (s) => s.includes('나: queued second') && (s.includes('응답 완료') || s.includes('턴 완료')) },
       ],
     });
   } finally {

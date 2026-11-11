@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
-import { consumeCredentialRegistrationBearer, issueSetupLinkToken } from '../../auth/setup-link-tokens.js';
+import { consumeCredentialRegistrationBearer, credentialRegistrationCompleted, issueSetupLinkToken } from '../../auth/setup-link-tokens.js';
 import { handleCredentialRegistrationClaim, handleCredentialRegistrationLinkCreate, handleCredentialRegistrationLinkRevoke, handleCredentialRegistrationSubmit, handleCredentialSlotsGet } from './setup-credentials.js';
 import { createFakeCred } from '../../ux-sim/fake-cred.js';
 import { fileBackend } from '../config/secrets/file-backend.js';
@@ -156,6 +156,33 @@ test('one-time web registration is slot scoped, verified, single use, and never 
   );
   expect(reused.status).toBe(401);
   expect((await reused.text())).not.toContain(secret);
+});
+
+test('OpenRouter phone registration completes only its issued link after a verified Nexus write', async () => {
+  const created = await handleCredentialRegistrationLinkCreate(
+    jsonPost('https://nexus.example/v1/credentials/registration-links', { slot: 'cred:openrouter.api_key' }),
+    { dir, now: () => 1_000, authorizeOwner: () => true },
+  );
+  expect(created.status).toBe(200);
+  const { url } = await created.json() as { url: string };
+  const token = new URL(url).hash.slice('#t='.length);
+  expect(credentialRegistrationCompleted(token, 'cred:openrouter.api_key', { dir })).toBe(false);
+  const claim = await handleCredentialRegistrationClaim(
+    jsonPost('https://nexus.example/v1/setup/credential-claim', { t: token }), { dir, now: () => 1_001 },
+  );
+  expect(claim.status).toBe(200);
+  const { bearer } = await claim.json() as { bearer: string };
+  const secret = 'sk-or-v1-phone-private-value';
+  const saved = await handleCredentialRegistrationSubmit(
+    jsonPost('https://nexus.example/v1/setup/credential-register', { slot: 'cred:openrouter.api_key', value: secret }, `Bearer ${bearer}`),
+    { dir, now: () => 1_002, verify: async (service, value) => {
+      expect(service).toBe('openrouter'); expect(value).toBe(secret); return { result: 'verified' };
+    } },
+  );
+  expect(saved.status).toBe(200);
+  expect(await saved.text()).not.toContain(secret);
+  expect(credentialRegistrationCompleted(token, 'cred:openrouter.api_key', { dir })).toBe(true);
+  expect(await fileBackend.get('cred:openrouter.api_key')).toBe(secret);
 });
 
 test('owner cancellation revokes the issued link and any bearer already exchanged from it', async () => {

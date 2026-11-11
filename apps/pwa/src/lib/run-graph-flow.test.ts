@@ -88,23 +88,30 @@ test('scenario injection provenance is retained for both declared B/C nodes', ()
     ],
   };
   const replayed = applyRunGraphEvents(withScenes, [
-    { seq: 12, ts: '2026-11-03T19:38:23.515Z', type: 'node-added', node: 'subscription-repair', kind: 'judge', decider: 'scenario-injection', reason: 'paid-wall recovery mock', scene: 'B' },
-    { seq: 17, ts: '2026-11-03T19:38:23.516Z', type: 'node-added', node: 'headline-refresh', kind: 'researcher', decider: 'scenario-injection', reason: 'new headline reordering mock', scene: 'C' },
+    { seq: 12, ts: '2026-11-03T19:38:23.515Z', type: 'node-added', node: 'subscription-repair', kind: 'judge', decider: 'scenario-injection', source: 'injected', reason: 'paid-wall recovery mock', scene: 'B' },
+    { seq: 17, ts: '2026-11-03T19:38:23.516Z', type: 'node-added', node: 'headline-refresh', kind: 'researcher', decider: 'scenario-injection', source: 'replay', reason: 'new headline reordering mock', scene: 'C' },
   ]);
   expect(replayed.nodes.find((node) => node.node_id === 'subscription-repair')?.provenance).toEqual({
-    type: 'scenario-injection', scene: 'B', reason: 'paid-wall recovery mock', mock: true,
+    source: 'injected', scene: 'B', reason: 'paid-wall recovery mock', mock: true,
   });
   expect(replayed.nodes.find((node) => node.node_id === 'headline-refresh')?.provenance).toEqual({
-    type: 'scenario-injection', scene: 'C', reason: 'new headline reordering mock', mock: true,
+    source: 'replay', scene: 'C', reason: 'new headline reordering mock', mock: true,
   });
   const nonMock = applyRunGraphEvents(graph, [
-    { seq: 18, ts: '2026-11-03T19:38:23.517Z', type: 'node-added', node: 'verified-source', kind: 'researcher', decider: 'scenario-injection', reason: 'plugin grounded repair, not mock', scene: 'D' },
+    { seq: 18, ts: '2026-11-03T19:38:23.517Z', type: 'node-added', node: 'verified-source', kind: 'researcher', decider: 'scenario-injection', source: 'real', reason: 'plugin grounded repair, not mock', scene: 'D' },
   ]);
-  expect(nonMock.nodes.find((node) => node.node_id === 'verified-source')?.provenance?.mock).toBeUndefined();
+  expect(nonMock.nodes.find((node) => node.node_id === 'verified-source')?.provenance).toMatchObject({ source: 'real' });
   expect(runGraphToFlow(replayed).nodes.filter((node) => ['subscription-repair', 'headline-refresh'].includes(node.id)).map((node) => node.data.provenance)).toMatchObject([
-    { type: 'scenario-injection', scene: 'B', reason: 'paid-wall recovery mock' },
-    { type: 'scenario-injection', scene: 'C', reason: 'new headline reordering mock' },
+    { source: 'injected', scene: 'B', reason: 'paid-wall recovery mock' },
+    { source: 'replay', scene: 'C', reason: 'new headline reordering mock' },
   ]);
+});
+
+test('adaptive node without a forwarded source stays unknown instead of inferring provenance from decider', () => {
+  const result = applyRunGraphEvents(graph, [
+    { seq: 1, ts: '2026-11-03T19:38:23.517Z', type: 'node-added', node: 'unclassified', kind: 'researcher', decider: 'scenario-injection', reason: 'no source tag' },
+  ]);
+  expect(result.nodes.find((node) => node.node_id === 'unclassified')?.provenance).toMatchObject({ source: 'unknown' });
 });
 
 test('DEMO1104-ARG-ADAPTIVE-VIEW: three scene evidence stays ordered and records add, depth, repair, and hand work', () => {

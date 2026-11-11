@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { formatSchedule, getSchedule, listSchedules, setSchedule, dueReleaseCutEvents, emitDueReleaseCutEvents } from './release-schedule.js';
+import { formatSchedule, getSchedule, listSchedules, setSchedule, dueReleaseCutEvents, emitDueReleaseCutEvents, planIncrementalSweepTick } from './release-schedule.js';
 import { addItem } from './checklist.js';
 import { runGraph } from '../graph-runner/runner.js';
 import { writeReleaseGraphFixture } from '../../test/helpers/release-graph-fixture.js';
@@ -16,6 +16,26 @@ import { parse as yaml } from 'yaml';
 let dir = '';
 function setup() { dir = mkdtempSync(join(tmpdir(), 'release-schedule-')); setElanousConfigDir(dir); }
 afterEach(() => { resetElanousConfigDir(); if (dir) rmSync(dir, { recursive: true, force: true }); dir = ''; });
+
+test('SWEEP-INCREMENTAL-CRON: three fake-clock sweeps report certificate age and dirty count, then pre-cut once', () => {
+  const start = Date.parse('2026-11-11T00:00:00Z');
+  const cutAt = new Date(start + 11 * 3_600_000).toISOString();
+  let lastSweepAt: string | null = null;
+  for (const [hours, dirty] of [[0, 2], [3, 1], [6, 0]]) {
+    const now = new Date(start + hours * 3_600_000).toISOString();
+    expect(planIncrementalSweepTick({ now, cutAt, lastSweepAt, certificateMeasuredAt: start, dirtyFiles: dirty }))
+      .toMatchObject({ reason: 'cadence', certificateAgeMs: hours * 3_600_000, dirtyFiles: dirty });
+    lastSweepAt = now;
+  }
+  const preCut = new Date(start + 9.5 * 3_600_000).toISOString();
+  expect(planIncrementalSweepTick({ now: preCut, cutAt, lastSweepAt, certificateMeasuredAt: start, dirtyFiles: 1 }))
+    .toMatchObject({ reason: 'pre-cut', dueAt: preCut, dirtyFiles: 1 });
+  expect(planIncrementalSweepTick({ now: preCut, cutAt, lastSweepAt: preCut, certificateMeasuredAt: start, dirtyFiles: 1 })).toBeNull();
+  expect(planIncrementalSweepTick({ now: new Date(start + 4 * 3_600_000).toISOString(), cutAt,
+    lastSweepAt: new Date(start).toISOString(), certificateMeasuredAt: start, dirtyFiles: 1 }))
+    .toMatchObject({ reason: 'cadence', dueAt: new Date(start + 3 * 3_600_000).toISOString() });
+  expect(planIncrementalSweepTick({ now: cutAt, cutAt, lastSweepAt, certificateMeasuredAt: start, dirtyFiles: 1 })).toBeNull();
+});
 
 test('판별 UTC 저장 · KST 표시 · 순서 · 이력의 from/to 및 관측', () => {
   setup();

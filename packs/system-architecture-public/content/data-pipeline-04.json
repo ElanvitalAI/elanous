@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "데이터 파이프라인·스트리밍 — 스키마 진화와 격리",
+  "source": "https://cloud.google.com/pubsub/docs/schemas",
+  "body": "적용 시점: 여러 생산자·소비자가 서로 다른 배포 속도로 데이터 계약을 바꿀 때.\n용량 단계: 초기부터 필드 호환 규칙을 정하고, 계약 변경이 독립 배포를 막으면 registry와 quarantine을 붙인다.\nGCP 대응: Pub/Sub schema 또는 명시적 protobuf/Avro 계약, Dataflow 검증, 오류 데이터는 별도 bucket/table.\n비용 축: 검증·스키마 관리·격리 보존과 재처리 컴퓨트가 비용 축이다.\n결정과 반증: 필드 추가·삭제·타입 변경의 구버전 생산자/소비자 조합을 계약 시험한다."
+}

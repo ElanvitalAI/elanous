@@ -270,6 +270,7 @@
 
 import { renderTuiNow, tuiNowSlash } from '../../context-bus/context-now-surfaces.js';
 import { contextNow, contextNowInWorker } from '../../context-bus/context-now.js';
+import { releaseTuiStatusLines } from '../../context-bus/release-tui-status.js';
 import { handleTuiChatPersona, type TuiChatPersonaSelection } from './chat-persona.js';
 import { createWishCard } from '../../intake-plane/wish-card.js';
 import { CardStore } from '../../task-cards/card-store.js';
@@ -1297,9 +1298,7 @@ export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps, decideLedg
   });
 
   registry.register(['release'], async (_args, ctx) => {
-    const answer = nowDeps ? contextNow({ topic: '발행 상황' }, nowDeps)
-      : await contextNowInWorker({ topic: '발행 상황' });
-    for (const line of renderTuiNow(answer)) ctx.pushChatLine(line);
+    for (const line of await releaseTuiStatusLines(nowDeps)) ctx.pushChatLine(line);
   });
 
   registry.register('loops', async (args, ctx) => {

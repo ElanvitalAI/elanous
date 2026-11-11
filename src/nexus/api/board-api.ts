@@ -36,7 +36,8 @@ export interface BoardEventStore {
   /** Structural adapter for the shared store.events@1 provider instance injected by Nexus at startup. */
   query(request: { memberId: string; type: string }): Promise<readonly unknown[]>;
   scan?(request: { type: string }): Promise<readonly unknown[]>;
-  append(event: unknown): Promise<void>;
+  /** Board API and graph-owned progress nodes share this persisted event shape. */
+  append(event: BoardCardEvent): Promise<void>;
   /** Emits journal changes so Nexus SSE can forward graph-produced card states. */
   subscribe?(listener: (event: unknown) => void): () => void;
 }

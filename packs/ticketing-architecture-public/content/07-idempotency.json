@@ -1,0 +1,7 @@
+{
+  "type": "rule",
+  "title": "멱등 요청과 콜백",
+  "source": "https://docs.stripe.com/api/idempotent_requests",
+  "scope": "예약·결제 요청과 PG 콜백.",
+  "basis": "(user_id,idempotency_key)를 유일하게 저장하고 동일 파라미터 재요청에는 저장된 결과를 재생한다. 같은 키로 다른 좌석/금액 요청이면 명시 오류를 돌린다. PG 요청에도 안정된 키를 쓰고 콜백 event_id를 별도로 UNIQUE 처리한다. 처리 중 동시 중복은 한 실행만 원장에 반영한다."
+}

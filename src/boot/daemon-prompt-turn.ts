@@ -31,6 +31,7 @@ export interface DaemonPromptTurnResult {
   sessionId: string;
   text: string;
   stopReason: string;
+  providerFinishReason?: string;
 }
 
 /** Phase B-3 (PWA chat streaming · 2026-05-06) — derive a one-line
@@ -388,5 +389,6 @@ export async function runDaemonPromptTurn(opts: {
     sessionId: request.sessionId,
     text: result.finalText,
     stopReason: result.stopReason,
+    ...(result.providerFinishReason ? { providerFinishReason: result.providerFinishReason } : {}),
   };
 }

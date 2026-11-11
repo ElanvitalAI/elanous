@@ -2,6 +2,7 @@ import { classifyIntakeFrontRoute } from '../../src/intake-plane/front-route-cla
 import { INTAKE_FRONT_ROUTE_TRACKS, type IntakeFrontRouteDecision, type IntakeFrontRouteTrack } from '../../src/intake-plane/front-route-rules.js';
 import type { ResolveRoleProviderFn } from '../../src/intake-plane/runtime-callables.js';
 import { wilsonInterval, type WilsonInterval } from './nl-routing-measurement.js';
+import { isRecord } from '../../src/primitives/guards.js';
 
 export interface FrontRouteItem { id: string; text: string; expected: IntakeFrontRouteTrack }
 export interface FrontRouteCorpus { description: string; items: FrontRouteItem[] }
@@ -16,10 +17,6 @@ export interface FrontRouteProviderResult {
   confusion: FrontRouteConfusion;
   meanLatencyMs: number;
   perItem: { id: string; expected: IntakeFrontRouteTrack; got: IntakeFrontRouteTrack[] }[];
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function isTrack(value: unknown): value is IntakeFrontRouteTrack {

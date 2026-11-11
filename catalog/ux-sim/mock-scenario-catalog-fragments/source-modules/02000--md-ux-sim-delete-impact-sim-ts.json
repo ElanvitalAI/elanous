@@ -1,0 +1,8 @@
+{
+  "id": "MD-UX-SIM-DELETE-IMPACT-SIM-TS",
+  "path": "src/ux-sim/delete-impact-sim.ts",
+  "boundary": "Compares a virtual deletion with the shared impact graph, measured JUnit inventory, fake check receipts, and a bounded call log; it does not remove files or run production commands.",
+  "deviceIds": ["delete-impact-sim"],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

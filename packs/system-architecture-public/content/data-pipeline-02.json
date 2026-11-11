@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "데이터 파이프라인·스트리밍 — 이벤트 시간과 늦은 데이터",
+  "source": "https://cloud.google.com/dataflow/docs/concepts/streaming-pipelines",
+  "body": "적용 시점: 원천 이벤트가 늦거나 순서가 바뀌어도 시간 창 기반 집계가 필요할 때.\n용량 단계: 정시 데이터만으로 시작하지 말고 늦은 입력 분포를 관측; 허용 지연과 상태 보존 창을 결정한다.\nGCP 대응: Dataflow windowing/watermark와 Pub/Sub timestamp를 사용하고 결과 저장소의 갱신 규칙을 둔다.\n비용 축: 대기 창 동안의 상태 메모리, 보존, 늦은 데이터 보정 재계산이 비용 축이다.\n결정과 반증: 이벤트 시간·도착 시간 차이를 넣어 늦은 업데이트와 중복 집계의 정합성을 시험한다."
+}

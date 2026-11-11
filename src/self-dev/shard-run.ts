@@ -81,7 +81,8 @@ export type ShardRunLifecycleEvent =
   | { type: 'running'; shard: GateTestShard; attempt: number; at: string }
   | { type: 'attempt'; shard: GateTestShard; attempt: GateShardAttempt; state: 'retry' | 'done' | 'failed'; at: string };
 
-function hostResources(): ShardRunMode['hostResources'] | undefined {
+/** Existing gate host reading, also consumed read-only by capacity proposal adapters. */
+export function readShardHostResources(): ShardRunMode['hostResources'] | undefined {
   try {
     const tmp = statfsSync(tmpdir());
     // Linux page cache is reclaimable. `freemem()` alone saw only ~10 GiB on a WSL host
@@ -292,7 +293,7 @@ export function runShardedGateTests(
     const lowerBound = Number.isFinite(budgetGiB) && budgetGiB > 0 ? Math.ceil(totalRss / (budgetGiB * 1024)) : count;
     plannedCount = Math.max(count, Math.min(fileCount, lowerBound));
     // The requested count may exceed the number of files. Only expansion is bounded by file count.
-    const maxCount = Math.max(count, Math.min(fileCount, maxAutomaticShardCount(count, budgetGiB, mode.hostResources ?? hostResources())));
+    const maxCount = Math.max(count, Math.min(fileCount, maxAutomaticShardCount(count, budgetGiB, mode.hostResources ?? readShardHostResources())));
     if (plannedCount > maxCount) return fixedAtHostCap(maxCount, `host shard expansion cap ${maxCount} < needed ${plannedCount} (requested ${count}, measured RSS sum ${Math.round(totalRss)} MiB, budget ${budgetGiB} GiB)`);
     for (; plannedCount <= maxCount; plannedCount++) {
       try { shards = planSelfGateSpawnSeparatedShards(files, rss, seconds, budgetGiB, plannedCount); break; }
@@ -412,7 +413,7 @@ export async function runShardedGateTestsAsync(
   measure: AsyncShardProcess = run,
 ): Promise<ShardRunResult> {
   if (mode.concurrency !== undefined && (!Number.isSafeInteger(mode.concurrency) || mode.concurrency < 1 || mode.concurrency > 4)) throw new Error('invalid shard concurrency (expected 1–4)');
-  const resources = mode.hostResources ?? hostResources();
+  const resources = mode.hostResources ?? readShardHostResources();
   const selectedConcurrency = resolveShardConcurrency(mode.concurrency, resources, budgetGiB);
   const concurrency = selectedConcurrency.count;
   debug.log('self-dev.shard', 'concurrency', { concurrency, reason: selectedConcurrency.reason });

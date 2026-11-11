@@ -401,18 +401,28 @@ test('GATE-CLOSURE-LAZY-REQUIRE shadow simulation: only actual filesystem reader
     'test/named-promises-reader.test.ts': "import { read } from '../src/named-promises-reader'; test('named promises reader', read);",
   });
   const comparison = testsReachingChangedCliLazyRequireCandidate(tree, ['src/changed.ts'], TESTS(tree));
-  expect(comparison.current).toMatchObject({ ok: true, tests: ['test/domain-log.test.ts', 'test/fs-reader.test.ts',
-    'test/named-promises-reader.test.ts', 'test/promises-reader.test.ts'], reached: 0, opaque: 4 });
   expect(comparison.proposed).toMatchObject({ ok: true, tests: ['test/fs-reader.test.ts', 'test/named-promises-reader.test.ts',
     'test/namespace-reader-escape.test.ts', 'test/object-reader-escape.test.ts', 'test/promises-alias-destructure-reader.test.ts',
     'test/promises-destructure-reader.test.ts', 'test/promises-reader.test.ts'] });
-  expect(comparison.current.ok && comparison.current.opaqueFiles).toEqual([
-    'src/domain-log.ts: reads a file through an opaque path',
-    'src/fs-reader.ts: reads a file through an opaque path',
-    'src/named-promises-reader.ts: reads a file through an opaque path',
-    'src/promises-reader.ts: reads a file through an opaque path',
-    'test/domain-log.test.ts: reads a file through an opaque path',
-  ]);
+  expect(comparison.current.ok && comparison.current.tests).toEqual(comparison.proposed.ok && comparison.proposed.tests);
+  expect(comparison.current.ok && comparison.current.opaqueFiles).not.toContain('src/domain-log.ts: reads a file through an opaque path');
+  expect(comparison.current.ok && comparison.current.opaqueFiles).toContain('src/object-reader-escape.ts: reads a file through an opaque path');
+});
+
+test('GATE-REUSE-BY-DIFF closure: dynamic fs imports remain opaque', () => {
+  const tree = treeOf({
+    'src/dynamic-fs.ts': "export const read = async () => { const { readFileSync } = await import('node:fs'); return readFileSync(process.env.INPUT!, 'utf8'); };",
+    'src/template-fs.ts': 'export const read = async () => { const { readFileSync } = await import(`node:fs`); return readFileSync(process.env.INPUT!, "utf8"); };',
+    'src/package-reader.ts': "import { readFile } from 'fs-extra/esm'; export const read = () => readFile(process.env.INPUT!);",
+    'src/package-namespace.ts': "import * as fse from 'fs-extra/esm'; export const read = () => fse.readFile(process.env.INPUT!);",
+    'src/mz-reader.ts': "import * as fs from 'mz/fs'; export const read = () => fs.readFile(process.env.INPUT!);",
+    'test/dynamic-fs.test.ts': "import { read } from '../src/dynamic-fs'; test('read', read);",
+  });
+  expect(buildClosureGraph(tree).opaque.get('src/dynamic-fs.ts')).toBe('reads a file through an opaque path');
+  expect(buildClosureGraph(tree).opaque.get('src/template-fs.ts')).toBe('reads a file through an opaque path');
+  expect(buildClosureGraph(tree).opaque.get('src/package-reader.ts')).toBe('reads a file through an opaque path');
+  expect(buildClosureGraph(tree).opaque.get('src/package-namespace.ts')).toBe('reads a file through an opaque path');
+  expect(buildClosureGraph(tree).opaque.get('src/mz-reader.ts')).toBe('reads a file through an opaque path');
 });
 
 test('GATE-REUSE-BY-DIFF closure: literal repo paths are dependencies; a path in a comment is not', () => {

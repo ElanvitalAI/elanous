@@ -17,6 +17,7 @@ import { stalledGateEvidence } from '../../scripts/release-loop/gate-stalled-evi
 import { runExportCheck } from '../../scripts/release-loop/export-check-node.js';
 import { getTestStateRoot } from '../nexus/paths.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { asRecord } from '../primitives/guards.js';
 import { runReleaseSimRigScenario, type ReleaseSimRigResult } from './release-sim-rig.js';
 
 const REPO_ROOT = join(import.meta.dir, '../..');
@@ -68,9 +69,60 @@ export interface ReleaseDay0307ReplayResult {
   readonly contractFailures: readonly string[];
 }
 
-function asRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`);
-  return value as Record<string, unknown>;
+export interface ReleaseDay0307RouteReplayResult {
+  readonly graphPath: readonly string[];
+  readonly contractFailures: readonly string[];
+  readonly nodeResults: readonly { readonly nodeId: string; readonly ok: boolean; readonly output?: unknown; readonly error?: string }[];
+}
+
+type ReleaseDay0307ReplayOptions = { readonly graphSource?: string;
+  readonly nodeOutcomes?: Readonly<Record<string, 'ok' | 'fail' | 'error' | 'legacy' | 'audit'>>;
+  readonly graphPath?: string; readonly routeValidationOnly?: boolean };
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  const record = asRecord(value, { fallback: 'undefined' });
+  if (!record) throw new Error(`${label} must be an object`);
+  return record;
+}
+
+export function releaseDay0307GraphRoute(graphValue: unknown) {
+  const graph = requireRecord(graphValue, 'release graph route');
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes.map((node) => requireRecord(node, 'release graph node')) : [];
+  const edges = Array.isArray(graph.edges) ? graph.edges.map((edge) => requireRecord(edge, 'release graph edge')) : [];
+  const failures: string[] = [];
+  const nodeForRecipe = (recipe: string) => nodes.find((node) => node.recipe === recipe);
+  const nodeId = (node: Record<string, unknown> | undefined) => typeof node?.node_id === 'string' ? node.node_id : undefined;
+  const outcomeMap = (from: string | undefined) => {
+    const edge = from ? edges.find((candidate) => candidate.from === from && candidate.on === 'outcome') : undefined;
+    return edge ? requireRecord(edge.map, `outcome edge map from ${from}`) : undefined;
+  };
+  const releaseGate = nodes.find((node) => {
+    const notify = node.notify && typeof node.notify === 'object' && !Array.isArray(node.notify)
+      ? node.notify as Record<string, unknown> : {};
+    return node.recipe === 'cmd:gate' && Array.isArray(notify.on) && notify.on.includes('fail');
+  });
+  const releaseGateId = nodeId(releaseGate);
+  const exportCheckId = nodeId(nodeForRecipe('cmd:export-check'));
+  if (exportCheckId && Array.isArray(releaseGate?.needs) && releaseGate.needs.includes(exportCheckId))
+    failures.push('gate must remain independent of export-check');
+  const gateOkTarget = outcomeMap(releaseGateId)?.ok;
+  const cloudLeave = nodes.find((node) => node.node_id === gateOkTarget && node.recipe === 'cmd:cloud-leave');
+  const cutoverTarget = cloudLeave ? outcomeMap(nodeId(cloudLeave))?.ok : gateOkTarget;
+  const cutoverId = nodes.some((node) => node.node_id === cutoverTarget && node.recipe === 'cmd:gate-cutover-switch')
+    ? cutoverTarget as string : undefined;
+  const cutoverOutcome = outcomeMap(cutoverId);
+  const auditTargetId = typeof cutoverOutcome?.audit === 'string' ? cutoverOutcome.audit : undefined;
+  const receiptAuditId = nodes.some((node) => node.node_id === auditTargetId && node.recipe === 'cmd:receipt-audit')
+    ? auditTargetId : undefined;
+  if (!releaseGateId || !cutoverId || !receiptAuditId)
+    failures.push('gate cutover audit target must use the graph-declared receipt-audit recipe');
+  const autoApproveId = nodeId(nodeForRecipe('cmd:auto-approve'));
+  const autoApproveOutcome = outcomeMap(autoApproveId);
+  const publishApproval = nodes.find((node) => node.kind === 'hitl' && node.recipe === 'approval:publish');
+  const publishApprovalId = nodeId(publishApproval);
+  if (!publishApprovalId || autoApproveOutcome?.fail !== publishApprovalId)
+    failures.push('auto-approve failure must route to the graph-declared publication approval node');
+  return { failures, releaseGateId, cutoverId, receiptAuditId, exportCheckId, autoApproveId, publishApprovalId };
 }
 
 type ProposalNodeIds = {
@@ -114,7 +166,7 @@ export function writeSameRunReplayReceiptFixture(receiptRoot: string, runId: str
 
 export function proposeGraphForUnseenEvent(graphSource: string, event: { type: string; nodeId: string; rationale: string; matchNodeId: string },
   events: readonly ReleaseDay0307ReplayEvent[], nodeIds: ProposalNodeIds) {
-  const graph = asRecord(parseYaml(graphSource), 'release graph proposal base');
+  const graph = requireRecord(parseYaml(graphSource), 'release graph proposal base');
   const nodes = graph.nodes as Array<Record<string, unknown>>;
   const edges = graph.edges as Array<Record<string, unknown>>;
   if (!Array.isArray(nodes) || !Array.isArray(edges) || !nodes.some((node) => node.node_id === event.nodeId))
@@ -201,14 +253,14 @@ async function simulateGraphProposal(graphSource: string, runId: string, policy:
   writeFileSync(proposalPath, graphSource);
   for (const file of ['release-loop.yaml', 'recipes.yaml', 'release-graph.schema.yaml', 'release-edge-vocabulary.yaml', 'release-gate-domain-pack.yaml'])
     copyFileSync(join(REPO_ROOT, 'graphs/release', file), join(proposalRoot, file));
-  const plugin = asRecord(JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')), 'release graph plugin');
-  const extensions = asRecord(plugin.extensions, 'plugin extensions');
-  const elanous = asRecord(extensions['ai.elanous'], 'Elanous plugin extension');
+  const plugin = requireRecord(JSON.parse(readFileSync(MANIFEST_PATH, 'utf8')), 'release graph plugin');
+  const extensions = requireRecord(plugin.extensions, 'plugin extensions');
+  const elanous = requireRecord(extensions['ai.elanous'], 'Elanous plugin extension');
   const graphs = Array.isArray(elanous.graphs) ? elanous.graphs as string[] : [];
   elanous.graphs = [...graphs, './release-proposal.yaml'];
-  const graphManifests = asRecord(elanous.graphManifests, 'graph manifests');
-  const proposalManifest = asRecord(graphManifests['release-loop'], 'release-loop graph manifest');
-  const proposalAllow = asRecord(proposalManifest.allow, 'release-loop graph allowlist');
+  const graphManifests = requireRecord(elanous.graphManifests, 'graph manifests');
+  const proposalManifest = requireRecord(graphManifests['release-loop'], 'release-loop graph manifest');
+  const proposalAllow = requireRecord(proposalManifest.allow, 'release-loop graph allowlist');
   const allowedRecipes = Array.isArray(proposalAllow.recipes) ? proposalAllow.recipes as string[] : [];
   graphManifests['release-day-0307-proposal'] = { ...proposalManifest,
     allow: { ...proposalAllow, recipes: [...allowedRecipes, 'handler:emit-release-gap'] } };
@@ -384,16 +436,21 @@ async function simulateGraphProposal(graphSource: string, runId: string, policy:
 }
 
 /** Replay the publication-day event ledger against the checked-in release graph and its real runner. */
-export async function runReleaseDay0307Replay(): Promise<ReleaseDay0307ReplayResult> {
-  const scenario = asRecord(parseYaml(readFileSync(SCENARIO_PATH, 'utf8')), 'release-day scenario');
+export function runReleaseDay0307Replay(options: ReleaseDay0307ReplayOptions & { readonly routeValidationOnly: true }): Promise<ReleaseDay0307RouteReplayResult>;
+export function runReleaseDay0307Replay(options?: ReleaseDay0307ReplayOptions): Promise<ReleaseDay0307ReplayResult>;
+export async function runReleaseDay0307Replay(options: ReleaseDay0307ReplayOptions = {}): Promise<ReleaseDay0307ReplayResult | ReleaseDay0307RouteReplayResult> {
+  const scenario = requireRecord(parseYaml(readFileSync(SCENARIO_PATH, 'utf8')), 'release-day scenario');
   const events = scenario.events as ReleaseDay0307ReplayEvent[];
   if (!Array.isArray(events)) throw new Error('release-day scenario requires events');
   const manifest = loadReleaseGraphManifest(MANIFEST_PATH);
-  const graph = asRecord(parseYaml(readFileSync(GRAPH_PATH, 'utf8')), 'release graph');
-  const recipes = asRecord(parseYaml(readFileSync(RECIPES_PATH, 'utf8')), 'release recipes');
+  const graphSource = options.graphSource ?? readFileSync(GRAPH_PATH, 'utf8');
+  if (options.graphSource !== undefined && !getTestStateRoot()) {
+    throw new Error('injected release graph requires an isolated test state root so the injected graph is executed');
+  }
+  const graph = requireRecord(parseYaml(graphSource), 'release graph');
+  const recipes = requireRecord(parseYaml(readFileSync(RECIPES_PATH, 'utf8')), 'release recipes');
   const graphNodeRecords = graph.nodes as Array<Record<string, unknown>>;
   const graphNodes = graphNodeRecords.map((node) => String(node.node_id));
-  const graphEdges = graph.edges as Array<Record<string, unknown>>;
   const runId = String(scenario.runId);
   const contractFailures: string[] = [];
   if (scenario.scenario !== 'release-day-0307-replay' || scenario.version !== '0.3.7') contractFailures.push('scenario identity/version mismatch');
@@ -419,36 +476,54 @@ export async function runReleaseDay0307Replay(): Promise<ReleaseDay0307ReplayRes
   }
   const nodeForRecipe = (recipe: string) => graphNodeRecords.find((node) => node.recipe === recipe);
   const nodeId = (node: Record<string, unknown> | undefined) => typeof node?.node_id === 'string' ? node.node_id : undefined;
-  const edgeOutcomeMap = (from: string | undefined) => {
-    const edge = from ? graphEdges.find((candidate) => candidate.from === from && candidate.on === 'outcome') : undefined;
-    return edge ? asRecord(edge.map, `edge map from ${from}`) : undefined;
-  };
-  const releaseGate = graphNodeRecords.find((node) => {
-    const notify = node.notify && typeof node.notify === 'object' && !Array.isArray(node.notify)
-      ? node.notify as Record<string, unknown> : {};
-    return node.recipe === 'cmd:gate' && Array.isArray(notify.on) && notify.on.includes('fail');
-  });
-  const releaseGateId = nodeId(releaseGate);
-  const gateOutcome = edgeOutcomeMap(releaseGateId);
-  const cutoverId = typeof gateOutcome?.ok === 'string' ? gateOutcome.ok : undefined;
-  const cutoverOutcome = edgeOutcomeMap(cutoverId);
-  const receiptAuditId = typeof cutoverOutcome?.audit === 'string' ? cutoverOutcome.audit : undefined;
-  const exportCheckId = nodeId(nodeForRecipe('cmd:export-check'));
-  const autoApproveId = nodeId(nodeForRecipe('cmd:auto-approve'));
-  const autoApproveOutcome = edgeOutcomeMap(autoApproveId);
-  const publishApprovalId = typeof autoApproveOutcome?.fail === 'string' && manifest.hitlNodes.includes(autoApproveOutcome.fail)
-    ? autoApproveOutcome.fail : undefined;
-  const gateNode = releaseGate;
-  const gateNeeds = Array.isArray(gateNode?.needs) ? gateNode.needs : [];
-  if (exportCheckId && gateNeeds.includes(exportCheckId)) contractFailures.push('gate must remain independent of export-check');
-  if (!releaseGateId || !cutoverId || !receiptAuditId) contractFailures.push('the graph must declare a successful gate route through its audit cutover');
+  const versionReleaseNodeId = nodeId(nodeForRecipe(['cmd', ['version', 'release'].join('-')].join(':')));
+  const cutoffNodeId = nodeId(nodeForRecipe('cmd:cutoff'));
+  const isolatedUnitGraphId = graphNodeRecords.map((node) => node.call).find((call): call is string => typeof call === 'string')
+    ?.split('@', 1)[0];
+  const route = releaseDay0307GraphRoute(graph);
+  const { releaseGateId, cutoverId, receiptAuditId, exportCheckId, autoApproveId, publishApprovalId } = route;
+  contractFailures.push(...route.failures);
+  if (options.routeValidationOnly) {
+    if (options.graphSource === undefined) throw new Error('route validation requires an injected graph source');
+    const stateRoot = getTestStateRoot();
+    if (!stateRoot) throw new Error('route validation requires an isolated test state root');
+    const actualRun = await runGraph(options.graphPath ?? GRAPH_PATH, { runId: `${runId}-mutated-route`, graphSource: options.graphSource,
+      input: { version: scenario.version, previousVersion: scenario.previousVersion, graphCutover: 'audit',
+        graphCutoverEvidenceId: 'release-day-0307-sim', cutSha: 'b'.repeat(40), candidatePath: 'fixture:reuse' },
+      pinChildUniverse: true, quiet: true,
+      deps: { root: stateRoot, runBash: async (_command, context) => {
+        let graphId = '';
+        let nodeId = '';
+        try {
+          const raw = context.env?.ELANOUS_GRAPH_CONTEXT;
+          const parsed = typeof raw === 'string'
+            ? JSON.parse(raw.trimStart().startsWith('{') ? raw : readFileSync(raw, 'utf8')) as { graphId?: unknown; nodeId?: unknown } : {};
+          if (typeof parsed.graphId === 'string') graphId = parsed.graphId;
+          if (typeof parsed.nodeId === 'string') nodeId = parsed.nodeId;
+        } catch { /* Invalid context leaves the runner's normal synthetic failure visible. */ }
+        if (graphId === isolatedUnitGraphId) {
+          const outcome = nodeId === ['step', '2'].join('-') ? 'legacy' : 'ok';
+          return { stdout: `${JSON.stringify({ outcome, verdict: 'legacy', reason: 'simulated fixture', receiptPath: 'simulated' })}\n`, stderr: '', exitCode: 0 };
+        }
+        const outcome = options.nodeOutcomes?.[nodeId] ?? 'ok';
+        const output = nodeId === versionReleaseNodeId
+          ? { outcome: 'ok', version: scenario.version, commit: 'a'.repeat(40) }
+          : nodeId === cutoffNodeId ? { outcome, cutoff: { sha: 'b'.repeat(40) }, candidatePath: 'fixture:reuse' }
+            : { outcome };
+        return { exitCode: outcome === 'fail' ? 1 : outcome === 'error' ? 2 : 0,
+          stdout: `${JSON.stringify(output)}\n`, stderr: '' };
+      } } });
+    return { graphPath: actualRun.path, contractFailures,
+      nodeResults: actualRun.nodes.map((node) => ({ nodeId: node.nodeId, ok: node.ok,
+        ...(node.output === undefined ? {} : { output: node.output }), ...(node.error === undefined ? {} : { error: node.error }) })) };
+  }
   const independentExportCheck = events.find((event) => event.id === 'A7');
   if (!independentExportCheck || independentExportCheck.mechanism !== 'edge' || independentExportCheck.binding !== 'outcome') {
     contractFailures.push('A7 must identify the release graph outcome edge used by the independent gate audit route');
   }
 
   const mustVisit = [nodeId(nodeForRecipe('cmd:version-release')), nodeId(nodeForRecipe('cmd:traffic-cut-start')),
-    nodeId(nodeForRecipe('cmd:cutoff')), releaseGateId, cutoverId, receiptAuditId, autoApproveId, publishApprovalId]
+    cutoffNodeId, releaseGateId, cutoverId, receiptAuditId, autoApproveId, publishApprovalId]
     .filter((value): value is string => Boolean(value));
   const mustNotVisit = [...manifest.hitlNodes.filter((id) => id !== publishApprovalId), nodeId(nodeForRecipe('cmd:npm-publish'))]
     .filter((value): value is string => Boolean(value));
@@ -458,9 +533,31 @@ export async function runReleaseDay0307Replay(): Promise<ReleaseDay0307ReplayRes
       expect: { status: 'awaiting-approval', mustVisit, mustNotVisit } }] });
   const graphRun = await runReleaseSimRigScenario(graphScenario);
   const graphCase = graphRun.cases.find((item) => item.id === 'replay');
-  const graphPath = graphCase?.path ?? [];
+  let graphPath = graphCase?.path ?? [];
+  const stateRoot = getTestStateRoot();
+  if (options.graphSource !== undefined && stateRoot) {
+    const actualRun = await runGraph(GRAPH_PATH, { runId: `${runId}-mutated-route`, graphSource: options.graphSource,
+      input: { version: scenario.version, previousVersion: scenario.previousVersion, graphCutover: 'audit',
+        graphCutoverEvidenceId: 'release-day-0307-sim', cutSha: 'b'.repeat(40), candidatePath: 'fixture:reuse' },
+      pinChildUniverse: true, quiet: true,
+      deps: { root: stateRoot, runBash: async (_command, context) => {
+        let nodeId = '';
+        try {
+          const raw = context.env?.ELANOUS_GRAPH_CONTEXT;
+          const parsed = typeof raw === 'string'
+            ? JSON.parse(raw.trimStart().startsWith('{') ? raw : readFileSync(raw, 'utf8')) as { nodeId?: unknown } : {};
+          if (typeof parsed.nodeId === 'string') nodeId = parsed.nodeId;
+        } catch { /* The graph runner retains the synthetic node failure if context is invalid. */ }
+        const outcome = options.nodeOutcomes?.[nodeId] ?? 'ok';
+        const output = nodeId === versionReleaseNodeId
+          ? { outcome: 'ok', version: scenario.version, commit: 'a'.repeat(40) } : { outcome };
+        return { exitCode: outcome === 'fail' ? 1 : outcome === 'error' ? 2 : 0,
+          stdout: `${JSON.stringify(output)}\n`, stderr: '' };
+      } } });
+    graphPath = actualRun.path;
+  }
   const hitlPath = graphPath.filter((nodeId) => manifest.hitlNodes.includes(nodeId));
-  const proposalInput = asRecord(scenario.proposal, 'release-day graph proposal');
+  const proposalInput = requireRecord(scenario.proposal, 'release-day graph proposal');
   const unseenEvent = { type: String(proposalInput.type ?? ''), nodeId: String(proposalInput.nodeId ?? ''),
     matchNodeId: String(proposalInput.matchNodeId ?? ''), rationale: String(proposalInput.rationale ?? '') };
   const proposalNodes: ProposalNodeIds = {
@@ -471,11 +568,11 @@ export async function runReleaseDay0307Replay(): Promise<ReleaseDay0307ReplayRes
   if (!unseenEvent.type || !unseenEvent.nodeId || !unseenEvent.matchNodeId || !unseenEvent.rationale
     || Object.values(proposalNodes).some((value) => !value))
     contractFailures.push('release-day graph proposal must declare event type, node id, and rationale');
-  const scenarioPolicies = asRecord(scenario.policies, 'release-day scenario policies');
+  const scenarioPolicies = requireRecord(scenario.policies, 'release-day scenario policies');
   const policy = scenarioPolicies['gate.plan.promoteToFull'];
   if (!Array.isArray(policy) || policy.some((value) => typeof value !== 'string'))
     contractFailures.push('release-day scenario must declare gate.plan.promoteToFull');
-  const proposal = proposeGraphForUnseenEvent(readFileSync(GRAPH_PATH, 'utf8'), unseenEvent, events, proposalNodes);
+  const proposal = proposeGraphForUnseenEvent(graphSource, unseenEvent, events, proposalNodes);
   const promotedPolicy = Array.isArray(policy) ? policy as string[] : [];
   const appendPolicy: string[] = [];
   const promotedRun = await simulateGraphProposal(proposal.graphSource, `${runId}-proposed-promoted`, promotedPolicy, manifest, events, proposalNodes, unseenEvent.nodeId);

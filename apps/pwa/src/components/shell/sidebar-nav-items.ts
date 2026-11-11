@@ -83,6 +83,7 @@ export const NON_MENU_SIDEBAR_ROUTE_CATEGORIES = [
   'provider-onboarding-complete', 'settings-subpage', 'workflow-subflow',
   'workflow-legacy-redirect', 'root-welcome', 'error-page', 'unwired-screen',
   'diagnostic-readonly', 'contact-form', 'beta-direct-link', 'operator-direct-link',
+  'member-signup',
 ];
 export type NonMenuSidebarRouteCategory = typeof NON_MENU_SIDEBAR_ROUTE_CATEGORIES[number];
 export interface NonMenuSidebarRoute {
@@ -95,6 +96,9 @@ export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
   { href: '/credentials/register', category: 'settings-subpage', reason: '자격 금고 슬롯별 등록 화면.' },
   { href: '/credentials/register/claim', category: 'settings-subpage', reason: '일회용 소유자 등록 링크를 처리하는 화면.' },
   { href: '/apps/report', category: 'workflow-subflow', reason: '앱 화면에서 여는 공개 앱 신고 화면.' },
+  { href: '/member/invite', category: 'workflow-subflow', reason: '회원 보드에서 여는 초대 링크 관리 화면.' },
+  { href: '/signup', category: 'member-signup', reason: '초대 링크로 직접 여는 회원 가입 화면.' },
+  { href: '/signup/complete', category: 'member-signup', reason: '회원 가입 완료 뒤 이동하는 화면.' },
   { href: '/ops/release', category: 'operator-direct-link', reason: '운영자 릴리스 그래프 직접 진입점.' },
   { href: '/live-run/adaptive', category: 'beta-direct-link', reason: '런 장면에서 여는 적응형 그래프 시뮬레이션 재생 화면.' },
   { href: '/share/received', category: 'system-share-target', reason: 'OS 공유 수신 후 회원 스크랩 저장 화면.' },

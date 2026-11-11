@@ -1,0 +1,270 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "host": "aws2",
+    "commit": "4fbf34cf9f870c232ce38ba75ae2b27ce7b1eb7f",
+    "runCommand": "CLASSIC_TICKET_SCENARIO=1 ELANOUS_TRACK=OP bun test src/dashboard/plugin-route-adapter.test.ts -t \"classic dashboard PTY carries KAIST scenes 1–6\"",
+    "verdict": "pass"
+  },
+  "receipt": {
+    "owner": "member-from-fake-nexus",
+    "scenes": {
+      "1": {
+        "runId": "efdbdd7d-7fce-44aa-972a-581f02527162",
+        "scene": 1,
+        "input": {
+          "kind": "text",
+          "text": "티켓 예매 서비스 · 동시 300명"
+        },
+        "output": {
+          "scrapId": "kcb-scrap-shared-text",
+          "owner": "member-from-fake-nexus"
+        }
+      },
+      "2": {
+        "runId": "cbd06970-ccc8-4ca8-ab05-a733ff0e75e7",
+        "scene": 2,
+        "input": {
+          "input": "오늘 브리핑",
+          "kinds": [
+            "web",
+            "x",
+            "youtube",
+            "voice",
+            "video",
+            "photo",
+            "text"
+          ]
+        },
+        "output": {
+          "extracted": 7,
+          "kinds": [
+            "web",
+            "x",
+            "youtube",
+            "voice",
+            "video",
+            "photo",
+            "text"
+          ],
+          "scrapIds": [
+            "kcb-scrap-web",
+            "kcb-scrap-x",
+            "kcb-scrap-youtube",
+            "kcb-scrap-voice",
+            "kcb-scrap-video",
+            "kcb-scrap-photo",
+            "kcb-scrap-shared-text"
+          ]
+        }
+      },
+      "3": {
+        "runId": "cbd06970-ccc8-4ca8-ab05-a733ff0e75e7",
+        "scene": 3,
+        "input": {
+          "owner": "member-from-fake-nexus",
+          "briefingId": "brief-kcb-ticket-1"
+        },
+        "output": {
+          "briefingId": "brief-kcb-ticket-1",
+          "channels": [
+            "android",
+            "tui",
+            "telegram"
+          ],
+          "briefing": {
+            "id": "brief-kcb-ticket-1",
+            "topics": [
+              {
+                "summary": "티켓 예매 서비스 · 동시 300명",
+                "sourceScrapIds": [
+                  "kcb-scrap-web",
+                  "kcb-scrap-x",
+                  "kcb-scrap-youtube",
+                  "kcb-scrap-voice",
+                  "kcb-scrap-video",
+                  "kcb-scrap-photo",
+                  "kcb-scrap-shared-text"
+                ]
+              }
+            ],
+            "scrapIds": [
+              "kcb-scrap-web",
+              "kcb-scrap-x",
+              "kcb-scrap-youtube",
+              "kcb-scrap-voice",
+              "kcb-scrap-video",
+              "kcb-scrap-photo",
+              "kcb-scrap-shared-text"
+            ]
+          }
+        }
+      },
+      "4": {
+        "runId": "4f03a7c6-ab91-4128-bca7-5f1b9201b121",
+        "scene": 4,
+        "input": {
+          "owner": "member-from-fake-nexus"
+        },
+        "output": {
+          "suggestionId": "suggestion-kcb-ticket-1",
+          "suggestionIds": [
+            "suggestion-kcb-ticket-1"
+          ],
+          "sourceScrapIds": [
+            "kcb-scrap-web",
+            "kcb-scrap-x",
+            "kcb-scrap-youtube",
+            "kcb-scrap-voice",
+            "kcb-scrap-video",
+            "kcb-scrap-photo",
+            "kcb-scrap-shared-text"
+          ],
+          "suggestion": {
+            "id": "suggestion-kcb-ticket-1",
+            "appId": "ticketing-fake-app",
+            "ask": "티켓 예매 서비스 · 동시 300명",
+            "evidenceScrapIds": [
+              "kcb-scrap-web",
+              "kcb-scrap-x",
+              "kcb-scrap-youtube",
+              "kcb-scrap-voice",
+              "kcb-scrap-video",
+              "kcb-scrap-photo",
+              "kcb-scrap-shared-text"
+            ],
+            "owner": "member-from-fake-nexus"
+          }
+        }
+      },
+      "5": {
+        "runId": "8240da26-5650-4ae8-99bc-26a0ebb852b8",
+        "scene": 5,
+        "input": {
+          "suggestionId": "suggestion-kcb-ticket-1",
+          "confirmation": "y"
+        },
+        "output": {
+          "boardCardId": "kcb-ticket-board-1",
+          "attachment": {
+            "id": "artifact-suggestion-kcb-ticket-1",
+            "kind": "app-artifact",
+            "sha256": "5628789d0c92f4b8ba323445269ff2053c64ce2677243a79e3622fa9750cc556",
+            "files": [
+              "/index.html"
+            ]
+          },
+          "acceptance": {
+            "suggestionId": "suggestion-kcb-ticket-1",
+            "owner": "member-from-fake-nexus",
+            "accepted": true,
+            "service": "티켓 예매 서비스"
+          },
+          "capacityAssumption": {
+            "concurrentUsers": 300,
+            "rationale": "요청에 \"동시 300명\"이 명시됨.",
+            "source": "user-input",
+            "userSpecified": true
+          },
+          "graphRun": {
+            "graphId": "absorb-build",
+            "runId": "8240da26-5650-4ae8-99bc-26a0ebb852b8",
+            "status": "done",
+            "path": [
+              "lookup-suggestion",
+              "build",
+              "simulate",
+              "approve-publish",
+              "publish",
+              "done"
+            ]
+          }
+        }
+      },
+      "6": {
+        "runId": "8240da26-5650-4ae8-99bc-26a0ebb852b8",
+        "scene": 6,
+        "input": {
+          "boardCardId": "kcb-ticket-board-1"
+        },
+        "output": {
+          "resultUrl": "https://ticketing-fake-app.app.sim.invalid/",
+          "boardCardId": "kcb-ticket-board-1",
+          "boardCard": {
+            "id": "kcb-ticket-board-1",
+            "owner": "member-from-fake-nexus",
+            "title": "티켓 예매 서비스 · 동시 300명",
+            "state": "released",
+            "stateHistory": [
+              "building",
+              "testing",
+              "released"
+            ],
+            "resultUrl": "https://ticketing-fake-app.app.sim.invalid/"
+          },
+          "attachment": {
+            "id": "artifact-suggestion-kcb-ticket-1",
+            "kind": "app-artifact",
+            "sha256": "5628789d0c92f4b8ba323445269ff2053c64ce2677243a79e3622fa9750cc556",
+            "files": [
+              "/index.html"
+            ]
+          }
+        }
+      }
+    },
+    "graphPath": [
+      "lookup-suggestion",
+      "build",
+      "simulate",
+      "approve-publish",
+      "publish",
+      "done"
+    ],
+    "graph": "absorb-build",
+    "status": "done",
+    "boardCard": {
+      "id": "kcb-ticket-board-1",
+      "owner": "member-from-fake-nexus",
+      "title": "티켓 예매 서비스 · 동시 300명",
+      "state": "released",
+      "stateHistory": [
+        "building",
+        "testing",
+        "released"
+      ],
+      "resultUrl": "https://ticketing-fake-app.app.sim.invalid/"
+    },
+    "attachment": {
+      "id": "artifact-suggestion-kcb-ticket-1",
+      "kind": "app-artifact",
+      "sha256": "5628789d0c92f4b8ba323445269ff2053c64ce2677243a79e3622fa9750cc556",
+      "files": [
+        "/index.html"
+      ]
+    },
+    "receipt": {
+      "id": "fake-pass-receipt",
+      "artifactId": "artifact-suggestion-kcb-ticket-1",
+      "owner": "member-from-fake-nexus",
+      "status": "passed",
+      "attachment": {
+        "id": "artifact-suggestion-kcb-ticket-1",
+        "kind": "app-artifact"
+      }
+    },
+    "graphRun": {
+      "graphId": "absorb-build",
+      "runId": "8240da26-5650-4ae8-99bc-26a0ebb852b8",
+      "status": "done",
+      "path": [
+        "lookup-suggestion",
+        "build",
+        "simulate",
+        "approve-publish",
+        "publish",
+        "done"
+      ]
+    }
+  }
+}

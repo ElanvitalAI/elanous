@@ -25,6 +25,8 @@ import { liveRunMetricCells } from '@/lib/live-run-metrics';
 import { failureRepairEvidence, liveRunStageMetrics, mcpEdgeDirection, nodeBirthsBetweenSteps, stageNodeResourceBadges, unorderableGraphEventCount, visibleRunAtCursor } from '@/lib/live-run-stage';
 import { aggregateGroupState, collapseGroups, GROUP_NODE_PREFIX, groupBoxes, groupNames, groupOf, isGroupNodeId, type GroupedRunGraph } from '@/components/editor/graph-groups';
 import { GROUP_BOX_NODE_TYPES, type GroupBoxData } from '@/components/editor/GraphGroupBox';
+import { ProvenanceBadge } from '@/components/provenance/ProvenanceBadge';
+import { projectPwaProvenanceBadge } from '@/lib/provenance-badge';
 
 const KIND_COLORS: Record<string, string> = {
   agent: '#3b82f6', gate: '#f59e0b', git: '#10b981', judge: '#a855f7',
@@ -73,6 +75,7 @@ interface LiveNodeData extends RunGraphNodeData {
 
 function LiveNode({ data }: NodeProps) {
   const node = data as LiveNodeData;
+  const provenance = node.provenance ? projectPwaProvenanceBadge(node.provenance.source) : null;
   return (
     <div data-testid={`live-node-${node.label}`} data-state={node.state}
       data-adaptive-event={node.adaptiveLabel} data-birth-active={node.birthActive ? 'true' : 'false'}
@@ -93,10 +96,9 @@ function LiveNode({ data }: NodeProps) {
           {(node.resourceBadges ?? ['호스트 기록 없음', '모델 기록 없음']).slice(0, 3).map((badge) => <span key={badge} className="shrink-0 rounded-full border border-cyan-400/40 bg-cyan-400/10 px-1 text-[8px] leading-3 text-cyan-700 dark:text-cyan-200">{badge}</span>)}
         </div>
       )}
-      {node.provenance?.type === 'scenario-injection' ? (
-        <div data-testid={`scenario-injection-${node.label}`} className="truncate text-[10px] text-amber-700 dark:text-amber-300"
-          title={`${node.provenance.type}${node.provenance.scene ? ` · ${node.provenance.scene}` : ''} · ${node.provenance.reason}`}>
-          시나리오 주입{node.provenance.scene ? ` · ${node.provenance.scene}` : ''}{node.provenance.mock ? ' · mock' : ''}
+      {provenance && provenance.kind !== 'unbadged' ? (
+        <div data-testid={`provenance-tag-${node.label}`} className="truncate text-[10px] text-amber-700 dark:text-amber-300">
+          <ProvenanceBadge source={node.provenance?.source} />
         </div>
       ) : !node.stageMode ? <div className="truncate text-[11px] text-text-tertiary" title={node.recipe}>{node.recipe} · 최대 {node.maxVisits}회</div> : null}
       {node.visits > 1 && (

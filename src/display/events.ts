@@ -5,10 +5,8 @@ import type {
   DisplaySurface,
   SurfaceId,
 } from './types.js';
-import type {
-  TerminalExposureSnapshot,
-  TerminalInteractionPolicy,
-} from '../dashboard/terminal-exposure.js';
+import type { TerminalExposureSnapshot } from '../terminal/posture.js';
+import type { TerminalInteractionPolicy } from '../terminal/tui-policy.js';
 
 export type DisplayEvent =
   | {

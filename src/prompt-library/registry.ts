@@ -7,6 +7,7 @@ import { GEMINI_CHAT_VARIANT } from './providers/gemini.js';
 import { GPT_CHAT_VARIANT } from './providers/gpt.js';
 import { GROK_CHAT_VARIANT } from './providers/grok.js';
 import { LOCAL_CHAT_VARIANT } from './providers/local.js';
+import { isSolarPro4Model, solarOptimizationEnabled, SOLAR_CHAT_VARIANT } from './providers/solar.js';
 
 export interface ResolveChatSystemPromptOpts {
   model?: string;
@@ -20,6 +21,7 @@ export interface ResolvedChatSystemPrompt {
 }
 
 export function resolveBuiltinChatVariant(model?: string): string {
+  if (solarOptimizationEnabled() && isSolarPro4Model(model)) return SOLAR_CHAT_VARIANT;
   switch (getModelFamily(model)) {
     case 'claude':
       return ANTHROPIC_CHAT_VARIANT;
@@ -75,7 +77,7 @@ export function resolveChatSystemPrompt(
     } as const;
     return resolved;
   }
-  const family = getModelFamily(opts.model);
+  const family = solarOptimizationEnabled() && isSolarPro4Model(opts.model) ? 'solar' : getModelFamily(opts.model);
   const resolved: ResolvedChatSystemPrompt = {
     text: resolveBuiltinChatVariant(opts.model),
     source: 'builtin',

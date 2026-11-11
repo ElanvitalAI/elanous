@@ -16,6 +16,7 @@
   "id": "world-runtime",
   "implementation": [
     "src/ux-sim/world.ts",
+    "src/ux-sim/scenario-target.ts",
     "src/cli/sim-cli.ts",
     "scripts/sim-world-runner.ts",
     "scenarios/ux-sim/night-train-dead-pid-lock.yaml",
@@ -68,6 +69,7 @@
   "target": "named catalog-device assembly, test-root world lifecycle, OS-enforced network denial, declared monkey faults on a shared fake-time timeline, and arbitrary world injections through the production ledger writer; SI uncertain-exec injection uses L0 fault records through production host transport and reconcile-only boundary; named catalog-device assembly, test-root lifecycle and OS-enforced network denial; dead-pid-lock and HQ transfer scenarios under fake host/clock edges; shared-timeline monkey faults, ledger/log injections, and app-host deploy/rollback; production gate roster cut, pinned image and same-shard host failover",
   "tests": [
     "src/ux-sim/world.test.ts",
+    "src/ux-sim/scenario-target.test.ts",
     "src/ux-sim/world-snapshot.test.ts",
     "src/ux-sim/world-chaos-runtime.test.ts",
     "src/ux-sim/event-monkey.test.ts",

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "ML 서빙 — 모델 점진 배포와 rollback",
+  "source": "https://docs.cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning",
+  "body": "적용 시점: 새 모델의 품질·지연이 기존 모델과 다를 수 있고 위험을 제한해야 할 때.\n용량 단계: 새 버전을 shadow/canary로 비교하고 안정성·품질 기준을 만족한 뒤 traffic을 이동한다.\nGCP 대응: Vertex AI traffic split/model monitoring 또는 Cloud Run revision split; model registry와 데이터 snapshot을 묶는다.\n비용 축: 이중 모델 serving, shadow inference, 저장된 평가 샘플과 rollback 준비가 임시 비용이다.\n결정과 반증: 새 버전의 rollback이 모델·전처리·스키마 세트를 함께 되돌리는지 확인한다."
+}

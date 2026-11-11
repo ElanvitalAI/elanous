@@ -203,6 +203,21 @@ describe('OpenRouter provider wire', () => {
     expect('max_tokens' in calls[1]!.body).toBe(false);
   });
 
+  test('Solar Pro 4 honors an explicit output budget and requires tool parameters', async () => {
+    const p = llm.getProviderForConfig(cfg({ provider: 'openrouter', model: 'openrouter/upstage/solar-pro4', apiKey: 'sk-or-cfg' }));
+    // Source: caller-selected fixture budget; the provider must receive the exact request rather than an invented default.
+    const requestedMaxTokens = 4096;
+    for await (const _ of p.streamChat!([{ role: 'user', content: 'Use the tool' }], {
+      maxTokens: requestedMaxTokens,
+      tools: [{ name: 'lookup', description: 'Read one fact', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } }],
+    })) { /* consume */ }
+    expect(calls[0]!.body.max_tokens).toBe(requestedMaxTokens);
+    expect(calls[0]!.body.provider.require_parameters).toBe(true);
+    expect(calls[0]!.body.tools).toHaveLength(1);
+    for await (const _ of p.streamChat!([{ role: 'user', content: 'Answer briefly' }], {})) { /* consume */ }
+    expect('max_tokens' in calls[1]!.body).toBe(false);
+  });
+
   test('⛔ reasoning_details 왕복 — 조각을 이어 첫 도구 호출에 싣고, 다음 요청 어시스턴트 메시지에 되돌린다(Kimi K3 는 필수)', async () => {
     installFetch(() => {
       const sse = [
@@ -246,4 +261,3 @@ describe('OpenRouter provider wire', () => {
     expect(calls[2]!.body.temperature).toBe(0.3);
   });
 });
-

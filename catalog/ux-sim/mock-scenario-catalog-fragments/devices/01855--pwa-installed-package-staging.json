@@ -1,0 +1,31 @@
+{
+  "id": "pwa-installed-package-staging-world",
+  "name": "pwa-installed-package-staging-world · nested npm install and PWA source staging",
+  "audience": "internal",
+  "checklistCells": ["PKG-INCLUDE-PWA-APPS"],
+  "implementation": [
+    "apps/pwa/scripts/static-generation.ts",
+    "package.json"
+  ],
+  "tests": [
+    "apps/pwa/scripts/static-generation.test.ts",
+    "test/package-files-pwa.test.ts"
+  ],
+  "target": "Production PWA static build staging and the real package file list, with a synthetic nested installed package and only the Next build call injected.",
+  "inputs": [
+    "package-local dependency and app build dependency",
+    "dependencies hoisted to the nearest and outer enclosing node_modules directories",
+    "dry-run package file list from Bun's package manager"
+  ],
+  "observations": [
+    "all dependency levels are linked into the staged repository with nearest-level precedence",
+    "the installed app node_modules link remains available to Next",
+    "the published package contains PWA build entry points without tests"
+  ],
+  "entryCommands": [
+    "bun test apps/pwa/scripts/static-generation.test.ts test/package-files-pwa.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

@@ -102,7 +102,7 @@ describe('next TUI × herdr prompt (L3)', () => {
       expect(states()[0]).toBe('idle');
       // herdr `pane run` 이 bracketed-paste 모드 pane 에 쓰는 바이트 그대로.
       pty.write(`\x1b[200~${prompt}\x1b[201~\r`);
-      const after = await waitFor('reply', (s) => s.includes(reply) && s.includes('응답 완료'));
+      const after = await waitFor('reply', (s) => s.includes(reply) && (s.includes('응답 완료') || s.includes('턴 완료')));
       expect(after).toContain(prompt);
       const id = getActiveSessionId() ?? '';
       expect(loadSession(id)?.messages.filter((m) => m.role === 'user').map((m) => m.content)).toEqual([prompt]);

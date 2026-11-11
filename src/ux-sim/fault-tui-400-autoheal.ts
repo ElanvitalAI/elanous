@@ -16,22 +16,18 @@
 // 관측 = 화면 줄 · self-health.autoheal 이벤트 · 공급자별 HTTP 호출 수 · 영수증(명령 ⊕ injectionId ⊕ 결과) · 층 L1.
 
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { _resetKeyCacheForTests } from '../config.js';
 import { debug } from '../debug/log.js';
-import { PROVIDERS } from '../llm.js';
+import { PROVIDERS, type LLMMessage } from '../llm.js';
 import { ZAI_CODING_PLAN_URL } from '../llm/zai-coding-plan.js';
+import { codexOwnerMirrorAuthPath } from '../oauth/codex-owner-mirror.js';
 import { ZAI_POD_SECRET_KEY } from '../task-orchestrator/surfaces/pod-zai-child.js';
 import { setUserConfigOverlay } from '../user-config.js';
 import { getCompactSystemPrompt } from '../compact/index.js';
-import { bootDashboardAcpSession } from '../dashboard/acp-boot.js';
-import {
-  runDashboardChatMainPlainTurn,
-  type DashboardChatMainPlainTurnRuntimeDeps,
-} from '../dashboard/input/chat-main-plain-turn-runtime.js';
-import { createDashboardTurnAutoheal } from '../dashboard/input/turn-autoheal.js';
+import type { Tui400Runtime } from './tui-400-runtime-contract.js';
 import type { ChatMessage } from '../chat/index.js';
 
 export const TUI_400_AUTOHEAL_LEVEL = 'L1' as const;
@@ -121,6 +117,7 @@ export async function simTui400Autoheal(
     /** false = 자동 회복 배선 없이(수리 전 동작 · 10-22 실측 멈춤 재현). 기본 true. */
     autoheal?: boolean;
   } = {},
+  runtime: Tui400Runtime,
 ): Promise<Tui400Observation> {
   const injectionId = opts.injectionId ?? `inj-${randomUUID()}`;
   const script = SCRIPTS[scenario];
@@ -133,13 +130,25 @@ export async function simTui400Autoheal(
   let codexTurnCalls = 0;
   let codexSummaryCalls = 0;
   let zaiCalls = 0;
-  let session: Awaited<ReturnType<typeof bootDashboardAcpSession>>['session'] | null = null;
+  let session: Awaited<ReturnType<Tui400Runtime['boot']>>['session'] | null = null;
   try {
     process.env.HOME = home;
     process.env.XDG_CONFIG_HOME = join(home, '.config');
     process.env.CODEX_HOME = join(home, '.codex');
     process.env.ELANOUS_STATE_DIR = join(home, 'state');
     for (const key of ISOLATED_LLM_ENV_KEYS) delete process.env[key];
+    // This fixture tests the real provider path behind a stubbed fetch, even under bun test.
+    process.env.ELANOUS_LLM_MODE = 'real';
+    process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
+    const mirrorPath = codexOwnerMirrorAuthPath();
+    const expiresAt = Date.now() + 60 * 60_000;
+    const accessToken = `e30.${Buffer.from(JSON.stringify({ exp: Math.floor(expiresAt / 1000) })).toString('base64url')}.synthetic`;
+    mkdirSync(dirname(mirrorPath), { recursive: true });
+    writeFileSync(mirrorPath, JSON.stringify({
+      version: 1, providers: { 'openai-codex': { authMode: 'chatgpt', tokens: {
+        accessToken, refreshToken: '', refresh_token: '', expiresAt, tokenType: 'Bearer',
+      } } },
+    }));
     process.env.ELANOUS_KEEP_ENV_KEYS = '1';
     _resetKeyCacheForTests();
     // ② 의 «다음 공급자» = 생산 glm(zai 코딩 플랜). 자격 env 하나만 가짜 값 — 공급자 코드는 그대로.
@@ -186,7 +195,7 @@ export async function simTui400Autoheal(
       { role: 'assistant', content: [{ type: 'tool_use', id: 'call_autoheal_sim', name: 'Read', input: { path: 'src/a.ts' } }] },
     ] as unknown as ChatMessage[];
     const cwd = home;
-    const boot = await bootDashboardAcpSession({
+    const boot = await runtime.boot({
       getCwd: () => cwd,
       getChatHistory: () => history,
       getPreamble: () => [],
@@ -194,7 +203,7 @@ export async function simTui400Autoheal(
       getTools: () => [{ name: 'tui_400_probe', description: 'tui-400-autoheal probe', parameters: { type: 'object' } }],
       getActiveModel: () => null,
       dispatchTool: async () => ({ error: 'no tools in tui-400-autoheal' }),
-      pushTurnToolHistory: (msgs) => { for (const m of msgs) history.push(m as ChatMessage); },
+      pushTurnToolHistory: (msgs: readonly LLMMessage[]) => { for (const m of msgs) history.push(m as ChatMessage); },
     });
     session = boot.session;
     session.setOriginSessionIdReader(() => null);
@@ -241,7 +250,7 @@ export async function simTui400Autoheal(
         },
       },
       ...(opts.autoheal === false ? {} : {
-        autoheal: createDashboardTurnAutoheal({
+        autoheal: runtime.createAutoheal({
           session: liveSession, getCwd: () => cwd, remote: false, activeModel: () => undefined, summaryTimeoutMs: 10_000,
         }),
       }),
@@ -258,8 +267,8 @@ export async function simTui400Autoheal(
       pushErrorLine: (message: string) => { screen.push(message); },
       pushFailureNotice: (notice: string) => { screen.push(notice); },
       finalizeTurn: (s: string) => { status = s; },
-    } as unknown as DashboardChatMainPlainTurnRuntimeDeps;
-    await runDashboardChatMainPlainTurn(deps);
+    } as unknown;
+    await runtime.runPlainTurn(deps);
     const autoheal = rows.filter((row) => row.category === 'self-health.autoheal')
       .map(({ event, data }) => ({ event, data }));
     const recovered = autoheal.find((row) => row.event === 'recovered');

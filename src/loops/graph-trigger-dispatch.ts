@@ -1,6 +1,6 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { parse as parseYaml } from 'yaml';
+import { parse as parseYaml, parseAllDocuments } from 'yaml';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { runGraph, type GraphRunOptions, type GraphRunState } from '../graph-runner/runner.js';
 import { registerGraphTriggerRun, type GraphTriggerRunRegistration, type RegisteredGraphTriggerRun } from './registry.js';
@@ -19,6 +19,80 @@ export interface DispatchedGraphTriggerRun {
   state?: GraphRunState;
 }
 
+export interface GraphTriggerEvent {
+  readonly graphId: string;
+  readonly runId: string;
+  readonly eventId: string;
+  readonly sequence: number;
+  readonly type: string;
+  readonly emittedAt: string;
+  readonly source: { readonly kind: 'runner' | 'node'; readonly nodeId?: string };
+  readonly data?: Readonly<Record<string, unknown>>;
+}
+
+interface DeclaredEventTarget { graphId: string; graphPath: string; from: string; on: string }
+
+function graphYamlFiles(directory: string): string[] {
+  const entries = readdirSync(directory, { withFileTypes: true });
+  return entries.flatMap((entry) => {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) return graphYamlFiles(path);
+    return entry.isFile() && /\.ya?ml$/i.test(entry.name) ? [path] : [];
+  });
+}
+
+function declaredEventTargets(root: string): DeclaredEventTarget[] {
+  const targets: DeclaredEventTarget[] = [];
+  for (const graphPath of graphYamlFiles(join(root, 'graphs'))) {
+    const documents = parseAllDocuments(readFileSync(graphPath, 'utf8'));
+    for (const document of documents) {
+      if (document.errors.length > 0) throw document.errors[0];
+      const value: unknown = document.toJS();
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const graph = value as Record<string, unknown>;
+      const triggers = graph.triggers;
+      if (!triggers || typeof triggers !== 'object' || Array.isArray(triggers)) continue;
+      const trigger = (triggers as Record<string, unknown>).event;
+      if (trigger === undefined) continue;
+      if (!trigger || typeof trigger !== 'object' || Array.isArray(trigger))
+        throw new Error(`invalid graph event trigger declaration: ${graphPath}`);
+      const declaration = trigger as Record<string, unknown>;
+      if (typeof graph.graph_id !== 'string' || !graph.graph_id.trim() ||
+          typeof declaration.from !== 'string' || !declaration.from.trim() ||
+          typeof declaration.on !== 'string' || !declaration.on.trim())
+        throw new Error(`invalid graph event trigger declaration: ${graphPath}`);
+      targets.push({ graphId: graph.graph_id, graphPath, from: declaration.from, on: declaration.on });
+    }
+  }
+  return targets;
+}
+
+/** Route real graph events to declared target graphs; the durable trigger registry deduplicates redelivery. */
+export async function dispatchGraphEventToDeclaredTargets(event: GraphTriggerEvent, options: {
+  graphRoot: string;
+  registryRoot: string;
+  stateRoot: string;
+  now?: () => number;
+  eventNow?: () => Date;
+}): Promise<DispatchedGraphTriggerRun[]> {
+  if (!event.eventId.trim() || !event.graphId.trim() || !event.type.trim())
+    throw new Error('graph event routing requires graphId, type, and eventId');
+  const results: DispatchedGraphTriggerRun[] = [];
+  const dedupeKey = `${event.graphId}:${event.runId}:${event.eventId}`;
+  for (const target of declaredEventTargets(resolve(options.graphRoot))) {
+    if (target.from !== event.graphId || target.on !== event.type) continue;
+    results.push(await dispatchGraphTriggerRun({
+      graphId: target.graphId, graphPath: target.graphPath,
+      triggerId: `event:${target.from}:${target.on}:${target.graphId}`, dedupeKey,
+      payload: { graphEvent: event },
+    }, { registryRoot: options.registryRoot, stateRoot: options.stateRoot, runRoot: options.stateRoot,
+      ...(options.now ? { now: options.now } : {}), ...(options.eventNow ? { eventNow: options.eventNow } : {}),
+      graphRunOptions: { quiet: true, routeGraphEvents: false },
+    }));
+  }
+  return results;
+}
+
 /** Shared trigger ingress: bind identity, claim its lease, and start or resume the corresponding graph run. */
 export async function dispatchGraphTriggerRun(input: DispatchGraphTriggerRunInput, options: {
   registryRoot?: string;
@@ -28,7 +102,7 @@ export async function dispatchGraphTriggerRun(input: DispatchGraphTriggerRunInpu
   leaseMs?: number;
   createRunId?: () => string;
   eventNow?: () => Date;
-  graphRunOptions?: Pick<GraphRunOptions, 'eventBus' | 'quiet' | 'deps'>;
+  graphRunOptions?: Pick<GraphRunOptions, 'eventBus' | 'quiet' | 'deps' | 'routeGraphEvents'>;
 } = {}): Promise<DispatchedGraphTriggerRun> {
   const graphDoc = parseYaml(readFileSync(input.graphPath, 'utf8')) as unknown;
   const actualGraphId = graphDoc && typeof graphDoc === 'object' && !Array.isArray(graphDoc)

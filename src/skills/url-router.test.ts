@@ -150,6 +150,19 @@ describe('detectUrlRoute — work-context guard', () => {
       expect(detectUrlRoute(text, urlRoutingDefaults())).not.toBeNull();
     }
   });
+
+  test('an explicit article-scrap request keeps its URL on the tool-routing path', () => {
+    expect(detectUrlRoute('이 기사 스크랩해줘 https://example.test/article', urlRoutingDefaults())).toBeNull();
+    expect(detectUrlRoute('이 링크 요약해줘 https://example.test/article', urlRoutingDefaults())?.skill).toBe('omni-digest');
+  });
+
+  test('explicit summary wins over a save word, while save substrings do not suppress routing', () => {
+    const defaults = urlRoutingDefaults();
+    expect(detectUrlRoute('이 링크 요약해줘 https://example.test/article 저장도 해줘', defaults)?.skill).toBe('omni-digest');
+    expect(detectUrlRoute('bookmarklet 문서 https://example.test/article', defaults)?.skill).toBe('omni-digest');
+    expect(detectUrlRoute('저장소 사용법 https://example.test/article', defaults)?.skill).toBe('omni-digest');
+    expect(detectUrlRoute('이 기사 스크랩해줘 https://example.test/summary', defaults)).toBeNull();
+  });
 });
 
 // 재현 — URL-ROUTE-WORK-CONTEXT-GUARD 사고(10-22 22:37 KST · n8n 특강 세션 elanous-session-bif5y7).

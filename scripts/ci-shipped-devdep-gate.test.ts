@@ -165,6 +165,7 @@ describe('checkShippedDevDependencies', () => {
       '@types/bun',
       '@types/diff',
       '@types/node-cron',
+      '@types/semver',
       '@types/web-push',
       'devtools-protocol',
     ]);

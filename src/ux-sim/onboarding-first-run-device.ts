@@ -41,7 +41,7 @@ export const FIRST_RUN_MENU_CHOICE_MARKERS = [FIRST_RUN_MENU_CHOICES, FIRST_RUN_
 /** Line `runFirstRun` prints before a fresh install has to pick a provider. */
 export const FIRST_RUN_SETUP_HINT = 'eln setup llm 으로 고르세요';
 /** Misses the parser must reject: out of range, exponent, and full-width digits. */
-export const FIRST_RUN_MENU_ANSWERS = ['4', '1e0', '１'] as const;
+export const FIRST_RUN_MENU_ANSWERS = ['5', '1e0', '１'] as const;
 
 const repoRoot = resolve(import.meta.dir, '../..');
 const cliEntry = join(repoRoot, 'bin', 'elanous.mjs');

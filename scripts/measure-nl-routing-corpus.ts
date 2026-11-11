@@ -188,7 +188,7 @@ export const NL_ROUTING_V5_QUESTIONS: readonly NlRoutingV5Question[] = [
   { id: 'v5-02', pattern: 'path-single-read', prompt: 'scripts/measure-nl-routing-corpus.ts 읽어 줘', expects: single('Read') },
   { id: 'v5-03', pattern: 'path-relative', prompt: 'src/cli/self-utterances-cli.ts 상대 경로로 열어 줘', expects: single('Read') },
   { id: 'v5-04', pattern: 'path-relative', prompt: './scripts/lib/nl-routing-screening.ts 상대 경로 파일 보여줘', expects: single('Read') },
-  { id: 'v5-05', pattern: 'path-absolute', prompt: '/home/user/.elanous/logs 절대 경로 확인해 줘', expects: single('Read') },
+  { id: 'v5-05', pattern: 'path-absolute', prompt: '/home/ubuntu/.elanous/logs 절대 경로 확인해 줘', expects: single('Read') },
   { id: 'v5-06', pattern: 'path-absolute', prompt: '/tmp/nl-routing/corpus.json 절대 경로 읽어 줘', expects: single('Read') },
   { id: 'v5-07', pattern: 'path-home-config', prompt: '~/.elanous 아래 설정 파일 읽어 줘', expects: single('Read') },
   { id: 'v5-08', pattern: 'path-home-config', prompt: '홈 디렉터리의 elanous 설정 읽어 줘', expects: single('Read') },

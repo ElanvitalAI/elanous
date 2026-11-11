@@ -223,7 +223,7 @@ test('root-level and absolute foreign file headers are also rejected; the reques
   }
   const own = { rc: 1, output: `${FILE}:\n3 pass\n0 fail\nRan 3 tests across 1 file.\n` };
   expect(readIsolatedRun(own, 'cut isolated', FILE)).toEqual({ kind: 'rc-nonzero-no-failures', rc: 1, pass: 3 });
-  const pod = { rc: 1, output: `/home/user/repo/${FILE}:\n3 pass\n0 fail\nRan 3 tests across 1 file.\n` };
+  const pod = { rc: 1, output: `/home/ubuntu/repo/${FILE}:\n3 pass\n0 fail\nRan 3 tests across 1 file.\n` };
   expect(readIsolatedRun(pod, 'cut isolated', FILE)).toEqual({ kind: 'rc-nonzero-no-failures', rc: 1, pass: 3 });
 });
 

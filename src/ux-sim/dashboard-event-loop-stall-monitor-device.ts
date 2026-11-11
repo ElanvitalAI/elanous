@@ -21,7 +21,7 @@
 import type { DebugBatchScheduler } from '../debug/batch-queue.js';
 import { LogStore, StoreSink, logStoreDrainChunkForSurface } from '../mss/logging/log-store.js';
 import type { LogRecord } from '../mss/logging/record.js';
-import { startEventLoopStallMonitor } from '../dashboard/event-loop-stall-monitor.js';
+import { startEventLoopStallMonitor } from '../event-loop-stall-monitor.js';
 
 export interface StageClock extends DebugBatchScheduler {
   now(): number;

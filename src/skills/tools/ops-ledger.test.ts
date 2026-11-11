@@ -36,6 +36,8 @@ import { registerAllDefaultToolRuntimes } from '../../tool-runtime/index.js';
 import { buildSessionRuntimeToolSpecs } from '../../session-runtime/index.js';
 import { dispatchDashboardSessionRuntimeTool } from '../../dashboard/session-runtime-dispatch.js';
 
+const tuiOpsLedgerRuntimes = ALL_OPS_LEDGER_RUNTIMES.filter(runtime => findNativeTool(runtime.id)?.host.includes('tui'));
+
 describe('ops-ledger msg tools (우편)', () => {
   let dir: string;
   let msgDeps: MsgLedgerDeps;
@@ -583,15 +585,20 @@ describe('ops-ledger 배선 — 카탈로그 ↔ 런타임 ↔ 등록부', () =>
     _resetToolRuntimeRegistryForTest();
   });
 
-  test('9개 런타임이 카탈로그 항목과 1:1 이고 별칭이 이름으로 풀린다', () => {
-    expect(ALL_OPS_LEDGER_RUNTIMES).toHaveLength(9);
+  test('10개 런타임이 카탈로그 항목과 1:1 이고 MsgInbox만 MCP 전용이다', () => {
+    expect(ALL_OPS_LEDGER_RUNTIMES).toHaveLength(10);
+    expect(tuiOpsLedgerRuntimes).toHaveLength(9);
     for (const runtime of ALL_OPS_LEDGER_RUNTIMES) {
       const entry = findNativeTool(runtime.id);
       expect(entry).toBeDefined();
       expect(entry!.aliases).toContain(runtime.spec.name);
-      expect(entry!.host).toContain('tui');
-      expect(entry!.host).toContain('skill');
       expect(entry!.defaultEnabled).toBe(true);
+    }
+    expect(findNativeTool('msg_inbox')?.host).toEqual(['mcp']);
+    for (const runtime of tuiOpsLedgerRuntimes) {
+      const entry = findNativeTool(runtime.id)!;
+      expect(entry.host).toContain('tui');
+      expect(entry.host).toContain('skill');
       expect(entry!.cleanerFitThanShell).toBe(true);
     }
     registerAllDefaultToolRuntimes();
@@ -618,7 +625,8 @@ describe('ops-ledger 배선 — 카탈로그 ↔ 런타임 ↔ 등록부', () =>
         runtimeTools: listToolRuntimes('tui'),
       });
       const names = new Set(specs.map((spec) => spec.name));
-      for (const runtime of ALL_OPS_LEDGER_RUNTIMES) expect(names.has(runtime.spec.name)).toBe(true);
+      for (const runtime of tuiOpsLedgerRuntimes) expect(names.has(runtime.spec.name)).toBe(true);
+      expect(names.has('MsgInbox')).toBe(false);
 
       const calls: Array<[string, Record<string, unknown>]> = [
         ['MsgPost', { from: 'OP', to: 'TC', body: 'probe' }],
@@ -694,7 +702,7 @@ describe('ops-ledger 한 턴 시나리오 — OP 가 우편 5통을 읽고 판�
         ['MsgAck', { to: 'OP', id: 5 }],
       ];
       // MsgAsk's linked reply path is exercised in its own focused test above.
-      expect(calls.map(([name]) => name).sort()).toEqual(ALL_OPS_LEDGER_RUNTIMES.filter(runtime => runtime.id !== 'msg_ask').map(runtime => runtime.spec.name).sort());
+      expect(calls.map(([name]) => name).sort()).toEqual(tuiOpsLedgerRuntimes.filter(runtime => runtime.id !== 'msg_ask').map(runtime => runtime.spec.name).sort());
       const results: Record<string, Record<string, unknown>> = {};
       const wallMs: Record<string, number> = {};
       for (const [name, args] of calls) {

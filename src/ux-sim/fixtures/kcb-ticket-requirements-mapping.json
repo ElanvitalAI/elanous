@@ -1,0 +1,60 @@
+{
+  "sourceRunIds": {
+    "briefing": "cbd06970-ccc8-4ca8-ab05-a733ff0e75e7",
+    "acceptance": "8240da26-5650-4ae8-99bc-26a0ebb852b8"
+  },
+  "briefingMapping": {
+    "id": "brief-kcb-ticket-1",
+    "owner": {
+      "status": "missing",
+      "source": "briefing receipt omits owner; verified owner is only at the receipt root"
+    },
+    "topics": [
+      {
+        "summary": "티켓 예매 서비스 · 동시 300명",
+        "sourceScrapIds": [
+          "kcb-scrap-web",
+          "kcb-scrap-x",
+          "kcb-scrap-youtube",
+          "kcb-scrap-voice",
+          "kcb-scrap-video",
+          "kcb-scrap-photo",
+          "kcb-scrap-shared-text"
+        ]
+      }
+    ]
+  },
+  "acceptance": {
+    "suggestionId": "suggestion-kcb-ticket-1",
+    "owner": "member-from-fake-nexus",
+    "accepted": true,
+    "service": "티켓 예매 서비스"
+  },
+  "capacityAssumption": {
+    "concurrentUsers": 300,
+    "rationale": "요청에 \"동시 300명\"이 명시됨.",
+    "source": "user-input",
+    "userSpecified": true
+  },
+  "suggestion": {
+    "id": "suggestion-kcb-ticket-1",
+    "appId": "ticketing-fake-app",
+    "ask": "티켓 예매 서비스 · 동시 300명",
+    "evidenceScrapIds": [
+      "kcb-scrap-web",
+      "kcb-scrap-x",
+      "kcb-scrap-youtube",
+      "kcb-scrap-voice",
+      "kcb-scrap-video",
+      "kcb-scrap-photo",
+      "kcb-scrap-shared-text"
+    ],
+    "owner": "member-from-fake-nexus"
+  },
+  "source": {
+    "host": "aws2",
+    "commit": "4fbf34cf9f870c232ce38ba75ae2b27ce7b1eb7f",
+    "runCommand": "CLASSIC_TICKET_SCENARIO=1 ELANOUS_TRACK=OP bun test src/dashboard/plugin-route-adapter.test.ts -t \"classic dashboard PTY carries KAIST scenes 1–6\"",
+    "verdict": "pass"
+  }
+}

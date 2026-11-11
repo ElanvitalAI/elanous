@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "고객 관점 SLI와 SLO",
+  "source": "https://sre.google/workbook/implementing-slos/",
+  "body": "고객 경험에 맞는 SLI를 선택하고 목표 SLO와 오류 예산을 정한다. 티켓팅에서는 대기 진입 성공률·입장까지 걸린 시간·좌석 홀드 성공률/지연·결제 후 발권 지연·중복 확정 0을 분리한다. 내부 CPU 사용률만으로 고객 경험을 대신하지 않는다. 목표값은 제품/운영 합의 전에는 가정이라고 표시한다."
+}

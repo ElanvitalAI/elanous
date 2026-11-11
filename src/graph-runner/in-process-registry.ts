@@ -5,6 +5,8 @@ export interface InProcessHandlerContext {
   readonly graphId: string;
   readonly runId: string;
   readonly nodeId: string;
+  /** Node-scoped resolved secret values; never copied into graph input or ledger output. */
+  readonly secrets?: Readonly<Record<string, string>>;
   /** Contract identifiers lowered from graph-v2 node requires. */
   readonly requires?: `${string}.${string}@${number}`;
   readonly input: unknown;

@@ -9,6 +9,8 @@ import { unattendedNextStepLine } from './entry-hints.js';
 import { buildUserConfig, saveUserConfig } from '../user-config.js';
 import { needsFirstRun, needsOnboarding } from '../onboarding.js';
 import type { DetectedProvider } from '../llm/provider-detect.js';
+import { OPENROUTER_ONBOARDING_CHOICES } from '../cli/first-run/openrouter-picker.js';
+import { OPENROUTER_MODEL_PICKS, promptOpenRouterModel } from './openrouter-model-picker.js';
 import { FIRST_RUN_PROVIDER_SETUP_MENU_MAX_MISSES } from '../cli/setup-keys.js';
 import {
   FIRST_RUN_MENU_ANSWERS,
@@ -37,6 +39,111 @@ function fixture() {
 }
 
 describe('first run', () => {
+  test('manual OpenRouter selection also persists the catalog model for role defaults', async () => {
+    const f = fixture();
+    try {
+      const cfg = buildUserConfig(f.path);
+      cfg.llm.rotation = [{ provider: 'openrouter', apiKey: 'fixture-key' }];
+      const model = OPENROUTER_ONBOARDING_CHOICES.find((item) => item.family === 'DeepSeek')!;
+      const pickerIndex = OPENROUTER_MODEL_PICKS.findIndex((item) => item.id === model.id);
+      const result = await runFirstRun({ path: f.path, config: cfg, isTTY: true,
+        detectProviders: async () => [], chooseProvider: async () => 'openrouter',
+        chooseOpenRouterModel: () => promptOpenRouterModel(async () => String(pickerIndex + 1), () => {}), print: () => {}, });
+      expect(result).toEqual({ outcome: 'ready', provider: 'openrouter', inputs: 1 });
+      const saved = buildUserConfig(f.path);
+      expect(saved.llm.model).toBe(`openrouter/${model.id}`);
+      expect(saved.roleLlm?.implement).toEqual({ provider: 'openrouter', model: `openrouter/${model.id}` });
+    } finally { f.cleanup(); }
+  });
+  test('Solar demo preset pins every role to the profile and uses Pro 4 for chat', async () => {
+    const f = fixture();
+    try {
+      const cfg = buildUserConfig(f.path);
+      cfg.llm.rotation = [{ provider: 'openrouter', apiKey: 'fixture-key' }];
+      expect(OPENROUTER_ONBOARDING_CHOICES.some((item) => item.id === 'solar-demo')).toBe(true);
+      const result = await runFirstRun({ path: f.path, config: cfg, isTTY: true,
+        detectProviders: async () => [], chooseProvider: async () => 'openrouter',
+        chooseOpenRouterModel: () => promptOpenRouterModel(async () => String(OPENROUTER_MODEL_PICKS.length + 1), () => {}), print: () => {}, });
+      expect(result).toEqual({ outcome: 'ready', provider: 'openrouter', inputs: 1 });
+      const saved = buildUserConfig(f.path);
+      expect(saved.llm.model).toBe('openrouter/upstage/solar-pro4');
+      expect(saved.roleLlm?.implement).toEqual({ provider: 'openrouter', model: 'openrouter/upstage/solar-pro4' });
+      expect(saved.roleLlm?.classify).toEqual({ provider: 'openrouter', model: 'openrouter/upstage/solar-mini4' });
+    } finally { f.cleanup(); }
+  });
+  test('ordinary Solar Pro 4 choice keeps every role on Pro 4 after reload', async () => {
+    const f = fixture();
+    try {
+      const cfg = buildUserConfig(f.path);
+      cfg.llm.rotation = [{ provider: 'openrouter', apiKey: 'fixture-key' }];
+      const model = OPENROUTER_ONBOARDING_CHOICES.find((item) => item.id === 'upstage/solar-pro4')!;
+      const result = await runFirstRun({ path: f.path, config: cfg, isTTY: true,
+        detectProviders: async () => [], chooseProvider: async () => 'openrouter',
+        chooseOpenRouterModel: async () => model, print: () => {}, });
+      expect(result).toEqual({ outcome: 'ready', provider: 'openrouter', inputs: 1 });
+      const saved = buildUserConfig(f.path);
+      expect(saved.llm.model).toBe('openrouter/upstage/solar-pro4');
+      expect(saved.roleLlm?.classify).toEqual({ provider: 'openrouter', model: 'openrouter/upstage/solar-pro4' });
+      expect(saved.roleLlm?.implement).toEqual({ provider: 'openrouter', model: 'openrouter/upstage/solar-pro4' });
+    } finally { f.cleanup(); }
+  });
+  test('ordinary Solar Mini 4 picker choice is accepted and saved for every role', async () => {
+    const f = fixture();
+    try {
+      const cfg = buildUserConfig(f.path);
+      cfg.llm.rotation = [{ provider: 'openrouter', apiKey: 'fixture-key' }];
+      const index = OPENROUTER_MODEL_PICKS.findIndex((item) => item.id === 'upstage/solar-mini4');
+      expect(OPENROUTER_MODEL_PICKS.some((item) => item.id === 'upstage/solar-mini4')).toBe(true);
+      const result = await runFirstRun({ path: f.path, config: cfg, isTTY: true,
+        detectProviders: async () => [], chooseProvider: async () => 'openrouter',
+        chooseOpenRouterModel: () => promptOpenRouterModel(async () => String(index + 1), () => {}), print: () => {}, });
+      expect(result).toEqual({ outcome: 'ready', provider: 'openrouter', inputs: 1 });
+      const saved = buildUserConfig(f.path);
+      expect(saved.llm.model).toBe('openrouter/upstage/solar-mini4');
+      expect(saved.roleLlm?.classify).toEqual({ provider: 'openrouter', model: saved.llm.model });
+      expect(saved.roleLlm?.implement).toEqual({ provider: 'openrouter', model: saved.llm.model });
+    } finally { f.cleanup(); }
+  });
+  test('explains that existing role model choices stay when changing the global OpenRouter model', async () => {
+    const f = fixture();
+    const output: string[] = [];
+    try {
+      const cfg = buildUserConfig(f.path);
+      cfg.llm.rotation = [{ provider: 'openrouter', apiKey: 'fixture-key' }];
+      cfg.roleLlm = { ...cfg.roleLlm, implement: { provider: 'openrouter', model: 'openrouter/example/explicit-role' } };
+      const choice = OPENROUTER_MODEL_PICKS.find((item) => item.family === 'DeepSeek')!;
+      const result = await runFirstRun({ path: f.path, config: cfg, isTTY: true,
+        detectProviders: async () => [], chooseProvider: async () => 'openrouter',
+        chooseOpenRouterModel: () => promptOpenRouterModel(async () => String(OPENROUTER_MODEL_PICKS.indexOf(choice) + 1), () => {}),
+        print: (line) => output.push(line), });
+      expect(result).toEqual({ outcome: 'ready', provider: 'openrouter', inputs: 1 });
+      expect(output.join('\n')).toContain('기존 역할별 모델 설정은 유지했습니다.');
+      expect(buildUserConfig(f.path).roleLlm?.implement).toEqual({ provider: 'openrouter', model: 'openrouter/example/explicit-role' });
+    } finally { f.cleanup(); }
+  });
+  test('configured OpenRouter provider fills missing roles after model pick and preserves explicit role models', async () => {
+    const f = fixture();
+    try {
+      const cfg = buildUserConfig(f.path);
+      cfg.llm.provider = 'openrouter';
+      cfg.llm.model = undefined;
+      cfg.llm.rotation = [{ provider: 'openrouter', apiKey: 'fixture-key' }];
+      cfg.roleLlm = { implement: { provider: 'openrouter', model: 'openrouter/example/explicit-role' } };
+      const index = OPENROUTER_MODEL_PICKS.findIndex((item) => item.id === 'deepseek/deepseek-v4.1-flash');
+      // Source: #36482 tests this catalog pick as the first-run menu input.
+      expect(index).toBeGreaterThanOrEqual(0);
+      const result = await runFirstRun({ path: f.path, config: cfg, isTTY: true,
+        detectProviders: async () => [],
+        // Source: the picker numbers choices from one while the catalog array is zero-indexed.
+        chooseOpenRouterModel: () => promptOpenRouterModel(async () => String(index + 1), () => {}), print: () => {}, });
+      // Source: existing provider and rotation credentials make this a zero-input first-run resume.
+      expect(result).toEqual({ outcome: 'ready', provider: 'openrouter', inputs: 0 });
+      const saved = buildUserConfig(f.path);
+      expect(saved.llm.model).toBe('openrouter/deepseek/deepseek-v4.1-flash');
+      expect(saved.roleLlm?.implement).toEqual({ provider: 'openrouter', model: 'openrouter/example/explicit-role' });
+      expect(saved.roleLlm?.classify).toEqual({ provider: 'openrouter', model: saved.llm.model });
+    } finally { f.cleanup(); }
+  });
   test('DEMO1104 first-run stores and probes a missing chosen key without marking the runtime ready', async () => {
     const f = fixture();
     const secret = 'first-run-secret-must-not-render';

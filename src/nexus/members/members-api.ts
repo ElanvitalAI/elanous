@@ -12,6 +12,9 @@ import type { VerifiedAppOwner } from '../apps/app-host.js';
 import type { GraphCapabilityRegistry } from '../../graph-runner/capabilities.js';
 import { createMemberTokenApi } from './member-token-api.js';
 import type { MemberAccessMatch } from './member-store.js';
+import { KCB_EVENT_CODE, KCB_TRY_EXAMPLES, KCB_TRY_MAX_ATTEMPTS, KCB_TRY_MAX_INPUT_CHARS,
+  runKcbTryExample, type KcbTryExampleId } from './kcb-try.js';
+import { runKcbTryWithinDeadline } from './kcb-try-deadline.js';
 
 export const MEMBER_GOOGLE_CALLBACK_PATH = '/v1/members/oauth/google/callback';
 const MEMBER_COOKIE = '__Host-elanous_member_session';
@@ -58,6 +61,8 @@ export interface MembersApiOptions {
   readonly google: GoogleSignin;
   /** Fixed post-signup destination, never accepted from request data. */
   readonly successRedirectUri: string;
+  /** KCB QR members land on the try cards; ordinary signup keeps its configured destination. */
+  readonly kcbSuccessRedirectUri?: string;
   /** Exact native callback URIs accepted from signup requests. */
   readonly appAuthRedirectUris?: readonly string[];
   /** Exact website origin allowed to use the member cookie cross-origin. */
@@ -75,6 +80,7 @@ export interface MembersApiOptions {
   readonly publicAppUrl?: (slot: MemberAppSlot) => string | null;
   /** Shared provider registry for graph-backed member route adapters. */
   readonly capabilityProviders?: GraphCapabilityRegistry;
+  readonly runTryExample?: (exampleId: KcbTryExampleId, input: string, signal?: AbortSignal) => Promise<string>;
 }
 
 export class GoogleMobileVerificationUnavailableError extends Error {
@@ -83,6 +89,12 @@ export class GoogleMobileVerificationUnavailableError extends Error {
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+}
+
+function memberInviteLink(webOrigin: string, referralCode: string): string {
+  const invite = new URL('/app/signup', webOrigin);
+  invite.searchParams.set('referralCode', referralCode);
+  return invite.toString();
 }
 
 async function readJson(request: Request): Promise<unknown> {
@@ -180,6 +192,8 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
   if (new URL(webOrigin).origin !== webOrigin || (new URL(webOrigin).protocol !== 'https:' && new URL(webOrigin).hostname !== 'localhost')) {
     throw new Error('member web origin must be a fixed HTTPS origin');
   }
+  const kcbSuccess = new URL(options.kcbSuccessRedirectUri ?? '/app/signup/complete/', webOrigin);
+  if (kcbSuccess.origin !== webOrigin) throw new Error('KCB success redirect must share the member web origin');
   const appAuthRedirectUris = new Set(options.appAuthRedirectUris ?? []);
   if ([...appAuthRedirectUris].some(uri => !validAppAuthRedirectUri(uri))) throw new Error('app auth redirects must be exact allowlisted elanous:// URIs');
   const now = options.now ?? Date.now;
@@ -251,7 +265,7 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         return respond(json({ error: 'method-not-allowed' }, 405));
       }
       if (request.method === 'OPTIONS' && [
-        '/v1/members', '/v1/members/validate-code', '/v1/members/app-slot', '/v1/members/app-slot/session', APP_SLOT_EXCHANGE_PATH, '/v1/members/owner', MEMBER_GOOGLE_CALLBACK_PATH,
+        '/v1/members', '/v1/members/referral-code', '/v1/members/validate-code', '/v1/members/try', '/v1/members/app-slot', '/v1/members/app-slot/session', APP_SLOT_EXCHANGE_PATH, '/v1/members/owner', MEMBER_GOOGLE_CALLBACK_PATH,
       ].includes(path)) {
         if (origin !== webOrigin) return new Response(null, { status: 403 });
         return withCors(request, corsPreflight('GET, POST, DELETE, OPTIONS'), webOrigin);
@@ -311,12 +325,13 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
           // must never prevent delivery of the key already committed to the member store.
           const session = member.session;
           const firstKey = member.initialKey;
-          const safeSuccess = success.toString().replace(/[&"<>]/g, character => ({ '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' })[character]!);
+          const destination = memberIntent.eventCode?.toUpperCase() === KCB_EVENT_CODE ? kcbSuccess : success;
+          const safeSuccess = destination.toString().replace(/[&"<>]/g, character => ({ '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' })[character]!);
           const response = firstKey
             ? new Response(`<!doctype html><html lang="en"><meta charset="utf-8"><title>Save your member key</title><h1>Save your member key</h1><p>This key is shown once. Store it privately.</p><code>${firstKey.key}</code><p><a href="${safeSuccess}" rel="noreferrer">Continue</a></p></html>`,
               { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store',
                 'referrer-policy': 'no-referrer', 'content-security-policy': "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" } })
-            : new Response(null, { status: 303, headers: { location: success.toString(), 'cache-control': 'no-store' } });
+            : new Response(null, { status: 303, headers: { location: destination.toString(), 'cache-control': 'no-store' } });
           response.headers.append('set-cookie', cookie(session.token, Math.max(0, Math.floor((Date.parse(session.expiresAt) - now()) / 1000))));
           response.headers.append('set-cookie', expiredStateCookie());
           try { synchronizeAppSlot(member.id); } catch { /* outbox retries on the next member read */ }
@@ -336,6 +351,35 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         if (Object.keys(input).some(key => !['code', 'kind'].includes(key)) || typeof input.code !== 'string'
           || input.code.length > 80 || (input.kind !== undefined && input.kind !== 'referral' && input.kind !== 'event')) return withCors(request, json({ error: 'invalid-request' }, 400), webOrigin);
         return withCors(request, json(options.store.validateCode(input.code, input.kind as 'referral' | 'event' | undefined, new Date(now()).toISOString())), webOrigin);
+      }
+      if (path === '/v1/members/try') {
+        if (request.method !== 'POST') return withCors(request, json({ error: 'method-not-allowed' }, 405), webOrigin);
+        const session = sessionFromCookie(request);
+        const member = session ? options.store.memberForSession(session, new Date(now()).toISOString()) : null;
+        if (!member || member.eventCode?.toUpperCase() !== KCB_EVENT_CODE) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+        let body: unknown;
+        try { body = await readJson(request); } catch { return withCors(request, json({ error: 'invalid-request' }, 400), webOrigin); }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return withCors(request, json({ error: 'invalid-request' }, 400), webOrigin);
+        const input = body as Record<string, unknown>;
+        const exampleId = input.exampleId;
+        const message = input.input;
+        if (Object.keys(input).length !== 2 || !KCB_TRY_EXAMPLES.some(example => example.id === exampleId)
+          || typeof message !== 'string' || !message.trim() || message.length > KCB_TRY_MAX_INPUT_CHARS)
+          return withCors(request, json({ error: 'invalid-request' }, 400), webOrigin);
+        if (!options.runTryExample) return withCors(request, json({ error: 'try-unavailable' }, 503), webOrigin);
+        const reservationId = options.store.reserveEventTry(member.id, KCB_EVENT_CODE, KCB_TRY_MAX_ATTEMPTS, new Date(now()).toISOString());
+        if (!reservationId) return withCors(request, json({ error: 'try-limit-reached' }, 429), webOrigin);
+        try {
+          const result = await runKcbTryWithinDeadline(
+            signal => options.runTryExample!(exampleId as KcbTryExampleId, message.trim(), signal), 30_000, request.signal,
+          );
+          if (!result.trim()) throw new Error('empty result');
+          if (!options.store.completeEventTry(reservationId, new Date(now()).toISOString())) throw new Error('try reservation expired');
+          return withCors(request, json({ exampleId, result: result.slice(0, 2_000) }), webOrigin);
+        } catch {
+          try { options.store.releaseEventTry(reservationId); } catch { /* failed attempts should not mask the safe response */ }
+          return withCors(request, json({ error: 'try-unavailable' }, 503), webOrigin);
+        }
       }
       if (path === '/v1/members/owner') {
         if (request.method !== 'GET') return withCors(request, json({ error: 'method-not-allowed' }, 405), webOrigin);
@@ -374,7 +418,24 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
         const member = token ? options.store.memberForSession(token, new Date(now()).toISOString()) : null;
         if (!member) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
         const slot = synchronizeAppSlot(member.id);
-        return withCors(request, json({ member, ...(slot ? { appSlot: publicAppSlot(slot, options.publicAppUrl?.(slot) ?? null) } : {}) }), webOrigin);
+        const activeCode = options.store.activeReferralCodeForMember(member.id);
+        const referralCount = options.store.referralsForMember(member.id).length;
+        const { invitedBy, ...ownProfile } = member;
+        const publicMember = { ...ownProfile, invited: invitedBy !== null, referralCount };
+        return withCors(request, json({ member: publicMember, inviteLink: activeCode ? memberInviteLink(webOrigin, activeCode) : null, referralCount,
+          ...(slot ? { appSlot: publicAppSlot(slot, options.publicAppUrl?.(slot) ?? null) } : {}) }), webOrigin);
+      }
+      if (path === '/v1/members/referral-code') {
+        if (request.method !== 'POST' && request.method !== 'DELETE') return withCors(request, json({ error: 'method-not-allowed' }, 405), webOrigin);
+        const token = sessionFromCookie(request);
+        const member = token ? options.store.memberForSession(token, new Date(now()).toISOString()) : null;
+        if (!member) return withCors(request, json({ error: 'unauthorized' }, 401), webOrigin);
+        if (request.method === 'DELETE') {
+          options.store.revokeReferralCode(member.id, new Date(now()).toISOString());
+          return withCors(request, json({ inviteLink: null }), webOrigin);
+        }
+        const code = options.store.rotateReferralCode(member.id, new Date(now()).toISOString());
+        return withCors(request, json({ inviteLink: memberInviteLink(webOrigin, code) }, 201), webOrigin);
       }
       if (path === '/v1/members/app-slot') {
         if (request.method !== 'GET' && request.method !== 'POST') return withCors(request, json({ error: 'method-not-allowed' }, 405), webOrigin);
@@ -459,7 +520,7 @@ export function createMembersApi(options: MembersApiOptions): MembersApi {
 }
 
 /** Builds the daemon's singleton member API only when its deployment URLs are explicitly configured. */
-export function createConfiguredMembersApi(options: Pick<MembersApiOptions, 'issueOwnerSession' | 'resolveVerifiedOwner' | 'resolveVerifiedMemberOwner' | 'publicAppUrl' | 'capabilityProviders'> = {}): MembersApi | null {
+export function createConfiguredMembersApi(options: Pick<MembersApiOptions, 'issueOwnerSession' | 'resolveVerifiedOwner' | 'resolveVerifiedMemberOwner' | 'publicAppUrl' | 'capabilityProviders' | 'runTryExample'> = {}): MembersApi | null {
   const redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI?.trim();
   if (!redirectUri) return null;
   const store = createMemberStore();
@@ -468,6 +529,8 @@ export function createConfiguredMembersApi(options: Pick<MembersApiOptions, 'iss
   const eventCode = process.env.KAIST_MEMBER_EVENT_CODE?.trim();
   const maxUses = Number(process.env.KAIST_MEMBER_EVENT_MAX_USES);
   if (eventCode && Number.isSafeInteger(maxUses) && maxUses > 0) store.provisionEventCode({ code: eventCode, maxUses });
+  store.provisionEventCode({ code: KCB_EVENT_CODE, maxUses: 300,
+    startsAt: '2026-11-12T15:00:00Z', endsAt: '2026-11-15T15:00:00Z' });
   const google = createGoogleSignin({
     clientId: () => getSecretAsync('GOOGLE_OAUTH_CLIENT_ID'),
     clientSecret: () => getSecretAsync('GOOGLE_OAUTH_CLIENT_SECRET'),
@@ -489,6 +552,7 @@ export function createConfiguredMembersApi(options: Pick<MembersApiOptions, 'iss
     ...(options.resolveVerifiedMemberOwner ? { resolveVerifiedMemberOwner: options.resolveVerifiedMemberOwner } : {}),
     ...(options.publicAppUrl ? { publicAppUrl: options.publicAppUrl } : {}),
     ...(options.capabilityProviders ? { capabilityProviders: options.capabilityProviders } : {}),
+    runTryExample: options.runTryExample ?? runKcbTryExample,
   });
 }
 

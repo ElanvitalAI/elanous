@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-KAIST-APP-QR-SIM-TS",
+  "path": "src/ux-sim/kaist-app-qr-sim.ts",
+  "boundary": "Resolves synthetic HTTPS app names locally and forwards requests into the production Nexus app-host handler; test-only storage is keyed by public origin and no external DNS, network, or phone is used.",
+  "deviceIds": [
+    "kaist-app-qr-public-isolation"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

@@ -50,7 +50,7 @@ export interface InstalledGraph {
   title: string;
   description: string;
   path: string;
-  /** 코어 loop.inputs 또는 플러그인 examples/*.json 표본의 입력 키. */
+  /** 코어 loop.inputs 또는 플러그인 그래프별 계약의 입력 키. */
   inputKeys?: string[];
 }
 export interface ExecPlanItem {
@@ -84,13 +84,15 @@ export function installedPluginGraphs(pluginsRoot = join(elanousStateRoot(), 'pl
       const root = join(pluginsRoot, market, name, version);
       const graphsDir = join(root, 'graphs');
       if (!existsSync(join(graphsDir, 'recipes.yaml'))) continue;
-      let meta: { name?: string; description?: string } = {};
+      let meta: { name?: string; description?: string; extensions?: { 'ai.elanous'?: { inputContract?: { inputKeys?: unknown; graphInputKeys?: Record<string, unknown> } } } } = {};
       try { meta = JSON.parse(readFileSync(join(root, 'plugin.json'), 'utf8')) as typeof meta; } catch { errors.push(`${market}/${name}@${version}: plugin.json unreadable`); }
       // 입력 키 — 플러그인이 입력 스키마를 따로 선언하지 않아 `examples/*.json` 첫 표본의 키를 쓴다(값은 가상이라 안 싣는다).
       // 2026-10-01 실측: 키를 몰라 COO 가 `inputs:{}` 로 맡겼고 geo-check 가 «brand is required» 로 첫 노드에서 떨어졌다.
       let inputKeys: string[] | undefined;
+      const declaredKeys = meta.extensions?.['ai.elanous']?.inputContract?.inputKeys;
+      if (Array.isArray(declaredKeys) && declaredKeys.every(key => typeof key === 'string' && key.trim())) inputKeys = declaredKeys;
       try {
-        const sample = readdirSync(join(root, 'examples')).filter(f => f.endsWith('.json')).sort()[0];
+        const sample = inputKeys ? undefined : readdirSync(join(root, 'examples')).filter(f => f.endsWith('.json')).sort()[0];
         if (sample) {
           const parsed = JSON.parse(readFileSync(join(root, 'examples', sample), 'utf8')) as unknown;
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) inputKeys = Object.keys(parsed);
@@ -101,10 +103,12 @@ export function installedPluginGraphs(pluginsRoot = join(elanousStateRoot(), 'pl
       for (const file of files) {
         const path = join(graphsDir, file);
         try {
-          const doc = parseYaml(readFileSync(path, 'utf8')) as { graph_id?: string; loop?: { title?: string; description?: string } };
-          const id = doc?.graph_id;
+          const doc = parseYaml(readFileSync(path, 'utf8')) as { graph_id?: string; graph?: { id?: string; purpose?: string }; loop?: { title?: string; description?: string } };
+          const id = doc?.graph_id ?? doc?.graph?.id;
           if (!id || !/^[a-z0-9-]+$/.test(id)) continue;
-          graphs.push({ id, title: doc.loop?.title ?? meta.name ?? id, description: doc.loop?.description ?? meta.description ?? '', path, ...(inputKeys ? { inputKeys } : {}) });
+          const specificKeys = meta.extensions?.['ai.elanous']?.inputContract?.graphInputKeys?.[id];
+          const graphInputKeys = Array.isArray(specificKeys) && specificKeys.every(key => typeof key === 'string' && key.trim()) ? specificKeys as string[] : inputKeys;
+          graphs.push({ id, title: doc.loop?.title ?? meta.name ?? id, description: doc.loop?.description ?? doc.graph?.purpose ?? meta.description ?? '', path, ...(graphInputKeys ? { inputKeys: graphInputKeys } : {}) });
         } catch { errors.push(`${market}/${name}@${version}: ${file} malformed`); }
       }
     }

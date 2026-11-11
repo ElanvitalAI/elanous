@@ -732,9 +732,11 @@ export async function runRehearsalTick(opts: RehearsalOptions = {}, deps: Rehear
                 ...(shardPlan ? { plannedShards: shardPlan.shards } : {}) } } : {}),
             };
             stamp.selection = selection;
-            if (plan.run !== 'rc-150m' && shardPlan && (shardPlan.testFiles === 0 || shardPlan.gatePlanShards === null)) {
+            // A missing prior board is a planning gap, not proof that this gate cannot run. The pinned
+            // remote RC measures the current checkout with the conservative four-shard host recipe.
+            if (plan.run !== 'rc-150m' && (shardPlan?.testFiles === null || shardPlan?.testFiles === 0)) {
               stamp.outcome = 'unmeasured';
-              stamp.summary = oneLine(`${shardPlan.testFiles === 0 ? 'no runnable rehearsal shards' : 'rehearsal shard plan unavailable'} · ${shardPlan.unmeasured ?? 'selected test files empty'}`);
+              stamp.summary = oneLine(`${shardPlan.testFiles === 0 ? 'no runnable rehearsal shards' : 'rehearsal test inventory unavailable'} · ${shardPlan.unmeasured ?? (shardPlan.testFiles === 0 ? 'selected test files empty' : 'selected test inventory unavailable')}`);
               stamp.endedAt = clock().toISOString();
               // No RC was launched: this claim is not a completed stage. Leave the ledger free for the next tick.
               unlinkSync(path);

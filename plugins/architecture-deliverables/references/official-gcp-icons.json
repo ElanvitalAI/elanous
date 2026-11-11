@@ -1,0 +1,193 @@
+{
+  "libraryUrl": "https://cloud.google.com/icons",
+  "archiveUrls": [
+    "https://services.google.com/fh/files/misc/core-products-icons.zip",
+    "https://services.google.com/fh/files/misc/category-icons.zip"
+  ],
+  "assets": {
+    "Unique Icons/Distributed Cloud/PNG/DistributedCloud-512-color.png": {
+      "archive": "core-products",
+      "sha256": "ddb2a3b859fd421c7f0f3a1bf02d8d4e102b22f08f52982f8a1b9587a564e26f"
+    },
+    "Unique Icons/Cloud Run/PNG/CloudRun-512-color-rgb.png": {
+      "archive": "core-products",
+      "sha256": "9b2dc1f56b1b60cdf013a67cf9a6e0276d8e1b0c5d45691591b76ff5a2ef5ead"
+    },
+    "Unique Icons/Security Operations/PNG/SecOps-512-color-rgb.png": {
+      "archive": "core-products",
+      "sha256": "e2e18483385f34431c016f316287225f9d279dd87cf6a589ad1baa77f17af80f"
+    },
+    "Unique Icons/AI Hypercomputer/PNG/AIHypercomputer-512-color.png": {
+      "archive": "core-products",
+      "sha256": "fbdb9c681cc3ed62aec30f5a6cfa4239af35353992ea56a0be0f3e7b7d236ce7"
+    },
+    "Unique Icons/Cloud Storage/PNG/Cloud_Storage-512-color.png": {
+      "archive": "core-products",
+      "sha256": "c93e9108ffcca2685686bf144b32c1fe4fe237f27448516decf12980745c34b8"
+    },
+    "Unique Icons/Cloud Spanner/PNG/CloudSpanner-512-color.png": {
+      "archive": "core-products",
+      "sha256": "a82283c24b86f102e75e3faf63665c2c424263c41cd60325718a2523961fe9e4"
+    },
+    "Unique Icons/Vertex AI/PNG/VertexAI-512-color.png": {
+      "archive": "core-products",
+      "sha256": "5a07416695e22b326514c35761050d20323d6b66e8bf715d09b7cd54ad736fa2"
+    },
+    "Unique Icons/Looker/PNG/Looker-512-color.png": {
+      "archive": "core-products",
+      "sha256": "e2385d9ae81298dec1ed2c088ffeea4c3de6cb95ad399d5a99122ac9eab5fe3d"
+    },
+    "Unique Icons/BigQuery/PNG/BigQuery-512-color.png": {
+      "archive": "core-products",
+      "sha256": "3c8e74ebbca6314d4ba786450414f9a1e695fe7a0baa9588ea95040d6ed9ddfa"
+    },
+    "Unique Icons/Threat Intelligence/PNG/ThreatIntelligence-512-color.png": {
+      "archive": "core-products",
+      "sha256": "b463d0f2988268b1cc523fc78a243d9554b732cbfc58f829c974c80a379b3eae"
+    },
+    "Unique Icons/Compute Engine/PNG/ComputeEngine-512-color.png": {
+      "archive": "core-products",
+      "sha256": "488da11fc15e34bef89eb1e8d81fdb00b12b86d3b21f2a178a07814baa9b8344"
+    },
+    "Unique Icons/Security Command Center/PNG/SecurityCommandCenter-512-color.png": {
+      "archive": "core-products",
+      "sha256": "d24ed3655d997dad35e44ad0d58b650f491c731fc13e27a7cc69ae6d3e0f92ab"
+    },
+    "Unique Icons/Anthos/PNG/Anthos-512-color.png": {
+      "archive": "core-products",
+      "sha256": "441c1fab8e62977beb6911c456282797a0366624c3df82c0df0b1612fd77fb65"
+    },
+    "Unique Icons/GKE/PNG/GKE-512-color.png": {
+      "archive": "core-products",
+      "sha256": "0635c5917fe15f34c6212b1fae0fdf7a32e2410640d6a38b9c1abf562ccb9747"
+    },
+    "Unique Icons/Apigee/PNG/Apigee-512-color.png": {
+      "archive": "core-products",
+      "sha256": "1a49f00eebecf44b9452fe41ee11c5041d9d1af3fe3811f6b2cbc8d6b791afce"
+    },
+    "Unique Icons/Hyperdisk/PNG/Hyperdisk-512-color.png": {
+      "archive": "core-products",
+      "sha256": "4a2415d87e15861febb3bd5ca7dd4c70d888ecae6dbd993dbea4d562b8ad6136"
+    },
+    "Unique Icons/Mandiant/PNG/Mandiant-512-color.png": {
+      "archive": "core-products",
+      "sha256": "86ca18c3338536b504e9ca81a2a7641a4b8cc5ff3ad723ce62f7c9f902934a4e"
+    },
+    "Unique Icons/Cloud SQL/PNG/CloudSQL-512-color.png": {
+      "archive": "core-products",
+      "sha256": "a917d0d46ea9c12ed0df75efee501fbbfbeb70017a3c8d723b2ce6c44fa80e3d"
+    },
+    "Unique Icons/AlloyDB/PNG/AlloyDB-512-color.png": {
+      "archive": "core-products",
+      "sha256": "1786ffaf6871e8d8e6469b118bbea61b13ae40a7260041d7c58b8c3110997fd7"
+    },
+    "Category Icons/AI _ Machine Learning/PNG/AIMachineLearning-512-color.png": {
+      "archive": "category",
+      "sha256": "c67717e3790f0e3c5e545f7f3c0b66f1125a7b6adcfd47ac2aa2be6355b6213a"
+    },
+    "Category Icons/Integration Services/PNG/IntegrationServices-512-color.png": {
+      "archive": "category",
+      "sha256": "758d90eec4a1478d2bf10c1593d84d27276b7f3c225c7bddeb5e21bab3fe2b3b"
+    },
+    "Category Icons/Serverless Computing/PNG/ServerlessComputing-512-color.png": {
+      "archive": "category",
+      "sha256": "b23991c307da56000e7f6f7382560b16a6111c9ce3920c0cda56a8bd7b0682d9"
+    },
+    "Category Icons/Operations/PNG/Operations-512-color.png": {
+      "archive": "category",
+      "sha256": "2fedce5748fff5ccec177db3e27b0e4b6cfee69d0519013d500d3e6970125a92"
+    },
+    "Category Icons/Compute/PNG/Compute-512-color.png": {
+      "archive": "category",
+      "sha256": "de2baad521f725d301960291b38ecf6dd8a47111600df2e8aae5f7a345dc3bd8"
+    },
+    "Category Icons/Developer Tools/PNG/Developer_Tools-512-color.png": {
+      "archive": "category",
+      "sha256": "5b3cba7d90562920818f629b2ef7bd0b40c239ba4a4ee22f6fabe7cc9371ad2c"
+    },
+    "Category Icons/Agents/PNG/Agents-512-color.png": {
+      "archive": "category",
+      "sha256": "d810f9917b1afeb3dbf5fd2a2e9b2b805b72d257f94574f9ce22355bcb6c811d"
+    },
+    "Category Icons/Migration/PNG/Migration-512-color.png": {
+      "archive": "category",
+      "sha256": "ff64671bdacc0de73008d07ca30007aa8f92503311b2f615afc6b9c5bcc2a2a8"
+    },
+    "Category Icons/DevOps/PNG/DevOps-512-color.png": {
+      "archive": "category",
+      "sha256": "8019ad5b1a776fbe08e7c424c9512cda4bfc219a75e603a55374e771e83eb7c0"
+    },
+    "Category Icons/Data Analytics/PNG/DataAnalytics-512-color.png": {
+      "archive": "category",
+      "sha256": "471ae55c18d3119afb4f0165ad11f622a72e18d5a81b7469428d48892b5d2c41"
+    },
+    "Category Icons/Storage/PNG/Storage-512-color.png": {
+      "archive": "category",
+      "sha256": "6cbdf51edde38e3201be06b15801c8a5166927aa1589f9418700056c2b60e6ac"
+    },
+    "Category Icons/Collaboration/PNG/Collaboration-512-color.png": {
+      "archive": "category",
+      "sha256": "42a2af752329659aebceecbaaa905242099d46262dfbf8dce5f2f48045452f72"
+    },
+    "Category Icons/Web & Mobile/PNG/WebMobile-512-color.png": {
+      "archive": "category",
+      "sha256": "0395c6a3d1a991b6fc6e575440f86a225bed1745214353c42adfdd5ac1067cc4"
+    },
+    "Category Icons/Databases/PNG/Databases-512-color.png": {
+      "archive": "category",
+      "sha256": "749518c3ebc0ffe36f9f8e66193ed1ad74f6c5947cdaeb4c33c7ee4b64b0d8f1"
+    },
+    "Category Icons/Mixed Reality/PNG/MixedReality-512-color.png": {
+      "archive": "category",
+      "sha256": "6a53ebd9e721e5b9d1db2ad176994d5e48c3ac5e9ce8678a0199326476a8bebe"
+    },
+    "Category Icons/Business Intelligence/PNG/BusinessIntelligence-512-color.png": {
+      "archive": "category",
+      "sha256": "7436502a04ea940ef24c891389fd6a60a612b231f9c6de12d97021411d2d744a"
+    },
+    "Category Icons/Marketplace/PNG/Marketplace-512-color.png": {
+      "archive": "category",
+      "sha256": "bb3ba442c147fc57688ce4e85821b810d61f7fe6f7eac03bacf935bb938e4418"
+    },
+    "Category Icons/Networking/PNG/Networking-512-color.png": {
+      "archive": "category",
+      "sha256": "58eab7b195e3fb621e41bf2c5a42fb0a5de925ee533400fa8b78a84daf81a65d"
+    },
+    "Category Icons/Security Identity/PNG/SecurityIdentity-512-color.png": {
+      "archive": "category",
+      "sha256": "629e38daa5626578797f9c47c57129d569ff0a397ff24999924ff5733b115e25"
+    },
+    "Category Icons/Hybrid & Multicloud/PNG/HybridMulticloud-512-color.png": {
+      "archive": "category",
+      "sha256": "863c0fb0a982d1a0d79d2a333199ec48d202e0decd16a87489d4a8a0ffe119d6"
+    },
+    "Category Icons/Web3/PNG/Web3-512-color.png": {
+      "archive": "category",
+      "sha256": "127db87534677a2ed00c60051619602ce5eafecda872776804c0396629b53512"
+    },
+    "Category Icons/Media Services/PNG/MediaServices-512-color.png": {
+      "archive": "category",
+      "sha256": "c174d94efb0eeaaba497bf9567306585c5f769ad68be900df1ac2538f0151c30"
+    },
+    "Category Icons/Observability/PNG/Observability-512-color.png": {
+      "archive": "category",
+      "sha256": "7df67bd62261998d306dd24fca0794867e0bf3d1c39a1ccc1d7a562fa0127239"
+    },
+    "Category Icons/Maps & Geospatial/PNG/MapsGeospatial-512-color.png": {
+      "archive": "category",
+      "sha256": "8199b0da4a40cb1f0b0d8329b17d99ebc64cd560550bc0f9672d5272aeff88dd"
+    },
+    "Category Icons/Containers/PNG/Containers-512-color.png": {
+      "archive": "category",
+      "sha256": "154f7d5dcf6ee2701693ebcbdde1de3afc33b1ef7a63126fdb30c0d39d3215bd"
+    },
+    "Category Icons/Management Tools/PNG/ManagementTools-512-color.png": {
+      "archive": "category",
+      "sha256": "be4d97db3f54fd6a3294d37bff3a0df2c53fb674ac2c1e291d64f7418eee2082"
+    }
+  },
+  "archiveSha256": {
+    "core-products": "6531a10f58bc599c24d9a455d81dd757c1a03c3c43da9cddf639b859c1c1eece",
+    "category": "e5bc3abd3527dc2500e9bff7f15870783e2c764129c49b7cd4c1b4e105345002"
+  }
+}

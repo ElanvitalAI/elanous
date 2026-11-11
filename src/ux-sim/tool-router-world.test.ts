@@ -21,6 +21,8 @@ import { routeToolSearch } from '../skills/tools/tool-search-route.js';
 import { takeHydratedTools } from '../skills/tools/tool-search-spec.js';
 import { estimateTokens } from '../tokens.js';
 
+const BUILTIN_PLUGIN_IDS = ['absorb', 'elanous-app-deploy', 'elanous-observe', 'elanous-release', 'gcp-architect-expand'];
+
 test('tool-router-world: index defaults on, explicit native bypass and failure remain enabled scoped', () => {
   const receipt = runToolRouterWorld();
   expect(DEFAULT_TOOL_ROUTING_STRATEGY).toBe('index');
@@ -28,7 +30,7 @@ test('tool-router-world: index defaults on, explicit native bypass and failure r
   expect(receipt.defaultRoute).toMatchObject({ mode: 'index', miss: false });
   expect(receipt.defaultRoute.matches[0]).toMatchObject({ pluginId: 'elanous-observe', name: 'ObserveLogs' });
   // Source: plugins/absorb/plugin.json declares the built-in absorb route surface now discovered by the router world.
-  expect(receipt.explicitNativeAll).toMatchObject({ mode: 'native-all', miss: true, enabledPluginIds: ['absorb', 'elanous-app-deploy', 'elanous-observe', 'elanous-release'] });
+  expect(receipt.explicitNativeAll).toMatchObject({ mode: 'native-all', miss: true, enabledPluginIds: BUILTIN_PLUGIN_IDS });
   expect(receipt.explicitNativeAll.fallbackReason).toBeUndefined();
   expect(receipt.disabledPlugin).toMatchObject({ mode: 'index', miss: true, matches: [] });
   expect(receipt.failedIndex).toMatchObject({ mode: 'native-all', fallbackReason: 'router-error', enabledPluginIds: ['elanous-release'] });
@@ -45,7 +47,7 @@ test('tool-router-world: index defaults on, explicit native bypass and failure r
   expect(receipt.activeRouteSearchMatches).toContain('ObserveLogs');
   expect(receipt.activeRouteSelectMatches).toContain('ObserveLogs');
   // Source: plugins/absorb/plugin.json is included in builtin plugin discovery and declares AI tools.
-  expect(receipt.firstPartyPluginIds).toEqual(['absorb', 'elanous-app-deploy', 'elanous-observe', 'elanous-release']);
+  expect(receipt.firstPartyPluginIds).toEqual(BUILTIN_PLUGIN_IDS);
   expect(receipt.ontologyPluginIds).toEqual(receipt.firstPartyPluginIds);
   expect(receipt.appDeployRoute.matches[0]).toMatchObject({ pluginId: 'elanous-app-deploy', name: 'app_deploy', route: { requiresConfirm: true } });
   expect(receipt.appDeployBlocked).toBe(true);

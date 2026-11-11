@@ -1,0 +1,24 @@
+graph_id: silence-watch
+loop:
+  title: Supervision silence watch
+  root: 조율자
+  description: Shadow-only scan for supervision observations without a live owner or timely no_action decision.
+  owner: ABSORB-1
+  trigger:
+    # Source: RFC-loop-agent-supervisor-and-arg-contract.md §2b sets silenceAfter to PT10M.
+    cron: '*/10 * * * *'
+    events: [manual]
+# Known gap: the current scheduled runner has no observation provider; `input.events` is an explicit shadow input until the graph-event projection is wired.
+# Source: graphs/ops graph manifest schema uses version 1.
+version: 1
+entry_node: tick
+terminal_nodes: [done, failed]
+nodes:
+  # Source: existing ops graphs bound the command node to one visit per graph run.
+  - { node_id: tick, kind: agent, recipe: 'cmd:silence-watch-shadow', max_visits: 1 }
+  # Source: existing ops graphs bound each terminal gate to one visit per graph run.
+  - { node_id: done, kind: gate, max_visits: 1 }
+  # Source: existing ops graphs bound each terminal gate to one visit per graph run.
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: tick, on: outcome, map: { ok: done, fail: failed, error: failed } }

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "웹 3계층 — 데이터 경계의 역압",
+  "source": "https://docs.cloud.google.com/application-design-center/docs/three-tier-web-app",
+  "body": "적용 시점: 웹 계층 급증이 데이터베이스 연결 풀을 고갈시키는 경우.\n용량 단계: 초기에는 풀 제한과 백프레셔를 둔다; 동시성 한도가 DB 용량을 넘으면 큐·읽기 복제·샤딩을 순서대로 검토한다.\nGCP 대응: Cloud Run concurrency와 Cloud SQL 연결 상한을 함께 설정하고, 비동기 작업은 Pub/Sub/Cloud Tasks로 분리한다.\n비용 축: 유휴·최대 웹 인스턴스 수, DB 연결, 큐 체류 시간, 네트워크가 비용 축이다.\n결정과 반증: 웹 인스턴스만 늘려도 처리량이 늘지 않는 지점이 DB 병목인지 부하 시험에서 확인한다."
+}

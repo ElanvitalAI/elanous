@@ -71,6 +71,16 @@ test('malformed or inconsistent count evidence cannot authorize a launch', () =>
   expect(result.evidence.countedIds).toEqual([]);
 });
 
+test('empty task identifiers remain invalid after using the shared string array guard', () => {
+  for (const field of ['active', 'terminal', 'unknown'] as const) {
+    const receipt: { count: number; active: string[]; terminal: string[]; unknown: string[] } =
+      { count: 0, active: [], terminal: [], unknown: [] };
+    receipt[field] = [''];
+    const result = simulateTaLandCountDispatch({ target: 2, command: command(JSON.stringify(receipt)) });
+    expect(result.decision).toEqual({ dispatch: false, activeCount: null, remaining: null, reason: 'invalid-count-evidence' });
+  }
+});
+
 test('a successful process exit with an error payload still fails closed', () => {
   const raw = JSON.stringify({ count: 0, active: [], terminal: [], unknown: [], error: 'ledger unreadable' });
   const result = simulateTaLandCountDispatch({ target: 4, command: command(raw) });

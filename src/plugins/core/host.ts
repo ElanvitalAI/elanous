@@ -15,8 +15,9 @@
 // commands. Full key-routing and LLM tool dispatch land in Phase 4.
 
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'fs';
-import { basename, dirname, join, resolve } from 'path';
-import { listInstalledPlugins } from '../install/plugin-install.js';
+import { basename, dirname, join, resolve, type PlatformPath } from 'path';
+import { listInstalledPlugins, parseDeclaredPluginRef } from '../install/plugin-install.js';
+import { satisfies as satisfiesSemver } from 'semver';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { homedir } from 'os';
 import type {
@@ -80,6 +81,11 @@ export interface PluginEntry {
   manifestInferred: boolean;
   source: PluginSource;
   path: string;                   // plugin directory
+}
+
+/** The installed tree is plugins/<market>/<id>/<version>; use native path operations on each host. */
+export function installedPluginMarketFromPath(pluginPath: string, paths: Pick<PlatformPath, 'basename' | 'dirname'> = { basename, dirname }): string {
+  return paths.basename(paths.dirname(paths.dirname(pluginPath)));
 }
 
 export interface ActiveDashboardPaneContribution {
@@ -703,7 +709,49 @@ export class PluginHost {
   }
 
   activate(name: string): Promise<void> {
-    return this.serializeLifecycle(() => this.activateNow(name));
+    return this.serializeLifecycle(() => this.activateWithDependenciesNow(name));
+  }
+
+  private async activateWithDependenciesNow(name: string): Promise<void> {
+    const ordered: PluginEntry[] = [];
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+    const visit = (requested: string): void => {
+      const entry = this.resolveEntry(requested);
+      if (!entry) throw new Error(`plugin "${requested}" not found — try /plugin list`);
+      const id = entry.manifest.id;
+      if (visiting.has(id)) throw new Error(`plugin dependency cycle: ${[...visiting, id].join(' -> ')}`);
+      if (visited.has(id)) return;
+      visiting.add(id);
+      for (const declaration of entry.manifest.dependencies?.plugins ?? []) {
+        const ref = parseDeclaredPluginRef(declaration);
+        if (ref.optional) continue;
+        const dependency = this.available.get(ref.id);
+        if (!dependency || !satisfiesSemver(dependency.manifest.version, ref.range) ||
+          (ref.market && !(dependency.source === 'installed' && installedPluginMarketFromPath(dependency.path) === ref.market))) {
+          throw new Error(`plugin "${id}" requires active plugin ${ref.id}@${ref.range}`);
+        }
+        visit(ref.id);
+      }
+      visiting.delete(id);
+      visited.add(id);
+      ordered.push(entry);
+    };
+    visit(name);
+    if (ordered.length > 1 && ordered.some(entry => !entry.manifest.allowMultiActive)) {
+      throw new Error(`plugin dependency activation requires allowMultiActive: ${ordered.map(entry => entry.manifest.id).join(', ')}`);
+    }
+    const newlyActive: string[] = [];
+    try {
+      for (const entry of ordered) {
+        if (this.activeEntries.has(entry.manifest.id)) continue;
+        await this.activateNow(entry.manifest.id);
+        newlyActive.push(entry.manifest.id);
+      }
+    } catch (error) {
+      for (const id of newlyActive.reverse()) await this.deactivateNow(id);
+      throw error;
+    }
   }
 
   private async activateNow(name: string): Promise<void> {

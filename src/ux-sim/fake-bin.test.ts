@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import type { Writable } from 'node:stream';
@@ -60,6 +60,100 @@ describe('fake-bin', () => {
       expect([result.status, result.stdout]).toEqual([0, 'ok\n']);
       expect(fakeBins.calls()).toEqual([{ name: 'tool', argv: ['inspect'] }]);
     } finally { fakeBins.cleanup(); }
+  });
+
+  test('PERL5OPT and UTF-8 recordEnv survive the fake and a delegated child', () => {
+    const sh = Bun.which('sh');
+    if (!sh) throw new Error('sh unavailable');
+    const fakeBins = createFakeBins({ tool: {
+      stdout: 'ok\n', whenArgsStartWith: ['inspect'], otherwise: sh,
+      recordEnv: ['PERL5OPT', 'FAKE_UNICODE'],
+    } });
+    try {
+      const env = { ...fakeBins.env, PERL5OPT: '-Mfake_bin_missing_startup_module', FAKE_UNICODE: '値🙂' };
+      const fake = spawnSync(fakeBins.bin('tool'), ['inspect'], { encoding: 'utf8', env });
+      const delegated = spawnSync(fakeBins.bin('tool'), ['-c', 'printf "%s" "$PERL5OPT"'], { encoding: 'utf8', env });
+      expect([fake.status, fake.stdout]).toEqual([0, 'ok\n']);
+      expect([delegated.status, delegated.stdout]).toEqual([0, env.PERL5OPT]);
+      expect(fakeBins.calls().map((call) => call.env)).toEqual([
+        { PERL5OPT: env.PERL5OPT, FAKE_UNICODE: '値🙂' },
+        { PERL5OPT: env.PERL5OPT, FAKE_UNICODE: '値🙂' },
+      ]);
+    } finally { fakeBins.cleanup(); }
+  });
+
+  test('delegation preserves a relative and writable caller PATH under Perl taint mode', () => {
+    const sh = Bun.which('sh');
+    if (!sh) throw new Error('sh unavailable');
+    const writable = mkdtempSync(join(tmpdir(), 'fake-bin-writable-path-'));
+    chmodSync(writable, 0o777);
+    const fakeBins = createFakeBins({ tool: { whenArgsStartWith: ['fake-only'], otherwise: sh, recordEnv: ['PATH'] } });
+    try {
+      const path = ['.', writable, fakeBins.env.PATH ?? ''].join(delimiter);
+      const result = spawnSync(fakeBins.bin('tool'), ['-c', 'printf "%s" "$PATH"'],
+        { encoding: 'utf8', env: { ...fakeBins.env, PATH: path } });
+      expect([result.status, result.stdout, result.stderr]).toEqual([0, path, '']);
+      expect(fakeBins.calls()[0]?.env?.PATH).toBe(path);
+    } finally { fakeBins.cleanup(); rmSync(writable, { recursive: true, force: true }); }
+  });
+
+  test('delegation preserves taint-sensitive environment and an executable path containing equals', () => {
+    const perl = Bun.which('perl');
+    if (!perl) throw new Error('perl unavailable');
+    const root = mkdtempSync(join(tmpdir(), 'fake-bin-equals-path-'));
+    const executable = join(root, 'a=b-tool');
+    symlinkSync(perl, executable);
+    const fakeBins = createFakeBins({ tool: { whenArgsStartWith: ['fake-only'], otherwise: executable,
+      recordEnv: ['PATH', 'IFS', 'CDPATH', 'ENV', 'BASH_ENV'] } });
+    try {
+      const env = { ...fakeBins.env, PATH: ['.', root, fakeBins.env.PATH ?? ''].join(delimiter),
+        IFS: '|', CDPATH: 'relative-cdpath', ENV: '/tmp/missing-env-file', BASH_ENV: '/tmp/missing-bash-env' };
+      const result = spawnSync(fakeBins.bin('tool'), ['-e', 'print join("\\n", map { $ENV{$_} // "" } qw(PATH IFS CDPATH ENV BASH_ENV)), "\\n";'],
+        { encoding: 'utf8', env });
+      expect([result.status, result.stderr]).toEqual([0, '']);
+      expect(result.stdout).toBe([env.PATH, env.IFS, env.CDPATH, env.ENV, env.BASH_ENV, ''].join('\n'));
+      expect(fakeBins.calls()[0]?.env).toEqual({ PATH: env.PATH, IFS: env.IFS,
+        CDPATH: env.CDPATH, ENV: env.ENV, BASH_ENV: env.BASH_ENV });
+    } finally { fakeBins.cleanup(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('delegation leaves caller variables matching the generated restore prefix untouched', () => {
+    const perl = Bun.which('perl');
+    if (!perl) throw new Error('perl unavailable');
+    const fakeBins = createFakeBins({ tool: { whenArgsStartWith: ['fake-only'], otherwise: perl } });
+    try {
+      const shim = readFileSync(fakeBins.bin('tool'), 'utf8');
+      const prefix = shim.match(/"restorePrefix":"(ELANOUS_FAKE_BIN_RESTORE_[A-Za-z0-9]+_)"/)?.[1];
+      if (!prefix) throw new Error('restore prefix missing from shim');
+      const collidingKey = `${prefix}PATH`;
+      const env = { ...fakeBins.env, [collidingKey]: 'caller-owned', [`${prefix}_PATH`]: 'caller-owned-too' };
+      const result = spawnSync(fakeBins.bin('tool'), ['-e', 'print join("\\n", $ENV{PATH}, $ENV{shift @ARGV}, $ENV{shift @ARGV})', collidingKey, `${prefix}_PATH`],
+        { encoding: 'utf8', env });
+      expect([result.status, result.stderr]).toEqual([0, '']);
+      expect(result.stdout).toBe([env.PATH, 'caller-owned', 'caller-owned-too'].join('\n'));
+    } finally { fakeBins.cleanup(); }
+  });
+
+  test('Perl interpreter path with spaces still starts the shim', () => {
+    const perl = Bun.which('perl');
+    if (!perl) throw new Error('perl unavailable');
+    const root = mkdtempSync(join(tmpdir(), 'fake bin perl path '));
+    const originalPath = process.env.PATH;
+    let fakeBins: ReturnType<typeof createFakeBins> | undefined;
+    try {
+      symlinkSync(perl, join(root, 'perl'));
+      process.env.PATH = `${root}${delimiter}${originalPath ?? ''}`;
+      fakeBins = createFakeBins({ tool: { stdout: 'space-ok\n' } });
+      process.env.PATH = originalPath;
+      const result = spawnSync(fakeBins.bin('tool'), ['inspect'], { encoding: 'utf8' });
+      expect([result.status, result.stdout]).toEqual([0, 'space-ok\n']);
+      expect(fakeBins.calls()[0]?.argv).toEqual(['inspect']);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      fakeBins?.cleanup();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('UTF-8 argv, recorded env and output round-trip through response matching', () => {

@@ -84,6 +84,7 @@ import type { LogSource, LogLevel } from '../mss/logging/record.js';
 import { cleanupLogDir } from '../mss/logging/retention.js';
 import { LogDietGuard, type LogDietSummary } from './log-diet.js';
 import { correlateGateLog } from '../mss/logging/gate-correlation.js';
+import { inheritProvenance, validateProvenance, withProvenance, type Provenance } from '../provenance/provenance.js';
 
 /** DebugEvent is the legacy shape. Pre-MSS callers only read/write
  *  `ts` / `category` / `event` / `data`. MSS M2.1 adds four optional
@@ -114,6 +115,7 @@ export interface DebugEvent {
   // Ambient run attribution falls back here when `data` is not a plain
   // object, preserving primitive and non-plain payload identity.
   runId?: string;
+  provenance?: Provenance;
   // ── SAM S0 seed — source block (platform disambiguation) ──
   source?: LogSource;
 }
@@ -602,7 +604,7 @@ class DebugLog {
     category: string,
     event: string,
     data?: unknown | (() => unknown),
-    opts?: { level?: LogLevel; compact?: CompactOpts },
+    opts?: { level?: LogLevel; compact?: CompactOpts; provenance?: Provenance },
   ): void {
     const lazy = typeof data === 'function';
     if (!this.isAnySinkEnabled() || (lazy && !this.enabled)) return;
@@ -620,13 +622,27 @@ class DebugLog {
         ? data
         : compactForLog(data, opts?.compact);
     const correlatedPayload = correlateGateLog(category, event, payload);
-    let rec: DebugEvent = {
+    const payloadProvenance = correlatedPayload && typeof correlatedPayload === 'object'
+      ? (correlatedPayload as Record<string, unknown>).provenance
+      : undefined;
+    const hasOptionProvenance = Boolean(opts && Object.hasOwn(opts, 'provenance'));
+    const hasPayloadProvenance = Boolean(correlatedPayload && typeof correlatedPayload === 'object'
+      && Object.hasOwn(correlatedPayload, 'provenance'));
+    const safeProvenance = withProvenance({ provenance: inheritProvenance([
+      ...(hasOptionProvenance ? [opts?.provenance] : []),
+      ...(hasPayloadProvenance ? [payloadProvenance] : []),
+    ]) }).provenance;
+    const safePayload = hasPayloadProvenance && correlatedPayload && typeof correlatedPayload === 'object'
+      && !Array.isArray(correlatedPayload) && validateProvenance(safeProvenance)
+      ? { ...(correlatedPayload as Record<string, unknown>), provenance: safeProvenance }
+      : correlatedPayload;
+    let rec: DebugEvent = withProvenance({
       ts: new Date().toISOString(),
       category,
       event,
-      ...(correlatedPayload !== undefined ? { data: correlatedPayload } : {}),
+      ...(safePayload !== undefined ? { data: safePayload } : {}),
       ...(opts?.level ? { level: opts.level } : {}),
-    };
+    }, safeProvenance);
     // MSS M2.1 enrichment — append trace/elanous context when live.
     enrichDebugRecord(rec);
     // MSS M2.3 sink-level redaction — runs once per event before any

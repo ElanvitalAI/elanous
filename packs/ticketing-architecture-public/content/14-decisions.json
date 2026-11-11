@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "선택 결정표",
+  "source": "https://github.com/donnemartin/system-design-primer",
+  "body": "| 결정 | 기본 선택 | 대안과 선택 조건 | 검증·근거 |\n| 좌석 원장 | PostgreSQL 행 잠금+확정 부분 UNIQUE | 조건부 UPDATE는 동일 불변식과 p95 실측 후 | 동시 장벽·[PG 잠금](https://www.postgresql.org/docs/current/explicit-locking.html) |\n| Redis | 사전 관문·짧은 캐시 | 원장으로 쓰려면 분산 장애 불변식 증명 | Redis 정지·[SET](https://redis.io/docs/latest/commands/set/) |\n| 대기열 | 사용자 순번+서버 입장률 | 추첨은 제품 공정성 정책일 때 | 순번 역전·[SRE 과부하](https://sre.google/sre-book/handling-overload/) |\n| 결제 | PENDING→웹훅→CONFIRMED | 동기 확정은 PG 불확실성 해소 필요 | 늦은 성공·[Stripe 웹훅](https://docs.stripe.com/webhooks) |\n| 이벤트 | DB outbox+멱등 소비자 | 직접 이중 쓰기는 공백 발생 | 릴레이 재시작·[outbox](https://microservices.io/patterns/data/transactional-outbox.html) |\n| 확장 | 무상태 앱+HPA+pool 예산+입장률 | 샤딩은 단일 원장 한계 실측 뒤 | p95/연결/핫키·[12-Factor](https://12factor.net/processes) |\n| 부하 완충 | 입장 대기열과 비동기 작업 큐를 분리 | 단일 큐는 공정성/작업 의미가 다름 | 복구·[Azure 패턴](https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling) |\n| 운영 판정 | SLI/SLO와 복구 절차를 먼저 정함 | 임의 임계값은 가정으로 표시 | 장애 주입·[SRE Workbook](https://sre.google/workbook/implementing-slos/)·[AWS](https://docs.aws.amazon.com/wellarchitected/latest/framework/rel-dp.html) |"
+}

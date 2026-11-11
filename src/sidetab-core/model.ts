@@ -33,6 +33,8 @@ export interface SidetabRow {
   readonly ptyId?: string;
   readonly nestDepth?: number;
   readonly ownerPid?: number;
+  /** PTY manifest process lifetime; absent for rows without a verifiable owner. */
+  readonly ptyStartedAt?: number;
   readonly currentProcess?: boolean;
   readonly controlState?: SidetabControlState;
   readonly runId?: string;
@@ -209,6 +211,7 @@ export function sidetabRowsFromManifest(
         ptyId: row.id,
         nestDepth: row.nestDepth,
         ownerPid: row.ownerPid,
+        ptyStartedAt: row.startedAt,
         currentProcess: row.kind === 'tui' && row.ownerPid === process.pid,
         ...(scope?.controlByPtyId?.[row.id]
           ? { controlState: sidetabControlState(scope.controlByPtyId[row.id]!) }

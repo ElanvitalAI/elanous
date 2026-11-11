@@ -1,0 +1,27 @@
+{
+  "id": "self-edge-byoc-world",
+  "name": "Member-owned public edge and home-cluster tunnel world",
+  "checklistCells": ["SELF-EDGE-BYOC-DNS"],
+  "implementation": ["src/ux-sim/self-edge-byoc-sim.ts", "src/ux-sim/fake-cloud-vm.ts", "src/ux-sim/fake-ssh.ts"],
+  "tests": ["src/ux-sim/self-edge-byoc-sim.test.ts"],
+  "target": "Exercise a zero-rail blank-VM BYOC control plane: owner DNS delegation, DNS-01 certificate readiness, member-owned reverse-proxy edge, and WireGuard path to a home WSL/Linux k3d endpoint.",
+  "inputs": [
+    "blank VM image digest and member public address",
+    "owner domain and app hostname",
+    "registrar and VM authoritative nameserver sets",
+    "SSH reachability, DNS-01 publication, TLS readiness, and home tunnel reachability"
+  ],
+  "observations": [
+    "DNS delegation and hostname ownership are checked before route readiness",
+    "certificate or tunnel failure leaves no public route",
+    "ready traffic targets the member VM and then the home WireGuard endpoint",
+    "the simulated flow makes no managed Elanous DNS, Elanous relay, or external provider calls",
+    "the model does not execute installation commands or contact real DNS, ACME, WireGuard, or k3s services"
+  ],
+  "entryCommands": ["bun test src/ux-sim/self-edge-byoc-sim.test.ts"],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null,
+  "audience": "internal",
+  "defaultProfile": { "credentials": "fake-only", "network": "loopback-only", "storage": "temporary" }
+}

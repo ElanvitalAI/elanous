@@ -11,12 +11,14 @@
   "inputs": [
     "fixed or scripted response",
     "delay",
-    "error/status"
+    "error/status",
+    "ordered tool-call sequence scoped to one human prompt"
   ],
   "observations": [
     "captured calls",
     "stream chunks",
-    "completion or failure"
+    "completion or failure",
+    "tool calls emitted in order until the sequence is exhausted"
   ],
   "entryCommands": [
     "bun test src/ux-sim/fake-llm.test.ts"

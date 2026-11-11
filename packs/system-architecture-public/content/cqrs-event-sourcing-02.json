@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "CQRS·이벤트 소싱 — 이벤트 소싱의 적합성",
+  "source": "https://microservices.io/patterns/data/event-sourcing.html",
+  "body": "적용 시점: 현재 상태뿐 아니라 변경 이력 자체가 도메인의 원본이어야 할 때.\n용량 단계: 간단한 변경 이력에는 감사 로그가 더 싸다; 상태 재구성·시간여행이 핵심이면 이벤트 원장을 검토한다.\nGCP 대응: Cloud SQL에 append-only 이벤트와 스냅샷을 저장하고 Pub/Sub로 파생 뷰를 전달할 수 있다.\n비용 축: 무한히 누적되는 이벤트 저장, 스냅샷, projection 재생과 운영 복잡성이 비용 축이다.\n결정과 반증: 감사 목적만으로 이벤트 소싱을 채택하지 말고 과거 이벤트로 현재 상태를 재생하는 요구를 확인한다."
+}

@@ -5,7 +5,7 @@
 //   elanous release tag --version <x.y.z> --source <commit> [--yes]
 //   elanous release verify  [--version <x.y.z>]
 //   elanous release notes   --from <ref> [--to <ref>]
-//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--dry-run] [--json] [--if-ready] [--force-new] [--adopt-failed-run <runId>]
+//   elanous release run     --version <x.y.z> [--prerelease rc] [--main-cut | --cut-commit <sha>] [--publish-at <iso>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--dry-run] [--json] [--if-ready] [--force-new]
 //   elanous release resume  --run <runId> --from <node> [--waive <node> --reason <text>] [--accepted-regressions <json>] [--gate-executor <pod|host> [--gate-host <ssh-host>]] [--gate-pod-pool <pool>] [--json]
 //   elanous release auto-start [--window-minutes <n>] [--apply] [--json]
 //   elanous release recover --run <runId> --pick <sha...> [--from export-check] [--command-root <path>] [--repo-root <path>] [--no-partial] [--json]
@@ -37,12 +37,14 @@ import { getUserConfig } from '../user-config/reader.js';
 import { addItem, cellsReferencingDoc, claimItem, decodeClaimHistoryEntry, inspectChecklistTargetPaths, lintDocRefs, listChecklist, normalizeRefs, noteDispatchSkip, ownerMatches, parseOwner, parityGap, refRoots, removeItem, renderRefsStatus, seedFromRoadmap, setItem, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind, type ChecklistDispatchKind } from '../release-loop/checklist.js';
 import * as features from '../release-loop/feature-store.js';
 import { evidencePlan, fetchMergedChecklistPrs, landedButYellow, type MergedPrRunner } from '../release-loop/landed-but-yellow.js';
-import { formatSchedule, getSchedule, listSchedules, setSchedule } from '../release-loop/release-schedule.js';
+import { formatSchedule, getSchedule, listSchedules, planIncrementalSweepTick, setSchedule } from '../release-loop/release-schedule.js';
+import { readSweepCertificate } from '../../scripts/release-loop/sweep-cert.js';
 import { mergedPrsLast24h, placeCell, planPullForward, pullForwardPlacementConfig, rebalance, seatMove, type PlacementPriority } from '../release-loop/placement.js';
 import { readTrafficSignal } from '../seat-loop/traffic-signal.js';
 import { parseRubric, parseRubricS, readRubricItems, rubricGrade, rubricScore } from '../release-loop/rubric.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { CliUserError } from './cli-user-error.js';
+import { assertManualSeatClaimOpenPrOwner, type ManualSeatClaimDeps } from './release-manual-seat-claim.js';
 import { hqCliWriteAllowed, type HqDeps } from '../hq/hq.js';
 import { fileLeaseStore } from '../hq/lease.js';
 import { isIsolatedLedgerWriteRoot } from '../hq/ledger-write-target.js';
@@ -72,10 +74,9 @@ import { registerReleaseRunStatusCommand } from './release-run-status-cli.js';
 export const GATE_SHARD_JSON_PAGE_MAX_BYTES = 60_000;
 
 /** Pin release-run freshness in tests so child CLIs do not observe a moving origin/main ref. */
-export function releaseCliFreshnessCutRevision(explicitCut: string | undefined, adoptFailedRun = false, cliRevision?: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+export function releaseCliFreshnessCutRevision(explicitCut: string | undefined, env: NodeJS.ProcessEnv = process.env): string | undefined {
   const explicit = explicitCut?.trim();
   if (explicit) return explicit;
-  if (adoptFailedRun) return cliRevision;
   if (env.NODE_ENV !== 'test') return undefined;
   const testBase = env.ELANOUS_TEST_RELEASE_CLI_FRESHNESS_BASE?.trim();
   return testBase || undefined;
@@ -659,7 +660,7 @@ export function formatResumeGatePlan(mode: 'not-run' | 'partial' | 'full', reaso
   return `부분 gate 계획 ${partial.requested && partial.applied ? `${partial.files}파일${partial.invalidatedShardIds?.length ? ` · 손상 receipt 재측 ${partial.invalidatedShardIds.join(',')}` : ''}` : '미상'}`;
 }
 
-export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}, resumeDeps: RecoverReleaseDeps = {}, checklistEvidenceReader?: ChecklistEvidenceReader): void {
+export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}, landedDeps: LandedButYellowDeps = {}, hqDeps: HqDeps = {}, lightRcDeps: LightRcDeps = {}, rehearsalDeps: RehearsalDeps = {}, resumeDeps: RecoverReleaseDeps = {}, checklistEvidenceReader?: ChecklistEvidenceReader, manualSeatClaimDeps: ManualSeatClaimDeps = {}): void {
   registerRfcCommands(program);
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   registerReleaseRunStatusCommand(release);
@@ -754,6 +755,27 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       const proposedPublishAt = proposePublishAt(row.cutAt, measure);
       if (o.json) console.log(JSON.stringify({ ...row, proposedPublishAt, measuredPublishMedianSeconds: measure.medianSeconds, measuredPublishSamples: measure.samples.map(({ version, seconds }) => ({ version, seconds })) }));
       else { console.log(formatSchedule(row)); console.log(formatPublishProposal(row.cutAt, measure)); }
+    });
+  schedule.command('sweep-due').description('증분 스윕의 3시간·컷 90분 전 실행 시각 판정')
+    .requiredOption('--version <v>', '조회할 판')
+    .requiredOption('--dirty-files <n>', '현재 증분 스윕 대상 파일 수')
+    .option('--last-sweep-at <iso>', '마지막 성공 스윕 시각(없으면 증명서 측정 시각)')
+    .option('--at <iso>', '판정 시각(기본 현재 시각)').option('--json', '결과 JSON')
+    .action((o: { version: string; dirtyFiles: string; lastSweepAt?: string; at?: string; json?: boolean }) => {
+      const root = scheduleLedgerRoot();
+      const row = getSchedule(o.version, root);
+      if (!row) throw new CliUserError(`없는 판 일정: ${o.version}`);
+      const dirtyFiles = Number(o.dirtyFiles);
+      if (!Number.isSafeInteger(dirtyFiles) || dirtyFiles < 0) throw new CliUserError('--dirty-files는 0 이상의 정수여야 한다');
+      const certificate = readSweepCertificate(join(root, 'release', o.version, 'gate-logs', 'cut', 'receipts'));
+      const lastSweepAt = o.lastSweepAt ?? (certificate ? new Date(certificate.measuredAt).toISOString() : null);
+      const at = o.at ?? new Date().toISOString();
+      const decision = planIncrementalSweepTick({ now: at, cutAt: row.cutAt, lastSweepAt,
+        certificateMeasuredAt: certificate?.measuredAt ?? null, dirtyFiles });
+      const result = { version: o.version, at, cutAt: row.cutAt, lastSweepAt, decision };
+      if (o.json) console.log(JSON.stringify(result));
+      else console.log(decision ? `${o.version} 증분 스윕 예정 · ${decision.reason} · 대상 ${decision.dirtyFiles}파일 · 증명서 나이 ${decision.certificateAgeMs === null ? '측정 불가' : `${Math.floor(decision.certificateAgeMs / 60_000)}분`} · ${decision.dueAt}`
+        : `${o.version} 증분 스윕 시각 아님`);
     });
   schedule.command('set').requiredOption('--version <v>', '갱신할 판')
     .option('--cut-at <iso>', '오프셋 포함 컷 시각').option('--land-by <iso>', '오프셋 포함 착지 마감')
@@ -1072,6 +1094,8 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       if (opts.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(opts.status)) throw new CliUserError(`잘못된 상태: ${opts.status}`, 'green|yellow|red|done');
       if (opts.disposition !== undefined && !['move', 'known-issue', 'block'].includes(opts.disposition)) throw new CliUserError(`잘못된 처분: ${opts.disposition}`, 'move|known-issue|block');
       if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined && opts.priority === undefined && opts.deadlineVersion === undefined && opts.predecessor === undefined && opts.ceoMinutes === undefined && opts.ceoDate === undefined && opts.accelerator === undefined && opts.ref === undefined) throw new CliUserError('갱신할 칸을 지정하라', '--ref · --status · --evidence · --owner · --disposition · --kind · --priority · --deadline-version · --predecessor · --ceo-minutes · --ceo-date · --accelerator · --no-accelerator 중 하나');
+      if (opts.status === 'green' && !ownerMatches(actor(), 'OP') && !ownerMatches(actor(), 'OPC'))
+        throw new CliUserError('초록 판정은 OP 또는 OPC만 기록할 수 있다 — 판정국에 [GREEN-REQ]를 보내 판정을 요청하라', 'release checklist set <id> --evidence "[GREEN-REQ] …"');
       if (!mayWrite(cmd)) return;
       const dispatchKind = opts.kind && !['screen', 'postpub'].includes(opts.kind) ? opts.kind as ChecklistDispatchKind : undefined;
       const data = setItem(version, id, { ...(opts.ref !== undefined ? { refs: opts.ref } : {}), ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined && !dispatchKind ? { kind: opts.kind as ChecklistKind } : {}), ...(dispatchKind ? { dispatchKind } : {}), ...(opts.priority !== undefined ? { priority: opts.priority as PlacementPriority } : {}), ...(opts.deadlineVersion !== undefined ? { deadlineVersion: opts.deadlineVersion } : {}), ...(opts.predecessor !== undefined ? { predecessors: opts.predecessor === false ? [] : opts.predecessor } : {}), ...(opts.ceoMinutes !== undefined ? { ceoMinutes: ceoMinutes(opts.ceoMinutes) } : {}), ...(opts.ceoDate !== undefined ? { ceoDate: opts.ceoDate } : {}), ...(opts.accelerator !== undefined ? { accelerator: opts.accelerator ? true : null } : {}) }, process.env.ELANOUS_TRACK || 'cli');
@@ -1088,6 +1112,11 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .action((id: string, opts: { by: string; force?: boolean; reason?: string }, cmd: Command) => {
       const { version, json } = context(cmd);
       if (!mayWrite(cmd)) return;
+      try {
+        const claimant = process.env.ELANOUS_TRACK ? parseOwner(process.env.ELANOUS_TRACK).seat : 'unknown';
+        assertManualSeatClaimOpenPrOwner(id, claimant, manualSeatClaimDeps);
+      }
+      catch (error) { throw new CliUserError(error instanceof Error ? error.message : String(error)); }
       const data = claimItem(version, id, opts.by, { force: opts.force, reason: opts.reason, actor: process.env.ELANOUS_TRACK || 'cli' });
       if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 주인 ${opts.by}`);
     });
@@ -1241,7 +1270,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .action(async (o: { version: string; base?: string; pick: string[]; append?: boolean; dryRun?: boolean; json?: boolean }) => {
       await jsonAction(o.json, async (log) => cutReleaseBranch({ ...o, log }), () => true);
     });
-  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; readinessCountdown?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; adoptFailedRun?: string; gateExecutor?: string; gateHost?: string; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
+  const runAction = async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; readinessCountdown?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }, logRun = console.log): Promise<boolean | AutoStartDeferral | undefined> => {
       const launchRefusal = releaseRunLaunchRefusal({ sourcePath: fileURLToPath(import.meta.url) });
       if (launchRefusal) {
         debug.log('release.run', 'seat-launch-refused', { seat: process.env.ELANOUS_TRACK ?? null, cwd: process.cwd(), reason: launchRefusal });
@@ -1258,13 +1287,6 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         process.exitCode = 1;
         return false;
       }
-      if (o.adoptFailedRun && (o.ifReady || o.cutCommit || o.mainCut || o.prerelease)) {
-        const message = '--adopt-failed-run requires a direct stable release-branch run';
-        if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, error: message })}\n`);
-        else console.error(`⛔ ${message}`);
-        process.exitCode = 1;
-        return false;
-      }
       // A malformed --publish-at is refused before readiness, so --if-ready cannot defer it as a success.
       const publishAtInvalid = o.publishAt === undefined ? null : publishAtError(o.publishAt);
       if (publishAtInvalid) {
@@ -1276,7 +1298,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       let branchCutBaseCommit: string | undefined;
       if (!o.dryRun) {
         const cliCommit = codeRevision();
-        const freshnessCut = releaseCliFreshnessCutRevision(o.cutCommit, !!o.adoptFailedRun, cliCommit);
+        const freshnessCut = releaseCliFreshnessCutRevision(o.cutCommit);
         try {
           const freshness = assertReleaseCliFresh(process.cwd(), cliCommit, freshnessCut);
           if (o.cutCommit === undefined && !o.mainCut) branchCutBaseCommit = freshness.cutCommit;
@@ -1336,7 +1358,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
             forceNew: o.forceNew,
             readiness: (version, options) => releaseReadiness(version, { ledgerRoot: releaseRunDeps.ledgerRoot, checklist: releaseRunDeps.checklist,
               allowBeforeCut: o.readinessCountdown, ...options }),
-            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost, adoptFailedRunId: o.adoptFailedRun }, releaseRunDeps),
+            run: () => runUnattendedRelease({ version: o.version, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps),
           });
           if (outcome.skipped) {
             if (outcome.reason === 'already-running') {
@@ -1373,7 +1395,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
         }
       }
       await jsonAction(o.json, async (log) => {
-        const run = () => runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost, adoptFailedRunId: o.adoptFailedRun }, releaseRunDeps);
+        const run = () => runUnattendedRelease({ version: o.version, dryRun: o.dryRun, cutCommit: o.cutCommit, branchCutBaseCommit, mainCut: o.mainCut, prerelease, forceFreeze: o.forceFreeze, forceNew: o.forceNew, publishAt: o.publishAt, gateExecutor: o.gateExecutor, gateHost: o.gateHost }, releaseRunDeps);
         const forceRun = () => {
           const atStart = releaseReadiness(o.version, { ledgerRoot, checklist: releaseRunDeps.checklist, isPidAlive: () => false });
           if (!atStart.ready) throw new Error(`release run --force-new not ready after claim: ${atStart.reason}`);
@@ -1402,11 +1424,10 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--publish-at <iso>', '승인·선행 노드 통과 뒤 지정 시각까지 발행 대기(오프셋 포함 ISO 시각)')
     .option('--force-freeze', '동결 중 게이트·발행 강행(관측 기록) — 가지 컷은 동결이 필요 없다 · 동결은 비상 스위치로 남는다')
     .option('--force-new', '같은 판의 살아 있는 릴리스 런을 확인한 뒤에도 새 런을 명시적으로 시작')
-    .option('--adopt-failed-run <runId>', 'OP 승인: 원장·판·컷 후손을 확인해 실패한 런의 release/<v> 가지를 인수')
     .option('--gate-executor <pod|host>', 'gate 노드 실행기(기본 pod) — host 는 Pod 대신 SSH 호스트의 깨끗한 클론에서 같은 판정(면제 아님)')
     .option('--gate-host <ssh-host>', '--gate-executor host 의 SSH 호스트(기본 release.loop.gateRemote)')
     .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
-    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; adoptFailedRun?: string; gateExecutor?: string; gateHost?: string; json?: boolean }) => { await runAction(o); });
+    .action(async (o: { version: string; cutCommit?: string; mainCut?: boolean; prerelease?: string; dryRun?: boolean; ifReady?: boolean; publishAt?: string; forceFreeze?: boolean; forceNew?: boolean; gateExecutor?: string; gateHost?: string; json?: boolean }) => { await runAction(o); });
   release.command('preflight')
     .description('컷 전 사전 점검(기본 읽기 전용) — --countdown 은 단계 판정 모델만 표시하고 컷을 실행하지 않는다. --allow-side-effects 를 명시해야 실패 우편·원장을 기록한다.')
     .requiredOption('--version <v>', '점검할 판(x.y.z)')

@@ -1,0 +1,95 @@
+{
+  "kind": "knowledge-pack",
+  "name": "ticketing-architecture-public",
+  "version": "0.2.0",
+  "description": "Original, source-linked ticketing system-design decisions from public architecture references and official component documentation; no redistributed source text.",
+  "signature": {
+    "alg": "ed25519",
+    "keyId": "00000000"
+  },
+  "dependencies": [],
+  "license": "CC-BY-4.0",
+  "visibility": "public",
+  "content": [
+    {
+      "type": "document",
+      "path": "content/01-scope.json"
+    },
+    {
+      "type": "document",
+      "path": "content/02-seat.json"
+    },
+    {
+      "type": "rule",
+      "path": "content/03-unique.json"
+    },
+    {
+      "type": "document",
+      "path": "content/04-queue.json"
+    },
+    {
+      "type": "document",
+      "path": "content/05-redis.json"
+    },
+    {
+      "type": "document",
+      "path": "content/06-payment.json"
+    },
+    {
+      "type": "rule",
+      "path": "content/07-idempotency.json"
+    },
+    {
+      "type": "document",
+      "path": "content/08-webhook.json"
+    },
+    {
+      "type": "procedure",
+      "path": "content/09-outbox.json"
+    },
+    {
+      "type": "document",
+      "path": "content/10-kafka.json"
+    },
+    {
+      "type": "document",
+      "path": "content/11-edge.json"
+    },
+    {
+      "type": "document",
+      "path": "content/12-hpa.json"
+    },
+    {
+      "type": "document",
+      "path": "content/13-probe.json"
+    },
+    {
+      "type": "document",
+      "path": "content/14-decisions.json"
+    },
+    {
+      "type": "document",
+      "path": "content/15-primer.json"
+    },
+    {
+      "type": "document",
+      "path": "content/16-slo.json"
+    },
+    {
+      "type": "document",
+      "path": "content/17-aws.json"
+    },
+    {
+      "type": "document",
+      "path": "content/18-azure.json"
+    },
+    {
+      "type": "document",
+      "path": "content/19-lease.json"
+    },
+    {
+      "type": "document",
+      "path": "content/20-twelve-factor.json"
+    }
+  ]
+}

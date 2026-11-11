@@ -103,14 +103,19 @@ test('resolves loop rows from the table, seats by exact pty name, then herdr pan
 test('routes pane/session and seat-pane addresses from a fake herdr pane census and reports ambiguous seats', () => {
   const f = fixture({
     listHerdrPanes: () => [
-      { paneId: 'wT:p4', sessionId: 'sess-4', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'idle' },
-      { paneId: 'wT:p5', sessionId: 'sess-5', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'idle' },
+      { paneId: 'wT:p4', sessionId: 'sess-4', title: 'work | ABSORB-FAKE', cwd: '/hq/seats/ABSORB-FAKE', status: 'idle' },
+      { paneId: 'wT:p5', sessionId: 'sess-5', title: 'work | ABSORB-FAKE', cwd: '/hq/seats/ABSORB-FAKE', status: 'idle' },
     ],
   });
   expect(resolveWake('pane:wT:p4', f.deps)).toMatchObject({ wake: 'herdr', target: 'wT:p4', source: 'herdr.pane' });
   expect(resolveWake('session:sess-5', f.deps)).toMatchObject({ wake: 'herdr', target: 'wT:p5', source: 'herdr.pane' });
   expect(resolveWake('TC/p4', { ...f.deps, listHerdrPanes: () => [{ paneId: 'wT:p4', title: 'work | TC', cwd: '/hq/seats/TC', status: 'idle' }] })).toMatchObject({ wake: 'herdr', target: 'wT:p4' });
-  expect(resolveWake('ABSORB-3', f.deps)).toMatchObject({ wake: 'none', reason: 'ambiguous-seat:candidates=2' });
+  expect(resolveWake('ABSORB-FAKE', f.deps)).toMatchObject({ wake: 'none', reason: 'ambiguous-seat:candidates=2' });
+  const duplicateRegisteredSeat = resolveWake('ABSORB-3', { ...f.deps, readRegistry: () => ({ status: 'absent' as const }), listHerdrPanes: () => [
+    { paneId: 'wT:p6', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'idle' },
+    { paneId: 'wT:p7', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'idle' },
+  ] });
+  expect(duplicateRegisteredSeat).toMatchObject({ wake: 'none', reason: 'ambiguous-seat:candidates=2' });
 });
 
 test('registry herdr targets require one live matching census pane', () => {
@@ -170,10 +175,22 @@ test('pane census command failures and malformed rows stay unknown; direct panes
   expect(resolveWake('pane:wT:p99', titleAndCwd.deps)).toMatchObject({ wake: 'none', reason: 'dead-pane-address:candidates=0' });
   expect(resolveWake('session:missing', titleAndCwd.deps)).toMatchObject({ wake: 'none', reason: 'session-address-fields-unknown:candidates=1' });
   const mixedSeat = fixture({ listHerdrPanes: () => [
-    { paneId: 'wT:p4', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'idle' },
-    { paneId: 'wT:p5', title: 'work | ABSORB-3', cwd: '/hq/seats/ABSORB-3', status: 'dead' },
+    { paneId: 'wT:p4', title: 'work | ABSORB-FAKE', cwd: '/hq/seats/ABSORB-FAKE', status: 'idle' },
+    { paneId: 'wT:p5', title: 'work | ABSORB-FAKE', cwd: '/hq/seats/ABSORB-FAKE', status: 'dead' },
   ] });
-  expect(resolveWake('ABSORB-3', mixedSeat.deps)).toMatchObject({ wake: 'none', reason: 'ambiguous-seat:candidates=2' });
+  expect(resolveWake('ABSORB-FAKE', mixedSeat.deps)).toMatchObject({ wake: 'none', reason: 'ambiguous-seat:candidates=2' });
+});
+
+test('Herdr 0.9.1 pane census retries without unsupported --json', () => {
+  const calls: string[][] = [];
+  const f = fixture({ listHerdrPanes: undefined, runHerdrPaneList: args => {
+    calls.push([...args]);
+    return args.includes('--json')
+      ? { status: 2, stdout: '', stderr: 'error: unknown option: --json' }
+      : { status: 0, stdout: '{"result":{"panes":[{"pane_id":"wT:p4","agent_status":"idle"}]}}' };
+  } });
+  expect(resolveWake('pane:wT:p4', f.deps)).toMatchObject({ wake: 'herdr', target: 'wT:p4' });
+  expect(calls).toEqual([['pane', 'list', '--json'], ['pane', 'list']]);
 });
 
 test('explicit herdr registration is not shadowed by a same-named PTY', () => {
@@ -212,6 +229,8 @@ test('all registered addresses reach a pane consumer for ten messages per Codex,
   expect(registered).toContain('NT-1');
   expect(registered).toContain('NT-3');
   expect(registered).toContain('LEDGER');
+  expect(registered).toContain('R-GCP1C');
+  expect(registered).toContain('MVP-B');
   for (const address of registered) expect(messageRouteFor(address)?.wakeFrom).toBe('host');
 
   const runtimes = [

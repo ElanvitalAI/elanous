@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { GraphTemplateSpec } from '../self-implement/graph-yaml.js';
+import { isRecord } from '../primitives/guards.js';
 
 export type ArgOpenChange =
   | { readonly kind: 'vocabulary'; readonly term: string }
@@ -33,10 +34,6 @@ export interface ArgOpenContext {
   readonly memory: readonly unknown[];
   readonly knowledgePacks: readonly unknown[];
   readonly cardPath: string;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
 /** The LLM output is untrusted. The union permits novel verbs while keeping

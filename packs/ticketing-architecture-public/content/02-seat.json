@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "좌석 원장과 상태 전이",
+  "source": "https://www.postgresql.org/docs/current/explicit-locking.html",
+  "body": "좌석은 AVAILABLE→HELD→SOLD 또는 HELD→AVAILABLE 상태를 가진다. 서버 시각의 expires_at을 DB 트랜잭션 안에서 판정한다. 특정 만료 기간은 제품 정책으로 고정하고 경계 시각에서 동일 좌석 재점유/결제 경합을 시험한다. PostgreSQL SELECT FOR UPDATE는 같은 좌석의 경쟁 트랜잭션을 직렬화한다. 조건부 UPDATE ... WHERE state='AVAILABLE' OR (state='HELD' AND expires_at<=now())도 대안이다. SOLD 상태는 만료 시각과 무관하게 재점유 조건에서 제외한다. 두 방식은 실측 경쟁/지연으로 고른다."
+}

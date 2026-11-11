@@ -50,6 +50,21 @@ export function gateImageLayerRuntimeKey(input: { baseImageDigest: string; lockH
     input.buildRecipeHash.toLowerCase(), input.gateDepsDigest.toLowerCase(), input.skillsDigest.toLowerCase()].join('\n')).digest('hex').slice(0, 40);
 }
 
+export function gateRuntimeBaseReuseMode(
+  identities: readonly ({ digest: string; architecture: string } | null)[],
+  existingTagDigests: readonly (string | null)[],
+): 'uniform-base' | 'shared-tag' {
+  if (!identities.length || identities.some((identity) => !identity))
+    throw new Error('gate runtime base digest or architecture could not be measured consistently across pools');
+  const distinctBases = new Set(identities.map((identity) => `${identity!.digest}\n${identity!.architecture}`));
+  if (distinctBases.size === 1) return 'uniform-base';
+  const digests = existingTagDigests.map(normalizeGateImageDigest);
+  if (digests.length !== identities.length || digests.some((digest) => !digest)
+    || new Set(digests).size !== 1)
+    throw new Error('gate runtime base digest or architecture differs and no shared pinned image tag exists across pools');
+  return 'shared-tag';
+}
+
 /** Build the cut image before the expensive gate starts, then persist the pin the gate will consume. */
 export async function prebuildGateImagePinAtCut(input: {
   root: string; version: string; runId: string; commit: string; image: string;
@@ -85,6 +100,20 @@ export async function prebuildGateImagePinAtCut(input: {
   if (currentPin) replaceGateImagePin(pinPath, input.runId, digest, imageTag, input.commit, imageTag, currentPin.commit);
   else writeGateImagePin(pinPath, input.runId, digest, imageTag, input.commit);
   return { outcome, digest, eligiblePools };
+}
+
+export async function prebuildGateImagePinForRuntimeBases(input: Parameters<typeof prebuildGateImagePinAtCut>[0] & {
+  runtimeBases: readonly ({ digest: string; architecture: string } | null)[];
+}): Promise<GateImagePrebuildResult> {
+  if (input.runtimeBases.some((identity) => !identity))
+    throw new Error('gate runtime base digest or architecture could not be measured consistently across pools');
+  const distinctBases = new Set(input.runtimeBases.map((identity) => `${identity!.digest}\n${identity!.architecture}`));
+  const observed = distinctBases.size === 1 ? [] : input.members.map(input.probe);
+  const mode = gateRuntimeBaseReuseMode(input.runtimeBases, observed);
+  if (mode === 'uniform-base') return prebuildGateImagePinAtCut(input);
+  const sharedDigest = normalizeGateImageDigest(observed[0])!;
+  return prebuildGateImagePinAtCut({ ...input, probe: () => sharedDigest,
+    sync: async () => { throw new Error('mixed runtime bases cannot build a shared image'); } });
 }
 
 function imageRepository(image: string): string {
@@ -398,14 +427,13 @@ async function prebuildFromArgs(args: string[]): Promise<ChildGateImagePrebuildO
       const architecture = lines.at(-1)?.trim();
       return digest && architecture ? { digest, architecture } : null;
     });
-    if (layerIdentities.some((identity) => !identity)
-      || new Set(layerIdentities.map((identity) => `${identity!.digest}\n${identity!.architecture}`)).size !== 1)
+    if (layerIdentities.some((identity) => !identity))
       throw new Error('gate runtime base digest or architecture could not be measured consistently across pools');
     const layerIdentity = layerIdentities[0]!;
     const runtimeKey = gateImageLayerRuntimeKey({ baseImageDigest: layerIdentity.digest, lockHash,
       architecture: layerIdentity.architecture, bunVersion, buildRecipeHash: recipeHash.digest('hex'), gateDepsDigest, skillsDigest });
     const image = `${imageRepository(baseImage)}:${runtimeKey.slice(0, 12)}`;
-    return await prebuildGateImagePinAtCut({ root, version, runId, commit, image, members,
+    return await prebuildGateImagePinForRuntimeBases({ root, version, runId, commit, image, members, runtimeBases: layerIdentities,
       probe: (member) => preflightGateImageDigest(specFor.get(member.context) ?? member.context, runtimeKey),
       sync: () => {
         const priorLayerOnly = process.env.ELANOUS_BUILD_GATE_LAYER_ONLY;

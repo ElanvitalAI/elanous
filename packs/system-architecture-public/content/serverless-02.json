@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "서버리스 — 이벤트 기반 함수",
+  "source": "https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/welcome.html",
+  "body": "적용 시점: 짧고 독립적이며 재시도 가능한 반응 작업에 적합하다.\n용량 단계: 기능이 작을 때 단일 trigger; 단계·장기 상태가 늘면 워크플로 엔진으로 옮긴다.\nGCP 대응: Cloud Functions 또는 Cloud Run functions, Pub/Sub/Eventarc trigger, Secret Manager.\n비용 축: 호출·실행 시간·메모리, 이벤트 재전달, 로그 보존이 주요 비용 축이다.\n결정과 반증: 함수 timeout·재전달·중복 입력에서 결과가 안전하며 장시간 작업이 잘못 함수에 묶이지 않는지 확인한다."
+}

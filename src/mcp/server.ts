@@ -100,6 +100,8 @@ export interface McpServerContext {
   clientName?: string;
   /** Authenticated HTTP token scope; absent on stdio and other trusted transports. */
   tokenScope?: TokenScope;
+  /** Seat bound by the trusted host/transport; never read from a tool call. */
+  authenticatedSeat?: string;
 }
 
 /** Accept only an already-safe run identifier from standard MCP params._meta. */
@@ -188,7 +190,9 @@ export async function handleMcpRequest(
         await preloadCoreTools();
         await ensureDefaultMcpToolRuntimes();
         const surface = ctx.surface ?? 'mcp';
-        const runtimes = listToolRuntimes(surface);
+        const runtimes = listToolRuntimes(surface).filter(runtime =>
+          (runtime.id !== 'msg_inbox' && runtime.id !== 'msg_ack') || Boolean(ctx.authenticatedSeat),
+        );
         logMcpToolsList(runtimes, surface, ctx.origin);
         const tools = runtimes.map(rt => runtimeToMcpTool(rt, surface));
         return { ...base, result: { tools: ctx.tokenScope ? filterToolsForScope(tools, ctx.tokenScope) : tools } };
@@ -198,6 +202,9 @@ export async function handleMcpRequest(
         await preloadCoreTools();
         await ensureDefaultMcpToolRuntimes();
         const name = typeof req.params?.name === 'string' ? req.params.name : '';
+        if ((name === 'MsgInbox' || name === 'msg_inbox' || name === 'MsgAck' || name === 'msg_ack') && !ctx.authenticatedSeat) {
+          return { ...base, error: { code: -32601, message: `unknown tool: ${name}` } };
+        }
         if (ctx.tokenScope && !isToolAllowedForScope(name, ctx.tokenScope)) {
           emitProxyCallIntent(name, ctx.origin, false, 'unknown_tool');
           return { ...base, error: { code: -32601, message: `unknown tool: ${name}` } };
@@ -243,6 +250,7 @@ export async function handleMcpRequest(
           const out = await dispatchToolByName(name, agentArgs, {
             surface,
             ...(ctx.clientName ? { mcpClient: ctx.clientName } : {}),
+            ...(ctx.authenticatedSeat ? { authenticatedSeat: ctx.authenticatedSeat } : {}),
             ...(runId ? { runId } : {}),
             ...(agentTools ? {
               agentHostTools: agentTools.specs,
@@ -305,7 +313,7 @@ async function preloadCoreTools(): Promise<void> {
  * the daemon's broader boot sequence has registered them. Registration is
  * idempotent, so externally registered proxy runtimes remain untouched. */
 async function ensureDefaultMcpToolRuntimes(): Promise<void> {
-  if (!getToolRuntime('elanous_autopilot_launch')) {
+  if (!getToolRuntime('elanous_fs_list')) {
     const { registerAllDefaultToolRuntimes } = await import('../tool-runtime/index.js');
     registerAllDefaultToolRuntimes();
   }
@@ -332,7 +340,11 @@ function logMcpToolsList(
 }
 
 function runtimeToMcpTool(rt: ToolRuntime, surface: ToolSurface) {
-  const inputSchema = surface === 'mcp' && rt.id === 'agent'
+  const inputSchema = surface === 'mcp' && rt.id === 'msg_ack'
+    ? { type: 'object', properties: { id: { type: 'integer', description: 'Acknowledge every message through this ID for the authenticated seat.' } }, required: ['id'], additionalProperties: false }
+    : rt.id === 'msg_inbox'
+      ? rt.spec.parameters
+      : surface === 'mcp' && rt.id === 'agent'
     ? {
         ...rt.spec.parameters,
         properties: {

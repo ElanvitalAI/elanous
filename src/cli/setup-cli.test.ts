@@ -566,6 +566,14 @@ describe('setup CLI', () => {
     expect(r.text).toContain('missing: LLM provider configuration');
   });
 
+  test('Solar OpenRouter first run keeps its selected provider when setup is repeated with --yes', async () => {
+    const result = await runSetup({ provider: 'openrouter', yes: true, nonInteractive: false, stdinTty: true });
+    expect(result.text).toContain('completed: LLM provider configuration');
+    expect(result.text).not.toContain('Set llm.provider to openai-codex now?');
+    expect(result.prompts).not.toContain('Set llm.provider to openai-codex now? [y/N] ');
+    expect(result.writes).toEqual([]);
+  });
+
   test('interactive first-run uses one consent and reports one result without the manual bundle list', async () => {
     const result = await runSetup({ firstRunTopics: true, provider: 'openai-codex', nonInteractive: false, stdinTty: true, answer: 'y' });
     expect(result.output).toHaveLength(1);

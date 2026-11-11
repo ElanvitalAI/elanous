@@ -45,7 +45,7 @@ test('parser (OpenRouter flag): truncated args at finish_reason=length → args 
   try {
     const evs = await collect(parseOpenAISSELines(sse(BROKEN, 'length'), { flagInvalidToolArgs: true }));
     const chars = BROKEN.join('').length;
-    expect(evs).toEqual([{ type: 'tool_call', id: 'c1', name: 'Write', args: {}, argsInvalid: { chars, finishReason: 'length' } }]);
+    expect(evs).toEqual([{ type: 'tool_call', id: 'c1', name: 'Write', args: {}, argsInvalid: { chars, finishReason: 'length' } }, { type: 'finish', reason: 'length' }]);
     const invalid = logs.filter((l) => l.event === 'tool-args-invalid');
     expect(invalid).toHaveLength(1);
     expect(invalid[0]!.category).toBe('llm.openrouter');
@@ -63,7 +63,7 @@ test('parser (OpenRouter flag): malformed args at finish_reason=tool_calls → a
   const { logs, restore } = captureLogs();
   try {
     const evs = await collect(parseOpenAISSELines(sse(['{"file_path": oops}'], 'tool_calls'), { flagInvalidToolArgs: true }));
-    expect(evs).toEqual([{ type: 'tool_call', id: 'c1', name: 'Write', args: {}, argsInvalid: { chars: 19, finishReason: 'tool_calls' } }]);
+    expect(evs).toEqual([{ type: 'tool_call', id: 'c1', name: 'Write', args: {}, argsInvalid: { chars: 19, finishReason: 'tool_calls' } }, { type: 'finish', reason: 'tool_calls' }]);
     expect(logs.filter((l) => l.event === 'tool-args-maybe-truncated')).toHaveLength(0);
   } finally {
     restore();
@@ -75,7 +75,7 @@ test('parser (OpenRouter flag): valid args at finish_reason=length → executes 
   try {
     const flagged = await collect(parseOpenAISSELines(sse(VALID, 'length'), { flagInvalidToolArgs: true }));
     const plain = await collect(parseOpenAISSELines(sse(VALID, 'length')));
-    expect(flagged).toEqual([{ type: 'tool_call', id: 'c1', name: 'Write', args: { file_path: '/tmp/a.ts', content: 'ok' } }]);
+    expect(flagged).toEqual([{ type: 'tool_call', id: 'c1', name: 'Write', args: { file_path: '/tmp/a.ts', content: 'ok' } }, { type: 'finish', reason: 'length' }]);
     expect(JSON.stringify(flagged)).toBe(JSON.stringify(plain));
     expect(logs.filter((l) => l.event === 'tool-args-maybe-truncated')).toHaveLength(1);
     expect(logs.filter((l) => l.event === 'tool-args-invalid')).toHaveLength(0);
@@ -94,7 +94,7 @@ test('parser invariant: without the flag, broken args still collapse to {} with 
   const { logs, restore } = captureLogs();
   try {
     const evs = await collect(parseOpenAISSELines(sse(BROKEN, 'length')));
-    expect(evs).toEqual([{ type: 'tool_call', id: 'c1', name: 'Write', args: {} }]);
+    expect(evs).toEqual([{ type: 'tool_call', id: 'c1', name: 'Write', args: {} }, { type: 'finish', reason: 'length' }]);
     expect(logs.filter((l) => l.event === 'tool-args-invalid' || l.event === 'tool-args-maybe-truncated')).toHaveLength(0);
   } finally {
     restore();

@@ -48,6 +48,8 @@ export interface AppStorage {
   maxUploadBytes(appSlug: string): number | undefined;
   read(input: { readonly appSlug: string; readonly key: string }): AppStorageResponse;
   list(appSlug: string): { readonly status: 200; readonly files: string[] } | { readonly status: 404 | 503; readonly reason: string; readonly retryable: boolean };
+  /** Owner-only object removal for the web drive. The caller must derive role from authenticated app context. */
+  delete?(input: { readonly appSlug: string; readonly key: string; readonly role: string }): AppStorageResponse;
   signUploadUrl(input: { readonly appSlug: string; readonly key: string; readonly expiresInMs: number; readonly role?: string; readonly anonymous?: boolean; readonly origin?: string }): string;
   observationLedger(): readonly { readonly appSlug: string; readonly bytes: number; readonly status: number }[];
   close(): void;
@@ -389,6 +391,43 @@ export function createAppStorage(manifests: readonly AppManifest[], options: App
       } catch (error) {
         const failure = providerFailure(error);
         return { status: 503, reason: 'storage provider list failed', retryable: failure.retryable };
+      }
+    },
+    delete(input) {
+      if (closed) return reject(input.appSlug, 500, 'storage is closed');
+      const app = apps.get(input.appSlug);
+      if (!app) return reject(input.appSlug, 404, 'app storage is not configured');
+      if (input.role !== 'owner' || !app.roles.has('owner')) return reject(input.appSlug, 403, 'app owner role is required');
+      let fullKey: string;
+      try { fullKey = appObjectKey(input.appSlug, input.key); }
+      catch { return reject(input.appSlug, 400, 'invalid app slug or app-relative object key'); }
+      try {
+        quotaDb.exec('BEGIN IMMEDIATE');
+        try {
+          const ledgerRow = quotaDb.query('SELECT 1 AS present FROM app_storage_usage WHERE app_slug = ? AND object_key = ?')
+            .get(input.appSlug, fullKey) as { present: number } | null;
+          if (!headObject(fullKey).exists) {
+            if (!ledgerRow) {
+              quotaDb.exec('ROLLBACK');
+              return reject(input.appSlug, 404, 'object not found');
+            }
+            // The provider may have deleted the object before its response or the ledger commit failed.
+            // Repeating the owner request finishes that operation under the same quota lock.
+            quotaDb.query('DELETE FROM app_storage_usage WHERE app_slug = ? AND object_key = ?').run(input.appSlug, fullKey);
+            quotaDb.exec('COMMIT');
+            return record(input.appSlug, 0, { status: 200 });
+          }
+          store.delete(fullKey);
+          quotaDb.query('DELETE FROM app_storage_usage WHERE app_slug = ? AND object_key = ?').run(input.appSlug, fullKey);
+          quotaDb.exec('COMMIT');
+          return record(input.appSlug, 0, { status: 200 });
+        } catch (error) {
+          try { quotaDb.exec('ROLLBACK'); } catch { /* preserve the provider or database failure */ }
+          throw error;
+        }
+      } catch (error) {
+        const failure = store.provider === 'local' ? { status: 500 as const, retryable: false } : providerFailure(error);
+        return reject(input.appSlug, failure.status, 'storage provider delete failed', failure.retryable);
       }
     },
     signUploadUrl(input) {

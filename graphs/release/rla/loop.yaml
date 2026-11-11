@@ -7,7 +7,8 @@ card:
   extensions: [elanous.dev/arg]
 triggers:
   events: [gate.verdict, release.incident, run.failed]
-authority: [reroute, add-node, repair, hitl]
+# Source: RLA ARG RFC §2d — proposal authority only; D2/D3 actions require their separate board/human decisions.
+authority: [reroute, add-node, repair, hitl, skip-node, gate-waiver, regression-response, emergency-release]
 policy:
   scope: run
   proposal: validate-before-apply

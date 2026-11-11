@@ -1,0 +1,10 @@
+graph_id: demo-brief-to-requirements
+version: 1
+entry_node: convert
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: convert, kind: agent, recipe: 'cmd:convert', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: convert, on: outcome, map: { ok: done, fail: failed } }

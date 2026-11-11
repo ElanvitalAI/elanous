@@ -43,7 +43,7 @@ const WEBTERM_ALWAYS_EXTRA = [
   //    ⛔ BrowserOpen · BrowserScreenshot · BrowserClose 는 safety:['process'] 라 «담지 않는다».
   //    근거·머리말 = src/tool-surface.ts · src/boot/daemon-tools/index.ts
   'BrowserNavigate', 'BrowserRead',
-  ...(isDevHarnessModelSurfaceEnabled() ? ['RunDevHarness'] : []), 'SolveMission',
+  ...(isDevHarnessModelSurfaceEnabled() ? ['RunDevHarness'] : []),
   'WebTerminalList', 'WebTerminalSnapshot', 'WebTerminalInput', 'WebTerminalScreenshot',
   'LiveCameraFrame',
 ];

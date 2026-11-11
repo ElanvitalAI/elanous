@@ -16,6 +16,41 @@ import {
 } from './setup-keys.js';
 import { startFakeOpenAiCompatibleApi } from '../ux-sim/service-key-setup.js';
 import { withSimClock } from '../ux-sim/fake-clock.js';
+import { OPENROUTER_ONBOARDING_CHOICES } from './first-run/openrouter-picker.js';
+
+test('first-run OpenRouter BYOK selects one Solar profile from catalog and stores role defaults without key output', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'first-run-openrouter-'));
+  const configPath = join(root, 'config.json');
+  const env: NodeJS.ProcessEnv = { HOME: root };
+  const output: string[] = [];
+  const stored: Array<Record<string, string>> = [];
+  const key = 'onboarding-fixture-key-never-print';
+  const solar = OPENROUTER_ONBOARDING_CHOICES.findIndex((model) => model.id === 'solar-demo') + 1;
+  const io: SetupKeysIO = {
+    ask: async (prompt) => prompt.startsWith('선택:') ? '2' : prompt.startsWith('키 공급 선택:') ? '3' : String(solar),
+    askSecret: async () => key,
+    print: (line) => output.push(line),
+  };
+  try {
+    const result = await runFirstRun({
+      path: configPath, config: buildUserConfig(configPath), env, isTTY: true,
+      detectProviders: async () => [], print: (line) => output.push(line),
+      setupWhenNoProvider: (config) => runFirstRunProviderSetup(io, {
+        config, env, loginWithCodex,
+        verifier: async () => ({ success: true, verification: 'verified' }),
+        saveCredentialSlotBatch: async (values) => { stored.push(values); },
+      }),
+    });
+    expect(result).toEqual({ outcome: 'ready', provider: 'openrouter', inputs: 1 });
+    const saved = buildUserConfig(configPath);
+    expect(saved.llm).toMatchObject({ provider: 'openrouter', model: 'openrouter/upstage/solar-pro4' });
+    expect(saved.roleLlm?.implement).toEqual({ provider: 'openrouter', model: 'openrouter/upstage/solar-pro4' });
+    expect(saved.roleLlm?.research).toEqual({ provider: 'openrouter', model: 'openrouter/upstage/solar-mini4' });
+    expect(stored).toEqual([{ 'cred:openrouter.api_key': key }]);
+    expect(output.join('\n')).not.toContain(key);
+    expect(JSON.stringify(saved)).not.toContain(key);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test('setup proposes fake-home credentials without values and stores only the selected catalog slot', async () => {
   const root = mkdtempSync(join(tmpdir(), 'setup-keys-import-'));
@@ -163,6 +198,7 @@ test('first-run no-provider flow reaches ready through the production Codex OAut
     });
     expect(result).toEqual({ outcome: 'ready', provider: 'openai-codex', inputs: 1 });
     expect(buildUserConfig(configPath).onboarding.ready).toBe(true);
+    expect(buildUserConfig(configPath).roleLlm?.implement).toEqual({ provider: 'openai-codex' });
     expect(loadTokens('openai-codex')?.tokens.accessToken).toBe('sentinel-access-token');
     expect(paths.map(path => new URL(path).pathname)).toEqual([
       '/api/accounts/deviceauth/usercode', '/api/accounts/deviceauth/token', '/oauth/token',
@@ -177,6 +213,30 @@ test('first-run no-provider flow reaches ready through the production Codex OAut
   }
 });
 
+test('first-run menu offers a direct OpenRouter path and saves the chosen catalog model', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'setup-keys-openrouter-'));
+  const path = join(root, 'config.json');
+  const lines: string[] = [];
+  const env: NodeJS.ProcessEnv = {};
+  const qwen = OPENROUTER_ONBOARDING_CHOICES.findIndex((model) => model.id === 'qwen/qwen3.8-flash') + 1;
+  const io: SetupKeysIO = { ask: async (prompt) => prompt.startsWith('선택:') ? '2'
+    : prompt.startsWith('이 키를 사용할까요?') ? 'y' : String(qwen), print: line => lines.push(line) };
+  try {
+    const result = await runFirstRun({
+      path, config: buildUserConfig(path), isTTY: true,
+      env,
+      detectProviders: async () => [], getSecretAsync: async () => undefined,
+      setupWhenNoProvider: config => runFirstRunProviderSetup(io, { config, env, loginWithCodex,
+        readOpenRouterSecret: async () => 'synthetic-test-key' }),
+      print: line => lines.push(line),
+    });
+    expect(result).toEqual({ outcome: 'ready', provider: 'openrouter', inputs: 1 });
+    expect(buildUserConfig(path).llm.model).toBe('openrouter/qwen/qwen3.8-flash');
+    expect(buildUserConfig(path).roleLlm?.implement?.model).toBe('openrouter/qwen/qwen3.8-flash');
+    expect(lines.join('\n')).not.toContain('synthetic-test-key');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('first-run API-key setup selects the detected provider and keeps the key out of config', async () => {
   const root = mkdtempSync(join(tmpdir(), 'setup-keys-api-'));
   const fake = await startFakeOpenAiCompatibleApi('ok');
@@ -186,7 +246,7 @@ test('first-run API-key setup selects the detected provider and keeps the key ou
   let selectingProvider = false;
   const io: SetupKeysIO = {
     ask: async prompt => {
-      if (prompt.startsWith('선택:')) return '2';
+      if (prompt.startsWith('선택:')) return '3';
       if (prompt.startsWith('기본 공급자 번호')) { selectingProvider = true; return '1'; }
       return '';
     },
@@ -221,7 +281,7 @@ test('first-run API-key setup selects the detected provider and keeps the key ou
 test('first-run setup menu re-asks parser misses, then asks for setup without recording ready; blank Enter still skips', async () => {
   const root = mkdtempSync(join(tmpdir(), 'setup-keys-menu-misses-'));
   const output: string[] = [];
-  const answers = ['4', '1e0', '１'];
+  const answers = ['5', '1e0', '１'];
   const io: SetupKeysIO = {
     ask: async () => answers.shift() ?? '',
     askSecret: async () => '',

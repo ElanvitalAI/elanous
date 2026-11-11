@@ -3,21 +3,22 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
+import { parse as parseYaml } from 'yaml';
 import { getTestStateRoot, nexusRootDir, setTestStateRoot } from '../nexus/paths.js';
 import { stateDirSourceForChild } from '../agent/identity-env.js';
 import { parseAppManifest } from '../nexus/apps/app-contract.js';
 import { validateAppSimulation } from '../nexus/apps/app-simulate.js';
 import { runScenarioFile } from '../ux-sim/scenario.js';
 import { buildMockScenarioUserPackage, loadMockScenarioCatalog, renderMockScenarioDevices } from '../ux-sim/mock-scenario-catalog.js';
-import { createWorld, createWorldRegressionTargetRunner, destroyWorldById, loadWorld, runWorldScenario } from '../ux-sim/world.js';
+import { createWorld, createWorldRegressionTargetRunner, destroyWorldById, loadWorld, parseSimWorld, runWorldScenario } from '../ux-sim/world.js';
 import { createSimWorld, destroySimWorld, listSimWorlds } from '../ux-sim/world-store.js';
 import { restoreSimWorld, snapshotSimWorld } from '../ux-sim/world-snapshot.js';
-import { parseSimWorld } from '../ux-sim/world-schema.js';
 import { listMockDeviceRequests, renderMockDeviceRequests, requestMockDevice } from '../ux-sim/mock-device-requests.js';
 import { compareDeviceRecording, deviceFidelityStatus } from '../ux-sim/device-fidelity.js';
 import { readSimCoverage } from '../ux-sim/sim-coverage.js';
 import { readSimWorldWatchEvents, renderSimWorldWatchEvent } from '../ux-sim/world-watch.js';
 import { assertNetworkZeroSandboxAvailable } from '../ux-sim/network-sandbox.js';
+import { assertRealTargetGuards, assertScenarioTargetAllowed, resolveScenarioTarget, type ScenarioTargetDeclaration } from '../ux-sim/scenario-target.js';
 import { registerSimSuggestCommand } from './sim-suggest-cli.js';
 
 type UserSimulationProfile = { credentials: string; network: string; storage: string };
@@ -119,19 +120,31 @@ export function registerSimCommands(program: Command, simAppRuntime: SimAppRunti
   registerSimSuggestCommand(sim);
   sim.command('suite <folder>')
     .description('시나리오 묶음의 정규화 영수증을 기준과 대조한다')
-    .option('--target <target>', 'sim 또는 real', 'sim')
+    .option('--target <target>', 'sim 또는 real')
     .option('--update-baseline', '결정론 확인 후 기준 영수증 갱신')
-    .action(async (folder: string, opts: { target: string; updateBaseline?: boolean }) => {
+    .action(async (folder: string, opts: { target?: string; updateBaseline?: boolean }) => {
       const priorRoot = getTestStateRoot();
       const ownedRoot = priorRoot ? null : mkdtempSync(join(tmpdir(), 'elanous-sim-suite-'));
       try {
         if (ownedRoot) setTestStateRoot(ownedRoot);
-        if (opts.target !== 'sim' && opts.target !== 'real') throw new Error('suite target must be sim or real');
-        const { runWorldRegressionSuite } = await import('../ux-sim/world-regression-suite.js');
+        const suiteTarget = opts.target ?? 'sim';
+        if (suiteTarget !== 'sim' && suiteTarget !== 'real') throw new Error('suite target must be sim or real');
+        const { discoverSuiteCases, runWorldRegressionSuite } = await import('../ux-sim/world-regression-suite.js');
+        const cases = discoverSuiteCases(folder, suiteTarget);
+        for (const item of cases) {
+          const value = parseYaml(readFileSync(item.scenarioFile, 'utf8'));
+          if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`scenario must be an object: ${item.scenarioFile}`);
+          const scenario = value as Record<string, unknown>;
+          const selection = resolveScenarioTarget(scenario.target, opts.target);
+          assertScenarioTargetAllowed(selection.target, priorRoot);
+          assertRealTargetGuards({ target: scenario.target as ScenarioTargetDeclaration['target'],
+            real: scenario.real as ScenarioTargetDeclaration['real'] }, opts.target);
+          if (selection.target === 'real') throw new Error('real scenario execution requires R-FRAG-2 world runner wiring');
+        }
         const targetRunner = createWorldRegressionTargetRunner();
-        const run = opts.target === 'sim' || (opts.target === 'real' && process.env.ELANOUS_SIM_REAL_TARGET_ADAPTER)
+        const run = suiteTarget === 'sim' || (suiteTarget === 'real' && process.env.ELANOUS_SIM_REAL_TARGET_ADAPTER)
           ? targetRunner.run : undefined;
-        const result = await runWorldRegressionSuite({ folder, target: opts.target, updateBaseline: opts.updateBaseline,
+        const result = await runWorldRegressionSuite({ folder, target: suiteTarget, updateBaseline: opts.updateBaseline,
           ...(run ? { run } : {}) });
         if (result.differences.length === 0) console.log(`suite ${result.scenarios} scenario(s): no differences`);
         else for (const difference of result.differences) console.log(JSON.stringify(difference));

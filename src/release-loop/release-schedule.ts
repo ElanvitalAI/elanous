@@ -17,6 +17,34 @@ export interface ReleaseCutDueEvent {
   at: string;
 }
 
+/** Scheduling decision only. The sweep runner records a successful tick before supplying lastSweepAt again. */
+export function planIncrementalSweepTick(input: {
+  now: string;
+  cutAt: string;
+  lastSweepAt: string | null;
+  certificateMeasuredAt: number | null;
+  dirtyFiles: number;
+  intervalMs?: number;
+}): { reason: 'cadence' | 'pre-cut'; dueAt: string; certificateAgeMs: number | null; dirtyFiles: number } | null {
+  const now = Date.parse(input.now);
+  const cut = Date.parse(input.cutAt);
+  const last = input.lastSweepAt === null ? null : Date.parse(input.lastSweepAt);
+  const interval = input.intervalMs ?? 3 * 3_600_000;
+  if (!Number.isFinite(now) || !Number.isFinite(cut) || (last !== null && !Number.isFinite(last))
+    || !Number.isSafeInteger(interval) || interval <= 0
+    || !Number.isSafeInteger(input.dirtyFiles) || input.dirtyFiles < 0)
+    throw new Error('invalid incremental sweep tick input');
+  if (last !== null && last > now) throw new Error('last sweep is in the future');
+  const preCut = cut - 90 * 60_000;
+  const preCutDue = now >= preCut && now < cut && (last === null || last < preCut);
+  const cadenceDue = now < cut && (last === null || now - last >= interval);
+  if (!preCutDue && !cadenceDue) return null;
+  const measured = input.certificateMeasuredAt;
+  const certificateAgeMs = measured === null ? null : Number.isFinite(measured) && measured <= now ? now - measured : null;
+  return { reason: preCutDue ? 'pre-cut' : 'cadence', dueAt: new Date(preCutDue ? preCut : last === null ? now : last + interval).toISOString(),
+    certificateAgeMs, dirtyFiles: input.dirtyFiles };
+}
+
 function newerVersion(version: string, published: string): boolean {
   if (!published) return true;
   const left = version.split('.').map(Number), right = published.split('.').map(Number);

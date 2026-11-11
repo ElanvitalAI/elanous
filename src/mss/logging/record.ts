@@ -7,6 +7,7 @@
 // (`debug.log(category, event, data?)`) byte-identical.
 
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'critical';
+import type { Provenance } from '../../provenance/provenance.js';
 
 export const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
   trace: 0,
@@ -47,6 +48,8 @@ export interface LogRecord {
   parent_span_id?: string;
   elanous_id?: string;
   source?: LogSource;
+  /** Origin contract; absent historical rows are unknown and never real. */
+  provenance?: Provenance;
   pid?: number;
 }
 

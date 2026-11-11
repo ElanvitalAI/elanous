@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { ORIGINAL_ASK_MARKER } from '../self-implement/goal-author.js';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout, spyOn, test } from 'bun:test';
@@ -30,9 +30,11 @@ import { parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/po
 import { HostPoolLease } from '../pod-lease/host-lease.js';
 import { createFakeKubectl } from '../ux-sim/fake-kubectl.js';
 import { createFakeGh } from '../ux-sim/fake-gh.js';
+import { createTempGitRemote } from '../ux-sim/temp-git-remote.js';
 import { withSimClock } from '../ux-sim/fake-clock.js';
 import { podJobName, podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { Command } from 'commander';
+import { simCli } from '../ux-sim/in-process-cli.js';
 import { assessRunningRuns, buildRunProgressRows, renderRunProgressTable } from '../self-implement/running-runs.js';
 import type { RunningRunsResult } from '../self-implement/running-runs.js';
 import { launchRegistryDir, removeLaunchBinding, writeLaunchBinding } from './launch-registry.js';
@@ -1510,8 +1512,9 @@ describe.serial('harness CLI command', () => {
     expect(requests.filter((args) => args[0] === 'label' && args[1] === 'create')).toHaveLength(1);
   });
 
-  test('draft sweep completes a 301-row merged inventory across four closed-PR pages', async () => {
+  test('draft sweep completes a 1324-row merged inventory across every closed-PR page', async () => {
     const requests: string[][] = [];
+    const cliUpdatedAt = new Date().toISOString();
     const pr = (number: number, merged: boolean) => ({
       number, draft: false, title: `merged ${number}`, head: { ref: `self-impl/${number}` }, base: { ref: 'main' },
       labels: [], created_at: '2026-10-20T00:00:00Z', updated_at: '2026-10-23T00:00:00Z',
@@ -1520,15 +1523,33 @@ describe.serial('harness CLI command', () => {
     const execute = (args: string[]) => {
       requests.push(args);
       const endpoint = args[1] ?? '';
+      if (endpoint === 'graphql') {
+        const query = args.find((arg) => arg.startsWith('query=')) ?? '';
+        const repository: Record<string, unknown> = {};
+        for (const [, rawNumber] of query.matchAll(/p\d+: pullRequest\(number: (\d+)\)/g)) {
+          const number = Number(rawNumber);
+          repository[`p${number}`] = { number, headRefOid: 'a'.repeat(40),
+            headRef: { target: { committedDate: cliUpdatedAt } },
+            files: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+            comments: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } },
+            reviews: { totalCount: 0, nodes: [], pageInfo: { hasNextPage: false } }, mergeCommit: null };
+        }
+        return JSON.stringify({ data: { repository } });
+      }
+      if (endpoint.includes('/check-runs')) return JSON.stringify({ total_count: 0, check_runs: [] });
+      if (endpoint.includes('/reviews') || endpoint.includes('/comments')) return '[]';
       if (endpoint.includes('state=open')) return JSON.stringify([{
-        ...pr(1, false), draft: true, head: { ref: 'self-impl/open-draft' }, created_at: '2026-10-21T00:00:00Z', merged_at: null,
+        ...pr(1, false), draft: true, head: { ref: 'self-impl/open-draft' },
+        created_at: '2026-10-21T00:00:00Z', merged_at: null,
       }]);
       if (endpoint.includes('state=closed')) {
         const page = Number(/&page=(\d+)/.exec(endpoint)?.[1]);
-        if (page <= 3) return JSON.stringify(Array.from({ length: 100 }, (_, index) => pr((page - 1) * 100 + index + 1001, true)));
-        return JSON.stringify([pr(1301, true)]);
+        const pageRows = (numbers: number[]) => numbers.map((number) => pr(number, true));
+        if (page <= 13) return JSON.stringify(pageRows(Array.from({ length: 100 }, (_, index) => (page - 1) * 100 + index + 1001)));
+        if (page === 14) return JSON.stringify(pageRows(Array.from({ length: 24 }, (_, index) => 2301 + index)));
+        return JSON.stringify([]);
       }
-      throw new Error(`unexpected GitHub request: ${endpoint}`);
+      return '[]';
     };
     const executeAsync = async (args: string[]) => {
       const query = args.find((arg) => arg.startsWith('query=')) ?? '';
@@ -1549,20 +1570,18 @@ describe.serial('harness CLI command', () => {
       stdout: args[0] === 'config' ? 'https://github.com/my/repo.git' : '' });
     const adapters = githubDraftSweepPreviewAdapters({ maxInventoryPages: 100 }, execute, git, process.cwd(), executeAsync);
 
-    const merged = [
-      ...(await adapters.listMerged(1, 100, 'my/repo')),
-      ...(await adapters.listMerged(2, 100, 'my/repo')),
-      ...(await adapters.listMerged(3, 100, 'my/repo')),
-      ...(await adapters.listMerged(4, 100, 'my/repo')),
-    ];
+    const merged = (await Promise.all(Array.from({ length: 14 }, (_, index) =>
+      adapters.listMerged(index + 1, 100, 'my/repo')))).flat();
 
-    expect(merged).toHaveLength(301);
+    expect(merged).toHaveLength(1324);
+    expect(merged.at(-1)?.number).toBe(2324);
     expect((await adapters.inventoryStatus?.())?.complete).toBe(true);
-    expect(requests.filter((args) => args[1]?.includes('state=closed'))).toHaveLength(4);
+    expect(requests.filter((args) => args[1]?.includes('state=closed'))).toHaveLength(14);
     const stateRoot = mkdtempSync(join(tmpdir(), 'draft-sweep-301-state-'));
     const previousState = process.env.ELANOUS_STATE_DIR;
     const previousConfig = process.env.ELANOUS_CONFIG_DIR;
     const sweepRequests: string[][] = [];
+    let cliGit: ReturnType<typeof createTempGitRemote> | undefined;
     const sweepAdapters = githubDraftSweepPreviewAdapters({ maxInventoryPages: 100 }, (args) => {
       sweepRequests.push(args);
       return execute(args);
@@ -1573,7 +1592,69 @@ describe.serial('harness CLI command', () => {
       const classified = await runDraftSweep({ repository: 'my/repo', adapters: sweepAdapters, now: new Date('2026-10-24T00:00:00Z') });
       expect(classified).toMatchObject({ complete: true, apply: false });
       expect(classified.entries).toHaveLength(1);
-      expect(sweepRequests.filter((args) => args[1]?.includes('state=closed'))).toHaveLength(4);
+      expect(sweepRequests.filter((args) => args[1]?.includes('state=closed'))).toHaveLength(14);
+
+      cliGit = createTempGitRemote();
+      const cliRoot = cliGit.checkout;
+      cliGit.git(cliRoot, ['remote', 'set-url', 'origin', 'https://github.com/my/repo.git']);
+      const fakeBin = join(stateRoot, 'fake-bin');
+      const fakeGhFixture = join(stateRoot, 'fake-gh.json');
+      const fakeGhCalls = join(stateRoot, 'fake-gh-calls.jsonl');
+      mkdirSync(fakeBin, { recursive: true });
+      const cliNow = new Date();
+      const cliFixture = {
+        repository: 'my/repo',
+        prs: [
+          { number: 1, title: 'open draft', branch: 'self-impl/open-draft', draft: true,
+            createdAt: new Date(cliNow.getTime() - 60 * 60 * 1_000).toISOString(), updatedAt: cliNow.toISOString() },
+          ...Array.from({ length: 1_324 }, (_, index) => ({ number: index + 1_001,
+            title: `merged ${index + 1_001}`, branch: `self-impl/${index + 1_001}`,
+            createdAt: '2026-10-20T00:00:00Z', updatedAt: cliNow.toISOString(), mergedAt: '2026-10-22T00:00:00Z' })),
+        ],
+        calls: fakeGhCalls,
+      };
+      writeFileSync(fakeGhFixture, JSON.stringify(cliFixture));
+      writeFileSync(fakeGhCalls, '');
+      const fakeGhScript = join(fakeBin, 'gh');
+      const fakeGhModule = join(import.meta.dir, '../ux-sim/fake-gh.ts');
+      writeFileSync(fakeGhScript, [
+        '#!/usr/bin/env bun',
+        "import { appendFileSync, readFileSync } from 'node:fs';",
+        `import { createFakeGh } from ${JSON.stringify(fakeGhModule)};`,
+        'const fixturePath = process.env.SIM_GH_FIXTURE;',
+        'const callsPath = process.env.SIM_GH_CALLS;',
+        'if (!fixturePath || !callsPath) throw new Error("sim fake gh fixture paths are required");',
+        'const args = process.argv.slice(2);',
+        'appendFileSync(callsPath, JSON.stringify(args) + "\\n");',
+        'try { process.stdout.write(createFakeGh(JSON.parse(readFileSync(fixturePath, "utf8"))).api(args)); }',
+        'catch (error) { process.stderr.write(String(error)); process.exitCode = 1; }',
+        '',
+      ].join('\n'));
+      chmodSync(fakeGhScript, 0o755);
+      const readGhCalls = () => readFileSync(fakeGhCalls, 'utf8').trim().split('\n').filter(Boolean)
+        .map((line) => JSON.parse(line) as string[]);
+      const runCli = async (maxMerged?: number) => {
+        writeFileSync(fakeGhCalls, '');
+        const args = ['harness', 'drafts', 'sweep', '--repo', 'my/repo', '--max-pages', '100', '--max-drafts', '300'];
+        if (maxMerged !== undefined) args.push('--max-merged', String(maxMerged));
+        const result = await simCli(args, {
+          allowPaths: [['harness', 'drafts', 'sweep']],
+          cwd: cliRoot,
+          env: { ...cliGit!.gitEnv, PATH: `${fakeBin}:${process.env.PATH ?? ''}`, SIM_GH_FIXTURE: fakeGhFixture, SIM_GH_CALLS: fakeGhCalls },
+        });
+        return { output: `${result.stdout}\n${result.stderr}`, pages: readGhCalls().filter((request) => request.some((arg) => arg.includes('state=closed'))) };
+      };
+      const uncappedCli = await runCli();
+      expect(uncappedCli.output).toContain('draft sweep my/repo: complete · dry-run');
+      expect(uncappedCli.pages).toHaveLength(14);
+      expect(uncappedCli.pages.some((request) => request.some((arg) => arg.includes('page=14')))).toBe(true);
+      const cappedCli = await runCli(1_000);
+      expect(cappedCli.output).toContain('incomplete (merged PR inventory capped at 1000 records (1324 records listed))');
+      expect(cappedCli.pages).toHaveLength(14);
+      expect(cappedCli.pages.some((request) => request.some((arg) => arg.includes('page=14')))).toBe(true);
+      expect(readGhCalls().some((args) => args[0] === 'pr' && ['edit', 'close'].includes(args[1] ?? '')
+        || args[0] === 'api' && args.some((arg) => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(arg)))).toBe(false);
+      expect(cliGit.git(cliRoot, ['status', '--porcelain'])).toBe('');
 
       const cappedRequests: string[][] = [];
       const cappedAdapters = githubDraftSweepPreviewAdapters({ maxInventoryPages: 100, maxMerged: 1 }, (args) => {
@@ -1583,9 +1664,10 @@ describe.serial('harness CLI command', () => {
       const capped = await runDraftSweep({ repository: 'my/repo', adapters: cappedAdapters, apply: true,
         now: new Date('2026-10-24T00:00:00Z') });
       expect(capped).toMatchObject({ complete: false, apply: true,
-        error: 'merged PR inventory capped at 1 records (301 records listed)' });
+        error: 'merged PR inventory capped at 1 records (1324 records listed)' });
       expect(cappedRequests.some((args) => args[0] === 'pr' || args[1]?.startsWith('repos/my/repo/issues/'))).toBe(false);
     } finally {
+      cliGit?.cleanup();
       if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previousState;
       if (previousConfig === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previousConfig;
       rmSync(stateRoot, { recursive: true, force: true });

@@ -29,6 +29,8 @@ export interface AdaptiveHealInput {
   sourceOutcome?: GateResult['outcome'] | 'fail';
   gateExecutor?: 'host' | 'pod';
   gatePodPool?: string;
+  /** New receipt-audit graph: two automatic repair rounds and audit reentry. */
+  autoAppendRepair?: boolean;
   /** Actual visits already consumed when this node executes; absence is unmeasured and fails closed. */
   visitState?: { gate: number; gateTriage: number };
   /** Optional bounded repair-ladder facts supplied by the release-loop adapter. */
@@ -53,10 +55,10 @@ export interface AdaptiveGateImageRepairNode {
 }
 
 export type AdaptiveHealDisposition =
-  | { action: 'append-repair-and-resume'; repairNode: AdaptiveGateRepairNode; resumeFrom: string; rerunGateAt: 'gate'; visitState: { gate: number; gateTriage: number }; visitLimits: { gate: 2; gateTriage: 2 }; maxRepairRetries: 1 }
-  | { action: 'append-image-repair-and-resume'; repairNode: AdaptiveGateImageRepairNode; resumeFrom: string; rerunGateAt: 'gate'; visitState: { gate: number; gateTriage: number }; visitLimits: { gate: 2; gateTriage: 2 }; maxRepairRetries: 1 }
+  | { action: 'append-repair-and-resume'; repairNode: AdaptiveGateRepairNode; resumeFrom: string; rerunGateAt: 'gate'; auditAfterGate?: string; visitState: { gate: number; gateTriage: number }; visitLimits: { gate: 2 | 3; gateTriage: 2 | 3 }; maxRepairRetries: 1 }
+  | { action: 'append-image-repair-and-resume'; repairNode: AdaptiveGateImageRepairNode; resumeFrom: string; rerunGateAt: 'gate'; auditAfterGate?: string; visitState: { gate: number; gateTriage: number }; visitLimits: { gate: 2 | 3; gateTriage: 2 | 3 }; maxRepairRetries: 1 }
   | { action: 'rerun-pod'; reason: string; resumeFrom: 'gate'; gatePodPool: string;
-      visitState: { gate: number; gateTriage: number }; visitLimits: { gate: 2; gateTriage: 2 } }
+      visitState: { gate: number; gateTriage: number }; visitLimits: { gate: 2 | 3; gateTriage: 2 | 3 } }
   | { action: 'decision-required'; reason: string }
   | { action: 'no-op'; reason: string };
 
@@ -89,7 +91,9 @@ export function planAdaptiveGateHeal(input: AdaptiveHealInput): AdaptiveGateHeal
   ];
   let macrophageRepairLadder: MacrophageRepairLadderDecision | undefined;
   const visitState = input.visitState;
-  const visitLimits = { gate: 2 as const, gateTriage: 2 as const };
+  const visitLimits = input.autoAppendRepair
+    ? { gate: 3 as const, gateTriage: 3 as const }
+    : { gate: 2 as const, gateTriage: 2 as const };
   if (!visitState || !Number.isSafeInteger(visitState.gate) || !Number.isSafeInteger(visitState.gateTriage)
     || visitState.gate < 1 || visitState.gateTriage < 1
     || visitState.gate >= visitLimits.gate || visitState.gateTriage >= visitLimits.gateTriage) {
@@ -148,7 +152,7 @@ export function planAdaptiveGateHeal(input: AdaptiveHealInput): AdaptiveGateHeal
     const repairNode: AdaptiveGateImageRepairNode = { nodeId, kind: 'agent', recipe: 'cmd:gate-image-repair', maxVisits: 1,
       input: { version: input.version, runId: input.runId, commit: triage.commit, pool: input.gatePodPool, failureCode: failureCode! } };
     const disposition = { action: 'append-image-repair-and-resume' as const, repairNode, resumeFrom: nodeId,
-      rerunGateAt: 'gate' as const, visitState, visitLimits, maxRepairRetries: 1 as const };
+      rerunGateAt: 'gate' as const, ...(input.autoAppendRepair ? { auditAfterGate: 'receipt-audit' } : {}), visitState, visitLimits, maxRepairRetries: 1 as const };
     events.push(
       { name: 'heal.image-repair-node.planned', data: { nodeId, commit: triage.commit, pool: input.gatePodPool } },
       { name: 'heal.graph-append.planned', data: { after: 'gate-triage', nodeId } },
@@ -171,12 +175,14 @@ export function planAdaptiveGateHeal(input: AdaptiveHealInput): AdaptiveGateHeal
     const repairNode: AdaptiveGateRepairNode = { nodeId, kind: 'agent', recipe: 'cmd:gate-repair', maxVisits: 1,
       input: { version: input.version, runId: input.runId, commit: triage.commit,
         ...(triage.gateExecutionId ? { gateExecutionId: triage.gateExecutionId } : {}), failureIds } };
+    // A repaired cut must be measured by a fresh gate execution before receipt audit consumes it.
+    const rerunGateAt = 'gate' as const;
     const disposition = { action: 'append-repair-and-resume' as const, repairNode, resumeFrom: nodeId,
-      rerunGateAt: 'gate' as const, visitState, visitLimits, maxRepairRetries: 1 as const };
+      rerunGateAt, ...(input.autoAppendRepair ? { auditAfterGate: 'receipt-audit' } : {}), visitState, visitLimits, maxRepairRetries: 1 as const };
     events.push(
       { name: 'heal.repair-node.planned', data: { nodeId, failureIds } },
       { name: 'heal.graph-append.planned', data: { after: 'gate-triage', nodeId } },
-      { name: 'heal.resume.decided', data: { from: nodeId, rerunGateAt: 'gate' } },
+      { name: 'heal.resume.decided', data: { from: nodeId, rerunGateAt } },
     );
     return { attribution, disposition, events, ...(macrophageRepairLadder ? { macrophageRepairLadder } : {}) };
   }

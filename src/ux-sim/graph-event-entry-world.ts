@@ -1,16 +1,17 @@
-import { createGraphEventBus, type GraphEvent } from '../graph-runner/graph-events.js';
+import { dispatchDeclaredGraphExternalEvent, type GraphEvent } from '../graph-runner/graph-events.js';
 import type { GraphRunState } from '../graph-runner/runner.js';
 import { createGraphTriggerHookDevice } from './graph-trigger-hook-device.js';
 
 export interface GraphExternalEventDelivery {
   readonly eventId: string;
-  readonly type: 'batch-closed';
+  readonly type: string;
   readonly sequence: number;
   readonly dedupeKey: string;
   readonly at: string;
   readonly payload: Readonly<Record<string, unknown>>;
 }
 
+/** Public compatibility type retained for callers; this simulator now exercises production dispatch directly. */
 export type GraphEventEntryAdapter = (input: {
   readonly event: GraphExternalEventDelivery;
   readonly start: () => Promise<GraphRunState>;
@@ -23,35 +24,44 @@ export const graphExternalEventScript: readonly GraphExternalEventDelivery[] = [
   { eventId: 'event-12', type: 'batch-closed', sequence: 12, dedupeKey: 'batch-12', at: '2026-11-10T08:00:02.000Z', payload: { batch: 'B-12' } },
 ];
 
-/** External entry is adapter-owned; the real graph event bus is separately scoped to an existing run. */
+/** Real graph dispatch and event bus; only clock, recipe process, and filesystem roots are simulated. */
 export function createGraphEventEntryWorld(source: string) {
   const ingress = createGraphTriggerHookDevice(source);
-  const internalBus = createGraphEventBus({ now: ingress.now });
+  const internalBus = ingress.eventBus;
   internalBus.registerType('batch-closed');
   const internalEvents: GraphEvent[] = [];
   internalBus.subscribe(event => { internalEvents.push(event); });
   const observations: Array<{ event: GraphExternalEventDelivery; decision: string; starts: string[]; runId?: string; reason?: string }> = [];
   const startedRuns = new Map<string, GraphRunState>();
+  const calls: GraphExternalEventDelivery[] = [];
   return {
-    calls: ingress.calls,
+    calls,
     runnerEvents: ingress.events,
     internalEvents,
     observations,
-    async deliver(event: GraphExternalEventDelivery, adapter: GraphEventEntryAdapter) {
+    async deliver(event: GraphExternalEventDelivery) {
       ingress.advanceTo(event.at);
-      const starts: string[] = [];
-      const decision = await adapter({ event, start: async () => {
-        const run = await ingress.fire('event', { ...event.payload, eventId: event.eventId, dedupeKey: event.dedupeKey });
-        starts.push(run.runId);
-        startedRuns.set(run.runId, run);
-        return run;
-      } });
-      const observation = { event, starts, ...decision };
+      calls.push(event);
+      const result = await dispatchDeclaredGraphExternalEvent(ingress.graphPath, event, {
+        registryRoot: ingress.stateRoot, stateRoot: ingress.stateRoot, runRoot: ingress.stateRoot,
+        createRunId: () => `sim-${event.eventId}`,
+        now: () => ingress.now().getTime(),
+        eventNow: ingress.now,
+        graphRunOptions: { eventBus: internalBus, quiet: true, deps: {
+          releaseGraphEventAdapters: false,
+          // Source: this fake recipe process returns the graph's success envelope without launching a shell.
+          runBash: async () => ({ stdout: '{"outcome":"ok"}', stderr: '', exitCode: 0 }),
+        } },
+      });
+      const starts = result.disposition === 'started' || result.disposition === 'resumed' ? [result.runId] : [];
+      if (result.disposition !== 'ignored' && result.state) startedRuns.set(result.runId, result.state);
+      const observation: { event: GraphExternalEventDelivery; decision: string; starts: string[]; runId?: string; reason?: string } = { event, starts, decision: result.disposition,
+        ...(result.disposition === 'ignored' ? { reason: result.reason } : { runId: result.runId }) };
       observations.push(observation);
       return observation;
     },
-    async play(adapter: GraphEventEntryAdapter) {
-      for (const event of graphExternalEventScript) await this.deliver(event, adapter);
+    async play() {
+      for (const event of graphExternalEventScript) await this.deliver(event);
       return observations;
     },
     async publishInsideRun(runId: string, eventId: string, sourceNodeId: string) {
@@ -59,10 +69,8 @@ export function createGraphEventEntryWorld(source: string) {
       if (!run) throw new Error(`event world has no started run: ${runId}`);
       if (!run.nodes.some(node => node.nodeId === sourceNodeId && node.executed))
         throw new Error(`event world source node was not executed: ${sourceNodeId}`);
-      const event = await internalBus.publish({
-        graphId: run.graphId, runId: run.runId, eventId, type: 'batch-closed',
-        source: { kind: 'node', nodeId: sourceNodeId }, data: { origin: 'node-subscription' },
-      });
+      const event = await internalBus.publish({ graphId: run.graphId, runId: run.runId, eventId, type: 'batch-closed',
+        source: { kind: 'node', nodeId: sourceNodeId }, data: { origin: 'node-subscription' } });
       await internalBus.flush({ graphId: run.graphId, runId: run.runId });
       return event;
     },

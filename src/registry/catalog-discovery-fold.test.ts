@@ -58,6 +58,8 @@ describe('로더 통합 — 실제 builtin 카탈로그 위에서', () => {
     expect(orModels.map((m) => m.id).sort()).toEqual([
       'openrouter/deepseek/deepseek-v4-pro-0813',
       'openrouter/deepseek/deepseek-v4.1-flash',
+      'openrouter/upstage/solar-mini4',
+      'openrouter/upstage/solar-pro4',
       'openrouter/z-ai/glm-5.3-flash',
     ]);
     expect(cat.providers.get('openrouter')?.catalogFromDiscovery).toBe(true);

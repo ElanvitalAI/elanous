@@ -1,0 +1,4 @@
+{
+  "deviceKey": "fake-llm",
+  "review": "> 📅 **2026-11-11 재검토 (ABSORB-4 · NEXT-TUI-TOOL-NOISE-ENCAPSULATION)** — 표지된 사람 발화에 유한한 ordered tool-call sequence를 주입해 실제 TUI PTY의 3-child 완료 카드 비교에 사용한다. 자격 증명·실제 provider 호출은 없다."
+}

@@ -1,0 +1,20 @@
+{
+  "memberId": "demo-member",
+  "briefing": {
+    "id": "brief-ticketing",
+    "memberId": "demo-member",
+    "groups": [
+      { "title": "접속 폭주 시 공정한 대기열", "scrapId": "scrap-ticketing-article" },
+      { "title": "같은 좌석 중복 예매 0건과 결제 실패 복구", "scrapId": "scrap-ticketing-article" }
+    ],
+    "todos": [],
+    "scrapIds": ["scrap-ticketing-article"]
+  },
+  "suggestion": {
+    "id": "suggest-ticketing-app",
+    "appId": "concert-ticketing",
+    "change": "콘서트 티켓팅 서비스 만들기",
+    "evidenceScrapIds": ["scrap-ticketing-article"]
+  },
+  "build": { "status": "done", "suggestionId": "suggest-ticketing-app", "memberId": "demo-member" }
+}

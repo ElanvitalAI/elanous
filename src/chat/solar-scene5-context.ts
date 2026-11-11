@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { isRecord } from '../primitives/guards.js';
 
 export const SOLAR_SCENE5_QUESTION = '오늘 데모에서 확인한 사실과 아직 확인하지 못한 사실을 각각 두 항목으로 구분해 한국어로 써 주세요.';
 
@@ -8,10 +9,6 @@ interface GraphReceipt {
   status: string;
   path: string[];
   nodes: Array<{ nodeId: string; ok: boolean; executed: boolean }>;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function cleanLine(value: string): string {

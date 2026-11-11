@@ -1,5 +1,6 @@
 {
   "src/graph-runner/runner.ts": [
+    "ApprovedGraphNodeInputCheck",
     "ExpectedGraphApprovalVisit",
     "GRAPH_GROWTH_SCOPE_ENV",
     "GraphClassifyInput",
@@ -18,6 +19,7 @@
     "decideGraphApproval",
     "forkGraphRun",
     "graphRunAlive",
+    "hasApprovedGraphNodeInput",
     "lastJsonObject",
     "latestGraphRun",
     "listGraphRuns",

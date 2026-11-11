@@ -77,7 +77,7 @@ test('registers harness orchestrate and plan while preserving all existing sixte
     { id: 'tui-slash-dev', surface: 'slash', status: 'live', stampability: 'structurally-unstampable', stampabilityEvidenceFilePath: undefined, verification: { actualMission: 'verified', legacyParity: 'unknown' } },
     { id: 'nl-self-implement', surface: 'nl', status: 'live', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/boot/daemon-tools/self-implement-names.ts', verification: { actualMission: 'verified', legacyParity: 'verified' } },
     { id: 'nl-self-orchestrate', surface: 'nl', status: 'retired', stampability: 'unknown', stampabilityEvidenceFilePath: undefined, verification: unknownVerification },
-    { id: 'nl-solve-mission', surface: 'nl', status: 'live', stampability: 'structurally-unstampable', stampabilityEvidenceFilePath: undefined, verification: unknownVerification },
+    { id: 'nl-solve-mission', surface: 'nl', status: 'retired', stampability: 'structurally-unstampable', stampabilityEvidenceFilePath: undefined, verification: unknownVerification },
     { id: 'nl-run-dev-harness', surface: 'nl', status: 'retired', stampability: 'structurally-unstampable', stampabilityEvidenceFilePath: undefined, verification: unknownVerification },
     { id: 'daemon-self-implement', surface: 'daemon', status: 'live', stampability: 'stampable', stampabilityEvidenceFilePath: 'src/boot/daemon-tools/self-implement-names.ts', verification: unknownVerification },
   ];
@@ -93,7 +93,7 @@ test('registers harness orchestrate and plan while preserving all existing sixte
   }
   const driveEntrance = lookupEntrance('cli-drive');
   expect(ENTRANCE_REGISTRY.some((entrance) => entrance === driveEntrance)).toBe(true);
-  expect(summarizeEntrances()).toMatchObject({ total: 19, live: 11, retired: 5, closed: 3 });
+  expect(summarizeEntrances()).toMatchObject({ total: 19, live: 10, retired: 6, closed: 3 }); // Source: src/self-dev/entrance-registry.ts ENTRANCE_REGISTRY.
   expect(summarizeEntrances().bySurface.find((surface) => surface.surface === 'cli')).toEqual({ surface: 'cli', total: 10, retired: 2 });
 });
 
@@ -139,7 +139,7 @@ test('catalog-backed model exposure keeps missing distinct from false and preser
       { id: 'tui-slash-dev', surface: 'slash', status: 'live', stampabilityEvidenceSource: 'structural-absence', stampabilityEvidenceSourceFilePath: undefined, evidenceSourceFilePath: undefined, modelExposed: undefined },
       { id: 'nl-self-implement', surface: 'nl', status: 'live', stampabilityEvidenceSource: 'self-implement-tool-names', stampabilityEvidenceSourceFilePath: 'src/boot/daemon-tools/self-implement-names.ts', evidenceSourceFilePath: 'src/boot/daemon-tools/self-implement-names.ts', modelExposed: true },
       { id: 'nl-self-orchestrate', surface: 'nl', status: 'retired', stampabilityEvidenceSource: 'unverified', stampabilityEvidenceSourceFilePath: undefined, evidenceSourceFilePath: undefined, modelExposed: false },
-      { id: 'nl-solve-mission', surface: 'nl', status: 'live', stampabilityEvidenceSource: 'structural-absence', stampabilityEvidenceSourceFilePath: undefined, evidenceSourceFilePath: undefined, modelExposed: true },
+      { id: 'nl-solve-mission', surface: 'nl', status: 'retired', stampabilityEvidenceSource: 'structural-absence', stampabilityEvidenceSourceFilePath: undefined, evidenceSourceFilePath: undefined, modelExposed: undefined },
       { id: 'nl-run-dev-harness', surface: 'nl', status: 'retired', stampabilityEvidenceSource: 'structural-absence', stampabilityEvidenceSourceFilePath: undefined, evidenceSourceFilePath: undefined, modelExposed: undefined },
       { id: 'daemon-self-implement', surface: 'daemon', status: 'live', stampabilityEvidenceSource: 'self-implement-tool-names', stampabilityEvidenceSourceFilePath: 'src/boot/daemon-tools/self-implement-names.ts', evidenceSourceFilePath: 'src/boot/daemon-tools/self-implement-names.ts', modelExposed: undefined },
       { id: 'daemon-harness-ask', surface: 'daemon', status: 'live', stampabilityEvidenceSource: 'entrance-registry', stampabilityEvidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', evidenceSourceFilePath: 'src/self-dev/entrance-registry.ts', modelExposed: undefined },
@@ -231,7 +231,7 @@ test('⭐ 사람이 읽는 화면이 은퇴를 «조용히 섞지» 않는다', 
   expect(rendered).toContain('cli-harness-run (stampable) verification=actualMission:unknown,legacyParity:unknown imprintEvidence=CLI_HARNESS_RUN_ENTRANCE evidenceSource=entrance-registry evidenceSourceFilePath=src/self-dev/entrance-registry.ts modelExposed=missing');
   expect(rendered).toContain('nl-self-implement (stampable) verification=actualMission:verified,legacyParity:verified imprintEvidence=SELF_IMPLEMENT_TOOL_NAMES evidenceSource=self-implement-tool-names evidenceSourceFilePath=src/boot/daemon-tools/self-implement-names.ts modelExposed=true');
   expect(rendered).toContain('nl-self-orchestrate (unknown) verification=actualMission:unknown,legacyParity:unknown imprintEvidence=unknown evidenceSource=unverified evidenceSourceFilePath=missing modelExposed=false');
-  expect(rendered).toContain('nl-solve-mission (structurally-unstampable) verification=actualMission:unknown,legacyParity:unknown imprintEvidence=none evidenceSource=structural-absence evidenceSourceFilePath=missing modelExposed=true');
+  expect(rendered).toContain('nl-solve-mission (structurally-unstampable) verification=actualMission:unknown,legacyParity:unknown imprintEvidence=none evidenceSource=structural-absence evidenceSourceFilePath=missing modelExposed=missing');
   for (const entrance of ENTRANCE_REGISTRY) {
     expect(rendered).toContain(entrance.id);
     // 은퇴한 것은 «표시»가 붙어야 한다.
@@ -304,7 +304,7 @@ test('runEntrancesAction consumes the registry that now renders harness ask and 
     .toMatchObject({ id: 'cli-harness-plan', verification: { actualMission: 'verified', legacyParity: 'unknown' }, imprintEvidence: 'CLI_HARNESS_PLAN_ENTRANCE' });
 
   const rendered = renderLaunchEntrances();
-  expect(rendered).toContain('launch entrances: 19 (live 11 · retired 5 · closed 3)');
+  expect(rendered).toContain('launch entrances: 19 (live 10 · retired 6 · closed 3)'); // Source: src/self-dev/entrance-registry.ts ENTRANCE_REGISTRY.
   expect(rendered).toContain('닫힘');
   expect(rendered).toContain('cli-drive (structurally-unstampable)');
   // ⭐ 2026-08-22: ask/say 두 입구가 «자기 이름을» 각인하게 됐다(#11462 가 인자를 열고 #11470 이 넘겼다).

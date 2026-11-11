@@ -1,0 +1,219 @@
+{
+  "kind": "knowledge-pack",
+  "name": "system-architecture-public",
+  "version": "0.1.0",
+  "description": "한국어 원저작 시스템 설계 결정 카드: 3계층, 이벤트·큐, CQRS·이벤트 소싱, 마이크로서비스·메시, 서버리스, 데이터 파이프라인·스트리밍, 검색, 실시간 채팅·알림, 미디어 처리, 멀티 테넌트 SaaS, ML 서빙, 캐시·샤딩·rate limit·멱등성·outbox·격리 패턴. 3줄 설계 요구에서 관련 카드를 선택한다.",
+  "signature": {
+    "alg": "ed25519",
+    "keyId": "00000000"
+  },
+  "dependencies": [],
+  "license": "CC-BY-4.0",
+  "visibility": "public",
+  "content": [
+    {
+      "type": "document",
+      "path": "content/three-tier-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/three-tier-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/three-tier-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/three-tier-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/event-queue-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/event-queue-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/event-queue-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/event-queue-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/cqrs-event-sourcing-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/cqrs-event-sourcing-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/cqrs-event-sourcing-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/cqrs-event-sourcing-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/microservices-mesh-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/microservices-mesh-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/microservices-mesh-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/microservices-mesh-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/serverless-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/serverless-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/serverless-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/serverless-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/data-pipeline-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/data-pipeline-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/data-pipeline-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/data-pipeline-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/search-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/search-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/search-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/search-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/realtime-chat-notify-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/realtime-chat-notify-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/realtime-chat-notify-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/realtime-chat-notify-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/file-media-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/file-media-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/file-media-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/file-media-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/multi-tenant-saas-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/multi-tenant-saas-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/multi-tenant-saas-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/multi-tenant-saas-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/ml-serving-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/ml-serving-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/ml-serving-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/ml-serving-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/shared-patterns-01.json"
+    },
+    {
+      "type": "document",
+      "path": "content/shared-patterns-02.json"
+    },
+    {
+      "type": "document",
+      "path": "content/shared-patterns-03.json"
+    },
+    {
+      "type": "document",
+      "path": "content/shared-patterns-04.json"
+    },
+    {
+      "type": "document",
+      "path": "content/shared-patterns-05.json"
+    },
+    {
+      "type": "document",
+      "path": "content/shared-patterns-06.json"
+    },
+    {
+      "type": "document",
+      "path": "content/shared-patterns-07.json"
+    }
+  ]
+}

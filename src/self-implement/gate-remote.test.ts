@@ -7,7 +7,7 @@ import { withFakeBins } from '../ux-sim/fake-bin.js';
 import { debug } from '../debug/log.js';
 import {
   annotateJsonStdout, decideGateDispatch, dispatchHeavyCheck, extractGateRemoteFlags, GATE_REMOTE_DEFAULTS, relativizeArgs,
-  gateRemoteHostCap, gateReservationAlternateHosts, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, remoteSelfGateArgv, remoteSupervisorScript, resolveGateRemoteSettings, resolveGatePrBase, runOnRemote, type GateRemoteRunner, type SshResult,
+  gateRemoteHostCap, gateReservationAlternateHosts, hostSlotScript, isValidGateHost, looksLikeHost, outsideRepoArgs, unreproducibleArgs, remoteScript, remoteSelfGateArgv, remoteSupervisorScript, resolveGateRemoteSettings, resolveGatePrBase, runOnRemote, type DispatchOptions, type GateRemoteRunner, type SshResult,
 } from './gate-remote.js';
 import { parseGateRemoteConfig } from '../user-config.js';
 import { readGateHostResources, reserveReleaseGateHosts, type GateHostResourceReading } from '../release-loop/gate-host-reservation.js';
@@ -740,6 +740,26 @@ describe('self gate explicit remote placement', () => {
       expect(io.err.join('')).not.toContain('using node-c');
     } finally { release(); }
   });
+
+  test.each(['ci-typecheck-changed', 'public-export-test-run'] as const)(
+    '%s refuses a reserved aws1 and names alternate test hosts, then runs when free', async (tool) => {
+      const root = slotDir();
+      const release = reserveReleaseGateHosts(root, 'release-gate-fixture', ['aws1']);
+      const runner = fakeRunner();
+      const io = sink();
+      const opts: DispatchOptions = { tool, repo: '/r', flags: { local: false, remote: 'aws1' },
+        reservationRoot: root, explicitRemoteOnly: true, remoteArgv: ['x'], runLocal: () => { throw new Error('remote only'); } };
+      try {
+        expect(await dispatchHeavyCheck(opts, { runner, settings, env: {}, load1: 1, write: io.write })).toBe(1);
+        expect(runner.calls.some(([kind]) => kind === 'ssh')).toBe(false);
+        expect(io.err.join('')).toContain('host-reserved: aws1');
+        expect(io.err.join('')).toContain('--remote aws2');
+        expect(io.err.join('')).toContain('--remote minim5');
+      } finally { release(); }
+      const free = sink();
+      expect(await dispatchHeavyCheck(opts, { runner, settings, env: {}, load1: 1, write: free.write })).toBe(0);
+      expect(runner.calls.some(([kind, host]) => kind === 'ssh' && host === 'aws1')).toBe(true);
+    });
 
   test.each([['node-b', 'node-b'], [true, 'node-b']] as const)(
     'a release reservation reroutes self gate %s to the free WSL host without local execution', async (remote, reservedHost) => {

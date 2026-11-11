@@ -94,6 +94,10 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
     turnProfile: unknown;
     userConfig: any;
   }) => unknown[];
+  /** Optional architecture scene bridge. Called before the model so cited KGS cards can inform its answer. */
+  prepareArchitectureContext?: (userText: string) => Promise<string | null>;
+  /** Runs the declared output graph after a completed model turn. */
+  deliverArchitecture?: (userText: string, fullResponse: string) => Promise<string | null>;
   runAutoCompact: (args: {
     preamble: unknown[];
     chatHistory: unknown[];
@@ -294,6 +298,8 @@ export async function runDashboardChatMainPlainTurn(
       turnProfile,
       userConfig,
     });
+    const architectureContext = await deps.prepareArchitectureContext?.(userText);
+    if (architectureContext) preamble.push({ role: 'system', content: architectureContext });
 
     let prePassApplied = false;
     await deps.runAutoCompact({
@@ -666,6 +672,15 @@ ${summary}` }] : []),
     }
 
     await deps.runTailAutoCopy(userText, fullResponse);
+    if (finalStatus === 'completed' && fullResponse.trim() && deps.deliverArchitecture) {
+      try {
+        const receipt = await deps.deliverArchitecture(userText, fullResponse);
+        if (receipt) deps.pushChatLine(`  📐 설계 산출 검증: ${receipt}`);
+      } catch (error) {
+        deps.pushChatLine(deps.warningLine(`설계 산출 실패: ${error instanceof Error ? error.message : String(error)}`));
+      }
+      deps.draw();
+    }
     await deps.runCodeEditPostTurn();
 
     await deps.runHandoffMirror(

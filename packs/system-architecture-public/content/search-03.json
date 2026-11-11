@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "검색 — 샤드와 복제본",
+  "source": "https://learn.microsoft.com/en-us/azure/architecture/patterns/sharding",
+  "body": "적용 시점: 단일 인덱스의 저장·검색 처리량이 실측 용량을 넘을 때.\n용량 단계: 단일 인덱스로 시작; 검색어·테넌트 skew와 shard 크기를 측정한 뒤 파티션한다.\nGCP 대응: 관리형 검색 서비스의 shard/replica 설정 또는 테넌트별 인덱스; 구체 옵션은 제품 계약에 맞춘다.\n비용 축: replica는 읽기와 가용성에, shard는 분산 용량에 비용을 추가한다.\n결정과 반증: 일반 질의·핫키 질의·노드 상실에서 latency와 재배치 시간을 비교한다."
+}

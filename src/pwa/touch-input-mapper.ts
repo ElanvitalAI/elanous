@@ -15,7 +15,7 @@
 // Pure stateless mapper — host 가 (touchstart, touchmove, touchend)
 // 를 sequence 로 넘기면 detector 가 적절한 intent kind 결정.
 
-import type { SerializableSurfaceIntent } from '../dashboard/terminal-surface-intent.js';
+import type { SerializableSurfaceIntent } from '../surface/terminal-surface-intent.js';
 import type { TerminalExposureSnapshot, TerminalSurfaceCapability } from '../terminal/posture.js';
 
 export interface TouchPoint {

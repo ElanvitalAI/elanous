@@ -1,0 +1,25 @@
+{
+  "id": "gcp-architect-tiered-design",
+  "name": "GCP architect tiered design simulation",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/gcp-architect-expand/tiered-design.ts"
+  ],
+  "tests": [
+    "src/ux-sim/gcp-architect-expand/tiered-design.test.ts"
+  ],
+  "target": "Compares three offline GCP capacity designs using synthetic costs without provisioning or live GCP calls.",
+  "inputs": [
+    "classified requirement with explicit synthetic traffic and capacity assumptions"
+  ],
+  "observations": [
+    "small, medium, and large plans retain synthetic-only cost status",
+    "every plan declares its capacity arithmetic and zero real GCP calls"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/gcp-architect-expand/tiered-design.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

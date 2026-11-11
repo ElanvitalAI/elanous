@@ -14,6 +14,10 @@ import {
   SHELL_APPROVAL_CANCEL_TYPE,
 } from './next-shell-approval.js';
 import { getSessionTierOverride } from '../model-tier/session-override.js';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { spawnElanousBun } from '../instance/spawn-elanous.js';
+import { debug } from '../debug/log.js';
 
 const STATUS_PREFIX = 'ELANOUS_TUI_BG_STATUS\t';
 let nextSidetabHandler: NextSidetabHandler | null = null;
@@ -102,8 +106,14 @@ class LocalChatSession {
     // TUI-NEXT-QUEUE-AND-WAKE: the child's ScheduleWakeup asks this process over Bun IPC — the scheduler
     // lives here because the child dies on Esc and /new. No tool registered → no IPC, env unchanged.
     const wakeupTool = nextTuiWakeupTool();
-    this.child = Bun.spawn({
-      cmd: [process.execPath, cli, '--config-dir', getElanousConfigDir(), 'repl', '--session', sessionId, '--json', '--stdin-jsonl'],
+    const fastChild = fileURLToPath(new URL('./fast-repl-child.ts', import.meta.url));
+    const useFastChild = cli.endsWith('/bin/elanous.mjs') && existsSync(fastChild);
+    this.child = spawnElanousBun(
+      useFastChild
+        ? [sessionId, getElanousConfigDir()]
+        : ['--config-dir', getElanousConfigDir(), 'repl', '--session', sessionId, '--json', '--stdin-jsonl'],
+      {
+      bin: useFastChild ? fastChild : cli,
       stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
       env: {
         ...process.env, ELANOUS_NEXT_TUI_BG_STATUS: '1', ELANOUS_NEXT_TUI_STREAM: '1',
@@ -270,6 +280,8 @@ class LocalChatSession {
       // Future side-channel events cannot complete a turn. Legacy final
       // frames have no event; typed final frames use event=result.
       if ('event' in result && result.event !== 'result') return;
+      try { debug.log('tui.local-chat', 'result-frame-accepted', { sessionId: this.sessionId, turnId: waiting.turnId, event: result.event ?? 'legacy' }); }
+      catch { /* observation cannot break an accepted turn */ }
       this.waiting = null;
       waiting.resolve(result);
     }, () => {

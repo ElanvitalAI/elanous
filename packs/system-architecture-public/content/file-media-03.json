@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "파일·미디어 처리 — 검사·격리·승인",
+  "source": "https://docs.aws.amazon.com/guardduty/latest/ug/how-malware-protection-for-s3-gdu-works.html",
+  "body": "적용 시점: 파일을 공개 제공하기 전에 형식·악성코드·정책 검사가 필요한 경우.\n용량 단계: 업로드 직후 private staging에 두고 검사 통과 후만 공개 경로로 승격한다.\nGCP 대응: 별도 staging/final Cloud Storage bucket, 검증 worker, IAM 경계와 감사 이벤트.\n비용 축: 보관 전 duplicate, 검사 컴퓨트, 격리 보존과 로그 비용이 축이다.\n결정과 반증: 검사 실패·타임아웃은 공개로 fall-through하지 않고 quarantine에 남는지 확인한다."
+}

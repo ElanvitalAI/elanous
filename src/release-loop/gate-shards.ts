@@ -5,6 +5,7 @@
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 
 export const SHARD_STATES = ['pending', 'running', 'stop-requested', 'done', 'retry', 'timeout', 'failed'] as const;
@@ -206,17 +207,25 @@ export function updateGateShards(path: string, update: (current: GateShardsFile)
   }
 }
 
+/** Compare the JSON shape stored on disk; optional undefined fields disappear during persistence. */
+const samePersistedShard = (left: GateShard | undefined, right: GateShard | undefined): boolean => {
+  const persisted = (shard: GateShard | undefined) => shard && Object.fromEntries(
+    Object.entries(shard).filter(([, value]) => value !== undefined));
+  return isDeepStrictEqual(persisted(left), persisted(right));
+};
+
 /** Apply a runner snapshot's changed rows to the latest board while preserving concurrent rows and stop intent. */
 export function mergeGateShardBoardChanges(current: GateShardsFile, previous: readonly GateShard[], desired: readonly GateShard[], now = new Date(), allowStopFinalize = false): GateShardsFile {
   const before = new Map(previous.map((shard) => [shard.id, shard]));
   const incoming = new Map(desired.map((shard) => [shard.id, shard]));
   const rows = new Map(current.shards.map((shard) => [shard.id, shard]));
   for (const shard of desired) {
-    if (JSON.stringify(before.get(shard.id)) === JSON.stringify(shard)) continue;
+    if (!rows.has(shard.id)) { rows.set(shard.id, shard); continue; }
+    if (samePersistedShard(before.get(shard.id), shard)) continue;
     const existing = rows.get(shard.id);
     if (existing?.state === 'stop-requested' && !(allowStopFinalize && (shard.state === 'done' || shard.state === 'failed' || shard.state === 'timeout'))) continue;
     const prior = before.get(shard.id);
-    if (existing && JSON.stringify(existing) !== JSON.stringify(prior) && JSON.stringify(existing) !== JSON.stringify(shard)) continue;
+    if (existing && !samePersistedShard(existing, prior) && !samePersistedShard(existing, shard)) continue;
     rows.set(shard.id, shard);
   }
   for (const shard of current.shards) if (!incoming.has(shard.id)) rows.set(shard.id, shard);

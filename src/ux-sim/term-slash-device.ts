@@ -3,8 +3,8 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SlashCommandRegistry } from '../dashboard/slash-runtime/registry.js';
-import { createDashboardTermSlashRuntime } from '../dashboard/term-slash-runtime.js';
+import { SlashCommandRegistry } from '../slash/registry.js';
+import { createDashboardTermSlashRuntime } from '../term-slash-runtime.js';
 import { registerTermSlash, type TermSlashContext } from '../tui/slash/term.js';
 
 export interface TermSlashScenarioResult {

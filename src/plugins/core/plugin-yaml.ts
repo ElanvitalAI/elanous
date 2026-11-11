@@ -39,7 +39,7 @@ export function compilePluginYaml(pluginDir: string): string {
   const raw = record(parseYaml(source), 'plugin.yaml');
   if (raw.apiVersion !== 'elanous.dev/plugin/v2') throw new Error('plugin.yaml apiVersion must be elanous.dev/plugin/v2');
   const allowedKeys = new Set(['apiVersion', 'id', 'name', 'version', 'description', 'graphs', 'capabilities', 'ext',
-    'trust', 'contributes', 'skills', 'packs', 'sims', 'handlers']);
+    'trust', 'contributes', 'skills', 'packs', 'sims', 'handlers', 'dependencies']);
   const unknownKeys = Object.keys(raw).filter(key => !allowedKeys.has(key));
   if (unknownKeys.length) throw new Error(`plugin.yaml has unsupported keys: ${unknownKeys.join(', ')}`);
   const id = raw.id;
@@ -126,6 +126,7 @@ export function compilePluginYaml(pluginDir: string): string {
     id,
     name,
     version,
+    ...(raw.dependencies === undefined ? {} : { dependencies: record(raw.dependencies, 'plugin.yaml dependencies') }),
     ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
     ...(Object.keys(contributes).length || skills.length ? { contributes: {
       ...contributes, ...(skills.length ? { skills } : {}),

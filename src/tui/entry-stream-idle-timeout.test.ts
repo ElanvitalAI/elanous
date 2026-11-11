@@ -24,19 +24,23 @@ test('next TUI /help shows Commands and Keys in the terminal screen', async () =
       env: { ELANOUS_SESSION_ROOT: join(root, 'sessions'), ELANOUS_NEXT_TUI_COMPACT_HEIGHT: '20' },
       ready: { label: 'next-tui-ready', timeoutMs: 30_000, until: (screen) => screen.split('\n').includes(NEXT_TUI_TITLE) && screen.includes('Ctrl+Q 종료') }, // Source: #36661
       steps: [{
-        label: 'help-keys-visible',
+        label: 'help-commands-visible',
         text: '/help',
-        timeoutMs: 30_000,
-        until: (screen) => screen.includes('Commands') && screen.includes('Keys') && screen.includes('PgUp/PgDn'),
+        timeoutMs: 30_000, // Source: #36860 established PTY interaction deadline.
+        until: (screen) => screen.includes('Commands') && screen.includes('/quit'),
+      }, {
+        label: 'help-keys-visible', keys: '\x1b[6~', timeoutMs: 30_000, // Source: #36860 help paging PTY deadline.
+        until: (screen) => screen.includes('Keys') && screen.includes('PgUp/PgDn'),
       }],
       quitKeys: '\x11',
     });
 
-    const helpScreen = run.frames.at(-1)?.screen ?? '';
-    expect(helpScreen).toContain('Commands');
-    expect(helpScreen).toContain('Keys');
-    expect(helpScreen).toContain('PgUp/PgDn');
-    expect(helpScreen).toContain('Ctrl+\\');
+    const commandScreen = run.frames.find((frame) => frame.label === 'help-commands-visible')?.screen ?? '';
+    const keysScreen = run.frames.find((frame) => frame.label === 'help-keys-visible')?.screen ?? '';
+    expect(commandScreen).toContain('Commands');
+    expect(keysScreen).toContain('Keys');
+    expect(keysScreen).toContain('PgUp/PgDn');
+    expect(keysScreen).toContain('Ctrl+\\');
     expect(run.exitCode).toBe(0);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -77,14 +81,14 @@ test('next TUI shows transient retry status and does not retain it in the transc
         label: 'idle-timeout-retry-settled',
         // Source: .rules/30-harness/testing-gates.md — preserve the established PTY step deadline.
         timeoutMs: 30_000,
-        until: (screen) => screen.includes(reply) && screen.includes('응답 완료'),
+        until: (screen) => screen.includes(reply) && (screen.includes('응답 완료') || screen.includes('턴 완료')),
       }],
       quitKeys: '\x11',
     });
 
     expect(run.frames[1]?.screen).toContain('스트림 무응답 · 재시도 1/1');
     expect(run.frames[2]?.screen).toContain(reply);
-    expect(run.frames[2]?.screen).toContain('응답 완료');
+    expect(run.frames[2]?.screen.includes('응답 완료') || run.frames[2]?.screen.includes('턴 완료')).toBe(true);
     expect(run.frames[2]?.screen).not.toContain('스트림 무응답 · 재시도 1/1');
     expect(run.exitCode).toBe(0);
   } finally {

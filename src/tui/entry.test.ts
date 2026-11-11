@@ -6,11 +6,9 @@
  * 남는지를 잰다. 다른 세션 키의 경계는 0건이어야 한다.
  *
  * 세션 스토어(../session/index.js)는 preload 격리 tmp 위에서 실물로 돈다.
- * 시차·파생 우주를 지우기 위해 TUI 가 그리는 입·출력 계층(../tui.js ·
- * ./input/composer.js · ./chat/background-job-status.js ·
- * ../tui-client/local-chat-turn.js)만 mock.module 로 갈아끼운다 — 이 넷의 소비자는
- * entry.ts 가 유일하다. 턴 경계 배선 자체(src/tui/entry.ts ·
- * src/dashboard/turn-start-segments.ts · src/tui/input-lag-probe.ts)는 실물로 돈다 —
+ * 테스트가 mock.module 로 바꾸는 process-wide 모듈은 파일 끝 afterAll 에서
+ * 원본 namespace 로 되돌린다. 턴 경계 배선 자체(src/tui/entry.ts ·
+ * src/tui/turn-start-segments.ts · src/tui/input-lag-probe.ts)는 실물로 돈다 —
  * 닫힌 턴의 줄은 실제 지연 emit(박동 두 번)까지 기다려 읽는다.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
@@ -24,12 +22,14 @@ import {
   TURN_START_SEGMENTS_EVENT,
   setTurnStartSegments,
   type TurnStartSegments,
-} from '../dashboard/turn-start-segments.js';
+} from './turn-start-segments.js';
 import type { Key } from '../tui.js';
 import * as tuiOriginal from '../tui.js';
 import * as localChatTurnOriginal from '../tui-client/local-chat-turn.js';
+import * as localProviderCommandOriginal from '../tui-client/local-provider-command.js';
 import * as composerOriginal from './input/composer.js';
 import * as backgroundJobStatusOriginal from './chat/background-job-status.js';
+import * as executionBadgeOriginal from './chat/execution-badge.js';
 import {
   _resetDefaultControlSignalObserverForTesting,
   defaultControlSignalObserver,
@@ -39,7 +39,7 @@ import {
   defaultControlSignalBus,
   type ControlSignal,
 } from '../input/control-signal.js';
-import { removePtyManifest, updatePtyManifestSession, upsertPtyManifest } from '../pty-shell/pty-manifest.js';
+import { removePtyManifest, setPtyManifestDbPathForTesting, updatePtyManifestSession, upsertPtyManifest } from '../pty-shell/pty-manifest.js';
 import { getTestStateRoot, setTestStateRoot } from '../nexus/paths.js';
 import { setResolveDaemonEndpointForTest } from '../nexus/daemon-endpoint.js';
 import { appendSimWorldWatchEvents } from '../ux-sim/world-watch.js';
@@ -53,9 +53,18 @@ import type { MessageBlock } from '../conv-substrate/message-block.js';
 // mock.module 복구용 원본 스냅샷 — 정적 import 가 먼저 실행되므로 mock 치환 전 실물이 담긴다.
 const restoreTui = { ...tuiOriginal };
 const restoreLocalChatTurn = { ...localChatTurnOriginal };
+const restoreLocalProviderCommand = { ...localProviderCommandOriginal };
 const restoreComposer = { ...composerOriginal };
 const restoreBackgroundJobStatus = { ...backgroundJobStatusOriginal };
+const restoreExecutionBadge = { ...executionBadgeOriginal };
 const restoreUxSimWorld = { ...uxSimWorldOriginal };
+
+async function expectOriginalModuleExports(actual: object, original: object): Promise<void> {
+  const actualExports = actual as Record<string, unknown>;
+  for (const [name, value] of Object.entries(original)) {
+    expect(actualExports[name]).toBe(value);
+  }
+}
 
 // readKey 가 내보낼 키 열 — 제출 한 턴 뒤 Ctrl+Q 로 TUI 를 닫는다.
 const keys: Key[] = [];
@@ -70,6 +79,7 @@ let beforeFakeTimerTick: (() => void) | null = null;
 const loopEvents: Array<{ event: string; data: unknown }> = [];
 // 위임한 턴이 실행된 세션 키 — runLocalChatTurn 목격.
 const turnsSeen: string[] = [];
+const turnTextsSeen: string[] = [];
 const turnTiersSeen: Array<{ tier: string; source: string }> = [];
 const transcript: string[] = [];
 function replayPaintWrites(writes: readonly string[]): string[] {
@@ -110,7 +120,12 @@ const committedPushNowIds: string[] = [];
 const requestedPushNowIds: string[] = [];
 let mockToolSnapshot: Array<{ id: string; name: string }> = [];
 let mockLocalChatTurnResult: { goalComplete?: boolean; goalStopReason?: string } | undefined;
+let mockLocalChatTurnError: string | undefined;
+let providerCommandCalls: string[] = [];
+let recoveryResumeTargetId = '';
+let useRealComposerForRecovery = false;
 let mockBackgroundLine: string | null = null;
+let mockExecutionBadge: string | Error = '🧠 test-model';
 let messageBlocksForTurn: MessageBlock[] = [];
 let selfHealthListener: ((snapshot: import('../tui/chat/self-health-status.js').NextTuiSelfHealthSnapshot | null) => void) | null = null;
 let nextSidetabHandler: NextSidetabHandler | null = null;
@@ -130,6 +145,10 @@ function enqueueReadKey(key: Key): void {
 }
 
 beforeEach(() => {
+  providerCommandCalls = [];
+  recoveryResumeTargetId = '';
+  useRealComposerForRecovery = false;
+  mockExecutionBadge = '🧠 test-model';
   priorTestStateRoot = getTestStateRoot();
   priorStateDir = process.env.ELANOUS_STATE_DIR;
   priorSimWorldId = process.env.ELANOUS_SIM_WORLD_ID;
@@ -137,6 +156,7 @@ beforeEach(() => {
   mkdirSync(join(isolatedTestStateRoot, 'sim'), { recursive: true });
   setTestStateRoot(isolatedTestStateRoot);
   process.env.ELANOUS_STATE_DIR = isolatedTestStateRoot;
+  setPtyManifestDbPathForTesting(join(isolatedTestStateRoot, 'pty', 'manifest.db'));
   delete process.env.ELANOUS_SIM_WORLD_ID;
 });
 
@@ -168,7 +188,7 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
   setNextTuiShellApprovalCancelHandler: (handler: typeof shellApprovalCancelHandler) => { shellApprovalCancelHandler = handler; },
   runLocalChatTurn: async (
     sessionId: string,
-    _text: string,
+    text: string,
     signal: AbortSignal,
     _cli: unknown,
     _writePrompt: unknown,
@@ -187,6 +207,7 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
     pushNowResultHandler = onPushNowResult ?? null;
     agentEventHandler = _onAgent ?? null;
     turnsSeen.push(sessionId);
+    turnTextsSeen.push(text);
     const tier = resolveLlmTier(undefined, 'openai-codex', { sessionId });
     turnTiersSeen.push({ tier: tier.tier, source: tier.source });
     onDelta?.('첫 응답 델타');
@@ -196,6 +217,10 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
     const afterTurn = keysAfterTurn;
     keysAfterTurn = [];
     if (afterTurn.length) setTimeout(() => afterTurn.forEach(enqueueReadKey), 25);
+    if (mockLocalChatTurnError) {
+      appendMessage(sessionId, { role: 'user', content: text, ts: new Date().toISOString() });
+      throw new Error(mockLocalChatTurnError);
+    }
     return mockLocalChatTurnResult;
   },
   requestLocalChatShellActivitySnapshot: () => {
@@ -230,6 +255,19 @@ mock.module('../tui-client/local-chat-turn.js', () => ({
   localChatModel: () => 'fake-model',
 }));
 
+mock.module('../tui-client/local-provider-command.js', () => ({
+  runLocalProviderCommand: async (command: string, _signal: AbortSignal, onLine: (line: string) => void) => {
+    providerCommandCalls.push(command);
+    onLine('provider recovery command completed');
+    if (!recoveryResumeTargetId) return;
+    setTimeout(() => {
+      submittedInputs.push(`/resume ${recoveryResumeTargetId}`);
+      enqueueReadKey({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+    }, 25);
+    setTimeout(() => enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\x11' }), 200);
+  },
+}));
+
 mock.module('./input/composer.js', () => ({
   MOUSE_RESIDUE_WINDOW_MS: 500,
   MouseResidueGuard: class {
@@ -240,19 +278,27 @@ mock.module('./input/composer.js', () => ({
   },
   emptyComposer: () => ({ text: '' }),
   applyComposerKey: (state: unknown, key: Key) => {
+    if (useRealComposerForRecovery) {
+      return restoreComposer.applyComposerKey(state as Parameters<typeof restoreComposer.applyComposerKey>[0], key);
+    }
     if (key.ctrl && key.name === 'q') return { state, action: 'quit' };
     if (key.name === 'enter') {
-      const submitted = submittedInputs.shift();
+      const currentText = typeof state === 'object' && state !== null && 'text' in state
+        ? String((state as { text?: unknown }).text ?? '')
+        : '';
+      const submitted = submittedInputs.shift() ?? currentText;
       if (submitted) return { state, action: 'submit', submitted };
     }
     return { state, action: 'edit' };
   },
-  composerViewport: () => ({ line: duringTurnHook ? '❯ ' : '', cursorCol: 1 }),
+  composerViewport: () => ({ lines: [duringTurnHook ? '❯ ' : ''], line: duringTurnHook ? '❯ ' : '',
+    cursorRow: 0, cursorCol: 1, pageSize: 1, scroll: 0 }),
   wheelDirection: () => null,
 }));
 
 mock.module('./chat/background-job-status.js', () => ({
   BackgroundJobStatus: class {
+    snapshot(): null { return null; }
     line(): string | null {
       return mockBackgroundLine;
     }
@@ -260,6 +306,11 @@ mock.module('./chat/background-job-status.js', () => ({
     clear(): void {}
   },
 }));
+
+mock.module('./chat/execution-badge.js', () => ({ resolveDashboardExecutionBadge: () => {
+  if (mockExecutionBadge instanceof Error) throw mockExecutionBadge;
+  return mockExecutionBadge;
+} }));
 
 const { nextTuiShellEscDecision, shellApprovalCommandViewport, showNextTui } = await import('./entry.js');
 const { LONG_SHELL_ESC_CONFIRMATION_MS } = await import('../esc-abort-gate.js');
@@ -291,6 +342,7 @@ afterEach(() => {
   loopEvents.length = 0;
   for (const sessionId of turnsSeen) clearSessionTierOverride(sessionId);
   turnsSeen.length = 0;
+  turnTextsSeen.length = 0;
   turnTiersSeen.length = 0;
   transcript.length = 0;
   turnAbortSignals.length = 0;
@@ -306,6 +358,7 @@ afterEach(() => {
   requestedPushNowIds.length = 0;
   duringTurnHook = null;
   mockLocalChatTurnResult = undefined;
+  mockLocalChatTurnError = undefined;
   mockBackgroundLine = null;
   messageBlocksForTurn = [];
   selfHealthListener = null;
@@ -319,6 +372,7 @@ afterEach(() => {
   Object.defineProperty(process.stdout, 'columns', { value: undefined, configurable: true });
   Object.defineProperty(process.stdout, 'rows', { value: undefined, configurable: true });
   const testRoot = isolatedTestStateRoot;
+  setPtyManifestDbPathForTesting(null);
   if (priorStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
   else process.env.ELANOUS_STATE_DIR = priorStateDir;
   if (priorSimWorldId === undefined) delete process.env.ELANOUS_SIM_WORLD_ID;
@@ -351,6 +405,224 @@ test('Bash approval viewport uses the reduced composer width when a sidetab is o
   const viewport = shellApprovalCommandViewport(command, 100, 35, 30, Number.MAX_SAFE_INTEGER);
   expect(viewport.lines.slice(viewport.scroll, viewport.scroll + viewport.pageSize).join('').replace(/\s/g, '')).toContain('NT_SW1_END');
 });
+
+test('compact first screen keeps welcome state, model and background graph status in separate rows', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true }); // Source: standard PTY width used by adjacent showNextTui viewport tests.
+  Object.defineProperty(process.stdout, 'rows', { value: 6, configurable: true }); // Source: compact-height integration case for the TUI first screen.
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  mockBackgroundLine = '[graph] triage ok · failed start';
+  keys.push({ name: 'q', ctrl: true, shift: false, raw: '\x11' });
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'collapsed', compactHeight: 6 });
+    const screen = transcript.join('');
+    expect(screen).toContain('Enter 전송');
+    expect(screen).toContain('🧠 test-model');
+    expect(screen).toContain(mockBackgroundLine);
+    expect(screen).not.toContain('NaN;');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('execution model badge refreshes after the model changes during a turn', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true }); // Source: standard integration viewport used by adjacent showNextTui tests.
+  Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true }); // Source: standard integration viewport used by adjacent showNextTui tests.
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  duringTurnHook = () => { mockExecutionBadge = '🧠 updated-model'; };
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  submittedInputs.push('start a turn');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(transcript.join('')).toContain('🧠 updated-model');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('model badge resolver failure does not loop renders and retries after an external input event', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  mockExecutionBadge = new Error('temporary config read failure');
+  setTimeout(() => {
+    mockExecutionBadge = '🧠 recovered-model';
+    enqueueReadKey({ name: 'down', ctrl: false, shift: false, raw: '\x1b[B' });
+  }, 50);
+  setTimeout(() => enqueueReadKey({ name: 'q', ctrl: true, shift: false, raw: '\x11' }), 100);
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(transcript.join('')).toContain('🧠 recovered-model');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('narrow live status stays visible while the attachment page hint is active', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 28, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 12, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  submittedInputs.push('/context', 'start a turn');
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  duringTurnHook = () => Bun.sleep(40);
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({
+      resumeSessionId: session.id,
+      sidetabMode: 'off',
+      compactHeight: 8,
+      contextAttachmentsForTest: Array.from({ length: 5 }, (_, index) => [
+        `[attached ${index + 1}: document-${index + 1}.md]`,
+        `/attachments/${String.fromCharCode(97 + index).repeat(180)}.md`,
+      ] as const),
+    });
+    expect(replayPaintWrites(transcript).some((frame) => frame.includes('PgUp/PgDn') && frame.includes('응답 중'))).toBe(true);
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('failed turn shows the recovery card through the real Next TUI entry path', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  mockLocalChatTurnError = 'provider unavailable';
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  submittedInputs.push('test failed turn');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    const screen = transcript.join('');
+    expect(screen).toContain('✘ 응답 실패 · provider unavailable');
+    expect(screen).toContain('↑ 이전 입력 후 Enter');
+    expect(screen).toContain('제공자 변경: /provider');
+    expect(screen).toContain('이어가기: /resume');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('partial reply followed by stream disconnect shows the recovery card through the real Next TUI entry path', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  mockLocalChatTurnError = 'stream disconnected after partial reply';
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  submittedInputs.push('test interrupted stream');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    const screen = transcript.join('');
+    expect(turnTextsSeen).toContain('test interrupted stream');
+    expect(screen).toContain('첫 응답 델타');
+    expect(screen).toContain('✘ 응답 실패 · stream disconnected after partial reply');
+    expect(screen).toContain('재시도: ↑ 이전 입력 후 Enter');
+    expect(screen).toContain('제공자 변경: /provider');
+    expect(screen).toContain('이어가기: /resume');
+  } finally {
+    process.stdout.write = output;
+  }
+});
+
+test('failed turn retry restores the prompt through the real composer in showNextTui', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  mockLocalChatTurnError = 'provider unavailable';
+  duringTurnHook = () => {
+    if (turnsSeen.length === 1) {
+      useRealComposerForRecovery = true;
+      keysAfterTurn = [
+        { name: 'up', ctrl: false, shift: false, raw: '\x1b[A' },
+        { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      ];
+      return;
+    }
+    mockLocalChatTurnError = undefined;
+    useRealComposerForRecovery = false;
+    keysAfterTurn = [{ name: 'q', ctrl: true, shift: false, raw: '\x11' }];
+  };
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  submittedInputs.push('test failed turn');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(turnTextsSeen).toEqual(['test failed turn', 'test failed turn']);
+  } finally {
+    process.stdout.write = output;
+  }
+}, 10_000);
+
+test('failed-turn recovery guidance dispatches retry, provider lookup and resume through the real input loop', async () => {
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+  Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
+  Object.defineProperty(process.stdout, 'rows', { value: 18, configurable: true });
+  const session = createSession({ source: 'tui' });
+  setActiveSessionId(session.id);
+  const resumeTarget = createSession({ source: 'tui' });
+  recoveryResumeTargetId = resumeTarget.id.slice(0, 8);
+  useRealComposerForRecovery = false;
+  appendMessage(resumeTarget.id, { role: 'assistant', content: 'resume target', ts: new Date().toISOString() });
+  mockLocalChatTurnError = 'provider unavailable';
+  duringTurnHook = () => {
+    if (turnsSeen.length === 1) {
+      // The recovery card's ↑ path recalls the failed prompt, then Enter retries it.
+      submittedInputs.push('test failed turn');
+      keysAfterTurn = [
+        { name: 'up', ctrl: false, shift: false, raw: '\x1b[A' },
+        { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      ];
+      return;
+    }
+    mockLocalChatTurnError = undefined;
+    submittedInputs.push('/provider models openai-codex');
+    keysAfterTurn = [
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+    ];
+  };
+  keys.push({ name: 'enter', ctrl: false, shift: false, raw: '\r' });
+  submittedInputs.push('test failed turn');
+  const output = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { transcript.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  try {
+    await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
+    expect(turnsSeen).toHaveLength(2);
+    expect(turnTextsSeen).toEqual(['test failed turn', 'test failed turn']);
+    expect(providerCommandCalls).toEqual(['models openai-codex']);
+    expect(getActiveSessionId()).toBe(resumeTarget.id);
+    expect(transcript.join('')).toContain('provider recovery command completed');
+  } finally {
+    process.stdout.write = output;
+  }
+}, 10_000);
 
 test('risky Bash approval is an inline prompt and only a human y dispatch decision is accepted', async () => {
   Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
@@ -501,7 +773,7 @@ test('empty Enter keeps the queued turn while a non-shell tool is running', asyn
   try {
     await showNextTui({ resumeSessionId: session.id, sidetabMode: 'off' });
     expect(interruptedDuringTool as boolean | null).toBe(false);
-    expect(transcript.join('')).toContain('실행 중인 도구 Read 뒤에 대기 입력 전송');
+    expect(transcript.join('')).toMatch(/턴 도구 실행 .*대기 1 · 배경 0/);
   } finally {
     process.stdout.write = output;
   }
@@ -690,15 +962,6 @@ test('child-agent noise collapses to one status card without duplicate MessageBl
     process.stdout.write = output;
   }
 }, 10_000);
-
-// R-TST23 — afterAll 마지막으로 원본을 반환하는 mock.module 로 네 치환을 복구한다.
-afterAll(() => {
-  mock.module('../tui.js', () => restoreTui);
-  mock.module('../tui-client/local-chat-turn.js', () => restoreLocalChatTurn);
-  mock.module('./input/composer.js', () => restoreComposer);
-  mock.module('./chat/background-job-status.js', () => restoreBackgroundJobStatus);
-  mock.module('../ux-sim/world.js', () => restoreUxSimWorld);
-});
 
 describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
   test('registry routes built-in help at the real input boundary and leaves longer help requests as chat', async () => {
@@ -1344,6 +1607,30 @@ describe('src/tui/entry.ts — showNextTui 턴 경계 recorder 배선', () => {
     }
   }, 10_000);
 
+  test('/now paints a pending frame and accepts Ctrl+Q while the worker scan is outstanding', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 24, configurable: true });
+    const output = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      transcript.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    keys.push(
+      { name: 'enter', ctrl: false, shift: false, raw: '\r' },
+      { name: 'q', ctrl: true, shift: false, raw: '\x11' },
+    );
+    submittedInputs.push('/now');
+    try {
+      await showNextTui({ resumeSessionId: createSession().id, sidetabMode: 'off' });
+      expect(transcript.join('')).toContain('현재 맥락 조회 중');
+      expect(transcript.join('')).toContain('현재 맥락 조회 취소됨');
+      expect(turnsSeen).toEqual([]);
+    } finally {
+      process.stdout.write = output;
+    }
+  }, 10_000);
+
   test('/model choice reaches the shared resolver on the next submitted CORE turn', async () => {
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
     Object.defineProperty(process.stdout, 'columns', { value: 80, configurable: true });
@@ -1617,4 +1904,24 @@ describe('src/tui/entry.ts — /signals 관측(읽기 전용) 슬래시', () => 
       restore();
     }
   }, 10_000);
+});
+
+// R-TST23 — file-scope teardown follows every test-local mock.module so the
+// process-wide Bun module registry ends on the original implementations.
+afterAll(async () => {
+  mock.module('../tui.js', () => restoreTui);
+  mock.module('../tui-client/local-chat-turn.js', () => restoreLocalChatTurn);
+  mock.module('../tui-client/local-provider-command.js', () => restoreLocalProviderCommand);
+  mock.module('./input/composer.js', () => restoreComposer);
+  mock.module('./chat/background-job-status.js', () => restoreBackgroundJobStatus);
+  mock.module('./chat/execution-badge.js', () => restoreExecutionBadge);
+  mock.module('../ux-sim/world.js', () => restoreUxSimWorld);
+
+  await expectOriginalModuleExports(await import('../tui.js'), restoreTui);
+  await expectOriginalModuleExports(await import('../tui-client/local-chat-turn.js'), restoreLocalChatTurn);
+  await expectOriginalModuleExports(await import('../tui-client/local-provider-command.js'), restoreLocalProviderCommand);
+  await expectOriginalModuleExports(await import('./input/composer.js'), restoreComposer);
+  await expectOriginalModuleExports(await import('./chat/background-job-status.js'), restoreBackgroundJobStatus);
+  await expectOriginalModuleExports(await import('./chat/execution-badge.js'), restoreExecutionBadge);
+  await expectOriginalModuleExports(await import('../ux-sim/world.js'), restoreUxSimWorld);
 });

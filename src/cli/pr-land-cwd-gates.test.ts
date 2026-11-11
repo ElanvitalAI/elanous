@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveTscScript, runGate } from '../../scripts/ci-typecheck-changed.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
-import { runPrLand, runPrLandTypecheckGate, shouldRefusePrLandLocalHeavySteps } from './pr-cli.js';
+import { runPrLand, runPrLandTypecheckGate, runPrLandTypecheckWithReceipt, shouldRefusePrLandLocalHeavySteps } from './pr-cli.js';
 
 setDefaultTimeout(60_000);
 
@@ -31,6 +31,7 @@ test('pr land routes its in-process typecheck from an HQ symlink to the canonica
     const passed = runPrLandTypecheckGate({ log: (line) => lines.push(line), error: (line) => lines.push(line) }, alias, {
       env: { ELANOUS_TYPECHECK_REMOTE: 'gcp2' },
       host: 'MacStudioB1',
+      baseRef: 'a'.repeat(40),
       runRemote: (command, args, options) => {
         calls.push({ command, args, cwd: options.cwd, env: options.env });
         return { status: 0, stdout: '[tsc-gate] PASS\n', stderr: '' };
@@ -42,10 +43,78 @@ test('pr land routes its in-process typecheck from an HQ symlink to the canonica
       command: process.execPath,
       args: [join(realpathSync(hqCheckout), 'scripts/ci-typecheck-changed.ts'), '--remote', 'gcp2'],
       cwd: realpathSync(hqCheckout),
-      env: { ELANOUS_TYPECHECK_REMOTE: 'gcp2' },
+      env: { ELANOUS_TYPECHECK_REMOTE: 'gcp2', TSC_BASE_REF: 'a'.repeat(40) },
     });
     expect(lines).toEqual(['[tsc-gate] PASS']);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('pr land reuses only the same PR, head, base and changed-tsc input receipt', () => {
+  const root = mkdtempSync(join(tmpdir(), 'prland-typecheck-receipt-'));
+  const receiptDir = join(root, 'receipts');
+  const input = { pr: 36874, head: 'a'.repeat(40), base: 'b'.repeat(40), cwd: root,
+    changedPaths: ['src/cli/pr-cli.ts'], host: 'minim5', receiptDir, env: { TSC_GATE_ROOTS: 'affected' } };
+  let runs = 0;
+  const pass = () => { runs++; return true; };
+  try {
+    mkdirSync(join(root, 'node_modules'));
+    writeFileSync(join(root, 'node_modules', 'dependency.d.ts'), 'export type Value = string;\n');
+    expect(runPrLandTypecheckWithReceipt(input, pass)).toEqual({ ok: true, source: 'gate' });
+    expect(runPrLandTypecheckWithReceipt(input, pass)).toEqual({ ok: true, source: 'receipt' });
+    expect(runs).toBe(1); // Source: PRLAND-REUSE-EXACT-HEAD-CHECKS same exact input needs one measurement.
+    expect(runPrLandTypecheckWithReceipt({ ...input, base: 'c'.repeat(40) }, pass).source).toBe('gate');
+    expect(runPrLandTypecheckWithReceipt({ ...input, head: 'd'.repeat(40) }, pass).source).toBe('gate');
+    expect(runPrLandTypecheckWithReceipt({ ...input, pr: 36875 }, pass).source).toBe('gate');
+    expect(runPrLandTypecheckWithReceipt({ ...input, changedPaths: ['src/other.ts'] }, pass).source).toBe('gate');
+    expect(runPrLandTypecheckWithReceipt({ ...input, env: { TSC_GATE_ROOTS: 'full' } }, pass).source).toBe('gate');
+    expect(runs).toBe(6); // Source: PRLAND-REUSE-EXACT-HEAD-CHECKS five changed identities remeasure after the first pass.
+    expect(runPrLandTypecheckWithReceipt(input, pass).source).toBe('gate');
+    expect(runPrLandTypecheckWithReceipt(input, pass).source).toBe('receipt');
+    writeFileSync(join(root, 'node_modules', 'dependency.d.ts'), 'export type Value = number;\n');
+    expect(runPrLandTypecheckWithReceipt(input, pass).source).toBe('gate');
+    rmSync(join(root, 'node_modules'), { recursive: true, force: true });
+    expect(runPrLandTypecheckWithReceipt(input, pass).source).toBe('gate');
+    expect(runs).toBe(9); // Source: PRLAND-REUSE-EXACT-HEAD-CHECKS changed or missing installed types force a fresh gate.
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('pr land never reuses a failed or unreadable typecheck receipt', () => {
+  const root = mkdtempSync(join(tmpdir(), 'prland-typecheck-failure-'));
+  const receiptDir = join(root, 'receipts');
+  const input = { pr: 36874, head: 'a'.repeat(40), base: 'b'.repeat(40), cwd: root,
+    changedPaths: ['src/cli/pr-cli.ts'], host: 'minim5', receiptDir };
+  let runs = 0;
+  try {
+    mkdirSync(join(root, 'node_modules'));
+    expect(runPrLandTypecheckWithReceipt(input, () => { runs++; return false; })).toEqual({ ok: false, source: 'gate' });
+    expect(runPrLandTypecheckWithReceipt(input, () => { runs++; return true; })).toEqual({ ok: true, source: 'gate' });
+    writeFileSync(join(receiptDir, `${input.pr}.json`), '{broken');
+    expect(runPrLandTypecheckWithReceipt(input, () => { runs++; return true; })).toEqual({ ok: true, source: 'gate' });
+    expect(runs).toBe(3); // Source: PRLAND-REUSE-EXACT-HEAD-CHECKS failed and unreadable evidence never proves a pass.
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('pr land refuses receipt reuse when installed types link outside the checkout', () => {
+  const root = mkdtempSync(join(tmpdir(), 'prland-external-types-'));
+  const external = mkdtempSync(join(tmpdir(), 'prland-external-package-'));
+  const input = { pr: 36874, head: 'a'.repeat(40), base: 'b'.repeat(40), cwd: root,
+    changedPaths: ['src/cli/pr-cli.ts'], host: 'minim5', receiptDir: join(root, 'receipts') };
+  let runs = 0;
+  const gate = () => { runs++; return true; };
+  try {
+    mkdirSync(join(root, 'node_modules'));
+    writeFileSync(join(external, 'index.d.ts'), 'export type Value = string;\n');
+    symlinkSync(external, join(root, 'node_modules', 'external'), 'dir');
+    expect(runPrLandTypecheckWithReceipt(input, gate).source).toBe('gate');
+    writeFileSync(join(external, 'index.d.ts'), 'export type Value = number;\n');
+    expect(runPrLandTypecheckWithReceipt(input, gate).source).toBe('gate');
+    rmSync(external, { recursive: true, force: true });
+    expect(runPrLandTypecheckWithReceipt(input, gate).source).toBe('gate');
+    expect(runs).toBe(3); // Source: PRLAND-REUSE-EXACT-HEAD-CHECKS outside and missing symlink targets never prove installed types unchanged.
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(external, { recursive: true, force: true });
+  }
 });
 
 function git(cwd: string, args: string[]): void {

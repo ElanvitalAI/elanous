@@ -9,6 +9,11 @@
 //  - stops + releases on stop()
 
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { resetEffectiveInstanceRoot } from '../src/instance/resolve';
+import { latestGraphRun } from '../src/graph-runner/runner';
 import { createWorkflowRuntimeDaemon } from '../src/workflow-runtime/daemon';
 import { createScheduleSource } from '../src/workflow-runtime/triggers/schedule-source';
 import { createWebhookSource } from '../src/workflow-runtime/triggers/webhook-source';
@@ -47,6 +52,47 @@ function wfWithWebhook(name: string, path: string, method = 'POST'): WorkflowEnt
 }
 
 describe('workflow-runtime daemon — lifecycle', () => {
+  test('installed graph schedule starts a graph tick through the daemon', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'graph-schedule-daemon-'));
+    const file = join(dir, 'graph.yaml');
+    writeFileSync(join(dir, 'recipes.yaml'), '{}\n');
+    writeFileSync(file, `graph_id: scheduled-graph
+version: 1
+entry_node: done
+terminal_nodes: [done]
+triggers:
+  schedule: { type: interval, interval: 2000 }
+nodes:
+  - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
+edges: []
+`);
+    let intervalCb: (() => void) | undefined;
+    const scheduleSource = createScheduleSource({
+      setInterval: cb => { intervalCb = cb; return 1 as unknown as ReturnType<typeof setInterval>; },
+      clearInterval: () => {},
+    });
+    const previousStateDir = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = dir;
+    resetEffectiveInstanceRoot();
+    const daemon = createWorkflowRuntimeDaemon({ workflows: [], graphFiles: [file], deps: stubDeps, scheduleSource });
+    try {
+      await daemon.start();
+      expect(daemon.status().schedule.activeIntervals).toBe(1);
+      expect(daemon.status().subscriptions.some(sub => sub.workflowName === 'graph:scheduled-graph')).toBe(true);
+      intervalCb?.();
+      const deadline = Date.now() + 5_000; // Source: #36711 daemon schedule integration test timeout.
+      while (Date.now() < deadline && latestGraphRun('scheduled-graph', dir)?.status !== 'done')
+        await new Promise(resolve => setTimeout(resolve, 20));
+      expect(latestGraphRun('scheduled-graph', dir)?.status).toBe('done');
+    } finally {
+      await daemon.stop();
+      if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousStateDir;
+      resetEffectiveInstanceRoot();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('start() → schedule + webhook sources connect', async () => {
     let intervalCb: (() => void) | null = null;
     const scheduleSource = createScheduleSource({

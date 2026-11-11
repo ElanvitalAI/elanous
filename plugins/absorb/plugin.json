@@ -3,6 +3,15 @@
   "id": "absorb",
   "name": "Absorb",
   "version": "0.3.9",
+  "dependencies": {
+    "plugins": [
+      {
+        "id": "elanous-app-deploy",
+        "version": "^0.3.9",
+        "optional": true
+      }
+    ]
+  },
   "description": "Member-owned scrap absorption, daily briefing, and app upgrade suggestion graph.",
   "contributes": {
     "aiTools": [
@@ -44,11 +53,13 @@
           "triggers": [
             "스크랩 추가",
             "이 링크 저장해",
+            "이 기사 스크랩해줘",
             "이것도 흡수해",
             "save this scrap"
           ],
           "examples": [
             "이 웹 문서를 스크랩에 추가해",
+            "이 기사 스크랩해줘 https://example.test/article",
             "save this YouTube video"
           ],
           "sideEffects": "external",

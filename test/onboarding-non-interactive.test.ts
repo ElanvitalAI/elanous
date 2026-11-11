@@ -170,6 +170,22 @@ describe('onboarding/non-interactive · scripted answer resolution', () => {
     io.close();
   });
 
+  test('Solar model answer is consumed by non-interactive setup', async () => {
+    const io = nonInteractiveIO({
+      answers: { llm: { provider: 'openrouter', model: 'openrouter/upstage/solar-pro4' } },
+      env: {},
+    });
+    io.showStep!({ index: 1, total: 5, title: 'LLM' });
+    expect(await io.ask('model', 'model')).toBe('openrouter/upstage/solar-pro4');
+    const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      io.complete?.();
+      expect(stderr.mock.calls.flat().join('')).not.toContain('llm.model');
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
   test('wizard integration preserves model and baseUrl across skipped API-key branch', async () => {
     const root = mkdtempSync(join(tmpdir(), 'onboarding-non-interactive-'));
     try {

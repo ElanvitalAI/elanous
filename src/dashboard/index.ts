@@ -5,6 +5,7 @@ import type { LLMToolSpec } from '../llm/tool-spec.js';
 // layout via the plugin host.
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { isTicketingArchitecturePrompt, SCENE4_DRAFT_POLICY, withScene4Workspace } from '../graph-runner/scene4-turn-policy.js';
 import { fileURLToPath } from 'node:url';
 import { createRunningBuildStatus } from './running-build-status.js';
 import { reportTuiAbortRequested, reportTuiProgress, reportTuiTurn } from '../pty-shell/tui-run-state.js';
@@ -147,9 +148,16 @@ import { getLocalSkills, executeSync } from '../sync.js';
 import { computeDiff } from '../smart.js';
 import { summarizeDiff, isAnalyzerAvailable } from '../grok.js';
 import { C, ICONS, ansi, initTui, closeTui, setExitNotice, readKey, setKeyTracer, render, termSize, pad, stripAnsi, hLine, showHelp, invalidateRenderCacheRow, wrapAnsiByWidth, injectKey, setExternalTuiKeyRoute } from '../tui.js';
-import { paintCursor, type CursorState } from '../display/cursor-state.js';
-import type { CursorDecision } from '../display/cursor-owner.js';
-import type { Key, RenderOptions } from '../tui.js';
+import type { CursorState } from '../display/cursor-state.js';
+import type { Key } from '../tui.js';
+import { renderDashboardFrame, createDashboardEssentialCursorObserver, type DashboardFrameInput } from '../display/dashboard-frame.js';
+export {
+  renderDashboardFrame,
+  createDashboardEssentialCursorObserver,
+  type DashboardFrameInput,
+  type EssentialFrameCursorObservation,
+  type DashboardEssentialCursorObserverDeps,
+} from '../display/dashboard-frame.js';
 import {
   createTurnTypeaheadState,
   applyTurnTypeaheadKey,
@@ -347,8 +355,6 @@ import {
 import { buildPromptFrameDividerRows } from '../display/prompt-frame-paint.js';
 import {
   paintTurnTypeaheadEchoRow,
-  resolveEssentialFrameCursorDecision,
-  type EssentialFrameCursorDecision,
 } from './input/turn-typeahead-prompt.js';
 import {
   buildDashboardTurnTypeaheadPromptZone,
@@ -1673,92 +1679,12 @@ export function resolveDashboardHarnessSubmitIntent(
   return routeDevHarnessSubmitIntent(resolveIntent(text, options));
 }
 
-type DashboardFrameRenderer = (lines: string[], options: RenderOptions) => void;
-
 /** Compose coordinator-owned modal surfaces into the dashboard's single frame overlay. */
 export function renderDashboardCoordinatorModalOverlay(display: Pick<DisplayCoordinator, 'snapshot'>): string {
   const snapshot = display.snapshot();
   return renderModalStack({
     surfaces: snapshot.surfaces,
     focusStack: snapshot.focus.stack,
-  });
-}
-
-/** 대시보드 draw 경로의 **단일 프레임 flush**. 커서는 행 캐시 밖에 있고 같은 write 안에서
- *  모든 overlay 뒤에 온다.
- *
- *  ⭐⭐⭐ **essential 은 커서 값을 Z축에 묻지 않는다**(2026-08-02 · RFC essential-z-axis-off).
- *  입력 루프가 끝나면 `setCursor(null)` 로 소유가 비므로 물어보면 빈손이고, 그래서 턴이 도는
- *  동안 커서가 사라졌다(라이브 14 표본 전부 `visible false`). ⇒ 모달이 **실제로 claim** 했으면
- *  그 값을 쓰고, 아니면 **프롬프트 caret** 을 쓴다. 프롬프트가 감춰졌으면 숨긴다. */
-export interface DashboardFrameInput {
-  overlay: string;
-  preserveBounds?: { row: number; col: number; width: number; height: number };
-  force: boolean;
-  /** ⭐ Z축이 **실제로 누구에게** 커서를 준 결정. essential 은 `modal`·`terminal` 일 때만
-   *  그 값에 양보한다 — `coordinator` fallback 은 소유자가 없다는 뜻이지 claim 이 아니다. */
-  cursorOwner: CursorDecision['owner'];
-  claimedCursor: CursorState | null;
-  /** essential 결정이 커서를 안 낼 때(null)의 폴백 — 조율자가 emit 하던 값(종전 동작 보존). */
-  coordinatorCursor?: CursorState | null;
-  promptCaret: CursorState | null;
-  suppressPromptArea: boolean;
-  onEssentialFrameCursorDecision?: (observation: EssentialFrameCursorObservation) => void;
-  onFrameWriteComplete?: (error?: Error | null) => void;
-}
-
-export interface EssentialFrameCursorObservation {
-  caret: CursorState | null;
-  cursorOwner: CursorDecision['owner'];
-  reason: EssentialFrameCursorDecision['reason'];
-  source: EssentialFrameCursorDecision['source'];
-  suppressPromptArea: boolean;
-}
-
-export interface DashboardEssentialCursorObserverDeps {
-  isDebugEnabled: () => boolean;
-  log: (category: string, event: string, data: EssentialFrameCursorObservation) => void;
-}
-
-export function createDashboardEssentialCursorObserver(deps: DashboardEssentialCursorObserverDeps): (
-  observation: EssentialFrameCursorObservation,
-) => void {
-  let lastKey = '';
-  return (observation) => {
-    if (!deps.isDebugEnabled()) return;
-    const key = JSON.stringify(observation);
-    if (key === lastKey) return;
-    lastKey = key;
-    try {
-      deps.log('cursor.final-decision', 'resolved', observation);
-    } catch { /* cursor observation must not affect frame rendering */ }
-  };
-}
-
-export function renderDashboardFrame(
-  lines: string[],
-  input: DashboardFrameInput,
-  renderFrame: DashboardFrameRenderer = render,
-): void {
-  const cursorDecisionExists = input.cursorOwner !== 'none';
-  const essentialDecision = resolveEssentialFrameCursorDecision({
-    claimedCursor: cursorDecisionExists ? input.claimedCursor : null,
-    promptCaret: input.promptCaret,
-    suppressPromptArea: input.suppressPromptArea,
-  });
-  renderFrame(lines, {
-    overlay: input.overlay,
-    preserveBounds: input.preserveBounds,
-    force: input.force,
-    cursor: paintCursor(essentialDecision.cursor ?? input.coordinatorCursor ?? null),
-    onWriteComplete: input.onFrameWriteComplete,
-  });
-  input.onEssentialFrameCursorDecision?.({
-    caret: essentialDecision.cursor,
-    cursorOwner: input.cursorOwner,
-    reason: essentialDecision.reason,
-    source: essentialDecision.source,
-    suppressPromptArea: input.suppressPromptArea,
   });
 }
 
@@ -14108,6 +14034,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     //     turns ever land, a sub-agent could inherit another turn's catalog. Whoever
     //     adds turn concurrency must key this by turn (or session+turn) first.
     let acpTurnToolSpecs: LLMToolSpec[] = [];
+    // The ACP bridge may pass a context-wrapped user message to getTools/getPreamble.
+    // Keep the route decision from the raw submitted three lines for this serialized turn.
+    let scene4DesignTurnActive = false;
     let acpDispatchToolSelf: CoreTurnDispatchTool | null = null;
     let acpToolDispatchCount = 0;
     const trMod = await import('../tool-runtime/index.js');
@@ -14142,6 +14071,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             memorySaveFailed = true;
             pushChatLine(C.warning('  ⚠ 기억을 저장하지 못했습니다. 저장소 상태를 확인해 주세요.'));
           });
+          if (scene4DesignTurnActive) return [{ role: 'system', content: SCENE4_DRAFT_POLICY }];
           const runtime = acpToolRuntime;
           const turnUserConfig = getUserConfig();
           const activeModel = inspectActiveProvider().model;
@@ -14190,6 +14120,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           ];
         },
         getTools: ({ userText }) => {
+          if (scene4DesignTurnActive) {
+            acpTurnToolSpecs = [];
+            return [];
+          }
           const runtime = acpToolRuntime;
           if (!runtime) return [];
           const tools = buildNextDashboardTuiTurnTools(pluginRouteAdapter, {
@@ -17187,7 +17121,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           thinking.update('Thinking');
 
           let latestTurnUsage: import('../prompt-cache/types.js').LLMUsage | undefined;
-          const runPlainSubmitTurn = (submit: PlainTurnSubmit) => runDashboardChatMainPlainTurn({
+          const executePlainSubmitTurn = (submit: PlainTurnSubmit) => runDashboardChatMainPlainTurn({
             // ⛔⭐ 관측 심을 «실제로» 넘긴다 — 타입만 선택적으로 넓히면 조용히 안 온다(`F12`).
             debugLog: (category, event, payload, opts) => { try { debug.log(category, event, payload, opts); } catch { /* fail-soft */ } },
             userText: tok.text,
@@ -17220,6 +17154,33 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             getUserConfig,
             inspectActiveProvider,
             getActivePluginName: () => pluginHost.active()?.name,
+            prepareArchitectureContext: async (userText) => {
+              const { isTicketingArchitecturePrompt } = await import('../graph-runner/ticketing-scene4.js');
+              if (!isTicketingArchitecturePrompt(userText)) return null;
+              const { dispatchKnowledgeQuery } = await import('../knowledge/tools/knowledge-query.js');
+              const packId = 'pack:ticketing-architecture-public@0.2.0';
+              const results = await Promise.all(['좌석', '대기열', '결제'].map(question => dispatchKnowledgeQuery({ pack_id: packId, question })));
+              const cards = [...new Map(results.flatMap(result => result.pack_hits ?? []).map(hit => [hit.ref, hit])).values()].slice(0, 10);
+              if (!cards.length) throw new Error('scene4 design pack is not installed');
+              return `${SCENE4_DRAFT_POLICY}\n설계 도메인 팩 ${packId}의 카드 요점을 사용하고 출처 ref를 인용하라. 응답에는 좌석 원장·공정 대기열·결제 실패 복구·용량 가정을 포함하라.\n${cards.map(card => `[${card.ref}] ${card.title}: ${card.body}`).join('\n').slice(0, 12000)}`;
+            },
+            deliverArchitecture: async (userText, fullResponse) => {
+              const { isTicketingArchitecturePrompt, runScene4Architecture } = await import('../graph-runner/ticketing-scene4.js');
+              if (!isTicketingArchitecturePrompt(userText)) return null;
+              const { randomUUID } = await import('node:crypto');
+              const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+              const cwd = getSessionCwd();
+              const resourceRoot = [cwd, resolve(import.meta.dir, '../..')].find(root =>
+                existsSync(join(root, 'plugins/demo-brief-to-requirements/graphs/scene4-architecture.yaml'))
+                && existsSync(join(root, 'plugins/architecture-deliverables/graphs/architecture-deliverables.yaml')));
+              if (!resourceRoot) throw new Error('scene4 and architecture output plugins are not available');
+              const graphPath = join(resourceRoot, 'plugins/demo-brief-to-requirements/graphs/scene4-architecture.yaml');
+              const runKey = randomUUID();
+              const result = await runScene4Architecture({ prompt: userText, answer: fullResponse,
+                outDir: join(effectiveInstanceRoot(), 'scene4-architecture', runKey), stateRoot: effectiveInstanceRoot(),
+                resourceRoot, architecturePluginRoot: join(resourceRoot, 'plugins/architecture-deliverables'), graphPath });
+              return result.receiptPath;
+            },
             buildTurnPromptRuntime: (userText, turnId, inputSource) => buildDashboardTurnPromptRuntime(
               userText,
               turnId,
@@ -17256,6 +17217,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 memorySaveFailed = true;
                 pushChatLine(C.warning('  ⚠ 기억을 저장하지 못했습니다. 저장소 상태를 확인해 주세요.'));
               });
+              if (scene4DesignTurnActive) return [{ role: 'system', content: SCENE4_DRAFT_POLICY }];
               // Wave 5 (2026-05-04) — plain-chat path enabledTools
               // propagation. Wave 4 wired the ACP path (line ~15107)
               // by inlining buildSessionRuntimeToolSpecs inside the
@@ -17573,6 +17535,14 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               });
             },
           });
+          const runPlainSubmitTurn = (submit: PlainTurnSubmit) => {
+            scene4DesignTurnActive = isTicketingArchitecturePrompt(tok.text);
+            return withScene4Workspace(tok.text, {
+              getCwd: getSessionCwd,
+              setCwd: (cwd) => setSessionCwd(cwd, 'tool'),
+              run: () => executePlainSubmitTurn(submit),
+            }).finally(() => { scene4DesignTurnActive = false; });
+          };
 
           // Goal-loop FU-1 (2026-05-05) — wrap submit-intent in a
           // do-while so an active /goal can drive auto-continuation

@@ -19,6 +19,8 @@ import { HARD_REHEARSAL_POD_SHARDS, hardRehearsalGateVersion, planHardRehearsalR
 import { appendGateShardLedger, appendGateShardLedgerBatch, gateShardLedgerPath, readGateShardLedger, type GateShardLedgerRow } from './gate-shard-ledger.js';
 import { gateShardsPath, writeGateShards } from './gate-shards.js';
 import type { CloudVmAdapter } from './cloud-vm-adapter.js';
+import { simCli } from '../ux-sim/in-process-cli.js';
+import { withFakeBins } from '../ux-sim/fake-bin.js';
 
 const cut = '2026-10-10T13:00:00Z';
 const schedule = { version: '0.2.23', cutAt: cut, publishAt: '2026-10-10T15:30:00Z' } as ReleaseSchedule;
@@ -800,23 +802,56 @@ test('a preflight with no runnable shards releases its claim and the next tick r
   expect(stamp(root, 'rc-7h').outcome).toBe('ok');
 });
 
-test('missing gate shard plan releases claim regardless of diagnostic wording', async () => {
-  const root = newRoot(), h = harness(at(420), rc({ shards: 1 }));
+test('unknown selected test inventory stays unmeasured without launching the RC', async () => {
+  const root = newRoot(), h = harness(at(420), rc({ shards: 4 }));
   const stage = join(root, 'release', schedule.version, 'rehearsal', 'rc-7h.json');
-  let boardReady = false;
-  h.deps.shardPlan = () => ({ shards: 1, testFiles: 1, gatePlanShards: boardReady ? 1 : null,
+  h.deps.shardPlan = () => ({ shards: 1, testFiles: null, gatePlanShards: null,
     resources: { cpus: 8, freeBytes: 8e9, totalBytes: 16e9 },
-    planningGaps: boardReady ? [] : ['gate board pending'],
-    unmeasured: boardReady ? null : 'gate board pending' });
-  const opts = { ledgerRoot: root, checkout: '/fake/checkout', apply: true };
-  const first = await runRehearsalTick(opts, h.deps);
-  expect(first).toMatchObject({ status: 'due', run: 'rc-7h', stamps: [{ outcome: 'unmeasured', shardPlan: { gatePlanShards: null } }] });
+    planningGaps: ['selected test inventory unavailable'], unmeasured: null });
+  const result = await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
+  expect(result).toMatchObject({ status: 'due', run: 'rc-7h', stamps: [{ outcome: 'unmeasured',
+    summary: expect.stringContaining('rehearsal test inventory unavailable') }] });
+  expect(JSON.stringify(result)).toContain('selected test inventory unavailable');
+  expect(JSON.stringify(result)).not.toContain('selected test files empty');
   expect(existsSync(stage)).toBe(false);
   expect(h.calls).toEqual([]);
-  boardReady = true;
-  const second = await runRehearsalTick(opts, h.deps);
-  expect(second).toMatchObject({ status: 'due', run: 'rc-7h', stamps: [{ outcome: 'ok', shardPlan: { gatePlanShards: 1 } }] });
+});
+
+test('missing gate shard plan runs the conservative four-shard host gate once', async () => {
+  const root = newRoot(), h = harness(at(420), rc({ shards: 4 }));
+  const stage = join(root, 'release', schedule.version, 'rehearsal', 'rc-7h.json');
+  const executionSelections: Array<{ shards?: number; remote?: string; rehearsalCloudHost?: boolean }> = [];
+  const lightRc = h.deps.lightRc!;
+  h.deps.lightRc = async (version, checkout, selection, runId) => {
+    executionSelections.push(selection);
+    return lightRc(version, checkout, selection, runId);
+  };
+  h.deps.shardPlan = () => ({ shards: 1, testFiles: 1, gatePlanShards: null,
+    resources: { cpus: 8, freeBytes: 8e9, totalBytes: 16e9 },
+    planningGaps: ['gate board pending'], unmeasured: 'gate board pending' });
+  const opts = { ledgerRoot: root, checkout: '/fake/checkout', apply: true };
+  const first = await runRehearsalTick(opts, h.deps);
+  expect(first).toMatchObject({ status: 'due', run: 'rc-7h', stamps: [{ outcome: 'ok', shardPlan: { gatePlanShards: null },
+    selection: { shards: 4, remote: 'aws1', fullFallback: { reason: expect.stringContaining('persisted gate shard plan unavailable') } } }] });
+  expect(existsSync(stage)).toBe(true);
   expect(h.calls).toEqual([schedule.version]);
+  expect(executionSelections[0]).toMatchObject({ shards: 4, remote: 'aws1', rehearsalCloudHost: true });
+  await runRehearsalTick(opts, h.deps);
+  expect(h.calls).toEqual([schedule.version]);
+});
+
+test('missing RSS and unverified scope launch fallback but cannot turn an unmeasured RC green', async () => {
+  const root = newRoot(), h = harness(at(420), rc({ introduced: null, unclassified: null,
+    unmeasured: 'remote shard-2 unmeasured', gateExitCode: 2, ok: false }));
+  h.deps.shardPlan = () => ({ shards: 4, testFiles: 2639, gatePlanShards: null,
+    resources: { cpus: 8, freeBytes: 8e9, totalBytes: 16e9 },
+    planningGaps: ['selected file memory not measured: 1195/2639', 'unverified scope: 916'],
+    unmeasured: 'selected file memory not measured: 1195/2639; unverified scope: 916; persisted gate shard plan unavailable' });
+  const result = await runRehearsalTick({ ledgerRoot: root, checkout: '/fake/checkout', apply: true }, h.deps);
+  expect(h.calls).toEqual([schedule.version]);
+  expect(result).toMatchObject({ stamps: [{ outcome: 'unmeasured', selection: { shards: 4, remote: 'aws1',
+    fullFallback: { reason: expect.stringContaining('selected file memory not measured: 1195/2639') } },
+    result: { unmeasured: 'remote shard-2 unmeasured' } }] });
 });
 
 test('REHEARSAL-HARD-2H-MANDATORY: rc-150m falls back to a complete remote shard run when planning inputs are incomplete', async () => {
@@ -1491,11 +1526,10 @@ test('CLI apply accepts injected clock and checkout, emits one JSON result and c
   expect(stamp(root, 'rc-7h').sha).toBe('1234567890abcdef');
 });
 
-test('release CLI two ticks report shard shortage, released claim, and same-stage retry in an isolated ledger', async () => {
-  const root = newRoot(), h = harness(at(420), rc({ shards: 1 }));
+test('release CLI records the four-shard fallback once when the prior board is missing', async () => {
+  const root = newRoot(), h = harness(at(420), rc({ shards: 4 }));
   const checkout = resolve(import.meta.dir, '..', '..');
   const stage = join(root, 'release', schedule.version, 'rehearsal', 'rc-7h.json');
-  let boardReady = false;
   h.deps.shardPlan = planRehearsalShards;
   let leakChecks = 0;
   h.deps.leakCheck = () => { leakChecks++; return { status: 0 }; };
@@ -1504,12 +1538,12 @@ test('release CLI two ticks report shard shortage, released claim, and same-stag
     select: () => ({ testFiles: ['src/release-loop/rehearsal.test.ts'], unrunImporterTotal: 0 }),
     fileMemory: () => new Map([['src/release-loop/rehearsal.test.ts', 500]]),
     resources: () => ({ cpus: 4, freeBytes: 8 * 1024 ** 3, totalBytes: 16 * 1024 ** 3 }),
-    board: () => boardReady ? { v: 1, version: schedule.version, updatedAt: at(420).toISOString(), shards: [{ id: '0', state: 'done' }] } : null,
+    board: () => null,
   };
   h.deps.lightRc = async (version, cwd) => {
     expect(cwd).toBe(checkout);
     h.calls.push(version);
-    return rc({ shards: 1 });
+    return rc({ shards: 4 });
   };
   setElanousConfigDir(root);
   const cli = new Command(); registerReleaseCommands(cli, { ledgerRoot: root }, {}, {}, {}, h.deps);
@@ -1521,23 +1555,22 @@ test('release CLI two ticks report shard shortage, released claim, and same-stag
     const args = ['release', 'rehearsal', 'tick', '--apply', '--checkout', checkout, '--json'];
     process.exitCode = 0;
     await cli.parseAsync(args, { from: 'user' });
-    expect(process.exitCode).toBe(1);
-    expect(JSON.parse(outputs[0]!)).toMatchObject({ ok: false, status: 'due', run: 'rc-7h', stamps: [{ outcome: 'unmeasured', shardPlan: { gatePlanShards: null, testFiles: 1 } }] });
-    expect(existsSync(stage)).toBe(false);
-    expect(h.calls).toEqual([]);
+    expect(process.exitCode).toBe(0);
+    expect(JSON.parse(outputs[0]!)).toMatchObject({ ok: true, status: 'due', run: 'rc-7h', stamps: [{ outcome: 'ok', shardPlan: { gatePlanShards: null, testFiles: 1 }, selection: { shards: 4 } }] });
+    expect(existsSync(stage)).toBe(true);
+    expect(h.calls).toEqual([schedule.version]);
     expect(leakChecks).toBe(1);
-    boardReady = true;
     process.exitCode = 0;
     await cli.parseAsync(args, { from: 'user' });
     expect(process.exitCode).toBe(0);
-    expect(JSON.parse(outputs[1]!)).toMatchObject({ ok: true, status: 'due', run: 'rc-7h', stamps: [{ outcome: 'ok', shardPlan: { testFiles: 1 } }] });
-    expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', result: { shards: 1 } });
+    expect(JSON.parse(outputs[1]!)).toMatchObject({ ok: true, status: 'not-yet' });
+    expect(stamp(root, 'rc-7h')).toMatchObject({ outcome: 'ok', result: { shards: 4 } });
     expect(h.calls).toEqual([schedule.version]);
-    expect(leakChecks).toBe(2);
+    expect(leakChecks).toBe(1);
   } finally { process.exitCode = exit ?? 0; process.stdout.write = original; console.error = oldError; }
 });
 
-test('production release CLI retries the same RC after a preflight shortage without leaving a stage claim', () => {
+test('in-process production release CLI retries the same RC after a preflight shortage without leaving a stage claim', async () => {
   const root = newRoot(false), repo = resolve(import.meta.dir, '..', '..');
   const checkout = join(root, 'checkout');
   mkdirSync(join(checkout, 'scripts'), { recursive: true });
@@ -1566,49 +1599,60 @@ test('production release CLI retries the same RC after a preflight shortage with
   writeFileSync(join(dir, 'hard-mid.json'), JSON.stringify({ version, step: 'hard-mid', cutAt,
     outcome: 'ok', startedAt: cutAt, endedAt: cutAt, notifiedAt: cutAt }));
   const stage = join(dir, 'rc-7h.json');
-  const args = ['bin/elanous.mjs', '--test', '--config-dir', root, 'release', 'rehearsal', 'tick', '--apply', '--checkout', checkout, '--json'];
   const before = existsSync(stage);
   // The export preflight must not treat this host's unrelated test fixture paths as leaks.
-  // 0.2.37 needed 86.5 s for both real CLI invocations; the 0.2.38 gate
-  // returned status=null after 89 s with a 60 s per-child budget.
-  const run = () => {
-    const startedAt = Date.now();
-    // Two sequential children must fit within the enclosing 300 s test budget.
-    const env: NodeJS.ProcessEnv = { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_EXPORT_REDACTIONS: join(root, 'empty-redactions.tsv'),
-      ELANOUS_LEAK_HOME_USER: 'rehearsal-fixture' };
-    // The gate runner may export an ignored legacy config variable that points at its state directory.
-    // This CLI fixture supplies --config-dir explicitly; do not let the legacy variable contaminate its child.
-    delete env.ELANOUS_CONFIG_DIR;
-    const probeOut = mkdtempSync(join(root, 'export-probe-'));
-    const probe = spawnSync('bun', ['scripts/public-export.ts', '--out', join(probeOut, 'export'), '--json', '--all'],
-      { cwd: checkout, encoding: 'utf8', timeout: 60_000, env });
-    expect(probe.status, `fixture export probe failed: stdout=${probe.stdout ?? ''} stderr=${probe.stderr ?? ''}`).toBe(0);
-    const result = spawnSync('bun', args, { cwd: repo, encoding: 'utf8', timeout: 135_000,
-      env });
-    if (result.status === null) throw new Error(`rehearsal CLI did not exit: code=${(result.error as NodeJS.ErrnoException | undefined)?.code ?? 'none'} signal=${result.signal ?? 'none'} elapsedMs=${Date.now() - startedAt}`);
-    return result;
-  };
-  writeFileSync(join(root, 'empty-redactions.tsv'), '');
-  const first = run(), afterFirst = existsSync(stage);
-  const second = run(), afterSecond = existsSync(stage);
-  expect(first.status, `first tick stdout=${first.stdout} stderr=${first.stderr}`).toBe(1);
-  expect(second.status, `first tick stdout=${first.stdout} stderr=${first.stderr} stageAfterFirst=${afterFirst}; second tick stdout=${second.stdout} stderr=${second.stderr}`).toBe(1);
-  const one = JSON.parse(first.stdout) as { ok: boolean; status: string; run: string; stamps: Array<{ outcome: string; summary: string; shardPlan: { gatePlanShards: number | null } }> };
-  const two = JSON.parse(second.stdout) as typeof one;
-  expect(one).toMatchObject({ status: 'due', run: 'rc-7h', stamps: [{ shardPlan: { gatePlanShards: null } }] });
-  expect([one.status, one.run, one.ok, one.stamps[0]?.outcome, one.stamps[0]?.shardPlan.gatePlanShards]).toEqual(['due', 'rc-7h', false, 'unmeasured', null]);
-  expect([two.status, two.run, two.ok, two.stamps[0]?.outcome, two.stamps[0]?.shardPlan.gatePlanShards]).toEqual(['due', 'rc-7h', false, 'unmeasured', null]);
-  expect(one.stamps[0]?.summary).toContain('rehearsal shard plan unavailable');
-  expect(two.stamps[0]?.summary).toContain('rehearsal shard plan unavailable');
-  for (const result of [first, second]) {
-    expect(result.stderr).toContain(`· 리허설 ${version} rc-7h · rehearsal shard plan unavailable`);
-    expect(result.stderr).toContain('· stage claim 해제 · 다음 tick 재시도');
+  const previousRedactions = process.env.ELANOUS_EXPORT_REDACTIONS;
+  const previousLeakHomeUser = process.env.ELANOUS_LEAK_HOME_USER;
+  try {
+    process.env.ELANOUS_EXPORT_REDACTIONS = join(root, 'empty-redactions.tsv');
+    process.env.ELANOUS_LEAK_HOME_USER = 'rehearsal-fixture';
+    const run = async () => {
+      const result = await simCli(['release', 'rehearsal', 'tick', '--apply', '--checkout', checkout, '--json'], {
+        allowPaths: [['release', 'rehearsal', 'tick']], stateRoot: root,
+      });
+      return { status: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+    };
+    writeFileSync(join(root, 'empty-redactions.tsv'), '');
+    // This case targets retry/stage-claim behavior after shard-plan preflight fails;
+    // the public-export scanner contract is covered separately, so fake its success here.
+    const { first, second, afterFirst, afterSecond } = await withFakeBins({
+      bun: { exitCode: 127, responses: [{ argsStartWith: ['scripts/public-export.ts'], stdout: '{"leaks":0,"hits":[]}\n' }] },
+    }, async fakeBins => {
+      const first = await run(), afterFirst = existsSync(stage);
+      const second = await run(), afterSecond = existsSync(stage);
+      const calls = fakeBins.calls();
+      expect(calls).toHaveLength(2);
+      for (const call of calls) {
+        expect(call.name).toBe('bun');
+        expect(call.argv).toEqual(['scripts/public-export.ts', '--out', expect.any(String), '--json', '--all']);
+      }
+      return { first, second, afterFirst, afterSecond };
+    });
+    expect(first.status).toBe(1);
+    expect(second.status).toBe(1);
+    const one = JSON.parse(first.stdout) as { ok: boolean; status: string; run: string; stamps: Array<{ outcome: string; summary: string; shardPlan: { gatePlanShards: number | null } }> };
+    const two = JSON.parse(second.stdout) as typeof one;
+    expect(one).toMatchObject({ status: 'due', run: 'rc-7h', stamps: [{ shardPlan: { gatePlanShards: null } }] });
+    expect([one.status, one.run, one.ok, one.stamps[0]?.outcome, one.stamps[0]?.shardPlan.gatePlanShards]).toEqual(['due', 'rc-7h', false, 'unmeasured', null]);
+    expect([two.status, two.run, two.ok, two.stamps[0]?.outcome, two.stamps[0]?.shardPlan.gatePlanShards]).toEqual(['due', 'rc-7h', false, 'unmeasured', null]);
+    expect(one.stamps[0]?.summary).toMatch(/rehearsal (?:shard plan|test inventory) unavailable/);
+    expect(two.stamps[0]?.summary).toMatch(/rehearsal (?:shard plan|test inventory) unavailable/);
+    for (const result of [first, second]) {
+      expect(result.stderr).toContain(`· 리허설 ${version} rc-7h ·`);
+      expect(result.stderr).toMatch(/rehearsal (?:shard plan|test inventory) unavailable/);
+      expect(result.stderr).toContain('· stage claim 해제 · 다음 tick 재시도');
+    }
+    expect([before, afterFirst, afterSecond]).toEqual([false, false, false]);
+    console.log(`CLI tick 1 rc=${first.status} stdout=${first.stdout.trim()} stderr=${first.stderr.trim()}`);
+    console.log(`stage before=${before} after tick 1=${afterFirst}`);
+    console.log(`CLI tick 2 rc=${second.status} stdout=${second.stdout.trim()} stderr=${second.stderr.trim()}`);
+    console.log(`stage after tick 2=${afterSecond}`);
+  } finally {
+    if (previousRedactions === undefined) delete process.env.ELANOUS_EXPORT_REDACTIONS;
+    else process.env.ELANOUS_EXPORT_REDACTIONS = previousRedactions;
+    if (previousLeakHomeUser === undefined) delete process.env.ELANOUS_LEAK_HOME_USER;
+    else process.env.ELANOUS_LEAK_HOME_USER = previousLeakHomeUser;
   }
-  expect([before, afterFirst, afterSecond]).toEqual([false, false, false]);
-  console.log(`CLI tick 1 rc=${first.status} stdout=${first.stdout.trim()} stderr=${first.stderr.trim()}`);
-  console.log(`stage before=${before} after tick 1=${afterFirst}`);
-  console.log(`CLI tick 2 rc=${second.status} stdout=${second.stdout.trim()} stderr=${second.stderr.trim()}`);
-  console.log(`stage after tick 2=${afterSecond}`);
 }, 300_000);
 
 test('CLI rejects invalid --shards and --remote before RC stamp', async () => {

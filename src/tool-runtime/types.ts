@@ -55,6 +55,8 @@ export interface ToolRuntimeContext {
   /** MCP only — the connected client's `clientInfo.name` from `initialize`
    *  (e.g. `claude-code`, `codex-mcp-client`). Unset on other surfaces. */
   mcpClient?: string;
+  /** Host-authenticated seat identity. Never populated from MCP tool arguments. */
+  authenticatedSeat?: string;
   /** Optional caller-supplied MCP join key. Correlation only; never an authorization input. */
   runId?: string;
   /** Cancellation — forwarded to underlying dispatcher when

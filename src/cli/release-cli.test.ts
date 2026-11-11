@@ -3,7 +3,7 @@ import { Command } from 'commander';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { checklistHistory, listChecklist, devVersion, refRoots, type Checklist, type ChecklistItem } from '../release-loop/checklist.js';
 import { CliUserError } from './cli-user-error.js';
@@ -22,22 +22,14 @@ import { codeRevision, setCodeRevisionRootForTesting } from '../version/code-rev
 import { enableLandingFreeze } from '../release-loop/landing-freeze.js';
 import { fileLeaseStore, serializeLease } from '../hq/lease.js';
 import type { HqDeps } from '../hq/hq.js';
-import { formatResumeGatePlan, GATE_SHARD_JSON_PAGE_MAX_BYTES, isPrerelease, isReleaseVersion, planPublish, prepareRelease, publishRelease, registerReleaseCommands as registerReleaseCommandsImpl, runReleaseInstaller, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, releaseCliFreshnessCutRevision, type ReleaseManifest, type Runner } from './release-cli.js';
+import { formatResumeGatePlan, GATE_SHARD_JSON_PAGE_MAX_BYTES, isPrerelease, isReleaseVersion, planPublish, prepareRelease, publishRelease, registerReleaseCommands as registerReleaseCommandsImpl, runReleaseInstaller, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 import { readActiveForceReleaseRun } from './release-single-flight.js';
 import { appendGateShardLedger, gateShardLedgerPath, readGateShardLedger, type GateShardLedgerRow } from '../release-loop/gate-shard-ledger.js';
 import { simCli } from '../ux-sim/in-process-cli.js';
 import { runGateNode } from '../../scripts/release-loop/gate-node.js';
-import { main as versionNodeMain } from '../../scripts/release-loop/version-node.js';
 
 const releaseCliTestCheckout = codeRevision() ?? '';
 const verifiedMainForCliTests = releaseCliTestCheckout;
-
-test('adopt failed-run freshness is pinned to the release CLI commit, not the test main base', () => {
-  const cliRevision = 'a'.repeat(40);
-  expect(releaseCliFreshnessCutRevision(undefined, true, cliRevision, {
-    NODE_ENV: 'test', ELANOUS_TEST_RELEASE_CLI_FRESHNESS_BASE: 'b'.repeat(40),
-  })).toBe(cliRevision);
-});
 
 function scopeReleaseCliFreshnessTestBase(): void {
   let previous: string | undefined;
@@ -59,8 +51,9 @@ const frozenGateRunner = {
 } as never;
 
 const registerReleaseCommands: typeof registerReleaseCommandsImpl = (...args) => {
-  const [program, releaseRunDeps = {}, ...rest] = args;
-  registerReleaseCommandsImpl(program, { assertCliCurrent: () => {}, ...releaseRunDeps }, ...rest);
+  const [program, releaseRunDeps = {}, landedDeps = {}, hqDeps = {}, lightRcDeps = {}, rehearsalDeps = {}, resumeDeps = {}, checklistEvidenceReader] = args;
+  registerReleaseCommandsImpl(program, { assertCliCurrent: () => {}, ...releaseRunDeps }, landedDeps, hqDeps,
+    lightRcDeps, rehearsalDeps, resumeDeps, checklistEvidenceReader, { listOpenPullRequests: () => [] });
 };
 
 test('release resume plan shows corrupt shard IDs in the partial gate label', () => {
@@ -588,6 +581,40 @@ function checklistTargetGitFixture(root: string): string {
 }
 
 describe('release checklist CLI', () => {
+  test('only OP and OPC may mark a checklist cell green through the CLI', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-checklist-green-authority-'));
+    const previousTrack = process.env.ELANOUS_TRACK;
+    setElanousConfigDir(dir);
+    const output = spyOn(console, 'log').mockImplementation(() => {});
+    const run = async (track: string, ...args: string[]) => {
+      process.env.ELANOUS_TRACK = track;
+      const cmd = new Command(); registerReleaseCommands(cmd);
+      await cmd.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' });
+    };
+    try {
+      const title = '대상 경로: src/release-loop/checklist.ts\n- 완료 경계 코드: green 권한 검사\n- 완료 경계 실물: CLI actor 판정\n- 완료 경계 증거 명령: bun test src/cli/release-cli.test.ts';
+      await run('OP', 'add', 'GREEN-OP', title, '--owner', 'TC');
+      const beforeTcAttempt = checklistHistory('GREEN-OP');
+      await expect(run('TC', 'set', 'GREEN-OP', '--status', 'green')).rejects.toThrow('판정국에 [GREEN-REQ]');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'GREEN-OP')?.status).toBe('yellow');
+      expect(checklistHistory('GREEN-OP')).toEqual(beforeTcAttempt);
+      await expect(run('UX', 'set', 'GREEN-OP', '--status', 'green')).rejects.toThrow('판정국에 [GREEN-REQ]');
+      expect(checklistHistory('GREEN-OP')).toEqual(beforeTcAttempt);
+      await run('TC', 'set', 'GREEN-OP', '--status', 'red');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'GREEN-OP')?.status).toBe('red');
+      await run('OP', 'set', 'GREEN-OP', '--status', 'green');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'GREEN-OP')?.status).toBe('green');
+      await run('OP/q1', 'set', 'GREEN-OP', '--status', 'green');
+
+      await run('OPC', 'add', 'GREEN-OPC', title);
+      await run('OPC', 'set', 'GREEN-OPC', '--status', 'green');
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'GREEN-OPC')?.status).toBe('green');
+    } finally {
+      if (previousTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previousTrack;
+      output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('strict add/retitle rejects malformed code cells before ledger writes; skip-note keeps evidence once', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-target-paths-cli-'));
     const repo = checklistTargetGitFixture(dir);
@@ -735,6 +762,8 @@ describe('release checklist CLI', () => {
   }, 180_000);
   test('refs <doc> lists citing cells across versions as a table or JSON and writes nothing', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-checklist-refs-cli-'));
+    const previousTrack = process.env.ELANOUS_TRACK;
+    process.env.ELANOUS_TRACK = 'OP';
     setElanousConfigDir(dir);
     const lines: string[] = [];
     const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
@@ -761,6 +790,7 @@ describe('release checklist CLI', () => {
       jsonOutput.mockRestore();
       resetElanousConfigDir();
       rmSync(dir, { recursive: true, force: true });
+      if (previousTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = previousTrack;
     }
   });
 
@@ -893,7 +923,6 @@ describe('release checklist CLI', () => {
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
       expect(release.commands.find((c) => c.name() === 'run')!.helpInformation()).toContain('--if-ready');
-      expect(release.commands.find((c) => c.name() === 'run')!.helpInformation()).toContain('--adopt-failed-run <runId>');
       expect(release.commands.find((c) => c.name() === 'preflight')!.helpInformation()).toContain('--countdown');
       expect(release.commands.find((c) => c.name() === 'resume')!.helpInformation()).toContain('--dry-run');
     } finally {
@@ -1250,6 +1279,16 @@ describe('release schedule CLI', () => {
       expect(JSON.parse(lines.at(-1)!)).toHaveLength(1);
       await run('set', '--version', '0.2.10', '--cut-at', '2026-10-03T09:00+09:00');
       expect(lines.at(-1)).toBe('0.2.10 컷 10-03(토) 09:00 KST · 착지 마감 06:30');
+      await run('sweep-due', '--version', '0.2.10', '--dirty-files', '2', '--at', '2026-10-02T15:00:00Z', '--json');
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ decision: { reason: 'cadence', dirtyFiles: 2 } });
+      await run('sweep-due', '--version', '0.2.10', '--dirty-files', '2', '--at', '2026-10-02T15:00:00Z');
+      expect(lines.at(-1)).toContain('대상 2파일 · 증명서 나이 측정 불가');
+      await run('sweep-due', '--version', '0.2.10', '--dirty-files', '2', '--last-sweep-at', '2026-10-02T13:00:00Z',
+        '--at', '2026-10-02T15:00:00Z', '--json');
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ decision: null });
+      await run('sweep-due', '--version', '0.2.10', '--dirty-files', '1', '--last-sweep-at', '2026-10-02T21:00:00Z',
+        '--at', '2026-10-02T22:30:00Z', '--json');
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ decision: { reason: 'pre-cut', dirtyFiles: 1 } });
       await expect(run('set', '--version', '0.2.10', '--cut-at', '2026-10-03T08:00')).rejects.toThrow('오프셋 필요');
     } finally {
       output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
@@ -1882,112 +1921,6 @@ describe('release run CLI', () => {
       } finally { process.exitCode = before ?? 0; write.mockRestore(); output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
     }
   });
-
-  test('--adopt-failed-run parses into the release graph input on a direct stable run', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'release-run-adopt-preview-'));
-    const ledger = join(dir, 'ledger');
-    mkdirSync(join(ledger, 'release', '0.2.3'), { recursive: true });
-    writeFileSync(join(ledger, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
-    const stdout: string[] = [];
-    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { stdout.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
-    const previousExit = process.exitCode;
-    try {
-      process.exitCode = 0;
-      const cli = new Command();
-      registerReleaseCommands(cli, { ledgerRoot: ledger, config: { gatePodPool: 'preview-pool' }, graph: async () => { throw new Error('dry-run invoked graph'); } });
-      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--adopt-failed-run', 'failed-run-1', '--json'], { from: 'user' });
-      expect(JSON.parse(stdout.at(-1)!)).toMatchObject({ ok: true, dryRun: true, input: {
-        version: '0.2.4', branchCut: true, adoptFailedRunId: 'failed-run-1', gatePodPool: 'preview-pool',
-      } });
-      expect(process.exitCode).toBe(0);
-    } finally { process.exitCode = previousExit ?? 0; write.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
-  });
-
-  test('--adopt-failed-run crosses the live CLI and graph into the adoption event and artifact owner', async () => {
-    const ledger = mkdtempSync(join(tmpdir(), 'release-run-adopt-graph-'));
-    const bin = join(ledger, 'bin');
-    mkdirSync(bin);
-    const tip = 'a'.repeat(40);
-    const base = 'b'.repeat(40);
-    writeFileSync(join(ledger, 'state.json'), JSON.stringify({ tip, base, version: '0.2.4-dev.0', branchVersion: '0.2.4', branchOwner: 'failed-source' }));
-    const fakeGit = `#!/usr/bin/env node
-const state = JSON.parse(require('node:fs').readFileSync(${JSON.stringify(join(ledger, 'state.json'))}, 'utf8'));
-const args = process.argv.slice(2);
-if (args[0] === 'fetch') process.exit(0);
-if (args[0] === 'ls-remote') { const ref = args.at(-1) || ''; if (ref === 'refs/heads/release/0.2.4') console.log(state.tip + '\\t' + ref); process.exit(0); }
-if (args[0] === 'rev-parse' && args[1] === '--verify') { console.log(args[2].includes('refs/remotes/origin/release/') ? state.tip : state.base); process.exit(0); }
-if (args[0] === 'merge-base') { console.log(state.base); process.exit(0); }
-if (args[0] === 'log' && args.some((arg) => arg.startsWith('--grep=^Cut from main '))) { console.log(state.tip + '\\x1fCut from main ' + state.base + '.'); process.exit(0); }
-if (args[0] === 'log') { console.log('Elanous-Release-Run: failed-source\\nElanous-Release-Attempt: 0\\n'); process.exit(0); }
-if (args[0] === 'show') { console.log(JSON.stringify({ version: args[1] === 'origin/main:package.json' || args[1].startsWith(state.base + ':') ? state.version : state.branchVersion })); process.exit(0); }
-console.error('unexpected fake git: ' + args.join(' ')); process.exit(2);
-`;
-    const gitPath = join(bin, 'git');
-    writeFileSync(gitPath, fakeGit);
-    chmodSync(gitPath, 0o755);
-    mkdirSync(join(ledger, 'release', '0.2.3'), { recursive: true });
-    writeFileSync(join(ledger, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
-    const failedPath = join(ledger, 'graph-runs', 'release-loop', 'failed-source.json');
-    mkdirSync(join(ledger, 'graph-runs', 'release-loop'), { recursive: true });
-    writeFileSync(failedPath, JSON.stringify({ graphId: 'release-loop', runId: 'failed-source', status: 'failed', startedAt: '2026-11-10T00:00:00Z',
-      input: { version: '0.2.4', branchCut: true }, path: ['version-release', 'readiness-countdown', 'failed'],
-      nodes: [{ nodeId: 'version-release', ok: true,
-        output: JSON.stringify({ outcome: 'ok', version: '0.2.4', commit: tip, branch: 'release/0.2.4' }) }], executed: 1, dryRun: false }));
-    const stdout: string[] = [];
-    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { stdout.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
-    const priorTrack = process.env.ELANOUS_TRACK;
-    const priorState = process.env.ELANOUS_STATE_DIR;
-    const priorExitCode = process.exitCode;
-    let graphStarts = 0;
-    try {
-      setElanousConfigDir(ledger);
-      process.env.ELANOUS_TRACK = 'OP';
-      process.exitCode = 0;
-      const cli = new Command();
-      registerReleaseCommands(cli, { ledgerRoot: ledger, freezeRoot: ledger, config: { gatePodPool: 'preview-pool' },
-        assertCliCurrent: () => {}, checklist: () => ({ ok: true, red: [], undecided: [], blocked: [] }), registerLogSink: async () => true,
-        graph: async (path, options) => {
-          graphStarts++;
-          return runGraph(path, { ...options, deps: { ...options.deps, runBash: async (body, runOptions) => {
-            if (!body.includes('version-node.ts release')) return { exitCode: 1, stdout: JSON.stringify({ outcome: 'fail', reason: 'test stopped after cut' }), stderr: '' };
-            const old = { context: process.env.ELANOUS_GRAPH_CONTEXT, state: process.env.ELANOUS_STATE_DIR,
-              fakeRoot: process.env.VERSION_NODE_TEST_ROOT, path: process.env.PATH };
-            try {
-              process.env.ELANOUS_GRAPH_CONTEXT = runOptions.env?.ELANOUS_GRAPH_CONTEXT ?? '';
-              process.env.ELANOUS_STATE_DIR = ledger;
-              process.env.VERSION_NODE_TEST_ROOT = ledger;
-              process.env.PATH = `${bin}:${process.env.PATH}`;
-              const output = versionNodeMain(['release', '--json'], ledger, { prebuildGateImage: (input) => ({ outcome: 'built', runId: input.runId,
-                cutCommit: input.commit, digest: `sha256:${'c'.repeat(64)}`, eligiblePools: ['preview-pool'] }) });
-              return { exitCode: output.outcome === 'ok' ? 0 : 1, stdout: JSON.stringify(output), stderr: '' };
-            } finally {
-              if (old.context === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = old.context;
-              if (old.state === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = old.state;
-              if (old.fakeRoot === undefined) delete process.env.VERSION_NODE_TEST_ROOT; else process.env.VERSION_NODE_TEST_ROOT = old.fakeRoot;
-              if (old.path === undefined) delete process.env.PATH; else process.env.PATH = old.path;
-            }
-          } } });
-        } });
-      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--force-new', '--adopt-failed-run', 'failed-source', '--json'], { from: 'user' });
-      const result = JSON.parse(stdout.at(-1)!) as { ok: boolean; state: { runId: string; status: string; nodes: Array<{ nodeId: string; output?: unknown }> } };
-      if (graphStarts !== 1) throw new Error(`release graph did not start: ${stdout.at(-1)}`);
-      expect(process.exitCode).toBe(1);
-      expect(result.state.status).toBe('failed');
-      const cutOutput = result.state.nodes.find((node) => node.nodeId === 'version-release')!.output;
-      const parsedCutOutput = typeof cutOutput === 'string' ? JSON.parse(cutOutput) : cutOutput;
-      expect(parsedCutOutput).toMatchObject({ artifactOwner: { runId: result.state.runId }, branchAdoption: {
-        event: 'release-branch-adopted', fromRunId: 'failed-source', toRunId: result.state.runId, version: '0.2.4', cutCommit: tip, branchTip: tip,
-      } });
-      expect(existsSync(join(ledger, 'release', '0.2.4', 'branch-adoptions'))).toBe(false);
-    } finally {
-      resetElanousConfigDir();
-      write.mockRestore();
-      process.exitCode = priorExitCode ?? 0;
-      if (priorTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = priorTrack;
-      if (priorState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = priorState;
-      rmSync(ledger, { recursive: true, force: true });
-    }
-  }, 30_000);
 
   test('--dry-run human output includes every graph input field without running the graph', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-run-cli-'));

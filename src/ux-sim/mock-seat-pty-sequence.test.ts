@@ -1,14 +1,21 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TEST_FAKE_LLM_TOOL_CALL_ENV } from './fake-llm.js';
+import { listSessions, loadSession } from '../session/index.js';
+import { TEST_FAKE_LLM_ENV, TEST_FAKE_LLM_RESPONSE_ENV, TEST_FAKE_LLM_TOOL_CALL_ENV } from './fake-llm.js';
 import { mockSeatPtySequence } from './mock-seat-pty-sequence.js';
 import { parseData, runNextTuiScenario } from './next-tui-seat-scenarios.js';
 
 const PROBE = join(import.meta.dir, 'mock-seat-pty-sequence-child.ts');
 const REPO_CLI = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
+const nextTuiTurnSettled = (screen: string): boolean => {
+  const lines = screen.split('\n');
+  const composer = lines.reduce((last, line, index) => line.startsWith('❯ ') ? index : last, -1);
+  const status = composer > 0 ? lines[composer - 1]!.trim() : '';
+  return status.startsWith('턴 완료 ·') && !/대기\s+[1-9]\d*/.test(status);
+};
 
 describe('N03 key sequence: one screen per step on a real PTY', () => {
   test('seat-seq CLI advertises the next-resume scenario', () => {
@@ -19,6 +26,47 @@ describe('N03 key sequence: one screen per step on a real PTY', () => {
     expect(run.stderr).toContain('next-resume');
     expect(run.stderr).toContain('next-core-harden');
   });
+
+  test('B3 /quit migration: quit-like plain text stays a chat turn in classic and next PTY', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'n03-quit-text-'));
+    const reply = '[fake-llm] quit text handled';
+    const inputs = ['quit', 'exit', '종료', '그만'];
+    try {
+      for (const mode of ['classic', 'next'] as const) {
+        for (const input of inputs) {
+          const root = join(dir, mode, input);
+          mkdirSync(root, { recursive: true });
+          writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+          const run = await mockSeatPtySequence({
+            executable: process.execPath,
+            args: [REPO_CLI, '--test={root}', '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', mode],
+            root,
+            env: {
+              [TEST_FAKE_LLM_ENV]: '1',
+              ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
+              [TEST_FAKE_LLM_RESPONSE_ENV]: reply,
+              ELANOUS_SESSION_ROOT: join(root, 'sessions'),
+              ELANOUS_CONFIG_DIR: root,
+              ELANOUS_STATE_DIR: root,
+              ELANOUS_STATE_DIR_SOURCE: 'explicit',
+            },
+            ready: { label: `${mode} boot`, until: (screen) => screen.includes('❯ ') },
+            steps: [{
+              label: `${mode} treats ${input} as ordinary text`,
+              text: input,
+              until: (screen) => screen.includes(input) && screen.includes(reply)
+                && (mode === 'classic' ? screen.includes('✔ 완료') : nextTuiTurnSettled(screen)),
+              timeoutMs: 30_000, // Source: #36860 bounded fake-provider PTY reply deadline.
+            }],
+            quitKeys: '\x11',
+            exitTimeoutMs: 20_000, // Source: #36860 bounded Ctrl+Q terminal cleanup wait.
+          });
+          expect(run.frames).toHaveLength(2);
+          expect(run.exitCode).toBe(0);
+        }
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 180_000);
 
   test('each step is read back as the screen the probe rendered, in order, with an isolated HOME', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'n03-seq-'));
@@ -61,6 +109,68 @@ describe('N03 key sequence: one screen per step on a real PTY', () => {
 // the universe back through the same CLI's `logs`. The busy-/new probe is a timing race (the fake
 // LLM answers in milliseconds), so it is reported as a check but not asserted here.
 describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
+  test('classic and next PTY compare the same three-child request; next folds lifecycle noise into one completed card', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'n03-three-child-tui-compare-'));
+    const ask = '세 자식으로 조사해줘';
+    const parentReply = '[fake] 세 자식 작업 완료';
+    async function runPtyMode(name: 'classic' | 'next') {
+      const root = join(dir, name);
+      mkdirSync(root, { recursive: true });
+      writeFileSync(join(root, 'config.json'), JSON.stringify({ onboarding: { completed: true }, errorReports: { enabled: false } }));
+      const next = name === 'next';
+      const calls: Array<{ name: string; args: Record<string, unknown> }> = [1, 2, 3].map((index) => ({
+        name: 'Agent', args: { description: `child ${index}`, prompt: `고정 child 지시 ${index}` },
+      }));
+      if (next) calls.push({ name: 'AgentOutput', args: { taskId: '$previousToolResult.taskId', block: false } });
+      const sequence = JSON.stringify({ when: '세 자식', calls });
+      return await mockSeatPtySequence({
+        executable: process.execPath,
+        args: [REPO_CLI, '--config-dir', '{root}', '--test-state-dir', '{root}', '--tui', next ? 'next' : 'classic'],
+        root, rows: 30, cols: 100, runId: `n03-three-child-${name}`,
+        env: {
+          ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
+          ELANOUS_TEST_FAKE_LLM_RESPONSE: parentReply, [TEST_FAKE_LLM_TOOL_CALL_ENV]: sequence,
+        },
+        quitKeys: next ? '\x11' : '/exit\r', exitTimeoutMs: 20_000,
+        ready: { label: 'boot', until: next
+          ? (screen) => screen.includes('바로 입력해 보세요:') && screen.includes('Ctrl+Q 종료')
+          : (screen) => (screen.includes('elanous | daemon') || screen.includes('Opening web setup…')
+            || screen.includes('웹 화면을 여는 중…') || screen.trimStart().startsWith('elanous')) && screen.includes('❯') },
+        steps: [{ label: 'three-child request', text: ask,
+          until: (screen) => screen.includes(parentReply) && (next
+            ? screen.includes('완료 3') && nextTuiTurnSettled(screen)
+            : screen.includes('✔ 완료')) }],
+      });
+    }
+    try {
+      const classic = await runPtyMode('classic');
+      const next = await runPtyMode('next');
+      const classicScreen = classic.frames.at(-1)?.screen ?? '';
+      const nextScreen = next.frames.at(-1)?.screen ?? '';
+      const sessionMessages = (name: 'classic' | 'next') => {
+        const root = join(dir, name);
+        const sessionRoot = join(root, 'sessions');
+        return listSessions({}, sessionRoot).flatMap(({ id }) => loadSession(id, sessionRoot)?.messages ?? []);
+      };
+      const classicMessages = sessionMessages('classic');
+      const nextMessages = sessionMessages('next');
+      const toolNames = (messages: typeof classicMessages) => messages
+        .filter((message) => message.role === 'tool').map((message) => message.toolName ?? '');
+      const classicTools = toolNames(classicMessages);
+      const nextTools = toolNames(nextMessages);
+      expect(classic.exitCode).toBe(0);
+      expect(next.exitCode).toBe(0);
+      expect(nextScreen.match(/하위 에이전트 ·/g)?.length).toBe(1);
+      expect(nextScreen).toContain('완료 3');
+      expect(nextScreen).not.toMatch(/실행 중 \d|진행 중/);
+      expect(nextScreen).not.toContain('AgentOutput');
+      expect(classicTools).toContain('Agent');
+      expect(nextTools).toContain('Agent');
+      expect(classicTools.filter((name) => name === 'Agent')).toHaveLength(3);
+      expect(nextTools).toContain('AgentOutput');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 180_000);
+
   test('next TUI PTY dispatches its read-only AgentList runtime', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'n03-next-runtime-dispatch-'));
     const root = join(dir, 'iso');
@@ -76,17 +186,22 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
         env: {
           ELANOUS_TEST_FAKE_LLM: '1', ELANOUS_TEST_FAKE_LLM_AS_PROVIDER: '1',
           ELANOUS_TEST_FAKE_LLM_RESPONSE: '[fake] runtime dispatch complete',
-          [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: 'PLUGIN-RUNTIME-PTY', name: 'agent_list', args: {} }),
+          [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: 'PLUGIN-RUNTIME-PTY', name: 'AgentList', args: {} }),
         },
-        ready: { label: 'boot', until: (screen) => screen.includes('elanous next ·') && screen.includes('Ctrl+Q 종료') },
+        ready: { label: 'boot', until: (screen) => screen.startsWith('elanous\n') && screen.includes('Ctrl+Q 종료') },
         steps: [{
           label: 'runtime dispatch', text: 'PLUGIN-RUNTIME-PTY',
-          until: (screen) => screen.includes('[fake] runtime dispatch complete') && screen.includes('응답 완료'),
+          until: (screen) => screen.includes('[fake] runtime dispatch complete') && screen.includes('❯') && !screen.includes('INVALID TOOL'),
         }],
       });
       const screen = run.frames.find((frame) => frame.label === 'runtime dispatch')?.screen ?? '';
+      const messages = listSessions({}, join(root, 'sessions'))
+        .flatMap(({ id }) => loadSession(id, join(root, 'sessions'))?.messages ?? []);
       expect(run.exitCode).toBe(0);
-      expect(screen).toContain('agent_list');
+      expect(messages.some((message) => message.role === 'tool' && message.toolName === 'AgentList')).toBe(true);
+      expect(screen).toContain('[fake] runtime dispatch complete');
+      const sessionFiles = readdirSync(root, { recursive: true }).map(String).filter((path) => path.endsWith('.jsonl'));
+      expect(sessionFiles.some((path) => readFileSync(join(root, path), 'utf8').includes('"toolName":"AgentList"'))).toBe(true);
       expect(screen).not.toContain('runtime unavailable in REPL');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 150_000);
@@ -108,10 +223,11 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
           ELANOUS_TEST_FAKE_LLM_RESPONSE: '[fake] plugin dispatch complete',
           [TEST_FAKE_LLM_TOOL_CALL_ENV]: JSON.stringify({ when: 'PLUGIN-GRAPH-PTY', name: 'suggest_list', args: {} }),
         },
-        ready: { label: 'boot', until: (screen) => screen.includes('elanous next ·') && screen.includes('Ctrl+Q 종료') },
+        ready: { label: 'boot', until: (screen) => screen.startsWith('elanous\n') && screen.includes('Ctrl+Q 종료') },
         steps: [{
           label: 'graph plugin dispatch', text: 'PLUGIN-GRAPH-PTY',
-          until: (screen) => screen.includes('[fake] plugin dispatch complete') && screen.includes('응답 완료'),
+          until: (screen) => screen.includes('[fake] plugin dispatch complete')
+            && screen.includes('graph route requires a verified owner context') && screen.includes('❯'),
         }],
       });
       const screen = run.frames.find((frame) => frame.label === 'graph plugin dispatch')?.screen ?? '';
@@ -214,11 +330,11 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
       };
       expect(first.checks).toEqual(expected);
       expect(second.checks).toEqual(expected);
-      expect(second.logs.eventCount).toBe(first.logs.eventCount);
+      expect(second.store.capturedRequests).toBe(first.store.capturedRequests);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 180_000);
 
-  test('next-queue: Esc asks first, and explicit y restores queued input ahead of the draft', async () => {
+  test('next-queue: Esc immediately restores queued input ahead of the draft', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'n03-next-queue-restore-'));
     try {
       const r = await runNextTuiScenario({ scenario: 'next-queue', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
@@ -227,8 +343,10 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
         userTurnsInOrder: true,
         threeReplies: true,
         draftKept: true,
-        escConfirmationKeepsQueuePending: true,
+        escCancelsWithoutShellConfirmation: true,
         escRestoresQueue: true,
+        escRestoresQueueAndDraft: true,
+        queueRestoreEventCarriesRestoredCount: true,
         onlyFakeProvider: true,
         exitedClean: true,
       });
@@ -310,7 +428,7 @@ describe('next TUI scenarios on N03 (this tree · fake LLM)', () => {
       const r = await runNextTuiScenario({ scenario: 'next-tool-fold', root: join(dir, 'iso'), executable: process.execPath, entry: REPO_CLI });
       expect(r.checks).toEqual({
         realToolResultStored: true, collapsedAfterTurn: true, summaryAtL1: true, stepsAtL2: true,
-        expandedOnL3: true, savedToolFoldIsSelectable: true, foldedAgainOnEnter: true,
+        expandedOnL3: true, foldedAgainOnEnter: true,
         sessionUnchanged: true, onlyFakeProvider: true, exitedClean: true,
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }

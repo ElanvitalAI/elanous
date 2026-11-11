@@ -18,6 +18,19 @@ function adapter(calls: Array<{ name: string; args: Record<string, unknown> }> =
   });
 }
 
+function briefingOwnerMapping(briefing: (Record<string, unknown> & { owner?: unknown }) | undefined) {
+  return typeof briefing?.owner === 'string' && briefing.owner.trim()
+    ? { status: 'present' as const, value: briefing.owner }
+    : { status: 'missing' as const, source: 'briefing receipt omits owner; verified owner is only at the receipt root' };
+}
+
+test('briefing owner mapping follows the actual payload in both directions', () => {
+  expect(briefingOwnerMapping({ id: 'brief-no-owner' })).toEqual({ status: 'missing',
+    source: 'briefing receipt omits owner; verified owner is only at the receipt root' });
+  expect(briefingOwnerMapping({ id: 'brief-with-owner', owner: 'member-from-fake-nexus' })).toEqual({ status: 'present',
+    value: 'member-from-fake-nexus' });
+});
+
 test('classic and ACP-next adapters expose the same plugin route specs with identity metadata', () => {
   const routeAdapter = adapter();
   const classic = routeAdapter.classicHostTools([]);
@@ -433,7 +446,14 @@ test('TUI deploy keeps confirmation on the originating ACP session when its peer
   expect(nativePrompted).toBe(false);
 });
 test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 through ingest, brief, suggestion, board, and QR', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'classic-kaist-real-entry-'));
+  const ticketScenario = process.env.CLASSIC_TICKET_SCENARIO === '1';
+  const sourceText = ticketScenario ? '티켓 예매 서비스 · 동시 300명' : 'KAIST 강의 자료에서 강의 노트 앱으로 이어 읽기';
+  const suggestionAsk = ticketScenario ? sourceText : 'Add a lesson timer';
+  const appId = ticketScenario ? 'ticketing-fake-app' : 'kaist-fake-app';
+  const suggestionId = ticketScenario ? 'suggestion-kcb-ticket-1' : 'suggestion-2026-11-09-1';
+  const boardCardId = ticketScenario ? 'kcb-ticket-board-1' : 'kaist-board-card-1';
+  const sharedScrapId = ticketScenario ? 'kcb-scrap-shared-text' : 'kaist-scrap-shared-text';
+  const root = mkdtempSync(join(tmpdir(), ticketScenario ? 'classic-ticket-real-entry-' : 'classic-kaist-real-entry-'));
   const markerPath = join(root, 'graph-receipt.json');
   const sessionToken = 'aps_' + 'k'.repeat(40);
   let ownerRequests = 0;
@@ -458,10 +478,11 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
     const turn = Math.floor((modelRequests - 1) / 3);
     const phase = (modelRequests - 1) % 3;
     const actions = [
-      { name: 'scrap_add', query: 'route: 이 링크 저장해', args: { kind: 'text', text: 'KAIST 강의 자료에서 강의 노트 앱으로 이어 읽기' } },
+      { name: 'scrap_add', query: 'route: 이 기사 스크랩해줘 https://example.test/article', args: { kind: 'web', url: 'https://example.test/article' } },
       { name: 'brief_today', query: 'route: 오늘 브리핑', args: {} },
       { name: 'suggest_list', query: 'route: 제안 목록', args: {} },
-      { name: 'suggest_accept', query: 'route: 이 제안 수락', args: { suggestionId: 'suggestion-2026-11-09-1' } },
+      { name: 'suggest_accept', query: 'route: 이 제안 수락', args: { suggestionId } },
+      { name: 'suggest_accept', query: 'route: 이 제안 수락', args: { suggestionId } },
     ] as const;
     const action = actions[turn];
     if (action && phase < 2) {
@@ -478,17 +499,19 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
     }
     const marker = existsSync(markerPath) ? JSON.parse(readFileSync(markerPath, 'utf8')) as {
       owner?: string; graph?: string; status?: string; boardCard?: { id?: string; owner?: string; state?: string; stateHistory?: string[]; resultUrl?: string };
-      attachment?: { id?: string }; scenes?: Record<string, Record<string, unknown>>;
+      attachment?: { id?: string; sha256?: string }; scenes?: Record<string, { output?: Record<string, unknown> }>;
     } : {};
     const scenes = marker.scenes ?? {};
-    const sceneLine = number => `KAIST_SCENE_RECEIPT ${JSON.stringify(scenes[String(number)] ?? { scene: number, missing: true })}`;
+    const sceneLine = (number: number) => `ABSORB_SCENE_RECEIPT ${JSON.stringify(scenes[String(number)] ?? { scene: number, missing: true })}`;
     const content = turn === 0 ? sceneLine(1)
       : turn === 1 ? `${sceneLine(2)}\n${sceneLine(3)}`
         : turn === 2 ? sceneLine(4)
           : turn === 3 && marker.owner === 'member-from-fake-nexus' && marker.graph === 'absorb-build' && marker.status === 'done'
             && marker.boardCard?.owner === marker.owner && marker.boardCard.state === 'released'
             && marker.boardCard.stateHistory?.join(',') === 'building,testing,released' && marker.attachment?.sha256
-            && marker.boardCard.resultUrl ? `${sceneLine(5)}\n${sceneLine(6)}` : 'CLASSIC_KCB_1_6_RECEIPT_MISSING';
+            && marker.boardCard.resultUrl ? `${sceneLine(5)}\n${sceneLine(6)}`
+            : turn === 4 && marker.status === 'testing' && !scenes['5']?.output?.acceptance
+              ? 'ABSORB_REJECT_RECEIPT' : 'CLASSIC_KCB_1_6_RECEIPT_MISSING';
     return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`, { headers });
   } });
   const driver = `
@@ -503,15 +526,15 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
     writeFileSync(join(state, 'config.json'), JSON.stringify({ onboarding: { completed: true },
       llm: { provider: 'local', model: 'classic-kaist-test', baseUrl: ${JSON.stringify(`http://127.0.0.1:${model.port}/v1`)} },
       skillRouter: { llmFallback: false }, mcp: { enabled: false } }));
-    const suggestionId = 'suggestion-2026-11-09-1';
+    const suggestionId = ${JSON.stringify(suggestionId)};
     const ownerId = 'member-from-fake-nexus';
     const marker = ${JSON.stringify(markerPath)};
     let providers = emptyGraphCapabilityRegistry();
     for (const id of ['store.read@1', 'store.write@1', 'extract.item@1', 'notify.channel@1', 'app-publish.action@1']) providers = registerGraphCapabilityContract(providers, {
       id, input: { type: 'object' }, output: { type: 'object' },
     });
-    const scraps = ['web', 'x', 'youtube', 'voice', 'video', 'photo'].map((kind, index) => ({
-      id: 'kaist-scrap-' + kind, owner: ownerId, status: 'new', kind, text: 'KAIST ' + kind + ' fixture', url: 'https://example.test/' + kind,
+    const scraps = ['x', 'youtube', 'voice', 'video', 'photo', 'text'].map((kind, index) => ({
+      id: (${JSON.stringify(ticketScenario ? 'kcb-scrap-' : 'kaist-scrap-')}) + kind, owner: ownerId, status: 'new', kind, text: ${JSON.stringify(ticketScenario ? sourceText : 'KAIST')} + ' ' + kind + ' fixture', url: 'https://example.test/' + kind,
       mediaRef: 'fake://' + kind,
     }));
     const briefings = [];
@@ -519,14 +542,19 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
     const channels = [];
     const receipts = [];
     let briefRunId;
+    const recordGraphNode = (nodeId) => {
+      const previous = existsSync(marker) ? JSON.parse(readFileSync(marker, 'utf8')) : {};
+      const graphPath = [...(previous.graphPath ?? []), nodeId];
+      writeFileSync(marker, JSON.stringify({ ...previous, graphPath }));
+    };
     const store = ({ graphId, runId, nodeInput = {}, input = {}, graphInput, outputs = {} }) => {
       if (graphId === 'absorb-brief') briefRunId = runId;
       const context = (graphInput ?? input).context ?? {};
       const config = nodeInput;
       if (config.op === 'create' && config.collection === 'scraps') {
-        const row = { ...(graphInput ?? input), id: 'kaist-scrap-shared-text', owner: context.memberId, status: 'new' };
+        const row = { ...(graphInput ?? input), id: ${JSON.stringify(sharedScrapId)}, owner: context.memberId, status: 'new' };
         scraps.push(row);
-        recordRun(graphId, runId, { kind: row.kind, text: row.text }, { scrapId: row.id, owner: row.owner });
+        recordRun(graphId, runId, { kind: row.kind, url: row.url }, { scrapId: row.id, owner: row.owner, kind: row.kind, url: row.url });
         return { ok: true, outcome: 'done', result: row, evidence: { stored: row } };
       }
       if (config.op === 'list' && config.collection === 'scraps') {
@@ -534,14 +562,15 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
         return { ok: true, outcome: 'done', result: { items }, evidence: { items, owner: context.memberId } };
       }
       if (config.op === 'list' && config.collection === 'member-app-slots') {
-        return { ok: true, outcome: 'done', result: { items: [{ id: 'kaist-fake-app', owner: context.memberId }] }, evidence: { owner: context.memberId } };
+        return { ok: true, outcome: 'done', result: { items: [{ id: ${JSON.stringify(appId)}, owner: context.memberId }] }, evidence: { owner: context.memberId } };
       }
       if (config.op === 'list' && config.collection === 'suggestions') {
         const items = suggestions.filter(row => row.owner === context.memberId);
-        recordRun(graphId, runId, { owner: context.memberId }, { suggestionId: items[0]?.id, suggestionIds: items.map(row => row.id), sourceScrapIds: items[0]?.evidenceScrapIds ?? [] }, 4);
+        recordRun(graphId, runId, { owner: context.memberId }, { suggestionId: items[0]?.id, suggestionIds: items.map(row => row.id), sourceScrapIds: items[0]?.evidenceScrapIds ?? [], suggestion: items[0] }, 4);
         return { ok: true, outcome: 'done', result: { items }, evidence: { items, owner: context.memberId } };
       }
       if (config.op === 'get' && config.collection === 'suggestions') {
+        recordGraphNode('lookup-suggestion');
         const id = (graphInput ?? input).suggestionId ?? config.id;
         const row = suggestions.find(item => item.id === id && item.owner === context.memberId);
         return row ? { ok: true, outcome: 'done', result: row, evidence: { suggestion: row, owner: context.memberId } }
@@ -582,7 +611,7 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
       const delivered = nodeInput.channels ?? nodeInput.with?.channels ?? [];
       channels.push(...delivered);
       const briefing = outputs.brief?.evidence?.briefing;
-      recordRun(graphId, runId, { owner: ownerId, briefingId: briefing?.id }, { briefingId: briefing?.id, channels: delivered }, 3);
+      recordRun(graphId, runId, { owner: ownerId, briefingId: briefing?.id }, { briefingId: briefing?.id, channels: delivered, briefing }, 3);
       return { ok: true, outcome: 'done', result: { delivered }, evidence: { delivered } };
     };
     const provider = (id, provides, invoke) => { providers = registerGraphCapabilityProviderDeclaration(providers, { id, provides, tier: 'free', invoke }); };
@@ -598,28 +627,45 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
         const context = (graphInput ?? input).context;
         if (context.memberId !== ownerId) return { ok: false, outcome: 'failed', error: 'verified owner missing' };
         if (nodeInput.action === 'simulate') {
+          recordGraphNode('simulate');
           const artifact = outputs.build.evidence.artifact;
           const suggestion = outputs['lookup-suggestion'].evidence.suggestion;
           if (suggestion.owner !== ownerId || outputs.build.evidence.owner !== ownerId) return { ok: false, outcome: 'failed', error: 'owner mismatch' };
           if (artifact.ask !== suggestion.ask) return { ok: false, outcome: 'failed', error: 'build ask did not match the looked-up suggestion' };
           const previous = JSON.parse(readFileSync(marker, 'utf8'));
           const receipt = { id: 'fake-pass-receipt', artifactId: artifact.id, owner: ownerId, status: 'passed', attachment: { id: artifact.id, kind: 'app-artifact' } };
-          const attachment = { ...receipt.attachment, sha256: createHash('sha256').update(JSON.stringify(artifact.files)).digest('hex') };
-          const boardCard = { id: 'kaist-board-card-1', owner: ownerId, state: 'testing', stateHistory: ['building', 'testing'] };
+          const attachment = { ...receipt.attachment, sha256: createHash('sha256').update(JSON.stringify(artifact.files)).digest('hex'), files: Object.keys(artifact.files) };
+          const boardCard = { id: ${JSON.stringify(boardCardId)}, owner: ownerId, title: artifact.ask, state: 'testing', stateHistory: ['building', 'testing'] };
           const scene5 = { runId, scene: 5, input: { suggestionId: suggestion.id, confirmation: 'y' }, output: { boardCardId: boardCard.id, attachment } };
-          const scene6 = { runId, scene: 6, input: { boardCardId: boardCard.id }, output: { resultUrl: 'https://kaist-fake-app.app.sim.invalid/' } };
+          const scene6 = { runId, scene: 6, input: { boardCardId: boardCard.id }, output: { resultUrl: ${JSON.stringify(`https://${appId}.app.sim.invalid/`)} } };
           writeFileSync(marker, JSON.stringify({ ...previous, status: 'testing', boardCard, receipt, attachment, scenes: { ...(previous.scenes ?? {}), '5': scene5, '6': scene6 } }));
           return { ok: true, outcome: 'done', result: { artifactId: artifact.id }, evidence: { receipt, isolated: true } };
         }
         if (nodeInput.action === 'publish') {
+          recordGraphNode('publish');
           const previous = JSON.parse(readFileSync(marker, 'utf8'));
           if (previous.status !== 'testing' || previous.boardCard.state !== 'testing' || previous.receipt?.status !== 'passed') {
             return { ok: false, outcome: 'failed', error: 'publish ran before the passing simulation receipt was approved' };
           }
-          const boardCard = { ...previous.boardCard, state: 'released', stateHistory: [...previous.boardCard.stateHistory, 'released'], resultUrl: 'https://kaist-fake-app.app.sim.invalid/' };
-          const scenes = { ...previous.scenes, '6': { ...previous.scenes?.['6'], output: { resultUrl: boardCard.resultUrl, boardCardId: boardCard.id } } };
+          const approval = outputs['approve-publish'];
+          if (approval?.outcome !== 'approved') return { ok: false, outcome: 'failed', error: 'publish did not receive an approved graph decision' };
+          if (nodeInput.service !== '$build.result.service' || nodeInput.capacityAssumption !== '$build.result.capacityAssumption') {
+            return { ok: false, outcome: 'failed', error: 'publish node did not declare the build service and capacity bindings' };
+          }
+          const buildResult = outputs.build?.result;
+          if (typeof buildResult?.service !== 'string' || !buildResult.capacityAssumption) {
+            return { ok: false, outcome: 'failed', error: 'publish capability could not resolve the declared build bindings' };
+          }
+          const acceptance = { suggestionId: outputs['lookup-suggestion']?.evidence?.suggestion?.id,
+            owner: ownerId, accepted: true, service: buildResult.service };
+          const capacityAssumption = buildResult.capacityAssumption;
+          const boardCard = { ...previous.boardCard, state: 'released', stateHistory: [...previous.boardCard.stateHistory, 'released'], resultUrl: ${JSON.stringify(`https://${appId}.app.sim.invalid/`)} };
+          const scenes = { ...previous.scenes,
+            '5': { ...previous.scenes?.['5'], output: { ...previous.scenes?.['5']?.output, acceptance, capacityAssumption } },
+            '6': { ...previous.scenes?.['6'], output: { resultUrl: boardCard.resultUrl, boardCardId: boardCard.id } } };
           writeFileSync(marker, JSON.stringify({ ...previous, status: 'done', boardCard, scenes }));
-          return { ok: true, outcome: 'done', result: { published: true, boardCard }, evidence: { owner: ownerId, boardCard, attachment: previous.attachment } };
+          return { ok: true, outcome: 'done', result: { published: true, boardCard, acceptance, capacityAssumption },
+            evidence: { owner: ownerId, boardCard, attachment: previous.attachment, acceptance, capacityAssumption } };
         }
         return { ok: false, outcome: 'failed', error: 'unexpected app-publish action' };
       } });
@@ -639,19 +685,25 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
         if (prompt.includes('absorb/brief')) {
           const cards = prior.cards ?? [];
           const sourceScrapIds = cards.map(card => card.scrapId);
-          const briefing = { id: 'brief-kaist-1', topics: [{ summary: 'KAIST lecture materials', sourceScrapIds }], scrapIds: sourceScrapIds };
+          const briefing = { id: ${JSON.stringify(ticketScenario ? 'brief-kcb-ticket-1' : 'brief-kaist-1')}, topics: [{ summary: ${JSON.stringify(ticketScenario ? sourceText : 'KAIST lecture materials')}, sourceScrapIds }], scrapIds: sourceScrapIds };
           return JSON.stringify({ outcome: 'done', result: { briefing }, evidence: { briefing } });
         }
         if (prompt.includes('absorb/suggest')) {
           const sourceScrapIds = Array.isArray(prior.briefing?.scrapIds) ? prior.briefing.scrapIds : [];
-          const suggestion = { id: suggestionId, owner: context.memberId, appId: 'kaist-fake-app', ask: 'Add a lesson timer', evidenceScrapIds: sourceScrapIds };
+          const suggestion = { id: suggestionId, owner: context.memberId, appId: ${JSON.stringify(appId)}, ask: ${JSON.stringify(suggestionAsk)}, evidenceScrapIds: sourceScrapIds };
           return JSON.stringify({ outcome: 'done', result: { items: [suggestion] }, evidence: { suggestions: [suggestion] } });
         }
-        if (!prompt.includes('absorb/build') || input.ask !== 'Add a lesson timer') throw new Error('unexpected KAIST graph LLM prompt: ' + prompt.slice(0, 300));
-        const artifact = { id: 'artifact-' + (context.suggestionId ?? suggestionId), ask: input.ask, files: { '/index.html': '<main>fake</main>' } };
+        if (!prompt.includes('absorb/build') || input.ask !== ${JSON.stringify(suggestionAsk)}) throw new Error('unexpected absorb-build graph LLM prompt: ' + prompt.slice(0, 300));
+        recordGraphNode('build');
+        const isTicketRequest = input.ask.includes('티켓 예매 서비스');
+        const service = isTicketRequest ? '티켓 예매 서비스' : 'lesson timer';
+        const capacityAssumption = isTicketRequest
+          ? { concurrentUsers: 300, rationale: '요청에 "동시 300명"이 명시됨.', source: 'user-input', userSpecified: true }
+          : { concurrentUsers: 1, rationale: '요청에 부하 목표가 없어 격리 시뮬레이션용 임시 기준으로만 추정함.', source: 'model-estimate', userSpecified: false };
+        const artifact = { id: 'artifact-' + (context.suggestionId ?? suggestionId), ask: input.ask, service, capacityAssumption, files: { '/index.html': '<main>fake</main>' } };
         const previous = existsSync(marker) ? JSON.parse(readFileSync(marker, 'utf8')) : {};
-        writeFileSync(marker, JSON.stringify({ ...previous, owner: context.memberId, graph: 'absorb-build', status: 'building', boardCard: { id: 'kaist-board-card-1', owner: context.memberId, state: 'building', stateHistory: ['building'] }, attachment: { id: artifact.id, kind: 'app-artifact' } }));
-        return JSON.stringify({ outcome: 'done', result: { artifact }, evidence: { artifact, owner: context.memberId, suggestionId: context.suggestionId } });
+        writeFileSync(marker, JSON.stringify({ ...previous, owner: context.memberId, graph: 'absorb-build', status: 'building', boardCard: { id: ${JSON.stringify(boardCardId)}, owner: context.memberId, state: 'building', stateHistory: ['building'] }, attachment: { id: artifact.id, kind: 'app-artifact' } }));
+        return JSON.stringify({ outcome: 'done', result: { artifact, service, capacityAssumption }, evidence: { artifact, owner: context.memberId, suggestionId: context.suggestionId, service, capacityAssumption } });
       } } };
     await showDashboard({ chatOnly: true, graphRunOptions,
       getNexusMemberSession: () => ({ nexusUrl: ${JSON.stringify(`http://127.0.0.1:${nexus.port}`)}, sessionToken: ${JSON.stringify(sessionToken)} }) });
@@ -691,8 +743,13 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
   };
   try {
     await waitFor('❯', 'classic dashboard prompt');
-    pty.write('이 링크 저장해'); pty.write('\r');
-    await waitFor('KAIST_SCENE_RECEIPT {"runId"', 'scene 1 fake scrape receipt');
+    pty.write('이 기사 스크랩해줘 https://example.test/article'); pty.write('\r');
+    const ingestScreen = await waitFor('ABSORB_SCENE_RECEIPT', 'scene 1 fake scrape receipt');
+    if (!existsSync(markerPath)) throw new Error(`classic PTY showed no ingest receipt file; modelRequests=${modelRequests}; toolResult=${lastToolResult}; screen=${ingestScreen}`);
+    const ingestReceipt = JSON.parse(readFileSync(markerPath, 'utf8')).scenes?.['1'];
+    expect(ingestReceipt).toMatchObject({ input: { kind: 'web', url: 'https://example.test/article' },
+      output: { owner: 'member-from-fake-nexus', kind: 'web', url: 'https://example.test/article' } });
+    expect(ingestScreen).toContain('https://example.test/article');
     pty.write('오늘 브리핑'); pty.write('\r');
     const briefScreen = await waitFor('"scene":3', 'scene 2–3 brief and fanout receipts');
     expect(briefScreen).toContain('"scene":2');
@@ -708,29 +765,81 @@ test.skipIf(!ptyAvailable())('classic dashboard PTY carries KAIST scenes 1–6 t
     const receiptScreen = await waitFor('"scene":6', 'scene 5–6 board, attachment, and QR receipts');
     expect(ownerRequests).toBeGreaterThan(0);
     expect(modelRequests).toBeGreaterThanOrEqual(3);
-    const graphResult = JSON.parse(lastToolResult) as { status?: string; path?: string[] };
-    expect(graphResult).toMatchObject({ status: 'done', path: expect.arrayContaining(['approve-publish', 'publish']) });
+    const graphResult = JSON.parse(lastToolResult) as { status?: string; path?: string[]; nodes?: Array<{ nodeId: string; output?: unknown }> };
+    expect(graphResult).toMatchObject({ status: 'done' });
+    expect(graphResult.path).toEqual(['lookup-suggestion', 'build', 'simulate', 'approve-publish', 'publish', 'done']);
+    const graphNodeOutput = (nodeId: string) => {
+      const output = graphResult.nodes?.find(node => node.nodeId === nodeId)?.output;
+      return typeof output === 'string' ? JSON.parse(output) as Record<string, unknown> : output as Record<string, unknown> | undefined;
+    };
+    expect(graphNodeOutput('approve-publish')).toMatchObject({ outcome: 'approved' });
+    expect(graphNodeOutput('publish')).toMatchObject({ result: {
+      acceptance: { suggestionId, owner: 'member-from-fake-nexus', accepted: true, service: ticketScenario ? '티켓 예매 서비스' : 'lesson timer' },
+      capacityAssumption: ticketScenario ? { concurrentUsers: 300, source: 'user-input', userSpecified: true }
+        : { concurrentUsers: 1, source: 'model-estimate', userSpecified: false },
+    } });
     expect(JSON.parse(readFileSync(markerPath, 'utf8'))).toMatchObject({ owner: 'member-from-fake-nexus', graph: 'absorb-build', status: 'done' });
     const finalMarker = JSON.parse(readFileSync(markerPath, 'utf8'));
+    finalMarker.graphPath = graphResult.path;
+    expect(finalMarker.graphPath).toEqual(graphResult.path);
+    const graphRun = { graphId: 'absorb-build', runId: finalMarker.scenes['5'].runId, status: graphResult.status, path: graphResult.path };
+    finalMarker.graphRun = graphRun;
+    finalMarker.scenes['5'].output.graphRun = graphRun;
+    finalMarker.scenes['6'].output.boardCard = finalMarker.boardCard;
+    finalMarker.scenes['6'].output.attachment = finalMarker.attachment;
+    writeFileSync(markerPath, JSON.stringify(finalMarker));
     expect(finalMarker).toMatchObject({
-      boardCard: { id: 'kaist-board-card-1', owner: 'member-from-fake-nexus', state: 'released', stateHistory: ['building', 'testing', 'released'] },
-      attachment: { id: 'artifact-suggestion-2026-11-09-1', kind: 'app-artifact' },
+      boardCard: { id: boardCardId, owner: 'member-from-fake-nexus', state: 'released', stateHistory: ['building', 'testing', 'released'] },
+      attachment: { id: 'artifact-' + suggestionId, kind: 'app-artifact' },
     });
     expect(finalMarker.attachment.sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(finalMarker.scenes['1'].output.owner).toBe('member-from-fake-nexus');
+    expect(finalMarker.scenes['1'].output).toMatchObject({ kind: 'web', url: 'https://example.test/article' });
     expect(finalMarker.scenes['2'].output.kinds).toEqual(expect.arrayContaining(['web', 'x', 'youtube', 'voice', 'video', 'photo', 'text']));
     expect(finalMarker.scenes['3'].output.channels).toEqual(['android', 'tui', 'telegram']);
     expect(finalMarker.scenes['4'].output.sourceScrapIds).toEqual(finalMarker.scenes['2'].output.scrapIds);
     expect(finalMarker.scenes['5'].output.attachment.sha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(finalMarker.scenes['6'].output.resultUrl).toBe('https://kaist-fake-app.app.sim.invalid/');
+    expect(finalMarker.scenes['5'].output.acceptance).toMatchObject({ suggestionId, owner: 'member-from-fake-nexus', accepted: true,
+      service: ticketScenario ? '티켓 예매 서비스' : 'lesson timer' });
+    expect(finalMarker.scenes['6'].output.resultUrl).toBe(`https://${appId}.app.sim.invalid/`);
+    if (ticketScenario) {
+      const suggestion = finalMarker.scenes['4'].output.suggestion;
+      const briefing = finalMarker.scenes['3'].output.briefing;
+      const ticketMapping = {
+        sourceRunIds: { briefing: finalMarker.scenes['3'].runId, acceptance: finalMarker.scenes['5'].runId },
+        briefingMapping: { id: briefing?.id, owner: briefingOwnerMapping(briefing), topics: briefing?.topics },
+        acceptance: finalMarker.scenes['5'].output.acceptance,
+        capacityAssumption: finalMarker.scenes['5'].output.capacityAssumption,
+        suggestion,
+      };
+      expect(Object.hasOwn(briefing ?? {}, 'owner')).toBe(false);
+      expect(ticketMapping.briefingMapping.owner).toEqual(briefingOwnerMapping(briefing));
+      expect(ticketMapping.acceptance).toMatchObject({ service: '티켓 예매 서비스' });
+      expect(ticketMapping.capacityAssumption).toEqual({ concurrentUsers: 300,
+        rationale: '요청에 "동시 300명"이 명시됨.', source: 'user-input', userSpecified: true });
+      process.stdout.write(`KCB_TICKET_MAPPING ${JSON.stringify(ticketMapping)}\n`);
+    }
     expect(receiptScreen).toContain('"scene":5');
-    process.stdout.write(`KAIST_KCB_RECEIPTS ${readFileSync(markerPath, 'utf8')}\n`);
-    const sceneReceipts = Object.values(finalMarker.scenes).sort((left, right) => left.scene - right.scene);
+    process.stdout.write(`${ticketScenario ? 'KCB_TICKET' : 'KAIST_KCB'}_RECEIPTS ${readFileSync(markerPath, 'utf8')}\n`);
+    const sceneReceipts = (Object.values(finalMarker.scenes) as Array<{ scene: number }>).sort((left, right) => left.scene - right.scene);
     expect(sceneReceipts).toHaveLength(6);
     for (const receipt of sceneReceipts) {
       expect(receipt).toMatchObject({ runId: expect.any(String), input: expect.any(Object), output: expect.any(Object) });
-      console.log(`KAIST_KCB_RECEIPT ${JSON.stringify(receipt)}`);
+      console.log(`${ticketScenario ? 'KCB_TICKET' : 'KAIST_KCB'}_RECEIPT ${JSON.stringify(receipt)}`);
     }
+    pty.write('이 제안 수락'); pty.write('\r');
+    await waitFor('이 제안을 격리된 앱 복사본에 적용하고 시뮬레이션을 시작할까요?', 'second acceptance start confirmation');
+    pty.write('y'); pty.write('\r');
+    await waitFor('N → rejected (default)', 'second run publish rejection');
+    pty.write('N'); pty.write('\r');
+    await waitFor('ABSORB_REJECT_RECEIPT', 'rejected graph receipt');
+    const rejectedGraphResult = JSON.parse(lastToolResult) as { status?: string; path?: string[]; nodes?: Array<{ nodeId: string; output?: unknown }> };
+    expect(rejectedGraphResult).toMatchObject({ status: 'failed' });
+    expect(rejectedGraphResult.path).toEqual(['lookup-suggestion', 'build', 'simulate', 'approve-publish', 'failed']);
+    const rejectedApproval = rejectedGraphResult.nodes?.find(node => node.nodeId === 'approve-publish')?.output;
+    expect(typeof rejectedApproval === 'string' ? JSON.parse(rejectedApproval) : rejectedApproval).toMatchObject({ outcome: 'rejected' });
+    expect(rejectedGraphResult.nodes?.some(node => node.nodeId === 'publish')).toBe(false);
+    expect(JSON.parse(readFileSync(markerPath, 'utf8')).scenes['5'].output.acceptance).toBeUndefined();
   } finally {
     pty.kill(); unregisterPty(pty.id);
     nexus.stop(true);

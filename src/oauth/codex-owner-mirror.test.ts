@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { loadFreshCodexAuthState } from './codex.js';
 import { _setCodexAccountOutboundSenderForTesting, autoConsumeCodexResetCredit, listCodexAccountsInStore, resolveCodexAccountForRun } from './codex-account-store.js';
 import { debug } from '../debug/log.js';
 import '../llm.js';
 import { collectCodexMirrorCredentials, CODEX_OWNER_MIRROR_RELATIVE_PATH, CODEX_OWNER_MIRROR_REQUIRED, codexOwnerMirrorAuthPath, isCodexTokenOwnerHost, readCodexOwnerAccessMirror } from './codex-owner-mirror.js';
+import { withFakeFetchDevice } from '../ux-sim/fake-fetch.js';
 
 const oldEnv = {
   xdg: process.env.XDG_CONFIG_HOME,
@@ -20,6 +21,7 @@ const oldEnv = {
   bunTest: process.env.BUN_TEST,
   testRunner: process.env.ELANOUS_TEST_RUNNER,
   nodeEnv: process.env.NODE_ENV,
+  llmMode: process.env.ELANOUS_LLM_MODE,
 };
 const roots: string[] = [];
 const fixture = () => {
@@ -30,6 +32,7 @@ const fixture = () => {
   delete process.env.ELANOUS_STATE_DIR_SOURCE;
   delete process.env.ELANOUS_CODEX_ACCOUNT;
   delete process.env.ELANOUS_RUN_ID;
+  delete process.env.CODEX_HOME;
   process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
   mkdirSync(join(root, 'state', 'remote-parent-credentials', 'cli-mirror'), { recursive: true });
   return { root, path: join(root, 'state', CODEX_OWNER_MIRROR_RELATIVE_PATH) };
@@ -53,7 +56,7 @@ afterEach(() => {
   if (oldEnv.remoteMirrorPath === undefined) delete process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH;
   else process.env.ELANOUS_REMOTE_CODEX_MIRROR_PATH = oldEnv.remoteMirrorPath;
   for (const [key, value] of Object.entries({ CODEX_HOME: oldEnv.codexHome, BUN_TEST: oldEnv.bunTest,
-    ELANOUS_TEST_RUNNER: oldEnv.testRunner, NODE_ENV: oldEnv.nodeEnv })) {
+    ELANOUS_TEST_RUNNER: oldEnv.testRunner, NODE_ENV: oldEnv.nodeEnv, ELANOUS_LLM_MODE: oldEnv.llmMode })) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -92,7 +95,49 @@ describe("remote direct Codex uses the owner's access-only mirror", () => {
     expect(codexOwnerMirrorAuthPath()).toBe(path);
   });
 
-  test('a standalone machine uses its valid local Codex login without an owner mirror', async () => {
+  test('explicit CODEX_HOME wins for access-only hosts and native access-only mirror tokens are accepted', async () => {
+    const { root, path: fallbackPath } = fixture();
+    const home = join(root, 'remote-parent-credentials', 'cli-mirror', 'codex-default');
+    mkdirSync(home, { recursive: true });
+    process.env.CODEX_HOME = relative(process.cwd(), home);
+    const expiresAt = Math.floor(Date.now() / 1000 + 3600);
+    const accessToken = jwt(expiresAt);
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+      access_token: accessToken, refresh_token: '', account_id: 'mirror-account',
+    } }));
+
+    expect(codexOwnerMirrorAuthPath()).toBe(join(home, 'auth.json'));
+    expect(codexOwnerMirrorAuthPath()).not.toBe(fallbackPath);
+    expect(readCodexOwnerAccessMirror('openai-codex')).toMatchObject({
+      source: 'mirror', authMode: 'chatgpt', accountUuid: 'mirror-account',
+      tokens: { accessToken, refreshToken: '', expiresAt: expiresAt * 1000 },
+    });
+    const { codexOAuthAvailable, getProvider } = await import('../llm.js');
+    expect(codexOAuthAvailable()).toBe(true);
+    process.env.ELANOUS_LLM_MODE = 'real';
+    const provider = getProvider('gpt-6.1-terra');
+    expect(provider.name).toBe('openai-codex');
+    expect(provider.available()).toBe(true);
+    const { loadFreshCodexAuthState } = await import('./codex.js');
+    const state = await loadFreshCodexAuthState();
+    expect(state?.tokens.accessToken).toBe(accessToken);
+    await withFakeFetchDevice([{ url: 'https://chatgpt.com/backend-api/codex/responses', method: 'POST', response: request => {
+      expect(request.headers.authorization).toBe(`Bearer ${accessToken}`);
+      expect(JSON.parse(String(request.body)).model).toBe('gpt-6.1-terra');
+      return new Response(`data: ${JSON.stringify({ type: 'response.completed', response: { usage: { input_tokens: 1, output_tokens: 1 } } })}\n\n`, {
+        status: 200, headers: { 'content-type': 'text/event-stream' },
+      });
+    } }], async (device) => {
+      for await (const _event of provider.streamChat!([{ role: 'user', content: 'review prompt' }], { model: 'gpt-6.1-terra' })) { /* consume response */ }
+      expect(device.calls()).toHaveLength(1);
+    });
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+      access_token: accessToken, refresh_token: 'must-not-refresh-locally',
+    } }));
+    expect(() => readCodexOwnerAccessMirror('openai-codex')).toThrow('reason=refresh-not-empty');
+  });
+
+  test('a local Codex login cannot refresh when no owner host is configured', async () => {
     const { root } = fixture();
     delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
     delete process.env.BUN_TEST;
@@ -108,12 +153,9 @@ describe("remote direct Codex uses the owner's access-only mirror", () => {
       tokens: { access_token: accessToken, refresh_token: 'local-refresh-token', account_id: 'local-account' },
     }));
 
-    const state = await loadFreshCodexAuthState({
+    await expect(loadFreshCodexAuthState({
       fetchImpl: (async () => { throw new Error('local unexpired login must not refresh'); }) as unknown as typeof fetch,
-    });
-
-    expect(state?.tokens.accessToken).toBe(accessToken);
-    expect(state?.tokens.refreshToken).toBe('local-refresh-token');
+    })).rejects.toThrow('reason=missing-file');
   });
 
   test('access-only seats still require the owner mirror even when a local Codex file exists', async () => {
@@ -127,7 +169,7 @@ describe("remote direct Codex uses the owner's access-only mirror", () => {
       tokens: { access_token: jwt(expiresAt / 1000), refresh_token: 'local-refresh-token', account_id: 'local-account' },
     }));
 
-    await expect(loadFreshCodexAuthState()).rejects.toThrow('reason=missing-file');
+    await expect(loadFreshCodexAuthState()).rejects.toThrow('reason=refresh-not-empty');
   });
 
   test('remote child uses the parent-installed mirror when its isolated state root differs', async () => {
@@ -169,10 +211,11 @@ describe("remote direct Codex uses the owner's access-only mirror", () => {
     expect(codexOwnerMirrorAuthPath()).toBe(path);
   });
 
-  test('owner host defaults to mbp and accepts the configured machine identity', () => {
-    expect(isCodexTokenOwnerHost({ llm: {}, hq: { hostName: 'mbp' } } as never, 'unknown')).toBe(true);
-    expect(isCodexTokenOwnerHost({ llm: { codexTokenOwnerHost: 'mbp' }, hq: { hostName: 'MBP.local' } } as never, 'unknown')).toBe(true);
-    expect(isCodexTokenOwnerHost({ llm: {}, hq: { hostName: 'node-b' } } as never, 'MacStudioB1')).toBe(false);
+  test('Codex owner is relocatable and requires one explicit configured host', () => {
+    fixture();
+    expect(isCodexTokenOwnerHost({ llm: {}, hq: { hostName: 'mbp' } } as never, 'unknown')).toBe(false);
+    expect(isCodexTokenOwnerHost({ llm: { codexTokenOwnerHost: 'mshq' }, hq: { hostName: 'MSHQ.local' } } as never, 'unknown')).toBe(true);
+    expect(isCodexTokenOwnerHost({ llm: { codexTokenOwnerHost: 'mshq' }, hq: { hostName: 'node-b' } } as never, 'MacStudioB1')).toBe(false);
   });
 
   test('fresh access-only snapshot is returned without invoking refresh', async () => {

@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "이벤트 기반·큐 — 급증 완충 큐",
+  "source": "https://learn.microsoft.com/en-us/azure/architecture/patterns/queue-based-load-leveling",
+  "body": "적용 시점: 짧은 시간의 유입 급증을 소비 처리율과 분리해 흡수할 때.\n용량 단계: 작은 부하는 동기 처리 가능; 지속적 버스트 또는 느린 작업에서 관리형 큐를 도입하고 backlog와 oldest-age를 본다.\nGCP 대응: Pub/Sub는 팬아웃 이벤트, Cloud Tasks는 개별 작업 재시도·속도 제어에 매핑한다.\n비용 축: 메시지 보관량·전송 횟수·재시도·소비 컴퓨트·교차 리전 전송이 축이다.\n결정과 반증: 큐 깊이뿐 아니라 가장 오래된 메시지 시간과 처리율이 안정되는지 부하·장애 시험으로 본다."
+}

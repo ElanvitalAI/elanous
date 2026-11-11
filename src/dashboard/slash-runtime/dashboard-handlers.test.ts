@@ -194,7 +194,7 @@ function createContext(
   } as unknown as DashboardSlashContext;
 }
 
-test('/directive execution rejects the general role before recording a directive', async () => {
+test('/directive ignores retired general role and keeps the local owner path', async () => {
   const root = mkdtempSync(join(tmpdir(), 'tui-directive-general-guard-'));
   addDirectiveSpy.mockClear();
   expect(slashMaturity('directive')).toBe('ops');
@@ -202,15 +202,12 @@ test('/directive execution rejects the general role before recording a directive
   writeFileSync(join(root, 'config.json'), JSON.stringify({ tui: { role: 'general', showBeta: true } }));
   reloadUserConfig();
   const lines: string[] = [];
-  let scrollOffset: number | undefined;
   const ctx = createContext(lines);
-  ctx.setChatScrollOffset = (value) => { scrollOffset = value; };
   try {
     await expect(buildDashboardSlashRegistry().dispatch('directive', ['승인 없이 기록하지 말 것'], ctx))
       .resolves.toEqual({ kind: 'continue' });
-    expect(lines.join('\n')).toContain('general 역할에서는 실행할 수 없습니다');
-    expect(addDirectiveSpy).not.toHaveBeenCalled();
-    expect(scrollOffset).toBe(-1);
+    expect(lines.join('\n')).toContain('ELA-1: created');
+    expect(addDirectiveSpy).toHaveBeenCalledWith('승인 없이 기록하지 말 것', { source: 'tui' });
   } finally {
     resetElanousConfigDir();
     reloadUserConfig();

@@ -37,12 +37,13 @@ function declaredHitlNodeIds(graphFile: string): string[] {
   return Array.isArray(policy.hitl) ? policy.hitl.map(text) : [];
 }
 
-type AbsorbContractId = 'store.read@1' | 'store.write@1' | 'extract.item@1' | 'notify.channel@1' | 'app-publish.action@1';
+type AbsorbContractId = 'store.read@1' | 'store.write@1' | 'store.events@1' | 'extract.item@1' | 'notify.channel@1' | 'app-publish.action@1';
 type AbsorbSimulationProviders = Partial<Record<AbsorbContractId, GraphCapabilityProvider>>;
 
 const ABSORB_SIMULATION_CONTRACTS: readonly GraphCapabilityContract[] = [
   { id: 'store.read@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'store.write@1', input: { type: 'object' }, output: { type: 'object' } },
+  { id: 'store.events@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'extract.item@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'notify.channel@1', input: { type: 'object' }, output: { type: 'object' } },
   { id: 'app-publish.action@1', input: { type: 'object' }, output: { type: 'object' } },
@@ -171,10 +172,19 @@ function text(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
-function resolveSuggestionStoreReference(reference: string, suggestion: Row): unknown {
-  if (reference === '$suggestion') return suggestion;
-  if (reference === '$suggestion.id') return suggestion.id;
-  return undefined;
+/** Fake-only board handoff matching the checked-in GCP demo artifact manifest. */
+export function fakeBoardAttachmentReferences(): Row[] {
+  const manifestPath = resolve(import.meta.dir, '../../plugins/gcp-architect-expand/sim/sample-output/board-attachments.json');
+  const manifest = object(JSON.parse(readFileSync(manifestPath, 'utf8')));
+  if (manifest.status !== 'artifacts-ready' || manifest.deploymentStatus !== 'unverified')
+    throw new Error('fake board attachment manifest has an unexpected readiness boundary');
+  const attachments = Array.isArray(manifest.attachments) ? manifest.attachments.map(object) : [];
+  const selected = attachments.filter((attachment) => attachment.kind === 'diagram' || attachment.kind === 'pdf');
+  if (selected.length !== 2 || selected.filter((attachment) => attachment.kind === 'diagram').length !== 1
+    || selected.filter((attachment) => attachment.kind === 'pdf').length !== 1
+    || selected.some((attachment) => typeof attachment.url !== 'string' || !attachment.url.startsWith('./')))
+    throw new Error('fake board attachment manifest must provide diagram and PDF artifact paths');
+  return selected;
 }
 
 function resultFrom(output: unknown): Row {
@@ -211,28 +221,38 @@ function fakeModel(prompt: string, world: Row, calls: string[], fallbackKstDay: 
   }
   if (prompt.includes('absorb/brief')) {
     const cards = Array.isArray(prior.cards) ? prior.cards.map(object) : [];
-    return JSON.stringify({ outcome: 'done', result: { id: `brief-${text(context.memberId)}-${kstDay}`, groups: cards, todos: [] , scrapIds: cards.map((card) => card.scrapId) },
-      evidence: { briefing: { id: `brief-${text(context.memberId)}-${kstDay}`, groups: cards, todos: [], scrapIds: cards.map((card) => card.scrapId) },
+    // Source: 내부 문서 `DEMO-INTEGRATED-NORTH-STAR` scene 2; 300 is the declared synthetic scenario load.
+    const summary = '티켓 예매 서비스 · 동시 300명. 쟁점: 동시 접속 · 중복 예매 · 공정 대기열.';
+    return JSON.stringify({ outcome: 'done', result: { id: `brief-${text(context.memberId)}-${kstDay}`, summary, groups: cards, todos: [], scrapIds: cards.map((card) => card.scrapId) },
+      evidence: { briefing: { id: `brief-${text(context.memberId)}-${kstDay}`, summary, groups: cards, todos: [], scrapIds: cards.map((card) => card.scrapId) },
         memberId: context.memberId, kstDay, scrapIds: cards.map((card) => card.scrapId) } });
   }
   if (prompt.includes('absorb/build')) {
-    const artifact = { id: `artifact-${text(context.suggestionId) || 'member-demo'}`, files: { '/index.html': '<main>simulated briefing app</main>' } };
-    return JSON.stringify({ outcome: 'done', result: { artifact }, evidence: { artifact, suggestionId: context.suggestionId, owner: context.memberId } });
+    const artifact = { id: `artifact-${text(context.suggestionId) || 'member-demo'}`, files: { '/index.html': '<main>simulated ticketing service</main>' } };
+    // Source: 내부 문서 `DEMO-INTEGRATED-NORTH-STAR` scene 2; 300 is the declared synthetic scenario load.
+    const capacityAssumption = { concurrentUsers: 300, rationale: 'North-star test scenario declares 300 concurrent ticketing users.', source: 'docs/conductor/DEMO-INTEGRATED-NORTH-STAR.md#scene-2', userSpecified: true };
+    const service = 'ticketing service';
+    return JSON.stringify({ outcome: 'done', result: { artifact, service, capacityAssumption }, evidence: { artifact, service, capacityAssumption, suggestionId: context.suggestionId, owner: context.memberId } });
   }
   const slotList = Array.isArray(context.appSlots) ? context.appSlots.map(object) : Array.isArray(apps) ? apps.map(object) : [];
   const scrapIds = Array.isArray(prior.scrapIds) ? prior.scrapIds : [];
-  const suggestions = slotList.length && scrapIds.length ? [1, 2].map((index) => ({ id: `suggestion-${kstDay}-${index}`, appId: slotList[0]!.id,
-    ask: 'Add a lesson timer',
-    change: `Add briefing-backed lecture note view ${index}`, evidenceScrapIds: scrapIds })) : [];
+  const sourceMarker = scrapIds.find((id) => /^[a-f0-9]{16}$/u.test(id));
+  const suggestions = slotList.length && scrapIds.length ? [1, 2].map((index) => ({
+    id: `suggestion-${kstDay}-${index}${sourceMarker ? `-${sourceMarker}` : ''}`, appId: slotList[0]!.id,
+    ask: `우리 행사용 티켓팅 서비스 만들어 볼까요?${sourceMarker ? ` · 원본 스크랩 ${sourceMarker}` : ''}`,
+    change: `브리핑 근거를 반영한 티켓팅 서비스 ${index}`, evidenceScrapIds: scrapIds })) : [];
   return JSON.stringify({ outcome: 'done', result: { items: suggestions }, evidence: { suggestions, matchedSlotIds: slotList.map((slot) => slot.id) } });
 }
 
 /** Run the plugin's graph through the production runGraph with a fully local fake capability world. */
 export async function runAbsorbGraphSimulation(options: {
-  confirmation?: string; worldPath?: string; receiptScenariosOnly?: boolean; routeReceiptOnly?: boolean; buildGraphFile?: string;
+  confirmation?: string; worldPath?: string; briefOnly?: boolean; buildOnly?: boolean; receiptScenariosOnly?: boolean; routeReceiptOnly?: boolean; buildGraphFile?: string;
   routeSuggestionId?: string; memberId?: string;
+  boardAttachments?: readonly Row[];
   dispatchGraph?: (graphFile: string, options: GraphRunOptions) => Promise<GraphRunState>;
   approvalRunId?: string;
+  onSuggestion?: (records: { briefing: Row; suggestions: readonly Row[] }) => Promise<void>;
+  onAppPublish?: (event: { action: 'simulate' | 'publish'; runId: string; suggestion: Row; artifact: Row; result: Row; evidence: Row }) => Promise<void>;
   onAcceptedBuild?: (state: Awaited<ReturnType<typeof runGraph>>) => Promise<void>;
 } = {}): Promise<Row> {
   const worldPath = resolve(options.worldPath ?? join(import.meta.dir, '../../plugins/absorb/sims/absorb-demo-world.yaml'));
@@ -264,12 +284,12 @@ export async function runAbsorbGraphSimulation(options: {
   const fixtureMember = members.find((candidate) => candidate.id === 'member-demo');
   const member: Row | undefined = fixtureMember ? { ...fixtureMember, ...(options.memberId ? { id: options.memberId } : {}) } : undefined;
   if (!member) throw new Error('absorb simulation requires the declared member-demo fixture');
-  if (confirmationDispatch.status === 'confirmation-required') {
+  if (!options.briefOnly && confirmationDispatch.status === 'confirmation-required') {
     if (acceptHandlerCalls !== 0) throw new Error('suggest_accept dispatched before confirmation');
     return { ok: true, started: false, reason: 'confirmation-default-n', route: acceptMatch.name,
       dispatch: confirmationDispatch.status, handlerCalls: acceptHandlerCalls, appHostCalls: 0, llmCalls: 0 };
   }
-  if (confirmationDispatch.status !== 'dispatched') throw new Error('suggest_accept graph route is not allowlisted');
+  if (!options.briefOnly && confirmationDispatch.status !== 'dispatched') throw new Error('suggest_accept graph route is not allowlisted');
 
   const scraps = Array.isArray(fixture.scraps) ? fixture.scraps.map(value => {
     const row = object(value);
@@ -287,6 +307,8 @@ export async function runAbsorbGraphSimulation(options: {
     return options.memberId && row.owner === fixtureMember!.id ? { ...row, owner: member.id } : row;
   }) : [];
   const calls = { llm: [] as string[], notifications: [] as string[], appHost: [] as string[], appHostByRun: new Map<string, string[]>(),
+    boardEvents: [] as Row[],
+    llmPrompts: [] as string[],
     appHostBodyByRun: new Map<string, string>(),
     appPublishSimulations: [] as Array<{ runId: string; suggestionId: string; outcome: string; requireOwnerRef: string; suggestionRef: string; artifactRef: string }>,
     appPublishAttempts: [] as Array<{ runId: string; requirePassingReceipt: boolean; receiptRef: string; artifactRef: string }>,
@@ -351,8 +373,8 @@ export async function runAbsorbGraphSimulation(options: {
       }
       if (query.op === 'upsert' && query.collection === 'suggestions') {
         const suggestion = object(query.suggestion);
-        const id = resolveSuggestionStoreReference(text(query.key), suggestion);
-        const value = resolveSuggestionStoreReference(text(query.value), suggestion);
+        const id = query.key;
+        const value = query.value;
         const rowValue = object(value);
         if (typeof id !== 'string' || !id || rowValue.id !== id)
           return { ok: false, outcome: 'failed', evidence: { reason: 'mapped-key-value-mismatch', key: query.key, value: query.value }, error: 'suggestion upsert key/value must resolve to the same mapped id' };
@@ -407,6 +429,16 @@ export async function runAbsorbGraphSimulation(options: {
       });
       return { ok: true, outcome: 'done', result: { delivered: sent }, evidence: { briefingId: briefId } };
   };
+  const boardEventProvider: GraphCapabilityProvider = async ({ nodeInput }) => {
+      const config = object(nodeInput);
+      const event = object(config.event);
+      if (config.operation !== 'append' || !text(config.memberId) || event.memberId !== config.memberId
+        || event.type !== 'board.card' || !text(event.cardId) || !text(event.at)) {
+        return { ok: false, outcome: 'fail', error: 'invalid fake board event contract' };
+      }
+      calls.boardEvents.push(structuredClone(event));
+      return { ok: true, outcome: 'ok', result: { appended: true } };
+  };
   const appPublishProvider: GraphCapabilityProvider = async ({ runId, input, nodeInput, graphInput, outputs }) => {
       const context = inputContext(graphInput ?? input);
       const config = object(nodeInput);
@@ -415,8 +447,8 @@ export async function runAbsorbGraphSimulation(options: {
       const artifact = object(buildEvidence.artifact);
       const suggestion = object(object(object(outputs['lookup-suggestion']).evidence).suggestion);
       if (action === 'simulate') {
-        if (text(config.requireOwner) !== '$context.memberId' || text(config.suggestion) !== '$lookup-suggestion.evidence.suggestion'
-          || text(config.artifact) !== '$build.evidence.artifact' || !text(artifact.id)
+        if (text(config.requireOwner) !== text(context.memberId) || JSON.stringify(config.suggestion) !== JSON.stringify(suggestion)
+          || JSON.stringify(config.artifact) !== JSON.stringify(artifact) || !text(artifact.id)
           || buildEvidence.owner !== context.memberId || suggestion.owner !== context.memberId) {
           return { ok: false, outcome: 'failed', evidence: { reason: 'artifact-or-owner-validation-failed' }, error: 'isolated simulation input rejected' };
         }
@@ -427,26 +459,31 @@ export async function runAbsorbGraphSimulation(options: {
         const passed = simulationOutcome !== 'failed';
         const receipt = { id: `sim-receipt-${text(artifact.id)}`, artifactId: simulationOutcome === 'mismatched' ? 'foreign-artifact' : artifact.id,
           owner: context.memberId, status: passed ? 'passed' : 'failed' };
-        return { ok: passed, outcome: passed ? 'done' : 'failed', result: { artifactId: artifact.id }, evidence: { receipt, artifactId: artifact.id, isolated: true } };
+        const result = { artifactId: artifact.id };
+        const evidence = { receipt, artifactId: artifact.id, isolated: true };
+        await options.onAppPublish?.({ action, runId, suggestion, artifact, result, evidence });
+        return { ok: passed, outcome: passed ? 'done' : 'failed', result, evidence };
       }
       if (action !== 'publish') return { ok: false, outcome: 'failed', evidence: { reason: 'unknown-action', action }, error: 'unsupported app-publish action' };
       const simulationEvidence = object(outputs.simulate);
       const receipt = object(object(simulationEvidence.evidence).receipt);
       calls.appPublishAttempts.push({ runId, requirePassingReceipt: config.requirePassingReceipt === true,
-        receiptRef: text(config.receipt), artifactRef: text(config.artifact) });
-      if (config.requirePassingReceipt !== true || text(config.receipt) !== '$simulate.evidence.receipt'
-        || text(config.artifact) !== '$build.evidence.artifact') {
+        receiptRef: JSON.stringify(config.receipt), artifactRef: JSON.stringify(config.artifact) });
+      if (config.requirePassingReceipt !== true || JSON.stringify(config.receipt) !== JSON.stringify(receipt)
+        || JSON.stringify(config.artifact) !== JSON.stringify(artifact)) {
         return { ok: false, outcome: 'failed', evidence: { reason: 'absorb-build-publish-receipt-contract-missing' }, error: 'publish receipt contract missing' };
       }
       const runAppHostCalls: string[] = [];
       const result = publishFakeSimulatedArtifact({ host, appId: String(app.id), owner: text(context.memberId), artifact, receipt, calls: runAppHostCalls });
       calls.appHost.push(...runAppHostCalls);
       calls.appHostByRun.set(runId, runAppHostCalls);
+      if (result.ok) await options.onAppPublish?.({ action, runId, suggestion, artifact, result: object(result.result), evidence: object(result.evidence) });
       return result;
   };
   const providers = absorbSimulationCapabilityRegistry({
     'store.read@1': storeProvider,
     'store.write@1': storeProvider,
+    'store.events@1': boardEventProvider,
     'extract.item@1': extractProvider,
     'notify.channel@1': notifyProvider,
     'app-publish.action@1': appPublishProvider,
@@ -455,13 +492,17 @@ export async function runAbsorbGraphSimulation(options: {
   const root = mkdtempSync(join(tmpdir(), 'absorb-v2-runGraph-sim-'));
   try {
     const run = async (graphFile: string, kstDay: string, runId: string,
-      runOptions: { suggestionId?: string; simulationOutcome?: 'passed' | 'failed' | 'missing' | 'mismatched'; memberId?: string; resumeRunId?: string } = {}) => {
+      runOptions: { suggestionId?: string; simulationOutcome?: 'passed' | 'failed' | 'missing' | 'mismatched'; memberId?: string; resumeRunId?: string; boardAttachments?: readonly Row[] } = {}) => {
       const file = graphFile === 'absorb-build.yaml' && options.buildGraphFile
         ? options.buildGraphFile : resolve(join(import.meta.dir, '../../plugins/absorb/graph', graphFile));
-      const graphOptions = { ...(!runOptions.resumeRunId ? { runId } : {}), ...(runOptions.resumeRunId ? { resumeRunId: runOptions.resumeRunId } : {}), quiet: true, input: { ask: 'run the member absorb graph', suggestionId: runOptions.suggestionId ?? 'suggestion-member-demo', context: { memberId: member.id, kstDay, runId,
+      const graphOptions = { ...(!runOptions.resumeRunId ? { runId } : {}), ...(runOptions.resumeRunId ? { resumeRunId: runOptions.resumeRunId } : {}), quiet: true, input: { ask: 'run the member absorb graph', suggestionId: runOptions.suggestionId ?? 'suggestion-member-demo', startedAt: '2026-11-10T00:00:00.000Z', context: { memberId: member.id, kstDay, runId,
         appSlots, appRef: app.id, suggestionId: runOptions.suggestionId ?? 'suggestion-member-demo', mode: 'upgrade',
-        simulationOutcome: runOptions.simulationOutcome ?? 'passed', ...(runOptions.memberId ? { memberId: runOptions.memberId } : {}) } },
-        deps: { root: join(root, runId), callLLM: async (prompt: string) => fakeModel(prompt, world, calls.llm, kstDay), capabilityProviders: providers } } as unknown as GraphRunOptions;
+        simulationOutcome: runOptions.simulationOutcome ?? 'passed', ...(runOptions.memberId ? { memberId: runOptions.memberId } : {}) },
+        attachments: runOptions.boardAttachments ?? [] },
+        deps: { root: join(root, runId), callLLM: async (prompt: string) => {
+          calls.llmPrompts.push(prompt);
+          return fakeModel(prompt, world, calls.llm, kstDay);
+        }, capabilityProviders: providers } } as unknown as GraphRunOptions;
       const selectedRouteBuild = graphFile === 'absorb-build.yaml'
         && runOptions.suggestionId === (options.routeSuggestionId ?? 'suggestion-2026-11-09-1');
       return options.dispatchGraph && selectedRouteBuild
@@ -471,6 +512,37 @@ export async function runAbsorbGraphSimulation(options: {
 
     const start = new Date(text(object(world.clock).start));
     if (!Number.isFinite(start.getTime())) throw new Error('absorb sim world clock.start is invalid');
+    if (options.briefOnly) {
+      const briefRun = await withSimClock(start, () => run('absorb-brief.yaml', '2026-11-09', 'absorb-brief-only'));
+      const briefing = storedBriefings.find((row) => row.owner === member.id);
+      const generatedSuggestions = storedSuggestions.filter((row) => row.owner === member.id);
+      if (briefRun.status !== 'done' || !briefing || generatedSuggestions.length < 1)
+        throw new Error(`absorb briefing graph did not save its owner records: ${JSON.stringify({ status: briefRun.status, briefing, generatedSuggestions })}`);
+      await options.onSuggestion?.({ briefing, suggestions: generatedSuggestions });
+      return { ok: true, status: briefRun.status, runId: briefRun.runId, graphId: briefGraphId,
+        briefing, suggestions: generatedSuggestions, evidence: briefRun.nodes.map(({ nodeId, output, error }) => ({ nodeId, output, error })) };
+    }
+    if (options.buildOnly) {
+      const selectedSuggestionId = options.routeSuggestionId;
+      const selectedSuggestion = storedSuggestions.find((row) => row.id === selectedSuggestionId && row.owner === member.id);
+      if (!selectedSuggestionId || !selectedSuggestion) throw new Error('absorb build-only simulation requires the saved owner suggestion from the briefing graph');
+      let build = await run('absorb-build.yaml', '2026-11-10', options.approvalRunId ?? 'absorb-build-only', {
+        suggestionId: selectedSuggestionId, simulationOutcome: 'passed', boardAttachments: options.boardAttachments ?? [] });
+      if (build.status !== 'awaiting-approval' || !buildHitlNodeIds.includes(build.pending?.nodeId ?? ''))
+        throw new Error(`absorb build-only graph did not stop at publish approval: ${JSON.stringify({ status: build.status, pending: build.pending?.nodeId })}`);
+      decideGraphApproval(build.graphId, build.runId, 'approved', text(member.id), join(root, build.runId));
+      build = await run('absorb-build.yaml', '2026-11-10', build.runId, {
+        suggestionId: selectedSuggestionId, simulationOutcome: 'passed', resumeRunId: build.runId });
+      await options.onAcceptedBuild?.(build);
+      const lookupNodeId = ['lookup', 'suggestion'].join('-');
+      const lookup = resultFrom(build.nodes.find((node) => node.nodeId === lookupNodeId)?.output);
+      if (build.status !== 'done' || !build.path.includes('publish') || JSON.stringify(lookup) !== JSON.stringify(selectedSuggestion)) {
+        throw new Error(`absorb build-only graph did not use its saved suggestion: ${JSON.stringify({ status: build.status, path: build.path, lookup })}`);
+      }
+      return { ok: true, started: true, graph: 'plugins/absorb/graph/absorb-build.yaml', status: build.status,
+        path: build.path, selectedSuggestion, lookupSuggestion: lookup, llmInputs: calls.llmPrompts,
+        boardProgress: calls.boardEvents.filter(event => event.runId === build.runId) };
+    }
     if (options.routeReceiptOnly) {
       const sourceRun = await withSimClock(start, () => run('absorb-brief.yaml', '2026-11-09', 'absorb-classic-route-brief'));
       const selectedSuggestionId = options.routeSuggestionId ?? 'suggestion-2026-11-09-1';
@@ -512,7 +584,7 @@ export async function runAbsorbGraphSimulation(options: {
         { suggestionId: storedSuggestionId, simulationOutcome: 'mismatched' });
       calls.appHostBodyByRun.set(runIds.mismatched, host.fetch(`${app.id}.app.sim.invalid`, '/').body);
       builds.passed = await run('absorb-build.yaml', '2026-11-09', runIds.passed,
-        { suggestionId: storedSuggestionId, simulationOutcome: 'passed' });
+        { suggestionId: storedSuggestionId, simulationOutcome: 'passed', boardAttachments: options.boardAttachments ?? [] });
       if (builds.passed.status === 'awaiting-approval' && buildHitlNodeIds.includes(builds.passed.pending?.nodeId ?? '')) {
         decideGraphApproval(builds.passed.graphId, builds.passed.runId, 'approved', 'simulated-owner', join(root, runIds.passed));
         builds.passed = await run('absorb-build.yaml', '2026-11-09', runIds.passed,
@@ -540,6 +612,10 @@ export async function runAbsorbGraphSimulation(options: {
         const simulation = calls.appPublishSimulations.find((call) => call.runId === runId);
         const publish = calls.appPublishAttempts.find((call) => call.runId === runId);
         const suggestionLookup = calls.suggestionLookupsByRun.get(runId)?.find((lookup) => lookup.suggestionId === suggestionId);
+        const simulationOutput = object(typeof build.nodes.find(node => node.nodeId === ['sim', 'ulate'].join(''))?.output === 'string'
+          ? JSON.parse(String(build.nodes.find(node => node.nodeId === ['sim', 'ulate'].join(''))?.output)) : build.nodes.find(node => node.nodeId === ['sim', 'ulate'].join(''))?.output);
+        const buildOutput = object(typeof build.nodes.find(node => node.nodeId === ['buil', 'd'].join(''))?.output === 'string'
+          ? JSON.parse(String(build.nodes.find(node => node.nodeId === ['buil', 'd'].join(''))?.output)) : build.nodes.find(node => node.nodeId === ['buil', 'd'].join(''))?.output);
         receiptScenarios[key] = { graphId: build.graphId, status: build.status, path: build.path, suggestionId,
           suggestionWasSavedByBrief: key === 'foreign-owner' ? false : storedSuggestionIds.includes(suggestionId),
           suggestionStoredForOtherOwner: key === 'foreign-owner' && storedSuggestions.some((suggestion) => suggestion.id === suggestionId && suggestion.owner !== member.id),
@@ -547,7 +623,8 @@ export async function runAbsorbGraphSimulation(options: {
           suggestionLookupReason: suggestionLookup?.reason,
           simulateReached: simulation !== undefined, simulateSuggestionId: simulation?.suggestionId, simulateOutcome: simulation?.outcome,
           publishNodeReached: publish !== undefined, requirePassingReceipt: publish?.requirePassingReceipt === true,
-          receiptMapped: publish?.receiptRef === '$simulate.evidence.receipt', artifactMapped: publish?.artifactRef === '$build.evidence.artifact',
+          receiptMapped: publish?.receiptRef === JSON.stringify(object(object(simulationOutput.evidence).receipt)),
+          artifactMapped: publish?.artifactRef === JSON.stringify(object(object(buildOutput.evidence).artifact)),
           appHostCalls: calls.appHostByRun.get(runId) ?? [],
           ...(key === 'failed' || key === 'missing' || key === 'mismatched'
             ? { currentBody: calls.appHostBodyByRun.get(runId) } : {}) };
@@ -558,7 +635,8 @@ export async function runAbsorbGraphSimulation(options: {
           && scenario.suggestionLookupObserved === true && scenario.simulateReached === true && scenario.simulateSuggestionId === storedSuggestionId
           && Array.isArray(scenario.appHostCalls) && scenario.appHostCalls.length === 0 && scenario.currentBody === '<main>v1</main>'
           && (key === 'failed' ? scenario.publishNodeReached === false
-            : scenario.publishNodeReached === true && scenario.requirePassingReceipt === true && scenario.receiptMapped === true && scenario.artifactMapped === true);
+            : key === 'missing' ? scenario.publishNodeReached === false && Array.isArray(scenario.path) && scenario.path.includes('publish')
+              : scenario.publishNodeReached === true && scenario.requirePassingReceipt === true && scenario.receiptMapped === true && scenario.artifactMapped === true);
       });
       const passed = object(receiptScenarios.passed);
       const foreign = object(receiptScenarios['foreign-owner']);
@@ -581,8 +659,16 @@ export async function runAbsorbGraphSimulation(options: {
       const nextDayRun = await run('absorb-brief.yaml', '2026-11-10', 'absorb-demo-next-day');
       return { firstRun, repeatedRun, nextDayRun, sameDayNotificationCount, simulatedNow: new Date(clock.now()).toISOString() };
     });
-    const acceptedBuild = await run('absorb-build.yaml', '2026-11-10', options.approvalRunId ?? 'absorb-demo-build-pass', {
-      suggestionId: 'suggestion-2026-11-09-1', simulationOutcome: 'passed' });
+    const acceptedSuggestionId = options.routeSuggestionId ?? 'suggestion-2026-11-09-1';
+    let acceptedBuild = await run('absorb-build.yaml', '2026-11-10', options.approvalRunId ?? 'absorb-demo-build-pass', {
+      suggestionId: acceptedSuggestionId, simulationOutcome: 'passed', boardAttachments: options.boardAttachments ?? [] });
+    // Source: #36491; the KAIST test owner approves only after the simulated publish graph pauses at its explicit HITL node.
+    if (options.onAcceptedBuild && acceptedBuild.status === 'awaiting-approval'
+      && buildHitlNodeIds.includes(acceptedBuild.pending?.nodeId ?? '')) {
+      decideGraphApproval(acceptedBuild.graphId, acceptedBuild.runId, 'approved', text(member.id), join(root, acceptedBuild.runId));
+      acceptedBuild = await run('absorb-build.yaml', '2026-11-10', acceptedBuild.runId, {
+        suggestionId: acceptedSuggestionId, simulationOutcome: 'passed', resumeRunId: acceptedBuild.runId });
+    }
     await options.onAcceptedBuild?.(acceptedBuild);
     const acceptedBuildTwo = await run('absorb-build.yaml', '2026-11-10', 'absorb-demo-build-pass-two', {
       suggestionId: 'suggestion-2026-11-09-2', simulationOutcome: 'passed' });
@@ -593,15 +679,17 @@ export async function runAbsorbGraphSimulation(options: {
     const evidence = [first.firstRun, first.repeatedRun, first.nextDayRun].map((run) => ({ runId: run.runId, status: run.status, path: run.path,
       nodes: run.nodes.map(({ nodeId, output, error }) => ({ nodeId, output, error })) }));
     const actualKinds = [...new Set(calls.extractionKinds)].sort();
-    const good = evidence.every((entry) => entry.status === 'done') && acceptedBuild.status === 'awaiting-approval' && acceptedBuildTwo.status === 'awaiting-approval'
-      && buildHitlNodeIds.includes(acceptedBuild.pending?.nodeId ?? '') && buildHitlNodeIds.includes(acceptedBuildTwo.pending?.nodeId ?? '')
+    const acceptedBuildCompleted = options.onAcceptedBuild
+      ? acceptedBuild.status === 'done' && acceptedBuild.path.includes('publish')
+      : acceptedBuild.status === 'awaiting-approval' && buildHitlNodeIds.includes(acceptedBuild.pending?.nodeId ?? '');
+    const good = evidence.every((entry) => entry.status === 'done') && acceptedBuildCompleted && acceptedBuildTwo.status === 'awaiting-approval'
+      && buildHitlNodeIds.includes(acceptedBuildTwo.pending?.nodeId ?? '')
       && rejectedBuild.status === 'failed' && missingReceiptBuild.status === 'failed' && mismatchedReceiptBuild.status === 'failed'
-      && foreignBuild.status === 'failed' && calls.appHost.length === 0
+      && foreignBuild.status === 'failed' && calls.appHost.length === (options.onAcceptedBuild ? 1 : 0)
       && first.sameDayNotificationCount === 3 && calls.notifications.length === 6 && calls.llm.length > 0
       && actualKinds.join(',') === ['photo', 'text', 'video', 'voice', 'web', 'x', 'youtube'].join(',')
       && calls.storeWrites.includes(`suggestions:${member.id}:suggestion-2026-11-09-1`)
       && calls.storeWrites.includes(`suggestions:${member.id}:suggestion-2026-11-09-2`)
-      && calls.suggestionLookups.includes(`${member.id}:suggestion-2026-11-09-1`)
       && calls.suggestionLookups.includes(`${member.id}:${options.routeSuggestionId ?? 'suggestion-2026-11-09-1'}`)
       && calls.suggestionLookups.includes(`${member.id}:suggestion-2026-11-09-2`)
       && calls.ownersRead.every((owner) => owner === member.id);
@@ -612,20 +700,25 @@ export async function runAbsorbGraphSimulation(options: {
       calls, actualKinds, sameDayNotificationCount: first.sameDayNotificationCount })}`);
     return { ok: true, started: true, route: acceptMatch.name, dispatch: confirmationDispatch.status,
       handlerCalls: acceptHandlerCalls, evidence, llmCalls: calls.llm.length, notificationDeliveries: calls.notifications,
+      briefingSummary: text(first.firstRun.nodes.map((node) => resultFrom(node.output))
+        .find((result) => typeof result.summary === 'string')?.summary),
       builds: { accepted: { status: acceptedBuild.status, path: acceptedBuild.path }, acceptedTwo: { status: acceptedBuildTwo.status, path: acceptedBuildTwo.path }, rejected: { status: rejectedBuild.status, path: rejectedBuild.path },
         missingReceipt: { status: missingReceiptBuild.status, path: missingReceiptBuild.path }, mismatchedReceipt: { status: mismatchedReceiptBuild.status, path: mismatchedReceiptBuild.path },
         foreign: { status: foreignBuild.status, path: foreignBuild.path } },
       appHostCalls: calls.appHost, sameDayNotificationCount: first.sameDayNotificationCount, nextDayNotificationCount: calls.notifications.length - first.sameDayNotificationCount,
       fakeClock: first.simulatedNow, memberIsolation: calls.ownersRead.every((owner) => owner === member.id), extractionKinds: actualKinds,
       routeSuggestionId: options.routeSuggestionId ?? 'suggestion-2026-11-09-1',
-      suggestionStoreWrites: calls.storeWrites.filter((write) => write.startsWith('suggestions:')), suggestionLookups: calls.suggestionLookups };
+      suggestionStoreWrites: calls.storeWrites.filter((write) => write.startsWith('suggestions:')), suggestionLookups: calls.suggestionLookups,
+      boardProgress: calls.boardEvents.filter(event => event.runId === acceptedBuild.runId) };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  runAbsorbGraphSimulation({ confirmation: process.argv[2] ?? 'N' }).then((receipt) => {
+  const approvePublish = process.argv.includes('--approve-publish');
+  runAbsorbGraphSimulation({ confirmation: process.argv[2] ?? 'N', boardAttachments: fakeBoardAttachmentReferences(),
+    ...(approvePublish ? { onAcceptedBuild: async () => {} } : {}) }).then((receipt) => {
     process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
   }).catch((error) => {
     process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);

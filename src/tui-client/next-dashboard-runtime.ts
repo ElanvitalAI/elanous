@@ -25,7 +25,7 @@ export interface NextTuiMissionPairCompletionResult {
 export async function completeNextTuiMissionPair(
   input: NextTuiMissionPairCompletionInput,
 ): Promise<NextTuiMissionPairCompletionResult> {
-  const { enqueueClassicSidetabMissionPairCompletion } = await import('../dashboard/classic-sidetab-mission-job.js');
+  const { enqueueClassicSidetabMissionPairCompletion } = await import('../sidetab-core/classic-sidetab-mission-job.js');
   const asClassicResult = (result: VisibleMissionResult) => ({
     ok: result.ok,
     status: result.ok ? 'completed' as const : 'failed' as const,
@@ -53,8 +53,8 @@ export async function completeNextTuiMissionPair(
 
 export async function loadNextTuiDashboardRuntime() {
   const [segments, goalContinue] = await Promise.all([
-    import('../dashboard/turn-start-segments.js'),
-    import('../dashboard/input/goal-continue.js'),
+    import('../tui/turn-start-segments.js'),
+    import('../tui/input/goal-continue.js'),
   ]);
   return { ...segments, ...goalContinue };
 }

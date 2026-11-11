@@ -220,7 +220,7 @@ const ENTRANCE_DECLARATIONS = [
   // ── 자연어(툴 표면) ────────────────────────────────────
   { id: 'nl-self-implement', surface: 'nl', status: 'live', verification: { actualMission: 'verified', legacyParity: 'verified' } },
   { id: 'nl-self-orchestrate', surface: 'nl', status: 'retired' },
-  { id: 'nl-solve-mission', surface: 'nl', status: 'live' },
+  { id: 'nl-solve-mission', surface: 'nl', status: 'retired' },
   { id: 'nl-run-dev-harness', surface: 'nl', status: 'retired' },
   // ── 데몬/ACP ─────────────────────────────────────────
   { id: 'daemon-self-implement', surface: 'daemon', status: 'live' },
@@ -258,7 +258,6 @@ export function recommendedEntranceNotice(
 export const NATIVE_TOOL_BY_ENTRANCE_ID: Readonly<Partial<Record<EntranceId, string>>> = {
   'nl-self-implement': 'SelfImplement',
   'nl-self-orchestrate': 'SelfOrchestrate',
-  'nl-solve-mission': 'SolveMission',
 };
 
 export interface EntranceWithModelExposure extends EntranceDeclaration {

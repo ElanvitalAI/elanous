@@ -6,7 +6,7 @@ import { AppRouterContext } from 'next/dist/shared/lib/app-router-context.shared
 import { SearchParamsContext } from 'next/dist/shared/lib/hooks-client-context.shared-runtime';
 import LiveRunPage from '@/app/live-run/page';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { createNexusClient, type HarnessRunTraversal, type HarnessTraversalStepWire, type RunGraphDetail } from '@/nexus/client';
+import { createNexusClient, type HarnessGraphEventWire, type HarnessRunTraversal, type HarnessTraversalStepWire, type RunGraphDetail } from '@/nexus/client';
 import { NexusProvider } from '@/nexus/hooks/use-nexus-context';
 import { followZoom, LiveRunGraph, replayOverviewMinZoom } from './LiveRunGraph';
 
@@ -79,6 +79,9 @@ async function mount(width: number, requests: string[] = [], traversal = TRAVERS
 }
 
 const text = (node: ReactTestInstance | string): string => typeof node === 'string' ? node : node.children.map(text).join('');
+const renderedTree = (node: ReactTestInstance | string): string => typeof node === 'string'
+  ? node
+  : `${[node.props.title, node.props['aria-label']].filter((value): value is string => typeof value === 'string').join(' ')} ${node.children.map(renderedTree).join('')}`;
 
 describe('LiveRunGraph — 390px', () => {
   const g = globalThis as Record<string, unknown>;
@@ -204,7 +207,15 @@ describe('LiveRunGraph — 390px', () => {
   });
 
   test('DEMO1104 fixed traversal response renders B/C scenario injections through /live-run', async () => {
-    const traversal = JSON.parse(readFileSync(new URL('../../../../../test/fixtures/run-ledgers/demo1104-arg-9770d6f8.traversal.json', import.meta.url), 'utf8')) as HarnessRunTraversal;
+    const fixtureTraversal = JSON.parse(readFileSync(new URL('../../../../../test/fixtures/run-ledgers/demo1104-arg-9770d6f8.traversal.json', import.meta.url), 'utf8')) as HarnessRunTraversal;
+    const traversal: HarnessRunTraversal = {
+      ...fixtureTraversal,
+      graphEvents: [
+        ...(fixtureTraversal.graphEvents ?? []),
+        { seq: 99, ts: '2026-11-11T00:00:05Z', type: 'node-added', node: 'sim-source', kind: 'judge', decider: 'sim', source: 'sim', reason: 'replay through response' },
+        { seq: 100, ts: '2026-11-11T00:00:06Z', type: 'node-added', node: 'shadow-source', kind: 'judge', decider: 'shadow', source: 'shadow', reason: 'shadow through response' },
+      ],
+    };
     const runId = '9770d6f8-39e6-412a-9e83-9447b7a2cd36';
     const requests: string[] = [];
     const declaredGraph: RunGraphDetail = {
@@ -217,23 +228,60 @@ describe('LiveRunGraph — 390px', () => {
     root = await mount(1024, requests, traversal, declaredGraph, true, false, runId);
     expect(requests).toContain('http://daemon/v1/harness/run-traversal?runId=' + runId);
     const flow = root.root.findByType(ReactFlow);
-    const nodes = flow.props.nodes as Array<{ id: string; data: { provenance?: { type: string; scene?: string; reason: string; mock?: boolean } } }>;
+    const nodes = flow.props.nodes as Array<{ id: string; data: { provenance?: { source: string; scene?: string; reason?: string; mock?: boolean } } }>;
     expect(nodes.filter((node) => ['subscription-repair', 'headline-refresh'].includes(node.id))).toMatchObject([
-      { id: 'subscription-repair', data: { provenance: { type: 'scenario-injection', scene: 'B', reason: 'paid-wall recovery mock', mock: true } } },
-      { id: 'headline-refresh', data: { provenance: { type: 'scenario-injection', scene: 'C', reason: 'new headline reordering mock', mock: true } } },
+      { id: 'subscription-repair', data: { provenance: { source: 'injected', scene: 'B', reason: 'paid-wall recovery mock', mock: true } } },
+      { id: 'headline-refresh', data: { provenance: { source: 'replay', scene: 'C', reason: 'new headline reordering mock', mock: true } } },
     ]);
-    expect(text(root.root.findByProps({ 'data-testid': 'scenario-injection-subscription-repair' })).trim()).toBe('시나리오 주입 · B · mock');
-    expect(text(root.root.findByProps({ 'data-testid': 'scenario-injection-headline-refresh' })).trim()).toBe('시나리오 주입 · C · mock');
-    expect(root.root.findByProps({ 'data-testid': 'scenario-injection-subscription-repair' }).props.title).toContain('paid-wall recovery mock');
+    expect(text(root.root.findByProps({ 'data-testid': 'provenance-tag-subscription-repair' })).trim()).toBe('💉 주입');
+    expect(text(root.root.findByProps({ 'data-testid': 'provenance-tag-headline-refresh' })).trim()).toBe('🎞 재생');
+    expect(text(root.root.findByProps({ 'data-testid': 'provenance-tag-sim-source' })).trim()).toBe('🧪 시뮬');
+    expect(text(root.root.findByProps({ 'data-testid': 'provenance-tag-shadow-source' })).trim()).toBe('👻 그림자');
+    expect(root.root.findByProps({ 'data-testid': 'provenance-tag-subscription-repair' }).props.title).toBeUndefined();
+    expect(text(root.root.findByProps({ 'data-testid': 'provenance-tag-subscription-repair' })).includes('B')).toBe(false);
+    expect(text(root.root.findByProps({ 'data-testid': 'provenance-tag-subscription-repair' })).includes('mock')).toBe(false);
   });
 
   test('non-mock scenario injection does not claim a mock label', async () => {
     const traversal = JSON.parse(readFileSync(new URL('../../../../../test/fixtures/run-ledgers/demo1104-arg-9770d6f8.traversal.json', import.meta.url), 'utf8')) as HarnessRunTraversal;
     const graphEvents = traversal.graphEvents?.map((event) => event.type === 'node-added' && event.node === 'subscription-repair'
-      ? { ...event, reason: 'plugin grounded repair, not mock' }
+      ? { ...event, source: 'real', reason: 'plugin grounded repair, not mock' }
       : event);
-    root = await mount(1024, [], { ...traversal, graphEvents }, GRAPH);
-    expect(text(root.root.findByProps({ 'data-testid': 'scenario-injection-subscription-repair' })).trim()).toBe('시나리오 주입 · B');
+    const mounted = await mount(1024, [], { ...traversal, graphEvents }, GRAPH);
+    root = mounted;
+    expect(() => mounted.root.findByProps({ 'data-testid': 'provenance-tag-subscription-repair' })).toThrow();
+    expect(text(mounted.root.findByProps({ 'data-testid': 'live-node-subscription-repair' }))).toContain('runtime:scenario-injection · 최대 1회');
+  });
+
+  test('unknown and empty sources render a safe unknown badge; unbadged sources keep recipe and metadata stays hidden', async () => {
+    const graphEvents: HarnessGraphEventWire[] = [
+      { seq: 1, ts: '2026-11-11T00:00:00Z', type: 'node-added', node: 'empty-source', kind: 'judge', decider: 'empty', source: '', scene: 'secret-host', reason: 'lease-1 secret-host mock' },
+      { seq: 2, ts: '2026-11-11T00:00:01Z', type: 'node-added', node: 'unknown-source', kind: 'judge', decider: 'unknown', source: 'secret-source-code', scene: 'secret-host', reason: 'lease-1 secret-host mock' },
+      { seq: 3, ts: '2026-11-11T00:00:02Z', type: 'node-added', node: 'real-source', kind: 'judge', decider: 'real', source: 'real', scene: 'secret-host', reason: 'lease-1 secret-host mock' },
+      { seq: 4, ts: '2026-11-11T00:00:03Z', type: 'node-added', node: 'probe-source', kind: 'judge', decider: 'probe', source: 'synthetic-probe', scene: 'secret-host', reason: 'lease-1 secret-host mock' },
+      { seq: 5, ts: '2026-11-11T00:00:04Z', type: 'node-added', node: 'missing-source', kind: 'judge', decider: 'missing', scene: 'secret-host', reason: 'lease-1 secret-host mock' },
+      { seq: 6, ts: '2026-11-11T00:00:05Z', type: 'node-added', node: 'blank-source', kind: 'judge', decider: 'blank', source: '   ', scene: 'secret-host', reason: 'lease-1 secret-host mock' },
+    ];
+    const mounted = await mount(1024, [], { ...TRAVERSAL, graphEvents }, GRAPH);
+    root = mounted;
+
+    for (const label of ['empty-source', 'unknown-source', 'missing-source', 'blank-source']) {
+      const wrapper = mounted.root.findByProps({ 'data-testid': `provenance-tag-${label}` });
+      const badge = wrapper.findByProps({ 'data-testid': 'provenance-unknown' });
+      expect(text(badge)).toBe('출처 미상');
+    }
+    for (const label of ['real-source', 'probe-source']) {
+      expect(() => mounted.root.findByProps({ 'data-testid': `provenance-tag-${label}` })).toThrow();
+      expect(text(mounted.root.findByProps({ 'data-testid': `live-node-${label}` }))).toContain(`runtime:${label.split('-')[0]} · 최대 1회`);
+    }
+
+    const rendered = ['empty-source', 'unknown-source', 'real-source', 'probe-source', 'missing-source', 'blank-source']
+      .map((label) => renderedTree(mounted.root.findByProps({ 'data-testid': `live-node-${label}` })).toLowerCase())
+      .join('\n');
+    expect(rendered).not.toContain('secret-host');
+    expect(rendered).not.toContain('lease-1');
+    expect(rendered).not.toContain('mock');
+    expect(rendered).not.toContain('secret-source-code');
   });
 
   test('선언 그래프 밖에서 실제로 밟은 노드에만 새로 추가 표식을 붙인다', async () => {

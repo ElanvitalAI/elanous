@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "데이터 파이프라인·스트리밍 — 배치와 스트림 선택",
+  "source": "https://docs.cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning",
+  "body": "적용 시점: 데이터 신선도 요구와 처리량이 서로 다른 입력을 정기·연속 처리할 때.\n용량 단계: 초기 데이터는 배치로 검증; 신선도 목표가 배치 간격보다 짧아지면 스트림을 도입한다.\nGCP 대응: Cloud Storage/BigQuery 배치 적재, 실시간은 Pub/Sub→Dataflow→BigQuery/Bigtable을 검토한다.\n비용 축: 항상 실행되는 worker, 데이터 보존·스캔, 셔플·전송과 재처리 비용이 축이다.\n결정과 반증: 같은 입력을 배치·스트림에서 비교해 지연·중복·결과 일관성을 확인한다."
+}

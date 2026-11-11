@@ -1,0 +1,11 @@
+{
+  "path": "src/ux-sim/kaist-app-qr-sim.ts",
+  "disposition": "device",
+  "entryCommand": "bun test src/ux-sim/kaist-app-qr-sim.test.ts",
+  "logsRecorded": "no",
+  "logsDetail": "In-process test device; no persistent simulation event log.",
+  "deviceId": "kaist-app-qr-public-isolation",
+  "scenarioIds": [
+    "KAIST-APP-QR-LIVE"
+  ]
+}

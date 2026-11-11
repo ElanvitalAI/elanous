@@ -155,7 +155,7 @@ const V5_TOOL_FIXTURES: Record<string, Record<string, number>> = {
   'scripts/measure-nl-routing-corpus.ts 읽어 줘': { Read: 1 },
   'src/cli/self-utterances-cli.ts 상대 경로로 열어 줘': { Read: 1 },
   './scripts/lib/nl-routing-screening.ts 상대 경로 파일 보여줘': { Read: 1 },
-  '/home/user/.elanous/logs 절대 경로 확인해 줘': { Read: 1 },
+  '/home/ubuntu/.elanous/logs 절대 경로 확인해 줘': { Read: 1 },
   '/tmp/nl-routing/corpus.json 절대 경로 읽어 줘': { Read: 1 },
   '~/.elanous 아래 설정 파일 읽어 줘': { Read: 1 },
   '홈 디렉터리의 elanous 설정 읽어 줘': { Read: 1 },

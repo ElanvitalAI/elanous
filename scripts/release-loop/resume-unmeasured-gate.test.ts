@@ -84,6 +84,29 @@ describe('resume --waive gate: only an unmeasured gate', () => {
     expect(gateUnmeasuredDetail(unmeasured, 2)).toBeUndefined();
   });
 
+  test('successful cloud cleanup preserves gate waiver classification; failed cleanup does not', () => {
+    const withCloudCleanup = (gate: Omit<SavedNode, 'nodeId'>) => {
+      const state = gateThenTriaged(gate);
+      state.path.splice(3, 0, 'cloud-leave-fail', 'emergency-switch');
+      state.nodes.splice(3, 0,
+        { nodeId: 'cloud-leave-fail', ok: true, executed: true, exit: 0 } as NodeRecord,
+        { nodeId: 'emergency-switch', ok: true, executed: true, exit: 0 } as NodeRecord);
+      return state;
+    };
+    const unmeasured = withCloudCleanup({ exit: null, output: '[gate] sweeping shard 4/12\n', error: 'SIGTERM' });
+    expect(releaseResumeWaiver(unmeasured, { from: 'gate', waive: 'gate', reason: REASON })?.unmeasured)
+      .toBe('no-verdict: gate process ended with exit null and no result line — SIGTERM');
+    const measured = withCloudCleanup({ exit: 1, output: gateOutput({ outcome: 'fail', introduced: ['src/a.test.ts > breaks'] }) });
+    expect(() => releaseResumeWaiver(measured, { from: 'gate', waive: 'gate', reason: REASON }))
+      .toThrow('measured gate regressions cannot be waived');
+    const errorPath = gateThenTriaged({ exit: null, output: '[gate] sweeping shard 4/12\n', error: 'SIGTERM' });
+    errorPath.path.splice(3, 0, 'cloud-leave-error');
+    errorPath.nodes.splice(3, 0, { nodeId: 'cloud-leave-error', ok: true, executed: true, exit: 0 } as NodeRecord);
+    expect(gateUnmeasuredDetail(errorPath, 2)).toStartWith('no-verdict:');
+    unmeasured.nodes[3]!.ok = false;
+    expect(gateUnmeasuredDetail(unmeasured, 2)).toBeUndefined();
+  });
+
   test('a measured gate failure (outcome fail · introduced > 0) is refused', () => {
     const measured = gateThenFailed({ exit: 1, output: gateOutput({ outcome: 'fail', verdict: 'fail', introduced: ['src/a.test.ts > breaks'] }) });
     expect(() => releaseResumeWaiver(measured, { from: 'gate', waive: 'gate', reason: REASON }))

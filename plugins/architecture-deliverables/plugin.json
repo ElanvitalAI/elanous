@@ -1,0 +1,108 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "architecture-deliverables",
+  "version": "0.1.0",
+  "dependencies": {
+    "runtime": [
+      { "kind": "uv-python", "project": "@distribution/skills/diagram-master/references", "extras": ["python-engines"], "browser": "chromium" }
+    ]
+  },
+  "description": "Generates editable system architecture diagrams and integrated PDFs from structured design JSON (nodes, zones, flows, tables).",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [
+        "./graphs/architecture-deliverables.yaml"
+      ],
+      "graphProviders": {
+        "./graphs/architecture-deliverables.yaml": {
+          "module": "src/graph-runner/capability-providers/architecture-deliverables.ts",
+          "factory": "createArchitectureDeliverablesRegistry",
+          "withPluginRoot": true
+        }
+      },
+      "outputContract": {
+        "appliesTo": [
+          "system-architecture",
+          "system-architecture-on-gcp",
+          "gcp-cloud-expansion"
+        ],
+        "requiredFiles": [
+          "architecture.excalidraw",
+          "architecture.png",
+          "architecture.html",
+          "architecture.pdf",
+          "verification.json"
+        ],
+        "pdfSections": [
+          "배경",
+          "요구사항",
+          "구성도",
+          "데이터 흐름",
+          "보안 등급",
+          "비용 예측",
+          "절감안",
+          "대안",
+          "결정 기록"
+        ],
+        "diagramQuality": {
+          "iconSource": "Generic: editable vector shapes. GCP: official core/category icon archives, verified by source path and SHA-256",
+          "layers": [
+            "users",
+            "edge",
+            "application",
+            "data",
+            "observability",
+            "security"
+          ],
+          "boundaries": [
+          "system/project",
+          "zone/region",
+          "network/VPC"
+          ],
+          "annotations": [
+            "numbered data flows",
+            "legend",
+            "title",
+            "version"
+          ]
+        },
+        "pdfQuality": [
+          "cover",
+          "table of contents",
+          "executive summary",
+          "embedded diagram",
+          "tables",
+          "appendix"
+        ],
+        "referenceStyle": [
+          "https://cloud.google.com/icons",
+          "https://docs.aws.amazon.com/reference-architecture-diagrams/"
+        ],
+        "completionRule": "All required files exist, nested boundary and flow shapes are present, and the integrated PDF has cover, contents, summary, body, tables, and appendix. GCP mode also verifies official icons."
+      },
+      "capabilities": [
+        "fs:workdir",
+        "proc:bun",
+        "proc:uv",
+        "proc:python"
+      ],
+      "connectors": [],
+      "pricing": {
+        "model": "free"
+      },
+      "trust": "official",
+      "category": "Productivity",
+      "inputContract": {
+        "defaultMode": "structured",
+        "inputKeys": ["structuredDesignPath", "outDir", "resourceRoot"],
+        "graphApiVersion": "elanous.dev/graph/v2",
+        "structuredDesignPath": "Absolute path to JSON conforming to references/structured-design.schema.json",
+        "legacyFinishedInputs": [
+          "designHtmlPath",
+          "diagramSourcePath"
+        ],
+        "resourceRoot": "Absolute path to existing repository skills used by diagram-master and PDF converter"
+      }
+    }
+  }
+}

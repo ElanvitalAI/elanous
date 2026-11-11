@@ -68,12 +68,30 @@ const runGraph: typeof runGraphActual = (path, options = {}) => {
   const runBash = options.deps?.runBash;
   return runGraphActual(path, { ...options,
     ...(options.input && typeof options.input === 'object' && !Array.isArray(options.input)
-      ? { input: { ...options.input, graphCutover: 'audit', graphCutoverEvidenceId: 'test-hard-rehearsal-and-shadow' } } : {}),
-    ...(runBash ? { deps: { ...options.deps, runBash: (command, args) => command.includes('gate-cutover-switch-node.ts')
-      ? Promise.resolve(spawnSync('/bin/bash', ['-c', command], {
+      ? { input: { cutSha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', candidatePath: 'fixture:release-graph', ...options.input,
+        graphCutover: 'audit', graphCutoverEvidenceId: 'test-hard-rehearsal-and-shadow' } } : {}),
+    ...(runBash ? { deps: { ...options.deps, runBash: async (command, args) => {
+      const contextPath = args.env?.ELANOUS_GRAPH_CONTEXT;
+      let context: { graphId?: string; nodeId?: string } | undefined;
+      if (contextPath) {
+        context = JSON.parse(readFileSync(contextPath, 'utf8')) as { graphId?: string; nodeId?: string };
+        if (context.graphId === 'pod-reuse-prep' && context.nodeId === 'pending')
+          return { exitCode: 0, stdout: JSON.stringify({ outcome: 'legacy', verdict: 'legacy', reason: 'prep-body-pending', receiptPath: '' }), stderr: '' };
+      }
+      if (command.includes('gate-cutover-switch-node.ts')) return Promise.resolve(spawnSync('/bin/bash', ['-c', command], {
         cwd: join(import.meta.dir, '../..'), env: { ...process.env, ...args.env }, encoding: 'utf8',
-      })).then(result => ({ exitCode: result.status ?? 2, stdout: result.stdout, stderr: result.stderr }))
-      : runBash(command, args) } } : {}),
+      })).then(result => ({ exitCode: result.status ?? 2, stdout: result.stdout, stderr: result.stderr }));
+      const result = await runBash(command, args);
+      // Source: release cutoff records the pinned cutoff SHA; older graph fixtures omitted this production field.
+      if (context?.graphId === 'release-loop' && context.nodeId === 'cutoff' && result.exitCode === 0) {
+        try {
+          const output = JSON.parse(result.stdout) as Record<string, unknown>;
+          if (!output.cutoff || typeof output.cutoff !== 'object') output.cutoff = { sha: 'a'.repeat(40) };
+          return { ...result, stdout: JSON.stringify(output) };
+        } catch { /* Preserve malformed fixture output so the graph still fails closed. */ }
+      }
+      return result;
+    } } } : {}),
   });
 };
 
@@ -86,8 +104,8 @@ test('release graph CLI dry-run previews automatic route without executing comma
     expect(run.exitCode).toBe(0);
     const output = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[]; plannedPath?: string[]; executed: number; pending?: { nodeId: string; message: string } };
     expect(output.status).toBe('done');
-    expect(output.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'gate-cutover-switch', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
-    expect(output.plannedPath).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'regression-suite', 'prefetch', 'pre-gate-join', 'gate', 'gate-cutover-switch', 'traffic-gate-passed', 'export-check', 'mac-smoke', 'pwa', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'docs-land', 'version-dev-bump', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+    expect(output.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+    expect(output.plannedPath).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'regression-suite', 'prefetch', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'export-check', 'mac-smoke', 'pwa', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'docs-land', 'version-dev-bump', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
     expect(output.pending).toBeUndefined();
     expect(output.executed).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -100,8 +118,8 @@ test('graph dry-run previews automatic path without executing commands', async (
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async () => { throw new Error('dry-run executed command'); } }, dryRun: true,
     });
     expect(state.status).toBe('done');
-    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'gate-cutover-switch', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
-    expect(state.plannedPath).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'regression-suite', 'prefetch', 'pre-gate-join', 'gate', 'gate-cutover-switch', 'traffic-gate-passed', 'export-check', 'mac-smoke', 'pwa', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'docs-land', 'version-dev-bump', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+    expect(state.plannedPath).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'checklist-gate', 'regression-suite', 'prefetch', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'traffic-gate-passed', 'export-check', 'mac-smoke', 'pwa', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'docs-land', 'version-dev-bump', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
     expect(state.pending).toBeUndefined();
     expect(state.executed).toBe(0);
     expect(state.nodes.every((node) => !node.executed)).toBe(true);
@@ -137,7 +155,7 @@ test('serial release baseline: RFC #24935 recorded figures (not a live measureme
       { nodeId: 'publish', startedAt: '2026-10-08T00:11:03Z' }] } as GraphRunState)).toEqual({ totalSeconds: 4500, gateToPublishSeconds: 663 });
   expect(releaseDurations({ nodes: [{ nodeId: 'gate' }, { nodeId: 'publish' }] } as GraphRunState)).toEqual({ totalSeconds: null, gateToPublishSeconds: null });
   const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as {
-    nodes: Array<{ node_id: string; recipe?: string; needs?: string[] }>;
+    nodes: Array<{ node_id: string; recipe?: string; needs?: string[]; call?: string }>;
     edges: Array<{ from: string; map?: Record<string, string>; branches?: Record<string, string[]>; join?: string; warning_branches?: string[] }>;
   };
   expect(graph.nodes.find((node) => node.node_id === 'prefetch')?.recipe).toBe('cmd:docs');
@@ -149,16 +167,19 @@ test('serial release baseline: RFC #24935 recorded figures (not a live measureme
   };
   // The historical RFC figures remain a serial measurement; current concurrency is declared on join-node needs.
   expect(next('traffic-gate-passed')).toBeNull();
-  expect(['gate', 'gate-cutover-switch', 'receipt-audit', 'pre-gate-join', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve']
-    .map(next)).toEqual(['gate-cutover-switch', null, 'traffic-gate-passed', 'gate', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish']);
+  expect(['gate', 'gate-cutover-switch', 'receipt-audit', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'cloud-leave-ok', 'cloud-leave-fail', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve']
+    .map(next)).toEqual(['cloud-leave-ok', null, 'traffic-gate-passed', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate-cutover-switch', 'emergency-switch', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish']);
   expect(graph.edges.find((edge) => edge.from === 'cutoff')).toMatchObject({ warning_branches: ['prefetch'] });
   expect(graph.nodes.find((node) => node.node_id === 'checklist-gate')?.needs).toEqual(['cutoff']);
   expect(graph.nodes.find((node) => node.node_id === 'prefetch')?.needs).toEqual(['cutoff']);
   expect(graph.nodes.find((node) => node.node_id === 'export-check')?.needs).toEqual(['traffic-gate-passed']);
   expect(graph.nodes.find((node) => node.node_id === 'regression-suite')?.needs).toEqual(['cutoff']);
   expect(graph.nodes.find((node) => node.node_id === 'pre-gate-join')?.needs).toEqual(['checklist-gate', 'regression-suite', 'prefetch']);
-  expect(graph.edges.find((edge) => edge.from === 'pre-gate-join')?.map).toEqual({ ok: 'gate', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
-  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'gate-cutover-switch', fail: 'emergency-switch', error: 'gate-triage' });
+  expect(graph.edges.find((edge) => edge.from === 'pre-gate-join')?.map).toEqual({ ok: 'cloud-approval-check', fail: 'traffic-failed-restore', error: 'traffic-failed-restore' });
+  expect(graph.nodes.find((node) => node.node_id === 'pod-reuse-prep')?.call).toBe('pod-reuse-prep@1');
+  expect(graph.edges.find((edge) => edge.from === 'cloud-join')?.map).toEqual({ ok: 'pod-reuse-prep', fail: 'cloud-leave-join-fail', error: 'cloud-leave-join-fail' });
+  expect(graph.edges.find((edge) => edge.from === 'pod-reuse-prep')?.map).toEqual({ reuse: 'gate', legacy: 'gate', skip: 'gate', failed: 'gate', error: 'gate' });
+  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'cloud-leave-ok', fail: 'cloud-leave-fail', error: 'cloud-leave-error' });
   expect(graph.nodes.find((node) => node.node_id === 'emergency-switch')).toMatchObject({ kind: 'judge', recipe: 'cmd:emergency-switch' });
   expect(graph.nodes.find((node) => node.node_id === 'emergency-gate')).toMatchObject({ kind: 'gate', recipe: 'cmd:emergency-gate' });
   expect(graph.edges.find((edge) => edge.from === 'emergency-switch')?.map).toMatchObject({ switch: 'emergency-gate', 'stay-normal': 'gate-triage' });
@@ -218,8 +239,8 @@ test('RELEASE-GRAPH-RECEIPT-AUDIT: missing file receipts run a residual gate and
         return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass","summary":"fixture"}\n', stderr: '' };
       } },
     });
-    expect(state.path.slice(0, 11)).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate',
-      'gate-cutover-switch', 'receipt-audit', 'residual-run', 'receipt-audit-recheck', 'traffic-gate-passed']);
+    expect(state.path.slice(0, 14)).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok',
+      'gate-cutover-switch', 'receipt-audit', 'residual-run', 'receipt-audit-recheck']);
     expect(state.status).toBe('done');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -270,7 +291,7 @@ test('public export check fails after gate and blocks prepare/publish', async ()
   expect(graph.edges.find((edge) => edge.from === 'export-check')).toBeUndefined();
   expect(graph.nodes.find((node) => node.node_id === 'regression-suite')?.needs).toEqual(['cutoff']);
   expect(graph.nodes.find((node) => node.node_id === 'pre-gate-join')?.needs).toEqual(['checklist-gate', 'regression-suite', 'prefetch']);
-  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'gate-cutover-switch', fail: 'emergency-switch', error: 'gate-triage' });
+  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'cloud-leave-ok', fail: 'cloud-leave-fail', error: 'cloud-leave-error' });
   expect(recipes['mac-smoke']).toEqual({ command: 'bun scripts/release-loop/mac-smoke-node.ts', timeout_ms: 1_800_000 });
   expect(recipes['export-check']).toEqual({ command: 'bun scripts/release-loop/export-check-node.ts', timeout_ms: 1_800_000 });
   const root = mkdtempSync(join(tmpdir(), 'release-export-failed-'));
@@ -299,7 +320,7 @@ test('mac-smoke fail and error are warning-only: the graph continues to pwa and 
         stdout: JSON.stringify(body.includes('mac-smoke-node.ts') ? { outcome, verdict: 'fail', summary: '측정 불가' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
       }) } });
       expect(state.status).toBe('done');
-      expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
+      expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
 });
@@ -314,7 +335,7 @@ test('GATE-NODES-PARALLEL: a crashed or failed prefetch node never stops the rel
         return prefetch ? { exitCode: outcome === 'fail' ? 1 : 2, stdout: '', stderr: 'worker spawn error' }
           : { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '' };
       } } });
-      expect(state.path.slice(0, 8)).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'gate-cutover-switch', 'receipt-audit']);
+      expect(state.path.slice(0, 12)).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit']);
       expect(state.status).toBe('done');
     } finally { rmSync(root, { recursive: true, force: true }); }
   }
@@ -663,7 +684,8 @@ test('graph recipes carry fail notices and measured long-node timeouts', () => {
   const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { nodes: ReleaseGraphNode[] };
   const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { timeout_ms?: number; command?: string; approval?: string }>;
   expect(graph.nodes.filter((node) => node.max_visits !== 1).map((node) => [node.node_id, node.max_visits])).toEqual([
-    ['gate', 4], ['gate-cutover-switch', 4], ['emergency-switch', 4], ['receipt-audit', 3], ['residual-run', 3], ['receipt-audit-recheck', 3], ['gate-triage', 3],
+    ['gate', 4], ['cloud-leave-ok', 4], ['cloud-leave-fail', 4], ['cloud-leave-error', 4], ['cloud-leave-join-fail', 4],
+    ['gate-cutover-switch', 4], ['emergency-switch', 4], ['receipt-audit', 3], ['residual-run', 3], ['receipt-audit-recheck', 3], ['gate-triage', 3],
   ]);
   expect(graph.nodes.filter((node) => notifyOnValues(node.notify).length > 0 && notifyOnValues(node.notify).every((value) => value === 'fail')).map((node) => node.node_id)).toEqual(['gate', 'pwa', 'prepare', 'pwa-formal-update']);
   expect(recipes.gate?.timeout_ms).toBe(14_400_000);
@@ -837,10 +859,10 @@ test('real graph commands stop at approval before publish', async () => {
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async (body) => ({ exitCode: body.includes('auto-approve-node.ts') ? 1 : 0, stdout: body.includes('auto-approve-node.ts') ? '{"outcome":"fail","verdict":"fail","summary":"unmeasured"}\n' : '{"outcome":"ok","verdict":"pass","summary":"fake"}\n', stderr: '' }) },
     });
     expect(state.status).toBe('awaiting-approval');
-    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'approve-publish']);
+    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed', 'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'approve-publish']);
     expect(state.pending?.nodeId).toBe('approve-publish');
-    // Source: the release graph now runs its regression suite node before the hard gate.
-    expect(state.executed).toBe(17);
+    // Source: the release graph now runs pod-reuse-prep before its regression suite node and hard gate.
+    expect(state.executed).toBe(21);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -909,9 +931,9 @@ test('gate regression routes to failed before preparing or publishing', async ()
       } },
     });
     expect(state.status).toBe('failed');
-    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'emergency-switch', 'gate-triage', 'traffic-failed-restore', 'failed']);
+    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-fail', 'emergency-switch', 'gate-triage', 'traffic-failed-restore', 'failed']);
     // Source: the regression suite command runs in the cutoff fan-out before this failing hard gate.
-    expect(commands).toHaveLength(11);
+    expect(commands).toHaveLength(14);
     expect(commands.some((command) => command.includes('gate-triage-node.ts'))).toBe(true);
     expect(commands.some((command) => command.includes('publish-node.ts'))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -929,7 +951,7 @@ test('shadow triage error cannot turn a failed gate into a passing release', asy
           : { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass","summary":"fake"}\n', stderr: '' } },
     });
     expect(state.status).toBe('awaiting-approval');
-    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'emergency-switch', 'gate-triage', 'gate-heal-decision']);
+    expect(state.path).toEqual(['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-fail', 'emergency-switch', 'gate-triage', 'gate-heal-decision']);
     expect(state.pending?.nodeId).toBe('gate-heal-decision');
     expect(state.path).not.toContain('publish');
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -1064,7 +1086,7 @@ test('actual docs output reaches the real notes checker and B11 blocks approval'
 
 describe('RELEASE-GRAPH-SELFHEAL: TDD 무대: 같은 production graph runner를 통과하는 mock', () => {
   const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
-  const fullPassPath = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'gate', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed',
+  const fullPassPath = ['version-release', 'readiness-countdown', 'traffic-cut-start', 'cutoff', 'pre-gate-join', 'cloud-approval-check', 'cloud-join', 'pod-reuse-prep', 'gate', 'cloud-leave-ok', 'gate-cutover-switch', 'receipt-audit', 'traffic-gate-passed',
     'pre-prepare-join', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish',
     'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done'];
 
@@ -1193,13 +1215,13 @@ test('approval resumes through publish, docs land, verify and dev bump with fake
     const first = await runGraph(graph, { input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: fake } });
     expect(first.status).toBe('awaiting-approval');
     // Source: the regression suite adds one command to the existing preapproval release path.
-    expect(commands).toHaveLength(20);
+    expect(commands).toHaveLength(23);
     decideGraphApproval(first.graphId, first.runId, 'approved', 'fake-approver', root);
     const resumed = await runGraph(graph, { resumeRunId: first.runId, deps: { root, runBash: fake } });
     expect(resumed.status).toBe('done');
     expect(resumed.path.slice(-12)).toEqual(['approve-publish', 'publish', 'npm-publish', 'traffic-npm-published', 'release-post-publish-join', 'verify', 'traffic-verify-complete', 'pwa-formal-update', 'vault-note', 'release-story', 'ops-upgrade', 'done']);
     // Source: the same regression suite command remains in the resumed release history.
-    expect(commands).toHaveLength(31);
+    expect(commands).toHaveLength(34);
     expect(commands.some((command) => command.includes('publish-node.ts'))).toBe(true);
     expect(commands.some((command) => command.includes('npm-publish-node.ts'))).toBe(true);
     expect(commands.some((command) => command.includes('version-node.ts dev-bump'))).toBe(true);
@@ -1661,7 +1683,7 @@ test('pr land creates a missing docs PR before merging it', async () => {
     out: { log: (line) => lines.push(line), error: (line) => lines.push(line) },
   });
   expect(code).toBe(0);
-  expect(calls).toEqual(['gh pr list', 'git push', 'gh pr list', 'gh pr create', 'gh pr merge', 'gh pr view']);
+  expect(calls).toEqual(['gh pr list', 'git push', 'gh pr list', 'gh pr create', 'gh pr merge', 'gh pr view', 'gh pr view']);
   expect(lines.some((line) => line.includes('✓ upsert-ready:') && line.includes('(새 PR)'))).toBe(true);
   expect(lines.some((line) => line.includes('✓ merge: squash'))).toBe(true);
 });

@@ -1,0 +1,45 @@
+graph_id: guardian-placement-shadow
+version: 1
+loop:
+  title: Guardian host placement shadow
+  description: >-
+    Phase 1 only: consume a deterministic placement snapshot and CIO decision, run graph handlers that filter hard-invalid
+    hosts before the model, validate its JSON response against the same constraints, and compare the validated result
+    with CIO. Never assign work or invoke cloud-vm start/stop in this graph. Invalid model output asks the injected
+    deterministic pick-host.sh fallback adapter. The host facts include L/L15/M/D, tools, seat roster, train rows, and warm-pool Pods.
+  trigger:
+    events: [placement.requested]
+    cron: '*/5 * * * *'
+entry_node: placement-collect
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: placement-collect, kind: agent, recipe: 'handler:placement-collect', max_visits: 1 }
+  - { node_id: placement-filter, kind: agent, recipe: 'handler:placement-filter', max_visits: 1 }
+  - node_id: placement-judge
+    kind: prompt
+    recipe: prompt:placement-rubric-v1
+    max_visits: 1
+    input:
+      contract: '{host, workKind, reason, confidence, cloudAction: none|start|stop}'
+      facts: 'filtered candidate result from placement-filter handler; excludes AWS1, MBP, SSH failure, maintenance, and unknown hosts'
+      policy: 'local-first rubric v1 and placement.jsonl precedents'
+      mode: shadow
+  - { node_id: placement-validate, kind: agent, recipe: 'handler:placement-validate', max_visits: 1 }
+  - { node_id: placement-compare, kind: agent, recipe: 'handler:placement-compare', max_visits: 1 }
+  - node_id: done
+    kind: gate
+    recipe: none
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    recipe: none
+    max_visits: 1
+edges:
+  - { from: placement-collect, on: outcome, map: { ok: placement-filter, fail: failed, error: failed } }
+  - { from: placement-filter, on: outcome, map: { ok: placement-judge, fail: failed, error: failed } }
+  - from: placement-judge
+    on: outcome
+    # Model transport/provider failures still enter validation, which treats absent output as invalid and runs the same fallback.
+    map: { ok: placement-validate, fail: placement-validate, error: placement-validate }
+  - { from: placement-validate, on: outcome, map: { ok: placement-compare, fail: failed, error: failed } }
+  - { from: placement-compare, on: outcome, map: { ok: done, fail: failed, error: failed } }

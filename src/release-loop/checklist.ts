@@ -6,6 +6,10 @@ import * as store from './feature-store.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
 import { parseTargetPathHintLine } from './checklist-target-path-hint.js';
+import { parseProvenanceEvidenceLine, provenanceEvidenceLine, validateProvenance, type Provenance } from '../provenance/provenance.js';
+import { messageRouteFor } from '../loops/msg-address.js';
+import { resolveSeatStateRoot } from '../loops/msg-wake.js';
+import { readSeatRegistry, seatRegistryPath } from '../loops/seat-registry.js';
 export { parseTargetPathHintLine } from './checklist-target-path-hint.js';
 export type { TargetPathHintLine } from './checklist-target-path-hint.js';
 
@@ -129,11 +133,20 @@ export function checklistDevVersion(version = devVersion()): string {
 const MVP_CHECKLIST_SEATS = Array.from({ length: 26 }, (_, index) => `MVP-${String.fromCharCode(65 + index)}`);
 const MANUAL_CHECKLIST_SEATS = new Set([...MVP_CHECKLIST_SEATS, 'MVP-*', 'NM-*', 'NT-*', 'GATE-G']);
 
+function runtimeMessageSeats(): ReadonlySet<string> {
+  const registry = readSeatRegistry(seatRegistryPath(resolveSeatStateRoot()));
+  return registry.status === 'ready' ? new Set(registry.registry.seats.map(({ address }) => address)) : new Set();
+}
+
 export function parseOwner(value: string): { seat: string; sub?: string } {
-  const match = /^([A-Z]{2,8}(?:-(?:[A-Z0-9]{1,8}|\*))?)(?:\/([a-z][a-z0-9-]{0,31}))?$/.exec(value);
+  // Match seat-registry.ts ADDRESS; the legacy wildcard branch is gated by MANUAL_CHECKLIST_SEATS.
+  const match = /^([A-Z][A-Z0-9_-]{0,63}|[A-Z]{2,8}-\*)(?:\/([a-z][a-z0-9-]{0,31}))?$/.exec(value);
   const seat = match?.[1];
   const legacySeat = seat !== undefined && /^[A-Z]{2,8}(?:-[0-9]{1,8})?$/.test(seat);
-  if (!match || match[0] !== value || (!legacySeat && !MANUAL_CHECKLIST_SEATS.has(seat!) ))
+  const manualSeat = seat !== undefined && MANUAL_CHECKLIST_SEATS.has(seat);
+  const declaredAddress = seat !== undefined && !legacySeat && !manualSeat &&
+    (messageRouteFor(seat) !== null || runtimeMessageSeats().has(seat));
+  if (!match || match[0] !== value || (!legacySeat && !manualSeat && !declaredAddress))
     throw new CliUserError(`잘못된 담당: ${value}`, '자리 이름(예: TC-1, MVP-D, MVP-*, GATE-G) 또는 자리/하위자리(예: TC/rel)');
   return match[2] ? { seat: seat!, sub: match[2] } : { seat: seat! };
 }
@@ -465,7 +478,7 @@ export function addItem(v: string, input: { id: string; title: string; refs?: st
   });
 }
 
-export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; knownIssue?: string | null; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
+export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; provenance?: Provenance; knownIssue?: string | null; refs?: string[]; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind; dispatchKind?: ChecklistDispatchKind; priority?: ChecklistItem['priority']; predecessors?: string[]; deadlineVersion?: string; ceoMinutes?: number; ceoDate?: string; accelerator?: boolean | null }, by: string): Checklist {
   return setItemGuarded(v, id, patch, by);
 }
 
@@ -552,6 +565,32 @@ function setItemGuarded(v: string, id: string, patch: Parameters<typeof setItem>
     assertPredecessorsExist(patch.predecessors, data, otherItems);
     if (patch.deadlineVersion !== undefined) store.validateVersion(patch.deadlineVersion);
     if (patch.accelerator !== undefined && patch.accelerator !== true && patch.accelerator !== null) throw new CliUserError('가속 등급은 true(부여) 또는 null(해제)이다');
+    if (patch.provenance !== undefined && !validateProvenance(patch.provenance)) throw new CliUserError('잘못된 근거 출처 꼬리표');
+    const evidenceWasProvided = patch.evidence !== undefined;
+    if (patch.provenance !== undefined && patch.evidence === undefined) patch = { ...patch, evidence: item.evidence ?? '' };
+    if (patch.evidence !== undefined) {
+      const provenanceLines = (evidence: string | undefined) => evidence?.split(/\r?\n/).filter(line => line.startsWith('provenance: ')) ?? [];
+      const currentLines = provenanceLines(item.evidence);
+      const incomingLines = evidenceWasProvided ? provenanceLines(patch.evidence) : [];
+      if (incomingLines.length > 1) throw new CliUserError('근거에 출처 꼬리표가 중복됐다');
+      const currentLine = currentLines.length === 1 ? currentLines[0] : undefined;
+      const incomingLine = incomingLines[0];
+      const currentProvenance = currentLine ? parseProvenanceEvidenceLine(currentLine) : null;
+      if (incomingLine && !parseProvenanceEvidenceLine(incomingLine))
+        throw new CliUserError('잘못된 근거 출처 꼬리표');
+      if (incomingLine && !patch.provenance && (!currentProvenance || incomingLine !== currentLine))
+        throw new CliUserError('잘못된 근거 출처 꼬리표');
+      if (currentProvenance && incomingLine && incomingLine !== currentLine) throw new CliUserError('기존 근거 출처 꼬리표와 새 꼬리표가 충돌한다');
+      if (patch.provenance) {
+        const provenanceLine = provenanceEvidenceLine(patch.provenance);
+        if (currentProvenance && currentLine !== provenanceLine) throw new CliUserError('기존 근거 출처 꼬리표와 새 꼬리표가 충돌한다');
+        if (incomingLine && incomingLine !== provenanceLine) throw new CliUserError('근거 출처 꼬리표와 새 꼬리표가 충돌한다');
+        const humanEvidence = (patch.evidence ?? '').split(/\r?\n/).filter(line => !line.startsWith('provenance: ')).join('\n');
+        patch = { ...patch, evidence: humanEvidence ? `${humanEvidence}\n${provenanceLine}` : provenanceLine };
+      } else if (currentProvenance && !incomingLine) {
+        patch = { ...patch, evidence: patch.evidence ? `${patch.evidence}\n${currentLine}` : currentLine };
+      }
+    }
     validateCeoLoad(patch);
     // --ref 는 «더하기»다 — 기존 참조 뒤에 붙이고 중복을 지운다.
     if (patch.refs !== undefined) patch = { ...patch, refs: normalizeRefs([...(item.refs ?? []), ...patch.refs]) };

@@ -1,11 +1,11 @@
 /** One injected input trace shared by classic and next goal-interim renderer evidence. */
 export const GOAL_INTERIM_USER_INPUT = '영상 만들어줘';
-export const GOAL_INTERIM_NOT_DONE_REPLY = '[fake-llm] {step}단계 렌더를 진행했습니다.\n남은 작업 {step}단계: 완료 영상 경로는 아직 보고할 수 없습니다 — 아직 못 했습니다.';
+export const GOAL_INTERIM_NOT_DONE_REPLY = '[fake-llm] {reply}단계 렌더를 진행했습니다.\n남은 작업 {reply}단계: 완료 영상 경로는 아직 보고할 수 없습니다 — 아직 못 했습니다.';
 export const GOAL_INTERIM_TOOL_CALL = JSON.stringify({ when: GOAL_INTERIM_USER_INPUT, name: 'ScheduleWakeup', args: { delaySeconds: 3600, reason: '렌더 점검' } });
 
 export const GOAL_INTERIM_RENDER_TRACE = {
   userInput: GOAL_INTERIM_USER_INPUT,
-  interimReplies: [1, 2].map((step) => GOAL_INTERIM_NOT_DONE_REPLY.replaceAll('{step}', String(step))),
+  interimReplies: [1, 2].map((step) => GOAL_INTERIM_NOT_DONE_REPLY.replaceAll('{reply}', String(step))),
   finalReply: '완료 영상: /tmp/final.mp4',
   toolCalls: ['ScheduleWakeup', 'ScheduleWakeup progress', 'ScheduleWakeup progress'],
 } as const;

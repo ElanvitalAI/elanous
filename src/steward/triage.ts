@@ -8,6 +8,7 @@ import { getUserConfig } from '../user-config/reader.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { loopEvent } from '../loops/observe.js';
+import { runtimeUniverse } from '../provenance/provenance.js';
 import { checkLoops, daemonScheduleEntries, entriesFromRegistry, extendHealthyLauncher, launcherEvidence, notifyOwners, scheduleFindings, versionEvidence, type CheckEntry } from '../loops/checker.js';
 import { listSchedules, schedulesDbPath, type ScheduleRow } from '../domains/schedule-registry.js';
 import { Database } from 'bun:sqlite';
@@ -670,7 +671,10 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
   outcome = 'ok';
   } finally {
     try { loopEvent('steward', 'tick', { runId, stage, outcome, reason: outcome,
-      sourceRef: 'graphs/steward/steward.yaml', profile: settings.mode }); }
+      sourceRef: 'graphs/steward/steward.yaml', profile: settings.mode,
+      provenance: settings.mode === 'live' || settings.mode === 'rescue'
+        ? { universe: runtimeUniverse(), source: 'real' }
+        : { universe: runtimeUniverse(), source: 'shadow', device: 'steward' } }); }
     catch { /* Observation must not change the stage outcome. */ }
   }
 }

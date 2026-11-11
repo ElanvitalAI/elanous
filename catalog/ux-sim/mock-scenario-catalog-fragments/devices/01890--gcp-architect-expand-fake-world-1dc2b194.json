@@ -1,0 +1,27 @@
+{
+  "id": "gcp-architect-expand-fake-world",
+  "name": "GCP architect expansion fake lifecycle",
+  "audience": "internal",
+  "implementation": [
+    "src/ux-sim/gcp-architect-expand-fake-world.ts"
+  ],
+  "tests": [
+    "src/ux-sim/gcp-architect-expand-fake-world.test.ts"
+  ],
+  "target": "Simulates shortage detection, priced proposal shape, approval, fake project lifecycle, idle stop, and cost ledger without live GCP calls.",
+  "inputs": [
+    "synthetic CPU, memory, disk, and queue signals",
+    "fake approval with project spend ceiling"
+  ],
+  "observations": [
+    "approval is required before side effects",
+    "fake project stops after idle TTL",
+    "cost and resource ledgers close with zero real GCP calls"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/gcp-architect-expand-fake-world.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

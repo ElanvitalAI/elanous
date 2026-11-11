@@ -12,7 +12,11 @@ export const LOOP_MESSAGE_ROUTES = {
  * Seat addresses share the table. A seat has no fixed `wake`: `wakeFrom: 'host'` says the path is
  * resolved on this host from the seat folder or a pty named after the seat (`resolveWake` in msg-wake.ts).
  */
-const REGISTERED_HAND_SEATS = ['OPC', 'OPT', 'NT-1', 'NT-3', 'LEDGER'] as const;
+const REGISTERED_HAND_SEATS = [
+  'OPC', 'OPT', 'NT-1', 'NT-3', 'LEDGER', 'MVP-B', 'R-GCP1C',
+  'R-OAUTH', 'R-TICKET', 'R-LLMNODE', 'Q-1', 'WIN-1', 'WIN-AZ',
+  'ABSORB-1', 'ABSORB-3', 'ABSORB-4', 'NM-1', 'MOB-1', 'K-EAST', 'OP-P4D',
+] as const;
 const SEAT_ADDRESS_IDS = [...new Set([
   ...registeredSeats().map((entry) => entry.id.toUpperCase()),
   ...REGISTERED_HAND_SEATS,

@@ -39,7 +39,9 @@ test('RELEASE-GRAPH-PODREUSE-SUBGRAPH-CALL: reuse, legacy, mismatch, timeout, fa
   const call = production.nodes.find((node) => node.node_id === 'pod-reuse-prep');
   expect(call).toMatchObject({ kind: 'subgraph', call: 'pod-reuse-prep@1',
     contract: { inputs: ['cutSha', 'candidatePath'], outputs: ['verdict', 'reason', 'receiptPath'] } });
-  expect(production.edges.find((edge) => edge.from === 'pre-gate-join')?.map?.ok).toBe('pod-reuse-prep');
+  expect(production.edges.find((edge) => edge.from === 'pre-gate-join')?.map?.ok).toBe('cloud-approval-check');
+  expect(production.edges.find((edge) => edge.from === 'cloud-approval-check')?.map?.ok).toBe('cloud-join');
+  expect(production.edges.find((edge) => edge.from === 'cloud-join')?.map?.ok).toBe('pod-reuse-prep');
   expect(production.edges.find((edge) => edge.from === 'pod-reuse-prep')?.map)
     .toEqual({ reuse: 'gate', legacy: 'gate', skip: 'gate', failed: 'gate', error: 'gate' });
 

@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { mkdtempSync, existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,7 @@ import { serviceKeyStatus, verifyServiceKey, type ServiceKeyVerification } from 
 import { importServiceKeys, runFirstRunProviderSetup } from '../cli/setup-keys.js';
 import { formatCodexDeviceLoginFailure, runCodexDeviceLoginWait } from '../cli/codex-device-login-wait.js';
 import type { UserConfig } from '../user-config/types.js';
+import { setUserConfigOverlay } from '../user-config.js';
 import { withSimClock } from './fake-clock.js';
 import {
   createFakeCodexDeviceOAuth,
@@ -18,7 +19,9 @@ import {
 
 const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 const isolatedRoots: string[] = [];
+beforeEach(() => setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm, codexTokenOwnerHost: 'mshq' }, hq: { ...config.hq, hostName: 'mshq' } })));
 afterEach(() => {
+  setUserConfigOverlay(null);
   if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
   for (const root of isolatedRoots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -173,7 +176,7 @@ test('first-run API-key choice never calls the actual OAuth module entrypoint', 
       'oauthSpy.mockClear();',
       "const { runFirstRunProviderSetup } = await import('./src/cli/setup-keys.ts');",
       "const env: Record<string, string | undefined> = {};",
-      "const result = await runFirstRunProviderSetup({ ask: async prompt => prompt === '선택: ' ? '2' : '1', askSecret: async prompt => prompt.includes('EXA_API_KEY') ? 'synthetic-exa-key' : '', print: () => {} }, {",
+      "const result = await runFirstRunProviderSetup({ ask: async prompt => prompt === '선택: ' ? '3' : '1', askSecret: async prompt => prompt.includes('EXA_API_KEY') ? 'synthetic-exa-key' : '', print: () => {} }, {",
       "  config: { llm: { provider: 'openai' } }, env, cacheDir: process.env.HOME + '/cache',",
       '  loginWithCodex: oauth.loginWithCodex, verifier: async input => { verifierCalls += 1; if (input.provider !== \'exa\' || input.apiKey !== \'synthetic-exa-key\') throw new Error(\'unexpected verifier input\'); return { success: true, verification: \'verified\' }; },',
       '});',
@@ -302,7 +305,7 @@ test('synthetic canary inputs never reach the key verifier or emitted output', a
     const firstRunCacheDir = mkdtempSync(join(tmpdir(), 'ux-service-key-first-run-'));
     isolatedRoots.push(firstRunCacheDir);
     await runFirstRunProviderSetup({
-      ask: async prompt => prompt === '선택: ' ? '2' : '',
+      ask: async prompt => prompt === '선택: ' ? '3' : '',
       askSecret: async prompt => prompt.includes('EXA_API_KEY') ? firstRunSecret : '',
       print: message => printed.push(message),
     }, {
@@ -360,6 +363,7 @@ test('fake device OAuth completes production login and refreshes an expired acce
 
   expect(saved.tokens.accessToken).toBe('fake-initial-access-token');
   expect(loadTokens('openai-codex')?.tokens.refreshToken).toBe('fake-initial-refresh-token');
+  setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm, codexTokenOwnerHost: 'mshq' }, hq: { ...config.hq, hostName: 'mshq' } }));
   const refreshed = await loadFreshCodexAuthState({ fetchImpl: oauth.fetchImpl, mirrorCodex: false });
   expect(refreshed?.tokens).toMatchObject({
     accessToken: 'fake-refreshed-access-token',

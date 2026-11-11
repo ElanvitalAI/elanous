@@ -30,6 +30,27 @@ test('cutover node defaults to legacy and refuses audit without an OP decision',
   } finally { console.log = original; }
 });
 
+test('automatic cut repair reenters receipt audit even when the ordinary route is legacy', () => {
+  const cut = 'e'.repeat(40);
+  const output: string[] = [];
+  const original = console.log;
+  console.log = (line: string) => { output.push(line); };
+  try {
+    expect(runGateCutoverSwitch({ ELANOUS_GRAPH_CONTEXT: JSON.stringify({ ...base,
+      input: { ...base.input, autoAppendRepair: true, graphCutover: 'legacy' },
+      outputs: { gate: { outcome: 'ok', commit: cut },
+        ['gate-repair-' + 'a'.repeat(12)]: { outcome: 'ok', commit: cut, requiresReceiptAudit: true,
+          appendedPicks: ['c'.repeat(40)], repairedFiles: ['src/failing.ts'] } } }) })).toBe(0);
+    expect(JSON.parse(output.at(-1)!).outcome).toBe('audit');
+    expect(runGateCutoverSwitch({ ELANOUS_GRAPH_CONTEXT: JSON.stringify({ ...base,
+      input: { ...base.input, autoAppendRepair: true, graphCutover: 'legacy' },
+      outputs: { gate: { outcome: 'ok', commit: cut },
+        ['gate-repair-' + 'b'.repeat(12)]: { outcome: 'ok', commit: 'd'.repeat(40), requiresReceiptAudit: true,
+          appendedPicks: ['c'.repeat(40)], repairedFiles: ['src/failing.ts'] } } }) })).toBe(2);
+    expect(JSON.parse(output.at(-1)!).summary).toContain('lacks matching receipt-audit evidence');
+  } finally { console.log = original; }
+});
+
 test('dry-run rejects an audit route without the same OP decision evidence', async () => {
   const root = mkdtempSync(join(tmpdir(), 'release-cutover-dry-'));
   try {

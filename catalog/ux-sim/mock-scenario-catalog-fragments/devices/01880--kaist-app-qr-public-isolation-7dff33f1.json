@@ -1,0 +1,36 @@
+{
+  "id": "kaist-app-qr-public-isolation",
+  "name": "KAIST public app QR and cross-app isolation",
+  "audience": "internal",
+  "checklistCells": [
+    "KAIST-APP-QR-LIVE"
+  ],
+  "implementation": [
+    "src/ux-sim/kaist-app-qr-sim.ts",
+    "src/ux-sim/fake-app-host.ts",
+    "src/nexus/apps/app-host.ts",
+    "src/relay/relay-server.ts"
+  ],
+  "tests": [
+    "src/ux-sim/kaist-app-qr-sim.test.ts"
+  ],
+  "target": "Run the real Nexus app-host request handler behind fake public-name resolution after fake deployment; keep app origins, session cookies, and per-app databases isolated.",
+  "inputs": [
+    "two fake deployed app artifacts",
+    "HTTPS QR URLs using app--owner.elanous.app",
+    "separate owner sessions and one deliberately crossed session"
+  ],
+  "observations": [
+    "fake deployment serves both app artifacts",
+    "public QR names resolve only for valid HTTPS app hosts",
+    "the real Nexus app-host serves both public app origins",
+    "a session from one app is rejected by the other app",
+    "RPC rows remain isolated per app and browser storage is origin-scoped"
+  ],
+  "entryCommands": [
+    "bun test src/ux-sim/kaist-app-qr-sim.test.ts"
+  ],
+  "logsRecorded": "no",
+  "eventNames": [],
+  "recentUse": null
+}

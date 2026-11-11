@@ -1,0 +1,97 @@
+{
+  "id": "ticket-demo-4c7c693ad20d",
+  "inputSha256": "4c7c693ad20d51a22fee6b808c94da303d212735fb431e92869f0d7fa8934858",
+  "ticketDesign": {
+    "schemaVersion": 1,
+    "sourceKind": "synthetic-ticket-design-fixture",
+    "title": "공연 티켓팅 플랫폼",
+    "summary": "구매 API와 좌석 재고·결제 경로는 로컬에 유지한다. 비식별 이벤트 집계와 리포트 생성만 비동기 배치로 분리한다.",
+    "requirements": [
+      "좌석 예약과 결제는 멱등 키로 중복 처리를 막는다",
+      "구매 경로와 분석 배치의 장애 영역을 분리한다",
+      "집계 작업은 재시도·체크포인트 가능하고 사용자 요청 지연에 영향을 주지 않는다"
+    ],
+    "localComponents": [
+      "구매 API",
+      "좌석 재고",
+      "결제",
+      "작업 대기열"
+    ],
+    "offloadWorkload": "비식별 이벤트 집계·리포트 생성",
+    "offloadKind": "batch",
+    "retryable": true,
+    "checkpointable": true,
+    "exportData": "식별자 제거된 집계 이벤트",
+    "containsPii": false,
+    "dataClass": "internal",
+    "region": "asia-northeast3",
+    "usage": {
+      "vcpuHours": 4,
+      "gibHours": 8
+    },
+    "assumptions": []
+  },
+  "assumptions": [],
+  "assumptionStatus": "none",
+  "signal": {
+    "cpuUsed": 0.93,
+    "memoryUsed": 0.91,
+    "diskUsed": 0.92,
+    "queued": 14,
+    "observedAt": "2026-11-10T04:00:00.000Z",
+    "source": "synthetic-demo-fixture"
+  },
+  "shortageAxes": [
+    "cpu",
+    "memory",
+    "disk",
+    "queue"
+  ],
+  "signalSource": "synthetic-demo-fixture",
+  "architecture": "batch-spot",
+  "region": "asia-northeast3",
+  "comparisonRegion": "us-central1",
+  "regionComparison": "서울 기본안과 us-central1 비교안의 공식 SKU·이그레스·지연·데이터 위치를 각각 확인한 뒤 사용자 승인",
+  "estimate": {
+    "period": "month",
+    "formula": "월 실행횟수 × (1회 예상 vCPU시간 × 해당 리전 Spot vCPU 공식 SKU 단가 + 1회 예상 GiB시간 × Spot 메모리 공식 SKU 단가) + 월 디스크 + 네트워크 + 로그",
+    "skuSource": "https://cloud.google.com/compute/all-pricing",
+    "price": "unpriced",
+    "usage": {
+      "vcpuHours": 4,
+      "gibHours": 8
+    },
+    "status": "월 비용 미산정 — 월 실행횟수와 공식 리전 SKU 실조회 필요",
+    "unresolvedInputs": [
+      "월 실행횟수",
+      "공식 리전 Spot SKU",
+      "디스크·네트워크·로그 사용량"
+    ]
+  },
+  "savings": [
+    "재시도 가능한 비식별 집계에만 Spot 검토",
+    "유휴 TTL 종료",
+    "리전·스토리지·이그레스 비교",
+    "예산 경보는 지출 차단 아님"
+  ],
+  "security": {
+    "grade": "internal",
+    "controls": [
+      "프로젝트 분리",
+      "Secret Manager 개별 접근",
+      "비공개 진입·리전 정책 확인"
+    ],
+    "exportData": "식별자 제거된 집계 이벤트",
+    "credentials": "user-device-only"
+  },
+  "alternatives": [
+    "로컬 대기열 조절",
+    "일반 VM",
+    "Cloud Run 0 scale for HTTP only",
+    "GKE Autopilot for durable Kubernetes need"
+  ],
+  "sourcePack": "packs/gcp-architect-expand",
+  "sourceCheckedAt": "2026-11-10 UTC",
+  "idleTtlMs": 60000,
+  "realGcpCalls": 0
+}

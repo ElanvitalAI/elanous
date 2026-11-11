@@ -4,8 +4,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assembleSeatQuickPath, assembleSeatTacitKnowledge, collectSeatBootSections, collectSeatLadderSections, registerSeatBootCommands, renderSeatBootCard, SEAT_QUICKSTART_MANUAL, SEAT_TRUST_LADDER } from './seat-cli.js';
-import { LAST_SESSION_FILE } from '../dashboard/seat-local-instructions.js';
+import { PROJECT_ANCHOR_LAST_SESSION_FILE as LAST_SESSION_FILE } from '../prompt-library/universal-preamble.js';
 import { MsgStore } from '../msg/msg-store.js';
+
+test('last-session filename matches the universal project-anchor contract', () => {
+  expect(LAST_SESSION_FILE).toBe('.AGENTS.local.last-session.md');
+});
 
 function fixture() {
   const home = mkdtempSync(join(tmpdir(), 'seat-boot-'));

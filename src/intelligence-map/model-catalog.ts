@@ -26,6 +26,42 @@ export const BUILTIN_CATALOG: ModelCatalog = {
   updated: Date.UTC(2026, 4, 3),    // 2026-05-03 snapshot timestamp
   models: [
     {
+      id: 'openrouter/upstage/solar-pro4',
+      provider: 'openrouter',
+      family: 'solar-pro4',
+      contextWindow: 524_288,
+      inputPerMtok: 0.30,
+      outputPerMtok: 1.20,
+      local: false,
+      tags: ['reasoning', 'coding', 'agentic', 'long-context'],
+      bestFor: ['complex-architecture', 'multi-file-edit', 'deep-analysis'],
+      envKey: 'OPENROUTER_API_KEY',
+      reservedOutputTokens: 16_000,
+      tier: 'best',
+      reasoningEffortCeiling: 'high',
+      releasedAt: '2026-08-10',
+      classification: { source: 'builtin', at: '2026-11-10' },
+      notes: 'Upstage Solar Pro 4 via OpenRouter. Catalog pricing is undiscounted USD/MTok; provider may apply a temporary discount.',
+    },
+    {
+      id: 'openrouter/upstage/solar-mini4',
+      provider: 'openrouter',
+      family: 'solar-mini4',
+      contextWindow: 524_288,
+      inputPerMtok: 0.10,
+      outputPerMtok: 0.40,
+      local: false,
+      tags: ['coding', 'agentic', 'long-context', 'cheap', 'fast'],
+      bestFor: ['daily-coding', 'summarization', 'routing'],
+      envKey: 'OPENROUTER_API_KEY',
+      reservedOutputTokens: 8_000,
+      tier: 'budget',
+      reasoningEffortCeiling: 'medium',
+      releasedAt: '2026-09-23',
+      classification: { source: 'builtin', at: '2026-11-10' },
+      notes: 'Upstage Solar Mini 4 via OpenRouter. Catalog pricing is undiscounted USD/MTok; provider may apply a temporary discount.',
+    },
+    {
       // ⭐ 2026-09-25 (대표 「모델별 최신으로」) — opus 최신은 «5.5»(`claude-opus-5-5` · 09-21). `/v1/models` 실측 ⊕ 실호출 OK.
       //    📏 공식 $4/$20 · 1M ctx · 출력 128K (Opus 5 보다 싸다).
       id: 'claude-opus-5-5',

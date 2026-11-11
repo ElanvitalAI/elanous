@@ -1,0 +1,19 @@
+apiVersion: elanous.dev/graph/v2
+graph:
+  id: architecture-deliverables
+  version: 2.0.0
+  layer: flow
+  purpose: "구조화 시스템 설계 → 편집 도식 → 통합 PDF → 산출 검증"
+entry: design
+nodes:
+  - { id: design, type: capability, requires: architecture.design@1, with: { stage: design } }
+  - { id: diagram, type: capability, requires: architecture.diagram@1, with: { stage: diagram } }
+  - { id: pdf, type: capability, requires: architecture.pdf@1, with: { stage: pdf } }
+  - { id: verify, type: capability, requires: architecture.verify@1, with: { stage: verify } }
+edges:
+  - { from: design, on: outcome, map: { ok: diagram, fail: failed } }
+  - { from: diagram, on: outcome, map: { ok: pdf, fail: failed } }
+  - { from: pdf, on: outcome, map: { ok: verify, fail: failed } }
+  - { from: verify, on: outcome, map: { ok: done, fail: failed } }
+terminal: [done, failed]
+observe: { categories: [graph.run, graph.unit, architecture.output] }

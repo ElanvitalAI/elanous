@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { asRecord } from '../src/primitives/guards.js';
 // Read-only llm.usage ledger: measurable USD + unknown-pricing remainder.
 //
 // Invokes the existing logs command. Does not write logs, mutate config,
@@ -179,15 +180,13 @@ function formatReconcileLines(reconcile: LlmCostReconcile): string[] {
   ];
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
+function recordOrUndefined(value: unknown): Record<string, unknown> | undefined {
+  return asRecord(value, { fallback: 'undefined' });
 }
 
 function usageFromRow(row: Record<string, unknown>): LlmCostUsage | undefined {
   if (row._meta) return undefined;
-  const nested = asRecord(row.data);
+  const nested = recordOrUndefined(row.data);
   const data = nested
     ?? (typeof row.model === 'string' ? row : undefined)
     ?? (row.category === 'llm.usage' ? row : undefined);
@@ -211,9 +210,9 @@ export function limitMetaFromRow(row: Record<string, unknown>): {
   nextCursor: number | null;
   nextCursors?: Record<string, number>;
 } | undefined {
-  const meta = asRecord(row._meta) ?? (row.type === 'log-query-limit' ? row : undefined);
+  const meta = recordOrUndefined(row._meta) ?? (row.type === 'log-query-limit' ? row : undefined);
   if (!meta || meta.type !== 'log-query-limit') return undefined;
-  const nextCursors = asRecord(meta.nextCursors) as Record<string, number> | undefined;
+  const nextCursors = recordOrUndefined(meta.nextCursors) as Record<string, number> | undefined;
   return {
     limitReached: meta.limitReached === true,
     nextCursor: typeof meta.nextCursor === 'number' ? meta.nextCursor : null,
@@ -262,12 +261,12 @@ export function pageIsIncomplete(
       invalidOutput = true;
       continue;
     }
-    const rec = asRecord(parsed);
+    const rec = recordOrUndefined(parsed);
     if (!rec) {
       invalidOutput = true;
       continue;
     }
-    const metaType = asRecord(rec._meta)?.type ?? rec.type;
+    const metaType = recordOrUndefined(rec._meta)?.type ?? rec.type;
     if (metaType === 'log-query-unreadable-instances') {
       unreadable = true;
       continue;
@@ -336,7 +335,7 @@ export function summarizeLlmUsageRows(
     if (!trimmed) continue;
     let parsed: unknown;
     try { parsed = JSON.parse(trimmed); } catch { continue; }
-    const rec = asRecord(parsed);
+    const rec = recordOrUndefined(parsed);
     if (!rec) continue;
     const usage = usageFromRow(rec);
     if (!usage) continue;

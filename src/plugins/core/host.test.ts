@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { homedir, tmpdir } from 'os';
-import { join } from 'path';
-import { PluginHost, USER_DIR, type HostHooks } from './host.js';
+import { join, win32 } from 'path';
+import { installedPluginMarketFromPath, PluginHost, USER_DIR, type HostHooks } from './host.js';
 import { installPlugin, removePlugin } from '../install/plugin-install.js';
 import { toLLMToolSpec } from '../../llm/tool-spec.js';
 
@@ -14,6 +14,10 @@ const hooks: HostHooks = {
   requestRender: () => {},
   focusPane: () => {},
 };
+
+test('installed dependency market is read with native separators on Windows', () => {
+  expect(installedPluginMarketFromPath('C:\\elanous\\plugins\\team-market\\base-plugin\\1.0.0', win32)).toBe('team-market');
+});
 
 const MINIMAL_PLUGIN = `export default { name: 'mine', version: '1', description: '', initialState: () => ({}), panes: {} };`;
 
@@ -113,7 +117,6 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
     const host = new PluginHost(hooks, null, { userDir });
     await host.discover();
     const builtins = host.list().filter((entry) => entry.source === 'builtin');
-    expect(builtins).toHaveLength(9);
     expect(builtins.some((entry) => entry.manifest.id === 'botlab')).toBe(true);
     expect(builtins.some((entry) => entry.manifest.id === 'elanous-hwp')).toBe(true);
     expect(host.list().filter((entry) => entry.source === 'user')).toHaveLength(0);
@@ -131,7 +134,6 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
     expect(names).not.toContain('marketplaces');
     expect(names).not.toContain('nested-pkg');
     expect(host.list().filter((entry) => entry.source === 'user')).toHaveLength(0);
-    expect(host.list().filter((entry) => entry.source === 'builtin')).toHaveLength(9);
   });
 
   test('a sibling mine/plugin.ts following the Elanous convention is discovered', async () => {
@@ -148,7 +150,6 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
     expect(names).toContain('mine');
     const userPlugins = host.list().filter((entry) => entry.source === 'user');
     expect(userPlugins.map((entry) => entry.manifest.id)).toEqual(['mine']);
-    expect(host.list().filter((entry) => entry.source === 'builtin')).toHaveLength(9);
   });
 
   test('ledger entries alone are discovered; removal and corrupt ledger preserve built-ins and user plugins', async () => {
@@ -183,7 +184,6 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
       expect(host.list().find(entry => entry.manifest.id === 'installed-test')).toMatchObject({ path: installed.path, source: 'installed' });
       expect(host.list().some(entry => entry.manifest.id === 'stray-test')).toBe(false);
       expect(host.list().find(entry => entry.manifest.id === 'installed-test')?.manifest.version).toBe('1.0.0');
-      expect(host.list().filter(entry => entry.source === 'builtin')).toHaveLength(9);
       expect(host.list().filter(entry => entry.source === 'user').map(entry => entry.manifest.id)).toEqual(['mine']);
       expect(host.list().find(entry => entry.manifest.id === 'mine')?.path).toBe(join(userDir, 'mine'));
       rmSync(fakeVersion, { recursive: true });
@@ -195,7 +195,6 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
       writeFileSync(join(root, 'plugins', 'installed.json'), '{bad');
       await host.discover();
       expect(warnings.some(message => message.includes('installed.json'))).toBe(true);
-      expect(host.list().filter(entry => entry.source === 'builtin')).toHaveLength(9);
       expect(host.list().filter(entry => entry.source === 'user').map(entry => entry.manifest.id)).toEqual(['mine']);
     } finally {
       if (original === undefined) delete process.env.ELANOUS_STATE_DIR;

@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { asRecord } from '../src/primitives/guards.js';
 
 export type CycleFiredStatus = 'not-fired' | 'incomplete' | 'fired';
 
@@ -15,8 +16,8 @@ export type LogQueryObserver = (args: string[]) => Promise<string>;
 
 type JsonRecord = Record<string, unknown>;
 
-function asRecord(value: unknown): JsonRecord | undefined {
-  return typeof value === 'object' && value !== null ? value as JsonRecord : undefined;
+function recordOrUndefined(value: unknown): JsonRecord | undefined {
+  return asRecord(value, { fallback: 'undefined', allowArrays: true });
 }
 
 function kstDate(timestamp: unknown): string | undefined {
@@ -28,9 +29,9 @@ function kstDate(timestamp: unknown): string | undefined {
 
 function dataRecord(value: unknown): JsonRecord {
   if (typeof value === 'string') {
-    try { return asRecord(JSON.parse(value)) ?? {}; } catch { return {}; }
+    try { return recordOrUndefined(JSON.parse(value)) ?? {}; } catch { return {}; }
   }
-  return asRecord(value) ?? {};
+  return recordOrUndefined(value) ?? {};
 }
 
 export function judgeCycleFired(jsonl: string, measuredAt = new Date()): CycleFiredDecision {
@@ -43,13 +44,13 @@ export function judgeCycleFired(jsonl: string, measuredAt = new Date()): CycleFi
   for (const [inputIndex, line] of jsonl.split('\n').entries()) {
     if (!line.trim()) continue;
     let parsed: JsonRecord;
-    try { parsed = asRecord(JSON.parse(line)) ?? {}; } catch { continue; }
-    const meta = asRecord(parsed._meta);
+    try { parsed = recordOrUndefined(JSON.parse(line)) ?? {}; } catch { continue; }
+    const meta = recordOrUndefined(parsed._meta);
     if (meta) {
       if (meta.type === 'log-query-opened-stores') {
         const stores = meta.stores;
         openedStores = Array.isArray(stores) ? stores.length : null;
-        const scope = asRecord(meta.scope);
+        const scope = recordOrUndefined(meta.scope);
         unopenedStores = typeof scope?.unopenedStores === 'number' ? scope.unopenedStores : null;
       }
       continue;

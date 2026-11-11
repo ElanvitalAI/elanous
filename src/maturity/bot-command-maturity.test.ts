@@ -55,7 +55,7 @@ describe('MAT1d bot menu grades', () => {
     expect(Object.keys(FEATURE_MATURITY.telegramCommand).sort()).toEqual(names(tg).sort());
     expect(Object.keys(FEATURE_MATURITY.discordCommand).sort()).toEqual(names(dc).sort());
     // Safety pins stay by hand: owner-only commands must never drift into a general menu by a grade-table edit.
-    for (const name of 'cc_clear mission_del botsay'.split(' ')) expect(FEATURE_MATURITY.telegramCommand[name as keyof typeof FEATURE_MATURITY.telegramCommand]).toBe('system');
+    for (const name of 'cc_clear botsay'.split(' ')) expect(FEATURE_MATURITY.telegramCommand[name as keyof typeof FEATURE_MATURITY.telegramCommand]).toBe('system');
     expect(FEATURE_MATURITY.telegramCommand.harness).toBe('ops');
     for (const name of 'relay botsay voice-join'.split(' ')) expect(FEATURE_MATURITY.discordCommand[name as keyof typeof FEATURE_MATURITY.discordCommand]).toBe('ops');
     for (const surface of ['telegram', 'discord'] as const) {

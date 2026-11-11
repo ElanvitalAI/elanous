@@ -296,7 +296,7 @@ test('phone claim route reuses an in-flight claim after the Nexus client tempora
   const client = createNexusClient({ baseUrl: 'https://nexus.example.test', fetchImpl: (async () => {
     claimCalls++;
     return await new Promise<Response>((resolve) => { finishClaim = resolve; });
-  }) as typeof fetch });
+  }) as unknown as typeof fetch });
   let tree!: ReturnType<typeof create>;
   try {
     await act(async () => { tree = create(<NexusProvider client={client}><CredentialClaimPage /></NexusProvider>); await Promise.resolve(); await Promise.resolve(); });
@@ -533,7 +533,7 @@ test('a changing claim client cannot undo a save in progress', async () => {
 
 test('registration-link API refuses a QR target outside the same Nexus claim route', async () => {
   const client = createNexusClient({ baseUrl: 'https://nexus.example.test', token: 'owner-session', fetchImpl: (async () =>
-    Response.json({ slot: slot.id, url: 'https://evil.example.test/steal/#t=one-time-secret', expiresAt: Date.now() + 60_000 })) as typeof fetch });
+    Response.json({ slot: slot.id, url: 'https://evil.example.test/steal/#t=one-time-secret', expiresAt: Date.now() + 60_000 })) as unknown as typeof fetch });
   await expect(client.createCredentialRegistrationLink(slot.id)).rejects.toThrow('자격 등록 링크를 확인할 수 없습니다.');
 });
 

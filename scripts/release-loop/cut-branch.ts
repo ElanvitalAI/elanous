@@ -13,6 +13,8 @@ export interface CutBranchOptions {
   base?: string;
   pick: string[];
   append?: boolean;
+  /** Refuse an automatic append if the measured cut tip has moved. */
+  expectedTip?: string;
   dryRun?: boolean;
   repoRoot?: string;
   log?: (line: string) => void;
@@ -299,6 +301,8 @@ export function cutReleaseBranch(opts: CutBranchOptions): { branch: string; comm
     if (!isReleaseVersion(opts.version)) throw new Error(`invalid release version: ${opts.version}`);
     if (!opts.pick.length) throw new Error('at least one --pick commit is required');
     if (opts.base === undefined && !opts.append) throw new Error('--base is required without --append');
+    if (opts.expectedTip !== undefined && (!opts.append || !/^[0-9a-f]{40}$/i.test(opts.expectedTip)))
+      throw new Error('expectedTip requires --append and a full commit SHA');
     for (const sha of [opts.base, ...opts.pick]) if (sha !== undefined && !/^[0-9a-f]{7,40}$/i.test(sha)) throw new Error(`invalid commit SHA: ${sha}`);
     git(repo, ['fetch', 'origin', 'main']);
     const remoteLine = git(repo, ['ls-remote', '--heads', 'origin', `refs/heads/${branch}`]);
@@ -313,6 +317,8 @@ export function cutReleaseBranch(opts: CutBranchOptions): { branch: string; comm
       git(repo, ['fetch', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
       remoteTip = git(repo, ['rev-parse', '--verify', `refs/remotes/origin/${branch}^{commit}`]);
       if (advertised !== remoteTip) throw new Error(`${branch} remote tip moved — fast-forward refused (no force push)`);
+      if (opts.expectedTip !== undefined && remoteTip !== opts.expectedTip)
+        throw new Error(`${branch} remote tip differs from measured cut ${opts.expectedTip}`);
     }
     // RELEASE-APPEND-BASE-AUTO (OP 0.2.38): a cut commit lives only on the release branch, so the main cut is resolved
     // before the ancestor refusal — from the run ledger's version-release record, else the release tip's first parent.

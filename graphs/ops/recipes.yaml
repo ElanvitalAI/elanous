@@ -12,6 +12,25 @@ secret-exposure-scan:
 guardian-shadow:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../bin/elanous.mjs" guardian tick'
   timeout_ms: 120000
+placement-rubric-v1:
+  prompt: >-
+    You are the phase-one shadow placement judge. Input contains a work request, deterministic eligible host facts
+    (after hard filtering), seat roster, train rows, warm-pool Pods, the local-first v1 rubric, and placement.jsonl
+    precedents. Filtered facts and request follow:
+    $placement-filter.output.result
+    Choose local first: green candidates in the work-kind priority order; otherwise yellow only when
+    that same work kind is already running there and add at most one; otherwise a green cloud host only when no
+    local is eligible; otherwise wait. Never choose aws1 or mbp. Return one JSON object and no prose with exactly
+    {"host":"<eligible host or wait>","workKind":"review|test|tsc|tab|train","reason":"...","confidence":0.0,"cloudAction":"none|start|stop"}.
+    Cloud start is only a recommendation when no local host is eligible. Cloud stop is only a recommendation when
+    at least two local hosts are green and the cloud host has been idle for five minutes with L15<10, zero tabs,
+    zero train rows, and zero warm Pods. This graph is shadow-only; do not claim to execute any action.
 harness-gc-tick:
   command: 'bun "$ELANOUS_GRAPH_DIR/../../src/harness/harness-gc.ts" --json'
   timeout_ms: 300000
+# Source: loop:silence-watch is shadow-only; observations are injected through graph context and claims persist in the state-root incident ledger.
+silence-watch-shadow:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/supervision/silence-watch.ts" --shadow'
+host-reservation-watch-shadow:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/loops/host-reservation-watch.ts"'
+  timeout_ms: 120000 # // Source: LOOP-HOST-RESERVATION-WATCH shadow tick must finish before the next five-minute cron tick.

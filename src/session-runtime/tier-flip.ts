@@ -57,6 +57,7 @@ function warmPreloadScopesFromText(userText: string): ReadonlySet<ToolIntentScop
   if (sig.intentCapture) scopes.add('capture');
   if (sig.intentOpsFleet) scopes.add('ops-fleet');
   if (sig.intentOpsUi) scopes.add('ops-ui');
+  if (sig.intentKnowledge) scopes.add('knowledge');
   return scopes;
 }
 
@@ -214,6 +215,12 @@ function splitDeferredToolSpecsInternal(
         summary: synthesiseFallbackSummary(spec),
       });
     } else if (!entry && isImplicitlyDeferredByName(spec.name)) {
+      if (spec.name === 'KnowledgeQuery' && warmPreloadScopes.has('knowledge')) {
+        active.push(spec);
+        if (!seen.has(spec.name)) warmPreloaded.push(spec.name);
+        seen.add(spec.name);
+        continue;
+      }
       // No catalog entry but the byname fallback says this is
       // specialised + rarely used. Render with a synthesised
       // promptSummary derived from the spec itself — the LLM still

@@ -40,8 +40,13 @@ describe('nextTuiSlashCandidates', () => {
   });
 });
 
-test('exact exit input closes next TUI while longer text stays a chat turn', () => {
-  expect(resolveNextTuiRoute(' exit ', NEXT_TUI_INPUT_CONTEXT)?.action).toBe('quit');
+test('only the slash quit command closes next TUI; plain exit words stay chat turns', () => {
+  for (const command of ['/quit', '/exit']) {
+    expect(resolveNextTuiRoute(command, NEXT_TUI_INPUT_CONTEXT)?.action).toBe('quit');
+  }
+  for (const phrase of ['quit', 'exit', '종료', '그만', '끝내기', '엘라누스 종료']) {
+    expect(resolveNextTuiRoute(phrase, NEXT_TUI_INPUT_CONTEXT)).toBeNull();
+  }
   expect(resolveNextTuiRoute('exiting now', NEXT_TUI_INPUT_CONTEXT)).toBeNull();
 });
 

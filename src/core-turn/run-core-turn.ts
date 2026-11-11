@@ -28,6 +28,7 @@ import { applyDeferredTools } from '../session-runtime/tier-flip.js';
 import { isOrderedLinearIssueStep, isOrderedLinearResearchWorkflow, isOrderedNonResearchWorkflow, isResearchAgentIntent } from '../tool-hints/signals.js';
 import { buildResearchDateSystemMessage, resolveSessionSurfaceProfile } from '../session-runtime/index.js';
 import { ensureResearchAnswerHasSourceUrl } from '../research/evidence-attribution.js';
+import { coreStopReasonFromProvider } from './provider-stop-reason.js';
 import {
   isResearchToolAllowed,
   RESEARCH_DOCUMENT_WRITE_TOOLS,
@@ -824,8 +825,12 @@ export async function runCoreTurn(
         }
       })();
     }
+    let providerFinishReason: string | undefined;
     const streamOptions = (availableTools: typeof tools, signal: AbortSignal = ctx.signal) => ({
       tools: availableTools,
+      onFinishReason: (reason: string) => { providerFinishReason = reason; },
+      longAnswer: /설계|아키텍처|RFC|상세|자세히|보고서|design|architecture|detailed|comprehensive/i.test(ctx.userText ?? ''),
+      ...(researchTurn ? { usageRole: 'research' as const } : {}),
       ...(firstTurnTools ? { firstTurnTools } : {}),
       researchTurn,
       ...(firstTurnTools?.[0] ? { toolChoice: { name: firstTurnTools[0].name } } : {}),
@@ -1098,8 +1103,9 @@ export async function runCoreTurn(
         // Observability must not prevent a completed turn from returning.
       }
       return {
-        stopReason: ctx.signal.aborted ? 'aborted' : 'end_turn',
+        stopReason: coreStopReasonFromProvider(ctx.signal.aborted, providerFinishReason),
         finalText,
+        ...(providerFinishReason ? { providerFinishReason } : {}),
         ...(ctx.callbacks?.onTurnComplete ? { finalPhaseAnswer } : {}),
       };
     } catch (err) {

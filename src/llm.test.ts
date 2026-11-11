@@ -3,9 +3,26 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from './debug/log.js';
-import { _setGpt6CodexGuardFlagsForTest, _usesAdaptiveThinkingForContractTest, AnthropicProvider, billingRouteForProvider, codexOAuthAvailable, getGpt6CodexGuardFlags, getGpt6CodexGuardStats, logAgentTurnUsage, PROVIDERS, resetGpt6CodexGuardObservations, streamLLM, streamLLMWithTools, type Gpt6CodexGuardId, type LLMMessage, type LLMProvider } from './llm.js';
+import { _setGpt6CodexGuardFlagsForTest, _usesAdaptiveThinkingForContractTest, AnthropicProvider, billingRouteForProvider, codexOAuthAvailable, getProvider, getGpt6CodexGuardFlags, getGpt6CodexGuardStats, logAgentTurnUsage, PROVIDERS, resetGpt6CodexGuardObservations, streamLLM, streamLLMWithTools, type Gpt6CodexGuardId, type LLMMessage, type LLMProvider } from './llm.js';
 import { _resetCodexBillingDecisionForTesting, noteCodexBillingDecision } from './oauth/codex-billing-route.js';
 import { withFakeFetchDevice } from './ux-sim/fake-fetch.js';
+
+test('access-only remote routes explicit Codex GPT model requests to the mirrored subscription provider', () => {
+  const previous = process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+  const previousMode = process.env.ELANOUS_LLM_MODE;
+  try {
+    process.env.ELANOUS_LLM_MODE = 'real';
+    delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+    expect(getProvider('gpt-6.1-terra').name).toBe('openai');
+    process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = '1';
+    expect(getProvider('gpt-6.1-terra').name).toBe('openai-codex');
+  } finally {
+    if (previous === undefined) delete process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY;
+    else process.env.ELANOUS_REMOTE_CODEX_ACCESS_ONLY = previous;
+    if (previousMode === undefined) delete process.env.ELANOUS_LLM_MODE;
+    else process.env.ELANOUS_LLM_MODE = previousMode;
+  }
+});
 
 test('credits-allowed Codex rotation records credit billing even when Codex auth is not inferred as OAuth', () => {
   // 인증 추론이 oauth 가 «아닌» 우주(빈 HOME·자격 미러 결손)를 고정한다 — oauth 우주에선

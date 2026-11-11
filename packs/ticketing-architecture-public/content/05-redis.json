@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "Redis 관문과 캐시",
+  "source": "https://redis.io/docs/latest/commands/set/",
+  "body": "Redis SET NX EX 또는 Lua는 경쟁 요청을 DB 앞에서 거르는 사전 관문이다. 랜덤 토큰과 값 비교 후 삭제로 남의 잠금을 지우지 않게 한다. 최종 좌석 판매 판정은 DB다. 좌석맵 캐시는 짧은 TTL과 변경 무효화를 쓰고 예약/결제는 DB를 재조회한다. Redis 장애 시 대기열 가용성과 좌석 정합성 정책을 별도로 정한다."
+}

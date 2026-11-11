@@ -11,7 +11,7 @@ import { logViewLines } from '../tui/chat/log-view.js';
 
 const REPO_CLI = join(import.meta.dir, '..', '..', 'bin', 'elanous.mjs');
 
-// Each scenario boots this tree's classic TUI (bare `elanous`) on a real PTY with the network-free
+// Each scenario explicitly boots this tree's classic TUI (`--tui classic`) on a real PTY with the network-free
 // fake LLM (`ELANOUS_TEST_FAKE_LLM_AS_PROVIDER=1`) and reads the universe back through the same CLI's
 // `logs`. One TUI at a time (sequential tests) — the seat host carries one isolated TUI per run.
 async function run(scenario: ClassicTuiScenario, rows = 30) {

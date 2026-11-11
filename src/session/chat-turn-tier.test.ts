@@ -68,14 +68,14 @@ describe('runTurn explicit model tier', () => {
 
     const pin: LLMOpts = { model: 'pinned-model', temperature: 0.2 };
     const pinned = await turn({ llm: 'budget' }, pin, 'best');
-    expect(pinned.seen[0]).toEqual(pin);
+    expect(pinned.seen[0]).toMatchObject({ ...pin, maxTokens: 4096 }); // Source: #36522
     expect(pinned.result.model).toBe('pinned-model');
     expect(pinned.llmOpts).toEqual(pin);
   });
 
-  test('implicit tier leaves provider opts and default model untouched', async () => {
+  test('implicit tier keeps the default model and receives the ordinary output budget', async () => {
     const { seen, result } = await turn({ preset: 'a-preset' });
-    expect(seen).toEqual([{}]);
+    expect(seen[0]).toMatchObject({ model: 'original-default', maxTokens: 4096 }); // Source: #36522
     expect(result.model).toBe('original-default');
   });
 });

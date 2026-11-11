@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "공통 패턴 — Circuit breaker",
+  "source": "https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker",
+  "body": "적용 시점: 느린 하위 서비스 호출이 자원 점유와 장애 전파를 늘릴 때.\n용량 단계: timeout과 bounded retry부터 적용; 지속 실패가 확인되면 open/half-open 상태와 fallback을 둔다.\nGCP 대응: Cloud Run client library/service mesh 또는 애플리케이션 정책; fallback 결과와 상태를 관측한다.\n비용 축: 대체 경로·격리 자원과 오류 관측 저장량이 비용 축이다.\n결정과 반증: 실패 후 회복 probe가 닫힘을 확인하고 열린 상태가 정상 트래픽을 무한 차단하지 않는지 확인한다."
+}

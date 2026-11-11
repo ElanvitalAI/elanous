@@ -1092,7 +1092,8 @@ test('RLA-REHEARSAL-INCIDENT-GRAPH sim: graph-run cloud boundary persists and th
   const pluginPath = join(graphDir, 'plugin.json');
   const plugin = JSON.parse(readFileSync(pluginPath, 'utf8'));
   plugin.extensions['ai.elanous'].graphManifests['release-loop'].hitl = [];
-  plugin.extensions['ai.elanous'].graphManifests['release-loop'].allow.recipes.push('cloud-join');
+  const allowedRecipes = plugin.extensions['ai.elanous'].graphManifests['release-loop'].allow.recipes as string[];
+  if (!allowedRecipes.includes('cloud-join')) allowedRecipes.push('cloud-join');
   writeFileSync(pluginPath, `${JSON.stringify(plugin, null, 2)}\n`);
   writeFileSync(join(graphDir, 'recipes.yaml'), [
     "version-release: { command: 'bun scripts/release-loop/version-node.ts release --json' }",
@@ -2564,7 +2565,7 @@ test('E11 c159bb8d ledger replay carries completed same-run shards before train 
     for (const driftPlan of [changedImagePlan, changedLockPlan]) {
       expect(driftPlan).toMatchObject({ outcome: 'ok', reusedShardCount: 0, fullSweepFallback: true });
       expect(driftPlan.remeasureFiles).toHaveLength(files.length);
-      expect([...driftPlan.remeasureFiles].sort()).toEqual([...files].sort());
+      expect([...(driftPlan.remeasureFiles ?? [])].sort()).toEqual([...files].sort());
     }
     expect(sameIdentitySelection).toEqual([files[17]]);
   } finally { rmSync(root, { recursive: true, force: true }); }

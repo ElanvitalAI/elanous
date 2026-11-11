@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "CQRS·이벤트 소싱 — projection 지연과 재생",
+  "source": "https://docs.cloud.google.com/pubsub/docs/overview",
+  "body": "적용 시점: 비동기 읽기 모델에서 지연을 허용할 수 있고 재생 가능한 입력이 있을 때.\n용량 단계: 초기에는 작은 소비자와 지연 관측; 재처리 창이 길어지면 분할 병렬성과 체크포인트를 설계한다.\nGCP 대응: Pub/Sub와 Dataflow 또는 Cloud Run consumer, 원본 이벤트는 Cloud Storage/BigQuery에 보존할 수 있다.\n비용 축: 재생 기간 동안의 읽기·쓰기·임시 저장과 이중 실행 컴퓨트가 비용 축이다.\n결정과 반증: 소비자 중단 후 lag 회복 시간과 중복 이벤트의 멱등성을 시험한다."
+}

@@ -311,7 +311,7 @@ export function buildAcpSessionSpawnSubTool(): LLMToolSpec {
         maxOutputChars: {
           type: 'integer',
           description:
-            'Cap on the concatenated output text returned from this call. Default ' + DEFAULT_MAX_OUTPUT + '.',
+            'Cap on the concatenated output text returned from this call. Default 32768.',
         },
         cwd: {
           type: 'string',
@@ -369,7 +369,7 @@ export function buildAcpPlanThenExecuteTool(): LLMToolSpec {
         maxOutputChars: {
           type: 'integer',
           description:
-            'Per-phase cap on captured text. Default ' + DEFAULT_MAX_OUTPUT + ' each.',
+            'Per-phase cap on captured text. Default 32768 each.',
         },
         cwd: {
           type: 'string',
@@ -408,7 +408,7 @@ export function buildAcpSessionSendTool(): LLMToolSpec {
         maxOutputChars: {
           type: 'integer',
           description:
-            'Cap on the concatenated output text returned from this call. Default ' + DEFAULT_MAX_OUTPUT + '.',
+            'Cap on the concatenated output text returned from this call. Default 32768.',
         },
       },
       required: ['sessionId', 'message'],

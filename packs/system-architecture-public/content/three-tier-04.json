@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "웹 3계층 — 경계 보안과 장애 격리",
+  "source": "https://cloud.google.com/run/docs/securing/service-identity",
+  "body": "적용 시점: 외부 트래픽, 인증, 업무 처리, 저장 계층의 신뢰 수준이 다를 때.\n용량 단계: 초기에는 네트워크·IAM 경계를 먼저 만들고, 장애 영향 반경이 커질 때 배포 경계를 나눈다.\nGCP 대응: External Application Load Balancer, IAM 서비스 계정, Secret Manager, Cloud SQL 비공개 IP.\n비용 축: 부하 분산, 감사 로그, 비공개 네트워크, 중복 가용성 구성이 비용을 만든다.\n결정과 반증: 웹 계층이 DB 자격증명을 직접 소유하지 않는지와 공개 경로가 최소인지 검증한다."
+}

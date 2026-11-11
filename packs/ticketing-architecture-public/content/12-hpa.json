@@ -1,0 +1,6 @@
+{
+  "type": "document",
+  "title": "HPA와 DB 연결 예산",
+  "source": "https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/",
+  "body": "HPA는 관측 메트릭·목표치·최소/최대 replica로 설정한다. readiness가 준비된 pod에만 트래픽이 간다. 최대 pod 수×pod당 pool 상한+운영 연결<DB max_connections−예비 연결을 검증한다. DB 연결이 병목이면 앱 replica만 늘려도 실패가 커지므로 admission rate와 pool 크기를 함께 조절한다."
+}

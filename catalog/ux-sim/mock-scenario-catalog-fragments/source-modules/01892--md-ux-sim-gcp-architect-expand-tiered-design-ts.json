@@ -1,0 +1,10 @@
+{
+  "id": "MD-UX-SIM-GCP-ARCHITECT-EXPAND-TIERED-DESIGN-TS",
+  "path": "src/ux-sim/gcp-architect-expand/tiered-design.ts",
+  "boundary": "Builds three offline GCP capacity options from classified traffic assumptions with synthetic rates and no provisioning connector.",
+  "deviceIds": [
+    "gcp-architect-tiered-design"
+  ],
+  "integrityCertificatePresent": false,
+  "integrityCertificatePath": null
+}

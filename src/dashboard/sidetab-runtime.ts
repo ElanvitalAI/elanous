@@ -2,12 +2,13 @@ import { createVwFilterPickerModal } from '../ui/vw-filter-picker-modal.js';
 import type { ModalSurface } from '../display/modal-stack.js';
 import type { Key } from '../tui.js';
 import { loadSidetabRows, type SidetabRow } from '../sidetab-core/model.js';
+import type { CodingAgentBrand } from '../terminal/session-registry.js';
 
 export interface DashboardLocalAgentSession {
   id: string;
   title: string;
   kind: 'shell' | 'coding-agent';
-  agentBrand?: 'claude-code' | 'codex' | 'gemini' | 'grok';
+  agentBrand?: CodingAgentBrand;
   state: 'foreground' | 'background' | 'exited';
 }
 

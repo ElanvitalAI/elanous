@@ -104,7 +104,8 @@ function prepareHistory(input: NextTuiLogFrameInput): PreparedHistory {
   // Keep their indexes stable for message blocks and tool fold targets, but omit those rows.
   const lifecycleToolCalls = HIDDEN_INTERNAL_TOOL_CALLS;
   const isLifecycleText = (text: string): boolean =>
-    /^(?:agent\s+(?:started|running|spawned)(?:\s*[:#-]\s*[\w.-]+)?|(?:started|running|spawned)\s+(?:agent|child agent)(?:\s*[:#-]\s*[\w.-]+)?|agent\s+(?:finished|completed|failed)|(?:finished|completed|failed)\s+(?:agent|child agent))$/i.test(text.trim());
+    /^(?:agent\s+(?:started|running|spawned)(?:\s*[:#-]\s*[\w.-]+)?|(?:started|running|spawned)\s+(?:agent|child agent)(?:\s*[:#-]\s*[\w.-]+)?|agent\s+(?:finished|completed|failed)|(?:finished|completed|failed)\s+(?:agent|child agent))$/i.test(text.trim())
+    || /^\(running in background — taskId=[^\r\n)]+\)$/.test(text.trim());
   const hasSubstantiveAgentValue = (value: unknown): boolean => {
     if (typeof value === 'string') return value.trim().length > 0 && !isLifecycleText(value);
     if (Array.isArray(value)) return value.some(hasSubstantiveAgentValue);
